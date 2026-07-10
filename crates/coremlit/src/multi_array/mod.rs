@@ -295,8 +295,10 @@ impl MultiArray {
   /// refuses.
   ///
   /// # Errors
-  /// Propagates [`Self::linear_offset`] bound/rank failures and
-  /// dtype-mismatch failures.
+  /// A dtype mismatch is reported before any index validation; index
+  /// bound/rank failures then propagate from [`Self::linear_offset`].
+  /// (The write side validates in the opposite order — only the winning
+  /// error differs when both conditions hold.)
   pub fn read_at<T>(&self, indices: &[usize]) -> Result<T, TensorError>
   where
     T: Element,

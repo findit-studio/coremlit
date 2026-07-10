@@ -255,3 +255,22 @@ fn padded_surface_rejects_flat_views_but_fills_elementwise() {
   // `f16_surface_is_f16_and_writable`.
   assert_eq!(arr.strides()[1] + 3, offset);
 }
+
+#[test]
+fn fill_last_dim_accepts_rank_one() {
+  let mut arr = MultiArray::zeros(&[4], DataType::F32).unwrap();
+  arr.fill_last_dim(&[0, 2], 1.5f32).unwrap();
+  assert_eq!(arr.as_slice::<f32>().unwrap(), &[1.5, 0.0, 1.5, 0.0]);
+}
+
+#[test]
+fn unsupported_shape_displays_reason() {
+  let err = MultiArray::zeros(&[2, 3], DataType::F32)
+    .unwrap()
+    .fill_last_dim(&[0], 1.0f32)
+    .unwrap_err();
+  assert_eq!(
+    err.to_string(),
+    "shape [2, 3] is unsupported: all dimensions before the last must be 1"
+  );
+}
