@@ -163,6 +163,36 @@ pub enum TensorError {
     /// The CVReturn code.
     code: i32,
   },
+  /// The shape does not meet an operation's structural requirement.
+  #[error("shape {shape:?} is unsupported: {reason}")]
+  UnsupportedShape {
+    /// The offending shape.
+    shape: Vec<usize>,
+    /// Why the shape was rejected.
+    reason: ShapeRequirement,
+  },
+}
+
+/// Why a shape was rejected by [`TensorError::UnsupportedShape`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
+#[display("{}", self.as_str())]
+#[non_exhaustive]
+pub enum ShapeRequirement {
+  /// All dimensions before the last must be 1.
+  LeadingDimsUnit,
+  /// The shape must have at least one dimension.
+  NonEmpty,
+}
+
+impl ShapeRequirement {
+  /// Stable name of the requirement.
+  #[inline(always)]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::LeadingDimsUnit => "all dimensions before the last must be 1",
+      Self::NonEmpty => "the shape must have at least one dimension",
+    }
+  }
 }
 
 #[cfg(test)]

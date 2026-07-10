@@ -32,7 +32,9 @@ mod state;
 mod units;
 
 pub use dtype::DataType;
-pub use error::{CompileError, LoadError, NsErrorInfo, PredictionError, TensorError};
+pub use error::{
+  CompileError, LoadError, NsErrorInfo, PredictionError, ShapeRequirement, TensorError,
+};
 pub use features::Features;
 pub use model::{FeatureInfo, Model, ModelDescription};
 pub use multi_array::{Element, MultiArray};

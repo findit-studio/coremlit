@@ -5,7 +5,7 @@ use objc2::{AnyThread, rc::Retained};
 use objc2_core_ml::{MLMultiArray, MLMultiArrayDataType};
 use objc2_foundation::{NSArray, NSNumber};
 
-use crate::{DataType, NsErrorInfo, TensorError};
+use crate::{DataType, NsErrorInfo, ShapeRequirement, TensorError};
 
 mod sealed {
   pub trait Sealed {}
@@ -248,14 +248,32 @@ impl MultiArray {
 
   /// Writes `value` at each `position` of the final axis.
   ///
+  /// Mirrors Swift's `fillLastDimension(indexes:with:)`, which
+  /// preconditions a `[1, 1, n]` shape; this port generalizes that to any
+  /// rank where every dimension before the last is 1 (rank 0/1 arrays have
+  /// no leading dimensions and are always accepted here), so a genuinely
+  /// multi-row array is rejected instead of only writing its first row.
+  ///
   /// # Errors
-  /// [`TensorError::IndexOutOfBounds`] if a position exceeds the final
-  /// axis; dtype-mismatch failures from the typed view.
+  /// [`TensorError::UnsupportedShape`] (reason
+  /// [`ShapeRequirement::LeadingDimsUnit`]) if any dimension before the
+  /// last is not 1. [`TensorError::IndexOutOfBounds`] if a position exceeds
+  /// the final axis — every position is validated before any element is
+  /// written, so a single out-of-bounds position leaves the array
+  /// untouched rather than partially filled. Dtype-mismatch failures from
+  /// the typed view.
   pub fn fill_last_dim<T>(&mut self, positions: &[usize], value: T) -> Result<(), TensorError>
   where
     T: Element,
   {
-    let last = self.shape().last().copied().unwrap_or(0);
+    let shape = self.shape();
+    if shape.len() >= 2 && shape[..shape.len() - 1].iter().any(|&dim| dim != 1) {
+      return Err(TensorError::UnsupportedShape {
+        shape,
+        reason: ShapeRequirement::LeadingDimsUnit,
+      });
+    }
+    let last = shape.last().copied().unwrap_or(0);
     let stride = self.strides().last().copied().unwrap_or(1);
     for &position in positions {
       if position >= last {
@@ -264,7 +282,134 @@ impl MultiArray {
           len: last,
         });
       }
+    }
+    for &position in positions {
       self.write_element(position * stride, value)?;
+    }
+    Ok(())
+  }
+
+  /// Reads one element at an index tuple, honoring strides.
+  ///
+  /// Works on non-contiguous (row-padded) arrays that [`Self::as_slice`]
+  /// refuses.
+  ///
+  /// # Errors
+  /// Propagates [`Self::linear_offset`] bound/rank failures and
+  /// dtype-mismatch failures.
+  pub fn read_at<T>(&self, indices: &[usize]) -> Result<T, TensorError>
+  where
+    T: Element,
+  {
+    self.check_dtype::<T>()?;
+    let offset = self.linear_offset(indices)?;
+    // SAFETY: dtype checked above; `offset` is in-bounds because
+    // `linear_offset` only returns successfully for indices already
+    // validated against this array's own shape/strides — the read-side
+    // mirror of `write_element`'s trust boundary.
+    #[allow(deprecated)]
+    let value = unsafe { *self.inner.dataPointer().as_ptr().cast::<T>().add(offset) };
+    Ok(value)
+  }
+
+  /// Gathers the whole logical array into `out`, in row-major order,
+  /// honoring strides.
+  ///
+  /// Unlike [`Self::as_slice`], this works on non-contiguous (row-padded)
+  /// arrays: contiguous arrays are copied in one range read, and padded
+  /// ones are gathered row by row (each row — everything but the last
+  /// dimension — is copied as one contiguous run when the last dimension's
+  /// stride is 1, which holds for every layout this crate produces; a
+  /// per-element fallback covers the case where it doesn't).
+  ///
+  /// # Errors
+  /// [`TensorError::ShapeMismatch`] if `out.len() != self.count()`.
+  /// Dtype-mismatch failures.
+  pub fn copy_into<T>(&self, out: &mut [T]) -> Result<(), TensorError>
+  where
+    T: Element,
+  {
+    self.check_dtype::<T>()?;
+    let count = self.count();
+    if out.len() != count {
+      return Err(TensorError::ShapeMismatch {
+        expected: count,
+        actual: out.len(),
+      });
+    }
+    if self.is_contiguous() {
+      // `as_slice` re-checks dtype (already confirmed above) and
+      // contiguity (just confirmed here), so this cannot fail; reusing it
+      // avoids duplicating the flat-read unsafe block.
+      out.copy_from_slice(self.as_slice::<T>()?);
+      return Ok(());
+    }
+
+    // Padded layout (e.g. `f16_surface`): CoreML only ever pads *between*
+    // rows, never inside one, so a rank >= 1 array's last dimension is one
+    // "row". `is_contiguous` returning false above guarantees rank >= 1
+    // here (a rank-0 shape trivially satisfies `is_contiguous`), so
+    // `shape[..rank - 1]` below never underflows.
+    let shape = self.shape();
+    let strides = self.strides();
+    let rank = shape.len();
+    let last_dim = shape[rank - 1];
+    let last_stride = strides[rank - 1];
+    let leading_dims = &shape[..rank - 1];
+    let leading_strides = &strides[..rank - 1];
+    let num_rows: usize = leading_dims.iter().product();
+
+    let mut row_indices = vec![0usize; leading_dims.len()];
+    for row in 0..num_rows {
+      // Unravel `row` into a multi-index over `leading_dims`, row-major
+      // (the last leading dimension varies fastest).
+      let mut remainder = row;
+      for i in (0..leading_dims.len()).rev() {
+        row_indices[i] = remainder % leading_dims[i];
+        remainder /= leading_dims[i];
+      }
+      let row_start: usize = row_indices
+        .iter()
+        .zip(leading_strides)
+        .map(|(&index, &stride)| index * stride)
+        .sum();
+      let out_start = row * last_dim;
+
+      if last_stride == 1 {
+        // SAFETY: dtype checked above; `row_start` is a valid in-bounds
+        // element offset built from this array's own shape/strides (each
+        // `row_indices[i] < leading_dims[i]`), and the following
+        // `last_dim` elements stay within that same row since its stride
+        // is 1 — the same CoreML shape/strides trust boundary
+        // `write_element` relies on, applied to a whole contiguous row at
+        // once instead of one element.
+        #[allow(deprecated)]
+        let row_slice: &[T] = unsafe {
+          core::slice::from_raw_parts(
+            self.inner.dataPointer().as_ptr().cast::<T>().add(row_start),
+            last_dim,
+          )
+        };
+        out[out_start..out_start + last_dim].copy_from_slice(row_slice);
+      } else {
+        // Fallback: the last dimension itself is strided, so gather it one
+        // element at a time.
+        for last in 0..last_dim {
+          // SAFETY: dtype checked above; `row_start + last * last_stride`
+          // is a valid in-bounds element offset for the same reason as the
+          // contiguous-row branch, one element at a time.
+          #[allow(deprecated)]
+          let value = unsafe {
+            *self
+              .inner
+              .dataPointer()
+              .as_ptr()
+              .cast::<T>()
+              .add(row_start + last * last_stride)
+          };
+          out[out_start + last] = value;
+        }
+      }
     }
     Ok(())
   }
@@ -354,6 +499,11 @@ impl MultiArray {
   /// must fill every element they read.
   ///
   /// # Errors
+  /// [`TensorError::UnsupportedShape`] (reason
+  /// [`ShapeRequirement::NonEmpty`]) if `shape` is empty — a rank-0 shape
+  /// has no last dimension to serve as the pixel buffer width, so
+  /// [`Self::shape`]/[`Self::linear_offset`] on the result would be
+  /// nonsensical rather than merely unusual.
   /// [`TensorError::PixelBuffer`] if CoreVideo rejects the pixel buffer
   /// allocation (for example, a `0`-height buffer from an all-zero shape).
   pub fn f16_surface(shape: &[usize]) -> Result<Self, TensorError> {
@@ -362,6 +512,13 @@ impl MultiArray {
       CVPixelBuffer, CVPixelBufferCreate, kCVPixelBufferIOSurfacePropertiesKey,
       kCVPixelFormatType_OneComponent16Half, kCVReturnSuccess,
     };
+
+    if shape.is_empty() {
+      return Err(TensorError::UnsupportedShape {
+        shape: Vec::new(),
+        reason: ShapeRequirement::NonEmpty,
+      });
+    }
 
     let count: usize = shape.iter().product();
     let width = shape.last().copied().unwrap_or(1).max(1);

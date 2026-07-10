@@ -1,7 +1,7 @@
 use half::f16;
 
 use super::*;
-use crate::{DataType, TensorError};
+use crate::{DataType, ShapeRequirement, TensorError};
 
 #[test]
 fn zeros_has_shape_count_dtype_and_zero_content() {
@@ -107,6 +107,27 @@ fn fill_last_dim_writes_positions() {
 }
 
 #[test]
+fn fill_last_dim_rejects_non_unit_leading_dims() {
+  let mut arr = MultiArray::zeros(&[2, 3, 4], DataType::F32).unwrap();
+  let err = arr.fill_last_dim(&[0], 1.0f32).unwrap_err();
+  assert_eq!(
+    err,
+    TensorError::UnsupportedShape {
+      shape: vec![2, 3, 4],
+      reason: ShapeRequirement::LeadingDimsUnit,
+    }
+  );
+}
+
+#[test]
+fn fill_last_dim_oob_position_leaves_array_untouched() {
+  let mut arr = MultiArray::zeros(&[1, 1, 4], DataType::F32).unwrap();
+  let err = arr.fill_last_dim(&[0, 2, 10], 1.5f32).unwrap_err();
+  assert_eq!(err, TensorError::IndexOutOfBounds { index: 10, len: 4 });
+  assert!(arr.as_slice::<f32>().unwrap().iter().all(|v| *v == 0.0));
+}
+
+#[test]
 fn f16_surface_is_f16_and_writable() {
   let mut arr = MultiArray::f16_surface(&[1, 2, 1, 4]).unwrap();
   assert_eq!(arr.data_type(), DataType::F16);
@@ -151,10 +172,57 @@ fn f16_surface_is_f16_and_writable() {
 }
 
 #[test]
+fn f16_surface_rejects_empty_shape() {
+  let err = MultiArray::f16_surface(&[]).unwrap_err();
+  assert_eq!(
+    err,
+    TensorError::UnsupportedShape {
+      shape: Vec::new(),
+      reason: ShapeRequirement::NonEmpty,
+    }
+  );
+}
+
+#[test]
 fn f16_surface_reports_pixel_buffer_backing() {
   let arr = MultiArray::f16_surface(&[1, 2, 1, 4]).unwrap();
   // SAFETY: accessor send on a live object.
   assert!(unsafe { arr.raw().pixelBuffer() }.is_some());
+}
+
+#[test]
+fn copy_into_and_read_at_round_trip_contiguous() {
+  let data = [1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+  let arr = MultiArray::from_slice(&[2, 3], &data).unwrap();
+  let mut out = [0.0f32; 6];
+  arr.copy_into(&mut out).unwrap();
+  assert_eq!(out, data);
+  assert_eq!(arr.read_at::<f32>(&[0, 0]).unwrap(), 1.0);
+  assert_eq!(arr.read_at::<f32>(&[1, 2]).unwrap(), 6.0);
+}
+
+#[test]
+fn copy_into_and_read_at_expose_padded_second_row() {
+  let mut arr = MultiArray::f16_surface(&[1, 2, 1, 4]).unwrap();
+  if arr.is_contiguous() {
+    // Row padding is an allocator decision; nothing to assert on this host.
+    return;
+  }
+  let row0_value = f16::from_f32(-1.25);
+  let row1_value = f16::from_f32(2.5);
+  arr.fill_at(&[0, 0, 0, 0], row0_value).unwrap();
+  arr.fill_at(&[0, 1, 0, 3], row1_value).unwrap();
+
+  assert_eq!(arr.read_at::<f16>(&[0, 0, 0, 0]).unwrap(), row0_value);
+  assert_eq!(arr.read_at::<f16>(&[0, 1, 0, 3]).unwrap(), row1_value);
+
+  let mut out = [f16::from_f32(0.0); 8];
+  arr.copy_into(&mut out).unwrap();
+  // Row-major flatten of [1,2,1,4]: [0,0,0,0] -> 0, [0,1,0,3] -> 7. Index 7
+  // falls inside row 1 (i1 == 1), the padded row `as_slice` refuses to
+  // expose — the exact gap `copy_into`/`read_at` exist to close.
+  assert_eq!(out[0], row0_value);
+  assert_eq!(out[7], row1_value);
 }
 
 #[test]

@@ -3,7 +3,7 @@
 
 mod common;
 
-use coremlit::{ComputeUnits, DataType, Features, Model, MultiArray, TensorError};
+use coremlit::{ComputeUnits, DataType, Features, Model, MultiArray};
 
 #[test]
 #[ignore = "requires local tiny model (see plan Task 8 Step 1)"]
@@ -49,14 +49,12 @@ fn mel_predict_produces_f16_spectrogram() {
   // buffer (width 3000 padded to a stride of 3008 elements, i.e. the 6000
   // logical bytes per row rounded up to the next 128-byte boundary) — the
   // same ANE-friendly layout `MultiArray::f16_surface` documents for
-  // inputs. `as_slice` correctly refuses to bulk-read that padding as
-  // `TensorError::NonContiguous` rather than misinterpreting it, so the
-  // flat check only runs when CoreML happens to hand back a dense buffer.
-  match mel.as_slice::<half::f16>() {
-    Ok(values) => assert!(values.iter().all(|v| v.to_f32().is_finite())),
-    Err(TensorError::NonContiguous { .. }) => {}
-    Err(e) => panic!("unexpected error reading mel output: {e}"),
-  }
+  // inputs. `copy_into` is stride-aware, so — unlike `as_slice`, which
+  // refuses padded buffers outright — it gathers every logical element
+  // correctly whether or not CoreML happens to hand back a dense buffer.
+  let mut values = vec![half::f16::from_f32(0.0); mel.count()];
+  mel.copy_into(&mut values).unwrap();
+  assert!(values.iter().all(|v| v.to_f32().is_finite()));
 }
 
 #[test]
@@ -82,12 +80,27 @@ fn stateless_model_accepts_state_prediction() {
     return;
   }
   let mut state = model.make_state().unwrap();
-  let audio = MultiArray::zeros(&[480_000], DataType::F32).unwrap();
-  let outputs = model
-    .predict_with_state(&Features::new().with("audio", audio), &mut state)
+  let stateful_audio = MultiArray::zeros(&[480_000], DataType::F32).unwrap();
+  let stateful_outputs = model
+    .predict_with_state(&Features::new().with("audio", stateful_audio), &mut state)
     .unwrap();
-  assert_eq!(
-    outputs.get("melspectrogram_features").unwrap().shape(),
-    vec![1, 80, 1, 3000]
-  );
+  let stateful_mel = stateful_outputs.get("melspectrogram_features").unwrap();
+  assert_eq!(stateful_mel.shape(), vec![1, 80, 1, 3000]);
+
+  let plain_audio = MultiArray::zeros(&[480_000], DataType::F32).unwrap();
+  let plain_outputs = model
+    .predict(&Features::new().with("audio", plain_audio))
+    .unwrap();
+  let plain_mel = plain_outputs.get("melspectrogram_features").unwrap();
+
+  let mut stateful_values = vec![half::f16::from_f32(0.0); stateful_mel.count()];
+  stateful_mel.copy_into(&mut stateful_values).unwrap();
+  let mut plain_values = vec![half::f16::from_f32(0.0); plain_mel.count()];
+  plain_mel.copy_into(&mut plain_values).unwrap();
+
+  // MelSpectrogram declares no state buffers, so `newState()` yields an
+  // empty MLState and stateful prediction must behave identically to plain
+  // `predict` — the invariant `Model::make_state`'s doc promises, now
+  // checked value-for-value instead of shape-only.
+  assert_eq!(stateful_values, plain_values);
 }
