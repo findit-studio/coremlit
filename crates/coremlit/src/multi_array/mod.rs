@@ -572,9 +572,10 @@ impl MultiArray {
   /// [`TensorError::NonContiguous`] rather than silently reading/writing
   /// through the padding; element access ([`Self::fill_at`],
   /// [`Self::fill_last_dim`]) and CoreML's own prediction APIs are
-  /// stride-aware and read/write the correct bytes either way. Unlike
-  /// [`Self::zeros`], the buffer's contents start uninitialized — callers
-  /// must fill every element they read.
+  /// stride-aware and read/write the correct bytes either way. As with
+  /// [`Self::zeros`], this constructor zero-fills the buffer — including any
+  /// inter-row padding — before returning, so every logical element is safe
+  /// to read immediately, whether or not the layout turned out padded.
   ///
   /// # Errors
   /// [`TensorError::UnsupportedShape`] (reason
@@ -666,7 +667,57 @@ impl MultiArray {
     let inner = unsafe {
       MLMultiArray::initWithPixelBuffer_shape(MLMultiArray::alloc(), &buffer, &ns_shape(shape))
     };
-    Ok(Self { inner })
+    let mut this = Self { inner };
+    // CoreML does not guarantee zeroed pixel-buffer memory, same as `zeros`
+    // — but unlike that dense case, this buffer may carry inter-row
+    // padding, so `count()` (the logical element count) would under-cover
+    // it; `zero_padded_f16_span` covers the array's full stride-derived
+    // span instead.
+    let span =
+      shape[0]
+        .checked_mul(this.strides()[0])
+        .ok_or_else(|| TensorError::ShapeOverflow {
+          shape: shape.to_vec(),
+        })?;
+    this.zero_padded_f16_span(span)?;
+    Ok(this)
+  }
+
+  /// Zero-fills `span_elements` half-precision elements starting at
+  /// `dataPointer`.
+  ///
+  /// Distinct from [`Self::fill_bytes_zero`]: that method zero-fills
+  /// exactly [`Self::count`] elements, correct only for the dense,
+  /// unpadded arrays [`Self::zeros`] produces. `span_elements` here is the
+  /// caller-computed *padded* span — the whole buffer a pixel-buffer-backed
+  /// array's first-dimension stride covers, including any inter-row
+  /// padding — so reusing `fill_bytes_zero`'s logical `count()` would leave
+  /// later rows of a padded [`Self::f16_surface`] array uninitialized.
+  ///
+  /// # Errors
+  /// [`TensorError::ShapeOverflow`] if `span_elements * 2` (bytes per `f16`)
+  /// overflows `usize`.
+  fn zero_padded_f16_span(&mut self, span_elements: usize) -> Result<(), TensorError> {
+    let byte_len = span_elements
+      .checked_mul(DataType::F16.size_of().expect("f16 has a known size"))
+      .ok_or_else(|| TensorError::ShapeOverflow {
+        shape: self.shape(),
+      })?;
+    // SAFETY: `initWithPixelBuffer:shape:` succeeded before this is called,
+    // so `dataPointer` is non-null and points at the pixel buffer's backing
+    // store, which is at least `span_elements` `f16`s long — `span_elements`
+    // is `shape[0] * strides()[0]`, and row-major layout (CoreML pads only
+    // *between* rows, never inside one — see `copy_into`'s doc) means the
+    // first dimension's stride times its own extent spans the entire
+    // buffer this array's metadata describes. All-zero bits are a valid
+    // `f16` value (`0.0`), so zero-filling raw bytes produces initialized,
+    // valid elements throughout, closing the gap `as_slice`/`read_at`/
+    // `copy_into` would otherwise read uninitialized memory through.
+    #[allow(deprecated)]
+    unsafe {
+      core::ptr::write_bytes(self.inner.dataPointer().as_ptr().cast::<u8>(), 0, byte_len);
+    }
+    Ok(())
   }
 }
 

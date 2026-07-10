@@ -276,6 +276,50 @@ fn unsupported_shape_displays_reason() {
 }
 
 #[test]
+fn f16_surface_padded_elements_are_zero_before_any_write() {
+  // Same reachable history as the review's PoC: read immediately after
+  // construction, before any write, through the stride-aware `read_at` path
+  // that bypasses the contiguity guard.
+  let arr = MultiArray::f16_surface(&[1, 4]).unwrap();
+  if arr.is_contiguous() {
+    // Row padding is an allocator decision; nothing to assert on this host
+    // (see `f16_surface_contiguous_is_zero_before_any_write` below).
+    return;
+  }
+  let shape = arr.shape();
+  for i0 in 0..shape[0] {
+    for i1 in 0..shape[1] {
+      assert_eq!(
+        arr.read_at::<f16>(&[i0, i1]).unwrap(),
+        f16::from_f32(0.0),
+        "logical index [{i0}, {i1}] was not zeroed"
+      );
+    }
+  }
+}
+
+#[test]
+fn f16_surface_contiguous_is_zero_before_any_write() {
+  // A wide-enough row already satisfies the platform's IOSurface row
+  // alignment with no padding, so this exercises the bulk `as_slice` path
+  // (only reachable when contiguous) reading immediately after
+  // construction, before any write.
+  let arr = MultiArray::f16_surface(&[1, 64]).unwrap();
+  if !arr.is_contiguous() {
+    // Row alignment padded this host's buffer; the padded branch above
+    // already covers the uninitialized-read invariant via `read_at`.
+    return;
+  }
+  assert!(
+    arr
+      .as_slice::<f16>()
+      .unwrap()
+      .iter()
+      .all(|v| *v == f16::from_f32(0.0))
+  );
+}
+
+#[test]
 fn zeros_rejects_shape_overflow() {
   let err = MultiArray::zeros(&[usize::MAX, 2], DataType::F32).unwrap_err();
   assert_eq!(
