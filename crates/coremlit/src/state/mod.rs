@@ -9,6 +9,18 @@ use objc2_core_ml::MLState;
 ///
 /// Created by [`Model::make_state`](crate::Model::make_state); mutated in
 /// place by [`Model::predict_with_state`](crate::Model::predict_with_state).
+///
+/// # Concurrency
+///
+/// `State` is [`Send`] but deliberately **not** [`Sync`]: Apple requires
+/// stateful predictions sharing an `MLState` to be serialized, and
+/// [`Model::predict_with_state`](crate::Model::predict_with_state) enforces
+/// that through `&mut State` exclusivity.
+///
+/// ```compile_fail
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<coremlit::State>();
+/// ```
 #[derive(Debug)]
 pub struct State {
   inner: Retained<MLState>,
@@ -44,3 +56,6 @@ impl State {
     &self.inner
   }
 }
+
+#[cfg(test)]
+mod tests;
