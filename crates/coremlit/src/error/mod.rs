@@ -137,6 +137,14 @@ pub enum TensorError {
     /// Bound it violated.
     len: usize,
   },
+  /// The array's memory layout is not row-major contiguous.
+  #[error("array layout is not contiguous (strides {strides:?} for shape {shape:?})")]
+  NonContiguous {
+    /// The array's shape.
+    shape: Vec<usize>,
+    /// The array's element strides.
+    strides: Vec<usize>,
+  },
   /// The data type cannot back an array (no known element size).
   #[error("unsupported data type `{dtype}` for array construction")]
   UnsupportedDataType {

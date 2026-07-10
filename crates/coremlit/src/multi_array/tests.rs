@@ -112,12 +112,78 @@ fn f16_surface_is_f16_and_writable() {
   assert_eq!(arr.data_type(), DataType::F16);
   assert_eq!(arr.shape(), vec![1, 2, 1, 4]);
   let half_one = f16::from_f32(1.0);
-  arr.as_slice_mut::<f16>().unwrap().fill(half_one);
-  assert!(
-    arr
-      .as_slice::<f16>()
-      .unwrap()
-      .iter()
-      .all(|v| *v == half_one)
-  );
+  if arr.is_contiguous() {
+    arr.as_slice_mut::<f16>().unwrap().fill(half_one);
+    assert!(
+      arr
+        .as_slice::<f16>()
+        .unwrap()
+        .iter()
+        .all(|v| *v == half_one)
+    );
+    return;
+  }
+  // Row-padded on this host: bulk slice views are rejected (see
+  // `padded_surface_rejects_flat_views_but_fills_elementwise`). Write every
+  // element individually and cross-check through CoreML's own
+  // `objectAtIndexedSubscript`, which — per objc2-core-ml's doc ("Get a
+  // value by its linear index (assumes C-style index ordering)") — takes a
+  // logical, shape-derived C-order position and internally re-applies the
+  // array's real strides, an independent read path from this crate's own
+  // `linear_offset`/`write_element`.
+  let shape = arr.shape();
+  for i0 in 0..shape[0] {
+    for i1 in 0..shape[1] {
+      for i2 in 0..shape[2] {
+        for i3 in 0..shape[3] {
+          arr.fill_at(&[i0, i1, i2, i3], half_one).unwrap();
+        }
+      }
+    }
+  }
+  for linear in 0..arr.count() {
+    // SAFETY: accessor send on a live object; `linear` is in `0..count()`,
+    // matching `objectAtIndexedSubscript`'s documented C-style linear
+    // indexing contract.
+    let value = unsafe { arr.raw().objectAtIndexedSubscript(linear as isize) };
+    assert_eq!(value.floatValue(), half_one.to_f32());
+  }
+}
+
+#[test]
+fn f16_surface_reports_pixel_buffer_backing() {
+  let arr = MultiArray::f16_surface(&[1, 2, 1, 4]).unwrap();
+  // SAFETY: accessor send on a live object.
+  assert!(unsafe { arr.raw().pixelBuffer() }.is_some());
+}
+
+#[test]
+fn zeros_arrays_are_contiguous_and_sliceable() {
+  let arr = MultiArray::zeros(&[2, 3], DataType::F32).unwrap();
+  assert!(arr.is_contiguous());
+  assert!(arr.as_slice::<f32>().is_ok());
+}
+
+#[test]
+fn padded_surface_rejects_flat_views_but_fills_elementwise() {
+  let mut arr = MultiArray::f16_surface(&[1, 2, 1, 4]).unwrap();
+  if arr.is_contiguous() {
+    // Row padding is an allocator decision; nothing to assert on this host.
+    return;
+  }
+  assert!(matches!(
+    arr.as_slice::<f16>(),
+    Err(TensorError::NonContiguous { .. })
+  ));
+  assert!(matches!(
+    arr.as_slice_mut::<f16>(),
+    Err(TensorError::NonContiguous { .. })
+  ));
+  arr.fill_at(&[0, 1, 0, 3], f16::from_f32(2.5)).unwrap();
+  let offset = arr.linear_offset(&[0, 1, 0, 3]).unwrap();
+  // `fill_at` wrote through this same stride-derived offset, so this only
+  // confirms the arithmetic is self-consistent; the independent read-back
+  // through CoreML's own `objectAtIndexedSubscript` lives in
+  // `f16_surface_is_f16_and_writable`.
+  assert_eq!(arr.strides()[1] + 3, offset);
 }

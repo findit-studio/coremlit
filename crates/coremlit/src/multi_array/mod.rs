@@ -124,6 +124,25 @@ impl MultiArray {
       .collect()
   }
 
+  /// Whether the elements are laid out contiguously in row-major order.
+  ///
+  /// Arrays from [`Self::zeros`]/[`Self::from_slice`] always are. Pixel-
+  /// buffer-backed arrays ([`Self::f16_surface`]) may carry row padding,
+  /// which surfaces here as non-default strides.
+  pub fn is_contiguous(&self) -> bool {
+    let shape = self.shape();
+    let strides = self.strides();
+    let mut expected = 1usize;
+    // Walk dims minor→major comparing against canonical row-major strides.
+    for (dim, stride) in shape.iter().zip(&strides).rev() {
+      if *stride != expected {
+        return false;
+      }
+      expected *= (*dim).max(1);
+    }
+    true
+  }
+
   /// Total number of elements.
   pub fn count(&self) -> usize {
     // SAFETY: accessor message send on a live object.
@@ -140,16 +159,27 @@ impl MultiArray {
   ///
   /// # Errors
   /// [`TensorError::DataTypeMismatch`] if `T` differs from
-  /// [`Self::data_type`].
+  /// [`Self::data_type`]. [`TensorError::NonContiguous`] if the array's
+  /// memory layout carries padding (see [`Self::is_contiguous`]) — a flat
+  /// slice cannot represent gaps between rows, so it is refused rather than
+  /// silently exposing/hiding padding bytes.
   pub fn as_slice<T>(&self) -> Result<&[T], TensorError>
   where
     T: Element,
   {
     self.check_dtype::<T>()?;
-    // SAFETY: dtype checked; CPU-backed buffer is contiguous for
-    // default-stride arrays; lifetime tied to &self. `dataPointer` is the
-    // only stable way to hand out a borrow (the block-based accessors
-    // scope the pointer to a closure); Swift WhisperKit does the same.
+    if !self.is_contiguous() {
+      return Err(TensorError::NonContiguous {
+        shape: self.shape(),
+        strides: self.strides(),
+      });
+    }
+    // SAFETY: dtype checked; contiguity checked above, so the flat range
+    // `[dataPointer, dataPointer + count * size_of::<T>())` holds exactly
+    // `count()` densely packed elements with no row gaps; lifetime tied to
+    // &self. `dataPointer` is the only stable way to hand out a borrow (the
+    // block-based accessors scope the pointer to a closure); Swift
+    // WhisperKit does the same.
     #[allow(deprecated)]
     Ok(unsafe {
       core::slice::from_raw_parts(self.inner.dataPointer().as_ptr().cast(), self.count())
@@ -160,13 +190,21 @@ impl MultiArray {
   ///
   /// # Errors
   /// [`TensorError::DataTypeMismatch`] if `T` differs from
-  /// [`Self::data_type`].
+  /// [`Self::data_type`]. [`TensorError::NonContiguous`] as in
+  /// [`Self::as_slice`].
   pub fn as_slice_mut<T>(&mut self) -> Result<&mut [T], TensorError>
   where
     T: Element,
   {
     self.check_dtype::<T>()?;
-    // SAFETY: as in `as_slice`, plus exclusivity via &mut self.
+    if !self.is_contiguous() {
+      return Err(TensorError::NonContiguous {
+        shape: self.shape(),
+        strides: self.strides(),
+      });
+    }
+    // SAFETY: as in `as_slice` (dtype and contiguity both checked above),
+    // plus exclusivity via &mut self.
     #[allow(deprecated)]
     Ok(unsafe {
       core::slice::from_raw_parts_mut(self.inner.dataPointer().as_ptr().cast(), self.count())
@@ -205,8 +243,7 @@ impl MultiArray {
     T: Element,
   {
     let offset = self.linear_offset(indices)?;
-    self.as_slice_mut::<T>()?[offset] = value;
-    Ok(())
+    self.write_element(offset, value)
   }
 
   /// Writes `value` at each `position` of the final axis.
@@ -220,7 +257,6 @@ impl MultiArray {
   {
     let last = self.shape().last().copied().unwrap_or(0);
     let stride = self.strides().last().copied().unwrap_or(1);
-    let slice = self.as_slice_mut::<T>()?;
     for &position in positions {
       if position >= last {
         return Err(TensorError::IndexOutOfBounds {
@@ -228,7 +264,7 @@ impl MultiArray {
           len: last,
         });
       }
-      slice[position * stride] = value;
+      self.write_element(position * stride, value)?;
     }
     Ok(())
   }
@@ -260,6 +296,25 @@ impl MultiArray {
     Ok(())
   }
 
+  /// Writes `value` at a stride-derived element `offset`, bypassing
+  /// [`Self::as_slice_mut`] so padded (non-contiguous) arrays stay writable
+  /// through [`Self::fill_at`]/[`Self::fill_last_dim`].
+  fn write_element<T>(&mut self, offset: usize, value: T) -> Result<(), TensorError>
+  where
+    T: Element,
+  {
+    self.check_dtype::<T>()?;
+    // Bound: offset was computed from in-range indices against this
+    // array's own strides, so it lies within the allocation.
+    // SAFETY: dtype checked; exclusive access via &mut self; in-bounds per
+    // the stride-derived offset argument above.
+    #[allow(deprecated)]
+    unsafe {
+      *self.inner.dataPointer().as_ptr().cast::<T>().add(offset) = value;
+    }
+    Ok(())
+  }
+
   fn fill_bytes_zero(&mut self) {
     let byte_len = self.count()
       * self
@@ -270,7 +325,11 @@ impl MultiArray {
     // `data_type()`, and the allocation backing it is at least
     // `count() * size_of(data_type())` bytes — guaranteed because every
     // constructor validates the dtype before the CoreML allocation call
-    // (see `zeros`), so `byte_len` never exceeds the buffer.
+    // (see `zeros`), so `byte_len` never exceeds the buffer. This method is
+    // only ever called from `zeros`, whose `initWithShape_dataType_error`
+    // allocation is always row-major contiguous (no padding), so a flat
+    // `byte_len`-sized zero-fill covers exactly the array's elements with
+    // no gaps to skip.
     #[allow(deprecated)]
     unsafe {
       core::ptr::write_bytes(self.inner.dataPointer().as_ptr().cast::<u8>(), 0, byte_len);
@@ -285,6 +344,16 @@ impl MultiArray {
   /// CoreML shares IOSurface-backed `f16` buffers with the ANE without
   /// copies; WhisperKit allocates every f16 tensor this way. Width is the
   /// last dimension (minimum 1); height is `count / width`.
+  ///
+  /// The IOSurface may pad each row out to a platform-chosen alignment, so
+  /// the result is not guaranteed [`Self::is_contiguous`]. When padded,
+  /// bulk access via [`Self::as_slice`]/[`Self::as_slice_mut`] returns
+  /// [`TensorError::NonContiguous`] rather than silently reading/writing
+  /// through the padding; element access ([`Self::fill_at`],
+  /// [`Self::fill_last_dim`]) and CoreML's own prediction APIs are
+  /// stride-aware and read/write the correct bytes either way. Unlike
+  /// [`Self::zeros`], the buffer's contents start uninitialized — callers
+  /// must fill every element they read.
   ///
   /// # Errors
   /// [`TensorError::PixelBuffer`] if CoreVideo rejects the pixel buffer
@@ -344,7 +413,10 @@ impl MultiArray {
     // `MLMultiArrayDataTypeFloat16`; `shape`'s last dimension equals `width`
     // and the product of the remaining dimensions equals `height`, matching
     // the pixel buffer's dimensions as the API's documented contract
-    // requires.
+    // requires. Ownership: per objc2-core-ml's doc for this initializer,
+    // "the pixel buffer [is] to be owned by the instance" — i.e. `inner`
+    // retains `buffer` itself, so it is sound for the local `CFRetained`
+    // binding to drop (release its own +1) once this function returns.
     let inner = unsafe {
       MLMultiArray::initWithPixelBuffer_shape(MLMultiArray::alloc(), &buffer, &ns_shape(shape))
     };
