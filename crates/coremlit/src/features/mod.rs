@@ -13,9 +13,15 @@ use crate::{MultiArray, NsErrorInfo, PredictionError};
 /// An insertion-ordered set of named [`MultiArray`]s.
 ///
 /// The input and output currency of [`Model::predict`](crate::Model::predict).
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct Features {
   entries: Vec<(String, MultiArray)>,
+}
+
+impl Default for Features {
+  fn default() -> Self {
+    Self::new()
+  }
 }
 
 impl Features {
@@ -28,6 +34,8 @@ impl Features {
   }
 
   /// Inserts (or replaces) a named array.
+  ///
+  /// Replacing an existing name moves it to the end of iteration order.
   pub fn insert(&mut self, name: impl Into<String>, array: MultiArray) -> &mut Self {
     let name = name.into();
     self.entries.retain(|(existing, _)| *existing != name);
