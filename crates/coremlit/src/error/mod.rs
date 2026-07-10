@@ -17,7 +17,6 @@ pub struct NsErrorInfo {
 
 impl NsErrorInfo {
   /// Construct from a live `NSError` reference.
-  #[allow(dead_code)] // consumed from Task 4 (Model)
   pub(crate) fn from_ns_error(error: &NSError) -> Self {
     // Plain accessor message sends on a live NSError reference.
     let (domain, code, message) = (

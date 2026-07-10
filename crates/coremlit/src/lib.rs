@@ -10,8 +10,10 @@
 
 mod dtype;
 mod error;
+mod multi_array;
 mod units;
 
 pub use dtype::DataType;
 pub use error::{CompileError, LoadError, NsErrorInfo, PredictionError, TensorError};
+pub use multi_array::{Element, MultiArray};
 pub use units::{ComputeUnits, ParseComputeUnitsError};
