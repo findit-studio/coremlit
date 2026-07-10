@@ -13,6 +13,7 @@ mod error;
 mod features;
 mod model;
 mod multi_array;
+mod state;
 mod units;
 
 pub use dtype::DataType;
@@ -20,4 +21,5 @@ pub use error::{CompileError, LoadError, NsErrorInfo, PredictionError, TensorErr
 pub use features::Features;
 pub use model::{FeatureInfo, Model, ModelDescription};
 pub use multi_array::{Element, MultiArray};
+pub use state::State;
 pub use units::{ComputeUnits, ParseComputeUnitsError};

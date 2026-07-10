@@ -99,6 +99,9 @@ pub enum PredictionError {
   /// CoreML reported a prediction failure.
   #[error("core ml prediction failed: {0}")]
   Native(NsErrorInfo),
+  /// Stateful prediction requires macOS 15 (MLState).
+  #[error("stateful prediction is unavailable on this OS (requires macOS 15)")]
+  StateUnsupported,
 }
 
 /// Failure constructing or viewing a multi-array.

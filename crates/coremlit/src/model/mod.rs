@@ -223,6 +223,62 @@ impl Model {
   pub fn prewarm(path: impl AsRef<Path>, units: ComputeUnits) -> Result<(), LoadError> {
     Self::load(path, units).map(drop)
   }
+
+  /// Whether this OS supports stateful prediction (macOS 15+).
+  ///
+  /// Backs the availability guard in both [`Self::make_state`] and
+  /// [`Self::predict_with_state`].
+  pub fn supports_state(&self) -> bool {
+    use objc2::runtime::NSObjectProtocol;
+    self.inner.respondsToSelector(objc2::sel!(newState))
+  }
+
+  /// Creates fresh model state for stateful prediction.
+  ///
+  /// CoreML defines `newState()` on a model with no declared state buffers
+  /// (e.g. WhisperKit's `MelSpectrogram`) as returning an *empty* state;
+  /// running [`Self::predict_with_state`] with that state then behaves
+  /// identically to [`Self::predict`]. Confirmed against `MelSpectrogram` in
+  /// this crate's integration tests — TTSKit's genuinely stateful models
+  /// exercise the buffer-carrying path this type exists for.
+  ///
+  /// # Errors
+  /// [`PredictionError::StateUnsupported`] before macOS 15.
+  pub fn make_state(&self) -> Result<crate::State, PredictionError> {
+    if !self.supports_state() {
+      return Err(PredictionError::StateUnsupported);
+    }
+    // SAFETY: availability probed above.
+    Ok(crate::State::from_raw(unsafe { self.inner.newState() }))
+  }
+
+  /// Runs a synchronous stateful prediction, mutating `state` in place.
+  ///
+  /// On an empty state (see [`Self::make_state`]) this behaves identically
+  /// to [`Self::predict`].
+  ///
+  /// # Errors
+  /// [`PredictionError::StateUnsupported`] before macOS 15;
+  /// [`PredictionError::Native`] on CoreML failure.
+  pub fn predict_with_state(
+    &self,
+    inputs: &Features,
+    state: &mut crate::State,
+  ) -> Result<Features, PredictionError> {
+    if !self.supports_state() {
+      return Err(PredictionError::StateUnsupported);
+    }
+    let provider = inputs.to_provider()?;
+    // SAFETY: provider + state are live; &mut state gives exclusivity.
+    let outputs = unsafe {
+      self.inner.predictionFromFeatures_usingState_error(
+        objc2::runtime::ProtocolObject::from_ref(&*provider),
+        state.raw(),
+      )
+    }
+    .map_err(|e| PredictionError::Native(NsErrorInfo::from_ns_error(&e)))?;
+    Features::from_provider(&outputs)
+  }
 }
 
 #[cfg(test)]

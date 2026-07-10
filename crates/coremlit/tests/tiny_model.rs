@@ -68,3 +68,26 @@ fn prewarm_loads_and_drops() {
   )
   .unwrap();
 }
+
+#[test]
+#[ignore = "requires local tiny model (see plan Task 8 Step 1)"]
+fn stateless_model_accepts_state_prediction() {
+  let model = Model::load(
+    common::tiny_dir().join("MelSpectrogram.mlmodelc"),
+    ComputeUnits::CpuOnly,
+  )
+  .unwrap();
+  if !model.supports_state() {
+    eprintln!("skipping: MLState unavailable on this OS");
+    return;
+  }
+  let mut state = model.make_state().unwrap();
+  let audio = MultiArray::zeros(&[480_000], DataType::F32).unwrap();
+  let outputs = model
+    .predict_with_state(&Features::new().with("audio", audio), &mut state)
+    .unwrap();
+  assert_eq!(
+    outputs.get("melspectrogram_features").unwrap().shape(),
+    vec![1, 80, 1, 3000]
+  );
+}
