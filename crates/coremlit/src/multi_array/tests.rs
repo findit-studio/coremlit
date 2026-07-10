@@ -73,3 +73,35 @@ fn zeros_rejects_unknown_dtype() {
     }
   );
 }
+
+#[test]
+fn linear_offset_uses_strides() {
+  let arr = MultiArray::zeros(&[2, 3, 4], DataType::F32).unwrap();
+  assert_eq!(arr.linear_offset(&[0, 0, 0]).unwrap(), 0);
+  assert_eq!(arr.linear_offset(&[1, 2, 3]).unwrap(), 23);
+  assert_eq!(
+    arr.linear_offset(&[1, 2]).unwrap_err(),
+    TensorError::RankMismatch {
+      expected: 3,
+      actual: 2
+    }
+  );
+  assert_eq!(
+    arr.linear_offset(&[0, 3, 0]).unwrap_err(),
+    TensorError::IndexOutOfBounds { index: 3, len: 3 }
+  );
+}
+
+#[test]
+fn fill_at_writes_one_element() {
+  let mut arr = MultiArray::zeros(&[2, 2], DataType::F32).unwrap();
+  arr.fill_at(&[1, 0], 7.0f32).unwrap();
+  assert_eq!(arr.as_slice::<f32>().unwrap(), &[0.0, 0.0, 7.0, 0.0]);
+}
+
+#[test]
+fn fill_last_dim_writes_positions() {
+  let mut arr = MultiArray::zeros(&[1, 1, 4], DataType::F32).unwrap();
+  arr.fill_last_dim(&[0, 2], 1.5f32).unwrap();
+  assert_eq!(arr.as_slice::<f32>().unwrap(), &[1.5, 0.0, 1.5, 0.0]);
+}

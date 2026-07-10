@@ -173,6 +173,66 @@ impl MultiArray {
     })
   }
 
+  /// Linear element offset of an index tuple, honoring strides.
+  ///
+  /// # Errors
+  /// [`TensorError::RankMismatch`] / [`TensorError::IndexOutOfBounds`].
+  pub fn linear_offset(&self, indices: &[usize]) -> Result<usize, TensorError> {
+    let shape = self.shape();
+    if indices.len() != shape.len() {
+      return Err(TensorError::RankMismatch {
+        expected: shape.len(),
+        actual: indices.len(),
+      });
+    }
+    let strides = self.strides();
+    let mut offset = 0usize;
+    for ((&index, &dim), &stride) in indices.iter().zip(&shape).zip(&strides) {
+      if index >= dim {
+        return Err(TensorError::IndexOutOfBounds { index, len: dim });
+      }
+      offset += index * stride;
+    }
+    Ok(offset)
+  }
+
+  /// Writes `value` at one index tuple.
+  ///
+  /// # Errors
+  /// Propagates [`Self::linear_offset`] and dtype-mismatch failures.
+  pub fn fill_at<T>(&mut self, indices: &[usize], value: T) -> Result<(), TensorError>
+  where
+    T: Element,
+  {
+    let offset = self.linear_offset(indices)?;
+    self.as_slice_mut::<T>()?[offset] = value;
+    Ok(())
+  }
+
+  /// Writes `value` at each `position` of the final axis.
+  ///
+  /// # Errors
+  /// [`TensorError::IndexOutOfBounds`] if a position exceeds the final
+  /// axis; dtype-mismatch failures from the typed view.
+  pub fn fill_last_dim<T>(&mut self, positions: &[usize], value: T) -> Result<(), TensorError>
+  where
+    T: Element,
+  {
+    let last = self.shape().last().copied().unwrap_or(0);
+    let stride = self.strides().last().copied().unwrap_or(1);
+    let slice = self.as_slice_mut::<T>()?;
+    for &position in positions {
+      if position >= last {
+        return Err(TensorError::IndexOutOfBounds {
+          index: position,
+          len: last,
+        });
+      }
+      slice[position * stride] = value;
+    }
+    Ok(())
+  }
+
   #[allow(dead_code)] // consumed from Task 7 (Features)
   pub(crate) fn raw(&self) -> &MLMultiArray {
     &self.inner
