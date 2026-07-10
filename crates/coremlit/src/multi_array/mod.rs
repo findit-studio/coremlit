@@ -269,7 +269,6 @@ impl MultiArray {
     Ok(())
   }
 
-  #[allow(dead_code)] // consumed from Task 7 (Features)
   pub(crate) fn raw(&self) -> &MLMultiArray {
     &self.inner
   }
@@ -277,7 +276,6 @@ impl MultiArray {
   // INVARIANT: callers must pass the sole `Retained` reference to this
   // array. `Send` and `as_slice_mut`'s exclusivity both assume no aliased
   // handle exists (Retained is Clone, so this cannot be enforced by type).
-  #[allow(dead_code)] // consumed from Task 7 (Features)
   pub(crate) fn from_raw(inner: Retained<MLMultiArray>) -> Self {
     Self { inner }
   }
