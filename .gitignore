@@ -13,6 +13,6 @@
 
 
 # Added by cargo
+**docs/
+**.claude/
 
-/target
-Cargo.lock
