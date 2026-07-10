@@ -205,8 +205,8 @@ impl Model {
     // caller still owns `inputs`), so an identity/zero-copy model echoing
     // one back as an output is the same aliasing hazard as two output names
     // sharing one array, which `from_provider` also catches on its own.
-    let mut known_ptrs = inputs.data_ptrs();
-    Features::from_provider(&outputs, &mut known_ptrs)
+    let mut known_regions = inputs.byte_ranges();
+    Features::from_provider(&outputs, &mut known_regions)
   }
 
   /// Compiles an `.mlpackage`/`.mlmodel` to a temporary `.mlmodelc`.
@@ -301,10 +301,10 @@ impl Model {
       )
     }
     .map_err(|e| PredictionError::Native(NsErrorInfo::from_ns_error(&e)))?;
-    // See `predict`'s comment: inputs outlive this call, so seed known_ptrs
+    // See `predict`'s comment: inputs outlive this call, so seed known_regions
     // with their buffer identities too.
-    let mut known_ptrs = inputs.data_ptrs();
-    Features::from_provider(&outputs, &mut known_ptrs)
+    let mut known_regions = inputs.byte_ranges();
+    Features::from_provider(&outputs, &mut known_regions)
   }
 }
 

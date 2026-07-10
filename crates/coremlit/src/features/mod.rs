@@ -78,14 +78,17 @@ impl Features {
     self.entries.is_empty()
   }
 
-  // Every array's native buffer identity, in insertion order. Seeds
+  // Every array's addressed byte region, in insertion order. Seeds
   // `from_provider`'s aliasing detection: `Model::predict` calls this on
   // its *inputs* before extracting outputs, because an input outlives the
   // call (the caller still owns it) — an output that echoes an input's
   // buffer (an identity/zero-copy model) is exactly the aliasing case
   // `from_provider` must catch, same as one array under two output names.
-  pub(crate) fn data_ptrs(&self) -> Vec<*const core::ffi::c_void> {
-    self.entries.iter().map(|(_, a)| a.data_ptr()).collect()
+  // Regions rather than bare pointers: an output VIEW offset inside
+  // another array's buffer aliases without pointer equality, so overlap
+  // of `[start, end)` ranges is the detection criterion.
+  pub(crate) fn byte_ranges(&self) -> Vec<(usize, usize)> {
+    self.entries.iter().map(|(_, a)| a.byte_range()).collect()
   }
 
   // Bridges to CoreML's `MLDictionaryFeatureProvider`, the concrete
@@ -140,19 +143,21 @@ impl Features {
   // `provider` pointing at the same array. `MultiArray::from_raw`'s
   // sole-ownership invariant is therefore not met by `provider` alone.
   //
-  // `known_ptrs` closes every one of those gaps: callers seed it with the
-  // `data_ptr` of every array that could be aliased and outlives this call
-  // (`Model::predict` seeds it with every input's, via `Features::data_ptrs`
-  // — inputs are exactly the case a duplicate-output-provider fixture can't
-  // reach on its own). Each extracted array whose `data_ptr` is already
-  // present is deep-copied into a freshly allocated, uniquely owned buffer
-  // before being inserted; either way, its (possibly new) `data_ptr` is
-  // then pushed, so a *third* name aliasing the same original buffer is
-  // caught too. With that, dropping the output provider immediately after
-  // calling this function (as `Model::predict` does) restores effective
-  // sole ownership of every array extracted here unconditionally — any
-  // surviving alias was already copied, not just the ones the provider
-  // itself would release.
+  // `known_regions` closes every one of those gaps: callers seed it with
+  // the addressed byte region of every array that could be aliased and
+  // outlives this call (`Model::predict` seeds it with every input's, via
+  // `Features::byte_ranges` — inputs are exactly the case a
+  // duplicate-output-provider fixture can't reach on its own). Each
+  // extracted array whose region OVERLAPS a known one — overlap, not
+  // pointer equality, so an offset view inside another buffer is caught —
+  // is deep-copied into a freshly allocated, uniquely owned buffer before
+  // being inserted; either way, its (possibly new) region is then pushed,
+  // so a *third* name aliasing the same original buffer is caught too.
+  // With that, dropping the output provider immediately after calling this
+  // function (as `Model::predict` does) restores effective sole ownership
+  // of every array extracted here unconditionally — any surviving alias
+  // was already copied, not just the ones the provider itself would
+  // release.
   //
   // Extracted arrays may also be non-contiguous (row-padded, as pixel-
   // buffer-backed arrays can be): `MultiArray::as_slice`/`as_slice_mut`
@@ -160,8 +165,11 @@ impl Features {
   // misreading the padding, so nothing extra is needed here.
   pub(crate) fn from_provider(
     provider: &ProtocolObject<dyn MLFeatureProvider>,
-    known_ptrs: &mut Vec<*const core::ffi::c_void>,
+    known_regions: &mut Vec<(usize, usize)>,
   ) -> Result<Self, PredictionError> {
+    fn overlaps(a: (usize, usize), b: (usize, usize)) -> bool {
+      a.0 < b.1 && b.0 < a.1
+    }
     let mut features = Self::new();
     // SAFETY: protocol getter message send on a live provider.
     let names = unsafe { provider.featureNames() };
@@ -181,12 +189,13 @@ impl Features {
           name: name_str.clone(),
         })?;
       let mut array = MultiArray::from_raw(array);
-      if known_ptrs.contains(&array.data_ptr()) {
+      let region = array.byte_range();
+      if known_regions.iter().any(|&known| overlaps(known, region)) {
         array = array
           .deep_copy()
           .map_err(PredictionError::AliasCopyFailed)?;
       }
-      known_ptrs.push(array.data_ptr());
+      known_regions.push(array.byte_range());
       features.insert(name_str, array);
     }
     Ok(features)

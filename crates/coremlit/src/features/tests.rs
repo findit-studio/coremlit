@@ -70,7 +70,7 @@ fn from_provider_deep_copies_one_array_shared_under_two_names() {
 
   let a = extracted.get("a").unwrap();
   let b = extracted.get("b").unwrap();
-  assert_ne!(a.data_ptr(), b.data_ptr());
+  assert_ne!(a.byte_range().0, b.byte_range().0);
   assert_eq!(a.as_slice::<f32>().unwrap(), b.as_slice::<f32>().unwrap());
 
   // Mutating one must not affect the other now that they own separate
@@ -86,7 +86,7 @@ fn from_provider_deep_copies_output_that_aliases_a_seeded_input() {
   // The identity/zero-copy model case: an output feature literally is one
   // of the caller's own (still-live) input arrays.
   let input = MultiArray::from_slice(&[2], &[5.0f32, 6.0]).unwrap();
-  let input_ptr = input.data_ptr();
+  let input_ptr = input.byte_range().0;
 
   // SAFETY: as in `Features::to_provider`.
   let value: Retained<MLFeatureValue> =
@@ -105,12 +105,12 @@ fn from_provider_deep_copies_output_that_aliases_a_seeded_input() {
   .unwrap();
 
   // Simulates what `Model::predict` does before extracting: seed
-  // `known_ptrs` with every live input's `data_ptr`.
+  // `known_regions` with every live input's byte range.
   let mut known_ptrs = vec![input_ptr];
   let extracted =
     Features::from_provider(ProtocolObject::from_ref(&*provider), &mut known_ptrs).unwrap();
   let output = extracted.get("y").unwrap();
-  assert_ne!(output.data_ptr(), input_ptr);
+  assert_ne!(output.byte_range().0, input_ptr);
   assert_eq!(output.as_slice::<f32>().unwrap(), &[5.0, 6.0]);
 }
 
@@ -123,4 +123,23 @@ fn insert_replacing_moves_name_to_end() {
   features.insert("a", MultiArray::zeros(&[9], DataType::F32).unwrap());
   assert_eq!(features.names().collect::<Vec<_>>(), vec!["b", "a"]);
   assert_eq!(features.get("a").unwrap().count(), 9);
+}
+
+#[test]
+fn overlapping_offset_regions_are_detected() {
+  // Regions are half-open [start, end): a view starting inside another
+  // array's span must collide even without pointer equality.
+  let base = MultiArray::from_slice(&[8], &[0.0f32; 8]).unwrap();
+  let (start, end) = base.byte_range();
+  assert_eq!(end - start, 8 * 4);
+  let mut known = vec![(start, end)];
+  let offset_view = (start + 8, start + 16); // bytes 8..16 inside base
+  assert!(
+    known
+      .iter()
+      .any(|&k| k.0 < offset_view.1 && offset_view.0 < k.1)
+  );
+  let adjacent = (end, end + 16); // begins exactly at end: no overlap
+  assert!(!known.iter().any(|&k| k.0 < adjacent.1 && adjacent.0 < k.1));
+  known.push(adjacent);
 }

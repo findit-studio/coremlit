@@ -526,19 +526,29 @@ impl MultiArray {
     }
   }
 
-  /// This array's native buffer identity, as an opaque pointer value.
+  /// This array's addressed byte region, as opaque `[start, end)` values.
   ///
-  /// Never dereferenced through this crate; used only as an equality key to
-  /// detect when two [`MultiArray`]s alias the same underlying storage (see
-  /// [`crate::Features::from_provider`]).
-  pub(crate) fn data_ptr(&self) -> *const core::ffi::c_void {
+  /// Never dereferenced through this crate; used only to detect when two
+  /// [`MultiArray`]s alias OVERLAPPING storage (see
+  /// [`crate::Features::from_provider`]) — exact-pointer equality alone
+  /// would miss a view offset inside another array's buffer. The span is
+  /// the physical row-major extent (`shape[0] * strides[0]` elements for
+  /// rank ≥ 1); trust-boundary arithmetic saturates, so a provider
+  /// reporting absurd geometry yields a conservatively HUGE range, which
+  /// can only force an unnecessary copy — never miss a real overlap.
+  pub(crate) fn byte_range(&self) -> (usize, usize) {
     // SAFETY: `dataPointer` is a plain accessor message send on a live
-    // object; the returned pointer is used only as an opaque identity
+    // object; the returned pointer is used only as an opaque address
     // value here, never read through.
     #[allow(deprecated)]
-    unsafe {
-      self.inner.dataPointer().as_ptr().cast_const()
-    }
+    let start = unsafe { self.inner.dataPointer().as_ptr() as usize };
+    let elem = self.data_type().size_of().unwrap_or(1);
+    let span_elements = match (self.shape().first(), self.strides().first()) {
+      (Some(&dim0), Some(&stride0)) => dim0.saturating_mul(stride0).max(self.count()),
+      _ => self.count().max(1),
+    };
+    let span_bytes = span_elements.saturating_mul(elem).max(1);
+    (start, start.saturating_add(span_bytes))
   }
 
   pub(crate) fn raw(&self) -> &MLMultiArray {
