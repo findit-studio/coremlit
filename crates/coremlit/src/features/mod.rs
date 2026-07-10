@@ -72,7 +72,6 @@ impl Features {
 
   // Bridges to CoreML's `MLDictionaryFeatureProvider`, the concrete
   // `MLFeatureProvider` used to feed `Model::predict` (Task 9).
-  #[allow(dead_code)] // consumed from Task 9 (Model::predict)
   pub(crate) fn to_provider(
     &self,
   ) -> Result<Retained<MLDictionaryFeatureProvider>, PredictionError> {
@@ -130,7 +129,6 @@ impl Features {
   // buffer-backed arrays can be): `MultiArray::as_slice`/`as_slice_mut`
   // already refuse those with `TensorError::NonContiguous` rather than
   // misreading the padding, so nothing extra is needed here.
-  #[allow(dead_code)] // consumed from Task 9 (Model::predict)
   pub(crate) fn from_provider(
     provider: &ProtocolObject<dyn MLFeatureProvider>,
   ) -> Result<Self, PredictionError> {

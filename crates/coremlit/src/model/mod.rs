@@ -6,7 +6,9 @@ use objc2::rc::Retained;
 use objc2_core_ml::{MLModel, MLModelConfiguration};
 use objc2_foundation::NSURL;
 
-use crate::{ComputeUnits, DataType, LoadError, NsErrorInfo};
+use crate::{
+  CompileError, ComputeUnits, DataType, Features, LoadError, NsErrorInfo, PredictionError,
+};
 
 /// A loaded CoreML model.
 ///
@@ -164,9 +166,62 @@ impl Model {
     &self.description
   }
 
-  #[allow(dead_code)] // consumed from Task 9 (Model::predict)
   pub(crate) fn raw(&self) -> &MLModel {
     &self.inner
+  }
+
+  /// Runs a synchronous prediction.
+  ///
+  /// # Errors
+  /// [`PredictionError::Native`] if CoreML fails; missing/mistyped outputs
+  /// surface as structured variants when extracted.
+  pub fn predict(&self, inputs: &Features) -> Result<Features, PredictionError> {
+    let provider = inputs.to_provider()?;
+    // SAFETY: provider conforms to MLFeatureProvider; blocking call.
+    let outputs = unsafe {
+      self
+        .raw()
+        .predictionFromFeatures_error(objc2::runtime::ProtocolObject::from_ref(&*provider))
+    }
+    .map_err(|e| PredictionError::Native(NsErrorInfo::from_ns_error(&e)))?;
+    Features::from_provider(&outputs)
+  }
+
+  /// Compiles an `.mlpackage`/`.mlmodel` to a temporary `.mlmodelc`.
+  ///
+  /// Callers move the returned directory to a permanent location.
+  ///
+  /// # Errors
+  /// [`CompileError::NotFound`] / [`CompileError::Native`].
+  pub fn compile(source: impl AsRef<Path>) -> Result<std::path::PathBuf, CompileError> {
+    let source = source.as_ref();
+    if !source.exists() {
+      return Err(CompileError::NotFound {
+        path: source.to_path_buf(),
+      });
+    }
+    let url = NSURL::fileURLWithPath(&objc2_foundation::NSString::from_str(
+      &source.to_string_lossy(),
+    ));
+    // SAFETY: blocking compile; Result-checked. The sync API is deprecated
+    // in favor of the async block variant, which this sync crate
+    // deliberately does not use.
+    #[allow(deprecated)]
+    let compiled = unsafe { MLModel::compileModelAtURL_error(&url) }
+      .map_err(|e| CompileError::Native(NsErrorInfo::from_ns_error(&e)))?;
+    let path = compiled.path().expect("compiled model URL has a path");
+    Ok(std::path::PathBuf::from(path.to_string()))
+  }
+
+  /// Loads a model and immediately drops it.
+  ///
+  /// Serializes ANE compilation and caps peak memory before a real
+  /// concurrent load — ports Swift's `prewarmMode`.
+  ///
+  /// # Errors
+  /// As [`Self::load`].
+  pub fn prewarm(path: impl AsRef<Path>, units: ComputeUnits) -> Result<(), LoadError> {
+    Self::load(path, units).map(drop)
   }
 }
 
