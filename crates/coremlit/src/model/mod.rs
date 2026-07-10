@@ -12,19 +12,35 @@ use crate::{
 
 /// A loaded CoreML model.
 ///
-/// `MLModel` prediction is thread-safe, so `Model` is `Send + Sync`; share
-/// one instance across worker threads.
+/// # Concurrency
+///
+/// `Model` is [`Send`] but deliberately **not** [`Sync`]: Apple documents,
+/// "Use an MLModel instance on one thread or one dispatch queue at a
+/// time" — concurrent `&Model` access from multiple threads is outside that
+/// contract. Callers that want to fan prediction work out across threads
+/// need one `Model` per worker (each independently loaded, or all
+/// serialized behind an external `Mutex`) rather than sharing one instance.
+///
+/// ```compile_fail
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<coremlit::Model>();
+/// ```
 #[derive(Debug)]
 pub struct Model {
   inner: Retained<MLModel>,
   description: ModelDescription,
 }
 
-// SAFETY: Apple documents MLModel prediction as thread-safe; the wrapper
-// exposes no unsynchronized interior mutation.
+// SAFETY: Apple's contract is about serialization ("one thread or one
+// dispatch queue at a time"), not confinement to the thread that loaded the
+// model, so moving a `Model` to another thread and continuing to use it
+// only from there afterward is exactly the documented usage pattern; the
+// wrapper also exposes no unsynchronized interior mutation for the move
+// itself to race against. Deliberately not `Sync` (see the `# Concurrency`
+// doc section above) — that would permit *concurrent* `&Model` access from
+// multiple threads, which Apple's "one thread ... at a time" contract rules
+// out.
 unsafe impl Send for Model {}
-// SAFETY: as above.
-unsafe impl Sync for Model {}
 
 /// Shape/type info for one model input or output feature.
 #[derive(Debug, Clone, PartialEq, Eq)]
