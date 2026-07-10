@@ -182,6 +182,10 @@ pub enum TensorError {
     /// The offending shape.
     shape: Vec<usize>,
   },
+  /// `MLMultiArray`'s pixel-buffer-backed initializer is unavailable on
+  /// this OS.
+  #[error("pixel-buffer-backed arrays require macOS 12 or newer")]
+  SurfaceUnsupported,
 }
 
 /// Why a shape was rejected by [`TensorError::UnsupportedShape`].

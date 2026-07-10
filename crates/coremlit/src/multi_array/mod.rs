@@ -1,7 +1,7 @@
 //! Owned, typed N-dimensional CoreML arrays.
 
 use half::f16;
-use objc2::{AnyThread, rc::Retained};
+use objc2::{AnyThread, ClassType, rc::Retained};
 use objc2_core_ml::{MLMultiArray, MLMultiArrayDataType};
 use objc2_foundation::{NSArray, NSNumber};
 
@@ -51,6 +51,21 @@ unsafe impl Send for MultiArray {}
 fn ns_shape(shape: &[usize]) -> Retained<NSArray<NSNumber>> {
   let numbers: Vec<Retained<NSNumber>> = shape.iter().map(|d| NSNumber::new_usize(*d)).collect();
   NSArray::from_retained_slice(&numbers)
+}
+
+impl MultiArray {
+  /// Whether this OS provides `MLMultiArray`'s pixel-buffer initializer
+  /// (macOS 12+), the capability behind [`Self::f16_surface`].
+  pub fn supports_surface() -> bool {
+    // SAFETY: `instancesRespondToSelector:` is a plain class-object query.
+    unsafe {
+      let responds: bool = objc2::msg_send![
+        MLMultiArray::class(),
+        instancesRespondToSelector: objc2::sel!(initWithPixelBuffer:shape:)
+      ];
+      responds
+    }
+  }
 }
 
 /// `shape`'s element count, rejecting `usize` overflow.
@@ -634,12 +649,20 @@ impl MultiArray {
   /// product) before any native allocation.
   /// [`TensorError::PixelBuffer`] if CoreVideo rejects the pixel buffer
   /// allocation (for example, a `0`-height buffer from an all-zero shape).
+  /// [`TensorError::SurfaceUnsupported`] before macOS 12, where
+  /// `MLMultiArray` has no pixel-buffer initializer — probed at runtime so
+  /// the unrecognized selector surfaces as an error, never an Objective-C
+  /// exception.
   pub fn f16_surface(shape: &[usize]) -> Result<Self, TensorError> {
     use objc2_core_foundation::{CFDictionary, CFRetained, CFType};
     use objc2_core_video::{
       CVPixelBuffer, CVPixelBufferCreate, kCVPixelBufferIOSurfacePropertiesKey,
       kCVPixelFormatType_OneComponent16Half, kCVReturnSuccess,
     };
+
+    if !Self::supports_surface() {
+      return Err(TensorError::SurfaceUnsupported);
+    }
 
     if shape.is_empty() {
       return Err(TensorError::UnsupportedShape {

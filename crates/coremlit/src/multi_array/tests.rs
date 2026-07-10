@@ -353,3 +353,8 @@ fn f16_surface_rejects_shape_overflow() {
     }
   );
 }
+
+#[test]
+fn surface_probe_is_true_on_this_host() {
+  assert!(MultiArray::supports_surface());
+}
