@@ -480,6 +480,52 @@ impl MultiArray {
     Ok(())
   }
 
+  /// Copies this array's element data into a freshly allocated array with
+  /// its own, uniquely owned native buffer.
+  ///
+  /// Used to de-alias a [`MultiArray`] whose buffer another live handle
+  /// (an input, or another output name) also references — see
+  /// [`crate::Features::from_provider`].
+  ///
+  /// # Errors
+  /// [`TensorError::UnsupportedDataType`] if this array's element type is
+  /// [`DataType::Unknown`] (no [`Element`] impl exists to copy through, so
+  /// there is no `T` to gather into). Propagates [`Self::copy_into`]/
+  /// [`Self::from_slice`] failures otherwise.
+  pub(crate) fn deep_copy(&self) -> Result<Self, TensorError> {
+    let shape = self.shape();
+    fn copy_typed<T: Element + Default>(
+      this: &MultiArray,
+      shape: &[usize],
+    ) -> Result<MultiArray, TensorError> {
+      let mut buf = vec![T::default(); this.count()];
+      this.copy_into(&mut buf)?;
+      MultiArray::from_slice(shape, &buf)
+    }
+    match self.data_type() {
+      DataType::F16 => copy_typed::<f16>(self, &shape),
+      DataType::F32 => copy_typed::<f32>(self, &shape),
+      DataType::F64 => copy_typed::<f64>(self, &shape),
+      DataType::I32 => copy_typed::<i32>(self, &shape),
+      dtype @ DataType::Unknown(_) => Err(TensorError::UnsupportedDataType { dtype }),
+    }
+  }
+
+  /// This array's native buffer identity, as an opaque pointer value.
+  ///
+  /// Never dereferenced through this crate; used only as an equality key to
+  /// detect when two [`MultiArray`]s alias the same underlying storage (see
+  /// [`crate::Features::from_provider`]).
+  pub(crate) fn data_ptr(&self) -> *const core::ffi::c_void {
+    // SAFETY: `dataPointer` is a plain accessor message send on a live
+    // object; the returned pointer is used only as an opaque identity
+    // value here, never read through.
+    #[allow(deprecated)]
+    unsafe {
+      self.inner.dataPointer().as_ptr().cast_const()
+    }
+  }
+
   pub(crate) fn raw(&self) -> &MLMultiArray {
     &self.inner
   }

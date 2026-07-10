@@ -78,6 +78,16 @@ impl Features {
     self.entries.is_empty()
   }
 
+  // Every array's native buffer identity, in insertion order. Seeds
+  // `from_provider`'s aliasing detection: `Model::predict` calls this on
+  // its *inputs* before extracting outputs, because an input outlives the
+  // call (the caller still owns it) — an output that echoes an input's
+  // buffer (an identity/zero-copy model) is exactly the aliasing case
+  // `from_provider` must catch, same as one array under two output names.
+  pub(crate) fn data_ptrs(&self) -> Vec<*const core::ffi::c_void> {
+    self.entries.iter().map(|(_, a)| a.data_ptr()).collect()
+  }
+
   // Bridges to CoreML's `MLDictionaryFeatureProvider`, the concrete
   // `MLFeatureProvider` used to feed `Model::predict`.
   pub(crate) fn to_provider(
@@ -125,12 +135,24 @@ impl Features {
   // fresh from `MLFeatureValue::multiArrayValue()` — but that handle's
   // *buffer* may still be referenced from inside `provider` (the
   // `MLFeatureValue` this came from, and the dictionary/provider holding
-  // it). `MultiArray::from_raw`'s sole-ownership invariant is therefore not
-  // strictly met by `provider` alone: it holds only as long as nothing
-  // continues to mutate the source array through `provider` while the
-  // extracted `MultiArray` is alive. `Model::predict` upholds this by
-  // dropping the output provider immediately after calling this function,
-  // which restores effective sole ownership of every array extracted here.
+  // it), from a caller-held input an identity/zero-copy model echoed back
+  // as this same output, or from another output name in this same
+  // `provider` pointing at the same array. `MultiArray::from_raw`'s
+  // sole-ownership invariant is therefore not met by `provider` alone.
+  //
+  // `known_ptrs` closes every one of those gaps: callers seed it with the
+  // `data_ptr` of every array that could be aliased and outlives this call
+  // (`Model::predict` seeds it with every input's, via `Features::data_ptrs`
+  // — inputs are exactly the case a duplicate-output-provider fixture can't
+  // reach on its own). Each extracted array whose `data_ptr` is already
+  // present is deep-copied into a freshly allocated, uniquely owned buffer
+  // before being inserted; either way, its (possibly new) `data_ptr` is
+  // then pushed, so a *third* name aliasing the same original buffer is
+  // caught too. With that, dropping the output provider immediately after
+  // calling this function (as `Model::predict` does) restores effective
+  // sole ownership of every array extracted here unconditionally — any
+  // surviving alias was already copied, not just the ones the provider
+  // itself would release.
   //
   // Extracted arrays may also be non-contiguous (row-padded, as pixel-
   // buffer-backed arrays can be): `MultiArray::as_slice`/`as_slice_mut`
@@ -138,6 +160,7 @@ impl Features {
   // misreading the padding, so nothing extra is needed here.
   pub(crate) fn from_provider(
     provider: &ProtocolObject<dyn MLFeatureProvider>,
+    known_ptrs: &mut Vec<*const core::ffi::c_void>,
   ) -> Result<Self, PredictionError> {
     let mut features = Self::new();
     // SAFETY: protocol getter message send on a live provider.
@@ -157,7 +180,14 @@ impl Features {
         unsafe { value.multiArrayValue() }.ok_or_else(|| PredictionError::NotMultiArray {
           name: name_str.clone(),
         })?;
-      features.insert(name_str, MultiArray::from_raw(array));
+      let mut array = MultiArray::from_raw(array);
+      if known_ptrs.contains(&array.data_ptr()) {
+        array = array
+          .deep_copy()
+          .map_err(PredictionError::AliasCopyFailed)?;
+      }
+      known_ptrs.push(array.data_ptr());
+      features.insert(name_str, array);
     }
     Ok(features)
   }

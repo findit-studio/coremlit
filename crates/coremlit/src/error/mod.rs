@@ -102,6 +102,10 @@ pub enum PredictionError {
   /// Stateful prediction requires macOS 15 (MLState).
   #[error("stateful prediction is unavailable on this OS (requires macOS 15)")]
   StateUnsupported,
+  /// De-aliasing an output array that shared its native buffer with
+  /// another live array (an input, or another output name) failed.
+  #[error("failed to de-alias a prediction output: {0}")]
+  AliasCopyFailed(TensorError),
 }
 
 /// Failure constructing or viewing a multi-array.

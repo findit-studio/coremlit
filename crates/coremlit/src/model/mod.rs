@@ -189,7 +189,9 @@ impl Model {
   ///
   /// # Errors
   /// [`PredictionError::Native`] if CoreML fails; missing/mistyped outputs
-  /// surface as structured variants when extracted.
+  /// surface as structured variants when extracted;
+  /// [`PredictionError::AliasCopyFailed`] if de-aliasing an output that
+  /// shared a buffer with an input (or another output) fails.
   pub fn predict(&self, inputs: &Features) -> Result<Features, PredictionError> {
     let provider = inputs.to_provider()?;
     // SAFETY: provider conforms to MLFeatureProvider; blocking call.
@@ -199,7 +201,12 @@ impl Model {
         .predictionFromFeatures_error(objc2::runtime::ProtocolObject::from_ref(&*provider))
     }
     .map_err(|e| PredictionError::Native(NsErrorInfo::from_ns_error(&e)))?;
-    Features::from_provider(&outputs)
+    // Seed with every input's buffer identity: inputs outlive this call (the
+    // caller still owns `inputs`), so an identity/zero-copy model echoing
+    // one back as an output is the same aliasing hazard as two output names
+    // sharing one array, which `from_provider` also catches on its own.
+    let mut known_ptrs = inputs.data_ptrs();
+    Features::from_provider(&outputs, &mut known_ptrs)
   }
 
   /// Compiles an `.mlpackage`/`.mlmodel` to a temporary `.mlmodelc`.
@@ -274,7 +281,9 @@ impl Model {
   ///
   /// # Errors
   /// [`PredictionError::StateUnsupported`] before macOS 15;
-  /// [`PredictionError::Native`] on CoreML failure.
+  /// [`PredictionError::Native`] on CoreML failure;
+  /// [`PredictionError::AliasCopyFailed`] if de-aliasing an output that
+  /// shared a buffer with an input (or another output) fails.
   pub fn predict_with_state(
     &self,
     inputs: &Features,
@@ -292,7 +301,10 @@ impl Model {
       )
     }
     .map_err(|e| PredictionError::Native(NsErrorInfo::from_ns_error(&e)))?;
-    Features::from_provider(&outputs)
+    // See `predict`'s comment: inputs outlive this call, so seed known_ptrs
+    // with their buffer identities too.
+    let mut known_ptrs = inputs.data_ptrs();
+    Features::from_provider(&outputs, &mut known_ptrs)
   }
 }
 
