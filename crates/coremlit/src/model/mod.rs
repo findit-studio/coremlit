@@ -130,8 +130,7 @@ impl Model {
       });
     }
     // `fileURLWithPath`/`NSString::from_str` are safe constructors in this
-    // objc2-foundation version (no `unsafe` needed, unlike the brief's
-    // assumption — see Task 8 report).
+    // objc2-foundation version, so no `unsafe` is needed here.
     let url = NSURL::fileURLWithPath(&objc2_foundation::NSString::from_str(
       &path.to_string_lossy(),
     ));

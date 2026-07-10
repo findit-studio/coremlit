@@ -71,7 +71,7 @@ impl Features {
   }
 
   // Bridges to CoreML's `MLDictionaryFeatureProvider`, the concrete
-  // `MLFeatureProvider` used to feed `Model::predict` (Task 9).
+  // `MLFeatureProvider` used to feed `Model::predict`.
   pub(crate) fn to_provider(
     &self,
   ) -> Result<Retained<MLDictionaryFeatureProvider>, PredictionError> {
@@ -120,10 +120,9 @@ impl Features {
   // it). `MultiArray::from_raw`'s sole-ownership invariant is therefore not
   // strictly met by `provider` alone: it holds only as long as nothing
   // continues to mutate the source array through `provider` while the
-  // extracted `MultiArray` is alive. `Model::predict` (Task 9) upholds this
-  // by dropping the output provider immediately after calling this
-  // function, which restores effective sole ownership of every array
-  // extracted here.
+  // extracted `MultiArray` is alive. `Model::predict` upholds this by
+  // dropping the output provider immediately after calling this function,
+  // which restores effective sole ownership of every array extracted here.
   //
   // Extracted arrays may also be non-contiguous (row-padded, as pixel-
   // buffer-backed arrays can be): `MultiArray::as_slice`/`as_slice_mut`

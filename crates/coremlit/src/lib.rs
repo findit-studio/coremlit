@@ -7,6 +7,21 @@
 //!
 //! macOS only. Mirrors the CoreML surface used by Argmax's WhisperKit
 //! (`MLModelExtensions` / `MLMultiArrayExtensions` in argmax-oss-swift).
+//!
+//! # Example
+//!
+//! ```no_run
+//! use coremlit::{ComputeUnits, DataType, Features, Model, MultiArray};
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let model = Model::load("MelSpectrogram.mlmodelc", ComputeUnits::CpuAndGpu)?;
+//! let audio = MultiArray::zeros(&[480_000], DataType::F32)?;
+//! let outputs = model.predict(&Features::new().with("audio", audio))?;
+//! let mel = outputs.get("melspectrogram_features").unwrap();
+//! assert_eq!(mel.data_type(), DataType::F16);
+//! # Ok(())
+//! # }
+//! ```
 
 mod dtype;
 mod error;

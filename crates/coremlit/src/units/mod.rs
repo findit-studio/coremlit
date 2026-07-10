@@ -33,6 +33,7 @@ impl ComputeUnits {
     }
   }
 
+  #[inline(always)]
   pub(crate) const fn to_raw(self) -> MLComputeUnits {
     match self {
       Self::CpuOnly => MLComputeUnits::CPUOnly,
