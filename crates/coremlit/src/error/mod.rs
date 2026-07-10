@@ -146,6 +146,12 @@ pub enum TensorError {
   /// CoreML rejected the array construction.
   #[error("core ml multi-array failure: {0}")]
   Native(NsErrorInfo),
+  /// CVPixelBuffer creation failed.
+  #[error("pixel buffer creation failed with CVReturn {code}")]
+  PixelBuffer {
+    /// The CVReturn code.
+    code: i32,
+  },
 }
 
 #[cfg(test)]

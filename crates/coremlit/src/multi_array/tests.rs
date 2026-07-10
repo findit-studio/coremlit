@@ -105,3 +105,19 @@ fn fill_last_dim_writes_positions() {
   arr.fill_last_dim(&[0, 2], 1.5f32).unwrap();
   assert_eq!(arr.as_slice::<f32>().unwrap(), &[1.5, 0.0, 1.5, 0.0]);
 }
+
+#[test]
+fn f16_surface_is_f16_and_writable() {
+  let mut arr = MultiArray::f16_surface(&[1, 2, 1, 4]).unwrap();
+  assert_eq!(arr.data_type(), DataType::F16);
+  assert_eq!(arr.shape(), vec![1, 2, 1, 4]);
+  let half_one = f16::from_f32(1.0);
+  arr.as_slice_mut::<f16>().unwrap().fill(half_one);
+  assert!(
+    arr
+      .as_slice::<f16>()
+      .unwrap()
+      .iter()
+      .all(|v| *v == half_one)
+  );
+}

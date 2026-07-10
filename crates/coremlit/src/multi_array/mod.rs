@@ -278,5 +278,79 @@ impl MultiArray {
   }
 }
 
+/// IOSurface-backed construction (ANE-efficient f16 I/O).
+impl MultiArray {
+  /// Allocates an IOSurface-backed half-precision array.
+  ///
+  /// CoreML shares IOSurface-backed `f16` buffers with the ANE without
+  /// copies; WhisperKit allocates every f16 tensor this way. Width is the
+  /// last dimension (minimum 1); height is `count / width`.
+  ///
+  /// # Errors
+  /// [`TensorError::PixelBuffer`] if CoreVideo rejects the pixel buffer
+  /// allocation (for example, a `0`-height buffer from an all-zero shape).
+  pub fn f16_surface(shape: &[usize]) -> Result<Self, TensorError> {
+    use objc2_core_foundation::{CFDictionary, CFRetained, CFType};
+    use objc2_core_video::{
+      CVPixelBuffer, CVPixelBufferCreate, kCVPixelBufferIOSurfacePropertiesKey,
+      kCVPixelFormatType_OneComponent16Half, kCVReturnSuccess,
+    };
+
+    let count: usize = shape.iter().product();
+    let width = shape.last().copied().unwrap_or(1).max(1);
+    let height = count / width;
+
+    // An empty IOSurface-properties dictionary as the value of
+    // `kCVPixelBufferIOSurfacePropertiesKey` opts the buffer into IOSurface
+    // backing (mirrors Apple's own `initWithPixelBuffer:shape:` sample).
+    let io_surface_props = CFDictionary::<CFType, CFType>::empty();
+    let io_surface_props_ref: &CFType = io_surface_props.as_ref();
+    // SAFETY: reads a linked, immutable `CFStringRef` constant exported by
+    // the CoreVideo framework; the resulting `'static` reference is valid
+    // for the lifetime of the process.
+    let io_surface_key = unsafe { kCVPixelBufferIOSurfacePropertiesKey };
+    let attrs = CFDictionary::from_slices(&[io_surface_key], &[io_surface_props_ref]);
+
+    let mut pixel_buffer: *mut CVPixelBuffer = core::ptr::null_mut();
+    // SAFETY: `width`/`height` are plain integers, `kCVPixelFormatType_OneComponent16Half`
+    // is a real `OSType` constant, `attrs` is a live `CFDictionary` borrowed
+    // for the duration of the call, and `pixel_buffer` is a valid, writable
+    // local the out-pointer references. The `CVReturn` result is checked
+    // immediately below before the (possibly still-null-on-failure)
+    // out-pointer is used.
+    let ret = unsafe {
+      CVPixelBufferCreate(
+        None,
+        width,
+        height,
+        kCVPixelFormatType_OneComponent16Half,
+        Some(attrs.as_opaque()),
+        core::ptr::NonNull::from(&mut pixel_buffer),
+      )
+    };
+    if ret != kCVReturnSuccess || pixel_buffer.is_null() {
+      return Err(TensorError::PixelBuffer { code: ret });
+    }
+    let pixel_buffer =
+      core::ptr::NonNull::new(pixel_buffer).expect("checked non-null CVPixelBuffer above");
+    // SAFETY: `CVPixelBufferCreate` returned `kCVReturnSuccess` with a
+    // non-null out-pointer, so `pixel_buffer` follows the Core Foundation
+    // Create rule: a live object with a +1 retain count that this call
+    // adopts into `CFRetained`, which will release it on drop.
+    let buffer: CFRetained<CVPixelBuffer> = unsafe { CFRetained::from_raw(pixel_buffer) };
+
+    // SAFETY: `buffer`'s pixel format is `kCVPixelFormatType_OneComponent16Half`,
+    // which `initWithPixelBuffer:shape:` requires for the resulting array's
+    // `MLMultiArrayDataTypeFloat16`; `shape`'s last dimension equals `width`
+    // and the product of the remaining dimensions equals `height`, matching
+    // the pixel buffer's dimensions as the API's documented contract
+    // requires.
+    let inner = unsafe {
+      MLMultiArray::initWithPixelBuffer_shape(MLMultiArray::alloc(), &buffer, &ns_shape(shape))
+    };
+    Ok(Self { inner })
+  }
+}
+
 #[cfg(test)]
 mod tests;

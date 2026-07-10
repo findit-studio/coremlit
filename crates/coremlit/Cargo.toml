@@ -12,6 +12,7 @@ objc2.workspace = true
 objc2-core-ml.workspace = true
 objc2-foundation.workspace = true
 objc2-core-video.workspace = true
+objc2-core-foundation.workspace = true
 block2.workspace = true
 half.workspace = true
 thiserror.workspace = true
