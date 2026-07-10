@@ -53,6 +53,23 @@ fn ns_shape(shape: &[usize]) -> Retained<NSArray<NSNumber>> {
   NSArray::from_retained_slice(&numbers)
 }
 
+/// `shape`'s element count, rejecting `usize` overflow.
+///
+/// Every sizing computation in this module funnels through here (or applies
+/// the same `checked_mul`/`checked_add` discipline inline for
+/// stride/offset arithmetic derived from a shape) instead of
+/// `Iterator::product`, which panics on overflow in debug builds and wraps
+/// silently in release — either outcome would let a native FFI call proceed
+/// with a size that does not match the shape it was derived from.
+fn checked_element_count(shape: &[usize]) -> Result<usize, TensorError> {
+  shape
+    .iter()
+    .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
+    .ok_or_else(|| TensorError::ShapeOverflow {
+      shape: shape.to_vec(),
+    })
+}
+
 impl MultiArray {
   /// Allocates an array of `shape` and fills it with zero bytes.
   ///
@@ -61,11 +78,14 @@ impl MultiArray {
   /// size (e.g. an unrecognized [`DataType::Unknown`] code); CoreML's
   /// `initWithShape_dataType_error` does not reject such codes itself, and
   /// an unsized dtype would make the zero-fill below unsound.
+  /// [`TensorError::ShapeOverflow`] if `shape`'s element count overflows
+  /// `usize`, checked before any native allocation.
   /// [`TensorError::Native`] if CoreML rejects the allocation.
   pub fn zeros(shape: &[usize], dtype: DataType) -> Result<Self, TensorError> {
     if dtype.size_of().is_none() {
       return Err(TensorError::UnsupportedDataType { dtype });
     }
+    checked_element_count(shape)?;
     // SAFETY: valid shape array; `dtype` was checked above to have a known
     // element size, so even though CoreML does not itself validate the
     // data-type code, the buffer this allocates is one this crate knows how
@@ -81,20 +101,21 @@ impl MultiArray {
     let mut this = Self { inner };
     // MLMultiArray does not guarantee zeroed memory; mirror ArgmaxCore's
     // explicit initialValue fill.
-    this.fill_bytes_zero();
+    this.fill_bytes_zero()?;
     Ok(this)
   }
 
   /// Builds an array of `shape` from `data` (row-major).
   ///
   /// # Errors
-  /// [`TensorError::ShapeMismatch`] if `data.len()` differs from the shape
-  /// product; [`TensorError::Native`] if allocation fails.
+  /// [`TensorError::ShapeOverflow`] if `shape`'s element count overflows
+  /// `usize`. [`TensorError::ShapeMismatch`] if `data.len()` differs from
+  /// the shape product; [`TensorError::Native`] if allocation fails.
   pub fn from_slice<T>(shape: &[usize], data: &[T]) -> Result<Self, TensorError>
   where
     T: Element,
   {
-    let expected: usize = shape.iter().product();
+    let expected = checked_element_count(shape)?;
     if expected != data.len() {
       return Err(TensorError::ShapeMismatch {
         expected,
@@ -138,7 +159,14 @@ impl MultiArray {
       if *stride != expected {
         return false;
       }
-      expected *= (*dim).max(1);
+      // An overflowing running product cannot equal any real stride CoreML
+      // reports (those describe an actually-allocated buffer, necessarily
+      // `usize`-representable), so treat overflow as a mismatch rather than
+      // wrapping into a value that might coincidentally compare equal.
+      let Some(next) = expected.checked_mul((*dim).max(1)) else {
+        return false;
+      };
+      expected = next;
     }
     true
   }
@@ -215,6 +243,10 @@ impl MultiArray {
   ///
   /// # Errors
   /// [`TensorError::RankMismatch`] / [`TensorError::IndexOutOfBounds`].
+  /// [`TensorError::ShapeOverflow`] if the stride-weighted offset overflows
+  /// `usize` — unreachable for indices/strides that came from a real
+  /// CoreML-allocated array, but checked rather than trusted since the
+  /// arithmetic is this crate's own.
   pub fn linear_offset(&self, indices: &[usize]) -> Result<usize, TensorError> {
     let shape = self.shape();
     if indices.len() != shape.len() {
@@ -229,7 +261,16 @@ impl MultiArray {
       if index >= dim {
         return Err(TensorError::IndexOutOfBounds { index, len: dim });
       }
-      offset += index * stride;
+      let term = index
+        .checked_mul(stride)
+        .ok_or_else(|| TensorError::ShapeOverflow {
+          shape: shape.clone(),
+        })?;
+      offset = offset
+        .checked_add(term)
+        .ok_or_else(|| TensorError::ShapeOverflow {
+          shape: shape.clone(),
+        })?;
     }
     Ok(offset)
   }
@@ -260,8 +301,9 @@ impl MultiArray {
   /// last is not 1. [`TensorError::IndexOutOfBounds`] if a position exceeds
   /// the final axis — every position is validated before any element is
   /// written, so a single out-of-bounds position leaves the array
-  /// untouched rather than partially filled. Dtype-mismatch failures from
-  /// the typed view.
+  /// untouched rather than partially filled. [`TensorError::ShapeOverflow`]
+  /// if a position's stride-weighted offset overflows `usize` (see
+  /// [`Self::linear_offset`]). Dtype-mismatch failures from the typed view.
   pub fn fill_last_dim<T>(&mut self, positions: &[usize], value: T) -> Result<(), TensorError>
   where
     T: Element,
@@ -284,7 +326,12 @@ impl MultiArray {
       }
     }
     for &position in positions {
-      self.write_element(position * stride, value)?;
+      let offset = position
+        .checked_mul(stride)
+        .ok_or_else(|| TensorError::ShapeOverflow {
+          shape: shape.clone(),
+        })?;
+      self.write_element(offset, value)?;
     }
     Ok(())
   }
@@ -326,6 +373,8 @@ impl MultiArray {
   ///
   /// # Errors
   /// [`TensorError::ShapeMismatch`] if `out.len() != self.count()`.
+  /// [`TensorError::ShapeOverflow`] if the padded-row gather's offset
+  /// arithmetic overflows `usize` (see [`Self::linear_offset`]).
   /// Dtype-mismatch failures.
   pub fn copy_into<T>(&self, out: &mut [T]) -> Result<(), TensorError>
   where
@@ -359,7 +408,7 @@ impl MultiArray {
     let last_stride = strides[rank - 1];
     let leading_dims = &shape[..rank - 1];
     let leading_strides = &strides[..rank - 1];
-    let num_rows: usize = leading_dims.iter().product();
+    let num_rows = checked_element_count(leading_dims)?;
 
     let mut row_indices = vec![0usize; leading_dims.len()];
     for row in 0..num_rows {
@@ -370,12 +419,24 @@ impl MultiArray {
         row_indices[i] = remainder % leading_dims[i];
         remainder /= leading_dims[i];
       }
-      let row_start: usize = row_indices
-        .iter()
-        .zip(leading_strides)
-        .map(|(&index, &stride)| index * stride)
-        .sum();
-      let out_start = row * last_dim;
+      let mut row_start = 0usize;
+      for (&index, &stride) in row_indices.iter().zip(leading_strides) {
+        let term = index
+          .checked_mul(stride)
+          .ok_or_else(|| TensorError::ShapeOverflow {
+            shape: shape.clone(),
+          })?;
+        row_start = row_start
+          .checked_add(term)
+          .ok_or_else(|| TensorError::ShapeOverflow {
+            shape: shape.clone(),
+          })?;
+      }
+      let out_start = row
+        .checked_mul(last_dim)
+        .ok_or_else(|| TensorError::ShapeOverflow {
+          shape: shape.clone(),
+        })?;
 
       if last_stride == 1 {
         // SAFETY: dtype checked above; `row_start` is a valid in-bounds
@@ -397,18 +458,21 @@ impl MultiArray {
         // Fallback: the last dimension itself is strided, so gather it one
         // element at a time.
         for last in 0..last_dim {
-          // SAFETY: dtype checked above; `row_start + last * last_stride`
-          // is a valid in-bounds element offset for the same reason as the
-          // contiguous-row branch, one element at a time.
+          let extra = last
+            .checked_mul(last_stride)
+            .ok_or_else(|| TensorError::ShapeOverflow {
+              shape: shape.clone(),
+            })?;
+          let offset = row_start
+            .checked_add(extra)
+            .ok_or_else(|| TensorError::ShapeOverflow {
+              shape: shape.clone(),
+            })?;
+          // SAFETY: dtype checked above; `offset` is a valid in-bounds
+          // element offset for the same reason as the contiguous-row
+          // branch, one element at a time.
           #[allow(deprecated)]
-          let value = unsafe {
-            *self
-              .inner
-              .dataPointer()
-              .as_ptr()
-              .cast::<T>()
-              .add(row_start + last * last_stride)
-          };
+          let value = unsafe { *self.inner.dataPointer().as_ptr().cast::<T>().add(offset) };
           out[out_start + last] = value;
         }
       }
@@ -460,12 +524,23 @@ impl MultiArray {
     Ok(())
   }
 
-  fn fill_bytes_zero(&mut self) {
-    let byte_len = self.count()
-      * self
-        .data_type()
-        .size_of()
-        .expect("constructors validate the data type");
+  /// # Errors
+  /// [`TensorError::ShapeOverflow`] if `count() * size_of(data_type())`
+  /// overflows `usize` — the element count itself was already checked
+  /// against the shape in `zeros`, but multiplying by byte size is a
+  /// distinct overflow surface (e.g. a large [`DataType::F64`] count).
+  fn fill_bytes_zero(&mut self) -> Result<(), TensorError> {
+    let byte_len = self
+      .count()
+      .checked_mul(
+        self
+          .data_type()
+          .size_of()
+          .expect("constructors validate the data type"),
+      )
+      .ok_or_else(|| TensorError::ShapeOverflow {
+        shape: self.shape(),
+      })?;
     // SAFETY: `dataPointer` is non-null and suitably aligned for
     // `data_type()`, and the allocation backing it is at least
     // `count() * size_of(data_type())` bytes — guaranteed because every
@@ -479,6 +554,7 @@ impl MultiArray {
     unsafe {
       core::ptr::write_bytes(self.inner.dataPointer().as_ptr().cast::<u8>(), 0, byte_len);
     }
+    Ok(())
   }
 }
 
@@ -506,6 +582,9 @@ impl MultiArray {
   /// has no last dimension to serve as the pixel buffer width, so
   /// [`Self::shape`]/[`Self::linear_offset`] on the result would be
   /// nonsensical rather than merely unusual.
+  /// [`TensorError::ShapeOverflow`] if `shape`'s element count overflows
+  /// `usize`, checked (and `height` derived from the checked leading
+  /// product) before any native allocation.
   /// [`TensorError::PixelBuffer`] if CoreVideo rejects the pixel buffer
   /// allocation (for example, a `0`-height buffer from an all-zero shape).
   pub fn f16_surface(shape: &[usize]) -> Result<Self, TensorError> {
@@ -522,9 +601,19 @@ impl MultiArray {
       });
     }
 
-    let count: usize = shape.iter().product();
+    // `initWithPixelBuffer:shape:` requires the product of every dimension
+    // before the last to equal the pixel buffer's height; derive `height`
+    // directly from that checked product (rather than a checked total
+    // divided by `width`), then separately confirm the two multiply back
+    // together without overflow. `shape` is non-empty (checked above), so
+    // `shape.len() - 1` cannot underflow.
     let width = shape.last().copied().unwrap_or(1).max(1);
-    let height = count / width;
+    let height = checked_element_count(&shape[..shape.len() - 1])?;
+    height
+      .checked_mul(width)
+      .ok_or_else(|| TensorError::ShapeOverflow {
+        shape: shape.to_vec(),
+      })?;
 
     // An empty IOSurface-properties dictionary as the value of
     // `kCVPixelBufferIOSurfacePropertiesKey` opts the buffer into IOSurface

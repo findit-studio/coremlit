@@ -274,3 +274,38 @@ fn unsupported_shape_displays_reason() {
     "shape [2, 3] is unsupported: all dimensions before the last must be 1"
   );
 }
+
+#[test]
+fn zeros_rejects_shape_overflow() {
+  let err = MultiArray::zeros(&[usize::MAX, 2], DataType::F32).unwrap_err();
+  assert_eq!(
+    err,
+    TensorError::ShapeOverflow {
+      shape: vec![usize::MAX, 2]
+    }
+  );
+}
+
+#[test]
+fn from_slice_rejects_shape_overflow() {
+  let data = [1.0f32];
+  let err = MultiArray::from_slice(&[usize::MAX, 2], &data).unwrap_err();
+  assert_eq!(
+    err,
+    TensorError::ShapeOverflow {
+      shape: vec![usize::MAX, 2]
+    }
+  );
+}
+
+#[test]
+fn f16_surface_rejects_shape_overflow() {
+  let huge = usize::MAX / 4 + 2;
+  let err = MultiArray::f16_surface(&[huge, 4]).unwrap_err();
+  assert_eq!(
+    err,
+    TensorError::ShapeOverflow {
+      shape: vec![huge, 4]
+    }
+  );
+}

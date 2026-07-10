@@ -171,6 +171,13 @@ pub enum TensorError {
     /// Why the shape was rejected.
     reason: ShapeRequirement,
   },
+  /// A shape's element count, or a size/offset derived from it, overflows
+  /// `usize`.
+  #[error("shape {shape:?} element count overflows usize")]
+  ShapeOverflow {
+    /// The offending shape.
+    shape: Vec<usize>,
+  },
 }
 
 /// Why a shape was rejected by [`TensorError::UnsupportedShape`].
