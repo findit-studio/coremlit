@@ -9,7 +9,9 @@
 //! (`MLModelExtensions` / `MLMultiArrayExtensions` in argmax-oss-swift).
 
 mod dtype;
+mod error;
 mod units;
 
 pub use dtype::DataType;
+pub use error::{CompileError, LoadError, NsErrorInfo, PredictionError, TensorError};
 pub use units::{ComputeUnits, ParseComputeUnitsError};
