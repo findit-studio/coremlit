@@ -635,7 +635,8 @@ impl MultiArray {
   ///
   /// CoreML shares IOSurface-backed `f16` buffers with the ANE without
   /// copies; WhisperKit allocates every f16 tensor this way. Width is the
-  /// last dimension (minimum 1); height is `count / width`.
+  /// last dimension exactly; height is the product of the leading
+  /// dimensions (every dimension must be nonzero).
   ///
   /// The IOSurface may pad each row out to a platform-chosen alignment, so
   /// the result is not guaranteed [`Self::is_contiguous`]. When padded,
@@ -654,11 +655,15 @@ impl MultiArray {
   /// has no last dimension to serve as the pixel buffer width, so
   /// [`Self::shape`]/[`Self::linear_offset`] on the result would be
   /// nonsensical rather than merely unusual.
+  /// [`TensorError::UnsupportedShape`] (reason
+  /// [`ShapeRequirement::NonZeroDims`]) if any dimension is zero — the
+  /// initializer requires the pixel width to equal the final dimension
+  /// exactly, and a zero-element surface has no valid width/height pair.
   /// [`TensorError::ShapeOverflow`] if `shape`'s element count overflows
   /// `usize`, checked (and `height` derived from the checked leading
   /// product) before any native allocation.
   /// [`TensorError::PixelBuffer`] if CoreVideo rejects the pixel buffer
-  /// allocation (for example, a `0`-height buffer from an all-zero shape).
+  /// allocation or CPU-access locking.
   /// [`TensorError::SurfaceUnsupported`] before macOS 12, where
   /// `MLMultiArray` has no pixel-buffer initializer — probed at runtime so
   /// the unrecognized selector surfaces as an error, never an Objective-C
@@ -680,14 +685,25 @@ impl MultiArray {
         reason: ShapeRequirement::NonEmpty,
       });
     }
+    // `initWithPixelBuffer:shape:` requires the pixel width to EQUAL the
+    // final shape dimension — a zero dimension would force a clamped width
+    // that violates that contract (an Objective-C exception from safe
+    // code), and a zero-element surface is meaningless anyway.
+    if shape.contains(&0) {
+      return Err(TensorError::UnsupportedShape {
+        shape: shape.to_vec(),
+        reason: ShapeRequirement::NonZeroDims,
+      });
+    }
 
     // `initWithPixelBuffer:shape:` requires the product of every dimension
     // before the last to equal the pixel buffer's height; derive `height`
     // directly from that checked product (rather than a checked total
     // divided by `width`), then separately confirm the two multiply back
-    // together without overflow. `shape` is non-empty (checked above), so
-    // `shape.len() - 1` cannot underflow.
-    let width = shape.last().copied().unwrap_or(1).max(1);
+    // together without overflow. `shape` is non-empty and all-nonzero
+    // (checked above), so `shape.len() - 1` cannot underflow and `width`
+    // is the exact final dimension with no clamping.
+    let width = *shape.last().expect("shape checked non-empty above");
     let height = checked_element_count(&shape[..shape.len() - 1])?;
     height
       .checked_mul(width)
@@ -743,60 +759,47 @@ impl MultiArray {
     // "the pixel buffer [is] to be owned by the instance" — i.e. `inner`
     // retains `buffer` itself, so it is sound for the local `CFRetained`
     // binding to drop (release its own +1) once this function returns.
+    // Zero the pixel buffer's ENTIRE allocation before CoreML wraps it —
+    // `CVPixelBufferGetDataSize` is the allocator's own byte count, so this
+    // covers row-tail padding on every rank (a rank-1 array's sole stride
+    // is 1 and would under-cover the padded row; deriving the span from
+    // MLMultiArray strides cannot see allocator padding past the logical
+    // extent). CoreML/CoreVideo do not guarantee zeroed memory, and
+    // `as_slice`/`read_at`/`copy_into` on the result must never observe
+    // uninitialized bytes.
+    // SAFETY: `buffer` is the live pixel buffer created above; lock/base/
+    // size/unlock is the documented CPU-access protocol, base is non-null
+    // after a successful lock of a successfully created buffer, and
+    // `write_bytes` stays within `CVPixelBufferGetDataSize` bytes of the
+    // locked base. All-zero bits are valid `f16` (0.0).
+    unsafe {
+      use objc2_core_video::{
+        CVPixelBufferGetBaseAddress, CVPixelBufferGetDataSize, CVPixelBufferLockBaseAddress,
+        CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
+      };
+      let lock = CVPixelBufferLockBaseAddress(&buffer, CVPixelBufferLockFlags::empty());
+      if lock != kCVReturnSuccess {
+        return Err(TensorError::PixelBuffer { code: lock });
+      }
+      let base = CVPixelBufferGetBaseAddress(&buffer);
+      if base.is_null() {
+        CVPixelBufferUnlockBaseAddress(&buffer, CVPixelBufferLockFlags::empty());
+        return Err(TensorError::PixelBuffer { code: lock });
+      }
+      core::ptr::write_bytes(base.cast::<u8>(), 0, CVPixelBufferGetDataSize(&buffer));
+      CVPixelBufferUnlockBaseAddress(&buffer, CVPixelBufferLockFlags::empty());
+    }
+
+    // SAFETY: `buffer`'s pixel format matches Float16, `shape`'s last
+    // dimension equals `width` exactly (zero dims were rejected above, so
+    // no `.max(1)` clamp can diverge from the real dimension), and the
+    // leading product equals `height` — the initializer's documented
+    // contract. Ownership: the instance retains the buffer, so the local
+    // `CFRetained` may drop after this call.
     let inner = unsafe {
       MLMultiArray::initWithPixelBuffer_shape(MLMultiArray::alloc(), &buffer, &ns_shape(shape))
     };
-    let mut this = Self { inner };
-    // CoreML does not guarantee zeroed pixel-buffer memory, same as `zeros`
-    // — but unlike that dense case, this buffer may carry inter-row
-    // padding, so `count()` (the logical element count) would under-cover
-    // it; `zero_padded_f16_span` covers the array's full stride-derived
-    // span instead.
-    let span =
-      shape[0]
-        .checked_mul(this.strides()[0])
-        .ok_or_else(|| TensorError::ShapeOverflow {
-          shape: shape.to_vec(),
-        })?;
-    this.zero_padded_f16_span(span)?;
-    Ok(this)
-  }
-
-  /// Zero-fills `span_elements` half-precision elements starting at
-  /// `dataPointer`.
-  ///
-  /// Distinct from [`Self::fill_bytes_zero`]: that method zero-fills
-  /// exactly [`Self::count`] elements, correct only for the dense,
-  /// unpadded arrays [`Self::zeros`] produces. `span_elements` here is the
-  /// caller-computed *padded* span — the whole buffer a pixel-buffer-backed
-  /// array's first-dimension stride covers, including any inter-row
-  /// padding — so reusing `fill_bytes_zero`'s logical `count()` would leave
-  /// later rows of a padded [`Self::f16_surface`] array uninitialized.
-  ///
-  /// # Errors
-  /// [`TensorError::ShapeOverflow`] if `span_elements * 2` (bytes per `f16`)
-  /// overflows `usize`.
-  fn zero_padded_f16_span(&mut self, span_elements: usize) -> Result<(), TensorError> {
-    let byte_len = span_elements
-      .checked_mul(DataType::F16.size_of().expect("f16 has a known size"))
-      .ok_or_else(|| TensorError::ShapeOverflow {
-        shape: self.shape(),
-      })?;
-    // SAFETY: `initWithPixelBuffer:shape:` succeeded before this is called,
-    // so `dataPointer` is non-null and points at the pixel buffer's backing
-    // store, which is at least `span_elements` `f16`s long — `span_elements`
-    // is `shape[0] * strides()[0]`, and row-major layout (CoreML pads only
-    // *between* rows, never inside one — see `copy_into`'s doc) means the
-    // first dimension's stride times its own extent spans the entire
-    // buffer this array's metadata describes. All-zero bits are a valid
-    // `f16` value (`0.0`), so zero-filling raw bytes produces initialized,
-    // valid elements throughout, closing the gap `as_slice`/`read_at`/
-    // `copy_into` would otherwise read uninitialized memory through.
-    #[allow(deprecated)]
-    unsafe {
-      core::ptr::write_bytes(self.inner.dataPointer().as_ptr().cast::<u8>(), 0, byte_len);
-    }
-    Ok(())
+    Ok(Self { inner })
   }
 }
 

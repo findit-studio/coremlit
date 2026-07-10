@@ -26,12 +26,12 @@ fn provider_round_trip_preserves_names_shapes_and_data() {
   // MLMultiArray buffer; `from_raw`'s sole-ownership invariant tolerates
   // this only because every access below is read-only — a future edit must
   // not add mutation through either handle while the other is alive.
-  // `known_ptrs` is empty (not seeded with `features`'s own pointers, as
+  // `known_regions` is empty (not seeded with `features`'s own regions, as
   // `Model::predict` seeds it with its live inputs), so this aliasing is
   // not detected/copied here — that's exercised separately below.
-  let mut known_ptrs = Vec::new();
+  let mut known_regions = Vec::new();
   let back =
-    Features::from_provider(ProtocolObject::from_ref(&*provider), &mut known_ptrs).unwrap();
+    Features::from_provider(ProtocolObject::from_ref(&*provider), &mut known_regions).unwrap();
   let x = back.get("x").unwrap();
   assert_eq!(x.shape(), vec![2, 2]);
   assert_eq!(x.as_slice::<f32>().unwrap(), &[1.0, 2.0, 3.0, 4.0]);
@@ -64,9 +64,9 @@ fn from_provider_deep_copies_one_array_shared_under_two_names() {
   }
   .unwrap();
 
-  let mut known_ptrs = Vec::new();
+  let mut known_regions = Vec::new();
   let mut extracted =
-    Features::from_provider(ProtocolObject::from_ref(&*provider), &mut known_ptrs).unwrap();
+    Features::from_provider(ProtocolObject::from_ref(&*provider), &mut known_regions).unwrap();
 
   let a = extracted.get("a").unwrap();
   let b = extracted.get("b").unwrap();
@@ -86,7 +86,7 @@ fn from_provider_deep_copies_output_that_aliases_a_seeded_input() {
   // The identity/zero-copy model case: an output feature literally is one
   // of the caller's own (still-live) input arrays.
   let input = MultiArray::from_slice(&[2], &[5.0f32, 6.0]).unwrap();
-  let input_ptr = input.byte_range().0;
+  let input_region = input.byte_range();
 
   // SAFETY: as in `Features::to_provider`.
   let value: Retained<MLFeatureValue> =
@@ -106,11 +106,11 @@ fn from_provider_deep_copies_output_that_aliases_a_seeded_input() {
 
   // Simulates what `Model::predict` does before extracting: seed
   // `known_regions` with every live input's byte range.
-  let mut known_ptrs = vec![input_ptr];
+  let mut known_regions = vec![input_region];
   let extracted =
-    Features::from_provider(ProtocolObject::from_ref(&*provider), &mut known_ptrs).unwrap();
+    Features::from_provider(ProtocolObject::from_ref(&*provider), &mut known_regions).unwrap();
   let output = extracted.get("y").unwrap();
-  assert_ne!(output.byte_range().0, input_ptr);
+  assert_ne!(output.byte_range().0, input_region.0);
   assert_eq!(output.as_slice::<f32>().unwrap(), &[5.0, 6.0]);
 }
 

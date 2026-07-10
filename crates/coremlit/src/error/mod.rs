@@ -197,6 +197,8 @@ pub enum ShapeRequirement {
   LeadingDimsUnit,
   /// The shape must have at least one dimension.
   NonEmpty,
+  /// Every dimension must be nonzero.
+  NonZeroDims,
 }
 
 impl ShapeRequirement {
@@ -206,6 +208,7 @@ impl ShapeRequirement {
     match self {
       Self::LeadingDimsUnit => "all dimensions before the last must be 1",
       Self::NonEmpty => "the shape must have at least one dimension",
+      Self::NonZeroDims => "every dimension must be nonzero",
     }
   }
 }

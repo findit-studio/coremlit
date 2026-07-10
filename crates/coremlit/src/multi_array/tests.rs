@@ -358,3 +358,18 @@ fn f16_surface_rejects_shape_overflow() {
 fn surface_probe_is_true_on_this_host() {
   assert!(MultiArray::supports_surface());
 }
+
+#[test]
+fn f16_surface_rejects_zero_dimensions() {
+  for shape in [&[0usize][..], &[1, 0], &[0, 4]] {
+    let err = MultiArray::f16_surface(shape).unwrap_err();
+    assert_eq!(
+      err,
+      TensorError::UnsupportedShape {
+        shape: shape.to_vec(),
+        reason: ShapeRequirement::NonZeroDims,
+      },
+      "shape {shape:?}"
+    );
+  }
+}
