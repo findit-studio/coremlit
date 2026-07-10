@@ -8,4 +8,8 @@
 //! macOS only. Mirrors the CoreML surface used by Argmax's WhisperKit
 //! (`MLModelExtensions` / `MLMultiArrayExtensions` in argmax-oss-swift).
 
-// Modules land in Tasks 2-10; lib.rs starts empty on purpose.
+mod dtype;
+mod units;
+
+pub use dtype::DataType;
+pub use units::{ComputeUnits, ParseComputeUnitsError};
