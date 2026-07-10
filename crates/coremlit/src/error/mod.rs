@@ -137,6 +137,12 @@ pub enum TensorError {
     /// Bound it violated.
     len: usize,
   },
+  /// The data type cannot back an array (no known element size).
+  #[error("unsupported data type `{dtype}` for array construction")]
+  UnsupportedDataType {
+    /// The rejected data type.
+    dtype: DataType,
+  },
   /// CoreML rejected the array construction.
   #[error("core ml multi-array failure: {0}")]
   Native(NsErrorInfo),

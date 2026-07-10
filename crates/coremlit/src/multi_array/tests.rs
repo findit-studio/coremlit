@@ -62,3 +62,14 @@ fn as_slice_mut_writes_are_visible() {
   arr.as_slice_mut::<f32>().unwrap()[1] = 9.5;
   assert_eq!(arr.as_slice::<f32>().unwrap()[1], 9.5);
 }
+
+#[test]
+fn zeros_rejects_unknown_dtype() {
+  let err = MultiArray::zeros(&[4], DataType::Unknown(0)).unwrap_err();
+  assert_eq!(
+    err,
+    TensorError::UnsupportedDataType {
+      dtype: DataType::Unknown(0)
+    }
+  );
+}

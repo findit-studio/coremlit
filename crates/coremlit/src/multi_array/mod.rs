@@ -57,9 +57,19 @@ impl MultiArray {
   /// Allocates an array of `shape` and fills it with zero bytes.
   ///
   /// # Errors
+  /// [`TensorError::UnsupportedDataType`] if `dtype` has no known element
+  /// size (e.g. an unrecognized [`DataType::Unknown`] code); CoreML's
+  /// `initWithShape_dataType_error` does not reject such codes itself, and
+  /// an unsized dtype would make the zero-fill below unsound.
   /// [`TensorError::Native`] if CoreML rejects the allocation.
   pub fn zeros(shape: &[usize], dtype: DataType) -> Result<Self, TensorError> {
-    // SAFETY: valid shape array and data-type code; result checked.
+    if dtype.size_of().is_none() {
+      return Err(TensorError::UnsupportedDataType { dtype });
+    }
+    // SAFETY: valid shape array; `dtype` was checked above to have a known
+    // element size, so even though CoreML does not itself validate the
+    // data-type code, the buffer this allocates is one this crate knows how
+    // to size and zero-fill. Result checked.
     let inner = unsafe {
       MLMultiArray::initWithShape_dataType_error(
         MLMultiArray::alloc(),
@@ -168,6 +178,9 @@ impl MultiArray {
     &self.inner
   }
 
+  // INVARIANT: callers must pass the sole `Retained` reference to this
+  // array. `Send` and `as_slice_mut`'s exclusivity both assume no aliased
+  // handle exists (Retained is Clone, so this cannot be enforced by type).
   #[allow(dead_code)] // consumed from Task 7 (Features)
   pub(crate) fn from_raw(inner: Retained<MLMultiArray>) -> Self {
     Self { inner }
@@ -188,8 +201,16 @@ impl MultiArray {
   }
 
   fn fill_bytes_zero(&mut self) {
-    let byte_len = self.count() * self.data_type().size_of().unwrap_or(0);
-    // SAFETY: writing zero bytes within the allocation's length.
+    let byte_len = self.count()
+      * self
+        .data_type()
+        .size_of()
+        .expect("constructors validate the data type");
+    // SAFETY: `dataPointer` is non-null and suitably aligned for
+    // `data_type()`, and the allocation backing it is at least
+    // `count() * size_of(data_type())` bytes — guaranteed because every
+    // constructor validates the dtype before the CoreML allocation call
+    // (see `zeros`), so `byte_len` never exceeds the buffer.
     #[allow(deprecated)]
     unsafe {
       core::ptr::write_bytes(self.inner.dataPointer().as_ptr().cast::<u8>(), 0, byte_len);
