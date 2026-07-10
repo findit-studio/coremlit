@@ -10,6 +10,28 @@ use crate::{
   CompileError, ComputeUnits, DataType, Features, LoadError, NsErrorInfo, PredictionError,
 };
 
+/// Converts `path` to a file URL through the filesystem-representation API,
+/// preserving the exact on-disk bytes.
+///
+/// `Path::to_string_lossy` would substitute U+FFFD into any non-UTF-8
+/// component, silently pointing CoreML at a DIFFERENT path than the one the
+/// caller's `exists()` check validated. APFS enforces UTF-8 names, but
+/// network and foreign-filesystem mounts on macOS need not.
+fn file_url(path: &Path, is_directory: bool) -> Retained<NSURL> {
+  use std::os::unix::ffi::OsStrExt;
+  let bytes = std::ffi::CString::new(path.as_os_str().as_bytes())
+    .expect("callers verify the path exists, so it contains no interior NUL");
+  // SAFETY: `bytes` is a valid NUL-terminated filesystem representation
+  // borrowed for the duration of the call; the initializer copies it.
+  unsafe {
+    NSURL::fileURLWithFileSystemRepresentation_isDirectory_relativeToURL(
+      core::ptr::NonNull::new(bytes.as_ptr().cast_mut()).expect("CString pointer is non-null"),
+      is_directory,
+      None,
+    )
+  }
+}
+
 /// A loaded CoreML model.
 ///
 /// # Concurrency
@@ -145,11 +167,7 @@ impl Model {
         path: path.to_path_buf(),
       });
     }
-    // `fileURLWithPath`/`NSString::from_str` are safe constructors in this
-    // objc2-foundation version, so no `unsafe` is needed here.
-    let url = NSURL::fileURLWithPath(&objc2_foundation::NSString::from_str(
-      &path.to_string_lossy(),
-    ));
+    let url = file_url(path, path.is_dir());
     // SAFETY: fresh configuration object; setComputeUnits is a setter.
     let configuration = unsafe {
       let configuration = MLModelConfiguration::new();
@@ -222,9 +240,7 @@ impl Model {
         path: source.to_path_buf(),
       });
     }
-    let url = NSURL::fileURLWithPath(&objc2_foundation::NSString::from_str(
-      &source.to_string_lossy(),
-    ));
+    let url = file_url(source, source.is_dir());
     // SAFETY: blocking compile; Result-checked. The sync API is deprecated
     // in favor of the async block variant, which this sync crate
     // deliberately does not use.

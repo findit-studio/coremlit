@@ -104,3 +104,20 @@ fn stateless_model_accepts_state_prediction() {
   // checked value-for-value instead of shape-only.
   assert_eq!(stateful_values, plain_values);
 }
+
+#[test]
+#[ignore = "requires local tiny model (see plan Task 8 Step 1)"]
+fn loads_through_non_ascii_symlinked_path() {
+  // The exact-bytes path contract: a non-ASCII (multi-byte UTF-8) component
+  // must reach CoreML unaltered. (A lossy conversion would survive valid
+  // UTF-8 too, but this pins the filesystem-representation route end to
+  // end; APFS enforces UTF-8, so invalid bytes are not constructible here.)
+  let link_dir = std::env::temp_dir().join("coremlit-tests");
+  std::fs::create_dir_all(&link_dir).unwrap();
+  let link = link_dir.join("modèle-mel.mlmodelc");
+  let _ = std::fs::remove_file(&link);
+  std::os::unix::fs::symlink(common::tiny_dir().join("MelSpectrogram.mlmodelc"), &link).unwrap();
+  let model = Model::load(&link, ComputeUnits::CpuOnly).unwrap();
+  assert!(model.description().input("audio").is_some());
+  let _ = std::fs::remove_file(&link);
+}
