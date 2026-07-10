@@ -1,0 +1,14 @@
+[package]
+name = "whisperkit"
+description = "Rust port of WhisperKit: on-device Whisper speech-to-text on CoreML"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+coremlit.workspace = true
+
+[lints]
+workspace = true
