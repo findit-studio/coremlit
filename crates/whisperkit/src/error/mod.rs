@@ -108,6 +108,9 @@ pub enum DecodeError {
   /// missing.
   #[error("decoder output is missing cross-attention alignment data")]
   MissingAlignment,
+  /// The inference backend failed.
+  #[error("backend failure: {0}")]
+  Backend(#[from] crate::backend::BackendError),
 }
 
 /// Top-level transcription failure, composing every domain error (spec

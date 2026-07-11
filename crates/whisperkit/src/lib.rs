@@ -23,6 +23,10 @@
 //!   detection, device support).
 //! - [`audio`] — sans-I/O DSP over 16 kHz mono PCM: pad/trim, energy,
 //!   VAD, long-form chunking.
+//! - [`backend`] — [`InferenceBackend`](backend::InferenceBackend) trait
+//!   (mel/encode/decode-step seam), [`ModelDims`](backend::ModelDims), and
+//!   the scripted [`MockBackend`](backend::mock::MockBackend) test double
+//!   used for hermetic pipeline tests.
 //! - [`log`] — leveled logging with a replacing callback.
 //!
 //! # Example
@@ -57,6 +61,7 @@
 //! deferred there rather than living here ahead of anything to drive it.
 
 pub mod audio;
+pub mod backend;
 pub mod constants;
 pub mod error;
 pub mod log;
