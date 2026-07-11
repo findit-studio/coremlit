@@ -319,3 +319,75 @@ fn dtw_add_before_compare_matches_swift_rounding_ties() {
   assert_eq!(path.text_indices_slice(), &[0, 1, 1]);
   assert_eq!(path.time_indices_slice(), &[0, 0, 1]);
 }
+
+// SegmentSeeker.swift:498-526 -- word-duration constraints and
+// sentence-boundary truncation. Reuses the `word` helper above rather than
+// a separate `timing` helper of the same shape.
+
+#[test]
+fn duration_constraints_take_the_capped_upper_median() {
+  // SegmentSeeker.swift:498-507. Durations 0.2/0.4/0.6 (plus one
+  // zero-length word that must be filtered): sorted[3/2] = sorted[1] = 0.4.
+  let alignment = [
+    word("a", 0.0, 0.2),
+    word("b", 0.2, 0.6),
+    word("c", 0.6, 1.2),
+    word("z", 1.2, 1.2), // zero duration -> filtered before the median
+  ];
+  let constraints = calculate_word_duration_constraints(&alignment);
+  assert!((constraints.median() - 0.4).abs() < 1e-6);
+  assert!((constraints.max_duration() - 0.8).abs() < 1e-6);
+
+  // Median above the cap clamps to 0.7 (max 1.4).
+  let long = [word("a", 0.0, 1.0), word("b", 1.0, 2.0)];
+  let constraints = calculate_word_duration_constraints(&long);
+  assert!((constraints.median() - 0.7).abs() < 1e-6);
+  assert!((constraints.max_duration() - 1.4).abs() < 1e-6);
+
+  // Empty (or all-zero-duration) input -> zeros.
+  let constraints = calculate_word_duration_constraints(&[]);
+  assert_eq!(constraints.median(), 0.0);
+  assert_eq!(constraints.max_duration(), 0.0);
+}
+
+#[test]
+fn truncation_fires_only_at_sentence_boundaries() {
+  // SegmentSeeker.swift:509-526.
+  // Case A: the overlong word IS a sentence mark -> end pulled to start+max.
+  let alignment = vec![word(" ok", 0.0, 0.3), word(".", 0.3, 2.0)];
+  let out = truncate_long_words_at_sentence_boundaries(alignment, 0.5);
+  assert!((out[1].end() - 0.8).abs() < 1e-6);
+
+  // Case B: the PREVIOUS word is a mark -> start pulled to end-max.
+  let alignment = vec![word("!", 0.0, 0.1), word(" Next", 0.1, 2.0)];
+  let out = truncate_long_words_at_sentence_boundaries(alignment, 0.5);
+  assert!((out[1].start() - 1.5).abs() < 1e-6);
+
+  // Case C: no boundary involvement -> untouched, even when overlong;
+  // and " ." with whitespace is NOT a mark (exact whole-word match).
+  let alignment = vec![
+    word(" a", 0.0, 0.1),
+    word(" long", 0.1, 3.0),
+    word(" .", 3.0, 6.0),
+  ];
+  let out = truncate_long_words_at_sentence_boundaries(alignment, 0.5);
+  assert_eq!(out[1].end(), 3.0);
+  assert_eq!(out[2].end(), 6.0);
+
+  // Index 0 is never truncated (loop starts at 1).
+  let alignment = vec![word(".", 0.0, 5.0)];
+  let out = truncate_long_words_at_sentence_boundaries(alignment, 0.5);
+  assert_eq!(out[0].end(), 5.0);
+}
+
+// FoundationExtensions.swift:9-13 -- Float.rounded(_:), half-away-from-zero.
+// Correction to this task's brief, which cited :8-12: line 8 is the
+// enclosing `extension Float {`, and the function's closing brace is on
+// line 13, not included in :8-12.
+
+#[test]
+fn rounded_to_places_matches_swift_rounding() {
+  assert_eq!(rounded_to_places(1.234, 2), 1.23);
+  assert_eq!(rounded_to_places(1.235, 2), 1.24);
+  assert_eq!(rounded_to_places(-1.235, 2), -1.24);
+}

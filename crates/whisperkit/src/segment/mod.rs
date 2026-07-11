@@ -14,9 +14,11 @@
 //! Also home to the word-timestamp core: [`dynamic_time_warping`] (ports
 //! `dynamicTimeWarping(withMatrix:)`, `SegmentSeeker.swift:195-278`,
 //! tie-breaking in the private `min_cost_and_trace`, `:239-251`),
-//! [`find_alignment`] (`:340-408`), and [`merge_punctuations`]
-//! (`:280-338`). `addWordTimestamps` (`:410-`) — the orchestration wrapper
-//! that re-anchors these against a window's seek offset, clamps against
+//! [`find_alignment`] (`:340-408`), [`merge_punctuations`] (`:280-338`),
+//! [`calculate_word_duration_constraints`] and
+//! [`truncate_long_words_at_sentence_boundaries`] (`:498-526`).
+//! `addWordTimestamps` (`:410-`) — the orchestration wrapper that
+//! re-anchors these against a window's seek offset, clamps against
 //! `lastSpeechTimestamp`, and writes results back onto
 //! [`TranscriptionSegment`]s — is deferred to a later task; this module
 //! ships only the pure alignment math it depends on.
@@ -592,6 +594,133 @@ pub fn find_alignment(
   }
 
   Ok(word_timings)
+}
+
+// ---------------------------------------------------------------------
+// Word-duration constraints and sentence-boundary truncation
+// ---------------------------------------------------------------------
+
+/// The capped-median/max word-duration pair [`calculate_word_duration_constraints`]
+/// computes over one window's word alignment — Swift's anonymous
+/// `(median: Float, max: Float)` tuple return (`SegmentSeeker.swift:
+/// 498-507`). `Copy`, and deliberately has no constructor: unlike an
+/// options type, whose fields a caller assembles piecewise before the
+/// fact, both fields here only ever come out of that one function
+/// together, and `max` is always exactly `median * 2` — a public
+/// constructor would let a caller build a pair that violates that
+/// invariant. This type is a computation RESULT, not configuration; that
+/// is a deliberate departure from the options pattern, not an oversight.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WordDurationConstraints {
+  median: f32,
+  max: f32,
+}
+
+impl WordDurationConstraints {
+  /// The capped median word duration: `min(0.7, raw median)`, in seconds,
+  /// or `0.0` when the source alignment had no positive-duration word
+  /// (`SegmentSeeker.swift:502-503`).
+  #[inline(always)]
+  pub const fn median(&self) -> f32 {
+    self.median
+  }
+
+  /// The overlong-word threshold: always exactly twice [`Self::median`]
+  /// (`SegmentSeeker.swift:504`), consumed by
+  /// [`truncate_long_words_at_sentence_boundaries`].
+  #[inline(always)]
+  pub const fn max_duration(&self) -> f32 {
+    self.max
+  }
+}
+
+/// Computes the capped-median/max word-duration pair used to flag overlong
+/// words. Ports `calculateWordDurationConstraints`
+/// (`SegmentSeeker.swift:498-507`): every word whose `duration` is not
+/// strictly positive is dropped before the median is taken (`:499-500`,
+/// `filter { $0 > 0 }`); the median is the sorted list's UPPER middle
+/// element — `sorted[count / 2]`, integer division, NOT an average of the
+/// two middle values on an even count (`:502`); that raw median is then
+/// capped at `0.7` s (`:503`), and `max` is always twice the CAPPED
+/// value, never the raw one (`:504`). An empty `alignment`, or one where
+/// every word has zero or negative duration, yields `median = max = 0.0`.
+pub fn calculate_word_duration_constraints(alignment: &[WordTiming]) -> WordDurationConstraints {
+  let mut durations: Vec<f32> = alignment
+    .iter()
+    .map(WordTiming::duration)
+    .filter(|&duration| duration > 0.0)
+    .collect();
+  durations.sort_by(f32::total_cmp);
+
+  let raw_median = durations.get(durations.len() / 2).copied().unwrap_or(0.0);
+  let median = raw_median.min(0.7);
+  let max = median * 2.0;
+
+  WordDurationConstraints { median, max }
+}
+
+/// Sentence-ending marks [`truncate_long_words_at_sentence_boundaries`]
+/// matches a word's text against EXACTLY — no substring or trimmed match
+/// (Swift `sentenceEndMarks`, `SegmentSeeker.swift:510`; includes the CJK
+/// full-width punctuation forms alongside the ASCII ones).
+const SENTENCE_END_MARKS: [&str; 6] = [".", "。", "!", "！", "?", "？"];
+
+/// Clips words whose duration exceeds `max_duration` back down to it, but
+/// only where a sentence boundary justifies the clip — guards against a
+/// single misaligned DTW timestamp stretching one word far past its real
+/// span. Ports `truncateLongWordsAtSentenceBoundaries`
+/// (`SegmentSeeker.swift:509-526`) structure-preserving: index `0` is
+/// never inspected or modified (the loop runs `1..alignment.len()`,
+/// `:514`; Rust's half-open `Range` is simply empty rather than panicking
+/// when `alignment` itself is empty, so no separate emptiness guard is
+/// needed the way Swift's `1..<0` `ClosedRange` would require). For each
+/// later word whose `duration()` exceeds `max_duration`:
+/// - if the word's own text EXACTLY matches a mark in the internal
+///   `SENTENCE_END_MARKS` table (whole-word — `" ."` with a leading space
+///   does not qualify), its `end` is pulled back to `start + max_duration`;
+/// - otherwise, if the PRECEDING word's text exactly matches a mark, this
+///   word's `start` is pushed forward to `end - max_duration`.
+///
+/// These are `if`/`else if` branches (`:516-520`), so a word that is
+/// itself a mark AND immediately follows another mark only ever takes the
+/// first branch: its `end` is adjusted, its `start` never is.
+pub fn truncate_long_words_at_sentence_boundaries(
+  mut alignment: Vec<WordTiming>,
+  max_duration: f32,
+) -> Vec<WordTiming> {
+  for i in 1..alignment.len() {
+    if alignment[i].duration() > max_duration {
+      if SENTENCE_END_MARKS.contains(&alignment[i].word()) {
+        let start = alignment[i].start();
+        alignment[i].set_end(start + max_duration);
+      } else if SENTENCE_END_MARKS.contains(&alignment[i - 1].word()) {
+        let end = alignment[i].end();
+        alignment[i].set_start(end - max_duration);
+      }
+    }
+  }
+  alignment
+}
+
+/// Rounds `value` to `decimal_places` decimal digits, half-away-from-zero.
+/// Ports `Float.rounded(_:)` (`ArgmaxCore/FoundationExtensions.swift:
+/// 9-13`: `(self * divisor).rounded() / divisor`, where Swift's
+/// no-argument `.rounded()` defaults to rule `.toNearestOrAwayFromZero`).
+/// Rust's [`f32::round`] documents that exact rule (round half-way cases
+/// away from `0.0`), so this is a direct, unadjusted port. `pub(crate)`:
+/// no caller outside this crate needs it yet — Task 3's segment-update
+/// heuristics are the first consumer.
+///
+/// `#[allow(dead_code)]` (not `#[expect]`): this crate's own unit tests
+/// already call this function under `#[cfg(test)]`, so `dead_code`'s
+/// fulfillment differs by build — dead in a plain `cargo build`, live
+/// under `cargo test` — which would make `#[expect(dead_code)]` flag an
+/// "unfulfilled expectation" in the latter. Remove this attribute once
+/// Task 3 adds a non-test caller.
+#[allow(dead_code)]
+pub(crate) fn rounded_to_places(value: f32, decimal_places: i32) -> f32 {
+  let divisor = 10f32.powi(decimal_places);
+  (value * divisor).round() / divisor
 }
 
 #[cfg(test)]
