@@ -22,6 +22,7 @@ thiserror = "2"
 derive_more = { version = "2.1", features = ["display", "is_variant"] }
 tokenizers = { version = "0.23", default-features = false, features = ["unstable_wasm"] }
 flate2 = "1"
+unicode_categories = "0.1"
 serde = { version = "1", features = ["derive"] }
 humantime-serde = "1"
 tracing = "0.1"

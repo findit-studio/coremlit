@@ -12,3 +12,4 @@ pub mod constants;
 pub mod error;
 pub mod options;
 pub mod result;
+pub mod text;

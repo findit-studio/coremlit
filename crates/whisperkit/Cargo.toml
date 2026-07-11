@@ -14,6 +14,7 @@ flate2.workspace = true
 half.workspace = true
 thiserror.workspace = true
 tokenizers.workspace = true
+unicode_categories.workspace = true
 
 humantime-serde = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
