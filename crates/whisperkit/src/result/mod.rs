@@ -22,7 +22,7 @@
 //! this task's own brief (the "silence" short-circuit does not consult
 //! `avg_logprob`, contrary to the brief's exploration).
 
-use crate::options::DecodingOptions;
+use crate::{constants::DEFAULT_LANGUAGE_CODE, options::DecodingOptions};
 
 // ---------------------------------------------------------------------
 // WordTiming
@@ -1340,6 +1340,17 @@ impl TranscriptionResult {
 /// [`TranscriptionResult::timings`] instead of nesting per window), and
 /// `fallback` (the fallback decision is a pure function of this type,
 /// [`needs_fallback`], rather than a stored, mutually-recursive field).
+///
+/// One field goes the other way, beyond Swift's own set:
+/// [`Self::first_token_log_prob`]. Swift computes the first sampled
+/// token's log probability only transiently, inside the decode loop
+/// (`TextDecoder.swift:662-667`), to build a local `isFirstTokenLogProbTooLow`
+/// bool that never leaves the function. This port's decode loop
+/// ([`crate::decode::decode_text`]) has no such back door — its only
+/// output is this struct — so the raw value is stored here instead,
+/// letting a later fallback-ladder caller recompute the threshold
+/// comparison itself and pass it to [`needs_fallback`] (that function's
+/// own doc comment's "assumption (b)").
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DecodingResult {
@@ -1385,6 +1396,10 @@ pub struct DecodingResult {
   /// Compression ratio of `text` (repetition signal).
   #[cfg_attr(feature = "serde", serde(default))]
   compression_ratio: f32,
+  /// The first sampled token's raw log probability (not a Swift field —
+  /// see this struct's doc comment).
+  #[cfg_attr(feature = "serde", serde(default))]
+  first_token_log_prob: f32,
 }
 
 impl Default for DecodingResult {
@@ -1407,6 +1422,7 @@ impl DecodingResult {
       no_speech_prob: 0.0,
       temperature: 0.0,
       compression_ratio: 0.0,
+      first_token_log_prob: 0.0,
     }
   }
 
@@ -1592,6 +1608,292 @@ impl DecodingResult {
     self.compression_ratio = compression_ratio;
     self
   }
+
+  // -- first_token_log_prob ------------------------------------------------
+  /// The first sampled token's raw log probability (not a Swift field —
+  /// see this struct's doc comment).
+  #[inline(always)]
+  pub const fn first_token_log_prob(&self) -> f32 {
+    self.first_token_log_prob
+  }
+  /// Builder form of [`Self::set_first_token_log_prob`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_first_token_log_prob(mut self, first_token_log_prob: f32) -> Self {
+    self.set_first_token_log_prob(first_token_log_prob);
+    self
+  }
+  /// Sets [`Self::first_token_log_prob`] in place.
+  #[inline(always)]
+  pub const fn set_first_token_log_prob(&mut self, first_token_log_prob: f32) -> &mut Self {
+    self.first_token_log_prob = first_token_log_prob;
+    self
+  }
+}
+
+// ---------------------------------------------------------------------
+// TranscriptionProgress
+// ---------------------------------------------------------------------
+
+/// Live per-step decode progress (Swift `TranscriptionProgress`,
+/// `Models.swift:643-661`), delivered to a
+/// [`TranscriptionProgressCallback`](crate::decode::TranscriptionProgressCallback)
+/// after every non-completed decode step, prefill steps included.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TranscriptionProgress {
+  /// Timings accumulated so far this run.
+  #[cfg_attr(feature = "serde", serde(default))]
+  timings: TranscriptionTimings,
+  /// Decoded text so far.
+  #[cfg_attr(feature = "serde", serde(default))]
+  text: String,
+  /// Sampled token ids so far (prompt included).
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "Vec::is_empty")
+  )]
+  tokens: Vec<u32>,
+  /// Sampling temperature, once known.
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "Option::is_none")
+  )]
+  temperature: Option<f32>,
+  /// Average sampled-token log probability so far, once known.
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "Option::is_none")
+  )]
+  avg_logprob: Option<f32>,
+  /// Compression ratio of [`Self::text`] so far, once known.
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "Option::is_none")
+  )]
+  compression_ratio: Option<f32>,
+  /// Which decode window this progress update belongs to.
+  #[cfg_attr(feature = "serde", serde(default))]
+  window_id: usize,
+}
+
+impl TranscriptionProgress {
+  /// Builds a progress update from its three always-known fields (Swift
+  /// `TranscriptionProgress.init`, `Models.swift:652-660`, defaults every
+  /// other parameter to `nil`/`0`); the optional trio starts `None` and
+  /// [`Self::window_id`] starts `0`.
+  pub fn new(
+    timings: TranscriptionTimings,
+    text: impl Into<String>,
+    tokens: impl Into<Vec<u32>>,
+  ) -> Self {
+    Self {
+      timings,
+      text: text.into(),
+      tokens: tokens.into(),
+      temperature: None,
+      avg_logprob: None,
+      compression_ratio: None,
+      window_id: 0,
+    }
+  }
+
+  // -- timings --------------------------------------------------------------
+  /// Timings accumulated so far this run.
+  #[inline(always)]
+  pub const fn timings(&self) -> &TranscriptionTimings {
+    &self.timings
+  }
+  /// Builder form of [`Self::set_timings`].
+  #[must_use]
+  #[inline(always)]
+  pub fn with_timings(mut self, timings: TranscriptionTimings) -> Self {
+    self.set_timings(timings);
+    self
+  }
+  /// Sets [`Self::timings`] in place.
+  #[inline(always)]
+  pub fn set_timings(&mut self, timings: TranscriptionTimings) -> &mut Self {
+    self.timings = timings;
+    self
+  }
+
+  // -- text -------------------------------------------------------------
+  /// Decoded text so far.
+  #[inline(always)]
+  pub fn text(&self) -> &str {
+    self.text.as_str()
+  }
+  /// Builder form of [`Self::set_text`].
+  #[must_use]
+  #[inline(always)]
+  pub fn with_text(mut self, text: impl Into<String>) -> Self {
+    self.set_text(text);
+    self
+  }
+  /// Sets [`Self::text`] in place.
+  #[inline(always)]
+  pub fn set_text(&mut self, text: impl Into<String>) -> &mut Self {
+    self.text = text.into();
+    self
+  }
+
+  // -- tokens (Vec<u32>) -------------------------------------------------
+  /// Sampled token ids so far (prompt included).
+  #[inline(always)]
+  pub const fn tokens_slice(&self) -> &[u32] {
+    self.tokens.as_slice()
+  }
+  /// Builder form of [`Self::set_tokens`].
+  #[must_use]
+  #[inline(always)]
+  pub fn with_tokens(mut self, tokens: impl Into<Vec<u32>>) -> Self {
+    self.set_tokens(tokens);
+    self
+  }
+  /// Sets [`Self::tokens_slice`] in place.
+  #[inline(always)]
+  pub fn set_tokens(&mut self, tokens: impl Into<Vec<u32>>) -> &mut Self {
+    self.tokens = tokens.into();
+    self
+  }
+
+  // -- temperature (Option<f32>) -------------------------------------------
+  /// Sampling temperature, once known.
+  #[inline(always)]
+  pub const fn temperature(&self) -> Option<f32> {
+    self.temperature
+  }
+  /// Builder form of [`Self::set_temperature`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_temperature(mut self, temperature: f32) -> Self {
+    self.set_temperature(temperature);
+    self
+  }
+  /// Sets [`Self::temperature`] to `Some(temperature)`.
+  #[inline(always)]
+  pub const fn set_temperature(&mut self, temperature: f32) -> &mut Self {
+    self.temperature = Some(temperature);
+    self
+  }
+  /// Builder form of [`Self::update_temperature`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn maybe_temperature(mut self, temperature: Option<f32>) -> Self {
+    self.update_temperature(temperature);
+    self
+  }
+  /// Assigns [`Self::temperature`] directly.
+  #[inline(always)]
+  pub const fn update_temperature(&mut self, temperature: Option<f32>) -> &mut Self {
+    self.temperature = temperature;
+    self
+  }
+  /// Sets [`Self::temperature`] to `None`.
+  #[inline(always)]
+  pub const fn clear_temperature(&mut self) -> &mut Self {
+    self.temperature = None;
+    self
+  }
+
+  // -- avg_logprob (Option<f32>) -------------------------------------------
+  /// Average sampled-token log probability so far, once known.
+  #[inline(always)]
+  pub const fn avg_logprob(&self) -> Option<f32> {
+    self.avg_logprob
+  }
+  /// Builder form of [`Self::set_avg_logprob`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_avg_logprob(mut self, avg_logprob: f32) -> Self {
+    self.set_avg_logprob(avg_logprob);
+    self
+  }
+  /// Sets [`Self::avg_logprob`] to `Some(avg_logprob)`.
+  #[inline(always)]
+  pub const fn set_avg_logprob(&mut self, avg_logprob: f32) -> &mut Self {
+    self.avg_logprob = Some(avg_logprob);
+    self
+  }
+  /// Builder form of [`Self::update_avg_logprob`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn maybe_avg_logprob(mut self, avg_logprob: Option<f32>) -> Self {
+    self.update_avg_logprob(avg_logprob);
+    self
+  }
+  /// Assigns [`Self::avg_logprob`] directly.
+  #[inline(always)]
+  pub const fn update_avg_logprob(&mut self, avg_logprob: Option<f32>) -> &mut Self {
+    self.avg_logprob = avg_logprob;
+    self
+  }
+  /// Sets [`Self::avg_logprob`] to `None`.
+  #[inline(always)]
+  pub const fn clear_avg_logprob(&mut self) -> &mut Self {
+    self.avg_logprob = None;
+    self
+  }
+
+  // -- compression_ratio (Option<f32>) -------------------------------------
+  /// Compression ratio of [`Self::text`] so far, once known.
+  #[inline(always)]
+  pub const fn compression_ratio(&self) -> Option<f32> {
+    self.compression_ratio
+  }
+  /// Builder form of [`Self::set_compression_ratio`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_compression_ratio(mut self, compression_ratio: f32) -> Self {
+    self.set_compression_ratio(compression_ratio);
+    self
+  }
+  /// Sets [`Self::compression_ratio`] to `Some(compression_ratio)`.
+  #[inline(always)]
+  pub const fn set_compression_ratio(&mut self, compression_ratio: f32) -> &mut Self {
+    self.compression_ratio = Some(compression_ratio);
+    self
+  }
+  /// Builder form of [`Self::update_compression_ratio`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn maybe_compression_ratio(mut self, compression_ratio: Option<f32>) -> Self {
+    self.update_compression_ratio(compression_ratio);
+    self
+  }
+  /// Assigns [`Self::compression_ratio`] directly.
+  #[inline(always)]
+  pub const fn update_compression_ratio(&mut self, compression_ratio: Option<f32>) -> &mut Self {
+    self.compression_ratio = compression_ratio;
+    self
+  }
+  /// Sets [`Self::compression_ratio`] to `None`.
+  #[inline(always)]
+  pub const fn clear_compression_ratio(&mut self) -> &mut Self {
+    self.compression_ratio = None;
+    self
+  }
+
+  // -- window_id ------------------------------------------------------------
+  /// Which decode window this progress update belongs to.
+  #[inline(always)]
+  pub const fn window_id(&self) -> usize {
+    self.window_id
+  }
+  /// Builder form of [`Self::set_window_id`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_window_id(mut self, window_id: usize) -> Self {
+    self.set_window_id(window_id);
+    self
+  }
+  /// Sets [`Self::window_id`] in place.
+  #[inline(always)]
+  pub const fn set_window_id(&mut self, window_id: usize) -> &mut Self {
+    self.window_id = window_id;
+    self
+  }
 }
 
 // ---------------------------------------------------------------------
@@ -1694,6 +1996,232 @@ pub fn needs_fallback(
     return Some(FallbackReason::LogProbThreshold);
   }
   None
+}
+
+// ---------------------------------------------------------------------
+// merge_transcription_results
+// ---------------------------------------------------------------------
+
+/// Sums `f(result.timings())` over `results` — the "work time"/count merge
+/// rule (Swift `.reduce(0, +)`).
+fn sum_timing(results: &[TranscriptionResult], f: impl Fn(&TranscriptionTimings) -> f64) -> f64 {
+  results.iter().map(|r| f(r.timings())).sum()
+}
+
+/// Maximum of `f(result.timings())` over `results`, `0.0` if `results` is
+/// empty — the "load time" merge rule (Swift `.max() ?? 0`).
+fn max_timing(results: &[TranscriptionResult], f: impl Fn(&TranscriptionTimings) -> f64) -> f64 {
+  results
+    .iter()
+    .map(|r| f(r.timings()))
+    .max_by(f64::total_cmp)
+    .unwrap_or(0.0)
+}
+
+/// Minimum of `f(result.timings())` over `results`, `0.0` if `results` is
+/// empty — the "earliest pipeline mark" merge rule (Swift `.min() ?? 0`).
+fn min_timing(results: &[TranscriptionResult], f: impl Fn(&TranscriptionTimings) -> f64) -> f64 {
+  results
+    .iter()
+    .map(|r| f(r.timings()))
+    .min_by(f64::total_cmp)
+    .unwrap_or(0.0)
+}
+
+/// Merges several per-chunk/per-window [`TranscriptionResult`]s into one.
+/// Ports `TranscriptionUtilities.mergeTranscriptionResults`
+/// (`TranscriptionUtilities.swift:76-160`), minus the streaming-only
+/// `confirmedWords` parameter (Plan 4 territory): this port always takes
+/// Swift's plain-text-join `else` branch (:82-84), and `results` is a
+/// plain slice rather than Swift's `[TranscriptionResult?]` — there is no
+/// per-element "missing result" case to `compactMap` away here, so every
+/// entry of `results` participates (Swift's `validResults`).
+///
+/// - [`TranscriptionResult::text`][]: every result's text, joined with `"
+///   "` (:82-84; empty for empty `results`, matching `[].joined(separator:
+///   " ") == ""`).
+/// - [`TranscriptionResult::segments_slice`][]: every result's segments,
+///   concatenated in order, each re-`id`'d to `result_index +
+///   segment_index` (:89-94) — a faithful bug-for-bug port: upstream
+///   renumbers segments this way, not sequentially across the whole
+///   merged list (verified against source, not "fixed"). Swift's
+///   `previousSeek`/local `seekTime` bookkeeping in this same loop
+///   (:90-99) is not ported: it is dead code in the source itself — every
+///   value it computes is either overwritten next iteration or never read
+///   again, and the returned `TranscriptionResult(...)` call at the end
+///   never consumes it either. `results` are expected to already carry
+///   correct per-segment/per-result seek anchoring from
+///   [`crate::audio::chunker::apply_result_seek_offset`] before reaching
+///   this function, exactly as Swift's `updateSeekOffsetsForResults`
+///   re-anchors chunk results before its own call into this merge.
+/// - [`TranscriptionResult::language`][]: the first result's language, or
+///   [`DEFAULT_LANGUAGE_CODE`] if `results` is empty (:104).
+/// - [`TranscriptionResult::timings`][]: [`TranscriptionTimings::model_loading`]/
+///   [`prewarm_load_time`](TranscriptionTimings::prewarm_load_time)/
+///   [`encoder_load_time`](TranscriptionTimings::encoder_load_time)/
+///   [`decoder_load_time`](TranscriptionTimings::decoder_load_time)/
+///   [`tokenizer_load_time`](TranscriptionTimings::tokenizer_load_time)
+///   take the max across results; every work-time/count field sums
+///   (:106-152); [`pipeline_start`](TranscriptionTimings::pipeline_start)/
+///   [`first_token_time`](TranscriptionTimings::first_token_time) take the
+///   min; [`input_audio_seconds`](TranscriptionTimings::input_audio_seconds)
+///   sums; [`full_pipeline`](TranscriptionTimings::full_pipeline) is
+///   `user_pipeline_duration.min(system_pipeline_duration)`, where
+///   `user_pipeline_duration` is the wall-clock span from the earliest
+///   `pipeline_start` to the latest `pipeline_start + full_pipeline`
+///   across results, and `system_pipeline_duration` is the sum of every
+///   result's own `full_pipeline`. **Documented deviation — the
+///   all-sentinel case is special-cased**, because this port's inputs
+///   differ from Swift's: Swift's `TranscribeTask.run` stamps a real
+///   `CFAbsoluteTimeGetCurrent()` into `pipelineStart`
+///   (`TranscribeTask.swift:65`), so its merge always sees finite starts;
+///   neither this crate's [`TranscribeTask::run`](crate::transcribe::TranscribeTask::run)
+///   nor [`crate::decode::detect_language`] ever populates
+///   `pipeline_start`/`first_token_time` (no absolute wall clock exists
+///   in this sync port to stamp them with — see `crate::decode`'s module
+///   doc), so every real result's `pipeline_start` is still
+///   [`DEFAULT_PIPELINE_TIME_SENTINEL`] (`f64::MAX`), where the verbatim
+///   Swift subtraction silently degenerates to `0.0` and would zero out
+///   the merged `full_pipeline` entirely (see the in-body comment for the
+///   exact float arithmetic). When no result carries a real
+///   `pipeline_start`, `user_pipeline_duration` is therefore treated as
+///   unbounded, collapsing the formula to `system_pipeline_duration` —
+///   the sum, the honest value for sync sequential composition. Results
+///   that do carry real stamps still merge through Swift's formula
+///   verbatim.
+///   [`encoder_specialization_time`](TranscriptionTimings::encoder_specialization_time)/
+///   [`decoder_specialization_time`](TranscriptionTimings::decoder_specialization_time)
+///   are **not** carried into the merged timings — Swift's own
+///   `TranscriptionTimings(...)` call inside `mergeTranscriptionResults`
+///   omits both parameters, so they take that initializer's `0` default
+///   regardless of what the source results held; ported faithfully
+///   (left at [`TranscriptionTimings::new`]'s own `0.0` default) rather
+///   than folded into the max-for-load-times group they would naively
+///   belong to.
+pub fn merge_transcription_results(results: &[TranscriptionResult]) -> TranscriptionResult {
+  let text = results
+    .iter()
+    .map(TranscriptionResult::text)
+    .collect::<Vec<_>>()
+    .join(" ");
+
+  let mut segments = Vec::new();
+  for (result_index, result) in results.iter().enumerate() {
+    for (segment_index, segment) in result.segments_slice().iter().enumerate() {
+      segments.push(segment.clone().with_id(result_index + segment_index));
+    }
+  }
+
+  let language = results.first().map_or_else(
+    || DEFAULT_LANGUAGE_CODE.to_string(),
+    |first| first.language().to_string(),
+  );
+
+  let earliest_pipeline_start = min_timing(results, TranscriptionTimings::pipeline_start);
+  let latest_pipeline_end = results
+    .iter()
+    .map(|r| r.timings().pipeline_start() + r.timings().full_pipeline())
+    .max_by(f64::total_cmp)
+    .unwrap_or(0.0);
+  // With NO real pipeline_start stamped anywhere (every value still the
+  // f64::MAX sentinel — what every result this sync port produces looks
+  // like), the wall-clock span is unknowable and the subtraction below
+  // would silently compute 0.0, NOT the intended sum: `f64::MAX +
+  // full_pipeline` ABSORBS back to exactly f64::MAX (the ULP at that
+  // magnitude is ~2e292, far above any real duration; it does not
+  // overflow to infinity), so `latest - earliest` is `f64::MAX - f64::MAX
+  // == 0.0` and the min() would zero out full_pipeline. An unknowable
+  // user duration is unbounded, not zero — INFINITY hands min() to the
+  // summed work time. A mixed batch (some real stamps) needs no guard:
+  // `earliest` is then finite and `latest` is ~f64::MAX, so the huge span
+  // already loses the min() to the sum on its own.
+  let user_pipeline_duration = if earliest_pipeline_start == DEFAULT_PIPELINE_TIME_SENTINEL {
+    f64::INFINITY
+  } else {
+    latest_pipeline_end - earliest_pipeline_start
+  };
+  let system_pipeline_duration = sum_timing(results, TranscriptionTimings::full_pipeline);
+
+  let mut timings = TranscriptionTimings::new();
+  timings
+    .set_model_loading(max_timing(results, TranscriptionTimings::model_loading))
+    .set_prewarm_load_time(max_timing(results, TranscriptionTimings::prewarm_load_time))
+    .set_encoder_load_time(max_timing(results, TranscriptionTimings::encoder_load_time))
+    .set_decoder_load_time(max_timing(results, TranscriptionTimings::decoder_load_time))
+    .set_tokenizer_load_time(max_timing(
+      results,
+      TranscriptionTimings::tokenizer_load_time,
+    ))
+    .set_audio_loading(sum_timing(results, TranscriptionTimings::audio_loading))
+    .set_audio_processing(sum_timing(results, TranscriptionTimings::audio_processing))
+    .set_logmels(sum_timing(results, TranscriptionTimings::logmels))
+    .set_encoding(sum_timing(results, TranscriptionTimings::encoding))
+    .set_decoding_init(sum_timing(results, TranscriptionTimings::decoding_init))
+    .set_decoding_loop(sum_timing(results, TranscriptionTimings::decoding_loop))
+    .set_decoding_predictions(sum_timing(
+      results,
+      TranscriptionTimings::decoding_predictions,
+    ))
+    .set_decoding_filtering(sum_timing(
+      results,
+      TranscriptionTimings::decoding_filtering,
+    ))
+    .set_decoding_sampling(sum_timing(results, TranscriptionTimings::decoding_sampling))
+    .set_decoding_fallback(sum_timing(results, TranscriptionTimings::decoding_fallback))
+    .set_decoding_windowing(sum_timing(
+      results,
+      TranscriptionTimings::decoding_windowing,
+    ))
+    .set_decoding_kv_caching(sum_timing(
+      results,
+      TranscriptionTimings::decoding_kv_caching,
+    ))
+    .set_decoding_word_timestamps(sum_timing(
+      results,
+      TranscriptionTimings::decoding_word_timestamps,
+    ))
+    .set_decoding_non_prediction(sum_timing(
+      results,
+      TranscriptionTimings::decoding_non_prediction,
+    ))
+    .set_total_audio_processing_runs(sum_timing(
+      results,
+      TranscriptionTimings::total_audio_processing_runs,
+    ))
+    .set_total_logmel_runs(sum_timing(results, TranscriptionTimings::total_logmel_runs))
+    .set_total_encoding_runs(sum_timing(
+      results,
+      TranscriptionTimings::total_encoding_runs,
+    ))
+    .set_total_decoding_loops(sum_timing(
+      results,
+      TranscriptionTimings::total_decoding_loops,
+    ))
+    .set_total_kv_update_runs(sum_timing(
+      results,
+      TranscriptionTimings::total_kv_update_runs,
+    ))
+    .set_total_timestamp_alignment_runs(sum_timing(
+      results,
+      TranscriptionTimings::total_timestamp_alignment_runs,
+    ))
+    .set_total_decoding_fallbacks(sum_timing(
+      results,
+      TranscriptionTimings::total_decoding_fallbacks,
+    ))
+    .set_total_decoding_windows(sum_timing(
+      results,
+      TranscriptionTimings::total_decoding_windows,
+    ))
+    .set_input_audio_seconds(sum_timing(
+      results,
+      TranscriptionTimings::input_audio_seconds,
+    ))
+    .set_full_pipeline(user_pipeline_duration.min(system_pipeline_duration))
+    .set_pipeline_start(earliest_pipeline_start)
+    .set_first_token_time(min_timing(results, TranscriptionTimings::first_token_time));
+
+  TranscriptionResult::new(text, segments, language, timings)
 }
 
 #[cfg(test)]

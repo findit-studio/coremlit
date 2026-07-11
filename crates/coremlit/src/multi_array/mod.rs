@@ -41,6 +41,12 @@ impl Element for i32 {
 #[derive(Debug)]
 pub struct MultiArray {
   inner: Retained<MLMultiArray>,
+  // Cached at construction: an MLMultiArray's shape and strides are fixed
+  // at init and never change for the array's lifetime, so one FFI read at
+  // wrap time serves every later accessor call — the decoder loop reads
+  // these many times per step (byte ranges, bounds checks, contiguity).
+  shape: Vec<usize>,
+  strides: Vec<usize>,
 }
 
 // SAFETY: MLMultiArray owns its buffer; ownership transfer across threads is
@@ -113,7 +119,7 @@ impl MultiArray {
       )
     }
     .map_err(|e| TensorError::Native(NsErrorInfo::from_ns_error(&e)))?;
-    let mut this = Self { inner };
+    let mut this = Self::from_raw(inner);
     // MLMultiArray does not guarantee zeroed memory; mirror ArgmaxCore's
     // explicit initialValue fill.
     this.fill_bytes_zero()?;
@@ -142,22 +148,16 @@ impl MultiArray {
     Ok(this)
   }
 
-  /// The dimension sizes.
-  pub fn shape(&self) -> Vec<usize> {
-    // SAFETY: accessor message send on a live object.
-    unsafe { self.inner.shape() }
-      .iter()
-      .map(|n| n.as_usize())
-      .collect()
+  /// The dimension sizes (cached at construction — the layout of an
+  /// `MLMultiArray` never changes after init).
+  pub fn shape(&self) -> &[usize] {
+    &self.shape
   }
 
-  /// The stride, in elements, of each dimension.
-  pub fn strides(&self) -> Vec<usize> {
-    // SAFETY: accessor message send on a live object.
-    unsafe { self.inner.strides() }
-      .iter()
-      .map(|n| n.as_usize())
-      .collect()
+  /// The stride, in elements, of each dimension (cached at construction
+  /// — see [`Self::shape`]).
+  pub fn strides(&self) -> &[usize] {
+    &self.strides
   }
 
   /// Whether the elements are laid out contiguously in row-major order.
@@ -170,7 +170,7 @@ impl MultiArray {
     let strides = self.strides();
     let mut expected = 1usize;
     // Walk dims minor→major comparing against canonical row-major strides.
-    for (dim, stride) in shape.iter().zip(&strides).rev() {
+    for (dim, stride) in shape.iter().zip(strides).rev() {
       if *stride != expected {
         return false;
       }
@@ -213,8 +213,8 @@ impl MultiArray {
     self.check_dtype::<T>()?;
     if !self.is_contiguous() {
       return Err(TensorError::NonContiguous {
-        shape: self.shape(),
-        strides: self.strides(),
+        shape: self.shape().to_vec(),
+        strides: self.strides().to_vec(),
       });
     }
     // SAFETY: dtype checked; contiguity checked above, so the flat range
@@ -242,8 +242,8 @@ impl MultiArray {
     self.check_dtype::<T>()?;
     if !self.is_contiguous() {
       return Err(TensorError::NonContiguous {
-        shape: self.shape(),
-        strides: self.strides(),
+        shape: self.shape().to_vec(),
+        strides: self.strides().to_vec(),
       });
     }
     // SAFETY: as in `as_slice` (dtype and contiguity both checked above),
@@ -272,19 +272,19 @@ impl MultiArray {
     }
     let strides = self.strides();
     let mut offset = 0usize;
-    for ((&index, &dim), &stride) in indices.iter().zip(&shape).zip(&strides) {
+    for ((&index, &dim), &stride) in indices.iter().zip(shape).zip(strides) {
       if index >= dim {
         return Err(TensorError::IndexOutOfBounds { index, len: dim });
       }
       let term = index
         .checked_mul(stride)
         .ok_or_else(|| TensorError::ShapeOverflow {
-          shape: shape.clone(),
+          shape: shape.to_vec(),
         })?;
       offset = offset
         .checked_add(term)
         .ok_or_else(|| TensorError::ShapeOverflow {
-          shape: shape.clone(),
+          shape: shape.to_vec(),
         })?;
     }
     Ok(offset)
@@ -323,15 +323,21 @@ impl MultiArray {
   where
     T: Element,
   {
-    let shape = self.shape();
-    if shape.len() >= 2 && shape[..shape.len() - 1].iter().any(|&dim| dim != 1) {
-      return Err(TensorError::UnsupportedShape {
-        shape,
-        reason: ShapeRequirement::LeadingDimsUnit,
-      });
-    }
-    let last = shape.last().copied().unwrap_or(0);
-    let stride = self.strides().last().copied().unwrap_or(1);
+    // Copy the scalars out so the cached-shape borrow ends before the
+    // mutating writes below.
+    let (last, stride) = {
+      let shape = self.shape();
+      if shape.len() >= 2 && shape[..shape.len() - 1].iter().any(|&dim| dim != 1) {
+        return Err(TensorError::UnsupportedShape {
+          shape: shape.to_vec(),
+          reason: ShapeRequirement::LeadingDimsUnit,
+        });
+      }
+      (
+        shape.last().copied().unwrap_or(0),
+        self.strides().last().copied().unwrap_or(1),
+      )
+    };
     for &position in positions {
       if position >= last {
         return Err(TensorError::IndexOutOfBounds {
@@ -344,7 +350,7 @@ impl MultiArray {
       let offset = position
         .checked_mul(stride)
         .ok_or_else(|| TensorError::ShapeOverflow {
-          shape: shape.clone(),
+          shape: self.shape().to_vec(),
         })?;
       self.write_element(offset, value)?;
     }
@@ -425,32 +431,32 @@ impl MultiArray {
     let leading_strides = &strides[..rank - 1];
     let num_rows = checked_element_count(leading_dims)?;
 
-    let mut row_indices = vec![0usize; leading_dims.len()];
     for row in 0..num_rows {
       // Unravel `row` into a multi-index over `leading_dims`, row-major
-      // (the last leading dimension varies fastest).
+      // (the last leading dimension varies fastest), folding the
+      // stride-weighted sum in the same pass — no per-call index buffer,
+      // so the decoder's padded-output gathers allocate nothing.
       let mut remainder = row;
-      for i in (0..leading_dims.len()).rev() {
-        row_indices[i] = remainder % leading_dims[i];
-        remainder /= leading_dims[i];
-      }
       let mut row_start = 0usize;
-      for (&index, &stride) in row_indices.iter().zip(leading_strides) {
-        let term = index
-          .checked_mul(stride)
-          .ok_or_else(|| TensorError::ShapeOverflow {
-            shape: shape.clone(),
-          })?;
+      for i in (0..leading_dims.len()).rev() {
+        let index = remainder % leading_dims[i];
+        remainder /= leading_dims[i];
+        let term =
+          index
+            .checked_mul(leading_strides[i])
+            .ok_or_else(|| TensorError::ShapeOverflow {
+              shape: shape.to_vec(),
+            })?;
         row_start = row_start
           .checked_add(term)
           .ok_or_else(|| TensorError::ShapeOverflow {
-            shape: shape.clone(),
+            shape: shape.to_vec(),
           })?;
       }
       let out_start = row
         .checked_mul(last_dim)
         .ok_or_else(|| TensorError::ShapeOverflow {
-          shape: shape.clone(),
+          shape: shape.to_vec(),
         })?;
 
       if last_stride == 1 {
@@ -476,12 +482,12 @@ impl MultiArray {
           let extra = last
             .checked_mul(last_stride)
             .ok_or_else(|| TensorError::ShapeOverflow {
-              shape: shape.clone(),
+              shape: shape.to_vec(),
             })?;
           let offset = row_start
             .checked_add(extra)
             .ok_or_else(|| TensorError::ShapeOverflow {
-              shape: shape.clone(),
+              shape: shape.to_vec(),
             })?;
           // SAFETY: dtype checked above; `offset` is a valid in-bounds
           // element offset for the same reason as the contiguous-row
@@ -518,10 +524,10 @@ impl MultiArray {
       MultiArray::from_slice(shape, &buf)
     }
     match self.data_type() {
-      DataType::F16 => copy_typed::<f16>(self, &shape),
-      DataType::F32 => copy_typed::<f32>(self, &shape),
-      DataType::F64 => copy_typed::<f64>(self, &shape),
-      DataType::I32 => copy_typed::<i32>(self, &shape),
+      DataType::F16 => copy_typed::<f16>(self, shape),
+      DataType::F32 => copy_typed::<f32>(self, shape),
+      DataType::F64 => copy_typed::<f64>(self, shape),
+      DataType::I32 => copy_typed::<i32>(self, shape),
       dtype @ DataType::Unknown(_) => Err(TensorError::UnsupportedDataType { dtype }),
     }
   }
@@ -550,7 +556,7 @@ impl MultiArray {
       .shape()
       .iter()
       .zip(self.strides())
-      .fold(1usize, |acc, (&dim, stride)| {
+      .fold(1usize, |acc, (&dim, &stride)| {
         acc.saturating_add(dim.saturating_sub(1).saturating_mul(stride))
       })
       .max(self.count());
@@ -566,7 +572,22 @@ impl MultiArray {
   // array. `Send` and `as_slice_mut`'s exclusivity both assume no aliased
   // handle exists (Retained is Clone, so this cannot be enforced by type).
   pub(crate) fn from_raw(inner: Retained<MLMultiArray>) -> Self {
-    Self { inner }
+    // SAFETY: accessor message sends on a live object; both values are
+    // fixed at the array's init, so reading them once here is exhaustive.
+    let shape = unsafe { inner.shape() }
+      .iter()
+      .map(|n| n.as_usize())
+      .collect();
+    // SAFETY: as above — accessor message send on the same live object.
+    let strides = unsafe { inner.strides() }
+      .iter()
+      .map(|n| n.as_usize())
+      .collect();
+    Self {
+      inner,
+      shape,
+      strides,
+    }
   }
 
   fn check_dtype<T>(&self) -> Result<(), TensorError>
@@ -617,7 +638,7 @@ impl MultiArray {
           .expect("constructors validate the data type"),
       )
       .ok_or_else(|| TensorError::ShapeOverflow {
-        shape: self.shape(),
+        shape: self.shape().to_vec(),
       })?;
     // SAFETY: `dataPointer` is non-null and suitably aligned for
     // `data_type()`, and the allocation backing it is at least
@@ -806,7 +827,7 @@ impl MultiArray {
     let inner = unsafe {
       MLMultiArray::initWithPixelBuffer_shape(MLMultiArray::alloc(), &buffer, &ns_shape(shape))
     };
-    Ok(Self { inner })
+    Ok(Self::from_raw(inner))
   }
 }
 

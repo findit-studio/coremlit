@@ -13,6 +13,7 @@ derive_more.workspace = true
 flate2.workspace = true
 libc.workspace = true
 mach2.workspace = true
+rand.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokenizers.workspace = true
@@ -26,6 +27,8 @@ serde = ["dep:serde"]
 tracing = ["dep:tracing"]
 
 [dev-dependencies]
+hound.workspace = true
+serde = { workspace = true, features = ["derive"] }
 tempfile.workspace = true
 
 [lints]

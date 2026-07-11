@@ -87,7 +87,12 @@ pub enum AudioError {
 }
 
 /// Failure running or interpreting a decoder step.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+///
+/// Not `Clone`/`PartialEq`/`Eq` (unlike its sibling domain-error enums):
+/// [`Self::Tokenizer`] wraps [`TokenizerError`], which itself wraps the
+/// foreign `tokenizers::Error` (`Box<dyn std::error::Error + Send +
+/// Sync>`) and so cannot implement any of the three.
+#[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum DecodeError {
   /// The CoreML runtime failed to run the decoder model.
@@ -108,6 +113,40 @@ pub enum DecodeError {
   /// missing.
   #[error("decoder output is missing cross-attention alignment data")]
   MissingAlignment,
+  /// The inference backend failed.
+  #[error("backend failure: {0}")]
+  Backend(#[from] crate::backend::BackendError),
+  /// Converting sampled token ids back to text failed (the decode loop's
+  /// per-step progress callback and its final result both decode through
+  /// the tokenizer).
+  #[error("tokenizer decode failed: {0}")]
+  Tokenizer(#[from] TokenizerError),
+}
+
+/// Failure seeking to the next decode window or slicing a window's decode
+/// result into segments.
+///
+/// Not `Clone`/`PartialEq`/`Eq` (unlike its sibling domain-error enums, same
+/// reason as [`DecodeError`]): [`Self::Tokenizer`] wraps [`TokenizerError`],
+/// which itself wraps the foreign `tokenizers::Error` and so cannot
+/// implement any of the three.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SegmentError {
+  /// A word-alignment matrix did not have the expected 2D shape, or its
+  /// flattened element count did not match `rows * cols`.
+  #[error("invalid alignment matrix shape: {rows} rows x {cols} cols, but data has {len} elements")]
+  InvalidAlignmentShape {
+    /// Expected row count (text tokens).
+    rows: usize,
+    /// Expected column count (audio tokens).
+    cols: usize,
+    /// Actual flattened element count.
+    len: usize,
+  },
+  /// Decoding a slice's tokens back to text failed.
+  #[error("tokenizer decode failed: {0}")]
+  Tokenizer(#[from] TokenizerError),
 }
 
 /// Top-level transcription failure, composing every domain error (spec
@@ -127,6 +166,9 @@ pub enum TranscribeError {
   /// A decode-step failure.
   #[error("decode error: {0}")]
   Decode(#[from] DecodeError),
+  /// A segment-seeking or slicing failure.
+  #[error("segment error: {0}")]
+  Segment(#[from] SegmentError),
 }
 
 #[cfg(test)]

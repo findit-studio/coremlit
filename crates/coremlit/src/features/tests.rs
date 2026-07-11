@@ -143,3 +143,23 @@ fn overlapping_offset_regions_are_detected() {
   assert!(!known.iter().any(|&k| k.0 < adjacent.1 && adjacent.0 < k.1));
   known.push(adjacent);
 }
+
+#[test]
+fn provider_from_borrowed_pairs_round_trips() {
+  let x = MultiArray::from_slice(&[2], &[1.0f32, 2.0]).unwrap();
+  let y = MultiArray::from_slice(&[1], &[3.0f32]).unwrap();
+  let provider = super::provider_from_pairs([("x", &x), ("y", &y)].into_iter()).unwrap();
+  // `known_regions` empty: this test checks the round-trip itself, not
+  // aliasing detection (exercised separately above), matching
+  // `provider_round_trip_preserves_names_shapes_and_data`'s own precedent.
+  let mut known_regions = Vec::new();
+  let back =
+    Features::from_provider(ProtocolObject::from_ref(&*provider), &mut known_regions).unwrap();
+  assert_eq!(
+    back.get("x").unwrap().as_slice::<f32>().unwrap(),
+    &[1.0, 2.0]
+  );
+  assert_eq!(back.get("y").unwrap().as_slice::<f32>().unwrap(), &[3.0]);
+  // x and y are still owned and usable here — nothing moved.
+  assert_eq!(x.count() + y.count(), 3);
+}

@@ -9,6 +9,9 @@ pub const WINDOW_SAMPLES: usize = 480_000;
 pub const WINDOW_SECONDS: f32 = 30.0;
 /// Maximum decoder token context (Swift: `448 / 2`).
 pub const MAX_TOKEN_CONTEXT: usize = 224;
+/// Seconds spanned by one timestamp-token step (`<|0.00|>` to `<|0.02|>`).
+/// Ports `WhisperKit.secondsPerTimeToken` (`Core/WhisperKit.swift:40`).
+pub const SECONDS_PER_TIME_TOKEN: f32 = 0.02;
 /// Fallback language when detection is off and none is set.
 pub const DEFAULT_LANGUAGE_CODE: &str = "en";
 /// Punctuation merged onto the FOLLOWING word by word-timestamp merging

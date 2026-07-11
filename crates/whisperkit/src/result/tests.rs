@@ -2,6 +2,87 @@ use super::*;
 use crate::options::DecodingOptions;
 
 // ---------------------------------------------------------------------
+// merge_transcription_results
+// ---------------------------------------------------------------------
+
+#[test]
+fn merge_transcription_results_concatenates_and_reids() {
+  // NOTE: the brief's literal snippet called `TranscriptionResult::new()`
+  // with no arguments; the shipped constructor requires all four fields
+  // (text, segments, language, timings) with no defaulted/zero-arg form
+  // (this module's own doc: "no honest default means no Default" applies
+  // equally to a bare `new()`). Built blank here, then mutated via the
+  // `set_*` calls the brief's snippet already used. Likewise `.into()` on
+  // the string literals is dropped: against `set_text`/`set_language`'s
+  // generic `impl Into<String>` parameter it is ambiguous (E0283 - `&str`
+  // implements `Into<T>` for several `T`), the same fix already applied
+  // to `WordTiming::new`'s call site above.
+  let mut first = TranscriptionResult::new("", Vec::new(), "", TranscriptionTimings::new());
+  let mut seg0 = TranscriptionSegment::new();
+  seg0.set_id(0).set_start(0.0).set_end(1.0);
+  first
+    .set_text("hello")
+    .set_segments(vec![seg0])
+    .set_language("en");
+  let mut second = TranscriptionResult::new("", Vec::new(), "", TranscriptionTimings::new());
+  let mut seg1 = TranscriptionSegment::new();
+  seg1.set_id(0).set_start(30.0).set_end(31.0);
+  second.set_text("world").set_segments(vec![seg1]);
+  let merged = merge_transcription_results(&[first, second]);
+  assert_eq!(merged.text(), "hello world");
+  assert_eq!(merged.segments_slice().len(), 2);
+  assert_eq!(merged.segments_slice()[1].id(), 1); // resultIndex + segmentIndex (:89-94)
+  assert_eq!(merged.language(), "en");
+}
+
+#[test]
+fn merge_full_pipeline_sums_when_pipeline_start_is_never_stamped() {
+  // Regression (task-12 review): with every pipeline_start at the
+  // "never stamped" sentinel (f64::MAX) — which is what every result this
+  // sync port produces looks like — the merged full_pipeline must be the
+  // sum of the per-result full_pipelines. The naive Swift formula
+  // degenerates here: f64::MAX + full_pipeline ABSORBS (the ULP at that
+  // magnitude is ~2e292, so the sum rounds back to exactly f64::MAX, it
+  // does NOT overflow to infinity), making user_pipeline_duration
+  // f64::MAX - f64::MAX == 0.0 and min() zero out the real sum.
+  let mut timings_a = TranscriptionTimings::new();
+  timings_a
+    .set_full_pipeline(2.0)
+    .set_total_decoding_loops(10.0);
+  let a = TranscriptionResult::new("a", Vec::new(), "en", timings_a);
+  let mut timings_b = TranscriptionTimings::new();
+  timings_b
+    .set_full_pipeline(3.0)
+    .set_total_decoding_loops(20.0);
+  let b = TranscriptionResult::new("b", Vec::new(), "en", timings_b);
+  let merged = merge_transcription_results(&[a, b]);
+  assert_eq!(merged.timings().full_pipeline(), 5.0);
+  // The derived projections must therefore be live, not zeroed.
+  assert_eq!(merged.timings().tokens_per_second(), 30.0 / 5.0);
+  // The sentinel itself survives the merge (min of sentinels), matching
+  // Swift's own formula on the same input.
+  assert_eq!(merged.timings().pipeline_start(), f64::MAX);
+  assert_eq!(merged.timings().first_token_time(), f64::MAX);
+}
+
+#[test]
+fn merge_full_pipeline_takes_wall_clock_span_when_starts_are_real() {
+  // The general Swift formula (TranscriptionUtilities.swift:110-114) on
+  // results that DO carry real pipeline_start stamps: two overlapping
+  // concurrent pipelines, user span = (101 + 3) - 100 = 4, system sum =
+  // 2 + 3 = 5, merged full_pipeline = min(4, 5) = 4.
+  let mut timings_a = TranscriptionTimings::new();
+  timings_a.set_pipeline_start(100.0).set_full_pipeline(2.0);
+  let a = TranscriptionResult::new("a", Vec::new(), "en", timings_a);
+  let mut timings_b = TranscriptionTimings::new();
+  timings_b.set_pipeline_start(101.0).set_full_pipeline(3.0);
+  let b = TranscriptionResult::new("b", Vec::new(), "en", timings_b);
+  let merged = merge_transcription_results(&[a, b]);
+  assert_eq!(merged.timings().full_pipeline(), 4.0);
+  assert_eq!(merged.timings().pipeline_start(), 100.0);
+}
+
+// ---------------------------------------------------------------------
 // FallbackReason / needs_fallback
 // ---------------------------------------------------------------------
 
@@ -390,6 +471,12 @@ fn decoding_result_defaults_match_swift_empty_results() {
   assert_eq!(r.no_speech_prob(), 0.0);
   assert_eq!(r.temperature(), 0.0); // unlike TranscriptionSegment's 1.0 default
   assert_eq!(r.compression_ratio(), 0.0); // unlike TranscriptionSegment's 1.0 default
+  // Rust-only addition beyond Swift's field set (T5/decode loop assumption
+  // (b), see `needs_fallback`'s doc): the raw first-sampled-token logprob,
+  // threaded out of the loop so a fallback-ladder caller can recompute
+  // `first_token_log_prob_too_low` without decode_text changing its return
+  // type.
+  assert_eq!(r.first_token_log_prob(), 0.0);
   assert_eq!(DecodingResult::default(), DecodingResult::new());
 }
 
@@ -404,7 +491,8 @@ fn decoding_result_builder_vocabulary() {
     .with_avg_logprob(-0.4)
     .with_no_speech_prob(0.02)
     .with_temperature(0.2)
-    .with_compression_ratio(1.6);
+    .with_compression_ratio(1.6)
+    .with_first_token_log_prob(-0.8);
   assert_eq!(r.language(), "en");
   assert_eq!(r.language_probs_slice(), &[("en".to_string(), 0.98)]);
   assert_eq!(r.tokens_slice(), &[50364u32, 15339]);
@@ -414,11 +502,53 @@ fn decoding_result_builder_vocabulary() {
   assert_eq!(r.no_speech_prob(), 0.02);
   assert_eq!(r.temperature(), 0.2);
   assert_eq!(r.compression_ratio(), 1.6);
+  assert_eq!(r.first_token_log_prob(), -0.8);
 
   let mut m = DecodingResult::new();
   m.set_text("mutated").set_avg_logprob(-1.0);
   assert_eq!(m.text(), "mutated");
   assert_eq!(m.avg_logprob(), -1.0);
+}
+
+// ---------------------------------------------------------------------
+// TranscriptionProgress
+// ---------------------------------------------------------------------
+
+#[test]
+fn transcription_progress_defaults_match_swift() {
+  // Models.swift:643-660 `TranscriptionProgress.init` defaults: the
+  // optional trio starts `nil`, `windowId` starts `0`.
+  let timings = TranscriptionTimings::new();
+  let p = TranscriptionProgress::new(timings.clone(), "hello", vec![50364u32, 15339]);
+  assert_eq!(p.timings(), &timings);
+  assert_eq!(p.text(), "hello");
+  assert_eq!(p.tokens_slice(), &[50364u32, 15339]);
+  assert_eq!(p.temperature(), None);
+  assert_eq!(p.avg_logprob(), None);
+  assert_eq!(p.compression_ratio(), None);
+  assert_eq!(p.window_id(), 0);
+}
+
+#[test]
+fn transcription_progress_builder_vocabulary() {
+  let p = TranscriptionProgress::new(TranscriptionTimings::new(), "hi", Vec::new())
+    .with_temperature(0.2)
+    .with_avg_logprob(-0.3)
+    .with_compression_ratio(1.4)
+    .with_window_id(2);
+  assert_eq!(p.temperature(), Some(0.2));
+  assert_eq!(p.avg_logprob(), Some(-0.3));
+  assert_eq!(p.compression_ratio(), Some(1.4));
+  assert_eq!(p.window_id(), 2);
+
+  let mut m = p.clone();
+  m.clear_temperature();
+  assert_eq!(m.temperature(), None);
+  m.update_avg_logprob(Some(-0.9));
+  assert_eq!(m.avg_logprob(), Some(-0.9));
+  m.set_text("mutated").set_tokens(vec![1u32]);
+  assert_eq!(m.text(), "mutated");
+  assert_eq!(m.tokens_slice(), &[1u32]);
 }
 
 // ---------------------------------------------------------------------
@@ -504,6 +634,23 @@ fn decoding_result_serde_round_trips_and_skips_empty_collections() {
   assert_eq!(
     serde_json::from_str::<DecodingResult>("{}").unwrap(),
     DecodingResult::new()
+  );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn transcription_progress_serde_round_trips_and_skips_absent_optionals() {
+  let p = TranscriptionProgress::new(TranscriptionTimings::new(), "hi", Vec::new());
+  let json = serde_json::to_string(&p).unwrap();
+  let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+  let object = value.as_object().unwrap();
+  assert!(!object.contains_key("temperature"));
+  assert!(!object.contains_key("avg_logprob"));
+  assert!(!object.contains_key("compression_ratio"));
+  assert!(!object.contains_key("tokens"));
+  assert_eq!(
+    serde_json::from_str::<TranscriptionProgress>(&json).unwrap(),
+    p
   );
 }
 
