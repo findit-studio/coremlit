@@ -73,9 +73,9 @@ pub const RELATIVE_ENERGY_WINDOW: usize = 20;
 ///
 /// [`Self::new`] and the accessors are this type's only public surface;
 /// every field mutates through a `pub(crate)` `set_*` family instead of a
-/// public one — a later state machine (Plan 4 T8) owns every transition
-/// Swift's actor applied via `didSet` (`AudioStreamTranscriber.swift:
-/// 27-31`), so outside callers only ever read a session's state.
+/// public one — [`AudioStreamTranscriber::push_samples`] owns every
+/// transition Swift's actor applied via `didSet` (`AudioStreamTranscriber.
+/// swift:27-31`), so outside callers only ever read a session's state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StreamState {
   current_fallbacks: usize,
@@ -290,6 +290,13 @@ impl StreamState {
 /// a `&F` reference is itself `Send` exactly when `F: Sync`, so a shared
 /// reference to a `Sync` closure is the reference-based equivalent of a
 /// thread-safe callback value.
+///
+/// The callback must not panic: [`AudioStreamTranscriber::push_samples`]
+/// fires it while the live [`StreamState`] is briefly swapped into an
+/// internal `Mutex` for a transcription run, and an unwind through that
+/// swap poisons the mutex and silently resets the transcriber's
+/// accumulated state to [`StreamState::default`] instead of restoring it
+/// (empirically established, not just theorized).
 pub type StateChangeCallback<'a> = &'a (dyn Fn(&StreamState, &StreamState) + Sync);
 
 // ---------------------------------------------------------------------
@@ -480,10 +487,11 @@ impl AudioStreamOptions {
 // StreamUpdate
 // ---------------------------------------------------------------------
 
-/// A streaming step's outcome — the vocabulary a later push-based driver
-/// (Plan 4 T8) reports after each pushed buffer: not enough audio yet,
-/// enough audio but no voice in it, or a transcription pass ran. Swift
-/// has no equivalent type; `AudioStreamTranscriber.transcribeCurrentBuffer`
+/// A streaming step's outcome — the vocabulary
+/// [`AudioStreamTranscriber::push_samples`] reports after each pushed
+/// buffer: not enough audio yet, enough audio but no voice in it, or a
+/// transcription pass ran. Swift has no equivalent type;
+/// `AudioStreamTranscriber.transcribeCurrentBuffer`
 /// (`AudioStreamTranscriber.swift:126-193`) expresses the same three
 /// outcomes as early `return`s rather than a value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display, derive_more::IsVariant)]
@@ -875,6 +883,12 @@ where
   ///    [`StreamState::current_text`]/[`StreamState::unconfirmed_text_slice`],
   ///    promotes segments past the confirmation watermark, and returns
   ///    [`StreamUpdate::Transcribed`] (`:159-192`).
+  ///
+  /// The [`Self::set_state_callback`] callback must not panic: step 4
+  /// above briefly swaps [`Self::state`] into an internal `Mutex` for the
+  /// transcription run, and an unwind through that swap poisons it,
+  /// silently resetting this transcriber's accumulated state to
+  /// [`StreamState::default`] instead of restoring it.
   ///
   /// # Errors
   /// Whatever [`crate::transcribe::TranscribeTask::run`] returns,
