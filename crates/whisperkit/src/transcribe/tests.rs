@@ -236,3 +236,23 @@ fn failed_probe_rederives_language_from_that_attempts_decode() {
   assert_eq!(result.timings().total_decoding_fallbacks(), 0.0);
   assert_eq!(mock.counters().resets(), 4);
 }
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn transcribe_all_preserves_order_across_scoped_threads() {
+  let t = tiny_tokenizer();
+  // The mock's script cursor lives in each worker's OWN MockDecoderState
+  // (Task 2), so concurrent workers replay the same script independently;
+  // only the counters are shared. One scripted window serves both audios.
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  let hello = t.encode(" Hello").unwrap()[0];
+  script_clean_window(&mut mock, hello);
+  let kit = WhisperKit::with_backend(mock, t);
+  let a = vec![0.1f32; 32_000];
+  let b = vec![0.1f32; 32_000];
+  let results = kit.transcribe_all(&[&a, &b], &DecodingOptions::new());
+  assert_eq!(results.len(), 2);
+  for result in results {
+    assert_eq!(result.unwrap().text(), "Hello");
+  }
+}

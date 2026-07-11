@@ -2,6 +2,87 @@ use super::*;
 use crate::options::DecodingOptions;
 
 // ---------------------------------------------------------------------
+// merge_transcription_results
+// ---------------------------------------------------------------------
+
+#[test]
+fn merge_transcription_results_concatenates_and_reids() {
+  // NOTE: the brief's literal snippet called `TranscriptionResult::new()`
+  // with no arguments; the shipped constructor requires all four fields
+  // (text, segments, language, timings) with no defaulted/zero-arg form
+  // (this module's own doc: "no honest default means no Default" applies
+  // equally to a bare `new()`). Built blank here, then mutated via the
+  // `set_*` calls the brief's snippet already used. Likewise `.into()` on
+  // the string literals is dropped: against `set_text`/`set_language`'s
+  // generic `impl Into<String>` parameter it is ambiguous (E0283 - `&str`
+  // implements `Into<T>` for several `T`), the same fix already applied
+  // to `WordTiming::new`'s call site above.
+  let mut first = TranscriptionResult::new("", Vec::new(), "", TranscriptionTimings::new());
+  let mut seg0 = TranscriptionSegment::new();
+  seg0.set_id(0).set_start(0.0).set_end(1.0);
+  first
+    .set_text("hello")
+    .set_segments(vec![seg0])
+    .set_language("en");
+  let mut second = TranscriptionResult::new("", Vec::new(), "", TranscriptionTimings::new());
+  let mut seg1 = TranscriptionSegment::new();
+  seg1.set_id(0).set_start(30.0).set_end(31.0);
+  second.set_text("world").set_segments(vec![seg1]);
+  let merged = merge_transcription_results(&[first, second]);
+  assert_eq!(merged.text(), "hello world");
+  assert_eq!(merged.segments_slice().len(), 2);
+  assert_eq!(merged.segments_slice()[1].id(), 1); // resultIndex + segmentIndex (:89-94)
+  assert_eq!(merged.language(), "en");
+}
+
+#[test]
+fn merge_full_pipeline_sums_when_pipeline_start_is_never_stamped() {
+  // Regression (task-12 review): with every pipeline_start at the
+  // "never stamped" sentinel (f64::MAX) — which is what every result this
+  // sync port produces looks like — the merged full_pipeline must be the
+  // sum of the per-result full_pipelines. The naive Swift formula
+  // degenerates here: f64::MAX + full_pipeline ABSORBS (the ULP at that
+  // magnitude is ~2e292, so the sum rounds back to exactly f64::MAX, it
+  // does NOT overflow to infinity), making user_pipeline_duration
+  // f64::MAX - f64::MAX == 0.0 and min() zero out the real sum.
+  let mut timings_a = TranscriptionTimings::new();
+  timings_a
+    .set_full_pipeline(2.0)
+    .set_total_decoding_loops(10.0);
+  let a = TranscriptionResult::new("a", Vec::new(), "en", timings_a);
+  let mut timings_b = TranscriptionTimings::new();
+  timings_b
+    .set_full_pipeline(3.0)
+    .set_total_decoding_loops(20.0);
+  let b = TranscriptionResult::new("b", Vec::new(), "en", timings_b);
+  let merged = merge_transcription_results(&[a, b]);
+  assert_eq!(merged.timings().full_pipeline(), 5.0);
+  // The derived projections must therefore be live, not zeroed.
+  assert_eq!(merged.timings().tokens_per_second(), 30.0 / 5.0);
+  // The sentinel itself survives the merge (min of sentinels), matching
+  // Swift's own formula on the same input.
+  assert_eq!(merged.timings().pipeline_start(), f64::MAX);
+  assert_eq!(merged.timings().first_token_time(), f64::MAX);
+}
+
+#[test]
+fn merge_full_pipeline_takes_wall_clock_span_when_starts_are_real() {
+  // The general Swift formula (TranscriptionUtilities.swift:110-114) on
+  // results that DO carry real pipeline_start stamps: two overlapping
+  // concurrent pipelines, user span = (101 + 3) - 100 = 4, system sum =
+  // 2 + 3 = 5, merged full_pipeline = min(4, 5) = 4.
+  let mut timings_a = TranscriptionTimings::new();
+  timings_a.set_pipeline_start(100.0).set_full_pipeline(2.0);
+  let a = TranscriptionResult::new("a", Vec::new(), "en", timings_a);
+  let mut timings_b = TranscriptionTimings::new();
+  timings_b.set_pipeline_start(101.0).set_full_pipeline(3.0);
+  let b = TranscriptionResult::new("b", Vec::new(), "en", timings_b);
+  let merged = merge_transcription_results(&[a, b]);
+  assert_eq!(merged.timings().full_pipeline(), 4.0);
+  assert_eq!(merged.timings().pipeline_start(), 100.0);
+}
+
+// ---------------------------------------------------------------------
 // FallbackReason / needs_fallback
 // ---------------------------------------------------------------------
 

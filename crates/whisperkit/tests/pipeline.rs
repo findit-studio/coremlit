@@ -11,7 +11,8 @@ use coremlit::{ComputeUnits, Model};
 use whisperkit::{
   backend::{InferenceBackend, coreml::CoreMlBackend},
   model::{ModelState, manager::ModelManager},
-  options::ComputeOptions,
+  options::{ComputeOptions, DecodingOptions, Options},
+  transcribe::WhisperKit,
 };
 
 fn load_backend() -> CoreMlBackend {
@@ -203,4 +204,39 @@ fn manager_prewarm_sequences_states() {
   assert_eq!(manager.state(), ModelState::Loaded);
   manager.unload();
   assert_eq!(manager.state(), ModelState::Unloaded);
+}
+
+// NOTE: the brief's literal snippet called `Options::new()` with no
+// arguments, then chained `.with_model_folder(...)`/
+// `.with_tokenizer_folder(...)`. The shipped constructor is two-argument
+// (`Options::new(model_folder, tokenizer_folder)` — Plan 2's own doc: "No
+// Default/zero-arg new(): there is no honest default model or tokenizer
+// folder"), so both folders are passed directly here instead.
+fn tiny_options() -> Options {
+  Options::new(common::tiny_dir(), common::tokenizer_dir())
+}
+
+#[test]
+#[ignore = "requires local tiny model (WHISPERKIT_TEST_MODELS)"]
+fn jfk_end_to_end_produces_english_transcript() {
+  let kit = WhisperKit::new(&tiny_options()).unwrap();
+  let audio = common::load_wav_mono_f32(&common::fixtures_dir().join("audio/jfk.wav"));
+  let result = kit.transcribe(&audio, &DecodingOptions::new()).unwrap();
+  assert_eq!(result.language(), "en");
+  let lowered = result.text().to_lowercase();
+  assert!(
+    lowered.contains("fellow americans"),
+    "got: {}",
+    result.text()
+  );
+  assert!(!result.segments_slice().is_empty());
+}
+
+#[test]
+#[ignore = "requires local tiny model (WHISPERKIT_TEST_MODELS)"]
+fn detect_language_on_jfk_is_english() {
+  let kit = WhisperKit::new(&tiny_options()).unwrap();
+  let audio = common::load_wav_mono_f32(&common::fixtures_dir().join("audio/jfk.wav"));
+  let detection = kit.detect_language(&audio).unwrap();
+  assert_eq!(detection.language(), "en");
 }
