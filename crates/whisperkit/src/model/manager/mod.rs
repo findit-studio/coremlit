@@ -254,8 +254,9 @@ impl ModelManager {
   /// (`ModelManager.unloadModels()`'s `guard modelState == .loaded ||
   /// .prewarmed`, `ModelManager.swift:194-201`; the guard keeps a
   /// callback-driven UI from seeing spurious `Unloading`/`Unloaded`
-  /// pairs. `WhisperKit.swift:487-499`'s wrapper has no guard of its
-  /// own, but only ever runs over the guarded manager).
+  /// pairs. `WhisperKit.swift:487-499` is a separate, unguarded
+  /// implementation — lifecycle semantics here follow `ModelManager`,
+  /// the load sequencing follows `WhisperKit`).
   pub fn unload(&mut self) {
     if !matches!(self.state, ModelState::Loaded | ModelState::Prewarmed) {
       return;
