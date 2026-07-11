@@ -52,14 +52,18 @@
 //!   [`TranscriptionSegment`](result::TranscriptionSegment)s and the next
 //!   seek offset
 //!   ([`find_seek_point_and_segments`](segment::find_seek_point_and_segments)),
-//!   plus the pure word-timestamp math a later plan wires into the
-//!   pipeline: [`dynamic_time_warping`](segment::dynamic_time_warping) over
-//!   a decoded-token x audio-frame alignment matrix,
+//!   plus the word-timestamp math
+//!   [`transcribe::TranscribeTask::run`] wires into the pipeline behind
+//!   [`DecodingOptions::word_timestamps`](options::DecodingOptions::word_timestamps):
+//!   [`dynamic_time_warping`](segment::dynamic_time_warping) over a
+//!   decoded-token x audio-frame alignment matrix,
 //!   [`find_alignment`](segment::find_alignment),
-//!   [`merge_punctuations`](segment::merge_punctuations), and the
-//!   word-duration heuristics
+//!   [`merge_punctuations`](segment::merge_punctuations), the word-duration
+//!   heuristics
 //!   ([`calculate_word_duration_constraints`](segment::calculate_word_duration_constraints),
-//!   [`truncate_long_words_at_sentence_boundaries`](segment::truncate_long_words_at_sentence_boundaries)).
+//!   [`truncate_long_words_at_sentence_boundaries`](segment::truncate_long_words_at_sentence_boundaries)),
+//!   and the orchestrating
+//!   [`add_word_timestamps`](segment::add_word_timestamps).
 //! - [`transcribe`] — [`WhisperKit`](transcribe::WhisperKit), the public
 //!   pipeline entry point (`transcribe`/`transcribe_all`/
 //!   `detect_language`), composing
