@@ -333,8 +333,11 @@ pub struct DecodingOptions {
     )
   )]
   first_token_logprob_threshold: Option<f32>,
-  /// Treat a window as silent if the no-speech probability exceeds this
-  /// value and `logprob_threshold` also fails. `None` disables the check.
+  /// Treat a window as silent when the no-speech probability strictly
+  /// exceeds this value. `None` disables the check. (Silence short-circuits
+  /// on this comparison ALONE — Swift's own doc comment claiming the
+  /// average log probability is also consulted is stale against its code;
+  /// see `result::needs_fallback`, `Models.swift:368-370`.)
   #[cfg_attr(
     feature = "serde",
     serde(
@@ -1112,8 +1115,11 @@ impl DecodingOptions {
   }
 
   // -- no_speech_threshold (Option<f32>) -----------------------------------
-  /// Treat a window as silent if the no-speech probability exceeds this
-  /// value and `logprob_threshold` also fails. `None` disables the check.
+  /// Treat a window as silent when the no-speech probability strictly
+  /// exceeds this value. `None` disables the check. (Silence short-circuits
+  /// on this comparison ALONE — Swift's own doc comment claiming the
+  /// average log probability is also consulted is stale against its code;
+  /// see `result::needs_fallback`, `Models.swift:368-370`.)
   #[inline(always)]
   pub const fn no_speech_threshold(&self) -> Option<f32> {
     self.no_speech_threshold
