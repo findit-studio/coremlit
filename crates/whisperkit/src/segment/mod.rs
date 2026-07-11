@@ -947,9 +947,10 @@ pub(crate) fn rounded_to_places(value: f32, decimal_places: i32) -> f32 {
 /// `split_to_word_tokens`, the same `NLLanguageRecognizer` replacement
 /// documented on [`find_alignment`] and
 /// [`WhisperTokenizer::split_to_word_tokens`] (spec §5.3). Swift's
-/// `segmentSize`, `options`, and `timings` parameters are unused in the
-/// function body (verified against `SegmentSeeker.swift:410-496`) and are
-/// dropped here: `timings`' duration/run-count bookkeeping
+/// `segmentSize` and `options` parameters are unused in the function body
+/// (verified against `SegmentSeeker.swift:410-496`), and `timings` is
+/// only passed through to `findAlignment` (`:471`), which ignores it —
+/// all three are dropped here: `timings`' duration/run-count bookkeeping
 /// (`TranscribeTask.swift:214-215`) is the caller's responsibility, same
 /// as at Swift's own call site.
 ///
@@ -1008,6 +1009,16 @@ pub fn add_word_timestamps(
   // `word_token_ids.len() <= alignment.rows()`.
   let needed = word_token_ids.len();
   let cols = alignment.cols();
+  // The doc's zero-columns promise, honored HERE: `chunks_mut(0)` below
+  // panics even over an empty buffer, and `dynamic_time_warping`'s own
+  // zero-shape rejection sits after this construction — too late.
+  if cols == 0 {
+    return Err(SegmentError::InvalidAlignmentShape {
+      rows: alignment.rows(),
+      cols,
+      len: alignment.data().len(),
+    });
+  }
   let mut data = vec![0.0f32; needed * cols];
   for (row_index, row) in data
     .chunks_mut(cols)
