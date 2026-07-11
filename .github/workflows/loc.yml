@@ -11,14 +11,6 @@ on:
       - '**.md'
       - '**.txt'
       - 'art'
-  pull_request:
-    paths-ignore:
-      - 'README.md'
-      - 'COPYRIGHT'
-      - 'LICENSE*'
-      - '**.md'
-      - '**.txt'
-      - 'art'
   workflow_dispatch:
 
 jobs:

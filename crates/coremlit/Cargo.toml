@@ -1,0 +1,22 @@
+[package]
+name = "coremlit"
+description = "Safe, synchronous CoreML runtime layer: model loading, prediction, stateful prediction, and typed multi-arrays"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+objc2.workspace = true
+objc2-core-ml.workspace = true
+objc2-foundation.workspace = true
+objc2-core-video.workspace = true
+objc2-core-foundation.workspace = true
+block2.workspace = true
+half.workspace = true
+thiserror.workspace = true
+derive_more.workspace = true
+
+[lints]
+workspace = true

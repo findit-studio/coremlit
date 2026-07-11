@@ -1,48 +1,30 @@
-[package]
-name = "template-rs"
-version = "0.0.0"
-edition = "2021"
-repository = "https://github.com/al8n/template-rs"
-homepage = "https://github.com/al8n/template-rs"
-documentation = "https://docs.rs/template-rs"
-description = "A template for creating Rust open-source repo on GitHub"
+[workspace]
+resolver = "3"
+members = ["crates/coremlit", "crates/whisperkit"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
 license = "MIT OR Apache-2.0"
-rust-version = "1.73"
+repository = "https://github.com/findit-studio/coremlit"
 
-[[bench]]
-path = "benches/foo.rs"
-name = "foo"
-harness = false
+[workspace.dependencies]
+coremlit = { path = "crates/coremlit" }
+objc2 = "0.6"
+objc2-core-ml = { version = "0.3", features = ["block2", "objc2-core-video"] }
+objc2-foundation = "0.3"
+objc2-core-video = "0.3"
+objc2-core-foundation = "0.3"
+block2 = "0.6"
+half = "2.7"
+thiserror = "2"
+derive_more = { version = "2.1", features = ["display", "is_variant"] }
 
-[features]
-default = ["std"]
-alloc = []
-std = []
+[workspace.lints.rust]
+missing_docs = "deny"
+rust_2018_idioms = { level = "warn", priority = -1 }
+single_use_lifetimes = { level = "warn", priority = -1 }
 
-[dependencies]
-
-[dev-dependencies]
-criterion = "0.8"
-tempfile = "3"
-
-[profile.bench]
-opt-level = 3
-debug = false
-codegen-units = 1
-lto = 'thin'
-incremental = false
-debug-assertions = false
-overflow-checks = false
-rpath = false
-
-[package.metadata.docs.rs]
-all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
-
-[lints.rust]
-rust_2018_idioms = "warn"
-single_use_lifetimes = "warn"
-unexpected_cfgs = { level = "warn", check-cfg = [
-  'cfg(all_tests)',
-  'cfg(tarpaulin)',
-] }
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"

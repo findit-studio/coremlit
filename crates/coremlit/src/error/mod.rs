@@ -1,0 +1,217 @@
+//! Structured error types for the CoreML layer.
+
+use std::path::PathBuf;
+
+use objc2_foundation::NSError;
+
+use crate::DataType;
+
+/// Structured capture of an `NSError` returned by CoreML.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error("{domain} (code {code}): {message}")]
+pub struct NsErrorInfo {
+  domain: String,
+  code: isize,
+  message: String,
+}
+
+impl NsErrorInfo {
+  /// Construct from a live `NSError` reference.
+  pub(crate) fn from_ns_error(error: &NSError) -> Self {
+    // Plain accessor message sends on a live NSError reference.
+    let (domain, code, message) = (
+      error.domain().to_string(),
+      error.code(),
+      error.localizedDescription().to_string(),
+    );
+    Self {
+      domain,
+      code,
+      message,
+    }
+  }
+
+  /// The `NSError` domain.
+  #[inline(always)]
+  pub fn domain(&self) -> &str {
+    &self.domain
+  }
+
+  /// The `NSError` code.
+  #[inline(always)]
+  pub const fn code(&self) -> isize {
+    self.code
+  }
+
+  /// The localized description.
+  #[inline(always)]
+  pub fn message(&self) -> &str {
+    &self.message
+  }
+}
+
+/// Failure loading a compiled model.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum LoadError {
+  /// The model path does not exist.
+  #[error("model not found at `{path}`", path = path.display())]
+  NotFound {
+    /// Path that was checked.
+    path: PathBuf,
+  },
+  /// CoreML rejected the model.
+  #[error("core ml failed to load model: {0}")]
+  Native(NsErrorInfo),
+}
+
+/// Failure compiling an `.mlpackage`/`.mlmodel` into an `.mlmodelc`.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum CompileError {
+  /// The source path does not exist.
+  #[error("model source not found at `{path}`", path = path.display())]
+  NotFound {
+    /// Path that was checked.
+    path: PathBuf,
+  },
+  /// CoreML rejected the compilation.
+  #[error("core ml failed to compile model: {0}")]
+  Native(NsErrorInfo),
+}
+
+/// Failure running a prediction.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum PredictionError {
+  /// The output feature dictionary lacks an expected name.
+  #[error("prediction output is missing feature `{name}`")]
+  MissingOutput {
+    /// Feature name that was absent.
+    name: String,
+  },
+  /// An output feature was not a multi-array.
+  #[error("prediction output `{name}` is not a multi-array")]
+  NotMultiArray {
+    /// Feature name with the wrong kind.
+    name: String,
+  },
+  /// CoreML reported a prediction failure.
+  #[error("core ml prediction failed: {0}")]
+  Native(NsErrorInfo),
+  /// Stateful prediction requires macOS 15 (MLState).
+  #[error("stateful prediction is unavailable on this OS (requires macOS 15)")]
+  StateUnsupported,
+  /// De-aliasing an output array that shared its native buffer with
+  /// another live array (an input, or another output name) failed.
+  #[error("failed to de-alias a prediction output: {0}")]
+  AliasCopyFailed(TensorError),
+}
+
+/// Failure constructing or viewing a multi-array.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum TensorError {
+  /// The array's element type differs from the requested view type.
+  #[error("data type mismatch: expected `{expected}`, got `{actual}`")]
+  DataTypeMismatch {
+    /// Requested element type.
+    expected: DataType,
+    /// The array's actual element type.
+    actual: DataType,
+  },
+  /// Element count differs from the shape's product.
+  #[error("shape mismatch: expected {expected} elements, got {actual}")]
+  ShapeMismatch {
+    /// Elements implied by the shape.
+    expected: usize,
+    /// Elements provided.
+    actual: usize,
+  },
+  /// Index tuple rank differs from the array rank.
+  #[error("rank mismatch: expected {expected} indices, got {actual}")]
+  RankMismatch {
+    /// The array's rank.
+    expected: usize,
+    /// Indices provided.
+    actual: usize,
+  },
+  /// A linear or dimensional index is out of bounds.
+  #[error("index {index} out of bounds for length {len}")]
+  IndexOutOfBounds {
+    /// Offending index.
+    index: usize,
+    /// Bound it violated.
+    len: usize,
+  },
+  /// The array's memory layout is not row-major contiguous.
+  #[error("array layout is not contiguous (strides {strides:?} for shape {shape:?})")]
+  NonContiguous {
+    /// The array's shape.
+    shape: Vec<usize>,
+    /// The array's element strides.
+    strides: Vec<usize>,
+  },
+  /// The data type cannot back an array (no known element size).
+  #[error("unsupported data type `{dtype}` for array construction")]
+  UnsupportedDataType {
+    /// The rejected data type.
+    dtype: DataType,
+  },
+  /// CoreML rejected the array construction.
+  #[error("core ml multi-array failure: {0}")]
+  Native(NsErrorInfo),
+  /// CVPixelBuffer creation failed.
+  #[error("pixel buffer creation failed with CVReturn {code}")]
+  PixelBuffer {
+    /// The CVReturn code.
+    code: i32,
+  },
+  /// The shape does not meet an operation's structural requirement.
+  #[error("shape {shape:?} is unsupported: {reason}")]
+  UnsupportedShape {
+    /// The offending shape.
+    shape: Vec<usize>,
+    /// Why the shape was rejected.
+    reason: ShapeRequirement,
+  },
+  /// A shape's element count, or a size/offset derived from it, overflows
+  /// `usize`.
+  #[error("shape {shape:?} element count overflows usize")]
+  ShapeOverflow {
+    /// The offending shape.
+    shape: Vec<usize>,
+  },
+  /// `MLMultiArray`'s pixel-buffer-backed initializer is unavailable on
+  /// this OS.
+  #[error("pixel-buffer-backed arrays require macOS 12 or newer")]
+  SurfaceUnsupported,
+}
+
+/// Why a shape was rejected by [`TensorError::UnsupportedShape`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
+#[display("{}", self.as_str())]
+#[non_exhaustive]
+pub enum ShapeRequirement {
+  /// All dimensions before the last must be 1.
+  LeadingDimsUnit,
+  /// The shape must have at least one dimension.
+  NonEmpty,
+  /// Every dimension must be nonzero.
+  NonZeroDims,
+}
+
+impl ShapeRequirement {
+  /// Stable name of the requirement.
+  #[inline(always)]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::LeadingDimsUnit => "all dimensions before the last must be 1",
+      Self::NonEmpty => "the shape must have at least one dimension",
+      Self::NonZeroDims => "every dimension must be nonzero",
+    }
+  }
+}
+
+#[cfg(test)]
+mod tests;
