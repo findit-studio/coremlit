@@ -27,9 +27,11 @@
 //!   (mel/encode/decode-step seam), [`ModelDims`](backend::ModelDims), and
 //!   the scripted [`MockBackend`](backend::mock::MockBackend) test double
 //!   used for hermetic pipeline tests.
-//! - [`decode`] — autoregressive decoding; currently the per-step
+//! - [`decode`] — autoregressive decoding: the per-step
 //!   [`LogitsFilter`](decode::filter::LogitsFilter) chain, driven against
-//!   an [`InferenceBackend`](backend::InferenceBackend)'s raw logits.
+//!   an [`InferenceBackend`](backend::InferenceBackend)'s raw logits, and
+//!   the [`GreedyTokenSampler`](decode::sampler::GreedyTokenSampler) that
+//!   picks the next token from what the chain leaves unmasked.
 //! - [`log`] — leveled logging with a replacing callback.
 //!
 //! # Example

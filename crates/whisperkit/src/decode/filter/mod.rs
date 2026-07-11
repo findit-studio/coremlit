@@ -234,29 +234,17 @@ impl LogitsFilter for TimestampRulesFilter {
 /// `logSumExp`/`max` reduction pair Swift runs to decide whether the
 /// timestamp region's combined probability mass exceeds every individual
 /// text token's (`LogitsFilter.swift:144-242`), computed here as plain
-/// `f32` math instead of BNNS (spec §4.8). `logits[time_begin..]` is the
-/// timestamp region, `logits[..time_begin]` the text region.
+/// `f32` math via [`super::log_sum_exp`] instead of BNNS (spec §4.8).
+/// `logits[time_begin..]` is the timestamp region, `logits[..time_begin]`
+/// the text region.
 fn timestamp_mass_exceeds_text(logits: &[f32], time_begin: usize) -> bool {
-  let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-  if !max.is_finite() {
+  let log_z = super::log_sum_exp(logits);
+  if !log_z.is_finite() {
     // Every entry is masked (-inf): there is no distribution to compare.
     return false;
   }
-  let log_z = max + logits.iter().map(|&v| (v - max).exp()).sum::<f32>().ln();
 
-  let timestamps = &logits[time_begin..];
-  let ts_max = timestamps.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-  let timestamp_logprob = if ts_max.is_finite() {
-    ts_max - log_z
-      + timestamps
-        .iter()
-        .map(|&v| (v - ts_max).exp())
-        .sum::<f32>()
-        .ln()
-  } else {
-    f32::NEG_INFINITY
-  };
-
+  let timestamp_logprob = super::log_sum_exp(&logits[time_begin..]) - log_z;
   let max_text_logprob = logits[..time_begin]
     .iter()
     .copied()
