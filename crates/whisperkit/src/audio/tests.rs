@@ -41,3 +41,23 @@ fn voice_activity_in_chunks_thresholds_rms() {
     vec![false, true, true]
   );
 }
+
+#[test]
+fn voice_detection_checks_the_oldest_prefix_of_the_recent_window() {
+  // AudioProcessor.swift:636-655: consider = seconds/0.1 entries; within
+  // them, only the OLDEST max(10, n-10) are checked.
+  let quiet_then_loud: Vec<f32> = std::iter::repeat_n(0.0, 10)
+    .chain(std::iter::repeat_n(0.9, 10))
+    .collect();
+  // 20 considered, check prefix max(10, 10) = 10 -> all quiet -> NOT detected.
+  assert!(!is_voice_detected(&quiet_then_loud, 2.0, 0.3));
+
+  let loud_then_quiet: Vec<f32> = std::iter::repeat_n(0.9, 10)
+    .chain(std::iter::repeat_n(0.0, 10))
+    .collect();
+  assert!(is_voice_detected(&loud_then_quiet, 2.0, 0.3));
+
+  // Short history: prefix(10) of 5 entries = all 5.
+  assert!(is_voice_detected(&[0.9; 5], 0.5, 0.3));
+  assert!(!is_voice_detected(&[], 1.0, 0.3));
+}

@@ -72,6 +72,14 @@
 //!   full audio buffer — and, for VAD-chunked audio, folding per-chunk
 //!   results together via
 //!   [`merge_transcription_results`](result::merge_transcription_results).
+//! - [`stream`] — push-based streaming vocabulary (spec §5.3 `stream`
+//!   row): [`StreamState`](stream::StreamState) (Swift's
+//!   `AudioStreamTranscriber.State`),
+//!   [`AudioStreamOptions`](stream::AudioStreamOptions),
+//!   [`StreamUpdate`](stream::StreamUpdate), and the early-stop gate
+//!   [`should_stop_early`](stream::should_stop_early) (Swift's static
+//!   `shouldStopEarly`) that a later push-based driver
+//!   (`AudioStreamTranscriber`, Plan 4 T8) is built from.
 //! - [`log`] — leveled logging with a replacing callback.
 //!
 //! # Examples
@@ -130,6 +138,7 @@ pub mod model;
 pub mod options;
 pub mod result;
 pub mod segment;
+pub mod stream;
 pub mod text;
 pub mod tokenizer;
 pub mod transcribe;
