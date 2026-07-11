@@ -91,8 +91,9 @@ pub fn voice_activity_in_chunks(
 /// in practice). `next_buffer_seconds` (the duration of audio just pushed)
 /// converts to a count of recent entries to `consider` (`/ 0.1`, one entry
 /// per frame); Swift's `max(0, Int(...))` clamp is redundant once ported —
-/// `as usize` on a negative or NaN float already saturates to `0` — but
-/// the cast alone reproduces it exactly. Within that considered suffix,
+/// `as usize` on a negative float already saturates to `0` (and on NaN,
+/// where Swift's `Int(Float)` would trap outright, this port is strictly
+/// more permissive: `as usize` yields `0`). Within that considered suffix,
 /// only the **oldest** `max(10, considered - 10)` entries are checked
 /// against `silence_threshold`: the newest ~1 s (10 entries) is
 /// deliberately excluded as possible trailing silence that just hasn't

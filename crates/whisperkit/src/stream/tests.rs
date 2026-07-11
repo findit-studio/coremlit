@@ -155,3 +155,24 @@ fn stream_state_defaults_and_pub_crate_mutation() {
     vec!["stale".to_string()]
   );
 }
+
+#[cfg(feature = "serde")]
+#[test]
+fn stream_options_partial_config_falls_back_to_defaults() {
+  // Options-pattern serde pairing (review finding): every field carries a
+  // fn-default, so a partial document inherits new()'s values.
+  let partial: AudioStreamOptions = serde_json::from_str(r#"{"use_vad":false}"#).unwrap();
+  assert!(!partial.use_vad());
+  assert_eq!(
+    partial.required_segments_for_confirmation(),
+    DEFAULT_REQUIRED_SEGMENTS_FOR_CONFIRMATION
+  );
+  assert_eq!(partial.silence_threshold(), DEFAULT_SILENCE_THRESHOLD);
+  assert_eq!(
+    partial.compression_check_window(),
+    DEFAULT_COMPRESSION_CHECK_WINDOW
+  );
+  let round: AudioStreamOptions =
+    serde_json::from_str(&serde_json::to_string(&AudioStreamOptions::new()).unwrap()).unwrap();
+  assert_eq!(round, AudioStreamOptions::new());
+}
