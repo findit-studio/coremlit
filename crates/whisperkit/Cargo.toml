@@ -28,6 +28,7 @@ tracing = ["dep:tracing"]
 
 [dev-dependencies]
 hound.workspace = true
+serde = { workspace = true, features = ["derive"] }
 tempfile.workspace = true
 
 [lints]

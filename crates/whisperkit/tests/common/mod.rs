@@ -19,8 +19,9 @@ pub fn tiny_dir() -> PathBuf {
 
 // `tests/common/mod.rs` is compiled fresh into each integration-test
 // binary that declares `mod common;`; not every binary uses every helper
-// (only `pipeline.rs` needs a tokenizer path so far), so an
-// unused-in-THIS-binary helper is expected here, not a real dead-code bug.
+// (only `pipeline.rs` and `parity_jfk.rs` need a tokenizer path so far),
+// so an unused-in-THIS-binary helper is expected here, not a real
+// dead-code bug.
 #[allow(dead_code)]
 pub fn tokenizer_dir() -> PathBuf {
   models_dir().join("tokenizers").join("whisper-tiny")
