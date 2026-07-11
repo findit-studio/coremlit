@@ -123,6 +123,32 @@ pub enum DecodeError {
   Tokenizer(#[from] TokenizerError),
 }
 
+/// Failure seeking to the next decode window or slicing a window's decode
+/// result into segments.
+///
+/// Not `Clone`/`PartialEq`/`Eq` (unlike its sibling domain-error enums, same
+/// reason as [`DecodeError`]): [`Self::Tokenizer`] wraps [`TokenizerError`],
+/// which itself wraps the foreign `tokenizers::Error` and so cannot
+/// implement any of the three.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum SegmentError {
+  /// A word-alignment matrix did not have the expected 2D shape, or its
+  /// flattened element count did not match `rows * cols`.
+  #[error("invalid alignment matrix shape: {rows} rows x {cols} cols, but data has {len} elements")]
+  InvalidAlignmentShape {
+    /// Expected row count (text tokens).
+    rows: usize,
+    /// Expected column count (audio tokens).
+    cols: usize,
+    /// Actual flattened element count.
+    len: usize,
+  },
+  /// Decoding a slice's tokens back to text failed.
+  #[error("tokenizer decode failed: {0}")]
+  Tokenizer(#[from] TokenizerError),
+}
+
 /// Top-level transcription failure, composing every domain error (spec
 /// §6.4).
 #[derive(Debug, thiserror::Error)]
@@ -140,6 +166,9 @@ pub enum TranscribeError {
   /// A decode-step failure.
   #[error("decode error: {0}")]
   Decode(#[from] DecodeError),
+  /// A segment-seeking or slicing failure.
+  #[error("segment error: {0}")]
+  Segment(#[from] SegmentError),
 }
 
 #[cfg(test)]

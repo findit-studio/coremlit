@@ -78,5 +78,6 @@ pub mod log;
 pub mod model;
 pub mod options;
 pub mod result;
+pub mod segment;
 pub mod text;
 pub mod tokenizer;

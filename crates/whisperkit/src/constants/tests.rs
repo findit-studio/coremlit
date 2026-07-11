@@ -10,6 +10,7 @@ fn window_math_is_consistent() {
   );
   assert_eq!(MAX_TOKEN_CONTEXT, 224); // Swift: Int(448 / 2), Models.swift:1334
   assert_eq!(SECONDS_PER_TIME_TOKEN, 0.02); // Core/WhisperKit.swift:40
+  assert_eq!((1.0 / SECONDS_PER_TIME_TOKEN) as u32, 50); // 50 <|0.02|>-steps per second
 }
 
 #[test]
