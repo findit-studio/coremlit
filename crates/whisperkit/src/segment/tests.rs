@@ -1,7 +1,9 @@
 use super::*;
 use crate::{
+  backend::AlignmentView,
+  constants::{APPEND_PUNCTUATION, PREPEND_PUNCTUATION},
   options::DecodingOptions,
-  result::DecodingResult,
+  result::{DecodingResult, WordTiming},
   tokenizer::{SpecialTokens, WhisperTokenizer},
 };
 
@@ -143,4 +145,142 @@ fn no_consecutive_timestamps_lumps_window_and_refines_duration() {
   let (_, segments) =
     find_seek_point_and_segments(&r, &DecodingOptions::new(), 0, 0, 160_000, &t).unwrap();
   assert!((segments.unwrap()[0].end() - 10.0).abs() < 1e-4);
+}
+
+// SegmentSeeker.swift:195-278 -- dynamic time warping over an alignment matrix.
+
+#[test]
+fn dtw_diagonal_identity() {
+  // Correction to this task's brief: the brief names this test for a
+  // "strong diagonal" path and expects `[0, 1, 2]`, assuming the diagonal
+  // wins cost ties. `minCostAndTrace` (`SegmentSeeker.swift:239-251`)
+  // does not: an exact three-way cost tie falls through to its final
+  // `else` and picks LEFT, never the diagonal. A perfect identity
+  // matrix's 0.0 off-diagonal cells create exactly this tie repeatedly
+  // (verified by hand-tracing the cost/trace matrices, and independently
+  // cross-checked against Swift's own passing
+  // `testDynamicTimeWarpingSimpleMatrix` ground truth in
+  // `dtw_matches_swift_unit_test_ground_truth` below), so the real path
+  // revisits row 1 and row 2 once each via LEFT steps before advancing.
+  #[rustfmt::skip]
+  let matrix = [
+    1.0f32, 0.0, 0.0,
+    0.0, 1.0, 0.0,
+    0.0, 0.0, 1.0,
+  ];
+  let view = AlignmentView::new(&matrix, 3, 3);
+  let path = dynamic_time_warping(&view).unwrap();
+  assert_eq!(path.text_indices_slice(), &[0, 1, 1, 2, 2]);
+  assert_eq!(path.time_indices_slice(), &[0, 0, 1, 1, 2]);
+}
+
+#[test]
+fn dtw_wide_matrix_repeats_text_indices() {
+  // 2 tokens x 4 frames: token 0 aligned to frames 0-1, token 1 to
+  // 2-3 -- see the correction below for why the real path has one extra
+  // step.
+  //
+  // Correction to this task's brief: the brief expects
+  // `text_indices=[0,0,1,1]`/`time_indices=[0,1,2,3]` (four steps). The
+  // actual path has five: at row 2/column 3, `up` (-1.9) and `left`
+  // (-1.9) are an exact cost tie, and `minCostAndTrace`'s strict `<` +
+  // final-`else` structure (`SegmentSeeker.swift:239-251`) makes LEFT
+  // win ties, not UP -- so the backtrace takes one extra LEFT step at
+  // column 3 before reaching column 4, repeating text index 1 a third
+  // time.
+  #[rustfmt::skip]
+  let matrix = [
+    0.9f32, 0.9, 0.1, 0.1,
+    0.1,    0.1, 0.9, 0.9,
+  ];
+  let view = AlignmentView::new(&matrix, 2, 4);
+  let path = dynamic_time_warping(&view).unwrap();
+  assert_eq!(path.text_indices_slice(), &[0, 0, 1, 1, 1]);
+  assert_eq!(path.time_indices_slice(), &[0, 1, 1, 2, 3]);
+}
+
+#[test]
+fn dtw_matches_swift_unit_test_ground_truth() {
+  // Cross-check against Swift's own ground truth for the exact matrix
+  // `testDynamicTimeWarpingSimpleMatrix` uses (`UnitTests.swift:
+  // 2337-2367`) -- independent confirmation, beyond hand-tracing, that
+  // this port's tie-breaking matches a real, passing upstream Swift
+  // assertion and not just this task's own (corrected, see below)
+  // synthetic test matrices.
+  #[rustfmt::skip]
+  let matrix = [
+    1.0f32, 1.0, 1.0,
+    5.0, 2.0, 1.0,
+    1.0, 5.0, 2.0,
+  ];
+  let view = AlignmentView::new(&matrix, 3, 3);
+  let path = dynamic_time_warping(&view).unwrap();
+  assert_eq!(path.text_indices_slice(), &[0, 1, 1, 2, 2]);
+  assert_eq!(path.time_indices_slice(), &[0, 0, 1, 1, 2]);
+}
+
+#[test]
+fn dtw_rejects_empty() {
+  let view = AlignmentView::new(&[], 0, 0);
+  assert!(dynamic_time_warping(&view).is_err());
+}
+
+fn word(text: &str, start: f32, end: f32) -> WordTiming {
+  // Passing `text` bare (not `text.into()`): with two `impl Into<_>`
+  // parameters in the same call, `.into()`'s target type is unresolvable
+  // (E0283) even though `&str: Into<String>` is the only fit -- the
+  // callee's own bound performs the conversion instead.
+  WordTiming::new(text, vec![1], start, end, 0.9)
+}
+
+#[test]
+fn merge_punctuations_english() {
+  // Ports testMergePunctuations shape: " Hey" "," " you" "!" -> " Hey," " you!"
+  let alignment = [
+    word(" Hey", 0.0, 0.2),
+    word(",", 0.2, 0.3),
+    word(" you", 0.3, 0.6),
+    word("!", 0.6, 0.7),
+  ];
+  let merged = merge_punctuations(&alignment, PREPEND_PUNCTUATION, APPEND_PUNCTUATION);
+  let words: Vec<&str> = merged.iter().map(|w| w.word()).collect();
+  assert_eq!(words, vec![" Hey,", " you!"]);
+  assert_eq!(merged[0].tokens_slice().len(), 2, "tokens concatenated");
+}
+
+#[test]
+fn merge_punctuations_prepended() {
+  // A leading prepend punctuation (space + quote) glues onto the NEXT word
+  // (SegmentSeeker.swift:296-315).
+  let alignment = [
+    word(" \u{00bf}", 0.0, 0.1),
+    word("Que", 0.1, 0.4),
+    word("?", 0.4, 0.5),
+  ];
+  let merged = merge_punctuations(&alignment, PREPEND_PUNCTUATION, APPEND_PUNCTUATION);
+  let words: Vec<&str> = merged.iter().map(|w| w.word()).collect();
+  assert_eq!(words, vec![" \u{00bf}Que?"]);
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn find_alignment_produces_monotonic_word_timings() {
+  let t = tiny_tokenizer();
+  let ids = t.encode(" Hello world again").unwrap();
+  // Diagonal-ish synthetic weights: token i peaks at frame i * 10.
+  let cols = 100usize;
+  let mut matrix = vec![0.0f32; ids.len() * cols];
+  for (i, row) in matrix.chunks_mut(cols).enumerate() {
+    row[i * 10] = 1.0;
+  }
+  let view = AlignmentView::new(&matrix, ids.len(), cols);
+  let log_probs = vec![-0.2f32; ids.len()];
+  let words = find_alignment(&ids, &view, &log_probs, &t, "en").unwrap();
+  assert!(!words.is_empty());
+  for pair in words.windows(2) {
+    assert!(pair[0].end() <= pair[1].start() + 1e-4, "monotonic timings");
+  }
+  for w in &words {
+    assert!((0.0..=1.0).contains(&w.probability()));
+  }
 }
