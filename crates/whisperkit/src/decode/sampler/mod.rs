@@ -115,6 +115,7 @@ impl GreedyTokenSampler {
   /// adds a reproducibility knob Swift has no equivalent for, so
   /// `temperature != 0.0` callers (e.g. tests) can assert an exact draw.
   #[must_use]
+  #[inline(always)]
   pub fn with_seed(mut self, seed: u64) -> Self {
     self.rng = StdRng::seed_from_u64(seed);
     self

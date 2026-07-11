@@ -131,6 +131,7 @@ impl MockBackend {
 
   /// Builder form of [`Self::set_dims`].
   #[must_use]
+  #[inline(always)]
   pub fn with_dims(mut self, dims: ModelDims) -> Self {
     self.set_dims(dims);
     self
@@ -139,6 +140,7 @@ impl MockBackend {
   /// Sets the dimensions [`InferenceBackend::dims`] reports, and that
   /// [`Self::push_step`]/[`Self::push_token_step`] validate scripted
   /// logits against.
+  #[inline(always)]
   pub fn set_dims(&mut self, dims: ModelDims) -> &mut Self {
     self.dims = dims;
     self

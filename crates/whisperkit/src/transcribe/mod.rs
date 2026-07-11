@@ -150,6 +150,7 @@ impl<'ctx, B> TranscribeTask<'ctx, B> {
 
   /// Builder form of [`Self::set_segment_callback`].
   #[must_use]
+  #[inline(always)]
   pub const fn with_segment_callback(
     mut self,
     segment_callback: SegmentDiscoveryCallback<'ctx>,
@@ -159,6 +160,7 @@ impl<'ctx, B> TranscribeTask<'ctx, B> {
   }
   /// Sets the callback fired with each window's segments as they're
   /// discovered.
+  #[inline(always)]
   pub const fn set_segment_callback(
     &mut self,
     segment_callback: SegmentDiscoveryCallback<'ctx>,
@@ -169,6 +171,7 @@ impl<'ctx, B> TranscribeTask<'ctx, B> {
 
   /// Builder form of [`Self::set_progress_callback`].
   #[must_use]
+  #[inline(always)]
   pub const fn with_progress_callback(
     mut self,
     progress_callback: TranscriptionProgressCallback<'ctx>,
@@ -177,6 +180,7 @@ impl<'ctx, B> TranscribeTask<'ctx, B> {
     self
   }
   /// Sets the callback fired with per-step decode progress.
+  #[inline(always)]
   pub const fn set_progress_callback(
     &mut self,
     progress_callback: TranscriptionProgressCallback<'ctx>,
@@ -187,6 +191,7 @@ impl<'ctx, B> TranscribeTask<'ctx, B> {
 
   /// Builder form of [`Self::set_window_id_offset`].
   #[must_use]
+  #[inline(always)]
   pub const fn with_window_id_offset(mut self, window_id_offset: usize) -> Self {
     self.set_window_id_offset(window_id_offset);
     self
@@ -195,6 +200,7 @@ impl<'ctx, B> TranscribeTask<'ctx, B> {
   /// are offset by — lets a caller running several [`TranscribeTask`]s
   /// concurrently over different audio chunks keep each worker's window ids
   /// distinct.
+  #[inline(always)]
   pub const fn set_window_id_offset(&mut self, window_id_offset: usize) -> &mut Self {
     self.window_id_offset = window_id_offset;
     self

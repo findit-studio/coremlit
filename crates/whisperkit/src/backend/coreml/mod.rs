@@ -267,6 +267,7 @@ impl CoreMlBackend {
   /// Whether the decoder carries the cross-attention word-timestamp head
   /// (`alignment_heads_weights`) — Swift `supportsWordTimestamps`
   /// (`TextDecoder.swift:309-311`).
+  #[inline(always)]
   pub const fn supports_word_timestamps(&self) -> bool {
     self.supports_alignment
   }
