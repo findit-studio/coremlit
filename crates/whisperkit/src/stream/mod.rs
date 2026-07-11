@@ -274,11 +274,36 @@ pub const DEFAULT_USE_VAD: bool = true;
 /// Swift's defaults verbatim, matching [`DecodingOptions`]'s own
 /// reference implementation of this crate's options pattern.
 #[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AudioStreamOptions {
+  #[cfg_attr(
+    feature = "serde",
+    serde(default = "default_required_segments_for_confirmation")
+  )]
   required_segments_for_confirmation: usize,
+  #[cfg_attr(feature = "serde", serde(default = "default_silence_threshold"))]
   silence_threshold: f32,
+  #[cfg_attr(feature = "serde", serde(default = "default_compression_check_window"))]
   compression_check_window: usize,
+  #[cfg_attr(feature = "serde", serde(default = "default_use_vad"))]
   use_vad: bool,
+}
+
+#[cfg(feature = "serde")]
+fn default_required_segments_for_confirmation() -> usize {
+  DEFAULT_REQUIRED_SEGMENTS_FOR_CONFIRMATION
+}
+#[cfg(feature = "serde")]
+fn default_silence_threshold() -> f32 {
+  DEFAULT_SILENCE_THRESHOLD
+}
+#[cfg(feature = "serde")]
+fn default_compression_check_window() -> usize {
+  DEFAULT_COMPRESSION_CHECK_WINDOW
+}
+#[cfg(feature = "serde")]
+fn default_use_vad() -> bool {
+  DEFAULT_USE_VAD
 }
 
 impl Default for AudioStreamOptions {
