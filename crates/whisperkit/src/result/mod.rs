@@ -1607,21 +1607,23 @@ impl FallbackReason {
 /// Ports Swift's `DecodingFallback.init?(options:isFirstTokenLogProbTooLow:
 /// noSpeechProb:compressionRatio:avgLogProb:)`
 /// (`argmax-oss-swift/Sources/WhisperKit/Core/Models.swift:357-381`).
-/// `isFirstTokenLogProbTooLow` is re-derived here from `decoding`'s first
-/// `token_log_probs` entry rather than threaded through as a separate
-/// parameter: Swift computes it inline in the decode loop by comparing
-/// the first sampled token's log probability against the same threshold
-/// (`TextDecoder.swift:662-663`), and `TextDecoder.swift:788-791`
-/// confirms each `DecodingResult.tokenLogProbs` step is built as exactly
-/// one `[token: logprob]` entry — i.e. the same "first sampled token's
-/// log probability" this function needs is already sitting at
-/// `token_log_probs[0]`.
+///
+/// **The caller (the decode loop) computes `first_token_log_prob_too_low`**
+/// by comparing the first sampled token's log probability against
+/// `options.first_token_logprob_threshold()` *inside* the decode loop
+/// (`TextDecoder.swift:662-667`). This value is not recoverable from
+/// `decoding.token_log_probs_slice()` because the prefill phase does not
+/// append the first token's log probability to that vector — the first
+/// entry stored there is actually a placeholder or undefined for prefill
+/// results. Therefore, the caller must compute this flag from the
+/// loop-local first sampled token's log probability and thread it through
+/// to this function as a parameter (mirroring Swift's signature).
 ///
 /// **Decision order matters** (this is the Swift source's own comment,
 /// `Models.swift:365`) and every comparison is strict, exactly matching
 /// the source:
 ///
-/// 1. first-token log prob `<` threshold -> `Some(FirstTokenLogProbThreshold)`.
+/// 1. `first_token_log_prob_too_low` is `true` -> `Some(FirstTokenLogProbThreshold)`.
 /// 2. else, if `no_speech_prob` `>` threshold -> **silence**, returns
 ///    `None` unconditionally. This step does *not* also consult
 ///    `avg_logprob` — an earlier exploration of this port assumed it
@@ -1636,13 +1638,11 @@ impl FallbackReason {
 /// falls through to the next step, matching Swift's `if let threshold =
 /// options.xThreshold` optional-binding guards.
 pub fn needs_fallback(
+  first_token_log_prob_too_low: bool,
   decoding: &DecodingResult,
   options: &DecodingOptions,
 ) -> Option<FallbackReason> {
-  if let Some(threshold) = options.first_token_logprob_threshold()
-    && let Some(&(_, first_token_logprob)) = decoding.token_log_probs_slice().first()
-    && first_token_logprob < threshold
-  {
+  if first_token_log_prob_too_low {
     return Some(FallbackReason::FirstTokenLogProbThreshold);
   }
   if let Some(threshold) = options.no_speech_threshold()

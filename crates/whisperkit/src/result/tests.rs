@@ -32,10 +32,11 @@ fn fallback_decision_order_matches_swift() {
   let opts = DecodingOptions::new();
 
   // 1. first-token logprob below threshold wins outright, before any other
-  //    check runs (TextDecoder.swift:662-663; Models.swift:366-367).
+  //    check runs (TextDecoder.swift:662-667; Models.swift:366-367).
+  //    first_token_lp=-2.0 < threshold=-1.5, so flag=true.
   let r = result_with(-0.5, 0.1, 1.0, -2.0);
   assert_eq!(
-    needs_fallback(&r, &opts),
+    needs_fallback(true, &r, &opts),
     Some(FallbackReason::FirstTokenLogProbThreshold)
   );
 
@@ -47,32 +48,36 @@ fn fallback_decision_order_matches_swift() {
   //    branch. This particular case's *outcome* happens to match either
   //    reading; see `fallback_silence_short_circuits_regardless_of_avg_logprob`
   //    below for a case that actually discriminates between them.
+  //    first_token_lp=0.0 >= threshold=-1.5, so flag=false.
   let r = result_with(-1.5, 0.9, 1.0, 0.0);
-  assert_eq!(needs_fallback(&r, &opts), None);
+  assert_eq!(needs_fallback(false, &r, &opts), None);
 
   // 3. compression ratio over threshold -> repetition fallback.
+  //    first_token_lp=0.0 >= threshold=-1.5, so flag=false.
   let r = result_with(-0.5, 0.1, 3.0, 0.0);
   assert_eq!(
-    needs_fallback(&r, &opts),
+    needs_fallback(false, &r, &opts),
     Some(FallbackReason::CompressionRatioThreshold)
   );
 
   // 4. avg logprob under threshold -> quality fallback.
+  //    first_token_lp=0.0 >= threshold=-1.5, so flag=false.
   let r = result_with(-1.5, 0.1, 1.0, 0.0);
   assert_eq!(
-    needs_fallback(&r, &opts),
+    needs_fallback(false, &r, &opts),
     Some(FallbackReason::LogProbThreshold)
   );
 
   // 5. clean result -> no fallback.
+  //    first_token_lp=0.0 >= threshold=-1.5, so flag=false.
   let r = result_with(-0.2, 0.1, 1.0, 0.0);
-  assert_eq!(needs_fallback(&r, &opts), None);
+  assert_eq!(needs_fallback(false, &r, &opts), None);
 
   // disabled thresholds (None) disable their own checks; nothing else
   // objects to a compression ratio of 3.0 here.
   let opts = DecodingOptions::new().maybe_compression_ratio_threshold(None);
   let r = result_with(-0.5, 0.1, 3.0, 0.0);
-  assert_eq!(needs_fallback(&r, &opts), None);
+  assert_eq!(needs_fallback(false, &r, &opts), None);
 }
 
 #[test]
@@ -86,9 +91,10 @@ fn fallback_silence_short_circuits_regardless_of_avg_logprob() {
   // original (avg_logprob-gated) reading of "silence", this case would
   // have fallen through to the compression check instead and returned
   // `Some(CompressionRatioThreshold)`.
+  // first_token_lp=0.0 >= threshold=-1.5, so flag=false.
   let opts = DecodingOptions::new();
   let r = result_with(-0.2, 0.9, 3.0, 0.0);
-  assert_eq!(needs_fallback(&r, &opts), None);
+  assert_eq!(needs_fallback(false, &r, &opts), None);
 }
 
 #[test]
@@ -97,32 +103,34 @@ fn fallback_thresholds_use_strict_inequality() {
   // `<=`/`>=`, at every step).
   let opts = DecodingOptions::new();
   // first_token_logprob_threshold default is Some(-1.5); exactly -1.5 must
-  // not trigger.
+  // not trigger. first_token_lp=-1.5 == threshold, so flag=false.
   let r = result_with(-0.2, 0.1, 1.0, -1.5);
-  assert_eq!(needs_fallback(&r, &opts), None);
+  assert_eq!(needs_fallback(false, &r, &opts), None);
   // no_speech_threshold default is Some(0.6); exactly 0.6 must not trigger
-  // silence.
+  // silence. first_token_lp=0.0 >= threshold=-1.5, so flag=false.
   let r = result_with(-0.2, 0.6, 1.0, 0.0);
-  assert_eq!(needs_fallback(&r, &opts), None);
+  assert_eq!(needs_fallback(false, &r, &opts), None);
   // compression_ratio_threshold default is Some(2.4); exactly 2.4 must not
-  // trigger.
+  // trigger. first_token_lp=0.0 >= threshold=-1.5, so flag=false.
   let r = result_with(-0.2, 0.1, 2.4, 0.0);
-  assert_eq!(needs_fallback(&r, &opts), None);
+  assert_eq!(needs_fallback(false, &r, &opts), None);
   // logprob_threshold default is Some(-1.0); exactly -1.0 must not trigger.
+  // first_token_lp=0.0 >= threshold=-1.5, so flag=false.
   let r = result_with(-1.0, 0.1, 1.0, 0.0);
-  assert_eq!(needs_fallback(&r, &opts), None);
+  assert_eq!(needs_fallback(false, &r, &opts), None);
 }
 
 #[test]
 fn fallback_first_token_check_ignores_empty_token_log_probs() {
-  // A `DecodingResult` with no token_log_probs at all has no "first token"
-  // to check; needs_fallback must skip that branch rather than panic, and
-  // fall through to the remaining checks.
+  // A `DecodingResult` with no token_log_probs at all still requires the
+  // caller to compute first_token_log_prob_too_low from the loop-local
+  // first token; this test passes false (no first-token fallback) and
+  // verifies the function continues to check other thresholds.
   let opts = DecodingOptions::new();
   let r = DecodingResult::new().with_avg_logprob(-1.5); // logprob-threshold-worthy
   assert!(r.token_log_probs_slice().is_empty());
   assert_eq!(
-    needs_fallback(&r, &opts),
+    needs_fallback(false, &r, &opts),
     Some(FallbackReason::LogProbThreshold)
   );
 }
@@ -135,8 +143,9 @@ fn fallback_all_thresholds_disabled_never_triggers() {
     .maybe_compression_ratio_threshold(None)
     .maybe_logprob_threshold(None);
   // Values that would trip every single check if thresholds were active.
+  // Pass false for the first_token flag since thresholds are disabled anyway.
   let r = result_with(-9.0, 1.0, 9.0, -9.0);
-  assert_eq!(needs_fallback(&r, &opts), None);
+  assert_eq!(needs_fallback(false, &r, &opts), None);
 }
 
 #[test]
