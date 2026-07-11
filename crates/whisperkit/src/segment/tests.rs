@@ -351,6 +351,23 @@ fn duration_constraints_take_the_capped_upper_median() {
 }
 
 #[test]
+fn even_count_median_takes_the_upper_middle_value() {
+  // Review finding: sorted[count/2] vs sorted[(count-1)/2] needs a
+  // genuinely even, distinct-valued input to discriminate. Durations
+  // 0.2/0.4/0.6/0.8 -> sorted[2] = 0.6 (the UPPER middle), max 1.2; the
+  // lower-median regression would report 0.4/0.8.
+  let alignment = [
+    word("a", 0.0, 0.2),
+    word("b", 0.2, 0.6),
+    word("c", 0.6, 1.2),
+    word("d", 1.2, 2.0),
+  ];
+  let constraints = calculate_word_duration_constraints(&alignment);
+  assert!((constraints.median() - 0.6).abs() < 1e-6);
+  assert!((constraints.max_duration() - 1.2).abs() < 1e-6);
+}
+
+#[test]
 fn truncation_fires_only_at_sentence_boundaries() {
   // SegmentSeeker.swift:509-526.
   // Case A: the overlong word IS a sentence mark -> end pulled to start+max.
@@ -373,6 +390,17 @@ fn truncation_fires_only_at_sentence_boundaries() {
   let out = truncate_long_words_at_sentence_boundaries(alignment, 0.5);
   assert_eq!(out[1].end(), 3.0);
   assert_eq!(out[2].end(), 6.0);
+
+  // Case D (review finding): BOTH branches hold — the overlong word is a
+  // mark AND its predecessor is a mark. Swift's if/else-if takes the
+  // first branch only: end is pulled in, start stays.
+  let alignment = vec![word("!", 0.0, 0.1), word(".", 0.1, 2.0)];
+  let out = truncate_long_words_at_sentence_boundaries(alignment, 0.5);
+  assert!(
+    (out[1].end() - 0.6).abs() < 1e-6,
+    "first branch: end = start + max"
+  );
+  assert_eq!(out[1].start(), 0.1, "second branch must not also fire");
 
   // Index 0 is never truncated (loop starts at 1).
   let alignment = vec![word(".", 0.0, 5.0)];

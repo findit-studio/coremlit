@@ -55,8 +55,11 @@
 //!   plus the pure word-timestamp math a later plan wires into the
 //!   pipeline: [`dynamic_time_warping`](segment::dynamic_time_warping) over
 //!   a decoded-token x audio-frame alignment matrix,
-//!   [`find_alignment`](segment::find_alignment), and
-//!   [`merge_punctuations`](segment::merge_punctuations).
+//!   [`find_alignment`](segment::find_alignment),
+//!   [`merge_punctuations`](segment::merge_punctuations), and the
+//!   word-duration heuristics
+//!   ([`calculate_word_duration_constraints`](segment::calculate_word_duration_constraints),
+//!   [`truncate_long_words_at_sentence_boundaries`](segment::truncate_long_words_at_sentence_boundaries)).
 //! - [`transcribe`] — [`WhisperKit`](transcribe::WhisperKit), the public
 //!   pipeline entry point (`transcribe`/`transcribe_all`/
 //!   `detect_language`), composing
