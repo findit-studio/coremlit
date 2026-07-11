@@ -124,6 +124,7 @@ impl ModelManager {
 
   /// Installs the callback fired on every state transition, replacing any
   /// previously installed one.
+  #[inline(always)]
   pub fn set_state_callback(&mut self, callback: StateCallback) -> &mut Self {
     self.callback = Some(callback);
     self
@@ -131,6 +132,7 @@ impl ModelManager {
 
   /// Builder form of [`Self::set_state_callback`].
   #[must_use]
+  #[inline(always)]
   pub fn with_state_callback(mut self, callback: StateCallback) -> Self {
     self.set_state_callback(callback);
     self
@@ -247,13 +249,17 @@ impl ModelManager {
   }
 
   /// Releases the loaded models, transitioning [`ModelState::Unloading`] →
-  /// [`ModelState::Unloaded`] unconditionally (Swift
-  /// `WhisperKit.unloadModels()`, `WhisperKit.swift:487-499`, which has no
-  /// "already unloaded" guard of its own — unlike the generic
-  /// `ModelManager.unloadModels()`'s `guard modelState == .loaded ||
-  /// .prewarmed`). A no-op on the model data itself when nothing was
-  /// loaded, since dropping `None` does nothing.
+  /// [`ModelState::Unloaded`]. A complete no-op — no transitions, no
+  /// callbacks — unless something is resident to release
+  /// (`ModelManager.unloadModels()`'s `guard modelState == .loaded ||
+  /// .prewarmed`, `ModelManager.swift:194-201`; the guard keeps a
+  /// callback-driven UI from seeing spurious `Unloading`/`Unloaded`
+  /// pairs. `WhisperKit.swift:487-499`'s wrapper has no guard of its
+  /// own, but only ever runs over the guarded manager).
   pub fn unload(&mut self) {
+    if !matches!(self.state, ModelState::Loaded | ModelState::Prewarmed) {
+      return;
+    }
     self.transition(ModelState::Unloading);
     self.models = None;
     self.transition(ModelState::Unloaded);

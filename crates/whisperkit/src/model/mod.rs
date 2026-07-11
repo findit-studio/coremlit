@@ -11,7 +11,8 @@
 //! reshaped for synchronous, single-owner use over a live `coremlit::Model`
 //! and driving the [`ModelState`] transitions below (see that module's doc
 //! for the sync reshape). Everything else here ships the model-lifecycle
-//! *vocabulary* [`manager::ModelManager`] and the rest of the pipeline use:
+//! *vocabulary* that [`manager::ModelManager`] and the rest of the
+//! pipeline use:
 //! state names, variant detection, folder/glob utilities, the
 //! support-config lookup, and the [`ModelLoader`] seam `ModelManager`
 //! resolves bundle paths through — [`ModelState`] transitions themselves
