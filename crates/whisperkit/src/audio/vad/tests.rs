@@ -5,7 +5,7 @@ fn energy_thresholding_flags_loud_frames() {
   // EnergyVad default frame = 0.1 s = 1600 samples @ 16 kHz:
   // two silent frames then one loud frame.
   let mut samples = vec![0.0f32; 3200];
-  samples.extend(std::iter::repeat(0.5).take(1600));
+  samples.extend(std::iter::repeat_n(0.5, 1600));
   let vad = EnergyVad::new();
   let activity = vad.voice_activity(&samples);
   assert_eq!(activity.len(), 3);
