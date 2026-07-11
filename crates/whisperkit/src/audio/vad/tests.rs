@@ -31,11 +31,21 @@ fn longest_silence_between_speech() {
 }
 
 #[test]
-fn active_chunks_merges_consecutive_frames() {
+fn active_frame_ranges_merges_consecutive_frames() {
   let frames = [false, true, true, false, true];
   let vad = EnergyVad::new();
-  assert_eq!(vad.active_chunks(&frames), vec![(1, 3), (4, 5)]);
-  assert!(vad.active_chunks(&[false, false]).is_empty());
+  assert_eq!(vad.active_frame_ranges(&frames), vec![(1, 3), (4, 5)]);
+  assert!(vad.active_frame_ranges(&[false, false]).is_empty());
+}
+
+#[test]
+fn active_chunks_returns_clamped_sample_ranges() {
+  // One silent frame then 1.5 loud frames: Swift returns sample ranges
+  // sliceable from the waveform, final end clamped to its length.
+  let mut samples = vec![0.0f32; 1600];
+  samples.extend(vec![0.5f32; 2400]);
+  let vad = EnergyVad::new();
+  assert_eq!(vad.active_chunks(&samples), vec![(1600, 4000)]);
 }
 
 #[test]

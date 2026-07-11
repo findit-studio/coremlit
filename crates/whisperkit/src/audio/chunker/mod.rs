@@ -5,7 +5,10 @@
 //! (`Utilities/Extensions+Internal.swift:112-130`).
 
 use crate::{
-  audio::vad::VoiceActivityDetector, constants::SAMPLE_RATE, result::TranscriptionSegment,
+  audio::vad::VoiceActivityDetector,
+  constants::SAMPLE_RATE,
+  error::AudioError,
+  result::{TranscriptionResult, TranscriptionSegment},
 };
 
 #[cfg(test)]
@@ -47,11 +50,28 @@ impl AudioChunk {
 /// Turns `clip_timestamps` seconds into `(start, end)` sample ranges.
 ///
 /// Ports `DecodingOptions.prepareSeekClips`
-/// (`Extensions+Internal.swift:112-130`) exactly: empty input becomes one
+/// (`Extensions+Internal.swift:112-130`): empty input becomes one
 /// full-range clip; an odd final timestamp runs to `content_frames`; pairs
-/// are consumed in order. Like Swift, no validation or clamping happens
-/// here — out-of-range clips are the transcription loop's concern.
-pub fn prepare_seek_clips(clip_timestamps: &[f32], content_frames: usize) -> Vec<(usize, usize)> {
+/// are consumed in order. Ordering and upper bounds are NOT validated,
+/// like Swift.
+///
+/// # Errors
+/// [`AudioError::InvalidClipRange`] for a negative or non-finite
+/// timestamp. This is a deliberate, documented divergence: Swift keeps the
+/// signed sample index and lets the chunk loop's bounds guard silently
+/// skip such clips, but a `usize` cast would saturate `-0.5` to `0` and
+/// silently transcribe from the start instead — rejecting loudly is the
+/// only faithful-or-better option.
+pub fn prepare_seek_clips(
+  clip_timestamps: &[f32],
+  content_frames: usize,
+) -> Result<Vec<(usize, usize)>, AudioError> {
+  if let Some(&bad) = clip_timestamps.iter().find(|t| !t.is_finite() || **t < 0.0) {
+    return Err(AudioError::InvalidClipRange {
+      start: bad,
+      end: bad,
+    });
+  }
   let mut seek_points: Vec<usize> = clip_timestamps
     .iter()
     .map(|seconds| (seconds * SAMPLE_RATE as f32).round() as usize)
@@ -62,10 +82,12 @@ pub fn prepare_seek_clips(clip_timestamps: &[f32], content_frames: usize) -> Vec
   if seek_points.len() % 2 == 1 {
     seek_points.push(content_frames);
   }
-  seek_points
-    .chunks(2)
-    .map(|pair| (pair[0], pair[1]))
-    .collect()
+  Ok(
+    seek_points
+      .chunks(2)
+      .map(|pair| (pair[0], pair[1]))
+      .collect(),
+  )
 }
 
 /// Shifts segments (seek, times, and word times) by an absolute chunk
@@ -74,6 +96,23 @@ pub fn prepare_seek_clips(clip_timestamps: &[f32], content_frames: usize) -> Vec
 /// Ports `TranscriptionUtilities.updateSegmentTimings`
 /// (`TranscriptionUtilities.swift:55-69`) applied per segment as the
 /// chunker's `updateSeekOffsetsForResults` does (`AudioChunker.swift:14-39`).
+/// Re-anchors a whole per-chunk result: stamps [`TranscriptionResult`]'s
+/// `seek_time` and shifts every segment and word.
+///
+/// Ports the result-level half of `updateSeekOffsetsForResults`
+/// (`AudioChunker.swift:14-39`, `seekTime` assignment at `:29`);
+/// [`apply_seek_offsets`] is its per-segment core.
+pub fn apply_result_seek_offset(result: &mut TranscriptionResult, seek_offset: usize) {
+  let seek_seconds = seek_offset as f32 / crate::constants::SAMPLE_RATE as f32;
+  result.set_seek_time(seek_seconds);
+  apply_seek_offsets(result.segments_slice_mut(), seek_offset);
+}
+
+/// Shifts segments (seek, times, and word times) by an absolute chunk
+/// offset — the per-segment core of [`apply_result_seek_offset`].
+///
+/// Ports `TranscriptionUtilities.updateSegmentTimings`
+/// (`TranscriptionUtilities.swift:55-69`).
 pub fn apply_seek_offsets(segments: &mut [TranscriptionSegment], seek_offset: usize) {
   let seek_seconds = seek_offset as f32 / SAMPLE_RATE as f32;
   for segment in segments {

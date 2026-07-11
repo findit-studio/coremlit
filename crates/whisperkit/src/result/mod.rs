@@ -1223,6 +1223,16 @@ impl TranscriptionResult {
   pub const fn segments_slice(&self) -> &[TranscriptionSegment] {
     self.segments.as_slice()
   }
+
+  /// Mutable view of the segments (fixed length; use
+  /// [`Self::set_segments`] to replace the collection). Segment timings
+  /// carry no cross-field invariant with the rest of the result, so
+  /// in-place mutation is safe to expose — chunk re-anchoring shifts them
+  /// directly.
+  #[inline(always)]
+  pub const fn segments_slice_mut(&mut self) -> &mut [TranscriptionSegment] {
+    self.segments.as_mut_slice()
+  }
   /// Builder form of [`Self::set_segments`].
   #[must_use]
   #[inline(always)]

@@ -1,18 +1,41 @@
 use super::*;
-use crate::{audio::vad::EnergyVad, constants::WINDOW_SAMPLES, result::TranscriptionSegment};
+use crate::{
+  audio::vad::EnergyVad,
+  constants::WINDOW_SAMPLES,
+  result::{TranscriptionResult, TranscriptionSegment},
+};
 
 #[test]
 fn seek_clips_from_timestamps() {
-  assert_eq!(prepare_seek_clips(&[], 1000), vec![(0, 1000)]);
+  assert_eq!(prepare_seek_clips(&[], 1000).unwrap(), vec![(0, 1000)]);
   assert_eq!(
-    prepare_seek_clips(&[1.0, 2.0], 100_000),
+    prepare_seek_clips(&[1.0, 2.0], 100_000).unwrap(),
     vec![(16_000, 32_000)]
   );
-  assert_eq!(prepare_seek_clips(&[1.0], 100_000), vec![(16_000, 100_000)]);
   assert_eq!(
-    prepare_seek_clips(&[0.0, 1.0, 2.0, 3.0], 100_000),
+    prepare_seek_clips(&[1.0], 100_000).unwrap(),
+    vec![(16_000, 100_000)]
+  );
+  assert_eq!(
+    prepare_seek_clips(&[0.0, 1.0, 2.0, 3.0], 100_000).unwrap(),
     vec![(0, 16_000), (32_000, 48_000)]
   );
+}
+
+#[test]
+fn seek_clips_reject_negative_and_non_finite_timestamps() {
+  use crate::error::AudioError;
+  // A usize cast would saturate -0.5 to sample 0 and silently transcribe
+  // from the start; Swift's signed indices make the loop guard skip such
+  // clips instead. Loud rejection is the documented divergence.
+  assert!(matches!(
+    prepare_seek_clips(&[-0.5, 1.0], 100_000),
+    Err(AudioError::InvalidClipRange { .. })
+  ));
+  assert!(matches!(
+    prepare_seek_clips(&[f32::NAN], 100_000),
+    Err(AudioError::InvalidClipRange { .. })
+  ));
 }
 
 #[test]
@@ -73,4 +96,23 @@ fn apply_seek_offsets_shifts_segments_and_words() {
   assert_eq!(segments[0].end(), 4.0);
   assert_eq!(segments[0].words_slice()[0].start(), 3.0);
   assert_eq!(segments[0].words_slice()[0].end(), 3.5);
+}
+
+#[test]
+fn apply_result_seek_offset_stamps_seek_time_and_shifts_nested_times() {
+  use crate::result::WordTiming;
+  let mut segment = TranscriptionSegment::new();
+  segment.set_start(1.0).set_end(2.0);
+  segment.set_words(vec![WordTiming::new("hi", vec![1], 1.0, 1.5, 0.9)]);
+  let mut result = TranscriptionResult::new(
+    "hi",
+    vec![segment],
+    "en",
+    crate::result::TranscriptionTimings::new(),
+  );
+  apply_result_seek_offset(&mut result, 32_000);
+  assert_eq!(result.seek_time(), Some(2.0));
+  let segment = &result.segments_slice()[0];
+  assert_eq!(segment.start(), 3.0);
+  assert_eq!(segment.words_slice()[0].end(), 3.5);
 }

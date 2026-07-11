@@ -30,8 +30,8 @@ pub trait VoiceActivityDetector {
   fn frame_length_samples(&self) -> usize;
 
   /// Merges consecutive active frames into half-open `(start, end)` frame
-  /// ranges (`VoiceActivityDetector.swift:52-77` in frame terms).
-  fn active_chunks(&self, frames: &[bool]) -> Vec<(usize, usize)> {
+  /// ranges — the frame-index view backing [`Self::active_chunks`].
+  fn active_frame_ranges(&self, frames: &[bool]) -> Vec<(usize, usize)> {
     let mut result = Vec::new();
     let mut current_start: Option<usize> = None;
     for (index, &active) in frames.iter().enumerate() {
@@ -48,6 +48,26 @@ pub trait VoiceActivityDetector {
       result.push((start, frames.len()));
     }
     result
+  }
+
+  /// Runs VAD over `samples` and merges active frames into half-open
+  /// SAMPLE ranges, the final range clamped to the waveform length.
+  ///
+  /// Ports `calculateActiveChunks` (`VoiceActivityDetector.swift:52-77`)
+  /// faithfully — Swift returns waveform-sliceable sample ranges, not
+  /// frame indices.
+  fn active_chunks(&self, samples: &[f32]) -> Vec<(usize, usize)> {
+    let frames = self.voice_activity(samples);
+    self
+      .active_frame_ranges(&frames)
+      .into_iter()
+      .map(|(start, end)| {
+        (
+          self.frame_to_sample(start),
+          self.frame_to_sample(end).min(samples.len()),
+        )
+      })
+      .collect()
   }
 
   /// First sample index of a frame.
