@@ -48,6 +48,8 @@ use crate::{
   transcribe::TranscribeTask,
 };
 
+pub mod agreement;
+
 #[cfg(test)]
 mod tests;
 
