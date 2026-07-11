@@ -92,43 +92,18 @@ impl Features {
   }
 
   // Bridges to CoreML's `MLDictionaryFeatureProvider`, the concrete
-  // `MLFeatureProvider` used to feed `Model::predict`.
+  // `MLFeatureProvider` used to feed `Model::predict`. `self.entries` is
+  // already a borrowed-pairs iterator in disguise — hand it to
+  // `provider_from_pairs` rather than duplicating construction here.
   pub(crate) fn to_provider(
     &self,
   ) -> Result<Retained<MLDictionaryFeatureProvider>, PredictionError> {
-    let keys: Vec<Retained<NSString>> = self
-      .entries
-      .iter()
-      .map(|(n, _)| NSString::from_str(n))
-      .collect();
-    let values: Vec<Retained<AnyObject>> = self
-      .entries
-      .iter()
-      .map(|(_, a)| {
-        // SAFETY: featureValueWithMultiArray is a plain constructor send;
-        // `a.raw()` borrows a live MLMultiArray for the call's duration and
-        // the returned MLFeatureValue retains it, so no dangling reference
-        // results once this closure returns.
-        let value: Retained<MLFeatureValue> =
-          unsafe { MLFeatureValue::featureValueWithMultiArray(a.raw()) };
-        // MLDictionaryFeatureProvider's initializer is typed over AnyObject
-        // (see below); erase the concrete class now.
-        value.into()
-      })
-      .collect();
-    let key_refs: Vec<&NSString> = keys.iter().map(|k| k.as_ref()).collect();
-    let dict = NSDictionary::from_retained_objects(&key_refs, &values);
-    // SAFETY: `dict` maps NSString keys to MLFeatureValue objects (erased
-    // to AnyObject), exactly the generic-dictionary-of-feature-values shape
-    // `initWithDictionary:error:` documents; `alloc()` supplies a fresh,
-    // unaliased receiver.
-    unsafe {
-      MLDictionaryFeatureProvider::initWithDictionary_error(
-        MLDictionaryFeatureProvider::alloc(),
-        &dict,
-      )
-    }
-    .map_err(|e| PredictionError::Native(NsErrorInfo::from_ns_error(&e)))
+    provider_from_pairs(
+      self
+        .entries
+        .iter()
+        .map(|(name, array)| (name.as_str(), array)),
+    )
   }
 
   // Extracts named multi-arrays out of any CoreML feature provider (e.g. a
@@ -200,6 +175,55 @@ impl Features {
     }
     Ok(features)
   }
+}
+
+// Builds an `MLDictionaryFeatureProvider` — the same construction
+// `Features::to_provider` used to do inline — from any iterator of
+// borrowed `(name, array)` pairs, not just one already collected into an
+// owned `Features`. `Model::predict_with` calls this directly so its
+// per-step inputs never need to move through an owned `Features` at all;
+// `to_provider` now just adapts `self.entries` into the same pair shape
+// and delegates here.
+//
+// A single pass over `pairs` (rather than the two separate `.map()`s
+// `to_provider` used when it only ever read from a re-iterable `Vec`)
+// pushes each name/value in lockstep, since `I: Iterator` may not be
+// cheaply re-iterable (e.g. a borrowed slice's `.iter().copied()`) —
+// `keys[i]`/`values[i]` still correspond to the same source pair, same as
+// before.
+pub(crate) fn provider_from_pairs<'a, I>(
+  pairs: I,
+) -> Result<Retained<MLDictionaryFeatureProvider>, PredictionError>
+where
+  I: Iterator<Item = (&'a str, &'a MultiArray)>,
+{
+  let mut keys: Vec<Retained<NSString>> = Vec::new();
+  let mut values: Vec<Retained<AnyObject>> = Vec::new();
+  for (name, array) in pairs {
+    keys.push(NSString::from_str(name));
+    // SAFETY: featureValueWithMultiArray is a plain constructor send;
+    // `array.raw()` borrows a live MLMultiArray for the call's duration and
+    // the returned MLFeatureValue retains it, so no dangling reference
+    // results once this call returns.
+    let value: Retained<MLFeatureValue> =
+      unsafe { MLFeatureValue::featureValueWithMultiArray(array.raw()) };
+    // MLDictionaryFeatureProvider's initializer is typed over AnyObject
+    // (see below); erase the concrete class now.
+    values.push(value.into());
+  }
+  let key_refs: Vec<&NSString> = keys.iter().map(|k| k.as_ref()).collect();
+  let dict = NSDictionary::from_retained_objects(&key_refs, &values);
+  // SAFETY: `dict` maps NSString keys to MLFeatureValue objects (erased
+  // to AnyObject), exactly the generic-dictionary-of-feature-values shape
+  // `initWithDictionary:error:` documents; `alloc()` supplies a fresh,
+  // unaliased receiver.
+  unsafe {
+    MLDictionaryFeatureProvider::initWithDictionary_error(
+      MLDictionaryFeatureProvider::alloc(),
+      &dict,
+    )
+  }
+  .map_err(|e| PredictionError::Native(NsErrorInfo::from_ns_error(&e)))
 }
 
 #[cfg(test)]

@@ -3,11 +3,12 @@
 use std::path::Path;
 
 use objc2::rc::Retained;
-use objc2_core_ml::{MLModel, MLModelConfiguration};
+use objc2_core_ml::{MLDictionaryFeatureProvider, MLModel, MLModelConfiguration};
 use objc2_foundation::NSURL;
 
 use crate::{
-  CompileError, ComputeUnits, DataType, Features, LoadError, NsErrorInfo, PredictionError,
+  CompileError, ComputeUnits, DataType, Features, LoadError, MultiArray, NsErrorInfo,
+  PredictionError,
 };
 
 /// Converts `path` to a file URL through the filesystem-representation API,
@@ -212,18 +213,59 @@ impl Model {
   /// shared a buffer with an input (or another output) fails.
   pub fn predict(&self, inputs: &Features) -> Result<Features, PredictionError> {
     let provider = inputs.to_provider()?;
-    // SAFETY: provider conforms to MLFeatureProvider; blocking call.
-    let outputs = unsafe {
-      self
-        .raw()
-        .predictionFromFeatures_error(objc2::runtime::ProtocolObject::from_ref(&*provider))
-    }
-    .map_err(|e| PredictionError::Native(NsErrorInfo::from_ns_error(&e)))?;
     // Seed with every input's buffer identity: inputs outlive this call (the
     // caller still owns `inputs`), so an identity/zero-copy model echoing
     // one back as an output is the same aliasing hazard as two output names
     // sharing one array, which `from_provider` also catches on its own.
-    let mut known_regions = inputs.byte_ranges();
+    self.predict_from_provider(&provider, inputs.byte_ranges())
+  }
+
+  /// Runs a synchronous prediction from borrowed inputs.
+  ///
+  /// The per-step decoder path reuses a fixed set of pre-allocated tensors
+  /// every step; [`Features`] owns its arrays, so `predict(&Features)` would
+  /// force a move-in/move-out of each one on every step, and could not
+  /// include a borrowed encoder output at all. This builds the feature
+  /// provider directly from borrowed `(name, array)` pairs instead of an
+  /// owned [`Features`].
+  ///
+  /// Sound because `MLFeatureValue(multiArray:)` retains the array it
+  /// wraps, so the provider built inside this call does not depend on any
+  /// input outliving the call; `&MultiArray` guarantees no `&mut` alias of
+  /// any input exists for the call's duration; and [`Model`] is [`Send`]
+  /// but deliberately not [`Sync`] (see the `# Concurrency` section above),
+  /// so no other thread can be predicting against — or otherwise touching —
+  /// this same `Model` concurrently.
+  ///
+  /// # Errors
+  /// As [`Self::predict`].
+  pub fn predict_with(&self, inputs: &[(&str, &MultiArray)]) -> Result<Features, PredictionError> {
+    let provider = crate::features::provider_from_pairs(inputs.iter().copied())?;
+    // As in `predict`: these borrowed inputs outlive this call too (the
+    // caller still owns each array), so seed `known_regions` the same way.
+    let known_regions = inputs.iter().map(|(_, a)| a.byte_range()).collect();
+    self.predict_from_provider(&provider, known_regions)
+  }
+
+  // Shared prediction tail for `predict`/`predict_with`: runs
+  // `predictionFromFeatures_error` against an already-built `provider` and
+  // extracts its outputs, seeding `known_regions` so aliasing with any
+  // still caller-owned input is caught by `Features::from_provider`. The
+  // two callers differ only in how `provider`/`known_regions` are built
+  // (from an owned `Features` vs. borrowed pairs); everything past that
+  // point is identical, so it lives here once.
+  fn predict_from_provider(
+    &self,
+    provider: &MLDictionaryFeatureProvider,
+    mut known_regions: Vec<(usize, usize)>,
+  ) -> Result<Features, PredictionError> {
+    // SAFETY: provider conforms to MLFeatureProvider; blocking call.
+    let outputs = unsafe {
+      self
+        .raw()
+        .predictionFromFeatures_error(objc2::runtime::ProtocolObject::from_ref(provider))
+    }
+    .map_err(|e| PredictionError::Native(NsErrorInfo::from_ns_error(&e)))?;
     Features::from_provider(&outputs, &mut known_regions)
   }
 

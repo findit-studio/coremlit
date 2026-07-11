@@ -121,3 +121,21 @@ fn loads_through_non_ascii_symlinked_path() {
   assert!(model.description().input("audio").is_some());
   let _ = std::fs::remove_file(&link);
 }
+
+#[test]
+#[ignore = "requires local tiny model (see plan Task 8 Step 1)"]
+fn mel_predict_with_borrowed_inputs() {
+  let model = Model::load(
+    common::tiny_dir().join("MelSpectrogram.mlmodelc"),
+    ComputeUnits::CpuOnly,
+  )
+  .unwrap();
+  let audio = MultiArray::zeros(&[480_000], DataType::F32).unwrap();
+  let outputs = model.predict_with(&[("audio", &audio)]).unwrap();
+  assert_eq!(
+    outputs.get("melspectrogram_features").unwrap().shape(),
+    vec![1, 80, 1, 3000]
+  );
+  // audio is still owned by the caller:
+  assert_eq!(audio.count(), 480_000);
+}
