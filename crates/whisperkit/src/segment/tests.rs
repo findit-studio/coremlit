@@ -301,3 +301,21 @@ fn find_alignment_produces_monotonic_word_timings() {
     assert!((0.0..=1.0).contains(&w.probability()));
   }
 }
+
+#[test]
+fn dtw_add_before_compare_matches_swift_rounding_ties() {
+  // Regression (phase-gate round 2): Swift adds the cell value BEFORE
+  // comparing (SegmentSeeker.swift:239-251); a large-magnitude value can
+  // round distinct incoming costs into exact ties, which fall to left.
+  // Comparing the bare incoming costs picks up (strictly smallest) here
+  // and walks a different path.
+  #[rustfmt::skip]
+  let matrix = [
+    0.0f32, 1.0,
+    0.0,    1.0e30,
+  ];
+  let view = AlignmentView::new(&matrix, 2, 2);
+  let path = dynamic_time_warping(&view).unwrap();
+  assert_eq!(path.text_indices_slice(), &[0, 1, 1]);
+  assert_eq!(path.time_indices_slice(), &[0, 0, 1]);
+}

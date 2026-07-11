@@ -290,19 +290,23 @@ impl DtwPath {
 /// reordered or loosened to `<=`.
 ///
 /// Swift computes `c0 = diagonal + value`, `c1 = up + value`, `c2 = left +
-/// value` up front and compares those. This compares the bare incoming
-/// costs instead and adds `value` to the winner afterward — bit-identical,
-/// since `value` is finite and constant across all three, so it cannot
-/// flip any `<` result (including when an operand is `f64::INFINITY`:
-/// `INFINITY + value == INFINITY`, so the comparison's truth value is
-/// unchanged either way).
-fn min_cost_and_trace(diagonal: f64, up: f64, left: f64) -> (f64, i8) {
-  if diagonal < up && diagonal < left {
-    (diagonal, 0)
-  } else if up < diagonal && up < left {
-    (up, 1)
+/// value` up front and compares THOSE (`SegmentSeeker.swift:239-251`) —
+/// and this port does the same, because adding a common finite value is
+/// not order-preserving in floating point: a large-magnitude `value` can
+/// round distinct incoming costs into exact ties, and exact ties fall to
+/// left. Comparing the bare incoming costs picked a different winner on
+/// such inputs (phase-gate finding; pinned by
+/// `dtw_add_before_compare_matches_swift_rounding_ties`).
+fn min_cost_and_trace(diagonal: f64, up: f64, left: f64, value: f64) -> (f64, i8) {
+  let c0 = diagonal + value;
+  let c1 = up + value;
+  let c2 = left + value;
+  if c0 < c1 && c0 < c2 {
+    (c0, 0)
+  } else if c1 < c0 && c1 < c2 {
+    (c1, 1)
   } else {
-    (left, 2)
+    (c2, 2)
   }
 }
 
@@ -350,8 +354,8 @@ pub fn dynamic_time_warping(matrix: &AlignmentView<'_>) -> Result<DtwPath, Segme
       let diagonal = cost[(row - 1) * width + column - 1];
       let up = cost[(row - 1) * width + column];
       let left = cost[row * width + column - 1];
-      let (best, direction) = min_cost_and_trace(diagonal, up, left);
-      cost[row * width + column] = best + value;
+      let (best, direction) = min_cost_and_trace(diagonal, up, left, value);
+      cost[row * width + column] = best;
       trace[row * width + column] = direction;
     }
   }
