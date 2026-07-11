@@ -85,7 +85,7 @@ use crate::{
     TranscriptionTimings, merge_transcription_results, needs_fallback,
   },
   segment,
-  stream::AudioStreamTranscriber,
+  stream::{AudioStreamTranscriber, agreement::LocalAgreementTranscriber},
   tokenizer::WhisperTokenizer,
 };
 
@@ -845,6 +845,25 @@ impl<B> WhisperKit<B> {
     decoding_options: DecodingOptions,
   ) -> AudioStreamTranscriber<'_, B> {
     AudioStreamTranscriber::new(self.backend(), self.tokenizer(), decoding_options)
+  }
+
+  /// Builds a [`LocalAgreementTranscriber`] over this pipeline — the
+  /// simulated-stream driver for LocalAgreement-2 confirmation. Mirrors
+  /// [`Self::audio_stream_transcriber`]'s role as the convenience
+  /// constructor for this pipeline's other streaming driver; see
+  /// [`crate::stream::agreement`] for the port this wraps
+  /// (`TranscribeCLI.swift:322-424`). Unlike
+  /// [`AudioStreamTranscriber::new`], which takes `backend`/`tokenizer`
+  /// separately, [`LocalAgreementTranscriber::new`] holds `self` directly:
+  /// it calls [`Self::transcribe`] (Swift's own `whisperKit.transcribe`
+  /// call site, `:369`) rather than assembling a
+  /// [`TranscribeTask`] itself.
+  #[inline(always)]
+  pub fn local_agreement_transcriber(
+    &self,
+    options: DecodingOptions,
+  ) -> LocalAgreementTranscriber<'_, B> {
+    LocalAgreementTranscriber::new(self, options)
   }
 }
 
