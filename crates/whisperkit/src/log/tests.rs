@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use super::*;
+use std::sync::Arc as StdArc;
 
 #[test]
 fn levels_gate_in_order() {
@@ -18,7 +19,7 @@ fn callback_receives_gated_messages() {
   let seen: Arc<Mutex<Vec<(LogLevel, String)>>> = Arc::default();
   let sink = Arc::clone(&seen);
   let logger = Logger::new(LogLevel::Info);
-  logger.set_callback(Box::new(move |level, msg| {
+  logger.set_callback(StdArc::new(move |level, msg| {
     sink.lock().unwrap().push((level, msg.to_string()));
   }));
   logger.log(LogLevel::Debug, format_args!("hidden"));
@@ -35,7 +36,7 @@ fn level_none_silences_everything() {
   let seen: Arc<Mutex<Vec<(LogLevel, String)>>> = Arc::default();
   let sink = Arc::clone(&seen);
   let logger = Logger::new(LogLevel::None);
-  logger.set_callback(Box::new(move |level, msg| {
+  logger.set_callback(StdArc::new(move |level, msg| {
     sink.lock().unwrap().push((level, msg.to_string()));
   }));
   logger.log(LogLevel::Error, format_args!("dropped"));
@@ -47,7 +48,7 @@ fn set_level_regates_at_runtime() {
   let seen: Arc<Mutex<Vec<String>>> = Arc::default();
   let sink = Arc::clone(&seen);
   let logger = Logger::new(LogLevel::Error);
-  logger.set_callback(Box::new(move |_, msg| {
+  logger.set_callback(StdArc::new(move |_, msg| {
     sink.lock().unwrap().push(msg.to_string())
   }));
   logger.log(LogLevel::Info, format_args!("early"));
@@ -64,4 +65,39 @@ fn resident_memory_is_plausible_and_repeatable() {
     "resident {first} bytes implausibly small"
   );
   assert!(resident_memory_bytes().is_some());
+}
+
+#[test]
+fn reentrant_callback_does_not_deadlock() {
+  let logger = StdArc::new(Logger::new(LogLevel::Debug));
+  let seen: StdArc<Mutex<Vec<String>>> = StdArc::default();
+  let sink = StdArc::clone(&seen);
+  let inner = StdArc::clone(&logger);
+  logger.set_callback(StdArc::new(move |level, msg: &str| {
+    sink.lock().unwrap().push(msg.to_string());
+    if !msg.starts_with("re:") {
+      // Reconfigure AND re-log from inside the callback — must not deadlock.
+      inner.set_level(LogLevel::Info);
+      inner.log(level, format_args!("re: {msg}"));
+    }
+  }));
+  logger.log(LogLevel::Error, format_args!("outer"));
+  assert_eq!(
+    seen.lock().unwrap().as_slice(),
+    &["outer".to_string(), "re: outer".to_string()]
+  );
+}
+
+#[test]
+fn clear_callback_restores_default_routing() {
+  let seen: StdArc<Mutex<Vec<String>>> = StdArc::default();
+  let sink = StdArc::clone(&seen);
+  let logger = Logger::new(LogLevel::Debug);
+  logger.set_callback(StdArc::new(move |_, msg: &str| {
+    sink.lock().unwrap().push(msg.to_string());
+  }));
+  logger.log(LogLevel::Info, format_args!("captured"));
+  logger.clear_callback();
+  logger.log(LogLevel::Info, format_args!("to stderr, not the sink"));
+  assert_eq!(seen.lock().unwrap().as_slice(), &["captured".to_string()]);
 }

@@ -75,7 +75,7 @@ impl core::str::FromStr for LogLevel {
 }
 
 /// The message sink installed via [`Logger::set_callback`].
-pub type LoggingCallback = Box<dyn Fn(LogLevel, &str) + Send + Sync>;
+pub type LoggingCallback = std::sync::Arc<dyn Fn(LogLevel, &str) + Send + Sync>;
 
 struct LoggerState {
   level: LogLevel,
@@ -123,6 +123,11 @@ impl Logger {
     self.state.lock().expect("logger lock poisoned").callback = Some(callback);
   }
 
+  /// Removes the installed sink, restoring default stderr output.
+  pub fn clear_callback(&self) {
+    self.state.lock().expect("logger lock poisoned").callback = None;
+  }
+
   /// Emits `args` at `level` if the gate allows it.
   ///
   /// `LogLevel::None` messages are never emitted regardless of the gate
@@ -131,8 +136,15 @@ impl Logger {
     if level.is_none() {
       return;
     }
-    let state = self.state.lock().expect("logger lock poisoned");
-    if state.level.is_none() || level < state.level {
+    // Copy the gate and sink under the lock, then RELEASE it before any
+    // user code runs (Swift parity, `Logging.swift:113`): a callback that
+    // logs recursively or reconfigures the logger must not deadlock, and a
+    // slow sink must not serialize configuration.
+    let (gate, callback) = {
+      let state = self.state.lock().expect("logger lock poisoned");
+      (state.level, state.callback.clone())
+    };
+    if gate.is_none() || level < gate {
       return;
     }
     let message = std::fmt::format(args);
@@ -143,7 +155,7 @@ impl Logger {
       LogLevel::Error => tracing::error!("{message}"),
       LogLevel::None => {}
     }
-    match state.callback.as_ref() {
+    match callback.as_ref() {
       Some(callback) => callback(level, &message),
       _ => eprintln!("[whisperkit {level}] {message}"),
     }
