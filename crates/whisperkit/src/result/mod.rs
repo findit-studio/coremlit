@@ -85,6 +85,20 @@ impl WordTiming {
     self.end
   }
 
+  /// Sets the start time, in seconds.
+  #[inline(always)]
+  pub const fn set_start(&mut self, start: f32) -> &mut Self {
+    self.start = start;
+    self
+  }
+
+  /// Sets the end time, in seconds.
+  #[inline(always)]
+  pub const fn set_end(&mut self, end: f32) -> &mut Self {
+    self.end = end;
+    self
+  }
+
   /// DTW alignment confidence.
   #[inline(always)]
   pub const fn probability(&self) -> f32 {
@@ -426,6 +440,15 @@ impl TranscriptionSegment {
   #[inline(always)]
   pub const fn words_slice(&self) -> &[WordTiming] {
     self.words.as_slice()
+  }
+
+  /// Mutable view of the per-word timings (fixed length; use
+  /// [`Self::set_words`] to replace the collection). Word times carry no
+  /// cross-field invariant, so in-place mutation is safe to expose — the
+  /// chunker's seek re-anchoring shifts them directly.
+  #[inline(always)]
+  pub const fn words_slice_mut(&mut self) -> &mut [WordTiming] {
+    self.words.as_mut_slice()
   }
   /// Builder form of [`Self::set_words`].
   #[must_use]

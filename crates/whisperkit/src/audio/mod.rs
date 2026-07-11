@@ -5,6 +5,7 @@
 //! [`SAMPLE_RATE`](crate::constants::SAMPLE_RATE). Ports the pure-math
 //! statics of `WhisperKit/Core/Audio/AudioProcessor.swift`.
 
+pub mod chunker;
 pub mod vad;
 
 #[cfg(test)]
