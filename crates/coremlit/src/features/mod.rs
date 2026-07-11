@@ -197,8 +197,12 @@ pub(crate) fn provider_from_pairs<'a, I>(
 where
   I: Iterator<Item = (&'a str, &'a MultiArray)>,
 {
-  let mut keys: Vec<Retained<NSString>> = Vec::new();
-  let mut values: Vec<Retained<AnyObject>> = Vec::new();
+  // The decoder loop calls this every step with a fixed handful of
+  // tensors; the lower size hint is exact for the slice-backed iterators
+  // both call paths pass, so these never reallocate there.
+  let (lower, _) = pairs.size_hint();
+  let mut keys: Vec<Retained<NSString>> = Vec::with_capacity(lower);
+  let mut values: Vec<Retained<AnyObject>> = Vec::with_capacity(lower);
   for (name, array) in pairs {
     keys.push(NSString::from_str(name));
     // SAFETY: featureValueWithMultiArray is a plain constructor send;

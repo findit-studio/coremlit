@@ -237,6 +237,12 @@ impl Model {
   /// so no other thread can be predicting against — or otherwise touching —
   /// this same `Model` concurrently.
   ///
+  /// Unlike [`Features`]-based construction (whose insert-by-name cannot
+  /// produce duplicates), a raw slice can repeat a name; duplicates are
+  /// not rejected — one entry silently wins per `NSDictionary`'s own
+  /// construction semantics, and every entry's byte region still seeds
+  /// the aliasing detector either way.
+  ///
   /// # Errors
   /// As [`Self::predict`].
   pub fn predict_with(&self, inputs: &[(&str, &MultiArray)]) -> Result<Features, PredictionError> {
