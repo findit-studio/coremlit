@@ -9,3 +9,4 @@
 //! macOS only. Swift source of truth: `argmax-oss-swift`.
 
 pub mod constants;
+pub mod error;
