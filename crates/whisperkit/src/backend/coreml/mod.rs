@@ -120,8 +120,9 @@ fn output_dim(
 /// The three scratch `Vec<f16>` buffers are sized once at construction so
 /// the per-step output extraction (`copy_into` gathers, see the module
 /// doc) performs no whisperkit-level heap allocation per step (spec
-/// §10); the remaining per-step allocations are small `Vec<usize>`
-/// shape/stride collections inside `coremlit`'s accessors.
+/// §10); `coremlit` caches array shape/strides at construction, leaving
+/// only `copy_into`'s small per-call row-index scratch on padded
+/// outputs.
 #[derive(Debug)]
 pub struct CoreMlDecoderState {
   /// `[1] i32` — current token (`TextDecoder.swift:137`).

@@ -410,8 +410,8 @@ pub trait InferenceBackend {
   ) -> Result<(), BackendError>;
 
   /// Accumulated per-token alignment weights, when the model has the
-  /// word-timestamp head (rows = alignment rows written so far — one per
-  /// step that produced a row — cols = audio ctx).
+  /// word-timestamp head (rows = the high-water row index — `position +
+  /// 2` across steps that produced a row; cols = audio ctx).
   fn alignment_weights<'state>(
     &self,
     state: &'state Self::DecoderState,
