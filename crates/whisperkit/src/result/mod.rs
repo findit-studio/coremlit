@@ -1638,7 +1638,7 @@ impl DecodingResult {
 /// Live per-step decode progress (Swift `TranscriptionProgress`,
 /// `Models.swift:643-661`), delivered to a
 /// [`TranscriptionProgressCallback`](crate::decode::TranscriptionProgressCallback)
-/// after every non-prefill decode step.
+/// after every non-completed decode step, prefill steps included.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TranscriptionProgress {

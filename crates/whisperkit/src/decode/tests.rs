@@ -215,7 +215,9 @@ fn early_stop_flag_breaks_loop_and_callback_sets_it() {
     &|_progress| {
       let mut seen = steps_seen.lock().unwrap();
       *seen += 1;
-      Some(*seen < 5) // request stop at the 5th non-prefill callback
+      // Prefill steps get callbacks too, so `seen` reaches 5 on the 2nd
+      // non-prefill step; the stop reply is honored there.
+      Some(*seen < 5)
     };
   let result = decode_text(
     &mock,
@@ -264,4 +266,22 @@ fn detect_language_single_step_and_resets_state() {
   );
   assert!(result.tokens_slice().is_empty()); // TextDecoder.swift:525-538
   assert_eq!(mock.counters().resets(), 1, "state reset after probe");
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn detect_language_resets_state_even_when_the_step_fails() {
+  // Regression (task-5 review, Important): a probe that errors partway
+  // may already have advanced KV/masks; the documented reset must run on
+  // error paths too, not only on success.
+  let t = tiny_tokenizer();
+  let mock = MockBackend::new(); // zero scripted steps -> ScriptExhausted
+  let encoded = mock
+    .encode(&mock.extract_features(&[0.0; 4]).unwrap())
+    .unwrap();
+  let mut state = mock.new_decoder_state().unwrap();
+  let mut timings = TranscriptionTimings::new();
+  let err = detect_language(&mock, &encoded, &mut state, &t, &mut timings).unwrap_err();
+  assert!(matches!(err, DecodeError::Backend(_)));
+  assert_eq!(mock.counters().resets(), 1, "state reset despite the error");
 }

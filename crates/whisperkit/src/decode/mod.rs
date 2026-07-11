@@ -83,9 +83,11 @@ fn log_sum_exp(logits: &[f32]) -> f32 {
 // ---------------------------------------------------------------------
 
 /// Per-step decode progress sink (Swift `TranscriptionCallback`,
-/// `WhisperKit.swift`): called after every non-prefill step of
-/// [`decode_text`]'s loop with the tokens/text decoded so far. Returning
-/// `Some(false)` requests early stop; `Some(true)`/`None` continue.
+/// `WhisperKit.swift`): called after every non-completed step of
+/// [`decode_text`]'s loop — prefill steps included, matching Swift's
+/// un-gated dispatch (`TextDecoder.swift:733-741`) — with the tokens/text
+/// decoded so far. Returning `Some(false)` requests early stop, honored
+/// only once past the prefill steps; `Some(true)`/`None` continue.
 ///
 /// Dispatched **inline**, synchronously, unlike Swift's
 /// `Task.detached(priority: .low)` (`TextDecoder.swift:734-741`) — this is
@@ -540,7 +542,9 @@ fn finalize_decoding_result(
 /// cache/masks — Swift's probe skips cache updates entirely, setting
 /// `inputIds`/`cacheLength` directly and never touching the KV tensors at
 /// all (`TextDecoder.swift:456-457`). This function therefore calls
-/// [`InferenceBackend::reset_decoder_state`] before returning. Equivalence:
+/// [`InferenceBackend::reset_decoder_state`] before returning — on every
+/// path, errors included, so a caller that reuses `state` after an `Err`
+/// (e.g. to retry) never decodes from the probe's stale row. Equivalence:
 /// reset restores the exact initial mask state, and the probe's one stale
 /// KV row is dead data — the model ignores cache beyond `cache_length ==
 /// 0`, and the first real decode step overwrites position 0 anyway.
@@ -548,6 +552,26 @@ fn finalize_decoding_result(
 /// # Errors
 /// [`DecodeError`] if the backend step or a tokenizer decode fails.
 pub fn detect_language<B>(
+  backend: &B,
+  encoder_output: &B::EncoderOutput,
+  state: &mut B::DecoderState,
+  tokenizer: &WhisperTokenizer,
+  timings: &mut TranscriptionTimings,
+) -> Result<DecodingResult, DecodeError>
+where
+  B: InferenceBackend,
+{
+  let result = detect_language_probe(backend, encoder_output, state, tokenizer, timings);
+  // Unconditional: the probe may have advanced KV/masks before failing
+  // partway (see the deviation note above), so the error paths need the
+  // reset as much as the success path does.
+  backend.reset_decoder_state(state);
+  result
+}
+
+/// The fallible body of [`detect_language`]; the public wrapper owns the
+/// unconditional state reset.
+fn detect_language_probe<B>(
   backend: &B,
   encoder_output: &B::EncoderOutput,
   state: &mut B::DecoderState,
@@ -598,8 +622,6 @@ where
   } else {
     DEFAULT_LANGUAGE_CODE.to_string()
   };
-
-  backend.reset_decoder_state(state);
 
   // :525-538 — tokens/text stay empty; this is a probe, not a transcript.
   Ok(
