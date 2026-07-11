@@ -478,7 +478,16 @@ fn finalize_decoding_result(
     .collect();
   let final_compression_ratio = text::compression_ratio_of_tokens(&word_tokens);
 
-  // :796-800 — `Extensions.rounded(3)`.
+  // :796-800 — `Extensions.rounded(3)`. Same half-away-from-zero formula
+  // as `segment::rounded_to_places` (both port the identical Swift
+  // extension, just at a different `decimal_places`); deliberately left
+  // duplicated here rather than shared. `rounded_to_places` is
+  // `pub(crate)`, so calling `crate::segment::rounded_to_places(value, 3)`
+  // from here would compile, but `decode` has no other reason to depend
+  // on `segment` — a later pipeline stage built on top of decode's own
+  // output — and reaching across that boundary (or adding a new
+  // shared-utility module) for one two-line arithmetic formula is more
+  // coupling than the duplication it would save.
   let temperature = (sampler.temperature() * 1000.0).round() / 1000.0;
 
   // :802 — upstream TODO, never actually computed by Swift either.

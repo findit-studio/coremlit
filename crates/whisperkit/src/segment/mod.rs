@@ -16,12 +16,19 @@
 //! tie-breaking in the private `min_cost_and_trace`, `:239-251`),
 //! [`find_alignment`] (`:340-408`), [`merge_punctuations`] (`:280-338`),
 //! [`calculate_word_duration_constraints`] and
-//! [`truncate_long_words_at_sentence_boundaries`] (`:498-526`).
-//! `addWordTimestamps` (`:410-`) — the orchestration wrapper that
-//! re-anchors these against a window's seek offset, clamps against
-//! `lastSpeechTimestamp`, and writes results back onto
-//! [`TranscriptionSegment`]s — is deferred to a later task; this module
-//! ships only the pure alignment math it depends on.
+//! [`truncate_long_words_at_sentence_boundaries`] (`:498-526`), and
+//! [`update_segments_with_word_timings`] (`:528-659`) — the final
+//! re-anchoring step that walks a word-index cursor shared across every
+//! segment, applies the short-word pull-back and pause/boundary
+//! heuristics, and writes the results back onto [`TranscriptionSegment`]s.
+//! `addWordTimestamps` itself (`:410-496`) — the orchestration wrapper
+//! that flattens each segment's tokens/log-probs into the flat index list
+//! used to filter the raw CoreML alignment-weights array, then threads
+//! that through `findAlignment` -> the duration/truncation hack ->
+//! `mergePunctuations` -> [`update_segments_with_word_timings`] in
+//! sequence — is deferred to a later task, along with wiring any of this
+//! module's word-timestamp math into the decode loop; this module ships
+//! only the pure math `addWordTimestamps` depends on.
 
 use unicode_categories::UnicodeCategories;
 
@@ -702,22 +709,220 @@ pub fn truncate_long_words_at_sentence_boundaries(
   alignment
 }
 
+/// Re-anchors DTW word-level `merged_alignment` timings onto `segments`,
+/// applying Swift's short-word pull-back and pause/boundary heuristics
+/// along the way. Ports `updateSegmentsWithWordTimings`
+/// (`SegmentSeeker.swift:528-659`) — the final step `addWordTimestamps`
+/// (`:410-496`, not yet ported; see this module's own doc) runs after
+/// `findAlignment` -> the duration/truncation hack -> `mergePunctuations`.
+///
+/// `merged_alignment` is walked with a cursor SHARED across every
+/// `segments` entry (`:538`, Swift's `wordIndex`): once an alignment entry
+/// is consumed by one segment it is never revisited by a later one, even
+/// if that segment's own token budget is not fully accounted for (the
+/// cursor simply runs out and that segment's word list ends up short).
+/// `last_speech_timestamp` is similarly threaded across every segment,
+/// seeded by the caller's initial value and updated to each segment's own
+/// final `end` once it gets at least one word (`:651`, guarded by the same
+/// non-empty check as the pause/boundary hack itself — a wordless segment
+/// leaves `last_speech_timestamp` untouched for the next one).
+///
+/// # Errors
+/// [`SegmentError::Tokenizer`] if retokenizing a partially-special-filtered
+/// alignment entry's surviving tokens fails (`:556-559`).
+pub fn update_segments_with_word_timings(
+  segments: &[TranscriptionSegment],
+  merged_alignment: &[WordTiming],
+  seek: usize,
+  last_speech_timestamp: f32,
+  constrained_median_duration: f32,
+  max_duration: f32,
+  tokenizer: &WhisperTokenizer,
+) -> Result<Vec<TranscriptionSegment>, SegmentError> {
+  // :537 -- this window's seek offset, in seconds.
+  let time_offset = seek as f32 / SAMPLE_RATE as f32;
+  let special_begin = tokenizer.special_tokens().special_token_begin();
+  // :538 -- cursor into `merged_alignment`, shared across every segment
+  // below; never reset per segment.
+  let mut word_index = 0usize;
+  let mut last_speech_timestamp = last_speech_timestamp;
+  let mut updated_segments: Vec<TranscriptionSegment> = Vec::with_capacity(segments.len());
+
+  for (segment_index, segment) in segments.iter().enumerate() {
+    let mut saved_tokens = 0usize;
+    // :544 -- only text tokens count toward this segment's word budget;
+    // special/timestamp tokens already in `segment.tokens` never do.
+    let text_token_count = segment
+      .tokens_slice()
+      .iter()
+      .filter(|&&token| token < special_begin)
+      .count();
+    let mut words_in_segment: Vec<WordTiming> = Vec::new();
+
+    // :547's `where savedTokens < textTokens.count` guards each element in
+    // Swift's `for timing in mergedAlignment[wordIndex...]`, skipping
+    // (not necessarily stopping at) elements while false. `break` here is
+    // behaviorally identical: `saved_tokens` and `word_index` both only
+    // ever advance inside this loop body, so once the bound trips false it
+    // stays false for every later element too, and Swift's `where` never
+    // lets the body run again either. `.min(merged_alignment.len())`
+    // guards a slice a Swift `mergedAlignment[wordIndex...]` has no
+    // equivalent for (it would trap on an out-of-range `wordIndex`); the
+    // invariant that `word_index` never exceeds `merged_alignment.len()`
+    // holds by construction (each increment consumes one element of the
+    // shrinking remaining slice), so this is a zero-cost safety net, not a
+    // behavior change.
+    for timing in &merged_alignment[word_index.min(merged_alignment.len())..] {
+      if saved_tokens >= text_token_count {
+        break;
+      }
+      word_index += 1;
+
+      // :551-554 -- drop special/timestamp tokens from this timing; an
+      // all-special entry is consumed from the cursor but emits no word.
+      let timing_tokens: Vec<u32> = timing
+        .tokens_slice()
+        .iter()
+        .copied()
+        .filter(|&token| token < special_begin)
+        .collect();
+      if timing_tokens.is_empty() {
+        continue;
+      }
+
+      // :556-559 -- retokenize only when some (not all) of this timing's
+      // tokens were filtered out; otherwise reuse its own decoded word.
+      let timing_tokens_len = timing_tokens.len();
+      let word = if timing_tokens_len < timing.tokens_slice().len() {
+        tokenizer.decode(&timing_tokens, false)?
+      } else {
+        timing.word().to_string()
+      };
+
+      // :561-562.
+      let mut start = rounded_to_places(time_offset + timing.start(), 2);
+      let end = rounded_to_places(time_offset + timing.end(), 2);
+
+      // :564-596 -- a short-duration word gets its start pulled back into
+      // any gap before it: against the previous word in THIS segment if
+      // there is one, else (only for a segment's own first word) against
+      // the previous segment's already-finalized end.
+      if end - start < constrained_median_duration / 4.0 {
+        if let Some(previous) = words_in_segment.last() {
+          let previous_end = previous.end();
+          if start > previous_end {
+            let space_available = start - previous_end;
+            let desired_duration = space_available.min(constrained_median_duration / 2.0);
+            start = rounded_to_places(start - desired_duration, 2);
+          }
+        } else if segment_index > 0
+          && updated_segments.len() > segment_index - 1
+          && start > updated_segments[segment_index - 1].end()
+        {
+          let previous_end = updated_segments[segment_index - 1].end();
+          let space_available = start - previous_end;
+          let desired_duration = space_available.min(constrained_median_duration / 2.0);
+          start = rounded_to_places(start - desired_duration, 2);
+        }
+      }
+
+      // :598.
+      let probability = rounded_to_places(timing.probability(), 2);
+      words_in_segment.push(WordTiming::new(
+        word,
+        timing_tokens,
+        start,
+        end,
+        probability,
+      ));
+      // :606 -- Swift re-reads `timingTokens.count`, the local filtered
+      // vec, not the just-pushed word's own token slice; captured above
+      // before `timing_tokens` moved into the `WordTiming`.
+      saved_tokens += timing_tokens_len;
+    }
+
+    let mut updated_segment = segment.clone();
+
+    // :615-652 -- only a segment that got at least one word runs the
+    // pause/boundary hack and advances `last_speech_timestamp`; a wordless
+    // segment leaves both `updated_segment`'s bounds and
+    // `last_speech_timestamp` untouched.
+    if !words_in_segment.is_empty() {
+      // :616-620 -- read BEFORE any mutation below, matching Swift's own
+      // `firstWord` copy.
+      let pause_length = words_in_segment[0].end() - last_speech_timestamp;
+      let first_word_too_long = words_in_segment[0].duration() > max_duration;
+      let both_words_too_long = words_in_segment.len() > 1
+        && words_in_segment[1].end() - words_in_segment[0].start() > max_duration * 2.0;
+
+      // :621-633 -- after an over-long pause, clamp the first word (and,
+      // if it is also too long, re-split the 0/1 boundary first) so
+      // neither word spans more than `max_duration`.
+      if pause_length > constrained_median_duration * 4.0
+        && (first_word_too_long || both_words_too_long)
+      {
+        if words_in_segment.len() > 1 && words_in_segment[1].duration() > max_duration {
+          let w1_end = words_in_segment[1].end();
+          let boundary = (w1_end / 2.0).max(w1_end - max_duration);
+          words_in_segment[0].set_end(boundary);
+          words_in_segment[1].set_start(boundary);
+        }
+        // Reads `words_in_segment[0].end()` LIVE: the boundary re-split
+        // just above, if it fired, already changed it.
+        let w0_end = words_in_segment[0].end();
+        words_in_segment[0].set_start(last_speech_timestamp.max(w0_end - max_duration));
+      }
+
+      // :635-640 -- prefer the segment-level start over the (possibly
+      // hack-adjusted) first word's start when the word has drifted more
+      // than half a second earlier than the segment itself began.
+      let w0_start = words_in_segment[0].start();
+      let w0_end = words_in_segment[0].end();
+      if segment.start() < w0_end && segment.start() - 0.5 > w0_start {
+        let clamped = (w0_end - constrained_median_duration)
+          .min(segment.start())
+          .max(0.0);
+        words_in_segment[0].set_start(clamped);
+      } else {
+        updated_segment.set_start(words_in_segment[0].start());
+      }
+
+      // :642-649 -- symmetric preference for the segment-level end over
+      // the last word's end. Swift's `wordsInSegment.last` is always
+      // non-nil here (guarded by the outer non-empty check already); when
+      // there is exactly one word this is the SAME element the
+      // start-preference block above just wrote, so `last_start` below
+      // can already reflect that mutation.
+      let last_index = words_in_segment.len() - 1;
+      let last_start = words_in_segment[last_index].start();
+      let last_end = words_in_segment[last_index].end();
+      if updated_segment.end() > last_start && segment.end() + 0.5 < last_end {
+        let clamped = (last_start + constrained_median_duration).max(segment.end());
+        words_in_segment[last_index].set_end(clamped);
+      } else {
+        updated_segment.set_end(last_end);
+      }
+
+      // :651.
+      last_speech_timestamp = updated_segment.end();
+    }
+
+    // :654-655.
+    updated_segment.set_words(words_in_segment);
+    updated_segments.push(updated_segment);
+  }
+
+  Ok(updated_segments)
+}
+
 /// Rounds `value` to `decimal_places` decimal digits, half-away-from-zero.
 /// Ports `Float.rounded(_:)` (`ArgmaxCore/FoundationExtensions.swift:
 /// 9-13`: `(self * divisor).rounded() / divisor`, where Swift's
 /// no-argument `.rounded()` defaults to rule `.toNearestOrAwayFromZero`).
 /// Rust's [`f32::round`] documents that exact rule (round half-way cases
 /// away from `0.0`), so this is a direct, unadjusted port. `pub(crate)`:
-/// no caller outside this crate needs it yet — Task 3's segment-update
-/// heuristics are the first consumer.
-///
-/// `#[allow(dead_code)]` (not `#[expect]`): this crate's own unit tests
-/// already call this function under `#[cfg(test)]`, so `dead_code`'s
-/// fulfillment differs by build — dead in a plain `cargo build`, live
-/// under `cargo test` — which would make `#[expect(dead_code)]` flag an
-/// "unfulfilled expectation" in the latter. Remove this attribute once
-/// Task 3 adds a non-test caller.
-#[allow(dead_code)]
+/// no caller outside this crate needs it yet — [`update_segments_with_word_timings`]
+/// is the first non-test consumer.
 pub(crate) fn rounded_to_places(value: f32, decimal_places: i32) -> f32 {
   let divisor = 10f32.powi(decimal_places);
   (value * divisor).round() / divisor
