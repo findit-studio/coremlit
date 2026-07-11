@@ -149,3 +149,65 @@ fn normalized_deletes_apostrophes_and_curly_quotes() {
     "quoted text"
   );
 }
+
+// ---------------------------------------------------------------------
+// find_longest_common_prefix / find_longest_different_suffix
+// ---------------------------------------------------------------------
+
+use crate::result::WordTiming;
+
+fn word(text: &str, start: f32, end: f32) -> WordTiming {
+  // NOTE (source-corrected per this task's own mandate): the brief's
+  // literal snippet called `.into()` on `text` here. Against
+  // `WordTiming::new`'s generic `impl Into<String>` parameter that is
+  // ambiguous (E0283 — `&str` implements `Into<T>` for several `T`, e.g.
+  // `String`/`Box<str>`/`Cow<str>`, and nothing pins which one an `impl
+  // Into<String>`-bounded type parameter should be). `&str` already
+  // satisfies `impl Into<String>` directly, so passing `text` itself
+  // (already `&str`-typed) needs no `.into()` call at all.
+  WordTiming::new(text, vec![1], start, end, 0.9)
+}
+
+#[test]
+fn common_prefix_compares_normalized_and_returns_current_elements() {
+  // TranscriptionUtilities.swift:34-37 — comparison is over String.normalized
+  // (case/punctuation-insensitive) and the RESULT elements come from the
+  // second (newer) array.
+  let previous = [
+    word(" Hey", 0.0, 0.2),
+    word(" you", 0.2, 0.4),
+    word(" there", 0.4, 0.6),
+  ];
+  let current = [
+    word(" hey,", 0.1, 0.3),
+    word(" You", 0.3, 0.5),
+    word(" friend", 0.5, 0.7),
+  ];
+  let prefix = find_longest_common_prefix(&previous, &current);
+  assert_eq!(prefix.len(), 2);
+  assert_eq!(prefix[0].word(), " hey,");
+  assert!((prefix[0].start() - 0.1).abs() < 1e-6, "newer timings kept");
+  // Length-asymmetric inputs stop at the shorter zip.
+  assert_eq!(
+    find_longest_common_prefix(&previous[..1], &current).len(),
+    1
+  );
+  assert!(find_longest_common_prefix(&[], &current).is_empty());
+}
+
+#[test]
+fn different_suffix_is_current_past_the_common_prefix() {
+  // TranscriptionUtilities.swift:44-48
+  let previous = [word(" Hey", 0.0, 0.2), word(" you", 0.2, 0.4)];
+  let current = [
+    word(" hey", 0.0, 0.2),
+    word(" you", 0.2, 0.4),
+    word(" friend", 0.4, 0.7),
+  ];
+  let suffix = find_longest_different_suffix(&previous, &current);
+  assert_eq!(suffix.len(), 1);
+  assert_eq!(suffix[0].word(), " friend");
+  // No agreement at all -> the whole current array is the suffix.
+  let disjoint = [word(" But", 0.0, 0.2)];
+  assert_eq!(find_longest_different_suffix(&disjoint, &current).len(), 3);
+}

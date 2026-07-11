@@ -1327,6 +1327,24 @@ impl TranscriptionResult {
     self.seek_time = None;
     self
   }
+
+  // -- all_words ----------------------------------------------------------
+  /// Every word timing across every segment, flattened in segment order —
+  /// ports the `TranscriptionResult.allWords` extension (`Models.swift:
+  /// 566-570`, `segments.compactMap { $0.words }.flatMap { $0 }`). This
+  /// port's [`TranscriptionSegment::words_slice`] is never optional
+  /// (empty-means-absent, this module's own doc comment), so a segment
+  /// with no words simply contributes zero elements here — no
+  /// `compactMap`-equivalent filter is needed to reproduce Swift's
+  /// nil-dropping.
+  pub fn all_words(&self) -> Vec<WordTiming> {
+    self
+      .segments
+      .iter()
+      .flat_map(TranscriptionSegment::words_slice)
+      .cloned()
+      .collect()
+  }
 }
 
 // ---------------------------------------------------------------------
@@ -1999,6 +2017,40 @@ pub fn needs_fallback(
 }
 
 // ---------------------------------------------------------------------
+// format_segments
+// ---------------------------------------------------------------------
+
+/// Renders `segments` as display lines, one per segment — ports
+/// `TranscriptionUtilities.formatSegments`
+/// (`Utilities/TranscriptionUtilities.swift:16-27`), timestamp formatting
+/// included (`Logging.formatTimestamp`, `Utilities/Logging.swift:50-52`,
+/// `String(format: "%.2f", _)`, i.e. Rust's `{:.2}`).
+///
+/// When `with_timestamps` is `true`, each line is `"[{start:.2} -->
+/// {end:.2}] {text}"`; when `false`, each line is `text` verbatim. Note
+/// the bracketed timestamp carries its own trailing space (Swift's own
+/// string interpolation builds `"[...] "`), so a segment `text` that
+/// itself starts with a leading space renders with two spaces before the
+/// first word — faithful to Swift, not a bug.
+pub fn format_segments(segments: &[TranscriptionSegment], with_timestamps: bool) -> Vec<String> {
+  segments
+    .iter()
+    .map(|segment| {
+      if with_timestamps {
+        format!(
+          "[{:.2} --> {:.2}] {}",
+          segment.start(),
+          segment.end(),
+          segment.text()
+        )
+      } else {
+        segment.text().to_string()
+      }
+    })
+    .collect()
+}
+
+// ---------------------------------------------------------------------
 // merge_transcription_results
 // ---------------------------------------------------------------------
 
@@ -2222,6 +2274,35 @@ pub fn merge_transcription_results(results: &[TranscriptionResult]) -> Transcrip
     .set_first_token_time(min_timing(results, TranscriptionTimings::first_token_time));
 
   TranscriptionResult::new(text, segments, language, timings)
+}
+
+// ---------------------------------------------------------------------
+// merge_transcription_results_with_words
+// ---------------------------------------------------------------------
+
+/// Merges `results` exactly as [`merge_transcription_results`] does, then
+/// overrides the merged text with `confirmed_words` — ports the
+/// `confirmedWords:` branch of `TranscriptionUtilities.
+/// mergeTranscriptionResults` (`Utilities/TranscriptionUtilities.swift:
+/// 76-82`): `words.map { $0.word }.joined()`, i.e. every confirmed word's
+/// text concatenated with **no** separator (word strings carry their own
+/// leading spaces, e.g. `" And"`). Everything else — segments, language,
+/// every timing field — is byte-identical to
+/// [`merge_transcription_results`]'s own output.
+///
+/// This is a deliberate **delegation**, not a parallel implementation: a
+/// future change to the plain merge's timing/segment rules is picked up
+/// here for free, and if upstream Swift ever grows a real divergence
+/// between the two branches beyond the text override, this call site is
+/// where that would need to change.
+pub fn merge_transcription_results_with_words(
+  results: &[TranscriptionResult],
+  confirmed_words: &[WordTiming],
+) -> TranscriptionResult {
+  let mut merged = merge_transcription_results(results);
+  let text: String = confirmed_words.iter().map(WordTiming::word).collect();
+  merged.set_text(text);
+  merged
 }
 
 #[cfg(test)]
