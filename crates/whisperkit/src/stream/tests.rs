@@ -1,7 +1,11 @@
+use std::sync::Mutex;
+
 use super::*;
 use crate::{
+  backend::{ModelDims, mock::MockBackend},
   options::DecodingOptions,
   result::{TranscriptionProgress, TranscriptionSegment, TranscriptionTimings},
+  tokenizer::{SpecialTokens, WhisperTokenizer},
 };
 
 #[test]
@@ -175,4 +179,109 @@ fn stream_options_partial_config_falls_back_to_defaults() {
   let round: AudioStreamOptions =
     serde_json::from_str(&serde_json::to_string(&AudioStreamOptions::new()).unwrap()).unwrap();
   assert_eq!(round, AudioStreamOptions::new());
+}
+
+// ---------------------------------------------------------------------
+// AudioStreamTranscriber
+// ---------------------------------------------------------------------
+
+fn tiny_tokenizer() -> WhisperTokenizer {
+  let root = std::env::var_os("WHISPERKIT_TEST_MODELS").map_or_else(
+    || {
+      std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("Models")
+    },
+    std::path::PathBuf::from,
+  );
+  WhisperTokenizer::from_folder(root.join("tokenizers/whisper-tiny")).unwrap()
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn short_push_awaits_audio_with_waiting_text() {
+  // AudioStreamTranscriber.swift:131-140.
+  let t = tiny_tokenizer();
+  let mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  let fired = Mutex::new(0usize);
+  let callback: &(dyn Fn(&StreamState, &StreamState) + Sync) = &|_old, _new| {
+    *fired.lock().unwrap() += 1;
+  };
+  let mut streamer =
+    AudioStreamTranscriber::new(&mock, &t, DecodingOptions::new()).with_state_callback(callback);
+  let update = streamer.push_samples(&vec![0.5; 8_000]).unwrap();
+  assert!(update.is_awaiting_audio());
+  assert_eq!(streamer.state().current_text(), "Waiting for speech...");
+  assert!(
+    *fired.lock().unwrap() >= 2,
+    "buffer_energy + waiting-text assignments fired"
+  );
+  assert_eq!(mock.counters().encode_calls(), 0);
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn silent_audio_is_vad_skipped() {
+  // AudioStreamTranscriber.swift:142-157 — 2 s of near-silence: enough new
+  // audio, but relative energies stay ~0 -> no transcription.
+  let t = tiny_tokenizer();
+  let mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  let mut streamer = AudioStreamTranscriber::new(&mock, &t, DecodingOptions::new());
+  let update = streamer.push_samples(&vec![0.001; 32_000]).unwrap();
+  assert!(update.is_awaiting_voice());
+  assert_eq!(
+    streamer.state().last_buffer_size(),
+    0,
+    "skipped runs do not consume the buffer"
+  );
+  assert_eq!(mock.counters().encode_calls(), 0);
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn voice_after_silence_transcribes_and_promotes_segments() {
+  let t = tiny_tokenizer();
+  let s = SpecialTokens::whisper_defaults();
+  let hello = t.encode(" Hello").unwrap()[0];
+  // Per-window script ending in a <|1.00|> pair: each 1 s mock window
+  // yields one 1 s segment (Plan 3 windowing precedent).
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  mock.push_token_steps(&[
+    s.english_token(),
+    s.transcribe_token(),
+    s.time_token_begin(),
+    hello,
+    s.time_token_begin() + 50,
+    s.time_token_begin() + 50,
+    s.end_token(),
+  ]);
+  let mut streamer = AudioStreamTranscriber::new(&mock, &t, DecodingOptions::new());
+
+  // 2 s quiet builds a low-energy reference (VAD-skipped, buffer kept)...
+  assert!(
+    streamer
+      .push_samples(&vec![0.001; 32_000])
+      .unwrap()
+      .is_awaiting_voice()
+  );
+  // ...then 2 s loud: 4 s buffer, seek clips [(0, 64000)] -> windows at
+  // 0/1/2 s -> 3 segments; required=2 -> confirm 1, keep 2 unconfirmed.
+  let update = streamer.push_samples(&vec![0.5; 32_000]).unwrap();
+  assert!(update.is_transcribed());
+  let state = streamer.state();
+  assert_eq!(state.confirmed_segments_slice().len(), 1);
+  assert_eq!(state.unconfirmed_segments_slice().len(), 2);
+  assert!((state.last_confirmed_segment_end_seconds() - 1.0).abs() < 1e-4);
+  assert_eq!(state.current_text(), "", "cleared after the run");
+  assert_eq!(state.last_buffer_size(), 64_000);
+
+  // Second round: push 2 s louder still (adaptive reference now includes
+  // loud frames; 0.9 vs 0.5 stays > 0.3 relative). Clip starts at the
+  // 1.0 s watermark -> 4 windows -> confirm 2 more.
+  let update = streamer.push_samples(&vec![0.9; 32_000]).unwrap();
+  assert!(update.is_transcribed());
+  let state = streamer.state();
+  assert_eq!(state.confirmed_segments_slice().len(), 3);
+  assert!((state.last_confirmed_segment_end_seconds() - 3.0).abs() < 1e-4);
+  assert_eq!(state.unconfirmed_segments_slice().len(), 2);
 }

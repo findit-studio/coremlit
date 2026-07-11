@@ -85,6 +85,7 @@ use crate::{
     TranscriptionTimings, merge_transcription_results, needs_fallback,
   },
   segment,
+  stream::AudioStreamTranscriber,
   tokenizer::WhisperTokenizer,
 };
 
@@ -825,6 +826,25 @@ impl<B> WhisperKit<B> {
   #[inline(always)]
   pub const fn variant(&self) -> Option<ModelVariant> {
     self.variant
+  }
+
+  /// Builds an [`AudioStreamTranscriber`] over this pipeline's own
+  /// backend/tokenizer — the convenience constructor mirroring how Swift
+  /// wires a streamer from the same pipeline components `WhisperKit.init`
+  /// already assembled (`AudioStreamTranscriber.swift:43-74`). Swift's
+  /// constructor takes the encoder/feature-extractor/segment-seeker/
+  /// decoder as separate dependencies and assembles its own internal
+  /// `TranscribeTask` from them (`:57-66`); this port's [`TranscribeTask`]
+  /// is already the assembled unit callers construct directly, so
+  /// [`AudioStreamTranscriber::push_samples`] builds one per run instead
+  /// (see that module's doc) and this constructor needs only
+  /// `backend`/`tokenizer`, exactly like [`TranscribeTask::new`] itself.
+  #[inline(always)]
+  pub fn audio_stream_transcriber(
+    &self,
+    decoding_options: DecodingOptions,
+  ) -> AudioStreamTranscriber<'_, B> {
+    AudioStreamTranscriber::new(self.backend(), self.tokenizer(), decoding_options)
   }
 }
 
