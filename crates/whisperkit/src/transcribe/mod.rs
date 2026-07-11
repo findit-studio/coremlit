@@ -302,16 +302,23 @@ where
         // model hallucinating a large timestamp near a short final window,
         // could otherwise underflow here. Swift's signed `Int` subtraction
         // has no such trap, but also has no defined behavior on that same
-        // malformed input (the resulting negative-length slice below would
-        // itself crash) — this is a strictly safer, not looser, port.
-        // The `audio[seek..seek + segment_size]` slice below remains a
-        // same-class panic under that malformed-clip input (a decoded
-        // timestamp can push `seek` past `content_frames` while still
-        // under an out-of-bounds `clip_guard`), exactly where Swift
-        // aborts too; well-formed clips cannot reach it.
+        // malformed input.
         let segment_size = window_samples
           .min(content_frames.saturating_sub(seek))
           .min(seek_clip_end.saturating_sub(seek));
+
+        // Nothing left to decode: `seek` reached (or a hallucinated
+        // timestamp pushed it past) the physical audio while an
+        // out-of-range clip end keeps `clip_guard` unsatisfied. Swift has
+        // no such guard — a `without_timestamps` window then advances by
+        // this zero and re-decodes padded silence forever, and a
+        // past-the-end `seek` crashes its slice — but a non-terminating
+        // or aborting publicly reachable configuration is not benign
+        // parity (documented deviation): move to the next clip instead.
+
+        if segment_size == 0 {
+          break;
+        }
 
         // :125-133 — no `windowPreprocess` hook (see module docs).
         let audio_processing_start = Instant::now();

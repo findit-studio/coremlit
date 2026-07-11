@@ -331,3 +331,39 @@ fn zero_max_window_seek_terminates() {
     "uncapped-in-practice advance"
   );
 }
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn out_of_range_clip_end_terminates_at_physical_audio() {
+  // Regression (phase-gate round 4, High): a clip end beyond the audio
+  // keeps `clip_guard` unsatisfied after `seek` reaches the physical
+  // end; `segment_size` hits zero and — `without_timestamps`, where the
+  // seek advance IS `segment_size` — the loop re-decoded padded silence
+  // forever. The zero-size guard now breaks to the next clip.
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  let hello = t.encode(" Hello").unwrap()[0];
+  let s = special();
+  // without_timestamps prompt: [sot, en, transcribe, no_ts]; forced
+  // predictions consume script[0..2], then sampled hello + EOT.
+  mock.push_token_steps(&[
+    s.english_token(),
+    s.transcribe_token(),
+    s.no_timestamps_token(),
+    hello,
+    s.end_token(),
+  ]);
+  let task = TranscribeTask::new(&mock, &t);
+  let options = DecodingOptions::new()
+    .with_without_timestamps()
+    .with_clip_timestamps(vec![0.0, 4.0]); // 64_000 samples of clip over 32_000 of audio
+  let result = task.run(&vec![0.1; 32_000], &options).unwrap();
+  // Two real 1-second windows fit the physical audio; the third
+  // iteration's zero segment breaks instead of decoding padding forever.
+  assert_eq!(result.segments_slice().len(), 2);
+  assert_eq!(
+    mock.counters().encode_calls(),
+    2,
+    "no empty-window inference"
+  );
+}
