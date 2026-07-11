@@ -148,18 +148,34 @@ impl ModelManager {
   /// [`ModelState::Unloaded`] on failure (`ModelManager.swift:142-152`'s
   /// same failure-recovery shape).
   ///
-  /// Unlike [`Self::ensure_loaded`], this is not idempotent: every call
-  /// re-resolves `folder` and re-runs all three prewarms, matching
-  /// `WhisperKit.swift`'s own `loadModels(prewarmMode:)`, which has no
-  /// already-prewarmed short-circuit of its own (unlike the generic
-  /// `ModelManager.prewarmModels()`, which does — that extra state-gated
-  /// skip belongs to an abstraction this port does not carry over, since
-  /// nothing here calls `prewarm()` more than once per real use).
+  /// State-gated like the generic `ModelManager.prewarmModels()`
+  /// (`ModelManager.swift:131-139`): already [`ModelState::Prewarmed`] is
+  /// a silent skip, and any resident-model state is rejected — Swift only
+  /// prewarns from `.downloaded`, whose local-folder equivalent here is
+  /// [`ModelState::Unloaded`] (there is no download layer; a folder on
+  /// disk is definitionally "downloaded"). Rejecting
+  /// [`ModelState::Loaded`] keeps the resident triple and the lifecycle
+  /// state consistent: prewarm-over-loaded would otherwise relabel
+  /// resident models `Prewarmed`, double-load on the next
+  /// [`Self::ensure_loaded`], and on failure strand them behind
+  /// [`Self::unload`]'s state guard.
   ///
   /// # Errors
-  /// Whatever [`LocalModelLoader::resolve`] or `coremlit::Model::prewarm`
-  /// returns.
+  /// [`ModelError::InvalidState`] when called while models are resident
+  /// ([`ModelState::Loaded`]); whatever [`LocalModelLoader::resolve`] or
+  /// `coremlit::Model::prewarm` returns otherwise.
   pub fn prewarm(&mut self) -> Result<(), ModelError> {
+    match self.state {
+      // ModelManager.swift:132-134 — already prewarmed: skip silently.
+      ModelState::Prewarmed => return Ok(()),
+      ModelState::Loaded => {
+        return Err(ModelError::InvalidState {
+          expected: "unloaded (local models prewarm before loading)",
+          actual: self.state.as_str(),
+        });
+      }
+      _ => {}
+    }
     self.transition(ModelState::Prewarming);
     match self.resolve_and_prewarm() {
       Ok(()) => {

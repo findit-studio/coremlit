@@ -240,3 +240,36 @@ fn detect_language_on_jfk_is_english() {
   let detection = kit.detect_language(&audio).unwrap();
   assert_eq!(detection.language(), "en");
 }
+
+#[test]
+#[ignore = "requires local tiny model (WHISPERKIT_TEST_MODELS)"]
+fn prewarm_over_loaded_models_is_rejected() {
+  // Regression (phase-gate round 3, ModelManager.swift:131-139): prewarm
+  // over a resident triple would relabel it Prewarmed, double-load on the
+  // next ensure_loaded, and on failure strand the models behind unload's
+  // state guard. It must reject instead, leaving state and models intact;
+  // an already-Prewarmed manager skips silently.
+  use whisperkit::{
+    error::ModelError,
+    model::{ModelState, manager::ModelManager},
+    options::ComputeOptions,
+  };
+  let mut manager = ModelManager::new(common::tiny_dir(), ComputeOptions::new());
+  manager.ensure_loaded().unwrap();
+  assert_eq!(manager.state(), ModelState::Loaded);
+  let err = manager.prewarm().unwrap_err();
+  assert!(matches!(err, ModelError::InvalidState { .. }));
+  assert_eq!(manager.state(), ModelState::Loaded, "state untouched");
+  manager.unload();
+  assert_eq!(
+    manager.state(),
+    ModelState::Unloaded,
+    "models still unloadable"
+  );
+
+  let mut manager = ModelManager::new(common::tiny_dir(), ComputeOptions::new());
+  manager.prewarm().unwrap();
+  assert_eq!(manager.state(), ModelState::Prewarmed);
+  manager.prewarm().unwrap(); // silent skip, no re-prewarm transitions
+  assert_eq!(manager.state(), ModelState::Prewarmed);
+}
