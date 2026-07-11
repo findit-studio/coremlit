@@ -708,6 +708,13 @@ impl DecodingOptions {
 
   // -- word_timestamps (bool) ----------------------------------------------
   /// Compute word-level timestamps via DTW alignment.
+  ///
+  /// **Not yet wired into the transcription pipeline**: the alignment
+  /// math ([`crate::segment::find_alignment`]) and the backend's
+  /// alignment-weight accumulation are shipped, but the orchestration
+  /// that anchors them onto segments (Swift's `addWordTimestamps`,
+  /// `TranscribeTask.swift:196-233`) lands in the next phase — until
+  /// then segments' `words` stay empty regardless of this flag.
   #[inline(always)]
   pub const fn word_timestamps(&self) -> bool {
     self.word_timestamps
