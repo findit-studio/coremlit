@@ -367,9 +367,13 @@ where
         // Word-timestamp re-adjustment (:196-233) is deferred — see module
         // docs.
 
-        // :236-239.
+        // :236-239 — hardened beyond Swift's bare `previous_seek + max`:
+        // the sum saturates (a huge configured cap must not overflow),
+        // and the cap floors at one sample of forward progress so the
+        // publicly reachable `Some(0)` degrades to a slow-but-finite
+        // loop instead of decoding the same window forever.
         if let Some(max_window_seek) = options.max_window_seek() {
-          seek = seek.min(previous_seek + max_window_seek);
+          seek = seek.min(previous_seek.saturating_add(max_window_seek.max(1)));
         }
 
         // :241-244 — a silent window: skip straight to the next iteration

@@ -797,7 +797,9 @@ impl DecodingOptions {
 
   // -- max_window_seek (Option<usize>) -------------------------------------
   /// Cap the seek position, in samples, for any single window. `None`
-  /// disables the cap.
+  /// disables the cap. The pipeline floors a configured cap at one
+  /// sample of forward progress per window — `Some(0)` would otherwise
+  /// pin the seek loop to the same window forever.
   #[inline(always)]
   pub const fn max_window_seek(&self) -> Option<usize> {
     self.max_window_seek

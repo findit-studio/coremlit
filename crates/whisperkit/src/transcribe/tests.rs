@@ -302,3 +302,32 @@ fn vad_chunked_transcribe_reanchors_and_merges() {
     starts[2]
   );
 }
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn zero_max_window_seek_terminates() {
+  // Regression (phase-gate round 3): `Some(0)` reached the seek clamp as
+  // `min(seek, previous_seek + 0)`, re-decoding the same window forever.
+  // The cap now floors at one sample of progress: audio 3 samples past
+  // the window guard yields exactly 3 one-sample windows, then stops.
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  let hello = t.encode(" Hello").unwrap()[0];
+  script_clean_window(&mut mock, hello);
+  let task = TranscribeTask::new(&mock, &t);
+  let options = DecodingOptions::new().with_max_window_seek(0);
+  let result = task.run(&vec![0.1; 16_003], &options).unwrap();
+  assert_eq!(
+    result.segments_slice().len(),
+    3,
+    "one window per floored sample"
+  );
+  // Saturation half: a cap near usize::MAX must not overflow the sum.
+  let options = DecodingOptions::new().with_max_window_seek(usize::MAX);
+  let result = task.run(&vec![0.1; 32_000], &options).unwrap();
+  assert_eq!(
+    result.segments_slice().len(),
+    1,
+    "uncapped-in-practice advance"
+  );
+}
