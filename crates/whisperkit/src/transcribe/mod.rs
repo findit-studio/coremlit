@@ -343,11 +343,9 @@ where
         timings.set_encoding(timings.encoding() + encoder_start.elapsed().as_secs_f64());
         timings.set_total_encoding_runs(timings.total_encoding_runs() + 1.0);
 
-        // :156-173 — a fresh early-stop flag per window (matching this
-        // port's own decode-loop test convention of a fresh `AtomicBool`
-        // per `decode_text` call); windowId attribution happens inside
-        // `decode_with_fallback`, which already receives `timings`.
-        let early_stop = AtomicBool::new(false);
+        // windowId attribution happens inside `decode_with_fallback`,
+        // which already receives `timings`; the early-stop flag is that
+        // function's own per-attempt concern.
         let decoding_result = self.decode_with_fallback(
           &encoder_output,
           &mut state,
@@ -355,7 +353,6 @@ where
           &mut detected_language,
           options,
           &mut timings,
-          &early_stop,
         )?;
 
         // :178-194.
@@ -478,7 +475,6 @@ where
     detected_language: &mut Option<String>,
     options: &DecodingOptions,
     timings: &mut TranscriptionTimings,
-    early_stop: &AtomicBool,
   ) -> Result<DecodingResult, TranscribeError> {
     let special = *self.tokenizer.special_tokens();
 
@@ -509,6 +505,12 @@ where
       let temperature =
         options.temperature() + attempt as f32 * options.temperature_increment_on_fallback();
       let mut sampler = GreedyTokenSampler::new(temperature, special.end_token(), options);
+      // A FRESH early-stop latch per attempt: Swift initializes a new
+      // early-stop entry for every decodeText invocation
+      // (TextDecoder.swift:570), so a callback-stopped attempt whose
+      // partial result triggers an ordinary fallback must not truncate
+      // the retry (phase-gate round-5 finding).
+      let early_stop = AtomicBool::new(false);
 
       // :340-365 — for a multilingual model with no explicit language and
       // detection requested, probe the language once, patch a per-attempt
@@ -555,7 +557,7 @@ where
         &window_options,
         self.tokenizer,
         timings,
-        early_stop,
+        &early_stop,
         window_callback,
       )?;
 

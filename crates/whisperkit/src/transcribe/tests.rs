@@ -367,3 +367,47 @@ fn out_of_range_clip_end_terminates_at_physical_audio() {
     "no empty-window inference"
   );
 }
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn early_stop_does_not_leak_into_fallback_retries() {
+  // Regression (phase-gate round 5): the early-stop latch was allocated
+  // once per window, so a callback-stopped attempt whose partial result
+  // triggered an ordinary fallback handed the still-true flag to the
+  // retry, truncating it after one step — Swift initializes a fresh
+  // latch per decodeText (TextDecoder.swift:570).
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  let hello = t.encode(" Hello").unwrap()[0];
+  script_clean_window(&mut mock, hello);
+  let calls = std::sync::Mutex::new(0usize);
+  let callback: &(dyn Fn(&crate::result::TranscriptionProgress) -> Option<bool> + Sync) =
+    &|_progress| {
+      let mut seen = calls.lock().unwrap();
+      *seen += 1;
+      // Call 6 = attempt 0's third sampled step (after hello + both
+      // timestamps landed): request the stop. Every other call continues.
+      Some(*seen != 6)
+    };
+  let task = TranscribeTask::new(&mock, &t).with_progress_callback(callback);
+  // At t = 0 the window averages ~-0.19 (hello's one-hot logprob -1.21
+  // diluted by prefill/EOT zeros and the mass-rule-boosted timestamp
+  // logprobs of ~-0.07); at t = 0.2 every draw scores ~0. A -0.1
+  // threshold therefore fails attempt 0's stopped partial and accepts
+  // the full retry. A leaked stale flag instead breaks the retry after
+  // one step. (The first-token threshold stays disabled: it would
+  // complete attempt 0 at its very first iteration, before any callback
+  // can fire.)
+  let options = DecodingOptions::new()
+    .with_temperature_fallback_count(1)
+    .maybe_first_token_logprob_threshold(None)
+    .maybe_logprob_threshold(Some(-0.1));
+  let result = task.run(&vec![0.1; 32_000], &options).unwrap();
+  assert_eq!(result.text(), "Hello", "the retry ran to completion");
+  assert_eq!(
+    mock.counters().decode_steps(),
+    13,
+    "6 stopped steps + 7 full-retry steps"
+  );
+  assert_eq!(result.timings().total_decoding_fallbacks(), 0.0);
+}
