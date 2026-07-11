@@ -590,21 +590,33 @@ fn segment_level_bounds_preferred_when_words_drift_far_from_segment() {
   // last_speech_timestamp = 9.9 keeps the pause (:618-621) small, so the
   // pause-hack itself never fires -- isolating the segment-bounds
   // preference branches below.
+  // median 2.5 (review follow-up): the end clamp's word-anchored term
+  // must WIN its max so a stale pre-clamp `last.start` read becomes
+  // detectable — live 3.0 + 2.5 = 5.5 beats segment.end 5.0, where the
+  // stale 2.0 + 2.5 = 4.5 would collapse back to 5.0.
   let updated =
-    update_segments_with_word_timings(&segments, &alignment, 0, 9.9, 0.6, 1.2, &t).unwrap();
+    update_segments_with_word_timings(&segments, &alignment, 0, 9.9, 2.5, 1.2, &t).unwrap();
   let words = updated[0].words_slice();
   assert_eq!(words.len(), 1);
   // start: segment.start(3.0) < w0.end(10.0) && segment.start-0.5=2.5 >
-  // w0.start(2.0) -> true -> max(0, min(10.0-0.6=9.4, 3.0)) = 3.0.
+  // w0.start(2.0) -> true -> clamped to segment.start = 3.0.
   assert!(
     (words[0].start() - 3.0).abs() < 1e-4,
     "segment start preferred"
   );
-  // end: updatedSegment.end(5.0) > lastWord.start(3.0) && segment.end+0.5
-  // =5.5 < lastWord.end(10.0) -> true -> max(3.0+0.6=3.6, 5.0) = 5.0.
-  assert!((words[0].end() - 5.0).abs() < 1e-4, "segment end preferred");
+  // end: updatedSegment.end(5.0) > lastWord.start(3.0, POST-clamp) &&
+  // segment.end+0.5=5.5 < lastWord.end(10.0) -> true -> max(3.0+2.5,
+  // 5.0) = 5.5 — the word-anchored term, provably reading the mutated
+  // start.
+  assert!(
+    (words[0].end() - 5.5).abs() < 1e-4,
+    "word-anchored clamp term reads the live start"
+  );
   assert!((updated[0].start() - 3.0).abs() < 1e-4);
-  assert!((updated[0].end() - 5.0).abs() < 1e-4);
+  assert!(
+    (updated[0].end() - 5.0).abs() < 1e-4,
+    "IF branch leaves segment.end"
+  );
 }
 
 #[test]
