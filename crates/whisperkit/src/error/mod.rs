@@ -27,6 +27,16 @@ pub enum ModelError {
   /// The CoreML runtime failed to load the compiled model.
   #[error("failed to load model: {0}")]
   Load(#[from] coremlit::LoadError),
+  /// A [`crate::model::ModelInfo`] was constructed with an empty name.
+  #[error("model info name must not be empty")]
+  EmptyName,
+  /// A [`crate::model::SupportConfig`] JSON document was malformed or had
+  /// an unexpected shape. Carries a rendered message rather than the
+  /// originating `serde_json::Error` because that type implements
+  /// neither `Clone` nor `PartialEq`/`Eq`, which this enum otherwise
+  /// derives uniformly across every variant.
+  #[error("invalid support config: {0}")]
+  InvalidSupportConfig(String),
 }
 
 /// Failure loading or using the BPE tokenizer.

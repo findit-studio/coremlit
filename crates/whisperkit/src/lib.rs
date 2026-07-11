@@ -7,9 +7,17 @@
 //! later plans fill the map in task by task.
 //!
 //! macOS only. Swift source of truth: `argmax-oss-swift`.
+//!
+//! Note on scope: [`model`] ships the model-lifecycle *vocabulary*
+//! (`ModelState`, `ModelVariant`, folder/glob detection, `ModelInfo`,
+//! `SupportConfig`) and the `ModelLoader` seam, but not `ModelManager` —
+//! Swift's coalesced load/unload/prewarm orchestrator. That belongs with
+//! the backend that actually loads models (`backend`, Plan 3), so it is
+//! deferred there rather than living here ahead of anything to drive it.
 
 pub mod constants;
 pub mod error;
+pub mod model;
 pub mod options;
 pub mod result;
 pub mod text;
