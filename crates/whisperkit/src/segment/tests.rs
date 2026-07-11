@@ -796,3 +796,20 @@ fn add_word_timestamps_errors_on_empty_segments() {
     SegmentError::InvalidAlignmentShape { rows: 0, .. }
   ));
 }
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn add_word_timestamps_errors_on_zero_columns() {
+  // Regression (task-4 review, High): a zero-column view reached
+  // `chunks_mut(0)`, which panics even over an empty buffer — the
+  // documented InvalidAlignmentShape must surface instead.
+  let t = tiny_tokenizer();
+  let hello = t.encode(" Hello").unwrap()[0];
+  let segments = [plain_segment(vec![hello], 0.0, 1.0)];
+  let view = AlignmentView::new(&[], 5, 0);
+  let err = add_word_timestamps(&segments, &view, &t, "en", 0, "", "", 0.0).unwrap_err();
+  assert!(matches!(
+    err,
+    SegmentError::InvalidAlignmentShape { cols: 0, .. }
+  ));
+}
