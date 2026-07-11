@@ -90,6 +90,13 @@ pub struct MockBackend {
   dims: ModelDims,
   script: Vec<ScriptedStep>,
   counters: Arc<Mutex<MockCounters>>,
+  // 1-based decode_step call ordinals scripted to fail, and the running
+  // attempt count they are checked against. Deliberately reset-IMMUNE
+  // (unlike the script cursor, which reset rewinds): a "transient"
+  // failure on the n-th call stays consumed across window resets, which
+  // is what lets a replayed script fail on one window/attempt only.
+  fail_calls: Vec<usize>,
+  attempted: Arc<Mutex<usize>>,
 }
 
 impl Default for MockBackend {
@@ -106,7 +113,20 @@ impl MockBackend {
       dims: ModelDims::new(),
       script: Vec::new(),
       counters: Arc::new(Mutex::new(MockCounters::default())),
+      fail_calls: Vec::new(),
+      attempted: Arc::new(Mutex::new(0)),
     }
+  }
+
+  /// Scripts the `call`-th (1-based, counted across resets)
+  /// [`InferenceBackend::decode_step`] call to fail with
+  /// [`BackendError::ScriptedFailure`] instead of consuming a script
+  /// step. Because the ordinal survives [`InferenceBackend::reset_decoder_state`]'s
+  /// script rewind, a replayed script can fail on exactly one
+  /// window/attempt — e.g. a transiently failing language probe.
+  pub fn fail_on_call(&mut self, call: usize) -> &mut Self {
+    self.fail_calls.push(call);
+    self
   }
 
   /// Builder form of [`Self::set_dims`].
@@ -250,6 +270,17 @@ impl InferenceBackend for MockBackend {
     state: &mut Self::DecoderState,
     logits: &mut Vec<f32>,
   ) -> Result<(), BackendError> {
+    let call = {
+      let mut attempted = self
+        .attempted
+        .lock()
+        .expect("mock backend attempted-call lock poisoned");
+      *attempted += 1;
+      *attempted
+    };
+    if self.fail_calls.contains(&call) {
+      return Err(BackendError::ScriptedFailure { call });
+    }
     let Some(scripted) = self.script.get(state.step) else {
       return Err(BackendError::ScriptExhausted { step: state.step });
     };

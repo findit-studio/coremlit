@@ -346,6 +346,14 @@ pub enum BackendError {
     /// The step index the script had no entry for.
     step: usize,
   },
+  /// A failure scripted by [`mock::MockBackend::fail_on_call`] — lets
+  /// hermetic tests drive error paths (e.g. a transiently failing
+  /// language probe) that no scripted-logits vocabulary can express.
+  #[error("scripted decode-step failure on call {call}")]
+  ScriptedFailure {
+    /// 1-based ordinal of the failing `decode_step` call.
+    call: usize,
+  },
 }
 
 // ---------------------------------------------------------------------

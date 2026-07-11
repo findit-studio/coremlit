@@ -182,3 +182,57 @@ fn segment_discovery_callback_fires_per_window() {
     .unwrap();
   assert_eq!(discovered.lock().unwrap().as_slice(), &[1]);
 }
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn failed_probe_rederives_language_from_that_attempts_decode() {
+  // Regression (task-11 review, Important): TranscribeTask.swift:351-352
+  // assigns the probe's outcome unconditionally (`try?` yields nil on
+  // failure), so a later attempt's FAILED probe must clear the earlier
+  // value and re-derive from that attempt's own decode result — never
+  // stay sticky at the stale probe language.
+  let t = tiny_tokenizer();
+  let es = t.token_to_id("<|es|>").unwrap();
+  let hello = t.encode(" Hello").unwrap()[0];
+  let s = special();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  // Replayed from position 0 after every reset: serves attempt 0's probe
+  // (one step) AND, after the probe's internal rewind, the decode itself.
+  mock.push_token_steps(&[
+    es,
+    s.transcribe_token(),
+    ts(0),
+    hello,
+    ts(100),
+    ts(100),
+    s.end_token(),
+  ]);
+  // Call ordinals (measured): probe0 = call 1 (succeeds, "es");
+  // attempt-0 decode = call 2 only — decode_text's own first-token early
+  // stop fires (forced "es" logprob ~-1.21 < -0.5 at t = 0) -> fallback;
+  // probe1 = call 3 -> scripted to fail. Attempt 1's decode then rebuilds
+  // the prompt with the default language and early-stops the same way,
+  // so the ladder exhausts with attempt 1's result.
+  mock.fail_on_call(3);
+
+  let options = DecodingOptions::new()
+    .with_detect_language()
+    .with_temperature_fallback_count(1)
+    .maybe_first_token_logprob_threshold(Some(-0.5))
+    .maybe_logprob_threshold(None);
+  let task = TranscribeTask::new(&mock, &t);
+  let result = task.run(&vec![0.1; 32_000], &options).unwrap();
+  assert_eq!(
+    result.language(),
+    "en",
+    "stale probe language must not survive a failed re-probe"
+  );
+  // The only enabled fallback trigger is the first-token comparison; it
+  // fires on attempt 0 (stored counter = that fallback's 0-based attempt
+  // index, TranscribeTask.swift:397) and attempt 1 accepts. The reset
+  // count pins the full structure — probe0 + fallback + probe1 + window
+  // — so a broken first-token comparison (no fallback, no re-probe)
+  // fails here even though 0.0 is also the counter's default.
+  assert_eq!(result.timings().total_decoding_fallbacks(), 0.0);
+  assert_eq!(mock.counters().resets(), 4);
+}

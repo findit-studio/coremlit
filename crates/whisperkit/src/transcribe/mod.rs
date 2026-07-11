@@ -261,6 +261,11 @@ where
         // has no such trap, but also has no defined behavior on that same
         // malformed input (the resulting negative-length slice below would
         // itself crash) — this is a strictly safer, not looser, port.
+        // The `audio[seek..seek + segment_size]` slice below remains a
+        // same-class panic under that malformed-clip input (a decoded
+        // timestamp can push `seek` past `content_frames` while still
+        // under an out-of-bounds `clip_guard`), exactly where Swift
+        // aborts too; well-formed clips cannot reach it.
         let segment_size = window_samples
           .min(content_frames.saturating_sub(seek))
           .min(seek_clip_end.saturating_sub(seek));
@@ -428,6 +433,9 @@ where
     // computes this in `run`, immediately before calling this function; doing
     // it here instead is equivalent, since `timings` hasn't changed for this
     // window yet either way).
+    // The `.max(0.0)` diverges from Swift's plain Int arithmetic, which
+    // can go negative under heavy early-window fallback; `usize` forces
+    // the clamp, and 0 is the sanest floor for progress metadata.
     let window_id = self.window_id_offset
       + (timings.total_decoding_windows() - timings.total_decoding_fallbacks()).max(0.0) as usize;
     let stamped = self.progress_callback.map(|callback| {
@@ -456,11 +464,18 @@ where
         && options.language().is_empty()
         && options.detect_language()
       {
-        if let Ok(probe) =
-          decode::detect_language(self.backend, encoder_output, state, self.tokenizer, timings)
+        // :351-352 — the probe's outcome is assigned UNCONDITIONALLY
+        // (Swift's `try?` yields nil on failure), so a failed probe
+        // clears any earlier window's/attempt's value and the
+        // post-decode re-derivation below fires for THIS attempt —
+        // last-write-wins, never sticky-to-first-success.
+        match decode::detect_language(self.backend, encoder_output, state, self.tokenizer, timings)
         {
-          window_options.set_language(probe.language().to_string());
-          *detected_language = Some(probe.language().to_string());
+          Ok(probe) => {
+            window_options.set_language(probe.language().to_string());
+            *detected_language = Some(probe.language().to_string());
+          }
+          Err(_) => *detected_language = None,
         }
         if options.use_prefill_prompt() {
           *initial_prompt = decode::prefill_tokens(&window_options, self.tokenizer, true);
