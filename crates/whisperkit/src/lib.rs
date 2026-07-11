@@ -43,6 +43,9 @@
 //!   [`TranscriptionSegment`](result::TranscriptionSegment)s and the next
 //!   seek offset
 //!   ([`find_seek_point_and_segments`](segment::find_seek_point_and_segments)).
+//! - [`transcribe`] — [`TranscribeTask`](transcribe::TranscribeTask), the
+//!   seek/window loop and temperature-fallback ladder that drives the decode
+//!   stack over a full audio buffer.
 //! - [`log`] — leveled logging with a replacing callback.
 //!
 //! # Example
@@ -81,3 +84,4 @@ pub mod result;
 pub mod segment;
 pub mod text;
 pub mod tokenizer;
+pub mod transcribe;
