@@ -151,6 +151,8 @@ pub const DEFAULT_LOGPROB_THRESHOLD: f32 = -1.0;
 pub const DEFAULT_FIRST_TOKEN_LOGPROB_THRESHOLD: f32 = -1.5;
 /// Default [`DecodingOptions::no_speech_threshold`].
 pub const DEFAULT_NO_SPEECH_THRESHOLD: f32 = 0.6;
+/// Default [`DecodingOptions::use_prefill_prompt`].
+pub const DEFAULT_USE_PREFILL_PROMPT: bool = true;
 /// Default [`DecodingOptions::concurrent_worker_count`] (Swift's macOS default).
 pub const DEFAULT_CONCURRENT_WORKER_COUNT: NonZeroUsize = NonZeroUsize::new(16).unwrap();
 
@@ -198,7 +200,7 @@ fn default_no_speech_threshold() -> Option<f32> {
 // (Swift `usePrefillPrompt = true`), so it needs a fn-default too.
 #[cfg(feature = "serde")]
 fn default_use_prefill_prompt() -> bool {
-  true
+  DEFAULT_USE_PREFILL_PROMPT
 }
 
 /// Decode-time configuration: the full 27-knob surface Swift exposes as
@@ -369,7 +371,7 @@ impl DecodingOptions {
       temperature_fallback_count: DEFAULT_TEMPERATURE_FALLBACK_COUNT,
       sample_length: DEFAULT_SAMPLE_LENGTH,
       top_k: DEFAULT_TOP_K,
-      use_prefill_prompt: true,
+      use_prefill_prompt: DEFAULT_USE_PREFILL_PROMPT,
       detect_language: false,
       skip_special_tokens: false,
       without_timestamps: false,

@@ -14,6 +14,7 @@ fn decoding_defaults_match_swift() {
   assert_eq!(o.sample_length(), 224);
   assert_eq!(o.top_k(), 5);
   assert!(o.use_prefill_prompt());
+  assert_eq!(o.use_prefill_prompt(), DEFAULT_USE_PREFILL_PROMPT); // pin to const
   assert!(!o.detect_language());
   assert!(!o.skip_special_tokens());
   assert!(!o.without_timestamps());
@@ -249,4 +250,11 @@ fn decoding_options_empty_collections_skip_serializing() {
     serde_json::from_str::<DecodingOptions>(&json).unwrap(),
     DecodingOptions::new()
   );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn compute_units_rejects_unknown_names() {
+  let err = serde_json::from_str::<ComputeOptions>(r#"{"mel":"bogus"}"#).unwrap_err();
+  assert!(err.to_string().contains("unknown compute units name"));
 }
