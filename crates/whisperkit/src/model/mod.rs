@@ -6,15 +6,17 @@
 //! Utilities/ModelUtilities}.swift` (see each item's doc for exact line
 //! citations).
 //!
-//! **`ModelManager` is deferred to Plan 3** (also noted in the crate root
-//! doc). Swift's `ModelManager.swift` coalesces load/unload/prewarm against
-//! a live `coremlit::Model` and drives [`ModelState`] transitions; that
-//! orchestration belongs with the backend that actually loads models
-//! (`whisperkit::backend`, Plan 3), not here. This module ships the
-//! vocabulary and pure logic those future transitions will use: state
-//! names, variant detection, folder/glob utilities, and the support-config
-//! lookup — [`ModelState`] transitions themselves are not enforced by
-//! anything in this module.
+//! [`manager`] hosts [`manager::ModelManager`]: Swift's coalesced
+//! load/unload/prewarm orchestrator (`ArgmaxCore/ModelManager.swift`),
+//! reshaped for synchronous, single-owner use over a live `coremlit::Model`
+//! and driving the [`ModelState`] transitions below (see that module's doc
+//! for the sync reshape). Everything else here ships the model-lifecycle
+//! *vocabulary* [`manager::ModelManager`] and the rest of the pipeline use:
+//! state names, variant detection, folder/glob utilities, the
+//! support-config lookup, and the [`ModelLoader`] seam `ModelManager`
+//! resolves bundle paths through — [`ModelState`] transitions themselves
+//! are enforced only by [`manager::ModelManager`], not by anything else in
+//! this module.
 //!
 //! Two implementation decisions worth recording:
 //!
@@ -1174,6 +1176,12 @@ impl ModelLoader for LocalModelLoader {
     Ok(ResolvedModels::new(mel, encoder, decoder))
   }
 }
+
+// ---------------------------------------------------------------------
+// ModelManager
+// ---------------------------------------------------------------------
+
+pub mod manager;
 
 #[cfg(test)]
 mod tests;

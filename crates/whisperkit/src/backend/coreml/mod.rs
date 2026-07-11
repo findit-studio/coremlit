@@ -27,7 +27,10 @@
 
 use coremlit::{DataType, Model, MultiArray, TensorError, f16};
 
-use crate::backend::{AlignmentView, BackendError, InferenceBackend, ModelDims};
+use crate::{
+  backend::{AlignmentView, BackendError, InferenceBackend, ModelDims},
+  model::manager::LoadedModels,
+};
 
 #[cfg(test)]
 mod tests;
@@ -247,6 +250,17 @@ impl CoreMlBackend {
       dims,
       supports_alignment,
     })
+  }
+
+  /// Builds a backend from an already-loaded [`LoadedModels`] triple — the
+  /// `ModelManager`-driven construction path (`model::manager`) —
+  /// delegating to [`Self::new`] via [`LoadedModels::into_parts`].
+  ///
+  /// # Errors
+  /// As [`Self::new`].
+  pub fn from_loaded(models: LoadedModels) -> Result<Self, BackendError> {
+    let (mel, encoder, decoder) = models.into_parts();
+    Self::new(mel, encoder, decoder)
   }
 
   /// Whether the decoder carries the cross-attention word-timestamp head

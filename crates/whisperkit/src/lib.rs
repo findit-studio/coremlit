@@ -20,7 +20,10 @@
 //!   decision ([`needs_fallback`](result::needs_fallback)).
 //! - [`tokenizer`] — the Whisper tokenizer facade and special tokens.
 //! - [`model`] — model-lifecycle vocabulary (states, variants, folder
-//!   detection, device support).
+//!   detection, device support) and
+//!   [`ModelManager`](model::manager::ModelManager), the coalesced
+//!   load/prewarm/unload orchestrator over
+//!   [`LoadedModels`](model::manager::LoadedModels).
 //! - [`audio`] — sans-I/O DSP over 16 kHz mono PCM: pad/trim, energy,
 //!   VAD, long-form chunking.
 //! - [`backend`] — [`InferenceBackend`](backend::InferenceBackend) trait
@@ -65,13 +68,6 @@
 //!   Some(FallbackReason::CompressionRatioThreshold),
 //! );
 //! ```
-//!
-//! Note on scope: [`model`] ships the model-lifecycle *vocabulary*
-//! (`ModelState`, `ModelVariant`, folder/glob detection, `ModelInfo`,
-//! `SupportConfig`) and the `ModelLoader` seam, but not `ModelManager` —
-//! Swift's coalesced load/unload/prewarm orchestrator. That belongs with
-//! the backend that actually loads models (`backend`, Plan 3), so it is
-//! deferred there rather than living here ahead of anything to drive it.
 
 pub mod audio;
 pub mod backend;

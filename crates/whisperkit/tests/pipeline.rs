@@ -8,7 +8,11 @@
 mod common;
 
 use coremlit::{ComputeUnits, Model};
-use whisperkit::backend::{InferenceBackend, coreml::CoreMlBackend};
+use whisperkit::{
+  backend::{InferenceBackend, coreml::CoreMlBackend},
+  model::{ModelState, manager::ModelManager},
+  options::ComputeOptions,
+};
 
 fn load_backend() -> CoreMlBackend {
   let tiny = common::tiny_dir();
@@ -162,4 +166,41 @@ fn last_kv_slot_decode_step_succeeds() {
     assert_eq!(view.rows(), dims.max_token_context() + 1);
     assert_eq!(view.cols(), dims.n_audio_ctx());
   }
+}
+
+#[test]
+#[ignore = "requires local tiny model (WHISPERKIT_TEST_MODELS)"]
+fn manager_loads_tiny_idempotently_and_backend_builds() {
+  let mut manager = ModelManager::new(
+    common::tiny_dir(),
+    ComputeOptions::new()
+      // CpuOnly across the board in tests (no ANE compilation stalls).
+      .with_mel(ComputeUnits::CpuOnly)
+      .with_encoder(ComputeUnits::CpuOnly)
+      .with_decoder(ComputeUnits::CpuOnly),
+  );
+  manager.ensure_loaded().unwrap();
+  assert_eq!(manager.state(), ModelState::Loaded);
+  manager.ensure_loaded().unwrap(); // idempotent — no reload, still Loaded
+  assert_eq!(manager.state(), ModelState::Loaded);
+  let backend = CoreMlBackend::from_loaded(manager.into_loaded().unwrap()).unwrap();
+  assert_eq!(backend.dims().vocab(), 51865);
+}
+
+#[test]
+#[ignore = "requires local tiny model (WHISPERKIT_TEST_MODELS)"]
+fn manager_prewarm_sequences_states() {
+  let mut manager = ModelManager::new(
+    common::tiny_dir(),
+    ComputeOptions::new()
+      .with_mel(ComputeUnits::CpuOnly)
+      .with_encoder(ComputeUnits::CpuOnly)
+      .with_decoder(ComputeUnits::CpuOnly),
+  );
+  manager.prewarm().unwrap();
+  assert_eq!(manager.state(), ModelState::Prewarmed);
+  manager.ensure_loaded().unwrap();
+  assert_eq!(manager.state(), ModelState::Loaded);
+  manager.unload();
+  assert_eq!(manager.state(), ModelState::Unloaded);
 }
