@@ -9,6 +9,22 @@ repository.workspace = true
 
 [dependencies]
 coremlit.workspace = true
+derive_more.workspace = true
+flate2.workspace = true
+half.workspace = true
+thiserror.workspace = true
+tokenizers.workspace = true
+
+humantime-serde = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[features]
+serde = ["dep:serde", "dep:humantime-serde"]
+tracing = ["dep:tracing"]
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true
