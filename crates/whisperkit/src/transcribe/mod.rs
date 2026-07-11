@@ -790,7 +790,9 @@ where
   /// method's own loop, needing only `B: InferenceBackend`. The
   /// observable per-chunk work, error handling, and merge step are
   /// otherwise identical either way; only the parallelism differs, and
-  /// Swift's own concurrency model (actor-isolated `async` tasks) has no
+  /// Swift's own concurrency model (concurrent tasks sharing one plain
+  /// class instance through an `@unchecked Sendable` wrapper —
+  /// `ConcurrencyUtilities.swift:131` — not actor isolation) has no
   /// `Sync`-shaped restriction forcing the same tradeoff there.
   ///
   /// # Errors
@@ -900,7 +902,7 @@ where
   ///
   /// Pads or trims `audio` to one window ([`audio::pad_or_trim`],
   /// :554-558 — Swift's separate `detectLanguage(audioPath:)` overload
-  /// clips to 30 s before this point instead, :522; this port takes
+  /// clips to 30 s before this point instead, :525; this port takes
   /// samples directly, so only the pad/trim step applies here), extracts
   /// mel features, encodes, and runs [`decode::detect_language`] against a
   /// fresh decoder state (:550-563).

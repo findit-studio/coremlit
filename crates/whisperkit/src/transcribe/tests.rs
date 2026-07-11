@@ -1,7 +1,7 @@
 use super::*;
 use crate::{
   backend::{ModelDims, mock::MockBackend},
-  options::DecodingOptions,
+  options::{ChunkingStrategy, DecodingOptions},
   tokenizer::{SpecialTokens, WhisperTokenizer},
 };
 
@@ -255,4 +255,50 @@ fn transcribe_all_preserves_order_across_scoped_threads() {
   for result in results {
     assert_eq!(result.unwrap().text(), "Hello");
   }
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn vad_chunked_transcribe_reanchors_and_merges() {
+  // Regression (task-12 review, Important): the VAD branch itself —
+  // chunk_all splitting, per-chunk clip clearing, apply_seek_offsets
+  // re-anchoring, and merge_transcription_results — had no direct test.
+  // Silence frames at 32_000..35_200 and 64_000..67_200 make
+  // split_on_middle_of_longest_silence cut at 33_600 and 65_600, giving
+  // three chunks (offsets 0 / 33_600 / 65_600), each decoding one
+  // scripted "Hello" window.
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(48_000));
+  let hello = t.encode(" Hello").unwrap()[0];
+  script_clean_window(&mut mock, hello);
+  let kit = WhisperKit::with_backend(mock, t);
+  let mut audio = vec![0.1f32; 96_000];
+  audio[32_000..35_200].fill(0.0);
+  audio[64_000..67_200].fill(0.0);
+  let options = DecodingOptions::new().with_chunking_strategy(ChunkingStrategy::Vad);
+  let result = kit.transcribe(&audio, &options).unwrap();
+  assert_eq!(result.text(), "Hello Hello Hello", "per-chunk texts joined");
+  let segments = result.segments_slice();
+  assert_eq!(segments.len(), 3);
+  let ids: Vec<usize> = segments.iter().map(|s| s.id()).collect();
+  assert_eq!(
+    ids,
+    vec![0, 1, 2],
+    "merge re-ids result_index + segment_index"
+  );
+  let starts: Vec<f32> = segments.iter().map(|s| s.start()).collect();
+  assert!((starts[0] - 0.0).abs() < 1e-3);
+  // 33_600 / 16_000 = 2.1 s and 65_600 / 16_000 = 4.1 s: the .1 offsets
+  // are the chunk boundaries and CANNOT come from the un-chunked path
+  // (whose window seeks land on whole timestamps, 2.0 / 4.0).
+  assert!(
+    (starts[1] - 2.1).abs() < 1e-3,
+    "chunk 2 re-anchored, got {}",
+    starts[1]
+  );
+  assert!(
+    (starts[2] - 4.1).abs() < 1e-3,
+    "chunk 3 re-anchored, got {}",
+    starts[2]
+  );
 }
