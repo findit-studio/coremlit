@@ -24,6 +24,8 @@
 
 use crate::{constants::DEFAULT_LANGUAGE_CODE, options::DecodingOptions};
 
+pub mod writer;
+
 // ---------------------------------------------------------------------
 // WordTiming
 // ---------------------------------------------------------------------
