@@ -666,3 +666,89 @@ fn fallback_reason_serde_uses_swift_strings() {
     FallbackReason::LogProbThreshold
   );
 }
+
+// ---------------------------------------------------------------------
+// all_words / format_segments / merge_transcription_results_with_words
+// ---------------------------------------------------------------------
+
+fn timed_word(text: &str, start: f32, end: f32) -> WordTiming {
+  // See the analogous NOTE on `word()` in `text/tests.rs`: `.into()` on
+  // `text` is dropped here for the same E0283 ambiguity reason already
+  // documented earlier in this file's own `WordTiming::new` call sites.
+  WordTiming::new(text, vec![1], start, end, 0.9)
+}
+
+fn segment_with_words(
+  start: f32,
+  end: f32,
+  text: &str,
+  words: Vec<WordTiming>,
+) -> TranscriptionSegment {
+  let mut segment = TranscriptionSegment::new();
+  segment
+    .set_start(start)
+    .set_end(end)
+    .set_text(text)
+    .set_words(words);
+  segment
+}
+
+#[test]
+fn all_words_flattens_segments_in_order() {
+  // Models.swift:566-570
+  let mut result = TranscriptionResult::new("", Vec::new(), "", TranscriptionTimings::new());
+  result.set_segments(vec![
+    segment_with_words(0.0, 1.0, " Hi", vec![timed_word(" Hi", 0.0, 0.5)]),
+    segment_with_words(
+      1.0,
+      2.0,
+      " there now",
+      vec![timed_word(" there", 1.0, 1.4), timed_word(" now", 1.4, 1.9)],
+    ),
+  ]);
+  let words = result.all_words();
+  assert_eq!(words.len(), 3);
+  assert_eq!(words[1].word(), " there");
+  // Segments without words contribute nothing (empty-means-absent).
+  let mut bare = TranscriptionResult::new("", Vec::new(), "", TranscriptionTimings::new());
+  bare.set_segments(vec![segment_with_words(0.0, 1.0, " Hi", vec![])]);
+  assert!(bare.all_words().is_empty());
+}
+
+#[test]
+fn format_segments_renders_timestamps_and_raw_text() {
+  // TranscriptionUtilities.swift:16-27 + Logging.formatTimestamp ("%.2f").
+  let segments = [segment_with_words(0.0, 2.5, " Hello", vec![])];
+  assert_eq!(
+    format_segments(&segments, true),
+    vec!["[0.00 --> 2.50]  Hello".to_string()]
+  );
+  assert_eq!(
+    format_segments(&segments, false),
+    vec![" Hello".to_string()]
+  );
+}
+
+#[test]
+fn merge_with_confirmed_words_overrides_text_only() {
+  // TranscriptionUtilities.swift:76-82 — confirmed words joined with NO
+  // separator; segments/language/timings identical to the plain merge.
+  let mut first = TranscriptionResult::new("", Vec::new(), "", TranscriptionTimings::new());
+  first
+    .set_text("hello")
+    .set_language("en")
+    .set_segments(vec![segment_with_words(0.0, 1.0, "hello", vec![])]);
+  let mut second = TranscriptionResult::new("", Vec::new(), "", TranscriptionTimings::new());
+  second
+    .set_text("world")
+    .set_segments(vec![segment_with_words(30.0, 31.0, "world", vec![])]);
+  let results = [first, second];
+  let confirmed = [timed_word(" And", 0.0, 0.4), timed_word(" so", 0.4, 0.7)];
+
+  let with_words = merge_transcription_results_with_words(&results, &confirmed);
+  let plain = merge_transcription_results(&results);
+  assert_eq!(with_words.text(), " And so");
+  assert_eq!(plain.text(), "hello world");
+  assert_eq!(with_words.segments_slice(), plain.segments_slice());
+  assert_eq!(with_words.language(), plain.language());
+}

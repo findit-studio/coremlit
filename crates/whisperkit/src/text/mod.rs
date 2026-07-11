@@ -1,18 +1,23 @@
-//! Text utilities: zlib compression-ratio repetition signal + string
-//! normalization. Ports `Utilities/TextUtilities.swift`
-//! `TextUtilities.compressionRatio(of:)` (both overloads) and
+//! Text utilities: zlib compression-ratio repetition signal, string
+//! normalization, and the streaming word-timing prefix/suffix helpers.
+//! Ports `Utilities/TextUtilities.swift`
+//! `TextUtilities.compressionRatio(of:)` (both overloads),
 //! `Utilities/Extensions+Public.swift` `String.normalized`/
-//! `String.trimmingSpecialTokenCharacters()`.
+//! `String.trimmingSpecialTokenCharacters()`, and two functions from
+//! `Utilities/TranscriptionUtilities.swift`: `findLongestCommonPrefix`/
+//! `findLongestDifferentSuffix`.
 //!
-//! Streaming-decode helpers (longest-common-prefix word-timing merge,
-//! `batched`) are explicitly out of scope here — deferred to Plan 4
-//! (streaming) per this task's brief; Plan 3 uses `slice::chunks` directly
-//! wherever batching is needed instead.
+//! `Array.batched` (`Core/WhisperKit.swift:739`, concurrent-worker audio
+//! batching) is unrelated to the above and stays out of scope: Plan 3 uses
+//! `slice::chunks` directly wherever batching is needed, and this sync,
+//! single-threaded port has no concurrent-worker fan-out to batch for.
 
 use std::io::Write;
 
 use flate2::{Compression, write::ZlibEncoder};
 use unicode_categories::UnicodeCategories;
+
+use crate::result::WordTiming;
 
 /// zlib-compresses `bytes` at [`Compression::default`], returning the
 /// compressed byte length. `Err` only if the in-memory `Vec<u8>` sink's
@@ -134,6 +139,39 @@ pub fn normalized(text: &str) -> String {
 /// the literal two-character substring `"<|"`).
 pub fn trim_special_token_chars(text: &str) -> &str {
   text.trim_matches(['<', '|', '>'])
+}
+
+/// Longest run of word-by-word agreement between two decode passes over
+/// the same audio span, comparing [`normalized`] text — ports
+/// `TranscriptionUtilities.findLongestCommonPrefix`
+/// (`Utilities/TranscriptionUtilities.swift:34-37`): `zip(words1,
+/// words2).prefix(while: { $0.word.normalized == $1.word.normalized })`,
+/// mapped to `$0.1`, i.e. the **returned elements come from `current`**,
+/// the newer pass, not `previous`. A borrowed prefix of `current` replaces
+/// Swift's array copy — identical contents, zero allocation. Stops at the
+/// shorter of the two inputs, exactly like `zip`.
+pub fn find_longest_common_prefix<'a>(
+  previous: &[WordTiming],
+  current: &'a [WordTiming],
+) -> &'a [WordTiming] {
+  let agreed = previous
+    .iter()
+    .zip(current)
+    .take_while(|(a, b)| normalized(a.word()) == normalized(b.word()))
+    .count();
+  &current[..agreed]
+}
+
+/// `current` past its agreement with `previous` — ports
+/// `TranscriptionUtilities.findLongestDifferentSuffix`
+/// (`Utilities/TranscriptionUtilities.swift:44-48`): `words2[commonPrefix.
+/// count...]`. When `previous` and `current` share no common prefix at
+/// all, the whole of `current` is returned.
+pub fn find_longest_different_suffix<'a>(
+  previous: &[WordTiming],
+  current: &'a [WordTiming],
+) -> &'a [WordTiming] {
+  &current[find_longest_common_prefix(previous, current).len()..]
 }
 
 #[cfg(test)]
