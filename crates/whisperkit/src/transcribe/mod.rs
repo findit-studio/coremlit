@@ -1,19 +1,12 @@
 //! The transcription window loop: turns the decode stack into full-audio
 //! transcription. Ports `TranscribeTask` (`TranscribeTask.swift:57-411`) —
-//! [`TranscribeTask::run`] is the seek/window loop (:57-296) and its
-//! private `decode_with_fallback` is the temperature-fallback ladder
-//! (:316-411).
-//!
-//! **Deferred to Plan 4:** word-timestamp integration
-//! (`options.word_timestamps()`, `TranscribeTask.swift:196-233`). The
-//! alignment data already flows through
-//! [`crate::backend::InferenceBackend::alignment_weights`] (Task 9) and the
-//! pure math it needs ships in [`crate::segment`] (`find_alignment`,
-//! `dynamic_time_warping`, `merge_punctuations`, Task 10), but
-//! `addWordTimestamps`'s orchestration — re-anchoring word times against a
-//! window's seek offset, clamping against `lastSpeechTimestamp`, writing the
-//! results back onto segments, and the seek re-adjustment that follows
-//! (:196-224) — is not called from this loop yet.
+//! [`TranscribeTask::run`] is the seek/window loop (:57-296), including the
+//! optional word-timestamp re-anchoring step
+//! (`options.word_timestamps()`, :196-233) that runs
+//! [`crate::segment::add_word_timestamps`] against the accepted attempt's
+//! alignment snapshot; its private `decode_with_fallback` is the
+//! temperature-fallback ladder (:316-411) that produces that snapshot
+//! (:198).
 //!
 //! **Documented deviation — parameterless reset:** Swift's
 //! `decoderInputs.reset(maxTokenContext:)` (:271-273) takes the window's
@@ -81,8 +74,8 @@ use unicode_categories::UnicodeCategories;
 
 use crate::{
   audio::{self, chunker},
-  backend::{InferenceBackend, coreml::CoreMlBackend},
-  constants::{DEFAULT_LANGUAGE_CODE, SAMPLE_RATE},
+  backend::{AlignmentMatrix, InferenceBackend, coreml::CoreMlBackend},
+  constants::{APPEND_PUNCTUATION, DEFAULT_LANGUAGE_CODE, PREPEND_PUNCTUATION, SAMPLE_RATE},
   decode::{self, TranscriptionProgressCallback, sampler::GreedyTokenSampler},
   error::{DecodeError, ModelError, TranscribeError},
   model::{ModelVariant, detect_variant, manager::ModelManager},
@@ -230,8 +223,10 @@ where
   /// [`TranscribeError::Audio`] if `options`' clip timestamps are malformed;
   /// [`TranscribeError::Decode`] if a backend feature-extraction, encode, or
   /// decode step fails; [`TranscribeError::Segment`] if seeking a decoded
-  /// window into segments fails; [`TranscribeError::Tokenizer`] if the final
-  /// transcript decode fails.
+  /// window into segments fails, or — when `options.word_timestamps()` is
+  /// set — if aligning that window's words fails (see the word-timestamp
+  /// block below for when this fires); [`TranscribeError::Tokenizer`] if
+  /// the final transcript decode fails.
   pub fn run(
     &self,
     audio: &[f32],
@@ -345,8 +340,10 @@ where
 
         // windowId attribution happens inside `decode_with_fallback`,
         // which already receives `timings`; the early-stop flag is that
-        // function's own per-attempt concern.
-        let decoding_result = self.decode_with_fallback(
+        // function's own per-attempt concern. `captured_alignment` is the
+        // accepted attempt's alignment-weight snapshot (see that
+        // function's own doc); `None` unless `options.word_timestamps()`.
+        let (decoding_result, captured_alignment) = self.decode_with_fallback(
           &encoder_output,
           &mut state,
           &mut initial_prompt,
@@ -358,7 +355,7 @@ where
         // :178-194.
         let windowing_start = Instant::now();
         let previous_seek = seek;
-        let (new_seek, current_segments) = segment::find_seek_point_and_segments(
+        let (new_seek, mut current_segments) = segment::find_seek_point_and_segments(
           &decoding_result,
           options,
           all_segments.len(),
@@ -368,8 +365,62 @@ where
         )?;
         seek = seek.max(new_seek);
 
-        // Word-timestamp re-adjustment (:196-233) is deferred — see module
-        // docs.
+        // :196-233 — optional word-timestamp re-anchoring, run against the
+        // accepted attempt's alignment snapshot.
+        if options.word_timestamps()
+          && let Some(matrix) = &captured_alignment
+        {
+          let word_timestamps_start = Instant::now();
+          let language = detected_language
+            .as_deref()
+            .unwrap_or(DEFAULT_LANGUAGE_CODE);
+          let with_words = segment::add_word_timestamps(
+            current_segments.as_deref().unwrap_or(&[]), // Swift quirk: nil -> [] (:202)
+            &matrix.view(),
+            self.tokenizer,
+            language,
+            previous_seek,
+            PREPEND_PUNCTUATION,
+            APPEND_PUNCTUATION,
+            previous_seek as f32 / SAMPLE_RATE as f32, // :209
+          )?;
+          timings.set_decoding_word_timestamps(
+            timings.decoding_word_timestamps() + word_timestamps_start.elapsed().as_secs_f64(),
+          );
+          timings
+            .set_total_timestamp_alignment_runs(timings.total_timestamp_alignment_runs() + 1.0);
+          // :217-218 — drop zero-length segments.
+          let filtered: Vec<TranscriptionSegment> = with_words
+            .into_iter()
+            .filter(|segment| segment.end() > segment.start())
+            .collect();
+          // :221-223 — refine seek with the (more accurate) last word end.
+          if let Some(last_end) = filtered.last().map(TranscriptionSegment::end) {
+            seek = seek.max((last_end * SAMPLE_RATE as f32) as usize);
+          }
+          // CORRECTION (this task's brief describes a silence-skipped
+          // window's `None` becoming `Some(vec![])` here, mirroring
+          // Swift's `currentSegments ?? []`): `current_segments` is `None`
+          // only via `find_seek_point_and_segments`'s silence-skip branch,
+          // which makes `segments` above `&[]`; `add_word_timestamps` on
+          // an empty `segments` slice always returns
+          // `SegmentError::InvalidAlignmentShape` (its prefix-take
+          // alignment is sized off `segments`' own token count — zero
+          // here — independent of `matrix`'s real shape; see that
+          // function's `# Errors` doc), which the `?` above propagates out
+          // of `run` as `TranscribeError::Segment` instead of reaching
+          // this assignment. That is the faithful analogue of Swift's own
+          // unconditional crash on the same input
+          // (`SegmentSeeker.swift:208`/`:211`'s unguarded `1...0`
+          // `ClosedRange` traps for a zero-row filtered matrix) — a typed,
+          // recoverable error in place of a hard process abort, never a
+          // silent `Some(vec![])`. This path is dormant today regardless:
+          // `no_speech_prob` is permanently `0.0`
+          // (`crate::decode::decode_text`'s own faithfully-ported upstream
+          // TODO), so no positive `no_speech_threshold` — including the
+          // default — can ever reach it.
+          current_segments = Some(filtered);
+        }
 
         // :236-239 — hardened beyond Swift's bare `previous_seek + max`:
         // the sum saturates (a huge configured cap must not overflow),
@@ -463,6 +514,20 @@ where
   /// only the most recent fallback's attempt index, not a running total
   /// across windows — kept exactly as Swift computes it rather than
   /// "fixed" into an accumulator.
+  ///
+  /// Also returns an owned alignment-weight snapshot alongside the
+  /// [`DecodingResult`], taken immediately after each attempt's
+  /// `decode_text` returns and before that same attempt's own
+  /// fallback-triggered reset, if any (`TranscribeTask.swift:198`'s
+  /// per-attempt `decodingResult.cache?.alignmentWeights` capture). A later
+  /// attempt's snapshot always overwrites an earlier one, so by the time
+  /// this function returns, the snapshot belongs to the accepted (last-run)
+  /// attempt — it cannot instead be taken once, after the loop, because
+  /// [`InferenceBackend::reset_decoder_state`] zeroes the live accumulator
+  /// [`InferenceBackend::alignment_weights`] borrows from in place on every
+  /// fallback and again before the caller's next window (see
+  /// [`AlignmentMatrix`]'s own doc). `None` when `options.word_timestamps()`
+  /// is `false` or the backend has no alignment data for this window.
   #[allow(clippy::too_many_arguments)] // Mirrors Swift's decodeWithFallback argument
   // surface (mirroring decode_text's own precedent for this exact lint, per
   // its doc comment); no natural subset of these forms a cohesive struct
@@ -475,7 +540,7 @@ where
     detected_language: &mut Option<String>,
     options: &DecodingOptions,
     timings: &mut TranscriptionTimings,
-  ) -> Result<DecodingResult, TranscribeError> {
+  ) -> Result<(DecodingResult, Option<AlignmentMatrix>), TranscribeError> {
     let special = *self.tokenizer.special_tokens();
 
     // :156-158 — windowId for progress attribution, computed once before
@@ -500,6 +565,7 @@ where
       .map(|wrapper| wrapper as &(dyn Fn(&TranscriptionProgress) -> Option<bool> + Sync));
 
     let mut decoding = None;
+    let mut captured_alignment: Option<AlignmentMatrix> = None;
     for attempt in 0..=options.temperature_fallback_count() {
       let attempt_start = Instant::now();
       let temperature =
@@ -561,6 +627,18 @@ where
         window_callback,
       )?;
 
+      // TranscribeTask.swift:198 — snapshot THIS attempt's alignment
+      // weights now, before the fallback branch below can reset (and
+      // thereby zero) the live accumulator they borrow from; see this
+      // function's own doc for why the snapshot can't just be read once
+      // after the loop instead.
+      if options.word_timestamps() {
+        captured_alignment = self
+          .backend
+          .alignment_weights(state)
+          .map(|view| view.to_matrix());
+      }
+
       // :375-378 — only used if language detection above never ran/set it.
       if detected_language.is_none() {
         *detected_language = Some(result.language().to_string());
@@ -583,7 +661,10 @@ where
         None => break,
       }
     }
-    Ok(decoding.expect("the loop runs at least once (0..=count always yields >= 1 attempt)"))
+    Ok((
+      decoding.expect("the loop runs at least once (0..=count always yields >= 1 attempt)"),
+      captured_alignment,
+    ))
   }
 }
 

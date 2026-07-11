@@ -273,3 +273,35 @@ fn prewarm_over_loaded_models_is_rejected() {
   manager.prewarm().unwrap(); // silent skip, no re-prewarm transitions
   assert_eq!(manager.state(), ModelState::Prewarmed);
 }
+
+#[test]
+#[ignore = "requires local tiny model (WHISPERKIT_TEST_MODELS)"]
+fn jfk_word_timestamps_are_monotonic_and_cover_the_transcript() {
+  let kit = WhisperKit::new(&tiny_options()).unwrap();
+  let audio = common::load_wav_mono_f32(&common::fixtures_dir().join("audio/jfk.wav"));
+  let options = DecodingOptions::new().with_word_timestamps();
+  let result = kit.transcribe(&audio, &options).unwrap();
+  let words: Vec<_> = result
+    .segments_slice()
+    .iter()
+    .flat_map(|s| s.words_slice().iter().cloned())
+    .collect();
+  assert!(words.len() >= 10, "jfk has ~22 words; got {}", words.len());
+  for pair in words.windows(2) {
+    assert!(
+      pair[0].start() <= pair[1].start() + 1e-3,
+      "monotonic word starts"
+    );
+  }
+  for word in &words {
+    assert!(word.end() >= word.start());
+    assert!((0.0..=1.0).contains(&word.probability()));
+    assert!(word.end() <= 11.5, "inside the 11 s clip");
+  }
+  let joined: String = words.iter().map(|w| w.word()).collect();
+  let normalized = whisperkit::text::normalized(&joined);
+  assert!(
+    normalized.contains("ask not what your country"),
+    "got: {normalized}"
+  );
+}

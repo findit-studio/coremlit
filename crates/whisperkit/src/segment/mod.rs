@@ -26,10 +26,9 @@
 //! used to filter the raw CoreML alignment-weights array, then threads
 //! that through [`find_alignment`] -> the duration/truncation hack ->
 //! [`merge_punctuations`] -> [`update_segments_with_word_timings`] in
-//! sequence. Wiring `add_word_timestamps` into the decode loop itself
-//! (`TranscribeTask.swift:196-233`) is deferred to a later task; this
-//! module ships the orchestration and every pure-math function it
-//! depends on.
+//! sequence. [`crate::transcribe::TranscribeTask::run`]'s window loop
+//! calls `add_word_timestamps` directly (`TranscribeTask.swift:196-233`)
+//! when `options.word_timestamps()` is set.
 
 use unicode_categories::UnicodeCategories;
 

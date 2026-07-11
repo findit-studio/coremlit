@@ -1,6 +1,7 @@
 use super::*;
 use crate::{
   backend::{ModelDims, mock::MockBackend},
+  error::SegmentError,
   options::{ChunkingStrategy, DecodingOptions},
   tokenizer::{SpecialTokens, WhisperTokenizer},
 };
@@ -410,4 +411,110 @@ fn early_stop_does_not_leak_into_fallback_retries() {
     "6 stopped steps + 7 full-retry steps"
   );
   assert_eq!(result.timings().total_decoding_fallbacks(), 0.0);
+}
+
+fn one_hot(token: u32) -> Vec<f32> {
+  let mut logits = vec![0.0f32; 51865];
+  logits[token as usize] = 10.0;
+  logits
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn window_loop_attaches_word_timings_when_enabled() {
+  let t = tiny_tokenizer();
+  let s = special();
+  let hello = t.encode(" Hello").unwrap()[0];
+  // Mock with alignment rows: dims n_audio_ctx 100 -> 100-col rows; each
+  // step's row peaks 10 frames (0.2 s) later than the last.
+  let mut mock = MockBackend::new().with_dims(
+    ModelDims::new()
+      .with_window_samples(16_000)
+      .with_n_audio_ctx(100),
+  );
+  let script = [
+    s.english_token(),
+    s.transcribe_token(),
+    ts(0),
+    hello,
+    ts(100),
+    ts(100),
+    s.end_token(),
+  ];
+  for (step, token) in script.iter().enumerate() {
+    let mut row = vec![0.0f32; 100];
+    row[(step + 1) * 10] = 1.0;
+    mock.push_step_with_alignment(one_hot(*token), row);
+  }
+  let task = TranscribeTask::new(&mock, &t);
+  let options = DecodingOptions::new().with_word_timestamps();
+  let result = task.run(&vec![0.1; 32_000], &options).unwrap();
+  assert_eq!(result.segments_slice().len(), 1);
+  let words = result.segments_slice()[0].words_slice();
+  assert!(!words.is_empty(), "word timings attached");
+  let joined: String = words.iter().map(|w| w.word()).collect();
+  assert_eq!(crate::text::normalized(&joined), "hello");
+  for word in words {
+    assert!(word.end() >= word.start());
+    assert!(
+      (0.0..=2.5).contains(&word.end()),
+      "timings inside the window"
+    );
+  }
+  // Segment boundary follows the last word (update heuristics ran).
+  assert!((result.segments_slice()[0].end() - words.last().unwrap().end()).abs() < 1e-4);
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn word_timestamps_off_leaves_segments_wordless() {
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  let hello = t.encode(" Hello").unwrap()[0];
+  script_clean_window(&mut mock, hello);
+  let task = TranscribeTask::new(&mock, &t);
+  let result = task
+    .run(&vec![0.1; 32_000], &DecodingOptions::new())
+    .unwrap();
+  assert!(result.segments_slice()[0].words_slice().is_empty());
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn silence_skipped_window_with_word_timestamps_surfaces_a_segment_error() {
+  // Self-review finding (task-5 review): the brief's insert-code comment
+  // describes a silence-skipped window's `None` `current_segments`
+  // becoming `Some(vec![])` under word timestamps, mirroring Swift's
+  // `currentSegments ?? []`. That is not what the already-shipped
+  // `add_word_timestamps` (task 4) does: called with an empty `segments`
+  // slice, its prefix-take alignment always ends up zero rows (sized off
+  // `segments`' own token count, independent of the real alignment
+  // matrix's shape), which `find_alignment`'s DTW guard unconditionally
+  // rejects as `SegmentError::InvalidAlignmentShape`. `run` therefore
+  // surfaces a `TranscribeError::Segment`, not a silent empty segment
+  // list — the faithful analogue of Swift's own unconditional crash on
+  // the same input (`SegmentSeeker.swift:208`/`:211`'s unguarded `1...0`
+  // range) as a typed, recoverable error instead of a hard process abort.
+  //
+  // Reached here via an explicit negative `no_speech_threshold`, since
+  // `no_speech_prob` is permanently `0.0` (`decode/mod.rs`'s own
+  // faithfully-ported upstream TODO) — no positive threshold, including
+  // the default, can trigger the silence skip through a real decode.
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  let hello = t.encode(" Hello").unwrap()[0];
+  script_clean_window(&mut mock, hello);
+  let task = TranscribeTask::new(&mock, &t);
+  let options = DecodingOptions::new()
+    .with_word_timestamps()
+    .with_no_speech_threshold(-0.1)
+    .maybe_logprob_threshold(None);
+  let err = task.run(&vec![0.1; 32_000], &options).unwrap_err();
+  assert!(
+    matches!(
+      err,
+      TranscribeError::Segment(SegmentError::InvalidAlignmentShape { rows: 0, .. })
+    ),
+    "got: {err:?}"
+  );
 }
