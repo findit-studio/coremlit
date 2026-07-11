@@ -661,3 +661,138 @@ fn empty_segments_returns_empty_without_consuming_alignment() {
   let updated = update_segments_with_word_timings(&[], &alignment, 0, 0.0, 0.6, 1.2, &t).unwrap();
   assert!(updated.is_empty());
 }
+
+// SegmentSeeker.swift:410-496 -- add_word_timestamps: the orchestration
+// wrapper composing gather -> prefix-take/zero-pad -> find_alignment ->
+// duration constraints/truncation -> merge_punctuations -> word-timing
+// re-anchoring.
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn add_word_timestamps_attaches_merged_monotonic_words() {
+  // End-to-end over the pure stack: DTW -> find_alignment -> constraints ->
+  // truncation -> merge_punctuations -> segment updates. Timestamp tokens
+  // ride along exactly as in the real flow (SegmentSeeker.swift:427-442
+  // gathers ALL segment tokens; specials drop inside the word split /
+  // update walk). Verified rather than assumed: these ids resolve in the
+  // tiny tokenizer's real vocabulary, so `split_to_word_tokens` decodes
+  // them without error, and it is `update_segments_with_word_timings`'s
+  // own special-token filter (:551-554) that drops them from the joined
+  // text asserted below -- no correction to Plan 2's split was needed.
+  let t = tiny_tokenizer();
+  let s = SpecialTokens::whisper_defaults();
+  let hello = t.encode(" Hello").unwrap()[0];
+  let world = t.encode(" world").unwrap()[0];
+  let tokens = vec![
+    s.time_token_begin(),
+    hello,
+    world,
+    s.time_token_begin() + 100,
+  ];
+  let log_probs: Vec<(u32, f32)> = tokens.iter().map(|&tok| (tok, -0.2)).collect();
+  let mut segment = TranscriptionSegment::new();
+  segment
+    .set_tokens(tokens)
+    .set_token_log_probs(log_probs)
+    .set_start(0.0)
+    .set_end(2.0);
+
+  // 4 token rows x 150 frames; row i peaks at frame i*25 (0.5 s apart).
+  let cols = 150usize;
+  let mut weights = vec![0.0f32; 4 * cols];
+  for (i, row) in weights.chunks_mut(cols).enumerate() {
+    row[i * 25] = 1.0;
+  }
+  let view = AlignmentView::new(&weights, 4, cols);
+
+  let updated = add_word_timestamps(
+    &[segment],
+    &view,
+    &t,
+    "en",
+    0,
+    crate::constants::PREPEND_PUNCTUATION,
+    crate::constants::APPEND_PUNCTUATION,
+    0.0,
+  )
+  .unwrap();
+  assert_eq!(updated.len(), 1);
+  let words = updated[0].words_slice();
+  assert!(!words.is_empty(), "text tokens produced word timings");
+  let joined: String = words.iter().map(|w| w.word()).collect();
+  assert_eq!(crate::text::normalized(&joined), "hello world");
+  for pair in words.windows(2) {
+    assert!(
+      pair[0].start() <= pair[1].start() + 1e-4,
+      "monotonic starts"
+    );
+  }
+  for word in words {
+    assert!(word.end() >= word.start());
+    assert!((0.0..=1.0).contains(&word.probability()));
+  }
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn add_word_timestamps_zero_pads_missing_rows() {
+  // More gathered tokens than written alignment rows: Swift reads zeros
+  // from its preallocation (:444-461); the port zero-fills and must not
+  // error or panic.
+  let t = tiny_tokenizer();
+  let hello = t.encode(" Hello").unwrap()[0];
+  let world = t.encode(" world").unwrap()[0];
+  let mut segment = TranscriptionSegment::new();
+  segment
+    .set_tokens(vec![hello, world])
+    .set_token_log_probs(vec![(hello, -0.1), (world, -0.1)])
+    .set_start(0.0)
+    .set_end(1.0);
+  let weights = vec![1.0f32; 3]; // only ONE row written
+  let view = AlignmentView::new(&weights, 1, 3);
+  let updated = add_word_timestamps(
+    &[segment],
+    &view,
+    &t,
+    "en",
+    0,
+    crate::constants::PREPEND_PUNCTUATION,
+    crate::constants::APPEND_PUNCTUATION,
+    0.0,
+  )
+  .unwrap();
+  assert_eq!(updated.len(), 1); // structure survives; timings degrade gracefully
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn add_word_timestamps_errors_on_empty_segments() {
+  // Correction to this task's brief: its "Assertion note" claims
+  // `needed == 0` flows through `find_alignment`'s `<= 1 word` early
+  // return into an empty, word-less result, "exactly Swift's degenerate
+  // path." It does not: `find_alignment` calls `dynamic_time_warping`
+  // FIRST and unconditionally (see that function's own doc -- "DTW itself
+  // still runs first regardless ... so a malformed alignment still errors
+  // even on that trivial path"), and `dynamic_time_warping` rejects zero
+  // rows before the word-count check is ever reached. An empty `segments`
+  // input (zero gathered tokens) surfaces `InvalidAlignmentShape` here,
+  // matching Swift's own crash on the equivalent `1...0` `ClosedRange`
+  // (see `dynamic_time_warping`'s doc) rather than a silent empty result.
+  let t = tiny_tokenizer();
+  let view = AlignmentView::new(&[], 0, 3);
+  let err = add_word_timestamps(
+    &[],
+    &view,
+    &t,
+    "en",
+    0,
+    crate::constants::PREPEND_PUNCTUATION,
+    crate::constants::APPEND_PUNCTUATION,
+    0.0,
+  )
+  .unwrap_err();
+  assert!(matches!(
+    err,
+    SegmentError::InvalidAlignmentShape { rows: 0, .. }
+  ));
+}

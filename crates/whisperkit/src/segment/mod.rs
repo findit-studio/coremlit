@@ -16,24 +16,25 @@
 //! tie-breaking in the private `min_cost_and_trace`, `:239-251`),
 //! [`find_alignment`] (`:340-408`), [`merge_punctuations`] (`:280-338`),
 //! [`calculate_word_duration_constraints`] and
-//! [`truncate_long_words_at_sentence_boundaries`] (`:498-526`), and
+//! [`truncate_long_words_at_sentence_boundaries`] (`:498-526`),
 //! [`update_segments_with_word_timings`] (`:528-659`) — the final
 //! re-anchoring step that walks a word-index cursor shared across every
 //! segment, applies the short-word pull-back and pause/boundary
-//! heuristics, and writes the results back onto [`TranscriptionSegment`]s.
-//! `addWordTimestamps` itself (`:410-496`) — the orchestration wrapper
+//! heuristics, and writes the results back onto [`TranscriptionSegment`]s
+//! — and [`add_word_timestamps`] (`:410-496`), the orchestration wrapper
 //! that flattens each segment's tokens/log-probs into the flat index list
 //! used to filter the raw CoreML alignment-weights array, then threads
-//! that through `findAlignment` -> the duration/truncation hack ->
-//! `mergePunctuations` -> [`update_segments_with_word_timings`] in
-//! sequence — is deferred to a later task, along with wiring any of this
-//! module's word-timestamp math into the decode loop; this module ships
-//! only the pure math `addWordTimestamps` depends on.
+//! that through [`find_alignment`] -> the duration/truncation hack ->
+//! [`merge_punctuations`] -> [`update_segments_with_word_timings`] in
+//! sequence. Wiring `add_word_timestamps` into the decode loop itself
+//! (`TranscribeTask.swift:196-233`) is deferred to a later task; this
+//! module ships the orchestration and every pure-math function it
+//! depends on.
 
 use unicode_categories::UnicodeCategories;
 
 use crate::{
-  backend::AlignmentView,
+  backend::{AlignmentMatrix, AlignmentView},
   constants::{SAMPLE_RATE, SECONDS_PER_TIME_TOKEN},
   error::SegmentError,
   options::DecodingOptions,
@@ -926,6 +927,143 @@ pub fn update_segments_with_word_timings(
 pub(crate) fn rounded_to_places(value: f32, decimal_places: i32) -> f32 {
   let divisor = 10f32.powi(decimal_places);
   (value * divisor).round() / divisor
+}
+
+// ---------------------------------------------------------------------
+// add_word_timestamps: the orchestration wrapper
+// ---------------------------------------------------------------------
+
+/// Assembles one window's word-level timestamps end to end. Ports
+/// `SegmentSeeker.addWordTimestamps` (`SegmentSeeker.swift:410-496`):
+/// flattens `segments`' tokens/log-probs into the flat list
+/// [`find_alignment`] needs (`:427-442`), builds a prefix-take,
+/// zero-padded [`AlignmentMatrix`] from `alignment` (`:444-461`), then
+/// threads that through [`find_alignment`] (`:465-472`) -> the
+/// duration-constraint/sentence-boundary truncation hack (`:474-477`) ->
+/// [`merge_punctuations`] when non-empty (`:479-482`) ->
+/// [`update_segments_with_word_timings`] (`:484-493`).
+///
+/// `language_code` is threaded straight into `find_alignment` ->
+/// `split_to_word_tokens`, the same `NLLanguageRecognizer` replacement
+/// documented on [`find_alignment`] and
+/// [`WhisperTokenizer::split_to_word_tokens`] (spec §5.3). Swift's
+/// `segmentSize`, `options`, and `timings` parameters are unused in the
+/// function body (verified against `SegmentSeeker.swift:410-496`) and are
+/// dropped here: `timings`' duration/run-count bookkeeping
+/// (`TranscribeTask.swift:214-215`) is the caller's responsibility, same
+/// as at Swift's own call site.
+///
+/// # Errors
+/// [`SegmentError::InvalidAlignmentShape`] if the prefix-take alignment
+/// ends up with zero rows or columns — notably an empty (or
+/// all-empty-tokens) `segments` input, which Swift's own unguarded
+/// `1...0` range would instead crash on (see [`dynamic_time_warping`]'s
+/// doc); [`SegmentError::Tokenizer`] if `split_to_word_tokens` or a
+/// partial-special retokenize fails.
+#[allow(clippy::too_many_arguments)] // Mirrors Swift's addWordTimestamps argument
+// surface (mirroring decode_text's own precedent for this exact lint, per its
+// doc comment); no natural subset of these forms a cohesive struct without
+// inventing one purely to dodge the lint.
+pub fn add_word_timestamps(
+  segments: &[TranscriptionSegment],
+  alignment: &AlignmentView<'_>,
+  tokenizer: &WhisperTokenizer,
+  language_code: &str,
+  seek: usize,
+  prepended: &str,
+  appended: &str,
+  last_speech_timestamp: f32,
+) -> Result<Vec<TranscriptionSegment>, SegmentError> {
+  // :427-442 -- flatten every segment's tokens, in order; pair each with
+  // its logged log-prob only when Swift's dictionary probe would have
+  // found one (`segment.tokenLogProbs[index][token] != nil`): this
+  // position's logged token id equals the token actually being gathered.
+  // `.get` (rather than a direct index) additionally tolerates a shorter
+  // `token_log_probs_slice` -- every `TranscriptionSegment` this crate
+  // constructs keeps the two parallel, so that is a defensive no-op here,
+  // not an intentional behavior difference from Swift's dictionary array.
+  let mut word_token_ids: Vec<u32> = Vec::new();
+  let mut filtered_log_probs: Vec<f32> = Vec::new();
+  for segment in segments {
+    let log_probs = segment.token_log_probs_slice();
+    for (index, &token) in segment.tokens_slice().iter().enumerate() {
+      word_token_ids.push(token);
+      if let Some(&(logged_token, log_prob)) = log_probs.get(index)
+        && logged_token == token
+      {
+        filtered_log_probs.push(log_prob);
+      }
+    }
+  }
+
+  // :444-461 -- Swift's `filteredIndices` are consecutive `0..N` by
+  // construction (`:432` unconditionally appends `index + indexOffset`,
+  // and `:441` advances `indexOffset` by exactly the previous segment's
+  // token count), so "filtering" the alignment weights collapses to a
+  // prefix take over rows `0..word_token_ids.len()`. Swift's destination
+  // `MLMultiArray` is zero-initialized (`initialValue: FloatType(0)`,
+  // `:450`) and only rows `0..alignmentWeights.rows` are ever memcpy'd in
+  // (`:454-459`), so rows beyond that read back as zero there too -- this
+  // mirrors that exactly, rather than requiring
+  // `word_token_ids.len() <= alignment.rows()`.
+  let needed = word_token_ids.len();
+  let cols = alignment.cols();
+  let mut data = vec![0.0f32; needed * cols];
+  for (row_index, row) in data
+    .chunks_mut(cols)
+    .enumerate()
+    .take(alignment.rows().min(needed))
+  {
+    row.copy_from_slice(alignment.row(row_index));
+  }
+  let filtered = AlignmentMatrix::new(data, needed, cols);
+
+  // :465-472. The construction above guarantees `filtered.rows() ==
+  // word_token_ids.len()` always -- the invariant `find_alignment` needs
+  // to index `start_times`/`end_times`/`token_log_probs` in lockstep with
+  // `word_token_ids` -- regardless of how `alignment.rows()` compares to
+  // `word_token_ids.len()`. When `word_token_ids` is empty this makes
+  // `filtered.rows() == 0`; `dynamic_time_warping` checks that
+  // unconditionally, before `find_alignment`'s own `<= 1 word` early
+  // return (see that function's doc), so an empty `segments` input
+  // surfaces `SegmentError::InvalidAlignmentShape` here rather than
+  // degrading to word-less segments.
+  let mut merged = find_alignment(
+    &word_token_ids,
+    &filtered.view(),
+    &filtered_log_probs,
+    tokenizer,
+    language_code,
+  )?;
+
+  // :474-477 -- the upstream "hack" Swift's own comment flags (reference,
+  // Swift's own citation at `:474-475`: openai/whisper
+  // `whisper/timing.py#L305`, commit `ba3f3cd`): constrain the
+  // median/max word duration, then truncate overlong words at sentence
+  // boundaries, before merging punctuation.
+  let word_durations = calculate_word_duration_constraints(&merged);
+  merged = truncate_long_words_at_sentence_boundaries(merged, word_durations.max_duration());
+
+  // :480-482 -- gated on the merged ALIGNMENT being non-empty, not on
+  // `prepended`/`appended` (a correction to this task's brief: Swift's
+  // `if !alignment.isEmpty` reads the alignment array, not the
+  // punctuation-string parameters). `merge_punctuations` is already a
+  // no-op on an empty slice (see its own doc), so this gate changes
+  // nothing observable -- kept only to mirror Swift's exact shape.
+  if !merged.is_empty() {
+    merged = merge_punctuations(&merged, prepended, appended);
+  }
+
+  // :484-493.
+  update_segments_with_word_timings(
+    segments,
+    &merged,
+    seek,
+    last_speech_timestamp,
+    word_durations.median(),
+    word_durations.max_duration(),
+    tokenizer,
+  )
 }
 
 #[cfg(test)]
