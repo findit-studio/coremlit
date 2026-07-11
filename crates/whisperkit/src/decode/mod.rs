@@ -549,6 +549,14 @@ fn finalize_decoding_result(
 /// KV row is dead data — the model ignores cache beyond `cache_length ==
 /// 0`, and the first real decode step overwrites position 0 anyway.
 ///
+/// The probe samples through the caller's `sampler` (Swift passes the
+/// fallback ladder's own attempt sampler, `TranscribeTask.swift:337-343`,
+/// and the probe draws through it, `TextDecoder.swift:500`): at a nonzero
+/// temperature the language choice is a top-k draw, not an argmax, and
+/// the draw advances the same RNG stream the attempt's text tokens then
+/// continue from. One attempt owns one sampler; every sample in the
+/// attempt advances the same stream.
+///
 /// # Errors
 /// [`DecodeError`] if the backend step or a tokenizer decode fails.
 pub fn detect_language<B>(
@@ -556,12 +564,13 @@ pub fn detect_language<B>(
   encoder_output: &B::EncoderOutput,
   state: &mut B::DecoderState,
   tokenizer: &WhisperTokenizer,
+  sampler: &mut GreedyTokenSampler,
   timings: &mut TranscriptionTimings,
 ) -> Result<DecodingResult, DecodeError>
 where
   B: InferenceBackend,
 {
-  let result = detect_language_probe(backend, encoder_output, state, tokenizer, timings);
+  let result = detect_language_probe(backend, encoder_output, state, tokenizer, sampler, timings);
   // Unconditional: the probe may have advanced KV/masks before failing
   // partway (see the deviation note above), so the error paths need the
   // reset as much as the success path does.
@@ -576,6 +585,7 @@ fn detect_language_probe<B>(
   encoder_output: &B::EncoderOutput,
   state: &mut B::DecoderState,
   tokenizer: &WhisperTokenizer,
+  sampler: &mut GreedyTokenSampler,
   timings: &mut TranscriptionTimings,
 ) -> Result<DecodingResult, DecodeError>
 where
@@ -599,7 +609,6 @@ where
   let prompt = [special.start_of_transcript_token()];
   filter.filter(&mut logits, &prompt);
 
-  let mut sampler = GreedyTokenSampler::new(0.0, special.end_token(), &DecodingOptions::new());
   let sample_start = Instant::now();
   let sample = sampler.sample(&logits);
   timings.set_decoding_sampling(timings.decoding_sampling() + sample_start.elapsed().as_secs_f64());

@@ -256,7 +256,13 @@ fn detect_language_single_step_and_resets_state() {
     .unwrap();
   let mut state = mock.new_decoder_state().unwrap();
   let mut timings = TranscriptionTimings::new();
-  let result = detect_language(&mock, &encoded, &mut state, &t, &mut timings).unwrap();
+  let mut sampler = GreedyTokenSampler::new(
+    0.0,
+    SpecialTokens::whisper_defaults().end_token(),
+    &DecodingOptions::new(),
+  );
+  let result =
+    detect_language(&mock, &encoded, &mut state, &t, &mut sampler, &mut timings).unwrap();
   assert_eq!(result.language(), "es");
   assert!(
     result
@@ -281,7 +287,75 @@ fn detect_language_resets_state_even_when_the_step_fails() {
     .unwrap();
   let mut state = mock.new_decoder_state().unwrap();
   let mut timings = TranscriptionTimings::new();
-  let err = detect_language(&mock, &encoded, &mut state, &t, &mut timings).unwrap_err();
+  let s = SpecialTokens::whisper_defaults();
+  let mut sampler = GreedyTokenSampler::new(0.0, s.end_token(), &DecodingOptions::new());
+  let err =
+    detect_language(&mock, &encoded, &mut state, &t, &mut sampler, &mut timings).unwrap_err();
   assert!(matches!(err, DecodeError::Backend(_)));
   assert_eq!(mock.counters().resets(), 1, "state reset despite the error");
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn detect_language_samples_through_the_callers_sampler() {
+  // Regression (phase-gate round 1, High): Swift threads the attempt's
+  // own sampler into the probe (TranscribeTask.swift:337-343) and draws
+  // through it (TextDecoder.swift:500) — at nonzero temperature the
+  // language pick is a top-k draw, and it consumes exactly one draw from
+  // the attempt's RNG stream.
+  let t = tiny_tokenizer();
+  let es = t.token_to_id("<|es|>").unwrap();
+  let de = t.token_to_id("<|de|>").unwrap();
+  let mut mock = MockBackend::new();
+  // Two viable languages: close logits so a t = 0.7 draw genuinely
+  // consults the RNG (argmax would always pick es).
+  let mut logits = vec![0.0f32; crate::backend::ModelDims::new().vocab()];
+  logits[es as usize] = 10.0;
+  logits[de as usize] = 9.5;
+  mock.push_step(logits.clone());
+  let encoded = mock
+    .encode(&mock.extract_features(&[0.0; 4]).unwrap())
+    .unwrap();
+  let mut state = mock.new_decoder_state().unwrap();
+  let mut timings = TranscriptionTimings::new();
+  let s = SpecialTokens::whisper_defaults();
+
+  // Reference stream: an identically seeded sampler draws directly from
+  // the identically filtered buffer.
+  let mut reference =
+    GreedyTokenSampler::new(0.7, s.end_token(), &DecodingOptions::new()).with_seed(7);
+  let filter = crate::decode::filter::LanguageLogitsFilter::new(t.all_language_tokens(), 0);
+  let mut reference_logits = logits;
+  filter.filter(&mut reference_logits, &[s.start_of_transcript_token()]);
+  let expected = reference.sample(&reference_logits);
+  let expected_language = t
+    .language_for_token(expected.token())
+    .expect("draw lands on a language token");
+
+  let mut probe_sampler =
+    GreedyTokenSampler::new(0.7, s.end_token(), &DecodingOptions::new()).with_seed(7);
+  let result = detect_language(
+    &mock,
+    &encoded,
+    &mut state,
+    &t,
+    &mut probe_sampler,
+    &mut timings,
+  )
+  .unwrap();
+  assert_eq!(
+    result.language(),
+    expected_language,
+    "probe = the caller's draw"
+  );
+
+  // Exactly one draw consumed: both streams must continue in lockstep.
+  let plain = [1.0f32, 2.0, 3.0, 2.5];
+  for _ in 0..5 {
+    assert_eq!(
+      probe_sampler.sample(&plain).token(),
+      reference.sample(&plain).token(),
+      "streams diverged: the probe consumed a different number of draws"
+    );
+  }
 }

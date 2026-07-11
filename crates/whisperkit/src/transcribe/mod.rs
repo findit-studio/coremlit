@@ -512,8 +512,18 @@ where
         // clears any earlier window's/attempt's value and the
         // post-decode re-derivation below fires for THIS attempt —
         // last-write-wins, never sticky-to-first-success.
-        match decode::detect_language(self.backend, encoder_output, state, self.tokenizer, timings)
-        {
+        // :337-343 — the probe samples through THIS attempt's sampler:
+        // at nonzero temperature the language pick is a top-k draw, and
+        // the draw advances the same RNG stream the attempt's text
+        // tokens continue from.
+        match decode::detect_language(
+          self.backend,
+          encoder_output,
+          state,
+          self.tokenizer,
+          &mut sampler,
+          timings,
+        ) {
           Ok(probe) => {
             window_options.set_language(probe.language().to_string());
             *detected_language = Some(probe.language().to_string());
@@ -946,11 +956,17 @@ where
       .map_err(DecodeError::from)?;
     let mut timings = TranscriptionTimings::new();
 
+    // WhisperKit.swift:569-575 — the standalone path builds its own
+    // zero-temperature sampler (argmax; never consults the RNG).
+    let special = *self.tokenizer.special_tokens();
+    let mut sampler =
+      decode::sampler::GreedyTokenSampler::new(0.0, special.end_token(), &DecodingOptions::new());
     let probe = decode::detect_language(
       &self.backend,
       &encoder_output,
       &mut state,
       &self.tokenizer,
+      &mut sampler,
       &mut timings,
     )?;
 
