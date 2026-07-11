@@ -81,3 +81,33 @@ pub fn voice_activity_in_chunks(
     })
     .collect()
 }
+
+/// Whether the most recently pushed audio contains voice, per the
+/// streaming [`relative_energy`] history recorded so far.
+///
+/// Ports `AudioProcessor.isVoiceDetected` (`AudioProcessor.swift:636-655`):
+/// `relative_energy` holds one entry per completed 0.1 s frame (oldest
+/// first — `crate::stream`'s `EnergyTracker` is what builds this history
+/// in practice). `next_buffer_seconds` (the duration of audio just pushed)
+/// converts to a count of recent entries to `consider` (`/ 0.1`, one entry
+/// per frame); Swift's `max(0, Int(...))` clamp is redundant once ported —
+/// `as usize` on a negative or NaN float already saturates to `0` — but
+/// the cast alone reproduces it exactly. Within that considered suffix,
+/// only the **oldest** `max(10, considered - 10)` entries are checked
+/// against `silence_threshold`: the newest ~1 s (10 entries) is
+/// deliberately excluded as possible trailing silence that just hasn't
+/// been confirmed as the end of speech yet. A `consider`/suffix shorter
+/// than 10 entries (little history yet) checks everything available,
+/// exactly like Swift's `ArraySlice.prefix(n)` on a shorter slice.
+pub fn is_voice_detected(
+  relative_energy: &[f32],
+  next_buffer_seconds: f32,
+  silence_threshold: f32,
+) -> bool {
+  let consider = (next_buffer_seconds / 0.1) as usize;
+  let suffix = &relative_energy[relative_energy.len().saturating_sub(consider)..];
+  let check_len = suffix.len().saturating_sub(10).max(10).min(suffix.len());
+  suffix[..check_len]
+    .iter()
+    .any(|&energy| energy > silence_threshold)
+}
