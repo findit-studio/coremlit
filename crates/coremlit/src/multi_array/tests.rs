@@ -152,7 +152,7 @@ fn f16_surface_is_f16_and_writable() {
   // logical, shape-derived C-order position and internally re-applies the
   // array's real strides, an independent read path from this crate's own
   // `linear_offset`/`write_element`.
-  let shape = arr.shape();
+  let shape = arr.shape().to_vec();
   for i0 in 0..shape[0] {
     for i1 in 0..shape[1] {
       for i2 in 0..shape[2] {
