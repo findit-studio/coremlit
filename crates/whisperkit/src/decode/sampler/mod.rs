@@ -85,9 +85,12 @@ pub struct GreedyTokenSampler {
   eot_token: u32,
   top_k: NonZeroUsize,
   rng: StdRng,
-  // Reused across `sample` calls at `temperature != 0` to avoid a
-  // per-step allocation; cleared and repopulated at the top of that path.
+  // Reused across `sample` calls at `temperature != 0` to avoid
+  // per-step allocations; cleared and repopulated at the top of that
+  // path. `indices` is the top-k candidate list — full-vocab sized, so
+  // reallocating it every sampled token would churn ~400 KiB/step.
   probs: Vec<f32>,
+  indices: Vec<usize>,
 }
 
 impl GreedyTokenSampler {
@@ -105,6 +108,7 @@ impl GreedyTokenSampler {
       top_k: NonZeroUsize::new(options.top_k()).unwrap_or(NonZeroUsize::MIN),
       rng: StdRng::from_os_rng(),
       probs: Vec::new(),
+      indices: Vec::new(),
     }
   }
 
@@ -199,24 +203,25 @@ impl GreedyTokenSampler {
       // candidate count so a `top_k` misconfigured above `logits.len()`
       // can't panic.
       let k = self.top_k.get().min(self.probs.len());
-      let mut indices: Vec<usize> = (0..self.probs.len()).collect();
-      indices.select_nth_unstable_by(k.saturating_sub(1), |&a, &b| {
-        self.probs[b].total_cmp(&self.probs[a])
-      });
+      let probs = &self.probs;
+      let indices = &mut self.indices;
+      indices.clear();
+      indices.extend(0..probs.len());
+      indices.select_nth_unstable_by(k.saturating_sub(1), |&a, &b| probs[b].total_cmp(&probs[a]));
       indices.truncate(k);
 
-      let top_sum: f32 = indices.iter().map(|&i| self.probs[i]).sum();
+      let top_sum: f32 = indices.iter().map(|&i| probs[i]).sum();
       let rnd = self.rng.random_range(0.0..top_sum);
       let mut accumulator = 0.0f32;
       let mut chosen = indices[0];
-      for &i in &indices {
-        accumulator += self.probs[i];
+      for &i in indices.iter() {
+        accumulator += probs[i];
         if rnd < accumulator {
           chosen = i;
           break;
         }
       }
-      (chosen as u32, (self.probs[chosen] / sum).ln())
+      (chosen as u32, (probs[chosen] / sum).ln())
     };
     SamplingResult {
       token,

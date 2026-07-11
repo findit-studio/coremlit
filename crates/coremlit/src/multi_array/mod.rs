@@ -431,22 +431,22 @@ impl MultiArray {
     let leading_strides = &strides[..rank - 1];
     let num_rows = checked_element_count(leading_dims)?;
 
-    let mut row_indices = vec![0usize; leading_dims.len()];
     for row in 0..num_rows {
       // Unravel `row` into a multi-index over `leading_dims`, row-major
-      // (the last leading dimension varies fastest).
+      // (the last leading dimension varies fastest), folding the
+      // stride-weighted sum in the same pass — no per-call index buffer,
+      // so the decoder's padded-output gathers allocate nothing.
       let mut remainder = row;
-      for i in (0..leading_dims.len()).rev() {
-        row_indices[i] = remainder % leading_dims[i];
-        remainder /= leading_dims[i];
-      }
       let mut row_start = 0usize;
-      for (&index, &stride) in row_indices.iter().zip(leading_strides) {
-        let term = index
-          .checked_mul(stride)
-          .ok_or_else(|| TensorError::ShapeOverflow {
-            shape: shape.to_vec(),
-          })?;
+      for i in (0..leading_dims.len()).rev() {
+        let index = remainder % leading_dims[i];
+        remainder /= leading_dims[i];
+        let term =
+          index
+            .checked_mul(leading_strides[i])
+            .ok_or_else(|| TensorError::ShapeOverflow {
+              shape: shape.to_vec(),
+            })?;
         row_start = row_start
           .checked_add(term)
           .ok_or_else(|| TensorError::ShapeOverflow {
