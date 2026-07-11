@@ -504,3 +504,15 @@ fn local_model_loader_default_matches_new() {
   // `::default()`, so compare the unit value against `new()` directly.
   assert_eq!(LocalModelLoader, LocalModelLoader::new());
 }
+
+#[test]
+fn recursive_detection_survives_symlink_cycles() {
+  let dir = tempfile::tempdir().unwrap();
+  std::os::unix::fs::symlink(dir.path(), dir.path().join("loop")).unwrap();
+  let err = detect_model_url(dir.path(), "Missing", true).unwrap_err();
+  assert!(matches!(err, ModelError::NotFound { .. }));
+  // A genuinely present bundle nested one level down is still found.
+  let nested = dir.path().join("sub/Found.mlmodelc");
+  std::fs::create_dir_all(&nested).unwrap();
+  assert_eq!(detect_model_url(dir.path(), "Found", true).unwrap(), nested);
+}

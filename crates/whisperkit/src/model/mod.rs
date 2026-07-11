@@ -329,16 +329,25 @@ pub fn detect_model_url(folder: &Path, name: &str, recursive: bool) -> Result<Pa
 /// search (matches the enumerator's own default error-handling, which
 /// simply omits entries it cannot read).
 fn find_named_recursive(folder: &Path, target_name: &str) -> Option<PathBuf> {
-  let entries = std::fs::read_dir(folder).ok()?;
-  for entry in entries.flatten() {
-    let path = entry.path();
-    if path.file_name().and_then(|n| n.to_str()) == Some(target_name) {
-      return Some(path);
-    }
-    if path.is_dir()
-      && let Some(found) = find_named_recursive(&path, target_name)
-    {
-      return Some(found);
+  // Iterative worklist, descending only into REAL directories
+  // (`DirEntry::file_type` does not follow symlinks): a self-referential
+  // directory symlink (`loop -> .`) must terminate the search, not
+  // overflow the stack recursing through itself. `.mlmodelc` bundle roots
+  // reached via a symlinked PATH still match by name before the descent
+  // decision, so plain model-folder symlinks keep working.
+  let mut worklist = vec![folder.to_path_buf()];
+  while let Some(dir) = worklist.pop() {
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+      continue;
+    };
+    for entry in entries.flatten() {
+      let path = entry.path();
+      if path.file_name().and_then(|n| n.to_str()) == Some(target_name) {
+        return Some(path);
+      }
+      if entry.file_type().is_ok_and(|t| t.is_dir()) {
+        worklist.push(path);
+      }
     }
   }
   None
