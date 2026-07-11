@@ -36,6 +36,10 @@
 //!   against each step's raw logits, and the
 //!   [`GreedyTokenSampler`](decode::sampler::GreedyTokenSampler) that
 //!   picks the next token from what the chain leaves unmasked.
+//! - [`segment`] — how a decoded window becomes
+//!   [`TranscriptionSegment`](result::TranscriptionSegment)s and the next
+//!   seek offset
+//!   ([`find_seek_point_and_segments`](segment::find_seek_point_and_segments)).
 //! - [`log`] — leveled logging with a replacing callback.
 //!
 //! # Example
