@@ -373,3 +373,34 @@ fn f16_surface_rejects_zero_dimensions() {
     );
   }
 }
+
+#[test]
+fn byte_range_covers_non_major_strides() {
+  // Strides [1, 100] put the farthest element of a [2, 2] array at linear
+  // offset 101 — a row-major `dim0 * stride0` extent (= 2) would miss it.
+  use objc2::AnyThread;
+  use objc2_core_ml::{MLMultiArray, MLMultiArrayDataType};
+  use objc2_foundation::{NSArray, NSNumber};
+  let dims: Vec<_> = [2usize, 2]
+    .iter()
+    .map(|d| NSNumber::new_usize(*d))
+    .collect();
+  let strides: Vec<_> = [1usize, 100]
+    .iter()
+    .map(|d| NSNumber::new_usize(*d))
+    .collect();
+  // SAFETY: valid shape/stride arrays; the initializer allocates backing
+  // storage sized for the strides it is given.
+  let raw = unsafe {
+    MLMultiArray::initWithShape_dataType_strides(
+      MLMultiArray::alloc(),
+      &NSArray::from_retained_slice(&dims),
+      MLMultiArrayDataType(DataType::F32.to_raw()),
+      &NSArray::from_retained_slice(&strides),
+    )
+  };
+  let arr = MultiArray::from_raw(raw);
+  let (start, end) = arr.byte_range();
+  // 1 + (2-1)*1 + (2-1)*100 = 102 elements minimum.
+  assert!(end - start >= 102 * 4, "extent {} too small", end - start);
+}
