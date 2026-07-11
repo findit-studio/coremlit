@@ -4,6 +4,13 @@
 //! the pinned whisperkit-cli invocation). Contract (spec §2.1): exact token
 //! ids; segment boundaries within epsilon (timestamps are quantized to
 //! 0.02 s tokens, so epsilon 1e-3 catches any real divergence).
+//!
+//! Compute path: the pipeline runs on the DEFAULT compute units (CPU +
+//! Neural Engine, spec Goal 2 — identical to Swift's defaults), matching
+//! how the golden itself was produced by `whisperkit-cli`. If this test
+//! ever fails on a different Apple Silicon generation with a one-token
+//! divergence, suspect ANE numeric drift on a borderline argmax before
+//! assuming a pipeline logic bug.
 
 mod common;
 
@@ -43,6 +50,11 @@ fn jfk_tiny_matches_golden_tokens_and_segments() {
   // `tiny_options`.
   let kit = WhisperKit::new(&Options::new(common::tiny_dir(), common::tokenizer_dir())).unwrap();
   let result = kit.transcribe(&audio, &DecodingOptions::new()).unwrap();
+  // Clean speech at temperature 0 must never enter the fallback ladder —
+  // the ladder's t > 0 attempts draw from an unseeded RNG, so pinning
+  // zero fallbacks turns any future ladder-triggering regression into one
+  // deterministic, attributable failure instead of a flake-flavored one.
+  assert_eq!(result.timings().total_decoding_fallbacks(), 0.0);
 
   if std::env::var_os("UPDATE_GOLDEN").is_some() {
     // Fallback-path writer (plan Task 13 Step 1-FALLBACK): pin the Rust
