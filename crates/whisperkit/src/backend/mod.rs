@@ -58,9 +58,9 @@ pub const DEFAULT_WINDOW_SAMPLES: usize = crate::constants::WINDOW_SAMPLES;
 /// sizing, and multilinguality (spec §5.4: "vocab, n_mels, n_ctx, embed —
 /// drives variant detection").
 ///
-/// [`Self::new`]/[`Default`] return the tiny model's dimensions (Task 1's
-/// live introspection against the real `openai_whisper-tiny` `.mlmodelc`
-/// bundles; see `.superpowers/sdd/task-1-report.md`) — every unit/doc test
+/// [`Self::new`]/[`Default`] return the tiny model's dimensions
+/// (introspected live from the real `openai_whisper-tiny` `.mlmodelc`
+/// bundles and pinned by `tests/model_io.rs`) — every unit/doc test
 /// in this crate implicitly targets that model. A real backend overrides
 /// every field from its own model's introspection at load time; these
 /// defaults exist for the tiny model and the mock/fallback case only, not
@@ -391,6 +391,13 @@ pub trait InferenceBackend {
   /// One autoregressive step: consume `token` at `position`, write the full
   /// vocab logits (converted to f32 once) into the reused `logits` buffer,
   /// and advance the KV cache/masks/alignment inside `state`.
+  ///
+  /// `position` is 0-based and must be in `0..dims().max_token_context()`:
+  /// it is the KV-cache slot this step fills (the caches are
+  /// `[1, kv, 1, max_token_context]`, per the introspected tiny model).
+  /// On success the backend leaves `logits` exactly `dims().vocab()` long,
+  /// holding only this step's values — the buffer is fully overwritten,
+  /// never appended to, so no stale data from prior steps survives.
   ///
   /// # Errors
   /// [`BackendError`] if the step fails.

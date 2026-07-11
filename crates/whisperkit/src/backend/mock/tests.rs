@@ -75,3 +75,36 @@ fn alignment_rows_accumulate_at_position_plus_one() {
   assert_eq!(view.row(1), &[0.5, 0.6, 0.7]);
   assert_eq!(view.row(0), &[0.0, 0.0, 0.0]);
 }
+
+#[test]
+fn full_token_budget_reaches_last_position_without_panicking() {
+  // Regression (task-2 review, Critical): the last legal position is
+  // `max_token_context - 1`, and its alignment row lands at row
+  // `position + 1` — stepping there must neither panic in `decode_step`
+  // nor in `alignment_weights`.
+  let dims = ModelDims::new()
+    .with_vocab(8)
+    .with_max_token_context(4)
+    .with_n_audio_ctx(3);
+  let mut mock = MockBackend::new().with_dims(dims);
+  for _ in 0..dims.max_token_context() - 1 {
+    mock.push_step(vec![0.0; dims.vocab()]);
+  }
+  mock.push_step_with_alignment(vec![0.0; dims.vocab()], vec![0.5; dims.n_audio_ctx()]);
+  let encoded = mock
+    .encode(&mock.extract_features(&[0.0; 16]).unwrap())
+    .unwrap();
+  let mut state = mock.new_decoder_state().unwrap();
+  let mut logits = Vec::new();
+  for position in 0..dims.max_token_context() {
+    mock
+      .decode_step(0, position, &encoded, &mut state, &mut logits)
+      .unwrap();
+    assert_eq!(logits.len(), dims.vocab());
+  }
+  let view = mock
+    .alignment_weights(&state)
+    .expect("mock always has alignment");
+  assert_eq!(view.rows(), dims.max_token_context() + 1);
+  assert_eq!(view.row(dims.max_token_context()), &[0.5, 0.5, 0.5]);
+}

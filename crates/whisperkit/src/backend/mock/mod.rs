@@ -222,7 +222,10 @@ impl InferenceBackend for MockBackend {
     Ok(MockDecoderState {
       step: 0,
       consumed: Vec::new(),
-      alignment: vec![0.0; self.dims.max_token_context() * self.dims.n_audio_ctx()],
+      // One row of headroom: `decode_step` at `position` writes its
+      // alignment row at `position + 1`, so the last legal position
+      // (`max_token_context - 1`) must still have a row to land in.
+      alignment: vec![0.0; (self.dims.max_token_context() + 1) * self.dims.n_audio_ctx()],
       written_rows: 0,
     })
   }
