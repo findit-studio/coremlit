@@ -263,6 +263,23 @@ fn merge_punctuations_prepended() {
 }
 
 #[test]
+fn merge_punctuations_ignores_whitespace_only_words() {
+  // Regression (task-7 review, Important): a word that trims to nothing
+  // (a standalone space BPE token can form one) must match NO punctuation
+  // set — Swift's `String.contains("")` is false. `str::contains("")` is
+  // true, which would glue the space word onto its neighbor as prepend
+  // punctuation.
+  let alignment = [
+    word(" a", 0.0, 0.2),
+    word(" ", 0.2, 0.3),
+    word(" b", 0.3, 0.6),
+  ];
+  let merged = merge_punctuations(&alignment, PREPEND_PUNCTUATION, APPEND_PUNCTUATION);
+  let words: Vec<&str> = merged.iter().map(|w| w.word()).collect();
+  assert_eq!(words, vec![" a", " ", " b"], "no merges, nothing dropped");
+}
+
+#[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn find_alignment_produces_monotonic_word_timings() {
   let t = tiny_tokenizer();

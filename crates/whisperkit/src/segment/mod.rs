@@ -252,10 +252,11 @@ pub fn find_seek_point_and_segments(
 /// One decoded-token/audio-frame alignment path out of
 /// [`dynamic_time_warping`]'s cost-matrix backtrace: parallel
 /// `text_indices`/`time_indices` sequences of equal length, walking from
-/// the matrix's first aligned position to `(rows - 1, cols - 1)`. Entries
-/// can legitimately be `-1` while the backtrace still walks the cost
-/// matrix's top/left border before reaching a real cell
-/// (`SegmentSeeker.swift:260-262`), hence `isize` rather than `usize`.
+/// the matrix's first aligned position to `(rows - 1, cols - 1)`. `isize`
+/// mirrors the `-1` entries Swift's border-walk code shape permits
+/// (`SegmentSeeker.swift:260-262`); in practice both cursors reach `0`
+/// together via the unique `(1, 1) -> (0, 0)` step, so valid inputs never
+/// produce one.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DtwPath {
   text_indices: Vec<isize>,
