@@ -145,10 +145,37 @@ impl GreedyTokenSampler {
   /// `log(softmaxResult[nextToken])`. Either way, `completed` is `token
   /// == eot_token()` (`TokenSampler.swift:233`).
   ///
+  /// A `top_k` configured above `logits.len()` is clamped to it (Swift's
+  /// BNNS path has no defined behavior for that misconfiguration — `try!
+  /// BNNS.applyTopK` with an oversized `k` is crash territory), and a
+  /// `top_k` of `0` was already clamped up to `1` at construction.
+  ///
+  /// When every entry of `logits` is masked (`-inf`) there is no
+  /// distribution to sample; both temperature paths then return the same
+  /// defined degenerate result — the argmax convention's first index with
+  /// `logprob` `-inf` — without consulting the RNG, so the decode loop's
+  /// logprob threshold triggers fallback naturally. (Swift has no defined
+  /// behavior here either: BNNS softmax over all-`-inf` yields NaNs.)
+  ///
   /// # Panics
   ///
   /// Panics if `logits` is empty.
   pub fn sample(&mut self, logits: &[f32]) -> SamplingResult {
+    assert!(!logits.is_empty(), "sample() requires non-empty logits");
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+      // Fully masked buffer (see the doc paragraph above): intercept
+      // before the paths' natural failure modes — `-inf - -inf = NaN`
+      // logprob at `temperature == 0`, and a panic on the empty
+      // `0.0..0.0` multinomial range otherwise. Mirrors the all-masked
+      // guard in `decode::log_sum_exp`.
+      let token = argmax(logits) as u32;
+      return SamplingResult {
+        token,
+        logprob: f32::NEG_INFINITY,
+        completed: token == self.eot_token,
+      };
+    }
     let (token, logprob) = if self.temperature == 0.0 {
       let index = argmax(logits);
       (index as u32, logits[index] - super::log_sum_exp(logits))
@@ -157,7 +184,7 @@ impl GreedyTokenSampler {
       let inv_t = 1.0 / self.temperature;
       // logits scaled by inv_t, max-shifted by the scaled max — avoids a
       // second pass over `logits` to find the max of the scaled values.
-      let scaled_max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max) * inv_t;
+      let scaled_max = max * inv_t;
       let mut sum = 0.0f32;
       self.probs.extend(logits.iter().map(|&v| {
         let e = (v * inv_t - scaled_max).exp();
@@ -214,9 +241,14 @@ impl GreedyTokenSampler {
 }
 
 /// Index of the largest entry in `logits`, comparing with `f32::total_cmp`
-/// and keeping the first index on an exact tie (matching vDSP/numpy
-/// argmax convention). Ports the argmax branch of Swift's
-/// `sampleWithMLTensor`/`sampleWithBNNS` (`TokenSampler.swift:75,182-196`).
+/// and keeping the first index on an exact tie. Ports the argmax branch of
+/// Swift's `sampleWithMLTensor`/`sampleWithBNNS`
+/// (`TokenSampler.swift:75,182-196`) — Swift's actual argmax is
+/// `MLTensor.argmax` or `BNNS.ReductionFunction.argMax` picked by OS
+/// availability, both opaque about tie-breaking, so first-index-wins
+/// (numpy's convention) is this port's pinned choice, not verified Swift
+/// parity; exact ties between distinct vocab entries on real f32 decoder
+/// logits are measure-zero.
 fn argmax(logits: &[f32]) -> usize {
   let mut best = 0;
   for (index, &value) in logits.iter().enumerate().skip(1) {

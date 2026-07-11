@@ -46,6 +46,48 @@ fn nonzero_temperature_is_seed_deterministic_and_top_k_bounded() {
 }
 
 #[test]
+fn fully_masked_logits_degenerate_without_panic_or_nan() {
+  // Regression (task-4 review, Important): every entry masked (-inf)
+  // panicked on the empty multinomial range at t != 0 and produced a NaN
+  // logprob at t == 0. Both paths must return the same defined result.
+  let masked = [f32::NEG_INFINITY; 8];
+  for temperature in [0.0, 0.7] {
+    let result = greedy(temperature).sample(&masked);
+    assert_eq!(result.token(), 0, "t={temperature}");
+    assert_eq!(result.logprob(), f32::NEG_INFINITY, "t={temperature}");
+    assert!(!result.completed(), "t={temperature}");
+  }
+  // eot at the degenerate index still reports completion.
+  let eot_zero = GreedyTokenSampler::new(0.7, 0, &DecodingOptions::new())
+    .with_seed(42)
+    .sample(&masked);
+  assert!(eot_zero.completed());
+}
+
+#[test]
+fn fully_masked_sample_does_not_consume_rng() {
+  // The degenerate path must not consult the RNG: a sampler that first
+  // saw a fully masked buffer draws the same stream afterwards as a
+  // fresh same-seeded sampler.
+  let logits: Vec<f32> = (0..16).map(|i| i as f32 * 0.25).collect();
+  let mut interrupted = greedy(0.7);
+  let mut fresh = greedy(0.7);
+  interrupted.sample(&[f32::NEG_INFINITY; 16]);
+  for _ in 0..10 {
+    assert_eq!(
+      interrupted.sample(&logits).token(),
+      fresh.sample(&logits).token()
+    );
+  }
+}
+
+#[test]
+#[should_panic(expected = "non-empty logits")]
+fn empty_logits_panic() {
+  greedy(0.0).sample(&[]);
+}
+
+#[test]
 fn finalize_appends_eot_once() {
   let sampler = greedy(0.0);
   let (mut tokens, mut logprobs) = (vec![1u32, 2], vec![-0.5f32, -0.25]);
