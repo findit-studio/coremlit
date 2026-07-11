@@ -6,16 +6,15 @@
 //! sizing) and [`AlignmentView`] (the borrowed cross-attention alignment
 //! slice word-timestamp code reads).
 //!
-//! `backend::coreml::CoreMlBackend` — the real implementation owning three
-//! `coremlit::Model`s (spec §5.4) — is deferred to a later task; this one
-//! ships the trait, its supporting vocabulary ([`ModelDims`],
-//! [`AlignmentView`], [`BackendError`]), and [`mock::MockBackend`], the
-//! scripted, hermetic test double every decode-loop/fallback/windowing
-//! test downstream needs before a compiled model exists at all (spec
-//! §9.1).
+//! Two implementations live here: [`coreml::CoreMlBackend`] — the real
+//! one, owning the three `coremlit::Model`s (spec §5.4) — and
+//! [`mock::MockBackend`], the scripted, hermetic test double every
+//! decode-loop/fallback/windowing test downstream needs before a compiled
+//! model exists at all (spec §9.1).
 
 use crate::model::is_model_multilingual;
 
+pub mod coreml;
 pub mod mock;
 
 #[cfg(test)]
