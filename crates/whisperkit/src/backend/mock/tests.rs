@@ -108,3 +108,34 @@ fn full_token_budget_reaches_last_position_without_panicking() {
   assert_eq!(view.rows(), dims.max_token_context() + 1);
   assert_eq!(view.row(dims.max_token_context()), &[0.5, 0.5, 0.5]);
 }
+
+#[test]
+fn steps_without_alignment_rows_do_not_extend_the_view() {
+  // Regression (task-9 review, Important): the bump is gated on the row
+  // being present, matching the real backend and Swift's
+  // `if let ... = cache?.alignmentWeights`.
+  let dims = ModelDims::new().with_vocab(4).with_n_audio_ctx(2);
+  let mut mock = MockBackend::new().with_dims(dims);
+  mock.push_step(vec![0.0; 4]);
+  mock.push_step_with_alignment(vec![0.0; 4], vec![0.7, 0.7]);
+  let encoded = mock
+    .encode(&mock.extract_features(&[0.0; 4]).unwrap())
+    .unwrap();
+  let mut state = mock.new_decoder_state().unwrap();
+  let mut logits = Vec::new();
+  mock
+    .decode_step(0, 0, &encoded, &mut state, &mut logits)
+    .unwrap();
+  let view = mock
+    .alignment_weights(&state)
+    .expect("mock always has alignment");
+  assert_eq!(view.rows(), 0, "plain step must not extend the view");
+  mock
+    .decode_step(0, 1, &encoded, &mut state, &mut logits)
+    .unwrap();
+  let view = mock
+    .alignment_weights(&state)
+    .expect("mock always has alignment");
+  assert_eq!(view.rows(), 3, "alignment step extends to position + 2");
+  assert_eq!(view.row(2), &[0.7, 0.7]);
+}

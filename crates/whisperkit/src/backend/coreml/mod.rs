@@ -116,7 +116,9 @@ fn output_dim(
 ///
 /// The three scratch `Vec<f16>` buffers are sized once at construction so
 /// the per-step output extraction (`copy_into` gathers, see the module
-/// doc) allocates nothing per step (spec §10).
+/// doc) performs no whisperkit-level heap allocation per step (spec
+/// §10); the remaining per-step allocations are small `Vec<usize>`
+/// shape/stride collections inside `coremlit`'s accessors.
 #[derive(Debug)]
 pub struct CoreMlDecoderState {
   /// `[1] i32` — current token (`TextDecoder.swift:137`).
@@ -224,7 +226,10 @@ impl CoreMlBackend {
         });
       }
     };
-    let supports_alignment = decoder.description().output(names::ALIGNMENT).is_some();
+    // Swift's supportsWordTimestamps is getModelOutputDimension(...) !=
+    // nil (TextDecoder.swift:309-311) — the OUTER dim must exist, not just
+    // the output; output_dim is the faithful probe.
+    let supports_alignment = output_dim(&decoder, "decoder", names::ALIGNMENT, 0).is_ok();
 
     let dims = ModelDims::new()
       .with_window_samples(window_samples)
@@ -260,10 +265,12 @@ impl CoreMlBackend {
 /// performs the same updates *inside* [`InferenceBackend::decode_step`],
 /// unconditionally. Equivalent because (i) after the completion break the
 /// loop never issues another step against the same state before a reset,
-/// so the extra advance is never observed by a prediction; (ii) positions
-/// stay `<= max_token_context - 2` (`loop_count <=
-/// MAX_TOKEN_CONTEXT - 1`), so the unconditional `position + 1` writes
-/// stay in bounds exactly where Swift's conditional ones do; and (iii)
+/// so the extra advance is never observed by a prediction; (ii) the
+/// loop keeps positions `<= max_token_context - 2` (`loop_count <=
+/// MAX_TOKEN_CONTEXT - 1`), exactly where Swift's conditional updates
+/// run — and at the trait-legal last slot, which Swift never reaches,
+/// the next-step mask preparation is skipped (nothing to prepare) while
+/// the KV/alignment writes still land in their headroom; and (iii)
 /// [`InferenceBackend::reset_decoder_state`] restores the full mask/
 /// cache-visibility invariant, so the next window starts from the same
 /// state either way.
@@ -358,7 +365,10 @@ impl InferenceBackend for CoreMlBackend {
       value_cache,
       kv_cache_update_mask,
       decoder_key_padding_mask,
-      alignment: vec![0.0; max_ctx * self.dims.n_audio_ctx()],
+      // One row of headroom, exactly like MockBackend: a step at the
+      // trait-legal last position (`max_ctx - 1`) writes alignment row
+      // `position + 1 == max_ctx`, so the buffer holds `max_ctx + 1` rows.
+      alignment: vec![0.0; (max_ctx + 1) * self.dims.n_audio_ctx()],
       alignment_rows: 0,
       // Sized up front so even the first decode step allocates nothing.
       kv_scratch: vec![f16::ZERO; kv_dim],
@@ -482,18 +492,23 @@ impl InferenceBackend for CoreMlBackend {
 
     // Mask flips (TextDecoder.swift:704-707), in the mask's introspected
     // dtype: expose the next slot, and move the update target from this
-    // position to the next. At the last slot (position == max_ctx - 1,
-    // unreachable from the decode loop — see the impl doc) `fill_at`
-    // reports a structured out-of-bounds error rather than wrapping.
-    state
-      .decoder_key_padding_mask
-      .fill_at(&[0, position + 1], f16::ZERO)?;
-    state
-      .kv_cache_update_mask
-      .fill_at(&[0, position], f16::ZERO)?;
-    state
-      .kv_cache_update_mask
-      .fill_at(&[0, position + 1], f16::ONE)?;
+    // position to the next. Their only purpose is preparing the NEXT
+    // step, so at the trait-legal last slot (position == max_ctx - 1,
+    // which Swift's own loop bound never reaches) there is nothing to
+    // prepare and all three writes are skipped as a unit — the state
+    // stays internally consistent and, as always, only a reset makes it
+    // steppable again.
+    if position + 1 < max_ctx {
+      state
+        .decoder_key_padding_mask
+        .fill_at(&[0, position + 1], f16::ZERO)?;
+      state
+        .kv_cache_update_mask
+        .fill_at(&[0, position], f16::ZERO)?;
+      state
+        .kv_cache_update_mask
+        .fill_at(&[0, position + 1], f16::ONE)?;
+    }
 
     // Alignment (updateAlignmentWeights, TextDecoder.swift:272-296 via
     // :709-717): row `position + 1`, converted to the f32 accumulator
@@ -506,8 +521,9 @@ impl InferenceBackend for CoreMlBackend {
       state.align_scratch.resize(cols, f16::ZERO);
       alignment.copy_into::<f16>(&mut state.align_scratch)?;
       let start = (position + 1) * cols;
-      // In bounds: the mask flips above succeeded, so position + 1 <
-      // max_ctx, hence start + cols <= max_ctx * cols == alignment.len().
+      // In bounds: position < max_ctx (checked at entry), so
+      // start + cols == (position + 2) * cols <= (max_ctx + 1) * cols
+      // == alignment.len() (the buffer's one-row headroom).
       for (dst, src) in state.alignment[start..start + cols]
         .iter_mut()
         .zip(&state.align_scratch)

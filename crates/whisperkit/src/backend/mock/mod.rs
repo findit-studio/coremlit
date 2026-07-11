@@ -262,8 +262,11 @@ impl InferenceBackend for MockBackend {
       let cols = self.dims.n_audio_ctx();
       let start = (position + 1) * cols;
       state.alignment[start..start + cols].copy_from_slice(row);
+      // Gated exactly like the real backend (and Swift's
+      // `if let ... = cache?.alignmentWeights`): steps without an
+      // alignment row do not extend the view.
+      state.written_rows = state.written_rows.max(position + 2);
     }
-    state.written_rows = state.written_rows.max(position + 2);
     state.step += 1;
 
     self

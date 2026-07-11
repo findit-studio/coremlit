@@ -135,3 +135,31 @@ fn wrong_audio_length_is_structured_error() {
     }
   ));
 }
+
+#[test]
+#[ignore = "requires local tiny model (WHISPERKIT_TEST_MODELS)"]
+fn last_kv_slot_decode_step_succeeds() {
+  // Regression (task-9 review, Critical): the trait legalizes every
+  // position in 0..max_token_context, but the mask flips prepare
+  // position + 1 — at the last slot there is no next slot to prepare and
+  // the flips must be skipped, while the KV append and the alignment row
+  // (headroom row max_ctx) still land. Pre-fix this returned a structured
+  // IndexOutOfBounds AFTER mutating the KV cache.
+  let backend = load_backend();
+  let dims = backend.dims();
+  let last = dims.max_token_context() - 1;
+  let features = backend
+    .extract_features(&vec![0.0; dims.window_samples()])
+    .unwrap();
+  let encoded = backend.encode(&features).unwrap();
+  let mut state = backend.new_decoder_state().unwrap();
+  let mut logits = Vec::new();
+  backend
+    .decode_step(50258, last, &encoded, &mut state, &mut logits)
+    .expect("the last KV slot is a legal position");
+  assert_eq!(logits.len(), dims.vocab());
+  if let Some(view) = backend.alignment_weights(&state) {
+    assert_eq!(view.rows(), dims.max_token_context() + 1);
+    assert_eq!(view.cols(), dims.n_audio_ctx());
+  }
+}
