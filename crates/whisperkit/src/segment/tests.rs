@@ -419,3 +419,233 @@ fn rounded_to_places_matches_swift_rounding() {
   assert_eq!(rounded_to_places(1.235, 2), 1.24);
   assert_eq!(rounded_to_places(-1.235, 2), -1.24);
 }
+
+// SegmentSeeker.swift:528-659 -- update_segments_with_word_timings: the
+// final word-timing re-anchoring step `addWordTimestamps` runs after
+// `findAlignment` -> duration constraints/truncation -> mergePunctuations.
+
+fn plain_segment(tokens: Vec<u32>, start: f32, end: f32) -> TranscriptionSegment {
+  let mut segment = TranscriptionSegment::new();
+  segment.set_tokens(tokens).set_start(start).set_end(end);
+  segment
+}
+
+fn aligned(text: &str, tokens: Vec<u32>, start: f32, end: f32) -> WordTiming {
+  // Passing `text` bare, not `text.into()`: see the `word` helper above --
+  // the same E0283 trap applies here (`WordTiming::new` takes two
+  // `impl Into<_>` parameters in this one call).
+  WordTiming::new(text, tokens, start, end, 0.9)
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn word_walk_assigns_words_and_pulls_short_words_back() {
+  let t = tiny_tokenizer();
+  let hello = t.encode(" Hello").unwrap()[0];
+  let world = t.encode(" world").unwrap()[0];
+  let segments = [plain_segment(vec![hello, world], 0.0, 2.0)];
+  // Second word is near-zero-length with a 1.4 s gap: start moves back by
+  // min(gap, median/2) = 0.3 (SegmentSeeker.swift:564-583).
+  let alignment = [
+    aligned(" Hello", vec![hello], 0.0, 0.5),
+    aligned(" world", vec![world], 1.9, 2.0),
+  ];
+  let updated =
+    update_segments_with_word_timings(&segments, &alignment, 0, 0.0, 0.6, 1.2, &t).unwrap();
+  assert_eq!(updated.len(), 1);
+  let words = updated[0].words_slice();
+  assert_eq!(words.len(), 2);
+  assert!(
+    (words[1].start() - 1.6).abs() < 1e-4,
+    "0.1s word pulled back by median/2"
+  );
+  assert!((words[1].end() - 2.0).abs() < 1e-4);
+  // Segment boundaries follow the words (:636-649 else-branches).
+  assert!((updated[0].start() - 0.0).abs() < 1e-4);
+  assert!((updated[0].end() - 2.0).abs() < 1e-4);
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn special_only_alignment_entries_are_skipped() {
+  // SegmentSeeker.swift:551-554: a timing whose tokens are all specials is
+  // consumed from the cursor but emits no word.
+  let t = tiny_tokenizer();
+  let s = SpecialTokens::whisper_defaults();
+  let hello = t.encode(" Hello").unwrap()[0];
+  let segments = [plain_segment(vec![hello], 0.0, 1.0)];
+  let alignment = [
+    aligned("<|0.00|>", vec![s.time_token_begin()], 0.0, 0.0),
+    aligned(" Hello", vec![hello], 0.0, 0.5),
+  ];
+  let updated =
+    update_segments_with_word_timings(&segments, &alignment, 0, 0.0, 0.6, 1.2, &t).unwrap();
+  let words = updated[0].words_slice();
+  assert_eq!(words.len(), 1);
+  assert_eq!(words[0].word(), " Hello");
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn seek_offset_and_pause_hack_apply() {
+  let t = tiny_tokenizer();
+  let hello = t.encode(" Hello").unwrap()[0];
+  // seek 32000 -> +2.0 s offset (:537). Pause: last_speech_timestamp 0,
+  // first word ends at 2.0+3.0=5.0 -> pause 5.0 > 0.6*4; word duration
+  // 3.0 > max 1.2 -> w0.start = max(0, 5.0 - 1.2) = 3.8 (:615-632).
+  let segments = [plain_segment(vec![hello], 2.0, 5.0)];
+  let alignment = [aligned(" Hello", vec![hello], 0.0, 3.0)];
+  let updated =
+    update_segments_with_word_timings(&segments, &alignment, 32_000, 0.0, 0.6, 1.2, &t).unwrap();
+  let words = updated[0].words_slice();
+  assert!((words[0].end() - 5.0).abs() < 1e-4, "offset applied");
+  assert!(
+    (words[0].start() - 3.8).abs() < 1e-4,
+    "pause-hack clamped the first word"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn word_index_cursor_is_shared_and_previous_segment_gap_pulls_first_word_back() {
+  // SegmentSeeker.swift:538: `wordIndex` is a single cursor walked across
+  // every segment, never reset per segment; and :584-595: a segment's own
+  // first word (only reachable while its local `wordsInSegment` is still
+  // empty) pulls back against the PREVIOUS segment's already-finalized
+  // `end`, not a word in this segment.
+  let t = tiny_tokenizer();
+  let hello = t.encode(" Hello").unwrap()[0];
+  let world = t.encode(" world").unwrap()[0];
+  let segments = [
+    plain_segment(vec![hello], 0.0, 1.0),
+    plain_segment(vec![world], 2.0, 3.0),
+  ];
+  let alignment = [
+    aligned(" Hello", vec![hello], 0.0, 1.0),
+    aligned(" world", vec![world], 2.4, 2.45),
+  ];
+  let updated =
+    update_segments_with_word_timings(&segments, &alignment, 0, 0.0, 0.6, 1.2, &t).unwrap();
+  assert_eq!(updated.len(), 2);
+  assert!((updated[0].end() - 1.0).abs() < 1e-4);
+  let second_words = updated[1].words_slice();
+  assert_eq!(
+    second_words.len(),
+    1,
+    "cursor advanced past segment 0's word, not reused"
+  );
+  // gap = 2.4 - 1.0 = 1.4; desired = min(1.4, 0.6/2=0.3) = 0.3 -> 2.4-0.3=2.1.
+  assert!(
+    (second_words[0].start() - 2.1).abs() < 1e-4,
+    "first word of segment 1 pulled back against segment 0's end"
+  );
+  assert!((second_words[0].end() - 2.45).abs() < 1e-4);
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn second_word_too_long_triggers_boundary_resplit() {
+  // SegmentSeeker.swift:621-633: an over-long pause followed by a
+  // too-long SECOND word re-splits the 0/1 boundary at
+  // max(w1.end/2, w1.end-max) before clamping the first word's start.
+  let t = tiny_tokenizer();
+  let hello = t.encode(" Hello").unwrap()[0];
+  let world = t.encode(" world").unwrap()[0];
+  let segments = [plain_segment(vec![hello, world], 0.0, 10.0)];
+  let alignment = [
+    aligned(" Hello", vec![hello], 3.0, 3.3),
+    aligned(" world", vec![world], 3.3, 6.0),
+  ];
+  let updated =
+    update_segments_with_word_timings(&segments, &alignment, 0, 0.0, 0.6, 1.2, &t).unwrap();
+  let words = updated[0].words_slice();
+  assert_eq!(words.len(), 2);
+  // boundary = max(6.0/2=3.0, 6.0-1.2=4.8) = 4.8.
+  assert!((words[0].end() - 4.8).abs() < 1e-4, "resplit boundary");
+  assert!((words[1].start() - 4.8).abs() < 1e-4, "resplit boundary");
+  // w0.start = max(last_speech_timestamp=0, w0.end(4.8) - max(1.2)) = 3.6.
+  assert!(
+    (words[0].start() - 3.6).abs() < 1e-4,
+    "first word clamped after resplit"
+  );
+  assert!(
+    (words[1].end() - 6.0).abs() < 1e-4,
+    "second word's end untouched by resplit"
+  );
+  assert!((updated[0].start() - 3.6).abs() < 1e-4);
+  assert!((updated[0].end() - 6.0).abs() < 1e-4);
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn segment_level_bounds_preferred_when_words_drift_far_from_segment() {
+  // SegmentSeeker.swift:635-640 and :642-649's IF branches (not the
+  // ubiquitous else): the first/last word's timing is replaced by a
+  // segment-anchored clamp when it has drifted more than half a second
+  // from the segment's own start/end.
+  let t = tiny_tokenizer();
+  let hello = t.encode(" Hello").unwrap()[0];
+  let segments = [plain_segment(vec![hello], 3.0, 5.0)];
+  let alignment = [aligned(" Hello", vec![hello], 2.0, 10.0)];
+  // last_speech_timestamp = 9.9 keeps the pause (:618-621) small, so the
+  // pause-hack itself never fires -- isolating the segment-bounds
+  // preference branches below.
+  let updated =
+    update_segments_with_word_timings(&segments, &alignment, 0, 9.9, 0.6, 1.2, &t).unwrap();
+  let words = updated[0].words_slice();
+  assert_eq!(words.len(), 1);
+  // start: segment.start(3.0) < w0.end(10.0) && segment.start-0.5=2.5 >
+  // w0.start(2.0) -> true -> max(0, min(10.0-0.6=9.4, 3.0)) = 3.0.
+  assert!(
+    (words[0].start() - 3.0).abs() < 1e-4,
+    "segment start preferred"
+  );
+  // end: updatedSegment.end(5.0) > lastWord.start(3.0) && segment.end+0.5
+  // =5.5 < lastWord.end(10.0) -> true -> max(3.0+0.6=3.6, 5.0) = 5.0.
+  assert!((words[0].end() - 5.0).abs() < 1e-4, "segment end preferred");
+  assert!((updated[0].start() - 3.0).abs() < 1e-4);
+  assert!((updated[0].end() - 5.0).abs() < 1e-4);
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn mixed_special_and_word_tokens_retokenize_the_surviving_ones() {
+  // SegmentSeeker.swift:556-559: when only SOME of a timing's tokens are
+  // filtered out (not all -- that's the :551-554 skip case), the word is
+  // retokenized from just the survivors rather than reusing the timing's
+  // own (here deliberately wrong) `.word` text.
+  let t = tiny_tokenizer();
+  let s = SpecialTokens::whisper_defaults();
+  let hello = t.encode(" Hello").unwrap()[0];
+  let segments = [plain_segment(vec![hello], 0.0, 1.0)];
+  let alignment = [aligned(
+    "WRONG",
+    vec![s.time_token_begin(), hello],
+    0.0,
+    0.5,
+  )];
+  let updated =
+    update_segments_with_word_timings(&segments, &alignment, 0, 0.0, 0.6, 1.2, &t).unwrap();
+  let words = updated[0].words_slice();
+  assert_eq!(words.len(), 1);
+  assert_eq!(
+    words[0].word(),
+    " Hello",
+    "retokenized from the surviving token, not `.word`"
+  );
+  assert_eq!(
+    words[0].tokens_slice().to_vec(),
+    vec![hello],
+    "special token filtered out of stored tokens too"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn empty_segments_returns_empty_without_consuming_alignment() {
+  let t = tiny_tokenizer();
+  let hello = t.encode(" Hello").unwrap()[0];
+  let alignment = [aligned(" Hello", vec![hello], 0.0, 0.5)];
+  let updated = update_segments_with_word_timings(&[], &alignment, 0, 0.0, 0.6, 1.2, &t).unwrap();
+  assert!(updated.is_empty());
+}
