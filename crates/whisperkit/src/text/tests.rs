@@ -138,3 +138,14 @@ fn trim_special_token_chars_is_a_character_class_trim_not_a_fixed_affix() {
   assert_eq!(trim_special_token_chars("<<|x|>"), "x");
   assert_eq!(trim_special_token_chars("<|a|><|b|>"), "a|><|b");
 }
+
+#[test]
+fn normalized_deletes_apostrophes_and_curly_quotes() {
+  // Po/Pi/Pf punctuation must be deleted like any other P* class — pins the
+  // classifier choice against a future mechanism swap.
+  assert_eq!(normalized("don't"), "dont");
+  assert_eq!(
+    normalized("\u{2018}quoted\u{2019} \u{201C}text\u{201D}"),
+    "quoted text"
+  );
+}
