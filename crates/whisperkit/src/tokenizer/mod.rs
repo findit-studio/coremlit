@@ -125,6 +125,31 @@ impl SpecialTokens {
     }
   }
 
+  /// Builds the fixed multilingual-GPT-2 fallback ids directly, with no
+  /// loaded tokenizer at all — the same defaults the vocabulary probe
+  /// falls back to per-field when a probe misses
+  /// (`Models.swift:1203-1214`, values from `Models.swift:1311-1321`).
+  ///
+  /// Exists so decode-chain code and its tests can build a plausible
+  /// [`SpecialTokens`] table hermetically, without a `tokenizer.json`
+  /// fixture on disk.
+  #[inline(always)]
+  pub const fn whisper_defaults() -> Self {
+    Self {
+      end_token: DEFAULT_END_TOKEN,
+      english_token: DEFAULT_ENGLISH_TOKEN,
+      no_speech_token: DEFAULT_NO_SPEECH_TOKEN,
+      no_timestamps_token: DEFAULT_NO_TIMESTAMPS_TOKEN,
+      special_token_begin: DEFAULT_SPECIAL_TOKEN_BEGIN,
+      start_of_previous_token: DEFAULT_START_OF_PREVIOUS_TOKEN,
+      start_of_transcript_token: DEFAULT_START_OF_TRANSCRIPT_TOKEN,
+      time_token_begin: DEFAULT_TIME_TOKEN_BEGIN,
+      transcribe_token: DEFAULT_TRANSCRIBE_TOKEN,
+      translate_token: DEFAULT_TRANSLATE_TOKEN,
+      whitespace_token: DEFAULT_WHITESPACE_TOKEN,
+    }
+  }
+
   /// `<|endoftext|>`'s id — Whisper's decoder EOS token.
   #[inline(always)]
   pub const fn end_token(&self) -> u32 {

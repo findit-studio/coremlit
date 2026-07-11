@@ -27,6 +27,9 @@
 //!   (mel/encode/decode-step seam), [`ModelDims`](backend::ModelDims), and
 //!   the scripted [`MockBackend`](backend::mock::MockBackend) test double
 //!   used for hermetic pipeline tests.
+//! - [`decode`] — autoregressive decoding; currently the per-step
+//!   [`LogitsFilter`](decode::filter::LogitsFilter) chain, driven against
+//!   an [`InferenceBackend`](backend::InferenceBackend)'s raw logits.
 //! - [`log`] — leveled logging with a replacing callback.
 //!
 //! # Example
@@ -63,6 +66,7 @@
 pub mod audio;
 pub mod backend;
 pub mod constants;
+pub mod decode;
 pub mod error;
 pub mod log;
 pub mod model;
