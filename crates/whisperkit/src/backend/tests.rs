@@ -24,6 +24,16 @@ fn alignment_view_rows() {
 }
 
 #[test]
+fn alignment_matrix_round_trips_a_view() {
+  let data = [0.0f32, 1.0, 2.0, 3.0, 4.0, 5.0];
+  let view = AlignmentView::new(&data, 2, 3);
+  let matrix = view.to_matrix();
+  assert_eq!(matrix.rows(), 2);
+  assert_eq!(matrix.cols(), 3);
+  assert_eq!(matrix.view().row(1), &[3.0, 4.0, 5.0]);
+}
+
+#[test]
 fn backend_error_displays_structured() {
   let e = BackendError::MissingFeature {
     model: "decoder",

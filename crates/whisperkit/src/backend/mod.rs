@@ -3,8 +3,8 @@
 //! whether it is talking to a real CoreML model or a scripted test double
 //! (spec §5.4). Also home to [`ModelDims`] (the static shape/vocabulary
 //! description backends report — drives variant detection and buffer
-//! sizing) and [`AlignmentView`] (the borrowed cross-attention alignment
-//! slice word-timestamp code reads).
+//! sizing) and [`AlignmentView`]/[`AlignmentMatrix`] (the borrowed/owned
+//! cross-attention alignment slice word-timestamp code reads and snapshots).
 //!
 //! Two implementations live here: [`coreml::CoreMlBackend`] — the real
 //! one, owning the three `coremlit::Model`s (spec §5.4) — and
@@ -304,6 +304,69 @@ impl<'a> AlignmentView<'a> {
   #[inline(always)]
   pub const fn data(&self) -> &'a [f32] {
     self.data
+  }
+}
+
+// ---------------------------------------------------------------------
+// AlignmentMatrix
+// ---------------------------------------------------------------------
+
+/// Owned `rows * cols` cross-attention alignment-weight buffer — the port
+/// of Swift's per-attempt `decodingResult.cache?.alignmentWeights`
+/// snapshot (`TranscribeTask.swift:198`). A fallback ladder tries several
+/// decode attempts per window, and [`InferenceBackend::reset_decoder_state`]
+/// zeroes the live accumulator between attempts and windows (Task 9's
+/// `CoreMlDecoderState::alignment`/`MockDecoderState::alignment`, both
+/// filled with `0.0` on reset); an [`AlignmentView`] borrowed from that
+/// live state would not survive past the next reset, so the accepted
+/// attempt's weights must be copied out into owned data before then. See
+/// [`AlignmentView::to_matrix`] for the copy-out.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlignmentMatrix {
+  data: Vec<f32>,
+  rows: usize,
+  cols: usize,
+}
+
+impl AlignmentMatrix {
+  /// Wraps `data` as an owned `rows * cols` row-major matrix.
+  ///
+  /// # Panics
+  /// If `data.len() != rows * cols`.
+  pub fn new(data: Vec<f32>, rows: usize, cols: usize) -> Self {
+    assert_eq!(
+      data.len(),
+      rows * cols,
+      "AlignmentMatrix: data.len() ({}) != rows ({rows}) * cols ({cols})",
+      data.len()
+    );
+    Self { data, rows, cols }
+  }
+
+  /// Number of decoded-token rows.
+  #[inline(always)]
+  pub const fn rows(&self) -> usize {
+    self.rows
+  }
+
+  /// Number of encoder audio-context columns.
+  #[inline(always)]
+  pub const fn cols(&self) -> usize {
+    self.cols
+  }
+
+  /// Borrows this matrix as an [`AlignmentView`].
+  #[inline(always)]
+  pub fn view(&self) -> AlignmentView<'_> {
+    AlignmentView::new(&self.data, self.rows, self.cols)
+  }
+}
+
+impl AlignmentView<'_> {
+  /// Copies this view's data out into an owned [`AlignmentMatrix`] (see
+  /// its doc for why word-timestamp code needs the copy).
+  pub fn to_matrix(&self) -> AlignmentMatrix {
+    AlignmentMatrix::new(self.data.to_vec(), self.rows, self.cols)
   }
 }
 
