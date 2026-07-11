@@ -712,8 +712,8 @@ pub fn truncate_long_words_at_sentence_boundaries(
 /// Re-anchors DTW word-level `merged_alignment` timings onto `segments`,
 /// applying Swift's short-word pull-back and pause/boundary heuristics
 /// along the way. Ports `updateSegmentsWithWordTimings`
-/// (`SegmentSeeker.swift:528-659`) — the final step `addWordTimestamps`
-/// (`:410-496`, not yet ported; see this module's own doc) runs after
+/// (`SegmentSeeker.swift:528-659`) — the last stage of
+/// [`add_word_timestamps`] (`:410-496`), which runs it after
 /// `findAlignment` -> the duration/truncation hack -> `mergePunctuations`.
 ///
 /// `merged_alignment` is walked with a cursor SHARED across every
