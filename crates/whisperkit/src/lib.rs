@@ -15,6 +15,7 @@
 //! the backend that actually loads models (`backend`, Plan 3), so it is
 //! deferred there rather than living here ahead of anything to drive it.
 
+pub mod audio;
 pub mod constants;
 pub mod error;
 pub mod model;
