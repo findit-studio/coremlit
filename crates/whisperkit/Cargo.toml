@@ -9,6 +9,24 @@ repository.workspace = true
 
 [dependencies]
 coremlit.workspace = true
+derive_more.workspace = true
+flate2.workspace = true
+libc.workspace = true
+mach2.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokenizers.workspace = true
+unicode_categories.workspace = true
+
+serde = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[features]
+serde = ["dep:serde"]
+tracing = ["dep:tracing"]
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
