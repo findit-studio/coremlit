@@ -43,3 +43,12 @@ fn transcribe_error_composes_tokenizer_and_decode_arms() {
   let e: TranscribeError = DecodeError::MissingAlignment.into();
   assert!(matches!(e, TranscribeError::Decode(_)));
 }
+
+#[test]
+fn decode_error_composes_tokenizer_arm() {
+  let e: DecodeError = TokenizerError::MissingToken {
+    token: "<|endoftext|>",
+  }
+  .into();
+  assert!(matches!(e, DecodeError::Tokenizer(_)));
+}

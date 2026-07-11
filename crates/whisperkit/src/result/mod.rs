@@ -1340,6 +1340,17 @@ impl TranscriptionResult {
 /// [`TranscriptionResult::timings`] instead of nesting per window), and
 /// `fallback` (the fallback decision is a pure function of this type,
 /// [`needs_fallback`], rather than a stored, mutually-recursive field).
+///
+/// One field goes the other way, beyond Swift's own set:
+/// [`Self::first_token_log_prob`]. Swift computes the first sampled
+/// token's log probability only transiently, inside the decode loop
+/// (`TextDecoder.swift:662-667`), to build a local `isFirstTokenLogProbTooLow`
+/// bool that never leaves the function. This port's decode loop
+/// ([`crate::decode::decode_text`]) has no such back door — its only
+/// output is this struct — so the raw value is stored here instead,
+/// letting a later fallback-ladder caller recompute the threshold
+/// comparison itself and pass it to [`needs_fallback`] (that function's
+/// own doc comment's "assumption (b)").
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DecodingResult {
@@ -1385,6 +1396,10 @@ pub struct DecodingResult {
   /// Compression ratio of `text` (repetition signal).
   #[cfg_attr(feature = "serde", serde(default))]
   compression_ratio: f32,
+  /// The first sampled token's raw log probability (not a Swift field —
+  /// see this struct's doc comment).
+  #[cfg_attr(feature = "serde", serde(default))]
+  first_token_log_prob: f32,
 }
 
 impl Default for DecodingResult {
@@ -1407,6 +1422,7 @@ impl DecodingResult {
       no_speech_prob: 0.0,
       temperature: 0.0,
       compression_ratio: 0.0,
+      first_token_log_prob: 0.0,
     }
   }
 
@@ -1590,6 +1606,292 @@ impl DecodingResult {
   #[inline(always)]
   pub const fn set_compression_ratio(&mut self, compression_ratio: f32) -> &mut Self {
     self.compression_ratio = compression_ratio;
+    self
+  }
+
+  // -- first_token_log_prob ------------------------------------------------
+  /// The first sampled token's raw log probability (not a Swift field —
+  /// see this struct's doc comment).
+  #[inline(always)]
+  pub const fn first_token_log_prob(&self) -> f32 {
+    self.first_token_log_prob
+  }
+  /// Builder form of [`Self::set_first_token_log_prob`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_first_token_log_prob(mut self, first_token_log_prob: f32) -> Self {
+    self.set_first_token_log_prob(first_token_log_prob);
+    self
+  }
+  /// Sets [`Self::first_token_log_prob`] in place.
+  #[inline(always)]
+  pub const fn set_first_token_log_prob(&mut self, first_token_log_prob: f32) -> &mut Self {
+    self.first_token_log_prob = first_token_log_prob;
+    self
+  }
+}
+
+// ---------------------------------------------------------------------
+// TranscriptionProgress
+// ---------------------------------------------------------------------
+
+/// Live per-step decode progress (Swift `TranscriptionProgress`,
+/// `Models.swift:643-661`), delivered to a
+/// [`TranscriptionProgressCallback`](crate::decode::TranscriptionProgressCallback)
+/// after every non-prefill decode step.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TranscriptionProgress {
+  /// Timings accumulated so far this run.
+  #[cfg_attr(feature = "serde", serde(default))]
+  timings: TranscriptionTimings,
+  /// Decoded text so far.
+  #[cfg_attr(feature = "serde", serde(default))]
+  text: String,
+  /// Sampled token ids so far (prompt included).
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "Vec::is_empty")
+  )]
+  tokens: Vec<u32>,
+  /// Sampling temperature, once known.
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "Option::is_none")
+  )]
+  temperature: Option<f32>,
+  /// Average sampled-token log probability so far, once known.
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "Option::is_none")
+  )]
+  avg_logprob: Option<f32>,
+  /// Compression ratio of [`Self::text`] so far, once known.
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "Option::is_none")
+  )]
+  compression_ratio: Option<f32>,
+  /// Which decode window this progress update belongs to.
+  #[cfg_attr(feature = "serde", serde(default))]
+  window_id: usize,
+}
+
+impl TranscriptionProgress {
+  /// Builds a progress update from its three always-known fields (Swift
+  /// `TranscriptionProgress.init`, `Models.swift:652-660`, defaults every
+  /// other parameter to `nil`/`0`); the optional trio starts `None` and
+  /// [`Self::window_id`] starts `0`.
+  pub fn new(
+    timings: TranscriptionTimings,
+    text: impl Into<String>,
+    tokens: impl Into<Vec<u32>>,
+  ) -> Self {
+    Self {
+      timings,
+      text: text.into(),
+      tokens: tokens.into(),
+      temperature: None,
+      avg_logprob: None,
+      compression_ratio: None,
+      window_id: 0,
+    }
+  }
+
+  // -- timings --------------------------------------------------------------
+  /// Timings accumulated so far this run.
+  #[inline(always)]
+  pub const fn timings(&self) -> &TranscriptionTimings {
+    &self.timings
+  }
+  /// Builder form of [`Self::set_timings`].
+  #[must_use]
+  #[inline(always)]
+  pub fn with_timings(mut self, timings: TranscriptionTimings) -> Self {
+    self.set_timings(timings);
+    self
+  }
+  /// Sets [`Self::timings`] in place.
+  #[inline(always)]
+  pub fn set_timings(&mut self, timings: TranscriptionTimings) -> &mut Self {
+    self.timings = timings;
+    self
+  }
+
+  // -- text -------------------------------------------------------------
+  /// Decoded text so far.
+  #[inline(always)]
+  pub fn text(&self) -> &str {
+    self.text.as_str()
+  }
+  /// Builder form of [`Self::set_text`].
+  #[must_use]
+  #[inline(always)]
+  pub fn with_text(mut self, text: impl Into<String>) -> Self {
+    self.set_text(text);
+    self
+  }
+  /// Sets [`Self::text`] in place.
+  #[inline(always)]
+  pub fn set_text(&mut self, text: impl Into<String>) -> &mut Self {
+    self.text = text.into();
+    self
+  }
+
+  // -- tokens (Vec<u32>) -------------------------------------------------
+  /// Sampled token ids so far (prompt included).
+  #[inline(always)]
+  pub const fn tokens_slice(&self) -> &[u32] {
+    self.tokens.as_slice()
+  }
+  /// Builder form of [`Self::set_tokens`].
+  #[must_use]
+  #[inline(always)]
+  pub fn with_tokens(mut self, tokens: impl Into<Vec<u32>>) -> Self {
+    self.set_tokens(tokens);
+    self
+  }
+  /// Sets [`Self::tokens_slice`] in place.
+  #[inline(always)]
+  pub fn set_tokens(&mut self, tokens: impl Into<Vec<u32>>) -> &mut Self {
+    self.tokens = tokens.into();
+    self
+  }
+
+  // -- temperature (Option<f32>) -------------------------------------------
+  /// Sampling temperature, once known.
+  #[inline(always)]
+  pub const fn temperature(&self) -> Option<f32> {
+    self.temperature
+  }
+  /// Builder form of [`Self::set_temperature`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_temperature(mut self, temperature: f32) -> Self {
+    self.set_temperature(temperature);
+    self
+  }
+  /// Sets [`Self::temperature`] to `Some(temperature)`.
+  #[inline(always)]
+  pub const fn set_temperature(&mut self, temperature: f32) -> &mut Self {
+    self.temperature = Some(temperature);
+    self
+  }
+  /// Builder form of [`Self::update_temperature`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn maybe_temperature(mut self, temperature: Option<f32>) -> Self {
+    self.update_temperature(temperature);
+    self
+  }
+  /// Assigns [`Self::temperature`] directly.
+  #[inline(always)]
+  pub const fn update_temperature(&mut self, temperature: Option<f32>) -> &mut Self {
+    self.temperature = temperature;
+    self
+  }
+  /// Sets [`Self::temperature`] to `None`.
+  #[inline(always)]
+  pub const fn clear_temperature(&mut self) -> &mut Self {
+    self.temperature = None;
+    self
+  }
+
+  // -- avg_logprob (Option<f32>) -------------------------------------------
+  /// Average sampled-token log probability so far, once known.
+  #[inline(always)]
+  pub const fn avg_logprob(&self) -> Option<f32> {
+    self.avg_logprob
+  }
+  /// Builder form of [`Self::set_avg_logprob`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_avg_logprob(mut self, avg_logprob: f32) -> Self {
+    self.set_avg_logprob(avg_logprob);
+    self
+  }
+  /// Sets [`Self::avg_logprob`] to `Some(avg_logprob)`.
+  #[inline(always)]
+  pub const fn set_avg_logprob(&mut self, avg_logprob: f32) -> &mut Self {
+    self.avg_logprob = Some(avg_logprob);
+    self
+  }
+  /// Builder form of [`Self::update_avg_logprob`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn maybe_avg_logprob(mut self, avg_logprob: Option<f32>) -> Self {
+    self.update_avg_logprob(avg_logprob);
+    self
+  }
+  /// Assigns [`Self::avg_logprob`] directly.
+  #[inline(always)]
+  pub const fn update_avg_logprob(&mut self, avg_logprob: Option<f32>) -> &mut Self {
+    self.avg_logprob = avg_logprob;
+    self
+  }
+  /// Sets [`Self::avg_logprob`] to `None`.
+  #[inline(always)]
+  pub const fn clear_avg_logprob(&mut self) -> &mut Self {
+    self.avg_logprob = None;
+    self
+  }
+
+  // -- compression_ratio (Option<f32>) -------------------------------------
+  /// Compression ratio of [`Self::text`] so far, once known.
+  #[inline(always)]
+  pub const fn compression_ratio(&self) -> Option<f32> {
+    self.compression_ratio
+  }
+  /// Builder form of [`Self::set_compression_ratio`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_compression_ratio(mut self, compression_ratio: f32) -> Self {
+    self.set_compression_ratio(compression_ratio);
+    self
+  }
+  /// Sets [`Self::compression_ratio`] to `Some(compression_ratio)`.
+  #[inline(always)]
+  pub const fn set_compression_ratio(&mut self, compression_ratio: f32) -> &mut Self {
+    self.compression_ratio = Some(compression_ratio);
+    self
+  }
+  /// Builder form of [`Self::update_compression_ratio`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn maybe_compression_ratio(mut self, compression_ratio: Option<f32>) -> Self {
+    self.update_compression_ratio(compression_ratio);
+    self
+  }
+  /// Assigns [`Self::compression_ratio`] directly.
+  #[inline(always)]
+  pub const fn update_compression_ratio(&mut self, compression_ratio: Option<f32>) -> &mut Self {
+    self.compression_ratio = compression_ratio;
+    self
+  }
+  /// Sets [`Self::compression_ratio`] to `None`.
+  #[inline(always)]
+  pub const fn clear_compression_ratio(&mut self) -> &mut Self {
+    self.compression_ratio = None;
+    self
+  }
+
+  // -- window_id ------------------------------------------------------------
+  /// Which decode window this progress update belongs to.
+  #[inline(always)]
+  pub const fn window_id(&self) -> usize {
+    self.window_id
+  }
+  /// Builder form of [`Self::set_window_id`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_window_id(mut self, window_id: usize) -> Self {
+    self.set_window_id(window_id);
+    self
+  }
+  /// Sets [`Self::window_id`] in place.
+  #[inline(always)]
+  pub const fn set_window_id(&mut self, window_id: usize) -> &mut Self {
+    self.window_id = window_id;
     self
   }
 }

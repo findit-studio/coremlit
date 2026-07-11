@@ -390,6 +390,12 @@ fn decoding_result_defaults_match_swift_empty_results() {
   assert_eq!(r.no_speech_prob(), 0.0);
   assert_eq!(r.temperature(), 0.0); // unlike TranscriptionSegment's 1.0 default
   assert_eq!(r.compression_ratio(), 0.0); // unlike TranscriptionSegment's 1.0 default
+  // Rust-only addition beyond Swift's field set (T5/decode loop assumption
+  // (b), see `needs_fallback`'s doc): the raw first-sampled-token logprob,
+  // threaded out of the loop so a fallback-ladder caller can recompute
+  // `first_token_log_prob_too_low` without decode_text changing its return
+  // type.
+  assert_eq!(r.first_token_log_prob(), 0.0);
   assert_eq!(DecodingResult::default(), DecodingResult::new());
 }
 
@@ -404,7 +410,8 @@ fn decoding_result_builder_vocabulary() {
     .with_avg_logprob(-0.4)
     .with_no_speech_prob(0.02)
     .with_temperature(0.2)
-    .with_compression_ratio(1.6);
+    .with_compression_ratio(1.6)
+    .with_first_token_log_prob(-0.8);
   assert_eq!(r.language(), "en");
   assert_eq!(r.language_probs_slice(), &[("en".to_string(), 0.98)]);
   assert_eq!(r.tokens_slice(), &[50364u32, 15339]);
@@ -414,11 +421,53 @@ fn decoding_result_builder_vocabulary() {
   assert_eq!(r.no_speech_prob(), 0.02);
   assert_eq!(r.temperature(), 0.2);
   assert_eq!(r.compression_ratio(), 1.6);
+  assert_eq!(r.first_token_log_prob(), -0.8);
 
   let mut m = DecodingResult::new();
   m.set_text("mutated").set_avg_logprob(-1.0);
   assert_eq!(m.text(), "mutated");
   assert_eq!(m.avg_logprob(), -1.0);
+}
+
+// ---------------------------------------------------------------------
+// TranscriptionProgress
+// ---------------------------------------------------------------------
+
+#[test]
+fn transcription_progress_defaults_match_swift() {
+  // Models.swift:643-660 `TranscriptionProgress.init` defaults: the
+  // optional trio starts `nil`, `windowId` starts `0`.
+  let timings = TranscriptionTimings::new();
+  let p = TranscriptionProgress::new(timings.clone(), "hello", vec![50364u32, 15339]);
+  assert_eq!(p.timings(), &timings);
+  assert_eq!(p.text(), "hello");
+  assert_eq!(p.tokens_slice(), &[50364u32, 15339]);
+  assert_eq!(p.temperature(), None);
+  assert_eq!(p.avg_logprob(), None);
+  assert_eq!(p.compression_ratio(), None);
+  assert_eq!(p.window_id(), 0);
+}
+
+#[test]
+fn transcription_progress_builder_vocabulary() {
+  let p = TranscriptionProgress::new(TranscriptionTimings::new(), "hi", Vec::new())
+    .with_temperature(0.2)
+    .with_avg_logprob(-0.3)
+    .with_compression_ratio(1.4)
+    .with_window_id(2);
+  assert_eq!(p.temperature(), Some(0.2));
+  assert_eq!(p.avg_logprob(), Some(-0.3));
+  assert_eq!(p.compression_ratio(), Some(1.4));
+  assert_eq!(p.window_id(), 2);
+
+  let mut m = p.clone();
+  m.clear_temperature();
+  assert_eq!(m.temperature(), None);
+  m.update_avg_logprob(Some(-0.9));
+  assert_eq!(m.avg_logprob(), Some(-0.9));
+  m.set_text("mutated").set_tokens(vec![1u32]);
+  assert_eq!(m.text(), "mutated");
+  assert_eq!(m.tokens_slice(), &[1u32]);
 }
 
 // ---------------------------------------------------------------------
@@ -504,6 +553,23 @@ fn decoding_result_serde_round_trips_and_skips_empty_collections() {
   assert_eq!(
     serde_json::from_str::<DecodingResult>("{}").unwrap(),
     DecodingResult::new()
+  );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn transcription_progress_serde_round_trips_and_skips_absent_optionals() {
+  let p = TranscriptionProgress::new(TranscriptionTimings::new(), "hi", Vec::new());
+  let json = serde_json::to_string(&p).unwrap();
+  let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+  let object = value.as_object().unwrap();
+  assert!(!object.contains_key("temperature"));
+  assert!(!object.contains_key("avg_logprob"));
+  assert!(!object.contains_key("compression_ratio"));
+  assert!(!object.contains_key("tokens"));
+  assert_eq!(
+    serde_json::from_str::<TranscriptionProgress>(&json).unwrap(),
+    p
   );
 }
 
