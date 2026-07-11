@@ -32,3 +32,14 @@ fn coreml_errors_wrap_typed() {
   let e: DecodeError = inner.into();
   assert!(matches!(e, DecodeError::Tensor(_)));
 }
+
+#[test]
+fn transcribe_error_composes_tokenizer_and_decode_arms() {
+  let e: TranscribeError = TokenizerError::MissingToken {
+    token: "<|endoftext|>",
+  }
+  .into();
+  assert!(matches!(e, TranscribeError::Tokenizer(_)));
+  let e: TranscribeError = DecodeError::MissingAlignment.into();
+  assert!(matches!(e, TranscribeError::Decode(_)));
+}

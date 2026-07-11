@@ -34,7 +34,7 @@ pub fn language_code(name_or_code: &str) -> Option<&'static str> {
 
 // Extracted from Models.swift with:
 //   awk '/static let languages/,/^    \]/' \
-//     /Users/al/Developer/findit-studio/argmax-oss-swift/Sources/WhisperKit/Core/Models.swift \
+//     <argmax-oss-swift>/Sources/WhisperKit/Core/Models.swift \
 //   | grep '":' | sed -E 's/^[[:space:]]*"([^"]+)": "([^"]+)",?/    ("\1", "\2"),/'
 static LANGUAGES: &[(&str, &str)] = &[
   ("english", "en"),

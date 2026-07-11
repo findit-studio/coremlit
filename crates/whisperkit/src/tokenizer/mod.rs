@@ -137,7 +137,7 @@ impl SpecialTokens {
     self.english_token
   }
 
-  /// The no-speech-probability probe token's id (see [`Self::probe`]'s doc
+  /// The no-speech-probability probe token's id (see the vocabulary probe's doc
   /// for why this resolves via the default fallback on a real Whisper
   /// vocab rather than an actual `"<|nospeech|>"` vocabulary hit).
   #[inline(always)]
@@ -190,7 +190,7 @@ impl SpecialTokens {
   }
 
   /// A single space character's id (GPT-2 byte-level BPE's `Ġ`, U+0120 —
-  /// id 220 in every Whisper vocab; see [`Self::probe`]'s doc).
+  /// id 220 in every Whisper vocab; see the vocabulary probe's doc).
   #[inline(always)]
   pub const fn whitespace_token(&self) -> u32 {
     self.whitespace_token
