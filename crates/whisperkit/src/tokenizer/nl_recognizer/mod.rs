@@ -39,7 +39,7 @@ mod tests;
 /// a bare base code: for Traditional Chinese text it returns `zh-Hant`,
 /// not `zh` (verified empirically against this exact crate version).
 /// Swift's WhisperKit passes that raw tag straight into its own CJK
-/// allowlist check (`Models.swift:1297`), which only matches the bare
+/// allowlist check (`Models.swift:1301`), which only matches the bare
 /// codes `zh`/`ja`/`th`/`lo`/`my`/`yue` — so `zh-Hant` misses the list and
 /// Swift falls through to space-based (phrase-blob) splitting for
 /// Traditional Chinese (coremlit issue #9's root-caused finding). This
