@@ -1,0 +1,12 @@
+# CI model-cache key (.github/workflows/ci.yml, job `model-tests`).
+# actions/cache keys on the hash of this file: bump `cache-epoch` (or pin
+# different revisions) to force a re-download.
+cache-epoch = 1
+
+[argmaxinc/whisperkit-coreml]
+include  = openai_whisper-tiny/*
+revision = main
+
+[openai/whisper-tiny]
+files    = tokenizer.json tokenizer_config.json config.json
+revision = main

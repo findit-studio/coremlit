@@ -8,9 +8,38 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-hack
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+      - run: cargo hack test -p whisperkit --each-feature
+      - run: cargo build -p whisperkit --examples
       - run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+  model-tests:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Restore model cache
+        id: models
+        uses: actions/cache@v4
+        with:
+          path: |
+            Models/whisperkit-coreml/openai_whisper-tiny
+            Models/tokenizers/whisper-tiny
+          key: models-${{ hashFiles('MODELS_LOCK') }}
+      - name: Download models (cache miss)
+        if: steps.models.outputs.cache-hit != 'true'
+        run: |
+          pipx install "huggingface_hub[cli]"
+          hf download argmaxinc/whisperkit-coreml --include "openai_whisper-tiny/*" \
+            --local-dir Models/whisperkit-coreml
+          hf download openai/whisper-tiny tokenizer.json tokenizer_config.json config.json \
+            --local-dir Models/tokenizers/whisper-tiny
+      - run: cargo test -p coremlit -- --ignored
+      - run: cargo test -p whisperkit -- --ignored
