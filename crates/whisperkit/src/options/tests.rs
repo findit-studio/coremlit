@@ -92,6 +92,98 @@ fn serde_round_trips_and_fills_defaults() {
 }
 
 #[test]
+fn detect_language_default_couples_to_prefill() {
+  // Ports Swift's `detectLanguage ?? !usePrefillPrompt`
+  // (Configurations.swift:222): unset detection defaults ON exactly when
+  // prefill is OFF, and an explicit choice always wins (coremlit
+  // issue #9 follow-up — this was the one genuine defaults gap between
+  // the ports).
+
+  // Unset + prefill ON (both defaults): resolves false — the pre-coupling
+  // default path, byte-unchanged.
+  let unset = DecodingOptions::new();
+  assert!(unset.use_prefill_prompt());
+  assert!(!unset.detect_language());
+  assert_eq!(unset.detect_language, None, "constructed unset, not false");
+
+  // Unset + prefill OFF: resolves true — the Swift-matching coupling.
+  let mut no_prefill = DecodingOptions::new();
+  no_prefill.clear_use_prefill_prompt();
+  assert!(no_prefill.detect_language());
+
+  // Explicit false beats the coupling even with prefill off...
+  let mut explicit_false = DecodingOptions::new();
+  explicit_false
+    .clear_use_prefill_prompt()
+    .clear_detect_language();
+  assert!(!explicit_false.detect_language());
+
+  // ...and mutation ORDER does not matter: the coupling is resolved at
+  // read time, so flipping prefill after the explicit choice cannot
+  // overwrite it (the construction-time-resolution failure mode).
+  let mut late_prefill = DecodingOptions::new();
+  late_prefill.clear_detect_language();
+  late_prefill.clear_use_prefill_prompt();
+  assert!(!late_prefill.detect_language());
+
+  // Explicit true with prefill ON (coupling would say false).
+  let explicit_true = DecodingOptions::new().with_detect_language();
+  assert!(explicit_true.use_prefill_prompt());
+  assert!(explicit_true.detect_language());
+
+  // maybe_/update_ record an explicit choice too.
+  let via_update = DecodingOptions::new()
+    .maybe_use_prefill_prompt(false)
+    .maybe_detect_language(false);
+  assert!(!via_update.detect_language());
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn detect_language_serde_tristate() {
+  // (d) of the coupling contract: unset serializes ABSENT and a missing
+  // field deserializes as unset (still coupled), while explicit values
+  // round-trip and win.
+
+  // Unset -> key absent (also covered by the exact-key test above).
+  let json = serde_json::to_string(&DecodingOptions::new()).unwrap();
+  let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+  assert!(!value.as_object().unwrap().contains_key("detect_language"));
+
+  // Missing field -> unset, not Some(false): with prefill also absent
+  // (default ON) it resolves false...
+  let missing: DecodingOptions = serde_json::from_str("{}").unwrap();
+  assert_eq!(missing.detect_language, None);
+  assert!(!missing.detect_language());
+  // ...and with prefill explicitly OFF in the config, the still-unset
+  // field resolves true — a partial config gets the Swift coupling.
+  let coupled: DecodingOptions = serde_json::from_str(r#"{"use_prefill_prompt":false}"#).unwrap();
+  assert_eq!(coupled.detect_language, None);
+  assert!(coupled.detect_language());
+
+  // Explicit false survives the round trip and beats the coupling.
+  let explicit_false: DecodingOptions =
+    serde_json::from_str(r#"{"use_prefill_prompt":false,"detect_language":false}"#).unwrap();
+  assert_eq!(explicit_false.detect_language, Some(false));
+  assert!(!explicit_false.detect_language());
+  let json = serde_json::to_string(&explicit_false).unwrap();
+  assert!(json.contains("\"detect_language\":false"));
+  assert_eq!(
+    serde_json::from_str::<DecodingOptions>(&json).unwrap(),
+    explicit_false
+  );
+
+  // Explicit true round-trips as a present key.
+  let explicit_true = DecodingOptions::new().with_detect_language();
+  let json = serde_json::to_string(&explicit_true).unwrap();
+  assert!(json.contains("\"detect_language\":true"));
+  assert_eq!(
+    serde_json::from_str::<DecodingOptions>(&json).unwrap(),
+    explicit_true
+  );
+}
+
+#[test]
 fn compute_defaults_match_swift_model_compute_options() {
   let c = ComputeOptions::new();
   assert_eq!(c.mel(), coremlit::ComputeUnits::CpuAndGpu);
@@ -237,15 +329,17 @@ fn decoding_options_empty_collections_skip_serializing() {
   let json = serde_json::to_string(&DecodingOptions::new()).unwrap();
   let value: serde_json::Value = serde_json::from_str(&json).unwrap();
   let object = value.as_object().unwrap();
-  // Exact-key checks: `detect_language` (always serialized) contains the
-  // substring "language", so a substring match on the JSON text would be a
-  // false negative for the `language` field specifically.
+  // Exact-key checks: an explicitly-set `detect_language` key contains
+  // the substring "language", so a substring match on the JSON text would
+  // be a false negative for the `language` field specifically.
   assert!(!object.contains_key("language"));
   assert!(!object.contains_key("clip_timestamps"));
   assert!(!object.contains_key("prompt_tokens"));
   assert!(!object.contains_key("prefix_tokens"));
   assert!(!object.contains_key("suppress_tokens"));
-  assert!(object.contains_key("detect_language"));
+  // Unset tri-state `detect_language` is skipped like the `None` floats
+  // (see `detect_language_serde_tristate` for the full presence matrix).
+  assert!(!object.contains_key("detect_language"));
   assert_eq!(
     serde_json::from_str::<DecodingOptions>(&json).unwrap(),
     DecodingOptions::new()
