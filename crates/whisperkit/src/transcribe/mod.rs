@@ -861,7 +861,40 @@ impl<B> WhisperKit<B> {
   /// drives — the seam matching Swift's injectable `voiceActivityDetector`
   /// field (`WhisperKit.swift:880`). [`audio::vad::EnergyVad`] (this
   /// pipeline's default) is one valid detector to construct here; any
-  /// other [`audio::vad::VoiceActivityDetector`] implementation works too.
+  /// type implementing [`audio::vad::VoiceActivityDetector`] works too,
+  /// provided it also satisfies this parameter's actual bounds —
+  /// `Send + Sync + 'static` (the `'static` is implicit: the default
+  /// object-lifetime bound for a `Box<dyn Trait + Send + Sync>` with no
+  /// lifetime written out) — because the boxed detector is stored on
+  /// `self` for the pipeline's full lifetime and must be safe to
+  /// send/share across threads along with it.
+  ///
+  /// # Examples
+  ///
+  /// A detector holding non-`Send` state is rejected at compile time
+  /// (this example is intentionally `compile_fail`):
+  ///
+  /// ```compile_fail
+  /// use std::{cell::Cell, rc::Rc};
+  /// use whisperkit::audio::vad::VoiceActivityDetector;
+  /// use whisperkit::transcribe::WhisperKit;
+  ///
+  /// struct NotSendVad(Rc<Cell<u32>>);
+  ///
+  /// impl VoiceActivityDetector for NotSendVad {
+  ///   fn voice_activity(&self, samples: &[f32]) -> Vec<bool> {
+  ///     vec![false; samples.len()]
+  ///   }
+  ///   fn frame_length_samples(&self) -> usize {
+  ///     160
+  ///   }
+  /// }
+  ///
+  /// fn reject<B>(kit: &mut WhisperKit<B>) {
+  ///   // error[E0277]: `Rc<Cell<u32>>` cannot be sent between threads safely
+  ///   kit.set_vad_detector(Box::new(NotSendVad(Rc::new(Cell::new(0)))));
+  /// }
+  /// ```
   #[inline(always)]
   pub fn set_vad_detector(
     &mut self,

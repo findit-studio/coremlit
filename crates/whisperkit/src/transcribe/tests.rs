@@ -322,6 +322,13 @@ fn vad_detector_swap_changes_chunk_boundaries() {
   // of the default `EnergyVad`'s silence-cut boundaries (3 chunks,
   // starting at 0 / 2.1 / 4.1 s, pinned above) -- an observable chunking
   // difference driven purely by which detector is plugged in.
+  //
+  // Unit struct: no fields, so it is trivially `Send + Sync + 'static`
+  // (auto traits with nothing in the type to violate them) -- it
+  // satisfies `set_vad_detector`'s actual bounds, and compiling below is
+  // the positive-case proof of that, complementing that method's
+  // `compile_fail` doctest, which rejects a detector holding non-`Send`
+  // state.
   struct AlwaysActiveVad;
   impl VoiceActivityDetector for AlwaysActiveVad {
     fn voice_activity(&self, samples: &[f32]) -> Vec<bool> {

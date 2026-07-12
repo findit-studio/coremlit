@@ -29,6 +29,7 @@ unicode_categories.workspace = true
 
 serde = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
+objc2 = { workspace = true, optional = true }
 objc2-foundation = { workspace = true, optional = true }
 objc2-natural-language = { workspace = true, optional = true }
 
@@ -41,7 +42,7 @@ tracing = ["dep:tracing"]
 # truth for language stays the decoder's own `<|lang|>` token (see
 # `WhisperTokenizer::split_to_word_tokens`'s doc) -- this feature only
 # exposes the redetection helper for callers who want a second opinion.
-nl-recognizer = ["dep:objc2-foundation", "dep:objc2-natural-language"]
+nl-recognizer = ["dep:objc2", "dep:objc2-foundation", "dep:objc2-natural-language"]
 
 [dev-dependencies]
 cpal.workspace = true

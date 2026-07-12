@@ -41,3 +41,28 @@ fn normalize_bcp47_maps_cmn_to_zh() {
   assert_eq!(normalize_bcp47("cmn"), "zh");
   assert_eq!(normalize_bcp47("cmn-Hant"), "zh");
 }
+
+#[test]
+fn redetect_language_is_stable_across_repeated_calls_on_a_bare_thread() {
+  // Regression coverage for `redetect_language`'s autorelease-pool wrap:
+  // a bare `std::thread` (unlike a Cocoa/AppKit run loop) never has a
+  // pool already on the stack, so this exercises exactly the thread
+  // shape that would leak without the function establishing its own
+  // pool. Fifty repeated calls returning a stable, correct result is
+  // evidence the pool-wrapped path is correct and repeatable from such a
+  // thread; it is NOT proof that nothing leaks -- that would need a
+  // subprocess harness driven with `OBJC_DEBUG_MISSING_POOLS=YES`,
+  // deliberately not built here (recorded as a known limitation in the
+  // fixes report instead).
+  let handle = std::thread::spawn(|| {
+    for _ in 0..50 {
+      assert_eq!(
+        redetect_language("This is a plain English sentence for language detection.").as_deref(),
+        Some("en")
+      );
+    }
+  });
+  handle
+    .join()
+    .expect("redetect_language must not panic on a bare thread");
+}
