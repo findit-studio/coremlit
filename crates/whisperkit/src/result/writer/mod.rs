@@ -233,17 +233,44 @@ impl SrtWriter {
 /// reader sees either the old content or the new, never a partial
 /// (phase-gate finding: `std::fs::write` truncates first).
 fn write_atomic(path: &Path, contents: &str) -> Result<(), WriteError> {
-  let mut tmp = path.as_os_str().to_owned();
-  tmp.push(".tmp");
-  let tmp = PathBuf::from(tmp);
-  let staged = std::fs::write(&tmp, contents).and_then(|()| std::fs::rename(&tmp, path));
+  use std::io::Write as _;
+  let map = |source| WriteError::Write {
+    path: path.to_path_buf(),
+    source,
+  };
+  // A UNIQUE staging sibling, arbitrated by `create_new` (O_EXCL): a
+  // deterministic `<dest>.tmp` let two concurrent writers share one
+  // staging inode — one could keep writing it after the other renamed it
+  // into place, exposing partial content and breaking the old-or-new
+  // guarantee (phase-gate round-3 finding) — and silently destroyed any
+  // pre-existing file of that name. Collisions (same pid retrying, or a
+  // stale leftover) skip to the next suffix instead of clobbering.
+  let mut attempt = 0u32;
+  let (mut file, tmp) = loop {
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".{}.{attempt}.tmp", std::process::id()));
+    let tmp = PathBuf::from(name);
+    match std::fs::OpenOptions::new()
+      .write(true)
+      .create_new(true)
+      .open(&tmp)
+    {
+      Ok(file) => break (file, tmp),
+      Err(source) if source.kind() == std::io::ErrorKind::AlreadyExists && attempt < 1024 => {
+        attempt += 1;
+      }
+      Err(source) => return Err(map(source)),
+    }
+  };
+  let written = file.write_all(contents.as_bytes());
+  // The descriptor must close before the rename: holding it open across
+  // the swap is exactly the exposed-partial-content shape being fixed.
+  drop(file);
+  let staged = written.and_then(|()| std::fs::rename(&tmp, path));
   staged.map_err(|source| {
     // Best-effort cleanup; the original error is the one worth reporting.
     let _ = std::fs::remove_file(&tmp);
-    WriteError::Write {
-      path: path.to_path_buf(),
-      source,
-    }
+    map(source)
   })
 }
 

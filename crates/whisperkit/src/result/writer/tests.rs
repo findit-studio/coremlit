@@ -113,3 +113,73 @@ fn writers_replace_existing_files_without_leaving_staging_artifacts() {
     .collect();
   assert!(leftovers.is_empty(), "staging file leaked: {leftovers:?}");
 }
+
+#[test]
+fn staging_never_clobbers_existing_files_and_concurrent_writes_stay_whole() {
+  // Regression (phase-gate round 3): the deterministic .tmp staging name
+  // let concurrent writers share one staging inode and silently destroyed
+  // pre-existing files of that name. (1) A planted file at the first
+  // candidate name must survive untouched — create_new skips past it.
+  let dir = tempfile::tempdir().unwrap();
+  let writer = SrtWriter::new(dir.path());
+  let planted = dir
+    .path()
+    .join(format!("whole.srt.{}.0.tmp", std::process::id()));
+  std::fs::write(&planted, "sentinel").unwrap();
+  writer.write(&result_with_segment(vec![]), "whole").unwrap();
+  assert_eq!(
+    std::fs::read_to_string(&planted).unwrap(),
+    "sentinel",
+    "pre-existing staging-shaped file clobbered"
+  );
+  std::fs::remove_file(&planted).unwrap();
+
+  // (2) Concurrent writers to one destination: every observation of the
+  // destination is one writer's WHOLE payload, never a mixture.
+  let a = {
+    let mut segment = TranscriptionSegment::new();
+    segment
+      .set_start(0.0)
+      .set_end(1.0)
+      .set_text("AAAA".repeat(256));
+    TranscriptionResult::new("", vec![segment], "en", TranscriptionTimings::new())
+  };
+  let b = {
+    let mut segment = TranscriptionSegment::new();
+    segment
+      .set_start(0.0)
+      .set_end(1.0)
+      .set_text("BBBB".repeat(256));
+    TranscriptionResult::new("", vec![segment], "en", TranscriptionTimings::new())
+  };
+  let full_a = srt_content(&a);
+  let full_b = srt_content(&b);
+  std::thread::scope(|scope| {
+    let writer_a = SrtWriter::new(dir.path());
+    let writer_b = SrtWriter::new(dir.path());
+    let ta = scope.spawn(move || {
+      for _ in 0..50 {
+        writer_a.write(&a, "contended").unwrap();
+      }
+    });
+    let tb = scope.spawn(move || {
+      for _ in 0..50 {
+        writer_b.write(&b, "contended").unwrap();
+      }
+    });
+    ta.join().unwrap();
+    tb.join().unwrap();
+  });
+  let observed = std::fs::read_to_string(dir.path().join("contended.srt")).unwrap();
+  assert!(
+    observed == full_a || observed == full_b,
+    "destination holds a mixture: len {}",
+    observed.len()
+  );
+  let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+    .unwrap()
+    .filter_map(Result::ok)
+    .filter(|e| e.path().extension().is_some_and(|x| x == "tmp"))
+    .collect();
+  assert!(leftovers.is_empty(), "staging leaked: {leftovers:?}");
+}
