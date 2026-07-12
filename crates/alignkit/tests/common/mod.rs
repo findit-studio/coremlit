@@ -62,7 +62,11 @@ pub fn load_wav_mono_f32(path: &Path) -> Vec<f32> {
 /// Lowercase-hex SHA-256 digest of a file's contents.
 ///
 /// Backs `tests/model_io.rs`'s provenance/integrity pin over the downloaded
-/// model artifacts.
+/// model artifacts. `common` is a `mod`, not a separate crate, so each
+/// `tests/*.rs` integration-test binary compiles its own copy; binaries
+/// that don't happen to call this one (e.g. `tests/parity_emissions.rs`)
+/// would otherwise warn `dead_code` on it.
+#[allow(dead_code)]
 pub fn sha256_hex(path: &Path) -> String {
   use sha2::{Digest, Sha256};
   let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
