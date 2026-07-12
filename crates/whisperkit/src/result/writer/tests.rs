@@ -93,3 +93,23 @@ fn json_round_trips_through_serde() {
     serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
   assert_eq!(parsed, result);
 }
+
+#[test]
+fn writers_replace_existing_files_without_leaving_staging_artifacts() {
+  // Phase-gate follow-up: writes stage into a sibling .tmp then rename
+  // (Swift's atomically: true). Overwrite works and no staging file
+  // survives either write.
+  let dir = tempfile::tempdir().unwrap();
+  let writer = SrtWriter::new(dir.path());
+  let first = result_with_segment(vec![]);
+  let path = writer.write(&first, "again").unwrap();
+  let before = std::fs::read_to_string(&path).unwrap();
+  writer.write(&first, "again").unwrap();
+  assert_eq!(std::fs::read_to_string(&path).unwrap(), before);
+  let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+    .unwrap()
+    .filter_map(Result::ok)
+    .filter(|e| e.path().extension().is_some_and(|x| x == "tmp"))
+    .collect();
+  assert!(leftovers.is_empty(), "staging file leaked: {leftovers:?}");
+}
