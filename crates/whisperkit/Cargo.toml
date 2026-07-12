@@ -61,5 +61,21 @@ harness = false
 name = "rtf"
 harness = false
 
+# `rtf` itself stays `harness = false` so `cargo bench` runs its real
+# end-to-end main() directly. Cargo still sets `cfg(test)` there regardless
+# of `harness` (verified empirically, see the phase-5 fix report), so its
+# `#[cfg(test)]` block compiles either way — but `harness = false` means no
+# libtest runner is ever linked for that target, so nothing ever CALLS
+# those `#[test]` fns there. A bare `test = true` on the bench stanza above
+# would therefore build but could never run `models_ready`'s hermetic
+# tests. This second target compiles the exact same source under the
+# default (harness = true) test harness instead, purely so those tests run
+# under `cargo test`; Cargo prints an informational (non-fatal, `-D
+# warnings`-immune) "present in multiple build targets" note for this
+# because of the shared path, which is expected and harmless.
+[[test]]
+name = "rtf_gate"
+path = "benches/rtf.rs"
+
 [lints]
 workspace = true
