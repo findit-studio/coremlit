@@ -141,7 +141,7 @@
 //! cheapest faithful record is to serialize the exact option values used
 //! and store that snapshot with the transcript.
 //!
-//! Two provenance-adjacent behaviors to plan for:
+//! Provenance-adjacent behaviors to plan for:
 //!
 //! - **Compute units affect output.** The same model/audio/options can
 //!   yield different transcripts across `cpuOnly`/`cpuAndGPU`/
@@ -155,6 +155,31 @@
 //!   [`BLANK_AUDIO_MARKER`](constants::BLANK_AUDIO_MARKER) — see that
 //!   constant's doc; product layers filter or model it rather than
 //!   indexing it as transcript text.
+//! - **Sampling above temperature 0 is non-reproducible by design, on
+//!   both runtimes.** Whenever the fallback ladder retries at
+//!   `temperature > 0`, upstream Swift draws from an unseeded RNG
+//!   (`Float.random`, `TokenSampler.swift:169`) and this port's default
+//!   deliberately matches that non-determinism
+//!   ([`GreedyTokenSampler::new`](decode::sampler::GreedyTokenSampler::new)
+//!   seeds from the OS via `StdRng::from_os_rng`). Two identical runs
+//!   that fall back can therefore legitimately differ. Consumers that
+//!   need reproducible fallback output should build their sampler with
+//!   [`GreedyTokenSampler::with_seed`](decode::sampler::GreedyTokenSampler::with_seed)
+//!   — a determinism knob Swift has no equivalent for — and should record
+//!   the effective temperature (the initial value plus any fallback
+//!   increments actually taken) in provenance, since it marks exactly
+//!   which outputs carry sampling randomness.
+//! - **Swift CLI comparison pitfall: `--language` forces prefill on.**
+//!   The upstream Swift CLI resolves
+//!   `usePrefillPrompt: arguments.usePrefillPrompt || arguments.language
+//!   != nil || task == .translate` (`TranscribeCLIUtils.swift:56`), so
+//!   passing `--language` to it silently turns prefill ON regardless of
+//!   the flag under test. A parity or benchmark harness that sets
+//!   `--language` while intending a no-prefill configuration is
+//!   comparing mismatched configurations — pin the language through
+//!   [`DecodingOptions::language`](options::DecodingOptions::language)
+//!   on this side and double-check what the Swift side actually resolved
+//!   before attributing any divergence to the ports.
 //!
 //! # Examples
 //!
