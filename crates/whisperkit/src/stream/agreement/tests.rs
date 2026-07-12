@@ -157,3 +157,30 @@ fn agreement_count_needed_zero_is_clamped_to_one_and_never_panics() {
   let second = result_with_words(vec![word(" And", 0.0, 0.4), word(" so", 0.4, 0.7)]);
   agreement.ingest(second); // must not panic
 }
+
+#[test]
+fn later_segment_words_satisfy_the_any_segment_gate() {
+  // Review follow-up pinning the documented deviation (module doc): the
+  // gate is "ANY segment carries words", not Swift's first-segment-only
+  // nil probe — a wordless first segment with a worded second one must
+  // NOT be flagged NoWordTimings.
+  let mut wordless = TranscriptionSegment::new();
+  wordless.set_start(0.0).set_end(0.5);
+  let mut worded = TranscriptionSegment::new();
+  worded
+    .set_start(0.5)
+    .set_end(1.0)
+    .set_words(vec![word(" hi", 0.5, 1.0)]);
+  let result = TranscriptionResult::new(
+    "",
+    vec![wordless, worded],
+    "en",
+    TranscriptionTimings::new(),
+  );
+  let mut agreement = LocalAgreement::new();
+  let outcome = agreement.ingest(result);
+  assert!(
+    !outcome.is_no_word_timings(),
+    "any-segment gate: later words count"
+  );
+}
