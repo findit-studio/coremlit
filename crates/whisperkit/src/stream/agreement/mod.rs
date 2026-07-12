@@ -274,17 +274,31 @@ impl LocalAgreement {
     watermark: f32,
     confirmed: &[WordTiming],
   ) -> Vec<WordTiming> {
-    let readmitted = confirmed
+    // The confirmed tail that a tied start would re-admit, in order.
+    let tail_start = confirmed
       .iter()
       .rev()
       .take_while(|word| word.start() >= watermark)
       .count();
-    result
+    let readmit_candidates = &confirmed[confirmed.len() - tail_start..];
+    let filtered: Vec<WordTiming> = result
       .all_words()
       .into_iter()
       .filter(|word| word.start() >= watermark)
-      .skip(readmitted)
-      .collect()
+      .collect();
+    // Strip only an ACTUALLY MATCHING prefix (normalized, the agreement's
+    // own equality — `find_longest_common_prefix` compares the same way):
+    // an unconditional count-skip dropped a PROVISIONAL word whenever a
+    // rewrite omitted a confirmed tied word and shifted everything left
+    // (phase-gate round-2 finding).
+    let strip = readmit_candidates
+      .iter()
+      .zip(&filtered)
+      .take_while(|(confirmed_word, candidate)| {
+        crate::text::normalized(confirmed_word.word()) == crate::text::normalized(candidate.word())
+      })
+      .count();
+    filtered[strip..].to_vec()
   }
 
   /// Folds one freshly-decoded `result` into the engine. Ports
