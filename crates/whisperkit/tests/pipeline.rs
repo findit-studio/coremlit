@@ -11,7 +11,7 @@ use coremlit::{ComputeUnits, Model};
 use whisperkit::{
   backend::{InferenceBackend, coreml::CoreMlBackend},
   model::{ModelState, manager::ModelManager},
-  options::{ComputeOptions, DecodingOptions, Options},
+  options::{ChunkingStrategy, ComputeOptions, DecodingOptions, Options},
   transcribe::WhisperKit,
 };
 
@@ -316,4 +316,49 @@ fn detect_language_on_es_and_ja_clips() {
   assert_eq!(kit.detect_language(&es).unwrap().language(), "es");
   let ja = common::load_wav_mono_f32(&common::fixtures_dir().join("audio/ja_test_clip.wav"));
   assert_eq!(kit.detect_language(&ja).unwrap().language(), "ja");
+}
+
+#[test]
+#[ignore = "requires local tiny model (WHISPERKIT_TEST_MODELS)"]
+fn silence_transcribes_to_the_blank_audio_marker() {
+  // Pins coremlit issue #9's silence edge case: 5 s of digital silence,
+  // VAD off / prefill on, decoded to exactly `[BLANK_AUDIO]`, one segment,
+  // on both Rust and Swift in the issue's own validation run --
+  // upstream-compatible model behavior, not a Rust-only quirk.
+  // `use_prefill_prompt`/`chunking_strategy` are set explicitly rather
+  // than left to their (already-matching) defaults, per the issue's own
+  // P1 policy recommendation to pin decode options rather than rely on
+  // them silently.
+  let kit = WhisperKit::new(&tiny_options()).unwrap();
+  let audio = vec![0.0f32; 5 * whisperkit::constants::SAMPLE_RATE as usize];
+  let options = DecodingOptions::new()
+    .with_use_prefill_prompt()
+    .with_chunking_strategy(ChunkingStrategy::Disabled);
+  let result = kit.transcribe(&audio, &options).unwrap();
+  assert!(
+    result
+      .text()
+      .contains(whisperkit::constants::BLANK_AUDIO_MARKER),
+    "got: {:?}",
+    result.text()
+  );
+  assert_eq!(result.segments_slice().len(), 1);
+}
+
+#[test]
+#[ignore = "requires local tiny model (WHISPERKIT_TEST_MODELS)"]
+fn half_second_clip_yields_no_segments() {
+  // Pins coremlit issue #9's other validated edge case: a clip too short
+  // to form a segment decodes to empty text with zero segments on both
+  // runtimes -- distinct from the silence case above (real speech
+  // content, just too little of it: the first 0.5 s of `jfk.wav`).
+  let kit = WhisperKit::new(&tiny_options()).unwrap();
+  let mut audio = common::load_wav_mono_f32(&common::fixtures_dir().join("audio/jfk.wav"));
+  audio.truncate(whisperkit::constants::SAMPLE_RATE as usize / 2); // 0.5 s
+  let options = DecodingOptions::new()
+    .with_use_prefill_prompt()
+    .with_chunking_strategy(ChunkingStrategy::Disabled);
+  let result = kit.transcribe(&audio, &options).unwrap();
+  assert_eq!(result.text(), "", "got: {:?}", result.text());
+  assert!(result.segments_slice().is_empty());
 }

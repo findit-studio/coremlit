@@ -21,6 +21,29 @@ pub const PREPEND_PUNCTUATION: &str = "\"'“¡¿([{-";
 /// `defaultAppendPunctuations`, Models.swift:1460).
 pub const APPEND_PUNCTUATION: &str = "\"'.。,，!！?？:：”)]}、";
 
+/// Upstream-compatible marker some Whisper models emit as decoded text for
+/// silent or near-silent audio. This is a training-data artifact baked
+/// into the model's learned output, not a tokenizer special token or a
+/// control code this crate inserts: the decoder literally samples the BPE
+/// tokens that spell this string out, the same as it would any other
+/// text, and this crate decodes and reports it faithfully rather than
+/// intercepting it.
+///
+/// Matches Swift's own observed output for the same input bit-for-bit
+/// (coremlit issue #9, "Silence output should be filtered or explicitly
+/// modeled": both runtimes produced exactly `[BLANK_AUDIO]`, one segment,
+/// for 5 s of silence under matched VAD/prefill settings). Because this is
+/// upstream-compatible model behavior rather than a bug, this crate does
+/// not filter it out of
+/// [`TranscriptionResult`](crate::result::TranscriptionResult)/
+/// [`TranscriptionSegment`](crate::result::TranscriptionSegment) text —
+/// product layers that don't want `[BLANK_AUDIO]` polluting search or
+/// timeline results must filter or model it themselves, e.g. by comparing
+/// [`TranscriptionResult::text`](crate::result::TranscriptionResult::text)/
+/// [`TranscriptionSegment::text`](crate::result::TranscriptionSegment::text)
+/// against this constant.
+pub const BLANK_AUDIO_MARKER: &str = "[BLANK_AUDIO]";
+
 /// Whisper language table: `(english_name, iso_code)`, 112 entries.
 ///
 /// Extracted verbatim from `Models.swift` `Constants.languages`.
