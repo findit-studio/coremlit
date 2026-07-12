@@ -2,6 +2,7 @@ use std::path::PathBuf;
 
 use super::*;
 use crate::{
+  audio::vad::VoiceActivityDetector,
   backend::{ModelDims, mock::MockBackend},
   error::SegmentError,
   options::{ChunkingStrategy, DecodingOptions},
@@ -303,6 +304,52 @@ fn vad_chunked_transcribe_reanchors_and_merges() {
     (starts[2] - 4.1).abs() < 1e-3,
     "chunk 3 re-anchored, got {}",
     starts[2]
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn vad_detector_swap_changes_chunk_boundaries() {
+  // coremlit issue #9 ("Make VAD strategy pluggable or configurable
+  // rather than locking product behavior to the default energy VAD"):
+  // reuses `vad_chunked_transcribe_reanchors_and_merges`'s exact audio
+  // (two silent stretches inside 96_000 samples, 48_000-sample windows)
+  // but swaps in a detector that never reports silence. With no silence
+  // to split on, `split_on_middle_of_longest_silence` falls through to
+  // its `None => end` arm every time instead of cutting at a silence
+  // midpoint, so chunking lands on whole-window boundaries (2 chunks of
+  // 48_000 samples each, second chunk starting at exactly 3.0 s) instead
+  // of the default `EnergyVad`'s silence-cut boundaries (3 chunks,
+  // starting at 0 / 2.1 / 4.1 s, pinned above) -- an observable chunking
+  // difference driven purely by which detector is plugged in.
+  struct AlwaysActiveVad;
+  impl VoiceActivityDetector for AlwaysActiveVad {
+    fn voice_activity(&self, samples: &[f32]) -> Vec<bool> {
+      vec![true; samples.len().div_ceil(self.frame_length_samples())]
+    }
+    fn frame_length_samples(&self) -> usize {
+      crate::audio::vad::DEFAULT_FRAME_LENGTH_SAMPLES
+    }
+  }
+
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(48_000));
+  let hello = t.encode(" Hello").unwrap()[0];
+  script_clean_window(&mut mock, hello);
+  let kit = WhisperKit::with_backend(mock, t).with_vad_detector(Box::new(AlwaysActiveVad));
+  let mut audio = vec![0.1f32; 96_000];
+  audio[32_000..35_200].fill(0.0);
+  audio[64_000..67_200].fill(0.0);
+  let options = DecodingOptions::new().with_chunking_strategy(ChunkingStrategy::Vad);
+  let result = kit.transcribe(&audio, &options).unwrap();
+  assert_eq!(result.text(), "Hello Hello", "2 whole-window chunks, not 3");
+  let segments = result.segments_slice();
+  assert_eq!(segments.len(), 2);
+  assert!((segments[0].start() - 0.0).abs() < 1e-3);
+  assert!(
+    (segments[1].start() - 3.0).abs() < 1e-3,
+    "chunk 2 starts at the whole-window boundary (48_000 / 16_000), got {}",
+    segments[1].start()
   );
 }
 

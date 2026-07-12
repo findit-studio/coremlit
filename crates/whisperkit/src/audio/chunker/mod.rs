@@ -187,7 +187,7 @@ impl VadChunker {
     clip_ranges: &[(usize, usize)],
   ) -> Vec<AudioChunk>
   where
-    V: VoiceActivityDetector,
+    V: VoiceActivityDetector + ?Sized,
   {
     if samples.len() <= max_len {
       return vec![AudioChunk::new(0, samples)];
@@ -234,7 +234,7 @@ impl VadChunker {
     end: usize,
   ) -> usize
   where
-    V: VoiceActivityDetector,
+    V: VoiceActivityDetector + ?Sized,
   {
     let mid = start + (end - start) / 2;
     let activity = vad.voice_activity(&samples[mid..end]);

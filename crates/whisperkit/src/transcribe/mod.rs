@@ -725,6 +725,14 @@ pub struct WhisperKit<B> {
   backend: B,
   tokenizer: WhisperTokenizer,
   variant: Option<ModelVariant>,
+  /// VAD detector [`Self::transcribe`]'s VAD-chunked branch drives.
+  /// Defaults to [`audio::vad::EnergyVad`] — Swift's own default for its
+  /// counterpart `voiceActivityDetector` field (`WhisperKit.swift:880`) —
+  /// and is swappable via [`Self::with_vad_detector`]/
+  /// [`Self::set_vad_detector`] (coremlit issue #9: "Make VAD strategy
+  /// pluggable or configurable rather than locking product behavior to
+  /// the default energy VAD").
+  vad_detector: Box<dyn audio::vad::VoiceActivityDetector + Send + Sync>,
 }
 
 impl WhisperKit<CoreMlBackend> {
@@ -782,6 +790,7 @@ impl WhisperKit<CoreMlBackend> {
       backend,
       tokenizer,
       variant,
+      vad_detector: Box::new(audio::vad::EnergyVad::new()),
     })
   }
 }
@@ -804,6 +813,7 @@ impl<B> WhisperKit<B> {
       backend,
       tokenizer,
       variant: None,
+      vad_detector: Box::new(audio::vad::EnergyVad::new()),
     }
   }
 
@@ -826,6 +836,39 @@ impl<B> WhisperKit<B> {
   #[inline(always)]
   pub const fn variant(&self) -> Option<ModelVariant> {
     self.variant
+  }
+
+  /// The VAD detector [`Self::transcribe`]'s VAD-chunked branch drives.
+  /// Defaults to [`audio::vad::EnergyVad`]; see [`Self::with_vad_detector`]/
+  /// [`Self::set_vad_detector`] to swap it.
+  #[inline(always)]
+  pub fn vad_detector(&self) -> &(dyn audio::vad::VoiceActivityDetector + Send + Sync) {
+    self.vad_detector.as_ref()
+  }
+
+  /// Builder form of [`Self::set_vad_detector`].
+  #[must_use]
+  #[inline(always)]
+  pub fn with_vad_detector(
+    mut self,
+    detector: Box<dyn audio::vad::VoiceActivityDetector + Send + Sync>,
+  ) -> Self {
+    self.set_vad_detector(detector);
+    self
+  }
+
+  /// Replaces the VAD detector [`Self::transcribe`]'s VAD-chunked branch
+  /// drives — the seam matching Swift's injectable `voiceActivityDetector`
+  /// field (`WhisperKit.swift:880`). [`audio::vad::EnergyVad`] (this
+  /// pipeline's default) is one valid detector to construct here; any
+  /// other [`audio::vad::VoiceActivityDetector`] implementation works too.
+  #[inline(always)]
+  pub fn set_vad_detector(
+    &mut self,
+    detector: Box<dyn audio::vad::VoiceActivityDetector + Send + Sync>,
+  ) -> &mut Self {
+    self.vad_detector = detector;
+    self
   }
 
   /// Builds an [`AudioStreamTranscriber`] over this pipeline's own
@@ -898,13 +941,14 @@ where
   /// [`ChunkingStrategy::Vad`](crate::options::ChunkingStrategy::Vad)
   /// **and** `audio.len()` exceeds the backend's
   /// [`ModelDims::window_samples`](crate::backend::ModelDims::window_samples)
-  /// (:876-878): [`audio::vad::EnergyVad`] +
-  /// [`chunker::VadChunker::chunk_all`] split `audio` along silence
-  /// boundaries (:880-886 — Swift's injectable `voiceActivityDetector ??
-  /// EnergyVAD()` field, :880, has no seam here yet: the energy VAD is
-  /// the only detector this port ships, so it is constructed directly),
-  /// with `clip_timestamps` cleared per chunk since chunking already
-  /// consumed them (:892-894); each chunk runs its own
+  /// (:876-878): [`Self::vad_detector`] + [`chunker::VadChunker::chunk_all`]
+  /// split `audio` along silence boundaries (:880-886 — Swift's injectable
+  /// `voiceActivityDetector ?? EnergyVAD()` field, :880, is
+  /// [`Self::vad_detector`]'s own counterpart: it defaults to
+  /// [`audio::vad::EnergyVad`], same as Swift, and
+  /// [`Self::with_vad_detector`]/[`Self::set_vad_detector`] are the seam
+  /// that swaps it), with `clip_timestamps` cleared per chunk since
+  /// chunking already consumed them (:892-894); each chunk runs its own
   /// [`TranscribeTask::run`], window-id-offset by its position in the
   /// chunk list (Swift's `audioIndex + batchIndex * batchSize`, :750 —
   /// which collapses to a flat running index here, see the deviation note
@@ -957,10 +1001,14 @@ where
   ) -> Result<TranscriptionResult, TranscribeError> {
     let window_samples = self.backend.dims().window_samples();
     if options.chunking_strategy().is_vad() && audio.len() > window_samples {
-      let vad = audio::vad::EnergyVad::new();
       let vad_chunker = chunker::VadChunker::new();
       let clip_ranges = chunker::prepare_seek_clips(options.clip_timestamps_slice(), audio.len())?;
-      let chunks = vad_chunker.chunk_all(&vad, audio, window_samples, &clip_ranges);
+      let chunks = vad_chunker.chunk_all(
+        self.vad_detector.as_ref(),
+        audio,
+        window_samples,
+        &clip_ranges,
+      );
       let chunk_options = options.clone().with_clip_timestamps(Vec::new());
 
       let mut chunk_results = Vec::with_capacity(chunks.len());

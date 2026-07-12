@@ -20,7 +20,12 @@ pub const DEFAULT_ENERGY_THRESHOLD: f32 = 0.02;
 ///
 /// Implementors supply per-frame activity; the provided methods port the
 /// frame/segment utilities every detector shares
-/// (`VoiceActivityDetector.swift`).
+/// (`VoiceActivityDetector.swift`). Every method takes `&self` and returns
+/// a concrete, owned or borrowed value — no generics, no `Self`-sized
+/// return — so this trait is dyn-compatible; that is what lets
+/// [`crate::transcribe::WhisperKit`] hold one behind
+/// `Box<dyn VoiceActivityDetector + Send + Sync>` and swap it at runtime
+/// via [`crate::transcribe::WhisperKit::set_vad_detector`].
 pub trait VoiceActivityDetector {
   /// One activity flag per [`Self::frame_length_samples`]-sized frame
   /// (final partial frame included).
