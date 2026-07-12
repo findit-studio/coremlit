@@ -27,7 +27,9 @@ serde = ["dep:serde"]
 tracing = ["dep:tracing"]
 
 [dev-dependencies]
+cpal.workspace = true
 hound.workspace = true
+rubato.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tempfile.workspace = true
 
