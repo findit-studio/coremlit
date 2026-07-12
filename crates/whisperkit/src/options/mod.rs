@@ -244,9 +244,16 @@ pub struct DecodingOptions {
   /// model choose them.
   #[cfg_attr(feature = "serde", serde(default = "default_use_prefill_prompt"))]
   use_prefill_prompt: bool,
-  /// Detect the spoken language instead of using `language`.
-  #[cfg_attr(feature = "serde", serde(default))]
-  detect_language: bool,
+  /// Detect the spoken language instead of using `language`. Tri-state:
+  /// `None` means the caller never chose, and the value resolves against
+  /// `use_prefill_prompt` at read time — see [`Self::detect_language`]
+  /// (the getter is the single resolution point) for the Swift rule this
+  /// ports (`Configurations.swift:222`).
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "Option::is_none")
+  )]
+  detect_language: Option<bool>,
   /// Omit special tokens (e.g. `<|endoftext|>`) from decoded text.
   #[cfg_attr(feature = "serde", serde(default))]
   skip_special_tokens: bool,
@@ -375,7 +382,7 @@ impl DecodingOptions {
       sample_length: DEFAULT_SAMPLE_LENGTH,
       top_k: DEFAULT_TOP_K,
       use_prefill_prompt: DEFAULT_USE_PREFILL_PROMPT,
-      detect_language: false,
+      detect_language: None,
       skip_special_tokens: false,
       without_timestamps: false,
       word_timestamps: false,
@@ -589,11 +596,27 @@ impl DecodingOptions {
     self
   }
 
-  // -- detect_language (bool) --------------------------------------------
-  /// Detect the spoken language instead of using `language`.
+  // -- detect_language (tri-state bool) ------------------------------------
+  /// Detect the spoken language instead of using `language`, resolved:
+  /// when the caller never set it, it defaults to `!use_prefill_prompt` —
+  /// detection kicks in by default exactly when prefill is off. Ports
+  /// Swift's constructor resolution `detectLanguage ?? !usePrefillPrompt`
+  /// (`Configurations.swift:222`, "If prefill is false, detect language
+  /// by default"); this port resolves at read time instead of
+  /// construction time only because Rust builders mutate after
+  /// construction — the observable rule is identical, and an explicit
+  /// [`Self::set_detect_language`]/[`Self::clear_detect_language`]/
+  /// [`Self::update_detect_language`] always wins over the coupling, in
+  /// either direction, regardless of mutation order.
+  ///
+  /// This getter is the single resolution point: every pipeline consumer
+  /// reads the coupled value through it.
   #[inline(always)]
   pub const fn detect_language(&self) -> bool {
-    self.detect_language
+    match self.detect_language {
+      Some(explicit) => explicit,
+      None => !self.use_prefill_prompt,
+    }
   }
   /// Builder form of [`Self::set_detect_language`].
   #[must_use]
@@ -602,10 +625,11 @@ impl DecodingOptions {
     self.set_detect_language();
     self
   }
-  /// Sets [`Self::detect_language`] to `true`.
+  /// Sets [`Self::detect_language`] explicitly to `true` (an explicit
+  /// value always beats the `!use_prefill_prompt` default coupling).
   #[inline(always)]
   pub const fn set_detect_language(&mut self) -> &mut Self {
-    self.detect_language = true;
+    self.detect_language = Some(true);
     self
   }
   /// Builder form of [`Self::update_detect_language`].
@@ -615,16 +639,19 @@ impl DecodingOptions {
     self.update_detect_language(detect_language);
     self
   }
-  /// Assigns [`Self::detect_language`] directly.
+  /// Assigns [`Self::detect_language`] explicitly (an explicit value
+  /// always beats the `!use_prefill_prompt` default coupling).
   #[inline(always)]
   pub const fn update_detect_language(&mut self, detect_language: bool) -> &mut Self {
-    self.detect_language = detect_language;
+    self.detect_language = Some(detect_language);
     self
   }
-  /// Sets [`Self::detect_language`] to `false`.
+  /// Sets [`Self::detect_language`] explicitly to `false` (an explicit
+  /// value always beats the `!use_prefill_prompt` default coupling — this
+  /// is how a no-prefill caller opts back out of detection).
   #[inline(always)]
   pub const fn clear_detect_language(&mut self) -> &mut Self {
-    self.detect_language = false;
+    self.detect_language = Some(false);
     self
   }
 
