@@ -38,3 +38,11 @@ fn punctuation_contains_load_bearing_members() {
   assert!(APPEND_PUNCTUATION.contains(','));
   assert!(APPEND_PUNCTUATION.contains('.'));
 }
+
+#[test]
+fn blank_audio_marker_matches_upstream_literal() {
+  // Pins the exact literal (coremlit issue #9): both runtimes decoded
+  // silence to this same text bit-for-bit, so this crate must not
+  // normalize/trim/alter it into some other shape.
+  assert_eq!(BLANK_AUDIO_MARKER, "[BLANK_AUDIO]");
+}
