@@ -184,3 +184,34 @@ fn later_segment_words_satisfy_the_any_segment_gate() {
     "any-segment gate: later words count"
   );
 }
+
+#[test]
+fn tied_word_starts_never_confirm_twice() {
+  // Regression (phase-gate round 1): the timestamp-only watermark
+  // re-admitted already-confirmed words whose start ties the watermark
+  // (B holds the watermark at A's shared start), confirming A again on
+  // the next pass. Three-pass history from the finding, agreement 2.
+  let a = || word(" A", 0.0, 0.5);
+  let b = || word(" B", 0.0, 1.0); // tied start with A
+  let c = || word(" C", 1.0, 2.0);
+  let d = || word(" D", 2.0, 3.0);
+  let e = || word(" E", 3.0, 4.0);
+  let mut agreement = LocalAgreement::new();
+  agreement.ingest(result_with_words(vec![a(), b(), c()]));
+  agreement.ingest(result_with_words(vec![a(), b(), c(), d()]));
+  agreement.ingest(result_with_words(vec![a(), b(), c(), d(), e()]));
+  let confirmed: Vec<&str> = agreement
+    .confirmed_words_slice()
+    .iter()
+    .map(|w| w.word())
+    .collect();
+  assert_eq!(confirmed, vec![" A", " B"], "confirmed once and stable");
+  let text = agreement.finalize().text().to_string();
+  for token in ["A", "B", "C", "D", "E"] {
+    assert_eq!(
+      text.matches(token).count(),
+      1,
+      "{token} must appear exactly once in {text:?}"
+    );
+  }
+}

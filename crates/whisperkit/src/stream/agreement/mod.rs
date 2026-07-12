@@ -253,6 +253,40 @@ impl LocalAgreement {
       .with_prefix_tokens(prefix_tokens)
   }
 
+  /// The agreement view of a result's words: everything at or past the
+  /// watermark, MINUS the already-confirmed words a tied start would
+  /// re-admit. The watermark is the first held-back word's start; a word
+  /// confirmed in the previous round can share that exact start (DTW row
+  /// steps without a column advance, then centisecond rounding — ties are
+  /// pipeline-reachable), and a bare timestamp filter would pull it back
+  /// in and confirm it AGAIN (phase-gate round-1 finding; Swift shares
+  /// the bug, and "confirmed once and stable" wins over parity here).
+  /// Confirmed words are time-ordered, so the re-admitted ones are
+  /// exactly the trailing run with `start >= watermark`, and they sit at
+  /// the front of the filtered list — skipping that count restores the
+  /// invariant on both sides of the prefix comparison.
+  fn watermark_filtered(&self, result: &TranscriptionResult) -> Vec<WordTiming> {
+    Self::watermark_filtered_with(result, self.last_agreed_seconds, &self.confirmed_words)
+  }
+
+  fn watermark_filtered_with(
+    result: &TranscriptionResult,
+    watermark: f32,
+    confirmed: &[WordTiming],
+  ) -> Vec<WordTiming> {
+    let readmitted = confirmed
+      .iter()
+      .rev()
+      .take_while(|word| word.start() >= watermark)
+      .count();
+    result
+      .all_words()
+      .into_iter()
+      .filter(|word| word.start() >= watermark)
+      .skip(readmitted)
+      .collect()
+  }
+
   /// Folds one freshly-decoded `result` into the engine. Ports
   /// `TranscribeCLI.swift:370-410`:
   ///
@@ -298,25 +332,18 @@ impl LocalAgreement {
       return AgreementOutcome::NoWordTimings;
     }
 
-    // :372.
-    let watermark = self.last_agreed_seconds;
-    self.hypothesis_words = result
-      .all_words()
-      .into_iter()
-      .filter(|word| word.start() >= watermark)
-      .collect();
+    // :372 — plus the readmit skip (see `watermark_filtered`).
+    self.hypothesis_words = self.watermark_filtered(&result);
 
     let mut advanced = false;
     let mut skip_append = false;
     // :374 — absent on the first-ever call, so nothing below runs and
     // this falls through to the `AwaitingAgreement` append below.
     if let Some(prev_result) = &self.prev_result {
-      // :375-376.
-      self.prev_words = prev_result
-        .all_words()
-        .into_iter()
-        .filter(|word| word.start() >= watermark)
-        .collect();
+      // :375-376 — the SAME filter as the hypothesis, so the two sides
+      // stay index-aligned for the prefix comparison.
+      self.prev_words =
+        Self::watermark_filtered_with(prev_result, self.last_agreed_seconds, &self.confirmed_words);
       let common = find_longest_common_prefix(&self.prev_words, &self.hypothesis_words);
       if common.len() >= self.agreement_count_needed {
         // :383-394 — advance the watermark.
