@@ -165,11 +165,21 @@
 //!   deliberately matches that non-determinism
 //!   ([`GreedyTokenSampler::new`](decode::sampler::GreedyTokenSampler::new)
 //!   seeds from the OS via `StdRng::from_os_rng`). Two identical runs
-//!   that fall back can therefore legitimately differ. Consumers that
-//!   need reproducible fallback output should build their sampler with
+//!   that fall back can therefore legitimately differ. The full
+//!   [`WhisperKit::transcribe`](transcribe::WhisperKit::transcribe)/
+//!   [`transcribe_all`](transcribe::WhisperKit::transcribe_all) pipeline
+//!   builds this sampler internally, fresh per attempt, and takes no
+//!   sampler of its own — so at this level there is no seed-injection
+//!   path today, and output stays non-deterministic at `temperature >
+//!   0` by design, exactly like Swift, with no workaround available
+//!   here. Direct callers of [`decode::decode_text`]/
+//!   [`decode::detect_language`] (this crate's own tests included) sit
+//!   one layer lower and do supply their own sampler, so they can build
+//!   it with
 //!   [`GreedyTokenSampler::with_seed`](decode::sampler::GreedyTokenSampler::with_seed)
-//!   — a determinism knob Swift has no equivalent for — and should record
-//!   the effective temperature (the initial value plus any fallback
+//!   — a determinism knob Swift has no equivalent for — for
+//!   reproducible output at that layer. Either way, record the
+//!   effective temperature (the initial value plus any fallback
 //!   increments actually taken) in provenance, since it marks exactly
 //!   which outputs carry sampling randomness.
 //! - **Swift CLI comparison pitfall: `--language` forces prefill on.**

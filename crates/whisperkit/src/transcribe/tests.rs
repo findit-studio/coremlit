@@ -243,6 +243,83 @@ fn failed_probe_rederives_language_from_that_attempts_decode() {
 
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn detect_language_pinned_deviation_actually_runs_the_probe() {
+  // Closes the loop on `DecodingOptions::detect_language`'s pinned
+  // deviation (also pinned at the options-getter level by
+  // `options::tests::detect_language_pinned_construction_vs_mutation_histories`):
+  // an unset `detect_language` with `use_prefill_prompt` mutated to
+  // `false` in place resolves `true` on this port (Swift's equivalent
+  // history stays `false`). This test proves that resolution is not
+  // just a getter-level curiosity — it actually gates whether
+  // `TranscribeTask::run` invokes the language-detection probe against
+  // the backend, observed via `MockCounters` deltas between two
+  // otherwise-identical runs.
+  let t = tiny_tokenizer();
+  let hello = t.encode(" Hello").unwrap()[0];
+
+  // Shared recipe: prefill OFF (so `initial_prompt == [SOT]` on both
+  // sides — one token, no task token anywhere in `current_tokens`,
+  // which keeps `TimestampRulesFilter` a no-op for a multilingual model
+  // per its own `effective_sample_begin` doc, so the scripted logits
+  // reach the sampler unmodified), one fallback attempt
+  // (`temperature_fallback_count(0)`), and the same first-token-logprob
+  // trick `failed_probe_rederives_language_from_that_attempts_decode`
+  // above uses: an unmasked one-hot step samples with logprob ~-1.21
+  // against this tiny vocab's softmax denominator, comfortably below
+  // -0.5, so `decode_text` breaks after exactly one `decode_step` call.
+  // One scripted step serves either run: the probe (if it runs) and the
+  // main decode both read script index 0 — the probe's own
+  // unconditional reset rewinds the mock's script cursor before the
+  // main decode starts (`decode::detect_language`'s own doc).
+  let base_options = || {
+    DecodingOptions::new()
+      .maybe_use_prefill_prompt(false)
+      .with_temperature_fallback_count(0)
+      .maybe_first_token_logprob_threshold(Some(-0.5))
+      .maybe_logprob_threshold(None)
+  };
+
+  // Probe disabled: explicit `false` beats the coupling even with
+  // prefill off.
+  let mut no_probe = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  no_probe.push_token_step(hello);
+  let options_no_probe = base_options().maybe_detect_language(false);
+  assert!(!options_no_probe.detect_language());
+  TranscribeTask::new(&no_probe, &t)
+    .run(&vec![0.1; 32_000], &options_no_probe)
+    .unwrap();
+
+  // Probe enabled: `detect_language` left unset, resolving `true` via
+  // the pinned deviation — Swift's equivalent history
+  // (`DecodingOptions()` then `usePrefillPrompt = false`) would stay
+  // `false` and never run this probe at all.
+  let mut with_probe = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  with_probe.push_token_step(hello);
+  let options_with_probe = base_options();
+  assert!(options_with_probe.detect_language());
+  TranscribeTask::new(&with_probe, &t)
+    .run(&vec![0.1; 32_000], &options_with_probe)
+    .unwrap();
+
+  // The delta IS the probe: one extra `decode_step` (the probe's own
+  // one-shot draw) and one extra `reset_decoder_state`
+  // (`decode::detect_language`'s own unconditional reset).
+  let base = no_probe.counters();
+  let probed = with_probe.counters();
+  assert_eq!(
+    probed.decode_steps(),
+    base.decode_steps() + 1,
+    "probe adds exactly one decode_step call"
+  );
+  assert_eq!(
+    probed.resets(),
+    base.resets() + 1,
+    "probe adds exactly one reset_decoder_state call"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn transcribe_all_preserves_order_across_scoped_threads() {
   let t = tiny_tokenizer();
   // The mock's script cursor lives in each worker's OWN MockDecoderState

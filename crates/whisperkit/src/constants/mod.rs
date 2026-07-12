@@ -38,10 +38,27 @@ pub const APPEND_PUNCTUATION: &str = "\"'.。,，!！?？:：”)]}、";
 /// [`TranscriptionResult`](crate::result::TranscriptionResult)/
 /// [`TranscriptionSegment`](crate::result::TranscriptionSegment) text —
 /// product layers that don't want `[BLANK_AUDIO]` polluting search or
-/// timeline results must filter or model it themselves, e.g. by comparing
-/// [`TranscriptionResult::text`](crate::result::TranscriptionResult::text)/
+/// timeline results must filter or model it themselves.
+///
+/// **Result-level equality is the validated contract.** The pinned
+/// silence golden asserts
+/// [`TranscriptionResult::text`](crate::result::TranscriptionResult::text)
+/// exactly equal to this constant. Segment text is a different shape:
+/// under that same validated configuration (default
+/// `skip_special_tokens == false`),
 /// [`TranscriptionSegment::text`](crate::result::TranscriptionSegment::text)
-/// against this constant.
+/// is the undecorated per-segment decode and still carries its
+/// special/timestamp tokens
+/// (`<|startoftranscript|><|en|><|transcribe|><|0.00|> [BLANK_AUDIO]<|10.00|><|endoftext|>`
+/// for that golden) — comparing it against this constant with equality
+/// will not match there. Setting `skip_special_tokens` filters those
+/// tokens out of segment text too (see
+/// [`segment::find_seek_point_and_segments`](crate::segment::find_seek_point_and_segments)),
+/// which narrows the gap, but that combination isn't itself pinned by a
+/// golden here: treat a segment-level check as `contains`, not
+/// equality, or filter/model on
+/// [`TranscriptionResult::text`](crate::result::TranscriptionResult::text)
+/// instead.
 pub const BLANK_AUDIO_MARKER: &str = "[BLANK_AUDIO]";
 
 /// Whisper language table: `(english_name, iso_code)`, 112 entries.

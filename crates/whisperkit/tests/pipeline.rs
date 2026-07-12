@@ -330,9 +330,9 @@ fn silence_transcribes_to_the_blank_audio_marker() {
   // P1 policy recommendation to pin decode options rather than rely on
   // them silently.
   //
-  // All three assertions below are byte-exact pins captured empirically
-  // against this exact tiny-model/option combination (`cargo test -p
-  // whisperkit --test pipeline -- --ignored --nocapture
+  // The byte-exact strings below are pins captured empirically against
+  // this exact tiny-model/option combination (`cargo test -p whisperkit
+  // --test pipeline -- --ignored --nocapture
   // silence_transcribes_to_the_blank_audio_marker`), not derived from a
   // spec: `result.text()` is exactly the marker, with no surrounding
   // whitespace. The sole segment's raw `text()` retains its special/
@@ -340,7 +340,11 @@ fn silence_transcribes_to_the_blank_audio_marker() {
   // its default (`false`, unset here) -- segment text is the
   // undecorated decode, `TranscriptionResult::text()` is the cleaned
   // aggregate view assembled from it, so the two having different
-  // shapes is expected, not a bug in either.
+  // shapes is expected, not a bug in either. The representation
+  // invariant that falls out of this -- result-level equality against
+  // the marker holds, segment-level equality never does under this
+  // configuration (`BLANK_AUDIO_MARKER`'s own doc) -- is asserted
+  // explicitly below, not left for a reader to infer from the strings.
   let kit = WhisperKit::new(&tiny_options()).unwrap();
   let audio = vec![0.0f32; 5 * whisperkit::constants::SAMPLE_RATE as usize];
   let options = DecodingOptions::new()
@@ -360,6 +364,11 @@ fn silence_transcribes_to_the_blank_audio_marker() {
     "<|startoftranscript|><|en|><|transcribe|><|0.00|> [BLANK_AUDIO]<|10.00|><|endoftext|>",
     "got: {:?}",
     segments[0].text()
+  );
+  assert_ne!(
+    segments[0].text(),
+    whisperkit::constants::BLANK_AUDIO_MARKER,
+    "segment text must retain its special/timestamp tokens here, unlike result.text()"
   );
 }
 
