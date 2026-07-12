@@ -37,6 +37,7 @@ tracing = ["dep:tracing"]
 [dev-dependencies]
 hound.workspace = true
 sha2.workspace = true
+tokenizers.workspace = true
 
 [lints]
 workspace = true
