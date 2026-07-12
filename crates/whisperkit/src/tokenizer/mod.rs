@@ -422,7 +422,7 @@ impl WhisperTokenizer {
   /// `NLLanguageRecognizer` that additionally normalizes its raw BCP-47
   /// result to a bare base code (`zh-Hant`/`zh-Hans`/`zh-*` all become
   /// `zh`) before returning — the exact normalization step Swift's own
-  /// call site skips (`Models.swift:1297`), which is why a `zh-Hant`
+  /// call site skips (`Models.swift:1301`), which is why a `zh-Hant`
   /// transcript falls through to space-based splitting there instead of
   /// landing on the CJK arm above (coremlit issue #9). See that
   /// function's doc for the full trade-off: a text-based second opinion
