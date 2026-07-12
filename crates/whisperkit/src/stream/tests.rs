@@ -99,12 +99,12 @@ fn energy_tracker_frames_and_first_frame_zero() {
   let mut tracker = EnergyTracker::default();
   let mut buffer = vec![0.001f32; 2 * ENERGY_FRAME_SAMPLES];
   tracker.absorb(&buffer);
-  assert_eq!(tracker.relative_energies().len(), 2);
-  assert_eq!(tracker.relative_energies()[0], 0.0);
+  assert_eq!(tracker.relative_energies_from(0).len(), 2);
+  assert_eq!(tracker.relative_energies_from(0)[0], 0.0);
   // Loud frames against the quiet reference read near 1.
   buffer.extend(std::iter::repeat_n(0.5, ENERGY_FRAME_SAMPLES));
   tracker.absorb(&buffer);
-  let energies = tracker.relative_energies();
+  let energies = tracker.relative_energies_from(0);
   assert_eq!(energies.len(), 3);
   assert!(
     energies[2] > 0.5,
@@ -114,7 +114,7 @@ fn energy_tracker_frames_and_first_frame_zero() {
   // Partial frames wait for completion.
   buffer.extend(std::iter::repeat_n(0.5, 10));
   tracker.absorb(&buffer);
-  assert_eq!(tracker.relative_energies().len(), 3);
+  assert_eq!(tracker.relative_energies_from(0).len(), 3);
 }
 
 #[test]
@@ -138,7 +138,7 @@ fn stream_state_defaults_and_pub_crate_mutation() {
   state.set_current_fallbacks(2);
   state.set_last_buffer_size(1_600);
   state.set_last_confirmed_segment_end_seconds(3.5);
-  state.set_buffer_energy(vec![0.1, 0.2]);
+  state.buffer_energy_mut().extend_from_slice(&[0.1, 0.2]);
   state.set_current_text("hello");
   let segment = TranscriptionSegment::new().with_text("hi");
   state.confirmed_segments_mut().push(segment.clone());
@@ -488,21 +488,19 @@ fn fallback_retry_stashes_superseded_text_as_unconfirmed() {
 
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
-fn panicking_state_callback_resets_state_to_default() {
-  // Ledgered at task 8 for this phase gate (progress-plan4.md P4.T8):
-  // `StateChangeCallback`'s doc and `push_samples`' doc both warn that a
-  // panicking callback poisons the internal `state_mutex`
-  // `transcribe_audio_samples` swaps the live `StreamState` into for a
-  // run's duration (mod.rs), silently resetting the transcriber's
-  // accumulated state to `StreamState::default()` instead of restoring
-  // it once the panic unwinds past the `self.state = state_mutex.
-  // into_inner()...` restore line. That was "empirically established, not
+fn panicking_state_callback_preserves_accumulated_state() {
+  // Phase-gate round 1 inverted this pin: the RAII RestoreOnDrop guard
+  // in `transcribe_audio_samples` now moves the state back on EVERY
+  // exit, so a panicking callback preserves the accumulated state
+  // as-of-panic instead of silently resetting it. The firing-count
+  // choreography below is unchanged. (History: the pre-guard behavior
+  // was "empirically established, not
   // just theorized" per the doc, but had no regression test pinning it —
   // closed here, template = nth-firing panic + catch_unwind + assert
   // reset.
   //
   // `push_samples` fires the state-change callback exactly twice
-  // (`set_buffer_energy`, then `set_last_buffer_size`) BEFORE
+  // (the energy extend, then `set_last_buffer_size`) BEFORE
   // `transcribe_audio_samples` ever swaps `self.state` into the Mutex —
   // both mutate `&mut self.state` directly, outside the swap (`use_vad`
   // is disabled and the push below is loud/long enough in one call to
@@ -562,9 +560,42 @@ fn panicking_state_callback_resets_state_to_default() {
     "the run must not reach a 4th callback firing once the 3rd one panics"
   );
 
-  // The accumulated state (buffer_energy and last_buffer_size, at least,
-  // were both set before the panic) is gone: push_samples never reached
-  // its restore line, so `self.state` still holds the `mem::take`
-  // placeholder from the moment of the swap.
-  assert_eq!(*streamer.state(), StreamState::default());
+  // Regression INVERTED by the phase-gate round-1 repair: the RAII
+  // guard restores the state as-of-panic, so everything published
+  // before the panic (buffer_energy, last_buffer_size) survives and a
+  // subsequent push continues instead of retranscribing from scratch.
+  assert!(
+    !streamer.state().buffer_energy_slice().is_empty(),
+    "pre-panic energy history survives the unwind"
+  );
+  assert!(
+    streamer.state().last_buffer_size() > 0,
+    "pre-panic buffer watermark survives the unwind"
+  );
+  let next = streamer
+    .push_samples(&[0.5; 1_600])
+    .expect("stream continues after the panic");
+  assert!(
+    next.is_awaiting_audio(),
+    "1 s of new audio since the surviving watermark is not enough to transcribe"
+  );
+}
+
+#[test]
+fn incremental_energy_publication_equals_full_recompute() {
+  // Phase-gate round-1 repair pin: extending by the newly completed tail
+  // per push must equal republishing the whole history.
+  let mut incremental = EnergyTracker::default();
+  let mut oneshot = EnergyTracker::default();
+  let mut published: Vec<f32> = Vec::new();
+  let mut audio: Vec<f32> = Vec::new();
+  for chunk in [1_600usize, 2_400, 800, 4_000] {
+    audio.extend(std::iter::repeat_n(0.25, chunk));
+    incremental.absorb(&audio);
+    let tail = incremental.relative_energies_from(published.len());
+    published.extend_from_slice(&tail);
+  }
+  oneshot.absorb(&audio);
+  assert_eq!(published, oneshot.relative_energies_from(0));
+  assert_eq!(published.len(), audio.len() / ENERGY_FRAME_SAMPLES);
 }
