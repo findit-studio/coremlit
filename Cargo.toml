@@ -16,6 +16,11 @@ objc2-core-ml = { version = "0.3", features = ["block2", "objc2-core-video"] }
 objc2-foundation = "0.3"
 objc2-core-video = "0.3"
 objc2-core-foundation = "0.3"
+objc2-natural-language = { version = "0.3", default-features = false, features = [
+  "std",
+  "NLLanguage",
+  "NLLanguageRecognizer",
+] }
 block2 = "0.6"
 half = "2.7"
 thiserror = "2"
