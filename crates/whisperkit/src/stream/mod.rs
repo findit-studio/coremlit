@@ -167,12 +167,11 @@ impl StreamState {
   pub const fn buffer_energy_slice(&self) -> &[f32] {
     self.buffer_energy.as_slice()
   }
-  /// Sets [`Self::buffer_energy_slice`] in place. `pub(crate)`: see this
-  /// struct's doc.
+  /// Mutable access for the state machine's incremental append.
+  /// `pub(crate)`: consumers read.
   #[inline(always)]
-  pub(crate) fn set_buffer_energy(&mut self, buffer_energy: impl Into<Vec<f32>>) -> &mut Self {
-    self.buffer_energy = buffer_energy.into();
-    self
+  pub(crate) fn buffer_energy_mut(&mut self) -> &mut Vec<f32> {
+    &mut self.buffer_energy
   }
 
   // -- current_text ------------------------------------------------------------
@@ -276,12 +275,12 @@ impl StreamState {
 /// reference to a `Sync` closure is the reference-based equivalent of a
 /// thread-safe callback value.
 ///
-/// The callback must not panic: [`AudioStreamTranscriber::push_samples`]
-/// fires it while the live [`StreamState`] is briefly swapped into an
-/// internal `Mutex` for a transcription run, and an unwind through that
-/// swap poisons the mutex and silently resets the transcriber's
-/// accumulated state to [`StreamState::default`] instead of restoring it
-/// (empirically established, not just theorized).
+/// The callback should not panic. If one does, the transcriber's
+/// accumulated state survives: an unwind through the internal swap
+/// [`AudioStreamTranscriber::push_samples`] performs for a run restores
+/// the state as-of-panic via an RAII guard (a mid-mutation snapshot at
+/// worst — never a silent reset), and the panic propagates to the
+/// caller.
 pub type StateChangeCallback<'a> = &'a (dyn Fn(&StreamState, &StreamState) + Sync);
 
 // ---------------------------------------------------------------------
@@ -634,8 +633,13 @@ impl EnergyTracker {
   /// Relative energy per completed frame, oldest first — the history
   /// `crate::audio::is_voice_detected` reads (Swift `AudioProcessor.
   /// relativeEnergy`, `AudioProcessor.swift:210-212`).
-  fn relative_energies(&self) -> Vec<f32> {
-    self.frames.iter().map(|&(rel, _)| rel).collect()
+  /// The relative energies of frames `start..`, one per completed frame
+  /// — the incremental tail the stream state appends per push.
+  fn relative_energies_from(&self, start: usize) -> Vec<f32> {
+    self.frames[start.min(self.frames.len())..]
+      .iter()
+      .map(|&(rel, _)| rel)
+      .collect()
   }
 }
 
@@ -666,10 +670,18 @@ fn apply(
   callback: Option<StateChangeCallback<'_>>,
   mutate: impl FnOnce(&mut StreamState),
 ) {
-  let old = state.clone();
-  mutate(state);
-  if let Some(callback) = callback {
-    callback(&old, state);
+  match callback {
+    Some(callback) => {
+      // The old-state snapshot exists ONLY to serve the callback: with
+      // none installed there is no observer, and a deep clone of a
+      // growing StreamState per mutation — several per decoded token —
+      // is quadratic memory traffic Swift never pays (its arrays are
+      // copy-on-write; a didSet with no observable work is free).
+      let old = state.clone();
+      mutate(state);
+      callback(&old, state);
+    }
+    None => mutate(state),
   }
 }
 
@@ -869,11 +881,10 @@ where
   ///    promotes segments past the confirmation watermark, and returns
   ///    [`StreamUpdate::Transcribed`] (`:159-192`).
   ///
-  /// The [`Self::set_state_callback`] callback must not panic: step 4
-  /// above briefly swaps [`Self::state`] into an internal `Mutex` for the
-  /// transcription run, and an unwind through that swap poisons it,
-  /// silently resetting this transcriber's accumulated state to
-  /// [`StreamState::default`] instead of restoring it.
+  /// The [`Self::set_state_callback`] callback should not panic. If it
+  /// does, step 4's internal swap restores [`Self::state`] as-of-panic
+  /// through an RAII guard (best-effort mid-mutation state, never a
+  /// silent reset) and the panic propagates to the caller.
   ///
   /// # Errors
   /// Whatever [`crate::transcribe::TranscribeTask::run`] returns,
@@ -886,9 +897,18 @@ where
     // separate mic callback exists at this sans-I/O boundary.
     self.buffer.extend_from_slice(samples);
     self.energy.absorb(&self.buffer);
-    let buffer_energy = self.energy.relative_energies();
+    // Incremental publication: the state's copy only ever grows through
+    // this path, so its length IS the cursor into the tracker's frames —
+    // extending by the new tail keeps each push O(new frames) where a
+    // full rebuild republished the entire stream history every 100 ms
+    // (quadratic over a session; phase-gate round-1 finding). The
+    // assignment (and its callback) still fires every push, even with an
+    // empty tail, preserving the per-assignment didSet parity.
+    let new_tail = self
+      .energy
+      .relative_energies_from(self.state.buffer_energy_slice().len());
     apply(&mut self.state, self.state_callback, |s| {
-      s.set_buffer_energy(buffer_energy);
+      s.buffer_energy_mut().extend_from_slice(&new_tail);
     });
 
     // :131-140. `saturating_sub` (not Swift's signed `Int` subtraction):
@@ -1004,6 +1024,32 @@ where
     let state_callback = self.state_callback;
 
     let state_mutex = Mutex::new(std::mem::take(&mut self.state));
+
+    // RAII restore: the state must move back into `self.state` on EVERY
+    // exit — including a panic unwinding out of a caller-supplied
+    // callback (phase-gate round-1 finding: the straight-line restore
+    // was skipped by the unwind, leaving a default state next to a
+    // still-populated buffer/energy tracker, so the next push silently
+    // retranscribed from watermark zero). A poisoned lock yields its
+    // inner value: best-effort mid-mutation state beats a reset.
+    struct RestoreOnDrop<'a> {
+      slot: &'a mut StreamState,
+      mutex: &'a Mutex<StreamState>,
+    }
+    impl Drop for RestoreOnDrop<'_> {
+      fn drop(&mut self) {
+        let mut guard = self
+          .mutex
+          .lock()
+          .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *self.slot = std::mem::take(&mut guard);
+      }
+    }
+    let _restore = RestoreOnDrop {
+      slot: &mut self.state,
+      mutex: &state_mutex,
+    };
+
     let progress_callback = |progress: &TranscriptionProgress| -> Option<bool> {
       {
         let mut guard = state_mutex.lock().expect("stream state mutex poisoned");
@@ -1012,14 +1058,8 @@ where
       should_stop_early(progress, &options, compression_check_window)
     };
 
-    let result = TranscribeTask::new(self.backend, self.tokenizer)
+    TranscribeTask::new(self.backend, self.tokenizer)
       .with_progress_callback(&progress_callback)
-      .run(&self.buffer, &options);
-
-    self.state = state_mutex
-      .into_inner()
-      .expect("stream state mutex poisoned");
-
-    result
+      .run(&self.buffer, &options)
   }
 }
