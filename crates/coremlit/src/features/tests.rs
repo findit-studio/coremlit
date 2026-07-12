@@ -163,3 +163,81 @@ fn provider_from_borrowed_pairs_round_trips() {
   // x and y are still owned and usable here — nothing moved.
   assert_eq!(x.count() + y.count(), 3);
 }
+
+#[test]
+fn from_provider_rejects_non_multi_array_values() {
+  use objc2::{AllocAnyThread, runtime::ProtocolObject};
+  use objc2_core_ml::{MLDictionaryFeatureProvider, MLFeatureValue};
+  use objc2_foundation::{NSDictionary, NSString};
+
+  // A string-valued feature: legal CoreML, but not a tensor — the
+  // featureValueWithString route from the fix-wave triage.
+  // SAFETY: plain constructor message sends building a string-valued
+  // feature dictionary; initWithDictionary result is checked.
+  let provider = unsafe {
+    let value: Retained<AnyObject> =
+      MLFeatureValue::featureValueWithString(&NSString::from_str("not a tensor")).into();
+    let dict = NSDictionary::from_retained_objects(&[&*NSString::from_str("meta")], &[value]);
+    MLDictionaryFeatureProvider::initWithDictionary_error(
+      MLDictionaryFeatureProvider::alloc(),
+      &dict,
+    )
+    .expect("string feature dictionary is valid")
+  };
+  let err =
+    Features::from_provider(ProtocolObject::from_ref(&*provider), &mut Vec::new()).unwrap_err();
+  assert_eq!(
+    err,
+    crate::PredictionError::NotMultiArray {
+      name: "meta".into()
+    }
+  );
+}
+
+// `unsafe impl <protocol> for GhostProvider` below needs the protocol trait
+// as a bare name in scope — `define_class!` matches the impl'd protocol as a
+// single identifier token, not a path, so `MLFeatureProvider` (already
+// bare-imported by `super::*` via this module's parent) and this import both
+// have to be unqualified.
+use objc2_foundation::NSObjectProtocol;
+
+// A provider that advertises a feature name and then refuses to produce its
+// value — the inconsistency `from_provider`'s MissingOutput arm defends
+// against. MLDictionaryFeatureProvider can never produce it (names and
+// values are the same dictionary), so a custom conformer is the only honest
+// exercise of the branch.
+objc2::define_class!(
+  #[unsafe(super(objc2_foundation::NSObject))]
+  #[name = "CoremlitGhostFeatureProvider"]
+  struct GhostProvider;
+
+  unsafe impl NSObjectProtocol for GhostProvider {}
+
+  unsafe impl MLFeatureProvider for GhostProvider {
+    #[unsafe(method_id(featureNames))]
+    fn feature_names(&self) -> Retained<objc2_foundation::NSSet<NSString>> {
+      objc2_foundation::NSSet::from_retained_slice(&[NSString::from_str("ghost")])
+    }
+
+    #[unsafe(method_id(featureValueForName:))]
+    fn feature_value_for_name(&self, _name: &NSString) -> Option<Retained<MLFeatureValue>> {
+      None
+    }
+  }
+);
+
+#[test]
+fn from_provider_surfaces_missing_outputs() {
+  use objc2::{AllocAnyThread, rc::Retained, runtime::ProtocolObject};
+
+  // SAFETY: plain NSObject-subclass alloc/init of the test conformer.
+  let provider: Retained<GhostProvider> = unsafe { objc2::msg_send![GhostProvider::alloc(), init] };
+  let err =
+    Features::from_provider(ProtocolObject::from_ref(&*provider), &mut Vec::new()).unwrap_err();
+  assert_eq!(
+    err,
+    crate::PredictionError::MissingOutput {
+      name: "ghost".into()
+    }
+  );
+}
