@@ -602,12 +602,52 @@ impl DecodingOptions {
   /// detection kicks in by default exactly when prefill is off. Ports
   /// Swift's constructor resolution `detectLanguage ?? !usePrefillPrompt`
   /// (`Configurations.swift:222`, "If prefill is false, detect language
-  /// by default"); this port resolves at read time instead of
-  /// construction time only because Rust builders mutate after
-  /// construction — the observable rule is identical, and an explicit
-  /// [`Self::set_detect_language`]/[`Self::clear_detect_language`]/
-  /// [`Self::update_detect_language`] always wins over the coupling, in
-  /// either direction, regardless of mutation order.
+  /// by default"). An explicit [`Self::set_detect_language`]/
+  /// [`Self::clear_detect_language`]/[`Self::update_detect_language`]
+  /// always wins over the coupling, in either direction, regardless of
+  /// mutation order.
+  ///
+  /// **Construction is Swift-identical.** Build with the chained
+  /// `with_*`/`maybe_*` form and this getter returns exactly what
+  /// Swift's memberwise initializer would have stored for the same
+  /// `(detect_language, use_prefill_prompt)` pair: e.g.
+  /// `DecodingOptions::new().maybe_use_prefill_prompt(false)` resolves
+  /// `true` here, same as Swift's `DecodingOptions(usePrefillPrompt:
+  /// false)`, because both sides apply the identical `?? !usePrefillPrompt`
+  /// formula to the same final inputs.
+  ///
+  /// **Pinned deviation: in-place mutation of `use_prefill_prompt` after
+  /// construction, while `detect_language` is still unset.** Swift's
+  /// `detectLanguage` is a plain stored `Bool` — resolved once inside
+  /// `init`, then frozen; reassigning the `var usePrefillPrompt`
+  /// property afterward never touches it again. This getter has no such
+  /// freeze point and re-resolves on every call against whatever
+  /// `use_prefill_prompt` currently holds. Concretely:
+  /// `DecodingOptions::new()` (prefill ON, the default) followed by the
+  /// in-place mutator [`Self::clear_use_prefill_prompt`] resolves `true`
+  /// here — but Swift's equivalent, `var o = DecodingOptions()`
+  /// (`detectLanguage` already frozen `false`) followed by
+  /// `o.usePrefillPrompt = false`, leaves `detectLanguage` at the
+  /// `false` its initializer committed to. At a nonzero temperature
+  /// this changes whether a language-detection probe runs at all, which
+  /// consumes the attempt's sampler RNG draw and can shift both the
+  /// sampled tokens that follow and the word-level language split.
+  ///
+  /// This is a deliberate, accepted deviation, not a defect to fix:
+  /// eagerly freezing the resolution — inside `new()` or every mutator
+  /// that touches `use_prefill_prompt` — would have to materialize
+  /// `Some(false)` immediately, destroying the `None` ("caller never
+  /// chose") tri-state this field exists to represent, and with it
+  /// `serde`'s absent-on-unset round trip
+  /// (`skip_serializing_if = "Option::is_none"`) and the explicit-wins
+  /// guarantee above — both depend on telling "never set" apart from
+  /// "set to whatever the coupling currently says." A caller who wants
+  /// Swift's frozen-at-construction behavior after mutating
+  /// `use_prefill_prompt` in place sets `detect_language` explicitly
+  /// first (one call to [`Self::set_detect_language`]/
+  /// [`Self::clear_detect_language`]/[`Self::update_detect_language`]
+  /// before the mutation) — an explicit choice always wins over the
+  /// coupling.
   ///
   /// This getter is the single resolution point: every pipeline consumer
   /// reads the coupled value through it.

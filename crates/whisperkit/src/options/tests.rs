@@ -106,7 +106,13 @@ fn detect_language_default_couples_to_prefill() {
   assert!(!unset.detect_language());
   assert_eq!(unset.detect_language, None, "constructed unset, not false");
 
-  // Unset + prefill OFF: resolves true — the Swift-matching coupling.
+  // Unset + prefill OFF, reached by an in-place mutator on an
+  // already-constructed value: resolves true, this port's own
+  // live-resolution rule — not Swift-identical. See
+  // `DecodingOptions::detect_language`'s doc ("Pinned deviation") and
+  // `detect_language_pinned_construction_vs_mutation_histories` below
+  // for the construction-vs-mutation distinction Swift parity actually
+  // depends on here.
   let mut no_prefill = DecodingOptions::new();
   no_prefill.clear_use_prefill_prompt();
   assert!(no_prefill.detect_language());
@@ -136,6 +142,46 @@ fn detect_language_default_couples_to_prefill() {
     .maybe_use_prefill_prompt(false)
     .maybe_detect_language(false);
   assert!(!via_update.detect_language());
+}
+
+#[test]
+fn detect_language_pinned_construction_vs_mutation_histories() {
+  // `DecodingOptions::detect_language`'s doc names two histories for an
+  // unset `detect_language` ending with `use_prefill_prompt == false`.
+  // Both resolve to the SAME Rust value (`true`) — what differs is
+  // which Swift call each history actually corresponds to.
+
+  // (i) Construction: chain `with_*`/`maybe_*` from `new()`, never
+  // mutate again. Swift-identical — matches
+  // `DecodingOptions(usePrefillPrompt: false)`, whose initializer
+  // computes `detectLanguage = nil ?? !false = true` directly from the
+  // argument: same formula, same final inputs, same value.
+  let constructed = DecodingOptions::new().maybe_use_prefill_prompt(false);
+  assert_eq!(constructed.detect_language, None, "still unset");
+  assert!(constructed.detect_language());
+
+  // (ii) In-place mutation of an already-constructed value: the pinned
+  // deviation. Also resolves `true` here, but Swift's equivalent is
+  // `var o = DecodingOptions()` — `usePrefillPrompt` defaults `true`,
+  // so `detectLanguage` freezes `!true == false` right there in `init`
+  // — followed by the LATER, separate mutation `o.usePrefillPrompt =
+  // false`, which cannot reach back and change the already-frozen
+  // `detectLanguage`. Swift stays `false`; this port resolves `true`.
+  // Kept deliberately (see the doc's tri-state/serde argument), not
+  // "fixed" to match.
+  let mut mutated = DecodingOptions::new();
+  assert!(mutated.use_prefill_prompt()); // prefill ON — Swift's default init
+  mutated.clear_use_prefill_prompt(); // separate, later mutation: Swift's `o.usePrefillPrompt = false`
+  assert_eq!(mutated.detect_language, None, "still unset");
+  assert!(
+    mutated.detect_language(),
+    "pinned deviation: Swift's equivalent history stays false here"
+  );
+
+  // Both histories land on the identical Rust value, which is exactly
+  // why this is a getter-shape (Swift-comparison-point) deviation
+  // rather than a value bug reachable from a single Rust run.
+  assert_eq!(constructed.detect_language(), mutated.detect_language());
 }
 
 #[cfg(feature = "serde")]
