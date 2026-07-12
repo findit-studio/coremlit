@@ -171,6 +171,59 @@ fn split_to_word_tokens_empty_input_is_empty() {
 
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn cjk_languages_split_into_fine_grained_words() {
+  // Pins a deliberate, chosen DIVERGENCE from Swift (coremlit issue #9,
+  // "Chinese word timestamp grouping needs a product policy"): Swift's
+  // `NLLanguageRecognizer` reports `zh-Hant` for Traditional Chinese text,
+  // but Swift's own CJK allowlist in `splitToWordTokens` is exactly
+  // `zh`/`ja`/`th`/`lo`/`my`/`yue` (`Models.swift:1293-1306`) --
+  // `zh-Hant` misses that list and falls through to the space-based
+  // splitter, which (Chinese has no spaces) groups a whole utterance into
+  // one coarse phrase blob instead of timing each character. This crate
+  // never reproduces that gap: the language code driving the split always
+  // comes from the decoder's own `<|lang|>` prompt token (see
+  // [`WhisperTokenizer::split_to_word_tokens`]'s doc), which is a bare
+  // base code (`zh`, never `zh-Hant`) by construction, so it always lands
+  // on the CJK arm below. The sample string and its expected
+  // per-character split are copied verbatim from issue #9's own
+  // Rust/Swift comparison run (its "Representative output" section). If a
+  // future change ever "fixes" this by routing decoder language codes
+  // through Swift's raw, un-normalized recognizer output, this test
+  // catches the regression back to phrase-blob grouping.
+  let t = tiny();
+  let text = "你上學也不也不說普通話";
+  let expected_words = vec![
+    "你", "上", "學", "也", "不", "也", "不", "說", "普", "通", "話",
+  ];
+  assert_eq!(expected_words.len(), text.chars().count());
+
+  for lang in ["zh", "ja", "yue"] {
+    let ids = t.encode(text).unwrap();
+    let words = t.split_to_word_tokens(&ids, lang).unwrap();
+    let texts: Vec<&str> = words.iter().map(|(w, _)| w.as_str()).collect();
+    assert_eq!(texts, expected_words, "language {lang}");
+    assert_eq!(
+      words.len(),
+      text.chars().count(),
+      "language {lang}: word count must equal char count"
+    );
+  }
+
+  // Contrast: a non-CJK language code routes the exact same tokens to the
+  // space-based splitter instead -- since the sample has no spaces, the
+  // whole utterance collapses into a single coarse "word". This is the
+  // failure mode the CJK arm above exists to avoid.
+  let ids = t.encode(text).unwrap();
+  let en_words = t.split_to_word_tokens(&ids, "en").unwrap();
+  assert_eq!(
+    en_words.len(),
+    1,
+    "non-CJK routing must not split per character"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn split_to_word_tokens_preserves_token_coverage_and_text() {
   // Structural invariants that must hold regardless of split strategy:
   // every input token is covered by exactly one word, in original order;
