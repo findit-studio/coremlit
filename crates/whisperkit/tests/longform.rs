@@ -1,7 +1,8 @@
 //! Long-form VAD chunking end-to-end on ted_60 (60 s) / tiny — the first
-//! real exercise of spec §5.5's long-form flow: EnergyVad chunking, the
-//! scoped-thread worker pool, seek-offset re-application (incl. word
-//! timings), and merge_transcription_results.
+//! real-model exercise of spec §5.5's long-form flow: EnergyVad chunking,
+//! the sequential per-chunk loop (the real backend is !Sync — the
+//! documented deviation on WhisperKit::transcribe), seek-offset
+//! re-application (incl. word timings), and merge_transcription_results.
 
 mod common;
 
@@ -26,14 +27,25 @@ fn ted_60_vad_chunked_transcription_with_word_timestamps() {
   let result = kit.transcribe(&audio, &options).unwrap();
 
   assert_eq!(result.language(), "en");
+  // Content keyword per the sibling jfk pattern: the opening clause of
+  // the TED clip must survive chunking + merging.
+  assert!(
+    result.text().to_lowercase().contains("in college"),
+    "expected the opening clause, got: {}",
+    &result.text()[..result.text().len().min(120)]
+  );
   assert!(
     result.text().len() > 200,
     "60 s of speech transcribes substantially"
   );
   let segments = result.segments_slice();
   assert!(segments.len() >= 4, "got {} segments", segments.len());
-  // Chunk re-anchoring: at least one segment lives past the 30 s window
-  // boundary — impossible without VAD chunking + seek offsets.
+  // Chunk re-anchoring sanity: segments live past the 30 s window
+  // boundary. (The un-chunked seek loop also reaches past 30 s, so this
+  // is a smoke check of the real-model VAD path, not a discriminator —
+  // the mock-backed vad_chunked_transcribe_reanchors_and_merges pins the
+  // chunk/offset mechanism with fractional offsets the un-chunked path
+  // cannot produce.)
   assert!(
     segments.iter().any(|s| s.start() > 30.0),
     "no segment beyond 30 s: offsets not re-applied"
