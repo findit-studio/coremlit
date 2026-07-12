@@ -39,6 +39,7 @@ serde = ["dep:serde"]
 
 [dev-dependencies]
 hound.workspace = true
+serde_json.workspace = true
 
 [lints]
 workspace = true
