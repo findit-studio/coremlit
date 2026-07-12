@@ -141,7 +141,7 @@ fn stream_state_defaults_and_pub_crate_mutation() {
   state.set_buffer_energy(vec![0.1, 0.2]);
   state.set_current_text("hello");
   let segment = TranscriptionSegment::new().with_text("hi");
-  state.set_confirmed_segments(vec![segment.clone()]);
+  state.confirmed_segments_mut().push(segment.clone());
   state.set_unconfirmed_segments(vec![segment]);
   state.set_unconfirmed_text(vec!["stale".to_string()]);
 
@@ -484,4 +484,87 @@ fn fallback_retry_stashes_superseded_text_as_unconfirmed() {
   // unconditionally once the run completes: the stash is real but
   // transient, never surviving past the call that produced it.
   assert!(streamer.state().unconfirmed_text_slice().is_empty());
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn panicking_state_callback_resets_state_to_default() {
+  // Ledgered at task 8 for this phase gate (progress-plan4.md P4.T8):
+  // `StateChangeCallback`'s doc and `push_samples`' doc both warn that a
+  // panicking callback poisons the internal `state_mutex`
+  // `transcribe_audio_samples` swaps the live `StreamState` into for a
+  // run's duration (mod.rs), silently resetting the transcriber's
+  // accumulated state to `StreamState::default()` instead of restoring
+  // it once the panic unwinds past the `self.state = state_mutex.
+  // into_inner()...` restore line. That was "empirically established, not
+  // just theorized" per the doc, but had no regression test pinning it —
+  // closed here, template = nth-firing panic + catch_unwind + assert
+  // reset.
+  //
+  // `push_samples` fires the state-change callback exactly twice
+  // (`set_buffer_energy`, then `set_last_buffer_size`) BEFORE
+  // `transcribe_audio_samples` ever swaps `self.state` into the Mutex —
+  // both mutate `&mut self.state` directly, outside the swap (`use_vad`
+  // is disabled and the push below is loud/long enough in one call to
+  // skip both early-return branches, so neither's `set_waiting_text_if_empty`
+  // adds an extra firing here). Every firing from the third on happens
+  // from INSIDE `on_progress_callback`, reached only through the
+  // Mutex-guarded `progress_callback` closure `decode_text` calls once
+  // per loop iteration (`decode/mod.rs`) — including forced prefill
+  // iterations, which run a real `decode_step` first, so the mock's
+  // script is exercised before this fires. The third firing is therefore
+  // always `on_progress_callback`'s own first `apply()` call
+  // (`set_current_text`), on the very first (prefill) loop iteration of
+  // the run's only decode attempt — squarely inside the swap window.
+  // Confirmed empirically, not just derived: `--nocapture`'s captured
+  // panic backtrace shows frame 3 (`apply`) called from frame 4
+  // (`on_progress_callback`) called from frame 5
+  // (`transcribe_audio_samples`'s closure) called from `decode_text`
+  // (`decode/mod.rs:412`) on this run's first loop iteration — exactly
+  // this path, every time, across repeated runs.
+  let t = tiny_tokenizer();
+  let s = SpecialTokens::whisper_defaults();
+  let hello = t.encode(" Hello").unwrap()[0];
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  mock.push_token_steps(&[
+    s.english_token(),
+    s.transcribe_token(),
+    s.time_token_begin(),
+    hello,
+    s.time_token_begin() + 100, // <|2.00|>
+    s.time_token_begin() + 100,
+    s.end_token(),
+  ]);
+  let mut stream_options = AudioStreamOptions::new();
+  stream_options.clear_use_vad();
+
+  let fired = std::sync::atomic::AtomicUsize::new(0);
+  let callback: &(dyn Fn(&StreamState, &StreamState) + Sync) = &|_old, _new| {
+    if fired.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1 == 3 {
+      panic!("scripted panic: the state callback must not panic (see StateChangeCallback's doc)");
+    }
+  };
+  let mut streamer = AudioStreamTranscriber::new(&mock, &t, DecodingOptions::new())
+    .with_stream_options(stream_options)
+    .with_state_callback(callback);
+
+  let samples = vec![0.5; 32_000];
+  let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    streamer.push_samples(&samples)
+  }));
+  assert!(
+    outcome.is_err(),
+    "the scripted callback panic must propagate out of push_samples, not get swallowed"
+  );
+  assert_eq!(
+    fired.load(std::sync::atomic::Ordering::SeqCst),
+    3,
+    "the run must not reach a 4th callback firing once the 3rd one panics"
+  );
+
+  // The accumulated state (buffer_energy and last_buffer_size, at least,
+  // were both set before the panic) is gone: push_samples never reached
+  // its restore line, so `self.state` still holds the `mem::take`
+  // placeholder from the moment of the swap.
+  assert_eq!(*streamer.state(), StreamState::default());
 }

@@ -17,7 +17,12 @@
 //! - [`error`] — per-domain error types composing into
 //!   [`TranscribeError`](error::TranscribeError).
 //! - [`result`] — transcription value types and the temperature-fallback
-//!   decision ([`needs_fallback`](result::needs_fallback)).
+//!   decision ([`needs_fallback`](result::needs_fallback)), plus the
+//!   [`writer`](result::writer) submodule's transcript writers:
+//!   [`SrtWriter`](result::writer::SrtWriter) and
+//!   [`VttWriter`](result::writer::VttWriter) always, and — behind the
+//!   `serde` feature — `JsonWriter`, all behind the shared
+//!   [`ResultWriter`](result::writer::ResultWriter) trait.
 //! - [`tokenizer`] — the Whisper tokenizer facade and special tokens.
 //! - [`model`] — model-lifecycle vocabulary (states, variants, folder
 //!   detection, device support) and
@@ -78,8 +83,20 @@
 //!   [`AudioStreamOptions`](stream::AudioStreamOptions),
 //!   [`StreamUpdate`](stream::StreamUpdate), and the early-stop gate
 //!   [`should_stop_early`](stream::should_stop_early) (Swift's static
-//!   `shouldStopEarly`) that a later push-based driver
-//!   (`AudioStreamTranscriber`, Plan 4 T8) is built from.
+//!   `shouldStopEarly`), driving the push-based state machine
+//!   [`AudioStreamTranscriber`](stream::AudioStreamTranscriber): push new
+//!   samples through
+//!   [`push_samples`](stream::AudioStreamTranscriber::push_samples) as
+//!   they arrive and read [`StreamState`](stream::StreamState) back for
+//!   the session's live transcript. [`stream::agreement`] adds the
+//!   LocalAgreement-2 confirmation engine
+//!   [`LocalAgreement`](stream::agreement::LocalAgreement) and its
+//!   simulated-stream driver
+//!   [`LocalAgreementTranscriber`](stream::agreement::LocalAgreementTranscriber).
+//!   [`WhisperKit`](transcribe::WhisperKit) builds either streamer from an
+//!   already-constructed pipeline
+//!   ([`audio_stream_transcriber`](transcribe::WhisperKit::audio_stream_transcriber)/
+//!   [`local_agreement_transcriber`](transcribe::WhisperKit::local_agreement_transcriber)).
 //! - [`log`] — leveled logging with a replacing callback.
 //!
 //! # Examples
@@ -126,6 +143,33 @@
 //!   needs_fallback(false, &repetitive, &options),
 //!   Some(FallbackReason::CompressionRatioThreshold),
 //! );
+//! ```
+//!
+//! # Streaming example
+//!
+//! ```no_run
+//! use whisperkit::options::{DecodingOptions, Options};
+//! use whisperkit::transcribe::WhisperKit;
+//!
+//! # fn main() -> Result<(), Box<dyn std::error::Error>> {
+//! let options = Options::new(
+//!   "Models/whisperkit-coreml/openai_whisper-tiny",
+//!   "Models/tokenizers/whisper-tiny",
+//! );
+//! let kit = WhisperKit::new(&options)?;
+//! let mut streamer = kit.audio_stream_transcriber(DecodingOptions::new());
+//! loop {
+//!   let samples: Vec<f32> = vec![0.0; 16_000]; // 1 s of 16 kHz mono from the caller's source
+//!   let update = streamer.push_samples(&samples)?;
+//!   if update.is_transcribed() {
+//!     for segment in streamer.state().confirmed_segments_slice() {
+//!       println!("confirmed: {}", segment.text());
+//!     }
+//!     break;
+//!   }
+//! }
+//! # Ok(())
+//! # }
 //! ```
 
 pub mod audio;
