@@ -99,9 +99,16 @@ impl BoundedAudioQueue {
     if incoming >= self.capacity {
       // A single callback chunk already fills (or exceeds) the whole
       // queue on its own: keep only its most recent `capacity` samples.
+      // Count an overrun only when samples were actually discarded —
+      // queued audio dropped by the clear, or the chunk's own excess
+      // beyond capacity. `incoming == capacity` into an empty queue
+      // keeps every sample and is NOT an overrun (phase-gate finding).
+      let dropped = queue.len() + (incoming - self.capacity);
       queue.clear();
       queue.extend(samples.skip(incoming - self.capacity));
-      self.overruns.fetch_add(1, Ordering::Relaxed);
+      if dropped > 0 {
+        self.overruns.fetch_add(1, Ordering::Relaxed);
+      }
       return;
     }
 
@@ -310,5 +317,33 @@ mod tests {
       "must keep the newest samples"
     );
     assert_eq!(queue.overruns(), 1);
+  }
+}
+
+#[cfg(test)]
+mod overrun_edge_tests {
+  use super::BoundedAudioQueue;
+
+  #[test]
+  fn exactly_capacity_into_an_empty_queue_is_not_an_overrun() {
+    // Regression (phase-gate round 2): the oversized branch incremented
+    // the counter even when nothing was discarded.
+    let queue = BoundedAudioQueue::new(8);
+    queue.push_overwriting([0.0f32; 8].into_iter());
+    assert_eq!(queue.overruns(), 0, "all samples kept: no overrun");
+    let mut out = Vec::new();
+    queue.drain_into(&mut out);
+    assert_eq!(out.len(), 8);
+  }
+
+  #[test]
+  fn overruns_count_exactly_the_dropping_pushes() {
+    let queue = BoundedAudioQueue::new(8);
+    queue.push_overwriting([0.0f32; 4].into_iter()); // fits
+    queue.push_overwriting([0.0f32; 4].into_iter()); // fits exactly
+    assert_eq!(queue.overruns(), 0);
+    queue.push_overwriting([0.0f32; 1].into_iter()); // drops one -> 1
+    queue.push_overwriting([0.0f32; 12].into_iter()); // oversized, drops -> 2
+    assert_eq!(queue.overruns(), 2, "exactly the two dropping pushes");
   }
 }

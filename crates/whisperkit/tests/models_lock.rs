@@ -20,6 +20,22 @@ fn workspace_root() -> PathBuf {
   PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
 }
 
+/// This is a repository-infrastructure check: the workspace's MODELS_LOCK
+/// and ci.yml are deliberately NOT packaged with the crate (verified via
+/// `cargo package --list`), so a `cargo test` run from the published
+/// tarball must SKIP rather than fail `NotFound`.
+fn repo_files() -> Option<(PathBuf, PathBuf)> {
+  let root = workspace_root();
+  let lock = root.join("MODELS_LOCK");
+  let workflow = root.join(".github/workflows/ci.yml");
+  if lock.is_file() && workflow.is_file() {
+    Some((lock, workflow))
+  } else {
+    eprintln!("models_lock checks skipped: not in the repository workspace");
+    None
+  }
+}
+
 fn field<'a>(table: &'a LockTable, key: &str) -> Option<&'a str> {
   table
     .fields
@@ -72,8 +88,10 @@ fn parse_lock(contents: &str) -> Vec<LockTable> {
 
 #[test]
 fn lock_parses_and_every_table_has_a_selector_and_a_revision() {
-  let contents =
-    fs::read_to_string(workspace_root().join("MODELS_LOCK")).expect("MODELS_LOCK reads");
+  let Some((lock_path, _)) = repo_files() else {
+    return;
+  };
+  let contents = fs::read_to_string(lock_path).expect("MODELS_LOCK reads");
   let tables = parse_lock(&contents);
 
   assert_eq!(
@@ -99,11 +117,12 @@ fn lock_parses_and_every_table_has_a_selector_and_a_revision() {
 
 #[test]
 fn ci_workflow_derives_downloads_from_the_lock_instead_of_hardcoding_them() {
-  let lock_contents =
-    fs::read_to_string(workspace_root().join("MODELS_LOCK")).expect("MODELS_LOCK reads");
+  let Some((lock_path, workflow_path)) = repo_files() else {
+    return;
+  };
+  let lock_contents = fs::read_to_string(lock_path).expect("MODELS_LOCK reads");
   let tables = parse_lock(&lock_contents);
-  let ci_contents = fs::read_to_string(workspace_root().join(".github/workflows/ci.yml"))
-    .expect(".github/workflows/ci.yml reads");
+  let ci_contents = fs::read_to_string(workflow_path).expect(".github/workflows/ci.yml reads");
 
   let repo_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
   assert_eq!(

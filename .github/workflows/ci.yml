@@ -74,6 +74,17 @@ jobs:
           echo "MODELS_LOCK: model=$model_repo@$model_revision include=$model_include"
           echo "MODELS_LOCK: tokenizer=$tokenizer_repo@$tokenizer_revision files=$tokenizer_files"
 
+          # Fail LOUD on any empty extraction: `hf download repo` with no
+          # selector silently fetches the WHOLE repository, so a future
+          # MODELS_LOCK format drift must stop the job here, not download
+          # different content than the lock intends.
+          for v in model_repo model_include model_revision tokenizer_repo tokenizer_files tokenizer_revision; do
+            if [ -z "${!v}" ]; then
+              echo "::error::MODELS_LOCK parse produced empty '$v' — format drift? fix the lock or the parser" >&2
+              exit 1
+            fi
+          done
+
           pipx install "huggingface_hub[cli]"
           hf download "$model_repo" --include "$model_include" --revision "$model_revision" \
             --local-dir Models/whisperkit-coreml
