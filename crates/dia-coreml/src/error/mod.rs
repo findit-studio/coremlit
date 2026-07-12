@@ -63,6 +63,29 @@ pub enum InferError {
     /// Shape the construction-time contract declares.
     expected: Vec<usize>,
   },
+  /// The caller's input contained a NaN or infinite value before inference
+  /// ran. Complements [`Self::NonFiniteOutput`]: an unchecked NaN sample
+  /// can otherwise propagate silently into a finite-looking but garbage
+  /// embedding that no downstream check would catch. Mirrors dia's
+  /// analogous embed-side guard, `embed::Error::NonFiniteInput`
+  /// (`diarization/src/embed/error.rs:107-109`) — a unit variant there.
+  /// This variant adds the offending flat index, matching this crate's own
+  /// [`Self::NonFiniteOutput`] shape: a deliberate enhancement over dia's,
+  /// not a parity requirement (dia's own variant carries no index).
+  #[error("input contains a non-finite value at index {index}")]
+  NonFiniteInput {
+    /// Flat index of the offending element.
+    index: usize,
+  },
+  /// A per-frame speaker-activity mask had no active (`true`) frame at
+  /// all. Every WeSpeaker call backed by an all-zero mask would receive
+  /// all-zero pooling weights, which divides by zero inside statistics
+  /// pooling and yields a NaN/Inf row — rejected here as a typed error
+  /// instead. Mirrors dia's `embed::Error::EmptyOrInactiveMask`
+  /// (`diarization/src/embed/error.rs:65-71`; the check itself lives at
+  /// `diarization/src/embed/model.rs:646-649`).
+  #[error("mask has no active (true) frame")]
+  EmptyMask,
 }
 
 /// Top-level extraction failure, composing model-lifecycle and inference

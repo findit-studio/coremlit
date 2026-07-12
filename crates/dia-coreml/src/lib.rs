@@ -15,5 +15,8 @@
 //!
 //! macOS only (built on [`coremlit`]).
 
+#[cfg(feature = "serde")]
+mod compute_units_serde;
+pub mod embed;
 pub mod error;
 pub mod segment;
