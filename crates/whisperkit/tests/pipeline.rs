@@ -329,20 +329,38 @@ fn silence_transcribes_to_the_blank_audio_marker() {
   // than left to their (already-matching) defaults, per the issue's own
   // P1 policy recommendation to pin decode options rather than rely on
   // them silently.
+  //
+  // All three assertions below are byte-exact pins captured empirically
+  // against this exact tiny-model/option combination (`cargo test -p
+  // whisperkit --test pipeline -- --ignored --nocapture
+  // silence_transcribes_to_the_blank_audio_marker`), not derived from a
+  // spec: `result.text()` is exactly the marker, with no surrounding
+  // whitespace. The sole segment's raw `text()` retains its special/
+  // timestamp tokens because this test leaves `skip_special_tokens` at
+  // its default (`false`, unset here) -- segment text is the
+  // undecorated decode, `TranscriptionResult::text()` is the cleaned
+  // aggregate view assembled from it, so the two having different
+  // shapes is expected, not a bug in either.
   let kit = WhisperKit::new(&tiny_options()).unwrap();
   let audio = vec![0.0f32; 5 * whisperkit::constants::SAMPLE_RATE as usize];
   let options = DecodingOptions::new()
     .with_use_prefill_prompt()
     .with_chunking_strategy(ChunkingStrategy::Disabled);
   let result = kit.transcribe(&audio, &options).unwrap();
-  assert!(
-    result
-      .text()
-      .contains(whisperkit::constants::BLANK_AUDIO_MARKER),
+  assert_eq!(
+    result.text(),
+    whisperkit::constants::BLANK_AUDIO_MARKER,
     "got: {:?}",
     result.text()
   );
-  assert_eq!(result.segments_slice().len(), 1);
+  let segments = result.segments_slice();
+  assert_eq!(segments.len(), 1, "got: {segments:?}");
+  assert_eq!(
+    segments[0].text(),
+    "<|startoftranscript|><|en|><|transcribe|><|0.00|> [BLANK_AUDIO]<|10.00|><|endoftext|>",
+    "got: {:?}",
+    segments[0].text()
+  );
 }
 
 #[test]

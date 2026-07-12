@@ -150,11 +150,14 @@
 //!   matches). Never compare outputs across compute units as if
 //!   equivalent: fix one unit for regression baselines, or keep a
 //!   separate baseline per unit.
-//! - **Silence decodes to a marker, not to empty text.** Silent windows
-//!   come back as
+//! - **Silence can decode to a marker, not to empty text.** Confirmed
+//!   under the validated configuration coremlit issue #9 pinned (tiny
+//!   model, matched VAD/prefill options, 5 s of digital silence): the
+//!   window decodes to exactly
 //!   [`BLANK_AUDIO_MARKER`](constants::BLANK_AUDIO_MARKER) — see that
-//!   constant's doc; product layers filter or model it rather than
-//!   indexing it as transcript text.
+//!   constant's doc for the general, model/config-dependent shape of
+//!   this behavior. When this marker is emitted, product layers should
+//!   filter or model it rather than indexing it as transcript text.
 //! - **Sampling above temperature 0 is non-reproducible by design, on
 //!   both runtimes.** Whenever the fallback ladder retries at
 //!   `temperature > 0`, upstream Swift draws from an unseeded RNG

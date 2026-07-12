@@ -5,6 +5,7 @@
 //! [`super::WhisperTokenizer::split_to_word_tokens`]'s doc for why the
 //! pipeline itself never calls this automatically (coremlit issue #9).
 
+use objc2::rc::autoreleasepool;
 use objc2_foundation::NSString;
 use objc2_natural_language::NLLanguageRecognizer;
 
@@ -13,8 +14,8 @@ mod tests;
 
 /// Redetects `text`'s dominant language from its own decoded content via
 /// `NLLanguageRecognizer` — the same class Swift's WhisperKit uses
-/// internally (`Models.swift:1294`) — normalizing the raw BCP-47 result to
-/// a Whisper base language code before returning it.
+/// internally (`Models.swift:1297-1299`) — normalizing the raw BCP-47
+/// result to a Whisper base language code before returning it.
 ///
 /// # Why this exists
 /// [`super::WhisperTokenizer::split_to_word_tokens`] always splits words
@@ -52,17 +53,37 @@ mod tests;
 ///
 /// Returns `None` when `NLLanguageRecognizer` cannot determine a dominant
 /// language (notably: empty or extremely short input).
+///
+/// # Thread safety
+/// This function establishes its own autorelease pool
+/// ([`autoreleasepool`]) around the complete operation — including the
+/// final owned-`String` conversion — so it is safe to call from any
+/// thread, including a bare `std::thread` with no surrounding Cocoa/
+/// AppKit run-loop pool. The pool is required, not optional: objc2's own
+/// documented contract is that any Objective-C method may autorelease
+/// internally (`objc2` 0.6.4 `src/rc/autorelease.rs:316`,
+/// [`autoreleasepool`]'s own doc), and the final `NSString` -> `String`
+/// conversion below specifically goes through `objc2-foundation`'s
+/// `autoreleasepool_leaking` (`objc2-foundation` 0.3.2 `src/util.rs:46`),
+/// which — per its own SAFETY comment (`objc2`
+/// `src/rc/autorelease.rs:524-533`) — *assumes* a real pool exists
+/// further up the call stack rather than establishing one itself. Without
+/// the pool this function pushes, every temporary autoreleased while
+/// redetecting a language would leak instead of draining on a thread
+/// with no pool above it.
 pub fn redetect_language(text: &str) -> Option<String> {
-  // SAFETY: fresh, unshared recognizer instance; `new` has no
-  // preconditions beyond ordinary Objective-C allocation.
-  let recognizer = unsafe { NLLanguageRecognizer::new() };
-  let ns_text = NSString::from_str(text);
-  // SAFETY: `recognizer` and `ns_text` are both live for the call, and
-  // the recognizer is not shared across threads.
-  unsafe { recognizer.processString(&ns_text) };
-  // SAFETY: accessor send on the same live recognizer.
-  let language = unsafe { recognizer.dominantLanguage() }?;
-  Some(normalize_bcp47(&language.to_string()))
+  autoreleasepool(|_| {
+    // SAFETY: fresh, unshared recognizer instance; `new` has no
+    // preconditions beyond ordinary Objective-C allocation.
+    let recognizer = unsafe { NLLanguageRecognizer::new() };
+    let ns_text = NSString::from_str(text);
+    // SAFETY: `recognizer` and `ns_text` are both live for the call, and
+    // the recognizer is not shared across threads.
+    unsafe { recognizer.processString(&ns_text) };
+    // SAFETY: accessor send on the same live recognizer.
+    let language = unsafe { recognizer.dominantLanguage() }?;
+    Some(normalize_bcp47(&language.to_string()))
+  })
 }
 
 /// Reduces a BCP-47 language tag to the primary subtag Whisper's
