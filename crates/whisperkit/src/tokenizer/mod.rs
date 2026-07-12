@@ -17,6 +17,9 @@ use unicode_categories::UnicodeCategories;
 
 use crate::{constants, error::TokenizerError};
 
+#[cfg(feature = "nl-recognizer")]
+pub mod nl_recognizer;
+
 // ---------------------------------------------------------------------
 // SpecialTokens
 // ---------------------------------------------------------------------
@@ -405,6 +408,26 @@ impl WhisperTokenizer {
   /// `NLLanguageRecognizer.dominantLanguage` detection (spec §5.3) — the
   /// caller supplies it directly (e.g. from the decoded `<|lang|>` prompt
   /// token) instead of re-detecting it from the decoded text.
+  ///
+  /// # Overriding or pre-normalizing `language_code`
+  /// `language_code` is an ordinary argument, not something this method
+  /// derives itself — this crate's pipeline callers pass the decoder's own
+  /// `<|lang|>` prompt token by default, and that stays the one source of
+  /// truth (see the paragraph above). A caller that instead wants Swift's
+  /// original text-based re-detection — e.g. for code-switched audio,
+  /// where the decoder's single per-window language token can be a poor
+  /// fit — can compute its own replacement code and pass that here. The
+  /// optional `nl-recognizer` feature (off by default) ships exactly that
+  /// as `tokenizer::nl_recognizer::redetect_language`, a thin wrapper over
+  /// `NLLanguageRecognizer` that additionally normalizes its raw BCP-47
+  /// result to a bare base code (`zh-Hant`/`zh-Hans`/`zh-*` all become
+  /// `zh`) before returning — the exact normalization step Swift's own
+  /// call site skips (`Models.swift:1297`), which is why a `zh-Hant`
+  /// transcript falls through to space-based splitting there instead of
+  /// landing on the CJK arm above (coremlit issue #9). See that
+  /// function's doc for the full trade-off: a text-based second opinion
+  /// can help, but it is still a second, independently-fallible signal,
+  /// which is exactly why this crate does not call it automatically.
   ///
   /// `tokens` is **not** filtered before splitting, even though Swift's
   /// language-detection preamble filters its own (separate, ephemeral)
