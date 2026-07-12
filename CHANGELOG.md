@@ -18,7 +18,8 @@ Initial release: a safe, synchronous CoreML runtime layer.
 Initial release: a Rust port of [WhisperKit](https://github.com/argmaxinc/WhisperKit) (Swift) on CoreML, sans-I/O (16 kHz mono `&[f32]` in).
 
 - Full pipeline: mel → encoder → autoregressive decoder with prefill prompts, KV caching, logits filters, and the temperature-fallback ladder; token parity with Swift `whisperkit-cli` on `openai_whisper-tiny` (en + es goldens).
-- Long-form: energy-VAD chunking, scoped-thread worker pool, seek re-anchoring, result merging (60 s fixture-proven).
+- Long-form: energy-VAD chunking (sequential per chunk on the CoreML backend, which is deliberately not `Sync`), seek re-anchoring, result merging (60 s fixture-proven).
+- Batch transcription (`transcribe_all`): scoped-thread worker pool over `Sync` backends (e.g. the mock backend), `concurrent_worker_count`-sized batches.
 - Word timestamps: DTW over decoder alignment weights, duration constraints, punctuation merging (`DecodingOptions::word_timestamps`).
 - Streaming: push-based `AudioStreamTranscriber` (VAD-gated, confirmed/unconfirmed segment promotion) and LocalAgreement-2 word confirmation (`LocalAgreementTranscriber`).
 - Language detection; SRT/VTT/JSON result writers; `serde` and `tracing` optional features.

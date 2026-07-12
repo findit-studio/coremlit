@@ -14,12 +14,12 @@
 | Crate | What it is |
 |---|---|
 | [`coremlit`](crates/coremlit) | Safe, synchronous CoreML runtime layer over `objc2-core-ml`: model load / compile / prewarm, prediction, stateful prediction (`MLState`), typed multi-arrays (including IOSurface-backed `f16` for the Neural Engine), eager I/O introspection. Every `unsafe` FFI call lives inside this crate behind a safe API. |
-| [`whisperkit`](crates/whisperkit) | The Whisper pipeline on CoreML: mel → encoder → autoregressive decoder with prefill, KV caching, and the temperature-fallback ladder; energy-VAD long-form chunking with a worker pool; DTW word timestamps; push-based streaming with confirmed/unconfirmed promotion and LocalAgreement-2; SRT/VTT/JSON writers. Token-for-token parity-tested against Swift WhisperKit's CLI on `openai_whisper-tiny`. |
+| [`whisperkit`](crates/whisperkit) | The Whisper pipeline on CoreML: mel → encoder → autoregressive decoder with prefill, KV caching, and the temperature-fallback ladder; energy-VAD long-form chunking (sequential per chunk on the CoreML backend); a scoped-thread worker pool for batch transcription over `Sync` backends; DTW word timestamps; push-based streaming with confirmed/unconfirmed promotion and LocalAgreement-2; SRT/VTT/JSON writers. Token-for-token parity-tested against Swift WhisperKit's CLI on `openai_whisper-tiny`. |
 
 ## The contract: sans-I/O, synchronous, macOS
 
 - **Audio enters as 16 kHz mono `&[f32]`.** The library never opens files or devices and never resamples. Decoding and capture belong to your app — [`examples/transcribe_wav.rs`](crates/whisperkit/examples/transcribe_wav.rs) (hound) and [`examples/mic_stream.rs`](crates/whisperkit/examples/mic_stream.rs) (cpal + rubato) show both sides of the boundary; those crates are dev-dependencies here, never library dependencies.
-- **Synchronous.** No async runtime anywhere; long-form transcription parallelizes internally with scoped threads.
+- **Synchronous.** No async runtime anywhere; batch transcription (`transcribe_all`) parallelizes internally with scoped threads over `Sync` backends. VAD long-form chunking on the CoreML backend runs each chunk sequentially instead — `CoreMlBackend` is deliberately not `Sync` (Apple's contract is one `MLModel` on one thread at a time), so it can never satisfy `transcribe_all`'s bound; see `WhisperKit::transcribe`'s docs.
 - **macOS on Apple Silicon** (CI: `macos-15`). Compute-unit selection (`CPU`/`GPU`/`Neural Engine`) per model stage; `MLState`-based stateful prediction requires macOS 15 and is probed at runtime (`Model::supports_state`).
 
 ## Quick start
