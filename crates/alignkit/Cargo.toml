@@ -3,12 +3,9 @@ name = "alignkit"
 description = "CoreML wav2vec2 forced word-level alignment"
 version.workspace = true
 edition.workspace = true
-# Unpublishable: this task lands only the crate skeleton, model
-# ground-truth, and the emission-representation decision — no alignment
-# algorithm yet. The eventual `asry` dependency (`features = ["emissions"]`,
-# design spec §6/§8) is deferred past this task (see src/error/mod.rs's
-# module doc) and asry's `emissions` feature isn't published either; flip
-# once both land.
+# Unpublishable: `asry` is a local path dependency (see the `[dependencies]`
+# entry below) and its own `emissions` feature isn't published either; flip
+# once both land on a released asry version.
 publish = false
 rust-version.workspace = true
 license.workspace = true
@@ -26,6 +23,21 @@ targets = ["aarch64-apple-darwin"]
 coremlit.workspace = true
 thiserror.workspace = true
 
+# INTERIM (controller decision, Task B3): default-features stays ON here
+# (pulling in asry's `runner` default, i.e. `whispercpp`) rather than the
+# plan's original `default-features = false, features = ["emissions"]`.
+# The latter fails to compile today: `asry/src/types/lang.rs` does
+# `pub use whispercpp::Lang;` with no `#[cfg(feature = "runner")]` guard,
+# so ANY asry feature selection that omits `runner` breaks at asry's own
+# crate root regardless of what alignkit requests. Revert to
+# `default-features = false, features = ["emissions"]` once an upstream
+# fix (e.g. `fix/core-lang-decouple` or an equivalent gating fix on
+# `asry::types::lang`) lands. `features = ["emissions"]` itself lives on
+# asry's `feat/emissions-seam` branch, not yet on `main`; this path
+# resolves against that branch via a workspace-relative symlink in the
+# dev worktree layout (see the Task B3 report for the exact mechanism).
+asry = { path = "../../../asry", features = ["emissions"] }
+
 serde = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 
@@ -36,6 +48,7 @@ tracing = ["dep:tracing"]
 
 [dev-dependencies]
 hound.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 tokenizers.workspace = true
 
