@@ -50,6 +50,19 @@ pub enum InferError {
     /// Elements the model requires.
     expected: usize,
   },
+  /// A predict-time output tensor's shape diverged from the contract
+  /// validated at construction. `coremlit::MultiArray::copy_into` alone
+  /// only validates total element count, so an axes-swapped output (e.g.
+  /// `[1, classes, frames]` instead of `[1, frames, classes]`) can carry
+  /// the same element count as the expected shape and would otherwise pass
+  /// silently, transposing two axes instead of erroring.
+  #[error("output shape mismatch: expected {expected:?}, got {got:?}")]
+  OutputShape {
+    /// Shape the runtime tensor actually had.
+    got: Vec<usize>,
+    /// Shape the construction-time contract declares.
+    expected: Vec<usize>,
+  },
 }
 
 /// Top-level extraction failure, composing model-lifecycle and inference
