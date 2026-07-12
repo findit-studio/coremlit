@@ -42,6 +42,17 @@ rubato.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tempfile.workspace = true
 
+# `test = true` compiles this example under the normal libtest harness too
+# (in addition to its ordinary `cargo build --examples`/`cargo run`
+# build), so `cargo test` also runs its inline `#[cfg(test)]` hermetic
+# `BoundedAudioQueue` tests. `main` is unaffected: under `--test`
+# compilation the harness supplies its own entry point, so `main` is
+# compiled (and therefore still type-checked) but never executed —
+# `cargo test` never opens a microphone.
+[[example]]
+name = "mic_stream"
+test = true
+
 [[bench]]
 name = "stages"
 harness = false
