@@ -1,13 +1,15 @@
+use std::path::PathBuf;
+
 use super::*;
 
 fn tiny() -> WhisperTokenizer {
   let root = std::env::var_os("WHISPERKIT_TEST_MODELS").map_or_else(
     || {
-      std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+      PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("Models")
     },
-    std::path::PathBuf::from,
+    PathBuf::from,
   );
   WhisperTokenizer::from_folder(root.join("tokenizers/whisper-tiny")).unwrap()
 }
@@ -68,7 +70,7 @@ fn from_folder_missing_file_reports_searched_path() {
   // Hermetic: `src/` always exists (it's this crate's own source root) but
   // never contains a `tokenizer.json`, so this needs no tokenizer fixture
   // and no filesystem mutation/cleanup.
-  let folder = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
+  let folder = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
   let err = WhisperTokenizer::from_folder(&folder).unwrap_err();
   match err {
     TokenizerError::FileNotFound { searched } => {

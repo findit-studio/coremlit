@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::{path::PathBuf, sync::Mutex};
 
 use super::*;
 use crate::{
@@ -223,11 +223,11 @@ fn stream_options_partial_config_falls_back_to_defaults() {
 fn tiny_tokenizer() -> WhisperTokenizer {
   let root = std::env::var_os("WHISPERKIT_TEST_MODELS").map_or_else(
     || {
-      std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+      PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("Models")
     },
-    std::path::PathBuf::from,
+    PathBuf::from,
   );
   WhisperTokenizer::from_folder(root.join("tokenizers/whisper-tiny")).unwrap()
 }
