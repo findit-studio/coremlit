@@ -56,6 +56,35 @@ fn infer_error_input_length_displays_got_and_expected() {
 }
 
 #[test]
+fn infer_error_output_shape_displays_got_and_expected() {
+  // Missing pin (T2 review-queue item): every other variant has a Display
+  // test, but `OutputShape` (added in fix round 1, commit fcbce74) never
+  // got one.
+  let e = InferError::OutputShape {
+    got: vec![1, 7, 589],
+    expected: vec![1, 589, 7],
+  };
+  let rendered = e.to_string();
+  assert!(rendered.contains("[1, 7, 589]"));
+  assert!(rendered.contains("[1, 589, 7]"));
+}
+
+#[test]
+fn infer_error_non_finite_input_displays_index() {
+  let e = InferError::NonFiniteInput { index: 7 };
+  assert_eq!(
+    e.to_string(),
+    "input contains a non-finite value at index 7"
+  );
+}
+
+#[test]
+fn infer_error_empty_mask_displays_message() {
+  let e = InferError::EmptyMask;
+  assert_eq!(e.to_string(), "mask has no active (true) frame");
+}
+
+#[test]
 fn extract_error_composes_model_arm() {
   let model_err: ModelError = coremlit::LoadError::NotFound {
     path: "seg.mlmodelc".into(),

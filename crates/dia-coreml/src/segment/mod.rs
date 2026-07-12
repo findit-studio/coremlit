@@ -39,9 +39,11 @@
 //!   (already-present) output scan whenever it propagates to a non-finite
 //!   logit — the typical IEEE-arithmetic outcome, but not a guarantee
 //!   (a kernel could in principle absorb it into finite garbage), so this
-//!   is a KNOWN, documented gap vs dia's earlier, more specific guard;
-//!   adding an input-side variant when `error/mod.rs` is next in scope
-//!   closes it.
+//!   is a KNOWN, documented gap vs dia's earlier, more specific guard.
+//!   The variant now exists (`InferError::NonFiniteInput`, added with the
+//!   embed module, which scans its inputs) but is deliberately NOT yet
+//!   wired into [`SegmentModel::infer`] — closing this gap here is queued
+//!   for the pre-merge review pass.
 //! - **Layout re-validation**: dia's `infer` re-validates its output's
 //!   shape/layout on every call (`model.rs:313-338`) because, per its own
 //!   doc comment, "Load-time dimension verification ... is reserved for a
@@ -156,40 +158,16 @@ fn default_segment_compute() -> ComputeUnits {
   DEFAULT_SEGMENT_COMPUTE
 }
 
-// `coremlit::ComputeUnits` carries no serde impl of its own (coremlit has
-// no serde dependency at all) — bridge it through its existing
-// `as_str`/`FromStr`, the same shape whisperkit's private
-// `options::compute_units_serde` module uses
-// (crates/whisperkit/src/options/mod.rs).
-#[cfg(feature = "serde")]
-mod compute_units_serde {
-  use core::str::FromStr;
-
-  use coremlit::ComputeUnits;
-  use serde::{Deserialize, Deserializer, Serializer};
-
-  pub(super) fn serialize<S: Serializer>(
-    value: &ComputeUnits,
-    serializer: S,
-  ) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(value.as_str())
-  }
-
-  pub(super) fn deserialize<'de, D: Deserializer<'de>>(
-    deserializer: D,
-  ) -> Result<ComputeUnits, D::Error> {
-    let name = String::deserialize(deserializer)?;
-    ComputeUnits::from_str(&name).map_err(serde::de::Error::custom)
-  }
-}
-
 /// Construction options for [`SegmentModel`] (rust-options-pattern).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SegmentModelOptions {
   #[cfg_attr(
     feature = "serde",
-    serde(default = "default_segment_compute", with = "compute_units_serde")
+    serde(
+      default = "default_segment_compute",
+      with = "crate::compute_units_serde"
+    )
   )]
   compute: ComputeUnits,
 }
