@@ -225,6 +225,28 @@ impl SrtWriter {
   }
 }
 
+/// Writes `contents` to `path` atomically: staged into a sibling
+/// temporary file, then renamed over the destination (rename within one
+/// directory is atomic on macOS/POSIX). Ports Swift's
+/// `String.write(..., atomically: true)` — a failed write can therefore
+/// never truncate or half-replace an existing file, and a concurrent
+/// reader sees either the old content or the new, never a partial
+/// (phase-gate finding: `std::fs::write` truncates first).
+fn write_atomic(path: &Path, contents: &str) -> Result<(), WriteError> {
+  let mut tmp = path.as_os_str().to_owned();
+  tmp.push(".tmp");
+  let tmp = PathBuf::from(tmp);
+  let staged = std::fs::write(&tmp, contents).and_then(|()| std::fs::rename(&tmp, path));
+  staged.map_err(|source| {
+    // Best-effort cleanup; the original error is the one worth reporting.
+    let _ = std::fs::remove_file(&tmp);
+    WriteError::Write {
+      path: path.to_path_buf(),
+      source,
+    }
+  })
+}
+
 impl ResultWriter for SrtWriter {
   fn output_dir(&self) -> &Path {
     &self.output_dir
@@ -232,10 +254,7 @@ impl ResultWriter for SrtWriter {
 
   fn write(&self, result: &TranscriptionResult, file_stem: &str) -> Result<PathBuf, WriteError> {
     let path = self.output_dir.join(format!("{file_stem}.srt"));
-    std::fs::write(&path, srt_content(result)).map_err(|source| WriteError::Write {
-      path: path.clone(),
-      source,
-    })?;
+    write_atomic(&path, &srt_content(result))?;
     Ok(path)
   }
 }
@@ -263,10 +282,7 @@ impl ResultWriter for VttWriter {
 
   fn write(&self, result: &TranscriptionResult, file_stem: &str) -> Result<PathBuf, WriteError> {
     let path = self.output_dir.join(format!("{file_stem}.vtt"));
-    std::fs::write(&path, vtt_content(result)).map_err(|source| WriteError::Write {
-      path: path.clone(),
-      source,
-    })?;
+    write_atomic(&path, &vtt_content(result))?;
     Ok(path)
   }
 }
@@ -298,10 +314,7 @@ impl ResultWriter for JsonWriter {
   fn write(&self, result: &TranscriptionResult, file_stem: &str) -> Result<PathBuf, WriteError> {
     let content = json_content(result)?;
     let path = self.output_dir.join(format!("{file_stem}.json"));
-    std::fs::write(&path, content).map_err(|source| WriteError::Write {
-      path: path.clone(),
-      source,
-    })?;
+    write_atomic(&path, &content)?;
     Ok(path)
   }
 }
