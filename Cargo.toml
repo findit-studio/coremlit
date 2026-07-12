@@ -31,6 +31,8 @@ mach2 = "0.4"
 tempfile = "3"
 rand = "0.9"
 hound = "3.5"
+cpal = "0.16"
+rubato = "0.16"
 
 [workspace.lints.rust]
 missing_docs = "deny"
