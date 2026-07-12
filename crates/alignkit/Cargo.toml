@@ -47,6 +47,15 @@ serde = ["dep:serde"]
 tracing = ["dep:tracing"]
 
 [dev-dependencies]
+# Adds asry's `parity-dump-emission` feature (which implies `alignment`:
+# ort + whisper.cpp + the ONNX wav2vec2 path) ON TOP OF the `emissions`
+# feature already requested above, but ONLY for test/bench/example
+# builds — the published lib (`[dependencies]` above) never links `ort`
+# or `whispercpp`. `tests/parity_emissions.rs` (Gate 1) uses the
+# resulting `ASRY_PARITY_DUMP_TRELLIS` diagnostic hook to capture asry's
+# own ONNX emissions as this crate's parity reference; see that file's
+# module doc for the exact mechanism.
+asry = { path = "../../../asry", features = ["parity-dump-emission"] }
 hound.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
