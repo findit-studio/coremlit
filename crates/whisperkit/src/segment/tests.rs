@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use super::*;
 use crate::{
   backend::AlignmentView,
@@ -10,11 +12,11 @@ use crate::{
 fn tiny_tokenizer() -> WhisperTokenizer {
   let root = std::env::var_os("WHISPERKIT_TEST_MODELS").map_or_else(
     || {
-      std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+      PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("Models")
     },
-    std::path::PathBuf::from,
+    PathBuf::from,
   );
   WhisperTokenizer::from_folder(root.join("tokenizers/whisper-tiny")).unwrap()
 }
