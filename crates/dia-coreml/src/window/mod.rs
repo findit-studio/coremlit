@@ -212,6 +212,49 @@
 //! multi-gigabyte adversarial inputs via its `ops::spill` subsystem,
 //! which this crate does not depend on; out of scope for porting the
 //! numeric ALGORITHM itself, which is this task's explicit focus.
+//!
+//! Additionally guarded: the output-frame-count computation itself
+//! (`last_chunk_end / frame_step`, rounded and cast to `usize`) is
+//! checked for overflow rather than left to saturate — see
+//! `try_num_output_frames`'s own doc (private to this module) for the
+//! exact bound, ported from dia's `ShapeError::OutputFrameCountOverflow`
+//! guard (`count.rs:504-509, 522-533`).
+//!
+//! ## Downstream re-validation: what dia actually re-checks
+//!
+//! This function's output — the `count` tensor, plus
+//! [`chunk_sliding_window`]/[`frame_sliding_window`]'s `SlidingWindow`
+//! values — ultimately feeds dia's `offline::OfflineInput::new`. That
+//! constructor (`diarization/src/offline/algo.rs:216-248`) is a bare
+//! `pub const fn` performing ONLY field assignment: it validates
+//! NOTHING. The real re-validation happens one call further in, inside
+//! `offline::diarize_offline` itself (`diarization/src/offline/algo.rs:
+//! 494-596`): it re-checks `num_chunks`/`num_frames_per_chunk`/
+//! `num_speakers` are non-zero, re-checks the `raw_embeddings`/
+//! `segmentations` length products (overflow-checked), and re-checks
+//! `count.len() == num_output_frames` plus a `MAX_COUNT_PER_FRAME` cap —
+//! mirroring `reconstruct`'s own boundary checks so a malformed `count`
+//! tensor fails before the expensive AHC/VBx/PLDA stages run rather than
+//! after. `reconstruct::reconstruct`
+//! (`diarization/src/reconstruct/algo.rs:400-406`) separately re-checks
+//! `chunks_sw`/`frames_sw` finiteness AND positivity (`w.duration`/
+//! `step`/`start` `.is_finite()`, `w.duration`/`step` `> 0.0`).
+//!
+//! **`onset` is the one exception — nothing downstream re-checks it.**
+//! dia's `OfflineInput` doesn't even carry an `onset` field: by the time
+//! execution reaches `OfflineInput::new`, onset's effect is already
+//! pre-baked into the caller-supplied `segmentations` (hard-zeroed
+//! column-wise against `>= onset`, `diarization/src/offline/owned.rs:
+//! 544-570`) and `count` (thresholded internally by `try_count_pyannote`,
+//! `count.rs:715`) tensors. dia validates the raw `onset` scalar exactly
+//! ONCE, upstream of all of this, at `OwnedPipelineOptions::with_onset`
+//! (builder-time panic, `owned.rs:222-235`) and
+//! `OwnedDiarizationPipeline::run`'s own defense-in-depth re-check
+//! (`owned.rs:388-392`) — never again after that. So in THIS crate's
+//! port, [`count_from_segmentations`]'s own `onset.is_finite()` assert is
+//! LOAD-BEARING, not redundant defense-in-depth: no function in dia's
+//! pipeline, or this crate's, would ever catch a non-finite `onset`
+//! otherwise.
 
 use crate::segment::SEG_CHUNK_SAMPLES;
 
@@ -555,6 +598,78 @@ pub fn frame_sliding_window() -> SlidingWindow {
   SlidingWindow::new(0.0, FRAME_DURATION_S, FRAME_STEP_S)
 }
 
+/// Internal failure for [`try_num_output_frames`]'s guard. Not part of
+/// this crate's public error taxonomy (`crate::error::{ModelError,
+/// InferError, ExtractError}`, design spec §5) — [`count_from_segmentations`]'s
+/// established public contract stays `Result`-free (module doc, "Who
+/// validates dims"), so this type exists purely to make the overflow
+/// guard's control flow, and this module's regression tests, typed
+/// rather than an unguarded arithmetic op. A future `Extractor` (Task 5)
+/// decides how, or whether, to surface this failure to its own
+/// `ExtractError`-returning callers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum WindowError {
+  /// `num_output_frames` would not fit in `usize` — see
+  /// [`try_num_output_frames`]'s own doc for the exact bound. Message
+  /// text matches dia's own `ShapeError::OutputFrameCountOverflow`
+  /// (`diarization/src/aggregate/count.rs:114-117`).
+  #[error(
+    "num_output_frames overflows usize (chunk_duration / frame_step too large \
+     to represent or saturated past usize::MAX)"
+  )]
+  OutputFrameCountOverflow,
+}
+
+/// Guarded computation of [`count_from_segmentations`]'s
+/// `num_output_frames`. Ports dia's `try_num_output_frames_pyannote`'s
+/// overflow check (`diarization/src/aggregate/count.rs:510-547`)
+/// bit-for-bit, scoped to the two inputs this function's one call site
+/// has already validated (`last_chunk_end`, `frame_step`) — dia's own
+/// `num_chunks == 0` / `frame_step` finiteness-and-positivity re-checks
+/// (`count.rs:516-521`) are not repeated here because
+/// [`count_from_segmentations`] already asserts both before computing
+/// `last_chunk_end` (unreachable at this call site). This helper's whole
+/// job is the ONE check dia has that this crate's port was missing: the
+/// division/rounding/cast sequence itself.
+///
+/// dia's exact bound (`count.rs:522-533`):
+/// ```text
+/// let frames_f = (last_chunk_end / frame_step).round_ties_even();
+/// if !frames_f.is_finite() || frames_f < 0.0 || frames_f >= usize::MAX as f64 {
+///     return Err(ShapeError::OutputFrameCountOverflow);
+/// }
+/// let n = (frames_f as usize).checked_add(1).ok_or(ShapeError::OutputFrameCountOverflow)?;
+/// ```
+///
+/// Two adversarial-but-finite geometries this guards against (both
+/// reachable through the public, unchecked [`SlidingWindow::new`]):
+/// `chunk_duration = 1e300, frame_step = 1e-300` divides straight to
+/// `+inf` (caught by `!frames_f.is_finite()`); `chunk_duration = 1e20,
+/// frame_step = 1.0` divides to a large but FINITE value that would
+/// still saturate `as usize` to a value near `usize::MAX` (caught by
+/// `frames_f >= usize::MAX as f64` — dia's own comment notes `usize::MAX
+/// as f64` rounds UP to exactly `2.0f64.powi(64)`, so this comparison
+/// stays monotonic). The trailing `checked_add(1)` is defense-in-depth
+/// for the residual case where `frames_f` is finite and just under that
+/// threshold, yet still casts to a `usize` within 1 of `usize::MAX`
+/// (`f64`'s ~53-bit mantissa has no integer resolution at this
+/// magnitude, so "just under the threshold" can still land exactly on
+/// `usize::MAX` after the cast).
+///
+/// # Errors
+/// [`WindowError::OutputFrameCountOverflow`] if `(last_chunk_end /
+/// frame_step).round_ties_even()` is non-finite, negative, `>=
+/// usize::MAX as f64`, or whose `+ 1` would overflow `usize`.
+fn try_num_output_frames(last_chunk_end: f64, frame_step: f64) -> Result<usize, WindowError> {
+  let frames_f = (last_chunk_end / frame_step).round_ties_even();
+  if !frames_f.is_finite() || frames_f < 0.0 || frames_f >= usize::MAX as f64 {
+    return Err(WindowError::OutputFrameCountOverflow);
+  }
+  (frames_f as usize)
+    .checked_add(1)
+    .ok_or(WindowError::OutputFrameCountOverflow)
+}
+
 /// dia's `count_pyannote` (`diarization/src/aggregate/count.rs:
 /// 579-807`) ported to a plain, `Vec`-based, `Result`-free function —
 /// see the module doc's "`count_from_segmentations`: the hairiest
@@ -568,7 +683,9 @@ pub fn frame_sliding_window() -> SlidingWindow {
 /// `chunks_sw`/`frames_sw`'s duration or step is non-positive or
 /// non-finite, if `onset` is non-finite, if `segmentations.len() !=
 /// num_chunks * num_frames_per_chunk * num_speakers` (or that product
-/// overflows `usize`), or if any `segmentations` value is NaN/infinite.
+/// overflows `usize`), if any `segmentations` value is NaN/infinite, or
+/// if the derived `num_output_frames` would not fit in `usize` (see
+/// `try_num_output_frames`, private to this module).
 pub fn count_from_segmentations(
   segmentations: &[f64],
   num_chunks: usize,
@@ -640,7 +757,8 @@ pub fn count_from_segmentations(
 
   // ── 2. Output-frame count — count.rs:486-547 ─────────────────────
   let last_chunk_end = chunk_duration + (num_chunks - 1) as f64 * chunk_step;
-  let num_output_frames = (last_chunk_end / frame_step).round_ties_even() as usize + 1;
+  let num_output_frames =
+    try_num_output_frames(last_chunk_end, frame_step).expect("num_output_frames must fit in usize");
 
   // ── 3. Aggregate: uniform-weight sum + covering-chunk count ──────
   // count.rs:762-777.

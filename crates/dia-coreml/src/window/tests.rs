@@ -403,6 +403,141 @@ fn count_from_segmentations_matches_dia_oracle_3_chunk_overlap() {
 }
 
 // ---------------------------------------------------------------------
+// count_from_segmentations: dia oracle cross-check at this crate's
+// DEFAULT production geometry (~10x nominal simultaneous overlap —
+// CHUNK_DURATION_S / step_s = 10.0 / 1.0 = 10 — vs. the 2x-overlap
+// fixture above)
+// ---------------------------------------------------------------------
+
+// Only consumed by the `dia`-gated oracle test below (unlike
+// `three_chunk_overlap_segmentations` above, there is no non-`dia`
+// hermetic test at this data volume — see that test's own doc for why),
+// so this whole fixture is `dia`-gated too; otherwise it's unused
+// (dead code) under the default/non-`dia` feature set.
+#[cfg(feature = "dia")]
+const DEFAULT_10X_NUM_CHUNKS: usize = 15;
+/// dia's real `FRAMES_PER_WINDOW` (`diarization/src/segment/options.rs:
+/// 21`) — the actual pyannote segmentation model's per-chunk frame
+/// count (also this crate's own introspected model contract, the
+/// `crate::segment` module doc's `[1, 589, 7]`). A smaller synthetic
+/// frame count would NOT exercise genuine 10x overlap: consecutive
+/// chunks' `start_frame(c) = round_ties_even(c * chunk_step /
+/// frame_step)` values are ~59.26 frames apart (`1.0 / 0.016875`), so a
+/// chunk's own frame span must be close to this real value for ~10
+/// consecutive chunks' windows to overlap a common output frame at all.
+#[cfg(feature = "dia")]
+const DEFAULT_10X_NUM_FRAMES_PER_CHUNK: usize = 589;
+#[cfg(feature = "dia")]
+const DEFAULT_10X_NUM_SPEAKERS: usize = 2;
+
+/// Synthetic segmentations at this crate's DEFAULT production geometry
+/// (`chunk_sliding_window(&WindowOptions::new())` = `(0.0, 10.0, 1.0)`,
+/// `frame_sliding_window()` = `(0.0, 0.0619375, 0.016875)`).
+///
+/// Base values follow `((c * 37 + f * 17 + s * 11) % 10) as f64 / 10.0`
+/// — deterministic, spans `{0.0, 0.1, ..., 0.9}`, crossing `onset =
+/// 0.5` in both directions broadly across the whole tensor (including
+/// exact `0.5` hits from the formula itself, at cells where `(c * 37 +
+/// f * 17 + s * 11) % 10 == 5`).
+///
+/// Ten cells are then deliberately overridden to force output frame `t
+/// = 711` onto an EXACT `round_ties_even` rounding TIE at full 10x
+/// overlap — a structurally different tie than the 2x-overlap fixture
+/// above (that one ties at divisor 2; a divisor-10 tie is only possible
+/// where the covering-chunk count is EVEN, and only exists at all in
+/// the interior of a long-enough recording). Exact arithmetic
+/// (`start_frame(c) = round_ties_even(c * 1.0 / 0.016875)` for `c` in
+/// `0..15`, verified independently — via a standalone script mirroring
+/// this exact formula — before writing this fixture, see the task
+/// report): output frame `t = 711` is covered by EXACTLY chunks `[3, 4,
+/// 5, 6, 7, 8, 9, 10, 11, 12]` (10 consecutive chunks — a covering
+/// range is always contiguous, since `start_frame` is monotonic in
+/// `c`), at local frame offsets `t - start_frame(c)`:
+///
+/// | c        | 3   | 4   | 5   | 6   | 7   | 8   | 9   | 10  | 11 | 12 |
+/// |----------|-----|-----|-----|-----|-----|-----|-----|-----|----|----|
+/// | local_f  | 533 | 474 | 415 | 355 | 296 | 237 | 178 | 118 | 59 | 0  |
+///
+/// Chunks `3..=7` get speaker 0 forced ACTIVE (`1.0`) at their local
+/// frame (speaker 1 forced `0.0`) — `chunk_count = 1` each. Chunks
+/// `8..=12` get BOTH speakers forced `0.0` — `chunk_count = 0` each.
+/// `aggregated[711] = 5 * 1 + 5 * 0 = 5`, `overlapping_count[711] =
+/// 10`, ratio `0.5` exactly — `round_ties_even` rounds to the nearest
+/// EVEN integer, `0`.
+#[cfg(feature = "dia")]
+fn default_geometry_10x_overlap_segmentations() -> Vec<f64> {
+  let mut segs =
+    vec![
+      0.0_f64;
+      DEFAULT_10X_NUM_CHUNKS * DEFAULT_10X_NUM_FRAMES_PER_CHUNK * DEFAULT_10X_NUM_SPEAKERS
+    ];
+  for c in 0..DEFAULT_10X_NUM_CHUNKS {
+    for f in 0..DEFAULT_10X_NUM_FRAMES_PER_CHUNK {
+      for s in 0..DEFAULT_10X_NUM_SPEAKERS {
+        let idx = (c * DEFAULT_10X_NUM_FRAMES_PER_CHUNK + f) * DEFAULT_10X_NUM_SPEAKERS + s;
+        segs[idx] = ((c * 37 + f * 17 + s * 11) % 10) as f64 / 10.0;
+      }
+    }
+  }
+
+  let overrides: [(usize, usize, bool); 10] = [
+    (3, 533, true),
+    (4, 474, true),
+    (5, 415, true),
+    (6, 355, true),
+    (7, 296, true),
+    (8, 237, false),
+    (9, 178, false),
+    (10, 118, false),
+    (11, 59, false),
+    (12, 0, false),
+  ];
+  for (c, f, active) in overrides {
+    let base = (c * DEFAULT_10X_NUM_FRAMES_PER_CHUNK + f) * DEFAULT_10X_NUM_SPEAKERS;
+    segs[base] = if active { 1.0 } else { 0.0 }; // speaker 0
+    segs[base + 1] = 0.0; // speaker 1: always inactive at these cells
+  }
+
+  segs
+}
+
+#[cfg(feature = "dia")]
+#[test]
+fn count_from_segmentations_matches_dia_oracle_default_geometry_10x_overlap() {
+  let segmentations = default_geometry_10x_overlap_segmentations();
+  let chunks_sw = chunk_sliding_window(&WindowOptions::new());
+  let frames_sw = frame_sliding_window();
+
+  let ours = count_from_segmentations(
+    &segmentations,
+    DEFAULT_10X_NUM_CHUNKS,
+    DEFAULT_10X_NUM_FRAMES_PER_CHUNK,
+    DEFAULT_10X_NUM_SPEAKERS,
+    0.5,
+    chunks_sw,
+    frames_sw,
+  );
+
+  let golden = dia::aggregate::try_count_pyannote(
+    &segmentations,
+    DEFAULT_10X_NUM_CHUNKS,
+    DEFAULT_10X_NUM_FRAMES_PER_CHUNK,
+    DEFAULT_10X_NUM_SPEAKERS,
+    0.5_f64,
+    chunks_sw.into(),
+    frames_sw.into(),
+    &dia::spill::SpillOptions::default(),
+  )
+  .expect("dia try_count_pyannote on default-geometry 10x-overlap synthetic fixture");
+
+  assert_eq!(ours.as_slice(), golden.count_slice());
+  // Pin the deliberately engineered round_ties_even tie directly too —
+  // makes the construction's intent independently checkable, not just
+  // implied by the oracle match.
+  assert_eq!(ours[711], 0);
+}
+
+// ---------------------------------------------------------------------
 // count_from_segmentations: precondition panics ("Who validates dims")
 // ---------------------------------------------------------------------
 
@@ -554,4 +689,65 @@ fn count_from_segmentations_panics_on_non_finite_segmentation_value() {
     SlidingWindow::new(0.0, 10.0, 1.0),
     frame_sliding_window(),
   );
+}
+
+// ---------------------------------------------------------------------
+// try_num_output_frames / count_from_segmentations: output-frame-count
+// overflow guard (review finding: adversarial-but-finite SlidingWindow
+// values — both individually positive and finite, so no OTHER
+// precondition assert above rejects them — previously drove
+// `num_output_frames`'s division/round/cast/+1 sequence to a debug
+// "attempt to add with overflow" panic, or a silent release wrap to 0,
+// instead of a typed/diagnosable failure. See `try_num_output_frames`'s
+// own doc for dia's cited guard this ports.)
+// ---------------------------------------------------------------------
+
+#[test]
+fn try_num_output_frames_accepts_valid_geometry() {
+  // Same last_chunk_end/frame_step as the hand-computed 3-chunk-overlap
+  // fixture above: chunk_duration=4.0, chunk_step=2.0, num_chunks=3 ->
+  // last_chunk_end = 4.0 + 2 * 2.0 = 8.0; frame_step=1.0 -> 8.0 + 1 = 9,
+  // matching that fixture's documented num_output_frames = 9.
+  assert_eq!(try_num_output_frames(8.0, 1.0), Ok(9));
+}
+
+#[test]
+fn try_num_output_frames_rejects_infinite_division() {
+  // Reviewer's exact adversarial construction: duration=1e300,
+  // frame_step=1e-300 -> the division overflows f64 directly to +inf
+  // (1e300 / 1e-300 = 1e600, outside f64's finite range). round_ties_even
+  // of +inf is still +inf, caught by the `!frames_f.is_finite()` arm.
+  assert_eq!(
+    try_num_output_frames(1e300, 1e-300),
+    Err(WindowError::OutputFrameCountOverflow)
+  );
+}
+
+#[test]
+fn try_num_output_frames_rejects_finite_but_saturating_division() {
+  // A DIFFERENT adversarial route than the +inf case above: the
+  // division stays FINITE (1e20 is far below f64::MAX ~1.8e308) but
+  // exceeds usize::MAX (~1.8447e19 on 64-bit), so `as usize` would
+  // saturate. Exercises the `frames_f >= usize::MAX as f64` arm
+  // specifically, not the `!frames_f.is_finite()` arm above — dia's own
+  // guard distinguishes the two, so this crate's port must too.
+  assert_eq!(
+    try_num_output_frames(1e20, 1.0),
+    Err(WindowError::OutputFrameCountOverflow)
+  );
+}
+
+#[test]
+#[should_panic(expected = "num_output_frames must fit in usize")]
+fn count_from_segmentations_panics_on_output_frame_count_overflow() {
+  // End-to-end: the same +inf adversarial geometry, reached through the
+  // public function. Both `chunks_sw` and `frames_sw` are constructible
+  // via the public, unchecked `SlidingWindow::new`; no OTHER guard in
+  // this function rejects them (duration/step are each individually
+  // positive and finite — only their COMBINATION overflows
+  // `num_output_frames`).
+  let segs = vec![0.0; 1]; // num_chunks=1, num_frames_per_chunk=1, num_speakers=1
+  let chunks_sw = SlidingWindow::new(0.0, 1e300, 1.0);
+  let frames_sw = SlidingWindow::new(0.0, 0.0619375, 1e-300);
+  let _ = count_from_segmentations(&segs, 1, 1, 1, 0.5, chunks_sw, frames_sw);
 }
