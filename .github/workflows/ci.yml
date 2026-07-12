@@ -36,10 +36,48 @@ jobs:
       - name: Download models (cache miss)
         if: steps.models.outputs.cache-hit != 'true'
         run: |
+          set -euo pipefail
+
+          # MODELS_LOCK is the source of truth for what gets downloaded, not
+          # just a cache-busting key: it has a fixed two-table shape (the
+          # whisperkit-coreml model repo, selector field `include`; then the
+          # tokenizer repo, selector field `files`), each with its own
+          # `revision`. Pull repo/selector/revision out by hand instead of
+          # hardcoding them here, so a MODELS_LOCK edit is what changes what
+          # this job downloads — no TOML crate needed for two fixed tables.
+          lock=MODELS_LOCK
+
+          table_header() { # Nth `["..."]` header line, unquoted.
+            sed -n 's/^\["\(.*\)"\]$/\1/p' "$lock" | sed -n "${1}p"
+          }
+          table_field() { # value of `key = "..."` inside the Nth table.
+            awk -v n="$1" -v key="$2" '
+              /^\[/ { seen++; in_table = (seen == n); next }
+              in_table && $1 == key {
+                line = $0
+                sub(/^[^=]*=[ \t]*"/, "", line)
+                sub(/"[ \t]*$/, "", line)
+                print line
+                exit
+              }
+            ' "$lock"
+          }
+
+          model_repo=$(table_header 1)
+          model_include=$(table_field 1 include)
+          model_revision=$(table_field 1 revision)
+          tokenizer_repo=$(table_header 2)
+          tokenizer_files=$(table_field 2 files)
+          tokenizer_revision=$(table_field 2 revision)
+          read -ra tokenizer_files_arr <<< "$tokenizer_files"
+
+          echo "MODELS_LOCK: model=$model_repo@$model_revision include=$model_include"
+          echo "MODELS_LOCK: tokenizer=$tokenizer_repo@$tokenizer_revision files=$tokenizer_files"
+
           pipx install "huggingface_hub[cli]"
-          hf download argmaxinc/whisperkit-coreml --include "openai_whisper-tiny/*" \
+          hf download "$model_repo" --include "$model_include" --revision "$model_revision" \
             --local-dir Models/whisperkit-coreml
-          hf download openai/whisper-tiny tokenizer.json tokenizer_config.json config.json \
+          hf download "$tokenizer_repo" "${tokenizer_files_arr[@]}" --revision "$tokenizer_revision" \
             --local-dir Models/tokenizers/whisper-tiny
       - run: cargo test -p coremlit -- --ignored
       - run: cargo test -p whisperkit -- --ignored
