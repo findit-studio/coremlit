@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/coremlit", "crates/whisperkit", "crates/speakerkit"]
+members = ["crates/alignkit", "crates/coremlit", "crates/whisperkit", "crates/speakerkit"]
 
 [workspace.package]
 version = "0.1.0"
@@ -38,10 +38,10 @@ mach2 = "0.4"
 tempfile = "3"
 rand = "0.9"
 hound = "3.5"
+sha2 = "0.11"
 cpal = "0.16"
 rubato = "0.16"
 criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
-sha2 = "0.10"
 
 # CO-DEV RECIPE (do NOT commit the patch itself): speakerkit's optional `dia`
 # dependency is pinned to the diarization repo by exact git rev

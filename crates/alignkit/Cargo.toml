@@ -1,0 +1,42 @@
+[package]
+name = "alignkit"
+description = "CoreML wav2vec2 forced word-level alignment"
+version.workspace = true
+edition.workspace = true
+# Unpublishable: this task lands only the crate skeleton, model
+# ground-truth, and the emission-representation decision — no alignment
+# algorithm yet. The eventual `asry` dependency (`features = ["emissions"]`,
+# design spec §6/§8) is deferred past this task (see src/error/mod.rs's
+# module doc) and asry's `emissions` feature isn't published either; flip
+# once both land.
+publish = false
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["alignment", "forced-alignment", "wav2vec2", "coreml", "speech"]
+categories = ["multimedia::audio", "os::macos-apis", "science"]
+
+[package.metadata.docs.rs]
+all-features = true
+default-target = "aarch64-apple-darwin"
+targets = ["aarch64-apple-darwin"]
+
+[dependencies]
+coremlit.workspace = true
+thiserror.workspace = true
+
+serde = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]
+tracing = ["dep:tracing"]
+
+[dev-dependencies]
+hound.workspace = true
+sha2.workspace = true
+
+[lints]
+workspace = true
