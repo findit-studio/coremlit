@@ -320,9 +320,7 @@ fn frame_sliding_window_matches_dia_constants() {
 /// 1.5`) and `t=3` (`1/2 = 0.5`) both exercise round_ties_even's
 /// banker's-rounding tie rule (1.5 -> 2, the nearest EVEN integer; 0.5
 /// -> 0, likewise nearest even) — not "round half up", which would give
-/// `[1, 2, 2, 1, 1, 2, 1, 0, 0]` instead (see the mutation-testing
-/// evidence in the task report for a rounding-rule regression this
-/// exact case catches).
+/// `[1, 2, 2, 1, 1, 2, 1, 0, 0]` instead.
 fn three_chunk_overlap_segmentations() -> Vec<f64> {
   #[rustfmt::skip]
   let segs = vec![
@@ -447,9 +445,7 @@ const DEFAULT_10X_NUM_SPEAKERS: usize = 2;
 /// where the covering-chunk count is EVEN, and only exists at all in
 /// the interior of a long-enough recording). Exact arithmetic
 /// (`start_frame(c) = round_ties_even(c * 1.0 / 0.016875)` for `c` in
-/// `0..15`, verified independently — via a standalone script mirroring
-/// this exact formula — before writing this fixture, see the task
-/// report): output frame `t = 711` is covered by EXACTLY chunks `[3, 4,
+/// `0..15`): output frame `t = 711` is covered by EXACTLY chunks `[3, 4,
 /// 5, 6, 7, 8, 9, 10, 11, 12]` (10 consecutive chunks — a covering
 /// range is always contiguous, since `start_frame` is monotonic in
 /// `c`), at local frame offsets `t - start_frame(c)`:

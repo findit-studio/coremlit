@@ -89,8 +89,12 @@ pub enum InferError {
 }
 
 /// Top-level extraction failure, composing model-lifecycle and inference
-/// errors (spec §5).
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+/// errors (spec §5) plus [`crate::extract::Extractor::extract`]'s own
+/// input-validation and geometry guards.
+// No `Eq`: `OnsetOutOfRange` carries an `f32` payload, and `f32` is not
+// `Eq` (mirrors dia's own `ShapeError::OnsetOutOfRange { onset: f32 }`,
+// `diarization/src/offline/algo.rs:90-97`, which is likewise not `Eq`).
+#[derive(Debug, Clone, PartialEq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ExtractError {
   /// A model failed to load, or its contract mismatched.
@@ -99,6 +103,83 @@ pub enum ExtractError {
   /// An inference call failed.
   #[error("infer error: {0}")]
   Infer(#[from] InferError),
+  /// The caller passed an empty `samples` slice. Mirrors dia's own
+  /// first-line guard, `ShapeError::EmptySamples`
+  /// (`diarization/src/offline/owned.rs:369-371`): with no audio there is
+  /// no chunk grid to build.
+  #[error("samples is empty")]
+  EmptySamples,
+  /// The configured `step_samples` is `0`. Mirrors dia's
+  /// `ShapeError::ZeroStepSamples`
+  /// (`diarization/src/offline/owned.rs:374-376`): a zero step would hang
+  /// the chunk planner's `div_ceil`. [`crate::window::WindowOptions`]'s
+  /// own builders already reject this, so reaching it means a
+  /// serde-deserialized config bypassed the builder — defense-in-depth,
+  /// exactly as dia re-checks it here despite `with_step_samples`'s panic.
+  #[error("step_samples must be > 0")]
+  ZeroStepSamples,
+  /// The configured `step_samples` exceeds [`crate::segment::SEG_CHUNK_SAMPLES`].
+  /// Mirrors dia's `ShapeError::StepSamplesExceedsWindow`
+  /// (`diarization/src/offline/owned.rs:377-387`, whose own comment gives
+  /// the serde-bypass defense-in-depth rationale): with `step > window`,
+  /// samples in `[window .. step)` per chunk are never segmented or
+  /// embedded — silent data loss returning `Ok(_)` with missing speech.
+  #[error("step_samples ({step}) must not exceed SEG_CHUNK_SAMPLES ({window})")]
+  StepSamplesExceedsWindow {
+    /// The rejected `step_samples`.
+    step: u32,
+    /// The chunk window length ([`crate::segment::SEG_CHUNK_SAMPLES`]).
+    window: usize,
+  },
+  /// The configured `onset` is not finite in `(0.0, 1.0]`. Mirrors dia's
+  /// `ShapeError::OnsetOutOfRange`
+  /// (`diarization/src/offline/owned.rs:388-393`) and
+  /// [`crate::window`]'s `check_onset` `(0.0, 1.0]` contract: the hard
+  /// segmentation mask `seg >= onset` degenerates — `> 1.0`/NaN makes
+  /// every frame inactive (empty diarization), `<= 0.0` makes every zero
+  /// cell active (corrupted masks/counts).
+  #[error("onset ({onset}) must be finite in (0.0, 1.0]")]
+  OnsetOutOfRange {
+    /// The rejected `onset`.
+    onset: f32,
+  },
+  /// The segmentation model's per-chunk frame count disagrees with the
+  /// embedding model's mask frame count. This guard has NO dia analog and
+  /// cannot: dia shares one `FRAMES_PER_WINDOW` const across both stages
+  /// (`diarization/src/offline/owned.rs:479,540`), so its two stages are
+  /// frame-aligned by construction. This crate's two models declare their
+  /// frame counts independently at load
+  /// ([`crate::segment::SegmentModel::num_frames`],
+  /// [`crate::embed::EmbedModel::num_mask_frames`]); a mismatch would
+  /// silently repeat-pad time-misaligned masks (`embed_chunk` pads each
+  /// mask to its OWN frame count), so it is rejected up front instead.
+  #[error(
+    "segmenter frame count ({segmenter}) does not match embedder mask frame count ({embedder})"
+  )]
+  FrameCountMismatch {
+    /// The segmentation model's per-chunk frame count.
+    segmenter: usize,
+    /// The embedding model's mask frame count.
+    embedder: usize,
+  },
+  /// The derived `num_output_frames` would not fit in `usize`. Converted
+  /// from [`crate::window`]'s crate-private `WindowError` by an exhaustive
+  /// manual match in [`crate::extract::Extractor::extract`] (deliberately
+  /// NOT a `From` impl — a `From` would put a crate-private type into a
+  /// public trait impl and add a second conversion surface for a single
+  /// call site; the exhaustive match forces revisiting this if
+  /// `WindowError` ever grows variants). Unreachable through `extract`'s
+  /// own geometry (`num_chunks * step_samples ≈ samples.len() <=
+  /// isize::MAX/4`, so `num_output_frames` stays far below `usize::MAX`),
+  /// but kept typed per this crate's no-panic-on-untrusted-config posture.
+  /// Message text mirrors `WindowError::OutputFrameCountOverflow`'s
+  /// display and dia's `ShapeError::OutputFrameCountOverflow`
+  /// (`diarization/src/aggregate/count.rs:114-117`).
+  #[error(
+    "num_output_frames overflows usize (chunk_duration / frame_step too large \
+     to represent or saturated past usize::MAX)"
+  )]
+  OutputFrameCountOverflow,
 }
 
 #[cfg(test)]

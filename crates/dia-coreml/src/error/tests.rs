@@ -104,3 +104,52 @@ fn extract_error_composes_infer_arm() {
   let e: ExtractError = infer_err.into();
   assert!(matches!(e, ExtractError::Infer(InferError::Tensor(_))));
 }
+
+#[test]
+fn extract_error_empty_samples_displays_message() {
+  assert_eq!(ExtractError::EmptySamples.to_string(), "samples is empty");
+}
+
+#[test]
+fn extract_error_zero_step_samples_displays_message() {
+  assert_eq!(
+    ExtractError::ZeroStepSamples.to_string(),
+    "step_samples must be > 0"
+  );
+}
+
+#[test]
+fn extract_error_step_samples_exceeds_window_displays_both() {
+  let e = ExtractError::StepSamplesExceedsWindow {
+    step: 200_000,
+    window: 160_000,
+  };
+  let rendered = e.to_string();
+  assert!(rendered.contains("200000"));
+  assert!(rendered.contains("160000"));
+}
+
+#[test]
+fn extract_error_onset_out_of_range_displays_value() {
+  let e = ExtractError::OnsetOutOfRange { onset: 1.5 };
+  let rendered = e.to_string();
+  assert!(rendered.contains("1.5"));
+  assert!(rendered.contains("(0.0, 1.0]"));
+}
+
+#[test]
+fn extract_error_frame_count_mismatch_displays_both() {
+  let e = ExtractError::FrameCountMismatch {
+    segmenter: 589,
+    embedder: 588,
+  };
+  let rendered = e.to_string();
+  assert!(rendered.contains("589"));
+  assert!(rendered.contains("588"));
+}
+
+#[test]
+fn extract_error_output_frame_count_overflow_displays_message() {
+  let rendered = ExtractError::OutputFrameCountOverflow.to_string();
+  assert!(rendered.contains("num_output_frames overflows usize"));
+}
