@@ -47,12 +47,16 @@
 //!   future revision once a stable ort metadata API is available"
 //!   (`model.rs:134-138`). `coremlit::Model::description()` already IS
 //!   that stable metadata API, so [`SegmentModel::from_file_with`]
-//!   validates shape/dtype once at construction
-//!   (`ModelError::ContractMismatch`) instead of on every `infer` call —
-//!   a deliberate, documented improvement dia's own comment anticipates,
-//!   not an unexamined divergence. (`infer` retains a `debug_assert` that
-//!   the predict-time tensor matches the declared shape, exercised by the
-//!   model-gated tests, which run under the debug profile.)
+//!   validates the declared contract (presence, dtype, base shape) once
+//!   at construction (`ModelError::ContractMismatch`) instead of
+//!   re-deriving it from scratch on every call — a deliberate, documented
+//!   improvement dia's own comment anticipates. A stable *declared*
+//!   contract at load time is not, however, a guarantee that every
+//!   individual CoreML prediction actually returns output matching it —
+//!   the runtime is a trust boundary independent of whether its metadata
+//!   API is introspectable — so [`SegmentModel::infer`] also re-validates
+//!   the predict-time `segments` tensor's shape on every call
+//!   (`InferError::OutputShape`), matching dia's own per-call re-check.
 //! - **dtype**: [`multilabel`] returns `Vec<f64>` because dia's
 //!   `OfflineInput::segmentations` field is `&'a [f64]`
 //!   (`diarization/src/offline/algo.rs:179`); dia itself produces those
@@ -330,6 +334,17 @@ impl SegmentModel {
   /// entirely ([`coremlit::PredictionError::MissingOutput`]; the
   /// construction-time contract pins the *declared* outputs, but the
   /// runtime provider's name set is CoreML's to produce per call).
+  /// [`InferError::OutputShape`] if the predict-time `segments` tensor's
+  /// shape diverges from `[1, num_frames, POWERSET_CLASSES]`. The
+  /// construction-time contract validated once in [`Self::from_file_with`]
+  /// is a claim about the model's declared shape, not a guarantee about
+  /// every individual prediction; the CoreML runtime is a trust boundary
+  /// re-checked here on every call, exactly as dia's `infer` re-validates
+  /// output layout on every call
+  /// (`diarization/src/segment/model.rs:313-338`). This also covers what
+  /// [`coremlit::MultiArray::copy_into`] cannot: it validates only total
+  /// element count, so an axes-swapped runtime output would otherwise be
+  /// silently transposed into `logits` instead of erroring.
   /// [`InferError::NonFiniteOutput`] if any output logit is NaN or
   /// infinite — the exact `ort` CoreML-EP corruption mode (design spec §1)
   /// this crate exists to replace.
@@ -344,15 +359,13 @@ impl SegmentModel {
         .ok_or_else(|| coremlit::PredictionError::MissingOutput {
           name: names::SEGMENTS.to_string(),
         })?;
-    // The compiled model's output is fixed-shape, so the predict-time
-    // tensor must match the construction-time declaration; the model-gated
-    // tests run under `cargo test` (debug), so this is exercised against
-    // the real model.
-    debug_assert_eq!(
-      segments.shape(),
-      [1, self.num_frames, POWERSET_CLASSES],
-      "predict-time `segments` shape diverged from the declared contract"
-    );
+    // The construction-time contract pins the model's DECLARED shape; the
+    // CoreML runtime producing a specific prediction's tensor is a
+    // separate trust boundary, re-checked here on every call exactly as
+    // dia's `infer` re-validates output layout on every call
+    // (`diarization/src/segment/model.rs:313-338`). `copy_into` below only
+    // validates total element count, so this must run first.
+    check_output_shape(segments.shape(), self.num_frames)?;
 
     let mut logits = vec![0.0f32; self.num_frames * POWERSET_CLASSES];
     segments.copy_into::<f32>(&mut logits)?;
@@ -370,6 +383,28 @@ fn check_input_length(got: usize) -> Result<(), InferError> {
     return Err(InferError::InputLength {
       got,
       expected: SEG_CHUNK_SAMPLES,
+    });
+  }
+  Ok(())
+}
+
+/// Validates a predict-time `segments` tensor's shape against the
+/// construction-time contract (`[1, num_frames, POWERSET_CLASSES]`) in
+/// isolation — hermetically testable without a loaded model (`infer`
+/// itself needs `&self`, i.e. a real loaded [`SegmentModel`], to reach the
+/// CoreML call this guards). Catches exactly what
+/// [`coremlit::MultiArray::copy_into`] cannot: it validates only total
+/// element count, so an axes-swapped `[1, POWERSET_CLASSES, num_frames]`
+/// tensor — the same element count as the expected
+/// `[1, num_frames, POWERSET_CLASSES]` — would otherwise pass `copy_into`
+/// silently and transpose frames and classes into `logits`.
+fn check_output_shape(shape: &[usize], num_frames: usize) -> Result<(), InferError> {
+  let shape_ok =
+    shape.len() == 3 && shape[0] == 1 && shape[1] == num_frames && shape[2] == POWERSET_CLASSES;
+  if !shape_ok {
+    return Err(InferError::OutputShape {
+      got: shape.to_vec(),
+      expected: vec![1, num_frames, POWERSET_CLASSES],
     });
   }
   Ok(())

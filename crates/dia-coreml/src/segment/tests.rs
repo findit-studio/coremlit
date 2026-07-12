@@ -134,6 +134,60 @@ fn check_input_length_rejects_long_input() {
 }
 
 #[test]
+fn check_output_shape_accepts_correct_shape() {
+  assert_eq!(check_output_shape(&[1, 589, POWERSET_CLASSES], 589), Ok(()));
+}
+
+/// The exact corruption `check_output_shape` exists to catch: axes swapped
+/// (`[1, POWERSET_CLASSES, num_frames]` instead of `[1, num_frames,
+/// POWERSET_CLASSES]`) carries the identical element count as the correct
+/// shape, so a total-element-count check alone (as `MultiArray::copy_into`
+/// performs) would not detect it.
+#[test]
+fn check_output_shape_rejects_swapped_axes() {
+  assert_eq!(
+    check_output_shape(&[1, POWERSET_CLASSES, 589], 589),
+    Err(InferError::OutputShape {
+      got: vec![1, POWERSET_CLASSES, 589],
+      expected: vec![1, 589, POWERSET_CLASSES],
+    })
+  );
+}
+
+#[test]
+fn check_output_shape_rejects_wrong_rank() {
+  assert_eq!(
+    check_output_shape(&[589, POWERSET_CLASSES], 589),
+    Err(InferError::OutputShape {
+      got: vec![589, POWERSET_CLASSES],
+      expected: vec![1, 589, POWERSET_CLASSES],
+    })
+  );
+}
+
+#[test]
+fn check_output_shape_rejects_wrong_frame_count() {
+  assert_eq!(
+    check_output_shape(&[1, 590, POWERSET_CLASSES], 589),
+    Err(InferError::OutputShape {
+      got: vec![1, 590, POWERSET_CLASSES],
+      expected: vec![1, 589, POWERSET_CLASSES],
+    })
+  );
+}
+
+#[test]
+fn check_output_shape_rejects_wrong_batch_dim() {
+  assert_eq!(
+    check_output_shape(&[2, 589, POWERSET_CLASSES], 589),
+    Err(InferError::OutputShape {
+      got: vec![2, 589, POWERSET_CLASSES],
+      expected: vec![1, 589, POWERSET_CLASSES],
+    })
+  );
+}
+
+#[test]
 fn check_finite_accepts_all_finite() {
   assert_eq!(check_finite(&[0.0, 1.0, -1.0]), Ok(()));
 }
