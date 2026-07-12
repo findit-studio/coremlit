@@ -246,15 +246,19 @@
 //! pre-baked into the caller-supplied `segmentations` (hard-zeroed
 //! column-wise against `>= onset`, `diarization/src/offline/owned.rs:
 //! 544-570`) and `count` (thresholded internally by `try_count_pyannote`,
-//! `count.rs:715`) tensors. dia validates the raw `onset` scalar exactly
-//! ONCE, upstream of all of this, at `OwnedPipelineOptions::with_onset`
-//! (builder-time panic, `owned.rs:222-235`) and
-//! `OwnedDiarizationPipeline::run`'s own defense-in-depth re-check
-//! (`owned.rs:388-392`) — never again after that. So in THIS crate's
-//! port, [`count_from_segmentations`]'s own `onset.is_finite()` assert is
-//! LOAD-BEARING, not redundant defense-in-depth: no function in dia's
-//! pipeline, or this crate's, would ever catch a non-finite `onset`
-//! otherwise.
+//! `count.rs:715`) tensors. dia validates the raw `onset` scalar at three
+//! points, all upstream of or INSIDE this computation: at
+//! `OwnedPipelineOptions::with_onset` (builder-time panic,
+//! `owned.rs:222-235`), at `OwnedDiarizationPipeline::run`'s own
+//! defense-in-depth re-check (`owned.rs:388-392`), and inside
+//! `try_count_pyannote` itself, which re-checks `onset.is_finite()`
+//! (`count.rs:649-651`) — the exact check this function's own
+//! `onset.is_finite()` assert ports. It is never re-validated DOWNSTREAM
+//! of `OfflineInput::new` (dia's `OfflineInput` carries no `onset` field
+//! at all). So in THIS crate's port, [`count_from_segmentations`]'s own
+//! `onset.is_finite()` assert is LOAD-BEARING: it is the port of dia's
+//! last-line `try_count_pyannote` finiteness check, and nothing
+//! DOWNSTREAM of this function would catch a non-finite `onset` otherwise.
 
 use crate::segment::SEG_CHUNK_SAMPLES;
 
@@ -409,8 +413,13 @@ impl From<dia::reconstruct::SlidingWindow> for SlidingWindow {
 /// the unstable `const_float_classify` feature, and dia's own
 /// `rust-version` is newer than this crate's), so the check is phrased
 /// by hand via the `v != v` NaN idiom plus direct comparisons.
+///
+/// `pub(crate)` so [`crate::extract::Extractor::extract`]'s own onset
+/// preflight can reuse this exact predicate (mirroring dia's
+/// `OwnedDiarizationPipeline::run` re-checking `check_onset` at
+/// `owned.rs:388-392`) rather than re-deriving the range test.
 #[inline]
-const fn check_onset(v: f32) -> bool {
+pub(crate) const fn check_onset(v: f32) -> bool {
   #[allow(clippy::eq_op)] // intentional NaN check: NaN != NaN by IEEE 754.
   let not_nan = !(v != v);
   not_nan && v > 0.0 && v <= 1.0
@@ -598,17 +607,19 @@ pub fn frame_sliding_window() -> SlidingWindow {
   SlidingWindow::new(0.0, FRAME_DURATION_S, FRAME_STEP_S)
 }
 
-/// Internal failure for [`try_num_output_frames`]'s guard. Not part of
-/// this crate's public error taxonomy (`crate::error::{ModelError,
-/// InferError, ExtractError}`, design spec §5) — [`count_from_segmentations`]'s
-/// established public contract stays `Result`-free (module doc, "Who
-/// validates dims"), so this type exists purely to make the overflow
-/// guard's control flow, and this module's regression tests, typed
-/// rather than an unguarded arithmetic op. A future `Extractor` (Task 5)
-/// decides how, or whether, to surface this failure to its own
-/// `ExtractError`-returning callers.
+/// Internal failure for [`try_num_output_frames`]'s guard, surfaced by
+/// [`try_count_from_segmentations`]. Not part of this crate's public
+/// error taxonomy (`crate::error::{ModelError, InferError, ExtractError}`,
+/// design spec §5) — [`count_from_segmentations`]'s established public
+/// contract stays `Result`-free (module doc, "Who validates dims"), so
+/// this type exists purely to make the overflow guard's control flow, and
+/// this module's regression tests, typed rather than an unguarded
+/// arithmetic op. [`crate::extract::Extractor::extract`] converts it to
+/// `crate::error::ExtractError::OutputFrameCountOverflow` via an
+/// exhaustive manual match (NOT a `From` impl — see that variant's own
+/// doc for why); it stays crate-private either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-enum WindowError {
+pub(crate) enum WindowError {
   /// `num_output_frames` would not fit in `usize` — see
   /// [`try_num_output_frames`]'s own doc for the exact bound. Message
   /// text matches dia's own `ShapeError::OutputFrameCountOverflow`
@@ -677,6 +688,15 @@ fn try_num_output_frames(last_chunk_end: f64, frame_step: f64) -> Result<usize, 
 /// threshold/combine/rounding rule cited against dia's own source, and
 /// exactly which preconditions this function validates.
 ///
+/// Thin wrapper over `try_count_from_segmentations` (private to this
+/// module): it unwraps the one typed failure that variant can return
+/// (the derived `num_output_frames`
+/// overflowing `usize`) into the panic direct callers already contract
+/// for — mirroring dia's own infallible `count_pyannote` wrapper, which
+/// likewise `.expect(..)`s its fallible `try_count_pyannote`
+/// (`count.rs:589-600`). All shape/precondition validation lives in the
+/// try_ variant.
+///
 /// # Panics
 /// See the module doc's "Who validates dims" section: panics if
 /// `num_chunks`/`num_frames_per_chunk`/`num_speakers` is `0`, if
@@ -695,6 +715,53 @@ pub fn count_from_segmentations(
   chunks_sw: SlidingWindow,
   frames_sw: SlidingWindow,
 ) -> Vec<u8> {
+  try_count_from_segmentations(
+    segmentations,
+    num_chunks,
+    num_frames_per_chunk,
+    num_speakers,
+    onset,
+    chunks_sw,
+    frames_sw,
+  )
+  .expect("num_output_frames must fit in usize")
+}
+
+/// Fallible core of [`count_from_segmentations`]: identical body and
+/// identical shape/precondition asserts, but returns the
+/// `num_output_frames`-overflow guard as a typed
+/// [`WindowError::OutputFrameCountOverflow`] instead of unwrapping it.
+///
+/// The seam exists so [`crate::extract::Extractor::extract`] can convert
+/// that one overflow case into its own `crate::error::ExtractError`
+/// (a `Result`-typed public API) while direct callers of the public
+/// [`count_from_segmentations`] keep the identical panic contract. Every
+/// OTHER precondition here stays an `assert!` rather than a `Result` arm:
+/// those are invariants `extract` already guarantees at its own boundary
+/// before calling this (`num_chunks >= 1` via [`chunk_starts`],
+/// length-consistent `segmentations` it assembled itself, an `onset` it
+/// already ran through [`check_onset`]), so surfacing them as typed
+/// errors would add unreachable variants to `WindowError` and to
+/// `ExtractError`'s match.
+///
+/// # Panics
+/// On the SAME shape/precondition violations as
+/// [`count_from_segmentations`] — see that function and the module doc's
+/// "Who validates dims" section.
+///
+/// # Errors
+/// [`WindowError::OutputFrameCountOverflow`] if the derived
+/// `num_output_frames` would not fit in `usize` (see
+/// `try_num_output_frames`).
+pub(crate) fn try_count_from_segmentations(
+  segmentations: &[f64],
+  num_chunks: usize,
+  num_frames_per_chunk: usize,
+  num_speakers: usize,
+  onset: f32,
+  chunks_sw: SlidingWindow,
+  frames_sw: SlidingWindow,
+) -> Result<Vec<u8>, WindowError> {
   assert!(num_chunks > 0, "num_chunks must be at least 1");
   assert!(
     num_frames_per_chunk > 0,
@@ -757,8 +824,7 @@ pub fn count_from_segmentations(
 
   // ── 2. Output-frame count — count.rs:486-547 ─────────────────────
   let last_chunk_end = chunk_duration + (num_chunks - 1) as f64 * chunk_step;
-  let num_output_frames =
-    try_num_output_frames(last_chunk_end, frame_step).expect("num_output_frames must fit in usize");
+  let num_output_frames = try_num_output_frames(last_chunk_end, frame_step)?;
 
   // ── 3. Aggregate: uniform-weight sum + covering-chunk count ──────
   // count.rs:762-777.
@@ -781,16 +847,18 @@ pub fn count_from_segmentations(
   // ── 4. count[t] = round(aggregated[t] / overlapping_count[t]) ────
   // count.rs:792-801: missing=0.0 for zero-coverage cells.
   let epsilon = 1e-12_f64;
-  (0..num_output_frames)
-    .map(|t| {
-      if overlapping_count[t] > 0.0 {
-        let avg = aggregated[t] / overlapping_count[t].max(epsilon);
-        avg.round_ties_even().clamp(0.0, u8::MAX as f64) as u8
-      } else {
-        0
-      }
-    })
-    .collect()
+  Ok(
+    (0..num_output_frames)
+      .map(|t| {
+        if overlapping_count[t] > 0.0 {
+          let avg = aggregated[t] / overlapping_count[t].max(epsilon);
+          avg.round_ties_even().clamp(0.0, u8::MAX as f64) as u8
+        } else {
+          0
+        }
+      })
+      .collect(),
+  )
 }
 
 #[cfg(test)]
