@@ -16,3 +16,4 @@
 //! macOS only (built on [`coremlit`]).
 
 pub mod error;
+pub mod segment;
