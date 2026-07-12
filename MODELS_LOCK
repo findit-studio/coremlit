@@ -1,12 +1,28 @@
 # CI model-cache key (.github/workflows/ci.yml, job `model-tests`).
 # actions/cache keys on the hash of this file: bump `cache-epoch` (or pin
 # different revisions) to force a re-download.
+#
+# This file is CONSUMED, not decorative: ci.yml's "Download models (cache
+# miss)" step hand-parses the two tables below (small sed/awk block, no
+# TOML crate — see the comment there) to build both `hf download`
+# commands, including `--revision`. Editing a repo name, selector, or
+# revision here changes what CI actually downloads next run, exactly like
+# editing any other lock file.
+#
+# LOUD FOLLOW-UP: `revision = "main"` below is a MOVING target, not a real
+# lock — CI can still download different upstream bytes on two runs of an
+# unchanged MODELS_LOCK if `main` moves between them. Pinning immutable,
+# content-addressed commit hashes for both repos is a deliberate user
+# follow-up: it requires live network access (`hf api ...` or the HF web
+# UI) to look up each repo's current commit SHA, which this environment
+# does not have. Until that lands, treat `cache-epoch` bumps as the only
+# reliable way to force a fresh, verified download.
 cache-epoch = 1
 
-[argmaxinc/whisperkit-coreml]
-include  = openai_whisper-tiny/*
-revision = main
+["argmaxinc/whisperkit-coreml"]
+include  = "openai_whisper-tiny/*"
+revision = "main"
 
-[openai/whisper-tiny]
-files    = tokenizer.json tokenizer_config.json config.json
-revision = main
+["openai/whisper-tiny"]
+files    = "tokenizer.json tokenizer_config.json config.json"
+revision = "main"
