@@ -1,6 +1,6 @@
 //! Model loading, introspection, prediction.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use objc2::rc::Retained;
 use objc2_core_ml::{MLDictionaryFeatureProvider, MLModel, MLModelConfiguration};
@@ -281,7 +281,7 @@ impl Model {
   ///
   /// # Errors
   /// [`CompileError::NotFound`] / [`CompileError::Native`].
-  pub fn compile(source: impl AsRef<Path>) -> Result<std::path::PathBuf, CompileError> {
+  pub fn compile(source: impl AsRef<Path>) -> Result<PathBuf, CompileError> {
     let source = source.as_ref();
     if !source.exists() {
       return Err(CompileError::NotFound {
@@ -296,7 +296,7 @@ impl Model {
     let compiled = unsafe { MLModel::compileModelAtURL_error(&url) }
       .map_err(|e| CompileError::Native(NsErrorInfo::from_ns_error(&e)))?;
     let path = compiled.path().expect("compiled model URL has a path");
-    Ok(std::path::PathBuf::from(path.to_string()))
+    Ok(PathBuf::from(path.to_string()))
   }
 
   /// Loads a model and immediately drops it.
