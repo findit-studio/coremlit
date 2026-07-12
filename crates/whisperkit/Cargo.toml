@@ -28,10 +28,19 @@ tracing = ["dep:tracing"]
 
 [dev-dependencies]
 cpal.workspace = true
+criterion.workspace = true
 hound.workspace = true
 rubato.workspace = true
 serde = { workspace = true, features = ["derive"] }
 tempfile.workspace = true
+
+[[bench]]
+name = "stages"
+harness = false
+
+[[bench]]
+name = "rtf"
+harness = false
 
 [lints]
 workspace = true
