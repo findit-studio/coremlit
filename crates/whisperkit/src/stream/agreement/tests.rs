@@ -215,3 +215,39 @@ fn tied_word_starts_never_confirm_twice() {
     );
   }
 }
+
+#[test]
+fn omitting_a_confirmed_tied_word_does_not_drop_provisional_words() {
+  // Regression (phase-gate round 2): the count-based readmit skip dropped
+  // B whenever a rewrite OMITTED confirmed A (tied start) and shifted the
+  // hypothesis left — the match-based strip only removes words that
+  // actually reproduce the confirmed tail.
+  let a = || word(" A", 0.0, 0.5);
+  let b = || word(" B", 0.0, 1.0); // tied start with A
+  let c = || word(" C", 1.0, 2.0);
+  let d = || word(" D", 2.0, 3.0);
+  let e = || word(" E", 3.0, 4.0);
+  let mut agreement = LocalAgreement::new();
+  agreement.ingest(result_with_words(vec![a(), b(), c()]));
+  agreement.ingest(result_with_words(vec![a(), b(), c(), d()])); // confirms A, holds B,C
+  // The rewrite omits A entirely: B must survive to be confirmed next.
+  agreement.ingest(result_with_words(vec![b(), c(), d(), e()]));
+  let confirmed: Vec<&str> = agreement
+    .confirmed_words_slice()
+    .iter()
+    .map(|w| w.word())
+    .collect();
+  assert!(
+    confirmed.contains(&" B"),
+    "B lost to the positional skip: {confirmed:?}"
+  );
+  assert_eq!(
+    confirmed.iter().filter(|w| **w == " B").count(),
+    1,
+    "and confirmed exactly once"
+  );
+  let text = agreement.finalize().text().to_string();
+  for token in ["A", "B", "C", "D", "E"] {
+    assert_eq!(text.matches(token).count(), 1, "{token} once in {text:?}");
+  }
+}
