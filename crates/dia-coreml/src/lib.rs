@@ -20,3 +20,4 @@ mod compute_units_serde;
 pub mod embed;
 pub mod error;
 pub mod segment;
+pub mod window;
