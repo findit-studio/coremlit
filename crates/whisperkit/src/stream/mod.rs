@@ -74,8 +74,8 @@ pub const RELATIVE_ENERGY_WINDOW: usize = 20;
 /// is dropped rather than ported.
 ///
 /// [`Self::new`] and the accessors are this type's only public surface;
-/// every field mutates through a `pub(crate)` `set_*` family instead of a
-/// public one — [`AudioStreamTranscriber::push_samples`] owns every
+/// every field mutates through a `pub(crate)` `set_*`/`_mut` family instead
+/// of a public one — [`AudioStreamTranscriber::push_samples`] owns every
 /// transition Swift's actor applied via `didSet` (`AudioStreamTranscriber.
 /// swift:27-31`), so outside callers only ever read a session's state.
 #[derive(Debug, Clone, PartialEq)]
@@ -196,32 +196,15 @@ impl StreamState {
   pub const fn confirmed_segments_slice(&self) -> &[TranscriptionSegment] {
     self.confirmed_segments.as_slice()
   }
-  /// Sets [`Self::confirmed_segments_slice`] in place, replacing the
-  /// whole collection. `pub(crate)`: see this struct's doc.
-  ///
-  /// Unlike its `set_*` siblings, [`AudioStreamTranscriber::push_samples`]
-  /// (Plan 4 T8) never calls this one: it only ever *grows* confirmed
-  /// segments, via [`Self::confirmed_segments_mut`]
-  /// (`AudioStreamTranscriber.swift:183`'s `append(contentsOf:)`, never a
-  /// wholesale replace), so this whole-collection setter stays exercised
-  /// only by this module's own tests in a plain (non-test) build — not a
-  /// bug, mirrors `tests/common/mod.rs`'s `tokenizer_dir`.
-  #[allow(dead_code)]
-  #[inline(always)]
-  pub(crate) fn set_confirmed_segments(
-    &mut self,
-    confirmed_segments: impl Into<Vec<TranscriptionSegment>>,
-  ) -> &mut Self {
-    self.confirmed_segments = confirmed_segments.into();
-    self
-  }
   /// Mutable access to the raw confirmed-segments vector, so a caller can
   /// grow it in place (e.g. `extend_from_slice`) instead of reading,
-  /// cloning, and rebuilding the whole collection through
-  /// [`Self::set_confirmed_segments`] on every promotion — ports Swift's
+  /// cloning, and rebuilding the whole collection — ports Swift's
   /// `state.confirmedSegments.append(contentsOf:)`
-  /// (`AudioStreamTranscriber.swift:183`). `pub(crate)`: see this
-  /// struct's doc.
+  /// (`AudioStreamTranscriber.swift:183`). This field has no whole-
+  /// collection `set_*` sibling: [`AudioStreamTranscriber::push_samples`]
+  /// only ever *grows* confirmed segments, never replaces them wholesale,
+  /// so a `set_confirmed_segments` would have no caller. `pub(crate)`: see
+  /// this struct's doc.
   #[inline(always)]
   pub(crate) const fn confirmed_segments_mut(&mut self) -> &mut Vec<TranscriptionSegment> {
     &mut self.confirmed_segments
