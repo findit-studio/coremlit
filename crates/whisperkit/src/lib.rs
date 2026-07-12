@@ -99,6 +99,63 @@
 //!   [`local_agreement_transcriber`](transcribe::WhisperKit::local_agreement_transcriber)).
 //! - [`log`] — leveled logging with a replacing callback.
 //!
+//! # Reproducibility and provenance
+//!
+//! The same audio through the same model can produce different text,
+//! tokens, and segments when decode options drift — coremlit issue #9's
+//! round-1–4 validation found exact Rust/Swift parity under one pinned
+//! configuration and observable divergence when single knobs moved (e.g.
+//! VAD-chunked with prefill was parity-pass; the same run without prefill
+//! was not). Consumers that index, snapshot, or regression-test
+//! transcripts should therefore set the decode policy **explicitly**
+//! rather than relying on defaults, and record the full configuration
+//! alongside every stored transcript or benchmark artifact:
+//!
+//! - model folder identity and revision (e.g. the Hugging Face repo id +
+//!   revision the `.mlmodelc` folder came from — this crate loads local
+//!   folders and does not know their provenance;
+//!   [`Options::model_folder`](options::Options::model_folder) is only
+//!   the path)
+//! - tokenizer identity and revision (same caveat;
+//!   [`Options::tokenizer_folder`](options::Options::tokenizer_folder))
+//! - compute units, per stage
+//!   ([`ComputeOptions`](options::ComputeOptions))
+//! - chunking strategy
+//!   ([`DecodingOptions::chunking_strategy`](options::DecodingOptions::chunking_strategy))
+//! - language, when known
+//!   ([`DecodingOptions::language`](options::DecodingOptions::language) —
+//!   set it explicitly instead of leaving auto-detection to pick one)
+//! - prefill
+//!   ([`DecodingOptions::use_prefill_prompt`](options::DecodingOptions::use_prefill_prompt))
+//! - special-token skipping
+//!   ([`DecodingOptions::skip_special_tokens`](options::DecodingOptions::skip_special_tokens))
+//! - word timestamps
+//!   ([`DecodingOptions::word_timestamps`](options::DecodingOptions::word_timestamps))
+//! - VAD strategy (the detector driving VAD chunking —
+//!   [`EnergyVad`](audio::vad::EnergyVad) by default, swappable via
+//!   [`WhisperKit::set_vad_detector`](transcribe::WhisperKit::set_vad_detector))
+//!
+//! Under the `serde` feature, [`DecodingOptions`](options::DecodingOptions),
+//! [`ComputeOptions`](options::ComputeOptions), and
+//! [`Options`](options::Options) are all serde-serializable, so the
+//! cheapest faithful record is to serialize the exact option values used
+//! and store that snapshot with the transcript.
+//!
+//! Two provenance-adjacent behaviors to plan for:
+//!
+//! - **Compute units affect output.** The same model/audio/options can
+//!   yield different transcripts across `cpuOnly`/`cpuAndGPU`/
+//!   `cpuAndNeuralEngine`/`all` — CoreML backend numeric drift, not a bug
+//!   in this port (Rust and Swift match each other when the unit
+//!   matches). Never compare outputs across compute units as if
+//!   equivalent: fix one unit for regression baselines, or keep a
+//!   separate baseline per unit.
+//! - **Silence decodes to a marker, not to empty text.** Silent windows
+//!   come back as
+//!   [`BLANK_AUDIO_MARKER`](constants::BLANK_AUDIO_MARKER) — see that
+//!   constant's doc; product layers filter or model it rather than
+//!   indexing it as transcript text.
+//!
 //! # Examples
 //!
 //! ```no_run
