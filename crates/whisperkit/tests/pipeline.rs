@@ -305,3 +305,15 @@ fn jfk_word_timestamps_are_monotonic_and_cover_the_transcript() {
     "got: {normalized}"
   );
 }
+
+#[test]
+#[ignore = "requires local tiny model (WHISPERKIT_TEST_MODELS)"]
+fn detect_language_on_es_and_ja_clips() {
+  // Ports the language expectations of Swift's detectLanguage tests: the
+  // clips' languages are the goldens.
+  let kit = WhisperKit::new(&tiny_options()).unwrap();
+  let es = common::load_wav_mono_f32(&common::fixtures_dir().join("audio/es_test_clip.wav"));
+  assert_eq!(kit.detect_language(&es).unwrap().language(), "es");
+  let ja = common::load_wav_mono_f32(&common::fixtures_dir().join("audio/ja_test_clip.wav"));
+  assert_eq!(kit.detect_language(&ja).unwrap().language(), "ja");
+}
