@@ -7,7 +7,8 @@
 //! plus the powerset argmax dia's owned audio-in pipeline performs inline
 //! (`diarization/src/offline/owned.rs:476-499`; dia's own
 //! `powerset_to_speakers_hard`, `diarization/src/segment/powerset.rs:
-//! 68-87`). Ground truth: task-1-report.md's introspected contract table
+//! 68-87`). Ground truth: `tests/model_io.rs`'s
+//! `pyannote_segmentation_io_matches_spec` introspection test
 //! (`pyannote_segmentation.mlmodelc`: `audio [1, 1, 160_000]` f32 in,
 //! `segments [1, 589, 7]` f32 out) and the design spec §4/§5.
 //!
@@ -118,8 +119,8 @@ use crate::error::{InferError, ModelError};
 /// Sample count of one segmentation-model chunk (10 s at 16 kHz). Matches
 /// dia's `WINDOW_SAMPLES` (`diarization/src/segment/options.rs:18`) and the
 /// introspected `pyannote_segmentation.mlmodelc` `audio` input's fixed
-/// shape `[1, 1, 160_000]` (design spec §4; task-1-report.md's contract
-/// table).
+/// shape `[1, 1, 160_000]` (design spec §4; pinned by
+/// `tests/model_io.rs::pyannote_segmentation_io_matches_spec`).
 pub const SEG_CHUNK_SAMPLES: usize = 160_000;
 
 /// Maximum simultaneous speakers the powerset encoding represents. Matches
@@ -135,7 +136,7 @@ pub const SEG_NUM_SLOTS: usize = 3;
 pub const POWERSET_CLASSES: usize = 7;
 
 /// Declared feature names on `pyannote_segmentation.mlmodelc`
-/// (task-1-report.md's contract table).
+/// (pinned by `tests/model_io.rs::pyannote_segmentation_io_matches_spec`).
 mod names {
   pub const AUDIO: &str = "audio";
   pub const SEGMENTS: &str = "segments";
@@ -145,8 +146,9 @@ mod names {
 /// CoreML schedule across ANE/GPU/CPU — the whole point of this crate
 /// (design spec §1's ~20x segmentation uplift target). Model-gated tests
 /// in this module instead load with `ComputeUnits::CpuOnly` for
-/// determinism (no ANE compile-latency variance across runs), per the T1
-/// ledger note (task-1-report.md) — production code keeps this default.
+/// determinism (no ANE compile-latency variance across runs), matching
+/// `tests/model_io.rs`'s introspection convention (every load there also
+/// uses `ComputeUnits::CpuOnly`) — production code keeps this default.
 pub const DEFAULT_SEGMENT_COMPUTE: ComputeUnits = ComputeUnits::All;
 
 #[cfg(feature = "serde")]
@@ -255,7 +257,8 @@ impl SegmentModel {
   }
 
   /// Loads the model with custom options, introspecting and validating its
-  /// I/O contract against task-1-report.md's pinned ground truth.
+  /// I/O contract against the ground truth pinned by
+  /// `tests/model_io.rs::pyannote_segmentation_io_matches_spec`.
   ///
   /// # Errors
   /// [`ModelError::Load`] if CoreML rejects the model.
@@ -313,8 +316,9 @@ impl SegmentModel {
   }
 
   /// Output frame count for one chunk — the introspected `segments`
-  /// shape's middle dimension (589 for `pyannote_segmentation.mlmodelc`;
-  /// read dynamically at construction, not hardcoded — task-1-report.md).
+  /// shape's middle dimension (589 for `pyannote_segmentation.mlmodelc`,
+  /// pinned by `tests/model_io.rs::pyannote_segmentation_io_matches_spec`;
+  /// read dynamically at construction, not hardcoded).
   #[inline(always)]
   pub const fn num_frames(&self) -> usize {
     self.num_frames

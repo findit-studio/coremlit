@@ -26,9 +26,10 @@ thiserror.workspace = true
 # `dia::offline::OfflineInput` etc., matching the design spec's API (§5).
 # Path is relative to THIS crate (crates/dia-coreml): three levels up
 # (crates/dia-coreml -> crates -> coremlit workspace root -> findit-studio)
-# then into the sibling `diarization` checkout — verified with `cargo
-# metadata` (see task-1-report.md), not the two-level guess that would
-# resolve inside the coremlit workspace itself.
+# then into the sibling `diarization` checkout, not the two-level guess that
+# would resolve inside the coremlit workspace itself — the `dia` feature
+# build (exercised by every `cargo hack test --each-feature` gate run) is
+# the standing, executable proof this path resolves.
 dia = { package = "diarization", path = "../../../diarization", optional = true }
 serde = { workspace = true, optional = true }
 

@@ -291,9 +291,10 @@ fn seg_path() -> std::path::PathBuf {
   models_dir().join("pyannote_segmentation.mlmodelc")
 }
 
-/// Loads the real segmentation model with `ComputeUnits::CpuOnly` — the T1
-/// ledger's model-gated-test convention (task-1-report.md): deterministic,
-/// no ANE compile-latency variance across runs. `DEFAULT_SEGMENT_COMPUTE`
+/// Loads the real segmentation model with `ComputeUnits::CpuOnly` —
+/// matching `tests/model_io.rs`'s introspection convention (every load
+/// there also uses `ComputeUnits::CpuOnly`): deterministic, no ANE
+/// compile-latency variance across runs. `DEFAULT_SEGMENT_COMPUTE`
 /// (`ComputeUnits::All`) stays the production default.
 fn load_seg_model() -> SegmentModel {
   SegmentModel::from_file_with(
@@ -307,7 +308,8 @@ fn load_seg_model() -> SegmentModel {
 #[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
 fn from_file_loads_and_reports_frame_count() {
   let model = load_seg_model();
-  // T1's introspected ground truth (task-1-report.md): 589 frames.
+  // Ground truth pinned by
+  // `tests/model_io.rs::pyannote_segmentation_io_matches_spec`: 589 frames.
   assert_eq!(model.num_frames(), 589);
 }
 

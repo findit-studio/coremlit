@@ -190,9 +190,9 @@ fn wespeaker_v2_and_wespeaker_int8_are_byte_identical() {
   // SPEC DELTA (module doc item 3): `wespeaker_v2.mlmodelc` and
   // `wespeaker_int8.mlmodelc` are not merely contract-equal, they are the
   // SAME artifact (`diff -rq` and sha256 of `model.mil` +
-  // `weights/weight.bin`, verified at plan time — see task-1-report.md).
+  // `weights/weight.bin` matched when checked manually during planning).
   // This test pins the I/O contract only; byte-identity isn't re-verified
-  // per run.
+  // per run, and no committed fixture re-checks it either.
   let path = common::models_dir().join("wespeaker_int8.mlmodelc");
   let model = Model::load(path, ComputeUnits::CpuOnly).unwrap();
   let description = model.description();
