@@ -3,6 +3,9 @@ name = "dia-coreml"
 description = "Native CoreML segmentation and embedding backends for the dia speaker-diarization pipeline"
 version.workspace = true
 edition.workspace = true
+# Unpublishable until the `diarization` sibling publishes (the optional
+# `dia` path dependency has no registry version); flip when it does.
+publish = false
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
