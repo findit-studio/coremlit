@@ -48,10 +48,11 @@
 //!   ("pick pyannote_segmentation if contract-equal") does not actually
 //!   hold, see `segmentation_alt_io_recorded_not_targeted` below. It is
 //!   chosen anyway because its single-chunk, fixed-shape `segments` output
-//!   (raw powerset logits) matches both the spec's pinned contract (§4
-//!   table) and the `SegmentModel::infer` single-chunk API (§5) exactly,
-//!   and it is FluidAudio's shipping name — the brief's fallback
-//!   tiebreaker.
+//!   (per-frame powerset **log-probabilities** — the graph's tail is
+//!   `softmax` → `log`, see `crate::segment`'s module doc) matches both the
+//!   spec's pinned contract (§4 table) and the `SegmentModel::infer`
+//!   single-chunk API (§5) exactly, and it is FluidAudio's shipping name —
+//!   the brief's fallback tiebreaker.
 //! - **Embedding: `wespeaker_v2.mlmodelc`.** Verified byte-identical
 //!   (`diff -rq`, sha256 of `model.mil` and `weights/weight.bin`, at plan
 //!   time) to `wespeaker_int8.mlmodelc` — "v2" is an alias for the
@@ -122,9 +123,16 @@ fn pyannote_segmentation_io_matches_spec() {
   assert_eq!(audio.data_type(), Some(DataType::F32));
 
   // Spec hypothesis: "589 frames, not the 592 the fps math suggests" (§4);
-  // introspection CONFIRMS 589 — raw powerset logits, matching the spec's
-  // `segments` name exactly (not log-probabilities; see the alt candidate
-  // below).
+  // introspection CONFIRMS 589.
+  //
+  // This comment used to continue "raw powerset logits ... (not
+  // log-probabilities)", reasoning from the output's NAME. That was
+  // exactly backwards, and it is why nobody went looking for the `log` op
+  // that is actually in the graph. `model.mil` ends `softmax` -> `log(eps
+  // = 0x0p+0)` -> `cast` -> `-> (segments)`: `segments` carries
+  // log-probabilities. A name is not a contract; the graph is. Shape and
+  // dtype are all this introspection test can pin — the numerics are
+  // pinned by `coremlit`'s `tests/fp16_guards.rs`.
   let segments = description.output("segments").expect("segments output");
   assert_eq!(segments.shape(), &[1, 589, 7]);
   assert_eq!(segments.data_type(), Some(DataType::F32));

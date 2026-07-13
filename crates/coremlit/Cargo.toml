@@ -26,5 +26,11 @@ half.workspace = true
 thiserror.workspace = true
 derive_more.workspace = true
 
+# `tests/fp16_guards.rs` corroborates its 2^-24 threshold against a real
+# fp16 rounding rather than trusting a hand-written constant. Integration
+# tests do not inherit `[dependencies]`, so `half` is named again here.
+[dev-dependencies]
+half.workspace = true
+
 [lints]
 workspace = true
