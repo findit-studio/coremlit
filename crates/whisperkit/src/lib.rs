@@ -174,7 +174,7 @@
 //!   [`transcribe_all`](transcribe::WhisperKit::transcribe_all) pipeline
 //!   **bit-reproducible across runs, with the fallback ladder still fully
 //!   enabled**: [`transcribe::TranscribeTask`] derives an independent
-//!   per-(window, attempt) sub-seed from the base seed
+//!   per-(worker, window, attempt) sub-seed from the base seed
 //!   ([`decode::sampler::derive_attempt_seed`] — see its doc for the exact
 //!   mixing function and why one seed can't just be reused verbatim
 //!   everywhere), so the same audio/options/seed always samples the same
