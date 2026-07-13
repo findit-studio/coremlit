@@ -171,36 +171,118 @@
 //! never meets [`Extraction`]'s frame timeline, which stays dia's
 //! ([`crate::window::frame_sliding_window`]).
 //!
-//! # The degenerate-mask guard (a real divergence, and why)
+//! # The overlap-exclusion fallback: `dia`'s mask policy, on argmax's tensors
 //!
-//! An "active" speaker (`> 2` active frames) whose every active frame is also
-//! an *overlap* frame gets an all-zero mask row, because the mask value is
-//! `speaker_ids * (1 - overlapped)` (`Emb.swift:245`) — argmax has no
-//! fallback here (dia does: `owned.rs:573-591` reverts to the raw mask when
-//! too few clean frames remain; that fallback is dia's host-side decode,
-//! which this source deliberately does not import).
+//! argmax's mask value is `speaker_ids * (1 - overlapped)` (`Emb.swift:245`) —
+//! the *clean* mask, with every overlap frame excluded. Applied
+//! unconditionally, as `Emb.swift` applies it, a slot whose active frames are
+//! mostly (or entirely) overlap frames pools over almost nothing: a SPARSE (or
+//! all-zero) mask row, and a correspondingly meaningless embedding.
 //!
 //! Probing the real embedder with an all-zero mask row shows it returns a
-//! **finite, non-zero, constant** embedding (L2 norm ≈ 0.5356, bit-identical
+//! **finite, non-zero, CONSTANT** embedding (L2 norm ≈ 0.5356, bit-identical
 //! across every all-zero row) — *not* the NaN that FluidAudio's WeSpeaker
-//! produces from an empty mask ([`crate::error::InferError::EmptyMask`]). Two
-//! consequences, both load-bearing:
+//! produces from an empty mask ([`crate::error::InferError::EmptyMask`]). Its
+//! norm is ~54× ABOVE `PLDA_MIN_NORM` (0.01), so the norm guard cannot catch
+//! it, and it carries no speaker information at all.
 //!
-//! 1. No NaN hazard, so this source needs none of [`crate::extract`]'s
-//!    placeholder-mask machinery: inactive rows are simply left zero, exactly
-//!    as argmax leaves them. Safe because the 64 slots are **independent** —
-//!    filling one row versus filling all 41 active rows returns that row
-//!    bit-for-bit identically (`max|diff| = 0.0`, verified on the real model).
-//! 2. That degenerate constant's norm (≈ 0.5356) is far ABOVE
-//!    `PLDA_MIN_NORM` (0.01), so the norm guard **cannot** catch it. Emitting
-//!    it would feed `dia`'s clustering a plausible-looking vector carrying no
-//!    speaker information.
+//! ## argmax is not vulnerable to this — but nothing at its MASK is what saves it
 //!
-//! So a consumed slot whose mask row is all-zero is **dropped** — embedding
-//! row left zero, segmentation column zeroed — rather than emitted. That is
-//! `dia`'s own drop semantics for an unusable slot (`owned.rs:561-571`), and
-//! it upholds [`Extraction`]'s documented invariant (see below). argmax's
-//! Swift would emit the degenerate vector; this port will not.
+//! It protects itself DOWNSTREAM. Every `SpeakerEmbedding` it emits carries a
+//! `nonOverlappedFrameRatio` (declared `Emb.swift:14`, computed
+//! `Emb.swift:105-118` as `clean_frames / framesPerWindowCount`, attached
+//! `Emb.swift:294`), and its clustering admits only `ratio > minActiveRatio`
+//! embeddings to cluster FORMATION (`VBxClustering.swift:50`; `minActiveRatio`
+//! defaults to `0.2`, `SpeakerClustering.swift:23`). Since `speaker_ids` and
+//! `overlapped_speaker_activity` are both binary ("Value semantics" above),
+//! `ratio == 0` ⟺ the clean mask is exactly all-zero — so argmax's degenerate
+//! vector IS emitted, it just never trains a cluster. Merely SPARSE masks are
+//! withheld too, at a far higher bar (`ratio > 0.2` ⟺ more than 117 clean
+//! frames of 589). Those slots are still LABELLED, by nearest centroid over
+//! `allEmbeddingsFloats` (`VBxClustering.swift:52,111,126`): argmax withholds
+//! them from cluster formation, it does not drop them.
+//!
+//! This port cannot reuse that protection. Per the design spec §4 the
+//! clustering is `dia`'s, and [`Extraction`] has no "present, but do not
+//! cluster on me" channel — every slot it carries is a slot `dia` clusters on.
+//! Porting argmax's mask policy WITHOUT argmax's filter would be the worst of
+//! both vendors: argmax's sparse mask, handed to clustering that has no idea it
+//! is sparse.
+//!
+//! ## So this port takes the other half of the pair: `dia`'s FALLBACK
+//!
+//! `dia`'s host-side decode (`owned.rs:522,573-591`; ported for
+//! [`crate::source::FluidAudioSource`] by [`crate::extract`]'s
+//! `derive_slot_plans`) never lets the clean mask starve a slot: when too few
+//! clean frames survive, it drops the overlap exclusion FOR THAT SLOT. Mapped
+//! onto argmax's tensors, per `(window, speaker)`:
+//!
+//! ```text
+//! clean[f] = speaker_ids[w][f][s] * (1 - overlapped[w][f])   (Emb.swift:245)
+//! raw[f]   = speaker_ids[w][f][s]
+//! mask     = if count(clean != 0) > EXCLUDE_OVERLAP_MIN_FRAMES { clean } else { raw }
+//! ```
+//!
+//! The correspondence is exact, not analogical: argmax's `overlapped[w][f]` IS
+//! `dia`'s `!clean_frame[f]` (both mean "2 or more slots active in this frame";
+//! 12 369/12 369 against the real model), and argmax's binary `speaker_ids` IS
+//! `dia`'s `seg >= onset` raw mask. `EXCLUDE_OVERLAP_MIN_FRAMES` (2) is
+//! *imported* from [`crate::extract`], not re-declared, and the comparison is
+//! `<=`, per pyannote's `np.sum(clean_mask) > min_num_frames` (`owned.rs:589`).
+//!
+//! Three consequences:
+//!
+//! 1. **An all-zero mask row is UNREACHABLE for a consumed slot.** A slot is
+//!    masked at all only if it cleared the activity gate (`> 2` active frames,
+//!    `Emb.swift:99-102`). If its clean count is `> 2` the clean mask has `> 2`
+//!    nonzero frames; otherwise it falls back to the raw mask, which has the
+//!    gate's `> 2` active frames by construction. Either way, non-empty. An
+//!    earlier revision of this module carried a bespoke all-zero-mask DROP
+//!    guard; it is gone — unnecessary under this rule, and it never fired on any
+//!    fixture. `place_embeddings` `debug_assert!`s the unreachability instead.
+//! 2. **Attribution is preserved.** Dropping the slot would erase it from
+//!    `Extraction` entirely; argmax never does that (it labels such slots by
+//!    nearest centroid). The fallback keeps the slot AND gives it a mask to
+//!    pool over.
+//! 3. **Mask construction is now one policy across both sources** — `dia`'s — so
+//!    the two differ where they genuinely should: in WHICH network decoded the
+//!    frames, not in how a mask is assembled from them.
+//!
+//! The fallback is a RARE path, exactly as it is in `dia`: on
+//! `02_pyannote_sample` it fires for 0 of the 41 active slots (no slot has `<= 2`
+//! clean frames). It is the *unreachability* it buys, not a routine rewrite of
+//! the mask, that earns it — see the divergence note below before reading it as
+//! a fix for sparse masks in general.
+//!
+//! ## The knowing divergence from argmax's Swift, stated plainly
+//!
+//! This port does **not** implement `nonOverlappedFrameRatio` /
+//! `minActiveRatio`, and the fallback above is NOT a substitute for it. The two
+//! rules sit at very different bars, and conflating them would be easy:
+//!
+//! | | fires when | on `02_pyannote_sample` |
+//! |---|---|---|
+//! | `dia`'s fallback (ported) | `clean_count <= 2` | 0 of 41 active slots |
+//! | argmax's filter (NOT ported) | `clean_count <= 117` (`ratio <= 0.2`) | 5 of 41 active slots |
+//!
+//! So a slot with, say, 40 clean frames of 589 keeps its SPARSE clean mask
+//! here, and `dia` clusters on it. argmax would have withheld it from cluster
+//! formation; this port does not, because `Extraction` has no channel to say so
+//! (spec §4 puts clustering on `dia`'s side, and every slot `Extraction` carries
+//! is one `dia` clusters). Adding one is a design change, not a port detail.
+//!
+//! What the fallback DOES buy is worth being precise about, because it is not
+//! "sparse masks are fixed":
+//!
+//! - the all-zero mask row — the one case where the embedding is not merely
+//!   sparse but *meaningless* (the norm-0.5356 constant) — becomes unreachable,
+//!   so no guard is needed for it;
+//! - mask construction stops being an argmax/`dia` hybrid. This port now applies
+//!   `dia`'s rule to `dia`'s clustering, exactly as
+//!   [`crate::source::FluidAudioSource`] does — and `dia` treats ITS own
+//!   segmenter's sparse-but-nonempty slots the same way, so the remaining
+//!   sparse-slot behavior is `dia`'s considered policy rather than an accident
+//!   of porting half of argmax's.
 //!
 //! # The `Extraction` invariant this source upholds
 //!
@@ -212,10 +294,37 @@
 //!
 //! Every slot this source leaves un-embedded therefore gets its segmentation
 //! column zeroed: the ones argmax's activity gate rejects (`<= 2` active
-//! frames — strictly more aggressive than dia's "no active frame at all"),
-//! the degenerate-mask ones above, and the PLDA-norm ones. `count` is then
-//! computed over the POST-zeroing buffer, preserving dia's own ordering
-//! (`owned.rs:663-673`; [`crate::extract`]'s "Count runs after all zeroing").
+//! frames — strictly more aggressive than dia's "no active frame at all"), and
+//! the PLDA-norm ones. `count` is then computed over the POST-zeroing buffer,
+//! preserving dia's own ordering (`owned.rs:663-673`; [`crate::extract`]'s
+//! "Count runs after all zeroing").
+//!
+//! Inactive rows of the embedder's 64-slot output are simply left zero, exactly
+//! as argmax leaves them — this source needs none of [`crate::extract`]'s
+//! placeholder-mask machinery, because an all-zero mask row here yields the
+//! finite constant above rather than a NaN. Safe because the 64 slots are
+//! **independent**: filling one row versus filling all 41 active rows returns
+//! that row bit-for-bit identically (`max|diff| = 0.0`, verified on the real
+//! model).
+//!
+//! # `onset` is INERT for this source (inert by construction, not ignored)
+//!
+//! [`ArgmaxOptions::window`]'s `onset` is validated (an out-of-range value is
+//! rejected, [`ExtractError::OnsetOutOfRange`]) and plumbed through, but it
+//! **cannot change any output here**. It reaches exactly one site —
+//! `try_count_from_segmentations`'s `v >= onset` threshold — and
+//! `segmentations` is argmax's hard-binary `speaker_ids` (value set exactly
+//! `{0.0, 1.0}`). For every onset the type admits (`(0.0, 1.0]`), `1.0 >= onset`
+//! is true and `0.0 >= onset` is false, so `count` is identical for all of them.
+//! Nothing else consults it: the mask uses `speaker_ids` directly and the
+//! activity gate uses `speaker_activity`'s frame count.
+//!
+//! It is kept (rather than removed like a foreign `step_samples`, which is
+//! *silently wrong* rather than merely inert) because it stays correct and
+//! becomes live the moment argmax emits a soft decode — and because dropping it
+//! would fork [`WindowOptions`] per source. Pinned by
+//! `onset_is_inert_on_argmaxs_hard_binary_decode`, which fails the day
+//! `segmentations` stops being hard-binary.
 
 use std::path::{Path, PathBuf};
 
@@ -224,7 +333,7 @@ use coremlit::{ComputeUnits, DataType, Features, Model, MultiArray, f16};
 use crate::{
   embed::{EMBED_SLOTS, EMBEDDING_DIM},
   error::{ExtractError, InferError, ModelError},
-  extract::Extraction,
+  extract::{EXCLUDE_OVERLAP_MIN_FRAMES, Extraction},
   segment::{SEG_CHUNK_SAMPLES, SEG_NUM_SLOTS},
   source::ModelSource,
   window::WindowOptions,
@@ -286,7 +395,30 @@ pub const ARGMAX_WINDOW_STRIDE_SAMPLES: usize =
 
 /// Overlap between consecutive 30 s chunks, in samples: `windowLength −
 /// windowStride = 160 000 − 16 000 = 144 000` (9 s) — `Seg.swift:114-116`'s
-/// `chunkStrideOffset`.
+/// `modelChunkStrideOffset`.
+///
+/// # The grid theorem's unstated premise: `useFullRedundancy == true`
+///
+/// This is one of TWO offsets argmax can chunk with. `Seg.swift:146` reads
+/// `chunkStrideOffset = useFullRedundancy ? modelChunkStrideOffset : 0`, and
+/// this port unconditionally implements the `true` branch — which is argmax's
+/// own default (`Seg.swift:26`: `useFullRedundancy: Bool = true`).
+///
+/// It is a premise, not a detail. With `false` the offset is `0`, so the chunk
+/// hop becomes a whole 480 000-sample chunk instead of 336 000: consecutive
+/// chunks' window grids stop abutting, the union of window starts develops
+/// 144 000-sample HOLES (nothing covers `k·480 000 + 336 000 ..
+/// (k+1)·480 000`), and `c = k * 21 + w` stops being `absolute_start / stride`
+/// — the module doc's index theorem is simply false.
+///
+/// The hop is a HOST-side choice, not something the model I/O declares, so it
+/// cannot be validated against the loaded model. It is instead pinned in
+/// constants: the module-bottom `const _` asserts `ARGMAX_CHUNK_HOP_SAMPLES ==
+/// ARGMAX_WINDOWS_PER_CHUNK * ARGMAX_WINDOW_STRIDE_SAMPLES`, which holds for
+/// this offset (336 000 = 21 × 16 000) and fails for the no-redundancy one
+/// (480 000 ≠ 336 000). That const-assert IS the premise check, and
+/// `tests`'s `the_grid_theorem_requires_argmaxs_full_redundancy` states it
+/// explicitly.
 pub const ARGMAX_CHUNK_STRIDE_OFFSET: usize = ARGMAX_WINDOW_SAMPLES - ARGMAX_WINDOW_STRIDE_SAMPLES;
 
 /// Hop between consecutive 30 s chunk starts: `480 000 − 144 000 = 336 000`
@@ -306,8 +438,10 @@ pub const ARGMAX_MIN_ACTIVE_FRAMES: f32 = 2.0;
 /// `diarization/src/offline/owned.rs:619-630`), re-applied here because
 /// `Extraction` feeds the same `dia` clustering either way.
 ///
-/// It does NOT subsume the degenerate-mask guard: the all-zero-mask
-/// embedding's norm is ≈ 0.5356, far above this (module doc).
+/// It could never have substituted for an all-zero-mask guard — that
+/// embedding's norm is ≈ 0.5356, ~54× above this (module doc) — but with
+/// `dia`'s exclude-overlap fallback in place, an all-zero mask row is
+/// unreachable for a consumed slot, so no such guard is needed.
 const PLDA_MIN_NORM: f64 = 0.01;
 
 mod names {
@@ -511,10 +645,20 @@ impl ArgmaxComputeOptions {
 ///
 /// No `Eq`: [`WindowOptions`] carries an `f32` `onset`.
 ///
-/// Unlike [`crate::extract::Options`], `window.step_samples` is not a free
-/// knob here — argmax's window stride is compiled into its graph, so
-/// [`ArgmaxSource::extract`] rejects anything but
-/// [`ARGMAX_WINDOW_STRIDE_SAMPLES`] (module doc).
+/// **Neither `WindowOptions` field is a live knob for this source**, and they
+/// are dead in two different ways — the distinction matters:
+///
+/// - `window.step_samples` would be SILENTLY WRONG: argmax's window stride is
+///   compiled into its graph, so honoring a different value is impossible and
+///   ignoring one would return an [`Extraction`] whose `chunks_sw.step()` lied
+///   about its own chunk grid. [`ArgmaxSource::extract`] therefore REJECTS
+///   anything but [`ARGMAX_WINDOW_STRIDE_SAMPLES`]
+///   ([`ExtractError::UnsupportedStepSamples`]).
+/// - `window.onset` is merely INERT — provably unable to change any output,
+///   because argmax's `segmentations` are hard-binary (module doc's "`onset` is
+///   INERT for this source"). It is validated and plumbed through rather than
+///   rejected: it stays correct, and it becomes live the moment argmax emits a
+///   soft decode.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ArgmaxOptions {
@@ -544,8 +688,11 @@ impl ArgmaxOptions {
     }
   }
 
-  /// The sliding-window geometry. Only its `onset` is a free knob; see the
-  /// struct doc for `step_samples`.
+  /// The sliding-window geometry.
+  ///
+  /// Neither of its fields can change this source's output: `step_samples` is
+  /// REJECTED unless it is [`ARGMAX_WINDOW_STRIDE_SAMPLES`], and `onset` is
+  /// inert by construction on argmax's hard-binary decode. See the struct doc.
   #[inline(always)]
   pub const fn window(&self) -> WindowOptions {
     self.window
@@ -771,14 +918,30 @@ fn window_plans(
 }
 
 /// Builds the embedder's `speaker_masks [1, 64, 1767]` buffer for one 30 s
-/// chunk — the exact scatter of `Emb.swift:216-253`.
+/// chunk — argmax's scatter (`Emb.swift:216-253`) with `dia`'s
+/// exclude-overlap FALLBACK applied per slot (module doc's "The
+/// overlap-exclusion fallback").
 ///
 /// Row `w * 3 + s` (`Emb.swift:240`) holds, at timeline position
-/// `window_start_frame(w) + f` (`Emb.swift:247`), the overlap-excluded mask
-/// value `speaker_ids[w][f][s] * (1 - overlapped[w][f])` (`Emb.swift:245`) —
+/// `window_start_frame(w) + f` (`Emb.swift:247`), that slot's pooling mask —
 /// but ONLY where slot `s` cleared the activity gate (`Emb.swift:248`), and
 /// only for windows with at least one active slot (`Emb.swift:233-236`).
 /// Everything else stays zero.
+///
+/// The mask is argmax's overlap-excluded (*clean*) value
+/// `speaker_ids[w][f][s] * (1 - overlapped[w][f])` (`Emb.swift:245`) — UNLESS
+/// that leaves `<= EXCLUDE_OVERLAP_MIN_FRAMES` nonzero frames, in which case
+/// this slot falls back to its raw `speaker_ids` mask, exactly as `dia` does
+/// (`owned.rs:573-591`, ported for the other source by [`crate::extract`]'s
+/// `derive_slot_plans`). The fallback is PER-SLOT: it replaces only this row.
+///
+/// This is the one place the port deliberately does NOT do what `Emb.swift`
+/// does, and the module doc gives the full argument. In short: argmax's
+/// unconditional clean mask starves a slot whose active frames are mostly
+/// overlap, and argmax compensates for that downstream, in a clustering stage
+/// this port does not own (`VBxClustering.swift:50`). Falling back makes the
+/// embedding real instead, and makes an all-zero mask row unreachable for any
+/// slot that cleared the gate.
 ///
 /// Note this uses each plan's `active` but NOT its `bounded`: argmax builds
 /// masks for ALL 21 windows (`Emb.swift:230`) and applies `bounded` only when
@@ -804,11 +967,29 @@ fn build_speaker_masks(
         continue; // Emb.swift:248 — inactive slots never written
       }
       let row = w * ARGMAX_NUM_SPEAKERS + s; // Emb.swift:240
-      for f in 0..ARGMAX_FRAMES_PER_WINDOW {
+      let span = &mut masks[row * ARGMAX_MASK_FRAMES + start..][..ARGMAX_FRAMES_PER_WINDOW];
+
+      // The clean (overlap-excluded) mask — argmax's own value, Emb.swift:245
+      // — and the clean-frame count dia's fallback keys on (owned.rs:583-588).
+      let mut clean_count = 0usize;
+      for (f, cell) in span.iter_mut().enumerate() {
         let id = ids[ids_index(w, f, s)];
         let overlap = overlapped[overlapped_index(w, f)];
-        let value = id * (1.0 - overlap); // Emb.swift:245
-        masks[row * ARGMAX_MASK_FRAMES + start + f] = f16::from_f32(value);
+        let value = id * (1.0 - overlap);
+        if value != 0.0 {
+          clean_count += 1;
+        }
+        *cell = f16::from_f32(value);
+      }
+
+      // dia's per-slot exclude-overlap FALLBACK (owned.rs:589): too few clean
+      // frames survive, so drop the overlap exclusion for THIS slot and pool
+      // over its raw `speaker_ids` mask. `<=`, per pyannote's
+      // `np.sum(clean_mask) > min_num_frames`.
+      if clean_count <= EXCLUDE_OVERLAP_MIN_FRAMES {
+        for (f, cell) in span.iter_mut().enumerate() {
+          *cell = f16::from_f32(ids[ids_index(w, f, s)]);
+        }
       }
     }
   }
@@ -826,8 +1007,12 @@ fn overlapped_index(w: usize, f: usize) -> usize {
 }
 
 /// Whether mask row `row` of a [`build_speaker_masks`] buffer is entirely
-/// zero — the degenerate-mask test (module doc). Reachable for an ACTIVE slot
-/// whose every active frame is also an overlap frame.
+/// zero.
+///
+/// For a slot that cleared the activity gate this is UNREACHABLE once `dia`'s
+/// exclude-overlap fallback is applied (module doc), which is why it is an
+/// invariant probe — `place_embeddings`' `debug_assert!`, plus the tests that
+/// pin the property — rather than a guard on the hot path.
 fn mask_row_is_zero(masks: &[f16], row: usize) -> bool {
   masks[row * ARGMAX_MASK_FRAMES..(row + 1) * ARGMAX_MASK_FRAMES]
     .iter()
@@ -1194,7 +1379,7 @@ fn write_segmentations(
 
 /// Places one bounded window's consumed embedding rows into `raw_embeddings`,
 /// dropping (row left zero + segmentation column zeroed) any slot that fails
-/// the degenerate-mask or PLDA-norm guard.
+/// the PLDA-norm guard.
 ///
 /// `embeddings` is the embedder's flat `[64, 256]` output; the row for
 /// `(w, s)` is `w * 3 + s` (`Emb.swift:288,291`).
@@ -1204,6 +1389,11 @@ fn write_segmentations(
 /// a hard error, matching dia (`owned.rs:611-618`) and this crate's policy
 /// that `NonFiniteOutput` is never a silent drop. The flat index reported is
 /// into the model's own `speaker_embeddings` output.
+///
+/// # Panics
+/// In debug builds, if a consumed slot's mask row is all-zero — unreachable by
+/// construction (module doc), and the property that retired the bespoke
+/// all-zero-mask drop guard an earlier revision carried here.
 fn place_embeddings(
   c: usize,
   w: usize,
@@ -1219,12 +1409,18 @@ fn place_embeddings(
     }
     let row = w * ARGMAX_NUM_SPEAKERS + s;
 
-    // Degenerate-mask guard (module doc): an all-zero mask row yields a
-    // FINITE constant (L2 ≈ 0.5356) that the norm guard below cannot catch.
-    if mask_row_is_zero(masks, row) {
-      zero_slot_column(&mut segmentations[chunk_segmentation_range(c)], s);
-      continue;
-    }
+    // Unreachable by construction, asserted rather than guarded (module doc):
+    // this slot cleared the `> 2`-frame activity gate, so with dia's
+    // exclude-overlap fallback its mask is either the clean mask (`> 2`
+    // nonzero frames) or the raw `speaker_ids` mask (the gate's `> 2` active
+    // frames). An all-zero row would mean the fallback did not fire when it
+    // should have, and the embedder would return the degenerate norm-0.5356
+    // constant that the PLDA-norm guard below cannot catch.
+    debug_assert!(
+      !mask_row_is_zero(masks, row),
+      "chunk {c} (w={w}) slot {s}: an ACTIVE slot's mask row cannot be all-zero \
+       once dia's exclude-overlap fallback is applied"
+    );
 
     let embedding = &embeddings[row * EMBEDDING_DIM..(row + 1) * EMBEDDING_DIM];
     if let Some(offset) = embedding.iter().position(|v| !v.is_finite()) {
@@ -1262,6 +1458,10 @@ impl ModelSource for ArgmaxSource {
   ///   doc). Rejected rather than silently ignored.
   /// - [`ExtractError::OnsetOutOfRange`] if `onset` is not finite in
   ///   `(0.0, 1.0]` (same guard as [`crate::extract::Extractor::extract`]).
+  ///   Note that every onset that PASSES this guard yields the identical
+  ///   `Extraction` — `onset` is inert on argmax's hard-binary decode (module
+  ///   doc). The guard is kept so an out-of-range value is still an error
+  ///   rather than silently meaningless.
   /// - [`ExtractError::Infer`] if any of the three models fails, an output's
   ///   shape diverges, or a CONSUMED tensor holds a non-finite value.
   /// - [`ExtractError::OutputFrameCountOverflow`] if the derived
@@ -1377,7 +1577,13 @@ const _: () = {
   assert!(ARGMAX_NUM_SPEAKERS == EMBED_SLOTS);
   assert!(ARGMAX_WINDOW_SAMPLES == SEG_CHUNK_SAMPLES);
   assert!(ARGMAX_WINDOW_STRIDE_SAMPLES == crate::window::DEFAULT_STEP_SAMPLES as usize);
-  // The identity the whole `c = k*21 + w` mapping rests on (module doc).
+  // The identity the whole `c = k*21 + w` mapping rests on (module doc) — and,
+  // equivalently, the premise that this port implements argmax's
+  // `useFullRedundancy == true` branch (`Seg.swift:146`, its default at
+  // `Seg.swift:26`). The no-redundancy offset (0) would make the hop a whole
+  // 480 000-sample chunk, which is NOT 21 × 16 000, and this assert would fail
+  // rather than the grid quietly developing holes. See
+  // `ARGMAX_CHUNK_STRIDE_OFFSET`.
   assert!(ARGMAX_CHUNK_HOP_SAMPLES == ARGMAX_WINDOWS_PER_CHUNK * ARGMAX_WINDOW_STRIDE_SAMPLES);
   assert!(ARGMAX_MASK_FRAMES == 1767);
 };
