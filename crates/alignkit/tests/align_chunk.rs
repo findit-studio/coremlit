@@ -25,21 +25,25 @@ mod common;
 use core::sync::atomic::AtomicBool;
 
 use alignkit::{
-  ANALYSIS_TIMEBASE, Aligner, EnglishNormalizer, Lang, OutputClock, default_oov_decisions,
+  ANALYSIS_TIMEBASE, Aligner, EnglishNormalizer, Lang, OutputClock, Word, default_oov_decisions,
 };
 
-#[test]
-#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
-fn align_chunk_produces_monotonic_word_timings() {
-  let model = common::model_path();
-  let samples = common::load_wav_mono_f32(&common::jfk_wav_path());
-  assert!(!samples.is_empty(), "fixture decoded to no samples");
-
-  // `Aligner::from_paths` → `AlignerOptions::new()` → `DEFAULT_ENCODER_COMPUTE`.
-  // Deliberately NOT a hardcoded compute placement: this is the crate's only
-  // end-to-end proof, so it must run the configuration that actually ships. A
-  // gate pinned to a compute unit proves only that compute unit.
-  let aligner = Aligner::from_paths(Lang::En, &model, Box::new(EnglishNormalizer::new())).expect(
+/// Builds the aligner and drives one real chunk (`jfk.wav` + its known
+/// transcript) end-to-end, on the crate's shipping configuration.
+///
+/// `Aligner::from_paths` → `AlignerOptions::new()` → `DEFAULT_ENCODER_COMPUTE`.
+/// Deliberately NOT a hardcoded compute placement: these are the crate's only
+/// end-to-end proofs, so they must run the configuration that actually ships.
+/// A gate pinned to a compute unit proves only that compute unit — the previous
+/// default (`ComputeUnits::All`) corrupted every emission tensor while every
+/// model-gated test, each pinned to `CpuOnly`, stayed green.
+fn align_jfk(samples: &[f32]) -> Vec<Word> {
+  let aligner = Aligner::from_paths(
+    Lang::En,
+    &common::model_path(),
+    Box::new(EnglishNormalizer::new()),
+  )
+  .expect(
     "build the En aligner from the CoreML model + bundled tokenizer (set ALIGNKIT_TEST_MODELS \
      to the model directory)",
   );
@@ -54,11 +58,20 @@ fn align_chunk_produces_monotonic_word_timings() {
   let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock construction");
   let abort = AtomicBool::new(false);
 
-  let result = aligner
-    .align_chunk(&samples, &[], text, clock, &abort, &decisions)
-    .expect("align_chunk succeeds end-to-end");
+  aligner
+    .align_chunk(samples, &[], text, clock, &abort, &decisions)
+    .expect("align_chunk succeeds end-to-end")
+    .words()
+    .to_vec()
+}
 
-  let words = result.words();
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn align_chunk_produces_monotonic_word_timings() {
+  let samples = common::load_wav_mono_f32(&common::jfk_wav_path());
+  assert!(!samples.is_empty(), "fixture decoded to no samples");
+
+  let words = &align_jfk(&samples);
   assert!(
     !words.is_empty(),
     "a real transcript over matching audio must produce words"
@@ -91,5 +104,62 @@ fn align_chunk_produces_monotonic_word_timings() {
       word.text()
     );
     prev_start = start;
+  }
+}
+
+/// **Gate 3 — determinism** (design spec §7): two runs, bit-identical.
+///
+/// Not a tolerance and not a statistic: `assert_eq!` on the PTS integers and on
+/// the score's raw bits (`f32::to_bits`, so a `NaN` or a `-0.0`/`+0.0` flip
+/// cannot slip through the `==` that `f32: PartialEq` would give). Every stage
+/// downstream of the encoder is deterministic dynamic programming, so this is
+/// really a statement about CoreML: the same weights on the same input on the
+/// same placement must return the same tensor, twice.
+///
+/// It matters because the alternative was live. When this model was scheduled
+/// on the ANE, 16.7% of its emission cells saturated to a `-45440` sentinel —
+/// and that corruption was **bit-identical run to run**. Had it instead been
+/// *non-deterministic*, every other gate in this crate would have flickered
+/// rather than failed, which is far harder to diagnose. This test is what says
+/// which of the two we are in.
+///
+/// Deliberately reloads the model on each run (via [`align_jfk`]) rather than
+/// reusing one `Aligner`: a load-time nondeterminism — a compute-placement
+/// decision CoreML makes differently on a second load, say — is exactly the
+/// class of defect a same-session double-`predict` would hide.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn align_chunk_is_bit_identical_across_runs() {
+  let samples = common::load_wav_mono_f32(&common::jfk_wav_path());
+
+  let first = align_jfk(&samples);
+  let second = align_jfk(&samples);
+
+  assert!(
+    !first.is_empty(),
+    "a real transcript over matching audio must produce words"
+  );
+  assert_eq!(
+    first.len(),
+    second.len(),
+    "two runs over identical input produced different word counts"
+  );
+
+  for (a, b) in first.iter().zip(&second) {
+    assert_eq!(a.text(), b.text(), "word text differs between runs");
+    assert_eq!(
+      (a.range().start_pts(), a.range().end_pts()),
+      (b.range().start_pts(), b.range().end_pts()),
+      "word `{}`: timing differs between two runs over identical input",
+      a.text()
+    );
+    assert_eq!(
+      a.score().to_bits(),
+      b.score().to_bits(),
+      "word `{}`: score differs between two runs over identical input ({} vs {})",
+      a.text(),
+      a.score(),
+      b.score()
+    );
   }
 }

@@ -38,15 +38,51 @@ tracing = { workspace = true, optional = true }
 default = []
 serde = ["dep:serde"]
 tracing = ["dep:tracing"]
+# DEV/TEST ONLY — adds nothing to this library.
+#
+# Turns on `asry`'s `alignment` feature, which lights up its ONNX-Runtime
+# forced aligner (`asry::Aligner`) — the ORACLE the word-timing parity gate
+# (`tests/parity_words.rs`) measures alignkit against. That feature implies
+# asry's `runner`, so enabling this drags **ort + whisper.cpp** into the
+# build; a first compile pays a whisper.cpp cmake build measured in minutes.
+#
+# It is a feature rather than a plain dev-dependency because Cargo unions
+# features across `[dependencies]` and `[dev-dependencies]` for the same
+# package: a dev-dep on `asry/alignment` would put ort and whisper.cpp into
+# EVERY `cargo test -p alignkit` build, which is exactly what B4 removed.
+# Behind this feature, plus `required-features` on the `parity_words` test
+# target below, an ordinary `cargo test -p alignkit` links neither.
+#
+# The parity gate therefore needs its feature named explicitly:
+#
+#   cargo test -p alignkit --features parity-oracle -- --ignored
+#
+# `ort` is in `load-dynamic` mode, so the build needs no ONNX Runtime, but
+# RUNNING the gate needs `libonnxruntime.dylib` on the loader path (Homebrew
+# `onnxruntime`, or point `ORT_DYLIB_PATH` at it).
+parity-oracle = ["asry/alignment"]
+
+# `required-features` (not an `#[ignore]`, not a `#[cfg]`) is what keeps ort
+# out of the default test build: without `parity-oracle` cargo does not
+# BUILD this target at all. Every other `tests/*.rs` stays auto-discovered.
+[[test]]
+name = "parity_words"
+path = "tests/parity_words.rs"
+required-features = ["parity-oracle"]
+
+[[bench]]
+name = "align"
+harness = false
 
 [dev-dependencies]
-# The B5 word-timing parity gate will re-add asry with the
-# `parity-dump-emission` feature (which implies `alignment`: ort +
-# whisper.cpp + the ONNX wav2vec2 oracle) as a dev-dependency. B4 does
-# not link that oracle: its own end-to-end test drives only alignkit's
-# CoreML pipeline, and `asry` is already available to tests through the
-# `[dependencies]` entry above (emissions-only). Keeping ort/whisper.cpp
-# out of alignkit's own test build until B5 needs it.
+# An integration test (`tests/*.rs`) is an external consumer: it links the
+# `alignkit` lib and the DEV-dependencies, never the lib's own
+# `[dependencies]`. `tests/parity_words.rs` names `asry::Aligner` (the ONNX
+# oracle) directly, so `asry` must appear here too. Cargo unions the features
+# of both entries, so this adds nothing on its own — `emissions` comes from
+# `[dependencies]` above, and `alignment` arrives only with `parity-oracle`.
+asry = { path = "../../../asry", default-features = false }
+criterion.workspace = true
 hound.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

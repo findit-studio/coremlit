@@ -23,6 +23,46 @@
 //! halves.
 //!
 //! macOS only (built on [`coremlit`]).
+//!
+//! # How far you can trust the timings
+//!
+//! Because alignkit and `asry` share every stage except the encoder, the
+//! encoder swap can be measured on its own — and it has been, at the word
+//! level, on real speech, on the shipping compute default
+//! (`tests/parity_words.rs`). On `jfk.wav`, against asry's ONNX-Runtime
+//! aligner: **38 of 44 word boundaries agree to within one 20 ms frame**, the
+//! median disagreement is **12.8 ms** (under a single frame), and the p90 is
+//! 47 ms.
+//!
+//! One boundary disagrees by 908 ms, and there **the oracle is the one that is
+//! wrong**: it places the second `ask` 873 ms before the audio contains any
+//! evidence for it, inside a silent pause across which the acoustic model's
+//! `logP(blank)` is fp16-saturated at exactly `0.0` for 41 consecutive frames.
+//! alignkit puts that word 35 ms from its true acoustic onset. The lesson
+//! generalises and is worth stating in the crate's own docs: **a forced
+//! aligner's word boundaries are only as determined as the acoustic evidence
+//! under them.** Across a long pause, with no VAD, the onset frame is a
+//! tie-break among numerically identical paths — supply `sub_segments` from a
+//! real VAD when you have one.
+//!
+//! # Features
+//!
+//! | feature | default | what it does |
+//! |---|---|---|
+//! | `serde` | no | `Serialize`/`Deserialize` for [`AlignerOptions`] and [`encode::EncoderOptions`] |
+//! | `tracing` | no | structured spans over load and per-chunk alignment |
+//! | `parity-oracle` | no | **dev/test only.** Turns on `asry`'s ONNX aligner (and with it `ort` + whisper.cpp) as the oracle for the word-timing parity gate. Adds nothing to this library; see `Cargo.toml`. |
+//!
+//! # Gates
+//!
+//! ```text
+//! cargo test -p alignkit -- --ignored                        # e2e + determinism + model I/O
+//! cargo test -p alignkit --features parity-oracle -- --ignored   # + the word-timing parity gate
+//! cargo bench -p alignkit --bench align                      # encode / align_chunk, RTF
+//! ```
+//!
+//! None of them skip: a missing model or fixture is a hard failure, never a
+//! green `0 passed`.
 
 pub mod aligner;
 #[cfg(feature = "serde")]

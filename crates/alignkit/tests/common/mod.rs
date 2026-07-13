@@ -68,6 +68,86 @@ pub fn jfk_wav_path() -> PathBuf {
 pub const JFK_TRANSCRIPT: &str = "And so my fellow Americans ask not what your country can do for \
                                   you, ask what you can do for your country.";
 
+/// SHA-256 of [`jfk_wav_path`]'s **decoded** buffer — the 176,000 f32
+/// samples [`load_wav_mono_f32`] returns, hashed as little-endian bytes.
+///
+/// This is the input-identity pin for `tests/parity_words.rs`. That gate
+/// compares alignkit's word timings against asry's ONNX aligner, and such a
+/// comparison is worth exactly nothing if the two sides are not looking at
+/// the same audio: the FIRST attempt at an alignkit-vs-asry comparison
+/// (`.superpowers/sdd/alignkit-gate1-diagnostic.md`) reported an alarming
+/// "86.6% divergence" that turned out to be a harness bug — one side got a
+/// padded buffer, the other an unpadded one. The number was measuring the
+/// harness, not the models.
+///
+/// The gate feeds one `Vec<f32>`, by reference, to both aligners, so
+/// buffer identity holds by construction; this digest additionally pins the
+/// FIXTURE, so a `jfk.wav` that is silently re-encoded, resampled, or
+/// swapped out from under the cross-crate relative path fails loudly instead
+/// of re-measuring parity on different audio.
+///
+/// `#[allow(dead_code)]`: only `tests/parity_words.rs` uses it.
+#[allow(dead_code)]
+pub const JFK_SAMPLES_SHA256: &str =
+  "ebd52851100536db02d12c49fddd010372dcdc70243562e057553d476b706ae0";
+
+/// Lowercase-hex SHA-256 of a decoded sample buffer, over its little-endian
+/// `f32` bytes. Backs [`JFK_SAMPLES_SHA256`].
+///
+/// `#[allow(dead_code)]`: only `tests/parity_words.rs` uses it.
+#[allow(dead_code)]
+pub fn sha256_samples_hex(samples: &[f32]) -> String {
+  use sha2::{Digest, Sha256};
+  let mut hasher = Sha256::new();
+  for sample in samples {
+    hasher.update(sample.to_le_bytes());
+  }
+  hasher
+    .finalize()
+    .iter()
+    .map(|b| format!("{b:02x}"))
+    .collect()
+}
+
+/// Directory holding asry's ONNX wav2vec2 oracle — the `models/` directory
+/// of the asry checkout alignkit already path-depends on
+/// (`crates/alignkit/Cargo.toml`'s `asry = { path = "../../../asry" }`), so
+/// the default resolves for anyone who can build this crate at all.
+/// Overridable via `ALIGNKIT_ASRY_MODELS`.
+///
+/// `#[allow(dead_code)]`: only `tests/parity_words.rs` uses it.
+#[allow(dead_code)]
+pub fn asry_models_dir() -> PathBuf {
+  std::env::var_os("ALIGNKIT_ASRY_MODELS").map_or_else(
+    || {
+      PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../asry")
+        .join("models")
+    },
+    PathBuf::from,
+  )
+}
+
+/// asry's ONNX wav2vec2-base-960h export (`onnx-community/
+/// wav2vec2-base-960h-ONNX`, fetched by asry's own `build.rs`). Raw
+/// **logits**, 32-class head — the oracle's encoder.
+///
+/// `#[allow(dead_code)]`: only `tests/parity_words.rs` uses it.
+#[allow(dead_code)]
+pub fn asry_onnx_model_path() -> PathBuf {
+  asry_models_dir().join("wav2vec2-base-960h.onnx")
+}
+
+/// The 32-class HuggingFace tokenizer matching [`asry_onnx_model_path`].
+/// **Not** alignkit's bundled 29-class chordai asset: each tokenizer belongs
+/// to its own CTC head, and asry's `Aligner::from_paths` validates the width.
+///
+/// `#[allow(dead_code)]`: only `tests/parity_words.rs` uses it.
+#[allow(dead_code)]
+pub fn asry_tokenizer_path() -> PathBuf {
+  asry_models_dir().join("wav2vec2-base-960h-tokenizer.json")
+}
+
 /// Reads a 16 kHz mono 16-bit PCM WAV into normalized f32 samples.
 ///
 /// Mirrors whisperkit's `tests/common::load_wav_mono_f32`.
