@@ -35,7 +35,70 @@ fn decoding_defaults_match_swift() {
   assert_eq!(o.concurrent_worker_count().get(), 16);
   assert_eq!(o.chunking_strategy(), ChunkingStrategy::Disabled);
   assert!(!o.verbose());
+  // Rust-only addition (coremlit issue #14), and the ONE default here that
+  // deliberately does NOT match Swift: Swift emits `[BLANK_AUDIO]` for
+  // silence, this drops it unless the caller opts back in. Pinned in full
+  // by `drop_blank_audio_defaults_on_and_opts_out_to_swift_parity`.
+  assert!(o.drop_blank_audio());
   assert_eq!(DecodingOptions::default(), DecodingOptions::new());
+}
+
+#[test]
+fn drop_blank_audio_defaults_on_and_opts_out_to_swift_parity() {
+  // Default ON (the maintainer decision on coremlit issue #14 — the
+  // inverse of that issue's originally-proposed `suppress_blank_audio:
+  // false`), pinned to the const so the two cannot drift apart.
+  let o = DecodingOptions::new();
+  assert!(o.drop_blank_audio());
+  assert_eq!(o.drop_blank_audio(), DEFAULT_DROP_BLANK_AUDIO); // pin to const
+
+  // Full bool vocabulary: `clear_` is the Swift-parity escape hatch.
+  assert!(
+    !DecodingOptions::new()
+      .maybe_drop_blank_audio(false)
+      .drop_blank_audio()
+  );
+  assert!(
+    DecodingOptions::new()
+      .with_drop_blank_audio()
+      .drop_blank_audio()
+  );
+  let mut m = DecodingOptions::new();
+  m.clear_drop_blank_audio();
+  assert!(!m.drop_blank_audio(), "clear_ opts out to Swift parity");
+  m.set_drop_blank_audio();
+  assert!(m.drop_blank_audio());
+  m.update_drop_blank_audio(false);
+  assert!(!m.drop_blank_audio());
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn drop_blank_audio_serde_default_is_true_not_bool_default() {
+  // The whole reason this field carries `serde(default = "fn")` rather than
+  // the bare `serde(default)`: `bool::default()` is `false`, which is the
+  // OPPOSITE of this knob's contract. A config that omits the field must
+  // still DROP; only an explicit `false` opts out.
+  let omitted: DecodingOptions = serde_json::from_str("{}").unwrap();
+  assert!(
+    omitted.drop_blank_audio(),
+    "an omitted field must default to dropping, not to bool::default()"
+  );
+  let explicit_false: DecodingOptions =
+    serde_json::from_str(r#"{"drop_blank_audio":false}"#).unwrap();
+  assert!(!explicit_false.drop_blank_audio());
+
+  // Round-trips in both states (always serialized — never skipped, so a
+  // persisted provenance-grade config always records which way it ran).
+  for wanted in [true, false] {
+    let options = DecodingOptions::new().maybe_drop_blank_audio(wanted);
+    let json = serde_json::to_string(&options).unwrap();
+    assert!(json.contains("drop_blank_audio"));
+    assert_eq!(
+      serde_json::from_str::<DecodingOptions>(&json).unwrap(),
+      options
+    );
+  }
 }
 
 #[test]

@@ -75,7 +75,9 @@ use unicode_categories::UnicodeCategories;
 use crate::{
   audio::{self, chunker},
   backend::{AlignmentMatrix, InferenceBackend, coreml::CoreMlBackend},
-  constants::{APPEND_PUNCTUATION, DEFAULT_LANGUAGE_CODE, PREPEND_PUNCTUATION, SAMPLE_RATE},
+  constants::{
+    APPEND_PUNCTUATION, BLANK_AUDIO_MARKER, DEFAULT_LANGUAGE_CODE, PREPEND_PUNCTUATION, SAMPLE_RATE,
+  },
   decode::{
     self, TranscriptionProgressCallback,
     sampler::{self, GreedyTokenSampler},
@@ -479,6 +481,23 @@ where
     }
     timings.set_decoding_loop(decode_loop_start.elapsed().as_secs_f64());
 
+    let special_token_begin = self.tokenizer.special_tokens().special_token_begin();
+
+    // coremlit issue #14 — the blank-audio drop, as a POST-decode filter
+    // over the fully-assembled segments and nothing more: it runs after
+    // every window has decoded, so it cannot perturb decoding itself, and
+    // it is skipped outright when the caller opts out. Sequencing it
+    // BEFORE the text assembly below is what makes a dropped segment's
+    // tokens vanish from `TranscriptionResult::text` too, rather than
+    // leaving the marker stranded in the aggregate text with no segment
+    // behind it — pure silence collapses to a genuinely empty result.
+    // Speech decodes no blank segment, so this is a no-op on the golden
+    // parity inputs under either setting (see
+    // `DecodingOptions::drop_blank_audio`).
+    if options.drop_blank_audio() {
+      self.drop_blank_audio_segments(&mut all_segments, special_token_begin)?;
+    }
+
     // :298-305 — every segment's tokens, filtered to non-special ids,
     // decoded, and trimmed. `all_tokens` isn't tracked as its own running
     // accumulator (unlike Swift's `allTokens`): since nothing here diverges
@@ -486,7 +505,6 @@ where
     // `windowPostProcess` hook to make them differ), deriving the token
     // list from `all_segments` once at the end is equivalent and avoids a
     // redundant parallel Vec.
-    let special_token_begin = self.tokenizer.special_tokens().special_token_begin();
     let word_tokens: Vec<u32> = all_segments
       .iter()
       .flat_map(|segment| segment.tokens_slice().iter().copied())
@@ -503,6 +521,65 @@ where
       detected_language.unwrap_or_else(|| DEFAULT_LANGUAGE_CODE.to_string()),
       timings,
     ))
+  }
+
+  /// Removes every blank-audio segment from `segments` in place, for
+  /// [`DecodingOptions::drop_blank_audio`] (coremlit issue #14). A segment
+  /// is blank-audio when its CLEAN text — its own tokens with the
+  /// special/timestamp ids (`>= special_token_begin`) stripped, decoded,
+  /// and Swift-whitespace-trimmed — is exactly
+  /// [`BLANK_AUDIO_MARKER`]. That projection is deliberately the
+  /// per-segment analogue of the aggregate text [`Self::run`] assembles
+  /// from the survivors, which is why the match is against the *clean*
+  /// text and not [`TranscriptionSegment::text`]: the latter still carries
+  /// its `<|startoftranscript|>`/timestamp tokens under the default
+  /// `skip_special_tokens == false`, so equality against the bare marker
+  /// would never hold there (see [`BLANK_AUDIO_MARKER`]'s own doc). It is
+  /// computed only to decide the drop and never reused to build the result
+  /// text — that stays the single aggregate decode of the surviving
+  /// segments' concatenated tokens, so per-segment isolation cannot change
+  /// the transcript's spacing.
+  ///
+  /// Renumbering is deliberately conditional: survivors are reassigned a
+  /// contiguous `0..N` id range **only when a segment was actually
+  /// dropped** — restoring the same id contiguity
+  /// [`merge_transcription_results`] gives a finalized result, which a bare
+  /// removal would otherwise leave gapped. When nothing is blank (every
+  /// speech input, the golden parity clips included) this returns having
+  /// touched nothing at all: same segments, same order, same ids.
+  ///
+  /// # Errors
+  /// [`TranscribeError::Tokenizer`] if a segment's tokens fail to decode.
+  fn drop_blank_audio_segments(
+    &self,
+    segments: &mut Vec<TranscriptionSegment>,
+    special_token_begin: u32,
+  ) -> Result<(), TranscribeError> {
+    let mut blank = Vec::with_capacity(segments.len());
+    for segment in segments.iter() {
+      let clean_tokens: Vec<u32> = segment
+        .tokens_slice()
+        .iter()
+        .copied()
+        .filter(|&token| token < special_token_begin)
+        .collect();
+      let clean_text = self.tokenizer.decode(&clean_tokens, false)?;
+      blank.push(trim_swift_whitespaces(&clean_text) == BLANK_AUDIO_MARKER);
+    }
+
+    if !blank.contains(&true) {
+      return Ok(());
+    }
+
+    let survivors: Vec<TranscriptionSegment> = segments
+      .drain(..)
+      .zip(blank)
+      .filter_map(|(segment, is_blank)| (!is_blank).then_some(segment))
+      .enumerate()
+      .map(|(id, segment)| segment.with_id(id))
+      .collect();
+    *segments = survivors;
+    Ok(())
   }
 
   /// The per-window temperature-fallback ladder: retries decoding at

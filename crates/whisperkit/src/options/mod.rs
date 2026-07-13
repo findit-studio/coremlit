@@ -153,6 +153,9 @@ pub const DEFAULT_FIRST_TOKEN_LOGPROB_THRESHOLD: f32 = -1.5;
 pub const DEFAULT_NO_SPEECH_THRESHOLD: f32 = 0.6;
 /// Default [`DecodingOptions::use_prefill_prompt`].
 pub const DEFAULT_USE_PREFILL_PROMPT: bool = true;
+/// Default [`DecodingOptions::drop_blank_audio`] — blank-audio segments are
+/// dropped unless the caller opts back into emitting them.
+pub const DEFAULT_DROP_BLANK_AUDIO: bool = true;
 /// Default [`DecodingOptions::concurrent_worker_count`] (Swift's macOS default).
 pub const DEFAULT_CONCURRENT_WORKER_COUNT: NonZeroUsize = NonZeroUsize::new(16).unwrap();
 
@@ -202,13 +205,27 @@ fn default_no_speech_threshold() -> Option<f32> {
 fn default_use_prefill_prompt() -> bool {
   DEFAULT_USE_PREFILL_PROMPT
 }
+// `drop_blank_audio` likewise defaults `true`, against `bool::default()`'s
+// `false` — a config that omits the field must still DROP, not emit.
+#[cfg(feature = "serde")]
+fn default_drop_blank_audio() -> bool {
+  DEFAULT_DROP_BLANK_AUDIO
+}
 
 /// Decode-time configuration: Swift's 27-knob `DecodingOptions` surface
-/// (spec §6.2), plus one Rust-only addition — [`Self::seed`], for
+/// (spec §6.2), plus two Rust-only additions — [`Self::seed`], for
 /// reproducible temperature-fallback sampling (coremlit issue #9; see the
-/// crate root's "Reproducibility and provenance" docs). `new()`/`Default`
-/// apply Swift's defaults verbatim for every ported knob; `seed` defaults
-/// unset (`None`), matching today's OS-seeded behavior exactly.
+/// crate root's "Reproducibility and provenance" docs), and
+/// [`Self::drop_blank_audio`], the post-decode blank-audio segment filter
+/// (coremlit issue #14). `new()`/`Default` apply Swift's defaults verbatim
+/// for every ported knob; `seed` defaults unset (`None`), matching today's
+/// OS-seeded behavior exactly.
+///
+/// **[`Self::drop_blank_audio`] is the sole knob whose default deliberately
+/// diverges from Swift** (it defaults `true`, dropping the `[BLANK_AUDIO]`
+/// segments Swift emits) — a product decision, with `false` as the exact
+/// parity escape hatch. See that field's own doc; every other default here
+/// is Swift's.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DecodingOptions {
@@ -373,6 +390,11 @@ pub struct DecodingOptions {
   /// Emit verbose per-step decode logging.
   #[cfg_attr(feature = "serde", serde(default))]
   verbose: bool,
+  /// Drop decoded blank-audio segments instead of emitting them. Defaults
+  /// `true` — see [`Self::drop_blank_audio`] for the full contract and the
+  /// deliberate Swift-parity divergence it carries.
+  #[cfg_attr(feature = "serde", serde(default = "default_drop_blank_audio"))]
+  drop_blank_audio: bool,
 }
 
 impl Default for DecodingOptions {
@@ -413,6 +435,7 @@ impl DecodingOptions {
       concurrent_worker_count: DEFAULT_CONCURRENT_WORKER_COUNT,
       chunking_strategy: ChunkingStrategy::Disabled,
       verbose: false,
+      drop_blank_audio: DEFAULT_DROP_BLANK_AUDIO,
     }
   }
 
@@ -1390,6 +1413,84 @@ impl DecodingOptions {
   #[inline(always)]
   pub const fn clear_verbose(&mut self) -> &mut Self {
     self.verbose = false;
+    self
+  }
+
+  // -- drop_blank_audio (bool) ----------------------------------------------
+  /// Drop blank-audio segments from the transcription instead of emitting
+  /// them. **Defaults `true`** (coremlit issue #14).
+  ///
+  /// Some Whisper models decode silent or near-silent audio to the literal
+  /// text [`BLANK_AUDIO_MARKER`](crate::constants::BLANK_AUDIO_MARKER)
+  /// (`"[BLANK_AUDIO]"`) — a training-data artifact the decoder genuinely
+  /// samples, not a special token this crate inserts (see that constant's
+  /// doc). When this is `true`,
+  /// [`TranscribeTask::run`](crate::transcribe::TranscribeTask::run)
+  /// applies a **post-decode filter** to the assembled segments: any
+  /// segment whose *clean* text — its tokens with the special/timestamp
+  /// ids stripped, decoded, and whitespace-trimmed, i.e. the same
+  /// projection [`TranscriptionResult::text`](crate::result::TranscriptionResult::text)
+  /// is built from, **not** the raw
+  /// [`TranscriptionSegment::text`](crate::result::TranscriptionSegment::text),
+  /// which still carries its special tokens — is exactly the marker gets
+  /// removed before the result text is assembled. Pure silence therefore
+  /// yields an **empty result** (zero segments, empty text) rather than a
+  /// one-segment `[BLANK_AUDIO]`; a blank stretch *between* speech is
+  /// dropped while the speech around it survives. Survivors are renumbered
+  /// to a contiguous `0..N` id range whenever a drop actually occurs, the
+  /// same contiguity
+  /// [`merge_transcription_results`](crate::result::merge_transcription_results)
+  /// gives a finalized result; when nothing is dropped the segments —
+  /// their ids included — are left exactly as decoded.
+  ///
+  /// **This default is the one deliberate Swift-parity divergence in this
+  /// type.** Swift WhisperKit *emits* `[BLANK_AUDIO]` for silence, so
+  /// defaulting to `true` diverges from it by design: `[BLANK_AUDIO]` is
+  /// noise for the search/index consumers this crate targets, and making
+  /// every one of them post-filter it was the worse default. Set this
+  /// `false` ([`Self::clear_drop_blank_audio`]) to restore **exact Swift
+  /// parity** — the filter is then skipped outright and the marker is
+  /// emitted verbatim, one segment, byte-for-byte as before this option
+  /// existed.
+  ///
+  /// Speech-only audio is unaffected either way: it decodes no such
+  /// segment, so the filter finds nothing to drop and the golden parity
+  /// transcripts are identical under both settings.
+  #[inline(always)]
+  pub const fn drop_blank_audio(&self) -> bool {
+    self.drop_blank_audio
+  }
+  /// Builder form of [`Self::set_drop_blank_audio`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_drop_blank_audio(mut self) -> Self {
+    self.set_drop_blank_audio();
+    self
+  }
+  /// Sets [`Self::drop_blank_audio`] to `true`.
+  #[inline(always)]
+  pub const fn set_drop_blank_audio(&mut self) -> &mut Self {
+    self.drop_blank_audio = true;
+    self
+  }
+  /// Builder form of [`Self::update_drop_blank_audio`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn maybe_drop_blank_audio(mut self, drop_blank_audio: bool) -> Self {
+    self.update_drop_blank_audio(drop_blank_audio);
+    self
+  }
+  /// Assigns [`Self::drop_blank_audio`] directly.
+  #[inline(always)]
+  pub const fn update_drop_blank_audio(&mut self, drop_blank_audio: bool) -> &mut Self {
+    self.drop_blank_audio = drop_blank_audio;
+    self
+  }
+  /// Sets [`Self::drop_blank_audio`] to `false` — blank-audio segments are
+  /// emitted verbatim, restoring exact Swift parity.
+  #[inline(always)]
+  pub const fn clear_drop_blank_audio(&mut self) -> &mut Self {
+    self.drop_blank_audio = false;
     self
   }
 }

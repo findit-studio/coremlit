@@ -32,16 +32,21 @@ pub const APPEND_PUNCTUATION: &str = "\"'.。,，!！?？:：”)]}、";
 /// Matches Swift's own observed output for the same input bit-for-bit
 /// (coremlit issue #9, "Silence output should be filtered or explicitly
 /// modeled": both runtimes produced exactly `[BLANK_AUDIO]`, one segment,
-/// for 5 s of silence under matched VAD/prefill settings). Because this is
-/// upstream-compatible model behavior rather than a bug, this crate does
-/// not filter it out of
-/// [`TranscriptionResult`](crate::result::TranscriptionResult)/
-/// [`TranscriptionSegment`](crate::result::TranscriptionSegment) text —
-/// product layers that don't want `[BLANK_AUDIO]` polluting search or
-/// timeline results must filter or model it themselves.
+/// for 5 s of silence under matched VAD/prefill settings).
 ///
-/// **Result-level equality is the validated contract.** The pinned
-/// silence golden asserts
+/// **This crate drops such segments by default** (coremlit issue #14):
+/// [`DecodingOptions::drop_blank_audio`](crate::options::DecodingOptions::drop_blank_audio)
+/// defaults `true`, so a segment decoding to exactly this marker is
+/// filtered out of
+/// [`TranscriptionResult`](crate::result::TranscriptionResult) after
+/// decoding, and pure silence yields an empty result rather than a
+/// one-segment `[BLANK_AUDIO]` — the marker is noise for the search/index
+/// consumers this crate targets. That default is a deliberate divergence
+/// from Swift, which emits the marker; clearing the option restores Swift's
+/// behavior exactly, and everything below describes what you then get.
+///
+/// **Result-level equality is the validated contract** (on that
+/// `drop_blank_audio == false` path). The pinned silence golden asserts
 /// [`TranscriptionResult::text`](crate::result::TranscriptionResult::text)
 /// exactly equal to this constant. Segment text is a different shape:
 /// under that same validated configuration (default
@@ -58,7 +63,9 @@ pub const APPEND_PUNCTUATION: &str = "\"'.。,，!！?？:：”)]}、";
 /// golden here: treat a segment-level check as `contains`, not
 /// equality, or filter/model on
 /// [`TranscriptionResult::text`](crate::result::TranscriptionResult::text)
-/// instead.
+/// instead. It is exactly this raw-vs-clean split that makes the drop
+/// filter match a segment's special-token-stripped decode rather than its
+/// [`TranscriptionSegment::text`](crate::result::TranscriptionSegment::text).
 pub const BLANK_AUDIO_MARKER: &str = "[BLANK_AUDIO]";
 
 /// Whisper language table: `(english_name, iso_code)`, 112 entries.

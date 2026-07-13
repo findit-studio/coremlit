@@ -769,3 +769,146 @@ fn silence_skipped_window_with_word_timestamps_surfaces_a_segment_error() {
     "got: {err:?}"
   );
 }
+
+// ---------------------------------------------------------------------
+// drop_blank_audio (coremlit issue #14)
+// ---------------------------------------------------------------------
+
+/// The BPE tokens a Whisper model samples to spell out `[BLANK_AUDIO]` for
+/// silence — several ordinary text tokens, not one special token (see
+/// `constants::BLANK_AUDIO_MARKER`'s doc). Encoded with the leading space
+/// the real model emits, which the drop filter's Swift-whitespace trim
+/// normalizes away before matching.
+fn blank_audio_tokens(t: &WhisperTokenizer) -> Vec<u32> {
+  t.encode(&format!(" {}", crate::constants::BLANK_AUDIO_MARKER))
+    .unwrap()
+}
+
+/// One window decoding to nothing but `[BLANK_AUDIO]` — the scripted
+/// analogue of the 5 s-of-silence pipeline golden, one segment spanning
+/// <|0.00|>..<|2.00|>.
+fn script_blank_audio_window(mock: &mut MockBackend, t: &WhisperTokenizer) {
+  let s = special();
+  let mut steps = vec![s.english_token(), s.transcribe_token(), ts(0)];
+  steps.extend(blank_audio_tokens(t));
+  steps.extend([ts(100), ts(100), s.end_token()]);
+  mock.push_token_steps(&steps);
+}
+
+/// One window decoding to speech / `[BLANK_AUDIO]` / speech as three
+/// consecutive-timestamp-delimited segments: <|0.00|>..<|1.00|> " Hello",
+/// <|1.00|>..<|2.00|> " [BLANK_AUDIO]", <|2.00|>..<|3.00|> " World".
+fn script_speech_blank_speech_window(mock: &mut MockBackend, t: &WhisperTokenizer) {
+  let s = special();
+  let hello = t.encode(" Hello").unwrap()[0];
+  let world = t.encode(" World").unwrap()[0];
+  let mut steps = vec![
+    s.english_token(),
+    s.transcribe_token(),
+    ts(0),
+    hello,
+    ts(50),
+    ts(50),
+  ];
+  steps.extend(blank_audio_tokens(t));
+  steps.extend([ts(100), ts(100), world, ts(150), ts(150), s.end_token()]);
+  mock.push_token_steps(&steps);
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn blank_audio_segment_is_dropped_by_default() {
+  // The DEFAULT path (`drop_blank_audio == true`): a window that decodes to
+  // nothing but the marker collapses to a genuinely empty result — zero
+  // segments AND empty text, not a segment-less transcript still carrying
+  // "[BLANK_AUDIO]" in its aggregate text. Deliberately diverges from
+  // Swift, which emits the marker (see the drop=false twin below).
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  script_blank_audio_window(&mut mock, &t);
+  let task = TranscribeTask::new(&mock, &t);
+  let result = task
+    .run(&vec![0.1; 32_000], &DecodingOptions::new())
+    .unwrap();
+  assert!(
+    result.segments_slice().is_empty(),
+    "got: {:?}",
+    result.segments_slice()
+  );
+  assert_eq!(result.text(), "", "got: {:?}", result.text());
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn blank_audio_segment_is_emitted_when_drop_is_cleared() {
+  // MUTATION EVIDENCE for the test above, and the exact Swift-parity escape
+  // hatch: the identical script with `drop_blank_audio == false` keeps the
+  // segment and reports the marker verbatim — byte-identical to the
+  // behavior that predates the option.
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  script_blank_audio_window(&mut mock, &t);
+  let task = TranscribeTask::new(&mock, &t);
+  let options = DecodingOptions::new().maybe_drop_blank_audio(false);
+  let result = task.run(&vec![0.1; 32_000], &options).unwrap();
+  assert_eq!(result.segments_slice().len(), 1);
+  assert_eq!(result.text(), crate::constants::BLANK_AUDIO_MARKER);
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn blank_audio_drop_keeps_surrounding_speech_and_renumbers() {
+  // A blank stretch BETWEEN speech: the default drops only the blank
+  // segment, the speech on either side survives untouched, the marker
+  // leaves the aggregate text with it, and the survivors are renumbered to
+  // a contiguous 0..N id range (the same contiguity a merged result has).
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  script_speech_blank_speech_window(&mut mock, &t);
+  let task = TranscribeTask::new(&mock, &t);
+  let result = task
+    .run(&vec![0.1; 32_000], &DecodingOptions::new())
+    .unwrap();
+
+  let segments = result.segments_slice();
+  assert_eq!(
+    segments.len(),
+    2,
+    "blank dropped, speech kept: {segments:?}"
+  );
+  assert_eq!(
+    segments.iter().map(|s| s.id()).collect::<Vec<_>>(),
+    vec![0, 1],
+    "survivors renumbered contiguously"
+  );
+  for segment in segments {
+    assert!(
+      !segment
+        .text()
+        .contains(crate::constants::BLANK_AUDIO_MARKER),
+      "no surviving segment carries the marker: {segment:?}"
+    );
+  }
+  assert_eq!(result.text(), "Hello World", "got: {:?}", result.text());
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn blank_audio_between_speech_is_kept_when_drop_is_cleared() {
+  // MUTATION EVIDENCE for the mixed case: the identical script with the
+  // filter off keeps all three segments, marker included — proving the two
+  // outcomes above are the option's doing and not the script's.
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  script_speech_blank_speech_window(&mut mock, &t);
+  let task = TranscribeTask::new(&mock, &t);
+  let options = DecodingOptions::new().maybe_drop_blank_audio(false);
+  let result = task.run(&vec![0.1; 32_000], &options).unwrap();
+
+  assert_eq!(result.segments_slice().len(), 3);
+  assert!(
+    result.text().contains(crate::constants::BLANK_AUDIO_MARKER),
+    "got: {:?}",
+    result.text()
+  );
+}

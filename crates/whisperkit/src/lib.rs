@@ -150,14 +150,18 @@
 //!   matches). Never compare outputs across compute units as if
 //!   equivalent: fix one unit for regression baselines, or keep a
 //!   separate baseline per unit.
-//! - **Silence can decode to a marker, not to empty text.** Confirmed
-//!   under the validated configuration coremlit issue #9 pinned (tiny
-//!   model, matched VAD/prefill options, 5 s of digital silence): the
-//!   window decodes to exactly
+//! - **Silence decodes to a marker, and this crate drops it by default.**
+//!   Confirmed under the validated configuration coremlit issue #9 pinned
+//!   (tiny model, matched VAD/prefill options, 5 s of digital silence):
+//!   the window decodes to exactly
 //!   [`BLANK_AUDIO_MARKER`](constants::BLANK_AUDIO_MARKER) — see that
-//!   constant's doc for the general, model/config-dependent shape of
-//!   this behavior. When this marker is emitted, product layers should
-//!   filter or model it rather than indexing it as transcript text.
+//!   constant's doc for the general, model/config-dependent shape of this
+//!   behavior. Rather than leave every product layer to post-filter that,
+//!   [`DecodingOptions::drop_blank_audio`](options::DecodingOptions::drop_blank_audio)
+//!   defaults `true` and removes such segments after decoding, so pure
+//!   silence yields an empty result (coremlit issue #14). This is the one
+//!   default in this crate that deliberately diverges from Swift, which
+//!   emits the marker; set the option `false` for exact Swift parity.
 //! - **Sampling above temperature 0 is non-reproducible by default, on
 //!   both runtimes — set [`DecodingOptions::seed`](options::DecodingOptions::seed) to make it
 //!   reproducible on this side.** Whenever the fallback ladder retries at
