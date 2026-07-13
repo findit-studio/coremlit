@@ -58,7 +58,8 @@
 //! what that does and doesn't say about the actual `MLMultiArray` I/O
 //! dtype. Clustering (PLDA/VBx) stays in `dia`, per the design spec's
 //! non-goals — `PldaProjector` is introspected below purely for
-//! completeness, as the plan brief requests.
+//! completeness, mirroring `tests/model_io.rs`'s PLDA-recording precedent
+//! (this task's own brief names no such artifact).
 //!
 //! # Licenses
 //!
@@ -109,9 +110,10 @@
 //!    re-verifying via `Model::load` rather than assuming from
 //!    byte-identity alone.
 //! 4. `PldaProjector.mlmodelc` (`speaker_clusterer`, out of scope): input
-//!    `embeddings [1, 64, 256]`, output `plda_embeddings [1, 64, 128]` — the
-//!    brief named this artifact for completeness without an expected
-//!    contract to check it against, so this is recorded, not a delta.
+//!    `embeddings [1, 64, 256]`, output `plda_embeddings [1, 64, 128]` —
+//!    recorded for completeness (mirroring `tests/model_io.rs`'s
+//!    PLDA-recording precedent) with no expected contract to check it
+//!    against, so this is recorded, not a delta.
 //!    Note the name is `plda_embeddings`, not the FluidAudio-side PLDA
 //!    artifact's `plda_features` (`tests/model_io.rs`'s
 //!    `plda_io_recorded_out_of_scope`) — the two sources don't share a
@@ -235,25 +237,21 @@ fn argmax_artifact_bytes_match_pinned_sha256() {
 }
 
 #[test]
-fn sha256_hex_matches_known_vectors() {
-  // FIPS 180-4 / RFC 6234 known-answer vectors (empty string, "abc", and
-  // the standard two-block message), independently cross-checked against
-  // the system `shasum -a 256` at authoring time -- not transcribed from
-  // memory. Proves `common::sha256_hex`'s padding/two-block logic before
-  // trusting it to gate `argmax_artifact_bytes_match_pinned_sha256` above.
-  // This test is intentionally NOT `#[ignore]`d: it needs no models, so it
-  // runs in the normal `cargo test` gate.
-  assert_eq!(
-    common::sha256_hex(b""),
-    "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-  );
+fn sha256_hex_matches_known_vector() {
+  // `common::sha256_hex` is now a thin wrapper over the upstream-tested
+  // `sha2` crate (see its doc comment), so re-proving SHA-256 itself with a
+  // full FIPS 180-4 / RFC 6234 known-answer-vector battery would be
+  // redundant -- that's `sha2`'s own test suite's job. One vector is kept as
+  // a hermetic wiring smoke test (digest + hex-encode aren't swapped or
+  // mis-cased), consistent with this file's practice of not just asserting
+  // but independently cross-checking (here, against the system
+  // `shasum -a 256`, matching this constant's pre-existing value). This test
+  // is intentionally NOT `#[ignore]`d: it needs no models, so it runs in the
+  // normal `cargo test` gate, unlike `argmax_artifact_bytes_match_pinned_sha256`
+  // above.
   assert_eq!(
     common::sha256_hex(b"abc"),
     "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
-  );
-  assert_eq!(
-    common::sha256_hex(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
-    "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"
   );
 }
 
@@ -319,62 +317,41 @@ fn speaker_segmenter_w8a16_io_matches_spec() {
   assert_eq!(waveform.shape(), &[480_000]);
   assert_eq!(waveform.data_type(), Some(DataType::F16));
 
-  assert_eq!(
-    description
-      .output("speaker_probs")
-      .expect("speaker_probs output")
-      .shape(),
-    &[21, 589, 3]
-  );
-  assert_eq!(
-    description
-      .output("speaker_ids")
-      .expect("speaker_ids output")
-      .shape(),
-    &[21, 589, 3]
-  );
-  assert_eq!(
-    description
-      .output("speaker_activity")
-      .expect("speaker_activity output")
-      .shape(),
-    &[21, 3]
-  );
-  assert_eq!(
-    description
-      .output("overlapped_speaker_activity")
-      .expect("overlapped_speaker_activity output")
-      .shape(),
-    &[21, 589]
-  );
-  assert_eq!(
-    description
-      .output("voice_activity")
-      .expect("voice_activity output")
-      .shape(),
-    &[1767]
-  );
-  assert_eq!(
-    description
-      .output("sliding_window_waveform")
-      .expect("sliding_window_waveform output")
-      .shape(),
-    &[21, 1, 160_000]
-  );
-  for name in [
-    "speaker_probs",
-    "speaker_ids",
-    "speaker_activity",
-    "overlapped_speaker_activity",
-    "voice_activity",
-    "sliding_window_waveform",
-  ] {
-    assert_eq!(
-      description.output(name).unwrap().data_type(),
-      Some(DataType::F16),
-      "{name}: expected F16"
-    );
-  }
+  let speaker_probs = description
+    .output("speaker_probs")
+    .expect("speaker_probs output");
+  assert_eq!(speaker_probs.shape(), &[21, 589, 3]);
+  assert_eq!(speaker_probs.data_type(), Some(DataType::F16));
+
+  let speaker_ids = description
+    .output("speaker_ids")
+    .expect("speaker_ids output");
+  assert_eq!(speaker_ids.shape(), &[21, 589, 3]);
+  assert_eq!(speaker_ids.data_type(), Some(DataType::F16));
+
+  let speaker_activity = description
+    .output("speaker_activity")
+    .expect("speaker_activity output");
+  assert_eq!(speaker_activity.shape(), &[21, 3]);
+  assert_eq!(speaker_activity.data_type(), Some(DataType::F16));
+
+  let overlapped = description
+    .output("overlapped_speaker_activity")
+    .expect("overlapped_speaker_activity output");
+  assert_eq!(overlapped.shape(), &[21, 589]);
+  assert_eq!(overlapped.data_type(), Some(DataType::F16));
+
+  let voice_activity = description
+    .output("voice_activity")
+    .expect("voice_activity output");
+  assert_eq!(voice_activity.shape(), &[1767]);
+  assert_eq!(voice_activity.data_type(), Some(DataType::F16));
+
+  let sliding_window = description
+    .output("sliding_window_waveform")
+    .expect("sliding_window_waveform output");
+  assert_eq!(sliding_window.shape(), &[21, 1, 160_000]);
+  assert_eq!(sliding_window.data_type(), Some(DataType::F16));
 }
 
 #[test]
@@ -474,9 +451,10 @@ fn speaker_embedder_w8a16_io_matches_spec() {
 #[ignore = "requires local argmax speakerkit models (ARGMAX_TEST_MODELS)"]
 fn plda_projector_w32a32_io_recorded_out_of_scope() {
   // Out of scope per the design spec's non-goals (clustering/VBx/PLDA stay
-  // in `dia`) -- recorded because the plan brief names this artifact as a
-  // candidate to introspect "for completeness". Module doc delta 4: no
-  // expected contract was given to check this against.
+  // in `dia`) -- introspected anyway for completeness, mirroring
+  // `tests/model_io.rs`'s PLDA-recording precedent (this task's own brief
+  // names no such artifact). Module doc delta 4: no expected contract was
+  // given to check this against.
   let path = artifact_path("speaker_clusterer/pyannote-v4/W32A32/PldaProjector.mlmodelc");
   let model = Model::load(path, ComputeUnits::CpuOnly).unwrap();
   let description = model.description();
