@@ -64,16 +64,38 @@ fn align_error_wraps_tensor_via_from() {
 }
 
 #[test]
-fn align_error_wraps_alignment_via_from_and_is_transparent() {
-  let inner = asry::AlignmentError::EmptyText(asry::AlignmentFailure::new(
-    "nothing to align".into(),
-    asry::Lang::En,
-  ));
+fn align_error_wraps_emissions_via_from_and_is_transparent() {
+  let inner = asry::emissions::EmissionsError::NoAlignmentPath(
+    asry::emissions::EmissionsFailure::new("no finite path".into()),
+  );
   let displayed_inner = inner.to_string();
-  let e: AlignError = inner.into();
+  let e: AlignError = inner.clone().into();
   assert!(matches!(e, AlignError::Alignment(_)));
   // `#[error(transparent)]` forwards Display verbatim, no extra wrapper text.
   assert_eq!(e.to_string(), displayed_inner);
+}
+
+#[test]
+fn align_error_wraps_span_via_from_and_is_transparent() {
+  let inner = asry::emissions::SpanError::Timebase {
+    expected: 16_000,
+    num: 1,
+    den: 1_000,
+  };
+  let displayed_inner = inner.to_string();
+  let e: AlignError = inner.into();
+  assert!(matches!(e, AlignError::Span(_)));
+  assert_eq!(e.to_string(), displayed_inner);
+}
+
+#[test]
+fn aligner_error_wraps_seam_via_from() {
+  let inner = asry::emissions::EmissionsError::Config(asry::emissions::EmissionsFailure::new(
+    "bad tokenizer".into(),
+  ));
+  let e: AlignerError = inner.into();
+  assert!(matches!(e, AlignerError::Seam(_)));
+  assert!(e.to_string().contains("bad tokenizer"));
 }
 
 #[test]

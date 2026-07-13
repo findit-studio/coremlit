@@ -49,26 +49,36 @@
 //!
 //! # No re-softmax
 //!
-//! [`Encoder::emissions`] builds an [`asry::emissions::LogProbsTV`]
-//! directly from the raw
-//! `emissions` tensor with **no softmax or log-softmax applied**. This is
-//! not an oversight: `tests/model_io.rs`'s
-//! `emissions_are_log_probs_not_raw_logits` (Task B1's pinned graph-truth
-//! test) empirically confirmed the model's `emissions` output is *already*
-//! log-softmaxed (per-frame `logsumexp` ≈ 0 within `1e-2`, and every value
-//! bounded by the `log(p) <= 0` ceiling that only a genuine
-//! log-probability tensor can hit) — re-applying softmax here would
-//! double-normalize and silently corrupt every downstream trellis/beam
-//! score. Contrast asry's own `encode_log_softmax`
-//! (`asry/src/runner/aligner/algorithm/encode.rs`), which DOES apply
-//! `log_softmax_with_finite_guard` to its ONNX model's raw output — that
-//! model emits logits, this one does not; the two encoders are not
-//! interchangeable drop-ins at the "what does the raw tensor mean" level,
-//! only at the "both eventually produce a `LogProbsTV`" level.
+//! [`Encoder::emissions`] wraps the raw `emissions` tensor into an
+//! [`Emissions`] through [`Emissions::from_log_probs`] — the log-prob
+//! door — with **no softmax or log-softmax applied**. This is not an
+//! oversight: `tests/model_io.rs`'s `emissions_are_log_probs_not_raw_logits`
+//! (Task B1's pinned graph-truth test) empirically confirmed the model's
+//! `emissions` output is *already* log-softmaxed (per-frame `logsumexp` ≈ 0
+//! within `1e-2`, and every value bounded by the `log(p) <= 0` ceiling that
+//! only a genuine log-probability tensor can hit) — routing it through
+//! [`Emissions::from_logits`] instead (asry's raw-logit door, which applies
+//! `log_softmax_with_finite_guard`) would double-normalize and silently
+//! corrupt every downstream trellis/beam score. Contrast asry's own ONNX
+//! encoder (`asry/src/runner/aligner/algorithm/encode.rs`), which DOES emit
+//! raw logits and so takes the `from_logits` door — that model emits
+//! logits, this one does not; the two encoders are not interchangeable
+//! drop-ins at the "what does the raw tensor mean" level, only at the "both
+//! eventually produce an [`Emissions`]" level.
+//!
+//! Because `from_log_probs` runs asry's `O(T·V)` value-domain scan (every
+//! element finite ∧ `<= 0`), a model that ever emitted a non-finite or
+//! positive value would surface as [`AlignError::Alignment`] (an
+//! `asry::emissions::EmissionsError`) rather than the infallible construction
+//! this crate could assume against the pre-seam `LogProbsTV::new`. On the
+//! pinned model that scan is a no-op (values measured in `[-28.4, 0.0]`);
+//! [`Encoder::emissions_raw`] exposes the pre-wrap tensor for callers that
+//! need to report on it directly.
 
+use core::num::NonZeroUsize;
 use std::{borrow::Cow, path::Path};
 
-use asry::emissions::LogProbsTV;
+use asry::emissions::Emissions;
 use coremlit::{ComputeUnits, DataType, Model, MultiArray};
 
 use crate::error::{AlignError, AlignerError};
@@ -89,6 +99,14 @@ pub const ENCODER_WINDOW_SAMPLES: usize = 960_000;
 /// [`Encoder::emissions`]'s doc for how it combines with the model's
 /// actual (introspected) frame count.
 pub const HOP_SAMPLES: usize = 320;
+
+/// [`crate::vocab::VOCAB_SIZE`] as a [`NonZeroUsize`], for the
+/// [`Emissions::from_log_probs`] `v` argument. The conversion is
+/// infallible: `VOCAB_SIZE` is the nonzero constant `29`.
+const VOCAB_SIZE_NZ: NonZeroUsize = match NonZeroUsize::new(crate::vocab::VOCAB_SIZE) {
+  Some(v) => v,
+  None => unreachable!(),
+};
 
 /// Declared feature names on `base960h_aligner.mlmodelc`
 /// (pinned by `tests/model_io.rs::base960h_aligner_io_matches_spec`).
@@ -286,34 +304,47 @@ impl Encoder {
     self.frames
   }
 
-  /// Runs the encoder on `samples`, returning per-frame CTC
-  /// log-probabilities as an [`asry::emissions::LogProbsTV`] with
-  /// `t = ceil(samples.len() / HOP_SAMPLES)` (clamped to [`Self::frames`],
-  /// see below) and `v = crate::vocab::VOCAB_SIZE`.
+  /// Runs the encoder on `encoder_input`, returning the **raw** truncated
+  /// per-frame CTC log-probabilities as a [`RawEmissions`] with
+  /// `frames = truncated_frame_count(real_samples)` (clamped to
+  /// [`Self::frames`], see below) and `V = crate::vocab::VOCAB_SIZE`.
   ///
-  /// `samples` shorter than [`ENCODER_WINDOW_SAMPLES`] is zero-padded up to
-  /// the full window before prediction; frames computed from the padded
-  /// tail are truncated away before this returns, so the result always
-  /// reflects only `samples`' own real audio. See the module doc's
-  /// "Fixed-window bridging" and "No re-softmax" sections.
+  /// `encoder_input` is the buffer the model runs on. For the alignment
+  /// pipeline it is `PreparedChunk::encoder_input()` — asry has already
+  /// applied the silence mask and padded to wav2vec2's receptive field — so
+  /// this method never re-implements the mask; a standalone caller may pass
+  /// raw samples directly. Shorter than [`ENCODER_WINDOW_SAMPLES`], it is
+  /// zero-padded up to the full window before prediction.
+  ///
+  /// `real_samples` is the count of REAL (pre-mask, pre-pad) audio samples
+  /// the chunk represents — for the pipeline, the `samples.len()` handed to
+  /// `prepare`. asry keeps `PreparedChunk::real_samples` crate-private, so
+  /// the consumer supplies it; it feeds the truncation formula alone and is
+  /// never re-scanned. Frames computed from the padded tail are truncated
+  /// away, so the result reflects only the real audio.
+  ///
+  /// Returns the tensor WITHOUT the [`Emissions`] value-domain scan or
+  /// wrapping — see [`Self::emissions`] for the wrapped door. Exposed
+  /// because [`Emissions`] deliberately offers no per-cell reads, yet the
+  /// emissions sanity metric needs the values back.
   ///
   /// # Truncation formula
   ///
-  /// Nominal: `ceil(samples.len() / HOP_SAMPLES)` (design spec §3:
+  /// Nominal: `ceil(real_samples / HOP_SAMPLES)` (design spec §3:
   /// `T_frames = ceil(real_samples / 320)`) — each [`HOP_SAMPLES`]-sample
   /// stride of real audio should contribute (at least) one real frame.
   /// Clamped to [`Self::frames`]: wav2vec2's convolutional feature
-  /// extractor is not an exact `samples / HOP_SAMPLES` divider (its
+  /// extractor is not an exact `real_samples / HOP_SAMPLES` divider (its
   /// multi-layer kernel/stride chain has kernels slightly wider than their
   /// strides, so a handful of samples at the very end of a full window
-  /// contribute no additional frame). Concretely, for `samples.len() ==
+  /// contribute no additional frame). Concretely, for `real_samples ==
   /// ENCODER_WINDOW_SAMPLES` (960,000 — no padding at all, exactly the
   /// `ted_60.wav` fixture's own case), the nominal formula evaluates to
   /// 3,000 (`960_000 / 320`), one more than
   /// `base960h_aligner.mlmodelc`'s actual 2,999
   /// (`tests/model_io.rs::base960h_aligner_io_matches_spec`). Without the
   /// clamp, this method would try to keep a 3,000th frame that was never
-  /// written into its `copy_into`-filled buffer for any `samples.len()` in
+  /// written into its `copy_into`-filled buffer for any `real_samples` in
   /// `(Self::frames() * HOP_SAMPLES, ENCODER_WINDOW_SAMPLES]` — see
   /// `tests.rs` for a regression pinning exactly this boundary.
   ///
@@ -337,24 +368,29 @@ impl Encoder {
   /// outcome this crate's own inputs can trigger.
   ///
   /// # Errors
-  /// [`AlignError::InputTooLong`] if `samples.len() > ENCODER_WINDOW_SAMPLES`.
+  /// [`AlignError::InputTooLong`] if
+  /// `encoder_input.len() > ENCODER_WINDOW_SAMPLES`.
   /// [`AlignError::Tensor`] if building the input tensor or reading the
   /// output tensor fails. [`AlignError::Prediction`] on a CoreML prediction
   /// failure, including a prediction whose runtime output set omits
   /// `emissions` entirely.
-  pub fn emissions(&self, samples: &[f32]) -> Result<LogProbsTV, AlignError> {
-    if samples.len() > ENCODER_WINDOW_SAMPLES {
+  pub fn emissions_raw(
+    &self,
+    encoder_input: &[f32],
+    real_samples: usize,
+  ) -> Result<RawEmissions, AlignError> {
+    if encoder_input.len() > ENCODER_WINDOW_SAMPLES {
       return Err(AlignError::InputTooLong {
-        got: samples.len(),
+        got: encoder_input.len(),
         max: ENCODER_WINDOW_SAMPLES,
       });
     }
 
-    let waveform: Cow<'_, [f32]> = if samples.len() == ENCODER_WINDOW_SAMPLES {
-      Cow::Borrowed(samples)
+    let waveform: Cow<'_, [f32]> = if encoder_input.len() == ENCODER_WINDOW_SAMPLES {
+      Cow::Borrowed(encoder_input)
     } else {
       let mut buf = vec![0.0f32; ENCODER_WINDOW_SAMPLES];
-      buf[..samples.len()].copy_from_slice(samples);
+      buf[..encoder_input.len()].copy_from_slice(encoder_input);
       Cow::Owned(buf)
     };
 
@@ -367,24 +403,87 @@ impl Encoder {
           name: names::EMISSIONS.to_string(),
         })?;
 
-    let mut raw = vec![0.0f32; self.frames * crate::vocab::VOCAB_SIZE];
-    emissions.copy_into::<f32>(&mut raw)?;
+    let mut data = vec![0.0f32; self.frames * crate::vocab::VOCAB_SIZE];
+    emissions.copy_into::<f32>(&mut data)?;
 
-    let real_frames = truncated_frame_count(samples.len(), self.frames);
-    // `real_frames <= self.frames` always (see `truncated_frame_count`'s
-    // clamp), so `real_frames * VOCAB_SIZE <= raw.len() == self.frames *
-    // VOCAB_SIZE` and `truncate` below always shrinks to exactly that
-    // length (never a no-op past `raw.len()`, which would leave `raw`
-    // longer than `real_frames * VOCAB_SIZE`).
-    raw.truncate(real_frames * crate::vocab::VOCAB_SIZE);
+    let frames = truncated_frame_count(real_samples, self.frames);
+    // `frames <= self.frames` always (see `truncated_frame_count`'s clamp),
+    // so `frames * VOCAB_SIZE <= data.len() == self.frames * VOCAB_SIZE` and
+    // `truncate` below always shrinks to exactly that length (never a no-op
+    // past `data.len()`, which would leave `data` longer than
+    // `frames * VOCAB_SIZE`).
+    data.truncate(frames * crate::vocab::VOCAB_SIZE);
 
-    Ok(
-      LogProbsTV::new(real_frames, crate::vocab::VOCAB_SIZE, raw).expect(
-        "real_frames * VOCAB_SIZE == raw.len() by construction (see the truncate call above), \
-         and VOCAB_SIZE is a nonzero crate constant, so LogProbsTV::new's only two failure \
-         modes cannot fire here",
-      ),
-    )
+    Ok(RawEmissions { frames, data })
+  }
+
+  /// Runs the encoder and wraps the truncated log-probabilities into an
+  /// [`Emissions`] — the sole log-prob currency
+  /// [`asry::emissions::EmissionsAligner::finish`] accepts.
+  ///
+  /// See [`Self::emissions_raw`] for the `encoder_input` / `real_samples`
+  /// contract and the truncation formula; this adds only the
+  /// [`Emissions::from_log_probs`] wrap (the log-prob door — **no
+  /// re-softmax**, see the module doc's "No re-softmax" section).
+  ///
+  /// # Errors
+  /// Everything [`Self::emissions_raw`] returns, plus
+  /// [`AlignError::Alignment`] (an `asry::emissions::EmissionsError`) if the
+  /// model output leaves the log-probability domain: `from_log_probs` runs
+  /// an `O(T·V)` finite ∧ `<= 0` scan, so a non-finite or positive value is
+  /// a real error path here — not the panic the pre-seam `LogProbsTV::new`
+  /// let this crate assume away.
+  pub fn emissions(
+    &self,
+    encoder_input: &[f32],
+    real_samples: usize,
+  ) -> Result<Emissions, AlignError> {
+    let RawEmissions { frames, data } = self.emissions_raw(encoder_input, real_samples)?;
+    Ok(Emissions::from_log_probs(frames, VOCAB_SIZE_NZ, data)?)
+  }
+}
+
+/// The **raw** truncated per-frame CTC log-probabilities from
+/// [`Encoder::emissions_raw`]: `frames × VOCAB_SIZE` row-major, exactly the
+/// tensor [`Encoder::emissions`] hands to [`Emissions::from_log_probs`].
+///
+/// [`Emissions`] intentionally exposes no per-cell reads — its opaque design
+/// deletes the row-major aliasing footgun asry documents — so this carrier
+/// exists for the one caller that legitimately needs the values back: the
+/// emissions sanity metric comparing alignkit's CoreML log-probs against
+/// asry's ONNX reference. It carries no invariant beyond
+/// `data.len() == frames * VOCAB_SIZE`; it is NOT a validated log-prob
+/// tensor (that is [`Emissions`], reached via [`Encoder::emissions`]).
+#[derive(Debug, Clone, PartialEq)]
+pub struct RawEmissions {
+  frames: usize,
+  data: Vec<f32>,
+}
+
+impl RawEmissions {
+  /// Truncated frame count `T`: real-audio frames only, padded-tail frames
+  /// already dropped.
+  #[must_use]
+  pub const fn frames(&self) -> usize {
+    self.frames
+  }
+
+  /// Vocab dimension `V` — always [`crate::vocab::VOCAB_SIZE`].
+  #[must_use]
+  pub const fn vocab(&self) -> usize {
+    crate::vocab::VOCAB_SIZE
+  }
+
+  /// The row-major `frames × VOCAB_SIZE` log-probabilities.
+  #[must_use]
+  pub fn data(&self) -> &[f32] {
+    &self.data
+  }
+
+  /// Consume, returning ownership of the buffer.
+  #[must_use]
+  pub fn into_data(self) -> Vec<f32> {
+    self.data
   }
 }
 

@@ -23,20 +23,13 @@ targets = ["aarch64-apple-darwin"]
 coremlit.workspace = true
 thiserror.workspace = true
 
-# INTERIM (controller decision, Task B3): default-features stays ON here
-# (pulling in asry's `runner` default, i.e. `whispercpp`) rather than the
-# plan's original `default-features = false, features = ["emissions"]`.
-# The latter fails to compile today: `asry/src/types/lang.rs` does
-# `pub use whispercpp::Lang;` with no `#[cfg(feature = "runner")]` guard,
-# so ANY asry feature selection that omits `runner` breaks at asry's own
-# crate root regardless of what alignkit requests. Revert to
-# `default-features = false, features = ["emissions"]` once an upstream
-# fix (e.g. `fix/core-lang-decouple` or an equivalent gating fix on
-# `asry::types::lang`) lands. `features = ["emissions"]` itself lives on
-# asry's `feat/emissions-seam` branch, not yet on `main`; this path
-# resolves against that branch via a workspace-relative symlink in the
-# dev worktree layout (see the Task B3 report for the exact mechanism).
-asry = { path = "../../../asry", features = ["emissions"] }
+# The clean, ort-free dependency: asry's `emissions` seam only (no
+# `whispercpp`, no `ort`). The B3 interim default-features-ON workaround
+# is retired now that asry's `lang.rs` decouple landed on `main` — an
+# `emissions`-only selection no longer trips `asry::types::lang`'s
+# `pub use whispercpp::Lang`. The path resolves to the real asry checkout
+# via a workspace-relative symlink in the dev worktree layout.
+asry = { path = "../../../asry", default-features = false, features = ["emissions"] }
 
 serde = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
@@ -47,15 +40,13 @@ serde = ["dep:serde"]
 tracing = ["dep:tracing"]
 
 [dev-dependencies]
-# Adds asry's `parity-dump-emission` feature (which implies `alignment`:
-# ort + whisper.cpp + the ONNX wav2vec2 path) ON TOP OF the `emissions`
-# feature already requested above, but ONLY for test/bench/example
-# builds — the published lib (`[dependencies]` above) never links `ort`
-# or `whispercpp`. `tests/parity_emissions.rs` (Gate 1) uses the
-# resulting `ASRY_PARITY_DUMP_TRELLIS` diagnostic hook to capture asry's
-# own ONNX emissions as this crate's parity reference; see that file's
-# module doc for the exact mechanism.
-asry = { path = "../../../asry", features = ["parity-dump-emission"] }
+# The B5 word-timing parity gate will re-add asry with the
+# `parity-dump-emission` feature (which implies `alignment`: ort +
+# whisper.cpp + the ONNX wav2vec2 oracle) as a dev-dependency. B4 does
+# not link that oracle: its own end-to-end test drives only alignkit's
+# CoreML pipeline, and `asry` is already available to tests through the
+# `[dependencies]` entry above (emissions-only). Keeping ort/whisper.cpp
+# out of alignkit's own test build until B5 needs it.
 hound.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

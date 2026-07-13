@@ -1,15 +1,15 @@
 //! Bridge between the chordai base960h CTC vocabulary and the
-//! `tokenizers`-crate schema `Aligner::from_paths`-style construction will
-//! need (design spec §3.1/§6,
+//! `tokenizers`-crate schema asry's seam builder needs (design spec §3.1/§6,
 //! `docs/superpowers/specs/2026-07-11-alignkit-forced-alignment-design.md`).
 //!
 //! `chordai/wav2vec2-base960h-aligner-coreml` ships a raw `{token: id}` CTC
 //! dict (`Models/alignkit/base960h_dict.json`), not a HuggingFace
-//! `tokenizer.json` — asry's `Aligner::from_paths` (and, later, alignkit's
-//! own) both need the latter. This module owns the derived, committed
-//! asset that fills that gap (`assets/chordai_base960h_tokenizer.json`)
-//! plus the vocabulary constants later tasks validate a loaded tokenizer
-//! against.
+//! `tokenizer.json` — both asry's own `Aligner::from_paths` and alignkit's
+//! [`crate::aligner::Aligner::from_paths`] (via
+//! [`asry::emissions::EmissionsAligner::builder`]) need the latter. This
+//! module owns the derived, committed asset that fills that gap
+//! (`assets/chordai_base960h_tokenizer.json`) plus the vocabulary constants
+//! the seam validates a loaded tokenizer against.
 //!
 //! # Generator note (reproducibility record)
 //!
@@ -44,15 +44,15 @@
 //!    `get_vocab_size` directly — so these pipeline fields are inert for
 //!    this asset's purpose.
 //!
-//! # Deferred
+//! # Where the asset is consumed
 //!
-//! This module exposes the asset and the constants derived from it — it
-//! does not depend on the `tokenizers` crate outside of tests (a
-//! dev-dependency only; see `Cargo.toml`) and does not itself construct a
-//! `Tokenizer`. Parsing the asset into a live tokenizer, and the
-//! `AlignerError` tokenizer-parse/vocab-mismatch variants that report on
-//! that (design spec §8, flagged in [`crate::error`]'s module doc), land
-//! with the concrete tokenizer type in a later task.
+//! This module exposes the asset and the constants derived from it — it does
+//! not itself construct a `Tokenizer` (it needs no `tokenizers` dependency
+//! outside tests). Parsing the asset into a live tokenizer, and reporting a
+//! parse / blank / delimiter failure, both happen inside asry's seam builder
+//! when [`crate::aligner::Aligner::from_paths`] hands it
+//! [`tokenizer_json_bytes`]; that failure surfaces as
+//! [`crate::error::AlignerError::Seam`].
 
 /// Number of entries in the chordai base960h CTC vocabulary, including the
 /// blank and word-delimiter tokens.
@@ -69,11 +69,11 @@ pub const VOCAB_SIZE: usize = 29;
 ///
 /// The dict maps the literal token `"-"` to id `0` — chordai's own CTC
 /// blank convention. This is distinct from the `<pad>` / `[PAD]` /
-/// `<blank>` special-token probe asry's `detect_blank_token_id`
-/// (`asry/src/runner/aligner/aligner.rs:1090`) performs by default: this
-/// vocabulary has no `<pad>`-style entry at all, only the bare `"-"` at id
-/// `0`. alignkit's own `Aligner` construction (a later task) uses this
-/// constant directly rather than that dynamic probe.
+/// `<blank>` special-token probe asry's `detect_blank_token_id` performs by
+/// default: this vocabulary has no `<pad>`-style entry at all, only the bare
+/// `"-"` at id `0`. [`crate::aligner::Aligner::from_paths`] therefore passes
+/// this constant to the seam builder's `.blank_token_id(..)` explicitly
+/// (the default auto-detect would fail construction).
 pub const BLANK_ID: u32 = 0;
 
 /// wav2vec2 inter-word delimiter token.
@@ -107,14 +107,11 @@ pub const WORD_DELIMITER: &str = "|";
 /// than a path would: `load_tokenizer_with_compat` immediately turns
 /// whatever path it's given into bytes (`std::fs::read`) before ever
 /// calling `Tokenizer::from_bytes` — never `Tokenizer::from_file`, despite
-/// that function's own error-message text saying so
-/// (`asry/src/runner/aligner/aligner.rs:1203`, `:1216`). A future
-/// `Aligner::from_paths`-style constructor that wants this bundled default
-/// can feed these bytes straight into that same `Tokenizer::from_bytes`
-/// call with no filesystem round-trip; the reverse direction (materialize
-/// a temp file from bytes, for an API that insists on `impl AsRef<Path>`)
-/// is trivial on demand, while the forward direction (a baked-in path
-/// surviving repackaging) is not achievable at all.
+/// that function's own error-message text saying so. These bytes are exactly
+/// what [`crate::aligner::Aligner::from_paths`] hands to
+/// [`asry::emissions::EmissionsAligner::builder`] with no filesystem
+/// round-trip — which is also why that constructor takes no `tokenizer_path`
+/// (a baked-in path would not survive repackaging, while bundled bytes do).
 pub const fn tokenizer_json_bytes() -> &'static [u8] {
   include_bytes!("../../assets/chordai_base960h_tokenizer.json")
 }
