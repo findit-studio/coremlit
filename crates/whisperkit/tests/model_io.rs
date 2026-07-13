@@ -4,6 +4,19 @@
 //! Task 9 (`CoreMlBackend` feature names + `CoreMlDecoderState` allocation).
 //! Swift-side derivations: `TextDecoder.swift:309-331` (dims read positions),
 //! `Models.swift:970-1107` (generated I/O wrappers), `FeatureExtractor.swift:25-39`.
+//!
+//! Compute path: `CpuOnly` throughout, and legitimately so — every assertion
+//! here is a SHAPE or a DTYPE read off the model description, which the
+//! compute unit cannot change, and CpuOnly skips the ANE compilation stall.
+//! THE RULE it must not be read as licensing: **a gate validating a shipping
+//! default must run on the shipping default.** The crate ships mel = CPU+GPU
+//! and encoder/decoder = CPU+ANE (`options::DEFAULT_*_COMPUTE_UNITS`), so
+//! anything comparing NUMBERS against a reference — above all
+//! `tests/parity_jfk.rs`/`parity_es.rs`, whose goldens are an ANE-captured
+//! external Swift oracle — must run on those units, and asserts so
+//! explicitly. The golden tests own the shipping compute path and must never
+//! be pinned away from it. See `tests/pipeline.rs`'s `load_backend` for the
+//! sibling-crate incident behind the rule.
 
 mod common;
 

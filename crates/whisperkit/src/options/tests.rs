@@ -361,10 +361,47 @@ fn detect_language_serde_tristate() {
 
 #[test]
 fn compute_defaults_match_swift_model_compute_options() {
+  // Pinned against the Swift source, `Models.swift:92-118`
+  // (`ModelComputeOptions.init`):
+  //
+  //   melCompute:         MLComputeUnits = .cpuAndGPU
+  //   audioEncoderCompute: MLComputeUnits? = nil
+  //                        -> .cpuAndNeuralEngine  (macOS 14+/iOS 17+)
+  //                        -> .cpuAndGPU           (older, not a target here)
+  //   textDecoderCompute:  MLComputeUnits = .cpuAndNeuralEngine
+  //
+  // (Swift's `isRunningOnSimulator` branch forces all three to `.cpuOnly`;
+  // this crate is macOS/CoreML-on-device only, so that branch has no
+  // counterpart and is deliberately not ported.)
+  //
+  // These three constants are what the crate SHIPS, and therefore what the
+  // parity goldens must run on: `jfk_tiny_golden.json`/`es_tiny_golden.json`
+  // were captured from `whisperkit-cli @ argmax-oss-swift` on the ANE, so
+  // `tests/parity_jfk.rs`/`parity_es.rs` assert `Options::new`'s compute
+  // units against exactly these values before building the pipeline. A gate
+  // validating a shipping default must run on the shipping default — see
+  // those tests, and `tests/pipeline.rs`, for the rule. Changing a value
+  // here without re-capturing the goldens against the new compute path is a
+  // silent parity break; that is what this test exists to stop.
+  assert_eq!(DEFAULT_MEL_COMPUTE_UNITS, coremlit::ComputeUnits::CpuAndGpu);
+  assert_eq!(
+    DEFAULT_ENCODER_COMPUTE_UNITS,
+    coremlit::ComputeUnits::CpuAndNeuralEngine
+  );
+  assert_eq!(
+    DEFAULT_DECODER_COMPUTE_UNITS,
+    coremlit::ComputeUnits::CpuAndNeuralEngine
+  );
+
+  // ...and `ComputeOptions::new()` — what `Options::new` hands the pipeline —
+  // really is built from those constants, not from `ComputeUnits::default()`
+  // (which is `All`, coremlit's own general-purpose default, and matches
+  // none of them).
   let c = ComputeOptions::new();
-  assert_eq!(c.mel(), coremlit::ComputeUnits::CpuAndGpu);
-  assert_eq!(c.encoder(), coremlit::ComputeUnits::CpuAndNeuralEngine);
-  assert_eq!(c.decoder(), coremlit::ComputeUnits::CpuAndNeuralEngine);
+  assert_eq!(c.mel(), DEFAULT_MEL_COMPUTE_UNITS);
+  assert_eq!(c.encoder(), DEFAULT_ENCODER_COMPUTE_UNITS);
+  assert_eq!(c.decoder(), DEFAULT_DECODER_COMPUTE_UNITS);
+  assert_eq!(Options::new("m", "t").compute(), c);
 }
 
 #[test]
