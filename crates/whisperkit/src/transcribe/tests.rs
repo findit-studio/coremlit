@@ -1066,3 +1066,278 @@ fn transcribe_all_batch_keeps_the_bare_separator_when_the_drop_is_cleared() {
   );
   assert_eq!(merged.timings().total_audio_processing_runs(), 2.0);
 }
+
+// ---------------------------------------------------------------------
+// The unseeded-sampling invariant (coremlit issue #14, codex round 1 /
+// finding 2)
+// ---------------------------------------------------------------------
+//
+// `Provenance::is_reproducible` used to reconstruct the decode's effective
+// temperature from the SURVIVING segments. Every filter between a decoded
+// window and a surviving segment is lossy, so a window that sampled from an
+// unseeded RNG could be erased entirely and leave a transcript that looked
+// greedy — and therefore reproducible — when it was not.
+//
+// The fix accumulates the fact in `TranscribeTask::run`, at the one point
+// where the accepted temperature is still knowable and ahead of every filter
+// that could erase it. These tests drive the real pipeline into each of those
+// filters and pin that the fact survives.
+
+/// Options that make the blank window (and ONLY the blank window) fall back,
+/// landing it on exactly temperature `0.2`.
+///
+/// The scripted speech window's decode compresses to 0.667 and the blank
+/// window's to 0.952, so a `compression_ratio_threshold` of 0.8 sits between
+/// them: the blank window trips the ladder on every attempt and the speech
+/// window never does — under ONE shared `DecodingOptions`, exactly as
+/// `WhisperKit::transcribe`'s VAD branch decodes all of its chunks. With
+/// `temperature_fallback_count == 1` the ladder's last rung is
+/// `0.0 + 1 * 0.2`, so the blank window is accepted at 0.2 and its segment
+/// carries that temperature.
+///
+/// Nothing here touches the sampler's determinism: the mock's logits are
+/// one-hot at 10.0, so even at 0.2 (`1/t == 5`, giving the target token a
+/// softmax mass of `1 - 5e-11` inside the top-k) the draw lands on the
+/// scripted token. The decode is stochastic in KIND — it consults the RNG —
+/// which is the entire point; it is simply peaked enough to script.
+fn blank_falls_back_to_point_two() -> DecodingOptions {
+  DecodingOptions::new()
+    .with_compression_ratio_threshold(0.8)
+    .with_temperature_fallback_count(1)
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn a_window_accepted_above_zero_can_decode_the_blank_marker_and_be_dropped() {
+  // THE REACHABILITY PROOF, and the exact question the review posed: can a
+  // window accepted at temperature > 0 decode to exactly the blank marker
+  // and then be dropped? Yes — constructed here, not argued.
+  //
+  // First, with the drop CLEARED, observe what the window actually decodes:
+  // `[BLANK_AUDIO]`, at temperature 0.2, from an unseeded sampler.
+  let t = tiny_tokenizer();
+  let options = blank_falls_back_to_point_two();
+  assert_eq!(options.seed(), None, "unseeded is the default");
+
+  let mut observed_mock =
+    MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  script_blank_audio_window(&mut observed_mock, &t);
+  let observed = TranscribeTask::new(&observed_mock, &t)
+    .run(
+      &vec![0.1; 32_000],
+      &options.clone().maybe_drop_blank_audio(false),
+    )
+    .unwrap();
+  assert_eq!(observed.text(), crate::constants::BLANK_AUDIO_MARKER);
+  assert_eq!(
+    observed.segments_slice()[0].temperature(),
+    0.2,
+    "the ladder must have climbed, or this proves nothing"
+  );
+
+  // Now the same window under the DEFAULT drop: the segment is deleted, and
+  // with it every trace of the temperature it was decoded at. The result has
+  // nothing left to read a temperature off — and yet the decode really did
+  // draw from an unseeded RNG, so the transcript is NOT reproducible.
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  script_blank_audio_window(&mut mock, &t);
+  let result = TranscribeTask::new(&mock, &t)
+    .run(&vec![0.1; 32_000], &options)
+    .unwrap();
+
+  assert!(result.segments_slice().is_empty(), "the drop emptied it");
+  assert!(
+    result.sampled_at_nonzero_temperature(),
+    "the sampling must survive the segment that carried it"
+  );
+
+  let provenance = crate::provenance::Provenance::for_result(
+    &options,
+    &crate::options::ComputeOptions::new(),
+    &result,
+  );
+  assert!(
+    !provenance.is_reproducible(),
+    "an unseeded sampled window was dropped: this transcript cannot be \
+     promised byte-for-byte"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn unseeded_sampling_survives_the_blank_audio_drop() {
+  // THE FULL FAILING HISTORY, end to end through the merge every VAD-chunked
+  // `WhisperKit::transcribe` runs:
+  //
+  //   1. chunk A decodes speech greedily at 0.0 and survives;
+  //   2. chunk B falls back, is accepted at 0.2, and samples exactly
+  //      `[BLANK_AUDIO]` from an unseeded RNG;
+  //   3. the default blank-drop deletes chunk B's only segment;
+  //   4. the merged transcript is chunk A's "Hello" — every surviving
+  //      segment reads 0.0.
+  //
+  // BEFORE the fix, `for_result` inferred the effective temperature from
+  // those survivors, saw only 0.0, and answered `is_reproducible() == true`.
+  // A re-run redraws chunk B's unseeded sample, and text that is not the
+  // marker SURVIVES the drop and changes the transcript — so that guarantee
+  // was false.
+  let t = tiny_tokenizer();
+  let options = blank_falls_back_to_point_two();
+
+  let mut speech = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  script_clean_window(&mut speech, t.encode(" Hello").unwrap()[0]);
+  let mut blank = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  script_blank_audio_window(&mut blank, &t);
+
+  let chunk_a = TranscribeTask::new(&speech, &t)
+    .run(&vec![0.1; 32_000], &options)
+    .unwrap();
+  let chunk_b = TranscribeTask::new(&blank, &t)
+    .run(&vec![0.1; 32_000], &options)
+    .unwrap();
+
+  assert_eq!(
+    chunk_a.segments_slice()[0].temperature(),
+    0.0,
+    "A is greedy"
+  );
+  assert!(!chunk_a.sampled_at_nonzero_temperature());
+  assert!(chunk_b.segments_slice().is_empty(), "B was emptied");
+  assert!(
+    chunk_b.sampled_at_nonzero_temperature(),
+    "B sampled, and said so"
+  );
+
+  let merged =
+    crate::result::merge_transcription_results_with_options(&[chunk_a, chunk_b], &options);
+  assert_eq!(merged.text(), "Hello");
+  assert!(
+    merged
+      .segments_slice()
+      .iter()
+      .all(|segment| segment.temperature() == 0.0),
+    "every SURVIVING segment is greedy — which is exactly why inferring the \
+     answer from them was wrong"
+  );
+
+  // The merge OR-ed the fact out of the chunk whose segments are gone.
+  assert!(merged.sampled_at_nonzero_temperature());
+
+  let compute = crate::options::ComputeOptions::new();
+  let provenance = crate::provenance::Provenance::for_result(&options, &compute, &merged);
+  assert_eq!(
+    provenance.effective_temperature(),
+    Some(0.0),
+    "the surviving segments really do all say 0.0 — the fix must NOT come \
+     from changing this"
+  );
+  assert!(
+    !provenance.is_reproducible(),
+    "REGRESSION: an unseeded sampled window was filtered out, and the record \
+     went back to promising byte-reproducibility it cannot honor"
+  );
+
+  // The seeded twin: the very same history, replayable, so the promise is
+  // real this time.
+  let seeded = options.clone().with_seed(7);
+  let mut speech = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  script_clean_window(&mut speech, t.encode(" Hello").unwrap()[0]);
+  let mut blank = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  script_blank_audio_window(&mut blank, &t);
+  let merged_seeded = crate::result::merge_transcription_results_with_options(
+    &[
+      TranscribeTask::new(&speech, &t)
+        .run(&vec![0.1; 32_000], &seeded)
+        .unwrap(),
+      TranscribeTask::new(&blank, &t)
+        .run(&vec![0.1; 32_000], &seeded)
+        .unwrap(),
+    ],
+    &seeded,
+  );
+  assert!(merged_seeded.sampled_at_nonzero_temperature());
+  assert!(
+    crate::provenance::Provenance::for_result(&seeded, &compute, &merged_seeded).is_reproducible(),
+    "a seed makes the same sampled window replayable"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn unseeded_sampling_survives_a_no_speech_window_with_no_segments() {
+  // SIBLING (`transcribe/mod.rs`'s no-speech `continue`): a window can
+  // produce no segments at all, without any filter running, and the same
+  // reasoning applies — the temperature it decoded at is nowhere in the
+  // output.
+  //
+  // A no-speech window never falls back (`needs_fallback` short-circuits on
+  // the same comparison that skips it), so the way to reach this state with
+  // sampling is a non-zero BASE temperature: the very first attempt draws
+  // from the sampler and is accepted as-is.
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  script_clean_window(&mut mock, t.encode(" Hello").unwrap()[0]);
+  // `no_speech_threshold(-0.1)` makes every window read as silent, and
+  // clearing `logprob_threshold` stops the skip being un-set again by a
+  // healthy average log probability (`segment::find_seek_point_and_segments`
+  // :96-99) — the same pairing `silence_skipped_window_with_word_timestamps_
+  // surfaces_a_segment_error` above needs, for the same reason.
+  let options = DecodingOptions::new()
+    .with_temperature(0.5)
+    .with_no_speech_threshold(-0.1)
+    .maybe_logprob_threshold(None);
+  assert_eq!(options.seed(), None);
+
+  let result = TranscribeTask::new(&mock, &t)
+    .run(&vec![0.1; 32_000], &options)
+    .unwrap();
+
+  assert!(
+    result.segments_slice().is_empty(),
+    "the no-speech window contributed nothing"
+  );
+  assert!(
+    result.sampled_at_nonzero_temperature(),
+    "it still sampled at 0.5, and the record has to know"
+  );
+  assert!(
+    !crate::provenance::Provenance::for_result(
+      &options,
+      &crate::options::ComputeOptions::new(),
+      &result,
+    )
+    .is_reproducible()
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn a_greedy_run_stays_reproducible_through_the_drop() {
+  // The other direction, so the fix is not just "always say no": an
+  // ALL-GREEDY run whose every segment the blank-drop deleted is still
+  // perfectly reproducible — nothing ever drew from the sampler. (The old
+  // inference-from-survivors rule could not tell this apart from the case
+  // above: both leave zero segments, and it guessed `false` for both.)
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  script_blank_audio_window(&mut mock, &t);
+  let options = DecodingOptions::new();
+
+  let result = TranscribeTask::new(&mock, &t)
+    .run(&vec![0.1; 32_000], &options)
+    .unwrap();
+  assert!(result.segments_slice().is_empty());
+  assert!(
+    !result.sampled_at_nonzero_temperature(),
+    "greedy throughout: the sampler was never consulted"
+  );
+  assert!(
+    crate::provenance::Provenance::for_result(
+      &options,
+      &crate::options::ComputeOptions::new(),
+      &result,
+    )
+    .is_reproducible(),
+    "an empty greedy transcript reproduces exactly"
+  );
+}

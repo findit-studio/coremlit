@@ -674,6 +674,7 @@ fn unset_identity_serializes_as_absent_not_null() {
     "compute",
     "detected_language",
     "effective_temperature",
+    "sampled_at_nonzero_temperature",
   ] {
     assert!(object.contains_key(present), "`{present}` must be recorded");
   }
@@ -721,6 +722,10 @@ fn a_record_missing_a_library_known_field_is_rejected() {
     "compute",
     "detected_language",
     "effective_temperature",
+    // The optimistic direction is the dangerous one: a dropped
+    // `sampled_at_nonzero_temperature` would read back `false` ("never
+    // sampled") and hand `is_reproducible` a guarantee it never earned.
+    "sampled_at_nonzero_temperature",
   ] {
     let mut without = value.clone();
     without.as_object_mut().unwrap().remove(required).unwrap();
@@ -739,5 +744,92 @@ fn a_record_missing_a_library_known_field_is_rejected() {
       .unwrap()
       .effective_temperature(),
     None
+  );
+}
+
+// ---------------------------------------------------------------------
+// The unseeded-sampling invariant (codex round 1 / finding 2)
+// ---------------------------------------------------------------------
+
+#[test]
+fn for_result_reads_the_carried_sampling_fact_not_the_surviving_segments() {
+  // The heart of finding 2, at the `Provenance` boundary. A result whose
+  // sampled window was FILTERED AWAY has no segment left to betray it: every
+  // survivor reads 0.0, and `effective_temperature` honestly reports
+  // `Some(0.0)`. Only the carried flag knows better -- and
+  // `is_reproducible` must believe the flag, not the survivors.
+  let compute = ComputeOptions::new();
+  let unseeded = DecodingOptions::new();
+
+  // A greedy transcript whose decode ALSO ran an unseeded sampled window
+  // that got dropped: exactly what the blank-audio drop leaves behind.
+  let filtered = result_at("en", &[0.0]).with_sampled_at_nonzero_temperature();
+  let record = Provenance::for_result(&unseeded, &compute, &filtered);
+  assert_eq!(
+    record.effective_temperature(),
+    Some(0.0),
+    "the survivors really are all greedy -- the fix must not come from here"
+  );
+  assert!(record.sampled_at_nonzero_temperature());
+  assert!(
+    !record.is_reproducible(),
+    "an unseeded sampled window happened, even though nothing survived to say so"
+  );
+
+  // Seeded, the same history replays exactly.
+  assert!(
+    Provenance::for_result(&DecodingOptions::new().with_seed(3), &compute, &filtered)
+      .is_reproducible()
+  );
+
+  // And with nothing sampled anywhere, a segment-less transcript is
+  // reproducible -- the answer the old infer-from-survivors rule could not
+  // give, because zero segments left it with no evidence and it had to guess.
+  let empty = result_at("en", &[]);
+  assert!(!empty.sampled_at_nonzero_temperature());
+  let greedy = Provenance::for_result(&unseeded, &compute, &empty);
+  assert_eq!(greedy.effective_temperature(), None);
+  assert!(
+    greedy.is_reproducible(),
+    "nothing ever drew from the sampler, so there is nothing to replay"
+  );
+}
+
+#[test]
+fn a_hand_built_result_cannot_hide_a_sampled_segment() {
+  // `TranscriptionResult::new` starts the flag `false`, so a result the
+  // pipeline did not produce claims no sampling. The segment scan in
+  // `for_result` is what keeps that from becoming a free "reproducible":
+  // evidence can only ADD sampling, never retract it.
+  let compute = ComputeOptions::new();
+  let unseeded = DecodingOptions::new();
+
+  let hand_built = result_at("en", &[0.0, 0.2]);
+  assert!(
+    !hand_built.sampled_at_nonzero_temperature(),
+    "no decode path set the flag"
+  );
+  let record = Provenance::for_result(&unseeded, &compute, &hand_built);
+  assert!(
+    record.sampled_at_nonzero_temperature(),
+    "a VISIBLE sampled segment is evidence too"
+  );
+  assert!(!record.is_reproducible());
+}
+
+#[test]
+fn from_options_and_for_segment_record_their_own_temperature() {
+  let compute = ComputeOptions::new();
+  let decoding = DecodingOptions::new();
+
+  assert!(
+    !Provenance::from_options(&decoding, &compute, 0.0).sampled_at_nonzero_temperature(),
+    "greedy: the sampler was never consulted"
+  );
+  assert!(Provenance::from_options(&decoding, &compute, 0.2).sampled_at_nonzero_temperature());
+
+  let sampled_segment = TranscriptionSegment::new().with_temperature(0.4);
+  assert!(
+    Provenance::for_segment(&decoding, &compute, &sampled_segment).sampled_at_nonzero_temperature()
   );
 }

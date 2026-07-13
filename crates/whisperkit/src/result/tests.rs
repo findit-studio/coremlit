@@ -953,3 +953,46 @@ fn merge_with_confirmed_words_overrides_text_only() {
   assert_eq!(with_words.segments_slice(), plain.segments_slice());
   assert_eq!(with_words.language(), plain.language());
 }
+
+#[test]
+fn merge_ors_the_sampling_fact_across_results() {
+  // The VAD-chunk instance of finding 2: a chunk the blank-audio drop
+  // emptied contributes NO segments, so its accepted temperature is nowhere
+  // in the merged segment list. The merge has to carry the fact out of it
+  // anyway, or the merged transcript looks greedy and claims a
+  // byte-reproducibility it cannot honor.
+  let greedy = TranscriptionResult::new(
+    "Hello",
+    vec![TranscriptionSegment::new().with_temperature(0.0)],
+    "en",
+    TranscriptionTimings::new(),
+  );
+  // The emptied chunk: zero segments, and the only witness to its own
+  // sampling is the flag itself.
+  let emptied = TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
+    .with_sampled_at_nonzero_temperature();
+  assert!(emptied.segments_slice().is_empty());
+
+  let merged = merge_transcription_results(&[greedy.clone(), emptied.clone()]);
+  assert!(
+    merged
+      .segments_slice()
+      .iter()
+      .all(|segment| segment.temperature() == 0.0),
+    "no surviving segment carries the evidence"
+  );
+  assert!(
+    merged.sampled_at_nonzero_temperature(),
+    "and yet the merge must still know"
+  );
+
+  // Same through the options-aware door `WhisperKit::transcribe` actually uses.
+  assert!(
+    merge_transcription_results_with_options(&[greedy.clone(), emptied], &DecodingOptions::new())
+      .sampled_at_nonzero_temperature()
+  );
+
+  // All-greedy merges stay honest in the other direction.
+  assert!(!merge_transcription_results(&[greedy.clone(), greedy]).sampled_at_nonzero_temperature());
+  assert!(!merge_transcription_results(&[]).sampled_at_nonzero_temperature());
+}

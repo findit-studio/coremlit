@@ -1178,12 +1178,37 @@ pub struct TranscriptionResult {
     serde(default, skip_serializing_if = "Option::is_none")
   )]
   seek_time: Option<f32>,
+  /// Whether **any** window of this transcript was accepted at a decode
+  /// temperature above `0.0` — i.e. whether the token sampler was ever
+  /// consulted at all. Rust-only; Swift records nothing like it.
+  ///
+  /// Accumulated by [`crate::transcribe::TranscribeTask::run`] the moment a
+  /// window's fallback ladder settles, and **never recomputed from the
+  /// segments afterwards** — which is the entire point of storing it. See
+  /// [`Self::sampled_at_nonzero_temperature`] for the failing history that
+  /// forced it.
+  ///
+  /// Always written by `serde` (no `skip_serializing_if`), so a persisted
+  /// transcript never quietly loses it. `serde(default)` for a partial
+  /// record, matching every other field of this type.
+  #[cfg_attr(feature = "serde", serde(default))]
+  sampled_at_nonzero_temperature: bool,
 }
 
 impl TranscriptionResult {
   /// Builds a result from its four required fields (Swift
   /// `TranscriptionResultStruct.init`, `Models.swift:550-562`, has no
-  /// defaults for these either); [`Self::seek_time`] starts `None`.
+  /// defaults for these either); [`Self::seek_time`] starts `None` and
+  /// [`Self::sampled_at_nonzero_temperature`] starts `false`.
+  ///
+  /// A result assembled by hand therefore claims **no** sampling happened.
+  /// That is the right default for a caller inventing a transcript, and it
+  /// is not a hole in the reproducibility guarantee:
+  /// [`Provenance::for_result`](crate::provenance::Provenance::for_result)
+  /// additionally scans the surviving segments' own temperatures, so a
+  /// visible `temperature > 0.0` is caught either way. What only this flag
+  /// can carry is a sampled window whose segments are *gone* — and only the
+  /// decode path can know about those.
   pub fn new(
     text: impl Into<String>,
     segments: impl Into<Vec<TranscriptionSegment>>,
@@ -1196,6 +1221,7 @@ impl TranscriptionResult {
       language: language.into(),
       timings,
       seek_time: None,
+      sampled_at_nonzero_temperature: false,
     }
   }
 
@@ -1327,6 +1353,80 @@ impl TranscriptionResult {
   #[inline(always)]
   pub const fn clear_seek_time(&mut self) -> &mut Self {
     self.seek_time = None;
+    self
+  }
+
+  // -- sampled_at_nonzero_temperature (bool) ------------------------------
+  /// Whether any window of this transcript was accepted at a decode
+  /// temperature above `0.0`, and therefore **drew from the token sampler**
+  /// rather than taking the deterministic argmax.
+  ///
+  /// This is the fact
+  /// [`Provenance::is_reproducible`](crate::provenance::Provenance::is_reproducible)
+  /// rests on, and it has to be *recorded* rather than reconstructed,
+  /// because every path from a decoded window to a surviving segment is
+  /// lossy:
+  ///
+  /// - [`DecodingOptions::drop_blank_audio`] removes a segment whose text is
+  ///   exactly `[BLANK_AUDIO]` — and a silent window is precisely the kind
+  ///   that trips the fallback ladder;
+  /// - the word-timestamp pass drops zero-length segments
+  ///   (`TranscribeTask.swift:217-218`);
+  /// - a no-speech window `continue`s having produced no segments at all;
+  /// - a VAD chunk emptied by any of the above contributes none to the
+  ///   merge.
+  ///
+  /// **The failing history this exists to prevent** (constructed, not
+  /// hypothesized — see `transcribe::tests`): window A decodes speech
+  /// greedily at `0.0`; window B falls back and is accepted at `0.2`,
+  /// sampling exactly `[BLANK_AUDIO]` from an **unseeded** RNG; the default
+  /// blank-drop deletes window B's only segment. Every *surviving* segment
+  /// now reads `0.0`, so a predicate that inferred the effective temperature
+  /// from the segments concluded "greedy, therefore reproducible" — while a
+  /// re-run would re-draw window B's unseeded sample and could produce text
+  /// that survives. The record promised byte-reproducibility it could not
+  /// back.
+  ///
+  /// Accumulated once per window in
+  /// [`TranscribeTask::run`](crate::transcribe::TranscribeTask::run), the
+  /// instant the ladder settles and **before** any of the four filters
+  /// above can run, and OR-ed across every merged result by
+  /// [`merge_transcription_results`]. `false` on a hand-built result — see
+  /// [`Self::new`].
+  #[inline(always)]
+  pub const fn sampled_at_nonzero_temperature(&self) -> bool {
+    self.sampled_at_nonzero_temperature
+  }
+  /// Builder form of [`Self::set_sampled_at_nonzero_temperature`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_sampled_at_nonzero_temperature(mut self) -> Self {
+    self.set_sampled_at_nonzero_temperature();
+    self
+  }
+  /// Sets [`Self::sampled_at_nonzero_temperature`] to `true`.
+  #[inline(always)]
+  pub const fn set_sampled_at_nonzero_temperature(&mut self) -> &mut Self {
+    self.sampled_at_nonzero_temperature = true;
+    self
+  }
+  /// Builder form of [`Self::update_sampled_at_nonzero_temperature`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn maybe_sampled_at_nonzero_temperature(mut self, sampled: bool) -> Self {
+    self.update_sampled_at_nonzero_temperature(sampled);
+    self
+  }
+  /// Assigns [`Self::sampled_at_nonzero_temperature`] directly.
+  #[inline(always)]
+  pub const fn update_sampled_at_nonzero_temperature(&mut self, sampled: bool) -> &mut Self {
+    self.sampled_at_nonzero_temperature = sampled;
+    self
+  }
+  /// Sets [`Self::sampled_at_nonzero_temperature`] to `false`.
+  #[inline(always)]
+  pub const fn clear_sampled_at_nonzero_temperature(&mut self) -> &mut Self {
+    self.sampled_at_nonzero_temperature = false;
     self
   }
 
@@ -2373,7 +2473,19 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
     .set_pipeline_start(earliest_pipeline_start)
     .set_first_token_time(min_timing(results, TranscriptionTimings::first_token_time));
 
+  // OR-ed, never recomputed from `segments`: a chunk the blank-audio drop
+  // emptied contributes NO segments to the merge, so its own accepted
+  // temperature is not visible in the merged segment list at all. If it
+  // sampled, the merged transcript is not byte-reproducible either — a
+  // re-run re-draws that chunk's unseeded sample, and the text it lands on
+  // next time may well survive the drop. The fact has to travel with the
+  // result rather than be read back off the output it no longer appears in.
+  let sampled = results
+    .iter()
+    .any(TranscriptionResult::sampled_at_nonzero_temperature);
+
   TranscriptionResult::new(text, segments, language, timings)
+    .maybe_sampled_at_nonzero_temperature(sampled)
 }
 
 // ---------------------------------------------------------------------

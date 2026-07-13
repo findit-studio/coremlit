@@ -239,6 +239,28 @@ pub struct Provenance {
   /// are handed the one temperature they record.
   #[cfg_attr(feature = "serde", serde(deserialize_with = "required_option"))]
   effective_temperature: Option<f32>,
+  /// Whether the decode ever **drew from the token sampler** — i.e. whether
+  /// any window was accepted above temperature `0.0`. Backs
+  /// [`Self::is_reproducible`], and is the one library-known fact here that
+  /// [`Self::effective_temperature`] cannot supply.
+  ///
+  /// It is a *carried* fact, not a derived one, and that distinction is the
+  /// whole of coremlit issue #14's second review finding.
+  /// [`Self::effective_temperature`] describes the transcript's **surviving
+  /// segments**; this describes the **decode**. They come apart exactly when
+  /// a filter deletes the segments of a window that sampled — the blank-audio
+  /// drop, the word-timestamp zero-length filter, a no-speech window, an
+  /// emptied VAD chunk. In that state every surviving segment reads `0.0`,
+  /// `effective_temperature` is `Some(0.0)`, and a predicate built on it
+  /// would call an unseeded, genuinely non-reproducible transcript
+  /// reproducible. See
+  /// [`TranscriptionResult::sampled_at_nonzero_temperature`] for the
+  /// constructed failing history.
+  ///
+  /// Required on deserialize, like the rest of the library-known facts: a
+  /// record that dropped this field would read back as "never sampled", the
+  /// optimistic answer, which is the one direction this must never fail in.
+  sampled_at_nonzero_temperature: bool,
 
   // -- consumer-supplied: load-time identity ----------------------------
   /// The model's identity (e.g. a Hub repo id), if the caller supplied it.
@@ -304,6 +326,7 @@ impl Provenance {
     compute: &ComputeOptions,
     detected_language: Option<String>,
     effective_temperature: Option<f32>,
+    sampled_at_nonzero_temperature: bool,
   ) -> Self {
     Self {
       // The WHOLE options value, not a field-by-field projection — the one
@@ -313,6 +336,7 @@ impl Provenance {
       compute: *compute,
       detected_language,
       effective_temperature,
+      sampled_at_nonzero_temperature,
       model_id: None,
       model_revision: None,
       tokenizer_id: None,
@@ -344,7 +368,16 @@ impl Provenance {
     compute: &ComputeOptions,
     effective_temperature: f32,
   ) -> Self {
-    Self::capture(decoding, compute, None, Some(effective_temperature))
+    Self::capture(
+      decoding,
+      compute,
+      None,
+      Some(effective_temperature),
+      // One decode at one temperature is all this constructor is told about,
+      // so that temperature IS the whole sampling history it can record.
+      // `for_result` is the form with a decode history to draw on.
+      effective_temperature > 0.0,
+    )
   }
 
   /// [`Self::from_options`] with the effective temperature read straight
@@ -417,6 +450,24 @@ impl Provenance {
       compute,
       Some(result.language().to_string()),
       unanimous_temperature(result.segments_slice()),
+      // Two sources, OR-ed, and the order matters less than the fact that
+      // neither can veto the other:
+      //
+      // - the decode path's own carried flag, which is the ONLY witness for
+      //   a window that sampled and then had its segments filtered away
+      //   (`TranscriptionResult::sampled_at_nonzero_temperature`); and
+      // - the surviving segments' temperatures, which catch a result
+      //   assembled by hand — `TranscriptionResult::new` starts the flag
+      //   `false`, so a caller who built a transcript out of segments the
+      //   pipeline sampled would otherwise get an unearned "reproducible".
+      //
+      // Monotone: evidence can only ever ADD sampling, never retract it, so
+      // no combination of the two can talk this predicate into optimism.
+      result.sampled_at_nonzero_temperature()
+        || result
+          .segments_slice()
+          .iter()
+          .any(|segment| segment.temperature() > 0.0),
     )
   }
 
@@ -486,28 +537,49 @@ impl Provenance {
     self.effective_temperature
   }
 
+  /// Whether the decode ever drew from the token sampler — see
+  /// [`TranscriptionResult::sampled_at_nonzero_temperature`], whose doc
+  /// carries the failing history that made this a stored fact.
+  #[inline(always)]
+  pub const fn sampled_at_nonzero_temperature(&self) -> bool {
+    self.sampled_at_nonzero_temperature
+  }
+
   /// Whether this transcript can be reproduced byte-for-byte by re-running
-  /// the same audio through the same options: true when the decode was
-  /// greedy (an effective temperature of `0.0` never draws from the
-  /// sampler) or when a [`DecodingOptions::seed`] makes the draws
+  /// the same audio through the same options: true when the decode never
+  /// drew from the sampler (every window accepted greedily at `0.0`), or
+  /// when a [`DecodingOptions::seed`] makes the draws it did make
   /// replayable.
   ///
-  /// A `None` [`Self::effective_temperature`] is treated as **not**
-  /// self-evidently reproducible, and so needs a seed: the ladder having
-  /// split the segments means at least one of them climbed off `0.0` and
-  /// sampled (the rungs only ever ascend), and a segment-less result
-  /// carries no evidence either way. Conservative on purpose — this
-  /// predicate must never claim reproducibility it cannot back.
+  /// # It reads a recorded fact, and deliberately does not infer one
+  ///
+  /// The predicate rests on [`Self::sampled_at_nonzero_temperature`] — a
+  /// fact the decode path *carried out* of the window loop — and **not** on
+  /// [`Self::effective_temperature`], which describes only the segments that
+  /// survived to the end.
+  ///
+  /// Inferring it from the survivors is exactly the bug this replaced. The
+  /// blank-audio drop, the word-timestamp zero-length filter, a no-speech
+  /// window, and an emptied VAD chunk each delete a whole window's segments;
+  /// a window accepted at `0.2` that sampled `[BLANK_AUDIO]` from an
+  /// unseeded RNG therefore leaves a transcript whose every surviving
+  /// segment reads `0.0`. Reconstructed from those, the answer was
+  /// `Some(0.0)` -> "greedy" -> **`true`** — a byte-reproducibility
+  /// guarantee the run could not honor, since a re-run redraws that window
+  /// and the text it lands on next time may well survive the filter.
+  ///
+  /// Because the fact is now carried rather than reconstructed, this is also
+  /// *more* precise than the old conservative fallbacks: an all-greedy run
+  /// whose every segment was dropped (pure silence, blank-dropped) is
+  /// correctly reproducible, where the old `None`-means-unknown rule had to
+  /// guess `false`.
   ///
   /// A seed makes *this port's* output reproducible; it cannot make that
   /// output match Swift's, which has no seed knob and always draws
   /// unseeded (see [`DecodingOptions::seed`]).
   #[inline(always)]
   pub const fn is_reproducible(&self) -> bool {
-    match self.effective_temperature {
-      Some(temperature) => temperature == 0.0 || self.decoding.seed().is_some(),
-      None => self.decoding.seed().is_some(),
-    }
+    !self.sampled_at_nonzero_temperature || self.decoding.seed().is_some()
   }
 
   // -- model_id (Option<String>) ------------------------------------------

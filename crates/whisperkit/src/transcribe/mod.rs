@@ -259,6 +259,11 @@ where
 
     let mut all_segments: Vec<TranscriptionSegment> = Vec::new();
     let mut detected_language: Option<String> = None;
+    // Whether ANY window's accepted decode drew from the token sampler
+    // (temperature > 0.0). Accumulated below, the instant each window's
+    // fallback ladder settles — see the assignment for why it cannot be
+    // reconstructed from `all_segments` afterwards.
+    let mut sampled_at_nonzero_temperature = false;
 
     // :82-85 — decoder init timing covers only state allocation, matching
     // Swift's `decoderInitTime` scope exactly (the prefill call right below
@@ -373,6 +378,30 @@ where
           window_index,
         )?;
         window_index += 1;
+
+        // THE reproducibility invariant, recorded HERE — at the one point
+        // where this window's accepted temperature is still knowable, and
+        // ahead of every step that can erase the evidence of it.
+        //
+        // `decode_with_fallback` has just settled the ladder, so
+        // `decoding_result.temperature()` is the rung the window was
+        // ACCEPTED at; above `0.0` it drew from the sampler, and with no
+        // `options.seed()` that draw cannot be replayed. Four things
+        // downstream of this line can delete every segment this window
+        // produces — the word-timestamp pass's zero-length filter (:416),
+        // the no-speech `continue` (:462), the blank-audio drop (:498),
+        // and, one level up, a VAD chunk that ends up contributing nothing
+        // to the merge. Once any of them fires, the window's temperature is
+        // no longer anywhere in the output, and a `Provenance` that read the
+        // effective temperature back off the SURVIVING segments would see
+        // only the greedy ones and declare the transcript reproducible.
+        // (Constructed, not hypothesized: `transcribe::tests`'
+        // `unseeded_sampling_survives_the_blank_audio_drop` scripts a window
+        // accepted at 0.2 that decodes to exactly `[BLANK_AUDIO]` and is
+        // then dropped.)
+        //
+        // So: accumulate before filtering, and never infer after.
+        sampled_at_nonzero_temperature |= decoding_result.temperature() > 0.0;
 
         // :178-194.
         let windowing_start = Instant::now();
@@ -516,12 +545,18 @@ where
 
     timings.set_full_pipeline(pipeline_start.elapsed().as_secs_f64());
 
-    Ok(TranscriptionResult::new(
-      trimmed_text,
-      all_segments,
-      detected_language.unwrap_or_else(|| DEFAULT_LANGUAGE_CODE.to_string()),
-      timings,
-    ))
+    Ok(
+      TranscriptionResult::new(
+        trimmed_text,
+        all_segments,
+        detected_language.unwrap_or_else(|| DEFAULT_LANGUAGE_CODE.to_string()),
+        timings,
+      )
+      // Carried out of the window loop, not derived from `all_segments` —
+      // by this point the filters above may have emptied the very window
+      // that sampled (see the assignment inside the loop).
+      .maybe_sampled_at_nonzero_temperature(sampled_at_nonzero_temperature),
+    )
   }
 
   /// Removes every blank-audio segment from `segments` in place, for
