@@ -302,8 +302,12 @@ const fn splitmix64(x: u64) -> u64 {
 /// `window_index` a strictly monotonic per-`run` window counter — offset by
 /// the task's own `window_id_offset` (see
 /// [`TranscribeTask::set_window_id_offset`](crate::transcribe::TranscribeTask::set_window_id_offset)'s
-/// doc) so sequential VAD chunks and concurrent batch workers don't reuse
-/// each other's window indices either — and `attempt_index` the fallback
+/// doc) to bias distinct chunks/workers toward distinct seed streams (note
+/// this is a decorrelation *nudge*, not a guarantee: per-chunk offsets
+/// increment by 1 while a chunk consumes as many window indices as it has
+/// windows, so `offset + window_index` ranges can overlap across chunks —
+/// harmless, because distinct audio yields distinct logits and thus
+/// distinct draws regardless of the seed) — and `attempt_index` the fallback
 /// loop's own `0..=temperature_fallback_count` counter. The function itself
 /// has no dependency on that caller: it is a pure, public mixing primitive,
 /// so a direct [`decode_text`](crate::decode::decode_text)/

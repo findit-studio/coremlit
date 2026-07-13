@@ -38,13 +38,12 @@ fn compression_ratio_of_tokens_matches_apple_libcompression_golden() {
   // `NSData.compressed(using: .zlib)` bytes Swift WhisperKit's
   // `TextUtilities.compressionRatio` produces — captured with an
   // independent oracle (NOT this crate's own encoder) and verified to
-  // inflate as raw DEFLATE / RFC 1951 (see
-  // `.superpowers/sdd/issue9-compression-fix-report.md`). Because they are
+  // inflate as raw DEFLATE / RFC 1951. Because they are
   // not self-referential, they FAIL if the codec regresses to
   // flate2/miniz_oxide (RFC-1950 zlib-wrapped, +6 bytes of wrapper, and a
   // weaker body); each case notes what flate2 would emit instead.
   //
-  // The findings doc's byte-level anchor: `[1212,318,257,1332,13]` x2 →
+  // Byte-level anchor: `[1212,318,257,1332,13]` x2 →
   // Apple emits 24 bytes beginning `db c3 c2 c0` (raw DEFLATE); flate2
   // would emit 30. This case simultaneously pins the i32-LE token encoding
   // (the input) and the Apple codec (the length).
