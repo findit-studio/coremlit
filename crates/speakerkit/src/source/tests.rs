@@ -127,13 +127,21 @@ fn any_source_load_dispatches_by_source() {
   assert_eq!(argmax_out.chunks_sw(), fluid_out.chunks_sw());
 
   // VALUES are NOT required to agree — the two decodes are independent (spec
-  // §4) — but nor are they required to DIFFER, and asserting they must would
-  // be wrong: on this short, clean, single-speaker clip the two hard decodes
-  // in fact produce IDENTICAL `segmentations`, which is unsurprising (same
-  // underlying pyannote model, two conversions) and reassuring. Only the
-  // embeddings must differ, because the two sources run entirely different
-  // embedding networks (WeSpeaker vs argmax's `SpeakerEmbedder`) — and both
-  // are non-trivial here, so this cannot pass vacuously on two zero buffers.
+  // §4) — but nor are they required to DIFFER, so neither is asserted about
+  // `segmentations`.
+  //
+  // Do NOT read the two sources as bit-identical segmenters. On this short,
+  // clean, SINGLE-SPEAKER 2 s clip they do happen to produce identical
+  // `segmentations`, but that is a property of THIS fixture, not of the two
+  // models: on a 30 s two-speaker clip they disagree on 3 of 37 107
+  // segmentation cells (0.008 %) and on ~65 % of embedding cells. The right
+  // cross-source claim is decision-level near-agreement, never bit-identity
+  // (Task 5 asserts it at that level).
+  //
+  // Only the embeddings must differ, because the two sources run entirely
+  // different embedding networks (WeSpeaker vs argmax's `SpeakerEmbedder`) —
+  // and both are non-trivial here, so this cannot pass vacuously on two zero
+  // buffers.
   assert!(fluid_out.raw_embeddings().iter().any(|&v| v != 0.0));
   assert!(argmax_out.raw_embeddings().iter().any(|&v| v != 0.0));
   assert_ne!(
