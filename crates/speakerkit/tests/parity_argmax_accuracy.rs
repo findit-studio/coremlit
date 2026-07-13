@@ -34,13 +34,20 @@
 //!    disagreements. The count of such gate-dropped-but-dia-active columns is
 //!    reported separately, because it explains most disagreement and is a
 //!    known semantic difference, not a conversion error.
-//! 3. **Embeddings are cross-mask AND cross-fbank AND cross-conversion.**
-//!    FluidAudio's parity_embed replayed dia's mask VERBATIM, so its 0.99999989
-//!    cosine isolates the WeSpeaker conversion alone. Here argmax pools over its
-//!    OWN in-graph mask (`speaker_ids * (1 - overlapped)`) and its OWN in-graph
-//!    30 s fbank, against dia's kaldi fbank + exclude-overlap mask. A lower
-//!    cosine than FluidAudio's is EXPECTED and is not a defect — it folds in
-//!    every one of those differences. Reported, never asserted tight.
+//! 3. **Embeddings are cross-mask AND cross-fbank AND cross-conversion — but
+//!    FBANK dominates, not the mask (spec §5.4).** FluidAudio's parity_embed
+//!    replayed dia's mask VERBATIM, so its 0.99999989 cosine isolates the
+//!    WeSpeaker conversion alone. Here argmax pools over its OWN in-graph
+//!    mask (`speaker_ids * (1 - overlapped)`) — which agrees with dia's
+//!    decision ~99.98% of the time (the same decode item 1 measures) — and
+//!    an 80-mel spectrogram from a SEPARATE `SpeakerEmbedderPreprocessor`
+//!    model: argmax's OWN fbank conversion, NOT computed in-graph, against
+//!    dia's kaldi fbank + exclude-overlap mask. That separate fbank is the
+//!    dominant divergence (FluidAudio's *in-graph* fbank matched kaldi to
+//!    1e-7 in T6; argmax's preprocessor does not); quantization is likewise
+//!    near-free (both tiers land at ~0.94 cosine). A lower cosine than
+//!    FluidAudio's is EXPECTED and is not a defect — it folds in every one of
+//!    those differences. Reported, never asserted tight.
 //!
 //! # The chunk correspondence (proven, not assumed)
 //!
@@ -118,24 +125,27 @@ const SEG_AGREEMENT_SANITY_FLOOR: f64 = 0.98;
 
 /// SANITY floor on per-`(chunk, slot)` embedding cosine vs the fp32 dia-ort
 /// oracle. Deliberately loose — argmax's embedder is a genuinely different
-/// conversion pooling over its OWN in-graph mask + fbank (module doc's
-/// structural-difference item 3), and
-/// the MEASURED worst is only **0.83** (07, chunk 1, slot 1), FAR below the
-/// mask-matched FluidAudio path's 0.99999989 (`parity_embed`). That gap is a
-/// reported FINDING, not a bug — so this is emphatically NOT a precision gate;
-/// it is a gross-mismap backstop. Slot CORRESPONDENCE is already guaranteed by
-/// the 99.98% segmentation agreement above (argmax slot `s`'s active frames
-/// match dia slot `s`'s), so a swapped-speaker embedding is caught there; this
-/// only trips on a catastrophe (orthogonal/negative cosine). Set below the
-/// measured worst with margin — do not raise it toward the measured value and
-/// mistake it for a fidelity bound.
+/// conversion pooling over its OWN mask (in-graph, from the segmenter) and
+/// fbank (a SEPARATE `SpeakerEmbedderPreprocessor` model, NOT in-graph —
+/// module doc's structural-difference item 3, where FBANK dominates the gap,
+/// not the mask). The MEASURED worst is only **0.83** (07, chunk 1, slot 1),
+/// FAR below the mask-matched FluidAudio path's 0.99999989 (`parity_embed`).
+/// That gap is a reported FINDING, not a bug — so this is emphatically NOT a
+/// precision gate; it is a gross-mismap backstop. Slot CORRESPONDENCE is
+/// already guaranteed by the 99.98% segmentation agreement above (argmax
+/// slot `s`'s active frames match dia slot `s`'s), so a swapped-speaker
+/// embedding is caught there; this only trips on a catastrophe
+/// (orthogonal/negative cosine). Set below the measured worst with margin —
+/// do not raise it toward the measured value and mistake it for a fidelity
+/// bound.
 const EMBED_COS_SANITY_FLOOR: f64 = 0.70;
 
-/// Max tolerated DROP in mean embedding cosine from the fp32-labelled Baseline
-/// tier to the 8-bit W8A16 tier — the "does quantization cost accuracy"
-/// tripwire. Quantization is EXPECTED to cost a little; a large regression
-/// (e.g. a broken W8A16 artifact) is a finding. Measured delta is reported;
-/// this only fails if W8A16 falls materially below Baseline.
+/// Max tolerated DROP in mean embedding cosine from the Baseline tier (W32A32
+/// segmenter, but W16A16 — fp16, NOT fp32 — embedder) to the 8-bit W8A16
+/// tier — the "does quantization cost accuracy" tripwire. Quantization is
+/// EXPECTED to cost a little; a large regression (e.g. a broken W8A16
+/// artifact) is a finding. Measured delta is reported; this only fails if
+/// W8A16 falls materially below Baseline.
 const MAX_QUANT_COS_DROP: f64 = 0.02;
 
 /// One variant's measured accuracy against the fp32 dia-ort oracle.
@@ -439,8 +449,10 @@ fn report(label: &str, a: &Accuracy) {
 #[test]
 #[ignore = "needs Models/argmax-speakerkit (ARGMAX_TEST_MODELS) + committed fp32-dia goldens"]
 fn argmax_accuracy_vs_fp32_dia_ort() {
-  // The fp32-labelled tier: W32A32 segmenter / W16A16 embedder (argmax's
-  // un-palettized baseline — the closest argmax has to "fp32").
+  // The Baseline tier: W32A32 (fp32) segmenter / W16A16 (fp16, NOT fp32)
+  // embedder — argmax's un-palettized tier. Comparing the fp16 embedder
+  // against dia's fp32 WeSpeaker folds a small precision term into the
+  // embedding-cosine gap below; the gap is not purely fbank + conversion.
   let baseline = measure(ArgmaxVariant::Baseline);
   report("Baseline (W32A32 seg / W16A16 embed)", &baseline);
 
@@ -448,7 +460,7 @@ fn argmax_accuracy_vs_fp32_dia_ort() {
   let w8a16 = measure(ArgmaxVariant::W8A16);
   report("W8A16", &w8a16);
 
-  // ── The quantization-cost verdict: W8A16 vs the fp32-labelled Baseline ──
+  // ── The quantization-cost verdict: W8A16 vs the Baseline tier ──
   let seg_delta = baseline.seg_agreement() - w8a16.seg_agreement();
   let cos_delta = baseline.mean_cos - w8a16.mean_cos;
   println!(

@@ -212,6 +212,10 @@ fn segmentation_parity_vs_dia_ort() {
   // asserted — spec §5). Fails on a genuine seg regression (mutation-proven,
   // module doc); the threshold value is a controller decision, never loosened
   // to hide one.
+  // NOTE: `agreement` pools both fixtures into one ratio, so a ≤3-flip burst
+  // confined to a single clip still clears this floor — acceptable now; a
+  // per-fixture floor could be added later if localized sensitivity is
+  // wanted.
   assert!(
     agreement >= SEG_DECISION_AGREEMENT_MIN,
     "seg multilabel DECISION agreement {:.4}% ({total_flips} flips / {total_frames} frames) fell \
