@@ -17,6 +17,60 @@
 //!   Aligner::align_chunk:  VAD → prepare → [CoreML encode] → finish → Words
 //! ```
 //!
+//! # The canonical call
+//!
+//! [`Aligner::align_chunk`] takes six arguments and three of them have contracts
+//! that are not obvious from their types, so here is the shape in full. This is
+//! a compiled doctest: it type-checks against the real signature on every
+//! `cargo test`.
+//!
+//! ```no_run
+//! use core::sync::atomic::AtomicBool;
+//! use std::path::Path;
+//!
+//! use alignkit::{
+//!   ANALYSIS_TIMEBASE, Aligner, EnglishNormalizer, Lang, OutputClock,
+//!   default_oov_decisions,
+//! };
+//!
+//! let aligner = Aligner::from_paths(
+//!   Lang::En,
+//!   Path::new("Models/alignkit/base960h_aligner.mlmodelc"),
+//!   Box::new(EnglishNormalizer::new()),
+//! )?;
+//!
+//! // 16 kHz mono f32, at most `encode::ENCODER_WINDOW_SAMPLES` (60 s).
+//! let samples: Vec<f32> = vec![0.0; 16_000];
+//! let text = "the transcript of what is said in `samples`";
+//!
+//! // OOV is DATA, not policy: detect the events, then resolve them. The
+//! // decisions must stay in the order `detect_oov` reported them.
+//! let events = aligner.detect_oov(text)?;
+//! let decisions = default_oov_decisions(&events);
+//!
+//! let result = aligner.align_chunk(
+//!   &samples,
+//!   // VAD speech spans in the chunk-local 1/16000 timebase. EMPTY means
+//!   // "no VAD" — i.e. all speech, NOT all silence (which would drop every
+//!   // word).
+//!   &[],
+//!   text,
+//!   // How stream sample indices map back to the output timebase.
+//!   OutputClock::new(0, ANALYSIS_TIMEBASE, 0)?,
+//!   // Cooperative cancellation, polled throughout prepare and finish.
+//!   &AtomicBool::new(false),
+//!   &decisions,
+//! )?;
+//!
+//! for word in result.words() {
+//!   println!("{:?} {}", word.range(), word.text());
+//! }
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! `no_run` because it needs the CoreML model on disk; it is compiled, so a
+//! change to `align_chunk`'s signature breaks it.
+//!
 //! The result vocabulary ([`AlignmentResult`], [`Word`], [`Lang`],
 //! [`TimeRange`], and the OOV / speech-span types) is re-exported FROM
 //! `asry`, so a caller speaks one vocabulary across the ASR and alignment
