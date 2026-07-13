@@ -135,11 +135,18 @@
 //!   [`EnergyVad`](audio::vad::EnergyVad) by default, swappable via
 //!   [`WhisperKit::set_vad_detector`](transcribe::WhisperKit::set_vad_detector))
 //!
-//! Under the `serde` feature, [`DecodingOptions`](options::DecodingOptions),
+//! [`Provenance`](provenance::Provenance) assembles that record for you
+//! (coremlit issue #14): [`Provenance::from_options`](provenance::Provenance::from_options)
+//! captures every library-known item above from the resolved
+//! [`DecodingOptions`](options::DecodingOptions)/[`ComputeOptions`](options::ComputeOptions)
+//! plus the *effective* decode temperature, and the two identity pairs —
+//! which this crate genuinely cannot observe, since it loads bare local
+//! folders — are settable `Option` fields the caller fills in. Under the
+//! `serde` feature the whole record serializes (unset identity omitted, so
+//! it can never masquerade as a known `null`), as do
+//! [`DecodingOptions`](options::DecodingOptions),
 //! [`ComputeOptions`](options::ComputeOptions), and
-//! [`Options`](options::Options) are all serde-serializable, so the
-//! cheapest faithful record is to serialize the exact option values used
-//! and store that snapshot with the transcript.
+//! [`Options`](options::Options) individually.
 //!
 //! Provenance-adjacent behaviors to plan for:
 //!
@@ -293,6 +300,7 @@ pub mod error;
 pub mod log;
 pub mod model;
 pub mod options;
+pub mod provenance;
 pub mod result;
 pub mod segment;
 pub mod stream;
