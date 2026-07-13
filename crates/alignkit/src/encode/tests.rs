@@ -288,10 +288,7 @@ fn from_file_loads_and_reports_frame_count() {
 fn emissions_rejects_input_too_long() {
   let encoder = load_encoder();
   let samples = vec![0.0f32; ENCODER_WINDOW_SAMPLES + 1];
-  // `LogProbsTV` (the `Ok` side) intentionally carries no `Debug` impl
-  // (see `asry`'s own `LogProbsTV::new` tests for the same idiom), so
-  // `Result::expect_err` (which requires `T: Debug`) is not usable here.
-  let Err(err) = encoder.emissions(&samples) else {
+  let Err(err) = encoder.emissions_raw(&samples, samples.len()) else {
     panic!("longer-than-window input must be rejected");
   };
   assert!(matches!(
@@ -308,18 +305,38 @@ fn emissions_rejects_input_too_long() {
 fn emissions_on_full_window_produces_correctly_shaped_finite_log_probs() {
   let encoder = load_encoder();
   let samples = vec![0.0f32; ENCODER_WINDOW_SAMPLES];
-  let log_probs = encoder.emissions(&samples).expect("emissions on silence");
-  assert_eq!(log_probs.t(), encoder.frames());
-  assert_eq!(log_probs.v(), crate::vocab::VOCAB_SIZE);
+  let raw = encoder
+    .emissions_raw(&samples, samples.len())
+    .expect("emissions on silence");
+  assert_eq!(raw.frames(), encoder.frames());
+  assert_eq!(raw.vocab(), crate::vocab::VOCAB_SIZE);
   assert!(
-    log_probs.data().iter().all(|v| v.is_finite()),
+    raw.data().iter().all(|v| v.is_finite()),
     "all log-probs finite"
   );
-  // Log-probabilities are bounded above by log(1) == 0.
+  // Log-probabilities are bounded above by log(1) == 0. This is also the
+  // exact domain `Emissions::from_log_probs` enforces, so a pass here is a
+  // canary that `Encoder::emissions` (the wrapped door) will not trip the
+  // value-domain scan on this input.
   assert!(
-    log_probs.data().iter().all(|&v| v <= 0.0),
+    raw.data().iter().all(|&v| v <= 0.0),
     "log-probs must satisfy log(p) <= 0"
   );
+}
+
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn emissions_wraps_into_validated_emissions() {
+  // The wrapped door: proves `Emissions::from_log_probs`' O(T·V) value scan
+  // passes on the real model's output (the fp16 log-prob ceiling holds), and
+  // that the shape handshake (`frames`/`vocab`) survives the wrap.
+  let encoder = load_encoder();
+  let samples = vec![0.0f32; 48_000];
+  let emissions = encoder
+    .emissions(&samples, samples.len())
+    .expect("emissions wraps into a validated Emissions");
+  assert_eq!(emissions.frames(), 150);
+  assert_eq!(emissions.vocab().get(), crate::vocab::VOCAB_SIZE);
 }
 
 #[test]
@@ -331,16 +348,16 @@ fn emissions_on_short_input_truncates_to_hermetic_formula() {
   // (cross-validates `truncated_frame_count` against the live model,
   // not just itself).
   let samples = vec![0.0f32; 48_000];
-  let log_probs = encoder
-    .emissions(&samples)
+  let raw = encoder
+    .emissions_raw(&samples, samples.len())
     .expect("emissions on short input");
   assert_eq!(
-    log_probs.t(),
+    raw.frames(),
     truncated_frame_count(48_000, encoder.frames())
   );
-  assert_eq!(log_probs.t(), 150);
-  assert_eq!(log_probs.v(), crate::vocab::VOCAB_SIZE);
-  assert_eq!(log_probs.data().len(), 150 * crate::vocab::VOCAB_SIZE);
+  assert_eq!(raw.frames(), 150);
+  assert_eq!(raw.vocab(), crate::vocab::VOCAB_SIZE);
+  assert_eq!(raw.data().len(), 150 * crate::vocab::VOCAB_SIZE);
 }
 
 #[test]
@@ -352,13 +369,17 @@ fn emissions_is_deterministic_across_repeated_calls() {
   let samples: Vec<f32> = (0..ENCODER_WINDOW_SAMPLES)
     .map(|i| 0.01 * (i as f32 * 0.001).sin())
     .collect();
-  let first = encoder.emissions(&samples).expect("first emissions call");
-  let second = encoder.emissions(&samples).expect("second emissions call");
-  assert_eq!(first.t(), second.t());
-  assert_eq!(first.v(), second.v());
+  let first = encoder
+    .emissions_raw(&samples, samples.len())
+    .expect("first emissions call");
+  let second = encoder
+    .emissions_raw(&samples, samples.len())
+    .expect("second emissions call");
+  assert_eq!(first.frames(), second.frames());
+  assert_eq!(first.vocab(), second.vocab());
   assert_eq!(
     first.data(),
     second.data(),
-    "repeated emissions() must be bit-identical"
+    "repeated emissions_raw() must be bit-identical"
   );
 }

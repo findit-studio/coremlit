@@ -40,9 +40,33 @@ pub fn model_path() -> PathBuf {
 /// path instead of committing a second copy of a ~1.9 MB binary fixture that
 /// would then need to stay byte-identical to the original forever. Both
 /// crates live in this workspace and move together.
+///
+/// `#[allow(dead_code)]`: only `tests/model_io.rs` uses it; the per-binary
+/// `common` copy in `tests/align_chunk.rs` does not.
+#[allow(dead_code)]
 pub fn ted_60_wav_path() -> PathBuf {
   PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../whisperkit/tests/fixtures/audio/ted_60.wav")
 }
+
+/// Path to the 11 s @ 16 kHz mono `jfk.wav` fixture (176,000 samples, well
+/// inside the encoder's 960,000 window), borrowed from the whisperkit crate
+/// exactly as [`ted_60_wav_path`] is. Its known transcript is
+/// [`JFK_TRANSCRIPT`]; together they drive `tests/align_chunk.rs`'s
+/// end-to-end alignment.
+///
+/// `#[allow(dead_code)]`: only `tests/align_chunk.rs` uses it.
+#[allow(dead_code)]
+pub fn jfk_wav_path() -> PathBuf {
+  PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../whisperkit/tests/fixtures/audio/jfk.wav")
+}
+
+/// The known transcript for [`jfk_wav_path`]'s audio (whisperkit's
+/// `tests/fixtures/golden/jfk_tiny_golden.json`).
+///
+/// `#[allow(dead_code)]`: only `tests/align_chunk.rs` uses it.
+#[allow(dead_code)]
+pub const JFK_TRANSCRIPT: &str = "And so my fellow Americans ask not what your country can do for \
+                                  you, ask what you can do for your country.";
 
 /// Reads a 16 kHz mono 16-bit PCM WAV into normalized f32 samples.
 ///
@@ -64,7 +88,7 @@ pub fn load_wav_mono_f32(path: &Path) -> Vec<f32> {
 /// Backs `tests/model_io.rs`'s provenance/integrity pin over the downloaded
 /// model artifacts. `common` is a `mod`, not a separate crate, so each
 /// `tests/*.rs` integration-test binary compiles its own copy; binaries
-/// that don't happen to call this one (e.g. `tests/parity_emissions.rs`)
+/// that don't happen to call this one (e.g. `tests/align_chunk.rs`)
 /// would otherwise warn `dead_code` on it.
 #[allow(dead_code)]
 pub fn sha256_hex(path: &Path) -> String {
