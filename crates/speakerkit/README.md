@@ -75,7 +75,8 @@ path inside this crate, not just a different weights file.
 | Decode semantics | **host-side**, in this crate — ports `dia`'s exact powerset/mask/window decode | **in-graph** — argmax's own semantics; this crate only reads the result |
 | Tier-1 fidelity ("did we read the model right") | relies on the tier-2 dia-ort check below; a dedicated FluidAudio Swift oracle is deferred/optional (no FluidAudio CLI) | argmax's own Swift (`argmax-oss-swift`'s `SpeakerSegmenterModel`/`SpeakerEmbedderModel`, via an out-of-tree harness since argmax's `DiarizeCLI` only emits post-clustering RTTM) |
 | Tier-2 accuracy ("is the decision right") vs fp32 `dia`-ort | seg **99.97%** decision-level agreement (99.9717%, 3533/3534 frames); embed cosine **0.99999989** worst | seg **99.98%** cell agreement (Baseline); embed cosine **mean ~0.94, worst ~0.83** |
-| Measured status | **validated** | tensor-fidelity **validated** (72447/72447 segmentation cells EXACT, 123/123 embedding rows bit-identical vs argmax's own Swift); accuracy **characterized**, not yet DER-validated |
+| Tier-3 accuracy (DER, end to end through `dia`'s clustering) | **validated** on 1-2 speakers (0.0000%); on multi-speaker audio it stays *decision*-correct (speaker count always right) but is **not** frame-exact — see the table below | **CHARACTERIZED, NOT VALIDATED** — exact at 1-2 speakers, then 3.3-9.3% DER on three of the four multi-speaker clips |
+| Measured status | **validated** (default; see the multi-speaker caveat below) | tensor-fidelity **validated** (72447/72447 segmentation cells EXACT, 123/123 embedding rows bit-identical vs argmax's own Swift); clustering accuracy **CHARACTERIZED, NOT VALIDATED** |
 
 **The two sources can produce different diarization results on the same
 audio — by design.** `Options::source` is a real tradeoff the caller picks,
@@ -83,7 +84,76 @@ not two paths that happen to agree: different decode semantics, different
 embedding space. See "Status" below for exactly what "validated" vs
 "characterized" means for each.
 
-A few decisions worth knowing before you pick a source:
+### ⚠ The argmax source diverges on multi-speaker audio
+
+**Do not use `Source::Argmax` on multi-speaker audio.** This is measured, not
+theoretical. End-to-end DER through `dia`'s clustering (standard 0.25 s collar,
+overlap excluded — the NIST/pyannote definition), scored against the pyannote
+reference on `dia`'s parity corpus, `CpuOnly`:
+
+| clip | ref speakers | FluidAudio | argmax |
+|---|---|---|---|
+| four clips | 1-2 | 0.0000%, count exact | 0.0000%, count exact |
+| `06_long_recording` | 3 | 0.0908%, finds 3 | 0.0908%, finds 3 |
+| `14_mrbeast_strongman_robot` | 4 | 0.3961%, finds 4 | **9.29%**, finds **5** |
+| `10_mrbeast_clean_water` | 7 | 0.0000%, finds 7 | **3.33%**, finds **8** |
+| `12_mrbeast_schools` | 15 | 0.1178%, finds 15 | **3.46%**, finds 15 |
+
+`dia`-ort (the upstream oracle) reproduces the reference frame-exactly on every
+one of these clips, and FluidAudio tracks it, so the audio, the framing, the
+clustering, the reference and the harness are all held constant: **argmax's
+embedding is the only variable.** Where it fails, the error is ~100% *confusion*
+with zero miss and zero false alarm — argmax hears exactly the same speech and
+assigns it to the wrong person. That is the signature of a clustering divergence,
+not of boundary jitter, which is why no collar absorbs it.
+
+**Read the table for what it says, and not for more.** It does *not* say "argmax
+breaks at ≥3 speakers": the 3-speaker clip is clean. It does *not* say the defect
+is just a spurious speaker: on the 15-speaker clip argmax gets the count exactly
+right and still misassigns 3.46% of speech. And the one clean multi-speaker clip
+is also the only non-MrBeast one, so speaker count and recording domain are
+**confounded** in this corpus. The failure is large, real and reproducible; its
+precise trigger is not isolated. Assume argmax is unsafe for multi-speaker audio
+until it is.
+
+**Why.** `dia`'s clustering is not intra-space geometry, and this is the trap:
+its AHC cuts at a **fixed 0.6 linkage threshold** inside a **frozen, pretrained**
+PLDA projection. `PldaTransform::new()` takes no data — it `include_bytes!`s an
+LDA (256→128) + PLDA fit on the **native kaldi-fbank WeSpeaker distribution**
+that `dia` and FluidAudio both feed it. argmax's embedder instead consumes an
+80-mel spectrogram from its own `SpeakerEmbedderPreprocessor`, so its vectors
+land in a differently-scaled space the frozen projection was never fit for. Where
+every pairwise distance sits far from the threshold, even a miscalibrated
+projection cuts in the right place — which is exactly why this looked benign for
+so long. Where distances crowd the threshold, merges flip.
+
+This means the **~0.94 embedding cosine is NOT benign at DER**, and any earlier
+claim in this repository's history that it was is **retracted**. It was measured
+only on 1- and 2-speaker clips, where DER = 0 is necessary but not sufficient.
+
+### ⚠ And the FluidAudio default is not frame-exact there either
+
+The same gate turned up a second thing, which the 1-2 speaker corpus had hidden:
+`speakerkit`'s FluidAudio path is **0.0000% vs `dia`-ort on every ≤2-speaker clip
+and on the 7-speaker clip, but 0.1191% and 0.3948% on `12` and `14`** — over the
+0.1% DER-parity bound this crate's spec sets for the faithful source. The error
+there is *confusion* (289 of 293 error units on `14`), not boundary jitter, so
+the CoreML conversion's numerical drift really does flip a small number of
+clustering assignments once several speakers must be separated.
+
+In practice FluidAudio remains the right default by a wide margin — it never gets
+the speaker *count* wrong, and it is ~23× more faithful than argmax on the same
+clip — but "0.1% DER parity" is a claim that was only ever tested on 1-2 speaker
+audio, and on multi-speaker audio it is false. It is recorded here rather than
+smoothed over, and the bound in the test suite has *not* been raised to make it
+pass.
+
+Both limitations are pinned in code, not merely documented: `tests/parity_e2e.rs`
+asserts every one of the numbers above on 3-, 4-, 7- and 15-speaker clips, so the
+gate fires if behaviour moves in *either* direction — including if someone fixes
+it, which must be a deliberate re-baseline rather than a silent pass.
+
+A few more decisions worth knowing before you pick a source:
 
 - **argmax's embedding space diverges from `dia`'s WeSpeaker space at
   cosine ~0.94 mean / ~0.83 worst.** Measured genuine, reproduced
@@ -92,12 +162,12 @@ A few decisions worth knowing before you pick a source:
   masks agree ~99.98%, both argmax quantization tiers sit at ~0.94, but
   argmax's WeSpeaker consumes an 80-mel spectrogram from its own separate
   `SpeakerEmbedderPreprocessor` rather than the kaldi fbank `dia`/FluidAudio
-  use. `dia`'s clustering operates on the *internal* geometry of whichever
-  embedding space it's given, not on cross-space cosine to `dia`'s own
-  space, so this does not directly predict clustering quality — the
-  end-to-end DER gate is what adjudicates whether it's good enough. Until
-  that gate runs, the argmax source is **characterized, not
-  production-validated**.
+  use. It is tempting to argue that `dia`'s clustering only cares about the
+  *internal* geometry of whichever space it is given, so a self-consistent
+  rotation would cluster fine. **That argument is wrong, and the DER gate
+  above is what disproved it** — the projection `dia` clusters through is
+  frozen and pretrained, so it is not rotation-invariant, and a divergent
+  front-end is a domain mismatch against it.
 - **Both sources share `dia`'s mask/overlap-exclusion policy**, not each
   vendor's own. In particular, argmax's own `minActiveRatio` filter — which
   withholds sparse/overlap-heavy slots (~12-17% of slots on real clips) from
@@ -212,15 +282,27 @@ argmax segmenter+embedder: **0.0911%** of hard `speaker_ids` cells flip, and
 quantization tier. The set of *which* `(chunk, slot)` pairs get consumed
 does not change (`slot_diffs == 0`, asserted in code, not just observed).
 
-Every fidelity/parity gate in this crate's test suite pins `ComputeUnits::CpuOnly`
-for determinism (partly forced: argmax's fbank preprocessor hardcodes
-`.cpuOnly` regardless of what this crate requests). That means those gates
-prove the `CpuOnly` execution path is correct — they say nothing about the
-`All` configuration this crate actually ships by default. End-to-end
-accuracy (DER) validation, when it lands, has to run against the shipping
-default and compare to ground truth directly, not against a `CpuOnly`
-reference: **a gate pinned to one compute unit only proves that compute
-unit.**
+Every *tensor-level* fidelity gate in this crate's test suite pins
+`ComputeUnits::CpuOnly` for determinism (partly forced: argmax's fbank
+preprocessor hardcodes `.cpuOnly` regardless of what this crate requests). Those
+gates prove the `CpuOnly` execution path is correct — they say nothing on their
+own about the `All` configuration this crate actually ships by default, because
+**a gate pinned to one compute unit only proves that compute unit.**
+
+The end-to-end DER gate therefore runs on **`All`, the shipping default**, and
+asserts (not merely reports) that the placement changes no diarization
+*decision*: for both sources, ΔDER(`All` − `CpuOnly`) against the reference is
+0.0000% and the speaker count is identical. The placement is genuinely exercised
+rather than silently falling back to CPU — the strict, no-collar frame-exact
+difference between the two placements is *non-zero* (0.12-0.29%), which an
+identical execution could not produce, while the collar-scored DER against the
+reference is unchanged. So the ANE's numerical drift is real but lands entirely
+inside the scoring collar: it moves span edges, not speakers.
+
+Scope that claim honestly: it is measured on the 1-2 speaker clips. The
+≥3-speaker gate runs `CpuOnly` (matched to `dia`-ort's CPU ONNX, which is what
+isolates the embedding axis from the placement axis), so `All` on multi-speaker
+audio is inferred rather than measured — see "Status".
 
 Practical takeaway: if you need bit-for-bit reproducibility across
 machines/runs, pin `ComputeUnits::CpuOnly` explicitly via `ComputeOptions`
@@ -256,23 +338,42 @@ see `tests/swift/regen_goldens.sh`.
 
 ## Status
 
-- **FluidAudio source: validated.** Segmentation decision-level agreement
-  and embedding cosine both measured against fp32 `dia`-ort (the table
-  above). A dedicated tier-1 fidelity oracle (FluidAudio's own Swift) is
-  deferred/optional — FluidAudio ships a library, not a CLI, so the tier-2
-  `dia`-ort accuracy check is what stands in for it.
-- **argmax source: tensor-fidelity validated, clustering accuracy
-  characterized.** Bit-exact/near-exact against argmax's own Swift decode
-  (tier 1, T4) — the strongest gate this crate has for any source. Its
-  accuracy relative to `dia`'s embedding space (tier 2, T5) is measured and
-  understood (fbank-dominant divergence, ~0.94 mean cosine), but whether
-  that's *sufficient* for clustering is an open question only an end-to-end
-  DER gate can answer. Treat this source as experimental until that lands.
-- **Clustering accuracy (DER), end to end, for either source: not yet
-  measured.** Out of this crate's scope by design (clustering is `dia`'s) —
-  this is the gate referenced throughout this README as the thing that
-  adjudicates the argmax embedding-space question and the compute-unit
-  question above.
+- **FluidAudio source: validated as the default; not frame-exact on
+  multi-speaker audio.** Segmentation decision-level agreement and embedding
+  cosine measured against fp32 `dia`-ort (the table above), and now DER through
+  `dia`'s clustering: **0.0000%** on every ≤2-speaker clip and on the 7-speaker
+  clip; **0.09-0.39%** on the other multi-speaker clips, exceeding the spec's
+  0.1% parity bound on two of them (see the second warning above). Its speaker
+  *count* decision is always right. A dedicated tier-1 fidelity oracle
+  (FluidAudio's own Swift) is deferred/optional — FluidAudio ships a library,
+  not a CLI, so the tier-2 `dia`-ort accuracy check is what stands in for it.
+- **argmax source: tensor-fidelity validated, clustering accuracy CHARACTERIZED,
+  NOT VALIDATED.** Bit-exact/near-exact against argmax's own Swift decode
+  (tier 1) — the strongest gate this crate has for any source. But end to end it
+  **fails on multi-speaker audio** (see the first warning above): exact at 1-2
+  speakers, then 3.3-9.3% DER on three of the four multi-speaker clips. It
+  remains available and user-selectable, with the limitation pinned by test and
+  documented here. Treat it as experimental, and do not point it at
+  multi-speaker audio.
+- **Known gap, stated rather than buried:** the multi-speaker DER numbers are
+  measured on `CpuOnly` — the placement matched to `dia`-ort's CPU ONNX runtime,
+  which is what isolates the *conversion* and *embedding* axes from the
+  *placement* axis. The shipping `All` placement is DER-verified (ΔDER = 0.0000%,
+  speaker count invariant) only on the 1-2 speaker clips. So "`All` changes no
+  decision" is established on easy audio and *inferred*, not measured, on
+  multi-speaker audio. That is precisely the shape of assumption that produced
+  both failures above, so it is written down as an open item rather than treated
+  as settled.
+- **What "DER" means here, precisely.** The reference RTTMs this crate scores
+  against are **pyannote.audio 4.0.4's own output**, captured and committed by
+  `dia` — *not* human annotation. (Their segment durations are multiples of
+  pyannote's 16.875 ms frame step; no human placed those boundaries.) So every
+  DER number above is a **distance to pyannote 4.0.4**, never a distance to the
+  truth: a source scoring 0.0000% has reproduced the upstream reference
+  implementation exactly, which is what this crate promises — it has **not** been
+  shown to be *correct*. Human-labelled benchmark RTTM (AMI, DIHARD) is not part
+  of this repository, so "are we right?" is a question none of these gates
+  answer. They answer "do we match the reference implementation?".
 - **`0.1.0` (unreleased), `publish = false`** until the `dia`/`diarization`
   path dependency has a registry version.
 
