@@ -464,6 +464,21 @@ impl Encoder {
   /// (`shape[1]`) is read dynamically, not hardcoded — mirrors
   /// `dia-coreml::SegmentModel`'s `num_frames` field
   /// (`crates/dia-coreml/src/segment/mod.rs`) — see [`Self::frames`].
+  ///
+  /// With the `tracing` feature: an `alignkit.encoder.load` span at `INFO`.
+  /// The CoreML load is where the wall-clock hides — 0.68 s cold on the
+  /// `CpuOnly` default, and **308 s** the first time a caller sets an ANE
+  /// placement (see [`DEFAULT_ENCODER_COMPUTE`]) — so the span carries the
+  /// placement, which is the field that explains the number.
+  #[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+      name = "alignkit.encoder.load",
+      level = "info",
+      skip_all,
+      fields(path = ?path.as_ref(), compute = ?options.compute()),
+    )
+  )]
   pub fn from_file_with(
     path: impl AsRef<Path>,
     options: EncoderOptions,
@@ -659,6 +674,27 @@ impl Encoder {
   /// finite ∧ `<= 0` scan, so a non-finite or positive value is a real error
   /// path here — not the panic the pre-seam `LogProbsTV::new` let this crate
   /// assume away.
+  ///
+  /// With the `tracing` feature: an `alignkit.encoder.emissions` span at
+  /// `DEBUG`, nested inside `alignkit.align_chunk` when the [`Aligner`] drives
+  /// it. This is the CoreML predict — the dominant cost of a chunk (0.74 s on
+  /// the `CpuOnly` default) — so it is the span that tells a caller whether a
+  /// slow alignment is the model or the trellis.
+  ///
+  /// [`Aligner`]: crate::aligner::Aligner
+  #[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+      name = "alignkit.encoder.emissions",
+      level = "debug",
+      skip_all,
+      fields(
+        encoder_input = encoder_input.len(),
+        real_samples,
+        compute = ?self.compute,
+      ),
+    )
+  )]
   pub fn emissions(
     &self,
     encoder_input: &[f32],

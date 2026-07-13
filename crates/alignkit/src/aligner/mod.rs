@@ -279,8 +279,24 @@ impl Aligner {
 
   /// [`Self::from_paths`] with explicit [`AlignerOptions`].
   ///
+  /// With the `tracing` feature: an `alignkit.aligner.load` span at `INFO`,
+  /// with the CoreML load (`alignkit.encoder.load`) nested inside it.
+  ///
   /// # Errors
   /// As [`Self::from_paths`].
+  #[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+      name = "alignkit.aligner.load",
+      level = "info",
+      skip_all,
+      fields(
+        language = ?language,
+        model_path = ?model_path,
+        compute = ?options.compute(),
+      ),
+    )
+  )]
   pub fn from_paths_with(
     language: Lang,
     model_path: &Path,
@@ -372,6 +388,14 @@ impl Aligner {
   /// ASR text survives, only per-word timings are dropped. See the
   /// [`crate::error`] module doc.
   ///
+  /// With the `tracing` feature: one `alignkit.align_chunk` span at `DEBUG` per
+  /// call, wrapping the whole VAD → prepare → encode → finish pass, with
+  /// `alignkit.encoder.emissions` nested inside it. Both of the empty-result
+  /// paths above are *successes* that produce no words, which is exactly the
+  /// state a caller ends up staring at a debugger over — the span's
+  /// `sub_segments` / `text_bytes` / `samples` fields are there to tell those
+  /// two apart from a chunk that simply had nothing in it.
+  ///
   /// # Errors
   /// [`AlignError::InputTooLong`] if `samples` exceeds the encoder window;
   /// [`AlignError::Span`] if `sub_segments` are not in the 1/16000 timebase;
@@ -382,6 +406,21 @@ impl Aligner {
   /// [`crate::encode::LOG_PROB_FLOOR`]); [`AlignError::Alignment`] for any
   /// non-recoverable seam failure (stride / vocab / blank-id validation, a
   /// non-finite or positive log-probability, tokenization, abort).
+  #[cfg_attr(
+    feature = "tracing",
+    tracing::instrument(
+      name = "alignkit.align_chunk",
+      level = "debug",
+      skip_all,
+      fields(
+        language = ?self.language_ref(),
+        samples = samples.len(),
+        sub_segments = sub_segments.len(),
+        text_bytes = text.len(),
+        oov_decisions = oov_decisions.len(),
+      ),
+    )
+  )]
   pub fn align_chunk(
     &self,
     samples: &[f32],

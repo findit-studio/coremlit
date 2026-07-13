@@ -77,9 +77,24 @@
 //!
 //! | feature | default | what it does |
 //! |---|---|---|
-//! | `serde` | no | `Serialize`/`Deserialize` for [`AlignerOptions`] and [`encode::EncoderOptions`] |
-//! | `tracing` | no | structured spans over load and per-chunk alignment |
+//! | `serde` | no | `Serialize`/`Deserialize` for [`AlignerOptions`], [`encode::EncoderOptions`] and [`AlignmentFallback`] |
+//! | `tracing` | no | structured spans over load and per-chunk alignment — the four below |
 //! | `parity-oracle` | no | **dev/test only.** Turns on `asry`'s ONNX aligner (and with it `ort` + whisper.cpp) as the oracle for the word-timing parity gate. Adds nothing to this library; see `Cargo.toml`. |
+//!
+//! ## `tracing` spans
+//!
+//! | span | level | opened by |
+//! |---|---|---|
+//! | `alignkit.aligner.load` | `INFO` | [`Aligner::from_paths`] / [`Aligner::from_paths_with`] |
+//! | `alignkit.encoder.load` | `INFO` | [`encode::Encoder::from_file`] — nested in the above |
+//! | `alignkit.align_chunk` | `DEBUG` | one per [`Aligner::align_chunk`] call |
+//! | `alignkit.encoder.emissions` | `DEBUG` | the CoreML predict — nested in the above |
+//!
+//! The two `INFO` spans carry the compute placement, which is the field that
+//! explains a load time (0.68 s on the default; **308 s** the first time
+//! [`encode::DEFAULT_ENCODER_COMPUTE`] is overridden to an ANE placement). The
+//! `DEBUG` spans separate the CoreML predict from the trellis, which is the
+//! first question a slow or mis-timed chunk raises.
 //!
 //! # Gates
 //!

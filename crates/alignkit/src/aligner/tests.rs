@@ -186,3 +186,211 @@ fn recover_propagates_non_recoverable_errors() {
     Err(AlignError::Alignment(EmissionsError::Aborted(_)))
   ));
 }
+
+// ---------------------------------------------------------------------
+// The `tracing` feature actually emits spans.
+//
+// The feature was declared in Cargo.toml, advertised in `lib.rs` ("structured
+// spans over load and per-chunk alignment") and implemented NOWHERE: not one
+// `tracing::` call-site existed anywhere in `src/`. A user who built
+// `--features tracing` with a subscriber installed got zero spans and lost the
+// afternoon to their own setup.
+//
+// Every gate missed it, and the reason generalises: `cargo hack check
+// --each-feature` only COMPILES each feature, and an unused optional dependency
+// compiles perfectly clean. Only EXECUTING a test under the feature can see
+// this class of bug, so these must run under `cargo hack test --each-feature` —
+// which means the load half below is deliberately hermetic (a missing model
+// still opens the span, because `#[instrument]` opens it before the body runs).
+// ---------------------------------------------------------------------
+
+#[cfg(feature = "tracing")]
+mod tracing_spans {
+  use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+  };
+
+  use super::*;
+
+  /// A capturing [`tracing::Subscriber`] that records the NAME of every span
+  /// opened while it is installed.
+  ///
+  /// Hand-rolled rather than `tracing-subscriber`: the whole surface needed is
+  /// seven trait methods, and a test-only dependency on a second tracing crate
+  /// (with its own feature matrix) to assert "≥ 1 span exists" would cost more
+  /// than it explains.
+  struct CaptureSpans {
+    names: Arc<Mutex<Vec<&'static str>>>,
+    next_id: AtomicU64,
+  }
+
+  impl CaptureSpans {
+    /// The subscriber and a handle to the names it will collect. The handle is
+    /// cloned out BEFORE the subscriber is moved into `with_default`, so the
+    /// captures are still readable once it is gone.
+    fn new() -> (Self, Arc<Mutex<Vec<&'static str>>>) {
+      let names = Arc::new(Mutex::new(Vec::new()));
+      (
+        Self {
+          names: Arc::clone(&names),
+          // `Id::from_u64` rejects 0.
+          next_id: AtomicU64::new(1),
+        },
+        names,
+      )
+    }
+  }
+
+  impl tracing::Subscriber for CaptureSpans {
+    fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
+      // Capture every level: the load spans are INFO and the per-chunk ones
+      // DEBUG, and this test is about whether they EXIST, not about filtering.
+      true
+    }
+
+    fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+      self
+        .names
+        .lock()
+        .expect("span capture lock")
+        .push(span.metadata().name());
+      tracing::span::Id::from_u64(self.next_id.fetch_add(1, Ordering::Relaxed))
+    }
+
+    fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
+    fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
+    fn event(&self, _event: &tracing::Event<'_>) {}
+    fn enter(&self, _span: &tracing::span::Id) {}
+    fn exit(&self, _span: &tracing::span::Id) {}
+  }
+
+  /// Runs `body` with a capturing subscriber installed and returns the names of
+  /// every span it opened, in order.
+  fn spans_opened_by(body: impl FnOnce()) -> Vec<&'static str> {
+    let (subscriber, names) = CaptureSpans::new();
+    tracing::subscriber::with_default(subscriber, body);
+    let names = names.lock().expect("span capture lock");
+    names.clone()
+  }
+
+  fn count(spans: &[&'static str], name: &str) -> usize {
+    spans.iter().filter(|span| **span == name).count()
+  }
+
+  /// **HERMETIC, and that is the point**: this runs under `cargo hack test
+  /// --each-feature`, the only gate that can see the feature do nothing.
+  ///
+  /// `#[instrument]` opens the span before the function body runs, so a load
+  /// that FAILS still emits one — which lets the load half of the contract be
+  /// proven with no CoreML model at all. The `Err` is asserted too: without it
+  /// this test would keep passing if the model path silently started resolving
+  /// to something real.
+  #[test]
+  fn load_emits_a_span_even_when_the_model_is_missing() {
+    let spans = spans_opened_by(|| {
+      let result = Aligner::from_paths_with(
+        Lang::En,
+        Path::new("/nonexistent/base960h_aligner.mlmodelc"),
+        normalizer(),
+        AlignerOptions::new(),
+      );
+      assert!(
+        matches!(result, Err(AlignerError::Load(_))),
+        "the point of this path is that it fails; a load that succeeded would prove nothing \
+         about the span"
+      );
+    });
+
+    // The span NAMES are the feature's observable contract — a subscriber
+    // filters and groups on them — so they are asserted as literals here rather
+    // than read back from a constant that a rename would silently carry along.
+    assert!(
+      count(&spans, "alignkit.aligner.load") >= 1,
+      "`--features tracing` must emit a load span; got {spans:?}"
+    );
+    assert!(
+      count(&spans, "alignkit.encoder.load") >= 1,
+      "the CoreML load must be its own nested span (it is where the wall-clock hides — 308 s on \
+       a cold ANE placement); got {spans:?}"
+    );
+  }
+
+  /// The per-chunk half: **one `alignkit.align_chunk` span per call**, with the
+  /// CoreML predict nested inside it. Model-gated, because a span over an
+  /// alignment needs an alignment.
+  #[test]
+  #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+  fn every_align_chunk_call_opens_exactly_one_span() {
+    let samples = load_jfk_wav();
+    let text = "And so my fellow Americans ask not what your country can do for you, ask what \
+                you can do for your country.";
+
+    let spans = spans_opened_by(|| {
+      let aligner = Aligner::from_paths(
+        Lang::En,
+        &models_dir().join("base960h_aligner.mlmodelc"),
+        normalizer(),
+      )
+      .expect("load base960h_aligner.mlmodelc (set ALIGNKIT_TEST_MODELS)");
+
+      let events = aligner.detect_oov(text).expect("detect_oov");
+      let decisions = asry::emissions::default_oov_decisions(&events);
+      let abort = AtomicBool::new(false);
+
+      // TWICE: "at least one span" would also pass against an `#[instrument]`
+      // that somehow fired once per Aligner rather than once per chunk.
+      for _ in 0..2 {
+        let clock = OutputClock::new(0, asry::time::ANALYSIS_TIMEBASE, 0).expect("clock");
+        let result = aligner
+          .align_chunk(&samples, &[], text, clock, &abort, &decisions)
+          .expect("align_chunk on the shipping default");
+        assert!(!result.words().is_empty(), "jfk.wav must align to words");
+      }
+    });
+
+    assert_eq!(
+      count(&spans, "alignkit.align_chunk"),
+      2,
+      "one span per align_chunk call, no more and no fewer; got {spans:?}"
+    );
+    assert!(
+      count(&spans, "alignkit.encoder.emissions") >= 2,
+      "the CoreML predict must be a span inside each chunk; got {spans:?}"
+    );
+    assert!(
+      count(&spans, "alignkit.aligner.load") >= 1,
+      "load must still be spanned on the success path; got {spans:?}"
+    );
+  }
+
+  /// `ALIGNKIT_TEST_MODELS`, or `<workspace>/Models/alignkit` — the crate's
+  /// convention (`tests/common/mod.rs`), duplicated here because a `src/` unit
+  /// test cannot import the `tests/` integration crate (the same duplication,
+  /// for the same reason, as `encode::tests` and `registry::tests`).
+  fn models_dir() -> std::path::PathBuf {
+    std::env::var_os("ALIGNKIT_TEST_MODELS").map_or_else(
+      || {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+          .join("../..")
+          .join("Models")
+          .join("alignkit")
+      },
+      std::path::PathBuf::from,
+    )
+  }
+
+  /// The 11 s `jfk.wav` fixture, borrowed from the whisperkit crate by relative
+  /// path (as `encode::tests` does) and failing LOUDLY if it ever moves.
+  fn load_jfk_wav() -> Vec<f32> {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+      .join("../whisperkit/tests/fixtures/audio/jfk.wav");
+    let mut reader = hound::WavReader::open(&path)
+      .unwrap_or_else(|e| panic!("open the jfk.wav fixture at {path:?}: {e}"));
+    assert_eq!(reader.spec().sample_rate, 16_000, "fixture must be 16 kHz");
+    reader
+      .samples::<i16>()
+      .map(|s| f32::from(s.expect("valid sample")) / 32_768.0)
+      .collect()
+  }
+}
