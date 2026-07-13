@@ -372,21 +372,32 @@ fn options_defaults_delegate_to_components() {
   let o = Options::new();
   assert_eq!(o.window(), WindowOptions::new());
   assert_eq!(o.compute(), ComputeOptions::new());
+  assert_eq!(o.source(), Source::default());
+  // Pin the concrete default too, matching the sibling `ComputeUnits::All`
+  // pin just below.
+  assert_eq!(o.source(), Source::FluidAudio);
 }
 
 #[test]
 fn options_builders_and_setters() {
   let window = WindowOptions::new().with_onset(0.25);
   let compute = ComputeOptions::new().with_segmenter(ComputeUnits::CpuOnly);
-  let o = Options::new().with_window(window).with_compute(compute);
+  let source = Source::Argmax;
+  let o = Options::new()
+    .with_window(window)
+    .with_compute(compute)
+    .with_source(source);
   assert_eq!(o.window(), window);
   assert_eq!(o.compute(), compute);
+  assert_eq!(o.source(), source);
 
   let mut m = Options::new();
   m.set_window(window);
   m.set_compute(compute);
+  m.set_source(source);
   assert_eq!(m.window(), window);
   assert_eq!(m.compute(), compute);
+  assert_eq!(m.source(), source);
 }
 
 // =====================================================================
@@ -415,28 +426,43 @@ fn extractor_with_options_round_trips() {
 fn options_serde_empty_object_is_full_defaults() {
   let o: Options = serde_json::from_str("{}").unwrap();
   assert_eq!(o, Options::new());
+  assert_eq!(o.source(), Source::FluidAudio);
 }
 
 #[cfg(feature = "serde")]
 #[test]
 fn options_serde_partial_window_keeps_step_default() {
   // Only window.onset is given: window.step_samples defaults (via
-  // WindowOptions' own per-field default), and compute defaults whole.
+  // WindowOptions' own per-field default), and compute/source default
+  // whole.
   let o: Options = serde_json::from_str(r#"{"window":{"onset":0.25}}"#).unwrap();
   assert_eq!(o.window().onset(), 0.25);
   assert_eq!(o.window().step_samples(), 16_000);
   assert_eq!(o.compute(), ComputeOptions::new());
+  assert_eq!(o.source(), Source::default());
 }
 
 #[cfg(feature = "serde")]
 #[test]
 fn options_serde_partial_compute_defaults_other_unit() {
   // Only compute.segmenter is given: compute.embedder defaults (via
-  // ComputeOptions' own per-field default), window defaults whole.
+  // ComputeOptions' own per-field default), window/source default whole.
   let o: Options = serde_json::from_str(r#"{"compute":{"segmenter":"cpu_only"}}"#).unwrap();
   assert_eq!(o.compute().segmenter(), ComputeUnits::CpuOnly);
   assert_eq!(o.compute().embedder(), ComputeUnits::All);
   assert_eq!(o.window(), WindowOptions::new());
+  assert_eq!(o.source(), Source::default());
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn options_serde_partial_source_defaults_others() {
+  // Only source is given: window/compute default whole. Mirrors the two
+  // sibling partial-input tests just above, for the new field.
+  let o: Options = serde_json::from_str(r#"{"source":"argmax"}"#).unwrap();
+  assert_eq!(o.source(), Source::Argmax);
+  assert_eq!(o.window(), WindowOptions::new());
+  assert_eq!(o.compute(), ComputeOptions::new());
 }
 
 #[cfg(feature = "serde")]
@@ -448,7 +474,8 @@ fn options_serde_round_trips() {
         .with_step_samples(40_000)
         .with_onset(0.7),
     )
-    .with_compute(ComputeOptions::new().with_segmenter(ComputeUnits::CpuOnly));
+    .with_compute(ComputeOptions::new().with_segmenter(ComputeUnits::CpuOnly))
+    .with_source(Source::Argmax);
   let json = serde_json::to_string(&o).unwrap();
   let back: Options = serde_json::from_str(&json).unwrap();
   assert_eq!(back, o);
