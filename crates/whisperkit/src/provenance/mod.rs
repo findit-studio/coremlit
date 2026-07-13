@@ -488,12 +488,12 @@ impl Provenance {
   ///
   /// let decoding = DecodingOptions::new()
   ///   .maybe_drop_blank_audio(false)
-  ///   .with_word_grouping(WordGrouping::Phrase);
+  ///   .with_word_grouping(WordGrouping::SwiftParity);
   /// let provenance = Provenance::from_options(&decoding, &ComputeOptions::new(), 0.0);
   ///
   /// // Knobs the old projection dropped on the floor, now recorded:
   /// assert!(!provenance.decoding().drop_blank_audio());
-  /// assert_eq!(provenance.decoding().word_grouping(), WordGrouping::Phrase);
+  /// assert_eq!(provenance.decoding().word_grouping(), WordGrouping::SwiftParity);
   /// // ... alongside the ones it did keep.
   /// assert_eq!(provenance.decoding(), &decoding);
   /// ```

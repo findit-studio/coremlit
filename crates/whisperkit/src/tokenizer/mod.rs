@@ -411,17 +411,26 @@ impl WhisperTokenizer {
   ///
   /// # Choosing the grouping
   /// `grouping` is the second half of that decision, made explicit
-  /// (coremlit issue #14). [`WordGrouping::FineGrained`] — the default, and
-  /// this port's long-standing behavior — takes the CJK arm above for those
-  /// six languages. [`WordGrouping::Phrase`] forces the space splitter for
-  /// **every** language, CJK included, reproducing the coarse phrase-blob
-  /// grouping Swift produces there. Swift reaches that grouping by
-  /// accident rather than intent — its detector returns a regional
-  /// `zh-Hant`, which its own bare-code CJK check (`Models.swift:1301`)
-  /// then fails to match, dropping the text through to the space splitter
-  /// — so this port exposes it as a named opt-in instead of a silent
-  /// fallthrough. For a non-CJK `language_code` the two groupings are
-  /// identical: both split on spaces.
+  /// (coremlit issue #14).
+  ///
+  /// [`WordGrouping::FineGrained`] — the default, and this port's
+  /// long-standing behavior — takes the Unicode arm for all six of the
+  /// languages above.
+  ///
+  /// [`WordGrouping::SwiftParity`] reproduces **Swift's own** arm selection,
+  /// which is not "spaces for all CJK": Swift matches its
+  /// `NLLanguageRecognizer` result against the same six names, and
+  /// `NLLanguage`'s raw values are bare for Japanese/Thai/Lao/Burmese
+  /// (`ja`/`th`/`lo`/`my` — they match, and Swift Unicode-splits them) but
+  /// regional for Chinese (`zh-Hans`/`zh-Hant` — they do not, so Chinese
+  /// alone falls through to the space splitter; Cantonese has no
+  /// `NLLanguage` case and is recognized as Chinese, so it goes the same
+  /// way). This variant therefore space-splits `zh`/`yue` and Unicode-splits
+  /// the rest, matching Swift's pinned Japanese expectation
+  /// (`UnitTests.swift:1360-1375`).
+  ///
+  /// The two groupings consequently differ **only for `zh` and `yue`**. For
+  /// every other `language_code` — CJK or not — they are the same splitter.
   ///
   /// # Overriding or pre-normalizing `language_code`
   /// `language_code` is an ordinary argument, not something this method
@@ -468,8 +477,32 @@ impl WhisperTokenizer {
     language_code: &str,
     grouping: WordGrouping,
   ) -> Result<Vec<(String, Vec<u32>)>, TokenizerError> {
-    let is_cjk = matches!(language_code, "zh" | "ja" | "th" | "lo" | "my" | "yue");
-    if is_cjk && grouping.is_fine_grained() {
+    let unicode_split = match grouping {
+      // Every non-whitespace-delimited language, fine-grained. This port's
+      // default and its issue-#11 pin.
+      WordGrouping::FineGrained => {
+        matches!(language_code, "zh" | "ja" | "th" | "lo" | "my" | "yue")
+      }
+      // Swift's arm selection, expressed against the BARE base codes this
+      // function is actually handed.
+      //
+      // Swift matches `NLLanguageRecognizer.dominantLanguage?.rawValue`
+      // against `["zh", "ja", "th", "lo", "my", "yue"]` (`Models.swift:1299`)
+      // -- but `NLLanguage`'s raw values are `ja`/`th`/`lo`/`my` (bare, so
+      // they MATCH and Swift Unicode-splits them) and `zh-Hans`/`zh-Hant`
+      // (regional, so they do NOT, and Chinese alone falls through to the
+      // space splitter). Cantonese has no `NLLanguage` case at all and is
+      // recognized as Chinese, so `yue` behaves the same way.
+      //
+      // Hence: `zh`/`yue` -> spaces, everything else per the list. Forcing
+      // spaces for ALL CJK -- what this variant used to do -- would diverge
+      // from Swift for Japanese, whose twelve Unicode-split groups Swift
+      // pins in its own test suite (`UnitTests.swift:1360-1375`), under the
+      // very name that promises parity with it.
+      WordGrouping::SwiftParity => matches!(language_code, "ja" | "th" | "lo" | "my"),
+    };
+
+    if unicode_split {
       self.split_tokens_on_unicode(tokens)
     } else {
       self.split_tokens_on_spaces(tokens)

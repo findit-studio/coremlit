@@ -95,7 +95,7 @@ fn mutations() -> Vec<OptionMutation> {
     // silently dropped — pinned by name below as well as by the table.
     ("drop_blank_audio", |o| o.maybe_drop_blank_audio(false)),
     ("word_grouping", |o| {
-      o.with_word_grouping(WordGrouping::Phrase)
+      o.with_word_grouping(WordGrouping::SwiftParity)
     }),
   ]
 }
@@ -184,7 +184,7 @@ fn drop_blank_audio_and_word_grouping_are_recorded() {
   // `word_grouping`: FineGrained vs Phrase carve a CJK segment's words
   // differently. Same story.
   let fine = DecodingOptions::new();
-  let phrase = DecodingOptions::new().with_word_grouping(WordGrouping::Phrase);
+  let phrase = DecodingOptions::new().with_word_grouping(WordGrouping::SwiftParity);
   assert_eq!(fine.word_grouping(), WordGrouping::FineGrained);
   assert_ne!(
     record(&fine),
@@ -193,7 +193,7 @@ fn drop_blank_audio_and_word_grouping_are_recorded() {
   );
   assert_eq!(
     record(&phrase).decoding().word_grouping(),
-    WordGrouping::Phrase
+    WordGrouping::SwiftParity
   );
 }
 

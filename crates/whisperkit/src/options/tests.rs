@@ -149,11 +149,11 @@ fn enums_round_trip_and_display() {
   );
   assert!("bogus".parse::<Task>().is_err());
 
-  for g in [WordGrouping::FineGrained, WordGrouping::Phrase] {
+  for g in [WordGrouping::FineGrained, WordGrouping::SwiftParity] {
     assert_eq!(g.as_str().parse::<WordGrouping>().unwrap(), g);
   }
   assert_eq!(WordGrouping::FineGrained.to_string(), "fine_grained");
-  assert_eq!(WordGrouping::Phrase.as_str(), "phrase");
+  assert_eq!(WordGrouping::SwiftParity.as_str(), "swift_parity");
   assert!("bogus".parse::<WordGrouping>().is_err());
 }
 
@@ -169,13 +169,13 @@ fn word_grouping_defaults_to_fine_grained() {
   );
   assert!(DecodingOptions::new().word_grouping().is_fine_grained());
 
-  let built = DecodingOptions::new().with_word_grouping(WordGrouping::Phrase);
-  assert_eq!(built.word_grouping(), WordGrouping::Phrase);
-  assert!(built.word_grouping().is_phrase());
+  let built = DecodingOptions::new().with_word_grouping(WordGrouping::SwiftParity);
+  assert_eq!(built.word_grouping(), WordGrouping::SwiftParity);
+  assert!(built.word_grouping().is_swift_parity());
 
   let mut m = DecodingOptions::new();
-  m.set_word_grouping(WordGrouping::Phrase);
-  assert_eq!(m.word_grouping(), WordGrouping::Phrase);
+  m.set_word_grouping(WordGrouping::SwiftParity);
+  assert_eq!(m.word_grouping(), WordGrouping::SwiftParity);
   m.set_word_grouping(WordGrouping::FineGrained);
   assert_eq!(m.word_grouping(), WordGrouping::FineGrained);
 }
@@ -188,10 +188,11 @@ fn word_grouping_serde_omitted_stays_fine_grained() {
   let omitted: DecodingOptions = serde_json::from_str("{}").unwrap();
   assert_eq!(omitted.word_grouping(), WordGrouping::FineGrained);
 
-  let phrase: DecodingOptions = serde_json::from_str(r#"{"word_grouping":"phrase"}"#).unwrap();
-  assert_eq!(phrase.word_grouping(), WordGrouping::Phrase);
+  let phrase: DecodingOptions =
+    serde_json::from_str(r#"{"word_grouping":"swift_parity"}"#).unwrap();
+  assert_eq!(phrase.word_grouping(), WordGrouping::SwiftParity);
 
-  for wanted in [WordGrouping::FineGrained, WordGrouping::Phrase] {
+  for wanted in [WordGrouping::FineGrained, WordGrouping::SwiftParity] {
     let options = DecodingOptions::new().with_word_grouping(wanted);
     let json = serde_json::to_string(&options).unwrap();
     assert_eq!(
