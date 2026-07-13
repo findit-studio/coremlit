@@ -206,55 +206,68 @@ fn recover_propagates_non_recoverable_errors() {
 
 #[cfg(feature = "tracing")]
 mod tracing_spans {
+  use core::cell::RefCell;
   use std::sync::{
-    Arc, Mutex,
+    Once,
     atomic::{AtomicU64, Ordering},
   };
 
   use super::*;
 
-  /// A capturing [`tracing::Subscriber`] that records the NAME of every span
-  /// opened while it is installed.
-  ///
-  /// Hand-rolled rather than `tracing-subscriber`: the whole surface needed is
-  /// seven trait methods, and a test-only dependency on a second tracing crate
-  /// (with its own feature matrix) to assert "≥ 1 span exists" would cost more
-  /// than it explains.
-  struct CaptureSpans {
-    names: Arc<Mutex<Vec<&'static str>>>,
-    next_id: AtomicU64,
+  // Why a GLOBAL subscriber with thread-local capture, and not the obvious
+  // `with_default(subscriber, || ...)`:
+  //
+  // `tracing` caches an `Interest` per callsite, PROCESS-WIDE, the first time
+  // that callsite is reached. A callsite first reached while no subscriber is
+  // installed caches `Interest::never()` and is then dead for the rest of the
+  // process. `with_default` installs a THREAD-LOCAL subscriber and does NOT
+  // rebuild that cache (`rebuild_interest_cache` recomputes from the list of
+  // GLOBAL dispatchers, which is empty in that case — it cannot help). Other
+  // tests in this binary call `Encoder::emissions` with no subscriber at all,
+  // so on a full `--ignored` run they killed the `alignkit.encoder.emissions`
+  // callsite before this test ever ran and it captured three of its four spans.
+  // Found exactly that way: green alone, red in the suite.
+  //
+  // `set_global_default` DOES rebuild the interest cache, and `enabled()` below
+  // is unconditionally true, so every callsite lands on `Interest::always()` and
+  // can never be re-poisoned. Capture is then armed per-thread, which is also
+  // what keeps parallel tests from seeing each other's spans.
+  //
+  // This is a property of scoped subscribers in a multi-test process, NOT of
+  // this crate: a real user calls `init()` / `set_global_default`, which takes
+  // the same path this does. There is nothing to fix in the library.
+
+  thread_local! {
+    /// `Some` while this thread is capturing; the names it has collected.
+    static CAPTURED: RefCell<Option<Vec<&'static str>>> = const { RefCell::new(None) };
   }
 
-  impl CaptureSpans {
-    /// The subscriber and a handle to the names it will collect. The handle is
-    /// cloned out BEFORE the subscriber is moved into `with_default`, so the
-    /// captures are still readable once it is gone.
-    fn new() -> (Self, Arc<Mutex<Vec<&'static str>>>) {
-      let names = Arc::new(Mutex::new(Vec::new()));
-      (
-        Self {
-          names: Arc::clone(&names),
-          // `Id::from_u64` rejects 0.
-          next_id: AtomicU64::new(1),
-        },
-        names,
-      )
-    }
+  /// A capturing [`tracing::Subscriber`]: records the NAME of every span opened
+  /// on a thread that has armed [`CAPTURED`], and ignores every other thread.
+  ///
+  /// Hand-rolled rather than `tracing-subscriber`: the whole surface is seven
+  /// trait methods, and a test-only dependency on a second tracing crate (with
+  /// its own feature matrix) to assert "≥ 1 span exists" would cost more than
+  /// it explains.
+  struct CaptureSpans {
+    next_id: AtomicU64,
   }
 
   impl tracing::Subscriber for CaptureSpans {
     fn enabled(&self, _metadata: &tracing::Metadata<'_>) -> bool {
-      // Capture every level: the load spans are INFO and the per-chunk ones
-      // DEBUG, and this test is about whether they EXIST, not about filtering.
+      // Every level: the load spans are INFO and the per-chunk ones DEBUG, and
+      // this test is about whether they EXIST, not about filtering. Being
+      // unconditional is also what pins every callsite to `Interest::always()`.
       true
     }
 
     fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-      self
-        .names
-        .lock()
-        .expect("span capture lock")
-        .push(span.metadata().name());
+      CAPTURED.with(|captured| {
+        if let Some(names) = captured.borrow_mut().as_mut() {
+          names.push(span.metadata().name());
+        }
+      });
+      // `Id::from_u64` rejects 0.
       tracing::span::Id::from_u64(self.next_id.fetch_add(1, Ordering::Relaxed))
     }
 
@@ -265,13 +278,25 @@ mod tracing_spans {
     fn exit(&self, _span: &tracing::span::Id) {}
   }
 
-  /// Runs `body` with a capturing subscriber installed and returns the names of
-  /// every span it opened, in order.
+  /// Runs `body` with the capturing subscriber armed on this thread and returns
+  /// the names of every span it opened, in order.
   fn spans_opened_by(body: impl FnOnce()) -> Vec<&'static str> {
-    let (subscriber, names) = CaptureSpans::new();
-    tracing::subscriber::with_default(subscriber, body);
-    let names = names.lock().expect("span capture lock");
-    names.clone()
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+      tracing::subscriber::set_global_default(CaptureSpans {
+        next_id: AtomicU64::new(1),
+      })
+      .expect("no other subscriber may claim the global default in this test binary");
+    });
+
+    CAPTURED.with(|captured| *captured.borrow_mut() = Some(Vec::new()));
+    body();
+    CAPTURED.with(|captured| {
+      captured
+        .borrow_mut()
+        .take()
+        .expect("capture was armed above")
+    })
   }
 
   fn count(spans: &[&'static str], name: &str) -> usize {

@@ -597,9 +597,9 @@ impl Encoder {
   /// values; it does not bound them from below. [`LOG_PROB_FLOOR`] does, and
   /// this method checks it first: an ANE-corrupted matrix (finite, negative,
   /// and utterly wrong) is [`AlignError::CorruptEmissions`] here rather than a
-  /// plausible alignment 881 ms off. Unlike [`Self::emissions_raw`], which
-  /// hands back the tensor unchecked, **this is the guarded door** — and the
-  /// only one [`crate::aligner::Aligner`] uses.
+  /// plausible alignment 881 ms off. Unlike the crate-private `emissions_raw`,
+  /// which hands back the tensor unchecked, **this is the guarded door** — and
+  /// the only one [`crate::aligner::Aligner`] uses.
   ///
   /// `encoder_input` is the buffer the model runs on. For the alignment
   /// pipeline it is `PreparedChunk::encoder_input()` — asry has already

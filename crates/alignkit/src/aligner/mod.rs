@@ -178,7 +178,7 @@ impl AlignerOptions {
   /// property of the model artifact, not of this crate, and nothing here can
   /// recover the underflowed cells.
   ///
-  /// It is not silent: [`Self::align_chunk`] fails such a chunk with
+  /// It is not silent: [`Aligner::align_chunk`] fails such a chunk with
   /// [`AlignError::CorruptEmissions`], which names this placement (see
   /// [`crate::encode::LOG_PROB_FLOOR`]). The guard is on the emission VALUES,
   /// not on the placement, so a numerically-clean non-default placement —
