@@ -87,7 +87,7 @@ use crate::{
   options::{DecodingOptions, Options},
   result::{
     DecodingResult, TranscriptionProgress, TranscriptionResult, TranscriptionSegment,
-    TranscriptionTimings, merge_transcription_results, needs_fallback,
+    TranscriptionTimings, merge_transcription_results_with_options, needs_fallback,
   },
   segment,
   stream::{AudioStreamTranscriber, agreement::LocalAgreementTranscriber},
@@ -562,7 +562,8 @@ where
   /// correlate them. Left alone, the ids are stable across the toggle and
   /// the hole is self-describing ("segment 1 was dropped"). There is also
   /// no id contiguity to "restore" in the first place:
-  /// [`merge_transcription_results`] re-ids every segment it merges to
+  /// [`merge_transcription_results`](crate::result::merge_transcription_results)
+  /// re-ids every segment it merges to
   /// `result_index + segment_index` — a faithfully-ported upstream quirk
   /// that is neither dense nor unique (two results of two segments give
   /// `[0, 1, 1, 2]`) — and it does so unconditionally, so on the VAD path
@@ -858,46 +859,6 @@ impl LanguageDetection {
   }
 }
 
-/// Joins `results`' texts with a single `" "`, **skipping the empty ones**
-/// — the text rule [`WhisperKit::transcribe`]'s VAD branch substitutes for
-/// [`merge_transcription_results`]'s own join when
-/// [`DecodingOptions::drop_blank_audio`] is set (coremlit issue #14).
-///
-/// # Why this is not folded into [`merge_transcription_results`]
-///
-/// Because an empty-text [`TranscriptionResult`] is **not** unique to the
-/// blank-audio drop, and the merge is a bug-for-bug port that must keep
-/// behaving like Swift for every input it can already be handed today.
-/// [`TranscribeTask::run`] returns a zero-segment, empty-text result
-/// whenever its window loop never runs — an audio buffer shorter than
-/// [`DecodingOptions::window_clip_time`] is the standing example, pinned by
-/// `audio_shorter_than_window_clip_time_yields_no_windows` since long
-/// before this option existed — and Swift's own
-/// `mergeTranscriptionResults` (`TranscriptionUtilities.swift:82-84`)
-/// `compactMap`s away only *nil* results, never empty-text ones, so it
-/// joins such a result as a bare separator exactly as this port's merge
-/// does. Filtering inside the merge would therefore silently change the
-/// `drop_blank_audio == false` path — the one that exists precisely to be
-/// byte-for-byte Swift — for a case that has nothing to do with blank
-/// audio. The repair belongs on the path whose own default created the
-/// problem, and nowhere else.
-///
-/// The merge still runs over **every** chunk result, emptied ones included:
-/// only the text is re-joined here. Dropping an emptied chunk from the
-/// merge input instead would take its
-/// [`input_audio_seconds`](crate::result::TranscriptionTimings::input_audio_seconds)/
-/// [`audio_processing`](crate::result::TranscriptionTimings::audio_processing)
-/// and every other summed timing out with it, quietly corrupting the
-/// merged metrics (and the RTF derived from them) to fix a spacing bug.
-fn join_non_empty_texts(results: &[TranscriptionResult]) -> String {
-  results
-    .iter()
-    .map(TranscriptionResult::text)
-    .filter(|text| !text.is_empty())
-    .collect::<Vec<_>>()
-    .join(" ")
-}
-
 // ---------------------------------------------------------------------
 // WhisperKit
 // ---------------------------------------------------------------------
@@ -1156,9 +1117,10 @@ where
   /// [`TranscriptionResult`] return rather than Swift's redundant
   /// one-element-array wrapping, so by the time `transcribe`'s VAD branch
   /// has several chunk results to reconcile, folding them through
-  /// [`merge_transcription_results`] right here is what keeps this
-  /// method's own signature single-valued — pulling a call Swift leaves to
-  /// its CLI down into the library, not adding behavior Swift lacks.
+  /// [`merge_transcription_results_with_options`] right here is what keeps
+  /// this method's own signature single-valued — pulling a call Swift
+  /// leaves to its CLI down into the library, not adding behavior Swift
+  /// lacks.
   ///
   /// When `options.chunking_strategy()` is
   /// [`ChunkingStrategy::Vad`](crate::options::ChunkingStrategy::Vad)
@@ -1181,7 +1143,11 @@ where
   /// rethrows); every surviving chunk's segments and
   /// [`TranscriptionResult::seek_time`] are re-anchored to the original
   /// timeline by [`chunker::apply_result_seek_offset`] before all chunk
-  /// results are folded into one via [`merge_transcription_results`].
+  /// results are folded into one via
+  /// [`merge_transcription_results_with_options`] — passed this call's own
+  /// `options`, so a chunk the blank-audio drop emptied contributes no bare
+  /// separator to the joined text while still contributing its timings to
+  /// the merged sums (see that function's doc).
   /// Zero chunks (every clip shorter than the chunker's window padding —
   /// [`chunker::VadChunker::chunk_all`]'s own documented outcome), or
   /// every chunk erroring, therefore yields an `Ok` result with empty
@@ -1244,23 +1210,20 @@ where
           chunk_results.push(result);
         }
       }
-      let mut merged = merge_transcription_results(&chunk_results);
-      // coremlit issue #14 — the blank-audio drop can empty a whole chunk
-      // (a wholly-silent one decodes to nothing but `[BLANK_AUDIO]`, which
-      // the filter then removes), and `chunk_all` is a CONTIGUOUS chunker:
-      // `start = end` marches across the clip and nothing is ever skipped,
-      // so a long enough silence really does become a chunk of its own.
-      // The merge joins every chunk's text with `" "` regardless, so an
-      // emptied chunk would land in the transcript as a BARE SEPARATOR —
-      // a doubled space between two speech runs, a leading or trailing one
-      // at the edges. Re-join without the empties. See
-      // `join_non_empty_texts` for why this is not done inside the merge
-      // (short answer: an empty-text result predates this option, and the
-      // merge must stay byte-for-byte Swift for the `false` path).
-      if options.drop_blank_audio() {
-        merged.set_text(join_non_empty_texts(&chunk_results));
-      }
-      return Ok(merged);
+      // `_with_options`, not the plain merge: the blank-audio drop can
+      // empty a whole chunk (a wholly-silent one decodes to nothing but
+      // `[BLANK_AUDIO]`, which the filter then removes), and `chunk_all` is
+      // a CONTIGUOUS chunker — `start = end` marches across the clip and
+      // nothing is ever skipped — so a long enough silence really does
+      // become a chunk of its own. Swift's join would land it in the
+      // transcript as a bare separator. Passing the very `options` the
+      // chunks were decoded with is what keeps the merged text and the
+      // decode from disagreeing; every chunk is still merged, so no chunk's
+      // timings leave the sums.
+      return Ok(merge_transcription_results_with_options(
+        &chunk_results,
+        options,
+      ));
     }
 
     TranscribeTask::new(&self.backend, &self.tokenizer).run(audio, options)

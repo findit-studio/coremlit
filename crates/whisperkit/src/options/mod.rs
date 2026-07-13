@@ -1549,15 +1549,32 @@ impl DecodingOptions {
   /// to become a chunk of its own — the chunker is *contiguous*, so
   /// silence is never skipped, only cut around — decodes to nothing but
   /// the marker and is therefore emptied outright by this filter.
-  /// [`WhisperKit::transcribe`](crate::transcribe::WhisperKit::transcribe)
-  /// leaves such a chunk out of the merged transcript's **text join** when
-  /// this is `true`, so it cannot surface as the bare `" "` separator
+  ///
+  /// **This option is consequently a merge rule as well as a decode
+  /// filter.** An emptied chunk has no text, and
   /// [`merge_transcription_results`](crate::result::merge_transcription_results)
-  /// would otherwise give it (a doubled space between two speech runs; a
-  /// leading or trailing one at the clip's edges). The chunk is still
-  /// *merged* — its timings stay in the summed metrics; only its empty
-  /// text is skipped. That re-join is gated on this option: the merge
-  /// itself keeps Swift's join verbatim.
+  /// joins *every* result's text with `" "` — so an emptied one would
+  /// surface as a bare separator (a doubled space between two speech runs;
+  /// a leading or trailing one at the clip's edges).
+  /// [`merge_transcription_results_with_options`](crate::result::merge_transcription_results_with_options)
+  /// is the merge that reads this option and **skips empty texts in the
+  /// join** when it is set;
+  /// [`WhisperKit::transcribe`](crate::transcribe::WhisperKit::transcribe)
+  /// uses it for its own VAD chunks, and it is what a caller folding a
+  /// [`WhisperKit::transcribe_all`](crate::transcribe::WhisperKit::transcribe_all)
+  /// batch by hand should use too. Every result is still *merged* — its
+  /// timings stay in the summed metrics; only its empty text is skipped.
+  /// The plain [`merge_transcription_results`](crate::result::merge_transcription_results)
+  /// keeps Swift's join verbatim, empties included.
+  ///
+  /// Note the scope that gives the merge: it skips **empty texts**, not
+  /// "blank chunks" — it cannot see why a result is empty. With this set,
+  /// an empty result from *short audio* (any clip below
+  /// [`Self::window_clip_time`] runs no window and returns one) is skipped
+  /// from the join too. That is the intended reading — blank-dropping means
+  /// empty chunks do not pollute the text — and not a further divergence:
+  /// clear this option and Swift's join, bare separators and all, is back
+  /// exactly.
   ///
   /// Speech-only audio is unaffected either way: it decodes no such
   /// segment, so the filter finds nothing to drop and the golden parity

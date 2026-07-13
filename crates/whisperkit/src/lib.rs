@@ -76,7 +76,10 @@
 //!   and temperature-fallback ladder that drives the decode stack over a
 //!   full audio buffer — and, for VAD-chunked audio, folding per-chunk
 //!   results together via
-//!   [`merge_transcription_results`](result::merge_transcription_results).
+//!   [`merge_transcription_results_with_options`](result::merge_transcription_results_with_options),
+//!   which is equally the entry point for folding a `transcribe_all` batch
+//!   by hand ([`merge_transcription_results`](result::merge_transcription_results)
+//!   is its options-blind, exactly-Swift sibling).
 //! - [`stream`] — push-based streaming vocabulary (spec §5.3 `stream`
 //!   row): [`StreamState`](stream::StreamState) (Swift's
 //!   `AudioStreamTranscriber.State`),

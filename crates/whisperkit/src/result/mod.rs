@@ -2101,14 +2101,12 @@ fn min_timing(results: &[TranscriptionResult], f: impl Fn(&TranscriptionTimings)
 ///   shorter than [`DecodingOptions::window_clip_time`](crate::options::DecodingOptions::window_clip_time)
 ///   runs no window at all and returns one — and this port keeps the
 ///   quirk rather than "fixing" it, exactly like the segment re-`id`
-///   below. Callers that must not surface it (
+///   below. This function is therefore the merge for
 ///   [`DecodingOptions::drop_blank_audio`](crate::options::DecodingOptions::drop_blank_audio)
-///   newly makes an *emptied* chunk common — a wholly-silent VAD chunk
-///   decodes to nothing but the blank marker, which the filter removes)
-///   re-join the non-empty texts themselves;
-///   [`WhisperKit::transcribe`](crate::transcribe::WhisperKit::transcribe)'s
-///   VAD branch does so for its own result, still merging every chunk
-///   here so no chunk's timings are lost from the sums.
+///   `== false` — exact Swift — by definition;
+///   [`merge_transcription_results_with_options`] is the entry point that
+///   skips the empties instead, for the callers whose own options made an
+///   emptied result routine. Both share one implementation.
 /// - [`TranscriptionResult::segments_slice`][]: every result's segments,
 ///   concatenated in order, each re-`id`'d to `result_index +
 ///   segment_index` (:89-94) — a faithful bug-for-bug port: upstream
@@ -2168,9 +2166,94 @@ fn min_timing(results: &[TranscriptionResult], f: impl Fn(&TranscriptionTimings)
 ///   than folded into the max-for-load-times group they would naively
 ///   belong to.
 pub fn merge_transcription_results(results: &[TranscriptionResult]) -> TranscriptionResult {
+  // `false` — Swift's own join: every text participates, an empty one as a
+  // bare separator. See this function's doc for why that is not "fixed".
+  merge_results(results, false)
+}
+
+/// Merges `results` exactly as [`merge_transcription_results`] does, but
+/// takes the [`DecodingOptions`] they were decoded under and applies the
+/// one merge rule those options govern: when
+/// [`DecodingOptions::drop_blank_audio`] is set (**the default**), a result
+/// whose text is empty contributes **nothing to the text join** — not the
+/// bare `" "` separator Swift's join gives it.
+///
+/// This is the entry point for folding a
+/// [`WhisperKit::transcribe_all`](crate::transcribe::WhisperKit::transcribe_all)
+/// batch, and the one
+/// [`WhisperKit::transcribe`](crate::transcribe::WhisperKit::transcribe)'s
+/// VAD branch uses for its own chunk results. Hand it the same `options`
+/// the results were decoded with and the merged text cannot contradict
+/// them.
+///
+/// # Why the option has to reach the merge at all
+///
+/// [`DecodingOptions::drop_blank_audio`] makes an **empty result routine**:
+/// a wholly-silent VAD chunk — the chunker is *contiguous*, so silence is
+/// cut around, never skipped — decodes to nothing but
+/// [`BLANK_AUDIO_MARKER`](crate::constants::BLANK_AUDIO_MARKER), the filter
+/// removes that one segment, and the chunk is left with no text at all.
+/// Joined Swift's way, every such chunk lands in the transcript as a bare
+/// separator: a doubled space between two speech runs, a leading or
+/// trailing one at the clip's edges. [`merge_transcription_results`] cannot
+/// simply filter them out, because an empty-text result is **not** unique
+/// to the drop — any audio shorter than
+/// [`DecodingOptions::window_clip_time`] runs no window and returns one,
+/// which predates this option entirely — and Swift joins *those* as bare
+/// separators too, so filtering there would silently change the
+/// `drop_blank_audio == false` path, whose whole purpose is to be
+/// byte-for-byte Swift. The rule therefore travels with the option that
+/// created the need for it, and this is where the two meet.
+///
+/// # What is skipped is *empty text*, not *blank audio*
+///
+/// The merge cannot see **why** a result came back empty, and deliberately
+/// does not ask. With `drop_blank_audio` set, an empty result from
+/// **short audio** is skipped from the join exactly like an emptied blank
+/// chunk. That is the intended reading of the option — *blank-dropping
+/// means empty chunks do not pollute the text* — not an accidental
+/// over-reach: a caller who asked not to see `[BLANK_AUDIO]` has no more
+/// use for a bare separator standing in for a sub-second clip than for one
+/// standing in for silence. Callers who want Swift's join for every input,
+/// empties included, call [`merge_transcription_results`] — or clear the
+/// option, which makes this function that one exactly.
+///
+/// # Every result is still merged
+///
+/// Only the *join* skips empties. Segment concatenation and every timing
+/// reduction run over **all** of `results` either way, so the merged
+/// segments and every timing field — the summed
+/// [`input_audio_seconds`](TranscriptionTimings::input_audio_seconds) and
+/// [`audio_processing`](TranscriptionTimings::audio_processing), the
+/// [`real_time_factor`](TranscriptionTimings::real_time_factor) derived
+/// from them, all of it — are byte-identical to
+/// [`merge_transcription_results`]'s on the same input, whichever way the
+/// option is set. **Only [`TranscriptionResult::text`] can differ.**
+/// Dropping an emptied result from the merge *input* instead would take its
+/// metrics out with it, quietly corrupting the sums (and the RTF) to fix a
+/// spacing bug.
+pub fn merge_transcription_results_with_options(
+  results: &[TranscriptionResult],
+  options: &DecodingOptions,
+) -> TranscriptionResult {
+  merge_results(results, options.drop_blank_audio())
+}
+
+/// The single merge implementation behind [`merge_transcription_results`]
+/// and [`merge_transcription_results_with_options`].
+///
+/// `skip_empty_texts` governs the **text join and nothing else**: every
+/// result participates in the segment concatenation and in every timing
+/// reduction regardless of it, so the two entry points can differ only in
+/// [`TranscriptionResult::text`]. Keeping that promise structural — one
+/// body, one `filter`, reached through both doors — is the point of the
+/// split: the alternative (a second join written out at the call site that
+/// happens to know the option) is exactly how the two drifted apart before.
+fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> TranscriptionResult {
   let text = results
     .iter()
     .map(TranscriptionResult::text)
+    .filter(|text| !(skip_empty_texts && text.is_empty()))
     .collect::<Vec<_>>()
     .join(" ");
 
@@ -2312,6 +2395,15 @@ pub fn merge_transcription_results(results: &[TranscriptionResult]) -> Transcrip
 /// here for free, and if upstream Swift ever grows a real divergence
 /// between the two branches beyond the text override, this call site is
 /// where that would need to change.
+///
+/// There is deliberately no `_with_words`/`_with_options` combination:
+/// [`DecodingOptions::drop_blank_audio`] only ever changes the merged
+/// **text join**, and this function *discards* that join wholesale in
+/// favour of `confirmed_words`. The option is therefore unobservable here
+/// by construction, and delegating to the plain (Swift-faithful) merge is
+/// not a gap — a
+/// [`merge_transcription_results_with_options`] call in its place would
+/// compute a different string and then throw it away.
 pub fn merge_transcription_results_with_words(
   results: &[TranscriptionResult],
   confirmed_words: &[WordTiming],

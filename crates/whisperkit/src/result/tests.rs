@@ -35,28 +35,32 @@ fn merge_transcription_results_concatenates_and_reids() {
   assert_eq!(merged.language(), "en");
 }
 
+/// A result carrying nothing but text — the shape `transcribe_all` returns
+/// for a chunk/clip whose segments were all emptied (or, independently of
+/// the blank-audio drop, for any clip shorter than `window_clip_time`).
+fn spoken(text: &str) -> TranscriptionResult {
+  TranscriptionResult::new(text, Vec::new(), "en", TranscriptionTimings::new())
+}
+
 #[test]
 fn merge_joins_an_empty_text_as_a_bare_separator() {
-  // PARITY PIN (issue #14 review, C1). This merge deliberately does NOT
+  // PARITY PIN (issue #14). The options-BLIND merge deliberately does NOT
   // skip empty-text results: Swift's `validResults` `compactMap`s away
   // only *nil* elements, never empty-text ones, so
   // `["a", "", "b"].joined(separator: " ")` is `"a  b"` there and must be
   // `"a  b"` here.
   //
-  // It is tempting to "fix" this, because
-  // `DecodingOptions::drop_blank_audio` (default `true`) newly makes an
-  // emptied chunk common. DON'T — an empty-text result is reachable with
-  // NO involvement from that option (any audio shorter than
+  // It is tempting to "fix" this here, because
+  // `DecodingOptions::drop_blank_audio` (default `true`) makes an emptied
+  // chunk common. DON'T — an empty-text result is reachable with NO
+  // involvement from that option (any audio shorter than
   // `window_clip_time` runs no window and returns one; see
   // `transcribe::tests::audio_shorter_than_window_clip_time_yields_no_windows`,
-  // which predates the option), so filtering here would silently change
-  // the `drop_blank_audio == false` path — the path whose whole purpose is
-  // to be byte-for-byte Swift. The repair is gated on the option, at
-  // `WhisperKit::transcribe`'s VAD branch
-  // (`transcribe::join_non_empty_texts`), and this test is what keeps it
-  // from creeping back down here.
-  let spoken =
-    |text: &str| TranscriptionResult::new(text, Vec::new(), "en", TranscriptionTimings::new());
+  // which predates the option), so filtering unconditionally here would
+  // silently change the `drop_blank_audio == false` path — the path whose
+  // whole purpose is to be byte-for-byte Swift. The skip belongs to the
+  // option, and therefore to `merge_transcription_results_with_options`
+  // (below); this test is what keeps it from creeping down here.
   assert_eq!(
     merge_transcription_results(&[spoken("a"), spoken(""), spoken("b")]).text(),
     "a  b",
@@ -67,6 +71,142 @@ fn merge_joins_an_empty_text_as_a_bare_separator() {
     "a ",
     "trailing empty stays a bare separator (Swift parity)"
   );
+}
+
+#[test]
+fn merge_with_options_skips_empty_texts_when_blank_audio_is_dropped() {
+  // THE REGRESSION, at the public door a consumer actually uses: fold a
+  // `transcribe_all` batch through the merge under the DEFAULT options
+  // (`drop_blank_audio == true`). An emptied result must contribute no
+  // separator at all — the merge's own `["a", "", "b"].join(" ")` would
+  // make it `"a  b"`.
+  let options = DecodingOptions::new();
+  assert!(options.drop_blank_audio(), "this is the default path");
+  let text = |results: &[TranscriptionResult]| {
+    merge_transcription_results_with_options(results, &options)
+      .text()
+      .to_string()
+  };
+
+  // Interior: an emptied chunk BETWEEN two speech runs -> no doubled space.
+  assert_eq!(
+    text(&[spoken("Hello world."), spoken(""), spoken("Goodbye.")]),
+    "Hello world. Goodbye."
+  );
+  // Trailing: emptied chunks after the speech -> no trailing space(s).
+  assert_eq!(
+    text(&[spoken("Hello world."), spoken(""), spoken("")]),
+    "Hello world."
+  );
+  // Leading: an emptied chunk before the speech -> no leading space.
+  assert_eq!(text(&[spoken(""), spoken("Hello world.")]), "Hello world.");
+  // Wholly emptied: nothing at all, not a string of bare separators.
+  assert_eq!(text(&[spoken(""), spoken(""), spoken("")]), "");
+  // Speech only: the join is untouched — one separator per gap.
+  assert_eq!(text(&[spoken("Hello"), spoken("world.")]), "Hello world.");
+  // Empty input: still the empty string (`[].join(" ")`).
+  assert_eq!(text(&[]), "");
+}
+
+#[test]
+fn merge_with_options_joins_empty_texts_verbatim_when_the_drop_is_cleared() {
+  // The `false` TWIN of the test above, and the parity pin on this entry
+  // point: cleared, it must reproduce `merge_transcription_results` — bare
+  // separators and all — byte for byte. This is what makes the skip above
+  // provably attributable to the option rather than to the new function.
+  let options = DecodingOptions::new().maybe_drop_blank_audio(false);
+  let results = [spoken("Hello world."), spoken(""), spoken("Goodbye.")];
+
+  let merged = merge_transcription_results_with_options(&results, &options);
+  assert_eq!(
+    merged.text(),
+    "Hello world.  Goodbye.",
+    "the bare separator must SURVIVE when the drop is cleared (Swift parity)"
+  );
+  assert_eq!(
+    merged.text(),
+    merge_transcription_results(&results).text(),
+    "cleared, this entry point IS the options-blind merge"
+  );
+  assert_eq!(
+    merge_transcription_results_with_options(&[spoken("a"), spoken("")], &options).text(),
+    "a ",
+    "trailing bare separator survives too"
+  );
+}
+
+#[test]
+fn merge_with_options_keeps_every_result_in_the_timing_sums() {
+  // The skip is a JOIN rule, not a merge-input filter. Dropping an emptied
+  // result from the merge instead would take its `input_audio_seconds` /
+  // `audio_processing` / every other summed timing out with it — silently
+  // corrupting the merged metrics, and the RTF derived from them, to fix a
+  // spacing bug. Every field except `text` must therefore be INVARIANT
+  // under the option.
+  let timed = |text: &str, audio_seconds: f64| {
+    let mut timings = TranscriptionTimings::new();
+    timings
+      .set_input_audio_seconds(audio_seconds)
+      .set_audio_processing(audio_seconds / 10.0)
+      .set_total_audio_processing_runs(1.0)
+      .set_full_pipeline(audio_seconds / 4.0);
+    TranscriptionResult::new(text, Vec::new(), "en", timings)
+  };
+  // The middle chunk is 30 s of silence the blank-audio drop emptied: no
+  // text, but 30 s of audio that really was processed.
+  let results = [
+    timed("Hello world.", 30.0),
+    timed("", 30.0),
+    timed("Goodbye.", 20.0),
+  ];
+
+  let dropped = merge_transcription_results_with_options(
+    &results,
+    &DecodingOptions::new().with_drop_blank_audio(),
+  );
+  let kept = merge_transcription_results_with_options(
+    &results,
+    &DecodingOptions::new().maybe_drop_blank_audio(false),
+  );
+  let blind = merge_transcription_results(&results);
+
+  // Only the text moves.
+  assert_eq!(dropped.text(), "Hello world. Goodbye.");
+  assert_eq!(kept.text(), "Hello world.  Goodbye.");
+
+  // Everything else is byte-identical across all three doors — including
+  // the EMPTIED chunk's 30 s, which must still be in the sums.
+  for other in [&kept, &blind] {
+    assert_eq!(
+      dropped.timings().input_audio_seconds(),
+      other.timings().input_audio_seconds()
+    );
+    assert_eq!(
+      dropped.timings().audio_processing(),
+      other.timings().audio_processing()
+    );
+    assert_eq!(
+      dropped.timings().total_audio_processing_runs(),
+      other.timings().total_audio_processing_runs()
+    );
+    assert_eq!(
+      dropped.timings().full_pipeline(),
+      other.timings().full_pipeline()
+    );
+    assert_eq!(
+      dropped.timings().real_time_factor(),
+      other.timings().real_time_factor()
+    );
+    assert_eq!(dropped.segments_slice().len(), other.segments_slice().len());
+    assert_eq!(dropped.language(), other.language());
+  }
+
+  // ...and the sums are the REAL ones, not the ones a skipped result leaves
+  // behind: 30 + 30 + 20, not 30 + 20.
+  assert_eq!(dropped.timings().input_audio_seconds(), 80.0);
+  assert_eq!(dropped.timings().total_audio_processing_runs(), 3.0);
+  assert_eq!(dropped.timings().full_pipeline(), 20.0);
+  assert_eq!(dropped.timings().real_time_factor(), 20.0 / 80.0);
 }
 
 #[test]
