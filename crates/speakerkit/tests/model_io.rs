@@ -8,7 +8,7 @@
 //! DELTA`. Feeds Task 2 (`SegmentModel`) and later tasks (`EmbedModel`,
 //! `Extractor`).
 //!
-//! # Artifacts (`Models/dia-coreml/`, gitignored, fetched dev-time)
+//! # Artifacts (`Models/speakerkit/`, gitignored, fetched dev-time)
 //!
 //! | File | Role | Targeted? |
 //! |---|---|---|
@@ -21,7 +21,7 @@
 //! | `Embedding.mlmodelc` | embedding backend, split-pipeline alt | no |
 //! | `PLDA.mlmodelc` | clustering input transform | out of scope (spec §3 non-goal) |
 //!
-//! # Licenses (`Models/dia-coreml/README.md`)
+//! # Licenses (`Models/speakerkit/README.md`)
 //!
 //! The repo's HuggingFace frontmatter declares `license: cc-by-4.0` for the
 //! model repo as a whole; the body clarifies "the SDK itself is Apache 2.0,
@@ -37,7 +37,7 @@
 //! research and production oriented speaker embedding learning toolkit",
 //! ICASSP 2023), and speaker clustering / VBx (Landini et al., "Bayesian
 //! HMM clustering of x-vector sequences (VBx) in speaker diarization",
-//! Computer Speech & Language 2022) — the last is irrelevant to dia-coreml
+//! Computer Speech & Language 2022) — the last is irrelevant to speakerkit
 //! (clustering stays in `dia`, spec §3) but ships in the same README and is
 //! reproduced here for completeness.
 //!
@@ -111,7 +111,7 @@ mod common;
 use coremlit::{ComputeUnits, DataType, Model};
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn pyannote_segmentation_io_matches_spec() {
   let model = Model::load(common::seg_path(), ComputeUnits::CpuOnly).unwrap();
   let description = model.description();
@@ -131,7 +131,7 @@ fn pyannote_segmentation_io_matches_spec() {
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn segmentation_alt_io_recorded_not_targeted() {
   let path = common::models_dir().join("Segmentation.mlmodelc");
   let model = Model::load(path, ComputeUnits::CpuOnly).unwrap();
@@ -157,7 +157,7 @@ fn segmentation_alt_io_recorded_not_targeted() {
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn wespeaker_v2_io_matches_spec() {
   let model = Model::load(common::embed_path(), ComputeUnits::CpuOnly).unwrap();
   let description = model.description();
@@ -185,7 +185,7 @@ fn wespeaker_v2_io_matches_spec() {
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn wespeaker_v2_and_wespeaker_int8_are_byte_identical() {
   // SPEC DELTA (module doc item 3): `wespeaker_v2.mlmodelc` and
   // `wespeaker_int8.mlmodelc` are not merely contract-equal, they are the
@@ -202,7 +202,7 @@ fn wespeaker_v2_and_wespeaker_int8_are_byte_identical() {
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn wespeaker_fp32_io_contract_equal_but_not_targeted() {
   // `wespeaker.mlmodelc` shares the identical I/O contract with
   // `wespeaker_v2`/`wespeaker_int8` (same names/shapes/dtypes below) but is
@@ -220,7 +220,7 @@ fn wespeaker_fp32_io_contract_equal_but_not_targeted() {
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn fbank_io_recorded_not_targeted() {
   // NOT targeted (spec §2.4 — `wespeaker_v2` computes fbank in-graph, so
   // this split-pipeline frontend is unused). Recorded because the plan
@@ -251,7 +251,7 @@ fn fbank_io_recorded_not_targeted() {
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn embedding_split_io_recorded_not_targeted() {
   // NOT targeted — the split-pipeline second stage (fbank features +
   // per-frame weights -> embedding), superseded by wespeaker_v2's single
@@ -292,7 +292,7 @@ fn embedding_split_io_recorded_not_targeted() {
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn plda_io_recorded_out_of_scope() {
   // Out of scope per spec §3 non-goals ("Any clustering/VBx/PLDA port") —
   // recorded because the plan brief names it as a candidate artifact to

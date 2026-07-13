@@ -7,21 +7,21 @@
 
 use std::path::PathBuf;
 
-use dia_coreml::segment::{POWERSET_CLASSES, SEG_CHUNK_SAMPLES};
+use speakerkit::segment::{POWERSET_CLASSES, SEG_CHUNK_SAMPLES};
 
-/// Directory containing the downloaded dia-coreml model artifacts.
+/// Directory containing the downloaded speakerkit model artifacts.
 ///
-/// Overridable via `DIA_COREML_TEST_MODELS`; otherwise falls back to
-/// `<workspace>/Models/dia-coreml` — gitignored, fetched dev-time per the
+/// Overridable via `SPEAKERKIT_TEST_MODELS`; otherwise falls back to
+/// `<workspace>/Models/speakerkit` — gitignored, fetched dev-time per the
 /// design spec §4 (mirrors whisperkit's `WHISPERKIT_TEST_MODELS`/`Models/`
 /// convention, one directory level down for this crate's own model set).
 pub fn models_dir() -> PathBuf {
-  std::env::var_os("DIA_COREML_TEST_MODELS").map_or_else(
+  std::env::var_os("SPEAKERKIT_TEST_MODELS").map_or_else(
     || {
       PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("Models")
-        .join("dia-coreml")
+        .join("speakerkit")
     },
     PathBuf::from,
   )
@@ -154,7 +154,7 @@ pub fn load_wav_16k_mono(path: &std::path::Path) -> Vec<f32> {
 /// offline pipeline zero-pads the short tail, `owned.rs:469-475`). It is a
 /// deliberate simplification of dia's *overlapping* sliding-window GRID
 /// (`step_samples = 16_000`, `crate::window`) down to `step = window`: the
-/// grid geometry is a pipeline concern (dia-coreml's `window`/`extract`
+/// grid geometry is a pipeline concern (speakerkit's `window`/`extract`
 /// modules and their own parity), whereas Gates 1-2 isolate the MODELS on
 /// identical per-chunk inputs — a 160 000-sample window is processed
 /// bit-identically by each model regardless of how the grid spaces windows.
@@ -256,7 +256,7 @@ pub fn max_abs_diff(a: &[f32], b: &[f32]) -> f64 {
 }
 
 /// Hard argmax over one frame's [`POWERSET_CLASSES`] logits, ties toward the
-/// lowest index (`>` seeded at class 0) — the exact rule dia-coreml's shipping
+/// lowest index (`>` seeded at class 0) — the exact rule speakerkit's shipping
 /// `segment::multilabel` and dia's `powerset_to_speakers_hard` both use. Gate
 /// 1's multilabel-flip check argmaxes both models' logits with this and counts
 /// per-frame disagreements.
@@ -293,7 +293,7 @@ pub fn mask_from_string(s: &str) -> Vec<bool> {
 /// One embedded speaker slot within a golden chunk: the per-frame mask fed to
 /// the embedding model and the resulting dia-ort reference embedding.
 pub struct GoldenSlot {
-  /// Speaker-slot index (0..[`dia_coreml::segment::SEG_NUM_SLOTS`]).
+  /// Speaker-slot index (0..[`speakerkit::segment::SEG_NUM_SLOTS`]).
   pub slot: usize,
   /// The per-frame pooling mask (length = segmentation frame count) fed to
   /// BOTH backends — stored verbatim so the parity side is mask-identical.

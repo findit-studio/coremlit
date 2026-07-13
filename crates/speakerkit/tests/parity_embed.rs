@@ -1,4 +1,4 @@
-//! Gate 2 (spec §6.2): dia-coreml's CoreML `EmbedModel` vs dia's own `ort`
+//! Gate 2 (spec §6.2): speakerkit's CoreML `EmbedModel` vs dia's own `ort`
 //! WeSpeaker ResNet34-LM inference, per `(chunk, slot)`.
 //!
 //! # Precision-matched pairing (the ONLY meaningful Gate-2 comparison)
@@ -26,13 +26,13 @@
 //! dia's own fbank-input ONNX to CoreML — is a DECISION, not an inline pivot),
 //! never loosen the bound.
 //!
-//! `#[ignore]` (needs the gitignored `Models/dia-coreml/` artifacts); run via
-//! `cargo test -p dia-coreml -- --ignored`.
+//! `#[ignore]` (needs the gitignored `Models/speakerkit/` artifacts); run via
+//! `cargo test -p speakerkit -- --ignored`.
 
 mod common;
 
 use coremlit::ComputeUnits;
-use dia_coreml::embed::{EmbedModel, EmbedModelOptions};
+use speakerkit::embed::{EmbedModel, EmbedModelOptions};
 
 /// Gate-2 cosine floor: min per-`(chunk, slot)` cosine between fp32 CoreML and
 /// fp32 dia-ort raw embeddings. Starting point 0.9999 (spec §6.2), settled
@@ -103,7 +103,7 @@ fn measure(model: &EmbedModel, label: &str) -> (f64, f64, usize) {
 
 /// GATE 2 — fp32 CoreML (`wespeaker.mlmodelc`) vs fp32 dia-ort.
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS) + committed goldens"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS) + committed goldens"]
 fn embedding_parity_fp32_vs_dia_ort() {
   let model = EmbedModel::from_file_with(
     common::embed_fp32_path(),

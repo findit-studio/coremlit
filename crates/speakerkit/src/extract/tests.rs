@@ -507,8 +507,8 @@ fn into_offline_input_round_trips_against_real_dia() {
 }
 
 // =====================================================================
-// Model-gated (all #[ignore]): requires local dia-coreml models
-// (DIA_COREML_TEST_MODELS or Models/dia-coreml/) plus the cross-crate
+// Model-gated (all #[ignore]): requires local speakerkit models
+// (SPEAKERKIT_TEST_MODELS or Models/speakerkit/) plus the cross-crate
 // ted_60.wav fixture. Loader/path helpers duplicated in miniature because
 // unit tests under `src/` cannot import the separate `tests/`
 // integration-test crate — same reason as crate::embed::tests and
@@ -516,12 +516,12 @@ fn into_offline_input_round_trips_against_real_dia() {
 // =====================================================================
 
 fn models_dir() -> std::path::PathBuf {
-  std::env::var_os("DIA_COREML_TEST_MODELS").map_or_else(
+  std::env::var_os("SPEAKERKIT_TEST_MODELS").map_or_else(
     || {
       std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("Models")
-        .join("dia-coreml")
+        .join("speakerkit")
     },
     std::path::PathBuf::from,
   )
@@ -566,7 +566,7 @@ fn load_ted_60() -> Vec<f32> {
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn extract_ted30_invariants() {
   let seg = load_seg_model();
   let embed = load_embed_model();
@@ -632,7 +632,7 @@ fn extract_ted30_invariants() {
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn extract_empty_samples_errors() {
   let seg = load_seg_model();
   let embed = load_embed_model();
@@ -647,11 +647,11 @@ fn extract_empty_samples_errors() {
 // rationale, owned.rs:377-378). These reach `extract`'s own
 // defense-in-depth guards, which run BEFORE any inference. Model-gated
 // only because `extract`'s signature requires loaded models; they run
-// under `cargo test -p dia-coreml --features serde -- --ignored`.
+// under `cargo test -p speakerkit --features serde -- --ignored`.
 
 #[cfg(feature = "serde")]
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn extract_serde_bypassed_zero_step_samples_errors() {
   let seg = load_seg_model();
   let embed = load_embed_model();
@@ -664,7 +664,7 @@ fn extract_serde_bypassed_zero_step_samples_errors() {
 
 #[cfg(feature = "serde")]
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn extract_serde_bypassed_step_samples_exceeds_window_errors() {
   let seg = load_seg_model();
   let embed = load_embed_model();
@@ -680,7 +680,7 @@ fn extract_serde_bypassed_step_samples_exceeds_window_errors() {
 
 #[cfg(feature = "serde")]
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn extract_serde_bypassed_onset_out_of_range_errors() {
   let seg = load_seg_model();
   let embed = load_embed_model();
