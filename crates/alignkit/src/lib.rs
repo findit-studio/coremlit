@@ -136,6 +136,7 @@ pub use aligner::{Aligner, AlignerOptions};
 pub use error::{AlignError, AlignerError};
 pub use registry::{
   AlignerKey, AlignmentFallback, AlignmentLookup, AlignmentSet, AlignmentSetBuilder,
+  ParseAlignmentFallbackError,
 };
 
 // `ComputeUnits` is on this crate's own public surface

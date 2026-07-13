@@ -28,6 +28,100 @@ fn fallback_default_is_skip_chunk() {
   assert_eq!(AlignmentFallback::default(), AlignmentFallback::SkipChunk);
 }
 
+// ---------------------------------------------------------------------
+// The enum contract (mirrors `whisperkit::log::LogLevel`): as_str, a Display
+// derived FROM as_str, a TOTAL FromStr, an opaque parse error, snake_case
+// serde, and IsVariant. A fallback policy arrives from a config file or a CLI
+// flag, so it has to survive a round trip through text — which it could not do
+// in either direction before.
+// ---------------------------------------------------------------------
+
+#[test]
+fn fallback_round_trips_through_its_own_text_form() {
+  // THE contract, as one property: for every variant, `as_str` → `from_str` is
+  // the identity. Written as an exhaustive slice rather than a variant-by-
+  // variant assertion so that adding a variant without a `from_str` arm fails
+  // here instead of silently becoming unparseable.
+  for fallback in [AlignmentFallback::SkipChunk, AlignmentFallback::Error] {
+    let text = fallback.as_str();
+    assert_eq!(
+      text.parse::<AlignmentFallback>(),
+      Ok(fallback),
+      "`{text}` must parse back to the variant that produced it"
+    );
+    // Display is DERIVED from as_str (`#[display("{}", self.as_str())]`), so
+    // the two can never drift apart — this pins that they are wired that way.
+    assert_eq!(fallback.to_string(), text);
+  }
+}
+
+#[test]
+fn fallback_from_str_names_the_snake_case_spelling() {
+  // The exact spellings, pinned: they are the serde wire form and the CLI/env
+  // form, so a rename is a breaking change and must be a deliberate one.
+  assert_eq!(
+    "skip_chunk".parse::<AlignmentFallback>(),
+    Ok(AlignmentFallback::SkipChunk)
+  );
+  assert_eq!(
+    "error".parse::<AlignmentFallback>(),
+    Ok(AlignmentFallback::Error)
+  );
+}
+
+#[test]
+fn fallback_from_str_is_total_and_rejects_everything_else() {
+  // Total: every input has an answer, and an unknown one is an Err rather than
+  // a panic or a silent default. A policy that quietly defaulted to SkipChunk
+  // on a typo'd config value is exactly the failure this crate exists not to
+  // have.
+  for unknown in [
+    "",
+    "SkipChunk",
+    "skip-chunk",
+    "Error",
+    "skip_chunk ",
+    "fail",
+  ] {
+    assert!(
+      unknown.parse::<AlignmentFallback>().is_err(),
+      "`{unknown}` must not parse"
+    );
+  }
+}
+
+#[test]
+fn fallback_is_variant_predicates() {
+  assert!(AlignmentFallback::SkipChunk.is_skip_chunk());
+  assert!(!AlignmentFallback::SkipChunk.is_error());
+  assert!(AlignmentFallback::Error.is_error());
+}
+
+#[test]
+fn aligner_key_is_variant_predicates() {
+  assert!(AlignerKey::Lang(Lang::En).is_lang());
+  assert!(!AlignerKey::Lang(Lang::En).is_any());
+  assert!(AlignerKey::Any.is_any());
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn fallback_serde_uses_the_same_snake_case_spelling() {
+  // One spelling across `as_str`, `FromStr` and serde, or the text form is not
+  // a round trip at all — a config file that serializes `skip_chunk` and a CLI
+  // that parses `SkipChunk` is two vocabularies wearing one type.
+  let json = serde_json::to_string(&AlignmentFallback::SkipChunk).unwrap();
+  assert_eq!(json, r#""skip_chunk""#);
+  assert_eq!(
+    json,
+    format!("\"{}\"", AlignmentFallback::SkipChunk.as_str())
+  );
+
+  let back: AlignmentFallback = serde_json::from_str(r#""error""#).unwrap();
+  assert_eq!(back, AlignmentFallback::Error);
+  assert!(serde_json::from_str::<AlignmentFallback>(r#""SkipChunk""#).is_err());
+}
+
 #[test]
 fn empty_set_misses_with_default_fallback() {
   let set = AlignmentSetBuilder::new().build();
