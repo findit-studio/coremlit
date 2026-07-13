@@ -1,22 +1,16 @@
 //! The standard frame-based DER calculation (NIST `md-eval` /
-//! `pyannote.metrics` `DiarizationErrorRate`), shared by the end-to-end
-//! parity suites.
+//! `pyannote.metrics` `DiarizationErrorRate`) — the SINGLE definition, shared
+//! by every end-to-end parity suite (`parity_e2e.rs`, `parity_shipping_der.rs`).
 //!
-//! # Provenance — this is a VERBATIM copy, not a reimplementation
+//! Every DER this repository reports is scored here. Do not reintroduce a
+//! second copy in a suite: two DER implementations that drift produce two
+//! incomparable characterizations, and the pins in `parity_e2e.rs` are only
+//! meaningful because the shipping suite scores with the same code.
 //!
-//! Every item below is copied unchanged from `tests/parity_e2e.rs`, where
-//! this calculation was written and verified: its scoring mask was
-//! independently reimplemented in Python by a reviewer and reproduced to the
-//! exact unit. The six unit tests that pinned it travel WITH it (bottom of
-//! this file) so the copy is proven behaviourally identical every run, not
-//! merely assumed to be.
-//!
-//! It lives in its own module (rather than being duplicated inline in the new
-//! suite) purely so the duplication has a **seam**: `parity_e2e.rs` still
-//! carries its own copy, and cannot be edited here (a concurrent task owns
-//! that file). Once that settles, `parity_e2e.rs` can delete its copy and
-//! `mod der_calc;` instead — a one-line change — leaving a single definition.
-//! Do not fork the two: fix bugs in both, or do the dedupe.
+//! Its scoring mask was independently reimplemented in Python by a reviewer and
+//! reproduced to the exact unit. The unit tests that pin it live at the bottom
+//! of this file, travelling with the calculation, so every test binary that
+//! includes this module re-proves it on each run rather than assuming it.
 //!
 //! # The definition
 //!
@@ -88,6 +82,16 @@ pub struct Der {
   pub err_frames: u64,
   pub num_ref_spk: usize,
   pub num_hyp_spk: usize,
+}
+
+impl Der {
+  /// Total error in raw speaker-frame units — the DER numerator. Zero here is
+  /// the strongest statement the metric can make (not "rounds to 0.0000 %",
+  /// but "not one scored speaker-frame differs"), so it is what the exact
+  /// parity pins assert.
+  pub const fn err_units(&self) -> u64 {
+    self.miss_units + self.fa_units + self.conf_units
+  }
 }
 
 /// Distinct speaker ids appearing in `segs` with any positive duration.
@@ -391,14 +395,16 @@ pub fn fmt_der(tag: &str, d: &Der) -> String {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// Unit tests for the DER calc itself — copied verbatim WITH the calc, so the
-// copy is proven behaviourally identical to `parity_e2e.rs`'s original every
-// run rather than assumed to be. No models needed; these run in the ordinary
-// `--features dia` suite.
+// Unit tests for the DER calc itself — they travel WITH the calculation, so
+// every test binary that includes this module re-proves it. No models and no
+// fixtures needed: these run in the ordinary (non-`--ignored`) `--features
+// dia` suite, in BOTH `parity_e2e` and `parity_shipping_der`.
 // ══════════════════════════════════════════════════════════════════════
 
+/// Float compare for the DER unit tests. `pub` because the suites including
+/// this module assert on the same quantities with the same tolerance.
 #[cfg(test)]
-fn approx(a: f64, b: f64) -> bool {
+pub fn approx(a: f64, b: f64) -> bool {
   (a - b).abs() < 1e-9
 }
 
@@ -433,7 +439,7 @@ fn der_identical_is_zero() {
   ];
   let d = der_strict(&reference, &hypothesis);
   assert!(approx(d.der, 0.0), "identical ⇒ DER 0, got {}", d.der);
-  assert_eq!(d.miss_units + d.fa_units + d.conf_units, 0);
+  assert_eq!(d.err_units(), 0);
 }
 
 /// Empty hypothesis over speech ⇒ 100 % miss.
