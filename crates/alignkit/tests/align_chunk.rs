@@ -6,49 +6,43 @@
 //!
 //! This is Gate-1 (word-timing) PLUMBING, not the parity gate: it asserts
 //! alignkit's OWN output is well-formed, NOT that it agrees with asry-ort
-//! (that oracle comparison is Task B5). Self-skips when
-//! `ALIGNKIT_TEST_MODELS` / the fixture are absent, matching the workspace
-//! `-- --ignored` convention.
+//! (that oracle comparison is Task B5).
+//!
+//! # This test does not skip
+//!
+//! `#[ignore]` is the opt-in gate, and it is the ONLY gate. A missing model or
+//! a missing fixture is a hard FAILURE, never an early `return`. It used to
+//! self-skip on both, which made it a fake gate: pointing
+//! `ALIGNKIT_TEST_MODELS` at an empty directory reported `test result: ok. 1
+//! passed` — green, having aligned nothing. The live exposure was the fixture,
+//! reached by a cross-crate relative path into whisperkit
+//! (`tests/common/mod.rs`): had that file ever moved, B4's only end-to-end
+//! proof would have evaporated silently while the gate stayed green. A skip
+//! that looks like a pass in the test summary is worse than no test.
 
 mod common;
 
 use core::sync::atomic::AtomicBool;
 
 use alignkit::{
-  ANALYSIS_TIMEBASE, Aligner, AlignerOptions, ComputeUnits, EnglishNormalizer, Lang, OutputClock,
-  default_oov_decisions,
+  ANALYSIS_TIMEBASE, Aligner, EnglishNormalizer, Lang, OutputClock, default_oov_decisions,
 };
 
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
 fn align_chunk_produces_monotonic_word_timings() {
   let model = common::model_path();
-  if !model.exists() {
-    eprintln!("SKIP: model not found at {model:?} (set ALIGNKIT_TEST_MODELS)");
-    return;
-  }
-  let wav = common::jfk_wav_path();
-  if !wav.exists() {
-    eprintln!("SKIP: jfk.wav fixture not found at {wav:?}");
-    return;
-  }
-
-  let samples = common::load_wav_mono_f32(&wav);
+  let samples = common::load_wav_mono_f32(&common::jfk_wav_path());
   assert!(!samples.is_empty(), "fixture decoded to no samples");
 
-  // `ComputeUnits::CpuOnly`, matching this crate's model-gated convention
-  // (`src/encode/tests.rs`, `tests/model_io.rs`): deterministic, and it skips
-  // the one-time multi-minute CoreML ANE compilation an `All` load of this
-  // model's fixed 960,000-sample input pays. `ComputeUnits::All` remains the
-  // default placement — and is the one B5's word-timing parity gate must
-  // measure, per the plan's compute-unit rule.
-  let aligner = Aligner::from_paths_with(
-    Lang::En,
-    &model,
-    Box::new(EnglishNormalizer::new()),
-    AlignerOptions::new().with_compute(ComputeUnits::CpuOnly),
-  )
-  .expect("build the En aligner from the CoreML model + bundled tokenizer");
+  // `Aligner::from_paths` → `AlignerOptions::new()` → `DEFAULT_ENCODER_COMPUTE`.
+  // Deliberately NOT a hardcoded compute placement: this is the crate's only
+  // end-to-end proof, so it must run the configuration that actually ships. A
+  // gate pinned to a compute unit proves only that compute unit.
+  let aligner = Aligner::from_paths(Lang::En, &model, Box::new(EnglishNormalizer::new())).expect(
+    "build the En aligner from the CoreML model + bundled tokenizer (set ALIGNKIT_TEST_MODELS \
+     to the model directory)",
+  );
 
   let text = common::JFK_TRANSCRIPT;
   let events = aligner.detect_oov(text).expect("detect_oov");

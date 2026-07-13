@@ -195,8 +195,12 @@ fn check_emissions_contract_rejects_wrong_dtype() {
 // ---------------------------------------------------------------------
 
 #[test]
-fn options_new_defaults_to_all_compute() {
-  assert_eq!(EncoderOptions::new().compute(), ComputeUnits::All);
+fn options_new_defaults_to_cpu_only_compute() {
+  // Not a perf preference: the ANE placements corrupt this model's emissions.
+  // See `DEFAULT_ENCODER_COMPUTE` and
+  // `emissions_have_no_fp16_log_zero_sentinel`.
+  assert_eq!(EncoderOptions::new().compute(), DEFAULT_ENCODER_COMPUTE);
+  assert_eq!(EncoderOptions::new().compute(), ComputeUnits::CpuOnly);
 }
 
 #[test]
@@ -206,8 +210,10 @@ fn options_default_matches_new() {
 
 #[test]
 fn options_with_compute_overrides() {
-  let options = EncoderOptions::new().with_compute(ComputeUnits::CpuOnly);
-  assert_eq!(options.compute(), ComputeUnits::CpuOnly);
+  // A NON-default placement, or this would also pass against a `with_compute`
+  // that silently ignored its argument.
+  let options = EncoderOptions::new().with_compute(ComputeUnits::CpuAndGpu);
+  assert_eq!(options.compute(), ComputeUnits::CpuAndGpu);
 }
 
 #[test]
@@ -219,18 +225,21 @@ fn options_set_compute_in_place() {
 
 #[cfg(feature = "serde")]
 #[test]
-fn options_serde_missing_compute_defaults_to_all() {
+fn options_serde_missing_compute_defaults_to_cpu_only() {
   let options: EncoderOptions = serde_json::from_str("{}").unwrap();
-  assert_eq!(options.compute(), ComputeUnits::All);
+  assert_eq!(options.compute(), DEFAULT_ENCODER_COMPUTE);
+  assert_eq!(options.compute(), ComputeUnits::CpuOnly);
 }
 
 #[cfg(feature = "serde")]
 #[test]
 fn options_serde_round_trips_explicit_compute() {
-  let options: EncoderOptions = serde_json::from_str(r#"{"compute":"cpu_only"}"#).unwrap();
-  assert_eq!(options.compute(), ComputeUnits::CpuOnly);
+  // Round-trip a non-default placement: deserializing `cpu_only` would now be
+  // indistinguishable from the field defaulting.
+  let options: EncoderOptions = serde_json::from_str(r#"{"compute":"cpu_and_gpu"}"#).unwrap();
+  assert_eq!(options.compute(), ComputeUnits::CpuAndGpu);
   let json = serde_json::to_string(&options).unwrap();
-  assert!(json.contains("cpu_only"), "round-tripped json: {json}");
+  assert!(json.contains("cpu_and_gpu"), "round-tripped json: {json}");
 }
 
 // ---------------------------------------------------------------------
@@ -240,10 +249,16 @@ fn options_serde_round_trips_explicit_compute() {
 // Duplicated here in miniature because unit tests under `src/` cannot
 // import the separate `tests/` integration-test crate (mirrors
 // dia-coreml::segment::tests's identical duplication and rationale).
-// Real-audio, cross-tool parity testing against asry's ONNX path lives
-// in `tests/parity_emissions.rs` (Gate 1), not here — these tests use
-// only synthetic signals, matching dia-coreml's own src/-level
-// convention.
+//
+// These load the encoder on DEFAULT_ENCODER_COMPUTE — never a hardcoded
+// placement — so they validate the SHIPPING configuration for free. A gate
+// pinned to a compute unit proves only that compute unit; pinning CpuOnly
+// here is exactly how the `All`-path emission corruption survived review.
+//
+// Mostly synthetic signals, but not exclusively: the fp16 `log(0)` sentinel
+// only appears on inputs whose probabilities fall under the fp16 floor, which
+// silence and a low-amplitude sine never do — see
+// `emissions_have_no_fp16_log_zero_sentinel`, which needs real speech.
 // ---------------------------------------------------------------------
 
 fn models_dir() -> std::path::PathBuf {
@@ -262,16 +277,13 @@ fn encoder_path() -> std::path::PathBuf {
   models_dir().join("base960h_aligner.mlmodelc")
 }
 
-/// Loads the real encoder model with `ComputeUnits::CpuOnly` — matching
-/// `tests/model_io.rs`'s introspection convention: deterministic, no ANE
-/// compile-latency variance across runs. [`DEFAULT_ENCODER_COMPUTE`]
-/// (`ComputeUnits::All`) stays the production default.
+/// Loads the real encoder model on [`DEFAULT_ENCODER_COMPUTE`] — the shipping
+/// placement, via the same `EncoderOptions::new()` door production code takes.
+/// Deliberately NOT a hardcoded `ComputeUnits::_`: every model-gated test
+/// below is then a test OF the default.
 fn load_encoder() -> Encoder {
-  Encoder::from_file_with(
-    encoder_path(),
-    EncoderOptions::new().with_compute(ComputeUnits::CpuOnly),
-  )
-  .expect("load base960h_aligner.mlmodelc")
+  Encoder::from_file(encoder_path())
+    .expect("load base960h_aligner.mlmodelc (set ALIGNKIT_TEST_MODELS to the model directory)")
 }
 
 #[test]
@@ -308,10 +320,10 @@ fn emissions_on_full_window_produces_correctly_shaped_finite_log_probs() {
   let raw = encoder
     .emissions_raw(&samples, samples.len())
     .expect("emissions on silence");
-  assert_eq!(raw.frames(), encoder.frames());
-  assert_eq!(raw.vocab(), crate::vocab::VOCAB_SIZE);
+  assert_eq!(raw.frames, encoder.frames());
+  assert_eq!(raw.data.len(), raw.frames * crate::vocab::VOCAB_SIZE);
   assert!(
-    raw.data().iter().all(|v| v.is_finite()),
+    raw.data.iter().all(|v| v.is_finite()),
     "all log-probs finite"
   );
   // Log-probabilities are bounded above by log(1) == 0. This is also the
@@ -319,9 +331,81 @@ fn emissions_on_full_window_produces_correctly_shaped_finite_log_probs() {
   // canary that `Encoder::emissions` (the wrapped door) will not trip the
   // value-domain scan on this input.
   assert!(
-    raw.data().iter().all(|&v| v <= 0.0),
+    raw.data.iter().all(|&v| v <= 0.0),
     "log-probs must satisfy log(p) <= 0"
   );
+}
+
+/// **THE C1 REGRESSION ORACLE.** No emission cell may be an fp16 `log(0)`
+/// saturation sentinel.
+///
+/// `base960h_aligner.mlmodelc` ends in an fp16 `softmax` followed by an fp16
+/// `log` whose `epsilon = 0x1p-149` guard is far below fp16's smallest
+/// subnormal and therefore inert (see [`DEFAULT_ENCODER_COMPUTE`]). On an ANE
+/// placement every softmax output under the fp16 floor underflows to 0 and
+/// `log(0)` saturates to ≈ `-45440`, silently replacing ordinary log-probs of
+/// `-19.0` … `-21.75` and shifting real word timings by hundreds of ms.
+///
+/// The encoder is built from [`DEFAULT_ENCODER_COMPUTE`] — NEVER a hardcoded
+/// placement — so this is a test of the shipping default. Flipping that
+/// constant to `ComputeUnits::All` makes it fail (measured `min = -45440`,
+/// 2,667 of 15,950 cells past the threshold); on `CpuOnly` it passes
+/// (`min = -30.81`).
+///
+/// It must run on REAL SPEECH. This bug is invisible to synthetic input:
+/// measured on the same model, 960,000 samples of silence bottom out at
+/// `min = -8.55` and a low-amplitude sine at `-9.07` — both far ABOVE the fp16
+/// floor (`log(2⁻²⁴) ≈ -16.6`), so nothing underflows and an `All` run of
+/// either passes clean. Only real speech drives per-class probabilities down to
+/// `e^-30.8 ≈ 4e-14`, deep under the floor. Hence the cross-crate `jfk.wav`
+/// borrow.
+///
+/// The `-100.0` threshold is not a tolerance to be relaxed: it separates two
+/// populations three orders of magnitude apart (worst legitimate log-prob
+/// measured anywhere on this model ≈ `-30.8`; the sentinel ≈ `-45440`).
+/// Anything in between is already a broken emission matrix.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn emissions_have_no_fp16_log_zero_sentinel() {
+  const FLOOR: f32 = -100.0;
+
+  let encoder = load_encoder();
+  let samples = load_jfk_wav();
+  let raw = encoder
+    .emissions_raw(&samples, samples.len())
+    .expect("emissions on jfk.wav");
+
+  let min = raw.data.iter().copied().fold(f32::INFINITY, f32::min);
+  let sentinels = raw.data.iter().filter(|v| **v < FLOOR).count();
+  assert_eq!(
+    sentinels,
+    0,
+    "{sentinels} of {} emission cells are below {FLOOR} (min = {min}) — the fp16 `log(0)` \
+     sentinel. The encoder is on {:?}; an ANE placement corrupts this model's emissions and \
+     cannot be used. See DEFAULT_ENCODER_COMPUTE.",
+    raw.data.len(),
+    DEFAULT_ENCODER_COMPUTE,
+  );
+}
+
+/// Decodes the 11 s `jfk.wav` fixture (16 kHz mono int16) to f32 samples.
+///
+/// Borrowed from the whisperkit crate by relative path rather than committing
+/// a second copy — the same borrow `tests/common/mod.rs` makes, and it FAILS
+/// LOUDLY (never skips) if that path ever moves.
+fn load_jfk_wav() -> Vec<f32> {
+  let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    .join("../whisperkit/tests/fixtures/audio/jfk.wav");
+  let mut reader = hound::WavReader::open(&path)
+    .unwrap_or_else(|e| panic!("open the jfk.wav fixture at {path:?}: {e}"));
+  let spec = reader.spec();
+  assert_eq!(spec.channels, 1, "fixture must be mono");
+  assert_eq!(spec.sample_rate, 16_000, "fixture must be 16 kHz");
+  assert_eq!(spec.sample_format, hound::SampleFormat::Int);
+  reader
+    .samples::<i16>()
+    .map(|s| f32::from(s.expect("valid sample")) / 32_768.0)
+    .collect()
 }
 
 #[test]
@@ -351,13 +435,9 @@ fn emissions_on_short_input_truncates_to_hermetic_formula() {
   let raw = encoder
     .emissions_raw(&samples, samples.len())
     .expect("emissions on short input");
-  assert_eq!(
-    raw.frames(),
-    truncated_frame_count(48_000, encoder.frames())
-  );
-  assert_eq!(raw.frames(), 150);
-  assert_eq!(raw.vocab(), crate::vocab::VOCAB_SIZE);
-  assert_eq!(raw.data().len(), 150 * crate::vocab::VOCAB_SIZE);
+  assert_eq!(raw.frames, truncated_frame_count(48_000, encoder.frames()));
+  assert_eq!(raw.frames, 150);
+  assert_eq!(raw.data.len(), 150 * crate::vocab::VOCAB_SIZE);
 }
 
 #[test]
@@ -375,11 +455,9 @@ fn emissions_is_deterministic_across_repeated_calls() {
   let second = encoder
     .emissions_raw(&samples, samples.len())
     .expect("second emissions call");
-  assert_eq!(first.frames(), second.frames());
-  assert_eq!(first.vocab(), second.vocab());
+  assert_eq!(first.frames, second.frames);
   assert_eq!(
-    first.data(),
-    second.data(),
+    first.data, second.data,
     "repeated emissions_raw() must be bit-identical"
   );
 }

@@ -31,10 +31,30 @@ use crate::{
   error::{AlignError, AlignerError},
 };
 
-/// Default frame stride in 16 kHz samples: `320` (= 20 ms) — the
-/// wav2vec2-base convention and [`crate::encode::HOP_SAMPLES`].
-pub const DEFAULT_HOP_SAMPLES: NonZeroU32 = match NonZeroU32::new(crate::encode::HOP_SAMPLES as u32)
-{
+/// The frame stride handed to asry's seam, in 16 kHz samples — the SAME
+/// number [`Encoder`]'s truncation formula divides by, re-typed as the
+/// [`NonZeroU32`] the seam builder wants.
+///
+/// Derived from [`crate::encode::HOP_SAMPLES`] rather than re-spelled as
+/// `320`, so the stride that TRUNCATES the emissions and the stride that
+/// TIMES the words are one constant and cannot drift apart. It is private and
+/// there is no option to override it: this crate wraps exactly one model,
+/// whose stride is fixed at 320 by its graph, so no other value is ever
+/// correct.
+///
+/// This was a caller-settable `AlignerOptions::hop_samples` knob, which was a
+/// latent corruption: it reached only the seam (the timing half), never the
+/// encoder (`truncated_frame_count` divides by the hardcoded
+/// [`crate::encode::HOP_SAMPLES`]). asry's own `validate_stride_extent` slack
+/// is `chunk_extent ± 2·hop`, far too loose to catch the skew — measured on
+/// `jfk.wav`, a hop of 319, 320 or 321 all returned `Ok` with 22 words and no
+/// error, so a caller setting 319 got words timed at the wrong stride,
+/// silently. asry can afford the knob because its `T` comes from the ONNX
+/// model's own output shape, making `hop_samples` the single place stride is
+/// declared there; alignkit computes `T` itself, so a second declaration is a
+/// second source of truth. Pinned by
+/// `tests::seam_stride_is_the_encoder_stride`.
+const SEAM_HOP_SAMPLES: NonZeroU32 = match NonZeroU32::new(crate::encode::HOP_SAMPLES as u32) {
   Some(v) => v,
   None => unreachable!(),
 };
@@ -48,10 +68,6 @@ pub const DEFAULT_MIN_SPEECH_COVERAGE: f32 = SpeechCoverage::DEFAULT.get();
 pub const DEFAULT_MAX_INTRA_SILENT_RUN: Duration = asry::emissions::DEFAULT_MAX_INTRA_SILENT_RUN;
 
 #[cfg(feature = "serde")]
-fn default_hop_samples() -> NonZeroU32 {
-  DEFAULT_HOP_SAMPLES
-}
-#[cfg(feature = "serde")]
 fn default_min_speech_coverage() -> f32 {
   DEFAULT_MIN_SPEECH_COVERAGE
 }
@@ -64,10 +80,17 @@ fn default_compute() -> ComputeUnits {
   DEFAULT_ENCODER_COMPUTE
 }
 
-/// Construction options for [`Aligner`] (rust-options-pattern): the three
-/// knobs asry's [`EmissionsAligner`]
-/// builder exposes, plus the CoreML compute placement handed to the
+/// Construction options for [`Aligner`] (rust-options-pattern): the two seam
+/// knobs asry's [`EmissionsAligner`] builder exposes that have a meaningful
+/// range for this model, plus the CoreML compute placement handed to the
 /// [`Encoder`].
+///
+/// Deliberately NOT here: `hop_samples`. The seam builder accepts one, but
+/// this crate wraps a single model whose stride is fixed at 320 by its graph
+/// ([`crate::encode::HOP_SAMPLES`]), and the encoder's own truncation divides
+/// by that same constant without consulting any option — so a caller-set
+/// stride would apply to only half the pipeline and skew every word. The seam
+/// is wired from that one constant instead (`SEAM_HOP_SAMPLES`, private).
 ///
 /// These are **construction-time**: they are fed to the builder / model load
 /// once and baked in, so there are no post-construction setters on
@@ -77,8 +100,6 @@ fn default_compute() -> ComputeUnits {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct AlignerOptions {
-  #[cfg_attr(feature = "serde", serde(default = "default_hop_samples"))]
-  hop_samples: NonZeroU32,
   #[cfg_attr(feature = "serde", serde(default = "default_min_speech_coverage"))]
   min_speech_coverage: f32,
   #[cfg_attr(feature = "serde", serde(default = "default_max_intra_silent_run"))]
@@ -97,33 +118,15 @@ impl Default for AlignerOptions {
 }
 
 impl AlignerOptions {
-  /// Options matching the crate defaults: [`DEFAULT_HOP_SAMPLES`],
-  /// [`DEFAULT_MIN_SPEECH_COVERAGE`], [`DEFAULT_MAX_INTRA_SILENT_RUN`].
+  /// Options matching the crate defaults: [`DEFAULT_MIN_SPEECH_COVERAGE`],
+  /// [`DEFAULT_MAX_INTRA_SILENT_RUN`], [`DEFAULT_ENCODER_COMPUTE`].
   #[must_use]
   pub const fn new() -> Self {
     Self {
-      hop_samples: DEFAULT_HOP_SAMPLES,
       min_speech_coverage: DEFAULT_MIN_SPEECH_COVERAGE,
       max_intra_silent_run: DEFAULT_MAX_INTRA_SILENT_RUN,
       compute: DEFAULT_ENCODER_COMPUTE,
     }
-  }
-
-  /// Frame stride in 16 kHz samples (the encoder model's stride).
-  #[must_use]
-  pub const fn hop_samples(&self) -> NonZeroU32 {
-    self.hop_samples
-  }
-  /// Builder form of [`Self::set_hop_samples`].
-  #[must_use]
-  pub const fn with_hop_samples(mut self, hop: NonZeroU32) -> Self {
-    self.set_hop_samples(hop);
-    self
-  }
-  /// Sets [`Self::hop_samples`] in place.
-  pub const fn set_hop_samples(&mut self, hop: NonZeroU32) -> &mut Self {
-    self.hop_samples = hop;
-    self
   }
 
   /// Minimum speech coverage a word must clear to survive.
@@ -166,14 +169,15 @@ impl AlignerOptions {
   }
 
   /// Which hardware CoreML may schedule the encoder on. Defaults to
-  /// [`DEFAULT_ENCODER_COMPUTE`] (`ComputeUnits::All`) — the production
-  /// placement, and the one a word-timing parity gate must measure.
+  /// [`DEFAULT_ENCODER_COMPUTE`] (`ComputeUnits::CpuOnly`).
   ///
-  /// `ComputeUnits::CpuOnly` trades that for determinism and a fast, cache-
-  /// independent load: an `All` load pays a one-time multi-minute CoreML ANE
-  /// compilation for this model's fixed 960,000-sample input, which is why
-  /// this crate's own model-gated tests pin `CpuOnly` (the same convention
-  /// `crate::encode`'s tests and `tests/model_io.rs` already follow).
+  /// **Overriding this to an ANE placement (`ComputeUnits::All` or
+  /// `CpuAndNeuralEngine`) silently corrupts the emissions** — the model's
+  /// fp16 `log(softmax(·))` tail underflows to a `-45440` sentinel on 16.7% of
+  /// cells and shifts real word timings by hundreds of milliseconds. That is a
+  /// property of the model artifact, not of this crate. Read
+  /// [`DEFAULT_ENCODER_COMPUTE`]'s doc before changing this; `CpuOnly` is also
+  /// the fastest correct placement, so there is nothing to buy.
   #[must_use]
   pub const fn compute(&self) -> ComputeUnits {
     self.compute
@@ -193,11 +197,12 @@ impl AlignerOptions {
 
 /// Build asry's [`EmissionsAligner`] the
 /// way [`Aligner::from_paths_with`] does: bundled 29-class chordai
-/// tokenizer, the MANDATORY explicit blank id, and `options` fed to the
-/// builder.
+/// tokenizer, the MANDATORY explicit blank id, the model's fixed stride, and
+/// `options` fed to the builder.
 ///
 /// Factored out of [`Aligner::from_paths_with`] so the wiring — above all
-/// the blank-id override — is unit-testable without a CoreML model.
+/// the blank-id override and the stride — is unit-testable without a CoreML
+/// model.
 fn build_seam(
   language: Lang,
   normalizer: DynTextNormalizer,
@@ -205,7 +210,11 @@ fn build_seam(
 ) -> Result<EmissionsAligner, EmissionsError> {
   EmissionsAligner::builder(language, crate::vocab::tokenizer_json_bytes())
     .normalizer(normalizer)
-    .hop_samples(options.hop_samples())
+    // NOT an option (see `SEAM_HOP_SAMPLES`): the stride that times the words
+    // here must be the stride that truncates the emissions in
+    // `Encoder::emissions`, and asry's `chunk_extent ± 2·hop` validator is too
+    // loose to catch them disagreeing.
+    .hop_samples(SEAM_HOP_SAMPLES)
     .min_speech_coverage(SpeechCoverage::clamped(options.min_speech_coverage()))
     .max_intra_silent_run(options.max_intra_silent_run())
     // MANDATORY (DECISION 5): the chordai vocab's blank is `"-"`@0 and there

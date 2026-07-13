@@ -61,12 +61,13 @@
 
 mod common;
 
-use coremlit::{ComputeUnits, DataType, Features, Model, MultiArray};
+use alignkit::encode::DEFAULT_ENCODER_COMPUTE;
+use coremlit::{DataType, Features, Model, MultiArray};
 
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
 fn base960h_aligner_io_matches_spec() {
-  let model = Model::load(common::model_path(), ComputeUnits::CpuOnly).unwrap();
+  let model = Model::load(common::model_path(), DEFAULT_ENCODER_COMPUTE).unwrap();
   let description = model.description();
 
   // DECISION: this is the Task B1 encoder target — see the module doc.
@@ -174,19 +175,35 @@ fn run_emissions(model: &Model, waveform: &[f32]) -> Vec<f32> {
 /// it wires `asry::LogProbsTV` directly from the raw `emissions` tensor.
 /// (Had the verdict instead been raw logits, the consequence would have
 /// been the opposite: apply asry's `log_softmax_with_finite_guard` first.)
+///
+/// SUPERSEDED AS EVIDENCE, retained as a check: the model's `.mil` graph
+/// settles the question directly — its final ops are `softmax` → `log` →
+/// `cast(fp32)` (quoted in `alignkit::encode`'s module doc). The verdict below
+/// is inferred from measured values; the graph states it. The two agree.
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
 fn emissions_are_log_probs_not_raw_logits() {
   const TOLERANCE: f64 = 1e-2;
-  let model = Model::load(common::model_path(), ComputeUnits::CpuOnly).unwrap();
+  let model = Model::load(common::model_path(), DEFAULT_ENCODER_COMPUTE).unwrap();
 
   let waveform = common::load_wav_mono_f32(&common::ted_60_wav_path());
   let emissions = run_emissions(&model, &waveform);
   assert_logsumexp_near_zero(&emissions, TOLERANCE, "real audio (ted_60.wav)");
 
-  // Corroborating signal: a log-probability can never exceed ln(1) = 0;
-  // raw logits have no such ceiling. Slack of 1e-3 (10x tighter than the
-  // logsumexp tolerance above) covers fp16 rounding right at the ceiling.
+  // Corroborating signal: a log-probability can never exceed ln(1) = 0; raw
+  // logits have no such ceiling.
+  //
+  // The `1e-3` slack is VESTIGIAL, not a live tension. The graph applies `log`
+  // to a `softmax` output, which is in [0, 1] by construction, so `<= 0` is
+  // guaranteed — and the measured max is exactly `0.0` on all four compute
+  // placements, not merely close to it. The slack is kept only so this assert
+  // reads as a ceiling check rather than an exact-equality trap; do not mistake
+  // it for evidence that the model can emit slightly-positive log-probs.
+  //
+  // Do NOT "fix" a future positive max by clamping in `Encoder::emissions`: a
+  // positive max is the signal that the model has been swapped for a
+  // raw-logit CTC head, which `Emissions::from_log_probs` must be allowed to
+  // reject loudly. See `alignkit::encode`'s module doc.
   let max_value = emissions.iter().copied().fold(f32::NEG_INFINITY, f32::max);
   assert!(
     max_value <= 1e-3,

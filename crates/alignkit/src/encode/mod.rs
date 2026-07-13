@@ -22,9 +22,9 @@
 //!   rejects rather than pads short input
 //!   (`crates/dia-coreml/src/segment/mod.rs`'s "dia contract match"
 //!   section). wav2vec2 is not causal, so whether padding perturbs
-//!   in-range emissions is an open empirical question, not an assumption —
-//!   exactly what Gate 1 (`tests/parity_emissions.rs`) exists to measure,
-//!   per design spec §3's Candidate A note.
+//!   in-range emissions remains an open empirical question, not an
+//!   assumption — it is for the B5 word-timing parity gate to measure, per
+//!   design spec §3's Candidate A note.
 //! - **`emissions` frames past the real (non-padded) audio**: truncated
 //!   away — see [`Encoder::emissions`]'s doc for the exact formula and why
 //!   it must be clamped to the model's actual frame count.
@@ -47,33 +47,48 @@
 //! §7's data flow already assumes per-chunk audio, not a whole-file
 //! stream).
 //!
-//! # No re-softmax
+//! # The log-prob door: `from_log_probs`, not `from_logits`
 //!
 //! [`Encoder::emissions`] wraps the raw `emissions` tensor into an
-//! [`Emissions`] through [`Emissions::from_log_probs`] — the log-prob
-//! door — with **no softmax or log-softmax applied**. This is not an
-//! oversight: `tests/model_io.rs`'s `emissions_are_log_probs_not_raw_logits`
-//! (Task B1's pinned graph-truth test) empirically confirmed the model's
-//! `emissions` output is *already* log-softmaxed (per-frame `logsumexp` ≈ 0
-//! within `1e-2`, and every value bounded by the `log(p) <= 0` ceiling that
-//! only a genuine log-probability tensor can hit) — routing it through
-//! [`Emissions::from_logits`] instead (asry's raw-logit door, which applies
-//! `log_softmax_with_finite_guard`) would double-normalize and silently
-//! corrupt every downstream trellis/beam score. Contrast asry's own ONNX
-//! encoder (`asry/src/runner/aligner/algorithm/encode.rs`), which DOES emit
-//! raw logits and so takes the `from_logits` door — that model emits
-//! logits, this one does not; the two encoders are not interchangeable
-//! drop-ins at the "what does the raw tensor mean" level, only at the "both
-//! eventually produce an [`Emissions`]" level.
+//! [`Emissions`] through [`Emissions::from_log_probs`] — the log-prob door —
+//! with **no softmax or log-softmax applied**. The model's own graph already
+//! ends in one (`Models/alignkit/base960h_aligner.mlmodelc/model.mil`, final
+//! ops — this is graph truth, not an inference from measured values):
 //!
-//! Because `from_log_probs` runs asry's `O(T·V)` value-domain scan (every
-//! element finite ∧ `<= 0`), a model that ever emitted a non-finite or
-//! positive value would surface as [`AlignError::Alignment`] (an
-//! `asry::emissions::EmissionsError`) rather than the infallible construction
-//! this crate could assume against the pre-seam `LogProbsTV::new`. On the
-//! pinned model that scan is a no-op (values measured in `[-28.4, 0.0]`);
-//! [`Encoder::emissions_raw`] exposes the pre-wrap tensor for callers that
-//! need to report on it directly.
+//! ```text
+//! linear_73_cast_fp16       = linear(...)                          // CTC head → logits
+//! var_849_softmax_cast_fp16 = softmax(axis = -1, x = linear_73_cast_fp16)
+//! var_849_cast_fp16         = log(epsilon = 0x1p-149, x = var_849_softmax_cast_fp16)
+//! emissions                 = cast(dtype = fp32, x = var_849_cast_fp16)
+//! ```
+//!
+//! The reason to prefer this door is NOT that re-applying a log-softmax
+//! would corrupt the values. It would not: **log-softmax is exactly
+//! idempotent.** For `y = log_softmax(x)`, `lse(y) = ln Σ exp(x_j − lse(x)) =
+//! ln 1 = 0`, so `log_softmax(y) = y`. Routing genuine log-probs through
+//! [`Emissions::from_logits`] (asry's raw-logit door, which applies
+//! `log_softmax_with_finite_guard`) would be a numerical no-op.
+//!
+//! The real reason is that `from_log_probs` doubles as a **contract check on
+//! the model artifact**. Its `O(T·V)` value-domain scan (every element finite
+//! ∧ `<= 0`) is an assertion that the tensor really is log-probs. Should a
+//! future model revision ship a raw-logit CTC head — entirely plausible,
+//! since that is the *standard* wav2vec2 export, and asry's own ONNX model
+//! does exactly that (`asry/src/runner/aligner/algorithm/encode.rs` takes the
+//! `from_logits` door) — the scan sees positive maxima and fails **loudly**
+//! with [`AlignError::Alignment`] (`EmissionsError::Value`). `from_logits`
+//! would instead **silently re-normalize** the garbage into a plausible
+//! log-prob domain and align on it forever. That is precisely the bug class
+//! this seam exists to kill: the scan is the guard, so the door that runs it
+//! is the door to take.
+//!
+//! For the same reason the raw tensor is passed through **unclamped**. The
+//! graph's `softmax` output is in `[0, 1]` by construction, so its `log` is
+//! `<= 0` *guaranteed by the graph* (measured max is exactly `0.0` on every
+//! compute placement). An unbounded `.min(0.0)` would be actively dangerous —
+//! it is exactly what would mask a raw-logit model from the scan above. If a
+//! clamp is ever needed here, it must be **bounded** to a pinned slack, never
+//! open-ended.
 
 use core::num::NonZeroUsize;
 use std::{borrow::Cow, path::Path};
@@ -115,14 +130,58 @@ mod names {
   pub const EMISSIONS: &str = "emissions";
 }
 
-/// Default [`EncoderOptions::compute`]. `ComputeUnits::All` lets CoreML
-/// schedule across ANE/GPU/CPU, mirroring `dia-coreml`'s
-/// `DEFAULT_SEGMENT_COMPUTE` (`crates/dia-coreml/src/segment/mod.rs`).
-/// Model-gated tests in this module instead load with
-/// `ComputeUnits::CpuOnly` for determinism (no ANE compile-latency
-/// variance across runs), matching `tests/model_io.rs`'s introspection
-/// convention — production code keeps this default.
-pub const DEFAULT_ENCODER_COMPUTE: ComputeUnits = ComputeUnits::All;
+/// Default [`EncoderOptions::compute`].
+///
+/// **`CpuOnly` is a correctness requirement of this model, not a performance
+/// preference.** Do NOT "optimise" it back to `ComputeUnits::All`: on the ANE
+/// this model produces a corrupted emission matrix.
+///
+/// # Why
+///
+/// `base960h_aligner.mlmodelc` does not end in a fused, numerically-stable
+/// `log_softmax`. Its graph decomposes the CTC tail into an fp16 `softmax`
+/// followed by a separate fp16 `log`
+/// (`Models/alignkit/base960h_aligner.mlmodelc/model.mil`, final ops):
+///
+/// ```text
+/// var_849_softmax_cast_fp16 = softmax(axis = -1, x = linear_73_cast_fp16)
+/// var_849_cast_fp16         = log(epsilon = 0x1p-149, x = var_849_softmax_cast_fp16)
+/// ```
+///
+/// That `log`'s anti-`log(0)` guard is `epsilon = 0x1p-149` (2⁻¹⁴⁹) — far
+/// below fp16's smallest subnormal (2⁻²⁴ ≈ `5.96e-8`) — so inside an fp16
+/// `log` it rounds to zero and the guard is **inert**. On the ANE any softmax
+/// output beneath the fp16 floor therefore underflows to 0, and `log(0)`
+/// saturates to ≈ `-45440`: a sentinel standing where an ordinary log-prob
+/// (`-19.0` … `-21.75`) belongs.
+///
+/// Measured on `jfk.wav` (550 frames × 29 = 15,950 cells). `load` is a cold
+/// first load — the ANE compilation is cached afterwards, so a warm `All`
+/// load is fast and hides nothing:
+///
+/// | compute | load (cold) | predict | `min(emissions)` | sentinel cells |
+/// |---|---|---|---|---|
+/// | `CpuOnly` | 0.68 s | **0.74 s** | **-30.81** | **0** |
+/// | `All` | 308 s | 2.15 s | `-45440` | 2,667 (16.7%) |
+/// | `CpuAndNeuralEngine` | 508 s | 2.32 s | `-45440` | 2,667 (16.7%) |
+/// | `CpuAndGpu` | 0.37 s | 3.55 s | -30.02 | 0 |
+///
+/// The corruption is bit-identical run to run — systematic, not
+/// nondeterminism — and it reaches the output: on the `All` path 8 of the 22
+/// jfk words shift in time (`ask` starts 881.6 ms late) and all 22 differ in
+/// timing and/or score. There is no trade-off to weigh, because the ANE
+/// placement is ~450× slower to load, ~3× slower to predict, **and** wrong;
+/// `CpuOnly` additionally has the best predict time of any numerically-correct
+/// placement.
+///
+/// Running this model on the ANE would require **re-converting the artifact**
+/// with a fused (or fp32) `log_softmax` tail. That is a model fix, not a code
+/// fix — nothing in this crate can recover the underflowed cells.
+///
+/// Pinned by `tests::emissions_have_no_fp16_log_zero_sentinel`, which builds
+/// its encoder from this constant (never a hardcoded placement) and fails on
+/// `All`.
+pub const DEFAULT_ENCODER_COMPUTE: ComputeUnits = ComputeUnits::CpuOnly;
 
 #[cfg(feature = "serde")]
 fn default_encoder_compute() -> ComputeUnits {
@@ -152,7 +211,8 @@ impl Default for EncoderOptions {
 
 impl EncoderOptions {
   /// Options matching the crate's default: [`DEFAULT_ENCODER_COMPUTE`]
-  /// (`ComputeUnits::All`).
+  /// (`ComputeUnits::CpuOnly` — see that constant for why the ANE placements
+  /// are not merely slower but numerically wrong on this model).
   pub const fn new() -> Self {
     Self {
       compute: DEFAULT_ENCODER_COMPUTE,
@@ -243,7 +303,7 @@ pub struct Encoder {
 }
 
 impl Encoder {
-  /// Loads the model with [`EncoderOptions::new`] (`ComputeUnits::All`).
+  /// Loads the model with [`EncoderOptions::new`] ([`DEFAULT_ENCODER_COMPUTE`]).
   ///
   /// # Errors
   /// As [`Self::from_file_with`].
@@ -304,77 +364,22 @@ impl Encoder {
     self.frames
   }
 
-  /// Runs the encoder on `encoder_input`, returning the **raw** truncated
-  /// per-frame CTC log-probabilities as a [`RawEmissions`] with
-  /// `frames = truncated_frame_count(real_samples)` (clamped to
-  /// [`Self::frames`], see below) and `V = crate::vocab::VOCAB_SIZE`.
+  /// [`Self::emissions`] without the [`Emissions`] value-domain scan or
+  /// wrapping: the truncated log-probabilities as a plain [`RawEmissions`]
+  /// carrier. See [`Self::emissions`] for the `encoder_input` /
+  /// `real_samples` contract, the truncation formula, and the errors — this
+  /// is the same method minus the final wrap.
   ///
-  /// `encoder_input` is the buffer the model runs on. For the alignment
-  /// pipeline it is `PreparedChunk::encoder_input()` — asry has already
-  /// applied the silence mask and padded to wav2vec2's receptive field — so
-  /// this method never re-implements the mask; a standalone caller may pass
-  /// raw samples directly. Shorter than [`ENCODER_WINDOW_SAMPLES`], it is
-  /// zero-padded up to the full window before prediction.
-  ///
-  /// `real_samples` is the count of REAL (pre-mask, pre-pad) audio samples
-  /// the chunk represents — for the pipeline, the `samples.len()` handed to
-  /// `prepare`. asry keeps `PreparedChunk::real_samples` crate-private, so
-  /// the consumer supplies it; it feeds the truncation formula alone and is
-  /// never re-scanned. Frames computed from the padded tail are truncated
-  /// away, so the result reflects only the real audio.
-  ///
-  /// Returns the tensor WITHOUT the [`Emissions`] value-domain scan or
-  /// wrapping — see [`Self::emissions`] for the wrapped door. Exposed
-  /// because [`Emissions`] deliberately offers no per-cell reads, yet the
-  /// emissions sanity metric needs the values back.
-  ///
-  /// # Truncation formula
-  ///
-  /// Nominal: `ceil(real_samples / HOP_SAMPLES)` (design spec §3:
-  /// `T_frames = ceil(real_samples / 320)`) — each [`HOP_SAMPLES`]-sample
-  /// stride of real audio should contribute (at least) one real frame.
-  /// Clamped to [`Self::frames`]: wav2vec2's convolutional feature
-  /// extractor is not an exact `real_samples / HOP_SAMPLES` divider (its
-  /// multi-layer kernel/stride chain has kernels slightly wider than their
-  /// strides, so a handful of samples at the very end of a full window
-  /// contribute no additional frame). Concretely, for `real_samples ==
-  /// ENCODER_WINDOW_SAMPLES` (960,000 — no padding at all, exactly the
-  /// `ted_60.wav` fixture's own case), the nominal formula evaluates to
-  /// 3,000 (`960_000 / 320`), one more than
-  /// `base960h_aligner.mlmodelc`'s actual 2,999
-  /// (`tests/model_io.rs::base960h_aligner_io_matches_spec`). Without the
-  /// clamp, this method would try to keep a 3,000th frame that was never
-  /// written into its `copy_into`-filled buffer for any `real_samples` in
-  /// `(Self::frames() * HOP_SAMPLES, ENCODER_WINDOW_SAMPLES]` — see
-  /// `tests.rs` for a regression pinning exactly this boundary.
-  ///
-  /// # Known gap
-  ///
-  /// `coremlit::MultiArray::copy_into` validates only the predict-time
-  /// `emissions` tensor's *total element count* against
-  /// `Self::frames * crate::vocab::VOCAB_SIZE` (established once at
-  /// construction) — an axes-swapped runtime output carrying the identical
-  /// element count (e.g. `[1, VOCAB_SIZE, frames]` instead of `[1, frames,
-  /// VOCAB_SIZE]`) is not independently re-validated per call the way
-  /// `dia-coreml::SegmentModel::infer` re-validates its own output shape
-  /// on every call (`crates/dia-coreml/src/segment/mod.rs`'s
-  /// `check_output_shape`). Accepted here rather than ported: unlike
-  /// `dia-coreml`'s `SegmentModel` (which validates a whole family of
-  /// possible models sharing one contract), this crate's `Encoder`
-  /// contract is pinned to one SHA-tracked model revision
-  /// (`tests/model_io.rs`'s module doc), so an axis swap surfacing between
-  /// two predictions of an already-loaded, already-contract-validated
-  /// `Model` would be a CoreML runtime regression, not a data-dependent
-  /// outcome this crate's own inputs can trigger.
+  /// Crate-private, and staying that way until something needs otherwise:
+  /// [`Emissions`] deliberately exposes no per-cell reads, and the only
+  /// in-crate caller that legitimately wants the values back is the numeric
+  /// regression coverage in `tests.rs` (which is precisely how the fp16
+  /// `log(0)` sentinel behind [`DEFAULT_ENCODER_COMPUTE`] is pinned).
   ///
   /// # Errors
-  /// [`AlignError::InputTooLong`] if
-  /// `encoder_input.len() > ENCODER_WINDOW_SAMPLES`.
-  /// [`AlignError::Tensor`] if building the input tensor or reading the
-  /// output tensor fails. [`AlignError::Prediction`] on a CoreML prediction
-  /// failure, including a prediction whose runtime output set omits
-  /// `emissions` entirely.
-  pub fn emissions_raw(
+  /// As [`Self::emissions`], minus [`AlignError::Alignment`] — skipping the
+  /// wrap is exactly skipping the check that can raise it.
+  pub(crate) fn emissions_raw(
     &self,
     encoder_input: &[f32],
     real_samples: usize,
@@ -417,22 +422,89 @@ impl Encoder {
     Ok(RawEmissions { frames, data })
   }
 
-  /// Runs the encoder and wraps the truncated log-probabilities into an
-  /// [`Emissions`] — the sole log-prob currency
-  /// [`asry::emissions::EmissionsAligner::finish`] accepts.
+  /// Runs the encoder on `encoder_input` and wraps the truncated per-frame
+  /// CTC log-probabilities into an [`Emissions`] — the sole log-prob currency
+  /// [`asry::emissions::EmissionsAligner::finish`] accepts — with
+  /// `T = truncated_frame_count(real_samples)` (clamped to [`Self::frames`],
+  /// see below) and `V = `[`crate::vocab::VOCAB_SIZE`].
   ///
-  /// See [`Self::emissions_raw`] for the `encoder_input` / `real_samples`
-  /// contract and the truncation formula; this adds only the
-  /// [`Emissions::from_log_probs`] wrap (the log-prob door — **no
-  /// re-softmax**, see the module doc's "No re-softmax" section).
+  /// The wrap goes through [`Emissions::from_log_probs`], the log-prob door:
+  /// **no softmax or log-softmax is applied**, and the raw tensor is passed
+  /// through unclamped. See the module doc's "The log-prob door" section for
+  /// why that door — and not [`Emissions::from_logits`] — is the correct one,
+  /// which is a subtler argument than it looks.
+  ///
+  /// `encoder_input` is the buffer the model runs on. For the alignment
+  /// pipeline it is `PreparedChunk::encoder_input()` — asry has already
+  /// applied the silence mask and padded to wav2vec2's receptive field — so
+  /// this method never re-implements the mask; a standalone caller may pass
+  /// raw samples directly. Shorter than [`ENCODER_WINDOW_SAMPLES`], it is
+  /// zero-padded up to the full window before prediction.
+  ///
+  /// `real_samples` is the count of REAL (pre-mask, pre-pad) audio samples
+  /// the chunk represents — for the pipeline, the `samples.len()` handed to
+  /// `prepare`. asry keeps `PreparedChunk::real_samples` crate-private, so
+  /// the consumer supplies it; it feeds the truncation formula alone and is
+  /// never re-scanned. Frames computed from the padded tail are truncated
+  /// away, so the result reflects only the real audio.
+  ///
+  /// # Truncation formula
+  ///
+  /// Nominal: `ceil(real_samples / HOP_SAMPLES)` (design spec §3:
+  /// `T_frames = ceil(real_samples / 320)`) — each [`HOP_SAMPLES`]-sample
+  /// stride of real audio should contribute (at least) one real frame.
+  /// Clamped to [`Self::frames`]: wav2vec2's convolutional feature
+  /// extractor is not an exact `real_samples / HOP_SAMPLES` divider (its
+  /// multi-layer kernel/stride chain has kernels slightly wider than their
+  /// strides, so a handful of samples at the very end of a full window
+  /// contribute no additional frame). Concretely, for `real_samples ==
+  /// ENCODER_WINDOW_SAMPLES` (960,000 — no padding at all, exactly the
+  /// `ted_60.wav` fixture's own case), the nominal formula evaluates to
+  /// 3,000 (`960_000 / 320`), one more than
+  /// `base960h_aligner.mlmodelc`'s actual 2,999
+  /// (`tests/model_io.rs::base960h_aligner_io_matches_spec`). Without the
+  /// clamp, this method would try to keep a 3,000th frame that was never
+  /// written into its `copy_into`-filled buffer for any `real_samples` in
+  /// `(Self::frames() * HOP_SAMPLES, ENCODER_WINDOW_SAMPLES]` — see
+  /// `tests.rs` for a regression pinning exactly this boundary.
+  ///
+  /// [`HOP_SAMPLES`] is the ONE stride in this crate: the same constant times
+  /// the words in [`crate::aligner::Aligner`]'s seam. It is fixed by the
+  /// model's graph and is deliberately not configurable — a caller-settable
+  /// stride that truncated at 320 while timing at 319 would skew every word
+  /// silently.
+  ///
+  /// # Known gap
+  ///
+  /// `coremlit::MultiArray::copy_into` validates only the predict-time
+  /// `emissions` tensor's *total element count* against
+  /// `Self::frames * crate::vocab::VOCAB_SIZE` (established once at
+  /// construction) — an axes-swapped runtime output carrying the identical
+  /// element count (e.g. `[1, VOCAB_SIZE, frames]` instead of `[1, frames,
+  /// VOCAB_SIZE]`) is not independently re-validated per call the way
+  /// `dia-coreml::SegmentModel::infer` re-validates its own output shape
+  /// on every call (`crates/dia-coreml/src/segment/mod.rs`'s
+  /// `check_output_shape`). Accepted here rather than ported: unlike
+  /// `dia-coreml`'s `SegmentModel` (which validates a whole family of
+  /// possible models sharing one contract), this crate's `Encoder`
+  /// contract is pinned to one SHA-tracked model revision
+  /// (`tests/model_io.rs`'s module doc), so an axis swap surfacing between
+  /// two predictions of an already-loaded, already-contract-validated
+  /// `Model` would be a CoreML runtime regression, not a data-dependent
+  /// outcome this crate's own inputs can trigger.
   ///
   /// # Errors
-  /// Everything [`Self::emissions_raw`] returns, plus
-  /// [`AlignError::Alignment`] (an `asry::emissions::EmissionsError`) if the
-  /// model output leaves the log-probability domain: `from_log_probs` runs
-  /// an `O(T·V)` finite ∧ `<= 0` scan, so a non-finite or positive value is
-  /// a real error path here — not the panic the pre-seam `LogProbsTV::new`
-  /// let this crate assume away.
+  /// [`AlignError::InputTooLong`] if
+  /// `encoder_input.len() > ENCODER_WINDOW_SAMPLES`.
+  /// [`AlignError::Tensor`] if building the input tensor or reading the
+  /// output tensor fails. [`AlignError::Prediction`] on a CoreML prediction
+  /// failure, including a prediction whose runtime output set omits
+  /// `emissions` entirely. [`AlignError::Alignment`] (an
+  /// `asry::emissions::EmissionsError`) if the model output leaves the
+  /// log-probability domain: `from_log_probs` runs an `O(T·V)` finite ∧
+  /// `<= 0` scan, so a non-finite or positive value is a real error path here
+  /// — not the panic the pre-seam `LogProbsTV::new` let this crate assume
+  /// away.
   pub fn emissions(
     &self,
     encoder_input: &[f32],
@@ -447,44 +519,20 @@ impl Encoder {
 /// [`Encoder::emissions_raw`]: `frames × VOCAB_SIZE` row-major, exactly the
 /// tensor [`Encoder::emissions`] hands to [`Emissions::from_log_probs`].
 ///
-/// [`Emissions`] intentionally exposes no per-cell reads — its opaque design
-/// deletes the row-major aliasing footgun asry documents — so this carrier
-/// exists for the one caller that legitimately needs the values back: the
-/// emissions sanity metric comparing alignkit's CoreML log-probs against
-/// asry's ONNX reference. It carries no invariant beyond
-/// `data.len() == frames * VOCAB_SIZE`; it is NOT a validated log-prob
-/// tensor (that is [`Emissions`], reached via [`Encoder::emissions`]).
+/// Crate-private, like the method that produces it: the public currency is
+/// [`Emissions`], which intentionally exposes no per-cell reads (its opaque
+/// design deletes the row-major aliasing footgun asry documents). This is a
+/// plain internal carrier, not an API — it holds no invariant beyond
+/// `data.len() == frames * VOCAB_SIZE`, and in particular it is NOT a
+/// validated log-prob tensor (that is [`Emissions`], reached only through the
+/// two guarded constructors).
 #[derive(Debug, Clone, PartialEq)]
-pub struct RawEmissions {
-  frames: usize,
-  data: Vec<f32>,
-}
-
-impl RawEmissions {
+pub(crate) struct RawEmissions {
   /// Truncated frame count `T`: real-audio frames only, padded-tail frames
   /// already dropped.
-  #[must_use]
-  pub const fn frames(&self) -> usize {
-    self.frames
-  }
-
-  /// Vocab dimension `V` — always [`crate::vocab::VOCAB_SIZE`].
-  #[must_use]
-  pub const fn vocab(&self) -> usize {
-    crate::vocab::VOCAB_SIZE
-  }
-
+  pub(crate) frames: usize,
   /// The row-major `frames × VOCAB_SIZE` log-probabilities.
-  #[must_use]
-  pub fn data(&self) -> &[f32] {
-    &self.data
-  }
-
-  /// Consume, returning ownership of the buffer.
-  #[must_use]
-  pub fn into_data(self) -> Vec<f32> {
-    self.data
-  }
+  pub(crate) data: Vec<f32>,
 }
 
 /// See [`Encoder::emissions`]'s "Truncation formula" doc section.
