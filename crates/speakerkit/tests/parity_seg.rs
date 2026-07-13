@@ -1,4 +1,4 @@
-//! Gate 1 (spec §6.1): dia-coreml's CoreML `SegmentModel` vs dia's own `ort`
+//! Gate 1 (spec §6.1): speakerkit's CoreML `SegmentModel` vs dia's own `ort`
 //! `pyannote/segmentation-3.0` inference, per chunk.
 //!
 //! Both sides run the SAME model (pyannote/segmentation-3.0) on the SAME raw
@@ -6,7 +6,7 @@
 //! (`tests/fixtures/golden/*.json`, produced by `tests/generate_goldens.rs`);
 //! CoreML re-runs the conversion (`pyannote_segmentation.mlmodelc`). Neither
 //! side softmaxes (dia's `SegmentModel::infer` returns raw logits;
-//! `dia_coreml::segment::SegmentModel::infer` likewise), so the comparison is
+//! `speakerkit::segment::SegmentModel::infer` likewise), so the comparison is
 //! raw-logit-vs-raw-logit in the identical frame-major `[frame * 7 + class]`
 //! layout.
 //!
@@ -17,14 +17,14 @@
 //!   ("flips"); the hard 0/1 speaker mask feeds dia's clustering unchanged, so
 //!   the budget is ZERO.
 //!
-//! `#[ignore]` (needs the gitignored `Models/dia-coreml/` artifacts, like
+//! `#[ignore]` (needs the gitignored `Models/speakerkit/` artifacts, like
 //! `tests/model_io.rs`); run with local models via
-//! `cargo test -p dia-coreml -- --ignored`.
+//! `cargo test -p speakerkit -- --ignored`.
 
 mod common;
 
 use coremlit::ComputeUnits;
-use dia_coreml::segment::{POWERSET_CLASSES, SegmentModel, SegmentModelOptions};
+use speakerkit::segment::{POWERSET_CLASSES, SegmentModel, SegmentModelOptions};
 
 /// Gate-1 logit tolerance: max absolute per-element divergence between CoreML
 /// and dia-ort raw powerset logits. Starting point 1e-3 (spec §6.1),
@@ -33,7 +33,7 @@ use dia_coreml::segment::{POWERSET_CLASSES, SegmentModel, SegmentModelOptions};
 const SEG_MAX_ABS_TOL: f64 = 1e-3;
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS) + committed goldens"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS) + committed goldens"]
 fn segmentation_parity_vs_dia_ort() {
   // CpuOnly for run-to-run determinism (no ANE compile-latency variance) and
   // an apples-to-apples match with dia-ort's CPU EP — the same convention

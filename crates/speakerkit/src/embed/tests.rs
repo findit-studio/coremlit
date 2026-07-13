@@ -366,8 +366,8 @@ fn options_serde_round_trips_explicit_compute() {
 
 // ---------------------------------------------------------------------
 // EmbedModel: model-gated (brief Step 2) — requires local
-// wespeaker_v2.mlmodelc AND wespeaker.mlmodelc (DIA_COREML_TEST_MODELS or
-// Models/dia-coreml/, same convention as tests/model_io.rs's `common`
+// wespeaker_v2.mlmodelc AND wespeaker.mlmodelc (SPEAKERKIT_TEST_MODELS or
+// Models/speakerkit/, same convention as tests/model_io.rs's `common`
 // module and crate::segment::tests). Duplicated here in miniature because
 // unit tests under `src/` cannot import the separate `tests/`
 // integration-test crate.
@@ -379,12 +379,12 @@ fn options_serde_round_trips_explicit_compute() {
 // ---------------------------------------------------------------------
 
 fn models_dir() -> std::path::PathBuf {
-  std::env::var_os("DIA_COREML_TEST_MODELS").map_or_else(
+  std::env::var_os("SPEAKERKIT_TEST_MODELS").map_or_else(
     || {
       std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("Models")
-        .join("dia-coreml")
+        .join("speakerkit")
     },
     std::path::PathBuf::from,
   )
@@ -429,7 +429,7 @@ fn synthetic_samples(len: usize) -> Vec<f32> {
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn from_file_loads_and_reports_mask_frame_count_v2() {
   let model = load_embed_model(embed_v2_path());
   // Ground truth pinned by
@@ -438,7 +438,7 @@ fn from_file_loads_and_reports_mask_frame_count_v2() {
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn from_file_loads_and_reports_mask_frame_count_fp32() {
   let model = load_embed_model(embed_fp32_path());
   // Ground truth pinned by
@@ -447,7 +447,7 @@ fn from_file_loads_and_reports_mask_frame_count_fp32() {
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn from_file_rejects_wrong_contract_model() {
   // pyannote_segmentation.mlmodelc has no `waveform`/`mask` inputs at all
   // (its input is `audio`) — a real, locally-available model with a
@@ -483,13 +483,13 @@ fn embed_chunk_produces_correctly_shaped_finite_embeddings(path: std::path::Path
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn embed_chunk_produces_correctly_shaped_finite_embeddings_v2() {
   embed_chunk_produces_correctly_shaped_finite_embeddings(embed_v2_path());
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn embed_chunk_produces_correctly_shaped_finite_embeddings_fp32() {
   embed_chunk_produces_correctly_shaped_finite_embeddings(embed_fp32_path());
 }
@@ -512,13 +512,13 @@ fn embed_chunk_is_deterministic_across_repeated_calls(path: std::path::PathBuf) 
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn embed_chunk_is_deterministic_across_repeated_calls_v2() {
   embed_chunk_is_deterministic_across_repeated_calls(embed_v2_path());
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn embed_chunk_is_deterministic_across_repeated_calls_fp32() {
   embed_chunk_is_deterministic_across_repeated_calls(embed_fp32_path());
 }
@@ -538,13 +538,13 @@ fn embed_chunk_with_frame_mask_is_raw_not_unit_norm(path: std::path::PathBuf) {
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn embed_chunk_with_frame_mask_is_raw_not_unit_norm_v2() {
   embed_chunk_with_frame_mask_is_raw_not_unit_norm(embed_v2_path());
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn embed_chunk_with_frame_mask_is_raw_not_unit_norm_fp32() {
   embed_chunk_with_frame_mask_is_raw_not_unit_norm(embed_fp32_path());
 }
@@ -576,19 +576,19 @@ fn embed_chunk_with_frame_mask_matches_batched_slot_zero(path: std::path::PathBu
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn embed_chunk_with_frame_mask_matches_batched_slot_zero_v2() {
   embed_chunk_with_frame_mask_matches_batched_slot_zero(embed_v2_path());
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn embed_chunk_with_frame_mask_matches_batched_slot_zero_fp32() {
   embed_chunk_with_frame_mask_matches_batched_slot_zero(embed_fp32_path());
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn embed_chunk_with_frame_mask_rejects_all_false_mask() {
   let model = load_embed_model(embed_v2_path());
   let samples = synthetic_samples(crate::segment::SEG_CHUNK_SAMPLES);
@@ -600,7 +600,7 @@ fn embed_chunk_with_frame_mask_rejects_all_false_mask() {
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn embed_chunk_rejects_non_finite_samples() {
   let model = load_embed_model(embed_v2_path());
   let mut samples = synthetic_samples(crate::segment::SEG_CHUNK_SAMPLES);
@@ -614,7 +614,7 @@ fn embed_chunk_rejects_non_finite_samples() {
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn embed_chunk_handles_short_padded_input() {
   // A chunk shorter than SEG_CHUNK_SAMPLES exercises the repeat-pad path
   // against the real model end to end (not just the hermetic

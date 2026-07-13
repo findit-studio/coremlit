@@ -2,7 +2,7 @@
 //!
 //! This is the *executable, reproducible* oracle: rather than pinning opaque
 //! reference blobs, it RUNS dia's own `ort` pipeline — the very
-//! `pyannote/segmentation-3.0` + WeSpeaker ResNet34-LM models dia-coreml
+//! `pyannote/segmentation-3.0` + WeSpeaker ResNet34-LM models speakerkit
 //! re-implements over CoreML — and writes each fixture's reference tensors to
 //! `tests/fixtures/golden/<name>.json`. The parity suites
 //! (`tests/parity_seg.rs`, `tests/parity_embed.rs`) then check CoreML against
@@ -13,7 +13,7 @@
 //! runs in an ordinary `cargo test`; regenerate with:
 //!
 //! ```text
-//! cargo test -p dia-coreml --features dia --test generate_goldens -- --ignored --nocapture
+//! cargo test -p speakerkit --features dia --test generate_goldens -- --ignored --nocapture
 //! ```
 //!
 //! Provisioning (proven working standalone before this harness was wired):
@@ -26,7 +26,7 @@
 //!   feature (cached at `~/Library/Caches/ort.pyke.io`); no `ORT_DYLIB_PATH`.
 //!
 //! Both models run on ort's CPU EP (dia registers no execution provider here —
-//! `dia-coreml`'s `dia` feature enables none of dia's per-EP features), the
+//! `speakerkit`'s `dia` feature enables none of dia's per-EP features), the
 //! matched reference for CoreML's own deterministic `CpuOnly` parity runs.
 #![cfg(feature = "dia")]
 
@@ -35,15 +35,15 @@ mod common;
 use std::io::Write as _;
 
 use dia::{embed::EmbedModel, segment::SegmentModel};
-use dia_coreml::segment::{POWERSET_CLASSES, SEG_NUM_SLOTS, multilabel};
+use speakerkit::segment::{POWERSET_CLASSES, SEG_NUM_SLOTS, multilabel};
 
 /// dia's community-1 onset (`diarization/src/offline/owned.rs:144`;
-/// dia-coreml's `window::DEFAULT_ONSET`). On the hard 0/1 multilabel a slot is
+/// speakerkit's `window::DEFAULT_ONSET`). On the hard 0/1 multilabel a slot is
 /// active at a frame iff its value is `>= ONSET`.
 const ONSET: f64 = 0.5;
 
 /// pyannote's `embedding_exclude_overlap` minimum clean-frame count
-/// (`diarization/src/offline/owned.rs:522`; dia-coreml's
+/// (`diarization/src/offline/owned.rs:522`; speakerkit's
 /// `extract::EXCLUDE_OVERLAP_MIN_FRAMES`): the overlap-excluded mask is used
 /// only with STRICTLY more clean frames than this, else the slot falls back to
 /// its raw active mask.
@@ -61,7 +61,7 @@ fn wespeaker_onnx_path() -> std::path::PathBuf {
 }
 
 /// Per-slot embedding masks for one chunk, reproducing dia's offline
-/// overlap-exclusion (`derive_slot_plans`, dia-coreml `extract/mod.rs`, itself
+/// overlap-exclusion (`derive_slot_plans`, speakerkit `extract/mod.rs`, itself
 /// a bit-for-bit port of `owned.rs:507-591`) so the reference embeddings use
 /// the exact masks dia's pipeline would feed. `None` = the slot has no active
 /// frame (dia skips it — no embed call).
@@ -146,7 +146,7 @@ fn generate_goldens() {
       num_frames_seen = Some(*num_frames_seen.get_or_insert(num_frames));
       assert_eq!(num_frames_seen, Some(num_frames), "frame count drift");
 
-      // Hard multilabel (dia-coreml's decode == dia's softmax+argmax) → the
+      // Hard multilabel (speakerkit's decode == dia's softmax+argmax) → the
       // per-slot overlap-excluded masks dia's pipeline feeds to embed.
       let slab = multilabel(&logits, num_frames);
       let masks = derive_slot_masks(&slab, num_frames);

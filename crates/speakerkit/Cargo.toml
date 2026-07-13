@@ -1,5 +1,5 @@
 [package]
-name = "dia-coreml"
+name = "speakerkit"
 description = "Native CoreML segmentation and embedding backends for the dia speaker-diarization pipeline"
 version.workspace = true
 edition.workspace = true
@@ -24,8 +24,8 @@ thiserror.workspace = true
 
 # Renamed to `dia` (its own package name is `diarization`) so call sites read
 # `dia::offline::OfflineInput` etc., matching the design spec's API (§5).
-# Path is relative to THIS crate (crates/dia-coreml): three levels up
-# (crates/dia-coreml -> crates -> coremlit workspace root -> findit-studio)
+# Path is relative to THIS crate (crates/speakerkit): three levels up
+# (crates/speakerkit -> crates -> coremlit workspace root -> findit-studio)
 # then into the sibling `diarization` checkout, not the two-level guess that
 # would resolve inside the coremlit workspace itself — the `dia` feature
 # build (exercised by every `cargo hack test --each-feature` gate run) is

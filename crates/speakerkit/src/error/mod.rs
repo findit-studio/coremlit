@@ -1,4 +1,4 @@
-//! Structured, per-domain error types for the `dia-coreml` backends (design
+//! Structured, per-domain error types for the `speakerkit` backends (design
 //! spec §5). Foreign errors from `coremlit` are wrapped as typed `#[from]`
 //! variants; [`ExtractError`] composes both domain errors at the top level.
 

@@ -269,19 +269,19 @@ fn options_serde_round_trips_explicit_compute() {
 
 // ---------------------------------------------------------------------
 // SegmentModel: model-gated (brief Step 2) — requires a local
-// pyannote_segmentation.mlmodelc (DIA_COREML_TEST_MODELS or
-// Models/dia-coreml/, same convention as tests/model_io.rs's `common`
+// pyannote_segmentation.mlmodelc (SPEAKERKIT_TEST_MODELS or
+// Models/speakerkit/, same convention as tests/model_io.rs's `common`
 // module). Duplicated here in miniature because unit tests under `src/`
 // cannot import the separate `tests/` integration-test crate.
 // ---------------------------------------------------------------------
 
 fn models_dir() -> std::path::PathBuf {
-  std::env::var_os("DIA_COREML_TEST_MODELS").map_or_else(
+  std::env::var_os("SPEAKERKIT_TEST_MODELS").map_or_else(
     || {
       std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("Models")
-        .join("dia-coreml")
+        .join("speakerkit")
     },
     std::path::PathBuf::from,
   )
@@ -305,7 +305,7 @@ fn load_seg_model() -> SegmentModel {
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn from_file_loads_and_reports_frame_count() {
   let model = load_seg_model();
   // Ground truth pinned by
@@ -314,7 +314,7 @@ fn from_file_loads_and_reports_frame_count() {
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn from_file_rejects_wrong_contract_model() {
   // wespeaker_v2.mlmodelc has no `audio` input at all (its inputs are
   // `waveform`/`mask`) — a real, locally-available model with a
@@ -332,7 +332,7 @@ fn from_file_rejects_wrong_contract_model() {
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn infer_rejects_wrong_input_length() {
   let model = load_seg_model();
   let err = model
@@ -348,7 +348,7 @@ fn infer_rejects_wrong_input_length() {
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn infer_produces_correctly_shaped_finite_logits() {
   let model = load_seg_model();
   let samples = vec![0.0f32; SEG_CHUNK_SAMPLES];
@@ -358,7 +358,7 @@ fn infer_produces_correctly_shaped_finite_logits() {
 }
 
 #[test]
-#[ignore = "requires local dia-coreml models (DIA_COREML_TEST_MODELS)"]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn infer_is_deterministic_across_repeated_calls() {
   let model = load_seg_model();
   // Small-amplitude non-zero signal, not pure silence, so this exercises
