@@ -202,6 +202,33 @@ fn fallback_thresholds_use_strict_inequality() {
 }
 
 #[test]
+fn empty_word_tokens_do_not_trigger_compression_fallback() {
+  // PARITY (coremlit issue #9), decision level. An empty word-token window
+  // (decode/mod.rs feeds `compression_ratio_of_tokens(&word_tokens)`, and
+  // `word_tokens` can be empty) yields a compression ratio of 0.0 — Swift's
+  // value, since its tokens overload has no empty guard (see
+  // `text::tests::compression_ratio_of_tokens_empty_is_zero_matching_swift`).
+  // Threaded through `needs_fallback` at the DEFAULT threshold (Some(2.4)),
+  // `0.0 > 2.4` is false, so the compression check does not fire and no
+  // repetition fallback is requested — matching Swift. Before this fix the
+  // ratio was f32::INFINITY, `INFINITY > 2.4` was true, and this same empty
+  // window would have (wrongly) forced a fallback: the exact parity bug this
+  // guards against.
+  let empty_ratio = crate::text::compression_ratio_of_tokens(&[]);
+  assert_eq!(empty_ratio, 0.0);
+  // Other signals kept clean so the compression branch is the one under
+  // test: no_speech below its 0.6 default, avg_logprob above its -1.0
+  // default, first-token flag false.
+  let opts = DecodingOptions::new();
+  let r = result_with(-0.2, 0.1, empty_ratio, 0.0);
+  assert_ne!(
+    needs_fallback(false, &r, &opts),
+    Some(FallbackReason::CompressionRatioThreshold)
+  );
+  assert_eq!(needs_fallback(false, &r, &opts), None);
+}
+
+#[test]
 fn fallback_first_token_check_ignores_empty_token_log_probs() {
   // A `DecodingResult` with no token_log_probs at all still requires the
   // caller to compute first_token_log_prob_too_low from the loop-local
