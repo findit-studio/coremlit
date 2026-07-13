@@ -12,17 +12,27 @@
 //! provenance record that quietly invents a field is worse than one that
 //! admits the gap:
 //!
-//! - **Library-known** — everything reachable from the resolved
-//!   [`DecodingOptions`] (task, language and its resolved
-//!   `detect_language` coupling, prefill, skip-special, word-timestamps,
-//!   the chunking strategy — *whether* VAD chunking ran, never *which*
-//!   detector drove it; see below — the whole temperature-fallback ladder,
-//!   the seed), the [`ComputeOptions`] the pipeline was built with, and —
-//!   from the transcript itself — the language the decode actually
-//!   **detected** and the *effective* temperature it actually landed on.
-//!   [`Provenance::from_options`] fills in everything the options alone
-//!   settle; [`Provenance::for_result`] adds the two outcome facts, and is
-//!   the constructor to reach for when you have a transcript in hand.
+//! - **Library-known** — the **whole resolved [`DecodingOptions`]**, embedded
+//!   verbatim ([`Provenance::decoding`]); the [`ComputeOptions`] the pipeline
+//!   was built with; and — from the transcript itself — the language the
+//!   decode actually **detected** and the *effective* temperature it actually
+//!   landed on. [`Provenance::from_options`] fills in everything the options
+//!   alone settle; [`Provenance::for_result`] adds the two outcome facts, and
+//!   is the constructor to reach for when you have a transcript in hand.
+//!
+//!   Note *whole*, and note **embedded** rather than projected. An earlier
+//!   shape hand-copied a curated subset of [`DecodingOptions`]' knobs into
+//!   flat fields here, and it did what every hand-maintained projection does:
+//!   it drifted. It reached 30 options captured as 11, and the 19 it silently
+//!   dropped included
+//!   [`DecodingOptions::drop_blank_audio`] and [`DecodingOptions::word_grouping`]
+//!   — two knobs that visibly change the transcript, so two runs that differed
+//!   only in them left **byte-identical records**. Embedding the struct makes
+//!   completeness true *by construction*: a knob added to [`DecodingOptions`]
+//!   tomorrow is captured here with no edit to this file, and cannot be
+//!   forgotten. `provenance::tests`' mutation table enforces it — its coverage
+//!   check is derived from [`DecodingOptions`]' own serialized key set, so a
+//!   new field fails the suite until it is exercised.
 //! - **Consumer-supplied** — three facts this crate cannot observe. All
 //!   start `None`, stay `None` until the caller sets them, and are never
 //!   guessed:
@@ -43,8 +53,8 @@
 //!     object carries no identity to read; and it lives on
 //!     [`WhisperKit`](crate::transcribe::WhisperKit), not in
 //!     [`DecodingOptions`] or [`ComputeOptions`], so the constructors here
-//!     could not reach it even if it had a name. That is why
-//!     [`Provenance::chunking_strategy`] records only *whether* VAD ran.
+//!     could not reach it even if it had a name. That is why the record's
+//!     [`DecodingOptions::chunking_strategy`] says only *whether* VAD ran.
 //!     Supplying the detector matters because swapping it
 //!     ([`crate::transcribe::WhisperKit::set_vad_detector`]) moves the
 //!     chunk boundaries, and the boundaries move the transcript — so two
@@ -66,8 +76,9 @@
 //!   matching Swift's own unseeded draw). [`Provenance::effective_temperature`]
 //!   is therefore the field that tells you whether the decode was
 //!   greedy/deterministic (`Some(0.0)`) or sampled, and
-//!   [`Provenance::seed`] tells you whether that sampling can be replayed
-//!   at all. Record both, or a re-run that disagrees is uninvestigable.
+//!   [`DecodingOptions::seed`] — embedded with the rest of the options —
+//!   tells you whether that sampling can be replayed at all. Record both, or
+//!   a re-run that disagrees is uninvestigable.
 //! - **Auto-detect makes the *configured* language useless as a record.**
 //!   It is `""` whenever the decoder is left to detect (the default
 //!   pairing), so a record built from options alone names no language at
@@ -78,7 +89,7 @@
 use coremlit::ComputeUnits;
 
 use crate::{
-  options::{ChunkingStrategy, ComputeOptions, DecodingOptions, Task},
+  options::{ComputeOptions, DecodingOptions},
   result::{TranscriptionResult, TranscriptionSegment},
 };
 
@@ -152,7 +163,7 @@ fn unanimous_temperature(segments: &[TranscriptionSegment]) -> Option<f32> {
 ///   .with_model_id("openai_whisper-tiny")
 ///   .with_model_revision("a1b2c3d");
 ///
-/// assert_eq!(provenance.language(), "en");
+/// assert_eq!(provenance.decoding().language(), "en");
 /// assert_eq!(provenance.model_id(), Some("openai_whisper-tiny"));
 /// // Never fabricated: the tokenizer identity was not supplied.
 /// assert_eq!(provenance.tokenizer_revision(), None);
@@ -170,48 +181,25 @@ fn unanimous_temperature(segments: &[TranscriptionSegment]) -> Option<f32> {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Provenance {
   // -- library-known: the resolved decode configuration -----------------
-  /// The decode task (transcribe vs. translate) — it changes the output
-  /// text outright, so a record that omitted it could not tell a
-  /// translation from a transcription.
-  task: Task,
-  /// The configured spoken language (ISO code); empty means the decoder
-  /// was left to auto-detect. This is the *configured* value: the language
-  /// actually detected for a given run is reported by
-  /// [`TranscriptionResult::language`](crate::result::TranscriptionResult::language),
-  /// which is where a consumer should read the outcome rather than the
-  /// input.
-  language: String,
-  /// Whether language detection ran, already **resolved** through
-  /// [`DecodingOptions::detect_language`]'s coupling to
-  /// `use_prefill_prompt` — the value the pipeline actually acted on, not
-  /// the raw tri-state. It is recorded because a detection probe consumes
-  /// a sampler draw, so at a non-zero temperature it can shift the tokens
-  /// that follow.
-  detect_language: bool,
-  /// Whether the prefill tokens were forced from `task`/`language`.
-  use_prefill_prompt: bool,
-  /// Whether special tokens were omitted from decoded segment text.
-  skip_special_tokens: bool,
-  /// Whether word-level DTW timestamps were computed.
-  word_timestamps: bool,
-  /// The chunking/VAD strategy long-form audio was split with.
-  chunking_strategy: ChunkingStrategy,
-  /// The **base** decode temperature the fallback ladder started from.
-  /// See [`Self::effective_temperature`] for the one a segment landed on.
-  temperature: f32,
-  /// The temperature added per fallback retry.
-  temperature_increment_on_fallback: f32,
-  /// The maximum number of fallback retries.
-  temperature_fallback_count: usize,
-  /// The base seed for reproducible sampling, or `None` when sampling was
-  /// left OS-seeded (the default). See this module's docs: without a seed,
-  /// any segment whose [`Self::effective_temperature`] climbed above `0.0`
-  /// is not reproducible.
-  #[cfg_attr(
-    feature = "serde",
-    serde(default, skip_serializing_if = "Option::is_none")
-  )]
-  seed: Option<u64>,
+  /// The **entire** resolved [`DecodingOptions`] the decode ran under,
+  /// embedded verbatim — every knob, including the ones nobody thought to
+  /// list.
+  ///
+  /// Embedded rather than projected into flat fields, and that is the whole
+  /// design: a hand-curated projection is a list somebody has to remember to
+  /// extend, and the one this replaced had already drifted to 11 of 30 knobs
+  /// (see the module doc). Reading a knob costs one hop —
+  /// `provenance.decoding().drop_blank_audio()` — and in exchange the record
+  /// cannot be incomplete. [`DecodingOptions::detect_language`] is the
+  /// resolved getter, so the tri-state is stored raw and still reads back
+  /// resolved; `use_prefill_prompt` travels with it, so the coupling
+  /// re-resolves to exactly what the pipeline acted on.
+  ///
+  /// Required on deserialize, and lossless: [`DecodingOptions`]' own wire
+  /// form round-trips every value exactly (see that module's doc), so a
+  /// persisted record reconstructs the run's configuration rather than
+  /// approximating it.
+  decoding: DecodingOptions,
 
   // -- library-known: compute + outcome ---------------------------------
   /// The per-stage CoreML compute units the pipeline ran on. Recorded
@@ -219,10 +207,10 @@ pub struct Provenance {
   compute: ComputeOptions,
   /// The language the transcript was actually decoded in
   /// ([`TranscriptionResult::language`]) — the **outcome**, where
-  /// [`Self::language`] is the **input**. This is the one that matters
-  /// under auto-detect: `language` is then empty (and it is empty on every
-  /// run with [`DecodingOptions::use_prefill_prompt`] cleared, the default
-  /// pairing for detection), so the configured value says nothing at all
+  /// [`DecodingOptions::language`] is the **input**. This is the one that
+  /// matters under auto-detect: the configured language is then empty (and
+  /// it is empty on every run with [`DecodingOptions::use_prefill_prompt`]
+  /// cleared, the default pairing for detection), so it says nothing at all
   /// about what was spoken, and only this field does.
   ///
   /// `None` **iff the record was built without a result** — by
@@ -234,8 +222,9 @@ pub struct Provenance {
   detected_language: Option<String>,
   /// The temperature the decode **actually landed on** — the fallback
   /// ladder's accepted attempt, read off
-  /// [`TranscriptionSegment::temperature`]. Equal to [`Self::temperature`]
-  /// when no fallback was needed; higher when the ladder climbed.
+  /// [`TranscriptionSegment::temperature`]. Equal to
+  /// [`DecodingOptions::temperature`] when no fallback was needed; higher
+  /// when the ladder climbed.
   /// `Some(0.0)` means greedy/argmax and therefore deterministic; the
   /// overwhelmingly common no-fallback case.
   ///
@@ -282,8 +271,10 @@ pub struct Provenance {
   /// Which VAD detector drove the chunking, if the caller supplied it.
   ///
   /// Never inferred — not from the detector's concrete type, not from
-  /// [`std::any::type_name`], and not from [`Self::chunking_strategy`]
-  /// being [`ChunkingStrategy::Vad`]. The pipeline holds the detector as a
+  /// [`std::any::type_name`], and not from
+  /// [`DecodingOptions::chunking_strategy`] being
+  /// [`ChunkingStrategy::Vad`](crate::options::ChunkingStrategy::Vad). The
+  /// pipeline holds the detector as a
   /// `Box<dyn VoiceActivityDetector>`
   /// ([`crate::transcribe::WhisperKit::vad_detector`]), which exposes no
   /// identity to read, and it lives on
@@ -296,7 +287,7 @@ pub struct Provenance {
   /// where the chunk boundaries fall, and the boundaries decide the text,
   /// so two runs that differ *only* in detector yield different
   /// transcripts from records that are otherwise identical.
-  /// [`Self::chunking_strategy`] alone cannot tell them apart.
+  /// [`DecodingOptions::chunking_strategy`] alone cannot tell them apart.
   #[cfg_attr(
     feature = "serde",
     serde(default, skip_serializing_if = "Option::is_none")
@@ -315,19 +306,10 @@ impl Provenance {
     effective_temperature: Option<f32>,
   ) -> Self {
     Self {
-      task: decoding.task(),
-      language: decoding.language().to_string(),
-      // The resolved getter, not the raw tri-state: this records what the
-      // pipeline acted on (see the field's doc).
-      detect_language: decoding.detect_language(),
-      use_prefill_prompt: decoding.use_prefill_prompt(),
-      skip_special_tokens: decoding.skip_special_tokens(),
-      word_timestamps: decoding.word_timestamps(),
-      chunking_strategy: decoding.chunking_strategy(),
-      temperature: decoding.temperature(),
-      temperature_increment_on_fallback: decoding.temperature_increment_on_fallback(),
-      temperature_fallback_count: decoding.temperature_fallback_count(),
-      seed: decoding.seed(),
+      // The WHOLE options value, not a field-by-field projection — the one
+      // line that makes this capture complete by construction, and keeps it
+      // complete for every knob added after today (see the field's doc).
+      decoding: decoding.clone(),
       compute: *compute,
       detected_language,
       effective_temperature,
@@ -388,8 +370,8 @@ impl Provenance {
   ///   recording, and it is one [`Self::for_segment`] structurally cannot
   ///   reach (it is handed a segment, not the result that carries the
   ///   detection outcome). Under the default auto-detect the *configured*
-  ///   [`Self::language`] is just `""`, so without this a record of the
-  ///   common case names no language at all.
+  ///   [`DecodingOptions::language`] is just `""`, so without this a record
+  ///   of the common case names no language at all.
   /// - [`Self::effective_temperature`] becomes `Some(t)` **iff every
   ///   segment landed on the same `t`** — the overwhelmingly common
   ///   no-fallback case, which yields `Some(0.0)` — and `None` when the
@@ -419,7 +401,7 @@ impl Provenance {
   /// );
   ///
   /// let provenance = Provenance::for_result(&decoding, &compute, &result);
-  /// assert_eq!(provenance.language(), "");
+  /// assert_eq!(provenance.decoding().language(), "");
   /// // ... and the DETECTED one is the fact actually worth persisting.
   /// assert_eq!(provenance.detected_language(), Some("en"));
   /// // No segments landed anywhere, so no single temperature describes it.
@@ -438,83 +420,35 @@ impl Provenance {
     )
   }
 
-  // -- task ---------------------------------------------------------------
-  /// The decode task the transcript was produced with.
+  // -- decoding -----------------------------------------------------------
+  /// The **whole** resolved [`DecodingOptions`] the decode ran under — the
+  /// single door to every decode-time fact this record carries.
+  ///
+  /// There are deliberately no per-knob projections beside it
+  /// (`provenance.decoding().task()`, not `provenance.task()`): a projection
+  /// is a list that has to be kept in step with [`DecodingOptions`], and the
+  /// one this replaced fell 19 knobs behind (module doc). One accessor cannot.
+  ///
+  /// ```
+  /// use whisperkit::{
+  ///   options::{ComputeOptions, DecodingOptions, WordGrouping},
+  ///   provenance::Provenance,
+  /// };
+  ///
+  /// let decoding = DecodingOptions::new()
+  ///   .maybe_drop_blank_audio(false)
+  ///   .with_word_grouping(WordGrouping::Phrase);
+  /// let provenance = Provenance::from_options(&decoding, &ComputeOptions::new(), 0.0);
+  ///
+  /// // Knobs the old projection dropped on the floor, now recorded:
+  /// assert!(!provenance.decoding().drop_blank_audio());
+  /// assert_eq!(provenance.decoding().word_grouping(), WordGrouping::Phrase);
+  /// // ... alongside the ones it did keep.
+  /// assert_eq!(provenance.decoding(), &decoding);
+  /// ```
   #[inline(always)]
-  pub const fn task(&self) -> Task {
-    self.task
-  }
-
-  // -- language -----------------------------------------------------------
-  /// The configured spoken language (ISO code); empty means auto-detect.
-  #[inline(always)]
-  pub fn language(&self) -> &str {
-    self.language.as_str()
-  }
-
-  // -- detect_language ----------------------------------------------------
-  /// Whether language detection ran (already resolved — see the field doc).
-  #[inline(always)]
-  pub const fn detect_language(&self) -> bool {
-    self.detect_language
-  }
-
-  // -- use_prefill_prompt -------------------------------------------------
-  /// Whether the prefill tokens were forced from `task`/`language`.
-  #[inline(always)]
-  pub const fn use_prefill_prompt(&self) -> bool {
-    self.use_prefill_prompt
-  }
-
-  // -- skip_special_tokens ------------------------------------------------
-  /// Whether special tokens were omitted from decoded segment text.
-  #[inline(always)]
-  pub const fn skip_special_tokens(&self) -> bool {
-    self.skip_special_tokens
-  }
-
-  // -- word_timestamps ----------------------------------------------------
-  /// Whether word-level DTW timestamps were computed.
-  #[inline(always)]
-  pub const fn word_timestamps(&self) -> bool {
-    self.word_timestamps
-  }
-
-  // -- chunking_strategy --------------------------------------------------
-  /// The chunking/VAD strategy long-form audio was split with.
-  #[inline(always)]
-  pub const fn chunking_strategy(&self) -> ChunkingStrategy {
-    self.chunking_strategy
-  }
-
-  // -- temperature --------------------------------------------------------
-  /// The base decode temperature the fallback ladder started from.
-  #[inline(always)]
-  pub const fn temperature(&self) -> f32 {
-    self.temperature
-  }
-
-  // -- temperature_increment_on_fallback ----------------------------------
-  /// The temperature added per fallback retry.
-  #[inline(always)]
-  pub const fn temperature_increment_on_fallback(&self) -> f32 {
-    self.temperature_increment_on_fallback
-  }
-
-  // -- temperature_fallback_count -----------------------------------------
-  /// The maximum number of fallback retries.
-  #[inline(always)]
-  pub const fn temperature_fallback_count(&self) -> usize {
-    self.temperature_fallback_count
-  }
-
-  // -- seed ---------------------------------------------------------------
-  /// The base seed for reproducible sampling, or `None` when sampling was
-  /// OS-seeded. Without one, a segment whose
-  /// [`Self::effective_temperature`] exceeds `0.0` cannot be replayed.
-  #[inline(always)]
-  pub const fn seed(&self) -> Option<u64> {
-    self.seed
+  pub const fn decoding(&self) -> &DecodingOptions {
+    &self.decoding
   }
 
   // -- compute ------------------------------------------------------------
@@ -533,8 +467,8 @@ impl Provenance {
 
   // -- detected_language --------------------------------------------------
   /// The language the transcript was actually decoded in — the outcome,
-  /// where [`Self::language`] is the configured input. `None` iff this
-  /// record was built without a result ([`Self::from_options`] /
+  /// where [`DecodingOptions::language`] is the configured input. `None` iff
+  /// this record was built without a result ([`Self::from_options`] /
   /// [`Self::for_segment`]); never inferred. See the field's doc.
   #[inline(always)]
   pub fn detected_language(&self) -> Option<&str> {
@@ -544,7 +478,7 @@ impl Provenance {
   // -- effective_temperature ----------------------------------------------
   /// The temperature the decode actually landed on. `Some(0.0)` means
   /// greedy and therefore deterministic; anything higher was sampled, and
-  /// is only reproducible if [`Self::seed`] is set. `None` means no single
+  /// is only reproducible if [`DecodingOptions::seed`] is set. `None` means no single
   /// temperature describes the transcript — the per-window fallback ladder
   /// split its segments, or it has no segments. See the field's doc.
   #[inline(always)]
@@ -555,7 +489,8 @@ impl Provenance {
   /// Whether this transcript can be reproduced byte-for-byte by re-running
   /// the same audio through the same options: true when the decode was
   /// greedy (an effective temperature of `0.0` never draws from the
-  /// sampler) or when a [`Self::seed`] makes the draws replayable.
+  /// sampler) or when a [`DecodingOptions::seed`] makes the draws
+  /// replayable.
   ///
   /// A `None` [`Self::effective_temperature`] is treated as **not**
   /// self-evidently reproducible, and so needs a seed: the ladder having
@@ -570,8 +505,8 @@ impl Provenance {
   #[inline(always)]
   pub const fn is_reproducible(&self) -> bool {
     match self.effective_temperature {
-      Some(temperature) => temperature == 0.0 || self.seed.is_some(),
-      None => self.seed.is_some(),
+      Some(temperature) => temperature == 0.0 || self.decoding.seed().is_some(),
+      None => self.decoding.seed().is_some(),
     }
   }
 

@@ -139,16 +139,30 @@
 //!   [`WhisperKit::set_vad_detector`](transcribe::WhisperKit::set_vad_detector))
 //!
 //! [`Provenance`](provenance::Provenance) assembles that record for you
-//! (coremlit issue #14). Of the items above, the **library-known** ones —
-//! compute units, chunking strategy, language, prefill, special-token
-//! skipping, word timestamps, and the rest of the decode configuration —
-//! are captured wholesale by
-//! [`Provenance::from_options`](provenance::Provenance::from_options) from
-//! the resolved
-//! [`DecodingOptions`](options::DecodingOptions)/[`ComputeOptions`](options::ComputeOptions)
-//! plus the *effective* decode temperature. The remaining three are
-//! **consumer-supplied**: settable `Option` fields, left `None` and never
-//! guessed, because this crate genuinely cannot observe them.
+//! (coremlit issue #14). Of the items above, the **library-known** ones are
+//! captured by
+//! [`Provenance::from_options`](provenance::Provenance::from_options) —
+//! which **embeds the entire resolved
+//! [`DecodingOptions`](options::DecodingOptions)**
+//! ([`Provenance::decoding`](provenance::Provenance::decoding)) rather than
+//! copying a chosen handful of its knobs into flat fields of its own,
+//! alongside the [`ComputeOptions`](options::ComputeOptions) and the
+//! *effective* decode temperature.
+//!
+//! "Wholesale" is load-bearing and not a figure of speech. A curated
+//! projection is a list somebody must remember to extend, and this one had
+//! already drifted to 11 of 30 knobs — silently dropping, among others,
+//! `drop_blank_audio` and `word_grouping`, both of which visibly change the
+//! transcript, so two runs differing only in them left byte-identical
+//! records. Embedding the struct makes the record complete **by
+//! construction**: an option added tomorrow is recorded with no change to
+//! the provenance code, and `provenance`'s mutation table — whose coverage
+//! is derived from [`DecodingOptions`](options::DecodingOptions)' own field
+//! set, not hand-written — fails the suite if one ever is not.
+//!
+//! The remaining three are **consumer-supplied**: settable `Option` fields,
+//! left `None` and never guessed, because this crate genuinely cannot
+//! observe them.
 //!
 //! - Model identity and tokenizer identity — it loads bare local folders,
 //!   so it never sees a repo id or a revision.
@@ -162,7 +176,7 @@
 //!   [`from_options`](provenance::Provenance::from_options) could not
 //!   reach it even if it had a name. The record therefore says *whether*
 //!   VAD chunking ran
-//!   ([`chunking_strategy`](provenance::Provenance::chunking_strategy)),
+//!   ([`chunking_strategy`](options::DecodingOptions::chunking_strategy)),
 //!   never *which* detector drove it. Since a swapped detector moves the
 //!   chunk boundaries — and the boundaries move the transcript — a
 //!   consumer that calls

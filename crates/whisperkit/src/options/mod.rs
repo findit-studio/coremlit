@@ -10,13 +10,39 @@
 //! and returns the defaults; `Default` delegates to `new()`; every knob has
 //! a projected `#[inline(always)]` accessor plus `with_*`/`set_*`, and
 //! `Option`/`bool` knobs get the full `set_`/`with_`/`update_`/`maybe_`/
-//! `clear_` vocabulary. `serde` (optional feature) never emits `null` and
-//! every field falls back to its true default on a partial config —
-//! including fields whose default isn't the field type's own `Default`
-//! (`NonZeroUsize` has none at all; several thresholds default `Some(_)`;
-//! `ComputeOptions`'s per-stage defaults aren't `ComputeUnits::default()`),
-//! which is exactly why those fields use `serde(default = "fn")` rather
-//! than the bare form.
+//! `clear_` vocabulary. Every field falls back to its true default on a
+//! partial `serde` config — including fields whose default isn't the field
+//! type's own `Default` (`NonZeroUsize` has none at all; the four
+//! thresholds default `Some(_)`; `ComputeOptions`'s per-stage defaults
+//! aren't `ComputeUnits::default()`), which is exactly why those fields use
+//! `serde(default = "fn")` rather than the bare form.
+//!
+//! # The `serde` round trip is lossless, and that is a load-bearing property
+//!
+//! Every value survives `serialize` -> `deserialize` unchanged, so a
+//! serialized [`DecodingOptions`] **reconstructs the exact configuration a
+//! run used**. That is what lets [`crate::provenance::Provenance`] embed one
+//! wholesale and still be an honest record of what produced a transcript
+//! (coremlit issue #14).
+//!
+//! Losslessness is why the **four `Option<f32>` thresholds**
+//! ([`DecodingOptions::compression_ratio_threshold`],
+//! [`DecodingOptions::logprob_threshold`],
+//! [`DecodingOptions::first_token_logprob_threshold`],
+//! [`DecodingOptions::no_speech_threshold`]) are the one place this module
+//! *does* emit `null`. They are the only fields whose default is `Some(_)`
+//! rather than `None`, so for them — and only for them — "absent" and
+//! "`None`" mean different things: absent is "the caller did not configure
+//! this knob", which resolves to the default `Some(_)`; `None` is "the
+//! caller explicitly DISABLED this check". `skip_serializing_if` would
+//! collapse the second into the first, and a disabled threshold would read
+//! back **re-enabled at its default** — silently restoring a check the run
+//! did not perform. `null` keeps the two apart, and a partial config that
+//! simply omits the key still gets its true default.
+//!
+//! Every other `Option`/collection field defaults to `None`/empty, so for
+//! those absent *is* the value and `skip_serializing_if` stays: an unset
+//! [`DecodingOptions::seed`] is absent, never a `null`.
 
 use std::{
   num::NonZeroUsize,
@@ -419,32 +445,30 @@ pub struct DecodingOptions {
   suppress_tokens: Vec<u32>,
   /// Treat decoding as failed if the output text's compression ratio
   /// exceeds this value (too repetitive). `None` disables the check.
+  ///
+  /// No `skip_serializing_if`: this knob's default is `Some(_)`, so a
+  /// skipped `None` would read back **re-enabled at the default**. See the
+  /// module doc's lossless-round-trip section.
   #[cfg_attr(
     feature = "serde",
-    serde(
-      default = "default_compression_ratio_threshold",
-      skip_serializing_if = "Option::is_none"
-    )
+    serde(default = "default_compression_ratio_threshold")
   )]
   compression_ratio_threshold: Option<f32>,
   /// Treat decoding as failed if the average sampled-token log
   /// probability falls below this value. `None` disables the check.
-  #[cfg_attr(
-    feature = "serde",
-    serde(
-      default = "default_logprob_threshold",
-      skip_serializing_if = "Option::is_none"
-    )
-  )]
+  ///
+  /// Serialized even when `None` — see
+  /// [`Self::compression_ratio_threshold`]'s field note.
+  #[cfg_attr(feature = "serde", serde(default = "default_logprob_threshold"))]
   logprob_threshold: Option<f32>,
   /// Treat decoding as failed if the first sampled token's log
   /// probability falls below this value. `None` disables the check.
+  ///
+  /// Serialized even when `None` — see
+  /// [`Self::compression_ratio_threshold`]'s field note.
   #[cfg_attr(
     feature = "serde",
-    serde(
-      default = "default_first_token_logprob_threshold",
-      skip_serializing_if = "Option::is_none"
-    )
+    serde(default = "default_first_token_logprob_threshold")
   )]
   first_token_logprob_threshold: Option<f32>,
   /// Treat a window as silent when the no-speech probability strictly
@@ -452,13 +476,10 @@ pub struct DecodingOptions {
   /// on this comparison ALONE — Swift's own doc comment claiming the
   /// average log probability is also consulted is stale against its code;
   /// see `result::needs_fallback`, `Models.swift:368-370`.)
-  #[cfg_attr(
-    feature = "serde",
-    serde(
-      default = "default_no_speech_threshold",
-      skip_serializing_if = "Option::is_none"
-    )
-  )]
+  ///
+  /// Serialized even when `None` — see
+  /// [`Self::compression_ratio_threshold`]'s field note.
+  #[cfg_attr(feature = "serde", serde(default = "default_no_speech_threshold"))]
   no_speech_threshold: Option<f32>,
   /// Worker threads for batch transcription (Swift's macOS default: 16).
   #[cfg_attr(feature = "serde", serde(default = "default_concurrent_worker_count"))]
