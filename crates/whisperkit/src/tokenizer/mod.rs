@@ -15,7 +15,7 @@ use std::path::Path;
 
 use unicode_categories::UnicodeCategories;
 
-use crate::{constants, error::TokenizerError};
+use crate::{constants, error::TokenizerError, options::WordGrouping};
 
 #[cfg(feature = "nl-recognizer")]
 pub mod nl_recognizer;
@@ -398,16 +398,30 @@ impl WhisperTokenizer {
   }
 
   /// Decodes `tokens` into words and each word's contributing subtokens,
-  /// choosing the split strategy by `language_code`: Unicode-boundary
-  /// splitting (every complete Unicode scalar its own unit, merged only
-  /// enough to repair BPE tokens that split a multi-byte character) for
-  /// `zh`/`ja`/`th`/`lo`/`my`/`yue` — languages without reliable
-  /// whitespace-delimited words — and space/punctuation-boundary splitting
-  /// otherwise. Ports Swift's `splitToWordTokens(tokenIds:)`
+  /// choosing the split strategy by `language_code` and `grouping`:
+  /// Unicode-boundary splitting (every complete Unicode scalar its own
+  /// unit, merged only enough to repair BPE tokens that split a multi-byte
+  /// character) for `zh`/`ja`/`th`/`lo`/`my`/`yue` — languages without
+  /// reliable whitespace-delimited words — and space/punctuation-boundary
+  /// splitting otherwise. Ports Swift's `splitToWordTokens(tokenIds:)`
   /// (`Models.swift:1293-1306`); `language_code` replaces Swift's
   /// `NLLanguageRecognizer.dominantLanguage` detection (spec §5.3) — the
   /// caller supplies it directly (e.g. from the decoded `<|lang|>` prompt
   /// token) instead of re-detecting it from the decoded text.
+  ///
+  /// # Choosing the grouping
+  /// `grouping` is the second half of that decision, made explicit
+  /// (coremlit issue #14). [`WordGrouping::FineGrained`] — the default, and
+  /// this port's long-standing behavior — takes the CJK arm above for those
+  /// six languages. [`WordGrouping::Phrase`] forces the space splitter for
+  /// **every** language, CJK included, reproducing the coarse phrase-blob
+  /// grouping Swift produces there. Swift reaches that grouping by
+  /// accident rather than intent — its detector returns a regional
+  /// `zh-Hant`, which its own bare-code CJK check (`Models.swift:1301`)
+  /// then fails to match, dropping the text through to the space splitter
+  /// — so this port exposes it as a named opt-in instead of a silent
+  /// fallthrough. For a non-CJK `language_code` the two groupings are
+  /// identical: both split on spaces.
   ///
   /// # Overriding or pre-normalizing `language_code`
   /// `language_code` is an ordinary argument, not something this method
@@ -452,8 +466,10 @@ impl WhisperTokenizer {
     &self,
     tokens: &[u32],
     language_code: &str,
+    grouping: WordGrouping,
   ) -> Result<Vec<(String, Vec<u32>)>, TokenizerError> {
-    if matches!(language_code, "zh" | "ja" | "th" | "lo" | "my" | "yue") {
+    let is_cjk = matches!(language_code, "zh" | "ja" | "th" | "lo" | "my" | "yue");
+    if is_cjk && grouping.is_fine_grained() {
       self.split_tokens_on_unicode(tokens)
     } else {
       self.split_tokens_on_spaces(tokens)

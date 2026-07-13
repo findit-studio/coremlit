@@ -36,7 +36,7 @@ use crate::{
   backend::{AlignmentMatrix, AlignmentView},
   constants::{SAMPLE_RATE, SECONDS_PER_TIME_TOKEN},
   error::SegmentError,
-  options::DecodingOptions,
+  options::{DecodingOptions, WordGrouping},
   result::{DecodingResult, TranscriptionSegment, WordTiming},
   tokenizer::WhisperTokenizer,
 };
@@ -534,7 +534,9 @@ pub fn merge_punctuations(
 /// into `split_to_word_tokens` in place of Swift's internal
 /// `NLLanguageRecognizer` detection (spec §5.3; see
 /// [`WhisperTokenizer::split_to_word_tokens`]'s own doc for the same
-/// substitution there).
+/// substitution there), and `grouping` chooses how that splitter groups
+/// (coremlit issue #14 — [`WordGrouping::FineGrained`] is the default and
+/// this port's long-standing behavior).
 ///
 /// Returns an empty vec when `split_to_word_tokens` groups `word_token_ids`
 /// into one word or fewer (`:351-353`) — DTW timing is meaningless for a
@@ -552,12 +554,13 @@ pub fn find_alignment(
   token_log_probs: &[f32],
   tokenizer: &WhisperTokenizer,
   language_code: &str,
+  grouping: WordGrouping,
 ) -> Result<Vec<WordTiming>, SegmentError> {
   let path = dynamic_time_warping(alignment)?;
   let text_indices = path.text_indices_slice();
   let time_indices = path.time_indices_slice();
 
-  let word_tokens = tokenizer.split_to_word_tokens(word_token_ids, language_code)?;
+  let word_tokens = tokenizer.split_to_word_tokens(word_token_ids, language_code, grouping)?;
   if word_tokens.len() <= 1 {
     return Ok(Vec::new());
   }
@@ -942,10 +945,13 @@ pub(crate) fn rounded_to_places(value: f32, decimal_places: i32) -> f32 {
 /// [`merge_punctuations`] when non-empty (`:479-482`) ->
 /// [`update_segments_with_word_timings`] (`:484-493`).
 ///
-/// `language_code` is threaded straight into `find_alignment` ->
-/// `split_to_word_tokens`, the same `NLLanguageRecognizer` replacement
-/// documented on [`find_alignment`] and
-/// [`WhisperTokenizer::split_to_word_tokens`] (spec §5.3). Swift's
+/// `language_code` and `grouping` are threaded straight into
+/// `find_alignment` -> `split_to_word_tokens`: the same
+/// `NLLanguageRecognizer` replacement documented on [`find_alignment`] and
+/// [`WhisperTokenizer::split_to_word_tokens`] (spec §5.3), plus the
+/// explicit word-grouping mode from coremlit issue #14
+/// ([`WordGrouping::FineGrained`] is the default and reproduces this port's
+/// long-standing behavior). Swift's
 /// `segmentSize` and `options` parameters are unused in the function body
 /// (verified against `SegmentSeeker.swift:410-496`), and `timings` is
 /// only passed through to `findAlignment` (`:471`), which ignores it —
@@ -969,6 +975,7 @@ pub fn add_word_timestamps(
   alignment: &AlignmentView<'_>,
   tokenizer: &WhisperTokenizer,
   language_code: &str,
+  grouping: WordGrouping,
   seek: usize,
   prepended: &str,
   appended: &str,
@@ -1044,6 +1051,7 @@ pub fn add_word_timestamps(
     &filtered_log_probs,
     tokenizer,
     language_code,
+    grouping,
   )?;
 
   // :474-477 -- the upstream "hack" Swift's own comment flags (reference,

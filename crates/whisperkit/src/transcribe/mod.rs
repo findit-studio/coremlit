@@ -401,6 +401,7 @@ where
             &matrix.view(),
             self.tokenizer,
             language,
+            options.word_grouping(), // coremlit issue #14; default: fine-grained
             previous_seek,
             PREPEND_PUNCTUATION,
             APPEND_PUNCTUATION,

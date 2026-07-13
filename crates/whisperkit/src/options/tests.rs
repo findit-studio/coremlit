@@ -40,6 +40,11 @@ fn decoding_defaults_match_swift() {
   // silence, this drops it unless the caller opts back in. Pinned in full
   // by `drop_blank_audio_defaults_on_and_opts_out_to_swift_parity`.
   assert!(o.drop_blank_audio());
+  // Rust-only addition (coremlit issue #14). Swift has no grouping knob at
+  // all — it picks one from a language it detects internally, landing on
+  // the coarse `Phrase` shape for CJK. This default preserves THIS port's
+  // #11-pinned fine-grained CJK grouping; Swift's is the explicit opt-in.
+  assert_eq!(o.word_grouping(), WordGrouping::FineGrained);
   assert_eq!(DecodingOptions::default(), DecodingOptions::new());
 }
 
@@ -143,6 +148,57 @@ fn enums_round_trip_and_display() {
     ChunkingStrategy::Disabled
   );
   assert!("bogus".parse::<Task>().is_err());
+
+  for g in [WordGrouping::FineGrained, WordGrouping::Phrase] {
+    assert_eq!(g.as_str().parse::<WordGrouping>().unwrap(), g);
+  }
+  assert_eq!(WordGrouping::FineGrained.to_string(), "fine_grained");
+  assert_eq!(WordGrouping::Phrase.as_str(), "phrase");
+  assert!("bogus".parse::<WordGrouping>().is_err());
+}
+
+#[test]
+fn word_grouping_defaults_to_fine_grained() {
+  // The #11-pinned CJK behavior stays the default: a caller who never
+  // mentions grouping gets the fine-grained split, and Swift's coarse
+  // phrase-blob grouping is reachable only by naming it (coremlit #14).
+  assert_eq!(WordGrouping::default(), WordGrouping::FineGrained);
+  assert_eq!(
+    DecodingOptions::new().word_grouping(),
+    WordGrouping::FineGrained
+  );
+  assert!(DecodingOptions::new().word_grouping().is_fine_grained());
+
+  let built = DecodingOptions::new().with_word_grouping(WordGrouping::Phrase);
+  assert_eq!(built.word_grouping(), WordGrouping::Phrase);
+  assert!(built.word_grouping().is_phrase());
+
+  let mut m = DecodingOptions::new();
+  m.set_word_grouping(WordGrouping::Phrase);
+  assert_eq!(m.word_grouping(), WordGrouping::Phrase);
+  m.set_word_grouping(WordGrouping::FineGrained);
+  assert_eq!(m.word_grouping(), WordGrouping::FineGrained);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn word_grouping_serde_omitted_stays_fine_grained() {
+  // An omitted field must NOT silently opt a config into Swift's coarse
+  // grouping — the whole point of making `Phrase` explicit.
+  let omitted: DecodingOptions = serde_json::from_str("{}").unwrap();
+  assert_eq!(omitted.word_grouping(), WordGrouping::FineGrained);
+
+  let phrase: DecodingOptions = serde_json::from_str(r#"{"word_grouping":"phrase"}"#).unwrap();
+  assert_eq!(phrase.word_grouping(), WordGrouping::Phrase);
+
+  for wanted in [WordGrouping::FineGrained, WordGrouping::Phrase] {
+    let options = DecodingOptions::new().with_word_grouping(wanted);
+    let json = serde_json::to_string(&options).unwrap();
+    assert_eq!(
+      serde_json::from_str::<DecodingOptions>(&json).unwrap(),
+      options
+    );
+  }
 }
 
 #[cfg(feature = "serde")]

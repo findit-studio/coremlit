@@ -52,12 +52,16 @@ fn language_tokens_cover_the_table() {
 fn split_words_space_vs_unicode() {
   let t = tiny();
   let ids = t.encode(" Hello world").unwrap();
-  let words = t.split_to_word_tokens(&ids, "en").unwrap();
+  let words = t
+    .split_to_word_tokens(&ids, "en", WordGrouping::FineGrained)
+    .unwrap();
   let texts: Vec<&str> = words.iter().map(|(w, _)| w.as_str()).collect();
   assert_eq!(texts, vec![" Hello", " world"]);
   // unicode-split path: every CJK char its own word
   let zh = t.encode("你好世界").unwrap();
-  let words = t.split_to_word_tokens(&zh, "zh").unwrap();
+  let words = t
+    .split_to_word_tokens(&zh, "zh", WordGrouping::FineGrained)
+    .unwrap();
   assert!(words.len() >= 4 || words.iter().all(|(w, _)| !w.contains(' ')));
 }
 
@@ -166,7 +170,11 @@ fn decode_skip_special_strips_control_tokens_but_keeps_timestamps() {
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn split_to_word_tokens_empty_input_is_empty() {
   let t = tiny();
-  assert_eq!(t.split_to_word_tokens(&[], "en").unwrap(), vec![]);
+  assert_eq!(
+    t.split_to_word_tokens(&[], "en", WordGrouping::FineGrained)
+      .unwrap(),
+    vec![]
+  );
 }
 
 #[test]
@@ -199,7 +207,9 @@ fn cjk_languages_split_into_fine_grained_words() {
 
   for lang in ["zh", "ja", "yue"] {
     let ids = t.encode(text).unwrap();
-    let words = t.split_to_word_tokens(&ids, lang).unwrap();
+    let words = t
+      .split_to_word_tokens(&ids, lang, WordGrouping::FineGrained)
+      .unwrap();
     let texts: Vec<&str> = words.iter().map(|(w, _)| w.as_str()).collect();
     assert_eq!(texts, expected_words, "language {lang}");
     assert_eq!(
@@ -214,7 +224,9 @@ fn cjk_languages_split_into_fine_grained_words() {
   // whole utterance collapses into a single coarse "word". This is the
   // failure mode the CJK arm above exists to avoid.
   let ids = t.encode(text).unwrap();
-  let en_words = t.split_to_word_tokens(&ids, "en").unwrap();
+  let en_words = t
+    .split_to_word_tokens(&ids, "en", WordGrouping::FineGrained)
+    .unwrap();
   assert_eq!(
     en_words.len(),
     1,
@@ -234,7 +246,9 @@ fn split_to_word_tokens_preserves_token_coverage_and_text() {
   let t = tiny();
   for (text, lang) in [(" The quick brown fox.", "en"), ("你好，世界！", "zh")] {
     let ids = t.encode(text).unwrap();
-    let words = t.split_to_word_tokens(&ids, lang).unwrap();
+    let words = t
+      .split_to_word_tokens(&ids, lang, WordGrouping::FineGrained)
+      .unwrap();
 
     let covered: Vec<u32> = words
       .iter()
@@ -252,4 +266,80 @@ fn split_to_word_tokens_preserves_token_coverage_and_text() {
       );
     }
   }
+}
+
+// ---------------------------------------------------------------------
+// WordGrouping (coremlit issue #14)
+// ---------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn word_grouping_routes_cjk_fine_grained_by_default_and_phrase_on_opt_in() {
+  // A ZH utterance with no spaces to split on -- the shape behind coremlit
+  // issue #11's divergence (Rust's 85 fine-grained words against Swift's 24
+  // phrase blobs on the real ZH clip), in miniature.
+  let t = tiny();
+  let zh = t.encode("我今天很高兴见到你").unwrap();
+
+  // DEFAULT -- the #11-pinned behavior, unchanged: the Unicode splitter
+  // carves the utterance into its Unicode-complete units. (Those units are
+  // BPE-token-shaped, not strictly one-per-character -- "今天" is a single
+  // token -- which is exactly what `split_tokens_on_unicode` produces and
+  // what #11 pinned; the point is that they are FINE-GRAINED.)
+  let fine = t
+    .split_to_word_tokens(&zh, "zh", WordGrouping::FineGrained)
+    .unwrap();
+  let fine_texts: Vec<&str> = fine.iter().map(|(w, _)| w.as_str()).collect();
+  assert_eq!(
+    fine_texts,
+    vec!["我", "今天", "很", "高", "兴", "见", "到", "你"]
+  );
+  assert_eq!(
+    crate::options::DecodingOptions::new().word_grouping(),
+    WordGrouping::FineGrained,
+    "and fine-grained is what a caller gets without asking"
+  );
+
+  // OPT-IN -- the space splitter finds no space anywhere in CJK, so the
+  // whole utterance collapses into a single phrase blob with one start/end
+  // time: Swift's `zh-Hant`-fallthrough grouping, reproduced deliberately
+  // rather than stumbled into.
+  let phrase = t
+    .split_to_word_tokens(&zh, "zh", WordGrouping::Phrase)
+    .unwrap();
+  let phrase_texts: Vec<&str> = phrase.iter().map(|(w, _)| w.as_str()).collect();
+  assert_eq!(phrase_texts, vec!["我今天很高兴见到你"]);
+
+  // MUTATION EVIDENCE: identical tokens, identical language code -- only the
+  // grouping differs, and it alone moves 8 words to 1.
+  assert!(
+    fine.len() > phrase.len(),
+    "fine-grained must out-split phrase on CJK: {fine_texts:?} vs {phrase_texts:?}"
+  );
+  // Neither mode loses text; they only disagree on where the boundaries are.
+  assert_eq!(fine_texts.concat(), phrase_texts.concat());
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn word_grouping_is_inert_for_whitespace_delimited_languages() {
+  // The grouping re-routes the CJK arm ONLY: a space-delimited language
+  // already takes the space splitter under both modes, so the two are
+  // identical there. This is the structural reason the English/Spanish
+  // goldens cannot move no matter what this knob is set to.
+  let t = tiny();
+  let ids = t.encode(" Hello world").unwrap();
+
+  let fine = t
+    .split_to_word_tokens(&ids, "en", WordGrouping::FineGrained)
+    .unwrap();
+  let phrase = t
+    .split_to_word_tokens(&ids, "en", WordGrouping::Phrase)
+    .unwrap();
+
+  assert_eq!(fine, phrase, "non-CJK: both modes split on spaces");
+  assert_eq!(
+    fine.iter().map(|(w, _)| w.as_str()).collect::<Vec<_>>(),
+    vec![" Hello", " world"]
+  );
 }

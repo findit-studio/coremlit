@@ -128,6 +128,81 @@ impl core::str::FromStr for ChunkingStrategy {
 }
 
 // ---------------------------------------------------------------------
+// WordGrouping
+// ---------------------------------------------------------------------
+
+/// How decoded tokens are grouped into "words" for word-level timestamps
+/// (coremlit issue #14). Rust-only: Swift has no such switch — it picks the
+/// strategy from a language it detects internally, which is precisely the
+/// hidden second language decision that caused the original divergence
+/// (issue #9), so this port makes the choice explicit instead.
+///
+/// This only affects **word grouping**. It is orthogonal to the optional
+/// `nl-recognizer` feature, which is about *which language code* reaches
+/// the splitter, not about how that splitter then groups.
+#[derive(
+  Debug, Default, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display, derive_more::IsVariant,
+)]
+#[display("{}", self.as_str())]
+#[non_exhaustive]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum WordGrouping {
+  /// One "word" per Unicode scalar for languages that are not
+  /// whitespace-delimited (`zh`/`ja`/`th`/`lo`/`my`/`yue`), and ordinary
+  /// space/punctuation splitting for every other language. **The default,
+  /// and today's behavior exactly.**
+  ///
+  /// This is the product-correct grouping for CJK: those scripts do not
+  /// separate words with spaces, so space splitting collapses a whole
+  /// utterance into one undifferentiated blob with a single start/end time.
+  /// Per-character grouping is what makes word timestamps mean anything
+  /// there (test-pinned in coremlit issue #11: 85 fine-grained words on the
+  /// ZH clip, against Swift's 24 phrase-blobs).
+  #[default]
+  FineGrained,
+  /// Space/punctuation splitting for **every** language, CJK included —
+  /// the coarse "phrase blob" grouping Swift produces for CJK.
+  ///
+  /// Swift lands here for CJK by accident, not by choice: its
+  /// `NLLanguageRecognizer` returns a regional code like `zh-Hant`, which
+  /// its own CJK check (`Models.swift:1301`, matching bare codes only)
+  /// fails to recognize, so the text falls through to the space splitter.
+  /// This variant reproduces that grouping deliberately, for a consumer who
+  /// wants byte-comparable word grouping against Swift — never as a
+  /// default.
+  Phrase,
+}
+
+impl WordGrouping {
+  /// Stable snake_case name of the variant.
+  #[inline(always)]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::FineGrained => "fine_grained",
+      Self::Phrase => "phrase",
+    }
+  }
+}
+
+/// Error parsing a [`WordGrouping`] name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("unknown word grouping name")]
+pub struct ParseWordGroupingError(());
+
+impl core::str::FromStr for WordGrouping {
+  type Err = ParseWordGroupingError;
+
+  fn from_str(s: &str) -> Result<Self, Self::Err> {
+    Ok(match s {
+      "fine_grained" => Self::FineGrained,
+      "phrase" => Self::Phrase,
+      _ => return Err(ParseWordGroupingError(())),
+    })
+  }
+}
+
+// ---------------------------------------------------------------------
 // DecodingOptions
 // ---------------------------------------------------------------------
 
@@ -213,19 +288,23 @@ fn default_drop_blank_audio() -> bool {
 }
 
 /// Decode-time configuration: Swift's 27-knob `DecodingOptions` surface
-/// (spec §6.2), plus two Rust-only additions — [`Self::seed`], for
+/// (spec §6.2), plus three Rust-only additions — [`Self::seed`], for
 /// reproducible temperature-fallback sampling (coremlit issue #9; see the
-/// crate root's "Reproducibility and provenance" docs), and
-/// [`Self::drop_blank_audio`], the post-decode blank-audio segment filter
-/// (coremlit issue #14). `new()`/`Default` apply Swift's defaults verbatim
+/// crate root's "Reproducibility and provenance" docs), and, from coremlit
+/// issue #14, [`Self::drop_blank_audio`] (the post-decode blank-audio
+/// segment filter) and [`Self::word_grouping`] (the explicit CJK
+/// word-grouping mode). `new()`/`Default` apply Swift's defaults verbatim
 /// for every ported knob; `seed` defaults unset (`None`), matching today's
-/// OS-seeded behavior exactly.
+/// OS-seeded behavior exactly, and `word_grouping` defaults to the
+/// fine-grained grouping this port already used.
 ///
 /// **[`Self::drop_blank_audio`] is the sole knob whose default deliberately
 /// diverges from Swift** (it defaults `true`, dropping the `[BLANK_AUDIO]`
 /// segments Swift emits) — a product decision, with `false` as the exact
 /// parity escape hatch. See that field's own doc; every other default here
-/// is Swift's.
+/// is Swift's — including [`Self::word_grouping`], whose
+/// [`WordGrouping::Phrase`] variant is what reproduces Swift's CJK
+/// grouping, strictly on opt-in.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DecodingOptions {
@@ -395,6 +474,10 @@ pub struct DecodingOptions {
   /// deliberate Swift-parity divergence it carries.
   #[cfg_attr(feature = "serde", serde(default = "default_drop_blank_audio"))]
   drop_blank_audio: bool,
+  /// How decoded tokens are grouped into words for word-level timestamps.
+  /// Defaults to [`WordGrouping::FineGrained`] — today's behavior exactly.
+  #[cfg_attr(feature = "serde", serde(default))]
+  word_grouping: WordGrouping,
 }
 
 impl Default for DecodingOptions {
@@ -436,6 +519,7 @@ impl DecodingOptions {
       chunking_strategy: ChunkingStrategy::Disabled,
       verbose: false,
       drop_blank_audio: DEFAULT_DROP_BLANK_AUDIO,
+      word_grouping: WordGrouping::FineGrained,
     }
   }
 
@@ -1491,6 +1575,46 @@ impl DecodingOptions {
   #[inline(always)]
   pub const fn clear_drop_blank_audio(&mut self) -> &mut Self {
     self.drop_blank_audio = false;
+    self
+  }
+
+  // -- word_grouping --------------------------------------------------------
+  /// How decoded tokens are grouped into words when
+  /// [`Self::word_timestamps`] is on (coremlit issue #14). Defaults to
+  /// [`WordGrouping::FineGrained`], which is today's behavior **exactly**:
+  /// per-Unicode-scalar grouping for the non-whitespace-delimited languages
+  /// (`zh`/`ja`/`th`/`lo`/`my`/`yue`), space/punctuation splitting for
+  /// everything else.
+  ///
+  /// [`WordGrouping::Phrase`] forces the space splitter for **every**
+  /// language, CJK included — reproducing, as an explicit opt-in, the
+  /// coarse phrase-blob grouping Swift falls into for CJK. Making that an
+  /// opt-in rather than a default is the whole point: Swift arrives there
+  /// by a *hidden* second language decision (its `NLLanguageRecognizer`
+  /// returns `zh-Hant`, which its own bare-code CJK check then misses), and
+  /// that hidden decision is what produced the original divergence in
+  /// coremlit issue #9. This crate keeps the fine-grained default pinned
+  /// (issue #11) and lets a caller ask for Swift's grouping by name.
+  ///
+  /// Inert unless [`Self::word_timestamps`] is set: word grouping only runs
+  /// inside the DTW alignment pass. It never affects the transcript text,
+  /// the tokens, or the segments — only how a segment's words are carved
+  /// out of them.
+  #[inline(always)]
+  pub const fn word_grouping(&self) -> WordGrouping {
+    self.word_grouping
+  }
+  /// Builder form of [`Self::set_word_grouping`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_word_grouping(mut self, word_grouping: WordGrouping) -> Self {
+    self.set_word_grouping(word_grouping);
+    self
+  }
+  /// Sets [`Self::word_grouping`] in place.
+  #[inline(always)]
+  pub const fn set_word_grouping(&mut self, word_grouping: WordGrouping) -> &mut Self {
+    self.word_grouping = word_grouping;
     self
   }
 }
