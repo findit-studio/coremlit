@@ -6,10 +6,14 @@
 //!
 //! # The fundamental difference: argmax decodes IN-GRAPH
 //!
-//! FluidAudio's segmenter emits raw powerset logits `[1, 589, 7]` and this
+//! FluidAudio's segmenter emits per-frame powerset **log-probabilities**
+//! `[1, 589, 7]` — its graph's tail is `softmax` → `log`, not a bare
+//! linear ([`crate::segment`]'s module doc quotes the MIL) — and this
 //! crate decodes them host-side with dia's exact semantics
 //! ([`crate::segment::multilabel`], [`crate::extract`]'s overlap-exclusion
-//! mask derivation). argmax's segmenter emits **already-decoded** tensors:
+//! mask derivation), which is sound because a `log_softmax` shifts each
+//! row by a constant and so preserves its argmax. argmax's segmenter emits
+//! **already-decoded** tensors:
 //! it takes 30 s of waveform and returns per-window, per-frame, per-speaker
 //! activity having done the windowing, the powerset decode, the overlap
 //! detection and a VAD *inside the CoreML graph*, with **its own**

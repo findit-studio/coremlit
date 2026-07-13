@@ -3,11 +3,25 @@
 //! per chunk.
 //!
 //! Both sides run the SAME model (pyannote/segmentation-3.0) on the SAME raw
-//! 16 kHz waveform — dia-ort's raw powerset logits are the committed golden
+//! 16 kHz waveform — dia-ort's powerset output is the committed golden
 //! (`tests/fixtures/golden/*.json`, produced by `tests/generate_goldens.rs`);
-//! CoreML re-runs the conversion (`pyannote_segmentation.mlmodelc`). Neither
-//! side softmaxes (both return raw logits), so the raw comparison is
-//! logit-vs-logit in the identical frame-major `[frame * 7 + class]` layout.
+//! CoreML re-runs the conversion (`pyannote_segmentation.mlmodelc`).
+//!
+//! **Both sides emit `log(softmax(·))`, not raw logits** — this file, the
+//! golden's `seg_logits` field name, and `generate_goldens.rs` all said
+//! "raw logits, neither side softmaxes" until the graphs were read.
+//! `pyannote_segmentation.mlmodelc/model.mil` ends `softmax` → `log` →
+//! `-> (segments)` (quoted in `crate::segment`'s module doc), and the
+//! committed ORT golden is log-probabilities on its own arithmetic: all
+//! 4123 values are `<= 0` and every 7-class row satisfies
+//! `sum(exp(row)) == 1.000000`. The comparison below is therefore still
+//! apples-to-apples — log-probs vs log-probs, identical frame-major
+//! `[frame * 7 + class]` layout — and its conclusions stand. Only the
+//! description of WHAT is being compared was wrong.
+//!
+//! The naming is left as-is (`seg_logits` in the golden, `logits` locals):
+//! renaming the committed fixture field would churn every golden for no
+//! behavioral gain. The values are log-probabilities; read them as such.
 //!
 //! # The re-frame: the DECISION metric gates; the raw stats are REPORTED
 //!
