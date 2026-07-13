@@ -1,5 +1,11 @@
 use super::*;
-use crate::result::TranscriptionTimings;
+use crate::{
+  audio::{
+    chunker::{AudioChunk, VadChunker, prepare_seek_clips},
+    vad::{EnergyVad, VoiceActivityDetector},
+  },
+  result::TranscriptionTimings,
+};
 
 /// A deliberately all-non-default decode configuration: every field the
 /// capture below asserts differs from `DecodingOptions::new()`, so a
@@ -49,11 +55,14 @@ fn from_options_captures_every_library_known_field() {
   // does not pretend to: `for_result` is the one that records it.
   assert_eq!(provenance.detected_language(), None);
 
-  // The identity the library genuinely cannot observe is never invented.
+  // What the library genuinely cannot observe is never invented — the
+  // identity, and (though `chunking_strategy` above proves VAD ran) the
+  // detector that drove it.
   assert_eq!(provenance.model_id(), None);
   assert_eq!(provenance.model_revision(), None);
   assert_eq!(provenance.tokenizer_id(), None);
   assert_eq!(provenance.tokenizer_revision(), None);
+  assert_eq!(provenance.vad_detector(), None);
 }
 
 #[test]
@@ -236,6 +245,126 @@ fn identity_uses_the_full_option_vocabulary() {
   assert_eq!(via_maybe.model_revision(), Some("feedface"));
 }
 
+#[test]
+fn provenance_never_infers_the_vad_detector() {
+  // The detector is consumer-supplied for the same reason the model and
+  // tokenizer identity are: this crate cannot observe it. `WhisperKit`
+  // holds it as a `Box<dyn VoiceActivityDetector>` — a trait object with
+  // no identity to read — and it lives on the pipeline, not in
+  // `DecodingOptions`/`ComputeOptions`, so no constructor here is ever
+  // handed it. `chunking_strategy` records THAT VAD ran; nothing records
+  // WHICH detector ran unless the caller says so.
+
+  // A real detector, at `WhisperKit::set_vad_detector`'s own boxed type,
+  // and a genuinely behavior-changing one: it never reports silence, so
+  // the chunker finds no silence midpoint to cut at and falls through to
+  // whole-window boundaries.
+  struct AlwaysActiveVad;
+  impl VoiceActivityDetector for AlwaysActiveVad {
+    fn voice_activity(&self, samples: &[f32]) -> Vec<bool> {
+      vec![true; samples.len().div_ceil(self.frame_length_samples())]
+    }
+    fn frame_length_samples(&self) -> usize {
+      crate::audio::vad::DEFAULT_FRAME_LENGTH_SAMPLES
+    }
+  }
+  let installed: Box<dyn VoiceActivityDetector + Send + Sync> = Box::new(AlwaysActiveVad);
+
+  // The premise, driven through the exact seam `WhisperKit::transcribe`
+  // drives (`VadChunker::chunk_all(self.vad_detector.as_ref(), ..)`,
+  // `transcribe/mod.rs:1195`): which detector is installed decides where
+  // the chunks fall, and the chunk boundaries decide the text. Two silent
+  // stretches inside 96_000 samples, 48_000-sample windows.
+  let mut audio = vec![0.1f32; 96_000];
+  audio[32_000..35_200].fill(0.0);
+  audio[64_000..67_200].fill(0.0);
+  let clips = prepare_seek_clips(&[], audio.len()).unwrap();
+  let boundaries = |vad: &(dyn VoiceActivityDetector + Send + Sync)| {
+    VadChunker::new()
+      .chunk_all(vad, &audio, 48_000, &clips)
+      .iter()
+      .map(AudioChunk::seek_offset)
+      .collect::<Vec<_>>()
+  };
+  assert_ne!(
+    boundaries(&EnergyVad::new()),
+    boundaries(installed.as_ref()),
+    "the swap must move the chunk boundaries, or the rest proves nothing"
+  );
+
+  // ... and yet the record cannot see any of it. Both runs are described
+  // by the same options, and the options are ALL the constructor is given,
+  // so the best a consumer can do for two runs whose transcripts differ is
+  // two byte-identical records. That is the gap this field closes.
+  let decoding = DecodingOptions::new().with_chunking_strategy(ChunkingStrategy::Vad);
+  let compute = ComputeOptions::new();
+  let result = result_at("en", &[0.0]);
+  let default_run = Provenance::for_result(&decoding, &compute, &result);
+  let installed_run = Provenance::for_result(&decoding, &compute, &result);
+  assert_eq!(
+    default_run, installed_run,
+    "there is no constructor parameter the detector could arrive through"
+  );
+
+  // So it stays `None` — never a name derived from the concrete type, from
+  // `type_name`, or from the bare fact that VAD chunking ran.
+  assert_eq!(installed_run.chunking_strategy(), ChunkingStrategy::Vad);
+  assert_eq!(
+    installed_run.vad_detector(),
+    None,
+    "never inferred: not `AlwaysActiveVad`, not the default `EnergyVad`"
+  );
+
+  // Only the consumer — the one party that knows what it installed — can
+  // close the gap, through the same option vocabulary the identity fields
+  // use.
+  let named =
+    Provenance::for_result(&decoding, &compute, &result).with_vad_detector("AlwaysActiveVad");
+  assert_eq!(named.vad_detector(), Some("AlwaysActiveVad"));
+  assert_ne!(
+    named, default_run,
+    "supplied, the two runs are finally distinguishable"
+  );
+  assert_eq!(
+    Provenance::for_result(&decoding, &compute, &result)
+      .maybe_vad_detector(Some("AlwaysActiveVad".to_string())),
+    named
+  );
+
+  let mut mutated =
+    Provenance::for_result(&decoding, &compute, &result).with_vad_detector("AlwaysActiveVad");
+  mutated.clear_vad_detector();
+  assert_eq!(mutated.vad_detector(), None);
+  mutated.set_vad_detector("EnergyVad");
+  assert_eq!(mutated.vad_detector(), Some("EnergyVad"));
+  mutated.update_vad_detector(None);
+  assert_eq!(mutated.vad_detector(), None);
+
+  // Unset is ABSENT on the wire, exactly like the identity pairs: an
+  // unsupplied detector must never read back as a known `null`. Supplied,
+  // it round-trips.
+  #[cfg(feature = "serde")]
+  {
+    let unsupplied: serde_json::Value = serde_json::to_value(&installed_run).unwrap();
+    assert!(
+      !unsupplied.as_object().unwrap().contains_key("vad_detector"),
+      "an unsupplied detector is absent, not null"
+    );
+    assert_eq!(
+      serde_json::from_str::<Provenance>(&unsupplied.to_string()).unwrap(),
+      installed_run,
+      "and it reads back `None`, never a guess"
+    );
+
+    let supplied: serde_json::Value = serde_json::to_value(&named).unwrap();
+    assert_eq!(supplied["vad_detector"], "AlwaysActiveVad");
+    assert_eq!(
+      serde_json::from_str::<Provenance>(&supplied.to_string()).unwrap(),
+      named
+    );
+  }
+}
+
 #[cfg(feature = "serde")]
 #[test]
 fn serde_round_trips_every_field() {
@@ -243,7 +372,8 @@ fn serde_round_trips_every_field() {
     .with_model_id("openai_whisper-tiny")
     .with_model_revision("a1b2c3d")
     .with_tokenizer_id("openai/whisper-tiny")
-    .with_tokenizer_revision("deadbeef");
+    .with_tokenizer_revision("deadbeef")
+    .with_vad_detector("SileroVad");
 
   let json = serde_json::to_string(&full).unwrap();
   assert_eq!(serde_json::from_str::<Provenance>(&json).unwrap(), full);
@@ -263,6 +393,7 @@ fn unset_identity_serializes_as_absent_not_null() {
     "model_revision",
     "tokenizer_id",
     "tokenizer_revision",
+    "vad_detector",
     "seed",
   ] {
     assert!(

@@ -139,15 +139,40 @@
 //!   [`WhisperKit::set_vad_detector`](transcribe::WhisperKit::set_vad_detector))
 //!
 //! [`Provenance`](provenance::Provenance) assembles that record for you
-//! (coremlit issue #14): [`Provenance::from_options`](provenance::Provenance::from_options)
-//! captures every library-known item above from the resolved
+//! (coremlit issue #14). Of the items above, the **library-known** ones —
+//! compute units, chunking strategy, language, prefill, special-token
+//! skipping, word timestamps, and the rest of the decode configuration —
+//! are captured wholesale by
+//! [`Provenance::from_options`](provenance::Provenance::from_options) from
+//! the resolved
 //! [`DecodingOptions`](options::DecodingOptions)/[`ComputeOptions`](options::ComputeOptions)
-//! plus the *effective* decode temperature, and the two identity pairs —
-//! which this crate genuinely cannot observe, since it loads bare local
-//! folders — are settable `Option` fields the caller fills in. Under the
-//! `serde` feature the whole record serializes (unset identity omitted, so
-//! it can never masquerade as a known `null`), as do
-//! [`DecodingOptions`](options::DecodingOptions),
+//! plus the *effective* decode temperature. The remaining three are
+//! **consumer-supplied**: settable `Option` fields, left `None` and never
+//! guessed, because this crate genuinely cannot observe them.
+//!
+//! - Model identity and tokenizer identity — it loads bare local folders,
+//!   so it never sees a repo id or a revision.
+//! - The **VAD detector**
+//!   ([`Provenance::vad_detector`](provenance::Provenance::vad_detector)).
+//!   This one is not an oversight: the pipeline holds the detector as a
+//!   `Box<dyn `[`VoiceActivityDetector`](audio::vad::VoiceActivityDetector)`>`
+//!   ([`WhisperKit::vad_detector`](transcribe::WhisperKit::vad_detector)),
+//!   and a trait object carries no identity to read — nor does it live in
+//!   either options struct, so
+//!   [`from_options`](provenance::Provenance::from_options) could not
+//!   reach it even if it had a name. The record therefore says *whether*
+//!   VAD chunking ran
+//!   ([`chunking_strategy`](provenance::Provenance::chunking_strategy)),
+//!   never *which* detector drove it. Since a swapped detector moves the
+//!   chunk boundaries — and the boundaries move the transcript — a
+//!   consumer that calls
+//!   [`set_vad_detector`](transcribe::WhisperKit::set_vad_detector) should
+//!   name it here, or two runs that differ only in detector leave
+//!   byte-identical records with no trace of what made their text differ.
+//!
+//! Under the `serde` feature the whole record serializes (unset
+//! consumer-supplied fields omitted, so they can never masquerade as a
+//! known `null`), as do [`DecodingOptions`](options::DecodingOptions),
 //! [`ComputeOptions`](options::ComputeOptions), and
 //! [`Options`](options::Options) individually.
 //!

@@ -15,23 +15,42 @@
 //! - **Library-known** — everything reachable from the resolved
 //!   [`DecodingOptions`] (task, language and its resolved
 //!   `detect_language` coupling, prefill, skip-special, word-timestamps,
-//!   chunking/VAD strategy, the whole temperature-fallback ladder, the
-//!   seed), the [`ComputeOptions`] the pipeline was built with, and — from
-//!   the transcript itself — the language the decode actually **detected**
-//!   and the *effective* temperature it actually landed on.
+//!   the chunking strategy — *whether* VAD chunking ran, never *which*
+//!   detector drove it; see below — the whole temperature-fallback ladder,
+//!   the seed), the [`ComputeOptions`] the pipeline was built with, and —
+//!   from the transcript itself — the language the decode actually
+//!   **detected** and the *effective* temperature it actually landed on.
 //!   [`Provenance::from_options`] fills in everything the options alone
 //!   settle; [`Provenance::for_result`] adds the two outcome facts, and is
 //!   the constructor to reach for when you have a transcript in hand.
-//! - **Consumer-supplied** — the model and tokenizer identity
-//!   ([`Provenance::model_id`]/[`Provenance::model_revision`],
-//!   [`Provenance::tokenizer_id`]/[`Provenance::tokenizer_revision`]).
-//!   These are *load-time* facts: this crate loads models and tokenizers
-//!   from plain local folders ([`crate::options::Options`] holds nothing
-//!   but two [`std::path::Path`]s; model auto-download is deferred, spec
-//!   §4.7), so nothing in the pipeline ever sees a Hub repo id or a git
-//!   revision. They start `None` and stay `None` unless the caller — who
-//!   *does* know which artifact it put in those folders — sets them. This
-//!   crate will not fabricate a revision it cannot observe.
+//! - **Consumer-supplied** — three facts this crate cannot observe. All
+//!   start `None`, stay `None` until the caller sets them, and are never
+//!   guessed:
+//!   - The model identity ([`Provenance::model_id`]/
+//!     [`Provenance::model_revision`]) and the tokenizer identity
+//!     ([`Provenance::tokenizer_id`]/[`Provenance::tokenizer_revision`]).
+//!     These are *load-time* facts: this crate loads models and tokenizers
+//!     from plain local folders ([`crate::options::Options`] holds nothing
+//!     but two [`std::path::Path`]s; model auto-download is deferred, spec
+//!     §4.7), so nothing in the pipeline ever sees a Hub repo id or a git
+//!     revision. Only the caller — who *does* know which artifact it put
+//!     in those folders — can say. This crate will not fabricate a
+//!     revision it cannot observe.
+//!   - The VAD detector ([`Provenance::vad_detector`]). It is
+//!     **doubly** unobservable: the pipeline holds it as a
+//!     `Box<dyn VoiceActivityDetector>`
+//!     ([`crate::transcribe::WhisperKit::vad_detector`]), and a trait
+//!     object carries no identity to read; and it lives on
+//!     [`WhisperKit`](crate::transcribe::WhisperKit), not in
+//!     [`DecodingOptions`] or [`ComputeOptions`], so the constructors here
+//!     could not reach it even if it had a name. That is why
+//!     [`Provenance::chunking_strategy`] records only *whether* VAD ran.
+//!     Supplying the detector matters because swapping it
+//!     ([`crate::transcribe::WhisperKit::set_vad_detector`]) moves the
+//!     chunk boundaries, and the boundaries move the transcript — so two
+//!     runs differing *only* in detector would otherwise leave
+//!     byte-identical records with no trace of what made their text
+//!     differ.
 //!
 //! # Why these fields are worth recording
 //!
@@ -109,13 +128,14 @@ fn unanimous_temperature(segments: &[TranscriptionSegment]) -> Option<f32> {
 /// A serde-serializable record of what produced a transcript: the resolved
 /// decode configuration, the compute units it ran on, the language it
 /// detected and the effective temperature it landed on, and — when the
-/// caller supplies them — the model and tokenizer identity.
+/// caller supplies them — the model and tokenizer identity and the VAD
+/// detector.
 ///
 /// Build it with [`Self::for_result`] when you have the transcript (the
 /// form that records the detected language and the effective temperature);
 /// with [`Self::for_segment`] to record one segment's own rung of the
 /// fallback ladder; or with [`Self::from_options`] from the configuration
-/// alone. Then attach the identity the library cannot know:
+/// alone. Then attach what the library cannot know:
 ///
 /// ```
 /// use whisperkit::{
@@ -136,12 +156,16 @@ fn unanimous_temperature(segments: &[TranscriptionSegment]) -> Option<f32> {
 /// assert_eq!(provenance.model_id(), Some("openai_whisper-tiny"));
 /// // Never fabricated: the tokenizer identity was not supplied.
 /// assert_eq!(provenance.tokenizer_revision(), None);
+/// // Nor is the VAD detector ever guessed — it is a `dyn` trait object on
+/// // `WhisperKit`, so only the caller that installed it can name it.
+/// assert_eq!(provenance.vad_detector(), None);
 /// ```
 ///
 /// The library-known fields are captured facts, so they are read-only
 /// (there are no setters for them — reconstruct from the options instead);
-/// only the four identity fields are settable, and each serializes as
-/// **absent** while unset rather than as `null`.
+/// only the five consumer-supplied fields are settable — the two identity
+/// pairs and [`Self::vad_detector`] — and each serializes as **absent**
+/// while unset rather than as `null`.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Provenance {
@@ -253,6 +277,31 @@ pub struct Provenance {
     serde(default, skip_serializing_if = "Option::is_none")
   )]
   tokenizer_revision: Option<String>,
+
+  // -- consumer-supplied: the VAD detector --------------------------------
+  /// Which VAD detector drove the chunking, if the caller supplied it.
+  ///
+  /// Never inferred — not from the detector's concrete type, not from
+  /// [`std::any::type_name`], and not from [`Self::chunking_strategy`]
+  /// being [`ChunkingStrategy::Vad`]. The pipeline holds the detector as a
+  /// `Box<dyn VoiceActivityDetector>`
+  /// ([`crate::transcribe::WhisperKit::vad_detector`]), which exposes no
+  /// identity to read, and it lives on
+  /// [`WhisperKit`](crate::transcribe::WhisperKit) rather than in
+  /// [`DecodingOptions`]/[`ComputeOptions`] — so no constructor here can
+  /// reach it. Only the caller that installed it knows what it is.
+  ///
+  /// Worth supplying whenever it is not the default
+  /// [`EnergyVad`](crate::audio::vad::EnergyVad): the detector decides
+  /// where the chunk boundaries fall, and the boundaries decide the text,
+  /// so two runs that differ *only* in detector yield different
+  /// transcripts from records that are otherwise identical.
+  /// [`Self::chunking_strategy`] alone cannot tell them apart.
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "Option::is_none")
+  )]
+  vad_detector: Option<String>,
 }
 
 impl Provenance {
@@ -286,6 +335,10 @@ impl Provenance {
       model_revision: None,
       tokenizer_id: None,
       tokenizer_revision: None,
+      // Structurally unreachable from here, and never guessed: the
+      // detector lives on `WhisperKit`, behind a `dyn` trait object with
+      // no identity to read (see the field's doc).
+      vad_detector: None,
     }
   }
 
@@ -675,6 +728,46 @@ impl Provenance {
   #[inline(always)]
   pub fn clear_tokenizer_revision(&mut self) -> &mut Self {
     self.tokenizer_revision = None;
+    self
+  }
+
+  // -- vad_detector (Option<String>) ---------------------------------------
+  /// Which VAD detector drove the chunking, if the caller supplied it.
+  /// Never inferred — see the field's doc.
+  #[inline(always)]
+  pub fn vad_detector(&self) -> Option<&str> {
+    self.vad_detector.as_deref()
+  }
+  /// Builder form of [`Self::set_vad_detector`].
+  #[must_use]
+  #[inline(always)]
+  pub fn with_vad_detector(mut self, vad_detector: impl Into<String>) -> Self {
+    self.set_vad_detector(vad_detector);
+    self
+  }
+  /// Sets [`Self::vad_detector`] to `Some(vad_detector)`.
+  #[inline(always)]
+  pub fn set_vad_detector(&mut self, vad_detector: impl Into<String>) -> &mut Self {
+    self.vad_detector = Some(vad_detector.into());
+    self
+  }
+  /// Builder form of [`Self::update_vad_detector`].
+  #[must_use]
+  #[inline(always)]
+  pub fn maybe_vad_detector(mut self, vad_detector: Option<String>) -> Self {
+    self.update_vad_detector(vad_detector);
+    self
+  }
+  /// Assigns [`Self::vad_detector`] directly.
+  #[inline(always)]
+  pub fn update_vad_detector(&mut self, vad_detector: Option<String>) -> &mut Self {
+    self.vad_detector = vad_detector;
+    self
+  }
+  /// Sets [`Self::vad_detector`] to `None`.
+  #[inline(always)]
+  pub fn clear_vad_detector(&mut self) -> &mut Self {
+    self.vad_detector = None;
     self
   }
 }
