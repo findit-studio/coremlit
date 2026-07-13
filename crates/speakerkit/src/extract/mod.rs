@@ -144,11 +144,14 @@ use crate::{
 /// (`diarization/src/offline/owned.rs:522`; pyannote's `min_num_frames =
 /// ceil(589 * 400 / (10 * 16000)) = 2`).
 ///
-/// `pub(crate)` because [`crate::source::ArgmaxSource`] applies the SAME rule
-/// to argmax's own tensors (its module doc's "The overlap-exclusion fallback"
-/// section). Both sources share this one constant rather than re-declaring it,
-/// so the two mask policies cannot drift apart.
-pub(crate) const EXCLUDE_OVERLAP_MIN_FRAMES: usize = 2;
+/// `pub` (not `pub(crate)`) for two independent reasons rather than one:
+/// [`crate::source::ArgmaxSource`] applies the SAME rule to argmax's own
+/// tensors (its module doc's "The overlap-exclusion fallback" section), and
+/// `tests/parity_argmax_swift.rs` — a separate crate, so `pub(crate)` cannot
+/// reach it — asserts the fallback never fires on any consumed slot. All
+/// three name this ONE constant rather than each declaring their own `2`, so
+/// none of them can drift apart.
+pub const EXCLUDE_OVERLAP_MIN_FRAMES: usize = 2;
 
 /// PLDA minimum raw-embedding L2 norm: a slot whose raw embedding has a
 /// smaller norm is dropped (its column zeroed, its row left zero) before

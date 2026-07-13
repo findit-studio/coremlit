@@ -89,7 +89,27 @@ private struct GoldenChunk: Encodable {
   /// The `w`s for which `SpeakerEmbedderContext.bounded(windowIdx:)` is true.
   let boundedWindows: [Int]
   /// `chunkOffset(k) + round(w * secondsPerStride)` for those `w` — argmax's
-  /// own `windowIndex` formula (`SpeakerEmbedderModel.swift:300`).
+  /// own `windowIndex` formula (`SpeakerEmbedderModel.swift:300`), evaluated
+  /// over EVERY bounded window regardless of speaker activity.
+  ///
+  /// Deliberately NOT read back from `run.embeddings[].windowIndex`, even
+  /// though that field carries the identical formula's output
+  /// (`GoldenSlot.chunk` below IS it): `SpeakerEmbedderModel.processChunk`
+  /// only appends a `SpeakerEmbedding` for a `(window, speaker)` pair whose
+  /// speaker is in `context.activeSpeakerIndices(for: windowIdx)`
+  /// (`SpeakerEmbedderModel.swift:284-307` — the outer `for windowIdx` loop
+  /// has no `else` branch, so a bounded window with ZERO active speakers
+  /// contributes no `SpeakerEmbedding` and thus no `windowIndex` at all).
+  /// Deriving `globalChunks` from emitted `windowIndex` values would
+  /// therefore silently narrow it from "every bounded window" to "every
+  /// bounded window with >=1 detected speaker" — a different, weaker
+  /// invariant that happens to coincide with this formula on the three
+  /// fixtures committed today (every bounded window here has >=1 consumed
+  /// slot — verified against the goldens) but is not guaranteed to for a
+  /// future fixture with a genuinely silent bounded window. `chunkOffset(for:)`
+  /// IS read from argmax (`SpeakerEmbedderContext`, called below); only the
+  /// stride arithmetic is restated, because argmax exposes no callable
+  /// narrower than the private `processChunk` that returns this value.
   let globalChunks: [Int]
 }
 
