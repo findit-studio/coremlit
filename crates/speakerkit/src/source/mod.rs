@@ -34,8 +34,10 @@
 //!
 //! # [`argmax::ArgmaxSource`]: the in-graph-decoded source
 //!
-//! argmax's segmenter does NOT emit raw logits — it takes 30 s of waveform
-//! and returns already-decoded per-window/frame/speaker activity, having
+//! argmax's segmenter does NOT emit a per-frame powerset row for this
+//! crate to decode (FluidAudio's emits `log(softmax(·))` log-probabilities;
+//! see [`crate::segment`]'s module doc) — it takes 30 s of waveform and
+//! returns already-decoded per-window/frame/speaker activity, having
 //! done the windowing, the powerset decode and the overlap detection inside
 //! the CoreML graph with its OWN semantics. So [`argmax::ArgmaxSource`]
 //! reuses none of the host-side decode above: it maps argmax's decoded

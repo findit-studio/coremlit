@@ -1,6 +1,6 @@
 //! CoreML wrapper for `pyannote_segmentation.mlmodelc` (spec §4) and the
-//! powerset→multilabel decode that turns its raw logits into dia's
-//! `segmentations` tensor layout.
+//! powerset→multilabel decode that turns its per-frame log-probabilities
+//! into dia's `segmentations` tensor layout.
 //!
 //! Ports the model-facing half of dia's `segment` stage — `SegmentModel`
 //! (`diarization/src/segment/model.rs`) — over `coremlit` instead of `ort`,
@@ -70,39 +70,79 @@
 //!   both formats), so building the lookup table directly in `f64` here is
 //!   bit-identical to dia's f32-then-cast.
 //!
-//! # No-softmax equivalence
+//! # `segments` is `log(softmax(·))`, NOT raw logits
 //!
-//! dia's audio-in pipeline computes `softmax_row(&row)` before argmaxing
-//! (`diarization/src/offline/owned.rs:484-494`). [`multilabel`] argmaxes
-//! the RAW logits instead — no softmax. These are equivalent because
-//! softmax, evaluated over one fixed row, is a strictly monotonic, order-
-//! AND tie-preserving transform of that row's logits: every class in a row
-//! shares the same normalizing denominator `D = Σ exp(logits)`, so
-//! `softmax(logits)_i = exp(logits_i) / D`, and since `exp` is strictly
-//! increasing and `D > 0`:
+//! This module's docs asserted "raw powerset logits" until someone read
+//! the graph. They are not. `pyannote_segmentation.mlmodelc/model.mil`
+//! ends (lines 137-139, immediately before its `-> (segments)` return):
 //!
-//! - `logits_i > logits_j  <=>  softmax(logits)_i > softmax(logits)_j`
-//! - `logits_i == logits_j <=> softmax(logits)_i == softmax(logits)_j`
+//! ```text
+//! var_231_softmax_cast_fp16 = softmax(axis = var_230, x = linear_2_cast_fp16)
+//! var_231_epsilon_0_to_fp16 = const()[..., val = tensor<fp16, []>(0x0p+0)]
+//! var_231_cast_fp16         = log(epsilon = var_231_epsilon_0_to_fp16,
+//!                                 x = var_231_softmax_cast_fp16)
+//! segments                  = cast(dtype = fp32, x = var_231_cast_fp16)
+//! ```
 //!
-//! in exact (real-number) arithmetic — so `argmax` over raw logits and
-//! `argmax` over softmaxed probabilities always select the same class,
-//! including which side of a tie wins. Skipping softmax also saves 7
-//! `exp` calls and a division per frame for an identical result.
+//! `segments` is that `log`'s output. The tensor holds per-frame
+//! **log-probabilities** — a `log_softmax` the converter decomposed into
+//! `softmax` → `log`. The fp32 `Segmentation.mlmodelc` variant has the
+//! identical tail and names its output `log_probs`, which is the honest
+//! name.
 //!
-//! **Floating-point caveat** (why this holds "in practice", not as an
-//! absolute guarantee): the equivalence above assumes exact arithmetic.
-//! `expf`'s rounding means it is (astronomically unlikely, but not
-//! impossible) for two DISTINCT `f32` logits close enough together to
-//! round to the IDENTICAL `f32` softmax output after `exp`+divide, while
-//! the raw logits themselves still compare unequal. In that specific edge
-//! case, raw-logit argmax and softmax-then-argmax could pick different
-//! classes on what raw-logit argmax sees as a clear (if extremely close)
-//! winner but softmax-then-argmax sees as an exact tie. Real segmentation-
-//! model logits are not adversarially constructed to sit on this boundary,
-//! so this is a documented theoretical caveat, not an observed divergence.
-//! An EXACT tie in the raw logits, by contrast, is provably also an exact
-//! tie after softmax (same input bits in, same `exp` output bits out), so
-//! the ordinary tie-handling case below is exact, not approximate.
+//! That mistake was not cosmetic: it is precisely why nobody went looking
+//! for a `log` op — and there is one, carrying an `epsilon` of literally
+//! `0x0p+0`. See "fp16 hazard" below.
+//!
+//! # Why argmaxing it without a softmax is still correct
+//!
+//! dia's audio-in pipeline runs `softmax_row(&row)` before argmaxing
+//! (`diarization/src/offline/owned.rs:484-494`), because dia's ONNX model
+//! really does emit raw logits `z`. [`multilabel`] argmaxes this model's
+//! output directly. The two select the same class — but NOT for the
+//! reason previously documented here (which assumed we, too, held `z`).
+//!
+//! In exact arithmetic `log(softmax(z))_i = z_i - logsumexp(z)`, and
+//! `logsumexp(z)` is a single scalar shared by every class in the row. So
+//! this model's output is each frame's logit vector shifted by a **per-row
+//! constant** — and subtracting a constant from every element of a row
+//! changes neither which element is largest nor which elements are exactly
+//! equal:
+//!
+//! - `z_i > z_j  <=>  z_i - c > z_j - c`
+//! - `z_i == z_j <=> z_i - c == z_j - c`
+//!
+//! Hence `argmax(log(softmax(z))) == argmax(softmax(z)) == argmax(z)`,
+//! ties included, and [`multilabel`]'s private `hard_argmax` is order-for-order
+//! dia's decode. (Monotonicity alone would give the same answer here, but
+//! the constant-shift form is the stronger statement: it is exact, not
+//! merely order-preserving, so the tie rule below is exact too.)
+//!
+//! [`multilabel`] therefore consumes only the ORDERING of each row. It
+//! never reads a magnitude, which is what keeps the decode correct in
+//! spite of the next section.
+//!
+//! # fp16 hazard in the shipped graph (a KNOWN, pinned defect)
+//!
+//! That in-graph `log`'s guard epsilon is `0x0p+0` — zero. Its fp32 and
+//! argmax-vendored siblings carry `0x1p-149`, which is fp32's smallest
+//! subnormal and rounds to zero in fp16 all the same. Every epsilon below
+//! fp16's smallest subnormal (`2^-24` ≈ 5.96e-8) is inert on any ANE/GPU
+//! path — i.e. on the default [`coremlit::ComputeUnits::All`] — so a
+//! softmax output that underflows to 0 reaches `log(0)`, which saturates
+//! (≈ -45440 on the ANE) instead of being guarded.
+//!
+//! `coremlit`'s `tests/fp16_guards.rs` pins this graph, and every other
+//! shipped graph, against that floor. Two consequences for callers:
+//!
+//! - The argmax decode survives it. Classes that underflow all saturate to
+//!   the same floor, so they tie at the BOTTOM of the row; with seven
+//!   classes the winner's softmax is at least `1/7`, so the winning class
+//!   can never underflow and can never be displaced.
+//! - The magnitudes do NOT survive it. On any fp16 path these values are
+//!   saturated, not calibrated log-probabilities. Do not consume
+//!   `segments` as a confidence, a threshold input, or a log-likelihood.
+//!   Only its per-row ordering is trustworthy.
 //!
 //! # Tie handling
 //!
@@ -216,7 +256,8 @@ fn describe(shape: &[usize], dtype: Option<DataType>) -> String {
 
 /// CoreML wrapper over `pyannote_segmentation.mlmodelc`: one
 /// [`SEG_CHUNK_SAMPLES`]-sample chunk in, flattened `[num_frames *
-/// POWERSET_CLASSES]` raw powerset logits out — layout-identical to dia's
+/// POWERSET_CLASSES]` powerset **log-probabilities** out (the graph's tail
+/// is `softmax` → `log`; see the module doc) — layout-identical to dia's
 /// `SegmentModel::infer` (`diarization/src/segment/model.rs:280-357`; see
 /// the module doc's "dia contract match" section).
 #[derive(Debug)]
@@ -303,9 +344,15 @@ impl SegmentModel {
   }
 
   /// Runs one segmentation chunk, returning flattened `[num_frames *
-  /// POWERSET_CLASSES]` raw powerset logits, row-major `[frame][class]` —
-  /// layout-identical to dia's `SegmentModel::infer`
+  /// POWERSET_CLASSES]` powerset **log-probabilities**, row-major
+  /// `[frame][class]` — layout-identical to dia's `SegmentModel::infer`
   /// (`diarization/src/segment/model.rs:280-357`).
+  ///
+  /// These are `log(softmax(z))`, not the raw logits `z`: the graph's tail
+  /// is a decomposed `log_softmax` (module doc, "`segments` is
+  /// `log(softmax(·))`"). Consume the per-row ORDERING — which is
+  /// identical to the logits' — and not the magnitudes, which the graph's
+  /// inert fp16 `log` epsilon saturates on ANE/GPU paths.
   ///
   /// # Errors
   /// [`InferError::InputLength`] unless `samples.len() == SEG_CHUNK_SAMPLES`
@@ -450,8 +497,10 @@ fn hard_argmax(row: &[f32; POWERSET_CLASSES]) -> usize {
 /// `segmentations` buffer uses for one chunk
 /// (`diarization/src/offline/owned.rs:496`:
 /// `segs[(c * FRAMES_PER_WINDOW + f) * SLOTS_PER_CHUNK + s]`, `c = 0`). See
-/// the module doc's "No-softmax equivalence" and "Tie handling" sections
-/// for why this operates on raw logits, no softmax, and how ties resolve.
+/// the module doc's "Why argmaxing it without a softmax is still correct"
+/// and "Tie handling" sections for why this needs no softmax of its own
+/// (the input is already `log(softmax(·))`, i.e. the logits shifted by a
+/// per-row constant) and how ties resolve.
 ///
 /// `logits` is expected to be finite, as [`SegmentModel::infer`] guarantees
 /// for its own output — the same precondition dia's callers establish

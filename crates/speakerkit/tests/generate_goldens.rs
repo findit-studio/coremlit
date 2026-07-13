@@ -135,7 +135,13 @@ fn generate_goldens() {
     let mut chunk_values: Vec<serde_json::Value> = Vec::with_capacity(chunks.len());
 
     for (c, chunk) in chunks.iter().enumerate() {
-      // dia-ort segmentation: raw powerset logits [num_frames * 7], no softmax.
+      // dia-ort segmentation: [num_frames * 7] powerset LOG-PROBABILITIES,
+      // not raw logits (this comment claimed "no softmax" until the values
+      // were checked: every element is <= 0 and each 7-class row satisfies
+      // sum(exp(row)) == 1.0). The CoreML side emits the same quantity —
+      // its MIL ends `softmax` -> `log` — so `parity_seg.rs` compares like
+      // with like. The `logits`/`seg_logits` names are kept to avoid
+      // churning every committed golden; the values are log-probs.
       let logits = seg.infer(chunk).expect("dia-ort segmentation infer");
       assert_eq!(
         logits.len() % POWERSET_CLASSES,
@@ -184,7 +190,7 @@ fn generate_goldens() {
       "source": fixture.source,
       "wav_sha256": fixture.sha256,
       "sample_count": samples.len(),
-      "seg_model": "segmentation-3.0.onnx (dia bundled, ort CPU EP, raw powerset logits)",
+      "seg_model": "segmentation-3.0.onnx (dia bundled, ort CPU EP, powerset log-probabilities)",
       "embed_model": "wespeaker_resnet34_lm.onnx (dia BYO, ort CPU EP, fp32)",
       "onset": ONSET,
       "num_chunks": chunks.len(),
