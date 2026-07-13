@@ -97,3 +97,116 @@ fn finalize_appends_eot_once() {
   sampler.finalize(&mut tokens, &mut logprobs); // idempotent: already ends in EOT
   assert_eq!(tokens.len(), 3);
 }
+
+// ---------------------------------------------------------------------
+// derive_attempt_seed
+// ---------------------------------------------------------------------
+
+#[test]
+fn derive_attempt_seed_is_pure_and_deterministic() {
+  // Same triple, same result -- every time, no hidden state.
+  assert_eq!(
+    derive_attempt_seed(1, 2, 3),
+    derive_attempt_seed(1, 2, 3),
+    "pure function: identical inputs must reproduce identical output"
+  );
+  // Each coordinate independently changes the result.
+  assert_ne!(
+    derive_attempt_seed(1, 2, 3),
+    derive_attempt_seed(1, 2, 4),
+    "attempt_index must change the derived seed"
+  );
+  assert_ne!(
+    derive_attempt_seed(1, 2, 3),
+    derive_attempt_seed(1, 3, 3),
+    "window_index must change the derived seed"
+  );
+  assert_ne!(
+    derive_attempt_seed(1, 2, 3),
+    derive_attempt_seed(2, 2, 3),
+    "the base seed must change the derived seed"
+  );
+}
+
+#[test]
+fn derive_attempt_seed_has_no_collisions_over_realistic_ranges() {
+  // Statistical decorrelation check over a generous window/attempt range
+  // (temperature_fallback_count defaults to 5, so 0..=8 already exceeds
+  // any default configuration; 0..64 windows covers long-form audio's
+  // window count many times over). A broken derivation that ignored (or
+  // truncated) either coordinate would collide immediately here.
+  let mut seen = std::collections::HashSet::new();
+  for window in 0..64u64 {
+    for attempt in 0..=8u64 {
+      let derived = derive_attempt_seed(0xABCD_1234_5678_9ABC, window, attempt);
+      assert!(
+        seen.insert(derived),
+        "collision at window={window} attempt={attempt}"
+      );
+    }
+  }
+}
+
+/// A seeded, non-degenerate (multi-candidate) sampler at `temperature =
+/// 0.7` -- top_k defaults to 5, so this is a genuine multinomial draw
+/// among several candidates, not a coin flip between two or a foregone
+/// argmax.
+fn seeded_sampler(seed: u64) -> GreedyTokenSampler {
+  GreedyTokenSampler::new(0.7, 999, &DecodingOptions::new()).with_seed(seed)
+}
+
+fn draw_sequence(sampler: &mut GreedyTokenSampler, logits: &[f32], n: usize) -> Vec<u32> {
+  (0..n).map(|_| sampler.sample(logits).token()).collect()
+}
+
+#[test]
+fn attempt_seed_derivation_changes_sampled_draws_across_attempts() {
+  // Proves the (window, attempt) sub-seed derivation is actually wired
+  // into distinct SAMPLING streams, not just distinct numbers in the
+  // abstract: two samplers seeded from adjacent attempt indices at the
+  // same window draw different sequences from the exact same logits.
+  //
+  // Mutation check performed by hand (not left in the tree): temporarily
+  // making `derive_attempt_seed` ignore `attempt_index` (returning the
+  // same sub-seed for every attempt at a fixed window) made this
+  // `assert_ne!` fail, confirming the test is sensitive to exactly the
+  // bug class it exists to catch.
+  let seed = 0xC0FFEE_u64;
+  let window = 3u64;
+  let logits: Vec<f32> = (0..32).map(|i| i as f32 * 0.1 - 1.6).collect();
+
+  let mut attempt0 = seeded_sampler(derive_attempt_seed(seed, window, 0));
+  let mut attempt1 = seeded_sampler(derive_attempt_seed(seed, window, 1));
+  let draws0 = draw_sequence(&mut attempt0, &logits, 20);
+  let draws1 = draw_sequence(&mut attempt1, &logits, 20);
+  assert_ne!(
+    draws0, draws1,
+    "different attempt_index must decorrelate the sampled stream"
+  );
+
+  // Reproducibility half: the identical (window, attempt) pair always
+  // replays the identical stream (this is what makes a whole
+  // transcription reproducible from one base seed).
+  let mut replay0 = seeded_sampler(derive_attempt_seed(seed, window, 0));
+  let replay_draws0 = draw_sequence(&mut replay0, &logits, 20);
+  assert_eq!(draws0, replay_draws0);
+}
+
+#[test]
+fn attempt_seed_derivation_changes_sampled_draws_across_windows() {
+  // Same proof as above, along the window_index coordinate instead of
+  // attempt_index: two different windows at the same attempt must not
+  // share a draw stream either.
+  let seed = 0xC0FFEE_u64;
+  let attempt = 1u64;
+  let logits: Vec<f32> = (0..32).map(|i| i as f32 * 0.1 - 1.6).collect();
+
+  let mut window0 = seeded_sampler(derive_attempt_seed(seed, 0, attempt));
+  let mut window1 = seeded_sampler(derive_attempt_seed(seed, 1, attempt));
+  let draws0 = draw_sequence(&mut window0, &logits, 20);
+  let draws1 = draw_sequence(&mut window1, &logits, 20);
+  assert_ne!(
+    draws0, draws1,
+    "different window_index must decorrelate the sampled stream"
+  );
+}

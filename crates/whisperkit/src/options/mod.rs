@@ -1,9 +1,9 @@
 //! Configuration types for the WhisperKit pipeline (spec §5.3, §6.2): the
-//! full 27-knob decode-time surface ([`DecodingOptions`]), per-stage compute
-//! unit selection ([`ComputeOptions`]), and construction config
-//! ([`Options`]). Ports `Configurations.swift` `DecodingOptions`/
-//! `WhisperKitConfig` and `Models.swift`
-//! `DecodingTask`/`ChunkingStrategy`/`ModelComputeOptions`.
+//! 27-knob decode-time surface Swift exposes, plus one Rust-only
+//! reproducibility addition ([`DecodingOptions`]), per-stage compute unit
+//! selection ([`ComputeOptions`]), and construction config ([`Options`]).
+//! Ports `Configurations.swift` `DecodingOptions`/`WhisperKitConfig` and
+//! `Models.swift` `DecodingTask`/`ChunkingStrategy`/`ModelComputeOptions`.
 //!
 //! Reference implementation of rust-options-pattern for this workspace:
 //! `DEFAULT_*` consts are the single source of truth; `new()` is `const`
@@ -203,9 +203,12 @@ fn default_use_prefill_prompt() -> bool {
   DEFAULT_USE_PREFILL_PROMPT
 }
 
-/// Decode-time configuration: the full 27-knob surface Swift exposes as
-/// `DecodingOptions` (spec §6.2). `new()`/`Default` apply Swift's defaults
-/// verbatim.
+/// Decode-time configuration: Swift's 27-knob `DecodingOptions` surface
+/// (spec §6.2), plus one Rust-only addition — [`Self::seed`], for
+/// reproducible temperature-fallback sampling (coremlit issue #9; see the
+/// crate root's "Reproducibility and provenance" docs). `new()`/`Default`
+/// apply Swift's defaults verbatim for every ported knob; `seed` defaults
+/// unset (`None`), matching today's OS-seeded behavior exactly.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DecodingOptions {
@@ -240,6 +243,14 @@ pub struct DecodingOptions {
   /// Candidate count for non-zero-temperature sampling.
   #[cfg_attr(feature = "serde", serde(default = "default_top_k"))]
   top_k: usize,
+  /// Base seed for reproducible temperature-fallback sampling. `None`
+  /// (the default) leaves sampling OS-seeded. See [`Self::seed`] for the
+  /// full contract.
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "Option::is_none")
+  )]
+  seed: Option<u64>,
   /// Force the prefill tokens from `task`/`language` rather than let the
   /// model choose them.
   #[cfg_attr(feature = "serde", serde(default = "default_use_prefill_prompt"))]
@@ -381,6 +392,7 @@ impl DecodingOptions {
       temperature_fallback_count: DEFAULT_TEMPERATURE_FALLBACK_COUNT,
       sample_length: DEFAULT_SAMPLE_LENGTH,
       top_k: DEFAULT_TOP_K,
+      seed: None,
       use_prefill_prompt: DEFAULT_USE_PREFILL_PROMPT,
       detect_language: None,
       skip_special_tokens: false,
@@ -553,6 +565,66 @@ impl DecodingOptions {
   #[inline(always)]
   pub const fn set_top_k(&mut self, top_k: usize) -> &mut Self {
     self.top_k = top_k;
+    self
+  }
+
+  // -- seed (Option<u64>) ---------------------------------------------------
+  /// Base seed for reproducible temperature-fallback sampling.
+  ///
+  /// `None` (the default) leaves every attempt's
+  /// [`GreedyTokenSampler`](crate::decode::sampler::GreedyTokenSampler)
+  /// OS-seeded, matching Swift's own unseeded `Float.random`
+  /// (`TokenSampler.swift:169`) — nondeterministic at `temperature > 0`,
+  /// by design, on both runtimes; this is the byte-unchanged default
+  /// path.
+  ///
+  /// `Some(seed)` makes the whole transcription reproducible instead:
+  /// [`crate::transcribe::TranscribeTask`]'s fallback ladder derives an
+  /// independent per-(window, attempt) sub-seed from it via
+  /// [`derive_attempt_seed`](crate::decode::sampler::derive_attempt_seed)
+  /// rather than reusing `seed` verbatim everywhere (see that function's
+  /// doc for why, and for the exact mixing function) — so re-running the
+  /// same audio through the same options and `seed` always samples the
+  /// identical tokens, with the fallback ladder still fully enabled. A
+  /// seed makes this port's *own* output reproducible; it cannot make
+  /// that output match Swift's, which has no seed knob of its own and
+  /// always draws unseeded — record the effective temperature in
+  /// provenance either way
+  /// ([`TranscriptionSegment::temperature`](crate::result::TranscriptionSegment::temperature)).
+  #[inline(always)]
+  pub const fn seed(&self) -> Option<u64> {
+    self.seed
+  }
+  /// Builder form of [`Self::set_seed`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_seed(mut self, seed: u64) -> Self {
+    self.set_seed(seed);
+    self
+  }
+  /// Sets [`Self::seed`] to `Some(seed)`.
+  #[inline(always)]
+  pub const fn set_seed(&mut self, seed: u64) -> &mut Self {
+    self.seed = Some(seed);
+    self
+  }
+  /// Builder form of [`Self::update_seed`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn maybe_seed(mut self, seed: Option<u64>) -> Self {
+    self.update_seed(seed);
+    self
+  }
+  /// Assigns [`Self::seed`] directly.
+  #[inline(always)]
+  pub const fn update_seed(&mut self, seed: Option<u64>) -> &mut Self {
+    self.seed = seed;
+    self
+  }
+  /// Sets [`Self::seed`] to `None`.
+  #[inline(always)]
+  pub const fn clear_seed(&mut self) -> &mut Self {
+    self.seed = None;
     self
   }
 

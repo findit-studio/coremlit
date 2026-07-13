@@ -76,7 +76,10 @@ use crate::{
   audio::{self, chunker},
   backend::{AlignmentMatrix, InferenceBackend, coreml::CoreMlBackend},
   constants::{APPEND_PUNCTUATION, DEFAULT_LANGUAGE_CODE, PREPEND_PUNCTUATION, SAMPLE_RATE},
-  decode::{self, TranscriptionProgressCallback, sampler::GreedyTokenSampler},
+  decode::{
+    self, TranscriptionProgressCallback,
+    sampler::{self, GreedyTokenSampler},
+  },
   error::{DecodeError, ModelError, TranscribeError},
   model::{ModelVariant, detect_variant, manager::ModelManager},
   options::{DecodingOptions, Options},
@@ -281,6 +284,16 @@ where
     let window_padding = (options.window_clip_time() * SAMPLE_RATE as f32) as usize;
     let window_samples = self.backend.dims().window_samples();
 
+    // Strictly monotonic, 0-based count of windows this `run` call has
+    // attempted so far (incremented once per `decode_with_fallback` call,
+    // below) — the seed-derivation input `sampler::derive_attempt_seed`'s
+    // doc calls `window_index`. Deliberately NOT the `window_id` computed
+    // inside `decode_with_fallback` for progress-callback attribution:
+    // that value is derived from `timings` counters a prior window's
+    // fallback can leave in a stale state (see its own doc), so it is not
+    // guaranteed distinct across windows the way seed derivation needs.
+    let mut window_index: u64 = 0;
+
     let decode_loop_start = Instant::now();
     for (seek_clip_start, seek_clip_end) in seek_clips {
       // :116 — Swift's signed `seek < seekClipEnd - windowPadding` is
@@ -351,7 +364,9 @@ where
           &mut detected_language,
           options,
           &mut timings,
+          window_index,
         )?;
+        window_index += 1;
 
         // :178-194.
         let windowing_start = Instant::now();
@@ -529,6 +544,16 @@ where
   /// fallback and again before the caller's next window (see
   /// [`AlignmentMatrix`]'s own doc). `None` when `options.word_timestamps()`
   /// is `false` or the backend has no alignment data for this window.
+  ///
+  /// **Rust-only addition, no Swift equivalent:** each attempt's sampler is
+  /// seeded from `options.seed()` when set, via
+  /// [`sampler::derive_attempt_seed`] applied to `window_index` (this
+  /// call's own position in [`Self::run`]'s strictly monotonic per-window
+  /// counter, combined with `self.window_id_offset`) and the loop's own
+  /// `attempt` index — see that function's doc for the full mixing
+  /// contract. `options.seed()` unset takes the exact same
+  /// [`GreedyTokenSampler::new`] OS-seeded path as before this knob
+  /// existed: the default is byte-unchanged.
   #[allow(clippy::too_many_arguments)] // Mirrors Swift's decodeWithFallback argument
   // surface (mirroring decode_text's own precedent for this exact lint, per
   // its doc comment); no natural subset of these forms a cohesive struct
@@ -541,6 +566,7 @@ where
     detected_language: &mut Option<String>,
     options: &DecodingOptions,
     timings: &mut TranscriptionTimings,
+    window_index: u64,
   ) -> Result<(DecodingResult, Option<AlignmentMatrix>), TranscribeError> {
     let special = *self.tokenizer.special_tokens();
 
@@ -572,6 +598,20 @@ where
       let temperature =
         options.temperature() + attempt as f32 * options.temperature_increment_on_fallback();
       let mut sampler = GreedyTokenSampler::new(temperature, special.end_token(), options);
+      // `options.seed()` unset (the default): no-op, leaving `sampler`'s
+      // OS-seeded RNG exactly as `GreedyTokenSampler::new` just built it —
+      // byte-identical to the pre-seed-knob behavior. Set: reseed with
+      // this (window, attempt) pair's own derived sub-seed, so the whole
+      // transcription reproduces bit-for-bit across runs while every
+      // window/attempt still draws an independent stream (see
+      // `sampler::derive_attempt_seed`'s doc for the full contract).
+      if let Some(seed) = options.seed() {
+        sampler = sampler.with_seed(sampler::derive_attempt_seed(
+          seed,
+          self.window_id_offset as u64 + window_index,
+          attempt as u64,
+        ));
+      }
       // A FRESH early-stop latch per attempt: Swift initializes a new
       // early-stop entry for every decodeText invocation
       // (TextDecoder.swift:570), so a callback-stopped attempt whose

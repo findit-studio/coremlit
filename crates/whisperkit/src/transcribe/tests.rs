@@ -170,6 +170,124 @@ fn fallback_ladder_retries_with_rising_temperature_then_accepts() {
   );
 }
 
+/// Scripts the exact catastrophic-avg-logprob window
+/// `fallback_ladder_retries_with_rising_temperature_then_accepts` uses to
+/// force the fallback ladder to exhaust all 3 attempts regardless of
+/// temperature (see that test's own comments for the avg-logprob
+/// derivation). Reused here because it is a PROVEN fallback-forcing
+/// script, and because its 4 "flat" (all-zero-but-EOT) steps per attempt
+/// are genuine top-k multinomial draws at temperature > 0: the sampled
+/// TOKEN is RNG-dependent even though the STEP COUNT is not, which is
+/// exactly the observable coremlit issue #9's seed-reproducibility
+/// contract needs.
+fn script_exhausting_fallback_window(mock: &mut MockBackend, end_token: u32) {
+  for _ in 0..3 {
+    for _ in 0..4 {
+      let mut flat = vec![0.0f32; 51865];
+      flat[end_token as usize] = -20.0;
+      mock.push_step(flat);
+    }
+    mock.push_token_step(end_token);
+  }
+}
+
+/// The fallback-exhausting options recipe, with a nonzero base
+/// `temperature` (so even ATTEMPT 0 draws from the RNG — attempt 0 at the
+/// crate's default `temperature() == 0.0` would sample by argmax alone,
+/// never touching the seed) and `seed` set from the given value.
+fn exhausting_fallback_options(seed: Option<u64>) -> DecodingOptions {
+  DecodingOptions::new()
+    .with_temperature(0.3)
+    .with_without_timestamps()
+    .maybe_first_token_logprob_threshold(None)
+    .maybe_compression_ratio_threshold(None)
+    .with_temperature_fallback_count(2) // 3 attempts total
+    .maybe_seed(seed)
+}
+
+/// Runs the exhausting-fallback scenario end to end against a freshly
+/// built [`MockBackend`]/[`TranscribeTask`] pair, so repeated calls are
+/// fully independent runs (no shared mutable state whatsoever) — the
+/// same shape a real caller re-invoking [`WhisperKit::transcribe`] twice
+/// would see.
+fn run_exhausting_fallback(t: &WhisperTokenizer, seed: Option<u64>) -> TranscriptionResult {
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  script_exhausting_fallback_window(&mut mock, special().end_token());
+  let task = TranscribeTask::new(&mock, t);
+  let audio = vec![0.1f32; 32_000];
+  task
+    .run(&audio, &exhausting_fallback_options(seed))
+    .unwrap()
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn seeded_fallback_ladder_is_bit_reproducible_across_runs() {
+  // Closes coremlit issue #9's final open item: with a seed set, the
+  // fallback ladder can stay fully enabled AND be bit-reproducible.
+  // N (here 4) entirely independent runs (fresh backend/task every time)
+  // at the same seed, each forcing the SAME 3-attempt exhausting ladder,
+  // must all sample byte-identical tokens.
+  let t = tiny_tokenizer();
+  let runs: Vec<TranscriptionResult> = (0..4)
+    .map(|_| run_exhausting_fallback(&t, Some(7)))
+    .collect();
+  let reference = &runs[0];
+  assert_eq!(reference.segments_slice().len(), 1);
+  let reference_tokens = reference.segments_slice()[0].tokens_slice();
+  for (index, run) in runs.iter().enumerate().skip(1) {
+    assert_eq!(run.segments_slice().len(), 1);
+    assert_eq!(
+      run.segments_slice()[0].tokens_slice(),
+      reference_tokens,
+      "run {index} diverged from run 0: same seed, same fallback ladder -> byte-identical sampled tokens"
+    );
+    assert_eq!(run.text(), reference.text(), "run {index} text diverged");
+  }
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn seeded_fallback_ladder_differs_across_seeds() {
+  // Proves the seed is actually threaded into the pipeline's sampler
+  // construction, not silently ignored: a DIFFERENT base seed over the
+  // identical scripted scenario must sample different tokens. (If this
+  // ever flakes because two specific seed literals happen to coincide,
+  // that is a signal to pick different literals, not to delete the
+  // property -- verified empirically for the literals below before
+  // trusting them.)
+  let t = tiny_tokenizer();
+  let a = run_exhausting_fallback(&t, Some(7));
+  let b = run_exhausting_fallback(&t, Some(99));
+  assert_ne!(
+    a.segments_slice()[0].tokens_slice(),
+    b.segments_slice()[0].tokens_slice(),
+    "different seeds must not sample the same tokens"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn unseeded_fallback_ladder_still_runs_without_threading_a_seed() {
+  // `seed = None` (the default): the fallback ladder must still run to
+  // completion exactly as it did before this knob existed. Deliberately
+  // NOT asserting any determinism/nondeterminism property here (an
+  // OS-seeded run could coincidentally repeat) -- only that this code
+  // path is exercised successfully. `options.seed()` returning `None`
+  // means `decode_with_fallback`'s `if let Some(seed) = ...` body never
+  // runs, so no seed is threaded into the sampler at all; that skip is a
+  // structural (code-path) guarantee, not something this test can
+  // observe from the outside without breaking the "don't assert
+  // (non)determinism" rule above.
+  let t = tiny_tokenizer();
+  let result = run_exhausting_fallback(&t, None);
+  assert_eq!(result.segments_slice().len(), 1, "lump branch, as scripted");
+  assert!(
+    (result.segments_slice()[0].temperature() - (0.3 + 2.0 * 0.2)).abs() < 1e-3,
+    "ladder still exhausts to the final (highest-temperature) attempt"
+  );
+}
+
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn segment_discovery_callback_fires_per_window() {

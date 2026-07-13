@@ -13,6 +13,7 @@ fn decoding_defaults_match_swift() {
   assert_eq!(o.temperature_fallback_count(), 5);
   assert_eq!(o.sample_length(), 224);
   assert_eq!(o.top_k(), 5);
+  assert_eq!(o.seed(), None); // Rust-only addition (coremlit issue #9): unset by default
   assert!(o.use_prefill_prompt());
   assert_eq!(o.use_prefill_prompt(), DEFAULT_USE_PREFILL_PROMPT); // pin to const
   assert!(!o.detect_language());
@@ -43,18 +44,28 @@ fn builder_and_mutator_vocabulary() {
     .with_temperature(0.4)
     .with_no_speech_threshold(0.9) // set_ = present value
     .maybe_logprob_threshold(None) // maybe_ = raw Option
-    .with_without_timestamps(); // bool with_ takes no arg
+    .with_without_timestamps() // bool with_ takes no arg
+    .with_seed(7);
   assert_eq!(o.temperature(), 0.4);
   assert_eq!(o.no_speech_threshold(), Some(0.9));
   assert_eq!(o.logprob_threshold(), None);
   assert!(o.without_timestamps());
+  assert_eq!(o.seed(), Some(7));
   let mut m = DecodingOptions::new();
   m.set_top_k(10)
     .clear_compression_ratio_threshold()
-    .set_detect_language();
+    .set_detect_language()
+    .set_seed(11);
   assert_eq!(m.top_k(), 10);
   assert_eq!(m.compression_ratio_threshold(), None);
   assert!(m.detect_language());
+  assert_eq!(m.seed(), Some(11));
+  m.update_seed(Some(12));
+  assert_eq!(m.seed(), Some(12));
+  m.clear_seed();
+  assert_eq!(m.seed(), None);
+  let via_maybe = DecodingOptions::new().maybe_seed(Some(13));
+  assert_eq!(via_maybe.seed(), Some(13));
 }
 
 #[test]
@@ -386,10 +397,46 @@ fn decoding_options_empty_collections_skip_serializing() {
   // Unset tri-state `detect_language` is skipped like the `None` floats
   // (see `detect_language_serde_tristate` for the full presence matrix).
   assert!(!object.contains_key("detect_language"));
+  // Unset `seed` (coremlit issue #9) follows the identical
+  // `Option<Copy>` presence rule as `max_initial_timestamp`/
+  // `max_window_seek` (see `seed_serde_absent_when_unset_round_trips_when_set`).
+  assert!(!object.contains_key("seed"));
   assert_eq!(
     serde_json::from_str::<DecodingOptions>(&json).unwrap(),
     DecodingOptions::new()
   );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn seed_serde_absent_when_unset_round_trips_when_set() {
+  // Unset -> key absent (also covered by the exact-key test above).
+  let json = serde_json::to_string(&DecodingOptions::new()).unwrap();
+  let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+  assert!(!value.as_object().unwrap().contains_key("seed"));
+  assert_eq!(
+    serde_json::from_str::<DecodingOptions>(&json)
+      .unwrap()
+      .seed(),
+    None
+  );
+
+  // Missing field -> None, not some sentinel value.
+  let missing: DecodingOptions = serde_json::from_str("{}").unwrap();
+  assert_eq!(missing.seed(), None);
+
+  // Explicit value round-trips exactly, including through the full
+  // u64 range (serde_json represents u64 natively, no float-precision
+  // loss to worry about like it would for e.g. an f64 seed).
+  for seed in [0u64, 1, 42, u64::MAX] {
+    let explicit = DecodingOptions::new().with_seed(seed);
+    let json = serde_json::to_string(&explicit).unwrap();
+    assert!(json.contains(&format!("\"seed\":{seed}")));
+    assert_eq!(
+      serde_json::from_str::<DecodingOptions>(&json).unwrap(),
+      explicit
+    );
+  }
 }
 
 #[cfg(feature = "serde")]
