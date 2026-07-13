@@ -32,32 +32,46 @@
 //! caller who wants to swap models per call without owning them keeps
 //! that option).
 //!
-//! # [`Source`]: today just FluidAudio, `Argmax` reserved
+//! # [`argmax::ArgmaxSource`]: the in-graph-decoded source
 //!
-//! [`crate::extract::Options`] carries a [`Source`] selector so
-//! configuration can name which vendor's source to build — `FluidAudio`
-//! (default, cleanly licensed — design spec §6) or `Argmax`. Only
-//! [`FluidAudioSource`] exists today: `Source::Argmax` is a real,
-//! exhaustively-matchable variant (nothing hides it behind a wildcard —
-//! see this module's `source_variants_are_exhaustively_matchable` test),
-//! but no `ModelSource` impl is built from it yet — that is the multi-source
-//! plan's Task 3 (`ArgmaxSource`). Selecting `Argmax` on an `Options`
-//! value has no effect on its own: nothing in this crate reads
-//! `Options::source` to decide which source to construct yet, so this is
-//! forward-compatible configuration surface, not yet a working switch.
+//! argmax's segmenter does NOT emit raw logits — it takes 30 s of waveform
+//! and returns already-decoded per-window/frame/speaker activity, having
+//! done the windowing, the powerset decode and the overlap detection inside
+//! the CoreML graph with its OWN semantics. So [`argmax::ArgmaxSource`]
+//! reuses none of the host-side decode above: it maps argmax's decoded
+//! tensors straight into the same [`Extraction`]. The two sources can
+//! therefore diarize the same audio differently — by design (spec §4). See
+//! [`argmax`]'s module doc for the full decode semantics, the index mapping,
+//! and every deliberate divergence from argmax's own Swift.
+//!
+//! # [`Source`] and [`AnySource`]: the selector and the dispatcher
+//!
+//! [`crate::extract::Options`] carries a [`Source`] selector naming which
+//! vendor's source to build — `FluidAudio` (default, cleanly licensed —
+//! design spec §6) or `Argmax`. [`AnySource`] is the runtime counterpart: a
+//! built, dispatchable `ModelSource`, one variant per `Source`, constructed
+//! by [`AnySource::load`]. Both its `load` match and its
+//! [`ModelSource::extract`] match are exhaustive with no wildcard arm, so
+//! neither source can silently fall through to the other.
+//!
 //! `Source` is deliberately NOT `#[non_exhaustive]`: unlike this crate's
-//! error enums (which reserve growth room because callers must match
-//! them defensively), `Source`'s whole point right now is that its
-//! variant set is exactly and honestly `{FluidAudio, Argmax}` — a future
-//! dispatcher matching on it should be forced by the compiler to handle
-//! `Argmax` explicitly, not silently fall through a catch-all arm.
+//! error enums (which reserve growth room because callers must match them
+//! defensively), `Source`'s whole point is that its variant set is exactly
+//! and honestly `{FluidAudio, Argmax}` — the dispatcher matching on it is
+//! forced by the compiler to handle every variant explicitly.
+
+use std::path::Path;
 
 use crate::{
   embed::EmbedModel,
-  error::ExtractError,
+  error::{ExtractError, ModelError},
   extract::{Extraction, Extractor, Options},
   segment::SegmentModel,
 };
+
+pub mod argmax;
+
+pub use argmax::{ArgmaxComputeOptions, ArgmaxOptions, ArgmaxSource, ArgmaxVariant};
 
 /// A pluggable seg+embed backend: given 16 kHz mono `samples`, produces the
 /// [`Extraction`] tensor set `dia`'s offline diarizer consumes. See the
@@ -125,25 +139,122 @@ impl ModelSource for FluidAudioSource {
 pub const DEFAULT_SOURCE: Source = Source::FluidAudio;
 
 /// Which vendor's CoreML conversion computes the seg+embed tensors —
-/// [`crate::extract::Options`]'s source selector (design spec §4). See the
-/// module doc's "`Source`: today just FluidAudio, `Argmax` reserved"
-/// section: only `FluidAudio` has a working [`ModelSource`] impl today.
+/// [`crate::extract::Options`]'s source selector (design spec §4). Build the
+/// named source with [`AnySource::load`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum Source {
-  /// [`FluidAudioSource`] — this crate's original pipeline. The default.
+  /// [`FluidAudioSource`] — this crate's original, host-side-decoding
+  /// pipeline. The default.
   FluidAudio,
-  /// The argmax `speakerkit-coreml` source. Reserved for the multi-source
-  /// plan's Task 3 (`ArgmaxSource`): this variant exists and is fully
-  /// matchable today, but no [`ModelSource`] impl is built from it yet —
-  /// selecting it has no effect on its own (module doc).
+  /// [`ArgmaxSource`] — the `argmaxinc/speakerkit-coreml` source, decoded
+  /// in-graph (see [`argmax`]'s module doc).
   Argmax,
 }
 
 impl Default for Source {
   fn default() -> Self {
     DEFAULT_SOURCE
+  }
+}
+
+/// A built, dispatchable [`ModelSource`] — the runtime counterpart to the
+/// [`Source`] selector, owning whichever source's models were loaded.
+///
+/// Both this type's [`ModelSource::extract`] impl and [`Self::load`] match
+/// [`Source`] exhaustively with no wildcard arm, so no path can silently fall
+/// back from one source to the other.
+#[derive(Debug)]
+pub enum AnySource {
+  /// A loaded [`FluidAudioSource`].
+  FluidAudio(FluidAudioSource),
+  /// A loaded [`ArgmaxSource`].
+  Argmax(ArgmaxSource),
+}
+
+impl AnySource {
+  /// Loads the source [`Options::source`] names, from that VENDOR's own
+  /// artifact root.
+  ///
+  /// The two vendors ship different layouts, so `models_root` means a
+  /// different thing per arm — there is no single directory that could serve
+  /// both:
+  ///
+  /// - [`Source::FluidAudio`]: a directory holding
+  ///   `pyannote_segmentation.mlmodelc` and `wespeaker_v2.mlmodelc`
+  ///   (this crate's `Models/speakerkit`).
+  /// - [`Source::Argmax`]: the `speakerkit-coreml` root holding
+  ///   `speaker_segmenter/` and `speaker_embedder/` (this crate's
+  ///   `Models/argmax-speakerkit`) — see [`ArgmaxSource::from_dir_with`].
+  ///
+  /// `options`'s [`crate::window::WindowOptions`] and
+  /// [`crate::extract::ComputeOptions`] are threaded into both arms. The
+  /// argmax arm additionally needs an [`ArgmaxVariant`] (quantization tier)
+  /// and a third compute placement (its fbank preprocessor), neither of which
+  /// exists on the shared [`Options`]; it uses [`ArgmaxOptions::new`]'s
+  /// defaults for those, mapping the preprocessor onto
+  /// [`crate::extract::ComputeOptions::embedder`] (argmax's own Swift likewise
+  /// owns the preprocessor inside its embedder model,
+  /// `SpeakerEmbedderModel.swift:142,148`). A caller who needs a different
+  /// variant builds [`ArgmaxSource::from_dir_with`] directly and wraps it in
+  /// [`Self::Argmax`].
+  ///
+  /// # Errors
+  /// [`ModelError::Load`] / [`ModelError::ContractMismatch`] from whichever
+  /// source's loader runs.
+  pub fn load(models_root: impl AsRef<Path>, options: Options) -> Result<Self, ModelError> {
+    let root = models_root.as_ref();
+    let compute = options.compute();
+    match options.source() {
+      Source::FluidAudio => {
+        let seg = SegmentModel::from_file_with(
+          root.join("pyannote_segmentation.mlmodelc"),
+          crate::segment::SegmentModelOptions::new().with_compute(compute.segmenter()),
+        )?;
+        let embed = EmbedModel::from_file_with(
+          root.join("wespeaker_v2.mlmodelc"),
+          crate::embed::EmbedModelOptions::new().with_compute(compute.embedder()),
+        )?;
+        Ok(Self::FluidAudio(FluidAudioSource::with_options(
+          seg, embed, options,
+        )))
+      }
+      Source::Argmax => {
+        let argmax_options = ArgmaxOptions::new()
+          .with_window(options.window())
+          .with_compute(
+            ArgmaxComputeOptions::new()
+              .with_segmenter(compute.segmenter())
+              .with_preprocessor(compute.embedder())
+              .with_embedder(compute.embedder()),
+          );
+        Ok(Self::Argmax(ArgmaxSource::from_dir_with(
+          root,
+          argmax_options,
+        )?))
+      }
+    }
+  }
+
+  /// The [`Source`] this was built from.
+  #[inline(always)]
+  pub const fn source(&self) -> Source {
+    match self {
+      Self::FluidAudio(_) => Source::FluidAudio,
+      Self::Argmax(_) => Source::Argmax,
+    }
+  }
+}
+
+impl ModelSource for AnySource {
+  /// Dispatches to the loaded source's own `extract`. Exhaustive match — a
+  /// new [`Source`] variant cannot silently route to an existing source.
+  fn extract(&self, samples: &[f32]) -> Result<Extraction, ExtractError> {
+    match self {
+      Self::FluidAudio(source) => source.extract(samples),
+      Self::Argmax(source) => source.extract(samples),
+    }
   }
 }
 

@@ -143,6 +143,31 @@ pub enum ExtractError {
     /// The rejected `onset`.
     onset: f32,
   },
+  /// The configured `step_samples` is one the selected source cannot honor
+  /// because its sliding-window stride is compiled INTO the model graph.
+  ///
+  /// Raised only by [`crate::source::ArgmaxSource`]: argmax's segmenter
+  /// slides its 21 windows internally at a fixed
+  /// [`crate::source::argmax::ARGMAX_WINDOW_STRIDE_SAMPLES`] (16 000 = 1 s,
+  /// derived from the graph's own `[21, 1, 160000]` output shape), so there
+  /// is no knob to vary. [`crate::extract::Extractor`]'s host-side chunk
+  /// planner has no such constraint and accepts any `step_samples` in
+  /// `(0, SEG_CHUNK_SAMPLES]`.
+  ///
+  /// Rejected rather than ignored: silently overriding the caller's
+  /// `step_samples` would return an `Extraction` whose `chunks_sw.step()`
+  /// did not describe its own chunk grid, corrupting every downstream time
+  /// offset `dia` reconstructs from it.
+  #[error(
+    "step_samples ({step}) is not supported by this source: its window stride is fixed at \
+     {required} by the model graph"
+  )]
+  UnsupportedStepSamples {
+    /// The rejected `step_samples`.
+    step: u32,
+    /// The stride the source's graph requires.
+    required: u32,
+  },
   /// The segmentation model's per-chunk frame count disagrees with the
   /// embedding model's mask frame count. This guard has NO dia analog and
   /// cannot: dia shares one `FRAMES_PER_WINDOW` const across both stages

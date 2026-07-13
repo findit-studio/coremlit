@@ -129,6 +129,22 @@ fn extract_error_step_samples_exceeds_window_displays_both() {
   assert!(rendered.contains("160000"));
 }
 
+/// Distinct from `StepSamplesExceedsWindow` above: that one rejects a step
+/// too LARGE for any source, this one rejects a step the SELECTED source
+/// cannot honor at all because its stride is compiled into the model graph
+/// (`crate::source::ArgmaxSource`). Both must render both numbers, so a
+/// caller can see what it asked for AND what the source requires.
+#[test]
+fn extract_error_unsupported_step_samples_displays_both() {
+  let e = ExtractError::UnsupportedStepSamples {
+    step: 8_000,
+    required: 16_000,
+  };
+  let rendered = e.to_string();
+  assert!(rendered.contains("8000"));
+  assert!(rendered.contains("16000"));
+}
+
 #[test]
 fn extract_error_onset_out_of_range_displays_value() {
   let e = ExtractError::OnsetOutOfRange { onset: 1.5 };

@@ -55,6 +55,95 @@ fn source_serde_round_trips() {
 }
 
 // =====================================================================
+// Hermetic: AnySource (the dispatcher)
+// =====================================================================
+
+// `AnySource`'s one-variant-per-`Source` correspondence needs no test of its
+// own: all three of its matches (`load`, `source`, and the `ModelSource`
+// impl) are exhaustive with no wildcard arm, so a `Source` variant with no
+// `AnySource` counterpart — the only way one source could silently route to
+// another — fails to COMPILE. The two properties a test CAN add are the
+// no-fallback error path (below) and real dispatch
+// (`any_source_load_dispatches_by_source`, model-gated).
+
+/// Loading `Source::Argmax` from a directory that holds only the FluidAudio
+/// artifacts must FAIL, not silently fall back to `FluidAudioSource` — the
+/// central honesty property of the dispatcher. (Hermetic: the load fails on
+/// a nonexistent path, no models needed.)
+#[test]
+fn any_source_argmax_does_not_fall_back_to_fluid_audio() {
+  let nowhere = std::path::Path::new("/nonexistent-speakerkit-models");
+  let got = AnySource::load(nowhere, Options::new().with_source(Source::Argmax));
+  assert!(
+    matches!(got, Err(crate::error::ModelError::Load(_))),
+    "a missing argmax model must surface as a load error, never a \
+     FluidAudio source; got {got:?}"
+  );
+  // And the FluidAudio arm fails independently on the same missing path.
+  let got = AnySource::load(nowhere, Options::new().with_source(Source::FluidAudio));
+  assert!(matches!(got, Err(crate::error::ModelError::Load(_))));
+}
+
+/// [`AnySource::load`] builds the source [`Options::source`] names — and
+/// dispatches `extract` to it.
+#[test]
+#[ignore = "requires local argmax + speakerkit models (both env vars)"]
+fn any_source_load_dispatches_by_source() {
+  let samples = load_ted_head();
+
+  let fluid = AnySource::load(models_dir(), Options::new().with_source(Source::FluidAudio))
+    .expect("load FluidAudio via the dispatcher");
+  assert_eq!(fluid.source(), Source::FluidAudio);
+  assert!(matches!(fluid, AnySource::FluidAudio(_)));
+  let fluid_out = fluid.extract(&samples).expect("dispatched extract");
+
+  let argmax_dir = std::env::var_os("ARGMAX_TEST_MODELS").map_or_else(
+    || {
+      std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("Models")
+        .join("argmax-speakerkit")
+    },
+    std::path::PathBuf::from,
+  );
+  let argmax = AnySource::load(argmax_dir, Options::new().with_source(Source::Argmax))
+    .expect("load Argmax via the dispatcher");
+  assert_eq!(argmax.source(), Source::Argmax);
+  assert!(matches!(argmax, AnySource::Argmax(_)));
+  let argmax_out = argmax.extract(&samples).expect("dispatched extract");
+
+  // THAT each call ran its own source is already proven above, by the
+  // compiler: an `AnySource::Argmax` can only dispatch to `ArgmaxSource`
+  // (the `ModelSource` impl's match is exhaustive and wildcard-free), and
+  // `matches!` pinned which variant was built. No output comparison is
+  // needed for that, and none would be sound as a proxy — see below.
+  //
+  // Geometry must agree (the grid theorem in `argmax`'s module doc).
+  assert_eq!(argmax_out.num_chunks(), fluid_out.num_chunks());
+  assert_eq!(
+    argmax_out.num_output_frames(),
+    fluid_out.num_output_frames()
+  );
+  assert_eq!(argmax_out.chunks_sw(), fluid_out.chunks_sw());
+
+  // VALUES are NOT required to agree — the two decodes are independent (spec
+  // §4) — but nor are they required to DIFFER, and asserting they must would
+  // be wrong: on this short, clean, single-speaker clip the two hard decodes
+  // in fact produce IDENTICAL `segmentations`, which is unsurprising (same
+  // underlying pyannote model, two conversions) and reassuring. Only the
+  // embeddings must differ, because the two sources run entirely different
+  // embedding networks (WeSpeaker vs argmax's `SpeakerEmbedder`) — and both
+  // are non-trivial here, so this cannot pass vacuously on two zero buffers.
+  assert!(fluid_out.raw_embeddings().iter().any(|&v| v != 0.0));
+  assert!(argmax_out.raw_embeddings().iter().any(|&v| v != 0.0));
+  assert_ne!(
+    argmax_out.raw_embeddings(),
+    fluid_out.raw_embeddings(),
+    "two different embedding networks cannot produce bit-identical embeddings"
+  );
+}
+
+// =====================================================================
 // Model-gated (all #[ignore]): requires local speakerkit models
 // (SPEAKERKIT_TEST_MODELS or Models/speakerkit/) plus the cross-crate
 // ted_60.wav fixture. Loader/path helpers duplicated in miniature — same
