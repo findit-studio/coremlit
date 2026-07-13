@@ -72,7 +72,8 @@
 //! over the whole sequence axis and attends globally with no padding mask, so
 //! 49 s of zeros perturb every real frame. Every jfk number is therefore a
 //! *sum* of two effects and cannot separate them;
-//! [`fixed_window_padding_is_the_control`] exists solely to bound the second.
+//! [`fixed_window_padding_does_not_explain_the_divergence`] exists solely to
+//! bound the second.
 //!
 //! `ted_60.wav` is **exactly** `ENCODER_WINDOW_SAMPLES`, so `emissions_raw`
 //! borrows the buffer and appends nothing: both encoders see the identical
@@ -174,11 +175,11 @@ const MAX_MEDIAN_BOUNDARY_DELTA_MS: f64 = FRAME_MS;
 ///
 /// The headroom above that is not slack, it is a *measured floor*: alignkit
 /// cannot beat its own fixed-window padding, and
-/// [`fixed_window_padding_is_the_control`] measures the padding's cost —
-/// asry-ort against **itself**, ONNX both times, nothing but the zeros
-/// changing — at a p90 in this same band. A bound tighter than the padding's
-/// own contribution would be demanding that alignkit outperform its model's
-/// input shape.
+/// [`fixed_window_padding_does_not_explain_the_divergence`] measures the
+/// padding's cost — asry-ort against **itself**, ONNX both times, nothing but
+/// the zeros changing — at a p90 in this same band. A bound tighter than the
+/// padding's own contribution would be demanding that alignkit outperform its
+/// model's input shape.
 const MAX_P90_BOUNDARY_DELTA_MS: f64 = 5.0 * FRAME_MS;
 
 /// A boundary disagreement above this is "gross": no longer explicable as
@@ -271,7 +272,7 @@ const MAX_MEDIAN_SCORE_DELTA: f32 = 0.10;
 
 /// Largest tolerated boundary movement when the ORACLE's OWN input is
 /// zero-padded to alignkit's fixed window: **5 frames** at p90.
-/// [`fixed_window_padding_is_the_control`] measures it.
+/// [`fixed_window_padding_does_not_explain_the_divergence`] measures it.
 const MAX_PADDING_P90_DELTA_MS: f64 = 5.0 * FRAME_MS;
 
 // =========================================================================
@@ -293,8 +294,9 @@ const MAX_PADDING_P90_DELTA_MS: f64 = 5.0 * FRAME_MS;
 // | within one frame   | 38/44 (86.4%)      | **367/372 (98.7%)** |
 //
 // That is the affirmative result of this fixture, and it retroactively
-// confirms `fixed_window_padding_is_the_control`: jfk's 12.8 ms median really
-// was the zero-padding, and with the zeros removed it collapses to nothing.
+// confirms `fixed_window_padding_does_not_explain_the_divergence`: jfk's
+// 12.8 ms median really was the zero-padding, and with the zeros removed it
+// collapses to nothing.
 // =========================================================================
 
 /// ted_60's largest tolerated **median** boundary disagreement: **one frame**.
@@ -892,8 +894,9 @@ fn word_timings_agree_with_asry_ort_on_jfk() {
 /// `jfk.wav` is 176,000 samples against a 960,000-sample encoder window, so
 /// **81.7% of what CoreML sees is zeros alignkit appended**. Every number that
 /// test produces is a sum of two effects — the encoder swap and the padding —
-/// and it cannot separate them; `fixed_window_padding_is_the_control` exists
-/// only to bound the second one. `ted_60.wav` is **exactly** 960,000 samples
+/// and it cannot separate them;
+/// `fixed_window_padding_does_not_explain_the_divergence` exists only to bound
+/// the second one. `ted_60.wav` is **exactly** 960,000 samples
 /// ([`ted_60_samples`] asserts it), so `Encoder::emissions_raw` borrows the
 /// caller's buffer and appends **no zeros at all**: both encoders see the
 /// identical 960,000 real samples, and the encoder swap is the *only*
