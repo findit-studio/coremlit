@@ -104,45 +104,103 @@ fn finalize_appends_eot_once() {
 
 #[test]
 fn derive_attempt_seed_is_pure_and_deterministic() {
-  // Same triple, same result -- every time, no hidden state.
+  // Same tuple, same result -- every time, no hidden state.
   assert_eq!(
-    derive_attempt_seed(1, 2, 3),
-    derive_attempt_seed(1, 2, 3),
+    derive_attempt_seed(1, 2, 3, 4),
+    derive_attempt_seed(1, 2, 3, 4),
     "pure function: identical inputs must reproduce identical output"
   );
-  // Each coordinate independently changes the result.
+  // Each of the four coordinates independently changes the result: the
+  // mixer folds every one into its own bijective `splitmix64` round, so
+  // changing exactly one is *guaranteed* to change the output (see
+  // `derive_attempt_seed`'s doc), not merely likely to.
   assert_ne!(
-    derive_attempt_seed(1, 2, 3),
-    derive_attempt_seed(1, 2, 4),
-    "attempt_index must change the derived seed"
+    derive_attempt_seed(1, 2, 3, 4),
+    derive_attempt_seed(2, 2, 3, 4),
+    "the base seed must change the derived seed"
   );
   assert_ne!(
-    derive_attempt_seed(1, 2, 3),
-    derive_attempt_seed(1, 3, 3),
+    derive_attempt_seed(1, 2, 3, 4),
+    derive_attempt_seed(1, 9, 3, 4),
+    "worker_index must change the derived seed"
+  );
+  assert_ne!(
+    derive_attempt_seed(1, 2, 3, 4),
+    derive_attempt_seed(1, 2, 9, 4),
     "window_index must change the derived seed"
   );
   assert_ne!(
-    derive_attempt_seed(1, 2, 3),
-    derive_attempt_seed(2, 2, 3),
-    "the base seed must change the derived seed"
+    derive_attempt_seed(1, 2, 3, 4),
+    derive_attempt_seed(1, 2, 3, 9),
+    "attempt_index must change the derived seed"
+  );
+}
+
+#[test]
+fn derive_attempt_seed_domain_separates_worker_and_window() {
+  // Regression for the caller-side `offset + window_index` SUM alias
+  // (coremlit#13): `transcribe_all` feeds each audio's global index as the
+  // worker id while every task resets its window counter to 0, so
+  // audio-0/window-1 (0 + 1) and audio-1/window-0 (1 + 0) summed to the
+  // same coordinate `1` and shared one StdRng stream -- identical draws on
+  // any shared logits shape (silent/repeated windows, or the MockBackend
+  // that ignores encoder output). Passed as SEPARATE coordinates they must
+  // derive different sub-seeds.
+  for seed in [0u64, 1, 7, u64::MAX] {
+    for attempt in 0..=5u64 {
+      assert_ne!(
+        derive_attempt_seed(seed, 0, 1, attempt),
+        derive_attempt_seed(seed, 1, 0, attempt),
+        "(worker=0, window=1) must not alias (worker=1, window=0) \
+         [seed={seed} attempt={attempt}]"
+      );
+    }
+  }
+}
+
+#[test]
+fn derive_attempt_seed_has_no_zero_collapse_across_base_seeds() {
+  // Regression for the mixer's XOR/zero alias (coremlit#13): the old
+  // `splitmix64(seed ^ window)` mixer folded distinct coordinates together
+  // because `splitmix64(0) == 0`. `(seed=0, window=0)` and
+  // `(seed=1, window=1)` both derived 0, and `(seed=0, window=1)` aliased
+  // `(seed=1, window=0)`. None of these may alias now, and the all-zero
+  // tuple must not derive 0.
+  assert_ne!(
+    derive_attempt_seed(0, 0, 0, 0),
+    0,
+    "the all-zero tuple must not collapse to 0"
+  );
+  assert_ne!(
+    derive_attempt_seed(0, 0, 0, 0),
+    derive_attempt_seed(1, 0, 1, 0),
+    "(seed=0, window=0) must not alias (seed=1, window=1)"
+  );
+  assert_ne!(
+    derive_attempt_seed(0, 0, 1, 0),
+    derive_attempt_seed(1, 0, 0, 0),
+    "(seed=0, window=1) must not alias (seed=1, window=0)"
   );
 }
 
 #[test]
 fn derive_attempt_seed_has_no_collisions_over_realistic_ranges() {
-  // Statistical decorrelation check over a generous window/attempt range
-  // (temperature_fallback_count defaults to 5, so 0..=8 already exceeds
-  // any default configuration; 0..64 windows covers long-form audio's
-  // window count many times over). A broken derivation that ignored (or
-  // truncated) either coordinate would collide immediately here.
+  // Statistical decorrelation check over a generous worker/window/attempt
+  // range (temperature_fallback_count defaults to 5, so 0..=8 already
+  // exceeds any default configuration; 0..64 windows covers long-form
+  // audio's window count many times over; 0..64 workers covers a large
+  // concurrent batch or VAD-chunk count). A broken derivation that ignored,
+  // truncated, or summed any coordinate would collide immediately here.
   let mut seen = std::collections::HashSet::new();
-  for window in 0..64u64 {
-    for attempt in 0..=8u64 {
-      let derived = derive_attempt_seed(0xABCD_1234_5678_9ABC, window, attempt);
-      assert!(
-        seen.insert(derived),
-        "collision at window={window} attempt={attempt}"
-      );
+  for worker in 0..64u64 {
+    for window in 0..64u64 {
+      for attempt in 0..=8u64 {
+        let derived = derive_attempt_seed(0xABCD_1234_5678_9ABC, worker, window, attempt);
+        assert!(
+          seen.insert(derived),
+          "collision at worker={worker} window={window} attempt={attempt}"
+        );
+      }
     }
   }
 }
@@ -161,10 +219,10 @@ fn draw_sequence(sampler: &mut GreedyTokenSampler, logits: &[f32], n: usize) -> 
 
 #[test]
 fn attempt_seed_derivation_changes_sampled_draws_across_attempts() {
-  // Proves the (window, attempt) sub-seed derivation is actually wired
-  // into distinct SAMPLING streams, not just distinct numbers in the
-  // abstract: two samplers seeded from adjacent attempt indices at the
-  // same window draw different sequences from the exact same logits.
+  // Proves the sub-seed derivation is actually wired into distinct SAMPLING
+  // streams, not just distinct numbers in the abstract: two samplers seeded
+  // from adjacent attempt indices at the same (worker, window) draw
+  // different sequences from the exact same logits.
   //
   // Mutation check performed by hand (not left in the tree): temporarily
   // making `derive_attempt_seed` ignore `attempt_index` (returning the
@@ -172,11 +230,12 @@ fn attempt_seed_derivation_changes_sampled_draws_across_attempts() {
   // `assert_ne!` fail, confirming the test is sensitive to exactly the
   // bug class it exists to catch.
   let seed = 0xC0FFEE_u64;
+  let worker = 2u64;
   let window = 3u64;
   let logits: Vec<f32> = (0..32).map(|i| i as f32 * 0.1 - 1.6).collect();
 
-  let mut attempt0 = seeded_sampler(derive_attempt_seed(seed, window, 0));
-  let mut attempt1 = seeded_sampler(derive_attempt_seed(seed, window, 1));
+  let mut attempt0 = seeded_sampler(derive_attempt_seed(seed, worker, window, 0));
+  let mut attempt1 = seeded_sampler(derive_attempt_seed(seed, worker, window, 1));
   let draws0 = draw_sequence(&mut attempt0, &logits, 20);
   let draws1 = draw_sequence(&mut attempt1, &logits, 20);
   assert_ne!(
@@ -184,29 +243,50 @@ fn attempt_seed_derivation_changes_sampled_draws_across_attempts() {
     "different attempt_index must decorrelate the sampled stream"
   );
 
-  // Reproducibility half: the identical (window, attempt) pair always
-  // replays the identical stream (this is what makes a whole
-  // transcription reproducible from one base seed).
-  let mut replay0 = seeded_sampler(derive_attempt_seed(seed, window, 0));
+  // Reproducibility half: the identical tuple always replays the identical
+  // stream (this is what makes a whole transcription reproducible from one
+  // base seed).
+  let mut replay0 = seeded_sampler(derive_attempt_seed(seed, worker, window, 0));
   let replay_draws0 = draw_sequence(&mut replay0, &logits, 20);
   assert_eq!(draws0, replay_draws0);
 }
 
 #[test]
 fn attempt_seed_derivation_changes_sampled_draws_across_windows() {
-  // Same proof as above, along the window_index coordinate instead of
-  // attempt_index: two different windows at the same attempt must not
-  // share a draw stream either.
+  // Same proof as above, along the window_index coordinate: two different
+  // windows at the same (worker, attempt) must not share a draw stream.
   let seed = 0xC0FFEE_u64;
+  let worker = 2u64;
   let attempt = 1u64;
   let logits: Vec<f32> = (0..32).map(|i| i as f32 * 0.1 - 1.6).collect();
 
-  let mut window0 = seeded_sampler(derive_attempt_seed(seed, 0, attempt));
-  let mut window1 = seeded_sampler(derive_attempt_seed(seed, 1, attempt));
+  let mut window0 = seeded_sampler(derive_attempt_seed(seed, worker, 0, attempt));
+  let mut window1 = seeded_sampler(derive_attempt_seed(seed, worker, 1, attempt));
   let draws0 = draw_sequence(&mut window0, &logits, 20);
   let draws1 = draw_sequence(&mut window1, &logits, 20);
   assert_ne!(
     draws0, draws1,
     "different window_index must decorrelate the sampled stream"
+  );
+}
+
+#[test]
+fn attempt_seed_derivation_changes_sampled_draws_across_workers() {
+  // The Class-A alias (coremlit#13) at the SAMPLED-STREAM level: the two
+  // (worker, window) pairs the old `offset + window_index` sum collapsed --
+  // (worker=0, window=1) and (worker=1, window=0) -- must now draw
+  // different sequences from identical logits, exactly as two real
+  // transcription windows sharing a logits shape would need.
+  let seed = 0xC0FFEE_u64;
+  let attempt = 0u64;
+  let logits: Vec<f32> = (0..32).map(|i| i as f32 * 0.1 - 1.6).collect();
+
+  let mut worker0_window1 = seeded_sampler(derive_attempt_seed(seed, 0, 1, attempt));
+  let mut worker1_window0 = seeded_sampler(derive_attempt_seed(seed, 1, 0, attempt));
+  let draws_a = draw_sequence(&mut worker0_window1, &logits, 20);
+  let draws_b = draw_sequence(&mut worker1_window0, &logits, 20);
+  assert_ne!(
+    draws_a, draws_b,
+    "(worker=0, window=1) and (worker=1, window=0) must not share a stream"
   );
 }

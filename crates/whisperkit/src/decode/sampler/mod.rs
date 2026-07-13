@@ -270,8 +270,8 @@ impl GreedyTokenSampler {
 /// rounds that turn a single-bit input difference into an unrelated
 /// (on average half-flipped) 64-bit output. The same finalizer backs
 /// `java.util.SplittableRandom`'s stream splitting; [`derive_attempt_seed`]
-/// below chains two rounds of it to fold extra coordinates into a base
-/// seed.
+/// below chains one round of it per coordinate (base seed, worker, window,
+/// attempt) to fold all four into a single sub-seed.
 const fn splitmix64(x: u64) -> u64 {
   let mut z = x;
   z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -279,45 +279,100 @@ const fn splitmix64(x: u64) -> u64 {
   z ^ (z >> 31)
 }
 
-/// Deterministically derives a per-(window, attempt) sampler seed from a
-/// caller-chosen base `seed` ([`DecodingOptions::seed`]).
+/// Distinct, nonzero *odd* multipliers — one per coordinate — that spread a
+/// coordinate across the full 64-bit width before it is XORed into the
+/// running `splitmix64` state in [`derive_attempt_seed`]. Oddness makes
+/// `coord.wrapping_mul(GAMMA)` a bijection on `u64` (odd values are units
+/// modulo 2^64), so distinct coordinate values never collapse to the same
+/// contribution; using a *different* constant per coordinate — applied at a
+/// *different* mixing round — is what stops two coordinates from aliasing
+/// when their raw values are swapped. `GAMMA_SEED` is SplitMix64's
+/// golden-ratio increment; the other three are the MurmurHash3 / SplitMix64
+/// finalizer multipliers — all well-known full-period mixing constants.
+const GAMMA_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
+const GAMMA_WORKER: u64 = 0xD1B5_4A32_D192_ED03;
+const GAMMA_WINDOW: u64 = 0xFF51_AFD7_ED55_8CCD;
+const GAMMA_ATTEMPT: u64 = 0xC4CE_B9FE_1A85_EC53;
+
+/// Deterministically derives a per-(worker, window, attempt) sampler
+/// sub-seed from a caller-chosen base `seed` ([`DecodingOptions::seed`]).
 ///
 /// Reusing `seed` verbatim for every [`GreedyTokenSampler`] the
 /// temperature-fallback ladder builds would make every window/attempt draw
 /// the exact same RNG stream — wrong the moment two of them share a logits
-/// shape, since they would then sample identical sequences. Instead
-/// `window_index` and `attempt_index` are folded into `seed` through two
-/// rounds of `splitmix64`'s avalanche (this module's private SplitMix64
-/// finalizer, above): the first round mixes in `window_index`, the second
-/// mixes `attempt_index` into that already-avalanched state — so any
-/// `(seed, window_index, attempt_index)` triple that differs in even one
-/// coordinate produces an unrelated 64-bit result, while the identical
-/// triple always reproduces the identical result. That is what lets
-/// [`DecodingOptions::seed`] be, at once, (a) sufficient on its own to
-/// reproduce a whole transcription's sampled tokens bit-for-bit across
-/// separate runs, and (b) safe to reuse across every window and fallback
-/// attempt in that transcription without correlating their draws.
+/// shape, since they would then sample identical sequences. Instead the
+/// three coordinates are *domain-separated*: each is folded into the running
+/// state in its own `splitmix64` round (this module's private SplitMix64
+/// finalizer, above), after an initial round that mixes the base seed with a
+/// nonzero constant. With `s` the running state:
+///
+/// ```text
+/// s = splitmix64(seed           ^ GAMMA_SEED)
+/// s = splitmix64(s ^ worker_index .wrapping_mul(GAMMA_WORKER))
+/// s = splitmix64(s ^ window_index .wrapping_mul(GAMMA_WINDOW))
+/// s = splitmix64(s ^ attempt_index.wrapping_mul(GAMMA_ATTEMPT))
+/// ```
+///
+/// The coordinates are **never summed or otherwise collapsed into one
+/// number**: `worker_index` and `window_index` enter at *different* rounds
+/// through *different* multipliers, so `(worker = 0, window = 1)` and
+/// `(worker = 1, window = 0)` derive unrelated sub-seeds — the earlier
+/// `offset + window_index` sum aliased exactly that pair. And because the
+/// first round mixes `seed` with a nonzero constant, `seed = 0` does not
+/// collapse to `0`, so cross-seed pairs the earlier XOR mixer folded onto a
+/// single value (`(seed = 0, window = 0)` and `(seed = 1, window = 1)` both
+/// became `0` under `splitmix64(seed ^ window)`, since `splitmix64(0) == 0`)
+/// now differ too.
+///
+/// Two guaranteed properties:
+///
+/// * **Reproducible.** This is a pure function of its four arguments, so an
+///   identical `(seed, worker_index, window_index, attempt_index)` tuple
+///   always reproduces the identical result — which is what lets
+///   [`DecodingOptions::seed`] alone reproduce a whole transcription's
+///   sampled tokens bit-for-bit across separate runs.
+/// * **No single-coordinate collapse.** Changing *exactly one* coordinate
+///   (holding the others fixed) is *guaranteed* to change the output, never
+///   merely usually: each `splitmix64` round is a bijection, and a
+///   coordinate reaches its round through an odd-constant multiply then an
+///   XOR — both bijections — so the map from that coordinate to the
+///   post-round state is injective and every later round preserves the
+///   difference. No coordinate (the base seed included) has a value that
+///   aliases another, and none collapses at zero.
+///
+/// A `u64` result cannot be globally injective over the full four-`u64`
+/// input space (pigeonhole), so "collision-free" here means the
+/// per-single-coordinate injectivity above plus being empirically
+/// collision-free across the realistic worker/window/attempt ranges a
+/// transcription reaches — see this module's `derive_attempt_seed` collision
+/// test.
 ///
 /// [`crate::transcribe::TranscribeTask`]'s fallback ladder calls this with
-/// `window_index` a strictly monotonic per-`run` window counter — offset by
-/// the task's own `window_id_offset` (see
-/// [`TranscribeTask::set_window_id_offset`](crate::transcribe::TranscribeTask::set_window_id_offset)'s
-/// doc) to bias distinct chunks/workers toward distinct seed streams (note
-/// this is a decorrelation *nudge*, not a guarantee: per-chunk offsets
-/// increment by 1 while a chunk consumes as many window indices as it has
-/// windows, so `offset + window_index` ranges can overlap across chunks —
-/// harmless, because distinct audio yields distinct logits and thus
-/// distinct draws regardless of the seed) — and `attempt_index` the fallback
-/// loop's own `0..=temperature_fallback_count` counter. The function itself
-/// has no dependency on that caller: it is a pure, public mixing primitive,
-/// so a direct [`decode_text`](crate::decode::decode_text)/
+/// `worker_index` the task's own
+/// [`window_id_offset`](crate::transcribe::TranscribeTask::set_window_id_offset)
+/// (a genuinely unique per-chunk / per-audio / per-worker id, so distinct
+/// chunks and concurrently-running workers now get distinct seed streams as
+/// a real guarantee rather than the pre-fix *nudge*), `window_index` a
+/// strictly monotonic per-`run` window counter *local* to that task (reset
+/// to 0 for every task — precisely why it must be a coordinate separate from
+/// `worker_index`), and `attempt_index` the fallback loop's own
+/// `0..=temperature_fallback_count` counter. The function itself has no
+/// dependency on that caller: it is a pure, public mixing primitive, so a
+/// direct [`decode_text`](crate::decode::decode_text)/
 /// [`detect_language`](crate::decode::detect_language) caller that wants to
 /// replicate (or deliberately diverge from) the pipeline's exact seed
-/// schedule can call it exactly the same way.
+/// schedule can call it the same way.
 #[must_use]
-pub const fn derive_attempt_seed(seed: u64, window_index: u64, attempt_index: u64) -> u64 {
-  let with_window = splitmix64(seed ^ window_index);
-  splitmix64(with_window ^ attempt_index)
+pub const fn derive_attempt_seed(
+  seed: u64,
+  worker_index: u64,
+  window_index: u64,
+  attempt_index: u64,
+) -> u64 {
+  let mut state = splitmix64(seed ^ GAMMA_SEED);
+  state = splitmix64(state ^ worker_index.wrapping_mul(GAMMA_WORKER));
+  state = splitmix64(state ^ window_index.wrapping_mul(GAMMA_WINDOW));
+  splitmix64(state ^ attempt_index.wrapping_mul(GAMMA_ATTEMPT))
 }
 
 /// Index of the largest entry in `logits`, comparing with `f32::total_cmp`

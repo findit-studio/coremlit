@@ -196,7 +196,11 @@ impl<'ctx, B> TranscribeTask<'ctx, B> {
   /// Sets the chunk-worker id [`TranscriptionProgress::window_id`] updates
   /// are offset by — lets a caller running several [`TranscribeTask`]s
   /// concurrently over different audio chunks keep each worker's window ids
-  /// distinct.
+  /// distinct. It doubles as the `worker_index` coordinate of the seeded
+  /// fallback ladder's sub-seed derivation (see
+  /// [`sampler::derive_attempt_seed`]), which is what keeps distinct
+  /// chunks/workers on distinct RNG streams even where their task-local
+  /// window indices coincide.
   #[inline(always)]
   pub const fn set_window_id_offset(&mut self, window_id_offset: usize) -> &mut Self {
     self.window_id_offset = window_id_offset;
@@ -547,13 +551,14 @@ where
   ///
   /// **Rust-only addition, no Swift equivalent:** each attempt's sampler is
   /// seeded from `options.seed()` when set, via
-  /// [`sampler::derive_attempt_seed`] applied to `window_index` (this
-  /// call's own position in [`Self::run`]'s strictly monotonic per-window
-  /// counter, combined with `self.window_id_offset`) and the loop's own
-  /// `attempt` index — see that function's doc for the full mixing
-  /// contract. `options.seed()` unset takes the exact same
-  /// [`GreedyTokenSampler::new`] OS-seeded path as before this knob
-  /// existed: the default is byte-unchanged.
+  /// [`sampler::derive_attempt_seed`] over three domain-separated
+  /// coordinates — `self.window_id_offset` (this task's per-chunk/worker
+  /// id), `window_index` (this call's own position in [`Self::run`]'s
+  /// strictly monotonic per-`run` window counter, local to the task), and
+  /// the loop's own `attempt` index — passed distinctly, never summed; see
+  /// that function's doc for the full mixing contract. `options.seed()`
+  /// unset takes the exact same [`GreedyTokenSampler::new`] OS-seeded path
+  /// as before this knob existed: the default is byte-unchanged.
   #[allow(clippy::too_many_arguments)] // Mirrors Swift's decodeWithFallback argument
   // surface (mirroring decode_text's own precedent for this exact lint, per
   // its doc comment); no natural subset of these forms a cohesive struct
@@ -600,15 +605,16 @@ where
       let mut sampler = GreedyTokenSampler::new(temperature, special.end_token(), options);
       // `options.seed()` unset (the default): no-op, leaving `sampler`'s
       // OS-seeded RNG exactly as `GreedyTokenSampler::new` just built it —
-      // byte-identical to the pre-seed-knob behavior. Set: reseed with
-      // this (window, attempt) pair's own derived sub-seed, so the whole
-      // transcription reproduces bit-for-bit across runs while every
+      // byte-identical to the pre-seed-knob behavior. Set: reseed with this
+      // (worker, window, attempt) triple's own derived sub-seed, so the
+      // whole transcription reproduces bit-for-bit across runs while every
       // window/attempt still draws an independent stream (see
       // `sampler::derive_attempt_seed`'s doc for the full contract).
       if let Some(seed) = options.seed() {
         sampler = sampler.with_seed(sampler::derive_attempt_seed(
           seed,
-          self.window_id_offset as u64 + window_index,
+          self.window_id_offset as u64,
+          window_index,
           attempt as u64,
         ));
       }
@@ -697,6 +703,12 @@ where
             timings.decoding_fallback() + attempt_start.elapsed().as_secs_f64(),
           );
           self.backend.reset_decoder_state(state);
+          // Records the ZERO-BASED `attempt` index of the latest fallback:
+          // the first fallback writes 0.0, which is also this counter's init
+          // value, so it alone cannot tell "never fell back" from "one
+          // fallback at attempt 0" (a true fallback count would be
+          // `attempt + 1`). Kept as-is: the field is public and summed
+          // across merged results, so re-defining it is out of scope here.
           timings.set_total_decoding_fallbacks(attempt as f64);
         }
         None => break,

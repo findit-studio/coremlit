@@ -580,7 +580,7 @@ impl DecodingOptions {
   ///
   /// `Some(seed)` makes the whole transcription reproducible instead:
   /// [`crate::transcribe::TranscribeTask`]'s fallback ladder derives an
-  /// independent per-(window, attempt) sub-seed from it via
+  /// independent per-(worker, window, attempt) sub-seed from it via
   /// [`derive_attempt_seed`](crate::decode::sampler::derive_attempt_seed)
   /// rather than reusing `seed` verbatim everywhere (see that function's
   /// doc for why, and for the exact mixing function) — so re-running the
