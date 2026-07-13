@@ -258,11 +258,11 @@ impl ComputeOptions {
 ///
 /// No `Eq`: [`WindowOptions`] carries an `f32` `onset`.
 ///
-/// `source` is NOT read by [`Extractor::extract`] (it always runs the
-/// FluidAudio orchestration regardless of this field — see
-/// [`crate::source`]'s module doc): today it is forward-compatible
-/// configuration surface for a future source-selecting factory, not yet a
-/// working switch.
+/// `source` is NOT read by [`Extractor::extract`] — that method IS the
+/// FluidAudio orchestration and always runs it, whatever this field says.
+/// The field is read by [`crate::source::AnySource::load`], the dispatcher
+/// that builds the named source; an `Extractor` obtained by other means
+/// simply ignores it.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Options {
@@ -305,8 +305,9 @@ impl Options {
   pub const fn compute(&self) -> ComputeOptions {
     self.compute
   }
-  /// The selected model [`Source`]. See this field's struct-level doc: not
-  /// yet consumed by [`Extractor::extract`].
+  /// The selected model [`Source`] — read by
+  /// [`crate::source::AnySource::load`], not by [`Extractor::extract`] (see
+  /// this field's struct-level doc).
   #[inline(always)]
   pub const fn source(&self) -> Source {
     self.source
@@ -544,18 +545,15 @@ impl Extractor {
         ExtractError::OutputFrameCountOverflow
       }
     })?;
-    let num_output_frames = count.len(); // owned.rs:674
-
-    Ok(Extraction {
+    Ok(Extraction::from_parts(
       raw_embeddings,
       segmentations,
       count,
       num_chunks,
-      num_frames_per_chunk: num_frames,
-      num_output_frames,
+      num_frames,
       chunks_sw,
       frames_sw,
-    })
+    ))
   }
 }
 
@@ -579,6 +577,37 @@ pub struct Extraction {
 }
 
 impl Extraction {
+  /// The single construction site for an [`Extraction`], shared by every
+  /// [`crate::source::ModelSource`] (crate-private: the field set is an
+  /// implementation detail, and each source assembles it its own way — see
+  /// [`crate::source::argmax`], which builds the identical layout from
+  /// argmax's in-graph-decoded tensors instead of a host-side decode).
+  ///
+  /// `num_output_frames` is not a parameter: it IS `count.len()`
+  /// (`owned.rs:674`), so deriving it here makes the two impossible to
+  /// disagree.
+  pub(crate) fn from_parts(
+    raw_embeddings: Vec<f32>,
+    segmentations: Vec<f64>,
+    count: Vec<u8>,
+    num_chunks: usize,
+    num_frames_per_chunk: usize,
+    chunks_sw: SlidingWindow,
+    frames_sw: SlidingWindow,
+  ) -> Self {
+    let num_output_frames = count.len(); // owned.rs:674
+    Self {
+      raw_embeddings,
+      segmentations,
+      count,
+      num_chunks,
+      num_frames_per_chunk,
+      num_output_frames,
+      chunks_sw,
+      frames_sw,
+    }
+  }
+
   /// Pre-PLDA WeSpeaker raw embeddings, flattened `[c][s][d]`. Length
   /// `num_chunks * num_speakers * EMBEDDING_DIM`. Dropped `(chunk, slot)`
   /// rows are all-zero. Matches `OfflineInput::raw_embeddings`
