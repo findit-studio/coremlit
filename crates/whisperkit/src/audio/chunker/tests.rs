@@ -84,6 +84,60 @@ fn tiny_clip_inside_window_padding_produces_no_chunks() {
 }
 
 #[test]
+fn trailing_silence_yields_wholly_silent_chunks() {
+  // REACHABILITY PIN for coremlit issue #14's blank-audio drop (review
+  // C1). It is tempting to argue that a wholly-silent chunk "cannot
+  // normally arise, because VAD splits AT silence boundaries" — and to
+  // conclude from that that a chunk emptied by the drop is a curiosity
+  // rather than a bug. That premise is FALSE, and this test exists to
+  // keep it falsified:
+  //
+  // `chunk_all` is a CONTIGUOUS chunker. `start = end` marches across the
+  // whole clip and nothing is ever skipped; the VAD only chooses WHERE to
+  // cut (the middle of the longest silence in the window's second half),
+  // never WHAT to omit. Over an all-silent window
+  // `find_longest_silence` spans the entire second half, so the cut lands
+  // near `start + 0.75 * max_len` and the chunk BEFORE it is pure
+  // silence — which a real model decodes to nothing but `[BLANK_AUDIO]`,
+  // which `drop_blank_audio` then removes, leaving the chunk's result
+  // with empty text.
+  //
+  // 40 s of speech followed by 60 s of silence, 30 s windows.
+  let mut samples = vec![0.5f32; 40 * 16_000];
+  samples.extend(vec![0.0f32; 60 * 16_000]);
+  let vad = EnergyVad::new();
+  let chunks = VadChunker::new().chunk_all(&vad, &samples, WINDOW_SAMPLES, &[(0, samples.len())]);
+
+  let silent = chunks
+    .iter()
+    .filter(|chunk| {
+      vad
+        .voice_activity(chunk.samples_slice())
+        .iter()
+        .all(|active| !active)
+    })
+    .count();
+  assert!(
+    silent >= 1,
+    "a contiguous chunker over trailing silence MUST emit at least one \
+     wholly-silent chunk; got {silent} of {} chunks with lengths {:?}",
+    chunks.len(),
+    chunks
+      .iter()
+      .map(|c| c.samples_slice().len())
+      .collect::<Vec<_>>()
+  );
+  // Nothing is dropped on the floor either — the chunks tile the clip.
+  assert_eq!(
+    chunks
+      .iter()
+      .map(|c| c.samples_slice().len())
+      .sum::<usize>(),
+    samples.len()
+  );
+}
+
+#[test]
 fn apply_seek_offsets_shifts_segments_and_words() {
   use crate::result::WordTiming;
   let mut segment = TranscriptionSegment::new();

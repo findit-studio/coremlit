@@ -36,6 +36,40 @@ fn merge_transcription_results_concatenates_and_reids() {
 }
 
 #[test]
+fn merge_joins_an_empty_text_as_a_bare_separator() {
+  // PARITY PIN (issue #14 review, C1). This merge deliberately does NOT
+  // skip empty-text results: Swift's `validResults` `compactMap`s away
+  // only *nil* elements, never empty-text ones, so
+  // `["a", "", "b"].joined(separator: " ")` is `"a  b"` there and must be
+  // `"a  b"` here.
+  //
+  // It is tempting to "fix" this, because
+  // `DecodingOptions::drop_blank_audio` (default `true`) newly makes an
+  // emptied chunk common. DON'T — an empty-text result is reachable with
+  // NO involvement from that option (any audio shorter than
+  // `window_clip_time` runs no window and returns one; see
+  // `transcribe::tests::audio_shorter_than_window_clip_time_yields_no_windows`,
+  // which predates the option), so filtering here would silently change
+  // the `drop_blank_audio == false` path — the path whose whole purpose is
+  // to be byte-for-byte Swift. The repair is gated on the option, at
+  // `WhisperKit::transcribe`'s VAD branch
+  // (`transcribe::join_non_empty_texts`), and this test is what keeps it
+  // from creeping back down here.
+  let spoken =
+    |text: &str| TranscriptionResult::new(text, Vec::new(), "en", TranscriptionTimings::new());
+  assert_eq!(
+    merge_transcription_results(&[spoken("a"), spoken(""), spoken("b")]).text(),
+    "a  b",
+    "interior empty stays a bare separator (Swift parity)"
+  );
+  assert_eq!(
+    merge_transcription_results(&[spoken("a"), spoken("")]).text(),
+    "a ",
+    "trailing empty stays a bare separator (Swift parity)"
+  );
+}
+
+#[test]
 fn merge_full_pipeline_sums_when_pipeline_start_is_never_stamped() {
   // Regression (task-12 review): with every pipeline_start at the
   // "never stamped" sentinel (f64::MAX) — which is what every result this

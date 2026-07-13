@@ -2093,7 +2093,22 @@ fn min_timing(results: &[TranscriptionResult], f: impl Fn(&TranscriptionTimings)
 ///
 /// - [`TranscriptionResult::text`][]: every result's text, joined with `"
 ///   "` (:82-84; empty for empty `results`, matching `[].joined(separator:
-///   " ") == ""`).
+///   " ") == ""`). **An empty-text result is joined as a bare separator,
+///   not skipped** — faithfully, because Swift's `validResults`
+///   `compactMap`s away only *nil* elements (`:80`), never empty-text ones,
+///   so `["a", "", "b"].joined(separator: " ")` is `"a  b"` there too. A
+///   zero-segment, empty-text result is reachable on its own — any audio
+///   shorter than [`DecodingOptions::window_clip_time`](crate::options::DecodingOptions::window_clip_time)
+///   runs no window at all and returns one — and this port keeps the
+///   quirk rather than "fixing" it, exactly like the segment re-`id`
+///   below. Callers that must not surface it (
+///   [`DecodingOptions::drop_blank_audio`](crate::options::DecodingOptions::drop_blank_audio)
+///   newly makes an *emptied* chunk common — a wholly-silent VAD chunk
+///   decodes to nothing but the blank marker, which the filter removes)
+///   re-join the non-empty texts themselves;
+///   [`WhisperKit::transcribe`](crate::transcribe::WhisperKit::transcribe)'s
+///   VAD branch does so for its own result, still merging every chunk
+///   here so no chunk's timings are lost from the sums.
 /// - [`TranscriptionResult::segments_slice`][]: every result's segments,
 ///   concatenated in order, each re-`id`'d to `result_index +
 ///   segment_index` (:89-94) — a faithful bug-for-bug port: upstream

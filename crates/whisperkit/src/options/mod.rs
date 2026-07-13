@@ -1537,6 +1537,20 @@ impl DecodingOptions {
   /// emitted verbatim, one segment, byte-for-byte as before this option
   /// existed.
   ///
+  /// Under [`ChunkingStrategy::Vad`], a wholly-silent stretch long enough
+  /// to become a chunk of its own — the chunker is *contiguous*, so
+  /// silence is never skipped, only cut around — decodes to nothing but
+  /// the marker and is therefore emptied outright by this filter.
+  /// [`WhisperKit::transcribe`](crate::transcribe::WhisperKit::transcribe)
+  /// leaves such a chunk out of the merged transcript's **text join** when
+  /// this is `true`, so it cannot surface as the bare `" "` separator
+  /// [`merge_transcription_results`](crate::result::merge_transcription_results)
+  /// would otherwise give it (a doubled space between two speech runs; a
+  /// leading or trailing one at the clip's edges). The chunk is still
+  /// *merged* — its timings stay in the summed metrics; only its empty
+  /// text is skipped. That re-join is gated on this option: the merge
+  /// itself keeps Swift's join verbatim.
+  ///
   /// Speech-only audio is unaffected either way: it decodes no such
   /// segment, so the filter finds nothing to drop and the golden parity
   /// transcripts are identical under both settings.

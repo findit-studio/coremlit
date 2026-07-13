@@ -912,3 +912,125 @@ fn blank_audio_between_speech_is_kept_when_drop_is_cleared() {
     result.text()
   );
 }
+
+// ---------------------------------------------------------------------
+// drop_blank_audio x the VAD merge join (issue #14 review, C1)
+// ---------------------------------------------------------------------
+
+/// A chunk result carrying `text` and no segments — the shape
+/// [`TranscribeTask::run`] returns for a chunk the blank-audio drop
+/// emptied (and, independently of the drop, for any chunk shorter than
+/// `window_clip_time`).
+fn chunk_text(text: &str) -> TranscriptionResult {
+  TranscriptionResult::new(text, Vec::new(), "en", TranscriptionTimings::new())
+}
+
+#[test]
+fn emptied_chunks_never_become_bare_separators_in_the_join() {
+  // The C1 REGRESSION, at the exact function `transcribe`'s VAD branch
+  // substitutes for the merge's own join under `drop_blank_audio`.
+  //
+  // The bug: the merge joins EVERY result's text with `" "`, so an emptied
+  // chunk contributes a bare separator — `["a", "", "b"].join(" ")` is
+  // `"a  b"`. All three placements are the same defect, and all three are
+  // covered here because the mock's script cursor rewinds on every
+  // `reset_decoder_state`, which makes every chunk of a scripted VAD run
+  // decode IDENTICALLY: the mixed speech/silence/speech shape is not
+  // expressible end-to-end against `MockBackend`, so it is pinned here,
+  // against the real joining code, and the wiring is pinned end-to-end by
+  // `vad_chunked_blank_audio_does_not_leave_bare_separators` below.
+
+  // Interior: silence BETWEEN two speech runs -> no doubled space.
+  assert_eq!(
+    join_non_empty_texts(&[
+      chunk_text("Hello world."),
+      chunk_text(""),
+      chunk_text("Goodbye."),
+    ]),
+    "Hello world. Goodbye."
+  );
+  // Trailing: silence after the speech -> no trailing space(s).
+  assert_eq!(
+    join_non_empty_texts(&[chunk_text("Hello world."), chunk_text(""), chunk_text("")]),
+    "Hello world."
+  );
+  // Leading: silence before the speech -> no leading space.
+  assert_eq!(
+    join_non_empty_texts(&[chunk_text(""), chunk_text("Hello world.")]),
+    "Hello world."
+  );
+  // Wholly silent: nothing at all, not a string of separators.
+  assert_eq!(
+    join_non_empty_texts(&[chunk_text(""), chunk_text(""), chunk_text("")]),
+    ""
+  );
+  // Speech only: the join is untouched — a single separator per gap.
+  assert_eq!(
+    join_non_empty_texts(&[chunk_text("Hello"), chunk_text("world.")]),
+    "Hello world."
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn vad_chunked_blank_audio_does_not_leave_bare_separators() {
+  // END-TO-END wiring proof for C1, through `WhisperKit::transcribe`'s VAD
+  // branch. Same audio as `vad_chunked_transcribe_reanchors_and_merges`
+  // (three chunks), but every chunk decodes to nothing but the blank
+  // marker, so the default drop empties all three. Before the fix the
+  // merge joined `["", "", ""]` into TWO BARE SPACES; the transcript of a
+  // silent recording must be genuinely empty.
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(48_000));
+  script_blank_audio_window(&mut mock, &t);
+  let kit = WhisperKit::with_backend(mock, t);
+  let mut audio = vec![0.1f32; 96_000];
+  audio[32_000..35_200].fill(0.0);
+  audio[64_000..67_200].fill(0.0);
+  let options = DecodingOptions::new().with_chunking_strategy(ChunkingStrategy::Vad);
+
+  let result = kit.transcribe(&audio, &options).unwrap();
+  assert_eq!(
+    result.text(),
+    "",
+    "three emptied chunks must not join into bare separators, got {:?}",
+    result.text()
+  );
+  assert!(result.segments_slice().is_empty());
+  // The chunks were MERGED, not skipped: dropping an emptied result from
+  // the merge input would have taken its timings with it, and
+  // `total_audio_processing_runs` sums one per decoded window per chunk.
+  assert_eq!(
+    result.timings().total_audio_processing_runs(),
+    3.0,
+    "every chunk's timings must still be in the merged sums"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn vad_chunked_blank_audio_is_joined_verbatim_when_drop_is_cleared() {
+  // MUTATION EVIDENCE + the Swift-parity pin: the identical audio and
+  // script with `drop_blank_audio == false` keeps all three markers and
+  // joins them with the merge's own single separator, byte-for-byte as
+  // before this option existed. The C1 repair above must be INERT here —
+  // it is gated on `drop_blank_audio` precisely because an empty-text
+  // result is reachable WITHOUT the drop (see
+  // `audio_shorter_than_window_clip_time_yields_no_windows`), and the
+  // merge must keep joining those as Swift does.
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(48_000));
+  script_blank_audio_window(&mut mock, &t);
+  let kit = WhisperKit::with_backend(mock, t);
+  let mut audio = vec![0.1f32; 96_000];
+  audio[32_000..35_200].fill(0.0);
+  audio[64_000..67_200].fill(0.0);
+  let options = DecodingOptions::new()
+    .with_chunking_strategy(ChunkingStrategy::Vad)
+    .maybe_drop_blank_audio(false);
+
+  let result = kit.transcribe(&audio, &options).unwrap();
+  let marker = crate::constants::BLANK_AUDIO_MARKER;
+  assert_eq!(result.text(), format!("{marker} {marker} {marker}"));
+  assert_eq!(result.segments_slice().len(), 3);
+}
