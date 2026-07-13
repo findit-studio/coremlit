@@ -29,7 +29,6 @@ fn compression_ratio_detects_repetition() {
   // > 2.4, which is precisely why the `> 2.4` check alone cannot guard the
   // codec choice, but this length pin can.
   assert_eq!(compressed_len_of_tokens(&repeated), 13);
-  assert_eq!(compression_ratio_of_tokens(&[]), f32::INFINITY);
 }
 
 #[test]
@@ -57,6 +56,24 @@ fn compression_ratio_of_tokens_matches_apple_libcompression_golden() {
   // compression on repetition); flate2 would emit 37. 160 raw bytes.
   let phrase_x8: Vec<u32> = [1212, 318, 257, 1332, 13].repeat(8);
   assert_eq!(compressed_len_of_tokens(&phrase_x8), 24); // flate2: 37
+}
+
+#[test]
+fn compression_ratio_of_tokens_empty_is_zero_matching_swift() {
+  // PARITY (coremlit issue #9). Swift's TOKENS overload
+  // (Utilities/TextUtilities.swift:14-28) has NO empty guard: it compresses
+  // an empty `Data()`, and Apple's libcompression turns a zero-length
+  // buffer into 2 bytes (it does NOT throw — proven by the issue-9 objc2
+  // probe), so Swift returns `0 / 2 == 0.0`, not infinity. This value is
+  // pinned to Swift's proven result, not a re-run of our own encoder.
+  //
+  // Decision-level consequence: in `needs_fallback`, `0.0 > threshold`
+  // (default 2.4) is false, so an empty word-token window does NOT force a
+  // repetition fallback — matching Swift. INFINITY (the pre-fix value)
+  // would have flipped that to a wrongful fallback. The end-to-end check
+  // lives in
+  // `result::tests::empty_word_tokens_do_not_trigger_compression_fallback`.
+  assert_eq!(compression_ratio_of_tokens(&[]), 0.0);
 }
 
 #[test]

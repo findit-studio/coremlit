@@ -45,8 +45,11 @@ use crate::result::WordTiming;
 /// [`crate::tokenizer::nl_recognizer::redetect_language`]'s rationale: any
 /// Objective-C method may autorelease internally, so a pool must sit on the
 /// stack or temporaries leak on a thread with no Cocoa run-loop pool above
-/// it. Callers guard empty input before reaching here (Swift's zero-length
-/// `Data` compression throws, landing in the same `catch`).
+/// it. Empty input needs no special-casing: Apple's libcompression
+/// compresses a zero-length buffer to a small non-empty result (2 bytes,
+/// per the issue-9 objc2 probe), never throwing, so this returns `Some(2)`
+/// for `&[]`. `None` is reserved for a genuine OS compression error — the
+/// only case Swift's `catch` actually handles.
 fn zlib_compressed_len(bytes: &[u8]) -> Option<usize> {
   autoreleasepool(|_| {
     NSData::with_bytes(bytes)
@@ -63,10 +66,15 @@ fn zlib_compressed_len(bytes: &[u8]) -> Option<usize> {
 /// into a `Data` buffer (platform-native byte order, little-endian on
 /// every Apple target), then `(data as NSData).compressed(using: .zlib)`.
 ///
-/// Returns [`f32::INFINITY`] for an empty `tokens` slice (Swift's
-/// zero-length `Data` compression attempt fails there, landing in its
-/// `catch` block) or on a genuine compression error (mirrors Swift's
-/// `catch { return .infinity }`).
+/// An empty `tokens` slice returns **`0.0`**, matching Swift's tokens
+/// overload exactly: that overload has **no empty guard**
+/// (`Utilities/TextUtilities.swift:14-28`), so it compresses an empty
+/// `Data()`, which Apple's libcompression turns into 2 bytes (not an
+/// error) — giving `0 / 2 == 0.0`. (Contrast [`compression_ratio_of_text`],
+/// which Swift *does* guard.) Only a genuine OS compression error yields
+/// [`f32::INFINITY`] here, mirroring Swift's `catch { return .infinity }` —
+/// and Swift's tokens overload would land in that identical `catch` on the
+/// same error, so the error path matches on both sides too.
 ///
 /// The compression itself goes through the private `zlib_compressed_len`,
 /// which calls the same Apple `NSData.compressed(using: .zlib)` API as
@@ -75,9 +83,6 @@ fn zlib_compressed_len(bytes: &[u8]) -> Option<usize> {
 /// encoding below is unchanged: it already matched Apple; only the
 /// compressor differed.
 pub fn compression_ratio_of_tokens(tokens: &[u32]) -> f32 {
-  if tokens.is_empty() {
-    return f32::INFINITY;
-  }
   let bytes: Vec<u8> = tokens
     .iter()
     .flat_map(|t| (*t as i32).to_le_bytes())
@@ -88,10 +93,18 @@ pub fn compression_ratio_of_tokens(tokens: &[u32]) -> f32 {
 /// Compression ratio (`raw_bytes / compressed_bytes`) of `text`'s UTF-8
 /// bytes — ports Swift `TextUtilities.compressionRatio(of text: String)`
 /// (`Utilities/TextUtilities.swift:33-53`). Returns [`f32::INFINITY`] for
-/// empty text (Swift's explicit `if text.isEmpty` guard, lines 34-36) or
-/// on a genuine compression error (Swift's `catch`, lines 49-51). Swift
-/// also guards a fallible `text.data(using: .utf8)` (lines 39-42); that
-/// path is unreachable here since a Rust `&str` is always valid UTF-8.
+/// empty text via Swift's explicit `if text.isEmpty { return .infinity }`
+/// guard (lines 34-36), or on a genuine compression error (Swift's
+/// `catch`, lines 49-51). Swift also guards a fallible `text.data(using:
+/// .utf8)` (lines 39-42); that path is unreachable here since a Rust
+/// `&str` is always valid UTF-8.
+///
+/// **Empty-input asymmetry (deliberate, matches Swift).** Unlike
+/// [`compression_ratio_of_tokens`] — whose Swift overload has *no* empty
+/// guard and so returns `0.0` for empty input — this text overload *does*
+/// guard empty and returns infinity. The two Swift overloads diverge here
+/// on purpose (`:34-36` guards text; `:14-28` does not guard tokens); keep
+/// this guard.
 ///
 /// Compresses via the private `zlib_compressed_len` (Apple's `.zlib` = raw
 /// DEFLATE), identical to Swift; see [`compression_ratio_of_tokens`].
