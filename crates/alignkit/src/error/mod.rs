@@ -110,6 +110,49 @@ pub enum AlignError {
     /// ([`crate::encode::ENCODER_WINDOW_SAMPLES`]).
     max: usize,
   },
+  /// The encoder returned an emission matrix that is **not log-probabilities**:
+  /// at least one cell sits below [`crate::encode::LOG_PROB_FLOOR`], the fp16
+  /// `log(0)` saturation sentinel (`≈ -45440`).
+  ///
+  /// This is the loud form of what used to be a silent one. The values are
+  /// finite and negative, so they pass `Emissions::from_log_probs`' own
+  /// `finite ∧ <= 0` scan untouched and would align to *plausible, wrong*
+  /// timings (measured: `ask` 881 ms early on `jfk.wav`) — which is why the
+  /// floor is checked separately. See
+  /// [`crate::encode::DEFAULT_ENCODER_COMPUTE`] for the mechanism and
+  /// [`crate::encode::LOG_PROB_FLOOR`] for why the guard keys on the value
+  /// domain rather than on the compute placement.
+  ///
+  /// It is a defect of the **model artifact**, not of the caller's audio: no
+  /// input can make a correctly-converted artifact produce it, and no input
+  /// avoids it on a corrupted one (though only real speech reaches the regime
+  /// that exposes it — synthetic silence and tones never drive a class
+  /// posterior under the fp16 floor). The fix is the placement named in this
+  /// error, or a re-converted model; nothing in this crate can recover the
+  /// underflowed cells.
+  #[error(
+    "encoder emissions are not log-probabilities: {cells} of {total} cells are below {floor} \
+     (min = {min}), the fp16 `log(0)` saturation sentinel. The encoder was scheduled on \
+     {compute:?}: this model's fp16 `log(softmax(·))` tail underflows on the Apple Neural \
+     Engine and its word timings shift by hundreds of milliseconds. Load the encoder on \
+     `alignkit::encode::DEFAULT_ENCODER_COMPUTE` (the default, and the fastest correct \
+     placement) — or re-convert the model with a fused `log_softmax` tail.",
+    floor = crate::encode::LOG_PROB_FLOOR,
+  )]
+  CorruptEmissions {
+    /// The compute placement the encoder was loaded on — the knob the caller
+    /// can actually turn, hence the one the message names.
+    compute: coremlit::ComputeUnits,
+    /// The most negative cell in the matrix (`≈ -45440` on an ANE placement;
+    /// `-30.81` on the `CpuOnly` default, measured on `jfk.wav`).
+    min: f32,
+    /// How many cells fell below [`crate::encode::LOG_PROB_FLOOR`] (2,667 on
+    /// `jfk.wav`'s ANE run).
+    cells: usize,
+    /// Cells scanned: `frames × `[`crate::vocab::VOCAB_SIZE`] (15,950 on
+    /// `jfk.wav`).
+    total: usize,
+  },
 }
 
 #[cfg(test)]

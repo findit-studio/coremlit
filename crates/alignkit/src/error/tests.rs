@@ -108,3 +108,43 @@ fn align_error_input_too_long_displays_both_counts() {
   assert!(rendered.contains("1000000"));
   assert!(rendered.contains("960000"));
 }
+
+#[test]
+fn align_error_corrupt_emissions_names_the_placement_and_the_floor() {
+  // The error exists to be SELF-DIAGNOSING: a caller who flipped
+  // `with_compute` must be able to read the cause straight off the message,
+  // without knowing anything about fp16 subnormals. So the placement, the
+  // floor that was tripped, the observed minimum and the blast radius all
+  // have to survive into Display. The real ANE numbers, measured on jfk.wav.
+  let e = AlignError::CorruptEmissions {
+    compute: coremlit::ComputeUnits::All,
+    min: -45_440.0,
+    cells: 2_667,
+    total: 15_950,
+  };
+  let rendered = e.to_string();
+  assert!(
+    rendered.contains("All"),
+    "must name the placement: {rendered}"
+  );
+  assert!(
+    rendered.contains("-45440"),
+    "must report the min: {rendered}"
+  );
+  assert!(
+    rendered.contains("2667"),
+    "must report the blast radius: {rendered}"
+  );
+  assert!(
+    rendered.contains("15950"),
+    "must report the total: {rendered}"
+  );
+  assert!(
+    rendered.contains(&crate::encode::LOG_PROB_FLOOR.to_string()),
+    "must name the floor it tripped: {rendered}"
+  );
+  assert!(
+    rendered.contains("DEFAULT_ENCODER_COMPUTE"),
+    "must name the way out: {rendered}"
+  );
+}

@@ -191,6 +191,84 @@ fn check_emissions_contract_rejects_wrong_dtype() {
 }
 
 // ---------------------------------------------------------------------
+// check_log_prob_floor: hermetic coverage of the fp16 `log(0)` sentinel
+// guard. The model-gated half (`emissions_reject_an_ane_corrupted_matrix`)
+// proves the real ANE artifact trips it; these prove the predicate itself,
+// including the two boundaries a mutant would move.
+// ---------------------------------------------------------------------
+
+#[test]
+fn check_log_prob_floor_accepts_real_log_probs() {
+  // The measured legitimate range on this model: max exactly 0.0, min -30.81
+  // (`CpuOnly`) / -30.02 (`CpuAndGpu`). Nothing here is anywhere near the floor.
+  let data = [0.0, -0.06, -19.0, -21.75, -30.02, -30.81];
+  assert!(check_log_prob_floor(&data, ComputeUnits::CpuOnly).is_ok());
+}
+
+#[test]
+fn check_log_prob_floor_accepts_an_empty_matrix() {
+  // `real_samples == 0` truncates to zero frames; the guard must not invent a
+  // failure out of an empty scan (min would be +inf).
+  assert!(check_log_prob_floor(&[], ComputeUnits::CpuOnly).is_ok());
+}
+
+#[test]
+fn check_log_prob_floor_rejects_the_fp16_log_zero_sentinel() {
+  // One corrupt cell in an otherwise clean matrix is still a corrupt matrix:
+  // the ANE run corrupts 16.7% of cells, but a single one is enough to move a
+  // trellis path. Catches a mutant that thresholds on a FRACTION of cells.
+  let data = [0.0, -1.5, -45_440.0, -20.0];
+  let Err(err) = check_log_prob_floor(&data, ComputeUnits::All) else {
+    panic!("the -45440 fp16 log(0) sentinel must be rejected");
+  };
+  let AlignError::CorruptEmissions {
+    compute,
+    min,
+    cells,
+    total,
+  } = err
+  else {
+    panic!("expected AlignError::CorruptEmissions, got {err:?}");
+  };
+  assert_eq!(compute, ComputeUnits::All);
+  assert_eq!(min, -45_440.0);
+  assert_eq!(cells, 1);
+  assert_eq!(total, 4);
+}
+
+#[test]
+fn check_log_prob_floor_is_a_strict_lower_bound_at_the_floor_itself() {
+  // The floor is INCLUSIVE (`< LOG_PROB_FLOOR` fails, `== LOG_PROB_FLOOR`
+  // passes). Pins the comparison's direction and strictness together: a mutant
+  // flipping `<` to `<=` fails the first assertion, one flipping it to `>`
+  // fails the second.
+  assert!(check_log_prob_floor(&[LOG_PROB_FLOOR], ComputeUnits::CpuOnly).is_ok());
+  assert!(
+    check_log_prob_floor(&[LOG_PROB_FLOOR - 1.0], ComputeUnits::CpuOnly).is_err(),
+    "one ulp-plus below the floor is already outside the log-prob domain"
+  );
+}
+
+#[test]
+fn check_log_prob_floor_leaves_non_finite_values_to_from_log_probs() {
+  // Deliberate division of labour, documented on `check_log_prob_floor`: the
+  // floor guard is the LOWER bound only. `NaN` compares false against
+  // everything and passes here; `Emissions::from_log_probs`' finite ∧ <= 0 scan
+  // (which runs on the very next line of `Encoder::emissions`) is what rejects
+  // it. Neither scan is redundant with the other, and this pins that seam so a
+  // later "simplification" cannot silently drop one of them.
+  assert!(check_log_prob_floor(&[f32::NAN], ComputeUnits::CpuOnly).is_ok());
+  assert!(check_log_prob_floor(&[f32::INFINITY], ComputeUnits::CpuOnly).is_ok());
+  // -inf is genuinely below the floor and IS the guard's business.
+  assert!(check_log_prob_floor(&[f32::NEG_INFINITY], ComputeUnits::CpuOnly).is_err());
+}
+
+// LOG_PROB_FLOOR's separation property (strictly between the -30.81 legitimate
+// minimum and the -45440 sentinel) is asserted in `mod.rs` at COMPILE time, not
+// here: both operands are constants, so a runtime test of it is dead weight that
+// only fires after a build already succeeded.
+
+// ---------------------------------------------------------------------
 // EncoderOptions
 // ---------------------------------------------------------------------
 
@@ -360,15 +438,17 @@ fn emissions_on_full_window_produces_correctly_shaped_finite_log_probs() {
 /// `e^-30.8 ≈ 4e-14`, deep under the floor. Hence the cross-crate `jfk.wav`
 /// borrow.
 ///
-/// The `-100.0` threshold is not a tolerance to be relaxed: it separates two
+/// [`LOG_PROB_FLOOR`] is not a tolerance to be relaxed: it separates two
 /// populations three orders of magnitude apart (worst legitimate log-prob
 /// measured anywhere on this model ≈ `-30.8`; the sentinel ≈ `-45440`).
 /// Anything in between is already a broken emission matrix.
+///
+/// This measures the RAW tensor. `emissions_reject_an_ane_corrupted_matrix`
+/// pins the same fact at the public door, where it is now an error rather than
+/// a measurement.
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
 fn emissions_have_no_fp16_log_zero_sentinel() {
-  const FLOOR: f32 = -100.0;
-
   let encoder = load_encoder();
   let samples = load_jfk_wav();
   let raw = encoder
@@ -376,16 +456,133 @@ fn emissions_have_no_fp16_log_zero_sentinel() {
     .expect("emissions on jfk.wav");
 
   let min = raw.data.iter().copied().fold(f32::INFINITY, f32::min);
-  let sentinels = raw.data.iter().filter(|v| **v < FLOOR).count();
+  let sentinels = raw.data.iter().filter(|v| **v < LOG_PROB_FLOOR).count();
   assert_eq!(
     sentinels,
     0,
-    "{sentinels} of {} emission cells are below {FLOOR} (min = {min}) — the fp16 `log(0)` \
-     sentinel. The encoder is on {:?}; an ANE placement corrupts this model's emissions and \
-     cannot be used. See DEFAULT_ENCODER_COMPUTE.",
+    "{sentinels} of {} emission cells are below {LOG_PROB_FLOOR} (min = {min}) — the fp16 \
+     `log(0)` sentinel. The encoder is on {:?}; an ANE placement corrupts this model's emissions \
+     and cannot be used. See DEFAULT_ENCODER_COMPUTE.",
     raw.data.len(),
     DEFAULT_ENCODER_COMPUTE,
   );
+}
+
+/// **THE SILENT-CORRUPTION REGRESSION.** An ANE-corrupted emission matrix must
+/// be REJECTED by the public door, not returned as a plausible `Ok`.
+///
+/// [`EncoderOptions::with_compute`] is public and accepts `ComputeUnits::All`.
+/// Before [`LOG_PROB_FLOOR`] existed, this exact call returned **`Ok`**: the
+/// `-45440` sentinel is finite and `<= 0`, so it satisfies every check
+/// [`Emissions::from_log_probs`] runs, and the caller got word timings that were
+/// wrong by up to 881 ms with no diagnostic anywhere. Measured on the real
+/// model, pre-guard: `Aligner::align_chunk(jfk, …)` → `Ok`, with `ask` at
+/// 7533.7 ms instead of 8415.3 ms.
+///
+/// REAL SPEECH is load-bearing, and a synthetic input cannot replace it: on the
+/// corrupt path 960,000 samples of digital silence bottom out at `-8.55` and a
+/// low-amplitude sine at `-9.07`, both ABOVE the fp16 floor
+/// (`log(2⁻²⁴) ≈ -16.6`), so nothing underflows and this test would pass
+/// **against the corrupt model**. Only real speech drives a class posterior
+/// under the floor. Hence the cross-crate `jfk.wav` borrow.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn emissions_reject_an_ane_corrupted_matrix() {
+  let encoder = Encoder::from_file_with(
+    encoder_path(),
+    EncoderOptions::new().with_compute(ComputeUnits::All),
+  )
+  .expect("load base960h_aligner.mlmodelc on ComputeUnits::All");
+  let samples = load_jfk_wav();
+
+  let Err(err) = encoder.emissions(&samples, samples.len()) else {
+    panic!(
+      "an ANE-corrupted emission matrix was accepted. `Emissions::from_log_probs` cannot catch \
+       this — -45440 is finite and <= 0 — so the caller now has plausible, silently wrong word \
+       timings. LOG_PROB_FLOOR is the only thing standing here."
+    );
+  };
+  let AlignError::CorruptEmissions {
+    compute,
+    min,
+    cells,
+    total,
+  } = err
+  else {
+    panic!("expected AlignError::CorruptEmissions, got {err:?}");
+  };
+  // The measured ANE signature, pinned: 2,667 of 15,950 cells (16.7%),
+  // min = -45440. Asserted as bounds rather than as equalities — the exact
+  // count is a property of one OS/ANE firmware pair, but the ORDER of the
+  // corruption is the fact worth pinning.
+  assert_eq!(compute, ComputeUnits::All);
+  assert_eq!(total, 550 * crate::vocab::VOCAB_SIZE);
+  assert!(
+    cells > 0 && cells <= total,
+    "corrupt cells: {cells}/{total}"
+  );
+  assert!(
+    min < LOG_PROB_FLOOR,
+    "reported min {min} must be past the floor it tripped"
+  );
+  // Self-diagnosing: the message must NAME the placement, or the caller is
+  // left to rediscover a 450×-slower, 16.7%-corrupt configuration by hand.
+  let rendered = AlignError::CorruptEmissions {
+    compute,
+    min,
+    cells,
+    total,
+  }
+  .to_string();
+  assert!(
+    rendered.contains("All"),
+    "error must name the placement: {rendered}"
+  );
+  println!("rejected with: {rendered}");
+}
+
+/// The guard keys on the emission VALUES, never on the placement — so a
+/// non-default but numerically-clean placement must still be accepted.
+///
+/// `CpuAndGpu` is that placement: measured `min = -30.02`, zero cells past
+/// [`LOG_PROB_FLOOR`] on the same real speech the ANE corrupts. A guard that
+/// rejected "any non-default compute" would fail here, and would also forbid a
+/// future re-converted artifact that runs correctly on the ANE. This test is
+/// what keeps the fix a value-domain check instead of a placement ban.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn emissions_accept_the_cpu_and_gpu_placement() {
+  let encoder = Encoder::from_file_with(
+    encoder_path(),
+    EncoderOptions::new().with_compute(ComputeUnits::CpuAndGpu),
+  )
+  .expect("load base960h_aligner.mlmodelc on ComputeUnits::CpuAndGpu");
+  let samples = load_jfk_wav();
+
+  let emissions = encoder
+    .emissions(&samples, samples.len())
+    .expect("CpuAndGpu emissions are clean log-probs and must pass the floor guard");
+  assert_eq!(emissions.frames(), 550);
+  assert_eq!(emissions.vocab().get(), crate::vocab::VOCAB_SIZE);
+}
+
+/// The shipping default on the same real speech, through the SAME guarded door
+/// the ANE test fails at — the third leg of the placement-agnostic proof
+/// (`CpuOnly` Ok, `CpuAndGpu` Ok, `All` Err).
+///
+/// `emissions_wraps_into_validated_emissions` covers the door on silence, which
+/// (as `emissions_reject_an_ane_corrupted_matrix` explains) never reaches the
+/// failure regime at all — so it cannot stand in for this.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn emissions_accept_the_default_placement_on_real_speech() {
+  let encoder = load_encoder();
+  let samples = load_jfk_wav();
+  let emissions = encoder
+    .emissions(&samples, samples.len())
+    .unwrap_or_else(|e| panic!("the SHIPPING placement must produce clean log-probs: {e}"));
+  assert_eq!(emissions.frames(), 550);
+  assert_eq!(emissions.vocab().get(), crate::vocab::VOCAB_SIZE);
 }
 
 /// Decodes the 11 s `jfk.wav` fixture (16 kHz mono int16) to f32 samples.

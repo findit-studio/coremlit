@@ -89,6 +89,24 @@
 //! it is exactly what would mask a raw-logit model from the scan above. If a
 //! clamp is ever needed here, it must be **bounded** to a pinned slack, never
 //! open-ended.
+//!
+//! # The floor: [`LOG_PROB_FLOOR`], the door's other half
+//!
+//! [`Emissions::from_log_probs`]'s scan bounds the emissions from **above**
+//! (`<= 0`) and rules out non-finite values. It does not bound them from
+//! **below**, and it cannot: `-45440` is finite and negative, so an
+//! ANE-corrupted matrix — every softmax output under the fp16 floor underflowed
+//! to `0`, every `log(0)` saturated to that sentinel
+//! ([`DEFAULT_ENCODER_COMPUTE`]) — sails straight through it and aligns to
+//! plausible, silently wrong timings.
+//!
+//! That gap was reachable from this crate's own public API
+//! ([`EncoderOptions::with_compute`], [`crate::AlignerOptions::with_compute`]),
+//! and it was the *measured* defect, not the hypothetical one the paragraph
+//! above guards against. So [`Encoder::emissions`] scans the other side too:
+//! any cell below [`LOG_PROB_FLOOR`] is [`AlignError::CorruptEmissions`], a
+//! typed error that NAMES the compute placement the encoder was loaded with.
+//! Loud, and self-diagnosing.
 
 use core::num::NonZeroUsize;
 use std::{borrow::Cow, path::Path};
@@ -181,7 +199,81 @@ mod names {
 /// Pinned by `tests::emissions_have_no_fp16_log_zero_sentinel`, which builds
 /// its encoder from this constant (never a hardcoded placement) and fails on
 /// `All`.
+///
+/// This is the *default*, not a lock: [`EncoderOptions::with_compute`] still
+/// accepts any placement. What stops an ANE override from silently corrupting
+/// a caller's timings is [`LOG_PROB_FLOOR`] — a value-domain guard in
+/// [`Encoder::emissions`], not a ban on the knob.
 pub const DEFAULT_ENCODER_COMPUTE: ComputeUnits = ComputeUnits::CpuOnly;
+
+/// Lower bound of the log-probability domain [`Encoder::emissions`] will
+/// accept: **`-100.0`**. A cell strictly below it is not a log-probability at
+/// all — it is the fp16 `log(0)` saturation sentinel
+/// ([`DEFAULT_ENCODER_COMPUTE`] has the mechanism) — and
+/// [`Encoder::emissions`] rejects the whole matrix with
+/// [`AlignError::CorruptEmissions`] rather than align on it.
+///
+/// # Why a bound on the VALUE, never on the placement
+///
+/// The corruption is a property of the *artifact*, not of the ANE: a
+/// re-converted `base960h_aligner` with a fused (or fp32) `log_softmax` tail
+/// would be correct on the ANE, and a placement-keyed guard ("reject `All`")
+/// would forbid it forever while still failing to describe what is actually
+/// wrong. A value-domain guard is placement-agnostic in both directions — it
+/// fails the corrupt artifact wherever it runs, and passes any artifact whose
+/// emissions really are log-probabilities, including on
+/// [`ComputeUnits::CpuAndGpu`], a legitimate non-default placement this crate
+/// measures clean (see below).
+///
+/// # Why `-100`
+///
+/// It separates two populations three orders of magnitude apart. Measured on
+/// `jfk.wav` (550 frames × 29 = 15,950 cells), `min(emissions)` per placement:
+///
+/// | compute | `min(emissions)` | cells below `-100` |
+/// |---|---|---|
+/// | `CpuOnly` (the default) | **-30.81** | 0 |
+/// | `CpuAndGpu` | **-30.02** | 0 |
+/// | `All` / `CpuAndNeuralEngine` (ANE) | **-45440** | **2,667 of 15,950 (16.7%)** |
+///
+/// `-100` sits ~3.2× below the worst legitimate value ever measured on this
+/// model and ~454× above the sentinel; nothing this model produces lands in
+/// between. It is not a tolerance to be tuned: `exp(-100) ≈ 3.7e-44` is a
+/// posterior no 29-class CTC head assigns to anything (it is beneath fp32's
+/// smallest *normal*, `1.2e-38`), so a matrix that reaches it is already
+/// broken — while a *correct* fp16 tail cannot underflow below
+/// `log(2⁻²⁴) ≈ -16.6` in the first place.
+///
+/// # Cost
+///
+/// One extra pass of `<= 2,999 × 29 = 86,971` float comparisons against a
+/// **0.74 s** CoreML predict, and [`Emissions::from_log_probs`] already walks
+/// every element immediately afterwards. It is not measurable.
+///
+/// Pinned by `tests::emissions_reject_an_ane_corrupted_matrix` (an `All`
+/// encoder on real speech must return `Err`) and
+/// `tests::emissions_accept_the_cpu_and_gpu_placement` (a non-default but
+/// numerically-clean placement must still return `Ok` — the guard keys on the
+/// values, not the hardware).
+pub const LOG_PROB_FLOOR: f32 = -100.0;
+
+/// [`LOG_PROB_FLOOR`]'s separation property, asserted at **compile time**: it
+/// must sit strictly between the worst legitimate log-probability this model
+/// produces on any placement (`-30.81`, `CpuOnly`) and the fp16 `log(0)`
+/// sentinel (`-45440`). Tuning the constant into either population is then a
+/// BUILD failure, not a test failure — which is the right severity, because a
+/// floor inside the legitimate population rejects correct audio and a floor
+/// below the sentinel silently disarms the guard that exists to catch it.
+const _: () = {
+  assert!(
+    LOG_PROB_FLOOR < -30.81,
+    "LOG_PROB_FLOOR would reject this model's own legitimate log-probs (measured min -30.81)"
+  );
+  assert!(
+    LOG_PROB_FLOOR > -45_440.0,
+    "LOG_PROB_FLOOR would no longer reject the fp16 log(0) sentinel (measured -45440)"
+  );
+};
 
 #[cfg(feature = "serde")]
 fn default_encoder_compute() -> ComputeUnits {
@@ -219,7 +311,15 @@ impl EncoderOptions {
     }
   }
 
-  /// Which hardware CoreML may schedule the encoder model on.
+  /// Which hardware CoreML may schedule the encoder model on. Defaults to
+  /// [`DEFAULT_ENCODER_COMPUTE`] (`ComputeUnits::CpuOnly`), which is a
+  /// **correctness** requirement of this model artifact, not a performance
+  /// preference — an ANE placement corrupts its emissions.
+  ///
+  /// Setting one is not silent: [`Encoder::emissions`] then fails with
+  /// [`AlignError::CorruptEmissions`], which names the placement. The guard is
+  /// on the emission VALUES ([`LOG_PROB_FLOOR`]), not on the placement, so a
+  /// numerically-clean non-default placement (`CpuAndGpu`) still works.
   #[inline(always)]
   pub const fn compute(&self) -> ComputeUnits {
     self.compute
@@ -291,6 +391,40 @@ fn check_emissions_contract(
   Ok(shape[1])
 }
 
+/// Rejects an emission matrix that has left the log-probability domain from
+/// BELOW: any cell under [`LOG_PROB_FLOOR`] is an fp16 `log(0)` saturation
+/// sentinel, not a log-probability. Hermetic (no loaded model), like
+/// [`check_waveform_contract`] and [`check_emissions_contract`].
+///
+/// `compute` is carried into the error so the failure NAMES the placement that
+/// produced it — the diagnosis, not just the symptom.
+///
+/// Deliberately only the lower bound: the upper bound (`<= 0`) and finiteness
+/// are [`Emissions::from_log_probs`]'s scan, which runs on the very next line
+/// of [`Encoder::emissions`]. A `NaN` therefore passes *here* (`NaN < x` is
+/// false) and is caught *there*; neither scan is redundant with the other.
+fn check_log_prob_floor(data: &[f32], compute: ComputeUnits) -> Result<(), AlignError> {
+  let mut min = f32::INFINITY;
+  let mut cells = 0usize;
+  for &value in data {
+    if value < min {
+      min = value;
+    }
+    if value < LOG_PROB_FLOOR {
+      cells += 1;
+    }
+  }
+  if cells > 0 {
+    return Err(AlignError::CorruptEmissions {
+      compute,
+      min,
+      cells,
+      total: data.len(),
+    });
+  }
+  Ok(())
+}
+
 /// CoreML wrapper over `base960h_aligner.mlmodelc`: one
 /// [`ENCODER_WINDOW_SAMPLES`]-sample fixed window in, per-frame CTC
 /// log-probabilities out — see the module doc for the padding/truncation
@@ -300,6 +434,12 @@ fn check_emissions_contract(
 pub struct Encoder {
   model: Model,
   frames: usize,
+  /// The placement this encoder was loaded on, kept so
+  /// [`AlignError::CorruptEmissions`] can name it. The corruption
+  /// [`LOG_PROB_FLOOR`] catches is a property of the model artifact, but the
+  /// placement is what a caller can actually change, so it is the one fact the
+  /// error most needs to carry.
+  compute: ComputeUnits,
 }
 
 impl Encoder {
@@ -351,7 +491,11 @@ impl Encoder {
         })?;
     let frames = check_emissions_contract(emissions.shape(), emissions.data_type())?;
 
-    Ok(Self { model, frames })
+    Ok(Self {
+      model,
+      frames,
+      compute: options.compute(),
+    })
   }
 
   /// Output frame count for one full (unpadded) window — the introspected
@@ -434,6 +578,14 @@ impl Encoder {
   /// why that door — and not [`Emissions::from_logits`] — is the correct one,
   /// which is a subtler argument than it looks.
   ///
+  /// That door's scan bounds the emissions from above and rules out non-finite
+  /// values; it does not bound them from below. [`LOG_PROB_FLOOR`] does, and
+  /// this method checks it first: an ANE-corrupted matrix (finite, negative,
+  /// and utterly wrong) is [`AlignError::CorruptEmissions`] here rather than a
+  /// plausible alignment 881 ms off. Unlike [`Self::emissions_raw`], which
+  /// hands back the tensor unchecked, **this is the guarded door** — and the
+  /// only one [`crate::aligner::Aligner`] uses.
+  ///
   /// `encoder_input` is the buffer the model runs on. For the alignment
   /// pipeline it is `PreparedChunk::encoder_input()` — asry has already
   /// applied the silence mask and padded to wav2vec2's receptive field — so
@@ -499,18 +651,21 @@ impl Encoder {
   /// [`AlignError::Tensor`] if building the input tensor or reading the
   /// output tensor fails. [`AlignError::Prediction`] on a CoreML prediction
   /// failure, including a prediction whose runtime output set omits
-  /// `emissions` entirely. [`AlignError::Alignment`] (an
+  /// `emissions` entirely. [`AlignError::CorruptEmissions`] if any cell is
+  /// below [`LOG_PROB_FLOOR`] — the fp16 `log(0)` sentinel an ANE placement
+  /// produces on this model artifact. [`AlignError::Alignment`] (an
   /// `asry::emissions::EmissionsError`) if the model output leaves the
-  /// log-probability domain: `from_log_probs` runs an `O(T·V)` finite ∧
-  /// `<= 0` scan, so a non-finite or positive value is a real error path here
-  /// — not the panic the pre-seam `LogProbsTV::new` let this crate assume
-  /// away.
+  /// log-probability domain the other way: `from_log_probs` runs an `O(T·V)`
+  /// finite ∧ `<= 0` scan, so a non-finite or positive value is a real error
+  /// path here — not the panic the pre-seam `LogProbsTV::new` let this crate
+  /// assume away.
   pub fn emissions(
     &self,
     encoder_input: &[f32],
     real_samples: usize,
   ) -> Result<Emissions, AlignError> {
     let RawEmissions { frames, data } = self.emissions_raw(encoder_input, real_samples)?;
+    check_log_prob_floor(&data, self.compute)?;
     Ok(Emissions::from_log_probs(frames, VOCAB_SIZE_NZ, data)?)
   }
 }

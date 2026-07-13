@@ -172,12 +172,19 @@ impl AlignerOptions {
   /// [`DEFAULT_ENCODER_COMPUTE`] (`ComputeUnits::CpuOnly`).
   ///
   /// **Overriding this to an ANE placement (`ComputeUnits::All` or
-  /// `CpuAndNeuralEngine`) silently corrupts the emissions** — the model's
-  /// fp16 `log(softmax(·))` tail underflows to a `-45440` sentinel on 16.7% of
-  /// cells and shifts real word timings by hundreds of milliseconds. That is a
-  /// property of the model artifact, not of this crate. Read
-  /// [`DEFAULT_ENCODER_COMPUTE`]'s doc before changing this; `CpuOnly` is also
-  /// the fastest correct placement, so there is nothing to buy.
+  /// `CpuAndNeuralEngine`) corrupts the emissions** — the model's fp16
+  /// `log(softmax(·))` tail underflows to a `-45440` sentinel on 16.7% of cells
+  /// and shifts real word timings by hundreds of milliseconds. That is a
+  /// property of the model artifact, not of this crate, and nothing here can
+  /// recover the underflowed cells.
+  ///
+  /// It is not silent: [`Self::align_chunk`] fails such a chunk with
+  /// [`AlignError::CorruptEmissions`], which names this placement (see
+  /// [`crate::encode::LOG_PROB_FLOOR`]). The guard is on the emission VALUES,
+  /// not on the placement, so a numerically-clean non-default placement —
+  /// `CpuAndGpu`, measured `min = -30.02` — still works. There is simply
+  /// nothing to buy: `CpuOnly` is also the fastest correct placement. Read
+  /// [`DEFAULT_ENCODER_COMPUTE`]'s doc before changing this.
   #[must_use]
   pub const fn compute(&self) -> ComputeUnits {
     self.compute
@@ -369,9 +376,12 @@ impl Aligner {
   /// [`AlignError::InputTooLong`] if `samples` exceeds the encoder window;
   /// [`AlignError::Span`] if `sub_segments` are not in the 1/16000 timebase;
   /// [`AlignError::Prediction`] / [`AlignError::Tensor`] from the CoreML
-  /// encode; [`AlignError::Alignment`] for any non-recoverable seam failure
-  /// (stride / vocab / blank-id validation, a non-finite or positive
-  /// log-probability, tokenization, abort).
+  /// encode; [`AlignError::CorruptEmissions`] if the encoder's emission matrix
+  /// left the log-probability domain (an ANE placement set through
+  /// [`AlignerOptions::with_compute`] — see
+  /// [`crate::encode::LOG_PROB_FLOOR`]); [`AlignError::Alignment`] for any
+  /// non-recoverable seam failure (stride / vocab / blank-id validation, a
+  /// non-finite or positive log-probability, tokenization, abort).
   pub fn align_chunk(
     &self,
     samples: &[f32],
