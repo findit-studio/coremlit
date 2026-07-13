@@ -4,28 +4,59 @@ use super::*;
 // compression_ratio_of_tokens / compression_ratio_of_text
 // ---------------------------------------------------------------------
 
+// Recover the codec's compressed byte length from the public ratio
+// (`ratio == raw_len / compressed_len`), so the GOLDEN tests below can pin
+// Apple libcompression's ACTUAL output length — the true oracle — with a
+// clear integer failure message. `.round()` absorbs f32 division noise
+// (each captured length round-trips exactly; a wrong codec lands on a
+// different integer). Raw length is the i32-LE byte count (4 bytes/token)
+// for tokens and the UTF-8 byte count for text.
+fn compressed_len_of_tokens(tokens: &[u32]) -> usize {
+  (tokens.len() as f32 * 4.0 / compression_ratio_of_tokens(tokens)).round() as usize
+}
+fn compressed_len_of_text(text: &str) -> usize {
+  (text.len() as f32 / compression_ratio_of_text(text)).round() as usize
+}
+
 #[test]
 fn compression_ratio_detects_repetition() {
   let unique: Vec<u32> = (0..200).collect();
   let repeated = vec![42u32; 200];
   assert!(compression_ratio_of_tokens(&repeated) > compression_ratio_of_tokens(&unique));
   assert!(compression_ratio_of_tokens(&repeated) > 2.4); // crosses the fallback threshold
+  // Exact Apple oracle for the repeated case (see the golden test): 800
+  // raw i32-LE bytes compress to 13. flate2/miniz_oxide gave 27 — still
+  // > 2.4, which is precisely why the `> 2.4` check alone cannot guard the
+  // codec choice, but this length pin can.
+  assert_eq!(compressed_len_of_tokens(&repeated), 13);
   assert_eq!(compression_ratio_of_tokens(&[]), f32::INFINITY);
 }
 
 #[test]
-fn compression_ratio_uses_i32_le_bytes() {
-  // Byte-format parity: ratio == raw_len / zlib_len computed over i32-LE bytes.
-  let tokens = [1u32, 2, 3, 4];
-  let bytes: Vec<u8> = tokens
-    .iter()
-    .flat_map(|t| (*t as i32).to_le_bytes())
-    .collect();
-  let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-  std::io::Write::write_all(&mut enc, &bytes).unwrap();
-  let compressed = enc.finish().unwrap();
-  let expected = bytes.len() as f32 / compressed.len() as f32;
-  assert_eq!(compression_ratio_of_tokens(&tokens), expected);
+fn compression_ratio_of_tokens_matches_apple_libcompression_golden() {
+  // GOLDEN / DIFFERENTIAL (coremlit issue #9). The pinned lengths are
+  // Apple libcompression's ACTUAL `.zlib` output — the exact
+  // `NSData.compressed(using: .zlib)` bytes Swift WhisperKit's
+  // `TextUtilities.compressionRatio` produces — captured with an
+  // independent oracle (NOT this crate's own encoder) and verified to
+  // inflate as raw DEFLATE / RFC 1951 (see
+  // `.superpowers/sdd/issue9-compression-fix-report.md`). Because they are
+  // not self-referential, they FAIL if the codec regresses to
+  // flate2/miniz_oxide (RFC-1950 zlib-wrapped, +6 bytes of wrapper, and a
+  // weaker body); each case notes what flate2 would emit instead.
+  //
+  // The findings doc's byte-level anchor: `[1212,318,257,1332,13]` x2 →
+  // Apple emits 24 bytes beginning `db c3 c2 c0` (raw DEFLATE); flate2
+  // would emit 30. This case simultaneously pins the i32-LE token encoding
+  // (the input) and the Apple codec (the length).
+  let doc_example: Vec<u32> = [1212, 318, 257, 1332, 13].repeat(2);
+  assert_eq!(doc_example.len(), 10, "40 raw i32-LE bytes");
+  assert_eq!(compressed_len_of_tokens(&doc_example), 24); // flate2: 30
+
+  // The same 5-token phrase x8 → Apple plateaus at 24 bytes (its harder
+  // compression on repetition); flate2 would emit 37. 160 raw bytes.
+  let phrase_x8: Vec<u32> = [1212, 318, 257, 1332, 13].repeat(8);
+  assert_eq!(compressed_len_of_tokens(&phrase_x8), 24); // flate2: 37
 }
 
 #[test]
@@ -36,18 +67,18 @@ fn compression_ratio_of_text_empty_is_infinite() {
 }
 
 #[test]
-fn compression_ratio_of_text_matches_hand_computed_zlib_ratio() {
-  // Same ratio formula as compression_ratio_of_tokens, different byte
-  // source (UTF-8 vs. i32-LE): sanity-checks the formula against a
-  // hand-rolled zlib pass over the string's own UTF-8 bytes, at the same
-  // Compression::default() level.
-  let text = "the quick brown fox jumps over the lazy dog ".repeat(5);
-  let bytes = text.as_bytes();
-  let mut enc = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-  std::io::Write::write_all(&mut enc, bytes).unwrap();
-  let compressed = enc.finish().unwrap();
-  let expected = bytes.len() as f32 / compressed.len() as f32;
-  assert_eq!(compression_ratio_of_text(&text), expected);
+fn compression_ratio_of_text_matches_apple_libcompression_golden() {
+  // GOLDEN (see the tokens golden above for provenance): Apple `.zlib`
+  // UTF-8 output lengths, independently captured and raw-DEFLATE-verified;
+  // they fail under a flate2 regression (flate2 lengths, noted, are
+  // larger).
+  let the_x20 = "the the the the the the the the the the the the the the the the the the the the";
+  assert_eq!(the_x20.len(), 79);
+  assert_eq!(compressed_len_of_text(the_x20), 9); // flate2: 28
+
+  let fox_x5 = "the quick brown fox jumps over the lazy dog ".repeat(5);
+  assert_eq!(fox_x5.len(), 220);
+  assert_eq!(compressed_len_of_text(&fox_x5), 48); // flate2: 58
 }
 
 #[test]
