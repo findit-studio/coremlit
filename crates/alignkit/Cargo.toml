@@ -21,6 +21,7 @@ targets = ["aarch64-apple-darwin"]
 
 [dependencies]
 coremlit.workspace = true
+derive_more.workspace = true
 thiserror.workspace = true
 
 # The clean, ort-free dependency: asry's `emissions` seam only (no
