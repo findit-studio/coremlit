@@ -158,30 +158,44 @@
 //!   constant's doc for the general, model/config-dependent shape of
 //!   this behavior. When this marker is emitted, product layers should
 //!   filter or model it rather than indexing it as transcript text.
-//! - **Sampling above temperature 0 is non-reproducible by design, on
-//!   both runtimes.** Whenever the fallback ladder retries at
+//! - **Sampling above temperature 0 is non-reproducible by default, on
+//!   both runtimes — set [`DecodingOptions::seed`](options::DecodingOptions::seed) to make it
+//!   reproducible on this side.** Whenever the fallback ladder retries at
 //!   `temperature > 0`, upstream Swift draws from an unseeded RNG
-//!   (`Float.random`, `TokenSampler.swift:169`) and this port's default
-//!   deliberately matches that non-determinism
+//!   (`Float.random`, `TokenSampler.swift:169`), and with
+//!   [`DecodingOptions::seed`](options::DecodingOptions::seed) left `None` (the default) this port's
+//!   sampler matches that non-determinism
 //!   ([`GreedyTokenSampler::new`](decode::sampler::GreedyTokenSampler::new)
-//!   seeds from the OS via `StdRng::from_os_rng`). Two identical runs
-//!   that fall back can therefore legitimately differ. The full
+//!   seeds from the OS via `StdRng::from_os_rng`) — two identical unseeded
+//!   runs that fall back can legitimately differ, by design, exactly like
+//!   Swift, and this is the byte-unchanged default path. Setting
+//!   [`DecodingOptions::seed`](options::DecodingOptions::seed) to `Some(_)` makes the full
 //!   [`WhisperKit::transcribe`](transcribe::WhisperKit::transcribe)/
 //!   [`transcribe_all`](transcribe::WhisperKit::transcribe_all) pipeline
-//!   builds this sampler internally, fresh per attempt, and takes no
-//!   sampler of its own — so at this level there is no seed-injection
-//!   path today, and output stays non-deterministic at `temperature >
-//!   0` by design, exactly like Swift, with no workaround available
-//!   here. Direct callers of [`decode::decode_text`]/
-//!   [`decode::detect_language`] (this crate's own tests included) sit
-//!   one layer lower and do supply their own sampler, so they can build
-//!   it with
+//!   **bit-reproducible across runs, with the fallback ladder still fully
+//!   enabled**: [`transcribe::TranscribeTask`] derives an independent
+//!   per-(window, attempt) sub-seed from the base seed
+//!   ([`decode::sampler::derive_attempt_seed`] — see its doc for the exact
+//!   mixing function and why one seed can't just be reused verbatim
+//!   everywhere), so the same audio/options/seed always samples the same
+//!   tokens end to end, while different windows and different fallback
+//!   attempts still draw distinct, uncorrelated streams. A seed makes
+//!   **this port's own** output reproducible; it does not, and cannot,
+//!   make that output match Swift's draws — Swift has no seed knob at
+//!   all, and its sampling stays unseeded regardless of anything set on
+//!   this side. Direct callers of [`decode::decode_text`]/
+//!   [`decode::detect_language`] (this crate's own tests included) sit one
+//!   layer below the pipeline and supply their own sampler; they can call
 //!   [`GreedyTokenSampler::with_seed`](decode::sampler::GreedyTokenSampler::with_seed)
-//!   — a determinism knob Swift has no equivalent for — for
-//!   reproducible output at that layer. Either way, record the
-//!   effective temperature (the initial value plus any fallback
-//!   increments actually taken) in provenance, since it marks exactly
-//!   which outputs carry sampling randomness.
+//!   directly (optionally through
+//!   [`decode::sampler::derive_attempt_seed`] too, to replicate the
+//!   pipeline's own seed schedule) for the same reproducibility at that
+//!   layer. Either way, seeded or not, record the effective temperature
+//!   (the initial value plus any fallback increments actually taken) in
+//!   provenance — already carried per window by
+//!   [`TranscriptionSegment::temperature`](result::TranscriptionSegment::temperature)/
+//!   [`DecodingResult::temperature`](result::DecodingResult::temperature) —
+//!   since it marks exactly which outputs carry sampling randomness.
 //! - **Swift CLI comparison pitfall: `--language` forces prefill on.**
 //!   The upstream Swift CLI resolves
 //!   `usePrefillPrompt: arguments.usePrefillPrompt || arguments.language

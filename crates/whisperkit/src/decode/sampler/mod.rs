@@ -23,6 +23,14 @@
 //! every method it defines is an unconditional `fatalError`, including
 //! its own initializer on an invalid beam size/patience, so there is no
 //! real behavior to port — a spec non-goal.
+//!
+//! **Rust-only addition, no Swift equivalent:** [`derive_attempt_seed`]
+//! turns one caller-chosen [`DecodingOptions::seed`] into a distinct
+//! [`GreedyTokenSampler::with_seed`] seed per (window, attempt), so
+//! [`crate::transcribe::TranscribeTask`]'s temperature-fallback ladder can
+//! be both reproducible end to end and free of correlated draws across
+//! windows/attempts — see that function's own doc for the exact mixing
+//! function and contract (coremlit issue #9).
 
 use std::num::NonZeroUsize;
 
@@ -100,7 +108,11 @@ impl GreedyTokenSampler {
   /// `NonZeroUsize::MIN`). Seeds its RNG from the OS
   /// (`StdRng::from_os_rng`) — `temperature == 0.0` never consults the
   /// RNG, so this only matters for reproducibility at `temperature !=
-  /// 0.0`; see [`Self::with_seed`] for the deterministic alternative.
+  /// 0.0`; see [`Self::with_seed`] for the deterministic alternative,
+  /// which [`crate::transcribe::TranscribeTask`]'s fallback ladder now
+  /// calls automatically (via [`derive_attempt_seed`]) whenever
+  /// [`DecodingOptions::seed`] is set — this constructor's OS-seeded
+  /// behavior is exactly what running with `seed` left `None` still gets.
   pub fn new(temperature: f32, eot_token: u32, options: &DecodingOptions) -> Self {
     Self {
       temperature,
@@ -117,7 +129,10 @@ impl GreedyTokenSampler {
   /// 0..<sum)` unseeded (`TokenSampler.swift:169`); [`Self::new`]'s
   /// OS-seeded default matches that non-determinism, and this builder
   /// adds a reproducibility knob Swift has no equivalent for, so
-  /// `temperature != 0.0` callers (e.g. tests) can assert an exact draw.
+  /// `temperature != 0.0` callers (e.g. tests, and — via
+  /// [`derive_attempt_seed`] — [`crate::transcribe::TranscribeTask`]'s
+  /// own fallback ladder when [`DecodingOptions::seed`] is set) can
+  /// assert or reproduce an exact draw.
   #[must_use]
   #[inline(always)]
   pub fn with_seed(mut self, seed: u64) -> Self {
@@ -244,6 +259,61 @@ impl GreedyTokenSampler {
       logprobs.push(0.0);
     }
   }
+}
+
+// ---------------------------------------------------------------------
+// Seed derivation
+// ---------------------------------------------------------------------
+
+/// SplitMix64's avalanche finalizer (Steele, Lea & Flood, *Fast Splittable
+/// Pseudorandom Number Generators*, OOPSLA 2014): two multiply-xorshift
+/// rounds that turn a single-bit input difference into an unrelated
+/// (on average half-flipped) 64-bit output. The same finalizer backs
+/// `java.util.SplittableRandom`'s stream splitting; [`derive_attempt_seed`]
+/// below chains two rounds of it to fold extra coordinates into a base
+/// seed.
+const fn splitmix64(x: u64) -> u64 {
+  let mut z = x;
+  z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+  z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+  z ^ (z >> 31)
+}
+
+/// Deterministically derives a per-(window, attempt) sampler seed from a
+/// caller-chosen base `seed` ([`DecodingOptions::seed`]).
+///
+/// Reusing `seed` verbatim for every [`GreedyTokenSampler`] the
+/// temperature-fallback ladder builds would make every window/attempt draw
+/// the exact same RNG stream — wrong the moment two of them share a logits
+/// shape, since they would then sample identical sequences. Instead
+/// `window_index` and `attempt_index` are folded into `seed` through two
+/// rounds of `splitmix64`'s avalanche (this module's private SplitMix64
+/// finalizer, above): the first round mixes in `window_index`, the second
+/// mixes `attempt_index` into that already-avalanched state — so any
+/// `(seed, window_index, attempt_index)` triple that differs in even one
+/// coordinate produces an unrelated 64-bit result, while the identical
+/// triple always reproduces the identical result. That is what lets
+/// [`DecodingOptions::seed`] be, at once, (a) sufficient on its own to
+/// reproduce a whole transcription's sampled tokens bit-for-bit across
+/// separate runs, and (b) safe to reuse across every window and fallback
+/// attempt in that transcription without correlating their draws.
+///
+/// [`crate::transcribe::TranscribeTask`]'s fallback ladder calls this with
+/// `window_index` a strictly monotonic per-`run` window counter — offset by
+/// the task's own `window_id_offset` (see
+/// [`TranscribeTask::set_window_id_offset`](crate::transcribe::TranscribeTask::set_window_id_offset)'s
+/// doc) so sequential VAD chunks and concurrent batch workers don't reuse
+/// each other's window indices either — and `attempt_index` the fallback
+/// loop's own `0..=temperature_fallback_count` counter. The function itself
+/// has no dependency on that caller: it is a pure, public mixing primitive,
+/// so a direct [`decode_text`](crate::decode::decode_text)/
+/// [`detect_language`](crate::decode::detect_language) caller that wants to
+/// replicate (or deliberately diverge from) the pipeline's exact seed
+/// schedule can call it exactly the same way.
+#[must_use]
+pub const fn derive_attempt_seed(seed: u64, window_index: u64, attempt_index: u64) -> u64 {
+  let with_window = splitmix64(seed ^ window_index);
+  splitmix64(with_window ^ attempt_index)
 }
 
 /// Index of the largest entry in `logits`, comparing with `f32::total_cmp`
