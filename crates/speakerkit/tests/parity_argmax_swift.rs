@@ -82,13 +82,22 @@
 //!    legitimately ours-not-theirs and would have to be exempted explicitly.
 //! 2. **Mask row 63.** argmax zero-fills only rows `0..<63` and leaves the
 //!    64th uninitialized (`SpeakerEmbedderModel.swift:219-224`); we zero all
-//!    64. The golden records that a fresh `[1, 64, 1767]` `MLMultiArray` does
-//!    **not** come back zeroed (`freshMaskAllocAllZero: false`), so argmax's
-//!    row 63 really is garbage and really does differ from ours. That makes
-//!    the embedding comparison below a stronger check than the row-independence
-//!    probe it replaces: if the 41/24/58 consumed rows match with a *differing*
-//!    row 63, the embedder's 64 slots are independent as a matter of measured
-//!    fact.
+//!    64. The golden records that a FRESH, separately-allocated `[1, 64,
+//!    1767]` `MLMultiArray` does **not** come back zeroed
+//!    (`freshMaskAllocAllZero: false`) — but that probe inspects a
+//!    DIFFERENT allocation than the one `processChunk` itself used on the
+//!    runs below, so on its own it is strong measured evidence that such
+//!    allocations aren't zero-initialized *in general* on this platform, not
+//!    a measurement that row 63 was nonzero *on this run*. The stronger leg
+//!    is `determinismVerified: true`: two independent full-pipeline runs
+//!    (separate allocations throughout) produced bit-identical embeddings,
+//!    which bears directly on the buffers the compared run actually used.
+//!    Together they are strong measured evidence — short of a formal proof —
+//!    that argmax's row 63 really does differ from ours here too. That makes
+//!    the embedding comparison below a stronger check than the
+//!    row-independence probe it replaces: if the 41/24/58 consumed rows
+//!    match despite a probably-differing row 63, the embedder's 64 slots are
+//!    independent as a matter of strong measured evidence.
 //!
 //! `#[ignore]` (needs the gitignored `Models/argmax-speakerkit/` artifacts and
 //! the committed goldens); run via
@@ -101,7 +110,7 @@ use std::{collections::BTreeSet, path::PathBuf};
 use coremlit::ComputeUnits;
 use speakerkit::{
   embed::EMBEDDING_DIM,
-  extract::Extraction,
+  extract::{EXCLUDE_OVERLAP_MIN_FRAMES, Extraction},
   segment::SEG_NUM_SLOTS,
   source::{
     ArgmaxComputeOptions, ArgmaxOptions, ArgmaxSource, ArgmaxVariant, ModelSource,
@@ -147,13 +156,6 @@ const PLACEMENT_SEG_MISMATCH_TOL: f64 = 0.002;
 /// (`ted_60`, chunk 18, slot 2); bounded with headroom, per
 /// [`PLACEMENT_SEG_MISMATCH_TOL`]'s rationale.
 const PLACEMENT_COS_TOL: f64 = 0.90;
-
-/// pyannote's `embedding_exclude_overlap` minimum clean-frame count, mirroring
-/// the crate-private `extract::EXCLUDE_OVERLAP_MIN_FRAMES` (`pub(crate)`, so
-/// an integration test cannot name it). A slot whose clean-frame count is
-/// STRICTLY greater than this keeps its overlap-excluded mask — which is
-/// argmax's own mask, unconditionally (module doc's divergence 1).
-const EXCLUDE_OVERLAP_MIN_FRAMES: usize = 2;
 
 /// The fixtures this gate replays, and where their audio lives.
 ///
@@ -401,6 +403,15 @@ struct Fidelity {
   exact_rows: usize,
   /// Rows compared (`|ours ∩ theirs|`).
   compared_rows: usize,
+  /// `golden.slots.len()` — the raw count of `(chunk, slot)` entries argmax's
+  /// Swift emitted for this fixture, read straight off the golden and
+  /// independent of [`Self::only_ours`]/[`Self::only_theirs`]/
+  /// [`Self::compared_rows`]'s own bookkeeping. A caller that also proves the
+  /// slot SET matches (`only_ours`/`only_theirs` both empty, or their summed
+  /// length zero) can assert this against [`Self::compared_rows`] to catch
+  /// the embedding loop's `ours.contains(..)` filter silently shrinking
+  /// coverage instead of failing — a bug that check would share with neither.
+  golden_slots: usize,
 }
 
 /// Replays one fixture through [`ArgmaxSource`] at `compute` and measures it
@@ -583,6 +594,7 @@ fn measure(
     worst_cos,
     exact_rows,
     compared_rows,
+    golden_slots: golden.slots.len(),
   }
 }
 
@@ -699,6 +711,7 @@ fn argmax_default_placement_vs_the_cpu_only_reference() {
 
   let (mut worst_abs, mut worst_cos) = (0.0f64, 1.0f64);
   let (mut mismatches, mut cells, mut slot_diffs) = (0usize, 0usize, 0usize);
+  let (mut compared_rows, mut golden_slots) = (0usize, 0usize);
   for fixture in GATE_FIXTURES {
     let f = measure(fixture, compute, false);
     worst_abs = worst_abs.max(f.worst_abs);
@@ -706,6 +719,8 @@ fn argmax_default_placement_vs_the_cpu_only_reference() {
     mismatches += f.seg_mismatches;
     cells += f.seg_cells;
     slot_diffs += f.only_ours.len() + f.only_theirs.len();
+    compared_rows += f.compared_rows;
+    golden_slots += f.golden_slots;
   }
   let seg_rate = mismatches as f64 / cells as f64;
   println!(
@@ -713,6 +728,36 @@ fn argmax_default_placement_vs_the_cpu_only_reference() {
      cells differ ({:.4}%), {slot_diffs} slot-set differences, embedding worst \
      max|diff|={worst_abs:.3e} worst cos={worst_cos:.9}",
     seg_rate * 100.0
+  );
+
+  // The consumed (chunk, slot) SET must be IDENTICAL between `All` and
+  // `CpuOnly` — no speaker may appear or vanish under a pure scheduling
+  // change, only boundary jitter within slots both sides already agree
+  // exist. Per spec §5.3 ("RECORDED DECISION — compute-unit placement and
+  // what the gates actually prove", decision #4): that invariant is the
+  // ENTIRE reason the divergence measured below (worst cosine 0.9241, every
+  // embedding row moved) is a BOUNDED placement-noise risk rather than an
+  // open "we might be losing speakers" one. It must be enforced here, not
+  // merely printed above.
+  assert_eq!(
+    slot_diffs, 0,
+    "ANE/GPU placement changed the consumed (chunk, slot) set relative to the cpu_only \
+     reference — a speaker appeared or vanished under a scheduling change, not just boundary \
+     jitter. That breaks the load-bearing premise of this whole study (spec §5.3, decision #4) \
+     and must never be papered over by loosening a tolerance."
+  );
+  // Compounding trap: `measure()`'s embedding loop filters `golden.slots` to
+  // `ours.contains(..)`, so if the slot sets ever diverged despite
+  // `slot_diffs == 0` above (a bug shared with that bookkeeping), the filter
+  // would silently SHRINK `compared_rows` instead of failing anything.
+  // `golden_slots` is read straight off the golden, independent of
+  // `only_ours`/`only_theirs`, so this closes that gap rather than
+  // rephrasing the same check.
+  assert_eq!(
+    compared_rows, golden_slots,
+    "only {compared_rows} of {golden_slots} golden-consumed slots were actually compared — the \
+     embedding loop silently shrank its coverage instead of comparing every slot argmax \
+     consumed."
   );
 
   assert!(
