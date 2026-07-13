@@ -14,6 +14,15 @@
 //! [desktop-120]: https://github.com/findit-studio/desktop/issues/120
 //!
 //! macOS only (built on [`coremlit`]).
+//!
+//! # Multi-source backend
+//!
+//! As of the multi-source split
+//! (`docs/superpowers/specs/2026-07-13-speakerkit-multisource-diarizer-backend-design.md`),
+//! the segmentation/embedding pipeline above is [`source::ModelSource`]'s
+//! first implementation ([`source::FluidAudioSource`]), not this crate's
+//! only one — see that module for the pluggable-source abstraction and
+//! why it exists.
 
 #[cfg(feature = "serde")]
 mod compute_units_serde;
@@ -21,4 +30,5 @@ pub mod embed;
 pub mod error;
 pub mod extract;
 pub mod segment;
+pub mod source;
 pub mod window;

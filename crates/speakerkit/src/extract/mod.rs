@@ -133,6 +133,7 @@ use crate::{
   embed::{EMBED_SLOTS, EMBEDDING_DIM, EmbedModel},
   error::ExtractError,
   segment::{SEG_CHUNK_SAMPLES, SEG_NUM_SLOTS, SegmentModel},
+  source::Source,
   window::{SlidingWindow, WindowOptions},
 };
 
@@ -252,9 +253,16 @@ impl ComputeOptions {
 
 /// Full [`Extractor`] configuration: the sliding-window geometry
 /// ([`WindowOptions`]) plus the per-model compute placement
-/// ([`ComputeOptions`]), composed per rust-options-pattern.
+/// ([`ComputeOptions`]) plus the selected model [`Source`], composed per
+/// rust-options-pattern.
 ///
 /// No `Eq`: [`WindowOptions`] carries an `f32` `onset`.
+///
+/// `source` is NOT read by [`Extractor::extract`] (it always runs the
+/// FluidAudio orchestration regardless of this field — see
+/// [`crate::source`]'s module doc): today it is forward-compatible
+/// configuration surface for a future source-selecting factory, not yet a
+/// working switch.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Options {
@@ -262,6 +270,8 @@ pub struct Options {
   window: WindowOptions,
   #[cfg_attr(feature = "serde", serde(default))]
   compute: ComputeOptions,
+  #[cfg_attr(feature = "serde", serde(default))]
+  source: Source,
 }
 
 impl Default for Options {
@@ -271,14 +281,16 @@ impl Default for Options {
 }
 
 impl Options {
-  /// Options composing [`WindowOptions::new`] and [`ComputeOptions::new`]
-  /// — each component's own default is the single source of truth (the
-  /// `serde(default)` on each field defers to it; nested partial configs
-  /// are covered by each component's own per-field serde defaults).
+  /// Options composing [`WindowOptions::new`], [`ComputeOptions::new`],
+  /// and [`crate::source::DEFAULT_SOURCE`] — each component's own default
+  /// is the single source of truth (the `serde(default)` on each field
+  /// defers to it; nested partial configs are covered by each component's
+  /// own per-field serde defaults).
   pub const fn new() -> Self {
     Self {
       window: WindowOptions::new(),
       compute: ComputeOptions::new(),
+      source: crate::source::DEFAULT_SOURCE,
     }
   }
 
@@ -292,6 +304,12 @@ impl Options {
   #[inline(always)]
   pub const fn compute(&self) -> ComputeOptions {
     self.compute
+  }
+  /// The selected model [`Source`]. See this field's struct-level doc: not
+  /// yet consumed by [`Extractor::extract`].
+  #[inline(always)]
+  pub const fn source(&self) -> Source {
+    self.source
   }
 
   /// Builder form of [`Self::set_window`].
@@ -318,6 +336,19 @@ impl Options {
   #[inline(always)]
   pub const fn set_compute(&mut self, compute: ComputeOptions) -> &mut Self {
     self.compute = compute;
+    self
+  }
+  /// Builder form of [`Self::set_source`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_source(mut self, source: Source) -> Self {
+    self.set_source(source);
+    self
+  }
+  /// Sets [`Self::source`] in place.
+  #[inline(always)]
+  pub const fn set_source(&mut self, source: Source) -> &mut Self {
+    self.source = source;
     self
   }
 }
