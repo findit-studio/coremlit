@@ -12,23 +12,48 @@
 //! `slice::chunks` directly wherever batching is needed, and this sync,
 //! single-threaded port has no concurrent-worker fan-out to batch for.
 
-use std::io::Write;
-
-use flate2::{Compression, write::ZlibEncoder};
+use objc2::rc::autoreleasepool;
+use objc2_foundation::{NSData, NSDataCompressionAlgorithm};
 use unicode_categories::UnicodeCategories;
 
 use crate::result::WordTiming;
 
-/// zlib-compresses `bytes` at [`Compression::default`], returning the
-/// compressed byte length. `Err` only if the in-memory `Vec<u8>` sink's
-/// `Write` impl fails, which does not happen in practice — kept
-/// `Result`-typed so callers can fall back to [`f32::INFINITY`] the same
-/// way Swift's `catch` does, rather than `unwrap`-panicking on a
-/// theoretical error.
-fn zlib_compressed_len(bytes: &[u8]) -> std::io::Result<usize> {
-  let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
-  encoder.write_all(bytes)?;
-  Ok(encoder.finish()?.len())
+/// zlib-compresses `bytes` with Apple's libcompression — the exact
+/// `NSData.compressed(using: .zlib)` API Swift WhisperKit's
+/// `TextUtilities.compressionRatio` calls
+/// (`Utilities/TextUtilities.swift:14-28,33-53`) — and returns the
+/// compressed byte length. `None` mirrors Swift's `catch { return
+/// .infinity }`: on a genuine OS compression error the caller substitutes
+/// [`f32::INFINITY`] rather than `unwrap`-panicking.
+///
+/// # Why Apple's compressor, not `flate2`/`miniz_oxide`
+/// This length feeds the temperature-fallback repetition signal
+/// ([`compression_ratio_of_tokens`] -> `decode::finalize_decoding_result`),
+/// whose fallback *decision* must match Swift byte-for-byte (coremlit
+/// issue #9). Apple's `.zlib` algorithm emits **raw DEFLATE (RFC 1951)** —
+/// no zlib wrapper (its output begins e.g. `db c3 …`, not `78 …`) — and
+/// compresses markedly harder than `miniz_oxide` on repetitive input.
+/// `flate2::write::ZlibEncoder` emits RFC 1950 (a 2-byte header + 4-byte
+/// Adler-32 trailer, +6 bytes) and saturates at a weaker ratio; both gaps
+/// push our ratio *below* Swift's, flipping the fallback decision at
+/// realistic thresholds. No `flate2` compression level reproduces Apple's
+/// lengths, so this crate calls the identical Foundation API to get a
+/// ratio equal to Swift's by construction. This is a safe `objc2` call —
+/// `objc2` owns the FFI.
+///
+/// The [`autoreleasepool`] matches
+/// [`crate::tokenizer::nl_recognizer::redetect_language`]'s rationale: any
+/// Objective-C method may autorelease internally, so a pool must sit on the
+/// stack or temporaries leak on a thread with no Cocoa run-loop pool above
+/// it. Callers guard empty input before reaching here (Swift's zero-length
+/// `Data` compression throws, landing in the same `catch`).
+fn zlib_compressed_len(bytes: &[u8]) -> Option<usize> {
+  autoreleasepool(|_| {
+    NSData::with_bytes(bytes)
+      .compressedDataUsingAlgorithm_error(NSDataCompressionAlgorithm::Zlib)
+      .ok()
+      .map(|compressed| compressed.len())
+  })
 }
 
 /// Compression ratio (`raw_bytes / compressed_bytes`) of `tokens`, encoded
@@ -43,11 +68,12 @@ fn zlib_compressed_len(bytes: &[u8]) -> std::io::Result<usize> {
 /// `catch` block) or on a genuine compression error (mirrors Swift's
 /// `catch { return .infinity }`).
 ///
-/// Uses [`Compression::default`] (zlib level 6). Apple's
-/// `NSData.compressed(using: .zlib)` compression level is fixed by the OS
-/// and undocumented; if the golden-parity harness (Plan 3) shows
-/// threshold-crossing differences against real WhisperKit output, revisit
-/// the level there — not here.
+/// The compression itself goes through the private `zlib_compressed_len`,
+/// which calls the same Apple `NSData.compressed(using: .zlib)` API as
+/// Swift — see that function for why the codec, not just the byte
+/// encoding, must match Swift (coremlit issue #9). The `i32`-LE token
+/// encoding below is unchanged: it already matched Apple; only the
+/// compressor differed.
 pub fn compression_ratio_of_tokens(tokens: &[u32]) -> f32 {
   if tokens.is_empty() {
     return f32::INFINITY;
@@ -67,8 +93,8 @@ pub fn compression_ratio_of_tokens(tokens: &[u32]) -> f32 {
 /// also guards a fallible `text.data(using: .utf8)` (lines 39-42); that
 /// path is unreachable here since a Rust `&str` is always valid UTF-8.
 ///
-/// See [`compression_ratio_of_tokens`] for the zlib-compression-level
-/// caveat.
+/// Compresses via the private `zlib_compressed_len` (Apple's `.zlib` = raw
+/// DEFLATE), identical to Swift; see [`compression_ratio_of_tokens`].
 pub fn compression_ratio_of_text(text: &str) -> f32 {
   if text.is_empty() {
     return f32::INFINITY;
