@@ -10,6 +10,20 @@
 //! `Aligner::align` is `&mut self`; alignkit's
 //! [`Aligner::align_chunk`](crate::aligner::Aligner::align_chunk) is `&self`
 //! (the CoreML `Model` predicts without `&mut`), so there is nothing to lock.
+//!
+//! # Scope of that win
+//!
+//! `&self` alignment means many chunks can be aligned through one registry
+//! without interior mutability — but **not** that an [`AlignmentSet`] can be
+//! shared across threads today. It is `!Sync`: an [`Aligner`] holds asry's
+//! `EmissionsAligner`, which owns a
+//! [`DynTextNormalizer`](asry::emissions::DynTextNormalizer) =
+//! `Box<dyn TextNormalizer>`, and asry declares
+//! `TextNormalizer: Send` with no `Sync` bound — so the box is not `Sync`,
+//! and neither is anything holding it. An `Arc<AlignmentSet>` fanned out to
+//! worker threads will not compile until asry widens that bound to
+//! `Send + Sync`. Until then the mutex-free design buys single-threaded reuse
+//! and one less lock in the hot path, not free cross-thread sharing.
 
 use std::collections::HashMap;
 
@@ -79,7 +93,10 @@ pub enum AlignmentLookup<'a> {
 ///
 /// Fields are private; construct via [`AlignmentSetBuilder`]. Lookup is
 /// `&self`, and — unlike asry's `Mutex`-wrapped pool — the stored aligners
-/// are aligned through `&self` too, so a whole set is shared read-only.
+/// align through `&self` too, so the whole set is usable behind a shared
+/// reference with no interior mutability. It is **not** `Sync`, so that
+/// shared reference cannot cross threads; see the module doc's "Scope of that
+/// win".
 pub struct AlignmentSet {
   aligners: HashMap<AlignerKey, Aligner>,
   fallback: AlignmentFallback,

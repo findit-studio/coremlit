@@ -2,8 +2,6 @@ use super::*;
 
 use asry::emissions::EnglishNormalizer;
 
-use crate::aligner::AlignerOptions;
-
 // ---------------------------------------------------------------------
 // Hermetic: registry key / fallback / miss semantics need no aligner.
 // ---------------------------------------------------------------------
@@ -86,19 +84,17 @@ fn models_dir() -> std::path::PathBuf {
   )
 }
 
-/// Loads the real model as an En aligner on `ComputeUnits::CpuOnly` — the
-/// same convention `crate::encode`'s model-gated tests follow: deterministic,
-/// and no multi-minute CoreML ANE compilation on the first `All` load of this
-/// model's fixed 960,000-sample input. `DEFAULT_ENCODER_COMPUTE`
-/// (`ComputeUnits::All`) stays the production default.
+/// Loads the real model as an En aligner on the SHIPPING compute placement
+/// (`AlignerOptions::new()` → `DEFAULT_ENCODER_COMPUTE`), never a hardcoded
+/// `ComputeUnits::_` — so these tests exercise the default rather than a
+/// configuration no user runs.
 fn en_aligner() -> Aligner {
-  Aligner::from_paths_with(
+  Aligner::from_paths(
     Lang::En,
     &models_dir().join("base960h_aligner.mlmodelc"),
     Box::new(EnglishNormalizer::new()),
-    AlignerOptions::new().with_compute(coremlit::ComputeUnits::CpuOnly),
   )
-  .expect("load base960h_aligner.mlmodelc as an En aligner")
+  .expect("load base960h_aligner.mlmodelc as an En aligner (set ALIGNKIT_TEST_MODELS)")
 }
 
 #[test]
