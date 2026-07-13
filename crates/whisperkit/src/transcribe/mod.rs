@@ -541,13 +541,35 @@ where
   /// segments' concatenated tokens, so per-segment isolation cannot change
   /// the transcript's spacing.
   ///
-  /// Renumbering is deliberately conditional: survivors are reassigned a
-  /// contiguous `0..N` id range **only when a segment was actually
-  /// dropped** — restoring the same id contiguity
-  /// [`merge_transcription_results`] gives a finalized result, which a bare
-  /// removal would otherwise leave gapped. When nothing is blank (every
-  /// speech input, the golden parity clips included) this returns having
-  /// touched nothing at all: same segments, same order, same ids.
+  /// **Only the exact [`BLANK_AUDIO_MARKER`] literal is dropped.** The
+  /// other non-speech markers a Whisper model samples — `[APPLAUSE]`,
+  /// `[MUSIC]`, and friends; `[APPLAUSE]` shows up in this crate's own jfk
+  /// fixture decode — are left in the transcript, by design. This is a
+  /// blank-*audio* filter, not a general non-speech-annotation stripper:
+  /// silence carries no information a consumer could want, whereas
+  /// `[APPLAUSE]` is a genuine (if non-lexical) event, and deciding which
+  /// of those a product wants to keep is not this crate's call to make.
+  ///
+  /// **Survivors keep the ids they were decoded with, gaps and all** — a
+  /// drop REMOVES, it does not relabel. A segment id is
+  /// `all_segments_count + segments.len()`
+  /// ([`segment::find_seek_point_and_segments`]), i.e. an *ordinal decode
+  /// position*, not an index into this vec, and nothing in the crate looks
+  /// a segment up by it. Renumbering the survivors to a dense `0..N` would
+  /// only make the two settings harder to compare: id 1 would mean "the
+  /// blank" under `drop_blank_audio == false` and "the second speech
+  /// segment" under `true`, so a consumer diffing the two runs could not
+  /// correlate them. Left alone, the ids are stable across the toggle and
+  /// the hole is self-describing ("segment 1 was dropped"). There is also
+  /// no id contiguity to "restore" in the first place:
+  /// [`merge_transcription_results`] re-ids every segment it merges to
+  /// `result_index + segment_index` — a faithfully-ported upstream quirk
+  /// that is neither dense nor unique (two results of two segments give
+  /// `[0, 1, 1, 2]`) — and it does so unconditionally, so on the VAD path
+  /// any renumbering here would be overwritten anyway.
+  ///
+  /// When nothing is blank (every speech input, the golden parity clips
+  /// included) this returns having touched nothing at all.
   ///
   /// # Errors
   /// [`TranscribeError::Tokenizer`] if a segment's tokens fail to decode.
@@ -576,8 +598,6 @@ where
       .drain(..)
       .zip(blank)
       .filter_map(|(segment, is_blank)| (!is_blank).then_some(segment))
-      .enumerate()
-      .map(|(id, segment)| segment.with_id(id))
       .collect();
     *segments = survivors;
     Ok(())

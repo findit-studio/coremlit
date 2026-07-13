@@ -857,11 +857,19 @@ fn blank_audio_segment_is_emitted_when_drop_is_cleared() {
 
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
-fn blank_audio_drop_keeps_surrounding_speech_and_renumbers() {
+fn blank_audio_drop_keeps_surrounding_speech_and_preserves_ids() {
   // A blank stretch BETWEEN speech: the default drops only the blank
-  // segment, the speech on either side survives untouched, the marker
-  // leaves the aggregate text with it, and the survivors are renumbered to
-  // a contiguous 0..N id range (the same contiguity a merged result has).
+  // segment, the speech on either side survives untouched, and the marker
+  // leaves the aggregate text with it.
+  //
+  // The survivors KEEP THEIR ORIGINAL IDS -- [0, 2], with the gap where
+  // the blank segment 1 was. A drop removes, it does not relabel: an id is
+  // an ordinal decode position (`all_segments_count + segments.len()`),
+  // not an index into this vec, and nothing in the crate looks a segment
+  // up by one. Renumbering to a dense [0, 1] would make id 1 mean "the
+  // blank" with the filter off and "World" with it on, so a consumer
+  // diffing the two settings could not correlate them; the gap, by
+  // contrast, is self-describing.
   let t = tiny_tokenizer();
   let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
   script_speech_blank_speech_window(&mut mock, &t);
@@ -878,8 +886,8 @@ fn blank_audio_drop_keeps_surrounding_speech_and_renumbers() {
   );
   assert_eq!(
     segments.iter().map(|s| s.id()).collect::<Vec<_>>(),
-    vec![0, 1],
-    "survivors renumbered contiguously"
+    vec![0, 2],
+    "survivors keep their decoded ids; the dropped segment leaves a gap"
   );
   for segment in segments {
     assert!(

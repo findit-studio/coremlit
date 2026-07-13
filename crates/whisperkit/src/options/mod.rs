@@ -1520,12 +1520,20 @@ impl DecodingOptions {
   /// removed before the result text is assembled. Pure silence therefore
   /// yields an **empty result** (zero segments, empty text) rather than a
   /// one-segment `[BLANK_AUDIO]`; a blank stretch *between* speech is
-  /// dropped while the speech around it survives. Survivors are renumbered
-  /// to a contiguous `0..N` id range whenever a drop actually occurs, the
-  /// same contiguity
-  /// [`merge_transcription_results`](crate::result::merge_transcription_results)
-  /// gives a finalized result; when nothing is dropped the segments —
-  /// their ids included — are left exactly as decoded.
+  /// dropped while the speech around it survives.
+  ///
+  /// Survivors **keep the ids they were decoded with**: a drop leaves a
+  /// gap (`[0, 2]` where segment 1 was blank) rather than relabelling the
+  /// segments around it, so ids stay stable whichever way this is set and
+  /// the hole itself says what happened. See
+  /// [`TranscribeTask::run`](crate::transcribe::TranscribeTask::run) for
+  /// why (an id is an ordinal decode position, not an index, and nothing
+  /// in the crate looks a segment up by one).
+  ///
+  /// Only the **exact** `[BLANK_AUDIO]` literal is dropped. Other
+  /// non-speech markers a model emits — `[APPLAUSE]`, `[MUSIC]` — are
+  /// deliberately left alone: this is a blank-*audio* filter, not a
+  /// general non-speech-annotation stripper.
   ///
   /// **This default is the one deliberate Swift-parity divergence in this
   /// type.** Swift WhisperKit *emits* `[BLANK_AUDIO]` for silence, so
