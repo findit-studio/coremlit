@@ -1,4 +1,5 @@
 use super::*;
+use crate::result::TranscriptionTimings;
 
 /// A deliberately all-non-default decode configuration: every field the
 /// capture below asserts differs from `DecodingOptions::new()`, so a
@@ -42,7 +43,11 @@ fn from_options_captures_every_library_known_field() {
   assert_eq!(provenance.seed(), Some(42));
   assert_eq!(provenance.compute(), compute);
   assert_eq!(provenance.encoder_compute_units(), ComputeUnits::All);
-  assert_eq!(provenance.effective_temperature(), 0.6);
+  assert_eq!(provenance.effective_temperature(), Some(0.6));
+
+  // Options alone cannot observe a DETECTION outcome, so this constructor
+  // does not pretend to: `for_result` is the one that records it.
+  assert_eq!(provenance.detected_language(), None);
 
   // The identity the library genuinely cannot observe is never invented.
   assert_eq!(provenance.model_id(), None);
@@ -84,7 +89,7 @@ fn for_segment_reads_the_effective_temperature_off_the_segment() {
   let segment = TranscriptionSegment::new().with_temperature(0.4);
 
   let provenance = Provenance::for_segment(&decoding, &compute, &segment);
-  assert_eq!(provenance.effective_temperature(), 0.4);
+  assert_eq!(provenance.effective_temperature(), Some(0.4));
   assert_eq!(
     provenance.temperature(),
     0.0,
@@ -94,6 +99,85 @@ fn for_segment_reads_the_effective_temperature_off_the_segment() {
     provenance,
     Provenance::from_options(&decoding, &compute, 0.4),
     "for_segment is from_options with the segment's temperature"
+  );
+}
+
+/// A result of `segments` decoded at the given temperatures, reporting
+/// `language` as the DETECTED one.
+fn result_at(language: &str, temperatures: &[f32]) -> TranscriptionResult {
+  TranscriptionResult::new(
+    "Hello world.",
+    temperatures
+      .iter()
+      .map(|&t| TranscriptionSegment::new().with_temperature(t))
+      .collect::<Vec<_>>(),
+    language,
+    TranscriptionTimings::new(),
+  )
+}
+
+#[test]
+fn for_result_records_the_detected_language_not_the_configured_one() {
+  // The whole point (issue #14 review, m4). Under the DEFAULT auto-detect
+  // the configured language is "" — so a record built from options alone
+  // names no language at all, which is precisely the fact issue #9 wanted
+  // recorded. Only the result knows what was actually detected, and
+  // `for_segment` structurally cannot reach it (it takes a segment).
+  let decoding = DecodingOptions::new();
+  let compute = ComputeOptions::new();
+  assert_eq!(decoding.language(), "", "auto-detect is the default");
+
+  let provenance = Provenance::for_result(&decoding, &compute, &result_at("es", &[0.0]));
+
+  assert_eq!(
+    provenance.language(),
+    "",
+    "the CONFIGURED language, verbatim"
+  );
+  assert_eq!(
+    provenance.detected_language(),
+    Some("es"),
+    "the DETECTED language — the fact the record exists to carry"
+  );
+  // Never inferred: without a result there is nothing to read it from.
+  assert_eq!(
+    Provenance::from_options(&decoding, &compute, 0.0).detected_language(),
+    None
+  );
+}
+
+#[test]
+fn for_result_temperature_is_some_only_when_every_segment_agrees() {
+  // m3: a result-level `f32` would have had to misrepresent a per-window
+  // fallback ladder that split the segments. `Option<f32>` is honest AND
+  // usable: the overwhelmingly common no-fallback case still answers
+  // `Some(0.0)`.
+  let decoding = DecodingOptions::new();
+  let compute = ComputeOptions::new();
+  let for_result = |temperatures: &[f32]| {
+    Provenance::for_result(&decoding, &compute, &result_at("en", temperatures))
+      .effective_temperature()
+  };
+
+  assert_eq!(
+    for_result(&[0.0, 0.0, 0.0]),
+    Some(0.0),
+    "no fallback anywhere"
+  );
+  assert_eq!(
+    for_result(&[0.4, 0.4]),
+    Some(0.4),
+    "the same rung throughout"
+  );
+  assert_eq!(
+    for_result(&[0.0, 0.2]),
+    None,
+    "the ladder split the segments: no single temperature describes this"
+  );
+  assert_eq!(
+    for_result(&[]),
+    None,
+    "no segments (silence, once drop_blank_audio empties it) landed anywhere"
   );
 }
 
@@ -113,6 +197,16 @@ fn is_reproducible_requires_greedy_or_a_seed() {
     "a fallback climb with no seed is not reproducible"
   );
   assert!(Provenance::from_options(&seeded, &compute, 0.2).is_reproducible());
+
+  // A SPLIT ladder (None) is conservatively not reproducible without a
+  // seed: the rungs only ascend, so a split means at least one segment
+  // climbed off 0.0 and sampled. A segment-less result carries no evidence
+  // either way, and this predicate must never claim what it cannot back.
+  let split = |decoding: &DecodingOptions| {
+    Provenance::for_result(decoding, &compute, &result_at("en", &[0.0, 0.2])).is_reproducible()
+  };
+  assert!(!split(&unseeded));
+  assert!(split(&seeded));
 }
 
 #[test]
@@ -178,7 +272,12 @@ fn unset_identity_serializes_as_absent_not_null() {
   }
 
   // The library-known facts are always written, so a persisted record is
-  // never silently missing the settings that produced it.
+  // never silently missing the settings that produced it. The two OUTCOME
+  // fields are written even when they are `None` — as an explicit `null`,
+  // NOT omitted like the identity above, because for them `None` is itself
+  // the fact ("the ladder split the segments" / "this record was built
+  // without a result"), and a reader must be able to tell that from "the
+  // writer dropped the field".
   for present in [
     "task",
     "language",
@@ -191,10 +290,15 @@ fn unset_identity_serializes_as_absent_not_null() {
     "temperature_increment_on_fallback",
     "temperature_fallback_count",
     "compute",
+    "detected_language",
     "effective_temperature",
   ] {
     assert!(object.contains_key(present), "`{present}` must be recorded");
   }
+  assert!(
+    object["detected_language"].is_null(),
+    "an unobserved detection outcome is an explicit null, not an omission"
+  );
 
   assert_eq!(
     serde_json::from_str::<Provenance>(&value.to_string()).unwrap(),
@@ -211,16 +315,47 @@ fn a_record_missing_a_library_known_field_is_rejected() {
   // for a missing field would be a lie about what actually ran. Only the
   // consumer-supplied identity (and `seed`, whose absence honestly means
   // "unseeded") may be omitted.
-  let full = Provenance::from_options(&distinctive_decoding(), &distinctive_compute(), 0.6);
-  let mut value: serde_json::Value = serde_json::to_value(&full).unwrap();
-  value
-    .as_object_mut()
-    .unwrap()
-    .remove("use_prefill_prompt")
-    .unwrap();
+  //
+  // The two `Option` OUTCOME fields need `required_option` to hold this
+  // line at all: serde's derive silently treats a missing `Option` field
+  // as `None` even with no `serde(default)` on it, which for these two
+  // would forge a meaning ("the ladder split the segments" / "no result
+  // was observed") out of a field the writer merely dropped. They are
+  // asserted here alongside the plain ones — this is the test that proves
+  // the `deserialize_with` actually defeats that path.
+  let full = Provenance::for_result(
+    &distinctive_decoding(),
+    &distinctive_compute(),
+    &result_at("es", &[0.6]),
+  );
+  let value: serde_json::Value = serde_json::to_value(&full).unwrap();
+  assert_eq!(
+    serde_json::from_str::<Provenance>(&value.to_string()).unwrap(),
+    full,
+    "the intact record must round-trip, or the removals below prove nothing"
+  );
 
-  assert!(
-    serde_json::from_str::<Provenance>(&value.to_string()).is_err(),
-    "a missing library-known field must fail, not default"
+  for required in [
+    "use_prefill_prompt",
+    "detected_language",
+    "effective_temperature",
+  ] {
+    let mut without = value.clone();
+    without.as_object_mut().unwrap().remove(required).unwrap();
+    assert!(
+      serde_json::from_str::<Provenance>(&without.to_string()).is_err(),
+      "a missing `{required}` must fail, not default"
+    );
+  }
+
+  // Present-but-null is the honest, ACCEPTED encoding of "no such fact":
+  // it is the omission that is rejected, not the null.
+  let mut nulled = value;
+  nulled.as_object_mut().unwrap()["effective_temperature"] = serde_json::Value::Null;
+  assert_eq!(
+    serde_json::from_str::<Provenance>(&nulled.to_string())
+      .unwrap()
+      .effective_temperature(),
+    None
   );
 }

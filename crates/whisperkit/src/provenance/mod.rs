@@ -16,9 +16,12 @@
 //!   [`DecodingOptions`] (task, language and its resolved
 //!   `detect_language` coupling, prefill, skip-special, word-timestamps,
 //!   chunking/VAD strategy, the whole temperature-fallback ladder, the
-//!   seed), the [`ComputeOptions`] the pipeline was built with, and the
-//!   *effective* decode temperature a segment actually landed on.
-//!   [`Provenance::from_options`] fills every one of these in for you.
+//!   seed), the [`ComputeOptions`] the pipeline was built with, and — from
+//!   the transcript itself — the language the decode actually **detected**
+//!   and the *effective* temperature it actually landed on.
+//!   [`Provenance::from_options`] fills in everything the options alone
+//!   settle; [`Provenance::for_result`] adds the two outcome facts, and is
+//!   the constructor to reach for when you have a transcript in hand.
 //! - **Consumer-supplied** — the model and tokenizer identity
 //!   ([`Provenance::model_id`]/[`Provenance::model_revision`],
 //!   [`Provenance::tokenizer_id`]/[`Provenance::tokenizer_revision`]).
@@ -42,29 +45,77 @@
 //!   temperature-fallback ladder samples stochastically once it climbs off
 //!   `0.0`, and [`DecodingOptions::seed`] is unset by default (OS-seeded,
 //!   matching Swift's own unseeded draw). [`Provenance::effective_temperature`]
-//!   is therefore the field that tells you whether a given segment was
-//!   greedy/deterministic (`0.0`) or sampled, and
+//!   is therefore the field that tells you whether the decode was
+//!   greedy/deterministic (`Some(0.0)`) or sampled, and
 //!   [`Provenance::seed`] tells you whether that sampling can be replayed
 //!   at all. Record both, or a re-run that disagrees is uninvestigable.
+//! - **Auto-detect makes the *configured* language useless as a record.**
+//!   It is `""` whenever the decoder is left to detect (the default
+//!   pairing), so a record built from options alone names no language at
+//!   all. [`Provenance::detected_language`] is the field that carries what
+//!   was actually spoken, and only [`Provenance::for_result`] — which is
+//!   handed the transcript — can fill it in.
 
 use coremlit::ComputeUnits;
 
 use crate::{
   options::{ChunkingStrategy, ComputeOptions, DecodingOptions, Task},
-  result::TranscriptionSegment,
+  result::{TranscriptionResult, TranscriptionSegment},
 };
 
 #[cfg(test)]
 mod tests;
 
-/// A serde-serializable record of what produced a transcript: the resolved
-/// decode configuration, the compute units it ran on, the effective decode
-/// temperature, and — when the caller supplies them — the model and
-/// tokenizer identity.
+/// Deserializes a **required but nullable** `Option` field.
 ///
-/// Build it with [`Self::from_options`] (or [`Self::for_segment`], which
-/// reads the effective temperature straight off a decoded segment), then
-/// attach the identity the library cannot know:
+/// Serde's derive special-cases a *missing* `Option` field to `None` (its
+/// `missing_field` helper feeds the type a deserializer that answers
+/// `deserialize_option` with `visit_none`), so a bare `Option<T>` field is
+/// silently optional even with no `serde(default)` on it. That is exactly
+/// the silent defaulting this type refuses: an absent
+/// [`Provenance::effective_temperature`] would read back as "the fallback
+/// ladder split the segments" when all it really means is "whoever wrote
+/// this record dropped the field". Naming a `deserialize_with` sends the
+/// derive down its required-field path instead — the key must be present,
+/// and `null` then carries its real meaning and nothing else.
+#[cfg(feature = "serde")]
+fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+  D: serde::Deserializer<'de>,
+  T: serde::Deserialize<'de>,
+{
+  <Option<T> as serde::Deserialize<'de>>::deserialize(deserializer)
+}
+
+/// The one temperature every segment of a result agrees on, or `None` when
+/// they do not — backing [`Provenance::effective_temperature`] for
+/// [`Provenance::for_result`].
+///
+/// `None` for an empty slice too: the temperature-fallback ladder runs
+/// per *window*, so a result is only describable by a single effective
+/// temperature when every segment in it actually landed on the same rung,
+/// and a result with no segments has nothing to land. (Both cases are
+/// ordinary now — [`DecodingOptions::drop_blank_audio`] empties a silent
+/// chunk outright.) Claiming a number here for either would be a
+/// fabrication; `None` says the honest thing.
+fn unanimous_temperature(segments: &[TranscriptionSegment]) -> Option<f32> {
+  let first = segments.first()?.temperature();
+  segments
+    .iter()
+    .all(|segment| segment.temperature() == first)
+    .then_some(first)
+}
+
+/// A serde-serializable record of what produced a transcript: the resolved
+/// decode configuration, the compute units it ran on, the language it
+/// detected and the effective temperature it landed on, and — when the
+/// caller supplies them — the model and tokenizer identity.
+///
+/// Build it with [`Self::for_result`] when you have the transcript (the
+/// form that records the detected language and the effective temperature);
+/// with [`Self::for_segment`] to record one segment's own rung of the
+/// fallback ladder; or with [`Self::from_options`] from the configuration
+/// alone. Then attach the identity the library cannot know:
 ///
 /// ```
 /// use whisperkit::{
@@ -142,12 +193,39 @@ pub struct Provenance {
   /// The per-stage CoreML compute units the pipeline ran on. Recorded
   /// because they change the output (see this module's docs).
   compute: ComputeOptions,
+  /// The language the transcript was actually decoded in
+  /// ([`TranscriptionResult::language`]) — the **outcome**, where
+  /// [`Self::language`] is the **input**. This is the one that matters
+  /// under auto-detect: `language` is then empty (and it is empty on every
+  /// run with [`DecodingOptions::use_prefill_prompt`] cleared, the default
+  /// pairing for detection), so the configured value says nothing at all
+  /// about what was spoken, and only this field does.
+  ///
+  /// `None` **iff the record was built without a result** — by
+  /// [`Self::from_options`] or [`Self::for_segment`], neither of which is
+  /// handed a [`TranscriptionResult`] and so neither of which can observe
+  /// the detection outcome. Never inferred from the configured language.
+  /// [`Self::for_result`] always fills it in.
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "required_option"))]
+  detected_language: Option<String>,
   /// The temperature the decode **actually landed on** — the fallback
   /// ladder's accepted attempt, read off
   /// [`TranscriptionSegment::temperature`]. Equal to [`Self::temperature`]
-  /// when no fallback was needed; higher when the ladder climbed. `0.0`
-  /// means greedy/argmax and therefore deterministic.
-  effective_temperature: f32,
+  /// when no fallback was needed; higher when the ladder climbed.
+  /// `Some(0.0)` means greedy/argmax and therefore deterministic; the
+  /// overwhelmingly common no-fallback case.
+  ///
+  /// `None` means **no single temperature describes this transcript**. The
+  /// ladder runs per *window*, so two segments of one result can
+  /// legitimately land on different rungs; when they do, any single number
+  /// here would be a lie about at least one of them. A result with no
+  /// segments at all (silence, once
+  /// [`DecodingOptions::drop_blank_audio`] has emptied it) is `None` for
+  /// the same reason: nothing landed anywhere.
+  /// [`Self::from_options`]/[`Self::for_segment`] are always `Some` — they
+  /// are handed the one temperature they record.
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "required_option"))]
+  effective_temperature: Option<f32>,
 
   // -- consumer-supplied: load-time identity ----------------------------
   /// The model's identity (e.g. a Hub repo id), if the caller supplied it.
@@ -178,21 +256,14 @@ pub struct Provenance {
 }
 
 impl Provenance {
-  /// Captures every library-known fact from `decoding`/`compute` plus the
-  /// `effective_temperature` a decode landed on, leaving the model and
-  /// tokenizer identity unset (`None`) for the caller to fill in — this
-  /// crate loads from bare local folders and genuinely does not know it
-  /// (see the module docs).
-  ///
-  /// `effective_temperature` is per-*segment*, not per-result: the
-  /// fallback ladder runs per window, so two segments of one transcript
-  /// can legitimately land on different temperatures. Pass
-  /// [`TranscriptionSegment::temperature`] for the segment being recorded
-  /// — or use [`Self::for_segment`], which does exactly that.
-  pub fn from_options(
+  /// The shared capture: every library-known fact off `decoding`/`compute`,
+  /// with the two outcome fields — which only a result or a segment can
+  /// supply — passed in, and the identity left `None`.
+  fn capture(
     decoding: &DecodingOptions,
     compute: &ComputeOptions,
-    effective_temperature: f32,
+    detected_language: Option<String>,
+    effective_temperature: Option<f32>,
   ) -> Self {
     Self {
       task: decoding.task(),
@@ -209,6 +280,7 @@ impl Provenance {
       temperature_fallback_count: decoding.temperature_fallback_count(),
       seed: decoding.seed(),
       compute: *compute,
+      detected_language,
       effective_temperature,
       model_id: None,
       model_revision: None,
@@ -217,19 +289,100 @@ impl Provenance {
     }
   }
 
+  /// Captures every library-known fact from `decoding`/`compute` plus the
+  /// `effective_temperature` a decode landed on, leaving the model and
+  /// tokenizer identity unset (`None`) for the caller to fill in — this
+  /// crate loads from bare local folders and genuinely does not know it
+  /// (see the module docs).
+  ///
+  /// [`Self::detected_language`] is left `None`: options alone cannot know
+  /// what language was detected. Reach for [`Self::for_result`] when you
+  /// have the transcript — that is the constructor that records it.
+  ///
+  /// `effective_temperature` is per-*segment*, not per-result: the
+  /// fallback ladder runs per window, so two segments of one transcript
+  /// can legitimately land on different temperatures. Pass
+  /// [`TranscriptionSegment::temperature`] for the segment being recorded
+  /// — or use [`Self::for_segment`], which does exactly that.
+  pub fn from_options(
+    decoding: &DecodingOptions,
+    compute: &ComputeOptions,
+    effective_temperature: f32,
+  ) -> Self {
+    Self::capture(decoding, compute, None, Some(effective_temperature))
+  }
+
   /// [`Self::from_options`] with the effective temperature read straight
   /// off a decoded `segment` — the ergonomic form when recording
-  /// provenance for a transcript you already have.
+  /// provenance for one segment of a transcript you already have.
   ///
-  /// Provenance is per-segment for the reason spelled out on
-  /// [`Self::from_options`]: only the segment knows which rung of the
-  /// fallback ladder its decode was accepted at.
+  /// Per-segment for the reason spelled out on [`Self::from_options`]:
+  /// only the segment knows which rung of the fallback ladder its decode
+  /// was accepted at. For the whole transcript, use [`Self::for_result`].
   pub fn for_segment(
     decoding: &DecodingOptions,
     compute: &ComputeOptions,
     segment: &TranscriptionSegment,
   ) -> Self {
     Self::from_options(decoding, compute, segment.temperature())
+  }
+
+  /// The **result-level** capture: [`Self::from_options`]'s facts, plus the
+  /// two a whole transcript — and only a whole transcript — can settle.
+  ///
+  /// - [`Self::detected_language`] becomes `Some(result.language())`: the
+  ///   language the decode **actually ran in**. This is the fact worth
+  ///   recording, and it is one [`Self::for_segment`] structurally cannot
+  ///   reach (it is handed a segment, not the result that carries the
+  ///   detection outcome). Under the default auto-detect the *configured*
+  ///   [`Self::language`] is just `""`, so without this a record of the
+  ///   common case names no language at all.
+  /// - [`Self::effective_temperature`] becomes `Some(t)` **iff every
+  ///   segment landed on the same `t`** — the overwhelmingly common
+  ///   no-fallback case, which yields `Some(0.0)` — and `None` when the
+  ///   per-window fallback ladder split them, or when the result has no
+  ///   segments at all to agree (silence, after
+  ///   [`DecodingOptions::drop_blank_audio`] empties it). A result-level
+  ///   `f32` would have had to invent a number for both.
+  ///
+  /// The model/tokenizer identity is still the caller's to supply — a
+  /// result cannot know it either.
+  ///
+  /// ```
+  /// use whisperkit::{
+  ///   options::{ComputeOptions, DecodingOptions},
+  ///   provenance::Provenance,
+  ///   result::{TranscriptionResult, TranscriptionTimings},
+  /// };
+  ///
+  /// // Auto-detect: the CONFIGURED language is empty ...
+  /// let decoding = DecodingOptions::new();
+  /// let compute = ComputeOptions::new();
+  /// let result = TranscriptionResult::new(
+  ///   "Hello world.",
+  ///   Vec::new(),
+  ///   "en",
+  ///   TranscriptionTimings::new(),
+  /// );
+  ///
+  /// let provenance = Provenance::for_result(&decoding, &compute, &result);
+  /// assert_eq!(provenance.language(), "");
+  /// // ... and the DETECTED one is the fact actually worth persisting.
+  /// assert_eq!(provenance.detected_language(), Some("en"));
+  /// // No segments landed anywhere, so no single temperature describes it.
+  /// assert_eq!(provenance.effective_temperature(), None);
+  /// ```
+  pub fn for_result(
+    decoding: &DecodingOptions,
+    compute: &ComputeOptions,
+    result: &TranscriptionResult,
+  ) -> Self {
+    Self::capture(
+      decoding,
+      compute,
+      Some(result.language().to_string()),
+      unanimous_temperature(result.segments_slice()),
+    )
   }
 
   // -- task ---------------------------------------------------------------
@@ -325,12 +478,24 @@ impl Provenance {
     self.compute.encoder()
   }
 
-  // -- effective_temperature ----------------------------------------------
-  /// The temperature the decode actually landed on. `0.0` means greedy and
-  /// therefore deterministic; anything higher was sampled, and is only
-  /// reproducible if [`Self::seed`] is set.
+  // -- detected_language --------------------------------------------------
+  /// The language the transcript was actually decoded in — the outcome,
+  /// where [`Self::language`] is the configured input. `None` iff this
+  /// record was built without a result ([`Self::from_options`] /
+  /// [`Self::for_segment`]); never inferred. See the field's doc.
   #[inline(always)]
-  pub const fn effective_temperature(&self) -> f32 {
+  pub fn detected_language(&self) -> Option<&str> {
+    self.detected_language.as_deref()
+  }
+
+  // -- effective_temperature ----------------------------------------------
+  /// The temperature the decode actually landed on. `Some(0.0)` means
+  /// greedy and therefore deterministic; anything higher was sampled, and
+  /// is only reproducible if [`Self::seed`] is set. `None` means no single
+  /// temperature describes the transcript — the per-window fallback ladder
+  /// split its segments, or it has no segments. See the field's doc.
+  #[inline(always)]
+  pub const fn effective_temperature(&self) -> Option<f32> {
     self.effective_temperature
   }
 
@@ -339,12 +504,22 @@ impl Provenance {
   /// greedy (an effective temperature of `0.0` never draws from the
   /// sampler) or when a [`Self::seed`] makes the draws replayable.
   ///
+  /// A `None` [`Self::effective_temperature`] is treated as **not**
+  /// self-evidently reproducible, and so needs a seed: the ladder having
+  /// split the segments means at least one of them climbed off `0.0` and
+  /// sampled (the rungs only ever ascend), and a segment-less result
+  /// carries no evidence either way. Conservative on purpose — this
+  /// predicate must never claim reproducibility it cannot back.
+  ///
   /// A seed makes *this port's* output reproducible; it cannot make that
   /// output match Swift's, which has no seed knob and always draws
   /// unseeded (see [`DecodingOptions::seed`]).
   #[inline(always)]
   pub const fn is_reproducible(&self) -> bool {
-    self.effective_temperature == 0.0 || self.seed.is_some()
+    match self.effective_temperature {
+      Some(temperature) => temperature == 0.0 || self.seed.is_some(),
+      None => self.seed.is_some(),
+    }
   }
 
   // -- model_id (Option<String>) ------------------------------------------
