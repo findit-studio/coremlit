@@ -30,7 +30,8 @@ pub fn model_path() -> PathBuf {
   models_dir().join("base960h_aligner.mlmodelc")
 }
 
-/// Path to the 60 s @ 16 kHz mono fixture used by the graph-truth test.
+/// Path to the 60 s @ 16 kHz mono fixture used by the graph-truth test and
+/// by `tests/parity_words.rs`'s **unpadded** half.
 ///
 /// alignkit has no committed audio fixtures of its own. `ted_60.wav` in the
 /// whisperkit crate's `tests/fixtures/audio/` is already exactly 960,000
@@ -41,12 +42,118 @@ pub fn model_path() -> PathBuf {
 /// would then need to stay byte-identical to the original forever. Both
 /// crates live in this workspace and move together.
 ///
-/// `#[allow(dead_code)]`: only `tests/model_io.rs` uses it; the per-binary
-/// `common` copy in `tests/align_chunk.rs` does not.
+/// That exact-window property is the whole reason the parity gate wants this
+/// clip: see [`TED_60_TRANSCRIPT`].
+///
+/// `#[allow(dead_code)]`: only `tests/model_io.rs` and `tests/parity_words.rs`
+/// use it; the per-binary `common` copy in `tests/align_chunk.rs` does not.
 #[allow(dead_code)]
 pub fn ted_60_wav_path() -> PathBuf {
   PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../whisperkit/tests/fixtures/audio/ted_60.wav")
 }
+
+/// The verified transcript for [`ted_60_wav_path`]'s audio — the opening 60 s
+/// of Tim Urban's TED talk *Inside the mind of a master procrastinator*.
+///
+/// # Why this clip has a transcript at all
+///
+/// `jfk.wav` is 176,000 samples; the encoder window is 960,000, so alignkit
+/// zero-pads it by 81.7% and the **unpadded path has never been gated**.
+/// `ted_60.wav` is exactly 960,000 samples, so
+/// `Encoder::emissions_raw` takes its `Cow::Borrowed` branch — *no zeros are
+/// ever appended* — and `truncated_frame_count(960_000, 2999)` keeps all 2,999
+/// frames instead of jfk's 550. Forced alignment needs a transcript, and this
+/// clip shipped without one, which is exactly why the gap survived B5.
+///
+/// # Provenance: ASR, because ASR is what feeds forced alignment
+///
+/// Produced by **this workspace's own whisperkit** — the real production
+/// pipeline, ASR → forced alignment — via
+/// `cargo run -p whisperkit --example transcribe_wav`, on
+/// `openai_whisper-large-v3` (`argmaxinc/whisperkit-coreml`). It is therefore
+/// the *kind* of text a caller actually aligns: readable ASR output, not a
+/// hand-made verbatim transcription.
+///
+/// # Verification — three sources, and the ASR lost twice
+///
+/// A transcript is an **input** to forced alignment: a wrong word does not
+/// fail, it silently becomes a wrong alignment target. So this text was
+/// cross-checked against two independent readings of the same audio —
+/// whisper-small (the same pipeline, a weaker checkpoint) and a **greedy CTC
+/// decode of alignkit's own wav2vec2 emissions**, which is the acoustic model
+/// that will actually consume it — and every disagreement was settled against
+/// the emission posteriors and the RMS envelope, never by vote:
+///
+/// - **`ninety-page`, not `90-page`** (large-v3's spelling). The 29-class CTC
+///   vocabulary has **no digits**, so `90` can only align as out-of-vocabulary
+///   wildcards. The greedy decode reads the audio as `NINETY | PAGE` — two
+///   words — and [`asry::EnglishNormalizer`] splits on the hyphen, so the
+///   spoken form lands as exactly those two words. Spoken form is the correct
+///   register for a forced-alignment target.
+/// - **`happen to every single paper`**, not whisper-small's `happen in`. The
+///   greedy decode emits a bare `T` at 37,520 ms between `HAPPEN` and `EVERY`
+///   — the /t/ that `in` does not have. large-v3 agrees.
+/// - **`everything gets done and things stay civil`** — the `and` is real,
+///   though the greedy decode drops it. Frames 1055–1057 (21,100–21,140 ms)
+///   carry `A`/`I` → `N` → `D` posterior mass in sequence beneath a dominant
+///   word-delimiter, over a non-zero RMS of 0.081 → 0.062 → 0.021: a reduced,
+///   unstressed /ənd/ in the 160 ms gap. Greedy CTC routinely swallows those
+///   (it also lost the `may` of `maybe` and the `st` of `stay` right here).
+/// - **`I knew for a paper like that`** — large-v3's leading **`And` is a
+///   hallucination and is NOT in this transcript.** Frames 2285–2296
+///   (45,700–45,920 ms) are digital silence: RMS 0.001–0.003, `logP(blank)`
+///   fp16-saturated at exactly `0.0`, and no letter posterior above −8. Speech
+///   resumes at 45,920 ms and the model fires `I` at 45,940 ms with a −0.06
+///   log-prob — there is neither room nor evidence for an `And`. It is a
+///   textbook Whisper segment-initial discourse-marker insertion: large-v3
+///   opened a new segment at exactly 45.84 s, right after that pause, and
+///   whisper-small — which did not break a segment there — never wrote it.
+///
+/// The clip's last word is complete: the greedy decode closes `IT` at
+/// 59,980 ms, 20 ms inside the 60,000 ms edge.
+///
+/// # What is deliberately NOT here
+///
+/// Whisper elides disfluencies, and two survive in the audio: a false start
+/// (`I would`… ~27,520–28,220 ms) before `I would have it all ready to go`,
+/// and a `would would` repetition near 31,800 ms. They are **left out on
+/// purpose** — this is ASR output, which is what production feeds an aligner,
+/// and *both* aligners receive the identical text, so the omission cannot bias
+/// the comparison. It does leave real speech with no transcript word under it,
+/// which makes those two spots the natural places for the trellis to diverge;
+/// `tests/parity_words.rs`'s divergence ledger is where that shows up, and it
+/// is pinned rather than tolerated.
+///
+/// `#[allow(dead_code)]`: only `tests/parity_words.rs` uses it.
+#[allow(dead_code)]
+pub const TED_60_TRANSCRIPT: &str = concat!(
+  "So in college, I was a government major, which means I had to write a lot of papers. ",
+  "Now, when a normal student writes a paper, they might spread the work out a little like this. ",
+  "So, you know, you get started maybe a little slowly, but you get enough done in the first week ",
+  "that with some heavier days later on, everything gets done and things stay civil. ",
+  "And I would want to do that like that. That would be the plan. ",
+  "I would have it all ready to go, but then actually the paper would come along, ",
+  "and then I would kind of do this. ",
+  "And that would happen to every single paper. ",
+  "But then came my ninety-page senior thesis, a paper you're supposed to spend a year on. ",
+  "I knew for a paper like that, my normal workflow was not an option. ",
+  "It was way too big a project. ",
+  "So I planned things out, and I decided I kind of had to go something like this. ",
+  "This is how the year would go. So I'd start off light and I'd bump it",
+);
+
+/// SHA-256 of [`ted_60_wav_path`]'s **decoded** buffer — the 960,000 f32
+/// samples [`load_wav_mono_f32`] returns, hashed as little-endian bytes.
+/// Exactly [`JFK_SAMPLES_SHA256`]'s role, for the second clip: it pins the
+/// audio the gate's ted_60 bounds were measured on, and it is *also* the pin
+/// that the clip still fills the window exactly — a re-encode that changed the
+/// length by one sample would silently move alignkit onto its zero-padding
+/// branch and quietly retire the very path this fixture exists to cover.
+///
+/// `#[allow(dead_code)]`: only `tests/parity_words.rs` uses it.
+#[allow(dead_code)]
+pub const TED_60_SAMPLES_SHA256: &str =
+  "b14ed488eb68545e49893bd424d78a0849941b97c3f042c3e4461e3bfb513dd5";
 
 /// Path to the 11 s @ 16 kHz mono `jfk.wav` fixture (176,000 samples, well
 /// inside the encoder's 960,000 window), borrowed from the whisperkit crate

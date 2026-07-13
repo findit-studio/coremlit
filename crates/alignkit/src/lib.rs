@@ -29,21 +29,49 @@
 //! Because alignkit and `asry` share every stage except the encoder, the
 //! encoder swap can be measured on its own — and it has been, at the word
 //! level, on real speech, on the shipping compute default
-//! (`tests/parity_words.rs`). On `jfk.wav`, against asry's ONNX-Runtime
-//! aligner: **38 of 44 word boundaries agree to within one 20 ms frame**, the
-//! median disagreement is **12.8 ms** (under a single frame), and the p90 is
-//! 47 ms.
+//! (`tests/parity_words.rs`), against asry's ONNX-Runtime aligner. It is
+//! measured on **two** clips, and the difference between them is the most
+//! useful thing this section can tell you:
 //!
-//! One boundary disagrees by 908 ms, and there **the oracle is the one that is
-//! wrong**: it places the second `ask` 873 ms before the audio contains any
-//! evidence for it, inside a silent pause across which the acoustic model's
-//! `logP(blank)` is fp16-saturated at exactly `0.0` for 41 consecutive frames.
-//! alignkit puts that word 35 ms from its true acoustic onset. The lesson
-//! generalises and is worth stating in the crate's own docs: **a forced
-//! aligner's word boundaries are only as determined as the acoustic evidence
-//! under them.** Across a long pause, with no VAD, the onset frame is a
-//! tie-break among numerically identical paths — supply `sub_segments` from a
-//! real VAD when you have one.
+//! | | `ted_60.wav` (60 s — **fills the window**) | `jfk.wav` (11 s — **zero-padded**) |
+//! |---|---|---|
+//! | boundaries within one 20 ms frame | **367 / 372 (98.7%)** | 38 / 44 (86.4%) |
+//! | median disagreement | **0.0 ms** — frame-identical | 12.8 ms |
+//! | p90 disagreement | **0.0 ms** | 47.0 ms |
+//!
+//! **Feed the encoder a full window and its word boundaries are frame-exact
+//! against the reference implementation.** The encoder's CoreML fp16 29-class
+//! conversion costs essentially nothing.
+//!
+//! The jfk column is not encoder error either — it is **padding**. The CoreML
+//! graph takes a fixed `[1, 960_000]` input ([`encode::ENCODER_WINDOW_SAMPLES`]),
+//! so a chunk shorter than 60 s is zero-padded, and wav2vec2-base group-norms
+//! over the whole sequence axis and attends globally with no padding mask: the
+//! zeros perturb *every* real frame, not just the tail. So, practically:
+//! **a short chunk costs you roughly a frame of extra spread — fill the window
+//! when you can.**
+//!
+//! ## Where a forced aligner cannot help you
+//!
+//! On each clip exactly one boundary diverges grossly from the oracle, and on
+//! **both** it is the ORACLE that is wrong — the same mechanism twice:
+//!
+//! - `jfk.wav`: it places the second `ask` 873 ms before the audio contains any
+//!   evidence for it, inside a pause across which `logP(blank)` is fp16-saturated
+//!   at exactly `0.0` for 41 consecutive frames. alignkit puts that word 35 ms
+//!   from its true acoustic onset.
+//! - `ted_60.wav`: the speaker says `would` twice and the ASR transcript names
+//!   it once; the oracle ends the word at the *first* realisation and calls the
+//!   second — 120 ms of confidently-decoded speech — blank. alignkit spans the
+//!   word's real acoustic support.
+//!
+//! The lesson generalises and is worth stating in the crate's own docs: **a
+//! forced aligner's word boundaries are only as determined as the acoustic
+//! evidence under them.** Across a blank-saturated pause, or where the
+//! transcript does not name what was actually said, the boundary frame is a
+//! tie-break among numerically identical paths. Two things help, and both are
+//! yours to supply: pass `sub_segments` from a real VAD when you have one, and
+//! give the aligner a transcript that says what the speaker said.
 //!
 //! # Features
 //!
@@ -63,6 +91,23 @@
 //!
 //! None of them skip: a missing model or fixture is a hard failure, never a
 //! green `0 passed`.
+//!
+//! The `parity-oracle` gate additionally needs ONNX Runtime at **run** time
+//! (`ort` is `load-dynamic`, so the *build* needs nothing), and on Apple
+//! Silicon `brew install onnxruntime` alone is not enough: Homebrew's
+//! `/opt/homebrew/lib` is on neither `DYLD_LIBRARY_PATH` nor dyld's fallback
+//! list, so the bare `dlopen` fails. Point `ORT_DYLIB_PATH` at it:
+//!
+//! ```text
+//! ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib \
+//!   cargo test -p alignkit --features parity-oracle -- --ignored
+//! ```
+//!
+//! This matters more than a normal missing-dependency note, because when `ort`
+//! cannot resolve the library it **deadlocks instead of returning an error**
+//! (it builds the load failure inside a `Once` it is already holding). The gate
+//! would hang forever rather than fail, so `tests/parity_words.rs` resolves the
+//! library itself up front and panics with an actionable message.
 
 pub mod aligner;
 #[cfg(feature = "serde")]

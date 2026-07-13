@@ -53,34 +53,61 @@
 //! **873 ms before** it. Requiring alignkit to reproduce the oracle's answer
 //! here would be requiring it to be wrong. The gate is therefore built on
 //! **robust statistics** (median, p90) plus an explicit, pinned **ledger of the
-//! divergences** ([`EXPECTED_DIVERGENCES`]) — not on a max-delta bound, which
+//! divergences** ([`JFK_EXPECTED_DIVERGENCES`]) — not on a max-delta bound, which
 //! could only be satisfied by inflating it to 908 ms, at which point it would no
 //! longer catch the 881 ms regression it exists to catch. A bound that cannot
 //! distinguish the defect from the baseline is not a bound.
 //!
-//! # What "same input" means here — and what it deliberately does not
+//! # Two clips, because one of them is padded and the other is not
+//!
+//! | test | clip | samples | padding CoreML sees | what it isolates |
+//! |---|---|---|---|---|
+//! | [`word_timings_agree_with_asry_ort_on_jfk`] | `jfk.wav` | 176,000 | **784,000 zeros (81.7%)** | encoder swap **+** fixed-window padding, summed |
+//! | [`word_timings_agree_with_asry_ort_on_ted_60`] | `ted_60.wav` | **960,000** | **none** | the encoder swap, **alone** |
+//!
+//! alignkit's CoreML graph takes a fixed `[1, 960_000]` input, so a short chunk
+//! is zero-padded to 60 s before the encoder sees it; asry's ONNX graph is
+//! variable-length and sees the buffer as-is. On `jfk.wav` that asymmetry is
+//! **most of the input**, and it is not cosmetic — wav2vec2-base group-norms
+//! over the whole sequence axis and attends globally with no padding mask, so
+//! 49 s of zeros perturb every real frame. Every jfk number is therefore a
+//! *sum* of two effects and cannot separate them;
+//! [`fixed_window_padding_is_the_control`] exists solely to bound the second.
+//!
+//! `ted_60.wav` is **exactly** `ENCODER_WINDOW_SAMPLES`, so `emissions_raw`
+//! borrows the buffer and appends nothing: both encoders see the identical
+//! 960,000 real samples and the encoder swap is the only difference left. It
+//! needs no control, and it is the stronger measurement. It also says something
+//! jfk cannot:
+//!
+//! | | jfk (padded) | **ted_60 (unpadded)** |
+//! |---|---|---|
+//! | median \|Δ\| | 12.8 ms | **0.0 ms** |
+//! | p90 \|Δ\| | 47.0 ms | **0.0 ms** |
+//! | boundaries within one frame | 38/44 (86.4%) | **367/372 (98.7%)** |
+//!
+//! **With the padding gone, the CoreML fp16 29-class encoder and the ONNX fp32
+//! 32-class encoder put 90%+ of all word boundaries on the same frame.** jfk's
+//! 12.8 ms median really was the zeros.
+//!
+//! ted_60 also runs what jfk leaves cold: the full 2,999-frame emission tensor
+//! instead of 550, a trellis over 186 words instead of 22, and a real
+//! disfluency — the speaker says `would` twice and the ASR transcript names it
+//! once — which is exactly where a forced aligner has to guess, and where the
+//! two aligners disagree (see [`TED_60_EXPECTED_DIVERGENCES`]; the audio says
+//! alignkit is right, and the ANE collapses it onto the oracle's answer).
+//!
+//! # What "same input" means here
 //!
 //! Both aligners receive the **same decoded `Vec<f32>`, by reference**, the
 //! same transcript, the same `EnglishNormalizer`, the same OOV policy
 //! (`default_oov_decisions`), the same whole-chunk speech span, the same
 //! 320-sample stride, and the same coverage / silent-run defaults. Buffer
-//! identity holds by construction; [`common::JFK_SAMPLES_SHA256`] additionally
-//! pins the fixture, because the first attempt at this comparison reported an
-//! "86.6% divergence" that was really one side being handed a padded buffer and
-//! the other an unpadded one. A parity number measured on two different inputs
-//! measures the harness.
-//!
-//! What is **not** held equal — on purpose — is the encoder's input window.
-//! alignkit's model has a fixed `[1, 960_000]` input, so an 11 s chunk is
-//! zero-padded to 60 s before CoreML sees it; asry's ONNX graph is
-//! variable-length and sees the 11 s buffer as-is. That asymmetry is not a
-//! harness defect to be corrected away — **it is what alignkit does in
-//! production**, and it is not cosmetic: wav2vec2-base's first conv layer
-//! group-norms over the *whole* sequence axis and its 12 transformer layers
-//! attend globally with no padding mask, so 49 s of zeros perturb every real
-//! frame, not just the boundary ones. [`fixed_window_padding_is_the_control`]
-//! measures that cost on its own, with CoreML held out of it, so the two
-//! contributions are never conflated.
+//! identity holds by construction; [`common::JFK_SAMPLES_SHA256`] and
+//! [`common::TED_60_SAMPLES_SHA256`] additionally pin the fixtures, because the
+//! first attempt at this comparison reported an "86.6% divergence" that was
+//! really one side being handed a padded buffer and the other an unpadded one.
+//! A parity number measured on two different inputs measures the harness.
 //!
 //! # This test does not skip
 //!
@@ -105,6 +132,7 @@
 mod common;
 
 use core::sync::atomic::AtomicBool;
+use std::path::PathBuf;
 
 use alignkit::{
   ANALYSIS_TIMEBASE, Aligner, EnglishNormalizer, Lang, OutputClock, TimeRange, Word,
@@ -135,14 +163,14 @@ const FRAME_MS: f64 = 20.0;
 /// It is **not** the bound that catches the ANE corruption, and this is recorded
 /// rather than assumed because it was measured: on the corrupted path the median
 /// moves only 12.8 → 16.7 ms, still inside this bound. What catches the ANE is
-/// [`ACOUSTIC_ONSET_OF_ASK_MS`] and [`EXPECTED_DIVERGENCES`]. Do not "simplify"
+/// [`ACOUSTIC_ONSET_OF_ASK_MS`] and [`JFK_EXPECTED_DIVERGENCES`]. Do not "simplify"
 /// the gate down to this bound.
 const MAX_MEDIAN_BOUNDARY_DELTA_MS: f64 = FRAME_MS;
 
 /// Largest tolerated **90th-percentile** boundary disagreement: **5 frames**.
 ///
 /// Bounds the bulk of the distribution without being hostage to the
-/// information-free outlier ([`EXPECTED_DIVERGENCES`]). Measured: **47.0 ms**.
+/// information-free outlier ([`JFK_EXPECTED_DIVERGENCES`]). Measured: **47.0 ms**.
 ///
 /// The headroom above that is not slack, it is a *measured floor*: alignkit
 /// cannot beat its own fixed-window padding, and
@@ -155,7 +183,7 @@ const MAX_P90_BOUNDARY_DELTA_MS: f64 = 5.0 * FRAME_MS;
 
 /// A boundary disagreement above this is "gross": no longer explicable as
 /// encoder precision or as fixed-window padding, and therefore something that
-/// must be *named* in [`EXPECTED_DIVERGENCES`] rather than absorbed by a
+/// must be *named* in [`JFK_EXPECTED_DIVERGENCES`] rather than absorbed by a
 /// tolerance.
 ///
 /// **150 ms = 7.5 frames.** It sits above the worst *acoustically anchored*
@@ -197,7 +225,7 @@ const GROSS_DELTA_MS: f64 = 150.0;
 /// So the ledger pins the divergence set by identity. A **new** divergence fails
 /// (a fresh defect), and — the case that matters — the **disappearance** of this
 /// one fails too, because agreeing with a wrong oracle is itself the symptom.
-const EXPECTED_DIVERGENCES: &[(usize, Boundary)] = &[(14, Boundary::Start)];
+const JFK_EXPECTED_DIVERGENCES: &[(usize, Boundary)] = &[(14, Boundary::Start)];
 
 /// The true acoustic onset of the second `ask`, in ms: **8380**, frame 419.
 ///
@@ -246,8 +274,156 @@ const MAX_MEDIAN_SCORE_DELTA: f32 = 0.10;
 /// [`fixed_window_padding_is_the_control`] measures it.
 const MAX_PADDING_P90_DELTA_MS: f64 = 5.0 * FRAME_MS;
 
+// =========================================================================
+// ted_60 — the UNPADDED clip. Its own bounds, because they are properties of
+// its audio, not of the harness.
+//
+// Why the numbers below are so much tighter than jfk's: with the padding gone
+// (`ted_60.wav` is exactly ENCODER_WINDOW_SAMPLES, so `emissions_raw` borrows
+// the buffer and appends no zeros), the ONLY difference left between the two
+// pipelines is the encoder itself — CoreML fp16 29-class against ONNX fp32
+// 32-class. jfk cannot separate those two effects; it can only measure their
+// sum. ted_60 measures the encoder swap ALONE, and the answer is that the two
+// encoders put **90%+ of all word boundaries on exactly the same frame**:
+//
+// |                    | jfk (padded 81.7%) | ted_60 (unpadded) |
+// |--------------------|--------------------|-------------------|
+// | median |Δ|         | 12.8 ms            | **0.0 ms**        |
+// | p90 |Δ|            | 47.0 ms            | **0.0 ms**        |
+// | within one frame   | 38/44 (86.4%)      | **367/372 (98.7%)** |
+//
+// That is the affirmative result of this fixture, and it retroactively
+// confirms `fixed_window_padding_is_the_control`: jfk's 12.8 ms median really
+// was the zero-padding, and with the zeros removed it collapses to nothing.
+// =========================================================================
+
+/// ted_60's largest tolerated **median** boundary disagreement: **one frame**.
+/// Measured: **0.0 ms** — the median boundary is frame-IDENTICAL.
+///
+/// Bounds systematic shift (a wrong stride, an off-by-one in the emissions
+/// truncation, a mis-anchored clock), exactly as its jfk counterpart does.
+///
+/// It does **not** catch the ANE corruption, and that is measured, not
+/// assumed: on the corrupted path ted_60's median is *also* 0.0 ms. See
+/// [`TED_60_EXPECTED_DIVERGENCES`] for what does.
+const MAX_TED_60_MEDIAN_BOUNDARY_DELTA_MS: f64 = FRAME_MS;
+
+/// ted_60's largest tolerated **90th-percentile** boundary disagreement: **one
+/// frame**. Measured: **0.0 ms**.
+///
+/// Five times tighter than jfk's `MAX_P90_BOUNDARY_DELTA_MS` (5 frames), and
+/// the gap is the whole point of this clip. jfk's p90 headroom is a *measured
+/// floor* imposed by its zero-padding — the control test shows the padding
+/// alone costs p90 80.9 ms, and alignkit cannot beat its own model's input
+/// shape. Remove the padding and that floor disappears: on ted_60 at least 90%
+/// of the 372 boundaries land on the **same frame**, so one frame of headroom
+/// over a measured 0.0 ms is the honest bound.
+///
+/// Also does **not** catch the ANE (corrupted p90 is likewise 0.0 ms).
+const MAX_TED_60_P90_BOUNDARY_DELTA_MS: f64 = FRAME_MS;
+
+/// **ted_60's ledger.** The single gross (> [`GROSS_DELTA_MS`]) divergence:
+/// word 96, `would`, its END — an `assert_eq!` on the set, so it is pinned in
+/// **both** directions.
+///
+/// # The boundary, and which side the AUDIO says is right
+///
+/// The speaker says `would` **twice** — "the paper would… would come along" —
+/// a disfluency the ASR transcript elides (see [`common::TED_60_TRANSCRIPT`],
+/// which names this spot in advance as a place the trellis can diverge). One
+/// transcript word, two acoustic realisations, and a 100 ms fp16-saturated
+/// blank plateau between them: the trellis has to pick, and the two aligners
+/// pick differently.
+///
+/// | | `would`.end |
+/// |---|---|
+/// | alignkit (`CpuOnly`, shipping) | **31,981.3 ms** |
+/// | asry-ort (the oracle) | 31,741.2 ms |
+/// | alignkit (`ComputeUnits::All`, ANE-corrupt) | **31,741.2 ms** — the oracle's value, exactly |
+///
+/// Three independent readings of the audio say **alignkit is right**:
+///
+/// 1. A **greedy CTC decode** of alignkit's own emissions reads `WOULD` at
+///    31,560–31,680 ms and a **second** `WOULD` at 31,820–**31,940** ms.
+/// 2. A **verbatim forced alignment** — the same clip with `would would` in
+///    the transcript — places those two words at 31,601.1–31,741.2 and
+///    31,861.2–**31,981.3** ms, with scores 0.758 and 0.664. The second
+///    realisation is real, confident speech.
+/// 3. The **RMS envelope** has no silent run anywhere in 28,400–33,720 ms, so
+///    31,820–31,940 ms carries speech energy, not silence.
+///
+/// The oracle's answer, 31,741.2 ms, is *exactly* the offset of the FIRST
+/// `would`. It therefore assigns a 120 ms, confidently-decoded `WOULD` to
+/// **blank** — contradicted by its own posterior. alignkit's answer spans the
+/// word's full acoustic support and hands off precisely where `come` begins
+/// (both aligners put `come` at 32,021.4 ms). **Requiring alignkit to
+/// reproduce the oracle here would be requiring it to call speech silence.**
+///
+/// # Why a ledger and not a max-delta bound — measured on THIS clip
+///
+/// Because on ted_60 a max-delta bound is not merely weak, it is **inverted**,
+/// and more starkly than on jfk. Mutating [`alignkit::encode::DEFAULT_ENCODER_COMPUTE`]
+/// to `ComputeUnits::All`:
+///
+/// | | correct (`CpuOnly`) | **corrupted (`All`)** |
+/// |---|---|---|
+/// | max \|Δ\| vs oracle | 240.1 ms | **20.1 ms** |
+/// | median \|Δ\| | 0.0 ms | 0.0 ms |
+/// | p90 \|Δ\| | 0.0 ms | 0.0 ms |
+/// | boundaries within 1 frame | 367/372 | **369/372** |
+/// | median \|Δscore\| | 0.0134 | **0.0076** |
+/// | gross divergences | `[(96, End)]` | **`[]`** |
+///
+/// **Every agreement statistic IMPROVES under corruption.** max, within-one-frame
+/// and score-delta all move the *wrong* way; median and p90 cannot see it at
+/// all. The corruption destroys the blank plateau that was anchoring `would`
+/// to its second realisation and lets the trellis collapse onto the oracle's
+/// answer — to the exact millisecond.
+///
+/// So the ledger pins the divergence set by identity. A **new** divergence
+/// fails (a fresh defect); the **disappearance** of this one fails too, and on
+/// this clip that disappearance is the ANE's entire signature.
+const TED_60_EXPECTED_DIVERGENCES: &[(usize, Boundary)] = &[(96, Boundary::End)];
+
+/// The acoustic offset of the **second** spoken `would`, in ms: **31,940**,
+/// frame 1597 — the last frame at which a greedy argmax over alignkit's
+/// emissions still reads a letter of `WOULD` before the blank that precedes
+/// `come`.
+///
+/// Deliberately taken from the **greedy argmax**, not from any forced
+/// alignment, so the constant this test measures alignkit against is not
+/// derived from alignkit's own trellis. Corroborated independently by the RMS
+/// envelope (speech energy, no silent run) and by the verbatim two-`would`
+/// alignment (which ends its second `would` at 31,981.3 ms, 41 ms later — two
+/// frames, the usual CTC offset lag).
+const ACOUSTIC_OFFSET_OF_SECOND_WOULD_MS: f64 = 31_940.0;
+
+/// How far alignkit's `would` offset may sit from
+/// [`ACOUSTIC_OFFSET_OF_SECOND_WOULD_MS`]: **3 frames** — the same tolerance
+/// [`MAX_ASK_ONSET_ERROR_MS`] gives jfk's un-refereeable boundary, for the same
+/// reason (a CTC offset frame trails the acoustic one by a frame or two).
+///
+/// Measured: **+41.3 ms**, inside two frames.
+///
+/// **This is the check that catches the ANE on this clip**, and it is the one
+/// that runs FIRST: corrupted, alignkit puts the offset at 31,741.2 ms —
+/// **198.8 ms** from the acoustic evidence, 3.3× over this bound. The oracle
+/// cannot referee the boundary (it is the one calling that speech blank), so
+/// the audio does.
+const MAX_WOULD_OFFSET_ERROR_MS: f64 = 3.0 * FRAME_MS;
+
+/// ted_60's largest tolerated **median** per-word score disagreement: `0.05`.
+/// Measured: **0.0134** — four times tighter than jfk's 0.0838, again because
+/// no zero-padding is perturbing the emissions.
+///
+/// Bounds a **systematic confidence regression**. It does **NOT** catch the
+/// ANE — measured: the corrupted median score delta *falls* to 0.0076, for the
+/// same reason its timing statistics improve. Recorded so nobody mistakes it
+/// for a safety net.
+const MAX_TED_60_MEDIAN_SCORE_DELTA: f32 = 0.05;
+
 /// Which end of a word a delta belongs to. Named, because
-/// [`EXPECTED_DIVERGENCES`] pins divergences by identity and "word 14" alone
+/// [`JFK_EXPECTED_DIVERGENCES`] pins divergences by identity and "word 14" alone
 /// would not say whether it is the onset (which is what the oracle gets wrong)
 /// or the offset (which it does not).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -264,6 +440,132 @@ fn ms(range: TimeRange) -> (f64, f64) {
     range.start_pts() as f64 / SAMPLES_PER_MS,
     range.end_pts() as f64 / SAMPLES_PER_MS,
   )
+}
+
+/// One clip's measured alignkit-vs-oracle comparison.
+///
+/// Built by [`compare`], which owns every mechanic the two clips share — the
+/// tokenization-identity and word-sequence preconditions, the per-word delta
+/// table, the robust statistics, and the gross-divergence classification. The
+/// per-clip *bounds* deliberately do NOT live here: they are properties of the
+/// audio, not of the harness, and each one is justified against its own clip's
+/// measurements at its own call site.
+///
+/// # There is deliberately no `max` field
+///
+/// [`compare`] computes and PRINTS the maximum boundary delta, because it is
+/// the first thing a human wants when a bound trips — but it does not hand one
+/// back, because **a max-delta bound is the single trap this gate exists to
+/// avoid**. On both clips the maximum moves the *wrong way* under the ANE
+/// corruption (jfk 908.0 → 87.1 ms; ted_60 240.1 → 20.1 ms), so any assertion
+/// built on it would pass the corrupt build and fail the correct one. The
+/// worst-case boundary is named in a ledger ([`JFK_EXPECTED_DIVERGENCES`],
+/// [`TED_60_EXPECTED_DIVERGENCES`]) and checked against the AUDIO instead.
+/// Not offering the number is the cheapest way to stop someone reaching for it.
+struct Comparison {
+  ak_words: Vec<Word>,
+  ort_words: Vec<Word>,
+  median: f64,
+  p90: f64,
+  median_score: f32,
+  gross: Vec<(usize, Boundary)>,
+}
+
+/// Runs both aligners on one clip, asserts the two preconditions that make a
+/// per-word delta meaningful at all, and reduces the result to [`Comparison`].
+///
+/// The preconditions are asserted *here*, once, for both clips: identical OOV
+/// event streams (the two heads carry different vocabularies — 29-class chordai
+/// vs 32-class HuggingFace — so an equal transcript is not by itself proof that
+/// equal TOKENS reach the two trellises) and identical word sequences (different
+/// words means there is no per-word delta to take).
+fn compare(
+  clip: &str,
+  alignkit: &Aligner,
+  ort: &mut OrtAligner,
+  samples: &[f32],
+  text: &str,
+) -> Comparison {
+  assert_eq!(
+    alignkit.detect_oov(text).expect("alignkit detect_oov"),
+    ort.detect_oov(text).expect("asry-ort detect_oov"),
+    "[{clip}] the two vocabularies disagree about which characters are out-of-vocabulary, so the \
+     two trellises are not being handed the same tokens and their word timings are not comparable"
+  );
+
+  let ak_words = align_with_alignkit(alignkit, samples, text);
+  let ort_words = align_with_asry_ort(ort, samples, text);
+
+  assert!(
+    !ak_words.is_empty(),
+    "[{clip}] a real transcript over matching audio must produce words"
+  );
+
+  let ak_texts: Vec<&str> = ak_words.iter().map(Word::text).collect();
+  let ort_texts: Vec<&str> = ort_words.iter().map(Word::text).collect();
+  assert_eq!(
+    ak_texts, ort_texts,
+    "[{clip}] the two aligners produced different WORDS, not merely different timings for the same \
+     words — there is no meaningful per-word delta to take"
+  );
+
+  let mut boundary_deltas: Vec<f64> = Vec::with_capacity(ak_words.len() * 2);
+  let mut score_deltas: Vec<f32> = Vec::with_capacity(ak_words.len());
+  let mut gross: Vec<(usize, Boundary)> = Vec::new();
+
+  println!(
+    "\n=== {clip} ===\n{:<12} {:>10} {:>10} {:>9} {:>10} {:>10} {:>9} {:>8}",
+    "word", "ak.start", "ort.start", "Δstart", "ak.end", "ort.end", "Δend", "Δscore"
+  );
+  for (i, (ak, orw)) in ak_words.iter().zip(&ort_words).enumerate() {
+    let (ak_start, ak_end) = ms(ak.range());
+    let (ort_start, ort_end) = ms(orw.range());
+    let (d_start, d_end) = (ak_start - ort_start, ak_end - ort_end);
+    let d_score = ak.score() - orw.score();
+
+    println!(
+      "{:<12} {ak_start:>10.1} {ort_start:>10.1} {d_start:>+9.1} {ak_end:>10.1} {ort_end:>10.1} \
+       {d_end:>+9.1} {d_score:>+8.4}",
+      ak.text()
+    );
+
+    boundary_deltas.push(d_start.abs());
+    boundary_deltas.push(d_end.abs());
+    score_deltas.push(d_score.abs());
+    if d_start.abs() > GROSS_DELTA_MS {
+      gross.push((i, Boundary::Start));
+    }
+    if d_end.abs() > GROSS_DELTA_MS {
+      gross.push((i, Boundary::End));
+    }
+  }
+
+  boundary_deltas.sort_by(f64::total_cmp);
+  score_deltas.sort_by(f32::total_cmp);
+  let median = percentile(&boundary_deltas, 0.50);
+  let p90 = percentile(&boundary_deltas, 0.90);
+  let p95 = percentile(&boundary_deltas, 0.95);
+  let max = *boundary_deltas.last().expect("at least two boundaries");
+  let within_one_frame = boundary_deltas.iter().filter(|d| **d <= FRAME_MS).count();
+  let median_score = score_deltas[score_deltas.len() / 2];
+
+  println!(
+    "\n[{clip}] {} words, {} boundaries | median {median:.1} ms | p90 {p90:.1} ms | p95 {p95:.1} \
+     ms | max {max:.1} ms | within 1 frame ({FRAME_MS:.0} ms): {within_one_frame}/{} | median \
+     Δscore {median_score:.4} | gross (>{GROSS_DELTA_MS:.0} ms): {gross:?}\n",
+    ak_words.len(),
+    boundary_deltas.len(),
+    boundary_deltas.len(),
+  );
+
+  Comparison {
+    ak_words,
+    ort_words,
+    median,
+    p90,
+    median_score,
+    gross,
+  }
 }
 
 /// Nearest-rank percentile over an already-sorted slice. `p` in `[0, 1]`.
@@ -293,9 +595,79 @@ fn load_alignkit() -> Aligner {
   )
 }
 
+/// Fails loudly if `ort` will not be able to `dlopen` ONNX Runtime — because
+/// if it cannot, it **hangs instead of erroring**, and a gate that hangs is
+/// worse than one that fails.
+///
+/// `ort` runs in `load-dynamic` mode: it resolves `libonnxruntime.dylib` at
+/// *runtime*, not link time. When the library is not resolvable, ort does not
+/// return `Err` — it **deadlocks**. `ort::setup_api` runs inside a
+/// `std::sync::Once`, and its failure path constructs the error through
+/// `ort::error::Error::new_internal`, which re-enters the **same** `Once`; the
+/// thread parks in `semaphore_wait_trap` and never comes back. Measured here,
+/// not inferred: `cargo test -p alignkit --features parity-oracle` sat for ten
+/// minutes printing "has been running for over 60 seconds" while the process
+/// burned **0.01 s of CPU**, and `sample(1)` showed precisely that stack —
+/// `load_asry_ort` → `SessionBuilder::new` → `environment::current` →
+/// `Once::call` → `setup_api` → `Once::call` → `Error::new_internal` →
+/// `Once::wait` → `semaphore_wait_trap`.
+///
+/// In CI that is a job that burns to its timeout and reports nothing
+/// actionable; here it looked exactly like "the 60 s clip is just slow", which
+/// is the kind of wrong conclusion that gets a gate weakened. So resolve the
+/// library up front and panic with something a human can act on.
+///
+/// The search mirrors what ort and dyld actually do: `ORT_DYLIB_PATH` if set,
+/// otherwise a bare `dlopen("libonnxruntime.dylib")`, which consults
+/// `DYLD_LIBRARY_PATH` and then `DYLD_FALLBACK_LIBRARY_PATH` (default
+/// `$HOME/lib:/usr/local/lib:/usr/lib`). Homebrew's `/opt/homebrew/lib` is on
+/// **neither** list on Apple Silicon — which is why `brew install onnxruntime`
+/// on its own is not enough, and `ORT_DYLIB_PATH` is effectively mandatory.
+fn assert_onnxruntime_is_resolvable() {
+  const LIB: &str = "libonnxruntime.dylib";
+  const HINT: &str = "ONNX Runtime is the parity gate's ORACLE; without it there is nothing to \
+                      compare alignkit against. Install it (`brew install onnxruntime`) and point \
+                      ORT_DYLIB_PATH at the dylib, e.g. \
+                      ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib. Do NOT skip this \
+                      test instead — a parity gate that opts itself out is not a gate.";
+
+  if let Some(explicit) = std::env::var_os("ORT_DYLIB_PATH") {
+    let path = PathBuf::from(&explicit);
+    assert!(
+      path.is_file(),
+      "ORT_DYLIB_PATH points at {}, but there is no file there. ort would DEADLOCK on this (it \
+       builds the load failure inside a `Once` it is already holding), so failing here instead. \
+       {HINT}",
+      path.display()
+    );
+    return;
+  }
+
+  let mut dirs: Vec<PathBuf> = std::env::var_os("DYLD_LIBRARY_PATH")
+    .iter()
+    .flat_map(std::env::split_paths)
+    .collect();
+  match std::env::var_os("DYLD_FALLBACK_LIBRARY_PATH") {
+    Some(fallback) => dirs.extend(std::env::split_paths(&fallback)),
+    None => {
+      dirs.extend(std::env::var_os("HOME").map(|h| PathBuf::from(h).join("lib")));
+      dirs.push(PathBuf::from("/usr/local/lib"));
+      dirs.push(PathBuf::from("/usr/lib"));
+    }
+  }
+
+  assert!(
+    dirs.iter().any(|dir| dir.join(LIB).is_file()),
+    "ORT_DYLIB_PATH is unset and no {LIB} is on dyld's search path (looked in {dirs:?}). ort \
+     resolves ONNX Runtime with a bare dlopen and, when that fails, DEADLOCKS rather than \
+     returning an error — so this test would hang forever instead of telling you why. {HINT}"
+  );
+}
+
 /// Loads the oracle. Separate from [`align_with_asry_ort`] so the ONNX session
 /// (a ~378 MB model) is built once and reused across a test's runs.
 fn load_asry_ort() -> OrtAligner {
+  assert_onnxruntime_is_resolvable();
   OrtAligner::from_paths(
     Lang::En,
     &common::asry_onnx_model_path(),
@@ -409,6 +781,38 @@ fn jfk_samples() -> Vec<f32> {
   samples
 }
 
+/// Decodes `ted_60.wav` and asserts **both** things the unpadded half depends
+/// on: that it is the audio these numbers were measured on, and that it still
+/// fills the encoder window *exactly*.
+///
+/// The length assertion is not a tautology of the digest — it is the one that
+/// says what this fixture is FOR. At exactly [`alignkit::encode::ENCODER_WINDOW_SAMPLES`]
+/// samples, `Encoder::emissions_raw` borrows the caller's buffer and appends no
+/// zeros at all; one sample fewer and it silently takes the zero-fill branch,
+/// which would quietly convert this test back into a second copy of the padded
+/// jfk case and retire the only coverage the unpadded path has. Spelled out, so
+/// that a re-encoded fixture fails HERE, loudly, instead of passing while
+/// measuring nothing new.
+fn ted_60_samples() -> Vec<f32> {
+  let samples = common::load_wav_mono_f32(&common::ted_60_wav_path());
+  assert_eq!(
+    samples.len(),
+    alignkit::encode::ENCODER_WINDOW_SAMPLES,
+    "ted_60.wav is {} samples, not the {} that exactly fill the encoder window. This fixture's \
+     entire purpose is the ZERO-PADDING-FREE path (`emissions_raw`'s `Cow::Borrowed` branch); at \
+     any other length alignkit pads, and this test degenerates into a second padded clip.",
+    samples.len(),
+    alignkit::encode::ENCODER_WINDOW_SAMPLES,
+  );
+  assert_eq!(
+    common::sha256_samples_hex(&samples),
+    common::TED_60_SAMPLES_SHA256,
+    "the decoded ted_60.wav buffer is not the audio this gate's numbers were measured on; a parity \
+     number from two different inputs measures the harness, not the models"
+  );
+  samples
+}
+
 /// **The gate.** Per-word start/end/score agreement between alignkit (CoreML)
 /// and asry (ONNX Runtime) on real speech.
 ///
@@ -421,109 +825,26 @@ fn jfk_samples() -> Vec<f32> {
 /// this crate ships a `CpuOnly` default to avoid actually lives.
 #[test]
 #[ignore = "requires local alignkit + asry models (ALIGNKIT_TEST_MODELS, ALIGNKIT_ASRY_MODELS)"]
-fn word_timings_agree_with_asry_ort() {
+fn word_timings_agree_with_asry_ort_on_jfk() {
   let samples = jfk_samples();
   let text = common::JFK_TRANSCRIPT;
 
   let alignkit = load_alignkit();
   let mut ort = load_asry_ort();
-
-  // ---- tokenization identity --------------------------------------------
-  // The two heads carry different vocabularies (29-class chordai vs 32-class
-  // HuggingFace), so "the same transcript" is not by itself proof that the same
-  // TOKENS reach the two trellises. The OOV event stream is where a vocab
-  // difference would surface as a policy difference — a char out-of-vocab for
-  // one head and in-vocab for the other produces an event on one side only, and
-  // `default_oov_decisions` would then wildcard a different set of positions.
-  // Equal event streams (here, empty on both: plain English letters, one comma,
-  // one full stop) rule that out.
-  assert_eq!(
-    alignkit.detect_oov(text).expect("alignkit detect_oov"),
-    ort.detect_oov(text).expect("asry-ort detect_oov"),
-    "the two vocabularies disagree about which characters are out-of-vocabulary, so the two \
-     trellises are not being handed the same tokens and their word timings are not comparable"
-  );
-
-  // ---- the two pipelines -------------------------------------------------
-  let ak_words = align_with_alignkit(&alignkit, &samples, text);
-  let ort_words = align_with_asry_ort(&mut ort, &samples, text);
-
-  assert!(
-    !ak_words.is_empty(),
-    "a real transcript over matching audio must produce words"
-  );
-
-  // ---- word-sequence identity (a precondition, not a tolerance) ----------
-  let ak_texts: Vec<&str> = ak_words.iter().map(Word::text).collect();
-  let ort_texts: Vec<&str> = ort_words.iter().map(Word::text).collect();
-  assert_eq!(
-    ak_texts, ort_texts,
-    "the two aligners produced different WORDS, not merely different timings for the same words \
-     — there is no meaningful per-word delta to take"
-  );
-
-  // ---- per-word deltas ---------------------------------------------------
-  let mut boundary_deltas: Vec<f64> = Vec::with_capacity(ak_words.len() * 2);
-  let mut score_deltas: Vec<f32> = Vec::with_capacity(ak_words.len());
-  let mut gross: Vec<(usize, Boundary)> = Vec::new();
-
-  println!(
-    "\n{:<12} {:>10} {:>10} {:>9} {:>10} {:>10} {:>9} {:>8}",
-    "word", "ak.start", "ort.start", "Δstart", "ak.end", "ort.end", "Δend", "Δscore"
-  );
-  for (i, (ak, orw)) in ak_words.iter().zip(&ort_words).enumerate() {
-    let (ak_start, ak_end) = ms(ak.range());
-    let (ort_start, ort_end) = ms(orw.range());
-    let (d_start, d_end) = (ak_start - ort_start, ak_end - ort_end);
-    let d_score = ak.score() - orw.score();
-
-    println!(
-      "{:<12} {ak_start:>10.1} {ort_start:>10.1} {d_start:>+9.1} {ak_end:>10.1} {ort_end:>10.1} \
-       {d_end:>+9.1} {d_score:>+8.4}",
-      ak.text()
-    );
-
-    boundary_deltas.push(d_start.abs());
-    boundary_deltas.push(d_end.abs());
-    score_deltas.push(d_score.abs());
-    if d_start.abs() > GROSS_DELTA_MS {
-      gross.push((i, Boundary::Start));
-    }
-    if d_end.abs() > GROSS_DELTA_MS {
-      gross.push((i, Boundary::End));
-    }
-  }
-
-  boundary_deltas.sort_by(f64::total_cmp);
-  score_deltas.sort_by(f32::total_cmp);
-  let median = percentile(&boundary_deltas, 0.50);
-  let p90 = percentile(&boundary_deltas, 0.90);
-  let p95 = percentile(&boundary_deltas, 0.95);
-  let max = *boundary_deltas.last().expect("at least two boundaries");
-  let within_one_frame = boundary_deltas.iter().filter(|d| **d <= FRAME_MS).count();
-  let median_score = score_deltas[score_deltas.len() / 2];
-
-  println!(
-    "\n{} words, {} boundaries | median {median:.1} ms | p90 {p90:.1} ms | p95 {p95:.1} ms | max \
-     {max:.1} ms | within 1 frame ({FRAME_MS:.0} ms): {within_one_frame}/{} | median Δscore \
-     {median_score:.4} | gross (>{GROSS_DELTA_MS:.0} ms): {gross:?}\n",
-    ak_words.len(),
-    boundary_deltas.len(),
-    boundary_deltas.len(),
-  );
+  let c = compare("jfk", &alignkit, &mut ort, &samples, text);
 
   // ---- FIRST: the boundary the oracle cannot referee, refereed by the audio
   // The one boundary the ledger permits is the one the oracle gets WRONG. It is
   // not exempt from checking — it is checked against something better than the
   // oracle, and this check runs before any comparison to the oracle does,
   // because the audio outranks it.
-  assert_eq!(ak_words[14].text(), "ask", "word 14 is no longer `ask`");
-  let (ask_start, _) = ms(ak_words[14].range());
+  assert_eq!(c.ak_words[14].text(), "ask", "word 14 is no longer `ask`");
+  let (ask_start, _) = ms(c.ak_words[14].range());
   let onset_error = (ask_start - ACOUSTIC_ONSET_OF_ASK_MS).abs();
   println!(
     "`ask` onset: alignkit {ask_start:.1} ms vs ACOUSTIC onset {ACOUSTIC_ONSET_OF_ASK_MS:.1} ms \
      (error {onset_error:+.1} ms); the oracle says {:.1} ms, which is inside the silence.\n",
-    ms(ort_words[14].range()).0,
+    ms(c.ort_words[14].range()).0,
   );
   assert!(
     onset_error <= MAX_ASK_ONSET_ERROR_MS,
@@ -535,35 +856,130 @@ fn word_timings_agree_with_asry_ort() {
 
   // ---- then the comparison to the oracle ---------------------------------
   assert!(
-    median <= MAX_MEDIAN_BOUNDARY_DELTA_MS,
-    "median word-boundary disagreement {median:.1} ms exceeds {MAX_MEDIAN_BOUNDARY_DELTA_MS:.1} \
-     ms (one frame) — more than half of all boundaries moved. That is a SYSTEMATIC shift (a \
-     stride, a truncation off-by-one, a clock anchor), not encoder precision."
+    c.median <= MAX_MEDIAN_BOUNDARY_DELTA_MS,
+    "median word-boundary disagreement {:.1} ms exceeds {MAX_MEDIAN_BOUNDARY_DELTA_MS:.1} ms (one \
+     frame) — more than half of all boundaries moved. That is a SYSTEMATIC shift (a stride, a \
+     truncation off-by-one, a clock anchor), not encoder precision.",
+    c.median
   );
   assert!(
-    p90 <= MAX_P90_BOUNDARY_DELTA_MS,
-    "p90 word-boundary disagreement {p90:.1} ms exceeds {MAX_P90_BOUNDARY_DELTA_MS:.1} ms — the \
-     BULK of the distribution moved, not just a tail. Do NOT widen this bound; read the per-word \
-     table above."
+    c.p90 <= MAX_P90_BOUNDARY_DELTA_MS,
+    "p90 word-boundary disagreement {:.1} ms exceeds {MAX_P90_BOUNDARY_DELTA_MS:.1} ms — the BULK \
+     of the distribution moved, not just a tail. Do NOT widen this bound; read the per-word table \
+     above.",
+    c.p90
   );
   assert_eq!(
-    gross.as_slice(),
-    EXPECTED_DIVERGENCES,
+    c.gross.as_slice(),
+    JFK_EXPECTED_DIVERGENCES,
     "the ledger of gross (>{GROSS_DELTA_MS:.0} ms) divergences from the oracle changed. Each \
-     entry must be a KNOWN, root-caused boundary — see EXPECTED_DIVERGENCES. A NEW one is a \
+     entry must be a KNOWN, root-caused boundary — see JFK_EXPECTED_DIVERGENCES. A NEW one is a \
      finding to investigate and document, never an entry to append until the test is green. A \
      MISSING one is worse: agreeing with an oracle that is demonstrably wrong is the ANE \
      corruption's own signature."
   );
   assert!(
-    median_score <= MAX_MEDIAN_SCORE_DELTA,
-    "median per-word score disagreement {median_score:.4} exceeds {MAX_MEDIAN_SCORE_DELTA:.4} — \
-     the two encoders systematically disagree about how confident the alignment is"
+    c.median_score <= MAX_MEDIAN_SCORE_DELTA,
+    "median per-word score disagreement {:.4} exceeds {MAX_MEDIAN_SCORE_DELTA:.4} — the two \
+     encoders systematically disagree about how confident the alignment is",
+    c.median_score
+  );
+}
+
+/// **The gate's unpadded half** — the configuration
+/// [`word_timings_agree_with_asry_ort_on_jfk`] structurally cannot reach.
+///
+/// `jfk.wav` is 176,000 samples against a 960,000-sample encoder window, so
+/// **81.7% of what CoreML sees is zeros alignkit appended**. Every number that
+/// test produces is a sum of two effects — the encoder swap and the padding —
+/// and it cannot separate them; `fixed_window_padding_is_the_control` exists
+/// only to bound the second one. `ted_60.wav` is **exactly** 960,000 samples
+/// ([`ted_60_samples`] asserts it), so `Encoder::emissions_raw` borrows the
+/// caller's buffer and appends **no zeros at all**: both encoders see the
+/// identical 960,000 real samples, and the encoder swap is the *only*
+/// difference left. This is the stronger comparison, and it needs no control.
+///
+/// It also runs the parts of the pipeline jfk leaves cold: the full
+/// 2,999-frame emission tensor rather than 550 (`truncated_frame_count`'s
+/// clamp engages, dropping nothing), a trellis over 186 words rather than 22,
+/// and — because the transcript is real ASR output over spontaneous speech — a
+/// disfluency the transcript elides, which is exactly where a forced aligner
+/// is forced to guess.
+#[test]
+#[ignore = "requires local alignkit + asry models (ALIGNKIT_TEST_MODELS, ALIGNKIT_ASRY_MODELS)"]
+fn word_timings_agree_with_asry_ort_on_ted_60() {
+  let samples = ted_60_samples();
+  let text = common::TED_60_TRANSCRIPT;
+
+  let alignkit = load_alignkit();
+  let mut ort = load_asry_ort();
+  let c = compare("ted_60", &alignkit, &mut ort, &samples, text);
+
+  // ---- FIRST: the boundary the oracle cannot referee, refereed by the audio
+  // The oracle is the side that calls a confidently-decoded `WOULD` blank here
+  // (see TED_60_EXPECTED_DIVERGENCES), so it does not get a vote. The audio
+  // does, and it votes before any comparison to the oracle happens.
+  assert_eq!(
+    c.ak_words[96].text(),
+    "would",
+    "word 96 is no longer `would`"
+  );
+  let (_, would_end) = ms(c.ak_words[96].range());
+  let offset_error = (would_end - ACOUSTIC_OFFSET_OF_SECOND_WOULD_MS).abs();
+  println!(
+    "`would` offset: alignkit {would_end:.1} ms vs ACOUSTIC offset of the second spoken `would` \
+     {ACOUSTIC_OFFSET_OF_SECOND_WOULD_MS:.1} ms (error {offset_error:+.1} ms); the oracle says \
+     {:.1} ms, which ends the word before that `would` is spoken.\n",
+    ms(c.ort_words[96].range()).1,
+  );
+  assert!(
+    offset_error <= MAX_WOULD_OFFSET_ERROR_MS,
+    "alignkit ends `would` at {would_end:.1} ms, {offset_error:.1} ms from the acoustic offset of \
+     the second spoken `would` at {ACOUSTIC_OFFSET_OF_SECOND_WOULD_MS:.1} ms (bound: \
+     {MAX_WOULD_OFFSET_ERROR_MS:.1} ms). The speaker says `would` TWICE and the transcript names \
+     it once; the oracle resolves that by calling the second one blank, so it cannot referee this \
+     boundary — the audio does. This is exactly the boundary the ANE's corrupted emissions \
+     collapse onto the oracle's answer, at 31741.2 ms."
+  );
+
+  // ---- then the comparison to the oracle ---------------------------------
+  assert!(
+    c.median <= MAX_TED_60_MEDIAN_BOUNDARY_DELTA_MS,
+    "median word-boundary disagreement {:.1} ms exceeds {MAX_TED_60_MEDIAN_BOUNDARY_DELTA_MS:.1} \
+     ms (one frame) — more than half of all boundaries moved. With no padding in play that is a \
+     SYSTEMATIC shift (a stride, a truncation off-by-one, a clock anchor), not encoder precision: \
+     unpadded, the median boundary is normally frame-IDENTICAL (0.0 ms).",
+    c.median
+  );
+  assert!(
+    c.p90 <= MAX_TED_60_P90_BOUNDARY_DELTA_MS,
+    "p90 word-boundary disagreement {:.1} ms exceeds {MAX_TED_60_P90_BOUNDARY_DELTA_MS:.1} ms \
+     (one frame). Unpadded, 90%+ of boundaries land on the SAME FRAME (measured p90: 0.0 ms) — \
+     the two encoders genuinely agree that closely once the zero-padding is removed. Do NOT widen \
+     this bound to jfk's 5 frames; jfk needs those frames for its padding, and this clip has none. \
+     Read the per-word table above.",
+    c.p90
+  );
+  assert_eq!(
+    c.gross.as_slice(),
+    TED_60_EXPECTED_DIVERGENCES,
+    "the ledger of gross (>{GROSS_DELTA_MS:.0} ms) divergences from the oracle changed. Each entry \
+     must be a KNOWN, root-caused boundary — see TED_60_EXPECTED_DIVERGENCES. A NEW one is a \
+     finding to investigate and document, never an entry to append until the test is green. A \
+     MISSING one is worse, and on THIS clip it is the ANE corruption's entire signature: every \
+     other statistic here IMPROVES when the emissions are corrupted, and the vanishing of this \
+     divergence is the only thing left that still says so."
+  );
+  assert!(
+    c.median_score <= MAX_TED_60_MEDIAN_SCORE_DELTA,
+    "median per-word score disagreement {:.4} exceeds {MAX_TED_60_MEDIAN_SCORE_DELTA:.4} — the two \
+     encoders systematically disagree about how confident the alignment is",
+    c.median_score
   );
 }
 
 /// **The control.** Answers the one question
-/// [`word_timings_agree_with_asry_ort`]'s numbers cannot answer on their own:
+/// [`word_timings_agree_with_asry_ort_on_jfk`]'s numbers cannot answer on their own:
 /// **is the 908 ms `ask` divergence caused by alignkit's fixed 60 s window, or
 /// by its CoreML conversion?**
 ///
