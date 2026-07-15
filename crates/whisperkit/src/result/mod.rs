@@ -1178,9 +1178,11 @@ pub struct TranscriptionResult {
     serde(default, skip_serializing_if = "Option::is_none")
   )]
   seek_time: Option<f32>,
-  /// Whether **any** window of this transcript was accepted at a decode
-  /// temperature above `0.0` — i.e. whether the token sampler was ever
-  /// consulted at all. Rust-only; Swift records nothing like it.
+  /// Whether **any** window of this transcript was accepted at a **non-zero**
+  /// decode temperature — i.e. whether the token sampler was ever consulted
+  /// at all (it argmax-decodes only at exactly `0.0`, and samples for every
+  /// other value, negatives included). Rust-only; Swift records nothing like
+  /// it.
   ///
   /// Accumulated by [`crate::transcribe::TranscribeTask::run`] the moment a
   /// window's fallback ladder settles, and **never recomputed from the
@@ -1357,9 +1359,10 @@ impl TranscriptionResult {
   }
 
   // -- sampled_at_nonzero_temperature (bool) ------------------------------
-  /// Whether any window of this transcript was accepted at a decode
-  /// temperature above `0.0`, and therefore **drew from the token sampler**
-  /// rather than taking the deterministic argmax.
+  /// Whether any window of this transcript was accepted at a **non-zero**
+  /// decode temperature, and therefore **drew from the token sampler**
+  /// rather than taking the deterministic argmax (which the sampler does
+  /// only at exactly `0.0`, sampling for every other value).
   ///
   /// This is the fact
   /// [`Provenance::is_reproducible`](crate::provenance::Provenance::is_reproducible)

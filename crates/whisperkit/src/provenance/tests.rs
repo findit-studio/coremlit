@@ -833,3 +833,69 @@ fn from_options_and_for_segment_record_their_own_temperature() {
     Provenance::for_segment(&decoding, &compute, &sampled_segment).sampled_at_nonzero_temperature()
   );
 }
+
+#[test]
+fn sampling_predicate_matches_the_samplers_nonzero_branch() {
+  // F2 (codex round 2). The token sampler argmax-decodes ONLY at exactly
+  // `temperature == 0.0` and draws from the RNG for every other value --
+  // NEGATIVES included -- exactly as Swift's `temperature != 0.0` guard does
+  // (`TokenSampler.swift:49,110,140`). The reproducibility predicate must key
+  // on the same `!= 0.0`; the old `> 0.0` called an unseeded negative-temp
+  // draw "greedy" and thus reproducible, when a re-run redraws it.
+  //
+  // Mutation proof: restore any of the three predicates to `> 0.0` and the
+  // `-0.2` row's `sampled`/`is_reproducible` assertions fail.
+  let compute = ComputeOptions::new();
+
+  for &temperature in &[-0.2f32, -0.0, 0.0, 0.2] {
+    // `-0.0 == 0.0` in IEEE, so the sampler's `== 0.0` arm catches it too;
+    // this expectation IS the sampler's branch, restated.
+    let samples = temperature != 0.0;
+
+    // The sampler's own branch agrees. At a temperature the `== 0.0` arm
+    // catches, decoding is argmax (index 1 of these logits) and never touches
+    // the RNG; the sampled temps may or may not land on argmax for a given
+    // draw, so only the greedy rows are pinned to a token.
+    let mut sampler =
+      crate::decode::sampler::GreedyTokenSampler::new(temperature, 99, &DecodingOptions::new());
+    let token = sampler.sample(&[0.0f32, 1.0, 0.5]).token();
+    if !samples {
+      assert_eq!(
+        token, 1,
+        "temperature {temperature} must decode greedily (argmax)"
+      );
+    }
+
+    // from_options predicate (`provenance/mod.rs`, `effective_temperature`).
+    let unseeded = Provenance::from_options(&DecodingOptions::new(), &compute, temperature);
+    assert_eq!(
+      unseeded.sampled_at_nonzero_temperature(),
+      samples,
+      "temperature {temperature}: sampled flag must match the sampler's != 0.0 branch"
+    );
+    assert_eq!(
+      unseeded.is_reproducible(),
+      !samples,
+      "unseeded temperature {temperature}: reproducible iff the sampler was never drawn"
+    );
+
+    // A seed makes even a sampled draw replayable.
+    assert!(
+      Provenance::from_options(&DecodingOptions::new().with_seed(7), &compute, temperature)
+        .is_reproducible(),
+      "seeded temperature {temperature} replays exactly"
+    );
+
+    // for_result's surviving-segment scan (the third predicate site).
+    assert_eq!(
+      Provenance::for_result(
+        &DecodingOptions::new(),
+        &compute,
+        &result_at("en", &[temperature])
+      )
+      .sampled_at_nonzero_temperature(),
+      samples,
+      "temperature {temperature}: for_result's segment scan must agree"
+    );
+  }
+}

@@ -385,8 +385,10 @@ where
         //
         // `decode_with_fallback` has just settled the ladder, so
         // `decoding_result.temperature()` is the rung the window was
-        // ACCEPTED at; above `0.0` it drew from the sampler, and with no
-        // `options.seed()` that draw cannot be replayed. Four things
+        // ACCEPTED at; at any NON-ZERO temperature it drew from the sampler
+        // (whose own branch is `== 0.0` -> argmax, else sample — matching
+        // Swift's `temperature != 0.0`, `TokenSampler.swift:49,110,140`), and
+        // with no `options.seed()` that draw cannot be replayed. Four things
         // downstream of this line can delete every segment this window
         // produces — the word-timestamp pass's zero-length filter (:416),
         // the no-speech `continue` (:462), the blank-audio drop (:498),
@@ -401,7 +403,7 @@ where
         // then dropped.)
         //
         // So: accumulate before filtering, and never infer after.
-        sampled_at_nonzero_temperature |= decoding_result.temperature() > 0.0;
+        sampled_at_nonzero_temperature |= decoding_result.temperature() != 0.0;
 
         // :178-194.
         let windowing_start = Instant::now();

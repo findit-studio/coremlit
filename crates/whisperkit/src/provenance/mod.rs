@@ -240,7 +240,9 @@ pub struct Provenance {
   #[cfg_attr(feature = "serde", serde(deserialize_with = "required_option"))]
   effective_temperature: Option<f32>,
   /// Whether the decode ever **drew from the token sampler** — i.e. whether
-  /// any window was accepted above temperature `0.0`. Backs
+  /// any window was accepted at a **non-zero** temperature (the sampler
+  /// argmax-decodes only at exactly `0.0`, and draws from the RNG for every
+  /// other value, negatives included). Backs
   /// [`Self::is_reproducible`], and is the one library-known fact here that
   /// [`Self::effective_temperature`] cannot supply.
   ///
@@ -376,7 +378,13 @@ impl Provenance {
       // One decode at one temperature is all this constructor is told about,
       // so that temperature IS the whole sampling history it can record.
       // `for_result` is the form with a decode history to draw on.
-      effective_temperature > 0.0,
+      //
+      // `!= 0.0`, not `> 0.0`: the sampler draws from the RNG for EVERY
+      // temperature its own `== 0.0` argmax branch does not catch — negative
+      // ones included — matching Swift's `temperature != 0.0`
+      // (`TokenSampler.swift:49,110,140`). `> 0.0` would call an unseeded
+      // negative-temperature draw "greedy" and hand it a false reproducibility.
+      effective_temperature != 0.0,
     )
   }
 
@@ -467,7 +475,10 @@ impl Provenance {
         || result
           .segments_slice()
           .iter()
-          .any(|segment| segment.temperature() > 0.0),
+          // `!= 0.0` mirrors the sampler's own `== 0.0` argmax branch (and
+          // Swift's `temperature != 0.0`): a surviving segment at a negative
+          // temperature was sampled too, not decoded greedily.
+          .any(|segment| segment.temperature() != 0.0),
     )
   }
 
