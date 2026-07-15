@@ -84,6 +84,39 @@ fn any_source_argmax_does_not_fall_back_to_fluid_audio() {
   assert!(matches!(got, Err(crate::error::ModelError::Load(_))));
 }
 
+/// Finding 3, hermetic: the shipping FluidAudio selection is a pure function of
+/// the models root, pinned to the int8 `wespeaker_v2.mlmodelc`. This is the same
+/// resolver [`AnySource::load`] uses, so the pin sits on production's own
+/// selection. Repointing [`FluidAudioArtifacts::resolve`] at the fp32
+/// `wespeaker.mlmodelc` (the fp32-tested/int8-shipped hazard) fails this
+/// immediately — no models needed, because the resolver does no I/O.
+#[test]
+fn fluid_audio_artifacts_resolve_to_the_int8_shipping_embedder() {
+  let artifacts = FluidAudioArtifacts::resolve("some/models/root");
+  assert!(
+    artifacts.embedder().ends_with("wespeaker_v2.mlmodelc"),
+    "the shipping FluidAudio embedder must be the int8 wespeaker_v2.mlmodelc, got {}",
+    artifacts.embedder().display()
+  );
+  assert!(
+    artifacts
+      .segmenter()
+      .ends_with("pyannote_segmentation.mlmodelc"),
+    "the FluidAudio segmenter must be pyannote_segmentation.mlmodelc, got {}",
+    artifacts.segmenter().display()
+  );
+  // Rooted under the given directory, both files (a full-path pin, so a change
+  // to the join logic — not just the filename — also fails).
+  assert_eq!(
+    artifacts.embedder(),
+    std::path::Path::new("some/models/root/wespeaker_v2.mlmodelc")
+  );
+  assert_eq!(
+    artifacts.segmenter(),
+    std::path::Path::new("some/models/root/pyannote_segmentation.mlmodelc")
+  );
+}
+
 /// [`AnySource::load`] builds the source [`Options::source`] names — and
 /// dispatches `extract` to it.
 #[test]
