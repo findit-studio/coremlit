@@ -167,7 +167,21 @@ pub struct TranscriptionSegment {
   )]
   token_log_probs: Vec<(u32, f32)>,
   /// Sampling temperature this segment was decoded at.
-  #[cfg_attr(feature = "serde", serde(default = "default_segment_temperature"))]
+  ///
+  /// Bridged through the finite-float `serde` helper (codex round 3, F6) — the
+  /// one segment float that is: it is what `provenance`'s
+  /// `unanimous_temperature`/`sampled_at_nonzero_temperature` read to decide
+  /// reproducibility, so a non-finite value silently changing across a round
+  /// trip would corrupt that record. The descriptive telemetry floats beside
+  /// it (`avg_logprob`, `compression_ratio`, `no_speech_prob`) are left as-is:
+  /// `compression_ratio` legitimately reaches `f32::INFINITY` on empty text.
+  #[cfg_attr(
+    feature = "serde",
+    serde(
+      default = "default_segment_temperature",
+      with = "crate::options::finite_f32"
+    )
+  )]
   temperature: f32,
   /// Average sampled-token log probability.
   #[cfg_attr(feature = "serde", serde(default))]
@@ -2529,9 +2543,7 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
       id_base = max_local_id
         .checked_add(1)
         .and_then(|span| id_base.checked_add(span))
-        .expect(
-          "drop_blank_audio segment-id base overflowed usize (a segment id near usize::MAX)",
-        );
+        .expect("drop_blank_audio segment-id base overflowed usize (a segment id near usize::MAX)");
     }
   }
 

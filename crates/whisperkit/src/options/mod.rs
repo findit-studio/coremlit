@@ -25,6 +25,20 @@
 //! wholesale and still be an honest record of what produced a transcript
 //! (coremlit issue #14).
 //!
+//! Losslessness has a floating-point edge case, and this module closes it
+//! (codex round 3, F6): `serde_json` has no JSON form for `NaN` or ±∞ and
+//! silently writes each as `null`, so a `Some(-inf)` threshold would read back
+//! `None` — a check that fired on every finite value **silently disabled**
+//! across a round trip. Every `f32`-bearing knob here is therefore bridged
+//! through the `finite_f32`/`finite_f32_option`/`finite_f32_vec` helpers, which
+//! refuse a non-finite value on *both* sides of the boundary rather than let it
+//! round-trip to a different meaning. This matches Swift, whose
+//! `DecodingOptions: Codable` (`Configurations.swift:155`) encodes through the
+//! default `JSONEncoder` and so throws on a non-finite field: the value is
+//! rejected at the wire, exactly where Swift rejects it, and not at
+//! construction — Swift's initializer stores it without complaint, and so do
+//! these `const` builders.
+//!
 //! Losslessness is why the **four `Option<f32>` thresholds**
 //! ([`DecodingOptions::compression_ratio_threshold`],
 //! [`DecodingOptions::logprob_threshold`],
@@ -371,6 +385,109 @@ fn default_drop_blank_audio() -> bool {
   DEFAULT_DROP_BLANK_AUDIO
 }
 
+// ---------------------------------------------------------------------
+// Non-finite float rejection at the serde boundary (codex round 3, F6)
+// ---------------------------------------------------------------------
+
+/// The error a non-finite `f32` raises on either side of the `serde` boundary,
+/// shared by the `finite_f32*` helpers below.
+#[cfg(feature = "serde")]
+pub(crate) const NON_FINITE_FLOAT_MSG: &str = "non-finite float (NaN or infinity) is not \
+  representable in JSON and is rejected to keep the serde round trip lossless (matches Swift's \
+  JSONEncoder, which throws on non-finite by default)";
+
+/// `serde` bridge for a scalar `f32` that must round-trip losslessly (codex
+/// round 3, F6).
+///
+/// `serde_json` has no JSON form for `NaN`/±∞ and silently writes `null` for
+/// each; a `Some(-inf)` `Option<f32>` then reads back `None`, silently
+/// disabling a check that fired on every finite value. Swift refuses the same
+/// values from the other direction — `DecodingOptions: Codable`
+/// (`Configurations.swift:155`) with the default `JSONEncoder`, whose
+/// `nonConformingFloatEncodingStrategy` is `.throw`. This helper matches Swift:
+/// a non-finite value is refused on serialize (so the lossy `null` is never
+/// produced) and on deserialize (so a non-finite literal is never accepted),
+/// while a genuine `None` still writes `null` and reads back `None`. In-memory
+/// construction is deliberately NOT guarded — Swift's initializer also stores a
+/// non-finite value and only its encoder throws (`Configurations.swift:212`).
+#[cfg(feature = "serde")]
+pub(crate) mod finite_f32 {
+  use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+  pub(crate) fn serialize<S: Serializer>(value: &f32, serializer: S) -> Result<S::Ok, S::Error> {
+    if !value.is_finite() {
+      return Err(serde::ser::Error::custom(super::NON_FINITE_FLOAT_MSG));
+    }
+    value.serialize(serializer)
+  }
+
+  pub(crate) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f32, D::Error> {
+    let value = f32::deserialize(deserializer)?;
+    if !value.is_finite() {
+      return Err(serde::de::Error::custom(super::NON_FINITE_FLOAT_MSG));
+    }
+    Ok(value)
+  }
+}
+
+/// `serde` bridge for an `Option<f32>` that must round-trip losslessly: a
+/// finite `Some` and a `None` (written `null`) survive, and a non-finite `Some`
+/// is refused. Same rationale as `finite_f32`. Composes both with
+/// `serde(default = …)` (the four `DecodingOptions` thresholds) and with no
+/// default at all (a required, nullable field like
+/// `provenance::Provenance::effective_temperature`, which stays required
+/// because naming a `with`/`deserialize_with` defeats serde's
+/// missing-`Option`-is-`None` special case).
+#[cfg(feature = "serde")]
+pub(crate) mod finite_f32_option {
+  use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+  pub(crate) fn serialize<S: Serializer>(
+    value: &Option<f32>,
+    serializer: S,
+  ) -> Result<S::Ok, S::Error> {
+    if matches!(value, Some(v) if !v.is_finite()) {
+      return Err(serde::ser::Error::custom(super::NON_FINITE_FLOAT_MSG));
+    }
+    value.serialize(serializer)
+  }
+
+  pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+    deserializer: D,
+  ) -> Result<Option<f32>, D::Error> {
+    let value = Option::<f32>::deserialize(deserializer)?;
+    if matches!(value, Some(v) if !v.is_finite()) {
+      return Err(serde::de::Error::custom(super::NON_FINITE_FLOAT_MSG));
+    }
+    Ok(value)
+  }
+}
+
+/// `serde` bridge for a `Vec<f32>` that must round-trip losslessly: every
+/// element is finite, or the whole value is refused. Same rationale as
+/// `finite_f32`.
+#[cfg(feature = "serde")]
+pub(crate) mod finite_f32_vec {
+  use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+  pub(crate) fn serialize<S: Serializer>(value: &[f32], serializer: S) -> Result<S::Ok, S::Error> {
+    if value.iter().any(|v| !v.is_finite()) {
+      return Err(serde::ser::Error::custom(super::NON_FINITE_FLOAT_MSG));
+    }
+    value.serialize(serializer)
+  }
+
+  pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+    deserializer: D,
+  ) -> Result<Vec<f32>, D::Error> {
+    let value = Vec::<f32>::deserialize(deserializer)?;
+    if value.iter().any(|v| !v.is_finite()) {
+      return Err(serde::de::Error::custom(super::NON_FINITE_FLOAT_MSG));
+    }
+    Ok(value)
+  }
+}
+
 /// Decode-time configuration: Swift's 27-knob `DecodingOptions` surface
 /// (spec §6.2), plus three Rust-only additions — [`Self::seed`], for
 /// reproducible temperature-fallback sampling (coremlit issue #9; see the
@@ -403,12 +520,15 @@ pub struct DecodingOptions {
   )]
   language: String,
   /// Sampling temperature; `0.0` is greedy (argmax) decoding.
-  #[cfg_attr(feature = "serde", serde(default))]
+  #[cfg_attr(feature = "serde", serde(default, with = "finite_f32"))]
   temperature: f32,
   /// Amount added to `temperature` on each fallback retry.
   #[cfg_attr(
     feature = "serde",
-    serde(default = "default_temperature_increment_on_fallback")
+    serde(
+      default = "default_temperature_increment_on_fallback",
+      with = "finite_f32"
+    )
   )]
   temperature_increment_on_fallback: f32,
   /// Maximum number of temperature-fallback retries.
@@ -458,7 +578,11 @@ pub struct DecodingOptions {
   /// window. `None` disables the check (golden `Option<Copy>` exception).
   #[cfg_attr(
     feature = "serde",
-    serde(default, skip_serializing_if = "Option::is_none")
+    serde(
+      default,
+      skip_serializing_if = "Option::is_none",
+      with = "finite_f32_option"
+    )
   )]
   max_initial_timestamp: Option<f32>,
   /// Cap the seek position, in samples, for any single window. `None`
@@ -473,12 +597,19 @@ pub struct DecodingOptions {
   /// is one segment.
   #[cfg_attr(
     feature = "serde",
-    serde(default, skip_serializing_if = "Vec::is_empty")
+    serde(
+      default,
+      skip_serializing_if = "Vec::is_empty",
+      with = "finite_f32_vec"
+    )
   )]
   clip_timestamps: Vec<f32>,
   /// Seconds clipped from the end of each window, to reduce hallucinated
   /// trailing text.
-  #[cfg_attr(feature = "serde", serde(default = "default_window_clip_time"))]
+  #[cfg_attr(
+    feature = "serde",
+    serde(default = "default_window_clip_time", with = "finite_f32")
+  )]
   window_clip_time: f32,
   /// Token ids prepended to the prefill tokens as a conditioning prompt.
   #[cfg_attr(
@@ -509,7 +640,10 @@ pub struct DecodingOptions {
   /// module doc's lossless-round-trip section.
   #[cfg_attr(
     feature = "serde",
-    serde(default = "default_compression_ratio_threshold")
+    serde(
+      default = "default_compression_ratio_threshold",
+      with = "finite_f32_option"
+    )
   )]
   compression_ratio_threshold: Option<f32>,
   /// Treat decoding as failed if the average sampled-token log
@@ -517,7 +651,10 @@ pub struct DecodingOptions {
   ///
   /// Serialized even when `None` — see
   /// [`Self::compression_ratio_threshold`]'s field note.
-  #[cfg_attr(feature = "serde", serde(default = "default_logprob_threshold"))]
+  #[cfg_attr(
+    feature = "serde",
+    serde(default = "default_logprob_threshold", with = "finite_f32_option")
+  )]
   logprob_threshold: Option<f32>,
   /// Treat decoding as failed if the first sampled token's log
   /// probability falls below this value. `None` disables the check.
@@ -526,7 +663,10 @@ pub struct DecodingOptions {
   /// [`Self::compression_ratio_threshold`]'s field note.
   #[cfg_attr(
     feature = "serde",
-    serde(default = "default_first_token_logprob_threshold")
+    serde(
+      default = "default_first_token_logprob_threshold",
+      with = "finite_f32_option"
+    )
   )]
   first_token_logprob_threshold: Option<f32>,
   /// Treat a window as silent when the no-speech probability strictly
@@ -537,7 +677,10 @@ pub struct DecodingOptions {
   ///
   /// Serialized even when `None` — see
   /// [`Self::compression_ratio_threshold`]'s field note.
-  #[cfg_attr(feature = "serde", serde(default = "default_no_speech_threshold"))]
+  #[cfg_attr(
+    feature = "serde",
+    serde(default = "default_no_speech_threshold", with = "finite_f32_option")
+  )]
   no_speech_threshold: Option<f32>,
   /// Worker threads for batch transcription (Swift's macOS default: 16).
   #[cfg_attr(feature = "serde", serde(default = "default_concurrent_worker_count"))]

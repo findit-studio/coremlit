@@ -602,3 +602,65 @@ fn compute_units_rejects_unknown_names() {
   let err = serde_json::from_str::<ComputeOptions>(r#"{"mel":"bogus"}"#).unwrap_err();
   assert!(err.to_string().contains("unknown compute units name"));
 }
+
+#[cfg(feature = "serde")]
+#[test]
+fn non_finite_floats_are_rejected_at_the_serde_boundary() {
+  // Codex round 3, F6. `serde_json` has no JSON form for `NaN`/±∞ and silently
+  // writes `null` for each, so `with_compression_ratio_threshold(-inf)` would
+  // serialize `Some(-inf)` as `null` and deserialize back as `None` — a check
+  // that fired on every finite ratio SILENTLY DISABLED across a round trip.
+  // Swift closes the same hole from the encode side (`DecodingOptions: Codable`,
+  // `Configurations.swift:155`, default throwing `JSONEncoder`); this port
+  // refuses a non-finite float on BOTH sides of the wire, so the lossy `null`
+  // is never produced and the round trip stays lossless. Covers all three field
+  // shapes the finding names — scalar, optional, vector — against NaN and both
+  // infinities.
+  for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+    // scalar f32
+    assert!(
+      serde_json::to_string(&DecodingOptions::new().with_temperature(bad)).is_err(),
+      "a non-finite scalar `temperature` must be refused, not written as null"
+    );
+    assert!(serde_json::to_string(&DecodingOptions::new().with_window_clip_time(bad)).is_err());
+    // optional Option<f32> — the exact finding field
+    assert!(
+      serde_json::to_string(&DecodingOptions::new().with_compression_ratio_threshold(bad)).is_err(),
+      "a non-finite threshold must be refused, or it round-trips to a forged `None`"
+    );
+    // vector Vec<f32>
+    assert!(
+      serde_json::to_string(&DecodingOptions::new().with_clip_timestamps(vec![0.0, bad])).is_err()
+    );
+  }
+
+  // The deserialize side is guarded too: a JSON literal that overflows to a
+  // non-finite value must be rejected, not silently accepted (serde_json parses
+  // `1e400` to an infinity, and the finite guard then refuses it).
+  assert!(serde_json::from_str::<DecodingOptions>(r#"{"temperature":1e400}"#).is_err());
+  assert!(serde_json::from_str::<DecodingOptions>(r#"{"clip_timestamps":[1e400]}"#).is_err());
+  assert!(
+    serde_json::from_str::<DecodingOptions>(r#"{"compression_ratio_threshold":1e400}"#).is_err()
+  );
+
+  // `null` for a threshold is STILL the honest "check disabled" — only a
+  // non-finite NUMBER is rejected, never a genuine `None`. This is the
+  // distinction the whole finding turns on.
+  let disabled: DecodingOptions =
+    serde_json::from_str(r#"{"compression_ratio_threshold":null}"#).unwrap();
+  assert_eq!(disabled.compression_ratio_threshold(), None);
+
+  // A finite config — negative temperatures included, which F1 keeps valid
+  // in-memory — still round-trips losslessly, the property the guard protects.
+  let finite = DecodingOptions::new()
+    .with_temperature(-0.2)
+    .with_window_clip_time(0.5)
+    .with_compression_ratio_threshold(2.4)
+    .maybe_logprob_threshold(None)
+    .with_clip_timestamps(vec![0.0, 1.5, 3.0]);
+  let json = serde_json::to_string(&finite).unwrap();
+  assert_eq!(
+    serde_json::from_str::<DecodingOptions>(&json).unwrap(),
+    finite
+  );
+}

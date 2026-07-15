@@ -103,11 +103,16 @@ mod tests;
 /// `deserialize_option` with `visit_none`), so a bare `Option<T>` field is
 /// silently optional even with no `serde(default)` on it. That is exactly
 /// the silent defaulting this type refuses: an absent
-/// [`Provenance::effective_temperature`] would read back as "the fallback
-/// ladder split the segments" when all it really means is "whoever wrote
-/// this record dropped the field". Naming a `deserialize_with` sends the
-/// derive down its required-field path instead — the key must be present,
-/// and `null` then carries its real meaning and nothing else.
+/// [`Provenance::detected_language`] would read back as "no window observed a
+/// language" when all it really means is "whoever wrote this record dropped
+/// the field". Naming a `deserialize_with` sends the derive down its
+/// required-field path instead — the key must be present, and `null` then
+/// carries its real meaning and nothing else.
+///
+/// [`Provenance::effective_temperature`] gets the identical required-field
+/// treatment from `crate::options::finite_f32_option` (a `with`, which is a
+/// `deserialize_with` too, so the same special case is defeated), and that
+/// helper additionally refuses a non-finite value — see the field.
 #[cfg(feature = "serde")]
 fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
 where
@@ -240,7 +245,16 @@ pub struct Provenance {
   /// the same reason: nothing landed anywhere.
   /// [`Self::from_options`]/[`Self::for_segment`] are always `Some` — they
   /// are handed the one temperature they record.
-  #[cfg_attr(feature = "serde", serde(deserialize_with = "required_option"))]
+  ///
+  /// Required on deserialize, and finite: bridged through
+  /// `crate::options::finite_f32_option`, which keeps the field required
+  /// (naming a `with` defeats serde's missing-`Option`-is-`None` special case,
+  /// exactly as `required_option` does for `detected_language`) and refuses a
+  /// non-finite value on both sides of the wire (codex round 3, F6). Without
+  /// it, a `Some(-inf)` that `serde_json` collapses to `null` would read back
+  /// as a forged `None` ("the ladder split the segments") — the same silent
+  /// round-trip disable this record's embedded `DecodingOptions` closes.
+  #[cfg_attr(feature = "serde", serde(with = "crate::options::finite_f32_option"))]
   effective_temperature: Option<f32>,
   /// Whether the decode ever **drew from the token sampler** — i.e. whether
   /// any window was accepted at a **non-zero** temperature (the sampler
@@ -439,7 +453,10 @@ impl Provenance {
   ///   result::{TranscriptionResult, TranscriptionTimings},
   /// };
   ///
-  /// // Auto-detect: the CONFIGURED language is empty ...
+  /// // Auto-detect: the CONFIGURED language is empty, while the run OBSERVED
+  /// // English. The pipeline records the observation on the result; here it is
+  /// // set explicitly, since this is a hand-built one (a genuine observation is
+  /// // never inferred from the "en" display string — codex round 3, F3).
   /// let decoding = DecodingOptions::new();
   /// let compute = ComputeOptions::new();
   /// let result = TranscriptionResult::new(
@@ -447,7 +464,8 @@ impl Provenance {
   ///   Vec::new(),
   ///   "en",
   ///   TranscriptionTimings::new(),
-  /// );
+  /// )
+  /// .with_detected_language("en");
   ///
   /// let provenance = Provenance::for_result(&decoding, &compute, &result);
   /// assert_eq!(provenance.decoding().language(), "");

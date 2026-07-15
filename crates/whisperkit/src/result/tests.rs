@@ -1203,7 +1203,11 @@ fn merge_with_confirmed_words_honors_drop_blank_id_mapping() {
     vec![0, 2],
     "confirmed-words merge must preserve the dropped-id gap, not renumber to [0, 1]"
   );
-  assert_eq!(dropped.text(), " X", "text is still the confirmed-words override");
+  assert_eq!(
+    dropped.text(),
+    " X",
+    "text is still the confirmed-words override"
+  );
 
   // drop-OFF: EXACTLY Swift's dense reindex [0, 1].
   let dense = merge_transcription_results_with_words(
@@ -1327,5 +1331,31 @@ fn new_does_not_infer_detected_language_from_the_display_language() {
     r.with_detected_language("es").detected_language(),
     Some("es"),
     "an explicit observation is still recorded"
+  );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn segment_non_finite_temperature_is_rejected_by_serde() {
+  // Codex round 3, F6. `temperature` is the one `TranscriptionSegment` float
+  // bridged through the finite-float guard, because `provenance` reads it
+  // (`unanimous_temperature`, `sampled_at_nonzero_temperature`) to decide
+  // reproducibility — a non-finite value silently changing across a round trip
+  // would corrupt that record. It is refused on serialize rather than written
+  // as the lossy `null` serde_json emits; a finite segment still round-trips.
+  // The descriptive telemetry floats beside it (`avg_logprob`,
+  // `compression_ratio`, `no_speech_prob`) are deliberately left unguarded.
+  for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+    let segment = TranscriptionSegment::new().with_temperature(bad);
+    assert!(serde_json::to_string(&segment).is_err());
+  }
+  let finite = TranscriptionSegment::new()
+    .with_id(2)
+    .with_text("hola")
+    .with_temperature(0.2);
+  let json = serde_json::to_string(&finite).unwrap();
+  assert_eq!(
+    serde_json::from_str::<TranscriptionSegment>(&json).unwrap(),
+    finite
   );
 }

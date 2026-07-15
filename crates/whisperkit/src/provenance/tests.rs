@@ -715,13 +715,16 @@ fn a_record_missing_a_library_known_field_is_rejected() {
   // block would be a lie about what actually ran. Only the
   // consumer-supplied identity may be omitted.
   //
-  // The two `Option` OUTCOME fields need `required_option` to hold this
-  // line at all: serde's derive silently treats a missing `Option` field
-  // as `None` even with no `serde(default)` on it, which for these two
-  // would forge a meaning ("the ladder split the segments" / "no result
-  // was observed") out of a field the writer merely dropped. They are
-  // asserted here alongside the plain ones — this is the test that proves
-  // the `deserialize_with` actually defeats that path.
+  // The two `Option` OUTCOME fields each name a `deserialize_with` to hold
+  // this line at all: serde's derive silently treats a missing `Option`
+  // field as `None` even with no `serde(default)` on it, which for these two
+  // would forge a meaning ("the ladder split the segments" / "no result was
+  // observed") out of a field the writer merely dropped. `detected_language`
+  // uses `required_option`; `effective_temperature` uses the finite-float
+  // `with` helper (also a `deserialize_with`, and it refuses a non-finite
+  // value too — codex round 3, F6). They are asserted here alongside the
+  // plain ones — this is the test that proves the `deserialize_with` actually
+  // defeats that path.
   let full = Provenance::for_result(
     &distinctive_decoding(),
     &distinctive_compute(),
@@ -919,4 +922,23 @@ fn sampling_predicate_matches_the_samplers_nonzero_branch() {
       "temperature {temperature}: for_result's segment scan must agree"
     );
   }
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn effective_temperature_non_finite_is_rejected_by_serde() {
+  // Codex round 3, F6. A non-finite effective temperature must not serialize
+  // to the lossy `null` serde_json emits — the required-field deserialize would
+  // read that back as a forged `None` ("the ladder split the segments"), the
+  // same silent round-trip disable the embedded `DecodingOptions` closes. It is
+  // refused on serialize instead; a finite record still round-trips.
+  let compute = ComputeOptions::new();
+  for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+    let record = Provenance::from_options(&DecodingOptions::new(), &compute, bad);
+    assert!(record.effective_temperature().is_some());
+    assert!(serde_json::to_string(&record).is_err());
+  }
+  let finite = Provenance::from_options(&DecodingOptions::new(), &compute, 0.7);
+  let json = serde_json::to_string(&finite).unwrap();
+  assert_eq!(serde_json::from_str::<Provenance>(&json).unwrap(), finite);
 }
