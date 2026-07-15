@@ -413,33 +413,57 @@ const KNOWN_DEFECTS: &[KnownDefect] = &[
   },
   KnownDefect {
     path: "speakerkit/wespeaker.mlmodelc",
-    sites: &["real_div/fp32 guard=denom:add(+9.99999993922529e-9) eff=9.99999993922529e-9"],
-    note: "Attentive-stat pooling divides by `count + 1e-8`. 1e-8 is 0.168x fp16's smallest \
-           subnormal, so on the ANE the divisor guard is zero. Same fp32 artifact, same input, \
-           only CpuOnly -> All: cosine collapses to 0.035.",
+    // THREE identical divisor guards, one per attentive-stat pooling division
+    // (the weighted mean and the two divisions feeding the weighted variance /
+    // `std`). Listed thrice, not deduped: the multiplicity is the blast radius
+    // (finding 5).
+    sites: &[
+      "real_div/fp32 guard=denom:add(+9.99999993922529e-9) eff=9.99999993922529e-9",
+      "real_div/fp32 guard=denom:add(+9.99999993922529e-9) eff=9.99999993922529e-9",
+      "real_div/fp32 guard=denom:add(+9.99999993922529e-9) eff=9.99999993922529e-9",
+    ],
+    note: "Attentive-stat pooling divides by `count + 1e-8` at THREE sites (the weighted mean \
+           and the two divisions behind the weighted variance/std). 1e-8 is 0.168x fp16's \
+           smallest subnormal, so on the ANE all three divisor guards are zero. Same fp32 \
+           artifact, same input, only CpuOnly -> All: cosine collapses to 0.035.",
   },
   KnownDefect {
     path: "speakerkit/wespeaker_v2.mlmodelc",
-    sites: &["real_div/fp32 guard=denom:add(+9.99999993922529e-9) eff=9.99999993922529e-9"],
-    note: "Same pooling epsilon as wespeaker.mlmodelc.",
+    sites: &[
+      "real_div/fp32 guard=denom:add(+9.99999993922529e-9) eff=9.99999993922529e-9",
+      "real_div/fp32 guard=denom:add(+9.99999993922529e-9) eff=9.99999993922529e-9",
+      "real_div/fp32 guard=denom:add(+9.99999993922529e-9) eff=9.99999993922529e-9",
+    ],
+    note: "Same three-site pooling epsilon as wespeaker.mlmodelc.",
   },
   KnownDefect {
     path: "speakerkit/wespeaker_int8.mlmodelc",
-    sites: &["real_div/fp32 guard=denom:add(+9.99999993922529e-9) eff=9.99999993922529e-9"],
-    note: "Same pooling epsilon as wespeaker.mlmodelc.",
+    sites: &[
+      "real_div/fp32 guard=denom:add(+9.99999993922529e-9) eff=9.99999993922529e-9",
+      "real_div/fp32 guard=denom:add(+9.99999993922529e-9) eff=9.99999993922529e-9",
+      "real_div/fp32 guard=denom:add(+9.99999993922529e-9) eff=9.99999993922529e-9",
+    ],
+    note: "Same three-site pooling epsilon as wespeaker.mlmodelc.",
   },
   KnownDefect {
     path: "speakerkit/PLDA.mlmodelc",
-    sites: &["sqrt/fp32 guard=clip(alpha=9.999999960041972e-13) eff=9.999999960041972e-13"],
-    note: "Normalization clips to 1e-12 before `sqrt`, then divides by it. 1e-12 is 1.7e-5x \
-           fp16's smallest subnormal: on the ANE the clip floor is zero, giving sqrt(0) and a \
-           divide by zero. Not yet observed in a shipping path (found by this sweep, not by a \
-           failure).",
+    // TWO sqrt-of-clipped-value guards, each clipped to 1e-12 (finding 5).
+    sites: &[
+      "sqrt/fp32 guard=clip(alpha=9.999999960041972e-13) eff=9.999999960041972e-13",
+      "sqrt/fp32 guard=clip(alpha=9.999999960041972e-13) eff=9.999999960041972e-13",
+    ],
+    note: "Normalization clips to 1e-12 before `sqrt` at TWO sites, then divides by it. 1e-12 is \
+           1.7e-5x fp16's smallest subnormal: on the ANE the clip floor is zero, giving sqrt(0) \
+           and a divide by zero. Not yet observed in a shipping path (found by this sweep, not by \
+           a failure).",
   },
   KnownDefect {
     path: "speakerkit/PldaRho.mlmodelc",
-    sites: &["sqrt/fp32 guard=clip(alpha=9.999999960041972e-13) eff=9.999999960041972e-13"],
-    note: "Same 1e-12 clip floor as PLDA.mlmodelc.",
+    sites: &[
+      "sqrt/fp32 guard=clip(alpha=9.999999960041972e-13) eff=9.999999960041972e-13",
+      "sqrt/fp32 guard=clip(alpha=9.999999960041972e-13) eff=9.999999960041972e-13",
+    ],
+    note: "Same two-site 1e-12 clip floor as PLDA.mlmodelc.",
   },
   KnownDefect {
     path: "argmax-speakerkit/speaker_segmenter/pyannote-v3/W32A32/SpeakerSegmenter.mlmodelc",
@@ -498,14 +522,47 @@ const WHISPER_MEL: &str = r#"
             tensor<fp16, [80, 3000]> log_0_cast_fp16 = log(epsilon = log_0_epsilon_0_to_fp16, x = mel_spec_cast_fp16)[name = tensor<string, []>("log_0_cast_fp16")];
 "#;
 
-/// Only `log`/`sqrt`/`rsqrt`/`real_div`/norm sites, not every op.
-fn vanishing(mil: &str) -> Vec<String> {
-  parse_mil(mil)
-    .audit()
+/// Two INDEPENDENT decomposed-`log_softmax` sites, distinct vars but an
+/// identical vanishing signature — the multiset shape finding 5 is about, and
+/// the exact one the live wespeaker/PLDA graphs carry (3 and 2 same-signature
+/// sites). Both render to `log/fp16 guard=softmax->log eff=0e0`, so a `dedup` or
+/// set would collapse them into one and hide the second defect under a green
+/// pin. Synthesized from two copies of the real `SPEAKERKIT_SEG_FP16` shape.
+const TWO_SITE_LOG_SOFTMAX: &str = r#"
+            tensor<fp16, [1, 589, 7]> a_softmax_cast_fp16 = softmax(axis = a_axis, x = a_linear)[name = tensor<string, []>("a_softmax")];
+            tensor<fp16, []> a_epsilon = const()[name = tensor<string, []>("a_epsilon"), val = tensor<fp16, []>(0x0p+0)];
+            tensor<fp16, [1, 589, 7]> a_cast_fp16 = log(epsilon = a_epsilon, x = a_softmax_cast_fp16)[name = tensor<string, []>("a_log")];
+            tensor<fp16, [1, 589, 7]> b_softmax_cast_fp16 = softmax(axis = b_axis, x = b_linear)[name = tensor<string, []>("b_softmax")];
+            tensor<fp16, []> b_epsilon = const()[name = tensor<string, []>("b_epsilon"), val = tensor<fp16, []>(0x0p+0)];
+            tensor<fp16, [1, 589, 7]> b_cast_fp16 = log(epsilon = b_epsilon, x = b_softmax_cast_fp16)[name = tensor<string, []>("b_log")];
+"#;
+
+/// The vanishing guard sites of an already-audited graph, rendered and sorted
+/// as a **multiset** — duplicates PRESERVED. Two sites with the same signature
+/// are two defects, not one: a `dedup`/set here would let a reconversion that
+/// adds a second same-signature vanishing site collapse into the first and keep
+/// a green pin while the blast radius grows (finding 5). The live tree already
+/// carries this — wespeaker's attentive-stat pooling has THREE identical
+/// `real_div` guards and PLDA/PldaRho two `sqrt` each — which is exactly why the
+/// dedup was hiding real multiplicity.
+///
+/// Both the sweep and the hermetic parser tests route through here, so the
+/// multiset property is exercised by the always-run tests, not merely asserted
+/// against live models.
+fn vanishing_sites(findings: &[Finding]) -> Vec<String> {
+  let mut sites: Vec<String> = findings
     .iter()
     .filter(|f| !f.survives_fp16())
     .map(Finding::render)
-    .collect()
+    .collect();
+  sites.sort();
+  sites
+}
+
+/// The vanishing guard sites of a MIL program (parse + audit + multiset render).
+/// Only `log`/`sqrt`/`rsqrt`/`real_div`/norm sites, not every op.
+fn vanishing(mil: &str) -> Vec<String> {
+  vanishing_sites(&parse_mil(mil).audit())
 }
 
 #[test]
@@ -618,6 +675,27 @@ fn accepts_whisperkits_mel_guard() {
   );
 }
 
+/// Finding 5: two vanishing sites with the SAME signature must be TWO findings,
+/// not deduped to one. This is the blast-radius multiplicity a `dedup`/set
+/// silently hides (a reconversion that adds a second same-signature vanishing
+/// site keeps a green pin while doubling the corrupted sites). Routes through
+/// the same `vanishing` path the live sweep uses, so re-introducing a dedup in
+/// [`vanishing_sites`] breaks this hermetically, before any model is loaded.
+#[test]
+fn same_signature_sites_are_a_multiset_not_a_set() {
+  let sites = vanishing(TWO_SITE_LOG_SOFTMAX);
+  assert_eq!(
+    sites.len(),
+    2,
+    "two independent softmax->log sites must render as TWO findings, not collapse to one — got {sites:?}"
+  );
+  assert_eq!(
+    sites[0], sites[1],
+    "...and they share a signature, which is exactly what a set/dedup would fold away"
+  );
+  assert_eq!(sites[0], "log/fp16 guard=softmax->log eff=0e0");
+}
+
 // ---------------------------------------------------------------------------
 // The sweep — runs iff `Models/` is on disk (see `build.rs`).
 // ---------------------------------------------------------------------------
@@ -707,13 +785,10 @@ fn every_shipped_model_graph_survives_fp16() {
     );
     audited_sites += findings.len();
 
-    let mut vanishing: Vec<String> = findings
-      .iter()
-      .filter(|f| !f.survives_fp16())
-      .map(Finding::render)
-      .collect();
-    vanishing.sort();
-    vanishing.dedup();
+    // A MULTISET, not a set: duplicates are preserved so a second
+    // same-signature vanishing site fails the pin instead of collapsing into the
+    // first (finding 5). See `vanishing_sites`.
+    let vanishing = vanishing_sites(&findings);
 
     // Even a SURVIVING epsilon does not make `softmax -> log` safe: the
     // softmax underflows to 0 in fp16 before the log adds it. Any such
