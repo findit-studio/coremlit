@@ -123,6 +123,25 @@ pub const FIXTURES: &[Fixture] = &[
   },
 ];
 
+/// The exact `seg_model` provenance string frozen into every committed golden
+/// (`tests/fixtures/golden/*.json`) AND the single source of truth that
+/// `tests/generate_goldens.rs` writes when it regenerates one. Pinned here so
+/// the two can never silently drift apart; `tests/golden_metadata.rs` asserts
+/// each committed golden still carries this exact string in the ordinary
+/// `cargo test` suite.
+///
+/// The phrase **"raw powerset logits" is a legacy misnomer kept verbatim** to
+/// match the committed oracle — the identical decision `tests/parity_seg.rs`
+/// documents for the golden's `seg_logits` field name: renaming it would churn
+/// every committed golden (each ~270 KB) for zero behavioral gain, since no
+/// gate reads this string. The values are in fact powerset **log-probabilities**
+/// (`pyannote_segmentation.mlmodelc`'s MIL ends `softmax` → `log`, see
+/// `speakerkit::segment`'s module doc; the committed ORT golden agrees — every
+/// value `<= 0`, every 7-class row `sum(exp(row)) == 1`). Read the string as a
+/// provenance tag, not a claim about the tensor's calibration.
+pub const SEG_MODEL_LABEL: &str =
+  "segmentation-3.0.onnx (dia bundled, ort CPU EP, raw powerset logits)";
+
 /// Directory holding the committed parity fixtures (`audio/` + `golden/`).
 pub fn fixtures_dir() -> PathBuf {
   PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
