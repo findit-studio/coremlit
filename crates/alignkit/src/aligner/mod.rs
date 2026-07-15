@@ -231,6 +231,21 @@ fn build_seam(
     .build()
 }
 
+/// The `requested` [`AlignerOptions`] as the seam actually APPLIES them — the
+/// effective state [`Aligner::options`] must report.
+///
+/// The seam coerces `min_speech_coverage` through
+/// [`SpeechCoverage::clamped`](asry::emissions::SpeechCoverage::clamped) at
+/// construction (`NaN` → default, out-of-range → `[0, 1]`), so the requested
+/// value and the applied one can differ. This reads the applied coverage back
+/// OUT of the built `seam` rather than re-clamping here, so `options()` can never
+/// drift from what the seam does: the seam's own clamp is the single source of
+/// truth. `max_intra_silent_run` and `compute` are not coerced, so they pass
+/// through from `requested` unchanged.
+fn effective_options(seam: &EmissionsAligner, requested: &AlignerOptions) -> AlignerOptions {
+  requested.with_min_speech_coverage(seam.min_speech_coverage().get())
+}
+
 /// Per-language forced aligner over the CoreML wav2vec2 encoder.
 ///
 /// Wraps alignkit's CoreML [`Encoder`] (its head
@@ -318,6 +333,11 @@ impl Aligner {
       crate::vocab::VOCAB_SIZE,
       "bundled tokenizer vocab must equal the CTC head width"
     );
+    // `options()` must report EFFECTIVE state (F3): the seam coerced
+    // `min_speech_coverage` through `SpeechCoverage::clamped`, so store what the
+    // seam actually applies — read back out of it — not the requested value that
+    // may have been out of range or NaN.
+    let options = effective_options(&inner, &options);
     Ok(Self {
       encoder,
       inner,
@@ -331,7 +351,13 @@ impl Aligner {
     self.inner.language()
   }
 
-  /// The [`AlignerOptions`] baked into this aligner's seam.
+  /// The **effective** [`AlignerOptions`] baked into this aligner's seam — the
+  /// values actually in force, which are not always the ones requested at
+  /// construction. In particular `min_speech_coverage` is the seam's *clamped*
+  /// value ([`SpeechCoverage::clamped`](asry::emissions::SpeechCoverage::clamped):
+  /// `NaN` → default, out-of-range → `[0, 1]`), so a caller that constructed the
+  /// aligner with `2.0` reads back `1.0` here — the coverage the aligner will
+  /// actually apply — never the un-applied request.
   #[must_use]
   pub const fn options(&self) -> AlignerOptions {
     self.options
