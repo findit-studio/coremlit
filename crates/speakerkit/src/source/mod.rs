@@ -62,7 +62,7 @@
 //! and honestly `{FluidAudio, Argmax}` — the dispatcher matching on it is
 //! forced by the compiler to handle every variant explicitly.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::{
   embed::EmbedModel,
@@ -161,6 +161,56 @@ impl Default for Source {
   }
 }
 
+/// The exact on-disk artifacts the [`Source::FluidAudio`] arm of
+/// [`AnySource::load`] loads under a `models_root` — the SINGLE definition of
+/// *which files ship*.
+///
+/// [`AnySource::load`] resolves the FluidAudio paths through this and nothing
+/// else, so a gate can assert the shipping selection at its source of truth
+/// instead of re-encoding it. [`Self::embedder`] is the int8-palettized
+/// `wespeaker_v2.mlmodelc` (the shipping default; byte-identical to
+/// `wespeaker_int8.mlmodelc`, `tests/model_io.rs`). Repointing it at the fp32
+/// `wespeaker.mlmodelc` — the fp32-tested/int8-shipped hazard — then moves
+/// production AND the test that pins it together, so the two cannot silently
+/// diverge (a test that loaded its OWN `wespeaker_v2` path while production
+/// loaded something else is exactly how that hazard hides).
+///
+/// **Pure**: path selection only — no filesystem access, no model load — so a
+/// hermetic unit test can pin the selection with no models present.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FluidAudioArtifacts {
+  segmenter: PathBuf,
+  embedder: PathBuf,
+}
+
+impl FluidAudioArtifacts {
+  /// Resolve the FluidAudio artifact paths under `models_root`. Pure: joins the
+  /// two fixed artifact names onto the root, touching no filesystem.
+  #[must_use]
+  pub fn resolve(models_root: impl AsRef<Path>) -> Self {
+    let root = models_root.as_ref();
+    Self {
+      segmenter: root.join("pyannote_segmentation.mlmodelc"),
+      embedder: root.join("wespeaker_v2.mlmodelc"),
+    }
+  }
+
+  /// The segmentation artifact path (`<root>/pyannote_segmentation.mlmodelc`).
+  #[inline]
+  #[must_use]
+  pub fn segmenter(&self) -> &Path {
+    &self.segmenter
+  }
+
+  /// The embedder artifact path (`<root>/wespeaker_v2.mlmodelc`, the int8
+  /// shipping default).
+  #[inline]
+  #[must_use]
+  pub fn embedder(&self) -> &Path {
+    &self.embedder
+  }
+}
+
 /// A built, dispatchable [`ModelSource`] — the runtime counterpart to the
 /// [`Source`] selector, owning whichever source's models were loaded.
 ///
@@ -210,12 +260,16 @@ impl AnySource {
     let compute = options.compute();
     match options.source() {
       Source::FluidAudio => {
+        // The two artifact paths come from the pure resolver, the single place
+        // "which FluidAudio files ship" is defined, so a gate pins production's
+        // exact selection rather than a parallel copy of it (finding 3).
+        let artifacts = FluidAudioArtifacts::resolve(root);
         let seg = SegmentModel::from_file_with(
-          root.join("pyannote_segmentation.mlmodelc"),
+          artifacts.segmenter(),
           crate::segment::SegmentModelOptions::new().with_compute(compute.segmenter()),
         )?;
         let embed = EmbedModel::from_file_with(
-          root.join("wespeaker_v2.mlmodelc"),
+          artifacts.embedder(),
           crate::embed::EmbedModelOptions::new().with_compute(compute.embedder()),
         )?;
         Ok(Self::FluidAudio(FluidAudioSource::with_options(

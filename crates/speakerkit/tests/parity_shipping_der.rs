@@ -146,7 +146,7 @@ use speakerkit::{
   embed::{EmbedModel, EmbedModelOptions},
   extract::{Extraction, Options},
   segment::{SegmentModel, SegmentModelOptions},
-  source::{AnySource, FluidAudioSource, ModelSource},
+  source::{AnySource, FluidAudioArtifacts, FluidAudioSource, ModelSource},
 };
 
 // ══════════════════════════════════════════════════════════════════════
@@ -567,6 +567,12 @@ fn measure(clip: &MultiSpkClip) -> Measurement {
     plda: &plda,
     dia: &dia,
   };
+  // The int8 embedder path comes from the SAME resolver production uses
+  // (`AnySource::load`'s FluidAudio arm), so "the shipping int8 arm" IS the
+  // shipping selection by construction — not a second copy of the path via
+  // `common::embed_path()` that could drift from production (finding 3). fp32 is
+  // the CONTROL and deliberately stays the non-shipping `wespeaker.mlmodelc`.
+  let shipping = FluidAudioArtifacts::resolve(common::models_dir());
   let fp32 = run_arm(
     &ctx,
     "fp32/CpuOnly",
@@ -576,10 +582,10 @@ fn measure(clip: &MultiSpkClip) -> Measurement {
   let int8_cpu = run_arm(
     &ctx,
     "int8/CpuOnly",
-    &common::embed_path(),
+    shipping.embedder(),
     ComputeUnits::CpuOnly,
   );
-  let int8_all = run_arm(&ctx, "int8/All", &common::embed_path(), ComputeUnits::All);
+  let int8_all = run_arm(&ctx, "int8/All", shipping.embedder(), ComputeUnits::All);
 
   // ══ REPORT (unconditional — printed BEFORE any assertion) ══
   //
@@ -1017,9 +1023,14 @@ fn shipping_embedder_cost_int8_vs_fp32() {
 }
 
 /// The shipping default really is the int8 artifact — the premise this whole
-/// suite rests on. If `ModelSource::load` is ever repointed at the fp32
-/// `wespeaker.mlmodelc`, this fails and tells the next reader that the gates
-/// above are now measuring the same thing twice.
+/// suite rests on. It pins the exact selection at its source of truth: the pure
+/// [`FluidAudioArtifacts::resolve`] that `AnySource::load` itself uses. If that
+/// resolver is ever repointed at the fp32 `wespeaker.mlmodelc`, this fails —
+/// and so does the hermetic `FluidAudioArtifacts` unit test — because both read
+/// production's own selection, not a parallel copy of the path (finding 3: the
+/// old version asserted only the enum variant and directory sizes, so repointing
+/// the loader passed everything while the DER arms went on loading their own
+/// `common::embed_path()`).
 ///
 /// Needs only the model directory (no audio, no ort), so it runs cheaply — but
 /// it is still `#[ignore]`d because it loads the real artifacts.
@@ -1032,10 +1043,20 @@ fn shipping_default_is_the_int8_embedder() {
     "wespeaker_v2.mlmodelc (int8) missing under {}",
     root.display()
   );
-  // `AnySource::load` (the shipping entry point) must succeed against the real
-  // directory: for the default `Source::FluidAudio` it hard-codes
-  // `wespeaker_v2.mlmodelc` (src/source/mod.rs), the int8-palettized artifact
-  // (byte-identical to `wespeaker_int8.mlmodelc`, tests/model_io.rs).
+  // The selection, pinned at production's source of truth. `AnySource::load`
+  // resolves the FluidAudio embedder through exactly this, and the DER arms in
+  // `measure()` load through it too, so this assertion covers what actually
+  // ships — not a re-encoding of it.
+  let artifacts = FluidAudioArtifacts::resolve(&root);
+  assert!(
+    artifacts.embedder().ends_with("wespeaker_v2.mlmodelc"),
+    "AnySource::load's FluidAudio embedder resolves to {}, not the int8 wespeaker_v2.mlmodelc — \
+     the shipping default moved, so the DER gates in this suite are now measuring the wrong \
+     artifact",
+    artifacts.embedder().display()
+  );
+  // `AnySource::load` (the shipping entry point) must also succeed against the
+  // real directory and build the FluidAudio variant.
   let source = AnySource::load(&root, Options::new()).expect("AnySource::load shipping default");
   assert!(
     matches!(source, AnySource::FluidAudio(_)),
@@ -1056,7 +1077,7 @@ fn shipping_default_is_the_int8_embedder() {
     }
     walk(p)
   };
-  let int8 = du(&common::embed_path());
+  let int8 = du(artifacts.embedder());
   let fp32 = du(&common::embed_fp32_path());
   println!(
     "shipping embedder wespeaker_v2 (int8) = {:.1} MB | wespeaker (fp32) = {:.1} MB | \
