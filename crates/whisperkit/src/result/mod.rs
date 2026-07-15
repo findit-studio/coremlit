@@ -2417,6 +2417,15 @@ pub fn merge_transcription_results(results: &[TranscriptionResult]) -> Transcrip
 /// Dropping an emptied result from the merge *input* instead would take its
 /// metrics out with it, quietly corrupting the sums (and the RTF) to fix a
 /// spacing bug.
+///
+/// # Panics
+///
+/// When [`DecodingOptions::drop_blank_audio`] is set, each chunk's segment ids
+/// are re-mapped onto a running base advancing by the chunk's id span, so the
+/// merged ids stay injective while preserving each chunk's local gaps. That
+/// arithmetic is checked: a hand-built segment id near [`usize::MAX`] panics
+/// deliberately rather than wrapping into a colliding id. Pipeline-produced
+/// ids are small decode ordinals and never approach this.
 pub fn merge_transcription_results_with_options(
   results: &[TranscriptionResult],
   options: &DecodingOptions,
@@ -2443,27 +2452,49 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
     .join(" ");
 
   let mut segments = Vec::new();
+  // Running id base for the drop-ON (`skip_empty_texts`) mapping. Each chunk's
+  // survivors are re-`id`'d to `id_base + segment.id()` (its **decode
+  // ordinal**, its position within its own chunk), and `id_base` then advances
+  // by that chunk's id SPAN — its max local id `+ 1`. This is INJECTIVE across
+  // chunks (no two chunks' id windows overlap) while preserving each chunk's
+  // own local gaps: a blank dropped mid-chunk leaves `[.., 2]` where segment 1
+  // was, and that hole survives inside the chunk's window as the audit trail
+  // `drop_blank_audio` promises. The earlier `result_index + segment.id()`
+  // COLLIDED the moment a chunk had more than one segment — `[0,1] + [0,1]`
+  // renumbered to `[0,1,1,2]`, and a blank-dropped `[0,2] + [0,1]` to
+  // `[0,2,1,2]` — because `result_index` advances by 1 per chunk regardless of
+  // how many ids the chunk actually spans. `id_base` advances by the real span
+  // instead. With dropping OFF the false path stays EXACTLY Swift's
+  // `resultIndex + segmentIndex`, byte-for-byte (its duplicate ids are pinned
+  // parity), and `id_base` is left untouched.
+  let mut id_base = 0usize;
   for (result_index, result) in results.iter().enumerate() {
+    let mut max_local_id = 0usize;
+    let mut saw_segment = false;
     for (segment_index, segment) in result.segments_slice().iter().enumerate() {
-      // `skip_empty_texts` IS `drop_blank_audio` (threaded from the options).
-      // With it ON, offset each survivor's **decode ordinal** (`segment.id()`,
-      // its position within its own chunk) by `result_index`, exactly as
-      // Swift's reindexing offsets `segment_index`. `segment.id()` equals
-      // `segment_index` UNLESS a blank was dropped mid-chunk, so this keeps
-      // the gap that drop leaves ([.., 2] where segment 1 was blank) as the
-      // audit trail — the same promise the unmerged single-chunk path already
-      // honours (`options::DecodingOptions::drop_blank_audio`), which the VAD
-      // path (always merged, `transcribe::WhisperKit::transcribe`) otherwise
-      // broke by pulling survivors down into the gap. The `result_index`
-      // offset is what keeps one-segment-per-chunk VAD output from collapsing
-      // every chunk's lone `id() == 0` into a single id. With it OFF the false
-      // path stays EXACTLY Swift's `resultIndex + segmentIndex`, byte-for-byte.
       let id = if skip_empty_texts {
-        result_index + segment.id()
+        // Checked: a hand-built `usize::MAX` id is adversarial input, so a
+        // deliberate documented panic beats a silent wraparound collision (see
+        // this function's `# Panics`).
+        id_base.checked_add(segment.id()).expect(
+          "drop_blank_audio segment-id mapping overflowed usize (a segment id near usize::MAX)",
+        )
       } else {
         result_index + segment_index
       };
       segments.push(segment.clone().with_id(id));
+      max_local_id = max_local_id.max(segment.id());
+      saw_segment = true;
+    }
+    if skip_empty_texts && saw_segment {
+      // Advance past this chunk's id window (max local id + 1). Same checked
+      // arithmetic and same rationale as the per-segment add above.
+      id_base = max_local_id
+        .checked_add(1)
+        .and_then(|span| id_base.checked_add(span))
+        .expect(
+          "drop_blank_audio segment-id base overflowed usize (a segment id near usize::MAX)",
+        );
     }
   }
 

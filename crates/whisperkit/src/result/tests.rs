@@ -145,6 +145,67 @@ fn merge_preserves_survivor_ids_when_dropping_blanks() {
   assert_eq!(two_chunks.segments_slice()[1].tokens_slice(), &[20]);
 }
 
+#[test]
+fn merge_drop_on_ids_stay_injective_across_multi_segment_chunks() {
+  // F4 (codex round 3). The round-2 test above uses ONE segment per chunk, so
+  // it never exercised `result_index + segment.id()`'s collision on
+  // MULTI-segment chunks: `[0,1] + [0,1]` renumbered to `[0,1,1,2]`, and a
+  // blank-dropped `[0,2] + [0,1]` to `[0,2,1,2]` -- duplicate ids either way.
+  // The running-base mapping must keep (chunk, original_id) injective while
+  // preserving each chunk's own local gaps.
+  let seg = |id: usize, token: u32| {
+    let mut s = TranscriptionSegment::new();
+    s.set_id(id).set_tokens(vec![token]);
+    s
+  };
+
+  // Chunk A carries an INTERNAL dropped-id gap -- ids [0, 2], its segment 1
+  // was a dropped blank. Chunk B is dense -- ids [0, 1].
+  let chunk_a = TranscriptionResult::new(
+    "A",
+    vec![seg(0, 10), seg(2, 12)],
+    "en",
+    TranscriptionTimings::new(),
+  );
+  let chunk_b = TranscriptionResult::new(
+    "B",
+    vec![seg(0, 20), seg(1, 21)],
+    "en",
+    TranscriptionTimings::new(),
+  );
+  let merged =
+    merge_transcription_results_with_options(&[chunk_a, chunk_b], &DecodingOptions::new());
+
+  let ids: Vec<usize> = merged
+    .segments_slice()
+    .iter()
+    .map(TranscriptionSegment::id)
+    .collect();
+  // Chunk A: base 0 -> [0, 2] (its local gap at 1 preserved). Span = 2 + 1 = 3.
+  // Chunk B: base 3 -> [3, 4]. The pre-fix formula produced
+  // [0+0, 0+2, 1+0, 1+1] = [0, 2, 1, 2] -- a duplicate 2.
+  assert_eq!(
+    ids,
+    vec![0, 2, 3, 4],
+    "injective across chunks, each chunk's local gap preserved"
+  );
+  let unique: std::collections::HashSet<usize> = ids.iter().copied().collect();
+  assert_eq!(
+    unique.len(),
+    ids.len(),
+    "(chunk, original_id) must map injectively -- no id collisions"
+  );
+  // Survivor identity travels through the re-id, matched by tokens not id.
+  assert_eq!(
+    merged
+      .segments_slice()
+      .iter()
+      .map(|s| s.tokens_slice()[0])
+      .collect::<Vec<_>>(),
+    vec![10, 12, 20, 21],
+  );
+}
+
 /// A result carrying nothing but text — the shape `transcribe_all` returns
 /// for a chunk/clip whose segments were all emptied (or, independently of
 /// the blank-audio drop, for any clip shorter than `window_clip_time`).
