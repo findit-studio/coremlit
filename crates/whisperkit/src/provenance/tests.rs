@@ -100,30 +100,6 @@ fn mutations() -> Vec<OptionMutation> {
   ]
 }
 
-/// A [`DecodingOptions`] with every knob set to a non-default, **non-skipped**
-/// value — the fixture `mutation_table_covers_every_decoding_option` derives
-/// the true field list from. Every collection is non-empty and every
-/// `Option` whose default is `None` is `Some`, so nothing is elided by
-/// `skip_serializing_if` and the serialized map has exactly one key per
-/// field.
-#[cfg(feature = "serde")]
-fn fully_populated() -> DecodingOptions {
-  mutations()
-    .into_iter()
-    .fold(DecodingOptions::new(), |options, (_, mutate)| {
-      mutate(options)
-    })
-    // The four thresholds' mutations DISABLE them (`None`), which is the
-    // right probe for the record but the wrong one for a key census: they
-    // serialize as `null` rather than being skipped, so they are present
-    // either way. Set them back to real numbers so this fixture reads as
-    // what it claims to be — "every knob populated".
-    .with_compression_ratio_threshold(3.0)
-    .with_logprob_threshold(-2.0)
-    .with_first_token_logprob_threshold(-2.5)
-    .with_no_speech_threshold(0.7)
-}
-
 #[test]
 fn provenance_records_every_decoding_option() {
   // THE completeness gate. For each knob in turn: change only that knob,
@@ -197,28 +173,26 @@ fn drop_blank_audio_and_word_grouping_are_recorded() {
   );
 }
 
-#[cfg(feature = "serde")]
 #[test]
 fn mutation_table_covers_every_decoding_option() {
-  // What makes the table above a GATE rather than a list somebody has to
-  // remember: the field roster is read off `DecodingOptions` itself (its
-  // serialized key set, one key per field once nothing is skipped), so a
-  // knob added tomorrow lands here as an uncovered name and fails this test
-  // until it is exercised. The old completeness test had no such anchor —
-  // it iterated the fields the record already had, which is why it passed
-  // while 19 were missing.
-  let value: serde_json::Value = serde_json::to_value(fully_populated()).unwrap();
-  let fields: std::collections::BTreeSet<&str> = value
-    .as_object()
-    .expect("DecodingOptions serializes as a map")
-    .keys()
-    .map(String::as_str)
+  // NON-CIRCULAR by construction (codex round 3, F7). The field roster comes
+  // from `DecodingOptions` ITSELF -- `options::DECODING_OPTION_FIELD_NAMES`,
+  // backed by a compile-time exhaustive destructure (no `..`) in the `options`
+  // module -- NOT from `serde_json::to_value(fully_populated())`, which folded
+  // the very `mutations()` table this test verifies. Under the old anchor a new
+  // field whose default is skip-serialized was absent from BOTH sides and
+  // slipped through all three table-driven tests. Now adding a field breaks the
+  // destructure's compilation until it is named in the roster, and then fails
+  // HERE as an uncovered name until it also gets a mutation row.
+  let expected: std::collections::BTreeSet<&str> = crate::options::DECODING_OPTION_FIELD_NAMES
+    .iter()
+    .copied()
     .collect();
   let covered: std::collections::BTreeSet<&str> =
     mutations().iter().map(|(field, _)| *field).collect();
 
   assert_eq!(
-    covered, fields,
+    covered, expected,
     "the provenance mutation table has fallen out of step with \
      DecodingOptions -- every knob needs a row (see `mutations`)"
   );

@@ -559,6 +559,73 @@ pub struct DecodingOptions {
   word_grouping: WordGrouping,
 }
 
+/// Names every field of [`DecodingOptions`] exactly once, generating (for
+/// tests) both a `DECODING_OPTION_FIELD_NAMES` roster and a compile-time
+/// exhaustiveness guard that destructures `DecodingOptions` WITHOUT `..`.
+///
+/// This is what makes the provenance completeness tests non-circular (codex
+/// round 3, F7): the field roster they check the mutation table against comes
+/// from `DecodingOptions` ITSELF, not from folding the very `mutations()` table
+/// under test. Add a field to the struct and the guard below fails to compile
+/// until it is named here — and it then lands in
+/// `provenance::tests::mutation_table_covers_every_decoding_option` as an
+/// uncovered name until it also gets a mutation row. The serde key of every
+/// field equals its Rust name (no field carries `serde(rename)`), so
+/// `stringify!` yields exactly the serialized key set.
+macro_rules! decoding_option_field_names {
+  ($($field:ident),+ $(,)?) => {
+    /// The full field/serde-key set of [`DecodingOptions`], one entry per
+    /// field. Kept exhaustive at compile time by the guard in the same macro
+    /// expansion. Consumed by the provenance mutation-table coverage test.
+    #[cfg(test)]
+    #[allow(dead_code)] // used only by the serde-gated provenance coverage test
+    pub(crate) const DECODING_OPTION_FIELD_NAMES: &[&str] = &[$(stringify!($field)),+];
+
+    /// A pure compile-time exhaustiveness check: destructuring without `..`
+    /// forces every `DecodingOptions` field to be named in the list above, so
+    /// a newly added field breaks the test build until the roster (and the
+    /// provenance mutation table) name it. Never called.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn _decoding_options_field_exhaustiveness_guard(options: DecodingOptions) {
+      let DecodingOptions { $($field: _),+ } = options;
+    }
+  };
+}
+
+decoding_option_field_names!(
+  task,
+  language,
+  temperature,
+  temperature_increment_on_fallback,
+  temperature_fallback_count,
+  sample_length,
+  top_k,
+  seed,
+  use_prefill_prompt,
+  detect_language,
+  skip_special_tokens,
+  without_timestamps,
+  word_timestamps,
+  max_initial_timestamp,
+  max_window_seek,
+  clip_timestamps,
+  window_clip_time,
+  prompt_tokens,
+  prefix_tokens,
+  suppress_blank,
+  suppress_tokens,
+  compression_ratio_threshold,
+  logprob_threshold,
+  first_token_logprob_threshold,
+  no_speech_threshold,
+  concurrent_worker_count,
+  chunking_strategy,
+  verbose,
+  drop_blank_audio,
+  word_grouping,
+);
+
 impl Default for DecodingOptions {
   fn default() -> Self {
     Self::new()
