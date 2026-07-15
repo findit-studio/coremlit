@@ -205,19 +205,22 @@ pub struct Provenance {
   /// The per-stage CoreML compute units the pipeline ran on. Recorded
   /// because they change the output (see this module's docs).
   compute: ComputeOptions,
-  /// The language the transcript was actually decoded in
-  /// ([`TranscriptionResult::language`]) — the **outcome**, where
+  /// The language a window **actually observed**
+  /// ([`TranscriptionResult::detected_language`]) — the **outcome**, where
   /// [`DecodingOptions::language`] is the **input**. This is the one that
   /// matters under auto-detect: the configured language is then empty (and
   /// it is empty on every run with [`DecodingOptions::use_prefill_prompt`]
   /// cleared, the default pairing for detection), so it says nothing at all
   /// about what was spoken, and only this field does.
   ///
-  /// `None` **iff the record was built without a result** — by
-  /// [`Self::from_options`] or [`Self::for_segment`], neither of which is
-  /// handed a [`TranscriptionResult`] and so neither of which can observe
-  /// the detection outcome. Never inferred from the configured language.
-  /// [`Self::for_result`] always fills it in.
+  /// `None` in two honest cases, never as a guess: when the record was built
+  /// **without a result** ([`Self::from_options`]/[`Self::for_segment`],
+  /// neither handed a [`TranscriptionResult`]), or when it was built
+  /// [`Self::for_result`] from a run that **observed no language** — a decode
+  /// that ran zero windows (audio too short, or an all-skipped clip) detects
+  /// nothing. Never the Swift-compat `"en"` display fallback
+  /// [`TranscriptionResult::language`] carries, and never inferred from the
+  /// configured language: a fabricated language is worse than an admitted gap.
   #[cfg_attr(feature = "serde", serde(deserialize_with = "required_option"))]
   detected_language: Option<String>,
   /// The temperature the decode **actually landed on** — the fallback
@@ -406,9 +409,14 @@ impl Provenance {
   /// The **result-level** capture: [`Self::from_options`]'s facts, plus the
   /// two a whole transcript — and only a whole transcript — can settle.
   ///
-  /// - [`Self::detected_language`] becomes `Some(result.language())`: the
-  ///   language the decode **actually ran in**. This is the fact worth
-  ///   recording, and it is one [`Self::for_segment`] structurally cannot
+  /// - [`Self::detected_language`] becomes
+  ///   [`result.detected_language()`](TranscriptionResult::detected_language):
+  ///   the language a window **actually observed**, or `None` when the run
+  ///   observed none (a decode that ran zero windows detects nothing). It is
+  ///   deliberately **not** [`TranscriptionResult::language`], whose
+  ///   Swift-compat `"en"` display fallback would fabricate a language a
+  ///   silent run never saw — "record what produced the transcript, invent
+  ///   nothing". This is a fact [`Self::for_segment`] structurally cannot
   ///   reach (it is handed a segment, not the result that carries the
   ///   detection outcome). Under the default auto-detect the *configured*
   ///   [`DecodingOptions::language`] is just `""`, so without this a record
@@ -456,7 +464,10 @@ impl Provenance {
     Self::capture(
       decoding,
       compute,
-      Some(result.language().to_string()),
+      // The OBSERVATION, not the display string: `None` when the run decoded
+      // no window and so witnessed no language, rather than promoting
+      // `TranscriptionResult::language`'s Swift-compat `"en"` fallback.
+      result.detected_language().map(str::to_string),
       unanimous_temperature(result.segments_slice()),
       // Two sources, OR-ed, and the order matters less than the fact that
       // neither can veto the other:
@@ -528,10 +539,11 @@ impl Provenance {
   }
 
   // -- detected_language --------------------------------------------------
-  /// The language the transcript was actually decoded in — the outcome,
-  /// where [`DecodingOptions::language`] is the configured input. `None` iff
-  /// this record was built without a result ([`Self::from_options`] /
-  /// [`Self::for_segment`]); never inferred. See the field's doc.
+  /// The language a window actually observed — the outcome, where
+  /// [`DecodingOptions::language`] is the configured input. `None` when the
+  /// record was built without a result ([`Self::from_options`] /
+  /// [`Self::for_segment`]) or from a run that observed no language; never
+  /// the display fallback, never inferred. See the field's doc.
   #[inline(always)]
   pub fn detected_language(&self) -> Option<&str> {
     self.detected_language.as_deref()

@@ -63,6 +63,41 @@ fn audio_shorter_than_window_clip_time_yields_no_windows() {
 
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn zero_window_run_observes_no_language_in_provenance() {
+  // F3 (codex round 2), end to end. The same zero-window run as above:
+  // audio shorter than the padding threshold decodes NO window
+  // (encode_calls == 0), so the pipeline observes no language. The result
+  // still carries the Swift-compat `"en"` DISPLAY fallback, but the recorded
+  // observation -- and therefore `Provenance::for_result` -- must be `None`,
+  // not a fabricated language the pipeline never saw.
+  let t = tiny_tokenizer();
+  let mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  let task = TranscribeTask::new(&mock, &t);
+  let result = task
+    .run(&vec![0.1; 14_400], &DecodingOptions::new())
+    .unwrap();
+
+  assert_eq!(mock.counters().encode_calls(), 0, "no window decoded");
+  assert_eq!(result.language(), "en", "the display fallback is kept");
+  assert_eq!(
+    result.detected_language(),
+    None,
+    "nothing was observed, so the result records no detected language"
+  );
+  let provenance = crate::provenance::Provenance::for_result(
+    &DecodingOptions::new(),
+    &crate::options::ComputeOptions::new(),
+    &result,
+  );
+  assert_eq!(
+    provenance.detected_language(),
+    None,
+    "and neither does the provenance -- absent, not fabricated"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn single_window_run_produces_segments_and_text() {
   let t = tiny_tokenizer();
   let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));

@@ -404,6 +404,46 @@ fn for_result_records_the_detected_language_not_the_configured_one() {
 }
 
 #[test]
+fn for_result_detected_language_is_absent_when_no_window_observed_one() {
+  // F3 (codex round 2). A run that decoded ZERO windows (audio too short)
+  // observes no language, yet its result still carries the Swift-compat
+  // `"en"` DISPLAY fallback on `TranscriptionResult::language`. for_result
+  // must record `detected_language = None` -- reading the observation, not
+  // promoting the display string it never witnessed.
+  //
+  // Mutation proof: revert for_result to `Some(result.language())` and the
+  // first assertion (None) fails, reporting Some("en").
+  let compute = ComputeOptions::new();
+  let opts = DecodingOptions::new();
+
+  // The pipeline's zero-window shape: display "en", observation None.
+  let unobserved = TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
+    .maybe_detected_language(None);
+  assert_eq!(
+    unobserved.language(),
+    "en",
+    "the Swift-compat display fallback is kept on the result"
+  );
+  assert_eq!(
+    Provenance::for_result(&opts, &compute, &unobserved).detected_language(),
+    None,
+    "nothing was observed -- the detected language is absent, not fabricated"
+  );
+
+  // The guard against a wrong 'empty result means absent' fix: a window DID
+  // run and genuinely decoded English, then the blank-audio drop emptied its
+  // segments. The observation survives even though no segment does.
+  let dropped_english = TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
+    .maybe_detected_language(Some("en".to_string()));
+  assert!(dropped_english.segments_slice().is_empty());
+  assert_eq!(
+    Provenance::for_result(&opts, &compute, &dropped_english).detected_language(),
+    Some("en"),
+    "a genuinely observed language must survive its segments being dropped"
+  );
+}
+
+#[test]
 fn for_result_temperature_is_some_only_when_every_segment_agrees() {
   // m3: a result-level `f32` would have had to misrepresent a per-window
   // fallback ladder that split the segments. `Option<f32>` is honest AND

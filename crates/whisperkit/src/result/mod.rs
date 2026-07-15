@@ -1200,6 +1200,29 @@ pub struct TranscriptionResult {
   /// is rejected rather than defaulted — exactly as the same carried fact is
   /// on [`Provenance`](crate::provenance::Provenance) (see `provenance::tests`).
   sampled_at_nonzero_temperature: bool,
+  /// The language a window **actually observed**, or `None` when the run
+  /// observed none — a decode that ran **zero** windows (audio shorter than
+  /// the padding threshold, or an all-skipped clip) never detected anything.
+  ///
+  /// Deliberately separate from [`Self::language`], which keeps its
+  /// Swift-compat `"en"` display fallback even when nothing was decoded:
+  /// that string is what a consumer renders, this `Option` is what was
+  /// *witnessed*.
+  /// [`Provenance::for_result`](crate::provenance::Provenance::for_result)
+  /// reads THIS — so a zero-window result records
+  /// [`Provenance::detected_language`](crate::provenance::Provenance::detected_language)
+  /// as `None` rather than fabricating a language the pipeline never saw
+  /// ("record what produced the transcript, invent nothing").
+  ///
+  /// [`Self::new`] seeds it from its `language` argument (`Some` for a
+  /// non-empty one, `None` for `""`), so a hand-built result reads back the
+  /// language it was given; the pipeline overrides it with the true
+  /// observation via [`Self::maybe_detected_language`].
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "Option::is_none")
+  )]
+  detected_language: Option<String>,
 }
 
 impl TranscriptionResult {
@@ -1216,19 +1239,28 @@ impl TranscriptionResult {
   /// visible `temperature > 0.0` is caught either way. What only this flag
   /// can carry is a sampled window whose segments are *gone* — and only the
   /// decode path can know about those.
+  ///
+  /// [`Self::detected_language`] is seeded from `language`: `Some` for a
+  /// non-empty code, `None` for `""`. A hand-built result thus reads back the
+  /// language it was handed; the pipeline overrides it with the true
+  /// observation (`None` when it decoded no window) via
+  /// [`Self::maybe_detected_language`].
   pub fn new(
     text: impl Into<String>,
     segments: impl Into<Vec<TranscriptionSegment>>,
     language: impl Into<String>,
     timings: TranscriptionTimings,
   ) -> Self {
+    let language = language.into();
+    let detected_language = (!language.is_empty()).then(|| language.clone());
     Self {
       text: text.into(),
       segments: segments.into(),
-      language: language.into(),
+      language,
       timings,
       seek_time: None,
       sampled_at_nonzero_temperature: false,
+      detected_language,
     }
   }
 
@@ -1300,6 +1332,51 @@ impl TranscriptionResult {
   #[inline(always)]
   pub fn set_language(&mut self, language: impl Into<String>) -> &mut Self {
     self.language = language.into();
+    self
+  }
+
+  // -- detected_language --------------------------------------------------
+  /// The language a window **actually observed**, or `None` when the run
+  /// observed none. Distinct from [`Self::language`]'s Swift-compat display
+  /// fallback; this is what
+  /// [`Provenance::for_result`](crate::provenance::Provenance::for_result)
+  /// records. See the field's doc.
+  #[inline(always)]
+  pub fn detected_language(&self) -> Option<&str> {
+    self.detected_language.as_deref()
+  }
+  /// Builder form of [`Self::set_detected_language`].
+  #[must_use]
+  #[inline(always)]
+  pub fn with_detected_language(mut self, detected_language: impl Into<String>) -> Self {
+    self.set_detected_language(detected_language);
+    self
+  }
+  /// Sets [`Self::detected_language`] to `Some(detected_language)`.
+  #[inline(always)]
+  pub fn set_detected_language(&mut self, detected_language: impl Into<String>) -> &mut Self {
+    self.detected_language = Some(detected_language.into());
+    self
+  }
+  /// Builder form of [`Self::update_detected_language`].
+  #[must_use]
+  #[inline(always)]
+  pub fn maybe_detected_language(mut self, detected_language: Option<String>) -> Self {
+    self.update_detected_language(detected_language);
+    self
+  }
+  /// Assigns [`Self::detected_language`] directly — the pipeline passes the
+  /// true observation here (`None` when it decoded no window), overriding the
+  /// value [`Self::new`] seeded from the display language.
+  #[inline(always)]
+  pub fn update_detected_language(&mut self, detected_language: Option<String>) -> &mut Self {
+    self.detected_language = detected_language;
+    self
+  }
+  /// Sets [`Self::detected_language`] to `None`.
+  #[inline(always)]
+  pub fn clear_detected_language(&mut self) -> &mut Self {
+    self.detected_language = None;
     self
   }
 
@@ -2492,8 +2569,18 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
     .iter()
     .any(TranscriptionResult::sampled_at_nonzero_temperature);
 
+  // The observation, carried from the first result to match the merged
+  // DISPLAY `language` (also the first's). `None` when that result observed
+  // no language — a batch of only zero-window/empty results merges to a
+  // detected language of `None`, not the invented `"en"` `new` would seed
+  // from the display fallback. Honest, like the sampling fact above.
+  let detected_language = results
+    .first()
+    .and_then(|first| first.detected_language().map(str::to_string));
+
   TranscriptionResult::new(text, segments, language, timings)
     .maybe_sampled_at_nonzero_temperature(sampled)
+    .maybe_detected_language(detected_language)
 }
 
 // ---------------------------------------------------------------------

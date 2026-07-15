@@ -551,13 +551,24 @@ where
       TranscriptionResult::new(
         trimmed_text,
         all_segments,
-        detected_language.unwrap_or_else(|| DEFAULT_LANGUAGE_CODE.to_string()),
+        // Swift-compat DISPLAY fallback: `"en"` when the run detected
+        // nothing. Kept verbatim on `TranscriptionResult::language`.
+        detected_language
+          .clone()
+          .unwrap_or_else(|| DEFAULT_LANGUAGE_CODE.to_string()),
         timings,
       )
       // Carried out of the window loop, not derived from `all_segments` —
       // by this point the filters above may have emptied the very window
       // that sampled (see the assignment inside the loop).
-      .maybe_sampled_at_nonzero_temperature(sampled_at_nonzero_temperature),
+      .maybe_sampled_at_nonzero_temperature(sampled_at_nonzero_temperature)
+      // The true observation, SEPARATE from the display fallback above:
+      // `None` iff this run decoded zero windows and so witnessed no
+      // language. `Provenance::for_result` reads this, recording no detected
+      // language rather than fabricating the `"en"` fallback the pipeline
+      // never saw. (`new` seeded it from that fallback; this override is what
+      // keeps a zero-window run honest.)
+      .maybe_detected_language(detected_language),
     )
   }
 
