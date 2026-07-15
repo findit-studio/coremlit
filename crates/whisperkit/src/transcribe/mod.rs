@@ -381,37 +381,32 @@ where
           &mut initial_prompt,
           &mut detected_language,
           &mut observed_language,
+          &mut sampled_at_nonzero_temperature,
           options,
           &mut timings,
           window_index,
         )?;
         window_index += 1;
 
-        // THE reproducibility invariant, recorded HERE — at the one point
-        // where this window's accepted temperature is still knowable, and
-        // ahead of every step that can erase the evidence of it.
-        //
-        // `decode_with_fallback` has just settled the ladder, so
-        // `decoding_result.temperature()` is the rung the window was
-        // ACCEPTED at; at any NON-ZERO temperature it drew from the sampler
-        // (whose own branch is `== 0.0` -> argmax, else sample — matching
-        // Swift's `temperature != 0.0`, `TokenSampler.swift:49,110,140`), and
-        // with no `options.seed()` that draw cannot be replayed. Four things
-        // downstream of this line can delete every segment this window
-        // produces — the word-timestamp pass's zero-length filter (:416),
-        // the no-speech `continue` (:462), the blank-audio drop (:498),
-        // and, one level up, a VAD chunk that ends up contributing nothing
-        // to the merge. Once any of them fires, the window's temperature is
-        // no longer anywhere in the output, and a `Provenance` that read the
-        // effective temperature back off the SURVIVING segments would see
-        // only the greedy ones and declare the transcript reproducible.
-        // (Constructed, not hypothesized: `transcribe::tests`'
-        // `unseeded_sampling_survives_the_blank_audio_drop` scripts a window
-        // accepted at 0.2 that decodes to exactly `[BLANK_AUDIO]` and is
-        // then dropped.)
-        //
-        // So: accumulate before filtering, and never infer after.
-        sampled_at_nonzero_temperature |= decoding_result.temperature() != 0.0;
+        // THE reproducibility invariant. `sampled_at_nonzero_temperature` was
+        // accumulated INSIDE `decode_with_fallback` just now, from each
+        // attempt's `GreedyTokenSampler::drew_from_rng` — the honest fact of
+        // whether an RNG draw actually happened — NOT inferred here from
+        // `decoding_result.temperature()`. That inference was wrong twice over
+        // (F2, codex round 3): it missed a REJECTED attempt whose unseeded
+        // draw still decided which attempt was kept (accepted at 0.0 → looked
+        // greedy → falsely reproducible), and it overcounted a non-zero
+        // temperature that ran zero sampling iterations (or only hit the
+        // all-masked path) and never drew. Recording it in the ladder also
+        // keeps it ahead of every step that can erase the evidence — the
+        // word-timestamp zero-length filter, the no-speech `continue`, the
+        // blank-audio drop, or a VAD chunk contributing nothing to the merge —
+        // so a `Provenance` can never read the effective temperature back off
+        // the SURVIVING segments (only the greedy ones would remain) and
+        // declare the transcript reproducible. (Constructed, not hypothesized:
+        // `transcribe::tests`' `unseeded_sampling_survives_the_blank_audio_drop`
+        // scripts a window accepted at 0.2 that decodes to exactly
+        // `[BLANK_AUDIO]` and is then dropped.)
 
         // :178-194.
         let windowing_start = Instant::now();
@@ -725,6 +720,7 @@ where
     initial_prompt: &mut Vec<u32>,
     detected_language: &mut Option<String>,
     observed_language: &mut Option<String>,
+    sampled_at_nonzero_temperature: &mut bool,
     options: &DecodingOptions,
     timings: &mut TranscriptionTimings,
     window_index: u64,
@@ -838,6 +834,15 @@ where
         &early_stop,
         window_callback,
       )?;
+
+      // F2 (codex round 3): record whether THIS attempt actually drew from the
+      // RNG. One `sampler` owns both the language probe's draw and every text
+      // token's, so this single read covers the whole attempt; OR-ing it across
+      // every attempt — REJECTED as well as retained — is what the
+      // reproducibility fact needs, because a rejected unseeded draw still
+      // decides which attempt is kept. A zero-iteration decode at a non-zero
+      // temperature never draws, so it correctly leaves this unset.
+      *sampled_at_nonzero_temperature |= sampler.drew_from_rng();
 
       // TranscribeTask.swift:198 — snapshot THIS attempt's alignment
       // weights now, before the fallback branch below can reset (and

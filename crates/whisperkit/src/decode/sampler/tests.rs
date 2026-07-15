@@ -82,6 +82,39 @@ fn fully_masked_sample_does_not_consume_rng() {
 }
 
 #[test]
+fn drew_from_rng_tracks_real_rng_draws() {
+  // F2 (codex round 3). The fallback ladder records reproducibility from THIS
+  // fact, not from the temperature: it must be true iff `sample` actually
+  // consulted the RNG -- a non-zero-temperature draw on a non-masked buffer.
+  let logits = [1.0f32, 3.0, 2.0, 0.0];
+
+  // Argmax (temperature 0) never draws.
+  let mut argmax_sampler = greedy(0.0);
+  assert!(!argmax_sampler.drew_from_rng(), "a fresh sampler has not drawn");
+  argmax_sampler.sample(&logits);
+  assert!(
+    !argmax_sampler.drew_from_rng(),
+    "argmax decoding does not consult the RNG"
+  );
+
+  // A non-zero temperature draws, and the flag latches.
+  let mut sampling = greedy(0.7);
+  sampling.sample(&logits);
+  assert!(
+    sampling.drew_from_rng(),
+    "a non-zero-temperature sample draws from the RNG"
+  );
+
+  // The all-masked degenerate path returns without drawing.
+  let mut masked = greedy(0.7);
+  masked.sample(&[f32::NEG_INFINITY; 4]);
+  assert!(
+    !masked.drew_from_rng(),
+    "the all-masked degenerate path must not consult the RNG"
+  );
+}
+
+#[test]
 fn negative_temperature_wide_logits_sample_without_panic() {
   // F1 (codex round 3, High). Swift scales the logits by `1 / temperature`
   // FIRST, then softmaxes the *scaled* vector (`TokenSampler.swift:109-138`).

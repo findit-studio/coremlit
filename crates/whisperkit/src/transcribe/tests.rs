@@ -1200,6 +1200,97 @@ fn a_window_accepted_above_zero_can_decode_the_blank_marker_and_be_dropped() {
 
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn a_rejected_nonzero_attempt_is_recorded_even_when_the_window_is_accepted_greedily() {
+  // F2 (codex round 3), history 1. base temperature -0.2, increment 0.2,
+  // fallback 1: attempt 0 runs at -0.2 and DRAWS from the RNG, is rejected on
+  // its first-token logprob, and attempt 1 runs at exactly 0.0 (greedy) and is
+  // accepted as the ladder's last rung. The accepted temperature is 0.0, so
+  // the OLD temperature-inferred fact called this greedy and reproducible --
+  // but attempt 0's unseeded draw already happened, and a re-run may keep its
+  // output, so the transcript is NOT reproducible.
+  //
+  // `without_timestamps` empties the filter chain (no token is masked to
+  // -inf), so the -0.2 attempt samples over finite logits without tripping the
+  // negative-temperature/masked-token corner. Flat logits make the first-token
+  // logprob ~ln(1/V) at EITHER temperature, so both attempts break at their
+  // first token deterministically -- attempt 0 rejected, attempt 1 accepted as
+  // the last rung -- with no probabilistic assertion.
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  for _ in 0..24 {
+    mock.push_step(vec![0.0f32; 51865]);
+  }
+  let options = DecodingOptions::new()
+    .with_language("en") // no probe: keep the RNG accounting to the fallback ladder
+    .with_without_timestamps()
+    .with_temperature(-0.2)
+    .with_temperature_fallback_count(1) // attempts: -0.2, then exactly 0.0
+    .with_first_token_logprob_threshold(-1.5)
+    .maybe_compression_ratio_threshold(None)
+    .maybe_logprob_threshold(None);
+  assert_eq!(options.seed(), None, "unseeded is the default");
+
+  // 32_000 samples clears the 1 s (16_000-sample) window padding, so exactly
+  // one window actually decodes (a shorter clip would be skipped outright).
+  let result = TranscribeTask::new(&mock, &t)
+    .run(&vec![0.1; 32_000], &options)
+    .unwrap();
+  assert!(
+    mock.counters().encode_calls() > 0,
+    "a window must actually decode, or this proves nothing"
+  );
+  assert!(
+    result.sampled_at_nonzero_temperature(),
+    "attempt 0 drew at -0.2, even though the window was accepted greedily at 0.0"
+  );
+  let provenance = crate::provenance::Provenance::for_result(
+    &options,
+    &crate::options::ComputeOptions::new(),
+    &result,
+  );
+  assert!(
+    !provenance.is_reproducible(),
+    "an unseeded rejected draw cannot be promised byte-for-byte"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn a_nonzero_temperature_that_never_samples_records_no_sampling() {
+  // F2 (codex round 3), the inverse history. A non-zero temperature with
+  // `sample_length == 0` runs ZERO decode iterations, so the sampler is never
+  // consulted and no RNG draw happens. The OLD fact inferred sampling from the
+  // non-zero temperature and wrongly claimed the transcript was sampled; the
+  // drew-from-rng fact records the truth -- nothing was drawn.
+  let t = tiny_tokenizer();
+  let mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  let options = DecodingOptions::new()
+    .with_language("en") // no probe (a probe would itself draw)
+    .with_without_timestamps() // lump-branch seek advance, so the window terminates cleanly
+    .with_temperature(0.3) // non-zero...
+    .with_sample_length(0) // ...but zero iterations, so `sample` is never called
+    .with_temperature_fallback_count(0);
+
+  // 32_000 samples clears the window padding, so the window really decodes
+  // (with zero sampling iterations) rather than being skipped -- otherwise the
+  // old temperature-inferred fact would never have been consulted either, and
+  // the test would pass vacuously.
+  let result = TranscribeTask::new(&mock, &t)
+    .run(&vec![0.1; 32_000], &options)
+    .unwrap();
+  assert!(
+    mock.counters().encode_calls() > 0,
+    "the window must actually decode (at temperature 0.3) for the fact to matter"
+  );
+  assert!(
+    !result.sampled_at_nonzero_temperature(),
+    "a zero-iteration decode never draws, whatever the temperature -- the old \
+     `temperature != 0.0` inference wrongly recorded this window as sampled"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn unseeded_sampling_survives_the_blank_audio_drop() {
   // THE FULL FAILING HISTORY, end to end through the merge every VAD-chunked
   // `WhisperKit::transcribe` runs:

@@ -93,6 +93,14 @@ pub struct GreedyTokenSampler {
   eot_token: u32,
   top_k: NonZeroUsize,
   rng: StdRng,
+  /// Latches `true` the first time [`Self::sample`] consults `rng` — a real
+  /// multinomial draw, which happens only at a non-zero temperature on a
+  /// non-masked buffer. [`crate::transcribe::TranscribeTask`]'s fallback
+  /// ladder reads this to record whether an RNG draw *actually occurred*,
+  /// rather than inferring it from the accepted attempt's temperature — which
+  /// misses a rejected attempt's draw and overcounts a zero-iteration decode
+  /// (F2, codex round 3). See [`Self::drew_from_rng`].
+  drew_from_rng: bool,
   // Reused across `sample` calls at `temperature != 0` to avoid
   // per-step allocations; cleared and repopulated at the top of that
   // path. `indices` is the top-k candidate list — full-vocab sized, so
@@ -119,6 +127,7 @@ impl GreedyTokenSampler {
       eot_token,
       top_k: NonZeroUsize::new(options.top_k()).unwrap_or(NonZeroUsize::MIN),
       rng: StdRng::from_os_rng(),
+      drew_from_rng: false,
       probs: Vec::new(),
       indices: Vec::new(),
     }
@@ -150,6 +159,19 @@ impl GreedyTokenSampler {
   #[inline(always)]
   pub const fn eot_token(&self) -> u32 {
     self.eot_token
+  }
+
+  /// Whether [`Self::sample`] has consulted the RNG at least once on this
+  /// sampler — a real multinomial draw (non-zero temperature on a non-masked
+  /// buffer; argmax and the all-masked degenerate path never draw).
+  /// [`crate::transcribe::TranscribeTask`]'s fallback ladder ORs this across a
+  /// window's language probe and every attempt (rejected and retained) to
+  /// record whether the transcript depended on an RNG draw at all — the
+  /// reproducibility fact, recorded rather than inferred from a temperature
+  /// (F2, codex round 3).
+  #[inline(always)]
+  pub const fn drew_from_rng(&self) -> bool {
+    self.drew_from_rng
   }
 
   /// Samples the next token from a decode step's `logits`. At
@@ -238,6 +260,10 @@ impl GreedyTokenSampler {
       indices.truncate(k);
 
       let top_sum: f32 = indices.iter().map(|&i| probs[i]).sum();
+      // A real RNG draw — the fact the fallback ladder records for
+      // reproducibility (F2). Only reached at non-zero temperature on a
+      // non-masked buffer; the argmax and all-masked paths never get here.
+      self.drew_from_rng = true;
       let rnd = self.rng.random_range(0.0..top_sum);
       let mut accumulator = 0.0f32;
       let mut chosen = indices[0];
