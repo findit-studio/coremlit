@@ -35,6 +35,116 @@ fn merge_transcription_results_concatenates_and_reids() {
   assert_eq!(merged.language(), "en");
 }
 
+#[test]
+fn merge_preserves_survivor_ids_when_dropping_blanks() {
+  // F4 (codex round 2). The VAD path ALWAYS routes chunk results through
+  // `merge_transcription_results_with_options` (transcribe::transcribe), and
+  // that merge reindexed every survivor to `result_index + segment_index` --
+  // silently collapsing the [0, 2] gap a blank-audio drop leaves back to
+  // [0, 1], so `drop_blank_audio`'s documented "survivors keep their decoded
+  // ids" promise held only on the unmerged single-chunk path.
+  //
+  // One chunk, speech-blank-speech, the blank already dropped in the task ->
+  // survivors carry decode ids 0 and 2. Match survivors by tokens, assert ids.
+  let mut speech0 = TranscriptionSegment::new();
+  speech0
+    .set_id(0)
+    .set_start(0.0)
+    .set_end(1.0)
+    .set_text(" Hello")
+    .set_tokens(vec![10]);
+  let mut speech2 = TranscriptionSegment::new();
+  speech2
+    .set_id(2)
+    .set_start(2.0)
+    .set_end(3.0)
+    .set_text(" World")
+    .set_tokens(vec![20]);
+  let chunk = TranscriptionResult::new(
+    "Hello World",
+    vec![speech0, speech2],
+    "en",
+    TranscriptionTimings::new(),
+  );
+
+  // Dropping ON (the default): ids preserved, the [0, 2] hole intact.
+  let dropped =
+    merge_transcription_results_with_options(std::slice::from_ref(&chunk), &DecodingOptions::new());
+  assert_eq!(
+    dropped
+      .segments_slice()
+      .iter()
+      .map(TranscriptionSegment::id)
+      .collect::<Vec<_>>(),
+    vec![0, 2],
+    "survivors keep their decode ids; the dropped segment's gap is preserved"
+  );
+  // Survivors matched by tokens, NOT id: the second is still " World".
+  assert_eq!(dropped.segments_slice()[1].tokens_slice(), &[20]);
+  assert_eq!(dropped.segments_slice()[1].start(), 2.0);
+
+  // Dropping OFF: EXACTLY Swift's `result_index + segment_index` reindexing
+  // -- the false path stays byte-for-byte Swift, so the same survivors come
+  // back densely renumbered [0, 1].
+  let swift = merge_transcription_results_with_options(
+    std::slice::from_ref(&chunk),
+    &DecodingOptions::new().maybe_drop_blank_audio(false),
+  );
+  assert_eq!(
+    swift
+      .segments_slice()
+      .iter()
+      .map(TranscriptionSegment::id)
+      .collect::<Vec<_>>(),
+    vec![0, 1],
+    "Swift-exact reindexing (result_index + segment_index) when dropping is off"
+  );
+  assert_eq!(
+    swift.segments_slice()[1].tokens_slice(),
+    &[20],
+    "still the same survivor, only its id differs"
+  );
+
+  // Multiple chunks, dropping ON: each VAD chunk is its own decode with its
+  // own id space, so both lone survivors carry decode id 0. The
+  // `result_index` offset is what keeps them from COLLIDING to [0, 0] -- the
+  // id preservation must still disambiguate across chunks, landing [0, 1].
+  let mut chunk_a_seg = TranscriptionSegment::new();
+  chunk_a_seg
+    .set_id(0)
+    .set_text(" Hello")
+    .set_tokens(vec![10]);
+  let mut chunk_b_seg = TranscriptionSegment::new();
+  chunk_b_seg
+    .set_id(0)
+    .set_text(" World")
+    .set_tokens(vec![20]);
+  let chunk_a = TranscriptionResult::new(
+    "Hello",
+    vec![chunk_a_seg],
+    "en",
+    TranscriptionTimings::new(),
+  );
+  let chunk_b = TranscriptionResult::new(
+    "World",
+    vec![chunk_b_seg],
+    "en",
+    TranscriptionTimings::new(),
+  );
+  let two_chunks =
+    merge_transcription_results_with_options(&[chunk_a, chunk_b], &DecodingOptions::new());
+  assert_eq!(
+    two_chunks
+      .segments_slice()
+      .iter()
+      .map(TranscriptionSegment::id)
+      .collect::<Vec<_>>(),
+    vec![0, 1],
+    "each chunk's lone `id() == 0` must be offset by result_index, not collapsed to [0, 0]"
+  );
+  assert_eq!(two_chunks.segments_slice()[1].tokens_slice(), &[20]);
+}
+
 /// A result carrying nothing but text — the shape `transcribe_all` returns
 /// for a chunk/clip whose segments were all emptied (or, independently of
 /// the blank-audio drop, for any clip shorter than `window_clip_time`).

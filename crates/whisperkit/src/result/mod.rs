@@ -2445,7 +2445,25 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
   let mut segments = Vec::new();
   for (result_index, result) in results.iter().enumerate() {
     for (segment_index, segment) in result.segments_slice().iter().enumerate() {
-      segments.push(segment.clone().with_id(result_index + segment_index));
+      // `skip_empty_texts` IS `drop_blank_audio` (threaded from the options).
+      // With it ON, offset each survivor's **decode ordinal** (`segment.id()`,
+      // its position within its own chunk) by `result_index`, exactly as
+      // Swift's reindexing offsets `segment_index`. `segment.id()` equals
+      // `segment_index` UNLESS a blank was dropped mid-chunk, so this keeps
+      // the gap that drop leaves ([.., 2] where segment 1 was blank) as the
+      // audit trail — the same promise the unmerged single-chunk path already
+      // honours (`options::DecodingOptions::drop_blank_audio`), which the VAD
+      // path (always merged, `transcribe::WhisperKit::transcribe`) otherwise
+      // broke by pulling survivors down into the gap. The `result_index`
+      // offset is what keeps one-segment-per-chunk VAD output from collapsing
+      // every chunk's lone `id() == 0` into a single id. With it OFF the false
+      // path stays EXACTLY Swift's `resultIndex + segmentIndex`, byte-for-byte.
+      let id = if skip_empty_texts {
+        result_index + segment.id()
+      } else {
+        result_index + segment_index
+      };
+      segments.push(segment.clone().with_id(id));
     }
   }
 
