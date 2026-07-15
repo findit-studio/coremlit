@@ -39,13 +39,46 @@ fn fallback_default_is_skip_chunk() {
 // in either direction before.
 // ---------------------------------------------------------------------
 
+/// Every [`AlignmentFallback`] variant — the roster the round-trip, spelling, and
+/// (under `serde`) serialization tests below all iterate, so no variant can be
+/// tested through only some of them.
+///
+/// A new variant is FORCED to appear here (F3) by [`fallback_roster_is_exhaustive`]
+/// and the wildcard-free `match`es in the spelling / serde tests: adding a variant
+/// to `AlignmentFallback` fails those to compile until it is handled, and the fix
+/// sits right next to this array. That tripwire is the whole point — `FromStr`'s
+/// own `_ =>` arm compiles for any new variant, so without it a `Retry` variant
+/// would `Display`/serde as `"retry"` while `from_str` silently refused it, with
+/// every text-form test still green. A hand-listed roster iterated by those tests
+/// could not catch that; a hand-listed roster whose completeness is compiler-
+/// checked can.
+const ALL_FALLBACKS: &[AlignmentFallback] =
+  &[AlignmentFallback::SkipChunk, AlignmentFallback::Error];
+
+#[test]
+fn fallback_roster_is_exhaustive() {
+  // F3 tripwire. Rust cannot enumerate an enum's variants, so ALL_FALLBACKS is
+  // hand-listed; this wildcard-free match is what makes forgetting to extend it
+  // impossible to ship. Adding a variant to AlignmentFallback makes the match
+  // non-exhaustive and fails the build until the variant is handled here — the
+  // moment to also add it to ALL_FALLBACKS (they sit together). Once a variant is
+  // in the roster, every text-form test below round-trips, spells, and (under
+  // serde) serializes it.
+  for fallback in ALL_FALLBACKS {
+    match fallback {
+      AlignmentFallback::SkipChunk | AlignmentFallback::Error => {}
+    }
+  }
+}
+
 #[test]
 fn fallback_round_trips_through_its_own_text_form() {
-  // THE contract, as one property: for every variant, `as_str` → `from_str` is
-  // the identity. Written as an exhaustive slice rather than a variant-by-
-  // variant assertion so that adding a variant without a `from_str` arm fails
-  // here instead of silently becoming unparseable.
-  for fallback in [AlignmentFallback::SkipChunk, AlignmentFallback::Error] {
+  // THE contract, as one property over the exhaustive roster: for every variant,
+  // `as_str` → `from_str` is the identity. Iterating ALL_FALLBACKS (kept complete
+  // by `fallback_roster_is_exhaustive`) rather than a local slice means a new
+  // variant added without a `from_str` arm fails here instead of silently becoming
+  // unparseable.
+  for &fallback in ALL_FALLBACKS {
     let text = fallback.as_str();
     assert_eq!(
       text.parse::<AlignmentFallback>(),
@@ -60,16 +93,27 @@ fn fallback_round_trips_through_its_own_text_form() {
 
 #[test]
 fn fallback_from_str_names_the_snake_case_spelling() {
-  // The exact spellings, pinned: they are the serde wire form and the CLI/env
-  // form, so a rename is a breaking change and must be a deliberate one.
-  assert_eq!(
-    "skip_chunk".parse::<AlignmentFallback>(),
-    Ok(AlignmentFallback::SkipChunk)
-  );
-  assert_eq!(
-    "error".parse::<AlignmentFallback>(),
-    Ok(AlignmentFallback::Error)
-  );
+  // The exact spellings, pinned per variant: they are the serde wire form and the
+  // CLI/env form, so a rename is a breaking change and must be a deliberate one.
+  // The wildcard-free `match` is the F3 tripwire — a new variant must pin its own
+  // spelling here — and the loop over ALL_FALLBACKS checks every variant both
+  // spells to and parses from that literal.
+  for &fallback in ALL_FALLBACKS {
+    let spelling = match fallback {
+      AlignmentFallback::SkipChunk => "skip_chunk",
+      AlignmentFallback::Error => "error",
+    };
+    assert_eq!(
+      fallback.as_str(),
+      spelling,
+      "as_str spelling for {fallback:?} drifted from its pinned wire form"
+    );
+    assert_eq!(
+      spelling.parse::<AlignmentFallback>(),
+      Ok(fallback),
+      "`{spelling}` must parse back to {fallback:?}"
+    );
+  }
 }
 
 #[test]
@@ -110,18 +154,30 @@ fn aligner_key_is_variant_predicates() {
 #[cfg(feature = "serde")]
 #[test]
 fn fallback_serde_uses_the_same_snake_case_spelling() {
-  // One spelling across `as_str`, `FromStr` and serde, or the text form is not
-  // a round trip at all — a config file that serializes `skip_chunk` and a CLI
-  // that parses `SkipChunk` is two vocabularies wearing one type.
-  let json = serde_json::to_string(&AlignmentFallback::SkipChunk).unwrap();
-  assert_eq!(json, r#""skip_chunk""#);
-  assert_eq!(
-    json,
-    format!("\"{}\"", AlignmentFallback::SkipChunk.as_str())
-  );
-
-  let back: AlignmentFallback = serde_json::from_str(r#""error""#).unwrap();
-  assert_eq!(back, AlignmentFallback::Error);
+  // One spelling across `as_str`, `FromStr` and serde for EVERY variant, or the
+  // text form is not a round trip at all — a config file that serializes
+  // `skip_chunk` and a CLI that parses `SkipChunk` is two vocabularies wearing one
+  // type. The wildcard-free `match` is the F3 tripwire (a new variant must pin its
+  // JSON here); the loop checks each variant serializes to that literal, matches
+  // `as_str`, and deserializes back.
+  for &fallback in ALL_FALLBACKS {
+    let expected_json = match fallback {
+      AlignmentFallback::SkipChunk => r#""skip_chunk""#,
+      AlignmentFallback::Error => r#""error""#,
+    };
+    let json = serde_json::to_string(&fallback).unwrap();
+    assert_eq!(
+      json, expected_json,
+      "serde spelling for {fallback:?} drifted"
+    );
+    assert_eq!(json, format!("\"{}\"", fallback.as_str()));
+    let back: AlignmentFallback = serde_json::from_str(&json).unwrap();
+    assert_eq!(
+      back, fallback,
+      "{fallback:?} must deserialize back from its own JSON"
+    );
+  }
+  // A non-snake_case spelling must NOT deserialize — the rename guard, unchanged.
   assert!(serde_json::from_str::<AlignmentFallback>(r#""SkipChunk""#).is_err());
 }
 
