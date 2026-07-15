@@ -149,6 +149,94 @@ fn bundled_tokenizer_has_no_autodetectable_blank() {
 }
 
 // ---------------------------------------------------------------------
+// F3: options() reports EFFECTIVE (post-clamp) state, not the requested value.
+// The transform is hermetic (build the seam, read its applied coverage back);
+// the wiring through the real `Aligner::options()` is model-gated below.
+// ---------------------------------------------------------------------
+
+#[test]
+fn effective_options_reports_the_seams_clamped_coverage_not_the_requested_value() {
+  // Out-of-range requests are coerced by the seam; effective options must report
+  // the coerced value, so `Aligner::options()` never lies about the filter in
+  // force. A mutant that stored/returned the requested value fails here.
+  for (requested, effective) in [(2.0_f32, 1.0_f32), (-0.25, 0.0)] {
+    let options = AlignerOptions::new().with_min_speech_coverage(requested);
+    let seam = build_seam(Lang::En, normalizer(), &options).expect("builds");
+    let eff = effective_options(&seam, &options);
+    assert_eq!(
+      eff.min_speech_coverage(),
+      effective,
+      "requested {requested} must report as {effective}"
+    );
+    // ...and it equals the seam's own applied value exactly (the source of truth).
+    assert_eq!(eff.min_speech_coverage(), seam.min_speech_coverage().get());
+  }
+
+  // NaN → the seam's default, never NaN.
+  let options = AlignerOptions::new().with_min_speech_coverage(f32::NAN);
+  let seam = build_seam(Lang::En, normalizer(), &options).expect("builds");
+  let eff = effective_options(&seam, &options);
+  assert!(
+    !eff.min_speech_coverage().is_nan(),
+    "NaN must not survive into effective options"
+  );
+  assert_eq!(eff.min_speech_coverage(), DEFAULT_MIN_SPEECH_COVERAGE);
+  assert_eq!(eff.min_speech_coverage(), seam.min_speech_coverage().get());
+}
+
+#[test]
+fn effective_options_passes_through_the_uncoerced_fields() {
+  // Only min_speech_coverage is coerced; max_intra_silent_run and compute pass
+  // through from the request untouched. A mutant that rebuilt options from seam
+  // defaults (dropping the request) fails here.
+  let options = AlignerOptions::new()
+    .with_max_intra_silent_run(Duration::from_millis(120))
+    .with_compute(ComputeUnits::CpuAndGpu)
+    .with_min_speech_coverage(2.0);
+  let seam = build_seam(Lang::En, normalizer(), &options).expect("builds");
+  let eff = effective_options(&seam, &options);
+  assert_eq!(eff.max_intra_silent_run(), Duration::from_millis(120));
+  assert_eq!(eff.compute(), ComputeUnits::CpuAndGpu);
+  assert_eq!(eff.min_speech_coverage(), 1.0); // the one field that IS coerced
+}
+
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn aligner_options_reports_effective_coverage_after_construction() {
+  // The wiring proof: a real Aligner built with an out-of-range coverage must
+  // report the CLAMPED value through `options()`. Reverting `from_paths_with` to
+  // store the requested value fails exactly here (the mutation proof for F3's
+  // wiring, which the hermetic `effective_options` tests cannot see).
+  let aligner = Aligner::from_paths_with(
+    Lang::En,
+    &models_dir().join("base960h_aligner.mlmodelc"),
+    normalizer(),
+    AlignerOptions::new().with_min_speech_coverage(2.0),
+  )
+  .expect("load base960h_aligner.mlmodelc (set ALIGNKIT_TEST_MODELS)");
+  assert_eq!(
+    aligner.options().min_speech_coverage(),
+    1.0,
+    "options() must report the seam's clamped coverage, not the requested 2.0"
+  );
+}
+
+/// `ALIGNKIT_TEST_MODELS`, or `<workspace>/Models/alignkit` — the crate's
+/// convention, duplicated here (as `encode::tests` and `registry::tests` do)
+/// because a `src/` unit test cannot import the `tests/` integration crate.
+fn models_dir() -> std::path::PathBuf {
+  std::env::var_os("ALIGNKIT_TEST_MODELS").map_or_else(
+    || {
+      std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("Models")
+        .join("alignkit")
+    },
+    std::path::PathBuf::from,
+  )
+}
+
+// ---------------------------------------------------------------------
 // Recoverable-subset mapping — the `align_chunk` policy, tested directly.
 // ---------------------------------------------------------------------
 
