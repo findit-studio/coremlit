@@ -1190,10 +1190,15 @@ pub struct TranscriptionResult {
   /// [`Self::sampled_at_nonzero_temperature`] for the failing history that
   /// forced it.
   ///
-  /// Always written by `serde` (no `skip_serializing_if`), so a persisted
-  /// transcript never quietly loses it. `serde(default)` for a partial
-  /// record, matching every other field of this type.
-  #[cfg_attr(feature = "serde", serde(default))]
+  /// Always written by `serde` (no `skip_serializing_if`) and **required on
+  /// deserialize** (no `serde(default)`, unlike the rest of this type): a
+  /// dropped flag would read back `false` — "never sampled", the optimistic
+  /// answer — and hand
+  /// [`Provenance::is_reproducible`](crate::provenance::Provenance::is_reproducible)
+  /// a byte-reproducibility guarantee the run never earned. That is the one
+  /// direction this must never silently fail in, so a record missing the key
+  /// is rejected rather than defaulted — exactly as the same carried fact is
+  /// on [`Provenance`](crate::provenance::Provenance) (see `provenance::tests`).
   sampled_at_nonzero_temperature: bool,
 }
 

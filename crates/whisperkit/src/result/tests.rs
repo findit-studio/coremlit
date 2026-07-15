@@ -822,6 +822,41 @@ fn transcription_result_serde_skips_absent_seek_time() {
 
 #[cfg(feature = "serde")]
 #[test]
+fn sampled_at_nonzero_temperature_is_required_on_deserialize() {
+  // F1 (codex round 2). The flag must never silently default to `false`
+  // ("never sampled", the optimistic answer) when a persisted record drops
+  // it: a blank-dropped result whose sampled window was filtered away carries
+  // the fact ONLY here, and a `false` default would hand
+  // `Provenance::is_reproducible` a guarantee the run never earned. Mirrors
+  // the same requirement on `Provenance`'s carried flag
+  // (`provenance::tests::a_record_missing_a_library_known_field_is_rejected`).
+  let sampled_empty = TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
+    .with_sampled_at_nonzero_temperature();
+  let value: serde_json::Value = serde_json::to_value(&sampled_empty).unwrap();
+  // The intact record round-trips, or the removal below proves nothing.
+  assert_eq!(
+    serde_json::from_value::<TranscriptionResult>(value.clone()).unwrap(),
+    sampled_empty
+  );
+
+  // Drop the key: it must FAIL, not default to `false`.
+  let mut without = value;
+  assert!(
+    without
+      .as_object_mut()
+      .unwrap()
+      .remove("sampled_at_nonzero_temperature")
+      .is_some(),
+    "the flag is always serialized, so the key must have been present"
+  );
+  assert!(
+    serde_json::from_value::<TranscriptionResult>(without).is_err(),
+    "a dropped `sampled_at_nonzero_temperature` must be rejected, not read back false"
+  );
+}
+
+#[cfg(feature = "serde")]
+#[test]
 fn decoding_result_serde_round_trips_and_skips_empty_collections() {
   let r = DecodingResult::new().with_text("hi");
   let json = serde_json::to_string(&r).unwrap();
