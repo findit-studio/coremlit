@@ -14,8 +14,13 @@
 //!
 //! # The definition
 //!
-//! On a 10 ms frame grid (Kaldi/`md-eval` convention; the reference RTTM is
-//! itself 10 ms-quantized), after (a) a 0.25 s no-score collar on each side of
+//! On a 10 ms frame grid (the Kaldi/`md-eval` *scoring* convention — NOT the
+//! reference's own resolution: the RTTM's segment DURATIONS are integer
+//! multiples of pyannote's 16.875 ms output-frame step, and its absolute
+//! boundaries carry the sliding-window origin offset, so they lie on neither a
+//! 16.875 ms nor a 10 ms grid; the 10 ms scoring grid is finer than that
+//! 16.875 ms data step, so it oversamples the reference and changes no verdict),
+//! after (a) a 0.25 s no-score collar on each side of
 //! every reference-segment boundary and (b) optionally excluding frames with
 //! more than one reference speaker (`skip_overlap`), with the optimal
 //! one-to-one speaker mapping (the assignment that maximizes matched reference
@@ -48,8 +53,10 @@
 
 use std::{collections::BTreeSet, path::Path};
 
-/// DER frame-grid step in seconds (10 ms — the Kaldi/`md-eval` convention;
-/// the pyannote reference RTTM is itself quantized to 10 ms frames).
+/// DER frame-grid step in seconds (10 ms — the Kaldi/`md-eval` *scoring*
+/// convention). This is the scoring resolution, NOT the reference's own: the
+/// pyannote RTTM's segment durations are multiples of its 16.875 ms
+/// output-frame step, which this finer 10 ms grid oversamples.
 pub const DER_STEP_S: f64 = 0.010;
 
 /// Standard scoring collar in seconds, applied on EACH side of every
@@ -328,8 +335,8 @@ pub fn der(reference: &[Seg], hypothesis: &[Seg], collar: f64, skip_overlap: boo
 }
 
 /// The standard-collar DER (0.25 s collar, overlap excluded) — the DIHARD /
-/// NIST / pyannote convention used for the absolute-accuracy numbers, and the
-/// metric the spec's "DER" names. This is what gates.
+/// NIST / pyannote convention used for the absolute distance-to-reference
+/// numbers, and the metric the spec's "DER" names. This is what gates.
 pub fn der_std(reference: &[Seg], hypothesis: &[Seg]) -> Der {
   der(reference, hypothesis, DER_COLLAR_S, true)
 }

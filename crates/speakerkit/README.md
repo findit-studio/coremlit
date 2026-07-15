@@ -74,9 +74,9 @@ path inside this crate, not just a different weights file.
 | Segmenter output | raw powerset logits `[1,589,7]` | already decoded, in-graph: `speaker_ids`/`speaker_activity`/`overlapped_speaker_activity`/… |
 | Decode semantics | **host-side**, in this crate — ports `dia`'s exact powerset/mask/window decode | **in-graph** — argmax's own semantics; this crate only reads the result |
 | Tier-1 fidelity ("did we read the model right") | relies on the tier-2 dia-ort check below; a dedicated FluidAudio Swift oracle is deferred/optional (no FluidAudio CLI) | argmax's own Swift (`argmax-oss-swift`'s `SpeakerSegmenterModel`/`SpeakerEmbedderModel`, via an out-of-tree harness since argmax's `DiarizeCLI` only emits post-clustering RTTM) |
-| Tier-2 accuracy ("is the decision right") vs fp32 `dia`-ort | seg **99.97%** decision-level agreement (99.9717%, 3533/3534 frames); embed cosine **0.99999989** worst | seg **99.98%** cell agreement (Baseline); embed cosine **mean ~0.94, worst ~0.83** |
-| Tier-3 accuracy (DER, end to end through `dia`'s clustering) | **validated** on 1-2 speakers (0.0000%); on multi-speaker audio it stays *decision*-correct (speaker count always right) but is **not** frame-exact — see the table below | **CHARACTERIZED, NOT VALIDATED** — exact at 1-2 speakers, then 3.3-9.3% DER on three of the four multi-speaker clips |
-| Measured status | **validated** (default; see the multi-speaker caveat below) | tensor-fidelity **validated** (72447/72447 segmentation cells EXACT, 123/123 embedding rows bit-identical vs argmax's own Swift); clustering accuracy **CHARACTERIZED, NOT VALIDATED** |
+| Tier-2 agreement ("does the decision match dia-ort") vs fp32 `dia`-ort | seg **99.97%** decision-level agreement (99.9717%, 3533/3534 frames); embed cosine **0.99999989** worst | seg **99.98%** cell agreement (Baseline); embed cosine **mean ~0.94, worst ~0.83** |
+| Tier-3 parity (DER vs the reference, end to end through `dia`'s clustering) | **validated** on 1-2 speakers (0.0000%); on multi-speaker audio it stays *decision*-faithful (speaker count always matches the reference) but is **not** frame-exact — see the table below | **CHARACTERIZED, NOT VALIDATED** — exact at 1-2 speakers, then 3.3-9.3% DER on three of the four multi-speaker clips |
+| Measured status | **validated** (default; see the multi-speaker caveat below) | tensor-fidelity **validated** (72447/72447 segmentation cells EXACT, 123/123 embedding rows bit-identical vs argmax's own Swift); clustering parity **CHARACTERIZED, NOT VALIDATED** |
 
 **The two sources can produce different diarization results on the same
 audio — by design.** `Options::source` is a real tradeoff the caller picks,
@@ -346,8 +346,8 @@ see `tests/swift/regen_goldens.sh`.
   0.1% parity bound on two of them (see the second warning above). Its speaker
   *count* decision is always right. A dedicated tier-1 fidelity oracle
   (FluidAudio's own Swift) is deferred/optional — FluidAudio ships a library,
-  not a CLI, so the tier-2 `dia`-ort accuracy check is what stands in for it.
-- **argmax source: tensor-fidelity validated, clustering accuracy CHARACTERIZED,
+  not a CLI, so the tier-2 `dia`-ort agreement check is what stands in for it.
+- **argmax source: tensor-fidelity validated, clustering parity CHARACTERIZED,
   NOT VALIDATED.** Bit-exact/near-exact against argmax's own Swift decode
   (tier 1) — the strongest gate this crate has for any source. But end to end it
   **fails on multi-speaker audio** (see the first warning above): exact at 1-2
