@@ -96,11 +96,19 @@ fn es_tiny_matches_golden_tokens_and_segments() {
   // as `Options::new()` above.
   let options = DecodingOptions::new().with_language("es");
   let result = kit.transcribe(&audio, &options).unwrap();
-  // Clean speech at temperature 0 must never enter the fallback ladder —
-  // the ladder's t > 0 attempts draw from an unseeded RNG, so pinning
-  // zero fallbacks turns any future ladder-triggering regression into one
-  // deterministic, attributable failure instead of a flake-flavored one.
-  assert_eq!(result.timings().total_decoding_fallbacks(), 0.0);
+  // Clean speech at temperature 0 must never draw from the token sampler —
+  // the fallback ladder's t != 0 attempts sample from an unseeded RNG, so a
+  // ladder-triggering regression would make this decode non-reproducible.
+  // Asserted via the carried sampling flag, NOT
+  // `total_decoding_fallbacks()`: that counter stores the ZERO-BASED index
+  // of the last fallback (transcribe/mod.rs:846), so its FIRST fallback
+  // writes 0.0 — indistinguishable from "never fell back", making
+  // `== 0.0` vacuous. The flag is unambiguous, and also catches a sampled
+  // window that a later lossy filter removed.
+  assert!(
+    !result.sampled_at_nonzero_temperature(),
+    "clean speech must decode greedily; no window drew from the unseeded sampler"
+  );
 
   if std::env::var_os("UPDATE_GOLDEN").is_some() {
     // Fallback-path writer (mirrors parity_jfk.rs's Task 13 Step
