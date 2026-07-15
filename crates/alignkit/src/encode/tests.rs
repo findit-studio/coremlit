@@ -122,19 +122,25 @@ fn encoder_input_from_samples_binds_real_length_to_the_slice() {
 }
 
 #[test]
-fn encoder_input_from_prepared_takes_real_length_from_unpadded_audio_not_the_buffer() {
-  // The pipeline case: 200 real samples that asry silence-masks and zero-pads to
-  // the 400-sample receptive field. The real length is the UNPADDED audio (200),
-  // never the padded buffer's length (400). The F1 defect passed
-  // `encoder_input.len()` (400) as the real count, yielding 2 frames where 1
-  // belongs.
-  let real_audio = vec![0.1f32; 200];
+fn encoder_input_gate_binds_real_length_independent_of_the_padded_buffer() {
+  // The pipeline geometry: 200 real samples that asry silence-masks and zero-pads
+  // to the 400-sample receptive field. The gate every constructor funnels through
+  // records the real length as the UNPADDED count (200), never the padded buffer's
+  // length (400). `from_prepared` reads exactly this (buffer, real_samples) pair
+  // off an unforgeable `PreparedChunk`; here we drive the gate directly so the
+  // geometry is pinned with no model and no seam (the end-to-end `from_prepared`
+  // door, on a real chunk, is `tests/prepared_composition.rs`). The F1 defect
+  // recorded `encoder_input.len()` (400) as the real count, yielding 2 frames
+  // where 1 belongs.
+  let real_len = 200usize;
   let padded_buffer = vec![0.0f32; 400];
-  let input = EncoderInput::from_prepared(&padded_buffer, &real_audio).expect("valid geometry");
+  let input = EncoderInput::new(&padded_buffer, real_len).expect("valid geometry");
   assert_eq!(input.real_samples, 200); // NOT 400
   assert_eq!(input.encoder_input.len(), 400);
   assert_eq!(truncated_frame_count(input.real_samples, 2_999), 1); // ceil(200/320)
-  // The buffer-length answer is now unreachable.
+  // The buffer-length count (2) is the F1 bug — exactly what `from_samples` on the
+  // padded buffer would produce, which is why the padded buffer must never take
+  // that door.
   assert_eq!(truncated_frame_count(400, 2_999), 2); // the buggy count
   assert_ne!(
     truncated_frame_count(input.real_samples, 2_999),

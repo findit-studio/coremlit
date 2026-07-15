@@ -111,7 +111,7 @@
 use core::num::NonZeroUsize;
 use std::{borrow::Cow, path::Path};
 
-use asry::emissions::Emissions;
+use asry::emissions::{Emissions, PreparedChunk};
 use coremlit::{ComputeUnits, DataType, Model, MultiArray};
 
 use crate::error::{AlignError, AlignerError};
@@ -454,14 +454,21 @@ fn check_log_prob_floor(data: &[f32], compute: ComputeUnits) -> Result<(), Align
 /// - [`from_samples`](Self::from_samples) — the standalone / raw door. The
 ///   buffer IS the real audio, so both lengths are one slice's `.len()` and
 ///   cannot disagree.
-/// - the crate-private pipeline door taken by
-///   [`Aligner::align_chunk`](crate::aligner::Aligner::align_chunk), which reads
-///   the real length from the unpadded `samples` slice it handed `prepare`,
-///   never from asry's padded buffer.
+/// - [`from_prepared`](Self::from_prepared) — the composition door. Reads BOTH
+///   the padded buffer and the true pre-pad real length off one
+///   [`PreparedChunk`] — the capability token
+///   only asry's `prepare` can mint — so the two are drawn from the same
+///   authoritative object and cannot be paired wrong. It is the door
+///   [`Aligner::align_chunk`](crate::aligner::Aligner::align_chunk) takes AND the
+///   one an external `prepare` → `Encoder` → `finish` composer takes.
 ///
-/// There is deliberately **no** public `(buffer, count)` constructor: exposing
-/// one would re-open exactly the bug class this seam exists to close (the same
-/// reason asry keeps `PreparedChunk::real_samples` crate-private). The fixed
+/// There is deliberately **no** public `(buffer, count)` constructor: a free
+/// `real_samples: usize` supplied alongside a buffer is exactly the forgeable
+/// pair this type exists to delete. `from_prepared` is safe to expose precisely
+/// because it takes neither a loose integer nor a loose buffer — it reads both
+/// off the unforgeable [`PreparedChunk`], whose
+/// [`real_samples`](asry::emissions::PreparedChunk::real_samples) is asry's own
+/// pre-pad `samples.len()`, not a number the caller gets to choose. The fixed
 /// window ceiling `encoder_input.len() <= `[`ENCODER_WINDOW_SAMPLES`] is checked
 /// here, at construction — so invalid geometry is rejected BEFORE any prediction
 /// runs, and by the time [`Encoder::emissions`] holds an `EncoderInput` there is
@@ -477,11 +484,19 @@ pub struct EncoderInput<'a> {
 }
 
 impl<'a> EncoderInput<'a> {
-  /// A raw-audio encoder input: `samples` is both the buffer the model runs on
-  /// AND the real audio it represents, so `real_samples == samples.len()` and a
-  /// mismatch between them is impossible by construction. This is the door a
-  /// standalone [`Encoder`] caller takes; the alignment pipeline uses the
-  /// crate-private masked-buffer door instead (see the type doc).
+  /// A raw-audio encoder input for **un-prepared** samples: `samples` is both the
+  /// buffer the model runs on AND the real audio it represents, so
+  /// `real_samples == samples.len()` and a mismatch between them is impossible by
+  /// construction.
+  ///
+  /// This door is for genuinely raw audio only. Do **not** hand it a
+  /// [`PreparedChunk`]'s
+  /// [`encoder_input`](asry::emissions::PreparedChunk::encoder_input): that buffer
+  /// is receptive-field-padded, so its `.len()` is the PADDED count and recording
+  /// it as real is the F1 defect (200 real samples padded to 400 →
+  /// `ceil(400/320) = 2` frames kept where `ceil(200/320) = 1` belongs). A
+  /// prepared chunk must use [`from_prepared`](Self::from_prepared), which reads
+  /// the true pre-pad length off the chunk itself.
   ///
   /// `samples` shorter than [`ENCODER_WINDOW_SAMPLES`] is zero-padded up to the
   /// full window inside [`Encoder::emissions`]; longer is rejected here.
@@ -495,27 +510,32 @@ impl<'a> EncoderInput<'a> {
     Self::new(samples, samples.len())
   }
 
-  /// The pipeline door: asry's silence-masked, receptive-field-padded
-  /// `encoder_input` buffer, with the real length taken from the UNPADDED
-  /// `real_audio` slice handed to `prepare` — NOT from the padded buffer's own
-  /// length.
+  /// The composition door: build straight from asry's [`PreparedChunk`], reading
+  /// BOTH the silence-masked, receptive-field-padded
+  /// [`encoder_input`](asry::emissions::PreparedChunk::encoder_input) buffer AND
+  /// the true pre-pad real length
+  /// ([`real_samples`](asry::emissions::PreparedChunk::real_samples)) off the one
+  /// object — so the length that drives truncation is asry's own `samples.len()`,
+  /// never a count the caller pairs with the buffer by hand.
   ///
-  /// Crate-private on purpose. The only legitimate producer of a padded encoder
-  /// buffer is asry's `prepare`, reached through
-  /// [`Aligner::align_chunk`](crate::aligner::Aligner::align_chunk), which
-  /// passes the very `samples` slice it prepared; both come from one call site
-  /// that cannot get them out of step. A *public* `(buffer, real_audio)` door
-  /// would let a caller pair a padded buffer with an unrelated length and
-  /// re-create the F1 defect, so there isn't one.
+  /// This is the door for a caller who drives the supported seam directly —
+  /// `EmissionsAligner::prepare` → this [`Encoder`] → `EmissionsAligner::finish` —
+  /// and it is what [`Aligner::align_chunk`](crate::aligner::Aligner::align_chunk)
+  /// uses internally too. Exposing it is safe *because* the [`PreparedChunk`] is
+  /// unforgeable (only asry's `prepare` mints one) and carries both lengths
+  /// together: there is no way to hand this door a padded buffer with a mismatched
+  /// real count. Reaching for [`from_samples`](Self::from_samples) on
+  /// `prepared.encoder_input()` instead — treating the 400 padded samples as 400
+  /// real ones — is exactly the F1 hole this closes.
   ///
   /// # Errors
-  /// [`AlignError::InputTooLong`] if the buffer exceeds
-  /// [`ENCODER_WINDOW_SAMPLES`].
-  pub(crate) fn from_prepared(
-    encoder_input: &'a [f32],
-    real_audio: &[f32],
-  ) -> Result<Self, AlignError> {
-    Self::new(encoder_input, real_audio.len())
+  /// [`AlignError::InputTooLong`] if the prepared buffer exceeds
+  /// [`ENCODER_WINDOW_SAMPLES`]. asry's own per-chunk cap is far looser than this
+  /// crate's fixed 60 s window (see the module doc's "60 s clamp" section), so a
+  /// chunk asry accepted can still be too long for this encoder; it is rejected
+  /// here, at construction, before any prediction.
+  pub fn from_prepared(prepared: &'a PreparedChunk<'_>) -> Result<Self, AlignError> {
+    Self::new(prepared.encoder_input(), prepared.real_samples())
   }
 
   /// The single geometry gate both constructors funnel through, run at
@@ -723,11 +743,14 @@ impl Encoder {
   /// `input` is an [`EncoderInput`]: the buffer the model runs on, bound to the
   /// count of real (pre-pad) audio samples that drives the truncation. A
   /// standalone caller builds one from raw audio with
-  /// [`EncoderInput::from_samples`] (buffer == real audio); the alignment
-  /// pipeline builds it from asry's already-masked, receptive-field-padded
-  /// `PreparedChunk::encoder_input()` bound to the unpadded `samples.len()` it
-  /// prepared, so this method never re-implements the mask. Either way the two
-  /// lengths are captured together from the audio and cannot disagree — that
+  /// [`EncoderInput::from_samples`] (buffer == real audio); a `prepare` → encode
+  /// → `finish` composer (including this crate's own
+  /// [`Aligner`](crate::aligner::Aligner)) builds it from asry's already-masked,
+  /// receptive-field-padded [`PreparedChunk`] with
+  /// [`EncoderInput::from_prepared`], which reads the padded buffer and the true
+  /// pre-pad `real_samples` off the one chunk, so this method never re-implements
+  /// the mask. Either way the two lengths are captured together from the audio and
+  /// cannot disagree — that
   /// binding is the whole reason [`EncoderInput`] exists rather than a
   /// `(&[f32], usize)` pair (see its doc). A buffer shorter than
   /// [`ENCODER_WINDOW_SAMPLES`] is zero-padded up to the full window before
