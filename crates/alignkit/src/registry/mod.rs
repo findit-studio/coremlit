@@ -25,9 +25,13 @@
 //! `Send + Sync`. Until then the mutex-free design buys single-threaded reuse
 //! and one less lock in the hot path, not free cross-thread sharing.
 
+use core::sync::atomic::AtomicBool;
 use std::collections::HashMap;
 
-use asry::{Lang, emissions::OovEvent};
+use asry::{
+  AlignmentResult, Lang, TimeRange,
+  emissions::{OovEvent, OutputClock, ResolvedOov},
+};
 
 use crate::{aligner::Aligner, error::AlignError};
 
@@ -231,6 +235,134 @@ impl AlignmentSet {
     }
     Ok(events)
   }
+
+  /// Align one chunk end-to-end through the aligner registered for `language`,
+  /// applying the strict `Lang → Any → fallback` lookup and — crucially —
+  /// crossing the caller's requested-language OOV decisions safely into the
+  /// aligner that actually runs.
+  ///
+  /// This is the registry-owned counterpart to
+  /// [`Aligner::align_chunk`](crate::aligner::Aligner::align_chunk): call it
+  /// with the SAME `language` you passed to [`Self::detect_oov`] and the same
+  /// caller-resolved `oov_decisions` (in that order); the remaining arguments
+  /// are [`Aligner::align_chunk`](crate::aligner::Aligner::align_chunk)'s,
+  /// forwarded unchanged.
+  ///
+  /// # Why a registry-level align is needed at all
+  ///
+  /// [`Self::detect_oov`] stamps every OOV event with the *requested* language
+  /// (so per-language OOV policy keys on it), but the bound aligner's
+  /// `EmissionsAligner::prepare` validates decisions against the aligner's OWN
+  /// construction language. When those differ — an English [`AlignerKey::Any`]
+  /// aligner serving a Chinese request — handing that aligner the
+  /// requested-language decisions directly fails with a hard decision-language
+  /// error, so `Any`-fallback alignment breaks the moment any OOV decision is
+  /// present. This method reconciles the two: it validates the decisions carry
+  /// `language`, then re-stamps them to the bound aligner's language before
+  /// aligning. The decision CONTENT (wildcard / fail-closed, chosen by the
+  /// caller's per-`language` policy) is positional and unchanged; only the
+  /// language tag is crossed, and asry's `ResolvedOov` positional identity
+  /// ignores it. There is deliberately **no** caller-controlled
+  /// expected-language knob — that is exactly the guard bypass this reconciles.
+  ///
+  /// An [`AlignerKey::Lang`]`(L)` hit needs no crossing (the decisions already
+  /// carry `L`), so it forwards straight through and the aligner's own guard
+  /// validates them.
+  ///
+  /// # Registry miss
+  ///
+  /// On a miss (no `Lang(language)`, no `Any`) the configured
+  /// [`AlignmentFallback`] decides: [`AlignmentFallback::SkipChunk`] returns an
+  /// empty [`AlignmentResult`] (the ASR text survives, only per-word timings are
+  /// dropped); [`AlignmentFallback::Error`] returns
+  /// [`AlignError::LanguageUnsupported`].
+  ///
+  /// # Errors
+  /// [`AlignError::DecisionLanguage`] if an `oov_decisions` entry does not carry
+  /// `language`. [`AlignError::LanguageUnsupported`] on a miss under
+  /// [`AlignmentFallback::Error`]. Otherwise any error
+  /// [`Aligner::align_chunk`](crate::aligner::Aligner::align_chunk) itself
+  /// returns.
+  // Mirrors `Aligner::align_chunk`'s argument surface (already at the 7-arg
+  // limit) plus the registry's `language` lookup key, so a caller uses the exact
+  // call shape they already know rather than an opaque params struct. Same
+  // rationale as whisperkit's Swift-mirroring signatures.
+  #[allow(clippy::too_many_arguments)]
+  pub fn align_chunk(
+    &self,
+    language: &Lang,
+    samples: &[f32],
+    sub_segments: &[TimeRange],
+    text: &str,
+    clock: OutputClock,
+    abort_flag: &AtomicBool,
+    oov_decisions: &[ResolvedOov],
+  ) -> Result<AlignmentResult, AlignError> {
+    match self.lookup(language) {
+      AlignmentLookup::Hit { aligner, .. } => {
+        // Requested language == the aligner's own language, so decisions the
+        // caller resolved for `language` already carry the tag the aligner's
+        // `prepare` expects. Forward unchanged and let that guard validate them.
+        aligner.align_chunk(
+          samples,
+          sub_segments,
+          text,
+          clock,
+          abort_flag,
+          oov_decisions,
+        )
+      }
+      AlignmentLookup::AnyFallback { aligner } => {
+        // The Any aligner's language differs from the request. Validate the
+        // decisions were resolved for the REQUESTED language (so we are not
+        // masking a wrong-policy payload), then cross them into the aligner's
+        // own language — the only tag its `prepare` will accept.
+        let crossed = cross_decisions_into(oov_decisions, language, aligner.language_ref())?;
+        aligner.align_chunk(samples, sub_segments, text, clock, abort_flag, &crossed)
+      }
+      AlignmentLookup::Miss { fallback } => match fallback {
+        AlignmentFallback::SkipChunk => Ok(AlignmentResult::new(Vec::new())),
+        AlignmentFallback::Error => Err(AlignError::LanguageUnsupported {
+          language: language.clone(),
+        }),
+      },
+    }
+  }
+}
+
+/// Cross caller-resolved OOV decisions from the `requested` language into
+/// `aligner_language`, for an [`AlignerKey::Any`] fallback.
+///
+/// Validates every decision carries `requested` (else
+/// [`AlignError::DecisionLanguage`]), then returns a copy re-stamped to
+/// `aligner_language`. Only the language tag changes; the
+/// [`OovDecision`](asry::emissions::OovDecision) is positional and preserved,
+/// and asry's [`ResolvedOov`] positional identity deliberately ignores language
+/// — so the re-stamped decisions apply exactly the caller's
+/// per-`requested`-language policy at the same positions while satisfying the
+/// bound aligner's own-language guard.
+///
+/// When `requested == aligner_language` (an `Any` aligner serving its own
+/// language) it is a validated clone.
+fn cross_decisions_into(
+  decisions: &[ResolvedOov],
+  requested: &Lang,
+  aligner_language: &Lang,
+) -> Result<Vec<ResolvedOov>, AlignError> {
+  let mut crossed = Vec::with_capacity(decisions.len());
+  for (index, resolved) in decisions.iter().enumerate() {
+    if resolved.event().language() != requested {
+      return Err(AlignError::DecisionLanguage {
+        index,
+        requested: requested.clone(),
+        found: resolved.event().language().clone(),
+      });
+    }
+    let mut event = resolved.event().clone();
+    event.set_language(aligner_language.clone());
+    crossed.push(ResolvedOov::new(event, resolved.decision()));
+  }
+  Ok(crossed)
 }
 
 /// Builder for [`AlignmentSet`]. Mirrors the crate's `with_`/`set_` builder
