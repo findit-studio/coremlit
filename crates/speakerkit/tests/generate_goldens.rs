@@ -10,10 +10,18 @@
 //!
 //! Gated on the `dia` feature so the default build compiles this file to
 //! nothing (it links `ort` + a 27 MB ONNX otherwise). `#[ignore]` so it never
-//! runs in an ordinary `cargo test`; regenerate with:
+//! runs in an ordinary `cargo test`, AND gated on the `UPDATE_GOLDEN`
+//! environment variable so it never rewrites the committed oracle as a *side
+//! effect* of a routine `--ignored` sweep (whisperkit's convention, see
+//! `crates/whisperkit/tests/parity_jfk.rs`): `cargo test -p speakerkit
+//! --features dia -- --ignored` runs every `#[ignore]` test including this one,
+//! so without the env guard that standard gate would silently re-baseline the
+//! goldens it exists to validate. Without `UPDATE_GOLDEN` set this test is an
+//! explicit no-op that touches nothing; regeneration is a deliberate,
+//! human-verified act:
 //!
 //! ```text
-//! cargo test -p speakerkit --features dia --test generate_goldens -- --ignored --nocapture
+//! UPDATE_GOLDEN=1 cargo test -p speakerkit --features dia --test generate_goldens -- --ignored --nocapture
 //! ```
 //!
 //! Provisioning (proven working standalone before this harness was wired):
@@ -106,8 +114,27 @@ fn derive_slot_masks(chunk_segs: &[f64], num_frames: usize) -> [Option<Vec<bool>
 }
 
 #[test]
-#[ignore = "regenerates committed goldens; needs `dia` feature + ort + wespeaker ONNX"]
+#[ignore = "rewrites committed goldens; set UPDATE_GOLDEN=1 + `dia` feature + ort + wespeaker ONNX"]
 fn generate_goldens() {
+  // WRITE GUARD (whisperkit's `UPDATE_GOLDEN` convention, `parity_jfk.rs`):
+  // this test's whole body OVERWRITES the committed golden oracle
+  // (`tests/fixtures/golden/*.json`), so it must never fire from a routine
+  // `cargo test -p speakerkit --features dia -- --ignored` — that gate runs
+  // every `#[ignore]` test, and an unconditional writer here silently
+  // re-baselines the very oracle `tests/parity_seg.rs` / `parity_embed.rs`
+  // validate against. Unset ⇒ explicit no-op: no models loaded, no files
+  // touched, so the standard gate leaves the working tree clean. The freshly
+  // computed tensors are gated against the committed goldens by those parity
+  // suites; the `seg_model` provenance label by the hermetic
+  // `tests/golden_metadata.rs`. Regenerating is deliberate and human-verified.
+  if std::env::var_os("UPDATE_GOLDEN").is_none() {
+    eprintln!(
+      "generate_goldens: UPDATE_GOLDEN unset — no-op (committed goldens left \
+       untouched). Set UPDATE_GOLDEN=1 to regenerate, then human-verify the diff."
+    );
+    return;
+  }
+
   let onnx = wespeaker_onnx_path();
   assert!(
     onnx.exists(),
@@ -190,7 +217,10 @@ fn generate_goldens() {
       "source": fixture.source,
       "wav_sha256": fixture.sha256,
       "sample_count": samples.len(),
-      "seg_model": "segmentation-3.0.onnx (dia bundled, ort CPU EP, powerset log-probabilities)",
+      // Legacy provenance label, pinned in `common` and kept verbatim to match
+      // the committed oracle (the values are log-probabilities — see
+      // `common::SEG_MODEL_LABEL` and `speakerkit::segment`'s module doc).
+      "seg_model": common::SEG_MODEL_LABEL,
       "embed_model": "wespeaker_resnet34_lm.onnx (dia BYO, ort CPU EP, fp32)",
       "onset": ONSET,
       "num_chunks": chunks.len(),
