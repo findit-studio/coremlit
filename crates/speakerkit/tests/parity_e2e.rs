@@ -512,10 +512,20 @@ fn e2e_fixture_names() -> Vec<&'static str> {
 
 /// Tolerance on a pinned DER, absolute (0.05 pp). Tight: the CpuOnly pipelines
 /// are deterministic (Part A asserts bit-identical reruns), and the smallest
-/// degradation pinned below is 3.3 pp — 66× this band. Any clustering-decision
-/// change moves DER by whole points and fires immediately; the band exists only
-/// to absorb a stray flipped frame on a different CoreML build, not to hide
-/// movement. Never widen it to make a pin pass.
+/// argmax degradation pinned below is 3.3 pp — 66× this band. Any
+/// clustering-decision change moves DER by whole points and fires immediately;
+/// the band exists only to absorb a stray flipped frame on a different CoreML
+/// build, not to hide movement. Never widen it to make a pin pass.
+///
+/// **This band is WIDER than the margin by which the faithful source breaches
+/// [`PARITY_DER_MAX`]** (clip 12's `fa_vs_dia` clears the 0.1 % bound by only
+/// 0.0191 pp, well inside 0.05 pp). So the tolerance ALONE would let a
+/// pinned-breaching clip drift back under the bound in-tolerance — the breach
+/// warning would vanish and the crate README's "breaches on two clips" claim
+/// would go silently false with no red gate (finding 1). [`assert_pinned`]
+/// closes that: a measurement and its pin must also land on the SAME SIDE of
+/// [`PARITY_DER_MAX`], so a bound crossing is always a deliberate re-baseline,
+/// never a tolerance no-op.
 const DER_PIN_TOL: f64 = 0.0005;
 
 /// What the pipeline ACTUALLY does, per clip, end to end — the executable form
@@ -594,6 +604,15 @@ struct DerPin {
   /// FluidAudio's standard parity DER against dia-ort — the T7 claim, measured
   /// per clip. Above [`PARITY_DER_MAX`] on `12` and `14`; see finding 2 above.
   fa_vs_dia: f64,
+  /// ...of which CONFUSION — the KIND of the parity result, pinned so a breach
+  /// cannot silently change character. On the two clips that breach
+  /// [`PARITY_DER_MAX`] (`12`, `14`) essentially all of `fa_vs_dia` is confusion
+  /// (a clustering divergence the collar cannot absorb), which is the whole
+  /// reason the breach is a finding and not benign boundary jitter; on the clean
+  /// and near-clean clips it is zero (clip 06's small error is boundary MISS, so
+  /// its confusion is 0.0 too). The breach warning already prints these units —
+  /// pinning the fraction turns that report into a gate (finding 1).
+  fa_vs_dia_confusion: f64,
   /// FluidAudio's standard DER against the pyannote reference.
   fa_vs_reference: f64,
   /// Speakers the ArgmaxSource's clustering DECIDES on. Compare with
@@ -618,6 +637,7 @@ const DER_PINS: &[DerPin] = &[
   DerPin {
     name: "02_pyannote_sample",
     fa_vs_dia: 0.0,
+    fa_vs_dia_confusion: 0.0,
     fa_vs_reference: 0.0,
     ax_speakers: 2,
     ax_vs_reference: 0.0,
@@ -627,6 +647,7 @@ const DER_PINS: &[DerPin] = &[
   DerPin {
     name: "07_yuhewei_dongbei_english",
     fa_vs_dia: 0.0,
+    fa_vs_dia_confusion: 0.0,
     fa_vs_reference: 0.0,
     ax_speakers: 2,
     ax_vs_reference: 0.0,
@@ -636,6 +657,7 @@ const DER_PINS: &[DerPin] = &[
   DerPin {
     name: "04_three_speaker",
     fa_vs_dia: 0.0,
+    fa_vs_dia_confusion: 0.0,
     fa_vs_reference: 0.0,
     ax_speakers: 1,
     ax_vs_reference: 0.0,
@@ -645,6 +667,7 @@ const DER_PINS: &[DerPin] = &[
   DerPin {
     name: "05_four_speaker",
     fa_vs_dia: 0.0,
+    fa_vs_dia_confusion: 0.0,
     fa_vs_reference: 0.0,
     ax_speakers: 2,
     ax_vs_reference: 0.0,
@@ -656,6 +679,7 @@ const DER_PINS: &[DerPin] = &[
   DerPin {
     name: "06_long_recording",
     fa_vs_dia: 0.000_909,
+    fa_vs_dia_confusion: 0.0,
     fa_vs_reference: 0.000_908,
     ax_speakers: 3,
     ax_vs_reference: 0.000_908,
@@ -665,6 +689,7 @@ const DER_PINS: &[DerPin] = &[
   DerPin {
     name: "14_mrbeast_strongman_robot",
     fa_vs_dia: 0.003_948,
+    fa_vs_dia_confusion: 0.003_895,
     fa_vs_reference: 0.003_961,
     ax_speakers: 5,
     ax_vs_reference: 0.092_934,
@@ -674,6 +699,7 @@ const DER_PINS: &[DerPin] = &[
   DerPin {
     name: "10_mrbeast_clean_water",
     fa_vs_dia: 0.0,
+    fa_vs_dia_confusion: 0.0,
     fa_vs_reference: 0.0,
     ax_speakers: 8,
     ax_vs_reference: 0.033_282,
@@ -683,6 +709,7 @@ const DER_PINS: &[DerPin] = &[
   DerPin {
     name: "12_mrbeast_schools",
     fa_vs_dia: 0.001_191,
+    fa_vs_dia_confusion: 0.001_178,
     fa_vs_reference: 0.001_178,
     ax_speakers: 15,
     ax_vs_reference: 0.034_582,
@@ -703,7 +730,14 @@ fn der_pin(name: &str) -> &'static DerPin {
     .unwrap_or_else(|| panic!("{name}: no DER_PINS row — measure it and pin it before gating"))
 }
 
-/// Assert a pinned DER, in both directions.
+/// Assert a pinned DER, in both directions — AND that a drift within the
+/// tolerance band cannot silently carry the value ACROSS the spec's parity
+/// bound (finding 1). [`DER_PIN_TOL`] is wider than the margin by which the
+/// breach clips clear [`PARITY_DER_MAX`], so `(measured − pinned).abs() ≤ tol`
+/// alone would let a pinned-breaching clip drift back under the bound — the
+/// breach warning would disappear with no red gate. Requiring the measurement
+/// and its pin to sit on the SAME SIDE of the bound makes any bound crossing a
+/// deliberate re-baseline instead of a tolerance no-op.
 fn assert_pinned(name: &str, what: &str, measured: f64, pinned: f64) {
   assert!(
     (measured - pinned).abs() <= DER_PIN_TOL,
@@ -713,6 +747,23 @@ fn assert_pinned(name: &str, what: &str, measured: f64, pinned: f64) {
      just edit the number, and do NOT widen DER_PIN_TOL.",
     measured * 100.0,
     pinned * 100.0,
+    DER_PIN_TOL * 100.0
+  );
+  // Same side of PARITY_DER_MAX: a value must not cross the spec bound while
+  // staying inside DER_PIN_TOL. This is what keeps the faithful source's
+  // multi-speaker breach from silently un-breaching (finding 1).
+  assert_eq!(
+    measured > PARITY_DER_MAX,
+    pinned > PARITY_DER_MAX,
+    "{name}: {what} is {:.4}% but its pin is {:.4}% — on OPPOSITE sides of the PARITY_DER_MAX \
+     {:.4}% bound, a crossing DER_PIN_TOL ({:.4}%) would otherwise absorb. If a breach clip \
+     dropped under the bound, the crate README's 'breaches on two clips' claim just went \
+     silently false; if a clean clip rose over it, the faithful source just started breaching. \
+     Either way, re-baseline deliberately (re-measure, update DER_PINS + README) — do NOT let \
+     the tolerance hide a bound crossing.",
+    measured * 100.0,
+    pinned * 100.0,
+    PARITY_DER_MAX * 100.0,
     DER_PIN_TOL * 100.0
   );
 }
@@ -806,6 +857,16 @@ fn assert_clip_pins(
     fa_vs_dia.der,
     pin.fa_vs_dia,
   );
+  // The KIND of the parity result, pinned alongside its size: the two breach
+  // clips are a finding precisely because their error is CONFUSION (clustering),
+  // not collar-absorbable boundary jitter. Gating the confusion component stops
+  // a breach from silently changing character (finding 1).
+  assert_pinned(
+    name,
+    "FluidAudio parity CONFUSION vs dia-ort",
+    fa_vs_dia.confusion,
+    pin.fa_vs_dia_confusion,
+  );
   assert_pinned(
     name,
     "FluidAudio DER vs pyannote",
@@ -839,7 +900,11 @@ fn assert_clip_pins(
   );
 
   // Loud, so a reader of the log cannot miss finding 2 (see [`DerPin`]): the
-  // FAITHFUL source is over the spec's parity bound on this clip.
+  // FAITHFUL source is over the spec's parity bound on this clip. This is now a
+  // report on top of a GATE, not the gate itself: `assert_pinned` above already
+  // fails if this clip's `fa_vs_dia` drifts across PARITY_DER_MAX (same-side
+  // guard) or if its confusion character changes, so the breach cannot silently
+  // vanish (finding 1).
   if fa_vs_dia.der > PARITY_DER_MAX {
     println!(
       "[{name}] ⚠ SPEC BOUND BREACHED BY THE FAITHFUL SOURCE: FluidAudio parity DER {:.4}% > \
@@ -1179,6 +1244,59 @@ fn der_std_skips_only_reference_overlap_not_hypothesis_overlap() {
   assert_eq!(d.miss_units, 0);
   assert_eq!(d.conf_units, 0, "the real speaker is still matched");
   assert!(approx(d.der, 1.0), "got {}", d.der);
+}
+
+/// Finding 1, hermetic: [`assert_pinned`] must FAIL when a measurement crosses
+/// [`PARITY_DER_MAX`] while staying inside [`DER_PIN_TOL`] of its pin — the
+/// silent un-breach the same-side guard exists to stop. No models: it feeds
+/// synthetic `(measured, pinned)` pairs straight through the helper, catching
+/// the panic (`assert_pinned` aborts on failure).
+#[test]
+fn assert_pinned_fires_when_a_value_crosses_the_parity_bound() {
+  // A pin that BREACHES (clip 12's 0.1191 % fa_vs_dia) and a measurement that
+  // drifts back UNDER the 0.1 % bound but stays inside the 0.05 pp band: the
+  // magnitude check passes, so only the same-side guard can catch it.
+  let breach_pin: f64 = 0.001_191;
+  let drifted_under: f64 = 0.000_999; // |Δ| = 0.000192 < DER_PIN_TOL, yet < PARITY_DER_MAX
+  assert!((drifted_under - breach_pin).abs() <= DER_PIN_TOL);
+  assert!(breach_pin > PARITY_DER_MAX && drifted_under < PARITY_DER_MAX);
+  let crossed = std::panic::catch_unwind(|| {
+    assert_pinned(
+      "synthetic",
+      "fa_vs_dia (breach → under)",
+      drifted_under,
+      breach_pin,
+    );
+  });
+  assert!(
+    crossed.is_err(),
+    "a measurement crossing PARITY_DER_MAX from above to below, within tolerance, must fail \
+     assert_pinned — otherwise the breach silently un-breaches (finding 1)"
+  );
+
+  // The mirror: a clean pin (clip 06's 0.0909 %, just under the bound) with a
+  // measurement that rises OVER it in-tolerance — the faithful source silently
+  // STARTS breaching.
+  let clean_pin: f64 = 0.000_909;
+  let drifted_over: f64 = 0.001_400; // |Δ| = 0.000491 < DER_PIN_TOL, yet > PARITY_DER_MAX
+  assert!((drifted_over - clean_pin).abs() <= DER_PIN_TOL);
+  let rose = std::panic::catch_unwind(|| {
+    assert_pinned(
+      "synthetic",
+      "fa_vs_dia (clean → over)",
+      drifted_over,
+      clean_pin,
+    );
+  });
+  assert!(
+    rose.is_err(),
+    "a clean clip rising over PARITY_DER_MAX within tolerance must also fire (finding 1)"
+  );
+
+  // Control: an in-tolerance drift that stays on the SAME side of the bound must
+  // still pass (the guard is not a hair-trigger on the tolerance itself).
+  assert_pinned("synthetic", "same side, above", 0.001_150, breach_pin);
+  assert_pinned("synthetic", "same side, below", 0.000_800, clean_pin);
 }
 
 // ══════════════════════════════════════════════════════════════════════
