@@ -83,7 +83,7 @@
 //! But confusion is a cross-artifact AGREEMENT statistic, not a correctness
 //! one, so it is the *diagnostic*, not the tight gate. What gates is the pair
 //! of DECISION metrics: the **speaker count** (exact equality — the thing
-//! argmax violated) and **accuracy against the independent reference**
+//! argmax violated) and **agreement with the independent reference**
 //! ([`SHIPPING_ABS_DELTA_MAX`]). Confusion carries only a gross-regression
 //! tripwire ([`SHIPPING_CONFUSION_TRIPWIRE`]); read that constant's doc before
 //! touching it.
@@ -119,7 +119,7 @@
 //! control cannot cluster at all), so it cannot gate the precision axis; it
 //! asserts the known-bad state instead, and fails on purpose if that is fixed.
 //!
-//! # Ground truth
+//! # The reference (pyannote's output, not ground truth)
 //!
 //! `reference.rttm` is **pyannote.audio 4.0.4's own output** on the clip (dia's
 //! `manifest.json`), not human labels — the upstream reference implementation
@@ -154,12 +154,12 @@ use speakerkit::{
 // ══════════════════════════════════════════════════════════════════════
 
 /// **The decision gate.** Ceiling on |DER(int8 vs pyannote) − DER(fp32 vs
-/// pyannote)| (standard, 0.25 s collar): how much *accuracy* the shipping
-/// quantization may cost, relative to the fp32 control every existing gate
-/// measures, against the independent reference.
+/// pyannote)| (standard, 0.25 s collar): how much *agreement with the
+/// independent reference* the shipping quantization may cost, relative to the
+/// fp32 control every existing gate measures.
 ///
-/// This is a bound on CORRECTNESS, not on bit-agreement with another artifact,
-/// which is why it is the tight one. The argmax clustering failure cost +3.33
+/// This is a bound against the INDEPENDENT reference, not bit-agreement with
+/// another of our own artifacts, which is why it is the tight one. The argmax clustering failure cost +3.33
 /// points here and would blow through it 3×. Measured worst for int8: +0.2209 %
 /// (`int8/CpuOnly`) and +0.4217 % (`int8/All`, the literal shipping config) —
 /// both well inside. Never loosened.
@@ -192,7 +192,7 @@ const SHIPPING_ABS_DELTA_MAX: f64 = 0.01;
 /// path does not itself achieve — the exact anti-pattern `parity_seg.rs` and
 /// `parity_e2e.rs` already re-scoped in this repo ("gate the decision metric;
 /// report the raw"). The decision metrics here are the speaker count (exact
-/// equality, asserted) and [`SHIPPING_ABS_DELTA_MAX`] (accuracy vs the
+/// equality, asserted) and [`SHIPPING_ABS_DELTA_MAX`] (agreement vs the
 /// reference); both hold with margin.
 ///
 /// This tripwire therefore guards only against a CATASTROPHIC clustering
@@ -753,7 +753,7 @@ fn measure(clip: &MultiSpkClip) -> Measurement {
 ///   is a CoreML-path defect, not a dia limitation on this audio);
 /// - **G1** the speaker-count decision is identical across dia-ort, the fp32
 ///   control and both int8 arms — the metric argmax violated (7→8);
-/// - **G2** int8's accuracy against the independent pyannote reference is within
+/// - **G2** int8's agreement with the independent pyannote reference is within
 ///   [`SHIPPING_ABS_DELTA_MAX`] of the fp32 control's;
 /// - **G3** the int8-vs-fp32 confusion stays under
 ///   [`SHIPPING_CONFUSION_TRIPWIRE`] (gross-regression guard only — read that
@@ -804,17 +804,18 @@ fn gate(m: &Measurement) {
      we actually ship."
   );
 
-  // ── G2 (ACCURACY, the tight bound). The shipping default may not cost
-  // measurable accuracy against the independent reference relative to the fp32
-  // control. A bound on CORRECTNESS, not on bit-agreement with another artifact.
-  // argmax cost +3.33 points here and would blow through it 3×. Never loosened.
+  // ── G2 (REFERENCE AGREEMENT, the tight bound). The shipping default may not
+  // cost measurable agreement with the independent reference relative to the
+  // fp32 control. A bound against the independent reference, not bit-agreement
+  // with another of our own artifacts. argmax cost +3.33 points here and would
+  // blow through it 3×. Never loosened.
   let abs_fp32 = der_std(&m.reference, fp32).der;
   for (tag, hyp) in [("int8/CpuOnly", int8_cpu), ("int8/All", int8_all)] {
     let delta = der_std(&m.reference, hyp).der - abs_fp32;
     assert!(
       delta.abs() <= SHIPPING_ABS_DELTA_MAX,
       "{clip}: ΔDER({tag} − fp32) vs pyannote = {:+.4}%, over the ±{:.4}% bound — the shipping \
-       quantization measurably degrades diarization accuracy. Do NOT loosen.",
+       quantization measurably degrades agreement with the reference. Do NOT loosen.",
       delta * 100.0,
       SHIPPING_ABS_DELTA_MAX * 100.0
     );
@@ -845,7 +846,7 @@ fn shipping_int8_der_06_long_recording_3spk() {
 /// 4 speakers, 1103.0 s. The clip where clustering sits nearest a decision
 /// boundary: the fp32 CoreML control already carries ~0.39 % confusion against
 /// dia-ort here BEFORE any quantization, and int8 adds a similar increment. The
-/// speaker count and the accuracy bound both still hold — see
+/// speaker count and the reference-agreement bound both still hold — see
 /// [`SHIPPING_CONFUSION_TRIPWIRE`].
 #[test]
 #[ignore = "requires Models/speakerkit + sibling diarization ONNX/fixtures + ort"]
@@ -876,8 +877,8 @@ fn shipping_int8_der_10_mrbeast_clean_water_7spk() {
 
   // Clip-10-specific, the headline this test rests on: on the precision axis
   // (int8/CpuOnly vs fp32/CpuOnly) int8 clusters this 7-speaker clip so that not
-  // one collar-scored frame differs. `gate()`'s G2/G3 only bound accuracy within
-  // ±1 pp / 2 % confusion, which would pass a regression all the way from EXACT
+  // one collar-scored frame differs. `gate()`'s G2/G3 only bound reference-
+  // agreement within ±1 pp / 2 % confusion, which would pass a regression all the way from EXACT
   // agreement to ~0.9 % — so the "0.0000 % DER, zero confusion" claim is
   // ASSERTED here, not merely documented. `gate(&m)` above already proved every
   // arm clustered, so `segs()` cannot panic.

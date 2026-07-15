@@ -1,6 +1,7 @@
 //! Gates 3-4 (spec §5, the end-to-end tier): **DER through `dia`'s
 //! clustering** — the first speakerkit gate that measures the PRODUCT metric
-//! (does the pipeline diarize correctly) rather than tensor-level fidelity.
+//! (does the whole pipeline reproduce the reference diarization) rather than
+//! tensor-level fidelity.
 //!
 //! Every prior speakerkit gate is tensor-level: segmentation multilabel
 //! agreement (`parity_seg`), embedding cosine (`parity_embed`), argmax
@@ -84,8 +85,8 @@
 //! GATE, held to the original 0.1 % bound ([`PARITY_DER_MAX`]). The **strict
 //! frame-exact DER** ([`der_strict`]: no collar) is REPORTED but not the
 //! pass/fail bound. Reason (measured): the FluidAudio source diarizes
-//! IDENTICALLY to dia-ort at standard DER (0.0000 %) and is exactly as
-//! accurate as dia-ort against the independent pyannote reference (0.0000 %
+//! IDENTICALLY to dia-ort at standard DER (0.0000 %) and reproduces the
+//! independent pyannote reference exactly as dia-ort does (0.0000 %
 //! each), yet strict DER reads 0.08-0.29 % — a handful of 10 ms frames, ALL
 //! within a boundary collar (proven: standard DER = 0). That is the
 //! span-level image of the T6-accepted 99.97 % seg agreement (a 1-frame seg
@@ -112,8 +113,13 @@
 //! the **standard frame-based DER** (NIST `md-eval` / `pyannote.metrics`
 //! `DiarizationErrorRate`):
 //!
-//! On a 10 ms frame grid (Kaldi/`md-eval` convention; the reference RTTM is
-//! itself 10 ms-quantized), after (a) a 0.25 s no-score collar on each side
+//! On a 10 ms frame grid (the Kaldi/`md-eval` *scoring* convention — NOT the
+//! reference's own resolution: the RTTM's segment DURATIONS are integer
+//! multiples of pyannote's 16.875 ms output-frame step, and its absolute
+//! boundaries carry the sliding-window origin offset, so they lie on neither a
+//! 16.875 ms nor a 10 ms grid; the 10 ms scoring grid is finer than that
+//! 16.875 ms data step, so it oversamples the reference and changes no verdict),
+//! after (a) a 0.25 s no-score collar on each side
 //! of every reference-segment boundary and (b) optionally excluding frames
 //! with more than one reference speaker (`skip_overlap`), with the optimal
 //! one-to-one speaker mapping (the assignment that maximizes matched
@@ -1531,7 +1537,7 @@ fn fluidaudio_der_parity_vs_dia_ort_and_determinism() {
   assert!(
     worst_abs_delta <= PARITY_DER_MAX,
     "FluidAudio vs dia-ort absolute-DER delta {:.4}% exceeds {:.4}% — the two \
-     sources diverge in accuracy against the pyannote reference. Do NOT \
+     sources diverge in agreement with the pyannote reference. Do NOT \
      loosen; investigate.",
     worst_abs_delta * 100.0,
     PARITY_DER_MAX * 100.0
@@ -1595,7 +1601,7 @@ fn argmax_source_der_characterization() {
     );
     let fa_segs = diarize_extraction_segs(&fa_ext, &plda);
 
-    // argmax Baseline (W32A32 seg / W16A16 embed), CpuOnly — the accuracy
+    // argmax Baseline (W32A32 seg / W16A16 embed), CpuOnly — the parity
     // control (spec §5.3/§5.4). Its ~0.94 embedding divergence is the risk
     // under test.
     let ax_ext = argmax_extraction(
@@ -1745,12 +1751,12 @@ fn compute_unit_der_study_all_vs_cpuonly() {
          CpuOnly {n_cpu}) — that is a DECISION change, not the boundary jitter §5.3 accepted. \
          The shipping default does not diarize like the gated configuration."
       );
-      // ...nor move a span past the collar (the accuracy claim itself)...
+      // ...nor move a span past the collar (the reference-agreement claim itself)...
       assert!(
         delta <= PARITY_DER_MAX,
         "{name}/{tag}: ΔDER(All − CpuOnly) is {:+.4}%, past the {:.4}% bound — the shipping \
-         default is measurably less accurate than the configuration every fidelity gate pins. \
-         Do NOT loosen; investigate.",
+         default is measurably further from the reference than the configuration every fidelity \
+         gate pins. Do NOT loosen; investigate.",
         (all_der.der - cpu_der.der) * 100.0,
         PARITY_DER_MAX * 100.0
       );
