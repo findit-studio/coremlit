@@ -116,6 +116,17 @@ fn trim_swift_whitespaces(s: &str) -> &str {
 /// Fired once per decoded window, with that window's segments only (not the
 /// running total). Ports Swift `SegmentDiscoveryCallback`
 /// (`Models.swift:667-669`).
+///
+/// **Observes segments BEFORE the [`DecodingOptions::drop_blank_audio`]
+/// filter** (codex round 3, adjudicated). This is a real-time, raw-segment
+/// surface: it fires the instant a window finishes decoding, inside the window
+/// loop, so a window that decoded to nothing but `[BLANK_AUDIO]` is reported
+/// here even when `drop_blank_audio` is set and that segment is later dropped
+/// from the final [`TranscriptionResult`]. The drop governs the assembled
+/// result; this callback governs what was actually decoded. A consumer that
+/// wants only the surviving segments must filter its own copy — the drop runs
+/// once every window has decoded (see [`TranscribeTask::run`]), necessarily
+/// after this has already fired per-window.
 pub type SegmentDiscoveryCallback<'a> = &'a (dyn Fn(&[TranscriptionSegment]) + Sync);
 
 // ---------------------------------------------------------------------
