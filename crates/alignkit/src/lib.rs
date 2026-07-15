@@ -153,13 +153,23 @@
 //! # Gates
 //!
 //! ```text
-//! cargo test -p alignkit -- --ignored                        # e2e + determinism + model I/O
+//! cargo test -p alignkit -- --ignored                            # e2e + determinism + model I/O
 //! cargo test -p alignkit --features parity-oracle -- --ignored   # + the word-timing parity gate
-//! cargo bench -p alignkit --bench align                      # encode / align_chunk, RTF
+//! cargo test -p alignkit --features tracing -- --ignored         # + the per-chunk span instrumentation
+//! cargo bench -p alignkit --bench align                          # encode / align_chunk, RTF
 //! ```
 //!
 //! None of them skip: a missing model or fixture is a hard failure, never a
 //! green `0 passed`.
+//!
+//! The `tracing` gate is listed on its own for a reason. The per-chunk span
+//! test (`alignkit.align_chunk` / `alignkit.encoder.emissions`, in
+//! `aligner::tests`) sits behind BOTH `feature = "tracing"` AND `#[ignore]` — it
+//! needs a real model to open an alignment span — and **no other gate reaches
+//! that combination**: `cargo hack test --each-feature` enables `tracing` but
+//! skips ignored tests, and the `--ignored` runs above enable no features (or
+//! `parity-oracle`). Drop this line and deleting the per-call `#[instrument]`
+//! attributes stops being caught by anything.
 //!
 //! The `parity-oracle` gate additionally needs ONNX Runtime at **run** time
 //! (`ort` is `load-dynamic`, so the *build* needs nothing), and on Apple

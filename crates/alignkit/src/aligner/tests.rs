@@ -431,7 +431,14 @@ mod tracing_spans {
 
   /// The per-chunk half: **one `alignkit.align_chunk` span per call**, with the
   /// CoreML predict nested inside it. Model-gated, because a span over an
-  /// alignment needs an alignment.
+  /// alignment needs an alignment — so it runs ONLY under
+  /// `cargo test -p alignkit --features tracing -- --ignored`, the one gate that
+  /// both enables `tracing` and runs `#[ignore]` tests. `cargo hack test
+  /// --each-feature` enables the feature but skips ignored tests; the plain
+  /// `--ignored` runs do not enable `tracing`. Without that gate in the matrix,
+  /// deleting the per-call `#[instrument]` attributes on `Aligner::align_chunk`
+  /// or `Encoder::emissions` would be caught by nothing at all (F4) — see the
+  /// crate-root "Gates" section, which now lists it.
   #[test]
   #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
   fn every_align_chunk_call_opens_exactly_one_span() {
