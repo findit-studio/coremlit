@@ -420,6 +420,69 @@ fn any_fallback_aligns_a_cross_language_request_with_punctuation_oov() {
   );
 }
 
+/// **The F2 regression: the exact-hit path validates the decision language too.**
+/// An exact [`AlignerKey::Lang`]`(Lang::En)` hit handed a decision stamped
+/// [`Lang::Zh`]. The request IS En, so a Zh decision is a wrong-language payload
+/// that must surface as the typed [`AlignError::DecisionLanguage`] — at the SAME
+/// precedence the `Any` route gives it, BEFORE any dispatch — on this route too.
+///
+/// Two calls pin both ways the un-validated exact-hit path used to leak:
+/// - **in-window** audio: without the fix the decisions reach the bound aligner
+///   and asry's `prepare` rejects the Zh tag as an undifferentiated
+///   [`AlignError::Alignment`] (its `Tokenization`) — the finding's headline;
+/// - **oversized** audio: without the fix
+///   [`Aligner::align_chunk`](crate::aligner::Aligner::align_chunk)'s own length
+///   check raises [`AlignError::InputTooLong`] before `prepare` even runs, so the
+///   SAME wrong input produced a DIFFERENT error depending on the audio length.
+///
+/// With the fix both are the identical typed [`AlignError::DecisionLanguage`],
+/// because [`AlignmentSet::align_chunk`] validates the decision language ahead of
+/// dispatching to either. Deleting the `validate_decisions_language` call on the
+/// Hit path restores the two route-dependent errors above — the mutation proof.
+///
+/// This MUST go through [`AlignmentSet::align_chunk`]: the crossing tests call
+/// `cross_decisions_into` directly (only the `Any` path) and the e2e test above
+/// supplies valid decisions, so neither exercises the exact-hit validator.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn exact_hit_validates_decision_language_before_dispatch() {
+  let set = AlignmentSetBuilder::new()
+    .register(AlignerKey::Lang(Lang::En), en_aligner())
+    .build();
+  // A Zh-stamped decision under an En request: the exact En hit's decisions
+  // should carry En, so this is the wrong-language payload the validator catches.
+  let decisions = vec![ResolvedOov::new(
+    OovEvent::new(OovKind::Symbol('4'), 0, 0, Lang::Zh),
+    OovDecision::Wildcard,
+  )];
+  let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
+  let abort = AtomicBool::new(false);
+
+  let assert_decision_language = |samples: &[f32], case: &str| {
+    let err = set
+      .align_chunk(&Lang::En, samples, &[], "test", clock, &abort, &decisions)
+      .expect_err("a Zh decision under an En request must be rejected");
+    assert!(
+      matches!(
+        err,
+        AlignError::DecisionLanguage { index, ref requested, ref found }
+          if index == 0 && *requested == Lang::En && *found == Lang::Zh
+      ),
+      "{case}: exact En hit + Zh decision must be the typed DecisionLanguage, got {err:?}"
+    );
+  };
+
+  // In-window (1 s): the mutation would surface asry's generic Alignment here.
+  let in_window = vec![0.0f32; 16_000];
+  assert_decision_language(&in_window, "in-window");
+
+  // Oversized (window + 1): the mutation would surface InputTooLong here, since
+  // `Aligner::align_chunk`'s length check runs before `prepare` — so this pins
+  // that the validator precedes even that earliest error.
+  let oversized = vec![0.0f32; crate::encode::ENCODER_WINDOW_SAMPLES + 1];
+  assert_decision_language(&oversized, "oversized");
+}
+
 /// The known transcript for `jfk.wav`, with the commas that make the F2 test's
 /// punctuation OOV real (duplicated from `tests/common`, as the other src-level
 /// unit tests duplicate their fixtures — a `tests/` module is unreachable here).

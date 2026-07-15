@@ -266,8 +266,11 @@ impl AlignmentSet {
   /// expected-language knob — that is exactly the guard bypass this reconciles.
   ///
   /// An [`AlignerKey::Lang`]`(L)` hit needs no crossing (the decisions already
-  /// carry `L`), so it forwards straight through and the aligner's own guard
-  /// validates them.
+  /// carry `L`), but the same requested-language validation still runs here,
+  /// before dispatch, so a mis-stamped decision is the typed
+  /// [`AlignError::DecisionLanguage`] at the identical precedence to the `Any`
+  /// route — not a generic alignment error (or, on oversized audio, an
+  /// input-length error) from deep inside the bound aligner.
   ///
   /// # Registry miss
   ///
@@ -300,9 +303,17 @@ impl AlignmentSet {
   ) -> Result<AlignmentResult, AlignError> {
     match self.lookup(language) {
       AlignmentLookup::Hit { aligner, .. } => {
-        // Requested language == the aligner's own language, so decisions the
-        // caller resolved for `language` already carry the tag the aligner's
-        // `prepare` expects. Forward unchanged and let that guard validate them.
+        // Requested language == the aligner's own language (the builder asserts
+        // it for AlignerKey::Lang), so a correctly-resolved decision already
+        // carries the tag the aligner's `prepare` expects. Validate that HERE,
+        // before dispatch, so a MIS-stamped decision surfaces as the same typed
+        // DecisionLanguage error at the same precedence as the Any-fallback route
+        // (which validates in `cross_decisions_into`) — not the undifferentiated
+        // Alignment asry's `prepare` would raise, nor the InputTooLong the
+        // encoder could raise first on oversized audio, both of which made the
+        // error route-dependent (F2). The bound aligner's own guard still
+        // re-checks underneath; this is the classifier in front of it.
+        validate_decisions_language(oov_decisions, language)?;
         aligner.align_chunk(
           samples,
           sub_segments,
@@ -349,7 +360,37 @@ fn cross_decisions_into(
   requested: &Lang,
   aligner_language: &Lang,
 ) -> Result<Vec<ResolvedOov>, AlignError> {
+  // The same requested-language validation the exact-hit path runs — factored
+  // out so both routes reject a mis-stamped decision with the identical typed
+  // error at the identical precedence (before any re-stamp or dispatch).
+  validate_decisions_language(decisions, requested)?;
   let mut crossed = Vec::with_capacity(decisions.len());
+  for resolved in decisions {
+    let mut event = resolved.event().clone();
+    event.set_language(aligner_language.clone());
+    crossed.push(ResolvedOov::new(event, resolved.decision()));
+  }
+  Ok(crossed)
+}
+
+/// Validate that every OOV decision carries the `requested` language, returning
+/// [`AlignError::DecisionLanguage`] — naming the first offending index and the
+/// language it was found stamped with — if any does not.
+///
+/// Shared by BOTH align routes ([`AlignmentSet::align_chunk`]'s exact-`Lang` hit
+/// and, via [`cross_decisions_into`], the `Any` fallback) so a wrong-language
+/// decision is rejected with the same typed error at the same precedence — ahead
+/// of any dispatch — regardless of which aligner the lookup selected. The
+/// exact-hit path used to skip this and forward the decisions straight to the
+/// bound aligner, whose `prepare` DOES reject them, but only as an
+/// undifferentiated [`AlignError::Alignment`] (asry's `Tokenization`); worse, on
+/// oversized audio the encoder's [`AlignError::InputTooLong`] could surface
+/// first, so the SAME wrong input produced different errors on the two routes
+/// (F2).
+fn validate_decisions_language(
+  decisions: &[ResolvedOov],
+  requested: &Lang,
+) -> Result<(), AlignError> {
   for (index, resolved) in decisions.iter().enumerate() {
     if resolved.event().language() != requested {
       return Err(AlignError::DecisionLanguage {
@@ -358,11 +399,8 @@ fn cross_decisions_into(
         found: resolved.event().language().clone(),
       });
     }
-    let mut event = resolved.event().clone();
-    event.set_language(aligner_language.clone());
-    crossed.push(ResolvedOov::new(event, resolved.decision()));
   }
-  Ok(crossed)
+  Ok(())
 }
 
 /// Builder for [`AlignmentSet`]. Mirrors the crate's `with_`/`set_` builder
