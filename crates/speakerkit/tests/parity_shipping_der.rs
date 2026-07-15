@@ -45,10 +45,14 @@
 //!
 //! It holds, on the decision that matters. **int8 preserves the speaker-count
 //! decision on every clip measured (3 / 4 / 7 / 8-speaker references), and on
-//! the 7-speaker clip that broke argmax it clusters BIT-IDENTICALLY to fp32 —
-//! 0.0000 % DER, zero confusion — while carrying a *worse* embedding cosine
-//! than argmax does.** Cosine does not predict clustering; the *kind* of
-//! perturbation does.
+//! the 7-speaker clip that broke argmax the precision-isolated int8/CpuOnly arm
+//! clusters IDENTICALLY to fp32 on every collar-scored frame — 0.0000 %
+//! standard DER, zero confusion, asserted — while carrying a *worse* embedding
+//! cosine than argmax does.** (Identity here is standard-collar `err_units ==
+//! 0`, not literal output equality: ~6 sub-collar frames differ at no-collar,
+//! and `int8/All` folds in ANE placement for 0.0405 % — see
+//! [`shipping_int8_der_10_mrbeast_clean_water_7spk`].) Cosine does not predict
+//! clustering; the *kind* of perturbation does.
 //!
 //! Two things the measurement also surfaced, which the framing above did not
 //! anticipate:
@@ -172,7 +176,9 @@ const SHIPPING_ABS_DELTA_MAX: f64 = 0.01;
 /// falsified the premise, and the reason matters:
 ///
 /// - clips 06 (3 spk) and 10 (7 spk): int8-vs-fp32 confusion is **0.0000 %** —
-///   int8 clusters *identically* to fp32, frame-for-frame, under the collar.
+///   int8 clusters *identically* to fp32 on every collar-scored frame
+///   (`der_std` `err_units == 0`; clip 10's identity is asserted in
+///   [`shipping_int8_der_10_mrbeast_clean_water_7spk`]).
 /// - clip 14 (4 spk): **0.7832 %** — over that 0.5 %. But on the SAME clip the
 ///   **fp32 CoreML control already carries 0.39 % confusion against dia-ort**,
 ///   with zero quantization involved. Clip 14's clustering simply sits near a
@@ -842,14 +848,46 @@ fn shipping_int8_der_14_mrbeast_strongman_robot_4spk() {
 }
 
 /// 7 speakers, 619.5 s — **the clip that caught the argmax source** (spurious
-/// 8th speaker, 3.33 % DER, 100 % confusion). The single most important row:
-/// the shipping int8 embedder clusters it IDENTICALLY to fp32 (0.0000 % DER,
-/// zero confusion) and lands 7 speakers, despite carrying a *worse* embedding
-/// cosine than argmax does.
+/// 8th speaker, 3.33 % DER, 100 % confusion). The single most important row: on
+/// the precision axis (int8/CpuOnly vs the fp32/CpuOnly control, placement held
+/// constant) int8 clusters it IDENTICALLY — 0.0000 % standard DER, zero
+/// confusion, **asserted below** (`der_std(fp32, int8).err_units() == 0`, not
+/// one collar-scored frame differs) — and lands 7 speakers, despite carrying a
+/// *worse* embedding cosine than argmax does.
+///
+/// Two precise caveats behind the word "identically", so it is not read as
+/// literal output identity: this is agreement on the *collar-scored* frames.
+/// At the no-collar `der_strict` level the two arms differ on ~6 sub-collar
+/// frames (0.0100 %), and the `int8/All` arm — which also folds in ANE
+/// placement — carries 0.0405 % against the fp32 control (still well inside
+/// [`gate`]). So the identity that is asserted is exactly the one measured:
+/// standard-collar `err_units == 0`, on the int8/CpuOnly precision arm.
 #[test]
 #[ignore = "requires Models/speakerkit + sibling diarization ONNX/fixtures + ort"]
 fn shipping_int8_der_10_mrbeast_clean_water_7spk() {
-  gate(&measure(&MULTI_SPEAKER_CLIPS[2]));
+  let m = measure(&MULTI_SPEAKER_CLIPS[2]);
+  gate(&m);
+
+  // Clip-10-specific, the headline this test rests on: on the precision axis
+  // (int8/CpuOnly vs fp32/CpuOnly) int8 clusters this 7-speaker clip so that not
+  // one collar-scored frame differs. `gate()`'s G2/G3 only bound accuracy within
+  // ±1 pp / 2 % confusion, which would pass a regression all the way from EXACT
+  // agreement to ~0.9 % — so the "0.0000 % DER, zero confusion" claim is
+  // ASSERTED here, not merely documented. `gate(&m)` above already proved every
+  // arm clustered, so `segs()` cannot panic.
+  let precision = der_std(m.fp32.segs(), m.int8_cpu.segs());
+  assert_eq!(
+    precision.err_units(),
+    0,
+    "10: int8/CpuOnly no longer clusters IDENTICALLY to the fp32 control on the collar-scored \
+     frames ({} err units / {:.4}% standard DER, {} of them confusion) — the precision-isolated \
+     identity this test's headline rests on has regressed. This is the single clip proving a \
+     worse-than-argmax embedding cosine still clusters correctly; re-measure and update the doc \
+     + this assertion deliberately.",
+    precision.err_units(),
+    precision.der * 100.0,
+    precision.conf_units,
+  );
 }
 
 /// **Clip 09 (8 speakers, 1042.0 s) — a PINNED KNOWN DEFECT, not a passing gate.**
