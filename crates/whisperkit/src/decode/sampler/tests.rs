@@ -90,7 +90,10 @@ fn drew_from_rng_tracks_real_rng_draws() {
 
   // Argmax (temperature 0) never draws.
   let mut argmax_sampler = greedy(0.0);
-  assert!(!argmax_sampler.drew_from_rng(), "a fresh sampler has not drawn");
+  assert!(
+    !argmax_sampler.drew_from_rng(),
+    "a fresh sampler has not drawn"
+  );
   argmax_sampler.sample(&logits);
   assert!(
     !argmax_sampler.drew_from_rng(),
@@ -152,7 +155,10 @@ fn negative_temperature_wide_logits_sample_without_panic() {
   let mut sampler = greedy(-0.2);
   for _ in 0..50 {
     let r = sampler.sample(&wide);
-    assert!(r.logprob().is_finite(), "finite logprob under negative temperature");
+    assert!(
+      r.logprob().is_finite(),
+      "finite logprob under negative temperature"
+    );
     assert!(
       top_k.contains(&(r.token() as usize)),
       "drawn token {} fell outside the stable-softmax top-k {top_k:?}",

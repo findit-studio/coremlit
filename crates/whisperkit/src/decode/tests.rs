@@ -168,7 +168,12 @@ fn language_observed_only_for_a_decoded_language_token() {
     s.transcribe_token(),
     s.time_token_begin(),
   ];
-  let configured = run_mock(&mock, &prompt_es, &DecodingOptions::new().with_language("es"), &t);
+  let configured = run_mock(
+    &mock,
+    &prompt_es,
+    &DecodingOptions::new().with_language("es"),
+    &t,
+  );
   assert_eq!(configured.language(), "es");
   assert!(
     !configured.language_observed(),

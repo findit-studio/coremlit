@@ -146,7 +146,11 @@ fn finalize_threads_options_so_dropped_ids_survive() {
   );
   let mut agreement = LocalAgreement::new();
   agreement.ingest(result);
-  assert_eq!(agreement.results_slice().len(), 1, "first result is appended");
+  assert_eq!(
+    agreement.results_slice().len(),
+    1,
+    "first result is appended"
+  );
 
   // drop-ON (the default): the gap must survive finalization.
   let final_result = agreement.finalize(&crate::options::DecodingOptions::new());
