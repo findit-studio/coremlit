@@ -195,7 +195,10 @@
 mod common;
 mod der_calc;
 
-use std::path::{Path, PathBuf};
+use std::{
+  collections::BTreeMap,
+  path::{Path, PathBuf},
+};
 
 use coremlit::ComputeUnits;
 use der_calc::{Seg, approx, der_std, der_strict, distinct_speakers, fmt_der, parse_rttm};
@@ -1637,6 +1640,21 @@ fn compute_unit_der_study_all_vs_cpuonly() {
   let plda = load_plda();
   let argmax_root = argmax_models_root();
 
+  // Finding 4: a per-source WITNESS that the ANE placement was genuinely
+  // exercised. Every upper bound below (ΔDER, speaker count, strict tripwire) is
+  // satisfied by ZERO jitter — i.e. by both arms silently running the SAME
+  // placement (a CPU fallback), which is exactly what would make "All is
+  // decision-equivalent to CpuOnly" a vacuous claim (the README says the
+  // placement is genuinely exercised; without this, the test does not check it).
+  // So the strict no-collar jitter must be NON-zero on at least one pinned
+  // fixture per source. Weakest sufficient witness: non-zero err_units on ANY
+  // fixture — NOT a magnitude bound — measured 0.12-0.29 % here, four
+  // independent chances per source. TRADE-OFF: this is a new gate that would
+  // flake if Apple ever made this graph bit-identical across ANE and CPU; the
+  // floor is deliberately the weakest thing that still tells "the ANE ran"
+  // apart from "it didn't", so it fires only on a true no-op placement.
+  let mut strict_jitter_units: BTreeMap<&str, u64> = BTreeMap::new();
+
   for name in e2e_fixture_names() {
     let samples = fixture_audio(name);
     let reference = reference_segments(name);
@@ -1695,7 +1713,11 @@ fn compute_unit_der_study_all_vs_cpuonly() {
       let cpu_der = der_std(&reference, cpu);
       let all_der = der_std(&reference, all);
       let delta = (all_der.der - cpu_der.der).abs();
-      let jitter = der_strict(cpu, all).der;
+      let jitter_full = der_strict(cpu, all);
+      let jitter = jitter_full.der;
+      // Record the placement-exercised witness for this source (finding 4).
+      let w = strict_jitter_units.entry(tag).or_insert(0);
+      *w = (*w).max(jitter_full.err_units());
       let (n_cpu, n_all) = (distinct_speakers(cpu).len(), distinct_speakers(all).len());
       println!(
         "[{name}] {}",
@@ -1742,6 +1764,25 @@ fn compute_unit_der_study_all_vs_cpuonly() {
         STRICT_JITTER_TRIPWIRE * 100.0
       );
     }
+  }
+
+  // Finding 4: the placement-exercised witness, one per claimed source. A source
+  // that showed ZERO strict jitter across EVERY pinned fixture produced
+  // bit-identical All and CpuOnly spans — the ANE never diverged from the CPU,
+  // so "All is decision-equivalent to CpuOnly" would be vacuously true here (it
+  // is only meaningful once All has been observed doing something different).
+  // The upper bounds above cannot catch this; only a non-zero floor can. See the
+  // accumulator's comment for the (deliberately accepted) flake trade-off.
+  for tag in ["fluidaudio", "argmax"] {
+    let units = strict_jitter_units.get(tag).copied().unwrap_or(0);
+    assert!(
+      units > 0,
+      "{tag}: strict All-vs-CpuOnly jitter was ZERO on every pinned fixture — the two placements \
+       produced bit-identical spans, so ComputeUnits::All never actually diverged from the CPU on \
+       this source. This study cannot claim 'All is decision-equivalent to CpuOnly' when it never \
+       observed All doing anything different: either the ANE silently fell back to CPU, or the \
+       fixtures stopped exercising it. Investigate before trusting the ΔDER=0 result (finding 4)."
+    );
   }
 }
 
