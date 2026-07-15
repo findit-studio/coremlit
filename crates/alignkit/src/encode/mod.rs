@@ -425,6 +425,125 @@ fn check_log_prob_floor(data: &[f32], compute: ComputeUnits) -> Result<(), Align
   Ok(())
 }
 
+/// A provenance-bound encoder input: the buffer [`Encoder::emissions`] runs the
+/// model on, bound at construction to the count of REAL (pre-pad) audio samples
+/// that determines the truncated frame count `T`.
+///
+/// # Why this type exists — the recurring bug class, closed at the type level
+///
+/// [`Encoder::emissions`] needs two lengths that are NOT the same number: the
+/// buffer it feeds the fixed-window CoreML graph (asry's silence-masked,
+/// receptive-field-padded `encoder_input`, or a standalone caller's raw
+/// samples), and the count of real audio the chunk represents — which drives
+/// `truncated_frame_count`, and through it every word's timing. When those
+/// arrived as two independent arguments (`encoder_input: &[f32]` and a free
+/// `real_samples: usize`) nothing tied them together:
+///
+/// - A 176,000-sample buffer with `real_samples = 175_360` (two hops short)
+///   silently produced 548 frames where 550 belong, shifting a boundary by
+///   ~29 ms with **no error** — asry's own `chunk_extent ± 2·hop` stride check
+///   is too loose to catch a two-hop lie.
+/// - Naturally passing `encoder_input.len()` as the real count on a padded chunk
+///   (200 real samples zero-padded to 400) made the mirror mistake: 2 frames
+///   where 1 belongs.
+///
+/// This type makes that mismatch **unrepresentable**. `real_samples` is never a
+/// free integer supplied alongside the buffer; it is always a slice length,
+/// captured at construction from the audio itself:
+///
+/// - [`from_samples`](Self::from_samples) — the standalone / raw door. The
+///   buffer IS the real audio, so both lengths are one slice's `.len()` and
+///   cannot disagree.
+/// - the crate-private pipeline door taken by
+///   [`Aligner::align_chunk`](crate::aligner::Aligner::align_chunk), which reads
+///   the real length from the unpadded `samples` slice it handed `prepare`,
+///   never from asry's padded buffer.
+///
+/// There is deliberately **no** public `(buffer, count)` constructor: exposing
+/// one would re-open exactly the bug class this seam exists to close (the same
+/// reason asry keeps `PreparedChunk::real_samples` crate-private). The fixed
+/// window ceiling `encoder_input.len() <= `[`ENCODER_WINDOW_SAMPLES`] is checked
+/// here, at construction — so invalid geometry is rejected BEFORE any prediction
+/// runs, and by the time [`Encoder::emissions`] holds an `EncoderInput` there is
+/// no wrong length left to pass it.
+#[derive(Debug, Clone, Copy)]
+pub struct EncoderInput<'a> {
+  /// The buffer the model runs on (raw samples, or asry's masked+padded
+  /// buffer). Zero-padded up to the full window inside [`Encoder::emissions`].
+  encoder_input: &'a [f32],
+  /// The count of REAL (pre-pad) audio samples — a slice length captured at
+  /// construction, never a caller-supplied integer.
+  real_samples: usize,
+}
+
+impl<'a> EncoderInput<'a> {
+  /// A raw-audio encoder input: `samples` is both the buffer the model runs on
+  /// AND the real audio it represents, so `real_samples == samples.len()` and a
+  /// mismatch between them is impossible by construction. This is the door a
+  /// standalone [`Encoder`] caller takes; the alignment pipeline uses the
+  /// crate-private masked-buffer door instead (see the type doc).
+  ///
+  /// `samples` shorter than [`ENCODER_WINDOW_SAMPLES`] is zero-padded up to the
+  /// full window inside [`Encoder::emissions`]; longer is rejected here.
+  ///
+  /// # Errors
+  /// [`AlignError::InputTooLong`] if `samples.len() > `[`ENCODER_WINDOW_SAMPLES`]
+  /// — rejected at construction, before any prediction.
+  pub fn from_samples(samples: &'a [f32]) -> Result<Self, AlignError> {
+    // real == buffer: one slice, so `real_samples` cannot disagree with the
+    // buffer length — the raw path's whole safety argument.
+    Self::new(samples, samples.len())
+  }
+
+  /// The pipeline door: asry's silence-masked, receptive-field-padded
+  /// `encoder_input` buffer, with the real length taken from the UNPADDED
+  /// `real_audio` slice handed to `prepare` — NOT from the padded buffer's own
+  /// length.
+  ///
+  /// Crate-private on purpose. The only legitimate producer of a padded encoder
+  /// buffer is asry's `prepare`, reached through
+  /// [`Aligner::align_chunk`](crate::aligner::Aligner::align_chunk), which
+  /// passes the very `samples` slice it prepared; both come from one call site
+  /// that cannot get them out of step. A *public* `(buffer, real_audio)` door
+  /// would let a caller pair a padded buffer with an unrelated length and
+  /// re-create the F1 defect, so there isn't one.
+  ///
+  /// # Errors
+  /// [`AlignError::InputTooLong`] if the buffer exceeds
+  /// [`ENCODER_WINDOW_SAMPLES`].
+  pub(crate) fn from_prepared(
+    encoder_input: &'a [f32],
+    real_audio: &[f32],
+  ) -> Result<Self, AlignError> {
+    Self::new(encoder_input, real_audio.len())
+  }
+
+  /// The single geometry gate both constructors funnel through, run at
+  /// construction so [`Encoder::emissions`] never repeats it. Rejects a buffer
+  /// larger than the fixed window; debug-asserts the real length does not exceed
+  /// the buffer — an internal invariant both doors satisfy by construction
+  /// (`from_samples` by equality, [`from_prepared`](Self::from_prepared) because
+  /// asry only ever pads the real audio UP).
+  fn new(encoder_input: &'a [f32], real_samples: usize) -> Result<Self, AlignError> {
+    if encoder_input.len() > ENCODER_WINDOW_SAMPLES {
+      return Err(AlignError::InputTooLong {
+        got: encoder_input.len(),
+        max: ENCODER_WINDOW_SAMPLES,
+      });
+    }
+    debug_assert!(
+      real_samples <= encoder_input.len(),
+      "real_samples ({real_samples}) exceeds the encoder buffer ({} samples): the real audio \
+       cannot be longer than the (already silence-masked, padded) buffer it was built into",
+      encoder_input.len(),
+    );
+    Ok(Self {
+      encoder_input,
+      real_samples,
+    })
+  }
+}
+
 /// CoreML wrapper over `base960h_aligner.mlmodelc`: one
 /// [`ENCODER_WINDOW_SAMPLES`]-sample fixed window in, per-frame CTC
 /// log-probabilities out — see the module doc for the padding/truncation
@@ -525,9 +644,9 @@ impl Encoder {
 
   /// [`Self::emissions`] without the [`Emissions`] value-domain scan or
   /// wrapping: the truncated log-probabilities as a plain [`RawEmissions`]
-  /// carrier. See [`Self::emissions`] for the `encoder_input` /
-  /// `real_samples` contract, the truncation formula, and the errors — this
-  /// is the same method minus the final wrap.
+  /// carrier. See [`Self::emissions`] for the [`EncoderInput`] contract, the
+  /// truncation formula, and the errors — this is the same method minus the
+  /// final wrap.
   ///
   /// Crate-private, and staying that way until something needs otherwise:
   /// [`Emissions`] deliberately exposes no per-cell reads, and the only
@@ -537,18 +656,18 @@ impl Encoder {
   ///
   /// # Errors
   /// As [`Self::emissions`], minus [`AlignError::Alignment`] — skipping the
-  /// wrap is exactly skipping the check that can raise it.
-  pub(crate) fn emissions_raw(
-    &self,
-    encoder_input: &[f32],
-    real_samples: usize,
-  ) -> Result<RawEmissions, AlignError> {
-    if encoder_input.len() > ENCODER_WINDOW_SAMPLES {
-      return Err(AlignError::InputTooLong {
-        got: encoder_input.len(),
-        max: ENCODER_WINDOW_SAMPLES,
-      });
-    }
+  /// wrap is exactly skipping the check that can raise it. [`AlignError::InputTooLong`]
+  /// cannot arise here: [`EncoderInput`] already validated the window ceiling at
+  /// construction (see that type's doc).
+  pub(crate) fn emissions_raw(&self, input: EncoderInput<'_>) -> Result<RawEmissions, AlignError> {
+    let EncoderInput {
+      encoder_input,
+      real_samples,
+    } = input;
+    // Guaranteed by `EncoderInput::new` at construction — the pad branch's
+    // `buf[..encoder_input.len()]` copy relies on it, and the borrow branch on
+    // the exact-window equality.
+    debug_assert!(encoder_input.len() <= ENCODER_WINDOW_SAMPLES);
 
     let waveform: Cow<'_, [f32]> = if encoder_input.len() == ENCODER_WINDOW_SAMPLES {
       Cow::Borrowed(encoder_input)
@@ -558,8 +677,8 @@ impl Encoder {
       Cow::Owned(buf)
     };
 
-    let input = MultiArray::from_slice(&[1, ENCODER_WINDOW_SAMPLES], waveform.as_ref())?;
-    let mut outputs = self.model.predict_with(&[(names::WAVEFORM, &input)])?;
+    let array = MultiArray::from_slice(&[1, ENCODER_WINDOW_SAMPLES], waveform.as_ref())?;
+    let mut outputs = self.model.predict_with(&[(names::WAVEFORM, &array)])?;
     let emissions =
       outputs
         .take(names::EMISSIONS)
@@ -581,7 +700,7 @@ impl Encoder {
     Ok(RawEmissions { frames, data })
   }
 
-  /// Runs the encoder on `encoder_input` and wraps the truncated per-frame
+  /// Runs the encoder on `input` and wraps the truncated per-frame
   /// CTC log-probabilities into an [`Emissions`] — the sole log-prob currency
   /// [`asry::emissions::EmissionsAligner::finish`] accepts — with
   /// `T = truncated_frame_count(real_samples)` (clamped to [`Self::frames`],
@@ -601,19 +720,20 @@ impl Encoder {
   /// which hands back the tensor unchecked, **this is the guarded door** — and
   /// the only one [`crate::aligner::Aligner`] uses.
   ///
-  /// `encoder_input` is the buffer the model runs on. For the alignment
-  /// pipeline it is `PreparedChunk::encoder_input()` — asry has already
-  /// applied the silence mask and padded to wav2vec2's receptive field — so
-  /// this method never re-implements the mask; a standalone caller may pass
-  /// raw samples directly. Shorter than [`ENCODER_WINDOW_SAMPLES`], it is
-  /// zero-padded up to the full window before prediction.
-  ///
-  /// `real_samples` is the count of REAL (pre-mask, pre-pad) audio samples
-  /// the chunk represents — for the pipeline, the `samples.len()` handed to
-  /// `prepare`. asry keeps `PreparedChunk::real_samples` crate-private, so
-  /// the consumer supplies it; it feeds the truncation formula alone and is
-  /// never re-scanned. Frames computed from the padded tail are truncated
-  /// away, so the result reflects only the real audio.
+  /// `input` is an [`EncoderInput`]: the buffer the model runs on, bound to the
+  /// count of real (pre-pad) audio samples that drives the truncation. A
+  /// standalone caller builds one from raw audio with
+  /// [`EncoderInput::from_samples`] (buffer == real audio); the alignment
+  /// pipeline builds it from asry's already-masked, receptive-field-padded
+  /// `PreparedChunk::encoder_input()` bound to the unpadded `samples.len()` it
+  /// prepared, so this method never re-implements the mask. Either way the two
+  /// lengths are captured together from the audio and cannot disagree — that
+  /// binding is the whole reason [`EncoderInput`] exists rather than a
+  /// `(&[f32], usize)` pair (see its doc). A buffer shorter than
+  /// [`ENCODER_WINDOW_SAMPLES`] is zero-padded up to the full window before
+  /// prediction; the real-sample count feeds the truncation formula alone and is
+  /// never re-scanned, so frames computed from the padded tail are truncated away
+  /// and the result reflects only the real audio.
   ///
   /// # Truncation formula
   ///
@@ -661,8 +781,8 @@ impl Encoder {
   /// outcome this crate's own inputs can trigger.
   ///
   /// # Errors
-  /// [`AlignError::InputTooLong`] if
-  /// `encoder_input.len() > ENCODER_WINDOW_SAMPLES`.
+  /// Not [`AlignError::InputTooLong`]: [`EncoderInput`] validated the window
+  /// ceiling at construction, before this method is ever reachable.
   /// [`AlignError::Tensor`] if building the input tensor or reading the
   /// output tensor fails. [`AlignError::Prediction`] on a CoreML prediction
   /// failure, including a prediction whose runtime output set omits
@@ -689,18 +809,14 @@ impl Encoder {
       level = "debug",
       skip_all,
       fields(
-        encoder_input = encoder_input.len(),
-        real_samples,
+        encoder_input = input.encoder_input.len(),
+        real_samples = input.real_samples,
         compute = ?self.compute,
       ),
     )
   )]
-  pub fn emissions(
-    &self,
-    encoder_input: &[f32],
-    real_samples: usize,
-  ) -> Result<Emissions, AlignError> {
-    let RawEmissions { frames, data } = self.emissions_raw(encoder_input, real_samples)?;
+  pub fn emissions(&self, input: EncoderInput<'_>) -> Result<Emissions, AlignError> {
+    let RawEmissions { frames, data } = self.emissions_raw(input)?;
     check_log_prob_floor(&data, self.compute)?;
     Ok(Emissions::from_log_probs(frames, VOCAB_SIZE_NZ, data)?)
   }

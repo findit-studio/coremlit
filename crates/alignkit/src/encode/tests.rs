@@ -95,6 +95,78 @@ fn truncated_frame_count_never_exceeds_available_frames_near_full_window() {
 }
 
 // ---------------------------------------------------------------------
+// EncoderInput: the F1 capability. Hermetic, and that is the whole point —
+// a wrong real-sample length is unrepresentable at CONSTRUCTION, before any
+// Encoder or model exists, so the mismatch the free `real_samples: usize`
+// argument used to allow cannot reach a prediction.
+// ---------------------------------------------------------------------
+
+#[test]
+fn encoder_input_from_samples_binds_real_length_to_the_slice() {
+  // A 176,000-sample chunk fed as raw audio: `real_samples` IS the slice's own
+  // length, 176,000. The F1 defect declared 175,360 (two hops short) for this
+  // same buffer to get 548 frames where 550 belong; there is now no
+  // `real_samples` argument to declare it into.
+  let chunk = vec![0.0f32; 176_000];
+  let input = EncoderInput::from_samples(&chunk).expect("176k <= window");
+  assert_eq!(input.real_samples, 176_000);
+  assert_eq!(input.encoder_input.len(), 176_000);
+  assert_eq!(truncated_frame_count(input.real_samples, 2_999), 550);
+  // The buggy answer is now unreachable: 175_360 gives 548, but nothing can
+  // bind 175_360 to this 176,000-sample buffer.
+  assert_eq!(truncated_frame_count(175_360, 2_999), 548);
+  assert_ne!(
+    truncated_frame_count(input.real_samples, 2_999),
+    truncated_frame_count(175_360, 2_999)
+  );
+}
+
+#[test]
+fn encoder_input_from_prepared_takes_real_length_from_unpadded_audio_not_the_buffer() {
+  // The pipeline case: 200 real samples that asry silence-masks and zero-pads to
+  // the 400-sample receptive field. The real length is the UNPADDED audio (200),
+  // never the padded buffer's length (400). The F1 defect passed
+  // `encoder_input.len()` (400) as the real count, yielding 2 frames where 1
+  // belongs.
+  let real_audio = vec![0.1f32; 200];
+  let padded_buffer = vec![0.0f32; 400];
+  let input = EncoderInput::from_prepared(&padded_buffer, &real_audio).expect("valid geometry");
+  assert_eq!(input.real_samples, 200); // NOT 400
+  assert_eq!(input.encoder_input.len(), 400);
+  assert_eq!(truncated_frame_count(input.real_samples, 2_999), 1); // ceil(200/320)
+  // The buffer-length answer is now unreachable.
+  assert_eq!(truncated_frame_count(400, 2_999), 2); // the buggy count
+  assert_ne!(
+    truncated_frame_count(input.real_samples, 2_999),
+    truncated_frame_count(padded_buffer.len(), 2_999)
+  );
+}
+
+#[test]
+fn encoder_input_rejects_a_buffer_longer_than_the_window_before_any_prediction() {
+  // Invalid geometry is caught at construction, with no Encoder and no model in
+  // sight — so it can never reach a prediction. (Formerly this check lived
+  // inside `emissions_raw`, one predict away.)
+  let too_long = vec![0.0f32; ENCODER_WINDOW_SAMPLES + 1];
+  let err = EncoderInput::from_samples(&too_long).unwrap_err();
+  assert!(matches!(
+    err,
+    AlignError::InputTooLong { got, max }
+      if got == ENCODER_WINDOW_SAMPLES + 1 && max == ENCODER_WINDOW_SAMPLES
+  ));
+}
+
+#[test]
+fn encoder_input_accepts_a_buffer_exactly_the_window() {
+  // The exact-window boundary is valid — it is the `ted_60.wav` case, where
+  // `emissions_raw` borrows the buffer rather than padding it.
+  let full = vec![0.0f32; ENCODER_WINDOW_SAMPLES];
+  let input = EncoderInput::from_samples(&full).expect("exactly the window is fine");
+  assert_eq!(input.real_samples, ENCODER_WINDOW_SAMPLES);
+  assert_eq!(input.encoder_input.len(), ENCODER_WINDOW_SAMPLES);
+}
+
+// ---------------------------------------------------------------------
 // check_waveform_contract / check_emissions_contract: hermetic coverage
 // without a loaded model (see their doc comments for why this crate
 // tests the validation logic directly rather than model-gating against a
@@ -364,6 +436,16 @@ fn load_encoder() -> Encoder {
     .expect("load base960h_aligner.mlmodelc (set ALIGNKIT_TEST_MODELS to the model directory)")
 }
 
+/// `EncoderInput::from_samples` for the model-gated tests below, whose fixtures
+/// are always within the window. The fallible construction is F1's geometry
+/// gate; its rejection path is proven hermetically by
+/// `encoder_input_rejects_a_buffer_longer_than_the_window_before_any_prediction`
+/// (no model needed), so there is no longer a model-gated too-long test — the
+/// too-long buffer never reaches `emissions_raw` at all.
+fn window_input(samples: &[f32]) -> EncoderInput<'_> {
+  EncoderInput::from_samples(samples).expect("model-gated fixtures are <= ENCODER_WINDOW_SAMPLES")
+}
+
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
 fn from_file_loads_and_reports_frame_count() {
@@ -375,28 +457,11 @@ fn from_file_loads_and_reports_frame_count() {
 
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
-fn emissions_rejects_input_too_long() {
-  let encoder = load_encoder();
-  let samples = vec![0.0f32; ENCODER_WINDOW_SAMPLES + 1];
-  let Err(err) = encoder.emissions_raw(&samples, samples.len()) else {
-    panic!("longer-than-window input must be rejected");
-  };
-  assert!(matches!(
-    err,
-    AlignError::InputTooLong {
-      got,
-      max
-    } if got == ENCODER_WINDOW_SAMPLES + 1 && max == ENCODER_WINDOW_SAMPLES
-  ));
-}
-
-#[test]
-#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
 fn emissions_on_full_window_produces_correctly_shaped_finite_log_probs() {
   let encoder = load_encoder();
   let samples = vec![0.0f32; ENCODER_WINDOW_SAMPLES];
   let raw = encoder
-    .emissions_raw(&samples, samples.len())
+    .emissions_raw(window_input(&samples))
     .expect("emissions on silence");
   assert_eq!(raw.frames, encoder.frames());
   assert_eq!(raw.data.len(), raw.frames * crate::vocab::VOCAB_SIZE);
@@ -452,7 +517,7 @@ fn emissions_have_no_fp16_log_zero_sentinel() {
   let encoder = load_encoder();
   let samples = load_jfk_wav();
   let raw = encoder
-    .emissions_raw(&samples, samples.len())
+    .emissions_raw(window_input(&samples))
     .expect("emissions on jfk.wav");
 
   let min = raw.data.iter().copied().fold(f32::INFINITY, f32::min);
@@ -495,7 +560,7 @@ fn emissions_reject_an_ane_corrupted_matrix() {
   .expect("load base960h_aligner.mlmodelc on ComputeUnits::All");
   let samples = load_jfk_wav();
 
-  let Err(err) = encoder.emissions(&samples, samples.len()) else {
+  let Err(err) = encoder.emissions(window_input(&samples)) else {
     panic!(
       "an ANE-corrupted emission matrix was accepted. `Emissions::from_log_probs` cannot catch \
        this — -45440 is finite and <= 0 — so the caller now has plausible, silently wrong word \
@@ -560,7 +625,7 @@ fn emissions_accept_the_cpu_and_gpu_placement() {
   let samples = load_jfk_wav();
 
   let emissions = encoder
-    .emissions(&samples, samples.len())
+    .emissions(window_input(&samples))
     .expect("CpuAndGpu emissions are clean log-probs and must pass the floor guard");
   assert_eq!(emissions.frames(), 550);
   assert_eq!(emissions.vocab().get(), crate::vocab::VOCAB_SIZE);
@@ -579,7 +644,7 @@ fn emissions_accept_the_default_placement_on_real_speech() {
   let encoder = load_encoder();
   let samples = load_jfk_wav();
   let emissions = encoder
-    .emissions(&samples, samples.len())
+    .emissions(window_input(&samples))
     .unwrap_or_else(|e| panic!("the SHIPPING placement must produce clean log-probs: {e}"));
   assert_eq!(emissions.frames(), 550);
   assert_eq!(emissions.vocab().get(), crate::vocab::VOCAB_SIZE);
@@ -614,7 +679,7 @@ fn emissions_wraps_into_validated_emissions() {
   let encoder = load_encoder();
   let samples = vec![0.0f32; 48_000];
   let emissions = encoder
-    .emissions(&samples, samples.len())
+    .emissions(window_input(&samples))
     .expect("emissions wraps into a validated Emissions");
   assert_eq!(emissions.frames(), 150);
   assert_eq!(emissions.vocab().get(), crate::vocab::VOCAB_SIZE);
@@ -630,7 +695,7 @@ fn emissions_on_short_input_truncates_to_hermetic_formula() {
   // not just itself).
   let samples = vec![0.0f32; 48_000];
   let raw = encoder
-    .emissions_raw(&samples, samples.len())
+    .emissions_raw(window_input(&samples))
     .expect("emissions on short input");
   assert_eq!(raw.frames, truncated_frame_count(48_000, encoder.frames()));
   assert_eq!(raw.frames, 150);
@@ -647,10 +712,10 @@ fn emissions_is_deterministic_across_repeated_calls() {
     .map(|i| 0.01 * (i as f32 * 0.001).sin())
     .collect();
   let first = encoder
-    .emissions_raw(&samples, samples.len())
+    .emissions_raw(window_input(&samples))
     .expect("first emissions call");
   let second = encoder
-    .emissions_raw(&samples, samples.len())
+    .emissions_raw(window_input(&samples))
     .expect("second emissions call");
   assert_eq!(first.frames, second.frames);
   assert_eq!(

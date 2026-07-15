@@ -42,7 +42,7 @@ use std::{
 
 use alignkit::{
   ANALYSIS_TIMEBASE, Aligner, EnglishNormalizer, Lang, OutputClock, default_oov_decisions,
-  encode::Encoder,
+  encode::{Encoder, EncoderInput},
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 
@@ -117,7 +117,7 @@ fn bench_align(c: &mut Criterion) {
     b.iter(|| {
       black_box(
         encoder
-          .emissions(black_box(&samples), samples.len())
+          .emissions(EncoderInput::from_samples(black_box(&samples)).expect("jfk fits the window"))
           .expect("encode"),
       );
     });

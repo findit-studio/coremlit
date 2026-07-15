@@ -27,7 +27,7 @@ use asry::{
 use coremlit::ComputeUnits;
 
 use crate::{
-  encode::{DEFAULT_ENCODER_COMPUTE, Encoder, EncoderOptions},
+  encode::{DEFAULT_ENCODER_COMPUTE, Encoder, EncoderInput, EncoderOptions},
   error::{AlignError, AlignerError},
 };
 
@@ -454,13 +454,15 @@ impl Aligner {
       return Ok(AlignmentResult::new(Vec::new()));
     }
 
-    // asry has already silence-masked + receptive-field-padded the buffer;
-    // the encoder consumes exactly THAT, but the truncation formula needs
-    // the real sample count, which alignkit owns (asry keeps its own
-    // `PreparedChunk::real_samples` crate-private).
-    let emissions = self
-      .encoder
-      .emissions(prepared.encoder_input(), samples.len())?;
+    // asry has already silence-masked + receptive-field-padded the buffer; the
+    // encoder consumes exactly THAT, and the truncation formula needs the real
+    // sample count, which alignkit owns (asry keeps its own
+    // `PreparedChunk::real_samples` crate-private). Binding the padded buffer to
+    // the unpadded `samples.len()` in one `EncoderInput` is what makes a
+    // mismatched real length unrepresentable (F1): the guarded pipeline can only
+    // pass the length it actually prepared.
+    let input = EncoderInput::from_prepared(prepared.encoder_input(), samples)?;
+    let emissions = self.encoder.emissions(input)?;
 
     match self.inner.finish(prepared, &emissions, clock, abort_flag) {
       Ok(result) => Ok(result),
