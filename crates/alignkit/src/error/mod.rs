@@ -153,6 +153,51 @@ pub enum AlignError {
     /// `jfk.wav`).
     total: usize,
   },
+  /// A caller-supplied OOV decision does not carry the requested language.
+  ///
+  /// Returned by [`crate::registry::AlignmentSet::align_chunk`] when the
+  /// `ResolvedOov` at position `index` carries `found` rather than the
+  /// `requested` language the chunk is being aligned for. The registry checks
+  /// this BEFORE crossing the decisions into an
+  /// [`AlignerKey::Any`](crate::registry::AlignerKey::Any) fallback aligner's
+  /// own language: a foreign-language decision would otherwise be re-stamped and
+  /// silently apply another language's wildcard / fail-closed policy at a
+  /// matching position (asry's `ResolvedOov` identity ignores language on
+  /// purpose, so nothing downstream would catch it). Resolve decisions against
+  /// the SAME language you pass to `align_chunk` — the one
+  /// [`AlignmentSet::detect_oov`](crate::registry::AlignmentSet::detect_oov)
+  /// stamped them with.
+  #[error(
+    "oov_decisions[{index}] carries language {found:?} but the chunk is being aligned for \
+     {requested:?}; resolve the decisions against the language you request (the one \
+     `AlignmentSet::detect_oov` stamped them with)"
+  )]
+  DecisionLanguage {
+    /// Index of the offending decision in the caller's `oov_decisions` slice.
+    index: usize,
+    /// The language the chunk is being aligned for (the `align_chunk` argument).
+    requested: asry::Lang,
+    /// The language the decision actually carries.
+    found: asry::Lang,
+  },
+  /// No aligner is registered for the requested language, no
+  /// [`AlignerKey::Any`](crate::registry::AlignerKey::Any) fallback exists, and
+  /// the registry's miss policy is
+  /// [`AlignmentFallback::Error`](crate::registry::AlignmentFallback).
+  ///
+  /// Returned by [`crate::registry::AlignmentSet::align_chunk`]. Under the
+  /// default `SkipChunk` policy a miss instead yields an empty alignment result
+  /// (the ASR text survives, only per-word timings are dropped); this variant is
+  /// the opt-in loud form, for a pipeline that wants a missing language to stop
+  /// it rather than pass silently.
+  #[error(
+    "no aligner registered for language {language:?}, no `Any` fallback, and the registry miss \
+     policy is `Error`"
+  )]
+  LanguageUnsupported {
+    /// The requested language with no registered aligner and no `Any` fallback.
+    language: asry::Lang,
+  },
 }
 
 #[cfg(test)]
