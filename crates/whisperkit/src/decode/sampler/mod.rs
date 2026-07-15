@@ -202,9 +202,21 @@ impl GreedyTokenSampler {
     } else {
       self.probs.clear();
       let inv_t = 1.0 / self.temperature;
-      // logits scaled by inv_t, max-shifted by the scaled max — avoids a
-      // second pass over `logits` to find the max of the scaled values.
-      let scaled_max = max * inv_t;
+      // Swift scales the logits by `1 / temperature` FIRST, then softmaxes
+      // the *scaled* vector (`TokenSampler.swift:109-138`). The softmax
+      // stabilizer is therefore the max of the SCALED values, `max(v *
+      // inv_t)` — which equals `max(logits) * inv_t` only when `inv_t > 0`.
+      // For a NEGATIVE temperature `inv_t < 0` reverses the ordering, so
+      // `max(logits) * inv_t` is the *minimum* scaled value; subtracting it
+      // drove the true-largest scaled entry through `exp()` to `+inf`, making
+      // `sum`/`top_sum` non-finite and panicking `random_range` below. Take
+      // the true max of the scaled values. (For `inv_t > 0` this is
+      // bit-identical to the old `max * inv_t` — same float product at the
+      // max-raw position — so positive-temperature draws are unchanged.)
+      let scaled_max = logits
+        .iter()
+        .map(|&v| v * inv_t)
+        .fold(f32::NEG_INFINITY, f32::max);
       let mut sum = 0.0f32;
       self.probs.extend(logits.iter().map(|&v| {
         let e = (v * inv_t - scaled_max).exp();

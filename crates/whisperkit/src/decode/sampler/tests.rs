@@ -82,6 +82,53 @@ fn fully_masked_sample_does_not_consume_rng() {
 }
 
 #[test]
+fn negative_temperature_wide_logits_sample_without_panic() {
+  // F1 (codex round 3, High). Swift scales the logits by `1 / temperature`
+  // FIRST, then softmaxes the *scaled* vector (`TokenSampler.swift:109-138`).
+  // The port stabilized the softmax with `max(raw) * inv_t`, but for a
+  // NEGATIVE temperature `inv_t < 0` reverses order, so that constant is the
+  // *minimum* scaled value, not the max: the true-largest scaled entry then
+  // computes `exp(scaled - min) = exp(huge) = +inf`, making `top_sum`
+  // non-finite and panicking `random_range(0.0..inf)`.
+  //
+  // Reproduction (pre-fix): `sample([-10, 10])` at `-0.2` panicked. Post-fix
+  // it must return a finite draw with no panic.
+  let result = greedy(-0.2).sample(&[-10.0f32, 10.0]);
+  assert!(result.logprob().is_finite(), "logprob must be finite");
+  assert!((result.token() as usize) < 2, "token must index the logits");
+
+  // Every drawn token must lie in the top-k of a numerically stable softmax
+  // over the SCALED logits (`v / temperature`) -- exactly what Swift's
+  // scale-then-softmax computes. Under a negative temperature the *smallest*
+  // raw logit is the most probable, so a correct fix inverts the ordering
+  // rather than overflowing.
+  let wide = [-10.0f32, 10.0, -8.0, 5.0, -3.0, 2.0, 9.0, -1.0];
+  let inv_t = 1.0f32 / -0.2;
+  let scaled: Vec<f32> = wide.iter().map(|&v| v * inv_t).collect();
+  let scaled_max = scaled.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+  let reference: Vec<f32> = scaled.iter().map(|&s| (s - scaled_max).exp()).collect();
+  assert!(
+    reference.iter().all(|p| p.is_finite()),
+    "the reference stable softmax over scaled logits must stay finite"
+  );
+  // top_k defaults to 5: the five highest-probability scaled entries.
+  let mut order: Vec<usize> = (0..wide.len()).collect();
+  order.sort_by(|&a, &b| reference[b].total_cmp(&reference[a]));
+  let top_k: std::collections::HashSet<usize> = order.into_iter().take(5).collect();
+
+  let mut sampler = greedy(-0.2);
+  for _ in 0..50 {
+    let r = sampler.sample(&wide);
+    assert!(r.logprob().is_finite(), "finite logprob under negative temperature");
+    assert!(
+      top_k.contains(&(r.token() as usize)),
+      "drawn token {} fell outside the stable-softmax top-k {top_k:?}",
+      r.token()
+    );
+  }
+}
+
+#[test]
 #[should_panic(expected = "non-empty logits")]
 fn empty_logits_panic() {
   greedy(0.0).sample(&[]);

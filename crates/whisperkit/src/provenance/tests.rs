@@ -895,10 +895,14 @@ fn sampling_predicate_matches_the_samplers_nonzero_branch() {
     // The sampler's own branch agrees. At a temperature the `== 0.0` arm
     // catches, decoding is argmax (index 1 of these logits) and never touches
     // the RNG; the sampled temps may or may not land on argmax for a given
-    // draw, so only the greedy rows are pinned to a token.
+    // draw, so only the greedy rows are pinned to a token. The logits are
+    // deliberately WIDE (`[-10, 10, ..]`): a narrow `[0, 1, 0.5]` never
+    // reaches the negative-temperature overflow regime the sampler's
+    // scale-then-softmax must survive (codex round 3, F1), so the `-0.2` row
+    // would pass here even against the pre-fix panic.
     let mut sampler =
       crate::decode::sampler::GreedyTokenSampler::new(temperature, 99, &DecodingOptions::new());
-    let token = sampler.sample(&[0.0f32, 1.0, 0.5]).token();
+    let token = sampler.sample(&[-10.0f32, 10.0, 0.5]).token();
     if !samples {
       assert_eq!(
         token, 1,
