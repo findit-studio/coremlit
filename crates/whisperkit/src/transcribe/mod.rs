@@ -259,6 +259,13 @@ where
 
     let mut all_segments: Vec<TranscriptionSegment> = Vec::new();
     let mut detected_language: Option<String> = None;
+    // The GENUINE observation, kept SEPARATE from `detected_language` above:
+    // that one is the Swift-faithful DISPLAY language and includes a
+    // configured or fallback (`"en"`) value, whereas this is `Some` only when
+    // a probe ran or a `<|lang|>` token was actually decoded. This is what
+    // `TranscriptionResult::detected_language` records — a configured or
+    // defaulted language was never *detected* (F3, codex round 3).
+    let mut observed_language: Option<String> = None;
     // Whether ANY window's accepted decode drew from the token sampler
     // (temperature > 0.0). Accumulated below, the instant each window's
     // fallback ladder settles — see the assignment for why it cannot be
@@ -373,6 +380,7 @@ where
           &mut state,
           &mut initial_prompt,
           &mut detected_language,
+          &mut observed_language,
           options,
           &mut timings,
           window_index,
@@ -562,13 +570,13 @@ where
       // by this point the filters above may have emptied the very window
       // that sampled (see the assignment inside the loop).
       .maybe_sampled_at_nonzero_temperature(sampled_at_nonzero_temperature)
-      // The true observation, SEPARATE from the display fallback above:
-      // `None` iff this run decoded zero windows and so witnessed no
-      // language. `Provenance::for_result` reads this, recording no detected
-      // language rather than fabricating the `"en"` fallback the pipeline
-      // never saw. (`new` seeded it from that fallback; this override is what
-      // keeps a zero-window run honest.)
-      .maybe_detected_language(detected_language),
+      // The GENUINE observation (a probe ran or a `<|lang|>` token was
+      // decoded), SEPARATE from the display language above: `None` for a
+      // configured or fallback language, and for a zero-window run that
+      // witnessed nothing. `Provenance::for_result` reads THIS, recording no
+      // detected language rather than the display `"en"`/configured value the
+      // pipeline never actually detected (F3, codex round 3).
+      .maybe_detected_language(observed_language),
     )
   }
 
@@ -716,6 +724,7 @@ where
     state: &mut B::DecoderState,
     initial_prompt: &mut Vec<u32>,
     detected_language: &mut Option<String>,
+    observed_language: &mut Option<String>,
     options: &DecodingOptions,
     timings: &mut TranscriptionTimings,
     window_index: u64,
@@ -800,8 +809,17 @@ where
           Ok(probe) => {
             window_options.set_language(probe.language().to_string());
             *detected_language = Some(probe.language().to_string());
+            // A probe that ran IS a genuine detection (the F3 observation),
+            // even when it fell back to the default language.
+            *observed_language = Some(probe.language().to_string());
           }
-          Err(_) => *detected_language = None,
+          Err(_) => {
+            *detected_language = None;
+            // A failed probe witnessed nothing; the post-decode promotion
+            // below still sets the observation if a `<|lang|>` token is
+            // decoded.
+            *observed_language = None;
+          }
         }
         if options.use_prefill_prompt() {
           *initial_prompt = decode::prefill_tokens(&window_options, self.tokenizer, true);
@@ -833,9 +851,18 @@ where
           .map(|view| view.to_matrix());
       }
 
-      // :375-378 — only used if language detection above never ran/set it.
+      // :375-378 — the DISPLAY language: promote the decode's language when no
+      // probe set it. Kept for ALL branches (configured / decoded token /
+      // fallback) so the display stays Swift-faithful.
       if detected_language.is_none() {
         *detected_language = Some(result.language().to_string());
+      }
+      // The GENUINE observation (F3, codex round 3): promote ONLY when
+      // decode_text actually decoded a `<|lang|>` token. A configured language
+      // or the `"en"` fallback is not a detection, and leaves the observation
+      // as the probe set it (or `None`).
+      if result.language_observed() {
+        *observed_language = Some(result.language().to_string());
       }
 
       let is_first_token_log_prob_too_low = options

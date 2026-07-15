@@ -494,10 +494,16 @@ fn finalize_decoding_result(
   let no_speech_prob = 0.0;
 
   // :804-826.
-  let (language, language_probs) = if !options.language().is_empty() {
+  // `language_observed` is `true` ONLY in the decoded-`<|lang|>`-token branch:
+  // a configured language (Swift's `options.language != nil`) and the default
+  // fallback are NOT detections, so the pipeline records no observation for
+  // them (F3, codex round 3). Swift never drew this distinction — its
+  // `DecodingResult` carries no detection-provenance fact.
+  let (language, language_probs, language_observed) = if !options.language().is_empty() {
     (
       options.language().to_string(),
       vec![(options.language().to_string(), 0.0)],
+      false,
     )
   } else {
     match filtered_tokens
@@ -508,11 +514,11 @@ fn finalize_decoding_result(
         let decoded = tokenizer.decode(&filtered_tokens[index..=index], false)?;
         let lang = text::trim_special_token_chars(&decoded).to_string();
         let prob = filtered_log_probs[index];
-        (lang.clone(), vec![(lang, prob)])
+        (lang.clone(), vec![(lang, prob)], true)
       }
       None => {
         let lang = DEFAULT_LANGUAGE_CODE.to_string();
-        (lang.clone(), vec![(lang, 0.0)])
+        (lang.clone(), vec![(lang, 0.0)], false)
       }
     }
   };
@@ -526,6 +532,7 @@ fn finalize_decoding_result(
     DecodingResult::new()
       .with_language(language)
       .with_language_probs(language_probs)
+      .with_language_observed(language_observed)
       .with_tokens(filtered_tokens.to_vec())
       .with_token_log_probs(token_log_probs)
       .with_text(text)

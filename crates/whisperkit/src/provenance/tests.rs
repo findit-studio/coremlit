@@ -371,6 +371,9 @@ fn result_at(language: &str, temperatures: &[f32]) -> TranscriptionResult {
     language,
     TranscriptionTimings::new(),
   )
+  // `new` no longer seeds the observation from the display language (F3, codex
+  // round 3), so model a result that genuinely OBSERVED `language`.
+  .maybe_detected_language((!language.is_empty()).then(|| language.to_string()))
 }
 
 #[test]

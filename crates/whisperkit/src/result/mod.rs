@@ -1214,10 +1214,10 @@ pub struct TranscriptionResult {
   /// as `None` rather than fabricating a language the pipeline never saw
   /// ("record what produced the transcript, invent nothing").
   ///
-  /// [`Self::new`] seeds it from its `language` argument (`Some` for a
-  /// non-empty one, `None` for `""`), so a hand-built result reads back the
-  /// language it was given; the pipeline overrides it with the true
-  /// observation via [`Self::maybe_detected_language`].
+  /// [`Self::new`] starts it `None`: the display language is not an
+  /// observation, so a hand-built result witnesses nothing until it says so.
+  /// The pipeline sets the true observation via
+  /// [`Self::maybe_detected_language`].
   #[cfg_attr(
     feature = "serde",
     serde(default, skip_serializing_if = "Option::is_none")
@@ -1240,9 +1240,9 @@ impl TranscriptionResult {
   /// can carry is a sampled window whose segments are *gone* — and only the
   /// decode path can know about those.
   ///
-  /// [`Self::detected_language`] is seeded from `language`: `Some` for a
-  /// non-empty code, `None` for `""`. A hand-built result thus reads back the
-  /// language it was handed; the pipeline overrides it with the true
+  /// [`Self::detected_language`] starts `None` — the display `language` is
+  /// not an observation (a configured or fallback code was never *detected*),
+  /// so a hand-built result witnesses nothing. The pipeline sets the true
   /// observation (`None` when it decoded no window) via
   /// [`Self::maybe_detected_language`].
   pub fn new(
@@ -1251,16 +1251,18 @@ impl TranscriptionResult {
     language: impl Into<String>,
     timings: TranscriptionTimings,
   ) -> Self {
-    let language = language.into();
-    let detected_language = (!language.is_empty()).then(|| language.clone());
     Self {
       text: text.into(),
       segments: segments.into(),
-      language,
+      language: language.into(),
       timings,
       seek_time: None,
       sampled_at_nonzero_temperature: false,
-      detected_language,
+      // NOT seeded from `language`: the display language is not an
+      // observation — a configured or fallback code was never *detected*. A
+      // hand-built result witnesses nothing; the pipeline sets the true
+      // observation via `maybe_detected_language` (F3, codex round 3).
+      detected_language: None,
     }
   }
 
@@ -1573,6 +1575,17 @@ pub struct DecodingResult {
     serde(default, skip_serializing_if = "Vec::is_empty")
   )]
   language_probs: Vec<(String, f32)>,
+  /// Whether [`Self::language`] was OBSERVED from a decoded `<|lang|>` token —
+  /// a genuine in-loop language detection — rather than configured by the
+  /// caller or defaulted to [`DEFAULT_LANGUAGE_CODE`] because no language
+  /// token appeared. The pipeline promotes an *observed* language into
+  /// [`TranscriptionResult::detected_language`]; a configured or fallback
+  /// language is not a detection and records no observation (coremlit issue
+  /// #14, codex round 3). Not a Swift field — Swift's `DecodingResult` has no
+  /// detection-provenance concept, the same Rust-only extension rationale as
+  /// the sibling [`Self::first_token_log_prob`] (see this struct's doc).
+  #[cfg_attr(feature = "serde", serde(default))]
+  language_observed: bool,
   /// Sampled token ids for this window.
   #[cfg_attr(
     feature = "serde",
@@ -1620,6 +1633,7 @@ impl DecodingResult {
     Self {
       language: String::new(),
       language_probs: Vec::new(),
+      language_observed: false,
       tokens: Vec::new(),
       token_log_probs: Vec::new(),
       text: String::new(),
@@ -1670,6 +1684,29 @@ impl DecodingResult {
   #[inline(always)]
   pub fn set_language_probs(&mut self, language_probs: impl Into<Vec<(String, f32)>>) -> &mut Self {
     self.language_probs = language_probs.into();
+    self
+  }
+
+  // -- language_observed (bool) --------------------------------------------
+  /// Whether [`Self::language`] was observed from a decoded `<|lang|>` token
+  /// (a genuine detection) rather than configured or defaulted. See the field
+  /// doc for how the pipeline uses this to record
+  /// [`TranscriptionResult::detected_language`].
+  #[inline(always)]
+  pub const fn language_observed(&self) -> bool {
+    self.language_observed
+  }
+  /// Builder form of [`Self::set_language_observed`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_language_observed(mut self, language_observed: bool) -> Self {
+    self.set_language_observed(language_observed);
+    self
+  }
+  /// Sets [`Self::language_observed`] in place.
+  #[inline(always)]
+  pub const fn set_language_observed(&mut self, language_observed: bool) -> &mut Self {
+    self.language_observed = language_observed;
     self
   }
 
@@ -2618,14 +2655,19 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
     .iter()
     .any(TranscriptionResult::sampled_at_nonzero_temperature);
 
-  // The observation, carried from the first result to match the merged
-  // DISPLAY `language` (also the first's). `None` when that result observed
-  // no language — a batch of only zero-window/empty results merges to a
-  // detected language of `None`, not the invented `"en"` `new` would seed
-  // from the display fallback. Honest, like the sampling fact above.
+  // The observation: the FIRST result that witnessed a language wins. `None`
+  // only when no result observed one (a batch of only zero-window/empty
+  // results). Scanning all results for the first `Some` — not just
+  // `results.first()` — is the fix: the first-only read returned `None` for
+  // `[None, Some("es")]`, dropping an observation the batch plainly made, in
+  // violation of the field's own contract. A scalar cannot represent two
+  // conflicting observations, so the documented rule is "first observed
+  // wins"; this need NOT agree with the merged DISPLAY `language` (the first
+  // result's, keeping its Swift-compat `"en"` fallback) — the observation and
+  // the display string are deliberately separate (F3, codex round 3).
   let detected_language = results
-    .first()
-    .and_then(|first| first.detected_language().map(str::to_string));
+    .iter()
+    .find_map(|result| result.detected_language().map(str::to_string));
 
   TranscriptionResult::new(text, segments, language, timings)
     .maybe_sampled_at_nonzero_temperature(sampled)

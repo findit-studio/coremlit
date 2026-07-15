@@ -141,6 +141,86 @@ fn loop_forces_prompt_then_samples_to_eot() {
 
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn language_observed_only_for_a_decoded_language_token() {
+  // F3 (codex round 3). The `language_observed` fact is `true` ONLY when a
+  // `<|lang|>` token is actually decoded: a CONFIGURED language and the "en"
+  // fallback are copied/defaulted, not detected, so the pipeline records no
+  // observation for them.
+  let t = tiny_tokenizer();
+  let s = special();
+  let es = t.token_to_id("<|es|>").unwrap();
+
+  // Branch 1 -- CONFIGURED "es": the language is taken from the option, so it
+  // is NOT observed no matter what decodes.
+  let mut mock = MockBackend::new();
+  mock.push_token_steps(&[
+    es,
+    s.transcribe_token(),
+    s.time_token_begin(),
+    2425,
+    1002,
+    s.time_token_begin() + 50,
+    s.end_token(),
+  ]);
+  let prompt_es = vec![
+    s.start_of_transcript_token(),
+    es,
+    s.transcribe_token(),
+    s.time_token_begin(),
+  ];
+  let configured = run_mock(&mock, &prompt_es, &DecodingOptions::new().with_language("es"), &t);
+  assert_eq!(configured.language(), "es");
+  assert!(
+    !configured.language_observed(),
+    "a configured language is copied, not detected"
+  );
+
+  // Branch 2 -- DECODED token: empty configured language, and <|en|> appears in
+  // the decoded tokens (forced by the default multilingual prefill), so it IS
+  // observed. Same known-good script as `loop_forces...` above.
+  let mut mock = MockBackend::new();
+  mock.push_token_steps(&[
+    s.english_token(),
+    s.transcribe_token(),
+    s.time_token_begin(),
+    2425,
+    1002,
+    s.time_token_begin() + 50,
+    s.end_token(),
+  ]);
+  let observed = run_mock(&mock, &default_prompt(&s), &DecodingOptions::new(), &t);
+  assert_eq!(observed.language(), "en");
+  assert!(
+    observed.language_observed(),
+    "a decoded <|lang|> token is a genuine detection"
+  );
+
+  // Branch 3 -- FALLBACK: empty configured language and NO <|lang|> token in
+  // the decoded tokens, so the language defaults to "en" and is NOT observed.
+  let mut mock = MockBackend::new();
+  mock.push_token_steps(&[
+    s.transcribe_token(),
+    s.time_token_begin(),
+    2425,
+    1002,
+    s.time_token_begin() + 50,
+    s.end_token(),
+  ]);
+  let prompt_no_lang = vec![
+    s.start_of_transcript_token(),
+    s.transcribe_token(),
+    s.time_token_begin(),
+  ];
+  let fallback = run_mock(&mock, &prompt_no_lang, &DecodingOptions::new(), &t);
+  assert_eq!(fallback.language(), crate::constants::DEFAULT_LANGUAGE_CODE);
+  assert!(
+    !fallback.language_observed(),
+    "the \"en\" fallback is a default, not a detection"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn last_prefill_timestamp_keeps_model_prediction() {
   // TextDecoder.swift:581-594: if the LAST prompt token is a timestamp and
   // the model also predicted a timestamp, the model's wins (skip-force).

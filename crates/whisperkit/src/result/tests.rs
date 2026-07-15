@@ -849,6 +849,8 @@ fn decoding_result_defaults_match_swift_empty_results() {
   // `first_token_log_prob_too_low` without decode_text changing its return
   // type.
   assert_eq!(r.first_token_log_prob(), 0.0);
+  // F3 (codex round 3): a fresh result observed no `<|lang|>` token.
+  assert!(!r.language_observed());
   assert_eq!(DecodingResult::default(), DecodingResult::new());
 }
 
@@ -857,6 +859,7 @@ fn decoding_result_builder_vocabulary() {
   let r = DecodingResult::new()
     .with_language("en")
     .with_language_probs(vec![("en".to_string(), 0.98)])
+    .with_language_observed(true)
     .with_tokens(vec![50364u32, 15339])
     .with_token_log_probs(vec![(50364u32, -0.05)])
     .with_text("hello")
@@ -866,6 +869,7 @@ fn decoding_result_builder_vocabulary() {
     .with_compression_ratio(1.6)
     .with_first_token_log_prob(-0.8);
   assert_eq!(r.language(), "en");
+  assert!(r.language_observed());
   assert_eq!(r.language_probs_slice(), &[("en".to_string(), 0.98)]);
   assert_eq!(r.tokens_slice(), &[50364u32, 15339]);
   assert_eq!(r.token_log_probs_slice(), &[(50364u32, -0.05)]);
@@ -1259,4 +1263,69 @@ fn merge_ors_the_sampling_fact_across_results() {
   // All-greedy merges stay honest in the other direction.
   assert!(!merge_transcription_results(&[greedy.clone(), greedy]).sampled_at_nonzero_temperature());
   assert!(!merge_transcription_results(&[]).sampled_at_nonzero_temperature());
+}
+
+#[test]
+fn merge_carries_the_first_observed_language() {
+  // F3 (codex round 3). The merged observation is the FIRST result that
+  // WITNESSED a language, scanning ALL results -- not `results.first()`, which
+  // dropped `[None, Some("es")]` to `None`, losing an observation the batch
+  // plainly made. It is deliberately independent of the merged DISPLAY
+  // language (the first result's, keeping its Swift-compat fallback).
+  let observed = |lang: Option<&str>| {
+    TranscriptionResult::new("x", Vec::new(), "en", TranscriptionTimings::new())
+      .maybe_detected_language(lang.map(str::to_string))
+  };
+
+  // [None, Some("es")] -> Some("es"): the pre-fix first-only read returned None.
+  let merged = merge_transcription_results(&[observed(None), observed(Some("es"))]);
+  assert_eq!(
+    merged.detected_language(),
+    Some("es"),
+    "an observation in a later chunk must survive the merge"
+  );
+  assert_eq!(
+    merged.language(),
+    "en",
+    "the DISPLAY language stays the first result's, independent of the observation"
+  );
+
+  // Conflicting observations: first observed wins (the documented scalar rule).
+  assert_eq!(
+    merge_transcription_results(&[observed(Some("es")), observed(Some("fr"))]).detected_language(),
+    Some("es"),
+  );
+  // No result observed anything -> None, not the display fallback.
+  assert_eq!(
+    merge_transcription_results(&[observed(None), observed(None)]).detected_language(),
+    None,
+  );
+  // Through the options-aware door too.
+  assert_eq!(
+    merge_transcription_results_with_options(
+      &[observed(None), observed(Some("es"))],
+      &DecodingOptions::new(),
+    )
+    .detected_language(),
+    Some("es"),
+  );
+}
+
+#[test]
+fn new_does_not_infer_detected_language_from_the_display_language() {
+  // F3 (codex round 3). The display language is not an observation, so `new`
+  // must NOT seed `detected_language` from it -- a configured or fallback code
+  // was never *detected*. Only an explicit set/maybe records one.
+  let r = TranscriptionResult::new("hi", Vec::new(), "es", TranscriptionTimings::new());
+  assert_eq!(r.language(), "es", "the display language is still set");
+  assert_eq!(
+    r.detected_language(),
+    None,
+    "but no observation is inferred from the display language"
+  );
+  assert_eq!(
+    r.with_detected_language("es").detected_language(),
+    Some("es"),
+    "an explicit observation is still recorded"
+  );
 }
