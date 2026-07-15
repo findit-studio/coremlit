@@ -113,7 +113,7 @@ fn finalize_appends_agreed_tail_plus_different_suffix_and_merges() {
     word(" my", 0.7, 1.0),
     word(" fellow", 1.0, 1.5),
   ]));
-  let final_result = agreement.finalize();
+  let final_result = agreement.finalize(&crate::options::DecodingOptions::new());
   // confirmed [And] + lastAgreed [so, my] + differentSuffix(prev, hyp) [fellow]
   assert_eq!(final_result.text(), " And so my fellow");
   assert_eq!(final_result.language(), "en");
@@ -121,6 +121,43 @@ fn finalize_appends_agreed_tail_plus_different_suffix_and_merges() {
     final_result.segments_slice().len(),
     2,
     "merged from the two appended results"
+  );
+}
+
+#[test]
+fn finalize_threads_options_so_dropped_ids_survive() {
+  // F5 (codex round 3), the finalize half. `finalize` delegated to the
+  // options-blind confirmed-words merge, so the default streaming path lost a
+  // survivor id gap [0, 2] back to a dense [0, 1] at finalization. Threading
+  // the driver's own options through must preserve it.
+  let seg = |id: usize, start: f32, end: f32| {
+    let mut s = TranscriptionSegment::new();
+    s.set_id(id).set_start(start).set_end(end);
+    s
+  };
+  // One ingested result carrying an internal dropped-id gap [0, 2] (a
+  // wordless result is still appended on first ingest -- see
+  // `wordless_results_are_flagged_but_still_appended`).
+  let result = TranscriptionResult::new(
+    "A B",
+    vec![seg(0, 0.0, 1.0), seg(2, 1.0, 2.0)],
+    "en",
+    TranscriptionTimings::new(),
+  );
+  let mut agreement = LocalAgreement::new();
+  agreement.ingest(result);
+  assert_eq!(agreement.results_slice().len(), 1, "first result is appended");
+
+  // drop-ON (the default): the gap must survive finalization.
+  let final_result = agreement.finalize(&crate::options::DecodingOptions::new());
+  assert_eq!(
+    final_result
+      .segments_slice()
+      .iter()
+      .map(TranscriptionSegment::id)
+      .collect::<Vec<_>>(),
+    vec![0, 2],
+    "finalize must pass drop_blank_audio through, not collapse [0, 2] to [0, 1]"
   );
 }
 
@@ -206,7 +243,10 @@ fn tied_word_starts_never_confirm_twice() {
     .map(|w| w.word())
     .collect();
   assert_eq!(confirmed, vec![" A", " B"], "confirmed once and stable");
-  let text = agreement.finalize().text().to_string();
+  let text = agreement
+    .finalize(&crate::options::DecodingOptions::new())
+    .text()
+    .to_string();
   for token in ["A", "B", "C", "D", "E"] {
     assert_eq!(
       text.matches(token).count(),
@@ -246,7 +286,10 @@ fn omitting_a_confirmed_tied_word_does_not_drop_provisional_words() {
     1,
     "and confirmed exactly once"
   );
-  let text = agreement.finalize().text().to_string();
+  let text = agreement
+    .finalize(&crate::options::DecodingOptions::new())
+    .text()
+    .to_string();
   for token in ["A", "B", "C", "D", "E"] {
     assert_eq!(text.matches(token).count(), 1, "{token} once in {text:?}");
   }

@@ -395,12 +395,15 @@ impl LocalAgreement {
   /// ingested pair), both folded onto [`Self::confirmed_words_slice`];
   /// [`merge_transcription_results_with_words`] then merges every kept
   /// [`Self::results_slice`] result with that word list as the merged
-  /// text.
-  pub fn finalize(mut self) -> TranscriptionResult {
+  /// text, under `options` — the same options the kept results were decoded
+  /// with, so the merged segments honor
+  /// [`DecodingOptions::drop_blank_audio`]'s id mapping (which the confirmed
+  /// text override does not touch, but the segments still carry).
+  pub fn finalize(mut self, options: &DecodingOptions) -> TranscriptionResult {
     self.confirmed_words.append(&mut self.last_agreed_words);
     let suffix = find_longest_different_suffix(&self.prev_words, &self.hypothesis_words);
     self.confirmed_words.extend_from_slice(suffix);
-    merge_transcription_results_with_words(&self.results, &self.confirmed_words)
+    merge_transcription_results_with_words(&self.results, &self.confirmed_words, options)
   }
 }
 
@@ -465,9 +468,12 @@ impl<'ctx, B> LocalAgreementTranscriber<'ctx, B> {
   }
 
   /// Consumes the driver and produces the final merged transcript.
-  /// Delegates to [`LocalAgreement::finalize`].
+  /// Delegates to [`LocalAgreement::finalize`], passing this driver's own
+  /// (word-timestamp-forced) [`DecodingOptions`] so the merge honors the
+  /// same [`DecodingOptions::drop_blank_audio`] the streamed results decoded
+  /// under.
   pub fn finalize(self) -> TranscriptionResult {
-    self.agreement.finalize()
+    self.agreement.finalize(&self.options)
   }
 }
 

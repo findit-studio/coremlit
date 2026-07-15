@@ -1139,7 +1139,7 @@ fn format_segments_renders_timestamps_and_raw_text() {
 #[test]
 fn merge_with_confirmed_words_overrides_text_only() {
   // TranscriptionUtilities.swift:76-82 — confirmed words joined with NO
-  // separator; segments/language/timings identical to the plain merge.
+  // separator; segments/language/timings identical to the SAME-options merge.
   let mut first = TranscriptionResult::new("", Vec::new(), "", TranscriptionTimings::new());
   first
     .set_text("hello")
@@ -1151,13 +1151,71 @@ fn merge_with_confirmed_words_overrides_text_only() {
     .set_segments(vec![segment_with_words(30.0, 31.0, "world", vec![])]);
   let results = [first, second];
   let confirmed = [timed_word(" And", 0.0, 0.4), timed_word(" so", 0.4, 0.7)];
+  let options = DecodingOptions::new();
 
-  let with_words = merge_transcription_results_with_words(&results, &confirmed);
-  let plain = merge_transcription_results(&results);
+  let with_words = merge_transcription_results_with_words(&results, &confirmed, &options);
+  // Compared against the SAME-options merge, not the options-blind one:
+  // everything but the text must match what the confirmed-words path builds.
+  let plain = merge_transcription_results_with_options(&results, &options);
   assert_eq!(with_words.text(), " And so");
   assert_eq!(plain.text(), "hello world");
   assert_eq!(with_words.segments_slice(), plain.segments_slice());
   assert_eq!(with_words.language(), plain.language());
+}
+
+#[test]
+fn merge_with_confirmed_words_honors_drop_blank_id_mapping() {
+  // F5 (codex round 3). The confirmed-words merge delegated to the plain
+  // (drop-OFF) merge, so a survivor id gap [0, 2] came back densely
+  // renumbered [0, 1] -- the confirmed TEXT override is options-blind, but the
+  // merged SEGMENT ids are not (drop now controls the id mapping, coremlit
+  // #14 / F4). LocalAgreement::finalize (the default streaming path) inherited
+  // that loss; see `stream::agreement::tests` for the finalize half.
+  let seg = |id: usize, token: u32| {
+    let mut s = TranscriptionSegment::new();
+    s.set_id(id).set_tokens(vec![token]);
+    s
+  };
+  let chunk = TranscriptionResult::new(
+    "A B",
+    vec![seg(0, 10), seg(2, 12)],
+    "en",
+    TranscriptionTimings::new(),
+  );
+  let confirmed = [timed_word(" X", 0.0, 0.4)];
+
+  // drop-ON (the default): the [0, 2] gap survives, text still overridden.
+  let dropped = merge_transcription_results_with_words(
+    std::slice::from_ref(&chunk),
+    &confirmed,
+    &DecodingOptions::new(),
+  );
+  assert_eq!(
+    dropped
+      .segments_slice()
+      .iter()
+      .map(TranscriptionSegment::id)
+      .collect::<Vec<_>>(),
+    vec![0, 2],
+    "confirmed-words merge must preserve the dropped-id gap, not renumber to [0, 1]"
+  );
+  assert_eq!(dropped.text(), " X", "text is still the confirmed-words override");
+
+  // drop-OFF: EXACTLY Swift's dense reindex [0, 1].
+  let dense = merge_transcription_results_with_words(
+    std::slice::from_ref(&chunk),
+    &confirmed,
+    &DecodingOptions::new().maybe_drop_blank_audio(false),
+  );
+  assert_eq!(
+    dense
+      .segments_slice()
+      .iter()
+      .map(TranscriptionSegment::id)
+      .collect::<Vec<_>>(),
+    vec![0, 1],
+    "drop-OFF stays Swift-exact result_index + segment_index"
+  );
 }
 
 #[test]

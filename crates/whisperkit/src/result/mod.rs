@@ -2636,35 +2636,34 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
 // merge_transcription_results_with_words
 // ---------------------------------------------------------------------
 
-/// Merges `results` exactly as [`merge_transcription_results`] does, then
-/// overrides the merged text with `confirmed_words` — ports the
-/// `confirmedWords:` branch of `TranscriptionUtilities.
-/// mergeTranscriptionResults` (`Utilities/TranscriptionUtilities.swift:
-/// 76-82`): `words.map { $0.word }.joined()`, i.e. every confirmed word's
-/// text concatenated with **no** separator (word strings carry their own
-/// leading spaces, e.g. `" And"`). Everything else — segments, language,
-/// every timing field — is byte-identical to
-/// [`merge_transcription_results`]'s own output.
+/// Merges `results` under `options`, then overrides the merged text with
+/// `confirmed_words` — ports the `confirmedWords:` branch of
+/// `TranscriptionUtilities.mergeTranscriptionResults`
+/// (`Utilities/TranscriptionUtilities.swift:76-82`): `words.map { $0.word
+/// }.joined()`, i.e. every confirmed word's text concatenated with **no**
+/// separator (word strings carry their own leading spaces, e.g. `" And"`).
+/// Everything else — segments, language, every timing field — is
+/// byte-identical to [`merge_transcription_results_with_options`]'s own
+/// output.
 ///
-/// This is a deliberate **delegation**, not a parallel implementation: a
-/// future change to the plain merge's timing/segment rules is picked up
-/// here for free, and if upstream Swift ever grows a real divergence
-/// between the two branches beyond the text override, this call site is
-/// where that would need to change.
+/// # Why this needs the options after all
 ///
-/// There is deliberately no `_with_words`/`_with_options` combination:
-/// [`DecodingOptions::drop_blank_audio`] only ever changes the merged
-/// **text join**, and this function *discards* that join wholesale in
-/// favour of `confirmed_words`. The option is therefore unobservable here
-/// by construction, and delegating to the plain (Swift-faithful) merge is
-/// not a gap — a
-/// [`merge_transcription_results_with_options`] call in its place would
-/// compute a different string and then throw it away.
+/// The `confirmed_words` override discards the merged **text join**, so it is
+/// tempting to think [`DecodingOptions::drop_blank_audio`] is unobservable
+/// here and to delegate to the plain, options-blind merge. It is not:
+/// dropping now governs the **segment id mapping** too, not just the text
+/// (see [`merge_transcription_results_with_options`]). Delegating to the plain
+/// (drop-OFF) merge collapsed a survivor id gap `[0, 2]` back to a dense
+/// `[0, 1]`, and [`crate::stream::agreement::LocalAgreement::finalize`] — the
+/// default streaming path — inherited that loss at finalization. Threading the
+/// same `options` the results were decoded under keeps the merged **segments**
+/// honoring the drop even when the merged text does not come from them.
 pub fn merge_transcription_results_with_words(
   results: &[TranscriptionResult],
   confirmed_words: &[WordTiming],
+  options: &DecodingOptions,
 ) -> TranscriptionResult {
-  let mut merged = merge_transcription_results(results);
+  let mut merged = merge_results(results, options.drop_blank_audio());
   let text: String = confirmed_words.iter().map(WordTiming::word).collect();
   merged.set_text(text);
   merged
