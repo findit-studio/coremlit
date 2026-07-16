@@ -234,6 +234,18 @@ struct MultiSpkClip {
   /// silently drops the multi-speaker coverage fails loudly instead of turning
   /// this suite into a 2-speaker no-op.
   ref_spk: usize,
+  /// Decoded 16 kHz-mono sample count of `clip_16k.wav`, pinned so the clip's
+  /// identity is its AUDIO, not just its directory name. Asserted in
+  /// [`measure`] immediately after load: a same-name swap (a re-encode, a
+  /// truncation, a wrong file dropped in) changes this and fails BEFORE any DER
+  /// is scored. F4 — the clip-09 defect pin ([`assert_clip09_known_defect`])
+  /// checks only `o.clip == "09..."`, the manifest string, which a same-name
+  /// swap sails through.
+  samples: usize,
+  /// [`common::fnv1a_f32`] of those decoded samples — the content half of the
+  /// identity pin, catching a same-LENGTH content change the sample count
+  /// alone cannot. Asserted alongside [`Self::samples`] in [`measure`].
+  audio_fnv: u64,
 }
 
 /// The gated clips: a SELECTED subset — four of the eight ≥ 3-speaker clips in
@@ -244,60 +256,48 @@ const MULTI_SPEAKER_CLIPS: &[MultiSpkClip] = &[
   MultiSpkClip {
     name: "06_long_recording",
     ref_spk: 3,
+    samples: 15_643_627,
+    audio_fnv: 6_813_989_898_382_736_122,
   },
   MultiSpkClip {
     name: "14_mrbeast_strongman_robot",
     ref_spk: 4,
+    samples: 17_648_640,
+    audio_fnv: 8_962_622_122_443_019_965,
   },
   MultiSpkClip {
     name: "10_mrbeast_clean_water",
     ref_spk: 7,
+    samples: 9_911_979,
+    audio_fnv: 3_229_612_773_310_046_830,
   },
   MultiSpkClip {
     name: "09_mrbeast_dollar_date",
     ref_spk: 8,
+    samples: 16_671_744,
+    audio_fnv: 8_657_240_795_675_234_981,
   },
 ];
 
-/// The FULL ≥ 3-speaker membership of dia's parity corpus (eight clips), from
-/// which [`MULTI_SPEAKER_CLIPS`] selects four. Documented here so the "four of
-/// eight" claim and the SELECTION are pinned against silent corpus drift by
+/// The FULL ≥ 3-speaker membership of dia's parity corpus (eight clips), as
+/// `(name, ref_spk)`, from which [`MULTI_SPEAKER_CLIPS`] selects four.
+/// Documented here so the "four of eight" claim and the SELECTION are pinned
+/// against silent corpus drift by
 /// [`shipping_clip_selection_is_the_documented_subset`] (which re-derives the
-/// counts from the RTTMs), not asserted in prose alone. The parallel
-/// `parity_e2e::FIXTURE_FACTS` independently pins all 14 clips.
-const MULTISPK_CORPUS: &[MultiSpkClip] = &[
-  MultiSpkClip {
-    name: "06_long_recording",
-    ref_spk: 3,
-  },
-  MultiSpkClip {
-    name: "08_luyu_jinjing_freedom",
-    ref_spk: 3,
-  },
-  MultiSpkClip {
-    name: "09_mrbeast_dollar_date",
-    ref_spk: 8,
-  },
-  MultiSpkClip {
-    name: "10_mrbeast_clean_water",
-    ref_spk: 7,
-  },
-  MultiSpkClip {
-    name: "11_mrbeast_age_race",
-    ref_spk: 6,
-  },
-  MultiSpkClip {
-    name: "12_mrbeast_schools",
-    ref_spk: 15,
-  },
-  MultiSpkClip {
-    name: "13_mrbeast_saved_animals",
-    ref_spk: 11,
-  },
-  MultiSpkClip {
-    name: "14_mrbeast_strongman_robot",
-    ref_spk: 4,
-  },
+/// counts from the RTTMs), not asserted in prose alone. This is a MEMBERSHIP
+/// manifest, not a load manifest — only the selected four are decoded and
+/// scored, so only they carry the audio content-identity pin (F4,
+/// [`MultiSpkClip::audio_fnv`]); the corpus needs only name + speaker count.
+/// The parallel `parity_e2e::FIXTURE_FACTS` independently pins all 14 clips.
+const MULTISPK_CORPUS: &[(&str, usize)] = &[
+  ("06_long_recording", 3),
+  ("08_luyu_jinjing_freedom", 3),
+  ("09_mrbeast_dollar_date", 8),
+  ("10_mrbeast_clean_water", 7),
+  ("11_mrbeast_age_race", 6),
+  ("12_mrbeast_schools", 15),
+  ("13_mrbeast_saved_animals", 11),
+  ("14_mrbeast_strongman_robot", 4),
 ];
 
 // ══════════════════════════════════════════════════════════════════════
@@ -590,6 +590,28 @@ fn measure(clip: &MultiSpkClip) -> Measurement {
   // re-asserted after each arm.
   let samples = common::load_wav_16k_mono(&audio);
   let audio_fnv = common::fnv1a_f32(&samples);
+
+  // ── CONTENT-IDENTITY PIN (F4). The clip's identity is its DECODED AUDIO, not
+  // its directory name: a same-name swap (a re-encode, a truncation, a wrong
+  // file dropped in) changes the sample count or the FNV and fails HERE, before
+  // any DER is scored. The downstream clip-09 defect pin asserts only
+  // `o.clip == "09..."` (the manifest string); this is the check that watches
+  // the bytes. Mutation-proven by `clip09_content_pin_catches_an_audio_swap`.
+  assert_eq!(
+    samples.len(),
+    clip.samples,
+    "{}: decoded {} samples, pinned {} — the audio identity changed (a same-name swap?)",
+    clip.name,
+    samples.len(),
+    clip.samples
+  );
+  assert_eq!(
+    audio_fnv, clip.audio_fnv,
+    "{}: audio content hash {audio_fnv} != pinned {} — a same-length content change the \
+     sample count alone would miss",
+    clip.name, clip.audio_fnv
+  );
+
   let reference = parse_rttm(&reference_rttm_path(clip.name));
   let ref_spk = distinct_speakers(&reference).len();
 
@@ -1599,7 +1621,7 @@ fn shipping_clip_selection_is_the_documented_subset() {
 
   let mut documented: Vec<(String, usize)> = MULTISPK_CORPUS
     .iter()
-    .map(|c| (c.name.to_string(), c.ref_spk))
+    .map(|(name, spk)| ((*name).to_string(), *spk))
     .collect();
   documented.sort();
   assert_eq!(
@@ -1631,9 +1653,62 @@ fn shipping_clip_selection_is_the_documented_subset() {
     assert!(
       MULTISPK_CORPUS
         .iter()
-        .any(|m| m.name == c.name && m.ref_spk == c.ref_spk),
+        .any(|(name, spk)| *name == c.name && *spk == c.ref_spk),
       "{}: gated but not in the ≥ 3-speaker corpus manifest (or its count disagrees)",
       c.name
     );
   }
+}
+
+/// F4 mutation proof: the content-identity pin (`samples` + `audio_fnv`) that
+/// [`measure`] asserts actually catches a same-name audio swap on clip 09.
+/// Loads the real clip (no models — only the sibling fixture, like
+/// [`shipping_clip_selection_is_the_documented_subset`]) and shows the pinned
+/// values match the bytes on disk, then that BOTH a one-sample perturbation
+/// (the FNV half) and a length change (the count half) break the pin. Without
+/// this the pinned numbers could silently drift from the clip and a swap would
+/// still pass `measure`.
+#[test]
+#[ignore = "requires the sibling diarization parity fixtures (no models needed)"]
+fn clip09_content_pin_catches_an_audio_swap() {
+  let clip = &MULTI_SPEAKER_CLIPS[3];
+  assert_eq!(clip.name, "09_mrbeast_dollar_date", "index 3 is clip 09");
+
+  let samples = common::load_wav_16k_mono(&clip_audio_path(clip.name));
+  let fnv = common::fnv1a_f32(&samples);
+
+  // The pinned values ARE the real clip's — the same check `measure` runs. If a
+  // future capture drifts from the bytes, this fails here rather than letting a
+  // stale pin wave a swapped clip through.
+  assert_eq!(
+    samples.len(),
+    clip.samples,
+    "pinned sample count {} != the clip's {}",
+    clip.samples,
+    samples.len()
+  );
+  assert_eq!(fnv, clip.audio_fnv, "pinned FNV != the clip's");
+
+  // (a) One perturbed sample, SAME length: the count is unchanged but the FNV
+  // must move — so `measure`'s pin fires on a same-length swap the count misses.
+  let mut swapped = samples.clone();
+  let i = swapped.len() / 2;
+  swapped[i] = f32::from_bits(swapped[i].to_bits() ^ 1); // flip one mantissa bit
+  assert_eq!(
+    swapped.len(),
+    clip.samples,
+    "the perturbation keeps the count"
+  );
+  assert_ne!(
+    common::fnv1a_f32(&swapped),
+    clip.audio_fnv,
+    "a one-sample perturbation must break the FNV pin"
+  );
+
+  // (b) A truncated clip: the sample-count half must fire.
+  assert_ne!(
+    samples.len() - 1,
+    clip.samples,
+    "a length change must break the sample-count pin"
+  );
 }
