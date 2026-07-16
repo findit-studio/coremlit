@@ -174,14 +174,16 @@ fn arg<'a>(args: &'a str, key: &str) -> Option<&'a str> {
 /// than dropping it silently: it may be a numerically-guarded op emitted in
 /// syntax this hand-rolled reader does not yet handle — exactly what a new
 /// coremltools re-conversion can produce. Covers the guard SITES (`log`,
-/// `rsqrt`, `sqrt`, `real_div`, the norms) AND the floor-contributing ops a
-/// site's guard is resolved through (`add`, `clip`, `maximum`, `softmax`),
-/// because an unreadable `clip` can make a `sqrt` guard vanish just as
-/// silently as an unreadable `sqrt`. `exp` is included as the containment op
-/// the folded-log audit reasons about. The check is dormant on today's tree
-/// (every guard statement parses) and arms only when a re-conversion changes
-/// the shape of one — the bias is deliberately toward a loud review over a
-/// silent drop.
+/// `rsqrt`, `sqrt`, `real_div`, the norms — `instance_norm`, `layer_norm`,
+/// `batch_norm`, `l2_norm`) AND the floor-contributing ops a site's guard is
+/// resolved through (`add`, `clip`, `maximum`, `softmax`), because an unreadable
+/// `clip` can make a `sqrt` guard vanish just as silently as an unreadable
+/// `sqrt`. `exp` is included as the containment op the folded-log audit reasons
+/// about. `l2_norm` is whole-token matched, so `reduce_l2_norm` — a bare L2
+/// reduction that carries no `epsilon` — never trips it. The check is dormant on
+/// today's tree (every guard statement parses) and arms only when a re-conversion
+/// changes the shape of one — the bias is deliberately toward a loud review over
+/// a silent drop.
 const GUARD_LOOKING_OPS: &[&str] = &[
   "log",
   "rsqrt",
@@ -190,12 +192,24 @@ const GUARD_LOOKING_OPS: &[&str] = &[
   "instance_norm",
   "layer_norm",
   "batch_norm",
+  "l2_norm",
   "add",
   "clip",
   "maximum",
   "softmax",
   "exp",
 ];
+
+/// The kwarg spellings that name a numerical-stability guard *directly on an op*
+/// (as opposed to a floor contributed by a separate `add`/`clip`/`maximum`).
+/// CoreML MIL spells it `epsilon` on every guarded op it emits — `log`, `rsqrt`,
+/// the norms, `l2_norm`. Any op carrying one of these that no specific
+/// [`Graph::audit`] arm recognizes is still a guard the sweep must not drop: the
+/// vocabulary-independent catch-all surfaces it as unresolved. A one-element
+/// slice on purpose — extend it here if a future MIL op guards under a different
+/// name — kept a named set so the catch-all reads as "a guard we don't model",
+/// not a bare string check.
+const EPSILON_KWARGS: &[&str] = &["epsilon"];
 
 /// True when `b` can appear inside a MIL identifier.
 fn is_ident_byte(b: u8) -> bool {
@@ -494,10 +508,17 @@ impl Graph {
             None
           }
         },
-        // A normalization's epsilon is its whole guard. Unresolvable means the
-        // guard is unreadable, not absent — the site must FAIL the audit, not
-        // vanish from it (the old `eps_kwarg.map(...)` dropped it silently).
-        "instance_norm" | "layer_norm" | "batch_norm" => match eps_kwarg {
+        // A normalization's epsilon is its whole guard: `instance_norm`,
+        // `layer_norm` and `batch_norm` add it inside `sqrt(variance + eps)`, and
+        // `l2_norm` does the same inside `sqrt(sum(x^2) + eps)` — so the stored
+        // epsilon rounding to zero in fp16 is a divide-by-zero at the norm just as
+        // for the others, and the effective floor is the epsilon itself. The op
+        // prefix in `Finding::render` distinguishes `l2_norm` from the
+        // batch/layer/instance norms; the guard semantics are identical.
+        // Unresolvable means the guard is unreadable, not absent — the site must
+        // FAIL the audit, not vanish from it (the old `eps_kwarg.map(...)` dropped
+        // it silently).
+        "instance_norm" | "layer_norm" | "batch_norm" | "l2_norm" => match eps_kwarg {
           Some(e) => Some((e, 0.0, "norm".into())),
           None => {
             unresolved.push(unresolved_site(var, stmt));
@@ -536,6 +557,19 @@ impl Graph {
             None
           }
         },
+        // Vocabulary-independent completeness catch-all (BEFORE the wildcard). Any
+        // op no arm above recognized that still carries an `epsilon` kwarg (see
+        // [`EPSILON_KWARGS`]) is a numerical guard whose exact semantics this audit
+        // does not model — a re-conversion can emit a brand-new epsilon-bearing op,
+        // or a known one this reader was never taught (the `l2_norm` hole was
+        // exactly this). It must NOT drop through the `_ => None` wildcard the way a
+        // recognized-but-unguarded op does: surface it as unresolved so the sweep
+        // fails loudly, exactly like an unreadable guard statement. Resolvable or
+        // not, an epsilon we cannot attribute to modeled semantics is a hole.
+        _ if EPSILON_KWARGS.iter().any(|k| arg(&stmt.args, k).is_some()) => {
+          unresolved.push(unresolved_site(var, stmt));
+          None
+        }
         _ => None,
       };
       if let Some((eps, floor, guard)) = site {
@@ -903,6 +937,35 @@ const CAST_WRAPPED_DYNAMIC_DIVISOR: &str = r#"
             tensor<fp16, [3, 2560]> mean = real_div(x = numer_cast_fp16, y = v1_fp16)[name = tensor<string, []>("mean")];
 "#;
 
+/// F2 (recognized vocabulary): a clean, surviving `log` guard (whisper's mel
+/// `add(0x1p-24) → log`) beside an `l2_norm` whose `epsilon` vanishes in fp16.
+/// `l2_norm(x, epsilon)` computes `x / sqrt(sum(x^2) + epsilon)` — the epsilon is
+/// the whole divide guard, so `1e-8` (0.168× the fp16 floor) rounds to zero and
+/// the norm can divide by zero, exactly like the batch/layer/instance norms.
+/// Before `l2_norm` was in the vocabulary it fell to the `_ => None` wildcard and
+/// produced NEITHER a finding NOR an unresolved hole, so a re-conversion adding a
+/// safe `log` plus a vanishing `l2_norm` swept GREEN. It must now surface as a
+/// vanishing FINDING while the `log` beside it still survives.
+const L2_NORM_VANISHING: &str = r#"
+            tensor<fp16, []> ok_eps = const()[name = tensor<string, []>("ok_eps"), val = tensor<fp16, []>(0x1p-24)];
+            tensor<fp16, [80, 3000]> ok_mel = add(x = ok_mel_1, y = ok_eps)[name = tensor<string, []>("ok_mel")];
+            tensor<fp16, []> ok_log_eps = const()[name = tensor<string, []>("ok_log_eps"), val = tensor<fp16, []>(0x0p+0)];
+            tensor<fp16, [80, 3000]> ok_log = log(epsilon = ok_log_eps, x = ok_mel)[name = tensor<string, []>("ok_log")];
+            tensor<fp32, []> l2_eps = const()[name = tensor<string, []>("l2_eps"), val = tensor<fp32, []>(0x1.5798eep-27)];
+            tensor<fp16, [1, 256]> l2_out = l2_norm(epsilon = l2_eps, x = embed_cast_fp16)[name = tensor<string, []>("l2_out")];
+"#;
+
+/// F2 (the CLASS, not the op): an op this reader does NOT recognize that still
+/// carries an `epsilon` kwarg. Its exact semantics are unmodeled, so the
+/// vocabulary-independent catch-all must surface it as UNRESOLVED — never drop it
+/// through the `_ => None` wildcard — so a brand-new epsilon-bearing op from a
+/// future coremltools (or a known one this reader was never taught) cannot sweep
+/// green beside a recognized guard. The op-independent twin of the `l2_norm` fix.
+const EPSILON_BEARING_UNKNOWN_OP: &str = r#"
+            tensor<fp16, []> mystery_eps = const()[name = tensor<string, []>("mystery_eps"), val = tensor<fp16, []>(0x1p-30)];
+            tensor<fp16, [1, 256]> mystery_out = some_future_norm(epsilon = mystery_eps, x = in_cast_fp16)[name = tensor<string, []>("mystery_out")];
+"#;
+
 /// The vanishing guard sites of an already-audited graph, rendered and sorted
 /// as a **multiset** — duplicates PRESERVED. Two sites with the same signature
 /// are two defects, not one: a `dedup`/set here would let a reconversion that
@@ -1177,6 +1240,55 @@ fn a_norm_with_an_unreadable_epsilon_is_a_hole_not_a_skip() {
       .iter()
       .any(|u| u.contains("batch_norm") && u.contains("n_out")),
     "...but it must be reported unresolved, quoting the statement — not dropped: {:?}",
+    audit.unresolved
+  );
+}
+
+/// F2, recognized vocabulary: an `l2_norm` with a fp16-vanishing epsilon must
+/// surface as a FINDING (a vanishing guard site), rendered like the other norms
+/// but with an `l2_norm/` op prefix — beside a clean `log` that still survives.
+/// Before `l2_norm` was in the vocabulary it fell to the `_ => None` wildcard and
+/// produced NEITHER a finding NOR an unresolved hole: a re-conversion adding a
+/// safe `log` plus a vanishing `l2_norm(epsilon = 1e-8)` swept GREEN. MUTATION
+/// PROOF: dropping `l2_norm` from the norm arm sends it to the `epsilon`
+/// catch-all → unresolved → `vanishing()` panics; dropping BOTH the arm and the
+/// catch-all sends it to the wildcard → empty `vanishing()` → this assertion red.
+#[test]
+fn an_l2_norm_with_a_vanishing_epsilon_is_a_finding_not_a_wildcard_drop() {
+  assert_eq!(
+    vanishing(L2_NORM_VANISHING),
+    ["l2_norm/fp16 guard=norm eff=9.99999993922529e-9"],
+    "l2_norm's epsilon is its whole divide guard; 1e-8 rounds to zero in fp16 and \
+     must surface as a vanishing finding, not drop through the wildcard"
+  );
+}
+
+/// F2, the CLASS: an op the audit does not recognize that carries an `epsilon`
+/// kwarg is a hole, not an absence — the vocabulary-independent catch-all must
+/// FAIL the audit with the statement quoted, never drop it through the wildcard.
+/// This is what stops a brand-new epsilon-bearing op (a future MIL op, or a known
+/// one we forgot to teach) from sweeping green beside a recognized guard. MUTATION
+/// PROOF: removing the `_ if EPSILON_KWARGS ...` catch-all arm sends the unknown
+/// op to `_ => None` → `unresolved` empty → this assertion red.
+#[test]
+fn an_epsilon_bearing_unknown_op_is_a_hole_not_a_wildcard_drop() {
+  let audit = parse_mil(EPSILON_BEARING_UNKNOWN_OP).audit();
+  assert!(
+    audit.findings.is_empty(),
+    "an unrecognized op yields no resolved finding, got: {:?}",
+    audit
+      .findings
+      .iter()
+      .map(Finding::render)
+      .collect::<Vec<_>>()
+  );
+  assert!(
+    audit
+      .unresolved
+      .iter()
+      .any(|u| u.contains("some_future_norm") && u.contains("mystery_out")),
+    "an unknown op carrying an `epsilon` kwarg must be surfaced as unresolved, quoting the \
+     statement — not dropped through the wildcard: {:?}",
     audit.unresolved
   );
 }
