@@ -3,8 +3,8 @@ name = "speakerkit"
 description = "Native CoreML segmentation and embedding backends for the dia speaker-diarization pipeline"
 version.workspace = true
 edition.workspace = true
-# Unpublishable until the `diarization` sibling publishes (the optional
-# `dia` path dependency has no registry version); flip when it does.
+# Unpublishable until the `diarization` dependency publishes (the optional
+# `dia` git dependency has no registry version); flip when it does.
 publish = false
 rust-version.workspace = true
 license.workspace = true
@@ -24,13 +24,19 @@ thiserror.workspace = true
 
 # Renamed to `dia` (its own package name is `diarization`) so call sites read
 # `dia::offline::OfflineInput` etc., matching the design spec's API (§5).
-# Path is relative to THIS crate (crates/speakerkit): three levels up
-# (crates/speakerkit -> crates -> coremlit workspace root -> findit-studio)
-# then into the sibling `diarization` checkout, not the two-level guess that
-# would resolve inside the coremlit workspace itself — the `dia` feature
-# build (exercised by every `cargo hack test --each-feature` gate run) is
-# the standing, executable proof this path resolves.
-dia = { package = "diarization", path = "../../../diarization", optional = true }
+#
+# Pinned to the public diarization repo by EXACT rev, not a sibling path: a path
+# dep breaks a fresh `cargo metadata` on any checkout lacking the sibling,
+# because Cargo loads a path-dep manifest at resolution time even for an OPTIONAL
+# dep. This rev IS the repo's `origin/main` and is the exact offline surface
+# every green `dia`-feature gate ran against (the sibling was three additive,
+# unmerged `cluster/online` commits ahead, none consumed here).
+#
+# CO-DEV: to build the `dia` feature against a local diarization checkout
+# instead (e.g. an unmerged change), add an UNCOMMITTED `[patch]` to the
+# WORKSPACE ROOT Cargo.toml — see its own "CO-DEV RECIPE" comment. Do not edit
+# this line for that.
+dia = { package = "diarization", git = "https://github.com/findit-studio/diarization", rev = "b6a6f9adc8465f7a4c207dbaa2701d98e1be1ff2", optional = true }
 serde = { workspace = true, optional = true }
 
 [features]
