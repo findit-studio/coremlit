@@ -28,22 +28,19 @@
 //!   `Extractor`, mirroring `owned.rs`'s loop) is responsible for
 //!   zero-padding short chunks before calling — exactly dia's contract,
 //!   made a checked `Result` instead of a debug-only assertion.
-//! - **Non-finite outputs**: dia's `infer` rejects non-finite logits AFTER
-//!   extracting them (`Error::NonFiniteOutput`, `model.rs:346-355`) —
-//!   [`SegmentModel::infer`] does the same (`InferError::NonFiniteOutput`).
-//!   dia additionally rejects non-finite *input* samples before running
-//!   inference (`Error::NonFiniteInput`, `model.rs:283-290`); this crate's
-//!   `InferError` (pinned by Task 1, outside this task's file scope) has no
-//!   matching input-side variant, so that specific boundary isn't
-//!   duplicated here. A non-finite input sample is caught by the
-//!   (already-present) output scan whenever it propagates to a non-finite
-//!   logit — the typical IEEE-arithmetic outcome, but not a guarantee
-//!   (a kernel could in principle absorb it into finite garbage), so this
-//!   is a KNOWN, documented gap vs dia's earlier, more specific guard.
-//!   The variant now exists (`InferError::NonFiniteInput`, added with the
-//!   embed module, which scans its inputs) but is deliberately NOT yet
-//!   wired into [`SegmentModel::infer`] — closing this gap here is queued
-//!   for the pre-merge review pass.
+//! - **Non-finite inputs and outputs**: dia's `infer` rejects non-finite
+//!   *input* samples before running inference (`Error::NonFiniteInput`,
+//!   `model.rs:283-290`) AND non-finite output logits after extracting them
+//!   (`Error::NonFiniteOutput`, `model.rs:346-355`). [`SegmentModel::infer`]
+//!   now mirrors BOTH: `check_finite_input` scans `samples` before the CoreML
+//!   call ([`InferError::NonFiniteInput`]) and `check_finite` scans the
+//!   extracted logits after ([`InferError::NonFiniteOutput`]). Relying on the
+//!   output scan alone was a known gap: a NaN input is exactly the `ort`
+//!   CoreML-EP corruption mode this crate exists to replace, and although it
+//!   typically propagates to a non-finite logit, a kernel could in principle
+//!   absorb it into finite garbage the output scan would miss — so the input
+//!   scan closes that boundary directly, matching dia's own input-side guard
+//!   and the identical scan the embed module already performs on its inputs.
 //! - **Layout re-validation**: dia's `infer` re-validates its output's
 //!   shape/layout on every call (`model.rs:313-338`) because, per its own
 //!   doc comment, "Load-time dimension verification ... is reserved for a
@@ -368,7 +365,9 @@ impl SegmentModel {
   /// # Errors
   /// [`InferError::InputLength`] unless `samples.len() == SEG_CHUNK_SAMPLES`
   /// — see the module doc's "dia contract match" section for why this
-  /// rejects rather than pads. [`InferError::Prediction`] /
+  /// rejects rather than pads. [`InferError::NonFiniteInput`] if any input
+  /// sample is NaN or infinite, scanned before the CoreML call (module doc,
+  /// "Non-finite inputs and outputs"). [`InferError::Prediction`] /
   /// [`InferError::Tensor`] on a CoreML or tensor-construction failure —
   /// including a prediction whose runtime output set omits `segments`
   /// entirely ([`coremlit::PredictionError::MissingOutput`]; the
@@ -390,6 +389,7 @@ impl SegmentModel {
   /// this crate exists to replace.
   pub fn infer(&self, samples: &[f32]) -> Result<Vec<f32>, InferError> {
     check_input_length(samples.len())?;
+    check_finite_input(samples)?;
 
     let audio = MultiArray::from_slice(&[1, 1, SEG_CHUNK_SAMPLES], samples)?;
     let mut outputs = self.model.predict_with(&[(names::AUDIO, &audio)])?;
@@ -457,6 +457,20 @@ fn check_output_shape(shape: &[usize], num_frames: usize) -> Result<(), InferErr
 fn check_finite(logits: &[f32]) -> Result<(), InferError> {
   if let Some(index) = logits.iter().position(|v| !v.is_finite()) {
     return Err(InferError::NonFiniteOutput { index });
+  }
+  Ok(())
+}
+
+/// Scans `samples` for the first non-finite value, BEFORE the CoreML call —
+/// hermetically testable without a loaded model. Mirrors the embed module's
+/// identical input-side scan and dia's own `Error::NonFiniteInput` guard
+/// (`diarization/src/segment/model.rs:283-290`): a NaN sample would otherwise
+/// reach CoreML, and while it usually propagates to a non-finite logit the
+/// output scan catches, a kernel could absorb it into finite garbage — see
+/// the module doc's "Non-finite inputs and outputs" section.
+fn check_finite_input(samples: &[f32]) -> Result<(), InferError> {
+  if let Some(index) = samples.iter().position(|v| !v.is_finite()) {
+    return Err(InferError::NonFiniteInput { index });
   }
   Ok(())
 }

@@ -1062,6 +1062,19 @@ fn fill_padded_chunk(padded: &mut [f16], samples: &[f32], start: usize) -> usize
   n
 }
 
+/// Scans `samples` for the first non-finite value, BEFORE any f16 conversion
+/// or inference — hermetically testable without a loaded model. Mirrors the
+/// embed module's identical input-side scan and dia's own `NonFiniteInput`
+/// guard: a NaN sample would otherwise convert to an f16 NaN in
+/// [`fill_padded_chunk`] and reach the segmenter, where it can masquerade as a
+/// finite-looking but corrupt decode no consumed-output scan reliably catches.
+fn check_finite_input(samples: &[f32]) -> Result<(), InferError> {
+  if let Some(index) = samples.iter().position(|v| !v.is_finite()) {
+    return Err(InferError::NonFiniteInput { index });
+  }
+  Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Model I/O
 // ─────────────────────────────────────────────────────────────────────────
@@ -1466,8 +1479,11 @@ impl ModelSource for ArgmaxSource {
   ///   `Extraction` — `onset` is inert on argmax's hard-binary decode (module
   ///   doc). The guard is kept so an out-of-range value is still an error
   ///   rather than silently meaningless.
-  /// - [`ExtractError::Infer`] if any of the three models fails, an output's
-  ///   shape diverges, or a CONSUMED tensor holds a non-finite value.
+  /// - [`ExtractError::Infer`] wrapping [`InferError::NonFiniteInput`] if any
+  ///   input sample is NaN or infinite (scanned before any f16 conversion or
+  ///   inference), or wrapping a model/shape/consumed-output failure if any of
+  ///   the three models fails, an output's shape diverges, or a CONSUMED tensor
+  ///   holds a non-finite value.
   /// - [`ExtractError::OutputFrameCountOverflow`] if the derived
   ///   `num_output_frames` would not fit in `usize` (unreachable through this
   ///   geometry; kept typed, as in [`crate::extract`]).
@@ -1487,6 +1503,10 @@ impl ModelSource for ArgmaxSource {
         onset: w_opts.onset(),
       });
     }
+    // Reject a NaN/inf sample before it is converted to f16 and fed to the
+    // segmenter (M2) — the same input-side contract the embed module already
+    // enforces; converts to `ExtractError::Infer` via `?`.
+    check_finite_input(samples)?;
 
     // The Extraction chunk grid IS dia's (module doc's theorem), so it is
     // computed from the very same function FluidAudioSource uses — the two
