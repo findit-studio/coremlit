@@ -198,8 +198,12 @@ mod names {
 ///
 /// The corruption is bit-identical run to run — systematic, not
 /// nondeterminism — and it reaches the output: on the `All` path 8 of the 22
-/// jfk words shift in time (`ask` starts 881.6 ms late) and all 22 differ in
-/// timing and/or score. There is no trade-off to weigh, because the ANE
+/// jfk words shift in time (`ask` starts 881.6 ms early — 7533.7 ms against the
+/// correct 8415.3 ms) and all 22 differ in timing and/or score. Those
+/// word-shift figures are a pre-truncation-fix measurement, whose exact ms
+/// shifted with the fix; unlike the post-fix 549-frame table above they show
+/// only the ANE corruption's *direction* and *magnitude*, not timings against
+/// the current frame geometry. There is no trade-off to weigh, because the ANE
 /// placement is ~450× slower to load, ~3× slower to predict, **and** wrong;
 /// `CpuOnly` additionally has the best predict time of any numerically-correct
 /// placement.
@@ -782,29 +786,45 @@ impl Encoder {
   ///
   /// # Truncation formula
   ///
-  /// `T = floor((real_samples.max(400) − 400) / HOP_SAMPLES) + 1`, the
-  /// wav2vec2 feature extractor's OWN output-length arithmetic — the frame
-  /// count asry's variable-length ONNX encoder produces for the same audio,
-  /// which is exactly what this crate must reproduce to align identically
-  /// (`tests/parity_words.rs`). The `400` is the seven-layer strided conv
-  /// stack's receptive field (`RECEPTIVE_FIELD_SAMPLES`): the first output
-  /// frame needs a full 400-sample window, not one [`HOP_SAMPLES`] stride, and
-  /// each further frame needs one more stride. A chunk shorter than the
-  /// receptive field is padded up to it (asry's own `< 400` pad, mirrored by
-  /// the `.max(400)`) and yields exactly one frame.
+  /// Piecewise in the real (pre-pad) sample count, with `HOP_SAMPLES = 320` and
+  /// the `RECEPTIVE_FIELD_SAMPLES = 400` receptive field:
+  ///
+  /// ```text
+  /// real_samples == 0        →  T = 0
+  /// 1 <= real_samples < 400  →  T = 1   (padded up to the receptive field)
+  /// real_samples >= 400      →  T = floor((real_samples − 400) / HOP_SAMPLES) + 1
+  /// ```
+  ///
+  /// The lower two branches are the wav2vec2 feature extractor's OWN
+  /// output-length arithmetic — the frame count asry's variable-length ONNX
+  /// encoder produces for the same audio, which is exactly what this crate must
+  /// reproduce to align identically (`tests/parity_words.rs`). The `400` is the
+  /// seven-layer strided conv stack's receptive field
+  /// (`RECEPTIVE_FIELD_SAMPLES`): the first output frame needs a full 400-sample
+  /// window, not one [`HOP_SAMPLES`] stride, and each further frame needs one
+  /// more stride. A chunk shorter than the receptive field is padded up to it
+  /// (asry's own `< 400` pad) and yields exactly one frame — the middle branch.
+  /// The closed form `floor((real_samples.max(400) − 400) / HOP_SAMPLES) + 1`
+  /// folds that middle branch into the third via the `.max(400)` and is exact
+  /// for every `real_samples >= 1`; it is **not** exact at zero, where it would
+  /// floor UP to one phantom frame, so `real_samples == 0 → 0` is a separate
+  /// branch (a trivial chunk's empty tensor must stay empty — asry
+  /// short-circuits it before the encoder runs).
   ///
   /// It is **not** `ceil(real_samples / HOP_SAMPLES)`. That earlier formula
-  /// over-counted at every length by inventing a phantom frame out of the
-  /// receptive-field slack: `ceil(641/320) = 3` where the conv stack yields
-  /// **1** (641 real samples do not fill a second 400-wide window),
-  /// `ceil(48_000/320) = 150` where it yields **149**. Those phantom frames are
-  /// pure padding-derived structure — a 641-sample chunk carrying three
-  /// distinct tokens then returned a plausible alignment across three frames
-  /// that do not exist, where the reference correctly returns `NoAlignmentPath`
-  /// (one real frame cannot carry three tokens); asry's `chunk_extent ± 2·hop`
-  /// stride check (`3×320 = 960` inside `641 ± 640`) is too loose to catch it.
-  /// `tests/prepared_composition.rs` and `tests/align_chunk.rs` pin that
-  /// end-to-end.
+  /// agrees with the conv geometry only up to one hop — the two are identical on
+  /// `0..=HOP_SAMPLES` (both **0** at empty, both **1** across `1..=320`) — and
+  /// over-counts by one or two frames at every length ABOVE `HOP_SAMPLES`,
+  /// inventing phantom frames out of the receptive-field slack: `ceil(321/320) =
+  /// 2` and `ceil(641/320) = 3` where the conv stack yields **1** (neither 321
+  /// nor 641 real samples fills a second 400-wide window), `ceil(48_000/320) =
+  /// 150` where it yields **149**. Those phantom frames are pure padding-derived
+  /// structure — a 641-sample chunk carrying three distinct tokens then returned
+  /// a plausible alignment across three frames that do not exist, where the
+  /// reference correctly returns `NoAlignmentPath` (one real frame cannot carry
+  /// three tokens); asry's `chunk_extent ± 2·hop` stride check (`3×320 = 960`
+  /// inside `641 ± 640`) is too loose to catch it. `tests/prepared_composition.rs`
+  /// and `tests/align_chunk.rs` pin that end-to-end.
   ///
   /// Clamped to [`Self::frames`] as a defensive invariant only. At
   /// `real_samples == ENCODER_WINDOW_SAMPLES` (960,000 — the `ted_60.wav`
