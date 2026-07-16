@@ -2429,6 +2429,39 @@ pub fn merge_transcription_results_with_options(
   merge_results(results, options.drop_blank_audio())
 }
 
+/// The number of segment-id ordinals a result's decode **consumed** for the
+/// merge's id assignment: the carried [`TaskFacts::decoded_span`] when tracked,
+/// else the survivors' own extent — `max local id + 1`, or `0` when none
+/// survived — the fallback a hand-built or deserialized result (which carries no
+/// span) relies on.
+///
+/// This is the single definition both the id-base advance AND the task-facts
+/// fold consume, so the aggregate span the merged record STORES is exactly the
+/// total the ids actually consumed — the invariant that keeps a staged re-merge
+/// numbering identically to a one-shot merge even when a child's span was
+/// untracked (F1, codex round 6 post-consolidation; R6-F3 stored the raw
+/// optional, which under-counted an untracked-but-surviving child).
+///
+/// # Panics
+/// On the same `usize::MAX`-id overflow the id mapping guards (a hand-built
+/// segment id near [`usize::MAX`]); see [`merge_transcription_results_with_options`]'s
+/// own `# Panics`.
+fn effective_decoded_span(result: &TranscriptionResult) -> usize {
+  match result.task_facts().decoded_span() {
+    Some(span) => span,
+    None => result
+      .segments_slice()
+      .iter()
+      .map(TranscriptionSegment::id)
+      .max()
+      .map_or(0, |max_local_id| {
+        max_local_id.checked_add(1).expect(
+          "drop_blank_audio segment-id mapping overflowed usize (a segment id near usize::MAX)",
+        )
+      }),
+  }
+}
+
 /// The single merge implementation behind [`merge_transcription_results`]
 /// and [`merge_transcription_results_with_options`].
 ///
@@ -2474,8 +2507,6 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
   // survivors' own extent, its pre-existing behavior.
   let mut id_base = 0usize;
   for (result_index, result) in results.iter().enumerate() {
-    let mut max_local_id = 0usize;
-    let mut saw_segment = false;
     for (segment_index, segment) in result.segments_slice().iter().enumerate() {
       let id = if skip_empty_texts {
         // Checked: a hand-built `usize::MAX` id is adversarial input, so a
@@ -2488,24 +2519,15 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
         result_index + segment_index
       };
       segments.push(segment.clone().with_id(id));
-      max_local_id = max_local_id.max(segment.id());
-      saw_segment = true;
     }
     if skip_empty_texts {
-      // Advance past this chunk's DECODED id window. The carried span is
-      // authoritative (it counts the ordinals the decode allocated, dropped
-      // segments included); a result without one falls back to the survivors'
-      // own extent — `max local id + 1`, or 0 when nothing survived. Same
-      // checked arithmetic and rationale as the per-segment add above.
-      let span = match result.task_facts().decoded_span() {
-        Some(span) => span,
-        None if saw_segment => max_local_id.checked_add(1).expect(
-          "drop_blank_audio segment-id mapping overflowed usize (a segment id near usize::MAX)",
-        ),
-        None => 0,
-      };
+      // Advance past this chunk's DECODED id window by exactly the span
+      // [`effective_decoded_span`] reports — the carried authoritative count, or
+      // the survivors' own extent when untracked. That same helper feeds the
+      // task-facts fold below, so the stored aggregate can never disagree with
+      // the ordinals the ids just consumed.
       id_base = id_base
-        .checked_add(span)
+        .checked_add(effective_decoded_span(result))
         .expect("drop_blank_audio segment-id base overflowed usize (a segment id near usize::MAX)");
     }
   }
@@ -2635,12 +2657,22 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
   //   fallback).
   // - **concatenates** the worker schedules in order, so `[0, 2]` stays distinct
   //   from `[0, 1]` instead of collapsing to the first child's coordinate (R6-F2).
-  // - **sums** the decoded spans, so the merged result STORES its aggregate id
-  //   span and a staged re-merge (a VAD result re-merged at streaming finalize)
-  //   renumbers identically to a one-shot merge (R6-F3).
+  // - **sums** each child's EFFECTIVE span (`effective_decoded_span` — the carried
+  //   count, or the survivors' extent when untracked, the SAME value the id base
+  //   advanced by above), so the merged result STORES an aggregate that equals
+  //   what the ids actually consumed. A staged re-merge (a VAD result re-merged at
+  //   streaming finalize) then renumbers identically to a one-shot merge — even
+  //   when a child's span was untracked, the case R6-F3's raw-optional sum
+  //   under-counted into a staged-vs-one-shot id collision (F1, codex round 6
+  //   post-consolidation).
   let mut task_facts = TaskFacts::unknown();
   for result in results {
-    task_facts.merge(result.task_facts());
+    task_facts.merge(
+      &result
+        .task_facts()
+        .clone()
+        .with_decoded_span(Some(effective_decoded_span(result))),
+    );
   }
 
   TranscriptionResult::new(text, segments, language, timings).with_task_facts(task_facts)

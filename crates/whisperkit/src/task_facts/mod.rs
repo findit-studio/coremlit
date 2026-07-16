@@ -31,14 +31,34 @@
 //!
 //! # Explicit unknown, never a fabricated default
 //!
-//! [`TaskFacts::worker_schedule`] and [`TaskFacts::observed_language`] each carry
-//! an **explicit-unknown** state (`None`) distinct from any value. A record built
-//! from options with no decode to speak for
-//! ([`Provenance::from_options`](crate::provenance::Provenance::from_options)),
-//! or a transcript assembled by hand, knows no worker coordinate and witnessed
-//! no language — and says exactly that, rather than the worker `0` /
-//! `""`-language a default would forge. The merge law treats that unknown as an
-//! identity (it contributes nothing), which is what keeps the law associative.
+//! Every fact this record carries has an **explicit-unknown** state distinct
+//! from any observed value: `None` for [`TaskFacts::observed_language`] and
+//! [`TaskFacts::worker_schedule`], and — since codex round 6's post-consolidation
+//! F1 — `Option<bool>`'s `None` for [`TaskFacts::drew_from_rng`] and
+//! [`TaskFacts::early_stopped`] too. A record built from options with no decode to
+//! speak for ([`Provenance::from_options`](crate::provenance::Provenance::from_options)),
+//! or a transcript assembled by hand, knows no worker coordinate, witnessed no
+//! language, and **cannot observe** whether the decode drew from the sampler or a
+//! callback truncated it — and says exactly that, rather than the worker `0`,
+//! `""`-language, or the optimistic `drew = false` / `not-truncated` a default
+//! would forge.
+//!
+//! The distinction is not cosmetic: it separates two roles a single all-`false`
+//! record used to conflate.
+//!
+//! - As the **merge identity**, an unknown contributes nothing — the OR-of-bools
+//!   and the language/schedule/span folds all treat `None` as the neutral
+//!   element, which is what keeps [the merge law](TaskFacts::merge) associative.
+//! - As an **epistemic unknown**, an unknown boolean forces
+//!   [`is_reproducible_under`](TaskFacts::is_reproducible_under) to answer
+//!   CONSERVATIVELY: a record that cannot know whether a transcript-controlling
+//!   event (an RNG draw, a callback truncation) occurred must NOT promise
+//!   byte-reproducibility. The old `false`-means-both representation handed that
+//!   promise to a genuinely truncated segment recorded through
+//!   [`Provenance::for_segment`](crate::provenance::Provenance::for_segment),
+//!   whose constructor cannot see the truncation (F1). Only a fact POSITIVELY
+//!   observed as `Some(false)` — the shape a real decode carries out of the
+//!   window loop — earns the optimistic answer.
 
 #[cfg(test)]
 mod tests;
@@ -62,6 +82,19 @@ where
   <Option<T> as serde::Deserialize<'de>>::deserialize(deserializer)
 }
 
+/// Logical OR lifted over [`TaskFacts`]'s explicit-unknown booleans: `None` is
+/// the identity (an unobserved child contributes nothing), and two observed
+/// values OR. Lifting the `(bool, ||)` semigroup with a free identity keeps the
+/// operation associative, which is what makes the merge law a monoid over the
+/// tri-state representation (F1, codex round 6 post-consolidation).
+const fn or_unknown(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+  match (a, b) {
+    (Some(a), Some(b)) => Some(a || b),
+    (some @ Some(_), None) | (None, some @ Some(_)) => some,
+    (None, None) => None,
+  }
+}
+
 /// A carried record of the decode-time facts a transcription **run controls**,
 /// as opposed to the ones its [`DecodingOptions`](crate::options::DecodingOptions)
 /// configure: whether it drew from the token sampler, the language it genuinely
@@ -83,11 +116,14 @@ where
 ///   .with_observed_language(Some("es".to_string()))
 ///   .with_worker(2)
 ///   .with_decoded_span(Some(3));
-/// assert!(facts.drew_from_rng());
+/// assert_eq!(facts.drew_from_rng(), Some(true));
 /// assert_eq!(facts.observed_language(), Some("es"));
 /// assert_eq!(facts.worker_schedule(), Some([2].as_slice()));
-/// // A hand-built record knows no worker coordinate — explicit unknown, never 0.
+/// // A hand-built record knows no worker coordinate and cannot observe the draw
+/// // or a truncation — explicit unknown throughout, never a fabricated 0/false.
 /// assert_eq!(TaskFacts::unknown().worker_schedule(), None);
+/// assert_eq!(TaskFacts::unknown().drew_from_rng(), None);
+/// assert_eq!(TaskFacts::unknown().early_stopped(), None);
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -100,11 +136,21 @@ pub struct TaskFacts {
   /// fact, never re-derived from the surviving segments' temperatures (which a
   /// filter can empty). See [`crate::provenance::Provenance::is_reproducible`].
   ///
-  /// Required on deserialize: a dropped flag would read back `false` ("never
-  /// sampled"), the optimistic answer that hands a byte-reproducibility
-  /// guarantee to a run that never earned it — the one direction this must
-  /// never silently fail in.
-  drew_from_rng: bool,
+  /// **`Option<bool>`, with `None` the explicit unknown** (F1, codex round 6
+  /// post-consolidation): `Some(true)`/`Some(false)` is a decode that OBSERVED
+  /// whether it drew, `None` a record that cannot know (an options-only
+  /// [`Provenance::from_options`](crate::provenance::Provenance::from_options),
+  /// or the [`Self::unknown`] merge identity). A `false` and an unknown are NOT
+  /// the same fact: [`Self::is_reproducible_under`] trusts an observed
+  /// `Some(false)` (deterministic) but treats `None` conservatively.
+  ///
+  /// Required on deserialize (present, nullable, via [`required_option`]): a
+  /// dropped flag would read back `None` and — were `None` optimistic — hand a
+  /// byte-reproducibility guarantee to a run that never earned it; keeping it
+  /// present and conservative closes the one direction this must never silently
+  /// fail in.
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "required_option"))]
+  drew_from_rng: Option<bool>,
   /// The language a window **actually observed** (a probe ran or a `<|lang|>`
   /// token was predicted), or `None` when the run observed none. The
   /// **outcome**, distinct from the configured
@@ -123,13 +169,26 @@ pub struct TaskFacts {
   /// an ordinary EOT) — a caller CONTROL action, OR-ed across every attempt
   /// including a **rejected** one whose truncation changed which attempt the
   /// fallback ladder selected (R6-F1), and captured before any error could
-  /// propagate. Independently forces [`Self::is_reproducible_under`] false: a
+  /// propagate. An observed `Some(false)` forces nothing; an observed
+  /// `Some(true)` independently forces [`Self::is_reproducible_under`] false: a
   /// closure has no readable identity, so a re-run from the recorded
   /// options+seed alone cannot reproduce the truncation.
   ///
-  /// Required on deserialize, like [`Self::drew_from_rng`]: a dropped flag
-  /// reads back `false` ("not truncated"), the optimistic answer.
-  early_stopped: bool,
+  /// **`Option<bool>`, with `None` the explicit unknown** (F1, codex round 6
+  /// post-consolidation): a constructor that cannot see the truncation —
+  /// [`Provenance::for_segment`](crate::provenance::Provenance::for_segment) and
+  /// [`Provenance::from_options`](crate::provenance::Provenance::from_options),
+  /// which are handed options and at most one segment, never the callback —
+  /// records `None`, and [`Self::is_reproducible_under`] then refuses to promise
+  /// reproducibility rather than fabricating a `not-truncated`. That fabrication
+  /// was the bug: a genuinely callback-truncated segment recorded through
+  /// `for_segment` used to read back reproducible.
+  ///
+  /// Required on deserialize (present, nullable, via [`required_option`]), like
+  /// [`Self::drew_from_rng`]: a dropped flag must not silently become the
+  /// optimistic answer.
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "required_option"))]
+  early_stopped: Option<bool>,
   /// The ordered worker/chunk coordinates whose RNG streams produced this
   /// transcript's segments — a single decode task's own
   /// [`window_id_offset`](crate::transcribe::TranscribeTask::set_window_id_offset)
@@ -208,33 +267,42 @@ task_facts_field_names!(
 );
 
 impl TaskFacts {
-  /// The all-unknown record: no draw, no observed language, not truncated, an
-  /// **unknown** worker schedule (`None`, never `[0]`) and an untracked span
-  /// (`None`). The value a hand-built [`TranscriptionResult`](crate::result::TranscriptionResult)
+  /// The all-unknown record: an **unknown** draw and truncation (`None`, never
+  /// the optimistic `Some(false)`), no observed language, an **unknown** worker
+  /// schedule (`None`, never `[0]`), and an untracked span (`None`). The value a
+  /// hand-built [`TranscriptionResult`](crate::result::TranscriptionResult)
   /// carries, an options-only [`Provenance`](crate::provenance::Provenance)
-  /// records, and the **identity** of [`Self::merge`].
+  /// records, and the **identity** of [`Self::merge`]. Layer POSITIVELY observed
+  /// facts on with the `with_*` builders — a genuinely greedy, un-truncated
+  /// decode is `unknown().with_drew_from_rng(false).with_early_stopped(false)`,
+  /// which [`Self::is_reproducible_under`] can then trust, where the bare
+  /// `unknown()` cannot.
   #[inline]
   pub const fn unknown() -> Self {
     Self {
-      drew_from_rng: false,
+      drew_from_rng: None,
       observed_language: None,
-      early_stopped: false,
+      early_stopped: None,
       worker_schedule: None,
       decoded_span: None,
     }
   }
 
   // -- drew_from_rng ------------------------------------------------------
-  /// Whether the decode ever drew from the token sampler. See the field's doc.
+  /// Whether the decode ever drew from the token sampler, or `None` when
+  /// unobserved. See the field's doc.
   #[inline(always)]
-  pub const fn drew_from_rng(&self) -> bool {
+  pub const fn drew_from_rng(&self) -> Option<bool> {
     self.drew_from_rng
   }
-  /// Builder setting [`Self::drew_from_rng`].
+  /// Builder recording [`Self::drew_from_rng`] as a POSITIVELY observed fact
+  /// (`Some(drew_from_rng)`) — the shape a decode carries out of the window
+  /// loop. Leave it at [`Self::unknown`]'s `None` to say the draw was
+  /// unobserved.
   #[must_use]
   #[inline(always)]
   pub const fn with_drew_from_rng(mut self, drew_from_rng: bool) -> Self {
-    self.drew_from_rng = drew_from_rng;
+    self.drew_from_rng = Some(drew_from_rng);
     self
   }
 
@@ -253,16 +321,20 @@ impl TaskFacts {
   }
 
   // -- early_stopped ------------------------------------------------------
-  /// Whether a progress callback truncated the decode. See the field's doc.
+  /// Whether a progress callback truncated the decode, or `None` when
+  /// unobserved. See the field's doc.
   #[inline(always)]
-  pub const fn early_stopped(&self) -> bool {
+  pub const fn early_stopped(&self) -> Option<bool> {
     self.early_stopped
   }
-  /// Builder setting [`Self::early_stopped`].
+  /// Builder recording [`Self::early_stopped`] as a POSITIVELY observed fact
+  /// (`Some(early_stopped)`). Leave it at [`Self::unknown`]'s `None` when the
+  /// constructor cannot see the callback — the honest state for
+  /// [`Provenance::for_segment`](crate::provenance::Provenance::for_segment).
   #[must_use]
   #[inline(always)]
   pub const fn with_early_stopped(mut self, early_stopped: bool) -> Self {
-    self.early_stopped = early_stopped;
+    self.early_stopped = Some(early_stopped);
     self
   }
 
@@ -311,8 +383,11 @@ impl TaskFacts {
   /// VAD result safe to re-merge at streaming finalize (R6-F3):
   ///
   /// - **[`drew_from_rng`](Self::drew_from_rng)** / **[`early_stopped`](Self::early_stopped)**
-  ///   — logical OR. Either fact is true of the merge if it was true of any
-  ///   child.
+  ///   — logical OR lifted over the explicit unknown: `None` is
+  ///   the identity (an unobserved child contributes nothing), and two observed
+  ///   values OR. The merge is `Some(true)` iff some child observed `true`,
+  ///   `Some(false)` iff at least one child observed the fact and every observing
+  ///   child saw `false`, and `None` only when NO child observed it at all.
   /// - **[`observed_language`](Self::observed_language)** — first genuine
   ///   observation wins: `self`'s is kept when present, else `other`'s is
   ///   adopted. A scalar cannot hold two conflicting observations, and a
@@ -327,8 +402,8 @@ impl TaskFacts {
   ///   `None` child contributes nothing; the sum is `None` only when every
   ///   child is untracked.
   pub fn merge(&mut self, other: &Self) {
-    self.drew_from_rng |= other.drew_from_rng;
-    self.early_stopped |= other.early_stopped;
+    self.drew_from_rng = or_unknown(self.drew_from_rng, other.drew_from_rng);
+    self.early_stopped = or_unknown(self.early_stopped, other.early_stopped);
     if self.observed_language.is_none() {
       self.observed_language = other.observed_language.clone();
     }
@@ -349,9 +424,23 @@ impl TaskFacts {
   }
 
   /// Whether a transcript carrying these facts can be reproduced byte-for-byte
-  /// by re-running the same audio through the same options — `true` when the
-  /// decode never drew from the sampler, or when `seeded` makes the draws it did
-  /// make replayable, AND no progress callback truncated it.
+  /// by re-running the same audio through the same options — `true` only when
+  /// the decode POSITIVELY observed that it never drew from the sampler (or
+  /// `seeded` makes the draws it did make replayable) AND POSITIVELY observed
+  /// that no progress callback truncated it.
+  ///
+  /// **Conservative on the explicit unknown** (F1, codex round 6
+  /// post-consolidation): an unobserved draw or truncation (`None`) answers
+  /// `false`, never the optimistic value. A record that cannot see whether a
+  /// transcript-controlling event happened — an options-only
+  /// [`Provenance::from_options`](crate::provenance::Provenance::from_options),
+  /// or a segment-only [`Provenance::for_segment`](crate::provenance::Provenance::for_segment)
+  /// that is handed the truncated segment but never the callback — must not
+  /// promise byte-reproducibility. Only a real decode's carried `Some(false)`
+  /// facts, read by [`Provenance::for_result`](crate::provenance::Provenance::for_result)
+  /// off the transcript, earns the optimistic answer. The bare [`Self::unknown`]
+  /// is therefore NOT reproducible; a genuinely greedy run is
+  /// `unknown().with_drew_from_rng(false).with_early_stopped(false)`.
   ///
   /// The reproducibility predicate [`Provenance::is_reproducible`](crate::provenance::Provenance::is_reproducible)
   /// is built on: it reads [`Self::drew_from_rng`] and [`Self::early_stopped`]
@@ -361,6 +450,12 @@ impl TaskFacts {
   /// the full rationale.
   #[inline]
   pub const fn is_reproducible_under(&self, seeded: bool) -> bool {
-    !self.early_stopped && (!self.drew_from_rng || seeded)
+    let not_truncated = matches!(self.early_stopped, Some(false));
+    let draw_replayable = match self.drew_from_rng {
+      Some(false) => true,
+      Some(true) => seeded,
+      None => false,
+    };
+    not_truncated && draw_replayable
   }
 }

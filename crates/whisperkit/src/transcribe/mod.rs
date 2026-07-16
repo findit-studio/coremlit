@@ -651,9 +651,16 @@ where
       //   segments included) is what the merge advances its running base by.
       .with_task_facts({
         let facts = facts_sink.lock().unwrap_or_else(PoisonError::into_inner);
-        TaskFacts::unknown()
-          .with_drew_from_rng(facts.drew_from_rng())
-          .with_early_stopped(facts.early_stopped())
+        // Carry the sink's ACCUMULATED draw/early-stop facts verbatim — each an
+        // explicit `Some`/`None`, never collapsed to a bool (F1, codex round 6
+        // post-consolidation) — and layer THIS task's own observation, worker
+        // coordinate, and id span on top. The per-attempt merge only ever sets
+        // draw/early-stop/observation on the sink, so its worker schedule and
+        // span are still `None`; the `with_*` calls below define them, and
+        // `with_observed_language` overrides the sink's cross-chunk observation
+        // with this task's own (the sink carries it cross-chunk for the VAD merge).
+        facts
+          .clone()
           .with_observed_language(observed_language)
           .with_worker(self.window_id_offset)
           .with_decoded_span(Some(decoded_segment_span))

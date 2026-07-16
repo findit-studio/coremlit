@@ -340,6 +340,67 @@ fn drop_on_merge_is_associative_over_the_id_span() {
 }
 
 #[test]
+fn drop_on_merge_is_associative_with_mixed_tracked_and_untracked_spans() {
+  // F1 (codex round 6 post-consolidation). The R6-F3 fix stored the merged
+  // aggregate span, but as the sum of the RAW optional `decoded_span`s — which
+  // UNDER-counts a child that is untracked yet contributed a surviving segment,
+  // exactly the shape a public `TranscriptionResult::new` produces (documented
+  // untracked span). `[untracked-with-one-survivor, tracked span 1, tracked span
+  // 1]` therefore renumbered differently one-shot vs. staged. The fix sums each
+  // child's EFFECTIVE span (the same survivor-extent fallback the id assignment
+  // consumes), so the stored aggregate always equals what the ids consumed.
+  //
+  // Mutation proof: revert the fold to `task_facts.merge(result.task_facts())`
+  // (the raw optional, dropping the `effective_decoded_span` substitution) and
+  // the staged ids collapse to [0, 1, 1], failing the equality below.
+  let opts = DecodingOptions::new(); // drop ON (the default)
+  // A: a public `new` result — one surviving segment (local id 0), span
+  // UNTRACKED (`None`), the documented contract of the public constructor.
+  let untracked = |token: u32| {
+    let mut seg = TranscriptionSegment::new();
+    seg.set_id(0).set_text(" A").set_tokens(vec![token]);
+    TranscriptionResult::new(" A", vec![seg], "en", TranscriptionTimings::new())
+  };
+  let a = untracked(20);
+  assert_eq!(
+    a.task_facts().decoded_span(),
+    None,
+    "the public constructor leaves the span untracked, yet a segment survives"
+  );
+  let b = span_one_speech(21); // tracked span 1, one segment
+  let c = span_one_speech(22); // tracked span 1, one segment
+
+  let one_shot =
+    merge_transcription_results_with_options(&[a.clone(), b.clone(), c.clone()], &opts);
+  assert_eq!(
+    segment_ids(&one_shot),
+    vec![0, 1, 2],
+    "the untracked child's one survivor still consumes ordinal 0"
+  );
+  assert_eq!(
+    one_shot.task_facts().decoded_span(),
+    Some(3),
+    "the stored aggregate is the sum of EFFECTIVE spans (1 + 1 + 1), not the raw \
+     optionals (None + 1 + 1 = 2)"
+  );
+
+  // Staged: merge [a, b], then re-merge that with c.
+  let ab = merge_transcription_results_with_options(&[a, b], &opts);
+  assert_eq!(
+    ab.task_facts().decoded_span(),
+    Some(2),
+    "the intermediate STORES the untracked child's effective extent, not None + 1"
+  );
+  let staged = merge_transcription_results_with_options(&[ab, c], &opts);
+  assert_eq!(
+    segment_ids(&staged),
+    segment_ids(&one_shot),
+    "a staged re-merge renumbers identically to a one-shot merge"
+  );
+  assert_eq!(staged.task_facts().decoded_span(), Some(3));
+}
+
+#[test]
 fn local_agreement_over_a_premerged_vad_result_preserves_the_id_span() {
   // The LocalAgreement finalize re-merges kept results through
   // `merge_transcription_results_with_words`; when one is itself a VAD-merged
@@ -1439,12 +1500,16 @@ fn merge_ors_the_sampling_fact_across_results() {
   // in the merged segment list. The merge has to carry the fact out of it
   // anyway, or the merged transcript looks greedy and claims a
   // byte-reproducibility it cannot honor.
+  // A genuinely greedy chunk POSITIVELY records `drew_from_rng = Some(false)` —
+  // the shape a real decode carries — not the bare `unknown()` a segment alone
+  // would leave (which the merge could not tell from "never observed").
   let greedy = TranscriptionResult::new(
     "Hello",
     vec![TranscriptionSegment::new().with_temperature(0.0)],
     "en",
     TranscriptionTimings::new(),
-  );
+  )
+  .with_task_facts(TaskFacts::unknown().with_drew_from_rng(false));
   // The emptied chunk: zero segments, and the only witness to its own
   // sampling is the carried flag itself.
   let emptied = TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
@@ -1459,28 +1524,34 @@ fn merge_ors_the_sampling_fact_across_results() {
       .all(|segment| segment.temperature() == 0.0),
     "no surviving segment carries the evidence"
   );
-  assert!(
+  assert_eq!(
     merged.task_facts().drew_from_rng(),
+    Some(true),
     "and yet the merge must still know"
   );
 
   // Same through the options-aware door `WhisperKit::transcribe` actually uses.
-  assert!(
+  assert_eq!(
     merge_transcription_results_with_options(&[greedy.clone(), emptied], &DecodingOptions::new())
       .task_facts()
-      .drew_from_rng()
+      .drew_from_rng(),
+    Some(true),
   );
 
-  // All-greedy merges stay honest in the other direction.
-  assert!(
-    !merge_transcription_results(&[greedy.clone(), greedy])
+  // All-greedy merges stay honest in the other direction: two observed
+  // `Some(false)` stay `Some(false)`, never OR-ing up to a phantom draw.
+  assert_eq!(
+    merge_transcription_results(&[greedy.clone(), greedy])
       .task_facts()
-      .drew_from_rng()
+      .drew_from_rng(),
+    Some(false),
   );
-  assert!(
-    !merge_transcription_results(&[])
+  // An empty merge observed nothing at all — explicit unknown, not `Some(false)`.
+  assert_eq!(
+    merge_transcription_results(&[])
       .task_facts()
-      .drew_from_rng()
+      .drew_from_rng(),
+    None,
   );
 }
 

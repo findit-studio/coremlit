@@ -493,15 +493,19 @@ fn result_at(language: &str, temperatures: &[f32]) -> TranscriptionResult {
     TranscriptionTimings::new(),
   )
   // `new` no longer seeds the observation from the display language (F3, codex
-  // round 3), so model a result that genuinely OBSERVED `language` AND — the
-  // COMMON case — drew from the RNG if any window landed on a non-zero
-  // temperature. `for_result` reads THIS carried record, never the segment
-  // temperatures (F3, codex round 4); the zero-iteration EXCEPTION -- a
-  // non-zero-temperature segment that never drew -- is exercised on its own in
+  // round 3), so model a real decode that ran to completion: it genuinely
+  // OBSERVED `language`, POSITIVELY observed it was NOT truncated
+  // (`early_stopped = Some(false)`, the honest fact of a full run — F1, codex
+  // round 6 post-consolidation), and — the COMMON case — drew from the RNG if
+  // any window landed on a non-zero temperature. `for_result` reads THIS carried
+  // record, never the segment temperatures (F3, codex round 4); the
+  // zero-iteration EXCEPTION -- a non-zero-temperature segment that never drew --
+  // is exercised on its own in
   // `for_result_reads_the_carried_flag_not_the_segment_temperature`.
   .with_task_facts(
     TaskFacts::unknown()
       .with_observed_language((!language.is_empty()).then(|| language.to_string()))
+      .with_early_stopped(false)
       .with_drew_from_rng(temperatures.iter().any(|&t| t != 0.0)),
   )
 }
@@ -623,26 +627,43 @@ fn is_reproducible_requires_greedy_or_a_seed() {
   let unseeded = DecodingOptions::new();
   let seeded = DecodingOptions::new().with_seed(7);
 
+  // The greedy/seed axis is exercised through `for_result`, which reads a
+  // transcript's POSITIVELY observed facts — the only door that can answer
+  // reproducible at all (F1, codex round 6 post-consolidation): `result_at`
+  // carries an observed not-truncated (`early_stopped = Some(false)`), so the
+  // draw and the seed are the only variables left.
+  let repro = |decoding: &DecodingOptions, temps: &[f32]| {
+    Provenance::for_result(decoding, &compute, &result_at("en", temps)).is_reproducible()
+  };
+
   // Greedy (0.0, never drew) -> deterministic, seed or not.
-  assert!(Provenance::from_options(&unseeded, &compute, 0.0, false).is_reproducible());
-  assert!(Provenance::from_options(&seeded, &compute, 0.0, false).is_reproducible());
+  assert!(repro(&unseeded, &[0.0]));
+  assert!(repro(&seeded, &[0.0]));
 
   // Sampled (drew at 0.2): only a seed makes the draws replayable.
   assert!(
-    !Provenance::from_options(&unseeded, &compute, 0.2, true).is_reproducible(),
+    !repro(&unseeded, &[0.2]),
     "a fallback climb with no seed is not reproducible"
   );
-  assert!(Provenance::from_options(&seeded, &compute, 0.2, true).is_reproducible());
+  assert!(repro(&seeded, &[0.2]));
 
-  // A SPLIT ladder (None) is conservatively not reproducible without a
-  // seed: the rungs only ascend, so a split means at least one segment
-  // climbed off 0.0 and sampled. A segment-less result carries no evidence
-  // either way, and this predicate must never claim what it cannot back.
-  let split = |decoding: &DecodingOptions| {
-    Provenance::for_result(decoding, &compute, &result_at("en", &[0.0, 0.2])).is_reproducible()
-  };
-  assert!(!split(&unseeded));
-  assert!(split(&seeded));
+  // A SPLIT ladder (None effective temperature) is conservatively not
+  // reproducible without a seed: the rungs only ascend, so a split means at
+  // least one segment climbed off 0.0 and sampled.
+  assert!(!repro(&unseeded, &[0.0, 0.2]));
+  assert!(repro(&seeded, &[0.0, 0.2]));
+
+  // `from_options`, by contrast, can NEVER answer reproducible — it cannot see
+  // whether a callback truncated the decode, so its `early_stopped` is an
+  // explicit unknown and the predicate stays conservative, whatever the draw
+  // fact or the seed. This is the F1 fix: the old constructor fabricated a
+  // `not-truncated` and handed out a promise it could not back.
+  assert!(!Provenance::from_options(&unseeded, &compute, 0.0, false).is_reproducible());
+  assert!(
+    !Provenance::from_options(&seeded, &compute, 0.0, false).is_reproducible(),
+    "a seed cannot rescue what the constructor never observed — the truncation"
+  );
+  assert!(!Provenance::from_options(&seeded, &compute, 0.2, true).is_reproducible());
 }
 
 #[test]
@@ -983,14 +1004,18 @@ fn for_result_reads_the_carried_sampling_fact_not_the_surviving_segments() {
     "en",
     TranscriptionTimings::new(),
   )
-  .with_task_facts(TaskFacts::unknown().with_drew_from_rng(true));
+  .with_task_facts(
+    TaskFacts::unknown()
+      .with_drew_from_rng(true)
+      .with_early_stopped(false),
+  );
   let record = Provenance::for_result(&unseeded, &compute, &filtered);
   assert_eq!(
     record.effective_temperature(),
     Some(0.0),
     "the survivors really are all greedy -- the fix must not come from here"
   );
-  assert!(record.task_facts().drew_from_rng());
+  assert_eq!(record.task_facts().drew_from_rng(), Some(true));
   assert!(
     !record.is_reproducible(),
     "an unseeded sampled window happened, even though nothing survived to say so"
@@ -1006,7 +1031,7 @@ fn for_result_reads_the_carried_sampling_fact_not_the_surviving_segments() {
   // reproducible -- the answer the old infer-from-survivors rule could not
   // give, because zero segments left it with no evidence and it had to guess.
   let empty = result_at("en", &[]);
-  assert!(!empty.task_facts().drew_from_rng());
+  assert_eq!(empty.task_facts().drew_from_rng(), Some(false));
   let greedy = Provenance::for_result(&unseeded, &compute, &empty);
   assert_eq!(greedy.effective_temperature(), None);
   assert!(
@@ -1027,17 +1052,19 @@ fn from_options_and_for_segment_record_the_explicit_draw_fact_not_the_temperatur
   let decoding = DecodingOptions::new();
 
   // Non-zero temperature, explicit NO draw (the zero-iteration shape).
-  assert!(
-    !Provenance::from_options(&decoding, &compute, 0.3, false)
+  assert_eq!(
+    Provenance::from_options(&decoding, &compute, 0.3, false)
       .task_facts()
       .drew_from_rng(),
+    Some(false),
     "an explicit no-draw at 0.3 is recorded as not sampled, not inferred from 0.3"
   );
   // Zero temperature, explicit draw (proves no inference the other way either).
-  assert!(
+  assert_eq!(
     Provenance::from_options(&decoding, &compute, 0.0, true)
       .task_facts()
       .drew_from_rng(),
+    Some(true),
     "an explicit draw is recorded even at temperature 0.0"
   );
 
@@ -1050,14 +1077,16 @@ fn from_options_and_for_segment_record_the_explicit_draw_fact_not_the_temperatur
     Some(0.3),
     "the segment's rung is still recorded"
   );
-  assert!(
-    !record.task_facts().drew_from_rng(),
+  assert_eq!(
+    record.task_facts().drew_from_rng(),
+    Some(false),
     "a 0.3 segment that never drew is not sampled -- for_segment must not infer from 0.3"
   );
-  assert!(
+  assert_eq!(
     Provenance::for_segment(&decoding, &compute, &never_drew, true)
       .task_facts()
       .drew_from_rng(),
+    Some(true),
     "and an explicit draw on that same segment IS recorded"
   );
 }
@@ -1099,22 +1128,42 @@ fn provenance_records_the_real_draw_fact_never_the_temperature() {
     let unseeded = Provenance::from_options(&DecodingOptions::new(), &compute, temperature, drew);
     assert_eq!(
       unseeded.task_facts().drew_from_rng(),
-      drew,
+      Some(drew),
       "temperature {temperature}: the recorded fact is the explicit draw"
     );
+    // `from_options` cannot observe a truncation, so it is conservatively
+    // non-reproducible whatever the draw (F1) -- the reproducible-iff-greedy
+    // logic is exercised through `for_result`, which reads a transcript's
+    // observed facts. Model that transcript: it drew iff `drew`, and POSITIVELY
+    // ran to completion (`early_stopped = Some(false)`).
+    assert!(
+      !unseeded.is_reproducible(),
+      "temperature {temperature}: from_options never promises reproducibility"
+    );
+    let ran_to_completion = TranscriptionResult::new(
+      "x",
+      vec![TranscriptionSegment::new().with_temperature(temperature)],
+      "en",
+      TranscriptionTimings::new(),
+    )
+    .with_task_facts(
+      TaskFacts::unknown()
+        .with_drew_from_rng(drew)
+        .with_early_stopped(false),
+    );
     assert_eq!(
-      unseeded.is_reproducible(),
+      Provenance::for_result(&DecodingOptions::new(), &compute, &ran_to_completion)
+        .is_reproducible(),
       !drew,
       "unseeded temperature {temperature}: reproducible iff nothing was drawn"
     );
 
     // A seed makes even a real draw replayable.
     assert!(
-      Provenance::from_options(
+      Provenance::for_result(
         &DecodingOptions::new().with_seed(7),
         &compute,
-        temperature,
-        drew
+        &ran_to_completion
       )
       .is_reproducible(),
       "seeded temperature {temperature} replays exactly"
@@ -1141,14 +1190,23 @@ fn for_result_reads_the_carried_flag_not_the_segment_temperature() {
     vec![TranscriptionSegment::new().with_temperature(0.3)],
     "en",
     TranscriptionTimings::new(),
+  )
+  .with_task_facts(
+    // The zero-iteration decode's honest, POSITIVELY observed facts: it never
+    // drew (Some(false)) and ran to completion (Some(false)).
+    TaskFacts::unknown()
+      .with_drew_from_rng(false)
+      .with_early_stopped(false),
   );
-  assert!(
-    !never_drew.task_facts().drew_from_rng(),
+  assert_eq!(
+    never_drew.task_facts().drew_from_rng(),
+    Some(false),
     "the result itself carries no draw"
   );
   let record = Provenance::for_result(&decoding, &compute, &never_drew);
-  assert!(
-    !record.task_facts().drew_from_rng(),
+  assert_eq!(
+    record.task_facts().drew_from_rng(),
+    Some(false),
     "the 0.3 segment must NOT be read as a draw -- the carried flag is the only witness"
   );
   assert!(
@@ -1165,10 +1223,15 @@ fn for_result_reads_the_carried_flag_not_the_segment_temperature() {
     "en",
     TranscriptionTimings::new(),
   )
-  .with_task_facts(TaskFacts::unknown().with_drew_from_rng(true));
+  .with_task_facts(
+    TaskFacts::unknown()
+      .with_drew_from_rng(true)
+      .with_early_stopped(false),
+  );
   let record = Provenance::for_result(&decoding, &compute, &drew_greedy_survivors);
-  assert!(
+  assert_eq!(
     record.task_facts().drew_from_rng(),
+    Some(true),
     "a carried draw survives even when every remaining segment reads 0.0"
   );
   assert!(!record.is_reproducible());

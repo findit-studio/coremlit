@@ -9,8 +9,10 @@ fn merged(a: &TaskFacts, b: &TaskFacts) -> TaskFacts {
 }
 
 /// A deliberately varied corpus spanning every field's interesting states:
-/// draw on/off, three languages plus the unknown, truncated or not, known
-/// single/empty/unknown schedules, and tracked/untracked spans — including the
+/// each explicit-unknown boolean at all THREE of its values (`None`,
+/// `Some(false)`, `Some(true)`) so the OR-lifted-over-unknown merge is exercised
+/// across every mix; three languages plus the unknown; known
+/// single/empty/unknown schedules; and tracked/untracked spans — including the
 /// `unknown()` identity and an all-dropped-style `[]` schedule.
 fn corpus() -> Vec<TaskFacts> {
   vec![
@@ -29,6 +31,17 @@ fn corpus() -> Vec<TaskFacts> {
       .with_early_stopped(true)
       .with_observed_language(Some("en".to_string()))
       .with_decoded_span(Some(2)),
+    // POSITIVELY observed `Some(false)` facts — the shape a real greedy,
+    // un-truncated decode carries — distinct from the `unknown()` `None` above,
+    // so the merge's `Some(false)`/`None`/`Some(true)` mixes are all covered.
+    TaskFacts::unknown()
+      .with_drew_from_rng(false)
+      .with_early_stopped(false)
+      .with_worker(4)
+      .with_decoded_span(Some(1)),
+    TaskFacts::unknown()
+      .with_drew_from_rng(false)
+      .with_early_stopped(true),
     // A merge of zero workers (an empty-but-known schedule), distinct from the
     // unknown schedule above.
     TaskFacts::unknown().with_worker_schedule(Some(Vec::new())),
@@ -65,14 +78,46 @@ fn unknown_is_the_merge_identity() {
 }
 
 #[test]
-fn merge_ors_the_bools() {
+fn merge_ors_the_bools_over_the_explicit_unknown() {
   let drew = TaskFacts::unknown().with_drew_from_rng(true);
   let stopped = TaskFacts::unknown().with_early_stopped(true);
   let both = merged(&drew, &stopped);
-  assert!(both.drew_from_rng() && both.early_stopped());
-  // OR, not last-write: a false does not clear a true.
-  assert!(merged(&drew, &TaskFacts::unknown()).drew_from_rng());
-  assert!(merged(&TaskFacts::unknown(), &drew).drew_from_rng());
+  assert_eq!(both.drew_from_rng(), Some(true));
+  assert_eq!(both.early_stopped(), Some(true));
+
+  // `None` is the identity: an unobserved child contributes nothing, so a true
+  // survives it on either side (OR, never last-write).
+  assert_eq!(
+    merged(&drew, &TaskFacts::unknown()).drew_from_rng(),
+    Some(true)
+  );
+  assert_eq!(
+    merged(&TaskFacts::unknown(), &drew).drew_from_rng(),
+    Some(true)
+  );
+
+  // Two observed values OR: `Some(true)` wins over `Some(false)`, and two
+  // `Some(false)` stay `Some(false)` — NOT collapsed back to the `None` unknown.
+  let greedy = TaskFacts::unknown().with_drew_from_rng(false);
+  assert_eq!(merged(&greedy, &drew).drew_from_rng(), Some(true));
+  assert_eq!(merged(&drew, &greedy).drew_from_rng(), Some(true));
+  assert_eq!(merged(&greedy, &greedy).drew_from_rng(), Some(false));
+
+  // The unknown stays unknown only when NO child observed the fact.
+  assert_eq!(
+    merged(&TaskFacts::unknown(), &TaskFacts::unknown()).drew_from_rng(),
+    None
+  );
+  // A `Some(false)` still overrides the `None` identity (it IS an observation).
+  assert_eq!(
+    merged(&TaskFacts::unknown(), &greedy).early_stopped(),
+    None,
+    "the other child observed nothing about early-stop"
+  );
+  assert_eq!(
+    merged(&TaskFacts::unknown(), &greedy).drew_from_rng(),
+    Some(false)
+  );
 }
 
 #[test]
@@ -138,15 +183,35 @@ fn merge_sums_the_decoded_span() {
 }
 
 #[test]
-fn is_reproducible_under_reads_the_two_carried_facts() {
-  let greedy = TaskFacts::unknown();
+fn is_reproducible_under_is_conservative_on_the_explicit_unknown() {
+  // F1 (codex round 6 post-consolidation). The bare `unknown()` — draw AND
+  // truncation both unobserved — is NOT reproducible: a record that cannot know
+  // whether a transcript-controlling event happened must not promise
+  // byte-reproducibility. This is the case the old `false`-means-both
+  // representation wrongly called reproducible.
+  let unknown = TaskFacts::unknown();
+  assert!(
+    !unknown.is_reproducible_under(false),
+    "unknown is not a promise"
+  );
+  assert!(!unknown.is_reproducible_under(true));
+
+  // A genuinely greedy, un-truncated decode POSITIVELY observes both `false` —
+  // and only THAT earns the optimistic answer, seed or not.
+  let greedy = TaskFacts::unknown()
+    .with_drew_from_rng(false)
+    .with_early_stopped(false);
   assert!(
     greedy.is_reproducible_under(false),
-    "greedy reproduces unseeded"
+    "observed-greedy reproduces"
   );
   assert!(greedy.is_reproducible_under(true));
 
-  let drew = TaskFacts::unknown().with_drew_from_rng(true);
+  // An observed unseeded draw is not reproducible; a seed makes it replayable —
+  // but only because the truncation is ALSO positively observed as `false`.
+  let drew = TaskFacts::unknown()
+    .with_drew_from_rng(true)
+    .with_early_stopped(false);
   assert!(
     !drew.is_reproducible_under(false),
     "an unseeded draw is not reproducible"
@@ -156,11 +221,26 @@ fn is_reproducible_under_reads_the_two_carried_facts() {
     "a seed makes the draw replayable"
   );
 
-  // An early stop forces false regardless of the seed: the callback is not in
-  // the record.
-  let stopped = TaskFacts::unknown().with_early_stopped(true);
+  // An observed early stop forces false regardless of the seed: the callback is
+  // not in the record.
+  let stopped = TaskFacts::unknown()
+    .with_drew_from_rng(false)
+    .with_early_stopped(true);
   assert!(!stopped.is_reproducible_under(false));
   assert!(!stopped.is_reproducible_under(true));
+
+  // An UNKNOWN factor poisons the answer even when the other is observed-clean:
+  // an unobserved truncation (the `for_segment` shape) or an unobserved draw is
+  // conservatively non-reproducible, seed or not.
+  let truncation_unknown = TaskFacts::unknown().with_drew_from_rng(false);
+  assert!(!truncation_unknown.is_reproducible_under(false));
+  assert!(
+    !truncation_unknown.is_reproducible_under(true),
+    "an unobserved truncation is never reproducible, whatever the seed"
+  );
+  let draw_unknown = TaskFacts::unknown().with_early_stopped(false);
+  assert!(!draw_unknown.is_reproducible_under(false));
+  assert!(!draw_unknown.is_reproducible_under(true));
 }
 
 #[cfg(feature = "serde")]
@@ -175,8 +255,21 @@ fn serde_round_trips_every_field() {
   let json = serde_json::to_string(&full).unwrap();
   assert_eq!(serde_json::from_str::<TaskFacts>(&json).unwrap(), full);
 
-  // The unknown record round-trips too: null language/schedule read back as
-  // explicit unknown, and the absent span defaults to None.
+  // A POSITIVELY observed `Some(false)` draw/early-stop round-trips as `false`,
+  // and reads back distinct from the `None` unknown — the whole point of the
+  // tri-state (F1). If `false` and unknown serialized the same, this would fail.
+  let greedy = TaskFacts::unknown()
+    .with_drew_from_rng(false)
+    .with_early_stopped(false)
+    .with_worker(0);
+  let json = serde_json::to_string(&greedy).unwrap();
+  let read: TaskFacts = serde_json::from_str(&json).unwrap();
+  assert_eq!(read, greedy);
+  assert_eq!(read.drew_from_rng(), Some(false));
+  assert_ne!(read.drew_from_rng(), TaskFacts::unknown().drew_from_rng());
+
+  // The unknown record round-trips too: null draw/early-stop/language/schedule
+  // read back as explicit unknown, and the absent span defaults to None.
   let unknown = TaskFacts::unknown();
   let json = serde_json::to_string(&unknown).unwrap();
   assert_eq!(serde_json::from_str::<TaskFacts>(&json).unwrap(), unknown);
@@ -185,9 +278,10 @@ fn serde_round_trips_every_field() {
 #[cfg(feature = "serde")]
 #[test]
 fn the_reproducibility_and_coordinate_facts_are_required_on_deserialize() {
-  // The optimistic direction is the dangerous one: a dropped `drew_from_rng`
-  // or `early_stopped` reads back the reproducible answer, and a dropped
-  // `worker_schedule` a fabricated worker (R6-F2). All four are rejected on a
+  // The optimistic direction is the dangerous one: were a dropped
+  // `drew_from_rng` or `early_stopped` to default to `None` and were `None`
+  // optimistic, a dropped key would leak a reproducibility answer; a dropped
+  // `worker_schedule` would forge a worker (R6-F2). All four are rejected on a
   // missing key; only the transient `decoded_span` may be absent.
   let full = TaskFacts::unknown()
     .with_drew_from_rng(true)
@@ -217,16 +311,32 @@ fn the_reproducibility_and_coordinate_facts_are_required_on_deserialize() {
   }
 
   // Present-but-null is the honest, ACCEPTED encoding of explicit unknown for
-  // the two nullable fields.
+  // all four nullable fields — the draw and truncation among them (F1).
   let mut nulled = value.clone();
-  nulled.as_object_mut().unwrap()["observed_language"] = serde_json::Value::Null;
-  nulled.as_object_mut().unwrap()["worker_schedule"] = serde_json::Value::Null;
+  for field in [
+    "observed_language",
+    "worker_schedule",
+    "drew_from_rng",
+    "early_stopped",
+  ] {
+    nulled.as_object_mut().unwrap()[field] = serde_json::Value::Null;
+  }
   let read: TaskFacts = serde_json::from_str(&nulled.to_string()).unwrap();
   assert_eq!(read.observed_language(), None);
   assert_eq!(
     read.worker_schedule(),
     None,
     "null schedule is explicit unknown, never [0]"
+  );
+  assert_eq!(
+    read.drew_from_rng(),
+    None,
+    "null draw is explicit unknown, never false"
+  );
+  assert_eq!(
+    read.early_stopped(),
+    None,
+    "null early-stop is explicit unknown, never false"
   );
 
   // The transient span may be dropped without error, reading back untracked.

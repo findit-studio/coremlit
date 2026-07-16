@@ -845,9 +845,10 @@ fn a_rejected_attempts_early_stop_survives_the_fallback_selection() {
     .run(&vec![0.1; 32_000], &options)
     .unwrap();
   assert_eq!(uncut.text(), "Hello");
-  assert!(!uncut.task_facts().early_stopped());
-  assert!(
-    !uncut.task_facts().drew_from_rng(),
+  assert_eq!(uncut.task_facts().early_stopped(), Some(false));
+  assert_eq!(
+    uncut.task_facts().drew_from_rng(),
+    Some(false),
     "greedy retry never draws"
   );
   let uncut_prov = crate::provenance::Provenance::for_result(&options, &compute, &uncut);
@@ -871,16 +872,18 @@ fn a_rejected_attempts_early_stop_survives_the_fallback_selection() {
     "Hello",
     "the accepted retry still ran to completion"
   );
-  assert!(
+  assert_eq!(
     truncated.task_facts().early_stopped(),
+    Some(true),
     "the REJECTED attempt's early stop must survive the fallback selection"
   );
-  assert!(
-    !truncated.task_facts().drew_from_rng(),
+  assert_eq!(
+    truncated.task_facts().drew_from_rng(),
+    Some(false),
     "the greedy retry never draws, so early_stopped is the ONLY differing fact"
   );
   let trunc_prov = crate::provenance::Provenance::for_result(&options, &compute, &truncated);
-  assert!(trunc_prov.task_facts().early_stopped());
+  assert_eq!(trunc_prov.task_facts().early_stopped(), Some(true));
   assert!(
     !trunc_prov.is_reproducible(),
     "a callback truncation -- even of a rejected attempt -- is not reproducible from options alone"
@@ -912,8 +915,9 @@ fn a_callback_truncation_is_recorded_and_is_not_reproducible() {
   let full = TranscribeTask::new(&mock, &t)
     .run(&vec![0.1; 32_000], &options)
     .unwrap();
-  assert!(
-    !full.task_facts().early_stopped(),
+  assert_eq!(
+    full.task_facts().early_stopped(),
+    Some(false),
     "no callback truncated the full run"
   );
   let full_prov = crate::provenance::Provenance::for_result(&options, &compute, &full);
@@ -930,13 +934,15 @@ fn a_callback_truncation_is_recorded_and_is_not_reproducible() {
     .with_progress_callback(stop)
     .run(&vec![0.1; 32_000], &options)
     .unwrap();
-  assert!(
+  assert_eq!(
     truncated.task_facts().early_stopped(),
+    Some(true),
     "the callback's Some(false) truncated this run"
   );
   let trunc_prov = crate::provenance::Provenance::for_result(&options, &compute, &truncated);
-  assert!(
+  assert_eq!(
     trunc_prov.task_facts().early_stopped(),
+    Some(true),
     "provenance records the early-stop outcome"
   );
   assert!(
@@ -947,6 +953,34 @@ fn a_callback_truncation_is_recorded_and_is_not_reproducible() {
   assert_ne!(
     full_prov, trunc_prov,
     "the early-stop outcome distinguishes two runs that differ only in the callback"
+  );
+
+  // F1 (codex round 6 post-consolidation). The same greedy segment that
+  // `for_result` — handed the whole transcript, which POSITIVELY observed
+  // not-truncated — calls reproducible is NOT reproducible through `for_segment`,
+  // which is handed only the segment and structurally cannot see whether a
+  // callback truncated the decode. The pre-fix constructor fabricated a
+  // `not-truncated` and claimed reproducible — the exact false promise a
+  // genuinely callback-truncated segment (as here) would have inherited.
+  //
+  // Mutation proof: make `TaskFacts::is_reproducible_under` treat an unknown
+  // `early_stopped` optimistically (as `not-truncated`) and this assertion fails,
+  // reading back reproducible for a record that cannot know it was un-truncated.
+  let segment = full
+    .segments_slice()
+    .first()
+    .expect("the full greedy run produced a segment");
+  let seg_prov = crate::provenance::Provenance::for_segment(&options, &compute, segment, false);
+  assert!(
+    !seg_prov.is_reproducible(),
+    "for_segment cannot observe the truncation, so it must not promise reproducibility"
+  );
+  // Supplying the COMPLETE facts — via `for_result` on the un-truncated
+  // transcript, which carries the observed not-truncated — is what earns the
+  // promise back.
+  assert!(
+    full_prov.is_reproducible(),
+    "the complete facts (for_result on the un-truncated run) do promise it"
   );
 }
 
@@ -1552,8 +1586,9 @@ fn a_window_accepted_above_zero_can_decode_the_blank_marker_and_be_dropped() {
     .unwrap();
 
   assert!(result.segments_slice().is_empty(), "the drop emptied it");
-  assert!(
+  assert_eq!(
     result.task_facts().drew_from_rng(),
+    Some(true),
     "the sampling must survive the segment that carried it"
   );
 
@@ -1610,8 +1645,9 @@ fn a_rejected_nonzero_attempt_is_recorded_even_when_the_window_is_accepted_greed
     mock.counters().encode_calls() > 0,
     "a window must actually decode, or this proves nothing"
   );
-  assert!(
+  assert_eq!(
     result.task_facts().drew_from_rng(),
+    Some(true),
     "attempt 0 drew at -0.2, even though the window was accepted greedily at 0.0"
   );
   let provenance = crate::provenance::Provenance::for_result(
@@ -1653,8 +1689,9 @@ fn a_nonzero_temperature_that_never_samples_records_no_sampling() {
     mock.counters().encode_calls() > 0,
     "the window must actually decode (at temperature 0.3) for the fact to matter"
   );
-  assert!(
-    !result.task_facts().drew_from_rng(),
+  assert_eq!(
+    result.task_facts().drew_from_rng(),
+    Some(false),
     "a zero-iteration decode never draws, whatever the temperature -- the old \
      `temperature != 0.0` inference wrongly recorded this window as sampled"
   );
@@ -1681,8 +1718,9 @@ fn a_nonzero_temperature_that_never_samples_records_no_sampling() {
     &crate::options::ComputeOptions::new(),
     &result,
   );
-  assert!(
-    !provenance.task_facts().drew_from_rng(),
+  assert_eq!(
+    provenance.task_facts().drew_from_rng(),
+    Some(false),
     "the 0.3 segment must not be read as a draw"
   );
   assert!(
@@ -1729,10 +1767,11 @@ fn unseeded_sampling_survives_the_blank_audio_drop() {
     0.0,
     "A is greedy"
   );
-  assert!(!chunk_a.task_facts().drew_from_rng());
+  assert_eq!(chunk_a.task_facts().drew_from_rng(), Some(false));
   assert!(chunk_b.segments_slice().is_empty(), "B was emptied");
-  assert!(
+  assert_eq!(
     chunk_b.task_facts().drew_from_rng(),
+    Some(true),
     "B sampled, and said so"
   );
 
@@ -1749,7 +1788,7 @@ fn unseeded_sampling_survives_the_blank_audio_drop() {
   );
 
   // The merge OR-ed the fact out of the chunk whose segments are gone.
-  assert!(merged.task_facts().drew_from_rng());
+  assert_eq!(merged.task_facts().drew_from_rng(), Some(true));
 
   let compute = crate::options::ComputeOptions::new();
   let provenance = crate::provenance::Provenance::for_result(&options, &compute, &merged);
@@ -1783,7 +1822,7 @@ fn unseeded_sampling_survives_the_blank_audio_drop() {
     ],
     &seeded,
   );
-  assert!(merged_seeded.task_facts().drew_from_rng());
+  assert_eq!(merged_seeded.task_facts().drew_from_rng(), Some(true));
   assert!(
     crate::provenance::Provenance::for_result(&seeded, &compute, &merged_seeded).is_reproducible(),
     "a seed makes the same sampled window replayable"
@@ -1824,8 +1863,9 @@ fn unseeded_sampling_survives_a_no_speech_window_with_no_segments() {
     result.segments_slice().is_empty(),
     "the no-speech window contributed nothing"
   );
-  assert!(
+  assert_eq!(
     result.task_facts().drew_from_rng(),
+    Some(true),
     "it still sampled at 0.5, and the record has to know"
   );
   assert!(
@@ -1855,8 +1895,9 @@ fn a_greedy_run_stays_reproducible_through_the_drop() {
     .run(&vec![0.1; 32_000], &options)
     .unwrap();
   assert!(result.segments_slice().is_empty());
-  assert!(
-    !result.task_facts().drew_from_rng(),
+  assert_eq!(
+    result.task_facts().drew_from_rng(),
+    Some(false),
     "greedy throughout: the sampler was never consulted"
   );
   assert!(
@@ -1908,8 +1949,9 @@ fn unseeded_draw_survives_an_errored_vad_chunk_drop() {
     result.segments_slice().is_empty(),
     "the errored chunk was dropped, so nothing survives"
   );
-  assert!(
+  assert_eq!(
     result.task_facts().drew_from_rng(),
+    Some(true),
     "the dropped chunk's unseeded draw must survive into the merged result"
   );
   assert!(

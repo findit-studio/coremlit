@@ -94,8 +94,9 @@ fn jfk_tiny_matches_golden_tokens_and_segments() {
   // writes 0.0 — indistinguishable from "never fell back", making
   // `== 0.0` vacuous. The flag is unambiguous, and also catches a sampled
   // window that a later lossy filter removed.
-  assert!(
-    !result.task_facts().drew_from_rng(),
+  assert_eq!(
+    result.task_facts().drew_from_rng(),
+    Some(false),
     "clean speech must decode greedily; no window drew from the unseeded sampler"
   );
 

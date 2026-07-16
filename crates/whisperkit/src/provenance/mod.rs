@@ -228,8 +228,9 @@ pub struct Provenance {
   ///
   /// [`Self::from_options`]/[`Self::for_segment`] — options with no decode to
   /// speak for — record [`TaskFacts::unknown`] with only the caller-supplied
-  /// draw fact set: no observed language, not truncated, an **unknown** worker
-  /// schedule (never a fabricated `0`, R6-F2), and no id span.
+  /// draw fact set: no observed language, an **unknown** truncation (the callback
+  /// is unobservable, so `early_stopped` stays `None` — F1), an **unknown**
+  /// worker schedule (never a fabricated `0`, R6-F2), and no id span.
   ///
   /// Required on deserialize, with its own explicit-unknown serde contract (see
   /// [`TaskFacts`]): the reproducibility facts inside it must never silently
@@ -394,9 +395,16 @@ impl Provenance {
   /// as sampled and non-reproducible (F3, codex round 4). Options-and-a-
   /// -temperature alone cannot observe the draw, so the caller — who ran the
   /// decode — supplies the fact; a caller with only the configuration and no
-  /// decode to speak for should pass `false` and rely on [`DecodingOptions::seed`]
-  /// for the reproducibility answer. [`Self::for_result`] fills it from the
-  /// transcript's own carried flag instead.
+  /// decode to speak for should pass `false`.
+  ///
+  /// This constructor cannot observe an early-stop truncation either (it is
+  /// never handed the progress callback), so it records
+  /// [`TaskFacts::early_stopped`] as an explicit unknown and the resulting
+  /// record is conservatively NOT [`reproducible`](Self::is_reproducible),
+  /// whatever the draw fact or [`DecodingOptions::seed`] (F1, codex round 6
+  /// post-consolidation). [`Self::for_result`] is the constructor to reach for a
+  /// reproducibility answer: it fills the draw AND the truncation from the
+  /// transcript's own carried, POSITIVELY observed facts.
   pub fn from_options(
     decoding: &DecodingOptions,
     compute: &ComputeOptions,
@@ -408,9 +416,12 @@ impl Provenance {
       compute,
       Some(effective_temperature),
       // Options with no decode to speak for: only the caller-supplied draw fact
-      // is known. No observed language, not truncated, an UNKNOWN worker schedule
-      // (never a fabricated `0` — R6-F2), and no id span. `for_result` fills the
-      // rest from the transcript's own carried record.
+      // is known. No observed language, an UNKNOWN truncation (the constructor
+      // is never handed the progress callback, so `early_stopped` stays `None`,
+      // never a fabricated `not-truncated` — F1), an UNKNOWN worker schedule
+      // (never a fabricated `0` — R6-F2), and no id span. Because the truncation
+      // is unknown, such a record is conservatively NOT reproducible; `for_result`
+      // fills the honest facts in from the transcript's own carried record.
       TaskFacts::unknown().with_drew_from_rng(sampled_at_nonzero_temperature),
     )
   }
@@ -619,20 +630,29 @@ impl Provenance {
   /// output match Swift's, which has no seed knob and always draws
   /// unseeded (see [`DecodingOptions::seed`]).
   ///
-  /// # A callback truncation is never reproducible from the record
+  /// # A callback truncation — or an unobservable one — is never reproducible
   ///
-  /// [`TaskFacts::early_stopped`] independently forces `false`. A progress
-  /// callback returning `Some(false)` truncates the transcript — a CONTROL
-  /// action — but the callback is a closure with no readable identity, so it is
-  /// not part of this record. A re-run from the recorded options and seed alone
-  /// therefore cannot reproduce the truncation: two runs differing only in that
-  /// callback otherwise both claimed reproducibility (coremlit issue #14, codex
-  /// round 5). This keys on the OUTCOME (whether a stop actually fired), not the
-  /// presence of a callback, so a callback that only observed and never
-  /// truncated leaves reproducibility untouched — its transcript IS the
-  /// un-truncated one the options and seed reproduce. The whole predicate is
-  /// [`TaskFacts::is_reproducible_under`], to which this supplies whether a
-  /// [`DecodingOptions::seed`] is set.
+  /// An observed [`TaskFacts::early_stopped`] of `Some(true)` independently
+  /// forces `false`. A progress callback returning `Some(false)` truncates the
+  /// transcript — a CONTROL action — but the callback is a closure with no
+  /// readable identity, so it is not part of this record. A re-run from the
+  /// recorded options and seed alone therefore cannot reproduce the truncation:
+  /// two runs differing only in that callback otherwise both claimed
+  /// reproducibility (coremlit issue #14, codex round 5). This keys on the
+  /// OUTCOME (whether a stop actually fired), not the presence of a callback, so
+  /// a callback that only observed and never truncated (`Some(false)`) leaves
+  /// reproducibility untouched — its transcript IS the un-truncated one the
+  /// options and seed reproduce.
+  ///
+  /// An UNOBSERVED truncation (`None`) is treated the same as an observed one:
+  /// conservatively non-reproducible (F1, codex round 6 post-consolidation).
+  /// [`Self::from_options`]/[`Self::for_segment`] cannot see the callback — they
+  /// are handed options and at most one segment — so they record `None`, and a
+  /// record built through them is never reproducible, whatever the temperature
+  /// or seed. Reach for [`Self::for_result`] for a reproducibility answer: it
+  /// reads the transcript's carried, POSITIVELY observed facts. The whole
+  /// predicate is [`TaskFacts::is_reproducible_under`], to which this supplies
+  /// whether a [`DecodingOptions::seed`] is set.
   #[inline(always)]
   pub const fn is_reproducible(&self) -> bool {
     self
