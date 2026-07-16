@@ -1098,17 +1098,13 @@ fn window_loop_attaches_word_timings_when_enabled() {
   assert!((result.segments_slice()[0].end() - words.last().unwrap().end()).abs() < 1e-4);
 }
 
-#[test]
-#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
-fn word_timestamps_removing_a_segment_keeps_ids_unique_and_monotonic() {
-  // F2 (codex round 5), hole (b). Each window decodes speech / bare-timestamp /
-  // speech, so `find_seek_point_and_segments` allocates THREE ids per window but
-  // the MIDDLE one is a zero-length wordless slice the word-timestamp filter
-  // removes AFTER id allocation. The next window must id its segments off the
-  // count the decode ALLOCATED (3), not the count that SURVIVED (2) -- otherwise
-  // window 2's first survivor renumbers back onto window 1's second survivor
-  // (both id 2), leaving the pipeline-local ids non-unique/non-monotonic before
-  // the merge ever runs.
+/// Runs the F1 word-timestamp scenario under the given `drop_blank_audio` and
+/// returns the surviving segment ids. Two windows each decode
+/// speech/bare-timestamp/speech; the middle segment is a zero-length wordless
+/// slice the word-timestamp filter removes AFTER id allocation. Shared by the
+/// drop-ON unique-id pin and the drop-OFF Swift-parity duplicate pin so both run
+/// byte-identical scripting and differ only in the id-base advance.
+fn word_timestamp_removed_segment_ids(drop_blank_audio: bool) -> Vec<usize> {
   let t = tiny_tokenizer();
   let s = special();
   let hello = 2425u32;
@@ -1154,29 +1150,65 @@ fn word_timestamps_removing_a_segment_keeps_ids_unique_and_monotonic() {
   // windows (0..16_000, 16_000..32_000; the third would need seek < 32_000).
   let options = DecodingOptions::new()
     .with_word_timestamps()
-    .with_without_timestamps();
+    .with_without_timestamps()
+    .maybe_drop_blank_audio(drop_blank_audio);
   let result = task.run(&vec![0.1; 48_000], &options).unwrap();
-
   assert_eq!(mock.counters().encode_calls(), 2, "two windows decoded");
-  let ids: Vec<usize> = result
+  result
     .segments_slice()
     .iter()
     .map(TranscriptionSegment::id)
-    .collect();
-  // Window 1 allocates [0, 1, 2], drops the zero-length middle id 1 -> [0, 2],
-  // consuming 3 ordinals. Window 2 bases at 3, allocates [3, 4, 5], drops id 4
-  // -> [3, 5]. The pre-fix survivor-count base (2) instead produced [0, 2, 2, 4]
-  // -- a duplicate id 2.
+    .collect()
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn word_timestamps_removing_a_segment_keeps_ids_unique_and_monotonic() {
+  // F2 (codex round 5) / F1 (codex round 9), the TRUE-path pin. Under
+  // `drop_blank_audio` (the default, the deliberate unique-id hardening) the next
+  // window ids its segments off the count the decode ALLOCATED (3), not the count
+  // that SURVIVED (2) -- otherwise window 2's first survivor renumbers back onto
+  // window 1's second survivor (both id 2), leaving the pipeline-local ids
+  // non-unique/non-monotonic before the merge ever runs. Window 1 allocates
+  // [0, 1, 2], drops the zero-length middle id 1 -> [0, 2], advancing the base by
+  // ALL 3; window 2 bases at 3, allocates [3, 4, 5], drops id 4 -> [3, 5].
+  //
+  // Mutation proof: advance the drop-ON branch by the survivor count and these
+  // ids collapse to the drop-OFF [0, 2, 2, 4], failing uniqueness/monotonicity.
+  let ids = word_timestamp_removed_segment_ids(true);
   assert_eq!(
     ids,
     vec![0, 2, 3, 5],
-    "survivor ids stay unique and monotonic across the removed segment"
+    "survivor ids stay unique and monotonic across the removed segment (drop ON)"
   );
   let unique: std::collections::HashSet<usize> = ids.iter().copied().collect();
   assert_eq!(unique.len(), ids.len(), "no id collision across windows");
   assert!(
     ids.windows(2).all(|w| w[0] < w[1]),
     "survivor ids stay strictly monotonic"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn word_timestamps_drop_cleared_reproduces_swifts_duplicate_ids() {
+  // F1 (codex round 9), the FALSE-path Swift oracle. Clearing `drop_blank_audio`
+  // restores EXACT Swift parity: `findSeekPointAndSegments(allSegmentsCount:)`
+  // bases each window off the running SURVIVOR total Swift appends
+  // (`TranscribeTask.swift:181`), filters zero-length (`:217`), and appends only
+  // survivors (`:262`). Window 1 allocates [0, 1, 2], drops the middle -> [0, 2]
+  // (survivor count 2); window 2 bases at 2, allocates [2, 3, 4], drops id 3 ->
+  // [2, 4] -- so id 2 DUPLICATES, byte-for-byte as Swift's do. The pre-fix code
+  // advanced by the allocated count regardless of the option, yielding the
+  // unique-id [0, 2, 3, 5] here and violating the exact-parity contract.
+  //
+  // Mutation proof: advance the drop-OFF branch by the allocated count and these
+  // ids become the drop-ON [0, 2, 3, 5], failing the duplicate-id assertion.
+  let ids = word_timestamp_removed_segment_ids(false);
+  assert_eq!(
+    ids,
+    vec![0, 2, 2, 4],
+    "clearing drop_blank_audio reproduces Swift's duplicate survivor ids (drop OFF)"
   );
 }
 
@@ -2100,5 +2132,101 @@ fn predicted_language_survives_an_errored_vad_chunk_drop() {
     .observed_language(),
     Some("es"),
     "and provenance records the prediction the dropped chunk made"
+  );
+}
+
+#[test]
+fn recover_vad_run_facts_keeps_the_earliest_ingested_language() {
+  // F3 (codex round 9), the VAD facts combination in isolation. A two-chunk VAD
+  // history with DIFFERENT per-chunk languages cannot be scripted through the
+  // step-replaying MockBackend (each chunk replays the SAME script), so the
+  // combination is pinned directly. The shared sink observed chunk 1's "es" —
+  // which then errored and was dropped — BEFORE the surviving chunk 2's "fr".
+  // Seeding the fold FROM the sink keeps the earliest genuine observation; the
+  // surviving merge still contributes its worker schedule and id span.
+  //
+  // Mutation proof: fold the sink LAST instead (`merged.merge(&sink)`) and the
+  // language reads back Some("fr").
+  let sink = TaskFacts::observed_clean().with_observed_language(Some("es".into()));
+  let merged = TaskFacts::observed_clean()
+    .with_observed_language(Some("fr".into()))
+    .with_worker(1)
+    .with_decoded_span(Some(1));
+  let facts = recover_vad_run_facts(sink, &merged, true);
+  assert_eq!(
+    facts.observed_language(),
+    Some("es"),
+    "the earliest ingested language wins over a later survivor's",
+  );
+  assert_eq!(
+    facts.worker_schedule(),
+    Some([1].as_slice()),
+    "the surviving merge's worker schedule is kept",
+  );
+  assert_eq!(facts.decoded_span(), Some(1), "and its id span");
+}
+
+#[test]
+fn recover_vad_run_facts_keeps_a_zero_survivor_run_observed_clean() {
+  // F4 (codex round 9), the VAD facts combination in isolation. A genuine
+  // zero-chunk run: the sink is observed_clean (Some(false)/Some(false) — the run
+  // watched and saw no draw or truncation) but the empty result merge folds to
+  // unknown(). Folding that unknown() in — either order, the Kleene OR is
+  // commutative — poisons the sink's Some(false) to None and turns a run that did
+  // NOTHING non-reproducible. With no survivors the sink's seed is kept verbatim.
+  //
+  // Mutation proof: drop the `had_survivors` guard (always fold) and both
+  // booleans read back None, so is_reproducible_under(false) flips to false.
+  let facts = recover_vad_run_facts(TaskFacts::observed_clean(), &TaskFacts::unknown(), false);
+  assert_eq!(facts.drew_from_rng(), Some(false));
+  assert_eq!(facts.early_stopped(), Some(false));
+  assert!(
+    facts.is_reproducible_under(false),
+    "a zero-chunk run drew nothing and was truncated by nothing -- reproducible",
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn vad_run_with_zero_chunks_is_known_clean_not_unknown() {
+  // F4 (codex round 9), end to end. Audio LONGER than the model window takes the
+  // VAD branch, but a clip SHORTER than the chunker's 16_000-sample padding yields
+  // ZERO chunks (`AudioChunker.swift`'s signed `startIndex < end - padding`
+  // guard). No chunk decodes and no chunk errors, so the run KNOWS nothing
+  // happened: the shared sink stays observed_clean and, with no survivors, is
+  // carried verbatim rather than poisoned to unknown by the empty merge's
+  // unknown() (which pre-fix left both booleans None and non-reproducible).
+  let t = tiny_tokenizer();
+  // window_samples 8_000 < the 16_000 padding, so a 12_000-sample clip is longer
+  // than the window (VAD branch taken) yet shorter than the padding (zero chunks).
+  let mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(8_000));
+  let kit = WhisperKit::with_backend(mock, t);
+  let options = DecodingOptions::new().with_chunking_strategy(ChunkingStrategy::Vad);
+  let result = kit.transcribe(&vec![0.1; 12_000], &options).unwrap();
+
+  assert_eq!(
+    kit.backend().counters().encode_calls(),
+    0,
+    "no chunk decoded -- a genuine zero-chunk VAD run",
+  );
+  assert!(result.segments_slice().is_empty());
+  assert_eq!(
+    result.task_facts().drew_from_rng(),
+    Some(false),
+    "the run watched and POSITIVELY drew nothing",
+  );
+  assert_eq!(
+    result.task_facts().early_stopped(),
+    Some(false),
+    "and was truncated by nothing",
+  );
+  assert!(
+    crate::provenance::Provenance::for_result(
+      &options,
+      &crate::options::ComputeOptions::new(),
+      &result,
+    )
+    .is_reproducible(),
+    "a zero-chunk run did nothing to redo -- reproducible",
   );
 }

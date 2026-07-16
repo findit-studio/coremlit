@@ -306,16 +306,23 @@ where
     );
 
     let mut all_segments: Vec<TranscriptionSegment> = Vec::new();
-    // Strictly monotonic count of segment-id ordinals this run has ALLOCATED so
-    // far — the base each window's `find_seek_point_and_segments` ids its
-    // segments off, advanced by the number that call produced BEFORE the
-    // word-timestamp zero-length filter can remove any. Deliberately NOT
-    // `all_segments.len()` (the SURVIVING count): the filter drops segments
-    // after their ids are allocated, so a survivor-count base would reissue an
-    // id a survivor of an earlier window still carries, making the pipeline-local
-    // ids non-unique/non-monotonic before the merge ever runs (coremlit issue
-    // #14, codex round 5). Carried out onto the result as its decoded id span,
-    // for the merge to advance its own running base by.
+    // Monotonic count of segment-id ordinals this run has consumed so far — the
+    // base each window's `find_seek_point_and_segments` ids its segments off. How
+    // it advances per window depends on [`DecodingOptions::drop_blank_audio`]
+    // (see the F1 advance in the loop below):
+    //
+    // - `true` (the default) advances by ALL allocated ordinals, BEFORE the
+    //   word-timestamp zero-length filter removes any — a survivor-count base
+    //   would reissue an id a survivor of an earlier window still carries, making
+    //   the pipeline-local ids non-unique/non-monotonic (coremlit issue #14,
+    //   codex round 5). This is the deliberate unique-id hardening.
+    // - `false` advances by the SURVIVING count Swift appends
+    //   (`allSegmentsCount: allSegments.count`, `TranscribeTask.swift:181`), so
+    //   the ids DUPLICATE across a removed segment exactly as Swift's do — the
+    //   exact-parity contract of clearing the option (F1, codex round 9).
+    //
+    // Carried out onto the result as its decoded id span, for the merge to
+    // advance its own running base by.
     let mut decoded_segment_span = 0usize;
     let mut detected_language: Option<String> = None;
     // The GENUINE observation, kept SEPARATE from `detected_language` above:
@@ -498,12 +505,12 @@ where
           segment_size,
           self.tokenizer,
         )?;
-        // Advance the decoded-ordinal base by what this window ALLOCATED —
-        // before the word-timestamp filter below removes any — so the next
-        // window's ids never reuse an id a survivor here keeps (see the
-        // declaration). A silence-skipped window allocates nothing (`None`).
-        decoded_segment_span =
-          decoded_segment_span.saturating_add(current_segments.as_ref().map_or(0, Vec::len));
+        // The count this window ALLOCATED, captured before the word-timestamp
+        // zero-length filter below can remove any — the `drop_blank_audio == true`
+        // advance (see the F1 advance after that filter, and the
+        // `decoded_segment_span` declaration). A silence-skipped window allocates
+        // nothing (`None`).
+        let allocated_this_window = current_segments.as_ref().map_or(0, Vec::len);
         seek = seek.max(new_seek);
 
         // :196-233 — optional word-timestamp re-anchoring, run against the
@@ -563,6 +570,30 @@ where
           // default — can ever reach it.
           current_segments = Some(filtered);
         }
+
+        // F1 (codex round 9): advance the decoded-ordinal base for the NEXT
+        // window's ids, now that the word-timestamp zero-length filter above has
+        // run. The two paths differ only when that filter removed something:
+        //
+        // - `drop_blank_audio == true` (the default) advances by ALL allocated
+        //   ordinals — the deliberate unique-id hardening that keeps every
+        //   survivor id unique and monotonic across a removed segment
+        //   ([0, 2, 3, 5] rather than a duplicate).
+        // - `drop_blank_audio == false` advances by the SURVIVOR count Swift
+        //   appends — `findSeekPointAndSegments(allSegmentsCount:)` reads the
+        //   running SURVIVOR total (`TranscribeTask.swift:181`), which filters
+        //   zero-length (`:217`) and appends only survivors (`:262`), so its ids
+        //   DUPLICATE across a removed segment ([0, 2, 2, 4]) — exact Swift
+        //   parity, the whole contract of clearing the option.
+        //
+        // Without word timestamps the filter never runs, so survivors ==
+        // allocated and the two coincide. A silence-skipped window (`None`)
+        // allocated nothing and advances by zero either way.
+        decoded_segment_span = decoded_segment_span.saturating_add(if options.drop_blank_audio() {
+          allocated_this_window
+        } else {
+          current_segments.as_ref().map_or(0, Vec::len)
+        });
 
         // :236-239 — hardened beyond Swift's bare `previous_seek + max`:
         // the sum saturates (a huge configured cap must not overflow),
@@ -1336,6 +1367,37 @@ impl<B> WhisperKit<B> {
   }
 }
 
+/// Combines the shared fact `sink` a VAD run accumulated across EVERY chunk —
+/// dropped-because-errored ones included — with the `merged` result's own facts
+/// from the SURVIVING chunks, into the record the merged transcript carries.
+///
+/// The `sink` is the FOLD BASE, not a trailing contributor (codex round 9): it
+/// watched every chunk in ingestion order, so
+///
+/// - its first-observed language wins over a LATER surviving chunk's — a chunk
+///   that observed `es` then errored and was dropped keeps `es` even when a later
+///   surviving chunk observed `fr` (F3). Folding the sink LAST instead let the
+///   survivor's `fr` win, because [`TaskFacts::merge`]'s language law keeps
+///   `self`'s observation and takes `other`'s only when absent.
+/// - a genuine ZERO-survivor run keeps the sink's own seed verbatim rather than
+///   the `unknown()` an empty [`merge_transcription_results_with_options`] folds
+///   to. Folding that `unknown()` in — in EITHER order, the Kleene OR is
+///   commutative — poisons the sink's observed-clean `Some(false)` draw and
+///   early-stop to `None` (`kleene_or(Some(false), None) == None`), turning a run
+///   that did NOTHING conservatively non-reproducible (F4). `had_survivors`
+///   guards that fold: an empty merge has no worker schedule or id span to
+///   contribute anyway, the only two facts the sink never tracks.
+fn recover_vad_run_facts(sink: TaskFacts, merged: &TaskFacts, had_survivors: bool) -> TaskFacts {
+  let mut facts = sink;
+  if had_survivors {
+    // The sink already carries the whole run's draw, early-stop, and
+    // first-observed language; this fold adds only the surviving chunks' worker
+    // schedule and id span (which the sink leaves `None`).
+    facts.merge(merged);
+  }
+  facts
+}
+
 impl<B> WhisperKit<B>
 where
   B: InferenceBackend,
@@ -1487,16 +1549,21 @@ where
       // decode from disagreeing; every chunk is still merged, so no chunk's
       // timings leave the sums.
       let mut merged = merge_transcription_results_with_options(&chunk_results, options);
-      // Fold the shared sink's recovered facts onto the merged record through the
-      // SAME merge law. The merge over SURVIVING chunks already OR-ed their draws,
-      // OR-ed their early stops, and took the first observation; this recovers the
-      // same facts from any DROPPED-because-errored chunk (the sink saw them all).
-      // The sink's worker schedule and id span are unknown, so the merge law
-      // leaves the merged result's own (from the surviving chunks) untouched.
+      // Recover the shared sink's run-wide facts onto the merged record. The sink
+      // is the FOLD BASE (codex round 9): it watched every chunk in ingestion
+      // order — dropped-because-errored ones included — so its first-observed
+      // language must win over a later surviving chunk's (F3), and its
+      // observed-clean draw/early-stop watch must survive a zero-survivor run
+      // rather than being poisoned to unknown by the empty merge's `unknown()`
+      // (F4). The merged result contributes only the surviving chunks' worker
+      // schedule and id span, folded on when a chunk survived; see
+      // [`recover_vad_run_facts`].
       let sink_facts = facts_sink
         .into_inner()
         .unwrap_or_else(PoisonError::into_inner);
-      merged.task_facts_mut().merge(&sink_facts);
+      let recovered =
+        recover_vad_run_facts(sink_facts, merged.task_facts(), !chunk_results.is_empty());
+      *merged.task_facts_mut() = recovered;
       return Ok(merged);
     }
 
