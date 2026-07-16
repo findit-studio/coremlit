@@ -1389,14 +1389,19 @@ fn all_zero_mask_row_yields_a_finite_degenerate_constant() {
 /// - `sparse` — slots whose `nonOverlappedFrameRatio` is `<= minActiveRatio`
 ///   (0.2, i.e. `<= 117` clean frames of 589), the ones argmax's OWN clustering
 ///   would withhold from cluster FORMATION (`VBxClustering.swift:50`,
-///   `SpeakerClustering.swift:23`) and which this port instead carries into
-///   `dia`'s clustering, sparse clean mask and all.
+///   `SpeakerClustering.swift:23`) — and which `dia`'s clustering, the SAME
+///   `filter_embeddings`, withholds too (`offline/algo.rs:598-656`) before
+///   re-attaching them at nearest-centroid reassignment. This port carries
+///   their still-sparse clean masks into `dia`; `dia` then treats them exactly
+///   as argmax would.
 ///
 /// The second set is ~50× the first, and the fallback does NOT rescue it — that
-/// is the module doc's declared divergence, and this test exists partly to stop
-/// anyone reading the fallback as a fix for it. What the fallback guarantees is
-/// narrower and is what the assertions below check: no consumed slot pools over
-/// an EMPTY mask, so none carries the meaningless constant.
+/// is the DISTINCTION the module doc draws (the fallback is a mask-level rule at
+/// `clean <= 2`, not argmax's `minActiveRatio` cluster-formation filter at
+/// `clean <= 117`), and this test exists partly to stop anyone reading the
+/// fallback as a fix for sparse masks. What the fallback guarantees is narrower
+/// and is what the assertions below check: no consumed slot pools over an EMPTY
+/// mask, so none carries the meaningless constant.
 #[test]
 #[ignore = "requires local argmax speakerkit models (ARGMAX_TEST_MODELS)"]
 fn no_consumed_slot_yields_the_degenerate_constant() {
@@ -1481,9 +1486,11 @@ fn no_consumed_slot_yields_the_degenerate_constant() {
     "a 30 s speech clip must produce consumed slots"
   );
   eprintln!("consumed={consumed} fell_back(clean<=2)={fell_back} sparse(ratio<=0.2)={sparse}");
-  // The divergence the module doc declares is REAL on this fixture: these are
-  // the slots argmax would withhold from cluster formation and this port hands
-  // to dia — every one of them just proven to carry a real embedding.
+  // The sparse-slot population the module doc distinguishes is REAL on this
+  // fixture: these are the slots `dia`'s Stage 1 filter (the same one argmax's
+  // own clustering uses) withholds from cluster formation and reassigns — this
+  // port hands their real embeddings to dia, every one just proven
+  // non-degenerate.
   assert!(
     sparse > 0,
     "expected sparse-clean slots on this fixture — if this fires, the module \

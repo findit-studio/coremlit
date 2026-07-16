@@ -183,15 +183,24 @@ A few more decisions worth knowing before you pick a source:
   above is what disproved it** — the projection `dia` clusters through is
   frozen and pretrained, so it is not rotation-invariant, and a divergent
   front-end is a domain mismatch against it.
-- **Both sources share `dia`'s mask/overlap-exclusion policy**, not each
-  vendor's own. In particular, argmax's own `minActiveRatio` filter — which
-  withholds sparse/overlap-heavy slots (~12-17% of slots on real clips) from
-  cluster *formation* while still labeling them — is deliberately **not**
-  ported: clustering is `dia`'s, and `Extraction` has no "present but
-  excluded from clustering" channel, so reproducing that filter would mean
-  *dropping* the slot and losing its speech attribution entirely, which is
-  usually worse than clustering on a slightly sparse embedding. If DER
-  measurements later show this mattering, revisiting is an open watch item.
+- **Both sources share `dia`'s mask/overlap-exclusion policy AND its
+  clustering-stage `minActiveRatio` filter** — not each vendor's own, and not a
+  filter this crate omits. argmax's `minActiveRatio` (which withholds
+  sparse/overlap-heavy slots, ~12-17% on real clips, from cluster *formation*
+  while still labeling them by nearest centroid) is the SAME pyannote
+  community-1 `filter_embeddings` that `dia` ports and runs **unconditionally on
+  every `Extraction`, from either source** (`MIN_ACTIVE_RATIO = 0.2`, dia's
+  `offline/algo.rs`): the sparse slots are withheld from formation and then
+  re-attached at nearest-centroid reassignment — exactly argmax's own
+  withhold-then-reassign, reproduced downstream. So it is **not** an un-ported
+  divergence, and the old worry that reproducing it would mean *dropping* a slot
+  is moot: `dia` re-attaches, it never drops. This also settles what was once an
+  open watch item — the filter is **already live for argmax**, and it does
+  **not** rescue the multi-speaker divergence: every failing clip above ran with
+  it applied, `FluidAudio` through the same filter is clean, and the spurious
+  argmax clusters form among the slots that *pass* it. That is what pins the
+  cause on the 80-mel front end (above), not on any missing filter — the only
+  rescue path is a kaldi-fbank front-end swap.
 - **argmax ships two quantization tiers** (`ArgmaxVariant::Baseline`,
   un-palettized, the default; `ArgmaxVariant::W8A16`, 8-bit palettized).
   `AnySource::load` always loads `Baseline` — build `ArgmaxSource` via
