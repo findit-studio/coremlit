@@ -141,6 +141,41 @@ fn loop_forces_prompt_then_samples_to_eot() {
 
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn negative_temperature_decode_with_timestamp_filter_does_not_panic() {
+  // F1 (codex round 4, High), at the pipeline level. `TimestampRulesFilter`
+  // masks `<|notimestamps|>` (and, in pairs, whole token ranges) with `-inf`
+  // on every post-prefill step (`filter/mod.rs`, ports
+  // `LogitsFilter.swift:81`). At a NEGATIVE temperature the pre-fix sampler
+  // scaled that `-inf` by `1/T < 0` into `+inf`, so the masked index became
+  // the scaled max and the stabilized softmax collapsed to NaN, panicking
+  // `random_range`. The whole decode loop -- real filter chain, real sampler,
+  // negative temperature -- must now run to completion with a finite result.
+  let t = tiny_tokenizer();
+  let s = special();
+  let mut mock = MockBackend::new();
+  // Enough one-hot steps that the loop stays inside the script whatever the
+  // (unseeded) negative-temperature draws pick; `sample_length` bounds the
+  // loop well below the script length, so no EOT is required to terminate.
+  mock.push_token_steps(&[100u32; 24]);
+  let options = DecodingOptions::new()
+    .with_temperature(-0.2)
+    .with_sample_length(8);
+  // The mask is present from the first post-prefill step regardless of the
+  // RNG, so the failure regime is reached deterministically even though the
+  // draws themselves are not seeded here.
+  let result = run_mock(&mock, &default_prompt(&s), &options, &t);
+  assert!(
+    result.avg_logprob().is_finite(),
+    "a negative-temperature decode over masked logits must finish with a finite avg log-prob"
+  );
+  assert!(
+    (result.temperature() - (-0.2)).abs() < 1e-6,
+    "the accepted temperature is the configured negative one"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn language_observed_only_for_a_decoded_language_token() {
   // F3 (codex round 3). The `language_observed` fact is `true` ONLY when a
   // `<|lang|>` token is actually decoded: a CONFIGURED language and the "en"

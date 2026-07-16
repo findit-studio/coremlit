@@ -187,6 +187,14 @@ impl GreedyTokenSampler {
   /// `log(softmaxResult[nextToken])`. Either way, `completed` is `token
   /// == eot_token()` (`TokenSampler.swift:233`).
   ///
+  /// The scaling treats a filter MASK (`-inf`, what [`crate::decode::filter`]
+  /// writes for a suppressed token) as a mask rather than a number: it stays
+  /// `-inf` (probability 0) whatever the sign of `temperature`, so a negative
+  /// temperature cannot flip `-inf * (1 / temperature)` to `+inf` and turn a
+  /// suppressed token into the most-probable one (F1, codex round 4). A finite
+  /// logit whose scaled value overflows under a near-zero temperature is
+  /// clamped back into range, keeping the `# Panics` contract below true.
+  ///
   /// A `top_k` configured above `logits.len()` is clamped to it (Swift's
   /// BNNS path has no defined behavior for that misconfiguration — `try!
   /// BNNS.applyTopK` with an oversized `k` is crash territory), and a
@@ -224,24 +232,51 @@ impl GreedyTokenSampler {
     } else {
       self.probs.clear();
       let inv_t = 1.0 / self.temperature;
-      // Swift scales the logits by `1 / temperature` FIRST, then softmaxes
-      // the *scaled* vector (`TokenSampler.swift:109-138`). The softmax
-      // stabilizer is therefore the max of the SCALED values, `max(v *
-      // inv_t)` — which equals `max(logits) * inv_t` only when `inv_t > 0`.
-      // For a NEGATIVE temperature `inv_t < 0` reverses the ordering, so
-      // `max(logits) * inv_t` is the *minimum* scaled value; subtracting it
-      // drove the true-largest scaled entry through `exp()` to `+inf`, making
-      // `sum`/`top_sum` non-finite and panicking `random_range` below. Take
-      // the true max of the scaled values. (For `inv_t > 0` this is
-      // bit-identical to the old `max * inv_t` — same float product at the
-      // max-raw position — so positive-temperature draws are unchanged.)
+      // Scale each logit by `1 / temperature`, exactly as Swift does before it
+      // softmaxes the scaled vector (`TokenSampler.swift:109-138`) — but a
+      // filter MASK is a mask, not a number to scale. `decode::filter` writes
+      // `-inf` for a suppressed token (Swift's own filters do too,
+      // `LogitsFilter.swift:81`), and that entry must stay EXCLUDED
+      // (probability 0) whatever the sign of `inv_t`. Scaling it directly is
+      // the F1 bug (codex round 4): a NEGATIVE temperature turns `-inf * inv_t`
+      // into `+inf`, so the masked index becomes the single largest scaled
+      // value, the stabilizer subtraction below yields `+inf - +inf = NaN`
+      // across the whole vector, and `random_range` panics on the NaN range.
+      // A FINITE logit whose scaled value overflows under a near-zero
+      // temperature (`1/T` or `v/T` past the f32 range, or the `0 * inf` NaN
+      // when `1/T` itself overflowed) is clamped to the finite extremes /
+      // mapped to its true scaled value, so `sample` keeps its documented
+      // "panics only on empty logits" contract.
+      let scale = |v: f32| -> f32 {
+        if v == f32::NEG_INFINITY {
+          return f32::NEG_INFINITY; // mask: excluded at any temperature sign.
+        }
+        let scaled = v * inv_t;
+        if scaled.is_nan() {
+          // `0 * ±inf`, the only NaN a finite logit produces here (a subnormal
+          // temperature drove `inv_t` non-finite). The scaled value `0 / T` is
+          // `0` for every nonzero `T`, so that is the mathematically correct
+          // answer, not an arbitrary sentinel.
+          0.0
+        } else {
+          scaled.clamp(f32::MIN, f32::MAX) // clamp ±inf overflow to finite.
+        }
+      };
+      // Stabilize on the max of the FINITE scaled values. Masks stay `-inf` so
+      // they never win this max (and the fully-masked buffer already returned
+      // above), while every finite-origin logit maps to a finite scaled value
+      // — so `scaled_max` is always finite and `exp(scaled - scaled_max)` can
+      // never form `inf - inf`. For `inv_t > 0` with no overflow this is
+      // bit-identical to the pre-fix `max(v * inv_t)`, leaving
+      // positive-temperature draws unchanged.
       let scaled_max = logits
         .iter()
-        .map(|&v| v * inv_t)
+        .copied()
+        .map(scale)
         .fold(f32::NEG_INFINITY, f32::max);
       let mut sum = 0.0f32;
       self.probs.extend(logits.iter().map(|&v| {
-        let e = (v * inv_t - scaled_max).exp();
+        let e = (scale(v) - scaled_max).exp();
         sum += e;
         e
       }));

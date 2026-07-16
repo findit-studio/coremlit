@@ -168,6 +168,91 @@ fn negative_temperature_wide_logits_sample_without_panic() {
 }
 
 #[test]
+fn negative_temperature_masked_logits_sample_without_panic() {
+  // F1 (codex round 4, High). The round-3 fix scaled every logit by `1/T`
+  // and stabilized on `max(scaled)`, but a filter MASK (`-inf`, what
+  // `decode::filter` writes for a suppressed token) is not a number to
+  // scale: at a NEGATIVE temperature `-inf * (1/T)` flips to `+inf`, so the
+  // masked index BECOMES the scaled max, the stabilizer subtraction yields
+  // `+inf - +inf = NaN` across the vector, and `random_range(0.0..NaN)`
+  // panics. The round-3 regression above never reached this regime -- it
+  // used only finite logits, so no `-inf` was present to flip.
+  //
+  // Reproduction (pre-fix): `sample([0.0, NEG_INFINITY])` at `-0.2` panicked
+  // on the NaN multinomial range. Post-fix: no panic, a finite log-prob, a
+  // real RNG draw, and the masked index NEVER selected.
+  let mut sampler = greedy(-0.2);
+  for _ in 0..200 {
+    let r = sampler.sample(&[0.0f32, f32::NEG_INFINITY]);
+    assert!(
+      r.logprob().is_finite(),
+      "masked negative-temperature draw must have a finite log-prob"
+    );
+    assert_eq!(
+      r.token(),
+      0,
+      "the masked index (1) must never be drawn -- a mask is a mask at any temperature sign"
+    );
+  }
+  assert!(
+    sampler.drew_from_rng(),
+    "a non-zero-temperature draw on a non-masked-max buffer consults the RNG"
+  );
+
+  // The mask must stay excluded whatever the sign of the temperature, and
+  // the finite entry must win regardless of where it sits. A wider mix of
+  // finite and masked entries at a negative temperature: every draw lands on
+  // a FINITE-logit index, never a masked one, and stays finite.
+  let mixed = [
+    f32::NEG_INFINITY,
+    -4.0,
+    f32::NEG_INFINITY,
+    7.0,
+    2.0,
+    f32::NEG_INFINITY,
+  ];
+  let masked_indices = [0usize, 2, 5];
+  let mut sampler = greedy(-0.35);
+  for _ in 0..200 {
+    let r = sampler.sample(&mixed);
+    assert!(
+      r.logprob().is_finite(),
+      "finite log-prob under the mask + negative temperature"
+    );
+    assert!(
+      !masked_indices.contains(&(r.token() as usize)),
+      "a masked (-inf) index {} was drawn under negative temperature",
+      r.token()
+    );
+  }
+}
+
+#[test]
+fn tiny_temperature_overflow_sample_without_panic_or_nan() {
+  // F1 sibling (codex round 4). A finite-but-tiny temperature drives `1/T`
+  // (or a scaled logit) past the f32 range, so `v * (1/T)` overflows to
+  // `+-inf` (or, for `v == 0` when `1/T` itself overflowed, the `0 * inf`
+  // NaN). Either would break the stabilized softmax and violate `sample`'s
+  // "panics only on empty logits" contract; the fix clamps the overflow to
+  // the finite extremes and treats the `0 * inf` case as the true scaled
+  // value `0`.
+  for &temperature in &[1e-40f32, -1e-40, f32::MIN_POSITIVE, 1e-30] {
+    let mut sampler = GreedyTokenSampler::new(temperature, 3, &DecodingOptions::new()).with_seed(1);
+    for _ in 0..50 {
+      let r = sampler.sample(&[0.0f32, 20.0, -20.0, 5.0]);
+      assert!(
+        r.logprob().is_finite() || r.logprob() == f32::NEG_INFINITY,
+        "t={temperature}: log-prob must be finite or the degenerate -inf, never NaN"
+      );
+      assert!(
+        (r.token() as usize) < 4,
+        "t={temperature}: token must index the logits"
+      );
+    }
+  }
+}
+
+#[test]
 #[should_panic(expected = "non-empty logits")]
 fn empty_logits_panic() {
   greedy(0.0).sample(&[]);
