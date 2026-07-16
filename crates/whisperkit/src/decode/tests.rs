@@ -290,6 +290,52 @@ fn language_observed_only_for_a_predicted_language_token() {
     "the OBSERVATION is the PREDICTED <|es|>, never the forced display <|en|>"
   );
 
+  // Branch 2d -- FORCED `<|en|>` prefill AND a CONFIGURED `language="en"`, but the
+  // model STILL predicts `<|es|>` (round 10, F1): the exact failing history the
+  // finding turns on. Duplicates branch 2c with `.with_language("en")`, so
+  // `options.language()` is NON-empty. Pre-fix the observation gate ALSO required
+  // `options.language().is_empty()`, so a configured language SUPPRESSED the
+  // genuine prediction and `observed_language` wrongly read `None` for a run that
+  // plainly detected `es`. The display language is unchanged (the Swift-faithful
+  // forced `<|en|>`), proving the observation is decoupled from the configured
+  // input -- an observation is a probe or a PREDICTED token, never the config.
+  //
+  // Mutation proof: restore the `&& options.language().is_empty()` conjunct and
+  // this reads back `None`; branch 2c (no configured language) still passes, so
+  // ONLY the configured case catches the bug the conjunct caused.
+  let mut mock = MockBackend::new();
+  mock.push_token_steps(&[
+    s.english_token(),       // pos 0: overridden by prompt[1]
+    s.transcribe_token(),    // pos 1: overridden by prompt[2]
+    s.no_timestamps_token(), // pos 2: overridden by prompt[3]
+    es,                      // first PREDICTED token: a language token, after the prompt
+    2425,
+    s.end_token(),
+  ]);
+  let configured_en_predicts_es = run_mock(
+    &mock,
+    &[
+      s.start_of_transcript_token(),
+      s.english_token(),
+      s.transcribe_token(),
+      s.no_timestamps_token(),
+    ],
+    &DecodingOptions::new()
+      .with_without_timestamps()
+      .with_language("en"),
+    &t,
+  );
+  assert_eq!(
+    configured_en_predicts_es.language(),
+    "en",
+    "the DISPLAY language is the configured/forced <|en|>, unchanged by the fix"
+  );
+  assert_eq!(
+    configured_en_predicts_es.observed_language(),
+    Some("es"),
+    "a configured language must NOT suppress a genuinely PREDICTED <|es|> observation"
+  );
+
   // Branch 2b -- GENUINELY PREDICTED token (F2, codex round 4): a bare `[SOT]`
   // prompt (nothing forced past it) with `without_timestamps` (so no
   // `TimestampRulesFilter` masks the language token at the sampling position),

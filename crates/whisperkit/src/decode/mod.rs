@@ -401,14 +401,25 @@ where
       current_tokens.push(next_token); // :682-686
       log_probs.push(next_token_log_prob);
       // Recognize the genuine language OBSERVATION the instant its token lands in
-      // the predicted region — the first `<|lang|>` token under auto-detect — and
+      // the predicted region — the first `<|lang|>` token the model PREDICTS — and
       // stash it in the caller's cell BEFORE the next (fallible) `decode_step`.
       // FIRST wins, matching the finalized scan this replaces and the merge law's
       // first-observation rule; a token pushed here sits at/after
       // `initial_prompt_index`, so `!is_prefill` alone is the predicted-region
       // gate (F2, codex round 6 post-consolidation).
+      //
+      // NOT gated on `options.language().is_empty()`: a PREDICTED `<|lang|>` token
+      // is an OBSERVATION distinct from the configured/display language (round 10,
+      // F1). A multilingual decode configured `language="en"` with
+      // `without_timestamps` forces `[SOT, <|en|>, <|transcribe|>,
+      // <|notimestamps|>]`, then the model can still PREDICT `<|es|>` at the first
+      // free position: the display stays the Swift-faithful forced `<|en|>` while
+      // the observation is the predicted `<|es|>`. Suppressing it under a
+      // configured language contradicted the record's own contract
+      // (`observed_language` is the outcome, never the configured input) and
+      // recorded `None` for a run that plainly detected a language. The forced
+      // prefill `<|en|>` is already excluded by `!is_prefill`, not by the config.
       if observed_language_token.get().is_none()
-        && options.language().is_empty()
         && tokenizer.all_language_tokens().contains(&next_token)
       {
         observed_language_token.set(Some(next_token));
