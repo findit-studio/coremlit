@@ -389,19 +389,44 @@ impl Graph {
     }
   }
 
-  /// True when `operand`'s producer is a floor-contributing GUARD op
-  /// (`add`/`maximum`/`clip`) whose floor nonetheless did NOT resolve — the
-  /// graph structurally intends a floor here but its constant is unreadable
-  /// even through casts, so it is a hole to surface, not "no claim". Kept
-  /// distinct from a genuinely dynamic input (no producer, or a non-guard
-  /// producer like `real_div`/`sqrt`/`mul`/`reduce_*`/`scatter`), which stays
-  /// silent: that is what lets the shipped embedders' `sqrt(real_div(..))` std
-  /// sites and every `x / <dynamic>` divide avoid flooding the sweep with
-  /// false holes while a `count + <dynamic>` guard the reader cannot read is
-  /// still caught (see the `sqrt`/`real_div` arms of [`Graph::audit`]).
+  /// Follows `cast` producers to the ultimate non-`cast` producing statement of
+  /// `tok`, with the SAME bounded traversal [`Graph::floor`] and
+  /// [`Graph::const_through_cast`] use (depth-capped at 6). A fp16 conversion
+  /// routinely interposes a `cast` between a floor-contributing guard op and the
+  /// site it guards (`add → cast → real_div`), so inspecting only the immediate
+  /// producer would miss the guard.
+  fn producer_through_cast(&self, tok: Option<&str>, depth: u8) -> Option<&Stmt> {
+    let tok = tok?;
+    if depth > 6 {
+      return None;
+    }
+    match self.producers.get(tok) {
+      Some(stmt) if stmt.op == "cast" => {
+        self.producer_through_cast(arg(&stmt.args, "x"), depth + 1)
+      }
+      other => other,
+    }
+  }
+
+  /// True when `operand`'s producer — followed through any `cast` chain — is a
+  /// floor-contributing GUARD op (`add`/`maximum`/`clip`) whose floor
+  /// nonetheless did NOT resolve: the graph structurally intends a floor here
+  /// but its constant is unreadable even through casts, so it is a hole to
+  /// surface, not "no claim". The `cast` chain is followed with the SAME bounded
+  /// traversal [`Graph::floor`] uses (shared [`Graph::producer_through_cast`]);
+  /// [`Graph::floor`] itself recursively unwraps `cast`, so a `dynamic → add →
+  /// cast → real_div` divisor reaches the `add` when the floor is resolved — the
+  /// unresolved check must reach it too, or the site contributes neither a
+  /// finding nor a hole and simply vanishes. Kept distinct from a genuinely
+  /// dynamic input (no producer, or a non-guard producer like
+  /// `real_div`/`sqrt`/`mul`/`reduce_*`/`scatter`), which stays silent: that is
+  /// what lets the shipped embedders' `sqrt(real_div(..))` std sites and every
+  /// `x / <dynamic>` divide avoid flooding the sweep with false holes while a
+  /// `count + <dynamic>` guard the reader cannot read is still caught (see the
+  /// `sqrt`/`real_div` arms of [`Graph::audit`]).
   fn unreadable_floor_guard(&self, operand: Option<&str>) -> bool {
-    operand
-      .and_then(|v| self.producers.get(v))
+    self
+      .producer_through_cast(operand, 0)
       .is_some_and(|stmt| matches!(stmt.op.as_str(), "add" | "maximum" | "clip"))
   }
 
@@ -827,6 +852,28 @@ const DYNAMIC_UNRESOLVABLE_DIVISOR: &str = r#"
             tensor<fp16, [3, 2560]> mean = real_div(x = numer_cast_fp16, y = v1)[name = tensor<string, []>("mean")];
 "#;
 
+/// The same dynamically-unresolvable `add`-guarded divisor, but with a `cast`
+/// interposed before the `real_div` (`mul(dynamic) → add → cast → real_div`),
+/// beside one clean, surviving guard (whisper's mel `add(0x1p-24) → log`). Every
+/// statement parses, so nothing is unresolved at parse time; the `add`
+/// structurally guards the divisor but its epsilon is a `mul` (dynamic), so no
+/// floor resolves. `Graph::floor` recursively unwraps the `cast` to reach the
+/// `add` — so the unresolved-detection MUST unwrap it too, or the site produces
+/// NEITHER a finding NOR a hole and simply disappears while the clean guard
+/// keeps the sweep green. This is the exact hole an `unreadable_floor_guard`
+/// that inspects only the divisor's IMMEDIATE producer (the `cast`, whose op is
+/// not a guard op) leaves open.
+const CAST_WRAPPED_DYNAMIC_DIVISOR: &str = r#"
+            tensor<fp16, []> ok_eps = const()[name = tensor<string, []>("ok_eps"), val = tensor<fp16, []>(0x1p-24)];
+            tensor<fp16, [80, 3000]> ok_mel = add(x = ok_mel_1, y = ok_eps)[name = tensor<string, []>("ok_mel")];
+            tensor<fp16, []> ok_log_eps = const()[name = tensor<string, []>("ok_log_eps"), val = tensor<fp16, []>(0x0p+0)];
+            tensor<fp16, [80, 3000]> ok_log = log(epsilon = ok_log_eps, x = ok_mel)[name = tensor<string, []>("ok_log")];
+            tensor<fp16, [3, 1]> dyn_eps = mul(x = a_cast_fp16, y = b_cast_fp16)[name = tensor<string, []>("dyn_eps")];
+            tensor<fp16, [3, 1]> v1 = add(x = count_cast_fp16, y = dyn_eps)[name = tensor<string, []>("v1")];
+            tensor<fp16, [3, 1]> v1_fp16 = cast(dtype = fp16, x = v1)[name = tensor<string, []>("v1_fp16")];
+            tensor<fp16, [3, 2560]> mean = real_div(x = numer_cast_fp16, y = v1_fp16)[name = tensor<string, []>("mean")];
+"#;
+
 /// The vanishing guard sites of an already-audited graph, rendered and sorted
 /// as a **multiset** — duplicates PRESERVED. Two sites with the same signature
 /// are two defects, not one: a `dedup`/set here would let a reconversion that
@@ -1125,6 +1172,43 @@ fn an_unresolvable_add_guarded_divisor_is_a_hole_not_a_drop() {
       .any(|u| u.contains("real_div") && u.contains("mean")),
     "the unreadable `add`-guarded divisor must be surfaced as unresolved, quoting \
      the statement — not dropped: {:?}",
+    audit.unresolved
+  );
+}
+
+/// Regression (completeness, cast-wrapped UNRESOLVED floor). A cast-wrapped,
+/// dynamically-unresolvable `add`-guarded divisor (`mul → add → cast →
+/// real_div`) beside a clean, surviving guard must FAIL the audit: the clean
+/// guard must not mask the hole. `Graph::floor` unwraps the `cast` to reach the
+/// `add` when resolving the floor, so the unresolved-detection must unwrap it
+/// too — otherwise the `real_div` yields neither a finding nor an unresolved
+/// hole and vanishes. MUTATION PROOF: reverting `unreadable_floor_guard` to
+/// inspect only the divisor's IMMEDIATE producer (dropping the shared
+/// `producer_through_cast` unwrap) makes it see the `cast` — whose op is not a
+/// guard op — return false, push no unresolved, and this assertion goes red (the
+/// audit reports clean while the guard silently disappears).
+#[test]
+fn follows_a_cast_before_an_unresolvable_divisor_guard() {
+  let audit = parse_mil(CAST_WRAPPED_DYNAMIC_DIVISOR).audit();
+
+  // The clean mel-style guard is still audited and still survives...
+  assert!(
+    audit
+      .findings
+      .iter()
+      .any(|f| f.op == "log" && f.survives_fp16()),
+    "the valid mel-style guard must still be audited and survive"
+  );
+  // ...but the cast-wrapped `add`-guarded divisor is surfaced as a hole,
+  // quoting the `real_div` statement — not dropped so the clean guard alone
+  // reports a clean sweep.
+  assert!(
+    audit
+      .unresolved
+      .iter()
+      .any(|u| u.contains("real_div") && u.contains("mean")),
+    "the cast-wrapped unresolvable divisor guard must be surfaced as unresolved, \
+     quoting the statement — not dropped: {:?}",
     audit.unresolved
   );
 }
