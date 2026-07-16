@@ -3,9 +3,9 @@ name = "alignkit"
 description = "CoreML wav2vec2 forced word-level alignment"
 version.workspace = true
 edition.workspace = true
-# Unpublishable: `asry` is a local path dependency (see the `[dependencies]`
-# entry below) and its own `emissions` feature isn't published either; flip
-# once both land on a released asry version.
+# Unpublishable: `asry` is a rev-pinned git dependency (see the `[dependencies]`
+# entry below) — crates.io forbids git sources — and its own `emissions` feature
+# isn't published either; flip once asry lands on a released version.
 publish = false
 rust-version.workspace = true
 license.workspace = true
@@ -28,9 +28,23 @@ thiserror.workspace = true
 # `whispercpp`, no `ort`). The B3 interim default-features-ON workaround
 # is retired now that asry's `lang.rs` decouple landed on `main` — an
 # `emissions`-only selection no longer trips `asry::types::lang`'s
-# `pub use whispercpp::Lang`. The path resolves to the real asry checkout
-# via a workspace-relative symlink in the dev worktree layout.
-asry = { path = "../../../asry", default-features = false, features = ["emissions"] }
+# `pub use whispercpp::Lang`.
+#
+# Rev-pinned to a PUBLIC git source, NOT a sibling path: a clean checkout of
+# this repo alone resolves and builds the workspace, with no co-located `asry`
+# checkout required. A sibling `asry` is now only TEST DATA — for the ignored
+# oracle gates that read asry's `models/` fixtures (`ALIGNKIT_ASRY_MODELS`, see
+# `tests/common/mod.rs`) — never the code dependency. The rev is asry's
+# reviewed `main` HEAD at the time this branch was cut.
+#
+# Co-developing asry and alignkit together? Point both at your local `asry`
+# with an UNCOMMITTED workspace-root patch (add to the root `Cargo.toml`, never
+# commit it):
+#
+#   [patch."https://github.com/findit-studio/asry"]
+#   asry = { path = "../asry" }
+#
+asry = { git = "https://github.com/findit-studio/asry", rev = "49cbfc9ca6fb75366d75a862212bdebb889021e5", default-features = false, features = ["emissions"] }
 
 serde = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
@@ -82,7 +96,7 @@ harness = false
 # oracle) directly, so `asry` must appear here too. Cargo unions the features
 # of both entries, so this adds nothing on its own — `emissions` comes from
 # `[dependencies]` above, and `alignment` arrives only with `parity-oracle`.
-asry = { path = "../../../asry", default-features = false }
+asry = { git = "https://github.com/findit-studio/asry", rev = "49cbfc9ca6fb75366d75a862212bdebb889021e5", default-features = false }
 criterion.workspace = true
 hound.workspace = true
 serde_json.workspace = true

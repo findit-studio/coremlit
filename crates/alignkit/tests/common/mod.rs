@@ -216,11 +216,12 @@ pub fn sha256_samples_hex(samples: &[f32]) -> String {
     .collect()
 }
 
-/// Directory holding asry's ONNX wav2vec2 oracle — the `models/` directory
-/// of the asry checkout alignkit already path-depends on
-/// (`crates/alignkit/Cargo.toml`'s `asry = { path = "../../../asry" }`), so
-/// the default resolves for anyone who can build this crate at all.
-/// Overridable via `ALIGNKIT_ASRY_MODELS`.
+/// Directory holding asry's ONNX wav2vec2 oracle — the `models/` directory of a
+/// co-located `asry` checkout (a sibling of this repo). This is TEST DATA, not
+/// the code dependency: alignkit depends on asry as a rev-pinned git source
+/// (`crates/alignkit/Cargo.toml`), so building the crate does NOT put asry's
+/// `models/` on disk. The default path below assumes the dev-worktree layout (a
+/// sibling `asry`); set `ALIGNKIT_ASRY_MODELS` when it lives elsewhere.
 ///
 /// `#[allow(dead_code)]`: only `tests/parity_words.rs` uses it.
 #[allow(dead_code)]
