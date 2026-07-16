@@ -682,6 +682,170 @@ fn diarize_with_offline_routes_the_backend_options() {
 }
 
 // =====================================================================
+// diarize_online — the ONLINE engine wiring (T5). Hermetic: no models, ort-free,
+// NO plda. Proves the full online plumbing (feed order → per-slot labelling →
+// the SAME reconstruction the offline path uses): a purpose-built 2-chunk
+// extraction with orthogonal one-hot-block embeddings makes every assignment
+// predictable, so the exact hard_clusters can be pinned. The clusterer's own
+// decision logic is separately gated by dia's mutation-proven unit tests and the
+// Swift-trace oracle (`tests/parity_online_swift.rs`).
+// =====================================================================
+
+/// A 2-chunk extraction whose six slots are orthogonal one-hot 64-dim blocks
+/// (near-antipodal in cosine space) except the zeroed `(chunk0, slot2)`:
+///
+/// | slot        | block   | outcome (min_speech_duration = 0) |
+/// |-------------|---------|-----------------------------------|
+/// | c0 s0       | 0 (A)   | New speaker 1 → cluster 0          |
+/// | c0 s1       | 1 (B)   | New speaker 2 → cluster 1          |
+/// | c0 s2       | (zero)  | dropped (normalize_from None) → -2 |
+/// | c1 s0       | 0 (A)   | Existing speaker 1 → cluster 0     |
+/// | c1 s1       | 0 (A)   | Existing speaker 1 → cluster 0     |
+/// | c1 s2       | 2 (C)   | New speaker 3 → cluster 2          |
+///
+/// So `hard_clusters == [[0, 1, -2], [0, 0, 2]]`, `num_clusters == 3`. Timing is
+/// the community-1 default (chunks_sw step 1 s, frames_sw step 0.016875 s): with
+/// F = 4, chunk 1 lands at output frames 59..63, so `num_output_frames = 63`.
+fn online_extraction() -> Extraction {
+  const F: usize = 4;
+  let seg_idx = |c: usize, f: usize, s: usize| (c * F + f) * SEG_NUM_SLOTS + s;
+  let mut segmentations = vec![0.0f64; 2 * F * SEG_NUM_SLOTS];
+  // Activity per surviving slot (nonzero frames → the online speech duration);
+  // the exact counts do not matter with min_speech_duration = 0, only that the
+  // dropped slot's column stays zero.
+  for f in 0..2 {
+    segmentations[seg_idx(0, f, 0)] = 1.0; // c0 s0
+  }
+  for f in 2..4 {
+    segmentations[seg_idx(0, f, 1)] = 1.0; // c0 s1
+  }
+  // c0 s2: no active frame (dropped)
+  for f in 0..4 {
+    segmentations[seg_idx(1, f, 0)] = 1.0; // c1 s0
+  }
+  for f in 0..2 {
+    segmentations[seg_idx(1, f, 1)] = 1.0; // c1 s1
+  }
+  for f in 2..4 {
+    segmentations[seg_idx(1, f, 2)] = 1.0; // c1 s2
+  }
+
+  let mut raw_embeddings = vec![0.0f32; 2 * SEG_NUM_SLOTS * EMBEDDING_DIM];
+  let mut set_block = |c: usize, s: usize, block: usize| {
+    let base = (c * SEG_NUM_SLOTS + s) * EMBEDDING_DIM;
+    raw_embeddings[(base + block * 64)..(base + (block + 1) * 64)].fill(1.0);
+  };
+  set_block(0, 0, 0); // A
+  set_block(0, 1, 1); // B
+  // c0 s2 left zero → dropped by Embedding::normalize_from
+  set_block(1, 0, 0); // A (reuse)
+  set_block(1, 1, 0); // A (reuse)
+  set_block(1, 2, 2); // C
+
+  // count[t]: 2 active clusters over each chunk's frames, 0 elsewhere. Valid
+  // (<= MAX_COUNT_PER_FRAME) and length == num_output_frames.
+  let mut count = vec![0u8; 63];
+  count[0..4].fill(2);
+  count[59..63].fill(2);
+
+  Extraction {
+    raw_embeddings,
+    segmentations,
+    count,
+    num_chunks: 2,
+    num_frames_per_chunk: F,
+    num_output_frames: 63,
+    chunks_sw: crate::window::chunk_sliding_window(&WindowOptions::new()),
+    frames_sw: crate::window::frame_sliding_window(),
+  }
+}
+
+#[test]
+fn diarize_online_labels_slots_and_reconstructs_spans() {
+  let e = online_extraction();
+  // min_speech_duration = 0 isolates the plumbing from the duration gate: every
+  // slot with a real embedding forms or joins a speaker; the drop path here is
+  // exactly the zero-embedding slot.
+  let opts = OnlineOptions::new().with_min_speech_duration(0.0);
+
+  let out = e
+    .diarize_online(opts)
+    .expect("online reconstruction succeeds on a valid extraction");
+
+  // The engine's per-slot assignment, mapped to 0-based cluster ids, with the
+  // dropped (chunk0, slot2) as UNMATCHED (-2). This is THE wiring assertion: a
+  // wrong feed order, a mis-mapped id, or a skipped/duplicated slot breaks it.
+  assert_eq!(
+    out.hard_clusters_slice(),
+    &[[0, 1, -2], [0, 0, 2]],
+    "online per-slot labels (chunk order, slot order) diverged"
+  );
+  assert_eq!(out.num_clusters(), 3);
+
+  // The SAME reconstruction the offline path uses actually ran: it produced
+  // spans, and every span names one of the three online clusters.
+  let spans = out.spans_slice();
+  assert!(!spans.is_empty(), "reconstruction produced no spans");
+  assert!(
+    spans.iter().all(|s| s.cluster() < 3),
+    "a span named a cluster outside the online roster: {:?}",
+    spans.iter().map(|s| s.cluster()).collect::<Vec<_>>()
+  );
+}
+
+#[test]
+fn diarize_with_online_routes_to_diarize_online_ignoring_plda() {
+  // diarize_with(_, Online(opts)) MUST equal diarize_online(opts): same engine,
+  // same labels, and the plda is unused (a mutation routing Online through the
+  // offline PLDA path, or forwarding plda into a different engine, would diverge
+  // — offline clustering of these embeddings is not the online greedy result).
+  let e = online_extraction();
+  let opts = OnlineOptions::new().with_min_speech_duration(0.0);
+  let plda = dia::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+
+  let via_online = e.diarize_online(opts).expect("diarize_online ok");
+  let via_with = e
+    .diarize_with(&plda, ClusterBackend::Online(opts))
+    .expect("diarize_with(Online) ok");
+
+  assert_eq!(
+    via_online.hard_clusters_slice(),
+    via_with.hard_clusters_slice(),
+    "diarize_with(Online) routed to a different labelling than diarize_online"
+  );
+  assert_eq!(via_online.num_clusters(), via_with.num_clusters());
+  let spans = |o: &dia::offline::OfflineOutput| -> Vec<(f64, f64, usize)> {
+    o.spans_slice()
+      .iter()
+      .map(|s| (s.start(), s.end(), s.cluster()))
+      .collect()
+  };
+  assert_eq!(spans(&via_online), spans(&via_with));
+}
+
+#[test]
+fn diarize_online_default_options_drops_subsecond_slots() {
+  // With the DEFAULT min_speech_duration (1.0 s) and community-1 timing, every
+  // slot here is far under a second of activity (≤ 4 frames × 0.016875 s ≈
+  // 0.068 s) and none matches an existing speaker first, so all are dropped:
+  // hard_clusters is all-UNMATCHED and reconstruction yields an empty diarization.
+  // This exercises the default duration gate the plumbing test above bypasses.
+  let e = online_extraction();
+  let out = e
+    .diarize_online(OnlineOptions::default())
+    .expect("online reconstruction succeeds even with all slots dropped");
+  assert_eq!(
+    out.hard_clusters_slice(),
+    &[[-2, -2, -2], [-2, -2, -2]],
+    "default min_speech_duration should drop every sub-second slot"
+  );
+  assert!(
+    out.spans_slice().is_empty(),
+    "all-dropped extraction must produce no spans"
+  );
+}
+
+// =====================================================================
 // Model-gated (all #[ignore]): requires local speakerkit models
 // (SPEAKERKIT_TEST_MODELS or Models/speakerkit/) plus the cross-crate
 // ted_60.wav fixture. Loader/path helpers duplicated in miniature because

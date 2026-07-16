@@ -132,7 +132,7 @@
 //!   nonzero.
 
 use crate::{
-  cluster::ClusterBackend,
+  cluster::{ClusterBackend, OnlineOptions},
   embed::{EMBED_SLOTS, EMBEDDING_DIM, EmbedModel},
   error::ExtractError,
   segment::{SEG_CHUNK_SAMPLES, SEG_NUM_SLOTS, SegmentModel},
@@ -750,10 +750,22 @@ impl Extraction {
   /// [`dia::offline::OfflineInput`] bridge ([`Self::into_offline_input`]) with
   /// the variant's [`OfflineOptions`](crate::cluster::OfflineOptions) applied
   /// over it (its crate-private `apply_to`) and runs
-  /// [`dia::offline::diarize_offline`] over the result. The `match` on
-  /// `backend` is wildcard-free: when a second
-  /// engine variant lands, the compiler forces a new arm here rather than
-  /// letting it silently route to the offline path.
+  /// [`dia::offline::diarize_offline`] over the result. For
+  /// [`ClusterBackend::Online`], delegates to [`Self::diarize_online`] with the
+  /// variant's [`OnlineOptions`]. The `match` on
+  /// `backend` is wildcard-free: any future engine variant forces a new arm
+  /// here rather than silently routing to an existing path.
+  ///
+  /// # `plda` is consumed by `Offline` only
+  /// `plda` threads into the offline bridge (see [`Self::into_offline_input`]);
+  /// the [`Online`](ClusterBackend::Online) route IGNORES it. FluidAudio's
+  /// greedy matcher works on RAW cosine embeddings with no PLDA projection
+  /// (design spec §Architecture point 3; T4's semantics table), so
+  /// `diarize_with(plda, ClusterBackend::Online(opts))` is exactly
+  /// `self.diarize_online(opts)` with `plda` unused. Prefer
+  /// [`Self::diarize_online`] directly when you want the online engine and have
+  /// no PLDA to supply — its signature takes none, so the absence is a fact of
+  /// the API rather than an argument quietly discarded.
   ///
   /// The returned [`dia::offline::OfflineOutput`] carries the speaker-labelled
   /// spans ([`dia::offline::OfflineOutput::spans_slice`]) plus the frame-level
@@ -785,7 +797,164 @@ impl Extraction {
       ClusterBackend::Offline(opts) => {
         dia::offline::diarize_offline(&opts.apply_to(self.into_offline_input(plda)))
       }
+      // `plda` is deliberately NOT forwarded: the online engine matches raw
+      // cosine embeddings, not PLDA-projected ones (see the doc's "`plda` is
+      // consumed by `Offline` only" and [`Self::diarize_online`]).
+      ClusterBackend::Online(opts) => self.diarize_online(opts),
     }
+  }
+
+  /// Cluster this extraction into speaker-labelled spans with the ONLINE
+  /// (streaming) engine — FluidAudio's greedy centroid matcher, ported in dia as
+  /// [`dia::cluster::online::OnlineClusterer`] — tuned by
+  /// [`OnlineOptions`]. This is
+  /// [`Self::diarize_with`]'s [`ClusterBackend::Online`] route, exposed directly
+  /// because the online engine takes NO `plda`: it matches RAW L2-normalized
+  /// WeSpeaker embeddings by cosine distance, and the PLDA projection the
+  /// offline pipeline applies has no part in it (design spec §Architecture
+  /// point 3; T4's semantics table, "Cosine on raw WeSpeaker embeddings, no
+  /// PLDA"). Making the absence of `plda` a fact of the signature — rather than
+  /// an argument silently ignored — is the honest surface.
+  ///
+  /// # What it does
+  /// Feeds each `(chunk, slot)`'s raw embedding to the clusterer in **chunk
+  /// order, then slot order within the chunk** — the exact order FluidAudio's
+  /// `DiarizerManager` feeds `SpeakerManager` (`Core/DiarizerManager.swift:351`)
+  /// and the ONE order this order-DEPENDENT engine is defined at here
+  /// (deterministic given a fixed extraction). Per slot:
+  /// - a dropped slot (all-zero raw-embedding row —
+  ///   [`dia::embed::Embedding::normalize_from`] rejects its zero norm) is
+  ///   skipped and left unmatched;
+  /// - otherwise the row is L2-normalized into a [`dia::embed::Embedding`] and
+  ///   assigned, with a speech duration of `active_frame_count ×
+  ///   frames_sw.step` seconds — FluidAudio's `Float(activity) *
+  ///   slidingWindow.step` (`DiarizerManager.swift:357`), where `activity` is
+  ///   the slot's nonzero-segmentation frame count — which gates new-speaker
+  ///   creation vs. drop inside the engine.
+  ///
+  /// The per-slot speaker labels become the `hard_clusters` fed to the SAME
+  /// reconstruction the offline path uses ([`dia::reconstruct::reconstruct`] →
+  /// [`dia::reconstruct::try_discrete_to_spans`]); only the cluster labels come
+  /// from a different engine. The result is a [`dia::offline::OfflineOutput`]
+  /// (the type name refers to dia's `offline` module, not the engine — here it
+  /// carries the online greedy assignment) with the speaker-labelled spans, the
+  /// frame-level grid, and the per-chunk hard assignment.
+  ///
+  /// Online ids are the engine's dense `u64` from 1; they are mapped to the
+  /// 0-based cluster indices [`dia::reconstruct::reconstruct`] expects.
+  ///
+  /// # NOT pyannote-parity
+  /// The online engine is order-dependent and its gate is parity with
+  /// FluidAudio's Swift `SpeakerManager` (`tests/parity_online_swift.rs`), never
+  /// DER against pyannote. See
+  /// [`OnlineOptions`] and dia's `cluster::online`.
+  ///
+  /// # Errors
+  /// Every failure routes through [`dia::offline::Error::Reconstruct`]: a
+  /// non-finite segmentation, invalid sliding-window timing, or — only for a
+  /// degenerate input that spawns more than
+  /// [`dia::reconstruct::MAX_CLUSTER_ID`] + 1 speakers — an out-of-range cluster
+  /// id. The PLDA / pipeline / segment / embed error arms of
+  /// [`dia::offline::Error`] cannot fire here: the online path runs none of them.
+  pub fn diarize_online(
+    &self,
+    opts: OnlineOptions,
+  ) -> Result<dia::offline::OfflineOutput, dia::offline::Error> {
+    use dia::cluster::{
+      hungarian::UNMATCHED,
+      online::{Assignment, OnlineClusterer},
+    };
+
+    let mut clusterer = OnlineClusterer::new(opts.to_dia_options());
+    let frame_step = self.frames_sw.step() as f32;
+
+    // One `[i32; SEG_NUM_SLOTS]` row per chunk (dia's `ChunkAssignment`),
+    // UNMATCHED (-2) for every slot until the engine labels it.
+    let mut hard_clusters: Vec<dia::pipeline::ChunkAssignment> =
+      vec![[UNMATCHED; SEG_NUM_SLOTS]; self.num_chunks];
+
+    // Feed each (chunk, slot) in chunk order, then slot order within the chunk
+    // (iterating `hard_clusters` itself is that order and lets the label be
+    // written straight into the slot). Self's tensors are read by the `(c, s)`
+    // index alongside.
+    for (c, chunk_row) in hard_clusters.iter_mut().enumerate() {
+      for (s, slot) in chunk_row.iter_mut().enumerate() {
+        // Raw embedding row for (c, s). A dropped slot's row is all-zero, so
+        // `normalize_from` rejects it (zero norm) and the slot stays UNMATCHED.
+        let range = embedding_range(c, s);
+        let mut row = [0.0f32; EMBEDDING_DIM];
+        row.copy_from_slice(&self.raw_embeddings[range]);
+        let Some(embedding) = dia::embed::Embedding::normalize_from(row) else {
+          continue;
+        };
+
+        // Speech duration = active-frame count × frame step (FluidAudio's
+        // `Float(activity) * slidingWindow.step`, DiarizerManager.swift:357).
+        // Binarized segmentations are 0/1; count nonzero frames — dia's own
+        // `filter_embeddings` "any nonzero entry is binary-active" convention.
+        let mut activity = 0usize;
+        for f in 0..self.num_frames_per_chunk {
+          if self.segmentations[(c * self.num_frames_per_chunk + f) * SEG_NUM_SLOTS + s] > 0.0 {
+            activity += 1;
+          }
+        }
+        let speech_duration = activity as f32 * frame_step;
+
+        match clusterer.assign(&embedding, speech_duration) {
+          Assignment::New(id) | Assignment::Existing(id) => {
+            // Dense u64 ids from 1 → 0-based cluster indices. `try_from`
+            // cannot fail for realistic speaker counts; a pathological
+            // overflow surfaces later as reconstruct's HardClustersIdAboveMax
+            // (a typed error), never a panic here.
+            *slot = i32::try_from(id - 1).unwrap_or(i32::MAX);
+          }
+          Assignment::Dropped => {} // stays UNMATCHED
+        }
+      }
+    }
+
+    // The SAME reconstruction the offline path runs — only the cluster labels
+    // came from the online engine instead of AHC→VBx. `reconstruct` derives its
+    // own cluster count from `hard_clusters` + `count`.
+    let recon_input = dia::reconstruct::ReconstructInput::new(
+      self.segmentations.as_slice(),
+      self.num_chunks,
+      self.num_frames_per_chunk,
+      SEG_NUM_SLOTS,
+      &hard_clusters,
+      self.count.as_slice(),
+      self.num_output_frames,
+      self.chunks_sw.into(),
+      self.frames_sw.into(),
+    );
+    let discrete = dia::reconstruct::reconstruct(&recon_input)?;
+
+    // The grid is `num_output_frames × num_clusters` row-major, so its width IS
+    // the cluster count — the single source of truth for both the span
+    // conversion and the stored metadata. Deriving it from the grid (rather than
+    // recomputing dia's `num_clusters_from_hard.max(max_count.max(1))`) is always
+    // shape-consistent, INCLUDING reconstruct's all-UNMATCHED zero-return path
+    // (width 1), which a `count`-inflated recomputation would mismatch — that is
+    // the reachable "every slot dropped" outcome for a short clip at the default
+    // `min_speech_duration`. `num_output_frames > 0` holds here: `reconstruct`
+    // rejects a zero-frame grid before returning `Ok`.
+    let num_clusters = discrete.as_slice().len() / self.num_output_frames;
+    let spans = dia::reconstruct::try_discrete_to_spans(
+      discrete.as_slice(),
+      self.num_output_frames,
+      num_clusters,
+      self.frames_sw.into(),
+      // Online exposes no gap-merge knob; 0.0 = no merge, dia's own default.
+      0.0,
+    )
+    .map_err(dia::reconstruct::Error::from)?;
+
+    Ok(dia::offline::OfflineOutput::new(
+      std::sync::Arc::from(hard_clusters),
+      discrete,
+      num_clusters,
+      std::sync::Arc::from(spans),
+    ))
   }
 }
 
