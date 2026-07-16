@@ -547,6 +547,73 @@ fn der_collar_excludes_boundary() {
   );
 }
 
+/// A ONE-frame boundary shift is invisible to the standard (collar-scored) DER
+/// but not to [`der_strict`] — so "0.0000 % standard DER" and "frame-exact" are
+/// DIFFERENT claims, and the parity suites' zero pins (all [`der_std`]) certify
+/// the former, not the latter.
+///
+/// Reference: speaker 0 on `[0,5)`, speaker 1 on `[5,10)`. Hypothesis: identical
+/// except the 5.0 s speaker-change boundary is shifted LATER by one 10 ms scoring
+/// frame (to 5.01 s). The single frame centred at 5.005 s is speaker 1 in the
+/// reference but still speaker 0 in the hypothesis:
+///
+/// - [`der_strict`] scores it — one CONFUSION unit, `err_units() == 1`;
+/// - [`der_std`] does NOT — 5.005 s is 5 ms from the reference boundary at 5.0 s,
+///   deep inside the 0.25 s collar, so the frame is unscored and DER is 0.
+///
+/// A hypothesis that differs from frame-exact by one frame therefore passes every
+/// `der_std` zero pin in these suites. A claim must say which agreement it means;
+/// this is the proof the two metrics are separable.
+#[test]
+fn one_frame_boundary_shift_is_collar_invisible_but_strict_visible() {
+  let reference = vec![
+    Seg {
+      start: 0.0,
+      end: 5.0,
+      spk: 0,
+    },
+    Seg {
+      start: 5.0,
+      end: 10.0,
+      spk: 1,
+    },
+  ];
+  // The speaker-change boundary, moved one 10 ms scoring frame later.
+  let shifted = vec![
+    Seg {
+      start: 0.0,
+      end: 5.0 + DER_STEP_S,
+      spk: 0,
+    },
+    Seg {
+      start: 5.0 + DER_STEP_S,
+      end: 10.0,
+      spk: 1,
+    },
+  ];
+
+  let strict = der_strict(&reference, &shifted);
+  assert_eq!(
+    strict.err_units(),
+    1,
+    "a one-frame boundary shift must cost exactly one strict speaker-frame, got {} ({strict:?})",
+    strict.err_units()
+  );
+  assert_eq!(
+    strict.conf_units, 1,
+    "...and that frame is CONFUSION (wrong speaker), not miss/FA"
+  );
+
+  let std = der_std(&reference, &shifted);
+  assert_eq!(
+    std.err_units(),
+    0,
+    "the standard 0.25 s collar must absorb a one-frame boundary shift ({} err units) — this is \
+     exactly why a der_std zero pin does NOT prove frame-exactness",
+    std.err_units()
+  );
+}
+
 /// The optimal mapping must pick the assignment that MAXIMIZES matched
 /// speech, not a greedy first pick.
 #[test]

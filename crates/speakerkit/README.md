@@ -99,10 +99,10 @@ reference on `dia`'s parity corpus, `CpuOnly`:
 | `10_mrbeast_clean_water` | 7 | 0.0000%, finds 7 | **3.33%**, finds **8** |
 | `12_mrbeast_schools` | 15 | 0.1178%, finds 15 | **3.46%**, finds 15 |
 
-`dia`-ort (the upstream oracle) reproduces the reference frame-exactly on every
-one of these clips, and FluidAudio tracks it, so the audio, the framing, the
-clustering, the reference and the harness are all held constant: **argmax's
-embedding is the only variable.** Where it fails, the error is ~100% *confusion*
+`dia`-ort (the upstream oracle) reproduces the reference to 0.0000% standard
+(collar-scored) DER on every one of these clips, and FluidAudio tracks it, so the
+audio, the framing, the clustering, the reference and the harness are all held
+constant: **argmax's embedding is the only variable.** Where it fails, the error is ~100% *confusion*
 with zero miss and zero false alarm — argmax hears exactly the same speech and
 assigns it to the wrong person. That is the signature of a clustering divergence,
 not of boundary jitter, which is why no collar absorbs it.
