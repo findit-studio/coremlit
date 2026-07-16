@@ -37,7 +37,7 @@ use crate::{aligner::Aligner, error::AlignError};
 
 /// Identifies an aligner in the [`AlignmentSet`] registry.
 ///
-/// Lookup order (see [`AlignmentSet::lookup`]):
+/// Lookup order (see [`AlignmentSet::resolve`]):
 /// 1. [`AlignerKey::Lang`]`(L)` — the explicit aligner for a language.
 /// 2. [`AlignerKey::Any`] — the multilingual fallback (registry miss only).
 /// 3. The configured [`AlignmentFallback`].
@@ -174,13 +174,17 @@ define_alignment_fallback! {
   }
 }
 
-/// The result of an [`AlignmentSet::lookup`].
-pub enum AlignmentLookup<'a> {
+/// Internal result of [`AlignmentSet::lookup`]: the aligner-carrying resolution
+/// the guarded methods dispatch on. Deliberately **not** public — an
+/// `AnyFallback`'s raw `&Aligner` is exactly the cross-language escape hatch
+/// [`AlignmentHandle`] exists to close (F1). The only public resolver is
+/// [`AlignmentSet::resolve`], which hands back a handle, never an aligner.
+enum AlignmentLookup<'a> {
   /// Hit on [`AlignerKey::Lang`]`(L)`. A failure of this aligner does NOT
-  /// fall through to [`AlignerKey::Any`].
+  /// fall through to [`AlignerKey::Any`]. The matched key is always
+  /// `Lang(requested)`, so it carries no information beyond the handle's own
+  /// [`language`](AlignmentHandle::language) and is not stored.
   Hit {
-    /// The matched key (always [`AlignerKey::Lang`]).
-    matched: AlignerKey,
     /// The language-specific aligner.
     aligner: &'a Aligner,
   },
@@ -196,6 +200,67 @@ pub enum AlignmentLookup<'a> {
     /// The configured miss policy.
     fallback: AlignmentFallback,
   },
+}
+
+/// How [`AlignmentSet::resolve`] matched a request — the hit-vs-fallback-vs-miss
+/// resolution as DATA, never a raw `&Aligner`.
+///
+/// Returned by [`AlignmentHandle::binding`] for a caller that needs to know
+/// which aligner the registry bound (which language, hit or fallback); the
+/// aligner itself stays behind the handle's guarded
+/// [`detect_oov`](AlignmentHandle::detect_oov) /
+/// [`align_chunk`](AlignmentHandle::align_chunk), because a raw cross-language
+/// `&Aligner` is the escape hatch F1 closes.
+///
+/// Deliberately **not** `#[non_exhaustive]` — unlike the input vocabularies
+/// [`AlignerKey`] and [`AlignmentFallback`], this is a CLOSED trichotomy: the
+/// strict `Lang → Any → fallback` lookup resolves in exactly these three ways,
+/// and that stays true however many key KINDS [`AlignerKey`] later grows (a new
+/// key still resolves as an exact hit, the `Any` fallback, or a miss). Leaving
+/// it exhaustive lets a caller `match` it without a `_` arm and compare it with
+/// `==`, which is the ergonomics a result type wants.
+#[derive(Clone, PartialEq, Eq, Debug, derive_more::IsVariant)]
+pub enum AlignmentBinding {
+  /// Exact [`AlignerKey::Lang`]`(L)` hit: the requested language has its own
+  /// registered aligner. The bound language IS the request
+  /// ([`AlignmentHandle::language`]).
+  Exact,
+  /// Miss on `Lang(L)`, served by the [`AlignerKey::Any`] fallback, whose OWN
+  /// construction language is `aligner_language` — different from the request
+  /// (that difference is what makes it a fallback). Policy still keys on the
+  /// REQUESTED language, not on this one.
+  AnyFallback {
+    /// The `Any` aligner's own construction language.
+    aligner_language: Lang,
+  },
+  /// Miss on both `Lang(L)` and `Any`: the configured [`AlignmentFallback`]
+  /// decides what [`AlignmentHandle::align_chunk`] does.
+  Miss {
+    /// The configured miss policy.
+    fallback: AlignmentFallback,
+  },
+}
+
+/// A registry bound to one requested language — the guarded, request-scoped view
+/// over an [`AlignmentSet`], returned by [`AlignmentSet::resolve`].
+///
+/// [`detect_oov`](Self::detect_oov) and [`align_chunk`](Self::align_chunk)
+/// delegate to [`AlignmentSet::detect_oov`] / [`AlignmentSet::align_chunk`] under
+/// the bound language, so OOV events and decision-language policy always key on
+/// the REQUESTED language and an [`AlignerKey::Any`] fallback's decisions are
+/// re-stamped on the crossing — the same guarantees those set methods give.
+///
+/// The handle deliberately exposes **no** raw `&Aligner`. Handing back the
+/// aligner of an `Any` match — an English aligner serving a Chinese request, say
+/// — would let a caller call `detect_oov` through it and stamp events with the
+/// aligner's OWN language, or `align_chunk` through it and hit the
+/// undifferentiated decision-language error the typed
+/// [`AlignError::DecisionLanguage`] replaced: the exact guard bypass the registry
+/// exists to make unrepresentable (F1). To learn which aligner was bound, read
+/// [`Self::binding`] — that is data, not an escape hatch.
+pub struct AlignmentHandle<'a> {
+  set: &'a AlignmentSet,
+  language: Lang,
 }
 
 /// A registry of [`Aligner`]s keyed by [`AlignerKey`].
@@ -231,16 +296,51 @@ impl AlignmentSet {
     self.aligners.is_empty()
   }
 
-  /// Look up an aligner for `language`, applying the strict `Lang → Any →
-  /// fallback` order.
+  /// Bind this registry to a requested `language`, returning an
+  /// [`AlignmentHandle`] whose [`detect_oov`](AlignmentHandle::detect_oov) and
+  /// [`align_chunk`](AlignmentHandle::align_chunk) dispatch through the SAME
+  /// guarded paths as [`Self::detect_oov`] / [`Self::align_chunk`]: OOV events
+  /// and decision-language policy keyed on the REQUESTED `language`, an `Any`
+  /// fallback's decisions re-stamped on the crossing, typed errors throughout.
+  ///
+  /// This is the **only** public resolver, and it never yields a raw
+  /// `&Aligner`. An [`AlignerKey::Any`] aligner serving another language would
+  /// otherwise stamp OOV events with ITS construction language and reproduce the
+  /// generic decision-language error the typed [`AlignError::DecisionLanguage`]
+  /// replaced — the guard bypass F1 closes. Ask the returned handle
+  /// [`what it bound`](AlignmentHandle::binding) if you need the hit-vs-fallback
+  /// metadata; that comes back as data, not as the aligner.
+  ///
+  /// The raw aligner-resolving primitive and its `AnyFallback` `&Aligner` are
+  /// private, so the leak is unrepresentable through the public API — including
+  /// from an external crate:
+  ///
+  /// ```compile_fail
+  /// use alignkit::{AlignmentSetBuilder, Lang};
+  /// let set = AlignmentSetBuilder::new().build();
+  /// // `lookup` (and its `AlignmentLookup`, whose `AnyFallback` leaked a
+  /// // cross-language `&Aligner`) are private: this does NOT compile. `resolve`
+  /// // is the guarded replacement.
+  /// let _leak = set.lookup(&Lang::En);
+  /// ```
   #[must_use]
-  pub fn lookup<'a>(&'a self, language: &Lang) -> AlignmentLookup<'a> {
+  pub fn resolve<'a>(&'a self, language: &Lang) -> AlignmentHandle<'a> {
+    AlignmentHandle {
+      set: self,
+      language: language.clone(),
+    }
+  }
+
+  /// Look up an aligner for `language`, applying the strict `Lang → Any →
+  /// fallback` order. Internal aligner-carrying primitive that
+  /// [`Self::resolve`], [`Self::detect_oov`] and [`Self::align_chunk`] dispatch
+  /// on; not public — see [`AlignmentLookup`] for why an `Any` match's raw
+  /// `&Aligner` must not escape.
+  #[must_use]
+  fn lookup<'a>(&'a self, language: &Lang) -> AlignmentLookup<'a> {
     let lang_key = AlignerKey::Lang(language.clone());
     if let Some(aligner) = self.aligners.get(&lang_key) {
-      return AlignmentLookup::Hit {
-        matched: lang_key,
-        aligner,
-      };
+      return AlignmentLookup::Hit { aligner };
     }
     if let Some(aligner) = self.aligners.get(&AlignerKey::Any) {
       return AlignmentLookup::AnyFallback { aligner };
@@ -270,7 +370,7 @@ impl AlignmentSet {
   /// from the matched aligner.
   pub fn detect_oov(&self, text: &str, language: &Lang) -> Result<Vec<OovEvent>, AlignError> {
     let aligner = match self.lookup(language) {
-      AlignmentLookup::Hit { aligner, .. } | AlignmentLookup::AnyFallback { aligner } => aligner,
+      AlignmentLookup::Hit { aligner } | AlignmentLookup::AnyFallback { aligner } => aligner,
       AlignmentLookup::Miss { .. } => return Ok(Vec::new()),
     };
     let mut events = aligner.detect_oov(text)?;
@@ -346,7 +446,7 @@ impl AlignmentSet {
     oov_decisions: &[ResolvedOov],
   ) -> Result<AlignmentResult, AlignError> {
     match self.lookup(language) {
-      AlignmentLookup::Hit { aligner, .. } => {
+      AlignmentLookup::Hit { aligner } => {
         // Requested language == the aligner's own language (the builder asserts
         // it for AlignerKey::Lang), so a correctly-resolved decision already
         // carries the tag the aligner's `prepare` expects. Validate that HERE,
@@ -382,6 +482,74 @@ impl AlignmentSet {
         }),
       },
     }
+  }
+}
+
+impl AlignmentHandle<'_> {
+  /// The requested language this handle is bound to. Every policy decision — the
+  /// language OOV events are stamped with, the language decisions are validated
+  /// against — keys on THIS, never on a fallback aligner's own construction
+  /// language.
+  #[must_use]
+  pub const fn language(&self) -> &Lang {
+    &self.language
+  }
+
+  /// How the registry resolved this request — exact hit, [`AlignerKey::Any`]
+  /// fallback (carrying the bound aligner's own language), or miss (carrying the
+  /// policy) — as [`AlignmentBinding`] DATA. It never yields the aligner itself;
+  /// that stays behind [`Self::detect_oov`] / [`Self::align_chunk`] (F1).
+  #[must_use]
+  pub fn binding(&self) -> AlignmentBinding {
+    match self.set.lookup(&self.language) {
+      AlignmentLookup::Hit { .. } => AlignmentBinding::Exact,
+      AlignmentLookup::AnyFallback { aligner } => AlignmentBinding::AnyFallback {
+        aligner_language: aligner.language_ref().clone(),
+      },
+      AlignmentLookup::Miss { fallback } => AlignmentBinding::Miss { fallback },
+    }
+  }
+
+  /// Detect OOV characters in `text`, every event stamped the REQUESTED
+  /// language — the guarded [`AlignmentSet::detect_oov`] bound to this handle's
+  /// language, so an [`AlignerKey::Any`] fallback's events are patched back to
+  /// the request rather than left on the aligner's own language.
+  ///
+  /// # Errors
+  /// As [`AlignmentSet::detect_oov`].
+  pub fn detect_oov(&self, text: &str) -> Result<Vec<OovEvent>, AlignError> {
+    self.set.detect_oov(text, &self.language)
+  }
+
+  /// Align one chunk end-to-end through the bound language — the guarded
+  /// [`AlignmentSet::align_chunk`]. The requested-language decision validation,
+  /// the `Any`-fallback decision crossing, and the miss policy all apply exactly
+  /// as they do there; only the `language` lookup key is supplied for you.
+  ///
+  /// # Errors
+  /// As [`AlignmentSet::align_chunk`].
+  // Mirrors `AlignmentSet::align_chunk`'s argument surface minus the `language`
+  // this handle already carries — the same 7-arg shape a caller of the set
+  // method already knows.
+  #[allow(clippy::too_many_arguments)]
+  pub fn align_chunk(
+    &self,
+    samples: &[f32],
+    sub_segments: &[TimeRange],
+    text: &str,
+    clock: OutputClock,
+    abort_flag: &AtomicBool,
+    oov_decisions: &[ResolvedOov],
+  ) -> Result<AlignmentResult, AlignError> {
+    self.set.align_chunk(
+      &self.language,
+      samples,
+      sub_segments,
+      text,
+      clock,
+      abort_flag,
+      oov_decisions,
+    )
   }
 }
 
