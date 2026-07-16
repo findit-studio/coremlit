@@ -860,6 +860,88 @@ fn window_loop_attaches_word_timings_when_enabled() {
 
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn word_timestamps_removing_a_segment_keeps_ids_unique_and_monotonic() {
+  // F2 (codex round 5), hole (b). Each window decodes speech / bare-timestamp /
+  // speech, so `find_seek_point_and_segments` allocates THREE ids per window but
+  // the MIDDLE one is a zero-length wordless slice the word-timestamp filter
+  // removes AFTER id allocation. The next window must id its segments off the
+  // count the decode ALLOCATED (3), not the count that SURVIVED (2) -- otherwise
+  // window 2's first survivor renumbers back onto window 1's second survivor
+  // (both id 2), leaving the pipeline-local ids non-unique/non-monotonic before
+  // the merge ever runs.
+  let t = tiny_tokenizer();
+  let s = special();
+  let hello = 2425u32;
+  let world = 1002u32;
+  // n_audio_ctx 200 -> 200-col alignment rows; each step's peak marches 15
+  // frames later so the two real words get distinct, non-zero-length timings.
+  let mut mock = MockBackend::new().with_dims(
+    ModelDims::new()
+      .with_window_samples(16_000)
+      .with_n_audio_ctx(200),
+  );
+  // `without_timestamps` drops the TimestampRulesFilter, so the scripted
+  // timestamps are decoded verbatim (with it on, the filter masks a third
+  // consecutive timestamp and no bare pair ever forms). Prompt is then
+  // [SOT, en, transcribe, no_ts]; the free predictions ts(0) hello ts(25)
+  // ts(25) ts(25) world ts(50) ts(50) EOT slice into three segments --
+  // [hello 0-0.5s | ts(25) 0.5s (a zero-length wordless bare pair) | world
+  // 0.5-1s] -- and `word_timestamps` removes the middle one after id allocation.
+  let script = [
+    s.english_token(),
+    s.transcribe_token(),
+    s.no_timestamps_token(), // step 2 (overridden anyway; no_ts is forced)
+    ts(0),
+    hello,
+    ts(25),
+    ts(25),
+    ts(25),
+    world,
+    ts(50),
+    ts(50),
+    s.end_token(),
+  ];
+  for (step, token) in script.iter().enumerate() {
+    let mut row = vec![0.0f32; 200];
+    // Peaks kept near the window start so the word-timestamp end stays inside
+    // the window and its seek re-anchoring does not overshoot the next window.
+    row[step + 1] = 1.0;
+    mock.push_step_with_alignment(one_hot(*token), row);
+  }
+  let task = TranscribeTask::new(&mock, &t);
+  // Each window's last timestamp is ts(50) = 1.0 s, so seek advances 16_000
+  // samples per window; 48_000 samples of audio therefore run exactly two
+  // windows (0..16_000, 16_000..32_000; the third would need seek < 32_000).
+  let options = DecodingOptions::new()
+    .with_word_timestamps()
+    .with_without_timestamps();
+  let result = task.run(&vec![0.1; 48_000], &options).unwrap();
+
+  assert_eq!(mock.counters().encode_calls(), 2, "two windows decoded");
+  let ids: Vec<usize> = result
+    .segments_slice()
+    .iter()
+    .map(TranscriptionSegment::id)
+    .collect();
+  // Window 1 allocates [0, 1, 2], drops the zero-length middle id 1 -> [0, 2],
+  // consuming 3 ordinals. Window 2 bases at 3, allocates [3, 4, 5], drops id 4
+  // -> [3, 5]. The pre-fix survivor-count base (2) instead produced [0, 2, 2, 4]
+  // -- a duplicate id 2.
+  assert_eq!(
+    ids,
+    vec![0, 2, 3, 5],
+    "survivor ids stay unique and monotonic across the removed segment"
+  );
+  let unique: std::collections::HashSet<usize> = ids.iter().copied().collect();
+  assert_eq!(unique.len(), ids.len(), "no id collision across windows");
+  assert!(
+    ids.windows(2).all(|w| w[0] < w[1]),
+    "survivor ids stay strictly monotonic"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn word_timestamps_off_leaves_segments_wordless() {
   let t = tiny_tokenizer();
   let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));

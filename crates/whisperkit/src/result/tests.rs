@@ -206,6 +206,77 @@ fn merge_drop_on_ids_stay_injective_across_multi_segment_chunks() {
   );
 }
 
+#[test]
+fn merge_drop_on_advances_the_id_base_past_an_all_dropped_chunk() {
+  // F2 (codex round 5), hole (a). A blank-only VAD chunk decodes ONE segment
+  // (id 0), which the blank-audio drop then removes -- leaving the chunk with
+  // zero survivors but a DECODED span of 1. The merge must advance its running
+  // id base by that span, not by the (empty) survivors' extent: otherwise an
+  // all-dropped chunk is indistinguishable from a genuinely zero-window one,
+  // and the FOLLOWING speech chunk's survivor renumbers down onto the ordinal
+  // the blank consumed.
+  //
+  // The invariant the finding pins: the speech survivor keeps the SAME id under
+  // both drop settings. Under drop OFF the blank is present (id 0) and Swift's
+  // `result_index + segment_index` lands the speech at 1; under drop ON the
+  // blank is gone but its consumed ordinal still shifts the speech to 1.
+  let speech = || {
+    let mut s = TranscriptionSegment::new();
+    s.set_id(0).set_text(" World").set_tokens(vec![20]);
+    TranscriptionResult::new(" World", vec![s], "en", TranscriptionTimings::new())
+      .maybe_decoded_segment_span(Some(1))
+  };
+  let speech_id = |merged: &TranscriptionResult| {
+    merged
+      .segments_slice()
+      .iter()
+      .find(|s| s.tokens_slice() == [20])
+      .expect("the speech survivor is in the merge")
+      .id()
+  };
+
+  // Drop ON: the blank was dropped in the task, so the chunk has zero survivors
+  // but reports its decoded span of 1.
+  let all_dropped = TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
+    .maybe_decoded_segment_span(Some(1));
+  let dropped =
+    merge_transcription_results_with_options(&[all_dropped, speech()], &DecodingOptions::new());
+  assert!(
+    dropped.segments_slice().len() == 1 && speech_id(&dropped) == 1,
+    "the speech survivor sits past the all-dropped chunk's consumed ordinal, got id {}",
+    speech_id(&dropped)
+  );
+
+  // Drop OFF: the blank is present (id 0), and Swift's exact reindexing lands
+  // the speech at result_index 1.
+  let mut blank = TranscriptionSegment::new();
+  blank
+    .set_id(0)
+    .set_text(" [BLANK_AUDIO]")
+    .set_tokens(vec![99]);
+  let blank_kept = TranscriptionResult::new(
+    " [BLANK_AUDIO]",
+    vec![blank],
+    "en",
+    TranscriptionTimings::new(),
+  )
+  .maybe_decoded_segment_span(Some(1));
+  let emitted = merge_transcription_results_with_options(
+    &[blank_kept, speech()],
+    &DecodingOptions::new().maybe_drop_blank_audio(false),
+  );
+  assert_eq!(
+    speech_id(&emitted),
+    1,
+    "drop OFF is exact Swift: result_index + segment_index lands the speech at 1"
+  );
+  assert_eq!(
+    speech_id(&dropped),
+    speech_id(&emitted),
+    "the speech survivor keeps the same id under both drop settings"
+  );
+}
+
 /// A result carrying nothing but text — the shape `transcribe_all` returns
 /// for a chunk/clip whose segments were all emptied (or, independently of
 /// the blank-audio drop, for any clip shorter than `window_clip_time`).

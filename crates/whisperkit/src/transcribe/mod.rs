@@ -296,6 +296,17 @@ where
     );
 
     let mut all_segments: Vec<TranscriptionSegment> = Vec::new();
+    // Strictly monotonic count of segment-id ordinals this run has ALLOCATED so
+    // far — the base each window's `find_seek_point_and_segments` ids its
+    // segments off, advanced by the number that call produced BEFORE the
+    // word-timestamp zero-length filter can remove any. Deliberately NOT
+    // `all_segments.len()` (the SURVIVING count): the filter drops segments
+    // after their ids are allocated, so a survivor-count base would reissue an
+    // id a survivor of an earlier window still carries, making the pipeline-local
+    // ids non-unique/non-monotonic before the merge ever runs (coremlit issue
+    // #14, codex round 5). Carried out onto the result as its decoded id span,
+    // for the merge to advance its own running base by.
+    let mut decoded_segment_span = 0usize;
     let mut detected_language: Option<String> = None;
     // The GENUINE observation, kept SEPARATE from `detected_language` above:
     // that one is the Swift-faithful DISPLAY language and includes a
@@ -460,11 +471,17 @@ where
         let (new_seek, mut current_segments) = segment::find_seek_point_and_segments(
           &decoding_result,
           options,
-          all_segments.len(),
+          decoded_segment_span,
           seek,
           segment_size,
           self.tokenizer,
         )?;
+        // Advance the decoded-ordinal base by what this window ALLOCATED —
+        // before the word-timestamp filter below removes any — so the next
+        // window's ids never reuse an id a survivor here keeps (see the
+        // declaration). A silence-skipped window allocates nothing (`None`).
+        decoded_segment_span =
+          decoded_segment_span.saturating_add(current_segments.as_ref().map_or(0, Vec::len));
         seek = seek.max(new_seek);
 
         // :196-233 — optional word-timestamp re-anchoring, run against the
@@ -617,7 +634,11 @@ where
       // witnessed nothing. `Provenance::for_result` reads THIS, recording no
       // detected language rather than the display `"en"`/configured value the
       // pipeline never actually detected (F3, codex round 3).
-      .maybe_detected_language(observed_language),
+      .maybe_detected_language(observed_language)
+      // The DECODE's own id-ordinal span — how many segment ids this run
+      // allocated, dropped segments included — for the merge to advance its
+      // running base by (see the field's doc; coremlit issue #14, codex round 5).
+      .maybe_decoded_segment_span(Some(decoded_segment_span)),
     )
   }
 

@@ -1237,6 +1237,28 @@ pub struct TranscriptionResult {
     serde(default, skip_serializing_if = "Option::is_none")
   )]
   detected_language: Option<String>,
+  /// The number of segment-id ordinals this transcript's decode ALLOCATED —
+  /// a fact about the DECODE, carried separately from the surviving segments
+  /// because the two come apart. A window's segments are id'd `0..k` as they
+  /// are decoded, but the blank-audio drop and the word-timestamp zero-length
+  /// filter both remove some AFTER that allocation, so the survivors carry
+  /// gaps and their count under-reports how many ordinals were consumed.
+  ///
+  /// [`merge_transcription_results_with_options`] advances its running id base
+  /// by THIS span (not the survivors' extent) so a chunk whose segments were
+  /// all dropped still shifts the next chunk's survivors past the ordinals it
+  /// consumed — otherwise an all-dropped chunk (span here) would be
+  /// indistinguishable from a genuinely zero-window one, and the following
+  /// chunk's ids would collapse (coremlit issue #14, codex round 5).
+  ///
+  /// `None` for a hand-built or deserialized result that never tracked it; the
+  /// merge then falls back to the survivors' own extent (its pre-existing
+  /// behavior). Set by [`crate::transcribe::TranscribeTask::run`] to the
+  /// decode's own ordinal count. Not serialized: it is an in-process merge
+  /// coordinate, meaningless once a transcript is persisted and never part of
+  /// the Swift-parity wire form.
+  #[cfg_attr(feature = "serde", serde(skip))]
+  decoded_segment_span: Option<usize>,
 }
 
 impl TranscriptionResult {
@@ -1277,6 +1299,10 @@ impl TranscriptionResult {
       // hand-built result witnesses nothing; the pipeline sets the true
       // observation via `maybe_detected_language` (F3, codex round 3).
       detected_language: None,
+      // A hand-built result tracked no decode, so it names no span; the merge
+      // falls back to the survivors' own extent (see the field's doc). The
+      // pipeline sets the real span via `maybe_decoded_segment_span`.
+      decoded_segment_span: None,
     }
   }
 
@@ -1393,6 +1419,33 @@ impl TranscriptionResult {
   #[inline(always)]
   pub fn clear_detected_language(&mut self) -> &mut Self {
     self.detected_language = None;
+    self
+  }
+
+  // -- decoded_segment_span (Option<usize>) --------------------------------
+  /// The number of segment-id ordinals this transcript's decode allocated, or
+  /// `None` when untracked (a hand-built or deserialized result). See the field
+  /// doc for why the merge advances its id base by this rather than by the
+  /// surviving segments' extent.
+  #[inline(always)]
+  pub const fn decoded_segment_span(&self) -> Option<usize> {
+    self.decoded_segment_span
+  }
+  /// Builder form of [`Self::update_decoded_segment_span`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn maybe_decoded_segment_span(mut self, decoded_segment_span: Option<usize>) -> Self {
+    self.update_decoded_segment_span(decoded_segment_span);
+    self
+  }
+  /// Assigns [`Self::decoded_segment_span`] directly — the pipeline passes its
+  /// own decoded ordinal count.
+  #[inline(always)]
+  pub const fn update_decoded_segment_span(
+    &mut self,
+    decoded_segment_span: Option<usize>,
+  ) -> &mut Self {
+    self.decoded_segment_span = decoded_segment_span;
     self
   }
 
@@ -2521,18 +2574,27 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
   // Running id base for the drop-ON (`skip_empty_texts`) mapping. Each chunk's
   // survivors are re-`id`'d to `id_base + segment.id()` (its **decode
   // ordinal**, its position within its own chunk), and `id_base` then advances
-  // by that chunk's id SPAN — its max local id `+ 1`. This is INJECTIVE across
-  // chunks (no two chunks' id windows overlap) while preserving each chunk's
-  // own local gaps: a blank dropped mid-chunk leaves `[.., 2]` where segment 1
-  // was, and that hole survives inside the chunk's window as the audit trail
-  // `drop_blank_audio` promises. The earlier `result_index + segment.id()`
-  // COLLIDED the moment a chunk had more than one segment — `[0,1] + [0,1]`
-  // renumbered to `[0,1,1,2]`, and a blank-dropped `[0,2] + [0,1]` to
-  // `[0,2,1,2]` — because `result_index` advances by 1 per chunk regardless of
-  // how many ids the chunk actually spans. `id_base` advances by the real span
-  // instead. With dropping OFF the false path stays EXACTLY Swift's
-  // `resultIndex + segmentIndex`, byte-for-byte (its duplicate ids are pinned
-  // parity), and `id_base` is left untouched.
+  // by that chunk's decoded id SPAN. This is INJECTIVE across chunks (no two
+  // chunks' id windows overlap) while preserving each chunk's own local gaps: a
+  // blank dropped mid-chunk leaves `[.., 2]` where segment 1 was, and that hole
+  // survives inside the chunk's window as the audit trail `drop_blank_audio`
+  // promises. The earlier `result_index + segment.id()` COLLIDED the moment a
+  // chunk had more than one segment — `[0,1] + [0,1]` renumbered to `[0,1,1,2]`,
+  // and a blank-dropped `[0,2] + [0,1]` to `[0,2,1,2]` — because `result_index`
+  // advances by 1 per chunk regardless of how many ids the chunk actually
+  // spans. `id_base` advances by the real span instead. With dropping OFF the
+  // false path stays EXACTLY Swift's `resultIndex + segmentIndex`, byte-for-byte
+  // (its duplicate ids are pinned parity), and `id_base` is left untouched.
+  //
+  // The span is the chunk's DECODED ordinal count (`decoded_segment_span`),
+  // carried on the result, NOT the surviving segments' `max local id + 1`: a
+  // chunk whose segments were ALL dropped (a blank-only VAD chunk) survives with
+  // zero segments yet still consumed ordinals, and inferring the span from the
+  // survivors would collapse it to 0 — indistinguishable from a genuinely
+  // zero-window chunk — so the NEXT chunk's survivors would renumber down onto
+  // this one's window (coremlit issue #14, codex round 5). A hand-built or
+  // deserialized result carries no span; the merge then falls back to the
+  // survivors' own extent, its pre-existing behavior.
   let mut id_base = 0usize;
   for (result_index, result) in results.iter().enumerate() {
     let mut max_local_id = 0usize;
@@ -2552,12 +2614,21 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
       max_local_id = max_local_id.max(segment.id());
       saw_segment = true;
     }
-    if skip_empty_texts && saw_segment {
-      // Advance past this chunk's id window (max local id + 1). Same checked
-      // arithmetic and same rationale as the per-segment add above.
-      id_base = max_local_id
-        .checked_add(1)
-        .and_then(|span| id_base.checked_add(span))
+    if skip_empty_texts {
+      // Advance past this chunk's DECODED id window. The carried span is
+      // authoritative (it counts the ordinals the decode allocated, dropped
+      // segments included); a result without one falls back to the survivors'
+      // own extent — `max local id + 1`, or 0 when nothing survived. Same
+      // checked arithmetic and rationale as the per-segment add above.
+      let span = match result.decoded_segment_span() {
+        Some(span) => span,
+        None if saw_segment => max_local_id.checked_add(1).expect(
+          "drop_blank_audio segment-id mapping overflowed usize (a segment id near usize::MAX)",
+        ),
+        None => 0,
+      };
+      id_base = id_base
+        .checked_add(span)
         .expect("drop_blank_audio segment-id base overflowed usize (a segment id near usize::MAX)");
     }
   }
