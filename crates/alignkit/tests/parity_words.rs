@@ -134,8 +134,7 @@ mod common;
 
 use core::sync::atomic::AtomicBool;
 use std::{
-  ffi::{OsStr, OsString, c_void},
-  path::{Path, PathBuf},
+  ffi::OsStr,
   process::{Command, Stdio},
   time::{Duration, Instant},
 };
@@ -602,82 +601,50 @@ fn load_alignkit() -> Aligner {
   )
 }
 
-/// ort rc.12's macOS fallback dylib name — the bare name it hands to `dlopen`
-/// when `ORT_DYLIB_PATH` is unset, empty, or non-UTF-8
-/// (`ort-2.0.0-rc.12/src/lib.rs:195`).
-const ORT_DYLIB_BARE_NAME: &str = "libonnxruntime.dylib";
-
-/// Resolve the `dlopen` target EXACTLY as ort rc.12 does, so the preflight probes
-/// the library ort will actually load — never one ort would not use.
+/// Fails loudly if `ort` will not be able to load ONNX Runtime — because if it
+/// cannot, it **deadlocks instead of erroring**, and a gate that hangs is worse
+/// than one that fails.
 ///
-/// Mirrors ort's selection verbatim (`ort-2.0.0-rc.12/src/lib.rs:188-197`):
-/// ```text
-/// let path = match std::env::var("ORT_DYLIB_PATH") {
-///     Ok(s) if !s.is_empty() => s,      // UTF-8 AND non-empty → that path
-///     _ => "libonnxruntime.dylib",      // absent / empty / non-UTF-8 → bare name
-/// };
-/// ```
-/// The three subtleties a hand-rolled resolver gets wrong — each pinned by a
-/// regression test below:
-/// - `std::env::var` (UTF-8), **not** `var_os`: a non-UTF-8 value is `Err`, so ort
-///   IGNORES it and falls back to the bare name
-///   ([`preflight_non_utf8_ort_dylib_path_is_ignored_like_ort`]).
-/// - the `!s.is_empty()` guard: `ORT_DYLIB_PATH=""` is NOT an explicit path — ort
-///   falls back to the bare name
-///   ([`preflight_empty_ort_dylib_path_falls_back_to_bare_name_like_ort`]).
-/// - a **relative** value (`libonnxruntime.dylib`) is used as-is and resolved by
-///   `dlopen`/dyld — which consults `DYLD_LIBRARY_PATH` — never by a `cwd` check
-///   ([`preflight_relative_ort_dylib_path_resolves_via_dyld_like_ort`]).
-fn select_ort_dylib_target() -> OsString {
-  match std::env::var("ORT_DYLIB_PATH") {
-    Ok(explicit) if !explicit.is_empty() => OsString::from(explicit),
-    _ => OsString::from(ORT_DYLIB_BARE_NAME),
-  }
-}
-
-/// Fails loudly if `ort` will not be able to `dlopen` ONNX Runtime — because
-/// if it cannot, it **hangs instead of erroring**, and a gate that hangs is
-/// worse than one that fails.
+/// # Why a subprocess, and why REAL `ort` init inside it
 ///
 /// `ort` runs in `load-dynamic` mode: it resolves `libonnxruntime.dylib` at
-/// *runtime*, not link time. When the library is not resolvable, ort does not
-/// return `Err` — it **deadlocks**. `ort::setup_api` runs inside a
-/// `std::sync::Once`, and its failure path constructs the error through
-/// `ort::error::Error::new_internal`, which re-enters the **same** `Once`; the
-/// thread parks in `semaphore_wait_trap` and never comes back. Measured here,
-/// not inferred: `cargo test -p alignkit --features parity-oracle` sat for ten
-/// minutes printing "has been running for over 60 seconds" while the process
-/// burned **0.01 s of CPU**, and `sample(1)` showed precisely that stack —
-/// `load_asry_ort` → `SessionBuilder::new` → `environment::current` →
-/// `Once::call` → `setup_api` → `Once::call` → `Error::new_internal` →
-/// `Once::wait` → `semaphore_wait_trap`.
+/// *runtime*, not link time. When the library is not resolvable it does **not**
+/// return `Err` — it **deadlocks**, and the deadlock is structural rather than
+/// incidental. `ort` builds its load-failure error with `Error::new` →
+/// `Error::new_internal`, which calls `ortsys![CreateStatus]` → `ort::api()`
+/// (`ort-2.0.0-rc.12/src/error.rs:132`, `.../src/lib.rs:290`). But `api()` IS the
+/// `OnceLock` that is *currently running the load*
+/// (`api()` → `G_ORT_API.get_or_init(setup_api)`, `.../src/lib.rs:176`), so
+/// constructing the error re-enters that `Once` from the same thread and parks in
+/// `semaphore_wait_trap` forever. **`ort` cannot report a load failure without a
+/// loaded runtime, and it tries to — so every load failure hangs.** Measured, not
+/// inferred (see [`preflight_kills_a_deadlocked_ort_init_instead_of_hanging`]): a
+/// text file at `ORT_DYLIB_PATH` fed to `ort::api()` never returns; a real dylib
+/// returns in ~160 ms.
 ///
-/// In CI that is a job that burns to its timeout and reports nothing
-/// actionable; here it looked exactly like "the 60 s clip is just slow", which
-/// is the kind of wrong conclusion that gets a gate weakened. So resolve the
-/// library up front and panic with something a human can act on.
+/// # The preflight IS `ort`'s loader, by construction
 ///
-/// **Existence is not loadability** (F3). A file at the resolved path can still
-/// be a text file, a wrong-architecture dylib, a library missing `OrtGetApiBase`,
-/// or a runtime too OLD to provide the API version ort needs — each passes an
-/// `is_file()` check and then hits the very deadlock above. So the preflight does
-/// not stop at existence: it actually `dlopen`s the library, resolves
-/// `OrtGetApiBase`, and CALLS it to confirm `GetApi` yields a usable `OrtApi` at
-/// the required version — the entry point ort itself calls — in a CHILD PROCESS
-/// with a timeout ([`probe_ort_dylib_loadable`]), so a hanging loader kills the
-/// child instead of this test, and any unusable runtime becomes a fast,
-/// actionable panic rather than a silent hang.
+/// Earlier revisions hand-modelled `ort`'s loader in the child — `dlopen`, then
+/// `OrtGetApiBase`, then `GetApi`, then the executable-adjacent path precedence,
+/// then the `GetVersionString` ordering — and each review found the mirror one
+/// layer shallower than the real thing. This models nothing: the child re-execs
+/// this test binary and calls **`asry::ort::api()`**, the real entry point every
+/// `ort` API funnels through (`ort-2.0.0-rc.12/src/lib.rs:167`). That single call
+/// runs the *authoritative* sequence — `ORT_DYLIB_PATH` selection (`lib.rs:188`),
+/// executable-adjacent precedence for a relative path (`lib.rs:96`), the real
+/// `dlopen` (`lib.rs:107`), `OrtGetApiBase` (`lib.rs:109`), `GetVersionString`
+/// plus the minor-version compatibility check (`lib.rs:114`), and finally
+/// `GetApi(ORT_API_VERSION)` (`lib.rs:210`). Selection precedence, version
+/// negotiation and API resolution are therefore whatever `ort` itself does, with
+/// nothing left to drift out of sync. The deadlock that makes real init unusable
+/// in-process is contained by running it in a child the parent kills on a
+/// timeout: the bounded kill IS the deadlock containment.
 ///
-/// Target selection mirrors ort rc.12 EXACTLY ([`select_ort_dylib_target`],
-/// `ort-2.0.0-rc.12/src/lib.rs:188`), and the bounded child's `dlopen` — the same
-/// call ort ultimately makes (`load_dylib_from_path` → `libloading::Library::new`,
-/// ort `lib.rs:92`) — is the SOLE loadability judge: no `is_file()` pre-check and
-/// no hand-rolled dyld directory list, because `dlopen` already performs dyld's
-/// real search (`DYLD_LIBRARY_PATH`, then the defaults, then
-/// `DYLD_FALLBACK_LIBRARY_PATH`), so reimplementing it could only DIVERGE from
-/// what ort will actually load. Homebrew's `/opt/homebrew/lib` is on none of those
-/// default lists on Apple Silicon — which is why `brew install onnxruntime` on its
-/// own is not enough, and `ORT_DYLIB_PATH` is effectively mandatory.
+/// The child **inherits** this process's `ORT_DYLIB_PATH` (it does not re-select
+/// it), so it probes the exact library the in-process `ort` will load. On success
+/// (`exit 0`) the real session build in [`load_asry_ort`] cannot then hit a load
+/// failure; on a hang the [`PREFLIGHT_TIMEOUT`] kill turns the deadlock into this
+/// actionable panic.
 fn assert_onnxruntime_is_resolvable() {
   const HINT: &str = "ONNX Runtime is the parity gate's ORACLE; without it there is nothing to \
                       compare alignkit against. Install it (`brew install onnxruntime`) and point \
@@ -685,506 +652,195 @@ fn assert_onnxruntime_is_resolvable() {
                       ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib. Do NOT skip this \
                       test instead — a parity gate that opts itself out is not a gate.";
 
-  // Resolve the dlopen TARGET exactly as ort would (mirrors ort's own selection;
-  // see `select_ort_dylib_target`), then let the bounded child's `dlopen` be the
-  // ONLY loadability judge — existence is not loadability (F3), and dlopen is the
-  // same call ort ultimately makes, so any `is_file()`/dyld-list pre-check could
-  // only diverge from what ort will actually load.
-  let target = select_ort_dylib_target();
-  if let Err(why) = probe_ort_dylib_loadable(&target) {
+  // Inherit ORT_DYLIB_PATH (pass `None`): probe exactly what the in-process `ort`
+  // will load, and let `ort` — not a reimplementation of it — do the selecting.
+  if let Err(why) = probe_ort_init(None, PREFLIGHT_TIMEOUT) {
+    let configured = std::env::var_os("ORT_DYLIB_PATH");
+    let named = match configured.as_deref() {
+      Some(path) => format!("ORT_DYLIB_PATH={}", path.to_string_lossy()),
+      None => {
+        "ORT_DYLIB_PATH unset (ort falls back to the bare name `libonnxruntime.dylib`)".to_owned()
+      }
+    };
     panic!(
-      "ort cannot load ONNX Runtime from {}: {why}. ort resolves ONNX Runtime with the SAME \
-       dlopen and, when the load fails, DEADLOCKS rather than returning an error, so failing here \
-       instead. {HINT}",
-      PathBuf::from(&target).display()
+      "ort cannot initialize ONNX Runtime ({named}): {why}. ort resolves ONNX Runtime with the \
+       SAME load path and, when it fails, DEADLOCKS rather than returning an error, so failing \
+       here instead. {HINT}"
     );
   }
 }
 
-/// Env var carrying, into the re-exec'd child, the dylib path/name it must try
-/// to `dlopen`. Set only on the child's environment by
-/// [`probe_ort_dylib_loadable`]; absent in an ordinary run, where the child test
-/// is a no-op.
-const ORT_PROBE_TARGET_ENV: &str = "ALIGNKIT_ORT_PREFLIGHT_DLOPEN";
+/// The wall-clock the real preflight allows `ort`'s init before declaring a
+/// deadlock and killing the child: **30 s**. A good `asry::ort::api()` is
+/// sub-second (~160 ms measured), so this only bounds a genuine hang.
+const PREFLIGHT_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Child exit code: the file could not be `dlopen`ed at all (not a loadable
-/// dylib for this architecture — a text file, a wrong-arch binary, …).
-const PROBE_EXIT_LOAD_FAILED: i32 = 2;
-/// Child exit code: it loaded, but does not export `OrtGetApiBase` — so it is
-/// not ONNX Runtime.
-const PROBE_EXIT_NO_SYMBOL: i32 = 3;
-/// Child exit code: it loaded and exports `OrtGetApiBase`, but that entry
-/// point's `GetApi(`[`ORT_REQUIRED_API_VERSION`]`)` returned null — the runtime
-/// is too OLD to provide the `OrtApi` version ort was built against, so ort
-/// could not have used it either. This is the codex-round-5 gap: resolving the
-/// symbol without calling it accepted such a runtime, which then wedged ort's
-/// own init.
-const PROBE_EXIT_API_REJECTED: i32 = 4;
+/// Env var that switches [`ort_preflight_init_child`] out of its no-op mode into
+/// calling REAL `ort` init. Set only on the child's environment by
+/// [`probe_ort_init`]; absent in an ordinary run, where the child test is a
+/// passing no-op.
+const ORT_PREFLIGHT_CHILD_ENV: &str = "ALIGNKIT_ORT_PREFLIGHT_INIT";
 
-/// The `ORT_API_VERSION` ort negotiates with the loaded runtime — the exact
-/// argument ort's `setup_api` passes to `OrtApiBase::GetApi`
-/// (`((*base).GetApi)(ort_sys::ORT_API_VERSION)`, `ort-2.0.0-rc.12/src/lib.rs:210`).
+/// Run REAL `ort` initialization in a killable child and report whether it
+/// succeeds. `Ok(())` iff the child called `asry::ort::api()` and it returned —
+/// the dylib loaded, its version was accepted, and `GetApi` yielded an `OrtApi`.
+/// `Err` if the child exited non-zero (surfacing its stderr verbatim) or — the
+/// dominant case for any unusable runtime — did not return within `timeout`, i.e.
+/// `ort` deadlocked and this poll loop killed it.
 ///
-/// DERIVED from the authoritative compiled value, never hand-written. ort defines
-/// `pub const MINOR_VERSION: u32 = ort_sys::ORT_API_VERSION;`
-/// (`ort-2.0.0-rc.12/src/lib.rs:86`), so `asry::ort::MINOR_VERSION` — asry
-/// re-exports `ort` under its `alignment` feature, which `parity-oracle` turns on
-/// (`asry/src/lib.rs:100`) — IS the very number ort feeds to `GetApi`. Sourcing it
-/// from that symbol is what makes probe/ORT drift impossible BY CONSTRUCTION: a
-/// hand-written `24` could silently disagree with a bumped `ort_sys` (a runtime
-/// that satisfies the stale probe yet fails ort's real init); this cannot, and a
-/// future ort/ort-sys bump moves it automatically with no constant to forget.
+/// `ort_dylib_path`: `None` inherits this process's `ORT_DYLIB_PATH`, which is
+/// what the real preflight wants (probe what the in-process `ort` will load);
+/// `Some(p)` overrides it on the CHILD only, which is what the containment test
+/// wants (point the child at a decoy). The override is applied to the child's
+/// environment, never this process's — `std::env::set_var` is racy and its safety
+/// cannot be guaranteed here.
 ///
-/// The probe must pass THIS number to `GetApi`: a runtime that supports a lower
-/// version but not this one is exactly the mismatch ort cannot survive.
-const ORT_REQUIRED_API_VERSION: u32 = asry::ort::MINOR_VERSION;
-
-/// Prove ONNX Runtime at `target` is USABLE by ort — `dlopen` it, resolve
-/// `OrtGetApiBase`, and CALL it to confirm `GetApi(`[`ORT_REQUIRED_API_VERSION`]`)`
-/// returns a non-null `OrtApi` (the exact negotiation ort's `setup_api` performs)
-/// — in a CHILD PROCESS with a timeout, so a hanging loader kills the child
-/// rather than wedging this test. `Ok(())` iff the child loaded the library,
-/// found the symbol, AND the runtime supports the API version ort requires.
-///
-/// The load runs in a re-exec of THIS test binary
-/// ([`ort_preflight_dlopen_child`]), so the `unsafe` `libloading` call is
-/// confined to the test crate and the alignkit library stays unsafe-free. The
-/// timeout is a poll loop over [`std::process::Child::try_wait`] (no extra
-/// dependency) that kills the child if it overruns.
-fn probe_ort_dylib_loadable(target: &OsStr) -> Result<(), String> {
-  // Generous: a good dlopen of ONNX Runtime is sub-second, so this only bounds a
-  // genuine hang.
-  const TIMEOUT: Duration = Duration::from_secs(30);
+/// The timeout is a poll loop over [`std::process::Child::try_wait`] — no extra
+/// dependency — that kills the child if it overruns. The real preflight passes
+/// [`PREFLIGHT_TIMEOUT`]; the containment test passes a short bound, because the
+/// property under test is that a hang is KILLED, not the specific 30 s value.
+fn probe_ort_init(ort_dylib_path: Option<&OsStr>, timeout: Duration) -> Result<(), String> {
   const POLL: Duration = Duration::from_millis(50);
 
   let exe = std::env::current_exe().map_err(|e| format!("cannot find the test binary: {e}"))?;
-  let mut child = Command::new(exe)
-    // Run ONLY the child probe test — libtest's exact filter, plus `--ignored`
-    // because that test opts out of ordinary runs.
-    .args(["--exact", "--ignored", "ort_preflight_dlopen_child"])
-    .env(ORT_PROBE_TARGET_ENV, target)
+  let mut command = Command::new(exe);
+  command
+    // Run ONLY the child init probe — libtest's exact filter, `--ignored` because
+    // that test opts out of ordinary runs, and `--nocapture` so a panicking `ort`
+    // init writes its message to the stderr this parent captures.
+    .args(["--exact", "--ignored", "--nocapture", "ort_preflight_init_child"])
+    .env(ORT_PREFLIGHT_CHILD_ENV, "1")
     .stdout(Stdio::null())
-    .stderr(Stdio::null())
+    .stderr(Stdio::piped());
+  if let Some(path) = ort_dylib_path {
+    command.env("ORT_DYLIB_PATH", path);
+  }
+  let mut child = command
     .spawn()
-    .map_err(|e| format!("cannot spawn the dlopen probe subprocess: {e}"))?;
+    .map_err(|e| format!("cannot spawn the ort-init probe subprocess: {e}"))?;
 
   let start = Instant::now();
   loop {
     match child.try_wait() {
       Ok(Some(status)) => {
-        return match status.code() {
-          Some(0) => Ok(()),
-          Some(PROBE_EXIT_LOAD_FAILED) => Err(
-            "dlopen failed — not a loadable ONNX Runtime dylib for this architecture".to_owned(),
-          ),
-          Some(PROBE_EXIT_NO_SYMBOL) => {
-            Err("loaded, but does not export OrtGetApiBase — not ONNX Runtime".to_owned())
+        if status.success() {
+          return Ok(());
+        }
+        // The child has exited, so its stderr pipe drains to EOF without blocking
+        // (`ort`'s message is a single line and default backtraces are off).
+        let mut stderr = String::new();
+        if let Some(mut pipe) = child.stderr.take() {
+          use std::io::Read;
+          let _ = pipe.read_to_string(&mut stderr);
+        }
+        let stderr = stderr.trim();
+        return Err(match status.code() {
+          Some(code) if stderr.is_empty() => {
+            format!("the ort-init probe exited with status {code}")
           }
-          Some(PROBE_EXIT_API_REJECTED) => Err(format!(
-            "loaded and exports OrtGetApiBase, but GetApi({ORT_REQUIRED_API_VERSION}) returned \
-             null — this ONNX Runtime does not support the ORT_API_VERSION ort was built against \
-             (needs a runtime providing API {ORT_REQUIRED_API_VERSION}, e.g. ONNX Runtime >= \
-             1.{ORT_REQUIRED_API_VERSION}); ort would fail unrecoverably resolving this very API \
-             inside its init `Once`, so failing here instead"
-          )),
-          Some(other) => Err(format!("the dlopen probe exited with status {other}")),
-          None => Err("the dlopen probe was killed by a signal".to_owned()),
-        };
+          Some(code) => format!("the ort-init probe exited with status {code}: {stderr}"),
+          None => "the ort-init probe was killed by a signal".to_owned(),
+        });
       }
       Ok(None) => {
-        if start.elapsed() >= TIMEOUT {
+        if start.elapsed() >= timeout {
           let _ = child.kill();
           let _ = child.wait();
           return Err(format!(
-            "the loader did not return within {}s — a hanging dlopen, exactly the deadlock the \
+            "ort's init did not return within {}s — a hanging load, exactly the deadlock the \
              preflight exists to convert into a fast failure",
-            TIMEOUT.as_secs()
+            timeout.as_secs()
           ));
         }
         std::thread::sleep(POLL);
       }
-      Err(e) => return Err(format!("cannot wait on the dlopen probe subprocess: {e}")),
+      Err(e) => return Err(format!("cannot wait on the ort-init probe subprocess: {e}")),
     }
   }
 }
 
-/// Just enough of ONNX Runtime's `OrtApiBase` for the child probe: its FIRST
-/// field, `GetApi`, at offset 0. `#[repr(C)]` fixes that offset; the real
-/// struct's trailing fields (`GetVersionString`, …) are omitted because the
-/// probe only ever reads field 0 through a `*const OrtApiBase` and never handles
-/// the value by size. Mirrors `ort_sys::OrtApiBase`; `extern "C"` equals
-/// `ort_sys`' `extern "system"` on macOS (this crate's only target) and keeps
-/// the test free of an `ort_sys` dependency, which would drag ort into every
-/// build (see `Cargo.toml`).
-#[repr(C)]
-struct OrtApiBase {
-  /// `GetApi(version) -> *const OrtApi`; returns null when the runtime does not
-  /// support the requested `ORT_API_VERSION`. The result is only null-checked,
-  /// never dereferenced, so its pointee is elided to `c_void`.
-  get_api: unsafe extern "C" fn(u32) -> *const c_void,
-}
-
-/// The child half of [`probe_ort_dylib_loadable`], re-exec'd by it with
-/// [`ORT_PROBE_TARGET_ENV`] set: it `dlopen`s the target, resolves
-/// `OrtGetApiBase`, and CALLS it to check that
-/// `GetApi(`[`ORT_REQUIRED_API_VERSION`]`)` is non-null, then exits with a status
-/// the parent reads. Absent that env var — i.e. in any ordinary `--ignored`
-/// run — it is a passing no-op.
+/// The child half of [`probe_ort_init`], re-exec'd by it with
+/// [`ORT_PREFLIGHT_CHILD_ENV`] set: it calls **`asry::ort::api()`** — the real
+/// `ort` load + version + `GetApi` sequence (`ort-2.0.0-rc.12/src/lib.rs:167`) —
+/// and exits 0 if it returns. A load failure never reaches an explicit exit code:
+/// an unusable runtime **deadlocks** `ort` here (see
+/// [`assert_onnxruntime_is_resolvable`] for the mechanism), so the parent's kill
+/// is the verdict; the rare failure that panics instead (e.g. `GetApi` returning
+/// null on a version-compatible stub) exits non-zero through libtest with `ort`'s
+/// message on stderr. Absent the env var — i.e. in any ordinary `--ignored` run —
+/// it is a passing no-op.
 #[test]
-#[ignore = "internal ONNX Runtime dlopen-probe subprocess; a no-op unless re-exec'd by the parity preflight"]
-fn ort_preflight_dlopen_child() {
-  let Some(target) = std::env::var_os(ORT_PROBE_TARGET_ENV) else {
-    return;
-  };
-  // SAFETY: loading an arbitrary dylib runs its initializers, which is why the
-  // call is `unsafe` and why it runs in this short-lived CHILD process the parent
-  // kills on timeout. The unsafe is confined to this test-crate helper; the
-  // alignkit library is unsafe-free.
-  let library = match unsafe { libloading::Library::new(&target) } {
-    Ok(library) => library,
-    Err(_) => std::process::exit(PROBE_EXIT_LOAD_FAILED),
-  };
-  // SAFETY: resolving `OrtGetApiBase` by name. The signature mirrors
-  // `ort_sys::OrtGetApiBase` — `extern "system"`, which is ABI-identical to
-  // `extern "C"` on macOS, this crate's only target. A missing symbol means this
-  // is not ONNX Runtime.
-  let get_api_base =
-    match unsafe { library.get::<unsafe extern "C" fn() -> *const OrtApiBase>(b"OrtGetApiBase\0") }
-    {
-      Ok(get_api_base) => get_api_base,
-      Err(_) => std::process::exit(PROBE_EXIT_NO_SYMBOL),
-    };
-  // SAFETY: `OrtGetApiBase` and `OrtApiBase::GetApi` are ONNX Runtime's own
-  // version-negotiation entry points — pure accessors that return static
-  // pointers and take no locks, so unlike ort's `setup_api` they cannot deadlock
-  // or run environment init. Calling them HERE, in the timeout-bounded child, is
-  // what makes the check safe: it reproduces ort's
-  // `((*base).GetApi)(ort_sys::ORT_API_VERSION)` (ort `lib.rs`) and, on a null
-  // result — the runtime refusing the required version — lets the parent fail
-  // fast instead of the real process unwrapping that null inside its API-init
-  // `Once`. A null base or a null `GetApi` result both mean "no usable OrtApi at
-  // the required version".
-  let api = unsafe {
-    let base = get_api_base();
-    if base.is_null() {
-      std::process::exit(PROBE_EXIT_API_REJECTED);
-    }
-    ((*base).get_api)(ORT_REQUIRED_API_VERSION)
-  };
-  std::process::exit(if api.is_null() {
-    PROBE_EXIT_API_REJECTED
-  } else {
-    0
-  });
-}
-
-/// Switches [`ort_preflight_selection_child`] out of its no-op mode into running
-/// the REAL selection + probe against the child's own environment. Set only on
-/// that child's environment by [`run_ort_selection_probe`]; absent in an ordinary
-/// run, where the child test is a no-op.
-const ORT_SELECT_PROBE_ENV: &str = "ALIGNKIT_ORT_PREFLIGHT_SELECT";
-
-/// [`ort_preflight_selection_child`] exit codes — the decoded verdict of the real
-/// selection + probe for a crafted environment. Kept distinct from the
-/// `PROBE_EXIT_*` codes (which the grandchild dlopen probe reports) so the two
-/// process layers can never be confused.
-const SELECT_EXIT_ACCEPTED: i32 = 10;
-/// The selected target dlopened to a runtime that REFUSED the required API
-/// version — unreachable unless selection produced a bare/relative name that dyld
-/// resolved to the refusing stub, which is exactly what makes it a positive proof
-/// of resolution (a real, accepting runtime could never forge it).
-const SELECT_EXIT_API_REJECTED: i32 = 11;
-/// The selected target did not `dlopen` at all (not found / not loadable).
-const SELECT_EXIT_LOAD_FAILED: i32 = 12;
-/// Any other probe verdict — surfaced rather than swallowed so a surprising
-/// outcome fails a regression test loudly instead of masquerading as a pass.
-const SELECT_EXIT_OTHER: i32 = 13;
-
-/// Sibling of [`ort_preflight_dlopen_child`] for the SELECTION layer: re-exec'd by
-/// [`run_ort_selection_probe`] with [`ORT_SELECT_PROBE_ENV`] set, it runs the REAL
-/// [`select_ort_dylib_target`] against its own (parent-crafted) `ORT_DYLIB_PATH`
-/// and hands the result to the REAL [`probe_ort_dylib_loadable`], then exits with
-/// the decoded verdict — so the parent observes exactly what the preflight would
-/// decide for that environment, with no reimplementation to drift. Absent the env
-/// var — i.e. in any ordinary `--ignored` run — it is a passing no-op.
-#[test]
-#[ignore = "internal ORT_DYLIB_PATH selection-probe subprocess; a no-op unless re-exec'd by the L1 regression tests"]
-fn ort_preflight_selection_child() {
-  if std::env::var_os(ORT_SELECT_PROBE_ENV).is_none() {
+#[ignore = "internal ONNX Runtime init-probe subprocess; a no-op unless re-exec'd by the parity preflight"]
+fn ort_preflight_init_child() {
+  if std::env::var_os(ORT_PREFLIGHT_CHILD_ENV).is_none() {
     return;
   }
-  let code = match probe_ort_dylib_loadable(&select_ort_dylib_target()) {
-    Ok(()) => SELECT_EXIT_ACCEPTED,
-    // The verdict strings are `probe_ort_dylib_loadable`'s own — the same anchors
-    // the sibling `preflight_rejects_*` tests assert on.
-    Err(why) if why.contains("returned null") => SELECT_EXIT_API_REJECTED,
-    Err(why) if why.contains("dlopen failed") => SELECT_EXIT_LOAD_FAILED,
-    Err(_) => SELECT_EXIT_OTHER,
-  };
-  std::process::exit(code);
+  // Real `ort` init: resolves ORT_DYLIB_PATH, dlopens, negotiates the API version.
+  // It is `ort`'s own safe API (no `unsafe` here); on an unusable runtime it
+  // deadlocks and the parent kills this process — precisely the containment the
+  // preflight is built on.
+  let _ = asry::ort::api();
 }
 
-/// **F3 unit test.** The loadability validator REJECTS a file that exists but is
-/// not a loadable dylib. Hermetic — a text file in a temp dir, no ONNX Runtime,
-/// no models — and NOT `#[ignore]`, so it runs wherever `parity-oracle` is built
-/// (e.g. `cargo hack --each-feature`). It is the standing proof that
-/// `Path::is_file()` alone — the old preflight — was never enough: this decoy
-/// passes `is_file()` and would have sailed straight into ort's deadlock.
-#[test]
-fn preflight_rejects_a_non_dylib_file() {
-  let dir = tempfile::tempdir().expect("create a temp dir");
-  let not_a_dylib = dir.path().join("libonnxruntime.dylib");
-  std::fs::write(&not_a_dylib, b"I am a text file, not a Mach-O dylib.\n")
-    .expect("write the decoy file");
-  assert!(
-    not_a_dylib.is_file(),
-    "the decoy must exist, so this proves loadability is checked BEYOND existence"
-  );
-
-  let err = probe_ort_dylib_loadable(not_a_dylib.as_os_str())
-    .expect_err("a text file is not a loadable dylib and must be rejected");
-  assert!(
-    err.contains("dlopen failed"),
-    "expected a load failure for a non-dylib, got: {err}"
-  );
-}
-
-/// C source for a *loadable* dylib that impersonates ONNX Runtime's version
-/// negotiation but REFUSES the API version ort requires: its `OrtGetApiBase`
-/// returns a base whose `GetApi` yields non-null only for versions BELOW
-/// `REQUIRED_API_VERSION` (a `-D` define) and null at or above it — modelling a
-/// too-old runtime (e.g. ONNX Runtime 1.23 against ort's api-24). Returning
-/// non-null for a lower version is deliberate: it pins that the probe calls
-/// `GetApi` with the REQUIRED version, so a probe passing some lower version
-/// would wrongly accept this stub and fail the test.
-const API_REFUSING_STUB_C: &str = r#"
-#include <stdint.h>
-
-typedef struct OrtApiBase {
-  const void *(*GetApi)(uint32_t version);
-  const char *(*GetVersionString)(void);
-} OrtApiBase;
-
-static const char sentinel_api = 0;
-
-static const void *stub_get_api(uint32_t version) {
-  if (version < REQUIRED_API_VERSION) {
-    return (const void *)&sentinel_api;
-  }
-  return (const void *)0;
-}
-
-static const char *stub_get_version_string(void) {
-  return "0.0.0-alignkit-stub";
-}
-
-static const OrtApiBase base = { stub_get_api, stub_get_version_string };
-
-const OrtApiBase *OrtGetApiBase(void) {
-  return &base;
-}
-"#;
-
-/// C source for a *loadable* dylib that is NOT ONNX Runtime: it exports a marker
-/// but no `OrtGetApiBase`, so the probe must reach the "loaded, but does not
-/// export OrtGetApiBase" verdict — a path a non-dylib file (which fails at
-/// `dlopen`) can never exercise.
-const SYMBOLLESS_STUB_C: &str = r#"
-int alignkit_not_onnxruntime(void) {
-  return 0;
-}
-"#;
-
-/// Compiles `c_source` into a loadable dylib named `lib{name}.dylib` under `dir`
-/// and returns its path, applying each `-D{key}={value}` define.
+/// **The containment proof.** A path that is not a loadable ONNX Runtime makes
+/// REAL `ort` init **deadlock** (see [`assert_onnxruntime_is_resolvable`] for the
+/// mechanism), and the preflight's whole job is to convert that hang into a fast,
+/// hard failure. This drives exactly that: a decoy at the child's `ORT_DYLIB_PATH`
+/// hangs `asry::ort::api()`, and [`probe_ort_init`]'s poll loop must KILL the
+/// child and return the timeout error rather than block forever.
 ///
-/// The C compiler (`$CC`, else `cc`) ships with the Xcode Command Line Tools that
-/// building this crate already requires, and `cc -dynamiclib` is the lightest
-/// mechanism that yields a genuinely *loadable* Mach-O dylib — the only kind that
-/// exercises symbol and API-version resolution rather than just the
-/// `dlopen`-fails path — with no build script, no fixture crate, and no `unsafe`
-/// in this crate (the compile is a subprocess; the only FFI is the already-isolated
-/// child probe). Hermetic: source and output live under the caller's temp `dir`.
-fn compile_stub_dylib(dir: &Path, name: &str, c_source: &str, defines: &[(&str, &str)]) -> PathBuf {
-  let source = dir.join(format!("{name}.c"));
-  std::fs::write(&source, c_source).expect("write the stub C source");
-  let dylib = dir.join(format!("lib{name}.dylib"));
-  let compiler = std::env::var_os("CC").unwrap_or_else(|| OsString::from("cc"));
-
-  let mut command = Command::new(&compiler);
-  command.arg("-dynamiclib").arg("-o").arg(&dylib);
-  for (key, value) in defines {
-    command.arg(format!("-D{key}={value}"));
-  }
-  command.arg(&source);
-
-  let status = command.status().unwrap_or_else(|e| {
-    panic!("cannot run the C compiler {compiler:?} to build stub dylib {name}: {e}")
-  });
-  assert!(
-    status.success(),
-    "the C compiler failed to build stub dylib {name}"
-  );
-  assert!(
-    dylib.is_file(),
-    "stub dylib was not produced at {}",
-    dylib.display()
-  );
-  dylib
-}
-
-/// **F3 unit test.** The loadability validator REJECTS a *loadable* dylib that
-/// exports `OrtGetApiBase` but whose `GetApi` refuses the API version ort
-/// requires — the codex-round-5 gap: the old probe stopped at symbol resolution,
-/// so such a runtime sailed through the preflight and into ort's own
-/// unrecoverable init failure. Hermetic: a stub dylib compiled on the fly, no
-/// ONNX Runtime, no models — and NOT `#[ignore]`, so it runs wherever
-/// `parity-oracle` is built. Because the stub accepts every version BELOW
-/// [`ORT_REQUIRED_API_VERSION`] and refuses that one, it also pins that the probe
-/// negotiates the *correct* version, not merely some lower one.
+/// It is the negative half of the gate — its positive half is
+/// [`preflight_accepts_a_real_onnxruntime`] and the parity tests' own preflight
+/// succeeding — and it is the standing proof that **existence is not
+/// loadability**: the decoy is a real `is_file()`, so it would pass any existence
+/// check, yet `ort` cannot load it, so it hangs, so the kill must fire. Hermetic
+/// (a text file in a temp dir; no ONNX Runtime, no models) and NOT `#[ignore]`, so
+/// it runs wherever `parity-oracle` builds. The short timeout is deliberate: the
+/// property under test is that a hang is KILLED, not the 30 s the real preflight
+/// waits.
 #[test]
-fn preflight_rejects_a_dylib_that_refuses_the_required_api_version() {
+fn preflight_kills_a_deadlocked_ort_init_instead_of_hanging() {
+  // A real file that EXISTS but is not a Mach-O dylib: `ort`'s dlopen fails and it
+  // then deadlocks constructing the error. Named `libonnxruntime.dylib` so the
+  // decoy is spelled exactly like the thing it stands in for.
   let dir = tempfile::tempdir().expect("create a temp dir");
-  // Source the stub's refusal threshold DIRECTLY from the authoritative symbol —
-  // NOT from `ORT_REQUIRED_API_VERSION`, the probe's own binding. Two independent
-  // reads of `asry::ort::MINOR_VERSION` (`== ort_sys::ORT_API_VERSION`, ort
-  // lib.rs:86) are what make this test a probe/ORT DRIFT DETECTOR: were the probe
-  // ever pinned to a stale literal below the compiled version, the stub would
-  // accept the version the probe asks for, the rejection would vanish, and the
-  // `expect_err` below would fail. (Mutation-proven: dropping the probe's constant
-  // by one turns this test RED.)
-  let required = asry::ort::MINOR_VERSION.to_string();
-  let stub = compile_stub_dylib(
-    dir.path(),
-    "ort_api_refuse",
-    API_REFUSING_STUB_C,
-    &[("REQUIRED_API_VERSION", required.as_str())],
-  );
-
-  let err = probe_ort_dylib_loadable(stub.as_os_str())
-    .expect_err("a runtime refusing the required API version must be rejected");
+  let decoy = dir.path().join("libonnxruntime.dylib");
+  std::fs::write(&decoy, b"I am a text file, not a Mach-O dylib.\n").expect("write the decoy file");
   assert!(
-    err.contains(&format!("GetApi({ORT_REQUIRED_API_VERSION})")),
-    "expected an API-version rejection naming GetApi({ORT_REQUIRED_API_VERSION}), got: {err}"
+    decoy.is_file(),
+    "the decoy must exist, so this proves the hang is about loadability, not absence"
   );
-}
 
-/// **F3 unit test.** The validator REJECTS a *loadable* dylib that is not ONNX
-/// Runtime — it loads but exports no `OrtGetApiBase`. Distinct from
-/// [`preflight_rejects_a_non_dylib_file`], which fails during `dlopen`: this
-/// proves the symbol-missing verdict on a dylib that genuinely loaded. Hermetic,
-/// and NOT `#[ignore]`.
-#[test]
-fn preflight_rejects_a_loadable_dylib_without_ort_get_api_base() {
-  let dir = tempfile::tempdir().expect("create a temp dir");
-  let stub = compile_stub_dylib(dir.path(), "not_onnxruntime", SYMBOLLESS_STUB_C, &[]);
-
-  let err = probe_ort_dylib_loadable(stub.as_os_str())
-    .expect_err("a loadable dylib that is not ONNX Runtime must be rejected");
+  // Short, but far above a good init's ~160 ms, so reaching it means the child
+  // genuinely hung rather than just being slow.
+  const DEADLOCK_TIMEOUT: Duration = Duration::from_secs(5);
+  let start = Instant::now();
+  let why = probe_ort_init(Some(decoy.as_os_str()), DEADLOCK_TIMEOUT)
+    .expect_err("a decoy ORT_DYLIB_PATH deadlocks ort, so the preflight must fail, not hang");
   assert!(
-    err.contains("does not export OrtGetApiBase"),
-    "expected a missing-symbol rejection, got: {err}"
+    why.contains("did not return within"),
+    "the decoy must be caught by the timeout kill (the deadlock containment), not some other \
+     failure; got: {why}"
+  );
+  // And the kill must fire promptly at the bound, not run away unbounded.
+  assert!(
+    start.elapsed() < DEADLOCK_TIMEOUT * 2,
+    "the containment must return shortly after the timeout; took {:?}",
+    start.elapsed()
   );
 }
 
-/// Compiles the API-refusing stub as `libonnxruntime.dylib` under a fresh temp dir
-/// and returns the dir — put it on `DYLD_LIBRARY_PATH` and a bare
-/// `dlopen("libonnxruntime.dylib")` resolves to it. Refusing (not accepting) is
-/// deliberate: the resulting [`SELECT_EXIT_API_REJECTED`] verdict is UNREACHABLE
-/// unless the selection produced a bare/relative name that dyld resolved to THIS
-/// stub, so it is a positive proof of resolution no real, accepting runtime could
-/// forge. The stub refuses `asry::ort::MINOR_VERSION`, the exact version the probe
-/// requests (`ORT_REQUIRED_API_VERSION`).
-fn onnxruntime_stub_on_dyld_path() -> tempfile::TempDir {
-  let dir = tempfile::tempdir().expect("create a temp dir");
-  let required = asry::ort::MINOR_VERSION.to_string();
-  compile_stub_dylib(
-    dir.path(),
-    // `lib{name}.dylib` → `libonnxruntime.dylib`, the bare name dyld resolves.
-    "onnxruntime",
-    API_REFUSING_STUB_C,
-    &[("REQUIRED_API_VERSION", required.as_str())],
-  );
-  dir
-}
-
-/// Spawns [`ort_preflight_selection_child`] with a crafted `ORT_DYLIB_PATH` and a
-/// `DYLD_LIBRARY_PATH` pointing at `dyld_library_path`, and returns the child's
-/// exit code — the preflight's decoded verdict for that environment. The env is
-/// crafted on the CHILD (never mutated in-process — `set_var` is racy and its
-/// safety cannot be guaranteed here), and `ort_dylib_path` is an `&OsStr` so a
-/// caller can pass a non-UTF-8 value.
-fn run_ort_selection_probe(ort_dylib_path: &OsStr, dyld_library_path: &Path) -> i32 {
-  let exe = std::env::current_exe().expect("locate the test binary");
-  Command::new(exe)
-    .args(["--exact", "--ignored", "ort_preflight_selection_child"])
-    .env(ORT_SELECT_PROBE_ENV, "1")
-    .env("ORT_DYLIB_PATH", ort_dylib_path)
-    .env("DYLD_LIBRARY_PATH", dyld_library_path)
-    .stdout(Stdio::null())
-    .stderr(Stdio::null())
-    .status()
-    .expect("spawn the selection-probe child")
-    .code()
-    .expect("the selection-probe child was killed by a signal, not a code")
-}
-
-/// **L1 regression.** `ORT_DYLIB_PATH=""` must be treated as ort treats it — NOT
-/// as an explicit (missing) path, but as the bare-name fallback: ort's
-/// `Ok(s) if !s.is_empty()` guard fails for `""` (`ort-2.0.0-rc.12/src/lib.rs:188`).
-/// With the stub on `DYLD_LIBRARY_PATH`, the bare `dlopen` resolves to it and the
-/// probe reports the stub's API refusal; the OLD preflight `is_file("")`-rejected
-/// an empty path and diverged from ort. Hermetic (a compiled stub, no ONNX
-/// Runtime, no models) and NOT `#[ignore]`, so it runs wherever `parity-oracle`
-/// builds.
+/// **The preflight's good path, in isolation.** With a real ONNX Runtime on the
+/// loader path, [`assert_onnxruntime_is_resolvable`] must PASS quickly — the
+/// child's `asry::ort::api()` returns and exits 0. Kept separate from the parity
+/// tests (which also exercise it, but only after loading ~400 MB of models and a
+/// 60 s clip) so that a broken preflight fails HERE, fast and unambiguously.
+/// `#[ignore]` and needs `ORT_DYLIB_PATH` at a real `libonnxruntime.dylib`,
+/// exactly like the parity gate it guards.
 #[test]
-fn preflight_empty_ort_dylib_path_falls_back_to_bare_name_like_ort() {
-  let stub_dir = onnxruntime_stub_on_dyld_path();
-  let verdict = run_ort_selection_probe(OsStr::new(""), stub_dir.path());
-  assert_eq!(
-    verdict, SELECT_EXIT_API_REJECTED,
-    "empty ORT_DYLIB_PATH must fall back to the bare name (ort lib.rs:188) and dlopen the stub on \
-     DYLD_LIBRARY_PATH, reaching its API refusal; got exit {verdict}"
-  );
-}
-
-/// **L1 regression.** A RELATIVE `ORT_DYLIB_PATH=libonnxruntime.dylib` reachable
-/// via `DYLD_LIBRARY_PATH` must be loaded through dyld — as ort does
-/// (`load_dylib_from_path` → `libloading::Library::new`, ort `lib.rs:92`) — not
-/// rejected by a `cwd`-relative `is_file()` check, the OLD preflight's bug (it
-/// probed the cwd only, so ort would load this dylib while the preflight refused
-/// it). Hermetic and NOT `#[ignore]`.
-#[test]
-fn preflight_relative_ort_dylib_path_resolves_via_dyld_like_ort() {
-  let stub_dir = onnxruntime_stub_on_dyld_path();
-  let verdict = run_ort_selection_probe(OsStr::new(ORT_DYLIB_BARE_NAME), stub_dir.path());
-  assert_eq!(
-    verdict, SELECT_EXIT_API_REJECTED,
-    "a relative ORT_DYLIB_PATH must resolve through dyld's DYLD_LIBRARY_PATH search and reach the \
-     stub's API refusal, not be cwd-`is_file`-rejected; got exit {verdict}"
-  );
-}
-
-/// **L1 regression.** A NON-UTF-8 `ORT_DYLIB_PATH` must be IGNORED exactly as ort
-/// ignores it: ort reads it with `std::env::var` (UTF-8 only,
-/// `ort-2.0.0-rc.12/src/lib.rs:188`), so a non-UTF-8 value is `Err` and ort falls
-/// back to the bare name. The OLD preflight used `var_os` and probed the garbage
-/// path. With the stub on `DYLD_LIBRARY_PATH`, the bare-name fallback reaches its
-/// API refusal. Hermetic and NOT `#[ignore]`.
-#[test]
-fn preflight_non_utf8_ort_dylib_path_is_ignored_like_ort() {
-  use std::os::unix::ffi::OsStrExt;
-  // "foo" + bytes that are not valid UTF-8, so the child's `std::env::var` returns
-  // `Err` — the very case `var_os` would have wrongly surfaced as an explicit path.
-  let non_utf8 = OsStr::from_bytes(&[b'f', b'o', b'o', 0x80, 0xff]);
-  let stub_dir = onnxruntime_stub_on_dyld_path();
-  let verdict = run_ort_selection_probe(non_utf8, stub_dir.path());
-  assert_eq!(
-    verdict, SELECT_EXIT_API_REJECTED,
-    "a non-UTF-8 ORT_DYLIB_PATH must be ignored (ort reads UTF-8 via std::env::var, ort \
-     lib.rs:188) and fall back to the bare name, reaching the stub's API refusal; got exit \
-     {verdict}"
-  );
+#[ignore = "requires a real libonnxruntime.dylib on the loader path (ORT_DYLIB_PATH)"]
+fn preflight_accepts_a_real_onnxruntime() {
+  assert_onnxruntime_is_resolvable();
 }
 
 /// Loads the oracle. Separate from [`align_with_asry_ort`] so the ONNX session
