@@ -120,7 +120,7 @@ fn align_error_corrupt_emissions_names_the_placement_and_the_floor() {
     compute: coremlit::ComputeUnits::All,
     min: -45_440.0,
     cells: 2_667,
-    total: 15_950,
+    total: 15_921,
   };
   let rendered = e.to_string();
   assert!(
@@ -136,7 +136,7 @@ fn align_error_corrupt_emissions_names_the_placement_and_the_floor() {
     "must report the blast radius: {rendered}"
   );
   assert!(
-    rendered.contains("15950"),
+    rendered.contains("15921"),
     "must report the total: {rendered}"
   );
   assert!(

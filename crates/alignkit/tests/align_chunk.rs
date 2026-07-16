@@ -163,3 +163,58 @@ fn align_chunk_is_bit_identical_across_runs() {
     );
   }
 }
+
+/// **The codex-fence regression, on the canonical `Aligner` path.** 641 real
+/// samples carrying three distinct tokens (`ABC`) truncate to one emission frame,
+/// and one frame cannot carry three tokens — so the seam returns
+/// `NoAlignmentPath`, which [`Aligner::align_chunk`] RECOVERS into an EMPTY result:
+/// the ASR text survives, only the per-word timings are dropped (see
+/// `align_chunk`'s doc and `recover_or_error`).
+///
+/// This is the canonical-path half of `tests/prepared_composition.rs`'s
+/// `public_prepared_composition_641_abc_has_no_alignment_path` (which pins the raw
+/// `NoAlignmentPath` error at the seam). Both are mutation proofs: revert
+/// `truncated_frame_count` to `ceil(641/320) = 3` and the trellis threads `ABC`
+/// across three phantom, padding-derived frames, so `align_chunk` returns a
+/// non-empty word list — failing this assertion. asry's `chunk_extent ± 2·hop`
+/// stride check (`3×320 = 960` inside `641 ± 640`) is too loose to catch the
+/// phantom frames; this end-to-end test is the guard.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn align_chunk_641_abc_recovers_to_no_words() {
+  let aligner = Aligner::from_paths(
+    Lang::En,
+    &common::model_path(),
+    Box::new(EnglishNormalizer::new()),
+  )
+  .expect("build the En aligner (set ALIGNKIT_TEST_MODELS to the model directory)");
+
+  let jfk = common::load_wav_mono_f32(&common::jfk_wav_path());
+  let samples = &jfk[80_000..80_641];
+  assert_eq!(
+    samples.len(),
+    641,
+    "the fence case is exactly 641 real samples"
+  );
+
+  let text = "ABC";
+  let events = aligner.detect_oov(text).expect("detect_oov");
+  assert!(
+    events.is_empty(),
+    "A, B, C must be in-vocab, or the OOV path — not the frame count — would drive the result"
+  );
+  let decisions = default_oov_decisions(&events);
+  // No VAD; clock anchored at stream sample 0 in the analysis timebase.
+  let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock construction");
+  let abort = AtomicBool::new(false);
+
+  let result = aligner
+    .align_chunk(samples, &[], text, clock, &abort, &decisions)
+    .expect("align_chunk recovers NoAlignmentPath into an empty Ok, never an Err");
+  assert!(
+    result.words().is_empty(),
+    "one frame cannot carry three distinct tokens: the recovered result must have zero words, got \
+     {:?}",
+    result.words().iter().map(Word::text).collect::<Vec<_>>()
+  );
+}

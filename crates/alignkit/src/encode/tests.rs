@@ -9,69 +9,106 @@ use super::*;
 
 #[test]
 fn truncated_frame_count_zero_samples_is_zero() {
+  // No real audio → no real frames. The `real_samples == 0` short-circuit is
+  // load-bearing: the conv formula would otherwise floor UP to 1
+  // (`0.max(400)` → 400 → one frame). A trivial chunk's empty tensor must stay
+  // empty.
   assert_eq!(truncated_frame_count(0, 2999), 0);
 }
 
 #[test]
-fn truncated_frame_count_exact_multiple_of_hop() {
-  // 320 samples == exactly one hop: ceil(320/320) == 1, not 2. Catches a
-  // mutant that used a plain `/` (floor) with a stray `+1`, or a
-  // `div_ceil` misuse that rounds exact multiples up.
-  assert_eq!(truncated_frame_count(HOP_SAMPLES, 2999), 1);
+fn truncated_frame_count_sub_receptive_field_is_one_frame() {
+  // Anything from a single sample up to the full 400-sample receptive field
+  // yields exactly ONE frame: the wav2vec2 conv stack needs a complete
+  // receptive field for its first output, and asry pads a sub-400 chunk up to
+  // 400 before it — so one real sample and a full receptive field are the same
+  // one frame. (Reverting `saturating_sub` to a bare `-` underflows here.)
+  for real_samples in [1, 200, HOP_SAMPLES, 399, RECEPTIVE_FIELD_SAMPLES] {
+    assert_eq!(
+      truncated_frame_count(real_samples, 2999),
+      1,
+      "real_samples={real_samples} is within the receptive field: one frame"
+    );
+  }
 }
 
 #[test]
-fn truncated_frame_count_rounds_up_on_remainder() {
-  // 321 samples is one hop plus one leftover sample: ceil(321/320) == 2.
-  // Catches a mutant that used floor division (`/`) instead of
-  // `div_ceil`, which would wrongly return 1.
-  assert_eq!(truncated_frame_count(HOP_SAMPLES + 1, 2999), 2);
+fn truncated_frame_count_no_phantom_frame_from_receptive_field_slack() {
+  // THE wrong-pinning fix. The old formula was `ceil(real_samples / 320)`,
+  // which invented a phantom frame out of the receptive-field slack:
+  // `ceil(321/320) == 2` and `ceil(641/320) == 3`. But 321 (and 641) real
+  // samples do not fill a SECOND 400-wide receptive field, so the wav2vec2
+  // conv stack — and asry's own ONNX encoder — yield exactly ONE frame. Those
+  // phantom frames are pure padding-derived structure: a 641-sample chunk
+  // carrying three distinct tokens rode them into a plausible-but-nonexistent
+  // alignment where the reference returns `NoAlignmentPath`
+  // (`tests/prepared_composition.rs`, `tests/align_chunk.rs`). Reverting to
+  // `div_ceil` fails both assertions (2 and 3, not 1).
+  assert_eq!(truncated_frame_count(HOP_SAMPLES + 1, 2999), 1); // 321: was ceil → 2
+  assert_eq!(truncated_frame_count(641, 2999), 1); // was ceil → 3
 }
 
 #[test]
-fn truncated_frame_count_short_clip_not_clamped() {
-  // 48,000 samples (3 s) against the real model's 2,999-frame ceiling:
-  // nominal ceil(48_000/320) == 150, well under 2,999, so the clamp must
-  // be a no-op here. Catches a mutant that flips `.min` to `.max` (which
-  // would wrongly clamp UP to 2,999 even though nominal is already
-  // smaller) — `.max` only produces the same answer as `.min` when
-  // nominal >= available_frames, which is not this case.
-  assert_eq!(truncated_frame_count(48_000, 2_999), 150);
+fn truncated_frame_count_adds_one_frame_per_hop_past_the_receptive_field() {
+  // At and above the receptive field the count is `floor((L - 400)/320) + 1`:
+  // each further 320-sample hop past the first full receptive field adds one
+  // frame. Catches dropping the `+ 1` (401 → 0) or a wrong divisor.
+  assert_eq!(truncated_frame_count(RECEPTIVE_FIELD_SAMPLES + 1, 2999), 1); // 401
+  assert_eq!(
+    truncated_frame_count(RECEPTIVE_FIELD_SAMPLES + HOP_SAMPLES, 2999),
+    2
+  ); // 720
+  assert_eq!(
+    truncated_frame_count(RECEPTIVE_FIELD_SAMPLES + 2 * HOP_SAMPLES, 2999),
+    3
+  ); // 1040
 }
 
 #[test]
-fn truncated_frame_count_at_clamp_boundary_is_not_clamped() {
-  // 2_999 * 320 == 959_680 samples: nominal ceil(959_680/320) == 2_999
-  // exactly, equal to (not exceeding) available_frames, so clamping is a
-  // no-op at this exact boundary.
-  assert_eq!(truncated_frame_count(2_999 * HOP_SAMPLES, 2_999), 2_999);
+fn truncated_frame_count_reference_short_clip() {
+  // 48,000 samples (3 s), well under the model's 2,999-frame ceiling: the
+  // reference conv output is `floor((48_000 - 400)/320) + 1 == 149`. The old
+  // `ceil(48_000/320) == 150` over-counted by one, so reverting to `div_ceil`
+  // fails here (150, not 149). Cross-validated against the LIVE model by
+  // `emissions_on_short_input_truncates_to_hermetic_formula`.
+  assert_eq!(truncated_frame_count(48_000, 2_999), 149);
 }
 
 #[test]
-fn truncated_frame_count_one_sample_past_clamp_boundary_engages_clamp() {
-  // One more sample than the boundary above: nominal ceil(959_681/320)
-  // == 3_000, one past available_frames — the clamp must now engage and
-  // cap the result at 2_999.
-  assert_eq!(truncated_frame_count(2_999 * HOP_SAMPLES + 1, 2_999), 2_999);
-}
-
-#[test]
-fn truncated_frame_count_full_window_clamps_to_available_frames() {
-  // THE boundary the module doc calls out by name: a full,
-  // zero-padding-free ENCODER_WINDOW_SAMPLES (960,000, i.e. exactly the
-  // `ted_60.wav` fixture's own case) has nominal ceil(960_000/320) ==
-  // 3_000 — one MORE than `base960h_aligner.mlmodelc`'s actual 2,999
-  // frames (`tests/model_io.rs::base960h_aligner_io_matches_spec`).
-  // Without the `.min(available_frames)` clamp, `Encoder::emissions`
-  // would compute `real_frames = 3_000` and then either panic slicing
-  // `raw` (2,999 * VOCAB_SIZE elements) at a 3,000-frame boundary, or
-  // (if `truncate` silently no-ops past `raw.len()`, which it does)
-  // silently under-report by handing `LogProbsTV::new` a `t` that no
-  // longer matches `raw.len() / VOCAB_SIZE`, tripping the `.expect(...)`
-  // in `Encoder::emissions` instead. This is the exact regression this
-  // test pins: removing the clamp (or flipping `.min` to `.max`) makes
-  // this assertion fail with `3_000 != 2_999`.
+fn truncated_frame_count_full_window_is_the_model_frame_count() {
+  // A full, zero-padding-free ENCODER_WINDOW_SAMPLES (960,000 — exactly the
+  // `ted_60.wav` fixture's own case) evaluates to `floor((960_000 - 400)/320)
+  // + 1 == 2_999`, `base960h_aligner.mlmodelc`'s ACTUAL frame count
+  // (`tests/model_io.rs::base960h_aligner_io_matches_spec`): the model count
+  // falls out of the formula NATURALLY, with the `.min(available_frames)` clamp
+  // a no-op here. The old `ceil(960_000/320) == 3_000` overshot by one and
+  // relied on the clamp to hide the phantom frame; this formula does not.
   assert_eq!(truncated_frame_count(ENCODER_WINDOW_SAMPLES, 2_999), 2_999);
+}
+
+#[test]
+fn truncated_frame_count_approaches_the_full_window_without_overshoot() {
+  // The formula climbs to 2,999 and stops there — it never exceeds the model
+  // count for any in-window input, so the clamp is defensive, not corrective.
+  // `2_999 * 320 == 959_680` is now 2_998 (not the old ceil's 2_999); the count
+  // first reaches 2_999 at 959_760 and holds it through the full window.
+  assert_eq!(truncated_frame_count(2_999 * HOP_SAMPLES, 2_999), 2_998);
+  assert_eq!(truncated_frame_count(959_760, 2_999), 2_999);
+  assert_eq!(
+    truncated_frame_count(ENCODER_WINDOW_SAMPLES - 1, 2_999),
+    2_999
+  );
+}
+
+#[test]
+fn truncated_frame_count_clamp_engages_only_below_the_formula() {
+  // The `.min(available_frames)` clamp never fires for the real model (the
+  // formula tops out at exactly its 2,999), so prove it against a SMALLER
+  // hypothetical frame budget: 48,000 samples nominally yield 149, but a
+  // 100-frame model must cap at 100. Catches a `.min` → `.max` mutant, which
+  // would return 149 here.
+  assert_eq!(truncated_frame_count(48_000, 100), 100);
+  assert_eq!(truncated_frame_count(48_000, 149), 149); // exactly at the budget: no clamp
 }
 
 #[test]
@@ -105,16 +142,16 @@ fn truncated_frame_count_never_exceeds_available_frames_near_full_window() {
 fn encoder_input_from_samples_binds_real_length_to_the_slice() {
   // A 176,000-sample chunk fed as raw audio: `real_samples` IS the slice's own
   // length, 176,000. The F1 defect declared 175,360 (two hops short) for this
-  // same buffer to get 548 frames where 550 belong; there is now no
+  // same buffer to get 547 frames where 549 belong; there is now no
   // `real_samples` argument to declare it into.
   let chunk = vec![0.0f32; 176_000];
   let input = EncoderInput::from_samples(&chunk).expect("176k <= window");
   assert_eq!(input.real_samples, 176_000);
   assert_eq!(input.encoder_input.len(), 176_000);
-  assert_eq!(truncated_frame_count(input.real_samples, 2_999), 550);
-  // The buggy answer is now unreachable: 175_360 gives 548, but nothing can
+  assert_eq!(truncated_frame_count(input.real_samples, 2_999), 549);
+  // The buggy answer is now unreachable: 175_360 gives 547, but nothing can
   // bind 175_360 to this 176,000-sample buffer.
-  assert_eq!(truncated_frame_count(175_360, 2_999), 548);
+  assert_eq!(truncated_frame_count(175_360, 2_999), 547);
   assert_ne!(
     truncated_frame_count(input.real_samples, 2_999),
     truncated_frame_count(175_360, 2_999)
@@ -126,26 +163,25 @@ fn encoder_input_gate_binds_real_length_independent_of_the_padded_buffer() {
   // The pipeline geometry: 200 real samples that asry silence-masks and zero-pads
   // to the 400-sample receptive field. The gate every constructor funnels through
   // records the real length as the UNPADDED count (200), never the padded buffer's
-  // length (400). `from_prepared` reads exactly this (buffer, real_samples) pair
-  // off an unforgeable `PreparedChunk`; here we drive the gate directly so the
-  // geometry is pinned with no model and no seam (the end-to-end `from_prepared`
-  // door, on a real chunk, is `tests/prepared_composition.rs`). The F1 defect
-  // recorded `encoder_input.len()` (400) as the real count, yielding 2 frames
-  // where 1 belongs.
+  // length (400) — the type-level F1 property. `from_prepared` reads exactly this
+  // (buffer, real_samples) pair off an unforgeable `PreparedChunk`; here we drive
+  // the gate directly so the binding is pinned with no model and no seam (the
+  // end-to-end `from_prepared` door, on a real chunk, is
+  // `tests/prepared_composition.rs`).
   let real_len = 200usize;
   let padded_buffer = vec![0.0f32; 400];
   let input = EncoderInput::new(&padded_buffer, real_len).expect("valid geometry");
-  assert_eq!(input.real_samples, 200); // NOT 400
+  assert_eq!(input.real_samples, 200); // the UNPADDED count, NOT 400
   assert_eq!(input.encoder_input.len(), 400);
-  assert_eq!(truncated_frame_count(input.real_samples, 2_999), 1); // ceil(200/320)
-  // The buffer-length count (2) is the F1 bug — exactly what `from_samples` on the
-  // padded buffer would produce, which is why the padded buffer must never take
-  // that door.
-  assert_eq!(truncated_frame_count(400, 2_999), 2); // the buggy count
-  assert_ne!(
-    truncated_frame_count(input.real_samples, 2_999),
-    truncated_frame_count(padded_buffer.len(), 2_999)
-  );
+  // Under the corrected conv-geometry truncation this sub-receptive-field slip is
+  // BENIGN for the count: 200 real samples and the 400-sample pad both yield the
+  // single receptive-field frame — `ceil` was the only thing that ever made them
+  // 1 vs 2. The binding still matters (it records the honest length and stays
+  // correct for the general case pinned by
+  // `encoder_input_from_samples_binds_real_length_to_the_slice`: 176_000 vs
+  // 175_360 → 549 vs 547, where a short real count genuinely moves the count).
+  assert_eq!(truncated_frame_count(input.real_samples, 2_999), 1);
+  assert_eq!(truncated_frame_count(padded_buffer.len(), 2_999), 1);
 }
 
 #[test]
@@ -498,7 +534,7 @@ fn emissions_on_full_window_produces_correctly_shaped_finite_log_probs() {
 /// The encoder is built from [`DEFAULT_ENCODER_COMPUTE`] — NEVER a hardcoded
 /// placement — so this is a test of the shipping default. Flipping that
 /// constant to `ComputeUnits::All` makes it fail (measured `min = -45440`,
-/// 2,667 of 15,950 cells past the threshold); on `CpuOnly` it passes
+/// 2,667 of 15,921 cells past the threshold); on `CpuOnly` it passes
 /// (`min = -30.81`).
 ///
 /// It must run on REAL SPEECH. This bug is invisible to synthetic input:
@@ -582,12 +618,12 @@ fn emissions_reject_an_ane_corrupted_matrix() {
   else {
     panic!("expected AlignError::CorruptEmissions, got {err:?}");
   };
-  // The measured ANE signature, pinned: 2,667 of 15,950 cells (16.7%),
+  // The measured ANE signature, pinned: 2,667 of 15,921 cells (16.7%),
   // min = -45440. Asserted as bounds rather than as equalities — the exact
   // count is a property of one OS/ANE firmware pair, but the ORDER of the
   // corruption is the fact worth pinning.
   assert_eq!(compute, ComputeUnits::All);
-  assert_eq!(total, 550 * crate::vocab::VOCAB_SIZE);
+  assert_eq!(total, 549 * crate::vocab::VOCAB_SIZE);
   assert!(
     cells > 0 && cells <= total,
     "corrupt cells: {cells}/{total}"
@@ -633,7 +669,7 @@ fn emissions_accept_the_cpu_and_gpu_placement() {
   let emissions = encoder
     .emissions(window_input(&samples))
     .expect("CpuAndGpu emissions are clean log-probs and must pass the floor guard");
-  assert_eq!(emissions.frames(), 550);
+  assert_eq!(emissions.frames(), 549);
   assert_eq!(emissions.vocab().get(), crate::vocab::VOCAB_SIZE);
 }
 
@@ -652,7 +688,7 @@ fn emissions_accept_the_default_placement_on_real_speech() {
   let emissions = encoder
     .emissions(window_input(&samples))
     .unwrap_or_else(|e| panic!("the SHIPPING placement must produce clean log-probs: {e}"));
-  assert_eq!(emissions.frames(), 550);
+  assert_eq!(emissions.frames(), 549);
   assert_eq!(emissions.vocab().get(), crate::vocab::VOCAB_SIZE);
 }
 
@@ -687,7 +723,7 @@ fn emissions_wraps_into_validated_emissions() {
   let emissions = encoder
     .emissions(window_input(&samples))
     .expect("emissions wraps into a validated Emissions");
-  assert_eq!(emissions.frames(), 150);
+  assert_eq!(emissions.frames(), 149);
   assert_eq!(emissions.vocab().get(), crate::vocab::VOCAB_SIZE);
 }
 
@@ -704,8 +740,8 @@ fn emissions_on_short_input_truncates_to_hermetic_formula() {
     .emissions_raw(window_input(&samples))
     .expect("emissions on short input");
   assert_eq!(raw.frames, truncated_frame_count(48_000, encoder.frames()));
-  assert_eq!(raw.frames, 150);
-  assert_eq!(raw.data.len(), 150 * crate::vocab::VOCAB_SIZE);
+  assert_eq!(raw.frames, 149);
+  assert_eq!(raw.data.len(), 149 * crate::vocab::VOCAB_SIZE);
 }
 
 #[test]

@@ -89,20 +89,23 @@
 //!
 //! | | `ted_60.wav` (60 s — **fills the window**) | `jfk.wav` (11 s — **zero-padded**) |
 //! |---|---|---|
-//! | boundaries within one 20 ms frame | **367 / 372 (98.7%)** | 38 / 44 (86.4%) |
-//! | median disagreement | **0.0 ms** — frame-identical | 12.8 ms |
-//! | p90 disagreement | **0.0 ms** | 47.0 ms |
+//! | boundaries within one 20 ms frame | **367 / 372 (98.7%)** | 33 / 44 (75.0%) |
+//! | median disagreement | **0.0 ms** — frame-identical | **0.0 ms** — frame-identical |
+//! | p90 disagreement | **0.0 ms** | 40.1 ms |
 //!
 //! **Feed the encoder a full window and its word boundaries are frame-exact
 //! against the reference implementation.** The encoder's CoreML fp16 29-class
 //! conversion costs essentially nothing.
 //!
-//! The jfk column is not encoder error either — it is **padding**. The CoreML
-//! graph takes a fixed `[1, 960_000]` input ([`encode::ENCODER_WINDOW_SAMPLES`]),
-//! so a chunk shorter than 60 s is zero-padded, and wav2vec2-base group-norms
-//! over the whole sequence axis and attends globally with no padding mask: the
-//! zeros perturb *every* real frame, not just the tail. So, practically:
-//! **a short chunk costs you roughly a frame of extra spread — fill the window
+//! On a short, zero-padded chunk the *typical* boundary is still frame-exact —
+//! jfk's median disagreement is also 0.0 ms — but the **tail** spreads: its p90
+//! is 40.1 ms where ted_60's is 0.0. That spread is **padding**, not encoder
+//! error. The CoreML graph takes a fixed `[1, 960_000]` input
+//! ([`encode::ENCODER_WINDOW_SAMPLES`]), so a chunk shorter than 60 s is
+//! zero-padded, and wav2vec2-base group-norms over the whole sequence axis and
+//! attends globally with no padding mask: the zeros perturb *every* real frame,
+//! not just the tail. So, practically: **a short chunk costs you roughly a
+//! couple of frames of extra spread on the worst boundaries — fill the window
 //! when you can.**
 //!
 //! ## Where a forced aligner cannot help you

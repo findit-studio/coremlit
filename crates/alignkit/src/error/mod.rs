@@ -149,7 +149,7 @@ pub enum AlignError {
     /// How many cells fell below [`crate::encode::LOG_PROB_FLOOR`] (2,667 on
     /// `jfk.wav`'s ANE run).
     cells: usize,
-    /// Cells scanned: `frames × `[`crate::vocab::VOCAB_SIZE`] (15,950 on
+    /// Cells scanned: `frames × `[`crate::vocab::VOCAB_SIZE`] (15,921 on
     /// `jfk.wav`).
     total: usize,
   },

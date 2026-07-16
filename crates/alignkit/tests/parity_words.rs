@@ -30,11 +30,11 @@
 //!
 //! # The oracle is not ground truth, and this gate does not pretend it is
 //!
-//! Measured on `jfk.wav`: 38 of 44 word boundaries agree to within one 20 ms
-//! frame, and the median disagreement is 12.8 ms — under a single frame. **One
-//! boundary disagrees by 908 ms**, and it is the ORACLE that is wrong there.
-//! The word is the second `ask`, whose onset asry places at 7507 ms and
-//! alignkit at 8415 ms. The audio settles it:
+//! Measured on `jfk.wav`: the median boundary disagreement is 0.0 ms — the
+//! median boundary is frame-identical — and 33 of 44 boundaries agree to within
+//! one 20 ms frame. **One boundary disagrees by 923 ms**, and it is the ORACLE
+//! that is wrong there. The word is the second `ask`, whose onset asry places at
+//! 7507 ms and alignkit at 8431 ms. The audio settles it:
 //!
 //! - A 20 ms RMS envelope of `jfk.wav` puts **silence** across 7460–8180 ms
 //!   (RMS 0.009–0.037, against 0.2+ for speech). asry's onset, 7507 ms, is
@@ -49,12 +49,12 @@
 //!   fires `A` with a +6.64 margin over blank. A greedy CTC decode of the whole
 //!   clip confirms it: `…|FOR|YOU|AND|WHAT|YOU|CAN|…` with `A@8380ms`.
 //!
-//! So alignkit's onset is **35 ms after** the true acoustic onset, and asry's is
+//! So alignkit's onset is **51 ms after** the true acoustic onset, and asry's is
 //! **873 ms before** it. Requiring alignkit to reproduce the oracle's answer
 //! here would be requiring it to be wrong. The gate is therefore built on
 //! **robust statistics** (median, p90) plus an explicit, pinned **ledger of the
 //! divergences** ([`JFK_EXPECTED_DIVERGENCES`]) — not on a max-delta bound, which
-//! could only be satisfied by inflating it to 908 ms, at which point it would no
+//! could only be satisfied by inflating it to 923 ms, at which point it would no
 //! longer catch the 881 ms regression it exists to catch. A bound that cannot
 //! distinguish the defect from the baseline is not a bound.
 //!
@@ -83,16 +83,23 @@
 //!
 //! | | jfk (padded) | **ted_60 (unpadded)** |
 //! |---|---|---|
-//! | median \|Δ\| | 12.8 ms | **0.0 ms** |
-//! | p90 \|Δ\| | 47.0 ms | **0.0 ms** |
-//! | boundaries within one frame | 38/44 (86.4%) | **367/372 (98.7%)** |
+//! | median \|Δ\| | 0.0 ms | **0.0 ms** |
+//! | p90 \|Δ\| | 40.1 ms | **0.0 ms** |
+//! | boundaries within one frame | 33/44 (75.0%) | **367/372 (98.7%)** |
 //!
-//! **With the padding gone, the CoreML fp16 29-class encoder and the ONNX fp32
-//! 32-class encoder put 90%+ of all word boundaries on the same frame.** jfk's
-//! 12.8 ms median really was the zeros.
+//! **The median boundary is frame-identical on BOTH clips (0.0 ms): the padding
+//! does not move the median.** What the zeros still cost is the *tail* — jfk's
+//! p90 is 40.1 ms where ted_60's is 0.0 ms. (An earlier revision of this gate
+//! measured jfk's median at 12.8 ms and read it as the padding; it was not. It
+//! was alignkit over-counting jfk's emission frames by one — 550 where the
+//! wav2vec2 conv stack yields 549 — which put 320.0 samples/frame against the
+//! oracle's 320.58 and skewed every boundary, exactly the truncation off-by-one
+//! [`MAX_MEDIAN_BOUNDARY_DELTA_MS`] exists to catch. ted_60 was already correct
+//! at 2,999 frames, so it never showed the skew; correcting the truncation drops
+//! jfk's median to ted_60's 0.0, with the zeros' real cost left in the p90 tail.)
 //!
 //! ted_60 also runs what jfk leaves cold: the full 2,999-frame emission tensor
-//! instead of 550, a trellis over 186 words instead of 22, and a real
+//! instead of 549, a trellis over 186 words instead of 22, and a real
 //! disfluency — the speaker says `would` twice and the ASR transcript names it
 //! once — which is exactly where a forced aligner has to guess, and where the
 //! two aligners disagree (see [`TED_60_EXPECTED_DIVERGENCES`]; the audio says
@@ -163,11 +170,16 @@ const FRAME_MS: f64 = 20.0;
 /// clock — moves the median, however small each individual shift is. A worst-case
 /// bound cannot see any of that.
 ///
-/// Measured: **12.8 ms**, already under one frame.
+/// Measured: **0.0 ms** — the median boundary is frame-identical. (An earlier
+/// revision measured 12.8 ms; that WAS the "off-by-one in the emissions
+/// truncation" this bound names — alignkit over-counted jfk's frames by one, 550
+/// where the wav2vec2 conv stack yields 549 — and correcting the truncation drove
+/// it to 0.0.)
 ///
 /// It is **not** the bound that catches the ANE corruption, and this is recorded
-/// rather than assumed because it was measured: on the corrupted path the median
-/// moves only 12.8 → 16.7 ms, still inside this bound. What catches the ANE is
+/// rather than assumed because it was measured: the median barely moves under
+/// corruption (a pre-truncation-fix run measured a 12.8 → 16.7 ms correct/corrupt
+/// split), staying inside this bound. What catches the ANE is
 /// [`ACOUSTIC_ONSET_OF_ASK_MS`] and [`JFK_EXPECTED_DIVERGENCES`]. Do not "simplify"
 /// the gate down to this bound.
 const MAX_MEDIAN_BOUNDARY_DELTA_MS: f64 = FRAME_MS;
@@ -175,7 +187,7 @@ const MAX_MEDIAN_BOUNDARY_DELTA_MS: f64 = FRAME_MS;
 /// Largest tolerated **90th-percentile** boundary disagreement: **5 frames**.
 ///
 /// Bounds the bulk of the distribution without being hostage to the
-/// information-free outlier ([`JFK_EXPECTED_DIVERGENCES`]). Measured: **47.0 ms**.
+/// information-free outlier ([`JFK_EXPECTED_DIVERGENCES`]). Measured: **40.1 ms**.
 ///
 /// The headroom above that is not slack, it is a *measured floor*: alignkit
 /// cannot beat its own fixed-window padding, and
@@ -211,7 +223,10 @@ const GROSS_DELTA_MS: f64 = 150.0;
 /// Because a max-delta bound here is not merely weak, it is **inverted** —
 /// measured, not argued. Mutating [`alignkit::encode::DEFAULT_ENCODER_COMPUTE`]
 /// to `ComputeUnits::All` (the ANE placement, whose fp16 `log(softmax)` tail
-/// saturates 16.7% of emission cells to a `-45440` sentinel) gives:
+/// saturates 16.7% of emission cells to a `-45440` sentinel) gave — a
+/// pre-truncation-fix measurement, whose exact ms shifted with the fix (the
+/// correct-path median is now 0.0 ms, max 923.4 ms), though the inversion and the
+/// vanishing ledger entry it demonstrates did not:
 ///
 /// | | correct (`CpuOnly`) | **corrupted (`All`)** |
 /// |---|---|---|
@@ -249,7 +264,7 @@ const JFK_EXPECTED_DIVERGENCES: &[(usize, Boundary)] = &[(14, Boundary::Start)];
 const ACOUSTIC_ONSET_OF_ASK_MS: f64 = 8380.0;
 
 /// How far alignkit's `ask` onset may sit from [`ACOUSTIC_ONSET_OF_ASK_MS`]:
-/// **3 frames**. Measured: **+35.3 ms** (8415.3 ms), under two. A CTC onset
+/// **3 frames**. Measured: **+50.7 ms** (8430.7 ms), under three. A CTC onset
 /// frame is the first frame of the token's *acoustic* realisation, which for a
 /// vowel-initial word may legitimately lag the first frame at which the model
 /// becomes confident by a frame or so; three frames of room covers that without
@@ -293,14 +308,16 @@ const MAX_PADDING_P90_DELTA_MS: f64 = 5.0 * FRAME_MS;
 //
 // |                    | jfk (padded 81.7%) | ted_60 (unpadded) |
 // |--------------------|--------------------|-------------------|
-// | median |Δ|         | 12.8 ms            | **0.0 ms**        |
-// | p90 |Δ|            | 47.0 ms            | **0.0 ms**        |
-// | within one frame   | 38/44 (86.4%)      | **367/372 (98.7%)** |
+// | median |Δ|         | 0.0 ms             | **0.0 ms**        |
+// | p90 |Δ|            | 40.1 ms            | **0.0 ms**        |
+// | within one frame   | 33/44 (75.0%)      | **367/372 (98.7%)** |
 //
-// That is the affirmative result of this fixture, and it retroactively
-// confirms `fixed_window_padding_does_not_explain_the_divergence`: jfk's
-// 12.8 ms median really was the zero-padding, and with the zeros removed it
-// collapses to nothing.
+// That is the affirmative result of this fixture. The MEDIAN is frame-identical
+// on both clips (0.0 ms) — the padding does not move it; what the padding costs
+// jfk is the TAIL (p90 40.1 ms vs ted_60's 0.0). An earlier revision read jfk's
+// then-12.8 ms median as the zero-padding, but it was alignkit over-counting
+// jfk's frames by one (550 vs 549); correcting the emissions truncation dropped
+// jfk's median to ted_60's 0.0.
 // =========================================================================
 
 /// ted_60's largest tolerated **median** boundary disagreement: **one frame**.
@@ -1080,8 +1097,9 @@ fn word_timings_agree_with_asry_ort_on_jfk() {
 /// difference left. This is the stronger comparison, and it needs no control.
 ///
 /// It also runs the parts of the pipeline jfk leaves cold: the full
-/// 2,999-frame emission tensor rather than 550 (`truncated_frame_count`'s
-/// clamp engages, dropping nothing), a trellis over 186 words rather than 22,
+/// 2,999-frame emission tensor rather than 549 (the conv-geometry
+/// `truncated_frame_count` yields the full 2,999 naturally, dropping nothing), a
+/// trellis over 186 words rather than 22,
 /// and — because the transcript is real ASR output over spontaneous speech — a
 /// disfluency the transcript elides, which is exactly where a forced aligner
 /// is forced to guess.
@@ -1160,7 +1178,7 @@ fn word_timings_agree_with_asry_ort_on_ted_60() {
 
 /// **The control.** Answers the one question
 /// [`word_timings_agree_with_asry_ort_on_jfk`]'s numbers cannot answer on their own:
-/// **is the 908 ms `ask` divergence caused by alignkit's fixed 60 s window, or
+/// **is the 923 ms `ask` divergence caused by alignkit's fixed 60 s window, or
 /// by its CoreML conversion?**
 ///
 /// alignkit zero-pads an 11 s chunk to 960,000 samples because its CoreML graph
@@ -1182,7 +1200,8 @@ fn word_timings_agree_with_asry_ort_on_ted_60() {
 ///
 /// Not cherry-picking — a structural difference in what the two sides even
 /// compute. alignkit **truncates its emissions** to the real audio's frame count
-/// (`ceil(176_000 / 320) = 550` of 2999) before `finish` ever sees them, so its
+/// (`floor((176_000 − 400) / 320) + 1 = 549` of 2999) before `finish` ever sees
+/// them, so its
 /// trellis cannot path a token into the pad. asry's ORT front end fuses encode
 /// and finish and offers no seam to truncate at, so its padded trellis runs over
 /// all 2999 frames and the FINAL token is free to run out into the zeros — which
@@ -1239,14 +1258,14 @@ fn fixed_window_padding_does_not_explain_the_divergence() {
   println!(
     "\nORACLE vs ITSELF (ONNX both sides), unpadded vs 60 s zero-padded ONSETS: median \
      {median:.1} ms | p90 {p90:.1} ms | `ask` onset moved {ask_shift:.1} ms\n\
-     => alignkit's fixed window is NOT what moves `ask` by 908 ms.\n"
+     => alignkit's fixed window is NOT what moves `ask` by 923 ms.\n"
   );
 
   assert!(
     ask_shift <= GROSS_DELTA_MS,
     "zero-padding alone moves the oracle's `ask` onset by {ask_shift:.1} ms, past the \
      {GROSS_DELTA_MS:.0} ms gross threshold. The fixed window, not the CoreML conversion, would \
-     then be the prime suspect for the parity gate's 908 ms divergence, and the module doc's \
+     then be the prime suspect for the parity gate's 923 ms divergence, and the module doc's \
      root-cause analysis needs redoing."
   );
   assert!(
