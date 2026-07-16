@@ -147,9 +147,10 @@ pub struct LocalAgreement {
   /// dropped hypothesis's unseeded draw (or callback truncation) still decided
   /// which words the surviving hypotheses agreed on, so it must reach
   /// [`Self::finalize`]'s reproducibility answer even though its segments never
-  /// survive into the merge. Only the draw/early-stop/language facts are folded
-  /// (the worker schedule and id span are stripped, so the merged result's own
-  /// — from the surviving results — are left intact).
+  /// survive into the merge. Only the draw/early-stop/language facts are folded;
+  /// the worker schedule and id span are stripped to `None` (see the strip in
+  /// [`Self::ingest`]) — the finalized schedule is the adjudicated `None` and the
+  /// finalized span is restored from the merged surviving result (round 10).
   ingested_facts: TaskFactsAccumulator,
 }
 
@@ -353,9 +354,16 @@ impl LocalAgreement {
     // `skipAppend`) still contributes them to `finalize` (codex round 8, F1). It
     // controlled which words the surviving hypotheses agreed on — a re-run that
     // redraws its unseeded sample may land different confirmed text — so its draw
-    // must not vanish with its segments. Worker schedule and id span are stripped
-    // to `None`: those come from the SURVIVING results via the merge, and folding
-    // a dropped hypothesis's coordinate/span in would corrupt them.
+    // must not vanish with its segments.
+    //
+    // Worker schedule and id span are stripped to `None` here. For the SCHEDULE
+    // this is the ADJUDICATED agreement contract (round 10, F2): agreement-confirmed
+    // text interleaves words from MULTIPLE hypotheses, so no single ordered worker
+    // attribution is knowable — every contributor is `None`, which under the
+    // absorbing-`None` law is exactly what the finalized aggregate must read back
+    // (`finalize` leaves it there). For the SPAN the strip keeps `ingested_facts`
+    // from summing dropped hypotheses' ordinals; `finalize` restores the merged
+    // surviving result's own span, the authoritative id-ordinal count.
     self.ingested_facts.merge(
       &result
         .task_facts()
@@ -436,9 +444,10 @@ impl LocalAgreement {
   /// lost from the reproducibility answer. That ingest-ordered sink is the fold
   /// BASE, with the merged result's own facts folded IN (codex round 9): its
   /// FIRST-observed language then wins over a later surviving result's, where
-  /// folding the sink last let the survivor's win (F3). Worker schedule and id
-  /// span were stripped at ingest, so the merged result's own (from the
-  /// surviving results) still win those two fields.
+  /// folding the sink last let the survivor's win (F3). The worker schedule is
+  /// the adjudicated `None` (agreement attribution is unknown, round 10, F2) and
+  /// the decoded span is restored from the merged surviving result (round 10, F3,
+  /// whose absorbing-`None` law would otherwise null it); see [`Self::ingest`].
   pub fn finalize(mut self, options: &DecodingOptions) -> TranscriptionResult {
     self.confirmed_words.append(&mut self.last_agreed_words);
     let suffix = find_longest_different_suffix(&self.prev_words, &self.hypothesis_words);
@@ -449,13 +458,21 @@ impl LocalAgreement {
     // the other way round (codex round 9): the sink observed EVERY hypothesis in
     // ingest order — the disagreeing dropped ones included — so its FIRST-observed
     // language must win over a later surviving result's, which merging the sink
-    // last reversed (F3). Worker schedule and id span were stripped at ingest, so
-    // the merged result's own (from the surviving results) still win those two
-    // fields, and the draw/early-stop Kleene OR is commutative, so their answer
-    // is unchanged.
+    // last reversed (F3). The draw/early-stop Kleene OR is commutative, so their
+    // answer is unchanged by the order.
+    //
+    // The DECODED SPAN is then restored from the merged surviving result: the sink
+    // stripped its span to `None` at ingest, and under the absorbing-`None` span
+    // law (round 10, F3) that `None` would otherwise absorb the merged span away,
+    // losing the id-ordinal count a staged re-merge needs. The WORKER SCHEDULE is
+    // deliberately left at the `None` the strip and the absorbing merge produce —
+    // ADJUDICATED (round 10, F2): agreement-confirmed text interleaves multiple
+    // hypotheses, so no single ordered worker attribution is knowable. See the
+    // strip site in [`Self::ingest`].
+    let merged_span = merged.task_facts().decoded_span();
     let mut facts = self.ingested_facts.into_facts();
     facts.merge(merged.task_facts());
-    *merged.task_facts_mut() = facts;
+    *merged.task_facts_mut() = facts.with_decoded_span(merged_span);
     merged
   }
 }

@@ -228,8 +228,8 @@ pub struct TaskFacts {
   /// The ordered worker/chunk coordinates whose RNG streams produced this
   /// transcript's segments — a single decode task's own
   /// [`window_id_offset`](crate::transcribe::TranscribeTask::set_window_id_offset)
-  /// as `[offset]`, a merge's the concatenation of its children's in order
-  /// (`[0, 2]` for a VAD merge that dropped the middle chunk). Each coordinate
+  /// as `[offset]`, a merge's the ordered concatenation of its children's
+  /// (coordinates `[0]` and `[2]` merge to `[0, 2]`). Each coordinate
   /// domain-separates the seeded fallback ladder's sub-seed derivation
   /// ([`crate::decode::sampler::derive_attempt_seed`]), so under a
   /// [`DecodingOptions::seed`](crate::options::DecodingOptions::seed) two runs at
@@ -237,10 +237,14 @@ pub struct TaskFacts {
   ///
   /// **Explicit unknown (`None`) for a hand-built or options-only record, never
   /// a fabricated `[0]`** (R6-F2): a value nobody observed must not masquerade
-  /// as "worker zero". Required on deserialize (present, nullable, via
-  /// [`required_option`]) so a dropped key is rejected rather than read back as
-  /// unknown — and so removing a known coordinate fails or yields explicit
-  /// unknown, never zero.
+  /// as "worker zero". A known-empty `Some([])` — a run that observed zero
+  /// workers, e.g. a zero-chunk VAD run — is DISTINCT from that unknown, and
+  /// under [the merge law](Self::merge) `None` is ABSORBING while `Some([])` is
+  /// the identity (round 10, F2): an unknown contributor taints the ordered
+  /// aggregate to unknown, where a known-empty one leaves it unchanged. Required
+  /// on deserialize (present, nullable, via [`required_option`]) so a dropped key
+  /// is rejected rather than read back as unknown — and so removing a known
+  /// coordinate fails or yields explicit unknown, never zero.
   #[cfg_attr(feature = "serde", serde(deserialize_with = "required_option"))]
   worker_schedule: Option<Vec<usize>>,
   /// The number of segment-id ordinals this transcript's decode **allocated** —
@@ -461,11 +465,14 @@ impl TaskFacts {
   ///   observation wins: `self`'s is kept when present, else `other`'s is
   ///   adopted. A scalar cannot hold two conflicting observations, and a
   ///   left-fold over the children in order makes "first" well defined.
-  /// - **[`worker_schedule`](Self::worker_schedule)** — **concatenated in
-  ///   order**, so a merge of coordinates `[0]` and `[2]` records `[0, 2]`,
-  ///   distinct from `[0, 1]` (R6-F2). An unknown (`None`) child is the
-  ///   identity: it contributes no coordinates rather than poisoning the
-  ///   schedule, which is what keeps the concatenation associative.
+  /// - **[`worker_schedule`](Self::worker_schedule)** — two KNOWN schedules
+  ///   **concatenate in order**, so a merge of coordinates `[0]` and `[2]`
+  ///   records `[0, 2]`, distinct from `[0, 1]` (R6-F2); `Some([])` (known-empty)
+  ///   is the identity. An unknown (`None`) child is ABSORBING (round 10, F2): it
+  ///   taints the aggregate to `None` rather than passing the known side through
+  ///   as the whole schedule — a coordinate nobody could report must not read
+  ///   back as a fully-known ordering. Absorbing-`None` over a free monoid is
+  ///   associative, the same lattice the Kleene booleans use.
   /// - **[`decoded_span`](Self::decoded_span)** — summed with a **checked** add,
   ///   so the merged result stores the aggregate ordinal count its children
   ///   allocated (R6-F3). A `None` child contributes nothing; the sum is `None`
@@ -479,15 +486,24 @@ impl TaskFacts {
     if self.observed_language.is_none() {
       self.observed_language = other.observed_language.clone();
     }
-    match (
-      self.worker_schedule.as_mut(),
+    self.worker_schedule = match (
+      self.worker_schedule.take(),
       other.worker_schedule.as_deref(),
     ) {
-      (Some(schedule), Some(more)) => schedule.extend_from_slice(more),
-      (None, Some(more)) => self.worker_schedule = Some(more.to_vec()),
-      // `other` unknown (or both): keep `self`'s schedule as-is (identity).
-      (_, None) => {}
-    }
+      // Both KNOWN: ordered concatenation. `Some([])` is the identity — a known
+      // run of zero workers contributes no coordinates but does not taint the
+      // aggregate.
+      (Some(mut schedule), Some(more)) => {
+        schedule.extend_from_slice(more);
+        Some(schedule)
+      }
+      // An unknown (`None`) contributor is ABSORBING (round 10, F2): a child that
+      // cannot report its ordered coordinates taints the aggregate to unknown,
+      // rather than letting the known side pass for the WHOLE schedule. The
+      // pre-round-10 law treated `None` as the identity, so `None + Some([7])`
+      // read back `Some([7])` — partial knowledge presented as fully known.
+      (None, _) | (_, None) => None,
+    };
     self.decoded_span = match (self.decoded_span, other.decoded_span) {
       // Checked, NOT saturating (F2, codex round 9): an overflowing sum becomes
       // an honest untracked `None`, never a fabricated `usize::MAX` that a staged

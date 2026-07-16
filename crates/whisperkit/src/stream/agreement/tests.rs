@@ -428,3 +428,46 @@ fn finalize_keeps_the_earliest_ingested_language_over_a_later_survivor() {
     "and provenance carries that earliest observation",
   );
 }
+
+#[test]
+fn finalize_reports_an_unknown_worker_schedule() {
+  // ADJUDICATED (round 10, F2): agreement-confirmed text interleaves words from
+  // MULTIPLE hypotheses, so no single ordered worker attribution is knowable --
+  // the finalized record's worker_schedule is None even when every ingested
+  // hypothesis carried a DISTINCT, known coordinate. The strip at `ingest` makes
+  // every contributor's schedule None, and the absorbing-None merge law keeps the
+  // aggregate None (the surviving results' own [0, 2] cannot pass through it).
+  //
+  // Mutation proof: drop the `.with_worker_schedule(None)` strip in `ingest` and
+  // the ingested coordinates accumulate, so the finalized schedule reads back a
+  // non-None Some(...) instead of the adjudicated None.
+  let r1 = result_with_words(vec![word(" And", 0.0, 0.4), word(" so", 0.4, 0.7)])
+    .with_task_facts(TaskFacts::observed_clean().with_worker(0));
+  let r2 = result_with_words(vec![word(" But", 0.0, 0.4), word(" then", 0.4, 0.7)])
+    .with_task_facts(TaskFacts::observed_clean().with_worker(1));
+  let r3 = result_with_words(vec![
+    word(" But", 0.0, 0.4),
+    word(" then", 0.4, 0.7),
+    word(" folks", 0.7, 1.0),
+  ])
+  .with_task_facts(TaskFacts::observed_clean().with_worker(2));
+
+  let mut agreement = LocalAgreement::new();
+  assert!(agreement.ingest(r1).is_awaiting_agreement());
+  assert!(
+    agreement.ingest(r2).is_awaiting_agreement(),
+    "R2 disagrees with R1 and is dropped from results",
+  );
+  assert!(
+    agreement.ingest(r3).is_advanced(),
+    "R3 agrees with the retained R2 control hypothesis",
+  );
+  // The surviving results R1 (worker 0) and R3 (worker 2) carry a knowable [0, 2],
+  // but the confirmed transcript mixes their words -- attribution is unknown.
+  let finalized = agreement.finalize(&crate::options::DecodingOptions::new());
+  assert_eq!(
+    finalized.task_facts().worker_schedule(),
+    None,
+    "agreement-confirmed text has no single knowable worker attribution -- unknown, not [0, 2]",
+  );
+}

@@ -141,18 +141,31 @@ fn unknown_is_not_the_merge_identity_for_an_observed_clean_fact() {
   );
   assert_eq!(merged(&clean, &TaskFacts::unknown()).drew_from_rng(), None);
 
-  // It REMAINS an identity for the non-Kleene fields and for a `Some(true)` or
-  // `None` boolean, which the Kleene OR leaves unchanged beside a `None`.
-  let drew = TaskFacts::unknown()
-    .with_drew_from_rng(true)
-    .with_worker(2)
-    .with_decoded_span(Some(3));
+  // A `Some(true)` or `None` boolean beside a `None` is unchanged by the Kleene
+  // OR, and an absent language still adopts the other's (here also absent). But
+  // round 10 (F2) extends the correction to the worker SCHEDULE: `unknown()` is
+  // not an identity there either -- `None` is absorbing, so an unknown coordinate
+  // beside a known one NULLS the whole schedule rather than passing it through.
+  // (The decoded-span field's own absorbing correction is pinned by
+  // `merge_sums_the_decoded_span` and the associativity corpus.)
+  let drew = TaskFacts::unknown().with_drew_from_rng(true).with_worker(2);
+  let left = merged(&TaskFacts::unknown(), &drew);
   assert_eq!(
-    merged(&TaskFacts::unknown(), &drew),
-    drew,
-    "None|Some(true)=Some(true), and worker/span/language keep None as identity",
+    left.drew_from_rng(),
+    Some(true),
+    "None | Some(true) = Some(true)"
   );
-  assert_eq!(merged(&drew, &TaskFacts::unknown()), drew);
+  assert_eq!(left.observed_language(), None);
+  assert_eq!(
+    left.worker_schedule(),
+    None,
+    "an unknown coordinate absorbs a known one: unknown() is not a schedule identity (round 10, F2)",
+  );
+  assert_eq!(
+    merged(&drew, &TaskFacts::unknown()).worker_schedule(),
+    None,
+    "and in the other order",
+  );
 }
 
 #[test]
@@ -235,19 +248,52 @@ fn merge_concatenates_worker_schedules_in_order() {
     merged(&w(0), &w(1)).worker_schedule(),
     "the collapsed pre-fix merge made these two indistinguishable",
   );
-  // An unknown-coordinate child is the identity, never a fabricated 0.
+
+  // ORACLE CORRECTION (round 10, F2): `None` is ABSORBING, not the identity. A
+  // child that cannot report its ordered coordinates taints the aggregate to
+  // unknown -- partial knowledge must not read back as a fully-known schedule.
+  // The pre-round-10 law pinned these two as `Some([0])` / `Some([2])` (`None`
+  // as the identity); that oracle is replaced here on round 10's authority,
+  // mirroring the Kleene-bool correction (codex round 8) that gave `None` its
+  // absorbing role.
+  //
+  // Mutation proof: revert the merge to the `(None, Some(more)) => Some(...)`
+  // identity arm and both `None` expectations below read back `Some([0])` /
+  // `Some([2])`.
   assert_eq!(
     merged(&w(0), &TaskFacts::unknown()).worker_schedule(),
-    Some([0].as_slice()),
+    None,
+    "an unknown contributor absorbs a known coordinate (was Some([0]))",
   );
   assert_eq!(
     merged(&TaskFacts::unknown(), &w(2)).worker_schedule(),
-    Some([2].as_slice()),
+    None,
+    "and in the other order (was Some([2]))",
   );
   assert_eq!(
     merged(&TaskFacts::unknown(), &TaskFacts::unknown()).worker_schedule(),
     None,
     "two unknowns stay unknown, not [0]",
+  );
+
+  // `Some([])` (known-empty) IS the identity: it leaves a known schedule
+  // unchanged on either side, and two known-empties stay known-empty -- distinct
+  // from the absorbing unknown above.
+  let empty = || TaskFacts::unknown().with_worker_schedule(Some(Vec::new()));
+  let known_empty: &[usize] = &[];
+  assert_eq!(
+    merged(&w(0), &empty()).worker_schedule(),
+    Some([0].as_slice()),
+    "a known-empty child is the identity for a known coordinate",
+  );
+  assert_eq!(
+    merged(&empty(), &w(2)).worker_schedule(),
+    Some([2].as_slice()),
+  );
+  assert_eq!(
+    merged(&empty(), &empty()).worker_schedule(),
+    Some(known_empty),
+    "known-empty is the identity of itself, never nulled to unknown",
   );
 }
 

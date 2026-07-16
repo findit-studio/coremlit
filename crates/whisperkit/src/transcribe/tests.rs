@@ -667,6 +667,54 @@ fn vad_chunked_transcribe_reanchors_and_merges() {
     "chunk 3 re-anchored, got {}",
     starts[2]
   );
+  // All three chunks survived, so their ordered coordinates concatenate through
+  // the fixed schedule merge (round 10, F2) -- a fully-known ordered attribution,
+  // NOT the pre-fix first-child-only [0].
+  assert_eq!(
+    result.task_facts().worker_schedule(),
+    Some([0, 1, 2].as_slice()),
+    "every chunk survived -- the ordered coordinates concatenate to [0, 1, 2]",
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn worker_schedule_is_unknown_when_a_vad_chunk_errors() {
+  // ADJUDICATED (round 10, F2): a VAD chunk that ERRORS and is dropped contributes
+  // an UNKNOWN (`None`) schedule, not a missing coordinate -- and under the
+  // absorbing-`None` schedule law that taints the whole run's schedule to `None`,
+  // distinct from the surviving chunks' hand-selected `[1, 2]`. A run that lost a
+  // chunk cannot report a fully-known ordered worker attribution.
+  //
+  // Same 3-chunk audio as `vad_chunked_transcribe_reanchors_and_merges`, but
+  // chunk 0's first decode_step fails (`fail_on_call(1)`), so its whole run errors
+  // and the VAD branch drops it; chunks 1 and 2 replay the script from their own
+  // resets and survive with known coordinates [1] and [2].
+  //
+  // Mutation proof: seed the schedule fold from the merged survivors (hand-select
+  // the successes) instead of folding the errored chunk's `None`, and this reads
+  // back `Some([1, 2])` instead of the adjudicated `None`.
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(48_000));
+  let hello = t.encode(" Hello").unwrap()[0];
+  script_clean_window(&mut mock, hello);
+  mock.fail_on_call(1); // chunk 0's first decode_step errors -> its run is dropped
+  let kit = WhisperKit::with_backend(mock, t);
+  let mut audio = vec![0.1f32; 96_000];
+  audio[32_000..35_200].fill(0.0);
+  audio[64_000..67_200].fill(0.0);
+  let options = DecodingOptions::new().with_chunking_strategy(ChunkingStrategy::Vad);
+  let result = kit.transcribe(&audio, &options).unwrap();
+  assert_eq!(
+    result.text(),
+    "Hello Hello",
+    "chunk 0 errored and was dropped; only chunks 1 and 2 survive",
+  );
+  assert_eq!(
+    result.task_facts().worker_schedule(),
+    None,
+    "an errored chunk taints the ordered schedule to unknown -- NOT the survivors' [1, 2]",
+  );
 }
 
 #[test]
@@ -2136,50 +2184,66 @@ fn predicted_language_survives_an_errored_vad_chunk_drop() {
 }
 
 #[test]
-fn recover_vad_run_facts_keeps_the_earliest_ingested_language() {
-  // F3 (codex round 9), the VAD facts combination in isolation. A two-chunk VAD
-  // history with DIFFERENT per-chunk languages cannot be scripted through the
-  // step-replaying MockBackend (each chunk replays the SAME script), so the
-  // combination is pinned directly. The shared sink observed chunk 1's "es" —
-  // which then errored and was dropped — BEFORE the surviving chunk 2's "fr".
-  // Seeding the fold FROM the sink keeps the earliest genuine observation; the
-  // surviving merge still contributes its worker schedule and id span.
+fn recover_vad_run_facts_carries_sink_facts_with_explicit_schedule_and_span() {
+  // Round 10 refactor (extends codex round 9's F3). `recover_vad_run_facts` takes
+  // the sink's error-fragile facts VERBATIM — draw, early-stop, and the run's
+  // FIRST-observed language (the sink accumulated these across every chunk in
+  // ingestion order, a dropped chunk's "es" included, so no later survivor can
+  // overwrite it) — and sets the worker schedule and decoded span EXPLICITLY.
+  // Under the absorbing-None laws (F2/F3) the sink's own None schedule/span can no
+  // longer be merged from the survivors without absorbing them, so the caller
+  // hands them in: the schedule it folded over all chunks, and the merged
+  // surviving result's own span.
   //
-  // Mutation proof: fold the sink LAST instead (`merged.merge(&sink)`) and the
-  // language reads back Some("fr").
+  // Mutation proof: swap the two `with_*` calls in `recover_vad_run_facts` for a
+  // `merge` of a survivor-facts record and the explicit schedule/span are
+  // absorbed to None under the round-10 laws.
   let sink = TaskFacts::observed_clean().with_observed_language(Some("es".into()));
-  let merged = TaskFacts::observed_clean()
-    .with_observed_language(Some("fr".into()))
-    .with_worker(1)
-    .with_decoded_span(Some(1));
-  let facts = recover_vad_run_facts(sink, &merged, true);
+  let facts = recover_vad_run_facts(sink, Some(vec![1]), Some(1));
   assert_eq!(
     facts.observed_language(),
     Some("es"),
-    "the earliest ingested language wins over a later survivor's",
+    "the sink's earliest ingested language is carried, even from a dropped chunk",
+  );
+  assert_eq!(facts.drew_from_rng(), Some(false), "and its draw watch");
+  assert_eq!(
+    facts.early_stopped(),
+    Some(false),
+    "and its early-stop watch"
   );
   assert_eq!(
     facts.worker_schedule(),
     Some([1].as_slice()),
-    "the surviving merge's worker schedule is kept",
+    "the caller-folded schedule is set explicitly, not absorbed to None",
   );
-  assert_eq!(facts.decoded_span(), Some(1), "and its id span");
+  assert_eq!(
+    facts.decoded_span(),
+    Some(1),
+    "and the merged surviving result's id span, likewise",
+  );
 }
 
 #[test]
-fn recover_vad_run_facts_keeps_a_zero_survivor_run_observed_clean() {
-  // F4 (codex round 9), the VAD facts combination in isolation. A genuine
-  // zero-chunk run: the sink is observed_clean (Some(false)/Some(false) — the run
-  // watched and saw no draw or truncation) but the empty result merge folds to
-  // unknown(). Folding that unknown() in — either order, the Kleene OR is
-  // commutative — poisons the sink's Some(false) to None and turns a run that did
-  // NOTHING non-reproducible. With no survivors the sink's seed is kept verbatim.
+fn recover_vad_run_facts_keeps_a_zero_chunk_run_clean_and_known_empty() {
+  // F4 (codex round 9) + round 10 (F2), the VAD facts assembly in isolation for a
+  // genuine zero-chunk run. The sink is observed_clean (Some(false)/Some(false) —
+  // the run watched and saw no draw or truncation), the caller folds the schedule
+  // to the known-empty Some([]) (zero chunks = zero workers OBSERVED), and the
+  // empty merge carries no span (None). The record stays reproducible AND records
+  // a KNOWN-empty schedule, distinct from the unknown None a run that cannot see
+  // its workers would carry.
   //
-  // Mutation proof: drop the `had_survivors` guard (always fold) and both
-  // booleans read back None, so is_reproducible_under(false) flips to false.
-  let facts = recover_vad_run_facts(TaskFacts::observed_clean(), &TaskFacts::unknown(), false);
+  // Mutation proof: pass `None` for the schedule (the pre-round-10 zero-chunk
+  // value) and the known-empty assertion below fails.
+  let facts = recover_vad_run_facts(TaskFacts::observed_clean(), Some(Vec::new()), None);
   assert_eq!(facts.drew_from_rng(), Some(false));
   assert_eq!(facts.early_stopped(), Some(false));
+  let known_empty: &[usize] = &[];
+  assert_eq!(
+    facts.worker_schedule(),
+    Some(known_empty),
+    "a zero-chunk run KNOWS zero workers ran -- Some([]), never unknown None",
+  );
   assert!(
     facts.is_reproducible_under(false),
     "a zero-chunk run drew nothing and was truncated by nothing -- reproducible",
@@ -2220,13 +2284,27 @@ fn vad_run_with_zero_chunks_is_known_clean_not_unknown() {
     Some(false),
     "and was truncated by nothing",
   );
+  // The run KNOWS zero workers ran: a known-empty schedule Some([]), the identity
+  // of the merge law, NOT the unknown None a run that cannot see its workers
+  // carries (round 10, F2). Result AND provenance carry it.
+  let known_empty: &[usize] = &[];
+  assert_eq!(
+    result.task_facts().worker_schedule(),
+    Some(known_empty),
+    "a zero-chunk VAD run observed zero workers -- Some([]), never unknown None",
+  );
+  let provenance = crate::provenance::Provenance::for_result(
+    &options,
+    &crate::options::ComputeOptions::new(),
+    &result,
+  );
+  assert_eq!(
+    provenance.task_facts().worker_schedule(),
+    Some(known_empty),
+    "and provenance carries the known-empty schedule verbatim",
+  );
   assert!(
-    crate::provenance::Provenance::for_result(
-      &options,
-      &crate::options::ComputeOptions::new(),
-      &result,
-    )
-    .is_reproducible(),
+    provenance.is_reproducible(),
     "a zero-chunk run did nothing to redo -- reproducible",
   );
 }

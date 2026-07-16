@@ -1367,35 +1367,37 @@ impl<B> WhisperKit<B> {
   }
 }
 
-/// Combines the shared fact `sink` a VAD run accumulated across EVERY chunk —
-/// dropped-because-errored ones included — with the `merged` result's own facts
-/// from the SURVIVING chunks, into the record the merged transcript carries.
+/// Assembles the record a VAD-merged transcript carries from the run's three
+/// fact sources: the shared `sink`, the run's derived `worker_schedule`, and the
+/// merged surviving result's `decoded_span`.
 ///
-/// The `sink` is the FOLD BASE, not a trailing contributor (codex round 9): it
-/// watched every chunk in ingestion order, so
+/// The `sink` is authoritative for the run's error-fragile facts (codex rounds
+/// 4–9): it accumulated the per-attempt draw, early-stop, and language of EVERY
+/// chunk in ingestion order — dropped-because-errored ones included, captured
+/// before their error could propagate — so its Kleene-OR'd draw/early-stop and
+/// its FIRST-observed language are already the whole run's. A chunk that observed
+/// `es` then errored and was dropped keeps `es` over a later surviving chunk's
+/// `fr` (F3), and a genuine zero-survivor run keeps the sink's own observed-clean
+/// `Some(false)` draw/early-stop rather than the `unknown()` an empty merge folds
+/// to (F4). Those facts are taken from the sink verbatim; the merged surviving
+/// result carries no draw/early-stop/language the sink has not already seen.
 ///
-/// - its first-observed language wins over a LATER surviving chunk's — a chunk
-///   that observed `es` then errored and was dropped keeps `es` even when a later
-///   surviving chunk observed `fr` (F3). Folding the sink LAST instead let the
-///   survivor's `fr` win, because [`TaskFacts::merge`]'s language law keeps
-///   `self`'s observation and takes `other`'s only when absent.
-/// - a genuine ZERO-survivor run keeps the sink's own seed verbatim rather than
-///   the `unknown()` an empty [`merge_transcription_results_with_options`] folds
-///   to. Folding that `unknown()` in — in EITHER order, the Kleene OR is
-///   commutative — poisons the sink's observed-clean `Some(false)` draw and
-///   early-stop to `None` (`kleene_or(Some(false), None) == None`), turning a run
-///   that did NOTHING conservatively non-reproducible (F4). `had_survivors`
-///   guards that fold: an empty merge has no worker schedule or id span to
-///   contribute anyway, the only two facts the sink never tracks.
-fn recover_vad_run_facts(sink: TaskFacts, merged: &TaskFacts, had_survivors: bool) -> TaskFacts {
-  let mut facts = sink;
-  if had_survivors {
-    // The sink already carries the whole run's draw, early-stop, and
-    // first-observed language; this fold adds only the surviving chunks' worker
-    // schedule and id span (which the sink leaves `None`).
-    facts.merge(merged);
-  }
-  facts
+/// The `worker_schedule` and `decoded_span` are set EXPLICITLY rather than merged
+/// from the surviving result (round 10 refactor): under the absorbing-`None`
+/// schedule/span laws (F2/F3) the sink's stripped `None`s would otherwise ABSORB
+/// the merged `Some`s away. The `worker_schedule` is the aggregate the caller
+/// folded over ALL chunks (a dropped chunk's coordinate never reached a result,
+/// so it taints the ordered schedule to `None`; zero chunks record the known-empty
+/// `Some([])`), and the `decoded_span` is the merged surviving result's own — the
+/// id-ordinal count its segments consumed, which drives a staged re-merge's ids.
+fn recover_vad_run_facts(
+  sink: TaskFacts,
+  worker_schedule: Option<Vec<usize>>,
+  decoded_span: Option<usize>,
+) -> TaskFacts {
+  sink
+    .with_worker_schedule(worker_schedule)
+    .with_decoded_span(decoded_span)
 }
 
 impl<B> WhisperKit<B>
@@ -1515,8 +1517,10 @@ where
       // reading `detected_language == None` for a run that plainly observed one,
       // or claiming reproducibility for a callback-truncated run (coremlit issue
       // #14, codex rounds 4–6 — the early-stop recovery is the round-6 R6-F1
-      // addition). The worker schedule and id span come from the SURVIVING chunks
-      // via the merge, never through this sink.
+      // addition). Neither the worker schedule nor the id span rides this sink:
+      // the schedule is folded over EVERY chunk separately (below, so an errored
+      // chunk taints it to the adjudicated `None`, round 10 F2), and the id span
+      // is the merged surviving result's own.
       //
       // Seeded **observed-clean** like the per-run sink (codex round 8, F3): the
       // VAD run as a whole is watching every chunk, so before any chunk draws it
@@ -1526,17 +1530,33 @@ where
       // the merged record below even when that chunk errored and was dropped.
       let facts_sink = Mutex::new(TaskFacts::observed_clean());
       let mut chunk_results = Vec::with_capacity(chunks.len());
+      // The worker schedule is folded over EVERY chunk through the fixed merge law
+      // (round 10, F2), seeded known-empty (`Some([])`): a surviving chunk
+      // contributes its known coordinate `[chunk_index]`, and a chunk that errored
+      // and was dropped contributes an UNKNOWN schedule (`None`) that — the
+      // schedule law being absorbing-`None` — taints the ordered aggregate to
+      // `None` rather than letting the survivors pass for the whole schedule. Zero
+      // chunks keep the `Some([])` seed: the run observed zero workers. This fact
+      // cannot ride the per-attempt `facts_sink` (that would duplicate a
+      // coordinate per fallback), so it is derived here where every chunk's fate
+      // is visible.
+      let mut schedule = TaskFacts::unknown().with_worker_schedule(Some(Vec::new()));
       for (chunk_index, chunk) in chunks.iter().enumerate() {
         let outcome = TranscribeTask::new(&self.backend, &self.tokenizer)
           .with_window_id_offset(chunk_index)
           .with_facts_sink(&facts_sink)
           .run(chunk.samples_slice(), &chunk_options);
-        if let Ok(mut result) = outcome {
+        let coordinate = if let Ok(mut result) = outcome {
           chunker::apply_result_seek_offset(&mut result, chunk.seek_offset());
           chunk_results.push(result);
-        }
-        // An errored chunk is dropped here, but its error-fragile facts already
-        // reached the sink above — the drop cannot erase them.
+          TaskFacts::unknown().with_worker(chunk_index)
+        } else {
+          // An errored chunk is dropped here — its error-fragile draw/early-stop/
+          // language already reached the sink before the error, but its coordinate
+          // never reached a result, so its schedule contribution is unknown.
+          TaskFacts::unknown()
+        };
+        schedule.merge(&coordinate);
       }
       // `_with_options`, not the plain merge: the blank-audio drop can
       // empty a whole chunk (a wholly-silent one decodes to nothing but
@@ -1549,20 +1569,22 @@ where
       // decode from disagreeing; every chunk is still merged, so no chunk's
       // timings leave the sums.
       let mut merged = merge_transcription_results_with_options(&chunk_results, options);
-      // Recover the shared sink's run-wide facts onto the merged record. The sink
-      // is the FOLD BASE (codex round 9): it watched every chunk in ingestion
-      // order — dropped-because-errored ones included — so its first-observed
-      // language must win over a later surviving chunk's (F3), and its
-      // observed-clean draw/early-stop watch must survive a zero-survivor run
-      // rather than being poisoned to unknown by the empty merge's `unknown()`
-      // (F4). The merged result contributes only the surviving chunks' worker
-      // schedule and id span, folded on when a chunk survived; see
+      // Assemble the merged record's facts (round 10 refactor of codex rounds
+      // 4–9's VAD recovery): the shared sink is authoritative for the
+      // error-fragile draw/early-stop/language it watched across EVERY chunk
+      // (dropped ones included), while the worker schedule folded over all chunks
+      // above and the merged surviving result's own decoded span are set
+      // explicitly — the absorbing-`None` schedule/span laws (F2/F3) mean the
+      // sink's stripped `None`s would otherwise absorb them away. See
       // [`recover_vad_run_facts`].
       let sink_facts = facts_sink
         .into_inner()
         .unwrap_or_else(PoisonError::into_inner);
-      let recovered =
-        recover_vad_run_facts(sink_facts, merged.task_facts(), !chunk_results.is_empty());
+      let recovered = recover_vad_run_facts(
+        sink_facts,
+        schedule.worker_schedule().map(|s| s.to_vec()),
+        merged.task_facts().decoded_span(),
+      );
       *merged.task_facts_mut() = recovered;
       return Ok(merged);
     }
