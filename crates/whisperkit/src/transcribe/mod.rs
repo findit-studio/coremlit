@@ -69,7 +69,10 @@
 //! the full reasoning.
 
 use std::{
-  sync::atomic::{AtomicBool, Ordering},
+  sync::{
+    Mutex, PoisonError,
+    atomic::{AtomicBool, Ordering},
+  },
   time::Instant,
 };
 
@@ -157,6 +160,18 @@ pub struct TranscribeTask<'ctx, B> {
   /// chunk's error directly rather than dropping it, so `run` latches into a
   /// task-local flag instead.
   sampled_sink: Option<&'ctx AtomicBool>,
+  /// Optional caller-owned first-observation sink [`Self::run`] records this
+  /// task's genuine language observation into, the instant a probe settles
+  /// inside `decode_with_fallback` — *before* any error can propagate out. Same
+  /// shape and rationale as [`Self::sampled_sink`]: [`WhisperKit::transcribe`]'s
+  /// VAD branch installs one shared slot across its chunks so a chunk whose
+  /// probe detected a language and whose main decode then ERRORED and was
+  /// dropped still contributes that detection to the merged transcript's
+  /// [`TranscriptionResult::detected_language`] — whose own contract forbids
+  /// reading `None` when a window genuinely observed a language (codex round 5).
+  /// First observation wins; `None` on the non-VAD/`transcribe_all` paths, which
+  /// surface a chunk's error directly rather than dropping it.
+  observed_language_sink: Option<&'ctx Mutex<Option<String>>>,
 }
 
 impl<'ctx, B> TranscribeTask<'ctx, B> {
@@ -170,6 +185,7 @@ impl<'ctx, B> TranscribeTask<'ctx, B> {
       progress_callback: None,
       window_id_offset: 0,
       sampled_sink: None,
+      observed_language_sink: None,
     }
   }
 
@@ -182,6 +198,21 @@ impl<'ctx, B> TranscribeTask<'ctx, B> {
   #[inline(always)]
   pub(crate) const fn with_sampled_sink(mut self, sink: &'ctx AtomicBool) -> Self {
     self.sampled_sink = Some(sink);
+    self
+  }
+
+  /// Installs a caller-owned first-observation slot that [`Self::run`] records
+  /// this task's genuine language observation into before any error propagates
+  /// — see the field's own doc. `pub(crate)`: only [`WhisperKit::transcribe`]'s
+  /// VAD branch needs it, to keep a dropped-because-errored chunk's detection
+  /// from vanishing from the merged transcript's detected language.
+  #[must_use]
+  #[inline(always)]
+  pub(crate) const fn with_observed_language_sink(
+    mut self,
+    sink: &'ctx Mutex<Option<String>>,
+  ) -> Self {
+    self.observed_language_sink = Some(sink);
     self
   }
 
@@ -922,6 +953,21 @@ where
       // draw still decides which attempt is kept. A zero-iteration decode at a
       // non-zero temperature never draws, so it correctly leaves this unset.
       sampled_sink.fetch_or(sampler.drew_from_rng(), Ordering::Relaxed);
+      // Record this task's genuine observation into the caller's sink BEFORE the
+      // same `?` (codex round 5). The probe above may have detected a language
+      // and set `*observed_language`; if `decode_text` just errored, this whole
+      // `run` errors and the VAD branch DROPS the chunk, so without capturing it
+      // here that detection vanishes and the merged transcript reads
+      // `detected_language == None` for a run that plainly observed one. First
+      // observation wins across chunks, mirroring the merge's own rule.
+      if let Some(sink) = self.observed_language_sink
+        && let Some(observed) = observed_language.as_deref()
+      {
+        let mut slot = sink.lock().unwrap_or_else(PoisonError::into_inner);
+        if slot.is_none() {
+          *slot = Some(observed.to_string());
+        }
+      }
       let result = outcome?;
 
       // TranscribeTask.swift:198 — snapshot THIS attempt's alignment
@@ -1377,18 +1423,26 @@ where
       // chunk's unseeded sample and may land different surviving text (F3,
       // codex round 4).
       let sampled = AtomicBool::new(false);
+      // Same shape as `sampled`, for the genuine language observation: a chunk
+      // whose probe detected a language then errored and was dropped would
+      // otherwise leave the merged transcript's `detected_language` reading
+      // `None` for a run that plainly observed one (F3, codex round 5). First
+      // observation across chunks wins.
+      let observed_language: Mutex<Option<String>> = Mutex::new(None);
       let mut chunk_results = Vec::with_capacity(chunks.len());
       for (chunk_index, chunk) in chunks.iter().enumerate() {
         let outcome = TranscribeTask::new(&self.backend, &self.tokenizer)
           .with_window_id_offset(chunk_index)
           .with_sampled_sink(&sampled)
+          .with_observed_language_sink(&observed_language)
           .run(chunk.samples_slice(), &chunk_options);
         if let Ok(mut result) = outcome {
           chunker::apply_result_seek_offset(&mut result, chunk.seek_offset());
           chunk_results.push(result);
         }
-        // An errored chunk is dropped here, but its draws already reached
-        // `sampled` via the sink above — the drop cannot erase the fact.
+        // An errored chunk is dropped here, but its draws and its language
+        // observation already reached the sinks above — the drop cannot erase
+        // either fact.
       }
       // `_with_options`, not the plain merge: the blank-audio drop can
       // empty a whole chunk (a wholly-silent one decodes to nothing but
@@ -1406,6 +1460,19 @@ where
       // errored chunk's draw into the result.
       if sampled.load(Ordering::Relaxed) {
         merged.set_sampled_at_nonzero_temperature();
+      }
+      // Fill the merged observation from the shared slot only when the surviving
+      // chunks contributed none: the merge already records the FIRST surviving
+      // chunk's observation, so this carries a detection that lived ONLY in a
+      // dropped-because-errored chunk (F3, codex round 5). Fill-if-absent, never
+      // override — monotone, exactly like the sampling latch above.
+      if merged.detected_language().is_none()
+        && let Some(observed) = observed_language
+          .lock()
+          .unwrap_or_else(PoisonError::into_inner)
+          .take()
+      {
+        merged.set_detected_language(observed);
       }
       return Ok(merged);
     }

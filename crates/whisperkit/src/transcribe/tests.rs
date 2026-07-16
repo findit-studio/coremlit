@@ -1740,3 +1740,53 @@ fn unseeded_draw_survives_an_errored_vad_chunk_drop() {
     "an unseeded draw happened (in a dropped chunk), so the transcript is not reproducible"
   );
 }
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn probe_detection_survives_an_errored_vad_chunk_drop() {
+  // F3 (codex round 5), the same loss shape as the RNG-draw sink above. A VAD
+  // chunk's language probe genuinely detects Spanish (call 1), then the main
+  // decode errors (call 2), so the whole `run` errors and the VAD branch DROPS
+  // the chunk. The detection must still reach the merged transcript:
+  // `decode_with_fallback` records it into a sink the VAD branch owns across
+  // chunks BEFORE the error can propagate. Pre-fix the observation lived only in
+  // the dropped chunk's discarded `run`, so the merged result read
+  // `detected_language == None` -- violating that field's own contract for a run
+  // that plainly observed "es".
+  let t = tiny_tokenizer();
+  let s = special();
+  let es = t.token_to_id("<|es|>").unwrap();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(32_000));
+  // Call 1 is the probe: its language-filtered argmax is <|es|>. Call 2 is the
+  // main decode's first step, scripted to fail -> the chunk's whole run errors.
+  mock.push_token_steps(&[es, 1002, 2425, s.end_token()]);
+  mock.fail_on_call(2);
+  let kit = WhisperKit::with_backend(mock, t);
+  // Empty language + multilingual + detect_language -> the probe runs.
+  let options = DecodingOptions::new()
+    .with_chunking_strategy(ChunkingStrategy::Vad)
+    .with_detect_language();
+
+  // 40_000 samples > one 32_000-sample window -> the VAD branch; one voiced
+  // chunk that probes (call 1, detects "es") then errors (call 2) and is dropped.
+  let result = kit.transcribe(&vec![0.1; 40_000], &options).unwrap();
+  assert!(
+    result.segments_slice().is_empty(),
+    "the errored chunk was dropped, so nothing survives"
+  );
+  assert_eq!(
+    result.detected_language(),
+    Some("es"),
+    "the dropped chunk's probe detection must survive into the merged result"
+  );
+  assert_eq!(
+    crate::provenance::Provenance::for_result(
+      &options,
+      &crate::options::ComputeOptions::new(),
+      &result,
+    )
+    .detected_language(),
+    Some("es"),
+    "and provenance records the detection the dropped chunk made"
+  );
+}
