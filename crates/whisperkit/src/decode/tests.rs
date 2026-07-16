@@ -176,10 +176,11 @@ fn negative_temperature_decode_with_timestamp_filter_does_not_panic() {
 
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
-fn language_observed_only_for_a_decoded_language_token() {
-  // F3 (codex round 3). The `language_observed` fact is `true` ONLY when a
-  // `<|lang|>` token is actually decoded: a CONFIGURED language and the "en"
-  // fallback are copied/defaulted, not detected, so the pipeline records no
+fn language_observed_only_for_a_predicted_language_token() {
+  // F2 (codex round 4). The `language_observed` fact is `true` ONLY when the
+  // model PREDICTS a `<|lang|>` token at a position at/after the forced prompt:
+  // a CONFIGURED language, the "en" fallback, and a FORCED prefill `<|lang|>`
+  // are all inputs/defaults, not detections, so the pipeline records no
   // observation for them.
   let t = tiny_tokenizer();
   let s = special();
@@ -215,24 +216,57 @@ fn language_observed_only_for_a_decoded_language_token() {
     "a configured language is copied, not detected"
   );
 
-  // Branch 2 -- DECODED token: empty configured language, and <|en|> appears in
-  // the decoded tokens (forced by the default multilingual prefill), so it IS
-  // observed. Same known-good script as `loop_forces...` above.
+  // Branch 2 -- FORCED prompt token, NOT predicted (F2, codex round 4): the
+  // default multilingual prefill FORCES `<|en|>` into the prompt, and the
+  // model predicts only text/timestamps after it -- no `<|lang|>` token in the
+  // predicted region. The forced token is an INPUT, not a detection, so it
+  // must NOT be observed, even though it IS the Swift-faithful display
+  // language. (Pre-fix this asserted `true`: the mislabeled targeting test
+  // called the forced token "decoded" and scanned the full prompt+output
+  // slice, so it could not fail on the bug it existed to catch.)
   let mut mock = MockBackend::new();
   mock.push_token_steps(&[
-    s.english_token(),
-    s.transcribe_token(),
-    s.time_token_begin(),
-    2425,
+    s.english_token(),    // pos 0 prediction: overridden by prompt[1]
+    s.transcribe_token(), // overridden by prompt[2]
+    s.time_token_begin(), // overridden by prompt[3]
+    2425,                 // first PREDICTED token -- text, not a language token
     1002,
     s.time_token_begin() + 50,
     s.end_token(),
   ]);
-  let observed = run_mock(&mock, &default_prompt(&s), &DecodingOptions::new(), &t);
-  assert_eq!(observed.language(), "en");
+  let forced = run_mock(&mock, &default_prompt(&s), &DecodingOptions::new(), &t);
+  assert_eq!(
+    forced.language(),
+    "en",
+    "forced <|en|> is still the display language"
+  );
   assert!(
-    observed.language_observed(),
-    "a decoded <|lang|> token is a genuine detection"
+    !forced.language_observed(),
+    "a FORCED prefill <|en|> is an input, not a detection -- never observed"
+  );
+
+  // Branch 2b -- GENUINELY PREDICTED token (F2, codex round 4): a bare `[SOT]`
+  // prompt (nothing forced past it) with `without_timestamps` (so no
+  // `TimestampRulesFilter` masks the language token at the sampling position),
+  // and the model PREDICTS `<|es|>` at the first free position. That prediction
+  // sits at/after `initial_prompt_index`, so it IS a genuine observation. This
+  // is the case a broken "always false" over-correction would fail on.
+  let mut mock = MockBackend::new();
+  mock.push_token_steps(&[es, 2425, s.end_token()]);
+  let predicted = run_mock(
+    &mock,
+    &[s.start_of_transcript_token()],
+    &DecodingOptions::new().with_without_timestamps(),
+    &t,
+  );
+  assert_eq!(
+    predicted.language(),
+    "es",
+    "the predicted <|es|> is the display language"
+  );
+  assert!(
+    predicted.language_observed(),
+    "a <|lang|> token PREDICTED after the prompt is a genuine detection"
   );
 
   // Branch 3 -- FALLBACK: empty configured language and NO <|lang|> token in
@@ -256,6 +290,39 @@ fn language_observed_only_for_a_decoded_language_token() {
   assert!(
     !fallback.language_observed(),
     "the \"en\" fallback is a default, not a detection"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn zero_iteration_decode_forces_english_but_observes_nothing() {
+  // F2 (codex round 4). A `sample_length` of 0 runs ZERO decode iterations, so
+  // `current_tokens` stays exactly the forced multilingual prefill
+  // `[SOT, <|en|>, <|transcribe|>, <|0.00|>]` -- the model predicts nothing at
+  // all. The display language is still the Swift-faithful `<|en|>` off that
+  // forced prompt, but nothing was OBSERVED: the predicted region is empty.
+  // Pre-fix, finalization scanned the whole prompt+output slice and reported
+  // the FORCED `<|en|>` as observed, so a zero-step decode fabricated an
+  // English detection.
+  let t = tiny_tokenizer();
+  let s = special();
+  let mut mock = MockBackend::new();
+  mock.push_token_step(2425); // never reached: the loop runs 0 times
+  let result = run_mock(
+    &mock,
+    &default_prompt(&s),
+    &DecodingOptions::new().with_sample_length(0),
+    &t,
+  );
+  assert_eq!(mock.counters().decode_steps(), 0, "zero decoder steps ran");
+  assert_eq!(
+    result.language(),
+    "en",
+    "the display language is the forced <|en|>"
+  );
+  assert!(
+    !result.language_observed(),
+    "a zero-iteration decode predicts nothing, so it observes no language"
   );
 }
 

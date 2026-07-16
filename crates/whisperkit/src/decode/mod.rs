@@ -422,11 +422,11 @@ where
   finalize_decoding_result(
     current_tokens,
     log_probs,
+    initial_prompt_index,
     first_token_log_prob,
     sampler,
     options,
     tokenizer,
-    &special,
   )
 }
 
@@ -436,12 +436,18 @@ where
 fn finalize_decoding_result(
   mut current_tokens: Vec<u32>,
   mut log_probs: Vec<f32>,
+  initial_prompt_index: usize,
   first_token_log_prob: f32,
   sampler: &GreedyTokenSampler,
   options: &DecodingOptions,
   tokenizer: &WhisperTokenizer,
-  special: &SpecialTokens,
 ) -> Result<DecodingResult, DecodeError> {
+  // Read off `tokenizer` rather than taking a redundant parameter — the
+  // caller's own `special` is `*tokenizer.special_tokens()`, so threading it
+  // in as well would only pad the argument list (F2 added `initial_prompt_index`,
+  // which would otherwise trip `clippy::too_many_arguments`).
+  let special = tokenizer.special_tokens();
+
   // :776 — appends EOT (+logprob 0.0) unless already present.
   sampler.finalize(&mut current_tokens, &mut log_probs);
 
@@ -493,17 +499,14 @@ fn finalize_decoding_result(
   // :802 — upstream TODO, never actually computed by Swift either.
   let no_speech_prob = 0.0;
 
-  // :804-826.
-  // `language_observed` is `true` ONLY in the decoded-`<|lang|>`-token branch:
-  // a configured language (Swift's `options.language != nil`) and the default
-  // fallback are NOT detections, so the pipeline records no observation for
-  // them (F3, codex round 3). Swift never drew this distinction — its
-  // `DecodingResult` carries no detection-provenance fact.
-  let (language, language_probs, language_observed) = if !options.language().is_empty() {
+  // :804-826 — the DISPLAY language: Swift takes `options.language`, else the
+  // FIRST recognized language token in the full SOT..=EOT slice — the forced
+  // prefill `<|lang|>` included — else the default. Kept byte-for-byte so
+  // `DecodingResult::language` stays Swift-faithful.
+  let (language, language_probs) = if !options.language().is_empty() {
     (
       options.language().to_string(),
       vec![(options.language().to_string(), 0.0)],
-      false,
     )
   } else {
     match filtered_tokens
@@ -514,14 +517,37 @@ fn finalize_decoding_result(
         let decoded = tokenizer.decode(&filtered_tokens[index..=index], false)?;
         let lang = text::trim_special_token_chars(&decoded).to_string();
         let prob = filtered_log_probs[index];
-        (lang.clone(), vec![(lang, prob)], true)
+        (lang.clone(), vec![(lang, prob)])
       }
       None => {
         let lang = DEFAULT_LANGUAGE_CODE.to_string();
-        (lang.clone(), vec![(lang, 0.0)], false)
+        (lang.clone(), vec![(lang, 0.0)])
       }
     }
   };
+
+  // The Rust-only detection fact (no Swift equivalent): `language_observed`
+  // is `true` ONLY when the model PREDICTED a `<|lang|>` token — one at a
+  // position at or after the forced prompt (`initial_prompt_index`), scanned
+  // OFF the raw `current_tokens` rather than the display slice above. The
+  // default multilingual prefill inserts `<|en|>` when no language is
+  // configured (`prefill_tokens`), and a direct [`decode_text`] caller may
+  // pass a `<|lang|>` token in `initial_prompt`; neither is a detection.
+  // Scanning only the predicted region is what stops a zero-iteration decode
+  // — which forces `<|en|>` into the prompt but predicts nothing — from
+  // fabricating an observation the pipeline would promote to a detected
+  // language (F2, codex round 4). A configured language is never an
+  // observation either. This distinction feeds
+  // `TranscriptionResult::detected_language`; the Swift-compat display above
+  // is untouched.
+  let language_observed = options.language().is_empty()
+    && current_tokens
+      .get(initial_prompt_index..)
+      .is_some_and(|predicted| {
+        predicted
+          .iter()
+          .any(|&t| tokenizer.all_language_tokens().contains(&t))
+      });
 
   // :828 — decoded with `skipSpecialTokens: false` regardless of
   // `options.skipSpecialTokens` (that option only ever gates the live

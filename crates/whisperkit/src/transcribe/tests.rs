@@ -473,6 +473,52 @@ fn detect_language_pinned_deviation_actually_runs_the_probe() {
 
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn genuine_observation_survives_a_later_failed_probe() {
+  // F2 (codex round 4), opposite direction of the zero-iteration bug. Window
+  // 1's probe genuinely detects Spanish; window 2's probe FAILS. A failed
+  // probe witnessed nothing, so it must NOT erase the earlier genuine
+  // observation -- first-genuine-observation wins. Pre-fix the failed probe
+  // cleared `observed_language` to `None`, and with the finalize fix in place
+  // window 2's forced default `<|en|>` no longer re-observes either, so the
+  // whole run reported NO detection even though window 1 plainly detected
+  // "es".
+  let t = tiny_tokenizer();
+  let s = special();
+  let es = t.token_to_id("<|es|>").unwrap();
+  let hello = t.encode(" Hello").unwrap()[0];
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  // script[0] = <|es|>: the probe's language filter picks it as the detected
+  // language. The main decode's prompt is then re-derived with a
+  // `<|transcribe|>` task token, so `TimestampRulesFilter` masks language
+  // tokens at the sampling position -- the decode itself predicts NO language
+  // token, making the probe the sole observation. The ts(50) pair ends each
+  // window and advances seek 1 s, giving two windows over 3 s of audio.
+  mock.push_token_steps(&[
+    es,
+    s.transcribe_token(),
+    ts(0),
+    hello,
+    ts(50),
+    ts(50),
+    s.end_token(),
+  ]);
+  // Window 1: probe = call 1 (succeeds, "es"), decode = calls 2..=8.
+  // Window 2: probe = call 9 -> scripted to fail; its decode (calls 10..=16)
+  // still runs. `fail_on_call` is reset-immune, so only window 2's probe fails.
+  mock.fail_on_call(9);
+  let options = DecodingOptions::new().with_detect_language();
+  let task = TranscribeTask::new(&mock, &t);
+  let result = task.run(&vec![0.1; 48_000], &options).unwrap();
+  assert_eq!(mock.counters().encode_calls(), 2, "two windows decoded");
+  assert_eq!(
+    result.detected_language(),
+    Some("es"),
+    "window 1's genuine detection must survive window 2's failed probe"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn transcribe_all_preserves_order_across_scoped_threads() {
   let t = tiny_tokenizer();
   // The mock's script cursor lives in each worker's OWN MockDecoderState

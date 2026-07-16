@@ -816,16 +816,23 @@ where
           Ok(probe) => {
             window_options.set_language(probe.language().to_string());
             *detected_language = Some(probe.language().to_string());
-            // A probe that ran IS a genuine detection (the F3 observation),
-            // even when it fell back to the default language.
-            *observed_language = Some(probe.language().to_string());
+            // A probe that ran IS a genuine detection (the observation), even
+            // when it fell back to the default language. FIRST genuine
+            // observation wins (matching the merge rule from round 3), so an
+            // earlier window's or attempt's observation is never overwritten
+            // by a later probe (F2, codex round 4).
+            if observed_language.is_none() {
+              *observed_language = Some(probe.language().to_string());
+            }
           }
           Err(_) => {
+            // DISPLAY: Swift's `try?` yields nil — last-write-wins.
             *detected_language = None;
-            // A failed probe witnessed nothing; the post-decode promotion
-            // below still sets the observation if a `<|lang|>` token is
-            // decoded.
-            *observed_language = None;
+            // OBSERVATION: a FAILED probe witnessed nothing, so it must NOT
+            // erase an earlier genuine observation (F2, codex round 4). Left
+            // untouched; the post-decode promotion below still records THIS
+            // attempt's own observation if its decode predicts a `<|lang|>`
+            // token.
           }
         }
         if options.use_prefill_prompt() {
@@ -873,11 +880,13 @@ where
       if detected_language.is_none() {
         *detected_language = Some(result.language().to_string());
       }
-      // The GENUINE observation (F3, codex round 3): promote ONLY when
-      // decode_text actually decoded a `<|lang|>` token. A configured language
-      // or the `"en"` fallback is not a detection, and leaves the observation
-      // as the probe set it (or `None`).
-      if result.language_observed() {
+      // The GENUINE observation: promote ONLY when decode_text actually
+      // PREDICTED a `<|lang|>` token (not the forced prefill `<|en|>`, and not
+      // a configured/`"en"`-fallback display language — F2, codex round 4).
+      // FIRST genuine observation wins, so a later window/attempt cannot
+      // overwrite an earlier detection and a failed probe's cleared display
+      // does not drag the observation down with it.
+      if result.language_observed() && observed_language.is_none() {
         *observed_language = Some(result.language().to_string());
       }
 
