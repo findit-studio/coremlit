@@ -10,10 +10,13 @@ fn merged(a: &TaskFacts, b: &TaskFacts) -> TaskFacts {
 
 /// A deliberately varied corpus spanning every field's interesting states:
 /// each explicit-unknown boolean at all THREE of its values (`None`,
-/// `Some(false)`, `Some(true)`) so the OR-lifted-over-unknown merge is exercised
-/// across every mix; three languages plus the unknown; known
-/// single/empty/unknown schedules; and tracked/untracked spans — including the
-/// `unknown()` identity and an all-dropped-style `[]` schedule.
+/// `Some(false)`, `Some(true)`) and — since the Kleene OR came apart from the
+/// pre-round-8 free monoid on exactly the `Some(false)`/`None` mixes — both
+/// booleans crossed at every combination that matters (`(T, F)`, `(T, T)`,
+/// `(None, F)`); three languages plus the unknown; known single/empty/unknown
+/// schedules; and tracked/untracked spans — including the `unknown()` value and
+/// an all-dropped-style `[]` schedule. The `N` elements below drive the
+/// `N`-cubed associativity proof of [the Kleene contributor merge](TaskFacts::merge).
 fn corpus() -> Vec<TaskFacts> {
   vec![
     TaskFacts::unknown(),
@@ -45,15 +48,35 @@ fn corpus() -> Vec<TaskFacts> {
     // A merge of zero workers (an empty-but-known schedule), distinct from the
     // unknown schedule above.
     TaskFacts::unknown().with_worker_schedule(Some(Vec::new())),
+    // Kleene-cross additions (codex round 8): a drew-`true`/stop-`false` run, a
+    // drew-`true`/stop-`true` run, and a `None`-draw/`Some(false)`-stop record —
+    // the mixes on which `Some(false) | None = None` diverges from the old
+    // `Some(false)`-as-identity monoid, so associativity is re-proved across them.
+    TaskFacts::unknown()
+      .with_drew_from_rng(true)
+      .with_early_stopped(false)
+      .with_worker(5),
+    TaskFacts::unknown()
+      .with_drew_from_rng(true)
+      .with_early_stopped(true)
+      .with_observed_language(Some("de".to_string()))
+      .with_decoded_span(Some(4)),
+    TaskFacts::unknown()
+      .with_early_stopped(false)
+      .with_worker(6),
   ]
 }
 
 #[test]
 fn merge_is_associative_over_three_children() {
-  // THE property (coremlit issue #14, codex round 6): a one-shot merge and a
-  // staged merge -- the VAD-result-then-streaming-finalize shape -- must agree.
-  // `(a . b) . c == a . (b . c)` for every triple in the corpus, unknown-state
-  // and empty-schedule children included.
+  // THE property (coremlit issue #14, codex round 6; re-proved for the Kleene OR
+  // in round 8): a one-shot merge and a staged merge -- the
+  // VAD-result-then-streaming-finalize shape -- must agree. `(a . b) . c == a .
+  // (b . c)` for every triple in the corpus, unknown-state and empty-schedule
+  // children included. Kleene three-valued OR is itself associative, so swapping
+  // the free-monoid `or_unknown` for `kleene_or` preserves this even though it
+  // changed the `Some(false) | None` VALUE -- the Kleene-cross corpus additions
+  // exercise exactly those diverging mixes.
   let corpus = corpus();
   for a in &corpus {
     for b in &corpus {
@@ -70,54 +93,117 @@ fn merge_is_associative_over_three_children() {
 }
 
 #[test]
-fn unknown_is_the_merge_identity() {
+fn accumulator_empty_is_the_fold_identity() {
+  // The Accumulator -- NOT `unknown()` -- is the identity of a contributor fold
+  // (codex round 8, F2). `Empty` takes the first contributor verbatim, so no
+  // all-`None` `unknown()` boolean identity ever nulls a known `Some(false)`.
   for x in corpus() {
-    assert_eq!(merged(&TaskFacts::unknown(), &x), x, "left identity");
-    assert_eq!(merged(&x, &TaskFacts::unknown()), x, "right identity");
+    let mut acc = TaskFactsAccumulator::new();
+    acc.merge(&x);
+    assert_eq!(acc.into_facts(), x, "Empty is a verbatim left identity");
+  }
+  // Zero contributors fold to `unknown()` -- the honest "nothing observed".
+  assert_eq!(
+    TaskFactsAccumulator::new().into_facts(),
+    TaskFacts::unknown(),
+    "an empty fold is unknown, not observed-clean",
+  );
+  // A multi-contributor fold equals the left-fold that takes the first verbatim
+  // then merges the rest -- the exact shape `merge_results` relies on.
+  for a in &corpus() {
+    for b in &corpus() {
+      let mut acc = TaskFactsAccumulator::new();
+      acc.merge(a);
+      acc.merge(b);
+      assert_eq!(
+        acc.into_facts(),
+        merged(a, b),
+        "fold == verbatim-first then merge for a={a:?} b={b:?}",
+      );
+    }
   }
 }
 
 #[test]
-fn merge_ors_the_bools_over_the_explicit_unknown() {
-  let drew = TaskFacts::unknown().with_drew_from_rng(true);
-  let stopped = TaskFacts::unknown().with_early_stopped(true);
-  let both = merged(&drew, &stopped);
+fn unknown_is_not_the_merge_identity_for_an_observed_clean_fact() {
+  // The round-8 correction. Under the Kleene OR, `Some(false)` -- not `None` --
+  // is the boolean identity, so folding the all-`None` `unknown()` onto an
+  // observed-clean `Some(false)` NULLS it to unknown rather than preserving it.
+  // This is precisely why a contributor fold must seed from
+  // `TaskFactsAccumulator::Empty`, never from `unknown()`.
+  let clean = TaskFacts::observed_clean();
+  assert_eq!(clean.drew_from_rng(), Some(false));
+  assert_eq!(clean.early_stopped(), Some(false));
+  assert_eq!(
+    merged(&TaskFacts::unknown(), &clean).drew_from_rng(),
+    None,
+    "unknown() is NOT a left identity for an observed-clean draw",
+  );
+  assert_eq!(merged(&clean, &TaskFacts::unknown()).drew_from_rng(), None);
+
+  // It REMAINS an identity for the non-Kleene fields and for a `Some(true)` or
+  // `None` boolean, which the Kleene OR leaves unchanged beside a `None`.
+  let drew = TaskFacts::unknown()
+    .with_drew_from_rng(true)
+    .with_worker(2)
+    .with_decoded_span(Some(3));
+  assert_eq!(
+    merged(&TaskFacts::unknown(), &drew),
+    drew,
+    "None|Some(true)=Some(true), and worker/span/language keep None as identity",
+  );
+  assert_eq!(merged(&drew, &TaskFacts::unknown()), drew);
+}
+
+#[test]
+fn merge_ors_the_bools_by_the_kleene_table() {
+  // Pin the FULL Kleene three-valued OR the merge folds the draw/early-stop
+  // booleans with (codex round 8, F2). Vehicle: `drew_from_rng`, driven through
+  // the merge from every (self, other) pair. `Some(true)` absorbs, `Some(false)
+  // | Some(false)` stays `Some(false)`, and an unknown mixed with
+  // anything-but-true stays unknown -- INCLUDING the corrected `None |
+  // Some(false) = None` and `Some(false) | None = None`, the transitions the
+  // pre-round-8 free monoid (`None` as identity) wrongly pinned as `Some(false)`.
+  // That old oracle is deliberately replaced here, on codex round 8's authority:
+  // a child that cannot observe the draw must not certify the other's `false`.
+  let of = |b: Option<bool>| match b {
+    Some(v) => TaskFacts::unknown().with_drew_from_rng(v),
+    None => TaskFacts::unknown(),
+  };
+  let table = [
+    (Some(true), Some(true), Some(true)),
+    (Some(true), Some(false), Some(true)),
+    (Some(true), None, Some(true)),
+    (Some(false), Some(true), Some(true)),
+    (Some(false), Some(false), Some(false)),
+    (Some(false), None, None), // round-8 correction (was Some(false))
+    (None, Some(true), Some(true)),
+    (None, Some(false), None), // round-8 correction (was Some(false))
+    (None, None, None),
+  ];
+  for (a, b, expected) in table {
+    assert_eq!(
+      merged(&of(a), &of(b)).drew_from_rng(),
+      expected,
+      "kleene_or({a:?}, {b:?})",
+    );
+  }
+
+  // The same law reaches BOTH booleans independently: a drew-true merged with a
+  // stopped-true carries both `Some(true)`.
+  let both = merged(
+    &TaskFacts::unknown().with_drew_from_rng(true),
+    &TaskFacts::unknown().with_early_stopped(true),
+  );
   assert_eq!(both.drew_from_rng(), Some(true));
   assert_eq!(both.early_stopped(), Some(true));
 
-  // `None` is the identity: an unobserved child contributes nothing, so a true
-  // survives it on either side (OR, never last-write).
-  assert_eq!(
-    merged(&drew, &TaskFacts::unknown()).drew_from_rng(),
-    Some(true)
-  );
-  assert_eq!(
-    merged(&TaskFacts::unknown(), &drew).drew_from_rng(),
-    Some(true)
-  );
-
-  // Two observed values OR: `Some(true)` wins over `Some(false)`, and two
-  // `Some(false)` stay `Some(false)` — NOT collapsed back to the `None` unknown.
+  // `Some(false)` IS the OR identity (not `None`): a real greedy contributor
+  // folded beside a draw or another greedy behaves as OR.
   let greedy = TaskFacts::unknown().with_drew_from_rng(false);
+  let drew = TaskFacts::unknown().with_drew_from_rng(true);
   assert_eq!(merged(&greedy, &drew).drew_from_rng(), Some(true));
-  assert_eq!(merged(&drew, &greedy).drew_from_rng(), Some(true));
   assert_eq!(merged(&greedy, &greedy).drew_from_rng(), Some(false));
-
-  // The unknown stays unknown only when NO child observed the fact.
-  assert_eq!(
-    merged(&TaskFacts::unknown(), &TaskFacts::unknown()).drew_from_rng(),
-    None
-  );
-  // A `Some(false)` still overrides the `None` identity (it IS an observation).
-  assert_eq!(
-    merged(&TaskFacts::unknown(), &greedy).early_stopped(),
-    None,
-    "the other child observed nothing about early-stop"
-  );
-  assert_eq!(
-    merged(&TaskFacts::unknown(), &greedy).drew_from_rng(),
-    Some(false)
-  );
 }
 
 #[test]

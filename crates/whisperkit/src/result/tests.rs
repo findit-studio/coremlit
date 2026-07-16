@@ -457,6 +457,119 @@ fn merge_concatenates_worker_schedules_not_just_the_first() {
   );
 }
 
+#[test]
+fn plain_merge_completes_on_a_usize_max_segment_id_without_panicking() {
+  // F4 (codex round 8). The drop-OFF (plain) merge outputs ids as Swift's
+  // `result_index + segment_index` and NEVER consults the decoded span for the
+  // id mapping -- yet the task-facts fold still derives each child's effective
+  // span, where a hand-built `usize::MAX` segment id overflowed `max + 1` and
+  // panicked. The fold now records that unknowable span as `None` (untracked)
+  // instead of aborting, so the merge completes and the output id is the exact
+  // Swift ordinal 0.
+  //
+  // Mutation proof: revert `effective_decoded_span`'s `checked_add(1)` back to
+  // `.expect(...)` and this merge panics instead of completing.
+  let mut seg = TranscriptionSegment::new();
+  seg.set_id(usize::MAX).set_text(" X").set_tokens(vec![20]);
+  let adversarial = TranscriptionResult::new(" X", vec![seg], "en", TranscriptionTimings::new());
+
+  // The plain door (drop OFF): completes, and the single segment reindexes to
+  // Swift's `result_index(0) + segment_index(0) == 0`.
+  let merged = merge_transcription_results(std::slice::from_ref(&adversarial));
+  assert_eq!(
+    segment_ids(&merged),
+    vec![0],
+    "Swift-exact drop-OFF id is 0"
+  );
+  assert_eq!(
+    merged.task_facts().decoded_span(),
+    None,
+    "the overflowing extent is recorded untracked, not panicked on",
+  );
+
+  // The same through the confirmed-words door with `drop_blank_audio = false` --
+  // the default streaming finalize path, which also reaches the drop-OFF merge.
+  let confirmed = [WordTiming::new(" X", Vec::<u32>::new(), 0.0, 1.0, 1.0)];
+  let via_words = merge_transcription_results_with_words(
+    &[adversarial],
+    &confirmed,
+    &DecodingOptions::new().maybe_drop_blank_audio(false),
+  );
+  assert_eq!(
+    segment_ids(&via_words),
+    vec![0],
+    "the confirmed-words drop-OFF door completes identically",
+  );
+}
+
+#[test]
+#[should_panic(expected = "overflowed usize")]
+fn drop_on_merge_still_panics_on_a_usize_max_segment_id() {
+  // The drop-ON id mapping DOES drive an injective renumber off the span, so a
+  // hand-built `usize::MAX` id remains the documented DELIBERATE panic (it beats
+  // a silent wraparound into a colliding id). F4 loosened ONLY the drop-OFF fold,
+  // never this: the id-base advance turns the checked `None` span back into the
+  // same overflow panic the pre-fix `effective_decoded_span` raised.
+  let mut seg = TranscriptionSegment::new();
+  seg.set_id(usize::MAX).set_text(" X").set_tokens(vec![20]);
+  let adversarial = TranscriptionResult::new(" X", vec![seg], "en", TranscriptionTimings::new());
+  let _ = merge_transcription_results_with_options(&[adversarial], &DecodingOptions::new());
+}
+
+#[test]
+fn merging_an_unknown_facts_contributor_poisons_a_known_clean_result() {
+  // F2 (codex round 8), at the merge boundary. `None` is the epistemic unknown,
+  // NOT the OR identity: merging a contributor with genuinely-unknown
+  // draw/early-stop facts into a known-clean result must not read back
+  // observed-clean-and-reproducible. The pre-fix free monoid (`None` as
+  // identity) let `or_unknown(Some(false), None) = Some(false)`, so an unknown
+  // contributor vanished and the merge promised a byte-reproducibility neither
+  // result earned. Two mutations are caught here:
+  //   - seed the fold at `TaskFacts::unknown()` instead of the Accumulator, and
+  //     the LONE known-clean result nulls to `None` (the `solo` block fails);
+  //   - revert `kleene_or` to the free monoid, and the UNKNOWN contributor stops
+  //     poisoning, reading back `Some(false)`/reproducible (the `poisoned` block
+  //     fails).
+  let compute = crate::options::ComputeOptions::new();
+  let clean = TranscriptionResult::new(
+    "Hi",
+    vec![TranscriptionSegment::new()],
+    "en",
+    TranscriptionTimings::new(),
+  )
+  .with_task_facts(TaskFacts::observed_clean());
+  let unknown_contrib = TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
+    .with_task_facts(TaskFacts::unknown());
+
+  // A lone known-clean result stays observed-clean: the Accumulator takes it
+  // verbatim, NOT nulled by an `unknown()` fold seed.
+  let solo =
+    merge_transcription_results_with_options(std::slice::from_ref(&clean), &DecodingOptions::new());
+  assert_eq!(solo.task_facts().drew_from_rng(), Some(false));
+  assert_eq!(solo.task_facts().early_stopped(), Some(false));
+  assert!(
+    crate::provenance::Provenance::for_result(&DecodingOptions::new(), &compute, &solo)
+      .is_reproducible(),
+    "a lone observed-clean result is reproducible",
+  );
+
+  // Merge an UNKNOWN-facts contributor in: its `None` poisons the draw and
+  // early-stop to unknown, and the transcript is no longer promised reproducible.
+  let poisoned =
+    merge_transcription_results_with_options(&[clean, unknown_contrib], &DecodingOptions::new());
+  assert_eq!(
+    poisoned.task_facts().drew_from_rng(),
+    None,
+    "an unknown contributor's None poisons the known-clean draw (was wrongly Some(false))",
+  );
+  assert_eq!(poisoned.task_facts().early_stopped(), None);
+  assert!(
+    !crate::provenance::Provenance::for_result(&DecodingOptions::new(), &compute, &poisoned)
+      .is_reproducible(),
+    "the merge must not promise reproducibility once an unknown contributor joined",
+  );
+}
+
 /// A result carrying nothing but text — the shape `transcribe_all` returns
 /// for a chunk/clip whose segments were all emptied (or, independently of
 /// the blank-audio drop, for any clip shorter than `window_clip_time`).

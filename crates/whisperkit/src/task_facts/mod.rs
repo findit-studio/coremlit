@@ -43,12 +43,9 @@
 //! `""`-language, or the optimistic `drew = false` / `not-truncated` a default
 //! would forge.
 //!
-//! The distinction is not cosmetic: it separates two roles a single all-`false`
-//! record used to conflate.
+//! The distinction is not cosmetic, and it is why the merge is **Kleene**
+//! three-valued logic rather than a free monoid over `Option<bool>`.
 //!
-//! - As the **merge identity**, an unknown contributes nothing — the OR-of-bools
-//!   and the language/schedule/span folds all treat `None` as the neutral
-//!   element, which is what keeps [the merge law](TaskFacts::merge) associative.
 //! - As an **epistemic unknown**, an unknown boolean forces
 //!   [`is_reproducible_under`](TaskFacts::is_reproducible_under) to answer
 //!   CONSERVATIVELY: a record that cannot know whether a transcript-controlling
@@ -59,6 +56,28 @@
 //!   whose constructor cannot see the truncation (F1). Only a fact POSITIVELY
 //!   observed as `Some(false)` — the shape a real decode carries out of the
 //!   window loop — earns the optimistic answer.
+//! - Under [the merge law](TaskFacts::merge) the same unknown OR-s by
+//!   **Kleene's** rule (`kleene_or`): `Some(true)` absorbs, `Some(false) |
+//!   Some(false)` stays `Some(false)`, and an unknown mixed with
+//!   anything-but-true stays unknown (`None | Some(false) = None`) — a
+//!   contributor that cannot see the fact cannot certify the other's `false`.
+//!   The OR identity is therefore `Some(false)` (observed-clean), NOT `None`
+//!   (codex round 8, F2): the pre-round-8 free monoid that treated `None` as the
+//!   identity let `or_unknown(None, Some(false))` forge an observed-`false` out
+//!   of an unobserved contributor, so a merge of a genuinely-unknown record into
+//!   a known-clean one read back reproducible it never earned.
+//!
+//! Because `None` is no longer the OR identity, [`TaskFacts::unknown`] is no
+//! longer the identity of a CONTRIBUTOR fold either. A fold seeds from a
+//! separate "no contributor yet" (`TaskFactsAccumulator`) identity and takes the
+//! first contributor verbatim, so an all-unknown `unknown()` can never
+//! masquerade as the neutral element and silently null a known observation. A
+//! **real run** that is watching starts its own fact sink at
+//! [`TaskFacts::observed_clean`] (`Some(false)` for both booleans — it has
+//! POSITIVELY seen nothing happen yet), so a run that decodes no window at all
+//! keeps the reproducible `Some(false)`, while `unknown()` stays reserved for
+//! the hand-built, deserialized-absent, and segment-/options-only records that
+//! genuinely cannot see (codex round 8, F3).
 
 #[cfg(test)]
 mod tests;
@@ -82,16 +101,33 @@ where
   <Option<T> as serde::Deserialize<'de>>::deserialize(deserializer)
 }
 
-/// Logical OR lifted over [`TaskFacts`]'s explicit-unknown booleans: `None` is
-/// the identity (an unobserved child contributes nothing), and two observed
-/// values OR. Lifting the `(bool, ||)` semigroup with a free identity keeps the
-/// operation associative, which is what makes the merge law a monoid over the
-/// tri-state representation (F1, codex round 6 post-consolidation).
-const fn or_unknown(a: Option<bool>, b: Option<bool>) -> Option<bool> {
+/// **Kleene** (strong three-valued) logical OR over [`TaskFacts`]'s
+/// explicit-unknown booleans: `Some(true)` absorbs, `Some(false) | Some(false)`
+/// stays `Some(false)`, and an unknown (`None`) mixed with anything-but-true
+/// stays unknown — `None | Some(false) = None`, because a contributor that
+/// cannot see the fact cannot certify the OTHER contributor's `false` (codex
+/// round 8, F2). The full table:
+///
+/// | a \ b       | `Some(true)` | `Some(false)` | `None` |
+/// |-------------|--------------|---------------|--------|
+/// | `Some(true)`  | `Some(true)` | `Some(true)`  | `Some(true)` |
+/// | `Some(false)` | `Some(true)` | `Some(false)` | `None` |
+/// | `None`        | `Some(true)` | `None`        | `None` |
+///
+/// The OR **identity is `Some(false)`** (observed-clean), NOT `None`: a genuine
+/// unknown poisons the fold, so it can no longer double as the neutral element
+/// the way the pre-round-8 free monoid (`None`-as-identity) did — the very
+/// conflation that let a merge forge an observed-`false` out of an unobserved
+/// contributor. Kleene OR is nonetheless associative and commutative, which is
+/// what keeps [the contributor merge](TaskFacts::merge) associative over the
+/// tri-state; the fold's own identity moves to `TaskFactsAccumulator`.
+const fn kleene_or(a: Option<bool>, b: Option<bool>) -> Option<bool> {
   match (a, b) {
-    (Some(a), Some(b)) => Some(a || b),
-    (some @ Some(_), None) | (None, some @ Some(_)) => some,
-    (None, None) => None,
+    (Some(true), _) | (_, Some(true)) => Some(true),
+    (Some(false), Some(false)) => Some(false),
+    // `Some(false) | None`, `None | Some(false)`, `None | None` — an unknown
+    // that cannot be certified `false` by a mere observed `false` beside it.
+    _ => None,
   }
 }
 
@@ -272,11 +308,15 @@ impl TaskFacts {
   /// schedule (`None`, never `[0]`), and an untracked span (`None`). The value a
   /// hand-built [`TranscriptionResult`](crate::result::TranscriptionResult)
   /// carries, an options-only [`Provenance`](crate::provenance::Provenance)
-  /// records, and the **identity** of [`Self::merge`]. Layer POSITIVELY observed
-  /// facts on with the `with_*` builders — a genuinely greedy, un-truncated
-  /// decode is `unknown().with_drew_from_rng(false).with_early_stopped(false)`,
-  /// which [`Self::is_reproducible_under`] can then trust, where the bare
-  /// `unknown()` cannot.
+  /// records, and — for zero contributors — what a
+  /// `TaskFactsAccumulator` folds down to. **Not** the identity of
+  /// [`Self::merge`]: under the Kleene OR (`kleene_or`) the boolean identity is
+  /// `Some(false)`, so folding `unknown()` into a `Some(false)` observation
+  /// would null it; a contributor fold seeds from `TaskFactsAccumulator::Empty`
+  /// instead. Layer POSITIVELY observed facts on with the `with_*` builders — a
+  /// genuinely greedy, un-truncated decode is [`Self::observed_clean`], which
+  /// [`Self::is_reproducible_under`] can then trust, where the bare `unknown()`
+  /// cannot.
   #[inline]
   pub const fn unknown() -> Self {
     Self {
@@ -286,6 +326,29 @@ impl TaskFacts {
       worker_schedule: None,
       decoded_span: None,
     }
+  }
+
+  /// The **observed-clean** record a real run starts watching from: it has
+  /// POSITIVELY seen no RNG draw and no early-stop truncation yet (`Some(false)`
+  /// for [`Self::drew_from_rng`] and [`Self::early_stopped`]), with no observed
+  /// language, an unknown worker schedule, and an untracked span. Distinct from
+  /// [`Self::unknown`] — which cannot see either fact and is conservatively
+  /// non-reproducible — this is the honest initial state of a decode that IS
+  /// watching: a window that draws or a callback that truncates flips the
+  /// corresponding fact to `Some(true)` under the [merge law](Self::merge), and
+  /// a run that decodes NO window at all keeps the `Some(false)` and earns the
+  /// byte-reproducibility a zero-window run genuinely has (codex round 8, F3).
+  ///
+  /// It is also the correct **seed for a per-attempt fact sink**: under the
+  /// Kleene OR (`kleene_or`) `Some(false)` is the OR identity, so a greedy
+  /// attempt (`Some(false)`) folded onto this sink leaves it `Some(false)`,
+  /// where seeding at `unknown()`'s `None` would instead null it to unknown
+  /// (`None | Some(false) = None`).
+  #[inline]
+  pub const fn observed_clean() -> Self {
+    Self::unknown()
+      .with_drew_from_rng(false)
+      .with_early_stopped(false)
   }
 
   // -- drew_from_rng ------------------------------------------------------
@@ -377,17 +440,23 @@ impl TaskFacts {
   }
 
   /// Folds `other`'s facts into `self` under the **one** merge law every merge
-  /// entry point calls (coremlit issue #14, codex round 6). Associative with
-  /// [`Self::unknown`] as its identity, so a one-shot merge over a slice and a
-  /// staged left-fold produce byte-identical records — which is what makes a
-  /// VAD result safe to re-merge at streaming finalize (R6-F3):
+  /// entry point calls (coremlit issue #14, codex round 6). Associative — a
+  /// one-shot merge over a slice and a staged left-fold produce byte-identical
+  /// records, which is what makes a VAD result safe to re-merge at streaming
+  /// finalize (R6-F3) — but NOT with [`Self::unknown`] as its identity: under
+  /// the Kleene OR (`kleene_or`) the boolean identity is `Some(false)`, so a fold
+  /// over contributors seeds from the separate `TaskFactsAccumulator` identity
+  /// (codex round 8, F2). The per-field laws:
   ///
   /// - **[`drew_from_rng`](Self::drew_from_rng)** / **[`early_stopped`](Self::early_stopped)**
-  ///   — logical OR lifted over the explicit unknown: `None` is
-  ///   the identity (an unobserved child contributes nothing), and two observed
-  ///   values OR. The merge is `Some(true)` iff some child observed `true`,
-  ///   `Some(false)` iff at least one child observed the fact and every observing
-  ///   child saw `false`, and `None` only when NO child observed it at all.
+  ///   — Kleene three-valued OR (`kleene_or`): `Some(true)` absorbs, two
+  ///   `Some(false)` stay `Some(false)`, and an unknown (`None`) mixed with
+  ///   anything-but-true stays unknown (`None | Some(false) = None`). The merge
+  ///   is `Some(true)` iff some child observed `true`, `Some(false)` iff EVERY
+  ///   child observed the fact and all saw `false`, and `None` as soon as any
+  ///   child could not observe it (unless another observed `true`). A child that
+  ///   cannot see the fact therefore no longer lets a `Some(false)` beside it
+  ///   pass for an observed clean.
   /// - **[`observed_language`](Self::observed_language)** — first genuine
   ///   observation wins: `self`'s is kept when present, else `other`'s is
   ///   adopted. A scalar cannot hold two conflicting observations, and a
@@ -402,8 +471,8 @@ impl TaskFacts {
   ///   `None` child contributes nothing; the sum is `None` only when every
   ///   child is untracked.
   pub fn merge(&mut self, other: &Self) {
-    self.drew_from_rng = or_unknown(self.drew_from_rng, other.drew_from_rng);
-    self.early_stopped = or_unknown(self.early_stopped, other.early_stopped);
+    self.drew_from_rng = kleene_or(self.drew_from_rng, other.drew_from_rng);
+    self.early_stopped = kleene_or(self.early_stopped, other.early_stopped);
     if self.observed_language.is_none() {
       self.observed_language = other.observed_language.clone();
     }
@@ -457,5 +526,56 @@ impl TaskFacts {
       None => false,
     };
     not_truncated && draw_replayable
+  }
+}
+
+/// The **fold identity** for a merge over CONTRIBUTORS, kept distinct from
+/// [`TaskFacts::unknown`] so an unknown contributor can never masquerade as the
+/// neutral element (codex round 8, F2). Under the Kleene OR (`kleene_or`) the
+/// boolean identity is `Some(false)`, not `None`, so `unknown()` is no longer a
+/// left identity of [`TaskFacts::merge`] (`unknown().merge(Some(false))` nulls
+/// to `None`). [`Empty`](Self::Empty) is the honest "no contributor merged yet"
+/// element: the first contributor is taken **verbatim**, each subsequent one
+/// folds in under the merge law, and [`into_facts`](Self::into_facts) of an
+/// `Empty` accumulator is `unknown()` — the correct "nothing was observed"
+/// answer for zero contributors.
+///
+/// Consumed by [`merge_transcription_results_with_options`](crate::result::merge_transcription_results_with_options)'s
+/// task-facts fold and by [`LocalAgreement`](crate::stream::agreement::LocalAgreement)'s
+/// finalize sink (codex round 8, F1).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum TaskFactsAccumulator {
+  /// No contributor has been merged yet — the true fold identity.
+  Empty,
+  /// The running merge of every contributor folded in so far.
+  Merged(TaskFacts),
+}
+
+impl TaskFactsAccumulator {
+  /// A fresh [`Empty`](Self::Empty) accumulator.
+  #[inline]
+  pub(crate) const fn new() -> Self {
+    Self::Empty
+  }
+
+  /// Folds one `contributor` in: the first becomes the seed verbatim (so no
+  /// `unknown()` identity ever nulls a known `Some(false)`), each subsequent one
+  /// merges under [`TaskFacts::merge`].
+  #[inline]
+  pub(crate) fn merge(&mut self, contributor: &TaskFacts) {
+    match self {
+      Self::Empty => *self = Self::Merged(contributor.clone()),
+      Self::Merged(facts) => facts.merge(contributor),
+    }
+  }
+
+  /// The accumulated facts, or [`TaskFacts::unknown`] when no contributor was
+  /// ever merged.
+  #[inline]
+  pub(crate) fn into_facts(self) -> TaskFacts {
+    match self {
+      Self::Empty => TaskFacts::unknown(),
+      Self::Merged(facts) => facts,
+    }
   }
 }

@@ -26,7 +26,11 @@
 //! this task's own brief (the "silence" short-circuit does not consult
 //! `avg_logprob`, contrary to the brief's exploration).
 
-use crate::{constants::DEFAULT_LANGUAGE_CODE, options::DecodingOptions, task_facts::TaskFacts};
+use crate::{
+  constants::DEFAULT_LANGUAGE_CODE,
+  options::DecodingOptions,
+  task_facts::{TaskFacts, TaskFactsAccumulator},
+};
 
 pub mod writer;
 
@@ -2433,32 +2437,37 @@ pub fn merge_transcription_results_with_options(
 /// merge's id assignment: the carried [`TaskFacts::decoded_span`] when tracked,
 /// else the survivors' own extent — `max local id + 1`, or `0` when none
 /// survived — the fallback a hand-built or deserialized result (which carries no
-/// span) relies on.
+/// span) relies on. **`None` when the survivors' extent overflows `usize`** (a
+/// hand-built segment id at [`usize::MAX`]): the span is then unknowable, and a
+/// checked `None` lets the drop-OFF task-facts fold record an untracked span
+/// rather than panicking on a path that never needs the span for ids (codex
+/// round 8, F4).
 ///
 /// This is the single definition both the id-base advance AND the task-facts
 /// fold consume, so the aggregate span the merged record STORES is exactly the
 /// total the ids actually consumed — the invariant that keeps a staged re-merge
 /// numbering identically to a one-shot merge even when a child's span was
 /// untracked (F1, codex round 6 post-consolidation; R6-F3 stored the raw
-/// optional, which under-counted an untracked-but-surviving child).
-///
-/// # Panics
-/// On the same `usize::MAX`-id overflow the id mapping guards (a hand-built
-/// segment id near [`usize::MAX`]); see [`merge_transcription_results_with_options`]'s
-/// own `# Panics`.
-fn effective_decoded_span(result: &TranscriptionResult) -> usize {
+/// optional, which under-counted an untracked-but-surviving child). The drop-ON
+/// id-base advance turns this `None` back into the documented `usize::MAX`
+/// panic, since there the span DOES drive an injective id mapping; see
+/// [`merge_transcription_results_with_options`]'s own `# Panics`.
+fn effective_decoded_span(result: &TranscriptionResult) -> Option<usize> {
   match result.task_facts().decoded_span() {
-    Some(span) => span,
-    None => result
+    Some(span) => Some(span),
+    // No carried span: the survivors' extent. Empty survivors are a KNOWN span
+    // of `0` (`None` max -> `Some(0)`), while an overflowing `max + 1` (a
+    // `usize::MAX` id) is genuinely unknowable and reported as `None` rather than
+    // panicking here (codex round 8, F4).
+    None => match result
       .segments_slice()
       .iter()
       .map(TranscriptionSegment::id)
       .max()
-      .map_or(0, |max_local_id| {
-        max_local_id.checked_add(1).expect(
-          "drop_blank_audio segment-id mapping overflowed usize (a segment id near usize::MAX)",
-        )
-      }),
+    {
+      None => Some(0),
+      Some(max_local_id) => max_local_id.checked_add(1),
+    },
   }
 }
 
@@ -2525,9 +2534,13 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
       // [`effective_decoded_span`] reports — the carried authoritative count, or
       // the survivors' own extent when untracked. That same helper feeds the
       // task-facts fold below, so the stored aggregate can never disagree with
-      // the ordinals the ids just consumed.
-      id_base = id_base
-        .checked_add(effective_decoded_span(result))
+      // the ordinals the ids just consumed. Here — and ONLY here, where the span
+      // drives an injective id mapping — a `None` span (a `usize::MAX` survivor
+      // whose extent overflowed) OR an overflowing base is the documented
+      // adversarial-input panic; the drop-OFF fold, which never uses the span for
+      // ids, keeps the checked `None` instead (codex round 8, F4).
+      id_base = effective_decoded_span(result)
+        .and_then(|span| id_base.checked_add(span))
         .expect("drop_blank_audio segment-id base overflowed usize (a segment id near usize::MAX)");
     }
   }
@@ -2665,15 +2678,26 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
   //   when a child's span was untracked, the case R6-F3's raw-optional sum
   //   under-counted into a staged-vs-one-shot id collision (F1, codex round 6
   //   post-consolidation).
-  let mut task_facts = TaskFacts::unknown();
+  //
+  // Folded through [`TaskFactsAccumulator`], NOT seeded at `TaskFacts::unknown()`:
+  // under the Kleene OR (codex round 8, F2) `unknown()` is no longer the merge
+  // identity — seeding there would null a first child's observed-clean
+  // `Some(false)` to `None` — so the accumulator takes the first contributor
+  // verbatim and folds the rest, and yields `unknown()` only for an empty
+  // `results`. Each child's carried span is replaced with its EFFECTIVE span
+  // ([`effective_decoded_span`], the same value the id base advanced by), which
+  // is `None` only when a `usize::MAX` survivor made the extent unknowable
+  // (drop-OFF; codex round 8, F4) — the sum then treats that child as untracked.
+  let mut task_facts = TaskFactsAccumulator::new();
   for result in results {
     task_facts.merge(
       &result
         .task_facts()
         .clone()
-        .with_decoded_span(Some(effective_decoded_span(result))),
+        .with_decoded_span(effective_decoded_span(result)),
     );
   }
+  let task_facts = task_facts.into_facts();
 
   TranscriptionResult::new(text, segments, language, timings).with_task_facts(task_facts)
 }

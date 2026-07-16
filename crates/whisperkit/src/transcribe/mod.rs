@@ -336,7 +336,17 @@ where
     // sink is used so a chunk that drew/stopped/observed then ERRORED and is
     // dropped still records the facts; otherwise a task-local sink, discarded
     // with the error the caller surfaces anyway.
-    let local_facts = Mutex::new(TaskFacts::unknown());
+    //
+    // Seeded **observed-clean** (`Some(false)` for the draw and early-stop), not
+    // `unknown()`: this run IS watching, so before any window decodes it has
+    // POSITIVELY seen no draw and no truncation. A window that draws or a
+    // callback that truncates flips the fact to `Some(true)` under the Kleene OR
+    // (for which `Some(false)` is the identity, so a greedy attempt's `Some(false)`
+    // leaves the sink `Some(false)` rather than nulling it). A run that decodes NO
+    // window at all (audio shorter than one window) therefore finalizes the honest
+    // `Some(false)`/`Some(false)` and is reproducible, where `unknown()` would have
+    // left it conservatively non-reproducible (codex round 8, F3).
+    let local_facts = Mutex::new(TaskFacts::observed_clean());
     let facts_sink: &Mutex<TaskFacts> = self.facts_sink.unwrap_or(&local_facts);
 
     // :82-85 — decoder init timing covers only state allocation, matching
@@ -1445,7 +1455,14 @@ where
       // #14, codex rounds 4–6 — the early-stop recovery is the round-6 R6-F1
       // addition). The worker schedule and id span come from the SURVIVING chunks
       // via the merge, never through this sink.
-      let facts_sink = Mutex::new(TaskFacts::unknown());
+      //
+      // Seeded **observed-clean** like the per-run sink (codex round 8, F3): the
+      // VAD run as a whole is watching every chunk, so before any chunk draws it
+      // has seen no draw and no truncation. Under the Kleene OR `Some(false)` is
+      // the identity, so a greedy chunk's `Some(false)` leaves the sink
+      // `Some(false)`; a chunk that draws flips it to `Some(true)`, recovered into
+      // the merged record below even when that chunk errored and was dropped.
+      let facts_sink = Mutex::new(TaskFacts::observed_clean());
       let mut chunk_results = Vec::with_capacity(chunks.len());
       for (chunk_index, chunk) in chunks.iter().enumerate() {
         let outcome = TranscribeTask::new(&self.backend, &self.tokenizer)

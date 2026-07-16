@@ -84,6 +84,26 @@ fn zero_window_run_observes_no_language_in_provenance() {
     None,
     "nothing was observed, so the result records no detected language"
   );
+
+  // F3 (codex round 8). A zero-window run POSITIVELY knows it drew nothing and
+  // was truncated by nothing: no window decoded, so no attempt could draw or be
+  // stopped. Seeding the fact sink OBSERVED-CLEAN (not `unknown()`) records the
+  // honest `Some(false)`/`Some(false)`, so the run is reproducible -- where the
+  // pre-fix `unknown()` seed left it conservatively non-reproducible.
+  //
+  // Mutation proof: revert the sink seed to `TaskFacts::unknown()` and both
+  // booleans read back `None`, failing `is_reproducible()` below.
+  assert_eq!(
+    result.task_facts().drew_from_rng(),
+    Some(false),
+    "a run that decoded no window POSITIVELY drew nothing"
+  );
+  assert_eq!(
+    result.task_facts().early_stopped(),
+    Some(false),
+    "and was truncated by nothing"
+  );
+
   let provenance = crate::provenance::Provenance::for_result(
     &DecodingOptions::new(),
     &crate::options::ComputeOptions::new(),
@@ -93,6 +113,10 @@ fn zero_window_run_observes_no_language_in_provenance() {
     provenance.task_facts().observed_language(),
     None,
     "and neither does the provenance -- absent, not fabricated"
+  );
+  assert!(
+    provenance.is_reproducible(),
+    "an honest zero-window run reproduces byte-for-byte -- it did nothing to redo"
   );
 }
 
