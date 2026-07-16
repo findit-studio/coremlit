@@ -370,3 +370,61 @@ fn a_dropped_disagreeing_hypothesiss_draw_survives_into_finalize() {
     "a seed makes the recovered draw replayable",
   );
 }
+
+#[test]
+fn finalize_keeps_the_earliest_ingested_language_over_a_later_survivor() {
+  // F3 (codex round 9). The ingest-ordered sink observed a MIDDLE hypothesis's
+  // "es" (which disagreed and was dropped from `results`) BEFORE a later
+  // surviving hypothesis's "fr". Folding that sink as a trailing contributor let
+  // the survivor's "fr" win first-genuine; seeding the finalize fold FROM the
+  // sink keeps the earliest genuine observation, "es".
+  //
+  // Mutation proof: revert `finalize` to fold the sink LAST
+  // (`merged.task_facts_mut().merge(&ingested)`) and this reads back Some("fr").
+  //
+  // R1: kept (first ever), observes NO language. R2: disagrees with R1 (no common
+  // prefix), observes "es", dropped from results but retained as the control. R3:
+  // agrees with the retained R2 control, observes "fr", kept.
+  let r1 = result_with_words(vec![word(" And", 0.0, 0.4), word(" so", 0.4, 0.7)])
+    .with_task_facts(TaskFacts::observed_clean());
+  let r2 = result_with_words(vec![word(" But", 0.0, 0.4), word(" then", 0.4, 0.7)])
+    .with_task_facts(TaskFacts::observed_clean().with_observed_language(Some("es".into())));
+  let r3 = result_with_words(vec![
+    word(" But", 0.0, 0.4),
+    word(" then", 0.4, 0.7),
+    word(" folks", 0.7, 1.0),
+  ])
+  .with_task_facts(TaskFacts::observed_clean().with_observed_language(Some("fr".into())));
+
+  let mut agreement = LocalAgreement::new();
+  assert!(agreement.ingest(r1).is_awaiting_agreement());
+  assert!(
+    agreement.ingest(r2).is_awaiting_agreement(),
+    "R2 disagrees with R1 and is dropped from results",
+  );
+  assert!(
+    agreement.ingest(r3).is_advanced(),
+    "R3 agrees with the retained R2 control hypothesis",
+  );
+  assert_eq!(
+    agreement.results_slice().len(),
+    2,
+    "only R1 and R3 are kept; the es-observing R2 was dropped",
+  );
+
+  let options = crate::options::DecodingOptions::new();
+  let compute = crate::options::ComputeOptions::new();
+  let finalized = agreement.finalize(&options);
+  assert_eq!(
+    finalized.task_facts().observed_language(),
+    Some("es"),
+    "the earliest ingested genuine language wins, even from a dropped hypothesis",
+  );
+  assert_eq!(
+    crate::provenance::Provenance::for_result(&options, &compute, &finalized)
+      .task_facts()
+      .observed_language(),
+    Some("es"),
+    "and provenance carries that earliest observation",
+  );
+}

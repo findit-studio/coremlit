@@ -430,22 +430,32 @@ impl LocalAgreement {
   /// text override does not touch, but the segments still carry).
   ///
   /// The reproducibility facts of EVERY ingested hypothesis — including the
-  /// disagreeing ones dropped from [`Self::results_slice`] — are then folded
-  /// onto the merged record from `Self::ingested_facts` (codex round 8, F1),
-  /// so a dropped control hypothesis's unseeded draw or callback truncation is
-  /// not lost from the finalized transcript's reproducibility answer. Worker
-  /// schedule and id span were stripped at ingest, so this touches only the
-  /// draw/early-stop/language facts; the merged result's own schedule and span
-  /// (from the surviving results) are untouched.
+  /// disagreeing ones dropped from [`Self::results_slice`] — are carried on the
+  /// finalized record from `Self::ingested_facts` (codex round 8, F1), so a
+  /// dropped control hypothesis's unseeded draw or callback truncation is not
+  /// lost from the reproducibility answer. That ingest-ordered sink is the fold
+  /// BASE, with the merged result's own facts folded IN (codex round 9): its
+  /// FIRST-observed language then wins over a later surviving result's, where
+  /// folding the sink last let the survivor's win (F3). Worker schedule and id
+  /// span were stripped at ingest, so the merged result's own (from the
+  /// surviving results) still win those two fields.
   pub fn finalize(mut self, options: &DecodingOptions) -> TranscriptionResult {
     self.confirmed_words.append(&mut self.last_agreed_words);
     let suffix = find_longest_different_suffix(&self.prev_words, &self.hypothesis_words);
     self.confirmed_words.extend_from_slice(suffix);
     let mut merged =
       merge_transcription_results_with_words(&self.results, &self.confirmed_words, options);
-    merged
-      .task_facts_mut()
-      .merge(&self.ingested_facts.into_facts());
+    // Fold the merged (surviving-result) facts INTO the ingest-ordered sink, not
+    // the other way round (codex round 9): the sink observed EVERY hypothesis in
+    // ingest order — the disagreeing dropped ones included — so its FIRST-observed
+    // language must win over a later surviving result's, which merging the sink
+    // last reversed (F3). Worker schedule and id span were stripped at ingest, so
+    // the merged result's own (from the surviving results) still win those two
+    // fields, and the draw/early-stop Kleene OR is commutative, so their answer
+    // is unchanged.
+    let mut facts = self.ingested_facts.into_facts();
+    facts.merge(merged.task_facts());
+    *merged.task_facts_mut() = facts;
     merged
   }
 }
