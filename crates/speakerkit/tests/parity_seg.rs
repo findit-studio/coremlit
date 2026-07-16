@@ -401,3 +401,29 @@ fn golden_direct_and_dia_decode_agree() {
     divergences.join("\n  ")
   );
 }
+
+/// codex r7 F4: every committed golden's `seg_logits` really IS a powerset
+/// log-softmax — each element `≤ 0`, each row's `Σ exp = 1` — enforced against the
+/// oracle ON DISK, not just asserted in the generator's prose. A regeneration
+/// that emitted RAW logits (positive values, unnormalized rows) with the argmax
+/// ordering preserved would still decode the same speakers and pass the parity
+/// suites, yet break the invariant the whole `softmax → log` comparison rests on.
+/// This is the committed-side half of [`common::check_seg_log_probs`] (the
+/// generator runs the other half before serializing). Reads only the committed
+/// `tests/fixtures/golden/*.json` — no models, no `dia`/`ort`.
+#[test]
+fn committed_golden_seg_rows_are_log_probs() {
+  let mut total_rows = 0usize;
+  for fixture in common::FIXTURES {
+    let golden = common::load_golden(fixture.name);
+    for (c, chunk) in golden.chunks.iter().enumerate() {
+      common::check_seg_log_probs(&chunk.seg_logits, golden.num_frames)
+        .unwrap_or_else(|e| panic!("{} chunk {c}: {e}", fixture.name));
+      total_rows += golden.num_frames;
+    }
+  }
+  assert!(
+    total_rows > 0,
+    "read zero golden rows — the committed oracle vanished, the check would be vacuous"
+  );
+}
