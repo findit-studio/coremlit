@@ -32,7 +32,7 @@
 //!   (determinism). See [`fluidaudio_der_parity_vs_dia_ort_and_determinism`].
 //! - **B (§5.4/§5.6): argmax-source DER on ≤2-speaker clips.** The same
 //!   clips through `ArgmaxSource` → the SAME clustering. argmax matches the
-//!   faithful sources EXACTLY here (DER 0.0000 %, pinned) — which is precisely
+//!   faithful sources to 0.0000 % standard DER here (pinned) — which is precisely
 //!   what made the multi-speaker defect invisible for a whole task cycle. See
 //!   [`argmax_source_der_characterization`].
 //! - **C (§5.3): compute-unit DER.** DER on the shipping default (`All`) and
@@ -555,7 +555,7 @@ const DER_PIN_TOL: f64 = 0.0005;
 /// corpus T7 measured.
 ///
 /// **1. The ArgmaxSource is CHARACTERIZED, NOT VALIDATED.** It reproduces the
-/// faithful sources EXACTLY at 1-2 speakers, and it holds up on the 3-speaker
+/// faithful sources to 0.0000 % standard DER at 1-2 speakers, and it holds up on the 3-speaker
 /// clip. On the other three multi-speaker clips it diverges hard: 3.3-9.3 % DER,
 /// against a faithful source scoring 0.0-0.4 % on the same audio, through the
 /// same framing, the same clustering, the same reference and the same harness —
@@ -642,7 +642,7 @@ struct DerPin {
 
 /// The pinned end-to-end characterization — see [`DerPin`].
 const DER_PINS: &[DerPin] = &[
-  // ── ≤2 reference speakers: every source is frame-exact. (Parts B/C.)
+  // ── ≤2 reference speakers: every source scores 0.0000 % standard-collar DER. (Parts B/C.)
   DerPin {
     name: "02_pyannote_sample",
     fa_vs_dia: 0.0,
@@ -837,15 +837,17 @@ fn assert_clip_pins(
 
   // ── Structural invariants. These hold on EVERY clip in the corpus, 1 to 15
   // speakers, and they are what make the argmax pin attributable to argmax: the
-  // oracle reproduces the reference exactly, and the faithful source reproduces
-  // the oracle's speaker-count DECISION exactly. If either breaks, nothing
-  // measured on this clip means anything — so they are exact, not toleranced.
+  // oracle reproduces the reference on every collar-scored frame, and the
+  // faithful source reproduces the oracle's speaker-count DECISION exactly. If
+  // either breaks, nothing measured on this clip means anything — so they are
+  // exact, not toleranced.
   assert_eq!(
     dia_vs_ref.err_units(),
     0,
-    "{name}: dia-ort no longer reproduces the pyannote reference frame-exactly ({} error \
-     units) — the CONTROL is broken. Every DER this suite reports is scored against that \
-     reference, so no conclusion from this clip is trustworthy until this is explained.",
+    "{name}: dia-ort no longer reproduces the pyannote reference on every collar-scored frame \
+     ({} scored-frame error units) — the CONTROL is broken. Every DER this suite reports is \
+     scored against that reference, so no conclusion from this clip is trustworthy until this \
+     is explained.",
     dia_vs_ref.err_units()
   );
   assert_eq!(
@@ -1563,9 +1565,11 @@ fn fluidaudio_der_parity_vs_dia_ort_and_determinism() {
 ///
 /// This test's clean result is not a validation — it is the other half of the
 /// §5.6 finding. All four of its clips have ≤2 reference speakers
-/// ([`FIXTURE_FACTS`]), and argmax reproduces the faithful sources' spans
-/// EXACTLY on every one. Read alone, that says "argmax is fine"; that is the
-/// reading T7 made, and it was wrong. Read next to
+/// ([`FIXTURE_FACTS`]), and argmax reproduces the faithful sources' spans to
+/// 0.0000 % standard-collar DER on every one (collar-scored agreement, not
+/// asserted frame-exactness — the pins are all [`der_std`]). Read alone, that
+/// says "argmax is fine"; that is the reading T7 made, and it was wrong. Read
+/// next to
 /// [`stress_10_mrbeast_clean_water_7_speakers`], it says something sharper: the
 /// argmax divergence is *invisible* until the clustering decision gets hard,
 /// which is why the speaker count of the corpus — not its size, not its
@@ -1869,7 +1873,7 @@ fn stress_clip(name: &str) {
 
 /// **The counterexample** (7 reference speakers). argmax invents a spurious 8th
 /// speaker and scores 3.33 % DER — 33× the spec's 0.1 % bound — where BOTH
-/// faithful sources score 0.0000 %, frame-exactly, on the same audio. That
+/// faithful sources score 0.0000 % standard-collar DER on the same audio. That
 /// makes this the cleanest attribution in the corpus: nothing else varies.
 /// This single clip is what overturned §5.4's "the ~0.94 embedding divergence
 /// is benign" verdict, and it was in the repo the whole time — T7 simply never
