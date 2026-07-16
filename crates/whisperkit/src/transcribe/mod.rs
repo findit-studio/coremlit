@@ -97,6 +97,7 @@ use crate::{
   },
   segment,
   stream::{AudioStreamTranscriber, agreement::LocalAgreementTranscriber},
+  task_facts::TaskFacts,
   tokenizer::WhisperTokenizer,
 };
 
@@ -149,29 +150,21 @@ pub struct TranscribeTask<'ctx, B> {
   segment_callback: Option<SegmentDiscoveryCallback<'ctx>>,
   progress_callback: Option<TranscriptionProgressCallback<'ctx>>,
   window_id_offset: usize,
-  /// Optional caller-owned latch [`Self::run`] ORs each window's RNG-draw fact
-  /// into, the instant it settles inside `decode_with_fallback` — *before* any
-  /// error can propagate out. It outlives the task, so an errored [`Self::run`]
-  /// whose whole result the caller discards still leaves the draw fact behind:
-  /// [`WhisperKit::transcribe`]'s VAD branch installs one shared latch across
-  /// its chunks so a chunk that sampled then errored and was dropped still
-  /// contributes to the merged transcript's reproducibility fact (F3, codex
-  /// round 4). `None` on the non-VAD/`transcribe_all` paths, which surface a
-  /// chunk's error directly rather than dropping it, so `run` latches into a
-  /// task-local flag instead.
-  sampled_sink: Option<&'ctx AtomicBool>,
-  /// Optional caller-owned first-observation sink [`Self::run`] records this
-  /// task's genuine language observation into, the instant a probe settles
-  /// inside `decode_with_fallback` — *before* any error can propagate out. Same
-  /// shape and rationale as [`Self::sampled_sink`]: [`WhisperKit::transcribe`]'s
-  /// VAD branch installs one shared slot across its chunks so a chunk whose
-  /// probe detected a language and whose main decode then ERRORED and was
-  /// dropped still contributes that detection to the merged transcript's
-  /// [`TranscriptionResult::detected_language`] — whose own contract forbids
-  /// reading `None` when a window genuinely observed a language (codex round 5).
-  /// First observation wins; `None` on the non-VAD/`transcribe_all` paths, which
-  /// surface a chunk's error directly rather than dropping it.
-  observed_language_sink: Option<&'ctx Mutex<Option<String>>>,
+  /// Optional caller-owned [`TaskFacts`] sink [`Self::run`] merges each
+  /// attempt's error-fragile facts — the RNG draw, the early-stop truncation,
+  /// and the genuine language observation — into, the instant an attempt settles
+  /// inside `decode_with_fallback` and *before* any error can propagate out. It
+  /// outlives the task, so an errored [`Self::run`] whose whole result the caller
+  /// discards still leaves those facts behind: [`WhisperKit::transcribe`]'s VAD
+  /// branch installs one shared sink across its chunks so a chunk that sampled,
+  /// truncated, or detected a language then errored and was DROPPED still
+  /// contributes those facts to the merged transcript (coremlit issue #14, codex
+  /// rounds 4–6 — the early-stop fact is the round-6 R6-F1 addition the two
+  /// former per-fact sinks lacked). `None` on the non-VAD/`transcribe_all` paths,
+  /// which surface a chunk's error directly rather than dropping it, so `run`
+  /// accumulates into a task-local sink instead. The worker schedule and id span
+  /// are set on the result directly, never through this sink.
+  facts_sink: Option<&'ctx Mutex<TaskFacts>>,
 }
 
 impl<'ctx, B> TranscribeTask<'ctx, B> {
@@ -184,35 +177,20 @@ impl<'ctx, B> TranscribeTask<'ctx, B> {
       segment_callback: None,
       progress_callback: None,
       window_id_offset: 0,
-      sampled_sink: None,
-      observed_language_sink: None,
+      facts_sink: None,
     }
   }
 
-  /// Installs a caller-owned [`AtomicBool`] that [`Self::run`] ORs this task's
-  /// RNG-draw fact into before any error propagates — see the field's own doc.
+  /// Installs a caller-owned [`TaskFacts`] sink that [`Self::run`] merges this
+  /// task's error-fragile facts (RNG draw, early-stop truncation, language
+  /// observation) into before any error propagates — see the field's own doc.
   /// `pub(crate)`: only [`WhisperKit::transcribe`]'s VAD branch needs it, to
-  /// keep a dropped-because-errored chunk's draw from vanishing from the merged
-  /// transcript's reproducibility fact.
+  /// keep a dropped-because-errored chunk's facts from vanishing from the merged
+  /// transcript.
   #[must_use]
   #[inline(always)]
-  pub(crate) const fn with_sampled_sink(mut self, sink: &'ctx AtomicBool) -> Self {
-    self.sampled_sink = Some(sink);
-    self
-  }
-
-  /// Installs a caller-owned first-observation slot that [`Self::run`] records
-  /// this task's genuine language observation into before any error propagates
-  /// — see the field's own doc. `pub(crate)`: only [`WhisperKit::transcribe`]'s
-  /// VAD branch needs it, to keep a dropped-because-errored chunk's detection
-  /// from vanishing from the merged transcript's detected language.
-  #[must_use]
-  #[inline(always)]
-  pub(crate) const fn with_observed_language_sink(
-    mut self,
-    sink: &'ctx Mutex<Option<String>>,
-  ) -> Self {
-    self.observed_language_sink = Some(sink);
+  pub(crate) const fn with_facts_sink(mut self, sink: &'ctx Mutex<TaskFacts>) -> Self {
+    self.facts_sink = Some(sink);
     self
   }
 
@@ -338,29 +316,27 @@ where
     // #14, codex round 5). Carried out onto the result as its decoded id span,
     // for the merge to advance its own running base by.
     let mut decoded_segment_span = 0usize;
-    // Whether ANY accepted window's decode was truncated by a progress
-    // callback's early stop — a caller CONTROL action, OR-ed across windows and
-    // carried out for `Provenance::is_reproducible` (coremlit issue #14, codex
-    // round 5). Read off each accepted `DecodingResult::early_stopped`, never
-    // inferred from the callback itself (a closure has no readable identity).
-    let mut early_stopped = false;
     let mut detected_language: Option<String> = None;
     // The GENUINE observation, kept SEPARATE from `detected_language` above:
     // that one is the Swift-faithful DISPLAY language and includes a
     // configured or fallback (`"en"`) value, whereas this is `Some` only when
-    // a probe ran or a `<|lang|>` token was actually decoded. This is what
-    // `TranscriptionResult::detected_language` records — a configured or
-    // defaulted language was never *detected* (F3, codex round 3).
+    // a probe ran or a `<|lang|>` token was actually decoded. This is what the
+    // result's `TaskFacts::observed_language` records — a configured or
+    // defaulted language was never *detected* (F3, codex round 3). It is THIS
+    // task's own observation; the shared sink below carries it cross-chunk.
     let mut observed_language: Option<String> = None;
-    // Whether ANY window's decode drew from the token sampler. Accumulated
-    // into a latch the instant each attempt settles inside
-    // `decode_with_fallback` — from the sampler's own `drew_from_rng`, never
-    // inferred from a temperature (see the assignment there). When the caller
-    // installed a sink (the VAD branch), that shared latch is used so a chunk
-    // that drew then ERRORED and is dropped still records the fact; otherwise
-    // a task-local latch, discarded with the error the caller surfaces anyway.
-    let local_sampled = AtomicBool::new(false);
-    let sampled_sink: &AtomicBool = self.sampled_sink.unwrap_or(&local_sampled);
+    // The ONE sink for this task's error-fragile facts — the RNG draw (from the
+    // sampler's own `drew_from_rng`, never inferred from a temperature), the
+    // early-stop truncation (OR-ed across every attempt including a REJECTED one
+    // whose stop changed which attempt was selected — R6-F1, coremlit issue #14
+    // codex round 6), and the language observation. `decode_with_fallback` merges
+    // each attempt's facts in the instant it settles, BEFORE any error can
+    // propagate. When the caller installed a sink (the VAD branch), that shared
+    // sink is used so a chunk that drew/stopped/observed then ERRORED and is
+    // dropped still records the facts; otherwise a task-local sink, discarded
+    // with the error the caller surfaces anyway.
+    let local_facts = Mutex::new(TaskFacts::unknown());
+    let facts_sink: &Mutex<TaskFacts> = self.facts_sink.unwrap_or(&local_facts);
 
     // :82-85 — decoder init timing covers only state allocation, matching
     // Swift's `decoderInitTime` scope exactly (the prefill call right below
@@ -471,36 +447,30 @@ where
           &mut initial_prompt,
           &mut detected_language,
           &mut observed_language,
-          sampled_sink,
+          facts_sink,
           options,
           &mut timings,
           window_index,
         )?;
         window_index += 1;
-        // The accepted window's early-stop OUTCOME, OR-ed across windows: a
-        // callback truncated the transcript if it truncated any window (codex
-        // round 5). The honest library-known fact, not the closure's identity.
-        early_stopped |= decoding_result.early_stopped();
 
-        // THE reproducibility invariant. The RNG-draw fact was OR-ed into
-        // `sampled_sink` INSIDE `decode_with_fallback` just now, from each
-        // attempt's `GreedyTokenSampler::drew_from_rng` — the honest fact of
-        // whether an RNG draw actually happened — NOT inferred here from
-        // `decoding_result.temperature()`. That inference was wrong twice over
-        // (F2, codex round 3): it missed a REJECTED attempt whose unseeded
-        // draw still decided which attempt was kept (accepted at 0.0 → looked
-        // greedy → falsely reproducible), and it overcounted a non-zero
-        // temperature that ran zero sampling iterations (or only hit the
-        // all-masked path) and never drew. Recording it in the ladder also
-        // keeps it ahead of every step that can erase the evidence — the
-        // word-timestamp zero-length filter, the no-speech `continue`, the
-        // blank-audio drop, or (on the VAD path) a chunk that contributed
-        // nothing to the merge OR whose whole `run` errored and was dropped
-        // (F3, codex round 4: the fact is captured before that error can
-        // propagate, into a sink the caller owns) — so a `Provenance` can never
-        // read the effective temperature back off the SURVIVING segments (only
-        // the greedy ones would remain) and declare the transcript
-        // reproducible. (Constructed, not hypothesized: `transcribe::tests`'
+        // THE reproducibility invariant, now unified. The RNG-draw AND early-stop
+        // facts were merged into `facts_sink` INSIDE `decode_with_fallback` just
+        // now, per attempt, from the sampler's own `GreedyTokenSampler::drew_from_rng`
+        // and the per-attempt early-stop latch — the honest facts of whether an
+        // RNG draw or a callback truncation actually happened, NOT inferred here
+        // from `decoding_result` (its temperature, or its accepted-attempt-only
+        // `early_stopped`). The draw inference was wrong twice over (F2, codex
+        // round 3) and the accepted-only early-stop read lost a REJECTED attempt's
+        // truncation that changed which attempt was selected (R6-F1, codex round
+        // 6). Merging both into the ladder also keeps them ahead of every step
+        // that can erase the evidence — the word-timestamp zero-length filter, the
+        // no-speech `continue`, the blank-audio drop, or (on the VAD path) a chunk
+        // that contributed nothing to the merge OR whose whole `run` errored and
+        // was dropped (the facts are captured before that error can propagate,
+        // into the sink the caller owns) — so a `Provenance` can never read the
+        // effective temperature back off the SURVIVING segments and declare the
+        // transcript reproducible. (Constructed, not hypothesized: `transcribe::tests`'
         // `unseeded_sampling_survives_the_blank_audio_drop` scripts a window
         // accepted at 0.2 that decodes to exactly `[BLANK_AUDIO]` and is then
         // dropped, and `unseeded_draw_survives_an_errored_vad_chunk_drop` a
@@ -665,26 +635,29 @@ where
           .unwrap_or_else(|| DEFAULT_LANGUAGE_CODE.to_string()),
         timings,
       )
-      // Carried out of the window loop, not derived from `all_segments` —
-      // by this point the filters above may have emptied the very window
-      // that sampled (see the assignment inside the loop).
-      .maybe_sampled_at_nonzero_temperature(sampled_sink.load(Ordering::Relaxed))
-      // The GENUINE observation (a probe ran or a `<|lang|>` token was
-      // decoded), SEPARATE from the display language above: `None` for a
-      // configured or fallback language, and for a zero-window run that
-      // witnessed nothing. `Provenance::for_result` reads THIS, recording no
-      // detected language rather than the display `"en"`/configured value the
-      // pipeline never actually detected (F3, codex round 3).
-      .maybe_detected_language(observed_language)
-      // The DECODE's own id-ordinal span — how many segment ids this run
-      // allocated, dropped segments included — for the merge to advance its
-      // running base by (see the field's doc; coremlit issue #14, codex round 5).
-      .maybe_decoded_segment_span(Some(decoded_segment_span))
-      // Whether a progress callback truncated this transcript, and the worker
-      // coordinate it decoded under — both transcript-controlling task facts a
-      // `Provenance` records (codex round 5).
-      .maybe_early_stopped(early_stopped)
-      .with_window_id_offset(self.window_id_offset),
+      // The decode-time facts this run controlled, assembled into the ONE
+      // carried record (coremlit issue #14, codex round 6):
+      //
+      // - the RNG-draw and early-stop facts come from `facts_sink`, accumulated
+      //   across every attempt (rejected included) BEFORE any filter or error
+      //   could erase them — NOT derived from `all_segments`, which by this point
+      //   may have lost the very window that sampled or was truncated;
+      // - the genuine language observation is THIS task's own (the shared sink
+      //   carries it cross-chunk for the VAD merge instead), `None` for a
+      //   configured/fallback language or a zero-window run that witnessed
+      //   nothing — `Provenance::for_result` reads THIS, never the display `"en"`;
+      // - the worker coordinate is a single-run schedule `[offset]` (an explicit
+      //   KNOWN coordinate), and the decode's own id-ordinal span (dropped
+      //   segments included) is what the merge advances its running base by.
+      .with_task_facts({
+        let facts = facts_sink.lock().unwrap_or_else(PoisonError::into_inner);
+        TaskFacts::unknown()
+          .with_drew_from_rng(facts.drew_from_rng())
+          .with_early_stopped(facts.early_stopped())
+          .with_observed_language(observed_language)
+          .with_worker(self.window_id_offset)
+          .with_decoded_span(Some(decoded_segment_span))
+      }),
     )
   }
 
@@ -833,7 +806,7 @@ where
     initial_prompt: &mut Vec<u32>,
     detected_language: &mut Option<String>,
     observed_language: &mut Option<String>,
-    sampled_sink: &AtomicBool,
+    facts_sink: &Mutex<TaskFacts>,
     options: &DecodingOptions,
     timings: &mut TranscriptionTimings,
     window_index: u64,
@@ -955,34 +928,32 @@ where
         window_callback,
       );
 
-      // Record whether THIS attempt drew from the RNG BEFORE propagating any
-      // error (F3, codex round 4). decode_text may have drawn — an unseeded
-      // draw that chose this attempt's tokens, hence reproducibility — and then
-      // failed on a LATER step; reading the flag here, ahead of `?`, is what
-      // keeps that draw from vanishing. The sink outlives this task, so a VAD
-      // chunk that drew then errored and was DROPPED still contributes the fact
-      // to the merged transcript. One `sampler` owns both the language probe's
-      // draw and every text token's, so this single read covers the whole
-      // attempt; OR-ing it across every attempt — REJECTED as well as retained
-      // — is what the reproducibility fact needs, because a rejected unseeded
-      // draw still decides which attempt is kept. A zero-iteration decode at a
-      // non-zero temperature never draws, so it correctly leaves this unset.
-      sampled_sink.fetch_or(sampler.drew_from_rng(), Ordering::Relaxed);
-      // Record this task's genuine observation into the caller's sink BEFORE the
-      // same `?` (codex round 5). The probe above may have detected a language
-      // and set `*observed_language`; if `decode_text` just errored, this whole
-      // `run` errors and the VAD branch DROPS the chunk, so without capturing it
-      // here that detection vanishes and the merged transcript reads
-      // `detected_language == None` for a run that plainly observed one. First
-      // observation wins across chunks, mirroring the merge's own rule.
-      if let Some(sink) = self.observed_language_sink
-        && let Some(observed) = observed_language.as_deref()
-      {
-        let mut slot = sink.lock().unwrap_or_else(PoisonError::into_inner);
-        if slot.is_none() {
-          *slot = Some(observed.to_string());
-        }
-      }
+      // Merge THIS attempt's error-fragile facts into `facts_sink` BEFORE
+      // propagating any error (coremlit issue #14, codex rounds 4–6). Captured
+      // ahead of the `?` below so a VAD chunk that drew, was truncated, or
+      // observed a language then errored on a LATER step and was DROPPED still
+      // contributes those facts to the merged transcript. OR-ed across every
+      // attempt — REJECTED as well as retained — because a rejected attempt's
+      // unseeded draw still decides which attempt is kept (F2, codex round 3),
+      // and a rejected attempt's early stop still changed which attempt the
+      // ladder selected (R6-F1, codex round 6): reading only the accepted
+      // attempt's `DecodingResult::early_stopped` lost exactly that history.
+      // One `sampler` owns both the language probe's draw and every text token's,
+      // so its single `drew_from_rng` covers the whole attempt; a zero-iteration
+      // decode at a non-zero temperature never draws and correctly leaves it
+      // unset. `early_stop` is THIS attempt's own fresh latch (see its reset). The
+      // observation is first-wins (the merge law's rule) — a later attempt cannot
+      // overwrite an earlier genuine detection, and it lives ONLY in the sink so a
+      // dropped chunk's detection still reaches the merged transcript.
+      facts_sink
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .merge(
+          &TaskFacts::unknown()
+            .with_drew_from_rng(sampler.drew_from_rng())
+            .with_early_stopped(early_stop.load(Ordering::Relaxed))
+            .with_observed_language(observed_language.clone()),
+        );
       let result = outcome?;
 
       // TranscribeTask.swift:198 — snapshot THIS attempt's alignment
@@ -1429,35 +1400,32 @@ where
       );
       let chunk_options = options.clone().with_clip_timestamps(Vec::new());
 
-      // One latch shared across every chunk: `TranscribeTask::run` ORs each
-      // window's RNG-draw fact into it the instant it settles, BEFORE any error
-      // can propagate (see `TranscribeTask::with_sampled_sink`). A chunk whose
-      // task ERRORS is dropped below rather than merged, so its draw would
-      // otherwise vanish — leaving the merged transcript reading reproducible
-      // off the surviving greedy chunks while a re-run redraws that dropped
-      // chunk's unseeded sample and may land different surviving text (F3,
-      // codex round 4).
-      let sampled = AtomicBool::new(false);
-      // Same shape as `sampled`, for the genuine language observation: a chunk
-      // whose probe detected a language then errored and was dropped would
-      // otherwise leave the merged transcript's `detected_language` reading
-      // `None` for a run that plainly observed one (F3, codex round 5). First
-      // observation across chunks wins.
-      let observed_language: Mutex<Option<String>> = Mutex::new(None);
+      // One [`TaskFacts`] sink shared across every chunk: `TranscribeTask::run`
+      // merges each window's error-fragile facts — the RNG draw, the early-stop
+      // truncation, and the language observation — into it the instant an attempt
+      // settles, BEFORE any error can propagate (see `TranscribeTask::with_facts_sink`).
+      // A chunk whose task ERRORS is dropped below rather than merged, so those
+      // facts would otherwise vanish — leaving the merged transcript reading
+      // reproducible off the surviving greedy chunks while a re-run redraws that
+      // dropped chunk's unseeded sample and may land different surviving text, or
+      // reading `detected_language == None` for a run that plainly observed one,
+      // or claiming reproducibility for a callback-truncated run (coremlit issue
+      // #14, codex rounds 4–6 — the early-stop recovery is the round-6 R6-F1
+      // addition). The worker schedule and id span come from the SURVIVING chunks
+      // via the merge, never through this sink.
+      let facts_sink = Mutex::new(TaskFacts::unknown());
       let mut chunk_results = Vec::with_capacity(chunks.len());
       for (chunk_index, chunk) in chunks.iter().enumerate() {
         let outcome = TranscribeTask::new(&self.backend, &self.tokenizer)
           .with_window_id_offset(chunk_index)
-          .with_sampled_sink(&sampled)
-          .with_observed_language_sink(&observed_language)
+          .with_facts_sink(&facts_sink)
           .run(chunk.samples_slice(), &chunk_options);
         if let Ok(mut result) = outcome {
           chunker::apply_result_seek_offset(&mut result, chunk.seek_offset());
           chunk_results.push(result);
         }
-        // An errored chunk is dropped here, but its draws and its language
-        // observation already reached the sinks above — the drop cannot erase
-        // either fact.
+        // An errored chunk is dropped here, but its error-fragile facts already
+        // reached the sink above — the drop cannot erase them.
       }
       // `_with_options`, not the plain merge: the blank-audio drop can
       // empty a whole chunk (a wholly-silent one decodes to nothing but
@@ -1470,25 +1438,16 @@ where
       // decode from disagreeing; every chunk is still merged, so no chunk's
       // timings leave the sums.
       let mut merged = merge_transcription_results_with_options(&chunk_results, options);
-      // OR the shared latch onto the merged fact: the merge only sees the
-      // SURVIVING chunks' flags, so this is what carries a dropped-because-
-      // errored chunk's draw into the result.
-      if sampled.load(Ordering::Relaxed) {
-        merged.set_sampled_at_nonzero_temperature();
-      }
-      // Fill the merged observation from the shared slot only when the surviving
-      // chunks contributed none: the merge already records the FIRST surviving
-      // chunk's observation, so this carries a detection that lived ONLY in a
-      // dropped-because-errored chunk (F3, codex round 5). Fill-if-absent, never
-      // override — monotone, exactly like the sampling latch above.
-      if merged.detected_language().is_none()
-        && let Some(observed) = observed_language
-          .lock()
-          .unwrap_or_else(PoisonError::into_inner)
-          .take()
-      {
-        merged.set_detected_language(observed);
-      }
+      // Fold the shared sink's recovered facts onto the merged record through the
+      // SAME merge law. The merge over SURVIVING chunks already OR-ed their draws,
+      // OR-ed their early stops, and took the first observation; this recovers the
+      // same facts from any DROPPED-because-errored chunk (the sink saw them all).
+      // The sink's worker schedule and id span are unknown, so the merge law
+      // leaves the merged result's own (from the surviving chunks) untouched.
+      let sink_facts = facts_sink
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
+      merged.task_facts_mut().merge(&sink_facts);
       return Ok(merged);
     }
 

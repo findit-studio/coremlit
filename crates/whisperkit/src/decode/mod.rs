@@ -552,8 +552,8 @@ fn finalize_decoding_result(
   // above follows Swift's first-in-the-WHOLE-slice rule and so reports the
   // forced prefill `<|en|>`, while the model may predict a DIFFERENT language
   // after it (freely, once `without_timestamps` drops the timestamp filter).
-  // The pipeline promotes THIS predicted code into
-  // `TranscriptionResult::detected_language`; reconstructing it from the
+  // The pipeline promotes THIS predicted code into the result's
+  // `TaskFacts::observed_language`; reconstructing it from the
   // display `language` would misrecord a forced `<|en|>` as the detection when
   // `<|es|>` was predicted (F1, codex round 5). The Swift-compat display above
   // is untouched.

@@ -12,9 +12,14 @@
 //! ownership is enough, matching Swift's own lock-free
 //! `TranscriptionResultStruct` sibling (`Models.swift:543-563`) rather
 //! than the locked `TranscriptionResult` class. `serde` (optional
-//! feature) never emits `null`; `Vec`/`String` fields that carry
-//! meaningful "not present" semantics are empty-means-absent
-//! (`skip_serializing_if` + `default`, golden §10).
+//! feature) never emits `null` for the Swift-parity fields; `Vec`/`String`
+//! fields that carry meaningful "not present" semantics are
+//! empty-means-absent (`skip_serializing_if` + `default`, golden §10). The
+//! sole exception is the Rust-only
+//! [`TaskFacts`](crate::task_facts::TaskFacts) a
+//! [`TranscriptionResult`] carries, whose explicit-unknown reproducibility
+//! facts serialize as a deliberate `null` (see that type) so a dropped key
+//! is distinguishable from an unknown value.
 //!
 //! [`needs_fallback`]'s decision order and comparisons are copied verbatim
 //! from Swift's `DecodingFallback.init?` (`Models.swift:357-381`) — see
@@ -22,7 +27,7 @@
 //! this task's own brief (the "silence" short-circuit does not consult
 //! `avg_logprob`, contrary to the brief's exploration).
 
-use crate::{constants::DEFAULT_LANGUAGE_CODE, options::DecodingOptions};
+use crate::{constants::DEFAULT_LANGUAGE_CODE, options::DecodingOptions, task_facts::TaskFacts};
 
 pub mod writer;
 
@@ -1192,124 +1197,47 @@ pub struct TranscriptionResult {
     serde(default, skip_serializing_if = "Option::is_none")
   )]
   seek_time: Option<f32>,
-  /// Whether **any** window of this transcript was accepted at a **non-zero**
-  /// decode temperature — i.e. whether the token sampler was ever consulted
-  /// at all (it argmax-decodes only at exactly `0.0`, and samples for every
-  /// other value, negatives included). Rust-only; Swift records nothing like
-  /// it.
-  ///
-  /// Accumulated by [`crate::transcribe::TranscribeTask::run`] the moment a
-  /// window's fallback ladder settles, and **never recomputed from the
-  /// segments afterwards** — which is the entire point of storing it. See
-  /// [`Self::sampled_at_nonzero_temperature`] for the failing history that
-  /// forced it.
-  ///
-  /// Always written by `serde` (no `skip_serializing_if`) and **required on
-  /// deserialize** (no `serde(default)`, unlike the rest of this type): a
-  /// dropped flag would read back `false` — "never sampled", the optimistic
-  /// answer — and hand
-  /// [`Provenance::is_reproducible`](crate::provenance::Provenance::is_reproducible)
-  /// a byte-reproducibility guarantee the run never earned. That is the one
-  /// direction this must never silently fail in, so a record missing the key
-  /// is rejected rather than defaulted — exactly as the same carried fact is
-  /// on [`Provenance`](crate::provenance::Provenance) (see `provenance::tests`).
-  sampled_at_nonzero_temperature: bool,
-  /// The language a window **actually observed**, or `None` when the run
-  /// observed none — a decode that ran **zero** windows (audio shorter than
-  /// the padding threshold, or an all-skipped clip) never detected anything.
-  ///
-  /// Deliberately separate from [`Self::language`], which keeps its
-  /// Swift-compat `"en"` display fallback even when nothing was decoded:
-  /// that string is what a consumer renders, this `Option` is what was
-  /// *witnessed*.
-  /// [`Provenance::for_result`](crate::provenance::Provenance::for_result)
-  /// reads THIS — so a zero-window result records
-  /// [`Provenance::detected_language`](crate::provenance::Provenance::detected_language)
-  /// as `None` rather than fabricating a language the pipeline never saw
-  /// ("record what produced the transcript, invent nothing").
-  ///
-  /// [`Self::new`] starts it `None`: the display language is not an
-  /// observation, so a hand-built result witnesses nothing until it says so.
-  /// The pipeline sets the true observation via
-  /// [`Self::maybe_detected_language`].
-  #[cfg_attr(
-    feature = "serde",
-    serde(default, skip_serializing_if = "Option::is_none")
-  )]
-  detected_language: Option<String>,
-  /// The number of segment-id ordinals this transcript's decode ALLOCATED —
-  /// a fact about the DECODE, carried separately from the surviving segments
-  /// because the two come apart. A window's segments are id'd `0..k` as they
-  /// are decoded, but the blank-audio drop and the word-timestamp zero-length
-  /// filter both remove some AFTER that allocation, so the survivors carry
-  /// gaps and their count under-reports how many ordinals were consumed.
-  ///
-  /// [`merge_transcription_results_with_options`] advances its running id base
-  /// by THIS span (not the survivors' extent) so a chunk whose segments were
-  /// all dropped still shifts the next chunk's survivors past the ordinals it
-  /// consumed — otherwise an all-dropped chunk (span here) would be
-  /// indistinguishable from a genuinely zero-window one, and the following
-  /// chunk's ids would collapse (coremlit issue #14, codex round 5).
-  ///
-  /// `None` for a hand-built or deserialized result that never tracked it; the
-  /// merge then falls back to the survivors' own extent (its pre-existing
-  /// behavior). Set by [`crate::transcribe::TranscribeTask::run`] to the
-  /// decode's own ordinal count. Not serialized: it is an in-process merge
-  /// coordinate, meaningless once a transcript is persisted and never part of
-  /// the Swift-parity wire form.
-  #[cfg_attr(feature = "serde", serde(skip))]
-  decoded_segment_span: Option<usize>,
-  /// Whether a progress callback TRUNCATED this transcript with an early stop
-  /// (any window's decode ended on a `Some(false)` callback rather than an
-  /// ordinary EOT). A caller CONTROL action, carried out of the window loop
-  /// from each accepted window's [`DecodingResult::early_stopped`].
+  /// The decode-time facts this transcription **run controlled** — whether it
+  /// drew from the token sampler, the language it genuinely observed, whether a
+  /// progress callback truncated it, the worker coordinates its RNG streams
+  /// rode, and the segment-id span its decode allocated — as one carried record
+  /// (coremlit issue #14, codex round 6). Replaces the five separate fields
+  /// these facts used to scatter across, whose per-fact plumbing lost or
+  /// fabricated three of them at aggregation boundaries; see
+  /// [`TaskFacts`](crate::task_facts::TaskFacts) for the history and the one
+  /// merge law [`merge_transcription_results_with_options`] now folds them by.
   ///
   /// [`Provenance::for_result`](crate::provenance::Provenance::for_result) reads
-  /// this, and [`Provenance::is_reproducible`](crate::provenance::Provenance::is_reproducible)
-  /// keys on it: a transcript an unrecorded callback truncated cannot be
-  /// reproduced from the recorded options and seed alone, because the callback
-  /// — a closure with no readable identity — is not part of the record (coremlit
-  /// issue #14, codex round 5). Always written by `serde` and required on
-  /// deserialize, exactly like [`Self::sampled_at_nonzero_temperature`]: a
-  /// dropped flag would read back `false` (not truncated), the optimistic answer
-  /// this must never silently fail toward.
-  early_stopped: bool,
-  /// The worker/chunk coordinate this transcript decoded under —
-  /// [`crate::transcribe::TranscribeTask`]'s `window_id_offset`. It is the
-  /// domain-separating WORKER input to the seeded fallback ladder's sub-seed
-  /// derivation ([`crate::decode::sampler::derive_attempt_seed`]), so under a
-  /// [`DecodingOptions::seed`] two runs at different offsets draw different RNG
-  /// streams and land different transcripts.
+  /// this record whole; [`Self::new`] starts it
+  /// [`TaskFacts::unknown`](crate::task_facts::TaskFacts::unknown) (a hand-built
+  /// result drew nothing, witnessed no language, was not truncated, and rode an
+  /// **unknown** worker coordinate — never a fabricated `0`), and the pipeline
+  /// sets the observed value via [`Self::with_task_facts`].
   ///
-  /// Recorded so a [`Provenance`](crate::provenance::Provenance) of a seeded run
-  /// is complete: without it two runs differing ONLY in the offset would leave
-  /// byte-identical records for different text (coremlit issue #14, codex round
-  /// 5). Set by [`crate::transcribe::TranscribeTask::run`]; the merge takes the
-  /// first chunk's, matching how it takes the first result's display language.
-  #[cfg_attr(feature = "serde", serde(default))]
-  window_id_offset: usize,
+  /// Required on deserialize: the reproducibility facts inside it must never
+  /// silently default to their optimistic values (see that type's serde
+  /// contract).
+  task_facts: TaskFacts,
 }
 
 impl TranscriptionResult {
   /// Builds a result from its four required fields (Swift
   /// `TranscriptionResultStruct.init`, `Models.swift:550-562`, has no
   /// defaults for these either); [`Self::seek_time`] starts `None` and
-  /// [`Self::sampled_at_nonzero_temperature`] starts `false`.
+  /// [`Self::task_facts`] starts [`TaskFacts::unknown`].
   ///
-  /// A result assembled by hand therefore claims **no** sampling happened.
-  /// That is the right default for a caller inventing a transcript, and it
-  /// is not a hole in the reproducibility guarantee:
+  /// A result assembled by hand therefore claims **no** sampling, **no**
+  /// observed language, **no** callback truncation, an **unknown** worker
+  /// coordinate (never a fabricated `0`, R6-F2), and an untracked id span.
+  /// That is the right default for a caller inventing a transcript, and it is
+  /// not a hole in the reproducibility guarantee:
   /// [`Provenance::for_result`](crate::provenance::Provenance::for_result)
-  /// additionally scans the surviving segments' own temperatures, so a
-  /// visible `temperature > 0.0` is caught either way. What only this flag
-  /// can carry is a sampled window whose segments are *gone* — and only the
-  /// decode path can know about those.
-  ///
-  /// [`Self::detected_language`] starts `None` — the display `language` is
-  /// not an observation (a configured or fallback code was never *detected*),
-  /// so a hand-built result witnesses nothing. The pipeline sets the true
-  /// observation (`None` when it decoded no window) via
-  /// [`Self::maybe_detected_language`].
+  /// additionally scans the surviving segments' own temperatures, so a visible
+  /// `temperature > 0.0` is caught either way. What only the carried
+  /// [`TaskFacts::drew_from_rng`](crate::task_facts::TaskFacts::drew_from_rng)
+  /// flag can carry is a sampled window whose segments are *gone* — and only
+  /// the decode path can know about those, setting the observed facts via
+  /// [`Self::with_task_facts`].
   pub fn new(
     text: impl Into<String>,
     segments: impl Into<Vec<TranscriptionSegment>>,
@@ -1322,20 +1250,11 @@ impl TranscriptionResult {
       language: language.into(),
       timings,
       seek_time: None,
-      sampled_at_nonzero_temperature: false,
-      // NOT seeded from `language`: the display language is not an
-      // observation — a configured or fallback code was never *detected*. A
-      // hand-built result witnesses nothing; the pipeline sets the true
-      // observation via `maybe_detected_language` (F3, codex round 3).
-      detected_language: None,
-      // A hand-built result tracked no decode, so it names no span; the merge
-      // falls back to the survivors' own extent (see the field's doc). The
-      // pipeline sets the real span via `maybe_decoded_segment_span`.
-      decoded_segment_span: None,
-      // A hand-built result was truncated by no callback and rode no worker
-      // coordinate; the pipeline sets both from the decode it ran.
-      early_stopped: false,
-      window_id_offset: 0,
+      // A hand-built result controlled no decode: it drew nothing, witnessed no
+      // language, was truncated by no callback, rode an UNKNOWN worker
+      // coordinate (never a fabricated 0), and tracked no id span. The pipeline
+      // sets the observed record via `with_task_facts`.
+      task_facts: TaskFacts::unknown(),
     }
   }
 
@@ -1410,127 +1329,36 @@ impl TranscriptionResult {
     self
   }
 
-  // -- detected_language --------------------------------------------------
-  /// The language a window **actually observed**, or `None` when the run
-  /// observed none. Distinct from [`Self::language`]'s Swift-compat display
-  /// fallback; this is what
+  // -- task_facts ----------------------------------------------------------
+  /// The decode-time facts this transcription run **controlled** — the RNG
+  /// draw, the observed language, the early-stop truncation, the worker
+  /// coordinates, and the allocated id span — as one record.
   /// [`Provenance::for_result`](crate::provenance::Provenance::for_result)
-  /// records. See the field's doc.
+  /// reads it whole. See the field's doc.
   #[inline(always)]
-  pub fn detected_language(&self) -> Option<&str> {
-    self.detected_language.as_deref()
+  pub const fn task_facts(&self) -> &TaskFacts {
+    &self.task_facts
   }
-  /// Builder form of [`Self::set_detected_language`].
+  /// Mutable access to [`Self::task_facts`] — the pipeline uses it to
+  /// [`merge`](crate::task_facts::TaskFacts::merge) a shared sink's recovered
+  /// facts (a dropped-because-errored VAD chunk's draw/observation/early stop)
+  /// into a merged transcript in place.
+  #[inline(always)]
+  pub const fn task_facts_mut(&mut self) -> &mut TaskFacts {
+    &mut self.task_facts
+  }
+  /// Builder form of [`Self::set_task_facts`].
   #[must_use]
   #[inline(always)]
-  pub fn with_detected_language(mut self, detected_language: impl Into<String>) -> Self {
-    self.set_detected_language(detected_language);
+  pub fn with_task_facts(mut self, task_facts: TaskFacts) -> Self {
+    self.set_task_facts(task_facts);
     self
   }
-  /// Sets [`Self::detected_language`] to `Some(detected_language)`.
+  /// Assigns [`Self::task_facts`] directly — the pipeline passes the record it
+  /// accumulated across the decode.
   #[inline(always)]
-  pub fn set_detected_language(&mut self, detected_language: impl Into<String>) -> &mut Self {
-    self.detected_language = Some(detected_language.into());
-    self
-  }
-  /// Builder form of [`Self::update_detected_language`].
-  #[must_use]
-  #[inline(always)]
-  pub fn maybe_detected_language(mut self, detected_language: Option<String>) -> Self {
-    self.update_detected_language(detected_language);
-    self
-  }
-  /// Assigns [`Self::detected_language`] directly — the pipeline passes the
-  /// true observation here (`None` when it decoded no window), overriding the
-  /// value [`Self::new`] seeded from the display language.
-  #[inline(always)]
-  pub fn update_detected_language(&mut self, detected_language: Option<String>) -> &mut Self {
-    self.detected_language = detected_language;
-    self
-  }
-  /// Sets [`Self::detected_language`] to `None`.
-  #[inline(always)]
-  pub fn clear_detected_language(&mut self) -> &mut Self {
-    self.detected_language = None;
-    self
-  }
-
-  // -- decoded_segment_span (Option<usize>) --------------------------------
-  /// The number of segment-id ordinals this transcript's decode allocated, or
-  /// `None` when untracked (a hand-built or deserialized result). See the field
-  /// doc for why the merge advances its id base by this rather than by the
-  /// surviving segments' extent.
-  #[inline(always)]
-  pub const fn decoded_segment_span(&self) -> Option<usize> {
-    self.decoded_segment_span
-  }
-  /// Builder form of [`Self::update_decoded_segment_span`].
-  #[must_use]
-  #[inline(always)]
-  pub const fn maybe_decoded_segment_span(mut self, decoded_segment_span: Option<usize>) -> Self {
-    self.update_decoded_segment_span(decoded_segment_span);
-    self
-  }
-  /// Assigns [`Self::decoded_segment_span`] directly — the pipeline passes its
-  /// own decoded ordinal count.
-  #[inline(always)]
-  pub const fn update_decoded_segment_span(
-    &mut self,
-    decoded_segment_span: Option<usize>,
-  ) -> &mut Self {
-    self.decoded_segment_span = decoded_segment_span;
-    self
-  }
-
-  // -- early_stopped (bool) ------------------------------------------------
-  /// Whether a progress callback truncated this transcript with an early stop.
-  /// See the field doc; [`Provenance::is_reproducible`](crate::provenance::Provenance::is_reproducible)
-  /// reads it.
-  #[inline(always)]
-  pub const fn early_stopped(&self) -> bool {
-    self.early_stopped
-  }
-  /// Sets [`Self::early_stopped`] to `true`.
-  #[inline(always)]
-  pub const fn set_early_stopped(&mut self) -> &mut Self {
-    self.early_stopped = true;
-    self
-  }
-  /// Builder form of [`Self::update_early_stopped`].
-  #[must_use]
-  #[inline(always)]
-  pub const fn maybe_early_stopped(mut self, early_stopped: bool) -> Self {
-    self.update_early_stopped(early_stopped);
-    self
-  }
-  /// Assigns [`Self::early_stopped`] directly — the pipeline passes whether any
-  /// accepted window's decode was truncated by a callback.
-  #[inline(always)]
-  pub const fn update_early_stopped(&mut self, early_stopped: bool) -> &mut Self {
-    self.early_stopped = early_stopped;
-    self
-  }
-
-  // -- window_id_offset (usize) --------------------------------------------
-  /// The worker/chunk coordinate this transcript decoded under. See the field
-  /// doc: it selects the seeded RNG stream, so a
-  /// [`Provenance`](crate::provenance::Provenance) records it to stay complete.
-  #[inline(always)]
-  pub const fn window_id_offset(&self) -> usize {
-    self.window_id_offset
-  }
-  /// Builder form of [`Self::set_window_id_offset`].
-  #[must_use]
-  #[inline(always)]
-  pub const fn with_window_id_offset(mut self, window_id_offset: usize) -> Self {
-    self.set_window_id_offset(window_id_offset);
-    self
-  }
-  /// Assigns [`Self::window_id_offset`] directly — the pipeline passes the task's
-  /// own worker coordinate.
-  #[inline(always)]
-  pub const fn set_window_id_offset(&mut self, window_id_offset: usize) -> &mut Self {
-    self.window_id_offset = window_id_offset;
+  pub fn set_task_facts(&mut self, task_facts: TaskFacts) -> &mut Self {
+    self.task_facts = task_facts;
     self
   }
 
@@ -1591,81 +1419,6 @@ impl TranscriptionResult {
   #[inline(always)]
   pub const fn clear_seek_time(&mut self) -> &mut Self {
     self.seek_time = None;
-    self
-  }
-
-  // -- sampled_at_nonzero_temperature (bool) ------------------------------
-  /// Whether any window of this transcript was accepted at a **non-zero**
-  /// decode temperature, and therefore **drew from the token sampler**
-  /// rather than taking the deterministic argmax (which the sampler does
-  /// only at exactly `0.0`, sampling for every other value).
-  ///
-  /// This is the fact
-  /// [`Provenance::is_reproducible`](crate::provenance::Provenance::is_reproducible)
-  /// rests on, and it has to be *recorded* rather than reconstructed,
-  /// because every path from a decoded window to a surviving segment is
-  /// lossy:
-  ///
-  /// - [`DecodingOptions::drop_blank_audio`] removes a segment whose text is
-  ///   exactly `[BLANK_AUDIO]` — and a silent window is precisely the kind
-  ///   that trips the fallback ladder;
-  /// - the word-timestamp pass drops zero-length segments
-  ///   (`TranscribeTask.swift:217-218`);
-  /// - a no-speech window `continue`s having produced no segments at all;
-  /// - a VAD chunk emptied by any of the above contributes none to the
-  ///   merge.
-  ///
-  /// **The failing history this exists to prevent** (constructed, not
-  /// hypothesized — see `transcribe::tests`): window A decodes speech
-  /// greedily at `0.0`; window B falls back and is accepted at `0.2`,
-  /// sampling exactly `[BLANK_AUDIO]` from an **unseeded** RNG; the default
-  /// blank-drop deletes window B's only segment. Every *surviving* segment
-  /// now reads `0.0`, so a predicate that inferred the effective temperature
-  /// from the segments concluded "greedy, therefore reproducible" — while a
-  /// re-run would re-draw window B's unseeded sample and could produce text
-  /// that survives. The record promised byte-reproducibility it could not
-  /// back.
-  ///
-  /// Accumulated once per window in
-  /// [`TranscribeTask::run`](crate::transcribe::TranscribeTask::run), the
-  /// instant the ladder settles and **before** any of the four filters
-  /// above can run, and OR-ed across every merged result by
-  /// [`merge_transcription_results`]. `false` on a hand-built result — see
-  /// [`Self::new`].
-  #[inline(always)]
-  pub const fn sampled_at_nonzero_temperature(&self) -> bool {
-    self.sampled_at_nonzero_temperature
-  }
-  /// Builder form of [`Self::set_sampled_at_nonzero_temperature`].
-  #[must_use]
-  #[inline(always)]
-  pub const fn with_sampled_at_nonzero_temperature(mut self) -> Self {
-    self.set_sampled_at_nonzero_temperature();
-    self
-  }
-  /// Sets [`Self::sampled_at_nonzero_temperature`] to `true`.
-  #[inline(always)]
-  pub const fn set_sampled_at_nonzero_temperature(&mut self) -> &mut Self {
-    self.sampled_at_nonzero_temperature = true;
-    self
-  }
-  /// Builder form of [`Self::update_sampled_at_nonzero_temperature`].
-  #[must_use]
-  #[inline(always)]
-  pub const fn maybe_sampled_at_nonzero_temperature(mut self, sampled: bool) -> Self {
-    self.update_sampled_at_nonzero_temperature(sampled);
-    self
-  }
-  /// Assigns [`Self::sampled_at_nonzero_temperature`] directly.
-  #[inline(always)]
-  pub const fn update_sampled_at_nonzero_temperature(&mut self, sampled: bool) -> &mut Self {
-    self.sampled_at_nonzero_temperature = sampled;
-    self
-  }
-  /// Sets [`Self::sampled_at_nonzero_temperature`] to `false`.
-  #[inline(always)]
-  pub const fn clear_sampled_at_nonzero_temperature(&mut self) -> &mut Self {
-    self.sampled_at_nonzero_temperature = false;
     self
   }
 
@@ -1739,7 +1492,9 @@ pub struct DecodingResult {
   /// [`DEFAULT_LANGUAGE_CODE`] display fallback, and when the predicted region
   /// holds no language token at all (a zero-iteration decode forces `<|en|>`
   /// into the prompt but predicts nothing). The pipeline promotes THIS predicted
-  /// code into [`TranscriptionResult::detected_language`]; recording the display
+  /// code into the result's
+  /// [`TaskFacts::observed_language`](crate::task_facts::TaskFacts::observed_language);
+  /// recording the display
   /// [`Self::language`] there instead would misreport a forced `<|en|>` as the
   /// detection when a different language was predicted after it (coremlit issue
   /// #14, codex round 5) — the reason this carries the predicted STRING and not
@@ -1786,8 +1541,9 @@ pub struct DecodingResult {
   /// Whether a progress callback requested an early stop that TRUNCATED this
   /// window's decode (`Some(false)` past the prefill steps) — a caller CONTROL
   /// action, distinct from every ordinary termination (EOT, the token-context
-  /// cap, a too-low first-token log-prob). The pipeline carries this out to
-  /// [`TranscriptionResult::early_stopped`], which
+  /// cap, a too-low first-token log-prob). The pipeline carries this out to the
+  /// result's [`TaskFacts::early_stopped`](crate::task_facts::TaskFacts::early_stopped),
+  /// which
   /// [`Provenance::is_reproducible`](crate::provenance::Provenance::is_reproducible)
   /// reads: a transcript an unrecorded callback truncated cannot be reproduced
   /// from the recorded options and seed alone (coremlit issue #14, codex round
@@ -1869,8 +1625,9 @@ impl DecodingResult {
   /// The language the model actually PREDICTED (an ISO code), or `None`. A
   /// genuine in-loop detection, SEPARATE from the Swift-faithful display
   /// [`Self::language`]; see the field doc for how the pipeline promotes this
-  /// into [`TranscriptionResult::detected_language`], and why it is not the
-  /// display language.
+  /// into the result's
+  /// [`TaskFacts::observed_language`](crate::task_facts::TaskFacts::observed_language),
+  /// and why it is not the display language.
   #[inline(always)]
   pub fn observed_language(&self) -> Option<&str> {
     self.observed_language.as_deref()
@@ -2054,8 +1811,8 @@ impl DecodingResult {
 
   // -- early_stopped (bool) ------------------------------------------------
   /// Whether a progress callback truncated this window's decode with an early
-  /// stop. See the field doc; the pipeline carries this to
-  /// [`TranscriptionResult::early_stopped`].
+  /// stop. See the field doc; the pipeline carries this to the result's
+  /// [`TaskFacts::early_stopped`](crate::task_facts::TaskFacts::early_stopped).
   #[inline(always)]
   pub const fn early_stopped(&self) -> bool {
     self.early_stopped
@@ -2741,7 +2498,7 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
       // segments included); a result without one falls back to the survivors'
       // own extent — `max local id + 1`, or 0 when nothing survived. Same
       // checked arithmetic and rationale as the per-segment add above.
-      let span = match result.decoded_segment_span() {
+      let span = match result.task_facts().decoded_span() {
         Some(span) => span,
         None if saw_segment => max_local_id.checked_add(1).expect(
           "drop_blank_audio segment-id mapping overflowed usize (a segment id near usize::MAX)",
@@ -2863,49 +2620,31 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
     .set_pipeline_start(earliest_pipeline_start)
     .set_first_token_time(min_timing(results, TranscriptionTimings::first_token_time));
 
-  // OR-ed, never recomputed from `segments`: a chunk the blank-audio drop
-  // emptied contributes NO segments to the merge, so its own accepted
-  // temperature is not visible in the merged segment list at all. If it
-  // sampled, the merged transcript is not byte-reproducible either — a
-  // re-run re-draws that chunk's unseeded sample, and the text it lands on
-  // next time may well survive the drop. The fact has to travel with the
-  // result rather than be read back off the output it no longer appears in.
-  let sampled = results
-    .iter()
-    .any(TranscriptionResult::sampled_at_nonzero_temperature);
+  // The task facts, folded left-to-right through the ONE merge law
+  // ([`TaskFacts::merge`]) rather than the four scattered `.any()`/`.find_map()`/
+  // `.first()` reductions this replaced — the consolidation that closes R6-F1/F2/F3
+  // (coremlit issue #14, codex round 6). Over the children in order it:
+  //
+  // - **OR**s the RNG-draw and early-stop facts: a chunk the blank-audio drop
+  //   emptied contributes NO segments to the merge, so its accepted temperature
+  //   is invisible in the merged segment list — the fact has to travel with the
+  //   result, never be read back off the output it no longer appears in. A
+  //   callback truncated the merge if it truncated ANY chunk (R6-F1's merge side).
+  // - keeps the **first** genuine language observation (a later `Some` cannot
+  //   overwrite an earlier one), deliberately NOT agreeing with the merged
+  //   DISPLAY `language` (the first result's, keeping its Swift-compat `"en"`
+  //   fallback).
+  // - **concatenates** the worker schedules in order, so `[0, 2]` stays distinct
+  //   from `[0, 1]` instead of collapsing to the first child's coordinate (R6-F2).
+  // - **sums** the decoded spans, so the merged result STORES its aggregate id
+  //   span and a staged re-merge (a VAD result re-merged at streaming finalize)
+  //   renumbers identically to a one-shot merge (R6-F3).
+  let mut task_facts = TaskFacts::unknown();
+  for result in results {
+    task_facts.merge(result.task_facts());
+  }
 
-  // The observation: the FIRST result that witnessed a language wins. `None`
-  // only when no result observed one (a batch of only zero-window/empty
-  // results). Scanning all results for the first `Some` — not just
-  // `results.first()` — is the fix: the first-only read returned `None` for
-  // `[None, Some("es")]`, dropping an observation the batch plainly made, in
-  // violation of the field's own contract. A scalar cannot represent two
-  // conflicting observations, so the documented rule is "first observed
-  // wins"; this need NOT agree with the merged DISPLAY `language` (the first
-  // result's, keeping its Swift-compat `"en"` fallback) — the observation and
-  // the display string are deliberately separate (F3, codex round 3).
-  let detected_language = results
-    .iter()
-    .find_map(|result| result.detected_language().map(str::to_string));
-
-  // OR-ed like the sampling fact: a callback truncated the merged transcript if
-  // it truncated ANY of its chunks, and that is a caller control the record must
-  // not lose (codex round 5).
-  let early_stopped = results.iter().any(TranscriptionResult::early_stopped);
-  // The first chunk's worker coordinate, matching how the display `language`
-  // above takes the first result's. A VAD merge spans offsets 0..N, but they are
-  // deterministic from the chunk structure; recording the base is what keeps a
-  // single-worker result's own offset (its whole reproducibility story under a
-  // seed) from vanishing through the merge.
-  let window_id_offset = results
-    .first()
-    .map_or(0, TranscriptionResult::window_id_offset);
-
-  TranscriptionResult::new(text, segments, language, timings)
-    .maybe_sampled_at_nonzero_temperature(sampled)
-    .maybe_detected_language(detected_language)
-    .maybe_early_stopped(early_stopped)
-    .with_window_id_offset(window_id_offset)
+  TranscriptionResult::new(text, segments, language, timings).with_task_facts(task_facts)
 }
 
 // ---------------------------------------------------------------------

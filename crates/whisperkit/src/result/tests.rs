@@ -1,5 +1,5 @@
 use super::*;
-use crate::options::DecodingOptions;
+use crate::{options::DecodingOptions, task_facts::TaskFacts};
 
 // ---------------------------------------------------------------------
 // merge_transcription_results
@@ -224,7 +224,7 @@ fn merge_drop_on_advances_the_id_base_past_an_all_dropped_chunk() {
     let mut s = TranscriptionSegment::new();
     s.set_id(0).set_text(" World").set_tokens(vec![20]);
     TranscriptionResult::new(" World", vec![s], "en", TranscriptionTimings::new())
-      .maybe_decoded_segment_span(Some(1))
+      .with_task_facts(TaskFacts::unknown().with_decoded_span(Some(1)))
   };
   let speech_id = |merged: &TranscriptionResult| {
     merged
@@ -238,7 +238,7 @@ fn merge_drop_on_advances_the_id_base_past_an_all_dropped_chunk() {
   // Drop ON: the blank was dropped in the task, so the chunk has zero survivors
   // but reports its decoded span of 1.
   let all_dropped = TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
-    .maybe_decoded_segment_span(Some(1));
+    .with_task_facts(TaskFacts::unknown().with_decoded_span(Some(1)));
   let dropped =
     merge_transcription_results_with_options(&[all_dropped, speech()], &DecodingOptions::new());
   assert!(
@@ -260,7 +260,7 @@ fn merge_drop_on_advances_the_id_base_past_an_all_dropped_chunk() {
     "en",
     TranscriptionTimings::new(),
   )
-  .maybe_decoded_segment_span(Some(1));
+  .with_task_facts(TaskFacts::unknown().with_decoded_span(Some(1)));
   let emitted = merge_transcription_results_with_options(
     &[blank_kept, speech()],
     &DecodingOptions::new().maybe_drop_blank_audio(false),
@@ -1068,36 +1068,52 @@ fn transcription_result_serde_skips_absent_seek_time() {
 
 #[cfg(feature = "serde")]
 #[test]
-fn sampled_at_nonzero_temperature_is_required_on_deserialize() {
-  // F1 (codex round 2). The flag must never silently default to `false`
-  // ("never sampled", the optimistic answer) when a persisted record drops
-  // it: a blank-dropped result whose sampled window was filtered away carries
-  // the fact ONLY here, and a `false` default would hand
-  // `Provenance::is_reproducible` a guarantee the run never earned. Mirrors
-  // the same requirement on `Provenance`'s carried flag
-  // (`provenance::tests::a_record_missing_a_library_known_field_is_rejected`).
+fn task_facts_draw_flag_is_required_on_deserialize() {
+  // F1 (codex round 2), now carried in the embedded `task_facts`. The draw flag
+  // must never silently default to `false` ("never sampled", the optimistic
+  // answer) when a persisted record drops it: a blank-dropped result whose
+  // sampled window was filtered away carries the fact ONLY here, and a `false`
+  // default would hand `Provenance::is_reproducible` a guarantee the run never
+  // earned. Mirrors the same requirement on the record itself
+  // (`task_facts::tests::the_reproducibility_and_coordinate_facts_are_required_on_deserialize`).
   let sampled_empty = TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
-    .with_sampled_at_nonzero_temperature();
+    .with_task_facts(TaskFacts::unknown().with_drew_from_rng(true));
   let value: serde_json::Value = serde_json::to_value(&sampled_empty).unwrap();
-  // The intact record round-trips, or the removal below proves nothing.
+  // The intact record round-trips, or the removals below prove nothing.
   assert_eq!(
     serde_json::from_value::<TranscriptionResult>(value.clone()).unwrap(),
     sampled_empty
   );
 
-  // Drop the key: it must FAIL, not default to `false`.
-  let mut without = value;
+  // Drop the nested draw flag: it must FAIL, not default to `false`.
+  let mut without_flag = value.clone();
   assert!(
-    without
+    without_flag
       .as_object_mut()
       .unwrap()
-      .remove("sampled_at_nonzero_temperature")
+      .get_mut("task_facts")
+      .unwrap()
+      .as_object_mut()
+      .unwrap()
+      .remove("drew_from_rng")
       .is_some(),
     "the flag is always serialized, so the key must have been present"
   );
   assert!(
-    serde_json::from_value::<TranscriptionResult>(without).is_err(),
-    "a dropped `sampled_at_nonzero_temperature` must be rejected, not read back false"
+    serde_json::from_value::<TranscriptionResult>(without_flag).is_err(),
+    "a dropped `task_facts.drew_from_rng` must be rejected, not read back false"
+  );
+
+  // Drop the whole `task_facts` block: also rejected — the record is required.
+  let mut without_facts = value;
+  without_facts
+    .as_object_mut()
+    .unwrap()
+    .remove("task_facts")
+    .unwrap();
+  assert!(
+    serde_json::from_value::<TranscriptionResult>(without_facts).is_err(),
+    "a result missing its whole `task_facts` block must be rejected, not defaulted"
   );
 }
 
@@ -1311,9 +1327,9 @@ fn merge_ors_the_sampling_fact_across_results() {
     TranscriptionTimings::new(),
   );
   // The emptied chunk: zero segments, and the only witness to its own
-  // sampling is the flag itself.
+  // sampling is the carried flag itself.
   let emptied = TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
-    .with_sampled_at_nonzero_temperature();
+    .with_task_facts(TaskFacts::unknown().with_drew_from_rng(true));
   assert!(emptied.segments_slice().is_empty());
 
   let merged = merge_transcription_results(&[greedy.clone(), emptied.clone()]);
@@ -1325,19 +1341,28 @@ fn merge_ors_the_sampling_fact_across_results() {
     "no surviving segment carries the evidence"
   );
   assert!(
-    merged.sampled_at_nonzero_temperature(),
+    merged.task_facts().drew_from_rng(),
     "and yet the merge must still know"
   );
 
   // Same through the options-aware door `WhisperKit::transcribe` actually uses.
   assert!(
     merge_transcription_results_with_options(&[greedy.clone(), emptied], &DecodingOptions::new())
-      .sampled_at_nonzero_temperature()
+      .task_facts()
+      .drew_from_rng()
   );
 
   // All-greedy merges stay honest in the other direction.
-  assert!(!merge_transcription_results(&[greedy.clone(), greedy]).sampled_at_nonzero_temperature());
-  assert!(!merge_transcription_results(&[]).sampled_at_nonzero_temperature());
+  assert!(
+    !merge_transcription_results(&[greedy.clone(), greedy])
+      .task_facts()
+      .drew_from_rng()
+  );
+  assert!(
+    !merge_transcription_results(&[])
+      .task_facts()
+      .drew_from_rng()
+  );
 }
 
 #[test]
@@ -1349,13 +1374,13 @@ fn merge_carries_the_first_observed_language() {
   // language (the first result's, keeping its Swift-compat fallback).
   let observed = |lang: Option<&str>| {
     TranscriptionResult::new("x", Vec::new(), "en", TranscriptionTimings::new())
-      .maybe_detected_language(lang.map(str::to_string))
+      .with_task_facts(TaskFacts::unknown().with_observed_language(lang.map(str::to_string)))
   };
 
   // [None, Some("es")] -> Some("es"): the pre-fix first-only read returned None.
   let merged = merge_transcription_results(&[observed(None), observed(Some("es"))]);
   assert_eq!(
-    merged.detected_language(),
+    merged.task_facts().observed_language(),
     Some("es"),
     "an observation in a later chunk must survive the merge"
   );
@@ -1367,12 +1392,16 @@ fn merge_carries_the_first_observed_language() {
 
   // Conflicting observations: first observed wins (the documented scalar rule).
   assert_eq!(
-    merge_transcription_results(&[observed(Some("es")), observed(Some("fr"))]).detected_language(),
+    merge_transcription_results(&[observed(Some("es")), observed(Some("fr"))])
+      .task_facts()
+      .observed_language(),
     Some("es"),
   );
   // No result observed anything -> None, not the display fallback.
   assert_eq!(
-    merge_transcription_results(&[observed(None), observed(None)]).detected_language(),
+    merge_transcription_results(&[observed(None), observed(None)])
+      .task_facts()
+      .observed_language(),
     None,
   );
   // Through the options-aware door too.
@@ -1381,25 +1410,28 @@ fn merge_carries_the_first_observed_language() {
       &[observed(None), observed(Some("es"))],
       &DecodingOptions::new(),
     )
-    .detected_language(),
+    .task_facts()
+    .observed_language(),
     Some("es"),
   );
 }
 
 #[test]
-fn new_does_not_infer_detected_language_from_the_display_language() {
+fn new_does_not_infer_observed_language_from_the_display_language() {
   // F3 (codex round 3). The display language is not an observation, so `new`
-  // must NOT seed `detected_language` from it -- a configured or fallback code
-  // was never *detected*. Only an explicit set/maybe records one.
+  // must NOT seed the task facts' observed language from it -- a configured or
+  // fallback code was never *detected*. Only an explicit record carries one.
   let r = TranscriptionResult::new("hi", Vec::new(), "es", TranscriptionTimings::new());
   assert_eq!(r.language(), "es", "the display language is still set");
   assert_eq!(
-    r.detected_language(),
+    r.task_facts().observed_language(),
     None,
     "but no observation is inferred from the display language"
   );
   assert_eq!(
-    r.with_detected_language("es").detected_language(),
+    r.with_task_facts(TaskFacts::unknown().with_observed_language(Some("es".to_string())))
+      .task_facts()
+      .observed_language(),
     Some("es"),
     "an explicit observation is still recorded"
   );

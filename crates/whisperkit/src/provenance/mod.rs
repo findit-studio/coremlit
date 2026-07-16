@@ -82,45 +82,21 @@
 //! - **Auto-detect makes the *configured* language useless as a record.**
 //!   It is `""` whenever the decoder is left to detect (the default
 //!   pairing), so a record built from options alone names no language at
-//!   all. [`Provenance::detected_language`] is the field that carries what
-//!   was actually spoken, and only [`Provenance::for_result`] — which is
-//!   handed the transcript — can fill it in.
+//!   all. The carried [`Provenance::task_facts`]'
+//!   [`observed_language`](crate::task_facts::TaskFacts::observed_language) is
+//!   the fact that carries what was actually spoken, and only
+//!   [`Provenance::for_result`] — which is handed the transcript — can fill it in.
 
 use coremlit::ComputeUnits;
 
 use crate::{
   options::{ComputeOptions, DecodingOptions},
   result::{TranscriptionResult, TranscriptionSegment},
+  task_facts::TaskFacts,
 };
 
 #[cfg(test)]
 mod tests;
-
-/// Deserializes a **required but nullable** `Option` field.
-///
-/// Serde's derive special-cases a *missing* `Option` field to `None` (its
-/// `missing_field` helper feeds the type a deserializer that answers
-/// `deserialize_option` with `visit_none`), so a bare `Option<T>` field is
-/// silently optional even with no `serde(default)` on it. That is exactly
-/// the silent defaulting this type refuses: an absent
-/// [`Provenance::detected_language`] would read back as "no window observed a
-/// language" when all it really means is "whoever wrote this record dropped
-/// the field". Naming a `deserialize_with` sends the derive down its
-/// required-field path instead — the key must be present, and `null` then
-/// carries its real meaning and nothing else.
-///
-/// [`Provenance::effective_temperature`] gets the identical required-field
-/// treatment from `crate::options::finite_f32_option` (a `with`, which is a
-/// `deserialize_with` too, so the same special case is defeated), and that
-/// helper additionally refuses a non-finite value — see the field.
-#[cfg(feature = "serde")]
-fn required_option<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
-where
-  D: serde::Deserializer<'de>,
-  T: serde::Deserialize<'de>,
-{
-  <Option<T> as serde::Deserialize<'de>>::deserialize(deserializer)
-}
 
 /// The one temperature every segment of a result agrees on, or `None` when
 /// they do not — backing [`Provenance::effective_temperature`] for
@@ -211,24 +187,6 @@ pub struct Provenance {
   /// The per-stage CoreML compute units the pipeline ran on. Recorded
   /// because they change the output (see this module's docs).
   compute: ComputeOptions,
-  /// The language a window **actually observed**
-  /// ([`TranscriptionResult::detected_language`]) — the **outcome**, where
-  /// [`DecodingOptions::language`] is the **input**. This is the one that
-  /// matters under auto-detect: the configured language is then empty (and
-  /// it is empty on every run with [`DecodingOptions::use_prefill_prompt`]
-  /// cleared, the default pairing for detection), so it says nothing at all
-  /// about what was spoken, and only this field does.
-  ///
-  /// `None` in two honest cases, never as a guess: when the record was built
-  /// **without a result** ([`Self::from_options`]/[`Self::for_segment`],
-  /// neither handed a [`TranscriptionResult`]), or when it was built
-  /// [`Self::for_result`] from a run that **observed no language** — a decode
-  /// that ran zero windows (audio too short, or an all-skipped clip) detects
-  /// nothing. Never the Swift-compat `"en"` display fallback
-  /// [`TranscriptionResult::language`] carries, and never inferred from the
-  /// configured language: a fabricated language is worse than an admitted gap.
-  #[cfg_attr(feature = "serde", serde(deserialize_with = "required_option"))]
-  detected_language: Option<String>,
   /// The temperature the decode **actually landed on** — the fallback
   /// ladder's accepted attempt, read off
   /// [`TranscriptionSegment::temperature`]. Equal to
@@ -247,63 +205,36 @@ pub struct Provenance {
   /// [`Self::from_options`]/[`Self::for_segment`] are always `Some` — they
   /// are handed the one temperature they record.
   ///
-  /// Required on deserialize, and finite: bridged through
-  /// `crate::options::finite_f32_option`, which keeps the field required
-  /// (naming a `with` defeats serde's missing-`Option`-is-`None` special case,
-  /// exactly as `required_option` does for `detected_language`) and refuses a
-  /// non-finite value on both sides of the wire (codex round 3, F6). Without
-  /// it, a `Some(-inf)` that `serde_json` collapses to `null` would read back
-  /// as a forged `None` ("the ladder split the segments") — the same silent
-  /// round-trip disable this record's embedded `DecodingOptions` closes.
+  /// The one outcome fact NOT in [`Self::task_facts`]: it is *derived* from
+  /// the surviving segments (their unanimous temperature), where the record's
+  /// facts are *carried* out of the decode. Required on deserialize, and
+  /// finite: bridged through `crate::options::finite_f32_option`, which keeps
+  /// the field required (naming a `with` defeats serde's
+  /// missing-`Option`-is-`None` special case) and refuses a non-finite value
+  /// on both sides of the wire (codex round 3, F6). Without it, a `Some(-inf)`
+  /// that `serde_json` collapses to `null` would read back as a forged `None`
+  /// ("the ladder split the segments").
   #[cfg_attr(feature = "serde", serde(with = "crate::options::finite_f32_option"))]
   effective_temperature: Option<f32>,
-  /// Whether the decode ever **drew from the token sampler** — i.e. whether
-  /// any window was accepted at a **non-zero** temperature (the sampler
-  /// argmax-decodes only at exactly `0.0`, and draws from the RNG for every
-  /// other value, negatives included). Backs
-  /// [`Self::is_reproducible`], and is the one library-known fact here that
-  /// [`Self::effective_temperature`] cannot supply.
+  /// The decode-time facts this run **controlled** — the RNG draw, the
+  /// genuinely observed language, the early-stop truncation, the worker
+  /// coordinates, and the allocated id span — embedded verbatim as one record
+  /// (coremlit issue #14, codex round 6). [`Self::for_result`] clones it whole
+  /// off the [`TranscriptionResult`], so a fact the transcript carries cannot be
+  /// dropped or fabricated on the way into the provenance the way its five
+  /// former flat fields were; and [`Self::is_reproducible`] reads the two facts
+  /// it rests on ([`TaskFacts::drew_from_rng`] and [`TaskFacts::early_stopped`])
+  /// straight off it.
   ///
-  /// It is a *carried* fact, not a derived one, and that distinction is the
-  /// whole of coremlit issue #14's second review finding.
-  /// [`Self::effective_temperature`] describes the transcript's **surviving
-  /// segments**; this describes the **decode**. They come apart exactly when
-  /// a filter deletes the segments of a window that sampled — the blank-audio
-  /// drop, the word-timestamp zero-length filter, a no-speech window, an
-  /// emptied VAD chunk. In that state every surviving segment reads `0.0`,
-  /// `effective_temperature` is `Some(0.0)`, and a predicate built on it
-  /// would call an unseeded, genuinely non-reproducible transcript
-  /// reproducible. See
-  /// [`TranscriptionResult::sampled_at_nonzero_temperature`] for the
-  /// constructed failing history.
-  ///
-  /// Required on deserialize, like the rest of the library-known facts: a
-  /// record that dropped this field would read back as "never sampled", the
-  /// optimistic answer, which is the one direction this must never fail in.
-  sampled_at_nonzero_temperature: bool,
-  /// Whether a progress callback TRUNCATED the transcript with an early stop —
-  /// a caller CONTROL action ([`TranscriptionResult::early_stopped`]), and the
-  /// second library-known fact [`Self::is_reproducible`] rests on. A closure
-  /// has no readable identity, so this records the OUTCOME the library CAN
-  /// observe rather than the callback itself: two runs differing only in a
-  /// truncating callback would otherwise leave byte-identical records both
-  /// claiming reproducibility, when the truncated one cannot be replayed from
-  /// the recorded options and seed alone (coremlit issue #14, codex round 5).
   /// [`Self::from_options`]/[`Self::for_segment`] — options with no decode to
-  /// speak for — record `false`.
-  early_stopped: bool,
-  /// The worker/chunk coordinate the decode ran under
-  /// ([`TranscriptionResult::window_id_offset`]). It domain-separates the seeded
-  /// fallback ladder's sub-seed derivation
-  /// ([`crate::decode::sampler::derive_attempt_seed`]), so under a
-  /// [`DecodingOptions::seed`] two runs at different offsets draw different RNG
-  /// streams and land different transcripts. Recorded so a seeded run's record
-  /// is complete — without it, two such runs leave byte-identical records for
-  /// different text (coremlit issue #14, codex round 5).
-  /// [`Self::from_options`]/[`Self::for_segment`] record `0`, the default
-  /// single-worker coordinate.
-  #[cfg_attr(feature = "serde", serde(default))]
-  window_id_offset: usize,
+  /// speak for — record [`TaskFacts::unknown`] with only the caller-supplied
+  /// draw fact set: no observed language, not truncated, an **unknown** worker
+  /// schedule (never a fabricated `0`, R6-F2), and no id span.
+  ///
+  /// Required on deserialize, with its own explicit-unknown serde contract (see
+  /// [`TaskFacts`]): the reproducibility facts inside it must never silently
+  /// default to their optimistic values, the one direction this must not fail in.
+  task_facts: TaskFacts,
 
   // -- consumer-supplied: load-time identity ----------------------------
   /// The model's identity (e.g. a Hub repo id), if the caller supplied it.
@@ -397,11 +328,8 @@ macro_rules! provenance_field_names {
 provenance_field_names!(
   decoding,
   compute,
-  detected_language,
   effective_temperature,
-  sampled_at_nonzero_temperature,
-  early_stopped,
-  window_id_offset,
+  task_facts,
   model_id,
   model_revision,
   tokenizer_id,
@@ -410,17 +338,14 @@ provenance_field_names!(
 );
 
 impl Provenance {
-  /// The shared capture: every library-known fact off `decoding`/`compute`,
-  /// with the two outcome fields — which only a result or a segment can
-  /// supply — passed in, and the identity left `None`.
+  /// The shared capture: the resolved `decoding`/`compute`, the derived
+  /// `effective_temperature`, and the carried [`TaskFacts`] — with the identity
+  /// left `None`.
   fn capture(
     decoding: &DecodingOptions,
     compute: &ComputeOptions,
-    detected_language: Option<String>,
     effective_temperature: Option<f32>,
-    sampled_at_nonzero_temperature: bool,
-    early_stopped: bool,
-    window_id_offset: usize,
+    task_facts: TaskFacts,
   ) -> Self {
     Self {
       // The WHOLE options value, not a field-by-field projection — the one
@@ -428,11 +353,11 @@ impl Provenance {
       // complete for every knob added after today (see the field's doc).
       decoding: decoding.clone(),
       compute: *compute,
-      detected_language,
       effective_temperature,
-      sampled_at_nonzero_temperature,
-      early_stopped,
-      window_id_offset,
+      // The WHOLE task-facts record, likewise — every run-controlled fact
+      // travels in one carried value with one merge law, so none can be dropped
+      // or fabricated on the way in (coremlit issue #14, codex round 6).
+      task_facts,
       model_id: None,
       model_revision: None,
       tokenizer_id: None,
@@ -450,9 +375,9 @@ impl Provenance {
   /// crate loads from bare local folders and genuinely does not know it
   /// (see the module docs).
   ///
-  /// [`Self::detected_language`] is left `None`: options alone cannot know
-  /// what language was detected. Reach for [`Self::for_result`] when you
-  /// have the transcript — that is the constructor that records it.
+  /// The [`Self::task_facts`] observed language is left `None`: options alone
+  /// cannot know what language was detected. Reach for [`Self::for_result`] when
+  /// you have the transcript — that is the constructor that records it.
   ///
   /// `effective_temperature` is per-*segment*, not per-result: the
   /// fallback ladder runs per window, so two segments of one transcript
@@ -481,14 +406,12 @@ impl Provenance {
     Self::capture(
       decoding,
       compute,
-      None,
       Some(effective_temperature),
-      sampled_at_nonzero_temperature,
-      // Options with no decode to speak for: no callback truncated them, and
-      // they carry the default single-worker coordinate. `for_result` fills both
-      // from the transcript instead.
-      false,
-      0,
+      // Options with no decode to speak for: only the caller-supplied draw fact
+      // is known. No observed language, not truncated, an UNKNOWN worker schedule
+      // (never a fabricated `0` — R6-F2), and no id span. `for_result` fills the
+      // rest from the transcript's own carried record.
+      TaskFacts::unknown().with_drew_from_rng(sampled_at_nonzero_temperature),
     )
   }
 
@@ -521,21 +444,21 @@ impl Provenance {
     )
   }
 
-  /// The **result-level** capture: [`Self::from_options`]'s facts, plus the
-  /// two a whole transcript — and only a whole transcript — can settle.
+  /// The **result-level** capture: [`Self::from_options`]'s options, the
+  /// derived effective temperature, and the whole [`TaskFacts`] record the
+  /// transcript carries.
   ///
-  /// - [`Self::detected_language`] becomes
-  ///   [`result.detected_language()`](TranscriptionResult::detected_language):
-  ///   the language a window **actually observed**, or `None` when the run
-  ///   observed none (a decode that ran zero windows detects nothing). It is
-  ///   deliberately **not** [`TranscriptionResult::language`], whose
-  ///   Swift-compat `"en"` display fallback would fabricate a language a
-  ///   silent run never saw — "record what produced the transcript, invent
-  ///   nothing". This is a fact [`Self::for_segment`] structurally cannot
-  ///   reach (it is handed a segment, not the result that carries the
-  ///   detection outcome). Under the default auto-detect the *configured*
-  ///   [`DecodingOptions::language`] is just `""`, so without this a record
-  ///   of the common case names no language at all.
+  /// - [`Self::task_facts`] is **cloned whole** off the result
+  ///   ([`TranscriptionResult::task_facts`]): the observed language (never
+  ///   [`TranscriptionResult::language`]'s Swift-compat `"en"` display fallback
+  ///   — "record what produced the transcript, invent nothing"), the carried
+  ///   draw fact (the sampler's own [`drew_from_rng`](TaskFacts::drew_from_rng),
+  ///   accumulated across every attempt before any filter could delete the
+  ///   window that sampled — never inferred from a segment temperature, F3 codex
+  ///   round 4), the early-stop truncation (R6-F1), the worker schedule, and the
+  ///   id span. One clone replaces the five separate reads this used to
+  ///   fabricate or drop facts through, and is a fact [`Self::for_segment`]
+  ///   structurally cannot reach (it is handed a segment, not the result).
   /// - [`Self::effective_temperature`] becomes `Some(t)` **iff every
   ///   segment landed on the same `t`** — the overwhelmingly common
   ///   no-fallback case, which yields `Some(0.0)` — and `None` when the
@@ -552,12 +475,13 @@ impl Provenance {
   ///   options::{ComputeOptions, DecodingOptions},
   ///   provenance::Provenance,
   ///   result::{TranscriptionResult, TranscriptionTimings},
+  ///   task_facts::TaskFacts,
   /// };
   ///
   /// // Auto-detect: the CONFIGURED language is empty, while the run OBSERVED
-  /// // English. The pipeline records the observation on the result; here it is
-  /// // set explicitly, since this is a hand-built one (a genuine observation is
-  /// // never inferred from the "en" display string — codex round 3, F3).
+  /// // English. The pipeline records the observation on the result's task facts;
+  /// // here it is set explicitly, since this is a hand-built one (a genuine
+  /// // observation is never inferred from the "en" display string — F3).
   /// let decoding = DecodingOptions::new();
   /// let compute = ComputeOptions::new();
   /// let result = TranscriptionResult::new(
@@ -566,12 +490,12 @@ impl Provenance {
   ///   "en",
   ///   TranscriptionTimings::new(),
   /// )
-  /// .with_detected_language("en");
+  /// .with_task_facts(TaskFacts::unknown().with_observed_language(Some("en".to_string())));
   ///
   /// let provenance = Provenance::for_result(&decoding, &compute, &result);
   /// assert_eq!(provenance.decoding().language(), "");
-  /// // ... and the DETECTED one is the fact actually worth persisting.
-  /// assert_eq!(provenance.detected_language(), Some("en"));
+  /// // ... and the OBSERVED one is the fact actually worth persisting.
+  /// assert_eq!(provenance.task_facts().observed_language(), Some("en"));
   /// // No segments landed anywhere, so no single temperature describes it.
   /// assert_eq!(provenance.effective_temperature(), None);
   /// ```
@@ -583,28 +507,12 @@ impl Provenance {
     Self::capture(
       decoding,
       compute,
-      // The OBSERVATION, not the display string: `None` when the run decoded
-      // no window and so witnessed no language, rather than promoting
-      // `TranscriptionResult::language`'s Swift-compat `"en"` fallback.
-      result.detected_language().map(str::to_string),
       unanimous_temperature(result.segments_slice()),
-      // The draw fact comes ONLY from the carried flag, never inferred from a
-      // segment temperature (F3, codex round 4). The flag is the sampler's own
-      // `drew_from_rng`, accumulated across every attempt of every window
-      // (rejected included) before any filter could delete the window that
-      // sampled. A segment's temperature does NOT witness a draw: segment
-      // discovery copies the accepted rung into a segment even when ZERO
-      // sampling iterations ran (a `sample_length == 0` window at temperature
-      // 0.3 lands a 0.3-temperature segment that never drew), so OR-ing
-      // `segment.temperature() != 0.0` in reported a false "sampled" and a
-      // false non-reproducible. A caller assembling a result by hand owns the
-      // flag directly (`TranscriptionResult::maybe_sampled_at_nonzero_temperature`).
-      result.sampled_at_nonzero_temperature(),
-      // The two transcript-controlling task facts, read straight off the result
-      // (codex round 5): whether a progress callback truncated it, and the
-      // worker coordinate that selects its seeded RNG stream.
-      result.early_stopped(),
-      result.window_id_offset(),
+      // The WHOLE carried record, cloned off the transcript: every run-controlled
+      // fact travels in one value with one merge law, so none can be dropped or
+      // fabricated on the way into the provenance (coremlit issue #14, codex
+      // round 6) the way its five former flat reads were.
+      result.task_facts().clone(),
     )
   }
 
@@ -653,17 +561,6 @@ impl Provenance {
     self.compute.encoder()
   }
 
-  // -- detected_language --------------------------------------------------
-  /// The language a window actually observed — the outcome, where
-  /// [`DecodingOptions::language`] is the configured input. `None` when the
-  /// record was built without a result ([`Self::from_options`] /
-  /// [`Self::for_segment`]) or from a run that observed no language; never
-  /// the display fallback, never inferred. See the field's doc.
-  #[inline(always)]
-  pub fn detected_language(&self) -> Option<&str> {
-    self.detected_language.as_deref()
-  }
-
   // -- effective_temperature ----------------------------------------------
   /// The temperature the decode actually landed on. `Some(0.0)` means
   /// greedy and therefore deterministic; anything higher was sampled, and
@@ -675,40 +572,30 @@ impl Provenance {
     self.effective_temperature
   }
 
-  /// Whether the decode ever drew from the token sampler — see
-  /// [`TranscriptionResult::sampled_at_nonzero_temperature`], whose doc
-  /// carries the failing history that made this a stored fact.
+  // -- task_facts ---------------------------------------------------------
+  /// The decode-time facts this run **controlled**, as one carried record —
+  /// the RNG draw, the genuinely observed language, the early-stop truncation,
+  /// the worker coordinates, and the allocated id span. Read
+  /// [`provenance.task_facts().observed_language()`](TaskFacts::observed_language),
+  /// [`.drew_from_rng()`](TaskFacts::drew_from_rng),
+  /// [`.early_stopped()`](TaskFacts::early_stopped),
+  /// [`.worker_schedule()`](TaskFacts::worker_schedule), and
+  /// [`.decoded_span()`](TaskFacts::decoded_span) off it. See the field's doc.
   #[inline(always)]
-  pub const fn sampled_at_nonzero_temperature(&self) -> bool {
-    self.sampled_at_nonzero_temperature
-  }
-
-  /// Whether a progress callback truncated the transcript with an early stop —
-  /// see [`TranscriptionResult::early_stopped`]. Backs [`Self::is_reproducible`].
-  #[inline(always)]
-  pub const fn early_stopped(&self) -> bool {
-    self.early_stopped
-  }
-
-  /// The worker/chunk coordinate the decode ran under — see
-  /// [`TranscriptionResult::window_id_offset`]. Under a [`DecodingOptions::seed`]
-  /// it selects the RNG stream, so it is part of what a seeded run reproduces
-  /// against.
-  #[inline(always)]
-  pub const fn window_id_offset(&self) -> usize {
-    self.window_id_offset
+  pub const fn task_facts(&self) -> &TaskFacts {
+    &self.task_facts
   }
 
   /// Whether this transcript can be reproduced byte-for-byte by re-running
   /// the same audio through the same options: true when the decode never
   /// drew from the sampler (every window accepted greedily at `0.0`), or
   /// when a [`DecodingOptions::seed`] makes the draws it did make
-  /// replayable.
+  /// replayable — AND no progress callback truncated it.
   ///
-  /// # It reads a recorded fact, and deliberately does not infer one
+  /// # It reads recorded facts, and deliberately does not infer them
   ///
-  /// The predicate rests on [`Self::sampled_at_nonzero_temperature`] — a
-  /// fact the decode path *carried out* of the window loop — and **not** on
+  /// The predicate rests on [`TaskFacts::drew_from_rng`] — a fact the decode
+  /// path *carried out* of the window loop — and **not** on
   /// [`Self::effective_temperature`], which describes only the segments that
   /// survived to the end.
   ///
@@ -734,19 +621,23 @@ impl Provenance {
   ///
   /// # A callback truncation is never reproducible from the record
   ///
-  /// [`Self::early_stopped`] independently forces `false`. A progress callback
-  /// returning `Some(false)` truncates the transcript — a CONTROL action — but
-  /// the callback is a closure with no readable identity, so it is not part of
-  /// this record. A re-run from the recorded options and seed alone therefore
-  /// cannot reproduce the truncation: two runs differing only in that callback
-  /// otherwise both claimed reproducibility (coremlit issue #14, codex round 5).
-  /// This keys on the OUTCOME (whether a stop actually fired), not the presence
-  /// of a callback, so a callback that only observed and never truncated leaves
-  /// reproducibility untouched — its transcript IS the un-truncated one the
-  /// options and seed reproduce.
+  /// [`TaskFacts::early_stopped`] independently forces `false`. A progress
+  /// callback returning `Some(false)` truncates the transcript — a CONTROL
+  /// action — but the callback is a closure with no readable identity, so it is
+  /// not part of this record. A re-run from the recorded options and seed alone
+  /// therefore cannot reproduce the truncation: two runs differing only in that
+  /// callback otherwise both claimed reproducibility (coremlit issue #14, codex
+  /// round 5). This keys on the OUTCOME (whether a stop actually fired), not the
+  /// presence of a callback, so a callback that only observed and never
+  /// truncated leaves reproducibility untouched — its transcript IS the
+  /// un-truncated one the options and seed reproduce. The whole predicate is
+  /// [`TaskFacts::is_reproducible_under`], to which this supplies whether a
+  /// [`DecodingOptions::seed`] is set.
   #[inline(always)]
   pub const fn is_reproducible(&self) -> bool {
-    !self.early_stopped && (!self.sampled_at_nonzero_temperature || self.decoding.seed().is_some())
+    self
+      .task_facts
+      .is_reproducible_under(self.decoding.seed().is_some())
   }
 
   // -- model_id (Option<String>) ------------------------------------------

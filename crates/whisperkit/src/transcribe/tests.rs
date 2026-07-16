@@ -80,7 +80,7 @@ fn zero_window_run_observes_no_language_in_provenance() {
   assert_eq!(mock.counters().encode_calls(), 0, "no window decoded");
   assert_eq!(result.language(), "en", "the display fallback is kept");
   assert_eq!(
-    result.detected_language(),
+    result.task_facts().observed_language(),
     None,
     "nothing was observed, so the result records no detected language"
   );
@@ -90,7 +90,7 @@ fn zero_window_run_observes_no_language_in_provenance() {
     &result,
   );
   assert_eq!(
-    provenance.detected_language(),
+    provenance.task_facts().observed_language(),
     None,
     "and neither does the provenance -- absent, not fabricated"
   );
@@ -511,7 +511,7 @@ fn genuine_observation_survives_a_later_failed_probe() {
   let result = task.run(&vec![0.1; 48_000], &options).unwrap();
   assert_eq!(mock.counters().encode_calls(), 2, "two windows decoded");
   assert_eq!(
-    result.detected_language(),
+    result.task_facts().observed_language(),
     Some("es"),
     "window 1's genuine detection must survive window 2's failed probe"
   );
@@ -562,7 +562,7 @@ fn a_predicted_language_is_recorded_over_the_forced_display_language() {
     "the DISPLAY language is the forced-prefill <|en|>, kept Swift-faithful"
   );
   assert_eq!(
-    result.detected_language(),
+    result.task_facts().observed_language(),
     Some("es"),
     "the DETECTION is the PREDICTED <|es|>, not the forced display <|en|>"
   );
@@ -572,7 +572,8 @@ fn a_predicted_language_is_recorded_over_the_forced_display_language() {
       &crate::options::ComputeOptions::new(),
       &result,
     )
-    .detected_language(),
+    .task_facts()
+    .observed_language(),
     Some("es"),
     "provenance records the predicted detection, never the forced display"
   );
@@ -827,7 +828,10 @@ fn a_callback_truncation_is_recorded_and_is_not_reproducible() {
   let full = TranscribeTask::new(&mock, &t)
     .run(&vec![0.1; 32_000], &options)
     .unwrap();
-  assert!(!full.early_stopped(), "no callback truncated the full run");
+  assert!(
+    !full.task_facts().early_stopped(),
+    "no callback truncated the full run"
+  );
   let full_prov = crate::provenance::Provenance::for_result(&options, &compute, &full);
   assert!(
     full_prov.is_reproducible(),
@@ -843,12 +847,12 @@ fn a_callback_truncation_is_recorded_and_is_not_reproducible() {
     .run(&vec![0.1; 32_000], &options)
     .unwrap();
   assert!(
-    truncated.early_stopped(),
+    truncated.task_facts().early_stopped(),
     "the callback's Some(false) truncated this run"
   );
   let trunc_prov = crate::provenance::Provenance::for_result(&options, &compute, &truncated);
   assert!(
-    trunc_prov.early_stopped(),
+    trunc_prov.task_facts().early_stopped(),
     "provenance records the early-stop outcome"
   );
   assert!(
@@ -865,11 +869,13 @@ fn a_callback_truncation_is_recorded_and_is_not_reproducible() {
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn window_id_offset_is_recorded_in_the_result_and_provenance() {
-  // F4b (codex round 5). `window_id_offset` is the WORKER coordinate in the
-  // seeded fallback ladder's sub-seed derivation, so under a seed two runs at
-  // different offsets draw different RNG streams and land different transcripts.
-  // It must be recorded on the result and the provenance, or two such runs leave
-  // byte-identical records for text that genuinely differs.
+  // F4b (codex round 5), now carried in the task facts' worker schedule. The
+  // worker coordinate is the WORKER input to the seeded fallback ladder's
+  // sub-seed derivation, so under a seed two runs at different offsets draw
+  // different RNG streams and land different transcripts. A single run records it
+  // as a one-element schedule `[offset]` (an explicit KNOWN coordinate, never a
+  // fabricated 0), or two such runs leave byte-identical records for text that
+  // genuinely differs.
   let t = tiny_tokenizer();
   let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
   let hello = t.encode(" Hello").unwrap()[0];
@@ -885,13 +891,13 @@ fn window_id_offset_is_recorded_in_the_result_and_provenance() {
     .with_window_id_offset(3)
     .run(&vec![0.1; 32_000], &options)
     .unwrap();
-  assert_eq!(worker0.window_id_offset(), 0);
-  assert_eq!(worker3.window_id_offset(), 3);
+  assert_eq!(worker0.task_facts().worker_schedule(), Some([0].as_slice()));
+  assert_eq!(worker3.task_facts().worker_schedule(), Some([3].as_slice()));
 
   let prov0 = crate::provenance::Provenance::for_result(&options, &compute, &worker0);
   let prov3 = crate::provenance::Provenance::for_result(&options, &compute, &worker3);
-  assert_eq!(prov0.window_id_offset(), 0);
-  assert_eq!(prov3.window_id_offset(), 3);
+  assert_eq!(prov0.task_facts().worker_schedule(), Some([0].as_slice()));
+  assert_eq!(prov3.task_facts().worker_schedule(), Some([3].as_slice()));
   assert_ne!(
     prov0, prov3,
     "the worker coordinate distinguishes two runs that differ only in it"
@@ -1463,7 +1469,7 @@ fn a_window_accepted_above_zero_can_decode_the_blank_marker_and_be_dropped() {
 
   assert!(result.segments_slice().is_empty(), "the drop emptied it");
   assert!(
-    result.sampled_at_nonzero_temperature(),
+    result.task_facts().drew_from_rng(),
     "the sampling must survive the segment that carried it"
   );
 
@@ -1521,7 +1527,7 @@ fn a_rejected_nonzero_attempt_is_recorded_even_when_the_window_is_accepted_greed
     "a window must actually decode, or this proves nothing"
   );
   assert!(
-    result.sampled_at_nonzero_temperature(),
+    result.task_facts().drew_from_rng(),
     "attempt 0 drew at -0.2, even though the window was accepted greedily at 0.0"
   );
   let provenance = crate::provenance::Provenance::for_result(
@@ -1564,7 +1570,7 @@ fn a_nonzero_temperature_that_never_samples_records_no_sampling() {
     "the window must actually decode (at temperature 0.3) for the fact to matter"
   );
   assert!(
-    !result.sampled_at_nonzero_temperature(),
+    !result.task_facts().drew_from_rng(),
     "a zero-iteration decode never draws, whatever the temperature -- the old \
      `temperature != 0.0` inference wrongly recorded this window as sampled"
   );
@@ -1592,7 +1598,7 @@ fn a_nonzero_temperature_that_never_samples_records_no_sampling() {
     &result,
   );
   assert!(
-    !provenance.sampled_at_nonzero_temperature(),
+    !provenance.task_facts().drew_from_rng(),
     "the 0.3 segment must not be read as a draw"
   );
   assert!(
@@ -1639,10 +1645,10 @@ fn unseeded_sampling_survives_the_blank_audio_drop() {
     0.0,
     "A is greedy"
   );
-  assert!(!chunk_a.sampled_at_nonzero_temperature());
+  assert!(!chunk_a.task_facts().drew_from_rng());
   assert!(chunk_b.segments_slice().is_empty(), "B was emptied");
   assert!(
-    chunk_b.sampled_at_nonzero_temperature(),
+    chunk_b.task_facts().drew_from_rng(),
     "B sampled, and said so"
   );
 
@@ -1659,7 +1665,7 @@ fn unseeded_sampling_survives_the_blank_audio_drop() {
   );
 
   // The merge OR-ed the fact out of the chunk whose segments are gone.
-  assert!(merged.sampled_at_nonzero_temperature());
+  assert!(merged.task_facts().drew_from_rng());
 
   let compute = crate::options::ComputeOptions::new();
   let provenance = crate::provenance::Provenance::for_result(&options, &compute, &merged);
@@ -1693,7 +1699,7 @@ fn unseeded_sampling_survives_the_blank_audio_drop() {
     ],
     &seeded,
   );
-  assert!(merged_seeded.sampled_at_nonzero_temperature());
+  assert!(merged_seeded.task_facts().drew_from_rng());
   assert!(
     crate::provenance::Provenance::for_result(&seeded, &compute, &merged_seeded).is_reproducible(),
     "a seed makes the same sampled window replayable"
@@ -1735,7 +1741,7 @@ fn unseeded_sampling_survives_a_no_speech_window_with_no_segments() {
     "the no-speech window contributed nothing"
   );
   assert!(
-    result.sampled_at_nonzero_temperature(),
+    result.task_facts().drew_from_rng(),
     "it still sampled at 0.5, and the record has to know"
   );
   assert!(
@@ -1766,7 +1772,7 @@ fn a_greedy_run_stays_reproducible_through_the_drop() {
     .unwrap();
   assert!(result.segments_slice().is_empty());
   assert!(
-    !result.sampled_at_nonzero_temperature(),
+    !result.task_facts().drew_from_rng(),
     "greedy throughout: the sampler was never consulted"
   );
   assert!(
@@ -1819,7 +1825,7 @@ fn unseeded_draw_survives_an_errored_vad_chunk_drop() {
     "the errored chunk was dropped, so nothing survives"
   );
   assert!(
-    result.sampled_at_nonzero_temperature(),
+    result.task_facts().drew_from_rng(),
     "the dropped chunk's unseeded draw must survive into the merged result"
   );
   assert!(
@@ -1867,7 +1873,7 @@ fn probe_detection_survives_an_errored_vad_chunk_drop() {
     "the errored chunk was dropped, so nothing survives"
   );
   assert_eq!(
-    result.detected_language(),
+    result.task_facts().observed_language(),
     Some("es"),
     "the dropped chunk's probe detection must survive into the merged result"
   );
@@ -1877,7 +1883,8 @@ fn probe_detection_survives_an_errored_vad_chunk_drop() {
       &crate::options::ComputeOptions::new(),
       &result,
     )
-    .detected_language(),
+    .task_facts()
+    .observed_language(),
     Some("es"),
     "and provenance records the detection the dropped chunk made"
   );

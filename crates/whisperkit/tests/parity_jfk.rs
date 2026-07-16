@@ -95,7 +95,7 @@ fn jfk_tiny_matches_golden_tokens_and_segments() {
   // `== 0.0` vacuous. The flag is unambiguous, and also catches a sampled
   // window that a later lossy filter removed.
   assert!(
-    !result.sampled_at_nonzero_temperature(),
+    !result.task_facts().drew_from_rng(),
     "clean speech must decode greedily; no window drew from the unseeded sampler"
   );
 

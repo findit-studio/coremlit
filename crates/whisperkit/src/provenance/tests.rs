@@ -8,6 +8,7 @@ use crate::{
   },
   options::{ChunkingStrategy, Task, WordGrouping},
   result::TranscriptionTimings,
+  task_facts::TaskFacts,
 };
 
 // ---------------------------------------------------------------------
@@ -206,14 +207,16 @@ fn mutation_table_covers_every_decoding_option() {
 /// One TASK-LEVEL fact `Provenance::for_result` reads off the transcript,
 /// paired with a mutation that moves it off a baseline result. This is the
 /// analogue of the `DecodingOptions` `mutations()` table above, for the facts a
-/// RUN controls rather than the options configure: the detected language, the
-/// effective temperature, whether it sampled, whether a callback truncated it,
-/// and the worker coordinate it decoded under.
+/// RUN controls rather than the options configure: the whole
+/// [`TaskFacts`](crate::task_facts::TaskFacts) sub-record (observed language,
+/// RNG draw, early stop, worker schedule, id span) plus the one derived outcome
+/// that lives on `Provenance` beside it, the effective temperature.
 type TaskFactMutation = (&'static str, fn(TranscriptionResult) -> TranscriptionResult);
 
 /// A baseline transcript with every task fact at its `new` default: one
-/// segment at temperature 0.0 (so `effective_temperature` is `Some(0.0)`), no
-/// detection, greedy, not truncated, worker 0. Each mutation moves exactly one.
+/// segment at temperature 0.0 (so `effective_temperature` is `Some(0.0)`) and
+/// [`TaskFacts::unknown`] — no observation, greedy, not truncated, an unknown
+/// worker schedule, no id span. Each mutation moves exactly one.
 fn baseline_task_result() -> TranscriptionResult {
   TranscriptionResult::new(
     "x",
@@ -223,21 +226,36 @@ fn baseline_task_result() -> TranscriptionResult {
   )
 }
 
+/// The derived outcome fact `for_result` computes rather than reading off the
+/// carried record — kept separate from the [`TaskFacts`](crate::task_facts::TaskFacts)
+/// sub-facts in the coverage arithmetic below.
+const DERIVED_TASK_FACT: &str = "effective_temperature";
+
 fn task_fact_mutations() -> Vec<TaskFactMutation> {
   vec![
-    ("detected_language", |r| {
-      r.maybe_detected_language(Some("es".to_string()))
+    // The five carried `TaskFacts` sub-facts, keyed by their record field
+    // names, each set on an otherwise-unknown record.
+    ("observed_language", |r| {
+      r.with_task_facts(TaskFacts::unknown().with_observed_language(Some("es".to_string())))
     }),
-    ("effective_temperature", |mut r| {
+    ("drew_from_rng", |r| {
+      r.with_task_facts(TaskFacts::unknown().with_drew_from_rng(true))
+    }),
+    ("early_stopped", |r| {
+      r.with_task_facts(TaskFacts::unknown().with_early_stopped(true))
+    }),
+    ("worker_schedule", |r| {
+      r.with_task_facts(TaskFacts::unknown().with_worker(3))
+    }),
+    ("decoded_span", |r| {
+      r.with_task_facts(TaskFacts::unknown().with_decoded_span(Some(1)))
+    }),
+    // The derived one: moving a segment temperature changes the unanimous
+    // effective temperature `for_result` computes.
+    (DERIVED_TASK_FACT, |mut r| {
       r.set_segments(vec![TranscriptionSegment::new().with_temperature(0.6)]);
       r
     }),
-    (
-      "sampled_at_nonzero_temperature",
-      TranscriptionResult::with_sampled_at_nonzero_temperature,
-    ),
-    ("early_stopped", |r| r.maybe_early_stopped(true)),
-    ("window_id_offset", |r| r.with_window_id_offset(3)),
   ]
 }
 
@@ -247,8 +265,9 @@ fn provenance_records_every_task_fact() {
   // for the facts a RUN controls. Move one task fact off the baseline result and
   // the `for_result` record must change with it; a fact `for_result` fails to
   // read leaves a byte-identical record -- two runs whose transcripts differ,
-  // described the same. This is exactly what catches the round-5 omission of
-  // `early_stopped`/`window_id_offset`.
+  // described the same. This is exactly what catches a fact the consolidated
+  // `TaskFacts` clone silently drops (the round-5/6 omissions of
+  // early_stopped/worker_schedule/decoded_span among them).
   let decoding = DecodingOptions::new();
   let compute = ComputeOptions::new();
   let baseline = baseline_task_result();
@@ -272,13 +291,17 @@ fn provenance_records_every_task_fact() {
 
 #[test]
 fn task_fact_table_covers_every_provenance_task_fact() {
-  // NON-CIRCULAR by construction: the roster comes from `Provenance` ITSELF
-  // (the compile-time exhaustive destructure behind `PROVENANCE_FIELD_NAMES`),
-  // minus the embedded options (covered by the DecodingOptions `mutations()`
-  // table and the ComputeOptions itself) and the consumer-supplied identity
-  // (covered by the identity/vad tests). Add a task fact to `Provenance` and the
-  // destructure forces it into the roster, and then this fails HERE as an
-  // uncovered name until it also gets a mutation row above.
+  // NON-CIRCULAR by construction, on TWO exhaustive rosters:
+  //
+  // 1. `Provenance`'s own field set (`PROVENANCE_FIELD_NAMES`, from the
+  //    compile-time destructure) must partition into the non-task-facts (the
+  //    embedded options + the consumer-supplied identity), the one DERIVED
+  //    outcome, and the composite `task_facts` sub-record. Add a field to
+  //    `Provenance` and this fails until it is placed.
+  // 2. the composite is then covered field-by-field by `TaskFacts`' OWN roster
+  //    (`TASK_FACTS_FIELD_NAMES`) against the mutation rows. Add a field to
+  //    `TaskFacts` and its destructure forces it into that roster, and this
+  //    fails HERE as an uncovered name until it also gets a mutation row above.
   const NON_TASK_FACTS: &[&str] = &[
     "decoding", // embedded DecodingOptions, covered by `mutations()`
     "compute",  // embedded ComputeOptions
@@ -288,20 +311,36 @@ fn task_fact_table_covers_every_provenance_task_fact() {
     "tokenizer_revision",
     "vad_detector",
   ];
-  let expected: std::collections::BTreeSet<&str> = crate::provenance::PROVENANCE_FIELD_NAMES
+
+  // (1) Every Provenance field is accounted for.
+  let provenance_task_layer: std::collections::BTreeSet<&str> =
+    crate::provenance::PROVENANCE_FIELD_NAMES
+      .iter()
+      .copied()
+      .filter(|field| !NON_TASK_FACTS.contains(field))
+      .collect();
+  let provenance_expected: std::collections::BTreeSet<&str> =
+    [DERIVED_TASK_FACT, "task_facts"].into_iter().collect();
+  assert_eq!(
+    provenance_task_layer, provenance_expected,
+    "a Provenance field is neither a non-task-fact, the derived outcome, nor the \
+     carried `task_facts` record -- place it in this test's partition"
+  );
+
+  // (2) Every carried TaskFacts sub-fact (plus the derived outcome) has a row.
+  let expected: std::collections::BTreeSet<&str> = crate::task_facts::TASK_FACTS_FIELD_NAMES
     .iter()
     .copied()
-    .filter(|field| !NON_TASK_FACTS.contains(field))
+    .chain(std::iter::once(DERIVED_TASK_FACT))
     .collect();
   let covered: std::collections::BTreeSet<&str> = task_fact_mutations()
     .iter()
     .map(|(field, _)| *field)
     .collect();
-
   assert_eq!(
     covered, expected,
-    "the provenance task-fact table has fallen out of step with Provenance -- \
-     every task-level fact needs a mutation row (see `task_fact_mutations`)"
+    "the provenance task-fact table has fallen out of step with TaskFacts -- \
+     every carried sub-fact needs a mutation row (see `task_fact_mutations`)"
   );
 }
 
@@ -377,7 +416,7 @@ fn from_options_captures_the_options_and_invents_nothing_else() {
 
   // Options alone cannot observe a DETECTION outcome, so this constructor
   // does not pretend to: `for_result` is the one that records it.
-  assert_eq!(provenance.detected_language(), None);
+  assert_eq!(provenance.task_facts().observed_language(), None);
 
   // What the library genuinely cannot observe is never invented -- the
   // identity, and (though `chunking_strategy` above proves VAD ran) the
@@ -454,14 +493,17 @@ fn result_at(language: &str, temperatures: &[f32]) -> TranscriptionResult {
     TranscriptionTimings::new(),
   )
   // `new` no longer seeds the observation from the display language (F3, codex
-  // round 3), so model a result that genuinely OBSERVED `language`.
-  .maybe_detected_language((!language.is_empty()).then(|| language.to_string()))
-  // Model the COMMON case: a window that landed on a non-zero temperature drew
-  // from the RNG. `for_result` reads THIS carried flag, never the segment
+  // round 3), so model a result that genuinely OBSERVED `language` AND — the
+  // COMMON case — drew from the RNG if any window landed on a non-zero
+  // temperature. `for_result` reads THIS carried record, never the segment
   // temperatures (F3, codex round 4); the zero-iteration EXCEPTION -- a
   // non-zero-temperature segment that never drew -- is exercised on its own in
   // `for_result_reads_the_carried_flag_not_the_segment_temperature`.
-  .maybe_sampled_at_nonzero_temperature(temperatures.iter().any(|&t| t != 0.0))
+  .with_task_facts(
+    TaskFacts::unknown()
+      .with_observed_language((!language.is_empty()).then(|| language.to_string()))
+      .with_drew_from_rng(temperatures.iter().any(|&t| t != 0.0)),
+  )
 }
 
 #[test]
@@ -483,13 +525,15 @@ fn for_result_records_the_detected_language_not_the_configured_one() {
     "the CONFIGURED language, verbatim"
   );
   assert_eq!(
-    provenance.detected_language(),
+    provenance.task_facts().observed_language(),
     Some("es"),
     "the DETECTED language — the fact the record exists to carry"
   );
   // Never inferred: without a result there is nothing to read it from.
   assert_eq!(
-    Provenance::from_options(&decoding, &compute, 0.0, false).detected_language(),
+    Provenance::from_options(&decoding, &compute, 0.0, false)
+      .task_facts()
+      .observed_language(),
     None
   );
 }
@@ -509,14 +553,16 @@ fn for_result_detected_language_is_absent_when_no_window_observed_one() {
 
   // The pipeline's zero-window shape: display "en", observation None.
   let unobserved = TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
-    .maybe_detected_language(None);
+    .with_task_facts(TaskFacts::unknown().with_observed_language(None));
   assert_eq!(
     unobserved.language(),
     "en",
     "the Swift-compat display fallback is kept on the result"
   );
   assert_eq!(
-    Provenance::for_result(&opts, &compute, &unobserved).detected_language(),
+    Provenance::for_result(&opts, &compute, &unobserved)
+      .task_facts()
+      .observed_language(),
     None,
     "nothing was observed -- the detected language is absent, not fabricated"
   );
@@ -525,10 +571,12 @@ fn for_result_detected_language_is_absent_when_no_window_observed_one() {
   // run and genuinely decoded English, then the blank-audio drop emptied its
   // segments. The observation survives even though no segment does.
   let dropped_english = TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
-    .maybe_detected_language(Some("en".to_string()));
+    .with_task_facts(TaskFacts::unknown().with_observed_language(Some("en".to_string())));
   assert!(dropped_english.segments_slice().is_empty());
   assert_eq!(
-    Provenance::for_result(&opts, &compute, &dropped_english).detected_language(),
+    Provenance::for_result(&opts, &compute, &dropped_english)
+      .task_facts()
+      .observed_language(),
     Some("en"),
     "a genuinely observed language must survive its segments being dropped"
   );
@@ -794,24 +842,26 @@ fn unset_identity_serializes_as_absent_not_null() {
   );
 
   // The library-known facts are always written, so a persisted record is
-  // never silently missing the settings that produced it. The two OUTCOME
-  // fields are written even when they are `None` — as an explicit `null`,
-  // NOT omitted like the identity above, because for them `None` is itself
-  // the fact ("the ladder split the segments" / "this record was built
-  // without a result"), and a reader must be able to tell that from "the
-  // writer dropped the field".
-  for present in [
-    "decoding",
-    "compute",
-    "detected_language",
-    "effective_temperature",
-    "sampled_at_nonzero_temperature",
-  ] {
+  // never silently missing the settings that produced it. The derived
+  // `effective_temperature` and the carried `task_facts` record are written
+  // even when their contents are `None` — as an explicit `null`, NOT omitted
+  // like the identity above, because for them `None` is itself the fact ("the
+  // ladder split the segments" / "no language observed" / "unknown worker"),
+  // and a reader must be able to tell that from "the writer dropped the field".
+  for present in ["decoding", "compute", "effective_temperature", "task_facts"] {
     assert!(object.contains_key(present), "`{present}` must be recorded");
   }
+  // The explicit-unknown outcomes inside the carried record are present-null,
+  // not omitted — including the WORKER SCHEDULE, which must never read back as a
+  // fabricated `0` (R6-F2).
+  let facts = object["task_facts"].as_object().unwrap();
   assert!(
-    object["detected_language"].is_null(),
-    "an unobserved detection outcome is an explicit null, not an omission"
+    facts["observed_language"].is_null(),
+    "an unobserved detection is an explicit null, not an omission"
+  );
+  assert!(
+    facts["worker_schedule"].is_null(),
+    "an unknown worker schedule is an explicit null, never a fabricated 0"
   );
 
   assert_eq!(
@@ -829,16 +879,13 @@ fn a_record_missing_a_library_known_field_is_rejected() {
   // block would be a lie about what actually ran. Only the
   // consumer-supplied identity may be omitted.
   //
-  // The two `Option` OUTCOME fields each name a `deserialize_with` to hold
-  // this line at all: serde's derive silently treats a missing `Option`
-  // field as `None` even with no `serde(default)` on it, which for these two
-  // would forge a meaning ("the ladder split the segments" / "no result was
-  // observed") out of a field the writer merely dropped. `detected_language`
-  // uses `required_option`; `effective_temperature` uses the finite-float
-  // `with` helper (also a `deserialize_with`, and it refuses a non-finite
-  // value too — codex round 3, F6). They are asserted here alongside the
-  // plain ones — this is the test that proves the `deserialize_with` actually
-  // defeats that path.
+  // The rule reaches INTO the carried `task_facts`: serde's derive silently
+  // treats a missing `Option` field as `None` even with no `serde(default)` on
+  // it, which for `observed_language`/`worker_schedule` would forge "no language
+  // observed" / "unknown worker" (and, worse, a dropped `drew_from_rng` reads
+  // back `false`) out of a field the writer merely dropped. Each names a
+  // `deserialize_with` (`TaskFacts`' `required_option`) to defeat that path, and
+  // `effective_temperature` the finite-float `with` helper (codex round 3, F6).
   let full = Provenance::for_result(
     &distinctive_decoding(),
     &distinctive_compute(),
@@ -851,16 +898,8 @@ fn a_record_missing_a_library_known_field_is_rejected() {
     "the intact record must round-trip, or the removals below prove nothing"
   );
 
-  for required in [
-    "decoding",
-    "compute",
-    "detected_language",
-    "effective_temperature",
-    // The optimistic direction is the dangerous one: a dropped
-    // `sampled_at_nonzero_temperature` would read back `false` ("never
-    // sampled") and hand `is_reproducible` a guarantee it never earned.
-    "sampled_at_nonzero_temperature",
-  ] {
+  // Top-level required fields: dropping any is rejected.
+  for required in ["decoding", "compute", "effective_temperature", "task_facts"] {
     let mut without = value.clone();
     without.as_object_mut().unwrap().remove(required).unwrap();
     assert!(
@@ -869,15 +908,56 @@ fn a_record_missing_a_library_known_field_is_rejected() {
     );
   }
 
-  // Present-but-null is the honest, ACCEPTED encoding of "no such fact":
-  // it is the omission that is rejected, not the null.
+  // The carried record's OWN required facts, reached inside the nested object —
+  // the WORKER SCHEDULE among them, so a dropped coordinate is rejected rather
+  // than read back as a fabricated `0` (R6-F2), and a dropped `drew_from_rng` is
+  // rejected rather than read back `false` (the optimistic direction that hands
+  // `is_reproducible` a guarantee the run never earned).
+  for required in [
+    "drew_from_rng",
+    "observed_language",
+    "early_stopped",
+    "worker_schedule",
+  ] {
+    let mut without = value.clone();
+    without
+      .as_object_mut()
+      .unwrap()
+      .get_mut("task_facts")
+      .unwrap()
+      .as_object_mut()
+      .unwrap()
+      .remove(required)
+      .unwrap();
+    assert!(
+      serde_json::from_str::<Provenance>(&without.to_string()).is_err(),
+      "a missing `task_facts.{required}` must fail, not default"
+    );
+  }
+
+  // Present-but-null is the honest, ACCEPTED encoding of "no such fact": it is
+  // the omission that is rejected, not the null. `effective_temperature` and the
+  // carried explicit-unknown facts all read back their `None`.
   let mut nulled = value;
   nulled.as_object_mut().unwrap()["effective_temperature"] = serde_json::Value::Null;
-  assert_eq!(
-    serde_json::from_str::<Provenance>(&nulled.to_string())
+  {
+    let facts = nulled
+      .as_object_mut()
       .unwrap()
-      .effective_temperature(),
-    None
+      .get_mut("task_facts")
+      .unwrap()
+      .as_object_mut()
+      .unwrap();
+    facts["observed_language"] = serde_json::Value::Null;
+    facts["worker_schedule"] = serde_json::Value::Null;
+  }
+  let read: Provenance = serde_json::from_str(&nulled.to_string()).unwrap();
+  assert_eq!(read.effective_temperature(), None);
+  assert_eq!(read.task_facts().observed_language(), None);
+  assert_eq!(
+    read.task_facts().worker_schedule(),
+    None,
+    "a null worker schedule reads back explicit unknown, never [0]"
   );
 }
 
@@ -897,14 +977,20 @@ fn for_result_reads_the_carried_sampling_fact_not_the_surviving_segments() {
 
   // A greedy transcript whose decode ALSO ran an unseeded sampled window
   // that got dropped: exactly what the blank-audio drop leaves behind.
-  let filtered = result_at("en", &[0.0]).with_sampled_at_nonzero_temperature();
+  let filtered = TranscriptionResult::new(
+    "Hello world.",
+    vec![TranscriptionSegment::new().with_temperature(0.0)],
+    "en",
+    TranscriptionTimings::new(),
+  )
+  .with_task_facts(TaskFacts::unknown().with_drew_from_rng(true));
   let record = Provenance::for_result(&unseeded, &compute, &filtered);
   assert_eq!(
     record.effective_temperature(),
     Some(0.0),
     "the survivors really are all greedy -- the fix must not come from here"
   );
-  assert!(record.sampled_at_nonzero_temperature());
+  assert!(record.task_facts().drew_from_rng());
   assert!(
     !record.is_reproducible(),
     "an unseeded sampled window happened, even though nothing survived to say so"
@@ -920,7 +1006,7 @@ fn for_result_reads_the_carried_sampling_fact_not_the_surviving_segments() {
   // reproducible -- the answer the old infer-from-survivors rule could not
   // give, because zero segments left it with no evidence and it had to guess.
   let empty = result_at("en", &[]);
-  assert!(!empty.sampled_at_nonzero_temperature());
+  assert!(!empty.task_facts().drew_from_rng());
   let greedy = Provenance::for_result(&unseeded, &compute, &empty);
   assert_eq!(greedy.effective_temperature(), None);
   assert!(
@@ -942,12 +1028,16 @@ fn from_options_and_for_segment_record_the_explicit_draw_fact_not_the_temperatur
 
   // Non-zero temperature, explicit NO draw (the zero-iteration shape).
   assert!(
-    !Provenance::from_options(&decoding, &compute, 0.3, false).sampled_at_nonzero_temperature(),
+    !Provenance::from_options(&decoding, &compute, 0.3, false)
+      .task_facts()
+      .drew_from_rng(),
     "an explicit no-draw at 0.3 is recorded as not sampled, not inferred from 0.3"
   );
   // Zero temperature, explicit draw (proves no inference the other way either).
   assert!(
-    Provenance::from_options(&decoding, &compute, 0.0, true).sampled_at_nonzero_temperature(),
+    Provenance::from_options(&decoding, &compute, 0.0, true)
+      .task_facts()
+      .drew_from_rng(),
     "an explicit draw is recorded even at temperature 0.0"
   );
 
@@ -961,12 +1051,13 @@ fn from_options_and_for_segment_record_the_explicit_draw_fact_not_the_temperatur
     "the segment's rung is still recorded"
   );
   assert!(
-    !record.sampled_at_nonzero_temperature(),
+    !record.task_facts().drew_from_rng(),
     "a 0.3 segment that never drew is not sampled -- for_segment must not infer from 0.3"
   );
   assert!(
     Provenance::for_segment(&decoding, &compute, &never_drew, true)
-      .sampled_at_nonzero_temperature(),
+      .task_facts()
+      .drew_from_rng(),
     "and an explicit draw on that same segment IS recorded"
   );
 }
@@ -1007,7 +1098,7 @@ fn provenance_records_the_real_draw_fact_never_the_temperature() {
     // temperature it is also handed.
     let unseeded = Provenance::from_options(&DecodingOptions::new(), &compute, temperature, drew);
     assert_eq!(
-      unseeded.sampled_at_nonzero_temperature(),
+      unseeded.task_facts().drew_from_rng(),
       drew,
       "temperature {temperature}: the recorded fact is the explicit draw"
     );
@@ -1034,7 +1125,7 @@ fn provenance_records_the_real_draw_fact_never_the_temperature() {
 #[test]
 fn for_result_reads_the_carried_flag_not_the_segment_temperature() {
   // F3 (codex round 4). `for_result` takes the draw fact ONLY from the
-  // result's carried `sampled_at_nonzero_temperature`, never from a segment
+  // result's carried `task_facts().drew_from_rng()`, never from a segment
   // temperature. Segment discovery copies the accepted rung into a segment even
   // when ZERO sampling iterations ran (a `sample_length == 0` window at 0.3
   // lands a 0.3-temperature segment that never drew), so the old
@@ -1052,12 +1143,12 @@ fn for_result_reads_the_carried_flag_not_the_segment_temperature() {
     TranscriptionTimings::new(),
   );
   assert!(
-    !never_drew.sampled_at_nonzero_temperature(),
+    !never_drew.task_facts().drew_from_rng(),
     "the result itself carries no draw"
   );
   let record = Provenance::for_result(&decoding, &compute, &never_drew);
   assert!(
-    !record.sampled_at_nonzero_temperature(),
+    !record.task_facts().drew_from_rng(),
     "the 0.3 segment must NOT be read as a draw -- the carried flag is the only witness"
   );
   assert!(
@@ -1074,10 +1165,10 @@ fn for_result_reads_the_carried_flag_not_the_segment_temperature() {
     "en",
     TranscriptionTimings::new(),
   )
-  .with_sampled_at_nonzero_temperature();
+  .with_task_facts(TaskFacts::unknown().with_drew_from_rng(true));
   let record = Provenance::for_result(&decoding, &compute, &drew_greedy_survivors);
   assert!(
-    record.sampled_at_nonzero_temperature(),
+    record.task_facts().drew_from_rng(),
     "a carried draw survives even when every remaining segment reads 0.0"
   );
   assert!(!record.is_reproducible());
