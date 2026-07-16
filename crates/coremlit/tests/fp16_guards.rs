@@ -50,7 +50,7 @@
 
 use std::{
   collections::BTreeMap,
-  fs,
+  fs, io,
   path::{Path, PathBuf},
 };
 
@@ -88,6 +88,15 @@ struct Stmt {
 struct Graph {
   consts: BTreeMap<String, f64>,
   producers: BTreeMap<String, Stmt>,
+  /// Statement lines that NAME a guarded op (see [`GUARD_LOOKING_OPS`]) but
+  /// did not parse into a resolvable [`Stmt`]. Completeness accounting: a
+  /// guard the reader cannot read is a hole, not a pass. [`Graph::audit`]
+  /// carries these forward and the sweep fails with the line quoted, so a
+  /// re-conversion that emits a guard in syntax this hand-rolled reader does
+  /// not yet handle can never masquerade as a clean sweep — the exact way a
+  /// partial parse used to stay GREEN with one recognized guard beside a new
+  /// vanishing one.
+  unresolved: Vec<String>,
 }
 
 /// Parses a hex float literal (`0x1p-149`, `0x1.5798eep-27`, `0x0p+0`).
@@ -160,65 +169,180 @@ fn arg<'a>(args: &'a str, key: &str) -> Option<&'a str> {
   })
 }
 
-/// Reads a MIL program into constants and producers.
+/// The op names that make a statement *guard-looking*. If the reader cannot
+/// fully parse a statement whose op is one of these, the sweep fails rather
+/// than dropping it silently: it may be a numerically-guarded op emitted in
+/// syntax this hand-rolled reader does not yet handle — exactly what a new
+/// coremltools re-conversion can produce. Covers the guard SITES (`log`,
+/// `rsqrt`, `sqrt`, `real_div`, the norms) AND the floor-contributing ops a
+/// site's guard is resolved through (`add`, `clip`, `maximum`, `softmax`),
+/// because an unreadable `clip` can make a `sqrt` guard vanish just as
+/// silently as an unreadable `sqrt`. `exp` is included as the containment op
+/// the folded-log audit reasons about. The check is dormant on today's tree
+/// (every guard statement parses) and arms only when a re-conversion changes
+/// the shape of one — the bias is deliberately toward a loud review over a
+/// silent drop.
+const GUARD_LOOKING_OPS: &[&str] = &[
+  "log",
+  "rsqrt",
+  "sqrt",
+  "real_div",
+  "instance_norm",
+  "layer_norm",
+  "batch_norm",
+  "add",
+  "clip",
+  "maximum",
+  "softmax",
+  "exp",
+];
+
+/// True when `b` can appear inside a MIL identifier.
+fn is_ident_byte(b: u8) -> bool {
+  b.is_ascii_alphanumeric() || b == b'_'
+}
+
+/// The guard op *called* in `line`, if any: a `NAME(` where NAME is in
+/// [`GUARD_LOOKING_OPS`] and stands as a whole token — not the tail of a
+/// longer identifier such as `catalog(` or `log_softmax(`. Used only on
+/// statement lines that FAILED to parse, to tell a completeness hole (a
+/// guard we must not lose) from a benign non-guard op we never audited.
+fn guard_op_in(line: &str) -> Option<&'static str> {
+  let bytes = line.as_bytes();
+  GUARD_LOOKING_OPS.iter().copied().find(|&op| {
+    let mut from = 0;
+    while let Some(rel) = line[from..].find(op) {
+      let i = from + rel;
+      let after = i + op.len();
+      let before_ok = i == 0 || !is_ident_byte(bytes[i - 1]);
+      if before_ok && bytes.get(after) == Some(&b'(') {
+        return true;
+      }
+      from = i + 1;
+    }
+    false
+  })
+}
+
+/// The outcome of reading one physical line as a MIL statement.
+enum ParseOutcome {
+  /// Not a `tensor<...>` statement line at all — skipped, as before.
+  NotStatement,
+  /// A fully-parsed statement: its variable, producing op, and (when the op
+  /// is a scalar `const`) the resolved value.
+  Parsed {
+    var: String,
+    stmt: Stmt,
+    const_val: Option<f64>,
+  },
+  /// A `tensor<...>` statement line that did not parse. `guard` names the
+  /// guard op it appears to call, if any — `Some` is a completeness hole.
+  Unparsed { guard: Option<&'static str> },
+}
+
+/// Reads one trimmed line. Any `tensor<...>`-shaped statement that does not
+/// parse is reported as [`ParseOutcome::Unparsed`] — never silently skipped —
+/// so a guard emitted in unhandled syntax is surfaced, not lost.
+fn parse_stmt_line(line: &str) -> ParseOutcome {
+  let Some(rest) = line.strip_prefix("tensor<") else {
+    return ParseOutcome::NotStatement;
+  };
+  // From here the line IS a statement; any failure to parse is Unparsed, and
+  // a completeness hole iff the raw line names a guard op.
+  let unparsed = || ParseOutcome::Unparsed {
+    guard: guard_op_in(line),
+  };
+
+  // `fp16, [1, 2999, 29]> var = op(args)[attrs];` — shapes never nest angle
+  // brackets, so the first `>` closes the tensor type.
+  let Some((ty, rest)) = rest.split_once('>') else {
+    return unparsed();
+  };
+  let dtype = ty.split(',').next().unwrap_or("").trim().to_string();
+
+  let Some((var, rest)) = rest.split_once('=') else {
+    return unparsed();
+  };
+  let var = var.trim();
+  if var.is_empty() || !var.chars().all(|c| c.is_alphanumeric() || c == '_') {
+    return unparsed();
+  }
+
+  let rest = rest.trim();
+  let Some(open) = rest.find('(') else {
+    return unparsed();
+  };
+  let op = rest[..open].trim().to_string();
+
+  // Balanced scan for the op's argument list.
+  let mut depth = 0_i32;
+  let mut close = None;
+  for (i, c) in rest[open..].char_indices() {
+    match c {
+      '(' => depth += 1,
+      ')' => {
+        depth -= 1;
+        if depth == 0 {
+          close = Some(open + i);
+          break;
+        }
+      }
+      _ => {}
+    }
+  }
+  let Some(close) = close else {
+    // The op name is already in hand — classify by it directly rather than
+    // re-scanning, so a guard call with an unbalanced arg list is caught.
+    let guard = GUARD_LOOKING_OPS
+      .iter()
+      .copied()
+      .find(|&g| g == op.as_str());
+    return ParseOutcome::Unparsed { guard };
+  };
+  let args = rest[open + 1..close].to_string();
+  let attrs = rest[close + 1..].trim().to_string();
+
+  let const_val = (op == "const").then(|| const_scalar(&attrs)).flatten();
+  ParseOutcome::Parsed {
+    var: var.to_string(),
+    stmt: Stmt { dtype, op, args },
+    const_val,
+  }
+}
+
+/// Reads a MIL program into constants, producers, and — critically — the
+/// guard-looking statements it could NOT read (see [`Graph::unresolved`]).
 fn parse_mil(text: &str) -> Graph {
   let mut consts = BTreeMap::new();
   let mut producers = BTreeMap::new();
+  let mut unresolved = Vec::new();
 
   for line in text.lines() {
     let line = line.trim();
-    let Some(rest) = line.strip_prefix("tensor<") else {
-      continue;
-    };
-    // `fp16, [1, 2999, 29]> var = op(args)[attrs];` — shapes never nest
-    // angle brackets, so the first `>` closes the tensor type.
-    let (ty, rest) = match rest.split_once('>') {
-      Some(parts) => parts,
-      None => continue,
-    };
-    let dtype = ty.split(',').next().unwrap_or("").trim().to_string();
-
-    let Some((var, rest)) = rest.split_once('=') else {
-      continue;
-    };
-    let var = var.trim();
-    if var.is_empty() || !var.chars().all(|c| c.is_alphanumeric() || c == '_') {
-      continue;
-    }
-
-    let rest = rest.trim();
-    let Some(open) = rest.find('(') else { continue };
-    let op = rest[..open].trim().to_string();
-
-    // Balanced scan for the op's argument list.
-    let mut depth = 0_i32;
-    let mut close = None;
-    for (i, c) in rest[open..].char_indices() {
-      match c {
-        '(' => depth += 1,
-        ')' => {
-          depth -= 1;
-          if depth == 0 {
-            close = Some(open + i);
-            break;
-          }
+    match parse_stmt_line(line) {
+      ParseOutcome::NotStatement => {}
+      ParseOutcome::Parsed {
+        var,
+        stmt,
+        const_val,
+      } => {
+        if let Some(value) = const_val {
+          consts.insert(var.clone(), value);
         }
-        _ => {}
+        producers.insert(var, stmt);
       }
+      ParseOutcome::Unparsed { guard: Some(op) } => {
+        unresolved.push(format!("unreadable `{op}` statement: {line}"));
+      }
+      ParseOutcome::Unparsed { guard: None } => {}
     }
-    let Some(close) = close else { continue };
-    let args = rest[open + 1..close].to_string();
-    let attrs = rest[close + 1..].trim().to_string();
-
-    if op == "const"
-      && let Some(value) = const_scalar(&attrs)
-    {
-      consts.insert(var.to_string(), value);
-    }
-    producers.insert(var.to_string(), Stmt { dtype, op, args });
   }
 
-  Graph { consts, producers }
+  Graph {
+    consts,
+    producers,
+    unresolved,
+  }
 }
 
 /// Extracts a scalar `const`'s value from its attribute list:
@@ -274,25 +398,49 @@ impl Graph {
     }
   }
 
-  /// Every guard site in the graph, in a stable order.
-  fn audit(&self) -> Vec<Finding> {
+  /// Every guard site in the graph, in a stable order, together with every
+  /// guard-looking statement the audit could not fully resolve. A non-empty
+  /// [`Audit::unresolved`] is a hard sweep failure: an epsilon this reader
+  /// cannot resolve is a hole (the guard is unreadable), never a silent pass.
+  fn audit(&self) -> Audit {
     let mut found = Vec::new();
+    // Parser-level holes (unreadable statement shapes) carry through; audit-
+    // level holes (a recognized site whose epsilon will not resolve) join
+    // them below.
+    let mut unresolved = self.unresolved.clone();
     for (var, stmt) in &self.producers {
       let eps_kwarg = self.value(arg(&stmt.args, "epsilon"));
       let site = match stmt.op.as_str() {
-        // `log` and `rsqrt` always carry an `epsilon` in CoreML MIL, so
-        // they are always guard sites — including when that epsilon has
-        // already been folded to a literal `0x0p+0`.
-        "log" | "rsqrt" => {
-          let (floor, guard) = self
-            .floor(arg(&stmt.args, "x"), 0)
-            .unwrap_or((0.0, "-".into()));
-          Some((eps_kwarg.unwrap_or(0.0), floor, guard))
-        }
-        // A normalization's epsilon is its whole guard.
-        "instance_norm" | "layer_norm" | "batch_norm" => eps_kwarg.map(|e| (e, 0.0, "norm".into())),
+        // `log` and `rsqrt` always carry an `epsilon` in CoreML MIL, so they
+        // are always guard sites — including when that epsilon has already
+        // been folded to a literal `0x0p+0`. An epsilon that will NOT resolve
+        // is a hole (we cannot read the guard), not a site to fold to zero.
+        "log" | "rsqrt" => match eps_kwarg {
+          Some(eps) => {
+            let (floor, guard) = self
+              .floor(arg(&stmt.args, "x"), 0)
+              .unwrap_or((0.0, "-".into()));
+            Some((eps, floor, guard))
+          }
+          None => {
+            unresolved.push(unresolved_site(var, stmt));
+            None
+          }
+        },
+        // A normalization's epsilon is its whole guard. Unresolvable means the
+        // guard is unreadable, not absent — the site must FAIL the audit, not
+        // vanish from it (the old `eps_kwarg.map(...)` dropped it silently).
+        "instance_norm" | "layer_norm" | "batch_norm" => match eps_kwarg {
+          Some(e) => Some((e, 0.0, "norm".into())),
+          None => {
+            unresolved.push(unresolved_site(var, stmt));
+            None
+          }
+        },
         // `sqrt` has no epsilon: it is a guard site only when something
-        // constant floors its input.
+        // constant floors its input. A genuinely dynamic input is no claim,
+        // not a hole — its guard, if any, lives in a floor-contributing op
+        // whose own unreadability is caught at parse time.
         "sqrt" => self
           .floor(arg(&stmt.args, "x"), 0)
           .map(|(f, g)| (0.0, f, g)),
@@ -314,8 +462,30 @@ impl Graph {
         });
       }
     }
-    found
+    Audit {
+      findings: found,
+      unresolved,
+    }
   }
+}
+
+/// The result of auditing a graph: every resolved guard site, plus every
+/// guard-looking statement that could not be fully read. Completeness lives
+/// here — a non-empty `unresolved` is a hard sweep failure, so a partial
+/// parse can never report a clean fp16 sweep.
+struct Audit {
+  findings: Vec<Finding>,
+  unresolved: Vec<String>,
+}
+
+/// A one-line completeness failure for a recognized guard site whose epsilon
+/// did not resolve to a constant — the statement quoted so the hole is
+/// actionable (which op, which var, and the arguments as read).
+fn unresolved_site(var: &str, stmt: &Stmt) -> String {
+  format!(
+    "unresolvable epsilon on {}/{} {var}: {}({})",
+    stmt.op, stmt.dtype, stmt.op, stmt.args
+  )
 }
 
 /// One numerically-guarded op, with the guard resolved to a number.
@@ -537,6 +707,31 @@ const TWO_SITE_LOG_SOFTMAX: &str = r#"
             tensor<fp16, [1, 589, 7]> b_cast_fp16 = log(epsilon = b_epsilon, x = b_softmax_cast_fp16)[name = tensor<string, []>("b_log")];
 "#;
 
+/// One clean, surviving guard (whisper's mel `add(0x1p-24) -> log`) beside a
+/// second `log` emitted in syntax this reader cannot parse — its argument
+/// list left unbalanced, a stand-in for the unhandled shapes a new coremltools
+/// re-conversion can produce. This is the partial-parse trap: the recognized
+/// guard alone must NOT let the sweep report success while the unreadable
+/// vanishing guard silently disappears. The audit is required to surface the
+/// second statement as unresolved, not drop it.
+const VALID_GUARD_PLUS_UNREADABLE_GUARD: &str = r#"
+            tensor<fp16, []> ok_eps = const()[name = tensor<string, []>("ok_eps"), val = tensor<fp16, []>(0x1p-24)];
+            tensor<fp16, [80, 3000]> ok_mel = add(x = ok_mel_1, y = ok_eps)[name = tensor<string, []>("ok_mel")];
+            tensor<fp16, []> ok_log_eps = const()[name = tensor<string, []>("ok_log_eps"), val = tensor<fp16, []>(0x0p+0)];
+            tensor<fp16, [80, 3000]> ok_log = log(epsilon = ok_log_eps, x = ok_mel)[name = tensor<string, []>("ok_log")];
+            tensor<fp16, [1, 589, 7]> bad_softmax = softmax(axis = bad_axis, x = bad_linear)[name = tensor<string, []>("bad_softmax")];
+            tensor<fp16, [1, 589, 7]> bad_log = log(epsilon = bad_eps, x = bad_softmax [name = tensor<string, []>("bad_log")];
+"#;
+
+/// A `batch_norm` whose `epsilon` names a var that is never defined as a
+/// scalar const — the guard is present but unreadable. The old
+/// `eps_kwarg.map(...)` dropped such a site silently (the `.map` short-circuits
+/// on `None`); completeness requires it to FAIL the audit with the statement
+/// quoted, exactly as a malformed parse does.
+const NORM_WITH_UNRESOLVABLE_EPSILON: &str = r#"
+            tensor<fp16, [1, 384, 1, 1500]> n_out = batch_norm(beta = n_beta, epsilon = n_eps_missing, gamma = n_gamma, mean = n_mean, variance = n_var, x = n_in)[name = tensor<string, []>("n_out")];
+"#;
+
 /// The vanishing guard sites of an already-audited graph, rendered and sorted
 /// as a **multiset** — duplicates PRESERVED. Two sites with the same signature
 /// are two defects, not one: a `dedup`/set here would let a reconversion that
@@ -561,8 +756,19 @@ fn vanishing_sites(findings: &[Finding]) -> Vec<String> {
 
 /// The vanishing guard sites of a MIL program (parse + audit + multiset render).
 /// Only `log`/`sqrt`/`rsqrt`/`real_div`/norm sites, not every op.
+///
+/// Panics if the audit left any guard-looking statement unresolved, so every
+/// hermetic snippet that routes through here doubles as proof it parsed
+/// completely — a dropped guard can never hide inside a merely-empty vanishing
+/// list.
 fn vanishing(mil: &str) -> Vec<String> {
-  vanishing_sites(&parse_mil(mil).audit())
+  let audit = parse_mil(mil).audit();
+  assert!(
+    audit.unresolved.is_empty(),
+    "audit left guard-looking statement(s) unresolved: {:?}",
+    audit.unresolved
+  );
+  vanishing_sites(&audit.findings)
 }
 
 #[test]
@@ -619,7 +825,16 @@ fn detects_the_alignkit_log_softmax_defect() {
 
   let graph = parse_mil(ALIGNKIT_LOG_SOFTMAX);
   let audit = graph.audit();
-  let log = audit.iter().find(|f| f.op == "log").expect("a log site");
+  assert!(
+    audit.unresolved.is_empty(),
+    "the real alignkit excerpt must parse completely: {:?}",
+    audit.unresolved
+  );
+  let log = audit
+    .findings
+    .iter()
+    .find(|f| f.op == "log")
+    .expect("a log site");
   assert!(!log.survives_fp16());
   assert!(
     log.is_decomposed_log_softmax(),
@@ -662,7 +877,16 @@ fn accepts_whisperkits_mel_guard() {
 
   let graph = parse_mil(WHISPER_MEL);
   let audit = graph.audit();
-  let log = audit.iter().find(|f| f.op == "log").expect("a log site");
+  assert!(
+    audit.unresolved.is_empty(),
+    "the real whisper-mel excerpt must parse completely: {:?}",
+    audit.unresolved
+  );
+  let log = audit
+    .findings
+    .iter()
+    .find(|f| f.op == "log")
+    .expect("a log site");
   assert_eq!(log.eps, 0.0, "the log's OWN epsilon is 0x0p+0 here");
   assert_eq!(
     log.floor, FP16_MIN_SUBNORMAL,
@@ -696,6 +920,85 @@ fn same_signature_sites_are_a_multiset_not_a_set() {
   assert_eq!(sites[0], "log/fp16 guard=softmax->log eff=0e0");
 }
 
+/// Completeness (partial-parse face). A graph with ONE recognized, surviving
+/// guard beside ONE guard in syntax the reader cannot parse must FAIL the
+/// audit: the unreadable statement is surfaced, never dropped so the recognized
+/// guard alone reports a clean sweep. This is the exact rot a re-conversion can
+/// introduce — new coremltools, new MIL shape — and the reason the sweep audits
+/// completeness, not merely the guards it happens to recognize. Mutating the
+/// reader back to drop-silently (classifying every unparsed line as
+/// non-guard) turns `unresolved` empty and this assertion red.
+#[test]
+fn a_partial_parse_fails_the_audit_never_reports_clean() {
+  let audit = parse_mil(VALID_GUARD_PLUS_UNREADABLE_GUARD).audit();
+
+  // The clean mel-style guard is still audited and still survives...
+  assert!(
+    audit
+      .findings
+      .iter()
+      .any(|f| f.op == "log" && f.survives_fp16()),
+    "the valid mel-style guard must still be audited and survive"
+  );
+  // ...but the unreadable second `log` is surfaced as a completeness hole,
+  // not silently dropped: the audit is NOT clean, and it quotes the statement.
+  assert!(
+    !audit.unresolved.is_empty(),
+    "an unreadable guard statement must fail the audit, not vanish — got no unresolved holes"
+  );
+  assert!(
+    audit
+      .unresolved
+      .iter()
+      .any(|u| u.contains("log") && u.contains("bad_log")),
+    "the unresolved report must quote the offending `log` statement: {:?}",
+    audit.unresolved
+  );
+}
+
+/// Completeness (unresolvable-epsilon face). A recognized guard SITE
+/// (`batch_norm`) whose epsilon does not resolve to a constant is a hole, not
+/// an absence: the guard is unreadable. The old `eps_kwarg.map(...)`
+/// short-circuited on `None` and dropped the site; it must now fail the audit
+/// with the statement quoted. Reverting the norm arm to `eps_kwarg.map(...)`
+/// turns `unresolved` empty and this assertion red.
+#[test]
+fn a_norm_with_an_unreadable_epsilon_is_a_hole_not_a_skip() {
+  let audit = parse_mil(NORM_WITH_UNRESOLVABLE_EPSILON).audit();
+  assert!(
+    audit.findings.is_empty(),
+    "an unresolvable-epsilon norm yields no resolved finding, got: {:?}",
+    audit
+      .findings
+      .iter()
+      .map(Finding::render)
+      .collect::<Vec<_>>()
+  );
+  assert!(
+    audit
+      .unresolved
+      .iter()
+      .any(|u| u.contains("batch_norm") && u.contains("n_out")),
+    "...but it must be reported unresolved, quoting the statement — not dropped: {:?}",
+    audit.unresolved
+  );
+}
+
+/// The walk propagates I/O errors instead of flattening them into a silent
+/// early return: a `read_dir` failure must never quietly shrink the sweep to
+/// whatever happened to be readable. The old `let Ok(entries) = .. else
+/// return` swallowed exactly this.
+#[test]
+fn discover_propagates_read_dir_errors() {
+  let mut out = Vec::new();
+  let missing = models_dir().join("__no_such_subtree_for_the_walk__");
+  assert!(
+    discover(&missing, &mut out).is_err(),
+    "read_dir on a nonexistent path must return Err, not an empty Ok"
+  );
+  assert!(out.is_empty(), "a failed walk collects nothing");
+}
+
 // ---------------------------------------------------------------------------
 // The sweep — runs iff `Models/` is on disk (see `build.rs`).
 // ---------------------------------------------------------------------------
@@ -716,11 +1019,18 @@ fn models_dir() -> PathBuf {
 /// treating them as models would make the "a .mlmodelc must have a
 /// readable model.mil" hard failure fire on every machine that pulled the
 /// argmax models from the Hub.
-fn discover(root: &Path, out: &mut Vec<PathBuf>) {
-  let Ok(entries) = fs::read_dir(root) else {
-    return;
-  };
-  for entry in entries.flatten() {
+///
+/// A `read_dir` failure or an unreadable directory entry PROPAGATES as an
+/// `Err` rather than flattening into a silent early return — the walk must
+/// never quietly shrink the sweep to whatever happened to be readable, which
+/// is the same "fixture went missing, test went green" mode the pins guard
+/// against.
+fn discover(root: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
+  let entries = fs::read_dir(root)
+    .map_err(|e| io::Error::new(e.kind(), format!("read_dir {}: {e}", root.display())))?;
+  for entry in entries {
+    let entry = entry
+      .map_err(|e| io::Error::new(e.kind(), format!("dir entry under {}: {e}", root.display())))?;
     let path = entry.path();
     if !path.is_dir() {
       continue;
@@ -731,9 +1041,10 @@ fn discover(root: &Path, out: &mut Vec<PathBuf>) {
     if path.extension().is_some_and(|e| e == "mlmodelc") {
       out.push(path);
     } else {
-      discover(&path, out);
+      discover(&path, out)?;
     }
   }
+  Ok(())
 }
 
 #[cfg_attr(
@@ -750,7 +1061,8 @@ fn every_shipped_model_graph_survives_fp16() {
   );
 
   let mut models = Vec::new();
-  discover(&root, &mut models);
+  discover(&root, &mut models)
+    .unwrap_or_else(|e| panic!("walking Models/ failed instead of silently skipping: {e}"));
   models.sort();
 
   // Non-vacuity. A sweep that found nothing must never report `ok`.
@@ -777,7 +1089,26 @@ fn every_shipped_model_graph_survives_fp16() {
     let text = fs::read_to_string(&mil)
       .unwrap_or_else(|e| panic!("{rel}: .mlmodelc has no readable model.mil ({e})"));
 
-    let findings = parse_mil(&text).audit();
+    let Audit {
+      findings,
+      unresolved,
+    } = parse_mil(&text).audit();
+
+    // Completeness: a guard-looking statement the reader could not resolve is
+    // a hole, not a pass. A PARTIAL parse — one recognized guard beside a new
+    // vanishing one in syntax this reader does not handle — must fail the
+    // sweep with the offending statement quoted, never slip through GREEN on
+    // the strength of the one guard it happened to recognize.
+    if !unresolved.is_empty() {
+      failures.push(format!(
+        "{rel}: {} guard-looking statement(s) the reader could not resolve — a partial parse \
+         fails the sweep rather than dropping a guard. Re-convert with a readable guard or teach \
+         the reader this shape:\n      {}",
+        unresolved.len(),
+        unresolved.join("\n      ")
+      ));
+    }
+
     assert!(
       !findings.is_empty(),
       "{rel}: parsed zero guard sites from a {} byte graph — the parser has rotted",
