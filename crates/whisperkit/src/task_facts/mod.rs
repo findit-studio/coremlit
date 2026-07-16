@@ -31,8 +31,8 @@
 //!
 //! # Explicit unknown, never a fabricated default
 //!
-//! [`Self::worker_schedule`] and [`Self::observed_language`] each carry an
-//! **explicit-unknown** state (`None`) distinct from any value. A record built
+//! [`TaskFacts::worker_schedule`] and [`TaskFacts::observed_language`] each carry
+//! an **explicit-unknown** state (`None`) distinct from any value. A record built
 //! from options with no decode to speak for
 //! ([`Provenance::from_options`](crate::provenance::Provenance::from_options)),
 //! or a transcript assembled by hand, knows no worker coordinate and witnessed

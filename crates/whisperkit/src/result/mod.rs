@@ -15,8 +15,7 @@
 //! feature) never emits `null` for the Swift-parity fields; `Vec`/`String`
 //! fields that carry meaningful "not present" semantics are
 //! empty-means-absent (`skip_serializing_if` + `default`, golden §10). The
-//! sole exception is the Rust-only
-//! [`TaskFacts`](crate::task_facts::TaskFacts) a
+//! sole exception is the Rust-only [`TaskFacts`] a
 //! [`TranscriptionResult`] carries, whose explicit-unknown reproducibility
 //! facts serialize as a deliberate `null` (see that type) so a dropped key
 //! is distinguishable from an unknown value.
@@ -175,8 +174,8 @@ pub struct TranscriptionSegment {
   ///
   /// Bridged through the finite-float `serde` helper (codex round 3, F6) — the
   /// one segment float that is: it is what `provenance`'s
-  /// `unanimous_temperature`/`sampled_at_nonzero_temperature` read to decide
-  /// reproducibility, so a non-finite value silently changing across a round
+  /// `unanimous_temperature` reads for the effective temperature it records, so
+  /// a non-finite value silently changing across a round
   /// trip would corrupt that record. The descriptive telemetry floats beside
   /// it (`avg_logprob`, `compression_ratio`, `no_speech_prob`) are left as-is:
   /// `compression_ratio` legitimately reaches `f32::INFINITY` on empty text.
@@ -2464,7 +2463,7 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
   // false path stays EXACTLY Swift's `resultIndex + segmentIndex`, byte-for-byte
   // (its duplicate ids are pinned parity), and `id_base` is left untouched.
   //
-  // The span is the chunk's DECODED ordinal count (`decoded_segment_span`),
+  // The span is the chunk's DECODED ordinal count (`TaskFacts::decoded_span`),
   // carried on the result, NOT the surviving segments' `max local id + 1`: a
   // chunk whose segments were ALL dropped (a blank-only VAD chunk) survives with
   // zero segments yet still consumed ordinals, and inferring the span from the

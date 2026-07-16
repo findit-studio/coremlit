@@ -809,6 +809,90 @@ fn early_stop_does_not_leak_into_fallback_retries() {
 
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn a_rejected_attempts_early_stop_survives_the_fallback_selection() {
+  // R6-F1 (codex round 6). A callback truncates attempt 0, whose bad partial then
+  // CROSSES the logprob threshold and falls back; attempt 1 runs to completion
+  // and is accepted WITHOUT stopping. The accepted attempt was not truncated, so
+  // the pre-fix accepted-only read (`decoding_result.early_stopped()`) recorded
+  // early_stopped=false -- losing the history that a callback stop fired at all.
+  // The unified sink OR-s the rejected attempt's stop before the fallback drops
+  // it, so the fact survives to the accepted result, and the two runs -- one with
+  // the callback, one without -- leave DISTINCT records even though their text is
+  // identical: the truncated one is not reproducible from the options alone.
+  //
+  // Mutation proof: revert `decode_with_fallback` to merge `false` for the early
+  // stop (or read only the accepted `DecodingResult::early_stopped`) and the
+  // `early_stopped()` assertion below fails, reading back false.
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  let hello = t.encode(" Hello").unwrap()[0];
+  script_clean_window(&mut mock, hello);
+  let compute = crate::options::ComputeOptions::new();
+  // Same fallback-forcing configuration as the leak test above, but with a ZERO
+  // fallback increment so the accepted retry stays greedy (temperature 0.0) and
+  // never DRAWS -- isolating the early-stop fact as the only thing that can move
+  // the reproducibility answer between the two runs below.
+  let options = DecodingOptions::new()
+    .with_temperature_fallback_count(1)
+    .with_temperature_increment_on_fallback(0.0)
+    .maybe_first_token_logprob_threshold(None)
+    .maybe_logprob_threshold(Some(-0.1));
+
+  // WITHOUT a callback: attempt 0 runs full, still fails the threshold, falls
+  // back, and the greedy attempt 1 is accepted -- an un-truncated, non-sampling,
+  // reproducible run.
+  let uncut = TranscribeTask::new(&mock, &t)
+    .run(&vec![0.1; 32_000], &options)
+    .unwrap();
+  assert_eq!(uncut.text(), "Hello");
+  assert!(!uncut.task_facts().early_stopped());
+  assert!(
+    !uncut.task_facts().drew_from_rng(),
+    "greedy retry never draws"
+  );
+  let uncut_prov = crate::provenance::Provenance::for_result(&options, &compute, &uncut);
+  assert!(uncut_prov.is_reproducible());
+
+  // WITH a callback that stops attempt 0's third sampled step (call 6, exactly as
+  // the leak test): the rejected attempt is truncated, attempt 1 completes.
+  let calls = std::sync::Mutex::new(0usize);
+  let callback: &(dyn Fn(&crate::result::TranscriptionProgress) -> Option<bool> + Sync) =
+    &|_progress| {
+      let mut seen = calls.lock().unwrap();
+      *seen += 1;
+      Some(*seen != 6)
+    };
+  let truncated = TranscribeTask::new(&mock, &t)
+    .with_progress_callback(callback)
+    .run(&vec![0.1; 32_000], &options)
+    .unwrap();
+  assert_eq!(
+    truncated.text(),
+    "Hello",
+    "the accepted retry still ran to completion"
+  );
+  assert!(
+    truncated.task_facts().early_stopped(),
+    "the REJECTED attempt's early stop must survive the fallback selection"
+  );
+  assert!(
+    !truncated.task_facts().drew_from_rng(),
+    "the greedy retry never draws, so early_stopped is the ONLY differing fact"
+  );
+  let trunc_prov = crate::provenance::Provenance::for_result(&options, &compute, &truncated);
+  assert!(trunc_prov.task_facts().early_stopped());
+  assert!(
+    !trunc_prov.is_reproducible(),
+    "a callback truncation -- even of a rejected attempt -- is not reproducible from options alone"
+  );
+  assert_ne!(
+    uncut_prov, trunc_prov,
+    "the surviving early-stop fact distinguishes two runs whose text is identical"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn a_callback_truncation_is_recorded_and_is_not_reproducible() {
   // F4a (codex round 5). A progress callback returning Some(false) TRUNCATES the
   // transcript -- a caller CONTROL action -- but the callback is a closure the

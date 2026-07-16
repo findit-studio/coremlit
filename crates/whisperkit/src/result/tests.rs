@@ -277,6 +277,125 @@ fn merge_drop_on_advances_the_id_base_past_an_all_dropped_chunk() {
   );
 }
 
+/// A speech chunk decoding one segment carrying `token`, tracking a decoded
+/// span of 1 (coremlit issue #14, codex round 6 regression fixtures).
+fn span_one_speech(token: u32) -> TranscriptionResult {
+  let mut s = TranscriptionSegment::new();
+  s.set_id(0).set_text(" W").set_tokens(vec![token]);
+  TranscriptionResult::new(" W", vec![s], "en", TranscriptionTimings::new())
+    .with_task_facts(TaskFacts::unknown().with_decoded_span(Some(1)))
+}
+
+/// Segment ids of a result, in order.
+fn segment_ids(result: &TranscriptionResult) -> Vec<usize> {
+  result.segments_slice().iter().map(|s| s.id()).collect()
+}
+
+#[test]
+fn drop_on_merge_is_associative_over_the_id_span() {
+  // R6-F3 (codex round 6). A staged merge -- a VAD result re-merged at streaming
+  // finalize -- must renumber segments IDENTICALLY to a one-shot merge, which
+  // requires the merged result to STORE its aggregate id span rather than drop
+  // it. Script [speech(span 1), all-dropped(span 1), speech(span 1)] under drop
+  // ON: the dropped middle chunk still consumes an ordinal, so the second speech
+  // sits at id 2, and a staged re-merge must reach the same 2.
+  //
+  // Mutation proof: revert the merge to store no aggregate span (the merged
+  // result's `decoded_span` back to `None`) and the staged ids collapse to
+  // [0, 1], failing the associativity assertion below.
+  let opts = DecodingOptions::new(); // drop ON (the default)
+  let a = span_one_speech(20);
+  let b = TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
+    .with_task_facts(TaskFacts::unknown().with_decoded_span(Some(1)));
+  let c = span_one_speech(21);
+
+  // One-shot over all three.
+  let one_shot =
+    merge_transcription_results_with_options(&[a.clone(), b.clone(), c.clone()], &opts);
+  assert_eq!(
+    segment_ids(&one_shot),
+    vec![0, 2],
+    "the second speech sits past the dropped chunk's consumed ordinal"
+  );
+  assert_eq!(
+    one_shot.task_facts().decoded_span(),
+    Some(3),
+    "the aggregate span is the sum of the children's"
+  );
+
+  // Staged: merge [a, b] (the VAD result), then re-merge that with c (finalize).
+  let vad = merge_transcription_results_with_options(&[a, b], &opts);
+  assert_eq!(
+    vad.task_facts().decoded_span(),
+    Some(2),
+    "the VAD result STORES its aggregate span (the R6-F3 fix)"
+  );
+  let staged = merge_transcription_results_with_options(&[vad, c], &opts);
+  assert_eq!(
+    segment_ids(&staged),
+    segment_ids(&one_shot),
+    "a staged re-merge renumbers identically to a one-shot merge"
+  );
+  assert_eq!(staged.task_facts().decoded_span(), Some(3));
+}
+
+#[test]
+fn local_agreement_over_a_premerged_vad_result_preserves_the_id_span() {
+  // The LocalAgreement finalize re-merges kept results through
+  // `merge_transcription_results_with_words`; when one is itself a VAD-merged
+  // result, its STORED aggregate span must drive the re-merge's id base (R6-F3),
+  // or the confirmed-word transcript's segments renumber onto the earlier
+  // chunk's ordinals. Same [speech, all-dropped] VAD result, re-merged with a
+  // trailing speech chunk through the word-aware door.
+  let opts = DecodingOptions::new();
+  let vad = merge_transcription_results_with_options(
+    &[
+      span_one_speech(20),
+      TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
+        .with_task_facts(TaskFacts::unknown().with_decoded_span(Some(1))),
+    ],
+    &opts,
+  );
+  let confirmed = [WordTiming::new(" W W", Vec::<u32>::new(), 0.0, 1.0, 1.0)];
+  let finalized =
+    merge_transcription_results_with_words(&[vad, span_one_speech(21)], &confirmed, &opts);
+  assert_eq!(
+    segment_ids(&finalized),
+    vec![0, 2],
+    "the trailing chunk sits past the pre-merged VAD result's stored span, not on id 1"
+  );
+}
+
+#[test]
+fn merge_concatenates_worker_schedules_not_just_the_first() {
+  // R6-F2 (codex round 6), at the merge boundary. A merge of worker coordinates
+  // [0] and [2] must be distinguishable from [0] and [1] -- the pre-fix merge
+  // kept only the FIRST child's coordinate, collapsing both to [0], so two
+  // seeded VAD runs at different chunk structures left indistinguishable records.
+  //
+  // Mutation proof: revert the merge to `results.first()`'s coordinate and both
+  // schedules collapse to [0], failing the inequality below.
+  let at = |worker: usize| {
+    TranscriptionResult::new("x", Vec::new(), "en", TranscriptionTimings::new())
+      .with_task_facts(TaskFacts::unknown().with_worker(worker))
+  };
+  let merged_02 = merge_transcription_results(&[at(0), at(2)]);
+  let merged_01 = merge_transcription_results(&[at(0), at(1)]);
+  assert_eq!(
+    merged_02.task_facts().worker_schedule(),
+    Some([0, 2].as_slice())
+  );
+  assert_eq!(
+    merged_01.task_facts().worker_schedule(),
+    Some([0, 1].as_slice())
+  );
+  assert_ne!(
+    merged_02.task_facts().worker_schedule(),
+    merged_01.task_facts().worker_schedule(),
+    "the collapsed pre-fix merge made these two indistinguishable"
+  );
+}
+
 /// A result carrying nothing but text — the shape `transcribe_all` returns
 /// for a chunk/clip whose segments were all emptied (or, independently of
 /// the blank-audio drop, for any clip shorter than `window_clip_time`).
