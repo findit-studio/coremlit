@@ -850,7 +850,7 @@ fn decoding_result_defaults_match_swift_empty_results() {
   // type.
   assert_eq!(r.first_token_log_prob(), 0.0);
   // F3 (codex round 3): a fresh result observed no `<|lang|>` token.
-  assert!(!r.language_observed());
+  assert_eq!(r.observed_language(), None);
   assert_eq!(DecodingResult::default(), DecodingResult::new());
 }
 
@@ -859,7 +859,7 @@ fn decoding_result_builder_vocabulary() {
   let r = DecodingResult::new()
     .with_language("en")
     .with_language_probs(vec![("en".to_string(), 0.98)])
-    .with_language_observed(true)
+    .maybe_observed_language(Some("en".to_string()))
     .with_tokens(vec![50364u32, 15339])
     .with_token_log_probs(vec![(50364u32, -0.05)])
     .with_text("hello")
@@ -869,7 +869,7 @@ fn decoding_result_builder_vocabulary() {
     .with_compression_ratio(1.6)
     .with_first_token_log_prob(-0.8);
   assert_eq!(r.language(), "en");
-  assert!(r.language_observed());
+  assert_eq!(r.observed_language(), Some("en"));
   assert_eq!(r.language_probs_slice(), &[("en".to_string(), 0.98)]);
   assert_eq!(r.tokens_slice(), &[50364u32, 15339]);
   assert_eq!(r.token_log_probs_slice(), &[(50364u32, -0.05)]);

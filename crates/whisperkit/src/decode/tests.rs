@@ -177,11 +177,12 @@ fn negative_temperature_decode_with_timestamp_filter_does_not_panic() {
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn language_observed_only_for_a_predicted_language_token() {
-  // F2 (codex round 4). The `language_observed` fact is `true` ONLY when the
-  // model PREDICTS a `<|lang|>` token at a position at/after the forced prompt:
-  // a CONFIGURED language, the "en" fallback, and a FORCED prefill `<|lang|>`
-  // are all inputs/defaults, not detections, so the pipeline records no
-  // observation for them.
+  // F2 (codex round 4) / F1 (codex round 5). `observed_language` is `Some(code)`
+  // ONLY when the model PREDICTS a `<|lang|>` token at a position at/after the
+  // forced prompt, and it carries the PREDICTED code — never the Swift display
+  // `language`, which follows the first-in-the-whole-slice rule and so reports a
+  // forced prefill `<|en|>`. A CONFIGURED language, the "en" fallback, and a
+  // FORCED prefill `<|lang|>` are all inputs/defaults, not detections.
   let t = tiny_tokenizer();
   let s = special();
   let es = t.token_to_id("<|es|>").unwrap();
@@ -211,8 +212,9 @@ fn language_observed_only_for_a_predicted_language_token() {
     &t,
   );
   assert_eq!(configured.language(), "es");
-  assert!(
-    !configured.language_observed(),
+  assert_eq!(
+    configured.observed_language(),
+    None,
     "a configured language is copied, not detected"
   );
 
@@ -240,9 +242,50 @@ fn language_observed_only_for_a_predicted_language_token() {
     "en",
     "forced <|en|> is still the display language"
   );
-  assert!(
-    !forced.language_observed(),
+  assert_eq!(
+    forced.observed_language(),
+    None,
     "a FORCED prefill <|en|> is an input, not a detection -- never observed"
+  );
+
+  // Branch 2c -- FORCED `<|en|>` prefill, but the model PREDICTS `<|es|>` (F1,
+  // codex round 5): the divergence the whole finding turns on. `without_timestamps`
+  // drops the `TimestampRulesFilter`, so the model freely predicts `<|es|>` at
+  // the first free position AFTER the forced `[SOT, <|en|>, <|transcribe|>,
+  // <|notimestamps|>]`. The DISPLAY language stays the Swift-faithful FIRST
+  // language token in the whole slice -- the forced `<|en|>` -- while the
+  // OBSERVATION is the PREDICTED `<|es|>`. Pre-fix, `observed_language` was a
+  // mere boolean and the pipeline reconstructed the string from the display
+  // `language`, recording `"en"` for a run that plainly detected `"es"`.
+  let mut mock = MockBackend::new();
+  mock.push_token_steps(&[
+    s.english_token(),       // pos 0: overridden by prompt[1]
+    s.transcribe_token(),    // pos 1: overridden by prompt[2]
+    s.no_timestamps_token(), // pos 2: overridden by prompt[3]
+    es,                      // first PREDICTED token: a language token, after the prompt
+    2425,
+    s.end_token(),
+  ]);
+  let forced_en_predicts_es = run_mock(
+    &mock,
+    &[
+      s.start_of_transcript_token(),
+      s.english_token(),
+      s.transcribe_token(),
+      s.no_timestamps_token(),
+    ],
+    &DecodingOptions::new().with_without_timestamps(),
+    &t,
+  );
+  assert_eq!(
+    forced_en_predicts_es.language(),
+    "en",
+    "the DISPLAY language is the forced-prefill <|en|>, first in the whole slice"
+  );
+  assert_eq!(
+    forced_en_predicts_es.observed_language(),
+    Some("es"),
+    "the OBSERVATION is the PREDICTED <|es|>, never the forced display <|en|>"
   );
 
   // Branch 2b -- GENUINELY PREDICTED token (F2, codex round 4): a bare `[SOT]`
@@ -264,8 +307,9 @@ fn language_observed_only_for_a_predicted_language_token() {
     "es",
     "the predicted <|es|> is the display language"
   );
-  assert!(
-    predicted.language_observed(),
+  assert_eq!(
+    predicted.observed_language(),
+    Some("es"),
     "a <|lang|> token PREDICTED after the prompt is a genuine detection"
   );
 
@@ -287,8 +331,9 @@ fn language_observed_only_for_a_predicted_language_token() {
   ];
   let fallback = run_mock(&mock, &prompt_no_lang, &DecodingOptions::new(), &t);
   assert_eq!(fallback.language(), crate::constants::DEFAULT_LANGUAGE_CODE);
-  assert!(
-    !fallback.language_observed(),
+  assert_eq!(
+    fallback.observed_language(),
+    None,
     "the \"en\" fallback is a default, not a detection"
   );
 }
@@ -320,8 +365,9 @@ fn zero_iteration_decode_forces_english_but_observes_nothing() {
     "en",
     "the display language is the forced <|en|>"
   );
-  assert!(
-    !result.language_observed(),
+  assert_eq!(
+    result.observed_language(),
+    None,
     "a zero-iteration decode predicts nothing, so it observes no language"
   );
 }

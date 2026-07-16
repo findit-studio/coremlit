@@ -519,6 +519,67 @@ fn genuine_observation_survives_a_later_failed_probe() {
 
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn a_predicted_language_is_recorded_over_the_forced_display_language() {
+  // F1 (codex round 5). The default multilingual prefill FORCES `<|en|>` into
+  // the prompt, and `without_timestamps` (a public config) drops the
+  // `TimestampRulesFilter`, so the model can freely PREDICT `<|es|>` at the
+  // first free position after it. The Swift-faithful DISPLAY language is the
+  // FIRST language token in the whole slice -- the forced `<|en|>` -- while the
+  // OBSERVATION is the PREDICTED `<|es|>`.
+  //
+  // Pre-fix, `decode_with_fallback` reconstructed the observation from the
+  // display `result.language()` (the forced `<|en|>`), recording `"en"` for a
+  // run that plainly detected `"es"`; the observation now flows from the
+  // decode's own `observed_language`, so the display stays `"en"` and the
+  // detection is `"es"`.
+  let t = tiny_tokenizer();
+  let s = special();
+  let es = t.token_to_id("<|es|>").unwrap();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  // Prefill [SOT, <|en|>, <|transcribe|>, <|notimestamps|>] forces positions
+  // 0..=3; the first FREE prediction is `<|es|>`, then a text token, then EOT.
+  mock.push_token_steps(&[
+    s.english_token(),
+    s.transcribe_token(),
+    s.no_timestamps_token(),
+    es,
+    2425,
+    s.end_token(),
+  ]);
+  // Default `detect_language()` is false (use_prefill_prompt is set), so NO
+  // probe runs: the observation can only come from the decode's predicted token.
+  let options = DecodingOptions::new().with_without_timestamps();
+  assert!(
+    !options.detect_language(),
+    "no probe: prefill is on by default"
+  );
+  let task = TranscribeTask::new(&mock, &t);
+  let result = task.run(&vec![0.1; 32_000], &options).unwrap();
+
+  assert_eq!(
+    result.language(),
+    "en",
+    "the DISPLAY language is the forced-prefill <|en|>, kept Swift-faithful"
+  );
+  assert_eq!(
+    result.detected_language(),
+    Some("es"),
+    "the DETECTION is the PREDICTED <|es|>, not the forced display <|en|>"
+  );
+  assert_eq!(
+    crate::provenance::Provenance::for_result(
+      &options,
+      &crate::options::ComputeOptions::new(),
+      &result,
+    )
+    .detected_language(),
+    Some("es"),
+    "provenance records the predicted detection, never the forced display"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn transcribe_all_preserves_order_across_scoped_threads() {
   let t = tiny_tokenizer();
   // The mock's script cursor lives in each worker's OWN MockDecoderState

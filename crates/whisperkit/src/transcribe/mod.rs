@@ -921,14 +921,20 @@ where
       if detected_language.is_none() {
         *detected_language = Some(result.language().to_string());
       }
-      // The GENUINE observation: promote ONLY when decode_text actually
-      // PREDICTED a `<|lang|>` token (not the forced prefill `<|en|>`, and not
-      // a configured/`"en"`-fallback display language — F2, codex round 4).
-      // FIRST genuine observation wins, so a later window/attempt cannot
-      // overwrite an earlier detection and a failed probe's cleared display
-      // does not drag the observation down with it.
-      if result.language_observed() && observed_language.is_none() {
-        *observed_language = Some(result.language().to_string());
+      // The GENUINE observation: the language the decode actually PREDICTED
+      // (`DecodingResult::observed_language`), promoted ONLY when it predicted a
+      // `<|lang|>` token — never the forced prefill `<|en|>` nor a
+      // configured/`"en"`-fallback (F2, codex round 4). Read the predicted CODE,
+      // NOT the display `language`: a forced `<|en|>` prefill is the display even
+      // when the model predicted a different language after it, so promoting the
+      // display would record `"en"` for a run that detected `"es"` (F1, codex
+      // round 5). FIRST genuine observation wins, so a later window/attempt
+      // cannot overwrite an earlier detection and a failed probe's cleared
+      // display does not drag the observation down with it.
+      if observed_language.is_none()
+        && let Some(predicted) = result.observed_language()
+      {
+        *observed_language = Some(predicted.to_string());
       }
 
       let is_first_token_log_prob_too_low = options

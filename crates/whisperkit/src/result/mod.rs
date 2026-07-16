@@ -1589,17 +1589,30 @@ pub struct DecodingResult {
     serde(default, skip_serializing_if = "Vec::is_empty")
   )]
   language_probs: Vec<(String, f32)>,
-  /// Whether [`Self::language`] was OBSERVED from a decoded `<|lang|>` token —
-  /// a genuine in-loop language detection — rather than configured by the
-  /// caller or defaulted to [`DEFAULT_LANGUAGE_CODE`] because no language
-  /// token appeared. The pipeline promotes an *observed* language into
-  /// [`TranscriptionResult::detected_language`]; a configured or fallback
-  /// language is not a detection and records no observation (coremlit issue
-  /// #14, codex round 3). Not a Swift field — Swift's `DecodingResult` has no
-  /// detection-provenance concept, the same Rust-only extension rationale as
+  /// The language the model actually PREDICTED (an ISO code), or `None` when it
+  /// predicted none — a genuine in-loop language detection. Distinct from the
+  /// Swift-faithful display [`Self::language`], which reports the FIRST language
+  /// token in the WHOLE sequence (the forced prefill `<|en|>` included): this is
+  /// the first `<|lang|>` token the model emitted at or after the forced prompt,
+  /// so the two disagree exactly when a forced `<|en|>` prefill is followed by a
+  /// differently-predicted language.
+  ///
+  /// `None` for a configured language (an input, not a detection), for the
+  /// [`DEFAULT_LANGUAGE_CODE`] display fallback, and when the predicted region
+  /// holds no language token at all (a zero-iteration decode forces `<|en|>`
+  /// into the prompt but predicts nothing). The pipeline promotes THIS predicted
+  /// code into [`TranscriptionResult::detected_language`]; recording the display
+  /// [`Self::language`] there instead would misreport a forced `<|en|>` as the
+  /// detection when a different language was predicted after it (coremlit issue
+  /// #14, codex round 5) — the reason this carries the predicted STRING and not
+  /// a mere "observed" boolean. Not a Swift field — Swift's `DecodingResult` has
+  /// no detection-provenance concept, the same Rust-only extension rationale as
   /// the sibling [`Self::first_token_log_prob`] (see this struct's doc).
-  #[cfg_attr(feature = "serde", serde(default))]
-  language_observed: bool,
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "Option::is_none")
+  )]
+  observed_language: Option<String>,
   /// Sampled token ids for this window.
   #[cfg_attr(
     feature = "serde",
@@ -1647,7 +1660,7 @@ impl DecodingResult {
     Self {
       language: String::new(),
       language_probs: Vec::new(),
-      language_observed: false,
+      observed_language: None,
       tokens: Vec::new(),
       token_log_probs: Vec::new(),
       text: String::new(),
@@ -1701,26 +1714,28 @@ impl DecodingResult {
     self
   }
 
-  // -- language_observed (bool) --------------------------------------------
-  /// Whether [`Self::language`] was observed from a decoded `<|lang|>` token
-  /// (a genuine detection) rather than configured or defaulted. See the field
-  /// doc for how the pipeline uses this to record
-  /// [`TranscriptionResult::detected_language`].
+  // -- observed_language (Option<String>) ----------------------------------
+  /// The language the model actually PREDICTED (an ISO code), or `None`. A
+  /// genuine in-loop detection, SEPARATE from the Swift-faithful display
+  /// [`Self::language`]; see the field doc for how the pipeline promotes this
+  /// into [`TranscriptionResult::detected_language`], and why it is not the
+  /// display language.
   #[inline(always)]
-  pub const fn language_observed(&self) -> bool {
-    self.language_observed
+  pub fn observed_language(&self) -> Option<&str> {
+    self.observed_language.as_deref()
   }
-  /// Builder form of [`Self::set_language_observed`].
+  /// Builder form of [`Self::update_observed_language`].
   #[must_use]
   #[inline(always)]
-  pub const fn with_language_observed(mut self, language_observed: bool) -> Self {
-    self.set_language_observed(language_observed);
+  pub fn maybe_observed_language(mut self, observed_language: Option<String>) -> Self {
+    self.update_observed_language(observed_language);
     self
   }
-  /// Sets [`Self::language_observed`] in place.
+  /// Assigns [`Self::observed_language`] directly — the finalized decode passes
+  /// the predicted language code, or `None` when nothing was predicted.
   #[inline(always)]
-  pub const fn set_language_observed(&mut self, language_observed: bool) -> &mut Self {
-    self.language_observed = language_observed;
+  pub fn update_observed_language(&mut self, observed_language: Option<String>) -> &mut Self {
+    self.observed_language = observed_language;
     self
   }
 

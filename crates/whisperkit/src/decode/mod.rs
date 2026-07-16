@@ -526,28 +526,47 @@ fn finalize_decoding_result(
     }
   };
 
-  // The Rust-only detection fact (no Swift equivalent): `language_observed`
-  // is `true` ONLY when the model PREDICTED a `<|lang|>` token — one at a
+  // The Rust-only detection fact (no Swift equivalent): the language the model
+  // actually PREDICTED, as an ISO code — the FIRST `<|lang|>` token at a
   // position at or after the forced prompt (`initial_prompt_index`), scanned
-  // OFF the raw `current_tokens` rather than the display slice above. The
-  // default multilingual prefill inserts `<|en|>` when no language is
-  // configured (`prefill_tokens`), and a direct [`decode_text`] caller may
-  // pass a `<|lang|>` token in `initial_prompt`; neither is a detection.
-  // Scanning only the predicted region is what stops a zero-iteration decode
-  // — which forces `<|en|>` into the prompt but predicts nothing — from
+  // OFF the raw `current_tokens` predicted region rather than the display slice
+  // above, then decoded and trimmed the same way the display language is.
+  //
+  // `None` when a language is configured (an input, not a detection) and when
+  // the predicted region holds no language token — a zero-iteration decode
+  // forces `<|en|>` into the prompt but predicts nothing, and a direct
+  // [`decode_text`] caller may pass a `<|lang|>` token in `initial_prompt`;
+  // scanning ONLY the predicted region is what keeps either forced token from
   // fabricating an observation the pipeline would promote to a detected
-  // language (F2, codex round 4). A configured language is never an
-  // observation either. This distinction feeds
-  // `TranscriptionResult::detected_language`; the Swift-compat display above
+  // language (F2, codex round 4).
+  //
+  // It carries the predicted STRING, not a boolean: the DISPLAY `language`
+  // above follows Swift's first-in-the-WHOLE-slice rule and so reports the
+  // forced prefill `<|en|>`, while the model may predict a DIFFERENT language
+  // after it (freely, once `without_timestamps` drops the timestamp filter).
+  // The pipeline promotes THIS predicted code into
+  // `TranscriptionResult::detected_language`; reconstructing it from the
+  // display `language` would misrecord a forced `<|en|>` as the detection when
+  // `<|es|>` was predicted (F1, codex round 5). The Swift-compat display above
   // is untouched.
-  let language_observed = options.language().is_empty()
-    && current_tokens
+  let observed_language = if options.language().is_empty() {
+    match current_tokens
       .get(initial_prompt_index..)
-      .is_some_and(|predicted| {
+      .and_then(|predicted| {
         predicted
           .iter()
-          .any(|&t| tokenizer.all_language_tokens().contains(&t))
-      });
+          .copied()
+          .find(|&t| tokenizer.all_language_tokens().contains(&t))
+      }) {
+      Some(token) => {
+        let decoded = tokenizer.decode(&[token], false)?;
+        Some(text::trim_special_token_chars(&decoded).to_string())
+      }
+      None => None,
+    }
+  } else {
+    None
+  };
 
   // :828 — decoded with `skipSpecialTokens: false` regardless of
   // `options.skipSpecialTokens` (that option only ever gates the live
@@ -558,7 +577,7 @@ fn finalize_decoding_result(
     DecodingResult::new()
       .with_language(language)
       .with_language_probs(language_probs)
-      .with_language_observed(language_observed)
+      .maybe_observed_language(observed_language)
       .with_tokens(filtered_tokens.to_vec())
       .with_token_log_probs(token_log_probs)
       .with_text(text)
