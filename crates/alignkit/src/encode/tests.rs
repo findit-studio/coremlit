@@ -23,7 +23,13 @@ fn truncated_frame_count_sub_receptive_field_is_one_frame() {
   // receptive field for its first output, and asry pads a sub-400 chunk up to
   // 400 before it — so one real sample and a full receptive field are the same
   // one frame. (Reverting `saturating_sub` to a bare `-` underflows here.)
-  for real_samples in [1, 200, HOP_SAMPLES, 399, RECEPTIVE_FIELD_SAMPLES] {
+  //
+  // HAND-COMPUTED literal inputs, deliberately NOT `HOP_SAMPLES` /
+  // `RECEPTIVE_FIELD_SAMPLES`: a boundary derived from the constant it means to
+  // pin moves WITH the constant under mutation and stays green (F3). 320 and 400
+  // are spelled out; `receptive_field_and_hop_constants_are_pinned` pins the
+  // constants themselves.
+  for real_samples in [1, 200, 320, 399, 400] {
     assert_eq!(
       truncated_frame_count(real_samples, 2999),
       1,
@@ -44,7 +50,7 @@ fn truncated_frame_count_no_phantom_frame_from_receptive_field_slack() {
   // alignment where the reference returns `NoAlignmentPath`
   // (`tests/prepared_composition.rs`, `tests/align_chunk.rs`). Reverting to
   // `div_ceil` fails both assertions (2 and 3, not 1).
-  assert_eq!(truncated_frame_count(HOP_SAMPLES + 1, 2999), 1); // 321: was ceil → 2
+  assert_eq!(truncated_frame_count(321, 2999), 1); // 321: was ceil → 2
   assert_eq!(truncated_frame_count(641, 2999), 1); // was ceil → 3
 }
 
@@ -53,15 +59,41 @@ fn truncated_frame_count_adds_one_frame_per_hop_past_the_receptive_field() {
   // At and above the receptive field the count is `floor((L - 400)/320) + 1`:
   // each further 320-sample hop past the first full receptive field adds one
   // frame. Catches dropping the `+ 1` (401 → 0) or a wrong divisor.
-  assert_eq!(truncated_frame_count(RECEPTIVE_FIELD_SAMPLES + 1, 2999), 1); // 401
-  assert_eq!(
-    truncated_frame_count(RECEPTIVE_FIELD_SAMPLES + HOP_SAMPLES, 2999),
-    2
-  ); // 720
-  assert_eq!(
-    truncated_frame_count(RECEPTIVE_FIELD_SAMPLES + 2 * HOP_SAMPLES, 2999),
-    3
-  ); // 1040
+  //
+  // HAND-COMPUTED literals (NOT derived from the constants — see F3): 401 → 1,
+  // 720 → 2, 1040 → 3.
+  assert_eq!(truncated_frame_count(401, 2999), 1);
+  assert_eq!(truncated_frame_count(720, 2999), 2);
+  assert_eq!(truncated_frame_count(1040, 2999), 3);
+}
+
+#[test]
+fn truncated_frame_count_receptive_field_boundary_is_pinned_by_hand() {
+  // THE F3 pin. Literal, hand-computed frame counts across the first-frame
+  // boundary, referencing NEITHER RECEPTIVE_FIELD_SAMPLES nor HOP_SAMPLES — so
+  // mutating either constant (e.g. RECEPTIVE_FIELD_SAMPLES 400 → 399) cannot
+  // slide the inputs and expectations to stay green, the exact defect this
+  // replaces (a self-derived fixture became 719 → 2 and still passed).
+  //
+  // With RF = 400, HOP = 320 the count holds at 1 up to and including 719 real
+  // samples (719 does not fill a SECOND 400-wide window past the first hop) and
+  // steps to 2 at 720. Under the RF = 399 mutation the step falls to 719, so
+  // `719 → 1` is the assertion that catches it (it would return 2); `720 → 2`
+  // pins the true step.
+  assert_eq!(truncated_frame_count(399, 2999), 1);
+  assert_eq!(truncated_frame_count(400, 2999), 1);
+  assert_eq!(truncated_frame_count(719, 2999), 1);
+  assert_eq!(truncated_frame_count(720, 2999), 2);
+}
+
+#[test]
+fn receptive_field_and_hop_constants_are_pinned() {
+  // Direct literal pins on the geometry constants themselves, so a change to
+  // either is a loud, single-line failure and not a silent re-derivation of the
+  // frame-count fixtures. This is wav2vec2-base's fixed geometry: a 400-sample
+  // receptive field and a 320-sample (20 ms @ 16 kHz) hop.
+  assert_eq!(RECEPTIVE_FIELD_SAMPLES, 400);
+  assert_eq!(HOP_SAMPLES, 320);
 }
 
 #[test]
