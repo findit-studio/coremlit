@@ -115,9 +115,12 @@
 //!
 //! # The clips
 //!
-//! [`MULTI_SPEAKER_CLIPS`] — dia's parity corpus, every clip with ≥ 3 reference
-//! speakers (06 = 3, 14 = 4, 10 = 7, 09 = 8), i.e. the regime where clustering
-//! can actually fail. `parity_e2e`'s fixtures (2 speakers, ≤ 30 s) cannot
+//! [`MULTI_SPEAKER_CLIPS`] — a SELECTED subset of dia's parity corpus: four of
+//! its EIGHT ≥ 3-speaker clips (06 = 3, 14 = 4, 10 = 7, 09 = 8), spanning the
+//! speaker-count ladder at the lowest runtime — the regime where clustering can
+//! actually fail. The full ≥ 3-speaker membership and this selection are pinned
+//! against silent drift by [`shipping_clip_selection_is_the_documented_subset`].
+//! `parity_e2e`'s fixtures (2 speakers, ≤ 30 s) cannot
 //! express this failure: argmax scored 0.0000 % on them and still broke at 7
 //! speakers. That is the whole reason this suite exists — **the gate must run
 //! on audio hard enough to fail.**
@@ -233,8 +236,10 @@ struct MultiSpkClip {
   ref_spk: usize,
 }
 
-/// The gated clips. Every ≥ 3-speaker clip in dia's parity corpus, ordered by
-/// speaker count. 10 (7 spk) is the clip that caught argmax.
+/// The gated clips: a SELECTED subset — four of the eight ≥ 3-speaker clips in
+/// dia's parity corpus ([`MULTISPK_CORPUS`]) — ordered by speaker count. 10
+/// (7 spk) is the clip that caught argmax. The selection and its "four of eight"
+/// denominator are pinned by [`shipping_clip_selection_is_the_documented_subset`].
 const MULTI_SPEAKER_CLIPS: &[MultiSpkClip] = &[
   MultiSpkClip {
     name: "06_long_recording",
@@ -251,6 +256,47 @@ const MULTI_SPEAKER_CLIPS: &[MultiSpkClip] = &[
   MultiSpkClip {
     name: "09_mrbeast_dollar_date",
     ref_spk: 8,
+  },
+];
+
+/// The FULL ≥ 3-speaker membership of dia's parity corpus (eight clips), from
+/// which [`MULTI_SPEAKER_CLIPS`] selects four. Documented here so the "four of
+/// eight" claim and the SELECTION are pinned against silent corpus drift by
+/// [`shipping_clip_selection_is_the_documented_subset`] (which re-derives the
+/// counts from the RTTMs), not asserted in prose alone. The parallel
+/// `parity_e2e::FIXTURE_FACTS` independently pins all 14 clips.
+const MULTISPK_CORPUS: &[MultiSpkClip] = &[
+  MultiSpkClip {
+    name: "06_long_recording",
+    ref_spk: 3,
+  },
+  MultiSpkClip {
+    name: "08_luyu_jinjing_freedom",
+    ref_spk: 3,
+  },
+  MultiSpkClip {
+    name: "09_mrbeast_dollar_date",
+    ref_spk: 8,
+  },
+  MultiSpkClip {
+    name: "10_mrbeast_clean_water",
+    ref_spk: 7,
+  },
+  MultiSpkClip {
+    name: "11_mrbeast_age_race",
+    ref_spk: 6,
+  },
+  MultiSpkClip {
+    name: "12_mrbeast_schools",
+    ref_spk: 15,
+  },
+  MultiSpkClip {
+    name: "13_mrbeast_saved_animals",
+    ref_spk: 11,
+  },
+  MultiSpkClip {
+    name: "14_mrbeast_strongman_robot",
+    ref_spk: 4,
   },
 ];
 
@@ -1498,4 +1544,96 @@ fn shipping_default_is_the_int8_embedder() {
     "wespeaker_v2 ({int8} B) is not smaller than wespeaker ({fp32} B) — the int8/fp32 \
      identification is wrong"
   );
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// Corpus guard — the shipping matrix gates a documented SUBSET, not all of it
+// ══════════════════════════════════════════════════════════════════════
+
+/// The shipping matrix ([`MULTI_SPEAKER_CLIPS`]) gates a SELECTED subset — four
+/// of the eight ≥ 3-speaker clips in dia's parity corpus ([`MULTISPK_CORPUS`]),
+/// NOT all of them. This pins that selection against silent drift instead of
+/// trusting the prose: it re-derives the ≥ 3-speaker membership straight from the
+/// RTTMs on disk and asserts both the denominator (eight) and the selected four.
+///
+/// Needs only the sibling `diarization` fixtures (no models), like
+/// `parity_e2e`'s `fixture_facts_match_the_corpus_on_disk` (which independently
+/// pins all 14 clips).
+///
+/// # Why only four are gated (the excluded 08 / 11 / 12 / 13)
+///
+/// The selected four span the speaker-count ladder — 3 / 4 / 7 / 8 — at the
+/// lowest runtime that covers it. The other four ≥ 3-speaker clips are excluded
+/// deliberately: 08 (3 spk) duplicates 06's minimal-≥3 case, and 11 (6), 13 (11),
+/// 12 (15) are higher counts whose shipping int8 behaviour is UNMEASURED (§5.9
+/// measured only 06 / 14 / 10 / 09), each adding ~10 min to an already ~65-min
+/// suite (~+40 min for all four). Adding one is NOT free here: this suite runs
+/// once and pins measured values, so a new gated clip needs a measured int8
+/// baseline FIRST — a blind gate on an unmeasured clip could fail with no way to
+/// tell a real defect from a missing expectation. Clip 12 (the known
+/// FluidAudio-breach clip) has the highest marginal value and is first to add
+/// once measured.
+#[test]
+#[ignore = "requires the sibling diarization parity fixtures (no models needed)"]
+fn shipping_clip_selection_is_the_documented_subset() {
+  // Derive the ≥ 3-speaker membership from the RTTMs on disk — the denominator of
+  // "four of eight", not trusted from a table.
+  let mut found: Vec<(String, usize)> = Vec::new();
+  for entry in std::fs::read_dir(fixtures_root()).expect("read dia parity fixtures root") {
+    let dir = entry.expect("dir entry").path();
+    let rttm = dir.join("reference.rttm");
+    if !rttm.is_file() {
+      continue;
+    }
+    let n = distinct_speakers(&parse_rttm(&rttm)).len();
+    if n >= 3 {
+      let name = dir
+        .file_name()
+        .expect("clip dir name")
+        .to_string_lossy()
+        .into_owned();
+      found.push((name, n));
+    }
+  }
+  found.sort();
+
+  let mut documented: Vec<(String, usize)> = MULTISPK_CORPUS
+    .iter()
+    .map(|c| (c.name.to_string(), c.ref_spk))
+    .collect();
+  documented.sort();
+  assert_eq!(
+    found, documented,
+    "the corpus's ≥ 3-speaker membership on disk differs from MULTISPK_CORPUS — re-derive it \
+     (and the module doc's 'four of eight' denominator) from the RTTMs"
+  );
+  assert_eq!(
+    MULTISPK_CORPUS.len(),
+    8,
+    "the ≥ 3-speaker corpus is no longer eight clips — the 'four of eight' denominator moved"
+  );
+
+  // The gated selection is exactly the documented four, each a member of the
+  // ≥ 3-speaker corpus above. If MULTI_SPEAKER_CLIPS drifts, this fails.
+  let selected: Vec<&str> = MULTI_SPEAKER_CLIPS.iter().map(|c| c.name).collect();
+  assert_eq!(
+    selected,
+    [
+      "06_long_recording",
+      "14_mrbeast_strongman_robot",
+      "10_mrbeast_clean_water",
+      "09_mrbeast_dollar_date",
+    ],
+    "the shipping stress selection moved — re-derive it and update the module doc's 'four of \
+     eight' claim"
+  );
+  for c in MULTI_SPEAKER_CLIPS {
+    assert!(
+      MULTISPK_CORPUS
+        .iter()
+        .any(|m| m.name == c.name && m.ref_spk == c.ref_spk),
+      "{}: gated but not in the ≥ 3-speaker corpus manifest (or its count disagrees)",
+      c.name
+    );
+  }
 }
