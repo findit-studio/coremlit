@@ -401,6 +401,32 @@ pub fn fmt_der(tag: &str, d: &Der) -> String {
   )
 }
 
+/// Byte-exact `&str` equality usable in a `const` context.
+///
+/// The gate-roster macros (`stress_gates!` in `parity_e2e.rs`,
+/// `shipping_der_gate!` in `parity_shipping_der.rs`) call this from a
+/// `const _: () = assert!(…)` to prove, at COMPILE TIME, that a per-clip
+/// wrapper's function NAME agrees with the fixture it actually loads. A wrapper
+/// silently retargeted to a different clip then fails to build, rather than
+/// scoring the wrong audio under a name that still claims the original clip
+/// (codex r7 F1). Lives here because it is shared by exactly the two DER
+/// binaries that include this module.
+#[must_use]
+pub const fn const_str_eq(a: &str, b: &str) -> bool {
+  let (a, b) = (a.as_bytes(), b.as_bytes());
+  if a.len() != b.len() {
+    return false;
+  }
+  let mut i = 0;
+  while i < a.len() {
+    if a[i] != b[i] {
+      return false;
+    }
+    i += 1;
+  }
+  true
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Unit tests for the DER calc itself — they travel WITH the calculation, so
 // every test binary that includes this module re-proves it. No models and no
