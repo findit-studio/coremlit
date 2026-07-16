@@ -34,6 +34,7 @@
 //! orchestration layer this module doesn't own.
 
 use std::{
+  cell::Cell,
   sync::atomic::{AtomicBool, Ordering},
   time::Instant,
 };
@@ -281,12 +282,25 @@ pub(crate) fn create_logits_filters(
 /// this module's doc for the full list of timing fields this port does
 /// and doesn't populate).
 ///
+/// `observed_language_token` is an out-parameter for the genuine language
+/// OBSERVATION, captured at token-RECOGNITION time (the first `<|lang|>` token
+/// sampled into the predicted region under auto-detect) and set BEFORE the next
+/// fallible step — exactly the way `early_stop` and the sampler's own
+/// `drew_from_rng` survive an errored decode. The finalized
+/// [`DecodingResult::observed_language`] is then a READ of this already-captured
+/// fact, not a re-scan of the finalized tokens; and because the caller owns the
+/// cell, a decode that recognizes the language then errors on a LATER step still
+/// surfaces the observation (coremlit issue #14, codex round 6
+/// post-consolidation F2 — a predicted language used to die with an errored,
+/// dropped VAD chunk because its string was only built at successful
+/// finalization).
+///
 /// # Errors
 /// [`DecodeError`] if a backend decode step fails, or a progress
 /// callback's tokenizer decode fails.
 #[allow(clippy::too_many_arguments)] // Mirrors Swift's decodeText argument surface; this
 // signature is mandated by this port's own interface contract, and no
-// natural subset of these ten forms a cohesive struct without inventing
+// natural subset of these eleven forms a cohesive struct without inventing
 // one purely to dodge this lint.
 pub fn decode_text<B>(
   backend: &B,
@@ -298,6 +312,7 @@ pub fn decode_text<B>(
   tokenizer: &WhisperTokenizer,
   timings: &mut TranscriptionTimings,
   early_stop: &AtomicBool,
+  observed_language_token: &Cell<Option<u32>>,
   callback: Option<TranscriptionProgressCallback<'_>>,
 ) -> Result<DecodingResult, DecodeError>
 where
@@ -385,6 +400,19 @@ where
     if !is_prefill {
       current_tokens.push(next_token); // :682-686
       log_probs.push(next_token_log_prob);
+      // Recognize the genuine language OBSERVATION the instant its token lands in
+      // the predicted region — the first `<|lang|>` token under auto-detect — and
+      // stash it in the caller's cell BEFORE the next (fallible) `decode_step`.
+      // FIRST wins, matching the finalized scan this replaces and the merge law's
+      // first-observation rule; a token pushed here sits at/after
+      // `initial_prompt_index`, so `!is_prefill` alone is the predicted-region
+      // gate (F2, codex round 6 post-consolidation).
+      if observed_language_token.get().is_none()
+        && options.language().is_empty()
+        && tokenizer.all_language_tokens().contains(&next_token)
+      {
+        observed_language_token.set(Some(next_token));
+      }
     }
     // KV/mask/alignment advance already happened inside `decode_step` —
     // see this function's doc comment.
@@ -424,16 +452,28 @@ where
   // / low-first-token-logprob termination — so it is the honest witness of a
   // caller-CONTROLLED truncation, carried out on the result for
   // `Provenance::is_reproducible` (coremlit issue #14, codex round 5).
+  // The genuine observation is a READ of the cell captured mid-loop, decoded to
+  // its ISO code the same way the finalized display language is — never a re-scan
+  // of the finalized tokens (F2). On the success path this feeds
+  // `DecodingResult::observed_language`; on an errored decode the caller reads the
+  // very same cell instead, so the observation survives either way.
+  let observed_language = observed_language_token
+    .get()
+    .map(|token| {
+      let decoded = tokenizer.decode(&[token], false)?;
+      Ok::<String, DecodeError>(text::trim_special_token_chars(&decoded).to_string())
+    })
+    .transpose()?;
   Ok(
     finalize_decoding_result(
       current_tokens,
       log_probs,
-      initial_prompt_index,
       first_token_log_prob,
       sampler,
       options,
       tokenizer,
     )?
+    .maybe_observed_language(observed_language)
     .maybe_early_stopped(early_stop.load(Ordering::Relaxed)),
   )
 }
@@ -444,7 +484,6 @@ where
 fn finalize_decoding_result(
   mut current_tokens: Vec<u32>,
   mut log_probs: Vec<f32>,
-  initial_prompt_index: usize,
   first_token_log_prob: f32,
   sampler: &GreedyTokenSampler,
   options: &DecodingOptions,
@@ -452,8 +491,7 @@ fn finalize_decoding_result(
 ) -> Result<DecodingResult, DecodeError> {
   // Read off `tokenizer` rather than taking a redundant parameter — the
   // caller's own `special` is `*tokenizer.special_tokens()`, so threading it
-  // in as well would only pad the argument list (F2 added `initial_prompt_index`,
-  // which would otherwise trip `clippy::too_many_arguments`).
+  // in as well would only pad the argument list.
   let special = tokenizer.special_tokens();
 
   // :776 — appends EOT (+logprob 0.0) unless already present.
@@ -534,47 +572,21 @@ fn finalize_decoding_result(
     }
   };
 
-  // The Rust-only detection fact (no Swift equivalent): the language the model
-  // actually PREDICTED, as an ISO code — the FIRST `<|lang|>` token at a
-  // position at or after the forced prompt (`initial_prompt_index`), scanned
-  // OFF the raw `current_tokens` predicted region rather than the display slice
-  // above, then decoded and trimmed the same way the display language is.
-  //
-  // `None` when a language is configured (an input, not a detection) and when
-  // the predicted region holds no language token — a zero-iteration decode
-  // forces `<|en|>` into the prompt but predicts nothing, and a direct
-  // [`decode_text`] caller may pass a `<|lang|>` token in `initial_prompt`;
-  // scanning ONLY the predicted region is what keeps either forced token from
-  // fabricating an observation the pipeline would promote to a detected
-  // language (F2, codex round 4).
-  //
-  // It carries the predicted STRING, not a boolean: the DISPLAY `language`
-  // above follows Swift's first-in-the-WHOLE-slice rule and so reports the
-  // forced prefill `<|en|>`, while the model may predict a DIFFERENT language
-  // after it (freely, once `without_timestamps` drops the timestamp filter).
-  // The pipeline promotes THIS predicted code into the result's
-  // `TaskFacts::observed_language`; reconstructing it from the
-  // display `language` would misrecord a forced `<|en|>` as the detection when
-  // `<|es|>` was predicted (F1, codex round 5). The Swift-compat display above
-  // is untouched.
-  let observed_language = if options.language().is_empty() {
-    match current_tokens
-      .get(initial_prompt_index..)
-      .and_then(|predicted| {
-        predicted
-          .iter()
-          .copied()
-          .find(|&t| tokenizer.all_language_tokens().contains(&t))
-      }) {
-      Some(token) => {
-        let decoded = tokenizer.decode(&[token], false)?;
-        Some(text::trim_special_token_chars(&decoded).to_string())
-      }
-      None => None,
-    }
-  } else {
-    None
-  };
+  // The Rust-only detection fact (no Swift equivalent) — the language the model
+  // actually PREDICTED, as an ISO code — is no longer rescanned here. It is
+  // RECOGNIZED at sampling time inside [`decode_text`]'s loop (the first
+  // `<|lang|>` token in the predicted region under auto-detect) and stashed in
+  // the caller's `observed_language_token` cell, so it survives a decode that
+  // errors after recognizing it (F2, codex round 6 post-consolidation);
+  // `decode_text` decodes that captured token into `DecodingResult::observed_language`.
+  // It carries the predicted STRING, not a boolean, and is scanned OFF the
+  // predicted region rather than the display slice: the DISPLAY `language` above
+  // follows Swift's first-in-the-WHOLE-slice rule and so reports a forced prefill
+  // `<|en|>`, while the model may predict a DIFFERENT language after it (freely,
+  // once `without_timestamps` drops the timestamp filter). Reconstructing the
+  // observation from the display `language` would misrecord a forced `<|en|>` as
+  // the detection when `<|es|>` was predicted (F1, codex round 5). The
+  // Swift-compat display above is untouched.
 
   // :828 — decoded with `skipSpecialTokens: false` regardless of
   // `options.skipSpecialTokens` (that option only ever gates the live
@@ -585,7 +597,6 @@ fn finalize_decoding_result(
     DecodingResult::new()
       .with_language(language)
       .with_language_probs(language_probs)
-      .maybe_observed_language(observed_language)
       .with_tokens(filtered_tokens.to_vec())
       .with_token_log_probs(token_log_probs)
       .with_text(text)

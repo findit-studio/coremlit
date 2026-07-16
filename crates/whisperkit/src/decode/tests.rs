@@ -1,4 +1,5 @@
 use std::{
+  cell::Cell,
   path::PathBuf,
   sync::{Mutex, atomic::AtomicBool},
 };
@@ -60,6 +61,7 @@ fn run_mock(
     tokenizer,
     &mut timings,
     &AtomicBool::new(false),
+    &Cell::new(None),
     None,
   )
   .unwrap()
@@ -465,6 +467,7 @@ fn early_stop_flag_breaks_loop_and_callback_sets_it() {
     &t,
     &mut timings,
     &AtomicBool::new(false),
+    &Cell::new(None),
     Some(callback),
   )
   .unwrap();

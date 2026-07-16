@@ -2015,3 +2015,66 @@ fn probe_detection_survives_an_errored_vad_chunk_drop() {
     "and provenance records the detection the dropped chunk made"
   );
 }
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn predicted_language_survives_an_errored_vad_chunk_drop() {
+  // F2 (codex round 6 post-consolidation), the sibling of the probe test above
+  // with NO probe. Under auto-detect a language token becomes a genuine
+  // OBSERVATION the instant it is SAMPLED into the predicted region — the sampler
+  // draw from that same partial attempt already survives an errored drop — but
+  // the observation's STRING was only built at successful finalization, so a
+  // chunk that PREDICTED `<|es|>` (rather than probing it) then errored on a
+  // LATER step lost it: the merged result read `observed_language == None` for a
+  // run that plainly predicted "es". The fix recognizes the token at sampling
+  // time into a cell the sink reads before the error can propagate.
+  //
+  // Mutation proof: move the capture back to finalization — disable the
+  // recognition-time `observed_language_token.set(..)` in `decode::decode_text`
+  // (so the string is only built when finalization succeeds) and the
+  // `Some("es")` assertions below fail, reading back `None`.
+  let t = tiny_tokenizer();
+  let es = t.token_to_id("<|es|>").unwrap();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(32_000));
+  // NO probe. The multilingual prefill `[SOT, <|en|>, <|transcribe|>,
+  // <|notimestamps|>]` is forced over calls 1-3; call 4 samples the FIRST free
+  // prediction, scripted to `<|es|>` (recognized as the observation there); call
+  // 5 is the next step, scripted to fail -> the chunk's whole run errors.
+  mock.push_token_steps(&[2425, 2425, 2425, es]);
+  mock.fail_on_call(5);
+  let kit = WhisperKit::with_backend(mock, t);
+  // Empty language, detect_language OFF (the prefill-coupled default), and
+  // `without_timestamps` so the model freely predicts `<|es|>` at the first free
+  // position (no timestamp filter masks it).
+  let options = DecodingOptions::new()
+    .with_chunking_strategy(ChunkingStrategy::Vad)
+    .with_without_timestamps();
+  assert!(
+    !options.detect_language(),
+    "no probe runs, so <|es|> is a PREDICTION"
+  );
+
+  // 40_000 samples > one 32_000-sample window -> the VAD branch; one voiced chunk
+  // that predicts "es" (call 4) then errors (call 5) and is dropped.
+  let result = kit.transcribe(&vec![0.1; 40_000], &options).unwrap();
+  assert!(
+    result.segments_slice().is_empty(),
+    "the errored chunk was dropped, so nothing survives"
+  );
+  assert_eq!(
+    result.task_facts().observed_language(),
+    Some("es"),
+    "the dropped chunk's PREDICTED language must survive into the merged result"
+  );
+  assert_eq!(
+    crate::provenance::Provenance::for_result(
+      &options,
+      &crate::options::ComputeOptions::new(),
+      &result,
+    )
+    .task_facts()
+    .observed_language(),
+    Some("es"),
+    "and provenance records the prediction the dropped chunk made"
+  );
+}

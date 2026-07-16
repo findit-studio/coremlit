@@ -69,6 +69,7 @@
 //! the full reasoning.
 
 use std::{
+  cell::Cell,
   sync::{
     Mutex, PoisonError,
     atomic::{AtomicBool, Ordering},
@@ -869,6 +870,13 @@ where
       // partial result triggers an ordinary fallback must not truncate
       // the retry (phase-gate round-5 finding).
       let early_stop = AtomicBool::new(false);
+      // A FRESH per-attempt cell for the predicted-language OBSERVATION,
+      // recognized at token-sampling time inside `decode_text` and set BEFORE any
+      // later fallible step — exactly like `early_stop` and the sampler's own
+      // `drew_from_rng`, so a decode that recognizes `<|lang|>` then errors on a
+      // LATER step still surfaces the detection into the sink below (F2, codex
+      // round 6 post-consolidation).
+      let observed_language_token: Cell<Option<u32>> = Cell::new(None);
 
       // :340-365 — for a multilingual model with no explicit language and
       // detection requested, probe the language once, patch a per-attempt
@@ -932,6 +940,7 @@ where
         self.tokenizer,
         timings,
         &early_stop,
+        &observed_language_token,
         window_callback,
       );
 
@@ -948,10 +957,26 @@ where
       // One `sampler` owns both the language probe's draw and every text token's,
       // so its single `drew_from_rng` covers the whole attempt; a zero-iteration
       // decode at a non-zero temperature never draws and correctly leaves it
-      // unset. `early_stop` is THIS attempt's own fresh latch (see its reset). The
-      // observation is first-wins (the merge law's rule) — a later attempt cannot
-      // overwrite an earlier genuine detection, and it lives ONLY in the sink so a
-      // dropped chunk's detection still reaches the merged transcript.
+      // unset. `early_stop` is THIS attempt's own fresh latch (see its reset).
+      //
+      // The observation is first-wins (the merge law's rule) — a later attempt
+      // cannot overwrite an earlier genuine detection — and lives in the sink so a
+      // dropped chunk's detection still reaches the merged transcript. It is
+      // recovered here from `observed_language_token`, the cell `decode_text`
+      // recognized the predicted `<|lang|>` into at sampling time: a chunk that
+      // predicts `<|es|>` (no probe) then errors on a LATER step used to lose it,
+      // because its string was only built at successful finalization (F2, codex
+      // round 6 post-consolidation). The task-level `observed_language` (a probe's
+      // detection, or an earlier window's) takes precedence, preserving first-wins.
+      let attempt_observation = observed_language.clone().or_else(|| {
+        observed_language_token.get().and_then(|token| {
+          self
+            .tokenizer
+            .decode(&[token], false)
+            .ok()
+            .map(|decoded| crate::text::trim_special_token_chars(&decoded).to_string())
+        })
+      });
       facts_sink
         .lock()
         .unwrap_or_else(PoisonError::into_inner)
@@ -959,7 +984,7 @@ where
           &TaskFacts::unknown()
             .with_drew_from_rng(sampler.drew_from_rng())
             .with_early_stopped(early_stop.load(Ordering::Relaxed))
-            .with_observed_language(observed_language.clone()),
+            .with_observed_language(attempt_observation),
         );
       let result = outcome?;
 
