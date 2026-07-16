@@ -85,8 +85,19 @@ harness = false
 asry = { path = "../../../asry", default-features = false }
 criterion.workspace = true
 hound.workspace = true
+# `tests/parity_words.rs`'s ONNX-Runtime preflight (F3): before ort's own
+# `dlopen` — which DEADLOCKS rather than erroring when the dylib is unusable —
+# it proves the library actually LOADS and exports `OrtGetApiBase`, by trying it
+# in a child process with a timeout. `libloading` performs the load there; the
+# `unsafe` it requires lives ONLY in that test-crate child helper, so the
+# `alignkit` library stays unsafe-free. `tempfile` backs the hermetic unit test
+# that feeds the validator a non-dylib file. Both are tiny, test-only, and (via
+# the `parity_words` target's `required-features`) exercised only under
+# `parity-oracle` — they drag in nothing like ort/whisper.cpp.
+libloading = "0.8"
 serde_json.workspace = true
 sha2.workspace = true
+tempfile.workspace = true
 tokenizers.workspace = true
 
 [lints]

@@ -133,7 +133,12 @@
 mod common;
 
 use core::sync::atomic::AtomicBool;
-use std::path::PathBuf;
+use std::{
+  ffi::{OsStr, OsString},
+  path::PathBuf,
+  process::{Command, Stdio},
+  time::{Duration, Instant},
+};
 
 use alignkit::{
   ANALYSIS_TIMEBASE, Aligner, EnglishNormalizer, Lang, OutputClock, TimeRange, Word,
@@ -619,6 +624,16 @@ fn load_alignkit() -> Aligner {
 /// is the kind of wrong conclusion that gets a gate weakened. So resolve the
 /// library up front and panic with something a human can act on.
 ///
+/// **Existence is not loadability** (F3). A file at the resolved path can still
+/// be a text file, a wrong-architecture dylib, or a library missing
+/// `OrtGetApiBase` — each passes an `is_file()` check and then hits the very
+/// deadlock above. So the preflight does not stop at existence: it actually
+/// `dlopen`s the library and resolves `OrtGetApiBase` — the entry point ort
+/// itself calls — in a CHILD PROCESS with a timeout
+/// ([`probe_ort_dylib_loadable`]), so a hanging loader kills the child instead of
+/// this test, and a load failure becomes a fast, actionable panic rather than a
+/// silent hang.
+///
 /// The search mirrors what ort and dyld actually do: `ORT_DYLIB_PATH` if set,
 /// otherwise a bare `dlopen("libonnxruntime.dylib")`, which consults
 /// `DYLD_LIBRARY_PATH` and then `DYLD_FALLBACK_LIBRARY_PATH` (default
@@ -633,7 +648,9 @@ fn assert_onnxruntime_is_resolvable() {
                       ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib. Do NOT skip this \
                       test instead — a parity gate that opts itself out is not a gate.";
 
-  if let Some(explicit) = std::env::var_os("ORT_DYLIB_PATH") {
+  // 1. Resolve the dlopen TARGET, fast-failing with a precise message if the
+  //    library plainly is not on disk / on the loader path.
+  let target: OsString = if let Some(explicit) = std::env::var_os("ORT_DYLIB_PATH") {
     let path = PathBuf::from(&explicit);
     assert!(
       path.is_file(),
@@ -642,27 +659,169 @@ fn assert_onnxruntime_is_resolvable() {
        {HINT}",
       path.display()
     );
-    return;
-  }
+    explicit
+  } else {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("DYLD_LIBRARY_PATH")
+      .iter()
+      .flat_map(std::env::split_paths)
+      .collect();
+    match std::env::var_os("DYLD_FALLBACK_LIBRARY_PATH") {
+      Some(fallback) => dirs.extend(std::env::split_paths(&fallback)),
+      None => {
+        dirs.extend(std::env::var_os("HOME").map(|h| PathBuf::from(h).join("lib")));
+        dirs.push(PathBuf::from("/usr/local/lib"));
+        dirs.push(PathBuf::from("/usr/lib"));
+      }
+    }
+    assert!(
+      dirs.iter().any(|dir| dir.join(LIB).is_file()),
+      "ORT_DYLIB_PATH is unset and no {LIB} is on dyld's search path (looked in {dirs:?}). ort \
+       resolves ONNX Runtime with a bare dlopen and, when that fails, DEADLOCKS rather than \
+       returning an error — so this test would hang forever instead of telling you why. {HINT}"
+    );
+    // Bare name: let the child's dlopen use dyld's OWN resolution, exactly as ort
+    // does — so the preflight loads through the same path ort will.
+    OsString::from(LIB)
+  };
 
-  let mut dirs: Vec<PathBuf> = std::env::var_os("DYLD_LIBRARY_PATH")
-    .iter()
-    .flat_map(std::env::split_paths)
-    .collect();
-  match std::env::var_os("DYLD_FALLBACK_LIBRARY_PATH") {
-    Some(fallback) => dirs.extend(std::env::split_paths(&fallback)),
-    None => {
-      dirs.extend(std::env::var_os("HOME").map(|h| PathBuf::from(h).join("lib")));
-      dirs.push(PathBuf::from("/usr/local/lib"));
-      dirs.push(PathBuf::from("/usr/lib"));
+  // 2. Existence is not loadability (F3). Actually LOAD the library and resolve
+  //    `OrtGetApiBase`, in a child process with a timeout, and fail fast if ort
+  //    could not use it.
+  if let Err(why) = probe_ort_dylib_loadable(&target) {
+    panic!(
+      "{} exists but ort cannot use it: {why}. ort resolves ONNX Runtime with a bare dlopen and, \
+       when the load fails, DEADLOCKS rather than returning an error, so failing here instead. \
+       {HINT}",
+      PathBuf::from(&target).display()
+    );
+  }
+}
+
+/// Env var carrying, into the re-exec'd child, the dylib path/name it must try
+/// to `dlopen`. Set only on the child's environment by
+/// [`probe_ort_dylib_loadable`]; absent in an ordinary run, where the child test
+/// is a no-op.
+const ORT_PROBE_TARGET_ENV: &str = "ALIGNKIT_ORT_PREFLIGHT_DLOPEN";
+
+/// Child exit code: the file could not be `dlopen`ed at all (not a loadable
+/// dylib for this architecture — a text file, a wrong-arch binary, …).
+const PROBE_EXIT_LOAD_FAILED: i32 = 2;
+/// Child exit code: it loaded, but does not export `OrtGetApiBase` — so it is
+/// not ONNX Runtime.
+const PROBE_EXIT_NO_SYMBOL: i32 = 3;
+
+/// Prove ONNX Runtime at `target` is LOADABLE — actually `dlopen` it and resolve
+/// the `OrtGetApiBase` symbol ort calls — in a CHILD PROCESS with a timeout, so a
+/// hanging loader kills the child rather than wedging this test. `Ok(())` iff the
+/// child loaded the library and found the symbol.
+///
+/// The load runs in a re-exec of THIS test binary
+/// ([`ort_preflight_dlopen_child`]), so the `unsafe` `libloading` call is
+/// confined to the test crate and the alignkit library stays unsafe-free. The
+/// timeout is a poll loop over [`std::process::Child::try_wait`] (no extra
+/// dependency) that kills the child if it overruns.
+fn probe_ort_dylib_loadable(target: &OsStr) -> Result<(), String> {
+  // Generous: a good dlopen of ONNX Runtime is sub-second, so this only bounds a
+  // genuine hang.
+  const TIMEOUT: Duration = Duration::from_secs(30);
+  const POLL: Duration = Duration::from_millis(50);
+
+  let exe = std::env::current_exe().map_err(|e| format!("cannot find the test binary: {e}"))?;
+  let mut child = Command::new(exe)
+    // Run ONLY the child probe test — libtest's exact filter, plus `--ignored`
+    // because that test opts out of ordinary runs.
+    .args(["--exact", "--ignored", "ort_preflight_dlopen_child"])
+    .env(ORT_PROBE_TARGET_ENV, target)
+    .stdout(Stdio::null())
+    .stderr(Stdio::null())
+    .spawn()
+    .map_err(|e| format!("cannot spawn the dlopen probe subprocess: {e}"))?;
+
+  let start = Instant::now();
+  loop {
+    match child.try_wait() {
+      Ok(Some(status)) => {
+        return match status.code() {
+          Some(0) => Ok(()),
+          Some(PROBE_EXIT_LOAD_FAILED) => Err(
+            "dlopen failed — not a loadable ONNX Runtime dylib for this architecture".to_owned(),
+          ),
+          Some(PROBE_EXIT_NO_SYMBOL) => {
+            Err("loaded, but does not export OrtGetApiBase — not ONNX Runtime".to_owned())
+          }
+          Some(other) => Err(format!("the dlopen probe exited with status {other}")),
+          None => Err("the dlopen probe was killed by a signal".to_owned()),
+        };
+      }
+      Ok(None) => {
+        if start.elapsed() >= TIMEOUT {
+          let _ = child.kill();
+          let _ = child.wait();
+          return Err(format!(
+            "the loader did not return within {}s — a hanging dlopen, exactly the deadlock the \
+             preflight exists to convert into a fast failure",
+            TIMEOUT.as_secs()
+          ));
+        }
+        std::thread::sleep(POLL);
+      }
+      Err(e) => return Err(format!("cannot wait on the dlopen probe subprocess: {e}")),
     }
   }
+}
 
+/// The child half of [`probe_ort_dylib_loadable`], re-exec'd by it with
+/// [`ORT_PROBE_TARGET_ENV`] set: it `dlopen`s the target and resolves
+/// `OrtGetApiBase`, then exits with a status the parent reads. Absent that env
+/// var — i.e. in any ordinary `--ignored` run — it is a passing no-op.
+#[test]
+#[ignore = "internal ONNX Runtime dlopen-probe subprocess; a no-op unless re-exec'd by the parity preflight"]
+fn ort_preflight_dlopen_child() {
+  let Some(target) = std::env::var_os(ORT_PROBE_TARGET_ENV) else {
+    return;
+  };
+  // SAFETY: loading an arbitrary dylib runs its initializers, which is why the
+  // call is `unsafe` and why it runs in this short-lived CHILD process the parent
+  // kills on timeout. We only RESOLVE `OrtGetApiBase` below (never call it), so
+  // ort's own environment init — the code path that deadlocks — is never
+  // entered. The unsafe is confined to this test-crate helper; the alignkit
+  // library is unsafe-free.
+  let library = match unsafe { libloading::Library::new(&target) } {
+    Ok(library) => library,
+    Err(_) => std::process::exit(PROBE_EXIT_LOAD_FAILED),
+  };
+  // SAFETY: resolving a symbol by name; the returned pointer is never called, so
+  // no foreign code runs. Same child-process confinement as above.
+  let resolved = unsafe { library.get::<unsafe extern "C" fn()>(b"OrtGetApiBase\0") };
+  std::process::exit(if resolved.is_ok() {
+    0
+  } else {
+    PROBE_EXIT_NO_SYMBOL
+  });
+}
+
+/// **F3 unit test.** The loadability validator REJECTS a file that exists but is
+/// not a loadable dylib. Hermetic — a text file in a temp dir, no ONNX Runtime,
+/// no models — and NOT `#[ignore]`, so it runs wherever `parity-oracle` is built
+/// (e.g. `cargo hack --each-feature`). It is the standing proof that
+/// `Path::is_file()` alone — the old preflight — was never enough: this decoy
+/// passes `is_file()` and would have sailed straight into ort's deadlock.
+#[test]
+fn preflight_rejects_a_non_dylib_file() {
+  let dir = tempfile::tempdir().expect("create a temp dir");
+  let not_a_dylib = dir.path().join("libonnxruntime.dylib");
+  std::fs::write(&not_a_dylib, b"I am a text file, not a Mach-O dylib.\n")
+    .expect("write the decoy file");
   assert!(
-    dirs.iter().any(|dir| dir.join(LIB).is_file()),
-    "ORT_DYLIB_PATH is unset and no {LIB} is on dyld's search path (looked in {dirs:?}). ort \
-     resolves ONNX Runtime with a bare dlopen and, when that fails, DEADLOCKS rather than \
-     returning an error — so this test would hang forever instead of telling you why. {HINT}"
+    not_a_dylib.is_file(),
+    "the decoy must exist, so this proves loadability is checked BEYOND existence"
+  );
+
+  let err = probe_ort_dylib_loadable(not_a_dylib.as_os_str())
+    .expect_err("a text file is not a loadable dylib and must be rejected");
+  assert!(
+    err.contains("dlopen failed"),
+    "expected a load failure for a non-dylib, got: {err}"
   );
 }
 
