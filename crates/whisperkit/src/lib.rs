@@ -100,6 +100,13 @@
 //!   already-constructed pipeline
 //!   ([`audio_stream_transcriber`](transcribe::WhisperKit::audio_stream_transcriber)/
 //!   [`local_agreement_transcriber`](transcribe::WhisperKit::local_agreement_transcriber)).
+//! - [`task_facts`] — [`TaskFacts`](task_facts::TaskFacts), the single record
+//!   of the decode-time facts a run *controls* (RNG draw, observed language,
+//!   early-stop truncation, worker coordinates, allocated id span), with the
+//!   one associative [merge law](task_facts::TaskFacts::merge) every merge
+//!   entry point calls. Carried on every
+//!   [`TranscriptionResult`](result::TranscriptionResult) and embedded in
+//!   [`Provenance`](provenance::Provenance).
 //! - [`log`] — leveled logging with a replacing callback.
 //!
 //! # Reproducibility and provenance
@@ -346,6 +353,7 @@ pub mod provenance;
 pub mod result;
 pub mod segment;
 pub mod stream;
+pub mod task_facts;
 pub mod text;
 pub mod tokenizer;
 pub mod transcribe;
