@@ -615,7 +615,8 @@ fn measure(
      mismatched, first {first_seg_mismatch:?}) | slot set: +{} / -{} | embed: max|diff|={worst_abs:.3e} \
      (chunk {}, slot {}) cos_min={worst_cos:.9} (chunk {}, slot {}) bit-identical {exact_rows}/{compared_rows} \
      rows | min clean_count={min_clean} (dia's fallback fires 0x) | argmax's minActiveRatio would \
-     withhold {would_withhold}/{} slots from cluster FORMATION (spec §5.2: not ported, not gated) | \
+     withhold {would_withhold}/{} slots from cluster FORMATION (applied downstream by dia for every \
+     source, out of this gate's surface) | \
      argmax's fresh mask alloc all-zero: {}",
     samples.len(),
     extraction.num_chunks(),

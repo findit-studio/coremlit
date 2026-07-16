@@ -8,10 +8,15 @@ clustering. Product driver:
 [`findit-studio/desktop#120`](https://github.com/findit-studio/desktop/issues/120)
 (segmentation ~20x / embedding ~30x ANE uplift targets).
 
-**This is not a standalone diarizer.** Clustering — the step that turns
-embeddings into speaker labels — stays in `dia`, unchanged, by design. This
-crate's job stops the moment it has produced `dia`-shaped tensors
-(`Extraction`); it never assigns a speaker label to anything.
+**The clustering algorithms are `dia`'s, not this crate's.** speakerkit's own
+work is native CoreML inference: it runs the segmentation and embedding nets on
+the ANE and produces `dia`-shaped tensors (`Extraction`). It does not
+reimplement clustering. What it *does* provide — as of the clustering phase — is
+a thin runtime clustering *stage* (`Extraction::diarize` / `diarize_with` /
+`diarize_online`) that turns those tensors into speaker-labelled spans by
+delegating to one of `dia`'s two engines: the offline pyannote-community-1
+pipeline (the default, DER-gated) or the online FluidAudio-semantics matcher.
+See [Clustering](#clustering) below.
 
 **Sans-I/O**, like `whisperkit`: audio enters as 16 kHz mono `&[f32]`. No
 file I/O, no resampling, no device capture, no async. macOS only (Apple
@@ -33,9 +38,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let extraction = source.extract(&audio)?;
 
     // `extraction` now holds exactly the tensors `dia`'s offline diarizer
-    // consumes. Behind the `dia` feature:
-    //   extraction.into_offline_input(&plda)  ->  dia::offline::OfflineInput
-    // which feeds `dia::offline::diarize_offline` for the actual clustering.
+    // consumes. `dia` is a non-optional runtime dependency, so clustering is
+    // available directly (see "Clustering" below):
+    //   extraction.diarize(&plda)  ->  dia::offline::OfflineOutput
+    // or extraction.into_offline_input(&plda) for the raw dia::offline::OfflineInput.
     println!(
         "{} chunks, {} output frames",
         extraction.num_chunks(),
@@ -54,21 +60,139 @@ let options = Options::new().with_source(Source::Argmax);
 let source = AnySource::load("Models/argmax-speakerkit", options)?;
 ```
 
-Feature flags: `dia` (enables `Extraction::into_offline_input`; pulls in the
-`diarization` crate as an **optional git dependency pinned to an exact rev** —
-*not* a path dependency on a sibling checkout, so edits to a local
-`diarization` tree are **not** consumed unless you add the co-dev `[patch]` to
-the workspace-root `Cargo.toml`, see its "CO-DEV RECIPE" comment. The dep is
-`default-features = false`, so `dia` pulls only dia's backend-free offline
-**core** — no ONNX Runtime, no bundled ONNX model — keeping ORT out of
-CoreML-only deployments), `dia-oracle` (a **test-only** superset of `dia` that
-adds dia's own ort inference path, `dia/ort` + `dia/bundled-segmentation`, so
-the end-to-end DER parity suites can measure this crate's CoreML output against
-dia-ort; it is what the `parity_e2e` / `parity_shipping_der` / `generate_goldens`
-binaries compile under, and is never meant for production), and `serde`
-(`Serialize`/`Deserialize` on `Options` and friends). None is on by default. (A
-sibling `diarization` checkout is used only as **test data** for the model-gated
-DER gates below, never as the `dia` dependency itself.)
+Feature flags: `dia-oracle` (test-only — pulls in `dia`'s `ort`-backed ONNX
+reference oracle, `dia/ort` + `dia/bundled-segmentation`, that the end-to-end
+DER parity suites score the CoreML path against; it is what the `parity_e2e` /
+`parity_shipping_der` / `generate_goldens` binaries compile under, and is never
+meant for production) and `serde` (`Serialize`/`Deserialize` on `Options` and
+friends). Neither is on by default.
+
+The `diarization` crate (imported as `dia`) is a **non-optional runtime
+dependency** — the clustering stage (`diarize` / `diarize_with` /
+`diarize_online`) and `Extraction::into_offline_input` are always available, no
+feature required. It is pinned to the public repo by an **exact git rev, not a
+path dependency** on a sibling checkout (a path dep breaks a fresh `cargo
+metadata`; edits to a local `diarization` tree are not consumed unless you add
+the co-dev `[patch]` to the workspace-root `Cargo.toml` — see its "CO-DEV
+RECIPE" comment). The dep is `default-features = false`, so the runtime path
+pulls only dia's backend-free offline **core** — no ONNX Runtime, no bundled
+ONNX model — keeping ORT out of CoreML-only deployments. (A sibling
+`diarization` checkout is used only as **test data** for the model-gated DER
+gates below, never as the `dia` dependency itself.)
+
+## Clustering
+
+Turn an `Extraction` into speaker-labelled RTTM spans with one of two backends.
+Both are `dia`'s engines — this crate selects and drives them, it does not
+reimplement clustering. Pick a backend with `ClusterBackend` and tune it with
+`OfflineOptions` / `OnlineOptions`.
+
+### `ClusterBackend::Offline(OfflineOptions)` — the default, DER-gated
+
+`dia`'s pyannote-community-1 offline pipeline (`dia::offline::diarize_offline`:
+AHC initialization → VBx refinement over PLDA-projected embeddings). This is the
+path every DER number in this README is measured on, and the one
+`Extraction::diarize` runs by default. `OfflineOptions` mirrors, one-for-one, the
+five community-1 hyperparameters `dia` exposes:
+
+| knob | default | tunes |
+|---|---|---|
+| `threshold` | 0.6 | AHC linkage cut |
+| `fa` | 0.07 | VBx `Fa` |
+| `fb` | 0.8 | VBx `Fb` |
+| `max_iters` | 20 | VBx iteration cap |
+| `min_duration_off` | 0.0 | gap-merge threshold (s) for span post-processing |
+
+Every default equals `dia`'s, which equals pyannote's — pinned in code against
+`dia`'s own accessors (`cluster::defaults_equal_dia`), so a drift on *either*
+side fails the build. `OfflineOptions::default()` therefore produces
+byte-identical clustering to feeding `dia` directly.
+
+```rust,no_run
+use speakerkit::extract::Options;
+use speakerkit::source::{AnySource, ModelSource, Source};
+use speakerkit::{ClusterBackend, OfflineOptions};
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let audio: Vec<f32> = vec![0.0; 16_000]; // 16 kHz mono; no I/O in this crate.
+    let options = Options::new().with_source(Source::FluidAudio);
+    let extraction = AnySource::load("Models/speakerkit", options)?.extract(&audio)?;
+
+    // The frozen community-1 PLDA projection `dia` clusters through.
+    let plda = dia::plda::PldaTransform::new()?;
+
+    // `diarize` runs the default backend (offline, `dia`'s community-1 defaults).
+    let output = extraction.diarize(&plda)?;
+    println!("{} spans", output.spans_slice().len());
+
+    // `diarize_with` runs a specific, tuned backend.
+    let tuned = ClusterBackend::Offline(OfflineOptions::default().with_threshold(0.7));
+    let _ = extraction.diarize_with(&plda, tuned)?;
+    Ok(())
+}
+```
+
+### `ClusterBackend::Online(OnlineOptions)` — streaming, NOT pyannote-parity
+
+FluidAudio's greedy online centroid matcher (`SpeakerManager` semantics, ported
+in `dia` as `dia::cluster::online::OnlineClusterer`) — a genuinely *different*
+algorithm class: it assigns each segment as it arrives against running centroids,
+which AHC→VBx structurally cannot do. Three properties are load-bearing and **by
+design**:
+
+- **Order-dependent.** Feeding the same segments in a different order can yield
+  different speakers. The engine is defined here at one order (chunk order, then
+  slot order within a chunk — FluidAudio's own feed order).
+- **Raw cosine space, no PLDA.** It matches raw L2-normalized WeSpeaker
+  embeddings by cosine distance; the PLDA projection the offline pipeline applies
+  has no part in it. `diarize_online` therefore takes **no** `plda` argument —
+  the absence is a fact of the signature, not an argument silently ignored.
+- **Gated against FluidAudio's Swift, never pyannote DER.** Its correctness gate
+  is a committed 48-step Swift `SpeakerManager` trace (48/48 exact,
+  `tests/parity_online_swift.rs`), *not* DER against the pyannote reference. Do
+  not read online output as pyannote-parity diarization.
+
+`OnlineOptions` mirrors the three `SpeakerManager` knobs — `speaker_threshold`
+(0.65, the cosine *distance* for assignment), `embedding_threshold` (0.45, for
+centroid update), and `min_speech_duration` (1.0 s, to spawn a new speaker) —
+the defaults of a bare `SpeakerManager()`.
+`OnlineOptions::from_clustering_threshold(0.7)` reproduces the shipping FluidAudio
+diarizer's derived `0.84` / `0.56`.
+
+```rust,no_run
+use speakerkit::extract::Options;
+use speakerkit::source::{AnySource, ModelSource, Source};
+use speakerkit::OnlineOptions;
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let audio: Vec<f32> = vec![0.0; 16_000];
+    let options = Options::new().with_source(Source::FluidAudio);
+    let extraction = AnySource::load("Models/speakerkit", options)?.extract(&audio)?;
+
+    // No PLDA: the online engine matches raw cosine embeddings.
+    let output = extraction.diarize_online(OnlineOptions::default())?;
+    println!("{} spans", output.spans_slice().len());
+    Ok(())
+}
+```
+
+### Honesty boundaries
+
+- **Offline is the validated path.** Every DER number in this README, and every
+  ⚠ warning below, is the offline backend. In this crate "parity" means offline.
+- **Online is not parity.** It is order-dependent and gated only against
+  FluidAudio's Swift `SpeakerManager`, never against pyannote. It is a streaming
+  *capability*, not a faithful-diarization claim — do not DER-score it.
+- **`min_active_ratio` is not a knob.** An earlier plan floated it as a
+  speakerkit-side pre-filter (OFF = parity, ON = argmax); that was **dropped**,
+  because the premise was false. `dia`'s offline pipeline *already* applies
+  argmax's `minActiveRatio = 0.2` sparse-slot exclude-and-reassign
+  **unconditionally, for every source** (`dia`'s `offline/algo.rs`; see also "The
+  two model sources" below) — it withholds those slots from cluster *formation*
+  and re-attaches them at nearest-centroid reassignment, never dropping them. So
+  there is nothing to toggle: the filter is live for both sources, applied inside
+  `dia`, and a speakerkit knob could only add a novel stricter drop semantic no
+  one asked for.
 
 ## The two model sources
 
@@ -465,9 +589,12 @@ see `tests/swift/regen_goldens.sh`.
 ## See also
 
 - Design spec: `docs/superpowers/specs/2026-07-13-speakerkit-multisource-diarizer-backend-design.md`
-  (the source of truth for everything above) and its predecessor,
+  (the source of truth for the sources/DER material above) and its predecessor,
   `docs/superpowers/specs/2026-07-11-dia-coreml-backends-design.md` — both
-  referenced the same way from this crate's own rustdoc (e.g. `lib.rs`).
+  referenced the same way from this crate's own rustdoc (e.g. `lib.rs`). The
+  clustering surface documented under "Clustering" above has its own design of
+  record, `docs/superpowers/specs/2026-07-16-clustering-backends-design.md`
+  (whose 2026-07-16 amendment the `cluster` module and `lib.rs` cite).
   `docs/` is gitignored (local planning artifacts from this feature's
   spec/plan workflow, not shipped documentation), so these paths exist only
   where the feature was planned/built, not in every checkout — not

@@ -35,11 +35,19 @@
 //! - `dia::cluster::cluster_offline` — a separate BATCH clusterer
 //!   (agglomerative/spectral, `similarity_threshold = 0.5`, `target_speakers`,
 //!   `seed`), a DIFFERENT algorithm surface never validated against the parity
-//!   corpus. Its `OfflineClusterOptions`/`OfflineMethod`/`Linkage` vocabulary is
-//!   deliberately NOT part of speakerkit's surface (see [`crate`]'s own
-//!   root-doc note on the removed re-export). If a batch-clustering mode is
-//!   ever wanted it arrives as its own [`ClusterBackend`] variant with its own
-//!   gates.
+//!   corpus.
+//!
+//! Its `OfflineClusterOptions`/`OfflineMethod`/`Linkage` vocabulary is
+//! deliberately NOT part of speakerkit's surface. T1 briefly re-exported those
+//! three types at the crate root, expecting [`ClusterBackend::Offline`] to wrap
+//! them; T2 removed that re-export once T1 discovered the runtime path drives the
+//! OTHER entry point ([`dia::offline::diarize_offline`], above) — surfacing the
+//! batch clusterer's vocabulary as speakerkit's clustering surface would have
+//! been misleading for an unpublished crate whose only validated offline path is
+//! the pipeline (design spec AMENDMENT 2026-07-16). A caller who genuinely wants
+//! dia's batch clusterer can still reach it through the `dia` dependency
+//! directly; a first-class batch mode, if ever wanted, would arrive as its own
+//! [`ClusterBackend`] variant with its own gates.
 //!
 //! # The [`OfflineOptions`] knob set == dia's `OfflineInput` hyperparameters
 //!
@@ -67,6 +75,31 @@
 //!   temp-dir `PathBuf`), not a clustering hyperparameter; surfacing an I/O path
 //!   here would also cut against this crate's sans-I/O config surface. dia's
 //!   default is used unchanged.
+//!
+//! # Example: selecting and tuning a backend
+//!
+//! The config surface is pure and model-free — construct and inspect it without
+//! loading any model:
+//!
+//! ```
+//! use speakerkit::{ClusterBackend, OfflineOptions, OnlineOptions};
+//!
+//! // The default backend is the offline pyannote-community-1 pipeline with
+//! // dia's community-1 hyperparameters.
+//! assert_eq!(
+//!   ClusterBackend::default(),
+//!   ClusterBackend::Offline(OfflineOptions::default()),
+//! );
+//! assert_eq!(ClusterBackend::default().as_str(), "offline");
+//!
+//! // Tune the offline knobs (every default already equals dia's = pyannote's).
+//! let offline = OfflineOptions::default().with_threshold(0.7);
+//! assert_eq!(offline.threshold(), 0.7);
+//!
+//! // Select the online engine — raw cosine, NO PLDA, order-dependent by design.
+//! let online = ClusterBackend::Online(OnlineOptions::from_clustering_threshold(0.7));
+//! assert_eq!(online.as_str(), "online");
+//! ```
 
 #[cfg(test)]
 mod tests;
