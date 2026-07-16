@@ -100,7 +100,17 @@ jobs:
       # downloads WHISPER ONLY (per MODELS_LOCK), so the sweep here audits the
       # whisper graphs; the speakerkit/alignkit/argmax defect pins have no vendor
       # present and are a local/dev gate.
-      - run: cargo test -p coremlit --test fp16_guards
+      # codex r6 F3: the fp16 sweep enforces a vendor manifest — every vendor
+      # named by a KNOWN_DEFECTS pin must be present, or deleting a whole vendor
+      # would silently disable its pins. This runner is WHISPER-ONLY, so declare
+      # that scope EXPLICITLY: COREMLIT_FP16_SWEEP_VENDORS narrows the manifest to
+      # the vendor actually downloaded here. The absent speakerkit/alignkit/argmax
+      # pins are NOT verified on CI — a local/dev gate with the full Models/ tree
+      # does that. The override is fail-closed (unset would demand EVERY pinned
+      # vendor), so narrowing coverage is an explicit, reviewable act here, never a
+      # silent skip. See the coverage-boundary note in
+      # crates/coremlit/tests/fp16_guards.rs.
+      - run: COREMLIT_FP16_SWEEP_VENDORS=whisperkit-coreml cargo test -p coremlit --test fp16_guards
       - run: crates/coremlit/tests/fp16_sweep_inventory.sh
       - run: cargo test -p coremlit -- --ignored
       - run: cargo test -p whisperkit -- --ignored

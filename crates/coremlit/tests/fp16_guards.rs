@@ -38,9 +38,26 @@
 //! - Findings must match [`KNOWN_DEFECTS`] **exactly**. An unpinned model
 //!   that grows a vanishing guard fails; a pinned one that is quietly
 //!   *repaired* also fails, so a fix cannot land un-noticed either.
-//! - A `.mlmodelc` with no readable `model.mil` is a hard failure, and a
-//!   pinned defect that has disappeared from an otherwise-present vendor
-//!   tree is a hard failure. Nothing silently skips.
+//! - A `.mlmodelc` with no readable `model.mil` is a hard failure; a pinned
+//!   defect that has disappeared from an otherwise-present vendor tree is a hard
+//!   failure; and — the vendor manifest — an EXPECTED vendor directory that is
+//!   missing entirely is a hard failure too, so deleting a whole vendor cannot
+//!   silently disable all of its pins (the per-pin check alone only fired when
+//!   the vendor dir still existed). Nothing silently skips.
+//!
+//! # Coverage boundary (`COREMLIT_FP16_SWEEP_VENDORS`)
+//!
+//! By default the sweep requires EVERY vendor named by a [`KNOWN_DEFECTS`] pin to
+//! be present. CI's model job, however, downloads WHISPER ONLY (per MODELS_LOCK),
+//! so it sets `COREMLIT_FP16_SWEEP_VENDORS=whisperkit-coreml` to narrow the
+//! manifest EXPLICITLY: there the sweep proves it runs and that the whisper mel
+//! control is clean, but it CANNOT verify the speakerkit / alignkit / argmax
+//! defect pins — those models are not downloaded. Full pin verification (all ten
+//! defect pins) is a local/dev gate that needs the complete `Models/` tree. The
+//! override is fail-closed — absence of it requires ALL pinned vendors — so
+//! narrowing coverage is always an explicit, reviewable act in ci.yml, never the
+//! silent side effect of a deleted directory, which is the whole point of the
+//! manifest.
 //!
 //! When `Models/` is absent the sweep is `ignored`, never a green `ok`
 //! over zero models (see `build.rs`). The parser tests below are hermetic
@@ -49,8 +66,8 @@
 //! into something that always passes.
 
 use std::{
-  collections::BTreeMap,
-  fs, io,
+  collections::{BTreeMap, BTreeSet},
+  env, fs, io,
   path::{Path, PathBuf},
 };
 
@@ -1443,29 +1460,63 @@ fn discover(root: &Path, out: &mut Vec<PathBuf>) -> io::Result<()> {
   Ok(())
 }
 
-#[cfg_attr(
-  not(models_present),
-  ignore = "Models/ is gitignored and absent — nothing to sweep (build.rs)"
-)]
-#[test]
-fn every_shipped_model_graph_survives_fp16() {
-  let root = models_dir();
-  assert!(
-    root.is_dir(),
-    "Models/ vanished between build and run: {}",
-    root.display()
-  );
+/// The vendor prefix of a [`KNOWN_DEFECTS`] path
+/// (`speakerkit/Foo.mlmodelc` -> `speakerkit`).
+fn vendor_of(path: &str) -> &str {
+  path.split('/').next().unwrap_or(path)
+}
 
+/// The vendors the sweep REQUIRES to be present (the vendor manifest). Default:
+/// every vendor named by a [`KNOWN_DEFECTS`] pin, so deleting a whole vendor FAILS
+/// the sweep instead of silently dropping that vendor's pins. Fail-closed —
+/// absence of the override is the strictest setting.
+///
+/// `COREMLIT_FP16_SWEEP_VENDORS` (comma-separated) OVERRIDES the manifest for a
+/// deliberately-partial tree: CI's model job downloads WHISPER ONLY (per
+/// MODELS_LOCK) and sets `COREMLIT_FP16_SWEEP_VENDORS=whisperkit-coreml`, so there
+/// the sweep requires the whisper vendor and audits its graphs while the absent
+/// speakerkit/alignkit/argmax vendors are the DOCUMENTED escape, not a silent
+/// skip. Narrowing coverage is thus an explicit, reviewable act; the full pin
+/// verification remains a local/dev gate (see the module docs' coverage boundary).
+fn expected_vendors() -> BTreeSet<String> {
+  match env::var("COREMLIT_FP16_SWEEP_VENDORS") {
+    Ok(v) => v
+      .split(',')
+      .map(str::trim)
+      .filter(|s| !s.is_empty())
+      .map(String::from)
+      .collect(),
+    Err(_) => KNOWN_DEFECTS
+      .iter()
+      .map(|d| vendor_of(d.path).to_string())
+      .collect(),
+  }
+}
+
+/// The result of sweeping a tree: how many models and guard sites were audited,
+/// and every failure found. An empty `failures` is a clean sweep.
+struct SweepOutcome {
+  models_len: usize,
+  audited_sites: usize,
+  failures: Vec<String>,
+}
+
+/// Sweeps every `.mlmodelc` under `root` and returns the outcome — factored out
+/// of [`every_shipped_model_graph_survives_fp16`] so the vendor manifest is
+/// exercised hermetically over synthetic trees, not only the real `Models/`.
+///
+/// `expected_vendors` is the manifest: each named vendor directory MUST exist
+/// under `root` or a failure is recorded, so deleting an ENTIRE vendor can no
+/// longer silently disable its pins (the old per-pin check only fired when the
+/// vendor dir still existed, so a tree with just the clean whisper vendor swept
+/// green with all ten speakerkit/alignkit/argmax pins quietly skipped). A pin
+/// whose vendor is NOT in `expected_vendors` is allowed to be absent — the
+/// deliberately-partial-tree escape (see [`expected_vendors`]) — but a pin missing
+/// from a vendor that IS present still fails.
+fn sweep_tree(root: &Path, expected_vendors: &BTreeSet<String>) -> io::Result<SweepOutcome> {
   let mut models = Vec::new();
-  discover(&root, &mut models)
-    .unwrap_or_else(|e| panic!("walking Models/ failed instead of silently skipping: {e}"));
+  discover(root, &mut models)?;
   models.sort();
-
-  // Non-vacuity. A sweep that found nothing must never report `ok`.
-  assert!(
-    !models.is_empty(),
-    "Models/ exists but contains no .mlmodelc — the sweep would be vacuous"
-  );
 
   let pins: BTreeMap<&str, &KnownDefect> = KNOWN_DEFECTS.iter().map(|d| (d.path, d)).collect();
   let mut audited_sites = 0_usize;
@@ -1474,16 +1525,22 @@ fn every_shipped_model_graph_survives_fp16() {
 
   for model in &models {
     let rel = model
-      .strip_prefix(&root)
+      .strip_prefix(root)
       .expect("discovered under root")
       .to_string_lossy()
       .replace('\\', "/");
     seen.push(rel.clone());
 
-    // A model directory with no readable graph is a hard failure, never a skip.
+    // A model directory with no readable graph is a hard failure, never a skip —
+    // recorded (not a panic) so the sweep still reports every other model.
     let mil = model.join("model.mil");
-    let text = fs::read_to_string(&mil)
-      .unwrap_or_else(|e| panic!("{rel}: .mlmodelc has no readable model.mil ({e})"));
+    let text = match fs::read_to_string(&mil) {
+      Ok(text) => text,
+      Err(e) => {
+        failures.push(format!("{rel}: .mlmodelc has no readable model.mil ({e})"));
+        continue;
+      }
+    };
 
     let Audit {
       findings,
@@ -1505,11 +1562,15 @@ fn every_shipped_model_graph_survives_fp16() {
       ));
     }
 
-    assert!(
-      !findings.is_empty(),
-      "{rel}: parsed zero guard sites from a {} byte graph — the parser has rotted",
-      text.len()
-    );
+    // A parsed graph with zero guard sites is the parser having rotted — a hard
+    // failure recorded (not a panic) so the sweep still reports every other model.
+    if findings.is_empty() {
+      failures.push(format!(
+        "{rel}: parsed zero guard sites from a {} byte graph — the parser has rotted",
+        text.len()
+      ));
+      continue;
+    }
     audited_sites += findings.len();
 
     // A MULTISET, not a set: duplicates are preserved so a second
@@ -1567,13 +1628,28 @@ fn every_shipped_model_graph_survives_fp16() {
     }
   }
 
-  // A pinned defect that has disappeared from a vendor tree that IS
-  // present means the pin can no longer be verified. Hard failure — this
-  // is exactly the "fixture went missing, test went green" mode.
+  // The vendor manifest (F3): every EXPECTED vendor directory must be present, or
+  // deleting a whole vendor would silently disable ALL of its pins — the "fixture
+  // went missing, test went green" mode one level up from a single missing model.
+  // A tree carrying only the clean whisper vendor used to sweep green with every
+  // speakerkit/alignkit/argmax pin skipped. `expected_vendors` is narrowed
+  // explicitly for CI's whisper-only tree; unset, it demands every pinned vendor.
+  for vendor in expected_vendors {
+    if !root.join(vendor).is_dir() {
+      failures.push(format!(
+        "expected vendor Models/{vendor}/ is MISSING — its pinned known-defect models cannot be \
+         verified, and deleting an entire vendor must never silently disable its pins. Restore \
+         the vendor tree, or narrow COREMLIT_FP16_SWEEP_VENDORS for a deliberately partial tree."
+      ));
+    }
+  }
+
+  // A pinned defect that has disappeared from a vendor tree that IS present means
+  // the pin can no longer be verified. Hard failure — the single-model face of
+  // the same mode (the manifest above is the whole-vendor face).
   for defect in KNOWN_DEFECTS {
-    let vendor = defect.path.split('/').next().unwrap_or(defect.path);
-    let vendor_present = root.join(vendor).is_dir();
-    if vendor_present && !seen.iter().any(|s| s == defect.path) {
+    let vendor = vendor_of(defect.path);
+    if root.join(vendor).is_dir() && !seen.iter().any(|s| s == defect.path) {
       failures.push(format!(
         "{}: pinned known-defect model is MISSING, but Models/{vendor}/ is present. The pin \
          cannot be verified. Restore the model or remove the pin.",
@@ -1582,16 +1658,149 @@ fn every_shipped_model_graph_survives_fp16() {
     }
   }
 
+  Ok(SweepOutcome {
+    models_len: models.len(),
+    audited_sites,
+    failures,
+  })
+}
+
+#[cfg_attr(
+  not(models_present),
+  ignore = "Models/ is gitignored and absent — nothing to sweep (build.rs)"
+)]
+#[test]
+fn every_shipped_model_graph_survives_fp16() {
+  let root = models_dir();
   assert!(
-    audited_sites > 0,
+    root.is_dir(),
+    "Models/ vanished between build and run: {}",
+    root.display()
+  );
+
+  let outcome = sweep_tree(&root, &expected_vendors())
+    .unwrap_or_else(|e| panic!("walking Models/ failed instead of silently skipping: {e}"));
+
+  // Non-vacuity. A sweep that found nothing must never report `ok`.
+  assert!(
+    outcome.models_len > 0,
+    "Models/ exists but contains no .mlmodelc — the sweep would be vacuous"
+  );
+  assert!(
+    outcome.audited_sites > 0,
     "swept {} models and audited zero guard sites — vacuous",
-    models.len()
+    outcome.models_len
   );
 
   assert!(
-    failures.is_empty(),
-    "fp16 guard sweep failed over {} models / {audited_sites} guard sites:\n\n{}\n",
-    models.len(),
-    failures.join("\n\n")
+    outcome.failures.is_empty(),
+    "fp16 guard sweep failed over {} models / {} guard sites:\n\n{}\n",
+    outcome.models_len,
+    outcome.audited_sites,
+    outcome.failures.join("\n\n")
   );
+}
+
+// ---------------------------------------------------------------------------
+// Hermetic vendor-manifest tests — synthetic Models/ trees, no real models.
+// ---------------------------------------------------------------------------
+
+/// A unique, self-cleaning temp directory for the hermetic sweep tests. No
+/// `tempfile` dependency (coremlit's dev-deps are `half` only); removed on drop.
+struct TempTree(PathBuf);
+
+impl TempTree {
+  fn new(tag: &str) -> Self {
+    let uniq = format!(
+      "coremlit_fp16_sweep_{tag}_{}_{}",
+      std::process::id(),
+      std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos()
+    );
+    let root = env::temp_dir().join(uniq);
+    fs::create_dir_all(&root).expect("create temp tree");
+    TempTree(root)
+  }
+
+  fn path(&self) -> &Path {
+    &self.0
+  }
+}
+
+impl Drop for TempTree {
+  fn drop(&mut self) {
+    let _ = fs::remove_dir_all(&self.0);
+  }
+}
+
+/// Writes `mil` to `root/rel/model.mil`, creating parents — the hermetic sweep
+/// tests build a synthetic `Models/` tree from the same verbatim MIL excerpts the
+/// parser tests use.
+fn write_model(root: &Path, rel: &str, mil: &str) {
+  let dir = root.join(rel);
+  fs::create_dir_all(&dir).expect("create model dir");
+  fs::write(dir.join("model.mil"), mil).expect("write model.mil");
+}
+
+/// F3: deleting an entire vendor must FAIL the sweep, not silently skip its pins.
+/// A partial tree — one clean model under `whisperkit-coreml`, but NO `speakerkit`
+/// vendor — is exactly CI's partial download and the shape that used to let all
+/// ten defect pins skip green (the old per-pin check fired only when the vendor
+/// dir still existed). With `speakerkit` in the expected-vendor manifest, its
+/// absence is a hard failure naming the vendor. MUTATION PROOF: deleting the
+/// expected-vendor manifest loop in `sweep_tree` empties `failures` and this
+/// assertion goes red.
+#[test]
+fn a_missing_pinned_vendor_fails_the_sweep_not_silently_skips() {
+  let tree = TempTree::new("missing_vendor");
+  // One clean, present model keeps the sweep non-vacuous...
+  write_model(
+    tree.path(),
+    "whisperkit-coreml/openai_whisper-tiny/MelSpectrogram.mlmodelc",
+    WHISPER_MEL,
+  );
+  // ...but a pinned vendor (`speakerkit`) is entirely absent from the tree.
+  let expected = BTreeSet::from(["whisperkit-coreml".to_string(), "speakerkit".to_string()]);
+
+  let outcome = sweep_tree(tree.path(), &expected).expect("walk the temp tree");
+  assert!(
+    outcome
+      .failures
+      .iter()
+      .any(|f| f.contains("speakerkit") && f.contains("MISSING")),
+    "a missing expected vendor must FAIL the sweep, naming the vendor — got {:?}",
+    outcome.failures
+  );
+}
+
+/// F3/F1 reconciliation: the CI whisper-only scope sweeps CLEAN. With
+/// `expected_vendors = {whisperkit-coreml}` — what CI's model job sets via
+/// `COREMLIT_FP16_SWEEP_VENDORS` — a tree containing only the clean whisper mel
+/// sweeps green: the whisper vendor is present and its graph is clean, and the
+/// absent speakerkit/alignkit/argmax pins are the DOCUMENTED escape (verified by
+/// the full local/dev gate, not here). This is the exact scenario the model job
+/// runs; proving it here keeps the ci.yml wiring honest even though Actions cannot
+/// run in-repo. It also proves the narrowed manifest does NOT demand the pinned
+/// vendors — the fail-closed default does that only when the override is unset.
+#[test]
+fn the_ci_whisper_only_scope_sweeps_clean() {
+  let tree = TempTree::new("whisper_only");
+  write_model(
+    tree.path(),
+    "whisperkit-coreml/openai_whisper-tiny/MelSpectrogram.mlmodelc",
+    WHISPER_MEL,
+  );
+  let expected = BTreeSet::from(["whisperkit-coreml".to_string()]);
+
+  let outcome = sweep_tree(tree.path(), &expected).expect("walk the temp tree");
+  assert!(
+    outcome.failures.is_empty(),
+    "the whisper-only CI scope must sweep clean (whisper present + clean; the pins are the \
+     documented escape) — got {:?}",
+    outcome.failures
+  );
+  assert_eq!(outcome.models_len, 1, "one synthetic model");
+  assert!(outcome.audited_sites >= 1, "the mel log site was audited");
 }
