@@ -136,7 +136,10 @@
 
 mod common;
 
-use std::path::PathBuf;
+use std::{
+  collections::BTreeSet,
+  path::{Path, PathBuf},
+};
 
 use coremlit::{ComputeUnits, DataType, Model};
 
@@ -205,6 +208,29 @@ fn artifact_path(rel: &str) -> PathBuf {
   common::argmax_models_dir().join(rel)
 }
 
+/// Recursively collects every FILE under `dir` as a path relative to `root`,
+/// inserting each into `out` with `/` separators to match [`ARTIFACT_SHA256`]'s
+/// keys. Used to enumerate a `.mlmodelc` bundle's actual tree so it can be
+/// checked against the pinned key set (no unpinned extras, none missing).
+fn collect_files_rel(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
+  for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+  {
+    let entry = entry.expect("read dir entry");
+    let path = entry.path();
+    if entry.file_type().expect("file type").is_dir() {
+      collect_files_rel(root, &path, out);
+    } else {
+      let rel = path
+        .strip_prefix(root)
+        .expect("walked path is under root")
+        .to_str()
+        .expect("utf-8 path")
+        .to_string();
+      out.insert(rel);
+    }
+  }
+}
+
 #[test]
 #[ignore = "requires local argmax speakerkit models (ARGMAX_TEST_MODELS)"]
 fn argmax_artifact_bytes_match_pinned_sha256() {
@@ -215,6 +241,50 @@ fn argmax_artifact_bytes_match_pinned_sha256() {
      weights/weight.bin, analytics/coremldata.bin) across 7 .mlmodelc \
      bundles; table shape changed, update this assertion alongside it"
   );
+
+  // BEFORE hashing: enumerate each of the seven .mlmodelc bundles' real file
+  // trees and assert the discovered relative-path set EQUALS the pinned key set
+  // exactly — no unpinned extra (a file slipped into a bundle) and none missing
+  // (L3). Hashing only the 35 hard-coded keys never notices a 36th file. The
+  // bundle roots are DERIVED from the pinned keys, so the walk is scoped to
+  // exactly the seven real bundles: the sibling
+  // `.cache/huggingface/download/**/*.mlmodelc/*.metadata` download-cache mirror
+  // (not a model artifact, and not under any pinned bundle root) is never
+  // entered.
+  let pinned: BTreeSet<String> = ARTIFACT_SHA256
+    .iter()
+    .map(|(rel, _)| (*rel).to_string())
+    .collect();
+  let bundles: BTreeSet<&str> = ARTIFACT_SHA256
+    .iter()
+    .map(|(rel, _)| {
+      let end = rel
+        .find(".mlmodelc")
+        .expect("every pinned key is inside a .mlmodelc bundle")
+        + ".mlmodelc".len();
+      &rel[..end]
+    })
+    .collect();
+  assert_eq!(
+    bundles.len(),
+    7,
+    "expected 7 distinct .mlmodelc bundles across the pinned table; its bundle span changed"
+  );
+  let root = common::argmax_models_dir();
+  let mut discovered: BTreeSet<String> = BTreeSet::new();
+  for bundle in &bundles {
+    collect_files_rel(&root, &root.join(bundle), &mut discovered);
+  }
+  assert_eq!(
+    discovered,
+    pinned,
+    "argmax .mlmodelc bundle trees (revision {ARGMAX_REVISION}) do not match the pinned \
+     SHA-256 table's key set -- unpinned extras: {:?}, pinned-but-absent: {:?}. A file was \
+     added to or removed from a bundle; re-introspect and re-pin.",
+    discovered.difference(&pinned).collect::<Vec<_>>(),
+    pinned.difference(&discovered).collect::<Vec<_>>(),
+  );
+
   for (rel_path, expected) in ARTIFACT_SHA256 {
     let path = artifact_path(rel_path);
     let bytes = std::fs::read(&path).unwrap_or_else(|e| {
