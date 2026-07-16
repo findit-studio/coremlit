@@ -1478,19 +1478,52 @@ fn vendor_of(path: &str) -> &str {
 /// speakerkit/alignkit/argmax vendors are the DOCUMENTED escape, not a silent
 /// skip. Narrowing coverage is thus an explicit, reviewable act; the full pin
 /// verification remains a local/dev gate (see the module docs' coverage boundary).
+///
+/// A present-but-EMPTY override (`""`, whitespace, or only commas) is a HARD
+/// ERROR, not an empty manifest — see [`vendor_manifest`].
 fn expected_vendors() -> BTreeSet<String> {
-  match env::var("COREMLIT_FP16_SWEEP_VENDORS") {
-    Ok(v) => v
-      .split(',')
-      .map(str::trim)
-      .filter(|s| !s.is_empty())
-      .map(String::from)
-      .collect(),
-    Err(_) => KNOWN_DEFECTS
+  // `.ok()` folds both `VarError` variants to "unset" ⇒ the strict full manifest,
+  // keeping a non-UTF-8 value fail-CLOSED; a present-but-empty UTF-8 value is the
+  // fail-OPEN case `vendor_manifest` rejects.
+  vendor_manifest(env::var("COREMLIT_FP16_SWEEP_VENDORS").ok().as_deref())
+}
+
+/// The vendor manifest for a raw `COREMLIT_FP16_SWEEP_VENDORS` value: `None` (the
+/// variable is UNSET) ⇒ the full fail-closed manifest, every [`KNOWN_DEFECTS`]
+/// vendor; `Some(raw)` ⇒ its comma-separated, trimmed, non-empty vendor names.
+///
+/// Split out of [`expected_vendors`] so the present-but-empty rejection is
+/// exercised hermetically, without mutating a process-global env var that races
+/// across the parallel test threads.
+///
+/// # Panics
+/// If `raw` is `Some` but names no vendor (empty, whitespace-only, or only
+/// commas/whitespace): such an override collapses to an EMPTY expected set, which
+/// requires NO vendor and silently re-opens the whole-vendor-deletion escape the
+/// manifest exists to close (codex r7 F3). The panic names the variable so a CI
+/// expansion like `COREMLIT_FP16_SWEEP_VENDORS="$MAYBE_EMPTY"` fails loudly rather
+/// than disabling the fail-closed default.
+fn vendor_manifest(raw: Option<&str>) -> BTreeSet<String> {
+  let Some(raw) = raw else {
+    return KNOWN_DEFECTS
       .iter()
       .map(|d| vendor_of(d.path).to_string())
-      .collect(),
-  }
+      .collect();
+  };
+  let vendors: BTreeSet<String> = raw
+    .split(',')
+    .map(str::trim)
+    .filter(|s| !s.is_empty())
+    .map(String::from)
+    .collect();
+  assert!(
+    !vendors.is_empty(),
+    "COREMLIT_FP16_SWEEP_VENDORS is set to {raw:?} but names no vendor — a present-but-empty \
+     override (empty, whitespace, or comma-only) would require NO vendor and silently re-open the \
+     whole-vendor-deletion escape the manifest exists to close. Unset it to require every \
+     KNOWN_DEFECTS vendor, or name the vendors to audit (e.g. whisperkit-coreml)."
+  );
+  vendors
 }
 
 /// The result of sweeping a tree: how many models and guard sites were audited,
@@ -1803,4 +1836,49 @@ fn the_ci_whisper_only_scope_sweeps_clean() {
   );
   assert_eq!(outcome.models_len, 1, "one synthetic model");
   assert!(outcome.audited_sites >= 1, "the mel log site was audited");
+}
+
+/// codex r7 F3: a present-but-EMPTY `COREMLIT_FP16_SWEEP_VENDORS` must HARD-ERROR,
+/// never collapse to an empty (require-nothing) manifest that silently re-opens
+/// the whole-vendor-deletion escape. Exercised through the pure [`vendor_manifest`]
+/// (no env mutation, which would race the parallel test threads): unset ⇒ the full
+/// fail-closed set; a real override ⇒ exactly the named vendors, trimmed; and every
+/// empty SHAPE — `""`, whitespace, comma-only, whitespace-and-commas — panics.
+#[test]
+fn an_empty_vendor_override_hard_errors_not_disables_the_manifest() {
+  // Unset ⇒ exactly the pinned vendors (the fail-closed default).
+  let full = vendor_manifest(None);
+  assert_eq!(
+    full,
+    KNOWN_DEFECTS
+      .iter()
+      .map(|d| vendor_of(d.path).to_string())
+      .collect::<BTreeSet<String>>(),
+    "unset must yield every KNOWN_DEFECTS vendor"
+  );
+  assert!(!full.is_empty(), "the pinned-vendor manifest is non-empty");
+
+  // A real override ⇒ exactly the named vendors, whitespace trimmed.
+  assert_eq!(
+    vendor_manifest(Some(" whisperkit-coreml , speakerkit ")),
+    BTreeSet::from(["whisperkit-coreml".to_string(), "speakerkit".to_string()]),
+    "a named override selects exactly those vendors"
+  );
+
+  // Every present-but-empty SHAPE must panic (naming the variable), not return an
+  // empty set. Silence the panic hook so the expected messages do not spam the
+  // log, collect any shape that slipped through, then restore the hook and assert.
+  let prev = std::panic::take_hook();
+  std::panic::set_hook(Box::new(|_| {}));
+  let mut leaked: Vec<&str> = Vec::new();
+  for bad in ["", "   ", ",", ", ", " , , "] {
+    if std::panic::catch_unwind(|| vendor_manifest(Some(bad))).is_ok() {
+      leaked.push(bad);
+    }
+  }
+  std::panic::set_hook(prev);
+  assert!(
+    leaked.is_empty(),
+    "these present-but-empty overrides returned a manifest instead of hard-erroring: {leaked:?}"
+  );
 }
