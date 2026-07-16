@@ -560,7 +560,11 @@ const DER_PIN_TOL: f64 = 0.0005;
 /// clip. On the other three multi-speaker clips it diverges hard: 3.3-9.3 % DER,
 /// against a faithful source scoring 0.0-0.4 % on the same audio, through the
 /// same framing, the same clustering, the same reference and the same harness —
-/// so **argmax's embedding is the only variable**. Where it fails, the divergence
+/// so the argmax **embedding front-end warp is the leading explanation** — the
+/// divergence is *consistent with* an embedding-front-end cause, not an
+/// experimentally isolated single variable (the argmax source also swaps in its
+/// own segmenter and in-graph decode alongside the embedder). Where it fails,
+/// the divergence
 /// is essentially pure CONFUSION ([`DerPin::ax_vs_fluidaudio_confusion`] ≈
 /// [`DerPin::ax_vs_fluidaudio`], with zero miss and zero false alarm): argmax
 /// hears the same speech and assigns it to the wrong person, which is why no

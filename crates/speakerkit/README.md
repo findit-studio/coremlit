@@ -102,7 +102,11 @@ reference on `dia`'s parity corpus, `CpuOnly`:
 `dia`-ort (the upstream oracle) reproduces the reference to 0.0000% standard
 (collar-scored) DER on every one of these clips, and FluidAudio tracks it, so the
 audio, the framing, the clustering, the reference and the harness are all held
-constant: **argmax's embedding is the only variable.** Where it fails, the error is ~100% *confusion*
+constant, so the argmax **embedding front-end warp is the leading explanation**
+for the divergence — it is *consistent with* an embedding-front-end cause, not
+an experimentally isolated single variable, since the argmax source also swaps
+in its own segmenter and in-graph decode alongside the embedder. Where it fails,
+the error is ~100% *confusion*
 with zero miss and zero false alarm — argmax hears exactly the same speech and
 assigns it to the wrong person. That is the signature of a clustering divergence,
 not of boundary jitter, which is why no collar absorbs it.
@@ -337,6 +341,30 @@ Then, from the workspace root:
 SPEAKERKIT_TEST_MODELS=Models/speakerkit \
 ARGMAX_TEST_MODELS=Models/argmax-speakerkit \
 cargo test -p speakerkit -- --ignored
+```
+
+That runs the model-gated segmentation, embedding and argmax suites. It does
+**not** run the end-to-end **DER** gates: `tests/parity_e2e.rs` and
+`tests/parity_shipping_der.rs` are additionally `#![cfg(feature = "dia")]`, so
+without `--features dia` they compile to *nothing* and the sweep above is a
+green run containing **zero** DER tests. Run them explicitly (they also need
+the sibling `diarization` ONNX/fixtures + `ort`, so set `ORT_DYLIB_PATH` if
+`ort` cannot self-provision `libonnxruntime`):
+
+```sh
+SPEAKERKIT_TEST_MODELS=Models/speakerkit \
+cargo test -p speakerkit --features dia --test parity_e2e -- --ignored
+SPEAKERKIT_TEST_MODELS=Models/speakerkit \
+cargo test -p speakerkit --features dia --test parity_shipping_der -- --ignored
+```
+
+To confirm those DER gates are actually **compiled** — not silently feature-gated
+out, the exact trap above — run the inventory check. It lists each DER binary's
+tests and hard-fails if the list is empty or an expected gate is missing, so a
+feature-selection no-op is distinguishable from a real pass:
+
+```sh
+crates/speakerkit/tests/der_gate_inventory.sh
 ```
 
 The argmax Swift fidelity gate (`tests/parity_argmax_swift.rs`) compares
