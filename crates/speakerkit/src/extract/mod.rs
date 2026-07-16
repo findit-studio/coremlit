@@ -132,6 +132,7 @@
 //!   nonzero.
 
 use crate::{
+  cluster::ClusterBackend,
   embed::{EMBED_SLOTS, EMBEDDING_DIM, EmbedModel},
   error::ExtractError,
   segment::{SEG_CHUNK_SAMPLES, SEG_NUM_SLOTS, SegmentModel},
@@ -719,18 +720,40 @@ impl Extraction {
     )
   }
 
-  /// Cluster this extraction into speaker-labelled RTTM spans via dia's
-  /// offline pyannote-community-1 pipeline — the crate's runtime clustering
-  /// entry point.
+  /// Cluster this extraction into speaker-labelled RTTM spans at the DEFAULT
+  /// backend — [`ClusterBackend::default`], i.e. dia's offline
+  /// pyannote-community-1 pipeline with its community-1 hyperparameters. Exactly
+  /// [`self.diarize_with(plda, ClusterBackend::default())`](Self::diarize_with).
   ///
-  /// Assembles the [`dia::offline::OfflineInput`] bridge
-  /// ([`Self::into_offline_input`], carrying dia's community-1 hyperparameter
-  /// defaults — `threshold = 0.6` etc.) and runs
-  /// [`dia::offline::diarize_offline`] over it. This is the SINGLE runtime
-  /// clustering path: the parity harness scores exactly this method's output
-  /// rather than re-plumbing `into_offline_input → diarize_offline` itself, so
-  /// the public API and the tested path cannot diverge (the alignkit
-  /// canonical-wiring lesson).
+  /// This is the SINGLE default runtime clustering path: every parity harness
+  /// scores exactly this method's output rather than re-plumbing
+  /// `into_offline_input → diarize_offline` (or re-selecting a backend) itself,
+  /// so the public API and the tested path cannot diverge (the alignkit
+  /// canonical-wiring lesson). Because [`ClusterBackend::default`] applies
+  /// dia's own defaults, the assembled [`dia::offline::OfflineInput`] is
+  /// field-identical to the bare [`Self::into_offline_input`], so this is
+  /// byte-identical to feeding dia directly.
+  ///
+  /// # Errors
+  /// As [`Self::diarize_with`].
+  pub fn diarize(
+    &self,
+    plda: &dia::plda::PldaTransform,
+  ) -> Result<dia::offline::OfflineOutput, dia::offline::Error> {
+    self.diarize_with(plda, ClusterBackend::default())
+  }
+
+  /// Cluster this extraction into speaker-labelled RTTM spans via the selected
+  /// [`ClusterBackend`] — the crate's runtime clustering entry point.
+  ///
+  /// For [`ClusterBackend::Offline`], assembles the
+  /// [`dia::offline::OfflineInput`] bridge ([`Self::into_offline_input`]) with
+  /// the variant's [`OfflineOptions`](crate::cluster::OfflineOptions) applied
+  /// over it (its crate-private `apply_to`) and runs
+  /// [`dia::offline::diarize_offline`] over the result. The `match` on
+  /// `backend` is wildcard-free: when a second
+  /// engine variant lands, the compiler forces a new arm here rather than
+  /// letting it silently route to the offline path.
   ///
   /// The returned [`dia::offline::OfflineOutput`] carries the speaker-labelled
   /// spans ([`dia::offline::OfflineOutput::spans_slice`]) plus the frame-level
@@ -753,11 +776,16 @@ impl Extraction {
   /// cluster's alive-value lands in the SIMD guard band around the threshold.
   /// Keeping the error TYPED (not stringified) is load-bearing: the
   /// shipping-DER suite matches that exact variant rather than `is_err`.
-  pub fn diarize(
+  pub fn diarize_with(
     &self,
     plda: &dia::plda::PldaTransform,
+    backend: ClusterBackend,
   ) -> Result<dia::offline::OfflineOutput, dia::offline::Error> {
-    dia::offline::diarize_offline(&self.into_offline_input(plda))
+    match backend {
+      ClusterBackend::Offline(opts) => {
+        dia::offline::diarize_offline(&opts.apply_to(self.into_offline_input(plda)))
+      }
+    }
   }
 }
 

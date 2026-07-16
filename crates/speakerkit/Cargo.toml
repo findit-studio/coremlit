@@ -20,6 +20,11 @@ targets = ["aarch64-apple-darwin"]
 
 [dependencies]
 coremlit.workspace = true
+# `derive_more::Display` powers the `ClusterBackend` golden-enum's derived
+# `Display` (delegating to its `as_str`), matching the workspace convention
+# (`coremlit::ComputeUnits`, `whisperkit::Task`). Inherits the workspace
+# `display`/`is_variant` features; only `display` is used here.
+derive_more.workspace = true
 thiserror.workspace = true
 
 # `dia` (its own package name is `diarization`) is the offline clustering

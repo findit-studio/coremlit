@@ -602,32 +602,83 @@ fn diarize_matches_manual_into_offline_input_pipeline() {
 }
 
 // =====================================================================
-// OfflineClusterOptions re-export (`crate::OfflineClusterOptions` etc.) —
-// the T1 surface T2's `ClusterBackend` wraps (design spec §Architecture).
-// Hermetic: names the re-exported types and exercises the builder that
-// needs all three (`OfflineMethod`/`Linkage` are `OfflineClusterOptions`'s
-// constituent enums), proving the whole vocabulary is reachable from
-// speakerkit's own namespace, not merely via the `dia` dependency.
+// diarize_with — the ClusterBackend wiring (T2). Hermetic: no models,
+// ort-free. Proves a NON-default backend's OfflineOptions actually flow through
+// diarize_with (they are not silently ignored in favour of the default). The
+// DEFAULT path is already covered by
+// `diarize_matches_manual_into_offline_input_pipeline` above — diarize ==
+// diarize_with(default) == the bare bridge — and the knob→dia-field mapping by
+// `cluster::tests::apply_to_maps_each_knob_to_its_dia_field`.
 // =====================================================================
 
+/// A small, self-consistent [`Extraction`] (num_chunks=1, F=2, count len ==
+/// num_output_frames=4) — the same shape the round-trip / diarize tests above
+/// build inline. Private fields are visible to this child module.
+fn tiny_extraction() -> Extraction {
+  Extraction {
+    raw_embeddings: (0..(SEG_NUM_SLOTS * EMBEDDING_DIM))
+      .map(|i| i as f32 * 0.25 - 3.0)
+      .collect(),
+    segmentations: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+    count: vec![1, 2, 1, 0],
+    num_chunks: 1,
+    num_frames_per_chunk: 2,
+    num_output_frames: 4,
+    chunks_sw: crate::window::chunk_sliding_window(&WindowOptions::new()),
+    frames_sw: crate::window::frame_sliding_window(),
+  }
+}
+
 #[test]
-fn offline_cluster_options_vocabulary_is_reexported() {
-  let opts = crate::OfflineClusterOptions::new()
-    .with_method(crate::OfflineMethod::Agglomerative {
-      linkage: crate::Linkage::Average,
-    })
-    .with_similarity_threshold(0.6)
-    .with_target_speakers(3);
-  assert_eq!(
-    opts.method(),
-    crate::OfflineMethod::Agglomerative {
-      linkage: crate::Linkage::Average
+fn diarize_with_offline_routes_the_backend_options() {
+  // A NON-default Offline backend must produce exactly
+  // diarize_offline(opts.apply_to(into_offline_input)) — i.e. diarize_with
+  // threads the variant's OfflineOptions, not ClusterBackend::default()'s. A
+  // mutation that ignored `backend` (always using the default) would break this
+  // (the non-default knobs would not reach dia).
+  let e = tiny_extraction();
+  let plda = dia::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+  let opts = crate::cluster::OfflineOptions::new()
+    .with_threshold(0.55)
+    .with_fa(0.09)
+    .with_fb(0.71)
+    .with_max_iters(33)
+    .with_min_duration_off(1.25);
+
+  // Subject: the public runtime method with a selected non-default backend.
+  let via_public = e.diarize_with(&plda, ClusterBackend::Offline(opts));
+  // Reference: the same OfflineOptions applied by hand over the bare bridge.
+  let via_manual = dia::offline::diarize_offline(&opts.apply_to(e.into_offline_input(&plda)));
+
+  // OfflineOutput is not PartialEq: compare span geometry on success, the typed
+  // error's rendering on failure — same shape as the diarize test above.
+  match (via_public, via_manual) {
+    (Ok(pub_out), Ok(man_out)) => {
+      let spans = |o: &dia::offline::OfflineOutput| -> Vec<(f64, f64, usize)> {
+        o.spans_slice()
+          .iter()
+          .map(|s| (s.start(), s.end(), s.cluster()))
+          .collect()
+      };
+      assert_eq!(
+        spans(&pub_out),
+        spans(&man_out),
+        "diarize_with routed a different OfflineInput than apply_to"
+      );
     }
-  );
-  assert_eq!(opts.target_speakers(), Some(3));
-  // Re-export identity: speakerkit's name IS dia's type, so a value built
-  // through the speakerkit path is the very same type dia's clustering takes.
-  let _dia: dia::cluster::OfflineClusterOptions = opts;
+    (Err(pub_err), Err(man_err)) => {
+      assert_eq!(
+        format!("{pub_err:?}"),
+        format!("{man_err:?}"),
+        "diarize_with and the apply_to path refused differently"
+      );
+    }
+    (p, m) => panic!(
+      "diarize_with ({}) diverged from the apply_to path ({})",
+      if p.is_ok() { "Ok" } else { "Err" },
+      if m.is_ok() { "Ok" } else { "Err" },
+    ),
+  }
 }
 
 // =====================================================================

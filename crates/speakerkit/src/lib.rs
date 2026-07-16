@@ -24,6 +24,7 @@
 //! only one — see that module for the pluggable-source abstraction and
 //! why it exists.
 
+pub mod cluster;
 #[cfg(feature = "serde")]
 mod compute_units_serde;
 pub mod embed;
@@ -33,19 +34,23 @@ pub mod segment;
 pub mod source;
 pub mod window;
 
-/// dia's offline clustering option vocabulary, re-exported as speakerkit's
-/// public surface for the forthcoming `ClusterBackend` config type (design
-/// spec §Architecture: `Offline(OfflineClusterOptions)`), which will wrap it.
+/// The runtime clustering config surface (design spec §Architecture): select a
+/// backend with [`ClusterBackend`] and tune the offline engine with
+/// [`OfflineOptions`]; [`extract::Extraction::diarize_with`] runs it. See
+/// [`cluster`] for the full surface.
 ///
-/// [`OfflineClusterOptions`] configures dia's batch
-/// [`cluster_offline`](dia::cluster::cluster_offline) entry point (method,
-/// similarity threshold, target speakers, seed); [`OfflineMethod`] and
-/// [`Linkage`] are its constituent enums.
-///
-/// NB the current runtime clustering path, [`extract::Extraction::diarize`],
-/// drives dia's `diarize_offline` pipeline with that pipeline's own
-/// community-1 hyperparameter defaults (its inline `OfflineInput` knobs) and
-/// does not consume these options — `cluster_offline` and `diarize_offline`
-/// are distinct dia entry points. Reconciling the config surface with the
-/// runtime pipeline is T2's task; T1 only exposes the type T2 will wrap.
-pub use dia::cluster::{Linkage, OfflineClusterOptions, OfflineMethod};
+/// Removed re-export (was T1's): speakerkit no longer re-exports dia's
+/// `OfflineClusterOptions`/`OfflineMethod`/`Linkage`. T1 exposed them expecting
+/// [`ClusterBackend::Offline`] to wrap them, but T1 also discovered dia has TWO
+/// disjoint offline entry points, and the runtime path drives the OTHER one:
+/// [`extract::Extraction::diarize`] runs dia's pyannote-parity PIPELINE
+/// (`dia::offline::diarize_offline`, tuned by [`OfflineOptions`]), NOT dia's
+/// batch clusterer (`dia::cluster::cluster_offline`, which those three types
+/// configure — a different algorithm surface never validated against the parity
+/// corpus). Re-exporting the batch vocabulary as speakerkit's clustering
+/// surface was therefore misleading, so it is gone (design spec AMENDMENT
+/// 2026-07-16). A caller who genuinely wants dia's batch clusterer can still
+/// reach it through the `dia` dependency directly; a first-class batch mode, if
+/// ever wanted, would arrive as its own [`ClusterBackend`] variant with its own
+/// gates.
+pub use cluster::{ClusterBackend, OfflineOptions, ParseClusterBackendError};
