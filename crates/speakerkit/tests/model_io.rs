@@ -109,7 +109,32 @@
 
 mod common;
 
+use std::{collections::BTreeSet, path::Path};
+
 use coremlit::{ComputeUnits, DataType, Model};
+
+/// Recursively collects every FILE under `dir` as a `/`-separated path relative
+/// to `root`. Used by `wespeaker_v2_and_wespeaker_int8_are_byte_identical` to
+/// compare two `.mlmodelc` bundle trees file-for-file.
+fn collect_files_rel(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
+  for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
+  {
+    let entry = entry.expect("read dir entry");
+    let path = entry.path();
+    if entry.file_type().expect("file type").is_dir() {
+      collect_files_rel(root, &path, out);
+    } else {
+      out.insert(
+        path
+          .strip_prefix(root)
+          .expect("walked path is under root")
+          .to_str()
+          .expect("utf-8 path")
+          .to_string(),
+      );
+    }
+  }
+}
 
 #[test]
 #[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
@@ -195,14 +220,53 @@ fn wespeaker_v2_io_matches_spec() {
 #[test]
 #[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn wespeaker_v2_and_wespeaker_int8_are_byte_identical() {
-  // SPEC DELTA (module doc item 3): `wespeaker_v2.mlmodelc` and
-  // `wespeaker_int8.mlmodelc` are not merely contract-equal, they are the
-  // SAME artifact (`diff -rq` and sha256 of `model.mil` +
-  // `weights/weight.bin` matched when checked manually during planning).
-  // This test pins the I/O contract only; byte-identity isn't re-verified
-  // per run, and no committed fixture re-checks it either.
-  let path = common::models_dir().join("wespeaker_int8.mlmodelc");
-  let model = Model::load(path, ComputeUnits::CpuOnly).unwrap();
+  // The module's embedding DECISION rests on this premise (item 3):
+  // `wespeaker_v2.mlmodelc` is an ALIAS for the int8-palettized
+  // `wespeaker_int8.mlmodelc`, "v2" naming the same artifact, not a distinct
+  // fp32 architecture. This test is NAMED for that byte-identity but previously
+  // loaded only ONE bundle and checked shapes — it opened neither the other
+  // bundle nor any bytes (L4). It now enumerates BOTH bundle trees and
+  // byte-compares them file-for-file: equal relative path sets, and equal bytes
+  // for every file. A divergence breaks the DECISION's premise and is a finding
+  // to surface, NOT a test to relax.
+  let v2 = common::embed_path(); // wespeaker_v2.mlmodelc (the shipping int8 alias)
+  let int8 = common::models_dir().join("wespeaker_int8.mlmodelc");
+
+  let mut v2_tree = BTreeSet::new();
+  let mut int8_tree = BTreeSet::new();
+  collect_files_rel(&v2, &v2, &mut v2_tree);
+  collect_files_rel(&int8, &int8, &mut int8_tree);
+  assert!(
+    !v2_tree.is_empty(),
+    "wespeaker_v2.mlmodelc has no files — bundle missing or empty at {}",
+    v2.display()
+  );
+  assert_eq!(
+    v2_tree,
+    int8_tree,
+    "wespeaker_v2 / wespeaker_int8 bundle file trees differ — v2-only: {:?}, int8-only: {:?}",
+    v2_tree.difference(&int8_tree).collect::<Vec<_>>(),
+    int8_tree.difference(&v2_tree).collect::<Vec<_>>(),
+  );
+
+  for rel in &v2_tree {
+    let a = std::fs::read(v2.join(rel)).unwrap_or_else(|e| panic!("read v2/{rel}: {e}"));
+    let b = std::fs::read(int8.join(rel)).unwrap_or_else(|e| panic!("read int8/{rel}: {e}"));
+    assert!(
+      a == b,
+      "wespeaker_v2 and wespeaker_int8 differ at `{rel}` ({} vs {} bytes; sha256 {} vs {}) — the \
+       `v2 == int8` premise the embedding DECISION rests on (module doc) is broken; investigate \
+       before relying on either as the shipping artifact",
+      a.len(),
+      b.len(),
+      common::sha256_hex(&a),
+      common::sha256_hex(&b),
+    );
+  }
+
+  // Re-verify the shared I/O contract actually loads (the argmax-side precedent
+  // of confirming via `Model::load`, not assuming it from byte-identity alone).
+  let model = Model::load(&v2, ComputeUnits::CpuOnly).unwrap();
   let description = model.description();
   assert_eq!(description.input("waveform").unwrap().shape(), &[3, 160000]);
   assert_eq!(description.input("mask").unwrap().shape(), &[3, 589]);
