@@ -86,9 +86,9 @@
 //! frame-exact DER** ([`der_strict`]: no collar) is REPORTED but not the
 //! pass/fail bound. Reason (measured): the FluidAudio source diarizes
 //! IDENTICALLY to dia-ort at standard DER (0.0000 %) and reproduces the
-//! independent pyannote reference exactly as dia-ort does (0.0000 %
-//! each), yet strict DER reads 0.08-0.29 % — a handful of 10 ms frames, ALL
-//! within a boundary collar (proven: standard DER = 0). That is the
+//! independent pyannote reference to the same 0.0000 % standard-collar DER
+//! as dia-ort does, yet strict DER reads 0.08-0.29 % — a handful of 10 ms
+//! frames, ALL within a boundary collar (proven: standard DER = 0). That is the
 //! span-level image of the T6-accepted 99.97 % seg agreement (a 1-frame seg
 //! flip shifts a span edge by 1-3 frames), i.e. the "boundary jitter DER
 //! absorbs" §5.3 anticipated — not a clustering divergence. Gating the
@@ -178,8 +178,9 @@
 //! both dia-ort and speakerkit-CoreML — it is the upstream implementation the
 //! whole stack targets), and "**DER vs the reference**" in this suite means
 //! **distance to pyannote 4.0.4**, never *distance to the truth*. A source
-//! scoring 0.0000 % here has reproduced pyannote exactly; it has NOT been
-//! shown to be correct. Human-labelled benchmark RTTM (AMI, DIHARD) is not
+//! scoring 0.0000 % here has reproduced pyannote to 0.0000 % standard-collar
+//! DER (not frame-exactly); it has NOT been shown to be correct.
+//! Human-labelled benchmark RTTM (AMI, DIHARD) is not
 //! committed locally, so "are we RIGHT?" — as opposed to "do we match the
 //! reference implementation?" — remains out of reach of this suite. Every
 //! claim it makes is a parity claim.
@@ -1560,8 +1561,8 @@ fn fluidaudio_der_parity_vs_dia_ort_and_determinism() {
 // B — argmax-source DER on the ≤2-speaker clips (§5.4 / §5.6)
 // ══════════════════════════════════════════════════════════════════════
 
-/// argmax on the EASY half of the corpus: exact agreement with the faithful
-/// sources, pinned ([`DER_PINS`]).
+/// argmax on the EASY half of the corpus: 0.0000 % standard-collar DER agreement
+/// with the faithful sources, pinned ([`DER_PINS`]).
 ///
 /// This test's clean result is not a validation — it is the other half of the
 /// §5.6 finding. All four of its clips have ≤2 reference speakers
@@ -1744,9 +1745,10 @@ fn equal_delta_der_hides_disjoint_placement_errors() {
 /// reference: an equal distance-to-reference passes even when each placement errs
 /// on DIFFERENT frames. So they agree on every standard-collar-scored frame and
 /// differ only inside the collar. That pairwise zero is reachable only because
-/// both placements are frame-exact against the reference on these ≤2-speaker
-/// clips (mutual exactness ⇒ pairwise agreement); a nonzero-DER clip could expose
-/// a real decision change, which this assertion would pin rather than absorb.
+/// both placements score 0.0000 % standard-collar DER against the reference on
+/// these ≤2-speaker clips (mutual exactness ⇒ pairwise agreement); a nonzero-DER
+/// clip could expose a real decision change, which this assertion would pin
+/// rather than absorb.
 #[test]
 #[ignore = "requires Models/speakerkit (+ argmax) + sibling diarization + ort; runs the ANE"]
 fn compute_unit_der_study_all_vs_cpuonly() {
