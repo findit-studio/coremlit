@@ -71,7 +71,7 @@ path inside this crate, not just a different weights file.
 | | **FluidAudio** — `Source::FluidAudio` (default) | **argmax** — `Source::Argmax` (optional) |
 |---|---|---|
 | HF repo | `FluidInference/speaker-diarization-coreml` | `argmaxinc/speakerkit-coreml` |
-| Segmenter output | raw powerset logits `[1,589,7]` | already decoded, in-graph: `speaker_ids`/`speaker_activity`/`overlapped_speaker_activity`/… |
+| Segmenter output | powerset log-probs `[1,589,7]` (`log(softmax)`, not raw logits) | already decoded, in-graph: `speaker_ids`/`speaker_activity`/`overlapped_speaker_activity`/… |
 | Decode semantics | **host-side**, in this crate — ports `dia`'s exact powerset/mask/window decode | **in-graph** — argmax's own semantics; this crate only reads the result |
 | Tier-1 fidelity ("did we read the model right") | relies on the tier-2 dia-ort check below; a dedicated FluidAudio Swift oracle is deferred/optional (no FluidAudio CLI) | argmax's own Swift (`argmax-oss-swift`'s `SpeakerSegmenterModel`/`SpeakerEmbedderModel`, via an out-of-tree harness since argmax's `DiarizeCLI` only emits post-clustering RTTM) |
 | Tier-2 agreement ("does the decision match dia-ort") vs fp32 `dia`-ort | seg **99.97%** decision-level agreement (99.9717%, 3533/3534 frames); embed cosine **0.99999989** worst | seg **99.98%** cell agreement (Baseline); embed cosine **mean ~0.94, worst ~0.83** |
