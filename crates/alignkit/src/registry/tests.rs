@@ -39,37 +39,14 @@ fn fallback_default_is_skip_chunk() {
 // in either direction before.
 // ---------------------------------------------------------------------
 
-/// Every [`AlignmentFallback`] variant — the roster the round-trip, spelling, and
-/// (under `serde`) serialization tests below all iterate, so no variant can be
-/// tested through only some of them.
-///
-/// A new variant is FORCED to appear here (F3) by [`fallback_roster_is_exhaustive`]
-/// and the wildcard-free `match`es in the spelling / serde tests: adding a variant
-/// to `AlignmentFallback` fails those to compile until it is handled, and the fix
-/// sits right next to this array. That tripwire is the whole point — `FromStr`'s
-/// own `_ =>` arm compiles for any new variant, so without it a `Retry` variant
-/// would `Display`/serde as `"retry"` while `from_str` silently refused it, with
-/// every text-form test still green. A hand-listed roster iterated by those tests
-/// could not catch that; a hand-listed roster whose completeness is compiler-
-/// checked can.
-const ALL_FALLBACKS: &[AlignmentFallback] =
-  &[AlignmentFallback::SkipChunk, AlignmentFallback::Error];
-
-#[test]
-fn fallback_roster_is_exhaustive() {
-  // F3 tripwire. Rust cannot enumerate an enum's variants, so ALL_FALLBACKS is
-  // hand-listed; this wildcard-free match is what makes forgetting to extend it
-  // impossible to ship. Adding a variant to AlignmentFallback makes the match
-  // non-exhaustive and fails the build until the variant is handled here — the
-  // moment to also add it to ALL_FALLBACKS (they sit together). Once a variant is
-  // in the roster, every text-form test below round-trips, spells, and (under
-  // serde) serializes it.
-  for fallback in ALL_FALLBACKS {
-    match fallback {
-      AlignmentFallback::SkipChunk | AlignmentFallback::Error => {}
-    }
-  }
-}
+// The roster the round-trip / spelling / serde tests below iterate is
+// `AlignmentFallback::ALL`, GENERATED from the same one-row-per-variant table as
+// the enum, its spellings and its parser (`define_alignment_fallback!`, F2). It
+// can no longer fall behind the enum by construction — a variant that is not in
+// `ALL` cannot exist — so the hand-listed roster and the compiler-checked
+// exhaustive match this file used to carry (two structures that did not
+// constrain each other, the finding) are gone: the macro grammar now rejects a
+// variant with no spelling/parser at COMPILE time, which no test could.
 
 #[test]
 fn fallback_round_trips_through_its_own_text_form() {
@@ -78,7 +55,7 @@ fn fallback_round_trips_through_its_own_text_form() {
   // by `fallback_roster_is_exhaustive`) rather than a local slice means a new
   // variant added without a `from_str` arm fails here instead of silently becoming
   // unparseable.
-  for &fallback in ALL_FALLBACKS {
+  for &fallback in AlignmentFallback::ALL {
     let text = fallback.as_str();
     assert_eq!(
       text.parse::<AlignmentFallback>(),
@@ -98,7 +75,7 @@ fn fallback_from_str_names_the_snake_case_spelling() {
   // The wildcard-free `match` is the F3 tripwire — a new variant must pin its own
   // spelling here — and the loop over ALL_FALLBACKS checks every variant both
   // spells to and parses from that literal.
-  for &fallback in ALL_FALLBACKS {
+  for &fallback in AlignmentFallback::ALL {
     let spelling = match fallback {
       AlignmentFallback::SkipChunk => "skip_chunk",
       AlignmentFallback::Error => "error",
@@ -160,7 +137,7 @@ fn fallback_serde_uses_the_same_snake_case_spelling() {
   // type. The wildcard-free `match` is the F3 tripwire (a new variant must pin its
   // JSON here); the loop checks each variant serializes to that literal, matches
   // `as_str`, and deserializes back.
-  for &fallback in ALL_FALLBACKS {
+  for &fallback in AlignmentFallback::ALL {
     let expected_json = match fallback {
       AlignmentFallback::SkipChunk => r#""skip_chunk""#,
       AlignmentFallback::Error => r#""error""#,

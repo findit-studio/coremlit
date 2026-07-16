@@ -62,53 +62,6 @@ pub enum AlignerKey {
   Any,
 }
 
-/// Policy for a requested language with no registered aligner (and no
-/// [`AlignerKey::Any`] fallback registered either).
-///
-/// A vocabulary enum with the workspace's full contract (mirrors
-/// `whisperkit::log::LogLevel`): [`as_str`](Self::as_str) + a derived
-/// [`Display`](core::fmt::Display), a total
-/// [`FromStr`](core::str::FromStr) whose error
-/// ([`ParseAlignmentFallbackError`]) is opaque, `snake_case` serde under the
-/// `serde` feature, and `#[non_exhaustive]`. It is a *policy* — the kind of
-/// value that arrives from a config file, a CLI flag or an env var — so it has
-/// to survive a round trip through text, which it previously could not do in
-/// either direction even though [`crate::AlignerOptions`] is itself
-/// serde-gated.
-#[derive(
-  Copy, Clone, PartialEq, Eq, Debug, Default, derive_more::Display, derive_more::IsVariant,
-)]
-#[display("{}", self.as_str())]
-#[cfg_attr(
-  feature = "serde",
-  derive(serde::Serialize, serde::Deserialize),
-  serde(rename_all = "snake_case")
-)]
-#[non_exhaustive]
-pub enum AlignmentFallback {
-  /// Skip alignment for the chunk: the caller keeps the ASR text with empty
-  /// per-word timings. The default — alignment availability never blocks the
-  /// pipeline.
-  #[default]
-  SkipChunk,
-  /// Treat a registry miss as a hard error the caller must handle — useful
-  /// when a missing language should be a loud signal, not a silent skip.
-  Error,
-}
-
-impl AlignmentFallback {
-  /// Stable `snake_case` name of the policy — the same spelling the `serde`
-  /// feature reads and writes, and the one
-  /// [`FromStr`](core::str::FromStr) parses.
-  #[inline(always)]
-  pub const fn as_str(&self) -> &'static str {
-    match self {
-      Self::SkipChunk => "skip_chunk",
-      Self::Error => "error",
-    }
-  }
-}
-
 /// Error parsing an [`AlignmentFallback`] name.
 ///
 /// Opaque (`(())`): the rejected input is the caller's own string and carrying
@@ -118,15 +71,106 @@ impl AlignmentFallback {
 #[error("unknown alignment fallback policy name")]
 pub struct ParseAlignmentFallbackError(());
 
-impl core::str::FromStr for AlignmentFallback {
-  type Err = ParseAlignmentFallbackError;
+/// Defines [`AlignmentFallback`] and everything that MUST stay in lockstep with
+/// its variant list — from ONE table (F2). Each `Variant => "spelling"` row
+/// generates, for that variant: the enum arm, its stable wire spelling (shared
+/// by [`AlignmentFallback::as_str`], the derived [`Display`](core::fmt::Display)
+/// and, under `serde`, its `rename`), the total [`FromStr`](core::str::FromStr)
+/// arm, and its entry in the exhaustive `AlignmentFallback::ALL` roster the
+/// round-trip tests iterate.
+///
+/// The macro grammar REQUIRES the `=> "spelling"`, so a variant with no wire
+/// form and no parser mapping cannot even be written — it fails to compile. That
+/// closes the gap two independent structures left open: a hand-listed roster and
+/// a wildcard-armed `FromStr` did not constrain each other, so a variant could
+/// be added while BOTH the roster entry and the parser arm were forgotten —
+/// leaving `Display`/serde emitting a name `from_str` then rejected, every
+/// text-form test still green because the roster they iterate never grew.
+macro_rules! define_alignment_fallback {
+  (
+    $(#[$enum_meta:meta])*
+    $vis:vis enum $Name:ident {
+      $(
+        $(#[$variant_meta:meta])*
+        $Variant:ident => $spelling:literal
+      ),+ $(,)?
+    }
+  ) => {
+    $(#[$enum_meta])*
+    $vis enum $Name {
+      $(
+        $(#[$variant_meta])*
+        #[cfg_attr(feature = "serde", serde(rename = $spelling))]
+        $Variant,
+      )+
+    }
 
-  fn from_str(s: &str) -> Result<Self, Self::Err> {
-    Ok(match s {
-      "skip_chunk" => Self::SkipChunk,
-      "error" => Self::Error,
-      _ => return Err(ParseAlignmentFallbackError(())),
-    })
+    impl $Name {
+      /// Stable `snake_case` name of the policy — the same spelling the `serde`
+      /// feature reads and writes, [`Display`](core::fmt::Display) prints, and
+      /// [`FromStr`](core::str::FromStr) parses. All are generated from the same
+      /// table row as this variant, so they cannot drift apart.
+      #[inline(always)]
+      pub const fn as_str(&self) -> &'static str {
+        match self {
+          $( Self::$Variant => $spelling, )+
+        }
+      }
+
+      /// Every variant, in declaration order — the single generated roster the
+      /// round-trip / spelling / serde tests iterate. Generated from the same
+      /// table as the variants themselves, so a variant that is not in this
+      /// slice cannot exist (F2): the roster can never fall behind the enum.
+      #[cfg(test)]
+      pub(crate) const ALL: &'static [Self] = &[$( Self::$Variant, )+];
+    }
+
+    impl core::str::FromStr for $Name {
+      type Err = ParseAlignmentFallbackError;
+
+      fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
+          $( $spelling => Self::$Variant, )+
+          _ => return Err(ParseAlignmentFallbackError(())),
+        })
+      }
+    }
+  };
+}
+
+define_alignment_fallback! {
+  /// Policy for a requested language with no registered aligner (and no
+  /// [`AlignerKey::Any`] fallback registered either).
+  ///
+  /// A vocabulary enum with the workspace's full contract (mirrors
+  /// `whisperkit::log::LogLevel`): [`as_str`](Self::as_str) + a derived
+  /// [`Display`](core::fmt::Display), a total
+  /// [`FromStr`](core::str::FromStr) whose error
+  /// ([`ParseAlignmentFallbackError`]) is opaque, `snake_case` serde under the
+  /// `serde` feature, and `#[non_exhaustive]`. It is a *policy* — the kind of
+  /// value that arrives from a config file, a CLI flag or an env var — so it has
+  /// to survive a round trip through text, which it previously could not do in
+  /// either direction even though [`crate::AlignerOptions`] is itself
+  /// serde-gated.
+  ///
+  /// The enum, its wire spellings, its parser and its test roster are all
+  /// generated from one table by `define_alignment_fallback!`, so a new policy
+  /// is a single `Variant => "spelling"` row and cannot be half-added.
+  #[derive(
+    Copy, Clone, PartialEq, Eq, Debug, Default, derive_more::Display, derive_more::IsVariant,
+  )]
+  #[display("{}", self.as_str())]
+  #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+  #[non_exhaustive]
+  pub enum AlignmentFallback {
+    /// Skip alignment for the chunk: the caller keeps the ASR text with empty
+    /// per-word timings. The default — alignment availability never blocks the
+    /// pipeline.
+    #[default]
+    SkipChunk => "skip_chunk",
+    /// Treat a registry miss as a hard error the caller must handle — useful
+    /// when a missing language should be a loud signal, not a silent skip.
+    Error => "error",
   }
 }
 
