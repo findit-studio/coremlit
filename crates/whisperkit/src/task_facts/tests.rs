@@ -64,6 +64,11 @@ fn corpus() -> Vec<TaskFacts> {
     TaskFacts::unknown()
       .with_early_stopped(false)
       .with_worker(6),
+    // An overflowing span (round 10, F3): `usize::MAX` alongside the span-1 and
+    // span-2 children above forms the MAX,1,2 triple whose grouping the pre-fix
+    // identity-`None` made non-associative. The absorbing-`None` law must render
+    // every triple that mixes it associative.
+    TaskFacts::unknown().with_decoded_span(Some(usize::MAX)),
   ]
 }
 
@@ -299,18 +304,34 @@ fn merge_concatenates_worker_schedules_in_order() {
 
 #[test]
 fn merge_sums_the_decoded_span() {
-  // R6-F3: the merged result stores the aggregate span its children allocated.
+  // R6-F3: two KNOWN spans sum to the aggregate ordinal count their children
+  // allocated.
   let s = |n| TaskFacts::unknown().with_decoded_span(Some(n));
   assert_eq!(merged(&s(2), &s(1)).decoded_span(), Some(3));
+
+  // ORACLE CORRECTION (round 10, F3): a `None` (untracked) child is now ABSORBING,
+  // not the identity. Once any part of the total is untracked the whole total is
+  // honestly unknown, where the pre-round-10 law let the known sibling pass
+  // through as `Some(2)`. (The read-time `effective_decoded_span` still floors a
+  // merged `None` at the survivors' extent, so a re-merge never under-counts; see
+  // the result-level tests.)
+  //
+  // Mutation proof: revert the merge to the `(some, None) | (None, some) => some`
+  // identity arm and both `None` expectations below read back `Some(2)`.
   assert_eq!(
     merged(&s(2), &TaskFacts::unknown()).decoded_span(),
-    Some(2),
-    "an untracked child contributes nothing",
+    None,
+    "an untracked child absorbs the aggregate to unknown (was Some(2))",
+  );
+  assert_eq!(
+    merged(&TaskFacts::unknown(), &s(2)).decoded_span(),
+    None,
+    "and in the other order",
   );
   assert_eq!(
     merged(&TaskFacts::unknown(), &TaskFacts::unknown()).decoded_span(),
     None,
-    "the sum is unknown only when every child is untracked",
+    "two untracked children stay unknown",
   );
 }
 
@@ -330,6 +351,35 @@ fn merge_records_an_overflowing_span_as_untracked_not_saturated() {
     overflowing.decoded_span(),
     None,
     "an overflowing span is untracked, not saturated to usize::MAX",
+  );
+}
+
+#[test]
+fn merge_is_associative_over_an_overflowing_span_triple() {
+  // F3 (round 10). THE associativity failure the absorbing-`None` fix closes:
+  // spans MAX, 1, 2. The pre-round-10 identity-`None` gave `(A·B)·C = Some(2)`
+  // (`MAX + 1` overflowed to `None`, then `None + 2` read the `None` back as zero)
+  // but `A·(B·C) = None` (`1 + 2 = 3`, then `MAX + 3` overflowed) -- a documented-
+  // associative law that was not. With `None` ABSORBING, once the running total
+  // overflows it STAYS `None`, so both groupings agree at `None`.
+  //
+  // Mutation proof: revert the merge to the `(some, None) | (None, some) => some`
+  // identity arm and the left grouping reads back `Some(2)` while the right stays
+  // `None` -- failing both the equality and the `None` assertion.
+  let a = TaskFacts::unknown().with_decoded_span(Some(usize::MAX));
+  let b = TaskFacts::unknown().with_decoded_span(Some(1));
+  let c = TaskFacts::unknown().with_decoded_span(Some(2));
+  let left = merged(&merged(&a, &b), &c);
+  let right = merged(&a, &merged(&b, &c));
+  assert_eq!(
+    left.decoded_span(),
+    right.decoded_span(),
+    "the documented merge associativity holds across an overflowing span triple",
+  );
+  assert_eq!(
+    left.decoded_span(),
+    None,
+    "once the running total overflows it stays unknown (absorbing), not Some(2)",
   );
 }
 

@@ -518,20 +518,22 @@ fn drop_on_merge_still_panics_on_a_usize_max_segment_id() {
 
 #[test]
 fn a_merge_created_span_never_undercounts_its_own_survivors() {
-  // F2 (codex round 9). A plain (drop-OFF) merge renumbers segments by
-  // `result_index + segment_index`, but the task-facts fold sums each child's
-  // EFFECTIVE span — and a child whose extent overflowed (a `usize::MAX`
-  // survivor) folds in as untracked, contributing zero. So the merged result
-  // carried a span BELOW the max id its own survivors hold: `[A(usize::MAX id, no
-  // span), B(id 0)]` reindexed to `[0, 1]` yet carried `Some(1)`, and a staged
-  // drop-ON re-merge trusting that too-small span renumbered `C` onto id 1 —
-  // `[0, 1, 1]`. The merge now clamps its stored span up to its own survivor
-  // extent, and the id-base advance distrusts a too-small span, so the
-  // intermediate never under-counts and the staged ids stay injective.
+  // F2 (codex round 9), corrected for round 10's absorbing-`None` span law (F3). A
+  // plain (drop-OFF) merge renumbers segments by `result_index + segment_index`,
+  // but the task-facts fold sums each child's EFFECTIVE span — and a child whose
+  // extent overflowed (a `usize::MAX` survivor) folds in as untracked (`None`).
   //
-  // Mutation proof: revert the merge-output clamp alone and the `>= 2` assertion
-  // fails at `Some(1)`; also revert `effective_decoded_span`'s `carried.max(extent)`
-  // and the staged ids collapse to `[0, 1, 1]`.
+  // ORACLE CORRECTION (round 10, F3): that untracked child is now ABSORBING, so
+  // `[A(usize::MAX id, no span), B(id 0)]` stores `None` rather than the
+  // pre-round-10 `Some(2)` (the sibling's span clamped up to the extent, which the
+  // old identity-`None` fold let survive). The "never under-count its survivors"
+  // GUARANTEE is unchanged: it lives entirely in the read-time
+  // `effective_decoded_span`, which floors the stored `None` at the survivors' own
+  // extent (max id 1 + 1 = 2). So a staged drop-ON re-merge still advances its id
+  // base by 2 and renumbers `C` past the survivors — `[0, 1, 2]`, never `[0, 1, 1]`.
+  //
+  // Mutation proof: revert `effective_decoded_span`'s `carried.max(extent)` (or its
+  // `checked_add(1)`) and the staged ids collapse to `[0, 1, 1]`.
   let mut a_seg = TranscriptionSegment::new();
   a_seg.set_id(usize::MAX).set_text(" A").set_tokens(vec![20]);
   let a = TranscriptionResult::new(" A", vec![a_seg], "en", TranscriptionTimings::new());
@@ -542,13 +544,15 @@ fn a_merge_created_span_never_undercounts_its_own_survivors() {
   // Plain (drop-OFF) merge: Swift-exact `result_index + segment_index` -> [0, 1].
   let ab = merge_transcription_results(&[a, b]);
   assert_eq!(segment_ids(&ab), vec![0, 1], "drop-OFF reindex");
-  assert!(
-    matches!(ab.task_facts().decoded_span(), Some(span) if span >= 2),
-    "the merged span never under-counts its own survivors (max id 1 + 1 = 2), got {:?}",
+  assert_eq!(
     ab.task_facts().decoded_span(),
+    None,
+    "the unknowable `usize::MAX` child absorbs the merged span to unknown (round 10, F3, \
+     was Some(2))",
   );
 
-  // A staged drop-ON re-merge with a trailing chunk stays injective.
+  // A staged drop-ON re-merge with a trailing chunk stays injective: the stored
+  // `None` floors at the survivors' extent (2), so C lands at id 2, not id 1.
   let mut c_seg = TranscriptionSegment::new();
   c_seg.set_id(0).set_text(" C").set_tokens(vec![22]);
   let c = TranscriptionResult::new(" C", vec![c_seg], "en", TranscriptionTimings::new());
@@ -557,6 +561,63 @@ fn a_merge_created_span_never_undercounts_its_own_survivors() {
     segment_ids(&staged),
     vec![0, 1, 2],
     "the trailing chunk sits past the merged survivors, not on id 1",
+  );
+}
+
+#[test]
+fn drop_on_merge_trailing_id_is_grouping_independent_across_an_overflow() {
+  // F3 (round 10), the result-level effect of the absorbing-`None` span law. Three
+  // all-dropped chunks (no survivors, carried spans only) with spans MAX, 1, 2 --
+  // the triple whose merge grouping the pre-fix identity-`None` made non-
+  // associative. `effective_decoded_span` drives a drop-ON re-merge's id base, so
+  // the STORED span of the grouped intermediate decides where a trailing chunk
+  // lands:
+  //   (A·B)·C -- the one-shot left fold -- stored `Some(2)` pre-fix (`MAX+1`
+  //             overflowed to `None`, then the identity read it back as zero so
+  //             `None+2 = Some(2)`), landing the trailing chunk at id 2;
+  //   A·(B·C) -- pre-merge B,C then fold A -- stored `None` (`1+2=3`, then `MAX+3`
+  //             overflowed), landing the trailing chunk at id 0.
+  // A documented-associative merge law numbered the SAME inputs differently by
+  // grouping. With `None` ABSORBING both intermediates store `None`, so the
+  // trailing chunk lands at id 0 either way.
+  //
+  // Mutation proof: revert the `decoded_span` merge to the `(some, None) | (None,
+  // some) => some` identity arm and the (A·B)·C grouping's trailing id becomes 2
+  // while A·(B·C) stays 0 -- the equality below fails.
+  let all_dropped = |span: usize| {
+    TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
+      .with_task_facts(TaskFacts::unknown().with_decoded_span(Some(span)))
+  };
+  let a = || all_dropped(usize::MAX);
+  let b = || all_dropped(1);
+  let c = || all_dropped(2);
+  let trailing = span_one_speech(30); // one survivor at local id 0
+
+  // (A·B)·C: the one-shot left fold over all three.
+  let left_grouped = merge_transcription_results(&[a(), b(), c()]);
+  // A·(B·C): pre-merge B and C, then fold A over that intermediate.
+  let bc = merge_transcription_results(&[b(), c()]);
+  let right_grouped = merge_transcription_results(&[a(), bc]);
+
+  let opts = DecodingOptions::new(); // drop ON
+  let left_ids = segment_ids(&merge_transcription_results_with_options(
+    &[left_grouped, trailing.clone()],
+    &opts,
+  ));
+  let right_ids = segment_ids(&merge_transcription_results_with_options(
+    &[right_grouped, trailing],
+    &opts,
+  ));
+  assert_eq!(
+    left_ids, right_ids,
+    "a documented-associative merge law must number the trailing chunk identically \
+     for both groupings",
+  );
+  assert_eq!(
+    left_ids,
+    vec![0],
+    "both overflow-absorbing intermediates store `None`, so the trailing chunk falls \
+     back to the survivors' extent -> id 0",
   );
 }
 

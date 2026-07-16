@@ -257,10 +257,14 @@ pub struct TaskFacts {
   /// consumed, and — the R6-F3 fix — **stores the summed aggregate on the merged
   /// result** so a staged re-merge renumbers identically to a one-shot merge.
   ///
-  /// `None` when untracked (a hand-built or deserialized result); the merge then
-  /// falls back to the survivors' own extent. **Not** a reproducibility fact —
-  /// an in-process merge coordinate — so it defaults to `None` on a missing key
-  /// rather than being required, and is omitted from the wire form when absent.
+  /// `None` when untracked (a hand-built or deserialized result), and — since a
+  /// `None` contributor is ABSORBING under [the merge law](Self::merge) (round 10,
+  /// F3) — also whenever a merge folds in any untracked or overflowed child. The
+  /// merge's read-time span still floors a `None` at the survivors' own extent, so
+  /// a re-merge never under-counts its survivors even when the stored span is
+  /// `None`. **Not** a reproducibility fact — an in-process merge coordinate — so
+  /// it defaults to `None` on a missing key rather than being required, and is
+  /// omitted from the wire form when absent.
   #[cfg_attr(
     feature = "serde",
     serde(default, skip_serializing_if = "Option::is_none")
@@ -473,13 +477,19 @@ impl TaskFacts {
   ///   as the whole schedule — a coordinate nobody could report must not read
   ///   back as a fully-known ordering. Absorbing-`None` over a free monoid is
   ///   associative, the same lattice the Kleene booleans use.
-  /// - **[`decoded_span`](Self::decoded_span)** — summed with a **checked** add,
-  ///   so the merged result stores the aggregate ordinal count its children
-  ///   allocated (R6-F3). A `None` child contributes nothing; the sum is `None`
-  ///   when every child is untracked OR when it overflows `usize` — an
-  ///   overflowing sum is recorded as honest untracked rather than a fabricated
-  ///   saturated `usize::MAX` a staged re-merge would trust as a real count
-  ///   (F2, codex round 9).
+  /// - **[`decoded_span`](Self::decoded_span)** — two KNOWN spans **sum with a
+  ///   checked add** (overflow → `None`), so the merged result stores the
+  ///   aggregate ordinal count its children allocated (R6-F3). A `None` child is
+  ///   ABSORBING (round 10, F3): once any contributor is untracked or the sum
+  ///   overflows `usize`, the total is honestly unknown and STAYS unknown. The
+  ///   pre-round-10 law treated `None` as the identity (a `None` child
+  ///   contributed nothing), so the NEXT merge read that `None` back as zero and
+  ///   the documented associativity broke — spans MAX,1,2 gave `(A·B)·C =
+  ///   Some(2)` but `A·(B·C) = None`. An overflowing sum is likewise honest
+  ///   untracked, never a fabricated saturated `usize::MAX` a staged re-merge
+  ///   would trust as a real count (F2, codex round 9). Absorbing-`None` over the
+  ///   checked-add monoid is associative, the same lattice the worker schedule
+  ///   and Kleene booleans use.
   pub fn merge(&mut self, other: &Self) {
     self.drew_from_rng = kleene_or(self.drew_from_rng, other.drew_from_rng);
     self.early_stopped = kleene_or(self.early_stopped, other.early_stopped);
@@ -505,12 +515,16 @@ impl TaskFacts {
       (None, _) | (_, None) => None,
     };
     self.decoded_span = match (self.decoded_span, other.decoded_span) {
-      // Checked, NOT saturating (F2, codex round 9): an overflowing sum becomes
-      // an honest untracked `None`, never a fabricated `usize::MAX` that a staged
-      // re-merge would trust as a real ordinal count.
+      // Two KNOWN spans sum, checked NOT saturating (F2, codex round 9): an
+      // overflowing sum becomes an honest untracked `None`, never a fabricated
+      // `usize::MAX` that a staged re-merge would trust as a real ordinal count.
       (Some(a), Some(b)) => a.checked_add(b),
-      (some @ Some(_), None) | (None, some @ Some(_)) => some,
-      (None, None) => None,
+      // An unknown or overflowed (`None`) contributor is ABSORBING (round 10, F3):
+      // once any part of the total is untracked or the sum overflows, the aggregate
+      // is honestly unknown and STAYS unknown. The pre-round-10 identity-`None` let
+      // the next merge read it back as zero, so the documented associativity broke
+      // (spans MAX,1,2 gave `(A·B)·C = Some(2)` but `A·(B·C) = None`).
+      (None, _) | (_, None) => None,
     };
   }
 
