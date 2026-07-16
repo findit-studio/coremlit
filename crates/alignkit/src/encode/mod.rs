@@ -133,6 +133,18 @@ pub const ENCODER_WINDOW_SAMPLES: usize = 960_000;
 /// actual (introspected) frame count.
 pub const HOP_SAMPLES: usize = 320;
 
+/// wav2vec2-base's feature-extractor **receptive field**: 400 samples (25 ms
+/// @ 16 kHz). It is the composition of the CNN front-end's seven
+/// kernel/stride layers (kernels `[10, 3, 3, 3, 3, 2, 2]`, strides
+/// `[5, 2, 2, 2, 2, 2, 2]`), and it is the SAME 400 asry zero-pads a
+/// sub-receptive-field chunk up to before the conv stack
+/// (`asry/src/runner/aligner/core.rs`'s `prepare`, its `< 400` arm). Below it
+/// the conv stack produces no complete output frame at all, so a chunk shorter
+/// than this is padded up to exactly one frame; at or above it the output
+/// length is `floor((L - RECEPTIVE_FIELD_SAMPLES) / HOP_SAMPLES) + 1`. See
+/// `truncated_frame_count` and [`Encoder::emissions`]'s "Truncation formula".
+const RECEPTIVE_FIELD_SAMPLES: usize = 400;
+
 /// [`crate::vocab::VOCAB_SIZE`] as a [`NonZeroUsize`], for the
 /// [`Emissions::from_log_probs`] `v` argument. The conversion is
 /// infallible: `VOCAB_SIZE` is the nonzero constant `29`.
@@ -173,7 +185,7 @@ mod names {
 /// saturates to ≈ `-45440`: a sentinel standing where an ordinary log-prob
 /// (`-19.0` … `-21.75`) belongs.
 ///
-/// Measured on `jfk.wav` (550 frames × 29 = 15,950 cells). `load` is a cold
+/// Measured on `jfk.wav` (549 frames × 29 = 15,921 cells). `load` is a cold
 /// first load — the ANE compilation is cached afterwards, so a warm `All`
 /// load is fast and hides nothing:
 ///
@@ -228,13 +240,13 @@ pub const DEFAULT_ENCODER_COMPUTE: ComputeUnits = ComputeUnits::CpuOnly;
 /// # Why `-100`
 ///
 /// It separates two populations three orders of magnitude apart. Measured on
-/// `jfk.wav` (550 frames × 29 = 15,950 cells), `min(emissions)` per placement:
+/// `jfk.wav` (549 frames × 29 = 15,921 cells), `min(emissions)` per placement:
 ///
 /// | compute | `min(emissions)` | cells below `-100` |
 /// |---|---|---|
 /// | `CpuOnly` (the default) | **-30.81** | 0 |
 /// | `CpuAndGpu` | **-30.02** | 0 |
-/// | `All` / `CpuAndNeuralEngine` (ANE) | **-45440** | **2,667 of 15,950 (16.7%)** |
+/// | `All` / `CpuAndNeuralEngine` (ANE) | **-45440** | **2,667 of 15,921 (16.7%)** |
 ///
 /// `-100` sits ~3.2× below the worst legitimate value ever measured on this
 /// model and ~454× above the sentinel; nothing this model produces lands in
@@ -440,12 +452,16 @@ fn check_log_prob_floor(data: &[f32], compute: ComputeUnits) -> Result<(), Align
 /// `real_samples: usize`) nothing tied them together:
 ///
 /// - A 176,000-sample buffer with `real_samples = 175_360` (two hops short)
-///   silently produced 548 frames where 550 belong, shifting a boundary by
-///   ~29 ms with **no error** — asry's own `chunk_extent ± 2·hop` stride check
+///   silently produced 547 frames where 549 belong, moving the tail by two
+///   frames with **no error** — asry's own `chunk_extent ± 2·hop` stride check
 ///   is too loose to catch a two-hop lie.
 /// - Naturally passing `encoder_input.len()` as the real count on a padded chunk
-///   (200 real samples zero-padded to 400) made the mirror mistake: 2 frames
-///   where 1 belongs.
+///   (200 real samples zero-padded to 400) recorded the padded extent as real.
+///   With the corrected conv-geometry truncation that *particular* slip is now
+///   benign for a sub-receptive-field chunk — 200 real samples and their
+///   400-sample pad both yield the single receptive-field frame — but the
+///   binding still has to hold for the general case above, where a real count
+///   short of a full-window slice genuinely moves the count.
 ///
 /// This type makes that mismatch **unrepresentable**. `real_samples` is never a
 /// free integer supplied alongside the buffer; it is always a slice length,
@@ -492,11 +508,14 @@ impl<'a> EncoderInput<'a> {
   /// This door is for genuinely raw audio only. Do **not** hand it a
   /// [`PreparedChunk`]'s
   /// [`encoder_input`](asry::emissions::PreparedChunk::encoder_input): that buffer
-  /// is receptive-field-padded, so its `.len()` is the PADDED count and recording
-  /// it as real is the F1 defect (200 real samples padded to 400 →
-  /// `ceil(400/320) = 2` frames kept where `ceil(200/320) = 1` belongs). A
+  /// is receptive-field-padded, so its `.len()` is the PADDED count and the
+  /// honest length to record is the chunk's own pre-pad `real_samples`. A
   /// prepared chunk must use [`from_prepared`](Self::from_prepared), which reads
-  /// the true pre-pad length off the chunk itself.
+  /// that true pre-pad length off the chunk itself. (Under the conv-geometry
+  /// truncation the padded and real lengths now agree on the FRAME COUNT for a
+  /// sub-receptive-field chunk — 200 real and its 400-sample pad both yield one
+  /// frame — but `from_prepared` is still the correct, self-documenting door,
+  /// and the only one that stays right for the general case.)
   ///
   /// `samples` shorter than [`ENCODER_WINDOW_SAMPLES`] is zero-padded up to the
   /// full window inside [`Encoder::emissions`]; longer is rejected here.
@@ -525,8 +544,11 @@ impl<'a> EncoderInput<'a> {
   /// unforgeable (only asry's `prepare` mints one) and carries both lengths
   /// together: there is no way to hand this door a padded buffer with a mismatched
   /// real count. Reaching for [`from_samples`](Self::from_samples) on
-  /// `prepared.encoder_input()` instead — treating the 400 padded samples as 400
-  /// real ones — is exactly the F1 hole this closes.
+  /// `prepared.encoder_input()` instead — treating the padded samples as real —
+  /// records the padded length; the corrected conv-geometry truncation makes
+  /// that harmless for a sub-receptive-field chunk (padded and real yield the
+  /// same single frame), but this door is the one that stays honest without
+  /// relying on that coincidence.
   ///
   /// # Errors
   /// [`AlignError::InputTooLong`] if the prepared buffer exceeds
@@ -760,23 +782,39 @@ impl Encoder {
   ///
   /// # Truncation formula
   ///
-  /// Nominal: `ceil(real_samples / HOP_SAMPLES)` (design spec §3:
-  /// `T_frames = ceil(real_samples / 320)`) — each [`HOP_SAMPLES`]-sample
-  /// stride of real audio should contribute (at least) one real frame.
-  /// Clamped to [`Self::frames`]: wav2vec2's convolutional feature
-  /// extractor is not an exact `real_samples / HOP_SAMPLES` divider (its
-  /// multi-layer kernel/stride chain has kernels slightly wider than their
-  /// strides, so a handful of samples at the very end of a full window
-  /// contribute no additional frame). Concretely, for `real_samples ==
-  /// ENCODER_WINDOW_SAMPLES` (960,000 — no padding at all, exactly the
-  /// `ted_60.wav` fixture's own case), the nominal formula evaluates to
-  /// 3,000 (`960_000 / 320`), one more than
-  /// `base960h_aligner.mlmodelc`'s actual 2,999
-  /// (`tests/model_io.rs::base960h_aligner_io_matches_spec`). Without the
-  /// clamp, this method would try to keep a 3,000th frame that was never
-  /// written into its `copy_into`-filled buffer for any `real_samples` in
-  /// `(Self::frames() * HOP_SAMPLES, ENCODER_WINDOW_SAMPLES]` — see
-  /// `tests.rs` for a regression pinning exactly this boundary.
+  /// `T = floor((real_samples.max(400) − 400) / HOP_SAMPLES) + 1`, the
+  /// wav2vec2 feature extractor's OWN output-length arithmetic — the frame
+  /// count asry's variable-length ONNX encoder produces for the same audio,
+  /// which is exactly what this crate must reproduce to align identically
+  /// (`tests/parity_words.rs`). The `400` is the seven-layer strided conv
+  /// stack's receptive field (`RECEPTIVE_FIELD_SAMPLES`): the first output
+  /// frame needs a full 400-sample window, not one [`HOP_SAMPLES`] stride, and
+  /// each further frame needs one more stride. A chunk shorter than the
+  /// receptive field is padded up to it (asry's own `< 400` pad, mirrored by
+  /// the `.max(400)`) and yields exactly one frame.
+  ///
+  /// It is **not** `ceil(real_samples / HOP_SAMPLES)`. That earlier formula
+  /// over-counted at every length by inventing a phantom frame out of the
+  /// receptive-field slack: `ceil(641/320) = 3` where the conv stack yields
+  /// **1** (641 real samples do not fill a second 400-wide window),
+  /// `ceil(48_000/320) = 150` where it yields **149**. Those phantom frames are
+  /// pure padding-derived structure — a 641-sample chunk carrying three
+  /// distinct tokens then returned a plausible alignment across three frames
+  /// that do not exist, where the reference correctly returns `NoAlignmentPath`
+  /// (one real frame cannot carry three tokens); asry's `chunk_extent ± 2·hop`
+  /// stride check (`3×320 = 960` inside `641 ± 640`) is too loose to catch it.
+  /// `tests/prepared_composition.rs` and `tests/align_chunk.rs` pin that
+  /// end-to-end.
+  ///
+  /// Clamped to [`Self::frames`] as a defensive invariant only. At
+  /// `real_samples == ENCODER_WINDOW_SAMPLES` (960,000 — the `ted_60.wav`
+  /// case) the formula already evaluates to `floor((960_000 − 400) / 320) + 1
+  /// = 2_999`, `base960h_aligner.mlmodelc`'s actual count
+  /// (`tests/model_io.rs::base960h_aligner_io_matches_spec`), and it cannot
+  /// exceed that for any in-window `real_samples` — so unlike the old `ceil`
+  /// formula, which reached 3,000 and genuinely NEEDED the clamp, the `.min`
+  /// never engages on a valid input. It stays because `emissions_raw`'s
+  /// `data.truncate(frames * VOCAB_SIZE)` relies on `frames <= Self::frames`.
   ///
   /// [`HOP_SAMPLES`] is the ONE stride in this crate: the same constant times
   /// the words in [`crate::aligner::Aligner`]'s seam. It is fixed by the
@@ -867,7 +905,27 @@ pub(crate) struct RawEmissions {
 
 /// See [`Encoder::emissions`]'s "Truncation formula" doc section.
 fn truncated_frame_count(real_samples: usize, available_frames: usize) -> usize {
-  real_samples.div_ceil(HOP_SAMPLES).min(available_frames)
+  if real_samples == 0 {
+    // No real audio → no real frames. asry short-circuits a trivial chunk
+    // before the encoder ever runs, and `emissions_raw` truncates to an empty
+    // tensor; the conv formula below would otherwise floor UP to 1 here.
+    return 0;
+  }
+  // The wav2vec2 feature extractor's own output-length arithmetic:
+  // `floor((L - RECEPTIVE_FIELD_SAMPLES) / HOP_SAMPLES) + 1`, where `L` is the
+  // real audio padded up to at least the receptive field (asry pads a sub-400
+  // chunk to exactly 400 before the conv stack — mirrored here by flooring the
+  // numerator at 0 with `saturating_sub`, i.e. `real_samples.max(400)`). This
+  // is verified bit-identical to the exact nested per-layer conv composition —
+  // and to asry's ONNX model's own output shape — for every `real_samples` in
+  // `[1, ENCODER_WINDOW_SAMPLES]`, so alignkit truncates to the exact frame
+  // count asry's variable-length encoder would produce for the same audio.
+  // `.min(available_frames)` is a defensive invariant only: the formula already
+  // yields exactly `available_frames` at the full window and never exceeds it
+  // for any in-window input, so unlike the old `ceil` (which reached 3,000 and
+  // NEEDED the clamp) the `.min` never engages on a valid input — but
+  // `emissions_raw`'s `data.truncate` relies on `frames <= available_frames`.
+  (real_samples.saturating_sub(RECEPTIVE_FIELD_SAMPLES) / HOP_SAMPLES + 1).min(available_frames)
 }
 
 #[cfg(test)]

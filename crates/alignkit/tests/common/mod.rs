@@ -62,7 +62,7 @@ pub fn ted_60_wav_path() -> PathBuf {
 /// `ted_60.wav` is exactly 960,000 samples, so
 /// `Encoder::emissions_raw` takes its `Cow::Borrowed` branch — *no zeros are
 /// ever appended* — and `truncated_frame_count(960_000, 2999)` keeps all 2,999
-/// frames instead of jfk's 550. Forced alignment needs a transcript, and this
+/// frames instead of jfk's 549. Forced alignment needs a transcript, and this
 /// clip shipped without one, which is exactly why the gap survived B5.
 ///
 /// # Provenance: ASR, because ASR is what feeds forced alignment
