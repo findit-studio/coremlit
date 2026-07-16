@@ -117,8 +117,8 @@ pub enum AlignError {
   /// This is the loud form of what used to be a silent one. The values are
   /// finite and negative, so they pass `Emissions::from_log_probs`' own
   /// `finite ∧ <= 0` scan untouched and would align to *plausible, wrong*
-  /// timings (measured: `ask` 881 ms early on `jfk.wav`) — which is why the
-  /// floor is checked separately. See
+  /// timings (in the pre-truncation-fix measurement `ask` landed 881.6 ms early
+  /// on `jfk.wav`) — which is why the floor is checked separately. See
   /// [`crate::encode::DEFAULT_ENCODER_COMPUTE`] for the mechanism and
   /// [`crate::encode::LOG_PROB_FLOOR`] for why the guard keys on the value
   /// domain rather than on the compute placement.

@@ -55,7 +55,8 @@
 //! **robust statistics** (median, p90) plus an explicit, pinned **ledger of the
 //! divergences** ([`JFK_EXPECTED_DIVERGENCES`]) — not on a max-delta bound, which
 //! could only be satisfied by inflating it to 923 ms, at which point it would no
-//! longer catch the 881 ms regression it exists to catch. A bound that cannot
+//! longer catch the ANE regression it exists to catch (which displaced `ask` by
+//! 881.6 ms in the pre-truncation-fix measurement). A bound that cannot
 //! distinguish the defect from the baseline is not a bound.
 //!
 //! # Two clips, because one of them is padded and the other is not
@@ -206,8 +207,8 @@ const MAX_P90_BOUNDARY_DELTA_MS: f64 = 5.0 * FRAME_MS;
 /// **150 ms = 7.5 frames.** It sits above the worst *acoustically anchored*
 /// disagreement measured anywhere on this fixture (91.1 ms, on `country`) with
 /// 1.6× of room, and far below the 881.6 ms by which the ANE's corrupted
-/// emissions displace `ask`. It is a classifier, not a tolerance — nothing
-/// passes merely by coming in under it.
+/// emissions displaced `ask` in the pre-truncation-fix measurement. It is a
+/// classifier, not a tolerance — nothing passes merely by coming in under it.
 const GROSS_DELTA_MS: f64 = 150.0;
 
 /// **The ledger.** Every boundary that diverges from the oracle by more than
@@ -260,7 +261,8 @@ const JFK_EXPECTED_DIVERGENCES: &[(usize, Boundary)] = &[(14, Boundary::Start)];
 /// So for this one boundary the gate asserts alignkit against the **audio**
 /// rather than against asry. That is a strictly stronger check than the parity
 /// comparison it replaces — and it is the check that catches the ANE
-/// corruption, which moves this exact word by 881.6 ms.
+/// corruption, which moved this exact word by 881.6 ms in the pre-truncation-fix
+/// measurement.
 const ACOUSTIC_ONSET_OF_ASK_MS: f64 = 8380.0;
 
 /// How far alignkit's `ask` onset may sit from [`ACOUSTIC_ONSET_OF_ASK_MS`]:
@@ -1047,7 +1049,8 @@ fn word_timings_agree_with_asry_ort_on_jfk() {
     "alignkit places the second `ask` at {ask_start:.1} ms, {onset_error:.1} ms from the true \
      acoustic onset at {ACOUSTIC_ONSET_OF_ASK_MS:.1} ms (bound: {MAX_ASK_ONSET_ERROR_MS:.1} ms). \
      The oracle cannot referee this boundary — it places it 873 ms into digital silence — so the \
-     audio does. This is exactly the word the ANE's corrupted emissions displace, to 7533.7 ms."
+     audio does. This is exactly the word the ANE's corrupted emissions displaced to 7533.7 ms in \
+     the pre-truncation-fix measurement."
   );
 
   // ---- then the comparison to the oracle ---------------------------------
