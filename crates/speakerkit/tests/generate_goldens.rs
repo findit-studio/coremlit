@@ -193,13 +193,16 @@ fn generate_goldens() {
     let mut chunk_values: Vec<serde_json::Value> = Vec::with_capacity(chunks.len());
 
     for (c, chunk) in chunks.iter().enumerate() {
-      // dia-ort segmentation: [num_frames * 7] powerset LOG-PROBABILITIES,
-      // not raw logits (this comment claimed "no softmax" until the values
-      // were checked: every element is <= 0 and each 7-class row satisfies
-      // sum(exp(row)) == 1.0). The CoreML side emits the same quantity —
-      // its MIL ends `softmax` -> `log` — so `parity_seg.rs` compares like
-      // with like. The `logits`/`seg_logits` names are kept to avoid
-      // churning every committed golden; the values are log-probs.
+      // dia-ort segmentation: [num_frames * POWERSET_CLASSES] powerset
+      // LOG-PROBABILITIES (the CoreML side matches: its MIL ends `softmax` ->
+      // `log`, so `parity_seg.rs` compares like with like). The `logits` /
+      // `seg_logits` names are legacy, kept to avoid churning every committed
+      // golden. That these ARE log-probs — every element <= 0 and each row
+      // normalized so sum(exp) == 1 — is ENFORCED by `common::check_seg_log_probs`
+      // (called below before this chunk is serialized, and re-run against the
+      // committed goldens by `parity_seg::committed_golden_seg_rows_are_log_probs`),
+      // so a future model emitting raw logits with the argmax ordering preserved
+      // fails there rather than silently regenerating green goldens.
       let logits = seg.infer(chunk).expect("dia-ort segmentation infer");
       assert_eq!(
         logits.len() % POWERSET_CLASSES,
@@ -209,6 +212,11 @@ fn generate_goldens() {
       let num_frames = logits.len() / POWERSET_CLASSES;
       num_frames_seen = Some(*num_frames_seen.get_or_insert(num_frames));
       assert_eq!(num_frames_seen, Some(num_frames), "frame count drift");
+
+      // F4: enforce the log-prob invariant BEFORE these values are written — a raw
+      // logit or a broken normalization fails here, not silently into a green golden.
+      common::check_seg_log_probs(&logits, num_frames)
+        .unwrap_or_else(|e| panic!("[{}] chunk {c}: {e}", fixture.name));
 
       // Hard multilabel via dia's EXACT decode (softmax THEN argmax) → the
       // per-slot overlap-excluded masks dia's pipeline feeds to embed. This is

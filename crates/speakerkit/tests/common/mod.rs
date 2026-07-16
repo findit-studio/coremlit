@@ -322,6 +322,68 @@ pub fn max_abs_diff(a: &[f32], b: &[f32]) -> f64 {
     .fold(0.0, f64::max)
 }
 
+/// Max `|Σexp(row) − 1|` tolerated when validating a powerset log-softmax row.
+/// The committed goldens sit at ≤ 2.3e-7 (an f32 `softmax → log` round-trip);
+/// raw logits miss by many orders of magnitude, so this distinguishes the two
+/// with a wide margin while never flaking on f32 rounding.
+pub const SEG_ROW_SUM_EXP_TOL: f64 = 1e-4;
+
+/// Validates one chunk's flattened `[num_frames * POWERSET_CLASSES]` powerset
+/// segmentation output as LOG-PROBABILITIES: every element finite and `≤ 0`, and
+/// each [`POWERSET_CLASSES`]-wide row normalized so `Σ exp = 1` (within
+/// [`SEG_ROW_SUM_EXP_TOL`]).
+///
+/// dia-ort's segmentation MIL ends `softmax → log` and the CoreML side matches;
+/// the committed goldens store that quantity under the legacy `seg_logits` name.
+/// A future model emitting RAW logits (positive values, rows that do not sum-exp
+/// to 1) with the argmax ORDERING preserved would decode to the same speakers yet
+/// break this invariant — which `generate_goldens.rs`'s prose used to only
+/// assert, never check (codex r7 F4). This runs BOTH in the generator before
+/// serialization and against the committed goldens in the ordinary suite, so that
+/// drift cannot land silently.
+///
+/// # Errors
+/// Returns the first violation as a message: a length not matching
+/// `num_frames * POWERSET_CLASSES`, a non-finite or positive element, or a row
+/// whose `Σ exp` departs from 1 by more than [`SEG_ROW_SUM_EXP_TOL`].
+pub fn check_seg_log_probs(seg_logits: &[f32], num_frames: usize) -> Result<(), String> {
+  let expected = num_frames * POWERSET_CLASSES;
+  if seg_logits.len() != expected {
+    return Err(format!(
+      "seg_logits length {} != num_frames*POWERSET_CLASSES ({num_frames}*{POWERSET_CLASSES}={expected})",
+      seg_logits.len()
+    ));
+  }
+  for (f, row) in seg_logits
+    .as_chunks::<POWERSET_CLASSES>()
+    .0
+    .iter()
+    .enumerate()
+  {
+    let mut sum_exp = 0.0_f64;
+    for (k, &v) in row.iter().enumerate() {
+      if !v.is_finite() {
+        return Err(format!("frame {f} class {k}: non-finite log-prob {v}"));
+      }
+      if v > 0.0 {
+        return Err(format!(
+          "frame {f} class {k}: log-prob {v} > 0 — a probability's log is ≤ 0; this looks like a \
+           raw logit"
+        ));
+      }
+      sum_exp += f64::from(v).exp();
+    }
+    let dev = (sum_exp - 1.0).abs();
+    if dev > SEG_ROW_SUM_EXP_TOL {
+      return Err(format!(
+        "frame {f}: Σexp(row) = {sum_exp:.9}, off 1.0 by {dev:.3e} (> {SEG_ROW_SUM_EXP_TOL:.0e}) — \
+         the row is not a normalized log-softmax (raw logits, or a broken normalization)"
+      ));
+    }
+  }
+  Ok(())
+}
+
 /// Hard argmax over one frame's [`POWERSET_CLASSES`] logits, ties toward the
 /// lowest index (`>` seeded at class 0) — the exact rule speakerkit's shipping
 /// `segment::multilabel` and dia's `powerset_to_speakers_hard` both use. Gate
@@ -375,8 +437,10 @@ pub struct GoldenChunk {
   pub input_len: usize,
   /// [`fnv1a_f32`] of the exact chunk samples dia-ort was run on.
   pub input_fnv1a: u64,
-  /// dia-ort's flattened `[num_frames * POWERSET_CLASSES]` raw segmentation
-  /// logits (frame-major) — the Gate 1 reference.
+  /// dia-ort's flattened `[num_frames * POWERSET_CLASSES]` powerset segmentation
+  /// LOG-PROBABILITIES (frame-major; its MIL ends `softmax → log`, kept under the
+  /// legacy `seg_logits` name) — the Gate 1 reference. Validated as log-probs by
+  /// [`check_seg_log_probs`].
   pub seg_logits: Vec<f32>,
   /// The embedded slots for this chunk (skipped/degenerate slots omitted).
   pub slots: Vec<GoldenSlot>,
