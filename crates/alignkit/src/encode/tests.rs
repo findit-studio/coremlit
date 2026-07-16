@@ -113,15 +113,22 @@ fn truncated_frame_count_clamp_engages_only_below_the_formula() {
 
 #[test]
 fn truncated_frame_count_never_exceeds_available_frames_near_full_window() {
-  // Property-style sweep just below/at/above the full window, cross-
-  // checking the invariant `result <= available_frames` the clamp
-  // exists to guarantee.
+  // Sweep below/at/above the full window, cross-checking the invariant
+  // `result <= available_frames` the clamp exists to guarantee. Below and at
+  // the window the formula already tops out at exactly 2,999, so those cases
+  // alone are a VACUOUS `<=` check — the `.min` never fires, and deleting it
+  // (or flipping it to `.max`) still passes them. The ABOVE-window cases make
+  // the clamp load-bearing: `ENCODER_WINDOW_SAMPLES + HOP_SAMPLES` evaluates to
+  // 3,000 pre-clamp and `+ 10 * HOP_SAMPLES` to 3,009, so only
+  // `.min(available_frames)` pulls each back to the model's 2,999.
   let available_frames = 2_999;
   for real_samples in [
     ENCODER_WINDOW_SAMPLES - 1,
     ENCODER_WINDOW_SAMPLES,
     available_frames * HOP_SAMPLES,
     available_frames * HOP_SAMPLES + 1,
+    ENCODER_WINDOW_SAMPLES + HOP_SAMPLES,
+    ENCODER_WINDOW_SAMPLES + 10 * HOP_SAMPLES,
   ] {
     let t = truncated_frame_count(real_samples, available_frames);
     assert!(
@@ -129,6 +136,18 @@ fn truncated_frame_count_never_exceeds_available_frames_near_full_window() {
       "truncated_frame_count({real_samples}, {available_frames}) = {t} exceeds available_frames"
     );
   }
+  // Load-bearing clamp: above the window the conv formula overshoots 2,999, and
+  // ONLY the `.min` holds the result at exactly `base960h_aligner.mlmodelc`'s
+  // frame count. These EXACT `== 2_999` checks fail the instant `.min` is
+  // deleted or flipped to `.max` — the formula then returns 3,000 and 3,009.
+  assert_eq!(
+    truncated_frame_count(ENCODER_WINDOW_SAMPLES + HOP_SAMPLES, available_frames),
+    2_999
+  );
+  assert_eq!(
+    truncated_frame_count(ENCODER_WINDOW_SAMPLES + 10 * HOP_SAMPLES, available_frames),
+    2_999
+  );
 }
 
 // ---------------------------------------------------------------------

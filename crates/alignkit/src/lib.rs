@@ -115,8 +115,9 @@
 //!
 //! - `jfk.wav`: it places the second `ask` 873 ms before the audio contains any
 //!   evidence for it, inside a pause across which `logP(blank)` is fp16-saturated
-//!   at exactly `0.0` for 41 consecutive frames. alignkit puts that word 35 ms
-//!   from its true acoustic onset.
+//!   at exactly `0.0` for 41 consecutive frames. alignkit puts that word 50.7 ms
+//!   from its true acoustic onset — within the unchanged 3-frame (60 ms) anchor
+//!   bound the parity gate holds it to.
 //! - `ted_60.wav`: the speaker says `would` twice and the ASR transcript names
 //!   it once; the oracle ends the word at the *first* realisation and calls the
 //!   second — 120 ms of confidently-decoded speech — blank. alignkit spans the
