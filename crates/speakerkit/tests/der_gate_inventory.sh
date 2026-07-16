@@ -26,6 +26,14 @@
 # every load-bearing DER gate; a gate rename must update them (a deliberate
 # act), so a gate cannot silently disappear.
 #
+# codex r6 F4 — this inventory ALSO EXECUTES each binary's ORDINARY
+# (non-`--ignored`) suite. The README drove these binaries with `-- --ignored`
+# only, which SKIPS their hermetic ordinary tests: der_calc's DER-math units and
+# the mutation-proof pin guards (`assert_pinned_fires_...`,
+# `clip09_known_defect_pins_every_field`). Those need no models and no fixtures,
+# so dropping an `assert_pinned` clause left every documented command green while
+# a pin silently un-breached. Running the ordinary suite here turns that red.
+#
 # Run from the workspace root: crates/speakerkit/tests/der_gate_inventory.sh
 # Kept a shell script (not a `cargo test`) on purpose: it must shell out to
 # `cargo`, which cannot nest inside a `cargo test` run without deadlocking on
@@ -71,6 +79,32 @@ check_bin() {
   return "${rc}"
 }
 
+# Run one DER binary's ORDINARY (non-`--ignored`) suite and assert it PASSES with
+# at least one test (codex r6 F4). These are the hermetic gates the README's
+# `-- --ignored` command silently SKIPS — der_calc's DER-math unit tests plus the
+# mutation-proof pin guards — and they need no models and no fixtures, so they run
+# here in CI/dev without the gitignored `Models/` tree. `check_bin` above proves
+# each gate is COMPILED and still #[ignore]d; this proves the hermetic ordinary
+# tests actually RUN and pass, so a dropped `assert_pinned` clause is caught.
+run_ordinary() {
+  bin="$1"
+  echo "== ${bin} (ordinary suite) =="
+  out="$(cargo test -p speakerkit --features dia --test "${bin}" 2>&1)" || {
+    printf '%s\n' "${out}" | tail -25
+    echo "  FAIL: ${bin} ordinary suite did not pass — a hermetic gate (der_calc math or a"
+    echo "        mutation-proof pin guard) is red."
+    return 1
+  }
+  # Non-vacuity: `cargo test` exits 0 even with zero tests, so require passed > 0.
+  passed="$(printf '%s\n' "${out}" | sed -n 's/^test result: ok\. \([0-9][0-9]*\) passed.*/\1/p' | tail -1)"
+  if [ -z "${passed}" ] || [ "${passed}" -eq 0 ]; then
+    echo "  FAIL: ${bin} ran ZERO ordinary tests — the hermetic gate suite vanished."
+    return 1
+  fi
+  echo "  ok:   ${bin} ordinary suite passed (${passed} hermetic tests)"
+  return 0
+}
+
 fail=0
 
 # parity_e2e.rs — the fp32 dia-ort parity gate, the argmax characterization, the
@@ -99,8 +133,12 @@ check_bin parity_shipping_der \
   shipping_clip_selection_is_the_documented_subset \
   clip09_content_pin_catches_an_audio_swap || fail=1
 
+# ── Execute each binary's ORDINARY (hermetic) suite (codex r6 F4). ──
+run_ordinary parity_e2e || fail=1
+run_ordinary parity_shipping_der || fail=1
+
 if [ "${fail}" -ne 0 ]; then
   echo "DER gate inventory FAILED — the gates above are not all compiled, present, and #[ignore]d." >&2
   exit 1
 fi
-echo "DER gate inventory OK — every expected DER gate is compiled, listed, and still ignored."
+echo "DER gate inventory OK — every expected DER gate is compiled, listed and still ignored, and each binary's ordinary (hermetic) suite passed."
