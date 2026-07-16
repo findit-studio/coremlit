@@ -41,6 +41,20 @@ rubato = "0.16"
 criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
 sha2 = "0.10"
 
+# CO-DEV RECIPE (do NOT commit the patch itself): speakerkit's optional `dia`
+# dependency is pinned to the diarization repo by exact git rev
+# (crates/speakerkit/Cargo.toml). To build the `dia` feature against a LOCAL
+# diarization checkout instead — e.g. while co-developing an unmerged change —
+# add this UNCOMMITTED `[patch]` here (Cargo honors `[patch]` only at the
+# workspace root):
+#
+#   [patch."https://github.com/findit-studio/diarization"]
+#   dia = { path = "../diarization", package = "diarization" }
+#
+# `../diarization` is the sibling checkout relative to THIS workspace root; Cargo
+# then resolves `dia` to it for every crate in the workspace. Keep it out of
+# commits so CI and fresh checkouts continue to resolve the pinned rev.
+
 [workspace.lints.rust]
 missing_docs = "deny"
 rust_2018_idioms = { level = "warn", priority = -1 }
