@@ -32,3 +32,20 @@ pub mod extract;
 pub mod segment;
 pub mod source;
 pub mod window;
+
+/// dia's offline clustering option vocabulary, re-exported as speakerkit's
+/// public surface for the forthcoming `ClusterBackend` config type (design
+/// spec §Architecture: `Offline(OfflineClusterOptions)`), which will wrap it.
+///
+/// [`OfflineClusterOptions`] configures dia's batch
+/// [`cluster_offline`](dia::cluster::cluster_offline) entry point (method,
+/// similarity threshold, target speakers, seed); [`OfflineMethod`] and
+/// [`Linkage`] are its constituent enums.
+///
+/// NB the current runtime clustering path, [`extract::Extraction::diarize`],
+/// drives dia's `diarize_offline` pipeline with that pipeline's own
+/// community-1 hyperparameter defaults (its inline `OfflineInput` knobs) and
+/// does not consume these options — `cluster_offline` and `diarize_offline`
+/// are distinct dia entry points. Reconciling the config surface with the
+/// runtime pipeline is T2's task; T1 only exposes the type T2 will wrap.
+pub use dia::cluster::{Linkage, OfflineClusterOptions, OfflineMethod};

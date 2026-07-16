@@ -8,8 +8,10 @@
 //! input guards through the `count` tensor — stopping exactly where dia
 //! hands off to `diarize_offline`. Its output, [`Extraction`], exposes
 //! precisely `dia::offline::OfflineInput::new`'s parameter list
-//! (`diarization/src/offline/algo.rs:206-227`) and, behind the `dia`
-//! feature, converts into it directly (`Extraction::into_offline_input`).
+//! (`diarization/src/offline/algo.rs:206-227`) and converts into it
+//! directly (`Extraction::into_offline_input`) — `dia` is a runtime
+//! dependency, so that bridge (and the clustering it feeds) is always
+//! available.
 //!
 //! # Stage structure (ported from `owned.rs`)
 //!
@@ -568,7 +570,7 @@ impl Extractor {
 /// The assembled dia offline-input tensor set produced by
 /// [`Extractor::extract`]. Its accessors expose exactly
 /// `dia::offline::OfflineInput::new`'s parameter list (minus `plda`, which
-/// the consumer supplies) — see `Self::into_offline_input` (`dia` feature).
+/// the consumer supplies) — see `Self::into_offline_input`.
 ///
 /// Storage is plain `Vec` (spec §9 open item resolved: a desktop consumer
 /// clones once if it fans out; `Arc` is premature).
@@ -694,11 +696,11 @@ impl Extraction {
   /// (`diarization/src/plda/mod.rs:39`), NOT at its crate root, so the
   /// plan's `dia::PldaTransform` shorthand is written out in full here.
   /// The two [`SlidingWindow`] values convert into dia's own via
-  /// [`crate::window`]'s `dia`-gated `From` impls (`window/mod.rs:385-401`);
-  /// `OfflineInput::new` takes `dia::reconstruct::SlidingWindow` by value
-  /// (`algo.rs:11,224-225`).
-  #[cfg(feature = "dia")]
-  #[cfg_attr(docsrs, doc(cfg(feature = "dia")))]
+  /// [`crate::window`]'s `From` impls (`window/mod.rs`); `OfflineInput::new`
+  /// takes `dia::reconstruct::SlidingWindow` by value (`algo.rs:11,224-225`).
+  ///
+  /// Un-gated: `dia` is a runtime dependency and `dia::offline` is part of
+  /// its ort-free clustering surface, so this bridge is always available.
   pub fn into_offline_input<'a>(
     &'a self,
     plda: &'a dia::plda::PldaTransform,
@@ -715,6 +717,47 @@ impl Extraction {
       self.frames_sw.into(),
       plda,
     )
+  }
+
+  /// Cluster this extraction into speaker-labelled RTTM spans via dia's
+  /// offline pyannote-community-1 pipeline — the crate's runtime clustering
+  /// entry point.
+  ///
+  /// Assembles the [`dia::offline::OfflineInput`] bridge
+  /// ([`Self::into_offline_input`], carrying dia's community-1 hyperparameter
+  /// defaults — `threshold = 0.6` etc.) and runs
+  /// [`dia::offline::diarize_offline`] over it. This is the SINGLE runtime
+  /// clustering path: the parity harness scores exactly this method's output
+  /// rather than re-plumbing `into_offline_input → diarize_offline` itself, so
+  /// the public API and the tested path cannot diverge (the alignkit
+  /// canonical-wiring lesson).
+  ///
+  /// The returned [`dia::offline::OfflineOutput`] carries the speaker-labelled
+  /// spans ([`dia::offline::OfflineOutput::spans_slice`]) plus the frame-level
+  /// diarization grid and per-chunk hard assignments. `plda` is the frozen
+  /// community-1 PLDA projection ([`dia::plda::PldaTransform`]); see
+  /// [`Self::into_offline_input`] for how it threads through the bridge.
+  ///
+  /// Un-gated: `dia` is a runtime dependency and `dia::offline` is part of its
+  /// ort-free clustering surface, so this runs without `ort` (the `dia-oracle`
+  /// test feature only adds dia's ONNX reference oracle, never a runtime
+  /// requirement).
+  ///
+  /// # Errors
+  ///
+  /// Propagates [`dia::offline::diarize_offline`]'s typed
+  /// [`dia::offline::Error`] verbatim: a tensor-shape mismatch, a degenerate
+  /// (zero-norm/NaN) raw embedding rejected by PLDA, a non-finite
+  /// segmentation, or a clustering bail-out — e.g. the deliberate
+  /// `Pipeline(Centroid(AmbiguousAliveCluster { .. }))` refusal when a
+  /// cluster's alive-value lands in the SIMD guard band around the threshold.
+  /// Keeping the error TYPED (not stringified) is load-bearing: the
+  /// shipping-DER suite matches that exact variant rather than `is_err`.
+  pub fn diarize(
+    &self,
+    plda: &dia::plda::PldaTransform,
+  ) -> Result<dia::offline::OfflineOutput, dia::offline::Error> {
+    dia::offline::diarize_offline(&self.into_offline_input(plda))
   }
 }
 

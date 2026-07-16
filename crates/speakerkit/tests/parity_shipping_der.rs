@@ -448,7 +448,8 @@ fn fluidaudio_extraction(samples: &[f32], embed_path: &Path, cu: ComputeUnits) -
     .expect("FluidAudioSource::extract")
 }
 
-/// Run `diarize_offline` on an `Extraction` + the shared PLDA → its spans.
+/// Run the public `Extraction::diarize` clustering path on an `Extraction` +
+/// the shared PLDA → its spans (one code path with the runtime API).
 ///
 /// Returns dia's TYPED error rather than unwrapping or stringifying it: dia's
 /// clustering can REFUSE to produce an answer (e.g.
@@ -465,8 +466,7 @@ fn diarize_extraction_segs(
   ext: &Extraction,
   plda: &dia::plda::PldaTransform,
 ) -> Result<Vec<Seg>, dia::offline::Error> {
-  let input = ext.into_offline_input(plda);
-  dia::offline::diarize_offline(&input).map(|out| output_segs(&out))
+  ext.diarize(plda).map(|out| output_segs(&out))
 }
 
 /// One measured speakerkit arm. `segs` is `Err` when dia's clustering refused

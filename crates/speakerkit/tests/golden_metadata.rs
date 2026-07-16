@@ -1,6 +1,6 @@
 //! Hermetic integrity checks on the committed dia-ort parity goldens
 //! (`tests/fixtures/golden/*.json`) that run in the ORDINARY `cargo test`
-//! suite — no local models, no `ort`, no `dia` feature, nothing `#[ignore]`d.
+//! suite — no local models, no `ort`, no `dia-oracle` feature, nothing `#[ignore]`d.
 //!
 //! # Why this exists: the desync the parity suites cannot see
 //!

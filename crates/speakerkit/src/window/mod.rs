@@ -21,18 +21,20 @@
 //! ONLY through its public `new`/`start`/`duration`/`step`/`with_start`/
 //! `with_duration`/`with_step` API (all `pub const fn`, `algo.rs:52-113`).
 //!
-//! This crate builds WITHOUT the `dia` feature (T1's established
-//! contract — see `crates/speakerkit/Cargo.toml`'s optional `dia`
-//! dependency), so [`SlidingWindow`] cannot simply BE a re-export of
-//! dia's own type: that path only exists when the feature is on. The
-//! decision (mirror-struct-always, the shape already established by
-//! this crate's other feature-gated boundaries): this module defines
-//! its OWN [`SlidingWindow`] — same three private `f64` fields, same
-//! public `new`/accessor/builder surface, field-for-field and
-//! method-for-method identical to dia's — UNCONDITIONALLY, and adds
-//! `dia`-feature-gated `From` conversions in both directions, built
-//! entirely through dia's own public accessor API (its fields are
-//! private, so there is no other way to reach them). The conversions
+//! `dia` is a runtime dependency now (its ort-free clustering surface,
+//! `dia::reconstruct` included, is always linked), but its
+//! `SlidingWindow` fields stay private, and this crate keeps its OWN
+//! public [`SlidingWindow`] as a stable, dia-version-independent
+//! boundary type rather than re-exporting dia's (the mirror-struct
+//! decision, retained from when `dia` was an optional feature: the
+//! crate's public geometry surface should not shift if dia's type
+//! moves). The decision (mirror-struct): this module defines its OWN
+//! [`SlidingWindow`] — same three private `f64` fields, same public
+//! `new`/accessor/builder surface, field-for-field and
+//! method-for-method identical to dia's — and adds `From` conversions
+//! in both directions, built entirely through dia's own public accessor
+//! API (its fields are private, so there is no other way to reach
+//! them). The conversions
 //! are lossless and infallible: both types are plain `(f64, f64, f64)`
 //! tuples underneath, `Copy`, with no invariants enforced at
 //! construction on EITHER side (dia's own `SlidingWindow::new` performs
@@ -308,7 +310,8 @@ fn default_onset() -> f32 {
 /// 44-113`): `(start, duration, step)`, all in seconds — see the module
 /// doc's "`SlidingWindow`: the visibility DECISION" section for why this
 /// crate keeps its own copy of this type rather than depending on dia's
-/// directly, even where the `dia` feature is off.
+/// directly (the mirror-struct decision, retained now that `dia` is a
+/// runtime dependency).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SlidingWindow {
   start: f64,
@@ -382,22 +385,24 @@ impl SlidingWindow {
   }
 }
 
-/// `dia`-feature-gated conversion INTO dia's own `SlidingWindow` — see
-/// the module doc's "`SlidingWindow`: the visibility DECISION" section.
-/// Lossless and infallible: both types are unchecked `(f64, f64, f64)`
-/// tuples.
-#[cfg(feature = "dia")]
+/// Conversion INTO dia's own `SlidingWindow` — see the module doc's
+/// "`SlidingWindow`: the visibility DECISION" section. Lossless and
+/// infallible: both types are unchecked `(f64, f64, f64)` tuples.
+///
+/// Un-gated: `dia` is a runtime dependency now, and `dia::reconstruct` is
+/// part of its ort-free clustering surface, so this conversion is always
+/// available (it is what `Extraction::into_offline_input` feeds into
+/// `dia::offline::diarize_offline`).
 impl From<SlidingWindow> for dia::reconstruct::SlidingWindow {
   fn from(value: SlidingWindow) -> Self {
     Self::new(value.start, value.duration, value.step)
   }
 }
 
-/// `dia`-feature-gated conversion FROM dia's own `SlidingWindow` — the
-/// reverse of the `From` impl above. Built entirely through dia's public
-/// `start`/`duration`/`step` accessors: dia's fields are private, so
-/// there is no other way to reach them.
-#[cfg(feature = "dia")]
+/// Conversion FROM dia's own `SlidingWindow` — the reverse of the `From`
+/// impl above. Built entirely through dia's public `start`/`duration`/`step`
+/// accessors: dia's fields are private, so there is no other way to reach
+/// them.
 impl From<dia::reconstruct::SlidingWindow> for SlidingWindow {
   fn from(value: dia::reconstruct::SlidingWindow) -> Self {
     Self::new(value.start(), value.duration(), value.step())

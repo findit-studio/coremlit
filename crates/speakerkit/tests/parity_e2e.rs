@@ -1063,11 +1063,14 @@ fn argmax_models_root() -> PathBuf {
   root
 }
 
-/// Run `diarize_offline` on an `Extraction` + shared PLDA → its spans as
-/// [`Seg`]s. Borrows keep the `Extraction` alive across the call.
+/// Run the public `Extraction::diarize` clustering path on an `Extraction` +
+/// shared PLDA → its spans as [`Seg`]s. This suite scores exactly the runtime
+/// method (which internally is `into_offline_input → diarize_offline`), not a
+/// re-plumbed copy — the public API and the tested path are ONE code path.
 fn diarize_extraction_segs(ext: &Extraction, plda: &dia::plda::PldaTransform) -> Vec<Seg> {
-  let input = ext.into_offline_input(plda);
-  let out = dia::offline::diarize_offline(&input).expect("diarize_offline over speakerkit tensors");
+  let out = ext
+    .diarize(plda)
+    .expect("Extraction::diarize over speakerkit tensors");
   output_segs(&out)
 }
 

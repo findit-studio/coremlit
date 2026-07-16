@@ -3,8 +3,8 @@ name = "speakerkit"
 description = "Native CoreML segmentation and embedding backends for the dia speaker-diarization pipeline"
 version.workspace = true
 edition.workspace = true
-# Unpublishable until the `diarization` dependency publishes (the optional
-# `dia` git dependency has no registry version); flip when it does.
+# Unpublishable until the `diarization` dependency publishes (the `dia` git
+# dependency has no registry version); flip when it does.
 publish = false
 rust-version.workspace = true
 license.workspace = true
@@ -22,45 +22,43 @@ targets = ["aarch64-apple-darwin"]
 coremlit.workspace = true
 thiserror.workspace = true
 
-# Renamed to `dia` (its own package name is `diarization`) so call sites read
-# `dia::offline::OfflineInput` etc., matching the design spec's API (§5).
+# `dia` (its own package name is `diarization`) is the offline clustering
+# engine, consumed as a RUNTIME dependency: clustering is a public runtime
+# capability of this crate (`Extraction::diarize`), not a test-only harness
+# step. Call sites read `dia::offline::diarize_offline` etc. (design spec §5).
 #
-# Pinned to the public diarization repo by EXACT rev, not a sibling path: a path
-# dep breaks a fresh `cargo metadata` on any checkout lacking the sibling,
-# because Cargo loads a path-dep manifest at resolution time even for an OPTIONAL
-# dep. This rev IS the repo's `origin/main` and is the exact offline surface
-# every green `dia`-feature gate ran against (the sibling was three additive,
-# unmerged `cluster/online` commits ahead, none consumed here).
+# Pinned to the public diarization repo by EXACT rev, not a sibling path: a
+# path dep breaks a fresh `cargo metadata` on any checkout lacking the sibling,
+# because Cargo loads a path-dep manifest at resolution time. This rev IS the
+# repo's `origin/main` and the exact offline surface every green gate ran
+# against.
 #
-# `default-features = false`: the PUBLIC `dia` bridge pulls only dia's
-# backend-free offline core (clustering / PLDA / reconstruction) — the surface
-# `Extraction::into_offline_input` feeds. dia's defaults (`ort` +
-# `bundled-segmentation`) would drag ONNX Runtime and the ~6 MB embedded
-# segmentation model into every CoreML-only consumer — the exact inference
-# stack speakerkit REPLACES. The dia-ort DER oracle the parity suites need lives
-# behind the test-only `dia-oracle` feature below, never on this public bridge.
+# `default-features = false` is load-bearing. dia's defaults are
+# `["ort", "bundled-segmentation"]`; dropping them keeps the runtime clustering
+# path free of BOTH onnxruntime AND dia's ~6 MB embedded ONNX segmentation
+# model (speakerkit brings its own CoreML models). dia's whole clustering stack
+# (`offline::diarize_offline`, `plda`, `reconstruct`, `aggregate`, `pipeline`,
+# `cluster`) is public and un-gated, so it is fully usable with no default
+# features.
 #
-# CO-DEV: to build the `dia` feature against a local diarization checkout
-# instead (e.g. an unmerged change), add an UNCOMMITTED `[patch]` to the
-# WORKSPACE ROOT Cargo.toml — see its own "CO-DEV RECIPE" comment. Do not edit
-# this line for that.
-dia = { package = "diarization", git = "https://github.com/findit-studio/diarization", rev = "b6a6f9adc8465f7a4c207dbaa2701d98e1be1ff2", default-features = false, optional = true }
+# ORT-FREE PROOF — the runtime configuration pulls no `ort` crate:
+#   cargo tree -p speakerkit -e normal | grep -iw ort   # → no match
+# Contrast — the test-only oracle feature DOES pull it:
+#   cargo tree -p speakerkit --features dia-oracle -e normal | grep -iw ort
+dia = { package = "diarization", git = "https://github.com/findit-studio/diarization", rev = "b6a6f9adc8465f7a4c207dbaa2701d98e1be1ff2", default-features = false }
 serde = { workspace = true, optional = true }
 
 [features]
 default = []
-# Public, LEAN bridge: `Extraction::into_offline_input` → dia's backend-free
-# offline clustering core. NO `ort`, no bundled ONNX model (see the dep's
-# `default-features = false` above).
-dia = ["dep:dia"]
 # TEST-ONLY oracle. Adds dia's OWN ort inference path (bundled `segmentation-3.0`
 # + BYO fp32 WeSpeaker ONNX) so the DER parity suites (`parity_e2e`,
 # `parity_shipping_der`, `generate_goldens`) can measure speakerkit's CoreML
-# output against dia-ort. Pulls `ort` + `libonnxruntime` and the ~6 MB embedded
-# segmentation model — never enable it in production, only to run those oracle
-# gates. `dia/bundled-segmentation` already implies `dia/ort`; both are named
-# for clarity.
-dia-oracle = ["dia", "dia/ort", "dia/bundled-segmentation"]
+# output against dia-ort. Purely ADDITIVE over the always-on runtime `dia` dep
+# (cargo features are additive): it turns ON dia's `ort` + `bundled-segmentation`,
+# so the runtime build stays ort-free while a test build with this feature gets
+# the full ONNX oracle. `dia/bundled-segmentation` already implies `dia/ort`;
+# both are named for clarity.
+dia-oracle = ["dia/ort", "dia/bundled-segmentation"]
 serde = ["dep:serde"]
 
 [dev-dependencies]

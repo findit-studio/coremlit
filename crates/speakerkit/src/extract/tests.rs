@@ -482,12 +482,12 @@ fn options_serde_round_trips() {
 }
 
 // =====================================================================
-// dia-gated: into_offline_input — the compile/borrow proof AND the field
-// round-trip. plda is hermetic (compile-time-embedded weights,
-// transform.rs:341-379), so this needs no model, only the `dia` feature.
+// into_offline_input — the compile/borrow proof AND the field round-trip.
+// plda is hermetic (compile-time-embedded weights, transform.rs:341-379),
+// so this needs no model. `dia` is a runtime dependency now, so this runs
+// in the ordinary (feature-free) unit suite.
 // =====================================================================
 
-#[cfg(feature = "dia")]
 #[test]
 fn into_offline_input_round_trips_against_real_dia() {
   // A small, self-consistent Extraction (num_chunks=1, F=2, count len ==
@@ -531,6 +531,103 @@ fn into_offline_input_round_trips_against_real_dia() {
 
   // The borrowed plda is the very same one we passed in.
   assert!(std::ptr::eq(input.plda(), &plda));
+}
+
+// =====================================================================
+// diarize() — the public runtime clustering entry point. Hermetic proof
+// that it is ONE code path with the manual `into_offline_input →
+// diarize_offline` plumbing the parity harness used to inline (the alignkit
+// canonical-wiring lesson): SAME Extraction, SAME PLDA ⇒ byte-identical
+// Result. plda is hermetic (compile-time-embedded weights), so this needs
+// no model and runs ort-free in the ordinary unit suite. The model-gated
+// ≥3-speaker regime — where the clustering decision is non-trivial — is
+// proven in `tests/parity_diarize_wiring.rs`.
+// =====================================================================
+
+#[test]
+fn diarize_matches_manual_into_offline_input_pipeline() {
+  // The same small, self-consistent Extraction as the round-trip test above.
+  let e = Extraction {
+    raw_embeddings: (0..(SEG_NUM_SLOTS * EMBEDDING_DIM))
+      .map(|i| i as f32 * 0.25 - 3.0)
+      .collect(),
+    segmentations: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+    count: vec![1, 2, 1, 0],
+    num_chunks: 1,
+    num_frames_per_chunk: 2,
+    num_output_frames: 4,
+    chunks_sw: crate::window::chunk_sliding_window(&WindowOptions::new()),
+    frames_sw: crate::window::frame_sliding_window(),
+  };
+  let plda = dia::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+
+  // Subject: the public runtime method.
+  let via_public = e.diarize(&plda);
+  // Reference: the pre-refactor plumbing, reconstructed through the still-
+  // public `into_offline_input` bridge.
+  let via_manual = dia::offline::diarize_offline(&e.into_offline_input(&plda));
+
+  // The two must agree on their WHOLE Result — succeed identically, or refuse
+  // identically. `OfflineOutput` is not `PartialEq`, so compare the observable
+  // span geometry on success and the typed error's rendering on failure. A
+  // mutation to `diarize`'s wiring (dropped PLDA, swapped option, wrong tensor)
+  // breaks exactly one arm and this assertion fires.
+  match (via_public, via_manual) {
+    (Ok(pub_out), Ok(man_out)) => {
+      let spans = |o: &dia::offline::OfflineOutput| -> Vec<(f64, f64, usize)> {
+        o.spans_slice()
+          .iter()
+          .map(|s| (s.start(), s.end(), s.cluster()))
+          .collect()
+      };
+      assert_eq!(
+        spans(&pub_out),
+        spans(&man_out),
+        "diarize() spans diverged from into_offline_input → diarize_offline"
+      );
+    }
+    (Err(pub_err), Err(man_err)) => {
+      assert_eq!(
+        format!("{pub_err:?}"),
+        format!("{man_err:?}"),
+        "diarize() and the manual plumbing refused differently"
+      );
+    }
+    (pub_res, man_res) => panic!(
+      "diarize() ({}) diverged from manual into_offline_input → diarize_offline ({})",
+      if pub_res.is_ok() { "Ok" } else { "Err" },
+      if man_res.is_ok() { "Ok" } else { "Err" },
+    ),
+  }
+}
+
+// =====================================================================
+// OfflineClusterOptions re-export (`crate::OfflineClusterOptions` etc.) —
+// the T1 surface T2's `ClusterBackend` wraps (design spec §Architecture).
+// Hermetic: names the re-exported types and exercises the builder that
+// needs all three (`OfflineMethod`/`Linkage` are `OfflineClusterOptions`'s
+// constituent enums), proving the whole vocabulary is reachable from
+// speakerkit's own namespace, not merely via the `dia` dependency.
+// =====================================================================
+
+#[test]
+fn offline_cluster_options_vocabulary_is_reexported() {
+  let opts = crate::OfflineClusterOptions::new()
+    .with_method(crate::OfflineMethod::Agglomerative {
+      linkage: crate::Linkage::Average,
+    })
+    .with_similarity_threshold(0.6)
+    .with_target_speakers(3);
+  assert_eq!(
+    opts.method(),
+    crate::OfflineMethod::Agglomerative {
+      linkage: crate::Linkage::Average
+    }
+  );
+  assert_eq!(opts.target_speakers(), Some(3));
+  // Re-export identity: speakerkit's name IS dia's type, so a value built
+  // through the speakerkit path is the very same type dia's clustering takes.
+  let _dia: dia::cluster::OfflineClusterOptions = opts;
 }
 
 // =====================================================================
