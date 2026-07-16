@@ -272,10 +272,28 @@ pub fn sha256_hex(data: &[u8]) -> String {
 /// Cosine similarity of two equal-length vectors, accumulated in `f64` for
 /// precision (Gate 2's per-`(chunk, slot)` metric).
 ///
+/// Rejects the two degenerate inputs that silently poison the metric rather
+/// than returning a `NaN` a downstream fold would discard: a non-finite
+/// element (which propagates `NaN` straight into the result) and a zero-norm
+/// vector (`0 / 0 == NaN`). Gate 2 folds per-slot cosines with
+/// `worst.min(cos)`, and `f64::min` KEEPS the non-`NaN` operand — so a
+/// shape-compatible all-zero (or otherwise degenerate) embedder would leave
+/// `worst == 1.0` and report PERFECT parity from garbage (M1). A loud panic
+/// naming the offending vector turns that silent pass into a failure.
+///
 /// # Panics
-/// If the lengths differ.
+/// If the lengths differ, either vector contains a non-finite element, or
+/// either vector has a zero L2 norm.
 pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
   assert_eq!(a.len(), b.len(), "cosine: length mismatch");
+  assert!(
+    a.iter().all(|v| v.is_finite()),
+    "cosine: vector `a` contains a non-finite element"
+  );
+  assert!(
+    b.iter().all(|v| v.is_finite()),
+    "cosine: vector `b` contains a non-finite element"
+  );
   let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
   for (&x, &y) in a.iter().zip(b) {
     let (x, y) = (f64::from(x), f64::from(y));
@@ -283,6 +301,8 @@ pub fn cosine(a: &[f32], b: &[f32]) -> f64 {
     na += x * x;
     nb += y * y;
   }
+  assert!(na > 0.0, "cosine: vector `a` has zero norm");
+  assert!(nb > 0.0, "cosine: vector `b` has zero norm");
   dot / (na.sqrt() * nb.sqrt())
 }
 

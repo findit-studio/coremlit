@@ -98,6 +98,15 @@ fn measure(model: &EmbedModel, label: &str) -> (f64, f64, usize) {
       }
     }
   }
+  // A gate that compared nothing is not a passing gate: with no `(chunk,
+  // slot)` pair folded in, `worst` stays at its `1.0` seed and the caller's
+  // `worst >= EMBED_COS_TOL` assert reports PERFECT parity over an empty set
+  // (M1 — e.g. an empty fixture/golden set, or every slot skipped). Fail loud
+  // instead of silently verifying nothing.
+  assert!(
+    n > 0,
+    "{label}: no (chunk, slot) embeddings compared — the gate verified nothing"
+  );
   (worst, best, n)
 }
 
@@ -145,4 +154,44 @@ fn embedding_int8_quantization_cost_informational() {
     "int8 cosine {worst:.6} below sanity floor {INT8_SANITY_FLOOR} — likely a \
      harness/model error, not mere quantization"
   );
+}
+
+// ---------------------------------------------------------------------
+// Hermetic guards on `common::cosine` (M1): the metric must REJECT the
+// degenerate inputs that would otherwise pass a garbage embedding off as
+// perfect parity (an all-zero row → zero norm → 0/0 == NaN → discarded by
+// `worst.min(NaN)`). Not `#[ignore]`d — no models needed — so they run in
+// the ordinary `cargo test` gate.
+// ---------------------------------------------------------------------
+
+#[test]
+#[should_panic(expected = "cosine: vector `a` has zero norm")]
+fn cosine_rejects_zero_norm_first_vector() {
+  let _ = common::cosine(&[0.0, 0.0, 0.0], &[1.0, 2.0, 3.0]);
+}
+
+#[test]
+#[should_panic(expected = "cosine: vector `b` has zero norm")]
+fn cosine_rejects_zero_norm_second_vector() {
+  let _ = common::cosine(&[1.0, 2.0, 3.0], &[0.0, 0.0, 0.0]);
+}
+
+#[test]
+#[should_panic(expected = "cosine: vector `a` contains a non-finite element")]
+fn cosine_rejects_non_finite_first_vector() {
+  let _ = common::cosine(&[1.0, f32::NAN, 3.0], &[1.0, 2.0, 3.0]);
+}
+
+#[test]
+#[should_panic(expected = "cosine: vector `b` contains a non-finite element")]
+fn cosine_rejects_non_finite_second_vector() {
+  let _ = common::cosine(&[1.0, 2.0, 3.0], &[1.0, f32::INFINITY, 3.0]);
+}
+
+#[test]
+fn cosine_accepts_ordinary_finite_nonzero_vectors() {
+  // Identical vectors → cosine exactly 1.0; proves the new guards do not
+  // reject legitimate inputs.
+  let v = [0.5f32, -0.25, 0.75];
+  assert!((common::cosine(&v, &v) - 1.0).abs() < 1e-12);
 }
