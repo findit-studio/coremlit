@@ -43,7 +43,7 @@ mod common;
 use std::io::Write as _;
 
 use dia::{embed::EmbedModel, segment::SegmentModel};
-use speakerkit::segment::{POWERSET_CLASSES, SEG_NUM_SLOTS, multilabel};
+use speakerkit::segment::{POWERSET_CLASSES, SEG_NUM_SLOTS};
 
 /// dia's community-1 onset (`diarization/src/offline/owned.rs:144`;
 /// speakerkit's `window::DEFAULT_ONSET`). On the hard 0/1 multilabel a slot is
@@ -113,6 +113,37 @@ fn derive_slot_masks(chunk_segs: &[f64], num_frames: usize) -> [Option<Vec<bool>
   })
 }
 
+/// dia's EXACT segmentation decode of one chunk's powerset log-probabilities
+/// (`diarization/src/offline/owned.rs:479-497`): per frame, `softmax_row` THEN
+/// `powerset_to_speakers_hard`, written into the same `[num_frames *
+/// SEG_NUM_SLOTS]` frame-major f64 hard 0/1 slab speakerkit's `multilabel`
+/// returns and [`derive_slot_masks`] consumes.
+///
+/// Because this file is `dia`-gated it calls dia's OWN `powerset` functions, so
+/// the committed oracle is decoded byte-for-byte as dia's pipeline decodes it.
+/// speakerkit's shipping `multilabel` argmaxes the log-probs DIRECTLY (no
+/// softmax); that is order-for-order identical to this over reals (a per-row
+/// constant shift — see `speakerkit::segment`'s module doc), but over f32 the
+/// two can differ on a near-tie where `softmax`'s `exp` collapses two
+/// one-ULP-apart log-probs onto the same probability. The oracle must decode the
+/// way dia actually does; `parity_seg.rs::golden_direct_and_dia_decode_agree`
+/// pins that the two decodes coincide on every committed golden row today, so
+/// this choice does not silently move a committed mask.
+fn dia_hard_multilabel(logits: &[f32], num_frames: usize) -> Vec<f64> {
+  assert_eq!(
+    logits.len(),
+    num_frames * POWERSET_CLASSES,
+    "logits.len() must equal num_frames * POWERSET_CLASSES"
+  );
+  let mut slab = Vec::with_capacity(num_frames * SEG_NUM_SLOTS);
+  for row in logits.as_chunks::<POWERSET_CLASSES>().0 {
+    let probs = dia::segment::powerset::softmax_row(row);
+    let speakers = dia::segment::powerset::powerset_to_speakers_hard(&probs);
+    slab.extend(speakers.iter().map(|&s| f64::from(s)));
+  }
+  slab
+}
+
 #[test]
 #[ignore = "rewrites committed goldens; set UPDATE_GOLDEN=1 + `dia` feature + ort + wespeaker ONNX"]
 fn generate_goldens() {
@@ -179,9 +210,12 @@ fn generate_goldens() {
       num_frames_seen = Some(*num_frames_seen.get_or_insert(num_frames));
       assert_eq!(num_frames_seen, Some(num_frames), "frame count drift");
 
-      // Hard multilabel (speakerkit's decode == dia's softmax+argmax) → the
-      // per-slot overlap-excluded masks dia's pipeline feeds to embed.
-      let slab = multilabel(&logits, num_frames);
+      // Hard multilabel via dia's EXACT decode (softmax THEN argmax) → the
+      // per-slot overlap-excluded masks dia's pipeline feeds to embed. This is
+      // the oracle, so it decodes exactly as dia's own audio-in pipeline does
+      // rather than through speakerkit's direct-argmax shortcut (identical over
+      // reals, but they can differ on an f32 near-tie — see [`dia_hard_multilabel`]).
+      let slab = dia_hard_multilabel(&logits, num_frames);
       let masks = derive_slot_masks(&slab, num_frames);
 
       let mut slot_values: Vec<serde_json::Value> = Vec::new();

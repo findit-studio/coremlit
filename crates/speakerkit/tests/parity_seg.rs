@@ -94,6 +94,54 @@ use speakerkit::segment::{
 /// deliberately.
 const SEG_DECISION_AGREEMENT_MIN: f64 = 0.999;
 
+/// dia's EXACT audio-in segmentation decode of one chunk's powerset
+/// log-probabilities: per frame, `softmax_row` THEN hard argmax THEN the
+/// powerset→speaker table — replicating `diarization/src/offline/owned.rs:
+/// 479-497` (`softmax_row(&row)` then `powerset_to_speakers_hard(&probs)`).
+/// Returns the same `[num_frames * SEG_NUM_SLOTS]` hard 0/1 mask layout, in the
+/// same frame-major order, as speakerkit's shipping [`multilabel`].
+///
+/// speakerkit's `multilabel` argmaxes the log-probs DIRECTLY, without the
+/// `softmax_row`, which `speakerkit::segment`'s module doc proves is
+/// order-for-order dia's decode *in exact arithmetic* — `log(softmax(z))` is
+/// `z` shifted by a per-row constant, which preserves both the argmax and its
+/// exact ties. Over f32 the shortcut and dia's real path can still diverge on a
+/// near-tie: `softmax_row`'s `exp`/divide can round two log-probs that differ
+/// by one ULP to the SAME probability, turning a strict `>` into a tie that the
+/// lowest-index rule then resolves the other way. This function is dia's real
+/// f32 path, used for the ORT side of the gate so the oracle is decoded exactly
+/// as dia's pipeline decodes it. `near_tie_softmax_can_flip_the_argmax`
+/// exhibits such a divergence on a crafted row; `golden_direct_and_dia_decode_
+/// agree` asserts none occurs on any committed golden row (today's baseline).
+///
+/// The table is dia's `TABLE` (`diarization/src/segment/powerset.rs:77-85`),
+/// byte-identical to speakerkit's private `segment::POWERSET_TABLE` (silence, A,
+/// B, C, A+B, A+C, B+C); replicated here because that constant is not public and
+/// this file is not `dia`-gated (it must decode from the committed golden alone,
+/// no `dia`/`ort` dependency).
+fn dia_exact_multilabel(logits: &[f32], num_frames: usize) -> Vec<f64> {
+  const TABLE: [[f64; SEG_NUM_SLOTS]; POWERSET_CLASSES] = [
+    [0.0, 0.0, 0.0], // silence
+    [1.0, 0.0, 0.0], // A
+    [0.0, 1.0, 0.0], // B
+    [0.0, 0.0, 1.0], // C
+    [1.0, 1.0, 0.0], // A+B
+    [1.0, 0.0, 1.0], // A+C
+    [0.0, 1.0, 1.0], // B+C
+  ];
+  assert_eq!(
+    logits.len(),
+    num_frames * POWERSET_CLASSES,
+    "logits.len() must equal num_frames * POWERSET_CLASSES"
+  );
+  let mut out = Vec::with_capacity(num_frames * SEG_NUM_SLOTS);
+  for row in logits.as_chunks::<POWERSET_CLASSES>().0 {
+    let probs = common::softmax_row(row);
+    out.extend_from_slice(&TABLE[common::powerset_argmax(&probs)]);
+  }
+  out
+}
+
 #[test]
 #[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS) + committed goldens"]
 fn segmentation_parity_vs_dia_ort() {
@@ -163,11 +211,20 @@ fn segmentation_parity_vs_dia_ort() {
 
       // GATED: decode BOTH sides to the hard multilabel speaker set — the exact
       // tensor that feeds `dia`'s clustering — and count per-frame set
-      // disagreements. Routing through `multilabel` (POWERSET_TABLE) makes this
-      // the literal downstream DECISION, identical in definition to the argmax
-      // accuracy suite's metric.
+      // disagreements. The two sides use the two PRODUCTION decodes, not one
+      // shared shortcut: the CoreML side runs speakerkit's shipping `multilabel`
+      // (direct argmax of the log-probs — its own module doc proves that is
+      // order-for-order dia's decode in exact arithmetic), and the ORT side runs
+      // dia's EXACT audio-in sequence, `softmax_row` THEN argmax
+      // (`diarization/src/offline/owned.rs:479-497`), via
+      // [`dia_exact_multilabel`]. Decoding the oracle the way dia's pipeline
+      // actually decodes it — rather than through speakerkit's own
+      // no-softmax shortcut — is the honest end-to-end parity; over reals the
+      // two decodes coincide, over f32 they can differ on a near-tie
+      // (`golden_direct_and_dia_decode_agree` pins that they do not on any
+      // committed golden row).
       let coreml_set = multilabel(&coreml, golden.num_frames);
-      let ort_set = multilabel(&gc.seg_logits, golden.num_frames);
+      let ort_set = dia_exact_multilabel(&gc.seg_logits, golden.num_frames);
 
       let mut flips = 0usize;
       let mut softmax_abs = 0.0f64;
@@ -187,9 +244,11 @@ fn segmentation_parity_vs_dia_ort() {
         if coreml_set[s..s + SEG_NUM_SLOTS] != ort_set[s..s + SEG_NUM_SLOTS] {
           flips += 1;
           // Diagnostic label: the powerset class each side argmaxed to (a
-          // set-flip is a class-flip, POWERSET_TABLE being injective).
+          // set-flip is a class-flip, the powerset table being injective). Each
+          // side's class matches its own decode above — CoreML direct, ORT
+          // through dia's softmax (`so`, already computed for softmax_abs).
           let ac = common::powerset_argmax(&coreml[lo..hi]);
-          let ao = common::powerset_argmax(&gc.seg_logits[lo..hi]);
+          let ao = common::powerset_argmax(&so);
           flip_sites.push((fixture.name, c, f, ao, ac));
         }
       }
@@ -237,5 +296,108 @@ fn segmentation_parity_vs_dia_ort() {
      the threshold; investigate the CoreML decode.",
     agreement * 100.0,
     SEG_DECISION_AGREEMENT_MIN * 100.0
+  );
+}
+
+/// The whole reason the ORT side of the gate decodes through dia's exact
+/// `softmax_row`-then-argmax sequence rather than speakerkit's direct-argmax
+/// shortcut: over f32 the two DIVERGE on a near-tie. Here two powerset logits
+/// one ULP apart are the row's top pair; direct argmax picks the strictly-larger
+/// one (the higher index), but `softmax_row`'s `exp` rounds them to the SAME f32
+/// probability, so the lowest-index tie rule picks the lower index instead.
+///
+/// Hermetic and always-run. MUTATION PROOF: widening the pair from one ULP to a
+/// real gap (e.g. `b = a + 1.0`) stops the softmax collapse — `probs[1] ==
+/// probs[2]` and the final `assert_ne!` both go red — so this test genuinely
+/// depends on the near-tie, it is not vacuously true.
+#[test]
+fn near_tie_softmax_can_flip_the_argmax() {
+  // `a` and the next representable f32 above it. At this magnitude one ULP is
+  // ~2^-27, well under the ~2^-25 gap at which `exp` stops rounding to 1.0, so
+  // after subtracting the max the two collapse to the same probability.
+  let a = 0.1_f32;
+  let b = f32::from_bits(a.to_bits() + 1);
+  assert!(b > a, "b must be the next f32 above a");
+
+  // Index 2 (`b`) is the strict RAW max; index 1 (`a`) is one ULP below it.
+  // Every other class sits far below both.
+  let row = [-10.0_f32, a, b, -10.0, -10.0, -10.0, -10.0];
+
+  // speakerkit's shipping decode argmaxes the values DIRECTLY: `b` wins (2).
+  let direct = common::powerset_argmax(&row);
+  assert_eq!(
+    direct, 2,
+    "direct argmax must pick the strictly-largest logit"
+  );
+
+  // dia's decode softmaxes FIRST: `exp` collapses `a` and `b` onto the same f32
+  // probability, and the lowest-index tie rule then picks index 1.
+  let probs = common::softmax_row(&row);
+  assert_eq!(
+    probs[1], probs[2],
+    "softmax must round the one-ULP-apart logits to the SAME probability (the collapse)"
+  );
+  let dia = common::powerset_argmax(&probs);
+  assert_eq!(dia, 1, "softmax-then-argmax must take the lowest-index tie");
+
+  assert_ne!(
+    direct, dia,
+    "direct argmax and dia's softmax-then-argmax must DIVERGE on this row — the exact \
+     f32 hazard the ORT side is decoded through dia's real sequence to avoid"
+  );
+}
+
+/// F3 baseline, made EXPLICIT and hermetic. On EVERY committed golden row,
+/// speakerkit's shipping direct-argmax decode and dia's exact
+/// softmax-then-argmax decode agree — so switching the gate's ORT side from
+/// `multilabel` to [`dia_exact_multilabel`] does not move the measured flip
+/// count on the committed oracle (no near-tie collapse bites a real frame
+/// today). If a future re-cut golden ever disagrees, that is a genuine finding
+/// AND a deliberate golden decision, not a silent pass: this fails loudly and
+/// names every diverging frame. Reads only the committed
+/// `tests/fixtures/golden/*.json` — no models, no `dia`/`ort`.
+#[test]
+fn golden_direct_and_dia_decode_agree() {
+  let mut divergences: Vec<String> = Vec::new();
+  let mut total_rows = 0usize;
+  for fixture in common::FIXTURES {
+    let golden = common::load_golden(fixture.name);
+    for (c, chunk) in golden.chunks.iter().enumerate() {
+      assert_eq!(
+        chunk.seg_logits.len(),
+        golden.num_frames * POWERSET_CLASSES,
+        "{} chunk {c}: golden seg_logits length vs num_frames",
+        fixture.name
+      );
+      for (f, row) in chunk
+        .seg_logits
+        .as_chunks::<POWERSET_CLASSES>()
+        .0
+        .iter()
+        .enumerate()
+      {
+        total_rows += 1;
+        let direct = common::powerset_argmax(row);
+        let dia = common::powerset_argmax(&common::softmax_row(row));
+        if direct != dia {
+          divergences.push(format!(
+            "{} chunk {c} frame {f}: direct_argmax={direct} dia_softmax_argmax={dia}",
+            fixture.name
+          ));
+        }
+      }
+    }
+  }
+  assert!(
+    total_rows > 0,
+    "read zero golden rows — the committed oracle vanished, the check would be vacuous"
+  );
+  assert!(
+    divergences.is_empty(),
+    "{} of {total_rows} committed golden rows decode DIFFERENTLY under speakerkit's direct argmax \
+     vs dia's softmax-then-argmax — a near-tie collapse now bites a real frame. This is a finding \
+     AND a deliberate golden decision, not a silent pass; investigate before re-baselining:\n  {}",
+    divergences.len(),
+    divergences.join("\n  ")
   );
 }
