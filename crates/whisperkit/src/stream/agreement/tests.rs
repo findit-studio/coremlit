@@ -1,5 +1,8 @@
 use super::*;
-use crate::result::{TranscriptionResult, TranscriptionSegment, TranscriptionTimings, WordTiming};
+use crate::{
+  result::{TranscriptionResult, TranscriptionSegment, TranscriptionTimings, WordTiming},
+  task_facts::TaskFacts,
+};
 
 fn word(text: &str, start: f32, end: f32) -> WordTiming {
   WordTiming::new(text, vec![start as u32 + 1], start, end, 0.9)
@@ -297,4 +300,73 @@ fn omitting_a_confirmed_tied_word_does_not_drop_provisional_words() {
   for token in ["A", "B", "C", "D", "E"] {
     assert_eq!(text.matches(token).count(), 1, "{token} once in {text:?}");
   }
+}
+
+#[test]
+fn a_dropped_disagreeing_hypothesiss_draw_survives_into_finalize() {
+  // F1 (codex round 8). A three-hypothesis history where the MIDDLE hypothesis
+  // disagrees and is dropped from `results` (`:395-400`, skipAppend) but is
+  // retained as `prev_result` to CONTROL the next agreement comparison. Its
+  // unseeded draw decided which words R3 agreed on, so it must reach `finalize`'s
+  // reproducibility answer even though its segments never survive the merge.
+  //
+  // Mutation proof: remove the `ingested_facts` accumulation in `ingest` (or its
+  // merge in `finalize`) and the dropped R2's `Some(true)` draw vanishes -- the
+  // final record reads `Some(false)` and `is_reproducible()` flips true, failing
+  // the assertions below.
+  let r1 = result_with_words(vec![word(" And", 0.0, 0.4), word(" so", 0.4, 0.7)])
+    .with_task_facts(TaskFacts::observed_clean());
+  // R2 disagrees with R1 (no common prefix) AND drew from an unseeded sampler.
+  let r2 = result_with_words(vec![word(" But", 0.0, 0.4), word(" then", 0.4, 0.7)])
+    .with_task_facts(TaskFacts::observed_clean().with_drew_from_rng(true));
+  // R3 agrees with the retained R2 control hypothesis, advancing the watermark.
+  let r3 = result_with_words(vec![
+    word(" But", 0.0, 0.4),
+    word(" then", 0.4, 0.7),
+    word(" folks", 0.7, 1.0),
+  ])
+  .with_task_facts(TaskFacts::observed_clean());
+
+  let mut agreement = LocalAgreement::new();
+  assert!(agreement.ingest(r1).is_awaiting_agreement());
+  assert!(
+    agreement.ingest(r2).is_awaiting_agreement(),
+    "R2 disagrees with R1 and is dropped from results",
+  );
+  assert!(
+    agreement.ingest(r3).is_advanced(),
+    "R3 agrees with the retained R2 control hypothesis",
+  );
+
+  // R2 is absent from the kept results: only R1 (2 words) and R3 (3 words) remain.
+  assert_eq!(agreement.results_slice().len(), 2, "R2 was dropped");
+  assert_eq!(agreement.results_slice()[0].all_words().len(), 2, "R1 kept");
+  assert_eq!(
+    agreement.results_slice()[1].all_words().len(),
+    3,
+    "R3 kept -- the 2-word R2 is not here",
+  );
+
+  let options = crate::options::DecodingOptions::new();
+  let compute = crate::options::ComputeOptions::new();
+  let finalized = agreement.finalize(&options);
+  assert_eq!(
+    finalized.task_facts().drew_from_rng(),
+    Some(true),
+    "the dropped control hypothesis's unseeded draw survives into finalize",
+  );
+  assert!(
+    !crate::provenance::Provenance::for_result(&options, &compute, &finalized).is_reproducible(),
+    "an unseeded draw happened (in a dropped hypothesis), so it is not reproducible",
+  );
+  // A seed makes that same recovered draw replayable -- the promise becomes real.
+  assert!(
+    crate::provenance::Provenance::for_result(
+      &options.clone().with_seed(11),
+      &compute,
+      &finalized,
+    )
+    .is_reproducible(),
+    "a seed makes the recovered draw replayable",
+  );
 }

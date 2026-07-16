@@ -67,6 +67,7 @@ use crate::{
   error::TranscribeError,
   options::DecodingOptions,
   result::{TranscriptionResult, WordTiming, merge_transcription_results_with_words},
+  task_facts::TaskFactsAccumulator,
   text::{find_longest_common_prefix, find_longest_different_suffix},
   transcribe::WhisperKit,
 };
@@ -139,6 +140,17 @@ pub struct LocalAgreement {
   last_agreed_words: Vec<WordTiming>,
   confirmed_words: Vec<WordTiming>,
   results: Vec<TranscriptionResult>,
+  /// A sink for the reproducibility facts of EVERY ingested hypothesis —
+  /// including the disagreeing ones dropped from [`Self::results`] but retained
+  /// as [`Self::prev_result`] to CONTROL the next agreement comparison (codex
+  /// round 8, F1). The same error-drop-sink pattern the VAD branch uses: a
+  /// dropped hypothesis's unseeded draw (or callback truncation) still decided
+  /// which words the surviving hypotheses agreed on, so it must reach
+  /// [`Self::finalize`]'s reproducibility answer even though its segments never
+  /// survive into the merge. Only the draw/early-stop/language facts are folded
+  /// (the worker schedule and id span are stripped, so the merged result's own
+  /// — from the surviving results — are left intact).
+  ingested_facts: TaskFactsAccumulator,
 }
 
 impl Default for LocalAgreement {
@@ -161,6 +173,7 @@ impl LocalAgreement {
       last_agreed_words: Vec::new(),
       confirmed_words: Vec::new(),
       results: Vec::new(),
+      ingested_facts: TaskFactsAccumulator::new(),
     }
   }
 
@@ -335,6 +348,22 @@ impl LocalAgreement {
   /// becomes the new previous result for the next call (`:402`, outside
   /// the agreement `if`/`else` but still inside the has-words branch).
   pub fn ingest(&mut self, result: TranscriptionResult) -> AgreementOutcome {
+    // Accumulate THIS hypothesis's reproducibility facts BEFORE any gate or
+    // branch, so a hypothesis dropped from `results` on disagreement (:395-400,
+    // `skipAppend`) still contributes them to `finalize` (codex round 8, F1). It
+    // controlled which words the surviving hypotheses agreed on — a re-run that
+    // redraws its unseeded sample may land different confirmed text — so its draw
+    // must not vanish with its segments. Worker schedule and id span are stripped
+    // to `None`: those come from the SURVIVING results via the merge, and folding
+    // a dropped hypothesis's coordinate/span in would corrupt them.
+    self.ingested_facts.merge(
+      &result
+        .task_facts()
+        .clone()
+        .with_worker_schedule(None)
+        .with_decoded_span(None),
+    );
+
     // :371 gate — see this module's doc for "any segment" vs. Swift's
     // first-segment-only nil check.
     let has_words = result
@@ -399,11 +428,25 @@ impl LocalAgreement {
   /// with, so the merged segments honor
   /// [`DecodingOptions::drop_blank_audio`]'s id mapping (which the confirmed
   /// text override does not touch, but the segments still carry).
+  ///
+  /// The reproducibility facts of EVERY ingested hypothesis — including the
+  /// disagreeing ones dropped from [`Self::results_slice`] — are then folded
+  /// onto the merged record from `Self::ingested_facts` (codex round 8, F1),
+  /// so a dropped control hypothesis's unseeded draw or callback truncation is
+  /// not lost from the finalized transcript's reproducibility answer. Worker
+  /// schedule and id span were stripped at ingest, so this touches only the
+  /// draw/early-stop/language facts; the merged result's own schedule and span
+  /// (from the surviving results) are untouched.
   pub fn finalize(mut self, options: &DecodingOptions) -> TranscriptionResult {
     self.confirmed_words.append(&mut self.last_agreed_words);
     let suffix = find_longest_different_suffix(&self.prev_words, &self.hypothesis_words);
     self.confirmed_words.extend_from_slice(suffix);
-    merge_transcription_results_with_words(&self.results, &self.confirmed_words, options)
+    let mut merged =
+      merge_transcription_results_with_words(&self.results, &self.confirmed_words, options);
+    merged
+      .task_facts_mut()
+      .merge(&self.ingested_facts.into_facts());
+    merged
   }
 }
 
