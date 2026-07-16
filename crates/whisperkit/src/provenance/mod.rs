@@ -162,9 +162,10 @@ fn unanimous_temperature(segments: &[TranscriptionSegment]) -> Option<f32> {
 /// let decoding = DecodingOptions::new().with_language("en");
 /// let compute = ComputeOptions::new();
 ///
-/// // `0.0` here is the effective temperature the segment decoded at —
-/// // read it off `TranscriptionSegment::temperature()` in real use.
-/// let provenance = Provenance::from_options(&decoding, &compute, 0.0)
+/// // `0.0` is the effective temperature the segment decoded at, and `false`
+/// // the explicit draw fact (greedy at 0.0 never draws) — supply both from
+/// // the decode in real use, never inferring the draw from the temperature.
+/// let provenance = Provenance::from_options(&decoding, &compute, 0.0, false)
 ///   .with_model_id("openai_whisper-tiny")
 ///   .with_model_revision("a1b2c3d");
 ///
@@ -382,26 +383,31 @@ impl Provenance {
   /// can legitimately land on different temperatures. Pass
   /// [`TranscriptionSegment::temperature`] for the segment being recorded
   /// — or use [`Self::for_segment`], which does exactly that.
+  ///
+  /// `sampled_at_nonzero_temperature` is the **explicit** draw fact — whether
+  /// the decode actually drew from the token sampler — and is **never
+  /// inferred** from `effective_temperature` here. A temperature is not a
+  /// witness of a draw: a decode that ran zero sampling iterations (or only
+  /// the all-masked degenerate path) lands a non-zero temperature yet never
+  /// touched the RNG, so `effective_temperature != 0.0` would over-report it
+  /// as sampled and non-reproducible (F3, codex round 4). Options-and-a-
+  /// -temperature alone cannot observe the draw, so the caller — who ran the
+  /// decode — supplies the fact; a caller with only the configuration and no
+  /// decode to speak for should pass `false` and rely on [`DecodingOptions::seed`]
+  /// for the reproducibility answer. [`Self::for_result`] fills it from the
+  /// transcript's own carried flag instead.
   pub fn from_options(
     decoding: &DecodingOptions,
     compute: &ComputeOptions,
     effective_temperature: f32,
+    sampled_at_nonzero_temperature: bool,
   ) -> Self {
     Self::capture(
       decoding,
       compute,
       None,
       Some(effective_temperature),
-      // One decode at one temperature is all this constructor is told about,
-      // so that temperature IS the whole sampling history it can record.
-      // `for_result` is the form with a decode history to draw on.
-      //
-      // `!= 0.0`, not `> 0.0`: the sampler draws from the RNG for EVERY
-      // temperature its own `== 0.0` argmax branch does not catch — negative
-      // ones included — matching Swift's `temperature != 0.0`
-      // (`TokenSampler.swift:49,110,140`). `> 0.0` would call an unseeded
-      // negative-temperature draw "greedy" and hand it a false reproducibility.
-      effective_temperature != 0.0,
+      sampled_at_nonzero_temperature,
     )
   }
 
@@ -412,12 +418,26 @@ impl Provenance {
   /// Per-segment for the reason spelled out on [`Self::from_options`]:
   /// only the segment knows which rung of the fallback ladder its decode
   /// was accepted at. For the whole transcript, use [`Self::for_result`].
+  ///
+  /// `sampled_at_nonzero_temperature` stays an **explicit** argument rather
+  /// than being read off the segment: a [`TranscriptionSegment`] carries its
+  /// temperature but not the draw fact, and the two come apart (a
+  /// zero-iteration decode lands a non-zero-temperature segment that never
+  /// drew), so inferring it from `segment.temperature()` is exactly the F3
+  /// bug this constructor must not reintroduce. Only the caller that ran the
+  /// decode knows it.
   pub fn for_segment(
     decoding: &DecodingOptions,
     compute: &ComputeOptions,
     segment: &TranscriptionSegment,
+    sampled_at_nonzero_temperature: bool,
   ) -> Self {
-    Self::from_options(decoding, compute, segment.temperature())
+    Self::from_options(
+      decoding,
+      compute,
+      segment.temperature(),
+      sampled_at_nonzero_temperature,
+    )
   }
 
   /// The **result-level** capture: [`Self::from_options`]'s facts, plus the
@@ -487,27 +507,18 @@ impl Provenance {
       // `TranscriptionResult::language`'s Swift-compat `"en"` fallback.
       result.detected_language().map(str::to_string),
       unanimous_temperature(result.segments_slice()),
-      // Two sources, OR-ed, and the order matters less than the fact that
-      // neither can veto the other:
-      //
-      // - the decode path's own carried flag, which is the ONLY witness for
-      //   a window that sampled and then had its segments filtered away
-      //   (`TranscriptionResult::sampled_at_nonzero_temperature`); and
-      // - the surviving segments' temperatures, which catch a result
-      //   assembled by hand — `TranscriptionResult::new` starts the flag
-      //   `false`, so a caller who built a transcript out of segments the
-      //   pipeline sampled would otherwise get an unearned "reproducible".
-      //
-      // Monotone: evidence can only ever ADD sampling, never retract it, so
-      // no combination of the two can talk this predicate into optimism.
-      result.sampled_at_nonzero_temperature()
-        || result
-          .segments_slice()
-          .iter()
-          // `!= 0.0` mirrors the sampler's own `== 0.0` argmax branch (and
-          // Swift's `temperature != 0.0`): a surviving segment at a negative
-          // temperature was sampled too, not decoded greedily.
-          .any(|segment| segment.temperature() != 0.0),
+      // The draw fact comes ONLY from the carried flag, never inferred from a
+      // segment temperature (F3, codex round 4). The flag is the sampler's own
+      // `drew_from_rng`, accumulated across every attempt of every window
+      // (rejected included) before any filter could delete the window that
+      // sampled. A segment's temperature does NOT witness a draw: segment
+      // discovery copies the accepted rung into a segment even when ZERO
+      // sampling iterations ran (a `sample_length == 0` window at temperature
+      // 0.3 lands a 0.3-temperature segment that never drew), so OR-ing
+      // `segment.temperature() != 0.0` in reported a false "sampled" and a
+      // false non-reproducible. A caller assembling a result by hand owns the
+      // flag directly (`TranscriptionResult::maybe_sampled_at_nonzero_temperature`).
+      result.sampled_at_nonzero_temperature(),
     )
   }
 
@@ -529,7 +540,7 @@ impl Provenance {
   /// let decoding = DecodingOptions::new()
   ///   .maybe_drop_blank_audio(false)
   ///   .with_word_grouping(WordGrouping::SwiftParity);
-  /// let provenance = Provenance::from_options(&decoding, &ComputeOptions::new(), 0.0);
+  /// let provenance = Provenance::from_options(&decoding, &ComputeOptions::new(), 0.0, false);
   ///
   /// // Knobs the old projection dropped on the floor, now recorded:
   /// assert!(!provenance.decoding().drop_blank_audio());

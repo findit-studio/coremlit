@@ -109,7 +109,7 @@ fn provenance_records_every_decoding_option() {
   // differ, described by the same record.
   let compute = ComputeOptions::new();
   let baseline = DecodingOptions::new();
-  let baseline_record = Provenance::from_options(&baseline, &compute, 0.0);
+  let baseline_record = Provenance::from_options(&baseline, &compute, 0.0, false);
 
   for (field, mutate) in mutations() {
     let mutated = mutate(baseline.clone());
@@ -119,7 +119,7 @@ fn provenance_records_every_decoding_option() {
        below would prove nothing"
     );
 
-    let record = Provenance::from_options(&mutated, &compute, 0.0);
+    let record = Provenance::from_options(&mutated, &compute, 0.0, false);
     assert_ne!(
       record, baseline_record,
       "`{field}` is NOT represented in the provenance record: two runs \
@@ -140,7 +140,8 @@ fn drop_blank_audio_and_word_grouping_are_recorded() {
   // table above — they are the ones the old 11-of-30 projection dropped,
   // and both visibly change the transcript.
   let compute = ComputeOptions::new();
-  let record = |decoding: &DecodingOptions| Provenance::from_options(decoding, &compute, 0.0);
+  let record =
+    |decoding: &DecodingOptions| Provenance::from_options(decoding, &compute, 0.0, false);
 
   // `drop_blank_audio`: `true` yields "Hello World" / segment ids [0, 2];
   // `false` yields three segments including `[BLANK_AUDIO]`
@@ -208,12 +209,13 @@ fn every_decoding_option_survives_the_provenance_round_trip() {
   // the record would then quietly assert a check the run never performed.
   let compute = ComputeOptions::new();
   let baseline = DecodingOptions::new();
-  let baseline_json = serde_json::to_string(&Provenance::from_options(&baseline, &compute, 0.0))
-    .expect("baseline serializes");
+  let baseline_json =
+    serde_json::to_string(&Provenance::from_options(&baseline, &compute, 0.0, false))
+      .expect("baseline serializes");
 
   for (field, mutate) in mutations() {
     let mutated = mutate(baseline.clone());
-    let record = Provenance::from_options(&mutated, &compute, 0.0);
+    let record = Provenance::from_options(&mutated, &compute, 0.0, false);
 
     let json = serde_json::to_string(&record).expect("record serializes");
     assert_ne!(
@@ -257,7 +259,7 @@ fn distinctive_compute() -> ComputeOptions {
 fn from_options_captures_the_options_and_invents_nothing_else() {
   let decoding = distinctive_decoding();
   let compute = distinctive_compute();
-  let provenance = Provenance::from_options(&decoding, &compute, 0.6);
+  let provenance = Provenance::from_options(&decoding, &compute, 0.6, false);
 
   // The decode configuration, whole and verbatim -- one assertion, because
   // there is one field. (`provenance_records_every_decoding_option` above is
@@ -295,14 +297,14 @@ fn detect_language_reads_back_resolved_not_raw() {
   let prefilled = DecodingOptions::new();
   assert!(prefilled.use_prefill_prompt());
   assert!(
-    !Provenance::from_options(&prefilled, &compute, 0.0)
+    !Provenance::from_options(&prefilled, &compute, 0.0, false)
       .decoding()
       .detect_language()
   );
 
   let mut no_prefill = DecodingOptions::new();
   no_prefill.clear_use_prefill_prompt();
-  let provenance = Provenance::from_options(&no_prefill, &compute, 0.0);
+  let provenance = Provenance::from_options(&no_prefill, &compute, 0.0, false);
   assert!(
     provenance.decoding().detect_language(),
     "the resolved coupling, not the unset raw tri-state"
@@ -319,7 +321,7 @@ fn for_segment_reads_the_effective_temperature_off_the_segment() {
   let compute = ComputeOptions::new();
   let segment = TranscriptionSegment::new().with_temperature(0.4);
 
-  let provenance = Provenance::for_segment(&decoding, &compute, &segment);
+  let provenance = Provenance::for_segment(&decoding, &compute, &segment, false);
   assert_eq!(provenance.effective_temperature(), Some(0.4));
   assert_eq!(
     provenance.decoding().temperature(),
@@ -328,8 +330,8 @@ fn for_segment_reads_the_effective_temperature_off_the_segment() {
   );
   assert_eq!(
     provenance,
-    Provenance::from_options(&decoding, &compute, 0.4),
-    "for_segment is from_options with the segment's temperature"
+    Provenance::from_options(&decoding, &compute, 0.4, false),
+    "for_segment is from_options with the segment's temperature and draw fact"
   );
 }
 
@@ -348,6 +350,12 @@ fn result_at(language: &str, temperatures: &[f32]) -> TranscriptionResult {
   // `new` no longer seeds the observation from the display language (F3, codex
   // round 3), so model a result that genuinely OBSERVED `language`.
   .maybe_detected_language((!language.is_empty()).then(|| language.to_string()))
+  // Model the COMMON case: a window that landed on a non-zero temperature drew
+  // from the RNG. `for_result` reads THIS carried flag, never the segment
+  // temperatures (F3, codex round 4); the zero-iteration EXCEPTION -- a
+  // non-zero-temperature segment that never drew -- is exercised on its own in
+  // `for_result_reads_the_carried_flag_not_the_segment_temperature`.
+  .maybe_sampled_at_nonzero_temperature(temperatures.iter().any(|&t| t != 0.0))
 }
 
 #[test]
@@ -375,7 +383,7 @@ fn for_result_records_the_detected_language_not_the_configured_one() {
   );
   // Never inferred: without a result there is nothing to read it from.
   assert_eq!(
-    Provenance::from_options(&decoding, &compute, 0.0).detected_language(),
+    Provenance::from_options(&decoding, &compute, 0.0, false).detected_language(),
     None
   );
 }
@@ -461,16 +469,16 @@ fn is_reproducible_requires_greedy_or_a_seed() {
   let unseeded = DecodingOptions::new();
   let seeded = DecodingOptions::new().with_seed(7);
 
-  // Greedy (0.0) never draws from the sampler -> deterministic, seed or not.
-  assert!(Provenance::from_options(&unseeded, &compute, 0.0).is_reproducible());
-  assert!(Provenance::from_options(&seeded, &compute, 0.0).is_reproducible());
+  // Greedy (0.0, never drew) -> deterministic, seed or not.
+  assert!(Provenance::from_options(&unseeded, &compute, 0.0, false).is_reproducible());
+  assert!(Provenance::from_options(&seeded, &compute, 0.0, false).is_reproducible());
 
-  // Sampled: only a seed makes the draws replayable.
+  // Sampled (drew at 0.2): only a seed makes the draws replayable.
   assert!(
-    !Provenance::from_options(&unseeded, &compute, 0.2).is_reproducible(),
+    !Provenance::from_options(&unseeded, &compute, 0.2, true).is_reproducible(),
     "a fallback climb with no seed is not reproducible"
   );
-  assert!(Provenance::from_options(&seeded, &compute, 0.2).is_reproducible());
+  assert!(Provenance::from_options(&seeded, &compute, 0.2, true).is_reproducible());
 
   // A SPLIT ladder (None) is conservatively not reproducible without a
   // seed: the rungs only ascend, so a split means at least one segment
@@ -485,7 +493,7 @@ fn is_reproducible_requires_greedy_or_a_seed() {
 
 #[test]
 fn identity_uses_the_full_option_vocabulary() {
-  let base = Provenance::from_options(&DecodingOptions::new(), &ComputeOptions::new(), 0.0);
+  let base = Provenance::from_options(&DecodingOptions::new(), &ComputeOptions::new(), 0.0, false);
 
   let built = base
     .clone()
@@ -640,7 +648,7 @@ fn provenance_never_infers_the_vad_detector() {
 #[cfg(feature = "serde")]
 #[test]
 fn serde_round_trips_every_field() {
-  let full = Provenance::from_options(&distinctive_decoding(), &distinctive_compute(), 0.6)
+  let full = Provenance::from_options(&distinctive_decoding(), &distinctive_compute(), 0.6, false)
     .with_model_id("openai_whisper-tiny")
     .with_model_revision("a1b2c3d")
     .with_tokenizer_id("openai/whisper-tiny")
@@ -656,7 +664,7 @@ fn serde_round_trips_every_field() {
 fn unset_identity_serializes_as_absent_not_null() {
   // A provenance record must not claim a `null` model revision it never
   // knew: unset identity is ABSENT from the wire form entirely.
-  let bare = Provenance::from_options(&DecodingOptions::new(), &ComputeOptions::new(), 0.0);
+  let bare = Provenance::from_options(&DecodingOptions::new(), &ComputeOptions::new(), 0.0, false);
   let value: serde_json::Value = serde_json::to_value(&bare).unwrap();
   let object = value.as_object().unwrap();
 
@@ -816,112 +824,157 @@ fn for_result_reads_the_carried_sampling_fact_not_the_surviving_segments() {
 }
 
 #[test]
-fn a_hand_built_result_cannot_hide_a_sampled_segment() {
-  // `TranscriptionResult::new` starts the flag `false`, so a result the
-  // pipeline did not produce claims no sampling. The segment scan in
-  // `for_result` is what keeps that from becoming a free "reproducible":
-  // evidence can only ADD sampling, never retract it.
-  let compute = ComputeOptions::new();
-  let unseeded = DecodingOptions::new();
-
-  let hand_built = result_at("en", &[0.0, 0.2]);
-  assert!(
-    !hand_built.sampled_at_nonzero_temperature(),
-    "no decode path set the flag"
-  );
-  let record = Provenance::for_result(&unseeded, &compute, &hand_built);
-  assert!(
-    record.sampled_at_nonzero_temperature(),
-    "a VISIBLE sampled segment is evidence too"
-  );
-  assert!(!record.is_reproducible());
-}
-
-#[test]
-fn from_options_and_for_segment_record_their_own_temperature() {
+fn from_options_and_for_segment_record_the_explicit_draw_fact_not_the_temperature() {
+  // F3 (codex round 4). `from_options`/`for_segment` take the draw fact as an
+  // EXPLICIT argument and record it verbatim -- they never re-derive it from
+  // the temperature they are also handed. The two come apart: a zero-iteration
+  // decode lands a NON-zero-temperature segment that never drew, and a caller
+  // that ran it says so. The old `temperature != 0.0` inference would have
+  // called the 0.3 rows sampled and the 0.0-with-draw row greedy -- both wrong.
   let compute = ComputeOptions::new();
   let decoding = DecodingOptions::new();
 
+  // Non-zero temperature, explicit NO draw (the zero-iteration shape).
   assert!(
-    !Provenance::from_options(&decoding, &compute, 0.0).sampled_at_nonzero_temperature(),
-    "greedy: the sampler was never consulted"
+    !Provenance::from_options(&decoding, &compute, 0.3, false).sampled_at_nonzero_temperature(),
+    "an explicit no-draw at 0.3 is recorded as not sampled, not inferred from 0.3"
   );
-  assert!(Provenance::from_options(&decoding, &compute, 0.2).sampled_at_nonzero_temperature());
-
-  let sampled_segment = TranscriptionSegment::new().with_temperature(0.4);
+  // Zero temperature, explicit draw (proves no inference the other way either).
   assert!(
-    Provenance::for_segment(&decoding, &compute, &sampled_segment).sampled_at_nonzero_temperature()
+    Provenance::from_options(&decoding, &compute, 0.0, true).sampled_at_nonzero_temperature(),
+    "an explicit draw is recorded even at temperature 0.0"
+  );
+
+  // for_segment reads the segment's temperature but takes the draw fact
+  // explicitly: a 0.3 segment that never drew is not sampled.
+  let never_drew = TranscriptionSegment::new().with_temperature(0.3);
+  let record = Provenance::for_segment(&decoding, &compute, &never_drew, false);
+  assert_eq!(
+    record.effective_temperature(),
+    Some(0.3),
+    "the segment's rung is still recorded"
+  );
+  assert!(
+    !record.sampled_at_nonzero_temperature(),
+    "a 0.3 segment that never drew is not sampled -- for_segment must not infer from 0.3"
+  );
+  assert!(
+    Provenance::for_segment(&decoding, &compute, &never_drew, true)
+      .sampled_at_nonzero_temperature(),
+    "and an explicit draw on that same segment IS recorded"
   );
 }
 
 #[test]
-fn sampling_predicate_matches_the_samplers_nonzero_branch() {
-  // F2 (codex round 2). The token sampler argmax-decodes ONLY at exactly
+fn provenance_records_the_real_draw_fact_never_the_temperature() {
+  // F3 (codex round 4). The token sampler argmax-decodes ONLY at exactly
   // `temperature == 0.0` and draws from the RNG for every other value --
   // NEGATIVES included -- exactly as Swift's `temperature != 0.0` guard does
-  // (`TokenSampler.swift:49,110,140`). The reproducibility predicate must key
-  // on the same `!= 0.0`; the old `> 0.0` called an unseeded negative-temp
-  // draw "greedy" and thus reproducible, when a re-run redraws it.
-  //
-  // Mutation proof: restore any of the three predicates to `> 0.0` and the
-  // `-0.2` row's `sampled`/`is_reproducible` assertions fail.
+  // (`TokenSampler.swift:49,110,140`). The reproducibility fact keys on that
+  // REAL draw (`GreedyTokenSampler::drew_from_rng`), fed in explicitly, and is
+  // NEVER re-derived from the temperature: the two come apart for a
+  // zero-iteration decode, and a temperature-inferred fact would misreport it.
   let compute = ComputeOptions::new();
 
   for &temperature in &[-0.2f32, -0.0, 0.0, 0.2] {
-    // `-0.0 == 0.0` in IEEE, so the sampler's `== 0.0` arm catches it too;
-    // this expectation IS the sampler's branch, restated.
-    let samples = temperature != 0.0;
-
-    // The sampler's own branch agrees. At a temperature the `== 0.0` arm
-    // catches, decoding is argmax (index 1 of these logits) and never touches
-    // the RNG; the sampled temps may or may not land on argmax for a given
-    // draw, so only the greedy rows are pinned to a token. The logits are
-    // deliberately WIDE (`[-10, 10, ..]`): a narrow `[0, 1, 0.5]` never
-    // reaches the negative-temperature overflow regime the sampler's
-    // scale-then-softmax must survive (codex round 3, F1), so the `-0.2` row
-    // would pass here even against the pre-fix panic.
+    // Run the REAL sampler and read whether it actually drew. Wide logits
+    // (`[-10, 10, ..]`) keep the negative-temperature scale-then-softmax in
+    // range (codex round 3/4, F1); a narrow `[0, 1, 0.5]` would not.
     let mut sampler =
       crate::decode::sampler::GreedyTokenSampler::new(temperature, 99, &DecodingOptions::new());
     let token = sampler.sample(&[-10.0f32, 10.0, 0.5]).token();
-    if !samples {
+    let drew = sampler.drew_from_rng();
+    // `-0.0 == 0.0` in IEEE, so the sampler's `== 0.0` arm catches it too.
+    assert_eq!(
+      drew,
+      temperature != 0.0,
+      "temperature {temperature}: the sampler draws iff temperature != 0.0"
+    );
+    if !drew {
       assert_eq!(
         token, 1,
         "temperature {temperature} must decode greedily (argmax)"
       );
     }
 
-    // from_options predicate (`provenance/mod.rs`, `effective_temperature`).
-    let unseeded = Provenance::from_options(&DecodingOptions::new(), &compute, temperature);
+    // `from_options` records THAT fact verbatim -- never inferred from the
+    // temperature it is also handed.
+    let unseeded = Provenance::from_options(&DecodingOptions::new(), &compute, temperature, drew);
     assert_eq!(
       unseeded.sampled_at_nonzero_temperature(),
-      samples,
-      "temperature {temperature}: sampled flag must match the sampler's != 0.0 branch"
+      drew,
+      "temperature {temperature}: the recorded fact is the explicit draw"
     );
     assert_eq!(
       unseeded.is_reproducible(),
-      !samples,
-      "unseeded temperature {temperature}: reproducible iff the sampler was never drawn"
+      !drew,
+      "unseeded temperature {temperature}: reproducible iff nothing was drawn"
     );
 
-    // A seed makes even a sampled draw replayable.
+    // A seed makes even a real draw replayable.
     assert!(
-      Provenance::from_options(&DecodingOptions::new().with_seed(7), &compute, temperature)
-        .is_reproducible(),
+      Provenance::from_options(
+        &DecodingOptions::new().with_seed(7),
+        &compute,
+        temperature,
+        drew
+      )
+      .is_reproducible(),
       "seeded temperature {temperature} replays exactly"
     );
-
-    // for_result's surviving-segment scan (the third predicate site).
-    assert_eq!(
-      Provenance::for_result(
-        &DecodingOptions::new(),
-        &compute,
-        &result_at("en", &[temperature])
-      )
-      .sampled_at_nonzero_temperature(),
-      samples,
-      "temperature {temperature}: for_result's segment scan must agree"
-    );
   }
+}
+
+#[test]
+fn for_result_reads_the_carried_flag_not_the_segment_temperature() {
+  // F3 (codex round 4). `for_result` takes the draw fact ONLY from the
+  // result's carried `sampled_at_nonzero_temperature`, never from a segment
+  // temperature. Segment discovery copies the accepted rung into a segment even
+  // when ZERO sampling iterations ran (a `sample_length == 0` window at 0.3
+  // lands a 0.3-temperature segment that never drew), so the old
+  // `segment.temperature() != 0.0` OR reported a false "sampled" and a false
+  // non-reproducible.
+  let compute = ComputeOptions::new();
+  let decoding = DecodingOptions::new();
+
+  // A result whose only segment is at 0.3, but whose carried flag is false:
+  // the exact shape of a zero-iteration decode.
+  let never_drew = TranscriptionResult::new(
+    "Hello world.",
+    vec![TranscriptionSegment::new().with_temperature(0.3)],
+    "en",
+    TranscriptionTimings::new(),
+  );
+  assert!(
+    !never_drew.sampled_at_nonzero_temperature(),
+    "the result itself carries no draw"
+  );
+  let record = Provenance::for_result(&decoding, &compute, &never_drew);
+  assert!(
+    !record.sampled_at_nonzero_temperature(),
+    "the 0.3 segment must NOT be read as a draw -- the carried flag is the only witness"
+  );
+  assert!(
+    record.is_reproducible(),
+    "nothing drew, so it is reproducible despite the 0.3 segment"
+  );
+
+  // The converse: a run that DID draw but whose surviving segments are all
+  // greedy (the blank-drop history) is still recorded as sampled and
+  // non-reproducible -- from the carried flag alone.
+  let drew_greedy_survivors = TranscriptionResult::new(
+    "Hello",
+    vec![TranscriptionSegment::new().with_temperature(0.0)],
+    "en",
+    TranscriptionTimings::new(),
+  )
+  .with_sampled_at_nonzero_temperature();
+  let record = Provenance::for_result(&decoding, &compute, &drew_greedy_survivors);
+  assert!(
+    record.sampled_at_nonzero_temperature(),
+    "a carried draw survives even when every remaining segment reads 0.0"
+  );
+  assert!(!record.is_reproducible());
 }
 
 #[cfg(feature = "serde")]
@@ -934,11 +987,11 @@ fn effective_temperature_non_finite_is_rejected_by_serde() {
   // refused on serialize instead; a finite record still round-trips.
   let compute = ComputeOptions::new();
   for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
-    let record = Provenance::from_options(&DecodingOptions::new(), &compute, bad);
+    let record = Provenance::from_options(&DecodingOptions::new(), &compute, bad, false);
     assert!(record.effective_temperature().is_some());
     assert!(serde_json::to_string(&record).is_err());
   }
-  let finite = Provenance::from_options(&DecodingOptions::new(), &compute, 0.7);
+  let finite = Provenance::from_options(&DecodingOptions::new(), &compute, 0.7, false);
   let json = serde_json::to_string(&finite).unwrap();
   assert_eq!(serde_json::from_str::<Provenance>(&json).unwrap(), finite);
 }

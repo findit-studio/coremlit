@@ -1333,6 +1333,37 @@ fn a_nonzero_temperature_that_never_samples_records_no_sampling() {
     "a zero-iteration decode never draws, whatever the temperature -- the old \
      `temperature != 0.0` inference wrongly recorded this window as sampled"
   );
+
+  // F3 (codex round 4). The lump-branch segment DID land at 0.3: segment
+  // discovery copies the accepted rung into the segment even though ZERO
+  // sampling iterations ran. This is the exact history the old
+  // `for_result` OR-ed `segment.temperature() != 0.0` on, reporting a false
+  // "sampled" and a false non-reproducible. `for_result` must now read only
+  // the carried draw fact -- no draw, so no sampling and reproducible, despite
+  // the 0.3 segment sitting right there.
+  assert_eq!(
+    result.segments_slice().len(),
+    1,
+    "the zero-iteration window still lumps into one segment"
+  );
+  assert_eq!(
+    result.segments_slice()[0].temperature(),
+    0.3,
+    "the segment carries the accepted 0.3 rung, though nothing was drawn"
+  );
+  let provenance = crate::provenance::Provenance::for_result(
+    &options,
+    &crate::options::ComputeOptions::new(),
+    &result,
+  );
+  assert!(
+    !provenance.sampled_at_nonzero_temperature(),
+    "the 0.3 segment must not be read as a draw"
+  );
+  assert!(
+    provenance.is_reproducible(),
+    "a zero-iteration decode drew nothing, so it is reproducible despite the 0.3 segment"
+  );
 }
 
 #[test]
@@ -1511,5 +1542,58 @@ fn a_greedy_run_stays_reproducible_through_the_drop() {
     )
     .is_reproducible(),
     "an empty greedy transcript reproduces exactly"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn unseeded_draw_survives_an_errored_vad_chunk_drop() {
+  // F3 (codex round 4), the loss path. A VAD chunk decodes at a non-zero
+  // temperature (drawing from an unseeded RNG), then a later decode step
+  // errors, so its whole `run` errors and `WhisperKit::transcribe`'s VAD branch
+  // DROPS it. The draw fact must still reach the merged transcript:
+  // `decode_with_fallback` captures it BEFORE the error can propagate, into a
+  // sink the VAD branch owns across chunks. Pre-fix the errored chunk's draw
+  // was read only AFTER `?`, so it vanished with the dropped chunk and the
+  // empty merged result claimed a byte-reproducibility a re-run (which redraws
+  // that chunk's unseeded sample, and may not error) could not honor.
+  let t = tiny_tokenizer();
+  let s = special();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(32_000));
+  // Call 1 (position 0's sample) draws at 0.2; call 2 errors, aborting the
+  // chunk after the draw already happened. `fail_on_call` counts decode_step
+  // calls across resets, and there is a single chunk here, so call 2 is that
+  // chunk's second step.
+  mock.push_token_steps(&[2425, 1002, 2425, 1002, s.end_token()]);
+  mock.fail_on_call(2);
+  let kit = WhisperKit::with_backend(mock, t);
+  let options = DecodingOptions::new()
+    .with_chunking_strategy(ChunkingStrategy::Vad)
+    .with_language("en") // no probe: keep the RNG accounting to the decode
+    .with_temperature(0.2);
+  assert_eq!(options.seed(), None, "unseeded is the default");
+
+  // 40_000 samples > one 32_000-sample window -> the VAD branch; no silence in
+  // the 0.1 (voiced) audio -> a single chunk of 32_000 samples. That chunk
+  // clears the 16_000-sample window padding, so it decodes one window, which
+  // draws (call 1) then errors (call 2) and is dropped, leaving an empty
+  // merged result.
+  let result = kit.transcribe(&vec![0.1; 40_000], &options).unwrap();
+  assert!(
+    result.segments_slice().is_empty(),
+    "the errored chunk was dropped, so nothing survives"
+  );
+  assert!(
+    result.sampled_at_nonzero_temperature(),
+    "the dropped chunk's unseeded draw must survive into the merged result"
+  );
+  assert!(
+    !crate::provenance::Provenance::for_result(
+      &options,
+      &crate::options::ComputeOptions::new(),
+      &result,
+    )
+    .is_reproducible(),
+    "an unseeded draw happened (in a dropped chunk), so the transcript is not reproducible"
   );
 }
