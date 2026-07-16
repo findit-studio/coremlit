@@ -291,13 +291,23 @@ own about the `All` configuration this crate actually ships by default, because
 
 The end-to-end DER gate therefore runs on **`All`, the shipping default**, and
 asserts (not merely reports) that the placement changes no diarization
-*decision*: for both sources, ΔDER(`All` − `CpuOnly`) against the reference is
-0.0000% and the speaker count is identical. The placement is genuinely exercised
-rather than silently falling back to CPU — the strict, no-collar frame-exact
-difference between the two placements is *non-zero* (0.12-0.29%), which an
-identical execution could not produce, while the collar-scored DER against the
-reference is unchanged. So the ANE's numerical drift is real but lands entirely
+*decision*. For both sources it asserts this **directly** — the two placements
+are scored against *each other* and not one standard-collar speaker-frame is
+labelled differently (`der_std(CpuOnly, All).err_units() == 0`) — and the
+speaker count is identical. That is strictly stronger than an equal
+distance-to-reference: `All` and `CpuOnly` being *equally far* from the
+reference would pass even if each erred on different frames, so the gate
+compares the placements to each other, not only to the reference. The placement
+is genuinely exercised rather than silently falling back to CPU — the strict,
+no-collar difference between the two placements is *non-zero* (0.12-0.29%),
+which an identical execution could not produce, while their collar-scored
+disagreement is 0.0000%. So the ANE's numerical drift is real but lands entirely
 inside the scoring collar: it moves span edges, not speakers.
+
+That pairwise-zero is reachable only because both placements score 0.0000%
+standard-collar DER against the reference on these 1-2 speaker clips (mutual
+exactness implies pairwise agreement); a nonzero-DER clip could expose a real
+decision change, which the gate would pin rather than absorb.
 
 Scope that claim honestly: it is measured on the 1-2 speaker clips. The
 ≥3-speaker gate runs `CpuOnly` (matched to `dia`-ort's CPU ONNX, which is what
