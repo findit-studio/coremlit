@@ -294,6 +294,36 @@ fn align_chunk_miss_error_returns_language_unsupported() {
   ));
 }
 
+#[test]
+fn resolve_binds_the_requested_language_and_reports_the_miss() {
+  // Empty registry: `resolve` binds the REQUESTED language, and `binding()`
+  // reports the miss policy as data — no aligner involved, so hermetic.
+  let set = AlignmentSetBuilder::new().build();
+  let handle = set.resolve(&Lang::Zh);
+  assert_eq!(handle.language(), &Lang::Zh);
+  assert_eq!(
+    handle.binding(),
+    AlignmentBinding::Miss {
+      fallback: AlignmentFallback::SkipChunk
+    }
+  );
+}
+
+#[test]
+fn handle_align_chunk_is_the_guarded_set_align_chunk() {
+  // The handle's `align_chunk` is `AlignmentSet::align_chunk` bound to the
+  // requested language: a SkipChunk miss returns empty words, exactly as the set
+  // method does, with no aligner touched (hermetic).
+  let set = AlignmentSetBuilder::new().build();
+  let clock = OutputClock::new(0, ANALYSIS_TIMEBASE, 0).expect("clock");
+  let abort = AtomicBool::new(false);
+  let result = set
+    .resolve(&Lang::Zh)
+    .align_chunk(&[], &[], "anything", clock, &abort, &[])
+    .expect("a SkipChunk miss is not an error");
+  assert!(result.words().is_empty());
+}
+
 // ---------------------------------------------------------------------
 // Model-gated: populated lookup / register / detect_oov need a real
 // Aligner, which loads the CoreML model (ALIGNKIT_TEST_MODELS). Same
@@ -333,10 +363,10 @@ fn lookup_hits_registered_language() {
     .register(AlignerKey::Lang(Lang::En), en_aligner())
     .build();
   assert_eq!(set.len(), 1);
-  match set.lookup(&Lang::En) {
-    AlignmentLookup::Hit { matched, .. } => assert_eq!(matched, AlignerKey::Lang(Lang::En)),
-    _ => panic!("expected Hit"),
-  }
+  // Internal lookup hits the language's own aligner (never the Any fallback).
+  assert!(matches!(set.lookup(&Lang::En), AlignmentLookup::Hit { .. }));
+  // The public handle reports the same resolution as DATA: an exact bind.
+  assert_eq!(set.resolve(&Lang::En).binding(), AlignmentBinding::Exact);
 }
 
 #[test]
