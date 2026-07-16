@@ -36,7 +36,9 @@ pub mod window;
 
 /// The runtime clustering config surface (design spec §Architecture): select a
 /// backend with [`ClusterBackend`] and tune the offline engine with
-/// [`OfflineOptions`]; [`extract::Extraction::diarize_with`] runs it. See
+/// [`OfflineOptions`] or the online engine with [`OnlineOptions`];
+/// [`extract::Extraction::diarize_with`] runs it (or
+/// [`extract::Extraction::diarize_online`] for the plda-free online engine). See
 /// [`cluster`] for the full surface.
 ///
 /// Removed re-export (was T1's): speakerkit no longer re-exports dia's
@@ -53,4 +55,4 @@ pub mod window;
 /// reach it through the `dia` dependency directly; a first-class batch mode, if
 /// ever wanted, would arrive as its own [`ClusterBackend`] variant with its own
 /// gates.
-pub use cluster::{ClusterBackend, OfflineOptions, ParseClusterBackendError};
+pub use cluster::{ClusterBackend, OfflineOptions, OnlineOptions, ParseClusterBackendError};

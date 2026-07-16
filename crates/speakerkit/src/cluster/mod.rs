@@ -6,15 +6,22 @@
 //! [`crate::extract::Extraction::diarize`] is the same thing at the default
 //! backend ([`ClusterBackend::default`]), the path every parity harness drives.
 //!
-//! # One engine today: `Offline`
+//! # Two engines: `Offline` and `Online`
 //!
-//! [`ClusterBackend`] is `#[non_exhaustive]` and carries exactly one variant so
-//! far — [`Offline`](ClusterBackend::Offline), which wraps dia's
-//! pyannote-community-1 offline pipeline
-//! ([`dia::offline::diarize_offline`]). The online (streaming) engine is a
-//! genuinely different algorithm class (a greedy centroid matcher, not
-//! AHC→VBx) and lands as its own variant in a later task; there is no
-//! not-yet-implemented stub variant here (honest surface: what compiles, runs).
+//! [`ClusterBackend`] is `#[non_exhaustive]` and carries two variants:
+//! - [`Offline`](ClusterBackend::Offline) wraps dia's pyannote-community-1
+//!   offline pipeline ([`dia::offline::diarize_offline`], AHC→VBx over
+//!   PLDA-projected embeddings) — the default, and the backend every DER parity
+//!   gate drives. Tuned by [`OfflineOptions`].
+//! - [`Online`](ClusterBackend::Online) wraps FluidAudio's greedy online
+//!   centroid matcher ([`dia::cluster::online::OnlineClusterer`]) — a genuinely
+//!   DIFFERENT algorithm class (streaming assign-as-you-go, not AHC→VBx):
+//!   order-dependent by design, matched on RAW cosine embeddings with NO PLDA,
+//!   and gated against FluidAudio's Swift `SpeakerManager` rather than pyannote
+//!   DER. Tuned by [`OnlineOptions`]; run via
+//!   [`crate::extract::Extraction::diarize_online`]. `#[non_exhaustive]`
+//!   remains for a future third engine — there is no stub variant (honest
+//!   surface: what compiles, runs).
 //!
 //! ## Which dia entry point `Offline` wraps (and which it does NOT)
 //!
@@ -410,6 +417,353 @@ impl OfflineOptions {
   }
 }
 
+// =====================================================================
+// Online engine options — FluidAudio SpeakerManager knobs, ported by dia's
+// `cluster::online::OnlineClusterOptions`. Mirror dia's contract 1:1 (defaults,
+// range predicates), then harden the serde boundary the same way OfflineOptions
+// does, so no OnlineOptions can drive dia's validating setters into a panic.
+// =====================================================================
+
+/// Default [`OnlineOptions::speaker_threshold`] — the assignment cosine
+/// DISTANCE a bare FluidAudio `SpeakerManager()` uses. Equals dia's
+/// [`dia::cluster::online::DEFAULT_SPEAKER_THRESHOLD`] (0.65), which ports
+/// `Clustering/SpeakerManager.swift:46`. A distance in `[0.0, 2.0]` (0
+/// identical … 2 antipodal), NOT a similarity.
+pub const DEFAULT_SPEAKER_THRESHOLD: f32 = 0.65;
+
+/// Default [`OnlineOptions::embedding_threshold`] — the centroid-update cosine
+/// distance a bare `SpeakerManager()` uses. Equals dia's
+/// [`dia::cluster::online::DEFAULT_EMBEDDING_THRESHOLD`] (0.45)
+/// (`Clustering/SpeakerManager.swift:47`).
+pub const DEFAULT_EMBEDDING_THRESHOLD: f32 = 0.45;
+
+/// Default [`OnlineOptions::min_speech_duration`] (seconds) — the minimum
+/// segment length to spawn a new speaker a bare `SpeakerManager()` uses. Equals
+/// dia's [`dia::cluster::online::DEFAULT_MIN_SPEECH_DURATION`] (1.0)
+/// (`Clustering/SpeakerManager.swift:48`).
+pub const DEFAULT_MIN_SPEECH_DURATION: f32 = 1.0;
+
+#[cfg(feature = "serde")]
+fn default_speaker_threshold() -> f32 {
+  DEFAULT_SPEAKER_THRESHOLD
+}
+#[cfg(feature = "serde")]
+fn default_embedding_threshold() -> f32 {
+  DEFAULT_EMBEDDING_THRESHOLD
+}
+#[cfg(feature = "serde")]
+fn default_min_speech_duration() -> f32 {
+  DEFAULT_MIN_SPEECH_DURATION
+}
+
+/// dia's `validate_threshold` predicate as a `const fn`: a finite cosine
+/// distance in `[0.0, 2.0]`. `v >= 0.0` rejects NaN and `-∞`; `v <= 2.0`
+/// rejects NaN, `+∞`, and any value past `cosine_distance`'s codomain — so no
+/// separate NaN clause is needed (unlike [`check_min_speech_duration`], whose
+/// upper bound is `+∞`). Matches the range dia's
+/// [`dia::cluster::online::OnlineClusterOptions`] threshold setters assert
+/// (`diarization/src/cluster/online/options.rs`), so a value passing this
+/// cannot panic dia's setter in [`OnlineOptions::to_dia_options`].
+#[inline]
+#[allow(clippy::manual_range_contains)] // const fn: RangeInclusive::contains is not const at MSRV.
+const fn check_online_threshold(v: f32) -> bool {
+  v >= 0.0 && v <= 2.0
+}
+
+/// dia's `validate_duration` predicate as a `const fn`: a finite, non-negative
+/// number of seconds. `v >= 0.0` rejects NaN and `-∞`; the explicit
+/// `!= f32::INFINITY` rejects `+∞` — hand-rolled with the `v != v` NaN idiom
+/// because `f32::is_finite` is not usable in a `const fn` at this crate's MSRV
+/// (the same reason [`check_min_duration_off`] is hand-rolled).
+#[inline]
+const fn check_min_speech_duration(v: f32) -> bool {
+  #[allow(clippy::eq_op)] // intentional NaN check: NaN != NaN by IEEE 754.
+  let not_nan = !(v != v);
+  not_nan && v >= 0.0 && v != f32::INFINITY
+}
+
+/// The error a non-finite / out-of-range online threshold raises at the `serde`
+/// boundary. dia's threshold setters PANIC outside `[0.0, 2.0]`; rejecting the
+/// same predicate here (and in the builder) means no serde-deserialized
+/// `OnlineOptions` can later panic dia in [`OnlineOptions::to_dia_options`].
+#[cfg(feature = "serde")]
+const ONLINE_THRESHOLD_MSG: &str = "online cluster threshold must be a finite cosine distance in \
+  [0.0, 2.0]; NaN, infinity, and out-of-range values are rejected";
+
+/// The error a non-finite / negative `min_speech_duration` raises at the
+/// `serde` boundary — the predicate dia's duration setter asserts.
+#[cfg(feature = "serde")]
+const ONLINE_DURATION_MSG: &str = "min_speech_duration must be a finite, non-negative float \
+  (seconds); NaN, infinity, and negative values are rejected";
+
+/// `serde` bridge for the two [`OnlineOptions`] cosine-distance thresholds:
+/// refuses a value outside a finite `[0.0, 2.0]` on BOTH sides of the boundary,
+/// mirroring [`finite_nonneg_f64`]. See [`ONLINE_THRESHOLD_MSG`].
+#[cfg(feature = "serde")]
+pub(crate) mod finite_threshold_f32 {
+  use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+  pub(crate) fn serialize<S: Serializer>(value: &f32, serializer: S) -> Result<S::Ok, S::Error> {
+    if !super::check_online_threshold(*value) {
+      return Err(serde::ser::Error::custom(super::ONLINE_THRESHOLD_MSG));
+    }
+    value.serialize(serializer)
+  }
+
+  pub(crate) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f32, D::Error> {
+    let value = f32::deserialize(deserializer)?;
+    if !super::check_online_threshold(value) {
+      return Err(serde::de::Error::custom(super::ONLINE_THRESHOLD_MSG));
+    }
+    Ok(value)
+  }
+}
+
+/// `serde` bridge for [`OnlineOptions::min_speech_duration`]: refuses a
+/// non-finite OR negative value on both sides — the exact predicate dia's
+/// duration setter asserts. See [`ONLINE_DURATION_MSG`].
+#[cfg(feature = "serde")]
+pub(crate) mod finite_nonneg_f32 {
+  use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+  pub(crate) fn serialize<S: Serializer>(value: &f32, serializer: S) -> Result<S::Ok, S::Error> {
+    if !super::check_min_speech_duration(*value) {
+      return Err(serde::ser::Error::custom(super::ONLINE_DURATION_MSG));
+    }
+    value.serialize(serializer)
+  }
+
+  pub(crate) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f32, D::Error> {
+    let value = f32::deserialize(deserializer)?;
+    if !super::check_min_speech_duration(value) {
+      return Err(serde::de::Error::custom(super::ONLINE_DURATION_MSG));
+    }
+    Ok(value)
+  }
+}
+
+/// Hyperparameters for the online (streaming) greedy centroid clusterer — the
+/// payload of [`ClusterBackend::Online`]. Mirrors, field-for-field, the three
+/// knobs FluidAudio's `SpeakerManager` assignment path consults, exactly as
+/// dia's [`dia::cluster::online::OnlineClusterOptions`] ports them; every
+/// default equals dia's, which equals FluidAudio's bare `SpeakerManager()` (the
+/// `cluster::online_defaults_equal_dia` pin reads dia's OWN
+/// `OnlineClusterOptions::default` accessors, so a drift on EITHER side fails to
+/// compile the assertion).
+///
+/// # Cosine space, no PLDA
+/// The online engine matches RAW L2-normalized WeSpeaker embeddings by cosine
+/// distance; the PLDA projection the offline pipeline applies has NO part here
+/// (design spec §Architecture point 3; dia's `cluster::online` module doc; T4's
+/// semantics table). The thresholds are therefore cosine DISTANCES in
+/// `[0.0, 2.0]`, and [`crate::extract::Extraction::diarize_online`] takes NO
+/// `plda` argument.
+///
+/// # The two thresholds gate different decisions
+/// - [`speaker_threshold`](Self::speaker_threshold): assignment — reuse the
+///   nearest existing speaker vs. spawn a new one (strict `<`).
+/// - [`embedding_threshold`](Self::embedding_threshold): centroid update —
+///   whether an assigned segment folds into the speaker's running centroid.
+///
+/// Because the update threshold is (by default) the smaller, there is a band
+/// `[embedding_threshold, speaker_threshold)` where a segment is assigned but
+/// does not move its centroid.
+///
+/// Composed per the rust-options-pattern: [`Self::new`] (a `const fn` equal to
+/// [`Default`]) is the single source of the defaults, with a getter / `with_*`
+/// builder / `set_*` in-place setter per knob. Unlike [`OfflineOptions`]'s
+/// unchecked `threshold`/`fa`/`fb` (which mirror dia's unchecked `OfflineInput`
+/// setters), ALL three online setters panic-validate — because dia's
+/// `OnlineClusterOptions` setters do, and [`Self::to_dia_options`] drives them.
+/// No `Eq`: the three `f32` knobs make it unsound, exactly as [`OfflineOptions`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct OnlineOptions {
+  #[cfg_attr(
+    feature = "serde",
+    serde(default = "default_speaker_threshold", with = "finite_threshold_f32")
+  )]
+  speaker_threshold: f32,
+  #[cfg_attr(
+    feature = "serde",
+    serde(default = "default_embedding_threshold", with = "finite_threshold_f32")
+  )]
+  embedding_threshold: f32,
+  #[cfg_attr(
+    feature = "serde",
+    serde(default = "default_min_speech_duration", with = "finite_nonneg_f32")
+  )]
+  min_speech_duration: f32,
+}
+
+impl Default for OnlineOptions {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl OnlineOptions {
+  /// Options matching dia's / FluidAudio's bare `SpeakerManager()` defaults:
+  /// [`DEFAULT_SPEAKER_THRESHOLD`] (0.65), [`DEFAULT_EMBEDDING_THRESHOLD`]
+  /// (0.45), and [`DEFAULT_MIN_SPEECH_DURATION`] (1.0) — each equal to
+  /// [`dia::cluster::online::OnlineClusterOptions`]'s own default for the same
+  /// knob.
+  ///
+  /// This is NOT the production `DiarizerManager` wiring, which derives the
+  /// thresholds from `clusteringThreshold = 0.7` as `0.84` / `0.56` — reproduce
+  /// that with [`Self::from_clustering_threshold`].
+  pub const fn new() -> Self {
+    Self {
+      speaker_threshold: DEFAULT_SPEAKER_THRESHOLD,
+      embedding_threshold: DEFAULT_EMBEDDING_THRESHOLD,
+      min_speech_duration: DEFAULT_MIN_SPEECH_DURATION,
+    }
+  }
+
+  /// Construct the way production `DiarizerManager` does
+  /// (`Core/DiarizerManager.swift:29,32`, via dia's
+  /// [`dia::cluster::online::OnlineClusterOptions::from_clustering_threshold`]):
+  /// from a single base `clusteringThreshold`, deriving `speaker_threshold =
+  /// base × 1.2` and `embedding_threshold = base × 0.8`. `min_speech_duration`
+  /// keeps its default. Passing `base = 0.7` reproduces the shipping FluidAudio
+  /// diarizer's thresholds (`0.84` / `0.56`).
+  ///
+  /// # Panics
+  /// Panics if either derived threshold is non-finite or outside `[0.0, 2.0]`
+  /// (e.g. `base > 1.666…` overflows `speaker_threshold` past `2.0`) — the same
+  /// predicate dia asserts.
+  #[must_use]
+  pub const fn from_clustering_threshold(base: f32) -> Self {
+    Self::new()
+      .with_speaker_threshold(base * 1.2)
+      .with_embedding_threshold(base * 0.8)
+  }
+
+  /// The assignment cosine-distance threshold. Fed to
+  /// [`dia::cluster::online::OnlineClusterOptions::with_speaker_threshold`] by
+  /// [`Self::to_dia_options`].
+  #[inline(always)]
+  pub const fn speaker_threshold(&self) -> f32 {
+    self.speaker_threshold
+  }
+  /// The centroid-update cosine-distance threshold. Fed to
+  /// [`dia::cluster::online::OnlineClusterOptions::with_embedding_threshold`].
+  #[inline(always)]
+  pub const fn embedding_threshold(&self) -> f32 {
+    self.embedding_threshold
+  }
+  /// The minimum new-speaker speech duration (seconds). Fed to
+  /// [`dia::cluster::online::OnlineClusterOptions::with_min_speech_duration`].
+  #[inline(always)]
+  pub const fn min_speech_duration(&self) -> f32 {
+    self.min_speech_duration
+  }
+
+  /// Builder form of [`Self::set_speaker_threshold`].
+  ///
+  /// # Panics
+  /// As [`Self::set_speaker_threshold`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_speaker_threshold(mut self, speaker_threshold: f32) -> Self {
+    self.set_speaker_threshold(speaker_threshold);
+    self
+  }
+  /// Sets [`Self::speaker_threshold`] in place.
+  ///
+  /// # Panics
+  /// Panics if `speaker_threshold` is NaN, `±∞`, or outside `[0.0, 2.0]` —
+  /// mirroring dia's [`dia::cluster::online::OnlineClusterOptions`] threshold
+  /// setter (a cosine distance has codomain `[0.0, 2.0]`). The serde boundary
+  /// rejects the same values (the crate-private `finite_threshold_f32` helper),
+  /// so no `OnlineOptions` ever reaches dia's assert.
+  #[inline(always)]
+  pub const fn set_speaker_threshold(&mut self, speaker_threshold: f32) -> &mut Self {
+    assert!(
+      check_online_threshold(speaker_threshold),
+      "speaker_threshold must be a finite cosine distance in [0.0, 2.0]"
+    );
+    self.speaker_threshold = speaker_threshold;
+    self
+  }
+  /// Builder form of [`Self::set_embedding_threshold`].
+  ///
+  /// # Panics
+  /// As [`Self::set_embedding_threshold`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_embedding_threshold(mut self, embedding_threshold: f32) -> Self {
+    self.set_embedding_threshold(embedding_threshold);
+    self
+  }
+  /// Sets [`Self::embedding_threshold`] in place.
+  ///
+  /// # Panics
+  /// Panics if `embedding_threshold` is NaN, `±∞`, or outside `[0.0, 2.0]` — as
+  /// [`Self::set_speaker_threshold`].
+  #[inline(always)]
+  pub const fn set_embedding_threshold(&mut self, embedding_threshold: f32) -> &mut Self {
+    assert!(
+      check_online_threshold(embedding_threshold),
+      "embedding_threshold must be a finite cosine distance in [0.0, 2.0]"
+    );
+    self.embedding_threshold = embedding_threshold;
+    self
+  }
+  /// Builder form of [`Self::set_min_speech_duration`].
+  ///
+  /// # Panics
+  /// As [`Self::set_min_speech_duration`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_min_speech_duration(mut self, min_speech_duration: f32) -> Self {
+    self.set_min_speech_duration(min_speech_duration);
+    self
+  }
+  /// Sets [`Self::min_speech_duration`] in place.
+  ///
+  /// # Panics
+  /// Panics if `min_speech_duration` is NaN, `±∞`, or negative — mirroring
+  /// dia's duration setter. The serde boundary rejects the same values (the
+  /// crate-private `finite_nonneg_f32` helper).
+  #[inline(always)]
+  pub const fn set_min_speech_duration(&mut self, min_speech_duration: f32) -> &mut Self {
+    assert!(
+      check_min_speech_duration(min_speech_duration),
+      "min_speech_duration must be finite and >= 0"
+    );
+    self.min_speech_duration = min_speech_duration;
+    self
+  }
+
+  /// Map these three knobs onto dia's
+  /// [`dia::cluster::online::OnlineClusterOptions`] — the input to
+  /// [`dia::cluster::online::OnlineClusterer::new`].
+  ///
+  /// The SINGLE place [`OnlineOptions`] maps onto dia's online options (one
+  /// `with_*` builder per knob, in field order), the online analogue of
+  /// [`OfflineOptions`]'s `apply_to`.
+  /// [`crate::extract::Extraction::diarize_online`] builds the clusterer from
+  /// this, and the out-of-crate Swift-trace oracle
+  /// (`tests/parity_online_swift.rs`) drives the engine through it — so the gate
+  /// exercises the REAL wiring, not a re-implementation of it. The
+  /// `online_to_dia_options_maps_each_knob` test pins each knob to its dia
+  /// field.
+  ///
+  /// Cannot panic dia's validating setters: every `OnlineOptions` field
+  /// satisfies dia's predicate (finite thresholds in `[0.0, 2.0]`, finite
+  /// non-negative duration), enforced at both this crate's builder and its
+  /// serde boundary. With [`Self::default`] the result equals
+  /// [`dia::cluster::online::OnlineClusterOptions::default`].
+  #[must_use]
+  pub fn to_dia_options(&self) -> dia::cluster::online::OnlineClusterOptions {
+    dia::cluster::online::OnlineClusterOptions::new()
+      .with_speaker_threshold(self.speaker_threshold)
+      .with_embedding_threshold(self.embedding_threshold)
+      .with_min_speech_duration(self.min_speech_duration)
+  }
+}
+
 /// Emits [`ClusterBackend`], its [`ClusterBackend::as_str`], and its
 /// [`FromStr`](core::str::FromStr) parser from ONE table of
 /// `Variant(Payload) => "spelling"` rows — the workspace golden-enum contract
@@ -481,9 +835,8 @@ macro_rules! define_cluster_backend {
 define_cluster_backend! {
   /// The runtime clustering engine selection (design spec §Architecture) — the
   /// backend [`crate::extract::Extraction::diarize_with`] runs. `#[non_exhaustive]`
-  /// because a second engine (streaming/online) is planned; match it with a
-  /// wildcard-free arm and the compiler will force that variant on you when it
-  /// lands.
+  /// because a THIRD engine may yet land; match it with a wildcard-free arm and
+  /// the compiler will force any future variant on you when it does.
   ///
   /// Golden-enum contract (workspace convention): stable snake_case
   /// [`Self::as_str`], derived [`Display`](core::fmt::Display), total
@@ -501,6 +854,16 @@ define_cluster_backend! {
     /// ([`dia::offline::diarize_offline`]), tuned by [`OfflineOptions`]. The
     /// default backend, and the one every DER parity gate drives.
     Offline(OfflineOptions) => "offline",
+    /// FluidAudio's greedy online centroid matcher
+    /// ([`dia::cluster::online::OnlineClusterer`]), tuned by [`OnlineOptions`].
+    /// A DIFFERENT algorithm class from [`Offline`](Self::Offline) (streaming
+    /// greedy assignment, not AHC→VBx): order-dependent by design, matched on
+    /// RAW cosine embeddings with NO PLDA, and gated against FluidAudio's Swift
+    /// `SpeakerManager` (never pyannote DER). Run it with
+    /// [`crate::extract::Extraction::diarize_online`], or via
+    /// [`diarize_with`](crate::extract::Extraction::diarize_with) — which
+    /// ignores its `plda` argument for this backend.
+    Online(OnlineOptions) => "online",
   }
 }
 
