@@ -517,6 +517,78 @@ fn drop_on_merge_still_panics_on_a_usize_max_segment_id() {
 }
 
 #[test]
+fn a_merge_created_span_never_undercounts_its_own_survivors() {
+  // F2 (codex round 9). A plain (drop-OFF) merge renumbers segments by
+  // `result_index + segment_index`, but the task-facts fold sums each child's
+  // EFFECTIVE span — and a child whose extent overflowed (a `usize::MAX`
+  // survivor) folds in as untracked, contributing zero. So the merged result
+  // carried a span BELOW the max id its own survivors hold: `[A(usize::MAX id, no
+  // span), B(id 0)]` reindexed to `[0, 1]` yet carried `Some(1)`, and a staged
+  // drop-ON re-merge trusting that too-small span renumbered `C` onto id 1 —
+  // `[0, 1, 1]`. The merge now clamps its stored span up to its own survivor
+  // extent, and the id-base advance distrusts a too-small span, so the
+  // intermediate never under-counts and the staged ids stay injective.
+  //
+  // Mutation proof: revert the merge-output clamp alone and the `>= 2` assertion
+  // fails at `Some(1)`; also revert `effective_decoded_span`'s `carried.max(extent)`
+  // and the staged ids collapse to `[0, 1, 1]`.
+  let mut a_seg = TranscriptionSegment::new();
+  a_seg.set_id(usize::MAX).set_text(" A").set_tokens(vec![20]);
+  let a = TranscriptionResult::new(" A", vec![a_seg], "en", TranscriptionTimings::new());
+  let mut b_seg = TranscriptionSegment::new();
+  b_seg.set_id(0).set_text(" B").set_tokens(vec![21]);
+  let b = TranscriptionResult::new(" B", vec![b_seg], "en", TranscriptionTimings::new());
+
+  // Plain (drop-OFF) merge: Swift-exact `result_index + segment_index` -> [0, 1].
+  let ab = merge_transcription_results(&[a, b]);
+  assert_eq!(segment_ids(&ab), vec![0, 1], "drop-OFF reindex");
+  assert!(
+    matches!(ab.task_facts().decoded_span(), Some(span) if span >= 2),
+    "the merged span never under-counts its own survivors (max id 1 + 1 = 2), got {:?}",
+    ab.task_facts().decoded_span(),
+  );
+
+  // A staged drop-ON re-merge with a trailing chunk stays injective.
+  let mut c_seg = TranscriptionSegment::new();
+  c_seg.set_id(0).set_text(" C").set_tokens(vec![22]);
+  let c = TranscriptionResult::new(" C", vec![c_seg], "en", TranscriptionTimings::new());
+  let staged = merge_transcription_results_with_options(&[ab, c], &DecodingOptions::new());
+  assert_eq!(
+    segment_ids(&staged),
+    vec![0, 1, 2],
+    "the trailing chunk sits past the merged survivors, not on id 1",
+  );
+}
+
+#[test]
+fn a_public_results_too_small_span_is_distrusted_at_merge_input() {
+  // F2 sibling (codex round 9). A PUBLIC result whose carried span is below its
+  // survivor extent — a hand-built or deserialized inconsistency — must not be
+  // trusted at merge INPUT: two survivors `[0, 1]` (extent 2) carrying a span of
+  // `Some(1)` would, if believed, advance the drop-ON id base by only 1 and
+  // renumber a trailing chunk onto id 1. `effective_decoded_span` now clamps up
+  // to the survivor extent, keeping the merge injective.
+  //
+  // Mutation proof: revert `effective_decoded_span` to trust the carried `Some`
+  // verbatim and the staged ids collapse to `[0, 1, 1]`.
+  let mut s0 = TranscriptionSegment::new();
+  s0.set_id(0).set_text(" R0").set_tokens(vec![20]);
+  let mut s1 = TranscriptionSegment::new();
+  s1.set_id(1).set_text(" R1").set_tokens(vec![21]);
+  let r = TranscriptionResult::new(" R0 R1", vec![s0, s1], "en", TranscriptionTimings::new())
+    .with_task_facts(TaskFacts::unknown().with_decoded_span(Some(1)));
+  let mut c_seg = TranscriptionSegment::new();
+  c_seg.set_id(0).set_text(" C").set_tokens(vec![22]);
+  let c = TranscriptionResult::new(" C", vec![c_seg], "en", TranscriptionTimings::new());
+  let staged = merge_transcription_results_with_options(&[r, c], &DecodingOptions::new());
+  assert_eq!(
+    segment_ids(&staged),
+    vec![0, 1, 2],
+    "a too-small carried span is clamped up to the survivor extent at merge input",
+  );
+}
+
+#[test]
 fn merging_an_unknown_facts_contributor_poisons_a_known_clean_result() {
   // F2 (codex round 8), at the merge boundary. `None` is the epistemic unknown,
   // NOT the OR identity: merging a contributor with genuinely-unknown

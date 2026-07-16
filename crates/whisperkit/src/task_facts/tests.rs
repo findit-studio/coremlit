@@ -269,6 +269,25 @@ fn merge_sums_the_decoded_span() {
 }
 
 #[test]
+fn merge_records_an_overflowing_span_as_untracked_not_saturated() {
+  // F2 (codex round 9). Summing two decoded spans that overflow `usize` records
+  // an honest untracked `None`, NOT a fabricated saturated `usize::MAX` a staged
+  // re-merge would then trust as a real ordinal count.
+  //
+  // Mutation proof: revert the sum to `Some(a.saturating_add(b))` and this reads
+  // back `Some(usize::MAX)`.
+  let overflowing = merged(
+    &TaskFacts::unknown().with_decoded_span(Some(usize::MAX)),
+    &TaskFacts::unknown().with_decoded_span(Some(1)),
+  );
+  assert_eq!(
+    overflowing.decoded_span(),
+    None,
+    "an overflowing span is untracked, not saturated to usize::MAX",
+  );
+}
+
+#[test]
 fn is_reproducible_under_is_conservative_on_the_explicit_unknown() {
   // F1 (codex round 6 post-consolidation). The bare `unknown()` — draw AND
   // truncation both unobserved — is NOT reproducible: a record that cannot know

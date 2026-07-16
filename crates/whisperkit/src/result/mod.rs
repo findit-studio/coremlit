@@ -2434,14 +2434,20 @@ pub fn merge_transcription_results_with_options(
 }
 
 /// The number of segment-id ordinals a result's decode **consumed** for the
-/// merge's id assignment: the carried [`TaskFacts::decoded_span`] when tracked,
-/// else the survivors' own extent — `max local id + 1`, or `0` when none
-/// survived — the fallback a hand-built or deserialized result (which carries no
-/// span) relies on. **`None` when the survivors' extent overflows `usize`** (a
-/// hand-built segment id at [`usize::MAX`]): the span is then unknowable, and a
-/// checked `None` lets the drop-OFF task-facts fold record an untracked span
-/// rather than panicking on a path that never needs the span for ids (codex
-/// round 8, F4).
+/// merge's id assignment: the **larger** of the carried [`TaskFacts::decoded_span`]
+/// and the survivors' own extent — `max local id + 1`, or `0` when none survived.
+/// A carried span legitimately EXCEEDS the extent when a filter dropped ordinals
+/// after allocating them (the whole reason it is carried), but a carried span
+/// BELOW the extent under-counts — a hand-built or deserialized inconsistency, or
+/// a merge whose fold under-counted — so the extent is the trusted floor, never
+/// blindly the carried `Some` (F2, codex round 9). A hand-built or deserialized
+/// result that carries no span relies on the extent outright.
+///
+/// **`None` when the survivors' extent overflows `usize`** (a hand-built segment
+/// id at [`usize::MAX`]): the span is then unknowable and no finite carried span
+/// can be trusted to cover it, so a checked `None` lets the drop-OFF task-facts
+/// fold record an untracked span rather than panicking on a path that never needs
+/// the span for ids (codex round 8, F4).
 ///
 /// This is the single definition both the id-base advance AND the task-facts
 /// fold consume, so the aggregate span the merged record STORES is exactly the
@@ -2453,21 +2459,25 @@ pub fn merge_transcription_results_with_options(
 /// panic, since there the span DOES drive an injective id mapping; see
 /// [`merge_transcription_results_with_options`]'s own `# Panics`.
 fn effective_decoded_span(result: &TranscriptionResult) -> Option<usize> {
-  match result.task_facts().decoded_span() {
-    Some(span) => Some(span),
-    // No carried span: the survivors' extent. Empty survivors are a KNOWN span
-    // of `0` (`None` max -> `Some(0)`), while an overflowing `max + 1` (a
-    // `usize::MAX` id) is genuinely unknowable and reported as `None` rather than
-    // panicking here (codex round 8, F4).
-    None => match result
-      .segments_slice()
-      .iter()
-      .map(TranscriptionSegment::id)
-      .max()
-    {
-      None => Some(0),
-      Some(max_local_id) => max_local_id.checked_add(1),
-    },
+  // The survivors' own extent — `max local id + 1`, `0` when none survived, and
+  // `None` when a `usize::MAX` survivor overflows it (genuinely unknowable).
+  let survivor_extent = match result
+    .segments_slice()
+    .iter()
+    .map(TranscriptionSegment::id)
+    .max()
+  {
+    None => Some(0),
+    Some(max_local_id) => max_local_id.checked_add(1),
+  };
+  match (result.task_facts().decoded_span(), survivor_extent) {
+    // A `usize::MAX` survivor: the extent is unknowable and no finite carried
+    // span can be trusted to cover it — `None`, so the drop-ON advance panics.
+    (_, None) => None,
+    // Trust the LARGER: the extent is the floor a carried `Some` may exceed but
+    // must never fall below (F2, codex round 9).
+    (Some(carried), Some(extent)) => Some(carried.max(extent)),
+    (None, Some(extent)) => Some(extent),
   }
 }
 
@@ -2697,7 +2707,23 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
         .with_decoded_span(effective_decoded_span(result)),
     );
   }
-  let task_facts = task_facts.into_facts();
+  let mut task_facts = task_facts.into_facts();
+  // F2 (codex round 9): the merged result's carried span must never fall below
+  // its OWN survivor extent. The fold sums each child's EFFECTIVE span, but on
+  // the drop-OFF path — where segments are renumbered by `result_index +
+  // segment_index`, not by the span — a child whose extent overflowed (a
+  // `usize::MAX` survivor) folds in as untracked and contributes zero, so the
+  // aggregate can land BELOW the max id these merged segments actually hold. A
+  // staged re-merge trusting that too-small span would renumber a later result
+  // onto these very survivors. Clamp a tracked span up to the extent; an
+  // untracked (`None`) span stays untracked — the survivors' extent is the
+  // re-merge fallback anyway, and an overflowed fold is honestly unknowable.
+  if let Some(folded) = task_facts.decoded_span()
+    && let Some(max_id) = segments.iter().map(TranscriptionSegment::id).max()
+    && let Some(extent) = max_id.checked_add(1)
+  {
+    task_facts = task_facts.with_decoded_span(Some(folded.max(extent)));
+  }
 
   TranscriptionResult::new(text, segments, language, timings).with_task_facts(task_facts)
 }

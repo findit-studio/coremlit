@@ -466,10 +466,13 @@ impl TaskFacts {
   ///   distinct from `[0, 1]` (R6-F2). An unknown (`None`) child is the
   ///   identity: it contributes no coordinates rather than poisoning the
   ///   schedule, which is what keeps the concatenation associative.
-  /// - **[`decoded_span`](Self::decoded_span)** — summed, so the merged result
-  ///   stores the aggregate ordinal count its children allocated (R6-F3). A
-  ///   `None` child contributes nothing; the sum is `None` only when every
-  ///   child is untracked.
+  /// - **[`decoded_span`](Self::decoded_span)** — summed with a **checked** add,
+  ///   so the merged result stores the aggregate ordinal count its children
+  ///   allocated (R6-F3). A `None` child contributes nothing; the sum is `None`
+  ///   when every child is untracked OR when it overflows `usize` — an
+  ///   overflowing sum is recorded as honest untracked rather than a fabricated
+  ///   saturated `usize::MAX` a staged re-merge would trust as a real count
+  ///   (F2, codex round 9).
   pub fn merge(&mut self, other: &Self) {
     self.drew_from_rng = kleene_or(self.drew_from_rng, other.drew_from_rng);
     self.early_stopped = kleene_or(self.early_stopped, other.early_stopped);
@@ -486,7 +489,10 @@ impl TaskFacts {
       (_, None) => {}
     }
     self.decoded_span = match (self.decoded_span, other.decoded_span) {
-      (Some(a), Some(b)) => Some(a.saturating_add(b)),
+      // Checked, NOT saturating (F2, codex round 9): an overflowing sum becomes
+      // an honest untracked `None`, never a fabricated `usize::MAX` that a staged
+      // re-merge would trust as a real ordinal count.
+      (Some(a), Some(b)) => a.checked_add(b),
       (some @ Some(_), None) | (None, some @ Some(_)) => some,
       (None, None) => None,
     };
