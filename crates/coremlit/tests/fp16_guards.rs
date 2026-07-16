@@ -366,6 +366,45 @@ impl Graph {
     parse_scalar(tok).or_else(|| self.consts.get(tok).copied())
   }
 
+  /// Resolves a token to a constant scalar, following `cast` producers. A
+  /// fp16 conversion routinely emits a guard constant as `const → cast` — an
+  /// fp32 literal cast to fp16 before it reaches an `add`/`maximum`/`clip`
+  /// guard operand — and the bare [`Graph::value`] stops at the `cast`, so the
+  /// guard's floor silently vanishes (the exact `const(1e-8) → cast →
+  /// add(count, eps) → real_div` hole a re-conversion can open). Tries the
+  /// direct literal/const first — identical to [`Graph::value`] on today's
+  /// tree, where every guard constant is a direct literal — then follows a
+  /// `cast` chain to its constant source. Depth-capped like [`Graph::floor`].
+  fn const_through_cast(&self, tok: Option<&str>, depth: u8) -> Option<f64> {
+    let tok = tok?;
+    if let Some(v) = self.value(Some(tok)) {
+      return Some(v);
+    }
+    if depth > 6 {
+      return None;
+    }
+    match self.producers.get(tok) {
+      Some(stmt) if stmt.op == "cast" => self.const_through_cast(arg(&stmt.args, "x"), depth + 1),
+      _ => None,
+    }
+  }
+
+  /// True when `operand`'s producer is a floor-contributing GUARD op
+  /// (`add`/`maximum`/`clip`) whose floor nonetheless did NOT resolve — the
+  /// graph structurally intends a floor here but its constant is unreadable
+  /// even through casts, so it is a hole to surface, not "no claim". Kept
+  /// distinct from a genuinely dynamic input (no producer, or a non-guard
+  /// producer like `real_div`/`sqrt`/`mul`/`reduce_*`/`scatter`), which stays
+  /// silent: that is what lets the shipped embedders' `sqrt(real_div(..))` std
+  /// sites and every `x / <dynamic>` divide avoid flooding the sweep with
+  /// false holes while a `count + <dynamic>` guard the reader cannot read is
+  /// still caught (see the `sqrt`/`real_div` arms of [`Graph::audit`]).
+  fn unreadable_floor_guard(&self, operand: Option<&str>) -> bool {
+    operand
+      .and_then(|v| self.producers.get(v))
+      .is_some_and(|stmt| matches!(stmt.op.as_str(), "add" | "maximum" | "clip"))
+  }
+
   /// The provable lower bound on the tensor `var`, and where it comes from.
   ///
   /// Returns `None` when nothing constant bounds it — a dynamic value this
@@ -378,17 +417,20 @@ impl Graph {
     let stmt = self.producers.get(var)?;
     match stmt.op.as_str() {
       "const" => self.consts.get(var).map(|v| (*v, format!("const({v:e})"))),
-      // `x + eps` — the classic explicit guard.
+      // `x + eps` — the classic explicit guard. The constant operand is
+      // resolved through any `cast` (a fp16 conversion casts an fp32 literal
+      // before adding it), not just direct literals/consts — see
+      // [`Graph::const_through_cast`].
       "add" => ["y", "x"]
         .iter()
-        .find_map(|k| self.value(arg(&stmt.args, k)))
+        .find_map(|k| self.const_through_cast(arg(&stmt.args, k), 0))
         .map(|c| (c, format!("add(+{c:e})"))),
       "clip" => self
-        .value(arg(&stmt.args, "alpha"))
+        .const_through_cast(arg(&stmt.args, "alpha"), 0)
         .map(|lo| (lo, format!("clip(alpha={lo:e})"))),
       "maximum" => ["y", "x"]
         .iter()
-        .find_map(|k| self.value(arg(&stmt.args, k)))
+        .find_map(|k| self.const_through_cast(arg(&stmt.args, k), 0))
         .map(|c| (c, format!("maximum({c:e})"))),
       // A softmax output can underflow to exactly 0 in fp16 long before
       // the log's epsilon is ever added — the decomposed-log_softmax trap.
@@ -440,15 +482,35 @@ impl Graph {
         // `sqrt` has no epsilon: it is a guard site only when something
         // constant floors its input. A genuinely dynamic input is no claim,
         // not a hole — its guard, if any, lives in a floor-contributing op
-        // whose own unreadability is caught at parse time.
-        "sqrt" => self
-          .floor(arg(&stmt.args, "x"), 0)
-          .map(|(f, g)| (0.0, f, g)),
+        // whose own unreadability is caught at parse time. But a
+        // floor-contributing GUARD op (`add`/`maximum`/`clip`) whose constant
+        // will NOT resolve — even through a `cast` — IS a hole: the graph
+        // structurally intends a floor here and the reader cannot read it, so
+        // it must FAIL the audit, not `.map`-drop into silence (the
+        // `const(1e-8) → cast → add → sqrt` shape a re-conversion can emit).
+        "sqrt" => match self.floor(arg(&stmt.args, "x"), 0) {
+          Some((f, g)) => Some((0.0, f, g)),
+          None => {
+            if self.unreadable_floor_guard(arg(&stmt.args, "x")) {
+              unresolved.push(unresolved_site(var, stmt));
+            }
+            None
+          }
+        },
         // A divide is a guard site when its DIVISOR is const-floored —
-        // the `x / (n + eps)` pooling shape.
-        "real_div" => self
-          .floor(arg(&stmt.args, "y"), 0)
-          .map(|(f, g)| (0.0, f, format!("denom:{g}"))),
+        // the `x / (n + eps)` pooling shape. An unreadable floor guard on the
+        // divisor is a hole for the same reason as `sqrt` above; a divisor with
+        // no readable floor and no guard-op producer is a genuinely dynamic
+        // divide, which stays "no claim".
+        "real_div" => match self.floor(arg(&stmt.args, "y"), 0) {
+          Some((f, g)) => Some((0.0, f, format!("denom:{g}"))),
+          None => {
+            if self.unreadable_floor_guard(arg(&stmt.args, "y")) {
+              unresolved.push(unresolved_site(var, stmt));
+            }
+            None
+          }
+        },
         _ => None,
       };
       if let Some((eps, floor, guard)) = site {
@@ -732,6 +794,39 @@ const NORM_WITH_UNRESOLVABLE_EPSILON: &str = r#"
             tensor<fp16, [1, 384, 1, 1500]> n_out = batch_norm(beta = n_beta, epsilon = n_eps_missing, gamma = n_gamma, mean = n_mean, variance = n_var, x = n_in)[name = tensor<string, []>("n_out")];
 "#;
 
+/// A pooling-divisor guard emitted as `const → cast → add → real_div` — the
+/// shape a coremltools re-conversion produces when it casts the fp32 epsilon
+/// literal to fp16 before adding it to the count. Every statement here parses,
+/// so NOTHING is unresolved at parse time; the `1e-8` floor is reachable ONLY
+/// by following the `cast` from the `add`'s operand to the const. Modeled on
+/// the real `WESPEAKER_POOLING` `count + 1e-8` guard with a `cast` interposed
+/// on the constant. Before the audit followed constants through `cast`,
+/// `floor(add)` missed the cast-wrapped const, the `real_div` `.map`-dropped to
+/// nothing, and this vanishing guard produced NEITHER a finding NOR an
+/// unresolved hole — it simply disappeared while any other recognized guard
+/// kept the sweep GREEN.
+const CAST_WRAPPED_POOLING_DIVISOR: &str = r#"
+            tensor<fp32, []> eps_fp32 = const()[name = tensor<string, []>("eps_fp32"), val = tensor<fp32, []>(0x1.5798eep-27)];
+            tensor<fp16, []> eps_fp16 = cast(dtype = fp16, x = eps_fp32)[name = tensor<string, []>("eps_fp16")];
+            tensor<fp16, [3, 1]> v1 = add(x = count_cast_fp16, y = eps_fp16)[name = tensor<string, []>("v1")];
+            tensor<fp16, [3, 2560]> mean = real_div(x = numer_cast_fp16, y = v1)[name = tensor<string, []>("mean")];
+"#;
+
+/// The same pooling-divisor shape, but the epsilon is DYNAMIC — computed (a
+/// `mul`), not a constant — so no `cast` chain reaches a literal. The `add`
+/// still structurally guards the divisor (`count + <something>`), so its
+/// unresolvable floor is a HOLE, not "no claim": the reader can see a guard it
+/// cannot read, and must surface the `real_div` as unresolved rather than
+/// `.map`-drop it into a silent pass. Contrast a genuinely dynamic divisor
+/// produced by a NON-guard op — the shipped embedders' `x / real_div(..)` and
+/// `sqrt(real_div(..))` std sites — which stays "no claim" and never lands
+/// here.
+const DYNAMIC_UNRESOLVABLE_DIVISOR: &str = r#"
+            tensor<fp16, [3, 1]> dyn_eps = mul(x = a_cast_fp16, y = b_cast_fp16)[name = tensor<string, []>("dyn_eps")];
+            tensor<fp16, [3, 1]> v1 = add(x = count_cast_fp16, y = dyn_eps)[name = tensor<string, []>("v1")];
+            tensor<fp16, [3, 2560]> mean = real_div(x = numer_cast_fp16, y = v1)[name = tensor<string, []>("mean")];
+"#;
+
 /// The vanishing guard sites of an already-audited graph, rendered and sorted
 /// as a **multiset** — duplicates PRESERVED. Two sites with the same signature
 /// are two defects, not one: a `dedup`/set here would let a reconversion that
@@ -980,6 +1075,56 @@ fn a_norm_with_an_unreadable_epsilon_is_a_hole_not_a_skip() {
       .iter()
       .any(|u| u.contains("batch_norm") && u.contains("n_out")),
     "...but it must be reported unresolved, quoting the statement — not dropped: {:?}",
+    audit.unresolved
+  );
+}
+
+/// Regression (completeness, cast-wrapped floor). A `const → cast → add →
+/// real_div` divisor guard must surface its `1e-8` site in `vanishing()`,
+/// exactly like the direct-const `WESPEAKER_POOLING`. Before the audit followed
+/// constants through `cast`, this chain — every statement of which parses —
+/// produced no finding and no unresolved hole: the vanishing guard disappeared
+/// while any other recognized guard kept the sweep green. MUTATION PROOF:
+/// reverting `Graph::floor`'s `add` arm from `const_through_cast` back to
+/// `value` loses the cast-wrapped floor and turns this assertion red — the
+/// pinned `real_div` site is no longer what `vanishing()` returns.
+#[test]
+fn follows_a_cast_wrapped_pooling_divisor_guard() {
+  assert_eq!(
+    vanishing(CAST_WRAPPED_POOLING_DIVISOR),
+    ["real_div/fp16 guard=denom:add(+9.99999993922529e-9) eff=9.99999993922529e-9"],
+    "a `count + cast(1e-8)` divisor guard must be caught THROUGH the cast, \
+     rendering identically to the direct-const wespeaker pooling guard"
+  );
+}
+
+/// Regression (completeness, dynamically-unresolvable floor). An `add`-guarded
+/// divisor whose epsilon will not resolve to a constant — even through casts —
+/// is a hole the audit must FAIL on, not a silent drop. The `real_div` here
+/// divides by `count + <dynamic>`: structurally a guard, unreadable in value.
+/// A genuinely dynamic divisor from a NON-guard op stays silent instead (see
+/// `DYNAMIC_UNRESOLVABLE_DIVISOR`). MUTATION PROOF: reverting the `real_div`
+/// arm from routing this to `unresolved` back to a bare `.map`-drop turns
+/// `unresolved` empty and this assertion red.
+#[test]
+fn an_unresolvable_add_guarded_divisor_is_a_hole_not_a_drop() {
+  let audit = parse_mil(DYNAMIC_UNRESOLVABLE_DIVISOR).audit();
+  assert!(
+    audit.findings.is_empty(),
+    "an unresolvable divisor guard yields no resolved finding, got: {:?}",
+    audit
+      .findings
+      .iter()
+      .map(Finding::render)
+      .collect::<Vec<_>>()
+  );
+  assert!(
+    audit
+      .unresolved
+      .iter()
+      .any(|u| u.contains("real_div") && u.contains("mean")),
+    "the unreadable `add`-guarded divisor must be surfaced as unresolved, quoting \
+     the statement — not dropped: {:?}",
     audit.unresolved
   );
 }
