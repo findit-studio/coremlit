@@ -425,6 +425,22 @@ pub(crate) const fn check_onset(v: f32) -> bool {
   not_nan && v > 0.0 && v <= 1.0
 }
 
+/// [`WindowOptions::step_samples`]'s validity predicate: `> 0` and `<=
+/// SEG_CHUNK_SAMPLES` — the exact invariant [`WindowOptions::set_step_samples`]
+/// asserts. Named here (mirroring [`check_onset`]) so the serde deserialize
+/// path can enforce the SAME rule the checked setter does, rather than
+/// bypassing it. A `step_samples > SEG_CHUNK_SAMPLES` opens silent audio gaps
+/// of `step - SEG_CHUNK_SAMPLES` samples between consecutive chunks that no
+/// window covers (see [`WindowOptions::set_step_samples`]'s own doc); `0` would
+/// hang [`chunk_starts`]'s `div_ceil`. `serde`-gated: it exists to hold the
+/// deserialize path to this invariant, and the builder setters carry their own
+/// (message-distinct) asserts, so nothing references it without `serde`.
+#[cfg(feature = "serde")]
+#[inline]
+const fn check_step_samples(v: u32) -> bool {
+  v > 0 && v <= SEG_CHUNK_SAMPLES as u32
+}
+
 /// Construction options for [`chunk_starts`] and (via
 /// [`chunk_sliding_window`]) [`count_from_segmentations`]
 /// (rust-options-pattern). Mirrors dia's `OwnedPipelineOptions`'s
@@ -433,13 +449,63 @@ pub(crate) const fn check_onset(v: f32) -> bool {
 /// validated ranges — but scoped to only the two fields this crate's
 /// pure-geometry layer needs (dia's clustering/reconstruction
 /// hyperparameters on that same options type have no analog here).
+///
+/// # Validated deserialization
+///
+/// `Deserialize` routes through a private `WindowOptionsRepr` via
+/// `serde(try_from)`, so a config-file or hand-written `WindowOptions` is held
+/// to the SAME `step_samples`/`onset` invariants the checked setters enforce.
+/// Deriving
+/// `Deserialize` directly on the fields would bypass [`Self::set_step_samples`]
+/// entirely: `{"step_samples":200000}` on 320 000 samples would deserialize
+/// silently and then produce windows `[0, 160000) + [200000, 360000)`, omitting
+/// `[160000, 200000)` — audio dropped with no error (L1). Invalid input now
+/// fails to deserialize instead.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(try_from = "WindowOptionsRepr"))]
 pub struct WindowOptions {
-  #[cfg_attr(feature = "serde", serde(default = "default_step_samples"))]
   step_samples: u32,
-  #[cfg_attr(feature = "serde", serde(default = "default_onset"))]
   onset: f32,
+}
+
+/// The plain wire form [`WindowOptions`]'s `Deserialize` deserializes FIRST
+/// (carrying the same field defaults), before [`WindowOptions::try_from`]
+/// applies the range checks. Its whole purpose is to make the validated
+/// setters unbypassable via serde (see [`WindowOptions`]'s "Validated
+/// deserialization" doc) — it is never constructed or exposed otherwise.
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+struct WindowOptionsRepr {
+  #[serde(default = "default_step_samples")]
+  step_samples: u32,
+  #[serde(default = "default_onset")]
+  onset: f32,
+}
+
+#[cfg(feature = "serde")]
+impl TryFrom<WindowOptionsRepr> for WindowOptions {
+  type Error = String;
+
+  /// Applies [`check_step_samples`] and [`check_onset`] — the exact invariants
+  /// [`WindowOptions::set_step_samples`]/[`WindowOptions::set_onset`] assert —
+  /// as fallible checks, so a serde-deserialized value can never construct the
+  /// audio-dropping geometry (or degenerate onset) the builders reject.
+  fn try_from(r: WindowOptionsRepr) -> Result<Self, Self::Error> {
+    if !check_step_samples(r.step_samples) {
+      return Err(format!(
+        "step_samples ({}) must be > 0 and <= SEG_CHUNK_SAMPLES ({SEG_CHUNK_SAMPLES})",
+        r.step_samples
+      ));
+    }
+    if !check_onset(r.onset) {
+      return Err(format!("onset ({}) must be finite in (0.0, 1.0]", r.onset));
+    }
+    Ok(Self {
+      step_samples: r.step_samples,
+      onset: r.onset,
+    })
+  }
 }
 
 impl Default for WindowOptions {
