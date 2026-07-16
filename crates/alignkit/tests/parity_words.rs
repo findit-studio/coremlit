@@ -134,8 +134,8 @@ mod common;
 
 use core::sync::atomic::AtomicBool;
 use std::{
-  ffi::{OsStr, OsString},
-  path::PathBuf,
+  ffi::{OsStr, OsString, c_void},
+  path::{Path, PathBuf},
   process::{Command, Stdio},
   time::{Duration, Instant},
 };
@@ -625,14 +625,15 @@ fn load_alignkit() -> Aligner {
 /// library up front and panic with something a human can act on.
 ///
 /// **Existence is not loadability** (F3). A file at the resolved path can still
-/// be a text file, a wrong-architecture dylib, or a library missing
-/// `OrtGetApiBase` — each passes an `is_file()` check and then hits the very
-/// deadlock above. So the preflight does not stop at existence: it actually
-/// `dlopen`s the library and resolves `OrtGetApiBase` — the entry point ort
-/// itself calls — in a CHILD PROCESS with a timeout
-/// ([`probe_ort_dylib_loadable`]), so a hanging loader kills the child instead of
-/// this test, and a load failure becomes a fast, actionable panic rather than a
-/// silent hang.
+/// be a text file, a wrong-architecture dylib, a library missing `OrtGetApiBase`,
+/// or a runtime too OLD to provide the API version ort needs — each passes an
+/// `is_file()` check and then hits the very deadlock above. So the preflight does
+/// not stop at existence: it actually `dlopen`s the library, resolves
+/// `OrtGetApiBase`, and CALLS it to confirm `GetApi` yields a usable `OrtApi` at
+/// the required version — the entry point ort itself calls — in a CHILD PROCESS
+/// with a timeout ([`probe_ort_dylib_loadable`]), so a hanging loader kills the
+/// child instead of this test, and any unusable runtime becomes a fast,
+/// actionable panic rather than a silent hang.
 ///
 /// The search mirrors what ort and dyld actually do: `ORT_DYLIB_PATH` if set,
 /// otherwise a bare `dlopen("libonnxruntime.dylib")`, which consults
@@ -684,9 +685,9 @@ fn assert_onnxruntime_is_resolvable() {
     OsString::from(LIB)
   };
 
-  // 2. Existence is not loadability (F3). Actually LOAD the library and resolve
-  //    `OrtGetApiBase`, in a child process with a timeout, and fail fast if ort
-  //    could not use it.
+  // 2. Existence is not loadability (F3). Actually LOAD the library, resolve
+  //    `OrtGetApiBase`, and CALL GetApi at the required version, in a child
+  //    process with a timeout, and fail fast if ort could not use it.
   if let Err(why) = probe_ort_dylib_loadable(&target) {
     panic!(
       "{} exists but ort cannot use it: {why}. ort resolves ONNX Runtime with a bare dlopen and, \
@@ -709,11 +710,43 @@ const PROBE_EXIT_LOAD_FAILED: i32 = 2;
 /// Child exit code: it loaded, but does not export `OrtGetApiBase` — so it is
 /// not ONNX Runtime.
 const PROBE_EXIT_NO_SYMBOL: i32 = 3;
+/// Child exit code: it loaded and exports `OrtGetApiBase`, but that entry
+/// point's `GetApi(`[`ORT_REQUIRED_API_VERSION`]`)` returned null — the runtime
+/// is too OLD to provide the `OrtApi` version ort was built against, so ort
+/// could not have used it either. This is the codex-round-5 gap: resolving the
+/// symbol without calling it accepted such a runtime, which then wedged ort's
+/// own init.
+const PROBE_EXIT_API_REJECTED: i32 = 4;
 
-/// Prove ONNX Runtime at `target` is LOADABLE — actually `dlopen` it and resolve
-/// the `OrtGetApiBase` symbol ort calls — in a CHILD PROCESS with a timeout, so a
-/// hanging loader kills the child rather than wedging this test. `Ok(())` iff the
-/// child loaded the library and found the symbol.
+/// The `ORT_API_VERSION` ort negotiates with the loaded runtime — the exact
+/// argument ort's `setup_api` passes to `OrtApiBase::GetApi`
+/// (`((*base).GetApi)(ort_sys::ORT_API_VERSION)`, ort `2.0.0-rc.12` `lib.rs`).
+///
+/// **= 24**, confirmed from source rather than assumed:
+/// - asry pins `ort = { … features = ["std", "ndarray", "load-dynamic",
+///   "api-24"] }` (asry `Cargo.toml`), and `parity-oracle` is the only path by
+///   which ort enters this build at all.
+/// - `api-24` transitively enables `ort-sys/api-17 … api-24`, and
+///   `ort_sys::ORT_API_VERSION` is `17 + V18 + … + V24`, each `Vn` being
+///   `cfg!(feature = "api-n") as u32` (ort-sys `version.rs`): `17 + 7 = 24`.
+/// - `api-24` is the highest `api-*` feature ort-sys `2.0.0-rc.12` defines, so
+///   24 is both the floor asry sets and the ceiling the crate can reach.
+///
+/// The probe must pass THIS number to `GetApi`: a runtime that supports a lower
+/// version but not this one is exactly the mismatch ort cannot survive. Should a
+/// future ort bump raise the required version, this must move with it — the
+/// real-dylib preflight (which requires `GetApi` non-null against the installed
+/// runtime) and
+/// [`preflight_rejects_a_dylib_that_refuses_the_required_api_version`] both fail
+/// loudly if it drifts.
+const ORT_REQUIRED_API_VERSION: u32 = 24;
+
+/// Prove ONNX Runtime at `target` is USABLE by ort — `dlopen` it, resolve
+/// `OrtGetApiBase`, and CALL it to confirm `GetApi(`[`ORT_REQUIRED_API_VERSION`]`)`
+/// returns a non-null `OrtApi` (the exact negotiation ort's `setup_api` performs)
+/// — in a CHILD PROCESS with a timeout, so a hanging loader kills the child
+/// rather than wedging this test. `Ok(())` iff the child loaded the library,
+/// found the symbol, AND the runtime supports the API version ort requires.
 ///
 /// The load runs in a re-exec of THIS test binary
 /// ([`ort_preflight_dlopen_child`]), so the `unsafe` `libloading` call is
@@ -749,6 +782,13 @@ fn probe_ort_dylib_loadable(target: &OsStr) -> Result<(), String> {
           Some(PROBE_EXIT_NO_SYMBOL) => {
             Err("loaded, but does not export OrtGetApiBase — not ONNX Runtime".to_owned())
           }
+          Some(PROBE_EXIT_API_REJECTED) => Err(format!(
+            "loaded and exports OrtGetApiBase, but GetApi({ORT_REQUIRED_API_VERSION}) returned \
+             null — this ONNX Runtime does not support the ORT_API_VERSION ort was built against \
+             (needs a runtime providing API {ORT_REQUIRED_API_VERSION}, e.g. ONNX Runtime >= \
+             1.{ORT_REQUIRED_API_VERSION}); ort would fail unrecoverably resolving this very API \
+             inside its init `Once`, so failing here instead"
+          )),
           Some(other) => Err(format!("the dlopen probe exited with status {other}")),
           None => Err("the dlopen probe was killed by a signal".to_owned()),
         };
@@ -770,10 +810,28 @@ fn probe_ort_dylib_loadable(target: &OsStr) -> Result<(), String> {
   }
 }
 
+/// Just enough of ONNX Runtime's `OrtApiBase` for the child probe: its FIRST
+/// field, `GetApi`, at offset 0. `#[repr(C)]` fixes that offset; the real
+/// struct's trailing fields (`GetVersionString`, …) are omitted because the
+/// probe only ever reads field 0 through a `*const OrtApiBase` and never handles
+/// the value by size. Mirrors `ort_sys::OrtApiBase`; `extern "C"` equals
+/// `ort_sys`' `extern "system"` on macOS (this crate's only target) and keeps
+/// the test free of an `ort_sys` dependency, which would drag ort into every
+/// build (see `Cargo.toml`).
+#[repr(C)]
+struct OrtApiBase {
+  /// `GetApi(version) -> *const OrtApi`; returns null when the runtime does not
+  /// support the requested `ORT_API_VERSION`. The result is only null-checked,
+  /// never dereferenced, so its pointee is elided to `c_void`.
+  get_api: unsafe extern "C" fn(u32) -> *const c_void,
+}
+
 /// The child half of [`probe_ort_dylib_loadable`], re-exec'd by it with
-/// [`ORT_PROBE_TARGET_ENV`] set: it `dlopen`s the target and resolves
-/// `OrtGetApiBase`, then exits with a status the parent reads. Absent that env
-/// var — i.e. in any ordinary `--ignored` run — it is a passing no-op.
+/// [`ORT_PROBE_TARGET_ENV`] set: it `dlopen`s the target, resolves
+/// `OrtGetApiBase`, and CALLS it to check that
+/// `GetApi(`[`ORT_REQUIRED_API_VERSION`]`)` is non-null, then exits with a status
+/// the parent reads. Absent that env var — i.e. in any ordinary `--ignored`
+/// run — it is a passing no-op.
 #[test]
 #[ignore = "internal ONNX Runtime dlopen-probe subprocess; a no-op unless re-exec'd by the parity preflight"]
 fn ort_preflight_dlopen_child() {
@@ -782,21 +840,43 @@ fn ort_preflight_dlopen_child() {
   };
   // SAFETY: loading an arbitrary dylib runs its initializers, which is why the
   // call is `unsafe` and why it runs in this short-lived CHILD process the parent
-  // kills on timeout. We only RESOLVE `OrtGetApiBase` below (never call it), so
-  // ort's own environment init — the code path that deadlocks — is never
-  // entered. The unsafe is confined to this test-crate helper; the alignkit
-  // library is unsafe-free.
+  // kills on timeout. The unsafe is confined to this test-crate helper; the
+  // alignkit library is unsafe-free.
   let library = match unsafe { libloading::Library::new(&target) } {
     Ok(library) => library,
     Err(_) => std::process::exit(PROBE_EXIT_LOAD_FAILED),
   };
-  // SAFETY: resolving a symbol by name; the returned pointer is never called, so
-  // no foreign code runs. Same child-process confinement as above.
-  let resolved = unsafe { library.get::<unsafe extern "C" fn()>(b"OrtGetApiBase\0") };
-  std::process::exit(if resolved.is_ok() {
-    0
+  // SAFETY: resolving `OrtGetApiBase` by name. The signature mirrors
+  // `ort_sys::OrtGetApiBase` — `extern "system"`, which is ABI-identical to
+  // `extern "C"` on macOS, this crate's only target. A missing symbol means this
+  // is not ONNX Runtime.
+  let get_api_base =
+    match unsafe { library.get::<unsafe extern "C" fn() -> *const OrtApiBase>(b"OrtGetApiBase\0") }
+    {
+      Ok(get_api_base) => get_api_base,
+      Err(_) => std::process::exit(PROBE_EXIT_NO_SYMBOL),
+    };
+  // SAFETY: `OrtGetApiBase` and `OrtApiBase::GetApi` are ONNX Runtime's own
+  // version-negotiation entry points — pure accessors that return static
+  // pointers and take no locks, so unlike ort's `setup_api` they cannot deadlock
+  // or run environment init. Calling them HERE, in the timeout-bounded child, is
+  // what makes the check safe: it reproduces ort's
+  // `((*base).GetApi)(ort_sys::ORT_API_VERSION)` (ort `lib.rs`) and, on a null
+  // result — the runtime refusing the required version — lets the parent fail
+  // fast instead of the real process unwrapping that null inside its API-init
+  // `Once`. A null base or a null `GetApi` result both mean "no usable OrtApi at
+  // the required version".
+  let api = unsafe {
+    let base = get_api_base();
+    if base.is_null() {
+      std::process::exit(PROBE_EXIT_API_REJECTED);
+    }
+    ((*base).get_api)(ORT_REQUIRED_API_VERSION)
+  };
+  std::process::exit(if api.is_null() {
+    PROBE_EXIT_API_REJECTED
   } else {
-    PROBE_EXIT_NO_SYMBOL
+    0
   });
 }
 
@@ -822,6 +902,136 @@ fn preflight_rejects_a_non_dylib_file() {
   assert!(
     err.contains("dlopen failed"),
     "expected a load failure for a non-dylib, got: {err}"
+  );
+}
+
+/// C source for a *loadable* dylib that impersonates ONNX Runtime's version
+/// negotiation but REFUSES the API version ort requires: its `OrtGetApiBase`
+/// returns a base whose `GetApi` yields non-null only for versions BELOW
+/// `REQUIRED_API_VERSION` (a `-D` define) and null at or above it — modelling a
+/// too-old runtime (e.g. ONNX Runtime 1.23 against ort's api-24). Returning
+/// non-null for a lower version is deliberate: it pins that the probe calls
+/// `GetApi` with the REQUIRED version, so a probe passing some lower version
+/// would wrongly accept this stub and fail the test.
+const API_REFUSING_STUB_C: &str = r#"
+#include <stdint.h>
+
+typedef struct OrtApiBase {
+  const void *(*GetApi)(uint32_t version);
+  const char *(*GetVersionString)(void);
+} OrtApiBase;
+
+static const char sentinel_api = 0;
+
+static const void *stub_get_api(uint32_t version) {
+  if (version < REQUIRED_API_VERSION) {
+    return (const void *)&sentinel_api;
+  }
+  return (const void *)0;
+}
+
+static const char *stub_get_version_string(void) {
+  return "0.0.0-alignkit-stub";
+}
+
+static const OrtApiBase base = { stub_get_api, stub_get_version_string };
+
+const OrtApiBase *OrtGetApiBase(void) {
+  return &base;
+}
+"#;
+
+/// C source for a *loadable* dylib that is NOT ONNX Runtime: it exports a marker
+/// but no `OrtGetApiBase`, so the probe must reach the "loaded, but does not
+/// export OrtGetApiBase" verdict — a path a non-dylib file (which fails at
+/// `dlopen`) can never exercise.
+const SYMBOLLESS_STUB_C: &str = r#"
+int alignkit_not_onnxruntime(void) {
+  return 0;
+}
+"#;
+
+/// Compiles `c_source` into a loadable dylib named `lib{name}.dylib` under `dir`
+/// and returns its path, applying each `-D{key}={value}` define.
+///
+/// The C compiler (`$CC`, else `cc`) ships with the Xcode Command Line Tools that
+/// building this crate already requires, and `cc -dynamiclib` is the lightest
+/// mechanism that yields a genuinely *loadable* Mach-O dylib — the only kind that
+/// exercises symbol and API-version resolution rather than just the
+/// `dlopen`-fails path — with no build script, no fixture crate, and no `unsafe`
+/// in this crate (the compile is a subprocess; the only FFI is the already-isolated
+/// child probe). Hermetic: source and output live under the caller's temp `dir`.
+fn compile_stub_dylib(dir: &Path, name: &str, c_source: &str, defines: &[(&str, &str)]) -> PathBuf {
+  let source = dir.join(format!("{name}.c"));
+  std::fs::write(&source, c_source).expect("write the stub C source");
+  let dylib = dir.join(format!("lib{name}.dylib"));
+  let compiler = std::env::var_os("CC").unwrap_or_else(|| OsString::from("cc"));
+
+  let mut command = Command::new(&compiler);
+  command.arg("-dynamiclib").arg("-o").arg(&dylib);
+  for (key, value) in defines {
+    command.arg(format!("-D{key}={value}"));
+  }
+  command.arg(&source);
+
+  let status = command.status().unwrap_or_else(|e| {
+    panic!("cannot run the C compiler {compiler:?} to build stub dylib {name}: {e}")
+  });
+  assert!(
+    status.success(),
+    "the C compiler failed to build stub dylib {name}"
+  );
+  assert!(
+    dylib.is_file(),
+    "stub dylib was not produced at {}",
+    dylib.display()
+  );
+  dylib
+}
+
+/// **F3 unit test.** The loadability validator REJECTS a *loadable* dylib that
+/// exports `OrtGetApiBase` but whose `GetApi` refuses the API version ort
+/// requires — the codex-round-5 gap: the old probe stopped at symbol resolution,
+/// so such a runtime sailed through the preflight and into ort's own
+/// unrecoverable init failure. Hermetic: a stub dylib compiled on the fly, no
+/// ONNX Runtime, no models — and NOT `#[ignore]`, so it runs wherever
+/// `parity-oracle` is built. Because the stub accepts every version BELOW
+/// [`ORT_REQUIRED_API_VERSION`] and refuses that one, it also pins that the probe
+/// negotiates the *correct* version, not merely some lower one.
+#[test]
+fn preflight_rejects_a_dylib_that_refuses_the_required_api_version() {
+  let dir = tempfile::tempdir().expect("create a temp dir");
+  let required = ORT_REQUIRED_API_VERSION.to_string();
+  let stub = compile_stub_dylib(
+    dir.path(),
+    "ort_api_refuse",
+    API_REFUSING_STUB_C,
+    &[("REQUIRED_API_VERSION", required.as_str())],
+  );
+
+  let err = probe_ort_dylib_loadable(stub.as_os_str())
+    .expect_err("a runtime refusing the required API version must be rejected");
+  assert!(
+    err.contains(&format!("GetApi({ORT_REQUIRED_API_VERSION})")),
+    "expected an API-version rejection naming GetApi({ORT_REQUIRED_API_VERSION}), got: {err}"
+  );
+}
+
+/// **F3 unit test.** The validator REJECTS a *loadable* dylib that is not ONNX
+/// Runtime — it loads but exports no `OrtGetApiBase`. Distinct from
+/// [`preflight_rejects_a_non_dylib_file`], which fails during `dlopen`: this
+/// proves the symbol-missing verdict on a dylib that genuinely loaded. Hermetic,
+/// and NOT `#[ignore]`.
+#[test]
+fn preflight_rejects_a_loadable_dylib_without_ort_get_api_base() {
+  let dir = tempfile::tempdir().expect("create a temp dir");
+  let stub = compile_stub_dylib(dir.path(), "not_onnxruntime", SYMBOLLESS_STUB_C, &[]);
+
+  let err = probe_ort_dylib_loadable(stub.as_os_str())
+    .expect_err("a loadable dylib that is not ONNX Runtime must be rejected");
+  assert!(
+    err.contains("does not export OrtGetApiBase"),
+    "expected a missing-symbol rejection, got: {err}"
   );
 }
 
