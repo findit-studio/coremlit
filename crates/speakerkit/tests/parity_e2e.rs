@@ -208,7 +208,9 @@ use std::{
 };
 
 use coremlit::ComputeUnits;
-use der_calc::{Seg, approx, der_std, der_strict, distinct_speakers, fmt_der, parse_rttm};
+use der_calc::{
+  Seg, approx, const_str_eq, der_std, der_strict, distinct_speakers, fmt_der, parse_rttm,
+};
 use speakerkit::{
   embed::{EmbedModel, EmbedModelOptions},
   extract::{Extraction, Options},
@@ -392,31 +394,24 @@ fn facts(name: &str) -> &'static FixtureFacts {
     .unwrap_or_else(|| panic!("{name}: not a fixture in FIXTURE_FACTS"))
 }
 
-/// The ≥3-speaker clips this suite GATES on (Part D), one `#[test]` each.
-///
-/// Chosen from the eight ≥3-speaker clips in [`FIXTURE_FACTS`] to span the
-/// speaker-count ladder — 3, 4, 7, 15 — at the lowest runtime that still
-/// covers it:
-///
-/// - `10_mrbeast_clean_water` (7): **the counterexample.** This is the clip
-///   that overturns §5.4; it must be in the gate forever.
-/// - `06_long_recording` (3): the MINIMAL ≥3 case — the boundary where the
-///   clustering decision stops being trivial — and the only non-MrBeast clip
-///   in the set, so the finding is not an artifact of one recording style.
-/// - `12_mrbeast_schools` (15): the richest reference in the corpus, i.e. the
-///   maximum stress AHC's fixed threshold can face here.
-/// - `14_mrbeast_strongman_robot` (4): fills the 3→7 gap.
-///
-/// The other four (`08`=3, `09`=8, `11`=6, `13`=11) are redundant in kind and
-/// would roughly double the CPU cost (they are the four longest clips), so they
-/// are documented in [`FIXTURE_FACTS`] but not gated. Adding one back is a
-/// three-line `#[test]` plus its [`DER_PINS`] row.
-const STRESS_FIXTURES: &[&str] = &[
-  "06_long_recording",
-  "10_mrbeast_clean_water",
-  "12_mrbeast_schools",
-  "14_mrbeast_strongman_robot",
-];
+/// One ≥3-speaker stress gate (Part D): the identity of a single per-clip
+/// `#[test]`, so the wrapper's NAME, the fixture it LOADS, and its speaker COUNT
+/// come from ONE row instead of three hand-maintained lists that can drift apart
+/// (codex r7 F1). The roster [`STRESS_GATES`] is declared by the `stress_gates!`
+/// macro below, which also emits each wrapper and a compile-time assertion that
+/// `test_name == stress_<fixture>_<count>_speakers`.
+struct StressGate {
+  /// The generated `#[test]` function name (`stringify!` of the wrapper ident).
+  test_name: &'static str,
+  /// The [`FIXTURE_FACTS`] key the wrapper feeds to [`stress_clip`] — the ONLY
+  /// place that name appears in the body, so the wrapper cannot load a clip
+  /// other than the one its name and count claim.
+  fixture: &'static str,
+  /// The reference speaker count encoded in [`StressGate::test_name`], re-checked
+  /// against `facts(fixture).ref_speakers` by
+  /// [`stress_gate_roster_is_consistent`].
+  count: usize,
+}
 
 /// The pyannote reference RTTM for a fixture, from the sibling `diarization`
 /// checkout (override root via `DIA_PARITY_FIXTURES`). Same three-levels-up
@@ -437,7 +432,7 @@ fn reference_rttm_path(name: &str) -> PathBuf {
 /// What they are NOT is multi-speaker coverage. Their references hold ONE and
 /// TWO speakers respectively ([`FIXTURE_FACTS`]) — the names are aspirational.
 /// Reading speaker coverage off those names is the mistake that produced spec
-/// §5.6; the ≥3-speaker stress is [`STRESS_FIXTURES`]' job, and no other test
+/// §5.6; the ≥3-speaker stress is [`STRESS_GATES`]' job, and no other test
 /// may claim it.
 const EXTRA_DIA_FIXTURES: &[&str] = &["04_three_speaker", "05_four_speaker"];
 
@@ -1326,7 +1321,7 @@ fn assert_pinned_fires_when_a_value_crosses_the_parity_bound() {
 /// the fixture, rather than some DER number silently becoming meaningless.
 ///
 /// It also asserts the property the ≥3-speaker gate depends on — that every
-/// [`STRESS_FIXTURES`] clip really does have ≥3 reference speakers. Without
+/// [`STRESS_GATES`] clip really does have ≥3 reference speakers. Without
 /// that, "we gate on multi-speaker audio" is a claim about filenames, which is
 /// precisely how §5.6 happened.
 #[test]
@@ -1352,11 +1347,12 @@ fn fixture_facts_match_the_corpus_on_disk() {
     );
   }
 
-  for &name in STRESS_FIXTURES {
+  for gate in STRESS_GATES {
+    let name = gate.fixture;
     let n = facts(name).ref_speakers;
     assert!(
       n >= 3,
-      "{name} is in STRESS_FIXTURES but its reference holds {n} speaker(s). The ≥3-speaker \
+      "{name} is in STRESS_GATES but its reference holds {n} speaker(s). The ≥3-speaker \
        gate would be testing easy audio while claiming otherwise — the exact §5.6 failure."
     );
   }
@@ -1596,7 +1592,7 @@ fn argmax_source_der_characterization() {
     assert!(
       ref_spk <= 2,
       "{name} has {ref_spk} reference speakers — this part scores the EASY half of the \
-       corpus. A ≥3-speaker clip belongs in STRESS_FIXTURES, where its argmax divergence is \
+       corpus. A ≥3-speaker clip belongs in STRESS_GATES, where its argmax divergence is \
        actually gated."
     );
 
@@ -2011,54 +2007,138 @@ fn stress_clip(name: &str) {
   assert_clip_pins(name, &dia, &fa_segs, &ax_segs, &reference);
 }
 
-/// **The counterexample** (7 reference speakers). argmax invents a spurious 8th
-/// speaker and scores 3.33 % DER — 33× the spec's 0.1 % bound — where BOTH
-/// faithful sources score 0.0000 % standard-collar DER on the same audio. That
-/// makes this the cleanest attribution in the corpus: nothing else varies.
-/// This single clip is what overturned §5.4's "the ~0.94 embedding divergence
-/// is benign" verdict, and it was in the repo the whole time — T7 simply never
-/// ran it, because it picked its "multi-speaker" clips by NAME
-/// (see [`FIXTURE_FACTS`]).
-#[test]
-#[ignore = "requires Models/speakerkit + Models/argmax-speakerkit + sibling diarization + ort"]
-fn stress_10_mrbeast_clean_water_7_speakers() {
-  stress_clip("10_mrbeast_clean_water");
-}
-
-/// The MINIMAL multi-speaker case (3 reference speakers), and the only
-/// non-MrBeast clip in the stress set — **the clip where argmax HOLDS.**
+/// Declares the ≥3-speaker stress gates from ONE roster (codex r7 F1).
 ///
-/// It is in the gate precisely because it does not fail: argmax lands 3 speakers
-/// and 0.0908 % DER, matching FluidAudio to 0.0037 % (all of it boundary MISS,
-/// zero confusion). That is what forbids the tidy rule "argmax breaks at ≥3
-/// speakers" — and it is why [`DER_PINS`] says the trigger is NOT isolated. It
-/// also means speaker count and recording domain are confounded across this set,
-/// since the one clean multi-speaker clip is also the one non-MrBeast one.
-/// Pinning a clean result is as load-bearing as pinning a broken one: if argmax
-/// ever starts failing here too, the picture changes and this fires.
-#[test]
-#[ignore = "requires Models/speakerkit + Models/argmax-speakerkit + sibling diarization + ort"]
-fn stress_06_long_recording_3_speakers() {
-  stress_clip("06_long_recording");
+/// Each row `name => "fixture" @ count;` expands to three things bound together,
+/// so the wrapper's identity and the clip it exercises can no longer drift apart:
+///
+/// 1. a `const _: () = assert!(…)` that fails to BUILD unless the function name
+///    is exactly `stress_<fixture>_<count>_speakers` — retargeting the body to a
+///    different clip means editing the `fixture` literal, which breaks this;
+/// 2. the `#[test] #[ignore]` wrapper itself, whose body feeds that SAME
+///    `fixture` literal to [`stress_clip`] (the only place it appears);
+/// 3. a [`StressGate`] row in [`STRESS_GATES`], the single roster the corpus
+///    guard and [`stress_gate_roster_is_consistent`] derive from.
+///
+/// Per-row `///` docs are forwarded to the generated wrapper.
+macro_rules! stress_gates {
+  ( $( $(#[$meta:meta])* $name:ident => $fixture:literal @ $count:literal ; )+ ) => {
+    $(
+      const _: () = assert!(
+        const_str_eq(
+          stringify!($name),
+          concat!("stress_", $fixture, "_", $count, "_speakers"),
+        ),
+        concat!(
+          "stress gate `", stringify!($name), "` disagrees with its fixture/count `",
+          $fixture, "` @ ", stringify!($count),
+          " — a wrapper name must be stress_<fixture>_<count>_speakers",
+        ),
+      );
+    )+
+    $(
+      $(#[$meta])*
+      #[test]
+      #[ignore = "requires Models/speakerkit + Models/argmax-speakerkit + sibling diarization + ort"]
+      fn $name() {
+        stress_clip($fixture);
+      }
+    )+
+    /// The ≥3-speaker stress roster (Part D): the single source the wrappers, the
+    /// corpus guard, and [`stress_gate_roster_is_consistent`] all derive from.
+    const STRESS_GATES: &[StressGate] = &[
+      $( StressGate { test_name: stringify!($name), fixture: $fixture, count: $count }, )+
+    ];
+  };
 }
 
-/// The richest reference in the corpus (15 speakers) — and the clip that shows
-/// the defect is **not** merely "an extra speaker": argmax gets the speaker count
-/// exactly RIGHT (15) and still misassigns 3.46 % of speech, all of it confusion.
-/// A gate that only watched the speaker count would have called this a pass.
-#[test]
-#[ignore = "requires Models/speakerkit + Models/argmax-speakerkit + sibling diarization + ort"]
-fn stress_12_mrbeast_schools_15_speakers() {
-  stress_clip("12_mrbeast_schools");
+// The ≥3-speaker clips this suite GATES on (Part D), chosen from the eight
+// ≥3-speaker clips in FIXTURE_FACTS to span the speaker-count ladder — 3, 4, 7,
+// 15 — at the lowest runtime that still covers it. The other four (`08`=3,
+// `09`=8, `11`=6, `13`=11) are redundant in kind and would roughly double the CPU
+// cost (they are the four longest clips), so they are documented in FIXTURE_FACTS
+// but not gated; adding one back is a single `stress_gates!` row plus its
+// DER_PINS entry.
+stress_gates! {
+  /// **The counterexample** (7 reference speakers). argmax invents a spurious 8th
+  /// speaker and scores 3.33 % DER — 33× the spec's 0.1 % bound — where BOTH
+  /// faithful sources score 0.0000 % standard-collar DER on the same audio. That
+  /// makes this the cleanest attribution in the corpus: nothing else varies.
+  /// This single clip is what overturned §5.4's "the ~0.94 embedding divergence
+  /// is benign" verdict, and it was in the repo the whole time — T7 simply never
+  /// ran it, because it picked its "multi-speaker" clips by NAME
+  /// (see [`FIXTURE_FACTS`]).
+  stress_10_mrbeast_clean_water_7_speakers => "10_mrbeast_clean_water" @ 7;
+
+  /// The MINIMAL multi-speaker case (3 reference speakers), and the only
+  /// non-MrBeast clip in the stress set — **the clip where argmax HOLDS.**
+  ///
+  /// It is in the gate precisely because it does not fail: argmax lands 3 speakers
+  /// and 0.0908 % DER, matching FluidAudio to 0.0037 % (all of it boundary MISS,
+  /// zero confusion). That is what forbids the tidy rule "argmax breaks at ≥3
+  /// speakers" — and it is why [`DER_PINS`] says the trigger is NOT isolated. It
+  /// also means speaker count and recording domain are confounded across this set,
+  /// since the one clean multi-speaker clip is also the one non-MrBeast one.
+  /// Pinning a clean result is as load-bearing as pinning a broken one: if argmax
+  /// ever starts failing here too, the picture changes and this fires.
+  stress_06_long_recording_3_speakers => "06_long_recording" @ 3;
+
+  /// The richest reference in the corpus (15 speakers) — and the clip that shows
+  /// the defect is **not** merely "an extra speaker": argmax gets the speaker count
+  /// exactly RIGHT (15) and still misassigns 3.46 % of speech, all of it confusion.
+  /// A gate that only watched the speaker count would have called this a pass.
+  stress_12_mrbeast_schools_15_speakers => "12_mrbeast_schools" @ 15;
+
+  /// Four reference speakers — and argmax's WORST clip by a wide margin: 5 speakers
+  /// and **9.29 % DER**, ~23× the faithful source on the same audio. It also carries
+  /// FluidAudio's worst parity (0.3948 %, over [`PARITY_DER_MAX`] — finding 2 in
+  /// [`DER_PINS`]), which is what makes it the corpus's sharpest clustering cliff:
+  /// a small perturbation moves assignments, a large one invents a speaker.
+  stress_14_mrbeast_strongman_robot_4_speakers => "14_mrbeast_strongman_robot" @ 4;
 }
 
-/// Four reference speakers — and argmax's WORST clip by a wide margin: 5 speakers
-/// and **9.29 % DER**, ~23× the faithful source on the same audio. It also carries
-/// FluidAudio's worst parity (0.3948 %, over [`PARITY_DER_MAX`] — finding 2 in
-/// [`DER_PINS`]), which is what makes it the corpus's sharpest clustering cliff:
-/// a small perturbation moves assignments, a large one invents a speaker.
+/// The stress roster is internally consistent and complete — hermetic (only the
+/// compiled-in [`FIXTURE_FACTS`]; no models, no fixtures), so it runs in the
+/// ordinary `--features dia` suite that CI and `der_gate_inventory.sh` execute.
+///
+/// Complements the compile-time name↔fixture↔count check in `stress_gates!` with
+/// the two ties a `const` assertion cannot make: each gate's encoded speaker
+/// count matches `facts(fixture).ref_speakers` (the RTTM-derived table), and the
+/// gated set is EXACTLY the four documented stress clips — so a gate silently
+/// dropped, added, or pointed at a clip whose real count differs turns this red.
 #[test]
-#[ignore = "requires Models/speakerkit + Models/argmax-speakerkit + sibling diarization + ort"]
-fn stress_14_mrbeast_strongman_robot_4_speakers() {
-  stress_clip("14_mrbeast_strongman_robot");
+fn stress_gate_roster_is_consistent() {
+  for g in STRESS_GATES {
+    assert_eq!(
+      g.test_name,
+      format!("stress_{}_{}_speakers", g.fixture, g.count),
+      "stress gate name disagrees with its fixture/count row"
+    );
+    assert_eq!(
+      facts(g.fixture).ref_speakers,
+      g.count,
+      "{}: the gate name encodes {} speakers but FIXTURE_FACTS (from the RTTM) says {}",
+      g.fixture,
+      g.count,
+      facts(g.fixture).ref_speakers
+    );
+    assert!(
+      g.count >= 3,
+      "{}: a stress gate must be a ≥3-speaker clip, not {}",
+      g.fixture,
+      g.count
+    );
+  }
+  let gated: Vec<&str> = STRESS_GATES.iter().map(|g| g.fixture).collect();
+  assert_eq!(
+    gated,
+    [
+      "10_mrbeast_clean_water",
+      "06_long_recording",
+      "12_mrbeast_schools",
+      "14_mrbeast_strongman_robot",
+    ],
+    "the ≥3-speaker stress selection moved — update this roster deliberately (and the \
+     der_gate_inventory.sh manifest), do NOT silently drop or retarget a gate"
+  );
 }

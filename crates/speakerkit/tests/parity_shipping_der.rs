@@ -151,7 +151,9 @@ mod der_calc;
 use std::{path::Path, time::Instant};
 
 use coremlit::ComputeUnits;
-use der_calc::{Der, Seg, der_std, der_strict, distinct_speakers, fmt_der, parse_rttm};
+use der_calc::{
+  Der, Seg, const_str_eq, der_std, der_strict, distinct_speakers, fmt_der, parse_rttm,
+};
 use speakerkit::{
   embed::{EmbedModel, EmbedModelOptions},
   extract::{Extraction, Options},
@@ -299,6 +301,40 @@ const MULTISPK_CORPUS: &[(&str, usize)] = &[
   ("13_mrbeast_saved_animals", 11),
   ("14_mrbeast_strongman_robot", 4),
 ];
+
+/// The [`MultiSpkClip`] row for `name`. Resolving a gated clip BY NAME kills the
+/// positional-index coupling the wrappers used to carry (codex r7 F1):
+/// `MULTI_SPEAKER_CLIPS[2]` says nothing about which clip index 2 is, so a table
+/// reorder silently retargeted a gate to different audio.
+///
+/// # Panics
+/// If `name` is not one of the gated clips.
+fn clip_by_name(name: &str) -> &'static MultiSpkClip {
+  MULTI_SPEAKER_CLIPS
+    .iter()
+    .find(|c| c.name == name)
+    .unwrap_or_else(|| panic!("{name}: not in MULTI_SPEAKER_CLIPS"))
+}
+
+/// The reference speaker count [`MULTI_SPEAKER_CLIPS`] records for `name`,
+/// evaluated in `const` context. The `shipping_der_gate!` count assertion uses it
+/// to tie each wrapper's `@ <count>` to the table — and thus, via
+/// [`shipping_clip_selection_is_the_documented_subset`], to the RTTM corpus — at
+/// compile time.
+///
+/// # Panics
+/// If `name` is not a gated clip: a wrapper for an un-selected clip is a build
+/// error, never a silently-skipped gate.
+const fn clip_ref_spk(name: &str) -> usize {
+  let mut i = 0;
+  while i < MULTI_SPEAKER_CLIPS.len() {
+    if const_str_eq(MULTI_SPEAKER_CLIPS[i].name, name) {
+      return MULTI_SPEAKER_CLIPS[i].ref_spk;
+    }
+    i += 1;
+  }
+  panic!("clip_ref_spk: name is not in MULTI_SPEAKER_CLIPS");
+}
 
 // ══════════════════════════════════════════════════════════════════════
 // Fixture / model resolution
@@ -921,65 +957,110 @@ fn gate(m: &Measurement) {
   }
 }
 
-/// 3 speakers, 977.7 s.
-#[test]
-#[ignore = "requires Models/speakerkit + sibling diarization ONNX/fixtures + ort"]
-fn shipping_int8_der_06_long_recording_3spk() {
-  gate(&measure(&MULTI_SPEAKER_CLIPS[0]));
-}
-
-/// 4 speakers, 1103.0 s. The clip where clustering sits nearest a decision
-/// boundary: the fp32 CoreML control already carries ~0.39 % confusion against
-/// dia-ort here BEFORE any quantization, and int8 adds a similar increment. The
-/// speaker count and the reference-agreement bound both still hold — see
-/// [`SHIPPING_CONFUSION_TRIPWIRE`].
-#[test]
-#[ignore = "requires Models/speakerkit + sibling diarization ONNX/fixtures + ort"]
-fn shipping_int8_der_14_mrbeast_strongman_robot_4spk() {
-  gate(&measure(&MULTI_SPEAKER_CLIPS[1]));
-}
-
-/// 7 speakers, 619.5 s — **the clip that caught the argmax source** (spurious
-/// 8th speaker, 3.33 % DER, 100 % confusion). The single most important row: on
-/// the precision axis (int8/CpuOnly vs the fp32/CpuOnly control, placement held
-/// constant) int8 clusters it IDENTICALLY — 0.0000 % standard DER, zero
-/// confusion, **asserted below** (`der_std(fp32, int8).err_units() == 0`, not
-/// one collar-scored frame differs) — and lands 7 speakers, despite carrying a
-/// *worse* embedding cosine than argmax does.
+/// Declares one shipping-int8 DER gate, binding the wrapper's NAME to the clip it
+/// LOADS (codex r7 F1). Two compile-time assertions gate each wrapper:
+/// [`const_str_eq`] proves the function name is exactly
+/// `shipping_int8_der_<fixture>_<count>spk[suffix]`, and [`clip_ref_spk`] proves
+/// `<count>` equals the fixture's speaker count in [`MULTI_SPEAKER_CLIPS`] (whose
+/// membership and counts are pinned to the RTTM corpus by
+/// [`shipping_clip_selection_is_the_documented_subset`]). The body resolves the
+/// clip BY NAME via [`clip_by_name`] — the fixture literal is the ONLY place the
+/// clip appears — so neither a positional-index reorder nor a name/fixture
+/// mismatch can slip through as a green gate over the wrong audio.
 ///
-/// Two precise caveats behind the word "identically", so it is not read as
-/// literal output identity: this is agreement on the *collar-scored* frames.
-/// At the no-collar `der_strict` level the two arms differ on ~6 sub-collar
-/// frames (0.0100 %), and the `int8/All` arm — which also folds in ANE
-/// placement — carries 0.0405 % against the fp32 control (still well inside
-/// [`gate`]). So the identity that is asserted is exactly the one measured:
-/// standard-collar `err_units == 0`, on the int8/CpuOnly precision arm.
-#[test]
-#[ignore = "requires Models/speakerkit + sibling diarization ONNX/fixtures + ort"]
-fn shipping_int8_der_10_mrbeast_clean_water_7spk() {
-  let m = measure(&MULTI_SPEAKER_CLIPS[2]);
-  gate(&m);
+/// A bare row `name : "fixture" @ count` gets the default `gate(&measure(…))`
+/// body. `=> |m| { … }` supplies a custom body with the [`Measurement`] bound to
+/// `m`; `+ "suffix"` extends the checked name (clip 09's `_known_defect`).
+macro_rules! shipping_der_gate {
+  ( $(#[$meta:meta])* $name:ident : $fixture:literal @ $count:literal ) => {
+    shipping_der_gate! {
+      $(#[$meta])* $name : $fixture @ $count + "" => |m| { gate(&m); }
+    }
+  };
+  ( $(#[$meta:meta])* $name:ident : $fixture:literal @ $count:literal
+    $(+ $suffix:literal)? => |$m:ident| $body:block ) => {
+    const _: () = assert!(
+      const_str_eq(
+        stringify!($name),
+        concat!("shipping_int8_der_", $fixture, "_", $count, "spk" $(, $suffix)?),
+      ),
+      concat!(
+        "shipping gate `", stringify!($name), "` disagrees with its fixture/count `",
+        $fixture, "` @ ", stringify!($count),
+        " — a wrapper name must be shipping_int8_der_<fixture>_<count>spk",
+      ),
+    );
+    const _: () = assert!(
+      clip_ref_spk($fixture) == $count,
+      concat!(
+        "shipping gate `", stringify!($name), "` encodes ", stringify!($count),
+        " speakers but MULTI_SPEAKER_CLIPS records a different count for `", $fixture, "`",
+      ),
+    );
+    $(#[$meta])*
+    #[test]
+    #[ignore = "requires Models/speakerkit + sibling diarization ONNX/fixtures + ort"]
+    fn $name() {
+      let $m = measure(clip_by_name($fixture));
+      $body
+    }
+  };
+}
 
-  // Clip-10-specific, the headline this test rests on: on the precision axis
-  // (int8/CpuOnly vs fp32/CpuOnly) int8 clusters this 7-speaker clip so that not
-  // one collar-scored frame differs. `gate()`'s G2/G3 only bound reference-
-  // agreement within ±1 pp / 2 % confusion, which would pass a regression all the way from EXACT
-  // agreement to ~0.9 % — so the "0.0000 % DER, zero confusion" claim is
-  // ASSERTED here, not merely documented. `gate(&m)` above already proved every
-  // arm clustered, so `segs()` cannot panic.
-  let precision = der_std(m.fp32.segs(), m.int8_cpu.segs());
-  assert_eq!(
-    precision.err_units(),
-    0,
-    "10: int8/CpuOnly no longer clusters IDENTICALLY to the fp32 control on the collar-scored \
-     frames ({} err units / {:.4}% standard DER, {} of them confusion) — the precision-isolated \
-     identity this test's headline rests on has regressed. This is the single clip proving a \
-     worse-than-argmax embedding cosine still clusters correctly; re-measure and update the doc \
-     + this assertion deliberately.",
-    precision.err_units(),
-    precision.der * 100.0,
-    precision.conf_units,
-  );
+shipping_der_gate! {
+  /// 3 speakers, 977.7 s.
+  shipping_int8_der_06_long_recording_3spk : "06_long_recording" @ 3
+}
+
+shipping_der_gate! {
+  /// 4 speakers, 1103.0 s. The clip where clustering sits nearest a decision
+  /// boundary: the fp32 CoreML control already carries ~0.39 % confusion against
+  /// dia-ort here BEFORE any quantization, and int8 adds a similar increment. The
+  /// speaker count and the reference-agreement bound both still hold — see
+  /// [`SHIPPING_CONFUSION_TRIPWIRE`].
+  shipping_int8_der_14_mrbeast_strongman_robot_4spk : "14_mrbeast_strongman_robot" @ 4
+}
+
+shipping_der_gate! {
+  /// 7 speakers, 619.5 s — **the clip that caught the argmax source** (spurious
+  /// 8th speaker, 3.33 % DER, 100 % confusion). The single most important row: on
+  /// the precision axis (int8/CpuOnly vs the fp32/CpuOnly control, placement held
+  /// constant) int8 clusters it IDENTICALLY — 0.0000 % standard DER, zero
+  /// confusion, **asserted below** (`der_std(fp32, int8).err_units() == 0`, not
+  /// one collar-scored frame differs) — and lands 7 speakers, despite carrying a
+  /// *worse* embedding cosine than argmax does.
+  ///
+  /// Two precise caveats behind the word "identically", so it is not read as
+  /// literal output identity: this is agreement on the *collar-scored* frames.
+  /// At the no-collar `der_strict` level the two arms differ on ~6 sub-collar
+  /// frames (0.0100 %), and the `int8/All` arm — which also folds in ANE
+  /// placement — carries 0.0405 % against the fp32 control (still well inside
+  /// [`gate`]). So the identity that is asserted is exactly the one measured:
+  /// standard-collar `err_units == 0`, on the int8/CpuOnly precision arm.
+  shipping_int8_der_10_mrbeast_clean_water_7spk : "10_mrbeast_clean_water" @ 7 => |m| {
+    gate(&m);
+
+    // Clip-10-specific, the headline this test rests on: on the precision axis
+    // (int8/CpuOnly vs fp32/CpuOnly) int8 clusters this 7-speaker clip so that not
+    // one collar-scored frame differs. `gate()`'s G2/G3 only bound reference-
+    // agreement within ±1 pp / 2 % confusion, which would pass a regression all the way from EXACT
+    // agreement to ~0.9 % — so the "0.0000 % DER, zero confusion" claim is
+    // ASSERTED here, not merely documented. `gate(&m)` above already proved every
+    // arm clustered, so `segs()` cannot panic.
+    let precision = der_std(m.fp32.segs(), m.int8_cpu.segs());
+    assert_eq!(
+      precision.err_units(),
+      0,
+      "10: int8/CpuOnly no longer clusters IDENTICALLY to the fp32 control on the collar-scored \
+       frames ({} err units / {:.4}% standard DER, {} of them confusion) — the precision-isolated \
+       identity this test's headline rests on has regressed. This is the single clip proving a \
+       worse-than-argmax embedding cosine still clusters correctly; re-measure and update the doc \
+       + this assertion deliberately.",
+      precision.err_units(),
+      precision.der * 100.0,
+      precision.conf_units,
+    );
+  }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -1130,66 +1211,65 @@ fn assert_clip09_der_value(tag: &str, d: Der, pinned: f64) {
   );
 }
 
-/// **Clip 09 (8 speakers, 1042.0 s) — a PINNED KNOWN DEFECT, not a passing gate.**
-///
-/// This clip cannot gate the int8 question, because the **fp32 control itself is
-/// broken on it**. Measured (two independent full runs, reproduced exactly —
-/// §5.9/§5.10):
-///
-/// - `dia-ort` (ONNX fp32): clusters fine, 8 speakers.
-/// - `fp32/CpuOnly` CoreML: **`diarize_offline` returns `Err`** — dia's typed
-///   `Pipeline(Centroid(AmbiguousAliveCluster { cluster: 13, value: 1.70e-7,
-///   threshold: 1e-7, lo: 5e-8, hi: 2e-7 }))`. dia refuses to decide whether a
-///   cluster is alive; the pipeline produces NO diarization at all.
-/// - `int8/CpuOnly`: clusters, finds **6** speakers (16.4590 % DER).
-/// - `int8/All` (the shipping default): clusters, finds **5** speakers
-///   (16.5904 % DER, 100 % confusion).
-/// - reference (pyannote 4.0.4): **8** speakers.
-///
-/// So on 8-speaker audio the CoreML path is defective *regardless of precision*
-/// — and int8 is not the culprit; it is the arm that still returns an answer.
-/// This is a real, separately-actionable defect (see the task report), and it is
-/// pinned here rather than deleted so it cannot be forgotten.
-///
-/// The assertion is on the KNOWN-BAD state, pinned field by field by
-/// [`assert_clip09_known_defect`]: clip identity, the reference and oracle counts,
-/// the fp32 control's TYPED `AmbiguousAliveCluster` bail-out, both int8 counts,
-/// and both int8 DERs (the shipping arm with its miss/FA/confusion
-/// decomposition). If ANY moves — most importantly if the CoreML path is fixed
-/// and the fp32 control starts clustering — **this test fails on purpose**, the
-/// signal to promote clip 09 into [`gate`]'s gated set and delete this test.
-/// (Every field's both-directions sensitivity is proven hermetically by
-/// [`clip09_known_defect_pins_every_field`].) It is deliberately NOT an
-/// unfalsifiable `println!` (the mistake `parity_e2e`'s Part B made, where a real
-/// 3.33 % DER failure still exits 0).
-#[test]
-#[ignore = "requires Models/speakerkit + sibling diarization ONNX/fixtures + ort"]
-fn shipping_int8_der_09_mrbeast_dollar_date_8spk_known_defect() {
-  let m = measure(&MULTI_SPEAKER_CLIPS[3]);
+shipping_der_gate! {
+  /// **Clip 09 (8 speakers, 1042.0 s) — a PINNED KNOWN DEFECT, not a passing gate.**
+  ///
+  /// This clip cannot gate the int8 question, because the **fp32 control itself is
+  /// broken on it**. Measured (two independent full runs, reproduced exactly —
+  /// §5.9/§5.10):
+  ///
+  /// - `dia-ort` (ONNX fp32): clusters fine, 8 speakers.
+  /// - `fp32/CpuOnly` CoreML: **`diarize_offline` returns `Err`** — dia's typed
+  ///   `Pipeline(Centroid(AmbiguousAliveCluster { cluster: 13, value: 1.70e-7,
+  ///   threshold: 1e-7, lo: 5e-8, hi: 2e-7 }))`. dia refuses to decide whether a
+  ///   cluster is alive; the pipeline produces NO diarization at all.
+  /// - `int8/CpuOnly`: clusters, finds **6** speakers (16.4590 % DER).
+  /// - `int8/All` (the shipping default): clusters, finds **5** speakers
+  ///   (16.5904 % DER, 100 % confusion).
+  /// - reference (pyannote 4.0.4): **8** speakers.
+  ///
+  /// So on 8-speaker audio the CoreML path is defective *regardless of precision*
+  /// — and int8 is not the culprit; it is the arm that still returns an answer.
+  /// This is a real, separately-actionable defect (see the task report), and it is
+  /// pinned here rather than deleted so it cannot be forgotten.
+  ///
+  /// The assertion is on the KNOWN-BAD state, pinned field by field by
+  /// [`assert_clip09_known_defect`]: clip identity, the reference and oracle counts,
+  /// the fp32 control's TYPED `AmbiguousAliveCluster` bail-out, both int8 counts,
+  /// and both int8 DERs (the shipping arm with its miss/FA/confusion
+  /// decomposition). If ANY moves — most importantly if the CoreML path is fixed
+  /// and the fp32 control starts clustering — **this test fails on purpose**, the
+  /// signal to promote clip 09 into [`gate`]'s gated set and delete this test.
+  /// (Every field's both-directions sensitivity is proven hermetically by
+  /// [`clip09_known_defect_pins_every_field`].) It is deliberately NOT an
+  /// unfalsifiable `println!` (the mistake `parity_e2e`'s Part B made, where a real
+  /// 3.33 % DER failure still exits 0).
+  shipping_int8_der_09_mrbeast_dollar_date_8spk_known_defect
+    : "09_mrbeast_dollar_date" @ 8 + "_known_defect" => |m| {
+    // The shipping int8 arms must still ANSWER to score their DER; a failure here is
+    // itself a regression (the shipping default went from "answers, undercounts" to
+    // "cannot answer"), reported before the DER pin so the numbers still print.
+    let (int8_cpu, int8_all) = match (&m.int8_cpu.segs, &m.int8_all.segs) {
+      (Ok(_), Ok(_)) => (m.int8_cpu.segs(), m.int8_all.segs()),
+      _ => panic!(
+        "09: an int8 arm now fails to cluster (cpu={:?}, all={:?}). The shipping default regressed \
+         from 'answers, but undercounts' to 'cannot answer at all' on 8-speaker audio.",
+        m.int8_cpu.segs.as_ref().err(),
+        m.int8_all.segs.as_ref().err(),
+      ),
+    };
 
-  // The shipping int8 arms must still ANSWER to score their DER; a failure here is
-  // itself a regression (the shipping default went from "answers, undercounts" to
-  // "cannot answer"), reported before the DER pin so the numbers still print.
-  let (int8_cpu, int8_all) = match (&m.int8_cpu.segs, &m.int8_all.segs) {
-    (Ok(_), Ok(_)) => (m.int8_cpu.segs(), m.int8_all.segs()),
-    _ => panic!(
-      "09: an int8 arm now fails to cluster (cpu={:?}, all={:?}). The shipping default regressed \
-       from 'answers, but undercounts' to 'cannot answer at all' on 8-speaker audio.",
-      m.int8_cpu.segs.as_ref().err(),
-      m.int8_all.segs.as_ref().err(),
-    ),
-  };
-
-  assert_clip09_known_defect(&Clip09Observed {
-    clip: m.clip,
-    ref_spk: m.ref_spk,
-    dia_spk: m.dia_spk,
-    fp32: &m.fp32.segs,
-    int8_cpu_spk: m.int8_cpu.spk(),
-    int8_all_spk: m.int8_all.spk(),
-    int8_cpu_der: der_std(&m.reference, int8_cpu),
-    int8_all_der: der_std(&m.reference, int8_all),
-  });
+    assert_clip09_known_defect(&Clip09Observed {
+      clip: m.clip,
+      ref_spk: m.ref_spk,
+      dia_spk: m.dia_spk,
+      fp32: &m.fp32.segs,
+      int8_cpu_spk: m.int8_cpu.spk(),
+      int8_all_spk: m.int8_all.spk(),
+      int8_cpu_der: der_std(&m.reference, int8_cpu),
+      int8_all_der: der_std(&m.reference, int8_all),
+    });
+  }
 }
 
 /// [`assert_clip09_known_defect`] pins EVERY field, in BOTH directions — proven
@@ -1442,7 +1522,9 @@ fn shipping_embedder_cost_int8_vs_fp32() {
   // A 120 s slice of the 7-speaker clip: long enough that per-chunk steady-state
   // cost dominates fixed overhead, short enough to run four configs twice.
   const BENCH_S: usize = 120;
-  let all = common::load_wav_16k_mono(&clip_audio_path(MULTI_SPEAKER_CLIPS[2].name));
+  let all = common::load_wav_16k_mono(&clip_audio_path(
+    clip_by_name("10_mrbeast_clean_water").name,
+  ));
   let samples = &all[..(BENCH_S * 16_000).min(all.len())];
   let audio_s = samples.len() as f64 / 16_000.0;
 
@@ -1671,8 +1753,7 @@ fn shipping_clip_selection_is_the_documented_subset() {
 #[test]
 #[ignore = "requires the sibling diarization parity fixtures (no models needed)"]
 fn clip09_content_pin_catches_an_audio_swap() {
-  let clip = &MULTI_SPEAKER_CLIPS[3];
-  assert_eq!(clip.name, "09_mrbeast_dollar_date", "index 3 is clip 09");
+  let clip = clip_by_name("09_mrbeast_dollar_date");
 
   let samples = common::load_wav_16k_mono(&clip_audio_path(clip.name));
   let fnv = common::fnv1a_f32(&samples);
