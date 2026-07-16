@@ -176,6 +176,54 @@ fn options_serde_partial_fields_default_the_rest() {
   assert_eq!(o.onset(), 0.3);
 }
 
+// L1: `Deserialize` must route through the SAME invariants the checked setters
+// enforce (`serde(try_from = WindowOptionsRepr)`), not bypass them. The derived
+// field-Deserialize let `{"step_samples":200000}` construct geometry that
+// silently drops the samples in `[SEG_CHUNK_SAMPLES, step)` of every chunk.
+
+#[cfg(feature = "serde")]
+#[test]
+fn options_serde_rejects_step_samples_exceeding_window() {
+  // The brief's exact witness: 200000 > SEG_CHUNK_SAMPLES (160000). On 320000
+  // samples this produced windows [0,160000)+[200000,360000), omitting
+  // [160000,200000). Must now fail to deserialize.
+  let r: Result<WindowOptions, _> = serde_json::from_str(r#"{"step_samples":200000,"onset":0.5}"#);
+  assert!(
+    r.is_err(),
+    "step_samples 200000 > SEG_CHUNK_SAMPLES must fail to deserialize, got {r:?}"
+  );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn options_serde_rejects_zero_step_samples() {
+  let r: Result<WindowOptions, _> = serde_json::from_str(r#"{"step_samples":0}"#);
+  assert!(
+    r.is_err(),
+    "step_samples 0 must fail to deserialize, got {r:?}"
+  );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn options_serde_rejects_out_of_range_onset() {
+  for bad in [r#"{"onset":0.0}"#, r#"{"onset":1.5}"#, r#"{"onset":-0.1}"#] {
+    let r: Result<WindowOptions, _> = serde_json::from_str(bad);
+    assert!(r.is_err(), "{bad} must fail to deserialize, got {r:?}");
+  }
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn options_serde_accepts_valid_boundary_values() {
+  // The deserialize path must be no stricter than the builders: `step ==
+  // SEG_CHUNK_SAMPLES` and `onset == 1.0` are both valid at the setter
+  // (`options_with_step_samples_equal_to_chunk_ok`, `options_with_onset_one_ok`).
+  let o: WindowOptions = serde_json::from_str(r#"{"step_samples":160000,"onset":1.0}"#).unwrap();
+  assert_eq!(o.step_samples(), 160_000);
+  assert_eq!(o.onset(), 1.0);
+}
+
 // ---------------------------------------------------------------------
 // chunk_starts: hand-computed geometry edge cases (brief Step 1)
 // ---------------------------------------------------------------------
