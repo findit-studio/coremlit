@@ -34,6 +34,13 @@
 # so dropping an `assert_pinned` clause left every documented command green while
 # a pin silently un-breached. Running the ordinary suite here turns that red.
 #
+# codex r7 F2 — EXECUTING the ordinary suite still only checked that SOME test
+# passed (`passed > 0`), which der_calc's seven always-present math units satisfy
+# on their own. DELETING a pin/mutation guard therefore stayed green. So each
+# binary now also carries an explicit REQUIRED-ORDINARY-name manifest
+# (`check_ordinary`), asserted present-and-not-`#[ignore]`d BEFORE the suite runs,
+# the ordinary-test analogue of the `#[ignore]`d-gate manifests below.
+#
 # Run from the workspace root: crates/speakerkit/tests/der_gate_inventory.sh
 # Kept a shell script (not a `cargo test`) on purpose: it must shell out to
 # `cargo`, which cannot nest inside a `cargo test` run without deadlocking on
@@ -105,6 +112,39 @@ run_ordinary() {
   return 0
 }
 
+# Assert each REQUIRED ORDINARY (non-`--ignored`) gate is (a) present in the
+# binary's full test list AND (b) absent from its ignored-only list — i.e. it is
+# a hermetic test `run_ordinary` will actually EXECUTE — BEFORE running the suite
+# (codex r7 F2). `run_ordinary` only checks that SOME test passed, so der_calc's
+# always-present DER-math units kept the count nonzero even after a pin/mutation
+# guard (`assert_pinned_...`, `clip09_known_defect_pins_every_field`) was DELETED
+# or accidentally `#[ignore]`d — the deletion the pins exist to prevent slipped
+# through green. Naming each falsifiability guard here turns that red. The names
+# mirror the ordinary gates the DER binaries compile; a deliberate rename must
+# update this manifest, so a guard cannot silently disappear (same contract as
+# the `#[ignore]`d-gate manifests in `check_bin`).
+check_ordinary() {
+  bin="$1"
+  shift
+  echo "== ${bin} (required ordinary gates) =="
+  all="$(cargo test -p speakerkit --features dia --test "${bin}" -- --list 2>/dev/null || true)"
+  ignored="$(cargo test -p speakerkit --features dia --test "${bin}" -- --list --ignored 2>/dev/null || true)"
+  rc=0
+  for name in "$@"; do
+    if ! printf '%s\n' "${all}" | grep -q "^${name}: test$"; then
+      echo "  FAIL: required ordinary gate '${name}' is not in ${bin} (deleted or renamed)."
+      rc=1
+    elif printf '%s\n' "${ignored}" | grep -q "^${name}: test$"; then
+      echo "  FAIL: required ordinary gate '${name}' is now #[ignore]d in ${bin} —"
+      echo "        run_ordinary would SKIP it while still reporting a green pass count."
+      rc=1
+    else
+      echo "  ok:   ${name} (present + ordinary)"
+    fi
+  done
+  return "${rc}"
+}
+
 fail=0
 
 # parity_e2e.rs — the fp32 dia-ort parity gate, the argmax characterization, the
@@ -133,7 +173,17 @@ check_bin parity_shipping_der \
   shipping_clip_selection_is_the_documented_subset \
   clip09_content_pin_catches_an_audio_swap || fail=1
 
-# ── Execute each binary's ORDINARY (hermetic) suite (codex r6 F4). ──
+# ── Require each binary's load-bearing ORDINARY (hermetic) gates by NAME, then
+#    execute the ordinary suite (codex r7 F2 + r6 F4). The name manifest runs
+#    FIRST so a deleted/`#[ignore]`d pin-falsifiability guard fails even though
+#    der_calc's math units would keep run_ordinary's pass count nonzero. ──
+check_ordinary parity_e2e \
+  assert_pinned_fires_when_a_value_crosses_the_parity_bound \
+  equal_delta_der_hides_disjoint_placement_errors \
+  stress_gate_roster_is_consistent || fail=1
+check_ordinary parity_shipping_der \
+  clip09_known_defect_pins_every_field || fail=1
+
 run_ordinary parity_e2e || fail=1
 run_ordinary parity_shipping_der || fail=1
 
