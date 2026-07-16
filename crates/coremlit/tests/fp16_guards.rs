@@ -588,14 +588,27 @@ struct Finding {
 }
 
 impl Finding {
-  /// What the guard is actually worth: `log(x + eps)` is safe iff
-  /// `eps + lower_bound(x)` is representable in fp16.
+  /// What the guard is actually worth. The op's own `eps` and the preceding
+  /// floor are TWO independently-materialized constants — `log(x + eps)` with
+  /// `x` bounded below by an `add`/`clip`/`maximum` guard is two SEPARATE
+  /// constants in the graph, each rounded to fp16 on its own. So the guard
+  /// survives iff AT LEAST ONE of them clears the fp16 floor: the effective
+  /// floor is their MAX, not their sum. Summing them is wrong — two constants
+  /// each below `2^-24` BOTH round to zero independently, so their fp16 "sum"
+  /// never materializes (nothing proves CoreML folds them into a single
+  /// constant before lowering, e.g. `add(x, 0x1p-25)` feeding `log(eps =
+  /// 0x1p-25)` would falsely "survive" at `2^-24` while both halves vanish).
+  /// whisper-mel's clean pattern is `add(x, 0x1p-24)` with `log(eps = 0)`: the
+  /// `eps = 0` contributes nothing and the add's `2^-24` survives on its own, so
+  /// the MAX keeps mel clean.
   fn effective(&self) -> f64 {
-    self.eps + self.floor
+    self.eps.max(self.floor)
   }
 
-  /// The gate. An epsilon at or above fp16's smallest subnormal survives
-  /// the conversion; anything below it rounds to zero and goes inert.
+  /// The gate. A guard survives iff its effective floor — the MAX of the op's
+  /// own epsilon and the preceding floor, each an independent fp16 constant — is
+  /// at or above fp16's smallest subnormal; anything below rounds to zero and
+  /// the guard goes inert.
   fn survives_fp16(&self) -> bool {
     self.effective() >= FP16_MIN_SUBNORMAL
   }
@@ -777,6 +790,22 @@ const WHISPER_MEL: &str = r#"
             tensor<fp16, [80, 3000]> mel_spec_cast_fp16 = add(x = mel_spec_1_cast_fp16, y = var_41_to_fp16)[name = tensor<string, []>("mel_spec_cast_fp16")];
             tensor<fp16, []> log_0_epsilon_0_to_fp16 = const()[name = tensor<string, []>("log_0_epsilon_0_to_fp16"), val = tensor<fp16, []>(0x0p+0)];
             tensor<fp16, [80, 3000]> log_0_cast_fp16 = log(epsilon = log_0_epsilon_0_to_fp16, x = mel_spec_cast_fp16)[name = tensor<string, []>("log_0_cast_fp16")];
+"#;
+
+/// Two INDEPENDENT sub-threshold guard constants on ONE `log` site: an
+/// `add(x, 0x1p-25)` floor feeding a `log(eps = 0x1p-25)`. Each constant is
+/// `2^-25` — exactly HALF fp16's smallest subnormal — so each rounds to zero in
+/// fp16 on its own and the guard is inert. Their SUM is exactly `2^-24`, at the
+/// floor: an `effective = eps + floor` rule marks this "surviving" and masks a
+/// real vanishing guard, even though nothing proves CoreML folds the two
+/// materialized constants into one before lowering. The MAX rule — each constant
+/// must clear the floor on its own — correctly flags it. `WHISPER_MEL` with BOTH
+/// its constants halved (and thus the exact boundary the summing rule got wrong).
+const TWO_HALF_SUBNORMAL_GUARDS: &str = r#"
+            tensor<fp16, []> half_add_c = const()[name = tensor<string, []>("half_add_c"), val = tensor<fp16, []>(0x1p-25)];
+            tensor<fp16, [80, 3000]> half_guarded = add(x = feat_in, y = half_add_c)[name = tensor<string, []>("half_guarded")];
+            tensor<fp16, []> half_log_eps = const()[name = tensor<string, []>("half_log_eps"), val = tensor<fp16, []>(0x1p-25)];
+            tensor<fp16, [80, 3000]> half_log = log(epsilon = half_log_eps, x = half_guarded)[name = tensor<string, []>("half_log")];
 "#;
 
 /// Two INDEPENDENT decomposed-`log_softmax` sites, distinct vars but an
@@ -1038,6 +1067,32 @@ fn accepts_whisperkits_mel_guard() {
   assert!(
     !log.is_decomposed_log_softmax(),
     "it logs a mel spectrogram, not a softmax"
+  );
+}
+
+/// F3: two independently-materialized guard constants, each `2^-25` (half fp16's
+/// smallest subnormal), must NOT sum into a false "survives". Each rounds to zero
+/// in fp16 on its own, so the site is a vanishing finding — the effective floor
+/// is the MAX of the two, not their sum (which is exactly `2^-24` here and would
+/// spuriously pass). MUTATION PROOF: reverting `Finding::effective` from
+/// `eps.max(floor)` back to `eps + floor` makes the sum reach the floor, marks
+/// the site surviving, empties `vanishing()`, and turns this assertion red.
+#[test]
+fn two_sub_threshold_guards_do_not_sum_into_survival() {
+  assert_eq!(
+    vanishing(TWO_HALF_SUBNORMAL_GUARDS),
+    ["log/fp16 guard=add(+2.9802322387695313e-8) eff=2.9802322387695313e-8"],
+    "add(0x1p-25) feeding log(eps=0x1p-25): each constant is half the fp16 floor \
+     and rounds to zero on its own, so the guard vanishes — the two must not sum \
+     past the floor"
+  );
+
+  // The companion mel control proves the MAX rule does not over-flag: mel's
+  // surviving `add(0x1p-24)` with `log(eps = 0)` stays clean under the same rule.
+  assert_eq!(
+    vanishing(WHISPER_MEL),
+    Vec::<String>::new(),
+    "the MAX rule must keep whisper-mel clean (add's 2^-24 survives on its own)"
   );
 }
 
