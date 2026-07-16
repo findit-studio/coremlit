@@ -20,12 +20,13 @@
 //! concrete asymmetries shape every number below — each reported, none hidden:
 //!
 //! 1. **Segmentation is decision-level ONLY.** argmax's segmenter emits no
-//!    logits — it returns the already-decoded hard `speaker_ids` (spec §3). So
-//!    unlike FluidAudio's parity_seg (which has raw logits and reports a raw
-//!    max-abs), the ONLY segmentation metric that exists for argmax is the
-//!    decision: does argmax's hard 0/1 speaker mask agree with dia's
-//!    [`multilabel`] decode of the fp32 logits? A raw-logit max-abs simply has
-//!    no argmax-side operand, so none is reported for segmentation (it IS
+//!    per-frame scores — it returns the already-decoded hard `speaker_ids`
+//!    (spec §3). So unlike FluidAudio's parity_seg (whose model emits a raw
+//!    powerset log-prob tensor — `log(softmax)`, not raw logits — and reports a
+//!    raw max-abs over it), the ONLY segmentation metric that exists for argmax
+//!    is the decision: does argmax's hard 0/1 speaker mask agree with dia's
+//!    [`multilabel`] decode of the fp32 log-probs? A raw-tensor max-abs simply
+//!    has no argmax-side operand, so none is reported for segmentation (it IS
 //!    reported for embeddings).
 //! 2. **argmax's activity gate is stricter than dia's.** argmax drops a slot
 //!    with `<= 2` active frames in a window (`ArgmaxSource` zeroes its column);

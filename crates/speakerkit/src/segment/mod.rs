@@ -97,10 +97,14 @@
 //! # Why argmaxing it without a softmax is still correct
 //!
 //! dia's audio-in pipeline runs `softmax_row(&row)` before argmaxing
-//! (`diarization/src/offline/owned.rs:484-494`), because dia's ONNX model
-//! really does emit raw logits `z`. [`multilabel`] argmaxes this model's
-//! output directly. The two select the same class — but NOT for the
-//! reason previously documented here (which assumed we, too, held `z`).
+//! (`diarization/src/offline/owned.rs:484-494`). Its ONNX segmentation model
+//! emits log-probabilities — the same quantity this CoreML model does, NOT the
+//! raw logits `z` this section once claimed: `tests/generate_goldens.rs` checks
+//! the dia-ort output directly (every element `<= 0`, each 7-class row's
+//! `sum(exp(row)) == 1.0`). So dia's `softmax_row` renormalizes those log-probs
+//! back to probabilities (`softmax(log(softmax(z))) == softmax(z)`) rather than
+//! converting raw logits; [`multilabel`] skips that step and argmaxes the
+//! log-probs directly.
 //!
 //! In exact arithmetic `log(softmax(z))_i = z_i - logsumexp(z)`, and
 //! `logsumexp(z)` is a single scalar shared by every class in the row. So
@@ -112,11 +116,18 @@
 //! - `z_i > z_j  <=>  z_i - c > z_j - c`
 //! - `z_i == z_j <=> z_i - c == z_j - c`
 //!
-//! Hence `argmax(log(softmax(z))) == argmax(softmax(z)) == argmax(z)`,
-//! ties included, and [`multilabel`]'s private `hard_argmax` is order-for-order
-//! dia's decode. (Monotonicity alone would give the same answer here, but
-//! the constant-shift form is the stronger statement: it is exact, not
-//! merely order-preserving, so the tie rule below is exact too.)
+//! Hence `argmax(log(softmax(z))) == argmax(softmax(z)) == argmax(z)`, ties
+//! included — **in exact arithmetic**. That is the level at which
+//! [`multilabel`]'s direct `hard_argmax` and dia's softmax-THEN-argmax decode
+//! agree; they are NOT order-for-order identical over f32. dia's extra `softmax`
+//! runs `exp`, which can round two log-probs one ULP apart to the SAME
+//! probability, manufacturing a tie the lowest-index rule then breaks toward the
+//! LOWER index — so the two decodes can pick different classes on a near-tie
+//! (`tests/parity_seg.rs`'s `near_tie_softmax_can_flip_the_argmax`, the standing
+//! witness for why the universal wording was wrong). They agree on every
+//! committed golden row today (`tests/parity_seg.rs`'s
+//! `golden_direct_and_dia_decode_agree`); a future re-cut that made them
+//! disagree is a loud finding, not a silent pass.
 //!
 //! [`multilabel`] therefore consumes only the ORDERING of each row. It
 //! never reads a magnitude, which is what keeps the decode correct in
