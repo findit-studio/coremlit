@@ -98,6 +98,8 @@
 
 mod common;
 
+use std::collections::BTreeSet;
+
 use coremlit::ComputeUnits;
 use speakerkit::{
   embed::EMBEDDING_DIM,
@@ -150,7 +152,7 @@ const EMBED_COS_SANITY_FLOOR: f64 = 0.70;
 const MAX_QUANT_COS_DROP: f64 = 0.02;
 
 /// One variant's measured accuracy against the fp32 dia-ort oracle.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Accuracy {
   /// `(frame, slot)` decision cells compared (`compared_frames * 3`).
   seg_cells: usize,
@@ -177,8 +179,13 @@ struct Accuracy {
   /// Worst per-element |argmax − dia| embedding difference (the raw-value
   /// statistic the brief asks be reported alongside cosine).
   worst_max_abs: f64,
-  /// `(chunk, slot)` pairs BOTH sides embedded (the cosine denominator).
-  compared_slots: usize,
+  /// IDENTITIES of the `(fixture, chunk, slot)` pairs BOTH sides embedded (the
+  /// cosine denominator). A SET, not a count: the quantization-cost verdict
+  /// compares this across the two tiers, and equal counts over DISJOINT
+  /// identities (Baseline embeds `{A,B}`, W8A16 embeds `{A,C}`) would make the
+  /// mean-cosine delta meaningless while a bare `compared_slots` count assert
+  /// passed (L2).
+  compared_slot_ids: BTreeSet<(&'static str, usize, usize)>,
   /// Slots dia embedded that argmax did not (activity gate / norm / bounded).
   only_dia: usize,
   /// Slots argmax embedded that dia did not.
@@ -194,6 +201,11 @@ impl Accuracy {
   }
   fn frame_flips(&self) -> usize {
     self.frames - self.frame_agree
+  }
+  /// `(fixture, chunk, slot)` pairs BOTH sides embedded — the cosine
+  /// denominator, i.e. `compared_slot_ids.len()`.
+  fn compared_slots(&self) -> usize {
+    self.compared_slot_ids.len()
   }
 }
 
@@ -226,7 +238,8 @@ fn measure(variant: ArgmaxVariant) -> Accuracy {
   let (mut gate_dropped_active, mut chunks_uncompared) = (0usize, 0usize);
   let (mut worst_cos, mut best_cos, mut cos_sum) = (1.0f64, -1.0f64, 0.0f64);
   let mut worst_max_abs = 0.0f64;
-  let (mut compared_slots, mut only_dia, mut only_argmax) = (0usize, 0usize, 0usize);
+  let mut compared_slot_ids: BTreeSet<(&'static str, usize, usize)> = BTreeSet::new();
+  let (mut only_dia, mut only_argmax) = (0usize, 0usize);
 
   for fixture in common::FIXTURES {
     let golden = common::load_golden(fixture.name);
@@ -356,7 +369,9 @@ fn measure(variant: ArgmaxVariant) -> Accuracy {
         best_cos = best_cos.max(cos);
         cos_sum += cos;
         worst_max_abs = worst_max_abs.max(max_abs);
-        compared_slots += 1;
+        // Record the IDENTITY, not just a count, so the two tiers' compared
+        // sets can be checked for equality (L2), not merely equal size.
+        compared_slot_ids.insert((fixture.name, c, s));
         println!(
           "[{} {variant:?}] chunk {j} (c={c}) slot {s}: cosine={cos:.8} max|diff|={max_abs:.4e}",
           fixture.name
@@ -375,10 +390,10 @@ fn measure(variant: ArgmaxVariant) -> Accuracy {
     }
   }
 
-  let mean_cos = if compared_slots > 0 {
-    cos_sum / compared_slots as f64
-  } else {
+  let mean_cos = if compared_slot_ids.is_empty() {
     0.0
+  } else {
+    cos_sum / compared_slot_ids.len() as f64
   };
   Accuracy {
     seg_cells,
@@ -391,7 +406,7 @@ fn measure(variant: ArgmaxVariant) -> Accuracy {
     best_cos,
     mean_cos,
     worst_max_abs,
-    compared_slots,
+    compared_slot_ids,
     only_dia,
     only_argmax,
   }
@@ -418,7 +433,7 @@ fn report(label: &str, a: &Accuracy) {
     a.best_cos,
     a.mean_cos,
     a.worst_max_abs,
-    a.compared_slots,
+    a.compared_slots(),
     a.only_dia,
     a.only_argmax,
   );
@@ -431,7 +446,7 @@ fn report(label: &str, a: &Accuracy) {
     SEG_AGREEMENT_SANITY_FLOOR * 100.0
   );
   assert!(
-    a.compared_slots > 0,
+    a.compared_slots() > 0,
     "{label}: no (chunk, slot) embedded by BOTH sides — the harness compared nothing"
   );
   assert!(
@@ -484,13 +499,28 @@ fn argmax_accuracy_vs_fp32_dia_ort() {
   );
 
   // Both tiers must compare the SAME operands, or the delta is meaningless.
+  // The segmentation cells are all-or-nothing per compared chunk, and the
+  // compared-chunk set is fixed by the shared geometry (identical num_chunks),
+  // so an equal cell COUNT is an equal cell set here.
   assert_eq!(
     baseline.seg_cells, w8a16.seg_cells,
     "the two tiers compared different segmentation cell counts — the delta is not apples-to-apples"
   );
+  // Embedding slots are NOT geometry-fixed: whether a slot is embedded depends
+  // on each tier's own activity/mask decode, which quantization can flip. So
+  // assert SET EQUALITY of the compared `(fixture, chunk, slot)` identities,
+  // not just their count — Baseline `{A,B}` vs W8A16 `{A,C}` has equal size but
+  // a meaningless mean-cosine delta (L2). A `symmetric_difference` diff names
+  // exactly which slots diverged if this ever fires.
   assert_eq!(
-    baseline.compared_slots, w8a16.compared_slots,
-    "the two tiers compared different embedding-slot counts — the delta is not apples-to-apples"
+    baseline.compared_slot_ids,
+    w8a16.compared_slot_ids,
+    "the two tiers embedded DIFFERENT (fixture, chunk, slot) sets — the delta is not \
+     apples-to-apples. Symmetric difference: {:?}",
+    baseline
+      .compared_slot_ids
+      .symmetric_difference(&w8a16.compared_slot_ids)
+      .collect::<Vec<_>>()
   );
   assert!(
     cos_delta <= MAX_QUANT_COS_DROP,
