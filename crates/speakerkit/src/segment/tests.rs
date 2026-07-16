@@ -224,6 +224,39 @@ fn check_finite_reports_first_offending_index() {
   );
 }
 
+// M2: the input-side scan `infer` now runs BEFORE the CoreML call, so a NaN
+// sample surfaces as `NonFiniteInput` instead of reaching the model. Mirrors
+// the embed module's identical `check_finite_input` and dia's own input guard.
+
+#[test]
+fn check_finite_input_accepts_all_finite() {
+  assert_eq!(check_finite_input(&[0.0, 1.0, -1.0]), Ok(()));
+}
+
+#[test]
+fn check_finite_input_rejects_nan_at_reported_index() {
+  assert_eq!(
+    check_finite_input(&[0.0, f32::NAN, 2.0]),
+    Err(InferError::NonFiniteInput { index: 1 })
+  );
+}
+
+#[test]
+fn check_finite_input_rejects_positive_infinity() {
+  assert_eq!(
+    check_finite_input(&[f32::INFINITY]),
+    Err(InferError::NonFiniteInput { index: 0 })
+  );
+}
+
+#[test]
+fn check_finite_input_rejects_negative_infinity() {
+  assert_eq!(
+    check_finite_input(&[0.0, 0.0, f32::NEG_INFINITY]),
+    Err(InferError::NonFiniteInput { index: 2 })
+  );
+}
+
 // ---------------------------------------------------------------------
 // SegmentModelOptions
 // ---------------------------------------------------------------------

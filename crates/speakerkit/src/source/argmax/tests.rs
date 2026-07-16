@@ -1020,6 +1020,38 @@ fn fill_padded_chunk_pads_the_tail_and_reports_the_real_length() {
   );
 }
 
+// M2: the input-side scan `extract` runs before any f16 conversion, so a NaN
+// sample surfaces as `NonFiniteInput` instead of reaching the segmenter.
+
+#[test]
+fn check_finite_input_accepts_all_finite() {
+  assert_eq!(check_finite_input(&[0.0, 1.0, -1.0]), Ok(()));
+}
+
+#[test]
+fn check_finite_input_rejects_nan_at_reported_index() {
+  assert_eq!(
+    check_finite_input(&[0.0, f32::NAN, 2.0]),
+    Err(InferError::NonFiniteInput { index: 1 })
+  );
+}
+
+#[test]
+fn check_finite_input_rejects_positive_infinity() {
+  assert_eq!(
+    check_finite_input(&[f32::INFINITY]),
+    Err(InferError::NonFiniteInput { index: 0 })
+  );
+}
+
+#[test]
+fn check_finite_input_rejects_negative_infinity() {
+  assert_eq!(
+    check_finite_input(&[0.0, 0.0, f32::NEG_INFINITY]),
+    Err(InferError::NonFiniteInput { index: 2 })
+  );
+}
+
 // =====================================================================
 // Model-gated (#[ignore]): requires ARGMAX_TEST_MODELS
 // =====================================================================
@@ -1440,4 +1472,21 @@ fn argmax_source_rejects_a_foreign_step_samples() {
 #[ignore = "requires local argmax speakerkit models (ARGMAX_TEST_MODELS)"]
 fn argmax_source_rejects_empty_samples() {
   assert_eq!(load_source().extract(&[]), Err(ExtractError::EmptySamples));
+}
+
+/// A NaN sample is rejected as `NonFiniteInput` before any f16 conversion or
+/// inference (M2) — the same input-side contract the embed path enforces,
+/// proven at the source's own `extract` boundary (the hermetic
+/// `check_finite_input_*` tests above cover the scan in isolation).
+#[test]
+#[ignore = "requires local argmax speakerkit models (ARGMAX_TEST_MODELS)"]
+fn argmax_source_rejects_non_finite_samples() {
+  let mut clip = vec![0.0f32; 16_000];
+  clip[100] = f32::NAN;
+  assert_eq!(
+    load_source().extract(&clip),
+    Err(ExtractError::Infer(InferError::NonFiniteInput {
+      index: 100
+    }))
+  );
 }
