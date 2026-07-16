@@ -347,9 +347,25 @@ That runs the model-gated segmentation, embedding and argmax suites. It does
 **not** run the end-to-end **DER** gates: `tests/parity_e2e.rs` and
 `tests/parity_shipping_der.rs` are additionally `#![cfg(feature = "dia")]`, so
 without `--features dia` they compile to *nothing* and the sweep above is a
-green run containing **zero** DER tests. Run them explicitly (they also need
-the sibling `diarization` ONNX/fixtures + `ort`, so set `ORT_DYLIB_PATH` if
-`ort` cannot self-provision `libonnxruntime`):
+green run containing **zero** DER tests. Run them explicitly, in **two phases** —
+because `-- --ignored` runs the *ignored* tests **only**, and each DER binary
+also carries an *ordinary* (non-ignored) suite: the DER-math unit tests and the
+mutation-proof pin guards (e.g. `assert_pinned_fires_...`,
+`clip09_known_defect_pins_every_field`) that keep the DER numbers honest. A
+single `-- --ignored` invocation silently SKIPS them, so a dropped `assert_pinned`
+clause would stay green.
+
+Phase 1 — the ordinary (hermetic) suite. No models, no fixtures; run it WITHOUT
+`--ignored`:
+
+```sh
+cargo test -p speakerkit --features dia --test parity_e2e
+cargo test -p speakerkit --features dia --test parity_shipping_der
+```
+
+Phase 2 — the model-gated end-to-end DER gates (they also need the sibling
+`diarization` ONNX/fixtures + `ort`, so set `ORT_DYLIB_PATH` if `ort` cannot
+self-provision `libonnxruntime`):
 
 ```sh
 SPEAKERKIT_TEST_MODELS=Models/speakerkit \
@@ -359,9 +375,11 @@ cargo test -p speakerkit --features dia --test parity_shipping_der -- --ignored
 ```
 
 To confirm those DER gates are actually **compiled** — not silently feature-gated
-out, the exact trap above — run the inventory check. It lists each DER binary's
-tests and hard-fails if the list is empty or an expected gate is missing, so a
-feature-selection no-op is distinguishable from a real pass:
+out, the exact trap above — and that the Phase 1 hermetic suite passes, run the
+inventory check. It lists each DER binary's tests, hard-fails if the list is empty
+or an expected gate is missing, and then EXECUTES each binary's ordinary suite —
+so a feature-selection no-op is distinguishable from a real pass, and a weakened
+pin guard is caught even if you skipped Phase 1:
 
 ```sh
 crates/speakerkit/tests/der_gate_inventory.sh
