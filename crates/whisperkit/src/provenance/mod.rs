@@ -281,6 +281,29 @@ pub struct Provenance {
   /// record that dropped this field would read back as "never sampled", the
   /// optimistic answer, which is the one direction this must never fail in.
   sampled_at_nonzero_temperature: bool,
+  /// Whether a progress callback TRUNCATED the transcript with an early stop —
+  /// a caller CONTROL action ([`TranscriptionResult::early_stopped`]), and the
+  /// second library-known fact [`Self::is_reproducible`] rests on. A closure
+  /// has no readable identity, so this records the OUTCOME the library CAN
+  /// observe rather than the callback itself: two runs differing only in a
+  /// truncating callback would otherwise leave byte-identical records both
+  /// claiming reproducibility, when the truncated one cannot be replayed from
+  /// the recorded options and seed alone (coremlit issue #14, codex round 5).
+  /// [`Self::from_options`]/[`Self::for_segment`] — options with no decode to
+  /// speak for — record `false`.
+  early_stopped: bool,
+  /// The worker/chunk coordinate the decode ran under
+  /// ([`TranscriptionResult::window_id_offset`]). It domain-separates the seeded
+  /// fallback ladder's sub-seed derivation
+  /// ([`crate::decode::sampler::derive_attempt_seed`]), so under a
+  /// [`DecodingOptions::seed`] two runs at different offsets draw different RNG
+  /// streams and land different transcripts. Recorded so a seeded run's record
+  /// is complete — without it, two such runs leave byte-identical records for
+  /// different text (coremlit issue #14, codex round 5).
+  /// [`Self::from_options`]/[`Self::for_segment`] record `0`, the default
+  /// single-worker coordinate.
+  #[cfg_attr(feature = "serde", serde(default))]
+  window_id_offset: usize,
 
   // -- consumer-supplied: load-time identity ----------------------------
   /// The model's identity (e.g. a Hub repo id), if the caller supplied it.
@@ -337,6 +360,55 @@ pub struct Provenance {
   vad_detector: Option<String>,
 }
 
+/// Names every field of [`Provenance`] exactly once, generating (for tests) both
+/// a `PROVENANCE_FIELD_NAMES` roster and a compile-time exhaustiveness guard that
+/// destructures `Provenance` WITHOUT `..`.
+///
+/// This is what extends the DecodingOptions-only completeness mechanism to the
+/// TASK-LEVEL facts (coremlit issue #14, codex round 5). Add a field to the
+/// struct and the guard below fails to compile until it is named here — and it
+/// then lands in `provenance::tests`' `provenance_records_every_task_fact` /
+/// `task_fact_mutations` coverage as an uncovered name until it is either
+/// exercised by a mutation (a task fact) or listed among the non-task-fact
+/// partitions (the embedded options and the consumer-supplied identity). So a
+/// new outcome a run controls cannot be added to the record and left unread by
+/// [`Provenance::for_result`]: the mutation that moves it would produce a record
+/// identical to the baseline, failing the suite.
+macro_rules! provenance_field_names {
+  ($($field:ident),+ $(,)?) => {
+    /// The full field set of [`Provenance`], one entry per field. Kept
+    /// exhaustive at compile time by the guard in the same macro expansion.
+    /// Consumed by the provenance task-fact coverage test.
+    #[cfg(test)]
+    #[allow(dead_code)] // used only by the provenance coverage test
+    pub(crate) const PROVENANCE_FIELD_NAMES: &[&str] = &[$(stringify!($field)),+];
+
+    /// A pure compile-time exhaustiveness check: destructuring without `..`
+    /// forces every `Provenance` field to be named in the list above. Never
+    /// called.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn _provenance_field_exhaustiveness_guard(provenance: Provenance) {
+      let Provenance { $($field: _),+ } = provenance;
+    }
+  };
+}
+
+provenance_field_names!(
+  decoding,
+  compute,
+  detected_language,
+  effective_temperature,
+  sampled_at_nonzero_temperature,
+  early_stopped,
+  window_id_offset,
+  model_id,
+  model_revision,
+  tokenizer_id,
+  tokenizer_revision,
+  vad_detector,
+);
+
 impl Provenance {
   /// The shared capture: every library-known fact off `decoding`/`compute`,
   /// with the two outcome fields — which only a result or a segment can
@@ -347,6 +419,8 @@ impl Provenance {
     detected_language: Option<String>,
     effective_temperature: Option<f32>,
     sampled_at_nonzero_temperature: bool,
+    early_stopped: bool,
+    window_id_offset: usize,
   ) -> Self {
     Self {
       // The WHOLE options value, not a field-by-field projection — the one
@@ -357,6 +431,8 @@ impl Provenance {
       detected_language,
       effective_temperature,
       sampled_at_nonzero_temperature,
+      early_stopped,
+      window_id_offset,
       model_id: None,
       model_revision: None,
       tokenizer_id: None,
@@ -408,6 +484,11 @@ impl Provenance {
       None,
       Some(effective_temperature),
       sampled_at_nonzero_temperature,
+      // Options with no decode to speak for: no callback truncated them, and
+      // they carry the default single-worker coordinate. `for_result` fills both
+      // from the transcript instead.
+      false,
+      0,
     )
   }
 
@@ -519,6 +600,11 @@ impl Provenance {
       // false non-reproducible. A caller assembling a result by hand owns the
       // flag directly (`TranscriptionResult::maybe_sampled_at_nonzero_temperature`).
       result.sampled_at_nonzero_temperature(),
+      // The two transcript-controlling task facts, read straight off the result
+      // (codex round 5): whether a progress callback truncated it, and the
+      // worker coordinate that selects its seeded RNG stream.
+      result.early_stopped(),
+      result.window_id_offset(),
     )
   }
 
@@ -597,6 +683,22 @@ impl Provenance {
     self.sampled_at_nonzero_temperature
   }
 
+  /// Whether a progress callback truncated the transcript with an early stop —
+  /// see [`TranscriptionResult::early_stopped`]. Backs [`Self::is_reproducible`].
+  #[inline(always)]
+  pub const fn early_stopped(&self) -> bool {
+    self.early_stopped
+  }
+
+  /// The worker/chunk coordinate the decode ran under — see
+  /// [`TranscriptionResult::window_id_offset`]. Under a [`DecodingOptions::seed`]
+  /// it selects the RNG stream, so it is part of what a seeded run reproduces
+  /// against.
+  #[inline(always)]
+  pub const fn window_id_offset(&self) -> usize {
+    self.window_id_offset
+  }
+
   /// Whether this transcript can be reproduced byte-for-byte by re-running
   /// the same audio through the same options: true when the decode never
   /// drew from the sampler (every window accepted greedily at `0.0`), or
@@ -629,9 +731,22 @@ impl Provenance {
   /// A seed makes *this port's* output reproducible; it cannot make that
   /// output match Swift's, which has no seed knob and always draws
   /// unseeded (see [`DecodingOptions::seed`]).
+  ///
+  /// # A callback truncation is never reproducible from the record
+  ///
+  /// [`Self::early_stopped`] independently forces `false`. A progress callback
+  /// returning `Some(false)` truncates the transcript — a CONTROL action — but
+  /// the callback is a closure with no readable identity, so it is not part of
+  /// this record. A re-run from the recorded options and seed alone therefore
+  /// cannot reproduce the truncation: two runs differing only in that callback
+  /// otherwise both claimed reproducibility (coremlit issue #14, codex round 5).
+  /// This keys on the OUTCOME (whether a stop actually fired), not the presence
+  /// of a callback, so a callback that only observed and never truncated leaves
+  /// reproducibility untouched — its transcript IS the un-truncated one the
+  /// options and seed reproduce.
   #[inline(always)]
   pub const fn is_reproducible(&self) -> bool {
-    !self.sampled_at_nonzero_temperature || self.decoding.seed().is_some()
+    !self.early_stopped && (!self.sampled_at_nonzero_temperature || self.decoding.seed().is_some())
   }
 
   // -- model_id (Option<String>) ------------------------------------------

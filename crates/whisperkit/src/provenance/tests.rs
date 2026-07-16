@@ -199,6 +199,112 @@ fn mutation_table_covers_every_decoding_option() {
   );
 }
 
+// ---------------------------------------------------------------------
+// The task-fact completeness table (coremlit issue #14, codex round 5)
+// ---------------------------------------------------------------------
+
+/// One TASK-LEVEL fact `Provenance::for_result` reads off the transcript,
+/// paired with a mutation that moves it off a baseline result. This is the
+/// analogue of the `DecodingOptions` `mutations()` table above, for the facts a
+/// RUN controls rather than the options configure: the detected language, the
+/// effective temperature, whether it sampled, whether a callback truncated it,
+/// and the worker coordinate it decoded under.
+type TaskFactMutation = (&'static str, fn(TranscriptionResult) -> TranscriptionResult);
+
+/// A baseline transcript with every task fact at its `new` default: one
+/// segment at temperature 0.0 (so `effective_temperature` is `Some(0.0)`), no
+/// detection, greedy, not truncated, worker 0. Each mutation moves exactly one.
+fn baseline_task_result() -> TranscriptionResult {
+  TranscriptionResult::new(
+    "x",
+    vec![TranscriptionSegment::new().with_temperature(0.0)],
+    "en",
+    TranscriptionTimings::new(),
+  )
+}
+
+fn task_fact_mutations() -> Vec<TaskFactMutation> {
+  vec![
+    ("detected_language", |r| {
+      r.maybe_detected_language(Some("es".to_string()))
+    }),
+    ("effective_temperature", |mut r| {
+      r.set_segments(vec![TranscriptionSegment::new().with_temperature(0.6)]);
+      r
+    }),
+    (
+      "sampled_at_nonzero_temperature",
+      TranscriptionResult::with_sampled_at_nonzero_temperature,
+    ),
+    ("early_stopped", |r| r.maybe_early_stopped(true)),
+    ("window_id_offset", |r| r.with_window_id_offset(3)),
+  ]
+}
+
+#[test]
+fn provenance_records_every_task_fact() {
+  // THE task-fact completeness gate, mirroring `provenance_records_every_decoding_option`
+  // for the facts a RUN controls. Move one task fact off the baseline result and
+  // the `for_result` record must change with it; a fact `for_result` fails to
+  // read leaves a byte-identical record -- two runs whose transcripts differ,
+  // described the same. This is exactly what catches the round-5 omission of
+  // `early_stopped`/`window_id_offset`.
+  let decoding = DecodingOptions::new();
+  let compute = ComputeOptions::new();
+  let baseline = baseline_task_result();
+  let baseline_record = Provenance::for_result(&decoding, &compute, &baseline);
+
+  for (field, mutate) in task_fact_mutations() {
+    let mutated = mutate(baseline.clone());
+    assert_ne!(
+      mutated, baseline,
+      "`{field}`'s row does not actually change the result, so its assertion \
+       below would prove nothing"
+    );
+    let record = Provenance::for_result(&decoding, &compute, &mutated);
+    assert_ne!(
+      record, baseline_record,
+      "task fact `{field}` is NOT recorded in the provenance: two runs \
+       differing only in it leave byte-identical records"
+    );
+  }
+}
+
+#[test]
+fn task_fact_table_covers_every_provenance_task_fact() {
+  // NON-CIRCULAR by construction: the roster comes from `Provenance` ITSELF
+  // (the compile-time exhaustive destructure behind `PROVENANCE_FIELD_NAMES`),
+  // minus the embedded options (covered by the DecodingOptions `mutations()`
+  // table and the ComputeOptions itself) and the consumer-supplied identity
+  // (covered by the identity/vad tests). Add a task fact to `Provenance` and the
+  // destructure forces it into the roster, and then this fails HERE as an
+  // uncovered name until it also gets a mutation row above.
+  const NON_TASK_FACTS: &[&str] = &[
+    "decoding", // embedded DecodingOptions, covered by `mutations()`
+    "compute",  // embedded ComputeOptions
+    "model_id",
+    "model_revision",
+    "tokenizer_id",
+    "tokenizer_revision",
+    "vad_detector",
+  ];
+  let expected: std::collections::BTreeSet<&str> = crate::provenance::PROVENANCE_FIELD_NAMES
+    .iter()
+    .copied()
+    .filter(|field| !NON_TASK_FACTS.contains(field))
+    .collect();
+  let covered: std::collections::BTreeSet<&str> = task_fact_mutations()
+    .iter()
+    .map(|(field, _)| *field)
+    .collect();
+
+  assert_eq!(
+    covered, expected,
+    "the provenance task-fact table has fallen out of step with Provenance -- \
+     every task-level fact needs a mutation row (see `task_fact_mutations`)"
+  );
+}
+
 #[cfg(feature = "serde")]
 #[test]
 fn every_decoding_option_survives_the_provenance_round_trip() {

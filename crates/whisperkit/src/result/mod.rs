@@ -1259,6 +1259,35 @@ pub struct TranscriptionResult {
   /// the Swift-parity wire form.
   #[cfg_attr(feature = "serde", serde(skip))]
   decoded_segment_span: Option<usize>,
+  /// Whether a progress callback TRUNCATED this transcript with an early stop
+  /// (any window's decode ended on a `Some(false)` callback rather than an
+  /// ordinary EOT). A caller CONTROL action, carried out of the window loop
+  /// from each accepted window's [`DecodingResult::early_stopped`].
+  ///
+  /// [`Provenance::for_result`](crate::provenance::Provenance::for_result) reads
+  /// this, and [`Provenance::is_reproducible`](crate::provenance::Provenance::is_reproducible)
+  /// keys on it: a transcript an unrecorded callback truncated cannot be
+  /// reproduced from the recorded options and seed alone, because the callback
+  /// — a closure with no readable identity — is not part of the record (coremlit
+  /// issue #14, codex round 5). Always written by `serde` and required on
+  /// deserialize, exactly like [`Self::sampled_at_nonzero_temperature`]: a
+  /// dropped flag would read back `false` (not truncated), the optimistic answer
+  /// this must never silently fail toward.
+  early_stopped: bool,
+  /// The worker/chunk coordinate this transcript decoded under —
+  /// [`crate::transcribe::TranscribeTask`]'s `window_id_offset`. It is the
+  /// domain-separating WORKER input to the seeded fallback ladder's sub-seed
+  /// derivation ([`crate::decode::sampler::derive_attempt_seed`]), so under a
+  /// [`DecodingOptions::seed`] two runs at different offsets draw different RNG
+  /// streams and land different transcripts.
+  ///
+  /// Recorded so a [`Provenance`](crate::provenance::Provenance) of a seeded run
+  /// is complete: without it two runs differing ONLY in the offset would leave
+  /// byte-identical records for different text (coremlit issue #14, codex round
+  /// 5). Set by [`crate::transcribe::TranscribeTask::run`]; the merge takes the
+  /// first chunk's, matching how it takes the first result's display language.
+  #[cfg_attr(feature = "serde", serde(default))]
+  window_id_offset: usize,
 }
 
 impl TranscriptionResult {
@@ -1303,6 +1332,10 @@ impl TranscriptionResult {
       // falls back to the survivors' own extent (see the field's doc). The
       // pipeline sets the real span via `maybe_decoded_segment_span`.
       decoded_segment_span: None,
+      // A hand-built result was truncated by no callback and rode no worker
+      // coordinate; the pipeline sets both from the decode it ran.
+      early_stopped: false,
+      window_id_offset: 0,
     }
   }
 
@@ -1446,6 +1479,58 @@ impl TranscriptionResult {
     decoded_segment_span: Option<usize>,
   ) -> &mut Self {
     self.decoded_segment_span = decoded_segment_span;
+    self
+  }
+
+  // -- early_stopped (bool) ------------------------------------------------
+  /// Whether a progress callback truncated this transcript with an early stop.
+  /// See the field doc; [`Provenance::is_reproducible`](crate::provenance::Provenance::is_reproducible)
+  /// reads it.
+  #[inline(always)]
+  pub const fn early_stopped(&self) -> bool {
+    self.early_stopped
+  }
+  /// Sets [`Self::early_stopped`] to `true`.
+  #[inline(always)]
+  pub const fn set_early_stopped(&mut self) -> &mut Self {
+    self.early_stopped = true;
+    self
+  }
+  /// Builder form of [`Self::update_early_stopped`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn maybe_early_stopped(mut self, early_stopped: bool) -> Self {
+    self.update_early_stopped(early_stopped);
+    self
+  }
+  /// Assigns [`Self::early_stopped`] directly — the pipeline passes whether any
+  /// accepted window's decode was truncated by a callback.
+  #[inline(always)]
+  pub const fn update_early_stopped(&mut self, early_stopped: bool) -> &mut Self {
+    self.early_stopped = early_stopped;
+    self
+  }
+
+  // -- window_id_offset (usize) --------------------------------------------
+  /// The worker/chunk coordinate this transcript decoded under. See the field
+  /// doc: it selects the seeded RNG stream, so a
+  /// [`Provenance`](crate::provenance::Provenance) records it to stay complete.
+  #[inline(always)]
+  pub const fn window_id_offset(&self) -> usize {
+    self.window_id_offset
+  }
+  /// Builder form of [`Self::set_window_id_offset`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_window_id_offset(mut self, window_id_offset: usize) -> Self {
+    self.set_window_id_offset(window_id_offset);
+    self
+  }
+  /// Assigns [`Self::window_id_offset`] directly — the pipeline passes the task's
+  /// own worker coordinate.
+  #[inline(always)]
+  pub const fn set_window_id_offset(&mut self, window_id_offset: usize) -> &mut Self {
+    self.window_id_offset = window_id_offset;
     self
   }
 
@@ -1698,6 +1783,18 @@ pub struct DecodingResult {
   /// see this struct's doc comment).
   #[cfg_attr(feature = "serde", serde(default))]
   first_token_log_prob: f32,
+  /// Whether a progress callback requested an early stop that TRUNCATED this
+  /// window's decode (`Some(false)` past the prefill steps) — a caller CONTROL
+  /// action, distinct from every ordinary termination (EOT, the token-context
+  /// cap, a too-low first-token log-prob). The pipeline carries this out to
+  /// [`TranscriptionResult::early_stopped`], which
+  /// [`Provenance::is_reproducible`](crate::provenance::Provenance::is_reproducible)
+  /// reads: a transcript an unrecorded callback truncated cannot be reproduced
+  /// from the recorded options and seed alone (coremlit issue #14, codex round
+  /// 5). Not a Swift field — the same Rust-only extension rationale as the
+  /// sibling [`Self::first_token_log_prob`].
+  #[cfg_attr(feature = "serde", serde(default))]
+  early_stopped: bool,
 }
 
 impl Default for DecodingResult {
@@ -1722,6 +1819,7 @@ impl DecodingResult {
       temperature: 0.0,
       compression_ratio: 0.0,
       first_token_log_prob: 0.0,
+      early_stopped: false,
     }
   }
 
@@ -1951,6 +2049,29 @@ impl DecodingResult {
   #[inline(always)]
   pub const fn set_first_token_log_prob(&mut self, first_token_log_prob: f32) -> &mut Self {
     self.first_token_log_prob = first_token_log_prob;
+    self
+  }
+
+  // -- early_stopped (bool) ------------------------------------------------
+  /// Whether a progress callback truncated this window's decode with an early
+  /// stop. See the field doc; the pipeline carries this to
+  /// [`TranscriptionResult::early_stopped`].
+  #[inline(always)]
+  pub const fn early_stopped(&self) -> bool {
+    self.early_stopped
+  }
+  /// Builder form of [`Self::update_early_stopped`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn maybe_early_stopped(mut self, early_stopped: bool) -> Self {
+    self.update_early_stopped(early_stopped);
+    self
+  }
+  /// Assigns [`Self::early_stopped`] directly — the decode loop passes whether
+  /// its early-stop latch fired.
+  #[inline(always)]
+  pub const fn update_early_stopped(&mut self, early_stopped: bool) -> &mut Self {
+    self.early_stopped = early_stopped;
     self
   }
 }
@@ -2767,9 +2888,24 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
     .iter()
     .find_map(|result| result.detected_language().map(str::to_string));
 
+  // OR-ed like the sampling fact: a callback truncated the merged transcript if
+  // it truncated ANY of its chunks, and that is a caller control the record must
+  // not lose (codex round 5).
+  let early_stopped = results.iter().any(TranscriptionResult::early_stopped);
+  // The first chunk's worker coordinate, matching how the display `language`
+  // above takes the first result's. A VAD merge spans offsets 0..N, but they are
+  // deterministic from the chunk structure; recording the base is what keeps a
+  // single-worker result's own offset (its whole reproducibility story under a
+  // seed) from vanishing through the merge.
+  let window_id_offset = results
+    .first()
+    .map_or(0, TranscriptionResult::window_id_offset);
+
   TranscriptionResult::new(text, segments, language, timings)
     .maybe_sampled_at_nonzero_temperature(sampled)
     .maybe_detected_language(detected_language)
+    .maybe_early_stopped(early_stopped)
+    .with_window_id_offset(window_id_offset)
 }
 
 // ---------------------------------------------------------------------

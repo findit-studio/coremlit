@@ -806,6 +806,98 @@ fn early_stop_does_not_leak_into_fallback_retries() {
   assert_eq!(result.timings().total_decoding_fallbacks(), 0.0);
 }
 
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn a_callback_truncation_is_recorded_and_is_not_reproducible() {
+  // F4a (codex round 5). A progress callback returning Some(false) TRUNCATES the
+  // transcript -- a caller CONTROL action -- but the callback is a closure the
+  // record cannot name. Two runs differing ONLY in that callback must NOT leave
+  // byte-identical, both-reproducible provenance: the truncated one records the
+  // early-stop OUTCOME (library-known) and is not reproducible from the recorded
+  // options+seed alone, while the un-truncated one is (greedy). Pre-fix both
+  // recorded nothing of the callback and both claimed `is_reproducible()`.
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  let hello = t.encode(" Hello").unwrap()[0];
+  script_clean_window(&mut mock, hello);
+  let options = DecodingOptions::new();
+  let compute = crate::options::ComputeOptions::new();
+
+  // WITHOUT a callback: the full greedy transcript, reproducible from options.
+  let full = TranscribeTask::new(&mock, &t)
+    .run(&vec![0.1; 32_000], &options)
+    .unwrap();
+  assert!(!full.early_stopped(), "no callback truncated the full run");
+  let full_prov = crate::provenance::Provenance::for_result(&options, &compute, &full);
+  assert!(
+    full_prov.is_reproducible(),
+    "a greedy, un-truncated run reproduces from options alone"
+  );
+
+  // WITH a callback that stops at the first non-prefill step: the decode breaks
+  // early, so the transcript is a truncation of the full one.
+  let stop: &(dyn Fn(&crate::result::TranscriptionProgress) -> Option<bool> + Sync) =
+    &|_progress| Some(false);
+  let truncated = TranscribeTask::new(&mock, &t)
+    .with_progress_callback(stop)
+    .run(&vec![0.1; 32_000], &options)
+    .unwrap();
+  assert!(
+    truncated.early_stopped(),
+    "the callback's Some(false) truncated this run"
+  );
+  let trunc_prov = crate::provenance::Provenance::for_result(&options, &compute, &truncated);
+  assert!(
+    trunc_prov.early_stopped(),
+    "provenance records the early-stop outcome"
+  );
+  assert!(
+    !trunc_prov.is_reproducible(),
+    "a callback-truncated transcript is not reproducible from the record alone"
+  );
+  // The two runs differ ONLY in the callback, yet their records are now distinct.
+  assert_ne!(
+    full_prov, trunc_prov,
+    "the early-stop outcome distinguishes two runs that differ only in the callback"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn window_id_offset_is_recorded_in_the_result_and_provenance() {
+  // F4b (codex round 5). `window_id_offset` is the WORKER coordinate in the
+  // seeded fallback ladder's sub-seed derivation, so under a seed two runs at
+  // different offsets draw different RNG streams and land different transcripts.
+  // It must be recorded on the result and the provenance, or two such runs leave
+  // byte-identical records for text that genuinely differs.
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  let hello = t.encode(" Hello").unwrap()[0];
+  script_clean_window(&mut mock, hello);
+  let options = DecodingOptions::new();
+  let compute = crate::options::ComputeOptions::new();
+
+  let worker0 = TranscribeTask::new(&mock, &t)
+    .with_window_id_offset(0)
+    .run(&vec![0.1; 32_000], &options)
+    .unwrap();
+  let worker3 = TranscribeTask::new(&mock, &t)
+    .with_window_id_offset(3)
+    .run(&vec![0.1; 32_000], &options)
+    .unwrap();
+  assert_eq!(worker0.window_id_offset(), 0);
+  assert_eq!(worker3.window_id_offset(), 3);
+
+  let prov0 = crate::provenance::Provenance::for_result(&options, &compute, &worker0);
+  let prov3 = crate::provenance::Provenance::for_result(&options, &compute, &worker3);
+  assert_eq!(prov0.window_id_offset(), 0);
+  assert_eq!(prov3.window_id_offset(), 3);
+  assert_ne!(
+    prov0, prov3,
+    "the worker coordinate distinguishes two runs that differ only in it"
+  );
+}
+
 fn one_hot(token: u32) -> Vec<f32> {
   let mut logits = vec![0.0f32; 51865];
   logits[token as usize] = 10.0;

@@ -419,14 +419,22 @@ where
     }
   }
 
-  finalize_decoding_result(
-    current_tokens,
-    log_probs,
-    initial_prompt_index,
-    first_token_log_prob,
-    sampler,
-    options,
-    tokenizer,
+  // `early_stop` is set ONLY by a progress callback's `Some(false)` past the
+  // prefill steps (see the loop above) — never by an ordinary EOT / context-cap
+  // / low-first-token-logprob termination — so it is the honest witness of a
+  // caller-CONTROLLED truncation, carried out on the result for
+  // `Provenance::is_reproducible` (coremlit issue #14, codex round 5).
+  Ok(
+    finalize_decoding_result(
+      current_tokens,
+      log_probs,
+      initial_prompt_index,
+      first_token_log_prob,
+      sampler,
+      options,
+      tokenizer,
+    )?
+    .maybe_early_stopped(early_stop.load(Ordering::Relaxed)),
   )
 }
 

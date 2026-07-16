@@ -338,6 +338,12 @@ where
     // #14, codex round 5). Carried out onto the result as its decoded id span,
     // for the merge to advance its own running base by.
     let mut decoded_segment_span = 0usize;
+    // Whether ANY accepted window's decode was truncated by a progress
+    // callback's early stop — a caller CONTROL action, OR-ed across windows and
+    // carried out for `Provenance::is_reproducible` (coremlit issue #14, codex
+    // round 5). Read off each accepted `DecodingResult::early_stopped`, never
+    // inferred from the callback itself (a closure has no readable identity).
+    let mut early_stopped = false;
     let mut detected_language: Option<String> = None;
     // The GENUINE observation, kept SEPARATE from `detected_language` above:
     // that one is the Swift-faithful DISPLAY language and includes a
@@ -471,6 +477,10 @@ where
           window_index,
         )?;
         window_index += 1;
+        // The accepted window's early-stop OUTCOME, OR-ed across windows: a
+        // callback truncated the transcript if it truncated any window (codex
+        // round 5). The honest library-known fact, not the closure's identity.
+        early_stopped |= decoding_result.early_stopped();
 
         // THE reproducibility invariant. The RNG-draw fact was OR-ed into
         // `sampled_sink` INSIDE `decode_with_fallback` just now, from each
@@ -669,7 +679,12 @@ where
       // The DECODE's own id-ordinal span — how many segment ids this run
       // allocated, dropped segments included — for the merge to advance its
       // running base by (see the field's doc; coremlit issue #14, codex round 5).
-      .maybe_decoded_segment_span(Some(decoded_segment_span)),
+      .maybe_decoded_segment_span(Some(decoded_segment_span))
+      // Whether a progress callback truncated this transcript, and the worker
+      // coordinate it decoded under — both transcript-controlling task facts a
+      // `Provenance` records (codex round 5).
+      .maybe_early_stopped(early_stopped)
+      .with_window_id_offset(self.window_id_offset),
     )
   }
 
