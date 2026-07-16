@@ -43,16 +43,23 @@
 //!
 //! # What the measurement found
 //!
-//! It holds, on the decision that matters. **int8 preserves the speaker-count
-//! decision on every clip measured (3 / 4 / 7 / 8-speaker references), and on
-//! the 7-speaker clip that broke argmax the precision-isolated int8/CpuOnly arm
-//! clusters IDENTICALLY to fp32 on every collar-scored frame — 0.0000 %
-//! standard DER, zero confusion, asserted — while carrying a *worse* embedding
-//! cosine than argmax does.** (Identity here is standard-collar `err_units ==
-//! 0`, not literal output equality: ~6 sub-collar frames differ at no-collar,
-//! and `int8/All` folds in ANE placement for 0.0405 % — see
-//! [`shipping_int8_der_10_mrbeast_clean_water_7spk`].) Cosine does not predict
-//! clustering; the *kind* of perturbation does.
+//! It holds wherever the fp32 control can be measured. **int8 preserves the
+//! speaker-count decision on every clip whose fp32 control clusters (the 3 / 4 /
+//! 7-speaker references), and on the 7-speaker clip that broke argmax the
+//! precision-isolated int8/CpuOnly arm clusters IDENTICALLY to fp32 on every
+//! collar-scored frame — 0.0000 % standard DER, zero confusion, asserted — while
+//! carrying a *worse* embedding cosine than argmax does.** (Identity here is
+//! standard-collar `err_units == 0`, not literal output equality: ~6 sub-collar
+//! frames differ at no-collar, and `int8/All` folds in ANE placement for
+//! 0.0405 % — see [`shipping_int8_der_10_mrbeast_clean_water_7spk`].) Cosine does
+//! not predict clustering; the *kind* of perturbation does.
+//!
+//! The 8-speaker clip (09) is the sole exception, and it is NOT a
+//! speaker-count-preservation result: on it the fp32 control cannot cluster at
+//! all and int8 UNDERCOUNTS (5-6 of 8). That is a separate CoreML-path defect,
+//! pinned as a known defect (§5.10;
+//! [`shipping_int8_der_09_mrbeast_dollar_date_8spk_known_defect`]) — not evidence
+//! that int8 preserves the count on 8-speaker audio, which it does not.
 //!
 //! Two things the measurement also surfaced, which the framing above did not
 //! anticipate:
@@ -141,7 +148,7 @@ mod der_calc;
 use std::{path::Path, time::Instant};
 
 use coremlit::ComputeUnits;
-use der_calc::{Seg, der_std, der_strict, distinct_speakers, fmt_der, parse_rttm};
+use der_calc::{Der, Seg, der_std, der_strict, distinct_speakers, fmt_der, parse_rttm};
 use speakerkit::{
   embed::{EmbedModel, EmbedModelOptions},
   extract::{Extraction, Options},
@@ -203,6 +210,16 @@ const SHIPPING_ABS_DELTA_MAX: f64 = 0.01;
 /// the same rule: it is a controller decision, and it is never raised to hide a
 /// regression.
 const SHIPPING_CONFUSION_TRIPWIRE: f64 = 0.02;
+
+/// Two-sided tolerance (±0.05 pp) on the clip-09 known-defect DER pins
+/// ([`assert_clip09_known_defect`]) — the SAME band `parity_e2e`'s `DER_PIN_TOL`
+/// uses, for the same reason: the int8/CpuOnly pipeline is deterministic and the
+/// int8/All value reproduced EXACTLY across two independent full runs (spec
+/// §5.9), so the band exists only to absorb a stray flipped frame on a different
+/// CoreML build, not to hide movement. The pinned drifts here are ~16 pp, ~330×
+/// this band, so any clustering-decision change fires immediately. Never widened
+/// to make the pin pass; the clip-09 pin is a fail-if-fixed owner decision.
+const DER_PIN_TOL: f64 = 0.000_5;
 
 /// A dia parity-corpus clip with ≥ 3 reference speakers — the regime where
 /// clustering can actually fail. (`parity_e2e`'s own fixtures top out at 2
@@ -351,23 +368,23 @@ fn fluidaudio_extraction(samples: &[f32], embed_path: &Path, cu: ComputeUnits) -
 
 /// Run `diarize_offline` on an `Extraction` + the shared PLDA → its spans.
 ///
-/// Returns the dia error rather than unwrapping: dia's clustering can REFUSE
-/// to produce an answer (e.g. `Centroid(AmbiguousAliveCluster { .. })`, its
-/// deliberate bail-out when a cluster's alive-value lands in an ambiguous band
-/// around the threshold). Whether a given arm hits that is itself a
-/// first-class measurement — if the shipping int8 arm errors where the fp32
-/// control succeeds, the shipping default cannot diarize that audio AT ALL,
-/// which is a far worse defect than any DER. Unwrapping here would have
-/// reported it as an opaque harness panic.
+/// Returns dia's TYPED error rather than unwrapping or stringifying it: dia's
+/// clustering can REFUSE to produce an answer (e.g.
+/// `Pipeline(Centroid(AmbiguousAliveCluster { .. }))`, its deliberate bail-out
+/// when a cluster's alive-value lands in the SIMD guard band around the
+/// threshold). Whether a given arm hits that is itself a first-class
+/// measurement — if the shipping int8 arm errors where the fp32 control
+/// succeeds, the shipping default cannot diarize that audio AT ALL, which is a
+/// far worse defect than any DER. Unwrapping would report it as an opaque
+/// harness panic; and keeping the TYPED [`dia::offline::Error`] (not a
+/// `String`) is what lets [`assert_clip09_known_defect`] match the exact
+/// `AmbiguousAliveCluster` variant, not merely assert `is_err`.
 fn diarize_extraction_segs(
   ext: &Extraction,
   plda: &dia::plda::PldaTransform,
-) -> Result<Vec<Seg>, String> {
+) -> Result<Vec<Seg>, dia::offline::Error> {
   let input = ext.into_offline_input(plda);
-  match dia::offline::diarize_offline(&input) {
-    Ok(out) => Ok(output_segs(&out)),
-    Err(e) => Err(format!("{e:?}")),
-  }
+  dia::offline::diarize_offline(&input).map(|out| output_segs(&out))
 }
 
 /// One measured speakerkit arm. `segs` is `Err` when dia's clustering refused
@@ -375,7 +392,7 @@ fn diarize_extraction_segs(
 /// [`diarize_extraction_segs`]).
 struct Arm {
   tag: &'static str,
-  segs: Result<Vec<Seg>, String>,
+  segs: Result<Vec<Seg>, dia::offline::Error>,
   spk: Option<usize>,
   extract_s: f64,
 }
@@ -897,18 +914,168 @@ fn shipping_int8_der_10_mrbeast_clean_water_7spk() {
   );
 }
 
+// ══════════════════════════════════════════════════════════════════════
+// Clip 09 — the PINNED KNOWN DEFECT (§5.10)
+// ══════════════════════════════════════════════════════════════════════
+
+/// Everything clip 09's known-defect state must satisfy, extracted from a
+/// [`Measurement`] (or synthesized by the mutation test) so
+/// [`assert_clip09_known_defect`] is a pure function both can call.
+#[derive(Clone, Copy)]
+struct Clip09Observed<'a> {
+  /// The fixture this was measured on — asserted, so the pin cannot silently
+  /// re-target a DIFFERENT undercounting clip.
+  clip: &'a str,
+  /// Distinct speakers in `reference.rttm`.
+  ref_spk: usize,
+  /// dia-ort's (the ONNX oracle's) speaker count.
+  dia_spk: usize,
+  /// The fp32 CONTROL's clustering outcome, carrying dia's TYPED error so the pin
+  /// can match the exact `AmbiguousAliveCluster` variant, not just `is_err`.
+  fp32: &'a Result<Vec<Seg>, dia::offline::Error>,
+  /// int8/CpuOnly's speaker count.
+  int8_cpu_spk: usize,
+  /// int8/All (the shipping default) speaker count.
+  int8_all_spk: usize,
+  /// int8/CpuOnly's standard DER vs the pyannote reference.
+  int8_cpu_der: Der,
+  /// int8/All's standard DER vs the pyannote reference.
+  int8_all_der: Der,
+}
+
+/// The measured clip-09 known-defect record (§5.9/§5.10), pinned field by field
+/// so a single-value regression in EITHER direction fails — the fail-if-fixed
+/// gate this whole test rests on. Every field is exercised in both directions,
+/// hermetically, by [`clip09_known_defect_pins_every_field`].
+///
+/// Two independent full runs reproduced these EXACTLY (spec §5.9): reference &
+/// dia-ort oracle both 8 speakers; fp32/CpuOnly hits dia's typed
+/// `Pipeline(Centroid(AmbiguousAliveCluster { .. }))` bail-out (NO diarization at
+/// all); int8/CpuOnly 6 speakers, 16.4590 % DER; int8/All (SHIPPING) 5 speakers,
+/// 16.5904 % DER, 100 % CONFUSION (0 miss, 0 FA).
+fn assert_clip09_known_defect(o: &Clip09Observed<'_>) {
+  // Identity: the pin is clip-09-specific (its fp32 control cannot cluster), so a
+  // fixture-resolution drift onto another undercounting clip must fail loudly,
+  // never silently re-target.
+  assert_eq!(
+    o.clip, "09_mrbeast_dollar_date",
+    "clip-09 defect pin ran on {} — the fixture selection drifted",
+    o.clip
+  );
+  // Reference AND oracle both see 8 speakers, so int8's undercount below is a real
+  // defect, not a reference artifact.
+  assert_eq!(
+    o.ref_spk, 8,
+    "09: reference.rttm no longer holds 8 speakers ({})",
+    o.ref_spk
+  );
+  assert_eq!(
+    o.dia_spk, 8,
+    "09: dia-ort (the ONNX oracle) no longer clusters this clip at 8 speakers ({}) — the oracle \
+     moved; re-establish it before trusting the defect pin",
+    o.dia_spk
+  );
+  // THE DEFECT: the fp32 CoreML control does not merely fail — it fails with dia's
+  // TYPED AmbiguousAliveCluster bail-out (a near-zero cluster weight inside the
+  // SIMD guard band). Matching the VARIANT (not just `is_err`, and not the fragile
+  // `cluster`/`value` fields) is what makes "the known defect is fixed" the only
+  // way this can go green.
+  assert!(
+    matches!(
+      o.fp32,
+      Err(dia::offline::Error::Pipeline(
+        dia::pipeline::Error::Centroid(dia::cluster::centroid::Error::AmbiguousAliveCluster { .. })
+      ))
+    ),
+    "09: the fp32 CoreML control no longer fails with Pipeline(Centroid(AmbiguousAliveCluster)). \
+     Either it now CLUSTERS (the known defect is fixed — promote clip 09 into the gated set \
+     `gate(&measure(..))` and delete this pin), or it fails a DIFFERENT way (a new defect — \
+     investigate). Got: {:?}",
+    o.fp32.as_ref().err()
+  );
+  // Same-side rule on the reference-count bound: both int8 arms must stay BELOW 8
+  // (undercounting = the broken side). If either reaches 8 the path improved, and
+  // this must fire deliberately.
+  assert!(
+    o.int8_cpu_spk < o.ref_spk && o.int8_all_spk < o.ref_spk,
+    "09: int8 no longer UNDERCOUNTS (cpu={}, all={}, reference={}) — the CoreML path improved; \
+     re-measure and re-gate this clip.",
+    o.int8_cpu_spk,
+    o.int8_all_spk,
+    o.ref_spk
+  );
+  // Exact counts, both directions.
+  assert_eq!(
+    o.int8_cpu_spk, 6,
+    "09: int8/CpuOnly speaker count moved from the pinned 6 to {}",
+    o.int8_cpu_spk
+  );
+  assert_eq!(
+    o.int8_all_spk, 5,
+    "09: the SHIPPING int8/All speaker count moved from the pinned 5 to {}",
+    o.int8_all_spk
+  );
+  // int8/All (SHIPPING): DER two-sided AND its full decomposition — 100 %
+  // CONFUSION (0 miss, 0 FA), because after overlap-skip every scored frame has
+  // one reference and one hypothesis speaker, so the 3 unmapped reference speakers
+  // land entirely in confusion.
+  assert_clip09_der_decomposed("int8/All (SHIPPING)", o.int8_all_der, 0.165_904);
+  // int8/CpuOnly: DER value two-sided (a deterministic arm; only the shipping
+  // arm's decomposition is separately pinned, per §5.10).
+  assert_clip09_der_value("int8/CpuOnly", o.int8_cpu_der, 0.164_590);
+}
+
+/// A clip-09 arm's DER, pinned two-sided (±[`DER_PIN_TOL`]) with its full
+/// miss/FA/confusion decomposition: all the error is confusion.
+fn assert_clip09_der_decomposed(tag: &str, d: Der, pinned: f64) {
+  assert_clip09_der_value(tag, d, pinned);
+  assert_eq!(
+    d.miss_units, 0,
+    "09 {tag}: DER decomposition changed — {} miss units, pinned at 0 (undercounting a \
+     single-speaker-per-scored-frame reference is pure confusion, never miss)",
+    d.miss_units
+  );
+  assert_eq!(
+    d.fa_units, 0,
+    "09 {tag}: DER decomposition changed — {} false-alarm units, pinned at 0",
+    d.fa_units
+  );
+  assert!(
+    (d.confusion - pinned).abs() <= DER_PIN_TOL,
+    "09 {tag}: confusion {:.4}% moved from the pinned {:.4}% (±{:.4}%) — with miss/FA pinned at 0 \
+     the confusion IS the DER; the clustering divergence changed character",
+    d.confusion * 100.0,
+    pinned * 100.0,
+    DER_PIN_TOL * 100.0
+  );
+}
+
+/// A clip-09 arm's standard DER, pinned two-sided (±[`DER_PIN_TOL`]).
+fn assert_clip09_der_value(tag: &str, d: Der, pinned: f64) {
+  assert!(
+    (d.der - pinned).abs() <= DER_PIN_TOL,
+    "09 {tag}: standard DER {:.4}% moved from the pinned {:.4}% (±{:.4}%). Worse is a regression; \
+     better means the CoreML path changed — re-baseline deliberately, do NOT widen the band.",
+    d.der * 100.0,
+    pinned * 100.0,
+    DER_PIN_TOL * 100.0
+  );
+}
+
 /// **Clip 09 (8 speakers, 1042.0 s) — a PINNED KNOWN DEFECT, not a passing gate.**
 ///
 /// This clip cannot gate the int8 question, because the **fp32 control itself is
-/// broken on it**. Measured:
+/// broken on it**. Measured (two independent full runs, reproduced exactly —
+/// §5.9/§5.10):
 ///
-/// - `dia-ort` (ONNX fp32): clusters fine.
-/// - `fp32/CpuOnly` CoreML: **`diarize_offline` returns `Err`** —
-///   `Centroid(AmbiguousAliveCluster { cluster: 13, value: 1.70e-7, threshold:
-///   1e-7, lo: 5e-8, hi: 2e-7 })`. dia refuses to decide whether a cluster is
-///   alive; the pipeline produces NO diarization at all.
-/// - `int8/CpuOnly`: clusters, finds **6** speakers.
-/// - `int8/All` (the shipping default): clusters, finds **5** speakers.
+/// - `dia-ort` (ONNX fp32): clusters fine, 8 speakers.
+/// - `fp32/CpuOnly` CoreML: **`diarize_offline` returns `Err`** — dia's typed
+///   `Pipeline(Centroid(AmbiguousAliveCluster { cluster: 13, value: 1.70e-7,
+///   threshold: 1e-7, lo: 5e-8, hi: 2e-7 }))`. dia refuses to decide whether a
+///   cluster is alive; the pipeline produces NO diarization at all.
+/// - `int8/CpuOnly`: clusters, finds **6** speakers (16.4590 % DER).
+/// - `int8/All` (the shipping default): clusters, finds **5** speakers
+///   (16.5904 % DER, 100 % confusion).
 /// - reference (pyannote 4.0.4): **8** speakers.
 ///
 /// So on 8-speaker audio the CoreML path is defective *regardless of precision*
@@ -916,37 +1083,275 @@ fn shipping_int8_der_10_mrbeast_clean_water_7spk() {
 /// This is a real, separately-actionable defect (see the task report), and it is
 /// pinned here rather than deleted so it cannot be forgotten.
 ///
-/// The assertion is on the KNOWN-BAD state. If someone fixes the CoreML path and
-/// the fp32 control starts clustering this clip, **this test fails on purpose**
-/// — that is the signal to promote clip 09 into [`gate`]'s gated set and delete
-/// this test. It is deliberately NOT an unfalsifiable `println!` (the mistake
-/// `parity_e2e`'s Part B made, where a real 3.33 % DER failure still exits 0).
+/// The assertion is on the KNOWN-BAD state, pinned field by field by
+/// [`assert_clip09_known_defect`]: clip identity, the reference and oracle counts,
+/// the fp32 control's TYPED `AmbiguousAliveCluster` bail-out, both int8 counts,
+/// and both int8 DERs (the shipping arm with its miss/FA/confusion
+/// decomposition). If ANY moves — most importantly if the CoreML path is fixed
+/// and the fp32 control starts clustering — **this test fails on purpose**, the
+/// signal to promote clip 09 into [`gate`]'s gated set and delete this test.
+/// (Every field's both-directions sensitivity is proven hermetically by
+/// [`clip09_known_defect_pins_every_field`].) It is deliberately NOT an
+/// unfalsifiable `println!` (the mistake `parity_e2e`'s Part B made, where a real
+/// 3.33 % DER failure still exits 0).
 #[test]
 #[ignore = "requires Models/speakerkit + sibling diarization ONNX/fixtures + ort"]
 fn shipping_int8_der_09_mrbeast_dollar_date_8spk_known_defect() {
   let m = measure(&MULTI_SPEAKER_CLIPS[3]);
 
-  assert!(
-    m.fp32.segs.is_err(),
-    "09: the fp32 CoreML control now CLUSTERS this clip (it previously returned \
-     Centroid(AmbiguousAliveCluster)). The known defect is fixed — promote clip 09 into the \
-     gated set (`gate(&measure(..))`) and delete this pinned-defect test."
+  // The shipping int8 arms must still ANSWER to score their DER; a failure here is
+  // itself a regression (the shipping default went from "answers, undercounts" to
+  // "cannot answer"), reported before the DER pin so the numbers still print.
+  let (int8_cpu, int8_all) = match (&m.int8_cpu.segs, &m.int8_all.segs) {
+    (Ok(_), Ok(_)) => (m.int8_cpu.segs(), m.int8_all.segs()),
+    _ => panic!(
+      "09: an int8 arm now fails to cluster (cpu={:?}, all={:?}). The shipping default regressed \
+       from 'answers, but undercounts' to 'cannot answer at all' on 8-speaker audio.",
+      m.int8_cpu.segs.as_ref().err(),
+      m.int8_all.segs.as_ref().err(),
+    ),
+  };
+
+  assert_clip09_known_defect(&Clip09Observed {
+    clip: m.clip,
+    ref_spk: m.ref_spk,
+    dia_spk: m.dia_spk,
+    fp32: &m.fp32.segs,
+    int8_cpu_spk: m.int8_cpu.spk(),
+    int8_all_spk: m.int8_all.spk(),
+    int8_cpu_der: der_std(&m.reference, int8_cpu),
+    int8_all_der: der_std(&m.reference, int8_all),
+  });
+}
+
+/// [`assert_clip09_known_defect`] pins EVERY field, in BOTH directions — proven
+/// here hermetically (no models, no fixtures): the known-good record passes, and
+/// every single-field perturbation fails. Without this a field could silently go
+/// unpinned, and a real clip-09 regression in it would pass green.
+#[test]
+fn clip09_known_defect_pins_every_field() {
+  // dia's typed bail-out — the exact variant the fp32 control hits.
+  let fp32_defect: Result<Vec<Seg>, dia::offline::Error> = Err(dia::offline::Error::Pipeline(
+    dia::pipeline::Error::Centroid(dia::cluster::centroid::Error::AmbiguousAliveCluster {
+      cluster: 13,
+      value: 1.70e-7,
+      threshold: 1e-7,
+      lo: 5e-8,
+      hi: 2e-7,
+    }),
+  ));
+
+  let cpu_der = clip09_synth_der(0.164_590);
+  let all_der = clip09_synth_der(0.165_904);
+  let good = Clip09Observed {
+    clip: "09_mrbeast_dollar_date",
+    ref_spk: 8,
+    dia_spk: 8,
+    fp32: &fp32_defect,
+    int8_cpu_spk: 6,
+    int8_all_spk: 5,
+    int8_cpu_der: cpu_der,
+    int8_all_der: all_der,
+  };
+  // The measured record passes.
+  assert_clip09_known_defect(&good);
+
+  // The VARIANT is matched, not its field values: a DIFFERENT
+  // AmbiguousAliveCluster still passes, so the pin does not over-fit the fragile
+  // `cluster: 13` / `value: 1.70e-7`.
+  let fp32_other_fields: Result<Vec<Seg>, dia::offline::Error> =
+    Err(dia::offline::Error::Pipeline(
+      dia::pipeline::Error::Centroid(dia::cluster::centroid::Error::AmbiguousAliveCluster {
+        cluster: 99,
+        value: -1.0,
+        threshold: 5e-8,
+        lo: 1e-8,
+        hi: 9e-8,
+      }),
+    ));
+  assert_clip09_known_defect(&Clip09Observed {
+    fp32: &fp32_other_fields,
+    ..good
+  });
+
+  // ── Every single-field perturbation must FAIL. ──
+  fn reject(label: &str, o: &Clip09Observed<'_>) {
+    let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      assert_clip09_known_defect(o);
+    }));
+    assert!(
+      res.is_err(),
+      "mutation '{label}' did NOT fail the clip-09 pin — that field is unpinned, so a real \
+       regression in it would pass silently"
+    );
+  }
+
+  // Identity + counts (both directions on every scalar).
+  reject(
+    "clip",
+    &Clip09Observed {
+      clip: "10_mrbeast_clean_water",
+      ..good
+    },
   );
-  // The shipping int8 arms still answer — they just undercount badly (5-6 of 8).
-  // Pinned so a regression that ALSO breaks int8's clustering here fails loudly.
-  assert!(
-    m.int8_cpu.segs.is_ok() && m.int8_all.segs.is_ok(),
-    "09: an int8 arm now fails to cluster too. The shipping default has regressed from \
-     'answers, but undercounts' to 'cannot answer at all' on 8-speaker audio."
+  reject("ref_spk hi", &Clip09Observed { ref_spk: 9, ..good });
+  reject("ref_spk lo", &Clip09Observed { ref_spk: 7, ..good });
+  reject("dia_spk hi", &Clip09Observed { dia_spk: 9, ..good });
+  reject("dia_spk lo", &Clip09Observed { dia_spk: 7, ..good });
+  reject(
+    "int8_cpu_spk hi",
+    &Clip09Observed {
+      int8_cpu_spk: 7,
+      ..good
+    },
   );
-  assert!(
-    m.int8_cpu.spk() < m.ref_spk && m.int8_all.spk() < m.ref_spk,
-    "09: int8 no longer undercounts ({} / {} vs reference {}) — the CoreML path improved; \
-     re-measure and re-gate this clip.",
-    m.int8_cpu.spk(),
-    m.int8_all.spk(),
-    m.ref_spk
+  reject(
+    "int8_cpu_spk lo",
+    &Clip09Observed {
+      int8_cpu_spk: 5,
+      ..good
+    },
   );
+  reject(
+    "int8_cpu_spk fixed",
+    &Clip09Observed {
+      int8_cpu_spk: 8,
+      ..good
+    },
+  );
+  reject(
+    "int8_all_spk hi",
+    &Clip09Observed {
+      int8_all_spk: 6,
+      ..good
+    },
+  );
+  reject(
+    "int8_all_spk lo",
+    &Clip09Observed {
+      int8_all_spk: 4,
+      ..good
+    },
+  );
+  reject(
+    "int8_all_spk fixed",
+    &Clip09Observed {
+      int8_all_spk: 8,
+      ..good
+    },
+  );
+
+  // fp32 control: "fixed" (clusters) and a DIFFERENT error variant both fail.
+  let fp32_fixed: Result<Vec<Seg>, dia::offline::Error> = Ok(Vec::new());
+  reject(
+    "fp32 fixed (Ok)",
+    &Clip09Observed {
+      fp32: &fp32_fixed,
+      ..good
+    },
+  );
+  let fp32_wrong_variant: Result<Vec<Seg>, dia::offline::Error> = Err(
+    dia::offline::Error::Pipeline(dia::pipeline::Error::InvalidActiveRatio(0.5)),
+  );
+  reject(
+    "fp32 wrong variant",
+    &Clip09Observed {
+      fp32: &fp32_wrong_variant,
+      ..good
+    },
+  );
+
+  // int8/All DER + FULL decomposition (both directions).
+  reject(
+    "all der hi",
+    &Clip09Observed {
+      int8_all_der: clip09_synth_der(0.165_904 + 2.0 * DER_PIN_TOL),
+      ..good
+    },
+  );
+  reject(
+    "all der lo",
+    &Clip09Observed {
+      int8_all_der: clip09_synth_der(0.165_904 - 2.0 * DER_PIN_TOL),
+      ..good
+    },
+  );
+  reject(
+    "all miss_units",
+    &Clip09Observed {
+      int8_all_der: Der {
+        miss_units: 1,
+        ..all_der
+      },
+      ..good
+    },
+  );
+  reject(
+    "all fa_units",
+    &Clip09Observed {
+      int8_all_der: Der {
+        fa_units: 1,
+        ..all_der
+      },
+      ..good
+    },
+  );
+  reject(
+    "all confusion hi",
+    &Clip09Observed {
+      int8_all_der: Der {
+        confusion: all_der.confusion + 2.0 * DER_PIN_TOL,
+        ..all_der
+      },
+      ..good
+    },
+  );
+  reject(
+    "all confusion lo",
+    &Clip09Observed {
+      int8_all_der: Der {
+        confusion: all_der.confusion - 2.0 * DER_PIN_TOL,
+        ..all_der
+      },
+      ..good
+    },
+  );
+
+  // int8/CpuOnly DER value (both directions; its decomposition is not pinned).
+  reject(
+    "cpu der hi",
+    &Clip09Observed {
+      int8_cpu_der: clip09_synth_der(0.164_590 + 2.0 * DER_PIN_TOL),
+      ..good
+    },
+  );
+  reject(
+    "cpu der lo",
+    &Clip09Observed {
+      int8_cpu_der: clip09_synth_der(0.164_590 - 2.0 * DER_PIN_TOL),
+      ..good
+    },
+  );
+}
+
+/// A synthetic [`Der`] for the clip-09 mutation test: standard DER = confusion =
+/// `der`, zero miss/FA (clip 09's undercount is 100 % confusion). Only the fields
+/// [`assert_clip09_known_defect`] reads need be meaningful; the rest are inert.
+fn clip09_synth_der(der: f64) -> Der {
+  Der {
+    der,
+    miss: 0.0,
+    fa: 0.0,
+    confusion: der,
+    miss_units: 0,
+    fa_units: 0,
+    conf_units: 1,
+    ref_units: 1,
+    scored_frames: 1,
+    err_frames: 1,
+    num_ref_spk: 8,
+    num_hyp_spk: 5,
+  }
 }
 
 /// What switching the shipping default from int8 to fp32 would COST: model
