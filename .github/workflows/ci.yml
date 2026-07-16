@@ -90,5 +90,17 @@ jobs:
             --local-dir Models/whisperkit-coreml
           hf download "$tokenizer_repo" "${tokenizer_files_arr[@]}" --revision "$tokenizer_revision" \
             --local-dir Models/tokenizers/whisper-tiny
+      # codex r6 F1: build.rs UN-ignores the fp16 graph sweep
+      # (`every_shipped_model_graph_survives_fp16`) when Models/ is present, so
+      # the `-- --ignored` (ignored-ONLY) runs below EXCLUDE it exactly when the
+      # models are here — and the modelless `check` job skips it too (ignored
+      # there). Run the coremlit sweep binary's ordinary suite here so a newly
+      # vanishing fp16 guard cannot merge green; the inventory proves the sweep
+      # is ordinary-not-ignored under cfg(models_present). NOTE: this runner
+      # downloads WHISPER ONLY (per MODELS_LOCK), so the sweep here audits the
+      # whisper graphs; the speakerkit/alignkit/argmax defect pins have no vendor
+      # present and are a local/dev gate.
+      - run: cargo test -p coremlit --test fp16_guards
+      - run: crates/coremlit/tests/fp16_sweep_inventory.sh
       - run: cargo test -p coremlit -- --ignored
       - run: cargo test -p whisperkit -- --ignored
