@@ -145,6 +145,29 @@ pub const HOP_SAMPLES: usize = 320;
 /// `truncated_frame_count` and [`Encoder::emissions`]'s "Truncation formula".
 const RECEPTIVE_FIELD_SAMPLES: usize = 400;
 
+/// The one output frame count `base960h_aligner.mlmodelc` declares for its fixed
+/// [`ENCODER_WINDOW_SAMPLES`] window: **2999**. Nothing about this graph is
+/// dynamic — the window is fixed, the receptive field and hop are fixed — so the
+/// output frame dimension is fixed too, at exactly the wav2vec2 feature
+/// extractor's output length for one full window,
+/// `floor((960_000 - 400) / 320) + 1`. A loaded model whose `emissions` tensor
+/// declares any OTHER frame count is not this artifact and is rejected at
+/// construction (`check_emissions_contract`): a cropped `[1, 2998, 29]` export
+/// used to pass the old `shape[1] >= 1` check, construct fine, and then silently
+/// drop the last acoustic frame.
+const EXPECTED_OUTPUT_FRAMES: usize = 2_999;
+
+/// Ties [`EXPECTED_OUTPUT_FRAMES`] to the conv geometry at **compile time**: it
+/// must equal the feature extractor's output length for one full
+/// [`ENCODER_WINDOW_SAMPLES`] window. Changing any of the three geometry
+/// constants without re-deriving the frame count is then a BUILD failure, not a
+/// silently-stale contract.
+const _: () = assert!(
+  EXPECTED_OUTPUT_FRAMES == (ENCODER_WINDOW_SAMPLES - RECEPTIVE_FIELD_SAMPLES) / HOP_SAMPLES + 1,
+  "EXPECTED_OUTPUT_FRAMES must equal floor((ENCODER_WINDOW_SAMPLES - RECEPTIVE_FIELD_SAMPLES) / \
+   HOP_SAMPLES) + 1 — the wav2vec2 conv output length for one full window"
+);
+
 /// [`crate::vocab::VOCAB_SIZE`] as a [`NonZeroUsize`], for the
 /// [`Emissions::from_log_probs`] `v` argument. The conversion is
 /// infallible: `VOCAB_SIZE` is the nonzero constant `29`.
@@ -383,24 +406,34 @@ fn check_waveform_contract(shape: &[usize], dtype: Option<DataType>) -> Result<(
 /// Validates a loaded model's `emissions` output against the pinned
 /// contract, in isolation (see [`check_waveform_contract`]'s doc for why
 /// this is hermetic rather than model-gated). Returns the frame count
-/// (`shape[1]`) on success — read dynamically rather than hardcoded, see
-/// [`Encoder::frames`].
+/// (`shape[1]`) on success — the value the model declared, which this fixed
+/// graph guarantees is [`EXPECTED_OUTPUT_FRAMES`].
 ///
-/// `shape[1] >= 1`: a zero-frame model would "load fine" and then make
-/// every [`Encoder::emissions`] call return an empty result with no
-/// error — reject the degenerate contract at construction instead
-/// (mirrors `dia-coreml::SegmentModel::from_file_with`'s identical
-/// guard).
+/// The frame dimension must equal `EXPECTED_OUTPUT_FRAMES` (2999) exactly.
+/// This graph is fixed in every dimension — a 960,000-sample window in, a
+/// `[1, 2999, 29]` tensor out — so a declared `shape[1]` of anything but 2999
+/// is not this artifact: it is rejected here, at construction, rather than
+/// accepted and silently mis-mapped onto the audio. A cropped `[1, 2998, 29]`
+/// export in particular used to pass the old `shape[1] >= 1` check, construct
+/// fine, and then drop the last acoustic frame; the exact-count check closes
+/// that. (This subsumes the zero-frame degenerate case the `>= 1` guard —
+/// mirroring `dia-coreml::SegmentModel::from_file_with` — used to catch on its
+/// own: a `shape[1]` of 0 is `!= 2999`.)
 fn check_emissions_contract(
   shape: &[usize],
   dtype: Option<DataType>,
 ) -> Result<usize, AlignerError> {
-  let shape_ok =
-    shape.len() == 3 && shape[0] == 1 && shape[1] >= 1 && shape[2] == crate::vocab::VOCAB_SIZE;
+  let shape_ok = shape.len() == 3
+    && shape[0] == 1
+    && shape[1] == EXPECTED_OUTPUT_FRAMES
+    && shape[2] == crate::vocab::VOCAB_SIZE;
   if !shape_ok || dtype != Some(DataType::F32) {
     return Err(AlignerError::ContractMismatch {
       feature: names::EMISSIONS,
-      expected: format!("[1, >=1, {}] float32", crate::vocab::VOCAB_SIZE),
+      expected: format!(
+        "[1, {EXPECTED_OUTPUT_FRAMES}, {}] float32",
+        crate::vocab::VOCAB_SIZE
+      ),
       actual: describe(shape, dtype),
     });
   }
@@ -624,11 +657,14 @@ impl Encoder {
   /// [`AlignerError::Load`] if CoreML rejects the model.
   /// [`AlignerError::ContractMismatch`] if the loaded model's `waveform`
   /// input isn't `[1, ENCODER_WINDOW_SAMPLES]` f32, or its `emissions`
-  /// output isn't rank 3 with `shape[0] == 1`, `shape[1] >= 1`, and
-  /// `shape[2] == crate::vocab::VOCAB_SIZE` f32. The frame count
-  /// (`shape[1]`) is read dynamically, not hardcoded — mirrors
-  /// `dia-coreml::SegmentModel`'s `num_frames` field
-  /// (`crates/dia-coreml/src/segment/mod.rs`) — see [`Self::frames`].
+  /// output isn't rank 3 with `shape[0] == 1`,
+  /// `shape[1] == EXPECTED_OUTPUT_FRAMES` (2999), and
+  /// `shape[2] == crate::vocab::VOCAB_SIZE` f32. The frame count (`shape[1]`)
+  /// is read from the introspected shape into the `frames` field — mirroring
+  /// `dia-coreml::SegmentModel`'s `num_frames`
+  /// (`crates/dia-coreml/src/segment/mod.rs`) — but, unlike that
+  /// variable-contract model, it is pinned to a single value: this fixed graph
+  /// emits exactly 2999 frames or it is not this artifact. See [`Self::frames`].
   ///
   /// With the `tracing` feature: an `alignkit.encoder.load` span at `INFO`.
   /// The CoreML load is where the wall-clock hides — 0.68 s cold on the
@@ -678,11 +714,12 @@ impl Encoder {
     })
   }
 
-  /// Output frame count for one full (unpadded) window — the introspected
-  /// `emissions` shape's middle dimension (2999 for
-  /// `base960h_aligner.mlmodelc`, pinned by
-  /// `tests/model_io.rs::base960h_aligner_io_matches_spec`; read
-  /// dynamically at construction, not hardcoded).
+  /// Output frame count for one full (unpadded) window: **2999** for
+  /// `base960h_aligner.mlmodelc` (pinned by
+  /// `tests/model_io.rs::base960h_aligner_io_matches_spec`). Read from the
+  /// introspected `emissions` shape at construction and there validated to
+  /// equal `EXPECTED_OUTPUT_FRAMES` — the field carries the value the model
+  /// declared, which this fixed graph guarantees is 2999.
   #[inline(always)]
   pub const fn frames(&self) -> usize {
     self.frames

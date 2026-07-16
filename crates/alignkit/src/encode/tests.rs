@@ -323,6 +323,43 @@ fn check_emissions_contract_rejects_wrong_dtype() {
   assert!(matches!(err, AlignerError::ContractMismatch { .. }));
 }
 
+#[test]
+fn check_emissions_contract_rejects_a_cropped_frame_count() {
+  // 2998 — the fence's failing history. `floor((960_000 - 400)/320) + 1 == 2999`
+  // is the ONLY frame count this fixed-window graph declares; a cropped
+  // `[1, 2998, 29]` export used to pass the old `shape[1] >= 1` check, construct
+  // fine, then silently drop the last acoustic frame (the full-window formula
+  // requests 2999 but the introspected 2998 clamps it away). It is now a
+  // ContractMismatch at construction. Reverting the check to `>= 1` accepts it
+  // and fails this test.
+  let err = check_emissions_contract(&[1, 2_998, crate::vocab::VOCAB_SIZE], Some(DataType::F32))
+    .unwrap_err();
+  assert!(matches!(
+    err,
+    AlignerError::ContractMismatch {
+      feature: "emissions",
+      ..
+    }
+  ));
+}
+
+#[test]
+fn check_emissions_contract_rejects_an_overlong_frame_count() {
+  // 3000 — one frame too many. The contract is EXACTLY EXPECTED_OUTPUT_FRAMES,
+  // so an over-long declaration is a ContractMismatch at construction just like
+  // the cropped one, in the other direction. Reverting the check to `>= 1`
+  // accepts it and fails this test.
+  let err = check_emissions_contract(&[1, 3_000, crate::vocab::VOCAB_SIZE], Some(DataType::F32))
+    .unwrap_err();
+  assert!(matches!(
+    err,
+    AlignerError::ContractMismatch {
+      feature: "emissions",
+      ..
+    }
+  ));
+}
+
 // ---------------------------------------------------------------------
 // check_log_prob_floor: hermetic coverage of the fp16 `log(0)` sentinel
 // guard. The model-gated half (`emissions_reject_an_ane_corrupted_matrix`)
