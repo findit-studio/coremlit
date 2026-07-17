@@ -200,7 +200,11 @@ final class DumpArgmaxTensors: XCTestCase {
       }
 
       var binary = true
+      var fullWindow = true
       let slots: [GoldenSlot] = run.embeddings.map { embedding in
+        if embedding.activeFrames.count != run.framesPerWindow {
+          fullWindow = false
+        }
         for value in embedding.activeFrames where value != 0.0 && value != 1.0 {
           binary = false
         }
@@ -216,6 +220,22 @@ final class DumpArgmaxTensors: XCTestCase {
       // (it is what makes `onset` inert and `activeFrames` a bit string). If
       // it ever stops being so, this dump must fail rather than round.
       XCTAssertTrue(binary, "\(fixture.name): speaker_ids is not binary — the port's premise is void")
+      // Each consumed slot must serialize EXACTLY `framesPerWindow` frames, and
+      // the dump must consume at least one slot over a positive window. The
+      // Rust loader now hard-requires the per-slot length; enforce it at
+      // GENERATION too so a future dump cannot be vacuous. Note the `binary`
+      // flag above is on its own vacuously TRUE for an empty `activeFrames`
+      // vector (its `for` loop never runs), which is exactly the hole the
+      // length and non-empty checks below close.
+      XCTAssertGreaterThan(
+        run.framesPerWindow, 0,
+        "\(fixture.name): framesPerWindow is \(run.framesPerWindow) — a non-positive window makes the per-slot length check vacuous")
+      XCTAssertFalse(
+        run.embeddings.isEmpty,
+        "\(fixture.name): argmax consumed zero (chunk, slot) slots — a dump with no slots would compare nothing")
+      XCTAssertTrue(
+        fullWindow,
+        "\(fixture.name): a consumed slot's activeFrames is not exactly framesPerWindow (\(run.framesPerWindow)) frames — the dump would let the Rust segmentation comparison run over a truncated surface while still reporting full coverage")
 
       let whisperkit = whisperkitLoaderProbe(fixture.path)
       let golden = Golden(
