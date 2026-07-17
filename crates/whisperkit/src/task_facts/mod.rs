@@ -132,6 +132,133 @@ const fn kleene_or(a: Option<bool>, b: Option<bool>) -> Option<bool> {
   }
 }
 
+/// What a transcript's decode knows about the number of segment-id ordinals it
+/// **allocated** — the id span [`merge_transcription_results_with_options`](crate::result::merge_transcription_results_with_options)
+/// advances its running base by. **Two states**, because the fact has to tell an
+/// EXACTLY-known total apart from a known LOWER BOUND on an otherwise-unknown
+/// one, and the pre-round-12 `Option<usize>` could express only "exactly `n`"
+/// (`Some(n)`) and "wholly unknown" (`None`) — never "unknown total, but at
+/// least `k`" (coremlit issue #14, codex round 12).
+///
+/// That third state is not hypothetical. A VAD run that drops an errored chunk
+/// keeps its SURVIVING chunks' known ordinal count as a lower bound while the
+/// dropped chunk's contribution stays unknown; the pre-round-12 `None` — which
+/// **absorbed** under [the merge](TaskFacts::merge) — threw that lower bound
+/// away, so a staged re-merge, unable to recover the dropped chunk's ordinal
+/// from the survivors' extent alone, renumbered a trailing chunk onto an id a
+/// one-shot merge left free (the round-12 regression
+/// `drop_on_merge_preserves_known_empty_span_after_unknown_prefix`: records
+/// `A`=unknown-span-with-a-survivor, `B`=known-empty-span, `T`=a trailing
+/// survivor, numbered `[0, 2]` one-shot but `[0, 1]` staged). Carrying the lower
+/// bound explicitly makes [the merge](Self::merge) associative **by
+/// construction** — every grouping stores the same value, and the id-base
+/// advance derives from it — so one-shot and staged merges number identically.
+///
+/// - [`Exact(n)`](Self::Exact) — the decode allocated exactly `n` ordinals (the
+///   old `Some(n)`): a real decode task's own count, or a sum of exacts.
+/// - [`AtLeast(k)`](Self::AtLeast) — the exact total is unknown, but at least
+///   `k` ordinals were allocated. [`AtLeast(0)`](Self::wholly_unknown) is the
+///   WHOLLY-unknown value (the old `None` — a hand-built or deserialized-absent
+///   record); an `AtLeast(k)` with `k > 0` carries a genuine lower bound (a
+///   dropped-chunk VAD run's surviving span, or an overflowed sum's saturated
+///   floor).
+///
+/// **Not** a reproducibility fact — an in-process merge coordinate — so it plays
+/// no part in [`TaskFacts::is_reproducible_under`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum SpanKnowledge {
+  /// The decode allocated **exactly** this many segment-id ordinals — the old
+  /// `Some(n)`. A real decode task's own count (dropped segments included, since
+  /// the count is captured before the drop) and the sum of two exact spans.
+  Exact(usize),
+  /// The exact total is unknown, but **at least** this many ordinals were
+  /// allocated. [`AtLeast(0)`](Self::wholly_unknown) is the wholly-unknown value
+  /// (the old `None`); a positive bound is a genuine floor — the KNOWN survivors'
+  /// sum of a VAD run whose errored chunk was dropped, or the saturated floor of
+  /// a sum that overflowed `usize`.
+  AtLeast(usize),
+}
+
+impl SpanKnowledge {
+  /// The **wholly-unknown** span, [`AtLeast(0)`](Self::AtLeast) — the old `None`:
+  /// no lower bound is known. The value a hand-built or deserialized-absent
+  /// record carries (the [`TaskFacts::unknown`] span and the serde default), and
+  /// the serde-skipped one (see [`Self::is_wholly_unknown`]).
+  #[inline]
+  pub const fn wholly_unknown() -> Self {
+    Self::AtLeast(0)
+  }
+
+  /// The known **lower bound** on the ordinal count — `n` for both `Exact(n)` and
+  /// `AtLeast(n)`. The single value [the merge's id-base advance](crate::result::merge_transcription_results_with_options)
+  /// derives from (floored at the survivors' own extent at read time), so every
+  /// grouping advances by the same stored number and staged and one-shot merges
+  /// number identically.
+  #[inline]
+  pub const fn lower_bound(&self) -> usize {
+    match *self {
+      Self::Exact(n) | Self::AtLeast(n) => n,
+    }
+  }
+
+  /// Whether the **exact** total is known (`Exact`), as opposed to a mere lower
+  /// bound (`AtLeast`).
+  #[inline]
+  pub const fn is_exact(&self) -> bool {
+    matches!(self, Self::Exact(_))
+  }
+
+  /// Whether this is the wholly-unknown [`AtLeast(0)`](Self::wholly_unknown) — no
+  /// lower bound at all. The serde `skip_serializing_if` predicate: the transient
+  /// span is omitted from the wire form when it carries no information, and a
+  /// missing key reads back as this value. `Exact(0)` (a KNOWN-empty span, e.g. a
+  /// zero-chunk VAD run) is distinct and is NOT skipped.
+  #[inline]
+  pub const fn is_wholly_unknown(&self) -> bool {
+    matches!(self, Self::AtLeast(0))
+  }
+
+  /// Merges two spans — the id-ordinal counts of two transcripts being joined —
+  /// into the span of the join. **Associative and commutative by construction**,
+  /// with [`Exact(0)`](Self::Exact) the identity, which is what keeps
+  /// [`TaskFacts::merge`] associative over the span and a staged re-merge
+  /// numbering identically to a one-shot one (coremlit issue #14, codex round
+  /// 12):
+  ///
+  /// - **`Exact + Exact`** sums with a **checked** add — the join allocated
+  ///   exactly the two counts' sum. A sum that overflows `usize` has no exact
+  ///   answer, so it degrades to [`AtLeast(usize::MAX)`](Self::AtLeast) (the
+  ///   saturated lower bound), never a wrapped or a fabricated exact count.
+  /// - **any `AtLeast` participation** yields [`AtLeast`](Self::AtLeast) of the
+  ///   **saturating** sum of the two lower bounds: joining an exactly-known count
+  ///   onto an at-least-known one — or two at-least-known ones — can only
+  ///   lower-bound the total, at the sum of what each side is known to have
+  ///   allocated. Saturating, not checked: a lower bound that overflows `usize`
+  ///   is still a lower bound (`usize::MAX`), not a loss of the bound.
+  ///
+  /// The closed form both properties fall out of: the result is `Exact(T)` when
+  /// every merged leaf is `Exact` and their true total `T` fits `usize`, and
+  /// `AtLeast(min(T, usize::MAX))` otherwise — associative because `T` and
+  /// "every leaf `Exact`" are both grouping-independent.
+  #[must_use]
+  pub const fn merge(self, other: Self) -> Self {
+    match (self, other) {
+      (Self::Exact(a), Self::Exact(b)) => match a.checked_add(b) {
+        Some(sum) => Self::Exact(sum),
+        // No exact `usize` sum: degrade to the saturated lower bound, never a
+        // wrapped or fabricated exact count a staged re-merge would trust.
+        None => Self::AtLeast(usize::MAX),
+      },
+      // Any `AtLeast` makes the total a lower bound: the saturating sum of the
+      // two known floors.
+      (Self::Exact(a), Self::AtLeast(b))
+      | (Self::AtLeast(a), Self::Exact(b))
+      | (Self::AtLeast(a), Self::AtLeast(b)) => Self::AtLeast(a.saturating_add(b)),
+    }
+  }
+}
+
 /// A carried record of the decode-time facts a transcription **run controls**,
 /// as opposed to the ones its [`DecodingOptions`](crate::options::DecodingOptions)
 /// configure: whether it drew from the token sampler, the language it genuinely
@@ -144,15 +271,16 @@ const fn kleene_or(a: Option<bool>, b: Option<bool>) -> Option<bool> {
 /// with the `with_*` builders; merge two with [`Self::merge`].
 ///
 /// ```
-/// use whisperkit::task_facts::TaskFacts;
+/// use whisperkit::task_facts::{SpanKnowledge, TaskFacts};
 ///
 /// // A single run at worker 2 that observed Spanish, drew from the sampler,
-/// // was not truncated, and allocated 3 segment ordinals.
+/// // was not truncated, and allocated exactly 3 segment ordinals.
 /// let facts = TaskFacts::unknown()
 ///   .with_drew_from_rng(true)
 ///   .with_observed_language(Some("es".to_string()))
 ///   .with_worker(2)
-///   .with_decoded_span(Some(3));
+///   .with_decoded_span(SpanKnowledge::Exact(3));
+/// assert_eq!(facts.decoded_span(), SpanKnowledge::Exact(3));
 /// assert_eq!(facts.drew_from_rng(), Some(true));
 /// assert_eq!(facts.observed_language(), Some("es"));
 /// assert_eq!(facts.worker_schedule(), Some([2].as_slice()));
@@ -277,29 +405,38 @@ pub struct TaskFacts {
   /// coordinate fails or yields explicit unknown, never zero.
   #[cfg_attr(feature = "serde", serde(deserialize_with = "required_option"))]
   worker_schedule: Option<Vec<usize>>,
-  /// The number of segment-id ordinals this transcript's decode **allocated** —
-  /// carried separately from the surviving segments because a filter (the
-  /// blank-audio drop, the word-timestamp zero-length filter) removes some
-  /// *after* their ids are allocated, so the survivors' count under-reports the
-  /// span. [`merge_transcription_results_with_options`](crate::result::merge_transcription_results_with_options)
-  /// advances its running id base by this (not the survivors' extent) so a
-  /// wholly-dropped chunk still shifts the next chunk's ids past the ordinals it
-  /// consumed, and — the R6-F3 fix — **stores the summed aggregate on the merged
-  /// result** so a staged re-merge renumbers identically to a one-shot merge.
+  /// What this transcript's decode knows about the number of segment-id ordinals
+  /// it **allocated** — a [`SpanKnowledge`], carried separately from the surviving
+  /// segments because a filter (the blank-audio drop, the word-timestamp
+  /// zero-length filter) removes some *after* their ids are allocated, so the
+  /// survivors' count under-reports the span.
+  /// [`merge_transcription_results_with_options`](crate::result::merge_transcription_results_with_options)
+  /// advances its running id base by this span's [lower bound](SpanKnowledge::lower_bound)
+  /// (floored at the survivors' extent, not inferred from it) so a wholly-dropped
+  /// chunk still shifts the next chunk's ids past the ordinals it consumed, and
+  /// **stores the merged aggregate on the merged result** so a staged re-merge
+  /// renumbers identically to a one-shot merge (R6-F3).
   ///
-  /// `None` when untracked (a hand-built or deserialized result), and — since a
-  /// `None` contributor is ABSORBING under [the merge law](Self::merge) (round 10,
-  /// F3) — also whenever a merge folds in any untracked or overflowed child. The
-  /// merge's read-time span still floors a `None` at the survivors' own extent, so
-  /// a re-merge never under-counts its survivors even when the stored span is
-  /// `None`. **Not** a reproducibility fact — an in-process merge coordinate — so
-  /// it defaults to `None` on a missing key rather than being required, and is
-  /// omitted from the wire form when absent.
+  /// Two states rather than the pre-round-12 `Option<usize>` (codex round 12):
+  /// [`SpanKnowledge::Exact`] is a fully-known count, [`SpanKnowledge::AtLeast`]
+  /// a known lower bound on an unknown total —
+  /// [`AtLeast(0)`](SpanKnowledge::wholly_unknown) the wholly-unknown value a
+  /// hand-built or deserialized result carries. Because [the merge](Self::merge)
+  /// SUMS lower bounds rather than absorbing an unknown to a bound-less `None`, a
+  /// dropped chunk's unknown contribution no longer erases its surviving
+  /// siblings' KNOWN ordinals, and every grouping stores the same value — the
+  /// associativity the old absorbing-`None` could not give a staged re-merge. **Not**
+  /// a reproducibility fact — an in-process merge coordinate — so it defaults to
+  /// the wholly-unknown value on a missing key rather than being required, and is
+  /// omitted from the wire form when it carries no lower bound.
   #[cfg_attr(
     feature = "serde",
-    serde(default, skip_serializing_if = "Option::is_none")
+    serde(
+      default = "SpanKnowledge::wholly_unknown",
+      skip_serializing_if = "SpanKnowledge::is_wholly_unknown"
+    )
   )]
-  decoded_span: Option<usize>,
+  decoded_span: SpanKnowledge,
 }
 
 /// Names every field of [`TaskFacts`] exactly once, generating (for tests) both
@@ -344,8 +481,8 @@ task_facts_field_names!(
 impl TaskFacts {
   /// The all-unknown record: an **unknown** draw, truncation, and swallowed-error
   /// (`None`, never the optimistic `Some(false)`), no observed language, an
-  /// **unknown** worker schedule (`None`, never `[0]`), and an untracked span
-  /// (`None`). The value a
+  /// **unknown** worker schedule (`None`, never `[0]`), and a wholly-unknown span
+  /// ([`AtLeast(0)`](SpanKnowledge::wholly_unknown)). The value a
   /// hand-built [`TranscriptionResult`](crate::result::TranscriptionResult)
   /// carries, an options-only [`Provenance`](crate::provenance::Provenance)
   /// records, and — for zero contributors — what a
@@ -365,7 +502,7 @@ impl TaskFacts {
       early_stopped: None,
       had_swallowed_error: None,
       worker_schedule: None,
-      decoded_span: None,
+      decoded_span: SpanKnowledge::wholly_unknown(),
     }
   }
 
@@ -373,7 +510,7 @@ impl TaskFacts {
   /// POSITIVELY seen no RNG draw, no early-stop truncation, and no swallowed child
   /// error yet (`Some(false)` for [`Self::drew_from_rng`], [`Self::early_stopped`],
   /// and [`Self::had_swallowed_error`]), with no observed
-  /// language, an unknown worker schedule, and an untracked span. Distinct from
+  /// language, an unknown worker schedule, and a wholly-unknown span. Distinct from
   /// [`Self::unknown`] — which cannot see those facts and is conservatively
   /// non-reproducible — this is the honest initial state of a decode that IS
   /// watching: a window that draws, a callback that truncates, or a swallowed
@@ -487,16 +624,16 @@ impl TaskFacts {
   }
 
   // -- decoded_span -------------------------------------------------------
-  /// The number of segment-id ordinals the decode allocated, or `None` when
-  /// untracked. See the field's doc.
+  /// What the decode knows about the number of segment-id ordinals it allocated —
+  /// [`SpanKnowledge::wholly_unknown`] when untracked. See the field's doc.
   #[inline(always)]
-  pub const fn decoded_span(&self) -> Option<usize> {
+  pub const fn decoded_span(&self) -> SpanKnowledge {
     self.decoded_span
   }
   /// Builder assigning [`Self::decoded_span`] directly.
   #[must_use]
   #[inline(always)]
-  pub const fn with_decoded_span(mut self, decoded_span: Option<usize>) -> Self {
+  pub const fn with_decoded_span(mut self, decoded_span: SpanKnowledge) -> Self {
     self.decoded_span = decoded_span;
     self
   }
@@ -534,19 +671,18 @@ impl TaskFacts {
   ///   as the whole schedule — a coordinate nobody could report must not read
   ///   back as a fully-known ordering. Absorbing-`None` over a free monoid is
   ///   associative, the same lattice the Kleene booleans use.
-  /// - **[`decoded_span`](Self::decoded_span)** — two KNOWN spans **sum with a
-  ///   checked add** (overflow → `None`), so the merged result stores the
-  ///   aggregate ordinal count its children allocated (R6-F3). A `None` child is
-  ///   ABSORBING (round 10, F3): once any contributor is untracked or the sum
-  ///   overflows `usize`, the total is honestly unknown and STAYS unknown. The
-  ///   pre-round-10 law treated `None` as the identity (a `None` child
-  ///   contributed nothing), so the NEXT merge read that `None` back as zero and
-  ///   the documented associativity broke — spans MAX,1,2 gave `(A·B)·C =
-  ///   Some(2)` but `A·(B·C) = None`. An overflowing sum is likewise honest
-  ///   untracked, never a fabricated saturated `usize::MAX` a staged re-merge
-  ///   would trust as a real count (F2, codex round 9). Absorbing-`None` over the
-  ///   checked-add monoid is associative, the same lattice the worker schedule
-  ///   and Kleene booleans use.
+  /// - **[`decoded_span`](Self::decoded_span)** — the two spans **sum under
+  ///   [`SpanKnowledge::merge`]**, so the merged result stores the aggregate
+  ///   ordinal count its children allocated (R6-F3). Two exacts checked-add (an
+  ///   overflow degrades to a saturated `AtLeast(usize::MAX)`, never a wrapped or
+  ///   fabricated exact count); once any child is a mere `AtLeast`, the total is
+  ///   a saturating lower bound. Unlike the pre-round-12 absorbing-`None` (codex
+  ///   round 12), an unknown-but-with-a-known-sibling total is `AtLeast(sibling's
+  ///   count)`, NOT a bound-less unknown — a dropped chunk's unknown contribution
+  ///   no longer erases its siblings' KNOWN ordinals, which is what let a staged
+  ///   re-merge renumber a trailing chunk differently than a one-shot one. The
+  ///   sum is associative by construction (`Exact(0)` its identity), the same
+  ///   grouping-independence the worker schedule and Kleene booleans have.
   pub fn merge(&mut self, other: &Self) {
     self.drew_from_rng = kleene_or(self.drew_from_rng, other.drew_from_rng);
     self.early_stopped = kleene_or(self.early_stopped, other.early_stopped);
@@ -572,18 +708,12 @@ impl TaskFacts {
       // read back `Some([7])` — partial knowledge presented as fully known.
       (None, _) | (_, None) => None,
     };
-    self.decoded_span = match (self.decoded_span, other.decoded_span) {
-      // Two KNOWN spans sum, checked NOT saturating (F2, codex round 9): an
-      // overflowing sum becomes an honest untracked `None`, never a fabricated
-      // `usize::MAX` that a staged re-merge would trust as a real ordinal count.
-      (Some(a), Some(b)) => a.checked_add(b),
-      // An unknown or overflowed (`None`) contributor is ABSORBING (round 10, F3):
-      // once any part of the total is untracked or the sum overflows, the aggregate
-      // is honestly unknown and STAYS unknown. The pre-round-10 identity-`None` let
-      // the next merge read it back as zero, so the documented associativity broke
-      // (spans MAX,1,2 gave `(A·B)·C = Some(2)` but `A·(B·C) = None`).
-      (None, _) | (_, None) => None,
-    };
+    // Sum the two spans under [`SpanKnowledge::merge`] — checked-add over exacts,
+    // saturating lower bounds once any part is a mere `AtLeast`, associative by
+    // construction (codex round 12). This replaces the pre-round-12 absorbing-`None`
+    // fold, which threw away a dropped chunk's siblings' KNOWN ordinals and left a
+    // staged re-merge unable to recover them.
+    self.decoded_span = self.decoded_span.merge(other.decoded_span);
   }
 
   /// Whether a transcript carrying these facts can be reproduced byte-for-byte

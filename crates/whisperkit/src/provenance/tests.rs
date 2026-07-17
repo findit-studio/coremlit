@@ -8,7 +8,7 @@ use crate::{
   },
   options::{ChunkingStrategy, Task, WordGrouping},
   result::TranscriptionTimings,
-  task_facts::TaskFacts,
+  task_facts::{SpanKnowledge, TaskFacts},
 };
 
 // ---------------------------------------------------------------------
@@ -251,7 +251,7 @@ fn task_fact_mutations() -> Vec<TaskFactMutation> {
       r.with_task_facts(TaskFacts::unknown().with_worker(3))
     }),
     ("decoded_span", |r| {
-      r.with_task_facts(TaskFacts::unknown().with_decoded_span(Some(1)))
+      r.with_task_facts(TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(1)))
     }),
     // The derived one: moving a segment temperature changes the unanimous
     // effective temperature `for_result` computes.

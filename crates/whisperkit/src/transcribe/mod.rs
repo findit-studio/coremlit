@@ -98,7 +98,7 @@ use crate::{
   },
   segment,
   stream::{AudioStreamTranscriber, agreement::LocalAgreementTranscriber},
-  task_facts::TaskFacts,
+  task_facts::{SpanKnowledge, TaskFacts},
   tokenizer::WhisperTokenizer,
 };
 
@@ -705,7 +705,9 @@ where
           .clone()
           .with_observed_language(observed_language)
           .with_worker(self.window_id_offset)
-          .with_decoded_span(Some(decoded_segment_span))
+          // A real decode task KNOWS the exact ordinal count it allocated
+          // (dropped segments included — captured before the drop).
+          .with_decoded_span(SpanKnowledge::Exact(decoded_segment_span))
       }),
     )
   }
@@ -1408,12 +1410,14 @@ impl<B> WhisperKit<B> {
 /// so it taints the ordered schedule to `None`; zero chunks record the known-empty
 /// `Some([])`), and the `decoded_span` is the merged surviving result's own — the
 /// id-ordinal count its segments consumed, which drives a staged re-merge's ids —
-/// EXCEPT that the caller passes `None` once any chunk errored, since a dropped
-/// chunk is an unknown span contributor (codex round 11, M2).
+/// EXCEPT that once any chunk errored the caller passes an
+/// [`AtLeast`](SpanKnowledge::AtLeast) of the survivors' KNOWN sum, since the
+/// dropped chunk's contribution is unknown but the survivors' ordinals still
+/// lower-bound the run's total (codex round 11, M2; round 12).
 fn recover_vad_run_facts(
   sink: TaskFacts,
   worker_schedule: Option<Vec<usize>>,
-  decoded_span: Option<usize>,
+  decoded_span: SpanKnowledge,
 ) -> TaskFacts {
   sink
     .with_worker_schedule(worker_schedule)
@@ -1613,19 +1617,29 @@ where
       // for the error-fragile draw/early-stop/language/swallowed-error it watched
       // across EVERY chunk (dropped ones included — the drop itself is recorded as
       // a swallow above), while the worker schedule folded over all chunks above
-      // and the run's decoded span are set explicitly — the absorbing-`None`
-      // schedule/span laws (F2/F3) mean the sink's stripped `None`s would otherwise
-      // absorb them away. The decoded span is the merged surviving result's own,
-      // but absorbed to `None` once ANY chunk errored: a dropped chunk is an
-      // unknown span contributor (it may have allocated ordinals before erroring),
-      // so the run's total id span is honestly unknown — the decoded-span analogue
-      // of the schedule's absorbing-`None` over all chunks (codex round 11, M2).
-      // See [`recover_vad_run_facts`].
+      // and the run's decoded span are set explicitly — the sink's stripped
+      // schedule would otherwise absorb the merged coordinates, and its span seed
+      // is only the wholly-unknown default. The decoded span is the merged
+      // surviving result's own — an `Exact` sum of the surviving chunks' counts
+      // (or `Exact(0)` for a genuine zero-chunk run) — degraded to an `AtLeast` of
+      // the survivors' KNOWN sum once ANY chunk errored: the dropped chunk may
+      // have allocated ordinals before erroring, so the exact total is unknown,
+      // yet the survivors' ordinals still lower-bound the run's span. That lower
+      // bound is the round-12 replacement for the pre-round-12 `None`, which threw
+      // the survivors' known sum away (codex round 11, M2; round 12). See
+      // [`recover_vad_run_facts`].
       let sink_facts = facts_sink
         .into_inner()
         .unwrap_or_else(PoisonError::into_inner);
       let decoded_span = if any_chunk_dropped {
-        None
+        // The dropped chunk's contribution is unknown; the surviving merge's own
+        // lower bound is the run's known floor (round 12, replacing the pre-round-12
+        // `None` that threw the survivors' known sum away).
+        SpanKnowledge::AtLeast(merged.task_facts().decoded_span().lower_bound())
+      } else if chunk_results.is_empty() {
+        // A zero-chunk run allocated exactly nothing — a KNOWN-empty `Exact(0)`,
+        // distinct from the wholly-unknown value a run that cannot see would carry.
+        SpanKnowledge::Exact(0)
       } else {
         merged.task_facts().decoded_span()
       };

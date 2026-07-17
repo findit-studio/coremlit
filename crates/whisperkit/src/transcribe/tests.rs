@@ -697,8 +697,9 @@ fn worker_schedule_is_unknown_when_a_vad_chunk_errors() {
   //
   // Round 11 (M2) extends this history to the SWALLOWED-ERROR facts. The drop is a
   // hidden, transcript-controlling error, so the run must not claim byte
-  // reproducibility: `had_swallowed_error` reads `Some(true)`, the decoded span is
-  // absorbed to unknown (an errored chunk may have allocated ordinals), and
+  // reproducibility: `had_swallowed_error` reads `Some(true)`, the decoded span's
+  // exact total is unknown (the dropped chunk may have allocated ordinals) yet the
+  // survivors' ordinals lower-bound it to `AtLeast(2)` (round 12), and
   // `Provenance::is_reproducible` is false. The mock's `fail_on_call` is a
   // reset-immune ORDINAL, so a SECOND identical `kit.transcribe` -- same object,
   // audio, and options -- does not fail call 1 again, all three chunks survive, and
@@ -736,8 +737,9 @@ fn worker_schedule_is_unknown_when_a_vad_chunk_errors() {
   );
   assert_eq!(
     result.task_facts().decoded_span(),
-    None,
-    "an errored chunk is an unknown span contributor -- the run's id span is unknown",
+    SpanKnowledge::AtLeast(2),
+    "an errored chunk leaves the exact total unknown, but the two surviving chunks' \
+     ordinals still lower-bound the run's span (round 12; was the bound-less None)",
   );
   let compute = crate::options::ComputeOptions::new();
   assert!(
@@ -2233,16 +2235,16 @@ fn recover_vad_run_facts_carries_sink_facts_with_explicit_schedule_and_span() {
   // FIRST-observed language (the sink accumulated these across every chunk in
   // ingestion order, a dropped chunk's "es" included, so no later survivor can
   // overwrite it) — and sets the worker schedule and decoded span EXPLICITLY.
-  // Under the absorbing-None laws (F2/F3) the sink's own None schedule/span can no
-  // longer be merged from the survivors without absorbing them, so the caller
-  // hands them in: the schedule it folded over all chunks, and the merged
-  // surviving result's own span.
+  // The sink's own schedule cannot be merged from the survivors without absorbing
+  // them to None (F2), and its wholly-unknown span seed cannot supply the exact
+  // count (round 12), so the caller hands both in explicitly: the schedule it
+  // folded over all chunks, and the merged surviving result's own span.
   //
   // Mutation proof: swap the two `with_*` calls in `recover_vad_run_facts` for a
   // `merge` of a survivor-facts record and the explicit schedule/span are
   // absorbed to None under the round-10 laws.
   let sink = TaskFacts::observed_clean().with_observed_language(Some("es".into()));
-  let facts = recover_vad_run_facts(sink, Some(vec![1]), Some(1));
+  let facts = recover_vad_run_facts(sink, Some(vec![1]), SpanKnowledge::Exact(1));
   assert_eq!(
     facts.observed_language(),
     Some("es"),
@@ -2261,7 +2263,7 @@ fn recover_vad_run_facts_carries_sink_facts_with_explicit_schedule_and_span() {
   );
   assert_eq!(
     facts.decoded_span(),
-    Some(1),
+    SpanKnowledge::Exact(1),
     "and the merged surviving result's id span, likewise",
   );
 }
@@ -2271,16 +2273,26 @@ fn recover_vad_run_facts_keeps_a_zero_chunk_run_clean_and_known_empty() {
   // F4 (codex round 9) + round 10 (F2), the VAD facts assembly in isolation for a
   // genuine zero-chunk run. The sink is observed_clean (Some(false)/Some(false) —
   // the run watched and saw no draw or truncation), the caller folds the schedule
-  // to the known-empty Some([]) (zero chunks = zero workers OBSERVED), and the
-  // empty merge carries no span (None). The record stays reproducible AND records
-  // a KNOWN-empty schedule, distinct from the unknown None a run that cannot see
-  // its workers would carry.
+  // to the known-empty Some([]) (zero chunks = zero workers OBSERVED), and passes
+  // the KNOWN-empty span `Exact(0)` (a zero-chunk run KNOWS it allocated no
+  // ordinals, round 12 — distinct from the wholly-unknown `AtLeast(0)`). The record
+  // stays reproducible AND records a KNOWN-empty schedule, distinct from the
+  // unknown None a run that cannot see its workers would carry.
   //
   // Mutation proof: pass `None` for the schedule (the pre-round-10 zero-chunk
   // value) and the known-empty assertion below fails.
-  let facts = recover_vad_run_facts(TaskFacts::observed_clean(), Some(Vec::new()), None);
+  let facts = recover_vad_run_facts(
+    TaskFacts::observed_clean(),
+    Some(Vec::new()),
+    SpanKnowledge::Exact(0),
+  );
   assert_eq!(facts.drew_from_rng(), Some(false));
   assert_eq!(facts.early_stopped(), Some(false));
+  assert_eq!(
+    facts.decoded_span(),
+    SpanKnowledge::Exact(0),
+    "a zero-chunk run KNOWS it allocated no ordinals -- Exact(0), not wholly-unknown",
+  );
   let known_empty: &[usize] = &[];
   assert_eq!(
     facts.worker_schedule(),

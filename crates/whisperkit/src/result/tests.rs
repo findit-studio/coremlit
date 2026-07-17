@@ -1,5 +1,8 @@
 use super::*;
-use crate::{options::DecodingOptions, task_facts::TaskFacts};
+use crate::{
+  options::DecodingOptions,
+  task_facts::{SpanKnowledge, TaskFacts},
+};
 
 // ---------------------------------------------------------------------
 // merge_transcription_results
@@ -224,7 +227,7 @@ fn merge_drop_on_advances_the_id_base_past_an_all_dropped_chunk() {
     let mut s = TranscriptionSegment::new();
     s.set_id(0).set_text(" World").set_tokens(vec![20]);
     TranscriptionResult::new(" World", vec![s], "en", TranscriptionTimings::new())
-      .with_task_facts(TaskFacts::unknown().with_decoded_span(Some(1)))
+      .with_task_facts(TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(1)))
   };
   let speech_id = |merged: &TranscriptionResult| {
     merged
@@ -238,7 +241,7 @@ fn merge_drop_on_advances_the_id_base_past_an_all_dropped_chunk() {
   // Drop ON: the blank was dropped in the task, so the chunk has zero survivors
   // but reports its decoded span of 1.
   let all_dropped = TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
-    .with_task_facts(TaskFacts::unknown().with_decoded_span(Some(1)));
+    .with_task_facts(TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(1)));
   let dropped =
     merge_transcription_results_with_options(&[all_dropped, speech()], &DecodingOptions::new());
   assert!(
@@ -260,7 +263,7 @@ fn merge_drop_on_advances_the_id_base_past_an_all_dropped_chunk() {
     "en",
     TranscriptionTimings::new(),
   )
-  .with_task_facts(TaskFacts::unknown().with_decoded_span(Some(1)));
+  .with_task_facts(TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(1)));
   let emitted = merge_transcription_results_with_options(
     &[blank_kept, speech()],
     &DecodingOptions::new().maybe_drop_blank_audio(false),
@@ -283,7 +286,7 @@ fn span_one_speech(token: u32) -> TranscriptionResult {
   let mut s = TranscriptionSegment::new();
   s.set_id(0).set_text(" W").set_tokens(vec![token]);
   TranscriptionResult::new(" W", vec![s], "en", TranscriptionTimings::new())
-    .with_task_facts(TaskFacts::unknown().with_decoded_span(Some(1)))
+    .with_task_facts(TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(1)))
 }
 
 /// Segment ids of a result, in order.
@@ -306,7 +309,7 @@ fn drop_on_merge_is_associative_over_the_id_span() {
   let opts = DecodingOptions::new(); // drop ON (the default)
   let a = span_one_speech(20);
   let b = TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
-    .with_task_facts(TaskFacts::unknown().with_decoded_span(Some(1)));
+    .with_task_facts(TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(1)));
   let c = span_one_speech(21);
 
   // One-shot over all three.
@@ -319,15 +322,15 @@ fn drop_on_merge_is_associative_over_the_id_span() {
   );
   assert_eq!(
     one_shot.task_facts().decoded_span(),
-    Some(3),
-    "the aggregate span is the sum of the children's"
+    SpanKnowledge::Exact(3),
+    "the aggregate span is the exact sum of the children's"
   );
 
   // Staged: merge [a, b] (the VAD result), then re-merge that with c (finalize).
   let vad = merge_transcription_results_with_options(&[a, b], &opts);
   assert_eq!(
     vad.task_facts().decoded_span(),
-    Some(2),
+    SpanKnowledge::Exact(2),
     "the VAD result STORES its aggregate span (the R6-F3 fix)"
   );
   let staged = merge_transcription_results_with_options(&[vad, c], &opts);
@@ -336,37 +339,101 @@ fn drop_on_merge_is_associative_over_the_id_span() {
     segment_ids(&one_shot),
     "a staged re-merge renumbers identically to a one-shot merge"
   );
-  assert_eq!(staged.task_facts().decoded_span(), Some(3));
+  assert_eq!(staged.task_facts().decoded_span(), SpanKnowledge::Exact(3));
+}
+
+#[test]
+fn drop_on_merge_preserves_known_empty_span_after_unknown_prefix() {
+  // THE round-12 regression. A reachable history the pre-round-12 absorbing-`None`
+  // span numbered differently by grouping:
+  //   A -- a survivor at local id 0, span `AtLeast(1)`: the shape a VAD run leaves
+  //        when it drops an errored chunk but keeps a survivor whose 1 ordinal is a
+  //        KNOWN lower bound on the (now-unknown-exact) total;
+  //   B -- NO survivors, span `Exact(1)`: a known-empty span (a blank-only chunk
+  //        that allocated an ordinal then had it filtered);
+  //   T -- a trailing survivor at local id 0, span `Exact(1)`.
+  // A one-shot `merge([A, B, T])` numbers the survivors `[0, 2]` (A's survivor at
+  // 0, B's known ordinal consumes 1, T's survivor at 2). The pre-round-12 fold let
+  // A's unknown span ABSORB B's `Exact(1)` to a bound-less `None`, so a staged
+  // `merge([merge([A, B]), T])` could recover only the intermediate's survivor
+  // extent (1) and renumbered T onto id 1 -- `[0, 1]`. The round-12 `SpanKnowledge`
+  // sum keeps B's known ordinal as the aggregate's lower bound (`AtLeast(1) +
+  // Exact(1) = AtLeast(2)`), so ALL THREE groupings store `AtLeast(3)` and number
+  // T identically at id 2.
+  //
+  // Mutation proof: revert `SpanKnowledge::merge`'s `AtLeast` arm to the absorbing
+  // `_ => Self::AtLeast(0)` and the staged groupings lose B's known ordinal,
+  // landing T on id 1 while the one-shot keeps `[0, 2]` -- the equalities below fail.
+  let a = || {
+    let mut seg = TranscriptionSegment::new();
+    seg.set_id(0).set_text(" A").set_tokens(vec![20]);
+    TranscriptionResult::new(" A", vec![seg], "en", TranscriptionTimings::new())
+      .with_task_facts(TaskFacts::unknown().with_decoded_span(SpanKnowledge::AtLeast(1)))
+  };
+  let b = || {
+    TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
+      .with_task_facts(TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(1)))
+  };
+  let t = || span_one_speech(21); // trailing survivor at local id 0, Exact(1)
+
+  let opts = DecodingOptions::new(); // drop ON (the default)
+  let one_shot = merge_transcription_results_with_options(&[a(), b(), t()], &opts);
+  let left_staged = merge_transcription_results_with_options(
+    &[
+      merge_transcription_results_with_options(&[a(), b()], &opts),
+      t(),
+    ],
+    &opts,
+  );
+  let right_staged = merge_transcription_results_with_options(
+    &[
+      a(),
+      merge_transcription_results_with_options(&[b(), t()], &opts),
+    ],
+    &opts,
+  );
+
+  for (label, merged) in [
+    ("one-shot", &one_shot),
+    ("left-staged", &left_staged),
+    ("right-staged", &right_staged),
+  ] {
+    assert_eq!(
+      segment_ids(merged),
+      vec![0, 2],
+      "{label}: B's known empty span must keep T on id 2, never absorbed away to id 1",
+    );
+    assert_eq!(
+      merged.task_facts().decoded_span(),
+      SpanKnowledge::AtLeast(3),
+      "{label}: the stored aggregate is the grouping-independent lower bound",
+    );
+  }
 }
 
 #[test]
 fn drop_on_merge_is_associative_with_mixed_tracked_and_untracked_spans() {
-  // F1 (codex round 6 post-consolidation), corrected for round 10's absorbing-`None`
-  // span law (F3) and round 11's read-time-only inference (L). The invariant this
-  // test exists to guard is unchanged: `[untracked-with-one-survivor, tracked span
-  // 1, tracked span 1]` must renumber IDENTICALLY one-shot vs. staged (the round-6
-  // F1 defect renumbered them differently).
+  // F1 (codex round 6 post-consolidation), corrected under round 12. The invariant
+  // this test guards is unchanged: `[wholly-unknown-with-one-survivor, exact span
+  // 1, exact span 1]` must renumber IDENTICALLY one-shot vs. staged (the round-6 F1
+  // defect renumbered them differently).
   //
-  // ORACLE CORRECTION (round 11, L): the R6-F1 repair did this by SUBSTITUTING each
-  // child's EFFECTIVE span (the survivor-extent fallback) into the stored fact, so
-  // the aggregate stored `Some(3)`. That materialization of an INFERRED extent is
-  // the round-11 defect — it breaks grouping-independence once a survivor overflows
-  // (see `drop_on_merge_trailing_id_is_grouping_independent_across_an_overflow`). The
-  // fold now merges the RAW stored span under the absorbing-`None` law, so the
-  // untracked child `a` (`None`) ABSORBS the aggregate to `None` — the honest "this
-  // total is unknown" a hand-built untracked contributor forces. The IDS are
-  // UNCHANGED: the id base still advances by the read-time `effective_decoded_span`,
-  // which floors a stored `None` at the survivors' extent, so no re-merge
-  // under-counts its survivors and the staged/one-shot ids stay identical. Round
-  // 10's absorbing law plus that read-time floor already deliver R6-F1's guarantee
-  // without the harmful materialization.
+  // ORACLE CORRECTION (codex round 12): the pre-round-12 fold ABSORBED the whole
+  // aggregate to `None` the moment the wholly-unknown child `a` participated, so
+  // the stored span read back `None` and only the read-time extent floor kept the
+  // ids right. Under the `SpanKnowledge` sum an unknown child no longer erases its
+  // known siblings: `AtLeast(0) + Exact(1) + Exact(1) = AtLeast(2)`, so the stored
+  // span carries the KNOWN lower bound and the ids stay `[0, 1, 2]` in every
+  // grouping BY CONSTRUCTION — the read-time floor over `a`'s own survivor extent
+  // only lifts `a`'s advance to 1, and the associative sum carries the rest.
   //
-  // Mutation proof: restore the fold's `.with_decoded_span(effective_decoded_span(
-  // result))` substitution and the stored spans read back `Some(3)`/`Some(2)`,
-  // failing the `None` assertions below (the ids stay `[0, 1, 2]` either way).
+  // Mutation proof: revert `SpanKnowledge::merge`'s `AtLeast` arm to the absorbing
+  // `_ => None` and the stored-span assertions read back the wholly-unknown
+  // `AtLeast(0)` instead of the `AtLeast(1)`/`AtLeast(2)` bounds (the ids stay
+  // `[0, 1, 2]`, carried by the read-time floor either way).
   let opts = DecodingOptions::new(); // drop ON (the default)
   // A: a public `new` result — one surviving segment (local id 0), span
-  // UNTRACKED (`None`), the documented contract of the public constructor.
+  // WHOLLY UNKNOWN (`AtLeast(0)`), the documented contract of the public constructor.
   let untracked = |token: u32| {
     let mut seg = TranscriptionSegment::new();
     seg.set_id(0).set_text(" A").set_tokens(vec![token]);
@@ -375,46 +442,49 @@ fn drop_on_merge_is_associative_with_mixed_tracked_and_untracked_spans() {
   let a = untracked(20);
   assert_eq!(
     a.task_facts().decoded_span(),
-    None,
-    "the public constructor leaves the span untracked, yet a segment survives"
+    SpanKnowledge::wholly_unknown(),
+    "the public constructor leaves the span wholly unknown, yet a segment survives"
   );
-  let b = span_one_speech(21); // tracked span 1, one segment
-  let c = span_one_speech(22); // tracked span 1, one segment
+  let b = span_one_speech(21); // exact span 1, one segment
+  let c = span_one_speech(22); // exact span 1, one segment
 
   let one_shot =
     merge_transcription_results_with_options(&[a.clone(), b.clone(), c.clone()], &opts);
   assert_eq!(
     segment_ids(&one_shot),
     vec![0, 1, 2],
-    "the untracked child's one survivor still consumes ordinal 0"
+    "the wholly-unknown child's one survivor still consumes ordinal 0"
   );
   assert_eq!(
     one_shot.task_facts().decoded_span(),
-    None,
-    "the untracked child absorbs the stored aggregate to `None` (round 10 F3 / round \
-     11 L) — the read-time extent floor, not a materialized `Some(3)`, drives the ids",
+    SpanKnowledge::AtLeast(2),
+    "the known siblings survive as the aggregate's lower bound (round 12), never \
+     absorbed away to `AtLeast(0)`",
   );
 
   // Staged: merge [a, b], then re-merge that with c.
   let ab = merge_transcription_results_with_options(&[a, b], &opts);
   assert_eq!(
     ab.task_facts().decoded_span(),
-    None,
-    "the intermediate keeps the untracked child's `None`, never a materialized extent",
+    SpanKnowledge::AtLeast(1),
+    "the intermediate carries the known sibling's ordinal as its lower bound",
   );
   let staged = merge_transcription_results_with_options(&[ab, c], &opts);
   assert_eq!(
     segment_ids(&staged),
     segment_ids(&one_shot),
     "a staged re-merge renumbers identically to a one-shot merge — the invariant, \
-     preserved by the read-time extent floor over the stored `None`",
+     now carried by the associative stored span plus the read-time extent floor",
   );
   assert_eq!(
     segment_ids(&staged),
     vec![0, 1, 2],
-    "and both groupings land the same ids the read-time floor recovers",
+    "and both groupings land the same ids",
   );
-  assert_eq!(staged.task_facts().decoded_span(), None);
+  assert_eq!(
+    staged.task_facts().decoded_span(),
+    SpanKnowledge::AtLeast(2)
+  );
 }
 
 #[test]
@@ -430,7 +500,7 @@ fn local_agreement_over_a_premerged_vad_result_preserves_the_id_span() {
     &[
       span_one_speech(20),
       TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
-        .with_task_facts(TaskFacts::unknown().with_decoded_span(Some(1))),
+        .with_task_facts(TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(1))),
     ],
     &opts,
   );
@@ -476,16 +546,13 @@ fn merge_concatenates_worker_schedules_not_just_the_first() {
 
 #[test]
 fn plain_merge_completes_on_a_usize_max_segment_id_without_panicking() {
-  // F4 (codex round 8). The drop-OFF (plain) merge outputs ids as Swift's
-  // `result_index + segment_index` and NEVER consults the decoded span for the
-  // id mapping -- yet the task-facts fold still derives each child's effective
-  // span, where a hand-built `usize::MAX` segment id overflowed `max + 1` and
-  // panicked. The fold now records that unknowable span as `None` (untracked)
-  // instead of aborting, so the merge completes and the output id is the exact
-  // Swift ordinal 0.
-  //
-  // Mutation proof: revert `effective_decoded_span`'s `checked_add(1)` back to
-  // `.expect(...)` and this merge panics instead of completing.
+  // F4 (codex round 8), preserved under round 12. The drop-OFF (plain) merge
+  // outputs ids as Swift's `result_index + segment_index` and NEVER consults the
+  // decoded span for the id mapping, so a hand-built `usize::MAX` segment id whose
+  // `max + 1` extent overflows cannot panic here: the `SpanKnowledge` fold sums
+  // the RAW carried spans (this public-`new` child's wholly-unknown `AtLeast(0)`)
+  // and never touches the overflowing survivor extent. The merge completes and the
+  // output id is the exact Swift ordinal 0.
   let mut seg = TranscriptionSegment::new();
   seg.set_id(usize::MAX).set_text(" X").set_tokens(vec![20]);
   let adversarial = TranscriptionResult::new(" X", vec![seg], "en", TranscriptionTimings::new());
@@ -500,8 +567,8 @@ fn plain_merge_completes_on_a_usize_max_segment_id_without_panicking() {
   );
   assert_eq!(
     merged.task_facts().decoded_span(),
-    None,
-    "the overflowing extent is recorded untracked, not panicked on",
+    SpanKnowledge::wholly_unknown(),
+    "the public child's wholly-unknown span folds through untouched, not panicked on",
   );
 
   // The same through the confirmed-words door with `drop_blank_audio = false` --
@@ -535,21 +602,19 @@ fn drop_on_merge_still_panics_on_a_usize_max_segment_id() {
 
 #[test]
 fn a_merge_created_span_never_undercounts_its_own_survivors() {
-  // F2 (codex round 9), corrected for round 10's absorbing-`None` span law (F3). A
-  // plain (drop-OFF) merge renumbers segments by `result_index + segment_index`,
-  // but the task-facts fold sums each child's EFFECTIVE span — and a child whose
-  // extent overflowed (a `usize::MAX` survivor) folds in as untracked (`None`).
+  // F2 (codex round 9), corrected under round 12. A plain (drop-OFF) merge
+  // renumbers segments by `result_index + segment_index`, and here both children
+  // are public-`new` results carrying the wholly-unknown span (`AtLeast(0)`), so
+  // `[A(usize::MAX id), B(id 0)]` stores `AtLeast(0)` — neither child carries a
+  // known ordinal to lower-bound the aggregate with.
   //
-  // ORACLE CORRECTION (round 10, F3): that untracked child is now ABSORBING, so
-  // `[A(usize::MAX id, no span), B(id 0)]` stores `None` rather than the
-  // pre-round-10 `Some(2)` (the sibling's span clamped up to the extent, which the
-  // old identity-`None` fold let survive). The "never under-count its survivors"
-  // GUARANTEE is unchanged: it lives entirely in the read-time
-  // `effective_decoded_span`, which floors the stored `None` at the survivors' own
-  // extent (max id 1 + 1 = 2). So a staged drop-ON re-merge still advances its id
-  // base by 2 and renumbers `C` past the survivors — `[0, 1, 2]`, never `[0, 1, 1]`.
+  // The "never under-count its survivors" GUARANTEE is unchanged: it lives in the
+  // read-time `effective_decoded_span`, which floors the stored span's lower bound
+  // at the survivors' own extent (max id 1 + 1 = 2). So a staged drop-ON re-merge
+  // still advances its id base by 2 and renumbers `C` past the survivors — `[0, 1,
+  // 2]`, never `[0, 1, 1]`.
   //
-  // Mutation proof: revert `effective_decoded_span`'s `carried.max(extent)` (or its
+  // Mutation proof: revert `effective_decoded_span`'s `.max(extent)` (or its
   // `checked_add(1)`) and the staged ids collapse to `[0, 1, 1]`.
   let mut a_seg = TranscriptionSegment::new();
   a_seg.set_id(usize::MAX).set_text(" A").set_tokens(vec![20]);
@@ -563,13 +628,13 @@ fn a_merge_created_span_never_undercounts_its_own_survivors() {
   assert_eq!(segment_ids(&ab), vec![0, 1], "drop-OFF reindex");
   assert_eq!(
     ab.task_facts().decoded_span(),
-    None,
-    "the unknowable `usize::MAX` child absorbs the merged span to unknown (round 10, F3, \
-     was Some(2))",
+    SpanKnowledge::wholly_unknown(),
+    "two wholly-unknown children carry no known ordinal, so the aggregate stays \
+     wholly unknown (round 12)",
   );
 
   // A staged drop-ON re-merge with a trailing chunk stays injective: the stored
-  // `None` floors at the survivors' extent (2), so C lands at id 2, not id 1.
+  // span's lower bound floors at the survivors' extent (2), so C lands at id 2, not id 1.
   let mut c_seg = TranscriptionSegment::new();
   c_seg.set_id(0).set_text(" C").set_tokens(vec![22]);
   let c = TranscriptionResult::new(" C", vec![c_seg], "en", TranscriptionTimings::new());
@@ -583,82 +648,71 @@ fn a_merge_created_span_never_undercounts_its_own_survivors() {
 
 #[test]
 fn drop_on_merge_trailing_id_is_grouping_independent_across_an_overflow() {
-  // F3 (round 10), the result-level effect of the absorbing-`None` span law. Three
-  // all-dropped chunks (no survivors, carried spans only) with spans MAX, 1, 2 --
-  // the triple whose merge grouping the pre-fix identity-`None` made non-
-  // associative. `effective_decoded_span` drives a drop-ON re-merge's id base, so
-  // the STORED span of the grouped intermediate decides where a trailing chunk
-  // lands:
-  //   (A·B)·C -- the one-shot left fold -- stored `Some(2)` pre-fix (`MAX+1`
-  //             overflowed to `None`, then the identity read it back as zero so
-  //             `None+2 = Some(2)`), landing the trailing chunk at id 2;
-  //   A·(B·C) -- pre-merge B,C then fold A -- stored `None` (`1+2=3`, then `MAX+3`
-  //             overflowed), landing the trailing chunk at id 0.
-  // A documented-associative merge law numbered the SAME inputs differently by
-  // grouping. With `None` ABSORBING both intermediates store `None`, so the
-  // trailing chunk lands at id 0 either way.
+  // F3 (round 10), corrected under round 12. Three all-dropped chunks (no
+  // survivors, carried spans only) with spans MAX, 1, 2 -- the triple whose merge
+  // grouping the pre-fix identity-`None` made non-associative. Under the round-12
+  // `SpanKnowledge` sum the STORED span of the grouped intermediate is
+  // grouping-independent by construction:
+  //   (A·B)·C -- `Exact(MAX)·Exact(1)` overflows to `AtLeast(MAX)`, then
+  //             `·Exact(2)` saturates -> `AtLeast(MAX)`;
+  //   A·(B·C) -- `Exact(1)·Exact(2) = Exact(3)`, then `Exact(MAX)·Exact(3)`
+  //             overflows -> `AtLeast(MAX)`.
+  // Both groupings store `AtLeast(usize::MAX)` (the saturated lower bound of the
+  // true total `MAX + 3`) -- the associativity the pre-round-12 absorbing/identity
+  // `None` could not give. A trailing drop-ON merge over such a saturated span
+  // advances the id base by `usize::MAX` and hits the documented drop-ON overflow
+  // panic (see `drop_on_merge_still_panics_on_a_usize_max_segment_id`), so the
+  // grouping-independence is asserted directly on the STORED span here; the
+  // reachable-span trailing-id path is proved in the materialized-overflow variant
+  // below.
   //
-  // Mutation proof: revert the `decoded_span` merge to the `(some, None) | (None,
-  // some) => some` identity arm and the (A·B)·C grouping's trailing id becomes 2
-  // while A·(B·C) stays 0 -- the equality below fails.
+  // Mutation proof: revert `SpanKnowledge::merge`'s `Exact + Exact` overflow arm to
+  // the identity/absorbing `None` and the two groupings diverge, failing the
+  // equality.
   let all_dropped = |span: usize| {
     TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
-      .with_task_facts(TaskFacts::unknown().with_decoded_span(Some(span)))
+      .with_task_facts(TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(span)))
   };
   let a = || all_dropped(usize::MAX);
   let b = || all_dropped(1);
   let c = || all_dropped(2);
-  let trailing = span_one_speech(30); // one survivor at local id 0
 
   // (A·B)·C: the one-shot left fold over all three.
   let left_grouped = merge_transcription_results(&[a(), b(), c()]);
   // A·(B·C): pre-merge B and C, then fold A over that intermediate.
   let bc = merge_transcription_results(&[b(), c()]);
   let right_grouped = merge_transcription_results(&[a(), bc]);
-
-  let opts = DecodingOptions::new(); // drop ON
-  let left_ids = segment_ids(&merge_transcription_results_with_options(
-    &[left_grouped, trailing.clone()],
-    &opts,
-  ));
-  let right_ids = segment_ids(&merge_transcription_results_with_options(
-    &[right_grouped, trailing],
-    &opts,
-  ));
   assert_eq!(
-    left_ids, right_ids,
-    "a documented-associative merge law must number the trailing chunk identically \
-     for both groupings",
+    left_grouped.task_facts().decoded_span(),
+    right_grouped.task_facts().decoded_span(),
+    "a documented-associative merge law must store the same span for both groupings",
   );
   assert_eq!(
-    left_ids,
-    vec![0],
-    "both overflow-absorbing intermediates store `None`, so the trailing chunk falls \
-     back to the survivors' extent -> id 0",
+    left_grouped.task_facts().decoded_span(),
+    SpanKnowledge::AtLeast(usize::MAX),
+    "the overflowed total is the saturated lower bound, grouping-independent",
   );
 
-  // Round 11 (L): the MATERIALIZED-overflow variant the all-dropped case above
-  // misses. Here the overflowing child A carries a real SURVIVOR at id `usize::MAX`
-  // (stored span `None`), and a drop-OFF prefix merge reindexes it to id 0 —
-  // materializing the survivor extent. The pre-round-11 fold SUBSTITUTED
-  // `effective_decoded_span` into the stored fact, so `merge([A])`'s laundered
-  // `None -> Some(1)` made `merge([merge([A]), B])` store `Some(3)` while the
-  // one-shot `merge([A, B])` stored `None`; a trailing drop-ON merge then numbered
-  // the SAME inputs `[0, 1]` one-shot but `[0, 3]` staged. Folding the RAW stored
-  // span keeps a stored `None` as `None` through both groupings, so the stored
-  // facts AND the trailing ids are identical.
+  // Round 11 (L), corrected under round 12: the materialized-overflow variant with
+  // a real SURVIVOR. The overflowing child A carries a survivor at id `usize::MAX`
+  // (wholly-unknown span `AtLeast(0)`), and a drop-OFF prefix merge reindexes it to
+  // id 0. The pre-round-11 fold substituted an inferred extent into the stored fact
+  // and diverged the groupings; the round-12 fold sums the RAW `SpanKnowledge`, so
+  // `A(AtLeast(0)) · B(Exact(2)) = AtLeast(2)` in EVERY grouping -- B's KNOWN 2
+  // ordinals survive as the aggregate's lower bound (the round-12 fix: the
+  // pre-round-12 `None` erased them, landing the trailing chunk on id 1). The
+  // stored span AND the trailing drop-ON ids are then grouping-independent.
   //
-  // Mutation proof: restore the fold's `.with_decoded_span(effective_decoded_span(
-  // result))` substitution and the staged grouping stores `Some(3)`, landing the
-  // trailing segment at id 3 while the one-shot stays at id 1 — both equalities
-  // below fail.
+  // Mutation proof: revert `SpanKnowledge::merge`'s `AtLeast` arm to the absorbing
+  // `_ => None` and the stored span reads back the wholly-unknown `AtLeast(0)`,
+  // dropping the trailing id from 2 back to 1 -- both the value assertions fail.
   let a_overflow = || {
     let mut seg = TranscriptionSegment::new();
     seg.set_id(usize::MAX).set_text(" A").set_tokens(vec![20]);
-    // A public `new` result: one survivor, span UNTRACKED (`None`).
+    // A public `new` result: one survivor, span WHOLLY UNKNOWN (`AtLeast(0)`).
     TranscriptionResult::new(" A", vec![seg], "en", TranscriptionTimings::new())
   };
-  let b_dropped = || all_dropped(2); // no survivors, carried span Some(2)
+  let b_dropped = || all_dropped(2); // no survivors, carried span Exact(2)
   let t = || span_one_speech(31); // one trailing survivor at local id 0
 
   // One-shot `merge([A, B])` and staged `merge([merge([A]), B])` — both drop-OFF,
@@ -669,15 +723,16 @@ fn drop_on_merge_trailing_id_is_grouping_independent_across_an_overflow() {
   assert_eq!(
     one_shot_ab.task_facts().decoded_span(),
     staged_ab.task_facts().decoded_span(),
-    "materializing the overflowing prefix must not diverge the stored span",
+    "the overflowing prefix must not diverge the stored span across groupings",
   );
   assert_eq!(
     one_shot_ab.task_facts().decoded_span(),
-    None,
-    "A's untracked `None` survives the merge as `None`, never a materialized extent",
+    SpanKnowledge::AtLeast(2),
+    "B's KNOWN 2 ordinals survive as the aggregate's lower bound (round 12), never erased",
   );
 
   // A trailing drop-ON merge must number both groupings identically.
+  let opts = DecodingOptions::new(); // drop ON
   let one_shot_trailing = segment_ids(&merge_transcription_results_with_options(
     &[one_shot_ab, t()],
     &opts,
@@ -692,28 +747,31 @@ fn drop_on_merge_trailing_id_is_grouping_independent_across_an_overflow() {
   );
   assert_eq!(
     one_shot_trailing,
-    vec![0, 1],
-    "both store `None`, so the trailing segment lands past the single survivor -> id 1",
+    vec![0, 2],
+    "B's preserved lower bound of 2 lands the trailing segment past it -> id 2 (round 12; \
+     the pre-round-12 `None` erased B's ordinal and landed it on id 1)",
   );
 }
 
 #[test]
 fn a_public_results_too_small_span_is_distrusted_at_merge_input() {
-  // F2 sibling (codex round 9). A PUBLIC result whose carried span is below its
-  // survivor extent — a hand-built or deserialized inconsistency — must not be
-  // trusted at merge INPUT: two survivors `[0, 1]` (extent 2) carrying a span of
-  // `Some(1)` would, if believed, advance the drop-ON id base by only 1 and
-  // renumber a trailing chunk onto id 1. `effective_decoded_span` now clamps up
-  // to the survivor extent, keeping the merge injective.
+  // F2 sibling (codex round 9), preserved under round 12. A PUBLIC result whose
+  // carried span is below its survivor extent — a hand-built or deserialized
+  // inconsistency — must not be trusted at merge INPUT: two survivors `[0, 1]`
+  // (extent 2) carrying `Exact(1)` would, if believed, advance the drop-ON id base
+  // by only 1 and renumber a trailing chunk onto id 1. `effective_decoded_span`
+  // floors the carried span's lower bound at the survivor extent, keeping the
+  // merge injective.
   //
-  // Mutation proof: revert `effective_decoded_span` to trust the carried `Some`
-  // verbatim and the staged ids collapse to `[0, 1, 1]`.
+  // Mutation proof: revert `effective_decoded_span` to trust the carried lower
+  // bound verbatim (drop the `.max(extent)`) and the staged ids collapse to
+  // `[0, 1, 1]`.
   let mut s0 = TranscriptionSegment::new();
   s0.set_id(0).set_text(" R0").set_tokens(vec![20]);
   let mut s1 = TranscriptionSegment::new();
   s1.set_id(1).set_text(" R1").set_tokens(vec![21]);
   let r = TranscriptionResult::new(" R0 R1", vec![s0, s1], "en", TranscriptionTimings::new())
-    .with_task_facts(TaskFacts::unknown().with_decoded_span(Some(1)));
+    .with_task_facts(TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(1)));
   let mut c_seg = TranscriptionSegment::new();
   c_seg.set_id(0).set_text(" C").set_tokens(vec![22]);
   let c = TranscriptionResult::new(" C", vec![c_seg], "en", TranscriptionTimings::new());

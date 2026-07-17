@@ -67,7 +67,7 @@ use crate::{
   error::TranscribeError,
   options::DecodingOptions,
   result::{TranscriptionResult, WordTiming, merge_transcription_results_with_words},
-  task_facts::TaskFactsAccumulator,
+  task_facts::{SpanKnowledge, TaskFactsAccumulator},
   text::{find_longest_common_prefix, find_longest_different_suffix},
   transcribe::WhisperKit,
 };
@@ -356,20 +356,21 @@ impl LocalAgreement {
     // redraws its unseeded sample may land different confirmed text — so its draw
     // must not vanish with its segments.
     //
-    // Worker schedule and id span are stripped to `None` here. For the SCHEDULE
-    // this is the ADJUDICATED agreement contract (round 10, F2): agreement-confirmed
-    // text interleaves words from MULTIPLE hypotheses, so no single ordered worker
+    // Worker schedule and id span are stripped here. For the SCHEDULE this is the
+    // ADJUDICATED agreement contract (round 10, F2): agreement-confirmed text
+    // interleaves words from MULTIPLE hypotheses, so no single ordered worker
     // attribution is knowable — every contributor is `None`, which under the
     // absorbing-`None` law is exactly what the finalized aggregate must read back
-    // (`finalize` leaves it there). For the SPAN the strip keeps `ingested_facts`
-    // from summing dropped hypotheses' ordinals; `finalize` restores the merged
-    // surviving result's own span, the authoritative id-ordinal count.
+    // (`finalize` leaves it there). For the SPAN the strip to the wholly-unknown
+    // `AtLeast(0)` keeps `ingested_facts` from summing dropped hypotheses'
+    // ordinals; `finalize` overwrites it with the merged surviving result's own
+    // span, the authoritative id-ordinal count.
     self.ingested_facts.merge(
       &result
         .task_facts()
         .clone()
         .with_worker_schedule(None)
-        .with_decoded_span(None),
+        .with_decoded_span(SpanKnowledge::wholly_unknown()),
     );
 
     // :371 gate — see this module's doc for "any segment" vs. Swift's
@@ -446,8 +447,9 @@ impl LocalAgreement {
   /// FIRST-observed language then wins over a later surviving result's, where
   /// folding the sink last let the survivor's win (F3). The worker schedule is
   /// the adjudicated `None` (agreement attribution is unknown, round 10, F2) and
-  /// the decoded span is restored from the merged surviving result (round 10, F3,
-  /// whose absorbing-`None` law would otherwise null it); see [`Self::ingest`].
+  /// the decoded span is restored from the merged surviving result (round 10, F3;
+  /// the ingest strip carries only the wholly-unknown span, so the fold cannot
+  /// supply the exact count, round 12); see [`Self::ingest`].
   pub fn finalize(mut self, options: &DecodingOptions) -> TranscriptionResult {
     self.confirmed_words.append(&mut self.last_agreed_words);
     let suffix = find_longest_different_suffix(&self.prev_words, &self.hypothesis_words);
@@ -462,9 +464,11 @@ impl LocalAgreement {
     // answer is unchanged by the order.
     //
     // The DECODED SPAN is then restored from the merged surviving result: the sink
-    // stripped its span to `None` at ingest, and under the absorbing-`None` span
-    // law (round 10, F3) that `None` would otherwise absorb the merged span away,
-    // losing the id-ordinal count a staged re-merge needs. The WORKER SCHEDULE is
+    // stripped its span to the wholly-unknown `AtLeast(0)` at ingest, so the fold
+    // would only lower-bound the merged span (round 12: the strip no longer
+    // absorbs, but it also carries no exact count), losing the authoritative
+    // id-ordinal count a staged re-merge needs. Overwriting with the merged
+    // surviving result's own span restores it exactly. The WORKER SCHEDULE is
     // deliberately left at the `None` the strip and the absorbing merge produce —
     // ADJUDICATED (round 10, F2): agreement-confirmed text interleaves multiple
     // hypotheses, so no single ordered worker attribution is knowable. See the

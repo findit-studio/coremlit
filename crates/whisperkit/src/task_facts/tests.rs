@@ -14,7 +14,9 @@ fn merged(a: &TaskFacts, b: &TaskFacts) -> TaskFacts {
 /// pre-round-8 free monoid on exactly the `Some(false)`/`None` mixes — both
 /// booleans crossed at every combination that matters (`(T, F)`, `(T, T)`,
 /// `(None, F)`); three languages plus the unknown; known single/empty/unknown
-/// schedules; and tracked/untracked spans — including the `unknown()` value and
+/// schedules; and exact / at-least / overflowing / identity (`Exact(0)`) spans,
+/// whose round-12 `SpanKnowledge` sum saturates and degrades across states —
+/// including the `unknown()` value and
 /// an all-dropped-style `[]` schedule. The `N` elements below drive the
 /// `N`-cubed associativity proof of [the Kleene contributor merge](TaskFacts::merge).
 fn corpus() -> Vec<TaskFacts> {
@@ -22,18 +24,18 @@ fn corpus() -> Vec<TaskFacts> {
     TaskFacts::unknown(),
     TaskFacts::unknown()
       .with_worker(0)
-      .with_decoded_span(Some(1)),
+      .with_decoded_span(SpanKnowledge::Exact(1)),
     TaskFacts::unknown()
       .with_drew_from_rng(true)
       .with_worker(2)
-      .with_decoded_span(Some(3)),
+      .with_decoded_span(SpanKnowledge::Exact(3)),
     TaskFacts::unknown()
       .with_observed_language(Some("es".to_string()))
       .with_worker(1),
     TaskFacts::unknown()
       .with_early_stopped(true)
       .with_observed_language(Some("en".to_string()))
-      .with_decoded_span(Some(2)),
+      .with_decoded_span(SpanKnowledge::Exact(2)),
     // POSITIVELY observed `Some(false)` facts — the shape a real greedy,
     // un-truncated decode carries — distinct from the `unknown()` `None` above,
     // so the merge's `Some(false)`/`None`/`Some(true)` mixes are all covered.
@@ -41,7 +43,7 @@ fn corpus() -> Vec<TaskFacts> {
       .with_drew_from_rng(false)
       .with_early_stopped(false)
       .with_worker(4)
-      .with_decoded_span(Some(1)),
+      .with_decoded_span(SpanKnowledge::Exact(1)),
     TaskFacts::unknown()
       .with_drew_from_rng(false)
       .with_early_stopped(true),
@@ -60,15 +62,28 @@ fn corpus() -> Vec<TaskFacts> {
       .with_drew_from_rng(true)
       .with_early_stopped(true)
       .with_observed_language(Some("de".to_string()))
-      .with_decoded_span(Some(4)),
+      .with_decoded_span(SpanKnowledge::Exact(4)),
     TaskFacts::unknown()
       .with_early_stopped(false)
       .with_worker(6),
-    // An overflowing span (round 10, F3): `usize::MAX` alongside the span-1 and
-    // span-2 children above forms the MAX,1,2 triple whose grouping the pre-fix
-    // identity-`None` made non-associative. The absorbing-`None` law must render
-    // every triple that mixes it associative.
-    TaskFacts::unknown().with_decoded_span(Some(usize::MAX)),
+    // An overflowing EXACT span (round 10, F3): `usize::MAX` alongside the span-1
+    // and span-2 children above forms the MAX,1,2 triple whose grouping the pre-fix
+    // identity-`None` made non-associative. The round-12 `SpanKnowledge` sum must
+    // render every triple that mixes it associative.
+    TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(usize::MAX)),
+    // `AtLeast` spans (codex round 12): the KNOWN lower bound the round-12 redesign
+    // adds, at a small bound, at zero (the wholly-unknown value distinct from the
+    // `Exact(0)` identity below), and at the saturated `usize::MAX`. Crossing
+    // exact/at-least/overflow spans is what proves `SpanKnowledge::merge`
+    // associative — checked-add over exacts, saturating once any side is a bound.
+    TaskFacts::unknown()
+      .with_decoded_span(SpanKnowledge::AtLeast(2))
+      .with_worker(8),
+    TaskFacts::unknown().with_decoded_span(SpanKnowledge::AtLeast(0)),
+    TaskFacts::unknown().with_decoded_span(SpanKnowledge::AtLeast(usize::MAX)),
+    // The span monoid identity, `Exact(0)` — a KNOWN-empty span (a zero-chunk VAD
+    // run), distinct from the wholly-unknown `AtLeast(0)` above.
+    TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(0)),
     // Swallowed-error variants (codex round 11, M2): the third Kleene boolean at
     // its `Some(true)` (a swallowed drop) and `Some(false)` (an observed-clean
     // watch) states, crossed with a draw and a worker, so the associativity proof
@@ -336,69 +351,77 @@ fn merge_concatenates_worker_schedules_in_order() {
 fn merge_sums_the_decoded_span() {
   // R6-F3: two KNOWN spans sum to the aggregate ordinal count their children
   // allocated.
-  let s = |n| TaskFacts::unknown().with_decoded_span(Some(n));
-  assert_eq!(merged(&s(2), &s(1)).decoded_span(), Some(3));
+  let s = |n| TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(n));
+  assert_eq!(
+    merged(&s(2), &s(1)).decoded_span(),
+    SpanKnowledge::Exact(3),
+    "two exact spans sum exactly"
+  );
 
-  // ORACLE CORRECTION (round 10, F3): a `None` (untracked) child is now ABSORBING,
-  // not the identity. Once any part of the total is untracked the whole total is
-  // honestly unknown, where the pre-round-10 law let the known sibling pass
-  // through as `Some(2)`. (The read-time `effective_decoded_span` still floors a
-  // merged `None` at the survivors' extent, so a re-merge never under-counts; see
-  // the result-level tests.)
+  // ORACLE CORRECTION (codex round 12): a wholly-unknown (`AtLeast(0)`) child no
+  // longer ABSORBS its known sibling's ordinals — the round-10/11 absorbing-`None`
+  // that the round-12 redesign replaces. The KNOWN sibling survives as the
+  // aggregate's LOWER BOUND: `AtLeast(0) + Exact(2) = AtLeast(2)`, so a staged
+  // re-merge can still advance past the 2 ordinals the sibling allocated, which is
+  // exactly what the pre-round-12 `None` threw away.
   //
-  // Mutation proof: revert the merge to the `(some, None) | (None, some) => some`
-  // identity arm and both `None` expectations below read back `Some(2)`.
+  // Mutation proof: revert `SpanKnowledge::merge`'s `AtLeast` arm to the absorbing
+  // `_ => None` and these `AtLeast(2)` expectations read back the wholly-unknown
+  // `AtLeast(0)`.
   assert_eq!(
     merged(&s(2), &TaskFacts::unknown()).decoded_span(),
-    None,
-    "an untracked child absorbs the aggregate to unknown (was Some(2))",
+    SpanKnowledge::AtLeast(2),
+    "an unknown child lower-bounds, never erases, the known sibling (was absorbing None)",
   );
   assert_eq!(
     merged(&TaskFacts::unknown(), &s(2)).decoded_span(),
-    None,
+    SpanKnowledge::AtLeast(2),
     "and in the other order",
   );
   assert_eq!(
     merged(&TaskFacts::unknown(), &TaskFacts::unknown()).decoded_span(),
-    None,
-    "two untracked children stay unknown",
+    SpanKnowledge::AtLeast(0),
+    "two wholly-unknown children stay wholly unknown",
   );
 }
 
 #[test]
-fn merge_records_an_overflowing_span_as_untracked_not_saturated() {
-  // F2 (codex round 9). Summing two decoded spans that overflow `usize` records
-  // an honest untracked `None`, NOT a fabricated saturated `usize::MAX` a staged
-  // re-merge would then trust as a real ordinal count.
+fn merge_records_an_overflowing_span_as_a_saturated_lower_bound() {
+  // F2 (codex round 9), corrected under round 12. Summing two exact spans that
+  // overflow `usize` has no exact answer, so the sum degrades to a SATURATED LOWER
+  // BOUND `AtLeast(usize::MAX)` — never a fabricated EXACT `usize::MAX` a staged
+  // re-merge would trust as a precise ordinal count, and never (pre-round-12) a
+  // bound-less `None` that threw the count away.
   //
-  // Mutation proof: revert the sum to `Some(a.saturating_add(b))` and this reads
-  // back `Some(usize::MAX)`.
+  // Mutation proof: revert the `Exact + Exact` overflow arm to `Self::Exact(a
+  // .saturating_add(b))` and this reads back the EXACT `usize::MAX`.
   let overflowing = merged(
-    &TaskFacts::unknown().with_decoded_span(Some(usize::MAX)),
-    &TaskFacts::unknown().with_decoded_span(Some(1)),
+    &TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(usize::MAX)),
+    &TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(1)),
   );
   assert_eq!(
     overflowing.decoded_span(),
-    None,
-    "an overflowing span is untracked, not saturated to usize::MAX",
+    SpanKnowledge::AtLeast(usize::MAX),
+    "an overflowing exact sum is a saturated lower bound, not an exact usize::MAX",
   );
 }
 
 #[test]
 fn merge_is_associative_over_an_overflowing_span_triple() {
-  // F3 (round 10). THE associativity failure the absorbing-`None` fix closes:
-  // spans MAX, 1, 2. The pre-round-10 identity-`None` gave `(A·B)·C = Some(2)`
-  // (`MAX + 1` overflowed to `None`, then `None + 2` read the `None` back as zero)
-  // but `A·(B·C) = None` (`1 + 2 = 3`, then `MAX + 3` overflowed) -- a documented-
-  // associative law that was not. With `None` ABSORBING, once the running total
-  // overflows it STAYS `None`, so both groupings agree at `None`.
+  // F3 (round 10), corrected under round 12. THE associativity property the span
+  // law must keep: spans MAX, 1, 2. The pre-round-10 identity-`None` gave
+  // `(A·B)·C = Some(2)` but `A·(B·C) = None`. Under the round-12 `SpanKnowledge`
+  // sum both groupings agree at the saturated lower bound `AtLeast(usize::MAX)`:
+  // `Exact(MAX) + Exact(1)` overflows to `AtLeast(MAX)`, and any further `AtLeast`
+  // participation saturates, so the true total (`MAX + 3`) is reported as the
+  // grouping-independent `AtLeast(usize::MAX)`.
   //
-  // Mutation proof: revert the merge to the `(some, None) | (None, some) => some`
-  // identity arm and the left grouping reads back `Some(2)` while the right stays
-  // `None` -- failing both the equality and the `None` assertion.
-  let a = TaskFacts::unknown().with_decoded_span(Some(usize::MAX));
-  let b = TaskFacts::unknown().with_decoded_span(Some(1));
-  let c = TaskFacts::unknown().with_decoded_span(Some(2));
+  // Mutation proof: revert the `Exact + Exact` overflow arm to the absorbing
+  // `_ => None` (or the identity arm) and the two groupings diverge, failing the
+  // equality.
+  let a = TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(usize::MAX));
+  let b = TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(1));
+  let c = TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(2));
   let left = merged(&merged(&a, &b), &c);
   let right = merged(&a, &merged(&b, &c));
   assert_eq!(
@@ -408,8 +431,8 @@ fn merge_is_associative_over_an_overflowing_span_triple() {
   );
   assert_eq!(
     left.decoded_span(),
-    None,
-    "once the running total overflows it stays unknown (absorbing), not Some(2)",
+    SpanKnowledge::AtLeast(usize::MAX),
+    "the overflowed total is the saturated lower bound, grouping-independent",
   );
 }
 
@@ -501,7 +524,7 @@ fn serde_round_trips_every_field() {
     .with_early_stopped(true)
     .with_had_swallowed_error(true)
     .with_worker_schedule(Some(vec![0, 2]))
-    .with_decoded_span(Some(5));
+    .with_decoded_span(SpanKnowledge::Exact(5));
   let json = serde_json::to_string(&full).unwrap();
   assert_eq!(serde_json::from_str::<TaskFacts>(&json).unwrap(), full);
 
@@ -519,7 +542,8 @@ fn serde_round_trips_every_field() {
   assert_ne!(read.drew_from_rng(), TaskFacts::unknown().drew_from_rng());
 
   // The unknown record round-trips too: null draw/early-stop/language/schedule
-  // read back as explicit unknown, and the absent span defaults to None.
+  // read back as explicit unknown, and the absent span defaults to the
+  // wholly-unknown `AtLeast(0)`.
   let unknown = TaskFacts::unknown();
   let json = serde_json::to_string(&unknown).unwrap();
   assert_eq!(serde_json::from_str::<TaskFacts>(&json).unwrap(), unknown);
@@ -539,7 +563,7 @@ fn the_reproducibility_and_coordinate_facts_are_required_on_deserialize() {
     .with_early_stopped(true)
     .with_had_swallowed_error(true)
     .with_worker_schedule(Some(vec![0, 2]))
-    .with_decoded_span(Some(5));
+    .with_decoded_span(SpanKnowledge::Exact(5));
   let value: serde_json::Value = serde_json::to_value(&full).unwrap();
   assert_eq!(
     serde_json::from_str::<TaskFacts>(&value.to_string()).unwrap(),
@@ -598,13 +622,112 @@ fn the_reproducibility_and_coordinate_facts_are_required_on_deserialize() {
     "null swallowed-error is explicit unknown, never false"
   );
 
-  // The transient span may be dropped without error, reading back untracked.
+  // The transient span may be dropped without error, reading back the
+  // wholly-unknown `AtLeast(0)` (round 12: the old `None`).
   let mut without_span = value;
   without_span.as_object_mut().unwrap().remove("decoded_span");
   assert_eq!(
     serde_json::from_str::<TaskFacts>(&without_span.to_string())
       .unwrap()
       .decoded_span(),
-    None,
+    SpanKnowledge::wholly_unknown(),
   );
+}
+
+// ---------------------------------------------------------------------
+// SpanKnowledge — the two-state id-span fact (coremlit issue #14, codex round 12)
+// ---------------------------------------------------------------------
+
+/// A span corpus spanning both states at the boundary values the merge's
+/// checked/saturating arithmetic cares about: the identity, small counts, and
+/// the `usize::MAX` edge where an exact sum overflows.
+fn span_corpus() -> Vec<SpanKnowledge> {
+  vec![
+    SpanKnowledge::Exact(0), // the merge identity
+    SpanKnowledge::Exact(1),
+    SpanKnowledge::Exact(2),
+    SpanKnowledge::Exact(usize::MAX - 1),
+    SpanKnowledge::Exact(usize::MAX),
+    SpanKnowledge::wholly_unknown(), // AtLeast(0)
+    SpanKnowledge::AtLeast(1),
+    SpanKnowledge::AtLeast(2),
+    SpanKnowledge::AtLeast(usize::MAX),
+  ]
+}
+
+#[test]
+fn span_knowledge_accessors() {
+  assert_eq!(SpanKnowledge::wholly_unknown(), SpanKnowledge::AtLeast(0));
+  assert_eq!(SpanKnowledge::Exact(3).lower_bound(), 3);
+  assert_eq!(SpanKnowledge::AtLeast(3).lower_bound(), 3);
+  assert!(SpanKnowledge::Exact(0).is_exact());
+  assert!(!SpanKnowledge::AtLeast(0).is_exact());
+  // Only `AtLeast(0)` is wholly unknown — `Exact(0)` (a KNOWN-empty span) is not,
+  // so it is serialized rather than skipped.
+  assert!(SpanKnowledge::AtLeast(0).is_wholly_unknown());
+  assert!(!SpanKnowledge::Exact(0).is_wholly_unknown());
+  assert!(!SpanKnowledge::AtLeast(1).is_wholly_unknown());
+}
+
+#[test]
+fn span_knowledge_merge_closed_form() {
+  // Two exacts sum exactly; an overflowing exact sum degrades to the saturated
+  // lower bound; any `AtLeast` participation yields the saturating sum of the two
+  // lower bounds.
+  assert_eq!(
+    SpanKnowledge::Exact(2).merge(SpanKnowledge::Exact(3)),
+    SpanKnowledge::Exact(5),
+  );
+  assert_eq!(
+    SpanKnowledge::Exact(usize::MAX).merge(SpanKnowledge::Exact(1)),
+    SpanKnowledge::AtLeast(usize::MAX),
+    "an exact sum with no usize answer degrades to a saturated lower bound",
+  );
+  assert_eq!(
+    SpanKnowledge::AtLeast(1).merge(SpanKnowledge::Exact(2)),
+    SpanKnowledge::AtLeast(3),
+    "a known lower bound plus an exact count is a lower bound of their sum",
+  );
+  assert_eq!(
+    SpanKnowledge::AtLeast(usize::MAX).merge(SpanKnowledge::AtLeast(2)),
+    SpanKnowledge::AtLeast(usize::MAX),
+    "a lower bound sum saturates, never wraps",
+  );
+}
+
+#[test]
+fn span_knowledge_merge_identity_associative_commutative() {
+  // THE property the round-12 redesign rests on: `SpanKnowledge::merge` is an
+  // associative, commutative monoid with `Exact(0)` its identity, so a staged and
+  // a one-shot merge store the same span in every grouping. Proven exhaustively
+  // over the boundary corpus (identity, small, and `usize::MAX`-edge spans in both
+  // states) — the same shape the `TaskFacts` corpus folds through `TaskFacts::merge`.
+  let corpus = span_corpus();
+  for &a in &corpus {
+    // Two-sided identity.
+    assert_eq!(
+      SpanKnowledge::Exact(0).merge(a),
+      a,
+      "Exact(0) is a left identity"
+    );
+    assert_eq!(
+      a.merge(SpanKnowledge::Exact(0)),
+      a,
+      "Exact(0) is a right identity"
+    );
+    for &b in &corpus {
+      assert_eq!(
+        a.merge(b),
+        b.merge(a),
+        "merge is commutative for {a:?}, {b:?}"
+      );
+      for &c in &corpus {
+        assert_eq!(
+          a.merge(b).merge(c),
+          a.merge(b.merge(c)),
+          "merge is not associative for {a:?}, {b:?}, {c:?}",
+        );
+      }
+    }
+  }
 }
