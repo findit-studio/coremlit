@@ -56,6 +56,12 @@ fn measure(model: &EmbedModel, label: &str) -> (f64, f64, usize) {
 
   for fixture in common::FIXTURES {
     let golden = common::load_golden(fixture.name);
+    // INDEPENDENT ROSTER: the golden's stored (chunk, slot) set and every mask
+    // must EXACTLY match what its committed seg_logits imply — derived WITHOUT
+    // reading the slot list. `expected` is this fixture's total (chunk, slot)
+    // count, so a dropped slot or a whole dropped fixture can no longer hide
+    // behind the OTHER fixture's contribution to the global `n`.
+    let expected = common::assert_golden_roster(&golden);
     let samples = common::load_wav_16k_mono(&common::audio_path(fixture.name));
     let chunks = common::chunk_and_pad(&samples);
     assert_eq!(
@@ -65,6 +71,7 @@ fn measure(model: &EmbedModel, label: &str) -> (f64, f64, usize) {
       fixture.name
     );
 
+    let mut compared_this_fixture = 0usize;
     for (c, chunk) in chunks.iter().enumerate() {
       let gc = &golden.chunks[c];
       // INPUT-MATCH PROOF: identical audio to dia-ort (see parity_seg.rs). The
@@ -91,12 +98,26 @@ fn measure(model: &EmbedModel, label: &str) -> (f64, f64, usize) {
         worst = worst.min(cos);
         best = best.max(cos);
         n += 1;
+        compared_this_fixture += 1;
         println!(
           "[{label}] {} chunk {c} slot {}: cosine={cos:.8}",
           fixture.name, slot.slot
         );
       }
     }
+    // PER-FIXTURE COVERAGE: the number of (chunk, slot) pairs this fixture
+    // actually folded in MUST equal its independently derived roster count.
+    // `assert_golden_roster` already pins stored == derived, but re-counting the
+    // REALIZED loop here — rather than trusting it — turns coverage into a
+    // checked fact: a future `continue` that skips a slot, or a derivation that
+    // short-circuits a chunk, drops this below `expected` and fails.
+    assert_eq!(
+      compared_this_fixture, expected,
+      "{label}: {} folded in {compared_this_fixture} (chunk, slot) embedding(s), but its committed \
+       seg_logits imply exactly {expected} — the gate covered fewer slots than the golden's own \
+       segmentation requires",
+      fixture.name
+    );
   }
   // A gate that compared nothing is not a passing gate: with no `(chunk,
   // slot)` pair folded in, `worst` stays at its `1.0` seed and the caller's
@@ -194,4 +215,44 @@ fn cosine_accepts_ordinary_finite_nonzero_vectors() {
   // reject legitimate inputs.
   let v = [0.5f32, -0.25, 0.75];
   assert!((common::cosine(&v, &v) - 1.0).abs() < 1e-12);
+}
+
+// ---------------------------------------------------------------------
+// Hermetic guard on the Gate-2 roster (the embedding half of the golden-loader
+// leniency class). No models, no dia — runs in the ordinary `cargo test` gate —
+// so the strict mask loader and the independent (chunk, slot) roster are
+// exercised on every committed golden without waiting for the model-gated run.
+// ---------------------------------------------------------------------
+
+/// Every committed golden loads through the STRICT mask decoder
+/// ([`common::parse_bit_mask`], via [`common::load_golden`]) and its stored
+/// `(chunk, slot)` roster + masks EXACTLY match the roster independently derived
+/// from its committed `seg_logits` ([`common::assert_golden_roster`]), spanning
+/// every chunk. This pins the committed goldens' embedding rosters as
+/// well-formed and is where the leniency-class mutations fail WITHOUT models:
+/// deleting a fixture's slots, adding/removing a slot, moving a mask bit, a
+/// non-binary or wrong-length mask, or a derivation that skips a chunk.
+#[test]
+fn committed_goldens_match_the_independently_derived_embed_roster() {
+  for fixture in common::FIXTURES {
+    let golden = common::load_golden(fixture.name);
+    let total = common::assert_golden_roster(&golden);
+    // Coverage tripwire: the roster check must span EVERY chunk. Its returned
+    // slot total equals the stored slot count summed over ALL chunks here ONLY
+    // because `assert_golden_roster` pins stored == derived per chunk — so a
+    // derivation that short-circuits a chunk drops below this and fails HERE,
+    // without needing the model-gated run.
+    let stored_total: usize = golden.chunks.iter().map(|c| c.slots.len()).sum();
+    assert_eq!(
+      total, stored_total,
+      "{}: independently derived roster covered {total} (chunk, slot) slot(s), but the golden \
+       stores {stored_total} across all chunks — the derivation did not span every chunk",
+      fixture.name
+    );
+    assert!(
+      total > 0,
+      "{}: independently derived roster is empty — nothing for Gate 2 to compare",
+      fixture.name
+    );
+  }
 }

@@ -5,10 +5,14 @@
 // the shared module compiles clean under the workspace's `-D warnings` gate.
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::{collections::BTreeMap, path::PathBuf};
 
 use sha2::{Digest, Sha256};
-use speakerkit::segment::{POWERSET_CLASSES, SEG_CHUNK_SAMPLES};
+use speakerkit::{
+  extract::EXCLUDE_OVERLAP_MIN_FRAMES,
+  segment::{POWERSET_CLASSES, SEG_CHUNK_SAMPLES, SEG_NUM_SLOTS, multilabel},
+  window::DEFAULT_ONSET,
+};
 
 /// Directory containing the downloaded speakerkit model artifacts.
 ///
@@ -434,9 +438,46 @@ pub fn mask_to_string(mask: &[bool]) -> String {
   mask.iter().map(|&b| if b { '1' } else { '0' }).collect()
 }
 
-/// Decodes a [`mask_to_string`] `'0'`/`'1'` string back to `Vec<bool>`.
-pub fn mask_from_string(s: &str) -> Vec<bool> {
-  s.chars().map(|c| c == '1').collect()
+/// Strictly decodes a [`mask_to_string`] bit string into `Vec<bool>`,
+/// hard-failing unless it is EXACTLY `expected_len` characters and every
+/// character is `'0'` or `'1'`. `context` names the offending subject (e.g.
+/// `"<fixture>: chunk C slot S: mask"`) for the panic.
+///
+/// This is the SINGLE strict decoder for both committed golden-mask families —
+/// the embedding golden's per-frame pooling `mask` ([`load_golden`]) and the
+/// argmax-Swift golden's `activeFrames` (`parity_argmax_swift::parse_active_frames`).
+/// The old lenient decode (`c == '1'`, any length, every non-`'1'` char →
+/// `false`) is what let a gate pass vacuously: a truncated, empty, or junk mask
+/// decoded to a short or all-`false` `Vec<bool>` while the comparison still
+/// REPORTED full coverage — and an OVER-long mask was silently truncated back by
+/// the model's frame padding (`embed::repeat_pad_f32`), producing byte-identical
+/// model input. A wrong length or an unexpected character is a MALFORMED golden,
+/// never a slot with fewer active frames, so it is rejected here before a single
+/// fidelity number is read.
+///
+/// # Panics
+/// If any character is not `'0'`/`'1'`, or the decoded length is not `expected_len`.
+pub fn parse_bit_mask(context: &str, expected_len: usize, raw: &str) -> Vec<bool> {
+  let bits: Vec<bool> = raw
+    .chars()
+    .map(|c| match c {
+      '0' => false,
+      '1' => true,
+      other => panic!(
+        "{context} contains {other:?} — a golden bit mask is hard-binary, so only '0'/'1' are \
+         valid; an unknown character is a malformed golden, not an inactive frame."
+      ),
+    })
+    .collect();
+  assert_eq!(
+    bits.len(),
+    expected_len,
+    "{context} has {} characters, expected exactly {expected_len}. A short, empty, or over-long \
+     mask makes the comparison vacuous (or is truncated back by the model's frame padding) while \
+     the gate still reports full coverage.",
+    bits.len()
+  );
+  bits
 }
 
 /// One embedded speaker slot within a golden chunk: the per-frame mask fed to
@@ -496,7 +537,8 @@ pub fn load_golden(name: &str) -> Golden {
     .as_array()
     .expect("chunks array")
     .iter()
-    .map(|c| {
+    .enumerate()
+    .map(|(c_idx, c)| {
       let seg_logits = c["seg_logits"]
         .as_array()
         .expect("seg_logits array")
@@ -507,15 +549,24 @@ pub fn load_golden(name: &str) -> Golden {
         .as_array()
         .expect("slots array")
         .iter()
-        .map(|s| GoldenSlot {
-          slot: s["slot"].as_u64().expect("slot") as usize,
-          mask: mask_from_string(s["mask"].as_str().expect("mask string")),
-          embedding: s["embedding"]
-            .as_array()
-            .expect("embedding array")
-            .iter()
-            .map(|x| x.as_f64().expect("embed f64") as f32)
-            .collect(),
+        .map(|s| {
+          let slot = s["slot"].as_u64().expect("slot") as usize;
+          GoldenSlot {
+            slot,
+            // Strict decode: exactly `num_frames` chars, `{'0','1'}` only. A
+            // malformed mask is a hard error, not a lenient reinterpretation.
+            mask: parse_bit_mask(
+              &format!("{name}: chunk {c_idx} slot {slot}: mask"),
+              num_frames,
+              s["mask"].as_str().expect("mask string"),
+            ),
+            embedding: s["embedding"]
+              .as_array()
+              .expect("embedding array")
+              .iter()
+              .map(|x| x.as_f64().expect("embed f64") as f32)
+              .collect(),
+          }
         })
         .collect();
       let hex = c["input_fnv1a"].as_str().expect("input_fnv1a hex");
@@ -534,4 +585,134 @@ pub fn load_golden(name: &str) -> Golden {
     num_frames,
     chunks,
   }
+}
+
+/// Independently re-derives one chunk's expected per-slot embedding masks from
+/// its committed powerset segmentation log-probabilities, reproducing the golden
+/// generator's rule (`generate_goldens::derive_slot_masks`) WITHOUT reading the
+/// golden's stored slot list. `None` for a slot = it has no active frame, so the
+/// generator emitted no golden slot for it.
+///
+/// The decode is speakerkit's shipping [`multilabel`] (direct argmax over the
+/// log-probs). The generator decodes via dia's `softmax`-then-argmax; the two
+/// coincide on every committed golden row (pinned by
+/// `parity_seg::golden_direct_and_dia_decode_agree`), so this reproduces the
+/// generator's exact roster and masks on committed data while depending on
+/// neither dia nor the stored slots. The overlap-exclusion below is the same
+/// `embedding_exclude_overlap` port speakerkit's `extract::derive_slot_plans`
+/// runs, keyed on the SAME production [`DEFAULT_ONSET`] and
+/// [`EXCLUDE_OVERLAP_MIN_FRAMES`] (a slot is active at a frame iff its hard 0/1
+/// value is `>= DEFAULT_ONSET`; the overlap-excluded mask falls back to raw when
+/// `<= EXCLUDE_OVERLAP_MIN_FRAMES` clean frames remain).
+///
+/// # Panics
+/// If `seg_logits.len() != num_frames * POWERSET_CLASSES` (via [`multilabel`]).
+pub fn derive_expected_slot_masks(
+  seg_logits: &[f32],
+  num_frames: usize,
+) -> [Option<Vec<bool>>; SEG_NUM_SLOTS] {
+  let slab = multilabel(seg_logits, num_frames);
+  let onset = f64::from(DEFAULT_ONSET);
+
+  // Per-frame "clean" indicator: fewer than 2 of the slots active (dia's
+  // `owned.rs:536-549`). Computed once over all slots, before the per-slot loop.
+  let mut clean = vec![false; num_frames];
+  for (f, clean_f) in clean.iter_mut().enumerate() {
+    let active = (0..SEG_NUM_SLOTS)
+      .filter(|&s| slab[f * SEG_NUM_SLOTS + s] >= onset)
+      .count();
+    *clean_f = active < 2;
+  }
+
+  core::array::from_fn(|s| {
+    let mut frame_mask = vec![false; num_frames];
+    let mut any = false;
+    for (f, m) in frame_mask.iter_mut().enumerate() {
+      *m = slab[f * SEG_NUM_SLOTS + s] >= onset;
+      any |= *m;
+    }
+    if !any {
+      return None; // dia drops a slot with no active frame (owned.rs:561-571).
+    }
+    // Overlap-excluded mask = raw AND clean; fall back to raw when too few clean
+    // frames remain (`<=`, owned.rs:573-591).
+    let mut used = vec![false; num_frames];
+    let mut clean_count = 0usize;
+    for (f, u) in used.iter_mut().enumerate() {
+      *u = frame_mask[f] && clean[f];
+      if *u {
+        clean_count += 1;
+      }
+    }
+    if clean_count <= EXCLUDE_OVERLAP_MIN_FRAMES {
+      used = frame_mask;
+    }
+    Some(used)
+  })
+}
+
+/// Asserts a golden's stored `(chunk, slot)` roster and every per-frame mask
+/// EXACTLY match the roster independently re-derived from its committed
+/// `seg_logits` (via [`derive_expected_slot_masks`]), spanning EVERY chunk, and
+/// returns the total number of `(chunk, slot)` slots in that roster — the count
+/// Gate 2 must fold in.
+///
+/// This closes the embedding half of the golden-loader leniency class. The Gate
+/// 2 replay used to compare only the slots the golden happened to carry, gated
+/// on a merely global `n > 0`, so deleting one fixture's slots (or an entire
+/// fixture) left the other fixture's count non-zero and stayed green. Here the
+/// expected roster is derived from a DIFFERENT part of the golden (the
+/// segmentation tensor) than the part under test (the slot list), so a missing
+/// slot, an extra slot, a moved mask bit, a duplicate slot, or a dropped fixture
+/// all fail — per chunk, named.
+///
+/// # Panics
+/// On any roster/mask divergence, or a duplicate slot within a chunk.
+pub fn assert_golden_roster(golden: &Golden) -> usize {
+  let mut total = 0usize;
+  for (c_idx, chunk) in golden.chunks.iter().enumerate() {
+    let derived = derive_expected_slot_masks(&chunk.seg_logits, golden.num_frames);
+    let expected: BTreeMap<usize, &Vec<bool>> = derived
+      .iter()
+      .enumerate()
+      .filter_map(|(s, m)| m.as_ref().map(|mask| (s, mask)))
+      .collect();
+
+    let mut stored: BTreeMap<usize, &Vec<bool>> = BTreeMap::new();
+    for slot in &chunk.slots {
+      assert!(
+        stored.insert(slot.slot, &slot.mask).is_none(),
+        "{}: chunk {c_idx}: slot {} appears more than once in the golden",
+        golden.fixture,
+        slot.slot
+      );
+    }
+
+    let stored_roster: Vec<usize> = stored.keys().copied().collect();
+    let expected_roster: Vec<usize> = expected.keys().copied().collect();
+    assert_eq!(
+      stored_roster, expected_roster,
+      "{}: chunk {c_idx}: stored (chunk, slot) roster {stored_roster:?} != roster \
+       {expected_roster:?} independently derived from seg_logits — a golden slot was added or \
+       dropped",
+      golden.fixture
+    );
+
+    for (s, exp_mask) in &expected {
+      let got = stored
+        .get(s)
+        .expect("roster equality checked directly above");
+      assert_eq!(
+        got,
+        exp_mask,
+        "{}: chunk {c_idx} slot {s}: stored mask ({} active frame(s)) != mask independently \
+         derived from seg_logits ({} active frame(s))",
+        golden.fixture,
+        got.iter().filter(|&&b| b).count(),
+        exp_mask.iter().filter(|&&b| b).count()
+      );
+    }
+    total += expected.len();
+  }
+  total
 }
