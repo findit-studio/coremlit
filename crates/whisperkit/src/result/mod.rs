@@ -2680,44 +2680,44 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
   //   fallback).
   // - **concatenates** the worker schedules in order, so `[0, 2]` stays distinct
   //   from `[0, 1]` instead of collapsing to the first child's coordinate (R6-F2).
-  // - **sums** each child's EFFECTIVE span (`effective_decoded_span` — the carried
-  //   count, or the survivors' extent when untracked, the SAME value the id base
-  //   advanced by above), so the merged result STORES an aggregate that equals
-  //   what the ids actually consumed. A staged re-merge (a VAD result re-merged at
-  //   streaming finalize) then renumbers identically to a one-shot merge — even
-  //   when a child's span was untracked, the case R6-F3's raw-optional sum
-  //   under-counted into a staged-vs-one-shot id collision (F1, codex round 6
-  //   post-consolidation).
+  // - **sums** each child's STORED span under the merge's own absorbing-`None`
+  //   law, so a stored `None` survives the merge as `None` (round 10) — NOT the
+  //   survivors' extent. The read-time [`effective_decoded_span`] inference stays
+  //   READ-TIME ONLY: the id-base advance above already floors a stored `None` at
+  //   the survivors' extent, and the merge's stored fact must not MATERIALIZE that
+  //   inferred extent, or the same contributors renumber differently by grouping
+  //   (codex round 11, L). Concretely: a hand-built `usize::MAX`-id survivor
+  //   carries a stored `None`; a drop-OFF prefix merge reindexes it to id 0, and
+  //   substituting the now-`Some(1)` inferred extent into the stored fact made
+  //   `merge([A, B])` store `None` while `merge([merge([A]), B])` stored `Some(3)`
+  //   — so a trailing drop-ON merge numbered the SAME inputs `[0, 1]` one-shot but
+  //   `[0, 3]` staged. Folding the raw stored span keeps every grouping's stored
+  //   fact identical, and the read-time floor still stops any re-merge
+  //   under-counting its own survivors.
   //
   // Folded through [`TaskFactsAccumulator`], NOT seeded at `TaskFacts::unknown()`:
   // under the Kleene OR (codex round 8, F2) `unknown()` is no longer the merge
   // identity — seeding there would null a first child's observed-clean
   // `Some(false)` to `None` — so the accumulator takes the first contributor
   // verbatim and folds the rest, and yields `unknown()` only for an empty
-  // `results`. Each child's carried span is replaced with its EFFECTIVE span
-  // ([`effective_decoded_span`], the same value the id base advanced by), which
-  // is `None` only when a `usize::MAX` survivor made the extent unknowable
-  // (drop-OFF; codex round 8, F4) — the sum then treats that child as untracked.
+  // `results`.
   let mut task_facts = TaskFactsAccumulator::new();
   for result in results {
-    task_facts.merge(
-      &result
-        .task_facts()
-        .clone()
-        .with_decoded_span(effective_decoded_span(result)),
-    );
+    task_facts.merge(result.task_facts());
   }
   let mut task_facts = task_facts.into_facts();
-  // F2 (codex round 9): the merged result's carried span must never fall below
-  // its OWN survivor extent. The fold sums each child's EFFECTIVE span, but on
-  // the drop-OFF path — where segments are renumbered by `result_index +
-  // segment_index`, not by the span — a child whose extent overflowed (a
-  // `usize::MAX` survivor) folds in as untracked and contributes zero, so the
-  // aggregate can land BELOW the max id these merged segments actually hold. A
-  // staged re-merge trusting that too-small span would renumber a later result
-  // onto these very survivors. Clamp a tracked span up to the extent; an
-  // untracked (`None`) span stays untracked — the survivors' extent is the
-  // re-merge fallback anyway, and an overflowed fold is honestly unknowable.
+  // F2 (codex round 9): a TRACKED merged span must never fall below the merged
+  // result's OWN survivor extent. The raw-span fold above sums each child's stored
+  // span, and on the drop-OFF path — where segments are renumbered by
+  // `result_index + segment_index`, not by the span — a child that under-counts
+  // its survivors (a hand-built span below its own extent) can leave the tracked
+  // aggregate BELOW the max id these merged segments actually hold; a staged
+  // re-merge trusting that too-small span would renumber a later result onto these
+  // very survivors. Clamp a TRACKED span up to the extent. An untracked (`None`)
+  // span STAYS untracked — never materialized to the extent (codex round 11, L):
+  // the read-time [`effective_decoded_span`] floors it at the survivors' extent
+  // for the re-merge anyway, so a stored `None` is grouping-independent while a
+  // fabricated extent would not be.
   if let Some(folded) = task_facts.decoded_span()
     && let Some(max_id) = segments.iter().map(TranscriptionSegment::id).max()
     && let Some(extent) = max_id.checked_add(1)

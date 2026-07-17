@@ -341,18 +341,29 @@ fn drop_on_merge_is_associative_over_the_id_span() {
 
 #[test]
 fn drop_on_merge_is_associative_with_mixed_tracked_and_untracked_spans() {
-  // F1 (codex round 6 post-consolidation). The R6-F3 fix stored the merged
-  // aggregate span, but as the sum of the RAW optional `decoded_span`s — which
-  // UNDER-counts a child that is untracked yet contributed a surviving segment,
-  // exactly the shape a public `TranscriptionResult::new` produces (documented
-  // untracked span). `[untracked-with-one-survivor, tracked span 1, tracked span
-  // 1]` therefore renumbered differently one-shot vs. staged. The fix sums each
-  // child's EFFECTIVE span (the same survivor-extent fallback the id assignment
-  // consumes), so the stored aggregate always equals what the ids consumed.
+  // F1 (codex round 6 post-consolidation), corrected for round 10's absorbing-`None`
+  // span law (F3) and round 11's read-time-only inference (L). The invariant this
+  // test exists to guard is unchanged: `[untracked-with-one-survivor, tracked span
+  // 1, tracked span 1]` must renumber IDENTICALLY one-shot vs. staged (the round-6
+  // F1 defect renumbered them differently).
   //
-  // Mutation proof: revert the fold to `task_facts.merge(result.task_facts())`
-  // (the raw optional, dropping the `effective_decoded_span` substitution) and
-  // the staged ids collapse to [0, 1, 1], failing the equality below.
+  // ORACLE CORRECTION (round 11, L): the R6-F1 repair did this by SUBSTITUTING each
+  // child's EFFECTIVE span (the survivor-extent fallback) into the stored fact, so
+  // the aggregate stored `Some(3)`. That materialization of an INFERRED extent is
+  // the round-11 defect — it breaks grouping-independence once a survivor overflows
+  // (see `drop_on_merge_trailing_id_is_grouping_independent_across_an_overflow`). The
+  // fold now merges the RAW stored span under the absorbing-`None` law, so the
+  // untracked child `a` (`None`) ABSORBS the aggregate to `None` — the honest "this
+  // total is unknown" a hand-built untracked contributor forces. The IDS are
+  // UNCHANGED: the id base still advances by the read-time `effective_decoded_span`,
+  // which floors a stored `None` at the survivors' extent, so no re-merge
+  // under-counts its survivors and the staged/one-shot ids stay identical. Round
+  // 10's absorbing law plus that read-time floor already deliver R6-F1's guarantee
+  // without the harmful materialization.
+  //
+  // Mutation proof: restore the fold's `.with_decoded_span(effective_decoded_span(
+  // result))` substitution and the stored spans read back `Some(3)`/`Some(2)`,
+  // failing the `None` assertions below (the ids stay `[0, 1, 2]` either way).
   let opts = DecodingOptions::new(); // drop ON (the default)
   // A: a public `new` result — one surviving segment (local id 0), span
   // UNTRACKED (`None`), the documented contract of the public constructor.
@@ -379,25 +390,31 @@ fn drop_on_merge_is_associative_with_mixed_tracked_and_untracked_spans() {
   );
   assert_eq!(
     one_shot.task_facts().decoded_span(),
-    Some(3),
-    "the stored aggregate is the sum of EFFECTIVE spans (1 + 1 + 1), not the raw \
-     optionals (None + 1 + 1 = 2)"
+    None,
+    "the untracked child absorbs the stored aggregate to `None` (round 10 F3 / round \
+     11 L) — the read-time extent floor, not a materialized `Some(3)`, drives the ids",
   );
 
   // Staged: merge [a, b], then re-merge that with c.
   let ab = merge_transcription_results_with_options(&[a, b], &opts);
   assert_eq!(
     ab.task_facts().decoded_span(),
-    Some(2),
-    "the intermediate STORES the untracked child's effective extent, not None + 1"
+    None,
+    "the intermediate keeps the untracked child's `None`, never a materialized extent",
   );
   let staged = merge_transcription_results_with_options(&[ab, c], &opts);
   assert_eq!(
     segment_ids(&staged),
     segment_ids(&one_shot),
-    "a staged re-merge renumbers identically to a one-shot merge"
+    "a staged re-merge renumbers identically to a one-shot merge — the invariant, \
+     preserved by the read-time extent floor over the stored `None`",
   );
-  assert_eq!(staged.task_facts().decoded_span(), Some(3));
+  assert_eq!(
+    segment_ids(&staged),
+    vec![0, 1, 2],
+    "and both groupings land the same ids the read-time floor recovers",
+  );
+  assert_eq!(staged.task_facts().decoded_span(), None);
 }
 
 #[test]
@@ -618,6 +635,65 @@ fn drop_on_merge_trailing_id_is_grouping_independent_across_an_overflow() {
     vec![0],
     "both overflow-absorbing intermediates store `None`, so the trailing chunk falls \
      back to the survivors' extent -> id 0",
+  );
+
+  // Round 11 (L): the MATERIALIZED-overflow variant the all-dropped case above
+  // misses. Here the overflowing child A carries a real SURVIVOR at id `usize::MAX`
+  // (stored span `None`), and a drop-OFF prefix merge reindexes it to id 0 —
+  // materializing the survivor extent. The pre-round-11 fold SUBSTITUTED
+  // `effective_decoded_span` into the stored fact, so `merge([A])`'s laundered
+  // `None -> Some(1)` made `merge([merge([A]), B])` store `Some(3)` while the
+  // one-shot `merge([A, B])` stored `None`; a trailing drop-ON merge then numbered
+  // the SAME inputs `[0, 1]` one-shot but `[0, 3]` staged. Folding the RAW stored
+  // span keeps a stored `None` as `None` through both groupings, so the stored
+  // facts AND the trailing ids are identical.
+  //
+  // Mutation proof: restore the fold's `.with_decoded_span(effective_decoded_span(
+  // result))` substitution and the staged grouping stores `Some(3)`, landing the
+  // trailing segment at id 3 while the one-shot stays at id 1 — both equalities
+  // below fail.
+  let a_overflow = || {
+    let mut seg = TranscriptionSegment::new();
+    seg.set_id(usize::MAX).set_text(" A").set_tokens(vec![20]);
+    // A public `new` result: one survivor, span UNTRACKED (`None`).
+    TranscriptionResult::new(" A", vec![seg], "en", TranscriptionTimings::new())
+  };
+  let b_dropped = || all_dropped(2); // no survivors, carried span Some(2)
+  let t = || span_one_speech(31); // one trailing survivor at local id 0
+
+  // One-shot `merge([A, B])` and staged `merge([merge([A]), B])` — both drop-OFF,
+  // since a drop-ON merge over A's `usize::MAX` survivor is the documented panic.
+  let one_shot_ab = merge_transcription_results(&[a_overflow(), b_dropped()]);
+  let staged_ab =
+    merge_transcription_results(&[merge_transcription_results(&[a_overflow()]), b_dropped()]);
+  assert_eq!(
+    one_shot_ab.task_facts().decoded_span(),
+    staged_ab.task_facts().decoded_span(),
+    "materializing the overflowing prefix must not diverge the stored span",
+  );
+  assert_eq!(
+    one_shot_ab.task_facts().decoded_span(),
+    None,
+    "A's untracked `None` survives the merge as `None`, never a materialized extent",
+  );
+
+  // A trailing drop-ON merge must number both groupings identically.
+  let one_shot_trailing = segment_ids(&merge_transcription_results_with_options(
+    &[one_shot_ab, t()],
+    &opts,
+  ));
+  let staged_trailing = segment_ids(&merge_transcription_results_with_options(
+    &[staged_ab, t()],
+    &opts,
+  ));
+  assert_eq!(
+    one_shot_trailing, staged_trailing,
+    "the trailing id is grouping-independent across the materialized overflow",
+  );
+  assert_eq!(
+    one_shot_trailing,
+    vec![0, 1],
+    "both store `None`, so the trailing segment lands past the single survivor -> id 1",
   );
 }
 
