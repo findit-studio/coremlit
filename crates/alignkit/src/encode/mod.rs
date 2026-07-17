@@ -385,6 +385,22 @@ fn describe(shape: &[usize], dtype: Option<DataType>) -> String {
   format!("{shape:?} {dtype}")
 }
 
+/// The `waveform` input contract this fixed graph declares, formatted for
+/// [`AlignerError::ContractMismatch`]'s `expected` field (`[1, 960000]
+/// float32`). The single place that string is built: both branches that report
+/// a bad `waveform` input — the missing-input branch of
+/// [`Encoder::from_file_with`] (via [`waveform_input_or_mismatch`]) and the
+/// present-but-wrong-shape branch ([`check_waveform_contract`]) — draw from
+/// here, so they name one contract and a second hand-written literal cannot
+/// drift out of sync with the check. The two copies were still identical when
+/// this was factored — unlike the `emissions` side
+/// ([`expected_emissions_contract`]), no drift had yet happened — but the
+/// duplication is the same root cause, closed here on the same terms before it
+/// can.
+fn expected_waveform_contract() -> String {
+  format!("[1, {ENCODER_WINDOW_SAMPLES}] float32")
+}
+
 /// Validates a loaded model's `waveform` input against the pinned
 /// contract, in isolation — hermetically testable without a loaded model
 /// (unlike `dia-coreml::SegmentModel`'s analogous checks, this crate has
@@ -396,11 +412,28 @@ fn check_waveform_contract(shape: &[usize], dtype: Option<DataType>) -> Result<(
   if shape != [1, ENCODER_WINDOW_SAMPLES] || dtype != Some(DataType::F32) {
     return Err(AlignerError::ContractMismatch {
       feature: names::WAVEFORM,
-      expected: format!("[1, {ENCODER_WINDOW_SAMPLES}] float32"),
+      expected: expected_waveform_contract(),
       actual: describe(shape, dtype),
     });
   }
   Ok(())
+}
+
+/// Resolves the introspected `waveform` input feature, turning its ABSENCE
+/// into the same [`AlignerError::ContractMismatch`] a present-but-wrong input
+/// draws from [`check_waveform_contract`]: both carry one `expected` string,
+/// [`expected_waveform_contract`], so the missing-input diagnostic names the
+/// exact `[1, 960000]` target a caller must supply rather than some other shape
+/// the next load would reject. Factored out of [`Encoder::from_file_with`] so
+/// this branch — which no loaded-model test can reach, `Models/alignkit/`
+/// holding exactly one, always-present-input artifact — stays covered
+/// hermetically by passing `None`.
+fn waveform_input_or_mismatch(input: Option<&FeatureInfo>) -> Result<&FeatureInfo, AlignerError> {
+  input.ok_or_else(|| AlignerError::ContractMismatch {
+    feature: names::WAVEFORM,
+    expected: expected_waveform_contract(),
+    actual: "missing".to_string(),
+  })
 }
 
 /// The `emissions` output contract this fixed graph declares, formatted for
@@ -718,14 +751,7 @@ impl Encoder {
     let model = Model::load(path, options.compute())?;
     let description = model.description();
 
-    let waveform =
-      description
-        .input(names::WAVEFORM)
-        .ok_or_else(|| AlignerError::ContractMismatch {
-          feature: names::WAVEFORM,
-          expected: format!("[1, {ENCODER_WINDOW_SAMPLES}] float32"),
-          actual: "missing".to_string(),
-        })?;
+    let waveform = waveform_input_or_mismatch(description.input(names::WAVEFORM))?;
     check_waveform_contract(waveform.shape(), waveform.data_type())?;
 
     let emissions = emissions_output_or_mismatch(description.output(names::EMISSIONS))?;
