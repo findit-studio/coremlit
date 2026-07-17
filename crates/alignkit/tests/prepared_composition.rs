@@ -63,17 +63,26 @@ fn en_emissions_aligner() -> EmissionsAligner {
 /// chunk, and the conv-geometry truncation keeps the single receptive-field
 /// frame: `floor((200.max(400) − 400) / 320) + 1 = 1`.
 ///
-/// # The door choice is now benign for the count
+/// # The door choice is now benign for the FRAME COUNT
 ///
 /// Before the conv-geometry fix, feeding the padded buffer through
 /// [`EncoderInput::from_samples`] recorded 400 padded samples as real and kept
 /// `ceil(400/320) = 2` frames where `ceil(200/320) = 1` belonged — the F1
 /// divergence. With the corrected truncation both doors now keep **1** frame for
 /// any sub-receptive-field chunk (the conv stack pads to the receptive field
-/// either way), so this specific slip no longer changes the count. `from_prepared`
-/// is still the correct, self-documenting door — it reads the honest pre-pad
-/// length and stays right for the general case — but the count no longer depends
-/// on the choice here. Both are asserted, so a regression in EITHER door is caught.
+/// either way), so the door choice no longer moves the count. That makes the
+/// `frames() == 1` checks below a benign end-to-end sanity check, NOT a guard on
+/// the door: they can no longer tell `from_prepared` (records 200 real samples)
+/// from `from_samples(encoder_input())` (records 400), because both truncate to
+/// the same one frame. The distinguisher that survives is the recorded
+/// `real_samples` provenance, and THAT is pinned hermetically — through the same
+/// public `from_prepared` door, with no model — by
+/// `encode::tests::from_prepared_records_the_true_pre_pad_provenance_not_the_padded_length`,
+/// which goes RED on the `from_prepared` → `from_samples(encoder_input())`
+/// mutation this count coincidence hides. `from_prepared` remains the correct,
+/// self-documenting door: it reads the honest pre-pad length and stays right for
+/// the general case (above the receptive field the counts diverge again — the
+/// 641-sample fence below).
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
 fn public_prepared_composition_keeps_only_real_frames() {
