@@ -499,13 +499,19 @@ pub(crate) mod finite_f32_vec {
 /// OS-seeded behavior exactly, and `word_grouping` defaults to the
 /// fine-grained grouping this port already used.
 ///
-/// **[`Self::drop_blank_audio`] is the sole knob whose default deliberately
-/// diverges from Swift** (it defaults `true`, dropping the `[BLANK_AUDIO]`
-/// segments Swift emits) — a product decision, with `false` as the exact
-/// parity escape hatch. See that field's own doc; every other default here
-/// is Swift's — including [`Self::word_grouping`], whose
-/// [`WordGrouping::SwiftParity`] variant is what reproduces Swift's own
-/// grouping, strictly on opt-in.
+/// **Two knobs' defaults deliberately diverge from Swift, each with an exact
+/// parity escape hatch** — and they are the only such deviations; every other
+/// default here is Swift's. [`Self::drop_blank_audio`] defaults `true`,
+/// dropping the `[BLANK_AUDIO]` segments Swift emits (a product decision, with
+/// `false` the exact parity escape hatch). [`Self::word_grouping`] defaults to
+/// [`WordGrouping::FineGrained`] — the fine-grained CJK grouping this port
+/// already used (coremlit issue #11), **not** Swift's — while
+/// [`WordGrouping::SwiftParity`] is the opt-in that reproduces Swift's own
+/// Chinese/Cantonese space-fallthrough grouping. Default options on a Mandarin
+/// clip therefore Unicode-split into fine-grained words where Swift falls
+/// through to space splitting; that exact divergence is pinned by the named
+/// invariant `word_grouping_splits_chinese_and_only_chinese`
+/// (`tokenizer/tests.rs`). See each field's own doc.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DecodingOptions {

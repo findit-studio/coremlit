@@ -272,12 +272,21 @@ impl SpanKnowledge {
 /// facts on with the `with_*` builders; merge two with [`Self::merge`], or fold
 /// a whole sequence of contributors with [`Self::fold`].
 ///
-/// [`Self::unknown`] is an **unknown contributor, never a fold identity**: it is
-/// ABSORBING, so merging it into an observed fact NULLS that observation rather
-/// than leaving it intact (`None | Some(false) = None`; the example below). The
-/// neutral element of a contributor fold is [`Self::fold`] of no contributors —
-/// not `unknown()` reused as a seed — and a real run watching for these facts
-/// seeds its own sink at [`Self::observed_clean`].
+/// [`Self::unknown`] is an **unknown contributor, never a fold identity** — but
+/// it is not a blanket absorber. Under [the merge law](Self::merge) an unknown
+/// nulls only what an unknown genuinely taints: an observed-`false` boolean
+/// (`None | Some(false) = None` under Kleene OR) and an unknown worker schedule.
+/// It does NOT erase every observation beside it — a `Some(true)` boolean
+/// survives (`None | Some(true) = Some(true)`), an absent
+/// [`observed_language`](Self::observed_language) adopts the sibling's ("first
+/// observation wins"), and a [`decoded_span`](Self::decoded_span) SUMS:
+/// `unknown()`'s [`AtLeast(0)`](SpanKnowledge::wholly_unknown) is the span
+/// identity, so a sibling `Exact(3)` merges to `AtLeast(3)`, not away. It is
+/// still no fold identity — the Kleene boolean identity is `Some(false)`, not
+/// `None`, so seeding a fold with `unknown()` would null the first observed
+/// clean draw. The neutral element of a contributor fold is [`Self::fold`] of no
+/// contributors, and a real run watching for these facts seeds its own sink at
+/// [`Self::observed_clean`].
 ///
 /// ```
 /// use whisperkit::task_facts::{SpanKnowledge, TaskFacts};
@@ -301,17 +310,33 @@ impl SpanKnowledge {
 /// assert_eq!(TaskFacts::unknown().early_stopped(), None);
 /// assert_eq!(TaskFacts::unknown().had_swallowed_error(), None);
 ///
-/// // `unknown()` is an unknown CONTRIBUTOR, never a fold identity: it ABSORBS.
-/// // Merging it into an observed-clean fact NULLS the observation — the clean
-/// // `Some(false)` draw and truncation read back unknown (`None | Some(false) =
-/// // None`), and the reproducibility promise goes with them. Fold a sequence
-/// // with `TaskFacts::fold` instead of ever reusing `unknown()` as a seed.
+/// // `unknown()` is an unknown CONTRIBUTOR, never a fold identity: an unknown
+/// // beside an observed-`false` NULLS it. Merging `unknown()` into observed-clean
+/// // reads the clean `Some(false)` draw and truncation back as unknown (`None |
+/// // Some(false) = None` under Kleene OR), and the reproducibility promise goes
+/// // with them. Fold a sequence with `TaskFacts::fold`, never `unknown()` reused
+/// // as a seed.
 /// let mut clean = TaskFacts::observed_clean();
 /// assert!(clean.is_reproducible_under(false));
 /// clean.merge(&TaskFacts::unknown());
 /// assert_eq!(clean.drew_from_rng(), None, "unknown() absorbed the observation");
 /// assert_eq!(clean.early_stopped(), None);
 /// assert!(!clean.is_reproducible_under(false), "and flipped reproducibility");
+///
+/// // But `unknown()` is no blanket absorber: an unknown beside a genuine
+/// // observation keeps it. Seeded as `self` and merged with a real contributor,
+/// // a `Some(true)` draw survives, an absent language adopts the sibling's, and
+/// // the span sums off the `AtLeast(0)` identity to a lower bound.
+/// let mut seeded = TaskFacts::unknown();
+/// seeded.merge(
+///   &TaskFacts::unknown()
+///     .with_drew_from_rng(true)
+///     .with_observed_language(Some("es".to_string()))
+///     .with_decoded_span(SpanKnowledge::Exact(3)),
+/// );
+/// assert_eq!(seeded.drew_from_rng(), Some(true), "Some(true) survives");
+/// assert_eq!(seeded.observed_language(), Some("es"), "absent language adopts sibling");
+/// assert_eq!(seeded.decoded_span(), SpanKnowledge::AtLeast(3), "AtLeast(0)+Exact(3)");
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
