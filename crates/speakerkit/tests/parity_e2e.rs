@@ -415,8 +415,8 @@ struct StressGate {
 
 /// The pyannote reference RTTM for a fixture, from the sibling `diarization`
 /// checkout (override root via `DIA_PARITY_FIXTURES`). Same three-levels-up
-/// convention as the crate's `dia` path dependency and
-/// `generate_goldens.rs`'s wespeaker ONNX resolution.
+/// sibling-checkout convention as the co-dev `[patch]` for the git-pinned `dia`
+/// dep and `generate_goldens.rs`'s wespeaker ONNX resolution.
 fn reference_rttm_path(name: &str) -> PathBuf {
   let root = std::env::var_os("DIA_PARITY_FIXTURES").map_or_else(
     || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../diarization/tests/parity/fixtures"),

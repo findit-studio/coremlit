@@ -410,9 +410,9 @@ impl From<dia::reconstruct::SlidingWindow> for SlidingWindow {
 /// its const-fn-safe NaN check: `f32::is_finite` is not yet usable in a
 /// `const fn` at this crate's MSRV (dia's own comment at
 /// `diarization/src/segment/options.rs:54-56` explains why: it awaits
-/// the unstable `const_float_classify` feature, and dia's own
-/// `rust-version` is newer than this crate's), so the check is phrased
-/// by hand via the `v != v` NaN idiom plus direct comparisons.
+/// the unstable `const_float_classify` feature, still unstable at this
+/// crate's and dia's now-shared `rust-version` floor), so the check is
+/// phrased by hand via the `v != v` NaN idiom plus direct comparisons.
 ///
 /// `pub(crate)` so [`crate::extract::Extractor::extract`]'s own onset
 /// preflight can reuse this exact predicate (mirroring dia's
