@@ -844,6 +844,95 @@ fn raw_emissions_check_value_domain_binds_the_guard_and_the_minted_buffer() {
 }
 
 // ---------------------------------------------------------------------
+// ValueDomainChecked::into_emissions: the wrap the minted token feeds. The
+// minter test above stops at MINTING — it never consumes its token — so the door
+// choice inside `into_emissions` (`from_log_probs`, the log-prob door, vs
+// `from_logits`, the raw-logit door) is invisible to it. This test consumes the
+// token and pins that door: a frame that clears BOTH value-domain guards yet
+// carries a positive cell must be rejected by `from_log_probs`, where
+// `from_logits` would silently renormalize and accept.
+// ---------------------------------------------------------------------
+
+/// The value-domain guard is deliberately not the WHOLE log-prob contract:
+/// [`check_log_prob_floor`] bounds each cell from below and
+/// [`check_log_prob_normalization`] checks each frame is a distribution, but
+/// neither enforces the per-cell `<= 0` ceiling. That half is
+/// [`Emissions::from_log_probs`]'s own `finite ∧ <= 0` scan, run inside
+/// [`ValueDomainChecked::into_emissions`] on the very tensor the guard sealed
+/// (see [`check_log_prob_floor`]'s "Deliberately only the lower bound" note).
+///
+/// The distinguisher is a single frame `[0.001, -20.0 × 28]`:
+///
+/// - It clears [`check_log_prob_floor`]: the minimum cell is `-20.0`, far above
+///   [`LOG_PROB_FLOOR`] (`-100`).
+/// - It clears [`check_log_prob_normalization`]:
+///   `logsumexp = ln(e^0.001 + 28·e^-20) ≈ 0.001` (the 28 `-20.0` cells add
+///   `≈ 5.8e-8`), well inside [`LOG_PROB_SUM_TOLERANCE`] (`2e-2`). So both guards
+///   pass and the token mints.
+/// - But cell 0 is `0.001 > 0`, so it is not a log-probability.
+///   [`Emissions::from_log_probs`] rejects it as `LogProbsValueClass::Positive`;
+///   `Emissions::from_logits` would instead apply
+///   `log_softmax_with_finite_guard`, renormalize it into a plausible
+///   distribution, and return `Ok`.
+///
+/// So swapping the door in [`ValueDomainChecked::into_emissions`]
+/// (`from_log_probs` → `from_logits`) turns this `Err` into `Ok` and this test
+/// goes red, while every other test stays green: the minter test never consumes
+/// its token, and the model-gated `emissions_wraps_into_validated_emissions`
+/// feeds a genuine, already-normalized log-prob tensor both doors accept
+/// identically. This is the test that pins the door at the wrap.
+#[test]
+fn into_emissions_takes_the_log_prob_door_not_the_logit_door() {
+  use asry::emissions::{EmissionsError, LogProbsValueClass};
+
+  // One frame that clears both value-domain guards yet holds a single positive
+  // cell — the `<= 0` half of the log-prob contract the guards defer to
+  // `from_log_probs`.
+  let mut data = vec![-20.0f32; crate::vocab::VOCAB_SIZE];
+  data[0] = 0.001;
+
+  // Neither guard rejects it: the floor sees a min of -20.0 (above -100), and
+  // the frame's logsumexp is ≈ 0.001 (within 2e-2).
+  assert!(
+    check_log_prob_floor(&data, ComputeUnits::CpuOnly).is_ok(),
+    "min cell -20.0 is far above LOG_PROB_FLOOR (-100): the floor cannot catch a positive cell"
+  );
+  assert!(
+    check_log_prob_normalization(&data, ComputeUnits::CpuOnly).is_ok(),
+    "logsumexp ≈ 0.001 is within LOG_PROB_SUM_TOLERANCE (2e-2): normalization cannot catch it"
+  );
+
+  // ...so the token mints through the real check sequence.
+  let token = RawEmissions { frames: 1, data }
+    .check_value_domain(ComputeUnits::CpuOnly)
+    .expect("a frame that clears the floor and the normalization guard must mint a token");
+
+  // Only the log-prob door catches the positive cell on consumption. Swapping
+  // `from_log_probs` for `from_logits` in `into_emissions` renormalizes it and
+  // returns Ok — the exact mutation this asserts red.
+  let Err(err) = token.into_emissions() else {
+    panic!(
+      "into_emissions accepted a frame with a positive cell (0.001): from_log_probs must reject \
+       it. Only from_logits — the wrong door — would renormalize and accept."
+    );
+  };
+  let AlignError::Alignment(EmissionsError::Value(value)) = err else {
+    panic!("expected AlignError::Alignment(EmissionsError::Value), got {err:?}");
+  };
+  assert_eq!(
+    value.class(),
+    LogProbsValueClass::Positive,
+    "cell 0 (0.001) is finite and > 0 — the positive log-prob-domain class"
+  );
+  assert_eq!(value.frame(), 0, "the positive cell is in frame 0");
+  assert_eq!(
+    value.vocab_index(),
+    0,
+    "the positive cell is at vocab index 0"
+  );
+}
+
+// ---------------------------------------------------------------------
 // EncoderOptions
 // ---------------------------------------------------------------------
 
