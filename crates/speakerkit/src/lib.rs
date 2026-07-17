@@ -53,7 +53,7 @@
 //!
 //! // Offline (the default backend): dia's pyannote-community-1 AHC→VBx pipeline,
 //! // through the frozen community-1 PLDA projection it clusters in.
-//! let plda = dia::plda::PldaTransform::new()?;
+//! let plda = diaric::plda::PldaTransform::new()?;
 //! let offline = extraction.diarize(&plda)?;
 //! println!("offline: {} spans", offline.spans_slice().len());
 //!
@@ -88,7 +88,7 @@ pub mod window;
 /// speakerkit deliberately does NOT re-export dia's batch-clusterer vocabulary
 /// (`OfflineClusterOptions`/`OfflineMethod`/`Linkage`) that T1 briefly exposed:
 /// [`ClusterBackend::Offline`] wraps dia's pyannote-parity *pipeline*
-/// ([`extract::Extraction::diarize`] → `dia::offline::diarize_offline`), not the
+/// ([`extract::Extraction::diarize`] → `diaric::offline::diarize_offline`), not the
 /// batch clusterer those types configure. The [`cluster`] module documents which
 /// dia entry point `Offline` wraps and why the batch vocabulary was removed
 /// (design spec AMENDMENT 2026-07-16).

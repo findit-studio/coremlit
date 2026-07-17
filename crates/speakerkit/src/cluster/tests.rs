@@ -1,6 +1,6 @@
 use super::*;
 
-/// A minimal, self-consistent dia [`OfflineInput`](dia::offline::OfflineInput)
+/// A minimal, self-consistent dia [`OfflineInput`](diaric::offline::OfflineInput)
 /// over caller-owned buffers (num_chunks=1, num_speakers=3, one frame, one
 /// output frame). Its data tensors are irrelevant to the default/`apply_to`
 /// pins — only its (dia-default) hyperparameters and passthrough matter — so
@@ -10,9 +10,9 @@ fn base_offline_input<'a>(
   raw: &'a [f32],
   segs: &'a [f64],
   count: &'a [u8],
-  plda: &'a dia::plda::PldaTransform,
-) -> dia::offline::OfflineInput<'a> {
-  dia::offline::OfflineInput::new(
+  plda: &'a diaric::plda::PldaTransform,
+) -> diaric::offline::OfflineInput<'a> {
+  diaric::offline::OfflineInput::new(
     raw,
     1,
     3,
@@ -20,8 +20,8 @@ fn base_offline_input<'a>(
     1,
     count,
     1,
-    dia::reconstruct::SlidingWindow::new(0.0, 10.0, 1.0),
-    dia::reconstruct::SlidingWindow::new(0.0, 0.0619375, 0.016875),
+    diaric::reconstruct::SlidingWindow::new(0.0, 10.0, 1.0),
+    diaric::reconstruct::SlidingWindow::new(0.0, 0.0619375, 0.016875),
     plda,
   )
 }
@@ -166,7 +166,7 @@ fn defaults_equal_dia() {
   // OfflineInput defaults (which are pyannote-community-1's). Read dia's own
   // defaults off a freshly-constructed OfflineInput and compare. A drift on
   // EITHER side — speakerkit's const or dia's `OfflineInput::new` — fails this.
-  let plda = dia::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+  let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
   let raw = vec![0.0f32; crate::embed::EMBEDDING_DIM * 3];
   let segs = vec![0.0f64; 3];
   let count = vec![0u8; 1];
@@ -281,7 +281,7 @@ fn with_min_duration_off_accepts_zero_and_positive() {
 
 #[test]
 fn apply_to_maps_each_knob_to_its_dia_field() {
-  let plda = dia::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+  let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
   let raw = vec![0.0f32; crate::embed::EMBEDDING_DIM * 3];
   let segs = vec![0.0f64; 3];
   let count = vec![0u8; 1];
@@ -310,7 +310,7 @@ fn apply_to_default_is_a_no_op_over_dia_defaults() {
   // Applying the DEFAULT OfflineOptions re-writes each field with dia's own
   // default value, leaving the input's hyperparameters unchanged — the property
   // `Extraction::diarize` relies on for byte-identical default clustering.
-  let plda = dia::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+  let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
   let raw = vec![0.0f32; crate::embed::EMBEDDING_DIM * 3];
   let segs = vec![0.0f64; 3];
   let count = vec![0u8; 1];
@@ -476,7 +476,7 @@ fn online_defaults_equal_dia() {
   // OnlineClusterOptions defaults (which are FluidAudio's bare
   // `SpeakerManager()`). Read dia's own defaults off a freshly-constructed
   // OnlineClusterOptions and compare. A drift on EITHER side fails this.
-  let dia_default = dia::cluster::online::OnlineClusterOptions::default();
+  let dia_default = diaric::cluster::online::OnlineClusterOptions::default();
   let o = OnlineOptions::default();
   assert_eq!(
     o.speaker_threshold(),
@@ -501,7 +501,7 @@ fn online_from_clustering_threshold_matches_dia_ratios() {
   // base×0.8. Pinned against dia's OWN from_clustering_threshold so the two
   // convenience constructors cannot drift.
   let o = OnlineOptions::from_clustering_threshold(0.7);
-  let dia = dia::cluster::online::OnlineClusterOptions::from_clustering_threshold(0.7);
+  let dia = diaric::cluster::online::OnlineClusterOptions::from_clustering_threshold(0.7);
   assert_eq!(o.speaker_threshold(), dia.speaker_threshold());
   assert_eq!(o.embedding_threshold(), dia.embedding_threshold());
   assert_eq!(o.min_speech_duration(), dia.min_speech_duration());
@@ -620,7 +620,7 @@ fn online_to_dia_options_default_equals_dia_default() {
   // The default OnlineOptions maps to exactly dia's default OnlineClusterOptions
   // — the property diarize_online relies on for FluidAudio-default clustering.
   let dia = OnlineOptions::default().to_dia_options();
-  let dia_default = dia::cluster::online::OnlineClusterOptions::default();
+  let dia_default = diaric::cluster::online::OnlineClusterOptions::default();
   assert_eq!(dia.speaker_threshold(), dia_default.speaker_threshold());
   assert_eq!(dia.embedding_threshold(), dia_default.embedding_threshold());
   assert_eq!(dia.min_speech_duration(), dia_default.min_speech_duration());
@@ -634,7 +634,7 @@ fn online_to_dia_options_default_equals_dia_default() {
 
 #[test]
 fn online_clusterer_is_deterministic_given_fixed_order() {
-  use dia::{
+  use diaric::{
     cluster::online::{Assignment, OnlineClusterer},
     embed::{EMBEDDING_DIM, Embedding},
   };
@@ -654,7 +654,8 @@ fn online_clusterer_is_deterministic_given_fixed_order() {
   ];
 
   let run = || -> (Vec<Assignment>, Vec<[f32; EMBEDDING_DIM]>) {
-    let mut c = OnlineClusterer::new(OnlineOptions::default().to_dia_options());
+    let mut c = OnlineClusterer::try_new(OnlineOptions::default().to_dia_options())
+      .expect("default OnlineOptions are valid");
     let mut assigns = Vec::new();
     for (e, d) in &seq {
       assigns.push(c.assign(e, *d));

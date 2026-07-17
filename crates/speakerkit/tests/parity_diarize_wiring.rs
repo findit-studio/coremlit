@@ -72,7 +72,7 @@ const WIRING_CLIPS: &[WiringClip] = &[
 
 /// dia `OfflineOutput` RTTM spans → [`Seg`]s (cluster id is already a 0-indexed
 /// integer speaker id) — the observable clustering output this suite compares.
-fn output_segs(out: &dia::offline::OfflineOutput) -> Vec<Seg> {
+fn output_segs(out: &diaric::offline::OfflineOutput) -> Vec<Seg> {
   out
     .spans_slice()
     .iter()
@@ -161,7 +161,7 @@ fn prove_wiring(clip: &WiringClip) {
 
   let samples = fixture_audio(clip.name);
   let ext = fluidaudio_extraction(&samples);
-  let plda = dia::plda::PldaTransform::new().expect("load community-1 PldaTransform");
+  let plda = diaric::plda::PldaTransform::new().expect("load community-1 PldaTransform");
 
   // Subject: the public runtime method.
   let via_public = output_segs(
@@ -172,7 +172,7 @@ fn prove_wiring(clip: &WiringClip) {
   // Reference: the pre-refactor plumbing, reconstructed through the still-
   // public `into_offline_input` bridge (what the harness used to inline).
   let via_manual = output_segs(
-    &dia::offline::diarize_offline(&ext.into_offline_input(&plda))
+    &diaric::offline::diarize_offline(&ext.into_offline_input(&plda))
       .expect("manual into_offline_input → diarize_offline"),
   );
 

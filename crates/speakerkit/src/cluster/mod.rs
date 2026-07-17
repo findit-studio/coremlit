@@ -10,11 +10,11 @@
 //!
 //! [`ClusterBackend`] is `#[non_exhaustive]` and carries two variants:
 //! - [`Offline`](ClusterBackend::Offline) wraps dia's pyannote-community-1
-//!   offline pipeline ([`dia::offline::diarize_offline`], AHC→VBx over
+//!   offline pipeline ([`diaric::offline::diarize_offline`], AHC→VBx over
 //!   PLDA-projected embeddings) — the default, and the backend every DER parity
 //!   gate drives. Tuned by [`OfflineOptions`].
 //! - [`Online`](ClusterBackend::Online) wraps FluidAudio's greedy online
-//!   centroid matcher ([`dia::cluster::online::OnlineClusterer`]) — a genuinely
+//!   centroid matcher ([`diaric::cluster::online::OnlineClusterer`]) — a genuinely
 //!   DIFFERENT algorithm class (streaming assign-as-you-go, not AHC→VBx):
 //!   order-dependent by design, matched on RAW cosine embeddings with NO PLDA,
 //!   and gated against FluidAudio's Swift `SpeakerManager` rather than pyannote
@@ -27,12 +27,12 @@
 //!
 //! dia has TWO disjoint offline entry points, and this is the subtle one:
 //!
-//! - [`dia::offline::diarize_offline`] — the pyannote-parity PIPELINE (AHC
+//! - [`diaric::offline::diarize_offline`] — the pyannote-parity PIPELINE (AHC
 //!   initialization → VBx refinement; `threshold = 0.6`; the
 //!   `fa`/`fb`/`max_iters`/`min_duration_off` hyperparameters carried inline on
-//!   [`dia::offline::OfflineInput`]). This is what every DER gate validates and
+//!   [`diaric::offline::OfflineInput`]). This is what every DER gate validates and
 //!   what [`OfflineOptions`] configures.
-//! - `dia::cluster::cluster_offline` — a separate BATCH clusterer
+//! - `diaric::cluster::cluster_offline` — a separate BATCH clusterer
 //!   (agglomerative/spectral, `similarity_threshold = 0.5`, `target_speakers`,
 //!   `seed`), a DIFFERENT algorithm surface never validated against the parity
 //!   corpus.
@@ -41,7 +41,7 @@
 //! deliberately NOT part of speakerkit's surface. T1 briefly re-exported those
 //! three types at the crate root, expecting [`ClusterBackend::Offline`] to wrap
 //! them; T2 removed that re-export once T1 discovered the runtime path drives the
-//! OTHER entry point ([`dia::offline::diarize_offline`], above) — surfacing the
+//! OTHER entry point ([`diaric::offline::diarize_offline`], above) — surfacing the
 //! batch clusterer's vocabulary as speakerkit's clustering surface would have
 //! been misleading for an unpublished crate whose only validated offline path is
 //! the pipeline (design spec AMENDMENT 2026-07-16). A caller who genuinely wants
@@ -52,7 +52,7 @@
 //! # The [`OfflineOptions`] knob set == dia's `OfflineInput` hyperparameters
 //!
 //! [`OfflineOptions`] mirrors, one-for-one, the five community-1
-//! hyperparameters [`dia::offline::OfflineInput`] exposes through its `with_*`
+//! hyperparameters [`diaric::offline::OfflineInput`] exposes through its `with_*`
 //! builders — [`threshold`](OfflineOptions::threshold),
 //! [`fa`](OfflineOptions::fa), [`fb`](OfflineOptions::fb),
 //! [`max_iters`](OfflineOptions::max_iters), and
@@ -61,7 +61,7 @@
 //! pins this against dia's OWN `OfflineInput` accessors, so a drift on EITHER
 //! side fails to compile the assertion). [`OfflineOptions::default`] therefore
 //! produces byte-identical clustering to feeding a bare
-//! [`dia::offline::OfflineInput`] — the property
+//! [`diaric::offline::OfflineInput`] — the property
 //! [`crate::extract::Extraction::diarize`] relies on.
 //!
 //! Two `OfflineInput` fields are deliberately NOT surfaced:
@@ -105,27 +105,27 @@
 mod tests;
 
 /// Default [`OfflineOptions::threshold`] — dia's community-1 AHC linkage
-/// threshold. Matches [`dia::offline::OfflineInput`]'s `threshold` default
+/// threshold. Matches [`diaric::offline::OfflineInput`]'s `threshold` default
 /// (`diarization/src/offline/algo.rs`, `OfflineInput::new`'s community-1
 /// block), which is pyannote-community-1's `clustering.threshold`.
 pub const DEFAULT_THRESHOLD: f64 = 0.6;
 
 /// Default [`OfflineOptions::fa`] — dia's community-1 VBx `Fa`. Matches
-/// [`dia::offline::OfflineInput`]'s `fa` default (`OfflineInput::new`).
+/// [`diaric::offline::OfflineInput`]'s `fa` default (`OfflineInput::new`).
 pub const DEFAULT_FA: f64 = 0.07;
 
 /// Default [`OfflineOptions::fb`] — dia's community-1 VBx `Fb`. Matches
-/// [`dia::offline::OfflineInput`]'s `fb` default (`OfflineInput::new`).
+/// [`diaric::offline::OfflineInput`]'s `fb` default (`OfflineInput::new`).
 pub const DEFAULT_FB: f64 = 0.8;
 
 /// Default [`OfflineOptions::max_iters`] — dia's community-1 VBx
-/// max-iterations cap. Matches [`dia::offline::OfflineInput`]'s `max_iters`
+/// max-iterations cap. Matches [`diaric::offline::OfflineInput`]'s `max_iters`
 /// default (`OfflineInput::new`).
 pub const DEFAULT_MAX_ITERS: usize = 20;
 
 /// Default [`OfflineOptions::min_duration_off`] — dia's community-1 gap-merging
 /// threshold for span post-processing. Matches
-/// [`dia::offline::OfflineInput`]'s `min_duration_off` default
+/// [`diaric::offline::OfflineInput`]'s `min_duration_off` default
 /// (`OfflineInput::new`).
 pub const DEFAULT_MIN_DURATION_OFF: f64 = 0.0;
 
@@ -169,7 +169,7 @@ const NON_FINITE_FLOAT_MSG: &str = "non-finite float (NaN or infinity) is not re
 
 /// The error a non-finite OR negative `f64` raises at the `serde` boundary for
 /// [`OfflineOptions::min_duration_off`], whose dia consumer
-/// ([`dia::offline::OfflineInput::with_min_duration_off`]) PANICS on a
+/// ([`diaric::offline::OfflineInput::with_min_duration_off`]) PANICS on a
 /// non-finite or negative value. Rejecting the same predicate here (and in the
 /// builder) means no `OfflineOptions` value — however constructed, serde
 /// included — can drive dia into that panic.
@@ -180,7 +180,7 @@ const NEGATIVE_OR_NON_FINITE_MSG: &str = "min_duration_off must be a finite, non
 /// `serde` bridge for an `f64` hyperparameter that must round-trip losslessly:
 /// a non-finite value is refused on BOTH serialize (so the lossy `null` is
 /// never produced) and deserialize. In-memory construction is deliberately NOT
-/// guarded for these knobs — dia's own [`dia::offline::OfflineInput`] `with_*`
+/// guarded for these knobs — dia's own [`diaric::offline::OfflineInput`] `with_*`
 /// builders for `threshold`/`fa`/`fb` accept any `f64` unchecked, and
 /// [`OfflineOptions`] mirrors that contract; only the serde wire boundary is
 /// hardened. See [`NON_FINITE_FLOAT_MSG`].
@@ -206,7 +206,7 @@ pub(crate) mod finite_f64 {
 
 /// `serde` bridge for [`OfflineOptions::min_duration_off`]: refuses a
 /// non-finite OR negative value on both sides of the boundary — the exact
-/// predicate dia's [`dia::offline::OfflineInput::with_min_duration_off`]
+/// predicate dia's [`diaric::offline::OfflineInput::with_min_duration_off`]
 /// asserts (`check_min_duration_off`, see [`super::check_min_duration_off`]),
 /// so a serde-deserialized `OfflineOptions` (which bypasses the panicking
 /// builder) can never carry a value that would later panic dia. See
@@ -247,7 +247,7 @@ const fn check_min_duration_off(v: f64) -> bool {
 
 /// Hyperparameters for the offline pyannote-community-1 clustering pipeline —
 /// the payload of [`ClusterBackend::Offline`]. Mirrors, field-for-field, the
-/// five community-1 knobs [`dia::offline::OfflineInput`] exposes; see this
+/// five community-1 knobs [`diaric::offline::OfflineInput`] exposes; see this
 /// module's own doc for the full correspondence, every default's dia citation,
 /// and the two `OfflineInput` fields deliberately not surfaced.
 ///
@@ -287,7 +287,7 @@ impl OfflineOptions {
   /// Options matching dia's community-1 defaults: [`DEFAULT_THRESHOLD`] (0.6),
   /// [`DEFAULT_FA`] (0.07), [`DEFAULT_FB`] (0.8), [`DEFAULT_MAX_ITERS`] (20),
   /// and [`DEFAULT_MIN_DURATION_OFF`] (0.0) — each equal to
-  /// [`dia::offline::OfflineInput`]'s own default for the same knob.
+  /// [`diaric::offline::OfflineInput`]'s own default for the same knob.
   pub const fn new() -> Self {
     Self {
       threshold: DEFAULT_THRESHOLD,
@@ -299,31 +299,31 @@ impl OfflineOptions {
   }
 
   /// The AHC linkage threshold. Fed to
-  /// [`dia::offline::OfflineInput::with_threshold`].
+  /// [`diaric::offline::OfflineInput::with_threshold`].
   #[inline(always)]
   pub const fn threshold(&self) -> f64 {
     self.threshold
   }
   /// The VBx `Fa` hyperparameter. Fed to
-  /// [`dia::offline::OfflineInput::with_fa`].
+  /// [`diaric::offline::OfflineInput::with_fa`].
   #[inline(always)]
   pub const fn fa(&self) -> f64 {
     self.fa
   }
   /// The VBx `Fb` hyperparameter. Fed to
-  /// [`dia::offline::OfflineInput::with_fb`].
+  /// [`diaric::offline::OfflineInput::with_fb`].
   #[inline(always)]
   pub const fn fb(&self) -> f64 {
     self.fb
   }
   /// The VBx max-iterations cap. Fed to
-  /// [`dia::offline::OfflineInput::with_max_iters`].
+  /// [`diaric::offline::OfflineInput::with_max_iters`].
   #[inline(always)]
   pub const fn max_iters(&self) -> usize {
     self.max_iters
   }
   /// The gap-merging threshold (seconds) for span post-processing. Fed to
-  /// [`dia::offline::OfflineInput::with_min_duration_off`].
+  /// [`diaric::offline::OfflineInput::with_min_duration_off`].
   #[inline(always)]
   pub const fn min_duration_off(&self) -> f64 {
     self.min_duration_off
@@ -337,7 +337,7 @@ impl OfflineOptions {
     self
   }
   /// Sets [`Self::threshold`] in place. Unchecked, mirroring dia's own
-  /// [`dia::offline::OfflineInput::with_threshold`] (which range-checks
+  /// [`diaric::offline::OfflineInput::with_threshold`] (which range-checks
   /// nothing); a non-finite value is refused only at the serde boundary (the
   /// crate-private `finite_f64` serde helper).
   #[inline(always)]
@@ -353,7 +353,7 @@ impl OfflineOptions {
     self
   }
   /// Sets [`Self::fa`] in place. Unchecked, mirroring dia's own
-  /// [`dia::offline::OfflineInput::with_fa`].
+  /// [`diaric::offline::OfflineInput::with_fa`].
   #[inline(always)]
   pub const fn set_fa(&mut self, fa: f64) -> &mut Self {
     self.fa = fa;
@@ -367,7 +367,7 @@ impl OfflineOptions {
     self
   }
   /// Sets [`Self::fb`] in place. Unchecked, mirroring dia's own
-  /// [`dia::offline::OfflineInput::with_fb`].
+  /// [`diaric::offline::OfflineInput::with_fb`].
   #[inline(always)]
   pub const fn set_fb(&mut self, fb: f64) -> &mut Self {
     self.fb = fb;
@@ -400,7 +400,7 @@ impl OfflineOptions {
   ///
   /// # Panics
   /// Panics if `min_duration_off` is NaN, `±∞`, or negative — mirroring dia's
-  /// [`dia::offline::OfflineInput::with_min_duration_off`]
+  /// [`diaric::offline::OfflineInput::with_min_duration_off`]
   /// (`diarization/src/offline/algo.rs`), which asserts the identical
   /// predicate (this module's `check_min_duration_off`): RTTM span-merge
   /// consumes this as a non-negative seconds quantity, and `+∞` merges every
@@ -417,8 +417,8 @@ impl OfflineOptions {
     self
   }
 
-  /// Apply these five hyperparameters onto a [`dia::offline::OfflineInput`],
-  /// returning the tuned input ready for [`dia::offline::diarize_offline`].
+  /// Apply these five hyperparameters onto a [`diaric::offline::OfflineInput`],
+  /// returning the tuned input ready for [`diaric::offline::diarize_offline`].
   ///
   /// The SINGLE place [`OfflineOptions`] maps onto dia's `OfflineInput`
   /// hyperparameter fields — one `with_*` builder per knob, in field order.
@@ -439,8 +439,8 @@ impl OfflineOptions {
   #[must_use]
   pub(crate) fn apply_to<'a>(
     &self,
-    input: dia::offline::OfflineInput<'a>,
-  ) -> dia::offline::OfflineInput<'a> {
+    input: diaric::offline::OfflineInput<'a>,
+  ) -> diaric::offline::OfflineInput<'a> {
     input
       .with_threshold(self.threshold)
       .with_fa(self.fa)
@@ -459,20 +459,20 @@ impl OfflineOptions {
 
 /// Default [`OnlineOptions::speaker_threshold`] — the assignment cosine
 /// DISTANCE a bare FluidAudio `SpeakerManager()` uses. Equals dia's
-/// [`dia::cluster::online::DEFAULT_SPEAKER_THRESHOLD`] (0.65), which ports
+/// [`diaric::cluster::online::DEFAULT_SPEAKER_THRESHOLD`] (0.65), which ports
 /// `Clustering/SpeakerManager.swift:46`. A distance in `[0.0, 2.0]` (0
 /// identical … 2 antipodal), NOT a similarity.
 pub const DEFAULT_SPEAKER_THRESHOLD: f32 = 0.65;
 
 /// Default [`OnlineOptions::embedding_threshold`] — the centroid-update cosine
 /// distance a bare `SpeakerManager()` uses. Equals dia's
-/// [`dia::cluster::online::DEFAULT_EMBEDDING_THRESHOLD`] (0.45)
+/// [`diaric::cluster::online::DEFAULT_EMBEDDING_THRESHOLD`] (0.45)
 /// (`Clustering/SpeakerManager.swift:47`).
 pub const DEFAULT_EMBEDDING_THRESHOLD: f32 = 0.45;
 
 /// Default [`OnlineOptions::min_speech_duration`] (seconds) — the minimum
 /// segment length to spawn a new speaker a bare `SpeakerManager()` uses. Equals
-/// dia's [`dia::cluster::online::DEFAULT_MIN_SPEECH_DURATION`] (1.0)
+/// dia's [`diaric::cluster::online::DEFAULT_MIN_SPEECH_DURATION`] (1.0)
 /// (`Clustering/SpeakerManager.swift:48`).
 pub const DEFAULT_MIN_SPEECH_DURATION: f32 = 1.0;
 
@@ -494,7 +494,7 @@ fn default_min_speech_duration() -> f32 {
 /// rejects NaN, `+∞`, and any value past `cosine_distance`'s codomain — so no
 /// separate NaN clause is needed (unlike [`check_min_speech_duration`], whose
 /// upper bound is `+∞`). Matches the range dia's
-/// [`dia::cluster::online::OnlineClusterOptions`] threshold setters assert
+/// [`diaric::cluster::online::OnlineClusterOptions`] threshold setters assert
 /// (`diarization/src/cluster/online/options.rs`), so a value passing this
 /// cannot panic dia's setter in [`OnlineOptions::to_dia_options`].
 #[inline]
@@ -578,7 +578,7 @@ pub(crate) mod finite_nonneg_f32 {
 /// Hyperparameters for the online (streaming) greedy centroid clusterer — the
 /// payload of [`ClusterBackend::Online`]. Mirrors, field-for-field, the three
 /// knobs FluidAudio's `SpeakerManager` assignment path consults, exactly as
-/// dia's [`dia::cluster::online::OnlineClusterOptions`] ports them; every
+/// dia's [`diaric::cluster::online::OnlineClusterOptions`] ports them; every
 /// default equals dia's, which equals FluidAudio's bare `SpeakerManager()` (the
 /// `cluster::online_defaults_equal_dia` pin reads dia's OWN
 /// `OnlineClusterOptions::default` accessors, so a drift on EITHER side fails to
@@ -639,7 +639,7 @@ impl OnlineOptions {
   /// Options matching dia's / FluidAudio's bare `SpeakerManager()` defaults:
   /// [`DEFAULT_SPEAKER_THRESHOLD`] (0.65), [`DEFAULT_EMBEDDING_THRESHOLD`]
   /// (0.45), and [`DEFAULT_MIN_SPEECH_DURATION`] (1.0) — each equal to
-  /// [`dia::cluster::online::OnlineClusterOptions`]'s own default for the same
+  /// [`diaric::cluster::online::OnlineClusterOptions`]'s own default for the same
   /// knob.
   ///
   /// This is NOT the production `DiarizerManager` wiring, which derives the
@@ -655,7 +655,7 @@ impl OnlineOptions {
 
   /// Construct the way production `DiarizerManager` does
   /// (`Core/DiarizerManager.swift:29,32`, via dia's
-  /// [`dia::cluster::online::OnlineClusterOptions::from_clustering_threshold`]):
+  /// [`diaric::cluster::online::OnlineClusterOptions::from_clustering_threshold`]):
   /// from a single base `clusteringThreshold`, deriving `speaker_threshold =
   /// base × 1.2` and `embedding_threshold = base × 0.8`. `min_speech_duration`
   /// keeps its default. Passing `base = 0.7` reproduces the shipping FluidAudio
@@ -673,20 +673,20 @@ impl OnlineOptions {
   }
 
   /// The assignment cosine-distance threshold. Fed to
-  /// [`dia::cluster::online::OnlineClusterOptions::with_speaker_threshold`] by
+  /// [`diaric::cluster::online::OnlineClusterOptions::with_speaker_threshold`] by
   /// [`Self::to_dia_options`].
   #[inline(always)]
   pub const fn speaker_threshold(&self) -> f32 {
     self.speaker_threshold
   }
   /// The centroid-update cosine-distance threshold. Fed to
-  /// [`dia::cluster::online::OnlineClusterOptions::with_embedding_threshold`].
+  /// [`diaric::cluster::online::OnlineClusterOptions::with_embedding_threshold`].
   #[inline(always)]
   pub const fn embedding_threshold(&self) -> f32 {
     self.embedding_threshold
   }
   /// The minimum new-speaker speech duration (seconds). Fed to
-  /// [`dia::cluster::online::OnlineClusterOptions::with_min_speech_duration`].
+  /// [`diaric::cluster::online::OnlineClusterOptions::with_min_speech_duration`].
   #[inline(always)]
   pub const fn min_speech_duration(&self) -> f32 {
     self.min_speech_duration
@@ -706,7 +706,7 @@ impl OnlineOptions {
   ///
   /// # Panics
   /// Panics if `speaker_threshold` is NaN, `±∞`, or outside `[0.0, 2.0]` —
-  /// mirroring dia's [`dia::cluster::online::OnlineClusterOptions`] threshold
+  /// mirroring dia's [`diaric::cluster::online::OnlineClusterOptions`] threshold
   /// setter (a cosine distance has codomain `[0.0, 2.0]`). The serde boundary
   /// rejects the same values (the crate-private `finite_threshold_f32` helper),
   /// so no `OnlineOptions` ever reaches dia's assert.
@@ -769,9 +769,9 @@ impl OnlineOptions {
     self
   }
 
-  /// Map these three knobs onto dia's
-  /// [`dia::cluster::online::OnlineClusterOptions`] — the input to
-  /// [`dia::cluster::online::OnlineClusterer::new`].
+  /// Map these three knobs onto diaric's
+  /// [`diaric::cluster::online::OnlineClusterOptions`] — the input to
+  /// [`diaric::cluster::online::OnlineClusterer::try_new`].
   ///
   /// The SINGLE place [`OnlineOptions`] maps onto dia's online options (one
   /// `with_*` builder per knob, in field order), the online analogue of
@@ -787,10 +787,10 @@ impl OnlineOptions {
   /// satisfies dia's predicate (finite thresholds in `[0.0, 2.0]`, finite
   /// non-negative duration), enforced at both this crate's builder and its
   /// serde boundary. With [`Self::default`] the result equals
-  /// [`dia::cluster::online::OnlineClusterOptions::default`].
+  /// [`diaric::cluster::online::OnlineClusterOptions::default`].
   #[must_use]
-  pub fn to_dia_options(&self) -> dia::cluster::online::OnlineClusterOptions {
-    dia::cluster::online::OnlineClusterOptions::new()
+  pub fn to_dia_options(&self) -> diaric::cluster::online::OnlineClusterOptions {
+    diaric::cluster::online::OnlineClusterOptions::new()
       .with_speaker_threshold(self.speaker_threshold)
       .with_embedding_threshold(self.embedding_threshold)
       .with_min_speech_duration(self.min_speech_duration)
@@ -884,11 +884,11 @@ define_cluster_backend! {
   #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
   pub enum ClusterBackend {
     /// dia's pyannote-community-1 offline pipeline
-    /// ([`dia::offline::diarize_offline`]), tuned by [`OfflineOptions`]. The
+    /// ([`diaric::offline::diarize_offline`]), tuned by [`OfflineOptions`]. The
     /// default backend, and the one every DER parity gate drives.
     Offline(OfflineOptions) => "offline",
     /// FluidAudio's greedy online centroid matcher
-    /// ([`dia::cluster::online::OnlineClusterer`]), tuned by [`OnlineOptions`].
+    /// ([`diaric::cluster::online::OnlineClusterer`]), tuned by [`OnlineOptions`].
     /// A DIFFERENT algorithm class from [`Offline`](Self::Offline) (streaming
     /// greedy assignment, not AHC→VBx): order-dependent by design, matched on
     /// RAW cosine embeddings with NO PLDA, and gated against FluidAudio's Swift
@@ -903,7 +903,7 @@ define_cluster_backend! {
 impl Default for ClusterBackend {
   /// [`ClusterBackend::Offline`] with default [`OfflineOptions`] — dia's
   /// community-1 hyperparameters, i.e. byte-identical clustering to a bare
-  /// [`dia::offline::OfflineInput`]. This is the backend
+  /// [`diaric::offline::OfflineInput`]. This is the backend
   /// [`crate::extract::Extraction::diarize`] uses.
   fn default() -> Self {
     Self::Offline(OfflineOptions::new())

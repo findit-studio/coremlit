@@ -7,7 +7,7 @@
 //! (`diarization/src/offline/owned.rs:361-697`) — everything from the
 //! input guards through the `count` tensor — stopping exactly where dia
 //! hands off to `diarize_offline`. Its output, [`Extraction`], exposes
-//! precisely `dia::offline::OfflineInput::new`'s parameter list
+//! precisely `diaric::offline::OfflineInput::new`'s parameter list
 //! (`diarization/src/offline/algo.rs:206-227`) and converts into it
 //! directly (`Extraction::into_offline_input`) — `dia` is a runtime
 //! dependency, so that bridge (and the clustering it feeds) is always
@@ -570,7 +570,7 @@ impl Extractor {
 
 /// The assembled dia offline-input tensor set produced by
 /// [`Extractor::extract`]. Its accessors expose exactly
-/// `dia::offline::OfflineInput::new`'s parameter list (minus `plda`, which
+/// `diaric::offline::OfflineInput::new`'s parameter list (minus `plda`, which
 /// the consumer supplies) — see `Self::into_offline_input`.
 ///
 /// Storage is plain `Vec` (spec §9 open item resolved: a desktop consumer
@@ -685,7 +685,7 @@ impl Extraction {
   }
 
   /// Borrow this extraction (plus a caller-supplied `plda`) as a
-  /// `dia::offline::OfflineInput`, ready for `dia::offline::diarize_offline`.
+  /// `diaric::offline::OfflineInput`, ready for `diaric::offline::diarize_offline`.
   ///
   /// Fills `OfflineInput::new`'s 10-parameter signature verbatim (pinned
   /// at `diarization/src/offline/algo.rs:216-227`); the returned value
@@ -693,20 +693,20 @@ impl Extraction {
   /// etc., `algo.rs:239-246`), each overridable via dia's own `with_*`
   /// builders on the returned value.
   ///
-  /// `plda` is spelled `dia::plda::PldaTransform` — dia exports it there
+  /// `plda` is spelled `diaric::plda::PldaTransform` — dia exports it there
   /// (`diarization/src/plda/mod.rs:39`), NOT at its crate root, so the
-  /// plan's `dia::PldaTransform` shorthand is written out in full here.
+  /// plan's `diaric::PldaTransform` shorthand is written out in full here.
   /// The two [`SlidingWindow`] values convert into dia's own via
   /// [`crate::window`]'s `From` impls (`window/mod.rs`); `OfflineInput::new`
-  /// takes `dia::reconstruct::SlidingWindow` by value (`algo.rs:11,224-225`).
+  /// takes `diaric::reconstruct::SlidingWindow` by value (`algo.rs:11,224-225`).
   ///
-  /// Un-gated: `dia` is a runtime dependency and `dia::offline` is part of
+  /// Un-gated: `dia` is a runtime dependency and `diaric::offline` is part of
   /// its ort-free clustering surface, so this bridge is always available.
   pub fn into_offline_input<'a>(
     &'a self,
-    plda: &'a dia::plda::PldaTransform,
-  ) -> dia::offline::OfflineInput<'a> {
-    dia::offline::OfflineInput::new(
+    plda: &'a diaric::plda::PldaTransform,
+  ) -> diaric::offline::OfflineInput<'a> {
+    diaric::offline::OfflineInput::new(
       self.raw_embeddings.as_slice(),
       self.num_chunks,
       SEG_NUM_SLOTS,
@@ -730,7 +730,7 @@ impl Extraction {
   /// `into_offline_input → diarize_offline` (or re-selecting a backend) itself,
   /// so the public API and the tested path cannot diverge (the alignkit
   /// canonical-wiring lesson). Because [`ClusterBackend::default`] applies
-  /// dia's own defaults, the assembled [`dia::offline::OfflineInput`] is
+  /// dia's own defaults, the assembled [`diaric::offline::OfflineInput`] is
   /// field-identical to the bare [`Self::into_offline_input`], so this is
   /// byte-identical to feeding dia directly.
   ///
@@ -738,8 +738,8 @@ impl Extraction {
   /// As [`Self::diarize_with`].
   pub fn diarize(
     &self,
-    plda: &dia::plda::PldaTransform,
-  ) -> Result<dia::offline::OfflineOutput, dia::offline::Error> {
+    plda: &diaric::plda::PldaTransform,
+  ) -> Result<diaric::offline::OfflineOutput, diaric::offline::Error> {
     self.diarize_with(plda, ClusterBackend::default())
   }
 
@@ -747,10 +747,10 @@ impl Extraction {
   /// [`ClusterBackend`] — the crate's runtime clustering entry point.
   ///
   /// For [`ClusterBackend::Offline`], assembles the
-  /// [`dia::offline::OfflineInput`] bridge ([`Self::into_offline_input`]) with
+  /// [`diaric::offline::OfflineInput`] bridge ([`Self::into_offline_input`]) with
   /// the variant's [`OfflineOptions`](crate::cluster::OfflineOptions) applied
   /// over it (its crate-private `apply_to`) and runs
-  /// [`dia::offline::diarize_offline`] over the result. For
+  /// [`diaric::offline::diarize_offline`] over the result. For
   /// [`ClusterBackend::Online`], delegates to [`Self::diarize_online`] with the
   /// variant's [`OnlineOptions`]. The `match` on
   /// `backend` is wildcard-free: any future engine variant forces a new arm
@@ -767,21 +767,21 @@ impl Extraction {
   /// no PLDA to supply — its signature takes none, so the absence is a fact of
   /// the API rather than an argument quietly discarded.
   ///
-  /// The returned [`dia::offline::OfflineOutput`] carries the speaker-labelled
-  /// spans ([`dia::offline::OfflineOutput::spans_slice`]) plus the frame-level
+  /// The returned [`diaric::offline::OfflineOutput`] carries the speaker-labelled
+  /// spans ([`diaric::offline::OfflineOutput::spans_slice`]) plus the frame-level
   /// diarization grid and per-chunk hard assignments. `plda` is the frozen
-  /// community-1 PLDA projection ([`dia::plda::PldaTransform`]); see
+  /// community-1 PLDA projection ([`diaric::plda::PldaTransform`]); see
   /// [`Self::into_offline_input`] for how it threads through the bridge.
   ///
-  /// Un-gated: `dia` is a runtime dependency and `dia::offline` is part of its
+  /// Un-gated: `dia` is a runtime dependency and `diaric::offline` is part of its
   /// ort-free clustering surface, so this runs without `ort` (the `dia-oracle`
   /// test feature only adds dia's ONNX reference oracle, never a runtime
   /// requirement).
   ///
   /// # Errors
   ///
-  /// Propagates [`dia::offline::diarize_offline`]'s typed
-  /// [`dia::offline::Error`] verbatim: a tensor-shape mismatch, a degenerate
+  /// Propagates [`diaric::offline::diarize_offline`]'s typed
+  /// [`diaric::offline::Error`] verbatim: a tensor-shape mismatch, a degenerate
   /// (zero-norm/NaN) raw embedding rejected by PLDA, a non-finite
   /// segmentation, or a clustering bail-out — e.g. the deliberate
   /// `Pipeline(Centroid(AmbiguousAliveCluster { .. }))` refusal when a
@@ -790,12 +790,12 @@ impl Extraction {
   /// shipping-DER suite matches that exact variant rather than `is_err`.
   pub fn diarize_with(
     &self,
-    plda: &dia::plda::PldaTransform,
+    plda: &diaric::plda::PldaTransform,
     backend: ClusterBackend,
-  ) -> Result<dia::offline::OfflineOutput, dia::offline::Error> {
+  ) -> Result<diaric::offline::OfflineOutput, diaric::offline::Error> {
     match backend {
       ClusterBackend::Offline(opts) => {
-        dia::offline::diarize_offline(&opts.apply_to(self.into_offline_input(plda)))
+        diaric::offline::diarize_offline(&opts.apply_to(self.into_offline_input(plda)))
       }
       // `plda` is deliberately NOT forwarded: the online engine matches raw
       // cosine embeddings, not PLDA-projected ones (see the doc's "`plda` is
@@ -806,7 +806,7 @@ impl Extraction {
 
   /// Cluster this extraction into speaker-labelled spans with the ONLINE
   /// (streaming) engine — FluidAudio's greedy centroid matcher, ported in dia as
-  /// [`dia::cluster::online::OnlineClusterer`] — tuned by
+  /// [`diaric::cluster::online::OnlineClusterer`] — tuned by
   /// [`OnlineOptions`]. This is
   /// [`Self::diarize_with`]'s [`ClusterBackend::Online`] route, exposed directly
   /// because the online engine takes NO `plda`: it matches RAW L2-normalized
@@ -823,9 +823,9 @@ impl Extraction {
   /// and the ONE order this order-DEPENDENT engine is defined at here
   /// (deterministic given a fixed extraction). Per slot:
   /// - a dropped slot (all-zero raw-embedding row —
-  ///   [`dia::embed::Embedding::normalize_from`] rejects its zero norm) is
+  ///   [`diaric::embed::Embedding::normalize_from`] rejects its zero norm) is
   ///   skipped and left unmatched;
-  /// - otherwise the row is L2-normalized into a [`dia::embed::Embedding`] and
+  /// - otherwise the row is L2-normalized into a [`diaric::embed::Embedding`] and
   ///   assigned, with a speech duration of `active_frame_count ×
   ///   frames_sw.step` seconds — FluidAudio's `Float(activity) *
   ///   slidingWindow.step` (`DiarizerManager.swift:357`), where `activity` is
@@ -833,15 +833,15 @@ impl Extraction {
   ///   creation vs. drop inside the engine.
   ///
   /// The per-slot speaker labels become the `hard_clusters` fed to the SAME
-  /// reconstruction the offline path uses ([`dia::reconstruct::reconstruct`] →
-  /// [`dia::reconstruct::try_discrete_to_spans`]); only the cluster labels come
-  /// from a different engine. The result is a [`dia::offline::OfflineOutput`]
+  /// reconstruction the offline path uses ([`diaric::reconstruct::reconstruct`] →
+  /// [`diaric::reconstruct::try_discrete_to_spans`]); only the cluster labels come
+  /// from a different engine. The result is a [`diaric::offline::OfflineOutput`]
   /// (the type name refers to dia's `offline` module, not the engine — here it
   /// carries the online greedy assignment) with the speaker-labelled spans, the
   /// frame-level grid, and the per-chunk hard assignment.
   ///
   /// Online ids are the engine's dense `u64` from 1; they are mapped to the
-  /// 0-based cluster indices [`dia::reconstruct::reconstruct`] expects.
+  /// 0-based cluster indices [`diaric::reconstruct::reconstruct`] expects.
   ///
   /// # NOT pyannote-parity
   /// The online engine is order-dependent and its gate is parity with
@@ -850,27 +850,31 @@ impl Extraction {
   /// [`OnlineOptions`] and dia's `cluster::online`.
   ///
   /// # Errors
-  /// Every failure routes through [`dia::offline::Error::Reconstruct`]: a
+  /// Every failure routes through [`diaric::offline::Error::Reconstruct`]: a
   /// non-finite segmentation, invalid sliding-window timing, or — only for a
   /// degenerate input that spawns more than
-  /// [`dia::reconstruct::MAX_CLUSTER_ID`] + 1 speakers — an out-of-range cluster
+  /// [`diaric::reconstruct::MAX_CLUSTER_ID`] + 1 speakers — an out-of-range cluster
   /// id. The PLDA / pipeline / segment / embed error arms of
-  /// [`dia::offline::Error`] cannot fire here: the online path runs none of them.
+  /// [`diaric::offline::Error`] cannot fire here: the online path runs none of them.
   pub fn diarize_online(
     &self,
     opts: OnlineOptions,
-  ) -> Result<dia::offline::OfflineOutput, dia::offline::Error> {
-    use dia::cluster::{
+  ) -> Result<diaric::offline::OfflineOutput, diaric::offline::Error> {
+    use diaric::cluster::{
       hungarian::UNMATCHED,
       online::{Assignment, OnlineClusterer},
     };
 
-    let mut clusterer = OnlineClusterer::new(opts.to_dia_options());
+    // `to_dia_options` builds the options through diaric's validating `with_*`
+    // setters, so `try_new` cannot fail here; `diarize_online`'s
+    // `diaric::offline::Error` has no arm for an online-options error anyway.
+    let mut clusterer = OnlineClusterer::try_new(opts.to_dia_options())
+      .expect("to_dia_options yields validated OnlineClusterOptions");
     let frame_step = self.frames_sw.step() as f32;
 
     // One `[i32; SEG_NUM_SLOTS]` row per chunk (dia's `ChunkAssignment`),
     // UNMATCHED (-2) for every slot until the engine labels it.
-    let mut hard_clusters: Vec<dia::pipeline::ChunkAssignment> =
+    let mut hard_clusters: Vec<diaric::pipeline::ChunkAssignment> =
       vec![[UNMATCHED; SEG_NUM_SLOTS]; self.num_chunks];
 
     // Feed each (chunk, slot) in chunk order, then slot order within the chunk
@@ -884,7 +888,7 @@ impl Extraction {
         let range = embedding_range(c, s);
         let mut row = [0.0f32; EMBEDDING_DIM];
         row.copy_from_slice(&self.raw_embeddings[range]);
-        let Some(embedding) = dia::embed::Embedding::normalize_from(row) else {
+        let Some(embedding) = diaric::embed::Embedding::normalize_from(row) else {
           continue;
         };
 
@@ -916,7 +920,7 @@ impl Extraction {
     // The SAME reconstruction the offline path runs — only the cluster labels
     // came from the online engine instead of AHC→VBx. `reconstruct` derives its
     // own cluster count from `hard_clusters` + `count`.
-    let recon_input = dia::reconstruct::ReconstructInput::new(
+    let recon_input = diaric::reconstruct::ReconstructInput::new(
       self.segmentations.as_slice(),
       self.num_chunks,
       self.num_frames_per_chunk,
@@ -927,7 +931,7 @@ impl Extraction {
       self.chunks_sw.into(),
       self.frames_sw.into(),
     );
-    let discrete = dia::reconstruct::reconstruct(&recon_input)?;
+    let discrete = diaric::reconstruct::reconstruct(&recon_input)?;
 
     // The grid is `num_output_frames × num_clusters` row-major, so its width IS
     // the cluster count — the single source of truth for both the span
@@ -939,7 +943,7 @@ impl Extraction {
     // `min_speech_duration`. `num_output_frames > 0` holds here: `reconstruct`
     // rejects a zero-frame grid before returning `Ok`.
     let num_clusters = discrete.as_slice().len() / self.num_output_frames;
-    let spans = dia::reconstruct::try_discrete_to_spans(
+    let spans = diaric::reconstruct::try_discrete_to_spans(
       discrete.as_slice(),
       self.num_output_frames,
       num_clusters,
@@ -947,9 +951,9 @@ impl Extraction {
       // Online exposes no gap-merge knob; 0.0 = no merge, dia's own default.
       0.0,
     )
-    .map_err(dia::reconstruct::Error::from)?;
+    .map_err(diaric::reconstruct::Error::from)?;
 
-    Ok(dia::offline::OfflineOutput::new(
+    Ok(diaric::offline::OfflineOutput::new(
       std::sync::Arc::from(hard_clusters),
       discrete,
       num_clusters,

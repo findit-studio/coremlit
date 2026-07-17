@@ -37,11 +37,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let source = AnySource::load("Models/speakerkit", options)?;
     let extraction = source.extract(&audio)?;
 
-    // `extraction` now holds exactly the tensors `dia`'s offline diarizer
-    // consumes. `dia` is a non-optional runtime dependency, so clustering is
+    // `extraction` now holds exactly the tensors `diaric`'s offline diarizer
+    // consumes. `diaric` is a non-optional runtime dependency, so clustering is
     // available directly (see "Clustering" below):
-    //   extraction.diarize(&plda)  ->  dia::offline::OfflineOutput
-    // or extraction.into_offline_input(&plda) for the raw dia::offline::OfflineInput.
+    //   extraction.diarize(&plda)  ->  diaric::offline::OfflineOutput
+    // or extraction.into_offline_input(&plda) for the raw diaric::offline::OfflineInput.
     println!(
         "{} chunks, {} output frames",
         extraction.num_chunks(),
@@ -67,33 +67,32 @@ DER parity suites score the CoreML path against; it is what the `parity_e2e` /
 meant for production) and `serde` (`Serialize`/`Deserialize` on `Options` and
 friends). Neither is on by default.
 
-The `diarization` crate (imported as `dia`) is a **non-optional runtime
-dependency** — the clustering stage (`diarize` / `diarize_with` /
-`diarize_online`) and `Extraction::into_offline_input` are always available, no
-feature required. It is pinned to the public repo by an **exact git rev, not a
-path dependency** on a sibling checkout (a path dep breaks a fresh `cargo
-metadata`; edits to a local `diarization` tree are not consumed unless you add
-the co-dev `[patch]` to the workspace-root `Cargo.toml` — see its "CO-DEV
-RECIPE" comment). The dep is `default-features = false`, so the runtime path
-pulls only dia's backend-free offline **core** — no ONNX Runtime, no bundled
-ONNX model — keeping ORT out of CoreML-only deployments. (A sibling
-`diarization` checkout is used only as **test data** for the model-gated DER
-gates below, never as the `dia` dependency itself.)
+The `diaric` core crate is the **non-optional runtime dependency** — the
+clustering stage (`diarize` / `diarize_with` / `diarize_online`) and
+`Extraction::into_offline_input` are always available, no feature required. It
+is pinned to the public `diaric` repo by an **exact git rev, not a path
+dependency** on a sibling checkout (a path dep breaks a fresh `cargo metadata`).
+`diaric` is backend-free by construction — the ONNX/Torch model runners live in
+the separate `diarization` crate, never here — so the runtime clustering path
+pulls no ONNX Runtime and no bundled ONNX model, keeping ORT out of CoreML-only
+deployments. (The `diarization` crate is pulled in only by the test-only
+`dia-oracle` feature above, as the DER reference; a sibling `diarization`
+checkout is used only as **test data** for the model-gated DER gates below.)
 
 ## Clustering
 
 Turn an `Extraction` into speaker-labelled RTTM spans with one of two backends.
-Both are `dia`'s engines — this crate selects and drives them, it does not
+Both are `diaric`'s engines — this crate selects and drives them, it does not
 reimplement clustering. Pick a backend with `ClusterBackend` and tune it with
 `OfflineOptions` / `OnlineOptions`.
 
 ### `ClusterBackend::Offline(OfflineOptions)` — the default, DER-gated
 
-`dia`'s pyannote-community-1 offline pipeline (`dia::offline::diarize_offline`:
+`diaric`'s pyannote-community-1 offline pipeline (`diaric::offline::diarize_offline`:
 AHC initialization → VBx refinement over PLDA-projected embeddings). This is the
 path every DER number in this README is measured on, and the one
 `Extraction::diarize` runs by default. `OfflineOptions` mirrors, one-for-one, the
-five community-1 hyperparameters `dia` exposes:
+five community-1 hyperparameters `diaric` exposes:
 
 | knob | default | tunes |
 |---|---|---|
@@ -103,10 +102,10 @@ five community-1 hyperparameters `dia` exposes:
 | `max_iters` | 20 | VBx iteration cap |
 | `min_duration_off` | 0.0 | gap-merge threshold (s) for span post-processing |
 
-Every default equals `dia`'s, which equals pyannote's — pinned in code against
-`dia`'s own accessors (`cluster::defaults_equal_dia`), so a drift on *either*
-side fails the build. `OfflineOptions::default()` therefore produces
-byte-identical clustering to feeding `dia` directly.
+Every default equals `diaric`'s, which equals pyannote's — pinned in code
+against `diaric`'s own accessors (`cluster::defaults_equal_dia`), so a drift on
+*either* side fails the build. `OfflineOptions::default()` therefore produces
+byte-identical clustering to feeding `diaric` directly.
 
 ```rust,no_run
 use speakerkit::extract::Options;
@@ -118,10 +117,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let options = Options::new().with_source(Source::FluidAudio);
     let extraction = AnySource::load("Models/speakerkit", options)?.extract(&audio)?;
 
-    // The frozen community-1 PLDA projection `dia` clusters through.
-    let plda = dia::plda::PldaTransform::new()?;
+    // The frozen community-1 PLDA projection `diaric` clusters through.
+    let plda = diaric::plda::PldaTransform::new()?;
 
-    // `diarize` runs the default backend (offline, `dia`'s community-1 defaults).
+    // `diarize` runs the default backend (offline, `diaric`'s community-1 defaults).
     let output = extraction.diarize(&plda)?;
     println!("{} spans", output.spans_slice().len());
 
@@ -135,7 +134,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 ### `ClusterBackend::Online(OnlineOptions)` — streaming, NOT pyannote-parity
 
 FluidAudio's greedy online centroid matcher (`SpeakerManager` semantics, ported
-in `dia` as `dia::cluster::online::OnlineClusterer`) — a genuinely *different*
+in `diaric` as `diaric::cluster::online::OnlineClusterer`) — a genuinely *different*
 algorithm class: it assigns each segment as it arrives against running centroids,
 which AHC→VBx structurally cannot do. Three properties are load-bearing and **by
 design**:
@@ -185,13 +184,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   *capability*, not a faithful-diarization claim — do not DER-score it.
 - **`min_active_ratio` is not a knob.** An earlier plan floated it as a
   speakerkit-side pre-filter (OFF = parity, ON = argmax); that was **dropped**,
-  because the premise was false. `dia`'s offline pipeline *already* applies
+  because the premise was false. `diaric`'s offline pipeline *already* applies
   argmax's `minActiveRatio = 0.2` sparse-slot exclude-and-reassign
-  **unconditionally, for every source** (`dia`'s `offline/algo.rs`; see also "The
+  **unconditionally, for every source** (`diaric`'s `offline/algo.rs`; see also "The
   two model sources" below) — it withholds those slots from cluster *formation*
   and re-attaches them at nearest-centroid reassignment, never dropping them. So
   there is nothing to toggle: the filter is live for both sources, applied inside
-  `dia`, and a speakerkit knob could only add a novel stricter drop semantic no
+  `diaric`, and a speakerkit knob could only add a novel stricter drop semantic no
   one asked for.
 
 ## The two model sources

@@ -506,7 +506,7 @@ fn into_offline_input_round_trips_against_real_dia() {
     frames_sw: crate::window::frame_sliding_window(),
   };
 
-  let plda = dia::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+  let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
   let input = e.into_offline_input(&plda);
 
   assert_eq!(input.raw_embeddings(), e.raw_embeddings());
@@ -559,13 +559,13 @@ fn diarize_matches_manual_into_offline_input_pipeline() {
     chunks_sw: crate::window::chunk_sliding_window(&WindowOptions::new()),
     frames_sw: crate::window::frame_sliding_window(),
   };
-  let plda = dia::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+  let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
 
   // Subject: the public runtime method.
   let via_public = e.diarize(&plda);
   // Reference: the pre-refactor plumbing, reconstructed through the still-
   // public `into_offline_input` bridge.
-  let via_manual = dia::offline::diarize_offline(&e.into_offline_input(&plda));
+  let via_manual = diaric::offline::diarize_offline(&e.into_offline_input(&plda));
 
   // The two must agree on their WHOLE Result — succeed identically, or refuse
   // identically. `OfflineOutput` is not `PartialEq`, so compare the observable
@@ -574,7 +574,7 @@ fn diarize_matches_manual_into_offline_input_pipeline() {
   // breaks exactly one arm and this assertion fires.
   match (via_public, via_manual) {
     (Ok(pub_out), Ok(man_out)) => {
-      let spans = |o: &dia::offline::OfflineOutput| -> Vec<(f64, f64, usize)> {
+      let spans = |o: &diaric::offline::OfflineOutput| -> Vec<(f64, f64, usize)> {
         o.spans_slice()
           .iter()
           .map(|s| (s.start(), s.end(), s.cluster()))
@@ -637,7 +637,7 @@ fn diarize_with_offline_routes_the_backend_options() {
   // mutation that ignored `backend` (always using the default) would break this
   // (the non-default knobs would not reach dia).
   let e = tiny_extraction();
-  let plda = dia::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+  let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
   let opts = crate::cluster::OfflineOptions::new()
     .with_threshold(0.55)
     .with_fa(0.09)
@@ -648,13 +648,13 @@ fn diarize_with_offline_routes_the_backend_options() {
   // Subject: the public runtime method with a selected non-default backend.
   let via_public = e.diarize_with(&plda, ClusterBackend::Offline(opts));
   // Reference: the same OfflineOptions applied by hand over the bare bridge.
-  let via_manual = dia::offline::diarize_offline(&opts.apply_to(e.into_offline_input(&plda)));
+  let via_manual = diaric::offline::diarize_offline(&opts.apply_to(e.into_offline_input(&plda)));
 
   // OfflineOutput is not PartialEq: compare span geometry on success, the typed
   // error's rendering on failure — same shape as the diarize test above.
   match (via_public, via_manual) {
     (Ok(pub_out), Ok(man_out)) => {
-      let spans = |o: &dia::offline::OfflineOutput| -> Vec<(f64, f64, usize)> {
+      let spans = |o: &diaric::offline::OfflineOutput| -> Vec<(f64, f64, usize)> {
         o.spans_slice()
           .iter()
           .map(|s| (s.start(), s.end(), s.cluster()))
@@ -801,7 +801,7 @@ fn diarize_with_online_routes_to_diarize_online_ignoring_plda() {
   // — offline clustering of these embeddings is not the online greedy result).
   let e = online_extraction();
   let opts = OnlineOptions::new().with_min_speech_duration(0.0);
-  let plda = dia::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+  let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
 
   let via_online = e.diarize_online(opts).expect("diarize_online ok");
   let via_with = e
@@ -814,7 +814,7 @@ fn diarize_with_online_routes_to_diarize_online_ignoring_plda() {
     "diarize_with(Online) routed to a different labelling than diarize_online"
   );
   assert_eq!(via_online.num_clusters(), via_with.num_clusters());
-  let spans = |o: &dia::offline::OfflineOutput| -> Vec<(f64, f64, usize)> {
+  let spans = |o: &diaric::offline::OfflineOutput| -> Vec<(f64, f64, usize)> {
     o.spans_slice()
       .iter()
       .map(|s| (s.start(), s.end(), s.cluster()))

@@ -22,7 +22,7 @@
 //! `with_duration`/`with_step` API (all `pub const fn`, `algo.rs:52-113`).
 //!
 //! `dia` is a runtime dependency now (its ort-free clustering surface,
-//! `dia::reconstruct` included, is always linked), but its
+//! `diaric::reconstruct` included, is always linked), but its
 //! `SlidingWindow` fields stay private, and this crate keeps its OWN
 //! public [`SlidingWindow`] as a stable, dia-version-independent
 //! boundary type rather than re-exporting dia's (the mirror-struct
@@ -389,11 +389,11 @@ impl SlidingWindow {
 /// "`SlidingWindow`: the visibility DECISION" section. Lossless and
 /// infallible: both types are unchecked `(f64, f64, f64)` tuples.
 ///
-/// Un-gated: `dia` is a runtime dependency now, and `dia::reconstruct` is
+/// Un-gated: `dia` is a runtime dependency now, and `diaric::reconstruct` is
 /// part of its ort-free clustering surface, so this conversion is always
 /// available (it is what `Extraction::into_offline_input` feeds into
-/// `dia::offline::diarize_offline`).
-impl From<SlidingWindow> for dia::reconstruct::SlidingWindow {
+/// `diaric::offline::diarize_offline`).
+impl From<SlidingWindow> for diaric::reconstruct::SlidingWindow {
   fn from(value: SlidingWindow) -> Self {
     Self::new(value.start, value.duration, value.step)
   }
@@ -403,8 +403,8 @@ impl From<SlidingWindow> for dia::reconstruct::SlidingWindow {
 /// impl above. Built entirely through dia's public `start`/`duration`/`step`
 /// accessors: dia's fields are private, so there is no other way to reach
 /// them.
-impl From<dia::reconstruct::SlidingWindow> for SlidingWindow {
-  fn from(value: dia::reconstruct::SlidingWindow) -> Self {
+impl From<diaric::reconstruct::SlidingWindow> for SlidingWindow {
+  fn from(value: diaric::reconstruct::SlidingWindow) -> Self {
     Self::new(value.start(), value.duration(), value.step())
   }
 }

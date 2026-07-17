@@ -32,7 +32,7 @@ fn sliding_window_is_copy() {
 #[test]
 fn sliding_window_round_trips_into_dia_and_back() {
   let ours = SlidingWindow::new(0.25, 4.0, 1.5);
-  let theirs: dia::reconstruct::SlidingWindow = ours.into();
+  let theirs: diaric::reconstruct::SlidingWindow = ours.into();
   assert_eq!(theirs.start(), 0.25);
   assert_eq!(theirs.duration(), 4.0);
   assert_eq!(theirs.step(), 1.5);
@@ -427,15 +427,15 @@ fn count_from_segmentations_matches_dia_oracle_3_chunk_overlap() {
     SlidingWindow::new(0.0, 1.0, 1.0),
   );
 
-  let golden = dia::aggregate::try_count_pyannote(
+  let golden = diaric::aggregate::try_count_pyannote(
     &segmentations,
     3,
     4,
     2,
     0.5_f64,
-    dia::reconstruct::SlidingWindow::new(0.0, 4.0, 2.0),
-    dia::reconstruct::SlidingWindow::new(0.0, 1.0, 1.0),
-    &dia::spill::SpillOptions::default(),
+    diaric::reconstruct::SlidingWindow::new(0.0, 4.0, 2.0),
+    diaric::reconstruct::SlidingWindow::new(0.0, 1.0, 1.0),
+    &diaric::spill::SpillOptions::default(),
   )
   .expect("dia try_count_pyannote on synthetic 3-chunk overlap");
 
@@ -456,7 +456,7 @@ fn count_from_segmentations_matches_dia_oracle_3_chunk_overlap() {
 // Consumed only by the dia-oracle cross-check test below (unlike
 // `three_chunk_overlap_segmentations` above, there is no separate
 // hermetic hand-derived test at this data volume — see that test's own
-// doc for why). `dia` is a runtime dependency, so `dia::aggregate` is
+// doc for why). `dia` is a runtime dependency, so `diaric::aggregate` is
 // always available and this fixture + its oracle test compile
 // unconditionally.
 const DEFAULT_10X_NUM_CHUNKS: usize = 15;
@@ -556,7 +556,7 @@ fn count_from_segmentations_matches_dia_oracle_default_geometry_10x_overlap() {
     frames_sw,
   );
 
-  let golden = dia::aggregate::try_count_pyannote(
+  let golden = diaric::aggregate::try_count_pyannote(
     &segmentations,
     DEFAULT_10X_NUM_CHUNKS,
     DEFAULT_10X_NUM_FRAMES_PER_CHUNK,
@@ -564,7 +564,7 @@ fn count_from_segmentations_matches_dia_oracle_default_geometry_10x_overlap() {
     0.5_f64,
     chunks_sw.into(),
     frames_sw.into(),
-    &dia::spill::SpillOptions::default(),
+    &diaric::spill::SpillOptions::default(),
   )
   .expect("dia try_count_pyannote on default-geometry 10x-overlap synthetic fixture");
 

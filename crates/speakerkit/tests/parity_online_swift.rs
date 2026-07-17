@@ -46,7 +46,7 @@
 
 mod common;
 
-use dia::{
+use diaric::{
   cluster::online::{Assignment, OnlineClusterer},
   embed::Embedding,
 };
@@ -57,7 +57,7 @@ const SEED: u64 = 0xDEAD_BEEF_CAFE_F00D;
 const STEPS: usize = 48;
 const PROTOTYPES: usize = 8;
 const BLOCK: usize = 32;
-const DIM: usize = 256; // == dia::embed::EMBEDDING_DIM
+const DIM: usize = 256; // == diaric::embed::EMBEDDING_DIM
 const NOISE_SCALE: f32 = 0.02;
 const DUR_BASE: f32 = 0.3;
 const DUR_SPAN: f32 = 2.0;
@@ -195,7 +195,7 @@ fn load_trace() -> SwiftTrace {
 
 #[test]
 fn online_clusterer_matches_fluidaudio_swift_trace() {
-  assert_eq!(DIM, dia::embed::EMBEDDING_DIM, "DIM must equal dia's");
+  assert_eq!(DIM, diaric::embed::EMBEDDING_DIM, "DIM must equal dia's");
   let trace = load_trace();
   let seq = synthetic_sequence();
   assert_eq!(
@@ -221,7 +221,8 @@ fn online_clusterer_matches_fluidaudio_swift_trace() {
   assert_eq!(opts.embedding_threshold(), trace.embedding_threshold);
   assert_eq!(opts.min_speech_duration(), trace.min_speech_duration);
 
-  let mut clusterer = OnlineClusterer::new(opts.to_dia_options());
+  let mut clusterer = OnlineClusterer::try_new(opts.to_dia_options())
+    .expect("OnlineOptions map to a validated clusterer");
   let speaker_threshold = opts.speaker_threshold();
   let mut worst_centroid_diff = 0.0f64;
   let (mut n_new, mut n_existing, mut n_dropped) = (0usize, 0usize, 0usize);
@@ -325,7 +326,8 @@ fn online_oracle_sequence_is_deterministic() {
   // total-deterministic — the defining property the order-dependence relies on.
   let seq = synthetic_sequence();
   let run = || -> Vec<Assignment> {
-    let mut c = OnlineClusterer::new(OnlineOptions::default().to_dia_options());
+    let mut c = OnlineClusterer::try_new(OnlineOptions::default().to_dia_options())
+      .expect("default OnlineOptions are valid");
     seq
       .iter()
       .map(|(raw, d)| c.assign(&Embedding::normalize_from(*raw).unwrap(), *d))
