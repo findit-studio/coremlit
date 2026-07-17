@@ -57,8 +57,8 @@
 //! [`fa`](OfflineOptions::fa), [`fb`](OfflineOptions::fb),
 //! [`max_iters`](OfflineOptions::max_iters), and
 //! [`min_duration_off`](OfflineOptions::min_duration_off) — and every default
-//! equals dia's, which equals pyannote's (`cluster::defaults_equal_dia`
-//! pins this against dia's OWN `OfflineInput` accessors, so a drift on EITHER
+//! equals diaric's, which equals pyannote's (`cluster::defaults_equal_diaric`
+//! pins this against diaric's OWN `OfflineInput` accessors, so a drift on EITHER
 //! side fails to compile the assertion). [`OfflineOptions::default`] therefore
 //! produces byte-identical clustering to feeding a bare
 //! [`diaric::offline::OfflineInput`] — the property
@@ -427,8 +427,8 @@ impl OfflineOptions {
   /// `apply_to_maps_each_knob_to_its_dia_field` test pins each knob to its dia
   /// field so a swapped mapping fails.
   ///
-  /// With [`Self::default`] every applied value equals dia's own default (see
-  /// this module's `defaults_equal_dia` pin), so the returned input is
+  /// With [`Self::default`] every applied value equals diaric's own default (see
+  /// this module's `defaults_equal_diaric` pin), so the returned input is
   /// field-identical to the untouched one — the no-op
   /// [`crate::extract::Extraction::diarize`] relies on for byte-identical
   /// default clustering.
@@ -578,9 +578,9 @@ pub(crate) mod finite_nonneg_f32 {
 /// Hyperparameters for the online (streaming) greedy centroid clusterer — the
 /// payload of [`ClusterBackend::Online`]. Mirrors, field-for-field, the three
 /// knobs FluidAudio's `SpeakerManager` assignment path consults, exactly as
-/// dia's [`diaric::cluster::online::OnlineClusterOptions`] ports them; every
-/// default equals dia's, which equals FluidAudio's bare `SpeakerManager()` (the
-/// `cluster::online_defaults_equal_dia` pin reads dia's OWN
+/// diaric's [`diaric::cluster::online::OnlineClusterOptions`] ports them; every
+/// default equals diaric's, which equals FluidAudio's bare `SpeakerManager()`
+/// (the `cluster::online_defaults_equal_diaric` pin reads diaric's OWN
 /// `OnlineClusterOptions::default` accessors, so a drift on EITHER side fails to
 /// compile the assertion).
 ///

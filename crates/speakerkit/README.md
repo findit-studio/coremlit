@@ -3,18 +3,18 @@
 Native CoreML **inference backend** for speaker diarization: it runs
 pyannote's segmentation net and the WeSpeaker embedding net on the Apple
 Neural Engine (via [`coremlit`](../coremlit)) and produces the tensors that
-feed [`dia`](https://github.com/Findit-AI/diarization)'s Rust VBx/PLDA
+feed [`diaric`](https://github.com/findit-studio/diaric)'s Rust VBx/PLDA
 clustering. Product driver:
 [`findit-studio/desktop#120`](https://github.com/findit-studio/desktop/issues/120)
 (segmentation ~20x / embedding ~30x ANE uplift targets).
 
-**The clustering algorithms are `dia`'s, not this crate's.** speakerkit's own
+**The clustering algorithms are `diaric`'s, not this crate's.** speakerkit's own
 work is native CoreML inference: it runs the segmentation and embedding nets on
-the ANE and produces `dia`-shaped tensors (`Extraction`). It does not
+the ANE and produces `diaric`-shaped tensors (`Extraction`). It does not
 reimplement clustering. What it *does* provide — as of the clustering phase — is
 a thin runtime clustering *stage* (`Extraction::diarize` / `diarize_with` /
 `diarize_online`) that turns those tensors into speaker-labelled spans by
-delegating to one of `dia`'s two engines: the offline pyannote-community-1
+delegating to one of `diaric`'s two engines: the offline pyannote-community-1
 pipeline (the default, DER-gated) or the online FluidAudio-semantics matcher.
 See [Clustering](#clustering) below.
 
@@ -103,7 +103,7 @@ five community-1 hyperparameters `diaric` exposes:
 | `min_duration_off` | 0.0 | gap-merge threshold (s) for span post-processing |
 
 Every default equals `diaric`'s, which equals pyannote's — pinned in code
-against `diaric`'s own accessors (`cluster::defaults_equal_dia`), so a drift on
+against `diaric`'s own accessors (`cluster::defaults_equal_diaric`), so a drift on
 *either* side fails the build. `OfflineOptions::default()` therefore produces
 byte-identical clustering to feeding `diaric` directly.
 
@@ -206,10 +206,10 @@ path inside this crate, not just a different weights file.
 |---|---|---|
 | HF repo | `FluidInference/speaker-diarization-coreml` | `argmaxinc/speakerkit-coreml` |
 | Segmenter output | powerset log-probs `[1,589,7]` (`log(softmax)`, not raw logits) | already decoded, in-graph: `speaker_ids`/`speaker_activity`/`overlapped_speaker_activity`/… |
-| Decode semantics | **host-side**, in this crate — ports `dia`'s exact powerset/mask/window decode | **in-graph** — argmax's own semantics; this crate only reads the result |
+| Decode semantics | **host-side**, in this crate — ports `diaric`'s exact powerset/mask/window decode | **in-graph** — argmax's own semantics; this crate only reads the result |
 | Tier-1 fidelity ("did we read the model right") | relies on the tier-2 dia-ort check below; a dedicated FluidAudio Swift oracle is deferred/optional (no FluidAudio CLI) | argmax's own Swift (`argmax-oss-swift`'s `SpeakerSegmenterModel`/`SpeakerEmbedderModel`, via an out-of-tree harness since argmax's `DiarizeCLI` only emits post-clustering RTTM) |
 | Tier-2 agreement ("does the decision match dia-ort") vs fp32 `dia`-ort | seg **99.97%** decision-level agreement (99.9717%, 3533/3534 frames); embed cosine **0.99999989** worst | seg **99.98%** cell agreement (Baseline); embed cosine **mean ~0.94, worst ~0.83** |
-| Tier-3 parity (DER vs the reference, end to end through `dia`'s clustering) | **validated** on 1-2 speakers (0.0000%); on the multi-speaker clips in the table below it stays *decision*-faithful (the speaker count matches the reference on every one) but is **not** frame-exact — see that table | **CHARACTERIZED, NOT VALIDATED** — 0.0000% standard-collar DER at 1-2 speakers, then 3.3-9.3% DER on three of the four multi-speaker clips |
+| Tier-3 parity (DER vs the reference, end to end through `diaric`'s clustering) | **validated** on 1-2 speakers (0.0000%); on the multi-speaker clips in the table below it stays *decision*-faithful (the speaker count matches the reference on every one) but is **not** frame-exact — see that table | **CHARACTERIZED, NOT VALIDATED** — 0.0000% standard-collar DER at 1-2 speakers, then 3.3-9.3% DER on three of the four multi-speaker clips |
 | Measured status | **validated** (default; see the multi-speaker caveat below) | tensor-fidelity **validated** (72447/72447 segmentation cells EXACT, 123/123 embedding rows bit-identical vs argmax's own Swift); clustering parity **CHARACTERIZED, NOT VALIDATED** |
 
 **The two sources can produce different diarization results on the same
@@ -221,7 +221,7 @@ embedding space. See "Status" below for exactly what "validated" vs
 ### ⚠ The argmax source diverges on multi-speaker audio
 
 **Do not use `Source::Argmax` on multi-speaker audio.** This is measured, not
-theoretical. End-to-end DER through `dia`'s clustering (standard 0.25 s collar,
+theoretical. End-to-end DER through `diaric`'s clustering (standard 0.25 s collar,
 overlap excluded — the NIST/pyannote definition), scored against the pyannote
 reference on `dia`'s parity corpus, `CpuOnly`:
 
@@ -254,7 +254,7 @@ is also the only non-MrBeast one, so speaker count and recording domain are
 precise trigger is not isolated. Assume argmax is unsafe for multi-speaker audio
 until it is.
 
-**Why.** `dia`'s clustering is not intra-space geometry, and this is the trap:
+**Why.** `diaric`'s clustering is not intra-space geometry, and this is the trap:
 its AHC cuts at a **fixed 0.6 linkage threshold** inside a **frozen, pretrained**
 PLDA projection. `PldaTransform::new()` takes no data — it `include_bytes!`s an
 LDA (256→128) + PLDA fit on the **native kaldi-fbank WeSpeaker distribution**
@@ -300,24 +300,24 @@ A few more decisions worth knowing before you pick a source:
   masks agree ~99.98%, both argmax quantization tiers sit at ~0.94, but
   argmax's WeSpeaker consumes an 80-mel spectrogram from its own separate
   `SpeakerEmbedderPreprocessor` rather than the kaldi fbank `dia`/FluidAudio
-  use. It is tempting to argue that `dia`'s clustering only cares about the
+  use. It is tempting to argue that `diaric`'s clustering only cares about the
   *internal* geometry of whichever space it is given, so a self-consistent
   rotation would cluster fine. **That argument is wrong, and the DER gate
-  above is what disproved it** — the projection `dia` clusters through is
+  above is what disproved it** — the projection `diaric` clusters through is
   frozen and pretrained, so it is not rotation-invariant, and a divergent
   front-end is a domain mismatch against it.
-- **Both sources share `dia`'s mask/overlap-exclusion policy AND its
+- **Both sources share `diaric`'s mask/overlap-exclusion policy AND its
   clustering-stage `minActiveRatio` filter** — not each vendor's own, and not a
   filter this crate omits. argmax's `minActiveRatio` (which withholds
   sparse/overlap-heavy slots, ~12-17% on real clips, from cluster *formation*
   while still labeling them by nearest centroid) is the SAME pyannote
-  community-1 `filter_embeddings` that `dia` ports and runs **unconditionally on
-  every `Extraction`, from either source** (`MIN_ACTIVE_RATIO = 0.2`, dia's
+  community-1 `filter_embeddings` that `diaric` ports and runs **unconditionally on
+  every `Extraction`, from either source** (`MIN_ACTIVE_RATIO = 0.2`, diaric's
   `offline/algo.rs`): the sparse slots are withheld from formation and then
   re-attached at nearest-centroid reassignment — exactly argmax's own
   withhold-then-reassign, reproduced downstream. So it is **not** an un-ported
   divergence, and the old worry that reproducing it would mean *dropping* a slot
-  is moot: `dia` re-attaches, it never drops. This also settles what was once an
+  is moot: `diaric` re-attaches, it never drops. This also settles what was once an
   open watch item — the filter is **already live for argmax**, and it does
   **not** rescue the multi-speaker divergence: every failing clip above ran with
   it applied, `FluidAudio` through the same filter is clean, and the spurious
@@ -378,7 +378,7 @@ what each repository declares, not legal advice.
 
 ### pyannote attribution (CC-BY-4.0 — applies regardless of source)
 
-`dia`'s clustering — the destination for every tensor this crate produces,
+`diaric`'s clustering — the destination for every tensor this crate produces,
 from either source — runs pyannote's **community-1 PLDA**, which is
 **CC-BY-4.0** and requires attribution. Separately, pyannote's
 **segmentation-3.0** net (what both sources' segmenters derive from) is
@@ -411,7 +411,7 @@ citing the original papers):
 }
 ```
 
-(The third citation is VBx/clustering, which is `dia`'s domain, not this
+(The third citation is VBx/clustering, which is `diaric`'s domain, not this
 crate's — reproduced here because it ships in the same model-card citation
 block and applies to the same end-to-end pipeline.)
 
@@ -541,7 +541,7 @@ see `tests/swift/regen_goldens.sh`.
 - **FluidAudio source: validated as the default; not frame-exact on
   multi-speaker audio.** Segmentation decision-level agreement and embedding
   cosine measured against fp32 `dia`-ort (the table above), and now DER through
-  `dia`'s clustering: **0.0000%** on every ≤2-speaker clip and on the 7-speaker
+  `diaric`'s clustering: **0.0000%** on every ≤2-speaker clip and on the 7-speaker
   clip; **0.09-0.39%** on the other multi-speaker clips, exceeding the spec's
   0.1% parity bound on two of them (see the second warning above). Its speaker
   *count* decision matches the reference on every clip in that table. (The one
@@ -598,8 +598,10 @@ see `tests/swift/regen_goldens.sh`.
   spec/plan workflow, not shipped documentation), so these paths exist only
   where the feature was planned/built, not in every checkout — not
   browsable repo links.
-- [`dia`/`diarization`](https://github.com/Findit-AI/diarization) — the
-  clustering crate this one feeds.
+- [`diaric`](https://github.com/findit-studio/diaric) — the core clustering
+  crate this one feeds at runtime.
+- [`dia`/`diarization`](https://github.com/Findit-AI/diarization) — its
+  ONNX/`ort` superset, the DER oracle behind the `dia-oracle` feature.
 - [`coremlit`](../coremlit) — the safe CoreML runtime layer this crate is
   built on.
 - Workspace root [`README.md`](../../README.md) — `whisperkit`, MSRV, and

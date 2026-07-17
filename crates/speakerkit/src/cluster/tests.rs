@@ -161,11 +161,12 @@ fn offline_options_defaults_match_const_literals() {
 }
 
 #[test]
-fn defaults_equal_dia() {
-  // The load-bearing pin: speakerkit's OfflineOptions defaults MUST equal dia's
-  // OfflineInput defaults (which are pyannote-community-1's). Read dia's own
-  // defaults off a freshly-constructed OfflineInput and compare. A drift on
-  // EITHER side — speakerkit's const or dia's `OfflineInput::new` — fails this.
+fn defaults_equal_diaric() {
+  // The load-bearing pin: speakerkit's OfflineOptions defaults MUST equal
+  // diaric's OfflineInput defaults (which are pyannote-community-1's). Read
+  // diaric's own defaults off a freshly-constructed OfflineInput and compare. A
+  // drift on EITHER side — speakerkit's const or diaric's `OfflineInput::new` —
+  // fails this.
   let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
   let raw = vec![0.0f32; crate::embed::EMBEDDING_DIM * 3];
   let segs = vec![0.0f64; 3];
@@ -176,19 +177,19 @@ fn defaults_equal_dia() {
   assert_eq!(
     o.threshold(),
     input.threshold(),
-    "threshold drifted from dia"
+    "threshold drifted from diaric"
   );
-  assert_eq!(o.fa(), input.fa(), "fa drifted from dia");
-  assert_eq!(o.fb(), input.fb(), "fb drifted from dia");
+  assert_eq!(o.fa(), input.fa(), "fa drifted from diaric");
+  assert_eq!(o.fb(), input.fb(), "fb drifted from diaric");
   assert_eq!(
     o.max_iters(),
     input.max_iters(),
-    "max_iters drifted from dia"
+    "max_iters drifted from diaric"
   );
   assert_eq!(
     o.min_duration_off(),
     input.min_duration_off(),
-    "min_duration_off drifted from dia"
+    "min_duration_off drifted from diaric"
   );
 }
 
@@ -471,27 +472,27 @@ fn online_options_defaults_match_const_literals() {
 }
 
 #[test]
-fn online_defaults_equal_dia() {
-  // The load-bearing pin: speakerkit's OnlineOptions defaults MUST equal dia's
-  // OnlineClusterOptions defaults (which are FluidAudio's bare
-  // `SpeakerManager()`). Read dia's own defaults off a freshly-constructed
+fn online_defaults_equal_diaric() {
+  // The load-bearing pin: speakerkit's OnlineOptions defaults MUST equal
+  // diaric's OnlineClusterOptions defaults (which are FluidAudio's bare
+  // `SpeakerManager()`). Read diaric's own defaults off a freshly-constructed
   // OnlineClusterOptions and compare. A drift on EITHER side fails this.
-  let dia_default = diaric::cluster::online::OnlineClusterOptions::default();
+  let diaric_default = diaric::cluster::online::OnlineClusterOptions::default();
   let o = OnlineOptions::default();
   assert_eq!(
     o.speaker_threshold(),
-    dia_default.speaker_threshold(),
-    "speaker_threshold drifted from dia"
+    diaric_default.speaker_threshold(),
+    "speaker_threshold drifted from diaric"
   );
   assert_eq!(
     o.embedding_threshold(),
-    dia_default.embedding_threshold(),
-    "embedding_threshold drifted from dia"
+    diaric_default.embedding_threshold(),
+    "embedding_threshold drifted from diaric"
   );
   assert_eq!(
     o.min_speech_duration(),
-    dia_default.min_speech_duration(),
-    "min_speech_duration drifted from dia"
+    diaric_default.min_speech_duration(),
+    "min_speech_duration drifted from diaric"
   );
 }
 
