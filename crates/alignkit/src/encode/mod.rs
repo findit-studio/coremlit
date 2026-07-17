@@ -479,9 +479,13 @@ impl EncoderOptions {
   /// **correctness** requirement of this model artifact, not a performance
   /// preference — an ANE placement corrupts its emissions.
   ///
-  /// Setting one is not silent: [`Encoder::emissions`] then fails with
-  /// [`AlignError::CorruptEmissions`], which names the placement. The guard is
-  /// on the emission VALUES ([`LOG_PROB_FLOOR`]), not on the placement, so a
+  /// Setting one is not silent on the audio that exposes it:
+  /// [`Encoder::emissions`] fails a real-speech input with
+  /// [`AlignError::CorruptEmissions`], which names the placement. Detection is
+  /// input-dependent — the `log(0)` sentinel only appears once a class posterior
+  /// falls under the fp16 floor, so pure silence or a low tone can pass even
+  /// here — but any real transcription reaches that regime. The guard is on the
+  /// emission VALUES ([`LOG_PROB_FLOOR`]), not on the placement, so a
   /// numerically-clean non-default placement (`CpuAndGpu`) still works.
   #[inline(always)]
   pub const fn compute(&self) -> ComputeUnits {
