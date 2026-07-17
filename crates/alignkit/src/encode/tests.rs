@@ -1134,7 +1134,8 @@ fn emissions_have_no_fp16_log_zero_sentinel() {
 /// [`Emissions::from_log_probs`] runs, and the caller got word timings that were
 /// wrong by up to 881 ms with no diagnostic anywhere. Measured on the real
 /// model, pre-guard: `Aligner::align_chunk(jfk, …)` → `Ok`, with `ask` at
-/// 7533.7 ms instead of 8415.3 ms.
+/// 7533.7 ms instead of 8415.3 ms — a pre-truncation-fix measurement whose exact
+/// ms shifted with the fix (see [`DEFAULT_ENCODER_COMPUTE`]).
 ///
 /// REAL SPEECH is load-bearing, and a synthetic input cannot replace it: on the
 /// corrupt path 960,000 samples of digital silence bottom out at `-8.55` and a
