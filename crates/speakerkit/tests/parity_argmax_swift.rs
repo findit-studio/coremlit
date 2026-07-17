@@ -227,37 +227,23 @@ struct SwiftGolden {
 
 /// Decodes one slot's `activeFrames` bit string, hard-failing unless it is
 /// EXACTLY [`ARGMAX_FRAMES_PER_WINDOW`] characters and every character is
-/// `'0'` or `'1'`.
+/// `'0'` or `'1'` (`activeFrames` is `speaker_ids`, which is hard-binary — a
+/// non-binary or wrong-length value is a malformed golden, never a slot with
+/// fewer active frames).
 ///
-/// The old lenient decode (`c == '1'`, any length, every non-`'1'` char →
-/// `false`) is what let this gate pass vacuously: an empty or truncated
-/// `activeFrames` decoded to a short/empty `Vec<bool>`, the comparison below
-/// iterated only that length, yet [`Fidelity::seg_cells`] still REPORTED
-/// `slots × 589` cells "compared". A wrong length or an unexpected character is
-/// a MALFORMED golden — never a slot with fewer active frames — so it is
-/// rejected here before a single fidelity number is read.
+/// Delegates to the SINGLE strict decoder [`common::parse_bit_mask`] shared with
+/// the embedding golden's mask loader — one leniency killer, not two. The old
+/// lenient decode (`c == '1'`, any length, every non-`'1'` char → `false`) is
+/// what let this gate pass vacuously: an empty or truncated `activeFrames`
+/// decoded to a short/empty `Vec<bool>`, the comparison below iterated only that
+/// length, yet [`Fidelity::seg_cells`] still REPORTED `slots × 589` cells
+/// "compared".
 fn parse_active_frames(fixture: &str, chunk: usize, slot: usize, raw: &str) -> Vec<bool> {
-  let frames: Vec<bool> = raw
-    .chars()
-    .map(|c| match c {
-      '0' => false,
-      '1' => true,
-      other => panic!(
-        "{fixture}: chunk {chunk} slot {slot}: activeFrames contains {other:?} — speaker_ids is \
-         hard-binary, so only '0'/'1' are valid; an unknown character is a malformed golden, not \
-         an inactive frame."
-      ),
-    })
-    .collect();
-  assert_eq!(
-    frames.len(),
+  common::parse_bit_mask(
+    &format!("{fixture}: chunk {chunk} slot {slot}: activeFrames"),
     ARGMAX_FRAMES_PER_WINDOW,
-    "{fixture}: chunk {chunk} slot {slot}: activeFrames has {} characters, expected exactly \
-     {ARGMAX_FRAMES_PER_WINDOW}. A short or empty activeFrames would make the segmentation \
-     comparison vacuous while it still reports full per-window coverage.",
-    frames.len()
-  );
-  frames
+    raw,
+  )
 }
 
 /// Loads and parses a committed argmax-Swift golden.
