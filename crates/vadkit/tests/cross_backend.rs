@@ -2,16 +2,21 @@
 //! **behavioral agreement** of two independent VAD stacks on the parity-corpus
 //! clips, at the segment level:
 //!
-//! - **silero-ONNX** (the reference): the PUBLISHED `silero` crate at its
-//!   default features, running the bundled Silero VAD ONNX graph through ONNX
-//!   Runtime — 512-sample (32 ms) frames at 16 kHz — with silero's own
-//!   `detect_speech` segmenter (hysteresis, `min_speech`/`min_silence`,
-//!   `speech_pad`). A dev-dependency; `ort` never enters vadkit's runtime graph
+//! - **silero-ONNX** (the reference): the `silero` crate at its default
+//!   features, running the bundled Silero VAD ONNX graph through ONNX Runtime —
+//!   512-sample (32 ms) frames at 16 kHz — with silero's own `detect_speech`
+//!   segmenter (hysteresis, `min_speech`/`min_silence`, `speech_pad`). A
+//!   dev-dependency; `ort` never enters vadkit's runtime graph
 //!   (`cargo tree -p vadkit -e no-dev -i ort` finds nothing — the Cargo.toml
 //!   note).
-//! - **vadkit-CoreML** (under test): `vadkit::VadModel` (the FluidInference
-//!   unified 256 ms artifact, `silero-vad-unified-256ms-v6.2.1`) — 4096-sample
-//!   (256 ms) frames — post-processed by the MINIMAL test-only harness below.
+//! - **vadkit-CoreML** (under test): the FluidInference unified 256 ms artifact
+//!   (`silero-vad-unified-256ms-v6.2.1`) — 4096-sample (256 ms) frames — turned
+//!   into segments by **silero's own segmenter through vadkit's re-export**
+//!   ([`vadkit::detect_speech`], which forwards to `silero::detect_speech_with`
+//!   over [`vadkit::CoreMlBackend`]). This REPLACES T4's interim test-local
+//!   thresholding harness (T5): the vadkit side now runs the exact same
+//!   detection logic as the reference, differing only in model and geometry —
+//!   which is what makes the agreement a clean model-vs-model measurement.
 //!
 //! # This is behavioral agreement, NOT bit parity — by construction
 //!
@@ -31,7 +36,7 @@
 //!
 //! So the gate does not — and must not — assert equal probabilities or identical
 //! boundaries. It pins, two-sided from values MEASURED against the real models
-//! (recorded in the constants below and this crate's T4 report), the aggregate
+//! (recorded in the constants below and this crate's T5 report), the aggregate
 //! agreement a healthy pairing produces. Two complementary families of metric
 //! cover the two mutations the campaign requires to turn this red:
 //!
@@ -40,18 +45,20 @@
 //!   count frames whose speech label differs from vadkit's `probability ≥
 //!   threshold` call. MEASURED **0 on both clips** — the two independent models
 //!   make the identical per-frame decision everywhere at the 0.5 threshold.
-//!   Swapping the vadkit threshold 0.5 → 0.9 flips 2–3 confidently-but-not-
-//!   overwhelmingly-speech boundary frames → `grid_disagree` 2–3 > the pinned 1.
-//!   (These clips are 75–95 % speech and the VAD is very confident, so the
-//!   threshold barely moves the aggregate masks — only the grid metric is
-//!   sharp enough to catch it.)
-//! - **The mask/span metrics catch a geometry lie.** Sample-level overlap
-//!   (0.956–0.973), speech IoU (0.956–0.965), duration ratio (1.036–1.046) and
-//!   the outer speech-envelope boundary deltas (≤ 0.194 s) all collapse when the
-//!   harness places 4096-sample frames on silero's 512-sample stride
-//!   (`frame_samples` 4096 → 512): the timeline compresses 8×, so overlap →
-//!   0.15, IoU → 0.0–0.13, duration ratio → 0.13, and the envelope end-delta
-//!   blows out to 21–26 s. (The grid metric is frame-decision based and so is
+//!   Swapping that characterization threshold 0.5 → 0.9 flips 2–3 confidently-
+//!   but-not-overwhelmingly-speech boundary frames → `grid_disagree` 2–3 > the
+//!   pinned 1. (These clips are 75–95 % speech and the VAD is very confident, so
+//!   the threshold barely moves the aggregate masks — only the grid metric is
+//!   sharp enough to catch it. The grid metric reads vadkit's RAW per-256 ms
+//!   probabilities, which is model inference, not segment-assembly logic — it
+//!   stays here after T5's harness removal.)
+//! - **The mask/span metrics catch a geometry lie.** Sample-level overlap, speech
+//!   IoU, duration ratio and the outer speech-envelope boundary deltas all
+//!   collapse when silero's real [`SpeechSegmenter`] is driven over vadkit's
+//!   256 ms probabilities at silero's 512-sample stride
+//!   ([`SpeechSegmenter::set_frame_samples`] 4096 → 512): the timeline
+//!   compresses 8×, so overlap and IoU crater and the envelope end-delta blows
+//!   out by tens of seconds. (The grid metric is frame-decision based and so is
 //!   deliberately blind to this — the two families do not overlap.)
 //!
 //! Model-gated (`#[ignore]`): needs `Models/vadkit` (`VADKIT_TEST_MODELS`) for
@@ -60,7 +67,8 @@
 mod common;
 
 use coremlit::ComputeUnits;
-use vadkit::{CHUNK_SAMPLES, VadModel, VadModelOptions};
+use silero::{SpeechOptions, SpeechSegmenter};
+use vadkit::{CHUNK_SAMPLES, CoreMlBackend, VadModel, VadModelOptions, detect_speech};
 
 /// 16 kHz — the corpus sample rate both stacks consume (asserted per clip).
 const SAMPLE_RATE: u64 = 16_000;
@@ -71,124 +79,39 @@ const SAMPLE_RATE: u64 = 16_000;
 /// 99 frames, whose short final chunk exercises the padding path).
 const GATE_FIXTURES: &[&str] = &["02_pyannote_sample", "07_yuhewei_dongbei_english"];
 
-// ── The MINIMAL, TEST-ONLY vadkit post-processing harness ───────────────────
-//
-// INTERIM until T5. vadkit authors ZERO detection logic (spec §2-§3): the real
-// segmenter is silero's, wired over the CoreML backend by T5's re-export layer,
-// which does not exist yet. This harness exists ONLY so T4 can turn vadkit's
-// per-frame probabilities into segments to compare. It is deliberately cruder
-// than silero's segmenter — a fixed threshold plus min-duration merging, no
-// hysteresis, no speech padding, no force-split — precisely so the gate
-// measures the MODELS' agreement, not two copies of the same post-processor.
-// It is NOT a public API and MUST NOT be promoted to one.
+/// The grid-metric characterization threshold a HEALTHY run uses: vadkit calls a
+/// 256 ms frame speech when its probability ≥ this. Anchored on silero's
+/// `start_threshold` default. This is a TEST-SIDE measurement threshold over the
+/// models' raw probabilities, not vadkit's detection threshold (that lives in
+/// silero's segmenter, driven at its own default through the re-export).
+const GRID_THRESHOLD_HEALTHY: f32 = 0.5;
+/// Mutation 1 — the threshold-swap knob (spec §6 "swaps thresholds"): raise the
+/// grid characterization threshold 0.5 → 0.9. At 0.9, vadkit drops 2–3 boundary
+/// frames its raw probability no longer clears, so `grid_disagree` climbs from 0
+/// past the pinned bound.
+const GRID_THRESHOLD_MUTANT: f32 = 0.9;
 
-/// A half-open speech interval on the 16 kHz sample timeline, `[start, end)`.
+/// Mutation 2 — the geometry lie (spec §6 "geometry"): drive silero's real
+/// segmenter over vadkit's 256 ms probabilities at silero's 512-sample stride
+/// instead of the true [`CHUNK_SAMPLES`] (4096). Compresses vadkit's timeline
+/// 8×, collapsing overlap/IoU and blowing out the envelope boundary deltas.
+const MUTANT_FRAME_SAMPLES: usize = 512;
+
+// ── A half-open speech interval on the 16 kHz sample timeline, `[start, end)` ─
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Segment {
   start: u64,
   end: u64,
 }
 
-/// Configuration for [`vadkit_segments`] — the interim harness's knobs. Named so
-/// the healthy config and the two mutants each differ from it by ONE field.
-#[derive(Debug, Clone, Copy)]
-struct HarnessConfig {
-  /// Fixed speech threshold: a frame is speech iff `probability >= threshold`.
-  threshold: f32,
-  /// Interior silence gaps (in frames) no longer than this between two speech
-  /// runs are bridged (filled to speech) — the "min-silence" half of the
-  /// min-duration merge, approximating silero's dip-tolerant hysteresis on the
-  /// coarse 256 ms grid.
-  bridge_silence_frames: usize,
-  /// Speech runs shorter than this (in frames, after bridging) are dropped — the
-  /// "min-speech" half of the merge.
-  min_speech_frames: usize,
-  /// Samples per vadkit frame, used to place frame `i` at `[i·f, (i+1)·f)`. The
-  /// TRUE geometry is [`CHUNK_SAMPLES`] (4096). The geometry-lie mutation sets
-  /// this to silero's 512 — the single load-bearing timestamp constant.
-  frame_samples: u64,
-}
-
-/// The healthy vadkit harness config the gate is pinned around. `threshold` 0.5
-/// anchors on silero's `start_threshold`; `bridge_silence_frames` 1 lets a
-/// single 256 ms probability dip stay inside a segment (silero, on its 32 ms
-/// grid with 100 ms `min_silence` and 0.35 end-hysteresis, likewise rides out
-/// sub-frame dips); `min_speech_frames` 1 keeps segments ≥ 256 ms (≈ silero's
-/// 250 ms `min_speech`); `frame_samples` is the real 4096-sample geometry.
-const HEALTHY: HarnessConfig = HarnessConfig {
-  threshold: 0.5,
-  bridge_silence_frames: 1,
-  min_speech_frames: 1,
-  frame_samples: CHUNK_SAMPLES as u64,
-};
-
-/// Mutation 1 — threshold swap 0.5 → 0.9 (spec §6 "swaps thresholds"). Every
-/// other knob matches [`HEALTHY`]. At 0.9, vadkit drops 2–3 boundary frames,
-/// so `grid_disagree` climbs from 0 past the pinned bound.
-const MUT_THRESHOLD: HarnessConfig = HarnessConfig {
-  threshold: 0.9,
-  ..HEALTHY
-};
-
-/// Mutation 2 — geometry lie: place vadkit's 4096-sample frames on silero's
-/// 512-sample stride (spec §6 "geometry"). Every other knob matches [`HEALTHY`].
-/// This compresses vadkit's timeline 8×, collapsing overlap/IoU/duration and
-/// blowing out the envelope boundary deltas.
-const MUT_GEOMETRY: HarnessConfig = HarnessConfig {
-  frame_samples: 512,
-  ..HEALTHY
-};
-
-/// Turns vadkit's per-frame probabilities into segments per `cfg`: binarize at
-/// the threshold, bridge short interior silence gaps, emit runs ≥
-/// `min_speech_frames`, mapping frame `i` to `[i·frame_samples,
-/// (i+1)·frame_samples)` clamped to `total_samples`.
-fn vadkit_segments(probs: &[f32], cfg: HarnessConfig, total_samples: u64) -> Vec<Segment> {
-  let mut speech: Vec<bool> = probs.iter().map(|&p| p >= cfg.threshold).collect();
-
-  if cfg.bridge_silence_frames > 0
-    && let (Some(first), Some(last)) = (
-      speech.iter().position(|&s| s),
-      speech.iter().rposition(|&s| s),
-    )
-  {
-    let mut i = first;
-    while i <= last {
-      if speech[i] {
-        i += 1;
-        continue;
-      }
-      let gap_start = i;
-      while i <= last && !speech[i] {
-        i += 1;
-      }
-      if i - gap_start <= cfg.bridge_silence_frames {
-        speech[gap_start..i].fill(true);
-      }
+impl Segment {
+  fn of(seg: silero::SpeechSegment) -> Self {
+    Self {
+      start: seg.start_sample(),
+      end: seg.end_sample(),
     }
   }
-
-  let mut segments = Vec::new();
-  let mut i = 0;
-  while i < speech.len() {
-    if !speech[i] {
-      i += 1;
-      continue;
-    }
-    let run_start = i;
-    while i < speech.len() && speech[i] {
-      i += 1;
-    }
-    if i - run_start < cfg.min_speech_frames {
-      continue;
-    }
-    let start = (run_start as u64) * cfg.frame_samples;
-    let end = ((i as u64) * cfg.frame_samples).min(total_samples);
-    if start < total_samples && end > start {
-      segments.push(Segment { start, end });
-    }
-  }
-  segments
 }
 
 /// Rasterizes segments to a per-sample speech mask on `[0, n)`.
@@ -203,40 +126,55 @@ fn speech_mask(segments: &[Segment], n: usize) -> Vec<bool> {
 }
 
 // ── Pinned two-sided tolerances (MEASURED against the real models, then pinned
-//    with documented margin; see the module docs and the T4 report) ───────────
+//    with documented margin; see the module docs and the T5 report) ───────────
+//
+// The bounds are UNCHANGED from T4 (the task forbids re-pinning): the T5
+// re-export runs nearly the same segmentation math the interim harness
+// approximated (silero's segmenter with its 100 ms `min_silence` closes on the
+// second 256 ms low frame, exactly the harness's 1-frame bridge; 250 ms
+// `min_speech` is under one 256 ms frame, exactly the harness's 1-frame
+// minimum), so the healthy values land inside the same bands with room to
+// spare. The "measured (re-export)" numbers below are the T5 re-measurement.
 
 /// Max tolerated `grid_disagree` frames per clip. **Measured 0** on both clips —
 /// silero downsampled to vadkit's 256 ms grid and vadkit's `≥ 0.5` call agree on
 /// every frame. Pinned at 1 (a single frame of headroom for future toolchain
-/// drift, in the spirit of T3's `TRACE_TOL` headroom over a measured 0). The
-/// threshold-swap mutation reaches 2 (02) / 3 (07), clear of the bound; the
-/// geometry lie leaves this metric at 0 by construction (frame decisions do not
-/// depend on the segment stride) — it is caught by the mask/span bounds instead.
+/// drift). The threshold-swap mutation reaches 2 (02) / 3 (07); the geometry lie
+/// leaves this metric at 0 by construction (frame decisions do not depend on the
+/// segment stride) — it is caught by the mask/span bounds instead.
 const GRID_DISAGREE_MAX: usize = 1;
 
-/// Sample-level speech/non-speech overlap ratio band. **Measured 0.973 (02) /
-/// 0.956 (07)**; floor 0.90 leaves ≈ 0.05 margin. The geometry lie sends it to
-/// 0.15–0.17, far below the floor. (Upper bound 1.0 is the natural ceiling —
-/// perfect agreement — no healthy or mutant run approaches it.)
+/// Sample-level speech/non-speech overlap ratio band. **Measured (re-export)
+/// 0.972 (02) / 0.949 (07)**; floor 0.90 leaves ≈ 0.05 margin. The geometry lie
+/// sends it to 0.15 (02) / 0.17 (07), far below the floor. (Upper bound 1.0 is
+/// the natural ceiling — no healthy or mutant run approaches it.)
 const OVERLAP_MIN: f64 = 0.90;
 const OVERLAP_MAX: f64 = 1.0;
 
-/// Speech-region IoU (Jaccard) floor. **Measured 0.965 (02) / 0.956 (07)**;
-/// floor 0.85. The geometry lie sends it to 0.0 (02, disjoint) / 0.13 (07).
+/// Speech-region IoU (Jaccard) floor. **Measured (re-export) 0.964 (02) / 0.949
+/// (07)**; floor 0.85. The geometry lie sends it to 0.00 (02, disjoint) / 0.13
+/// (07).
 const IOU_MIN: f64 = 0.85;
 const IOU_MAX: f64 = 1.0;
 
-/// Total-speech duration ratio (vadkit ÷ silero) band. **Measured 1.036 (02) /
-/// 1.046 (07)** — vadkit calls slightly more of the clip speech than silero.
-/// Band [0.85, 1.20] straddles it two-sided; the geometry lie sends it to 0.13.
+/// Total-speech duration ratio (vadkit ÷ silero) band. **Measured (re-export)
+/// 1.038 (02) / 1.054 (07)** — vadkit calls slightly more of the clip speech
+/// than silero (its coarse grid + 30 ms pad + 0.35 end-hysteresis bridge/extend
+/// silero's short pauses). Band [0.85, 1.20] straddles it two-sided; the
+/// geometry lie sends it to 0.13.
 const DUR_RATIO_MIN: f64 = 0.85;
 const DUR_RATIO_MAX: f64 = 1.20;
 
 /// Max tolerated outer speech-envelope boundary delta (start and end), in
-/// samples. **Measured worst 0.194 s** (07 end; 3 104 samples). Pinned at
+/// samples. **Measured (re-export) worst 0.369 s** (07 end; 5 904 samples — the
+/// margin to the bound is tighter than T4's harness measured, because silero's
+/// real segmenter holds 07's trailing segment ≈ one grid step later than the
+/// hard-0.5 harness did, via its 0.35 end-hysteresis and 30 ms pad). Pinned at
 /// 6 400 samples (0.40 s ≈ 1.5 frames), covering one 256 ms frame of
-/// quantization plus silero's 30 ms pad plus margin. The geometry lie blows the
-/// envelope end-delta out to 21–26 s.
+/// quantization plus silero's pad plus margin. The geometry lie blows the
+/// envelope end-delta out to 21–26 s. This value is deterministic (`cpu_only`,
+/// SHA-pinned artifact, pinned silero rev); a dependency bump is the correct
+/// trigger to re-measure it.
 const SPAN_DELTA_MAX_SAMPLES: u64 = 6_400;
 
 // ── Metrics ─────────────────────────────────────────────────────────────────
@@ -246,7 +184,7 @@ const SPAN_DELTA_MAX_SAMPLES: u64 = 6_400;
 #[derive(Debug, Clone, Copy)]
 struct Agreement {
   /// Frames where silero (downsampled to the 256 ms grid, any-speech rule) and
-  /// vadkit (`probability ≥ threshold`) disagree — the threshold detector.
+  /// vadkit (`probability ≥ grid_threshold`) disagree — the threshold detector.
   grid_disagree: usize,
   /// Fraction of the timeline where both stacks agree (both speech or both
   /// silence) — the speech/non-speech overlap ratio.
@@ -267,9 +205,7 @@ struct Agreement {
 /// frame `i` is speech if ANY of its `CHUNK_SAMPLES` samples is silero-speech —
 /// the natural correspondence ("a 256 ms frame holding speech is a speech
 /// frame") under which the two independent models agree perfectly at threshold
-/// 0.5. (A majority rule instead disagrees on boundary frames and, perversely,
-/// AGREES MORE under the threshold mutation, so it cannot detect it — measured
-/// and discarded.)
+/// 0.5.
 fn silero_grid(silero_mask: &[bool], n_frames: usize) -> Vec<bool> {
   (0..n_frames)
     .map(|i| {
@@ -281,20 +217,28 @@ fn silero_grid(silero_mask: &[bool], n_frames: usize) -> Vec<bool> {
 }
 
 /// Characterizes the agreement between the silero reference segments and the
-/// vadkit stack (raw `probs` post-processed by `cfg`) over a `total`-sample
-/// timeline.
-fn characterize(silero: &[Segment], probs: &[f32], cfg: HarnessConfig, total: usize) -> Agreement {
+/// vadkit segments over a `total`-sample timeline. `probs` are vadkit's raw
+/// per-256 ms probabilities (for the grid metric, thresholded at
+/// `grid_threshold`); `vadkit` are the segments the vadkit stack produced (the
+/// real re-export for a healthy run, or silero's segmenter at a lied stride for
+/// the geometry mutation).
+fn characterize(
+  silero: &[Segment],
+  vadkit: &[Segment],
+  probs: &[f32],
+  grid_threshold: f32,
+  total: usize,
+) -> Agreement {
   let sil_mask = speech_mask(silero, total);
 
   // Grid metric: silero (any-speech, 256 ms) vs vadkit (threshold), per frame.
   let sil_grid = silero_grid(&sil_mask, probs.len());
   let grid_disagree = (0..probs.len())
-    .filter(|&i| (probs[i] >= cfg.threshold) != sil_grid[i])
+    .filter(|&i| (probs[i] >= grid_threshold) != sil_grid[i])
     .count();
 
-  // Mask metrics from the harness segments.
-  let vadkit = vadkit_segments(probs, cfg, total as u64);
-  let vk_mask = speech_mask(&vadkit, total);
+  // Mask metrics from the vadkit segments.
+  let vk_mask = speech_mask(vadkit, total);
   let mut agree = 0u64;
   let mut inter = 0u64;
   let mut union = 0u64;
@@ -309,15 +253,26 @@ fn characterize(silero: &[Segment], probs: &[f32], cfg: HarnessConfig, total: us
     vk_speech += u64::from(b);
   }
 
-  // Outer speech-envelope span deltas.
+  // Outer speech-envelope span deltas. Ends are clamped to the audio length
+  // (as T4's harness clamped every segment end to `total_samples`): silero's
+  // `detect_speech_with` zero-pads a trailing PARTIAL frame and closes the
+  // segment at the padded FRAME boundary (`n_frames * frame_samples`), which
+  // can overhang the true sample count by up to one frame (e.g. 07's 99·4096 =
+  // 405 504 past its 404 160 samples). That overhang is a timeline artifact,
+  // not real speech past the end of the audio, so the honest in-audio envelope
+  // — the same one the interim harness measured — clamps it away. It is a
+  // no-op for `02` (no partial frame) and for the compressed geometry-lie
+  // segments (all well within `total`), so it changes neither the healthy `02`
+  // value nor the mutation's blow-out.
+  let clamp = total as u64;
   let span = |segs: &[Segment]| -> (u64, u64) {
     (
-      segs.iter().map(|s| s.start).min().unwrap_or(0),
-      segs.iter().map(|s| s.end).max().unwrap_or(0),
+      segs.iter().map(|s| s.start.min(clamp)).min().unwrap_or(0),
+      segs.iter().map(|s| s.end.min(clamp)).max().unwrap_or(0),
     )
   };
   let (sil_lo, sil_hi) = span(silero);
-  let (vk_lo, vk_hi) = span(&vadkit);
+  let (vk_lo, vk_hi) = span(vadkit);
 
   Agreement {
     grid_disagree,
@@ -416,7 +371,7 @@ fn render(clip: &str, tag: &str, a: &Agreement) -> String {
 /// the 16 kHz timeline.
 fn silero_segments(samples: &[f32]) -> Vec<Segment> {
   let mut session = silero::Session::bundled().expect("load bundled silero ONNX model");
-  let options = silero::SpeechOptions::default();
+  let options = SpeechOptions::default();
   assert_eq!(
     options.sample_rate(),
     silero::SampleRate::Rate16k,
@@ -425,16 +380,14 @@ fn silero_segments(samples: &[f32]) -> Vec<Segment> {
   silero::detect_speech(&mut session, samples, options)
     .expect("silero detect_speech")
     .into_iter()
-    .map(|s| Segment {
-      start: s.start_sample(),
-      end: s.end_sample(),
-    })
+    .map(Segment::of)
     .collect()
 }
 
-/// Runs vadkit's CoreML model layer over the 4096-stride chunking on `cpu_only`
-/// (deterministic; matches the trace oracle's placement) and returns one speech
-/// probability per 256 ms frame.
+/// Runs vadkit's per-256 ms CoreML probabilities on `cpu_only` (deterministic;
+/// matches the trace oracle's placement). One probability per 256 ms frame — the
+/// raw model output the grid metric and the geometry-lie mutation drive, kept
+/// separate from segment assembly (which is silero's, below).
 fn vadkit_probs(samples: &[f32]) -> Vec<f32> {
   let mut model = VadModel::load_with(
     common::model_path(),
@@ -445,6 +398,45 @@ fn vadkit_probs(samples: &[f32]) -> Vec<f32> {
     .chunks(CHUNK_SAMPLES)
     .map(|chunk| model.predict_chunk(chunk).expect("vadkit predict_chunk"))
     .collect()
+}
+
+/// **The real re-export path** (T5): vadkit's segments as produced by silero's
+/// own segmenter over the CoreML backend — [`detect_speech`] forwarding to
+/// `silero::detect_speech_with`. Default `SpeechOptions`, `cpu_only`
+/// (deterministic). This is the healthy vadkit stack the gate measures — the
+/// same detection logic as the reference, only a different model and geometry.
+fn vadkit_detect_segments(samples: &[f32]) -> Vec<Segment> {
+  let mut backend = CoreMlBackend::load_with(
+    common::model_path(),
+    VadModelOptions::new().with_compute(ComputeUnits::CpuOnly),
+  )
+  .expect("load vadkit CoreML backend");
+  detect_speech(&mut backend, samples, SpeechOptions::default())
+    .expect("vadkit detect_speech")
+    .into_iter()
+    .map(Segment::of)
+    .collect()
+}
+
+/// Drives silero's REAL [`SpeechSegmenter`] over vadkit's per-256 ms `probs` at a
+/// chosen `frame_samples` stride, collecting the segments — the same segmenter
+/// [`detect_speech`] uses internally, exposed here so the geometry-lie mutation
+/// can feed it silero's 512-sample stride instead of the true 4096 while the
+/// probabilities stay vadkit's real 256 ms outputs. Authors no detection logic:
+/// `SpeechSegmenter` is silero's.
+fn silero_segmenter_segments(probs: &[f32], frame_samples: usize) -> Vec<Segment> {
+  let mut segmenter = SpeechSegmenter::new(SpeechOptions::default());
+  segmenter.set_frame_samples(frame_samples);
+  let mut segments = Vec::new();
+  for &probability in probs {
+    if let Some(segment) = segmenter.push_probability(probability) {
+      segments.push(Segment::of(segment));
+    }
+  }
+  if let Some(segment) = segmenter.finish() {
+    segments.push(Segment::of(segment));
+  }
+  segments
 }
 
 /// Loads a fixture clip, proving its bytes match the SHA-256 pinned in
@@ -466,10 +458,10 @@ fn load_fixture(name: &str) -> Vec<f32> {
 // ── The gate ────────────────────────────────────────────────────────────────
 
 /// **THE CROSS-BACKEND GATE** (model-gated). For each parity clip: run the
-/// silero-ONNX reference and the vadkit-CoreML stack, characterize their
-/// agreement, and require every pinned bound to hold — recording the measured
-/// numbers. The two `mutation_*` tests below prove the bounds turn red under a
-/// threshold swap and a geometry lie.
+/// silero-ONNX reference and the vadkit-CoreML stack (through the real
+/// re-export), characterize their agreement, and require every pinned bound to
+/// hold — recording the measured numbers. The two `mutation_*` tests below prove
+/// the bounds turn red under a threshold swap and a geometry lie.
 #[test]
 #[ignore = "requires local vadkit models (VADKIT_TEST_MODELS)"]
 fn cross_backend_agreement_holds() {
@@ -481,8 +473,9 @@ fn cross_backend_agreement_holds() {
     let silero = silero_segments(&samples);
     assert!(!silero.is_empty(), "{clip}: silero found no speech");
     let probs = vadkit_probs(&samples);
+    let vadkit = vadkit_detect_segments(&samples);
 
-    let agreement = characterize(&silero, &probs, HEALTHY, total);
+    let agreement = characterize(&silero, &vadkit, &probs, GRID_THRESHOLD_HEALTHY, total);
     println!("{}", render(clip, "HEALTHY", &agreement));
 
     let violations = within_gate(&agreement);
@@ -493,10 +486,12 @@ fn cross_backend_agreement_holds() {
   }
 }
 
-/// Mutation 1 (recorded red): swapping the vadkit threshold 0.5 → 0.9 drives
-/// `grid_disagree` past its bound — the same gate [`cross_backend_agreement_holds`]
-/// enforces now reports a violation. Proves the gate is sensitive to the
-/// threshold; the healthy run above proves it is not merely always-red.
+/// Mutation 1 (recorded red): raising the grid characterization threshold
+/// 0.5 → 0.9 drives `grid_disagree` past its bound — the same gate
+/// [`cross_backend_agreement_holds`] enforces now reports a violation. The
+/// vadkit SEGMENTS are the healthy re-export (unchanged), so only the threshold
+/// family moves: proves the gate is sensitive to the threshold without being
+/// merely always-red.
 #[test]
 #[ignore = "requires local vadkit models (VADKIT_TEST_MODELS)"]
 fn mutation_threshold_swap_breaks_gate() {
@@ -505,8 +500,9 @@ fn mutation_threshold_swap_breaks_gate() {
     let total = samples.len();
     let silero = silero_segments(&samples);
     let probs = vadkit_probs(&samples);
+    let vadkit = vadkit_detect_segments(&samples);
 
-    let agreement = characterize(&silero, &probs, MUT_THRESHOLD, total);
+    let agreement = characterize(&silero, &vadkit, &probs, GRID_THRESHOLD_MUTANT, total);
     println!("{}", render(clip, "mut:thr", &agreement));
 
     let violations = within_gate(&agreement);
@@ -521,11 +517,12 @@ fn mutation_threshold_swap_breaks_gate() {
   }
 }
 
-/// Mutation 2 (recorded red): lying about the geometry — placing vadkit's
-/// 4096-sample frames on silero's 512-sample stride — collapses the sample-level
-/// agreement and blows out the envelope boundary deltas, tripping the mask/span
-/// bounds. The grid metric (frame-decision based) is deliberately untouched, so
-/// this proves a DIFFERENT family of bound from mutation 1.
+/// Mutation 2 (recorded red): lying about the geometry — driving silero's real
+/// segmenter over vadkit's 256 ms probabilities at silero's 512-sample stride —
+/// collapses the sample-level agreement and blows out the envelope boundary
+/// deltas, tripping the mask/span bounds. The grid metric (frame-decision based)
+/// is deliberately untouched, so this proves a DIFFERENT family of bound from
+/// mutation 1.
 #[test]
 #[ignore = "requires local vadkit models (VADKIT_TEST_MODELS)"]
 fn mutation_geometry_lie_breaks_gate() {
@@ -534,8 +531,9 @@ fn mutation_geometry_lie_breaks_gate() {
     let total = samples.len();
     let silero = silero_segments(&samples);
     let probs = vadkit_probs(&samples);
+    let vadkit_lied = silero_segmenter_segments(&probs, MUTANT_FRAME_SAMPLES);
 
-    let agreement = characterize(&silero, &probs, MUT_GEOMETRY, total);
+    let agreement = characterize(&silero, &vadkit_lied, &probs, GRID_THRESHOLD_HEALTHY, total);
     println!("{}", render(clip, "mut:geom", &agreement));
 
     let violations = within_gate(&agreement);
