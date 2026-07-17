@@ -326,17 +326,40 @@ mod tracing_spans {
   // the same path this does. There is nothing to fix in the library.
 
   thread_local! {
-    /// `Some` while this thread is capturing; the names it has collected.
-    static CAPTURED: RefCell<Option<Vec<&'static str>>> = const { RefCell::new(None) };
+    /// `Some` while this thread is capturing; the spans it has collected.
+    static CAPTURED: RefCell<Option<Capture>> = const { RefCell::new(None) };
   }
 
-  /// A capturing [`tracing::Subscriber`]: records the NAME of every span opened
-  /// on a thread that has armed [`CAPTURED`], and ignores every other thread.
+  /// One captured span: its NAME, the NAMES of its declared diagnostic fields,
+  /// and the id of its (contextual) parent — everything the `tracing` contract
+  /// documents, so the gate proves the fields and the nesting, not merely the
+  /// count.
+  #[derive(Debug)]
+  struct CapturedSpan {
+    id: u64,
+    name: &'static str,
+    fields: Vec<&'static str>,
+    parent: Option<u64>,
+  }
+
+  /// The per-thread capture buffer: the spans opened so far, and the stack of
+  /// currently-entered span ids that resolves each new span's CONTEXTUAL parent
+  /// — exactly as `tracing-subscriber`'s registry does, since a `#[instrument]`
+  /// span's parent is whichever span is entered when it is created.
+  #[derive(Debug, Default)]
+  struct Capture {
+    spans: Vec<CapturedSpan>,
+    entered: Vec<u64>,
+  }
+
+  /// A capturing [`tracing::Subscriber`]: records the NAME, FIELD names, and
+  /// (contextual) PARENT of every span opened on a thread that has armed
+  /// [`CAPTURED`], and ignores every other thread.
   ///
   /// Hand-rolled rather than `tracing-subscriber`: the whole surface is seven
   /// trait methods, and a test-only dependency on a second tracing crate (with
-  /// its own feature matrix) to assert "≥ 1 span exists" would cost more than
-  /// it explains.
+  /// its own feature matrix) to assert the nesting and fields would cost more
+  /// than it explains.
   struct CaptureSpans {
     next_id: AtomicU64,
   }
@@ -350,25 +373,64 @@ mod tracing_spans {
     }
 
     fn new_span(&self, span: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+      // `Id::from_u64` rejects 0; `next_id` starts at 1.
+      let id = self.next_id.fetch_add(1, Ordering::Relaxed);
       CAPTURED.with(|captured| {
-        if let Some(names) = captured.borrow_mut().as_mut() {
-          names.push(span.metadata().name());
+        if let Some(capture) = captured.borrow_mut().as_mut() {
+          // A `#[instrument]` span sets no explicit parent, so its parent is the
+          // span currently entered on this thread (top of the stack), or none at
+          // the root.
+          let parent = capture.entered.last().copied();
+          let fields = span
+            .metadata()
+            .fields()
+            .iter()
+            .map(|field| field.name())
+            .collect();
+          capture.spans.push(CapturedSpan {
+            id,
+            name: span.metadata().name(),
+            fields,
+            parent,
+          });
         }
       });
-      // `Id::from_u64` rejects 0.
-      tracing::span::Id::from_u64(self.next_id.fetch_add(1, Ordering::Relaxed))
+      tracing::span::Id::from_u64(id)
     }
 
     fn record(&self, _span: &tracing::span::Id, _values: &tracing::span::Record<'_>) {}
     fn record_follows_from(&self, _span: &tracing::span::Id, _follows: &tracing::span::Id) {}
     fn event(&self, _event: &tracing::Event<'_>) {}
-    fn enter(&self, _span: &tracing::span::Id) {}
-    fn exit(&self, _span: &tracing::span::Id) {}
+
+    fn enter(&self, span: &tracing::span::Id) {
+      CAPTURED.with(|captured| {
+        if let Some(capture) = captured.borrow_mut().as_mut() {
+          capture.entered.push(span.into_u64());
+        }
+      });
+    }
+
+    fn exit(&self, span: &tracing::span::Id) {
+      CAPTURED.with(|captured| {
+        if let Some(capture) = captured.borrow_mut().as_mut() {
+          // `#[instrument]` enters/exits are strictly nested, so the exiting span
+          // is the top on the happy path; find-and-remove anyway so an unexpected
+          // order cannot corrupt the stack.
+          if let Some(pos) = capture
+            .entered
+            .iter()
+            .rposition(|&id| id == span.into_u64())
+          {
+            capture.entered.remove(pos);
+          }
+        }
+      });
+    }
   }
 
   /// Runs `body` with the capturing subscriber armed on this thread and returns
-  /// the names of every span it opened, in order.
-  fn spans_opened_by(body: impl FnOnce()) -> Vec<&'static str> {
+  /// every span it opened, in order.
+  fn spans_opened_by(body: impl FnOnce()) -> Vec<CapturedSpan> {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
       tracing::subscriber::set_global_default(CaptureSpans {
@@ -377,18 +439,48 @@ mod tracing_spans {
       .expect("no other subscriber may claim the global default in this test binary");
     });
 
-    CAPTURED.with(|captured| *captured.borrow_mut() = Some(Vec::new()));
+    CAPTURED.with(|captured| *captured.borrow_mut() = Some(Capture::default()));
     body();
     CAPTURED.with(|captured| {
       captured
         .borrow_mut()
         .take()
         .expect("capture was armed above")
+        .spans
     })
   }
 
-  fn count(spans: &[&'static str], name: &str) -> usize {
-    spans.iter().filter(|span| **span == name).count()
+  fn count(spans: &[CapturedSpan], name: &str) -> usize {
+    spans.iter().filter(|span| span.name == name).count()
+  }
+
+  /// The first captured span with `name` — for the field / parent assertions.
+  fn first<'a>(spans: &'a [CapturedSpan], name: &str) -> &'a CapturedSpan {
+    spans
+      .iter()
+      .find(|span| span.name == name)
+      .unwrap_or_else(|| panic!("no `{name}` span was captured; got {spans:?}"))
+  }
+
+  /// The name of `span`'s parent, resolved through the captured ids.
+  fn parent_name<'a>(spans: &'a [CapturedSpan], span: &CapturedSpan) -> Option<&'a str> {
+    let parent = span.parent?;
+    spans
+      .iter()
+      .find(|candidate| candidate.id == parent)
+      .map(|candidate| candidate.name)
+  }
+
+  /// Asserts `span` declares every documented field in `expected`.
+  fn assert_has_fields(span: &CapturedSpan, expected: &[&str]) {
+    for field in expected {
+      assert!(
+        span.fields.contains(field),
+        "`{}` span must carry the documented `{field}` field; got {:?}",
+        span.name,
+        span.fields
+      );
+    }
   }
 
   /// **HERMETIC, and that is the point**: this runs under `cargo hack test
@@ -426,6 +518,24 @@ mod tracing_spans {
       count(&spans, "alignkit.encoder.load") >= 1,
       "the CoreML load must be its own nested span (it is where the wall-clock hides — 308 s on \
        a cold ANE placement); got {spans:?}"
+    );
+
+    // The documented diagnostic FIELDS (a subscriber renders these) — stripping
+    // any one must fail here, not slip past a name count.
+    assert_has_fields(
+      first(&spans, "alignkit.aligner.load"),
+      &["language", "model_path", "compute"],
+    );
+    assert_has_fields(first(&spans, "alignkit.encoder.load"), &["path", "compute"]);
+
+    // NESTING (aligner/mod.rs:303): the CoreML load is a CHILD of the aligner
+    // load — this holds even on the failing path, since `#[instrument]` opens
+    // both spans before either body runs. A load moved out from under the aligner
+    // span would keep both counts but lose this parent link.
+    assert_eq!(
+      parent_name(&spans, first(&spans, "alignkit.encoder.load")),
+      Some("alignkit.aligner.load"),
+      "`alignkit.encoder.load` must nest inside `alignkit.aligner.load`; got {spans:?}"
     );
   }
 
@@ -474,14 +584,51 @@ mod tracing_spans {
       2,
       "one span per align_chunk call, no more and no fewer; got {spans:?}"
     );
-    assert!(
-      count(&spans, "alignkit.encoder.emissions") >= 2,
-      "the CoreML predict must be a span inside each chunk; got {spans:?}"
+    // EXACTLY two, tightened from `>= 2`: one predict per chunk — a second predict
+    // inside a chunk would be a real regression, and zero on a chunk would be the
+    // nesting bug the loop below catches.
+    assert_eq!(
+      count(&spans, "alignkit.encoder.emissions"),
+      2,
+      "exactly one CoreML predict span per chunk, two over two calls; got {spans:?}"
     );
     assert!(
       count(&spans, "alignkit.aligner.load") >= 1,
       "load must still be spanned on the success path; got {spans:?}"
     );
+
+    // The documented diagnostic FIELDS: the per-chunk debugger aids
+    // (aligner/mod.rs:427 — `sub_segments` / `text_bytes` / `samples` tell the two
+    // empty-result paths apart) and the encoder's geometry/placement.
+    assert_has_fields(
+      first(&spans, "alignkit.align_chunk"),
+      &[
+        "language",
+        "samples",
+        "sub_segments",
+        "text_bytes",
+        "oov_decisions",
+      ],
+    );
+    assert_has_fields(
+      first(&spans, "alignkit.encoder.emissions"),
+      &["encoder_input", "real_samples", "compute"],
+    );
+
+    // NESTING (aligner/mod.rs:424): EVERY emissions predict runs INSIDE an
+    // align_chunk pass, not beside it. Moving `align_chunk` onto a helper invoked
+    // after prediction would preserve both counts while un-nesting the predict —
+    // this loop is what catches that.
+    for span in spans
+      .iter()
+      .filter(|span| span.name == "alignkit.encoder.emissions")
+    {
+      assert_eq!(
+        parent_name(&spans, span),
+        Some("alignkit.align_chunk"),
+        "each `alignkit.encoder.emissions` must nest inside `alignkit.align_chunk`; got {spans:?}"
+      );
+    }
   }
 
   /// `ALIGNKIT_TEST_MODELS`, or `<workspace>/Models/alignkit` — the crate's
