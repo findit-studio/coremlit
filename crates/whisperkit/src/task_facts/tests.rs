@@ -69,6 +69,17 @@ fn corpus() -> Vec<TaskFacts> {
     // identity-`None` made non-associative. The absorbing-`None` law must render
     // every triple that mixes it associative.
     TaskFacts::unknown().with_decoded_span(Some(usize::MAX)),
+    // Swallowed-error variants (codex round 11, M2): the third Kleene boolean at
+    // its `Some(true)` (a swallowed drop) and `Some(false)` (an observed-clean
+    // watch) states, crossed with a draw and a worker, so the associativity proof
+    // below folds it through the same `Some(true)`/`Some(false)`/`None` mixes the
+    // other two booleans are proved on.
+    TaskFacts::unknown()
+      .with_had_swallowed_error(true)
+      .with_worker(7),
+    TaskFacts::unknown()
+      .with_drew_from_rng(false)
+      .with_had_swallowed_error(false),
   ]
 }
 
@@ -207,14 +218,33 @@ fn merge_ors_the_bools_by_the_kleene_table() {
     );
   }
 
-  // The same law reaches BOTH booleans independently: a drew-true merged with a
-  // stopped-true carries both `Some(true)`.
+  // The same table drives `had_swallowed_error` too (codex round 11, M2): it is a
+  // third `Option<bool>` folded through the very same `kleene_or`, so pin it on
+  // the transitions that matter -- `Some(true)` absorbs, two `Some(false)` stay
+  // clean, and an unknown beside a `Some(false)` poisons to `None`.
+  let se = |b: Option<bool>| match b {
+    Some(v) => TaskFacts::unknown().with_had_swallowed_error(v),
+    None => TaskFacts::unknown(),
+  };
+  for (a, b, expected) in table {
+    assert_eq!(
+      merged(&se(a), &se(b)).had_swallowed_error(),
+      expected,
+      "kleene_or({a:?}, {b:?}) on had_swallowed_error",
+    );
+  }
+
+  // The same law reaches all THREE booleans independently: a drew-true merged with
+  // a stopped-true and a swallowed-true carries all three `Some(true)`.
   let both = merged(
-    &TaskFacts::unknown().with_drew_from_rng(true),
+    &TaskFacts::unknown()
+      .with_drew_from_rng(true)
+      .with_had_swallowed_error(true),
     &TaskFacts::unknown().with_early_stopped(true),
   );
   assert_eq!(both.drew_from_rng(), Some(true));
   assert_eq!(both.early_stopped(), Some(true));
+  assert_eq!(both.had_swallowed_error(), Some(true));
 
   // `Some(false)` IS the OR identity (not `None`): a real greedy contributor
   // folded beside a draw or another greedy behaves as OR.
@@ -397,11 +427,12 @@ fn is_reproducible_under_is_conservative_on_the_explicit_unknown() {
   );
   assert!(!unknown.is_reproducible_under(true));
 
-  // A genuinely greedy, un-truncated decode POSITIVELY observes both `false` —
-  // and only THAT earns the optimistic answer, seed or not.
-  let greedy = TaskFacts::unknown()
-    .with_drew_from_rng(false)
-    .with_early_stopped(false);
+  // A genuinely greedy, un-truncated, no-swallow decode POSITIVELY observes all
+  // THREE `false` — and only THAT earns the optimistic answer, seed or not. Each
+  // fixture below pins ONE axis by holding the other two at their observed-clean
+  // `Some(false)`, so the swallowed-error axis added in round 11 does not mask the
+  // draw/truncation axes these assertions exist to catch.
+  let greedy = TaskFacts::observed_clean();
   assert!(
     greedy.is_reproducible_under(false),
     "observed-greedy reproduces"
@@ -409,10 +440,8 @@ fn is_reproducible_under_is_conservative_on_the_explicit_unknown() {
   assert!(greedy.is_reproducible_under(true));
 
   // An observed unseeded draw is not reproducible; a seed makes it replayable —
-  // but only because the truncation is ALSO positively observed as `false`.
-  let drew = TaskFacts::unknown()
-    .with_drew_from_rng(true)
-    .with_early_stopped(false);
+  // but only because the truncation and swallow are ALSO positively `Some(false)`.
+  let drew = TaskFacts::observed_clean().with_drew_from_rng(true);
   assert!(
     !drew.is_reproducible_under(false),
     "an unseeded draw is not reproducible"
@@ -424,24 +453,43 @@ fn is_reproducible_under_is_conservative_on_the_explicit_unknown() {
 
   // An observed early stop forces false regardless of the seed: the callback is
   // not in the record.
-  let stopped = TaskFacts::unknown()
-    .with_drew_from_rng(false)
-    .with_early_stopped(true);
+  let stopped = TaskFacts::observed_clean().with_early_stopped(true);
   assert!(!stopped.is_reproducible_under(false));
   assert!(!stopped.is_reproducible_under(true));
 
-  // An UNKNOWN factor poisons the answer even when the other is observed-clean:
-  // an unobserved truncation (the `for_segment` shape) or an unobserved draw is
-  // conservatively non-reproducible, seed or not.
-  let truncation_unknown = TaskFacts::unknown().with_drew_from_rng(false);
+  // An observed swallowed child error forces false regardless of the seed (codex
+  // round 11, M2): the hidden error controlled the transcript, and re-running the
+  // same audio and options need not reproduce the swallow. This is the axis a
+  // record built through the observed-clean sink flips to `Some(true)` at a VAD
+  // chunk drop or a failed language probe.
+  let swallowed = TaskFacts::observed_clean().with_had_swallowed_error(true);
+  assert!(!swallowed.is_reproducible_under(false));
+  assert!(!swallowed.is_reproducible_under(true));
+
+  // An UNKNOWN factor poisons the answer even when the others are observed-clean:
+  // an unobserved truncation (the `for_segment` shape), an unobserved draw, or an
+  // unobserved swallow is conservatively non-reproducible, seed or not. Each holds
+  // the OTHER two at `Some(false)` and leaves its own axis at `unknown()`'s `None`.
+  let truncation_unknown = TaskFacts::unknown()
+    .with_drew_from_rng(false)
+    .with_had_swallowed_error(false);
   assert!(!truncation_unknown.is_reproducible_under(false));
   assert!(
     !truncation_unknown.is_reproducible_under(true),
     "an unobserved truncation is never reproducible, whatever the seed"
   );
-  let draw_unknown = TaskFacts::unknown().with_early_stopped(false);
+  let draw_unknown = TaskFacts::unknown()
+    .with_early_stopped(false)
+    .with_had_swallowed_error(false);
   assert!(!draw_unknown.is_reproducible_under(false));
   assert!(!draw_unknown.is_reproducible_under(true));
+  // The swallow axis, unobserved: the `None` the other two booleans have always
+  // carried for a segment-/options-only record, mirrored (codex round 11, M2).
+  let swallow_unknown = TaskFacts::unknown()
+    .with_drew_from_rng(false)
+    .with_early_stopped(false);
+  assert!(!swallow_unknown.is_reproducible_under(false));
+  assert!(!swallow_unknown.is_reproducible_under(true));
 }
 
 #[cfg(feature = "serde")]
@@ -451,6 +499,7 @@ fn serde_round_trips_every_field() {
     .with_drew_from_rng(true)
     .with_observed_language(Some("es".to_string()))
     .with_early_stopped(true)
+    .with_had_swallowed_error(true)
     .with_worker_schedule(Some(vec![0, 2]))
     .with_decoded_span(Some(5));
   let json = serde_json::to_string(&full).unwrap();
@@ -480,14 +529,15 @@ fn serde_round_trips_every_field() {
 #[test]
 fn the_reproducibility_and_coordinate_facts_are_required_on_deserialize() {
   // The optimistic direction is the dangerous one: were a dropped
-  // `drew_from_rng` or `early_stopped` to default to `None` and were `None`
-  // optimistic, a dropped key would leak a reproducibility answer; a dropped
-  // `worker_schedule` would forge a worker (R6-F2). All four are rejected on a
-  // missing key; only the transient `decoded_span` may be absent.
+  // `drew_from_rng`, `early_stopped`, or `had_swallowed_error` to default to
+  // `None` and were `None` optimistic, a dropped key would leak a reproducibility
+  // answer; a dropped `worker_schedule` would forge a worker (R6-F2). All five are
+  // rejected on a missing key; only the transient `decoded_span` may be absent.
   let full = TaskFacts::unknown()
     .with_drew_from_rng(true)
     .with_observed_language(Some("es".to_string()))
     .with_early_stopped(true)
+    .with_had_swallowed_error(true)
     .with_worker_schedule(Some(vec![0, 2]))
     .with_decoded_span(Some(5));
   let value: serde_json::Value = serde_json::to_value(&full).unwrap();
@@ -501,6 +551,7 @@ fn the_reproducibility_and_coordinate_facts_are_required_on_deserialize() {
     "drew_from_rng",
     "observed_language",
     "early_stopped",
+    "had_swallowed_error",
     "worker_schedule",
   ] {
     let mut without = value.clone();
@@ -512,13 +563,15 @@ fn the_reproducibility_and_coordinate_facts_are_required_on_deserialize() {
   }
 
   // Present-but-null is the honest, ACCEPTED encoding of explicit unknown for
-  // all four nullable fields — the draw and truncation among them (F1).
+  // all five nullable fields — the draw, truncation, and swallowed-error among
+  // them (F1; codex round 11, M2).
   let mut nulled = value.clone();
   for field in [
     "observed_language",
     "worker_schedule",
     "drew_from_rng",
     "early_stopped",
+    "had_swallowed_error",
   ] {
     nulled.as_object_mut().unwrap()[field] = serde_json::Value::Null;
   }
@@ -538,6 +591,11 @@ fn the_reproducibility_and_coordinate_facts_are_required_on_deserialize() {
     read.early_stopped(),
     None,
     "null early-stop is explicit unknown, never false"
+  );
+  assert_eq!(
+    read.had_swallowed_error(),
+    None,
+    "null swallowed-error is explicit unknown, never false"
   );
 
   // The transient span may be dropped without error, reading back untracked.

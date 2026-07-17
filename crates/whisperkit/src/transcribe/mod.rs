@@ -918,6 +918,13 @@ where
       // LATER step still surfaces the detection into the sink below (F2, codex
       // round 6 post-consolidation).
       let observed_language_token: Cell<Option<u32>> = Cell::new(None);
+      // Whether THIS attempt's automatic-language probe failed and was SWALLOWED
+      // (Swift's `try?` → nil). A failed probe silently alters the prompt/language
+      // this attempt decodes from — the same class of hidden, transcript-controlling
+      // error as a dropped VAD chunk — so it is recorded into the sink's
+      // `had_swallowed_error` below, forcing the run non-reproducible (codex round
+      // 11, M2). Stays `false` when no probe runs or the probe succeeds.
+      let mut language_probe_swallowed = false;
 
       // :340-365 — for a multilingual model with no explicit language and
       // detection requested, probe the language once, patch a per-attempt
@@ -964,6 +971,12 @@ where
             // untouched; the post-decode promotion below still records THIS
             // attempt's own observation if its decode predicts a `<|lang|>`
             // token.
+            // SWALLOWED ERROR: the probe's failure was hidden, yet it changed the
+            // prompt/language this attempt (and a retry) decodes from — a
+            // transcript-controlling error with no outcome fact until now. Mark it
+            // for the sink so `is_reproducible` reflects the hidden failure (codex
+            // round 11, M2).
+            language_probe_swallowed = true;
           }
         }
         if options.use_prefill_prompt() {
@@ -1025,6 +1038,7 @@ where
           &TaskFacts::unknown()
             .with_drew_from_rng(sampler.drew_from_rng())
             .with_early_stopped(early_stop.load(Ordering::Relaxed))
+            .with_had_swallowed_error(language_probe_swallowed)
             .with_observed_language(attempt_observation),
         );
       let result = outcome?;
@@ -1372,15 +1386,19 @@ impl<B> WhisperKit<B> {
 /// merged surviving result's `decoded_span`.
 ///
 /// The `sink` is authoritative for the run's error-fragile facts (codex rounds
-/// 4–9): it accumulated the per-attempt draw, early-stop, and language of EVERY
-/// chunk in ingestion order — dropped-because-errored ones included, captured
-/// before their error could propagate — so its Kleene-OR'd draw/early-stop and
-/// its FIRST-observed language are already the whole run's. A chunk that observed
-/// `es` then errored and was dropped keeps `es` over a later surviving chunk's
-/// `fr` (F3), and a genuine zero-survivor run keeps the sink's own observed-clean
+/// 4–9; round 11 adds the swallowed-error): it accumulated the per-attempt draw,
+/// early-stop, language, and had-swallowed-error of EVERY chunk in ingestion order
+/// — dropped-because-errored ones included, captured before their error could
+/// propagate — so its Kleene-OR'd draw/early-stop/swallowed-error and its
+/// FIRST-observed language are already the whole run's. A chunk that observed `es`
+/// then errored and was dropped keeps `es` over a later surviving chunk's `fr`
+/// (F3); a genuine zero-survivor run keeps the sink's own observed-clean
 /// `Some(false)` draw/early-stop rather than the `unknown()` an empty merge folds
-/// to (F4). Those facts are taken from the sink verbatim; the merged surviving
-/// result carries no draw/early-stop/language the sink has not already seen.
+/// to (F4); and a chunk whose error was DROPPED leaves `had_swallowed_error =
+/// Some(true)` in the sink, so the merged record is not reproducible (codex round
+/// 11, M2). Those facts are taken from the sink verbatim; the merged surviving
+/// result carries no draw/early-stop/language/swallowed-error the sink has not
+/// already seen.
 ///
 /// The `worker_schedule` and `decoded_span` are set EXPLICITLY rather than merged
 /// from the surviving result (round 10 refactor): under the absorbing-`None`
@@ -1389,7 +1407,9 @@ impl<B> WhisperKit<B> {
 /// folded over ALL chunks (a dropped chunk's coordinate never reached a result,
 /// so it taints the ordered schedule to `None`; zero chunks record the known-empty
 /// `Some([])`), and the `decoded_span` is the merged surviving result's own — the
-/// id-ordinal count its segments consumed, which drives a staged re-merge's ids.
+/// id-ordinal count its segments consumed, which drives a staged re-merge's ids —
+/// EXCEPT that the caller passes `None` once any chunk errored, since a dropped
+/// chunk is an unknown span contributor (codex round 11, M2).
 fn recover_vad_run_facts(
   sink: TaskFacts,
   worker_schedule: Option<Vec<usize>>,
@@ -1541,6 +1561,12 @@ where
       // coordinate per fallback), so it is derived here where every chunk's fate
       // is visible.
       let mut schedule = TaskFacts::unknown().with_worker_schedule(Some(Vec::new()));
+      // Whether ANY chunk errored and was dropped. A dropped chunk hid an error
+      // that controlled the returned transcript (the sink records the swallow) and
+      // may have allocated id ordinals before erroring, so the run's decoded span
+      // becomes honestly unknown once it happens — the decoded-span analogue of the
+      // schedule's absorbing-`None` fold (codex round 11, M2).
+      let mut any_chunk_dropped = false;
       for (chunk_index, chunk) in chunks.iter().enumerate() {
         let outcome = TranscribeTask::new(&self.backend, &self.tokenizer)
           .with_window_id_offset(chunk_index)
@@ -1554,6 +1580,19 @@ where
           // An errored chunk is dropped here — its error-fragile draw/early-stop/
           // language already reached the sink before the error, but its coordinate
           // never reached a result, so its schedule contribution is unknown.
+          //
+          // Record the DROP itself as a swallowed error into the shared sink (codex
+          // round 11, M2): an observed `Some(true)` `had_swallowed_error` that
+          // forces `is_reproducible` false, since the hidden error controlled the
+          // transcript and a re-run of the same audio/options need not reproduce the
+          // drop. The observed-clean marker leaves the sink's draw/early-stop/
+          // language untouched (`Some(false)` is the Kleene-OR identity, and it
+          // carries no language) while OR-ing the swallow flag to `Some(true)`.
+          facts_sink
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .merge(&TaskFacts::observed_clean().with_had_swallowed_error(true));
+          any_chunk_dropped = true;
           TaskFacts::unknown()
         };
         schedule.merge(&coordinate);
@@ -1570,20 +1609,30 @@ where
       // timings leave the sums.
       let mut merged = merge_transcription_results_with_options(&chunk_results, options);
       // Assemble the merged record's facts (round 10 refactor of codex rounds
-      // 4–9's VAD recovery): the shared sink is authoritative for the
-      // error-fragile draw/early-stop/language it watched across EVERY chunk
-      // (dropped ones included), while the worker schedule folded over all chunks
-      // above and the merged surviving result's own decoded span are set
-      // explicitly — the absorbing-`None` schedule/span laws (F2/F3) mean the
-      // sink's stripped `None`s would otherwise absorb them away. See
-      // [`recover_vad_run_facts`].
+      // 4–9's VAD recovery; extended round 11): the shared sink is authoritative
+      // for the error-fragile draw/early-stop/language/swallowed-error it watched
+      // across EVERY chunk (dropped ones included — the drop itself is recorded as
+      // a swallow above), while the worker schedule folded over all chunks above
+      // and the run's decoded span are set explicitly — the absorbing-`None`
+      // schedule/span laws (F2/F3) mean the sink's stripped `None`s would otherwise
+      // absorb them away. The decoded span is the merged surviving result's own,
+      // but absorbed to `None` once ANY chunk errored: a dropped chunk is an
+      // unknown span contributor (it may have allocated ordinals before erroring),
+      // so the run's total id span is honestly unknown — the decoded-span analogue
+      // of the schedule's absorbing-`None` over all chunks (codex round 11, M2).
+      // See [`recover_vad_run_facts`].
       let sink_facts = facts_sink
         .into_inner()
         .unwrap_or_else(PoisonError::into_inner);
+      let decoded_span = if any_chunk_dropped {
+        None
+      } else {
+        merged.task_facts().decoded_span()
+      };
       let recovered = recover_vad_run_facts(
         sink_facts,
         schedule.worker_schedule().map(|s| s.to_vec()),
-        merged.task_facts().decoded_span(),
+        decoded_span,
       );
       *merged.task_facts_mut() = recovered;
       return Ok(merged);

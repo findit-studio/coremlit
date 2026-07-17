@@ -244,6 +244,9 @@ fn task_fact_mutations() -> Vec<TaskFactMutation> {
     ("early_stopped", |r| {
       r.with_task_facts(TaskFacts::unknown().with_early_stopped(true))
     }),
+    ("had_swallowed_error", |r| {
+      r.with_task_facts(TaskFacts::unknown().with_had_swallowed_error(true))
+    }),
     ("worker_schedule", |r| {
       r.with_task_facts(TaskFacts::unknown().with_worker(3))
     }),
@@ -506,6 +509,10 @@ fn result_at(language: &str, temperatures: &[f32]) -> TranscriptionResult {
     TaskFacts::unknown()
       .with_observed_language((!language.is_empty()).then(|| language.to_string()))
       .with_early_stopped(false)
+      // Swallowed nothing (codex round 11, M2): a full decode that watched its
+      // child steps and hid no error, the observed-clean fact a reproducible run
+      // must positively carry alongside the not-truncated one.
+      .with_had_swallowed_error(false)
       .with_drew_from_rng(temperatures.iter().any(|&t| t != 0.0)),
   )
 }
@@ -1007,7 +1014,10 @@ fn for_result_reads_the_carried_sampling_fact_not_the_surviving_segments() {
   .with_task_facts(
     TaskFacts::unknown()
       .with_drew_from_rng(true)
-      .with_early_stopped(false),
+      .with_early_stopped(false)
+      // Observed-clean on the swallow axis so a seed alone earns reproducibility
+      // back below (codex round 11, M2).
+      .with_had_swallowed_error(false),
   );
   let record = Provenance::for_result(&unseeded, &compute, &filtered);
   assert_eq!(
@@ -1149,7 +1159,10 @@ fn provenance_records_the_real_draw_fact_never_the_temperature() {
     .with_task_facts(
       TaskFacts::unknown()
         .with_drew_from_rng(drew)
-        .with_early_stopped(false),
+        .with_early_stopped(false)
+        // Observed-clean on the swallow axis so only the draw drives the answer
+        // (codex round 11, M2).
+        .with_had_swallowed_error(false),
     );
     assert_eq!(
       Provenance::for_result(&DecodingOptions::new(), &compute, &ran_to_completion)
@@ -1193,10 +1206,12 @@ fn for_result_reads_the_carried_flag_not_the_segment_temperature() {
   )
   .with_task_facts(
     // The zero-iteration decode's honest, POSITIVELY observed facts: it never
-    // drew (Some(false)) and ran to completion (Some(false)).
+    // drew (Some(false)), ran to completion (Some(false)), and swallowed no child
+    // error (Some(false) — codex round 11, M2).
     TaskFacts::unknown()
       .with_drew_from_rng(false)
-      .with_early_stopped(false),
+      .with_early_stopped(false)
+      .with_had_swallowed_error(false),
   );
   assert_eq!(
     never_drew.task_facts().drew_from_rng(),
@@ -1226,7 +1241,10 @@ fn for_result_reads_the_carried_flag_not_the_segment_temperature() {
   .with_task_facts(
     TaskFacts::unknown()
       .with_drew_from_rng(true)
-      .with_early_stopped(false),
+      .with_early_stopped(false)
+      // Observed-clean on the other two axes so ONLY the carried draw drives the
+      // non-reproducible result below (codex round 11, M2).
+      .with_had_swallowed_error(false),
   );
   let record = Provenance::for_result(&decoding, &compute, &drew_greedy_survivors);
   assert_eq!(

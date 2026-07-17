@@ -694,6 +694,20 @@ fn worker_schedule_is_unknown_when_a_vad_chunk_errors() {
   // Mutation proof: seed the schedule fold from the merged survivors (hand-select
   // the successes) instead of folding the errored chunk's `None`, and this reads
   // back `Some([1, 2])` instead of the adjudicated `None`.
+  //
+  // Round 11 (M2) extends this history to the SWALLOWED-ERROR facts. The drop is a
+  // hidden, transcript-controlling error, so the run must not claim byte
+  // reproducibility: `had_swallowed_error` reads `Some(true)`, the decoded span is
+  // absorbed to unknown (an errored chunk may have allocated ordinals), and
+  // `Provenance::is_reproducible` is false. The mock's `fail_on_call` is a
+  // reset-immune ORDINAL, so a SECOND identical `kit.transcribe` -- same object,
+  // audio, and options -- does not fail call 1 again, all three chunks survive, and
+  // the transcript is DIFFERENT ("Hello Hello Hello"): concrete proof the first
+  // result's reproducibility claim would have been false.
+  //
+  // Mutation proof (round 11): drop the `.with_had_swallowed_error(true)` at the
+  // VAD chunk-drop site (transcribe/mod.rs) and the first result reads back
+  // reproducible, failing the `!is_reproducible()` assertion below.
   let t = tiny_tokenizer();
   let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(48_000));
   let hello = t.encode(" Hello").unwrap()[0];
@@ -714,6 +728,35 @@ fn worker_schedule_is_unknown_when_a_vad_chunk_errors() {
     result.task_facts().worker_schedule(),
     None,
     "an errored chunk taints the ordered schedule to unknown -- NOT the survivors' [1, 2]",
+  );
+  assert_eq!(
+    result.task_facts().had_swallowed_error(),
+    Some(true),
+    "the dropped chunk's swallowed error is recorded as an outcome fact",
+  );
+  assert_eq!(
+    result.task_facts().decoded_span(),
+    None,
+    "an errored chunk is an unknown span contributor -- the run's id span is unknown",
+  );
+  let compute = crate::options::ComputeOptions::new();
+  assert!(
+    !crate::provenance::Provenance::for_result(&options, &compute, &result).is_reproducible(),
+    "a run that silently dropped a chunk cannot promise byte reproducibility",
+  );
+
+  // The reset-immune ordinal makes the falseness of that claim concrete: a second
+  // identical call does NOT re-fail call 1, so all three chunks survive.
+  let second = kit.transcribe(&audio, &options).unwrap();
+  assert_eq!(
+    second.text(),
+    "Hello Hello Hello",
+    "the second same-input call keeps chunk 0 -- a different transcript",
+  );
+  assert_ne!(
+    result.text(),
+    second.text(),
+    "same object, audio, and options -> different output: not reproducible",
   );
 }
 

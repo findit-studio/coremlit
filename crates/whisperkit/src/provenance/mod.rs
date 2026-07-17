@@ -586,10 +586,12 @@ impl Provenance {
   // -- task_facts ---------------------------------------------------------
   /// The decode-time facts this run **controlled**, as one carried record —
   /// the RNG draw, the genuinely observed language, the early-stop truncation,
-  /// the worker coordinates, and the allocated id span. Read
+  /// a swallowed child error, the worker coordinates, and the allocated id span.
+  /// Read
   /// [`provenance.task_facts().observed_language()`](TaskFacts::observed_language),
   /// [`.drew_from_rng()`](TaskFacts::drew_from_rng),
   /// [`.early_stopped()`](TaskFacts::early_stopped),
+  /// [`.had_swallowed_error()`](TaskFacts::had_swallowed_error),
   /// [`.worker_schedule()`](TaskFacts::worker_schedule), and
   /// [`.decoded_span()`](TaskFacts::decoded_span) off it. See the field's doc.
   #[inline(always)]

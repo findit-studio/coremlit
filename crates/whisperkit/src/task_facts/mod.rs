@@ -34,14 +34,15 @@
 //! Every fact this record carries has an **explicit-unknown** state distinct
 //! from any observed value: `None` for [`TaskFacts::observed_language`] and
 //! [`TaskFacts::worker_schedule`], and — since codex round 6's post-consolidation
-//! F1 — `Option<bool>`'s `None` for [`TaskFacts::drew_from_rng`] and
-//! [`TaskFacts::early_stopped`] too. A record built from options with no decode to
+//! F1 — `Option<bool>`'s `None` for [`TaskFacts::drew_from_rng`],
+//! [`TaskFacts::early_stopped`], and (codex round 11) [`TaskFacts::had_swallowed_error`]
+//! too. A record built from options with no decode to
 //! speak for ([`Provenance::from_options`](crate::provenance::Provenance::from_options)),
 //! or a transcript assembled by hand, knows no worker coordinate, witnessed no
-//! language, and **cannot observe** whether the decode drew from the sampler or a
-//! callback truncated it — and says exactly that, rather than the worker `0`,
-//! `""`-language, or the optimistic `drew = false` / `not-truncated` a default
-//! would forge.
+//! language, and **cannot observe** whether the decode drew from the sampler, a
+//! callback truncated it, or a child error was swallowed — and says exactly that,
+//! rather than the worker `0`, `""`-language, or the optimistic `drew = false` /
+//! `not-truncated` / `nothing-swallowed` a default would forge.
 //!
 //! The distinction is not cosmetic, and it is why the merge is **Kleene**
 //! three-valued logic rather than a free monoid over `Option<bool>`.
@@ -155,11 +156,13 @@ const fn kleene_or(a: Option<bool>, b: Option<bool>) -> Option<bool> {
 /// assert_eq!(facts.drew_from_rng(), Some(true));
 /// assert_eq!(facts.observed_language(), Some("es"));
 /// assert_eq!(facts.worker_schedule(), Some([2].as_slice()));
-/// // A hand-built record knows no worker coordinate and cannot observe the draw
-/// // or a truncation — explicit unknown throughout, never a fabricated 0/false.
+/// // A hand-built record knows no worker coordinate and cannot observe the draw,
+/// // a truncation, or a swallowed error — explicit unknown throughout, never a
+/// // fabricated 0/false.
 /// assert_eq!(TaskFacts::unknown().worker_schedule(), None);
 /// assert_eq!(TaskFacts::unknown().drew_from_rng(), None);
 /// assert_eq!(TaskFacts::unknown().early_stopped(), None);
+/// assert_eq!(TaskFacts::unknown().had_swallowed_error(), None);
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -225,6 +228,33 @@ pub struct TaskFacts {
   /// optimistic answer.
   #[cfg_attr(feature = "serde", serde(deserialize_with = "required_option"))]
   early_stopped: Option<bool>,
+  /// Whether the run **silently swallowed a child error** whose hidden outcome
+  /// controlled the returned transcript — a VAD chunk that errored and was
+  /// dropped, or an automatic-language probe that failed and was ignored — OR-ed
+  /// across every such site and captured before the surviving result is
+  /// assembled. An observed `Some(true)` independently forces
+  /// [`Self::is_reproducible_under`] false: the error was hidden, so a re-run of
+  /// the same audio and options need not hit it again (the mock's own
+  /// transient-failure semantics make this concrete — a second identical call can
+  /// return DIFFERENT text), and a transcript that depended on the drop cannot
+  /// promise byte-reproducibility (codex round 11, M2).
+  ///
+  /// **`Option<bool>`, with `None` the explicit unknown**, exactly like
+  /// [`Self::drew_from_rng`]/[`Self::early_stopped`]: `Some(false)` is a run that
+  /// POSITIVELY watched its child fallible steps and saw none swallowed (the
+  /// [`Self::observed_clean`] seed a real run starts from), `Some(true)` a run
+  /// that hid at least one, and `None` a record that cannot know — a hand-built or
+  /// options-/segment-only [`Provenance`](crate::provenance::Provenance) that
+  /// never watched a child step. [`Self::is_reproducible_under`] treats that `None`
+  /// like the other booleans' — conservatively non-reproducible — rather than
+  /// fabricating an optimistic "nothing was swallowed".
+  ///
+  /// Required on deserialize (present, nullable, via [`required_option`]), like
+  /// the other two reproducibility booleans: a dropped flag must not silently
+  /// become the optimistic answer and hand back a byte-reproducibility the run
+  /// never earned.
+  #[cfg_attr(feature = "serde", serde(deserialize_with = "required_option"))]
+  had_swallowed_error: Option<bool>,
   /// The ordered worker/chunk coordinates whose RNG streams produced this
   /// transcript's segments — a single decode task's own
   /// [`window_id_offset`](crate::transcribe::TranscribeTask::set_window_id_offset)
@@ -306,14 +336,16 @@ task_facts_field_names!(
   drew_from_rng,
   observed_language,
   early_stopped,
+  had_swallowed_error,
   worker_schedule,
   decoded_span,
 );
 
 impl TaskFacts {
-  /// The all-unknown record: an **unknown** draw and truncation (`None`, never
-  /// the optimistic `Some(false)`), no observed language, an **unknown** worker
-  /// schedule (`None`, never `[0]`), and an untracked span (`None`). The value a
+  /// The all-unknown record: an **unknown** draw, truncation, and swallowed-error
+  /// (`None`, never the optimistic `Some(false)`), no observed language, an
+  /// **unknown** worker schedule (`None`, never `[0]`), and an untracked span
+  /// (`None`). The value a
   /// hand-built [`TranscriptionResult`](crate::result::TranscriptionResult)
   /// carries, an options-only [`Provenance`](crate::provenance::Provenance)
   /// records, and — for zero contributors — what a
@@ -331,19 +363,22 @@ impl TaskFacts {
       drew_from_rng: None,
       observed_language: None,
       early_stopped: None,
+      had_swallowed_error: None,
       worker_schedule: None,
       decoded_span: None,
     }
   }
 
   /// The **observed-clean** record a real run starts watching from: it has
-  /// POSITIVELY seen no RNG draw and no early-stop truncation yet (`Some(false)`
-  /// for [`Self::drew_from_rng`] and [`Self::early_stopped`]), with no observed
+  /// POSITIVELY seen no RNG draw, no early-stop truncation, and no swallowed child
+  /// error yet (`Some(false)` for [`Self::drew_from_rng`], [`Self::early_stopped`],
+  /// and [`Self::had_swallowed_error`]), with no observed
   /// language, an unknown worker schedule, and an untracked span. Distinct from
-  /// [`Self::unknown`] — which cannot see either fact and is conservatively
+  /// [`Self::unknown`] — which cannot see those facts and is conservatively
   /// non-reproducible — this is the honest initial state of a decode that IS
-  /// watching: a window that draws or a callback that truncates flips the
-  /// corresponding fact to `Some(true)` under the [merge law](Self::merge), and
+  /// watching: a window that draws, a callback that truncates, or a swallowed
+  /// child error flips the corresponding fact to `Some(true)` under the
+  /// [merge law](Self::merge), and
   /// a run that decodes NO window at all keeps the `Some(false)` and earns the
   /// byte-reproducibility a zero-window run genuinely has (codex round 8, F3).
   ///
@@ -357,6 +392,7 @@ impl TaskFacts {
     Self::unknown()
       .with_drew_from_rng(false)
       .with_early_stopped(false)
+      .with_had_swallowed_error(false)
   }
 
   // -- drew_from_rng ------------------------------------------------------
@@ -409,6 +445,24 @@ impl TaskFacts {
     self
   }
 
+  // -- had_swallowed_error ------------------------------------------------
+  /// Whether the run silently swallowed a transcript-controlling child error, or
+  /// `None` when unobserved. See the field's doc.
+  #[inline(always)]
+  pub const fn had_swallowed_error(&self) -> Option<bool> {
+    self.had_swallowed_error
+  }
+  /// Builder recording [`Self::had_swallowed_error`] as a POSITIVELY observed
+  /// fact (`Some(had_swallowed_error)`) — `Some(false)` the observed-clean seed a
+  /// watching run starts from, `Some(true)` set at a swallow site. Leave it at
+  /// [`Self::unknown`]'s `None` when the constructor cannot see the child steps.
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_had_swallowed_error(mut self, had_swallowed_error: bool) -> Self {
+    self.had_swallowed_error = Some(had_swallowed_error);
+    self
+  }
+
   // -- worker_schedule ----------------------------------------------------
   /// The ordered worker/chunk coordinates, or `None` when unknown. See the
   /// field's doc.
@@ -457,14 +511,17 @@ impl TaskFacts {
   /// (codex round 8, F2). The per-field laws:
   ///
   /// - **[`drew_from_rng`](Self::drew_from_rng)** / **[`early_stopped`](Self::early_stopped)**
-  ///   — Kleene three-valued OR (`kleene_or`): `Some(true)` absorbs, two
-  ///   `Some(false)` stay `Some(false)`, and an unknown (`None`) mixed with
-  ///   anything-but-true stays unknown (`None | Some(false) = None`). The merge
-  ///   is `Some(true)` iff some child observed `true`, `Some(false)` iff EVERY
-  ///   child observed the fact and all saw `false`, and `None` as soon as any
-  ///   child could not observe it (unless another observed `true`). A child that
-  ///   cannot see the fact therefore no longer lets a `Some(false)` beside it
-  ///   pass for an observed clean.
+  ///   / **[`had_swallowed_error`](Self::had_swallowed_error)** — Kleene
+  ///   three-valued OR (`kleene_or`): `Some(true)` absorbs, two `Some(false)` stay
+  ///   `Some(false)`, and an unknown (`None`) mixed with anything-but-true stays
+  ///   unknown (`None | Some(false) = None`). The merge is `Some(true)` iff some
+  ///   child observed `true`, `Some(false)` iff EVERY child observed the fact and
+  ///   all saw `false`, and `None` as soon as any child could not observe it
+  ///   (unless another observed `true`). A child that cannot see the fact
+  ///   therefore no longer lets a `Some(false)` beside it pass for an observed
+  ///   clean. `had_swallowed_error` rides this same law so a VAD run's swallowed
+  ///   chunk-drop, merged in beside the surviving chunks' clean `Some(false)`,
+  ///   OR-s the aggregate to `Some(true)` (codex round 11, M2).
   /// - **[`observed_language`](Self::observed_language)** — first genuine
   ///   observation wins: `self`'s is kept when present, else `other`'s is
   ///   adopted. A scalar cannot hold two conflicting observations, and a
@@ -493,6 +550,7 @@ impl TaskFacts {
   pub fn merge(&mut self, other: &Self) {
     self.drew_from_rng = kleene_or(self.drew_from_rng, other.drew_from_rng);
     self.early_stopped = kleene_or(self.early_stopped, other.early_stopped);
+    self.had_swallowed_error = kleene_or(self.had_swallowed_error, other.had_swallowed_error);
     if self.observed_language.is_none() {
       self.observed_language = other.observed_language.clone();
     }
@@ -532,36 +590,43 @@ impl TaskFacts {
   /// by re-running the same audio through the same options — `true` only when
   /// the decode POSITIVELY observed that it never drew from the sampler (or
   /// `seeded` makes the draws it did make replayable) AND POSITIVELY observed
-  /// that no progress callback truncated it.
+  /// that no progress callback truncated it AND POSITIVELY observed that it
+  /// swallowed no transcript-controlling child error (codex round 11, M2).
   ///
   /// **Conservative on the explicit unknown** (F1, codex round 6
-  /// post-consolidation): an unobserved draw or truncation (`None`) answers
-  /// `false`, never the optimistic value. A record that cannot see whether a
-  /// transcript-controlling event happened — an options-only
+  /// post-consolidation): an unobserved draw, truncation, or swallowed error
+  /// (`None`) answers `false`, never the optimistic value. A record that cannot
+  /// see whether a transcript-controlling event happened — an options-only
   /// [`Provenance::from_options`](crate::provenance::Provenance::from_options),
   /// or a segment-only [`Provenance::for_segment`](crate::provenance::Provenance::for_segment)
   /// that is handed the truncated segment but never the callback — must not
   /// promise byte-reproducibility. Only a real decode's carried `Some(false)`
   /// facts, read by [`Provenance::for_result`](crate::provenance::Provenance::for_result)
   /// off the transcript, earns the optimistic answer. The bare [`Self::unknown`]
-  /// is therefore NOT reproducible; a genuinely greedy run is
-  /// `unknown().with_drew_from_rng(false).with_early_stopped(false)`.
+  /// is therefore NOT reproducible; a genuinely clean run is
+  /// [`Self::observed_clean`] (all three booleans positively `Some(false)`).
   ///
   /// The reproducibility predicate [`Provenance::is_reproducible`](crate::provenance::Provenance::is_reproducible)
-  /// is built on: it reads [`Self::drew_from_rng`] and [`Self::early_stopped`]
-  /// here and supplies whether [`DecodingOptions::seed`](crate::options::DecodingOptions::seed)
-  /// is set as `seeded`. Kept on the record so the two facts it rests on have
+  /// is built on: it reads [`Self::drew_from_rng`], [`Self::early_stopped`], and
+  /// [`Self::had_swallowed_error`] here and supplies whether
+  /// [`DecodingOptions::seed`](crate::options::DecodingOptions::seed)
+  /// is set as `seeded`. Kept on the record so the facts it rests on have
   /// one home; see the [`Provenance`](crate::provenance::Provenance) method for
   /// the full rationale.
   #[inline]
   pub const fn is_reproducible_under(&self, seeded: bool) -> bool {
     let not_truncated = matches!(self.early_stopped, Some(false));
+    // A swallowed child error (`Some(true)`) forces false — its hidden outcome
+    // controlled the transcript, unreproducibly — and an UNOBSERVED swallow
+    // (`None`) is treated exactly like an unobserved truncation: conservatively
+    // non-reproducible, never the optimistic answer (codex round 11, M2).
+    let no_swallowed_error = matches!(self.had_swallowed_error, Some(false));
     let draw_replayable = match self.drew_from_rng {
       Some(false) => true,
       Some(true) => seeded,
       None => false,
     };
-    not_truncated && draw_replayable
+    not_truncated && no_swallowed_error && draw_replayable
   }
 }
 
