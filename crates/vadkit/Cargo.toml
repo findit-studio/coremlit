@@ -29,6 +29,14 @@ thiserror.workspace = true
 hound.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+# Cross-backend characterization oracle (`tests/cross_backend.rs`, spec §6):
+# the PUBLISHED silero crate at its default features (`bundled` → `onnx` →
+# `ort`) is the ONNX reference stack the CoreML model layer is measured
+# against. DEV-ONLY on purpose — `ort` must never enter vadkit's runtime graph
+# (proven by `cargo tree -p vadkit -e no-dev -i ort` finding nothing; see the
+# test's module docs). Pinned to 0.4.0 (the version on crates.io); T5 bumps to
+# the 0.5.0 seam once it publishes, but the dev-only posture does not change.
+silero = "0.4.0"
 
 [lints]
 workspace = true
