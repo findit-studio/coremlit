@@ -401,6 +401,32 @@ fn strict_lookup_prefers_lang_over_any() {
 
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn any_fallback_can_match_the_requested_language() {
+  // The AnyFallback binding does NOT require the fallback aligner's language to
+  // DIFFER from the request — the state the variant doc once excluded. Register
+  // ONLY an English aligner under AlignerKey::Any (no AlignerKey::Lang(En)); an
+  // English request finds no exact Lang(En) key and falls through to Any, whose
+  // own construction language IS En. What made it a fallback is the missing exact
+  // key, not a language difference.
+  let set = AlignmentSetBuilder::new()
+    .register(AlignerKey::Any, en_aligner())
+    .build();
+  assert!(matches!(
+    set.lookup(&Lang::En),
+    AlignmentLookup::AnyFallback { .. }
+  ));
+  // The public binding carries the Any aligner's own language — here EQUAL to the
+  // requested language, exactly the case the doc now cites.
+  assert_eq!(
+    set.resolve(&Lang::En).binding(),
+    AlignmentBinding::AnyFallback {
+      aligner_language: Lang::En
+    }
+  );
+}
+
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
 #[should_panic(expected = "cannot accept an aligner built for")]
 fn register_panics_on_language_mismatch() {
   let _ = AlignmentSetBuilder::new().register(AlignerKey::Lang(Lang::Zh), en_aligner());

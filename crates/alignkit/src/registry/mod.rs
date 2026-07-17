@@ -240,11 +240,18 @@ pub enum AlignmentBinding {
   /// ([`AlignmentHandle::language`]).
   Exact,
   /// Miss on `Lang(L)`, served by the [`AlignerKey::Any`] fallback, whose OWN
-  /// construction language is `aligner_language` — different from the request
-  /// (that difference is what makes it a fallback). Policy still keys on the
-  /// REQUESTED language, not on this one.
+  /// construction language is `aligner_language`. What makes this a fallback is
+  /// that the lookup found no exact [`AlignerKey::Lang`]`(L)` and fell through to
+  /// [`AlignerKey::Any`] — **not** that the languages differ. They usually do (an
+  /// `Any` aligner serving another language), but they need not: with an English
+  /// aligner registered under [`AlignerKey::Any`] alone, an English request finds
+  /// no `Lang(En)` key and resolves to `AnyFallback { aligner_language: En }`,
+  /// matching the request (`registry::tests::any_fallback_can_match_the_requested_language`).
+  /// Either way policy keys on the REQUESTED language, not on this one.
   AnyFallback {
-    /// The `Any` aligner's own construction language.
+    /// The `Any` aligner's own construction language — MAY equal the request (see
+    /// the variant doc); it is the aligner the fallback bound, not a guarantee of
+    /// difference.
     aligner_language: Lang,
   },
   /// Miss on both `Lang(L)` and `Any`: the configured [`AlignmentFallback`]
@@ -482,10 +489,12 @@ impl AlignmentSet {
         )
       }
       AlignmentLookup::AnyFallback { aligner } => {
-        // The Any aligner's language differs from the request. Validate the
-        // decisions were resolved for the REQUESTED language (so we are not
-        // masking a wrong-policy payload), then cross them into the aligner's
-        // own language — the only tag its `prepare` will accept.
+        // The Any aligner's language MAY differ from the request (and usually
+        // does). Validate the decisions were resolved for the REQUESTED language
+        // (so we are not masking a wrong-policy payload), then cross them into the
+        // aligner's own language — the only tag its `prepare` will accept. When
+        // the languages already match (an Any aligner built for the requested
+        // language), `cross_decisions_into` is a validated clone.
         let crossed = cross_decisions_into(oov_decisions, language, aligner.language_ref())?;
         aligner.align_chunk(samples, sub_segments, text, clock, abort_flag, &crossed)
       }
