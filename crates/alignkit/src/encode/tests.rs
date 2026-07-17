@@ -775,19 +775,21 @@ fn check_log_prob_normalization_thresholds_on_the_tolerance() {
 }
 
 // ---------------------------------------------------------------------
-// check_emission_value_domain: the floor-then-normalization guard sequence
-// `Encoder::emissions` actually calls. Driving it here binds BOTH predicates to
-// the production door in one call — in particular the normalization half, which
+// RawEmissions::check_value_domain: the floor-then-normalization guard sequence
+// `Encoder::emissions` actually mints through. Driving the MINTER (not the
+// extracted `check_emission_value_domain` helper) binds BOTH predicates to the
+// production door in one call — in particular the normalization half, which
 // (unlike the floor half, bound end-to-end by the model-gated
 // `emissions_reject_an_ane_corrupted_matrix`) has no real-model fixture. If the
-// door's normalization step were ever handed `&[]` in place of its real tensor,
-// an un-normalized matrix would sail through unnoticed; because this test feeds
-// the door's own guard the same un-normalized tensors the door would, that
-// regression is red right here.
+// minter's guard were ever handed `&[]` in place of its real tensor, or skipped
+// normalization, an un-normalized matrix would sail through unnoticed; because
+// this test feeds the minter the same un-normalized tensors the door would AND
+// asserts the sealed buffer is the validated one, that regression is red right
+// here.
 // ---------------------------------------------------------------------
 
 #[test]
-fn check_emission_value_domain_binds_the_guard_sequence_to_the_door() {
+fn raw_emissions_check_value_domain_binds_the_guard_and_the_minted_buffer() {
   // A shifted-raw-logit matrix — every cell finite, <= 0, and above
   // LOG_PROB_FLOOR, so the floor and `from_log_probs`'s <= 0 scan both miss it
   // and only the normalization step in the sequence rejects it.
@@ -797,29 +799,47 @@ fn check_emission_value_domain_binds_the_guard_sequence_to_the_door() {
       shifted.push(-10.0 - (j as f32) * (10.0 / (crate::vocab::VOCAB_SIZE as f32 - 1.0)));
     }
   }
+  let raw = RawEmissions {
+    frames: 4,
+    data: shifted,
+  };
   assert!(
     matches!(
-      check_emission_value_domain(&shifted, ComputeUnits::CpuOnly),
+      raw.check_value_domain(ComputeUnits::CpuOnly),
       Err(AlignError::UnnormalizedEmissions { .. })
     ),
-    "the door guard must reject a shifted-raw-logit tensor as un-normalized"
+    "the minter must reject a shifted-raw-logit tensor as un-normalized"
   );
 
   // The all-zeros frame: exp(0) = 1 on every class, logsumexp = ln 29, again
   // above the floor and <= 0 — only normalization catches it.
+  let raw = RawEmissions {
+    frames: 1,
+    data: uniform_frame(0.0).to_vec(),
+  };
   assert!(
     matches!(
-      check_emission_value_domain(&uniform_frame(0.0), ComputeUnits::CpuOnly),
+      raw.check_value_domain(ComputeUnits::CpuOnly),
       Err(AlignError::UnnormalizedEmissions { .. })
     ),
-    "the door guard must reject an all-zeros frame as un-normalized"
+    "the minter must reject an all-zeros frame as un-normalized"
   );
 
-  // A genuinely normalized frame (logsumexp = 0) passes the whole sequence.
+  // A genuinely normalized frame (logsumexp = 0) passes — and the minted token
+  // owns EXACTLY the bytes the guard validated: the minter cannot clear one
+  // buffer and seal another.
   let ln29 = f64::from(crate::vocab::VOCAB_SIZE as u32).ln();
-  assert!(
-    check_emission_value_domain(&uniform_frame(-ln29 as f32), ComputeUnits::CpuOnly).is_ok(),
-    "the door guard must accept a normalized log-prob frame"
+  let normalized = uniform_frame(-ln29 as f32).to_vec();
+  let token = RawEmissions {
+    frames: 1,
+    data: normalized.clone(),
+  }
+  .check_value_domain(ComputeUnits::CpuOnly)
+  .expect("the minter must accept a normalized log-prob frame");
+  assert_eq!(token.frames, 1);
+  assert_eq!(
+    token.data, normalized,
+    "the minted token must own the exact buffer the guard validated"
   );
 }
 
