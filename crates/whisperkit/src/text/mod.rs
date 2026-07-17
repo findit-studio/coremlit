@@ -12,11 +12,98 @@
 //! `slice::chunks` directly wherever batching is needed, and this sync,
 //! single-threaded port has no concurrent-worker fan-out to batch for.
 
+use std::cell::Cell;
+
 use objc2::rc::autoreleasepool;
 use objc2_foundation::{NSData, NSDataCompressionAlgorithm};
 use unicode_categories::UnicodeCategories;
 
 use crate::result::WordTiming;
+
+thread_local! {
+  /// Latches `true` whenever [`zlib_compressed_len`] erases a genuine OS
+  /// compression error (its `.ok()`) on this thread. The erasure is buried
+  /// under the decode-attempt path's finalize/progress ratios
+  /// ([`compression_ratio_of_tokens`] → `decode::finalize_decoding_result`) and
+  /// the streaming early-stop's window ratio ([`crate::stream::should_stop_early`]),
+  /// all of which funnel through [`zlib_compressed_len`] on the same thread. The
+  /// fallback ladder reads and clears this once per attempt so a swallowed error
+  /// — whose `+inf` ratio drives a temperature fallback to a DIFFERENT transcript
+  /// — is recorded as
+  /// [`TaskFacts::had_swallowed_error`](crate::task_facts::TaskFacts::had_swallowed_error)
+  /// rather than left `Some(false)` while provenance claims byte reproducibility
+  /// (coremlit issue #14, codex round 14). Swift swallows the same error
+  /// (`TextUtilities.swift:20`), so the transcript stays parity-correct; only the
+  /// Rust-side provenance fact is made honest.
+  static COMPRESSION_ERROR_SWALLOWED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Clears this thread's swallowed-compression-error flag. The fallback ladder
+/// calls this at the start of each decode attempt so the flag it reads at that
+/// attempt's fact merge reflects only that attempt's compressions.
+pub(crate) fn clear_compression_error_swallowed() {
+  COMPRESSION_ERROR_SWALLOWED.with(|flag| flag.set(false));
+}
+
+/// Reads and clears this thread's swallowed-compression-error flag: `true` iff
+/// [`zlib_compressed_len`] erased at least one OS compression error since the
+/// last [`clear_compression_error_swallowed`].
+#[must_use]
+pub(crate) fn take_compression_error_swallowed() -> bool {
+  COMPRESSION_ERROR_SWALLOWED.with(|flag| flag.replace(false))
+}
+
+fn note_compression_error_swallowed() {
+  COMPRESSION_ERROR_SWALLOWED.with(|flag| flag.set(true));
+}
+
+/// The crate-private compression fault seam (mirrors
+/// [`crate::backend::mock::MockBackend::fail_on_call`]): tests script the
+/// `call`-th [`zlib_compressed_len`] on a thread to fail exactly as a genuine
+/// OS compression error would, so the swallowed-error provenance path can be
+/// exercised without an input that forces Foundation's zlib API to error.
+#[cfg(test)]
+pub(crate) mod fault {
+  use std::cell::RefCell;
+
+  thread_local! {
+    // (running call count, 1-based ordinals scripted to fail).
+    static SCRIPT: RefCell<(usize, Vec<usize>)> = const { RefCell::new((0, Vec::new())) };
+  }
+
+  /// Scripts the `call`-th (1-based, counted across the thread's lifetime)
+  /// [`super::zlib_compressed_len`] to return an error.
+  pub(crate) fn fail_compression_on_call(call: usize) {
+    SCRIPT.with(|s| s.borrow_mut().1.push(call));
+  }
+
+  /// Clears the fault script and resets the call counter.
+  pub(crate) fn reset_compression_faults() {
+    SCRIPT.with(|s| *s.borrow_mut() = (0, Vec::new()));
+  }
+
+  /// Advances the call counter and reports whether THIS call is scripted to
+  /// fail.
+  pub(super) fn next_call_fails() -> bool {
+    SCRIPT.with(|s| {
+      let mut s = s.borrow_mut();
+      s.0 += 1;
+      let ordinal = s.0;
+      s.1.contains(&ordinal)
+    })
+  }
+}
+
+#[cfg(test)]
+fn scripted_compression_failure() -> bool {
+  fault::next_call_fails()
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+fn scripted_compression_failure() -> bool {
+  false
+}
 
 /// zlib-compresses `bytes` with Apple's libcompression — the exact
 /// `NSData.compressed(using: .zlib)` API Swift WhisperKit's
@@ -50,13 +137,27 @@ use crate::result::WordTiming;
 /// per the issue-9 objc2 probe), never throwing, so this returns `Some(2)`
 /// for `&[]`. `None` is reserved for a genuine OS compression error — the
 /// only case Swift's `catch` actually handles.
+///
+/// Returning `None` (whether from the real API or the crate-private
+/// [`fault`] seam) also latches this thread's swallowed-error flag
+/// ([`note_compression_error_swallowed`]), the record the fallback ladder reads
+/// so an erased error is not silently converted to a reproducible-looking
+/// transcript (see [`COMPRESSION_ERROR_SWALLOWED`]).
 fn zlib_compressed_len(bytes: &[u8]) -> Option<usize> {
-  autoreleasepool(|_| {
+  if scripted_compression_failure() {
+    note_compression_error_swallowed();
+    return None;
+  }
+  let compressed = autoreleasepool(|_| {
     NSData::with_bytes(bytes)
       .compressedDataUsingAlgorithm_error(NSDataCompressionAlgorithm::Zlib)
       .ok()
       .map(|compressed| compressed.len())
-  })
+  });
+  if compressed.is_none() {
+    note_compression_error_swallowed();
+  }
+  compressed
 }
 
 /// Compression ratio (`raw_bytes / compressed_bytes`) of `tokens`, encoded

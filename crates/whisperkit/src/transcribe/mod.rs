@@ -1001,6 +1001,16 @@ where
         }
       }
 
+      // Start this attempt's swallowed-compression-error window clean. Every
+      // compression that controls this attempt's transcript/fallback — the
+      // decode's finalize and progress ratios, and any streaming early-stop
+      // callback's window ratio — funnels through `text::zlib_compressed_len` on
+      // this thread between here and the fact merge below, latching the flag on
+      // an erased OS error. Reading it there records `had_swallowed_error`
+      // honestly, so a swallowed error's `+inf` ratio that drove a fallback (a
+      // different transcript) can no longer read back as reproducible (coremlit
+      // issue #14, codex round 14).
+      crate::text::clear_compression_error_swallowed();
       let outcome = decode::decode_text(
         self.backend,
         encoder_output,
@@ -1055,7 +1065,9 @@ where
           &TaskFacts::unknown()
             .with_drew_from_rng(sampler.drew_from_rng())
             .with_early_stopped(early_stop.load(Ordering::Relaxed))
-            .with_had_swallowed_error(language_probe_swallowed)
+            .with_had_swallowed_error(
+              language_probe_swallowed || crate::text::take_compression_error_swallowed(),
+            )
             .with_observed_language(attempt_observation),
         );
       let result = outcome?;

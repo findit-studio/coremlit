@@ -349,6 +349,96 @@ fn unseeded_fallback_ladder_still_runs_without_threading_a_seed() {
 
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn compression_failure_marks_swallowed_error() {
+  // F2 (codex round 14). Foundation's zlib error is erased with `.ok()`
+  // (`text::zlib_compressed_len`) and becomes a `+inf` compression ratio, which
+  // drives a temperature fallback to a DIFFERENT (higher-temperature) attempt --
+  // yet `had_swallowed_error` stayed `Some(false)` (only the language-probe
+  // swallow set it), so `is_reproducible` trusted a run whose hidden OS error a
+  // re-run may not repeat. The fix routes every compression through a
+  // thread-local swallow flag the fallback ladder reads per attempt, so an
+  // erased error that controlled the transcript is recorded honestly.
+  //
+  // The crate-private compression fault seam (the compression analogue of
+  // `MockBackend::fail_on_call`) fails ONLY the first compression on this thread
+  // -- attempt 0's finalize ratio -- so attempt 0's `+inf` ratio forces the
+  // fallback and the higher-temperature attempt 1 is accepted; a second, clean
+  // run accepts attempt 0. Runtime confirmation needs this seam: no ordinary
+  // token input makes Foundation's zlib API error deterministically.
+  //
+  // Mutation: drop the `|| take_compression_error_swallowed()` at the fact merge
+  // and run 1 reads `had_swallowed_error == Some(false)` and reproducible,
+  // failing both assertions.
+  let t = tiny_tokenizer();
+  let s = special();
+  let hello = t.encode(" Hello").unwrap()[0];
+
+  // One clean window (prompt [SOT, en, transcribe, <|notimestamps|>] forced over
+  // the first 4 steps): a one-hot `hello` as the first free prediction -- a
+  // genuine top-k draw at temperature > 0, but the peak dominates so the STEP is
+  // deterministic and its compressed ratio stays well under threshold -- then
+  // EOT. Two attempts' worth of steps, since a fallback resets the window decode.
+  let build = || {
+    let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+    for _ in 0..2 {
+      mock.push_token_steps(&[2425, 2425, 2425, hello, s.end_token()]);
+    }
+    mock
+  };
+  // Base temperature 0.3 so even attempt 0 draws (threads the seed); the compression
+  // ratio is the ONLY fallback trigger left, so attempt 0's swallowed `+inf`
+  // forces exactly one fallback and the finite attempt 1 is accepted.
+  let options = DecodingOptions::new()
+    .with_temperature(0.3)
+    .with_without_timestamps()
+    .maybe_first_token_logprob_threshold(None)
+    .maybe_logprob_threshold(None)
+    .with_temperature_fallback_count(1) // attempts 0 and 1
+    .with_seed(7);
+  let compute = crate::options::ComputeOptions::new();
+
+  // Run 1: fail attempt 0's finalize compression (the thread's first).
+  crate::text::fault::reset_compression_faults();
+  crate::text::fault::fail_compression_on_call(1);
+  let mock1 = build();
+  let result1 = TranscribeTask::new(&mock1, &t)
+    .run(&vec![0.1; 32_000], &options)
+    .unwrap();
+  crate::text::fault::reset_compression_faults();
+
+  assert_eq!(
+    result1.task_facts().had_swallowed_error(),
+    Some(true),
+    "attempt 0's swallowed compression error -- its +inf ratio drove the fallback -- must be recorded"
+  );
+  assert!(
+    (result1.segments_slice()[0].temperature() - 0.5).abs() < 1e-3,
+    "the swallowed +inf rejected attempt 0 (0.3); attempt 1 (0.5) was accepted"
+  );
+  assert!(
+    !crate::provenance::Provenance::for_result(&options, &compute, &result1).is_reproducible(),
+    "a transcript that hinged on a swallowed OS error is not byte-reproducible"
+  );
+
+  // Run 2: no fault. Attempt 0's real (finite, low) ratio is accepted -- nothing
+  // was swallowed, and the same seeded run now reproduces.
+  let mock2 = build();
+  let result2 = TranscribeTask::new(&mock2, &t)
+    .run(&vec![0.1; 32_000], &options)
+    .unwrap();
+  assert_ne!(
+    result2.task_facts().had_swallowed_error(),
+    Some(true),
+    "a clean run swallowed nothing"
+  );
+  assert!(
+    (result2.segments_slice()[0].temperature() - 0.3).abs() < 1e-3,
+    "with no swallowed error attempt 0 (0.3) is accepted directly -- no fallback"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn segment_discovery_callback_fires_per_window() {
   let t = tiny_tokenizer();
   let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
