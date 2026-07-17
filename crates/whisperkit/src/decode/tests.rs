@@ -384,6 +384,74 @@ fn language_observed_only_for_a_predicted_language_token() {
     None,
     "the \"en\" fallback is a default, not a detection"
   );
+
+  // Branch 4 -- LOW-FIRST-TOKEN-LOGPROB completion (codex round 11, M1): the model
+  // genuinely SAMPLES `<|es|>` at the first free position of a bare `[SOT]` prompt
+  // (no prefill, no probe, `temperature_fallback_count` at its default 0), but its
+  // logprob falls below the default -1.5 first-token threshold, so the decode
+  // COMPLETES on that very first step. The observation must still latch: the
+  // recognition now runs BEFORE the completion break, so the sampled `<|es|>`
+  // reaches BOTH the finalized `DecodingResult` AND the `observed_language_token`
+  // cell the attempt sink carries into the task facts -- rather than being dropped
+  // because the threshold broke the loop first. `without_timestamps` frees the
+  // language slot (no `TimestampRulesFilter`), and a lone positive logit at `<|es|>`
+  // is the argmax at a probability far under `e^-1.5` (`ln P ~= -9.86`).
+  //
+  // Mutation proof: move the recognition back after the `is_segment_completed`
+  // break (its pre-round-11 position, inside the `!is_prefill` push) and both the
+  // `DecodingResult` and cell assertions below read back `None`/`None` -- the
+  // threshold completion skips the latch entirely.
+  let mut mock = MockBackend::new();
+  let mut low_confidence_es = vec![0.0_f32; mock.dims().vocab()];
+  low_confidence_es[es as usize] = 1.0; // the only positive logit: argmax `<|es|>`, low prob
+  mock.push_step(low_confidence_es);
+  // `temperature_fallback_count = 0` per the disclosed history -- `decode_text`
+  // runs a single decode and never consults it, but modelling it keeps the branch
+  // faithful to the reported transcribe-layer scenario.
+  let options = DecodingOptions::new()
+    .with_without_timestamps()
+    .with_temperature_fallback_count(0);
+  let encoded = mock
+    .encode(&mock.extract_features(&[0.0; 16]).unwrap())
+    .unwrap();
+  let mut state = mock.new_decoder_state().unwrap();
+  let mut sampler = GreedyTokenSampler::new(options.temperature(), s.end_token(), &options);
+  let mut timings = TranscriptionTimings::new();
+  let observed_cell: Cell<Option<u32>> = Cell::new(None);
+  let low_first = decode_text(
+    &mock,
+    &encoded,
+    &mut state,
+    &[s.start_of_transcript_token()],
+    &mut sampler,
+    &options,
+    &t,
+    &mut timings,
+    &AtomicBool::new(false),
+    &observed_cell,
+    None,
+  )
+  .unwrap();
+  assert!(
+    low_first.first_token_log_prob() < -1.5,
+    "the sampled <|es|> is below the -1.5 first-token threshold, got {}",
+    low_first.first_token_log_prob(),
+  );
+  assert_eq!(
+    mock.counters().decode_steps(),
+    1,
+    "the below-threshold first token completes the decode on the first step",
+  );
+  assert_eq!(
+    low_first.observed_language(),
+    Some("es"),
+    "a first token below the threshold still latches its PREDICTED language onto the DecodingResult",
+  );
+  assert_eq!(
+    observed_cell.get(),
+    Some(es),
+    "and into the cell the attempt sink carries into the task facts -- latched BEFORE the break",
+  );
 }
 
 #[test]

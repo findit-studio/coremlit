@@ -385,6 +385,40 @@ where
         is_first_token_log_prob_too_low = next_token_log_prob < threshold; // :662-667
       }
     }
+    // Recognize the genuine language OBSERVATION the instant its token lands in
+    // the predicted region — the first `<|lang|>` token the model PREDICTS — and
+    // stash it in the caller's cell BEFORE any completion or error exit. Running
+    // it here, AHEAD of the `is_segment_completed` break below, is what lets a
+    // token the model genuinely SAMPLED still register its language even when that
+    // same first token trips a completion gate — the low-first-token-logprob
+    // threshold or the context cap — instead of being dropped unobserved because
+    // the break fired first (codex round 11, M1). An EOT completion cannot carry a
+    // `<|lang|>` token, so latching before it is a no-op there; the cell (and so
+    // `DecodingResult::observed_language` and the attempt sink's task facts) now
+    // sees the sampled language regardless of which gate ends the loop. FIRST
+    // wins, matching the finalized scan this replaces and the merge law's
+    // first-observation rule; a sampled token at/after `initial_prompt_index` sits
+    // in the predicted region, so `!is_prefill` alone is the predicted-region gate
+    // (F2, codex round 6 post-consolidation).
+    //
+    // NOT gated on `options.language().is_empty()`: a PREDICTED `<|lang|>` token
+    // is an OBSERVATION distinct from the configured/display language (round 10,
+    // F1). A multilingual decode configured `language="en"` with
+    // `without_timestamps` forces `[SOT, <|en|>, <|transcribe|>,
+    // <|notimestamps|>]`, then the model can still PREDICT `<|es|>` at the first
+    // free position: the display stays the Swift-faithful forced `<|en|>` while
+    // the observation is the predicted `<|es|>`. Suppressing it under a
+    // configured language contradicted the record's own contract
+    // (`observed_language` is the outcome, never the configured input) and
+    // recorded `None` for a run that plainly detected a language. The forced
+    // prefill `<|en|>` is already excluded by `!is_prefill`, not by the config.
+    if !is_prefill
+      && observed_language_token.get().is_none()
+      && tokenizer.all_language_tokens().contains(&next_token)
+    {
+      observed_language_token.set(Some(next_token));
+    }
+
     let is_segment_completed = sample.completed()
       || current_tokens.len() >= MAX_TOKEN_CONTEXT - 1
       || is_first_token_log_prob_too_low; // :668-671
@@ -400,30 +434,6 @@ where
     if !is_prefill {
       current_tokens.push(next_token); // :682-686
       log_probs.push(next_token_log_prob);
-      // Recognize the genuine language OBSERVATION the instant its token lands in
-      // the predicted region — the first `<|lang|>` token the model PREDICTS — and
-      // stash it in the caller's cell BEFORE the next (fallible) `decode_step`.
-      // FIRST wins, matching the finalized scan this replaces and the merge law's
-      // first-observation rule; a token pushed here sits at/after
-      // `initial_prompt_index`, so `!is_prefill` alone is the predicted-region
-      // gate (F2, codex round 6 post-consolidation).
-      //
-      // NOT gated on `options.language().is_empty()`: a PREDICTED `<|lang|>` token
-      // is an OBSERVATION distinct from the configured/display language (round 10,
-      // F1). A multilingual decode configured `language="en"` with
-      // `without_timestamps` forces `[SOT, <|en|>, <|transcribe|>,
-      // <|notimestamps|>]`, then the model can still PREDICT `<|es|>` at the first
-      // free position: the display stays the Swift-faithful forced `<|en|>` while
-      // the observation is the predicted `<|es|>`. Suppressing it under a
-      // configured language contradicted the record's own contract
-      // (`observed_language` is the outcome, never the configured input) and
-      // recorded `None` for a run that plainly detected a language. The forced
-      // prefill `<|en|>` is already excluded by `!is_prefill`, not by the config.
-      if observed_language_token.get().is_none()
-        && tokenizer.all_language_tokens().contains(&next_token)
-      {
-        observed_language_token.set(Some(next_token));
-      }
     }
     // KV/mask/alignment advance already happened inside `decode_step` —
     // see this function's doc comment.
