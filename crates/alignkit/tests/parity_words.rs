@@ -1069,7 +1069,7 @@ fn word_timings_agree_with_asry_ort_on_jfk() {
   assert!(
     c.median <= MAX_MEDIAN_BOUNDARY_DELTA_MS,
     "median word-boundary disagreement {:.1} ms exceeds {MAX_MEDIAN_BOUNDARY_DELTA_MS:.1} ms (one \
-     frame) — more than half of all boundaries moved. That is a SYSTEMATIC shift (a stride, a \
+     frame) — more than half of all boundaries moved. That is a SYSTEMATIC shift (a \
      truncation off-by-one, a clock anchor), not encoder precision.",
     c.median
   );
@@ -1160,7 +1160,7 @@ fn word_timings_agree_with_asry_ort_on_ted_60() {
     c.median <= MAX_TED_60_MEDIAN_BOUNDARY_DELTA_MS,
     "median word-boundary disagreement {:.1} ms exceeds {MAX_TED_60_MEDIAN_BOUNDARY_DELTA_MS:.1} \
      ms (one frame) — more than half of all boundaries moved. With no padding in play that is a \
-     SYSTEMATIC shift (a stride, a truncation off-by-one, a clock anchor), not encoder precision: \
+     SYSTEMATIC shift (a truncation off-by-one, a clock anchor), not encoder precision: \
      unpadded, the median boundary is normally frame-IDENTICAL (0.0 ms).",
     c.median
   );

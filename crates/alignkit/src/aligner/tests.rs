@@ -112,12 +112,14 @@ fn build_seam_threads_options_into_the_seam() {
 
 #[test]
 fn seam_stride_is_the_encoder_stride() {
-  // THE one-stride invariant. The stride that TIMES the words (asry's seam)
-  // and the stride that TRUNCATES the emissions
-  // (`encode::truncated_frame_count`, which divides by
-  // `encode::HOP_SAMPLES`) must be the same number, or every word is skewed
-  // in proportion to the difference. They are not independently checked
-  // downstream: asry's `validate_stride_extent` allows `chunk_extent ± 2·hop`,
+  // THE one-stride invariant. The stride the encoder TRUNCATES by
+  // (`encode::truncated_frame_count`, which divides by `encode::HOP_SAMPLES`)
+  // is what times the words: it fixes `T`, and asry maps boundaries by the
+  // effective `n_samples / (T - 1)` ratio. The seam must be HANDED that same
+  // number — not because a seam-only mismatch re-times anything (at `T >= 2` it
+  // does not; the ratio follows the encoder's `T`, not the hop), but because it
+  // would otherwise DECLARE a stride the encoder never used, and asry does not
+  // reconcile the two: `validate_stride_extent` allows `chunk_extent ± 2·hop`,
   // which on jfk.wav accepts 319, 320 AND 321 without error.
   //
   // This held only by coincidence while `AlignerOptions::hop_samples` existed
@@ -129,7 +131,8 @@ fn seam_stride_is_the_encoder_stride() {
   assert_eq!(
     seam.hop_samples().get() as usize,
     crate::encode::HOP_SAMPLES,
-    "the seam's word-timing stride must equal the encoder's truncation stride"
+    "the seam's hop must equal the encoder's truncation stride (the stride that times the words, \
+     via T)"
   );
 }
 
