@@ -77,6 +77,23 @@ pub enum InferError {
     /// Flat index of the offending element.
     index: usize,
   },
+  /// The caller's input was finite in `f32` but its magnitude exceeds `f16`'s
+  /// finite range (`|x| > f16::MAX`, i.e. `65504`), so narrowing it to the
+  /// argmax segmenter's `.float16` `waveform` input would round it to an f16
+  /// infinity and reach CoreML as a non-finite value — the very thing
+  /// [`Self::NonFiniteInput`] exists to prevent, one representability step in.
+  /// Only the argmax source narrows host `f32` samples to `f16` before
+  /// inference; the FluidAudio and dia-coreml paths feed `f32` unchanged, so
+  /// this guard is scoped to that source's `extract` (the public contract
+  /// places no amplitude bound on `samples`, `source/mod.rs`).
+  #[error(
+    "input value at index {index} is finite in f32 but overflows the model's f16 input \
+     domain (|x| > f16::MAX)"
+  )]
+  F16OverflowInput {
+    /// Flat index of the offending element.
+    index: usize,
+  },
   /// A per-frame speaker-activity mask had no active (`true`) frame at
   /// all. Every WeSpeaker call backed by an all-zero mask would receive
   /// all-zero pooling weights, which divides by zero inside statistics

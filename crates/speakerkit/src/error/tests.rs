@@ -79,6 +79,19 @@ fn infer_error_non_finite_input_displays_index() {
 }
 
 #[test]
+fn infer_error_f16_overflow_input_displays_index_and_honest_reason() {
+  let e = InferError::F16OverflowInput { index: 42 };
+  let rendered = e.to_string();
+  assert!(rendered.contains("index 42"), "{rendered}");
+  // The message must be HONEST that the value is finite in f32 (unlike
+  // `NonFiniteInput`), and name f16 as the domain it overflows.
+  assert!(
+    rendered.contains("finite in f32") && rendered.contains("f16"),
+    "{rendered}"
+  );
+}
+
+#[test]
 fn infer_error_empty_mask_displays_message() {
   let e = InferError::EmptyMask;
   assert_eq!(e.to_string(), "mask has no active (true) frame");

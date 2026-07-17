@@ -1075,6 +1075,22 @@ fn check_finite_input(samples: &[f32]) -> Result<(), InferError> {
   Ok(())
 }
 
+/// Scans `samples` for the first value that is finite in `f32` but not
+/// representable in `f16`, BEFORE any f16 conversion. This path narrows every
+/// sample to `f16` in [`fill_padded_chunk`], where `|x| > f16::MAX` (e.g.
+/// `f32::MAX`) rounds to an f16 infinity that then reaches the segmenter
+/// looking like a finite-but-corrupt decode. [`check_finite_input`] rejects
+/// values already non-finite in `f32`; this rejects the ones that only become
+/// non-finite when narrowed. Scoped to this source: the FluidAudio and
+/// dia-coreml paths feed `f32` unchanged and so cannot hit this bound.
+fn check_f16_representable(samples: &[f32]) -> Result<(), InferError> {
+  let max = f32::from(f16::MAX);
+  if let Some(index) = samples.iter().position(|v| v.abs() > max) {
+    return Err(InferError::F16OverflowInput { index });
+  }
+  Ok(())
+}
+
 // ─────────────────────────────────────────────────────────────────────────
 // Model I/O
 // ─────────────────────────────────────────────────────────────────────────
@@ -1507,6 +1523,12 @@ impl ModelSource for ArgmaxSource {
     // segmenter (M2) — the same input-side contract the embed module already
     // enforces; converts to `ExtractError::Infer` via `?`.
     check_finite_input(samples)?;
+    // ...and reject a finite f32 whose magnitude overflows f16 (|x| > f16::MAX,
+    // e.g. f32::MAX), which would otherwise narrow to an f16 infinity in
+    // `fill_padded_chunk` and reach the segmenter as a non-finite value the
+    // finite-input scan above cannot see. Scoped here: only this source narrows
+    // host f32 samples to f16.
+    check_f16_representable(samples)?;
 
     // The Extraction chunk grid IS dia's (module doc's theorem), so it is
     // computed from the very same function FluidAudioSource uses — the two
