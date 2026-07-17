@@ -22,9 +22,12 @@
 //!   rejects rather than pads short input
 //!   (`crates/dia-coreml/src/segment/mod.rs`'s "dia contract match"
 //!   section). wav2vec2 is not causal, so whether padding perturbs
-//!   in-range emissions remains an open empirical question, not an
-//!   assumption — it is for the B5 word-timing parity gate to measure, per
-//!   design spec §3's Candidate A note.
+//!   in-range emissions was an open empirical question — the B5 word-timing
+//!   parity gate (`tests/parity_words.rs`) has since MEASURED it: fed a full
+//!   window the encoder is frame-exact against asry's ONNX reference, and
+//!   zero-padding a short clip leaves the median boundary frame-identical
+//!   (p90 40.1 ms on the 11 s `jfk.wav`). See the crate root's "How far you
+//!   can trust the timings" table for both clips.
 //! - **`emissions` frames past the real (non-padded) audio**: truncated
 //!   away — see [`Encoder::emissions`]'s doc for the exact formula and why
 //!   it must be clamped to the model's actual frame count.
@@ -1185,8 +1188,12 @@ impl Encoder {
   /// folds that middle branch into the third via the `.max(400)` and is exact
   /// for every `real_samples >= 1`; it is **not** exact at zero, where it would
   /// floor UP to one phantom frame, so `real_samples == 0 → 0` is a separate
-  /// branch (a trivial chunk's empty tensor must stay empty — asry
-  /// short-circuits it before the encoder runs).
+  /// branch. That zero is alignkit's own empty-audio POLICY — no real audio, no
+  /// real frames — not a reproduction of asry's encoder geometry: asry
+  /// short-circuits a TRIVIAL chunk (no alignable text) before the encoder, but
+  /// empty audio carrying alignable text is non-trivial, so asry pads it to 400
+  /// and its encoder returns ONE frame there, where this branch deliberately
+  /// keeps zero.
   ///
   /// It is **not** `ceil(real_samples / HOP_SAMPLES)`. That earlier formula
   /// agrees with the conv geometry only up to one hop — the two are identical on
@@ -1332,9 +1339,12 @@ impl RawEmissions {
 /// See [`Encoder::emissions`]'s "Truncation formula" doc section.
 fn truncated_frame_count(real_samples: usize, available_frames: usize) -> usize {
   if real_samples == 0 {
-    // No real audio → no real frames. asry short-circuits a trivial chunk
-    // before the encoder ever runs, and `emissions_raw` truncates to an empty
-    // tensor; the conv formula below would otherwise floor UP to 1 here.
+    // No real audio → no real frames: alignkit's empty-audio policy, not asry's
+    // encoder geometry. asry short-circuits a TRIVIAL chunk (no alignable text)
+    // before the encoder, but empty audio carrying alignable text is non-trivial —
+    // asry pads it to 400 and its encoder returns one frame; this branch keeps
+    // zero, and `emissions_raw` truncates to an empty tensor. The conv formula
+    // below would otherwise floor UP to 1 here.
     return 0;
   }
   // The wav2vec2 feature extractor's own output-length arithmetic:
