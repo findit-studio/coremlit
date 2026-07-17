@@ -524,6 +524,179 @@ fn check_log_prob_floor_leaves_non_finite_values_to_from_log_probs() {
 // only fires after a build already succeeded.
 
 // ---------------------------------------------------------------------
+// check_log_prob_normalization: hermetic coverage of the per-frame logsumexp
+// guard — the check that makes the "these really are log-probs" contract true
+// for a model-artifact swap the floor and `from_log_probs`'s finite ∧ <= 0 scan
+// both miss. The model-gated half
+// (`emissions_pass_the_normalization_guard_on_real_speech`) proves the real
+// artifact passes on both clips and both clean placements; these prove the
+// predicate rejects the two un-normalized inputs the finding names, AND that
+// neither the floor nor the <= 0 scan would have caught them (the closed bypass).
+// ---------------------------------------------------------------------
+
+/// A frame filled with `value` on every one of the 29 classes.
+fn uniform_frame(value: f32) -> [f32; crate::vocab::VOCAB_SIZE] {
+  [value; crate::vocab::VOCAB_SIZE]
+}
+
+#[test]
+fn check_log_prob_normalization_accepts_normalized_log_probs() {
+  // A normalized log-prob frame has logsumexp == 0 by construction. Two shapes:
+  // (1) uniform — 29 copies of ln(1/29) = -ln(29), the maximum-entropy
+  // distribution; (2) a peaked distribution built as a genuine log-softmax, so
+  // its probabilities sum to 1 and its logsumexp is 0 for a NON-uniform row too.
+  let ln29 = f64::from(crate::vocab::VOCAB_SIZE as u32).ln();
+  let uniform = uniform_frame(-ln29 as f32);
+
+  // log_softmax of arbitrary logits: row_j = z_j - logsumexp(z), which sums to 1
+  // in probability space, so logsumexp(row) == 0.
+  let logits: [f32; crate::vocab::VOCAB_SIZE] = core::array::from_fn(|j| (j as f32) * 0.5 - 3.0);
+  let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+  let z_lse = f64::from(max)
+    + logits
+      .iter()
+      .map(|&z| (f64::from(z) - f64::from(max)).exp())
+      .sum::<f64>()
+      .ln();
+  let peaked: Vec<f32> = logits
+    .iter()
+    .map(|&z| (f64::from(z) - z_lse) as f32)
+    .collect();
+
+  let mut data = Vec::new();
+  data.extend_from_slice(&uniform);
+  data.extend_from_slice(&peaked);
+  assert!(
+    check_log_prob_normalization(&data, ComputeUnits::CpuOnly).is_ok(),
+    "normalized log-prob frames (logsumexp ≈ 0) must pass"
+  );
+}
+
+#[test]
+fn check_log_prob_normalization_accepts_an_empty_matrix() {
+  // `real_samples == 0` truncates to zero frames; no frame to check, so Ok
+  // (mirrors `check_log_prob_floor_accepts_an_empty_matrix`).
+  assert!(check_log_prob_normalization(&[], ComputeUnits::CpuOnly).is_ok());
+}
+
+#[test]
+fn check_log_prob_normalization_rejects_shifted_raw_logits() {
+  // THE bypass this guard closes. A full 2999 × 29 matrix of raw logits shifted
+  // WHOLLY into [-20, -10] — the finding's exact fence. Every cell is finite and
+  // <= 0, so it passes BOTH the floor (nothing below -100) and the finite ∧ <= 0
+  // scan `from_log_probs` runs — yet no frame is a distribution: a row entirely
+  // in [-20, -10] has logsumexp in [max, max + ln 29] ⊆ [-20, -6.63], so
+  // |logsumexp| >= 6.63, orders of magnitude past the ±2e-2 tolerance.
+  let mut data = Vec::with_capacity(2999 * crate::vocab::VOCAB_SIZE);
+  for _ in 0..2999 {
+    // A ramp across the vocab, every value inside [-20, -10]; not normalized.
+    for j in 0..crate::vocab::VOCAB_SIZE {
+      data.push(-10.0 - (j as f32) * (10.0 / (crate::vocab::VOCAB_SIZE as f32 - 1.0)));
+    }
+  }
+  // The floor does NOT catch it (nothing below -100)...
+  assert!(
+    check_log_prob_floor(&data, ComputeUnits::CpuOnly).is_ok(),
+    "shifted raw logits in [-20, -10] are all above LOG_PROB_FLOOR — the floor cannot catch them"
+  );
+  // ...and `from_log_probs`'s finite ∧ <= 0 scan would not either.
+  assert!(
+    data.iter().all(|v| v.is_finite() && *v <= 0.0),
+    "shifted raw logits are finite and <= 0 — the from_log_probs scan cannot catch them"
+  );
+  // Only the normalization guard does.
+  let Err(err) = check_log_prob_normalization(&data, ComputeUnits::CpuOnly) else {
+    panic!("raw logits shifted into [-20, -10] must be rejected as un-normalized");
+  };
+  let AlignError::UnnormalizedEmissions {
+    logsumexp,
+    tolerance,
+    ..
+  } = err
+  else {
+    panic!("expected AlignError::UnnormalizedEmissions, got {err:?}");
+  };
+  assert!(
+    logsumexp.abs() > 6.6,
+    "a [-20, -10] shifted frame's |logsumexp| is >= 6.63, got {logsumexp}"
+  );
+  assert_eq!(tolerance, LOG_PROB_SUM_TOLERANCE);
+}
+
+#[test]
+fn check_log_prob_normalization_rejects_an_all_zero_frame() {
+  // THE simplest un-normalized case: an all-zeros frame, exp(0) = 1 on every
+  // class, so logsumexp = ln(29) ≈ 3.367 — again finite, <= 0, above the floor,
+  // and again only the normalization guard rejects it.
+  let data = uniform_frame(0.0);
+  assert!(
+    check_log_prob_floor(&data, ComputeUnits::CpuOnly).is_ok(),
+    "an all-zeros frame is above the floor"
+  );
+  assert!(data.iter().all(|v| v.is_finite() && *v <= 0.0));
+  let Err(AlignError::UnnormalizedEmissions {
+    row,
+    logsumexp,
+    compute,
+    ..
+  }) = check_log_prob_normalization(&data, ComputeUnits::All)
+  else {
+    panic!("an all-zeros frame (logsumexp = ln 29) must be rejected");
+  };
+  assert_eq!(row, 0);
+  assert_eq!(compute, ComputeUnits::All); // the placement is carried through
+  let ln29 = f64::from(crate::vocab::VOCAB_SIZE as u32).ln();
+  assert!(
+    (logsumexp - ln29).abs() < 1e-5,
+    "all-zeros logsumexp must be ln(29) ≈ {ln29}, got {logsumexp}"
+  );
+}
+
+#[test]
+fn check_log_prob_normalization_names_the_worst_frame() {
+  // Several normalized frames (logsumexp ≈ 0) with ONE un-normalized frame at a
+  // known index: the error must name THAT frame, not the first or the last.
+  let ln29 = f64::from(crate::vocab::VOCAB_SIZE as u32).ln();
+  let normalized = uniform_frame(-ln29 as f32);
+  let bad_index = 2usize;
+  let mut data = Vec::new();
+  for i in 0..5 {
+    if i == bad_index {
+      data.extend_from_slice(&uniform_frame(0.0)); // logsumexp = ln 29
+    } else {
+      data.extend_from_slice(&normalized); // logsumexp ≈ 0
+    }
+  }
+  let Err(AlignError::UnnormalizedEmissions { row, .. }) =
+    check_log_prob_normalization(&data, ComputeUnits::CpuOnly)
+  else {
+    panic!("the un-normalized frame must be rejected");
+  };
+  assert_eq!(row, bad_index, "the error must name the worst frame");
+}
+
+#[test]
+fn check_log_prob_normalization_thresholds_on_the_tolerance() {
+  // Pins the threshold LOCATION and direction: a uniform frame constructed to
+  // sit at logsumexp = TOL/2 passes, one at logsumexp = 2·TOL is rejected. (An
+  // exact-at-TOL boundary is not pinned here — an f32-stored frame cannot hit an
+  // f64 TOL exactly; the `>` strictness is stated on the function.)
+  let ln29 = f64::from(crate::vocab::VOCAB_SIZE as u32).ln();
+  let tol = LOG_PROB_SUM_TOLERANCE;
+  // uniform frame value `v` gives logsumexp = v + ln29; solve for the target.
+  let inside = uniform_frame((tol / 2.0 - ln29) as f32);
+  let outside = uniform_frame((2.0 * tol - ln29) as f32);
+  assert!(
+    check_log_prob_normalization(&inside, ComputeUnits::CpuOnly).is_ok(),
+    "logsumexp = TOL/2 is within tolerance"
+  );
+  assert!(
+    check_log_prob_normalization(&outside, ComputeUnits::CpuOnly).is_err(),
+    "logsumexp = 2·TOL exceeds tolerance"
+  );
+}
+
+// ---------------------------------------------------------------------
 // EncoderOptions
 // ---------------------------------------------------------------------
 
@@ -833,6 +1006,65 @@ fn emissions_accept_the_default_placement_on_real_speech() {
   assert_eq!(emissions.vocab().get(), crate::vocab::VOCAB_SIZE);
 }
 
+/// **THE NORMALIZATION-GUARD REGRESSION (c).** Real emissions from the shipping
+/// artifact must PASS `check_log_prob_normalization` — the guard that rejects a
+/// raw-logit model swap — on both gate clips and both numerically-clean gate
+/// placements, with the measured worst per-frame `|logsumexp|` comfortably under
+/// [`LOG_PROB_SUM_TOLERANCE`].
+///
+/// This is the model side of the tolerance calibration: it re-measures, at gate
+/// time, the worst `|logsumexp|` [`LOG_PROB_SUM_TOLERANCE`]'s doc records
+/// (`CpuOnly` `ted_60` 5.2485e-3, `jfk` 4.7453e-3; `CpuAndGpu` ~2.5e-7), so a
+/// future artifact or firmware whose jitter crept toward the bound would fail
+/// here rather than silently at a caller. It exercises the guarded door's exact
+/// check pair (`check_log_prob_floor` then `check_log_prob_normalization`) on the
+/// truncated real tensor; the end-to-end public door on real speech is covered by
+/// `emissions_accept_the_default_placement_on_real_speech` (jfk `CpuOnly`) and
+/// `emissions_accept_the_cpu_and_gpu_placement` (jfk `CpuAndGpu`), which now run
+/// the guard too, and by `tests/parity_words.rs` on `ted_60`.
+#[test]
+#[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
+fn emissions_pass_the_normalization_guard_on_real_speech() {
+  for compute in [ComputeUnits::CpuOnly, ComputeUnits::CpuAndGpu] {
+    let encoder =
+      Encoder::from_file_with(encoder_path(), EncoderOptions::new().with_compute(compute))
+        .unwrap_or_else(|e| panic!("load base960h_aligner.mlmodelc on {compute:?}: {e}"));
+    for (name, samples) in [("jfk", load_jfk_wav()), ("ted_60", load_ted_60_wav())] {
+      let raw = encoder
+        .emissions_raw(window_input(&samples))
+        .unwrap_or_else(|e| panic!("{compute:?} {name}: emissions_raw: {e}"));
+      // The exact guarded-door pair, on the exact truncated tensor the door checks.
+      check_log_prob_floor(&raw.data, compute)
+        .unwrap_or_else(|e| panic!("{compute:?} {name}: real emissions tripped the floor: {e}"));
+      check_log_prob_normalization(&raw.data, compute).unwrap_or_else(|e| {
+        panic!("{compute:?} {name}: real emissions tripped the normalization guard: {e}")
+      });
+      // The measurement of record: worst per-frame |logsumexp|, f64-accumulated,
+      // over the real (truncated) frames the guard scans.
+      let worst = raw
+        .data
+        .as_chunks::<{ crate::vocab::VOCAB_SIZE }>()
+        .0
+        .iter()
+        .map(|frame| {
+          let max = f64::from(frame.iter().copied().fold(f32::NEG_INFINITY, f32::max));
+          let sum: f64 = frame.iter().map(|&x| (f64::from(x) - max).exp()).sum();
+          (max + sum.ln()).abs()
+        })
+        .fold(0.0f64, f64::max);
+      println!(
+        "{compute:?} {name}: {} frames, worst |logsumexp| = {worst:.6e} (tolerance {LOG_PROB_SUM_TOLERANCE:e})",
+        raw.frames,
+      );
+      assert!(
+        worst < LOG_PROB_SUM_TOLERANCE,
+        "{compute:?} {name}: worst |logsumexp| {worst} is not under the guard tolerance \
+         {LOG_PROB_SUM_TOLERANCE} — the tolerance's measured headroom has been lost"
+      );
+    }
+  }
+}
+
 /// Decodes the 11 s `jfk.wav` fixture (16 kHz mono int16) to f32 samples.
 ///
 /// Borrowed from the whisperkit crate by relative path rather than committing
@@ -851,6 +1083,32 @@ fn load_jfk_wav() -> Vec<f32> {
     .samples::<i16>()
     .map(|s| f32::from(s.expect("valid sample")) / 32_768.0)
     .collect()
+}
+
+/// Decodes the 60 s `ted_60.wav` fixture (16 kHz mono int16) to f32 samples —
+/// exactly [`ENCODER_WINDOW_SAMPLES`] (960,000), the full window with no padding,
+/// so the normalization guard sees all 2,999 real frames. Borrowed cross-crate
+/// exactly as [`load_jfk_wav`]; fails loudly (never skips) if the path moves or
+/// the clip stops filling the window.
+fn load_ted_60_wav() -> Vec<f32> {
+  let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    .join("../whisperkit/tests/fixtures/audio/ted_60.wav");
+  let mut reader = hound::WavReader::open(&path)
+    .unwrap_or_else(|e| panic!("open the ted_60.wav fixture at {path:?}: {e}"));
+  let spec = reader.spec();
+  assert_eq!(spec.channels, 1, "fixture must be mono");
+  assert_eq!(spec.sample_rate, 16_000, "fixture must be 16 kHz");
+  assert_eq!(spec.sample_format, hound::SampleFormat::Int);
+  let samples: Vec<f32> = reader
+    .samples::<i16>()
+    .map(|s| f32::from(s.expect("valid sample")) / 32_768.0)
+    .collect();
+  assert_eq!(
+    samples.len(),
+    ENCODER_WINDOW_SAMPLES,
+    "ted_60.wav must fill the encoder window exactly (the zero-padding-free path)"
+  );
+  samples
 }
 
 #[test]

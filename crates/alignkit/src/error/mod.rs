@@ -153,6 +153,51 @@ pub enum AlignError {
     /// `jfk.wav`).
     total: usize,
   },
+  /// The encoder returned an emission matrix that is **not normalized
+  /// log-probabilities**: frame `row`'s `logsumexp` over the vocab axis is
+  /// `logsumexp`, exceeding [`crate::encode::LOG_PROB_SUM_TOLERANCE`] in
+  /// magnitude. A genuine CTC log-probability frame sums to 1 in probability
+  /// space, so its `logsumexp` is `0` (`ln Σ exp(log p_j) = ln Σ p_j = ln 1`); a
+  /// whole-unit deviation means the tensor carries raw logits — or another
+  /// un-normalized distribution — not the log-softmaxed output this crate's
+  /// encoder contract requires.
+  ///
+  /// Unlike [`Self::CorruptEmissions`] — a placement-dependent fp16 underflow of
+  /// THIS reviewed artifact — this is a **model-artifact contract** failure that
+  /// no placement causes and no placement cures: a revision shipping a raw-logit
+  /// CTC head (the *standard* wav2vec2 export, and what asry's own ONNX model
+  /// emits) is rejected here rather than silently re-normalized by
+  /// `Emissions::from_logits` and aligned on forever. It is the check that makes
+  /// [`crate::encode::Encoder::emissions`]'s "these really are log-probs" a
+  /// verified contract for any same-contract artifact loaded through the public
+  /// API, not merely for the one reviewed here. The finite ∧ `<= 0` scan
+  /// `Emissions::from_log_probs` runs cannot catch it: raw logits shifted wholly
+  /// into `[-20, -10]`, or an all-zeros frame, are finite and `<= 0` on every
+  /// cell yet no distribution at all. See
+  /// [`crate::encode::LOG_PROB_SUM_TOLERANCE`] for the measured tolerance and the
+  /// [`crate::encode`] module doc's "The normalization guard".
+  #[error(
+    "encoder emissions are not normalized log-probabilities: frame {row} has logsumexp \
+     {logsumexp} over the vocab axis (tolerance ±{tolerance}), but a CTC log-probability frame \
+     sums to 1 in probability space so its logsumexp is 0. This emission tensor carries raw \
+     logits or another un-normalized distribution, not the log-softmaxed output alignkit's \
+     encoder contract requires — most likely the model artifact was swapped for a raw-logit CTC \
+     head (the standard wav2vec2 export). The encoder was scheduled on {compute:?}."
+  )]
+  UnnormalizedEmissions {
+    /// The compute placement the encoder was loaded on. Carried for parity with
+    /// [`Self::CorruptEmissions`]; unlike that error the placement is not the
+    /// cause here (the model artifact is), but it remains useful context.
+    compute: coremlit::ComputeUnits,
+    /// Index of the worst frame — the one with the largest `|logsumexp|`.
+    row: usize,
+    /// That frame's `logsumexp` over the vocab axis (`≈ 0` for real log-probs;
+    /// `ln 29 ≈ 3.367` for an all-zeros frame; `>= 6.6` for a `[-20, -10]`
+    /// shifted raw-logit frame). Accumulated in `f64`.
+    logsumexp: f64,
+    /// The bound it exceeded ([`crate::encode::LOG_PROB_SUM_TOLERANCE`]).
+    tolerance: f64,
+  },
   /// A caller-supplied OOV decision does not carry the requested language.
   ///
   /// Returned by [`crate::registry::AlignmentSet::align_chunk`] when the
