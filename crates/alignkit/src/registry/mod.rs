@@ -15,15 +15,29 @@
 //!
 //! `&self` alignment means many chunks can be aligned through one registry
 //! without interior mutability — but **not** that an [`AlignmentSet`] can be
-//! shared across threads today. It is `!Sync`: an [`Aligner`] holds asry's
-//! `EmissionsAligner`, which owns a
-//! [`DynTextNormalizer`](asry::emissions::DynTextNormalizer) =
-//! `Box<dyn TextNormalizer>`, and asry declares
-//! `TextNormalizer: Send` with no `Sync` bound — so the box is not `Sync`,
-//! and neither is anything holding it. An `Arc<AlignmentSet>` fanned out to
-//! worker threads will not compile until asry widens that bound to
-//! `Send + Sync`. Until then the mutex-free design buys single-threaded reuse
-//! and one less lock in the hot path, not free cross-thread sharing.
+//! shared across threads. It is `!Sync` for **two independent reasons**, either
+//! of which alone is fatal to an `Arc<AlignmentSet>` fanned out to workers:
+//!
+//! 1. **The CoreML model.** Each [`Aligner`] owns an
+//!    [`Encoder`](crate::encode::Encoder) → [`coremlit::Model`], which is
+//!    deliberately [`Send`] but
+//!    **not** [`Sync`]: Apple documents "use an `MLModel` instance on one thread
+//!    or one dispatch queue at a time" (`coremlit::Model`'s `# Concurrency`), so
+//!    concurrent `&Model` access from multiple threads is outside contract. This
+//!    blocker is intrinsic to the model — no bound widening removes it.
+//! 2. **The text normalizer.** That same [`Aligner`]'s asry `EmissionsAligner`
+//!    owns a [`DynTextNormalizer`](asry::emissions::DynTextNormalizer) =
+//!    `Box<dyn TextNormalizer>`, and asry declares `TextNormalizer: Send` with no
+//!    `Sync` bound, so the box is not `Sync` either.
+//!
+//! The earlier claim that widening asry's bound to `Send + Sync` would enable
+//! sharing was wrong: it removes reason 2 but not reason 1, so
+//! `assert_sync::<AlignmentSet>()` still fails on the model. The real cross-thread
+//! route is therefore **one model per worker** — a separate [`AlignmentSet`] per
+//! thread, each `Model` independently loaded — or serializing all access to one
+//! set behind an external `Mutex`. Until then the mutex-free design buys
+//! single-threaded reuse and one less lock in the hot path, not free cross-thread
+//! sharing.
 
 use core::sync::atomic::AtomicBool;
 use std::collections::HashMap;
