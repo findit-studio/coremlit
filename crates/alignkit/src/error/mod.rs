@@ -127,7 +127,7 @@ pub enum AlignError {
   /// audio: no input makes a *correctly-converted* artifact produce it. But on a
   /// *corrupted* artifact its DETECTION is input-dependent — this error fires
   /// only when the input drives a class posterior under the fp16 floor and so
-  /// exposes the `log(0)` sentinel. Real speech does (measured `min ≈ -45440` on
+  /// exposes the `log(0)` sentinel. Real speech can (measured `min ≈ -45440` on
   /// `jfk.wav`); 960,000 samples of digital silence (`min ≈ -8.55`) and a
   /// low-amplitude sine (`≈ -9.07`) stay ABOVE the floor and pass clean even on
   /// the corrupt placement — the recorded evidence in
