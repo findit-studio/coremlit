@@ -641,9 +641,11 @@ fn emissions_output_or_mismatch(
 /// produced it — the diagnosis, not just the symptom.
 ///
 /// Deliberately only the lower bound: the upper bound (`<= 0`) and finiteness
-/// are [`Emissions::from_log_probs`]'s scan, which runs on the very next line
-/// of [`Encoder::emissions`]. A `NaN` therefore passes *here* (`NaN < x` is
-/// false) and is caught *there*; neither scan is redundant with the other.
+/// are [`Emissions::from_log_probs`]'s scan, which [`Encoder::emissions`] runs
+/// immediately after this guard — in [`ValueDomainChecked::into_emissions`], on
+/// the very tensor this floor just cleared. A `NaN` therefore passes *here*
+/// (`NaN < x` is false) and is caught *there*; neither scan is redundant with the
+/// other.
 fn check_log_prob_floor(data: &[f32], compute: ComputeUnits) -> Result<(), AlignError> {
   let mut min = f32::INFINITY;
   let mut cells = 0usize;
@@ -686,11 +688,12 @@ fn check_log_prob_floor(data: &[f32], compute: ComputeUnits) -> Result<(), Align
 /// deviation rather than this scan's own summation error, matching how
 /// [`LOG_PROB_SUM_TOLERANCE`] was measured. A frame with a non-finite maximum
 /// (all `-inf`, or a `+inf`/`NaN` cell) is skipped here and left to
-/// [`Emissions::from_log_probs`]'s finite scan on the very next line of
-/// [`Encoder::emissions`] — exactly the division of labour
-/// [`check_log_prob_floor`] keeps with `NaN`; recomputing `logsumexp` over it
-/// would only manufacture a `NaN` bound. An empty matrix (`real_samples == 0` →
-/// zero frames) has no frame to check and is accepted.
+/// [`Emissions::from_log_probs`]'s finite scan, which [`Encoder::emissions`] runs
+/// immediately after this guard (in [`ValueDomainChecked::into_emissions`]) —
+/// exactly the division of labour [`check_log_prob_floor`] keeps with `NaN`;
+/// recomputing `logsumexp` over it would only manufacture a `NaN` bound. An empty
+/// matrix (`real_samples == 0` → zero frames) has no frame to check and is
+/// accepted.
 fn check_log_prob_normalization(data: &[f32], compute: ComputeUnits) -> Result<(), AlignError> {
   debug_assert!(
     data.len().is_multiple_of(crate::vocab::VOCAB_SIZE),
@@ -729,15 +732,23 @@ fn check_log_prob_normalization(data: &[f32], compute: ComputeUnits) -> Result<(
   Ok(())
 }
 
-/// The value-domain guard sequence [`Encoder::emissions`] runs on the raw
-/// log-prob tensor before wrapping it: [`check_log_prob_floor`] then
-/// [`check_log_prob_normalization`], in that order, over the SAME `data` slice —
-/// the exact pair, on the exact argument, [`Encoder::emissions`] applies to the
-/// tensor it takes from [`Encoder::emissions_raw`].
+/// The value-domain guard sequence run over a raw log-prob tensor before it is
+/// wrapped: [`check_log_prob_floor`] then [`check_log_prob_normalization`], in
+/// that order, over the SAME `data` slice. On the production door this is the
+/// exact pair [`RawEmissions::check_value_domain`] runs to mint a
+/// [`ValueDomainChecked`] — the capability [`Encoder::emissions`] must hold before
+/// [`ValueDomainChecked::into_emissions`] will wrap the tensor through
+/// [`Emissions::from_log_probs`]. The guard is therefore not merely called *near*
+/// the wrap; the wrap is unreachable without it, so swapping in the weaker
+/// [`check_log_prob_floor`] alone at the call site stops type-checking (a bare
+/// `()` mints no token). This mirrors the [`EncoderInput`] capability one screen
+/// down: just as that type makes a buffer paired with the wrong real-sample count
+/// unrepresentable, this token makes "wrap a tensor the guard never cleared"
+/// unrepresentable.
 ///
-/// Extracted so the hermetic suite can drive the production guard through the one
-/// call the door itself makes (`tests::check_emission_value_domain_*`) rather
-/// than re-deriving the two calls: the normalization half has no real-model
+/// Extracted so the hermetic suite can drive that exact production sequence
+/// through the one call the minter itself makes (`tests::check_emission_value_domain_*`)
+/// rather than re-deriving the two calls: the normalization half has no real-model
 /// fixture — no loadable model emits un-normalized raw logits — so binding that
 /// predicate to the door means calling the door's own guard with a hand-built
 /// shifted-raw-logit tensor. The floor half is additionally exercised at the full
@@ -755,6 +766,52 @@ fn check_emission_value_domain(data: &[f32], compute: ComputeUnits) -> Result<()
   check_log_prob_floor(data, compute)?;
   check_log_prob_normalization(data, compute)?;
   Ok(())
+}
+
+/// A capability proof that a specific raw log-prob tensor cleared the FULL
+/// value-domain guard — [`check_log_prob_floor`] THEN
+/// [`check_log_prob_normalization`] — and which OWNS that exact tensor.
+/// Non-`Copy`, module-private, minted only by [`RawEmissions::check_value_domain`]
+/// on success and consumed only by [`Self::into_emissions`].
+///
+/// This is the [`EncoderInput`] capability pattern (same file, same intent)
+/// applied to the value-domain guard rather than to input geometry. `EncoderInput`
+/// makes a buffer paired with the wrong real-sample count unrepresentable; this
+/// token makes "wrap a tensor the guard never cleared" unrepresentable. The
+/// mechanism is the same — carry the checked thing INSIDE the capability so it
+/// cannot be swapped after the fact:
+///
+/// - Calling only [`check_log_prob_floor`], or skipping the guard, yields `()`
+///   and no token, so [`Self::into_emissions`] — the sole production route from a
+///   raw tensor to [`Emissions`] — has nothing to consume and [`Encoder::emissions`]
+///   no longer compiles.
+/// - Clearing `&[]` (or any other buffer) and then wrapping the real tensor is
+///   impossible: the token owns the very bytes the guard consumed, so the only
+///   tensor `into_emissions` can wrap is the one that passed.
+struct ValueDomainChecked {
+  /// Truncated frame count `T`, carried through from the guarded [`RawEmissions`].
+  frames: usize,
+  /// The row-major `frames × VOCAB_SIZE` log-probabilities that cleared the guard
+  /// — the exact tensor [`Self::into_emissions`] wraps, never a second one.
+  data: Vec<f32>,
+}
+
+impl ValueDomainChecked {
+  /// Wraps the guard-cleared tensor through [`Emissions::from_log_probs`] (the
+  /// log-prob door), consuming the capability. The only production path from a
+  /// value-domain-checked tensor to [`Emissions`].
+  ///
+  /// # Errors
+  /// [`AlignError::Alignment`] if [`Emissions::from_log_probs`]'s own finite ∧
+  /// `<= 0` scan rejects the tensor — the domain half the value-domain guard
+  /// deliberately leaves to it (see [`check_log_prob_floor`]).
+  fn into_emissions(self) -> Result<Emissions, AlignError> {
+    Ok(Emissions::from_log_probs(
+      self.frames,
+      VOCAB_SIZE_NZ,
+      self.data,
+    )?)
+  }
 }
 
 /// A provenance-bound encoder input: the buffer [`Encoder::emissions`] runs the
@@ -1219,9 +1276,15 @@ impl Encoder {
     )
   )]
   pub fn emissions(&self, input: EncoderInput<'_>) -> Result<Emissions, AlignError> {
-    let RawEmissions { frames, data } = self.emissions_raw(input)?;
-    check_emission_value_domain(&data, self.compute)?;
-    Ok(Emissions::from_log_probs(frames, VOCAB_SIZE_NZ, data)?)
+    // The raw tensor reaches `Emissions` ONLY through the value-domain guard: the
+    // guard mints a `ValueDomainChecked` capability that owns the cleared tensor,
+    // and only that capability's `into_emissions` wraps it. Swapping the guard for
+    // the weaker `check_log_prob_floor` here mints no token and stops compiling —
+    // the call-site binding `EncoderInput` gives input geometry, given the guard.
+    self
+      .emissions_raw(input)?
+      .check_value_domain(self.compute)?
+      .into_emissions()
   }
 }
 
@@ -1243,6 +1306,27 @@ pub(crate) struct RawEmissions {
   pub(crate) frames: usize,
   /// The row-major `frames × VOCAB_SIZE` log-probabilities.
   pub(crate) data: Vec<f32>,
+}
+
+impl RawEmissions {
+  /// Runs the full value-domain guard ([`check_emission_value_domain`]) over this
+  /// tensor and, on success, seals it into a [`ValueDomainChecked`] — the sole
+  /// route from a raw tensor to [`Emissions`] on the production door
+  /// ([`Encoder::emissions`]). Consumes `self`, so the bytes the guard validated
+  /// are exactly the bytes [`ValueDomainChecked::into_emissions`] later wraps: the
+  /// door cannot clear one buffer and wrap another.
+  ///
+  /// # Errors
+  /// As [`check_emission_value_domain`]: [`AlignError::CorruptEmissions`] (a cell
+  /// below [`LOG_PROB_FLOOR`]) or [`AlignError::UnnormalizedEmissions`] (a frame
+  /// past [`LOG_PROB_SUM_TOLERANCE`]).
+  fn check_value_domain(self, compute: ComputeUnits) -> Result<ValueDomainChecked, AlignError> {
+    check_emission_value_domain(&self.data, compute)?;
+    Ok(ValueDomainChecked {
+      frames: self.frames,
+      data: self.data,
+    })
+  }
 }
 
 /// See [`Encoder::emissions`]'s "Truncation formula" doc section.
