@@ -1202,11 +1202,12 @@ pub struct TranscriptionResult {
   seek_time: Option<f32>,
   /// The decode-time facts this transcription **run controlled** — whether it
   /// drew from the token sampler, the language it genuinely observed, whether a
-  /// progress callback truncated it, the worker coordinates its RNG streams
-  /// rode, and the segment-id span its decode allocated — as one carried record
-  /// (coremlit issue #14, codex round 6). Replaces the five separate fields
-  /// these facts used to scatter across, whose per-fact plumbing lost or
-  /// fabricated three of them at aggregation boundaries; see
+  /// progress callback truncated it, whether it swallowed a child error, the
+  /// worker coordinates its RNG streams rode, and the segment-id span its decode
+  /// allocated — as one carried record (coremlit issue #14, codex round 6).
+  /// Replaces the six separate fields these facts used to scatter across, whose
+  /// per-fact plumbing lost or fabricated three of them at aggregation
+  /// boundaries; see
   /// [`TaskFacts`](crate::task_facts::TaskFacts) for the history and the one
   /// merge law [`merge_transcription_results_with_options`] now folds them by.
   ///
@@ -1229,14 +1230,18 @@ impl TranscriptionResult {
   /// defaults for these either); [`Self::seek_time`] starts `None` and
   /// [`Self::task_facts`] starts [`TaskFacts::unknown`].
   ///
-  /// A result assembled by hand therefore claims **no** sampling, **no**
-  /// observed language, **no** callback truncation, an **unknown** worker
-  /// coordinate (never a fabricated `0`, R6-F2), and an untracked id span.
-  /// That is the right default for a caller inventing a transcript, and it is
-  /// not a hole in the reproducibility guarantee:
-  /// [`Provenance::for_result`](crate::provenance::Provenance::for_result)
-  /// additionally scans the surviving segments' own temperatures, so a visible
-  /// `temperature > 0.0` is caught either way. What only the carried
+  /// A result assembled by hand therefore records an **unknown** sampling draw,
+  /// **no** observed language, an **unknown** callback truncation, an **unknown**
+  /// swallowed child error, an **unknown** worker coordinate (never a fabricated
+  /// `0`, R6-F2), and an untracked id span — explicit unknown throughout, never
+  /// the optimistic `Some(false)` a "nothing happened" default would forge (F1).
+  /// That is the right default for a caller inventing a transcript, and it is not
+  /// a hole in the reproducibility guarantee:
+  /// [`Provenance::for_result`](crate::provenance::Provenance::for_result) TRUSTS
+  /// this carried record whole rather than scanning the surviving segments' own
+  /// temperatures (inferring the draw from the survivors was the bug it
+  /// replaced), so an unknown draw is treated CONSERVATIVELY as non-reproducible,
+  /// never optimistically waved through. What only the carried
   /// [`TaskFacts::drew_from_rng`](crate::task_facts::TaskFacts::drew_from_rng)
   /// flag can carry is a sampled window whose segments are *gone* — and only
   /// the decode path can know about those, setting the observed facts via
@@ -1253,10 +1258,12 @@ impl TranscriptionResult {
       language: language.into(),
       timings,
       seek_time: None,
-      // A hand-built result controlled no decode: it drew nothing, witnessed no
-      // language, was truncated by no callback, rode an UNKNOWN worker
-      // coordinate (never a fabricated 0), and tracked no id span. The pipeline
-      // sets the observed record via `with_task_facts`.
+      // A hand-built result controlled no decode, so it cannot OBSERVE whether a
+      // draw, a callback truncation, or a swallowed child error occurred: it
+      // records explicit UNKNOWN for each (never the optimistic Some(false)),
+      // witnessed no language, rode an UNKNOWN worker coordinate (never a
+      // fabricated 0), and tracked no id span. The pipeline sets the observed
+      // record via `with_task_facts`.
       task_facts: TaskFacts::unknown(),
     }
   }

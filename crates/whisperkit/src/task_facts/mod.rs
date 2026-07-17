@@ -1,7 +1,8 @@
 //! The decode-time facts a transcription **run controls** — the RNG draw, the
-//! genuinely observed language, the early-stop truncation, the worker
-//! coordinates its RNG streams rode, and the id-ordinal span it allocated —
-//! consolidated into ONE carried record (coremlit issue #14, codex round 6).
+//! genuinely observed language, the early-stop truncation, a swallowed child
+//! error, the worker coordinates its RNG streams rode, and the id-ordinal span
+//! it allocated — consolidated into ONE carried record (coremlit issue #14,
+//! codex round 6).
 //!
 //! # Why one record
 //!
@@ -10,7 +11,7 @@
 //! drop, a VAD chunk merge, a streaming finalize, an errored-and-dropped
 //! chunk), and is finally *read* by [`Provenance`](crate::provenance::Provenance)
 //! to answer [`Provenance::is_reproducible`](crate::provenance::Provenance::is_reproducible)
-//! and to describe the run. Carrying them as five separate fields — plus two
+//! and to describe the run. Carrying them as six separate fields — plus two
 //! ad-hoc decode-layer sinks and a scatter of `.any()`/`.find_map()`/`.first()`
 //! re-aggregations at each merge — is exactly how three of them came to be lost
 //! or fabricated at a boundary across six review rounds:
@@ -25,7 +26,7 @@
 //!   aggregate, so a staged re-merge (VAD result → streaming finalize)
 //!   renumbered segments differently than a one-shot merge (R6-F3).
 //!
-//! [`TaskFacts`] gives the five facts one home, one [merge law](TaskFacts::merge)
+//! [`TaskFacts`] gives the six facts one home, one [merge law](TaskFacts::merge)
 //! that every merge entry point calls, and one serde contract — so a boundary
 //! can no longer silently drop or invent one.
 //!
@@ -267,8 +268,16 @@ impl SpanKnowledge {
 ///
 /// Lives on every [`TranscriptionResult`](crate::result::TranscriptionResult)
 /// and is embedded verbatim in [`Provenance`](crate::provenance::Provenance).
-/// Build the identity/hand-built value with [`Self::unknown`] and layer facts on
-/// with the `with_*` builders; merge two with [`Self::merge`].
+/// Build the hand-built / all-unknown value with [`Self::unknown`] and layer
+/// facts on with the `with_*` builders; merge two with [`Self::merge`], or fold
+/// a whole sequence of contributors with [`Self::fold`].
+///
+/// [`Self::unknown`] is an **unknown contributor, never a fold identity**: it is
+/// ABSORBING, so merging it into an observed fact NULLS that observation rather
+/// than leaving it intact (`None | Some(false) = None`; the example below). The
+/// neutral element of a contributor fold is [`Self::fold`] of no contributors —
+/// not `unknown()` reused as a seed — and a real run watching for these facts
+/// seeds its own sink at [`Self::observed_clean`].
 ///
 /// ```
 /// use whisperkit::task_facts::{SpanKnowledge, TaskFacts};
@@ -291,6 +300,18 @@ impl SpanKnowledge {
 /// assert_eq!(TaskFacts::unknown().drew_from_rng(), None);
 /// assert_eq!(TaskFacts::unknown().early_stopped(), None);
 /// assert_eq!(TaskFacts::unknown().had_swallowed_error(), None);
+///
+/// // `unknown()` is an unknown CONTRIBUTOR, never a fold identity: it ABSORBS.
+/// // Merging it into an observed-clean fact NULLS the observation — the clean
+/// // `Some(false)` draw and truncation read back unknown (`None | Some(false) =
+/// // None`), and the reproducibility promise goes with them. Fold a sequence
+/// // with `TaskFacts::fold` instead of ever reusing `unknown()` as a seed.
+/// let mut clean = TaskFacts::observed_clean();
+/// assert!(clean.is_reproducible_under(false));
+/// clean.merge(&TaskFacts::unknown());
+/// assert_eq!(clean.drew_from_rng(), None, "unknown() absorbed the observation");
+/// assert_eq!(clean.early_stopped(), None);
+/// assert!(!clean.is_reproducible_under(false), "and flipped reproducibility");
 /// ```
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -307,7 +328,8 @@ pub struct TaskFacts {
   /// post-consolidation): `Some(true)`/`Some(false)` is a decode that OBSERVED
   /// whether it drew, `None` a record that cannot know (an options-only
   /// [`Provenance::from_options`](crate::provenance::Provenance::from_options),
-  /// or the [`Self::unknown`] merge identity). A `false` and an unknown are NOT
+  /// or a hand-built [`Self::unknown`] — an unknown contributor, not a merge
+  /// identity). A `false` and an unknown are NOT
   /// the same fact: [`Self::is_reproducible_under`] trusts an observed
   /// `Some(false)` (deterministic) but treats `None` conservatively.
   ///
@@ -714,6 +736,44 @@ impl TaskFacts {
     // fold, which threw away a dropped chunk's siblings' KNOWN ordinals and left a
     // staged re-merge unable to recover them.
     self.decoded_span = self.decoded_span.merge(other.decoded_span);
+  }
+
+  /// Folds a sequence of `contributors` into one record under [the merge
+  /// law](Self::merge) — the **reachable** form of the crate's internal
+  /// contributor fold (codex round 15), so a consumer aggregating facts no
+  /// longer has to reach for [`Self::unknown`] as a fold seed (which, being
+  /// ABSORBING, would null the first observed `Some(false)`; see
+  /// [`Self::unknown`] and the type-level example).
+  ///
+  /// It seeds from the honest "no contributor yet" identity (the private
+  /// accumulator, not `unknown()`), takes the **first** contributor VERBATIM,
+  /// and merges each subsequent one, so:
+  ///
+  /// - an **empty** fold yields [`Self::unknown`] — the correct "nothing was
+  ///   observed" answer for zero contributors;
+  /// - a **one-element** fold returns that contributor unchanged — no
+  ///   `unknown()` seed nulls its observed booleans;
+  /// - every grouping agrees, because [the merge](Self::merge) is associative.
+  ///
+  /// ```
+  /// use whisperkit::task_facts::TaskFacts;
+  ///
+  /// // The empty fold IS the identity: it yields unknown().
+  /// let no_contributors: [&TaskFacts; 0] = [];
+  /// assert_eq!(TaskFacts::fold(no_contributors), TaskFacts::unknown());
+  ///
+  /// // A one-element fold returns the contributor verbatim — the observed-clean
+  /// // `Some(false)` a bare `unknown()` seed would have nulled survives intact.
+  /// let clean = TaskFacts::observed_clean().with_worker(0);
+  /// assert_eq!(TaskFacts::fold([&clean]), clean);
+  /// ```
+  #[must_use]
+  pub fn fold<'a>(contributors: impl IntoIterator<Item = &'a Self>) -> Self {
+    let mut accumulator = TaskFactsAccumulator::new();
+    for contributor in contributors {
+      accumulator.merge(contributor);
+    }
+    accumulator.into_facts()
   }
 
   /// Whether a transcript carrying these facts can be reproduced byte-for-byte

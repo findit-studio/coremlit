@@ -156,6 +156,44 @@ fn accumulator_empty_is_the_fold_identity() {
 }
 
 #[test]
+fn fold_exposes_the_reachable_contributor_fold_identity() {
+  // Codex round 15: `TaskFacts::fold` is the PUBLIC, reachable form of the
+  // private `TaskFactsAccumulator` — the correct fold pattern the docs now point
+  // callers at, instead of the ABSORBING `unknown()`. Its two invariants are the
+  // accumulator's: an EMPTY fold yields `unknown()` (the honest "nothing
+  // observed"), and a ONE-element fold returns that contributor VERBATIM, never
+  // nulled by an `unknown()` seed.
+  let no_contributors: [&TaskFacts; 0] = [];
+  assert_eq!(
+    TaskFacts::fold(no_contributors),
+    TaskFacts::unknown(),
+    "an empty fold is unknown(), not observed-clean",
+  );
+  for x in corpus() {
+    assert_eq!(
+      TaskFacts::fold([&x]),
+      x,
+      "a one-element fold returns the contributor verbatim",
+    );
+  }
+  // And a multi-element fold agrees with the internal accumulator's left-fold --
+  // the exact shape `merge_results` relies on -- so the reachable helper and the
+  // private sink can never drift.
+  for a in &corpus() {
+    for b in &corpus() {
+      let mut acc = TaskFactsAccumulator::new();
+      acc.merge(a);
+      acc.merge(b);
+      assert_eq!(
+        TaskFacts::fold([a, b]),
+        acc.into_facts(),
+        "fold([a, b]) == the accumulator left-fold for a={a:?} b={b:?}",
+      );
+    }
+  }
+}
+
+#[test]
 fn unknown_is_not_the_merge_identity_for_an_observed_clean_fact() {
   // The round-8 correction. Under the Kleene OR, `Some(false)` -- not `None` --
   // is the boolean identity, so folding the all-`None` `unknown()` onto an
