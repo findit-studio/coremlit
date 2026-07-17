@@ -587,6 +587,114 @@ fn detect_language_pinned_deviation_actually_runs_the_probe() {
 
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn all_masked_probe_does_not_fabricate_language() {
+  // F3 (codex round 14). A valid tokenizer can resolve NO `<|lang|>` tokens
+  // (an English-only vocab paired with a multilingual model, which the loader
+  // never validates), so `LanguageLogitsFilter` masks EVERY entry and the
+  // sampler returns the degenerate token 0 at `-inf`: the probe's `language_probs`
+  // stays EMPTY, proving nothing was sampled. Yet the probe's `"en"` DISPLAY
+  // default was UNCONDITIONALLY promoted to `observed_language`, fabricating a
+  // detection the model never made -- and because language merging is first-wins,
+  // that fabricated `"en"` then SUPPRESSED a genuine later `"es"`. Gate the
+  // promotion on the probe actually having a predicted-language entry; the DISPLAY
+  // language stays the Swift-faithful `"en"`.
+  //
+  // The all-masked probe is forced with an all-`-inf` first scripted step (the
+  // probe's own logits), which after `LanguageLogitsFilter` leaves nothing to
+  // sample regardless of the real tokenizer's language set. The main decode
+  // re-reads that step as its SOT prefill (the sample is discarded), and
+  // `first_token_logprob_threshold` is disabled so the degenerate `-inf` first
+  // token does not early-complete the decode.
+  //
+  // Mutation: drop the `&& !probe.language_probs_slice().is_empty()` gate and the
+  // empty-probs probe promotes `"en"` -- part 1 reads `Some("en")` and part 2's
+  // fabricated `"en"` suppresses the predicted `"es"`, failing both `observed`
+  // assertions.
+  use crate::backend::InferenceBackend;
+  let t = tiny_tokenizer();
+  let s = special();
+  let es = t.token_to_id("<|es|>").unwrap();
+  let hello = t.encode(" Hello").unwrap()[0];
+  let all_masked = |vocab: usize| vec![f32::NEG_INFINITY; vocab];
+
+  // Direct probe check: the all-masked probe samples no language token, so its
+  // `language_probs` is empty and it falls back to the `"en"` DISPLAY default.
+  let mut probe_mock = MockBackend::new();
+  let vocab = probe_mock.dims().vocab();
+  probe_mock.push_step(all_masked(vocab));
+  let features = probe_mock.extract_features(&[0.0f32; 16]).unwrap();
+  let encoded = probe_mock.encode(&features).unwrap();
+  let mut state = probe_mock.new_decoder_state().unwrap();
+  let mut sampler = GreedyTokenSampler::new(0.0, s.end_token(), &DecodingOptions::new());
+  let mut timings = TranscriptionTimings::new();
+  let probe = decode::detect_language(
+    &probe_mock,
+    &encoded,
+    &mut state,
+    &t,
+    &mut sampler,
+    &mut timings,
+  )
+  .unwrap();
+  assert!(
+    probe.language_probs_slice().is_empty(),
+    "an all-masked probe sampled no language token, so it recorded no probability"
+  );
+  assert_eq!(
+    probe.language(),
+    crate::constants::DEFAULT_LANGUAGE_CODE,
+    "with nothing sampled the probe reports the Swift-faithful \"en\" DISPLAY default"
+  );
+
+  let options = DecodingOptions::new()
+    .with_detect_language()
+    .with_without_timestamps()
+    .maybe_first_token_logprob_threshold(None);
+
+  // Part 1 -- an all-masked probe, then a plain text decode: the display language
+  // is the `"en"` default, but nothing was OBSERVED.
+  let mut mock_a = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  let vocab_a = mock_a.dims().vocab();
+  mock_a.push_step(all_masked(vocab_a)); // probe step (re-read as the decode's SOT prefill)
+  mock_a.push_token_steps(&[2425, 2425, hello, s.end_token()]);
+  let result_a = TranscribeTask::new(&mock_a, &t)
+    .run(&vec![0.1; 32_000], &options)
+    .unwrap();
+  assert_eq!(
+    result_a.language(),
+    crate::constants::DEFAULT_LANGUAGE_CODE,
+    "the display language is the Swift-faithful \"en\" default"
+  );
+  assert_eq!(
+    result_a.task_facts().observed_language(),
+    None,
+    "an all-masked probe observed nothing, so no language may be recorded"
+  );
+
+  // Part 2 -- the same all-masked probe, but the decode then PREDICTS `<|es|>`:
+  // the observation must be the genuine `"es"`, no longer suppressed by a
+  // fabricated `"en"`.
+  let mut mock_b = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  let vocab_b = mock_b.dims().vocab();
+  mock_b.push_step(all_masked(vocab_b));
+  mock_b.push_token_steps(&[2425, 2425, es, s.end_token()]);
+  let result_b = TranscribeTask::new(&mock_b, &t)
+    .run(&vec![0.1; 32_000], &options)
+    .unwrap();
+  assert_eq!(
+    result_b.language(),
+    crate::constants::DEFAULT_LANGUAGE_CODE,
+    "the display language is still the forced-prefill \"en\""
+  );
+  assert_eq!(
+    result_b.task_facts().observed_language(),
+    Some("es"),
+    "the genuinely predicted \"es\" is the observation, not a fabricated \"en\""
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn genuine_observation_survives_a_later_failed_probe() {
   // F2 (codex round 4), opposite direction of the zero-iteration bug. Window
   // 1's probe genuinely detects Spanish; window 2's probe FAILS. A failed

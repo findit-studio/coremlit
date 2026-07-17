@@ -971,12 +971,21 @@ where
           Ok(probe) => {
             window_options.set_language(probe.language().to_string());
             *detected_language = Some(probe.language().to_string());
-            // A probe that ran IS a genuine detection (the observation), even
-            // when it fell back to the default language. FIRST genuine
-            // observation wins (matching the merge rule from round 3), so an
-            // earlier window's or attempt's observation is never overwritten
-            // by a later probe (F2, codex round 4).
-            if observed_language.is_none() {
+            // A probe that actually SAMPLED a language token IS a genuine
+            // detection (the observation), even when the sampled code fell back
+            // to the display default. But an all-masked probe -- a valid
+            // tokenizer with no `<|lang|>` entries makes `LanguageLogitsFilter`
+            // mask everything, so the sampler returns the degenerate token 0 at
+            // `-inf` and the probe's `language_probs` stays EMPTY -- sampled
+            // NOTHING; promoting its `"en"` DISPLAY default fabricates an
+            // observation the model never made, which first-wins merging then
+            // lets SUPPRESS a genuine later `"es"` (F3, codex round 14). Gate on
+            // the probe having a predicted-language entry, exactly the invariant
+            // `decode::decode_text` already holds for a decode's own prediction
+            // (`decode/tests.rs`). FIRST genuine observation wins (the round-3
+            // merge rule), so an earlier window's or attempt's observation is
+            // never overwritten by a later probe (F2, codex round 4).
+            if observed_language.is_none() && !probe.language_probs_slice().is_empty() {
               *observed_language = Some(probe.language().to_string());
             }
           }
