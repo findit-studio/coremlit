@@ -191,9 +191,15 @@ impl GreedyTokenSampler {
   /// writes for a suppressed token) as a mask rather than a number: it stays
   /// `-inf` (probability 0) whatever the sign of `temperature`, so a negative
   /// temperature cannot flip `-inf * (1 / temperature)` to `+inf` and turn a
-  /// suppressed token into the most-probable one (F1, codex round 4). A finite
-  /// logit whose scaled value overflows under a near-zero temperature is
-  /// clamped back into range, keeping the `# Panics` contract below true.
+  /// suppressed token into the most-probable one (F1, codex round 4). When a
+  /// near-zero temperature would overflow a finite logit's scaled value
+  /// (`1 / temperature` or `v / temperature` past the f32 range), the scaled
+  /// form collapses distinct logits to one endpoint, so scaling instead falls
+  /// back to a stable-difference softmax `(logit − stab) / temperature` that
+  /// keeps the ordering — the argmax (at a positive temperature; the argmin at
+  /// a negative one) taking probability 1 and logprob 0, every other distinct
+  /// logit −∞ — while ordinary temperatures keep the scaled softmax bit-for-bit
+  /// (F1, codex round 14). Either way `# Panics` below stays true.
   ///
   /// A `top_k` configured above `logits.len()` is clamped to it (Swift's
   /// BNNS path has no defined behavior for that misconfiguration — `try!
@@ -240,46 +246,87 @@ impl GreedyTokenSampler {
       // (probability 0) whatever the sign of `inv_t`. Scaling it directly is
       // the F1 bug (codex round 4): a NEGATIVE temperature turns `-inf * inv_t`
       // into `+inf`, so the masked index becomes the single largest scaled
-      // value, the stabilizer subtraction below yields `+inf - +inf = NaN`
-      // across the whole vector, and `random_range` panics on the NaN range.
-      // A FINITE logit whose scaled value overflows under a near-zero
-      // temperature (`1/T` or `v/T` past the f32 range, or the `0 * inf` NaN
-      // when `1/T` itself overflowed) is clamped to the finite extremes /
-      // mapped to its true scaled value, so `sample` keeps its documented
-      // "panics only on empty logits" contract.
-      let scale = |v: f32| -> f32 {
-        if v == f32::NEG_INFINITY {
-          return f32::NEG_INFINITY; // mask: excluded at any temperature sign.
-        }
-        let scaled = v * inv_t;
-        if scaled.is_nan() {
-          // `0 * ±inf`, the only NaN a finite logit produces here (a subnormal
-          // temperature drove `inv_t` non-finite). The scaled value `0 / T` is
-          // `0` for every nonzero `T`, so that is the mathematically correct
-          // answer, not an arbitrary sentinel.
-          0.0
-        } else {
-          scaled.clamp(f32::MIN, f32::MAX) // clamp ±inf overflow to finite.
-        }
-      };
-      // Stabilize on the max of the FINITE scaled values. Masks stay `-inf` so
-      // they never win this max (and the fully-masked buffer already returned
-      // above), while every finite-origin logit maps to a finite scaled value
-      // — so `scaled_max` is always finite and `exp(scaled - scaled_max)` can
-      // never form `inf - inf`. For `inv_t > 0` with no overflow this is
-      // bit-identical to the pre-fix `max(v * inv_t)`, leaving
-      // positive-temperature draws unchanged.
-      let scaled_max = logits
+      // value.
+      //
+      // A near-zero temperature is a second F1 failure the per-entry clamp
+      // hides (codex round 14): `1/T` (or a finite `v/T`) leaves the f32 range,
+      // so the clamp maps EVERY same-sign finite logit to the same endpoint and
+      // `scale(v) - scaled_max` is `0` for all of them — a UNIFORM draw over
+      // distinct logits, which flips the token and reports `ln(1/n)` where the
+      // limit is `0`. That saturation is exactly the set of FINITE logits whose
+      // `v * inv_t` overflows; when any does, take a stable-difference softmax
+      // that subtracts the stabilizer LOGIT *before* dividing by `temperature`
+      // (`(v - stab) / temperature`), which stays order-preserving and free of
+      // the `finite * inf` / `inf - inf` the scaled form produces. ORDINARY
+      // temperatures never saturate and keep the exact arithmetic below,
+      // bit-for-bit — the Swift-parity path the sampler goldens pin.
+      let saturates = logits
         .iter()
-        .copied()
-        .map(scale)
-        .fold(f32::NEG_INFINITY, f32::max);
+        .any(|&v| v.is_finite() && !(v * inv_t).is_finite());
       let mut sum = 0.0f32;
-      self.probs.extend(logits.iter().map(|&v| {
-        let e = (scale(v) - scaled_max).exp();
-        sum += e;
-        e
-      }));
+      if saturates {
+        // The stabilizer is the logit whose scaled value `v / temperature` is
+        // largest — the MAX finite logit at a positive temperature, the MIN at
+        // a negative one (dividing by a negative reverses the order). Masks
+        // (`-inf`) and any NaN are never the stabilizer and stay excluded. Then
+        // `(v - stab) / temperature` is `0` for the stabilizer (mass `1`,
+        // logprob `0`) and `-inf` for every other distinct finite logit (mass
+        // `0`, logprob `-inf`) — the true softmax limit as `temperature → 0`,
+        // computed with no overflow (`0 / T` and `finite / T` never form a NaN).
+        let stab = if self.temperature > 0.0 {
+          logits
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(f32::NEG_INFINITY, f32::max)
+        } else {
+          logits
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(f32::INFINITY, f32::min)
+        };
+        self.probs.extend(logits.iter().map(|&v| {
+          let e = if v.is_finite() {
+            ((v - stab) / self.temperature).exp()
+          } else {
+            0.0 // mask (or a NaN backend logit): excluded from the distribution.
+          };
+          sum += e;
+          e
+        }));
+      } else {
+        // ORDINARY temperature: `v * inv_t` stays in range for every finite
+        // logit, so this is the pre-fix scaled softmax unchanged — masks scale
+        // to `-inf`, and `scale(v) - scaled_max` is numerically stable because
+        // `scaled_max` is the max of the finite scaled values. Bit-identical to
+        // the code the sampler parity goldens pin (F1, codex round 14).
+        let scale = |v: f32| -> f32 {
+          if v == f32::NEG_INFINITY {
+            return f32::NEG_INFINITY; // mask: excluded at any temperature sign.
+          }
+          let scaled = v * inv_t;
+          if scaled.is_nan() {
+            // `0 * ±inf`, the only NaN a finite logit produces here (a subnormal
+            // temperature drove `inv_t` non-finite — unreachable now that such a
+            // temperature routes to the stable path above, but kept so this
+            // branch remains a total, self-contained scaling of any input).
+            0.0
+          } else {
+            scaled.clamp(f32::MIN, f32::MAX)
+          }
+        };
+        let scaled_max = logits
+          .iter()
+          .copied()
+          .map(scale)
+          .fold(f32::NEG_INFINITY, f32::max);
+        self.probs.extend(logits.iter().map(|&v| {
+          let e = (scale(v) - scaled_max).exp();
+          sum += e;
+          e
+        }));
+      }
 
       // Indices of the top-k entries by (unnormalized) probability: a
       // partition instead of a full sort, since only top-k membership and

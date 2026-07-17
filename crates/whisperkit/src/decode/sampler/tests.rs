@@ -253,6 +253,47 @@ fn tiny_temperature_overflow_sample_without_panic_or_nan() {
 }
 
 #[test]
+fn tiny_temperature_preserves_rank_and_logprob() {
+  // F1 (codex round 14). At a subnormal temperature `1 / temperature` (or a
+  // scaled logit) overflows f32; the pre-fix per-entry clamp then mapped every
+  // same-sign finite logit to the SAME endpoint, so the stabilized softmax was
+  // uniform over all of them. Concretely `[5.0, 20.0]` at `1e-40` clamped both
+  // to `f32::MAX`, drew `[0.5, 0.5]`, and returned `ln(0.5)` for whichever token
+  // it picked -- a possibly-wrong token, and a certainly-wrong logprob where the
+  // limit is `0`. The overflow-only stable-difference path preserves order: the
+  // temperature-sign-appropriate extreme takes probability 1 (logprob → 0) and
+  // every other distinct finite logit collapses to probability 0 (logprob −∞),
+  // independent of the seed. The existing
+  // `tiny_temperature_overflow_sample_without_panic_or_nan` still pins the
+  // no-panic / no-NaN contract this rank/logprob check sits on top of.
+  //
+  // Mutation: revert `sample` to the naive `(v * inv_t) - scaled_max` scaling
+  // (drop the `saturates` stable path) and BOTH `±1e-40` blocks fail -- the draw
+  // becomes uniform, so the token is seed-dependent and the logprob is `ln(1/n)`.
+  let logits = [5.0f32, 20.0, -3.0, 12.0]; // distinct, finite; argmax = 1, argmin = 2
+  for &(temperature, winner) in &[(1e-40f32, 1u32), (-1e-40f32, 2)] {
+    for seed in 0..8u64 {
+      // eot_token 3 is neither the argmax nor the argmin, so `completed` stays
+      // false whichever extreme wins.
+      let mut sampler =
+        GreedyTokenSampler::new(temperature, 3, &DecodingOptions::new()).with_seed(seed);
+      let result = sampler.sample(&logits);
+      assert_eq!(
+        result.token(),
+        winner,
+        "t={temperature}, seed={seed}: the order-preserving extreme must win, not a uniform draw"
+      );
+      assert!(
+        result.logprob().abs() < 1e-6,
+        "t={temperature}, seed={seed}: the point-mass winner's logprob → 0, got {}",
+        result.logprob()
+      );
+      assert!(!result.completed(), "t={temperature}, seed={seed}");
+    }
+  }
+}
+
+#[test]
 #[should_panic(expected = "non-empty logits")]
 fn empty_logits_panic() {
   greedy(0.0).sample(&[]);
