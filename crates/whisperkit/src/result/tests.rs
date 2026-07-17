@@ -418,19 +418,25 @@ fn drop_on_merge_is_associative_with_mixed_tracked_and_untracked_spans() {
   // 1, exact span 1]` must renumber IDENTICALLY one-shot vs. staged (the round-6 F1
   // defect renumbered them differently).
   //
-  // ORACLE CORRECTION (codex round 12): the pre-round-12 fold ABSORBED the whole
-  // aggregate to `None` the moment the wholly-unknown child `a` participated, so
-  // the stored span read back `None` and only the read-time extent floor kept the
-  // ids right. Under the `SpanKnowledge` sum an unknown child no longer erases its
-  // known siblings: `AtLeast(0) + Exact(1) + Exact(1) = AtLeast(2)`, so the stored
-  // span carries the KNOWN lower bound and the ids stay `[0, 1, 2]` in every
-  // grouping BY CONSTRUCTION — the read-time floor over `a`'s own survivor extent
-  // only lifts `a`'s advance to 1, and the associative sum carries the rest.
+  // ORACLE CORRECTION (codex round 13, M1): the stored span now carries the SAME
+  // survivor floor the ids advanced by. `a` is a public `new` result — a survivor
+  // at local id 0 but a WHOLLY-UNKNOWN carried span (`AtLeast(0)`) — so its
+  // survivor proves >= 1 allocated ordinal that its raw `AtLeast(0)` does not state.
+  // The drop-ON fold folds `a`'s EFFECTIVE span (that raw bound floored at its own
+  // survivor extent, `AtLeast(0)` -> `AtLeast(1)`), the very value `a`'s id-base
+  // advance used, so the aggregate is `AtLeast(1) + Exact(1) + Exact(1) =
+  // AtLeast(3)` — the survivors' true lower bound, in EVERY grouping. The
+  // pre-round-13 raw-`SpanKnowledge` fold stored `AtLeast(2)` here (`AtLeast(0) +
+  // Exact(1) + Exact(1)`), discarding `a`'s survivor floor even as the ids committed
+  // to it; the round-12 read-time floor still kept THESE ids `[0, 1, 2]` (b/c's
+  // small exact spans let the intermediate's survivor extent recover the lost
+  // floor), but a sparser sibling span defeats that recovery — see
+  // `drop_on_merge_staging_materializes_unknown_survivor_floor_before_sparse_span`.
   //
-  // Mutation proof: revert `SpanKnowledge::merge`'s `AtLeast` arm to the absorbing
-  // `_ => None` and the stored-span assertions read back the wholly-unknown
-  // `AtLeast(0)` instead of the `AtLeast(1)`/`AtLeast(2)` bounds (the ids stay
-  // `[0, 1, 2]`, carried by the read-time floor either way).
+  // Mutation proof: revert the drop-ON fold to fold the RAW carried spans (drop the
+  // `with_decoded_span(effective_span_knowledge(...))` substitution) and the stored
+  // spans read back `AtLeast(2)`/`AtLeast(1)`/`AtLeast(2)` — `a`'s survivor floor
+  // discarded from the stored fact (the ids stay `[0, 1, 2]` either way here).
   let opts = DecodingOptions::new(); // drop ON (the default)
   // A: a public `new` result — one surviving segment (local id 0), span
   // WHOLLY UNKNOWN (`AtLeast(0)`), the documented contract of the public constructor.
@@ -457,17 +463,18 @@ fn drop_on_merge_is_associative_with_mixed_tracked_and_untracked_spans() {
   );
   assert_eq!(
     one_shot.task_facts().decoded_span(),
-    SpanKnowledge::AtLeast(2),
-    "the known siblings survive as the aggregate's lower bound (round 12), never \
-     absorbed away to `AtLeast(0)`",
+    SpanKnowledge::AtLeast(3),
+    "the stored fact carries `a`'s survivor floor the ids advanced by (round 13, M1): \
+     `AtLeast(1) + Exact(1) + Exact(1)`, not the raw `AtLeast(2)`",
   );
 
   // Staged: merge [a, b], then re-merge that with c.
   let ab = merge_transcription_results_with_options(&[a, b], &opts);
   assert_eq!(
     ab.task_facts().decoded_span(),
-    SpanKnowledge::AtLeast(1),
-    "the intermediate carries the known sibling's ordinal as its lower bound",
+    SpanKnowledge::AtLeast(2),
+    "the intermediate carries `a`'s survivor floor plus b's ordinal (round 13, M1): \
+     `AtLeast(1) + Exact(1)`, not the raw `AtLeast(1)`",
   );
   let staged = merge_transcription_results_with_options(&[ab, c], &opts);
   assert_eq!(
@@ -483,8 +490,94 @@ fn drop_on_merge_is_associative_with_mixed_tracked_and_untracked_spans() {
   );
   assert_eq!(
     staged.task_facts().decoded_span(),
-    SpanKnowledge::AtLeast(2)
+    SpanKnowledge::AtLeast(3),
+    "the staged store matches the one-shot's `AtLeast(3)` — associative, and now \
+     carrying the survivor floor in the stored fact (round 13, M1)",
   );
+}
+
+#[test]
+fn drop_on_merge_staging_materializes_unknown_survivor_floor_before_sparse_span() {
+  // THE round-13 M1 regression. A drop-ON merge derives each child's id
+  // contribution from its EFFECTIVE span — the carried span floored at its own
+  // survivor extent — but before round 13 it STORED only the raw carried sum,
+  // discarding the survivor floor the ids had already committed to. A staged
+  // re-merge then read that under-count back and, when a sibling's SPARSE span put
+  // the survivor extent out of the read-time floor's reach, renumbered a trailing
+  // chunk onto an id the one-shot merge had left free.
+  //
+  // The reachable history (public/hand-built, all with drop_blank_audio = true):
+  //   A -- a survivor at local id 0, span `AtLeast(0)` (the public `new` default):
+  //        its survivor proves >= 1 ordinal its wholly-unknown span does not state;
+  //   B -- a survivor at local id 0, span `Exact(5)`: five ordinals allocated, only
+  //        id 0 surviving a filter (a legitimate carried-span-exceeds-extent shape);
+  //   T -- a trailing survivor at local id 0, span `Exact(1)`.
+  // A's effective span is `AtLeast(1)` (its `AtLeast(0)` floored at extent 1), so a
+  // one-shot `merge([A, B, T])` advances the id base 1 (A) then 5 (B) and lands T at
+  // id 6 -> `[0, 1, 6]`, storing `AtLeast(1) + Exact(5) + Exact(1) = AtLeast(7)`.
+  //
+  // Pre-round-13 the left-staged intermediate `merge([A, B])` stored the RAW
+  // `AtLeast(0) + Exact(5) = AtLeast(5)`, losing A's survivor floor; its own two
+  // survivors span only extent 2, so the read-time floor (`max(5, 2) = 5`) could NOT
+  // recover the lost ordinal, and re-merging with T landed it at id 5 -> `[0, 1, 5]`,
+  // diverging from the one-shot `[0, 1, 6]` and storing `AtLeast(6)`. Folding the
+  // EFFECTIVE span into the store makes the intermediate carry `AtLeast(6)`, so every
+  // grouping numbers T at 6 and stores `AtLeast(7)`.
+  //
+  // Mutation proof: revert the drop-ON fold to fold the RAW carried spans (drop the
+  // `with_decoded_span(effective_span_knowledge(...))` substitution) and the
+  // left-staged grouping's ids read back `[0, 1, 5]` and its stored span
+  // `AtLeast(6)`, failing the equalities below.
+  let opts = DecodingOptions::new(); // drop ON (the default)
+  let a = || {
+    let mut seg = TranscriptionSegment::new();
+    seg.set_id(0).set_text(" A").set_tokens(vec![20]);
+    // Public `new`: one survivor, span WHOLLY UNKNOWN (`AtLeast(0)`).
+    TranscriptionResult::new(" A", vec![seg], "en", TranscriptionTimings::new())
+  };
+  let b = || {
+    let mut seg = TranscriptionSegment::new();
+    seg.set_id(0).set_text(" B").set_tokens(vec![21]);
+    // Five ordinals allocated, four filtered away — a carried span that legitimately
+    // EXCEEDS its survivor extent of 1.
+    TranscriptionResult::new(" B", vec![seg], "en", TranscriptionTimings::new())
+      .with_task_facts(TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(5)))
+  };
+  let t = || span_one_speech(22); // trailing survivor at local id 0, Exact(1)
+
+  let one_shot = merge_transcription_results_with_options(&[a(), b(), t()], &opts);
+  let left_staged = merge_transcription_results_with_options(
+    &[
+      merge_transcription_results_with_options(&[a(), b()], &opts),
+      t(),
+    ],
+    &opts,
+  );
+  let right_staged = merge_transcription_results_with_options(
+    &[
+      a(),
+      merge_transcription_results_with_options(&[b(), t()], &opts),
+    ],
+    &opts,
+  );
+
+  for (label, merged) in [
+    ("one-shot", &one_shot),
+    ("left-staged", &left_staged),
+    ("right-staged", &right_staged),
+  ] {
+    assert_eq!(
+      segment_ids(merged),
+      vec![0, 1, 6],
+      "{label}: the trailing chunk sits past A's survivor floor and B's five ordinals",
+    );
+    assert_eq!(
+      merged.task_facts().decoded_span(),
+      SpanKnowledge::AtLeast(7),
+      "{label}: the stored fact carries the survivor floor the ids materialized \
+       (`AtLeast(1) + Exact(5) + Exact(1)`), grouping-independent",
+    );
+  }
 }
 
 #[test]
@@ -593,7 +686,7 @@ fn drop_on_merge_still_panics_on_a_usize_max_segment_id() {
   // hand-built `usize::MAX` id remains the documented DELIBERATE panic (it beats
   // a silent wraparound into a colliding id). F4 loosened ONLY the drop-OFF fold,
   // never this: the id-base advance turns the checked `None` span back into the
-  // same overflow panic the pre-fix `effective_decoded_span` raised.
+  // same overflow panic the pre-fix `effective_span_knowledge` raised.
   let mut seg = TranscriptionSegment::new();
   seg.set_id(usize::MAX).set_text(" X").set_tokens(vec![20]);
   let adversarial = TranscriptionResult::new(" X", vec![seg], "en", TranscriptionTimings::new());
@@ -609,12 +702,12 @@ fn a_merge_created_span_never_undercounts_its_own_survivors() {
   // known ordinal to lower-bound the aggregate with.
   //
   // The "never under-count its survivors" GUARANTEE is unchanged: it lives in the
-  // read-time `effective_decoded_span`, which floors the stored span's lower bound
+  // read-time `effective_span_knowledge`, which floors the stored span's lower bound
   // at the survivors' own extent (max id 1 + 1 = 2). So a staged drop-ON re-merge
   // still advances its id base by 2 and renumbers `C` past the survivors — `[0, 1,
   // 2]`, never `[0, 1, 1]`.
   //
-  // Mutation proof: revert `effective_decoded_span`'s `.max(extent)` (or its
+  // Mutation proof: revert `effective_span_knowledge`'s `.max(extent)` (or its
   // `checked_add(1)`) and the staged ids collapse to `[0, 1, 1]`.
   let mut a_seg = TranscriptionSegment::new();
   a_seg.set_id(usize::MAX).set_text(" A").set_tokens(vec![20]);
@@ -759,11 +852,11 @@ fn a_public_results_too_small_span_is_distrusted_at_merge_input() {
   // carried span is below its survivor extent — a hand-built or deserialized
   // inconsistency — must not be trusted at merge INPUT: two survivors `[0, 1]`
   // (extent 2) carrying `Exact(1)` would, if believed, advance the drop-ON id base
-  // by only 1 and renumber a trailing chunk onto id 1. `effective_decoded_span`
+  // by only 1 and renumber a trailing chunk onto id 1. `effective_span_knowledge`
   // floors the carried span's lower bound at the survivor extent, keeping the
   // merge injective.
   //
-  // Mutation proof: revert `effective_decoded_span` to trust the carried lower
+  // Mutation proof: revert `effective_span_knowledge` to trust the carried lower
   // bound verbatim (drop the `.max(extent)`) and the staged ids collapse to
   // `[0, 1, 1]`.
   let mut s0 = TranscriptionSegment::new();

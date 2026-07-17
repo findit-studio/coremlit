@@ -29,7 +29,7 @@
 use crate::{
   constants::DEFAULT_LANGUAGE_CODE,
   options::DecodingOptions,
-  task_facts::{TaskFacts, TaskFactsAccumulator},
+  task_facts::{SpanKnowledge, TaskFacts, TaskFactsAccumulator},
 };
 
 pub mod writer;
@@ -2484,48 +2484,66 @@ pub fn merge_transcription_results_with_options(
   merge_results(results, options.drop_blank_audio())
 }
 
-/// The number of segment-id ordinals a result's decode **consumed** for the
-/// merge's id assignment: the **larger** of the carried [`TaskFacts::decoded_span`]'s
-/// [known lower bound](crate::task_facts::SpanKnowledge::lower_bound) and the
-/// survivors' own extent — `max local id + 1`, or `0` when none survived. A
-/// carried span legitimately EXCEEDS the extent when a filter dropped ordinals
-/// after allocating them (the whole reason it is carried), but a carried lower
-/// bound BELOW the extent under-counts — a hand-built or deserialized
-/// inconsistency — so the extent is the trusted floor, never blindly the carried
-/// value (F2, codex round 9). A
-/// [wholly-unknown](crate::task_facts::SpanKnowledge::wholly_unknown) span
-/// (`AtLeast(0)`) has a lower bound of `0` and so relies on the extent outright.
+/// Each child's **effective** span knowledge for the drop-ON merge: its carried
+/// [`TaskFacts::decoded_span`] **floored by its own survivors' extent** — `max
+/// local id + 1`, or `0` when none survived. This is the round-9 F2 trust rule
+/// lifted from a bare number to a [`SpanKnowledge`](crate::task_facts::SpanKnowledge):
+/// a carried bound legitimately EXCEEDS the extent when a filter dropped ordinals
+/// after allocating them (the whole reason it is carried), but a carried bound
+/// BELOW the extent under-counts — a hand-built or deserialized inconsistency —
+/// so the extent is the trusted floor, never blindly the carried value.
+///
+/// - [`Exact(n)`](crate::task_facts::SpanKnowledge::Exact) stays `Exact(n)` when
+///   the extent does not exceed `n`; when the survivors OUT-count `n` the exact
+///   claim is contradicted, so it degrades to `AtLeast(extent)` — a bound, no
+///   longer a fabricated exact total.
+/// - [`AtLeast(k)`](crate::task_facts::SpanKnowledge::AtLeast) floors to
+///   `AtLeast(max(k, extent))`; a [wholly-unknown](crate::task_facts::SpanKnowledge::wholly_unknown)
+///   `AtLeast(0)` therefore relies on the extent outright.
+///
+/// This ONE value drives BOTH the drop-ON id-base advance AND the drop-ON stored
+/// fold (codex round 13, M1): the base advances by its
+/// [lower bound](crate::task_facts::SpanKnowledge::lower_bound), and the merged
+/// result STORES the fold of these same effective spans — so every staging
+/// materializes the same floors at the same points and the stored fact after any
+/// partial merge carries them. Folding the RAW carried spans instead left the
+/// store staging-dependent: a left-staged `merge([merge([A, B]), T])` stored a
+/// bound below the floors the one-shot ids had already committed to, so a further
+/// re-merge (its survivor extent too small to recover the lost floor) renumbered a
+/// trailing chunk onto an id the one-shot merge left free.
 ///
 /// **`None` when the survivors' extent overflows `usize`** (a hand-built segment
-/// id at [`usize::MAX`]): the span is then unknowable and no finite carried bound
-/// can be trusted to cover it, so a checked `None` lets the drop-OFF task-facts
-/// fold record an untracked span rather than panicking on a path that never needs
-/// the span for ids (codex round 8, F4).
-///
-/// Read-time ONLY, and it never feeds the STORED fact (codex round 11, preserved
-/// under round 12): the merge sums the RAW
-/// [`SpanKnowledge`](crate::task_facts::SpanKnowledge) lower bounds, so the
-/// stored span is grouping-independent, while this floor keeps a re-merge's id
-/// base from under-counting the survivors it is renumbering. The drop-ON id-base
-/// advance turns a `None` here back into the documented `usize::MAX` panic, since
-/// there the span DOES drive an injective id mapping; see
-/// [`merge_transcription_results_with_options`]'s own `# Panics`.
-fn effective_decoded_span(result: &TranscriptionResult) -> Option<usize> {
+/// id at [`usize::MAX`]): the extent is then unrepresentable. At the drop-ON
+/// id-base advance a `None` is the documented DELIBERATE panic — the span there
+/// drives an injective id mapping that cannot proceed past `usize::MAX` without a
+/// colliding wraparound (see [`merge_transcription_results_with_options`]'s own
+/// `# Panics`). The drop-OFF fold never calls this at all: its ids are Swift's
+/// `result_index + segment_index` and never consult the span, so it folds the RAW
+/// carried spans and never touches the overflowing extent (codex round 8, F4).
+fn effective_span_knowledge(result: &TranscriptionResult) -> Option<SpanKnowledge> {
   // The survivors' own extent — `max local id + 1`, `0` when none survived, and
-  // `None` when a `usize::MAX` survivor overflows it (genuinely unknowable).
+  // `None` (propagated out of this function) when a `usize::MAX` survivor
+  // overflows it (genuinely unrepresentable).
   let survivor_extent = match result
     .segments_slice()
     .iter()
     .map(TranscriptionSegment::id)
     .max()
   {
-    None => Some(0),
-    Some(max_local_id) => max_local_id.checked_add(1),
+    None => 0,
+    Some(max_local_id) => max_local_id.checked_add(1)?,
   };
-  // Trust the LARGER of the carried span's known lower bound and the survivors'
-  // extent (F2, codex round 9): the extent is a floor the carried bound may
-  // exceed but must never fall below. `None` only when the extent overflows.
-  survivor_extent.map(|extent| result.task_facts().decoded_span().lower_bound().max(extent))
+  // Floor the carried lower bound at the survivor extent (F2, codex round 9): the
+  // extent is a floor the carried bound may exceed but must never fall below. An
+  // exact count the extent does not out-count stays exact; otherwise the value
+  // degrades to an at-least bound AT the floor rather than a contradicted exact.
+  let carried = result.task_facts().decoded_span();
+  let floored = carried.lower_bound().max(survivor_extent);
+  Some(if carried.is_exact() && floored == carried.lower_bound() {
+    SpanKnowledge::Exact(floored)
+  } else {
+    SpanKnowledge::AtLeast(floored)
+  })
 }
 
 /// The single merge implementation behind [`merge_transcription_results`]
@@ -2590,18 +2608,18 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
       segments.push(segment.clone().with_id(id));
     }
     if skip_empty_texts {
-      // Advance past this chunk's DECODED id window by exactly the span
-      // [`effective_decoded_span`] reports — the carried span's known lower bound,
-      // floored at the survivors' own extent. That floor keeps a re-merge from
-      // under-counting the survivors it is renumbering, while the STORED fact
-      // below keeps the raw [`SpanKnowledge`] lower bound (grouping-independent).
-      // Here — and ONLY here, where the span drives an injective id mapping — a
-      // `None` span (a `usize::MAX` survivor whose extent overflowed) OR an
-      // overflowing base is the documented adversarial-input panic; the drop-OFF
-      // fold, which never uses the span for ids, keeps the checked `None` instead
-      // (codex round 8, F4).
-      id_base = effective_decoded_span(result)
-        .and_then(|span| id_base.checked_add(span))
+      // Advance past this chunk's DECODED id window by exactly the effective
+      // span's lower bound — the carried span floored at the survivors' own extent
+      // ([`effective_span_knowledge`]). That floor keeps a re-merge from
+      // under-counting the survivors it is renumbering, and the STORED fold below
+      // now folds this SAME effective span, so a staged re-merge stores the very
+      // floor it advanced by (codex round 13, M1). Here — and ONLY here, where the
+      // span drives an injective id mapping — a `None` span (a `usize::MAX`
+      // survivor whose extent overflowed) OR an overflowing base is the documented
+      // adversarial-input panic; the drop-OFF fold, which never uses the span for
+      // ids, keeps the checked `None` instead (codex round 8, F4).
+      id_base = effective_span_knowledge(result)
+        .and_then(|span| id_base.checked_add(span.lower_bound()))
         .expect("drop_blank_audio segment-id base overflowed usize (a segment id near usize::MAX)");
     }
   }
@@ -2731,21 +2749,25 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
   //   fallback).
   // - **concatenates** the worker schedules in order, so `[0, 2]` stays distinct
   //   from `[0, 1]` instead of collapsing to the first child's coordinate (R6-F2).
-  // - **sums** each child's STORED span under [`SpanKnowledge::merge`], so the
-  //   merged result stores the RAW aggregate its children carried — checked-add
-  //   over exacts, saturating lower bounds once any child is a mere `AtLeast`.
+  // - folds each child's **span** under [`SpanKnowledge::merge`]. WHICH span it
+  //   folds depends on the id mapping this merge performs (codex round 13, M1):
+  //   * **drop-ON** folds each child's EFFECTIVE span — its carried span floored
+  //     at its own survivor extent ([`effective_span_knowledge`]), the SAME value
+  //     the id-base advanced by — so the stored fact carries the floors the ids
+  //     already committed to, and a staged re-merge numbers identically to a
+  //     one-shot one (R6-F3). Folding the RAW carried spans here instead stored a
+  //     bound BELOW those floors, and a further re-merge whose survivor extent
+  //     could not recover them renumbered a trailing chunk onto a consumed id.
+  //   * **drop-OFF** folds each child's RAW carried span: its ids are Swift's
+  //     `result_index + segment_index` and never consult the span, so the fold
+  //     must not touch the (possibly `usize::MAX`-overflowing) survivor extent
+  //     (codex round 8, F4).
+  //   Either way the sum is checked-add over exacts (an overflow degrades to a
+  //   saturated `AtLeast(usize::MAX)`, never a wrapped or fabricated exact) and
+  //   saturating once any child is a mere `AtLeast`, associative by construction.
   //   Unlike the pre-round-12 absorbing-`None` fold, an unknown child no longer
   //   erases a known sibling's ordinals: `AtLeast(0) + Exact(1) = AtLeast(1)`, so
-  //   the known lower bound survives to drive a staged re-merge's id base. The
-  //   fold NEVER substitutes the read-time [`effective_decoded_span`] extent into
-  //   the stored fact (codex round 11, preserved under round 12) — the stored span
-  //   is the associative sum and is grouping-independent, while the read-time floor
-  //   (applied only at the id-base advance and a re-merge's own advance) stops any
-  //   re-merge under-counting the survivors it renumbers. No post-fold clamp is
-  //   needed: a drop-ON merge's summed lower bounds already dominate its survivor
-  //   extent by construction, and a drop-OFF hand-built under-count is caught by
-  //   that same read-time floor at the next merge, not by materializing an extent
-  //   the grouping cannot agree on.
+  //   the known lower bound survives to drive a staged re-merge's id base.
   //
   // Folded through [`TaskFactsAccumulator`], NOT seeded at `TaskFacts::unknown()`:
   // under the Kleene OR (codex round 8, F2) `unknown()` is no longer the merge
@@ -2755,7 +2777,22 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
   // `results`.
   let mut task_facts = TaskFactsAccumulator::new();
   for result in results {
-    task_facts.merge(result.task_facts());
+    if skip_empty_texts {
+      // Drop-ON: fold the EFFECTIVE span — the floored value this child's id-base
+      // advance used above — so the stored fact materializes the same floors the
+      // ids did and a staged re-merge numbers identically (codex round 13, M1).
+      // The `usize::MAX`-survivor overflow cannot reach here: the id loop above
+      // already panicked on it, so the saturated fallback only keeps this a total
+      // function and never actually materializes on the drop-ON path.
+      let effective =
+        effective_span_knowledge(result).unwrap_or(SpanKnowledge::AtLeast(usize::MAX));
+      task_facts.merge(&result.task_facts().clone().with_decoded_span(effective));
+    } else {
+      // Drop-OFF: fold the RAW carried span; the Swift `result_index +
+      // segment_index` ids never consult it, so the fold must not touch the
+      // (possibly overflowing) survivor extent (codex round 8, F4).
+      task_facts.merge(result.task_facts());
+    }
   }
   let task_facts = task_facts.into_facts();
 
