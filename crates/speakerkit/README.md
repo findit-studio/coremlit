@@ -58,10 +58,17 @@ Feature flags: `dia` (enables `Extraction::into_offline_input`; pulls in the
 `diarization` crate as an **optional git dependency pinned to an exact rev** —
 *not* a path dependency on a sibling checkout, so edits to a local
 `diarization` tree are **not** consumed unless you add the co-dev `[patch]` to
-the workspace-root `Cargo.toml`, see its "CO-DEV RECIPE" comment) and `serde`
-(`Serialize`/`Deserialize` on `Options` and friends). Neither is on by
-default. (A sibling `diarization` checkout is used only as **test data** for
-the model-gated DER gates below, never as the `dia` dependency itself.)
+the workspace-root `Cargo.toml`, see its "CO-DEV RECIPE" comment. The dep is
+`default-features = false`, so `dia` pulls only dia's backend-free offline
+**core** — no ONNX Runtime, no bundled ONNX model — keeping ORT out of
+CoreML-only deployments), `dia-oracle` (a **test-only** superset of `dia` that
+adds dia's own ort inference path, `dia/ort` + `dia/bundled-segmentation`, so
+the end-to-end DER parity suites can measure this crate's CoreML output against
+dia-ort; it is what the `parity_e2e` / `parity_shipping_der` / `generate_goldens`
+binaries compile under, and is never meant for production), and `serde`
+(`Serialize`/`Deserialize` on `Options` and friends). None is on by default. (A
+sibling `diarization` checkout is used only as **test data** for the model-gated
+DER gates below, never as the `dia` dependency itself.)
 
 ## The two model sources
 
@@ -349,8 +356,9 @@ cargo test -p speakerkit -- --ignored
 
 That runs the model-gated segmentation, embedding and argmax suites. It does
 **not** run the end-to-end **DER** gates: `tests/parity_e2e.rs` and
-`tests/parity_shipping_der.rs` are additionally `#![cfg(feature = "dia")]`, so
-without `--features dia` they compile to *nothing* and the sweep above is a
+`tests/parity_shipping_der.rs` are additionally `#![cfg(feature = "dia-oracle")]`
+(they need dia's own ort path as the parity oracle), so without
+`--features dia-oracle` they compile to *nothing* and the sweep above is a
 green run containing **zero** DER tests. Run them explicitly, in **two phases** —
 because `-- --ignored` runs the *ignored* tests **only**, and each DER binary
 also carries an *ordinary* (non-ignored) suite: the DER-math unit tests and the
@@ -363,8 +371,8 @@ Phase 1 — the ordinary (hermetic) suite. No models, no fixtures; run it WITHOU
 `--ignored`:
 
 ```sh
-cargo test -p speakerkit --features dia --test parity_e2e
-cargo test -p speakerkit --features dia --test parity_shipping_der
+cargo test -p speakerkit --features dia-oracle --test parity_e2e
+cargo test -p speakerkit --features dia-oracle --test parity_shipping_der
 ```
 
 Phase 2 — the model-gated end-to-end DER gates (they also need the sibling
@@ -373,9 +381,9 @@ self-provision `libonnxruntime`):
 
 ```sh
 SPEAKERKIT_TEST_MODELS=Models/speakerkit \
-cargo test -p speakerkit --features dia --test parity_e2e -- --ignored
+cargo test -p speakerkit --features dia-oracle --test parity_e2e -- --ignored
 SPEAKERKIT_TEST_MODELS=Models/speakerkit \
-cargo test -p speakerkit --features dia --test parity_shipping_der -- --ignored
+cargo test -p speakerkit --features dia-oracle --test parity_shipping_der -- --ignored
 ```
 
 To confirm those DER gates are actually **compiled** — not silently feature-gated

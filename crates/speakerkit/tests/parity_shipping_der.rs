@@ -141,9 +141,9 @@
 //! `diarization` ONNX + fixtures, and `ort`). Run with:
 //!
 //! ```text
-//! cargo test -p speakerkit --features dia --test parity_shipping_der -- --ignored --nocapture
+//! cargo test -p speakerkit --features dia-oracle --test parity_shipping_der -- --ignored --nocapture
 //! ```
-#![cfg(feature = "dia")]
+#![cfg(feature = "dia-oracle")]
 
 mod common;
 mod der_calc;

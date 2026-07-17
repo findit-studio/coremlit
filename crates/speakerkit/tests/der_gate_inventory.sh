@@ -3,8 +3,9 @@
 # and still #[ignore]d — not silently feature-gated out, deleted, or un-ignored.
 #
 # The DER binaries (`tests/parity_e2e.rs`, `tests/parity_shipping_der.rs`) are
-# `#![cfg(feature = "dia")]`. Without `--features dia` they compile to nothing,
-# so `cargo test -p speakerkit -- --ignored` reports a green sweep containing
+# `#![cfg(feature = "dia-oracle")]` — they need dia's own ort inference path as
+# the parity oracle. Without `--features dia-oracle` they compile to nothing, so
+# `cargo test -p speakerkit -- --ignored` reports a green sweep containing
 # ZERO DER tests. Every load-bearing gate here is ALSO `#[ignore]`d (each needs
 # the gitignored `Models/` tree plus the sibling `diarization` fixtures), and
 # the README drives them with `cargo test ... -- --ignored`.
@@ -58,16 +59,16 @@ check_bin() {
   # (compile noise) dropped. Used only for non-vacuity and to tell a DELETED
   # gate from an UN-IGNORED one. A compile FAILURE still surfaces because
   # `cargo` exits non-zero and the empty list below trips the hard-fail.
-  all="$(cargo test -p speakerkit --features dia --test "${bin}" -- --list 2>/dev/null || true)"
+  all="$(cargo test -p speakerkit --features dia-oracle --test "${bin}" -- --list 2>/dev/null || true)"
   count="$(printf '%s\n' "${all}" | grep -c ': test$' || true)"
   if [ "${count}" -eq 0 ]; then
     echo "  FAIL: 0 tests listed for ${bin} — it compiled to nothing."
-    echo "        (missing --features dia, a broken #![cfg(feature = \"dia\")] gate, or a build error)"
+    echo "        (missing --features dia-oracle, a broken #![cfg(feature = \"dia-oracle\")] gate, or a build error)"
     return 1
   fi
   # `--list --ignored`: the SAME `NAME: test` shape, but restricted to ignored
   # tests. This is what distinguishes an ignored gate from an un-ignored one.
-  ignored="$(cargo test -p speakerkit --features dia --test "${bin}" -- --list --ignored 2>/dev/null || true)"
+  ignored="$(cargo test -p speakerkit --features dia-oracle --test "${bin}" -- --list --ignored 2>/dev/null || true)"
   ignored_count="$(printf '%s\n' "${ignored}" | grep -c ': test$' || true)"
   echo "  ${count} tests listed (${ignored_count} ignored)"
   rc=0
@@ -96,7 +97,7 @@ check_bin() {
 run_ordinary() {
   bin="$1"
   echo "== ${bin} (ordinary suite) =="
-  out="$(cargo test -p speakerkit --features dia --test "${bin}" 2>&1)" || {
+  out="$(cargo test -p speakerkit --features dia-oracle --test "${bin}" 2>&1)" || {
     printf '%s\n' "${out}" | tail -25
     echo "  FAIL: ${bin} ordinary suite did not pass — a hermetic gate (der_calc math or a"
     echo "        mutation-proof pin guard) is red."
@@ -127,8 +128,8 @@ check_ordinary() {
   bin="$1"
   shift
   echo "== ${bin} (required ordinary gates) =="
-  all="$(cargo test -p speakerkit --features dia --test "${bin}" -- --list 2>/dev/null || true)"
-  ignored="$(cargo test -p speakerkit --features dia --test "${bin}" -- --list --ignored 2>/dev/null || true)"
+  all="$(cargo test -p speakerkit --features dia-oracle --test "${bin}" -- --list 2>/dev/null || true)"
+  ignored="$(cargo test -p speakerkit --features dia-oracle --test "${bin}" -- --list --ignored 2>/dev/null || true)"
   rc=0
   for name in "$@"; do
     if ! printf '%s\n' "${all}" | grep -q "^${name}: test$"; then

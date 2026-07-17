@@ -188,16 +188,16 @@
 //! `#[ignore]` (needs the gitignored `Models/speakerkit` +
 //! `Models/argmax-speakerkit` artifacts, the sibling `diarization` ONNX +
 //! fixtures, and `ort`); the DER-calc unit tests need none of that and run
-//! in the ordinary `--features dia` suite. Run the gate with:
+//! in the ordinary `--features dia-oracle` suite. Run the gate with:
 //!
 //! ```text
-//! cargo test -p speakerkit --features dia --test parity_e2e -- --ignored --nocapture
+//! cargo test -p speakerkit --features dia-oracle --test parity_e2e -- --ignored --nocapture
 //! ```
 //!
 //! Part D dominates the runtime (~46 min of audio through three pipelines each,
 //! ~77 min of CPU); its four clips are separate `#[test]`s so cargo's default
 //! thread pool runs them concurrently.
-#![cfg(feature = "dia")]
+#![cfg(feature = "dia-oracle")]
 
 mod common;
 mod der_calc;
@@ -2099,7 +2099,7 @@ stress_gates! {
 
 /// The stress roster is internally consistent and complete — hermetic (only the
 /// compiled-in [`FIXTURE_FACTS`]; no models, no fixtures), so it runs in the
-/// ordinary `--features dia` suite that CI and `der_gate_inventory.sh` execute.
+/// ordinary `--features dia-oracle` suite that CI and `der_gate_inventory.sh` execute.
 ///
 /// Complements the compile-time name↔fixture↔count check in `stress_gates!` with
 /// the two ties a `const` assertion cannot make: each gate's encoded speaker

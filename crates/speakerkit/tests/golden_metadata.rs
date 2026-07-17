@@ -11,7 +11,7 @@
 //! string frozen into the committed goldens is invisible to every other test
 //! until someone runs the `#[ignore]`d regenerator — and under the old
 //! unconditional writer, running it (as the standard `cargo test -p speakerkit
-//! --features dia -- --ignored` gate does) silently REWROTE the oracle.
+//! --features dia-oracle -- --ignored` gate does) silently REWROTE the oracle.
 //!
 //! Exactly that desync landed on this branch: a doc/label correction changed
 //! the generator's `seg_model` string from "raw powerset logits" to
