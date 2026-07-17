@@ -1052,6 +1052,50 @@ fn check_finite_input_rejects_negative_infinity() {
   );
 }
 
+// L1: the input-side scan ALSO rejects a finite f32 whose magnitude overflows
+// f16 (|x| > f16::MAX), which would otherwise narrow to an f16 infinity in
+// `fill_padded_chunk` and reach the segmenter. Only this source narrows to f16,
+// so the bound lives here, not in the shared segment/embed input scans.
+
+#[test]
+fn check_f16_representable_accepts_values_within_f16_range() {
+  // Including the boundary value itself: the bound is |x| > f16::MAX, so
+  // exactly ±f16::MAX must be accepted (it narrows losslessly).
+  let max = f32::from(f16::MAX);
+  assert_eq!(
+    check_f16_representable(&[0.0, 1.0, -1.0, max, -max]),
+    Ok(())
+  );
+}
+
+#[test]
+fn check_f16_representable_rejects_f32_max_at_reported_index() {
+  assert_eq!(
+    check_f16_representable(&[0.0, 1.0, f32::MAX]),
+    Err(InferError::F16OverflowInput { index: 2 })
+  );
+}
+
+#[test]
+fn check_f16_representable_rejects_negative_overflow() {
+  assert_eq!(
+    check_f16_representable(&[f32::MIN]),
+    Err(InferError::F16OverflowInput { index: 0 })
+  );
+}
+
+#[test]
+fn check_f16_representable_rejects_just_above_f16_max() {
+  // 65510 rounds to a FINITE f16 (65504), yet the finding's bound is the
+  // conservative |x| > f16::MAX, so it is still rejected — this pins that
+  // choice rather than the softer f16-infinity threshold (65520).
+  let just_above = f32::from(f16::MAX) + 6.0;
+  assert_eq!(
+    check_f16_representable(&[just_above]),
+    Err(InferError::F16OverflowInput { index: 0 })
+  );
+}
+
 // =====================================================================
 // Model-gated (#[ignore]): requires ARGMAX_TEST_MODELS
 // =====================================================================
@@ -1486,6 +1530,25 @@ fn argmax_source_rejects_non_finite_samples() {
   assert_eq!(
     load_source().extract(&clip),
     Err(ExtractError::Infer(InferError::NonFiniteInput {
+      index: 100
+    }))
+  );
+}
+
+/// A finite f32 sample that overflows f16 (`f32::MAX`) is rejected as
+/// `F16OverflowInput` before it narrows to an f16 infinity and reaches the
+/// segmenter (L1) — this source is the only one that narrows to f16. The
+/// hermetic `check_f16_representable_*` tests above cover the scan itself; this
+/// proves it is wired into the source's `extract` boundary, alongside the NaN
+/// check above.
+#[test]
+#[ignore = "requires local argmax speakerkit models (ARGMAX_TEST_MODELS)"]
+fn argmax_source_rejects_f16_overflow_samples() {
+  let mut clip = vec![0.0f32; 16_000];
+  clip[100] = f32::MAX;
+  assert_eq!(
+    load_source().extract(&clip),
+    Err(ExtractError::Infer(InferError::F16OverflowInput {
       index: 100
     }))
   );
