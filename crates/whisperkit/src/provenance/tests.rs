@@ -639,8 +639,15 @@ fn is_reproducible_requires_greedy_or_a_seed() {
   // reproducible at all (F1, codex round 6 post-consolidation): `result_at`
   // carries an observed not-truncated (`early_stopped = Some(false)`), so the
   // draw and the seed are the only variables left.
+  // A real drawing decode carries its worker coordinate, and a seed replays its
+  // draw only WITH it (codex round 13, M2). `result_at` models the worker-less
+  // shape the serde tests need, so layer a KNOWN coordinate on here — the seed rows
+  // below are the reproducible-WITH-schedule case (the schedule-less case is
+  // `task_facts::tests::seeded_draw_with_unknown_worker_schedule_is_not_reproducible`).
   let repro = |decoding: &DecodingOptions, temps: &[f32]| {
-    Provenance::for_result(decoding, &compute, &result_at("en", temps)).is_reproducible()
+    let result = result_at("en", temps);
+    let facts = result.task_facts().clone().with_worker(0);
+    Provenance::for_result(decoding, &compute, &result.with_task_facts(facts)).is_reproducible()
   };
 
   // Greedy (0.0, never drew) -> deterministic, seed or not.
@@ -1017,7 +1024,10 @@ fn for_result_reads_the_carried_sampling_fact_not_the_surviving_segments() {
       .with_early_stopped(false)
       // Observed-clean on the swallow axis so a seed alone earns reproducibility
       // back below (codex round 11, M2).
-      .with_had_swallowed_error(false),
+      .with_had_swallowed_error(false)
+      // A KNOWN worker coordinate — a real drawing decode always carries one — so
+      // the seed can replay it (codex round 13, M2).
+      .with_worker(0),
   );
   let record = Provenance::for_result(&unseeded, &compute, &filtered);
   assert_eq!(
@@ -1031,7 +1041,7 @@ fn for_result_reads_the_carried_sampling_fact_not_the_surviving_segments() {
     "an unseeded sampled window happened, even though nothing survived to say so"
   );
 
-  // Seeded, the same history replays exactly.
+  // Seeded, the same history replays exactly (its worker schedule is known).
   assert!(
     Provenance::for_result(&DecodingOptions::new().with_seed(3), &compute, &filtered)
       .is_reproducible()
@@ -1162,7 +1172,10 @@ fn provenance_records_the_real_draw_fact_never_the_temperature() {
         .with_early_stopped(false)
         // Observed-clean on the swallow axis so only the draw drives the answer
         // (codex round 11, M2).
-        .with_had_swallowed_error(false),
+        .with_had_swallowed_error(false)
+        // A KNOWN worker coordinate, so a seed can replay a real draw (codex round
+        // 13, M2 — the schedule-less draw is not seed-reproducible).
+        .with_worker(0),
     );
     assert_eq!(
       Provenance::for_result(&DecodingOptions::new(), &compute, &ran_to_completion)
@@ -1171,7 +1184,7 @@ fn provenance_records_the_real_draw_fact_never_the_temperature() {
       "unseeded temperature {temperature}: reproducible iff nothing was drawn"
     );
 
-    // A seed makes even a real draw replayable.
+    // A seed makes even a real draw replayable (its worker schedule is known).
     assert!(
       Provenance::for_result(
         &DecodingOptions::new().with_seed(7),

@@ -359,15 +359,30 @@ fn a_dropped_disagreeing_hypothesiss_draw_survives_into_finalize() {
     !crate::provenance::Provenance::for_result(&options, &compute, &finalized).is_reproducible(),
     "an unseeded draw happened (in a dropped hypothesis), so it is not reproducible",
   );
-  // A seed makes that same recovered draw replayable -- the promise becomes real.
+  // ORACLE CORRECTION (codex round 13, M2): a seed does NOT make the recovered
+  // draw replayable here. `finalize` leaves the worker schedule at the `None` the
+  // agreement strip produces (its confirmed text interleaves MULTIPLE hypotheses,
+  // so no single ordered attribution survives -- round 10, F2), and a draw whose
+  // domain-separating coordinate is unknown can land different text at a different
+  // coordinate even under the same seed. This is the LocalAgreement history through
+  // which the seed-plus-unknown-schedule case is reachable; the focused unit is
+  // `task_facts::tests::seeded_draw_with_unknown_worker_schedule_is_not_reproducible`.
+  //
+  // Mutation proof: drop the `&& schedule_known` guard from
+  // `is_reproducible_under`'s `Some(true)` draw arm and this reads back reproducible.
+  assert_eq!(
+    finalized.task_facts().worker_schedule(),
+    None,
+    "agreement strips the schedule, so the seeded draw's coordinate is unknown",
+  );
   assert!(
-    crate::provenance::Provenance::for_result(
+    !crate::provenance::Provenance::for_result(
       &options.clone().with_seed(11),
       &compute,
       &finalized,
     )
     .is_reproducible(),
-    "a seed makes the recovered draw replayable",
+    "a seed cannot replay the recovered draw whose worker coordinate agreement stripped",
   );
 }
 

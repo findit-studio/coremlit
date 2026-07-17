@@ -632,6 +632,19 @@ impl Provenance {
   /// output match Swift's, which has no seed knob and always draws
   /// unseeded (see [`DecodingOptions::seed`]).
   ///
+  /// # A seeded draw is reproducible only with a known worker schedule
+  ///
+  /// A seed replays an observed draw only when the worker/chunk schedule that
+  /// domain-separated its RNG streams is known ([`TaskFacts::worker_schedule`] is
+  /// `Some`): each coordinate reseeds the fallback ladder, so the same seed at a
+  /// DIFFERENT coordinate lands different text, and `window_id_offset` is an
+  /// in-process merge coordinate, not a [`DecodingOptions`] knob a re-run recovers
+  /// (codex round 13, M2). [`LocalAgreement`](crate::stream::agreement::LocalAgreement)
+  /// strips the schedule to `None` — its confirmed text interleaves MULTIPLE
+  /// hypotheses, so no single ordered attribution survives — so a seeded
+  /// LocalAgreement result whose text a dropped hypothesis's draw controlled is
+  /// NOT reproducible, exactly as an unobservable truncation is not.
+  ///
   /// # A callback truncation — or an unobservable one — is never reproducible
   ///
   /// An observed [`TaskFacts::early_stopped`] of `Some(true)` independently

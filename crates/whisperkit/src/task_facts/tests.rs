@@ -463,15 +463,21 @@ fn is_reproducible_under_is_conservative_on_the_explicit_unknown() {
   assert!(greedy.is_reproducible_under(true));
 
   // An observed unseeded draw is not reproducible; a seed makes it replayable —
-  // but only because the truncation and swallow are ALSO positively `Some(false)`.
-  let drew = TaskFacts::observed_clean().with_drew_from_rng(true);
+  // but only because the truncation and swallow are ALSO positively `Some(false)`
+  // AND the worker schedule is KNOWN (a real drawing decode always carries its
+  // coordinate; each coordinate reseeds the ladder, so the seed replays only WITH
+  // it — codex round 13, M2; the schedule-less case is
+  // `seeded_draw_with_unknown_worker_schedule_is_not_reproducible`).
+  let drew = TaskFacts::observed_clean()
+    .with_drew_from_rng(true)
+    .with_worker(0);
   assert!(
     !drew.is_reproducible_under(false),
     "an unseeded draw is not reproducible"
   );
   assert!(
     drew.is_reproducible_under(true),
-    "a seed makes the draw replayable"
+    "a seed makes the known-schedule draw replayable"
   );
 
   // An observed early stop forces false regardless of the seed: the callback is
@@ -513,6 +519,47 @@ fn is_reproducible_under_is_conservative_on_the_explicit_unknown() {
     .with_early_stopped(false);
   assert!(!swallow_unknown.is_reproducible_under(false));
   assert!(!swallow_unknown.is_reproducible_under(true));
+}
+
+#[test]
+fn seeded_draw_with_unknown_worker_schedule_is_not_reproducible() {
+  // Codex round 13, M2. A seed replays an OBSERVED draw only when the worker
+  // schedule that domain-separated its RNG streams is known: each coordinate
+  // reseeds the fallback ladder, so the same seed at a coordinate the record no
+  // longer carries can land different text. An observed-clean draw whose schedule
+  // is `None` — the shape `LocalAgreement` leaves, having stripped every
+  // hypothesis's schedule (round 10, F2) — is therefore NOT reproducible even
+  // seeded, exactly as an unobserved truncation is not.
+  //
+  // Mutation proof: drop the `&& schedule_known` guard from
+  // `is_reproducible_under`'s `Some(true)` draw arm and the unknown-schedule case
+  // below reads back reproducible when seeded.
+  let unknown_schedule = TaskFacts::observed_clean().with_drew_from_rng(true);
+  assert_eq!(
+    unknown_schedule.worker_schedule(),
+    None,
+    "the draw carries no coordinate — the LocalAgreement-stripped shape",
+  );
+  assert!(
+    !unknown_schedule.is_reproducible_under(false),
+    "an unseeded draw is never reproducible",
+  );
+  assert!(
+    !unknown_schedule.is_reproducible_under(true),
+    "and a seed cannot replay a draw whose worker coordinate is unknown",
+  );
+
+  // The discriminator is the schedule alone: the SAME draw with a KNOWN coordinate
+  // is seed-replayable (single-task and VAD runs keep their schedules).
+  let known_schedule = unknown_schedule.clone().with_worker(0);
+  assert!(
+    known_schedule.is_reproducible_under(true),
+    "a seed replays the draw once its worker coordinate is known",
+  );
+  assert!(
+    !known_schedule.is_reproducible_under(false),
+    "but still not without the seed",
+  );
 }
 
 #[cfg(feature = "serde")]

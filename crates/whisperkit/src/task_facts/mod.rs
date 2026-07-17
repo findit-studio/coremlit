@@ -719,9 +719,21 @@ impl TaskFacts {
   /// Whether a transcript carrying these facts can be reproduced byte-for-byte
   /// by re-running the same audio through the same options — `true` only when
   /// the decode POSITIVELY observed that it never drew from the sampler (or
-  /// `seeded` makes the draws it did make replayable) AND POSITIVELY observed
-  /// that no progress callback truncated it AND POSITIVELY observed that it
-  /// swallowed no transcript-controlling child error (codex round 11, M2).
+  /// `seeded` AND a known worker schedule make the draws it did make replayable)
+  /// AND POSITIVELY observed that no progress callback truncated it AND
+  /// POSITIVELY observed that it swallowed no transcript-controlling child error
+  /// (codex round 11, M2).
+  ///
+  /// **A seeded draw also needs its worker schedule** (codex round 13, M2): the
+  /// seed alone does not make an observed draw replayable, because each
+  /// worker/chunk coordinate reseeds the fallback ladder
+  /// ([`derive_attempt_seed`](crate::decode::sampler::derive_attempt_seed)), so
+  /// re-running the same seed at a coordinate the record no longer carries can
+  /// land different text. When [`worker_schedule`](Self::worker_schedule) is
+  /// `None` — the shape [`LocalAgreement`](crate::stream::agreement::LocalAgreement)
+  /// leaves after stripping the per-hypothesis schedules its interleaved confirmed
+  /// text can no longer attribute — an observed draw is non-reproducible even
+  /// seeded, exactly as an unobserved truncation is.
   ///
   /// **Conservative on the explicit unknown** (F1, codex round 6
   /// post-consolidation): an unobserved draw, truncation, or swallowed error
@@ -751,9 +763,20 @@ impl TaskFacts {
     // (`None`) is treated exactly like an unobserved truncation: conservatively
     // non-reproducible, never the optimistic answer (codex round 11, M2).
     let no_swallowed_error = matches!(self.had_swallowed_error, Some(false));
+    // A seed replays an OBSERVED draw only when the worker schedule that
+    // domain-separated its RNG streams is KNOWN (codex round 13, M2). Each
+    // coordinate reseeds the fallback ladder (`derive_attempt_seed`), so the SAME
+    // seed at a DIFFERENT coordinate draws a different stream and lands different
+    // text; `window_id_offset` is an in-process merge coordinate, not a
+    // `DecodingOptions` knob a re-run recovers. `LocalAgreement` strips the
+    // schedule to `None` (its confirmed text interleaves MULTIPLE hypotheses, so
+    // no single ordered attribution survives), so a seeded draw whose schedule is
+    // gone cannot promise byte-reproducibility — the same conservative refusal the
+    // unrecorded-callback (`early_stopped == None`) case already makes.
+    let schedule_known = self.worker_schedule.is_some();
     let draw_replayable = match self.drew_from_rng {
       Some(false) => true,
-      Some(true) => seeded,
+      Some(true) => seeded && schedule_known,
       None => false,
     };
     not_truncated && no_swallowed_error && draw_replayable
