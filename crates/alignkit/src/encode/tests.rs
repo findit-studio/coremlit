@@ -306,6 +306,33 @@ fn check_waveform_contract_rejects_missing_dtype() {
 }
 
 #[test]
+fn missing_waveform_input_diagnostic_names_the_exact_contract() {
+  // The MISSING-`waveform`-input branch of `Encoder::from_file_with`
+  // (`waveform_input_or_mismatch`) must name the SAME `[1, 960000]` contract the
+  // shape check reports. The two copies are identical today — unlike the
+  // `emissions` side, this diagnostic never drifted — but a second hand-written
+  // literal is the same root cause: change `ENCODER_WINDOW_SAMPLES` in one place
+  // and the other copy would report a window the next load rejects.
+  // `check_waveform_contract` is only reached with a present input, so the tests
+  // above cannot cover this separate branch; `None` drives it hermetically (no
+  // loaded model — the one artifact in `Models/alignkit/` always has the input).
+  // Hand-diverging `expected_waveform_contract` from the check's literal fails
+  // the `expected` assertion below.
+  match waveform_input_or_mismatch(None) {
+    Err(AlignerError::ContractMismatch {
+      feature,
+      expected,
+      actual,
+    }) => {
+      assert_eq!(feature, "waveform");
+      assert_eq!(expected, "[1, 960000] float32");
+      assert_eq!(actual, "missing");
+    }
+    other => panic!("expected a ContractMismatch, got {other:?}"),
+  }
+}
+
+#[test]
 fn check_emissions_contract_accepts_correct_shape_and_returns_frame_count() {
   assert_eq!(
     check_emissions_contract(&[1, 2_999, crate::vocab::VOCAB_SIZE], Some(DataType::F32)),
