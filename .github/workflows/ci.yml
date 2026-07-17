@@ -16,6 +16,24 @@ jobs:
       - run: cargo test --workspace
       - run: cargo hack test -p whisperkit --each-feature
       - run: cargo build -p whisperkit --examples
+      # speakerkit: compile the `dia` bridge surface and enforce the DER-gate
+      # suite, which the default-feature workspace steps above never touch. F1
+      # made the public `dia` feature lean (`default-features = false` on the dia
+      # dep — no `ort`, no bundled ONNX), so `--features dia` here builds only
+      # dia's pure-Rust offline core; no Models/ tree is downloaded.
+      - run: cargo test -p speakerkit --features dia
+      # The DER binaries are `#![cfg(feature = "dia-oracle")]`: without it they
+      # compile to nothing and a deleted gate, a lost `#[ignore]`, or a weakened
+      # mutation-proof pin would merge green. The inventory compiles them under
+      # `dia-oracle` (the ONLY step that pulls `ort`, to get dia's own
+      # segmentation/embedding oracle), lists each required gate as present +
+      # still ignored, and runs each binary's hermetic ordinary (falsifiability)
+      # suite. The heavy model-gated gates stay `#[ignore]`d — no models needed.
+      - run: crates/speakerkit/tests/der_gate_inventory.sh
+      # Feature-combination parity with the whisperkit step above. `dia-oracle`
+      # is excluded so this stays on dia's pure-Rust core (no `ort`); the oracle
+      # binaries are already compiled+exercised by the inventory step.
+      - run: cargo hack test -p speakerkit --each-feature --exclude-features dia-oracle
       - run: cargo doc --workspace --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
