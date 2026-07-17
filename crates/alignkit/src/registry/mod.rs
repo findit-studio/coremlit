@@ -447,10 +447,14 @@ impl AlignmentSet {
   ///
   /// # Errors
   /// [`AlignError::DecisionLanguage`] if an `oov_decisions` entry does not carry
-  /// `language`. [`AlignError::LanguageUnsupported`] on a miss under
-  /// [`AlignmentFallback::Error`]. Otherwise any error
-  /// [`Aligner::align_chunk`](crate::aligner::Aligner::align_chunk) itself
-  /// returns.
+  /// `language` — on the hit and [`AlignerKey::Any`] routes, the two that validate
+  /// the decisions before dispatch. A registry MISS validates nothing: it resolves
+  /// by [`AlignmentFallback`] alone (see "Registry miss" above), so a mis-stamped
+  /// decision never reaches a language check there — [`AlignmentFallback::SkipChunk`]
+  /// still returns empty success and [`AlignmentFallback::Error`] still returns
+  /// [`AlignError::LanguageUnsupported`], whatever language the decisions carry.
+  /// Otherwise any error
+  /// [`Aligner::align_chunk`](crate::aligner::Aligner::align_chunk) itself returns.
   // Mirrors `Aligner::align_chunk`'s argument surface (already at the 7-arg
   // limit) plus the registry's `language` lookup key, so a caller uses the exact
   // call shape they already know rather than an opaque params struct. Same
