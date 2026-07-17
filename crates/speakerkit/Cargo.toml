@@ -32,16 +32,35 @@ thiserror.workspace = true
 # every green `dia`-feature gate ran against (the sibling was three additive,
 # unmerged `cluster/online` commits ahead, none consumed here).
 #
+# `default-features = false`: the PUBLIC `dia` bridge pulls only dia's
+# backend-free offline core (clustering / PLDA / reconstruction) — the surface
+# `Extraction::into_offline_input` feeds. dia's defaults (`ort` +
+# `bundled-segmentation`) would drag ONNX Runtime and the ~6 MB embedded
+# segmentation model into every CoreML-only consumer — the exact inference
+# stack speakerkit REPLACES. The dia-ort DER oracle the parity suites need lives
+# behind the test-only `dia-oracle` feature below, never on this public bridge.
+#
 # CO-DEV: to build the `dia` feature against a local diarization checkout
 # instead (e.g. an unmerged change), add an UNCOMMITTED `[patch]` to the
 # WORKSPACE ROOT Cargo.toml — see its own "CO-DEV RECIPE" comment. Do not edit
 # this line for that.
-dia = { package = "diarization", git = "https://github.com/findit-studio/diarization", rev = "b6a6f9adc8465f7a4c207dbaa2701d98e1be1ff2", optional = true }
+dia = { package = "diarization", git = "https://github.com/findit-studio/diarization", rev = "b6a6f9adc8465f7a4c207dbaa2701d98e1be1ff2", default-features = false, optional = true }
 serde = { workspace = true, optional = true }
 
 [features]
 default = []
+# Public, LEAN bridge: `Extraction::into_offline_input` → dia's backend-free
+# offline clustering core. NO `ort`, no bundled ONNX model (see the dep's
+# `default-features = false` above).
 dia = ["dep:dia"]
+# TEST-ONLY oracle. Adds dia's OWN ort inference path (bundled `segmentation-3.0`
+# + BYO fp32 WeSpeaker ONNX) so the DER parity suites (`parity_e2e`,
+# `parity_shipping_der`, `generate_goldens`) can measure speakerkit's CoreML
+# output against dia-ort. Pulls `ort` + `libonnxruntime` and the ~6 MB embedded
+# segmentation model — never enable it in production, only to run those oracle
+# gates. `dia/bundled-segmentation` already implies `dia/ort`; both are named
+# for clarity.
+dia-oracle = ["dia", "dia/ort", "dia/bundled-segmentation"]
 serde = ["dep:serde"]
 
 [dev-dependencies]
