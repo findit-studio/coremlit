@@ -225,6 +225,41 @@ struct SwiftGolden {
   slots: Vec<SwiftSlot>,
 }
 
+/// Decodes one slot's `activeFrames` bit string, hard-failing unless it is
+/// EXACTLY [`ARGMAX_FRAMES_PER_WINDOW`] characters and every character is
+/// `'0'` or `'1'`.
+///
+/// The old lenient decode (`c == '1'`, any length, every non-`'1'` char →
+/// `false`) is what let this gate pass vacuously: an empty or truncated
+/// `activeFrames` decoded to a short/empty `Vec<bool>`, the comparison below
+/// iterated only that length, yet [`Fidelity::seg_cells`] still REPORTED
+/// `slots × 589` cells "compared". A wrong length or an unexpected character is
+/// a MALFORMED golden — never a slot with fewer active frames — so it is
+/// rejected here before a single fidelity number is read.
+fn parse_active_frames(fixture: &str, chunk: usize, slot: usize, raw: &str) -> Vec<bool> {
+  let frames: Vec<bool> = raw
+    .chars()
+    .map(|c| match c {
+      '0' => false,
+      '1' => true,
+      other => panic!(
+        "{fixture}: chunk {chunk} slot {slot}: activeFrames contains {other:?} — speaker_ids is \
+         hard-binary, so only '0'/'1' are valid; an unknown character is a malformed golden, not \
+         an inactive frame."
+      ),
+    })
+    .collect();
+  assert_eq!(
+    frames.len(),
+    ARGMAX_FRAMES_PER_WINDOW,
+    "{fixture}: chunk {chunk} slot {slot}: activeFrames has {} characters, expected exactly \
+     {ARGMAX_FRAMES_PER_WINDOW}. A short or empty activeFrames would make the segmentation \
+     comparison vacuous while it still reports full per-window coverage.",
+    frames.len()
+  );
+  frames
+}
+
 /// Loads and parses a committed argmax-Swift golden.
 ///
 /// # Panics
@@ -276,22 +311,26 @@ fn load_swift_golden(name: &str) -> SwiftGolden {
     .as_array()
     .expect("slots array")
     .iter()
-    .map(|s| SwiftSlot {
-      chunk: s["chunk"].as_u64().expect("chunk") as usize,
-      slot: s["slot"].as_u64().expect("slot") as usize,
-      active_frames: s["activeFrames"]
-        .as_str()
-        .expect("activeFrames string")
-        .chars()
-        .map(|c| c == '1')
-        .collect(),
-      non_overlapped_frame_ratio: s["nonOverlappedFrameRatio"].as_f64().expect("ratio"),
-      embedding: s["embedding"]
-        .as_array()
-        .expect("embedding array")
-        .iter()
-        .map(|x| x.as_f64().expect("embed f64") as f32)
-        .collect(),
+    .map(|s| {
+      let chunk = s["chunk"].as_u64().expect("chunk") as usize;
+      let slot = s["slot"].as_u64().expect("slot") as usize;
+      SwiftSlot {
+        chunk,
+        slot,
+        active_frames: parse_active_frames(
+          name,
+          chunk,
+          slot,
+          s["activeFrames"].as_str().expect("activeFrames string"),
+        ),
+        non_overlapped_frame_ratio: s["nonOverlappedFrameRatio"].as_f64().expect("ratio"),
+        embedding: s["embedding"]
+          .as_array()
+          .expect("embedding array")
+          .iter()
+          .map(|x| x.as_f64().expect("embed f64") as f32)
+          .collect(),
+      }
     })
     .collect();
 
@@ -518,6 +557,7 @@ fn measure(
   let segmentations = extraction.segmentations();
   let frames = extraction.num_frames_per_chunk();
   let mut seg_mismatches = 0usize;
+  let mut compared_seg_cells = 0usize;
   let mut first_seg_mismatch = None;
   for slot in &golden.slots {
     for (f, &active) in slot.active_frames.iter().enumerate() {
@@ -527,8 +567,25 @@ fn measure(
         seg_mismatches += 1;
         first_seg_mismatch.get_or_insert((slot.chunk, slot.slot, f, ours, theirs));
       }
+      compared_seg_cells += 1;
     }
   }
+  // Coverage guard — the other half of the vacuity fix, paired with the strict
+  // loader: the number of cells actually compared MUST equal `slots × frames`.
+  // The loader already guarantees every slot carries exactly `frames` bits, but
+  // asserting the realized count here — rather than trusting the loop bound —
+  // is what turns `seg_cells`'s reported coverage into a checked fact instead
+  // of an unverified claim, and it fails if the compared surface ever shrinks
+  // below what the report advertises.
+  assert_eq!(
+    compared_seg_cells,
+    golden.slots.len() * frames,
+    "{fixture}: compared {compared_seg_cells} segmentation cells, but the golden has {} slots × \
+     {frames} frames = {}. The comparison covered fewer cells than it reports — the vacuous pass \
+     this gate exists to prevent.",
+    golden.slots.len(),
+    golden.slots.len() * frames
+  );
 
   // ── Embeddings, over the slots BOTH sides carry ──
   let embeddings = extraction.raw_embeddings();
@@ -601,6 +658,44 @@ fn measure(
 // ─────────────────────────────────────────────────────────────────────────
 // The gates
 // ─────────────────────────────────────────────────────────────────────────
+
+/// Hermetic (no models): every committed golden loads through the STRICT
+/// [`parse_active_frames`] loader. This is what exercises the `activeFrames`
+/// validation — exactly [`ARGMAX_FRAMES_PER_WINDOW`] characters, each `'0'` or
+/// `'1'` — on every `cargo test` run, and pins the committed goldens as
+/// well-formed. An empty, truncated, or non-binary `activeFrames` in any of
+/// them (the mutation that used to make the segmentation comparison vacuous)
+/// fails HERE, without the model-gated fidelity run below. The model-gated
+/// gates additionally assert the realized compared-cell count in [`measure`].
+#[test]
+fn committed_goldens_load_through_the_strict_loader() {
+  for fixture in GATE_FIXTURES {
+    let golden = load_swift_golden(fixture);
+    assert_eq!(
+      golden.frames_per_window, ARGMAX_FRAMES_PER_WINDOW,
+      "{fixture}: golden declares framesPerWindow {}, expected {ARGMAX_FRAMES_PER_WINDOW}",
+      golden.frames_per_window
+    );
+    assert!(
+      !golden.slots.is_empty(),
+      "{fixture}: golden has no consumed slots — nothing to compare"
+    );
+    for slot in &golden.slots {
+      // `load_swift_golden` already rejects a non-589 activeFrames; re-assert
+      // the realized length so this test would fail even if the loader's
+      // length check were weakened.
+      assert_eq!(
+        slot.active_frames.len(),
+        ARGMAX_FRAMES_PER_WINDOW,
+        "{fixture}: chunk {} slot {}: activeFrames decoded to {} frames, expected \
+         {ARGMAX_FRAMES_PER_WINDOW}",
+        slot.chunk,
+        slot.slot,
+        slot.active_frames.len()
+      );
+    }
+  }
+}
 
 /// **THE GATE.** `ArgmaxSource` versus argmax's own Swift — matched
 /// placement, identical (hash-proven) input, provably identical masks — over
