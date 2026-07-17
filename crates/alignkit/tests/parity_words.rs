@@ -93,9 +93,12 @@
 //! p90 is 40.1 ms where ted_60's is 0.0 ms. (An earlier revision of this gate
 //! measured jfk's median at 12.8 ms and read it as the padding; it was not. It
 //! was alignkit over-counting jfk's emission frames by one — 550 where the
-//! wav2vec2 conv stack yields 549 — which put 320.0 samples/frame against the
-//! oracle's 320.58 and skewed every boundary, exactly the truncation off-by-one
-//! [`MAX_MEDIAN_BOUNDARY_DELTA_MS`] exists to catch. ted_60 was already correct
+//! wav2vec2 conv stack yields 549 — which, under asry's effective
+//! `n_samples / (T - 1)` frame-to-sample ratio (compose.rs:71), put
+//! 176,000/549 = 320.582878 samples/frame against the oracle's
+//! 176,000/548 = 321.167883 and skewed every boundary, exactly the truncation
+//! off-by-one [`MAX_MEDIAN_BOUNDARY_DELTA_MS`] exists to catch. ted_60 was
+//! already correct
 //! at 2,999 frames, so it never showed the skew; correcting the truncation drops
 //! jfk's median to ted_60's 0.0, with the zeros' real cost left in the p90 tail.)
 //!
@@ -158,18 +161,27 @@ use asry::Aligner as OrtAligner;
 /// so this is the only conversion the comparison needs.
 const SAMPLES_PER_MS: f64 = 16.0;
 
-/// One encoder frame in milliseconds: `HOP_SAMPLES` (320) @ 16 kHz. **The
-/// quantum of this entire measurement.** A CTC trellis backtrack yields a frame
-/// index per token, so no word boundary from either aligner can be more precise
-/// than 20 ms, and the smallest disagreement either can express is one frame.
+/// One encoder frame in milliseconds, at the model's **nominal** stride:
+/// `HOP_SAMPLES` (320) @ 16 kHz. **The quantum of this entire measurement.** A
+/// CTC trellis backtrack yields a frame index per token, so the smallest
+/// disagreement either aligner can express is one frame.
+///
+/// 20 ms is the *nominal* hop; the *effective* frame asry places boundaries on
+/// is `n_samples / (T - 1)` (compose.rs:71) — 176,000/548 = 321.167883 samples
+/// ≈ 20.07 ms on jfk, 960,000/2998 = 320.213476 samples ≈ 20.01 ms on ted_60 —
+/// so one frame is ≈ 20 ms, within ~0.1 ms of the nominal. The bounds below are
+/// set in the nominal 20 ms and carry that ~0.1 ms slack knowingly.
 const FRAME_MS: f64 = 20.0;
 
 /// Largest tolerated **median** boundary disagreement: **one frame**.
 ///
-/// The bound on *systematic* shift: a defect that moves every word — a wrong
-/// stride (319 vs 320), an off-by-one in the emissions truncation, a mis-anchored
-/// clock — moves the median, however small each individual shift is. A worst-case
-/// bound cannot see any of that.
+/// The bound on *systematic* shift: a defect that moves every word — an
+/// off-by-one in the emissions truncation (which shifts asry's effective
+/// `n_samples / (T - 1)` ratio, as the module header's 320.582878-vs-321.167883
+/// note shows), a mis-anchored clock — moves the median, however small each
+/// individual shift is. A worst-case bound cannot see any of that. (The seam hop
+/// is NOT such a defect: at T >= 2 asry maps frames by `n_samples / (T - 1)`, not
+/// by the hop, so 319 vs 320 does not move a whole-chunk boundary.)
 ///
 /// Measured: **0.0 ms** — the median boundary is frame-identical. (An earlier
 /// revision measured 12.8 ms; that WAS the "off-by-one in the emissions
@@ -325,8 +337,8 @@ const MAX_PADDING_P90_DELTA_MS: f64 = 5.0 * FRAME_MS;
 /// ted_60's largest tolerated **median** boundary disagreement: **one frame**.
 /// Measured: **0.0 ms** — the median boundary is frame-IDENTICAL.
 ///
-/// Bounds systematic shift (a wrong stride, an off-by-one in the emissions
-/// truncation, a mis-anchored clock), exactly as its jfk counterpart does.
+/// Bounds systematic shift (an off-by-one in the emissions truncation, a
+/// mis-anchored clock), exactly as its jfk counterpart does.
 ///
 /// It does **not** catch the ANE corruption, and that is measured, not
 /// assumed: on the corrupted path ted_60's median is *also* 0.0 ms. See
