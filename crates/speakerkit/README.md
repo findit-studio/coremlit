@@ -54,10 +54,14 @@ let options = Options::new().with_source(Source::Argmax);
 let source = AnySource::load("Models/argmax-speakerkit", options)?;
 ```
 
-Feature flags: `dia` (optional path dependency on the `diarization` sibling
-crate; enables `Extraction::into_offline_input`) and `serde`
+Feature flags: `dia` (enables `Extraction::into_offline_input`; pulls in the
+`diarization` crate as an **optional git dependency pinned to an exact rev** —
+*not* a path dependency on a sibling checkout, so edits to a local
+`diarization` tree are **not** consumed unless you add the co-dev `[patch]` to
+the workspace-root `Cargo.toml`, see its "CO-DEV RECIPE" comment) and `serde`
 (`Serialize`/`Deserialize` on `Options` and friends). Neither is on by
-default.
+default. (A sibling `diarization` checkout is used only as **test data** for
+the model-gated DER gates below, never as the `dia` dependency itself.)
 
 ## The two model sources
 
@@ -436,8 +440,10 @@ see `tests/swift/regen_goldens.sh`.
   shown to be *correct*. Human-labelled benchmark RTTM (AMI, DIHARD) is not part
   of this repository, so "are we right?" is a question none of these gates
   answer. They answer "do we match the reference implementation?".
-- **`0.1.0` (unreleased), `publish = false`** until the `dia`/`diarization`
-  path dependency has a registry version.
+- **`0.1.0` (unreleased), `publish = false`** until the optional `dia`
+  (`diarization`) git dependency has a registry version — an exact-rev git
+  dependency, like a path dependency, carries no version Cargo can publish
+  against.
 
 ## See also
 
