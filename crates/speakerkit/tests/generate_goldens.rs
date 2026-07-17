@@ -60,7 +60,8 @@ const EXCLUDE_OVERLAP_MIN_FRAMES: usize = 2;
 
 /// Resolves the BYO WeSpeaker fp32 ONNX: `DIA_EMBED_MODEL_PATH`, else the
 /// sibling `diarization/models/wespeaker_resnet34_lm.onnx` (relative to this
-/// crate, mirroring `Cargo.toml`'s `dia` path dependency).
+/// crate — a sibling-checkout convention; the `dia` dep itself is a git
+/// dependency pinned to an exact rev, not a path dep).
 fn wespeaker_onnx_path() -> std::path::PathBuf {
   if let Some(p) = std::env::var_os("DIA_EMBED_MODEL_PATH") {
     return std::path::PathBuf::from(p);
