@@ -1234,11 +1234,14 @@ impl Encoder {
   /// never engages on a valid input. It stays because `emissions_raw`'s
   /// `data.truncate(frames * VOCAB_SIZE)` relies on `frames <= Self::frames`.
   ///
-  /// [`HOP_SAMPLES`] is the ONE stride in this crate: the same constant times
-  /// the words in [`crate::aligner::Aligner`]'s seam. It is fixed by the
-  /// model's graph and is deliberately not configurable — a caller-settable
-  /// stride that truncated at 320 while timing at 319 would skew every word
-  /// silently.
+  /// [`HOP_SAMPLES`] is the ONE stride in this crate: the constant the encoder
+  /// truncates by, which — via the frame count `T` it yields — fixes asry's
+  /// effective `n_samples / (T - 1)` grid (~20 ms; `tests/parity_words.rs`)
+  /// where the word boundaries land, and the SAME constant handed to
+  /// [`crate::aligner::Aligner`]'s seam. It is fixed by the model's graph and
+  /// is deliberately not configurable — a seam-only stride would declare a hop
+  /// the encoder never truncated by (at `T >= 2` it would not even move the
+  /// boundaries, which follow the encoder-driven grid).
   ///
   /// # Known gap
   ///

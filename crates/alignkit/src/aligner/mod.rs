@@ -36,20 +36,25 @@ use crate::{
 /// [`NonZeroU32`] the seam builder wants.
 ///
 /// Derived from [`crate::encode::HOP_SAMPLES`] rather than re-spelled as
-/// `320`, so the stride that TRUNCATES the emissions and the stride that
-/// TIMES the words are one constant and cannot drift apart. It is private and
+/// `320`, so the stride that TRUNCATES the emissions and the stride handed to
+/// the seam are one constant and cannot drift apart. That truncation stride is
+/// also what TIMES the words: it fixes the frame count `T`, on which asry maps
+/// boundaries by the effective `n_samples / (T - 1)` ratio (~20 ms; see
+/// `tests/parity_words.rs`), not a literal 320-sample grid. It is private and
 /// there is no option to override it: this crate wraps exactly one model,
 /// whose stride is fixed at 320 by its graph, so no other value is ever
 /// correct.
 ///
 /// This was a caller-settable `AlignerOptions::hop_samples` knob, which was a
-/// latent corruption: it reached only the seam (the timing half), never the
-/// encoder (`truncated_frame_count` divides by the hardcoded
-/// [`crate::encode::HOP_SAMPLES`]). asry's own `validate_stride_extent` slack
-/// is `chunk_extent ± 2·hop`, far too loose to catch the skew — measured on
-/// `jfk.wav`, a hop of 319, 320 or 321 all returned `Ok` with 22 words and no
-/// error, so a caller setting 319 got words timed at the wrong stride,
-/// silently. asry can afford the knob because its `T` comes from the ONNX
+/// latent corruption: it reached only the seam (its stride check and `T < 2`
+/// fallback), never the encoder (`truncated_frame_count` divides by the
+/// hardcoded [`crate::encode::HOP_SAMPLES`]). At `T >= 2` that never re-timed
+/// the words — asry maps boundaries by the effective `n_samples / (T - 1)`
+/// ratio, driven by the encoder's frame count, not the seam's hop — but it let
+/// the seam DECLARE a stride the encoder never used, which asry's own
+/// `validate_stride_extent` slack (`chunk_extent ± 2·hop`) is far too loose to
+/// reject: on `jfk.wav`, a hop of 319, 320 or 321 all returned `Ok` with 22
+/// words and no error. asry can afford the knob because its `T` comes from the ONNX
 /// model's own output shape, making `hop_samples` the single place stride is
 /// declared there; alignkit computes `T` itself, so a second declaration is a
 /// second source of truth. Pinned by
@@ -89,8 +94,11 @@ fn default_compute() -> ComputeUnits {
 /// this crate wraps a single model whose stride is fixed at 320 by its graph
 /// ([`crate::encode::HOP_SAMPLES`]), and the encoder's own truncation divides
 /// by that same constant without consulting any option — so a caller-set
-/// stride would apply to only half the pipeline and skew every word. The seam
-/// is wired from that one constant instead (`SEAM_HOP_SAMPLES`, private).
+/// stride would reach only the seam half, declaring a stride the encoder never
+/// used: a second, driftable source of truth (at `T >= 2` it would not even
+/// move the boundaries, which asry maps by the encoder-driven
+/// `n_samples / (T - 1)` ratio — see `SEAM_HOP_SAMPLES`). The seam is wired
+/// from that one constant instead (`SEAM_HOP_SAMPLES`, private).
 ///
 /// These are **construction-time**: they are fed to the builder / model load
 /// once and baked in, so there are no post-construction setters on
@@ -222,10 +230,11 @@ fn build_seam(
 ) -> Result<EmissionsAligner, EmissionsError> {
   EmissionsAligner::builder(language, crate::vocab::tokenizer_json_bytes())
     .normalizer(normalizer)
-    // NOT an option (see `SEAM_HOP_SAMPLES`): the stride that times the words
-    // here must be the stride that truncates the emissions in
-    // `Encoder::emissions`, and asry's `chunk_extent ± 2·hop` validator is too
-    // loose to catch them disagreeing.
+    // NOT an option (see `SEAM_HOP_SAMPLES`): the stride handed to the seam
+    // here must equal the stride that truncates the emissions in
+    // `Encoder::emissions` — the one that, via `T`, times the words on asry's
+    // effective `n_samples / (T - 1)` grid — and asry's `chunk_extent ± 2·hop`
+    // validator is too loose to catch them disagreeing.
     .hop_samples(SEAM_HOP_SAMPLES)
     .min_speech_coverage(SpeechCoverage::clamped(options.min_speech_coverage()))
     .max_intra_silent_run(options.max_intra_silent_run())
