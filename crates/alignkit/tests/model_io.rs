@@ -170,11 +170,15 @@ fn run_emissions(model: &Model, waveform: &[f32]) -> Vec<f32> {
 /// (raw-logit) tensor would be expected to produce — it cannot accidentally
 /// mask a real logits-vs-log-probs mismatch.
 ///
-/// DECISION CONSEQUENCE: because emissions are already log-probs, Task B3's
-/// encoder wrapper must NOT re-apply softmax/log-softmax over this output —
-/// it wires `asry::LogProbsTV` directly from the raw `emissions` tensor.
-/// (Had the verdict instead been raw logits, the consequence would have
-/// been the opposite: apply asry's `log_softmax_with_finite_guard` first.)
+/// DECISION CONSEQUENCE: because emissions are already log-probs, the shipping
+/// encoder wrapper must NOT re-apply softmax/log-softmax over this output. It
+/// does not treat the tensor as trusted, though: rather than wiring
+/// `asry::LogProbsTV` straight from the raw `emissions`, it routes the raw tensor
+/// through the value-domain guard (the `LOG_PROB_FLOOR` floor plus the
+/// logsumexp-normalization check, which mint a `ValueDomainChecked` capability)
+/// and into `Emissions::from_log_probs` — no softmax, but a checked door, not a
+/// blind one. (Had the verdict instead been raw logits, the consequence would
+/// have been the opposite: apply asry's `log_softmax_with_finite_guard` first.)
 ///
 /// SUPERSEDED AS EVIDENCE, retained as a check: the model's `.mil` graph
 /// settles the question directly — its final ops are `softmax` → `log` →
