@@ -5,7 +5,9 @@ members = ["crates/coremlit", "crates/whisperkit", "crates/speakerkit"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+# MSRV floor is set by speakerkit's pinned `dia` (diarization) git dependency,
+# which needs rustc 1.95.
+rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/findit-studio/coremlit"
 

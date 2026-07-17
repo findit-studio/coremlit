@@ -4,7 +4,7 @@
 **On-device speech-to-text for macOS in Rust**: a safe CoreML runtime layer, and a faithful port of [WhisperKit](https://github.com/argmaxinc/WhisperKit).
 
 [<img alt="CI" src="https://img.shields.io/github/actions/workflow/status/findit-studio/coremlit/ci.yml?branch=main&style=for-the-badge&logo=github-actions" height="22">](https://github.com/findit-studio/coremlit/actions/workflows/ci.yml)
-<img alt="MSRV" src="https://img.shields.io/badge/MSRV-1.88-orange?style=for-the-badge&logo=rust" height="22">
+<img alt="MSRV" src="https://img.shields.io/badge/MSRV-1.95-orange?style=for-the-badge&logo=rust" height="22">
 <img alt="license" src="https://img.shields.io/badge/License-MIT%20OR%20Apache--2.0-blue?style=for-the-badge" height="22">
 
 </div>
@@ -137,7 +137,7 @@ works; swap the tokenizer repo to match the model size.
 
 ## MSRV & platform
 
-Rust **1.88**, edition 2024. macOS only (Apple Silicon primary; `x86_64-apple-darwin` is untested). Not sandboxed-Linux-buildable by design — this is a CoreML binding.
+Rust **1.95**, edition 2024. macOS only (Apple Silicon primary; `x86_64-apple-darwin` is untested). Not sandboxed-Linux-buildable by design — this is a CoreML binding.
 
 ## Status
 
