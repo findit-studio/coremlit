@@ -216,9 +216,10 @@ fn encoder_input_gate_binds_real_length_independent_of_the_padded_buffer() {
   // records the real length as the UNPADDED count (200), never the padded buffer's
   // length (400) — the type-level F1 property. `from_prepared` reads exactly this
   // (buffer, real_samples) pair off an unforgeable `PreparedChunk`; here we drive
-  // the gate directly so the binding is pinned with no model and no seam (the
-  // end-to-end `from_prepared` door, on a real chunk, is
-  // `tests/prepared_composition.rs`).
+  // the gate directly so the binding is pinned with no model and no seam. The
+  // `from_prepared` door's OWN provenance is pinned hermetically by the sibling
+  // `from_prepared_records_the_true_pre_pad_provenance_not_the_padded_length`; the
+  // end-to-end door on the CoreML encoder is `tests/prepared_composition.rs`.
   let real_len = 200usize;
   let padded_buffer = vec![0.0f32; 400];
   let input = EncoderInput::new(&padded_buffer, real_len).expect("valid geometry");
@@ -233,6 +234,83 @@ fn encoder_input_gate_binds_real_length_independent_of_the_padded_buffer() {
   // 175_360 → 549 vs 547, where a short real count genuinely moves the count).
   assert_eq!(truncated_frame_count(input.real_samples, 2_999), 1);
   assert_eq!(truncated_frame_count(padded_buffer.len(), 2_999), 1);
+}
+
+#[test]
+fn from_prepared_records_the_true_pre_pad_provenance_not_the_padded_length() {
+  // L2: the public `from_prepared` door must record the chunk's TRUE pre-pad
+  // `real_samples` (200), never the padded encoder-buffer length (400). The
+  // corrected conv geometry now maps BOTH 200 and 400 to a single frame, so the
+  // frame COUNT can no longer distinguish the two doors below the receptive field
+  // — which is exactly why `tests/prepared_composition.rs`'s `frames() == 1`
+  // checks went vacuous for this mutation. The surviving distinguisher is this
+  // recorded provenance.
+  //
+  // `real_samples` has no public accessor BY DESIGN (it must never be a
+  // caller-supplied integer — see `EncoderInput`), and no crate dev-dependency
+  // captures the `tracing` span field that carries it. So this pins the guarantee
+  // the adjudicated way: a crate-private assertion, reading the field one module
+  // in, driven through the SAME public `from_prepared` door on a real
+  // `PreparedChunk` — no CoreML model, since only construction is under test.
+  //
+  // Mutating `from_prepared` to `Self::from_samples(prepared.encoder_input())`
+  // records the padded 400 here and turns the `== 200` assertion RED — the exact
+  // regression the count-based test can no longer catch.
+  use asry::emissions::EmissionsAligner;
+  use core::sync::atomic::AtomicBool;
+
+  let aligner = EmissionsAligner::builder(crate::Lang::En, crate::vocab::tokenizer_json_bytes())
+    .normalizer(Box::new(crate::EnglishNormalizer::new()))
+    .blank_token_id(crate::vocab::BLANK_ID)
+    .build()
+    .expect("build the En seam from the bundled tokenizer");
+
+  // 200 real samples of unambiguously non-silent audio. The content is irrelevant
+  // to the recorded LENGTH (no encoder runs here), but the text must tokenize to
+  // alignable tokens or `prepare` returns a trivial chunk with no buffer to test.
+  let samples: Vec<f32> = (0..200).map(|i| (i as f32 * 0.05).sin() * 0.2).collect();
+  let abort = AtomicBool::new(false);
+  let prepared = aligner
+    .prepare(
+      &samples,
+      &crate::SpeechSpans::all_speech(),
+      "test",
+      &[],
+      &abort,
+    )
+    .expect("prepare 200 real samples with alignable text");
+  assert!(
+    !prepared.is_trivial(),
+    "`test` must tokenize to alignable tokens, or there is no prepared buffer to test"
+  );
+  assert_eq!(
+    prepared.encoder_input().len(),
+    400,
+    "asry pads 200 real samples up to the 400-sample receptive field"
+  );
+
+  // The supported door records asry's honest pre-pad length.
+  let via_prepared =
+    EncoderInput::from_prepared(&prepared).expect("from_prepared geometry is valid");
+  assert_eq!(
+    via_prepared.real_samples, 200,
+    "from_prepared must record the true pre-pad real_samples (200), never the padded 400"
+  );
+
+  // The raw door, handed the SAME padded buffer, records the padded length — the
+  // provenance the frame-count coincidence (both truncate to one frame) hides, and
+  // exactly what the vacuous mutation collapses `from_prepared` into.
+  let via_raw =
+    EncoderInput::from_samples(prepared.encoder_input()).expect("from_samples geometry is valid");
+  assert_eq!(
+    via_raw.real_samples, 400,
+    "from_samples records the buffer length it is handed (400) — the distinguisher"
+  );
+  assert_ne!(
+    via_prepared.real_samples, via_raw.real_samples,
+    "the two doors record DIFFERENT provenance for the one buffer; only the frame \
+     count coincides, which is why a count-only test cannot bind from_prepared"
+  );
 }
 
 #[test]
