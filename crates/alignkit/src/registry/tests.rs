@@ -578,9 +578,12 @@ fn exact_hit_validates_decision_language_before_dispatch() {
 const JFK_TRANSCRIPT: &str = "And so my fellow Americans ask not what your country can do for you, \
                               ask what you can do for your country.";
 
-/// "No VAD" — one span over the whole chunk in the 1/16000 analysis timebase
-/// (empty would mean "all silence" and drop every word; see
-/// [`crate::aligner::Aligner::align_chunk`]).
+/// "No VAD" — one explicit span over the whole chunk in the 1/16000 analysis
+/// timebase, i.e. all speech. Passing empty `sub_segments` is also "no VAD": the
+/// shipping API maps empty to
+/// [`SpeechSpans::all_speech`](asry::emissions::SpeechSpans::all_speech), NOT to
+/// "all silence" (see [`crate::aligner::Aligner::align_chunk`]); this helper just
+/// states the whole-chunk span explicitly.
 fn whole_chunk_is_speech(samples: &[f32]) -> [TimeRange; 1] {
   [TimeRange::new(0, samples.len() as i64, ANALYSIS_TIMEBASE)]
 }

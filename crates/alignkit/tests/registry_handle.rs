@@ -66,8 +66,9 @@ fn en_aligner() -> Aligner {
   .expect("load base960h_aligner.mlmodelc as an En aligner (set ALIGNKIT_TEST_MODELS)")
 }
 
-/// "No VAD" — one span over the whole chunk in the 1/16000 analysis timebase
-/// (empty would mean "all silence" and drop every word).
+/// "No VAD" — one explicit span over the whole chunk in the 1/16000 analysis
+/// timebase, i.e. all speech. Passing empty `sub_segments` is also "no VAD": the
+/// shipping API maps empty to `SpeechSpans::all_speech`, NOT to "all silence".
 fn whole_chunk_is_speech(samples: &[f32]) -> [TimeRange; 1] {
   [TimeRange::new(0, samples.len() as i64, ANALYSIS_TIMEBASE)]
 }
