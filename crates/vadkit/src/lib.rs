@@ -18,9 +18,13 @@
 //! `FluidAudio/Sources/FluidAudio/VAD/VadManager.swift:21-26`). It authors
 //! **zero** speech-detection or streaming-segmentation logic: that lives, and
 //! stays single-homed, in the published `silero` crate behind its backend
-//! seam (spec §2-§3). vadkit implements that seam over CoreML and re-exports
-//! silero's detector surface (spec §4) — the seam impl and re-export are a
-//! later task (T5); this module is the model layer alone (T2/T3).
+//! seam (spec §2-§3). [`CoreMlBackend`] implements that seam over CoreML and
+//! [`detect_speech`] plus the re-exported [`silero`] detector surface
+//! ([`SpeechOptions`], [`SpeechSegment`], [`SpeechSegmenter`],
+//! [`detect_speech_with`]) wire it up (spec §4) — so a vadkit consumer gets the
+//! full offline + streaming detection API with zero segmentation logic
+//! authored here. The `src/` grep gate in `tests/reexport.rs` pins that
+//! single-home invariant.
 //!
 //! # Oracle
 //!
@@ -32,11 +36,24 @@
 //! `coremlit`'s `tests/fp16_guards.rs` (vendor `vadkit`; the graph is
 //! fp16-clean — see that file's `accepts_vadkits_stft_sqrt_guard`).
 
+pub mod backend;
 pub mod error;
 pub mod model;
 
+pub use backend::{CoreMlBackend, detect_speech};
 pub use error::{InferError, ModelError};
 pub use model::{
   CHUNK_SAMPLES, CONTEXT_SAMPLES, MODEL_INPUT_SAMPLES, STATE_SIZE, VadModel, VadModelOptions,
   VadState,
+};
+
+// The silero detector surface, re-exported unchanged and wired (via
+// [`CoreMlBackend`] / [`detect_speech`]) to run over the CoreML backend. vadkit
+// adds NO detection logic (spec §2-§4); these are silero's own types. `Error`
+// / `Result` are silero's detector error (into which the model layer's
+// [`InferError`] bridges through [`silero::Error::Backend`]), distinct from the
+// model-layer [`ModelError`] / [`InferError`] above.
+pub use silero::{
+  Error, Result, SampleRate, SpeechDetector, SpeechOptions, SpeechSegment, SpeechSegmenter,
+  VadBackend, detect_speech_with,
 };

@@ -12,7 +12,7 @@ publish = false
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-readme = "../../README.md"
+readme = "README.md"
 keywords = ["vad", "voice-activity-detection", "silero", "coreml", "speech"]
 categories = ["multimedia::audio", "os::macos-apis", "science"]
 
@@ -24,19 +24,37 @@ targets = ["aarch64-apple-darwin"]
 [dependencies]
 coremlit.workspace = true
 thiserror.workspace = true
+# The detection/streaming logic single-home (spec §2-§3): vadkit implements
+# silero's `VadBackend` seam over CoreML and re-exports silero's detector
+# surface wired to that backend, authoring ZERO segmentation logic here.
+# `default-features = false` selects the LOGIC-ONLY silero crate — the
+# backend-agnostic detector/segmenter, `SpeechOptions`, the `VadBackend` trait,
+# and `detect_speech_with` — with NO `ort`/ONNX backend compiled, so `ort`
+# never enters vadkit's runtime graph (`cargo tree -p vadkit -e no-dev -i ort`
+# is empty; the cross_backend dev-dep below is the only thing that pulls ONNX,
+# and resolver v3 keeps its features out of the non-dev build).
+# Pinned to the 0.5.0 seam by git REV; RE-PIN to `silero = "0.5.0"` (a released
+# version dep, no git) once it publishes (spec §8.3) — which does not change
+# this no-`ort`, logic-only posture.
+silero = { git = "https://github.com/Findit-AI/silero", rev = "80f78c1a514f5c4e423e2a8d04d3b853b37079a0", default-features = false }
 
 [dev-dependencies]
 hound.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 # Cross-backend characterization oracle (`tests/cross_backend.rs`, spec §6):
-# the PUBLISHED silero crate at its default features (`bundled` → `onnx` →
-# `ort`) is the ONNX reference stack the CoreML model layer is measured
-# against. DEV-ONLY on purpose — `ort` must never enter vadkit's runtime graph
-# (proven by `cargo tree -p vadkit -e no-dev -i ort` finding nothing; see the
-# test's module docs). Pinned to 0.4.0 (the version on crates.io); T5 bumps to
-# the 0.5.0 seam once it publishes, but the dev-only posture does not change.
-silero = "0.4.0"
+# the silero ONNX reference stack — `Session::bundled()` + `detect_speech` —
+# is what the CoreML model layer is measured against, and the real
+# `SpeechSegmenter` (the seam's streaming shape) is what the gate now drives to
+# turn vadkit's probabilities into segments instead of the interim T4 harness
+# (T5's re-export). The `bundled` feature pulls ONNX/`ort`; DEV-ONLY on purpose
+# — `ort` must never enter vadkit's runtime graph. Resolver v3 keeps dev-dep
+# features out of the non-dev build, so `cargo tree -p vadkit -e no-dev -i ort`
+# stays empty (the T5 report records the proof). SAME git rev as the runtime
+# dep above (bumped from the crates.io 0.4.0 T4 used, since the seam's
+# `SpeechSegmenter`/`detect_speech_with` are 0.5.0 additions); RE-PIN to
+# `silero = { version = "0.5.0", features = ["bundled"] }` once it publishes.
+silero = { git = "https://github.com/Findit-AI/silero", rev = "80f78c1a514f5c4e423e2a8d04d3b853b37079a0", default-features = false, features = ["bundled"] }
 
 [lints]
 workspace = true
