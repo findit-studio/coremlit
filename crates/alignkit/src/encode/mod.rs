@@ -1007,10 +1007,17 @@ impl Encoder {
   /// `log(0)` sentinel behind [`DEFAULT_ENCODER_COMPUTE`] is pinned).
   ///
   /// # Errors
-  /// As [`Self::emissions`], minus [`AlignError::Alignment`] — skipping the
-  /// wrap is exactly skipping the check that can raise it. [`AlignError::InputTooLong`]
-  /// cannot arise here: [`EncoderInput`] already validated the window ceiling at
-  /// construction (see that type's doc).
+  /// As [`Self::emissions`], minus the three value-domain rejections that method
+  /// adds on top of the raw tensor: [`AlignError::CorruptEmissions`] and
+  /// [`AlignError::UnnormalizedEmissions`] (the floor and normalization guards this
+  /// method deliberately skips — it hands back an ANE-corrupted or shifted-raw-logit
+  /// tensor as `Ok`, which is its whole unguarded purpose) and
+  /// [`AlignError::Alignment`] (skipping the wrap is exactly skipping the
+  /// [`Emissions::from_log_probs`] scan that raises it). What remains —
+  /// [`AlignError::Tensor`] and [`AlignError::Prediction`] — arises here exactly as
+  /// in [`Self::emissions`], which runs the identical predict.
+  /// [`AlignError::InputTooLong`] cannot arise: [`EncoderInput`] already validated
+  /// the window ceiling at construction (see that type's doc).
   pub(crate) fn emissions_raw(&self, input: EncoderInput<'_>) -> Result<RawEmissions, AlignError> {
     let EncoderInput {
       encoder_input,

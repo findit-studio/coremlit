@@ -431,9 +431,11 @@ impl Aligner {
   /// [`AlignError::Span`] if `sub_segments` are not in the 1/16000 timebase;
   /// [`AlignError::Prediction`] / [`AlignError::Tensor`] from the CoreML
   /// encode; [`AlignError::CorruptEmissions`] if the encoder's emission matrix
-  /// left the log-probability domain (an ANE placement set through
-  /// [`AlignerOptions::with_compute`] — see
-  /// [`crate::encode::LOG_PROB_FLOOR`]); [`AlignError::Alignment`] for any
+  /// left the log-probability domain from below (an ANE placement set through
+  /// [`AlignerOptions::with_compute`] — see [`crate::encode::LOG_PROB_FLOOR`]);
+  /// [`AlignError::UnnormalizedEmissions`] if the encoder's emission matrix is not
+  /// normalized log-probabilities (a raw-logit model swap — see
+  /// [`crate::encode::LOG_PROB_SUM_TOLERANCE`]); [`AlignError::Alignment`] for any
   /// non-recoverable seam failure (stride / vocab / blank-id validation, a
   /// non-finite or positive log-probability, tokenization, abort).
   #[cfg_attr(
