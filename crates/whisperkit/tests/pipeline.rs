@@ -15,9 +15,29 @@ use whisperkit::{
   transcribe::WhisperKit,
 };
 
+/// CpuOnly is legitimate HERE — and only because of what this file asserts.
+///
+/// THE RULE: **a gate validating a shipping default must run on the shipping
+/// default.** The crate ships mel = CPU+GPU and encoder/decoder = CPU+ANE
+/// (`options::DEFAULT_*_COMPUTE_UNITS`, matching Swift's
+/// `ModelComputeOptions`), so anything asserting NUMERICS — above all
+/// `tests/parity_jfk.rs`/`parity_es.rs`, whose goldens are an ANE-captured
+/// external Swift oracle — must run on those units, and those tests assert
+/// so explicitly. **The golden tests own the shipping compute path and must
+/// never be pinned away from it**, however tempting that looks as a fix for
+/// a "flaky" golden. The sibling crate `alignkit` learned this the hard way:
+/// it shipped `ComputeUnits::All` while every test pinned `CpuOnly`, and the
+/// ANE turned out to produce a corrupted output matrix that the green suite
+/// never saw.
+///
+/// The tests in this file assert SHAPES, DTYPES, and CONTROL FLOW — window
+/// counts, feature dimensions, segment structure, callback wiring — none of
+/// which the compute unit can change. Pinning them to CpuOnly buys
+/// determinism and skips the ANE compilation stall, and costs no coverage
+/// the goldens do not already own. Do not extend that reasoning to a test
+/// that compares numbers against a reference.
 fn load_backend() -> CoreMlBackend {
   let tiny = common::tiny_dir();
-  // CpuOnly in tests: deterministic and no ANE compilation latency.
   let mel = Model::load(tiny.join("MelSpectrogram.mlmodelc"), ComputeUnits::CpuOnly).unwrap();
   let encoder = Model::load(tiny.join("AudioEncoder.mlmodelc"), ComputeUnits::CpuOnly).unwrap();
   let decoder = Model::load(tiny.join("TextDecoder.mlmodelc"), ComputeUnits::CpuOnly).unwrap();
@@ -174,8 +194,11 @@ fn last_kv_slot_decode_step_succeeds() {
 fn manager_loads_tiny_idempotently_and_backend_builds() {
   let mut manager = ModelManager::new(
     common::tiny_dir(),
+    // CpuOnly (no ANE compilation stalls) — legitimate here for the same
+    // reason as in `load_backend` above: this asserts LOAD STATE MACHINERY,
+    // not numerics. The goldens own the shipping compute path; see
+    // `load_backend`'s doc for the rule.
     ComputeOptions::new()
-      // CpuOnly across the board in tests (no ANE compilation stalls).
       .with_mel(ComputeUnits::CpuOnly)
       .with_encoder(ComputeUnits::CpuOnly)
       .with_decoder(ComputeUnits::CpuOnly),
@@ -320,7 +343,7 @@ fn detect_language_on_es_and_ja_clips() {
 
 #[test]
 #[ignore = "requires local tiny model (WHISPERKIT_TEST_MODELS)"]
-fn silence_transcribes_to_the_blank_audio_marker() {
+fn silence_transcribes_to_the_blank_audio_marker_when_drop_is_cleared() {
   // Pins coremlit issue #9's silence edge case: 5 s of digital silence,
   // VAD off / prefill on, decoded to exactly `[BLANK_AUDIO]`, one segment,
   // on both Rust and Swift in the issue's own validation run --
@@ -330,26 +353,37 @@ fn silence_transcribes_to_the_blank_audio_marker() {
   // P1 policy recommendation to pin decode options rather than rely on
   // them silently.
   //
+  // This contract now lives on the `drop_blank_audio == false` path
+  // (coremlit issue #14): dropping the marker became the DEFAULT, a
+  // deliberate product divergence from Swift, and clearing the option is
+  // the exact Swift-parity escape hatch. Everything asserted below is
+  // byte-for-byte what this test asserted before the option existed --
+  // that is the point: opting out restores the old behavior exactly. The
+  // default path is pinned by `silence_is_dropped_by_default` below.
+  //
   // The byte-exact strings below are pins captured empirically against
   // this exact tiny-model/option combination (`cargo test -p whisperkit
   // --test pipeline -- --ignored --nocapture
-  // silence_transcribes_to_the_blank_audio_marker`), not derived from a
-  // spec: `result.text()` is exactly the marker, with no surrounding
-  // whitespace. The sole segment's raw `text()` retains its special/
-  // timestamp tokens because this test leaves `skip_special_tokens` at
-  // its default (`false`, unset here) -- segment text is the
+  // silence_transcribes_to_the_blank_audio_marker_when_drop_is_cleared`),
+  // not derived from a spec: `result.text()` is exactly the marker, with
+  // no surrounding whitespace. The sole segment's raw `text()` retains its
+  // special/timestamp tokens because this test leaves `skip_special_tokens`
+  // at its default (`false`, unset here) -- segment text is the
   // undecorated decode, `TranscriptionResult::text()` is the cleaned
   // aggregate view assembled from it, so the two having different
   // shapes is expected, not a bug in either. The representation
   // invariant that falls out of this -- result-level equality against
   // the marker holds, segment-level equality never does under this
   // configuration (`BLANK_AUDIO_MARKER`'s own doc) -- is asserted
-  // explicitly below, not left for a reader to infer from the strings.
+  // explicitly below, not left for a reader to infer from the strings. It
+  // is also exactly why the drop filter matches a segment's CLEAN decode
+  // rather than this raw `text()`.
   let kit = WhisperKit::new(&tiny_options()).unwrap();
   let audio = vec![0.0f32; 5 * whisperkit::constants::SAMPLE_RATE as usize];
   let options = DecodingOptions::new()
     .with_use_prefill_prompt()
-    .with_chunking_strategy(ChunkingStrategy::Disabled);
+    .with_chunking_strategy(ChunkingStrategy::Disabled)
+    .maybe_drop_blank_audio(false);
   let result = kit.transcribe(&audio, &options).unwrap();
   assert_eq!(
     result.text(),
@@ -369,6 +403,37 @@ fn silence_transcribes_to_the_blank_audio_marker() {
     segments[0].text(),
     whisperkit::constants::BLANK_AUDIO_MARKER,
     "segment text must retain its special/timestamp tokens here, unlike result.text()"
+  );
+}
+
+#[test]
+#[ignore = "requires local tiny model (WHISPERKIT_TEST_MODELS)"]
+fn silence_is_dropped_by_default() {
+  // The DEFAULT path over the very same 5 s of digital silence its
+  // drop=false twin above decodes (coremlit issue #14): `drop_blank_audio`
+  // defaults `true`, so the sole `[BLANK_AUDIO]` segment is filtered out
+  // after decoding and the caller gets a genuinely empty result -- zero
+  // segments, empty text -- instead of a one-segment marker transcript.
+  //
+  // Same audio, same model, same prefill/chunking as that twin; the ONLY
+  // difference is the option left at its default. That pairing is the
+  // mutation evidence that this outcome is the filter's doing, not the
+  // decode's.
+  let kit = WhisperKit::new(&tiny_options()).unwrap();
+  let audio = vec![0.0f32; 5 * whisperkit::constants::SAMPLE_RATE as usize];
+  let options = DecodingOptions::new()
+    .with_use_prefill_prompt()
+    .with_chunking_strategy(ChunkingStrategy::Disabled);
+  assert!(
+    options.drop_blank_audio(),
+    "dropping must be the default, with no caller opt-in"
+  );
+  let result = kit.transcribe(&audio, &options).unwrap();
+  assert_eq!(result.text(), "", "got: {:?}", result.text());
+  assert!(
+    result.segments_slice().is_empty(),
+    "got: {:?}",
+    result.segments_slice()
   );
 }
 

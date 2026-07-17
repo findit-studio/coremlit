@@ -93,6 +93,14 @@ pub struct GreedyTokenSampler {
   eot_token: u32,
   top_k: NonZeroUsize,
   rng: StdRng,
+  /// Latches `true` the first time [`Self::sample`] consults `rng` — a real
+  /// multinomial draw, which happens only at a non-zero temperature on a
+  /// non-masked buffer. [`crate::transcribe::TranscribeTask`]'s fallback
+  /// ladder reads this to record whether an RNG draw *actually occurred*,
+  /// rather than inferring it from the accepted attempt's temperature — which
+  /// misses a rejected attempt's draw and overcounts a zero-iteration decode
+  /// (F2, codex round 3). See [`Self::drew_from_rng`].
+  drew_from_rng: bool,
   // Reused across `sample` calls at `temperature != 0` to avoid
   // per-step allocations; cleared and repopulated at the top of that
   // path. `indices` is the top-k candidate list — full-vocab sized, so
@@ -119,6 +127,7 @@ impl GreedyTokenSampler {
       eot_token,
       top_k: NonZeroUsize::new(options.top_k()).unwrap_or(NonZeroUsize::MIN),
       rng: StdRng::from_os_rng(),
+      drew_from_rng: false,
       probs: Vec::new(),
       indices: Vec::new(),
     }
@@ -152,6 +161,19 @@ impl GreedyTokenSampler {
     self.eot_token
   }
 
+  /// Whether [`Self::sample`] has consulted the RNG at least once on this
+  /// sampler — a real multinomial draw (non-zero temperature on a non-masked
+  /// buffer; argmax and the all-masked degenerate path never draw).
+  /// [`crate::transcribe::TranscribeTask`]'s fallback ladder ORs this across a
+  /// window's language probe and every attempt (rejected and retained) to
+  /// record whether the transcript depended on an RNG draw at all — the
+  /// reproducibility fact, recorded rather than inferred from a temperature
+  /// (F2, codex round 3).
+  #[inline(always)]
+  pub const fn drew_from_rng(&self) -> bool {
+    self.drew_from_rng
+  }
+
   /// Samples the next token from a decode step's `logits`. At
   /// `temperature() == 0.0`: argmax, with `logprob` the exact log-softmax
   /// value at the chosen index (`TokenSampler.swift:75,182-197,202-204`).
@@ -164,6 +186,20 @@ impl GreedyTokenSampler {
   /// distribution, matching Swift's `topKProbs...log()` /
   /// `log(softmaxResult[nextToken])`. Either way, `completed` is `token
   /// == eot_token()` (`TokenSampler.swift:233`).
+  ///
+  /// The scaling treats a filter MASK (`-inf`, what [`crate::decode::filter`]
+  /// writes for a suppressed token) as a mask rather than a number: it stays
+  /// `-inf` (probability 0) whatever the sign of `temperature`, so a negative
+  /// temperature cannot flip `-inf * (1 / temperature)` to `+inf` and turn a
+  /// suppressed token into the most-probable one (F1, codex round 4). When a
+  /// near-zero temperature would overflow a finite logit's scaled value
+  /// (`1 / temperature` or `v / temperature` past the f32 range), the scaled
+  /// form collapses distinct logits to one endpoint, so scaling instead falls
+  /// back to a stable-difference softmax `(logit − stab) / temperature` that
+  /// keeps the ordering — the argmax (at a positive temperature; the argmin at
+  /// a negative one) taking probability 1 and logprob 0, every other distinct
+  /// logit −∞ — while ordinary temperatures keep the scaled softmax bit-for-bit
+  /// (F1, codex round 14). Either way `# Panics` below stays true.
   ///
   /// A `top_k` configured above `logits.len()` is clamped to it (Swift's
   /// BNNS path has no defined behavior for that misconfiguration — `try!
@@ -202,15 +238,95 @@ impl GreedyTokenSampler {
     } else {
       self.probs.clear();
       let inv_t = 1.0 / self.temperature;
-      // logits scaled by inv_t, max-shifted by the scaled max — avoids a
-      // second pass over `logits` to find the max of the scaled values.
-      let scaled_max = max * inv_t;
+      // Scale each logit by `1 / temperature`, exactly as Swift does before it
+      // softmaxes the scaled vector (`TokenSampler.swift:109-138`) — but a
+      // filter MASK is a mask, not a number to scale. `decode::filter` writes
+      // `-inf` for a suppressed token (Swift's own filters do too,
+      // `LogitsFilter.swift:81`), and that entry must stay EXCLUDED
+      // (probability 0) whatever the sign of `inv_t`. Scaling it directly is
+      // the F1 bug (codex round 4): a NEGATIVE temperature turns `-inf * inv_t`
+      // into `+inf`, so the masked index becomes the single largest scaled
+      // value.
+      //
+      // A near-zero temperature is a second F1 failure the per-entry clamp
+      // hides (codex round 14): `1/T` (or a finite `v/T`) leaves the f32 range,
+      // so the clamp maps EVERY same-sign finite logit to the same endpoint and
+      // `scale(v) - scaled_max` is `0` for all of them — a UNIFORM draw over
+      // distinct logits, which flips the token and reports `ln(1/n)` where the
+      // limit is `0`. That saturation is exactly the set of FINITE logits whose
+      // `v * inv_t` overflows; when any does, take a stable-difference softmax
+      // that subtracts the stabilizer LOGIT *before* dividing by `temperature`
+      // (`(v - stab) / temperature`), which stays order-preserving and free of
+      // the `finite * inf` / `inf - inf` the scaled form produces. ORDINARY
+      // temperatures never saturate and keep the exact arithmetic below,
+      // bit-for-bit — the Swift-parity path the sampler goldens pin.
+      let saturates = logits
+        .iter()
+        .any(|&v| v.is_finite() && !(v * inv_t).is_finite());
       let mut sum = 0.0f32;
-      self.probs.extend(logits.iter().map(|&v| {
-        let e = (v * inv_t - scaled_max).exp();
-        sum += e;
-        e
-      }));
+      if saturates {
+        // The stabilizer is the logit whose scaled value `v / temperature` is
+        // largest — the MAX finite logit at a positive temperature, the MIN at
+        // a negative one (dividing by a negative reverses the order). Masks
+        // (`-inf`) and any NaN are never the stabilizer and stay excluded. Then
+        // `(v - stab) / temperature` is `0` for the stabilizer (mass `1`,
+        // logprob `0`) and `-inf` for every other distinct finite logit (mass
+        // `0`, logprob `-inf`) — the true softmax limit as `temperature → 0`,
+        // computed with no overflow (`0 / T` and `finite / T` never form a NaN).
+        let stab = if self.temperature > 0.0 {
+          logits
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(f32::NEG_INFINITY, f32::max)
+        } else {
+          logits
+            .iter()
+            .copied()
+            .filter(|v| v.is_finite())
+            .fold(f32::INFINITY, f32::min)
+        };
+        self.probs.extend(logits.iter().map(|&v| {
+          let e = if v.is_finite() {
+            ((v - stab) / self.temperature).exp()
+          } else {
+            0.0 // mask (or a NaN backend logit): excluded from the distribution.
+          };
+          sum += e;
+          e
+        }));
+      } else {
+        // ORDINARY temperature: `v * inv_t` stays in range for every finite
+        // logit, so this is the pre-fix scaled softmax unchanged — masks scale
+        // to `-inf`, and `scale(v) - scaled_max` is numerically stable because
+        // `scaled_max` is the max of the finite scaled values. Bit-identical to
+        // the code the sampler parity goldens pin (F1, codex round 14).
+        let scale = |v: f32| -> f32 {
+          if v == f32::NEG_INFINITY {
+            return f32::NEG_INFINITY; // mask: excluded at any temperature sign.
+          }
+          let scaled = v * inv_t;
+          if scaled.is_nan() {
+            // `0 * ±inf`, the only NaN a finite logit produces here (a subnormal
+            // temperature drove `inv_t` non-finite — unreachable now that such a
+            // temperature routes to the stable path above, but kept so this
+            // branch remains a total, self-contained scaling of any input).
+            0.0
+          } else {
+            scaled.clamp(f32::MIN, f32::MAX)
+          }
+        };
+        let scaled_max = logits
+          .iter()
+          .copied()
+          .map(scale)
+          .fold(f32::NEG_INFINITY, f32::max);
+        self.probs.extend(logits.iter().map(|&v| {
+          let e = (scale(v) - scaled_max).exp();
+          sum += e;
+          e
+        }));
+      }
 
       // Indices of the top-k entries by (unnormalized) probability: a
       // partition instead of a full sort, since only top-k membership and
@@ -226,6 +342,10 @@ impl GreedyTokenSampler {
       indices.truncate(k);
 
       let top_sum: f32 = indices.iter().map(|&i| probs[i]).sum();
+      // A real RNG draw — the fact the fallback ladder records for
+      // reproducibility (F2). Only reached at non-zero temperature on a
+      // non-masked buffer; the argmax and all-masked paths never get here.
+      self.drew_from_rng = true;
       let rnd = self.rng.random_range(0.0..top_sum);
       let mut accumulator = 0.0f32;
       let mut chosen = indices[0];

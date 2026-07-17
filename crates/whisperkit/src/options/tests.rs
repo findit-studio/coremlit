@@ -35,7 +35,75 @@ fn decoding_defaults_match_swift() {
   assert_eq!(o.concurrent_worker_count().get(), 16);
   assert_eq!(o.chunking_strategy(), ChunkingStrategy::Disabled);
   assert!(!o.verbose());
+  // Rust-only addition (coremlit issue #14), and the ONE default here that
+  // deliberately does NOT match Swift: Swift emits `[BLANK_AUDIO]` for
+  // silence, this drops it unless the caller opts back in. Pinned in full
+  // by `drop_blank_audio_defaults_on_and_opts_out_to_swift_parity`.
+  assert!(o.drop_blank_audio());
+  // Rust-only addition (coremlit issue #14). Swift has no grouping knob at
+  // all — it picks one from a language it detects internally, landing on
+  // the coarse `Phrase` shape for CJK. This default preserves THIS port's
+  // #11-pinned fine-grained CJK grouping; Swift's is the explicit opt-in.
+  assert_eq!(o.word_grouping(), WordGrouping::FineGrained);
   assert_eq!(DecodingOptions::default(), DecodingOptions::new());
+}
+
+#[test]
+fn drop_blank_audio_defaults_on_and_opts_out_to_swift_parity() {
+  // Default ON (the maintainer decision on coremlit issue #14 — the
+  // inverse of that issue's originally-proposed `suppress_blank_audio:
+  // false`), pinned to the const so the two cannot drift apart.
+  let o = DecodingOptions::new();
+  assert!(o.drop_blank_audio());
+  assert_eq!(o.drop_blank_audio(), DEFAULT_DROP_BLANK_AUDIO); // pin to const
+
+  // Full bool vocabulary: `clear_` is the Swift-parity escape hatch.
+  assert!(
+    !DecodingOptions::new()
+      .maybe_drop_blank_audio(false)
+      .drop_blank_audio()
+  );
+  assert!(
+    DecodingOptions::new()
+      .with_drop_blank_audio()
+      .drop_blank_audio()
+  );
+  let mut m = DecodingOptions::new();
+  m.clear_drop_blank_audio();
+  assert!(!m.drop_blank_audio(), "clear_ opts out to Swift parity");
+  m.set_drop_blank_audio();
+  assert!(m.drop_blank_audio());
+  m.update_drop_blank_audio(false);
+  assert!(!m.drop_blank_audio());
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn drop_blank_audio_serde_default_is_true_not_bool_default() {
+  // The whole reason this field carries `serde(default = "fn")` rather than
+  // the bare `serde(default)`: `bool::default()` is `false`, which is the
+  // OPPOSITE of this knob's contract. A config that omits the field must
+  // still DROP; only an explicit `false` opts out.
+  let omitted: DecodingOptions = serde_json::from_str("{}").unwrap();
+  assert!(
+    omitted.drop_blank_audio(),
+    "an omitted field must default to dropping, not to bool::default()"
+  );
+  let explicit_false: DecodingOptions =
+    serde_json::from_str(r#"{"drop_blank_audio":false}"#).unwrap();
+  assert!(!explicit_false.drop_blank_audio());
+
+  // Round-trips in both states (always serialized — never skipped, so a
+  // persisted provenance-grade config always records which way it ran).
+  for wanted in [true, false] {
+    let options = DecodingOptions::new().maybe_drop_blank_audio(wanted);
+    let json = serde_json::to_string(&options).unwrap();
+    assert!(json.contains("drop_blank_audio"));
+    assert_eq!(
+      serde_json::from_str::<DecodingOptions>(&json).unwrap(),
+      options
+    );
+  }
 }
 
 #[test]
@@ -80,6 +148,58 @@ fn enums_round_trip_and_display() {
     ChunkingStrategy::Disabled
   );
   assert!("bogus".parse::<Task>().is_err());
+
+  for g in [WordGrouping::FineGrained, WordGrouping::SwiftParity] {
+    assert_eq!(g.as_str().parse::<WordGrouping>().unwrap(), g);
+  }
+  assert_eq!(WordGrouping::FineGrained.to_string(), "fine_grained");
+  assert_eq!(WordGrouping::SwiftParity.as_str(), "swift_parity");
+  assert!("bogus".parse::<WordGrouping>().is_err());
+}
+
+#[test]
+fn word_grouping_defaults_to_fine_grained() {
+  // The #11-pinned CJK behavior stays the default: a caller who never
+  // mentions grouping gets the fine-grained split, and Swift's coarse
+  // phrase-blob grouping is reachable only by naming it (coremlit #14).
+  assert_eq!(WordGrouping::default(), WordGrouping::FineGrained);
+  assert_eq!(
+    DecodingOptions::new().word_grouping(),
+    WordGrouping::FineGrained
+  );
+  assert!(DecodingOptions::new().word_grouping().is_fine_grained());
+
+  let built = DecodingOptions::new().with_word_grouping(WordGrouping::SwiftParity);
+  assert_eq!(built.word_grouping(), WordGrouping::SwiftParity);
+  assert!(built.word_grouping().is_swift_parity());
+
+  let mut m = DecodingOptions::new();
+  m.set_word_grouping(WordGrouping::SwiftParity);
+  assert_eq!(m.word_grouping(), WordGrouping::SwiftParity);
+  m.set_word_grouping(WordGrouping::FineGrained);
+  assert_eq!(m.word_grouping(), WordGrouping::FineGrained);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn word_grouping_serde_omitted_stays_fine_grained() {
+  // An omitted field must NOT silently opt a config into Swift's coarse
+  // grouping — the whole point of making `Phrase` explicit.
+  let omitted: DecodingOptions = serde_json::from_str("{}").unwrap();
+  assert_eq!(omitted.word_grouping(), WordGrouping::FineGrained);
+
+  let phrase: DecodingOptions =
+    serde_json::from_str(r#"{"word_grouping":"swift_parity"}"#).unwrap();
+  assert_eq!(phrase.word_grouping(), WordGrouping::SwiftParity);
+
+  for wanted in [WordGrouping::FineGrained, WordGrouping::SwiftParity] {
+    let options = DecodingOptions::new().with_word_grouping(wanted);
+    let json = serde_json::to_string(&options).unwrap();
+    assert_eq!(
+      serde_json::from_str::<DecodingOptions>(&json).unwrap(),
+      options
+    );
+  }
 }
 
 #[cfg(feature = "serde")]
@@ -242,10 +362,47 @@ fn detect_language_serde_tristate() {
 
 #[test]
 fn compute_defaults_match_swift_model_compute_options() {
+  // Pinned against the Swift source, `Models.swift:92-118`
+  // (`ModelComputeOptions.init`):
+  //
+  //   melCompute:         MLComputeUnits = .cpuAndGPU
+  //   audioEncoderCompute: MLComputeUnits? = nil
+  //                        -> .cpuAndNeuralEngine  (macOS 14+/iOS 17+)
+  //                        -> .cpuAndGPU           (older, not a target here)
+  //   textDecoderCompute:  MLComputeUnits = .cpuAndNeuralEngine
+  //
+  // (Swift's `isRunningOnSimulator` branch forces all three to `.cpuOnly`;
+  // this crate is macOS/CoreML-on-device only, so that branch has no
+  // counterpart and is deliberately not ported.)
+  //
+  // These three constants are what the crate SHIPS, and therefore what the
+  // parity goldens must run on: `jfk_tiny_golden.json`/`es_tiny_golden.json`
+  // were captured from `whisperkit-cli @ argmax-oss-swift` on the ANE, so
+  // `tests/parity_jfk.rs`/`parity_es.rs` assert `Options::new`'s compute
+  // units against exactly these values before building the pipeline. A gate
+  // validating a shipping default must run on the shipping default — see
+  // those tests, and `tests/pipeline.rs`, for the rule. Changing a value
+  // here without re-capturing the goldens against the new compute path is a
+  // silent parity break; that is what this test exists to stop.
+  assert_eq!(DEFAULT_MEL_COMPUTE_UNITS, coremlit::ComputeUnits::CpuAndGpu);
+  assert_eq!(
+    DEFAULT_ENCODER_COMPUTE_UNITS,
+    coremlit::ComputeUnits::CpuAndNeuralEngine
+  );
+  assert_eq!(
+    DEFAULT_DECODER_COMPUTE_UNITS,
+    coremlit::ComputeUnits::CpuAndNeuralEngine
+  );
+
+  // ...and `ComputeOptions::new()` — what `Options::new` hands the pipeline —
+  // really is built from those constants, not from `ComputeUnits::default()`
+  // (which is `All`, coremlit's own general-purpose default, and matches
+  // none of them).
   let c = ComputeOptions::new();
-  assert_eq!(c.mel(), coremlit::ComputeUnits::CpuAndGpu);
-  assert_eq!(c.encoder(), coremlit::ComputeUnits::CpuAndNeuralEngine);
-  assert_eq!(c.decoder(), coremlit::ComputeUnits::CpuAndNeuralEngine);
+  assert_eq!(c.mel(), DEFAULT_MEL_COMPUTE_UNITS);
+  assert_eq!(c.encoder(), DEFAULT_ENCODER_COMPUTE_UNITS);
+  assert_eq!(c.decoder(), DEFAULT_DECODER_COMPUTE_UNITS);
+  assert_eq!(Options::new("m", "t").compute(), c);
 }
 
 #[test]
@@ -444,4 +601,66 @@ fn seed_serde_absent_when_unset_round_trips_when_set() {
 fn compute_units_rejects_unknown_names() {
   let err = serde_json::from_str::<ComputeOptions>(r#"{"mel":"bogus"}"#).unwrap_err();
   assert!(err.to_string().contains("unknown compute units name"));
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn non_finite_floats_are_rejected_at_the_serde_boundary() {
+  // Codex round 3, F6. `serde_json` has no JSON form for `NaN`/±∞ and silently
+  // writes `null` for each, so `with_compression_ratio_threshold(-inf)` would
+  // serialize `Some(-inf)` as `null` and deserialize back as `None` — a check
+  // that fired on every finite ratio SILENTLY DISABLED across a round trip.
+  // Swift closes the same hole from the encode side (`DecodingOptions: Codable`,
+  // `Configurations.swift:155`, default throwing `JSONEncoder`); this port
+  // refuses a non-finite float on BOTH sides of the wire, so the lossy `null`
+  // is never produced and the round trip stays lossless. Covers all three field
+  // shapes the finding names — scalar, optional, vector — against NaN and both
+  // infinities.
+  for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+    // scalar f32
+    assert!(
+      serde_json::to_string(&DecodingOptions::new().with_temperature(bad)).is_err(),
+      "a non-finite scalar `temperature` must be refused, not written as null"
+    );
+    assert!(serde_json::to_string(&DecodingOptions::new().with_window_clip_time(bad)).is_err());
+    // optional Option<f32> — the exact finding field
+    assert!(
+      serde_json::to_string(&DecodingOptions::new().with_compression_ratio_threshold(bad)).is_err(),
+      "a non-finite threshold must be refused, or it round-trips to a forged `None`"
+    );
+    // vector Vec<f32>
+    assert!(
+      serde_json::to_string(&DecodingOptions::new().with_clip_timestamps(vec![0.0, bad])).is_err()
+    );
+  }
+
+  // The deserialize side is guarded too: a JSON literal that overflows to a
+  // non-finite value must be rejected, not silently accepted (serde_json parses
+  // `1e400` to an infinity, and the finite guard then refuses it).
+  assert!(serde_json::from_str::<DecodingOptions>(r#"{"temperature":1e400}"#).is_err());
+  assert!(serde_json::from_str::<DecodingOptions>(r#"{"clip_timestamps":[1e400]}"#).is_err());
+  assert!(
+    serde_json::from_str::<DecodingOptions>(r#"{"compression_ratio_threshold":1e400}"#).is_err()
+  );
+
+  // `null` for a threshold is STILL the honest "check disabled" — only a
+  // non-finite NUMBER is rejected, never a genuine `None`. This is the
+  // distinction the whole finding turns on.
+  let disabled: DecodingOptions =
+    serde_json::from_str(r#"{"compression_ratio_threshold":null}"#).unwrap();
+  assert_eq!(disabled.compression_ratio_threshold(), None);
+
+  // A finite config — negative temperatures included, which F1 keeps valid
+  // in-memory — still round-trips losslessly, the property the guard protects.
+  let finite = DecodingOptions::new()
+    .with_temperature(-0.2)
+    .with_window_clip_time(0.5)
+    .with_compression_ratio_threshold(2.4)
+    .maybe_logprob_threshold(None)
+    .with_clip_timestamps(vec![0.0, 1.5, 3.0]);
+  let json = serde_json::to_string(&finite).unwrap();
+  assert_eq!(
+    serde_json::from_str::<DecodingOptions>(&json).unwrap(),
+    finite
+  );
 }

@@ -12,9 +12,13 @@
 //! ownership is enough, matching Swift's own lock-free
 //! `TranscriptionResultStruct` sibling (`Models.swift:543-563`) rather
 //! than the locked `TranscriptionResult` class. `serde` (optional
-//! feature) never emits `null`; `Vec`/`String` fields that carry
-//! meaningful "not present" semantics are empty-means-absent
-//! (`skip_serializing_if` + `default`, golden §10).
+//! feature) never emits `null` for the Swift-parity fields; `Vec`/`String`
+//! fields that carry meaningful "not present" semantics are
+//! empty-means-absent (`skip_serializing_if` + `default`, golden §10). The
+//! sole exception is the Rust-only [`TaskFacts`] a
+//! [`TranscriptionResult`] carries, whose explicit-unknown reproducibility
+//! facts serialize as a deliberate `null` (see that type) so a dropped key
+//! is distinguishable from an unknown value.
 //!
 //! [`needs_fallback`]'s decision order and comparisons are copied verbatim
 //! from Swift's `DecodingFallback.init?` (`Models.swift:357-381`) — see
@@ -22,7 +26,11 @@
 //! this task's own brief (the "silence" short-circuit does not consult
 //! `avg_logprob`, contrary to the brief's exploration).
 
-use crate::{constants::DEFAULT_LANGUAGE_CODE, options::DecodingOptions};
+use crate::{
+  constants::DEFAULT_LANGUAGE_CODE,
+  options::DecodingOptions,
+  task_facts::{SpanKnowledge, TaskFacts, TaskFactsAccumulator},
+};
 
 pub mod writer;
 
@@ -167,7 +175,21 @@ pub struct TranscriptionSegment {
   )]
   token_log_probs: Vec<(u32, f32)>,
   /// Sampling temperature this segment was decoded at.
-  #[cfg_attr(feature = "serde", serde(default = "default_segment_temperature"))]
+  ///
+  /// Bridged through the finite-float `serde` helper (codex round 3, F6) — the
+  /// one segment float that is: it is what `provenance`'s
+  /// `unanimous_temperature` reads for the effective temperature it records, so
+  /// a non-finite value silently changing across a round
+  /// trip would corrupt that record. The descriptive telemetry floats beside
+  /// it (`avg_logprob`, `compression_ratio`, `no_speech_prob`) are left as-is:
+  /// `compression_ratio` legitimately reaches `f32::INFINITY` on empty text.
+  #[cfg_attr(
+    feature = "serde",
+    serde(
+      default = "default_segment_temperature",
+      with = "crate::options::finite_f32"
+    )
+  )]
   temperature: f32,
   /// Average sampled-token log probability.
   #[cfg_attr(feature = "serde", serde(default))]
@@ -1178,12 +1200,52 @@ pub struct TranscriptionResult {
     serde(default, skip_serializing_if = "Option::is_none")
   )]
   seek_time: Option<f32>,
+  /// The decode-time facts this transcription **run controlled** — whether it
+  /// drew from the token sampler, the language it genuinely observed, whether a
+  /// progress callback truncated it, whether it swallowed a child error, the
+  /// worker coordinates its RNG streams rode, and the segment-id span its decode
+  /// allocated — as one carried record (coremlit issue #14, codex round 6).
+  /// Replaces the six separate fields these facts used to scatter across, whose
+  /// per-fact plumbing lost or fabricated three of them at aggregation
+  /// boundaries; see
+  /// [`TaskFacts`](crate::task_facts::TaskFacts) for the history and the one
+  /// merge law [`merge_transcription_results_with_options`] now folds them by.
+  ///
+  /// [`Provenance::for_result`](crate::provenance::Provenance::for_result) reads
+  /// this record whole; [`Self::new`] starts it
+  /// [`TaskFacts::unknown`](crate::task_facts::TaskFacts::unknown) (a hand-built
+  /// result drew nothing, witnessed no language, was not truncated, and rode an
+  /// **unknown** worker coordinate — never a fabricated `0`), and the pipeline
+  /// sets the observed value via [`Self::with_task_facts`].
+  ///
+  /// Required on deserialize: the reproducibility facts inside it must never
+  /// silently default to their optimistic values (see that type's serde
+  /// contract).
+  task_facts: TaskFacts,
 }
 
 impl TranscriptionResult {
   /// Builds a result from its four required fields (Swift
   /// `TranscriptionResultStruct.init`, `Models.swift:550-562`, has no
-  /// defaults for these either); [`Self::seek_time`] starts `None`.
+  /// defaults for these either); [`Self::seek_time`] starts `None` and
+  /// [`Self::task_facts`] starts [`TaskFacts::unknown`].
+  ///
+  /// A result assembled by hand therefore records an **unknown** sampling draw,
+  /// **no** observed language, an **unknown** callback truncation, an **unknown**
+  /// swallowed child error, an **unknown** worker coordinate (never a fabricated
+  /// `0`, R6-F2), and an untracked id span — explicit unknown throughout, never
+  /// the optimistic `Some(false)` a "nothing happened" default would forge (F1).
+  /// That is the right default for a caller inventing a transcript, and it is not
+  /// a hole in the reproducibility guarantee:
+  /// [`Provenance::for_result`](crate::provenance::Provenance::for_result) TRUSTS
+  /// this carried record whole rather than scanning the surviving segments' own
+  /// temperatures (inferring the draw from the survivors was the bug it
+  /// replaced), so an unknown draw is treated CONSERVATIVELY as non-reproducible,
+  /// never optimistically waved through. What only the carried
+  /// [`TaskFacts::drew_from_rng`](crate::task_facts::TaskFacts::drew_from_rng)
+  /// flag can carry is a sampled window whose segments are *gone* — and only
+  /// the decode path can know about those, setting the observed facts via
+  /// [`Self::with_task_facts`].
   pub fn new(
     text: impl Into<String>,
     segments: impl Into<Vec<TranscriptionSegment>>,
@@ -1196,6 +1258,13 @@ impl TranscriptionResult {
       language: language.into(),
       timings,
       seek_time: None,
+      // A hand-built result controlled no decode, so it cannot OBSERVE whether a
+      // draw, a callback truncation, or a swallowed child error occurred: it
+      // records explicit UNKNOWN for each (never the optimistic Some(false)),
+      // witnessed no language, rode an UNKNOWN worker coordinate (never a
+      // fabricated 0), and tracked no id span. The pipeline sets the observed
+      // record via `with_task_facts`.
+      task_facts: TaskFacts::unknown(),
     }
   }
 
@@ -1267,6 +1336,39 @@ impl TranscriptionResult {
   #[inline(always)]
   pub fn set_language(&mut self, language: impl Into<String>) -> &mut Self {
     self.language = language.into();
+    self
+  }
+
+  // -- task_facts ----------------------------------------------------------
+  /// The decode-time facts this transcription run **controlled** — the RNG
+  /// draw, the observed language, the early-stop truncation, the worker
+  /// coordinates, and the allocated id span — as one record.
+  /// [`Provenance::for_result`](crate::provenance::Provenance::for_result)
+  /// reads it whole. See the field's doc.
+  #[inline(always)]
+  pub const fn task_facts(&self) -> &TaskFacts {
+    &self.task_facts
+  }
+  /// Mutable access to [`Self::task_facts`] — the pipeline uses it to
+  /// [`merge`](crate::task_facts::TaskFacts::merge) a shared sink's recovered
+  /// facts (a dropped-because-errored VAD chunk's draw/observation/early stop)
+  /// into a merged transcript in place.
+  #[inline(always)]
+  pub const fn task_facts_mut(&mut self) -> &mut TaskFacts {
+    &mut self.task_facts
+  }
+  /// Builder form of [`Self::set_task_facts`].
+  #[must_use]
+  #[inline(always)]
+  pub fn with_task_facts(mut self, task_facts: TaskFacts) -> Self {
+    self.set_task_facts(task_facts);
+    self
+  }
+  /// Assigns [`Self::task_facts`] directly — the pipeline passes the record it
+  /// accumulated across the decode.
+  #[inline(always)]
+  pub fn set_task_facts(&mut self, task_facts: TaskFacts) -> &mut Self {
+    self.task_facts = task_facts;
     self
   }
 
@@ -1388,6 +1490,32 @@ pub struct DecodingResult {
     serde(default, skip_serializing_if = "Vec::is_empty")
   )]
   language_probs: Vec<(String, f32)>,
+  /// The language the model actually PREDICTED (an ISO code), or `None` when it
+  /// predicted none — a genuine in-loop language detection. Distinct from the
+  /// Swift-faithful display [`Self::language`], which reports the FIRST language
+  /// token in the WHOLE sequence (the forced prefill `<|en|>` included): this is
+  /// the first `<|lang|>` token the model emitted at or after the forced prompt,
+  /// so the two disagree exactly when a forced `<|en|>` prefill is followed by a
+  /// differently-predicted language.
+  ///
+  /// `None` for a configured language (an input, not a detection), for the
+  /// [`DEFAULT_LANGUAGE_CODE`] display fallback, and when the predicted region
+  /// holds no language token at all (a zero-iteration decode forces `<|en|>`
+  /// into the prompt but predicts nothing). The pipeline promotes THIS predicted
+  /// code into the result's
+  /// [`TaskFacts::observed_language`](crate::task_facts::TaskFacts::observed_language);
+  /// recording the display
+  /// [`Self::language`] there instead would misreport a forced `<|en|>` as the
+  /// detection when a different language was predicted after it (coremlit issue
+  /// #14, codex round 5) — the reason this carries the predicted STRING and not
+  /// a mere "observed" boolean. Not a Swift field — Swift's `DecodingResult` has
+  /// no detection-provenance concept, the same Rust-only extension rationale as
+  /// the sibling [`Self::first_token_log_prob`] (see this struct's doc).
+  #[cfg_attr(
+    feature = "serde",
+    serde(default, skip_serializing_if = "Option::is_none")
+  )]
+  observed_language: Option<String>,
   /// Sampled token ids for this window.
   #[cfg_attr(
     feature = "serde",
@@ -1420,6 +1548,19 @@ pub struct DecodingResult {
   /// see this struct's doc comment).
   #[cfg_attr(feature = "serde", serde(default))]
   first_token_log_prob: f32,
+  /// Whether a progress callback requested an early stop that TRUNCATED this
+  /// window's decode (`Some(false)` past the prefill steps) — a caller CONTROL
+  /// action, distinct from every ordinary termination (EOT, the token-context
+  /// cap, a too-low first-token log-prob). The pipeline carries this out to the
+  /// result's [`TaskFacts::early_stopped`](crate::task_facts::TaskFacts::early_stopped),
+  /// which
+  /// [`Provenance::is_reproducible`](crate::provenance::Provenance::is_reproducible)
+  /// reads: a transcript an unrecorded callback truncated cannot be reproduced
+  /// from the recorded options and seed alone (coremlit issue #14, codex round
+  /// 5). Not a Swift field — the same Rust-only extension rationale as the
+  /// sibling [`Self::first_token_log_prob`].
+  #[cfg_attr(feature = "serde", serde(default))]
+  early_stopped: bool,
 }
 
 impl Default for DecodingResult {
@@ -1435,6 +1576,7 @@ impl DecodingResult {
     Self {
       language: String::new(),
       language_probs: Vec::new(),
+      observed_language: None,
       tokens: Vec::new(),
       token_log_probs: Vec::new(),
       text: String::new(),
@@ -1443,6 +1585,7 @@ impl DecodingResult {
       temperature: 0.0,
       compression_ratio: 0.0,
       first_token_log_prob: 0.0,
+      early_stopped: false,
     }
   }
 
@@ -1485,6 +1628,32 @@ impl DecodingResult {
   #[inline(always)]
   pub fn set_language_probs(&mut self, language_probs: impl Into<Vec<(String, f32)>>) -> &mut Self {
     self.language_probs = language_probs.into();
+    self
+  }
+
+  // -- observed_language (Option<String>) ----------------------------------
+  /// The language the model actually PREDICTED (an ISO code), or `None`. A
+  /// genuine in-loop detection, SEPARATE from the Swift-faithful display
+  /// [`Self::language`]; see the field doc for how the pipeline promotes this
+  /// into the result's
+  /// [`TaskFacts::observed_language`](crate::task_facts::TaskFacts::observed_language),
+  /// and why it is not the display language.
+  #[inline(always)]
+  pub fn observed_language(&self) -> Option<&str> {
+    self.observed_language.as_deref()
+  }
+  /// Builder form of [`Self::update_observed_language`].
+  #[must_use]
+  #[inline(always)]
+  pub fn maybe_observed_language(mut self, observed_language: Option<String>) -> Self {
+    self.update_observed_language(observed_language);
+    self
+  }
+  /// Assigns [`Self::observed_language`] directly — the finalized decode passes
+  /// the predicted language code, or `None` when nothing was predicted.
+  #[inline(always)]
+  pub fn update_observed_language(&mut self, observed_language: Option<String>) -> &mut Self {
+    self.observed_language = observed_language;
     self
   }
 
@@ -1647,6 +1816,29 @@ impl DecodingResult {
   #[inline(always)]
   pub const fn set_first_token_log_prob(&mut self, first_token_log_prob: f32) -> &mut Self {
     self.first_token_log_prob = first_token_log_prob;
+    self
+  }
+
+  // -- early_stopped (bool) ------------------------------------------------
+  /// Whether a progress callback truncated this window's decode with an early
+  /// stop. See the field doc; the pipeline carries this to the result's
+  /// [`TaskFacts::early_stopped`](crate::task_facts::TaskFacts::early_stopped).
+  #[inline(always)]
+  pub const fn early_stopped(&self) -> bool {
+    self.early_stopped
+  }
+  /// Builder form of [`Self::update_early_stopped`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn maybe_early_stopped(mut self, early_stopped: bool) -> Self {
+    self.update_early_stopped(early_stopped);
+    self
+  }
+  /// Assigns [`Self::early_stopped`] directly — the decode loop passes whether
+  /// its early-stop latch fired.
+  #[inline(always)]
+  pub const fn update_early_stopped(&mut self, early_stopped: bool) -> &mut Self {
+    self.early_stopped = early_stopped;
     self
   }
 }
@@ -2093,7 +2285,20 @@ fn min_timing(results: &[TranscriptionResult], f: impl Fn(&TranscriptionTimings)
 ///
 /// - [`TranscriptionResult::text`][]: every result's text, joined with `"
 ///   "` (:82-84; empty for empty `results`, matching `[].joined(separator:
-///   " ") == ""`).
+///   " ") == ""`). **An empty-text result is joined as a bare separator,
+///   not skipped** — faithfully, because Swift's `validResults`
+///   `compactMap`s away only *nil* elements (`:80`), never empty-text ones,
+///   so `["a", "", "b"].joined(separator: " ")` is `"a  b"` there too. A
+///   zero-segment, empty-text result is reachable on its own — any audio
+///   shorter than [`DecodingOptions::window_clip_time`](crate::options::DecodingOptions::window_clip_time)
+///   runs no window at all and returns one — and this port keeps the
+///   quirk rather than "fixing" it, exactly like the segment re-`id`
+///   below. This function is therefore the merge for
+///   [`DecodingOptions::drop_blank_audio`](crate::options::DecodingOptions::drop_blank_audio)
+///   `== false` — exact Swift — by definition;
+///   [`merge_transcription_results_with_options`] is the entry point that
+///   skips the empties instead, for the callers whose own options made an
+///   emptied result routine. Both share one implementation.
 /// - [`TranscriptionResult::segments_slice`][]: every result's segments,
 ///   concatenated in order, each re-`id`'d to `result_index +
 ///   segment_index` (:89-94) — a faithful bug-for-bug port: upstream
@@ -2153,16 +2358,276 @@ fn min_timing(results: &[TranscriptionResult], f: impl Fn(&TranscriptionTimings)
 ///   than folded into the max-for-load-times group they would naively
 ///   belong to.
 pub fn merge_transcription_results(results: &[TranscriptionResult]) -> TranscriptionResult {
+  // `false` — Swift's own join: every text participates, an empty one as a
+  // bare separator. See this function's doc for why that is not "fixed".
+  merge_results(results, false)
+}
+
+/// Merges `results` exactly as [`merge_transcription_results`] does, but
+/// takes the [`DecodingOptions`] they were decoded under and applies the
+/// one merge rule those options govern: when
+/// [`DecodingOptions::drop_blank_audio`] is set (**the default**), a result
+/// whose text is empty contributes **nothing to the text join** — not the
+/// bare `" "` separator Swift's join gives it.
+///
+/// This is the entry point for folding a
+/// [`WhisperKit::transcribe_all`](crate::transcribe::WhisperKit::transcribe_all)
+/// batch, and the one
+/// [`WhisperKit::transcribe`](crate::transcribe::WhisperKit::transcribe)'s
+/// VAD branch uses for its own chunk results. Hand it the same `options`
+/// the results were decoded with and the merged text cannot contradict
+/// them.
+///
+/// # Why the option has to reach the merge at all
+///
+/// [`DecodingOptions::drop_blank_audio`] makes an **empty result routine**:
+/// a wholly-silent VAD chunk — the chunker is *contiguous*, so silence is
+/// cut around, never skipped — decodes to nothing but
+/// [`BLANK_AUDIO_MARKER`](crate::constants::BLANK_AUDIO_MARKER), the filter
+/// removes that one segment, and the chunk is left with no text at all.
+/// Joined Swift's way, every such chunk lands in the transcript as a bare
+/// separator: a doubled space between two speech runs, a leading or
+/// trailing one at the clip's edges. [`merge_transcription_results`] cannot
+/// simply filter them out, because an empty-text result is **not** unique
+/// to the drop — any audio shorter than
+/// [`DecodingOptions::window_clip_time`] runs no window and returns one,
+/// which predates this option entirely — and Swift joins *those* as bare
+/// separators too, so filtering there would silently change the
+/// `drop_blank_audio == false` path, whose whole purpose is to be
+/// byte-for-byte Swift. The rule therefore travels with the option that
+/// created the need for it, and this is where the two meet.
+///
+/// # What is skipped is *empty text*, not *blank audio*
+///
+/// The merge cannot see **why** a result came back empty, and deliberately
+/// does not ask. With `drop_blank_audio` set, an empty result from
+/// **short audio** is skipped from the join exactly like an emptied blank
+/// chunk. That is the intended reading of the option — *blank-dropping
+/// means empty chunks do not pollute the text* — not an accidental
+/// over-reach: a caller who asked not to see `[BLANK_AUDIO]` has no more
+/// use for a bare separator standing in for a sub-second clip than for one
+/// standing in for silence. Callers who want Swift's join for every input,
+/// empties included, call [`merge_transcription_results`] — or clear the
+/// option, which makes this function that one exactly.
+///
+/// # Every result is still merged
+///
+/// Only the *join* skips empties. Segment concatenation and every timing
+/// reduction run over **all** of `results` either way, so the merged
+/// segments' text and words, and every timing field — the summed
+/// [`input_audio_seconds`](TranscriptionTimings::input_audio_seconds) and
+/// [`audio_processing`](TranscriptionTimings::audio_processing), the
+/// [`real_time_factor`](TranscriptionTimings::real_time_factor) derived
+/// from them, all of it — are byte-identical to
+/// [`merge_transcription_results`]'s on the same input, whichever way the
+/// option is set. Dropping an emptied result from the merge *input* instead
+/// would take its metrics out with it, quietly corrupting the sums (and the
+/// RTF) to fix a spacing bug.
+///
+/// The option is **not** confined to [`TranscriptionResult::text`], though.
+/// It also selects the segment **id mapping**: a running injective base when
+/// dropping, Swift's `result_index + segment_index` when not (see the section
+/// below). So the merged segments' ids — but nothing else about them — can
+/// differ between the two settings even when every text is non-empty. (The
+/// [`confirmed_words`](merge_transcription_results_with_words) door notes the
+/// same, and depends on it.)
+///
+/// # The segment id mapping depends on the option, too
+///
+/// With the drop ON (the default), each chunk's survivors are re-`id`'d onto a
+/// running base that advances by the chunk's decoded id span — injective across
+/// chunks, each chunk's local gaps preserved. With it OFF, the ids are exactly
+/// Swift's `result_index + segment_index`, which **duplicates** ids across a
+/// multi-segment chunk (pinned parity). Two chunks with local ids `[0, 2]` and
+/// `[0, 1]` therefore merge to `[0, 2, 3, 4]` dropped but `[0, 1, 1, 2]` not:
+///
+/// ```
+/// use whisperkit::options::DecodingOptions;
+/// use whisperkit::result::{
+///   TranscriptionResult, TranscriptionSegment, TranscriptionTimings,
+///   merge_transcription_results_with_options,
+/// };
+///
+/// // Two chunks whose survivors sit at local ids [0, 2] and [0, 1].
+/// let chunk = |ids: &[usize]| {
+///   let segments: Vec<TranscriptionSegment> = ids
+///     .iter()
+///     .map(|&id| {
+///       let mut s = TranscriptionSegment::new();
+///       s.set_id(id).set_text(" w");
+///       s
+///     })
+///     .collect();
+///   TranscriptionResult::new(" w w", segments, "en", TranscriptionTimings::new())
+/// };
+/// let results = [chunk(&[0, 2]), chunk(&[0, 1])];
+/// let ids =
+///   |r: &TranscriptionResult| r.segments_slice().iter().map(|s| s.id()).collect::<Vec<_>>();
+///
+/// // Dropping ON (the default): a running injective base -> [0, 2, 3, 4].
+/// let dropped = merge_transcription_results_with_options(&results, &DecodingOptions::new());
+/// assert_eq!(ids(&dropped), [0, 2, 3, 4]);
+///
+/// // Dropping OFF: Swift's result_index + segment_index -> [0, 1, 1, 2] (ids collide).
+/// let swift = merge_transcription_results_with_options(
+///   &results,
+///   &DecodingOptions::new().maybe_drop_blank_audio(false),
+/// );
+/// assert_eq!(ids(&swift), [0, 1, 1, 2]);
+/// ```
+///
+/// # Panics
+///
+/// When [`DecodingOptions::drop_blank_audio`] is set, each chunk's segment ids
+/// are re-mapped onto a running base advancing by the chunk's id span, so the
+/// merged ids stay injective while preserving each chunk's local gaps. That
+/// arithmetic is checked: a hand-built segment id near [`usize::MAX`] panics
+/// deliberately rather than wrapping into a colliding id. Pipeline-produced
+/// ids are small decode ordinals and never approach this.
+pub fn merge_transcription_results_with_options(
+  results: &[TranscriptionResult],
+  options: &DecodingOptions,
+) -> TranscriptionResult {
+  merge_results(results, options.drop_blank_audio())
+}
+
+/// Each child's **effective** span knowledge for the drop-ON merge: its carried
+/// [`TaskFacts::decoded_span`] **floored by its own survivors' extent** — `max
+/// local id + 1`, or `0` when none survived. This is the round-9 F2 trust rule
+/// lifted from a bare number to a [`SpanKnowledge`](crate::task_facts::SpanKnowledge):
+/// a carried bound legitimately EXCEEDS the extent when a filter dropped ordinals
+/// after allocating them (the whole reason it is carried), but a carried bound
+/// BELOW the extent under-counts — a hand-built or deserialized inconsistency —
+/// so the extent is the trusted floor, never blindly the carried value.
+///
+/// - [`Exact(n)`](crate::task_facts::SpanKnowledge::Exact) stays `Exact(n)` when
+///   the extent does not exceed `n`; when the survivors OUT-count `n` the exact
+///   claim is contradicted, so it degrades to `AtLeast(extent)` — a bound, no
+///   longer a fabricated exact total.
+/// - [`AtLeast(k)`](crate::task_facts::SpanKnowledge::AtLeast) floors to
+///   `AtLeast(max(k, extent))`; a [wholly-unknown](crate::task_facts::SpanKnowledge::wholly_unknown)
+///   `AtLeast(0)` therefore relies on the extent outright.
+///
+/// This ONE value drives BOTH the drop-ON id-base advance AND the drop-ON stored
+/// fold (codex round 13, M1): the base advances by its
+/// [lower bound](crate::task_facts::SpanKnowledge::lower_bound), and the merged
+/// result STORES the fold of these same effective spans — so every staging
+/// materializes the same floors at the same points and the stored fact after any
+/// partial merge carries them. Folding the RAW carried spans instead left the
+/// store staging-dependent: a left-staged `merge([merge([A, B]), T])` stored a
+/// bound below the floors the one-shot ids had already committed to, so a further
+/// re-merge (its survivor extent too small to recover the lost floor) renumbered a
+/// trailing chunk onto an id the one-shot merge left free.
+///
+/// **`None` when the survivors' extent overflows `usize`** (a hand-built segment
+/// id at [`usize::MAX`]): the extent is then unrepresentable. At the drop-ON
+/// id-base advance a `None` is the documented DELIBERATE panic — the span there
+/// drives an injective id mapping that cannot proceed past `usize::MAX` without a
+/// colliding wraparound (see [`merge_transcription_results_with_options`]'s own
+/// `# Panics`). The drop-OFF fold never calls this at all: its ids are Swift's
+/// `result_index + segment_index` and never consult the span, so it folds the RAW
+/// carried spans and never touches the overflowing extent (codex round 8, F4).
+fn effective_span_knowledge(result: &TranscriptionResult) -> Option<SpanKnowledge> {
+  // The survivors' own extent — `max local id + 1`, `0` when none survived, and
+  // `None` (propagated out of this function) when a `usize::MAX` survivor
+  // overflows it (genuinely unrepresentable).
+  let survivor_extent = match result
+    .segments_slice()
+    .iter()
+    .map(TranscriptionSegment::id)
+    .max()
+  {
+    None => 0,
+    Some(max_local_id) => max_local_id.checked_add(1)?,
+  };
+  // Floor the carried lower bound at the survivor extent (F2, codex round 9): the
+  // extent is a floor the carried bound may exceed but must never fall below. An
+  // exact count the extent does not out-count stays exact; otherwise the value
+  // degrades to an at-least bound AT the floor rather than a contradicted exact.
+  let carried = result.task_facts().decoded_span();
+  let floored = carried.lower_bound().max(survivor_extent);
+  Some(if carried.is_exact() && floored == carried.lower_bound() {
+    SpanKnowledge::Exact(floored)
+  } else {
+    SpanKnowledge::AtLeast(floored)
+  })
+}
+
+/// The single merge implementation behind [`merge_transcription_results`]
+/// and [`merge_transcription_results_with_options`].
+///
+/// `skip_empty_texts` governs the **text join and the segment id mapping**:
+/// every result participates in the segment concatenation and in every timing
+/// reduction regardless of it, so the two entry points can differ only in
+/// [`TranscriptionResult::text`] and in the segments' **ids** (a running
+/// injective base when dropping, Swift's `result_index + segment_index` when
+/// not — see [`merge_transcription_results_with_options`]'s own doc). Keeping
+/// that promise structural — one body, one `filter`, reached through both
+/// doors — is the point of the split: the alternative (a second join written
+/// out at the call site that happens to know the option) is exactly how the
+/// two drifted apart before.
+fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> TranscriptionResult {
   let text = results
     .iter()
     .map(TranscriptionResult::text)
+    .filter(|text| !(skip_empty_texts && text.is_empty()))
     .collect::<Vec<_>>()
     .join(" ");
 
   let mut segments = Vec::new();
+  // Running id base for the drop-ON (`skip_empty_texts`) mapping. Each chunk's
+  // survivors are re-`id`'d to `id_base + segment.id()` (its **decode
+  // ordinal**, its position within its own chunk), and `id_base` then advances
+  // by that chunk's decoded id SPAN. This is INJECTIVE across chunks (no two
+  // chunks' id windows overlap) while preserving each chunk's own local gaps: a
+  // blank dropped mid-chunk leaves `[.., 2]` where segment 1 was, and that hole
+  // survives inside the chunk's window as the audit trail `drop_blank_audio`
+  // promises. The earlier `result_index + segment.id()` COLLIDED the moment a
+  // chunk had more than one segment — `[0,1] + [0,1]` renumbered to `[0,1,1,2]`,
+  // and a blank-dropped `[0,2] + [0,1]` to `[0,2,1,2]` — because `result_index`
+  // advances by 1 per chunk regardless of how many ids the chunk actually
+  // spans. `id_base` advances by the real span instead. With dropping OFF the
+  // false path stays EXACTLY Swift's `resultIndex + segmentIndex`, byte-for-byte
+  // (its duplicate ids are pinned parity), and `id_base` is left untouched.
+  //
+  // The span is the chunk's DECODED ordinal count (`TaskFacts::decoded_span`),
+  // carried on the result, NOT the surviving segments' `max local id + 1`: a
+  // chunk whose segments were ALL dropped (a blank-only VAD chunk) survives with
+  // zero segments yet still consumed ordinals, and inferring the span from the
+  // survivors would collapse it to 0 — indistinguishable from a genuinely
+  // zero-window chunk — so the NEXT chunk's survivors would renumber down onto
+  // this one's window (coremlit issue #14, codex round 5). A hand-built or
+  // deserialized result carries no span; the merge then falls back to the
+  // survivors' own extent, its pre-existing behavior.
+  let mut id_base = 0usize;
   for (result_index, result) in results.iter().enumerate() {
     for (segment_index, segment) in result.segments_slice().iter().enumerate() {
-      segments.push(segment.clone().with_id(result_index + segment_index));
+      let id = if skip_empty_texts {
+        // Checked: a hand-built `usize::MAX` id is adversarial input, so a
+        // deliberate documented panic beats a silent wraparound collision (see
+        // this function's `# Panics`).
+        id_base.checked_add(segment.id()).expect(
+          "drop_blank_audio segment-id mapping overflowed usize (a segment id near usize::MAX)",
+        )
+      } else {
+        result_index + segment_index
+      };
+      segments.push(segment.clone().with_id(id));
+    }
+    if skip_empty_texts {
+      // Advance past this chunk's DECODED id window by exactly the effective
+      // span's lower bound — the carried span floored at the survivors' own extent
+      // ([`effective_span_knowledge`]). That floor keeps a re-merge from
+      // under-counting the survivors it is renumbering, and the STORED fold below
+      // now folds this SAME effective span, so a staged re-merge stores the very
+      // floor it advanced by (codex round 13, M1). Here — and ONLY here, where the
+      // span drives an injective id mapping — a `None` span (a `usize::MAX`
+      // survivor whose extent overflowed) OR an overflowing base is the documented
+      // adversarial-input panic; the drop-OFF fold, which never uses the span for
+      // ids, keeps the checked `None` instead (codex round 8, F4).
+      id_base = effective_span_knowledge(result)
+        .and_then(|span| id_base.checked_add(span.lower_bound()))
+        .expect("drop_blank_audio segment-id base overflowed usize (a segment id near usize::MAX)");
     }
   }
 
@@ -2275,33 +2740,104 @@ pub fn merge_transcription_results(results: &[TranscriptionResult]) -> Transcrip
     .set_pipeline_start(earliest_pipeline_start)
     .set_first_token_time(min_timing(results, TranscriptionTimings::first_token_time));
 
-  TranscriptionResult::new(text, segments, language, timings)
+  // The task facts, folded left-to-right through the ONE merge law
+  // ([`TaskFacts::merge`]) rather than the four scattered `.any()`/`.find_map()`/
+  // `.first()` reductions this replaced — the consolidation that closes R6-F1/F2/F3
+  // (coremlit issue #14, codex round 6). Over the children in order it:
+  //
+  // - **OR**s the RNG-draw and early-stop facts: a chunk the blank-audio drop
+  //   emptied contributes NO segments to the merge, so its accepted temperature
+  //   is invisible in the merged segment list — the fact has to travel with the
+  //   result, never be read back off the output it no longer appears in. A
+  //   callback truncated the merge if it truncated ANY chunk (R6-F1's merge side).
+  // - keeps the **first** genuine language observation (a later `Some` cannot
+  //   overwrite an earlier one), deliberately NOT agreeing with the merged
+  //   DISPLAY `language` (the first result's, keeping its Swift-compat `"en"`
+  //   fallback).
+  // - **concatenates** the worker schedules in order, so `[0, 2]` stays distinct
+  //   from `[0, 1]` instead of collapsing to the first child's coordinate (R6-F2).
+  // - folds each child's **span** under [`SpanKnowledge::merge`]. WHICH span it
+  //   folds depends on the id mapping this merge performs (codex round 13, M1):
+  //   * **drop-ON** folds each child's EFFECTIVE span — its carried span floored
+  //     at its own survivor extent ([`effective_span_knowledge`]), the SAME value
+  //     the id-base advanced by — so the stored fact carries the floors the ids
+  //     already committed to, and a staged re-merge numbers identically to a
+  //     one-shot one (R6-F3). Folding the RAW carried spans here instead stored a
+  //     bound BELOW those floors, and a further re-merge whose survivor extent
+  //     could not recover them renumbered a trailing chunk onto a consumed id.
+  //   * **drop-OFF** folds each child's RAW carried span: its ids are Swift's
+  //     `result_index + segment_index` and never consult the span, so the fold
+  //     must not touch the (possibly `usize::MAX`-overflowing) survivor extent
+  //     (codex round 8, F4).
+  //   Either way the sum is checked-add over exacts (an overflow degrades to a
+  //   saturated `AtLeast(usize::MAX)`, never a wrapped or fabricated exact) and
+  //   saturating once any child is a mere `AtLeast`, associative by construction.
+  //   Unlike the pre-round-12 absorbing-`None` fold, an unknown child no longer
+  //   erases a known sibling's ordinals: `AtLeast(0) + Exact(1) = AtLeast(1)`, so
+  //   the known lower bound survives to drive a staged re-merge's id base.
+  //
+  // Folded through [`TaskFactsAccumulator`], NOT seeded at `TaskFacts::unknown()`:
+  // under the Kleene OR (codex round 8, F2) `unknown()` is no longer the merge
+  // identity — seeding there would null a first child's observed-clean
+  // `Some(false)` to `None` — so the accumulator takes the first contributor
+  // verbatim and folds the rest, and yields `unknown()` only for an empty
+  // `results`.
+  let mut task_facts = TaskFactsAccumulator::new();
+  for result in results {
+    if skip_empty_texts {
+      // Drop-ON: fold the EFFECTIVE span — the floored value this child's id-base
+      // advance used above — so the stored fact materializes the same floors the
+      // ids did and a staged re-merge numbers identically (codex round 13, M1).
+      // The `usize::MAX`-survivor overflow cannot reach here: the id loop above
+      // already panicked on it, so the saturated fallback only keeps this a total
+      // function and never actually materializes on the drop-ON path.
+      let effective =
+        effective_span_knowledge(result).unwrap_or(SpanKnowledge::AtLeast(usize::MAX));
+      task_facts.merge(&result.task_facts().clone().with_decoded_span(effective));
+    } else {
+      // Drop-OFF: fold the RAW carried span; the Swift `result_index +
+      // segment_index` ids never consult it, so the fold must not touch the
+      // (possibly overflowing) survivor extent (codex round 8, F4).
+      task_facts.merge(result.task_facts());
+    }
+  }
+  let task_facts = task_facts.into_facts();
+
+  TranscriptionResult::new(text, segments, language, timings).with_task_facts(task_facts)
 }
 
 // ---------------------------------------------------------------------
 // merge_transcription_results_with_words
 // ---------------------------------------------------------------------
 
-/// Merges `results` exactly as [`merge_transcription_results`] does, then
-/// overrides the merged text with `confirmed_words` — ports the
-/// `confirmedWords:` branch of `TranscriptionUtilities.
-/// mergeTranscriptionResults` (`Utilities/TranscriptionUtilities.swift:
-/// 76-82`): `words.map { $0.word }.joined()`, i.e. every confirmed word's
-/// text concatenated with **no** separator (word strings carry their own
-/// leading spaces, e.g. `" And"`). Everything else — segments, language,
-/// every timing field — is byte-identical to
-/// [`merge_transcription_results`]'s own output.
+/// Merges `results` under `options`, then overrides the merged text with
+/// `confirmed_words` — ports the `confirmedWords:` branch of
+/// `TranscriptionUtilities.mergeTranscriptionResults`
+/// (`Utilities/TranscriptionUtilities.swift:76-82`): `words.map { $0.word
+/// }.joined()`, i.e. every confirmed word's text concatenated with **no**
+/// separator (word strings carry their own leading spaces, e.g. `" And"`).
+/// Everything else — segments, language, every timing field — is
+/// byte-identical to [`merge_transcription_results_with_options`]'s own
+/// output.
 ///
-/// This is a deliberate **delegation**, not a parallel implementation: a
-/// future change to the plain merge's timing/segment rules is picked up
-/// here for free, and if upstream Swift ever grows a real divergence
-/// between the two branches beyond the text override, this call site is
-/// where that would need to change.
+/// # Why this needs the options after all
+///
+/// The `confirmed_words` override discards the merged **text join**, so it is
+/// tempting to think [`DecodingOptions::drop_blank_audio`] is unobservable
+/// here and to delegate to the plain, options-blind merge. It is not:
+/// dropping now governs the **segment id mapping** too, not just the text
+/// (see [`merge_transcription_results_with_options`]). Delegating to the plain
+/// (drop-OFF) merge collapsed a survivor id gap `[0, 2]` back to a dense
+/// `[0, 1]`, and [`crate::stream::agreement::LocalAgreement::finalize`] — the
+/// default streaming path — inherited that loss at finalization. Threading the
+/// same `options` the results were decoded under keeps the merged **segments**
+/// honoring the drop even when the merged text does not come from them.
 pub fn merge_transcription_results_with_words(
   results: &[TranscriptionResult],
   confirmed_words: &[WordTiming],
+  options: &DecodingOptions,
 ) -> TranscriptionResult {
-  let mut merged = merge_transcription_results(results);
+  let mut merged = merge_results(results, options.drop_blank_audio());
   let text: String = confirmed_words.iter().map(WordTiming::word).collect();
   merged.set_text(text);
   merged

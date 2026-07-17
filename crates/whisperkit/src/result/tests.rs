@@ -1,5 +1,8 @@
 use super::*;
-use crate::options::DecodingOptions;
+use crate::{
+  options::DecodingOptions,
+  task_facts::{SpanKnowledge, TaskFacts},
+};
 
 // ---------------------------------------------------------------------
 // merge_transcription_results
@@ -33,6 +36,1072 @@ fn merge_transcription_results_concatenates_and_reids() {
   assert_eq!(merged.segments_slice().len(), 2);
   assert_eq!(merged.segments_slice()[1].id(), 1); // resultIndex + segmentIndex (:89-94)
   assert_eq!(merged.language(), "en");
+}
+
+#[test]
+fn merge_preserves_survivor_ids_when_dropping_blanks() {
+  // F4 (codex round 2). The VAD path ALWAYS routes chunk results through
+  // `merge_transcription_results_with_options` (transcribe::transcribe), and
+  // that merge reindexed every survivor to `result_index + segment_index` --
+  // silently collapsing the [0, 2] gap a blank-audio drop leaves back to
+  // [0, 1], so `drop_blank_audio`'s documented "survivors keep their decoded
+  // ids" promise held only on the unmerged single-chunk path.
+  //
+  // One chunk, speech-blank-speech, the blank already dropped in the task ->
+  // survivors carry decode ids 0 and 2. Match survivors by tokens, assert ids.
+  let mut speech0 = TranscriptionSegment::new();
+  speech0
+    .set_id(0)
+    .set_start(0.0)
+    .set_end(1.0)
+    .set_text(" Hello")
+    .set_tokens(vec![10]);
+  let mut speech2 = TranscriptionSegment::new();
+  speech2
+    .set_id(2)
+    .set_start(2.0)
+    .set_end(3.0)
+    .set_text(" World")
+    .set_tokens(vec![20]);
+  let chunk = TranscriptionResult::new(
+    "Hello World",
+    vec![speech0, speech2],
+    "en",
+    TranscriptionTimings::new(),
+  );
+
+  // Dropping ON (the default): ids preserved, the [0, 2] hole intact.
+  let dropped =
+    merge_transcription_results_with_options(std::slice::from_ref(&chunk), &DecodingOptions::new());
+  assert_eq!(
+    dropped
+      .segments_slice()
+      .iter()
+      .map(TranscriptionSegment::id)
+      .collect::<Vec<_>>(),
+    vec![0, 2],
+    "survivors keep their decode ids; the dropped segment's gap is preserved"
+  );
+  // Survivors matched by tokens, NOT id: the second is still " World".
+  assert_eq!(dropped.segments_slice()[1].tokens_slice(), &[20]);
+  assert_eq!(dropped.segments_slice()[1].start(), 2.0);
+
+  // Dropping OFF: EXACTLY Swift's `result_index + segment_index` reindexing
+  // -- the false path stays byte-for-byte Swift, so the same survivors come
+  // back densely renumbered [0, 1].
+  let swift = merge_transcription_results_with_options(
+    std::slice::from_ref(&chunk),
+    &DecodingOptions::new().maybe_drop_blank_audio(false),
+  );
+  assert_eq!(
+    swift
+      .segments_slice()
+      .iter()
+      .map(TranscriptionSegment::id)
+      .collect::<Vec<_>>(),
+    vec![0, 1],
+    "Swift-exact reindexing (result_index + segment_index) when dropping is off"
+  );
+  assert_eq!(
+    swift.segments_slice()[1].tokens_slice(),
+    &[20],
+    "still the same survivor, only its id differs"
+  );
+
+  // Multiple chunks, dropping ON: each VAD chunk is its own decode with its
+  // own id space, so both lone survivors carry decode id 0. The
+  // `result_index` offset is what keeps them from COLLIDING to [0, 0] -- the
+  // id preservation must still disambiguate across chunks, landing [0, 1].
+  let mut chunk_a_seg = TranscriptionSegment::new();
+  chunk_a_seg
+    .set_id(0)
+    .set_text(" Hello")
+    .set_tokens(vec![10]);
+  let mut chunk_b_seg = TranscriptionSegment::new();
+  chunk_b_seg
+    .set_id(0)
+    .set_text(" World")
+    .set_tokens(vec![20]);
+  let chunk_a = TranscriptionResult::new(
+    "Hello",
+    vec![chunk_a_seg],
+    "en",
+    TranscriptionTimings::new(),
+  );
+  let chunk_b = TranscriptionResult::new(
+    "World",
+    vec![chunk_b_seg],
+    "en",
+    TranscriptionTimings::new(),
+  );
+  let two_chunks =
+    merge_transcription_results_with_options(&[chunk_a, chunk_b], &DecodingOptions::new());
+  assert_eq!(
+    two_chunks
+      .segments_slice()
+      .iter()
+      .map(TranscriptionSegment::id)
+      .collect::<Vec<_>>(),
+    vec![0, 1],
+    "each chunk's lone `id() == 0` must be offset by result_index, not collapsed to [0, 0]"
+  );
+  assert_eq!(two_chunks.segments_slice()[1].tokens_slice(), &[20]);
+}
+
+#[test]
+fn merge_drop_on_ids_stay_injective_across_multi_segment_chunks() {
+  // F4 (codex round 3). The round-2 test above uses ONE segment per chunk, so
+  // it never exercised `result_index + segment.id()`'s collision on
+  // MULTI-segment chunks: `[0,1] + [0,1]` renumbered to `[0,1,1,2]`, and a
+  // blank-dropped `[0,2] + [0,1]` to `[0,2,1,2]` -- duplicate ids either way.
+  // The running-base mapping must keep (chunk, original_id) injective while
+  // preserving each chunk's own local gaps.
+  let seg = |id: usize, token: u32| {
+    let mut s = TranscriptionSegment::new();
+    s.set_id(id).set_tokens(vec![token]);
+    s
+  };
+
+  // Chunk A carries an INTERNAL dropped-id gap -- ids [0, 2], its segment 1
+  // was a dropped blank. Chunk B is dense -- ids [0, 1].
+  let chunk_a = TranscriptionResult::new(
+    "A",
+    vec![seg(0, 10), seg(2, 12)],
+    "en",
+    TranscriptionTimings::new(),
+  );
+  let chunk_b = TranscriptionResult::new(
+    "B",
+    vec![seg(0, 20), seg(1, 21)],
+    "en",
+    TranscriptionTimings::new(),
+  );
+  let merged =
+    merge_transcription_results_with_options(&[chunk_a, chunk_b], &DecodingOptions::new());
+
+  let ids: Vec<usize> = merged
+    .segments_slice()
+    .iter()
+    .map(TranscriptionSegment::id)
+    .collect();
+  // Chunk A: base 0 -> [0, 2] (its local gap at 1 preserved). Span = 2 + 1 = 3.
+  // Chunk B: base 3 -> [3, 4]. The pre-fix formula produced
+  // [0+0, 0+2, 1+0, 1+1] = [0, 2, 1, 2] -- a duplicate 2.
+  assert_eq!(
+    ids,
+    vec![0, 2, 3, 4],
+    "injective across chunks, each chunk's local gap preserved"
+  );
+  let unique: std::collections::HashSet<usize> = ids.iter().copied().collect();
+  assert_eq!(
+    unique.len(),
+    ids.len(),
+    "(chunk, original_id) must map injectively -- no id collisions"
+  );
+  // Survivor identity travels through the re-id, matched by tokens not id.
+  assert_eq!(
+    merged
+      .segments_slice()
+      .iter()
+      .map(|s| s.tokens_slice()[0])
+      .collect::<Vec<_>>(),
+    vec![10, 12, 20, 21],
+  );
+}
+
+#[test]
+fn merge_drop_on_advances_the_id_base_past_an_all_dropped_chunk() {
+  // F2 (codex round 5), hole (a). A blank-only VAD chunk decodes ONE segment
+  // (id 0), which the blank-audio drop then removes -- leaving the chunk with
+  // zero survivors but a DECODED span of 1. The merge must advance its running
+  // id base by that span, not by the (empty) survivors' extent: otherwise an
+  // all-dropped chunk is indistinguishable from a genuinely zero-window one,
+  // and the FOLLOWING speech chunk's survivor renumbers down onto the ordinal
+  // the blank consumed.
+  //
+  // The invariant the finding pins: the speech survivor keeps the SAME id under
+  // both drop settings. Under drop OFF the blank is present (id 0) and Swift's
+  // `result_index + segment_index` lands the speech at 1; under drop ON the
+  // blank is gone but its consumed ordinal still shifts the speech to 1.
+  let speech = || {
+    let mut s = TranscriptionSegment::new();
+    s.set_id(0).set_text(" World").set_tokens(vec![20]);
+    TranscriptionResult::new(" World", vec![s], "en", TranscriptionTimings::new())
+      .with_task_facts(TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(1)))
+  };
+  let speech_id = |merged: &TranscriptionResult| {
+    merged
+      .segments_slice()
+      .iter()
+      .find(|s| s.tokens_slice() == [20])
+      .expect("the speech survivor is in the merge")
+      .id()
+  };
+
+  // Drop ON: the blank was dropped in the task, so the chunk has zero survivors
+  // but reports its decoded span of 1.
+  let all_dropped = TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
+    .with_task_facts(TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(1)));
+  let dropped =
+    merge_transcription_results_with_options(&[all_dropped, speech()], &DecodingOptions::new());
+  assert!(
+    dropped.segments_slice().len() == 1 && speech_id(&dropped) == 1,
+    "the speech survivor sits past the all-dropped chunk's consumed ordinal, got id {}",
+    speech_id(&dropped)
+  );
+
+  // Drop OFF: the blank is present (id 0), and Swift's exact reindexing lands
+  // the speech at result_index 1.
+  let mut blank = TranscriptionSegment::new();
+  blank
+    .set_id(0)
+    .set_text(" [BLANK_AUDIO]")
+    .set_tokens(vec![99]);
+  let blank_kept = TranscriptionResult::new(
+    " [BLANK_AUDIO]",
+    vec![blank],
+    "en",
+    TranscriptionTimings::new(),
+  )
+  .with_task_facts(TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(1)));
+  let emitted = merge_transcription_results_with_options(
+    &[blank_kept, speech()],
+    &DecodingOptions::new().maybe_drop_blank_audio(false),
+  );
+  assert_eq!(
+    speech_id(&emitted),
+    1,
+    "drop OFF is exact Swift: result_index + segment_index lands the speech at 1"
+  );
+  assert_eq!(
+    speech_id(&dropped),
+    speech_id(&emitted),
+    "the speech survivor keeps the same id under both drop settings"
+  );
+}
+
+/// A speech chunk decoding one segment carrying `token`, tracking a decoded
+/// span of 1 (coremlit issue #14, codex round 6 regression fixtures).
+fn span_one_speech(token: u32) -> TranscriptionResult {
+  let mut s = TranscriptionSegment::new();
+  s.set_id(0).set_text(" W").set_tokens(vec![token]);
+  TranscriptionResult::new(" W", vec![s], "en", TranscriptionTimings::new())
+    .with_task_facts(TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(1)))
+}
+
+/// Segment ids of a result, in order.
+fn segment_ids(result: &TranscriptionResult) -> Vec<usize> {
+  result.segments_slice().iter().map(|s| s.id()).collect()
+}
+
+#[test]
+fn drop_on_merge_is_associative_over_the_id_span() {
+  // R6-F3 (codex round 6). A staged merge -- a VAD result re-merged at streaming
+  // finalize -- must renumber segments IDENTICALLY to a one-shot merge, which
+  // requires the merged result to STORE its aggregate id span rather than drop
+  // it. Script [speech(span 1), all-dropped(span 1), speech(span 1)] under drop
+  // ON: the dropped middle chunk still consumes an ordinal, so the second speech
+  // sits at id 2, and a staged re-merge must reach the same 2.
+  //
+  // Mutation proof: revert the merge to store no aggregate span (the merged
+  // result's `decoded_span` back to `None`) and the staged ids collapse to
+  // [0, 1], failing the associativity assertion below.
+  let opts = DecodingOptions::new(); // drop ON (the default)
+  let a = span_one_speech(20);
+  let b = TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
+    .with_task_facts(TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(1)));
+  let c = span_one_speech(21);
+
+  // One-shot over all three.
+  let one_shot =
+    merge_transcription_results_with_options(&[a.clone(), b.clone(), c.clone()], &opts);
+  assert_eq!(
+    segment_ids(&one_shot),
+    vec![0, 2],
+    "the second speech sits past the dropped chunk's consumed ordinal"
+  );
+  assert_eq!(
+    one_shot.task_facts().decoded_span(),
+    SpanKnowledge::Exact(3),
+    "the aggregate span is the exact sum of the children's"
+  );
+
+  // Staged: merge [a, b] (the VAD result), then re-merge that with c (finalize).
+  let vad = merge_transcription_results_with_options(&[a, b], &opts);
+  assert_eq!(
+    vad.task_facts().decoded_span(),
+    SpanKnowledge::Exact(2),
+    "the VAD result STORES its aggregate span (the R6-F3 fix)"
+  );
+  let staged = merge_transcription_results_with_options(&[vad, c], &opts);
+  assert_eq!(
+    segment_ids(&staged),
+    segment_ids(&one_shot),
+    "a staged re-merge renumbers identically to a one-shot merge"
+  );
+  assert_eq!(staged.task_facts().decoded_span(), SpanKnowledge::Exact(3));
+}
+
+#[test]
+fn drop_on_merge_preserves_known_empty_span_after_unknown_prefix() {
+  // THE round-12 regression. A reachable history the pre-round-12 absorbing-`None`
+  // span numbered differently by grouping:
+  //   A -- a survivor at local id 0, span `AtLeast(1)`: the shape a VAD run leaves
+  //        when it drops an errored chunk but keeps a survivor whose 1 ordinal is a
+  //        KNOWN lower bound on the (now-unknown-exact) total;
+  //   B -- NO survivors, span `Exact(1)`: a known-empty span (a blank-only chunk
+  //        that allocated an ordinal then had it filtered);
+  //   T -- a trailing survivor at local id 0, span `Exact(1)`.
+  // A one-shot `merge([A, B, T])` numbers the survivors `[0, 2]` (A's survivor at
+  // 0, B's known ordinal consumes 1, T's survivor at 2). The pre-round-12 fold let
+  // A's unknown span ABSORB B's `Exact(1)` to a bound-less `None`, so a staged
+  // `merge([merge([A, B]), T])` could recover only the intermediate's survivor
+  // extent (1) and renumbered T onto id 1 -- `[0, 1]`. The round-12 `SpanKnowledge`
+  // sum keeps B's known ordinal as the aggregate's lower bound (`AtLeast(1) +
+  // Exact(1) = AtLeast(2)`), so ALL THREE groupings store `AtLeast(3)` and number
+  // T identically at id 2.
+  //
+  // Mutation proof: revert `SpanKnowledge::merge`'s `AtLeast` arm to the absorbing
+  // `_ => Self::AtLeast(0)` and the staged groupings lose B's known ordinal,
+  // landing T on id 1 while the one-shot keeps `[0, 2]` -- the equalities below fail.
+  let a = || {
+    let mut seg = TranscriptionSegment::new();
+    seg.set_id(0).set_text(" A").set_tokens(vec![20]);
+    TranscriptionResult::new(" A", vec![seg], "en", TranscriptionTimings::new())
+      .with_task_facts(TaskFacts::unknown().with_decoded_span(SpanKnowledge::AtLeast(1)))
+  };
+  let b = || {
+    TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
+      .with_task_facts(TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(1)))
+  };
+  let t = || span_one_speech(21); // trailing survivor at local id 0, Exact(1)
+
+  let opts = DecodingOptions::new(); // drop ON (the default)
+  let one_shot = merge_transcription_results_with_options(&[a(), b(), t()], &opts);
+  let left_staged = merge_transcription_results_with_options(
+    &[
+      merge_transcription_results_with_options(&[a(), b()], &opts),
+      t(),
+    ],
+    &opts,
+  );
+  let right_staged = merge_transcription_results_with_options(
+    &[
+      a(),
+      merge_transcription_results_with_options(&[b(), t()], &opts),
+    ],
+    &opts,
+  );
+
+  for (label, merged) in [
+    ("one-shot", &one_shot),
+    ("left-staged", &left_staged),
+    ("right-staged", &right_staged),
+  ] {
+    assert_eq!(
+      segment_ids(merged),
+      vec![0, 2],
+      "{label}: B's known empty span must keep T on id 2, never absorbed away to id 1",
+    );
+    assert_eq!(
+      merged.task_facts().decoded_span(),
+      SpanKnowledge::AtLeast(3),
+      "{label}: the stored aggregate is the grouping-independent lower bound",
+    );
+  }
+}
+
+#[test]
+fn drop_on_merge_is_associative_with_mixed_tracked_and_untracked_spans() {
+  // F1 (codex round 6 post-consolidation), corrected under round 12. The invariant
+  // this test guards is unchanged: `[wholly-unknown-with-one-survivor, exact span
+  // 1, exact span 1]` must renumber IDENTICALLY one-shot vs. staged (the round-6 F1
+  // defect renumbered them differently).
+  //
+  // ORACLE CORRECTION (codex round 13, M1): the stored span now carries the SAME
+  // survivor floor the ids advanced by. `a` is a public `new` result — a survivor
+  // at local id 0 but a WHOLLY-UNKNOWN carried span (`AtLeast(0)`) — so its
+  // survivor proves >= 1 allocated ordinal that its raw `AtLeast(0)` does not state.
+  // The drop-ON fold folds `a`'s EFFECTIVE span (that raw bound floored at its own
+  // survivor extent, `AtLeast(0)` -> `AtLeast(1)`), the very value `a`'s id-base
+  // advance used, so the aggregate is `AtLeast(1) + Exact(1) + Exact(1) =
+  // AtLeast(3)` — the survivors' true lower bound, in EVERY grouping. The
+  // pre-round-13 raw-`SpanKnowledge` fold stored `AtLeast(2)` here (`AtLeast(0) +
+  // Exact(1) + Exact(1)`), discarding `a`'s survivor floor even as the ids committed
+  // to it; the round-12 read-time floor still kept THESE ids `[0, 1, 2]` (b/c's
+  // small exact spans let the intermediate's survivor extent recover the lost
+  // floor), but a sparser sibling span defeats that recovery — see
+  // `drop_on_merge_staging_materializes_unknown_survivor_floor_before_sparse_span`.
+  //
+  // Mutation proof: revert the drop-ON fold to fold the RAW carried spans (drop the
+  // `with_decoded_span(effective_span_knowledge(...))` substitution) and the stored
+  // spans read back `AtLeast(2)`/`AtLeast(1)`/`AtLeast(2)` — `a`'s survivor floor
+  // discarded from the stored fact (the ids stay `[0, 1, 2]` either way here).
+  let opts = DecodingOptions::new(); // drop ON (the default)
+  // A: a public `new` result — one surviving segment (local id 0), span
+  // WHOLLY UNKNOWN (`AtLeast(0)`), the documented contract of the public constructor.
+  let untracked = |token: u32| {
+    let mut seg = TranscriptionSegment::new();
+    seg.set_id(0).set_text(" A").set_tokens(vec![token]);
+    TranscriptionResult::new(" A", vec![seg], "en", TranscriptionTimings::new())
+  };
+  let a = untracked(20);
+  assert_eq!(
+    a.task_facts().decoded_span(),
+    SpanKnowledge::wholly_unknown(),
+    "the public constructor leaves the span wholly unknown, yet a segment survives"
+  );
+  let b = span_one_speech(21); // exact span 1, one segment
+  let c = span_one_speech(22); // exact span 1, one segment
+
+  let one_shot =
+    merge_transcription_results_with_options(&[a.clone(), b.clone(), c.clone()], &opts);
+  assert_eq!(
+    segment_ids(&one_shot),
+    vec![0, 1, 2],
+    "the wholly-unknown child's one survivor still consumes ordinal 0"
+  );
+  assert_eq!(
+    one_shot.task_facts().decoded_span(),
+    SpanKnowledge::AtLeast(3),
+    "the stored fact carries `a`'s survivor floor the ids advanced by (round 13, M1): \
+     `AtLeast(1) + Exact(1) + Exact(1)`, not the raw `AtLeast(2)`",
+  );
+
+  // Staged: merge [a, b], then re-merge that with c.
+  let ab = merge_transcription_results_with_options(&[a, b], &opts);
+  assert_eq!(
+    ab.task_facts().decoded_span(),
+    SpanKnowledge::AtLeast(2),
+    "the intermediate carries `a`'s survivor floor plus b's ordinal (round 13, M1): \
+     `AtLeast(1) + Exact(1)`, not the raw `AtLeast(1)`",
+  );
+  let staged = merge_transcription_results_with_options(&[ab, c], &opts);
+  assert_eq!(
+    segment_ids(&staged),
+    segment_ids(&one_shot),
+    "a staged re-merge renumbers identically to a one-shot merge — the invariant, \
+     now carried by the associative stored span plus the read-time extent floor",
+  );
+  assert_eq!(
+    segment_ids(&staged),
+    vec![0, 1, 2],
+    "and both groupings land the same ids",
+  );
+  assert_eq!(
+    staged.task_facts().decoded_span(),
+    SpanKnowledge::AtLeast(3),
+    "the staged store matches the one-shot's `AtLeast(3)` — associative, and now \
+     carrying the survivor floor in the stored fact (round 13, M1)",
+  );
+}
+
+#[test]
+fn drop_on_merge_staging_materializes_unknown_survivor_floor_before_sparse_span() {
+  // THE round-13 M1 regression. A drop-ON merge derives each child's id
+  // contribution from its EFFECTIVE span — the carried span floored at its own
+  // survivor extent — but before round 13 it STORED only the raw carried sum,
+  // discarding the survivor floor the ids had already committed to. A staged
+  // re-merge then read that under-count back and, when a sibling's SPARSE span put
+  // the survivor extent out of the read-time floor's reach, renumbered a trailing
+  // chunk onto an id the one-shot merge had left free.
+  //
+  // The reachable history (public/hand-built, all with drop_blank_audio = true):
+  //   A -- a survivor at local id 0, span `AtLeast(0)` (the public `new` default):
+  //        its survivor proves >= 1 ordinal its wholly-unknown span does not state;
+  //   B -- a survivor at local id 0, span `Exact(5)`: five ordinals allocated, only
+  //        id 0 surviving a filter (a legitimate carried-span-exceeds-extent shape);
+  //   T -- a trailing survivor at local id 0, span `Exact(1)`.
+  // A's effective span is `AtLeast(1)` (its `AtLeast(0)` floored at extent 1), so a
+  // one-shot `merge([A, B, T])` advances the id base 1 (A) then 5 (B) and lands T at
+  // id 6 -> `[0, 1, 6]`, storing `AtLeast(1) + Exact(5) + Exact(1) = AtLeast(7)`.
+  //
+  // Pre-round-13 the left-staged intermediate `merge([A, B])` stored the RAW
+  // `AtLeast(0) + Exact(5) = AtLeast(5)`, losing A's survivor floor; its own two
+  // survivors span only extent 2, so the read-time floor (`max(5, 2) = 5`) could NOT
+  // recover the lost ordinal, and re-merging with T landed it at id 5 -> `[0, 1, 5]`,
+  // diverging from the one-shot `[0, 1, 6]` and storing `AtLeast(6)`. Folding the
+  // EFFECTIVE span into the store makes the intermediate carry `AtLeast(6)`, so every
+  // grouping numbers T at 6 and stores `AtLeast(7)`.
+  //
+  // Mutation proof: revert the drop-ON fold to fold the RAW carried spans (drop the
+  // `with_decoded_span(effective_span_knowledge(...))` substitution) and the
+  // left-staged grouping's ids read back `[0, 1, 5]` and its stored span
+  // `AtLeast(6)`, failing the equalities below.
+  let opts = DecodingOptions::new(); // drop ON (the default)
+  let a = || {
+    let mut seg = TranscriptionSegment::new();
+    seg.set_id(0).set_text(" A").set_tokens(vec![20]);
+    // Public `new`: one survivor, span WHOLLY UNKNOWN (`AtLeast(0)`).
+    TranscriptionResult::new(" A", vec![seg], "en", TranscriptionTimings::new())
+  };
+  let b = || {
+    let mut seg = TranscriptionSegment::new();
+    seg.set_id(0).set_text(" B").set_tokens(vec![21]);
+    // Five ordinals allocated, four filtered away — a carried span that legitimately
+    // EXCEEDS its survivor extent of 1.
+    TranscriptionResult::new(" B", vec![seg], "en", TranscriptionTimings::new())
+      .with_task_facts(TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(5)))
+  };
+  let t = || span_one_speech(22); // trailing survivor at local id 0, Exact(1)
+
+  let one_shot = merge_transcription_results_with_options(&[a(), b(), t()], &opts);
+  let left_staged = merge_transcription_results_with_options(
+    &[
+      merge_transcription_results_with_options(&[a(), b()], &opts),
+      t(),
+    ],
+    &opts,
+  );
+  let right_staged = merge_transcription_results_with_options(
+    &[
+      a(),
+      merge_transcription_results_with_options(&[b(), t()], &opts),
+    ],
+    &opts,
+  );
+
+  for (label, merged) in [
+    ("one-shot", &one_shot),
+    ("left-staged", &left_staged),
+    ("right-staged", &right_staged),
+  ] {
+    assert_eq!(
+      segment_ids(merged),
+      vec![0, 1, 6],
+      "{label}: the trailing chunk sits past A's survivor floor and B's five ordinals",
+    );
+    assert_eq!(
+      merged.task_facts().decoded_span(),
+      SpanKnowledge::AtLeast(7),
+      "{label}: the stored fact carries the survivor floor the ids materialized \
+       (`AtLeast(1) + Exact(5) + Exact(1)`), grouping-independent",
+    );
+  }
+}
+
+#[test]
+fn local_agreement_over_a_premerged_vad_result_preserves_the_id_span() {
+  // The LocalAgreement finalize re-merges kept results through
+  // `merge_transcription_results_with_words`; when one is itself a VAD-merged
+  // result, its STORED aggregate span must drive the re-merge's id base (R6-F3),
+  // or the confirmed-word transcript's segments renumber onto the earlier
+  // chunk's ordinals. Same [speech, all-dropped] VAD result, re-merged with a
+  // trailing speech chunk through the word-aware door.
+  let opts = DecodingOptions::new();
+  let vad = merge_transcription_results_with_options(
+    &[
+      span_one_speech(20),
+      TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
+        .with_task_facts(TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(1))),
+    ],
+    &opts,
+  );
+  let confirmed = [WordTiming::new(" W W", Vec::<u32>::new(), 0.0, 1.0, 1.0)];
+  let finalized =
+    merge_transcription_results_with_words(&[vad, span_one_speech(21)], &confirmed, &opts);
+  assert_eq!(
+    segment_ids(&finalized),
+    vec![0, 2],
+    "the trailing chunk sits past the pre-merged VAD result's stored span, not on id 1"
+  );
+}
+
+#[test]
+fn merge_concatenates_worker_schedules_not_just_the_first() {
+  // R6-F2 (codex round 6), at the merge boundary. A merge of worker coordinates
+  // [0] and [2] must be distinguishable from [0] and [1] -- the pre-fix merge
+  // kept only the FIRST child's coordinate, collapsing both to [0], so two
+  // seeded VAD runs at different chunk structures left indistinguishable records.
+  //
+  // Mutation proof: revert the merge to `results.first()`'s coordinate and both
+  // schedules collapse to [0], failing the inequality below.
+  let at = |worker: usize| {
+    TranscriptionResult::new("x", Vec::new(), "en", TranscriptionTimings::new())
+      .with_task_facts(TaskFacts::unknown().with_worker(worker))
+  };
+  let merged_02 = merge_transcription_results(&[at(0), at(2)]);
+  let merged_01 = merge_transcription_results(&[at(0), at(1)]);
+  assert_eq!(
+    merged_02.task_facts().worker_schedule(),
+    Some([0, 2].as_slice())
+  );
+  assert_eq!(
+    merged_01.task_facts().worker_schedule(),
+    Some([0, 1].as_slice())
+  );
+  assert_ne!(
+    merged_02.task_facts().worker_schedule(),
+    merged_01.task_facts().worker_schedule(),
+    "the collapsed pre-fix merge made these two indistinguishable"
+  );
+}
+
+#[test]
+fn plain_merge_completes_on_a_usize_max_segment_id_without_panicking() {
+  // F4 (codex round 8), preserved under round 12. The drop-OFF (plain) merge
+  // outputs ids as Swift's `result_index + segment_index` and NEVER consults the
+  // decoded span for the id mapping, so a hand-built `usize::MAX` segment id whose
+  // `max + 1` extent overflows cannot panic here: the `SpanKnowledge` fold sums
+  // the RAW carried spans (this public-`new` child's wholly-unknown `AtLeast(0)`)
+  // and never touches the overflowing survivor extent. The merge completes and the
+  // output id is the exact Swift ordinal 0.
+  let mut seg = TranscriptionSegment::new();
+  seg.set_id(usize::MAX).set_text(" X").set_tokens(vec![20]);
+  let adversarial = TranscriptionResult::new(" X", vec![seg], "en", TranscriptionTimings::new());
+
+  // The plain door (drop OFF): completes, and the single segment reindexes to
+  // Swift's `result_index(0) + segment_index(0) == 0`.
+  let merged = merge_transcription_results(std::slice::from_ref(&adversarial));
+  assert_eq!(
+    segment_ids(&merged),
+    vec![0],
+    "Swift-exact drop-OFF id is 0"
+  );
+  assert_eq!(
+    merged.task_facts().decoded_span(),
+    SpanKnowledge::wholly_unknown(),
+    "the public child's wholly-unknown span folds through untouched, not panicked on",
+  );
+
+  // The same through the confirmed-words door with `drop_blank_audio = false` --
+  // the default streaming finalize path, which also reaches the drop-OFF merge.
+  let confirmed = [WordTiming::new(" X", Vec::<u32>::new(), 0.0, 1.0, 1.0)];
+  let via_words = merge_transcription_results_with_words(
+    &[adversarial],
+    &confirmed,
+    &DecodingOptions::new().maybe_drop_blank_audio(false),
+  );
+  assert_eq!(
+    segment_ids(&via_words),
+    vec![0],
+    "the confirmed-words drop-OFF door completes identically",
+  );
+}
+
+#[test]
+#[should_panic(expected = "overflowed usize")]
+fn drop_on_merge_still_panics_on_a_usize_max_segment_id() {
+  // The drop-ON id mapping DOES drive an injective renumber off the span, so a
+  // hand-built `usize::MAX` id remains the documented DELIBERATE panic (it beats
+  // a silent wraparound into a colliding id). F4 loosened ONLY the drop-OFF fold,
+  // never this: the id-base advance turns the checked `None` span back into the
+  // same overflow panic the pre-fix `effective_span_knowledge` raised.
+  let mut seg = TranscriptionSegment::new();
+  seg.set_id(usize::MAX).set_text(" X").set_tokens(vec![20]);
+  let adversarial = TranscriptionResult::new(" X", vec![seg], "en", TranscriptionTimings::new());
+  let _ = merge_transcription_results_with_options(&[adversarial], &DecodingOptions::new());
+}
+
+#[test]
+fn a_merge_created_span_never_undercounts_its_own_survivors() {
+  // F2 (codex round 9), corrected under round 12. A plain (drop-OFF) merge
+  // renumbers segments by `result_index + segment_index`, and here both children
+  // are public-`new` results carrying the wholly-unknown span (`AtLeast(0)`), so
+  // `[A(usize::MAX id), B(id 0)]` stores `AtLeast(0)` — neither child carries a
+  // known ordinal to lower-bound the aggregate with.
+  //
+  // The "never under-count its survivors" GUARANTEE is unchanged: it lives in the
+  // read-time `effective_span_knowledge`, which floors the stored span's lower bound
+  // at the survivors' own extent (max id 1 + 1 = 2). So a staged drop-ON re-merge
+  // still advances its id base by 2 and renumbers `C` past the survivors — `[0, 1,
+  // 2]`, never `[0, 1, 1]`.
+  //
+  // Mutation proof: revert `effective_span_knowledge`'s `.max(extent)` (or its
+  // `checked_add(1)`) and the staged ids collapse to `[0, 1, 1]`.
+  let mut a_seg = TranscriptionSegment::new();
+  a_seg.set_id(usize::MAX).set_text(" A").set_tokens(vec![20]);
+  let a = TranscriptionResult::new(" A", vec![a_seg], "en", TranscriptionTimings::new());
+  let mut b_seg = TranscriptionSegment::new();
+  b_seg.set_id(0).set_text(" B").set_tokens(vec![21]);
+  let b = TranscriptionResult::new(" B", vec![b_seg], "en", TranscriptionTimings::new());
+
+  // Plain (drop-OFF) merge: Swift-exact `result_index + segment_index` -> [0, 1].
+  let ab = merge_transcription_results(&[a, b]);
+  assert_eq!(segment_ids(&ab), vec![0, 1], "drop-OFF reindex");
+  assert_eq!(
+    ab.task_facts().decoded_span(),
+    SpanKnowledge::wholly_unknown(),
+    "two wholly-unknown children carry no known ordinal, so the aggregate stays \
+     wholly unknown (round 12)",
+  );
+
+  // A staged drop-ON re-merge with a trailing chunk stays injective: the stored
+  // span's lower bound floors at the survivors' extent (2), so C lands at id 2, not id 1.
+  let mut c_seg = TranscriptionSegment::new();
+  c_seg.set_id(0).set_text(" C").set_tokens(vec![22]);
+  let c = TranscriptionResult::new(" C", vec![c_seg], "en", TranscriptionTimings::new());
+  let staged = merge_transcription_results_with_options(&[ab, c], &DecodingOptions::new());
+  assert_eq!(
+    segment_ids(&staged),
+    vec![0, 1, 2],
+    "the trailing chunk sits past the merged survivors, not on id 1",
+  );
+}
+
+#[test]
+fn drop_on_merge_trailing_id_is_grouping_independent_across_an_overflow() {
+  // F3 (round 10), corrected under round 12. Three all-dropped chunks (no
+  // survivors, carried spans only) with spans MAX, 1, 2 -- the triple whose merge
+  // grouping the pre-fix identity-`None` made non-associative. Under the round-12
+  // `SpanKnowledge` sum the STORED span of the grouped intermediate is
+  // grouping-independent by construction:
+  //   (A·B)·C -- `Exact(MAX)·Exact(1)` overflows to `AtLeast(MAX)`, then
+  //             `·Exact(2)` saturates -> `AtLeast(MAX)`;
+  //   A·(B·C) -- `Exact(1)·Exact(2) = Exact(3)`, then `Exact(MAX)·Exact(3)`
+  //             overflows -> `AtLeast(MAX)`.
+  // Both groupings store `AtLeast(usize::MAX)` (the saturated lower bound of the
+  // true total `MAX + 3`) -- the associativity the pre-round-12 absorbing/identity
+  // `None` could not give. A trailing drop-ON merge over such a saturated span
+  // advances the id base by `usize::MAX` and hits the documented drop-ON overflow
+  // panic (see `drop_on_merge_still_panics_on_a_usize_max_segment_id`), so the
+  // grouping-independence is asserted directly on the STORED span here; the
+  // reachable-span trailing-id path is proved in the materialized-overflow variant
+  // below.
+  //
+  // Mutation proof: revert `SpanKnowledge::merge`'s `Exact + Exact` overflow arm to
+  // the identity/absorbing `None` and the two groupings diverge, failing the
+  // equality.
+  let all_dropped = |span: usize| {
+    TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
+      .with_task_facts(TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(span)))
+  };
+  let a = || all_dropped(usize::MAX);
+  let b = || all_dropped(1);
+  let c = || all_dropped(2);
+
+  // (A·B)·C: the one-shot left fold over all three.
+  let left_grouped = merge_transcription_results(&[a(), b(), c()]);
+  // A·(B·C): pre-merge B and C, then fold A over that intermediate.
+  let bc = merge_transcription_results(&[b(), c()]);
+  let right_grouped = merge_transcription_results(&[a(), bc]);
+  assert_eq!(
+    left_grouped.task_facts().decoded_span(),
+    right_grouped.task_facts().decoded_span(),
+    "a documented-associative merge law must store the same span for both groupings",
+  );
+  assert_eq!(
+    left_grouped.task_facts().decoded_span(),
+    SpanKnowledge::AtLeast(usize::MAX),
+    "the overflowed total is the saturated lower bound, grouping-independent",
+  );
+
+  // Round 11 (L), corrected under round 12: the materialized-overflow variant with
+  // a real SURVIVOR. The overflowing child A carries a survivor at id `usize::MAX`
+  // (wholly-unknown span `AtLeast(0)`), and a drop-OFF prefix merge reindexes it to
+  // id 0. The pre-round-11 fold substituted an inferred extent into the stored fact
+  // and diverged the groupings; the round-12 fold sums the RAW `SpanKnowledge`, so
+  // `A(AtLeast(0)) · B(Exact(2)) = AtLeast(2)` in EVERY grouping -- B's KNOWN 2
+  // ordinals survive as the aggregate's lower bound (the round-12 fix: the
+  // pre-round-12 `None` erased them, landing the trailing chunk on id 1). The
+  // stored span AND the trailing drop-ON ids are then grouping-independent.
+  //
+  // Mutation proof: revert `SpanKnowledge::merge`'s `AtLeast` arm to the absorbing
+  // `_ => None` and the stored span reads back the wholly-unknown `AtLeast(0)`,
+  // dropping the trailing id from 2 back to 1 -- both the value assertions fail.
+  let a_overflow = || {
+    let mut seg = TranscriptionSegment::new();
+    seg.set_id(usize::MAX).set_text(" A").set_tokens(vec![20]);
+    // A public `new` result: one survivor, span WHOLLY UNKNOWN (`AtLeast(0)`).
+    TranscriptionResult::new(" A", vec![seg], "en", TranscriptionTimings::new())
+  };
+  let b_dropped = || all_dropped(2); // no survivors, carried span Exact(2)
+  let t = || span_one_speech(31); // one trailing survivor at local id 0
+
+  // One-shot `merge([A, B])` and staged `merge([merge([A]), B])` — both drop-OFF,
+  // since a drop-ON merge over A's `usize::MAX` survivor is the documented panic.
+  let one_shot_ab = merge_transcription_results(&[a_overflow(), b_dropped()]);
+  let staged_ab =
+    merge_transcription_results(&[merge_transcription_results(&[a_overflow()]), b_dropped()]);
+  assert_eq!(
+    one_shot_ab.task_facts().decoded_span(),
+    staged_ab.task_facts().decoded_span(),
+    "the overflowing prefix must not diverge the stored span across groupings",
+  );
+  assert_eq!(
+    one_shot_ab.task_facts().decoded_span(),
+    SpanKnowledge::AtLeast(2),
+    "B's KNOWN 2 ordinals survive as the aggregate's lower bound (round 12), never erased",
+  );
+
+  // A trailing drop-ON merge must number both groupings identically.
+  let opts = DecodingOptions::new(); // drop ON
+  let one_shot_trailing = segment_ids(&merge_transcription_results_with_options(
+    &[one_shot_ab, t()],
+    &opts,
+  ));
+  let staged_trailing = segment_ids(&merge_transcription_results_with_options(
+    &[staged_ab, t()],
+    &opts,
+  ));
+  assert_eq!(
+    one_shot_trailing, staged_trailing,
+    "the trailing id is grouping-independent across the materialized overflow",
+  );
+  assert_eq!(
+    one_shot_trailing,
+    vec![0, 2],
+    "B's preserved lower bound of 2 lands the trailing segment past it -> id 2 (round 12; \
+     the pre-round-12 `None` erased B's ordinal and landed it on id 1)",
+  );
+}
+
+#[test]
+fn a_public_results_too_small_span_is_distrusted_at_merge_input() {
+  // F2 sibling (codex round 9), preserved under round 12. A PUBLIC result whose
+  // carried span is below its survivor extent — a hand-built or deserialized
+  // inconsistency — must not be trusted at merge INPUT: two survivors `[0, 1]`
+  // (extent 2) carrying `Exact(1)` would, if believed, advance the drop-ON id base
+  // by only 1 and renumber a trailing chunk onto id 1. `effective_span_knowledge`
+  // floors the carried span's lower bound at the survivor extent, keeping the
+  // merge injective.
+  //
+  // Mutation proof: revert `effective_span_knowledge` to trust the carried lower
+  // bound verbatim (drop the `.max(extent)`) and the staged ids collapse to
+  // `[0, 1, 1]`.
+  let mut s0 = TranscriptionSegment::new();
+  s0.set_id(0).set_text(" R0").set_tokens(vec![20]);
+  let mut s1 = TranscriptionSegment::new();
+  s1.set_id(1).set_text(" R1").set_tokens(vec![21]);
+  let r = TranscriptionResult::new(" R0 R1", vec![s0, s1], "en", TranscriptionTimings::new())
+    .with_task_facts(TaskFacts::unknown().with_decoded_span(SpanKnowledge::Exact(1)));
+  let mut c_seg = TranscriptionSegment::new();
+  c_seg.set_id(0).set_text(" C").set_tokens(vec![22]);
+  let c = TranscriptionResult::new(" C", vec![c_seg], "en", TranscriptionTimings::new());
+  let staged = merge_transcription_results_with_options(&[r, c], &DecodingOptions::new());
+  assert_eq!(
+    segment_ids(&staged),
+    vec![0, 1, 2],
+    "a too-small carried span is clamped up to the survivor extent at merge input",
+  );
+}
+
+#[test]
+fn merging_an_unknown_facts_contributor_poisons_a_known_clean_result() {
+  // F2 (codex round 8), at the merge boundary. `None` is the epistemic unknown,
+  // NOT the OR identity: merging a contributor with genuinely-unknown
+  // draw/early-stop facts into a known-clean result must not read back
+  // observed-clean-and-reproducible. The pre-fix free monoid (`None` as
+  // identity) let `or_unknown(Some(false), None) = Some(false)`, so an unknown
+  // contributor vanished and the merge promised a byte-reproducibility neither
+  // result earned. Two mutations are caught here:
+  //   - seed the fold at `TaskFacts::unknown()` instead of the Accumulator, and
+  //     the LONE known-clean result nulls to `None` (the `solo` block fails);
+  //   - revert `kleene_or` to the free monoid, and the UNKNOWN contributor stops
+  //     poisoning, reading back `Some(false)`/reproducible (the `poisoned` block
+  //     fails).
+  let compute = crate::options::ComputeOptions::new();
+  let clean = TranscriptionResult::new(
+    "Hi",
+    vec![TranscriptionSegment::new()],
+    "en",
+    TranscriptionTimings::new(),
+  )
+  .with_task_facts(TaskFacts::observed_clean());
+  let unknown_contrib = TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
+    .with_task_facts(TaskFacts::unknown());
+
+  // A lone known-clean result stays observed-clean: the Accumulator takes it
+  // verbatim, NOT nulled by an `unknown()` fold seed.
+  let solo =
+    merge_transcription_results_with_options(std::slice::from_ref(&clean), &DecodingOptions::new());
+  assert_eq!(solo.task_facts().drew_from_rng(), Some(false));
+  assert_eq!(solo.task_facts().early_stopped(), Some(false));
+  assert!(
+    crate::provenance::Provenance::for_result(&DecodingOptions::new(), &compute, &solo)
+      .is_reproducible(),
+    "a lone observed-clean result is reproducible",
+  );
+
+  // Merge an UNKNOWN-facts contributor in: its `None` poisons the draw and
+  // early-stop to unknown, and the transcript is no longer promised reproducible.
+  let poisoned =
+    merge_transcription_results_with_options(&[clean, unknown_contrib], &DecodingOptions::new());
+  assert_eq!(
+    poisoned.task_facts().drew_from_rng(),
+    None,
+    "an unknown contributor's None poisons the known-clean draw (was wrongly Some(false))",
+  );
+  assert_eq!(poisoned.task_facts().early_stopped(), None);
+  assert!(
+    !crate::provenance::Provenance::for_result(&DecodingOptions::new(), &compute, &poisoned)
+      .is_reproducible(),
+    "the merge must not promise reproducibility once an unknown contributor joined",
+  );
+}
+
+/// A result carrying nothing but text — the shape `transcribe_all` returns
+/// for a chunk/clip whose segments were all emptied (or, independently of
+/// the blank-audio drop, for any clip shorter than `window_clip_time`).
+fn spoken(text: &str) -> TranscriptionResult {
+  TranscriptionResult::new(text, Vec::new(), "en", TranscriptionTimings::new())
+}
+
+#[test]
+fn merge_joins_an_empty_text_as_a_bare_separator() {
+  // PARITY PIN (issue #14). The options-BLIND merge deliberately does NOT
+  // skip empty-text results: Swift's `validResults` `compactMap`s away
+  // only *nil* elements, never empty-text ones, so
+  // `["a", "", "b"].joined(separator: " ")` is `"a  b"` there and must be
+  // `"a  b"` here.
+  //
+  // It is tempting to "fix" this here, because
+  // `DecodingOptions::drop_blank_audio` (default `true`) makes an emptied
+  // chunk common. DON'T — an empty-text result is reachable with NO
+  // involvement from that option (any audio shorter than
+  // `window_clip_time` runs no window and returns one; see
+  // `transcribe::tests::audio_shorter_than_window_clip_time_yields_no_windows`,
+  // which predates the option), so filtering unconditionally here would
+  // silently change the `drop_blank_audio == false` path — the path whose
+  // whole purpose is to be byte-for-byte Swift. The skip belongs to the
+  // option, and therefore to `merge_transcription_results_with_options`
+  // (below); this test is what keeps it from creeping down here.
+  assert_eq!(
+    merge_transcription_results(&[spoken("a"), spoken(""), spoken("b")]).text(),
+    "a  b",
+    "interior empty stays a bare separator (Swift parity)"
+  );
+  assert_eq!(
+    merge_transcription_results(&[spoken("a"), spoken("")]).text(),
+    "a ",
+    "trailing empty stays a bare separator (Swift parity)"
+  );
+}
+
+#[test]
+fn merge_with_options_skips_empty_texts_when_blank_audio_is_dropped() {
+  // THE REGRESSION, at the public door a consumer actually uses: fold a
+  // `transcribe_all` batch through the merge under the DEFAULT options
+  // (`drop_blank_audio == true`). An emptied result must contribute no
+  // separator at all — the merge's own `["a", "", "b"].join(" ")` would
+  // make it `"a  b"`.
+  let options = DecodingOptions::new();
+  assert!(options.drop_blank_audio(), "this is the default path");
+  let text = |results: &[TranscriptionResult]| {
+    merge_transcription_results_with_options(results, &options)
+      .text()
+      .to_string()
+  };
+
+  // Interior: an emptied chunk BETWEEN two speech runs -> no doubled space.
+  assert_eq!(
+    text(&[spoken("Hello world."), spoken(""), spoken("Goodbye.")]),
+    "Hello world. Goodbye."
+  );
+  // Trailing: emptied chunks after the speech -> no trailing space(s).
+  assert_eq!(
+    text(&[spoken("Hello world."), spoken(""), spoken("")]),
+    "Hello world."
+  );
+  // Leading: an emptied chunk before the speech -> no leading space.
+  assert_eq!(text(&[spoken(""), spoken("Hello world.")]), "Hello world.");
+  // Wholly emptied: nothing at all, not a string of bare separators.
+  assert_eq!(text(&[spoken(""), spoken(""), spoken("")]), "");
+  // Speech only: the join is untouched — one separator per gap.
+  assert_eq!(text(&[spoken("Hello"), spoken("world.")]), "Hello world.");
+  // Empty input: still the empty string (`[].join(" ")`).
+  assert_eq!(text(&[]), "");
+}
+
+#[test]
+fn merge_with_options_joins_empty_texts_verbatim_when_the_drop_is_cleared() {
+  // The `false` TWIN of the test above, and the parity pin on this entry
+  // point: cleared, it must reproduce `merge_transcription_results` — bare
+  // separators and all — byte for byte. This is what makes the skip above
+  // provably attributable to the option rather than to the new function.
+  let options = DecodingOptions::new().maybe_drop_blank_audio(false);
+  let results = [spoken("Hello world."), spoken(""), spoken("Goodbye.")];
+
+  let merged = merge_transcription_results_with_options(&results, &options);
+  assert_eq!(
+    merged.text(),
+    "Hello world.  Goodbye.",
+    "the bare separator must SURVIVE when the drop is cleared (Swift parity)"
+  );
+  assert_eq!(
+    merged.text(),
+    merge_transcription_results(&results).text(),
+    "cleared, this entry point IS the options-blind merge"
+  );
+  assert_eq!(
+    merge_transcription_results_with_options(&[spoken("a"), spoken("")], &options).text(),
+    "a ",
+    "trailing bare separator survives too"
+  );
+}
+
+#[test]
+fn merge_with_options_keeps_every_result_in_the_timing_sums() {
+  // The skip is a JOIN rule, not a merge-input filter. Dropping an emptied
+  // result from the merge instead would take its `input_audio_seconds` /
+  // `audio_processing` / every other summed timing out with it — silently
+  // corrupting the merged metrics, and the RTF derived from them, to fix a
+  // spacing bug. Every field except `text` must therefore be INVARIANT
+  // under the option.
+  let timed = |text: &str, audio_seconds: f64| {
+    let mut timings = TranscriptionTimings::new();
+    timings
+      .set_input_audio_seconds(audio_seconds)
+      .set_audio_processing(audio_seconds / 10.0)
+      .set_total_audio_processing_runs(1.0)
+      .set_full_pipeline(audio_seconds / 4.0);
+    TranscriptionResult::new(text, Vec::new(), "en", timings)
+  };
+  // The middle chunk is 30 s of silence the blank-audio drop emptied: no
+  // text, but 30 s of audio that really was processed.
+  let results = [
+    timed("Hello world.", 30.0),
+    timed("", 30.0),
+    timed("Goodbye.", 20.0),
+  ];
+
+  let dropped = merge_transcription_results_with_options(
+    &results,
+    &DecodingOptions::new().with_drop_blank_audio(),
+  );
+  let kept = merge_transcription_results_with_options(
+    &results,
+    &DecodingOptions::new().maybe_drop_blank_audio(false),
+  );
+  let blind = merge_transcription_results(&results);
+
+  // Only the text moves.
+  assert_eq!(dropped.text(), "Hello world. Goodbye.");
+  assert_eq!(kept.text(), "Hello world.  Goodbye.");
+
+  // Everything else is byte-identical across all three doors — including
+  // the EMPTIED chunk's 30 s, which must still be in the sums.
+  for other in [&kept, &blind] {
+    assert_eq!(
+      dropped.timings().input_audio_seconds(),
+      other.timings().input_audio_seconds()
+    );
+    assert_eq!(
+      dropped.timings().audio_processing(),
+      other.timings().audio_processing()
+    );
+    assert_eq!(
+      dropped.timings().total_audio_processing_runs(),
+      other.timings().total_audio_processing_runs()
+    );
+    assert_eq!(
+      dropped.timings().full_pipeline(),
+      other.timings().full_pipeline()
+    );
+    assert_eq!(
+      dropped.timings().real_time_factor(),
+      other.timings().real_time_factor()
+    );
+    assert_eq!(dropped.segments_slice().len(), other.segments_slice().len());
+    assert_eq!(dropped.language(), other.language());
+  }
+
+  // ...and the sums are the REAL ones, not the ones a skipped result leaves
+  // behind: 30 + 30 + 20, not 30 + 20.
+  assert_eq!(dropped.timings().input_audio_seconds(), 80.0);
+  assert_eq!(dropped.timings().total_audio_processing_runs(), 3.0);
+  assert_eq!(dropped.timings().full_pipeline(), 20.0);
+  assert_eq!(dropped.timings().real_time_factor(), 20.0 / 80.0);
 }
 
 #[test]
@@ -504,6 +1573,8 @@ fn decoding_result_defaults_match_swift_empty_results() {
   // `first_token_log_prob_too_low` without decode_text changing its return
   // type.
   assert_eq!(r.first_token_log_prob(), 0.0);
+  // F3 (codex round 3): a fresh result observed no `<|lang|>` token.
+  assert_eq!(r.observed_language(), None);
   assert_eq!(DecodingResult::default(), DecodingResult::new());
 }
 
@@ -512,6 +1583,7 @@ fn decoding_result_builder_vocabulary() {
   let r = DecodingResult::new()
     .with_language("en")
     .with_language_probs(vec![("en".to_string(), 0.98)])
+    .maybe_observed_language(Some("en".to_string()))
     .with_tokens(vec![50364u32, 15339])
     .with_token_log_probs(vec![(50364u32, -0.05)])
     .with_text("hello")
@@ -521,6 +1593,7 @@ fn decoding_result_builder_vocabulary() {
     .with_compression_ratio(1.6)
     .with_first_token_log_prob(-0.8);
   assert_eq!(r.language(), "en");
+  assert_eq!(r.observed_language(), Some("en"));
   assert_eq!(r.language_probs_slice(), &[("en".to_string(), 0.98)]);
   assert_eq!(r.tokens_slice(), &[50364u32, 15339]);
   assert_eq!(r.token_log_probs_slice(), &[(50364u32, -0.05)]);
@@ -648,6 +1721,57 @@ fn transcription_result_serde_skips_absent_seek_time() {
 
 #[cfg(feature = "serde")]
 #[test]
+fn task_facts_draw_flag_is_required_on_deserialize() {
+  // F1 (codex round 2), now carried in the embedded `task_facts`. The draw flag
+  // must never silently default to `false` ("never sampled", the optimistic
+  // answer) when a persisted record drops it: a blank-dropped result whose
+  // sampled window was filtered away carries the fact ONLY here, and a `false`
+  // default would hand `Provenance::is_reproducible` a guarantee the run never
+  // earned. Mirrors the same requirement on the record itself
+  // (`task_facts::tests::the_reproducibility_and_coordinate_facts_are_required_on_deserialize`).
+  let sampled_empty = TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
+    .with_task_facts(TaskFacts::unknown().with_drew_from_rng(true));
+  let value: serde_json::Value = serde_json::to_value(&sampled_empty).unwrap();
+  // The intact record round-trips, or the removals below prove nothing.
+  assert_eq!(
+    serde_json::from_value::<TranscriptionResult>(value.clone()).unwrap(),
+    sampled_empty
+  );
+
+  // Drop the nested draw flag: it must FAIL, not default to `false`.
+  let mut without_flag = value.clone();
+  assert!(
+    without_flag
+      .as_object_mut()
+      .unwrap()
+      .get_mut("task_facts")
+      .unwrap()
+      .as_object_mut()
+      .unwrap()
+      .remove("drew_from_rng")
+      .is_some(),
+    "the flag is always serialized, so the key must have been present"
+  );
+  assert!(
+    serde_json::from_value::<TranscriptionResult>(without_flag).is_err(),
+    "a dropped `task_facts.drew_from_rng` must be rejected, not read back false"
+  );
+
+  // Drop the whole `task_facts` block: also rejected — the record is required.
+  let mut without_facts = value;
+  without_facts
+    .as_object_mut()
+    .unwrap()
+    .remove("task_facts")
+    .unwrap();
+  assert!(
+    serde_json::from_value::<TranscriptionResult>(without_facts).is_err(),
+    "a result missing its whole `task_facts` block must be rejected, not defaulted"
+  );
+}
+
+#[cfg(feature = "serde")]
+#[test]
 fn decoding_result_serde_round_trips_and_skips_empty_collections() {
   let r = DecodingResult::new().with_text("hi");
   let json = serde_json::to_string(&r).unwrap();
@@ -759,7 +1883,7 @@ fn format_segments_renders_timestamps_and_raw_text() {
 #[test]
 fn merge_with_confirmed_words_overrides_text_only() {
   // TranscriptionUtilities.swift:76-82 — confirmed words joined with NO
-  // separator; segments/language/timings identical to the plain merge.
+  // separator; segments/language/timings identical to the SAME-options merge.
   let mut first = TranscriptionResult::new("", Vec::new(), "", TranscriptionTimings::new());
   first
     .set_text("hello")
@@ -771,11 +1895,233 @@ fn merge_with_confirmed_words_overrides_text_only() {
     .set_segments(vec![segment_with_words(30.0, 31.0, "world", vec![])]);
   let results = [first, second];
   let confirmed = [timed_word(" And", 0.0, 0.4), timed_word(" so", 0.4, 0.7)];
+  let options = DecodingOptions::new();
 
-  let with_words = merge_transcription_results_with_words(&results, &confirmed);
-  let plain = merge_transcription_results(&results);
+  let with_words = merge_transcription_results_with_words(&results, &confirmed, &options);
+  // Compared against the SAME-options merge, not the options-blind one:
+  // everything but the text must match what the confirmed-words path builds.
+  let plain = merge_transcription_results_with_options(&results, &options);
   assert_eq!(with_words.text(), " And so");
   assert_eq!(plain.text(), "hello world");
   assert_eq!(with_words.segments_slice(), plain.segments_slice());
   assert_eq!(with_words.language(), plain.language());
+}
+
+#[test]
+fn merge_with_confirmed_words_honors_drop_blank_id_mapping() {
+  // F5 (codex round 3). The confirmed-words merge delegated to the plain
+  // (drop-OFF) merge, so a survivor id gap [0, 2] came back densely
+  // renumbered [0, 1] -- the confirmed TEXT override is options-blind, but the
+  // merged SEGMENT ids are not (drop now controls the id mapping, coremlit
+  // #14 / F4). LocalAgreement::finalize (the default streaming path) inherited
+  // that loss; see `stream::agreement::tests` for the finalize half.
+  let seg = |id: usize, token: u32| {
+    let mut s = TranscriptionSegment::new();
+    s.set_id(id).set_tokens(vec![token]);
+    s
+  };
+  let chunk = TranscriptionResult::new(
+    "A B",
+    vec![seg(0, 10), seg(2, 12)],
+    "en",
+    TranscriptionTimings::new(),
+  );
+  let confirmed = [timed_word(" X", 0.0, 0.4)];
+
+  // drop-ON (the default): the [0, 2] gap survives, text still overridden.
+  let dropped = merge_transcription_results_with_words(
+    std::slice::from_ref(&chunk),
+    &confirmed,
+    &DecodingOptions::new(),
+  );
+  assert_eq!(
+    dropped
+      .segments_slice()
+      .iter()
+      .map(TranscriptionSegment::id)
+      .collect::<Vec<_>>(),
+    vec![0, 2],
+    "confirmed-words merge must preserve the dropped-id gap, not renumber to [0, 1]"
+  );
+  assert_eq!(
+    dropped.text(),
+    " X",
+    "text is still the confirmed-words override"
+  );
+
+  // drop-OFF: EXACTLY Swift's dense reindex [0, 1].
+  let dense = merge_transcription_results_with_words(
+    std::slice::from_ref(&chunk),
+    &confirmed,
+    &DecodingOptions::new().maybe_drop_blank_audio(false),
+  );
+  assert_eq!(
+    dense
+      .segments_slice()
+      .iter()
+      .map(TranscriptionSegment::id)
+      .collect::<Vec<_>>(),
+    vec![0, 1],
+    "drop-OFF stays Swift-exact result_index + segment_index"
+  );
+}
+
+#[test]
+fn merge_ors_the_sampling_fact_across_results() {
+  // The VAD-chunk instance of finding 2: a chunk the blank-audio drop
+  // emptied contributes NO segments, so its accepted temperature is nowhere
+  // in the merged segment list. The merge has to carry the fact out of it
+  // anyway, or the merged transcript looks greedy and claims a
+  // byte-reproducibility it cannot honor.
+  // A genuinely greedy chunk POSITIVELY records `drew_from_rng = Some(false)` —
+  // the shape a real decode carries — not the bare `unknown()` a segment alone
+  // would leave (which the merge could not tell from "never observed").
+  let greedy = TranscriptionResult::new(
+    "Hello",
+    vec![TranscriptionSegment::new().with_temperature(0.0)],
+    "en",
+    TranscriptionTimings::new(),
+  )
+  .with_task_facts(TaskFacts::unknown().with_drew_from_rng(false));
+  // The emptied chunk: zero segments, and the only witness to its own
+  // sampling is the carried flag itself.
+  let emptied = TranscriptionResult::new("", Vec::new(), "en", TranscriptionTimings::new())
+    .with_task_facts(TaskFacts::unknown().with_drew_from_rng(true));
+  assert!(emptied.segments_slice().is_empty());
+
+  let merged = merge_transcription_results(&[greedy.clone(), emptied.clone()]);
+  assert!(
+    merged
+      .segments_slice()
+      .iter()
+      .all(|segment| segment.temperature() == 0.0),
+    "no surviving segment carries the evidence"
+  );
+  assert_eq!(
+    merged.task_facts().drew_from_rng(),
+    Some(true),
+    "and yet the merge must still know"
+  );
+
+  // Same through the options-aware door `WhisperKit::transcribe` actually uses.
+  assert_eq!(
+    merge_transcription_results_with_options(&[greedy.clone(), emptied], &DecodingOptions::new())
+      .task_facts()
+      .drew_from_rng(),
+    Some(true),
+  );
+
+  // All-greedy merges stay honest in the other direction: two observed
+  // `Some(false)` stay `Some(false)`, never OR-ing up to a phantom draw.
+  assert_eq!(
+    merge_transcription_results(&[greedy.clone(), greedy])
+      .task_facts()
+      .drew_from_rng(),
+    Some(false),
+  );
+  // An empty merge observed nothing at all — explicit unknown, not `Some(false)`.
+  assert_eq!(
+    merge_transcription_results(&[])
+      .task_facts()
+      .drew_from_rng(),
+    None,
+  );
+}
+
+#[test]
+fn merge_carries_the_first_observed_language() {
+  // F3 (codex round 3). The merged observation is the FIRST result that
+  // WITNESSED a language, scanning ALL results -- not `results.first()`, which
+  // dropped `[None, Some("es")]` to `None`, losing an observation the batch
+  // plainly made. It is deliberately independent of the merged DISPLAY
+  // language (the first result's, keeping its Swift-compat fallback).
+  let observed = |lang: Option<&str>| {
+    TranscriptionResult::new("x", Vec::new(), "en", TranscriptionTimings::new())
+      .with_task_facts(TaskFacts::unknown().with_observed_language(lang.map(str::to_string)))
+  };
+
+  // [None, Some("es")] -> Some("es"): the pre-fix first-only read returned None.
+  let merged = merge_transcription_results(&[observed(None), observed(Some("es"))]);
+  assert_eq!(
+    merged.task_facts().observed_language(),
+    Some("es"),
+    "an observation in a later chunk must survive the merge"
+  );
+  assert_eq!(
+    merged.language(),
+    "en",
+    "the DISPLAY language stays the first result's, independent of the observation"
+  );
+
+  // Conflicting observations: first observed wins (the documented scalar rule).
+  assert_eq!(
+    merge_transcription_results(&[observed(Some("es")), observed(Some("fr"))])
+      .task_facts()
+      .observed_language(),
+    Some("es"),
+  );
+  // No result observed anything -> None, not the display fallback.
+  assert_eq!(
+    merge_transcription_results(&[observed(None), observed(None)])
+      .task_facts()
+      .observed_language(),
+    None,
+  );
+  // Through the options-aware door too.
+  assert_eq!(
+    merge_transcription_results_with_options(
+      &[observed(None), observed(Some("es"))],
+      &DecodingOptions::new(),
+    )
+    .task_facts()
+    .observed_language(),
+    Some("es"),
+  );
+}
+
+#[test]
+fn new_does_not_infer_observed_language_from_the_display_language() {
+  // F3 (codex round 3). The display language is not an observation, so `new`
+  // must NOT seed the task facts' observed language from it -- a configured or
+  // fallback code was never *detected*. Only an explicit record carries one.
+  let r = TranscriptionResult::new("hi", Vec::new(), "es", TranscriptionTimings::new());
+  assert_eq!(r.language(), "es", "the display language is still set");
+  assert_eq!(
+    r.task_facts().observed_language(),
+    None,
+    "but no observation is inferred from the display language"
+  );
+  assert_eq!(
+    r.with_task_facts(TaskFacts::unknown().with_observed_language(Some("es".to_string())))
+      .task_facts()
+      .observed_language(),
+    Some("es"),
+    "an explicit observation is still recorded"
+  );
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn segment_non_finite_temperature_is_rejected_by_serde() {
+  // Codex round 3, F6. `temperature` is the one `TranscriptionSegment` float
+  // bridged through the finite-float guard, because `provenance` reads it
+  // (`unanimous_temperature`, `sampled_at_nonzero_temperature`) to decide
+  // reproducibility — a non-finite value silently changing across a round trip
+  // would corrupt that record. It is refused on serialize rather than written
+  // as the lossy `null` serde_json emits; a finite segment still round-trips.
+  // The descriptive telemetry floats beside it (`avg_logprob`,
+  // `compression_ratio`, `no_speech_prob`) are deliberately left unguarded.
+  for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+    let segment = TranscriptionSegment::new().with_temperature(bad);
+    assert!(serde_json::to_string(&segment).is_err());
+  }
+  let finite = TranscriptionSegment::new()
+    .with_id(2)
+    .with_text("hola")
+    .with_temperature(0.2);
+  let json = serde_json::to_string(&finite).unwrap();
+  assert_eq!(
+    serde_json::from_str::<TranscriptionSegment>(&json).unwrap(),
+    finite
+  );
 }

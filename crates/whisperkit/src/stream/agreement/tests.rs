@@ -1,5 +1,8 @@
 use super::*;
-use crate::result::{TranscriptionResult, TranscriptionSegment, TranscriptionTimings, WordTiming};
+use crate::{
+  result::{TranscriptionResult, TranscriptionSegment, TranscriptionTimings, WordTiming},
+  task_facts::TaskFacts,
+};
 
 fn word(text: &str, start: f32, end: f32) -> WordTiming {
   WordTiming::new(text, vec![start as u32 + 1], start, end, 0.9)
@@ -113,7 +116,7 @@ fn finalize_appends_agreed_tail_plus_different_suffix_and_merges() {
     word(" my", 0.7, 1.0),
     word(" fellow", 1.0, 1.5),
   ]));
-  let final_result = agreement.finalize();
+  let final_result = agreement.finalize(&crate::options::DecodingOptions::new());
   // confirmed [And] + lastAgreed [so, my] + differentSuffix(prev, hyp) [fellow]
   assert_eq!(final_result.text(), " And so my fellow");
   assert_eq!(final_result.language(), "en");
@@ -121,6 +124,47 @@ fn finalize_appends_agreed_tail_plus_different_suffix_and_merges() {
     final_result.segments_slice().len(),
     2,
     "merged from the two appended results"
+  );
+}
+
+#[test]
+fn finalize_threads_options_so_dropped_ids_survive() {
+  // F5 (codex round 3), the finalize half. `finalize` delegated to the
+  // options-blind confirmed-words merge, so the default streaming path lost a
+  // survivor id gap [0, 2] back to a dense [0, 1] at finalization. Threading
+  // the driver's own options through must preserve it.
+  let seg = |id: usize, start: f32, end: f32| {
+    let mut s = TranscriptionSegment::new();
+    s.set_id(id).set_start(start).set_end(end);
+    s
+  };
+  // One ingested result carrying an internal dropped-id gap [0, 2] (a
+  // wordless result is still appended on first ingest -- see
+  // `wordless_results_are_flagged_but_still_appended`).
+  let result = TranscriptionResult::new(
+    "A B",
+    vec![seg(0, 0.0, 1.0), seg(2, 1.0, 2.0)],
+    "en",
+    TranscriptionTimings::new(),
+  );
+  let mut agreement = LocalAgreement::new();
+  agreement.ingest(result);
+  assert_eq!(
+    agreement.results_slice().len(),
+    1,
+    "first result is appended"
+  );
+
+  // drop-ON (the default): the gap must survive finalization.
+  let final_result = agreement.finalize(&crate::options::DecodingOptions::new());
+  assert_eq!(
+    final_result
+      .segments_slice()
+      .iter()
+      .map(TranscriptionSegment::id)
+      .collect::<Vec<_>>(),
+    vec![0, 2],
+    "finalize must pass drop_blank_audio through, not collapse [0, 2] to [0, 1]"
   );
 }
 
@@ -206,7 +250,10 @@ fn tied_word_starts_never_confirm_twice() {
     .map(|w| w.word())
     .collect();
   assert_eq!(confirmed, vec![" A", " B"], "confirmed once and stable");
-  let text = agreement.finalize().text().to_string();
+  let text = agreement
+    .finalize(&crate::options::DecodingOptions::new())
+    .text()
+    .to_string();
   for token in ["A", "B", "C", "D", "E"] {
     assert_eq!(
       text.matches(token).count(),
@@ -246,8 +293,196 @@ fn omitting_a_confirmed_tied_word_does_not_drop_provisional_words() {
     1,
     "and confirmed exactly once"
   );
-  let text = agreement.finalize().text().to_string();
+  let text = agreement
+    .finalize(&crate::options::DecodingOptions::new())
+    .text()
+    .to_string();
   for token in ["A", "B", "C", "D", "E"] {
     assert_eq!(text.matches(token).count(), 1, "{token} once in {text:?}");
   }
+}
+
+#[test]
+fn a_dropped_disagreeing_hypothesiss_draw_survives_into_finalize() {
+  // F1 (codex round 8). A three-hypothesis history where the MIDDLE hypothesis
+  // disagrees and is dropped from `results` (`:395-400`, skipAppend) but is
+  // retained as `prev_result` to CONTROL the next agreement comparison. Its
+  // unseeded draw decided which words R3 agreed on, so it must reach `finalize`'s
+  // reproducibility answer even though its segments never survive the merge.
+  //
+  // Mutation proof: remove the `ingested_facts` accumulation in `ingest` (or its
+  // merge in `finalize`) and the dropped R2's `Some(true)` draw vanishes -- the
+  // final record reads `Some(false)` and `is_reproducible()` flips true, failing
+  // the assertions below.
+  let r1 = result_with_words(vec![word(" And", 0.0, 0.4), word(" so", 0.4, 0.7)])
+    .with_task_facts(TaskFacts::observed_clean());
+  // R2 disagrees with R1 (no common prefix) AND drew from an unseeded sampler.
+  let r2 = result_with_words(vec![word(" But", 0.0, 0.4), word(" then", 0.4, 0.7)])
+    .with_task_facts(TaskFacts::observed_clean().with_drew_from_rng(true));
+  // R3 agrees with the retained R2 control hypothesis, advancing the watermark.
+  let r3 = result_with_words(vec![
+    word(" But", 0.0, 0.4),
+    word(" then", 0.4, 0.7),
+    word(" folks", 0.7, 1.0),
+  ])
+  .with_task_facts(TaskFacts::observed_clean());
+
+  let mut agreement = LocalAgreement::new();
+  assert!(agreement.ingest(r1).is_awaiting_agreement());
+  assert!(
+    agreement.ingest(r2).is_awaiting_agreement(),
+    "R2 disagrees with R1 and is dropped from results",
+  );
+  assert!(
+    agreement.ingest(r3).is_advanced(),
+    "R3 agrees with the retained R2 control hypothesis",
+  );
+
+  // R2 is absent from the kept results: only R1 (2 words) and R3 (3 words) remain.
+  assert_eq!(agreement.results_slice().len(), 2, "R2 was dropped");
+  assert_eq!(agreement.results_slice()[0].all_words().len(), 2, "R1 kept");
+  assert_eq!(
+    agreement.results_slice()[1].all_words().len(),
+    3,
+    "R3 kept -- the 2-word R2 is not here",
+  );
+
+  let options = crate::options::DecodingOptions::new();
+  let compute = crate::options::ComputeOptions::new();
+  let finalized = agreement.finalize(&options);
+  assert_eq!(
+    finalized.task_facts().drew_from_rng(),
+    Some(true),
+    "the dropped control hypothesis's unseeded draw survives into finalize",
+  );
+  assert!(
+    !crate::provenance::Provenance::for_result(&options, &compute, &finalized).is_reproducible(),
+    "an unseeded draw happened (in a dropped hypothesis), so it is not reproducible",
+  );
+  // ORACLE CORRECTION (codex round 13, M2): a seed does NOT make the recovered
+  // draw replayable here. `finalize` leaves the worker schedule at the `None` the
+  // agreement strip produces (its confirmed text interleaves MULTIPLE hypotheses,
+  // so no single ordered attribution survives -- round 10, F2), and a draw whose
+  // domain-separating coordinate is unknown can land different text at a different
+  // coordinate even under the same seed. This is the LocalAgreement history through
+  // which the seed-plus-unknown-schedule case is reachable; the focused unit is
+  // `task_facts::tests::seeded_draw_with_unknown_worker_schedule_is_not_reproducible`.
+  //
+  // Mutation proof: drop the `&& schedule_known` guard from
+  // `is_reproducible_under`'s `Some(true)` draw arm and this reads back reproducible.
+  assert_eq!(
+    finalized.task_facts().worker_schedule(),
+    None,
+    "agreement strips the schedule, so the seeded draw's coordinate is unknown",
+  );
+  assert!(
+    !crate::provenance::Provenance::for_result(
+      &options.clone().with_seed(11),
+      &compute,
+      &finalized,
+    )
+    .is_reproducible(),
+    "a seed cannot replay the recovered draw whose worker coordinate agreement stripped",
+  );
+}
+
+#[test]
+fn finalize_keeps_the_earliest_ingested_language_over_a_later_survivor() {
+  // F3 (codex round 9). The ingest-ordered sink observed a MIDDLE hypothesis's
+  // "es" (which disagreed and was dropped from `results`) BEFORE a later
+  // surviving hypothesis's "fr". Folding that sink as a trailing contributor let
+  // the survivor's "fr" win first-genuine; seeding the finalize fold FROM the
+  // sink keeps the earliest genuine observation, "es".
+  //
+  // Mutation proof: revert `finalize` to fold the sink LAST
+  // (`merged.task_facts_mut().merge(&ingested)`) and this reads back Some("fr").
+  //
+  // R1: kept (first ever), observes NO language. R2: disagrees with R1 (no common
+  // prefix), observes "es", dropped from results but retained as the control. R3:
+  // agrees with the retained R2 control, observes "fr", kept.
+  let r1 = result_with_words(vec![word(" And", 0.0, 0.4), word(" so", 0.4, 0.7)])
+    .with_task_facts(TaskFacts::observed_clean());
+  let r2 = result_with_words(vec![word(" But", 0.0, 0.4), word(" then", 0.4, 0.7)])
+    .with_task_facts(TaskFacts::observed_clean().with_observed_language(Some("es".into())));
+  let r3 = result_with_words(vec![
+    word(" But", 0.0, 0.4),
+    word(" then", 0.4, 0.7),
+    word(" folks", 0.7, 1.0),
+  ])
+  .with_task_facts(TaskFacts::observed_clean().with_observed_language(Some("fr".into())));
+
+  let mut agreement = LocalAgreement::new();
+  assert!(agreement.ingest(r1).is_awaiting_agreement());
+  assert!(
+    agreement.ingest(r2).is_awaiting_agreement(),
+    "R2 disagrees with R1 and is dropped from results",
+  );
+  assert!(
+    agreement.ingest(r3).is_advanced(),
+    "R3 agrees with the retained R2 control hypothesis",
+  );
+  assert_eq!(
+    agreement.results_slice().len(),
+    2,
+    "only R1 and R3 are kept; the es-observing R2 was dropped",
+  );
+
+  let options = crate::options::DecodingOptions::new();
+  let compute = crate::options::ComputeOptions::new();
+  let finalized = agreement.finalize(&options);
+  assert_eq!(
+    finalized.task_facts().observed_language(),
+    Some("es"),
+    "the earliest ingested genuine language wins, even from a dropped hypothesis",
+  );
+  assert_eq!(
+    crate::provenance::Provenance::for_result(&options, &compute, &finalized)
+      .task_facts()
+      .observed_language(),
+    Some("es"),
+    "and provenance carries that earliest observation",
+  );
+}
+
+#[test]
+fn finalize_reports_an_unknown_worker_schedule() {
+  // ADJUDICATED (round 10, F2): agreement-confirmed text interleaves words from
+  // MULTIPLE hypotheses, so no single ordered worker attribution is knowable --
+  // the finalized record's worker_schedule is None even when every ingested
+  // hypothesis carried a DISTINCT, known coordinate. The strip at `ingest` makes
+  // every contributor's schedule None, and the absorbing-None merge law keeps the
+  // aggregate None (the surviving results' own [0, 2] cannot pass through it).
+  //
+  // Mutation proof: drop the `.with_worker_schedule(None)` strip in `ingest` and
+  // the ingested coordinates accumulate, so the finalized schedule reads back a
+  // non-None Some(...) instead of the adjudicated None.
+  let r1 = result_with_words(vec![word(" And", 0.0, 0.4), word(" so", 0.4, 0.7)])
+    .with_task_facts(TaskFacts::observed_clean().with_worker(0));
+  let r2 = result_with_words(vec![word(" But", 0.0, 0.4), word(" then", 0.4, 0.7)])
+    .with_task_facts(TaskFacts::observed_clean().with_worker(1));
+  let r3 = result_with_words(vec![
+    word(" But", 0.0, 0.4),
+    word(" then", 0.4, 0.7),
+    word(" folks", 0.7, 1.0),
+  ])
+  .with_task_facts(TaskFacts::observed_clean().with_worker(2));
+
+  let mut agreement = LocalAgreement::new();
+  assert!(agreement.ingest(r1).is_awaiting_agreement());
+  assert!(
+    agreement.ingest(r2).is_awaiting_agreement(),
+    "R2 disagrees with R1 and is dropped from results",
+  );
+  assert!(
+    agreement.ingest(r3).is_advanced(),
+    "R3 agrees with the retained R2 control hypothesis",
+  );
+  // The surviving results R1 (worker 0) and R3 (worker 2) carry a knowable [0, 2],
+  // but the confirmed transcript mixes their words -- attribution is unknown.
+  let finalized = agreement.finalize(&crate::options::DecodingOptions::new());
+  assert_eq!(
+    finalized.task_facts().worker_schedule(),
+    None,
+    "agreement-confirmed text has no single knowable worker attribution -- unknown, not [0, 2]",
+  );
 }

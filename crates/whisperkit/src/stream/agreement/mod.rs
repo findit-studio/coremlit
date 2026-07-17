@@ -67,6 +67,7 @@ use crate::{
   error::TranscribeError,
   options::DecodingOptions,
   result::{TranscriptionResult, WordTiming, merge_transcription_results_with_words},
+  task_facts::{SpanKnowledge, TaskFactsAccumulator},
   text::{find_longest_common_prefix, find_longest_different_suffix},
   transcribe::WhisperKit,
 };
@@ -139,6 +140,18 @@ pub struct LocalAgreement {
   last_agreed_words: Vec<WordTiming>,
   confirmed_words: Vec<WordTiming>,
   results: Vec<TranscriptionResult>,
+  /// A sink for the reproducibility facts of EVERY ingested hypothesis —
+  /// including the disagreeing ones dropped from [`Self::results`] but retained
+  /// as [`Self::prev_result`] to CONTROL the next agreement comparison (codex
+  /// round 8, F1). The same error-drop-sink pattern the VAD branch uses: a
+  /// dropped hypothesis's unseeded draw (or callback truncation) still decided
+  /// which words the surviving hypotheses agreed on, so it must reach
+  /// [`Self::finalize`]'s reproducibility answer even though its segments never
+  /// survive into the merge. Only the draw/early-stop/language facts are folded;
+  /// the worker schedule and id span are stripped to `None` (see the strip in
+  /// [`Self::ingest`]) — the finalized schedule is the adjudicated `None` and the
+  /// finalized span is restored from the merged surviving result (round 10).
+  ingested_facts: TaskFactsAccumulator,
 }
 
 impl Default for LocalAgreement {
@@ -161,6 +174,7 @@ impl LocalAgreement {
       last_agreed_words: Vec::new(),
       confirmed_words: Vec::new(),
       results: Vec::new(),
+      ingested_facts: TaskFactsAccumulator::new(),
     }
   }
 
@@ -335,6 +349,30 @@ impl LocalAgreement {
   /// becomes the new previous result for the next call (`:402`, outside
   /// the agreement `if`/`else` but still inside the has-words branch).
   pub fn ingest(&mut self, result: TranscriptionResult) -> AgreementOutcome {
+    // Accumulate THIS hypothesis's reproducibility facts BEFORE any gate or
+    // branch, so a hypothesis dropped from `results` on disagreement (:395-400,
+    // `skipAppend`) still contributes them to `finalize` (codex round 8, F1). It
+    // controlled which words the surviving hypotheses agreed on — a re-run that
+    // redraws its unseeded sample may land different confirmed text — so its draw
+    // must not vanish with its segments.
+    //
+    // Worker schedule and id span are stripped here. For the SCHEDULE this is the
+    // ADJUDICATED agreement contract (round 10, F2): agreement-confirmed text
+    // interleaves words from MULTIPLE hypotheses, so no single ordered worker
+    // attribution is knowable — every contributor is `None`, which under the
+    // absorbing-`None` law is exactly what the finalized aggregate must read back
+    // (`finalize` leaves it there). For the SPAN the strip to the wholly-unknown
+    // `AtLeast(0)` keeps `ingested_facts` from summing dropped hypotheses'
+    // ordinals; `finalize` overwrites it with the merged surviving result's own
+    // span, the authoritative id-ordinal count.
+    self.ingested_facts.merge(
+      &result
+        .task_facts()
+        .clone()
+        .with_worker_schedule(None)
+        .with_decoded_span(SpanKnowledge::wholly_unknown()),
+    );
+
     // :371 gate — see this module's doc for "any segment" vs. Swift's
     // first-segment-only nil check.
     let has_words = result
@@ -395,12 +433,51 @@ impl LocalAgreement {
   /// ingested pair), both folded onto [`Self::confirmed_words_slice`];
   /// [`merge_transcription_results_with_words`] then merges every kept
   /// [`Self::results_slice`] result with that word list as the merged
-  /// text.
-  pub fn finalize(mut self) -> TranscriptionResult {
+  /// text, under `options` — the same options the kept results were decoded
+  /// with, so the merged segments honor
+  /// [`DecodingOptions::drop_blank_audio`]'s id mapping (which the confirmed
+  /// text override does not touch, but the segments still carry).
+  ///
+  /// The reproducibility facts of EVERY ingested hypothesis — including the
+  /// disagreeing ones dropped from [`Self::results_slice`] — are carried on the
+  /// finalized record from `Self::ingested_facts` (codex round 8, F1), so a
+  /// dropped control hypothesis's unseeded draw or callback truncation is not
+  /// lost from the reproducibility answer. That ingest-ordered sink is the fold
+  /// BASE, with the merged result's own facts folded IN (codex round 9): its
+  /// FIRST-observed language then wins over a later surviving result's, where
+  /// folding the sink last let the survivor's win (F3). The worker schedule is
+  /// the adjudicated `None` (agreement attribution is unknown, round 10, F2) and
+  /// the decoded span is restored from the merged surviving result (round 10, F3;
+  /// the ingest strip carries only the wholly-unknown span, so the fold cannot
+  /// supply the exact count, round 12); see [`Self::ingest`].
+  pub fn finalize(mut self, options: &DecodingOptions) -> TranscriptionResult {
     self.confirmed_words.append(&mut self.last_agreed_words);
     let suffix = find_longest_different_suffix(&self.prev_words, &self.hypothesis_words);
     self.confirmed_words.extend_from_slice(suffix);
-    merge_transcription_results_with_words(&self.results, &self.confirmed_words)
+    let mut merged =
+      merge_transcription_results_with_words(&self.results, &self.confirmed_words, options);
+    // Fold the merged (surviving-result) facts INTO the ingest-ordered sink, not
+    // the other way round (codex round 9): the sink observed EVERY hypothesis in
+    // ingest order — the disagreeing dropped ones included — so its FIRST-observed
+    // language must win over a later surviving result's, which merging the sink
+    // last reversed (F3). The draw/early-stop Kleene OR is commutative, so their
+    // answer is unchanged by the order.
+    //
+    // The DECODED SPAN is then restored from the merged surviving result: the sink
+    // stripped its span to the wholly-unknown `AtLeast(0)` at ingest, so the fold
+    // would only lower-bound the merged span (round 12: the strip no longer
+    // absorbs, but it also carries no exact count), losing the authoritative
+    // id-ordinal count a staged re-merge needs. Overwriting with the merged
+    // surviving result's own span restores it exactly. The WORKER SCHEDULE is
+    // deliberately left at the `None` the strip and the absorbing merge produce —
+    // ADJUDICATED (round 10, F2): agreement-confirmed text interleaves multiple
+    // hypotheses, so no single ordered worker attribution is knowable. See the
+    // strip site in [`Self::ingest`].
+    let merged_span = merged.task_facts().decoded_span();
+    let mut facts = self.ingested_facts.into_facts();
+    facts.merge(merged.task_facts());
+    *merged.task_facts_mut() = facts.with_decoded_span(merged_span);
+    merged
   }
 }
 
@@ -465,9 +542,12 @@ impl<'ctx, B> LocalAgreementTranscriber<'ctx, B> {
   }
 
   /// Consumes the driver and produces the final merged transcript.
-  /// Delegates to [`LocalAgreement::finalize`].
+  /// Delegates to [`LocalAgreement::finalize`], passing this driver's own
+  /// (word-timestamp-forced) [`DecodingOptions`] so the merge honors the
+  /// same [`DecodingOptions::drop_blank_audio`] the streamed results decoded
+  /// under.
   pub fn finalize(self) -> TranscriptionResult {
-    self.agreement.finalize()
+    self.agreement.finalize(&self.options)
   }
 }
 

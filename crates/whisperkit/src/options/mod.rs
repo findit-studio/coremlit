@@ -10,13 +10,53 @@
 //! and returns the defaults; `Default` delegates to `new()`; every knob has
 //! a projected `#[inline(always)]` accessor plus `with_*`/`set_*`, and
 //! `Option`/`bool` knobs get the full `set_`/`with_`/`update_`/`maybe_`/
-//! `clear_` vocabulary. `serde` (optional feature) never emits `null` and
-//! every field falls back to its true default on a partial config —
-//! including fields whose default isn't the field type's own `Default`
-//! (`NonZeroUsize` has none at all; several thresholds default `Some(_)`;
-//! `ComputeOptions`'s per-stage defaults aren't `ComputeUnits::default()`),
-//! which is exactly why those fields use `serde(default = "fn")` rather
-//! than the bare form.
+//! `clear_` vocabulary. Every field falls back to its true default on a
+//! partial `serde` config — including fields whose default isn't the field
+//! type's own `Default` (`NonZeroUsize` has none at all; the four
+//! thresholds default `Some(_)`; `ComputeOptions`'s per-stage defaults
+//! aren't `ComputeUnits::default()`), which is exactly why those fields use
+//! `serde(default = "fn")` rather than the bare form.
+//!
+//! # The `serde` round trip is lossless, and that is a load-bearing property
+//!
+//! Every value survives `serialize` -> `deserialize` unchanged, so a
+//! serialized [`DecodingOptions`] **reconstructs the exact configuration a
+//! run used**. That is what lets [`crate::provenance::Provenance`] embed one
+//! wholesale and still be an honest record of what produced a transcript
+//! (coremlit issue #14).
+//!
+//! Losslessness has a floating-point edge case, and this module closes it
+//! (codex round 3, F6): `serde_json` has no JSON form for `NaN` or ±∞ and
+//! silently writes each as `null`, so a `Some(-inf)` threshold would read back
+//! `None` — a check that fired on every finite value **silently disabled**
+//! across a round trip. Every `f32`-bearing knob here is therefore bridged
+//! through the `finite_f32`/`finite_f32_option`/`finite_f32_vec` helpers, which
+//! refuse a non-finite value on *both* sides of the boundary rather than let it
+//! round-trip to a different meaning. This matches Swift, whose
+//! `DecodingOptions: Codable` (`Configurations.swift:155`) encodes through the
+//! default `JSONEncoder` and so throws on a non-finite field: the value is
+//! rejected at the wire, exactly where Swift rejects it, and not at
+//! construction — Swift's initializer stores it without complaint, and so do
+//! these `const` builders.
+//!
+//! Losslessness is why the **four `Option<f32>` thresholds**
+//! ([`DecodingOptions::compression_ratio_threshold`],
+//! [`DecodingOptions::logprob_threshold`],
+//! [`DecodingOptions::first_token_logprob_threshold`],
+//! [`DecodingOptions::no_speech_threshold`]) are the one place this module
+//! *does* emit `null`. They are the only fields whose default is `Some(_)`
+//! rather than `None`, so for them — and only for them — "absent" and
+//! "`None`" mean different things: absent is "the caller did not configure
+//! this knob", which resolves to the default `Some(_)`; `None` is "the
+//! caller explicitly DISABLED this check". `skip_serializing_if` would
+//! collapse the second into the first, and a disabled threshold would read
+//! back **re-enabled at its default** — silently restoring a check the run
+//! did not perform. `null` keeps the two apart, and a partial config that
+//! simply omits the key still gets its true default.
+//!
+//! Every other `Option`/collection field defaults to `None`/empty, so for
+//! those absent *is* the value and `skip_serializing_if` stays: an unset
+//! [`DecodingOptions::seed`] is absent, never a `null`.
 
 use std::{
   num::NonZeroUsize,
@@ -128,6 +168,139 @@ impl core::str::FromStr for ChunkingStrategy {
 }
 
 // ---------------------------------------------------------------------
+// WordGrouping
+// ---------------------------------------------------------------------
+
+/// How decoded tokens are grouped into "words" for word-level timestamps
+/// (coremlit issue #14). Rust-only: Swift has no such switch — it picks the
+/// strategy from a language it detects internally, which is precisely the
+/// hidden second language decision that caused the original divergence
+/// (issue #9), so this port makes the choice explicit instead.
+///
+/// This only affects **word grouping**. It is orthogonal to the optional
+/// `nl-recognizer` feature, which is about *which language code* reaches
+/// the splitter, not about how that splitter then groups.
+///
+/// # What Swift actually does, and why the two variants differ at all
+///
+/// Swift's `splitToWordTokens` (`Models.swift:1293-1305`) takes the
+/// Unicode-splitting arm exactly when
+/// `NLLanguageRecognizer.dominantLanguage?.rawValue` is one of
+/// `["zh", "ja", "th", "lo", "my", "yue"]`, and the space-splitting arm
+/// otherwise. The list looks like "all of CJK" — but the values it is
+/// matched against are Apple's `NLLanguage` raw values, and those do not
+/// line up with it:
+///
+/// | language | `NLLanguage` raw value | in Swift's list? | Swift's arm |
+/// |---|---|---|---|
+/// | Japanese | `ja` | yes | **Unicode** |
+/// | Thai | `th` | yes | **Unicode** |
+/// | Lao | `lo` | yes | **Unicode** |
+/// | Burmese | `my` | yes | **Unicode** |
+/// | Chinese | `zh-Hans` / `zh-Hant` | **no** | space |
+/// | Cantonese | *(no `NLLanguage` case; recognized as Chinese)* | **no** | space |
+///
+/// So the coarse "phrase blob" grouping is a **Chinese-only** accident —
+/// Chinese is the one language whose `NLLanguage` raw value is *regional*,
+/// so it alone falls through a check written for bare codes. Swift
+/// fine-grains Japanese, Thai, Lao and Burmese exactly as this port's
+/// default does.
+///
+/// The two variants below therefore differ **only for `zh` and `yue`**. For
+/// every other language, including `ja`, they are the same splitter — which
+/// is the honest shape, because for every other language Swift and this port
+/// already agree.
+#[derive(
+  Debug, Default, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display, derive_more::IsVariant,
+)]
+#[display("{}", self.as_str())]
+#[non_exhaustive]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum WordGrouping {
+  /// Unicode splitting for every language that is not whitespace-delimited
+  /// (`zh`/`ja`/`th`/`lo`/`my`/`yue`), and ordinary space/punctuation
+  /// splitting for the rest. **The default, and this port's long-standing
+  /// behavior exactly.**
+  ///
+  /// "Unicode splitting" means the **smallest group of BPE tokens that
+  /// completes a Unicode scalar** — not one word per scalar. Whisper's BPE
+  /// merges common multi-character sequences into single tokens, so `今天`
+  /// arrives as one token and stays one unit, while a character split across
+  /// a token boundary is merged back together (that is the only merging
+  /// `split_tokens_on_unicode` does). Groups are therefore *token*-shaped and
+  /// vary in length; the guarantee is that they are fine-grained and never
+  /// contain a broken scalar, not that they are one-per-character.
+  ///
+  /// This is the product-correct grouping for CJK: those scripts do not
+  /// separate words with spaces, so space splitting collapses a whole
+  /// utterance into one undifferentiated blob with a single start/end time,
+  /// and word timestamps stop meaning anything. Test-pinned in coremlit issue
+  /// #11: 85 fine-grained words on the ZH clip, against Swift's 24 blobs.
+  #[default]
+  FineGrained,
+  /// Swift WhisperKit's own grouping, reproduced deliberately: the space
+  /// splitter for `zh` and `yue`, and the same Unicode splitting as
+  /// [`Self::FineGrained`] everywhere else — `ja`, `th`, `lo` and `my`
+  /// included.
+  ///
+  /// Choose this when word grouping must be byte-comparable against Swift.
+  /// It is not a default and should not be: for Chinese it produces the
+  /// coarse phrase blob Swift only lands on by accident (see the type's own
+  /// doc — `NLLanguageRecognizer` answers `zh-Hant`/`zh-Hans`, which Swift's
+  /// bare-code CJK check then fails to match), and that blob carries a single
+  /// start/end time for an entire utterance.
+  ///
+  /// **This is not "space-split everything".** An earlier shape of this
+  /// variant forced the space splitter for *all* CJK and documented itself as
+  /// Swift-parity; it was neither. Swift Unicode-splits Japanese — its own
+  /// test pins the twelve groups (`Tests/WhisperKitTests/UnitTests.swift:
+  /// 1360-1375`, ported verbatim as `tokenizer::tests`'
+  /// `swift_parity_matches_swifts_pinned_japanese_word_tokens`) — so forcing
+  /// spaces there diverged from Swift under the very name that promised
+  /// parity with it.
+  ///
+  /// Parity is conditional on the language code, as everywhere else in this
+  /// port: Swift reads its code from `NLLanguageRecognizer` over the decoded
+  /// text, while this crate passes the decoder's own `<|lang|>` token (spec
+  /// §5.3). Where the two identify the same base language, this variant's
+  /// grouping is Swift's. A caller who wants Swift's *language signal* too
+  /// can enable the `nl-recognizer` feature and pass
+  /// `tokenizer::nl_recognizer::redetect_language`'s result — it normalizes
+  /// `zh-Hant`/`zh-Hans` to a bare `zh`, which this variant then
+  /// space-splits, exactly as Swift does with the regional code.
+  SwiftParity,
+}
+
+impl WordGrouping {
+  /// Stable snake_case name of the variant.
+  #[inline(always)]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::FineGrained => "fine_grained",
+      Self::SwiftParity => "swift_parity",
+    }
+  }
+}
+
+/// Error parsing a [`WordGrouping`] name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("unknown word grouping name")]
+pub struct ParseWordGroupingError(());
+
+impl core::str::FromStr for WordGrouping {
+  type Err = ParseWordGroupingError;
+
+  fn from_str(s: &str) -> Result<Self, Self::Err> {
+    Ok(match s {
+      "fine_grained" => Self::FineGrained,
+      "swift_parity" => Self::SwiftParity,
+      _ => return Err(ParseWordGroupingError(())),
+    })
+  }
+}
+
+// ---------------------------------------------------------------------
 // DecodingOptions
 // ---------------------------------------------------------------------
 
@@ -153,6 +326,9 @@ pub const DEFAULT_FIRST_TOKEN_LOGPROB_THRESHOLD: f32 = -1.5;
 pub const DEFAULT_NO_SPEECH_THRESHOLD: f32 = 0.6;
 /// Default [`DecodingOptions::use_prefill_prompt`].
 pub const DEFAULT_USE_PREFILL_PROMPT: bool = true;
+/// Default [`DecodingOptions::drop_blank_audio`] — blank-audio segments are
+/// dropped unless the caller opts back into emitting them.
+pub const DEFAULT_DROP_BLANK_AUDIO: bool = true;
 /// Default [`DecodingOptions::concurrent_worker_count`] (Swift's macOS default).
 pub const DEFAULT_CONCURRENT_WORKER_COUNT: NonZeroUsize = NonZeroUsize::new(16).unwrap();
 
@@ -202,13 +378,134 @@ fn default_no_speech_threshold() -> Option<f32> {
 fn default_use_prefill_prompt() -> bool {
   DEFAULT_USE_PREFILL_PROMPT
 }
+// `drop_blank_audio` likewise defaults `true`, against `bool::default()`'s
+// `false` — a config that omits the field must still DROP, not emit.
+#[cfg(feature = "serde")]
+fn default_drop_blank_audio() -> bool {
+  DEFAULT_DROP_BLANK_AUDIO
+}
+
+// ---------------------------------------------------------------------
+// Non-finite float rejection at the serde boundary (codex round 3, F6)
+// ---------------------------------------------------------------------
+
+/// The error a non-finite `f32` raises on either side of the `serde` boundary,
+/// shared by the `finite_f32*` helpers below.
+#[cfg(feature = "serde")]
+pub(crate) const NON_FINITE_FLOAT_MSG: &str = "non-finite float (NaN or infinity) is not \
+  representable in JSON and is rejected to keep the serde round trip lossless (matches Swift's \
+  JSONEncoder, which throws on non-finite by default)";
+
+/// `serde` bridge for a scalar `f32` that must round-trip losslessly (codex
+/// round 3, F6).
+///
+/// `serde_json` has no JSON form for `NaN`/±∞ and silently writes `null` for
+/// each; a `Some(-inf)` `Option<f32>` then reads back `None`, silently
+/// disabling a check that fired on every finite value. Swift refuses the same
+/// values from the other direction — `DecodingOptions: Codable`
+/// (`Configurations.swift:155`) with the default `JSONEncoder`, whose
+/// `nonConformingFloatEncodingStrategy` is `.throw`. This helper matches Swift:
+/// a non-finite value is refused on serialize (so the lossy `null` is never
+/// produced) and on deserialize (so a non-finite literal is never accepted),
+/// while a genuine `None` still writes `null` and reads back `None`. In-memory
+/// construction is deliberately NOT guarded — Swift's initializer also stores a
+/// non-finite value and only its encoder throws (`Configurations.swift:212`).
+#[cfg(feature = "serde")]
+pub(crate) mod finite_f32 {
+  use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+  pub(crate) fn serialize<S: Serializer>(value: &f32, serializer: S) -> Result<S::Ok, S::Error> {
+    if !value.is_finite() {
+      return Err(serde::ser::Error::custom(super::NON_FINITE_FLOAT_MSG));
+    }
+    value.serialize(serializer)
+  }
+
+  pub(crate) fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<f32, D::Error> {
+    let value = f32::deserialize(deserializer)?;
+    if !value.is_finite() {
+      return Err(serde::de::Error::custom(super::NON_FINITE_FLOAT_MSG));
+    }
+    Ok(value)
+  }
+}
+
+/// `serde` bridge for an `Option<f32>` that must round-trip losslessly: a
+/// finite `Some` and a `None` (written `null`) survive, and a non-finite `Some`
+/// is refused. Same rationale as `finite_f32`. Composes both with
+/// `serde(default = …)` (the four `DecodingOptions` thresholds) and with no
+/// default at all (a required, nullable field like
+/// `provenance::Provenance::effective_temperature`, which stays required
+/// because naming a `with`/`deserialize_with` defeats serde's
+/// missing-`Option`-is-`None` special case).
+#[cfg(feature = "serde")]
+pub(crate) mod finite_f32_option {
+  use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+  pub(crate) fn serialize<S: Serializer>(
+    value: &Option<f32>,
+    serializer: S,
+  ) -> Result<S::Ok, S::Error> {
+    if matches!(value, Some(v) if !v.is_finite()) {
+      return Err(serde::ser::Error::custom(super::NON_FINITE_FLOAT_MSG));
+    }
+    value.serialize(serializer)
+  }
+
+  pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+    deserializer: D,
+  ) -> Result<Option<f32>, D::Error> {
+    let value = Option::<f32>::deserialize(deserializer)?;
+    if matches!(value, Some(v) if !v.is_finite()) {
+      return Err(serde::de::Error::custom(super::NON_FINITE_FLOAT_MSG));
+    }
+    Ok(value)
+  }
+}
+
+/// `serde` bridge for a `Vec<f32>` that must round-trip losslessly: every
+/// element is finite, or the whole value is refused. Same rationale as
+/// `finite_f32`.
+#[cfg(feature = "serde")]
+pub(crate) mod finite_f32_vec {
+  use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+  pub(crate) fn serialize<S: Serializer>(value: &[f32], serializer: S) -> Result<S::Ok, S::Error> {
+    if value.iter().any(|v| !v.is_finite()) {
+      return Err(serde::ser::Error::custom(super::NON_FINITE_FLOAT_MSG));
+    }
+    value.serialize(serializer)
+  }
+
+  pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+    deserializer: D,
+  ) -> Result<Vec<f32>, D::Error> {
+    let value = Vec::<f32>::deserialize(deserializer)?;
+    if value.iter().any(|v| !v.is_finite()) {
+      return Err(serde::de::Error::custom(super::NON_FINITE_FLOAT_MSG));
+    }
+    Ok(value)
+  }
+}
 
 /// Decode-time configuration: Swift's 27-knob `DecodingOptions` surface
-/// (spec §6.2), plus one Rust-only addition — [`Self::seed`], for
+/// (spec §6.2), plus three Rust-only additions — [`Self::seed`], for
 /// reproducible temperature-fallback sampling (coremlit issue #9; see the
-/// crate root's "Reproducibility and provenance" docs). `new()`/`Default`
-/// apply Swift's defaults verbatim for every ported knob; `seed` defaults
-/// unset (`None`), matching today's OS-seeded behavior exactly.
+/// crate root's "Reproducibility and provenance" docs), and, from coremlit
+/// issue #14, [`Self::drop_blank_audio`] (the post-decode blank-audio
+/// segment filter) and [`Self::word_grouping`] (the explicit CJK
+/// word-grouping mode). `new()`/`Default` apply Swift's defaults verbatim
+/// for every ported knob; `seed` defaults unset (`None`), matching today's
+/// OS-seeded behavior exactly, and `word_grouping` defaults to the
+/// fine-grained grouping this port already used.
+///
+/// **[`Self::drop_blank_audio`] is the sole knob whose default deliberately
+/// diverges from Swift** (it defaults `true`, dropping the `[BLANK_AUDIO]`
+/// segments Swift emits) — a product decision, with `false` as the exact
+/// parity escape hatch. See that field's own doc; every other default here
+/// is Swift's — including [`Self::word_grouping`], whose
+/// [`WordGrouping::SwiftParity`] variant is what reproduces Swift's own
+/// grouping, strictly on opt-in.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DecodingOptions {
@@ -223,12 +520,15 @@ pub struct DecodingOptions {
   )]
   language: String,
   /// Sampling temperature; `0.0` is greedy (argmax) decoding.
-  #[cfg_attr(feature = "serde", serde(default))]
+  #[cfg_attr(feature = "serde", serde(default, with = "finite_f32"))]
   temperature: f32,
   /// Amount added to `temperature` on each fallback retry.
   #[cfg_attr(
     feature = "serde",
-    serde(default = "default_temperature_increment_on_fallback")
+    serde(
+      default = "default_temperature_increment_on_fallback",
+      with = "finite_f32"
+    )
   )]
   temperature_increment_on_fallback: f32,
   /// Maximum number of temperature-fallback retries.
@@ -278,7 +578,11 @@ pub struct DecodingOptions {
   /// window. `None` disables the check (golden `Option<Copy>` exception).
   #[cfg_attr(
     feature = "serde",
-    serde(default, skip_serializing_if = "Option::is_none")
+    serde(
+      default,
+      skip_serializing_if = "Option::is_none",
+      with = "finite_f32_option"
+    )
   )]
   max_initial_timestamp: Option<f32>,
   /// Cap the seek position, in samples, for any single window. `None`
@@ -293,12 +597,19 @@ pub struct DecodingOptions {
   /// is one segment.
   #[cfg_attr(
     feature = "serde",
-    serde(default, skip_serializing_if = "Vec::is_empty")
+    serde(
+      default,
+      skip_serializing_if = "Vec::is_empty",
+      with = "finite_f32_vec"
+    )
   )]
   clip_timestamps: Vec<f32>,
   /// Seconds clipped from the end of each window, to reduce hallucinated
   /// trailing text.
-  #[cfg_attr(feature = "serde", serde(default = "default_window_clip_time"))]
+  #[cfg_attr(
+    feature = "serde",
+    serde(default = "default_window_clip_time", with = "finite_f32")
+  )]
   window_clip_time: f32,
   /// Token ids prepended to the prefill tokens as a conditioning prompt.
   #[cfg_attr(
@@ -323,31 +634,38 @@ pub struct DecodingOptions {
   suppress_tokens: Vec<u32>,
   /// Treat decoding as failed if the output text's compression ratio
   /// exceeds this value (too repetitive). `None` disables the check.
+  ///
+  /// No `skip_serializing_if`: this knob's default is `Some(_)`, so a
+  /// skipped `None` would read back **re-enabled at the default**. See the
+  /// module doc's lossless-round-trip section.
   #[cfg_attr(
     feature = "serde",
     serde(
       default = "default_compression_ratio_threshold",
-      skip_serializing_if = "Option::is_none"
+      with = "finite_f32_option"
     )
   )]
   compression_ratio_threshold: Option<f32>,
   /// Treat decoding as failed if the average sampled-token log
   /// probability falls below this value. `None` disables the check.
+  ///
+  /// Serialized even when `None` — see
+  /// [`Self::compression_ratio_threshold`]'s field note.
   #[cfg_attr(
     feature = "serde",
-    serde(
-      default = "default_logprob_threshold",
-      skip_serializing_if = "Option::is_none"
-    )
+    serde(default = "default_logprob_threshold", with = "finite_f32_option")
   )]
   logprob_threshold: Option<f32>,
   /// Treat decoding as failed if the first sampled token's log
   /// probability falls below this value. `None` disables the check.
+  ///
+  /// Serialized even when `None` — see
+  /// [`Self::compression_ratio_threshold`]'s field note.
   #[cfg_attr(
     feature = "serde",
     serde(
       default = "default_first_token_logprob_threshold",
-      skip_serializing_if = "Option::is_none"
+      with = "finite_f32_option"
     )
   )]
   first_token_logprob_threshold: Option<f32>,
@@ -356,12 +674,12 @@ pub struct DecodingOptions {
   /// on this comparison ALONE — Swift's own doc comment claiming the
   /// average log probability is also consulted is stale against its code;
   /// see `result::needs_fallback`, `Models.swift:368-370`.)
+  ///
+  /// Serialized even when `None` — see
+  /// [`Self::compression_ratio_threshold`]'s field note.
   #[cfg_attr(
     feature = "serde",
-    serde(
-      default = "default_no_speech_threshold",
-      skip_serializing_if = "Option::is_none"
-    )
+    serde(default = "default_no_speech_threshold", with = "finite_f32_option")
   )]
   no_speech_threshold: Option<f32>,
   /// Worker threads for batch transcription (Swift's macOS default: 16).
@@ -373,7 +691,83 @@ pub struct DecodingOptions {
   /// Emit verbose per-step decode logging.
   #[cfg_attr(feature = "serde", serde(default))]
   verbose: bool,
+  /// Drop decoded blank-audio segments instead of emitting them. Defaults
+  /// `true` — see [`Self::drop_blank_audio`] for the full contract and the
+  /// deliberate Swift-parity divergence it carries.
+  #[cfg_attr(feature = "serde", serde(default = "default_drop_blank_audio"))]
+  drop_blank_audio: bool,
+  /// How decoded tokens are grouped into words for word-level timestamps.
+  /// Defaults to [`WordGrouping::FineGrained`] — today's behavior exactly.
+  #[cfg_attr(feature = "serde", serde(default))]
+  word_grouping: WordGrouping,
 }
+
+/// Names every field of [`DecodingOptions`] exactly once, generating (for
+/// tests) both a `DECODING_OPTION_FIELD_NAMES` roster and a compile-time
+/// exhaustiveness guard that destructures `DecodingOptions` WITHOUT `..`.
+///
+/// This is what makes the provenance completeness tests non-circular (codex
+/// round 3, F7): the field roster they check the mutation table against comes
+/// from `DecodingOptions` ITSELF, not from folding the very `mutations()` table
+/// under test. Add a field to the struct and the guard below fails to compile
+/// until it is named here — and it then lands in
+/// `provenance::tests::mutation_table_covers_every_decoding_option` as an
+/// uncovered name until it also gets a mutation row. The serde key of every
+/// field equals its Rust name (no field carries `serde(rename)`), so
+/// `stringify!` yields exactly the serialized key set.
+macro_rules! decoding_option_field_names {
+  ($($field:ident),+ $(,)?) => {
+    /// The full field/serde-key set of [`DecodingOptions`], one entry per
+    /// field. Kept exhaustive at compile time by the guard in the same macro
+    /// expansion. Consumed by the provenance mutation-table coverage test.
+    #[cfg(test)]
+    #[allow(dead_code)] // used only by the serde-gated provenance coverage test
+    pub(crate) const DECODING_OPTION_FIELD_NAMES: &[&str] = &[$(stringify!($field)),+];
+
+    /// A pure compile-time exhaustiveness check: destructuring without `..`
+    /// forces every `DecodingOptions` field to be named in the list above, so
+    /// a newly added field breaks the test build until the roster (and the
+    /// provenance mutation table) name it. Never called.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    fn _decoding_options_field_exhaustiveness_guard(options: DecodingOptions) {
+      let DecodingOptions { $($field: _),+ } = options;
+    }
+  };
+}
+
+decoding_option_field_names!(
+  task,
+  language,
+  temperature,
+  temperature_increment_on_fallback,
+  temperature_fallback_count,
+  sample_length,
+  top_k,
+  seed,
+  use_prefill_prompt,
+  detect_language,
+  skip_special_tokens,
+  without_timestamps,
+  word_timestamps,
+  max_initial_timestamp,
+  max_window_seek,
+  clip_timestamps,
+  window_clip_time,
+  prompt_tokens,
+  prefix_tokens,
+  suppress_blank,
+  suppress_tokens,
+  compression_ratio_threshold,
+  logprob_threshold,
+  first_token_logprob_threshold,
+  no_speech_threshold,
+  concurrent_worker_count,
+  chunking_strategy,
+  verbose,
+  drop_blank_audio,
+  word_grouping,
+);
 
 impl Default for DecodingOptions {
   fn default() -> Self {
@@ -413,6 +807,8 @@ impl DecodingOptions {
       concurrent_worker_count: DEFAULT_CONCURRENT_WORKER_COUNT,
       chunking_strategy: ChunkingStrategy::Disabled,
       verbose: false,
+      drop_blank_audio: DEFAULT_DROP_BLANK_AUDIO,
+      word_grouping: WordGrouping::FineGrained,
     }
   }
 
@@ -1390,6 +1786,163 @@ impl DecodingOptions {
   #[inline(always)]
   pub const fn clear_verbose(&mut self) -> &mut Self {
     self.verbose = false;
+    self
+  }
+
+  // -- drop_blank_audio (bool) ----------------------------------------------
+  /// Drop blank-audio segments from the transcription instead of emitting
+  /// them. **Defaults `true`** (coremlit issue #14).
+  ///
+  /// Some Whisper models decode silent or near-silent audio to the literal
+  /// text [`BLANK_AUDIO_MARKER`](crate::constants::BLANK_AUDIO_MARKER)
+  /// (`"[BLANK_AUDIO]"`) — a training-data artifact the decoder genuinely
+  /// samples, not a special token this crate inserts (see that constant's
+  /// doc). When this is `true`,
+  /// [`TranscribeTask::run`](crate::transcribe::TranscribeTask::run)
+  /// applies a **post-decode filter** to the assembled segments: any
+  /// segment whose *clean* text — its tokens with the special/timestamp
+  /// ids stripped, decoded, and whitespace-trimmed, i.e. the same
+  /// projection [`TranscriptionResult::text`](crate::result::TranscriptionResult::text)
+  /// is built from, **not** the raw
+  /// [`TranscriptionSegment::text`](crate::result::TranscriptionSegment::text),
+  /// which still carries its special tokens — is exactly the marker gets
+  /// removed before the result text is assembled. Pure silence therefore
+  /// yields an **empty result** (zero segments, empty text) rather than a
+  /// one-segment `[BLANK_AUDIO]`; a blank stretch *between* speech is
+  /// dropped while the speech around it survives.
+  ///
+  /// Survivors **keep the ids they were decoded with**: a drop leaves a
+  /// gap (`[0, 2]` where segment 1 was blank) rather than relabelling the
+  /// segments around it, so ids stay stable whichever way this is set and
+  /// the hole itself says what happened. See
+  /// [`TranscribeTask::run`](crate::transcribe::TranscribeTask::run) for
+  /// why (an id is an ordinal decode position, not an index, and nothing
+  /// in the crate looks a segment up by one).
+  ///
+  /// Only the **exact** `[BLANK_AUDIO]` literal is dropped. Other
+  /// non-speech markers a model emits — `[APPLAUSE]`, `[MUSIC]` — are
+  /// deliberately left alone: this is a blank-*audio* filter, not a
+  /// general non-speech-annotation stripper.
+  ///
+  /// **This default is the one deliberate Swift-parity divergence in this
+  /// type.** Swift WhisperKit *emits* `[BLANK_AUDIO]` for silence, so
+  /// defaulting to `true` diverges from it by design: `[BLANK_AUDIO]` is
+  /// noise for the search/index consumers this crate targets, and making
+  /// every one of them post-filter it was the worse default. Set this
+  /// `false` ([`Self::clear_drop_blank_audio`]) to restore **exact Swift
+  /// parity** — the filter is then skipped outright and the marker is
+  /// emitted verbatim, one segment, byte-for-byte as before this option
+  /// existed.
+  ///
+  /// Under [`ChunkingStrategy::Vad`], a wholly-silent stretch long enough
+  /// to become a chunk of its own — the chunker is *contiguous*, so
+  /// silence is never skipped, only cut around — decodes to nothing but
+  /// the marker and is therefore emptied outright by this filter.
+  ///
+  /// **This option is consequently a merge rule as well as a decode
+  /// filter.** An emptied chunk has no text, and
+  /// [`merge_transcription_results`](crate::result::merge_transcription_results)
+  /// joins *every* result's text with `" "` — so an emptied one would
+  /// surface as a bare separator (a doubled space between two speech runs;
+  /// a leading or trailing one at the clip's edges).
+  /// [`merge_transcription_results_with_options`](crate::result::merge_transcription_results_with_options)
+  /// is the merge that reads this option and **skips empty texts in the
+  /// join** when it is set;
+  /// [`WhisperKit::transcribe`](crate::transcribe::WhisperKit::transcribe)
+  /// uses it for its own VAD chunks, and it is what a caller folding a
+  /// [`WhisperKit::transcribe_all`](crate::transcribe::WhisperKit::transcribe_all)
+  /// batch by hand should use too. Every result is still *merged* — its
+  /// timings stay in the summed metrics; only its empty text is skipped.
+  /// The plain [`merge_transcription_results`](crate::result::merge_transcription_results)
+  /// keeps Swift's join verbatim, empties included.
+  ///
+  /// Note the scope that gives the merge: it skips **empty texts**, not
+  /// "blank chunks" — it cannot see why a result is empty. With this set,
+  /// an empty result from *short audio* (any clip below
+  /// [`Self::window_clip_time`] runs no window and returns one) is skipped
+  /// from the join too. That is the intended reading — blank-dropping means
+  /// empty chunks do not pollute the text — and not a further divergence:
+  /// clear this option and Swift's join, bare separators and all, is back
+  /// exactly.
+  ///
+  /// Speech-only audio is unaffected either way: it decodes no such
+  /// segment, so the filter finds nothing to drop and the golden parity
+  /// transcripts are identical under both settings.
+  #[inline(always)]
+  pub const fn drop_blank_audio(&self) -> bool {
+    self.drop_blank_audio
+  }
+  /// Builder form of [`Self::set_drop_blank_audio`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_drop_blank_audio(mut self) -> Self {
+    self.set_drop_blank_audio();
+    self
+  }
+  /// Sets [`Self::drop_blank_audio`] to `true`.
+  #[inline(always)]
+  pub const fn set_drop_blank_audio(&mut self) -> &mut Self {
+    self.drop_blank_audio = true;
+    self
+  }
+  /// Builder form of [`Self::update_drop_blank_audio`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn maybe_drop_blank_audio(mut self, drop_blank_audio: bool) -> Self {
+    self.update_drop_blank_audio(drop_blank_audio);
+    self
+  }
+  /// Assigns [`Self::drop_blank_audio`] directly.
+  #[inline(always)]
+  pub const fn update_drop_blank_audio(&mut self, drop_blank_audio: bool) -> &mut Self {
+    self.drop_blank_audio = drop_blank_audio;
+    self
+  }
+  /// Sets [`Self::drop_blank_audio`] to `false` — blank-audio segments are
+  /// emitted verbatim, restoring exact Swift parity.
+  #[inline(always)]
+  pub const fn clear_drop_blank_audio(&mut self) -> &mut Self {
+    self.drop_blank_audio = false;
+    self
+  }
+
+  // -- word_grouping --------------------------------------------------------
+  /// How decoded tokens are grouped into words when
+  /// [`Self::word_timestamps`] is on (coremlit issue #14). Defaults to
+  /// [`WordGrouping::FineGrained`], which is this port's long-standing
+  /// behavior **exactly**: Unicode splitting for the non-whitespace-delimited
+  /// languages (`zh`/`ja`/`th`/`lo`/`my`/`yue`), space/punctuation splitting
+  /// for everything else.
+  ///
+  /// [`WordGrouping::SwiftParity`] reproduces Swift WhisperKit's own
+  /// grouping instead — which, read against Apple's actual `NLLanguage` raw
+  /// values, means the space splitter for `zh`/`yue` and Unicode splitting
+  /// for everything else, `ja`/`th`/`lo`/`my` included. See
+  /// [`WordGrouping`]'s own doc for the table and for why the coarse
+  /// phrase-blob grouping is a **Chinese-only** accident rather than a CJK
+  /// policy. The two variants consequently differ only for `zh` and `yue`;
+  /// this crate keeps the fine-grained default pinned (issue #11) and lets a
+  /// caller ask for Swift's grouping by name.
+  ///
+  /// Inert unless [`Self::word_timestamps`] is set: word grouping only runs
+  /// inside the DTW alignment pass. It never affects the transcript text,
+  /// the tokens, or the segments — only how a segment's words are carved
+  /// out of them.
+  #[inline(always)]
+  pub const fn word_grouping(&self) -> WordGrouping {
+    self.word_grouping
+  }
+  /// Builder form of [`Self::set_word_grouping`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_word_grouping(mut self, word_grouping: WordGrouping) -> Self {
+    self.set_word_grouping(word_grouping);
+    self
+  }
+  /// Sets [`Self::word_grouping`] in place.
+  #[inline(always)]
+  pub const fn set_word_grouping(&mut self, word_grouping: WordGrouping) -> &mut Self {
+    self.word_grouping = word_grouping;
     self
   }
 }

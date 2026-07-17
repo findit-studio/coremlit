@@ -20,17 +20,33 @@
 //! (timestamps are quantized to 0.02 s tokens, so epsilon 1e-3 catches any
 //! real divergence).
 //!
-//! Compute path: the pipeline runs on the DEFAULT compute units (CPU +
-//! Neural Engine, spec Goal 2 — identical to Swift's defaults), matching
-//! how the golden itself was produced by `whisperkit-cli`. If this test
-//! ever fails on a different Apple Silicon generation with a one-token
-//! divergence, suspect ANE numeric drift on a borderline argmax before
-//! assuming a pipeline logic bug.
+//! Compute path — THE RULE: **a gate validating a shipping default must run
+//! on the shipping default.** This test runs on the DEFAULT compute units
+//! (mel CPU+GPU, encoder/decoder CPU+ANE — spec Goal 2, and byte-identical
+//! to Swift's own `ModelComputeOptions` defaults, `Models.swift:92-118`),
+//! because that is the path the crate ships AND the path `whisperkit-cli`
+//! produced this golden on: an ANE-to-ANE external parity check. The
+//! assertion below pins it, so a future `CpuOnly` pin fails loudly instead
+//! of silently narrowing the coverage to a compute unit nobody runs. See
+//! `tests/parity_jfk.rs`'s module doc for the sibling-crate incident that
+//! makes this rule non-negotiable, and for why `tests/pipeline.rs` and
+//! `tests/model_io.rs` may still pin `CpuOnly` (they assert shapes and
+//! dtypes, not numerics).
+//!
+//! If this test ever fails on a different Apple Silicon generation with a
+//! one-token divergence, suspect ANE numeric drift on a borderline argmax
+//! before assuming a pipeline logic bug — `common::assert_golden_tokens`
+//! reports the first diverging step's competing tokens and their logit
+//! margin to tell the two apart. Never regenerate the golden or loosen the
+//! comparison to make either go away.
 
 mod common;
 
 use whisperkit::{
-  options::{DecodingOptions, Options},
+  options::{
+    DEFAULT_DECODER_COMPUTE_UNITS, DEFAULT_ENCODER_COMPUTE_UNITS, DEFAULT_MEL_COMPUTE_UNITS,
+    DecodingOptions, Options,
+  },
   transcribe::WhisperKit,
 };
 
@@ -63,7 +79,15 @@ fn es_tiny_matches_golden_tokens_and_segments() {
   // zero-arg `new()` plus `with_model_folder`/`with_tokenizer_folder`
   // builders) — same brief-vs-shipped-API fix as tests/pipeline.rs's
   // `tiny_options`/tests/parity_jfk.rs.
-  let kit = WhisperKit::new(&Options::new(common::tiny_dir(), common::tokenizer_dir())).unwrap();
+  let build = Options::new(common::tiny_dir(), common::tokenizer_dir());
+  // THE RULE (see this file's module doc): this golden is an ANE-captured
+  // Swift oracle, so the gate must run on the compute units the crate SHIPS.
+  // Pinning any of these to `CpuOnly` — the tempting "fix" for a flaky
+  // golden — would validate a path nobody runs. Fail here instead.
+  assert_eq!(build.compute().mel(), DEFAULT_MEL_COMPUTE_UNITS);
+  assert_eq!(build.compute().encoder(), DEFAULT_ENCODER_COMPUTE_UNITS);
+  assert_eq!(build.compute().decoder(), DEFAULT_DECODER_COMPUTE_UNITS);
+  let kit = WhisperKit::new(&build).unwrap();
   // Brief text said `.with_language("es".into())`, but `with_language`
   // takes `impl Into<String>` — calling `.into()` on the literal first
   // gives the compiler nothing to unify the target type against (E0283).
@@ -72,11 +96,20 @@ fn es_tiny_matches_golden_tokens_and_segments() {
   // as `Options::new()` above.
   let options = DecodingOptions::new().with_language("es");
   let result = kit.transcribe(&audio, &options).unwrap();
-  // Clean speech at temperature 0 must never enter the fallback ladder —
-  // the ladder's t > 0 attempts draw from an unseeded RNG, so pinning
-  // zero fallbacks turns any future ladder-triggering regression into one
-  // deterministic, attributable failure instead of a flake-flavored one.
-  assert_eq!(result.timings().total_decoding_fallbacks(), 0.0);
+  // Clean speech at temperature 0 must never draw from the token sampler —
+  // the fallback ladder's t != 0 attempts sample from an unseeded RNG, so a
+  // ladder-triggering regression would make this decode non-reproducible.
+  // Asserted via the carried sampling flag, NOT
+  // `total_decoding_fallbacks()`: that counter stores the ZERO-BASED index
+  // of the last fallback (transcribe/mod.rs:846), so its FIRST fallback
+  // writes 0.0 — indistinguishable from "never fell back", making
+  // `== 0.0` vacuous. The flag is unambiguous, and also catches a sampled
+  // window that a later lossy filter removed.
+  assert_eq!(
+    result.task_facts().drew_from_rng(),
+    Some(false),
+    "clean speech must decode greedily; no window drew from the unseeded sampler"
+  );
 
   if std::env::var_os("UPDATE_GOLDEN").is_some() {
     // Fallback-path writer (mirrors parity_jfk.rs's Task 13 Step
@@ -103,13 +136,15 @@ fn es_tiny_matches_golden_tokens_and_segments() {
 
   assert_eq!(golden.language, result.language());
 
-  // Keystone: exact token-id parity across the whole file.
+  // Keystone: exact token-id parity across the whole file. Exact — the
+  // helper only DIAGNOSES a mismatch (first diverging step, the two
+  // competing token ids, their logit margin); it never tolerates one.
   let rust_tokens: Vec<u32> = result
     .segments_slice()
     .iter()
     .flat_map(|s| s.tokens_slice().iter().copied())
     .collect();
-  assert_eq!(rust_tokens, golden.tokens, "token ids must match exactly");
+  common::assert_golden_tokens("es_tiny_golden.json", &rust_tokens, &golden.tokens, &audio);
 
   // Segment-level parity: count, ids, boundaries within epsilon, text.
   assert_eq!(result.segments_slice().len(), golden.segments.len());

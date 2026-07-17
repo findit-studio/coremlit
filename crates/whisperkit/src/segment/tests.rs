@@ -294,7 +294,7 @@ fn find_alignment_produces_monotonic_word_timings() {
   }
   let view = AlignmentView::new(&matrix, ids.len(), cols);
   let log_probs = vec![-0.2f32; ids.len()];
-  let words = find_alignment(&ids, &view, &log_probs, &t, "en").unwrap();
+  let words = find_alignment(&ids, &view, &log_probs, &t, "en", WordGrouping::FineGrained).unwrap();
   assert!(!words.is_empty());
   for pair in words.windows(2) {
     assert!(pair[0].end() <= pair[1].start() + 1e-4, "monotonic timings");
@@ -712,6 +712,7 @@ fn add_word_timestamps_attaches_merged_monotonic_words() {
     &view,
     &t,
     "en",
+    WordGrouping::FineGrained,
     0,
     crate::constants::PREPEND_PUNCTUATION,
     crate::constants::APPEND_PUNCTUATION,
@@ -757,6 +758,7 @@ fn add_word_timestamps_zero_pads_missing_rows() {
     &view,
     &t,
     "en",
+    WordGrouping::FineGrained,
     0,
     crate::constants::PREPEND_PUNCTUATION,
     crate::constants::APPEND_PUNCTUATION,
@@ -787,6 +789,7 @@ fn add_word_timestamps_errors_on_empty_segments() {
     &view,
     &t,
     "en",
+    WordGrouping::FineGrained,
     0,
     crate::constants::PREPEND_PUNCTUATION,
     crate::constants::APPEND_PUNCTUATION,
@@ -809,7 +812,18 @@ fn add_word_timestamps_errors_on_zero_columns() {
   let hello = t.encode(" Hello").unwrap()[0];
   let segments = [plain_segment(vec![hello], 0.0, 1.0)];
   let view = AlignmentView::new(&[], 5, 0);
-  let err = add_word_timestamps(&segments, &view, &t, "en", 0, "", "", 0.0).unwrap_err();
+  let err = add_word_timestamps(
+    &segments,
+    &view,
+    &t,
+    "en",
+    WordGrouping::FineGrained,
+    0,
+    "",
+    "",
+    0.0,
+  )
+  .unwrap_err();
   assert!(matches!(
     err,
     SegmentError::InvalidAlignmentShape { cols: 0, .. }

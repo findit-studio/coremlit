@@ -82,6 +82,218 @@ fn fully_masked_sample_does_not_consume_rng() {
 }
 
 #[test]
+fn drew_from_rng_tracks_real_rng_draws() {
+  // F2 (codex round 3). The fallback ladder records reproducibility from THIS
+  // fact, not from the temperature: it must be true iff `sample` actually
+  // consulted the RNG -- a non-zero-temperature draw on a non-masked buffer.
+  let logits = [1.0f32, 3.0, 2.0, 0.0];
+
+  // Argmax (temperature 0) never draws.
+  let mut argmax_sampler = greedy(0.0);
+  assert!(
+    !argmax_sampler.drew_from_rng(),
+    "a fresh sampler has not drawn"
+  );
+  argmax_sampler.sample(&logits);
+  assert!(
+    !argmax_sampler.drew_from_rng(),
+    "argmax decoding does not consult the RNG"
+  );
+
+  // A non-zero temperature draws, and the flag latches.
+  let mut sampling = greedy(0.7);
+  sampling.sample(&logits);
+  assert!(
+    sampling.drew_from_rng(),
+    "a non-zero-temperature sample draws from the RNG"
+  );
+
+  // The all-masked degenerate path returns without drawing.
+  let mut masked = greedy(0.7);
+  masked.sample(&[f32::NEG_INFINITY; 4]);
+  assert!(
+    !masked.drew_from_rng(),
+    "the all-masked degenerate path must not consult the RNG"
+  );
+}
+
+#[test]
+fn negative_temperature_wide_logits_sample_without_panic() {
+  // F1 (codex round 3, High). Swift scales the logits by `1 / temperature`
+  // FIRST, then softmaxes the *scaled* vector (`TokenSampler.swift:109-138`).
+  // The port stabilized the softmax with `max(raw) * inv_t`, but for a
+  // NEGATIVE temperature `inv_t < 0` reverses order, so that constant is the
+  // *minimum* scaled value, not the max: the true-largest scaled entry then
+  // computes `exp(scaled - min) = exp(huge) = +inf`, making `top_sum`
+  // non-finite and panicking `random_range(0.0..inf)`.
+  //
+  // Reproduction (pre-fix): `sample([-10, 10])` at `-0.2` panicked. Post-fix
+  // it must return a finite draw with no panic.
+  let result = greedy(-0.2).sample(&[-10.0f32, 10.0]);
+  assert!(result.logprob().is_finite(), "logprob must be finite");
+  assert!((result.token() as usize) < 2, "token must index the logits");
+
+  // Every drawn token must lie in the top-k of a numerically stable softmax
+  // over the SCALED logits (`v / temperature`) -- exactly what Swift's
+  // scale-then-softmax computes. Under a negative temperature the *smallest*
+  // raw logit is the most probable, so a correct fix inverts the ordering
+  // rather than overflowing.
+  let wide = [-10.0f32, 10.0, -8.0, 5.0, -3.0, 2.0, 9.0, -1.0];
+  let inv_t = 1.0f32 / -0.2;
+  let scaled: Vec<f32> = wide.iter().map(|&v| v * inv_t).collect();
+  let scaled_max = scaled.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+  let reference: Vec<f32> = scaled.iter().map(|&s| (s - scaled_max).exp()).collect();
+  assert!(
+    reference.iter().all(|p| p.is_finite()),
+    "the reference stable softmax over scaled logits must stay finite"
+  );
+  // top_k defaults to 5: the five highest-probability scaled entries.
+  let mut order: Vec<usize> = (0..wide.len()).collect();
+  order.sort_by(|&a, &b| reference[b].total_cmp(&reference[a]));
+  let top_k: std::collections::HashSet<usize> = order.into_iter().take(5).collect();
+
+  let mut sampler = greedy(-0.2);
+  for _ in 0..50 {
+    let r = sampler.sample(&wide);
+    assert!(
+      r.logprob().is_finite(),
+      "finite logprob under negative temperature"
+    );
+    assert!(
+      top_k.contains(&(r.token() as usize)),
+      "drawn token {} fell outside the stable-softmax top-k {top_k:?}",
+      r.token()
+    );
+  }
+}
+
+#[test]
+fn negative_temperature_masked_logits_sample_without_panic() {
+  // F1 (codex round 4, High). The round-3 fix scaled every logit by `1/T`
+  // and stabilized on `max(scaled)`, but a filter MASK (`-inf`, what
+  // `decode::filter` writes for a suppressed token) is not a number to
+  // scale: at a NEGATIVE temperature `-inf * (1/T)` flips to `+inf`, so the
+  // masked index BECOMES the scaled max, the stabilizer subtraction yields
+  // `+inf - +inf = NaN` across the vector, and `random_range(0.0..NaN)`
+  // panics. The round-3 regression above never reached this regime -- it
+  // used only finite logits, so no `-inf` was present to flip.
+  //
+  // Reproduction (pre-fix): `sample([0.0, NEG_INFINITY])` at `-0.2` panicked
+  // on the NaN multinomial range. Post-fix: no panic, a finite log-prob, a
+  // real RNG draw, and the masked index NEVER selected.
+  let mut sampler = greedy(-0.2);
+  for _ in 0..200 {
+    let r = sampler.sample(&[0.0f32, f32::NEG_INFINITY]);
+    assert!(
+      r.logprob().is_finite(),
+      "masked negative-temperature draw must have a finite log-prob"
+    );
+    assert_eq!(
+      r.token(),
+      0,
+      "the masked index (1) must never be drawn -- a mask is a mask at any temperature sign"
+    );
+  }
+  assert!(
+    sampler.drew_from_rng(),
+    "a non-zero-temperature draw on a non-masked-max buffer consults the RNG"
+  );
+
+  // The mask must stay excluded whatever the sign of the temperature, and
+  // the finite entry must win regardless of where it sits. A wider mix of
+  // finite and masked entries at a negative temperature: every draw lands on
+  // a FINITE-logit index, never a masked one, and stays finite.
+  let mixed = [
+    f32::NEG_INFINITY,
+    -4.0,
+    f32::NEG_INFINITY,
+    7.0,
+    2.0,
+    f32::NEG_INFINITY,
+  ];
+  let masked_indices = [0usize, 2, 5];
+  let mut sampler = greedy(-0.35);
+  for _ in 0..200 {
+    let r = sampler.sample(&mixed);
+    assert!(
+      r.logprob().is_finite(),
+      "finite log-prob under the mask + negative temperature"
+    );
+    assert!(
+      !masked_indices.contains(&(r.token() as usize)),
+      "a masked (-inf) index {} was drawn under negative temperature",
+      r.token()
+    );
+  }
+}
+
+#[test]
+fn tiny_temperature_overflow_sample_without_panic_or_nan() {
+  // F1 sibling (codex round 4). A finite-but-tiny temperature drives `1/T`
+  // (or a scaled logit) past the f32 range, so `v * (1/T)` overflows to
+  // `+-inf` (or, for `v == 0` when `1/T` itself overflowed, the `0 * inf`
+  // NaN). Either would break the stabilized softmax and violate `sample`'s
+  // "panics only on empty logits" contract; the fix clamps the overflow to
+  // the finite extremes and treats the `0 * inf` case as the true scaled
+  // value `0`.
+  for &temperature in &[1e-40f32, -1e-40, f32::MIN_POSITIVE, 1e-30] {
+    let mut sampler = GreedyTokenSampler::new(temperature, 3, &DecodingOptions::new()).with_seed(1);
+    for _ in 0..50 {
+      let r = sampler.sample(&[0.0f32, 20.0, -20.0, 5.0]);
+      assert!(
+        r.logprob().is_finite() || r.logprob() == f32::NEG_INFINITY,
+        "t={temperature}: log-prob must be finite or the degenerate -inf, never NaN"
+      );
+      assert!(
+        (r.token() as usize) < 4,
+        "t={temperature}: token must index the logits"
+      );
+    }
+  }
+}
+
+#[test]
+fn tiny_temperature_preserves_rank_and_logprob() {
+  // F1 (codex round 14). At a subnormal temperature `1 / temperature` (or a
+  // scaled logit) overflows f32; the pre-fix per-entry clamp then mapped every
+  // same-sign finite logit to the SAME endpoint, so the stabilized softmax was
+  // uniform over all of them. Concretely `[5.0, 20.0]` at `1e-40` clamped both
+  // to `f32::MAX`, drew `[0.5, 0.5]`, and returned `ln(0.5)` for whichever token
+  // it picked -- a possibly-wrong token, and a certainly-wrong logprob where the
+  // limit is `0`. The overflow-only stable-difference path preserves order: the
+  // temperature-sign-appropriate extreme takes probability 1 (logprob → 0) and
+  // every other distinct finite logit collapses to probability 0 (logprob −∞),
+  // independent of the seed. The existing
+  // `tiny_temperature_overflow_sample_without_panic_or_nan` still pins the
+  // no-panic / no-NaN contract this rank/logprob check sits on top of.
+  //
+  // Mutation: revert `sample` to the naive `(v * inv_t) - scaled_max` scaling
+  // (drop the `saturates` stable path) and BOTH `±1e-40` blocks fail -- the draw
+  // becomes uniform, so the token is seed-dependent and the logprob is `ln(1/n)`.
+  let logits = [5.0f32, 20.0, -3.0, 12.0]; // distinct, finite; argmax = 1, argmin = 2
+  for &(temperature, winner) in &[(1e-40f32, 1u32), (-1e-40f32, 2)] {
+    for seed in 0..8u64 {
+      // eot_token 3 is neither the argmax nor the argmin, so `completed` stays
+      // false whichever extreme wins.
+      let mut sampler =
+        GreedyTokenSampler::new(temperature, 3, &DecodingOptions::new()).with_seed(seed);
+      let result = sampler.sample(&logits);
+      assert_eq!(
+        result.token(),
+        winner,
+        "t={temperature}, seed={seed}: the order-preserving extreme must win, not a uniform draw"
+      );
+      assert!(
+        result.logprob().abs() < 1e-6,
+        "t={temperature}, seed={seed}: the point-mass winner's logprob → 0, got {}",
+        result.logprob()
+      );
+      assert!(!result.completed(), "t={temperature}, seed={seed}");
+    }
+  }
+}
+
+#[test]
 #[should_panic(expected = "non-empty logits")]
 fn empty_logits_panic() {
   greedy(0.0).sample(&[]);

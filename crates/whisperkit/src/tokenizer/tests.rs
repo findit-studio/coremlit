@@ -52,12 +52,16 @@ fn language_tokens_cover_the_table() {
 fn split_words_space_vs_unicode() {
   let t = tiny();
   let ids = t.encode(" Hello world").unwrap();
-  let words = t.split_to_word_tokens(&ids, "en").unwrap();
+  let words = t
+    .split_to_word_tokens(&ids, "en", WordGrouping::FineGrained)
+    .unwrap();
   let texts: Vec<&str> = words.iter().map(|(w, _)| w.as_str()).collect();
   assert_eq!(texts, vec![" Hello", " world"]);
   // unicode-split path: every CJK char its own word
   let zh = t.encode("你好世界").unwrap();
-  let words = t.split_to_word_tokens(&zh, "zh").unwrap();
+  let words = t
+    .split_to_word_tokens(&zh, "zh", WordGrouping::FineGrained)
+    .unwrap();
   assert!(words.len() >= 4 || words.iter().all(|(w, _)| !w.contains(' ')));
 }
 
@@ -166,7 +170,11 @@ fn decode_skip_special_strips_control_tokens_but_keeps_timestamps() {
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn split_to_word_tokens_empty_input_is_empty() {
   let t = tiny();
-  assert_eq!(t.split_to_word_tokens(&[], "en").unwrap(), vec![]);
+  assert_eq!(
+    t.split_to_word_tokens(&[], "en", WordGrouping::FineGrained)
+      .unwrap(),
+    vec![]
+  );
 }
 
 #[test]
@@ -199,7 +207,9 @@ fn cjk_languages_split_into_fine_grained_words() {
 
   for lang in ["zh", "ja", "yue"] {
     let ids = t.encode(text).unwrap();
-    let words = t.split_to_word_tokens(&ids, lang).unwrap();
+    let words = t
+      .split_to_word_tokens(&ids, lang, WordGrouping::FineGrained)
+      .unwrap();
     let texts: Vec<&str> = words.iter().map(|(w, _)| w.as_str()).collect();
     assert_eq!(texts, expected_words, "language {lang}");
     assert_eq!(
@@ -214,7 +224,9 @@ fn cjk_languages_split_into_fine_grained_words() {
   // whole utterance collapses into a single coarse "word". This is the
   // failure mode the CJK arm above exists to avoid.
   let ids = t.encode(text).unwrap();
-  let en_words = t.split_to_word_tokens(&ids, "en").unwrap();
+  let en_words = t
+    .split_to_word_tokens(&ids, "en", WordGrouping::FineGrained)
+    .unwrap();
   assert_eq!(
     en_words.len(),
     1,
@@ -234,7 +246,9 @@ fn split_to_word_tokens_preserves_token_coverage_and_text() {
   let t = tiny();
   for (text, lang) in [(" The quick brown fox.", "en"), ("你好，世界！", "zh")] {
     let ids = t.encode(text).unwrap();
-    let words = t.split_to_word_tokens(&ids, lang).unwrap();
+    let words = t
+      .split_to_word_tokens(&ids, lang, WordGrouping::FineGrained)
+      .unwrap();
 
     let covered: Vec<u32> = words
       .iter()
@@ -252,4 +266,210 @@ fn split_to_word_tokens_preserves_token_coverage_and_text() {
       );
     }
   }
+}
+
+// ---------------------------------------------------------------------
+// WordGrouping (coremlit issue #14; parity corrected in codex round 1)
+// ---------------------------------------------------------------------
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn swift_parity_matches_swifts_pinned_japanese_word_tokens() {
+  // Swift's OWN test, ported verbatim: `testSplitToWordTokensJapanese`
+  // (`Tests/WhisperKitTests/UnitTests.swift:1360-1375`), token vector and
+  // both expectations copied unchanged. Its assertion message reads "Words
+  // did not match expected output in Unicode split", and its expectations
+  // ARE the Unicode-split groups -- because Swift Unicode-splits Japanese.
+  //
+  //   こんにちは、世界！これはテストですよね？
+  //
+  // This is the test the old `Phrase` variant could not have passed. It
+  // forced the space splitter for every CJK language, which on spaceless
+  // Japanese collapses the whole utterance into one blob -- while claiming,
+  // by name and in its docs, to be byte-comparable with Swift. Swift's
+  // `NLLanguageRecognizer` returns the BARE code "ja", which its own CJK
+  // check matches, so Swift takes the Unicode arm here. Only Chinese
+  // (`zh-Hans`/`zh-Hant`, regional) misses that check.
+  let t = tiny();
+  let token_ids: Vec<u32> = vec![
+    50364, 38088, 1231, 24486, 171, 120, 223, 25212, 22985, 40498, 4767, 30346, 171, 120, 253,
+    50257,
+  ];
+
+  let expected_words = vec![
+    "<|0.00|>",
+    "こんにちは",
+    "、",
+    "世界",
+    "！",
+    "これは",
+    "テ",
+    "スト",
+    "です",
+    "よね",
+    "？",
+    "<|endoftext|>",
+  ];
+  let expected_word_tokens: Vec<Vec<u32>> = vec![
+    vec![50364],
+    vec![38088],
+    vec![1231],
+    vec![24486],
+    vec![171, 120, 223],
+    vec![25212],
+    vec![22985],
+    vec![40498],
+    vec![4767],
+    vec![30346],
+    vec![171, 120, 253],
+    vec![50257],
+  ];
+
+  let split = t
+    .split_to_word_tokens(&token_ids, "ja", WordGrouping::SwiftParity)
+    .unwrap();
+  let words: Vec<&str> = split.iter().map(|(word, _)| word.as_str()).collect();
+  let word_tokens: Vec<Vec<u32>> = split.iter().map(|(_, ids)| ids.clone()).collect();
+
+  assert_eq!(words, expected_words, "Words did not match Swift's output.");
+  assert_eq!(
+    word_tokens, expected_word_tokens,
+    "Word tokens did not match Swift's output."
+  );
+  assert_eq!(words.len(), 12, "Swift pins twelve groups");
+
+  // The default grouping agrees with Swift here too -- for Japanese there is
+  // nothing to trade off, because Swift is already fine-grained.
+  assert_eq!(
+    t.split_to_word_tokens(&token_ids, "ja", WordGrouping::FineGrained)
+      .unwrap(),
+    split,
+    "ja is the SAME splitter under both modes: Swift Unicode-splits it, and \
+     so does this port's default"
+  );
+
+  // The units are BPE-token-shaped, NOT one-per-Unicode-scalar: "こんにちは"
+  // is five scalars in a single group, because it is a single BPE token.
+  // (`FineGrained`'s doc used to claim one word per scalar; this is the
+  // counter-example, straight out of Swift's own fixture.)
+  assert_eq!("こんにちは".chars().count(), 5);
+  assert_eq!(split[1].1.len(), 1, "one token, five scalars, one group");
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn word_grouping_splits_chinese_and_only_chinese() {
+  // The whole of the divergence, in one test: `zh` is the ONLY language
+  // (with `yue`) where the two groupings disagree, because it is the only one
+  // whose `NLLanguage` raw value is regional (`zh-Hans`/`zh-Hant`) and so
+  // misses Swift's bare-code CJK check.
+  //
+  // A ZH utterance with no spaces to split on -- the shape behind coremlit
+  // issue #11's divergence (Rust's 85 fine-grained words against Swift's 24
+  // blobs on the real ZH clip), in miniature.
+  let t = tiny();
+  let zh = t.encode("我今天很高兴见到你").unwrap();
+
+  // DEFAULT -- the #11-pinned behavior, unchanged: the Unicode splitter
+  // carves the utterance into its Unicode-complete units. Those units are
+  // BPE-token-shaped, not one-per-character ("今天" is a single token); the
+  // guarantee is that they are FINE-GRAINED, never one-per-scalar.
+  let fine = t
+    .split_to_word_tokens(&zh, "zh", WordGrouping::FineGrained)
+    .unwrap();
+  let fine_texts: Vec<&str> = fine.iter().map(|(w, _)| w.as_str()).collect();
+  assert_eq!(
+    fine_texts,
+    vec!["我", "今天", "很", "高", "兴", "见", "到", "你"]
+  );
+  assert_eq!(
+    crate::options::DecodingOptions::new().word_grouping(),
+    WordGrouping::FineGrained,
+    "and fine-grained is what a caller gets without asking"
+  );
+
+  // OPT-IN -- the space splitter finds no space anywhere in Chinese, so the
+  // whole utterance collapses into a single blob with one start/end time:
+  // Swift's `zh-Hant`-fallthrough grouping, reproduced deliberately rather
+  // than stumbled into.
+  let swift = t
+    .split_to_word_tokens(&zh, "zh", WordGrouping::SwiftParity)
+    .unwrap();
+  let swift_texts: Vec<&str> = swift.iter().map(|(w, _)| w.as_str()).collect();
+  assert_eq!(swift_texts, vec!["我今天很高兴见到你"]);
+
+  // MUTATION EVIDENCE: identical tokens, identical language code -- only the
+  // grouping differs, and it alone moves 8 words to 1.
+  assert!(
+    fine.len() > swift.len(),
+    "fine-grained must out-split Swift's grouping on Chinese: \
+     {fine_texts:?} vs {swift_texts:?}"
+  );
+  // Neither mode loses text; they only disagree on where the boundaries are.
+  assert_eq!(fine_texts.concat(), swift_texts.concat());
+
+  // Cantonese rides with Chinese: `NLLanguage` has no Cantonese case, so
+  // Swift's recognizer answers `zh-Hans`/`zh-Hant` for it too.
+  assert_eq!(
+    t.split_to_word_tokens(&zh, "yue", WordGrouping::SwiftParity)
+      .unwrap(),
+    swift
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn swift_parity_unicode_splits_every_cjk_language_except_chinese() {
+  // The table on `WordGrouping`, executed. `ja`/`th`/`lo`/`my` have BARE
+  // `NLLanguage` raw values, so Swift's own check matches them and Swift
+  // Unicode-splits them -- meaning the two groupings must be IDENTICAL
+  // there. Only `zh`/`yue` may differ.
+  //
+  // This is the assertion the old `Phrase` variant failed by construction:
+  // it forced spaces for all six.
+  let t = tiny();
+  let ja = t.encode("こんにちは世界").unwrap();
+
+  for language in ["ja", "th", "lo", "my"] {
+    assert_eq!(
+      t.split_to_word_tokens(&ja, language, WordGrouping::SwiftParity)
+        .unwrap(),
+      t.split_to_word_tokens(&ja, language, WordGrouping::FineGrained)
+        .unwrap(),
+      "Swift Unicode-splits `{language}`, so the two groupings must agree"
+    );
+  }
+
+  for language in ["zh", "yue"] {
+    assert_ne!(
+      t.split_to_word_tokens(&ja, language, WordGrouping::SwiftParity)
+        .unwrap(),
+      t.split_to_word_tokens(&ja, language, WordGrouping::FineGrained)
+        .unwrap(),
+      "`{language}` is the accident: Swift space-splits it and this port does not"
+    );
+  }
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn word_grouping_is_inert_for_whitespace_delimited_languages() {
+  // A space-delimited language already takes the space splitter under both
+  // modes, so the two are identical there. This is the structural reason the
+  // English/Spanish goldens cannot move no matter what this knob is set to.
+  let t = tiny();
+  let ids = t.encode(" Hello world").unwrap();
+
+  let fine = t
+    .split_to_word_tokens(&ids, "en", WordGrouping::FineGrained)
+    .unwrap();
+  let swift = t
+    .split_to_word_tokens(&ids, "en", WordGrouping::SwiftParity)
+    .unwrap();
+
+  assert_eq!(fine, swift, "non-CJK: both modes split on spaces");
+  assert_eq!(
+    fine.iter().map(|(w, _)| w.as_str()).collect::<Vec<_>>(),
+    vec![" Hello", " world"]
+  );
 }

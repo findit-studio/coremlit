@@ -76,7 +76,10 @@
 //!   and temperature-fallback ladder that drives the decode stack over a
 //!   full audio buffer — and, for VAD-chunked audio, folding per-chunk
 //!   results together via
-//!   [`merge_transcription_results`](result::merge_transcription_results).
+//!   [`merge_transcription_results_with_options`](result::merge_transcription_results_with_options),
+//!   which is equally the entry point for folding a `transcribe_all` batch
+//!   by hand ([`merge_transcription_results`](result::merge_transcription_results)
+//!   is its options-blind, exactly-Swift sibling).
 //! - [`stream`] — push-based streaming vocabulary (spec §5.3 `stream`
 //!   row): [`StreamState`](stream::StreamState) (Swift's
 //!   `AudioStreamTranscriber.State`),
@@ -97,6 +100,13 @@
 //!   already-constructed pipeline
 //!   ([`audio_stream_transcriber`](transcribe::WhisperKit::audio_stream_transcriber)/
 //!   [`local_agreement_transcriber`](transcribe::WhisperKit::local_agreement_transcriber)).
+//! - [`task_facts`] — [`TaskFacts`](task_facts::TaskFacts), the single record
+//!   of the decode-time facts a run *controls* (RNG draw, observed language,
+//!   early-stop truncation, worker coordinates, allocated id span), with the
+//!   one associative [merge law](task_facts::TaskFacts::merge) every merge
+//!   entry point calls. Carried on every
+//!   [`TranscriptionResult`](result::TranscriptionResult) and embedded in
+//!   [`Provenance`](provenance::Provenance).
 //! - [`log`] — leveled logging with a replacing callback.
 //!
 //! # Reproducibility and provenance
@@ -135,11 +145,57 @@
 //!   [`EnergyVad`](audio::vad::EnergyVad) by default, swappable via
 //!   [`WhisperKit::set_vad_detector`](transcribe::WhisperKit::set_vad_detector))
 //!
-//! Under the `serde` feature, [`DecodingOptions`](options::DecodingOptions),
+//! [`Provenance`](provenance::Provenance) assembles that record for you
+//! (coremlit issue #14). Of the items above, the **library-known** ones are
+//! captured by
+//! [`Provenance::from_options`](provenance::Provenance::from_options) —
+//! which **embeds the entire resolved
+//! [`DecodingOptions`](options::DecodingOptions)**
+//! ([`Provenance::decoding`](provenance::Provenance::decoding)) rather than
+//! copying a chosen handful of its knobs into flat fields of its own,
+//! alongside the [`ComputeOptions`](options::ComputeOptions) and the
+//! *effective* decode temperature.
+//!
+//! "Wholesale" is load-bearing and not a figure of speech. A curated
+//! projection is a list somebody must remember to extend, and this one had
+//! already drifted to 11 of 30 knobs — silently dropping, among others,
+//! `drop_blank_audio` and `word_grouping`, both of which visibly change the
+//! transcript, so two runs differing only in them left byte-identical
+//! records. Embedding the struct makes the record complete **by
+//! construction**: an option added tomorrow is recorded with no change to
+//! the provenance code, and `provenance`'s mutation table — whose coverage
+//! is derived from [`DecodingOptions`](options::DecodingOptions)' own field
+//! set, not hand-written — fails the suite if one ever is not.
+//!
+//! The remaining three are **consumer-supplied**: settable `Option` fields,
+//! left `None` and never guessed, because this crate genuinely cannot
+//! observe them.
+//!
+//! - Model identity and tokenizer identity — it loads bare local folders,
+//!   so it never sees a repo id or a revision.
+//! - The **VAD detector**
+//!   ([`Provenance::vad_detector`](provenance::Provenance::vad_detector)).
+//!   This one is not an oversight: the pipeline holds the detector as a
+//!   `Box<dyn `[`VoiceActivityDetector`](audio::vad::VoiceActivityDetector)`>`
+//!   ([`WhisperKit::vad_detector`](transcribe::WhisperKit::vad_detector)),
+//!   and a trait object carries no identity to read — nor does it live in
+//!   either options struct, so
+//!   [`from_options`](provenance::Provenance::from_options) could not
+//!   reach it even if it had a name. The record therefore says *whether*
+//!   VAD chunking ran
+//!   ([`chunking_strategy`](options::DecodingOptions::chunking_strategy)),
+//!   never *which* detector drove it. Since a swapped detector moves the
+//!   chunk boundaries — and the boundaries move the transcript — a
+//!   consumer that calls
+//!   [`set_vad_detector`](transcribe::WhisperKit::set_vad_detector) should
+//!   name it here, or two runs that differ only in detector leave
+//!   byte-identical records with no trace of what made their text differ.
+//!
+//! Under the `serde` feature the whole record serializes (unset
+//! consumer-supplied fields omitted, so they can never masquerade as a
+//! known `null`), as do [`DecodingOptions`](options::DecodingOptions),
 //! [`ComputeOptions`](options::ComputeOptions), and
-//! [`Options`](options::Options) are all serde-serializable, so the
-//! cheapest faithful record is to serialize the exact option values used
-//! and store that snapshot with the transcript.
+//! [`Options`](options::Options) individually.
 //!
 //! Provenance-adjacent behaviors to plan for:
 //!
@@ -150,14 +206,18 @@
 //!   matches). Never compare outputs across compute units as if
 //!   equivalent: fix one unit for regression baselines, or keep a
 //!   separate baseline per unit.
-//! - **Silence can decode to a marker, not to empty text.** Confirmed
-//!   under the validated configuration coremlit issue #9 pinned (tiny
-//!   model, matched VAD/prefill options, 5 s of digital silence): the
-//!   window decodes to exactly
+//! - **Silence decodes to a marker, and this crate drops it by default.**
+//!   Confirmed under the validated configuration coremlit issue #9 pinned
+//!   (tiny model, matched VAD/prefill options, 5 s of digital silence):
+//!   the window decodes to exactly
 //!   [`BLANK_AUDIO_MARKER`](constants::BLANK_AUDIO_MARKER) — see that
-//!   constant's doc for the general, model/config-dependent shape of
-//!   this behavior. When this marker is emitted, product layers should
-//!   filter or model it rather than indexing it as transcript text.
+//!   constant's doc for the general, model/config-dependent shape of this
+//!   behavior. Rather than leave every product layer to post-filter that,
+//!   [`DecodingOptions::drop_blank_audio`](options::DecodingOptions::drop_blank_audio)
+//!   defaults `true` and removes such segments after decoding, so pure
+//!   silence yields an empty result (coremlit issue #14). This is the one
+//!   default in this crate that deliberately diverges from Swift, which
+//!   emits the marker; set the option `false` for exact Swift parity.
 //! - **Sampling above temperature 0 is non-reproducible by default, on
 //!   both runtimes — set [`DecodingOptions::seed`](options::DecodingOptions::seed) to make it
 //!   reproducible on this side.** Whenever the fallback ladder retries at
@@ -289,9 +349,11 @@ pub mod error;
 pub mod log;
 pub mod model;
 pub mod options;
+pub mod provenance;
 pub mod result;
 pub mod segment;
 pub mod stream;
+pub mod task_facts;
 pub mod text;
 pub mod tokenizer;
 pub mod transcribe;

@@ -68,14 +68,23 @@
 //! callable on `WhisperKit<CoreMlBackend>` — see that method's own doc for
 //! the full reasoning.
 
-use std::{sync::atomic::AtomicBool, time::Instant};
+use std::{
+  cell::Cell,
+  sync::{
+    Mutex, PoisonError,
+    atomic::{AtomicBool, Ordering},
+  },
+  time::Instant,
+};
 
 use unicode_categories::UnicodeCategories;
 
 use crate::{
   audio::{self, chunker},
   backend::{AlignmentMatrix, InferenceBackend, coreml::CoreMlBackend},
-  constants::{APPEND_PUNCTUATION, DEFAULT_LANGUAGE_CODE, PREPEND_PUNCTUATION, SAMPLE_RATE},
+  constants::{
+    APPEND_PUNCTUATION, BLANK_AUDIO_MARKER, DEFAULT_LANGUAGE_CODE, PREPEND_PUNCTUATION, SAMPLE_RATE,
+  },
   decode::{
     self, TranscriptionProgressCallback,
     sampler::{self, GreedyTokenSampler},
@@ -85,10 +94,11 @@ use crate::{
   options::{DecodingOptions, Options},
   result::{
     DecodingResult, TranscriptionProgress, TranscriptionResult, TranscriptionSegment,
-    TranscriptionTimings, merge_transcription_results, needs_fallback,
+    TranscriptionTimings, merge_transcription_results_with_options, needs_fallback,
   },
   segment,
   stream::{AudioStreamTranscriber, agreement::LocalAgreementTranscriber},
+  task_facts::{SpanKnowledge, TaskFacts},
   tokenizer::WhisperTokenizer,
 };
 
@@ -114,6 +124,17 @@ fn trim_swift_whitespaces(s: &str) -> &str {
 /// Fired once per decoded window, with that window's segments only (not the
 /// running total). Ports Swift `SegmentDiscoveryCallback`
 /// (`Models.swift:667-669`).
+///
+/// **Observes segments BEFORE the [`DecodingOptions::drop_blank_audio`]
+/// filter** (codex round 3, adjudicated). This is a real-time, raw-segment
+/// surface: it fires the instant a window finishes decoding, inside the window
+/// loop, so a window that decoded to nothing but `[BLANK_AUDIO]` is reported
+/// here even when `drop_blank_audio` is set and that segment is later dropped
+/// from the final [`TranscriptionResult`]. The drop governs the assembled
+/// result; this callback governs what was actually decoded. A consumer that
+/// wants only the surviving segments must filter its own copy — the drop runs
+/// once every window has decoded (see [`TranscribeTask::run`]), necessarily
+/// after this has already fired per-window.
 pub type SegmentDiscoveryCallback<'a> = &'a (dyn Fn(&[TranscriptionSegment]) + Sync);
 
 // ---------------------------------------------------------------------
@@ -130,6 +151,21 @@ pub struct TranscribeTask<'ctx, B> {
   segment_callback: Option<SegmentDiscoveryCallback<'ctx>>,
   progress_callback: Option<TranscriptionProgressCallback<'ctx>>,
   window_id_offset: usize,
+  /// Optional caller-owned [`TaskFacts`] sink [`Self::run`] merges each
+  /// attempt's error-fragile facts — the RNG draw, the early-stop truncation,
+  /// and the genuine language observation — into, the instant an attempt settles
+  /// inside `decode_with_fallback` and *before* any error can propagate out. It
+  /// outlives the task, so an errored [`Self::run`] whose whole result the caller
+  /// discards still leaves those facts behind: [`WhisperKit::transcribe`]'s VAD
+  /// branch installs one shared sink across its chunks so a chunk that sampled,
+  /// truncated, or detected a language then errored and was DROPPED still
+  /// contributes those facts to the merged transcript (coremlit issue #14, codex
+  /// rounds 4–6 — the early-stop fact is the round-6 R6-F1 addition the two
+  /// former per-fact sinks lacked). `None` on the non-VAD/`transcribe_all` paths,
+  /// which surface a chunk's error directly rather than dropping it, so `run`
+  /// accumulates into a task-local sink instead. The worker schedule and id span
+  /// are set on the result directly, never through this sink.
+  facts_sink: Option<&'ctx Mutex<TaskFacts>>,
 }
 
 impl<'ctx, B> TranscribeTask<'ctx, B> {
@@ -142,7 +178,21 @@ impl<'ctx, B> TranscribeTask<'ctx, B> {
       segment_callback: None,
       progress_callback: None,
       window_id_offset: 0,
+      facts_sink: None,
     }
+  }
+
+  /// Installs a caller-owned [`TaskFacts`] sink that [`Self::run`] merges this
+  /// task's error-fragile facts (RNG draw, early-stop truncation, language
+  /// observation) into before any error propagates — see the field's own doc.
+  /// `pub(crate)`: only [`WhisperKit::transcribe`]'s VAD branch needs it, to
+  /// keep a dropped-because-errored chunk's facts from vanishing from the merged
+  /// transcript.
+  #[must_use]
+  #[inline(always)]
+  pub(crate) const fn with_facts_sink(mut self, sink: &'ctx Mutex<TaskFacts>) -> Self {
+    self.facts_sink = Some(sink);
+    self
   }
 
   /// Builder form of [`Self::set_segment_callback`].
@@ -256,7 +306,62 @@ where
     );
 
     let mut all_segments: Vec<TranscriptionSegment> = Vec::new();
+    // Monotonic count of segment-id ordinals this run has consumed so far — the
+    // base each window's `find_seek_point_and_segments` ids its segments off. How
+    // it advances per window depends on [`DecodingOptions::drop_blank_audio`]
+    // (see the F1 advance in the loop below):
+    //
+    // - `true` (the default) advances by ALL allocated ordinals, BEFORE the
+    //   word-timestamp zero-length filter removes any — a survivor-count base
+    //   would reissue an id a survivor of an earlier window still carries, making
+    //   the pipeline-local ids non-unique/non-monotonic (coremlit issue #14,
+    //   codex round 5). This is the deliberate unique-id hardening.
+    // - `false` advances by the SURVIVING count Swift appends
+    //   (`allSegmentsCount: allSegments.count`, `TranscribeTask.swift:181`), so
+    //   the ids DUPLICATE across a removed segment exactly as Swift's do — the
+    //   exact-parity contract of clearing the option (F1, codex round 9).
+    let mut decoded_segment_span = 0usize;
+    // The ordinal-ALLOCATION fact carried onto the result as its `decoded_span`,
+    // kept SEPARATE from the id base above (codex round 13, M3). It advances by
+    // every window's PRE-FILTER allocation count regardless of the option, so it
+    // counts ordinals ALLOCATED — dropped segments included, the public definition
+    // of `SpanKnowledge::Exact` — where the `false`-path id base counts only
+    // SURVIVORS. On the `true` path the two coincide (both advance by the
+    // allocation); on the `false` path they diverge, and recording the id base as
+    // the span there fabricated an `Exact` that was neither the allocation count
+    // nor the survivor extent (it under-counted the ordinals the run consumed).
+    let mut allocated_ordinals = 0usize;
     let mut detected_language: Option<String> = None;
+    // The GENUINE observation, kept SEPARATE from `detected_language` above:
+    // that one is the Swift-faithful DISPLAY language and includes a
+    // configured or fallback (`"en"`) value, whereas this is `Some` only when
+    // a probe ran or a `<|lang|>` token was actually decoded. This is what the
+    // result's `TaskFacts::observed_language` records — a configured or
+    // defaulted language was never *detected* (F3, codex round 3). It is THIS
+    // task's own observation; the shared sink below carries it cross-chunk.
+    let mut observed_language: Option<String> = None;
+    // The ONE sink for this task's error-fragile facts — the RNG draw (from the
+    // sampler's own `drew_from_rng`, never inferred from a temperature), the
+    // early-stop truncation (OR-ed across every attempt including a REJECTED one
+    // whose stop changed which attempt was selected — R6-F1, coremlit issue #14
+    // codex round 6), and the language observation. `decode_with_fallback` merges
+    // each attempt's facts in the instant it settles, BEFORE any error can
+    // propagate. When the caller installed a sink (the VAD branch), that shared
+    // sink is used so a chunk that drew/stopped/observed then ERRORED and is
+    // dropped still records the facts; otherwise a task-local sink, discarded
+    // with the error the caller surfaces anyway.
+    //
+    // Seeded **observed-clean** (`Some(false)` for the draw and early-stop), not
+    // `unknown()`: this run IS watching, so before any window decodes it has
+    // POSITIVELY seen no draw and no truncation. A window that draws or a
+    // callback that truncates flips the fact to `Some(true)` under the Kleene OR
+    // (for which `Some(false)` is the identity, so a greedy attempt's `Some(false)`
+    // leaves the sink `Some(false)` rather than nulling it). A run that decodes NO
+    // window at all (audio shorter than one window) therefore finalizes the honest
+    // `Some(false)`/`Some(false)` and is reproducible, where `unknown()` would have
+    // left it conservatively non-reproducible (codex round 8, F3).
+    let local_facts = Mutex::new(TaskFacts::observed_clean());
+    let facts_sink: &Mutex<TaskFacts> = self.facts_sink.unwrap_or(&local_facts);
 
     // :82-85 — decoder init timing covers only state allocation, matching
     // Swift's `decoderInitTime` scope exactly (the prefill call right below
@@ -366,11 +471,35 @@ where
           &mut state,
           &mut initial_prompt,
           &mut detected_language,
+          &mut observed_language,
+          facts_sink,
           options,
           &mut timings,
           window_index,
         )?;
         window_index += 1;
+
+        // THE reproducibility invariant, now unified. The RNG-draw AND early-stop
+        // facts were merged into `facts_sink` INSIDE `decode_with_fallback` just
+        // now, per attempt, from the sampler's own `GreedyTokenSampler::drew_from_rng`
+        // and the per-attempt early-stop latch — the honest facts of whether an
+        // RNG draw or a callback truncation actually happened, NOT inferred here
+        // from `decoding_result` (its temperature, or its accepted-attempt-only
+        // `early_stopped`). The draw inference was wrong twice over (F2, codex
+        // round 3) and the accepted-only early-stop read lost a REJECTED attempt's
+        // truncation that changed which attempt was selected (R6-F1, codex round
+        // 6). Merging both into the ladder also keeps them ahead of every step
+        // that can erase the evidence — the word-timestamp zero-length filter, the
+        // no-speech `continue`, the blank-audio drop, or (on the VAD path) a chunk
+        // that contributed nothing to the merge OR whose whole `run` errored and
+        // was dropped (the facts are captured before that error can propagate,
+        // into the sink the caller owns) — so a `Provenance` can never read the
+        // effective temperature back off the SURVIVING segments and declare the
+        // transcript reproducible. (Constructed, not hypothesized: `transcribe::tests`'
+        // `unseeded_sampling_survives_the_blank_audio_drop` scripts a window
+        // accepted at 0.2 that decodes to exactly `[BLANK_AUDIO]` and is then
+        // dropped, and `unseeded_draw_survives_an_errored_vad_chunk_drop` a
+        // chunk that draws then errors.)
 
         // :178-194.
         let windowing_start = Instant::now();
@@ -378,11 +507,17 @@ where
         let (new_seek, mut current_segments) = segment::find_seek_point_and_segments(
           &decoding_result,
           options,
-          all_segments.len(),
+          decoded_segment_span,
           seek,
           segment_size,
           self.tokenizer,
         )?;
+        // The count this window ALLOCATED, captured before the word-timestamp
+        // zero-length filter below can remove any — the `drop_blank_audio == true`
+        // advance (see the F1 advance after that filter, and the
+        // `decoded_segment_span` declaration). A silence-skipped window allocates
+        // nothing (`None`).
+        let allocated_this_window = current_segments.as_ref().map_or(0, Vec::len);
         seek = seek.max(new_seek);
 
         // :196-233 — optional word-timestamp re-anchoring, run against the
@@ -399,6 +534,7 @@ where
             &matrix.view(),
             self.tokenizer,
             language,
+            options.word_grouping(), // coremlit issue #14; default: fine-grained
             previous_seek,
             PREPEND_PUNCTUATION,
             APPEND_PUNCTUATION,
@@ -442,6 +578,37 @@ where
           current_segments = Some(filtered);
         }
 
+        // F1 (codex round 9): advance the decoded-ordinal base for the NEXT
+        // window's ids, now that the word-timestamp zero-length filter above has
+        // run. The two paths differ only when that filter removed something:
+        //
+        // - `drop_blank_audio == true` (the default) advances by ALL allocated
+        //   ordinals — the deliberate unique-id hardening that keeps every
+        //   survivor id unique and monotonic across a removed segment
+        //   ([0, 2, 3, 5] rather than a duplicate).
+        // - `drop_blank_audio == false` advances by the SURVIVOR count Swift
+        //   appends — `findSeekPointAndSegments(allSegmentsCount:)` reads the
+        //   running SURVIVOR total (`TranscribeTask.swift:181`), which filters
+        //   zero-length (`:217`) and appends only survivors (`:262`), so its ids
+        //   DUPLICATE across a removed segment ([0, 2, 2, 4]) — exact Swift
+        //   parity, the whole contract of clearing the option.
+        //
+        // Without word timestamps the filter never runs, so survivors ==
+        // allocated and the two coincide. A silence-skipped window (`None`)
+        // allocated nothing and advances by zero either way.
+        decoded_segment_span = decoded_segment_span.saturating_add(if options.drop_blank_audio() {
+          allocated_this_window
+        } else {
+          current_segments.as_ref().map_or(0, Vec::len)
+        });
+        // The allocation FACT advances by the PRE-FILTER count on BOTH paths
+        // (codex round 13, M3): it records ordinals ALLOCATED, not survivors, so
+        // the `false`-path survivor-counting id base above no longer under-reports
+        // the stored `decoded_span`. On the `true` path this equals the advance
+        // above; on the `false` path it exceeds it whenever the filter dropped a
+        // segment.
+        allocated_ordinals = allocated_ordinals.saturating_add(allocated_this_window);
+
         // :236-239 — hardened beyond Swift's bare `previous_seek + max`:
         // the sum saturates (a huge configured cap must not overflow),
         // and the cap floors at one sample of forward progress so the
@@ -479,6 +646,23 @@ where
     }
     timings.set_decoding_loop(decode_loop_start.elapsed().as_secs_f64());
 
+    let special_token_begin = self.tokenizer.special_tokens().special_token_begin();
+
+    // coremlit issue #14 — the blank-audio drop, as a POST-decode filter
+    // over the fully-assembled segments and nothing more: it runs after
+    // every window has decoded, so it cannot perturb decoding itself, and
+    // it is skipped outright when the caller opts out. Sequencing it
+    // BEFORE the text assembly below is what makes a dropped segment's
+    // tokens vanish from `TranscriptionResult::text` too, rather than
+    // leaving the marker stranded in the aggregate text with no segment
+    // behind it — pure silence collapses to a genuinely empty result.
+    // Speech decodes no blank segment, so this is a no-op on the golden
+    // parity inputs under either setting (see
+    // `DecodingOptions::drop_blank_audio`).
+    if options.drop_blank_audio() {
+      self.drop_blank_audio_segments(&mut all_segments, special_token_begin)?;
+    }
+
     // :298-305 — every segment's tokens, filtered to non-special ids,
     // decoded, and trimmed. `all_tokens` isn't tracked as its own running
     // accumulator (unlike Swift's `allTokens`): since nothing here diverges
@@ -486,7 +670,6 @@ where
     // `windowPostProcess` hook to make them differ), deriving the token
     // list from `all_segments` once at the end is equivalent and avoids a
     // redundant parallel Vec.
-    let special_token_begin = self.tokenizer.special_tokens().special_token_begin();
     let word_tokens: Vec<u32> = all_segments
       .iter()
       .flat_map(|segment| segment.tokens_slice().iter().copied())
@@ -497,12 +680,131 @@ where
 
     timings.set_full_pipeline(pipeline_start.elapsed().as_secs_f64());
 
-    Ok(TranscriptionResult::new(
-      trimmed_text,
-      all_segments,
-      detected_language.unwrap_or_else(|| DEFAULT_LANGUAGE_CODE.to_string()),
-      timings,
-    ))
+    Ok(
+      TranscriptionResult::new(
+        trimmed_text,
+        all_segments,
+        // Swift-compat DISPLAY fallback: `"en"` when the run detected
+        // nothing. Kept verbatim on `TranscriptionResult::language`.
+        detected_language
+          .clone()
+          .unwrap_or_else(|| DEFAULT_LANGUAGE_CODE.to_string()),
+        timings,
+      )
+      // The decode-time facts this run controlled, assembled into the ONE
+      // carried record (coremlit issue #14, codex round 6):
+      //
+      // - the RNG-draw and early-stop facts come from `facts_sink`, accumulated
+      //   across every attempt (rejected included) BEFORE any filter or error
+      //   could erase them — NOT derived from `all_segments`, which by this point
+      //   may have lost the very window that sampled or was truncated;
+      // - the genuine language observation is THIS task's own (the shared sink
+      //   carries it cross-chunk for the VAD merge instead), `None` for a
+      //   configured/fallback language or a zero-window run that witnessed
+      //   nothing — `Provenance::for_result` reads THIS, never the display `"en"`;
+      // - the worker coordinate is a single-run schedule `[offset]` (an explicit
+      //   KNOWN coordinate), and the decode's own id-ordinal span (dropped
+      //   segments included) is what the merge advances its running base by.
+      .with_task_facts({
+        let facts = facts_sink.lock().unwrap_or_else(PoisonError::into_inner);
+        // Carry the sink's ACCUMULATED draw/early-stop facts verbatim — each an
+        // explicit `Some`/`None`, never collapsed to a bool (F1, codex round 6
+        // post-consolidation) — and layer THIS task's own observation, worker
+        // coordinate, and id span on top. The per-attempt merge only ever sets
+        // draw/early-stop/observation on the sink, so its worker schedule and
+        // span are still `None`; the `with_*` calls below define them, and
+        // `with_observed_language` overrides the sink's cross-chunk observation
+        // with this task's own (the sink carries it cross-chunk for the VAD merge).
+        facts
+          .clone()
+          .with_observed_language(observed_language)
+          .with_worker(self.window_id_offset)
+          // A real decode task KNOWS the exact ordinal count it allocated
+          // (dropped segments included — the pre-filter allocation total, NOT the
+          // `false`-path survivor-counting id base; codex round 13, M3).
+          .with_decoded_span(SpanKnowledge::Exact(allocated_ordinals))
+      }),
+    )
+  }
+
+  /// Removes every blank-audio segment from `segments` in place, for
+  /// [`DecodingOptions::drop_blank_audio`] (coremlit issue #14). A segment
+  /// is blank-audio when its CLEAN text — its own tokens with the
+  /// special/timestamp ids (`>= special_token_begin`) stripped, decoded,
+  /// and Swift-whitespace-trimmed — is exactly
+  /// [`BLANK_AUDIO_MARKER`]. That projection is deliberately the
+  /// per-segment analogue of the aggregate text [`Self::run`] assembles
+  /// from the survivors, which is why the match is against the *clean*
+  /// text and not [`TranscriptionSegment::text`]: the latter still carries
+  /// its `<|startoftranscript|>`/timestamp tokens under the default
+  /// `skip_special_tokens == false`, so equality against the bare marker
+  /// would never hold there (see [`BLANK_AUDIO_MARKER`]'s own doc). It is
+  /// computed only to decide the drop and never reused to build the result
+  /// text — that stays the single aggregate decode of the surviving
+  /// segments' concatenated tokens, so per-segment isolation cannot change
+  /// the transcript's spacing.
+  ///
+  /// **Only the exact [`BLANK_AUDIO_MARKER`] literal is dropped.** The
+  /// other non-speech markers a Whisper model samples — `[APPLAUSE]`,
+  /// `[MUSIC]`, and friends; `[APPLAUSE]` shows up in this crate's own jfk
+  /// fixture decode — are left in the transcript, by design. This is a
+  /// blank-*audio* filter, not a general non-speech-annotation stripper:
+  /// silence carries no information a consumer could want, whereas
+  /// `[APPLAUSE]` is a genuine (if non-lexical) event, and deciding which
+  /// of those a product wants to keep is not this crate's call to make.
+  ///
+  /// **Survivors keep the ids they were decoded with, gaps and all** — a
+  /// drop REMOVES, it does not relabel. A segment id is
+  /// `all_segments_count + segments.len()`
+  /// ([`segment::find_seek_point_and_segments`]), i.e. an *ordinal decode
+  /// position*, not an index into this vec, and nothing in the crate looks
+  /// a segment up by it. Renumbering the survivors to a dense `0..N` would
+  /// only make the two settings harder to compare: id 1 would mean "the
+  /// blank" under `drop_blank_audio == false` and "the second speech
+  /// segment" under `true`, so a consumer diffing the two runs could not
+  /// correlate them. Left alone, the ids are stable across the toggle and
+  /// the hole is self-describing ("segment 1 was dropped"). There is also
+  /// no id contiguity to "restore" in the first place:
+  /// [`merge_transcription_results`](crate::result::merge_transcription_results)
+  /// re-ids every segment it merges to
+  /// `result_index + segment_index` — a faithfully-ported upstream quirk
+  /// that is neither dense nor unique (two results of two segments give
+  /// `[0, 1, 1, 2]`) — and it does so unconditionally, so on the VAD path
+  /// any renumbering here would be overwritten anyway.
+  ///
+  /// When nothing is blank (every speech input, the golden parity clips
+  /// included) this returns having touched nothing at all.
+  ///
+  /// # Errors
+  /// [`TranscribeError::Tokenizer`] if a segment's tokens fail to decode.
+  fn drop_blank_audio_segments(
+    &self,
+    segments: &mut Vec<TranscriptionSegment>,
+    special_token_begin: u32,
+  ) -> Result<(), TranscribeError> {
+    let mut blank = Vec::with_capacity(segments.len());
+    for segment in segments.iter() {
+      let clean_tokens: Vec<u32> = segment
+        .tokens_slice()
+        .iter()
+        .copied()
+        .filter(|&token| token < special_token_begin)
+        .collect();
+      let clean_text = self.tokenizer.decode(&clean_tokens, false)?;
+      blank.push(trim_swift_whitespaces(&clean_text) == BLANK_AUDIO_MARKER);
+    }
+
+    if !blank.contains(&true) {
+      return Ok(());
+    }
+
+    let survivors: Vec<TranscriptionSegment> = segments
+      .drain(..)
+      .zip(blank)
+      .filter_map(|(segment, is_blank)| (!is_blank).then_some(segment))
+      .collect();
+    *segments = survivors;
+    Ok(())
   }
 
   /// The per-window temperature-fallback ladder: retries decoding at
@@ -569,6 +871,8 @@ where
     state: &mut B::DecoderState,
     initial_prompt: &mut Vec<u32>,
     detected_language: &mut Option<String>,
+    observed_language: &mut Option<String>,
+    facts_sink: &Mutex<TaskFacts>,
     options: &DecodingOptions,
     timings: &mut TranscriptionTimings,
     window_index: u64,
@@ -624,6 +928,20 @@ where
       // partial result triggers an ordinary fallback must not truncate
       // the retry (phase-gate round-5 finding).
       let early_stop = AtomicBool::new(false);
+      // A FRESH per-attempt cell for the predicted-language OBSERVATION,
+      // recognized at token-sampling time inside `decode_text` and set BEFORE any
+      // later fallible step — exactly like `early_stop` and the sampler's own
+      // `drew_from_rng`, so a decode that recognizes `<|lang|>` then errors on a
+      // LATER step still surfaces the detection into the sink below (F2, codex
+      // round 6 post-consolidation).
+      let observed_language_token: Cell<Option<u32>> = Cell::new(None);
+      // Whether THIS attempt's automatic-language probe failed and was SWALLOWED
+      // (Swift's `try?` → nil). A failed probe silently alters the prompt/language
+      // this attempt decodes from — the same class of hidden, transcript-controlling
+      // error as a dropped VAD chunk — so it is recorded into the sink's
+      // `had_swallowed_error` below, forcing the run non-reproducible (codex round
+      // 11, M2). Stays `false` when no probe runs or the probe succeeds.
+      let mut language_probe_swallowed = false;
 
       // :340-365 — for a multilingual model with no explicit language and
       // detection requested, probe the language once, patch a per-attempt
@@ -653,15 +971,56 @@ where
           Ok(probe) => {
             window_options.set_language(probe.language().to_string());
             *detected_language = Some(probe.language().to_string());
+            // A probe that actually SAMPLED a language token IS a genuine
+            // detection (the observation), even when the sampled code fell back
+            // to the display default. But an all-masked probe -- a valid
+            // tokenizer with no `<|lang|>` entries makes `LanguageLogitsFilter`
+            // mask everything, so the sampler returns the degenerate token 0 at
+            // `-inf` and the probe's `language_probs` stays EMPTY -- sampled
+            // NOTHING; promoting its `"en"` DISPLAY default fabricates an
+            // observation the model never made, which first-wins merging then
+            // lets SUPPRESS a genuine later `"es"` (F3, codex round 14). Gate on
+            // the probe having a predicted-language entry, exactly the invariant
+            // `decode::decode_text` already holds for a decode's own prediction
+            // (`decode/tests.rs`). FIRST genuine observation wins (the round-3
+            // merge rule), so an earlier window's or attempt's observation is
+            // never overwritten by a later probe (F2, codex round 4).
+            if observed_language.is_none() && !probe.language_probs_slice().is_empty() {
+              *observed_language = Some(probe.language().to_string());
+            }
           }
-          Err(_) => *detected_language = None,
+          Err(_) => {
+            // DISPLAY: Swift's `try?` yields nil — last-write-wins.
+            *detected_language = None;
+            // OBSERVATION: a FAILED probe witnessed nothing, so it must NOT
+            // erase an earlier genuine observation (F2, codex round 4). Left
+            // untouched; the post-decode promotion below still records THIS
+            // attempt's own observation if its decode predicts a `<|lang|>`
+            // token.
+            // SWALLOWED ERROR: the probe's failure was hidden, yet it changed the
+            // prompt/language this attempt (and a retry) decodes from — a
+            // transcript-controlling error with no outcome fact until now. Mark it
+            // for the sink so `is_reproducible` reflects the hidden failure (codex
+            // round 11, M2).
+            language_probe_swallowed = true;
+          }
         }
         if options.use_prefill_prompt() {
           *initial_prompt = decode::prefill_tokens(&window_options, self.tokenizer, true);
         }
       }
 
-      let result = decode::decode_text(
+      // Start this attempt's swallowed-compression-error window clean. Every
+      // compression that controls this attempt's transcript/fallback — the
+      // decode's finalize and progress ratios, and any streaming early-stop
+      // callback's window ratio — funnels through `text::zlib_compressed_len` on
+      // this thread between here and the fact merge below, latching the flag on
+      // an erased OS error. Reading it there records `had_swallowed_error`
+      // honestly, so a swallowed error's `+inf` ratio that drove a fallback (a
+      // different transcript) can no longer read back as reproducible (coremlit
+      // issue #14, codex round 14).
+      crate::text::clear_compression_error_swallowed();
+      let outcome = decode::decode_text(
         self.backend,
         encoder_output,
         state,
@@ -671,8 +1030,56 @@ where
         self.tokenizer,
         timings,
         &early_stop,
+        &observed_language_token,
         window_callback,
-      )?;
+      );
+
+      // Merge THIS attempt's error-fragile facts into `facts_sink` BEFORE
+      // propagating any error (coremlit issue #14, codex rounds 4–6). Captured
+      // ahead of the `?` below so a VAD chunk that drew, was truncated, or
+      // observed a language then errored on a LATER step and was DROPPED still
+      // contributes those facts to the merged transcript. OR-ed across every
+      // attempt — REJECTED as well as retained — because a rejected attempt's
+      // unseeded draw still decides which attempt is kept (F2, codex round 3),
+      // and a rejected attempt's early stop still changed which attempt the
+      // ladder selected (R6-F1, codex round 6): reading only the accepted
+      // attempt's `DecodingResult::early_stopped` lost exactly that history.
+      // One `sampler` owns both the language probe's draw and every text token's,
+      // so its single `drew_from_rng` covers the whole attempt; a zero-iteration
+      // decode at a non-zero temperature never draws and correctly leaves it
+      // unset. `early_stop` is THIS attempt's own fresh latch (see its reset).
+      //
+      // The observation is first-wins (the merge law's rule) — a later attempt
+      // cannot overwrite an earlier genuine detection — and lives in the sink so a
+      // dropped chunk's detection still reaches the merged transcript. It is
+      // recovered here from `observed_language_token`, the cell `decode_text`
+      // recognized the predicted `<|lang|>` into at sampling time: a chunk that
+      // predicts `<|es|>` (no probe) then errors on a LATER step used to lose it,
+      // because its string was only built at successful finalization (F2, codex
+      // round 6 post-consolidation). The task-level `observed_language` (a probe's
+      // detection, or an earlier window's) takes precedence, preserving first-wins.
+      let attempt_observation = observed_language.clone().or_else(|| {
+        observed_language_token.get().and_then(|token| {
+          self
+            .tokenizer
+            .decode(&[token], false)
+            .ok()
+            .map(|decoded| crate::text::trim_special_token_chars(&decoded).to_string())
+        })
+      });
+      facts_sink
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .merge(
+          &TaskFacts::unknown()
+            .with_drew_from_rng(sampler.drew_from_rng())
+            .with_early_stopped(early_stop.load(Ordering::Relaxed))
+            .with_had_swallowed_error(
+              language_probe_swallowed || crate::text::take_compression_error_swallowed(),
+            )
+            .with_observed_language(attempt_observation),
+        );
+      let result = outcome?;
 
       // TranscribeTask.swift:198 — snapshot THIS attempt's alignment
       // weights now, before the fallback branch below can reset (and
@@ -686,9 +1093,26 @@ where
           .map(|view| view.to_matrix());
       }
 
-      // :375-378 — only used if language detection above never ran/set it.
+      // :375-378 — the DISPLAY language: promote the decode's language when no
+      // probe set it. Kept for ALL branches (configured / decoded token /
+      // fallback) so the display stays Swift-faithful.
       if detected_language.is_none() {
         *detected_language = Some(result.language().to_string());
+      }
+      // The GENUINE observation: the language the decode actually PREDICTED
+      // (`DecodingResult::observed_language`), promoted ONLY when it predicted a
+      // `<|lang|>` token — never the forced prefill `<|en|>` nor a
+      // configured/`"en"`-fallback (F2, codex round 4). Read the predicted CODE,
+      // NOT the display `language`: a forced `<|en|>` prefill is the display even
+      // when the model predicted a different language after it, so promoting the
+      // display would record `"en"` for a run that detected `"es"` (F1, codex
+      // round 5). FIRST genuine observation wins, so a later window/attempt
+      // cannot overwrite an earlier detection and a failed probe's cleared
+      // display does not drag the observation down with it.
+      if observed_language.is_none()
+        && let Some(predicted) = result.observed_language()
+      {
+        *observed_language = Some(predicted.to_string());
       }
 
       let is_first_token_log_prob_too_low = options
@@ -995,6 +1419,47 @@ impl<B> WhisperKit<B> {
   }
 }
 
+/// Assembles the record a VAD-merged transcript carries from the run's three
+/// fact sources: the shared `sink`, the run's derived `worker_schedule`, and the
+/// merged surviving result's `decoded_span`.
+///
+/// The `sink` is authoritative for the run's error-fragile facts (codex rounds
+/// 4–9; round 11 adds the swallowed-error): it accumulated the per-attempt draw,
+/// early-stop, language, and had-swallowed-error of EVERY chunk in ingestion order
+/// — dropped-because-errored ones included, captured before their error could
+/// propagate — so its Kleene-OR'd draw/early-stop/swallowed-error and its
+/// FIRST-observed language are already the whole run's. A chunk that observed `es`
+/// then errored and was dropped keeps `es` over a later surviving chunk's `fr`
+/// (F3); a genuine zero-survivor run keeps the sink's own observed-clean
+/// `Some(false)` draw/early-stop rather than the `unknown()` an empty merge folds
+/// to (F4); and a chunk whose error was DROPPED leaves `had_swallowed_error =
+/// Some(true)` in the sink, so the merged record is not reproducible (codex round
+/// 11, M2). Those facts are taken from the sink verbatim; the merged surviving
+/// result carries no draw/early-stop/language/swallowed-error the sink has not
+/// already seen.
+///
+/// The `worker_schedule` and `decoded_span` are set EXPLICITLY rather than merged
+/// from the surviving result (round 10 refactor): under the absorbing-`None`
+/// schedule/span laws (F2/F3) the sink's stripped `None`s would otherwise ABSORB
+/// the merged `Some`s away. The `worker_schedule` is the aggregate the caller
+/// folded over ALL chunks (a dropped chunk's coordinate never reached a result,
+/// so it taints the ordered schedule to `None`; zero chunks record the known-empty
+/// `Some([])`), and the `decoded_span` is the merged surviving result's own — the
+/// id-ordinal count its segments consumed, which drives a staged re-merge's ids —
+/// EXCEPT that once any chunk errored the caller passes an
+/// [`AtLeast`](SpanKnowledge::AtLeast) of the survivors' KNOWN sum, since the
+/// dropped chunk's contribution is unknown but the survivors' ordinals still
+/// lower-bound the run's total (codex round 11, M2; round 12).
+fn recover_vad_run_facts(
+  sink: TaskFacts,
+  worker_schedule: Option<Vec<usize>>,
+  decoded_span: SpanKnowledge,
+) -> TaskFacts {
+  sink
+    .with_worker_schedule(worker_schedule)
+    .with_decoded_span(decoded_span)
+}
+
 impl<B> WhisperKit<B>
 where
   B: InferenceBackend,
@@ -1018,9 +1483,10 @@ where
   /// [`TranscriptionResult`] return rather than Swift's redundant
   /// one-element-array wrapping, so by the time `transcribe`'s VAD branch
   /// has several chunk results to reconcile, folding them through
-  /// [`merge_transcription_results`] right here is what keeps this
-  /// method's own signature single-valued — pulling a call Swift leaves to
-  /// its CLI down into the library, not adding behavior Swift lacks.
+  /// [`merge_transcription_results_with_options`] right here is what keeps
+  /// this method's own signature single-valued — pulling a call Swift
+  /// leaves to its CLI down into the library, not adding behavior Swift
+  /// lacks.
   ///
   /// When `options.chunking_strategy()` is
   /// [`ChunkingStrategy::Vad`](crate::options::ChunkingStrategy::Vad)
@@ -1043,7 +1509,11 @@ where
   /// rethrows); every surviving chunk's segments and
   /// [`TranscriptionResult::seek_time`] are re-anchored to the original
   /// timeline by [`chunker::apply_result_seek_offset`] before all chunk
-  /// results are folded into one via [`merge_transcription_results`].
+  /// results are folded into one via
+  /// [`merge_transcription_results_with_options`] — passed this call's own
+  /// `options`, so a chunk the blank-audio drop emptied contributes no bare
+  /// separator to the joined text while still contributing its timings to
+  /// the merged sums (see that function's doc).
   /// Zero chunks (every clip shorter than the chunker's window padding —
   /// [`chunker::VadChunker::chunk_all`]'s own documented outcome), or
   /// every chunk erroring, therefore yields an `Ok` result with empty
@@ -1096,17 +1566,126 @@ where
       );
       let chunk_options = options.clone().with_clip_timestamps(Vec::new());
 
+      // One [`TaskFacts`] sink shared across every chunk: `TranscribeTask::run`
+      // merges each window's error-fragile facts — the RNG draw, the early-stop
+      // truncation, and the language observation — into it the instant an attempt
+      // settles, BEFORE any error can propagate (see `TranscribeTask::with_facts_sink`).
+      // A chunk whose task ERRORS is dropped below rather than merged, so those
+      // facts would otherwise vanish — leaving the merged transcript reading
+      // reproducible off the surviving greedy chunks while a re-run redraws that
+      // dropped chunk's unseeded sample and may land different surviving text, or
+      // reading `detected_language == None` for a run that plainly observed one,
+      // or claiming reproducibility for a callback-truncated run (coremlit issue
+      // #14, codex rounds 4–6 — the early-stop recovery is the round-6 R6-F1
+      // addition). Neither the worker schedule nor the id span rides this sink:
+      // the schedule is folded over EVERY chunk separately (below, so an errored
+      // chunk taints it to the adjudicated `None`, round 10 F2), and the id span
+      // is the merged surviving result's own.
+      //
+      // Seeded **observed-clean** like the per-run sink (codex round 8, F3): the
+      // VAD run as a whole is watching every chunk, so before any chunk draws it
+      // has seen no draw and no truncation. Under the Kleene OR `Some(false)` is
+      // the identity, so a greedy chunk's `Some(false)` leaves the sink
+      // `Some(false)`; a chunk that draws flips it to `Some(true)`, recovered into
+      // the merged record below even when that chunk errored and was dropped.
+      let facts_sink = Mutex::new(TaskFacts::observed_clean());
       let mut chunk_results = Vec::with_capacity(chunks.len());
+      // The worker schedule is folded over EVERY chunk through the fixed merge law
+      // (round 10, F2), seeded known-empty (`Some([])`): a surviving chunk
+      // contributes its known coordinate `[chunk_index]`, and a chunk that errored
+      // and was dropped contributes an UNKNOWN schedule (`None`) that — the
+      // schedule law being absorbing-`None` — taints the ordered aggregate to
+      // `None` rather than letting the survivors pass for the whole schedule. Zero
+      // chunks keep the `Some([])` seed: the run observed zero workers. This fact
+      // cannot ride the per-attempt `facts_sink` (that would duplicate a
+      // coordinate per fallback), so it is derived here where every chunk's fate
+      // is visible.
+      let mut schedule = TaskFacts::unknown().with_worker_schedule(Some(Vec::new()));
+      // Whether ANY chunk errored and was dropped. A dropped chunk hid an error
+      // that controlled the returned transcript (the sink records the swallow) and
+      // may have allocated id ordinals before erroring, so the run's decoded span
+      // becomes honestly unknown once it happens — the decoded-span analogue of the
+      // schedule's absorbing-`None` fold (codex round 11, M2).
+      let mut any_chunk_dropped = false;
       for (chunk_index, chunk) in chunks.iter().enumerate() {
         let outcome = TranscribeTask::new(&self.backend, &self.tokenizer)
           .with_window_id_offset(chunk_index)
+          .with_facts_sink(&facts_sink)
           .run(chunk.samples_slice(), &chunk_options);
-        if let Ok(mut result) = outcome {
+        let coordinate = if let Ok(mut result) = outcome {
           chunker::apply_result_seek_offset(&mut result, chunk.seek_offset());
           chunk_results.push(result);
-        }
+          TaskFacts::unknown().with_worker(chunk_index)
+        } else {
+          // An errored chunk is dropped here — its error-fragile draw/early-stop/
+          // language already reached the sink before the error, but its coordinate
+          // never reached a result, so its schedule contribution is unknown.
+          //
+          // Record the DROP itself as a swallowed error into the shared sink (codex
+          // round 11, M2): an observed `Some(true)` `had_swallowed_error` that
+          // forces `is_reproducible` false, since the hidden error controlled the
+          // transcript and a re-run of the same audio/options need not reproduce the
+          // drop. The observed-clean marker leaves the sink's draw/early-stop/
+          // language untouched (`Some(false)` is the Kleene-OR identity, and it
+          // carries no language) while OR-ing the swallow flag to `Some(true)`.
+          facts_sink
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .merge(&TaskFacts::observed_clean().with_had_swallowed_error(true));
+          any_chunk_dropped = true;
+          TaskFacts::unknown()
+        };
+        schedule.merge(&coordinate);
       }
-      return Ok(merge_transcription_results(&chunk_results));
+      // `_with_options`, not the plain merge: the blank-audio drop can
+      // empty a whole chunk (a wholly-silent one decodes to nothing but
+      // `[BLANK_AUDIO]`, which the filter then removes), and `chunk_all` is
+      // a CONTIGUOUS chunker — `start = end` marches across the clip and
+      // nothing is ever skipped — so a long enough silence really does
+      // become a chunk of its own. Swift's join would land it in the
+      // transcript as a bare separator. Passing the very `options` the
+      // chunks were decoded with is what keeps the merged text and the
+      // decode from disagreeing; every chunk is still merged, so no chunk's
+      // timings leave the sums.
+      let mut merged = merge_transcription_results_with_options(&chunk_results, options);
+      // Assemble the merged record's facts (round 10 refactor of codex rounds
+      // 4–9's VAD recovery; extended round 11): the shared sink is authoritative
+      // for the error-fragile draw/early-stop/language/swallowed-error it watched
+      // across EVERY chunk (dropped ones included — the drop itself is recorded as
+      // a swallow above), while the worker schedule folded over all chunks above
+      // and the run's decoded span are set explicitly — the sink's stripped
+      // schedule would otherwise absorb the merged coordinates, and its span seed
+      // is only the wholly-unknown default. The decoded span is the merged
+      // surviving result's own — an `Exact` sum of the surviving chunks' counts
+      // (or `Exact(0)` for a genuine zero-chunk run) — degraded to an `AtLeast` of
+      // the survivors' KNOWN sum once ANY chunk errored: the dropped chunk may
+      // have allocated ordinals before erroring, so the exact total is unknown,
+      // yet the survivors' ordinals still lower-bound the run's span. That lower
+      // bound is the round-12 replacement for the pre-round-12 `None`, which threw
+      // the survivors' known sum away (codex round 11, M2; round 12). See
+      // [`recover_vad_run_facts`].
+      let sink_facts = facts_sink
+        .into_inner()
+        .unwrap_or_else(PoisonError::into_inner);
+      let decoded_span = if any_chunk_dropped {
+        // The dropped chunk's contribution is unknown; the surviving merge's own
+        // lower bound is the run's known floor (round 12, replacing the pre-round-12
+        // `None` that threw the survivors' known sum away).
+        SpanKnowledge::AtLeast(merged.task_facts().decoded_span().lower_bound())
+      } else if chunk_results.is_empty() {
+        // A zero-chunk run allocated exactly nothing — a KNOWN-empty `Exact(0)`,
+        // distinct from the wholly-unknown value a run that cannot see would carry.
+        SpanKnowledge::Exact(0)
+      } else {
+        merged.task_facts().decoded_span()
+      };
+      let recovered = recover_vad_run_facts(
+        sink_facts,
+        schedule.worker_schedule().map(|s| s.to_vec()),
+        decoded_span,
+      );
+      *merged.task_facts_mut() = recovered;
+      return Ok(merged);
     }
 
     TranscribeTask::new(&self.backend, &self.tokenizer).run(audio, options)
