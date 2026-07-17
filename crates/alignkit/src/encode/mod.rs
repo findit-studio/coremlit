@@ -484,9 +484,9 @@ impl EncoderOptions {
   /// [`AlignError::CorruptEmissions`], which names the placement. Detection is
   /// input-dependent — the `log(0)` sentinel only appears once a class posterior
   /// falls under the fp16 floor, so pure silence or a low tone can pass even
-  /// here — but any real transcription reaches that regime. The guard is on the
-  /// emission VALUES ([`LOG_PROB_FLOOR`]), not on the placement, so a
-  /// numerically-clean non-default placement (`CpuAndGpu`) still works.
+  /// here. Real speech can expose it, measured on `jfk.wav`. The guard is on the
+  /// emission VALUES ([`LOG_PROB_FLOOR`]), not the input category or the placement,
+  /// so a numerically-clean non-default placement (`CpuAndGpu`) still works.
   #[inline(always)]
   pub const fn compute(&self) -> ComputeUnits {
     self.compute

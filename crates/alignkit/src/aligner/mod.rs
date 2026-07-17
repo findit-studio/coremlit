@@ -183,9 +183,10 @@ impl AlignerOptions {
   /// [`AlignError::CorruptEmissions`], which names this placement (see
   /// [`crate::encode::LOG_PROB_FLOOR`]). Detection is input-dependent — the
   /// `log(0)` sentinel only appears once a class posterior falls under the fp16
-  /// floor, so a pure-silence or low-tone chunk can pass even here — but any real
-  /// transcription reaches that regime. The guard is on the emission VALUES, not
-  /// on the placement, so a numerically-clean non-default placement — `CpuAndGpu`,
+  /// floor, so a pure-silence or low-tone chunk can pass even here. Real speech
+  /// can expose it, measured on `jfk.wav`. The guard is on the emission VALUES,
+  /// not the input category or the placement, so a numerically-clean non-default
+  /// placement — `CpuAndGpu`,
   /// measured `min = -30.02` — still works. There is simply nothing to buy:
   /// `CpuOnly` is also the fastest correct placement. Read
   /// [`DEFAULT_ENCODER_COMPUTE`]'s doc before changing this.
