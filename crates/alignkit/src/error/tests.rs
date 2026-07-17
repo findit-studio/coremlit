@@ -148,3 +148,35 @@ fn align_error_corrupt_emissions_names_the_placement_and_the_floor() {
     "must name the way out: {rendered}"
   );
 }
+
+#[test]
+fn align_error_unnormalized_emissions_names_the_frame_and_logsumexp() {
+  // Self-diagnosing, like CorruptEmissions: a caller must read the cause — a
+  // model artifact swapped for a raw-logit head — straight off the message, so
+  // the offending frame, its logsumexp, the tolerance and the placement all
+  // survive into Display.
+  let e = AlignError::UnnormalizedEmissions {
+    compute: coremlit::ComputeUnits::All,
+    row: 2_832,
+    logsumexp: 6.63,
+    tolerance: crate::encode::LOG_PROB_SUM_TOLERANCE,
+  };
+  let rendered = e.to_string();
+  assert!(rendered.contains("2832"), "must name the frame: {rendered}");
+  assert!(
+    rendered.contains("6.63"),
+    "must report the logsumexp: {rendered}"
+  );
+  assert!(
+    rendered.contains(&crate::encode::LOG_PROB_SUM_TOLERANCE.to_string()),
+    "must report the tolerance: {rendered}"
+  );
+  assert!(
+    rendered.contains("All"),
+    "must name the placement: {rendered}"
+  );
+  assert!(
+    rendered.contains("raw-logit"),
+    "must name the likely cause: {rendered}"
+  );
+}

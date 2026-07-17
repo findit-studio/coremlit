@@ -69,24 +69,42 @@
 //! [`Emissions::from_logits`] (asry's raw-logit door, which applies
 //! `log_softmax_with_finite_guard`) would be a numerical no-op.
 //!
-//! The real reason is that `from_log_probs` doubles as a **contract check on
-//! the model artifact**. Its `O(T·V)` value-domain scan (every element finite
-//! ∧ `<= 0`) is an assertion that the tensor really is log-probs. Should a
-//! future model revision ship a raw-logit CTC head — entirely plausible,
-//! since that is the *standard* wav2vec2 export, and asry's own ONNX model
-//! does exactly that (`asry/src/runner/aligner/algorithm/encode.rs` takes the
-//! `from_logits` door) — the scan sees positive maxima and fails **loudly**
-//! with [`AlignError::Alignment`] (`EmissionsError::Value`). `from_logits`
-//! would instead **silently re-normalize** the garbage into a plausible
-//! log-prob domain and align on it forever. That is precisely the bug class
-//! this seam exists to kill: the scan is the guard, so the door that runs it
-//! is the door to take.
+//! The real reason is that this door **refuses to paper over a model-artifact
+//! swap**. [`Emissions::from_logits`] would apply its own
+//! `log_softmax_with_finite_guard` and **re-normalize whatever it is handed** —
+//! genuine log-probs (a no-op, per above) *or* raw logits — into a plausible
+//! log-prob domain, then align on the result forever. Taking `from_log_probs`
+//! consumes the tensor **as-is**, so a future model revision that ships a
+//! raw-logit CTC head — entirely plausible, since that is the *standard*
+//! wav2vec2 export, and asry's own ONNX model does exactly that
+//! (`asry/src/runner/aligner/algorithm/encode.rs` takes the `from_logits` door)
+//! — is caught rather than absorbed.
+//!
+//! Caught by what, exactly, is the subtle part, and the earlier revisions of
+//! this doc got it wrong. `from_log_probs`'s own `O(T·V)` scan (every element
+//! finite ∧ `<= 0`) is **necessary but not sufficient**: it rejects a raw-logit
+//! head only when some logit is *positive*. Logits are defined only up to an
+//! additive per-frame constant, so a raw-logit row shifted wholly into, say,
+//! `[-20, -10]` — or the degenerate all-zeros row, `exp(0) = 1` on every class —
+//! is finite and `<= 0` on every cell and sails straight through that scan while
+//! being nothing like a probability distribution. What actually pins the tensor
+//! to the log-probability domain is the **per-frame logsumexp guard**
+//! (`check_log_prob_normalization`, [`LOG_PROB_SUM_TOLERANCE`]): a genuine CTC
+//! log-prob row satisfies `logsumexp(row) = ln Σ exp(log p_j) = ln Σ p_j =
+//! ln 1 = 0` by construction, while an un-normalized row is off by whole units
+//! (the all-zeros row by `ln 29 ≈ 3.37`, a `[-20, -10]` shifted row by `>= 6.6`).
+//! That guard, the `<= 0` scan, and the [`LOG_PROB_FLOOR`] floor below are
+//! together what make "these really are log-probs" a *checked* contract rather
+//! than a hope — for any same-contract artifact loaded through the public API,
+//! not merely the one reviewed here. See "The normalization guard" below.
 //!
 //! For the same reason the raw tensor is passed through **unclamped**. The
 //! graph's `softmax` output is in `[0, 1]` by construction, so its `log` is
 //! `<= 0` *guaranteed by the graph* (measured max is exactly `0.0` on every
 //! compute placement). An unbounded `.min(0.0)` would be actively dangerous —
-//! it is exactly what would mask a raw-logit model from the scan above. If a
+//! it is exactly what would mask a raw-logit head's *positive maxima* from the
+//! `<= 0` scan above (the logsumexp guard would still catch a shifted-negative
+//! head, but suppressing any model-swap signal is the wrong direction). If a
 //! clamp is ever needed here, it must be **bounded** to a pinned slack, never
 //! open-ended.
 //!
@@ -107,6 +125,28 @@
 //! any cell below [`LOG_PROB_FLOOR`] is [`AlignError::CorruptEmissions`], a
 //! typed error that NAMES the compute placement the encoder was loaded with.
 //! Loud, and self-diagnosing.
+//!
+//! # The normalization guard: per-frame logsumexp
+//!
+//! The floor and `from_log_probs`'s `<= 0` scan bound each *cell*; neither
+//! checks that a frame's 29 log-probs describe a *distribution*.
+//! `check_log_prob_normalization` does, and it is what makes the "The log-prob
+//! door" section's model-swap claim actually true. For every truncated frame it
+//! recomputes `logsumexp` over the vocab axis (in `f64`, so the bound reflects
+//! the model's own fp16 deviation, not this crate's summation error) and rejects
+//! the matrix with [`AlignError::UnnormalizedEmissions`] — naming the worst frame
+//! and its `logsumexp` — the moment any frame's `|logsumexp|` exceeds
+//! [`LOG_PROB_SUM_TOLERANCE`]. A genuine CTC log-prob frame sums to 1 in
+//! probability space, so its `logsumexp` is `0`; a raw-logit frame (even one
+//! shifted wholly `<= 0`), or an all-zeros frame, is off by whole units. This is
+//! the check that closes the bypass the `<= 0` scan leaves open, for *any*
+//! same-contract artifact a caller loads through the public API — not only the
+//! reviewed one, whose normalization
+//! `tests/model_io.rs::emissions_are_log_probs_not_raw_logits` also pins.
+//!
+//! Cost: one `f64` exp/sum/log over `[<= 2999, 29]` per window — ~87k operations
+//! against a 0.74 s CoreML predict. Not measurable
+//! ([`LOG_PROB_SUM_TOLERANCE`]'s "Cost").
 
 use core::num::NonZeroUsize;
 use std::{borrow::Cow, path::Path};
@@ -311,6 +351,90 @@ const _: () = {
   assert!(
     LOG_PROB_FLOOR > -45_440.0,
     "LOG_PROB_FLOOR would no longer reject the fp16 log(0) sentinel (measured -45440)"
+  );
+};
+
+/// Largest per-frame `|logsumexp|` [`Encoder::emissions`] accepts as normalized
+/// log-probabilities: **`2e-2`**. A frame whose `logsumexp` over the vocab axis
+/// exceeds it in magnitude is not a probability distribution — a genuine CTC
+/// log-prob frame satisfies `logsumexp = ln Σ exp(log p_j) = ln Σ p_j = ln 1 = 0`
+/// by construction — and [`Encoder::emissions`] rejects the whole matrix with
+/// [`AlignError::UnnormalizedEmissions`] rather than align on it.
+///
+/// # Why a normalization check, on top of the floor and the `<= 0` scan
+///
+/// It is the half of the log-prob contract [`Emissions::from_log_probs`]'s
+/// `finite ∧ <= 0` scan cannot cover — the model-swap guard the module doc's
+/// "The log-prob door" advertises but that scan alone does not deliver. That
+/// scan rejects a raw-logit CTC head only when some logit is *positive*; logits
+/// are defined only up to an additive per-frame constant, so a raw-logit frame
+/// shifted wholly into `[-20, -10]` — or the degenerate all-zeros frame,
+/// `exp(0) = 1` on every class — is finite and `<= 0` on every cell yet carries
+/// no distribution. The `logsumexp` identity is the property that tells the two
+/// apart. See the module doc's "The normalization guard: per-frame logsumexp".
+///
+/// # Why `2e-2`
+///
+/// It separates the measured fp16 jitter of a *real* log-prob artifact from the
+/// whole-unit deviation of an un-normalized one, with headroom on both sides.
+/// Worst per-frame `|logsumexp|` MEASURED on this model (f64 accumulation — the
+/// real runtime path), across both gate clips and both numerically-clean gate
+/// placements:
+///
+/// | placement | clip | worst `|logsumexp|` |
+/// |---|---|---|
+/// | `CpuOnly` (the default) | `ted_60.wav` (full 960 k window) | **5.2485e-3** |
+/// | `CpuOnly` | `jfk.wav` | 4.7453e-3 |
+/// | `CpuAndGpu` | `ted_60.wav` | 2.578e-7 |
+/// | `CpuAndGpu` | `jfk.wav` | 2.406e-7 |
+///
+/// `2e-2` sits ~3.8× above the worst measured jitter (`5.2485e-3` — the fp16
+/// `softmax`→`log` accumulation error over 29 classes on the `CpuOnly` default),
+/// loose enough that legitimate emissions from a same-contract artifact are never
+/// false-rejected, and **more than two orders of magnitude below** the smallest
+/// deviation it must reject: an all-zeros frame's `ln 29 ≈ 3.367` (168×) and a
+/// `[-20, -10]` shifted raw-logit frame's `|logsumexp| >= 6.6` (>330×). Nothing
+/// this model produces lands between `5.2e-3` and `3.37`.
+///
+/// It is deliberately *looser* than `tests/model_io.rs`'s `1e-2` logsumexp
+/// tolerance. That is a **tripwire** on the one reviewed artifact — tight, to
+/// catch drift in a known quantity; this is a **fence** for any artifact a caller
+/// loads through the public API — lenient enough not to false-reject an
+/// unknown-but-legitimate one, still two orders below any un-normalized tensor.
+///
+/// # Cost
+///
+/// One `f64` exp/sum/log pass over `<= 2,999 × 29 = 86,971` cells against a
+/// **0.74 s** CoreML predict. Not measurable.
+///
+/// Pinned by `tests::check_log_prob_normalization_*` (hermetic: a `[-20, -10]`
+/// shifted-logit matrix and an all-zeros frame rejected, real log-probs accepted)
+/// and `tests::emissions_pass_the_normalization_guard_on_real_speech` (the live
+/// model, both clips, both numerically-clean placements).
+pub const LOG_PROB_SUM_TOLERANCE: f64 = 2e-2;
+
+/// [`LOG_PROB_SUM_TOLERANCE`]'s separation property, asserted at **compile
+/// time**: it must sit strictly above the worst legitimate per-frame
+/// `|logsumexp|` this model produces (`5.2485e-3`, `CpuOnly` `ted_60`) and at
+/// least an order of magnitude below the smallest un-normalized deviation the
+/// guard must reject (an all-zeros frame's `ln 29 ≈ 3.367`). Tuning it into
+/// either danger zone is then a BUILD failure, not a test failure — below the
+/// jitter it false-rejects real audio, and up toward `ln 29` it stops separating
+/// a shifted raw-logit head from a real log-prob one, the exact bypass this guard
+/// exists to close.
+const _: () = {
+  assert!(
+    LOG_PROB_SUM_TOLERANCE > 5.248_517e-3,
+    "LOG_PROB_SUM_TOLERANCE would reject this model's own measured fp16 logsumexp jitter (worst \
+     |logsumexp| 5.2485e-3, CpuOnly ted_60)"
+  );
+  assert!(
+    // 0.34 ≈ ln(29)/10: an order of magnitude below an all-zeros frame's own
+    // ln(29) ≈ 3.367 deviation, so the constant cannot be tuned up toward the
+    // reject region.
+    LOG_PROB_SUM_TOLERANCE < 0.34,
+    "LOG_PROB_SUM_TOLERANCE would drift within one order of magnitude of an all-zeros \
+     (unnormalized) frame's logsumexp (ln 29 ≈ 3.367)"
   );
 };
 
@@ -533,6 +657,69 @@ fn check_log_prob_floor(data: &[f32], compute: ComputeUnits) -> Result<(), Align
       min,
       cells,
       total: data.len(),
+    });
+  }
+  Ok(())
+}
+
+/// Rejects an emission matrix whose frames are not **normalized**
+/// log-probabilities: a genuine CTC log-prob frame satisfies
+/// `logsumexp(frame) = ln Σ exp(log p_j) = ln Σ p_j = ln 1 = 0` by construction,
+/// so a frame whose `|logsumexp|` over the vocab axis exceeds
+/// [`LOG_PROB_SUM_TOLERANCE`] carries raw logits — or another un-normalized
+/// distribution — not log-probabilities. Reports the single worst frame (largest
+/// `|logsumexp|`) in [`AlignError::UnnormalizedEmissions`], with `compute` for
+/// the placement, so the failure is self-diagnosing. Hermetic (no loaded model),
+/// like [`check_log_prob_floor`].
+///
+/// This is the half of the contract [`Emissions::from_log_probs`]'s
+/// `finite ∧ <= 0` scan cannot cover: a raw-logit frame shifted wholly into
+/// `[-20, -10]`, or the all-zeros frame, is finite and `<= 0` on every cell yet
+/// is no distribution at all — the model-swap the module doc's "The log-prob
+/// door" warns of. See the module doc's "The normalization guard".
+///
+/// `logsumexp` is accumulated in `f64` so the bound reflects the MODEL's
+/// deviation rather than this scan's own summation error, matching how
+/// [`LOG_PROB_SUM_TOLERANCE`] was measured. A frame with a non-finite maximum
+/// (all `-inf`, or a `+inf`/`NaN` cell) is skipped here and left to
+/// [`Emissions::from_log_probs`]'s finite scan on the very next line of
+/// [`Encoder::emissions`] — exactly the division of labour
+/// [`check_log_prob_floor`] keeps with `NaN`; recomputing `logsumexp` over it
+/// would only manufacture a `NaN` bound. An empty matrix (`real_samples == 0` →
+/// zero frames) has no frame to check and is accepted.
+fn check_log_prob_normalization(data: &[f32], compute: ComputeUnits) -> Result<(), AlignError> {
+  debug_assert!(
+    data.len().is_multiple_of(crate::vocab::VOCAB_SIZE),
+    "emissions buffer is frames × VOCAB_SIZE by construction"
+  );
+  let mut worst_row = 0usize;
+  let mut worst_abs = 0.0f64;
+  let mut worst_lse = 0.0f64;
+  for (row, frame) in data
+    .as_chunks::<{ crate::vocab::VOCAB_SIZE }>()
+    .0
+    .iter()
+    .enumerate()
+  {
+    let max = frame.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+      continue;
+    }
+    let max = f64::from(max);
+    let sum: f64 = frame.iter().map(|&x| (f64::from(x) - max).exp()).sum();
+    let lse = max + sum.ln();
+    if lse.abs() > worst_abs {
+      worst_abs = lse.abs();
+      worst_lse = lse;
+      worst_row = row;
+    }
+  }
+  if worst_abs > LOG_PROB_SUM_TOLERANCE {
+    return Err(AlignError::UnnormalizedEmissions {
+      compute,
+      row: worst_row,
+      logsumexp: worst_lse,
+      tolerance: LOG_PROB_SUM_TOLERANCE,
     });
   }
   Ok(())
@@ -846,14 +1033,19 @@ impl Encoder {
   /// which is a subtler argument than it looks.
   ///
   /// That door's scan bounds the emissions from above and rules out non-finite
-  /// values; it does not bound them from below. [`LOG_PROB_FLOOR`] does, and
-  /// this method checks it first: an ANE-corrupted matrix (finite, negative,
-  /// and utterly wrong) is [`AlignError::CorruptEmissions`] here rather than a
-  /// plausible but silently wrong alignment (the pre-truncation-fix ANE
+  /// values; it does not bound them from below, nor check that each frame is a
+  /// normalized distribution. Two guards run first and close both gaps.
+  /// [`LOG_PROB_FLOOR`] bounds from below: an ANE-corrupted matrix (finite,
+  /// negative, and utterly wrong) is [`AlignError::CorruptEmissions`] here rather
+  /// than a plausible but silently wrong alignment (the pre-truncation-fix ANE
   /// measurement put `ask` 881.6 ms early — see [`DEFAULT_ENCODER_COMPUTE`]).
-  /// Unlike the crate-private `emissions_raw`,
-  /// which hands back the tensor unchecked, **this is the guarded door** — and
-  /// the only one [`crate::aligner::Aligner`] uses.
+  /// `check_log_prob_normalization` then checks each frame's `logsumexp` is
+  /// `≈ 0` against [`LOG_PROB_SUM_TOLERANCE`]: a raw-logit model swap (shifted
+  /// wholly `<= 0`, so past the floor and the `<= 0` scan alike) is
+  /// [`AlignError::UnnormalizedEmissions`] rather than silently re-normalized
+  /// garbage. Unlike the crate-private `emissions_raw`, which hands back the
+  /// tensor unchecked, **this is the guarded door** — and the only one
+  /// [`crate::aligner::Aligner`] uses.
   ///
   /// `input` is an [`EncoderInput`]: the buffer the model runs on, bound to the
   /// count of real (pre-pad) audio samples that drives the truncation. A
@@ -958,7 +1150,9 @@ impl Encoder {
   /// failure, including a prediction whose runtime output set omits
   /// `emissions` entirely. [`AlignError::CorruptEmissions`] if any cell is
   /// below [`LOG_PROB_FLOOR`] — the fp16 `log(0)` sentinel an ANE placement
-  /// produces on this model artifact. [`AlignError::Alignment`] (an
+  /// produces on this model artifact. [`AlignError::UnnormalizedEmissions`] if a
+  /// frame's `logsumexp` exceeds [`LOG_PROB_SUM_TOLERANCE`] — a raw-logit model
+  /// swap the floor and the `<= 0` scan both miss. [`AlignError::Alignment`] (an
   /// `asry::emissions::EmissionsError`) if the model output leaves the
   /// log-probability domain the other way: `from_log_probs` runs an `O(T·V)`
   /// finite ∧ `<= 0` scan, so a non-finite or positive value is a real error
@@ -988,6 +1182,7 @@ impl Encoder {
   pub fn emissions(&self, input: EncoderInput<'_>) -> Result<Emissions, AlignError> {
     let RawEmissions { frames, data } = self.emissions_raw(input)?;
     check_log_prob_floor(&data, self.compute)?;
+    check_log_prob_normalization(&data, self.compute)?;
     Ok(Emissions::from_log_probs(frames, VOCAB_SIZE_NZ, data)?)
   }
 }
