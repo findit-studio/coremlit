@@ -2407,16 +2407,67 @@ pub fn merge_transcription_results(results: &[TranscriptionResult]) -> Transcrip
 ///
 /// Only the *join* skips empties. Segment concatenation and every timing
 /// reduction run over **all** of `results` either way, so the merged
-/// segments and every timing field — the summed
+/// segments' text and words, and every timing field — the summed
 /// [`input_audio_seconds`](TranscriptionTimings::input_audio_seconds) and
 /// [`audio_processing`](TranscriptionTimings::audio_processing), the
 /// [`real_time_factor`](TranscriptionTimings::real_time_factor) derived
 /// from them, all of it — are byte-identical to
 /// [`merge_transcription_results`]'s on the same input, whichever way the
-/// option is set. **Only [`TranscriptionResult::text`] can differ.**
-/// Dropping an emptied result from the merge *input* instead would take its
-/// metrics out with it, quietly corrupting the sums (and the RTF) to fix a
-/// spacing bug.
+/// option is set. Dropping an emptied result from the merge *input* instead
+/// would take its metrics out with it, quietly corrupting the sums (and the
+/// RTF) to fix a spacing bug.
+///
+/// The option is **not** confined to [`TranscriptionResult::text`], though.
+/// It also selects the segment **id mapping**: a running injective base when
+/// dropping, Swift's `result_index + segment_index` when not (see the section
+/// below). So the merged segments' ids — but nothing else about them — can
+/// differ between the two settings even when every text is non-empty. (The
+/// [`confirmed_words`](merge_transcription_results_with_words) door notes the
+/// same, and depends on it.)
+///
+/// # The segment id mapping depends on the option, too
+///
+/// With the drop ON (the default), each chunk's survivors are re-`id`'d onto a
+/// running base that advances by the chunk's decoded id span — injective across
+/// chunks, each chunk's local gaps preserved. With it OFF, the ids are exactly
+/// Swift's `result_index + segment_index`, which **duplicates** ids across a
+/// multi-segment chunk (pinned parity). Two chunks with local ids `[0, 2]` and
+/// `[0, 1]` therefore merge to `[0, 2, 3, 4]` dropped but `[0, 1, 1, 2]` not:
+///
+/// ```
+/// use whisperkit::options::DecodingOptions;
+/// use whisperkit::result::{
+///   TranscriptionResult, TranscriptionSegment, TranscriptionTimings,
+///   merge_transcription_results_with_options,
+/// };
+///
+/// // Two chunks whose survivors sit at local ids [0, 2] and [0, 1].
+/// let chunk = |ids: &[usize]| {
+///   let segments: Vec<TranscriptionSegment> = ids
+///     .iter()
+///     .map(|&id| {
+///       let mut s = TranscriptionSegment::new();
+///       s.set_id(id).set_text(" w");
+///       s
+///     })
+///     .collect();
+///   TranscriptionResult::new(" w w", segments, "en", TranscriptionTimings::new())
+/// };
+/// let results = [chunk(&[0, 2]), chunk(&[0, 1])];
+/// let ids =
+///   |r: &TranscriptionResult| r.segments_slice().iter().map(|s| s.id()).collect::<Vec<_>>();
+///
+/// // Dropping ON (the default): a running injective base -> [0, 2, 3, 4].
+/// let dropped = merge_transcription_results_with_options(&results, &DecodingOptions::new());
+/// assert_eq!(ids(&dropped), [0, 2, 3, 4]);
+///
+/// // Dropping OFF: Swift's result_index + segment_index -> [0, 1, 1, 2] (ids collide).
+/// let swift = merge_transcription_results_with_options(
+///   &results,
+///   &DecodingOptions::new().maybe_drop_blank_audio(false),
+/// );
+/// assert_eq!(ids(&swift), [0, 1, 1, 2]);
+/// ```
 ///
 /// # Panics
 ///
@@ -2480,13 +2531,16 @@ fn effective_decoded_span(result: &TranscriptionResult) -> Option<usize> {
 /// The single merge implementation behind [`merge_transcription_results`]
 /// and [`merge_transcription_results_with_options`].
 ///
-/// `skip_empty_texts` governs the **text join and nothing else**: every
-/// result participates in the segment concatenation and in every timing
+/// `skip_empty_texts` governs the **text join and the segment id mapping**:
+/// every result participates in the segment concatenation and in every timing
 /// reduction regardless of it, so the two entry points can differ only in
-/// [`TranscriptionResult::text`]. Keeping that promise structural — one
-/// body, one `filter`, reached through both doors — is the point of the
-/// split: the alternative (a second join written out at the call site that
-/// happens to know the option) is exactly how the two drifted apart before.
+/// [`TranscriptionResult::text`] and in the segments' **ids** (a running
+/// injective base when dropping, Swift's `result_index + segment_index` when
+/// not — see [`merge_transcription_results_with_options`]'s own doc). Keeping
+/// that promise structural — one body, one `filter`, reached through both
+/// doors — is the point of the split: the alternative (a second join written
+/// out at the call site that happens to know the option) is exactly how the
+/// two drifted apart before.
 fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> TranscriptionResult {
   let text = results
     .iter()
