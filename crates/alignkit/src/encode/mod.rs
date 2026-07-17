@@ -112,7 +112,7 @@ use core::num::NonZeroUsize;
 use std::{borrow::Cow, path::Path};
 
 use asry::emissions::{Emissions, PreparedChunk};
-use coremlit::{ComputeUnits, DataType, Model, MultiArray};
+use coremlit::{ComputeUnits, DataType, FeatureInfo, Model, MultiArray};
 
 use crate::error::{AlignError, AlignerError};
 
@@ -403,6 +403,21 @@ fn check_waveform_contract(shape: &[usize], dtype: Option<DataType>) -> Result<(
   Ok(())
 }
 
+/// The `emissions` output contract this fixed graph declares, formatted for
+/// [`AlignerError::ContractMismatch`]'s `expected` field (`[1, 2999, 29]
+/// float32`). The single place that string is built: both branches that report
+/// a bad `emissions` output — the missing-output branch of
+/// [`Encoder::from_file_with`] (via [`emissions_output_or_mismatch`]) and the
+/// present-but-wrong-shape branch ([`check_emissions_contract`]) — draw from
+/// here, so they name one contract and a second hand-written literal cannot
+/// drift out of sync with the check the way it once did.
+fn expected_emissions_contract() -> String {
+  format!(
+    "[1, {EXPECTED_OUTPUT_FRAMES}, {}] float32",
+    crate::vocab::VOCAB_SIZE
+  )
+}
+
 /// Validates a loaded model's `emissions` output against the pinned
 /// contract, in isolation (see [`check_waveform_contract`]'s doc for why
 /// this is hermetic rather than model-gated). Returns the frame count
@@ -430,14 +445,30 @@ fn check_emissions_contract(
   if !shape_ok || dtype != Some(DataType::F32) {
     return Err(AlignerError::ContractMismatch {
       feature: names::EMISSIONS,
-      expected: format!(
-        "[1, {EXPECTED_OUTPUT_FRAMES}, {}] float32",
-        crate::vocab::VOCAB_SIZE
-      ),
+      expected: expected_emissions_contract(),
       actual: describe(shape, dtype),
     });
   }
   Ok(shape[1])
+}
+
+/// Resolves the introspected `emissions` output feature, turning its ABSENCE
+/// into the same [`AlignerError::ContractMismatch`] a present-but-wrong output
+/// draws from [`check_emissions_contract`]: both carry one `expected` string,
+/// [`expected_emissions_contract`], so the missing-output diagnostic names the
+/// exact `[1, 2999, 29]` target a caller must supply rather than a looser shape
+/// the next load would reject. Factored out of [`Encoder::from_file_with`] so
+/// this branch — which no loaded-model test can reach, `Models/alignkit/`
+/// holding exactly one, always-present-output artifact — stays covered
+/// hermetically by passing `None`.
+fn emissions_output_or_mismatch(
+  output: Option<&FeatureInfo>,
+) -> Result<&FeatureInfo, AlignerError> {
+  output.ok_or_else(|| AlignerError::ContractMismatch {
+    feature: names::EMISSIONS,
+    expected: expected_emissions_contract(),
+    actual: "missing".to_string(),
+  })
 }
 
 /// Rejects an emission matrix that has left the log-probability domain from
@@ -697,14 +728,7 @@ impl Encoder {
         })?;
     check_waveform_contract(waveform.shape(), waveform.data_type())?;
 
-    let emissions =
-      description
-        .output(names::EMISSIONS)
-        .ok_or_else(|| AlignerError::ContractMismatch {
-          feature: names::EMISSIONS,
-          expected: format!("[1, >=1, {}] float32", crate::vocab::VOCAB_SIZE),
-          actual: "missing".to_string(),
-        })?;
+    let emissions = emissions_output_or_mismatch(description.output(names::EMISSIONS))?;
     let frames = check_emissions_contract(emissions.shape(), emissions.data_type())?;
 
     Ok(Self {

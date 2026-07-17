@@ -392,6 +392,32 @@ fn check_emissions_contract_rejects_an_overlong_frame_count() {
   ));
 }
 
+#[test]
+fn missing_emissions_output_diagnostic_names_the_exact_contract() {
+  // The MISSING-`emissions`-output branch of `Encoder::from_file_with`
+  // (`emissions_output_or_mismatch`) must name the SAME `[1, 2999, 29]` contract
+  // the shape check reports — not the stale `[1, >=1, 29]` this diagnostic once
+  // hand-duplicated, which would tell a developer a `[1, 3000, 29]` export is
+  // acceptable, only for the next load to reject it. `check_emissions_contract`
+  // is only reached with a present output, so the tests above cannot cover this
+  // separate branch; `None` drives it hermetically (no loaded model — the one
+  // artifact in `Models/alignkit/` always has the output). Reverting
+  // `expected_emissions_contract` to a `>=1` literal fails the `expected`
+  // assertion below.
+  match emissions_output_or_mismatch(None) {
+    Err(AlignerError::ContractMismatch {
+      feature,
+      expected,
+      actual,
+    }) => {
+      assert_eq!(feature, "emissions");
+      assert_eq!(expected, "[1, 2999, 29] float32");
+      assert_eq!(actual, "missing");
+    }
+    other => panic!("expected a ContractMismatch, got {other:?}"),
+  }
+}
+
 // ---------------------------------------------------------------------
 // check_log_prob_floor: hermetic coverage of the fp16 `log(0)` sentinel
 // guard. The model-gated half (`emissions_reject_an_ane_corrupted_matrix`)
