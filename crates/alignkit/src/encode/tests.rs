@@ -697,6 +697,55 @@ fn check_log_prob_normalization_thresholds_on_the_tolerance() {
 }
 
 // ---------------------------------------------------------------------
+// check_emission_value_domain: the floor-then-normalization guard sequence
+// `Encoder::emissions` actually calls. Driving it here binds BOTH predicates to
+// the production door in one call — in particular the normalization half, which
+// (unlike the floor half, bound end-to-end by the model-gated
+// `emissions_reject_an_ane_corrupted_matrix`) has no real-model fixture. If the
+// door's normalization step were ever handed `&[]` in place of its real tensor,
+// an un-normalized matrix would sail through unnoticed; because this test feeds
+// the door's own guard the same un-normalized tensors the door would, that
+// regression is red right here.
+// ---------------------------------------------------------------------
+
+#[test]
+fn check_emission_value_domain_binds_the_guard_sequence_to_the_door() {
+  // A shifted-raw-logit matrix — every cell finite, <= 0, and above
+  // LOG_PROB_FLOOR, so the floor and `from_log_probs`'s <= 0 scan both miss it
+  // and only the normalization step in the sequence rejects it.
+  let mut shifted = Vec::with_capacity(4 * crate::vocab::VOCAB_SIZE);
+  for _ in 0..4 {
+    for j in 0..crate::vocab::VOCAB_SIZE {
+      shifted.push(-10.0 - (j as f32) * (10.0 / (crate::vocab::VOCAB_SIZE as f32 - 1.0)));
+    }
+  }
+  assert!(
+    matches!(
+      check_emission_value_domain(&shifted, ComputeUnits::CpuOnly),
+      Err(AlignError::UnnormalizedEmissions { .. })
+    ),
+    "the door guard must reject a shifted-raw-logit tensor as un-normalized"
+  );
+
+  // The all-zeros frame: exp(0) = 1 on every class, logsumexp = ln 29, again
+  // above the floor and <= 0 — only normalization catches it.
+  assert!(
+    matches!(
+      check_emission_value_domain(&uniform_frame(0.0), ComputeUnits::CpuOnly),
+      Err(AlignError::UnnormalizedEmissions { .. })
+    ),
+    "the door guard must reject an all-zeros frame as un-normalized"
+  );
+
+  // A genuinely normalized frame (logsumexp = 0) passes the whole sequence.
+  let ln29 = f64::from(crate::vocab::VOCAB_SIZE as u32).ln();
+  assert!(
+    check_emission_value_domain(&uniform_frame(-ln29 as f32), ComputeUnits::CpuOnly).is_ok(),
+    "the door guard must accept a normalized log-prob frame"
+  );
+}
+
+// ---------------------------------------------------------------------
 // EncoderOptions
 // ---------------------------------------------------------------------
 
