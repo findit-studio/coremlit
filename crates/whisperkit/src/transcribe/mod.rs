@@ -320,10 +320,17 @@ where
     //   (`allSegmentsCount: allSegments.count`, `TranscribeTask.swift:181`), so
     //   the ids DUPLICATE across a removed segment exactly as Swift's do — the
     //   exact-parity contract of clearing the option (F1, codex round 9).
-    //
-    // Carried out onto the result as its decoded id span, for the merge to
-    // advance its own running base by.
     let mut decoded_segment_span = 0usize;
+    // The ordinal-ALLOCATION fact carried onto the result as its `decoded_span`,
+    // kept SEPARATE from the id base above (codex round 13, M3). It advances by
+    // every window's PRE-FILTER allocation count regardless of the option, so it
+    // counts ordinals ALLOCATED — dropped segments included, the public definition
+    // of `SpanKnowledge::Exact` — where the `false`-path id base counts only
+    // SURVIVORS. On the `true` path the two coincide (both advance by the
+    // allocation); on the `false` path they diverge, and recording the id base as
+    // the span there fabricated an `Exact` that was neither the allocation count
+    // nor the survivor extent (it under-counted the ordinals the run consumed).
+    let mut allocated_ordinals = 0usize;
     let mut detected_language: Option<String> = None;
     // The GENUINE observation, kept SEPARATE from `detected_language` above:
     // that one is the Swift-faithful DISPLAY language and includes a
@@ -594,6 +601,13 @@ where
         } else {
           current_segments.as_ref().map_or(0, Vec::len)
         });
+        // The allocation FACT advances by the PRE-FILTER count on BOTH paths
+        // (codex round 13, M3): it records ordinals ALLOCATED, not survivors, so
+        // the `false`-path survivor-counting id base above no longer under-reports
+        // the stored `decoded_span`. On the `true` path this equals the advance
+        // above; on the `false` path it exceeds it whenever the filter dropped a
+        // segment.
+        allocated_ordinals = allocated_ordinals.saturating_add(allocated_this_window);
 
         // :236-239 — hardened beyond Swift's bare `previous_seek + max`:
         // the sum saturates (a huge configured cap must not overflow),
@@ -706,8 +720,9 @@ where
           .with_observed_language(observed_language)
           .with_worker(self.window_id_offset)
           // A real decode task KNOWS the exact ordinal count it allocated
-          // (dropped segments included — captured before the drop).
-          .with_decoded_span(SpanKnowledge::Exact(decoded_segment_span))
+          // (dropped segments included — the pre-filter allocation total, NOT the
+          // `false`-path survivor-counting id base; codex round 13, M3).
+          .with_decoded_span(SpanKnowledge::Exact(allocated_ordinals))
       }),
     )
   }

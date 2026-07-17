@@ -1192,12 +1192,13 @@ fn window_loop_attaches_word_timings_when_enabled() {
 }
 
 /// Runs the F1 word-timestamp scenario under the given `drop_blank_audio` and
-/// returns the surviving segment ids. Two windows each decode
-/// speech/bare-timestamp/speech; the middle segment is a zero-length wordless
-/// slice the word-timestamp filter removes AFTER id allocation. Shared by the
-/// drop-ON unique-id pin and the drop-OFF Swift-parity duplicate pin so both run
-/// byte-identical scripting and differ only in the id-base advance.
-fn word_timestamp_removed_segment_ids(drop_blank_audio: bool) -> Vec<usize> {
+/// returns the full result. Two windows each decode speech/bare-timestamp/speech;
+/// the middle segment is a zero-length wordless slice the word-timestamp filter
+/// removes AFTER id allocation. Shared by the drop-ON unique-id pin, the drop-OFF
+/// Swift-parity duplicate pin, and the drop-OFF allocation-span pin so all run
+/// byte-identical scripting and differ only in the id-base advance and the stored
+/// span.
+fn word_timestamp_removed_segment_result(drop_blank_audio: bool) -> TranscriptionResult {
   let t = tiny_tokenizer();
   let s = special();
   let hello = 2425u32;
@@ -1248,6 +1249,11 @@ fn word_timestamp_removed_segment_ids(drop_blank_audio: bool) -> Vec<usize> {
   let result = task.run(&vec![0.1; 48_000], &options).unwrap();
   assert_eq!(mock.counters().encode_calls(), 2, "two windows decoded");
   result
+}
+
+/// The surviving segment ids of [`word_timestamp_removed_segment_result`].
+fn word_timestamp_removed_segment_ids(drop_blank_audio: bool) -> Vec<usize> {
+  word_timestamp_removed_segment_result(drop_blank_audio)
     .segments_slice()
     .iter()
     .map(TranscriptionSegment::id)
@@ -1302,6 +1308,39 @@ fn word_timestamps_drop_cleared_reproduces_swifts_duplicate_ids() {
     ids,
     vec![0, 2, 2, 4],
     "clearing drop_blank_audio reproduces Swift's duplicate survivor ids (drop OFF)"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn word_timestamps_drop_cleared_records_all_allocated_ordinals() {
+  // F3 (codex round 13, M3), the FALSE-path allocation-span pin. Clearing
+  // `drop_blank_audio` bases each window off the SURVIVOR count (Swift parity, the
+  // duplicate ids `[0, 2, 2, 4]`), but the STORED `decoded_span` must still be the
+  // count the decode ALLOCATED, not that survivor-counting id base: two windows
+  // allocate three ordinals each (`Exact(6)`), and the middle of each is filtered
+  // AFTER allocation. Recording the id base fabricated `Exact(4)` — neither the
+  // allocation (6) nor the survivor extent (5) — so a merge embedding those facts
+  // carried a span the survivors themselves contradict.
+  //
+  // Mutation proof: revert the stored span to the id base
+  // (`Exact(decoded_segment_span)`) and this reads back `Exact(4)`, failing the
+  // span assertion while the Swift ids stay `[0, 2, 2, 4]`.
+  let result = word_timestamp_removed_segment_result(false);
+  assert_eq!(
+    result
+      .segments_slice()
+      .iter()
+      .map(TranscriptionSegment::id)
+      .collect::<Vec<_>>(),
+    vec![0, 2, 2, 4],
+    "clearing drop_blank_audio keeps Swift's duplicate survivor ids (drop OFF)",
+  );
+  assert_eq!(
+    result.task_facts().decoded_span(),
+    SpanKnowledge::Exact(6),
+    "the stored span is the ordinals ALLOCATED (2 windows x 3), not the survivor \
+     count (4) the false-path id base advanced by",
   );
 }
 
