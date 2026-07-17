@@ -729,6 +729,34 @@ fn check_log_prob_normalization(data: &[f32], compute: ComputeUnits) -> Result<(
   Ok(())
 }
 
+/// The value-domain guard sequence [`Encoder::emissions`] runs on the raw
+/// log-prob tensor before wrapping it: [`check_log_prob_floor`] then
+/// [`check_log_prob_normalization`], in that order, over the SAME `data` slice —
+/// the exact pair, on the exact argument, [`Encoder::emissions`] applies to the
+/// tensor it takes from [`Encoder::emissions_raw`].
+///
+/// Extracted so the hermetic suite can drive the production guard through the one
+/// call the door itself makes (`tests::check_emission_value_domain_*`) rather
+/// than re-deriving the two calls: the normalization half has no real-model
+/// fixture — no loadable model emits un-normalized raw logits — so binding that
+/// predicate to the door means calling the door's own guard with a hand-built
+/// shifted-raw-logit tensor. The floor half is additionally exercised at the full
+/// public door by the model-gated `tests::emissions_reject_an_ane_corrupted_matrix`.
+///
+/// Floor before normalization, so an ANE-corrupted matrix is reported as
+/// [`AlignError::CorruptEmissions`] rather than merely un-normalized.
+///
+/// # Errors
+/// [`AlignError::CorruptEmissions`] from [`check_log_prob_floor`] (a cell below
+/// [`LOG_PROB_FLOOR`]); [`AlignError::UnnormalizedEmissions`] from
+/// [`check_log_prob_normalization`] (a frame's `|logsumexp|` past
+/// [`LOG_PROB_SUM_TOLERANCE`]).
+fn check_emission_value_domain(data: &[f32], compute: ComputeUnits) -> Result<(), AlignError> {
+  check_log_prob_floor(data, compute)?;
+  check_log_prob_normalization(data, compute)?;
+  Ok(())
+}
+
 /// A provenance-bound encoder input: the buffer [`Encoder::emissions`] runs the
 /// model on, bound at construction to the count of REAL (pre-pad) audio samples
 /// that determines the truncated frame count `T`.
@@ -1185,8 +1213,7 @@ impl Encoder {
   )]
   pub fn emissions(&self, input: EncoderInput<'_>) -> Result<Emissions, AlignError> {
     let RawEmissions { frames, data } = self.emissions_raw(input)?;
-    check_log_prob_floor(&data, self.compute)?;
-    check_log_prob_normalization(&data, self.compute)?;
+    check_emission_value_domain(&data, self.compute)?;
     Ok(Emissions::from_log_probs(frames, VOCAB_SIZE_NZ, data)?)
   }
 }
