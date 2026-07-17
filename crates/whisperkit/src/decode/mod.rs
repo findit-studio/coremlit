@@ -284,7 +284,8 @@ pub(crate) fn create_logits_filters(
 ///
 /// `observed_language_token` is an out-parameter for the genuine language
 /// OBSERVATION, captured at token-RECOGNITION time (the first `<|lang|>` token
-/// sampled into the predicted region under auto-detect) and set BEFORE the next
+/// sampled into the predicted region, regardless of configured language) and set
+/// BEFORE the next
 /// fallible step — exactly the way `early_stop` and the sampler's own
 /// `drew_from_rng` survive an errored decode. The finalized
 /// [`DecodingResult::observed_language`] is then a READ of this already-captured
@@ -596,7 +597,8 @@ fn finalize_decoding_result(
   // The Rust-only detection fact (no Swift equivalent) — the language the model
   // actually PREDICTED, as an ISO code — is no longer rescanned here. It is
   // RECOGNIZED at sampling time inside [`decode_text`]'s loop (the first
-  // `<|lang|>` token in the predicted region under auto-detect) and stashed in
+  // `<|lang|>` token in the predicted region, regardless of configured
+  // language) and stashed in
   // the caller's `observed_language_token` cell, so it survives a decode that
   // errors after recognizing it (F2, codex round 6 post-consolidation);
   // `decode_text` decodes that captured token into `DecodingResult::observed_language`.
@@ -607,7 +609,10 @@ fn finalize_decoding_result(
   // once `without_timestamps` drops the timestamp filter). Reconstructing the
   // observation from the display `language` would misrecord a forced `<|en|>` as
   // the detection when `<|es|>` was predicted (F1, codex round 5). The
-  // Swift-compat display above is untouched.
+  // Swift-compat display above is untouched. The named invariant
+  // `language_observed_only_for_a_predicted_language_token` (decode/tests.rs)
+  // pins exactly this: a CONFIGURED `"en"` whose model predicts `<|es|>` keeps
+  // display `"en"` while `observed_language == Some("es")`.
 
   // :828 — decoded with `skipSpecialTokens: false` regardless of
   // `options.skipSpecialTokens` (that option only ever gates the live

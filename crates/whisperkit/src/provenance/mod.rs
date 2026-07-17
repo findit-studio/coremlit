@@ -73,12 +73,19 @@
 //! - **A non-zero temperature is not reproducible without a seed.** The
 //!   temperature-fallback ladder samples stochastically once it climbs off
 //!   `0.0`, and [`DecodingOptions::seed`] is unset by default (OS-seeded,
-//!   matching Swift's own unseeded draw). [`Provenance::effective_temperature`]
-//!   is therefore the field that tells you whether the decode was
-//!   greedy/deterministic (`Some(0.0)`) or sampled, and
-//!   [`DecodingOptions::seed`] — embedded with the rest of the options —
-//!   tells you whether that sampling can be replayed at all. Record both, or
-//!   a re-run that disagrees is uninvestigable.
+//!   matching Swift's own unseeded draw). Whether a decode actually drew is read
+//!   from the carried [`Provenance::task_facts`]'
+//!   [`drew_from_rng`](crate::task_facts::TaskFacts::drew_from_rng) — a fact the
+//!   decode carried out of the window loop — and is **never** inferred from
+//!   [`Provenance::effective_temperature`], which summarizes only the segments
+//!   that survived: a window that sampled at `0.2` and then lost its text to the
+//!   blank-audio drop leaves every surviving segment reading `0.0`, so
+//!   `effective_temperature == Some(0.0)` even on a run that plainly sampled.
+//!   `effective_temperature` is worth recording as the rung the survivors agreed
+//!   on, and [`DecodingOptions::seed`] — embedded with the rest of the options —
+//!   as what makes an observed draw replayable at all; but the reproducibility
+//!   verdict rests on the carried draw fact, not the surviving temperature (see
+//!   [`Provenance::is_reproducible`]).
 //! - **Auto-detect makes the *configured* language useless as a record.**
 //!   It is `""` whenever the decoder is left to detect (the default
 //!   pairing), so a record built from options alone names no language at
