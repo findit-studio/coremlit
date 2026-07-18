@@ -5,7 +5,7 @@
 // `SpeakerManager.assignSpeaker` DIRECTLY on a deterministic synthetic
 // embedding sequence (a documented 64-bit LCG — NOT model output), then dumps
 // the per-step decision trace as JSON on stdout. The committed
-// `../fixtures/golden_online_swift/trace.json` is exactly this program's
+// `../../fixtures/golden_online_swift/trace.json` is exactly this program's
 // stdout, so the Rust gate replays it with no Swift toolchain and no models.
 //
 // The single source of truth for the sequence + hashing is the Rust harness

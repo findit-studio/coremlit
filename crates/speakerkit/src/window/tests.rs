@@ -408,6 +408,32 @@ fn count_from_segmentations_hand_computed_3_chunk_overlap() {
 }
 
 #[test]
+fn try_aggregate_output_frame_count_reproduces_the_hand_computed_overlap() {
+  // Direct cover for the extracted `try_aggregate_output_frame_count` seam (the
+  // steps-2..4 overlap-add + round_ties_even that `try_count_from_segmentations`
+  // and `Extraction::diarize_online` now share). Feeding it the step-1 chunk_count
+  // the 3-chunk-overlap fixture documents (c=0:[1,2,1,0], c=1:[2,1,1,2],
+  // c=2:[1,2,1,0]) must reproduce that fixture's end-to-end output vector — proving
+  // the refactor's step-1 / steps-2..4 split is value-identical, not just that the
+  // whole `count_from_segmentations` wrapper still passes.
+  #[rustfmt::skip]
+  let chunk_count = [
+    1.0, 2.0, 1.0, 0.0, // c=0
+    2.0, 1.0, 1.0, 2.0, // c=1
+    1.0, 2.0, 1.0, 0.0, // c=2
+  ];
+  let got = try_aggregate_output_frame_count(
+    &chunk_count,
+    3,
+    4,
+    SlidingWindow::new(0.0, 4.0, 2.0),
+    SlidingWindow::new(0.0, 1.0, 1.0),
+  )
+  .expect("valid geometry: num_output_frames fits usize");
+  assert_eq!(got, vec![1, 2, 2, 0, 1, 2, 1, 0, 0]);
+}
+
+#[test]
 fn count_from_segmentations_matches_dia_oracle_3_chunk_overlap() {
   // THE ORACLE IS CODE: dia's own `try_count_pyannote` is public
   // (`diarization::aggregate::try_count_pyannote`) and is called here

@@ -997,6 +997,172 @@ fn diarize_online_default_gate_keeps_above_threshold_drops_below() {
 }
 
 // =====================================================================
+// diarize_online — HIGH-CHURN allocation fence (codex R5). The M1 online-count
+// fix used to build a dense `num_chunks × num_frames_per_chunk ×
+// num_clusters_from_hard` f64 buffer; `num_clusters_from_hard` scales with the
+// TOTAL distinct global-cluster count, so a long/permissive recording drove an
+// unchecked ~GiB allocation BEFORE diaric's cluster/grid caps could fire — a
+// reachable process-OOM. The fix computes the per-(chunk,frame) DISTINCT-cluster
+// count directly (O(chunks×frames×slots), no cluster axis), so these prove (a)
+// many clusters reconstruct correctly with NO cluster-proportional allocation,
+// and (b) an over-cap grid is diaric's TYPED reconstruct error, never an OOM.
+// =====================================================================
+
+/// A high-churn online extraction that seeds `num_clusters` DISTINCT global
+/// speakers: each active `(chunk, slot)` carries a mutually-near-antipodal
+/// one-hot embedding (`+e_g` for `g < EMBEDDING_DIM`, `-e_{g-EMBEDDING_DIM}`
+/// after), so every pairwise cosine distance is `>= 1.0` — comfortably past the
+/// `0.65` `speaker_threshold` — and the greedy online clusterer spawns a NEW
+/// speaker for every one (`Assignment::New`), never matching an existing
+/// centroid. Feed order is chunk-major then slot-major (`g = c*SEG_NUM_SLOTS +
+/// s`), so slot `g` seeds speaker `g+1` → 0-based label `g`; any slot past
+/// `num_clusters` (the tail of the last chunk) is left zero and is dropped by
+/// `Embedding::normalize_from` (UNMATCHED). `{±e_i}` gives at most
+/// `2 * EMBEDDING_DIM` (512) distinct far vectors.
+///
+/// Each contributing slot is active across all `num_frames_per_chunk` frames, so
+/// it forms a real cluster with a span and the distinct-cluster count sees it.
+/// `min_speech_duration` must be `0.0` at the call site to keep the duration
+/// gate out of the picture.
+fn many_cluster_online_extraction(num_clusters: usize, num_frames_per_chunk: usize) -> Extraction {
+  assert!(
+    num_clusters <= 2 * EMBEDDING_DIM,
+    "`{{±e_i}}` yields at most 2*EMBEDDING_DIM ({}) distinct far vectors",
+    2 * EMBEDDING_DIM
+  );
+  let num_chunks = num_clusters.div_ceil(SEG_NUM_SLOTS);
+  let f = num_frames_per_chunk;
+  let mut segmentations = vec![0.0f64; num_chunks * f * SEG_NUM_SLOTS];
+  let mut raw_embeddings = vec![0.0f32; num_chunks * SEG_NUM_SLOTS * EMBEDDING_DIM];
+  for g in 0..num_clusters {
+    let c = g / SEG_NUM_SLOTS;
+    let s = g % SEG_NUM_SLOTS;
+    // Far vector #g: a signed one-hot. Distinct positions → cosine similarity 0
+    // (distance 1.0); `+e_i` vs `-e_i` → similarity -1 (distance 2.0). Either way
+    // >= speaker_threshold, so #g is a NEW speaker w.r.t. every earlier centroid.
+    let pos = g % EMBEDDING_DIM;
+    let sign = if g < EMBEDDING_DIM { 1.0f32 } else { -1.0f32 };
+    raw_embeddings[(c * SEG_NUM_SLOTS + s) * EMBEDDING_DIM + pos] = sign;
+    for ff in 0..f {
+      segmentations[(c * f + ff) * SEG_NUM_SLOTS + s] = 1.0;
+    }
+  }
+  // Chunk window sized to this fixture's F-frame chunks (same rationale as the
+  // other online fixtures: reconstruct ignores chunk DURATION, but the count
+  // helpers derive num_output_frames from it).
+  let chunks_sw = crate::window::chunk_sliding_window(&WindowOptions::new())
+    .with_duration((f as f64 - 1.0) * crate::window::FRAME_STEP_S);
+  let frames_sw = crate::window::frame_sliding_window();
+  // A valid offline `count` (diarize_online no longer consumes it, but Extraction
+  // owns the offline contract); its length IS num_output_frames.
+  let count = crate::window::count_from_segmentations(
+    &segmentations,
+    num_chunks,
+    f,
+    SEG_NUM_SLOTS,
+    0.5,
+    chunks_sw,
+    frames_sw,
+  );
+  Extraction::from_parts(
+    raw_embeddings,
+    segmentations,
+    count,
+    num_chunks,
+    f,
+    chunks_sw,
+    frames_sw,
+  )
+}
+
+#[test]
+fn diarize_online_many_clusters_use_no_cluster_axis_allocation() {
+  // 380 distinct global speakers over ceil(380/3) = 127 chunks (well past the
+  // 3-slot local ceiling, deep into the total-cluster regime the finding is about;
+  // 380 < 2*EMBEDDING_DIM = 512, the {±e_i} maximum). num_clusters_from_hard = 380,
+  // so the DELETED dense buffer was `num_chunks × num_frames_per_chunk × 380` f64,
+  // scaling with the TOTAL cluster count. At the PRODUCTION per-chunk frame count
+  // (589) that is 127 × 589 × 380 = 2.84e7 cells ≈ 227 MB for this many clusters —
+  // the hundreds-of-MB process-OOM the finding cites (and the `..._over_cap_grid_...`
+  // test below drives the same shape past a GiB). F is kept tiny here purely so the
+  // debug-build reconstruct stays fast; the allocation being fenced is independent
+  // of F. The NEW code allocates only a num_chunks × F chunk_count (127 × 4 = 508
+  // f64 ≈ 4 KB, NO cluster axis), then reuses the shared output-frame aggregator —
+  // so this test completing IS the allocation proof: no cluster-proportional buffer
+  // is ever materialized. (diaric's own reconstruct grid is checked/capped/
+  // spill-backed, unlike the deleted speakerkit buffer.)
+  const NUM_CLUSTERS: usize = 380;
+  const F: usize = 4;
+  let e = many_cluster_online_extraction(NUM_CLUSTERS, F);
+  assert_eq!(e.num_chunks(), 127, "ceil(380/3) chunks");
+
+  let out = e
+    .diarize_online(OnlineOptions::new().with_min_speech_duration(0.0))
+    .expect("high-churn online reconstruction succeeds with no cluster-axis allocation");
+
+  assert_eq!(
+    out.num_clusters(),
+    NUM_CLUSTERS,
+    "every distinct far embedding seeds its own global speaker"
+  );
+  // hard_clusters: chunk c slot s → label c*3+s for the first 380 slots; the 381st
+  // slot (chunk 126, slot 2) is past NUM_CLUSTERS → the dropped tail (UNMATCHED),
+  // which exercises the distinct-count's `k < 0` skip amid many clusters.
+  let hc = out.hard_clusters_slice();
+  assert_eq!(hc.len(), 127);
+  assert_eq!(hc[0], [0, 1, 2], "first chunk seeds labels 0,1,2");
+  assert_eq!(
+    hc[126],
+    [378, 379, -2],
+    "last chunk: two labels + the dropped tail"
+  );
+
+  let spans = out.spans_slice();
+  assert!(
+    !spans.is_empty(),
+    "reconstruction produced spans for the many clusters"
+  );
+  assert!(
+    spans.iter().all(|s| s.cluster() < NUM_CLUSTERS),
+    "every span names a cluster inside the 380-speaker roster"
+  );
+}
+
+#[test]
+fn diarize_online_over_cap_grid_is_a_typed_reconstruct_error_not_an_oom() {
+  // The finding's OOM SHAPE made safe. 380 clusters × 127 chunks × F = 8300 frames
+  // gives a clustered-grid cell count of 127 × 8300 × 380 = 4.006e8 cells, just past
+  // diaric's MAX_RECONSTRUCT_GRID_CELLS (4e8). The OLD speakerkit code allocated
+  // exactly this `num_chunks × num_frames_per_chunk × num_clusters_from_hard` f64
+  // buffer (4.006e8 × 8 B ≈ 3.2 GiB) INSIDE speakerkit, BEFORE diaric's guard could
+  // fire — the reachable process-OOM/abort. The NEW code allocates only a
+  // num_chunks × F chunk_count (no cluster axis), so diaric's typed cell-count cap
+  // (`ShapeError::OutputGridTooLarge`, reconstruct/algo.rs's cs_size guard) rejects
+  // cleanly. Its SIBLING cluster-id cap (`ShapeError::HardClustersIdAboveMax`,
+  // reconstruct/algo.rs — a hard-cluster id above MAX_CLUSTER_ID = 1023) is the
+  // analogous typed rejection for the >1023-speaker case (not economical to seed
+  // here: {±e_i} caps at 512 distinct far vectors). Either way the fix's guarantee
+  // is the same: a typed `Reconstruct` error, never an OOM.
+  const NUM_CLUSTERS: usize = 380;
+  const F: usize = 8300; // 127 * 8300 * 380 = 4.006e8 > 4e8
+  let e = many_cluster_online_extraction(NUM_CLUSTERS, F);
+
+  let err = e
+    .diarize_online(OnlineOptions::new().with_min_speech_duration(0.0))
+    .expect_err("an over-cap clustered grid must be a typed reconstruct error, not an OOM/panic");
+
+  assert!(
+    matches!(
+      err,
+      diaric::offline::Error::Reconstruct(diaric::reconstruct::Error::Shape(
+        diaric::reconstruct::ShapeError::OutputGridTooLarge { .. }
+      ))
+    ),
+    "expected Reconstruct(Shape(OutputGridTooLarge)), got {err:?}"
+  );
+}
+
+// =====================================================================
 // Model-gated (all #[ignore]): requires local speakerkit models
 // (SPEAKERKIT_TEST_MODELS or Models/speakerkit/) plus the cross-crate
 // ted_60.wav fixture. Loader/path helpers duplicated in miniature because

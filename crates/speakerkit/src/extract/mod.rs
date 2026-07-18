@@ -923,72 +923,91 @@ impl Extraction {
     // (`Assignment::Dropped` leaves it UNMATCHED, in no cluster) and can COLLIDE
     // two local slots onto ONE global cluster, so `self.count[t]` can EXCEED the
     // number of distinct global clusters active at frame `t`. Offline `reconstruct`
-    // treats its count as an injective per-cluster count: it sets `num_clusters =
-    // max(num_clusters_from_hard, max(count))` and its top-K binarize marks exactly
-    // `count[t]` clusters active by descending activation — so any `count[t]` above
-    // the real cluster count selects a zero-activation PADDED column and emits a
-    // phantom speaker/span. (The offline path is safe: its `count` and
+    // treats its count as an injective per-cluster count (its top-K binarize marks
+    // exactly `count[t]` clusters active by descending activation), so any `count[t]`
+    // above the real cluster count would select a zero-activation PADDED column and
+    // emit a phantom speaker/span. (The offline path is safe: its `count` and
     // `hard_clusters` come from the SAME pyannote assignment, so the injective
-    // assumption holds.) Derive the count from the CLUSTERED segmentation instead,
-    // guaranteeing `max(online_count) <= num_clusters_from_hard` so no padded column
-    // can exist.
+    // assumption holds.) Derive the count from the CLUSTERED assignment instead: the
+    // number of DISTINCT active clusters per frame.
     //
     // `num_clusters_from_hard = (max non-negative label) + 1`, matching diaric's own
-    // `max_cluster + 1` (reconstruct/algo.rs); UNMATCHED (-2) slots are excluded.
+    // `max_cluster + 1` (reconstruct/algo.rs); UNMATCHED (-2) slots are excluded. It
+    // is the ceiling of the distinct-cluster count derived below (and per (chunk,
+    // frame) that count is additionally `<= SEG_NUM_SLOTS`); kept as the invariant's
+    // ceiling, NOT to size any buffer — the direct count below allocates no cluster
+    // axis.
     let num_clusters_from_hard = hard_clusters
       .iter()
       .flatten()
       .filter(|&&k| k >= 0)
       .max()
       .map_or(0, |&k| k as usize + 1);
-    let online_count = if num_clusters_from_hard == 0 {
-      // Every slot was dropped: `reconstruct` early-returns an all-zero grid
-      // (`max_cluster < 0`) BEFORE it reads `count`, so the value is unused here —
-      // but it must still be a correctly-sized (`num_output_frames`) slice.
-      vec![0u8; self.num_output_frames]
-    } else {
-      // Clustered segmentation, shape `num_chunks × num_frames_per_chunk ×
-      // num_clusters_from_hard` (row-major, same index order as the raw
-      // segmentations): `clustered_seg[(c, f, k)] = 1.0` iff ANY slot `s` with
-      // `hard_clusters[c][s] == k` is active (`> 0.0`) at `(c, f)` — the SAME
-      // "any nonzero entry is binary-active" predicate the activity loop above
-      // uses. A dropped slot (label `< 0`) contributes to no `k`.
-      let mut clustered_seg =
-        vec![0.0f64; self.num_chunks * self.num_frames_per_chunk * num_clusters_from_hard];
-      for (c, chunk_row) in hard_clusters.iter().enumerate() {
-        for (s, &k) in chunk_row.iter().enumerate() {
+
+    // Per (chunk, frame): the number of DISTINCT non-negative cluster labels among
+    // the active slots (`seg > 0.0`). This equals, cell for cell, the column count
+    // the deleted dense `clustered_seg` tensor produced — a column `k` was `1.0`
+    // iff some active slot carried label `k`, and the count helper counted the
+    // `1.0` columns — so `online_count` below is byte-for-byte identical to the old
+    // buffer approach; the only difference is that we never materialize a
+    // `chunks × frames × clusters` tensor (the process-OOM the old buffer's
+    // unchecked `num_chunks * num_frames_per_chunk * num_clusters_from_hard`
+    // allocation risked before diaric's own cluster cap could fire). At most
+    // `SEG_NUM_SLOTS` labels are live at one cell, so an inline dedup over a fixed
+    // `[i32; SEG_NUM_SLOTS]` scratch is O(slots²) with `slots <= 3` — no global
+    // cluster axis, no allocation beyond this `chunks × frames` vector.
+    let mut chunk_count = vec![0.0f64; self.num_chunks * self.num_frames_per_chunk];
+    for c in 0..self.num_chunks {
+      let row = hard_clusters[c];
+      for f in 0..self.num_frames_per_chunk {
+        let mut seen = [i32::MIN; SEG_NUM_SLOTS];
+        let mut n_seen = 0usize;
+        for (s, &k) in row.iter().enumerate() {
           if k < 0 {
-            continue;
+            continue; // dropped/unmatched slot: in no cluster
           }
-          let k = k as usize;
-          for f in 0..self.num_frames_per_chunk {
-            if self.segmentations[(c * self.num_frames_per_chunk + f) * SEG_NUM_SLOTS + s] > 0.0 {
-              clustered_seg[(c * self.num_frames_per_chunk + f) * num_clusters_from_hard + k] = 1.0;
-            }
+          if self.segmentations[(c * self.num_frames_per_chunk + f) * SEG_NUM_SLOTS + s] > 0.0
+            && !seen[..n_seen].contains(&k)
+          {
+            seen[n_seen] = k;
+            n_seen += 1;
           }
         }
+        chunk_count[c * self.num_frames_per_chunk + f] = n_seen as f64;
       }
-      // Reuse extract()'s already-validated count helper over the clustered
-      // segmentation. `0.5` onset ≡ "nonzero active" because `clustered_seg` is
-      // exactly 0.0/1.0. The geometry (`num_chunks`/`num_frames_per_chunk`/
-      // `chunks_sw`/`frames_sw`) is IDENTICAL to the one `extract()` already ran to
-      // derive `self.num_output_frames`; only the speaker count differs, which does
-      // not affect the output-frame count — so `online_count.len() ==
-      // self.num_output_frames` and the overflow guard cannot recur.
-      crate::window::try_count_from_segmentations(
-        &clustered_seg,
-        self.num_chunks,
-        self.num_frames_per_chunk,
-        num_clusters_from_hard,
-        0.5,
-        self.chunks_sw,
-        self.frames_sw,
-      )
-      .expect(
-        "online count reuses extract()'s already-validated chunk/frame geometry, so the \
-         output-frame count cannot overflow here (num_output_frames is fixed)",
-      )
-    };
+    }
+
+    // The SAME overlap-add + rounding `count_from_segmentations` runs, over the
+    // distinct-cluster chunk count. The geometry (`num_chunks`/`num_frames_per_chunk`/
+    // `chunks_sw`/`frames_sw`) is IDENTICAL to the one `extract()` already ran to
+    // derive `self.num_output_frames`, so `online_count.len() ==
+    // self.num_output_frames` and the output-frame count cannot overflow. The
+    // all-dropped case falls out naturally: every label negative → every `chunk_count`
+    // cell `0` → `online_count` all-zero (length `self.num_output_frames`), and
+    // reconstruct's `max_cluster < 0` early-return fires regardless.
+    let online_count = crate::window::try_aggregate_output_frame_count(
+      &chunk_count,
+      self.num_chunks,
+      self.num_frames_per_chunk,
+      self.chunks_sw,
+      self.frames_sw,
+    )
+    .expect(
+      "online count reuses extract()'s already-validated chunk/frame geometry, so the \
+       output-frame count cannot overflow here (num_output_frames is fixed)",
+    );
+
+    // Invariant preserved from the deleted buffer approach: distinct labels at any
+    // one (chunk, frame) ≤ total distinct labels = `num_clusters_from_hard`, and the
+    // overlap-add average + `round_ties_even` is monotone (a mean of integers each
+    // `<= K` rounds to `<= K`), so `max(online_count) <= num_clusters_from_hard`. No
+    // padded column, no phantom speaker — the M1 correctness fix is fully preserved.
+    debug_assert!(
+      online_count
+        .iter()
+        .all(|&t| usize::from(t) <= num_clusters_from_hard),
+      "distinct-cluster online_count must not exceed num_clusters_from_hard"
+    );
 
     // The SAME reconstruction the offline path runs — only the cluster labels came
     // from the online engine instead of AHC→VBx, and the count is the

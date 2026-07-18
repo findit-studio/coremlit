@@ -4,7 +4,7 @@
 // part of the Rust build (cargo ignores Swift sources): it is driven only by
 // hand / by the regen command in this directory's README, which runs the
 // executable to dump the per-step SpeakerManager decision trace into
-// `../fixtures/golden_online_swift/trace.json`.
+// `../../fixtures/golden_online_swift/trace.json`.
 //
 // It depends on the LOCAL FluidAudio checkout BY PATH (a SIBLING of the
 // coremlit workspace: `…/findit-studio/FluidAudio`), read-only — nothing here

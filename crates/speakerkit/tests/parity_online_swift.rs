@@ -18,7 +18,7 @@
 //! with the same LCG sequence, and dumps per-step decisions (assigned id / new
 //! / dropped + the updated centroid) as JSON. Regenerate the committed trace
 //! from that directory with
-//! `swift run online_oracle > ../fixtures/golden_online_swift/trace.json` (its
+//! `swift run online_oracle > ../../fixtures/golden_online_swift/trace.json` (its
 //! README carries the FluidAudio path-dep note and the `FLUIDAUDIO_SRC`
 //! override).
 //!

@@ -6,8 +6,8 @@ FluidAudio checkout** and drives its `SpeakerManager.assignSpeaker` directly on
 the same deterministic synthetic LCG embedding sequence the Rust harness
 regenerates, then dumps the per-step decision trace (kind / id / centroid) as
 JSON. That JSON, committed as
-`../fixtures/golden_online_swift/trace.json`, lets the Rust gate replay Swift's
-decisions with **no Swift toolchain and no models**.
+`../../fixtures/golden_online_swift/trace.json`, lets the Rust gate replay
+Swift's decisions with **no Swift toolchain and no models**.
 
 It emits **both** input-attestation hashes with a Swift FNV-1a-64 that is
 byte-identical to the Rust `common::fnv1a_f32`:
@@ -35,7 +35,7 @@ FLUIDAUDIO_SRC=/abs/path/to/FluidAudio swift run online_oracle > /dev/null
 From this directory:
 
 ```sh
-swift run online_oracle > ../fixtures/golden_online_swift/trace.json
+swift run online_oracle > ../../fixtures/golden_online_swift/trace.json
 ```
 
 stdout carries only the JSON (the `[.prettyPrinted, .sortedKeys]` encoding the

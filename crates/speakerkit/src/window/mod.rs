@@ -797,8 +797,10 @@ pub fn count_from_segmentations(
   .expect("num_output_frames must fit in usize")
 }
 
-/// Fallible core of [`count_from_segmentations`]: identical body and
-/// identical shape/precondition asserts, but returns the
+/// Fallible core of [`count_from_segmentations`]: the same
+/// shape/precondition asserts and the same overlap-add aggregation (steps
+/// 2-4 now shared with the online path via
+/// [`try_aggregate_output_frame_count`]), but returns the
 /// `num_output_frames`-overflow guard as a typed
 /// [`WindowError::OutputFrameCountOverflow`] instead of unwrapping it.
 ///
@@ -838,27 +840,6 @@ pub(crate) fn try_count_from_segmentations(
     "num_frames_per_chunk must be at least 1"
   );
   assert!(num_speakers > 0, "num_speakers must be at least 1");
-
-  let chunk_duration = chunks_sw.duration();
-  let chunk_step = chunks_sw.step();
-  let frame_duration = frames_sw.duration();
-  let frame_step = frames_sw.step();
-  assert!(
-    chunk_duration.is_finite() && chunk_duration > 0.0,
-    "chunks_sw.duration() must be a positive finite scalar"
-  );
-  assert!(
-    chunk_step.is_finite() && chunk_step > 0.0,
-    "chunks_sw.step() must be a positive finite scalar"
-  );
-  assert!(
-    frame_duration.is_finite() && frame_duration > 0.0,
-    "frames_sw.duration() must be a positive finite scalar"
-  );
-  assert!(
-    frame_step.is_finite() && frame_step > 0.0,
-    "frames_sw.step() must be a positive finite scalar"
-  );
   assert!(onset.is_finite(), "onset must be finite");
 
   let expected = num_chunks
@@ -891,6 +872,86 @@ pub(crate) fn try_count_from_segmentations(
       chunk_count[c * num_frames_per_chunk + f] = active;
     }
   }
+
+  // ── 2-4. Output-frame count, overlap-add aggregation, and rounding ──
+  // Shared with the online distinct-cluster count path
+  // ([`crate::extract::Extraction::diarize_online`]) via
+  // [`try_aggregate_output_frame_count`]; the chunk/frame sliding-window
+  // finiteness asserts those steps rely on live there now, so this function
+  // keeps only step 1's own segmentation-specific asserts above.
+  try_aggregate_output_frame_count(
+    &chunk_count,
+    num_chunks,
+    num_frames_per_chunk,
+    chunks_sw,
+    frames_sw,
+  )
+}
+
+/// Steps 2-4 of the pyannote frame-count aggregation
+/// (`diarization/src/aggregate/count.rs:486-801`), factored out of
+/// [`try_count_from_segmentations`] so the online reconstruction path can
+/// reuse the EXACT same overlap-add + rounding over a chunk-count it derives
+/// differently (the number of distinct active *clusters* per (chunk, frame),
+/// rather than active *speaker slots*).
+///
+/// `chunk_count[c * num_frames_per_chunk + f]` is the per-(chunk, frame)
+/// scalar to overlap-add: [`try_count_from_segmentations`] fills it with the
+/// active-slot count, [`crate::extract::Extraction::diarize_online`] with the
+/// distinct-cluster count. Both are `<= num_speakers`, so the averaged,
+/// `round_ties_even`'d result stays within the same `u8` range either way.
+/// Splitting the count derivation from this shared tail is what lets the
+/// online path avoid ever materializing a `chunks × frames × clusters`
+/// tensor: it needs only this `chunks × frames` vector.
+///
+/// # Panics
+/// Panics if `num_chunks` or `num_frames_per_chunk` is `0`, if
+/// `chunk_count.len() != num_chunks * num_frames_per_chunk` (or that product
+/// overflows `usize`), or if any of `chunks_sw`/`frames_sw`'s duration or step
+/// is non-positive or non-finite — the same sliding-window preconditions
+/// [`count_from_segmentations`] documents.
+///
+/// # Errors
+/// [`WindowError::OutputFrameCountOverflow`] if the derived
+/// `num_output_frames` would not fit in `usize` (see `try_num_output_frames`).
+pub(crate) fn try_aggregate_output_frame_count(
+  chunk_count: &[f64],
+  num_chunks: usize,
+  num_frames_per_chunk: usize,
+  chunks_sw: SlidingWindow,
+  frames_sw: SlidingWindow,
+) -> Result<Vec<u8>, WindowError> {
+  assert!(num_chunks > 0, "num_chunks must be at least 1");
+  assert!(
+    num_frames_per_chunk > 0,
+    "num_frames_per_chunk must be at least 1"
+  );
+  assert_eq!(
+    Some(chunk_count.len()),
+    num_chunks.checked_mul(num_frames_per_chunk),
+    "chunk_count.len() must equal num_chunks * num_frames_per_chunk"
+  );
+
+  let chunk_duration = chunks_sw.duration();
+  let chunk_step = chunks_sw.step();
+  let frame_duration = frames_sw.duration();
+  let frame_step = frames_sw.step();
+  assert!(
+    chunk_duration.is_finite() && chunk_duration > 0.0,
+    "chunks_sw.duration() must be a positive finite scalar"
+  );
+  assert!(
+    chunk_step.is_finite() && chunk_step > 0.0,
+    "chunks_sw.step() must be a positive finite scalar"
+  );
+  assert!(
+    frame_duration.is_finite() && frame_duration > 0.0,
+    "frames_sw.duration() must be a positive finite scalar"
+  );
+  assert!(
+    frame_step.is_finite() && frame_step > 0.0,
+    "frames_sw.step() must be a positive finite scalar"
+  );
 
   // ── 2. Output-frame count — count.rs:486-547 ─────────────────────
   let last_chunk_end = chunk_duration + (num_chunks - 1) as f64 * chunk_step;
