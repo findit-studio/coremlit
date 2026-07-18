@@ -13,18 +13,22 @@
 //! fails") be observed in the ordinary suite.
 //!
 //! # The Swift oracle
-//! `scratchpad/online_oracle` (out-of-tree, owner decides permanent placement)
-//! is a SwiftPM executable that `import`s FluidAudio, drives `SpeakerManager`
-//! DIRECTLY with the same LCG sequence, and dumps per-step decisions (assigned
-//! id / new / dropped + the updated centroid) as JSON. Regenerate the committed
-//! trace with `swift run online_oracle > .../golden_online_swift/trace.json`.
+//! `tests/swift/online_oracle/` is a COMMITTED SwiftPM executable that
+//! `import`s the local FluidAudio checkout, drives `SpeakerManager` DIRECTLY
+//! with the same LCG sequence, and dumps per-step decisions (assigned id / new
+//! / dropped + the updated centroid) as JSON. Regenerate the committed trace
+//! from that directory with
+//! `swift run online_oracle > ../fixtures/golden_online_swift/trace.json` (its
+//! README carries the FluidAudio path-dep note and the `FLUIDAUDIO_SRC`
+//! override).
 //!
 //! The oracle emits the Swift-attested `generator` block (constants incl.
-//! `durationBase`/`durationSpan`) but NOT `durationsFnv1a` — that field is
-//! Rust-computed provenance (the hash of the durations this harness regenerates
-//! from the very constants the `generator` block pins). After any regeneration,
-//! re-add it: run this test once, and it prints the correct hash in its failure
-//! message; paste that into the trace's `durationsFnv1a`.
+//! `durationBase`/`durationSpan`) AND both input hashes, computed in Swift with
+//! an FNV-1a-64 byte-identical to `common::fnv1a_f32`: `inputFnv1a` over the raw
+//! embeddings and `durationsFnv1a` over the `[f32]` duration sequence. Both are
+//! Swift attestations of what the oracle actually fed `SpeakerManager` — NOT
+//! Rust self-hashes — so this harness proves cross-language input identity for
+//! BOTH clusterer inputs (finding M3).
 //!
 //! # The inputs are PROVEN identical, not assumed (the alignkit lesson)
 //! Before any decision is compared, BOTH clusterer inputs are proven identical to
@@ -36,11 +40,14 @@
 //!   New-vs-Dropped — is proven two ways: the trace's Swift-emitted `generator`
 //!   block (`durationBase`/`durationSpan`/`seed`/…) is asserted against the Rust
 //!   generator constants, and the regenerated durations are FNV-1a-64 hashed
-//!   against the committed `durationsFnv1a`. The embedding hash alone does NOT
-//!   cover durations: `DUR_BASE`/`DUR_SPAN` are affine constants applied to the
-//!   LCG draw's OUTPUT, so a change shifts every duration while leaving the LCG
-//!   progression (and thus the embedding hash) untouched — the hole that let a
-//!   fully-broken duration bridge still pass 48/48.
+//!   against the trace's `durationsFnv1a`, which the oracle now computes IN
+//!   SWIFT (the same byte-identical FNV as `inputFnv1a`) over the very durations
+//!   it fed `SpeakerManager` — a genuine cross-language attestation, not a Rust
+//!   self-hash. The embedding hash alone does NOT cover durations:
+//!   `DUR_BASE`/`DUR_SPAN` are affine constants applied to the LCG draw's
+//!   OUTPUT, so a change shifts every duration while leaving the LCG progression
+//!   (and thus the embedding hash) untouched — the hole that let a fully-broken
+//!   duration bridge still pass 48/48.
 //!
 //! Any mismatch fails as a HARNESS bug (a drifted LCG or duration constant),
 //! never as a clusterer finding.
@@ -71,7 +78,7 @@ use diaric::{
 };
 use speakerkit::OnlineOptions;
 
-// ── Generator constants (mirror scratchpad/online_oracle's main.swift) ──
+// ── Generator constants (mirror tests/swift/online_oracle's main.swift) ──
 const SEED: u64 = 0xDEAD_BEEF_CAFE_F00D;
 const STEPS: usize = 48;
 const PROTOTYPES: usize = 8;
@@ -180,8 +187,10 @@ struct TraceGenerator {
 struct SwiftTrace {
   input_fnv1a: String,
   /// FNV-1a-64 (hex) of the exact `[f32]` speech-duration sequence — the second
-  /// clusterer input, committed alongside the embedding `inputFnv1a` so a
-  /// duration drift is caught before any decision is read (codex M2a).
+  /// clusterer input. Swift-EMITTED by the oracle (the same byte-identical FNV
+  /// that reproduces `input_fnv1a`, hashed over the durations it fed
+  /// `SpeakerManager`), so hashing the Rust-regenerated durations against it is
+  /// a genuine cross-language check, not a Rust self-hash (findings M2a + M3).
   durations_fnv1a: String,
   generator: TraceGenerator,
   speaker_threshold: f32,
@@ -284,9 +293,12 @@ fn online_clusterer_matches_fluidaudio_swift_trace() {
   //       every Rust generator constant against it, so a DUR_BASE/DUR_SPAN (or
   //       seed/steps/…) drift on the Rust side fails against the oracle's own
   //       recorded values;
-  //   (2) hash the regenerated duration values against the committed
-  //       `durationsFnv1a`, mirroring the embedding hash — this ALSO catches a
-  //       change to the duration FORMULA that leaves the constants intact.
+  //   (2) hash the regenerated duration values against the trace's
+  //       `durationsFnv1a` — which the Swift oracle emits with the same
+  //       byte-identical FNV over the durations it actually fed `SpeakerManager`
+  //       — mirroring the embedding hash. A true cross-language check (not a
+  //       Rust self-hash): it ALSO catches a Swift-side change to the duration
+  //       value/FORMULA that leaves the LCG stream and the constants intact.
   let g = &trace.generator;
   assert_eq!(
     SEED, g.seed,
