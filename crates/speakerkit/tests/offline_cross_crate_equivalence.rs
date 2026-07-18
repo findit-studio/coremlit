@@ -10,16 +10,31 @@
 //! (dia-ort) side and diaric's on the MEASURED (speakerkit) side — so "the two
 //! clusterers cannot diverge" is an assumption the PLDA gate does NOT cover.
 //!
-//! This gate turns that assumption into an EXECUTABLE invariant. It builds ONE
-//! set of typed offline inputs (scripted raw embeddings + segmentations rich
-//! enough that the community-1 filter keeps many training pairs, AHC merges exact
-//! ties, and VBx actually iterates), feeds it to BOTH `diarize_offline`
+//! This gate turns that assumption into an EXECUTABLE invariant. It builds
+//! scripted typed offline inputs, feeds each to BOTH `diarize_offline`
 //! implementations, and asserts their WHOLE observable output is identical:
 //! typed outcome, per-chunk hard clusters, the discrete diarization grid
 //! (bit-exact `f32`), the cluster count, and the RTTM spans (bit-exact `f64`
-//! start/duration + cluster). A future re-pin of either crate that changes an
-//! AHC tie, `MIN_ACTIVE_RATIO`, a VBx step, the reassignment, or reconstruction
-//! — while leaving PLDA untouched — moves one side and fails here.
+//! start/duration + cluster). Two fixtures feed the gate:
+//!
+//! 1. [`offline_cross_crate_equivalence`] — the baseline: single-active
+//!    segmentations rich enough that the community-1 filter keeps many training
+//!    pairs, AHC merges exact ties, and VBx actually iterates.
+//! 2. [`offline_cross_crate_equivalence_activity_boundary`] — reaches the two
+//!    community-1 activity-filter branches the baseline never exercises: the
+//!    `MIN_ACTIVE_RATIO = 0.2` clean-frame threshold (an EDGE pair whose 5/20
+//!    clean frames sit in the (0.2, 0.3) band — retained at 0.2, dropped by a
+//!    0.3 re-pin — and which forms its OWN cluster, so its retention is visible
+//!    in the compared output) and the `active_count == 1` single-active gate (a
+//!    pair whose activity is mostly in genuinely overlapping frames, so those
+//!    frames are rejected from its clean-frame tally).
+//!
+//! A future re-pin of either crate that changes an AHC tie, the
+//! `MIN_ACTIVE_RATIO` boundary, the `active_count == 1` overlap rejection, a VBx
+//! step, the reassignment, or reconstruction — while leaving PLDA untouched —
+//! moves one side and fails here. The `MIN_ACTIVE_RATIO` and overlap coverage is
+//! fixture 2's; a local shim of one crate's ratio to 0.3 turns the boundary gate
+//! red (mutation-verified during development).
 //!
 //! # Why an INPUT-perturbation mutation proves drift-detection
 //! The fence's own drift scenario (re-pin one crate to a diverging revision) is
@@ -92,6 +107,12 @@ struct OfflineFixture {
   segmentations: Vec<f64>,
   count: Vec<u8>,
   num_output_frames: usize,
+  /// Chunk/frame geometry carried on the fixture so both the baseline and the
+  /// activity-boundary fixture (which have DIFFERENT shapes) reuse the same
+  /// `{diaric,dia}_outcome` runners. `num_speakers` is always `NUM_SPEAKERS`
+  /// (== `MAX_SPEAKER_SLOTS`), so it stays a const.
+  num_chunks: usize,
+  num_frames: usize,
 }
 
 /// Build the scripted offline input. `identity_of(c)` selects chunk `c`'s active
@@ -132,6 +153,8 @@ fn build_fixture(identity_of: impl Fn(usize) -> usize) -> OfflineFixture {
     segmentations,
     count,
     num_output_frames,
+    num_chunks: NUM_CHUNKS,
+    num_frames: FRAMES,
   }
 }
 
@@ -156,10 +179,10 @@ fn diaric_outcome(fx: &OfflineFixture) -> Outcome {
   let w = WindowOptions::new();
   let input = diaric::offline::OfflineInput::new(
     &fx.raw_embeddings,
-    NUM_CHUNKS,
+    fx.num_chunks,
     NUM_SPEAKERS,
     &fx.segmentations,
-    FRAMES,
+    fx.num_frames,
     &fx.count,
     fx.num_output_frames,
     chunk_sliding_window(&w).into(),
@@ -192,10 +215,10 @@ fn dia_outcome(fx: &OfflineFixture) -> Outcome {
   let fs = frame_sliding_window();
   let input = dia::offline::OfflineInput::new(
     &fx.raw_embeddings,
-    NUM_CHUNKS,
+    fx.num_chunks,
     NUM_SPEAKERS,
     &fx.segmentations,
-    FRAMES,
+    fx.num_frames,
     &fx.count,
     fx.num_output_frames,
     dia::reconstruct::SlidingWindow::new(cs.start(), cs.duration(), cs.step()),
@@ -294,4 +317,269 @@ fn offline_cross_crate_gate_detects_a_one_sided_divergence() {
     "the cross-crate gate FAILED to detect a one-sided input perturbation — the equivalence \
      comparison is vacuous and would not catch a real post-PLDA drift"
   );
+}
+
+// ── Activity-boundary fixture ─────────────────────────────────────────
+// A SECOND scripted input built to REACH the community-1 activity filter's two
+// decision branches, which the single-active baseline above never touches: the
+// `MIN_ACTIVE_RATIO = 0.2` clean-frame threshold and the `active_count == 1`
+// single-active gate. 7 chunks × 3 slots × 20 frames, so the retention bars are
+// `0.2 * 20 = 4` and `0.3 * 20 = 6` clean frames.
+//
+// Only TWO identities carry training weight, and they are chosen to be the pair
+// that clusters SEPARATELY under the crates' AHC threshold (0.6): identity 0 is
+// the base (>> bar, always retained) and identity 1 is the EDGE (in the flip
+// band). Each recurs across THREE chunks as exact duplicates, so both stay
+// VBx-alive and each forms its own cluster — the edge identity's whole cluster
+// therefore appears at 0.2 and VANISHES under a 0.3 re-pin, which is the
+// observable change the mutation flips.
+const B_NUM_CHUNKS: usize = 7;
+const B_FRAMES: usize = 20;
+const B_BASE_ID: usize = 0; // base identity: >> bar clean frames, always retained
+const B_EDGE_ID: usize = 1; // edge identity: 5/20 clean frames, in the (0.2, 0.3) band
+// Base pairs: >> 6 clean frames each, so identity 0 survives ANY ratio in
+// (0, 0.6] and is NOT what the 0.2-vs-0.3 flip is about.
+const B_BASE_CLEAN: usize = 12;
+// Edge pairs: 5/20 = 0.25 clean frames — RETAINED at 0.2 (5 >= 4), DROPPED by a
+// 0.3 re-pin (5 < 6). Mirrors the finding's 25/100 example.
+const B_EDGE_CLEAN: usize = 5;
+// OVERLAP chunk (last): slot 0 (identity 2) active over [0, B_OV_ACTIVE); slot 1
+// (identity 3) active over [0, B_OV_OVERLAP). The first B_OV_OVERLAP frames are
+// DOUBLE-active (active_count == 2 → NOT single-active), so only the tail
+// [B_OV_OVERLAP, B_OV_ACTIVE) is clean for slot 0: clean = 8 - 6 = 2 < 4. Slot 0
+// is thus dropped BECAUSE of the single-active gate even though its raw activity
+// (8 frames) clears the bar — making the `active_count == 1` gate LOAD-BEARING.
+const B_OV_ACTIVE: usize = 8;
+const B_OV_OVERLAP: usize = 6;
+const B_OV_CHUNK: usize = B_NUM_CHUNKS - 1; // 6
+
+/// Write a `1.0` activation for slot `s` of chunk `c` over frames `[f0, f1)`.
+fn set_active(seg: &mut [f64], num_frames: usize, c: usize, s: usize, f0: usize, f1: usize) {
+  for f in f0..f1 {
+    seg[(c * num_frames + f) * NUM_SPEAKERS + s] = 1.0;
+  }
+}
+
+/// Write identity `identity`'s prototype embedding into slot `s` of chunk `c`.
+fn set_proto(raw: &mut [f32], c: usize, s: usize, identity: usize) {
+  let base = (c * NUM_SPEAKERS + s) * EMBED_DIM;
+  raw[base..base + EMBED_DIM].copy_from_slice(&prototype(identity));
+}
+
+/// Build the activity-boundary fixture (geometry documented in the const block
+/// above). Reuses the same `count_from_segmentations` derivation as
+/// `build_fixture`, so the tensor set is reconstruct-valid despite the genuine
+/// overlap in the last chunk.
+fn build_boundary_fixture() -> OfflineFixture {
+  let mut raw_embeddings = vec![0.0f32; B_NUM_CHUNKS * NUM_SPEAKERS * EMBED_DIM];
+  let mut segmentations = vec![0.0f64; B_NUM_CHUNKS * B_FRAMES * NUM_SPEAKERS];
+
+  // Base cluster (identity 0): chunks 0,1,2, slot 0, exact duplicates, >> bar.
+  for c in 0..3 {
+    set_active(&mut segmentations, B_FRAMES, c, 0, 0, B_BASE_CLEAN);
+    set_proto(&mut raw_embeddings, c, 0, B_BASE_ID);
+  }
+  // EDGE cluster (identity 1): chunks 3,4,5, slot 1, exact duplicates, each with
+  // exactly B_EDGE_CLEAN single-active clean frames (the (0.2, 0.3) flip band).
+  for c in 3..6 {
+    set_active(&mut segmentations, B_FRAMES, c, 1, 0, B_EDGE_CLEAN);
+    set_proto(&mut raw_embeddings, c, 1, B_EDGE_ID);
+  }
+  // OVERLAP chunk: slot 0 (identity 2) over [0, 8), slot 1 (identity 3) over
+  // [0, 6) — the first 6 frames are double-active, so slot 0's clean tally is
+  // only 2 and it is dropped by the single-active gate.
+  set_active(&mut segmentations, B_FRAMES, B_OV_CHUNK, 0, 0, B_OV_ACTIVE);
+  set_proto(&mut raw_embeddings, B_OV_CHUNK, 0, 2);
+  set_active(&mut segmentations, B_FRAMES, B_OV_CHUNK, 1, 0, B_OV_OVERLAP);
+  set_proto(&mut raw_embeddings, B_OV_CHUNK, 1, 3);
+
+  let w = WindowOptions::new();
+  let count = speakerkit::window::count_from_segmentations(
+    &segmentations,
+    B_NUM_CHUNKS,
+    B_FRAMES,
+    NUM_SPEAKERS,
+    ONSET,
+    chunk_sliding_window(&w),
+    frame_sliding_window(),
+  );
+  let num_output_frames = count.len();
+  OfflineFixture {
+    raw_embeddings,
+    segmentations,
+    count,
+    num_output_frames,
+    num_chunks: B_NUM_CHUNKS,
+    num_frames: B_FRAMES,
+  }
+}
+
+/// Test-local, byte-faithful re-derivation of the community-1 activity filter
+/// (`{diaric,dia}::offline::algo` Stage 1): the `active_count == 1` single-active
+/// gate, then the `clean_frames >= ratio * num_frames` retention rule. It exists
+/// ONLY so the fixture's frame geometry can be pinned to the exact decision
+/// zones the two crates use — `ratio` is a parameter here, but the crates
+/// hard-code `MIN_ACTIVE_RATIO = 0.2`. This is a MIRROR for asserting the
+/// fixture, NOT the tested path: `diarize_offline` runs each crate's OWN copy.
+fn surviving_train_pairs(
+  seg: &[f64],
+  num_chunks: usize,
+  num_frames: usize,
+  ratio: f64,
+) -> std::collections::BTreeSet<(usize, usize)> {
+  let min_clean = ratio * num_frames as f64;
+  let mut out = std::collections::BTreeSet::new();
+  for c in 0..num_chunks {
+    let mut single_active = vec![false; num_frames];
+    for (f, sa) in single_active.iter_mut().enumerate() {
+      let active = (0..NUM_SPEAKERS)
+        .filter(|&s| seg[(c * num_frames + f) * NUM_SPEAKERS + s] > 0.0)
+        .count();
+      *sa = active == 1;
+    }
+    for s in 0..NUM_SPEAKERS {
+      let mut clean = 0.0f64;
+      for (f, &sa) in single_active.iter().enumerate() {
+        if sa {
+          clean += seg[(c * num_frames + f) * NUM_SPEAKERS + s];
+        }
+      }
+      if clean >= min_clean {
+        out.insert((c, s));
+      }
+    }
+  }
+  out
+}
+
+/// The clean-frame tally the filter WOULD compute if the `active_count == 1`
+/// gate were removed (naive `sum > 0` over frames): shows the overlap pair only
+/// falls below the bar BECAUSE of the single-active gate.
+fn naive_active_frames(seg: &[f64], num_frames: usize, c: usize, s: usize) -> f64 {
+  (0..num_frames)
+    .map(|f| seg[(c * num_frames + f) * NUM_SPEAKERS + s])
+    .sum()
+}
+
+#[test]
+fn offline_cross_crate_equivalence_activity_boundary() {
+  let fx = build_boundary_fixture();
+
+  // ── Fixture-geometry pins: both filter branches are genuinely reached ──
+  let edge_pairs = [(3usize, 1usize), (4, 1), (5, 1)]; // identity 1, flip band
+  let base_pairs = [(0usize, 0usize), (1, 0), (2, 0)]; // identity 0, always retained
+  let overlap = (B_OV_CHUNK, 0usize); // identity 2, overlap-contaminated
+  let at_02 = surviving_train_pairs(&fx.segmentations, B_NUM_CHUNKS, B_FRAMES, 0.2);
+  let at_03 = surviving_train_pairs(&fx.segmentations, B_NUM_CHUNKS, B_FRAMES, 0.3);
+  let bar_02 = 0.2 * B_FRAMES as f64;
+
+  // (a) MIN_ACTIVE_RATIO boundary: every edge pair is RETAINED at 0.2 and
+  //     DROPPED at 0.3 — the exact re-pin the gate must catch.
+  for &e in &edge_pairs {
+    assert!(
+      at_02.contains(&e),
+      "edge pair {e:?} must survive at 0.2 (clean {B_EDGE_CLEAN} >= {bar_02})"
+    );
+    assert!(
+      !at_03.contains(&e),
+      "edge pair {e:?} must be dropped at 0.3 (clean {B_EDGE_CLEAN} < {})",
+      0.3 * B_FRAMES as f64
+    );
+  }
+  for &b in &base_pairs {
+    assert!(
+      at_02.contains(&b) && at_03.contains(&b),
+      "base pair {b:?} must survive BOTH ratios (it is not the flip)"
+    );
+  }
+
+  // (b) active_count == 1 overlap rejection: the overlap pair has enough RAW
+  //     active frames to clear the bar, but the single-active gate rejects its
+  //     overlapping frames, so its clean tally falls below the bar → dropped.
+  let raw = naive_active_frames(&fx.segmentations, B_FRAMES, overlap.0, overlap.1);
+  assert!(
+    raw >= bar_02,
+    "overlap pair must clear the bar WITHOUT the gate ({raw} >= {bar_02})"
+  );
+  assert!(
+    !at_02.contains(&overlap),
+    "overlap pair must be dropped BY the active_count == 1 gate (clean < {bar_02})"
+  );
+  let double_active = (0..B_FRAMES).any(|f| {
+    (0..NUM_SPEAKERS)
+      .filter(|&s| fx.segmentations[(overlap.0 * B_FRAMES + f) * NUM_SPEAKERS + s] > 0.0)
+      .count()
+      >= 2
+  });
+  assert!(
+    double_active,
+    "the overlap chunk must contain genuinely double-active frames for the gate to reject"
+  );
+
+  // ── The gate: both crates' WHOLE offline output is bit-identical ──
+  let diaric = diaric_outcome(&fx);
+  let dia = dia_outcome(&fx);
+  assert_eq!(
+    diaric, dia,
+    "diaric and dia diverged on the activity-boundary fixture (filter branches / AHC / VBx / \
+     reassignment / reconstruct / spans) for identical inputs"
+  );
+
+  // ── Non-vacuity: the compared output OBSERVABLY depends on the edge cluster ──
+  // The edge identity forms its OWN cluster, distinct from the base cluster, and
+  // all three edge chunks agree on it. That cluster exists ONLY because the edge
+  // pairs survived the 0.2 filter; a 0.3 re-pin drops all of them, the edge
+  // cluster vanishes, and this side's hard clusters / grid / spans move — which
+  // is exactly what the equivalence assertion above would then report as a
+  // divergence. (Non-train pairs are reassigned to the nearest surviving
+  // cluster, not left UNMATCHED, so the CLUSTER IDENTITY — not an UNMATCHED
+  // sentinel — is the observable that flips.)
+  match &diaric {
+    Outcome::Ok {
+      hard_clusters,
+      num_clusters,
+      spans,
+      ..
+    } => {
+      let base_cluster = hard_clusters[base_pairs[0].0][base_pairs[0].1];
+      let edge_cluster = hard_clusters[edge_pairs[0].0][edge_pairs[0].1];
+      assert!(
+        base_cluster >= 0 && edge_cluster >= 0,
+        "base ({base_cluster}) and edge ({edge_cluster}) active slots must be clustered"
+      );
+      assert_ne!(
+        base_cluster, edge_cluster,
+        "edge identity must form its OWN cluster, distinct from base — otherwise a 0.3 \
+         re-pin (which drops the whole edge cluster) would not move the compared output"
+      );
+      for &(c, s) in &edge_pairs {
+        assert_eq!(
+          hard_clusters[c][s], edge_cluster,
+          "all edge chunks must share the edge cluster (chunk {c} slot {s})"
+        );
+      }
+      let distinct: std::collections::BTreeSet<i32> = hard_clusters
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|&k| k >= 0)
+        .collect();
+      assert_eq!(
+        distinct.len(),
+        2,
+        "exactly the base + edge clusters should be assigned (got {distinct:?})"
+      );
+      assert!(*num_clusters >= 2, "grid must carry both clusters");
+      assert!(!spans.is_empty(), "fixture must produce spans");
+      println!(
+        "[offline-cross-crate boundary] diaric == dia: {num_clusters} clusters, \
+         {} distinct speakers, {} spans; edge identity retained at 0.2 as its own \
+         cluster ({edge_cluster}) vs base ({base_cluster}), overlap pair rejected \
+         by the active_count gate",
+        distinct.len(),
+        spans.len(),
+      );
+    }
+    Outcome::Err(e) => panic!("expected a clustered result on the boundary fixture, got Err: {e}"),
+  }
 }
