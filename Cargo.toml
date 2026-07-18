@@ -1,6 +1,13 @@
 [workspace]
 resolver = "3"
-members = ["crates/alignkit", "crates/coremlit", "crates/whisperkit", "crates/speakerkit", "crates/vadkit"]
+members = [
+  "crates/alignkit",
+  "crates/clapkit",
+  "crates/coremlit",
+  "crates/whisperkit",
+  "crates/speakerkit",
+  "crates/vadkit",
+]
 
 [workspace.package]
 version = "0.1.0"
@@ -39,6 +46,8 @@ tempfile = "3"
 rand = "0.9"
 hound = "3.5"
 sha2 = "0.11"
+rustfft = "6"
+npyz = "0.9"
 cpal = "0.16"
 rubato = "0.16"
 criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
