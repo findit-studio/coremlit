@@ -1,0 +1,77 @@
+[package]
+name = "clapkit"
+description = "Native CoreML LAION CLAP (clap-htsat-unfused) audio + text encoders with an improved long-audio pipeline"
+version.workspace = true
+edition.workspace = true
+# Unpublishable while the `parity-oracle` gate depends on the unpublished
+# `textclap` git source (crates.io forbids git sources); flip once textclap
+# lands on a released version. The DEFAULT build has no git dependencies.
+publish = false
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../../README.md"
+keywords = ["clap", "audio", "text", "coreml", "embedding"]
+categories = ["multimedia::audio", "os::macos-apis", "science"]
+
+[package.metadata.docs.rs]
+all-features = true
+default-target = "aarch64-apple-darwin"
+targets = ["aarch64-apple-darwin"]
+
+[dependencies]
+coremlit.workspace = true
+thiserror.workspace = true
+# f64 forward FFT for the Slaney-mel front-end — the same crate + major version
+# textclap's `mel.rs` uses, so the ported numerics match on the scalar path
+# (see `src/audio/mel/mod.rs`).
+rustfft.workspace = true
+# HuggingFace `tokenizers` — the same crate + version textclap loads the pinned
+# Xenova `tokenizer.json` with, so token ids are identity-comparable.
+tokenizers.workspace = true
+serde = { workspace = true, optional = true }
+
+# The textclap oracle: rev-pinned to a PUBLIC git source (crates.io forbids git
+# sources, and textclap is unpublished), OPTIONAL and only linked under the
+# `parity-oracle` feature — an ordinary `cargo test -p clapkit` never resolves or
+# builds it. This rev is textclap's `origin/main` HEAD when this branch was cut;
+# it is ort-only (no `mlxrs`), so the oracle build downloads an ONNX Runtime
+# binary but compiles no native MLX runtime. clapkit calls only textclap's
+# `BUNDLED_TOKENIZER` const (no `ort` runtime), so the gate needs no
+# `libonnxruntime` at run time.
+#
+# Co-developing textclap and clapkit together? Point at a local checkout with an
+# UNCOMMITTED workspace-root patch (never commit it):
+#
+#   [patch."https://github.com/Findit-AI/textclap"]
+#   textclap = { path = "../../../textclap" }
+textclap = { git = "https://github.com/Findit-AI/textclap", rev = "584f21754337a0f6cc7575fa83e9e49a38e99ee9", optional = true }
+
+[features]
+default = []
+serde = ["dep:serde"]
+# DEV/TEST ONLY — adds nothing to this library. Enables the LIVE textclap oracle
+# cross-check (`tests/tokenizer_identity_textclap.rs`): it links the sibling
+# `textclap` crate and asserts clapkit's bundled tokenizer bytes are identical to
+# textclap's `BUNDLED_TOKENIZER`. The DEFAULT, always-run identity gate
+# (`tests/tokenizer_identity.rs`) carries the same byte-identity guarantee via a
+# SHA pin + pinned golden token ids, with no oracle build — so this feature is a
+# belt-and-suspenders live confirmation, not the load-bearing gate.
+parity-oracle = ["dep:textclap"]
+
+# `required-features` (not `#[ignore]`, not `#[cfg]`) keeps textclap + ort out of
+# the default test build: without `parity-oracle` cargo does not BUILD this
+# target at all. Every other `tests/*.rs` stays auto-discovered.
+[[test]]
+name = "tokenizer_identity_textclap"
+path = "tests/tokenizer_identity_textclap.rs"
+required-features = ["parity-oracle"]
+
+[dev-dependencies]
+npyz.workspace = true
+hound.workspace = true
+sha2.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
