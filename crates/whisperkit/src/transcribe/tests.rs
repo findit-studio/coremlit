@@ -4,7 +4,7 @@ use super::*;
 use crate::{
   audio::vad::VoiceActivityDetector,
   backend::{ModelDims, mock::MockBackend},
-  error::SegmentError,
+  error::{SegmentError, TranscribeError, VadError},
   options::{ChunkingStrategy, DecodingOptions},
   tokenizer::{SpecialTokens, WhisperTokenizer},
 };
@@ -1010,6 +1010,70 @@ fn vad_detector_swap_changes_chunk_boundaries() {
     (segments[1].start() - 3.0).abs() < 1e-3,
     "chunk 2 starts at the whole-window boundary (48_000 / 16_000), got {}",
     segments[1].start()
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn transcribe_surfaces_a_latched_vad_failure_instead_of_ok() {
+  // Regression (vadkit-fence Medium): a hard VAD *model* failure during
+  // chunking must be observable from the same `transcribe` call, not
+  // swallowed into false silence. A detector that latches an inference
+  // failure — the mock-backend fail pattern, standing in for the Silero
+  // CoreML model failing mid-stream — reports all-inactive frames, which on
+  // their own would let `chunk_all` split the window and `transcribe` return
+  // an `Ok` transcript off silently-degraded boundaries. Whisperkit's
+  // transcribe instead drains the latch after chunking (via
+  // `VoiceActivityDetector::take_detection_error`) and surfaces
+  // `TranscribeError::Vad`.
+  //
+  // Mutation: drop the `take_detection_error` check in `WhisperKit::transcribe`
+  // → the latched failure is ignored, the unscripted chunks decode/drop to an
+  // empty `Ok`, and this `expect_err` goes red.
+  #[derive(Default)]
+  struct FailingVad {
+    fired: std::sync::Mutex<bool>,
+  }
+  impl VoiceActivityDetector for FailingVad {
+    fn voice_activity(&self, samples: &[f32]) -> Vec<bool> {
+      *self.fired.lock().unwrap() = true;
+      // A hard failure is indistinguishable from silence at the trait
+      // boundary — exactly the degradation the latch exists to catch.
+      vec![false; samples.len().div_ceil(self.frame_length_samples())]
+    }
+    fn frame_length_samples(&self) -> usize {
+      crate::audio::vad::DEFAULT_FRAME_LENGTH_SAMPLES
+    }
+    fn take_detection_error(&self) -> Option<Box<dyn std::error::Error + Send + Sync + 'static>> {
+      self
+        .fired
+        .lock()
+        .unwrap()
+        .then(|| "scripted VAD inference failure".into())
+    }
+  }
+
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(48_000));
+  let hello = t.encode(" Hello").unwrap()[0];
+  script_clean_window(&mut mock, hello);
+  let kit = WhisperKit::with_backend(mock, t).with_vad_detector(Box::new(FailingVad::default()));
+  // Longer than one window, so the VAD chunking branch runs the detector.
+  let audio = vec![0.1f32; 96_000];
+  let options = DecodingOptions::new().with_chunking_strategy(ChunkingStrategy::Vad);
+
+  let error = kit
+    .transcribe(&audio, &options)
+    .expect_err("a latched hard VAD failure must fail transcription, not return Ok");
+  assert!(
+    matches!(error, TranscribeError::Vad(VadError::Detection(_))),
+    "expected TranscribeError::Vad, got {error:?}"
+  );
+  assert!(
+    error
+      .to_string()
+      .contains("voice-activity detection failed"),
+    "the error should render the VAD stage, got: {error}"
   );
 }
 

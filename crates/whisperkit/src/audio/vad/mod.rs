@@ -34,6 +34,31 @@ pub trait VoiceActivityDetector {
   /// Samples per analysis frame.
   fn frame_length_samples(&self) -> usize;
 
+  /// Drains and returns the first hard inference failure the detector
+  /// latched during its most recent [`voice_activity`](Self::voice_activity)
+  /// / [`active_chunks`](Self::active_chunks) run, or `None` if the
+  /// detector cannot fail or none occurred.
+  ///
+  /// [`voice_activity`](Self::voice_activity) is infallible by contract —
+  /// it returns `Vec<bool>`, with no per-frame error channel — so a
+  /// learned detector backed by a model (e.g. the `vadkit`-gated Silero
+  /// detector) that hits a hard model/runtime failure would otherwise
+  /// have to report it as ordinary "no speech". Rather than let that
+  /// failure masquerade as silence and silently corrupt chunk boundaries,
+  /// such a detector latches the first failure and exposes it here;
+  /// [`WhisperKit::transcribe`](crate::transcribe::WhisperKit::transcribe)
+  /// consults this right after driving the detector for chunking and
+  /// surfaces a [`crate::error::VadError`] instead of returning an `Ok`
+  /// transcript off a degraded segmentation. Detectors that cannot fail —
+  /// the default [`EnergyVad`], whose RMS is total over any finite input —
+  /// keep this default `None`.
+  ///
+  /// Draining (rather than peeking) keeps each transcription run's check
+  /// scoped to that run's own failures.
+  fn take_detection_error(&self) -> Option<Box<dyn std::error::Error + Send + Sync + 'static>> {
+    None
+  }
+
   /// Merges consecutive active frames into half-open `(start, end)` frame
   /// ranges — the frame-index view backing [`Self::active_chunks`].
   fn active_frame_ranges(&self, frames: &[bool]) -> Vec<(usize, usize)> {

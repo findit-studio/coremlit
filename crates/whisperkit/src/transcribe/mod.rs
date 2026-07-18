@@ -89,7 +89,7 @@ use crate::{
     self, TranscriptionProgressCallback,
     sampler::{self, GreedyTokenSampler},
   },
-  error::{DecodeError, ModelError, TranscribeError},
+  error::{DecodeError, ModelError, TranscribeError, VadError},
   model::{ModelVariant, detect_variant, manager::ModelManager},
   options::{DecodingOptions, Options},
   result::{
@@ -1558,12 +1558,24 @@ where
     if options.chunking_strategy().is_vad() && audio.len() > window_samples {
       let vad_chunker = chunker::VadChunker::new();
       let clip_ranges = chunker::prepare_seek_clips(options.clip_timestamps_slice(), audio.len())?;
+      // Clear any latch left by an out-of-band `voice_activity`/`active_chunks`
+      // call so this run's check considers only its own chunking failures.
+      let _ = self.vad_detector.take_detection_error();
       let chunks = vad_chunker.chunk_all(
         self.vad_detector.as_ref(),
         audio,
         window_samples,
         &clip_ranges,
       );
+      // The detector is infallible per frame (`voice_activity -> Vec<bool>`),
+      // so a hard model/runtime failure during chunking latches inside it
+      // rather than surfacing. Consult that latch now: a swallowed VAD failure
+      // produced degraded chunk boundaries (speech misread as silence), so fail
+      // the whole transcription with a typed `VadError` instead of returning an
+      // `Ok` transcript off a silently-corrupted segmentation.
+      if let Some(source) = self.vad_detector.take_detection_error() {
+        return Err(TranscribeError::Vad(VadError::Detection(source)));
+      }
       let chunk_options = options.clone().with_clip_timestamps(Vec::new());
 
       // One [`TaskFacts`] sink shared across every chunk: `TranscribeTask::run`

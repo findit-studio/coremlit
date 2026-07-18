@@ -149,6 +149,34 @@ pub enum SegmentError {
   Tokenizer(#[from] TokenizerError),
 }
 
+/// Failure running the pluggable voice-activity detector during
+/// [`ChunkingStrategy::Vad`](crate::options::ChunkingStrategy::Vad)
+/// chunking.
+///
+/// The detector's per-frame contract
+/// ([`voice_activity`](crate::audio::vad::VoiceActivityDetector::voice_activity))
+/// is infallible — it returns `Vec<bool>`, with no channel for a hard
+/// model/runtime failure. A learned detector backed by a model (e.g. the
+/// `vadkit`-gated Silero detector) therefore *latches* its first inference
+/// failure and the transcription pipeline surfaces it here after driving
+/// the detector, rather than letting a swallowed failure masquerade as
+/// silence and silently corrupt the chunk boundaries.
+///
+/// Not `Clone`/`PartialEq`/`Eq` (unlike its sibling domain-error enums):
+/// it carries the detector's own error as an erased
+/// `Box<dyn std::error::Error + Send + Sync>`, so the pipeline stays
+/// decoupled from any particular detector's error type.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum VadError {
+  /// The voice-activity detector reported a hard inference failure
+  /// mid-stream (e.g. the Silero CoreML model failed to run a frame, or
+  /// returned a non-finite probability). Its own error is preserved as
+  /// the [`source`](std::error::Error::source).
+  #[error("voice-activity detection failed: {0}")]
+  Detection(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
+}
+
 /// Top-level transcription failure, composing every domain error (spec
 /// §6.4).
 #[derive(Debug, thiserror::Error)]
@@ -169,6 +197,11 @@ pub enum TranscribeError {
   /// A segment-seeking or slicing failure.
   #[error("segment error: {0}")]
   Segment(#[from] SegmentError),
+  /// A voice-activity-detection failure during VAD chunking: the
+  /// pluggable detector hit a hard model/runtime failure that would
+  /// otherwise have been swallowed into false silence.
+  #[error("vad error: {0}")]
+  Vad(#[from] VadError),
 }
 
 #[cfg(test)]

@@ -46,7 +46,7 @@
 
 use std::sync::Mutex;
 
-use vadkit::{CHUNK_SAMPLES, ModelError, VadModel, VadModelOptions, VadState};
+use vadkit::{CHUNK_SAMPLES, InferError, ModelError, VadModel, VadModelOptions, VadState};
 
 use crate::audio::vad::VoiceActivityDetector;
 
@@ -64,6 +64,13 @@ pub const DEFAULT_SPEECH_THRESHOLD: f32 = 0.5;
 pub struct SileroVad {
   model: Mutex<VadModel>,
   threshold: f32,
+  // Latch for the FIRST inference failure seen during a `voice_activity`
+  // run. `voice_activity` is infallible per the trait, so a hard model
+  // failure is recorded here (not swallowed into false silence) and drained
+  // by `take_detection_error`, which whisperkit's transcribe consults after
+  // chunking to surface a typed error. Interior-mutable because the trait
+  // takes `&self`.
+  error: Mutex<Option<InferError>>,
 }
 
 impl SileroVad {
@@ -103,6 +110,7 @@ impl SileroVad {
     Self {
       model: Mutex::new(model),
       threshold: DEFAULT_SPEECH_THRESHOLD,
+      error: Mutex::new(None),
     }
   }
 
@@ -136,13 +144,19 @@ impl VoiceActivityDetector for SileroVad {
   /// The buffer is processed as one logical stream from a fresh recurrent
   /// state, so the result is independent of any previous call. A per-frame
   /// inference failure — a CoreML runtime error or the non-finite corruption
-  /// `vadkit` exists to catch — is treated as **inactive** for that frame:
+  /// `vadkit` exists to catch — is reported as **inactive** for that frame
+  /// (the trait's
   /// [`voice_activity`](crate::audio::vad::VoiceActivityDetector::voice_activity)
-  /// is infallible by contract (as is
-  /// [`EnergyVad`](crate::audio::vad::EnergyVad), whose RMS on non-finite input
-  /// likewise yields `false`), so a hard failure has no channel here. Callers
-  /// that need inference errors surfaced should drive
-  /// [`vadkit::detect_speech`] directly instead.
+  /// is infallible, returning `Vec<bool>`), but unlike
+  /// [`EnergyVad`](crate::audio::vad::EnergyVad) — whose RMS is a total
+  /// function of any finite input — a hard *model* failure here is not a
+  /// benign "no speech": it is **latched** (first failure wins) instead of
+  /// swallowed, so
+  /// [`take_detection_error`](crate::audio::vad::VoiceActivityDetector::take_detection_error)
+  /// can drain it. `WhisperKit::transcribe` consults that latch after
+  /// chunking and surfaces a [`crate::error::VadError`], so a hard failure
+  /// during VAD is observable from the same transcription call rather than
+  /// silently degrading the chunk boundaries.
   fn voice_activity(&self, samples: &[f32]) -> Vec<bool> {
     let model = self.model.lock().expect("SileroVad model mutex poisoned");
     let mut state = VadState::initial();
@@ -154,10 +168,32 @@ impl VoiceActivityDetector for SileroVad {
             state = next;
             probability >= self.threshold
           }
-          Err(_) => false,
+          Err(error) => {
+            // Infallible per the trait, so this frame is reported inactive —
+            // but the hard failure is LATCHED (first one wins) rather than
+            // lost, so `take_detection_error` can surface it. `state` is not
+            // advanced; later frames continue from the last good state.
+            let mut latch = self.error.lock().expect("SileroVad error latch poisoned");
+            if latch.is_none() {
+              *latch = Some(error);
+            }
+            false
+          }
         },
       )
       .collect()
+  }
+
+  /// Drains the first inference failure latched by [`Self::voice_activity`]
+  /// (see its note), boxed as the trait's erased error. `None` when the
+  /// most recent run hit no hard failure.
+  fn take_detection_error(&self) -> Option<Box<dyn std::error::Error + Send + Sync + 'static>> {
+    self
+      .error
+      .lock()
+      .expect("SileroVad error latch poisoned")
+      .take()
+      .map(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync + 'static>)
   }
 
   /// [`Self::FRAME_LENGTH_SAMPLES`] (4096 = 256 ms at 16 kHz).
