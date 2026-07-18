@@ -50,7 +50,7 @@ rustfft = "6"
 npyz = "0.9"
 cpal = "0.16"
 rubato = "0.16"
-criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 # CO-DEV RECIPE (do NOT commit the patch itself): speakerkit's optional `dia`
 # dependency is pinned to the diarization repo by exact git rev
