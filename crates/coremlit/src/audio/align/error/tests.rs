@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn aligner_error_wraps_load_via_from() {
-  let inner = coremlit::LoadError::NotFound {
+  let inner = crate::LoadError::NotFound {
     path: "base960h_aligner.mlmodelc".into(),
   };
   let e: AlignerError = inner.into();
@@ -11,7 +11,7 @@ fn aligner_error_wraps_load_via_from() {
 
 #[test]
 fn aligner_error_load_displays_inner_message() {
-  let e: AlignerError = coremlit::LoadError::NotFound {
+  let e: AlignerError = crate::LoadError::NotFound {
     path: "/tmp/missing.mlmodelc".into(),
   }
   .into();
@@ -44,7 +44,7 @@ fn aligner_error_is_equatable_and_cloneable() {
 
 #[test]
 fn align_error_wraps_prediction_via_from() {
-  let inner = coremlit::PredictionError::MissingOutput {
+  let inner = crate::PredictionError::MissingOutput {
     name: "emissions".to_string(),
   };
   let e: AlignError = inner.into();
@@ -54,7 +54,7 @@ fn align_error_wraps_prediction_via_from() {
 
 #[test]
 fn align_error_wraps_tensor_via_from() {
-  let inner = coremlit::TensorError::ShapeMismatch {
+  let inner = crate::TensorError::ShapeMismatch {
     expected: 960_000,
     actual: 100,
   };
@@ -102,7 +102,7 @@ fn aligner_error_wraps_seam_via_from() {
 fn align_error_input_too_long_displays_both_counts() {
   let e = AlignError::InputTooLong {
     got: 1_000_000,
-    max: crate::encode::ENCODER_WINDOW_SAMPLES,
+    max: crate::audio::align::encode::ENCODER_WINDOW_SAMPLES,
   };
   let rendered = e.to_string();
   assert!(rendered.contains("1000000"));
@@ -117,7 +117,7 @@ fn align_error_corrupt_emissions_names_the_placement_and_the_floor() {
   // floor that was tripped, the observed minimum and the blast radius all
   // have to survive into Display. The real ANE numbers, measured on jfk.wav.
   let e = AlignError::CorruptEmissions {
-    compute: coremlit::ComputeUnits::All,
+    compute: crate::ComputeUnits::All,
     min: -45_440.0,
     cells: 2_667,
     total: 15_921,
@@ -140,7 +140,7 @@ fn align_error_corrupt_emissions_names_the_placement_and_the_floor() {
     "must report the total: {rendered}"
   );
   assert!(
-    rendered.contains(&crate::encode::LOG_PROB_FLOOR.to_string()),
+    rendered.contains(&crate::audio::align::encode::LOG_PROB_FLOOR.to_string()),
     "must name the floor it tripped: {rendered}"
   );
   assert!(
@@ -156,10 +156,10 @@ fn align_error_unnormalized_emissions_names_the_frame_and_logsumexp() {
   // the offending frame, its logsumexp, the tolerance and the placement all
   // survive into Display.
   let e = AlignError::UnnormalizedEmissions {
-    compute: coremlit::ComputeUnits::All,
+    compute: crate::ComputeUnits::All,
     row: 2_832,
     logsumexp: 6.63,
-    tolerance: crate::encode::LOG_PROB_SUM_TOLERANCE,
+    tolerance: crate::audio::align::encode::LOG_PROB_SUM_TOLERANCE,
   };
   let rendered = e.to_string();
   assert!(rendered.contains("2832"), "must name the frame: {rendered}");
@@ -168,7 +168,7 @@ fn align_error_unnormalized_emissions_names_the_frame_and_logsumexp() {
     "must report the logsumexp: {rendered}"
   );
   assert!(
-    rendered.contains(&crate::encode::LOG_PROB_SUM_TOLERANCE.to_string()),
+    rendered.contains(&crate::audio::align::encode::LOG_PROB_SUM_TOLERANCE.to_string()),
     "must report the tolerance: {rendered}"
   );
   assert!(

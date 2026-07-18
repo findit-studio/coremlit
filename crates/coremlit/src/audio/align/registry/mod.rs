@@ -8,7 +8,7 @@
 //! with **one deliberate divergence**: this registry stores a plain
 //! [`Aligner`], not a `Mutex<Aligner>`. asry needs the mutex because its ORT
 //! `Aligner::align` is `&mut self`; alignkit's
-//! [`Aligner::align_chunk`](crate::aligner::Aligner::align_chunk) is `&self`
+//! [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk) is `&self`
 //! (the CoreML `Model` predicts without `&mut`), so there is nothing to lock.
 //!
 //! # Scope of that win
@@ -19,10 +19,10 @@
 //! of which alone is fatal to an `Arc<AlignmentSet>` fanned out to workers:
 //!
 //! 1. **The CoreML model.** Each [`Aligner`] owns an
-//!    [`Encoder`](crate::encode::Encoder) → [`coremlit::Model`], which is
+//!    [`Encoder`](crate::audio::align::encode::Encoder) → [`crate::Model`], which is
 //!    deliberately [`Send`] but
 //!    **not** [`Sync`]: Apple documents "use an `MLModel` instance on one thread
-//!    or one dispatch queue at a time" (`coremlit::Model`'s `# Concurrency`), so
+//!    or one dispatch queue at a time" (`crate::Model`'s `# Concurrency`), so
 //!    concurrent `&Model` access from multiple threads is outside contract. This
 //!    blocker is intrinsic to the model — no bound widening removes it.
 //! 2. **The text normalizer.** That same [`Aligner`]'s asry `EmissionsAligner`
@@ -47,7 +47,7 @@ use asry::{
   emissions::{OovEvent, OutputClock, ResolvedOov},
 };
 
-use crate::{aligner::Aligner, error::AlignError};
+use crate::audio::align::{aligner::Aligner, error::AlignError};
 
 /// Identifies an aligner in the [`AlignmentSet`] registry.
 ///
@@ -164,7 +164,7 @@ define_alignment_fallback! {
   /// `serde` feature, and `#[non_exhaustive]`. It is a *policy* — the kind of
   /// value that arrives from a config file, a CLI flag or an env var — so it has
   /// to survive a round trip through text, which it previously could not do in
-  /// either direction even though [`crate::AlignerOptions`] is itself
+  /// either direction even though [`crate::audio::align::AlignerOptions`] is itself
   /// serde-gated.
   ///
   /// The enum, its wire spellings, its parser and its test roster are all
@@ -381,7 +381,7 @@ impl AlignmentSet {
   ///
   /// The language patch mirrors asry's `AlignmentSet::detect_oov`
   /// (`asry/src/runner/aligner/set.rs`):
-  /// [`Aligner::detect_oov`](crate::aligner::Aligner::detect_oov) stamps
+  /// [`Aligner::detect_oov`](crate::audio::align::aligner::Aligner::detect_oov) stamps
   /// each event with the matched aligner's OWN construction language, so an
   /// `Any` fallback (e.g. an English aligner serving another language) would
   /// otherwise route per-language OOV policy on the wrong key.
@@ -407,10 +407,10 @@ impl AlignmentSet {
   /// aligner that actually runs.
   ///
   /// This is the registry-owned counterpart to
-  /// [`Aligner::align_chunk`](crate::aligner::Aligner::align_chunk): call it
+  /// [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk): call it
   /// with the SAME `language` you passed to [`Self::detect_oov`] and the same
   /// caller-resolved `oov_decisions` (in that order); the remaining arguments
-  /// are [`Aligner::align_chunk`](crate::aligner::Aligner::align_chunk)'s,
+  /// are [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk)'s,
   /// forwarded unchanged.
   ///
   /// # Why a registry-level align is needed at all
@@ -454,7 +454,7 @@ impl AlignmentSet {
   /// still returns empty success and [`AlignmentFallback::Error`] still returns
   /// [`AlignError::LanguageUnsupported`], whatever language the decisions carry.
   /// Otherwise any error
-  /// [`Aligner::align_chunk`](crate::aligner::Aligner::align_chunk) itself returns.
+  /// [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk) itself returns.
   // Mirrors `Aligner::align_chunk`'s argument surface (already at the 7-arg
   // limit) plus the registry's `language` lookup key, so a caller uses the exact
   // call shape they already know rather than an opaque params struct. Same

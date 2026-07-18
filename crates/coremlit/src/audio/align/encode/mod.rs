@@ -122,7 +122,7 @@
 //! plausible, silently wrong timings.
 //!
 //! That gap was reachable from this crate's own public API
-//! ([`EncoderOptions::with_compute`], [`crate::AlignerOptions::with_compute`]),
+//! ([`EncoderOptions::with_compute`], [`crate::audio::align::AlignerOptions::with_compute`]),
 //! and it was the *measured* defect, not the hypothetical one the paragraph
 //! above guards against. So [`Encoder::emissions`] scans the other side too:
 //! any cell below [`LOG_PROB_FLOOR`] is [`AlignError::CorruptEmissions`], a
@@ -154,10 +154,10 @@
 use core::num::NonZeroUsize;
 use std::{borrow::Cow, path::Path};
 
+use crate::{ComputeUnits, DataType, FeatureInfo, Model, MultiArray};
 use asry::emissions::{Emissions, PreparedChunk};
-use coremlit::{ComputeUnits, DataType, FeatureInfo, Model, MultiArray};
 
-use crate::error::{AlignError, AlignerError};
+use crate::audio::align::error::{AlignError, AlignerError};
 
 /// Fixed sample count of the encoder's input window (60 s @ 16 kHz).
 /// Pinned by `tests/model_io.rs::base960h_aligner_io_matches_spec`
@@ -171,7 +171,7 @@ pub const ENCODER_WINDOW_SAMPLES: usize = 960_000;
 /// 320"). Pinned by the design spec §3/§7 and the model card's "20
 /// ms/frame" claim; unlike [`ENCODER_WINDOW_SAMPLES`], this is not itself
 /// one of the model's declared tensor dimensions, so it is not
-/// introspectable from `coremlit::ModelDescription` — see
+/// introspectable from `crate::ModelDescription` — see
 /// [`Encoder::emissions`]'s doc for how it combines with the model's
 /// actual (introspected) frame count.
 pub const HOP_SAMPLES: usize = 320;
@@ -211,10 +211,11 @@ const _: () = assert!(
    HOP_SAMPLES) + 1 — the wav2vec2 conv output length for one full window"
 );
 
-/// [`crate::vocab::VOCAB_SIZE`] as a [`NonZeroUsize`], for the
+/// [`crate::audio::align::vocab::VOCAB_SIZE`] as a [`NonZeroUsize`], for the
 /// [`Emissions::from_log_probs`] `v` argument. The conversion is
 /// infallible: `VOCAB_SIZE` is the nonzero constant `29`.
-const VOCAB_SIZE_NZ: NonZeroUsize = match NonZeroUsize::new(crate::vocab::VOCAB_SIZE) {
+const VOCAB_SIZE_NZ: NonZeroUsize = match NonZeroUsize::new(crate::audio::align::vocab::VOCAB_SIZE)
+{
   Some(v) => v,
   None => unreachable!(),
 };
@@ -455,7 +456,7 @@ pub struct EncoderOptions {
     feature = "serde",
     serde(
       default = "default_encoder_compute",
-      with = "crate::compute_units_serde"
+      with = "crate::audio::align::compute_units_serde"
     )
   )]
   compute: ComputeUnits,
@@ -578,7 +579,7 @@ fn waveform_input_or_mismatch(input: Option<&FeatureInfo>) -> Result<&FeatureInf
 fn expected_emissions_contract() -> String {
   format!(
     "[1, {EXPECTED_OUTPUT_FRAMES}, {}] float32",
-    crate::vocab::VOCAB_SIZE
+    crate::audio::align::vocab::VOCAB_SIZE
   )
 }
 
@@ -605,7 +606,7 @@ fn check_emissions_contract(
   let shape_ok = shape.len() == 3
     && shape[0] == 1
     && shape[1] == EXPECTED_OUTPUT_FRAMES
-    && shape[2] == crate::vocab::VOCAB_SIZE;
+    && shape[2] == crate::audio::align::vocab::VOCAB_SIZE;
   if !shape_ok || dtype != Some(DataType::F32) {
     return Err(AlignerError::ContractMismatch {
       feature: names::EMISSIONS,
@@ -699,14 +700,16 @@ fn check_log_prob_floor(data: &[f32], compute: ComputeUnits) -> Result<(), Align
 /// accepted.
 fn check_log_prob_normalization(data: &[f32], compute: ComputeUnits) -> Result<(), AlignError> {
   debug_assert!(
-    data.len().is_multiple_of(crate::vocab::VOCAB_SIZE),
+    data
+      .len()
+      .is_multiple_of(crate::audio::align::vocab::VOCAB_SIZE),
     "emissions buffer is frames × VOCAB_SIZE by construction"
   );
   let mut worst_row = 0usize;
   let mut worst_abs = 0.0f64;
   let mut worst_lse = 0.0f64;
   for (row, frame) in data
-    .as_chunks::<{ crate::vocab::VOCAB_SIZE }>()
+    .as_chunks::<{ crate::audio::align::vocab::VOCAB_SIZE }>()
     .0
     .iter()
     .enumerate()
@@ -869,7 +872,7 @@ impl ValueDomainChecked {
 ///   [`PreparedChunk`] — the capability token
 ///   only asry's `prepare` can mint — so the two are drawn from the same
 ///   authoritative object and cannot be paired wrong. It is the door
-///   [`Aligner::align_chunk`](crate::aligner::Aligner::align_chunk) takes AND the
+///   [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk) takes AND the
 ///   one an external `prepare` → `Encoder` → `finish` composer takes.
 ///
 /// There is deliberately **no** public `(buffer, count)` constructor: a free
@@ -933,7 +936,7 @@ impl<'a> EncoderInput<'a> {
   ///
   /// This is the door for a caller who drives the supported seam directly —
   /// `EmissionsAligner::prepare` → this [`Encoder`] → `EmissionsAligner::finish` —
-  /// and it is what [`Aligner::align_chunk`](crate::aligner::Aligner::align_chunk)
+  /// and it is what [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk)
   /// uses internally too. Exposing it is safe *because* the [`PreparedChunk`] is
   /// unforgeable (only asry's `prepare` mints one) and carries both lengths
   /// together: there is no way to hand this door a padded buffer with a mismatched
@@ -1016,7 +1019,7 @@ impl Encoder {
   /// input isn't `[1, ENCODER_WINDOW_SAMPLES]` f32, or its `emissions`
   /// output isn't rank 3 with `shape[0] == 1`,
   /// `shape[1] == EXPECTED_OUTPUT_FRAMES` (2999), and
-  /// `shape[2] == crate::vocab::VOCAB_SIZE` f32. The frame count (`shape[1]`)
+  /// `shape[2] == crate::audio::align::vocab::VOCAB_SIZE` f32. The frame count (`shape[1]`)
   /// is read from the introspected shape into the `frames` field — mirroring
   /// `dia-coreml::SegmentModel`'s `num_frames`
   /// (`crates/dia-coreml/src/segment/mod.rs`) — but, unlike that
@@ -1115,11 +1118,11 @@ impl Encoder {
     let emissions =
       outputs
         .take(names::EMISSIONS)
-        .ok_or_else(|| coremlit::PredictionError::MissingOutput {
+        .ok_or_else(|| crate::PredictionError::MissingOutput {
           name: names::EMISSIONS.to_string(),
         })?;
 
-    let mut data = vec![0.0f32; self.frames * crate::vocab::VOCAB_SIZE];
+    let mut data = vec![0.0f32; self.frames * crate::audio::align::vocab::VOCAB_SIZE];
     emissions.copy_into::<f32>(&mut data)?;
 
     let frames = truncated_frame_count(real_samples, self.frames);
@@ -1128,7 +1131,7 @@ impl Encoder {
     // `truncate` below always shrinks to exactly that length (never a no-op
     // past `data.len()`, which would leave `data` longer than
     // `frames * VOCAB_SIZE`).
-    data.truncate(frames * crate::vocab::VOCAB_SIZE);
+    data.truncate(frames * crate::audio::align::vocab::VOCAB_SIZE);
 
     Ok(RawEmissions { frames, data })
   }
@@ -1137,7 +1140,7 @@ impl Encoder {
   /// CTC log-probabilities into an [`Emissions`] — the sole log-prob currency
   /// [`asry::emissions::EmissionsAligner::finish`] accepts — with
   /// `T = truncated_frame_count(real_samples)` (clamped to [`Self::frames`],
-  /// see below) and `V = `[`crate::vocab::VOCAB_SIZE`].
+  /// see below) and `V = `[`crate::audio::align::vocab::VOCAB_SIZE`].
   ///
   /// The wrap goes through [`Emissions::from_log_probs`], the log-prob door:
   /// **no softmax or log-softmax is applied**, and the raw tensor is passed
@@ -1158,14 +1161,14 @@ impl Encoder {
   /// [`AlignError::UnnormalizedEmissions`] rather than silently re-normalized
   /// garbage. Unlike the crate-private `emissions_raw`, which hands back the
   /// tensor unchecked, **this is the guarded door** — and the only one
-  /// [`crate::aligner::Aligner`] uses.
+  /// [`crate::audio::align::aligner::Aligner`] uses.
   ///
   /// `input` is an [`EncoderInput`]: the buffer the model runs on, bound to the
   /// count of real (pre-pad) audio samples that drives the truncation. A
   /// standalone caller builds one from raw audio with
   /// [`EncoderInput::from_samples`] (buffer == real audio); a `prepare` → encode
   /// → `finish` composer (including this crate's own
-  /// [`Aligner`](crate::aligner::Aligner)) builds it from asry's already-masked,
+  /// [`Aligner`](crate::audio::align::aligner::Aligner)) builds it from asry's already-masked,
   /// receptive-field-padded [`PreparedChunk`] with
   /// [`EncoderInput::from_prepared`], which reads the padded buffer and the true
   /// pre-pad `real_samples` off the one chunk, so this method never re-implements
@@ -1238,16 +1241,16 @@ impl Encoder {
   /// truncates by, which — via the frame count `T` it yields — fixes asry's
   /// effective `n_samples / (T - 1)` grid (~20 ms; `tests/parity_words.rs`)
   /// where the word boundaries land, and the SAME constant handed to
-  /// [`crate::aligner::Aligner`]'s seam. It is fixed by the model's graph and
+  /// [`crate::audio::align::aligner::Aligner`]'s seam. It is fixed by the model's graph and
   /// is deliberately not configurable — a seam-only stride would declare a hop
   /// the encoder never truncated by (at `T >= 2` it would not even move the
   /// boundaries, which follow the encoder-driven grid).
   ///
   /// # Known gap
   ///
-  /// `coremlit::MultiArray::copy_into` validates only the predict-time
+  /// `crate::MultiArray::copy_into` validates only the predict-time
   /// `emissions` tensor's *total element count* against
-  /// `Self::frames * crate::vocab::VOCAB_SIZE` (established once at
+  /// `Self::frames * crate::audio::align::vocab::VOCAB_SIZE` (established once at
   /// construction) — an axes-swapped runtime output carrying the identical
   /// element count (e.g. `[1, VOCAB_SIZE, frames]` instead of `[1, frames,
   /// VOCAB_SIZE]`) is not independently re-validated per call the way
@@ -1285,7 +1288,7 @@ impl Encoder {
   /// the `CpuOnly` default) — so it is the span that tells a caller whether a
   /// slow alignment is the model or the trellis.
   ///
-  /// [`Aligner`]: crate::aligner::Aligner
+  /// [`Aligner`]: crate::audio::align::aligner::Aligner
   #[cfg_attr(
     feature = "tracing",
     tracing::instrument(

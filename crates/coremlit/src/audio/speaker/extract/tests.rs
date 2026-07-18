@@ -1,5 +1,5 @@
 use super::*;
-use coremlit::ComputeUnits;
+use crate::ComputeUnits;
 
 // =====================================================================
 // Hermetic: index/range helpers
@@ -95,7 +95,7 @@ fn zero_slot_column_zeroes_only_the_named_column() {
 // =====================================================================
 // Hermetic: derive_slot_plans — THE critical port (owned.rs:507-591).
 //
-// Every scenario feeds HAND logits THROUGH `crate::segment::multilabel`
+// Every scenario feeds HAND logits THROUGH `crate::audio::speaker::segment::multilabel`
 // (the brief mandates hand logits through multilabel, not hand-written
 // slabs) and asserts the FULL [SlotPlan; 3] array. Class table
 // (segment/mod.rs:412-420): 0=silence, 1=A, 2=B, 3=C, 4=A+B, 5=A+C,
@@ -107,9 +107,10 @@ fn zero_slot_column_zeroes_only_the_named_column() {
 /// fed through `multilabel` so the slab is built exactly as `extract`
 /// builds it, not hand-written.
 fn logits_for_classes(classes: &[usize]) -> Vec<f32> {
-  let mut out = Vec::with_capacity(classes.len() * crate::segment::POWERSET_CLASSES);
+  let mut out =
+    Vec::with_capacity(classes.len() * crate::audio::speaker::segment::POWERSET_CLASSES);
   for &c in classes {
-    let mut row = [0.0f32; crate::segment::POWERSET_CLASSES];
+    let mut row = [0.0f32; crate::audio::speaker::segment::POWERSET_CLASSES];
     row[c] = 5.0;
     out.extend_from_slice(&row);
   }
@@ -118,7 +119,7 @@ fn logits_for_classes(classes: &[usize]) -> Vec<f32> {
 
 /// `classes` → one chunk's `[f][s]` multilabel slab.
 fn classes_to_slab(classes: &[usize]) -> Vec<f64> {
-  crate::segment::multilabel(&logits_for_classes(classes), classes.len())
+  crate::audio::speaker::segment::multilabel(&logits_for_classes(classes), classes.len())
 }
 
 /// `SlotPlan::Embed` from a fixed 6-frame mask literal.
@@ -315,7 +316,7 @@ fn geometry_pipeline_three_chunks_hand_derived_count() {
     segmentations[chunk_segmentation_range(c, num_frames)].copy_from_slice(&slab);
   }
 
-  let count = crate::window::count_from_segmentations(
+  let count = crate::audio::speaker::window::count_from_segmentations(
     &segmentations,
     num_chunks,
     num_frames,
@@ -340,8 +341,14 @@ fn compute_options_new_matches_default() {
 #[test]
 fn compute_options_defaults_match_crate_consts() {
   let o = ComputeOptions::new();
-  assert_eq!(o.segmenter(), crate::segment::DEFAULT_SEGMENT_COMPUTE);
-  assert_eq!(o.embedder(), crate::embed::DEFAULT_EMBED_COMPUTE);
+  assert_eq!(
+    o.segmenter(),
+    crate::audio::speaker::segment::DEFAULT_SEGMENT_COMPUTE
+  );
+  assert_eq!(
+    o.embedder(),
+    crate::audio::speaker::embed::DEFAULT_EMBED_COMPUTE
+  );
   // Both are ComputeUnits::All today; pin that too.
   assert_eq!(o.segmenter(), ComputeUnits::All);
   assert_eq!(o.embedder(), ComputeUnits::All);
@@ -487,7 +494,7 @@ fn options_serde_round_trips() {
 // transform.rs:341-379), so this needs no model, only the `dia` feature.
 // =====================================================================
 
-#[cfg(feature = "dia")]
+#[cfg(feature = "speaker")]
 #[test]
 fn into_offline_input_round_trips_against_real_dia() {
   // A small, self-consistent Extraction (num_chunks=1, F=2, count len ==
@@ -502,8 +509,8 @@ fn into_offline_input_round_trips_against_real_dia() {
     num_chunks: 1,
     num_frames_per_chunk: 2,
     num_output_frames: 4,
-    chunks_sw: crate::window::chunk_sliding_window(&WindowOptions::new()),
-    frames_sw: crate::window::frame_sliding_window(),
+    chunks_sw: crate::audio::speaker::window::chunk_sliding_window(&WindowOptions::new()),
+    frames_sw: crate::audio::speaker::window::frame_sliding_window(),
   };
 
   let plda = dia::plda::PldaTransform::new().expect("hermetic PLDA weights load");
@@ -538,8 +545,8 @@ fn into_offline_input_round_trips_against_real_dia() {
 // (SPEAKERKIT_TEST_MODELS or Models/speakerkit/) plus the cross-crate
 // ted_60.wav fixture. Loader/path helpers duplicated in miniature because
 // unit tests under `src/` cannot import the separate `tests/`
-// integration-test crate — same reason as crate::embed::tests and
-// crate::segment::tests.
+// integration-test crate — same reason as crate::audio::speaker::embed::tests and
+// crate::audio::speaker::segment::tests.
 // =====================================================================
 
 fn models_dir() -> std::path::PathBuf {
@@ -556,11 +563,11 @@ fn models_dir() -> std::path::PathBuf {
 
 fn load_seg_model() -> SegmentModel {
   // CpuOnly for determinism (no ANE compile-latency variance across runs),
-  // matching crate::segment::tests::load_seg_model. DEFAULT_SEGMENT_COMPUTE
+  // matching crate::audio::speaker::segment::tests::load_seg_model. DEFAULT_SEGMENT_COMPUTE
   // (All) stays the production default.
   SegmentModel::from_file_with(
     models_dir().join("pyannote_segmentation.mlmodelc"),
-    crate::segment::SegmentModelOptions::new().with_compute(ComputeUnits::CpuOnly),
+    crate::audio::speaker::segment::SegmentModelOptions::new().with_compute(ComputeUnits::CpuOnly),
   )
   .expect("load pyannote_segmentation.mlmodelc")
 }
@@ -568,7 +575,7 @@ fn load_seg_model() -> SegmentModel {
 fn load_embed_model() -> EmbedModel {
   EmbedModel::from_file_with(
     models_dir().join("wespeaker_v2.mlmodelc"),
-    crate::embed::EmbedModelOptions::new().with_compute(ComputeUnits::CpuOnly),
+    crate::audio::speaker::embed::EmbedModelOptions::new().with_compute(ComputeUnits::CpuOnly),
   )
   .expect("load wespeaker_v2.mlmodelc")
 }

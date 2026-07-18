@@ -293,7 +293,7 @@ fn glob_match_real_call_site_pattern_crosses_path_separators() {
 #[test]
 fn model_info_rejects_empty_name() {
   let err =
-    ModelInfo::try_new("", None, None, coremlit::ComputeUnits::CpuAndNeuralEngine).unwrap_err();
+    ModelInfo::try_new("", None, None, crate::ComputeUnits::CpuAndNeuralEngine).unwrap_err();
   assert!(matches!(err, ModelError::EmptyName));
 }
 
@@ -305,7 +305,7 @@ fn model_info_download_pattern_full_and_minimal() {
     "speaker_segmenter",
     Some("pyannote-v3".to_string()),
     Some("W8A16".to_string()),
-    coremlit::ComputeUnits::CpuAndNeuralEngine,
+    crate::ComputeUnits::CpuAndNeuralEngine,
   )
   .unwrap();
   assert_eq!(
@@ -317,7 +317,7 @@ fn model_info_download_pattern_full_and_minimal() {
     "speaker_segmenter",
     None,
     None,
-    coremlit::ComputeUnits::CpuAndNeuralEngine,
+    crate::ComputeUnits::CpuAndNeuralEngine,
   )
   .unwrap();
   assert_eq!(minimal.download_pattern(), "speaker_segmenter/*/*/*");
@@ -329,15 +329,15 @@ fn model_info_accessors() {
     "speaker_segmenter",
     Some("pyannote-v3".to_string()),
     Some("W8A16".to_string()),
-    coremlit::ComputeUnits::CpuAndNeuralEngine,
+    crate::ComputeUnits::CpuAndNeuralEngine,
   )
   .unwrap();
   assert_eq!(info.name(), "speaker_segmenter");
   assert_eq!(info.version(), Some("pyannote-v3"));
   assert_eq!(info.variant(), Some("W8A16"));
-  assert_eq!(info.compute(), coremlit::ComputeUnits::CpuAndNeuralEngine);
+  assert_eq!(info.compute(), crate::ComputeUnits::CpuAndNeuralEngine);
 
-  let minimal = ModelInfo::try_new("x", None, None, coremlit::ComputeUnits::CpuOnly).unwrap();
+  let minimal = ModelInfo::try_new("x", None, None, crate::ComputeUnits::CpuOnly).unwrap();
   assert_eq!(minimal.version(), None);
   assert_eq!(minimal.variant(), None);
 }
@@ -352,7 +352,7 @@ fn model_info_find_base_folder_walks_up_to_name() {
     "speaker_segmenter",
     Some("pyannote-v3".to_string()),
     Some("W8A16".to_string()),
-    coremlit::ComputeUnits::CpuAndNeuralEngine,
+    crate::ComputeUnits::CpuAndNeuralEngine,
   )
   .unwrap();
   let dir = tempfile::tempdir().unwrap();

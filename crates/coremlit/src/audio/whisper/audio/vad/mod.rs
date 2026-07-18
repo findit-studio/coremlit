@@ -4,7 +4,7 @@
 //! class's shared chunk/silence utilities become provided trait methods)
 //! and `EnergyVAD.swift`.
 
-use crate::constants::SAMPLE_RATE;
+use crate::audio::whisper::constants::SAMPLE_RATE;
 
 #[cfg(test)]
 mod tests;
@@ -23,9 +23,9 @@ pub const DEFAULT_ENERGY_THRESHOLD: f32 = 0.02;
 /// (`VoiceActivityDetector.swift`). Every method takes `&self` and returns
 /// a concrete, owned or borrowed value — no generics, no `Self`-sized
 /// return — so this trait is dyn-compatible; that is what lets
-/// [`crate::transcribe::WhisperKit`] hold one behind
+/// [`crate::audio::whisper::transcribe::WhisperKit`] hold one behind
 /// `Box<dyn VoiceActivityDetector + Send + Sync>` and swap it at runtime
-/// via [`crate::transcribe::WhisperKit::set_vad_detector`].
+/// via [`crate::audio::whisper::transcribe::WhisperKit::set_vad_detector`].
 pub trait VoiceActivityDetector {
   /// One activity flag per [`Self::frame_length_samples`]-sized frame
   /// (final partial frame included).
@@ -46,10 +46,10 @@ pub trait VoiceActivityDetector {
   /// failure masquerade as silence and silently corrupt chunk boundaries,
   /// such a detector latches the failure — bumping this generation and
   /// recording the error for [`last_detection_error`](Self::last_detection_error).
-  /// [`WhisperKit::transcribe`](crate::transcribe::WhisperKit::transcribe)
+  /// [`WhisperKit::transcribe`](crate::audio::whisper::transcribe::WhisperKit::transcribe)
   /// snapshots this generation before driving the detector for chunking
   /// and compares it afterward: any advance means a hard failure occurred
-  /// during that window, so it surfaces a [`crate::error::VadError`]
+  /// during that window, so it surfaces a [`crate::audio::whisper::error::VadError`]
   /// instead of returning an `Ok` transcript off a degraded segmentation.
   ///
   /// Comparing a monotonic generation — rather than draining a shared error
@@ -68,7 +68,7 @@ pub trait VoiceActivityDetector {
   /// The most recent hard inference failure this detector latched, or `None`
   /// if it cannot fail or none has occurred. Reading it is
   /// **non-destructive** — the failure stays recorded, so concurrent
-  /// [`transcribe`](crate::transcribe::WhisperKit::transcribe) callers that
+  /// [`transcribe`](crate::audio::whisper::transcribe::WhisperKit::transcribe) callers that
   /// each observe a [`detection_generation`](Self::detection_generation)
   /// advance can all retrieve it.
   ///

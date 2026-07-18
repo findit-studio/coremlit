@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::{
+use crate::audio::whisper::{
   audio::vad::VoiceActivityDetector,
   backend::{ModelDims, mock::MockBackend},
   error::{SegmentError, TranscribeError, VadError},
@@ -104,9 +104,9 @@ fn zero_window_run_observes_no_language_in_provenance() {
     "and was truncated by nothing"
   );
 
-  let provenance = crate::provenance::Provenance::for_result(
+  let provenance = crate::audio::whisper::provenance::Provenance::for_result(
     &DecodingOptions::new(),
-    &crate::options::ComputeOptions::new(),
+    &crate::audio::whisper::options::ComputeOptions::new(),
     &result,
   );
   assert_eq!(
@@ -395,16 +395,16 @@ fn compression_failure_marks_swallowed_error() {
     .maybe_logprob_threshold(None)
     .with_temperature_fallback_count(1) // attempts 0 and 1
     .with_seed(7);
-  let compute = crate::options::ComputeOptions::new();
+  let compute = crate::audio::whisper::options::ComputeOptions::new();
 
   // Run 1: fail attempt 0's finalize compression (the thread's first).
-  crate::text::fault::reset_compression_faults();
-  crate::text::fault::fail_compression_on_call(1);
+  crate::audio::whisper::text::fault::reset_compression_faults();
+  crate::audio::whisper::text::fault::fail_compression_on_call(1);
   let mock1 = build();
   let result1 = TranscribeTask::new(&mock1, &t)
     .run(&vec![0.1; 32_000], &options)
     .unwrap();
-  crate::text::fault::reset_compression_faults();
+  crate::audio::whisper::text::fault::reset_compression_faults();
 
   assert_eq!(
     result1.task_facts().had_swallowed_error(),
@@ -416,7 +416,8 @@ fn compression_failure_marks_swallowed_error() {
     "the swallowed +inf rejected attempt 0 (0.3); attempt 1 (0.5) was accepted"
   );
   assert!(
-    !crate::provenance::Provenance::for_result(&options, &compute, &result1).is_reproducible(),
+    !crate::audio::whisper::provenance::Provenance::for_result(&options, &compute, &result1)
+      .is_reproducible(),
     "a transcript that hinged on a swallowed OS error is not byte-reproducible"
   );
 
@@ -445,7 +446,7 @@ fn segment_discovery_callback_fires_per_window() {
   let hello = t.encode(" Hello").unwrap()[0];
   script_clean_window(&mut mock, hello);
   let discovered = std::sync::Mutex::new(Vec::<usize>::new());
-  let callback: &(dyn Fn(&[crate::result::TranscriptionSegment]) + Sync) =
+  let callback: &(dyn Fn(&[crate::audio::whisper::result::TranscriptionSegment]) + Sync) =
     &|segments| discovered.lock().unwrap().push(segments.len());
   let task = TranscribeTask::new(&mock, &t).with_segment_callback(callback);
   task
@@ -610,7 +611,7 @@ fn all_masked_probe_does_not_fabricate_language() {
   // empty-probs probe promotes `"en"` -- part 1 reads `Some("en")` and part 2's
   // fabricated `"en"` suppresses the predicted `"es"`, failing both `observed`
   // assertions.
-  use crate::backend::InferenceBackend;
+  use crate::audio::whisper::backend::InferenceBackend;
   let t = tiny_tokenizer();
   let s = special();
   let es = t.token_to_id("<|es|>").unwrap();
@@ -642,7 +643,7 @@ fn all_masked_probe_does_not_fabricate_language() {
   );
   assert_eq!(
     probe.language(),
-    crate::constants::DEFAULT_LANGUAGE_CODE,
+    crate::audio::whisper::constants::DEFAULT_LANGUAGE_CODE,
     "with nothing sampled the probe reports the Swift-faithful \"en\" DISPLAY default"
   );
 
@@ -662,7 +663,7 @@ fn all_masked_probe_does_not_fabricate_language() {
     .unwrap();
   assert_eq!(
     result_a.language(),
-    crate::constants::DEFAULT_LANGUAGE_CODE,
+    crate::audio::whisper::constants::DEFAULT_LANGUAGE_CODE,
     "the display language is the Swift-faithful \"en\" default"
   );
   assert_eq!(
@@ -683,7 +684,7 @@ fn all_masked_probe_does_not_fabricate_language() {
     .unwrap();
   assert_eq!(
     result_b.language(),
-    crate::constants::DEFAULT_LANGUAGE_CODE,
+    crate::audio::whisper::constants::DEFAULT_LANGUAGE_CODE,
     "the display language is still the forced-prefill \"en\""
   );
   assert_eq!(
@@ -789,9 +790,9 @@ fn a_predicted_language_is_recorded_over_the_forced_display_language() {
     "the DETECTION is the PREDICTED <|es|>, not the forced display <|en|>"
   );
   assert_eq!(
-    crate::provenance::Provenance::for_result(
+    crate::audio::whisper::provenance::Provenance::for_result(
       &options,
-      &crate::options::ComputeOptions::new(),
+      &crate::audio::whisper::options::ComputeOptions::new(),
       &result,
     )
     .task_facts()
@@ -939,9 +940,10 @@ fn worker_schedule_is_unknown_when_a_vad_chunk_errors() {
     "an errored chunk leaves the exact total unknown, but the two surviving chunks' \
      ordinals still lower-bound the run's span (round 12; was the bound-less None)",
   );
-  let compute = crate::options::ComputeOptions::new();
+  let compute = crate::audio::whisper::options::ComputeOptions::new();
   assert!(
-    !crate::provenance::Provenance::for_result(&options, &compute, &result).is_reproducible(),
+    !crate::audio::whisper::provenance::Provenance::for_result(&options, &compute, &result)
+      .is_reproducible(),
     "a run that silently dropped a chunk cannot promise byte reproducibility",
   );
 
@@ -988,7 +990,7 @@ fn vad_detector_swap_changes_chunk_boundaries() {
       vec![true; samples.len().div_ceil(self.frame_length_samples())]
     }
     fn frame_length_samples(&self) -> usize {
-      crate::audio::vad::DEFAULT_FRAME_LENGTH_SAMPLES
+      crate::audio::whisper::audio::vad::DEFAULT_FRAME_LENGTH_SAMPLES
     }
   }
 
@@ -1042,7 +1044,7 @@ fn transcribe_surfaces_a_latched_vad_failure_instead_of_ok() {
       vec![false; samples.len().div_ceil(self.frame_length_samples())]
     }
     fn frame_length_samples(&self) -> usize {
-      crate::audio::vad::DEFAULT_FRAME_LENGTH_SAMPLES
+      crate::audio::whisper::audio::vad::DEFAULT_FRAME_LENGTH_SAMPLES
     }
     fn detection_generation(&self) -> u64 {
       // One latched failure once `voice_activity` has run; monotonic, so the
@@ -1145,7 +1147,7 @@ fn concurrent_transcribe_cannot_steal_a_latched_vad_failure() {
       vec![false; samples.len().div_ceil(self.frame_length_samples())]
     }
     fn frame_length_samples(&self) -> usize {
-      crate::audio::vad::DEFAULT_FRAME_LENGTH_SAMPLES
+      crate::audio::whisper::audio::vad::DEFAULT_FRAME_LENGTH_SAMPLES
     }
     fn detection_generation(&self) -> u64 {
       *self.0.generation.lock().unwrap()
@@ -1273,14 +1275,15 @@ fn early_stop_does_not_leak_into_fallback_retries() {
   let hello = t.encode(" Hello").unwrap()[0];
   script_clean_window(&mut mock, hello);
   let calls = std::sync::Mutex::new(0usize);
-  let callback: &(dyn Fn(&crate::result::TranscriptionProgress) -> Option<bool> + Sync) =
-    &|_progress| {
-      let mut seen = calls.lock().unwrap();
-      *seen += 1;
-      // Call 6 = attempt 0's third sampled step (after hello + both
-      // timestamps landed): request the stop. Every other call continues.
-      Some(*seen != 6)
-    };
+  let callback: &(
+     dyn Fn(&crate::audio::whisper::result::TranscriptionProgress) -> Option<bool> + Sync
+   ) = &|_progress| {
+    let mut seen = calls.lock().unwrap();
+    *seen += 1;
+    // Call 6 = attempt 0's third sampled step (after hello + both
+    // timestamps landed): request the stop. Every other call continues.
+    Some(*seen != 6)
+  };
   let task = TranscribeTask::new(&mock, &t).with_progress_callback(callback);
   // At t = 0 the window averages ~-0.19 (hello's one-hot logprob -1.21
   // diluted by prefill/EOT zeros and the mass-rule-boosted timestamp
@@ -1324,7 +1327,7 @@ fn a_rejected_attempts_early_stop_survives_the_fallback_selection() {
   let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
   let hello = t.encode(" Hello").unwrap()[0];
   script_clean_window(&mut mock, hello);
-  let compute = crate::options::ComputeOptions::new();
+  let compute = crate::audio::whisper::options::ComputeOptions::new();
   // Same fallback-forcing configuration as the leak test above, but with a ZERO
   // fallback increment so the accepted retry stays greedy (temperature 0.0) and
   // never DRAWS -- isolating the early-stop fact as the only thing that can move
@@ -1348,18 +1351,20 @@ fn a_rejected_attempts_early_stop_survives_the_fallback_selection() {
     Some(false),
     "greedy retry never draws"
   );
-  let uncut_prov = crate::provenance::Provenance::for_result(&options, &compute, &uncut);
+  let uncut_prov =
+    crate::audio::whisper::provenance::Provenance::for_result(&options, &compute, &uncut);
   assert!(uncut_prov.is_reproducible());
 
   // WITH a callback that stops attempt 0's third sampled step (call 6, exactly as
   // the leak test): the rejected attempt is truncated, attempt 1 completes.
   let calls = std::sync::Mutex::new(0usize);
-  let callback: &(dyn Fn(&crate::result::TranscriptionProgress) -> Option<bool> + Sync) =
-    &|_progress| {
-      let mut seen = calls.lock().unwrap();
-      *seen += 1;
-      Some(*seen != 6)
-    };
+  let callback: &(
+     dyn Fn(&crate::audio::whisper::result::TranscriptionProgress) -> Option<bool> + Sync
+   ) = &|_progress| {
+    let mut seen = calls.lock().unwrap();
+    *seen += 1;
+    Some(*seen != 6)
+  };
   let truncated = TranscribeTask::new(&mock, &t)
     .with_progress_callback(callback)
     .run(&vec![0.1; 32_000], &options)
@@ -1379,7 +1384,8 @@ fn a_rejected_attempts_early_stop_survives_the_fallback_selection() {
     Some(false),
     "the greedy retry never draws, so early_stopped is the ONLY differing fact"
   );
-  let trunc_prov = crate::provenance::Provenance::for_result(&options, &compute, &truncated);
+  let trunc_prov =
+    crate::audio::whisper::provenance::Provenance::for_result(&options, &compute, &truncated);
   assert_eq!(trunc_prov.task_facts().early_stopped(), Some(true));
   assert!(
     !trunc_prov.is_reproducible(),
@@ -1406,7 +1412,7 @@ fn a_callback_truncation_is_recorded_and_is_not_reproducible() {
   let hello = t.encode(" Hello").unwrap()[0];
   script_clean_window(&mut mock, hello);
   let options = DecodingOptions::new();
-  let compute = crate::options::ComputeOptions::new();
+  let compute = crate::audio::whisper::options::ComputeOptions::new();
 
   // WITHOUT a callback: the full greedy transcript, reproducible from options.
   let full = TranscribeTask::new(&mock, &t)
@@ -1417,7 +1423,8 @@ fn a_callback_truncation_is_recorded_and_is_not_reproducible() {
     Some(false),
     "no callback truncated the full run"
   );
-  let full_prov = crate::provenance::Provenance::for_result(&options, &compute, &full);
+  let full_prov =
+    crate::audio::whisper::provenance::Provenance::for_result(&options, &compute, &full);
   assert!(
     full_prov.is_reproducible(),
     "a greedy, un-truncated run reproduces from options alone"
@@ -1425,8 +1432,9 @@ fn a_callback_truncation_is_recorded_and_is_not_reproducible() {
 
   // WITH a callback that stops at the first non-prefill step: the decode breaks
   // early, so the transcript is a truncation of the full one.
-  let stop: &(dyn Fn(&crate::result::TranscriptionProgress) -> Option<bool> + Sync) =
-    &|_progress| Some(false);
+  let stop: &(
+     dyn Fn(&crate::audio::whisper::result::TranscriptionProgress) -> Option<bool> + Sync
+   ) = &|_progress| Some(false);
   let truncated = TranscribeTask::new(&mock, &t)
     .with_progress_callback(stop)
     .run(&vec![0.1; 32_000], &options)
@@ -1436,7 +1444,8 @@ fn a_callback_truncation_is_recorded_and_is_not_reproducible() {
     Some(true),
     "the callback's Some(false) truncated this run"
   );
-  let trunc_prov = crate::provenance::Provenance::for_result(&options, &compute, &truncated);
+  let trunc_prov =
+    crate::audio::whisper::provenance::Provenance::for_result(&options, &compute, &truncated);
   assert_eq!(
     trunc_prov.task_facts().early_stopped(),
     Some(true),
@@ -1467,7 +1476,8 @@ fn a_callback_truncation_is_recorded_and_is_not_reproducible() {
     .segments_slice()
     .first()
     .expect("the full greedy run produced a segment");
-  let seg_prov = crate::provenance::Provenance::for_segment(&options, &compute, segment, false);
+  let seg_prov =
+    crate::audio::whisper::provenance::Provenance::for_segment(&options, &compute, segment, false);
   assert!(
     !seg_prov.is_reproducible(),
     "for_segment cannot observe the truncation, so it must not promise reproducibility"
@@ -1496,7 +1506,7 @@ fn window_id_offset_is_recorded_in_the_result_and_provenance() {
   let hello = t.encode(" Hello").unwrap()[0];
   script_clean_window(&mut mock, hello);
   let options = DecodingOptions::new();
-  let compute = crate::options::ComputeOptions::new();
+  let compute = crate::audio::whisper::options::ComputeOptions::new();
 
   let worker0 = TranscribeTask::new(&mock, &t)
     .with_window_id_offset(0)
@@ -1509,8 +1519,10 @@ fn window_id_offset_is_recorded_in_the_result_and_provenance() {
   assert_eq!(worker0.task_facts().worker_schedule(), Some([0].as_slice()));
   assert_eq!(worker3.task_facts().worker_schedule(), Some([3].as_slice()));
 
-  let prov0 = crate::provenance::Provenance::for_result(&options, &compute, &worker0);
-  let prov3 = crate::provenance::Provenance::for_result(&options, &compute, &worker3);
+  let prov0 =
+    crate::audio::whisper::provenance::Provenance::for_result(&options, &compute, &worker0);
+  let prov3 =
+    crate::audio::whisper::provenance::Provenance::for_result(&options, &compute, &worker3);
   assert_eq!(prov0.task_facts().worker_schedule(), Some([0].as_slice()));
   assert_eq!(prov3.task_facts().worker_schedule(), Some([3].as_slice()));
   assert_ne!(
@@ -1559,7 +1571,7 @@ fn window_loop_attaches_word_timings_when_enabled() {
   let words = result.segments_slice()[0].words_slice();
   assert!(!words.is_empty(), "word timings attached");
   let joined: String = words.iter().map(|w| w.word()).collect();
-  assert_eq!(crate::text::normalized(&joined), "hello");
+  assert_eq!(crate::audio::whisper::text::normalized(&joined), "hello");
   for word in words {
     assert!(word.end() >= word.start());
     assert!(
@@ -1788,8 +1800,11 @@ fn silence_skipped_window_with_word_timestamps_surfaces_a_segment_error() {
 /// the real model emits, which the drop filter's Swift-whitespace trim
 /// normalizes away before matching.
 fn blank_audio_tokens(t: &WhisperTokenizer) -> Vec<u32> {
-  t.encode(&format!(" {}", crate::constants::BLANK_AUDIO_MARKER))
-    .unwrap()
+  t.encode(&format!(
+    " {}",
+    crate::audio::whisper::constants::BLANK_AUDIO_MARKER
+  ))
+  .unwrap()
 }
 
 /// One window decoding to nothing but `[BLANK_AUDIO]` — the scripted
@@ -1860,7 +1875,10 @@ fn blank_audio_segment_is_emitted_when_drop_is_cleared() {
   let options = DecodingOptions::new().maybe_drop_blank_audio(false);
   let result = task.run(&vec![0.1; 32_000], &options).unwrap();
   assert_eq!(result.segments_slice().len(), 1);
-  assert_eq!(result.text(), crate::constants::BLANK_AUDIO_MARKER);
+  assert_eq!(
+    result.text(),
+    crate::audio::whisper::constants::BLANK_AUDIO_MARKER
+  );
 }
 
 #[test]
@@ -1901,7 +1919,7 @@ fn blank_audio_drop_keeps_surrounding_speech_and_preserves_ids() {
     assert!(
       !segment
         .text()
-        .contains(crate::constants::BLANK_AUDIO_MARKER),
+        .contains(crate::audio::whisper::constants::BLANK_AUDIO_MARKER),
       "no surviving segment carries the marker: {segment:?}"
     );
   }
@@ -1923,7 +1941,9 @@ fn blank_audio_between_speech_is_kept_when_drop_is_cleared() {
 
   assert_eq!(result.segments_slice().len(), 3);
   assert!(
-    result.text().contains(crate::constants::BLANK_AUDIO_MARKER),
+    result
+      .text()
+      .contains(crate::audio::whisper::constants::BLANK_AUDIO_MARKER),
     "got: {:?}",
     result.text()
   );
@@ -1999,7 +2019,7 @@ fn vad_chunked_blank_audio_is_joined_verbatim_when_drop_is_cleared() {
     .maybe_drop_blank_audio(false);
 
   let result = kit.transcribe(&audio, &options).unwrap();
-  let marker = crate::constants::BLANK_AUDIO_MARKER;
+  let marker = crate::audio::whisper::constants::BLANK_AUDIO_MARKER;
   assert_eq!(result.text(), format!("{marker} {marker} {marker}"));
   assert_eq!(result.segments_slice().len(), 3);
 }
@@ -2136,7 +2156,10 @@ fn a_window_accepted_above_zero_can_decode_the_blank_marker_and_be_dropped() {
       &options.clone().maybe_drop_blank_audio(false),
     )
     .unwrap();
-  assert_eq!(observed.text(), crate::constants::BLANK_AUDIO_MARKER);
+  assert_eq!(
+    observed.text(),
+    crate::audio::whisper::constants::BLANK_AUDIO_MARKER
+  );
   assert_eq!(
     observed.segments_slice()[0].temperature(),
     0.2,
@@ -2160,9 +2183,9 @@ fn a_window_accepted_above_zero_can_decode_the_blank_marker_and_be_dropped() {
     "the sampling must survive the segment that carried it"
   );
 
-  let provenance = crate::provenance::Provenance::for_result(
+  let provenance = crate::audio::whisper::provenance::Provenance::for_result(
     &options,
-    &crate::options::ComputeOptions::new(),
+    &crate::audio::whisper::options::ComputeOptions::new(),
     &result,
   );
   assert!(
@@ -2218,9 +2241,9 @@ fn a_rejected_nonzero_attempt_is_recorded_even_when_the_window_is_accepted_greed
     Some(true),
     "attempt 0 drew at -0.2, even though the window was accepted greedily at 0.0"
   );
-  let provenance = crate::provenance::Provenance::for_result(
+  let provenance = crate::audio::whisper::provenance::Provenance::for_result(
     &options,
-    &crate::options::ComputeOptions::new(),
+    &crate::audio::whisper::options::ComputeOptions::new(),
     &result,
   );
   assert!(
@@ -2281,9 +2304,9 @@ fn a_nonzero_temperature_that_never_samples_records_no_sampling() {
     0.3,
     "the segment carries the accepted 0.3 rung, though nothing was drawn"
   );
-  let provenance = crate::provenance::Provenance::for_result(
+  let provenance = crate::audio::whisper::provenance::Provenance::for_result(
     &options,
-    &crate::options::ComputeOptions::new(),
+    &crate::audio::whisper::options::ComputeOptions::new(),
     &result,
   );
   assert_eq!(
@@ -2343,8 +2366,10 @@ fn unseeded_sampling_survives_the_blank_audio_drop() {
     "B sampled, and said so"
   );
 
-  let merged =
-    crate::result::merge_transcription_results_with_options(&[chunk_a, chunk_b], &options);
+  let merged = crate::audio::whisper::result::merge_transcription_results_with_options(
+    &[chunk_a, chunk_b],
+    &options,
+  );
   assert_eq!(merged.text(), "Hello");
   assert!(
     merged
@@ -2358,8 +2383,9 @@ fn unseeded_sampling_survives_the_blank_audio_drop() {
   // The merge OR-ed the fact out of the chunk whose segments are gone.
   assert_eq!(merged.task_facts().drew_from_rng(), Some(true));
 
-  let compute = crate::options::ComputeOptions::new();
-  let provenance = crate::provenance::Provenance::for_result(&options, &compute, &merged);
+  let compute = crate::audio::whisper::options::ComputeOptions::new();
+  let provenance =
+    crate::audio::whisper::provenance::Provenance::for_result(&options, &compute, &merged);
   assert_eq!(
     provenance.effective_temperature(),
     Some(0.0),
@@ -2379,7 +2405,7 @@ fn unseeded_sampling_survives_the_blank_audio_drop() {
   script_clean_window(&mut speech, t.encode(" Hello").unwrap()[0]);
   let mut blank = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
   script_blank_audio_window(&mut blank, &t);
-  let merged_seeded = crate::result::merge_transcription_results_with_options(
+  let merged_seeded = crate::audio::whisper::result::merge_transcription_results_with_options(
     &[
       TranscribeTask::new(&speech, &t)
         .run(&vec![0.1; 32_000], &seeded)
@@ -2392,7 +2418,8 @@ fn unseeded_sampling_survives_the_blank_audio_drop() {
   );
   assert_eq!(merged_seeded.task_facts().drew_from_rng(), Some(true));
   assert!(
-    crate::provenance::Provenance::for_result(&seeded, &compute, &merged_seeded).is_reproducible(),
+    crate::audio::whisper::provenance::Provenance::for_result(&seeded, &compute, &merged_seeded)
+      .is_reproducible(),
     "a seed makes the same sampled window replayable"
   );
 }
@@ -2437,9 +2464,9 @@ fn unseeded_sampling_survives_a_no_speech_window_with_no_segments() {
     "it still sampled at 0.5, and the record has to know"
   );
   assert!(
-    !crate::provenance::Provenance::for_result(
+    !crate::audio::whisper::provenance::Provenance::for_result(
       &options,
-      &crate::options::ComputeOptions::new(),
+      &crate::audio::whisper::options::ComputeOptions::new(),
       &result,
     )
     .is_reproducible()
@@ -2469,9 +2496,9 @@ fn a_greedy_run_stays_reproducible_through_the_drop() {
     "greedy throughout: the sampler was never consulted"
   );
   assert!(
-    crate::provenance::Provenance::for_result(
+    crate::audio::whisper::provenance::Provenance::for_result(
       &options,
-      &crate::options::ComputeOptions::new(),
+      &crate::audio::whisper::options::ComputeOptions::new(),
       &result,
     )
     .is_reproducible(),
@@ -2523,9 +2550,9 @@ fn unseeded_draw_survives_an_errored_vad_chunk_drop() {
     "the dropped chunk's unseeded draw must survive into the merged result"
   );
   assert!(
-    !crate::provenance::Provenance::for_result(
+    !crate::audio::whisper::provenance::Provenance::for_result(
       &options,
-      &crate::options::ComputeOptions::new(),
+      &crate::audio::whisper::options::ComputeOptions::new(),
       &result,
     )
     .is_reproducible(),
@@ -2572,9 +2599,9 @@ fn probe_detection_survives_an_errored_vad_chunk_drop() {
     "the dropped chunk's probe detection must survive into the merged result"
   );
   assert_eq!(
-    crate::provenance::Provenance::for_result(
+    crate::audio::whisper::provenance::Provenance::for_result(
       &options,
-      &crate::options::ComputeOptions::new(),
+      &crate::audio::whisper::options::ComputeOptions::new(),
       &result,
     )
     .task_facts()
@@ -2635,9 +2662,9 @@ fn predicted_language_survives_an_errored_vad_chunk_drop() {
     "the dropped chunk's PREDICTED language must survive into the merged result"
   );
   assert_eq!(
-    crate::provenance::Provenance::for_result(
+    crate::audio::whisper::provenance::Provenance::for_result(
       &options,
-      &crate::options::ComputeOptions::new(),
+      &crate::audio::whisper::options::ComputeOptions::new(),
       &result,
     )
     .task_facts()
@@ -2767,9 +2794,9 @@ fn vad_run_with_zero_chunks_is_known_clean_not_unknown() {
     Some(known_empty),
     "a zero-chunk VAD run observed zero workers -- Some([]), never unknown None",
   );
-  let provenance = crate::provenance::Provenance::for_result(
+  let provenance = crate::audio::whisper::provenance::Provenance::for_result(
     &options,
-    &crate::options::ComputeOptions::new(),
+    &crate::audio::whisper::options::ComputeOptions::new(),
     &result,
   );
   assert_eq!(

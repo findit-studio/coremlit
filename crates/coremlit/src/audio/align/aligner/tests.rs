@@ -98,9 +98,12 @@ fn options_serde_round_trips() {
 fn build_seam_wires_blank_id_zero_and_vocab_29() {
   let seam = build_seam(Lang::En, normalizer(), &AlignerOptions::new())
     .expect("bundled tokenizer + explicit blank id builds");
-  assert_eq!(seam.blank_token_id(), crate::vocab::BLANK_ID);
+  assert_eq!(seam.blank_token_id(), crate::audio::align::vocab::BLANK_ID);
   assert_eq!(seam.blank_token_id(), 0);
-  assert_eq!(seam.vocab_size().get(), crate::vocab::VOCAB_SIZE);
+  assert_eq!(
+    seam.vocab_size().get(),
+    crate::audio::align::vocab::VOCAB_SIZE
+  );
 }
 
 #[test]
@@ -130,7 +133,7 @@ fn seam_stride_is_the_encoder_stride() {
   assert_eq!(seam.hop_samples(), SEAM_HOP_SAMPLES);
   assert_eq!(
     seam.hop_samples().get() as usize,
-    crate::encode::HOP_SAMPLES,
+    crate::audio::align::encode::HOP_SAMPLES,
     "the seam's hop must equal the encoder's truncation stride (the stride that times the words, \
      via T)"
   );
@@ -142,9 +145,10 @@ fn bundled_tokenizer_has_no_autodetectable_blank() {
   // load-bearing: WITHOUT it, asry's default `<pad>` / `[PAD]` / `<blank>`
   // auto-detect finds nothing in the chordai vocab and construction FAILS.
   // A mutant dropping that override would regress to exactly this error.
-  let result = EmissionsAligner::builder(Lang::En, crate::vocab::tokenizer_json_bytes())
-    .normalizer(normalizer())
-    .build();
+  let result =
+    EmissionsAligner::builder(Lang::En, crate::audio::align::vocab::tokenizer_json_bytes())
+      .normalizer(normalizer())
+      .build();
   assert!(
     matches!(result, Err(EmissionsError::Config(_))),
     "auto-detect must fail without an explicit blank id"

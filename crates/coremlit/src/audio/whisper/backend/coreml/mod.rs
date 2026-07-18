@@ -25,9 +25,9 @@
 //! (mel features, encoder output) are never read on the CPU at all and
 //! stay owned `MultiArray`s end to end.
 
-use coremlit::{DataType, Model, MultiArray, TensorError, f16};
+use crate::{DataType, Model, MultiArray, TensorError, f16};
 
-use crate::{
+use crate::audio::whisper::{
   backend::{AlignmentView, BackendError, InferenceBackend, ModelDims},
   model::manager::LoadedModels,
 };
@@ -183,7 +183,7 @@ fn append_kv(
 // CoreMlBackend
 // ---------------------------------------------------------------------
 
-/// The real [`InferenceBackend`]: owns the three `coremlit::Model`s of a
+/// The real [`InferenceBackend`]: owns the three `crate::Model`s of a
 /// Whisper pipeline and drives them per the tiny model's introspected I/O
 /// contract (see the module doc). Construction derives [`ModelDims`] from
 /// the models' own descriptions, so non-tiny variants report their real

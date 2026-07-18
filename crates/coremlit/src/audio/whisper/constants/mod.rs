@@ -35,10 +35,10 @@ pub const APPEND_PUNCTUATION: &str = "\"'.。,，!！?？:：”)]}、";
 /// for 5 s of silence under matched VAD/prefill settings).
 ///
 /// **This crate drops such segments by default** (coremlit issue #14):
-/// [`DecodingOptions::drop_blank_audio`](crate::options::DecodingOptions::drop_blank_audio)
+/// [`DecodingOptions::drop_blank_audio`](crate::audio::whisper::options::DecodingOptions::drop_blank_audio)
 /// defaults `true`, so a segment decoding to exactly this marker is
 /// filtered out of
-/// [`TranscriptionResult`](crate::result::TranscriptionResult) after
+/// [`TranscriptionResult`](crate::audio::whisper::result::TranscriptionResult) after
 /// decoding, and pure silence yields an empty result rather than a
 /// one-segment `[BLANK_AUDIO]` — the marker is noise for the search/index
 /// consumers this crate targets. That default is a deliberate divergence
@@ -47,25 +47,25 @@ pub const APPEND_PUNCTUATION: &str = "\"'.。,，!！?？:：”)]}、";
 ///
 /// **Result-level equality is the validated contract** (on that
 /// `drop_blank_audio == false` path). The pinned silence golden asserts
-/// [`TranscriptionResult::text`](crate::result::TranscriptionResult::text)
+/// [`TranscriptionResult::text`](crate::audio::whisper::result::TranscriptionResult::text)
 /// exactly equal to this constant. Segment text is a different shape:
 /// under that same validated configuration (default
 /// `skip_special_tokens == false`),
-/// [`TranscriptionSegment::text`](crate::result::TranscriptionSegment::text)
+/// [`TranscriptionSegment::text`](crate::audio::whisper::result::TranscriptionSegment::text)
 /// is the undecorated per-segment decode and still carries its
 /// special/timestamp tokens
 /// (`<|startoftranscript|><|en|><|transcribe|><|0.00|> [BLANK_AUDIO]<|10.00|><|endoftext|>`
 /// for that golden) — comparing it against this constant with equality
 /// will not match there. Setting `skip_special_tokens` filters those
 /// tokens out of segment text too (see
-/// [`segment::find_seek_point_and_segments`](crate::segment::find_seek_point_and_segments)),
+/// [`segment::find_seek_point_and_segments`](crate::audio::whisper::segment::find_seek_point_and_segments)),
 /// which narrows the gap, but that combination isn't itself pinned by a
 /// golden here: treat a segment-level check as `contains`, not
 /// equality, or filter/model on
-/// [`TranscriptionResult::text`](crate::result::TranscriptionResult::text)
+/// [`TranscriptionResult::text`](crate::audio::whisper::result::TranscriptionResult::text)
 /// instead. It is exactly this raw-vs-clean split that makes the drop
 /// filter match a segment's special-token-stripped decode rather than its
-/// [`TranscriptionSegment::text`](crate::result::TranscriptionSegment::text).
+/// [`TranscriptionSegment::text`](crate::audio::whisper::result::TranscriptionSegment::text).
 pub const BLANK_AUDIO_MARKER: &str = "[BLANK_AUDIO]";
 
 /// Whisper language table: `(english_name, iso_code)`, 112 entries.

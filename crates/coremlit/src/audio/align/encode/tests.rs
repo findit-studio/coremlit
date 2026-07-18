@@ -259,11 +259,14 @@ fn from_prepared_records_the_true_pre_pad_provenance_not_the_padded_length() {
   use asry::emissions::EmissionsAligner;
   use core::sync::atomic::AtomicBool;
 
-  let aligner = EmissionsAligner::builder(crate::Lang::En, crate::vocab::tokenizer_json_bytes())
-    .normalizer(Box::new(crate::EnglishNormalizer::new()))
-    .blank_token_id(crate::vocab::BLANK_ID)
-    .build()
-    .expect("build the En seam from the bundled tokenizer");
+  let aligner = EmissionsAligner::builder(
+    crate::audio::align::Lang::En,
+    crate::audio::align::vocab::tokenizer_json_bytes(),
+  )
+  .normalizer(Box::new(crate::audio::align::EnglishNormalizer::new()))
+  .blank_token_id(crate::audio::align::vocab::BLANK_ID)
+  .build()
+  .expect("build the En seam from the bundled tokenizer");
 
   // 200 real samples of unambiguously non-silent audio. The content is irrelevant
   // to the recorded LENGTH (no encoder runs here), but the text must tokenize to
@@ -273,7 +276,7 @@ fn from_prepared_records_the_true_pre_pad_provenance_not_the_padded_length() {
   let prepared = aligner
     .prepare(
       &samples,
-      &crate::SpeechSpans::all_speech(),
+      &crate::audio::align::SpeechSpans::all_speech(),
       "test",
       &[],
       &abort,
@@ -413,15 +416,21 @@ fn missing_waveform_input_diagnostic_names_the_exact_contract() {
 #[test]
 fn check_emissions_contract_accepts_correct_shape_and_returns_frame_count() {
   assert_eq!(
-    check_emissions_contract(&[1, 2_999, crate::vocab::VOCAB_SIZE], Some(DataType::F32)),
+    check_emissions_contract(
+      &[1, 2_999, crate::audio::align::vocab::VOCAB_SIZE],
+      Some(DataType::F32)
+    ),
     Ok(2_999)
   );
 }
 
 #[test]
 fn check_emissions_contract_rejects_wrong_rank() {
-  let err =
-    check_emissions_contract(&[2_999, crate::vocab::VOCAB_SIZE], Some(DataType::F32)).unwrap_err();
+  let err = check_emissions_contract(
+    &[2_999, crate::audio::align::vocab::VOCAB_SIZE],
+    Some(DataType::F32),
+  )
+  .unwrap_err();
   assert!(matches!(
     err,
     AlignerError::ContractMismatch {
@@ -433,8 +442,11 @@ fn check_emissions_contract_rejects_wrong_rank() {
 
 #[test]
 fn check_emissions_contract_rejects_wrong_batch_dim() {
-  let err = check_emissions_contract(&[2, 2_999, crate::vocab::VOCAB_SIZE], Some(DataType::F32))
-    .unwrap_err();
+  let err = check_emissions_contract(
+    &[2, 2_999, crate::audio::align::vocab::VOCAB_SIZE],
+    Some(DataType::F32),
+  )
+  .unwrap_err();
   assert!(matches!(err, AlignerError::ContractMismatch { .. }));
 }
 
@@ -442,8 +454,11 @@ fn check_emissions_contract_rejects_wrong_batch_dim() {
 fn check_emissions_contract_rejects_zero_frames() {
   // A zero-frame model would "load fine" and make every `emissions()`
   // call silently return an empty result — reject at construction.
-  let err =
-    check_emissions_contract(&[1, 0, crate::vocab::VOCAB_SIZE], Some(DataType::F32)).unwrap_err();
+  let err = check_emissions_contract(
+    &[1, 0, crate::audio::align::vocab::VOCAB_SIZE],
+    Some(DataType::F32),
+  )
+  .unwrap_err();
   assert!(matches!(err, AlignerError::ContractMismatch { .. }));
 }
 
@@ -455,8 +470,11 @@ fn check_emissions_contract_rejects_wrong_vocab_dim() {
 
 #[test]
 fn check_emissions_contract_rejects_wrong_dtype() {
-  let err = check_emissions_contract(&[1, 2_999, crate::vocab::VOCAB_SIZE], Some(DataType::F64))
-    .unwrap_err();
+  let err = check_emissions_contract(
+    &[1, 2_999, crate::audio::align::vocab::VOCAB_SIZE],
+    Some(DataType::F64),
+  )
+  .unwrap_err();
   assert!(matches!(err, AlignerError::ContractMismatch { .. }));
 }
 
@@ -469,8 +487,11 @@ fn check_emissions_contract_rejects_a_cropped_frame_count() {
   // requests 2999 but the introspected 2998 clamps it away). It is now a
   // ContractMismatch at construction. Reverting the check to `>= 1` accepts it
   // and fails this test.
-  let err = check_emissions_contract(&[1, 2_998, crate::vocab::VOCAB_SIZE], Some(DataType::F32))
-    .unwrap_err();
+  let err = check_emissions_contract(
+    &[1, 2_998, crate::audio::align::vocab::VOCAB_SIZE],
+    Some(DataType::F32),
+  )
+  .unwrap_err();
   assert!(matches!(
     err,
     AlignerError::ContractMismatch {
@@ -486,8 +507,11 @@ fn check_emissions_contract_rejects_an_overlong_frame_count() {
   // so an over-long declaration is a ContractMismatch at construction just like
   // the cropped one, in the other direction. Reverting the check to `>= 1`
   // accepts it and fails this test.
-  let err = check_emissions_contract(&[1, 3_000, crate::vocab::VOCAB_SIZE], Some(DataType::F32))
-    .unwrap_err();
+  let err = check_emissions_contract(
+    &[1, 3_000, crate::audio::align::vocab::VOCAB_SIZE],
+    Some(DataType::F32),
+  )
+  .unwrap_err();
   assert!(matches!(
     err,
     AlignerError::ContractMismatch {
@@ -613,8 +637,8 @@ fn check_log_prob_floor_leaves_non_finite_values_to_from_log_probs() {
 // ---------------------------------------------------------------------
 
 /// A frame filled with `value` on every one of the 29 classes.
-fn uniform_frame(value: f32) -> [f32; crate::vocab::VOCAB_SIZE] {
-  [value; crate::vocab::VOCAB_SIZE]
+fn uniform_frame(value: f32) -> [f32; crate::audio::align::vocab::VOCAB_SIZE] {
+  [value; crate::audio::align::vocab::VOCAB_SIZE]
 }
 
 #[test]
@@ -623,12 +647,13 @@ fn check_log_prob_normalization_accepts_normalized_log_probs() {
   // (1) uniform — 29 copies of ln(1/29) = -ln(29), the maximum-entropy
   // distribution; (2) a peaked distribution built as a genuine log-softmax, so
   // its probabilities sum to 1 and its logsumexp is 0 for a NON-uniform row too.
-  let ln29 = f64::from(crate::vocab::VOCAB_SIZE as u32).ln();
+  let ln29 = f64::from(crate::audio::align::vocab::VOCAB_SIZE as u32).ln();
   let uniform = uniform_frame(-ln29 as f32);
 
   // log_softmax of arbitrary logits: row_j = z_j - logsumexp(z), which sums to 1
   // in probability space, so logsumexp(row) == 0.
-  let logits: [f32; crate::vocab::VOCAB_SIZE] = core::array::from_fn(|j| (j as f32) * 0.5 - 3.0);
+  let logits: [f32; crate::audio::align::vocab::VOCAB_SIZE] =
+    core::array::from_fn(|j| (j as f32) * 0.5 - 3.0);
   let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
   let z_lse = f64::from(max)
     + logits
@@ -665,11 +690,12 @@ fn check_log_prob_normalization_rejects_shifted_raw_logits() {
   // scan `from_log_probs` runs — yet no frame is a distribution: a row entirely
   // in [-20, -10] has logsumexp in [max, max + ln 29] ⊆ [-20, -6.63], so
   // |logsumexp| >= 6.63, orders of magnitude past the ±2e-2 tolerance.
-  let mut data = Vec::with_capacity(2999 * crate::vocab::VOCAB_SIZE);
+  let mut data = Vec::with_capacity(2999 * crate::audio::align::vocab::VOCAB_SIZE);
   for _ in 0..2999 {
     // A ramp across the vocab, every value inside [-20, -10]; not normalized.
-    for j in 0..crate::vocab::VOCAB_SIZE {
-      data.push(-10.0 - (j as f32) * (10.0 / (crate::vocab::VOCAB_SIZE as f32 - 1.0)));
+    for j in 0..crate::audio::align::vocab::VOCAB_SIZE {
+      data
+        .push(-10.0 - (j as f32) * (10.0 / (crate::audio::align::vocab::VOCAB_SIZE as f32 - 1.0)));
     }
   }
   // The floor does NOT catch it (nothing below -100)...
@@ -723,7 +749,7 @@ fn check_log_prob_normalization_rejects_an_all_zero_frame() {
   };
   assert_eq!(row, 0);
   assert_eq!(compute, ComputeUnits::All); // the placement is carried through
-  let ln29 = f64::from(crate::vocab::VOCAB_SIZE as u32).ln();
+  let ln29 = f64::from(crate::audio::align::vocab::VOCAB_SIZE as u32).ln();
   assert!(
     (logsumexp - ln29).abs() < 1e-5,
     "all-zeros logsumexp must be ln(29) ≈ {ln29}, got {logsumexp}"
@@ -734,7 +760,7 @@ fn check_log_prob_normalization_rejects_an_all_zero_frame() {
 fn check_log_prob_normalization_names_the_worst_frame() {
   // Several normalized frames (logsumexp ≈ 0) with ONE un-normalized frame at a
   // known index: the error must name THAT frame, not the first or the last.
-  let ln29 = f64::from(crate::vocab::VOCAB_SIZE as u32).ln();
+  let ln29 = f64::from(crate::audio::align::vocab::VOCAB_SIZE as u32).ln();
   let normalized = uniform_frame(-ln29 as f32);
   let bad_index = 2usize;
   let mut data = Vec::new();
@@ -759,7 +785,7 @@ fn check_log_prob_normalization_thresholds_on_the_tolerance() {
   // sit at logsumexp = TOL/2 passes, one at logsumexp = 2·TOL is rejected. (An
   // exact-at-TOL boundary is not pinned here — an f32-stored frame cannot hit an
   // f64 TOL exactly; the `>` strictness is stated on the function.)
-  let ln29 = f64::from(crate::vocab::VOCAB_SIZE as u32).ln();
+  let ln29 = f64::from(crate::audio::align::vocab::VOCAB_SIZE as u32).ln();
   let tol = LOG_PROB_SUM_TOLERANCE;
   // uniform frame value `v` gives logsumexp = v + ln29; solve for the target.
   let inside = uniform_frame((tol / 2.0 - ln29) as f32);
@@ -793,10 +819,11 @@ fn raw_emissions_check_value_domain_binds_the_guard_and_the_minted_buffer() {
   // A shifted-raw-logit matrix — every cell finite, <= 0, and above
   // LOG_PROB_FLOOR, so the floor and `from_log_probs`'s <= 0 scan both miss it
   // and only the normalization step in the sequence rejects it.
-  let mut shifted = Vec::with_capacity(4 * crate::vocab::VOCAB_SIZE);
+  let mut shifted = Vec::with_capacity(4 * crate::audio::align::vocab::VOCAB_SIZE);
   for _ in 0..4 {
-    for j in 0..crate::vocab::VOCAB_SIZE {
-      shifted.push(-10.0 - (j as f32) * (10.0 / (crate::vocab::VOCAB_SIZE as f32 - 1.0)));
+    for j in 0..crate::audio::align::vocab::VOCAB_SIZE {
+      shifted
+        .push(-10.0 - (j as f32) * (10.0 / (crate::audio::align::vocab::VOCAB_SIZE as f32 - 1.0)));
     }
   }
   let raw = RawEmissions {
@@ -828,7 +855,7 @@ fn raw_emissions_check_value_domain_binds_the_guard_and_the_minted_buffer() {
   // A genuinely normalized frame (logsumexp = 0) passes — and the minted token
   // owns EXACTLY the bytes the guard validated: the minter cannot clear one
   // buffer and seal another.
-  let ln29 = f64::from(crate::vocab::VOCAB_SIZE as u32).ln();
+  let ln29 = f64::from(crate::audio::align::vocab::VOCAB_SIZE as u32).ln();
   let normalized = uniform_frame(-ln29 as f32).to_vec();
   let token = RawEmissions {
     frames: 1,
@@ -888,7 +915,7 @@ fn into_emissions_takes_the_log_prob_door_not_the_logit_door() {
   // One frame that clears both value-domain guards yet holds a single positive
   // cell — the `<= 0` half of the log-prob contract the guards defer to
   // `from_log_probs`.
-  let mut data = vec![-20.0f32; crate::vocab::VOCAB_SIZE];
+  let mut data = vec![-20.0f32; crate::audio::align::vocab::VOCAB_SIZE];
   data[0] = 0.001;
 
   // Neither guard rejects it: the floor sees a min of -20.0 (above -100), and
@@ -1056,7 +1083,10 @@ fn emissions_on_full_window_produces_correctly_shaped_finite_log_probs() {
     .emissions_raw(window_input(&samples))
     .expect("emissions on silence");
   assert_eq!(raw.frames, encoder.frames());
-  assert_eq!(raw.data.len(), raw.frames * crate::vocab::VOCAB_SIZE);
+  assert_eq!(
+    raw.data.len(),
+    raw.frames * crate::audio::align::vocab::VOCAB_SIZE
+  );
   assert!(
     raw.data.iter().all(|v| v.is_finite()),
     "all log-probs finite"
@@ -1174,7 +1204,7 @@ fn emissions_reject_an_ane_corrupted_matrix() {
   // count is a property of one OS/ANE firmware pair, but the ORDER of the
   // corruption is the fact worth pinning.
   assert_eq!(compute, ComputeUnits::All);
-  assert_eq!(total, 549 * crate::vocab::VOCAB_SIZE);
+  assert_eq!(total, 549 * crate::audio::align::vocab::VOCAB_SIZE);
   assert!(
     cells > 0 && cells <= total,
     "corrupt cells: {cells}/{total}"
@@ -1221,7 +1251,10 @@ fn emissions_accept_the_cpu_and_gpu_placement() {
     .emissions(window_input(&samples))
     .expect("CpuAndGpu emissions are clean log-probs and must pass the floor guard");
   assert_eq!(emissions.frames(), 549);
-  assert_eq!(emissions.vocab().get(), crate::vocab::VOCAB_SIZE);
+  assert_eq!(
+    emissions.vocab().get(),
+    crate::audio::align::vocab::VOCAB_SIZE
+  );
 }
 
 /// The shipping default on the same real speech, through the SAME guarded door
@@ -1240,7 +1273,10 @@ fn emissions_accept_the_default_placement_on_real_speech() {
     .emissions(window_input(&samples))
     .unwrap_or_else(|e| panic!("the SHIPPING placement must produce clean log-probs: {e}"));
   assert_eq!(emissions.frames(), 549);
-  assert_eq!(emissions.vocab().get(), crate::vocab::VOCAB_SIZE);
+  assert_eq!(
+    emissions.vocab().get(),
+    crate::audio::align::vocab::VOCAB_SIZE
+  );
 }
 
 /// **THE NORMALIZATION-GUARD REGRESSION (c).** Real emissions from the shipping
@@ -1280,7 +1316,7 @@ fn emissions_pass_the_normalization_guard_on_real_speech() {
       // over the real (truncated) frames the guard scans.
       let worst = raw
         .data
-        .as_chunks::<{ crate::vocab::VOCAB_SIZE }>()
+        .as_chunks::<{ crate::audio::align::vocab::VOCAB_SIZE }>()
         .0
         .iter()
         .map(|frame| {
@@ -1360,7 +1396,10 @@ fn emissions_wraps_into_validated_emissions() {
     .emissions(window_input(&samples))
     .expect("emissions wraps into a validated Emissions");
   assert_eq!(emissions.frames(), 149);
-  assert_eq!(emissions.vocab().get(), crate::vocab::VOCAB_SIZE);
+  assert_eq!(
+    emissions.vocab().get(),
+    crate::audio::align::vocab::VOCAB_SIZE
+  );
 }
 
 #[test]
@@ -1377,7 +1416,7 @@ fn emissions_on_short_input_truncates_to_hermetic_formula() {
     .expect("emissions on short input");
   assert_eq!(raw.frames, truncated_frame_count(48_000, encoder.frames()));
   assert_eq!(raw.frames, 149);
-  assert_eq!(raw.data.len(), 149 * crate::vocab::VOCAB_SIZE);
+  assert_eq!(raw.data.len(), 149 * crate::audio::align::vocab::VOCAB_SIZE);
 }
 
 #[test]

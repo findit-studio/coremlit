@@ -1,7 +1,7 @@
 use std::num::NonZeroUsize;
 
 use super::*;
-use crate::{
+use crate::audio::whisper::{
   audio::{
     chunker::{AudioChunk, VadChunker, prepare_seek_clips},
     vad::{EnergyVad, VoiceActivityDetector},
@@ -186,10 +186,11 @@ fn mutation_table_covers_every_decoding_option() {
   // slipped through all three table-driven tests. Now adding a field breaks the
   // destructure's compilation until it is named in the roster, and then fails
   // HERE as an uncovered name until it also gets a mutation row.
-  let expected: std::collections::BTreeSet<&str> = crate::options::DECODING_OPTION_FIELD_NAMES
-    .iter()
-    .copied()
-    .collect();
+  let expected: std::collections::BTreeSet<&str> =
+    crate::audio::whisper::options::DECODING_OPTION_FIELD_NAMES
+      .iter()
+      .copied()
+      .collect();
   let covered: std::collections::BTreeSet<&str> =
     mutations().iter().map(|(field, _)| *field).collect();
 
@@ -208,7 +209,7 @@ fn mutation_table_covers_every_decoding_option() {
 /// paired with a mutation that moves it off a baseline result. This is the
 /// analogue of the `DecodingOptions` `mutations()` table above, for the facts a
 /// RUN controls rather than the options configure: the whole
-/// [`TaskFacts`](crate::task_facts::TaskFacts) sub-record (observed language,
+/// [`TaskFacts`](crate::audio::whisper::task_facts::TaskFacts) sub-record (observed language,
 /// RNG draw, early stop, worker schedule, id span) plus the one derived outcome
 /// that lives on `Provenance` beside it, the effective temperature.
 type TaskFactMutation = (&'static str, fn(TranscriptionResult) -> TranscriptionResult);
@@ -227,7 +228,7 @@ fn baseline_task_result() -> TranscriptionResult {
 }
 
 /// The derived outcome fact `for_result` computes rather than reading off the
-/// carried record — kept separate from the [`TaskFacts`](crate::task_facts::TaskFacts)
+/// carried record — kept separate from the [`TaskFacts`](crate::audio::whisper::task_facts::TaskFacts)
 /// sub-facts in the coverage arithmetic below.
 const DERIVED_TASK_FACT: &str = "effective_temperature";
 
@@ -317,7 +318,7 @@ fn task_fact_table_covers_every_provenance_task_fact() {
 
   // (1) Every Provenance field is accounted for.
   let provenance_task_layer: std::collections::BTreeSet<&str> =
-    crate::provenance::PROVENANCE_FIELD_NAMES
+    crate::audio::whisper::provenance::PROVENANCE_FIELD_NAMES
       .iter()
       .copied()
       .filter(|field| !NON_TASK_FACTS.contains(field))
@@ -331,11 +332,12 @@ fn task_fact_table_covers_every_provenance_task_fact() {
   );
 
   // (2) Every carried TaskFacts sub-fact (plus the derived outcome) has a row.
-  let expected: std::collections::BTreeSet<&str> = crate::task_facts::TASK_FACTS_FIELD_NAMES
-    .iter()
-    .copied()
-    .chain(std::iter::once(DERIVED_TASK_FACT))
-    .collect();
+  let expected: std::collections::BTreeSet<&str> =
+    crate::audio::whisper::task_facts::TASK_FACTS_FIELD_NAMES
+      .iter()
+      .copied()
+      .chain(std::iter::once(DERIVED_TASK_FACT))
+      .collect();
   let covered: std::collections::BTreeSet<&str> = task_fact_mutations()
     .iter()
     .map(|(field, _)| *field)
@@ -727,7 +729,7 @@ fn provenance_never_infers_the_vad_detector() {
       vec![true; samples.len().div_ceil(self.frame_length_samples())]
     }
     fn frame_length_samples(&self) -> usize {
-      crate::audio::vad::DEFAULT_FRAME_LENGTH_SAMPLES
+      crate::audio::whisper::audio::vad::DEFAULT_FRAME_LENGTH_SAMPLES
     }
   }
   let installed: Box<dyn VoiceActivityDetector + Send + Sync> = Box::new(AlwaysActiveVad);
@@ -1126,8 +1128,11 @@ fn provenance_records_the_real_draw_fact_never_the_temperature() {
     // Run the REAL sampler and read whether it actually drew. Wide logits
     // (`[-10, 10, ..]`) keep the negative-temperature scale-then-softmax in
     // range (codex round 3/4, F1); a narrow `[0, 1, 0.5]` would not.
-    let mut sampler =
-      crate::decode::sampler::GreedyTokenSampler::new(temperature, 99, &DecodingOptions::new());
+    let mut sampler = crate::audio::whisper::decode::sampler::GreedyTokenSampler::new(
+      temperature,
+      99,
+      &DecodingOptions::new(),
+    );
     let token = sampler.sample(&[-10.0f32, 10.0, 0.5]).token();
     let drew = sampler.drew_from_rng();
     // `-0.0 == 0.0` in IEEE, so the sampler's `== 0.0` arm catches it too.

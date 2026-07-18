@@ -7,7 +7,7 @@
 //! [`Aligner`] is the entry point. It pairs alignkit's CoreML CTC acoustic
 //! encoder (`chordai/wav2vec2-base960h-aligner-coreml`, Apache-2.0 — see
 //! `tests/model_io.rs` for its pinned I/O contract and provenance), reached
-//! through [`coremlit`] by [`encode::Encoder`], with `asry`'s parity-tested
+//! through [`crate`] by [`encode::Encoder`], with `asry`'s parity-tested
 //! alignment seam ([`asry::emissions::EmissionsAligner`]): alignkit runs the
 //! encoder, and asry owns everything else — the tokenizer, the silence mask,
 //! the CTC trellis / beam / silence-aware word composition. [`AlignmentSet`]
@@ -76,7 +76,7 @@
 //! `asry`, so a caller speaks one vocabulary across the ASR and alignment
 //! halves.
 //!
-//! macOS only (built on [`coremlit`]).
+//! macOS only (built on [`crate`]).
 //!
 //! # How far you can trust the timings
 //!
@@ -211,7 +211,7 @@ pub use registry::{
 // ([`AlignerOptions::with_compute`], [`encode::EncoderOptions::with_compute`]),
 // so re-export it rather than force every consumer to depend on `coremlit`
 // directly just to name a compute placement.
-pub use coremlit::ComputeUnits;
+pub use crate::ComputeUnits;
 
 // The one vocabulary (design spec §6): result, language, time, OOV, and the
 // validated seam input types come straight from `asry`, so a consumer never

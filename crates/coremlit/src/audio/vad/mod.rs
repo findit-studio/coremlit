@@ -1,13 +1,13 @@
 //! Native CoreML model layer for Silero VAD — the FluidInference unified
 //! 256 ms artifact (`silero-vad-unified-256ms-v6.2.1`), run through the
-//! [`coremlit`] runtime instead of ONNX Runtime.
+//! [`crate`] runtime instead of ONNX Runtime.
 //!
 //! Design spec:
 //! `docs/superpowers/specs/2026-07-18-vadkit-design.md` (§4 model layer, §5
 //! adoption, §6 gates). Plan:
 //! `docs/superpowers/plans/2026-07-18-vadkit-plan.md`.
 //!
-//! macOS only (built on [`coremlit`]).
+//! macOS only (built on [`crate`]).
 //!
 //! # Scope: model layer only, no detection logic
 //!

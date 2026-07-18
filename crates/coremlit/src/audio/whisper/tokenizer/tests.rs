@@ -383,7 +383,7 @@ fn word_grouping_splits_chinese_and_only_chinese() {
     vec!["我", "今天", "很", "高", "兴", "见", "到", "你"]
   );
   assert_eq!(
-    crate::options::DecodingOptions::new().word_grouping(),
+    crate::audio::whisper::options::DecodingOptions::new().word_grouping(),
     WordGrouping::FineGrained,
     "and fine-grained is what a caller gets without asking"
   );

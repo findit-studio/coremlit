@@ -26,7 +26,7 @@
 //! this task's own brief (the "silence" short-circuit does not consult
 //! `avg_logprob`, contrary to the brief's exploration).
 
-use crate::{
+use crate::audio::whisper::{
   constants::DEFAULT_LANGUAGE_CODE,
   options::DecodingOptions,
   task_facts::{SpanKnowledge, TaskFacts, TaskFactsAccumulator},
@@ -187,7 +187,7 @@ pub struct TranscriptionSegment {
     feature = "serde",
     serde(
       default = "default_segment_temperature",
-      with = "crate::options::finite_f32"
+      with = "crate::audio::whisper::options::finite_f32"
     )
   )]
   temperature: f32,
@@ -1208,12 +1208,12 @@ pub struct TranscriptionResult {
   /// Replaces the six separate fields these facts used to scatter across, whose
   /// per-fact plumbing lost or fabricated three of them at aggregation
   /// boundaries; see
-  /// [`TaskFacts`](crate::task_facts::TaskFacts) for the history and the one
+  /// [`TaskFacts`](crate::audio::whisper::task_facts::TaskFacts) for the history and the one
   /// merge law [`merge_transcription_results_with_options`] now folds them by.
   ///
-  /// [`Provenance::for_result`](crate::provenance::Provenance::for_result) reads
+  /// [`Provenance::for_result`](crate::audio::whisper::provenance::Provenance::for_result) reads
   /// this record whole; [`Self::new`] starts it
-  /// [`TaskFacts::unknown`](crate::task_facts::TaskFacts::unknown) (a hand-built
+  /// [`TaskFacts::unknown`](crate::audio::whisper::task_facts::TaskFacts::unknown) (a hand-built
   /// result drew nothing, witnessed no language, was not truncated, and rode an
   /// **unknown** worker coordinate — never a fabricated `0`), and the pipeline
   /// sets the observed value via [`Self::with_task_facts`].
@@ -1237,12 +1237,12 @@ impl TranscriptionResult {
   /// the optimistic `Some(false)` a "nothing happened" default would forge (F1).
   /// That is the right default for a caller inventing a transcript, and it is not
   /// a hole in the reproducibility guarantee:
-  /// [`Provenance::for_result`](crate::provenance::Provenance::for_result) TRUSTS
+  /// [`Provenance::for_result`](crate::audio::whisper::provenance::Provenance::for_result) TRUSTS
   /// this carried record whole rather than scanning the surviving segments' own
   /// temperatures (inferring the draw from the survivors was the bug it
   /// replaced), so an unknown draw is treated CONSERVATIVELY as non-reproducible,
   /// never optimistically waved through. What only the carried
-  /// [`TaskFacts::drew_from_rng`](crate::task_facts::TaskFacts::drew_from_rng)
+  /// [`TaskFacts::drew_from_rng`](crate::audio::whisper::task_facts::TaskFacts::drew_from_rng)
   /// flag can carry is a sampled window whose segments are *gone* — and only
   /// the decode path can know about those, setting the observed facts via
   /// [`Self::with_task_facts`].
@@ -1343,14 +1343,14 @@ impl TranscriptionResult {
   /// The decode-time facts this transcription run **controlled** — the RNG
   /// draw, the observed language, the early-stop truncation, the worker
   /// coordinates, and the allocated id span — as one record.
-  /// [`Provenance::for_result`](crate::provenance::Provenance::for_result)
+  /// [`Provenance::for_result`](crate::audio::whisper::provenance::Provenance::for_result)
   /// reads it whole. See the field's doc.
   #[inline(always)]
   pub const fn task_facts(&self) -> &TaskFacts {
     &self.task_facts
   }
   /// Mutable access to [`Self::task_facts`] — the pipeline uses it to
-  /// [`merge`](crate::task_facts::TaskFacts::merge) a shared sink's recovered
+  /// [`merge`](crate::audio::whisper::task_facts::TaskFacts::merge) a shared sink's recovered
   /// facts (a dropped-because-errored VAD chunk's draw/observation/early stop)
   /// into a merged transcript in place.
   #[inline(always)]
@@ -1468,7 +1468,7 @@ impl TranscriptionResult {
 /// token's log probability only transiently, inside the decode loop
 /// (`TextDecoder.swift:662-667`), to build a local `isFirstTokenLogProbTooLow`
 /// bool that never leaves the function. This port's decode loop
-/// ([`crate::decode::decode_text`]) has no such back door — its only
+/// ([`crate::audio::whisper::decode::decode_text`]) has no such back door — its only
 /// output is this struct — so the raw value is stored here instead,
 /// letting a later fallback-ladder caller recompute the threshold
 /// comparison itself and pass it to [`needs_fallback`] (that function's
@@ -1503,7 +1503,7 @@ pub struct DecodingResult {
   /// holds no language token at all (a zero-iteration decode forces `<|en|>`
   /// into the prompt but predicts nothing). The pipeline promotes THIS predicted
   /// code into the result's
-  /// [`TaskFacts::observed_language`](crate::task_facts::TaskFacts::observed_language);
+  /// [`TaskFacts::observed_language`](crate::audio::whisper::task_facts::TaskFacts::observed_language);
   /// recording the display
   /// [`Self::language`] there instead would misreport a forced `<|en|>` as the
   /// detection when a different language was predicted after it (coremlit issue
@@ -1552,9 +1552,9 @@ pub struct DecodingResult {
   /// window's decode (`Some(false)` past the prefill steps) — a caller CONTROL
   /// action, distinct from every ordinary termination (EOT, the token-context
   /// cap, a too-low first-token log-prob). The pipeline carries this out to the
-  /// result's [`TaskFacts::early_stopped`](crate::task_facts::TaskFacts::early_stopped),
+  /// result's [`TaskFacts::early_stopped`](crate::audio::whisper::task_facts::TaskFacts::early_stopped),
   /// which
-  /// [`Provenance::is_reproducible`](crate::provenance::Provenance::is_reproducible)
+  /// [`Provenance::is_reproducible`](crate::audio::whisper::provenance::Provenance::is_reproducible)
   /// reads: a transcript an unrecorded callback truncated cannot be reproduced
   /// from the recorded options and seed alone (coremlit issue #14, codex round
   /// 5). Not a Swift field — the same Rust-only extension rationale as the
@@ -1636,7 +1636,7 @@ impl DecodingResult {
   /// genuine in-loop detection, SEPARATE from the Swift-faithful display
   /// [`Self::language`]; see the field doc for how the pipeline promotes this
   /// into the result's
-  /// [`TaskFacts::observed_language`](crate::task_facts::TaskFacts::observed_language),
+  /// [`TaskFacts::observed_language`](crate::audio::whisper::task_facts::TaskFacts::observed_language),
   /// and why it is not the display language.
   #[inline(always)]
   pub fn observed_language(&self) -> Option<&str> {
@@ -1822,7 +1822,7 @@ impl DecodingResult {
   // -- early_stopped (bool) ------------------------------------------------
   /// Whether a progress callback truncated this window's decode with an early
   /// stop. See the field doc; the pipeline carries this to the result's
-  /// [`TaskFacts::early_stopped`](crate::task_facts::TaskFacts::early_stopped).
+  /// [`TaskFacts::early_stopped`](crate::audio::whisper::task_facts::TaskFacts::early_stopped).
   #[inline(always)]
   pub const fn early_stopped(&self) -> bool {
     self.early_stopped
@@ -1849,7 +1849,7 @@ impl DecodingResult {
 
 /// Live per-step decode progress (Swift `TranscriptionProgress`,
 /// `Models.swift:643-661`), delivered to a
-/// [`TranscriptionProgressCallback`](crate::decode::TranscriptionProgressCallback)
+/// [`TranscriptionProgressCallback`](crate::audio::whisper::decode::TranscriptionProgressCallback)
 /// after every non-completed decode step, prefill steps included.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -2290,11 +2290,11 @@ fn min_timing(results: &[TranscriptionResult], f: impl Fn(&TranscriptionTimings)
 ///   `compactMap`s away only *nil* elements (`:80`), never empty-text ones,
 ///   so `["a", "", "b"].joined(separator: " ")` is `"a  b"` there too. A
 ///   zero-segment, empty-text result is reachable on its own — any audio
-///   shorter than [`DecodingOptions::window_clip_time`](crate::options::DecodingOptions::window_clip_time)
+///   shorter than [`DecodingOptions::window_clip_time`](crate::audio::whisper::options::DecodingOptions::window_clip_time)
 ///   runs no window at all and returns one — and this port keeps the
 ///   quirk rather than "fixing" it, exactly like the segment re-`id`
 ///   below. This function is therefore the merge for
-///   [`DecodingOptions::drop_blank_audio`](crate::options::DecodingOptions::drop_blank_audio)
+///   [`DecodingOptions::drop_blank_audio`](crate::audio::whisper::options::DecodingOptions::drop_blank_audio)
 ///   `== false` — exact Swift — by definition;
 ///   [`merge_transcription_results_with_options`] is the entry point that
 ///   skips the empties instead, for the callers whose own options made an
@@ -2310,7 +2310,7 @@ fn min_timing(results: &[TranscriptionResult], f: impl Fn(&TranscriptionTimings)
 ///   again, and the returned `TranscriptionResult(...)` call at the end
 ///   never consumes it either. `results` are expected to already carry
 ///   correct per-segment/per-result seek anchoring from
-///   [`crate::audio::chunker::apply_result_seek_offset`] before reaching
+///   [`crate::audio::whisper::audio::chunker::apply_result_seek_offset`] before reaching
 ///   this function, exactly as Swift's `updateSeekOffsetsForResults`
 ///   re-anchors chunk results before its own call into this merge.
 /// - [`TranscriptionResult::language`][]: the first result's language, or
@@ -2334,10 +2334,10 @@ fn min_timing(results: &[TranscriptionResult], f: impl Fn(&TranscriptionTimings)
 ///   differ from Swift's: Swift's `TranscribeTask.run` stamps a real
 ///   `CFAbsoluteTimeGetCurrent()` into `pipelineStart`
 ///   (`TranscribeTask.swift:65`), so its merge always sees finite starts;
-///   neither this crate's [`TranscribeTask::run`](crate::transcribe::TranscribeTask::run)
-///   nor [`crate::decode::detect_language`] ever populates
+///   neither this crate's [`TranscribeTask::run`](crate::audio::whisper::transcribe::TranscribeTask::run)
+///   nor [`crate::audio::whisper::decode::detect_language`] ever populates
 ///   `pipeline_start`/`first_token_time` (no absolute wall clock exists
-///   in this sync port to stamp them with — see `crate::decode`'s module
+///   in this sync port to stamp them with — see `crate::audio::whisper::decode`'s module
 ///   doc), so every real result's `pipeline_start` is still
 ///   [`DEFAULT_PIPELINE_TIME_SENTINEL`] (`f64::MAX`), where the verbatim
 ///   Swift subtraction silently degenerates to `0.0` and would zero out
@@ -2371,9 +2371,9 @@ pub fn merge_transcription_results(results: &[TranscriptionResult]) -> Transcrip
 /// bare `" "` separator Swift's join gives it.
 ///
 /// This is the entry point for folding a
-/// [`WhisperKit::transcribe_all`](crate::transcribe::WhisperKit::transcribe_all)
+/// [`WhisperKit::transcribe_all`](crate::audio::whisper::transcribe::WhisperKit::transcribe_all)
 /// batch, and the one
-/// [`WhisperKit::transcribe`](crate::transcribe::WhisperKit::transcribe)'s
+/// [`WhisperKit::transcribe`](crate::audio::whisper::transcribe::WhisperKit::transcribe)'s
 /// VAD branch uses for its own chunk results. Hand it the same `options`
 /// the results were decoded with and the merged text cannot contradict
 /// them.
@@ -2383,7 +2383,7 @@ pub fn merge_transcription_results(results: &[TranscriptionResult]) -> Transcrip
 /// [`DecodingOptions::drop_blank_audio`] makes an **empty result routine**:
 /// a wholly-silent VAD chunk — the chunker is *contiguous*, so silence is
 /// cut around, never skipped — decodes to nothing but
-/// [`BLANK_AUDIO_MARKER`](crate::constants::BLANK_AUDIO_MARKER), the filter
+/// [`BLANK_AUDIO_MARKER`](crate::audio::whisper::constants::BLANK_AUDIO_MARKER), the filter
 /// removes that one segment, and the chunk is left with no text at all.
 /// Joined Swift's way, every such chunk lands in the transcript as a bare
 /// separator: a doubled space between two speech runs, a leading or
@@ -2494,23 +2494,23 @@ pub fn merge_transcription_results_with_options(
 /// Each child's **effective** span knowledge for the drop-ON merge: its carried
 /// [`TaskFacts::decoded_span`] **floored by its own survivors' extent** — `max
 /// local id + 1`, or `0` when none survived. This is the round-9 F2 trust rule
-/// lifted from a bare number to a [`SpanKnowledge`](crate::task_facts::SpanKnowledge):
+/// lifted from a bare number to a [`SpanKnowledge`](crate::audio::whisper::task_facts::SpanKnowledge):
 /// a carried bound legitimately EXCEEDS the extent when a filter dropped ordinals
 /// after allocating them (the whole reason it is carried), but a carried bound
 /// BELOW the extent under-counts — a hand-built or deserialized inconsistency —
 /// so the extent is the trusted floor, never blindly the carried value.
 ///
-/// - [`Exact(n)`](crate::task_facts::SpanKnowledge::Exact) stays `Exact(n)` when
+/// - [`Exact(n)`](crate::audio::whisper::task_facts::SpanKnowledge::Exact) stays `Exact(n)` when
 ///   the extent does not exceed `n`; when the survivors OUT-count `n` the exact
 ///   claim is contradicted, so it degrades to `AtLeast(extent)` — a bound, no
 ///   longer a fabricated exact total.
-/// - [`AtLeast(k)`](crate::task_facts::SpanKnowledge::AtLeast) floors to
-///   `AtLeast(max(k, extent))`; a [wholly-unknown](crate::task_facts::SpanKnowledge::wholly_unknown)
+/// - [`AtLeast(k)`](crate::audio::whisper::task_facts::SpanKnowledge::AtLeast) floors to
+///   `AtLeast(max(k, extent))`; a [wholly-unknown](crate::audio::whisper::task_facts::SpanKnowledge::wholly_unknown)
 ///   `AtLeast(0)` therefore relies on the extent outright.
 ///
 /// This ONE value drives BOTH the drop-ON id-base advance AND the drop-ON stored
 /// fold (codex round 13, M1): the base advances by its
-/// [lower bound](crate::task_facts::SpanKnowledge::lower_bound), and the merged
+/// [lower bound](crate::audio::whisper::task_facts::SpanKnowledge::lower_bound), and the merged
 /// result STORES the fold of these same effective spans — so every staging
 /// materializes the same floors at the same points and the stored fact after any
 /// partial merge carries them. Folding the RAW carried spans instead left the
@@ -2828,7 +2828,7 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
 /// dropping now governs the **segment id mapping** too, not just the text
 /// (see [`merge_transcription_results_with_options`]). Delegating to the plain
 /// (drop-OFF) merge collapsed a survivor id gap `[0, 2]` back to a dense
-/// `[0, 1]`, and [`crate::stream::agreement::LocalAgreement::finalize`] — the
+/// `[0, 1]`, and [`crate::audio::whisper::stream::agreement::LocalAgreement::finalize`] — the
 /// default streaming path — inherited that loss at finalization. Threading the
 /// same `options` the results were decoded under keeps the merged **segments**
 /// honoring the drop even when the merged text does not come from them.

@@ -26,11 +26,11 @@ pub enum ModelError {
   },
   /// The CoreML runtime failed to load the compiled model.
   #[error("failed to load model: {0}")]
-  Load(#[from] coremlit::LoadError),
-  /// A [`crate::model::ModelInfo`] was constructed with an empty name.
+  Load(#[from] crate::LoadError),
+  /// A [`crate::audio::whisper::model::ModelInfo`] was constructed with an empty name.
   #[error("model info name must not be empty")]
   EmptyName,
-  /// A [`crate::model::SupportConfig`] JSON document was malformed or had
+  /// A [`crate::audio::whisper::model::SupportConfig`] JSON document was malformed or had
   /// an unexpected shape. Carries a rendered message rather than the
   /// originating `serde_json::Error` because that type implements
   /// neither `Clone` nor `PartialEq`/`Eq`, which this enum otherwise
@@ -97,10 +97,10 @@ pub enum AudioError {
 pub enum DecodeError {
   /// The CoreML runtime failed to run the decoder model.
   #[error("decoder prediction failed: {0}")]
-  Prediction(#[from] coremlit::PredictionError),
+  Prediction(#[from] crate::PredictionError),
   /// A decoder tensor failed to construct or view.
   #[error("decoder tensor failed: {0}")]
-  Tensor(#[from] coremlit::TensorError),
+  Tensor(#[from] crate::TensorError),
   /// The decoder's logits tensor has an unexpected shape.
   #[error("logits shape mismatch: expected {expected}, got {actual}")]
   LogitsShape {
@@ -115,7 +115,7 @@ pub enum DecodeError {
   MissingAlignment,
   /// The inference backend failed.
   #[error("backend failure: {0}")]
-  Backend(#[from] crate::backend::BackendError),
+  Backend(#[from] crate::audio::whisper::backend::BackendError),
   /// Converting sampled token ids back to text failed (the decode loop's
   /// per-step progress callback and its final result both decode through
   /// the tokenizer).
@@ -150,11 +150,11 @@ pub enum SegmentError {
 }
 
 /// Failure running the pluggable voice-activity detector during
-/// [`ChunkingStrategy::Vad`](crate::options::ChunkingStrategy::Vad)
+/// [`ChunkingStrategy::Vad`](crate::audio::whisper::options::ChunkingStrategy::Vad)
 /// chunking.
 ///
 /// The detector's per-frame contract
-/// ([`voice_activity`](crate::audio::vad::VoiceActivityDetector::voice_activity))
+/// ([`voice_activity`](crate::audio::whisper::audio::vad::VoiceActivityDetector::voice_activity))
 /// is infallible — it returns `Vec<bool>`, with no channel for a hard
 /// model/runtime failure. A learned detector backed by a model (e.g. the
 /// `vadkit`-gated Silero detector) therefore *latches* its first inference

@@ -9,7 +9,7 @@
 //! [`TranscriptionResult`]s (word timings and text, no backend, no I/O)
 //! and is fully hermetic to test. [`LocalAgreementTranscriber`] is the
 //! thin driver around it that owns a growing sample buffer and calls
-//! [`crate::transcribe::WhisperKit::transcribe`] once per stride.
+//! [`crate::audio::whisper::transcribe::WhisperKit::transcribe`] once per stride.
 //!
 //! **Documented deviations** from `TranscribeCLI.swift`:
 //!
@@ -18,7 +18,7 @@
 //!   segment's `words` property is non-nil" — optional-typed in Swift,
 //!   so nil (alignment weights unavailable) and `[]` (computed, zero
 //!   words) are distinguishable there. This port's
-//!   [`crate::result::TranscriptionSegment::words_slice`] is never
+//!   [`crate::audio::whisper::result::TranscriptionSegment::words_slice`] is never
 //!   optional (empty-means-absent, that module's own doc), so nil and
 //!   `[]` already collapse to the same representation before
 //!   [`LocalAgreement::ingest`] ever sees it — "any segment has a
@@ -53,15 +53,15 @@
 //!   byte-for-byte port of Swift's off-by-one starting point.
 //! - **`push_samples` needs only `B: InferenceBackend`, not `+ Sync`.**
 //!   Its only backend-touching call is
-//!   [`crate::transcribe::WhisperKit::transcribe`], whose own `impl`
+//!   [`crate::audio::whisper::transcribe::WhisperKit::transcribe`], whose own `impl`
 //!   block bound is `B: InferenceBackend` alone — `Sync` is
 //!   `WhisperKit::transcribe_all`'s addition, for its concurrent worker
-//!   pool (`crate::transcribe`'s module doc, "Concurrency note"), and
+//!   pool (`crate::audio::whisper::transcribe`'s module doc, "Concurrency note"), and
 //!   [`InferenceBackend`] itself has no `Sync` supertrait either. This is
 //!   a correction against this task's own brief, which specified `B:
 //!   InferenceBackend + Sync` here.
 
-use crate::{
+use crate::audio::whisper::{
   backend::InferenceBackend,
   constants::SAMPLE_RATE,
   error::TranscribeError,
@@ -309,7 +309,8 @@ impl LocalAgreement {
       .iter()
       .zip(&filtered)
       .take_while(|(confirmed_word, candidate)| {
-        crate::text::normalized(confirmed_word.word()) == crate::text::normalized(candidate.word())
+        crate::audio::whisper::text::normalized(confirmed_word.word())
+          == crate::audio::whisper::text::normalized(candidate.word())
       })
       .count();
     filtered[strip..].to_vec()
@@ -333,7 +334,7 @@ impl LocalAgreement {
   ///   let prevResult = prevResult` is simply not entered).
   /// - With a previous result, its own `all_words()` (filtered the same
   ///   way, `:375`) and the new hypothesis feed
-  ///   [`crate::text::find_longest_common_prefix`] (`:376`). A common
+  ///   [`crate::audio::whisper::text::find_longest_common_prefix`] (`:376`). A common
   ///   prefix at least [`Self::agreement_count_needed`] words long
   ///   advances the watermark: its trailing `agreement_count_needed`
   ///   words become the new [`Self::last_agreed_words_slice`] (whose
@@ -429,7 +430,7 @@ impl LocalAgreement {
   /// `TranscribeCLI.swift:418-421`: the last (still-provisional)
   /// agreement's [`Self::last_agreed_words_slice`], then whatever the
   /// final hypothesis added beyond the final previous result
-  /// ([`crate::text::find_longest_different_suffix`] over the last
+  /// ([`crate::audio::whisper::text::find_longest_different_suffix`] over the last
   /// ingested pair), both folded onto [`Self::confirmed_words_slice`];
   /// [`merge_transcription_results_with_words`] then merges every kept
   /// [`Self::results_slice`] result with that word list as the merged
@@ -491,7 +492,7 @@ impl LocalAgreement {
 pub const STRIDE_SAMPLES: usize = SAMPLE_RATE as usize;
 
 /// The simulated-stream driver: feeds a growing audio buffer through
-/// [`crate::transcribe::WhisperKit::transcribe`] one [`STRIDE_SAMPLES`]
+/// [`crate::audio::whisper::transcribe::WhisperKit::transcribe`] one [`STRIDE_SAMPLES`]
 /// stride at a time, folding each result through a [`LocalAgreement`].
 /// Ports the loop shell of `transcribeStreamSimulated`
 /// (`TranscribeCLI.swift:357-369`) — see this module's doc for the
@@ -502,7 +503,7 @@ pub const STRIDE_SAMPLES: usize = SAMPLE_RATE as usize;
 /// Bare struct, no bounds — bounds live on the `impl` blocks below,
 /// narrowed to just [`Self::push_samples`], the only member needing `B:
 /// InferenceBackend` (golden §8; mirrors
-/// [`crate::stream::AudioStreamTranscriber`]'s own two-impl-block split).
+/// [`crate::audio::whisper::stream::AudioStreamTranscriber`]'s own two-impl-block split).
 pub struct LocalAgreementTranscriber<'ctx, B> {
   kit: &'ctx WhisperKit<B>,
   options: DecodingOptions,
@@ -561,13 +562,13 @@ where
   /// `samples` was pending — arbitrary push sizes coalesce to the same
   /// fixed cadence). Each pass transcribes the buffer from the start
   /// through that stride's end
-  /// ([`crate::transcribe::WhisperKit::transcribe`], with options
+  /// ([`crate::audio::whisper::transcribe::WhisperKit::transcribe`], with options
   /// retargeted per [`LocalAgreement::decoding_options_for_next`]) and
   /// folds the result through [`LocalAgreement::ingest`]. Ports
   /// `TranscribeCLI.swift:357-369`.
   ///
   /// # Errors
-  /// Whatever [`crate::transcribe::WhisperKit::transcribe`] returns,
+  /// Whatever [`crate::audio::whisper::transcribe::WhisperKit::transcribe`] returns,
   /// propagated directly and immediately — a later stride is never
   /// attempted after an earlier one fails. **Documented deviation:**
   /// Swift's per-stride `catch` instead logs the error and continues to

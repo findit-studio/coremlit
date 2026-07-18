@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn model_error_wraps_load_via_from() {
-  let inner = coremlit::LoadError::NotFound {
+  let inner = crate::LoadError::NotFound {
     path: "silero-vad.mlmodelc".into(),
   };
   let e: ModelError = inner.into();
@@ -24,10 +24,10 @@ fn model_error_contract_mismatch_displays_feature_and_shapes() {
 
 #[test]
 fn infer_error_wraps_prediction_and_tensor_via_from() {
-  let e: InferError = coremlit::PredictionError::StateUnsupported.into();
+  let e: InferError = crate::PredictionError::StateUnsupported.into();
   assert!(matches!(e, InferError::Prediction(_)));
 
-  let e: InferError = coremlit::TensorError::ShapeMismatch {
+  let e: InferError = crate::TensorError::ShapeMismatch {
     expected: 4160,
     actual: 4096,
   }

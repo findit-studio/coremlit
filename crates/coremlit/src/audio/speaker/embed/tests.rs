@@ -160,8 +160,14 @@ fn mask_row_padding_short_mask_tiles_after_conversion() {
 #[test]
 fn build_waveform_repeats_the_same_row_in_every_slot() {
   let out = build_waveform(&[1.0, 2.0]);
-  assert_eq!(out.len(), EMBED_SLOTS * crate::segment::SEG_CHUNK_SAMPLES);
-  for slot in out.as_chunks::<{ crate::segment::SEG_CHUNK_SAMPLES }>().0 {
+  assert_eq!(
+    out.len(),
+    EMBED_SLOTS * crate::audio::speaker::segment::SEG_CHUNK_SAMPLES
+  );
+  for slot in out
+    .as_chunks::<{ crate::audio::speaker::segment::SEG_CHUNK_SAMPLES }>()
+    .0
+  {
     assert_eq!(slot[0], 1.0);
     assert_eq!(slot[1], 2.0);
     assert_eq!(slot[2], 1.0); // period-2 tiling continues into slot's tail
@@ -368,7 +374,7 @@ fn options_serde_round_trips_explicit_compute() {
 // EmbedModel: model-gated (brief Step 2) — requires local
 // wespeaker_v2.mlmodelc AND wespeaker.mlmodelc (SPEAKERKIT_TEST_MODELS or
 // Models/speakerkit/, same convention as tests/model_io.rs's `common`
-// module and crate::segment::tests). Duplicated here in miniature because
+// module and crate::audio::speaker::segment::tests). Duplicated here in miniature because
 // unit tests under `src/` cannot import the separate `tests/`
 // integration-test crate.
 //
@@ -400,7 +406,7 @@ fn embed_fp32_path() -> std::path::PathBuf {
 
 /// Loads a real embedding model from `path` with `ComputeUnits::CpuOnly` —
 /// matching `tests/model_io.rs`'s and
-/// `crate::segment::tests::load_seg_model`'s convention: deterministic, no
+/// `crate::audio::speaker::segment::tests::load_seg_model`'s convention: deterministic, no
 /// ANE compile-latency variance across runs. `DEFAULT_EMBED_COMPUTE`
 /// (`ComputeUnits::All`) stays the production default. Parameterized over
 /// `path` so the SAME loader drives both `wespeaker_v2.mlmodelc` (int8,
@@ -452,7 +458,7 @@ fn from_file_rejects_wrong_contract_model() {
   // pyannote_segmentation.mlmodelc has no `waveform`/`mask` inputs at all
   // (its input is `audio`) — a real, locally-available model with a
   // definitely-mismatched contract, mirroring
-  // `crate::segment::tests::from_file_rejects_wrong_contract_model`'s
+  // `crate::audio::speaker::segment::tests::from_file_rejects_wrong_contract_model`'s
   // reciprocal use of `wespeaker_v2.mlmodelc`.
   let path = models_dir().join("pyannote_segmentation.mlmodelc");
   let err = EmbedModel::from_file(path).expect_err("wrong contract must be rejected");
@@ -467,7 +473,7 @@ fn from_file_rejects_wrong_contract_model() {
 
 fn embed_chunk_produces_correctly_shaped_finite_embeddings(path: std::path::PathBuf) {
   let model = load_embed_model(path);
-  let samples = synthetic_samples(crate::segment::SEG_CHUNK_SAMPLES);
+  let samples = synthetic_samples(crate::audio::speaker::segment::SEG_CHUNK_SAMPLES);
   let mask = vec![true; model.num_mask_frames()];
   let masks: [&[bool]; EMBED_SLOTS] = [&mask, &mask, &mask];
   let out = model
@@ -496,7 +502,7 @@ fn embed_chunk_produces_correctly_shaped_finite_embeddings_fp32() {
 
 fn embed_chunk_is_deterministic_across_repeated_calls(path: std::path::PathBuf) {
   let model = load_embed_model(path);
-  let samples = synthetic_samples(crate::segment::SEG_CHUNK_SAMPLES);
+  let samples = synthetic_samples(crate::audio::speaker::segment::SEG_CHUNK_SAMPLES);
   let mask = vec![true; model.num_mask_frames()];
   let masks: [&[bool]; EMBED_SLOTS] = [&mask, &mask, &mask];
   let first = model
@@ -525,7 +531,7 @@ fn embed_chunk_is_deterministic_across_repeated_calls_fp32() {
 
 fn embed_chunk_with_frame_mask_is_raw_not_unit_norm(path: std::path::PathBuf) {
   let model = load_embed_model(path);
-  let samples = synthetic_samples(crate::segment::SEG_CHUNK_SAMPLES);
+  let samples = synthetic_samples(crate::audio::speaker::segment::SEG_CHUNK_SAMPLES);
   let mask = vec![true; model.num_mask_frames()];
   let embedding = model
     .embed_chunk_with_frame_mask(&samples, &mask)
@@ -556,7 +562,7 @@ fn embed_chunk_with_frame_mask_is_raw_not_unit_norm_fp32() {
 /// not just by code inspection.
 fn embed_chunk_with_frame_mask_matches_batched_slot_zero(path: std::path::PathBuf) {
   let model = load_embed_model(path);
-  let samples = synthetic_samples(crate::segment::SEG_CHUNK_SAMPLES);
+  let samples = synthetic_samples(crate::audio::speaker::segment::SEG_CHUNK_SAMPLES);
   // Partial (not all-active) mask — exercises a non-trivial pooling
   // weight, not just the degenerate all-ones case.
   let mut mask = vec![false; model.num_mask_frames()];
@@ -591,7 +597,7 @@ fn embed_chunk_with_frame_mask_matches_batched_slot_zero_fp32() {
 #[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn embed_chunk_with_frame_mask_rejects_all_false_mask() {
   let model = load_embed_model(embed_v2_path());
-  let samples = synthetic_samples(crate::segment::SEG_CHUNK_SAMPLES);
+  let samples = synthetic_samples(crate::audio::speaker::segment::SEG_CHUNK_SAMPLES);
   let mask = vec![false; model.num_mask_frames()];
   let err = model
     .embed_chunk_with_frame_mask(&samples, &mask)
@@ -603,7 +609,7 @@ fn embed_chunk_with_frame_mask_rejects_all_false_mask() {
 #[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn embed_chunk_rejects_non_finite_samples() {
   let model = load_embed_model(embed_v2_path());
-  let mut samples = synthetic_samples(crate::segment::SEG_CHUNK_SAMPLES);
+  let mut samples = synthetic_samples(crate::audio::speaker::segment::SEG_CHUNK_SAMPLES);
   samples[1234] = f32::NAN;
   let mask = vec![true; model.num_mask_frames()];
   let masks: [&[bool]; EMBED_SLOTS] = [&mask, &mask, &mask];

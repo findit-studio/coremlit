@@ -9,7 +9,7 @@
 pub enum ModelError {
   /// The CoreML runtime failed to load the compiled model.
   #[error("failed to load model: {0}")]
-  Load(#[from] coremlit::LoadError),
+  Load(#[from] crate::LoadError),
   /// A loaded model's input or output feature does not match the
   /// shape/dtype contract this crate was built against (see
   /// `tests/model_io.rs` for the pinned ground truth).
@@ -31,10 +31,10 @@ pub enum ModelError {
 pub enum InferError {
   /// The CoreML runtime failed to run the model.
   #[error("prediction failed: {0}")]
-  Prediction(#[from] coremlit::PredictionError),
+  Prediction(#[from] crate::PredictionError),
   /// A tensor failed to construct or view.
   #[error("tensor failed: {0}")]
-  Tensor(#[from] coremlit::TensorError),
+  Tensor(#[from] crate::TensorError),
   /// An output tensor contained a NaN or infinite value — the exact `ort`
   /// CoreML-EP failure mode this crate exists to replace (spec §6, gate 2).
   #[error("output contains a non-finite value at index {index}")]
@@ -51,7 +51,7 @@ pub enum InferError {
     expected: usize,
   },
   /// A predict-time output tensor's shape diverged from the contract
-  /// validated at construction. `coremlit::MultiArray::copy_into` alone
+  /// validated at construction. `crate::MultiArray::copy_into` alone
   /// only validates total element count, so an axes-swapped output (e.g.
   /// `[1, classes, frames]` instead of `[1, frames, classes]`) can carry
   /// the same element count as the expected shape and would otherwise pass
@@ -106,7 +106,7 @@ pub enum InferError {
 }
 
 /// Top-level extraction failure, composing model-lifecycle and inference
-/// errors (spec §5) plus [`crate::extract::Extractor::extract`]'s own
+/// errors (spec §5) plus [`crate::audio::speaker::extract::Extractor::extract`]'s own
 /// input-validation and geometry guards.
 // No `Eq`: `OnsetOutOfRange` carries an `f32` payload, and `f32` is not
 // `Eq` (mirrors dia's own `ShapeError::OnsetOutOfRange { onset: f32 }`,
@@ -129,13 +129,13 @@ pub enum ExtractError {
   /// The configured `step_samples` is `0`. Mirrors dia's
   /// `ShapeError::ZeroStepSamples`
   /// (`diarization/src/offline/owned.rs:374-376`): a zero step would hang
-  /// the chunk planner's `div_ceil`. [`crate::window::WindowOptions`]'s
+  /// the chunk planner's `div_ceil`. [`crate::audio::speaker::window::WindowOptions`]'s
   /// own builders already reject this, so reaching it means a
   /// serde-deserialized config bypassed the builder — defense-in-depth,
   /// exactly as dia re-checks it here despite `with_step_samples`'s panic.
   #[error("step_samples must be > 0")]
   ZeroStepSamples,
-  /// The configured `step_samples` exceeds [`crate::segment::SEG_CHUNK_SAMPLES`].
+  /// The configured `step_samples` exceeds [`crate::audio::speaker::segment::SEG_CHUNK_SAMPLES`].
   /// Mirrors dia's `ShapeError::StepSamplesExceedsWindow`
   /// (`diarization/src/offline/owned.rs:377-387`, whose own comment gives
   /// the serde-bypass defense-in-depth rationale): with `step > window`,
@@ -145,13 +145,13 @@ pub enum ExtractError {
   StepSamplesExceedsWindow {
     /// The rejected `step_samples`.
     step: u32,
-    /// The chunk window length ([`crate::segment::SEG_CHUNK_SAMPLES`]).
+    /// The chunk window length ([`crate::audio::speaker::segment::SEG_CHUNK_SAMPLES`]).
     window: usize,
   },
   /// The configured `onset` is not finite in `(0.0, 1.0]`. Mirrors dia's
   /// `ShapeError::OnsetOutOfRange`
   /// (`diarization/src/offline/owned.rs:388-393`) and
-  /// [`crate::window`]'s `check_onset` `(0.0, 1.0]` contract: the hard
+  /// [`crate::audio::speaker::window`]'s `check_onset` `(0.0, 1.0]` contract: the hard
   /// segmentation mask `seg >= onset` degenerates — `> 1.0`/NaN makes
   /// every frame inactive (empty diarization), `<= 0.0` makes every zero
   /// cell active (corrupted masks/counts).
@@ -163,11 +163,11 @@ pub enum ExtractError {
   /// The configured `step_samples` is one the selected source cannot honor
   /// because its sliding-window stride is compiled INTO the model graph.
   ///
-  /// Raised only by [`crate::source::ArgmaxSource`]: argmax's segmenter
+  /// Raised only by [`crate::audio::speaker::source::ArgmaxSource`]: argmax's segmenter
   /// slides its 21 windows internally at a fixed
-  /// [`crate::source::argmax::ARGMAX_WINDOW_STRIDE_SAMPLES`] (16 000 = 1 s,
+  /// [`crate::audio::speaker::source::argmax::ARGMAX_WINDOW_STRIDE_SAMPLES`] (16 000 = 1 s,
   /// derived from the graph's own `[21, 1, 160000]` output shape), so there
-  /// is no knob to vary. [`crate::extract::Extractor`]'s host-side chunk
+  /// is no knob to vary. [`crate::audio::speaker::extract::Extractor`]'s host-side chunk
   /// planner has no such constraint and accepts any `step_samples` in
   /// `(0, SEG_CHUNK_SAMPLES]`.
   ///
@@ -191,8 +191,8 @@ pub enum ExtractError {
   /// (`diarization/src/offline/owned.rs:479,540`), so its two stages are
   /// frame-aligned by construction. This crate's two models declare their
   /// frame counts independently at load
-  /// ([`crate::segment::SegmentModel::num_frames`],
-  /// [`crate::embed::EmbedModel::num_mask_frames`]); a mismatch would
+  /// ([`crate::audio::speaker::segment::SegmentModel::num_frames`],
+  /// [`crate::audio::speaker::embed::EmbedModel::num_mask_frames`]); a mismatch would
   /// silently repeat-pad time-misaligned masks (`embed_chunk` pads each
   /// mask to its OWN frame count), so it is rejected up front instead.
   #[error(
@@ -205,8 +205,8 @@ pub enum ExtractError {
     embedder: usize,
   },
   /// The derived `num_output_frames` would not fit in `usize`. Converted
-  /// from [`crate::window`]'s crate-private `WindowError` by an exhaustive
-  /// manual match in [`crate::extract::Extractor::extract`] (deliberately
+  /// from [`crate::audio::speaker::window`]'s crate-private `WindowError` by an exhaustive
+  /// manual match in [`crate::audio::speaker::extract::Extractor::extract`] (deliberately
   /// NOT a `From` impl — a `From` would put a crate-private type into a
   /// public trait impl and add a second conversion surface for a single
   /// call site; the exhaustive match forces revisiting this if

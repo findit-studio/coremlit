@@ -13,7 +13,7 @@
 //!
 //! [desktop-120]: https://github.com/findit-studio/desktop/issues/120
 //!
-//! macOS only (built on [`coremlit`]).
+//! macOS only (built on [`crate`]).
 //!
 //! # Multi-source backend
 //!

@@ -9,8 +9,8 @@
 //!   [`AlignerError::ContractMismatch`]) and building asry's alignment seam
 //!   from the tokenizer + normalizer ([`AlignerError::Seam`]).
 //! - [`AlignError`]: per-call — returned by both
-//!   [`crate::encode::Encoder::emissions`] and
-//!   [`crate::aligner::Aligner::align_chunk`], which sit at the same "one
+//!   [`crate::audio::align::encode::Encoder::emissions`] and
+//!   [`crate::audio::align::aligner::Aligner::align_chunk`], which sit at the same "one
 //!   chunk's worth of work" layer.
 //!
 //! # The recoverable subset lives in `Aligner`, not here
@@ -19,7 +19,7 @@
 //! `NoAlignmentPath` and `SemanticOutOfVocab` — are *recoverable*: a chunk
 //! that hits them yields an empty `AlignmentResult` (the ASR text is kept,
 //! only per-word timings are dropped), not a hard error. That mapping is a
-//! policy of [`crate::aligner::Aligner::align_chunk`], which converts those
+//! policy of [`crate::audio::align::aligner::Aligner::align_chunk`], which converts those
 //! two into `Ok(empty)` before they ever become an [`AlignError`] —
 //! mirroring asry's own `alignment_failure_is_recoverable`
 //! (`asry/src/runner/alignment_pool/mod.rs`). Every `EmissionsError` that
@@ -35,7 +35,7 @@
 pub enum AlignerError {
   /// The CoreML runtime failed to load the compiled model.
   #[error("failed to load model: {0}")]
-  Load(#[from] coremlit::LoadError),
+  Load(#[from] crate::LoadError),
   /// A loaded model's input or output feature does not match the
   /// shape/dtype contract this crate was built against (see
   /// `tests/model_io.rs` for the pinned ground truth).
@@ -53,7 +53,7 @@ pub enum AlignerError {
   /// not parse, the CTC blank token could not be resolved, the language has
   /// no default text normalizer, or the normalizer needs a `|`
   /// word-delimiter the tokenizer lacks. Surfaced by
-  /// [`crate::aligner::Aligner::from_paths`].
+  /// [`crate::audio::align::aligner::Aligner::from_paths`].
   #[error("alignment seam construction failed: {0}")]
   Seam(#[from] asry::emissions::EmissionsError),
 }
@@ -63,18 +63,18 @@ pub enum AlignerError {
 ///
 /// Wraps [`asry::emissions::EmissionsError`] — asry's own per-chunk
 /// alignment failures from the emissions seam
-/// ([`crate::aligner::Aligner::align_chunk`] feeds
-/// [`crate::encode::Encoder::emissions`]'s output through
+/// ([`crate::audio::align::aligner::Aligner::align_chunk`] feeds
+/// [`crate::audio::align::encode::Encoder::emissions`]'s output through
 /// `prepare`/`finish`) — alongside the CoreML-sourced variants
-/// [`crate::encode::Encoder::emissions`] itself can raise and the
+/// [`crate::audio::align::encode::Encoder::emissions`] itself can raise and the
 /// [`asry::emissions::SpanError`] the VAD bridge can produce. The
 /// CoreML-sourced shape (`Prediction` + `Tensor`) mirrors `dia-coreml`'s
 /// analogous `InferError` (`crates/dia-coreml/src/error/mod.rs`) rather than
 /// design spec §8's literal "one CoreML-sourced variant" —
-/// `coremlit::Model::predict_with` and
-/// `coremlit::MultiArray::from_slice`/`copy_into` fail with two distinct
-/// foreign error types ([`coremlit::PredictionError`] and
-/// [`coremlit::TensorError`] respectively), and collapsing both into one
+/// `crate::Model::predict_with` and
+/// `crate::MultiArray::from_slice`/`copy_into` fail with two distinct
+/// foreign error types ([`crate::PredictionError`] and
+/// [`crate::TensorError`] respectively), and collapsing both into one
 /// variant would mean re-stringifying one of them instead of preserving it
 /// as a typed `#[from]` source, the exact thing this module's opening
 /// paragraph rules out.
@@ -90,28 +90,28 @@ pub enum AlignError {
   Alignment(#[from] asry::emissions::EmissionsError),
   /// The VAD sub-segments were not in the chunk-local 1/16000 analysis
   /// timebase (or exceeded the representable sample range) when
-  /// [`crate::aligner::Aligner::align_chunk`] bridged them into
+  /// [`crate::audio::align::aligner::Aligner::align_chunk`] bridged them into
   /// [`asry::emissions::SpeechSpans`].
   #[error(transparent)]
   Span(#[from] asry::emissions::SpanError),
   /// The CoreML runtime failed to run the encoder.
   #[error("prediction failed: {0}")]
-  Prediction(#[from] coremlit::PredictionError),
+  Prediction(#[from] crate::PredictionError),
   /// A tensor failed to construct or view.
   #[error("tensor failed: {0}")]
-  Tensor(#[from] coremlit::TensorError),
-  /// `samples` exceeded [`crate::encode::Encoder::emissions`]'s fixed
+  Tensor(#[from] crate::TensorError),
+  /// `samples` exceeded [`crate::audio::align::encode::Encoder::emissions`]'s fixed
   /// input window.
   #[error("input exceeds encoder window: {got} samples > {max} samples")]
   InputTooLong {
     /// Samples the caller supplied.
     got: usize,
     /// The encoder's fixed window size
-    /// ([`crate::encode::ENCODER_WINDOW_SAMPLES`]).
+    /// ([`crate::audio::align::encode::ENCODER_WINDOW_SAMPLES`]).
     max: usize,
   },
   /// The encoder returned an emission matrix that is **not log-probabilities**:
-  /// at least one cell sits below [`crate::encode::LOG_PROB_FLOOR`], the fp16
+  /// at least one cell sits below [`crate::audio::align::encode::LOG_PROB_FLOOR`], the fp16
   /// `log(0)` saturation sentinel (`≈ -45440`).
   ///
   /// This is the loud form of what used to be a silent one. The values are
@@ -119,8 +119,8 @@ pub enum AlignError {
   /// `finite ∧ <= 0` scan untouched and would align to *plausible, wrong*
   /// timings (in the pre-truncation-fix measurement `ask` landed 881.6 ms early
   /// on `jfk.wav`) — which is why the floor is checked separately. See
-  /// [`crate::encode::DEFAULT_ENCODER_COMPUTE`] for the mechanism and
-  /// [`crate::encode::LOG_PROB_FLOOR`] for why the guard keys on the value
+  /// [`crate::audio::align::encode::DEFAULT_ENCODER_COMPUTE`] for the mechanism and
+  /// [`crate::audio::align::encode::LOG_PROB_FLOOR`] for why the guard keys on the value
   /// domain rather than on the compute placement.
   ///
   /// The corruption is a defect of the **model artifact**, not of the caller's
@@ -141,25 +141,25 @@ pub enum AlignError {
      Engine and its word timings shift by hundreds of milliseconds. Load the encoder on \
      `alignkit::encode::DEFAULT_ENCODER_COMPUTE` (the default, and the fastest correct \
      placement) — or re-convert the model with a fused `log_softmax` tail.",
-    floor = crate::encode::LOG_PROB_FLOOR,
+    floor = crate::audio::align::encode::LOG_PROB_FLOOR,
   )]
   CorruptEmissions {
     /// The compute placement the encoder was loaded on — the knob the caller
     /// can actually turn, hence the one the message names.
-    compute: coremlit::ComputeUnits,
+    compute: crate::ComputeUnits,
     /// The most negative cell in the matrix (`≈ -45440` on an ANE placement;
     /// `-30.81` on the `CpuOnly` default, measured on `jfk.wav`).
     min: f32,
-    /// How many cells fell below [`crate::encode::LOG_PROB_FLOOR`] (2,667 on
+    /// How many cells fell below [`crate::audio::align::encode::LOG_PROB_FLOOR`] (2,667 on
     /// `jfk.wav`'s ANE run).
     cells: usize,
-    /// Cells scanned: `frames × `[`crate::vocab::VOCAB_SIZE`] (15,921 on
+    /// Cells scanned: `frames × `[`crate::audio::align::vocab::VOCAB_SIZE`] (15,921 on
     /// `jfk.wav`).
     total: usize,
   },
   /// The encoder returned an emission matrix that is **not normalized
   /// log-probabilities**: frame `row`'s `logsumexp` over the vocab axis is
-  /// `logsumexp`, exceeding [`crate::encode::LOG_PROB_SUM_TOLERANCE`] in
+  /// `logsumexp`, exceeding [`crate::audio::align::encode::LOG_PROB_SUM_TOLERANCE`] in
   /// magnitude. A genuine CTC log-probability frame sums to 1 in probability
   /// space, so its `logsumexp` is `0` (`ln Σ exp(log p_j) = ln Σ p_j = ln 1`); a
   /// whole-unit deviation means the tensor carries raw logits — or another
@@ -172,14 +172,14 @@ pub enum AlignError {
   /// CTC head (the *standard* wav2vec2 export, and what asry's own ONNX model
   /// emits) is rejected here rather than silently re-normalized by
   /// `Emissions::from_logits` and aligned on forever. It is the check that makes
-  /// [`crate::encode::Encoder::emissions`]'s "these really are log-probs" a
+  /// [`crate::audio::align::encode::Encoder::emissions`]'s "these really are log-probs" a
   /// verified contract for any same-contract artifact loaded through the public
   /// API, not merely for the one reviewed here. The finite ∧ `<= 0` scan
   /// `Emissions::from_log_probs` runs cannot catch it: raw logits shifted wholly
   /// into `[-20, -10]`, or an all-zeros frame, are finite and `<= 0` on every
   /// cell yet no distribution at all. See
-  /// [`crate::encode::LOG_PROB_SUM_TOLERANCE`] for the measured tolerance and the
-  /// [`crate::encode`] module doc's "The normalization guard".
+  /// [`crate::audio::align::encode::LOG_PROB_SUM_TOLERANCE`] for the measured tolerance and the
+  /// [`crate::audio::align::encode`] module doc's "The normalization guard".
   #[error(
     "encoder emissions are not normalized log-probabilities: frame {row} has logsumexp \
      {logsumexp} over the vocab axis (tolerance ±{tolerance}), but a CTC log-probability frame \
@@ -192,29 +192,29 @@ pub enum AlignError {
     /// The compute placement the encoder was loaded on. Carried for parity with
     /// [`Self::CorruptEmissions`]; unlike that error the placement is not the
     /// cause here (the model artifact is), but it remains useful context.
-    compute: coremlit::ComputeUnits,
+    compute: crate::ComputeUnits,
     /// Index of the worst frame — the one with the largest `|logsumexp|`.
     row: usize,
     /// That frame's `logsumexp` over the vocab axis (`≈ 0` for real log-probs;
     /// `ln 29 ≈ 3.367` for an all-zeros frame; `>= 6.6` for a `[-20, -10]`
     /// shifted raw-logit frame). Accumulated in `f64`.
     logsumexp: f64,
-    /// The bound it exceeded ([`crate::encode::LOG_PROB_SUM_TOLERANCE`]).
+    /// The bound it exceeded ([`crate::audio::align::encode::LOG_PROB_SUM_TOLERANCE`]).
     tolerance: f64,
   },
   /// A caller-supplied OOV decision does not carry the requested language.
   ///
-  /// Returned by [`crate::registry::AlignmentSet::align_chunk`] when the
+  /// Returned by [`crate::audio::align::registry::AlignmentSet::align_chunk`] when the
   /// `ResolvedOov` at position `index` carries `found` rather than the
   /// `requested` language the chunk is being aligned for. The registry checks
   /// this BEFORE crossing the decisions into an
-  /// [`AlignerKey::Any`](crate::registry::AlignerKey::Any) fallback aligner's
+  /// [`AlignerKey::Any`](crate::audio::align::registry::AlignerKey::Any) fallback aligner's
   /// own language: a foreign-language decision would otherwise be re-stamped and
   /// silently apply another language's wildcard / fail-closed policy at a
   /// matching position (asry's `ResolvedOov` identity ignores language on
   /// purpose, so nothing downstream would catch it). Resolve decisions against
   /// the SAME language you pass to `align_chunk` — the one
-  /// [`AlignmentSet::detect_oov`](crate::registry::AlignmentSet::detect_oov)
+  /// [`AlignmentSet::detect_oov`](crate::audio::align::registry::AlignmentSet::detect_oov)
   /// stamped them with.
   #[error(
     "oov_decisions[{index}] carries language {found:?} but the chunk is being aligned for \
@@ -230,11 +230,11 @@ pub enum AlignError {
     found: asry::Lang,
   },
   /// No aligner is registered for the requested language, no
-  /// [`AlignerKey::Any`](crate::registry::AlignerKey::Any) fallback exists, and
+  /// [`AlignerKey::Any`](crate::audio::align::registry::AlignerKey::Any) fallback exists, and
   /// the registry's miss policy is
-  /// [`AlignmentFallback::Error`](crate::registry::AlignmentFallback).
+  /// [`AlignmentFallback::Error`](crate::audio::align::registry::AlignmentFallback).
   ///
-  /// Returned by [`crate::registry::AlignmentSet::align_chunk`]. Under the
+  /// Returned by [`crate::audio::align::registry::AlignmentSet::align_chunk`]. Under the
   /// default `SkipChunk` policy a miss instead yields an empty alignment result
   /// (the ASR text survives, only per-word timings are dropped); this variant is
   /// the opt-in loud form, for a pipeline that wants a missing language to stop

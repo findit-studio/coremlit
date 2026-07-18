@@ -17,6 +17,7 @@
 use core::{num::NonZeroU32, sync::atomic::AtomicBool, time::Duration};
 use std::path::Path;
 
+use crate::ComputeUnits;
 use asry::{
   AlignmentResult, Lang, TimeRange,
   emissions::{
@@ -24,9 +25,8 @@ use asry::{
     SpeechCoverage, SpeechSpans,
   },
 };
-use coremlit::ComputeUnits;
 
-use crate::{
+use crate::audio::align::{
   encode::{DEFAULT_ENCODER_COMPUTE, Encoder, EncoderInput, EncoderOptions},
   error::{AlignError, AlignerError},
 };
@@ -35,7 +35,7 @@ use crate::{
 /// number [`Encoder`]'s truncation formula divides by, re-typed as the
 /// [`NonZeroU32`] the seam builder wants.
 ///
-/// Derived from [`crate::encode::HOP_SAMPLES`] rather than re-spelled as
+/// Derived from [`crate::audio::align::encode::HOP_SAMPLES`] rather than re-spelled as
 /// `320`, so the stride that TRUNCATES the emissions and the stride handed to
 /// the seam are one constant and cannot drift apart. That truncation stride is
 /// also what TIMES the words: it fixes the frame count `T`, on which asry maps
@@ -48,7 +48,7 @@ use crate::{
 /// This was a caller-settable `AlignerOptions::hop_samples` knob, which was a
 /// latent corruption: it reached only the seam (its stride check and `T < 2`
 /// fallback), never the encoder (`truncated_frame_count` divides by the
-/// hardcoded [`crate::encode::HOP_SAMPLES`]). At `T >= 2` that never re-timed
+/// hardcoded [`crate::audio::align::encode::HOP_SAMPLES`]). At `T >= 2` that never re-timed
 /// the words — asry maps boundaries by the effective `n_samples / (T - 1)`
 /// ratio, driven by the encoder's frame count, not the seam's hop — but it let
 /// the seam DECLARE a stride the encoder never used, which asry's own
@@ -59,10 +59,11 @@ use crate::{
 /// declared there; alignkit computes `T` itself, so a second declaration is a
 /// second source of truth. Pinned by
 /// `tests::seam_stride_is_the_encoder_stride`.
-const SEAM_HOP_SAMPLES: NonZeroU32 = match NonZeroU32::new(crate::encode::HOP_SAMPLES as u32) {
-  Some(v) => v,
-  None => unreachable!(),
-};
+const SEAM_HOP_SAMPLES: NonZeroU32 =
+  match NonZeroU32::new(crate::audio::align::encode::HOP_SAMPLES as u32) {
+    Some(v) => v,
+    None => unreachable!(),
+  };
 
 /// Default minimum speech coverage a word must clear to survive (`0.5`) —
 /// asry's [`SpeechCoverage::DEFAULT`](asry::emissions::SpeechCoverage::DEFAULT).
@@ -92,7 +93,7 @@ fn default_compute() -> ComputeUnits {
 ///
 /// Deliberately NOT here: `hop_samples`. The seam builder accepts one, but
 /// this crate wraps a single model whose stride is fixed at 320 by its graph
-/// ([`crate::encode::HOP_SAMPLES`]), and the encoder's own truncation divides
+/// ([`crate::audio::align::encode::HOP_SAMPLES`]), and the encoder's own truncation divides
 /// by that same constant without consulting any option — so a caller-set
 /// stride would reach only the seam half, declaring a stride the encoder never
 /// used: a second, driftable source of truth (at `T >= 2` it would not even
@@ -114,7 +115,10 @@ pub struct AlignerOptions {
   max_intra_silent_run: Duration,
   #[cfg_attr(
     feature = "serde",
-    serde(default = "default_compute", with = "crate::compute_units_serde")
+    serde(
+      default = "default_compute",
+      with = "crate::audio::align::compute_units_serde"
+    )
   )]
   compute: ComputeUnits,
 }
@@ -189,7 +193,7 @@ impl AlignerOptions {
   /// It is not silent on the audio that exposes it: [`Aligner::align_chunk`]
   /// fails a real-speech chunk on an ANE placement with
   /// [`AlignError::CorruptEmissions`], which names this placement (see
-  /// [`crate::encode::LOG_PROB_FLOOR`]). Detection is input-dependent — the
+  /// [`crate::audio::align::encode::LOG_PROB_FLOOR`]). Detection is input-dependent — the
   /// `log(0)` sentinel only appears once a class posterior falls under the fp16
   /// floor, so a pure-silence or low-tone chunk can pass even here. Real speech
   /// can expose it, measured on `jfk.wav`. The guard is on the emission VALUES,
@@ -228,7 +232,7 @@ fn build_seam(
   normalizer: DynTextNormalizer,
   options: &AlignerOptions,
 ) -> Result<EmissionsAligner, EmissionsError> {
-  EmissionsAligner::builder(language, crate::vocab::tokenizer_json_bytes())
+  EmissionsAligner::builder(language, crate::audio::align::vocab::tokenizer_json_bytes())
     .normalizer(normalizer)
     // NOT an option (see `SEAM_HOP_SAMPLES`): the stride handed to the seam
     // here must equal the stride that truncates the emissions in
@@ -241,7 +245,7 @@ fn build_seam(
     // MANDATORY (DECISION 5): the chordai vocab's blank is `"-"`@0 and there
     // is no `<pad>` / `[PAD]` / `<blank>` entry, so the builder's default
     // auto-detect would FAIL construction. Pass the id explicitly.
-    .blank_token_id(crate::vocab::BLANK_ID)
+    .blank_token_id(crate::audio::align::vocab::BLANK_ID)
     .build()
 }
 
@@ -263,7 +267,7 @@ fn effective_options(seam: &EmissionsAligner, requested: &AlignerOptions) -> Ali
 /// Per-language forced aligner over the CoreML wav2vec2 encoder.
 ///
 /// Wraps alignkit's CoreML [`Encoder`] (its head
-/// width validated `== `[`VOCAB_SIZE`](crate::vocab::VOCAB_SIZE) at load),
+/// width validated `== `[`VOCAB_SIZE`](crate::audio::align::vocab::VOCAB_SIZE) at load),
 /// asry's [`EmissionsAligner`] seam, and
 /// the [`AlignerOptions`] baked into that seam. Build one per language with
 /// [`from_paths`](Self::from_paths), then drive it per chunk with
@@ -274,7 +278,7 @@ fn effective_options(seam: &EmissionsAligner, requested: &AlignerOptions) -> Ali
 /// unlike asry's own ORT `Aligner`, which its registry wraps in a `Mutex` —
 /// this one needs no interior mutability.
 pub struct Aligner {
-  encoder: crate::encode::Encoder,
+  encoder: crate::audio::align::encode::Encoder,
   inner: EmissionsAligner,
   options: AlignerOptions,
 }
@@ -282,12 +286,12 @@ pub struct Aligner {
 impl Aligner {
   /// Load an aligner for `language` from the compiled CoreML model at
   /// `model_path`, using the crate's **bundled** 29-class chordai tokenizer
-  /// ([`crate::vocab::tokenizer_json_bytes`]) and the default
+  /// ([`crate::audio::align::vocab::tokenizer_json_bytes`]) and the default
   /// [`AlignerOptions`].
   ///
   /// There is no `tokenizer_path` parameter: alignkit wraps exactly one
   /// model whose only correct tokenizer is the bundled asset (any other
-  /// vocab would fail the CTC-head handshake), and `crate::vocab`'s own
+  /// vocab would fail the CTC-head handshake), and `crate::audio::align::vocab`'s own
   /// "bytes, not a path" decision documents why a filesystem tokenizer path
   /// is the wrong shape for a packaged consumer. To align with a different
   /// tokenizer, build an [`EmissionsAligner`]
@@ -344,7 +348,7 @@ impl Aligner {
     // for any future mismatched build. Cheap startup sanity, not the guard.
     debug_assert_eq!(
       inner.vocab_size().get(),
-      crate::vocab::VOCAB_SIZE,
+      crate::audio::align::vocab::VOCAB_SIZE,
       "bundled tokenizer vocab must equal the CTC head width"
     );
     // `options()` must report EFFECTIVE state (F3): the seam coerced
@@ -407,7 +411,7 @@ impl Aligner {
   /// output timebase.
   ///
   /// - `samples`: the chunk's 16 kHz f32 mono audio, at most
-  ///   [`ENCODER_WINDOW_SAMPLES`](crate::encode::ENCODER_WINDOW_SAMPLES).
+  ///   [`ENCODER_WINDOW_SAMPLES`](crate::audio::align::encode::ENCODER_WINDOW_SAMPLES).
   /// - `sub_segments`: VAD speech spans in the chunk-local 1/16000 analysis
   ///   timebase. **Empty means "no VAD"** →
   ///   [`SpeechSpans::all_speech`](asry::emissions::SpeechSpans::all_speech),
@@ -426,7 +430,7 @@ impl Aligner {
   /// and the recoverable seam failures (`NoAlignmentPath`,
   /// `SemanticOutOfVocab`) both return an **empty** [`AlignmentResult`]: the
   /// ASR text survives, only per-word timings are dropped. See the
-  /// [`crate::error`] module doc.
+  /// [`crate::audio::align::error`] module doc.
   ///
   /// With the `tracing` feature: one `alignkit.align_chunk` span at `DEBUG` per
   /// call, wrapping the whole VAD → prepare → encode → finish pass, with
@@ -442,10 +446,10 @@ impl Aligner {
   /// [`AlignError::Prediction`] / [`AlignError::Tensor`] from the CoreML
   /// encode; [`AlignError::CorruptEmissions`] if the encoder's emission matrix
   /// left the log-probability domain from below (an ANE placement set through
-  /// [`AlignerOptions::with_compute`] — see [`crate::encode::LOG_PROB_FLOOR`]);
+  /// [`AlignerOptions::with_compute`] — see [`crate::audio::align::encode::LOG_PROB_FLOOR`]);
   /// [`AlignError::UnnormalizedEmissions`] if the encoder's emission matrix is not
   /// normalized log-probabilities (a raw-logit model swap — see
-  /// [`crate::encode::LOG_PROB_SUM_TOLERANCE`]); [`AlignError::Alignment`] for any
+  /// [`crate::audio::align::encode::LOG_PROB_SUM_TOLERANCE`]); [`AlignError::Alignment`] for any
   /// non-recoverable seam failure (stride / vocab / blank-id validation, a
   /// non-finite or positive log-probability, tokenization, abort).
   #[cfg_attr(
@@ -472,10 +476,10 @@ impl Aligner {
     abort_flag: &AtomicBool,
     oov_decisions: &[ResolvedOov],
   ) -> Result<AlignmentResult, AlignError> {
-    if samples.len() > crate::encode::ENCODER_WINDOW_SAMPLES {
+    if samples.len() > crate::audio::align::encode::ENCODER_WINDOW_SAMPLES {
       return Err(AlignError::InputTooLong {
         got: samples.len(),
-        max: crate::encode::ENCODER_WINDOW_SAMPLES,
+        max: crate::audio::align::encode::ENCODER_WINDOW_SAMPLES,
       });
     }
 

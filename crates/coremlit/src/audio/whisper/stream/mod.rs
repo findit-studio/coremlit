@@ -9,7 +9,7 @@
 //! (`AudioProcessor.requestRecordPermission`), and a `Task.sleep`-driven
 //! polling loop (`realtimeLoop`) that re-checks the input buffer every
 //! 100 ms. None of that has a home at this crate's sans-I/O boundary
-//! (`crate::audio`'s module doc): there is no microphone, no actor
+//! (`crate::audio::whisper::audio`'s module doc): there is no microphone, no actor
 //! isolation, and no async runtime here. This module ports the pure state
 //! machine the actor drove instead: [`AudioStreamTranscriber::push_samples`]
 //! is the caller-driven port of `transcribeCurrentBuffer`
@@ -20,8 +20,8 @@
 //!
 //! **Documented deviations**, beyond the mic lifecycle above:
 //! [`AudioStreamTranscriber::push_samples`] constructs a fresh
-//! [`crate::transcribe::TranscribeTask`] every call, so
-//! [`crate::result::TranscriptionTimings::total_decoding_fallbacks`]
+//! [`crate::audio::whisper::transcribe::TranscribeTask`] every call, so
+//! [`crate::audio::whisper::result::TranscriptionTimings::total_decoding_fallbacks`]
 //! counts fallbacks within that one run rather than accumulating across
 //! the whole stream the way Swift's single reused `transcribeTask` would
 //! (`AudioStreamTranscriber.swift:57-66`) — the fallback comparison
@@ -31,12 +31,12 @@
 //! `push_samples` instead of `realtimeLoop`'s log-and-break (`:98-107`).
 //! Every dropped `Logging.*` call along the way (`:150`'s VAD-skip debug
 //! log, `:119`'s fallback info log) follows this crate's established
-//! precedent of not wiring Swift's instrumentation calls to `crate::log`
-//! (see `crate::transcribe`'s module doc, "Not ported").
+//! precedent of not wiring Swift's instrumentation calls to `crate::audio::whisper::log`
+//! (see `crate::audio::whisper::transcribe`'s module doc, "Not ported").
 
 use std::sync::Mutex;
 
-use crate::{
+use crate::audio::whisper::{
   audio::{is_voice_detected, relative_energy, signal_energy},
   backend::InferenceBackend,
   constants::SAMPLE_RATE,
@@ -162,7 +162,7 @@ impl StreamState {
   /// Relative energy per frame of the current buffer (Swift
   /// `AudioProcessor.relativeEnergy`, mirrored into state on every buffer
   /// callback, `AudioStreamTranscriber.swift:109-111`) — the input
-  /// `crate::audio::is_voice_detected` reads.
+  /// `crate::audio::whisper::audio::is_voice_detected` reads.
   #[inline(always)]
   pub const fn buffer_energy_slice(&self) -> &[f32] {
     self.buffer_energy.as_slice()
@@ -270,7 +270,7 @@ impl StreamState {
 /// closure requirement (`AudioStreamTranscriberCallback`,
 /// `AudioStreamTranscriber.swift:20-23`) via the same shape this crate's
 /// decode-loop progress sink already uses
-/// ([`TranscriptionProgressCallback`](crate::decode::TranscriptionProgressCallback)):
+/// ([`TranscriptionProgressCallback`](crate::audio::whisper::decode::TranscriptionProgressCallback)):
 /// a `&F` reference is itself `Send` exactly when `F: Sync`, so a shared
 /// reference to a `Sync` closure is the reference-based equivalent of a
 /// thread-safe callback value.
@@ -383,7 +383,7 @@ impl AudioStreamOptions {
   }
 
   // -- silence_threshold ----------------------------------------------------
-  /// Relative-energy threshold `crate::audio::is_voice_detected` gates on.
+  /// Relative-energy threshold `crate::audio::whisper::audio::is_voice_detected` gates on.
   #[inline(always)]
   pub const fn silence_threshold(&self) -> f32 {
     self.silence_threshold
@@ -427,7 +427,7 @@ impl AudioStreamOptions {
   }
 
   // -- use_vad (bool) ---------------------------------------------------------
-  /// Gate transcription on `crate::audio::is_voice_detected` rather than
+  /// Gate transcription on `crate::audio::whisper::audio::is_voice_detected` rather than
   /// running on every buffer.
   #[inline(always)]
   pub const fn use_vad(&self) -> bool {
@@ -495,8 +495,8 @@ pub enum StreamUpdate {
 
 impl StreamUpdate {
   /// Stable snake_case name of the variant — the crate's own `as_str`
-  /// convention (matching [`crate::options::Task`]/
-  /// [`crate::model::ModelState`]).
+  /// convention (matching [`crate::audio::whisper::options::Task`]/
+  /// [`crate::audio::whisper::model::ModelState`]).
   #[inline(always)]
   pub const fn as_str(&self) -> &'static str {
     match self {
@@ -514,7 +514,7 @@ impl StreamUpdate {
 /// Whether a decode window should stop early — ports the static
 /// `shouldStopEarly` (`AudioStreamTranscriber.swift:208-227`), meant to be
 /// called from a
-/// [`TranscriptionProgressCallback`](crate::decode::TranscriptionProgressCallback)
+/// [`TranscriptionProgressCallback`](crate::audio::whisper::decode::TranscriptionProgressCallback)
 /// on every decode step: `Some(false)` there requests early stop, while
 /// `Some(true)`/`None` continue — so `None` here means "keep decoding,"
 /// not "checked and clean."
@@ -631,7 +631,7 @@ impl EnergyTracker {
   }
 
   /// Relative energy per completed frame, oldest first — the history
-  /// `crate::audio::is_voice_detected` reads (Swift `AudioProcessor.
+  /// `crate::audio::whisper::audio::is_voice_detected` reads (Swift `AudioProcessor.
   /// relativeEnergy`, `AudioProcessor.swift:210-212`).
   /// The relative energies of frames `start..`, one per completed frame
   /// — the incremental tail the stream state appends per push.
@@ -754,7 +754,7 @@ fn on_progress_callback(
 /// Bare struct, no bounds — bounds live on the `impl` blocks below,
 /// narrowed to just [`Self::push_samples`] and its private helpers, the
 /// only members needing `B: InferenceBackend` (golden §8; mirrors
-/// [`crate::transcribe::TranscribeTask`]/[`crate::transcribe::WhisperKit`]'s
+/// [`crate::audio::whisper::transcribe::TranscribeTask`]/[`crate::audio::whisper::transcribe::WhisperKit`]'s
 /// own two-impl-block split).
 pub struct AudioStreamTranscriber<'ctx, B> {
   backend: &'ctx B,
@@ -770,14 +770,14 @@ pub struct AudioStreamTranscriber<'ctx, B> {
 // Construction and field accessors: no bound — none of these touch an
 // `InferenceBackend` method, so none may demand one (golden §8's "where
 // clauses on the methods/impls that need them"; the same split
-// `crate::transcribe::WhisperKit`'s own impl blocks already demonstrate).
+// `crate::audio::whisper::transcribe::WhisperKit`'s own impl blocks already demonstrate).
 impl<'ctx, B> AudioStreamTranscriber<'ctx, B> {
   /// A fresh streaming session over `backend`/`tokenizer`, with default
   /// [`AudioStreamOptions`], a fresh [`StreamState`], no state-change
   /// callback, and an empty sample buffer — ports the pipeline-component
   /// slice of Swift's `AudioStreamTranscriber.init`
   /// (`AudioStreamTranscriber.swift:43-74`; see
-  /// [`crate::transcribe::WhisperKit::audio_stream_transcriber`] for the
+  /// [`crate::audio::whisper::transcribe::WhisperKit::audio_stream_transcriber`] for the
   /// convenience constructor mirroring Swift's call site).
   pub fn new(
     backend: &'ctx B,
@@ -872,7 +872,7 @@ where
   ///    [`StreamState::current_text`] is still empty and returns
   ///    [`StreamUpdate::AwaitingAudio`] (`:131-140`).
   /// 3. When [`AudioStreamOptions::use_vad`] and
-  ///    [`crate::audio::is_voice_detected`] finds no voice in the new
+  ///    [`crate::audio::whisper::audio::is_voice_detected`] finds no voice in the new
   ///    audio, sets the same placeholder and returns
   ///    [`StreamUpdate::AwaitingVoice`] (`:142-157`).
   /// 4. Otherwise runs the transcription (see the private
@@ -887,7 +887,7 @@ where
   /// silent reset) and the panic propagates to the caller.
   ///
   /// # Errors
-  /// Whatever [`crate::transcribe::TranscribeTask::run`] returns,
+  /// Whatever [`crate::audio::whisper::transcribe::TranscribeTask::run`] returns,
   /// propagated directly. **Documented deviation:** Swift's
   /// `realtimeLoop` instead logs the error and breaks its loop silently
   /// (`:102-104`); this port surfaces the failure to the caller as a
@@ -1001,13 +1001,13 @@ where
     }
   }
 
-  /// Runs one [`crate::transcribe::TranscribeTask`] over the whole
+  /// Runs one [`crate::audio::whisper::transcribe::TranscribeTask`] over the whole
   /// accumulated buffer, clipped from the last confirmed watermark.
   /// Ports `transcribeAudioSamples` (`AudioStreamTranscriber.swift:
   /// 195-206`).
   ///
   /// The live [`StreamState`] is moved into a [`Mutex`] for the duration
-  /// of the run: [`crate::transcribe::TranscribeTask::run`]'s progress
+  /// of the run: [`crate::audio::whisper::transcribe::TranscribeTask::run`]'s progress
   /// callback is a `&dyn Fn(..) + Sync` that may be called repeatedly
   /// while `run` holds only `&self`, so it cannot capture `&mut
   /// self.state` the way the rest of [`Self::push_samples`] mutates it

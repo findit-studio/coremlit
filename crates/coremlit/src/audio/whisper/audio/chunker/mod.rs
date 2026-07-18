@@ -4,7 +4,7 @@
 //! `DecodingOptions.prepareSeekClips`
 //! (`Utilities/Extensions+Internal.swift:112-130`).
 
-use crate::{
+use crate::audio::whisper::{
   audio::vad::VoiceActivityDetector,
   constants::SAMPLE_RATE,
   error::AudioError,
@@ -103,7 +103,7 @@ pub fn prepare_seek_clips(
 /// (`AudioChunker.swift:14-39`, `seekTime` assignment at `:29`);
 /// [`apply_seek_offsets`] is its per-segment core.
 pub fn apply_result_seek_offset(result: &mut TranscriptionResult, seek_offset: usize) {
-  let seek_seconds = seek_offset as f32 / crate::constants::SAMPLE_RATE as f32;
+  let seek_seconds = seek_offset as f32 / crate::audio::whisper::constants::SAMPLE_RATE as f32;
   result.set_seek_time(seek_seconds);
   apply_seek_offsets(result.segments_slice_mut(), seek_offset);
 }

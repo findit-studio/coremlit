@@ -358,7 +358,7 @@ pub mod segment;
 /// the `vadkit` feature — the energy VAD stays the default.
 ///
 /// [`VoiceActivityDetector`]: audio::vad::VoiceActivityDetector
-#[cfg(feature = "vadkit")]
+#[cfg(feature = "vad")]
 pub mod silero_vad;
 pub mod stream;
 pub mod task_facts;

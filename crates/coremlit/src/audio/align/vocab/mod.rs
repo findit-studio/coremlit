@@ -5,7 +5,7 @@
 //! `chordai/wav2vec2-base960h-aligner-coreml` ships a raw `{token: id}` CTC
 //! dict (`Models/alignkit/base960h_dict.json`), not a HuggingFace
 //! `tokenizer.json` — both asry's own `Aligner::from_paths` and alignkit's
-//! [`crate::aligner::Aligner::from_paths`] (via
+//! [`crate::audio::align::aligner::Aligner::from_paths`] (via
 //! [`asry::emissions::EmissionsAligner::builder`]) need the latter. This
 //! module owns the derived, committed asset that fills that gap
 //! (`assets/chordai_base960h_tokenizer.json`) plus the vocabulary constants
@@ -50,9 +50,9 @@
 //! not itself construct a `Tokenizer` (it needs no `tokenizers` dependency
 //! outside tests). Parsing the asset into a live tokenizer, and reporting a
 //! parse / blank / delimiter failure, both happen inside asry's seam builder
-//! when [`crate::aligner::Aligner::from_paths`] hands it
+//! when [`crate::audio::align::aligner::Aligner::from_paths`] hands it
 //! [`tokenizer_json_bytes`]; that failure surfaces as
-//! [`crate::error::AlignerError::Seam`].
+//! [`crate::audio::align::error::AlignerError::Seam`].
 
 /// Number of entries in the chordai base960h CTC vocabulary, including the
 /// blank and word-delimiter tokens.
@@ -71,7 +71,7 @@ pub const VOCAB_SIZE: usize = 29;
 /// blank convention. This is distinct from the `<pad>` / `[PAD]` /
 /// `<blank>` special-token probe asry's `detect_blank_token_id` performs by
 /// default: this vocabulary has no `<pad>`-style entry at all, only the bare
-/// `"-"` at id `0`. [`crate::aligner::Aligner::from_paths`] therefore passes
+/// `"-"` at id `0`. [`crate::audio::align::aligner::Aligner::from_paths`] therefore passes
 /// this constant to the seam builder's `.blank_token_id(..)` explicitly
 /// (the default auto-detect would fail construction).
 pub const BLANK_ID: u32 = 0;
@@ -108,12 +108,12 @@ pub const WORD_DELIMITER: &str = "|";
 /// whatever path it's given into bytes (`std::fs::read`) before ever
 /// calling `Tokenizer::from_bytes` — never `Tokenizer::from_file`, despite
 /// that function's own error-message text saying so. These bytes are exactly
-/// what [`crate::aligner::Aligner::from_paths`] hands to
+/// what [`crate::audio::align::aligner::Aligner::from_paths`] hands to
 /// [`asry::emissions::EmissionsAligner::builder`] with no filesystem
 /// round-trip — which is also why that constructor takes no `tokenizer_path`
 /// (a baked-in path would not survive repackaging, while bundled bytes do).
 pub const fn tokenizer_json_bytes() -> &'static [u8] {
-  include_bytes!("../../assets/chordai_base960h_tokenizer.json")
+  include_bytes!("../assets/chordai_base960h_tokenizer.json")
 }
 
 #[cfg(test)]

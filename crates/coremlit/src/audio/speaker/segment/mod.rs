@@ -45,7 +45,7 @@
 //!   shape/layout on every call (`model.rs:313-338`) because, per its own
 //!   doc comment, "Load-time dimension verification ... is reserved for a
 //!   future revision once a stable ort metadata API is available"
-//!   (`model.rs:134-138`). `coremlit::Model::description()` already IS
+//!   (`model.rs:134-138`). `crate::Model::description()` already IS
 //!   that stable metadata API, so [`SegmentModel::from_file_with`]
 //!   validates the declared contract (presence, dtype, base shape) once
 //!   at construction (`ModelError::ContractMismatch`) instead of
@@ -136,7 +136,7 @@
 //! argmax-vendored siblings carry `0x1p-149`, which is fp32's smallest
 //! subnormal and rounds to zero in fp16 all the same. Every epsilon below
 //! fp16's smallest subnormal (`2^-24` ≈ 5.96e-8) is inert on any ANE/GPU
-//! path — i.e. on the default [`coremlit::ComputeUnits::All`] — so a
+//! path — i.e. on the default [`crate::ComputeUnits::All`] — so a
 //! softmax output that underflows to 0 reaches `log(0)`, which saturates
 //! (≈ -45440 on the ANE) instead of being guarded.
 //!
@@ -162,9 +162,9 @@
 
 use std::path::Path;
 
-use coremlit::{ComputeUnits, DataType, Model, MultiArray};
+use crate::{ComputeUnits, DataType, Model, MultiArray};
 
-use crate::error::{InferError, ModelError};
+use crate::audio::speaker::error::{InferError, ModelError};
 
 /// Sample count of one segmentation-model chunk (10 s at 16 kHz). Matches
 /// dia's `WINDOW_SAMPLES` (`diarization/src/segment/options.rs:18`) and the
@@ -214,7 +214,7 @@ pub struct SegmentModelOptions {
     feature = "serde",
     serde(
       default = "default_segment_compute",
-      with = "crate::compute_units_serde"
+      with = "crate::audio::speaker::compute_units_serde"
     )
   )]
   compute: ComputeUnits,
@@ -370,7 +370,7 @@ impl SegmentModel {
   /// "Non-finite inputs and outputs"). [`InferError::Prediction`] /
   /// [`InferError::Tensor`] on a CoreML or tensor-construction failure —
   /// including a prediction whose runtime output set omits `segments`
-  /// entirely ([`coremlit::PredictionError::MissingOutput`]; the
+  /// entirely ([`crate::PredictionError::MissingOutput`]; the
   /// construction-time contract pins the *declared* outputs, but the
   /// runtime provider's name set is CoreML's to produce per call).
   /// [`InferError::OutputShape`] if the predict-time `segments` tensor's
@@ -381,7 +381,7 @@ impl SegmentModel {
   /// re-checked here on every call, exactly as dia's `infer` re-validates
   /// output layout on every call
   /// (`diarization/src/segment/model.rs:313-338`). This also covers what
-  /// [`coremlit::MultiArray::copy_into`] cannot: it validates only total
+  /// [`crate::MultiArray::copy_into`] cannot: it validates only total
   /// element count, so an axes-swapped runtime output would otherwise be
   /// silently transposed into `logits` instead of erroring.
   /// [`InferError::NonFiniteOutput`] if any output logit is NaN or
@@ -396,7 +396,7 @@ impl SegmentModel {
     let segments =
       outputs
         .take(names::SEGMENTS)
-        .ok_or_else(|| coremlit::PredictionError::MissingOutput {
+        .ok_or_else(|| crate::PredictionError::MissingOutput {
           name: names::SEGMENTS.to_string(),
         })?;
     // The construction-time contract pins the model's DECLARED shape; the
@@ -433,7 +433,7 @@ fn check_input_length(got: usize) -> Result<(), InferError> {
 /// isolation — hermetically testable without a loaded model (`infer`
 /// itself needs `&self`, i.e. a real loaded [`SegmentModel`], to reach the
 /// CoreML call this guards). Catches exactly what
-/// [`coremlit::MultiArray::copy_into`] cannot: it validates only total
+/// [`crate::MultiArray::copy_into`] cannot: it validates only total
 /// element count, so an axes-swapped `[1, POWERSET_CLASSES, num_frames]`
 /// tensor — the same element count as the expected
 /// `[1, num_frames, POWERSET_CLASSES]` — would otherwise pass `copy_into`

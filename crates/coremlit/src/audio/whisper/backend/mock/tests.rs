@@ -1,5 +1,5 @@
 use super::*;
-use crate::backend::{BackendError, InferenceBackend, ModelDims};
+use crate::audio::whisper::backend::{BackendError, InferenceBackend, ModelDims};
 
 fn tiny_mock(tokens: &[u32]) -> MockBackend {
   let mut mock = MockBackend::new().with_dims(ModelDims::new().with_vocab(100).with_n_audio_ctx(4));

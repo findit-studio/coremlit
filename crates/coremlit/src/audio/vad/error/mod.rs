@@ -1,5 +1,5 @@
 //! Structured, per-domain error types for the vadkit model layer (design
-//! spec §4). Foreign errors from [`coremlit`] are wrapped as typed `#[from]`
+//! spec §4). Foreign errors from [`crate`] are wrapped as typed `#[from]`
 //! variants, mirroring `speakerkit::error`.
 
 /// Failure locating, loading, or validating the CoreML VAD model.
@@ -8,7 +8,7 @@
 pub enum ModelError {
   /// The CoreML runtime failed to load the compiled model.
   #[error("failed to load model: {0}")]
-  Load(#[from] coremlit::LoadError),
+  Load(#[from] crate::LoadError),
   /// A loaded model's input or output feature does not match the shape/dtype
   /// contract this crate was built against — the exact contract pinned from
   /// the artifact's `metadata.json` (see `tests/model_io.rs` for the ground
@@ -30,12 +30,12 @@ pub enum ModelError {
 pub enum InferError {
   /// The CoreML runtime failed to run the model.
   #[error("prediction failed: {0}")]
-  Prediction(#[from] coremlit::PredictionError),
+  Prediction(#[from] crate::PredictionError),
   /// A tensor failed to construct or view.
   #[error("tensor failed: {0}")]
-  Tensor(#[from] coremlit::TensorError),
+  Tensor(#[from] crate::TensorError),
   /// The caller's chunk was longer than one model chunk
-  /// ([`crate::CHUNK_SAMPLES`]). Short chunks are padded (FluidAudio
+  /// ([`crate::audio::vad::CHUNK_SAMPLES`]). Short chunks are padded (FluidAudio
   /// repeat-last semantics, `VadManager.swift:173-182`); over-long ones are
   /// rejected rather than silently truncated, because a caller feeding more
   /// than one 256 ms window per call has a chunking bug this crate cannot
@@ -44,7 +44,7 @@ pub enum InferError {
   ChunkTooLong {
     /// Samples the caller provided.
     got: usize,
-    /// The one-chunk maximum ([`crate::CHUNK_SAMPLES`]).
+    /// The one-chunk maximum ([`crate::audio::vad::CHUNK_SAMPLES`]).
     max: usize,
   },
   /// The caller's chunk contained a NaN or infinite sample before inference

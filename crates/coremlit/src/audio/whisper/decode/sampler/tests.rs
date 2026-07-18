@@ -1,5 +1,5 @@
 use super::*;
-use crate::options::DecodingOptions;
+use crate::audio::whisper::options::DecodingOptions;
 
 fn greedy(temperature: f32) -> GreedyTokenSampler {
   GreedyTokenSampler::new(temperature, 3, &DecodingOptions::new()).with_seed(42)

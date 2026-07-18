@@ -10,7 +10,7 @@
 //! fallback, itself flagged with a `TODO` for replacement) — that
 //! collapse into the one plain `f32` path here: the f16→f32 conversion
 //! already happened at the backend boundary (spec §4.8; see
-//! [`crate::backend`]), matching [`crate::decode::filter`]'s convention.
+//! [`crate::audio::whisper::backend`]), matching [`crate::audio::whisper::decode::filter`]'s convention.
 //!
 //! **Deliberate mechanical deviation, documented per spec:** Swift's
 //! `SamplingResult` clones the whole `tokens`/`logProbs` arrays on every
@@ -27,7 +27,7 @@
 //! **Rust-only addition, no Swift equivalent:** [`derive_attempt_seed`]
 //! turns one caller-chosen [`DecodingOptions::seed`] into a distinct
 //! [`GreedyTokenSampler::with_seed`] seed per (window, attempt), so
-//! [`crate::transcribe::TranscribeTask`]'s temperature-fallback ladder can
+//! [`crate::audio::whisper::transcribe::TranscribeTask`]'s temperature-fallback ladder can
 //! be both reproducible end to end and free of correlated draws across
 //! windows/attempts — see that function's own doc for the exact mixing
 //! function and contract (coremlit issue #9).
@@ -36,7 +36,7 @@ use std::num::NonZeroUsize;
 
 use rand::{Rng, SeedableRng, rngs::StdRng};
 
-use crate::options::DecodingOptions;
+use crate::audio::whisper::options::DecodingOptions;
 
 #[cfg(test)]
 mod tests;
@@ -95,7 +95,7 @@ pub struct GreedyTokenSampler {
   rng: StdRng,
   /// Latches `true` the first time [`Self::sample`] consults `rng` — a real
   /// multinomial draw, which happens only at a non-zero temperature on a
-  /// non-masked buffer. [`crate::transcribe::TranscribeTask`]'s fallback
+  /// non-masked buffer. [`crate::audio::whisper::transcribe::TranscribeTask`]'s fallback
   /// ladder reads this to record whether an RNG draw *actually occurred*,
   /// rather than inferring it from the accepted attempt's temperature — which
   /// misses a rejected attempt's draw and overcounts a zero-iteration decode
@@ -117,7 +117,7 @@ impl GreedyTokenSampler {
   /// (`StdRng::from_os_rng`) — `temperature == 0.0` never consults the
   /// RNG, so this only matters for reproducibility at `temperature !=
   /// 0.0`; see [`Self::with_seed`] for the deterministic alternative,
-  /// which [`crate::transcribe::TranscribeTask`]'s fallback ladder now
+  /// which [`crate::audio::whisper::transcribe::TranscribeTask`]'s fallback ladder now
   /// calls automatically (via [`derive_attempt_seed`]) whenever
   /// [`DecodingOptions::seed`] is set — this constructor's OS-seeded
   /// behavior is exactly what running with `seed` left `None` still gets.
@@ -139,7 +139,7 @@ impl GreedyTokenSampler {
   /// OS-seeded default matches that non-determinism, and this builder
   /// adds a reproducibility knob Swift has no equivalent for, so
   /// `temperature != 0.0` callers (e.g. tests, and — via
-  /// [`derive_attempt_seed`] — [`crate::transcribe::TranscribeTask`]'s
+  /// [`derive_attempt_seed`] — [`crate::audio::whisper::transcribe::TranscribeTask`]'s
   /// own fallback ladder when [`DecodingOptions::seed`] is set) can
   /// assert or reproduce an exact draw.
   #[must_use]
@@ -164,7 +164,7 @@ impl GreedyTokenSampler {
   /// Whether [`Self::sample`] has consulted the RNG at least once on this
   /// sampler — a real multinomial draw (non-zero temperature on a non-masked
   /// buffer; argmax and the all-masked degenerate path never draw).
-  /// [`crate::transcribe::TranscribeTask`]'s fallback ladder ORs this across a
+  /// [`crate::audio::whisper::transcribe::TranscribeTask`]'s fallback ladder ORs this across a
   /// window's language probe and every attempt (rejected and retained) to
   /// record whether the transcript depended on an RNG draw at all — the
   /// reproducibility fact, recorded rather than inferred from a temperature
@@ -187,7 +187,7 @@ impl GreedyTokenSampler {
   /// `log(softmaxResult[nextToken])`. Either way, `completed` is `token
   /// == eot_token()` (`TokenSampler.swift:233`).
   ///
-  /// The scaling treats a filter MASK (`-inf`, what [`crate::decode::filter`]
+  /// The scaling treats a filter MASK (`-inf`, what [`crate::audio::whisper::decode::filter`]
   /// writes for a suppressed token) as a mask rather than a number: it stays
   /// `-inf` (probability 0) whatever the sign of `temperature`, so a negative
   /// temperature cannot flip `-inf * (1 / temperature)` to `+inf` and turn a
@@ -467,9 +467,9 @@ const GAMMA_ATTEMPT: u64 = 0xC4CE_B9FE_1A85_EC53;
 /// transcription reaches — see this module's `derive_attempt_seed` collision
 /// test.
 ///
-/// [`crate::transcribe::TranscribeTask`]'s fallback ladder calls this with
+/// [`crate::audio::whisper::transcribe::TranscribeTask`]'s fallback ladder calls this with
 /// `worker_index` the task's own
-/// [`window_id_offset`](crate::transcribe::TranscribeTask::set_window_id_offset)
+/// [`window_id_offset`](crate::audio::whisper::transcribe::TranscribeTask::set_window_id_offset)
 /// (a genuinely unique per-chunk / per-audio / per-worker id, so distinct
 /// chunks and concurrently-running workers now get distinct seed streams as
 /// a real guarantee rather than the pre-fix *nudge*), `window_index` a
@@ -478,8 +478,8 @@ const GAMMA_ATTEMPT: u64 = 0xC4CE_B9FE_1A85_EC53;
 /// `worker_index`), and `attempt_index` the fallback loop's own
 /// `0..=temperature_fallback_count` counter. The function itself has no
 /// dependency on that caller: it is a pure, public mixing primitive, so a
-/// direct [`decode_text`](crate::decode::decode_text)/
-/// [`detect_language`](crate::decode::detect_language) caller that wants to
+/// direct [`decode_text`](crate::audio::whisper::decode::decode_text)/
+/// [`detect_language`](crate::audio::whisper::decode::detect_language) caller that wants to
 /// replicate (or deliberately diverge from) the pipeline's exact seed
 /// schedule can call it the same way.
 #[must_use]

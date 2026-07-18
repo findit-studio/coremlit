@@ -1,5 +1,5 @@
 use super::*;
-use coremlit::ComputeUnits;
+use crate::ComputeUnits;
 
 // =====================================================================
 // Hermetic: Source (rust-type-conventions vocabulary enum)
@@ -75,13 +75,16 @@ fn any_source_argmax_does_not_fall_back_to_fluid_audio() {
   let nowhere = std::path::Path::new("/nonexistent-speakerkit-models");
   let got = AnySource::load(nowhere, Options::new().with_source(Source::Argmax));
   assert!(
-    matches!(got, Err(crate::error::ModelError::Load(_))),
+    matches!(got, Err(crate::audio::speaker::error::ModelError::Load(_))),
     "a missing argmax model must surface as a load error, never a \
      FluidAudio source; got {got:?}"
   );
   // And the FluidAudio arm fails independently on the same missing path.
   let got = AnySource::load(nowhere, Options::new().with_source(Source::FluidAudio));
-  assert!(matches!(got, Err(crate::error::ModelError::Load(_))));
+  assert!(matches!(
+    got,
+    Err(crate::audio::speaker::error::ModelError::Load(_))
+  ));
 }
 
 /// Finding 3, hermetic: the shipping FluidAudio selection is a pure function of
@@ -188,8 +191,8 @@ fn any_source_load_dispatches_by_source() {
 // Model-gated (all #[ignore]): requires local speakerkit models
 // (SPEAKERKIT_TEST_MODELS or Models/speakerkit/) plus the cross-crate
 // ted_60.wav fixture. Loader/path helpers duplicated in miniature — same
-// reason as crate::extract::tests, crate::embed::tests, and
-// crate::segment::tests: unit tests under `src/` cannot import the
+// reason as crate::audio::speaker::extract::tests, crate::audio::speaker::embed::tests, and
+// crate::audio::speaker::segment::tests: unit tests under `src/` cannot import the
 // separate `tests/` integration-test crate.
 // =====================================================================
 
@@ -206,11 +209,11 @@ fn models_dir() -> std::path::PathBuf {
 }
 
 fn load_seg_model() -> SegmentModel {
-  // CpuOnly for determinism, matching crate::extract::tests::load_seg_model
+  // CpuOnly for determinism, matching crate::audio::speaker::extract::tests::load_seg_model
   // and every other model-gated loader in this crate.
   SegmentModel::from_file_with(
     models_dir().join("pyannote_segmentation.mlmodelc"),
-    crate::segment::SegmentModelOptions::new().with_compute(ComputeUnits::CpuOnly),
+    crate::audio::speaker::segment::SegmentModelOptions::new().with_compute(ComputeUnits::CpuOnly),
   )
   .expect("load pyannote_segmentation.mlmodelc")
 }
@@ -218,15 +221,15 @@ fn load_seg_model() -> SegmentModel {
 fn load_embed_model() -> EmbedModel {
   EmbedModel::from_file_with(
     models_dir().join("wespeaker_v2.mlmodelc"),
-    crate::embed::EmbedModelOptions::new().with_compute(ComputeUnits::CpuOnly),
+    crate::audio::speaker::embed::EmbedModelOptions::new().with_compute(ComputeUnits::CpuOnly),
   )
   .expect("load wespeaker_v2.mlmodelc")
 }
 
 /// The first 2 s (32_000 samples at 16 kHz) of the cross-crate `ted_60.wav`
-/// fixture (see `crate::extract::tests::load_ted_60` for the full-clip
+/// fixture (see `crate::audio::speaker::extract::tests::load_ted_60` for the full-clip
 /// loader) — long enough to be a real, non-degenerate segmentation chunk,
-/// short enough (`<= SEG_CHUNK_SAMPLES`) that `crate::window::chunk_starts`
+/// short enough (`<= SEG_CHUNK_SAMPLES`) that `crate::audio::speaker::window::chunk_starts`
 /// always yields exactly one chunk, keeping these equivalence tests fast.
 fn load_ted_head() -> Vec<f32> {
   let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -292,7 +295,7 @@ fn fluid_audio_source_matches_extractor_default_options() {
 #[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
 fn fluid_audio_source_matches_extractor_custom_options() {
   let options = Options::new().with_window(
-    crate::window::WindowOptions::new()
+    crate::audio::speaker::window::WindowOptions::new()
       .with_onset(0.3)
       .with_step_samples(8_000),
   );
@@ -320,7 +323,7 @@ fn fluid_audio_source_matches_extractor_custom_options() {
 /// reject empty `samples` identically. Model-gated only because
 /// `FluidAudioSource::new`/`Extractor::extract` both require loaded
 /// models to construct/call, mirroring
-/// `crate::extract::tests::extract_empty_samples_errors`'s identical
+/// `crate::audio::speaker::extract::tests::extract_empty_samples_errors`'s identical
 /// rationale.
 #[test]
 #[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]

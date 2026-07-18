@@ -11,18 +11,18 @@
 //!
 //! **Timing fields this sync port actually measures**, inside
 //! [`decode_text`]/[`detect_language`]:
-//! [`TranscriptionTimings::total_decoding_loops`](crate::result::TranscriptionTimings::total_decoding_loops),
-//! [`TranscriptionTimings::decoding_predictions`](crate::result::TranscriptionTimings::decoding_predictions)
+//! [`TranscriptionTimings::total_decoding_loops`](crate::audio::whisper::result::TranscriptionTimings::total_decoding_loops),
+//! [`TranscriptionTimings::decoding_predictions`](crate::audio::whisper::result::TranscriptionTimings::decoding_predictions)
 //! (wall-clock around [`InferenceBackend::decode_step`]),
-//! [`TranscriptionTimings::decoding_sampling`](crate::result::TranscriptionTimings::decoding_sampling)
+//! [`TranscriptionTimings::decoding_sampling`](crate::audio::whisper::result::TranscriptionTimings::decoding_sampling)
 //! (around [`sampler::GreedyTokenSampler::sample`]), and
-//! [`TranscriptionTimings::decoding_filtering`](crate::result::TranscriptionTimings::decoding_filtering)
+//! [`TranscriptionTimings::decoding_filtering`](crate::audio::whisper::result::TranscriptionTimings::decoding_filtering)
 //! (around the filter chain; [`decode_text`] only — Swift's
 //! `detectLanguage` never times its own filter call either).
 //! **Deliberately left untouched** (stay at whatever the caller's shared
 //! `TranscriptionTimings` already held going in):
 //! `first_token_time` — Swift stamps `CFAbsoluteTimeGetCurrent()`, an
-//! absolute wall-clock reading; [`crate::log`] exposes no clock at all,
+//! absolute wall-clock reading; [`crate::audio::whisper::log`] exposes no clock at all,
 //! and a bare [`std::time::Instant`] has no meaningful absolute value to
 //! store in its place, so this field is skipped rather than faked;
 //! `decoding_kv_caching`/`total_kv_update_runs` — the KV-cache update
@@ -39,7 +39,7 @@ use std::{
   time::Instant,
 };
 
-use crate::{
+use crate::audio::whisper::{
   backend::InferenceBackend,
   constants::{DEFAULT_LANGUAGE_CODE, MAX_TOKEN_CONTEXT, SECONDS_PER_TIME_TOKEN, language_code},
   decode::{
@@ -106,7 +106,7 @@ pub type TranscriptionProgressCallback<'a> =
 /// Ports the token-assembly half of `prefillDecoderInputs`
 /// (`TextDecoder.swift:163-216`) — the KV-cache/mask side effects at
 /// `:211-213` are backend-internal state this port has no equivalent
-/// field for ([`crate::backend::InferenceBackend::new_decoder_state`]
+/// field for ([`crate::audio::whisper::backend::InferenceBackend::new_decoder_state`]
 /// already starts a fresh state at position 0).
 ///
 /// Shape: `[<|startoftranscript|>]`; if `is_multilingual`, followed by
@@ -556,7 +556,7 @@ fn finalize_decoding_result(
   // as `segment::rounded_to_places` (both port the identical Swift
   // extension, just at a different `decimal_places`); deliberately left
   // duplicated here rather than shared. `rounded_to_places` is
-  // `pub(crate)`, so calling `crate::segment::rounded_to_places(value, 3)`
+  // `pub(crate)`, so calling `crate::audio::whisper::segment::rounded_to_places(value, 3)`
   // from here would compile, but `decode` has no other reason to depend
   // on `segment` — a later pipeline stage built on top of decode's own
   // output — and reaching across that boundary (or adding a new

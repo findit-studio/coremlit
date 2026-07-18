@@ -3,7 +3,7 @@
 //! [`TranscribeTask::run`] is the seek/window loop (:57-296), including the
 //! optional word-timestamp re-anchoring step
 //! (`options.word_timestamps()`, :196-233) that runs
-//! [`crate::segment::add_word_timestamps`] against the accepted attempt's
+//! [`crate::audio::whisper::segment::add_word_timestamps`] against the accepted attempt's
 //! alignment snapshot; its private `decode_with_fallback` is the
 //! temperature-fallback ladder (:316-411) that produces that snapshot
 //! (:198).
@@ -14,9 +14,9 @@
 //! Swift's decoder tensors are allocated once at the model's absolute
 //! maximum and `reset` re-derives a *mask* over that fixed allocation from
 //! the given bound. This port's
-//! [`crate::backend::InferenceBackend::reset_decoder_state`] takes no such
+//! [`crate::audio::whisper::backend::InferenceBackend::reset_decoder_state`] takes no such
 //! parameter: the backend's decoder state is sized once at allocation
-//! ([`crate::backend::InferenceBackend::new_decoder_state`]), and reset
+//! ([`crate::audio::whisper::backend::InferenceBackend::new_decoder_state`]), and reset
 //! always restores that same fixed allocation's initial state, so there is
 //! nothing left for a per-call bound to vary.
 //!
@@ -25,7 +25,7 @@
 //! `Task.checkCancellation()` cooperative-cancellation checks (:135, 144,
 //! 165) have no equivalent here — this is a sync library with no `Progress`
 //! type and no structured-concurrency task tree to cancel.
-//! [`crate::decode::TranscriptionProgressCallback`]'s `Some(false)`-triggered
+//! [`crate::audio::whisper::decode::TranscriptionProgressCallback`]'s `Some(false)`-triggered
 //! [`AtomicBool`] early stop is a different, narrower mechanism (ends the
 //! *current window's* decode loop only, like reaching end-of-text) and is
 //! the only cancellation-adjacent hook this port exposes. Swift's `open`
@@ -42,7 +42,7 @@
 //! `WhisperKit.swift:716-812`), and one-shot language detection
 //! ([`WhisperKit::detect_language`], ports `WhisperKit.swift:534-581`).
 //! [`WhisperKit::<CoreMlBackend>::new`] loads models and tokenizer from
-//! [`crate::options::Options`] and detects the model variant the same way
+//! [`crate::audio::whisper::options::Options`] and detects the model variant the same way
 //! `loadTokenizerIfNeeded` does (`WhisperKit.swift:444-457`);
 //! [`WhisperKit::with_backend`] is the mock/e2e-hermetic construction seam
 //! every test above this layer uses instead.
@@ -50,16 +50,16 @@
 //! **Concurrency note — why `transcribe_all` has no `CoreMlBackend`
 //! instance:** [`WhisperKit::transcribe_all`] batches workers over
 //! `std::thread::scope`, which requires `B: Sync` (every worker holds a
-//! `&self.backend` shared across threads at once). `coremlit::Model` is
+//! `&self.backend` shared across threads at once). `crate::Model` is
 //! documented `Send` but deliberately **not** `Sync` — Apple's contract is
 //! "use an `MLModel` instance on one thread ... at a time" — so
-//! [`crate::backend::coreml::CoreMlBackend`], which owns three `Model`s,
+//! [`crate::audio::whisper::backend::coreml::CoreMlBackend`], which owns three `Model`s,
 //! is not `Sync` either, and `WhisperKit<CoreMlBackend>::transcribe_all`
 //! is simply never a callable method (there is no `impl` providing it for
 //! that `B`). This is by design, not a gap: real concurrent batch
 //! transcription over CoreML needs one backend — hence one `WhisperKit` —
 //! per worker thread, each driven independently, not one shared backend
-//! serving many. [`crate::backend::mock::MockBackend`] IS `Sync` (its
+//! serving many. [`crate::audio::whisper::backend::mock::MockBackend`] IS `Sync` (its
 //! mutable state lives behind `Arc<Mutex<_>>`), so hermetic batch tests
 //! exercise the real code path. [`WhisperKit::transcribe`], by contrast,
 //! never needs `B: Sync`: its VAD-chunked branch runs each chunk's
@@ -79,7 +79,7 @@ use std::{
 
 use unicode_categories::UnicodeCategories;
 
-use crate::{
+use crate::audio::whisper::{
   audio::{self, chunker},
   backend::{AlignmentMatrix, InferenceBackend, coreml::CoreMlBackend},
   constants::{
@@ -111,7 +111,7 @@ mod tests;
 /// (`TranscribeTask.swift:305`). Rust's [`str::trim`] is narrower-scoped in
 /// the wrong direction for this: it also strips newlines, which Swift's
 /// `.whitespaces` (unlike `.whitespacesAndNewlines`) deliberately does not.
-/// Duplicated from [`crate::segment`]'s private helper of the same name and
+/// Duplicated from [`crate::audio::whisper::segment`]'s private helper of the same name and
 /// behavior, since that one isn't visible outside its own module.
 fn trim_swift_whitespaces(s: &str) -> &str {
   s.trim_matches(|c: char| c.is_separator_space() || c == '\u{0009}')
@@ -267,11 +267,11 @@ where
   /// (`TranscribeTask.swift:57-296`).
   ///
   /// Per seek clip (`chunker::prepare_seek_clips`), decodes consecutive
-  /// [`crate::backend::ModelDims::window_samples`]-sized (or shorter, for
+  /// [`crate::audio::whisper::backend::ModelDims::window_samples`]-sized (or shorter, for
   /// the final partial window) windows until fewer than
   /// `options.window_clip_time()` seconds of the clip remain, feeding each
   /// window's decode through the private temperature-fallback ladder and
-  /// then [`crate::segment::find_seek_point_and_segments`] to turn it into
+  /// then [`crate::audio::whisper::segment::find_seek_point_and_segments`] to turn it into
   /// the next seek offset and zero or more segments. The final transcript
   /// is every segment's tokens, filtered to non-special ids and decoded,
   /// trimmed the same way Swift trims it (`.trimmingCharacters(in:
@@ -572,7 +572,7 @@ where
           // recoverable error in place of a hard process abort, never a
           // silent `Some(vec![])`. This path is dormant today regardless:
           // `no_speech_prob` is permanently `0.0`
-          // (`crate::decode::decode_text`'s own faithfully-ported upstream
+          // (`crate::audio::whisper::decode::decode_text`'s own faithfully-ported upstream
           // TODO), so no positive `no_speech_threshold` — including the
           // default — can ever reach it.
           current_segments = Some(filtered);
@@ -765,7 +765,7 @@ where
   /// correlate them. Left alone, the ids are stable across the toggle and
   /// the hole is self-describing ("segment 1 was dropped"). There is also
   /// no id contiguity to "restore" in the first place:
-  /// [`merge_transcription_results`](crate::result::merge_transcription_results)
+  /// [`merge_transcription_results`](crate::audio::whisper::result::merge_transcription_results)
   /// re-ids every segment it merges to
   /// `result_index + segment_index` — a faithfully-ported upstream quirk
   /// that is neither dense nor unique (two results of two segments give
@@ -1019,7 +1019,7 @@ where
       // honestly, so a swallowed error's `+inf` ratio that drove a fallback (a
       // different transcript) can no longer read back as reproducible (coremlit
       // issue #14, codex round 14).
-      crate::text::clear_compression_error_swallowed();
+      crate::audio::whisper::text::clear_compression_error_swallowed();
       let outcome = decode::decode_text(
         self.backend,
         encoder_output,
@@ -1060,11 +1060,9 @@ where
       // detection, or an earlier window's) takes precedence, preserving first-wins.
       let attempt_observation = observed_language.clone().or_else(|| {
         observed_language_token.get().and_then(|token| {
-          self
-            .tokenizer
-            .decode(&[token], false)
-            .ok()
-            .map(|decoded| crate::text::trim_special_token_chars(&decoded).to_string())
+          self.tokenizer.decode(&[token], false).ok().map(|decoded| {
+            crate::audio::whisper::text::trim_special_token_chars(&decoded).to_string()
+          })
         })
       });
       facts_sink
@@ -1075,7 +1073,8 @@ where
             .with_drew_from_rng(sampler.drew_from_rng())
             .with_early_stopped(early_stop.load(Ordering::Relaxed))
             .with_had_swallowed_error(
-              language_probe_swallowed || crate::text::take_compression_error_swallowed(),
+              language_probe_swallowed
+                || crate::audio::whisper::text::take_compression_error_swallowed(),
             )
             .with_observed_language(attempt_observation),
         );
@@ -1235,7 +1234,7 @@ impl WhisperKit<CoreMlBackend> {
   /// monolingual-model case [`Self::detect_language`] reports the same
   /// way.
   /// [`TranscribeError::Decode`] if the loaded models' introspected
-  /// dimensions are inconsistent (wraps [`crate::backend::BackendError`]
+  /// dimensions are inconsistent (wraps [`crate::audio::whisper::backend::BackendError`]
   /// via [`CoreMlBackend::from_loaded`]).
   /// [`TranscribeError::Tokenizer`] if the tokenizer fails to load.
   pub fn new(options: &Options) -> Result<Self, TranscribeError> {
@@ -1277,7 +1276,7 @@ impl WhisperKit<CoreMlBackend> {
 // `TranscribeTask`'s two impl blocks above already demonstrate).
 impl<B> WhisperKit<B> {
   /// Wraps an already-constructed `backend`/`tokenizer` directly, with no
-  /// model-loading step — the seam [`crate::backend::mock::MockBackend`]-driven
+  /// model-loading step — the seam [`crate::audio::whisper::backend::mock::MockBackend`]-driven
   /// hermetic tests (and any other non-CoreML/e2e backend) use to build a
   /// pipeline. [`Self::variant`] starts `None`: variant detection is
   /// [`WhisperKit::<CoreMlBackend>::new`]'s job specifically, since it
@@ -1403,7 +1402,7 @@ impl<B> WhisperKit<B> {
   /// simulated-stream driver for LocalAgreement-2 confirmation. Mirrors
   /// [`Self::audio_stream_transcriber`]'s role as the convenience
   /// constructor for this pipeline's other streaming driver; see
-  /// [`crate::stream::agreement`] for the port this wraps
+  /// [`crate::audio::whisper::stream::agreement`] for the port this wraps
   /// (`TranscribeCLI.swift:322-424`). Unlike
   /// [`AudioStreamTranscriber::new`], which takes `backend`/`tokenizer`
   /// separately, [`LocalAgreementTranscriber::new`] holds `self` directly:
@@ -1489,9 +1488,9 @@ where
   /// lacks.
   ///
   /// When `options.chunking_strategy()` is
-  /// [`ChunkingStrategy::Vad`](crate::options::ChunkingStrategy::Vad)
+  /// [`ChunkingStrategy::Vad`](crate::audio::whisper::options::ChunkingStrategy::Vad)
   /// **and** `audio.len()` exceeds the backend's
-  /// [`ModelDims::window_samples`](crate::backend::ModelDims::window_samples)
+  /// [`ModelDims::window_samples`](crate::audio::whisper::backend::ModelDims::window_samples)
   /// (:876-878): [`Self::vad_detector`] + [`chunker::VadChunker::chunk_all`]
   /// split `audio` along silence boundaries (:880-886 — Swift's injectable
   /// `voiceActivityDetector ?? EnergyVAD()` field, :880, is
@@ -1531,7 +1530,7 @@ where
   /// (one [`TranscribeTask::run`] per chunk, with a distinct window-id
   /// offset) is identical: [`Self::transcribe_all`] additionally requires
   /// `B: Sync` (see its own doc), which
-  /// [`crate::backend::coreml::CoreMlBackend`] does not satisfy, and this
+  /// [`crate::audio::whisper::backend::coreml::CoreMlBackend`] does not satisfy, and this
   /// method must stay callable on `WhisperKit<CoreMlBackend>` — the only
   /// backend real (non-mock, non-streaming-e2e) callers ever transcribe
   /// through. Chunks are therefore processed one at a time in this
@@ -1728,7 +1727,7 @@ where
   /// Each worker's window ids are offset by its global index
   /// (`audio_index + batch_index * batch_size`, :750) via
   /// [`TranscribeTask::with_window_id_offset`], so
-  /// [`crate::result::TranscriptionProgress::window_id`] stays distinct
+  /// [`crate::audio::whisper::result::TranscriptionProgress::window_id`] stays distinct
   /// across concurrently-running workers. Results come back in input
   /// order: this function spawns each batch's workers in `audios`' order
   /// and joins the returned handles in that same order, which
@@ -1780,7 +1779,7 @@ where
   }
 
   /// One-shot language-detection probe over the first
-  /// [`window_samples`](crate::backend::ModelDims::window_samples)-worth
+  /// [`window_samples`](crate::audio::whisper::backend::ModelDims::window_samples)-worth
   /// of `audio`. Ports `WhisperKit.detectLangauge(audioArray:)`
   /// (`WhisperKit.swift:534-581`, Swift's own misspelling — not repeated
   /// here).

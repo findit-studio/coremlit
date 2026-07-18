@@ -25,7 +25,7 @@ fn tokenizer_missing_token_displays_name() {
 
 #[test]
 fn coreml_errors_wrap_typed() {
-  let inner = coremlit::TensorError::ShapeMismatch {
+  let inner = crate::TensorError::ShapeMismatch {
     expected: 4,
     actual: 2,
   };

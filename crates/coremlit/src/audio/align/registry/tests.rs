@@ -520,7 +520,7 @@ fn any_fallback_aligns_a_cross_language_request_with_punctuation_oov() {
 ///   and asry's `prepare` rejects the Zh tag as an undifferentiated
 ///   [`AlignError::Alignment`] (its `Tokenization`) — the finding's headline;
 /// - **oversized** audio: without the fix
-///   [`Aligner::align_chunk`](crate::aligner::Aligner::align_chunk)'s own length
+///   [`Aligner::align_chunk`](crate::audio::align::aligner::Aligner::align_chunk)'s own length
 ///   check raises [`AlignError::InputTooLong`] before `prepare` even runs, so the
 ///   SAME wrong input produced a DIFFERENT error depending on the audio length.
 ///
@@ -568,7 +568,7 @@ fn exact_hit_validates_decision_language_before_dispatch() {
   // Oversized (window + 1): the mutation would surface InputTooLong here, since
   // `Aligner::align_chunk`'s length check runs before `prepare` — so this pins
   // that the validator precedes even that earliest error.
-  let oversized = vec![0.0f32; crate::encode::ENCODER_WINDOW_SAMPLES + 1];
+  let oversized = vec![0.0f32; crate::audio::align::encode::ENCODER_WINDOW_SAMPLES + 1];
   assert_decision_language(&oversized, "oversized");
 }
 
@@ -582,7 +582,7 @@ const JFK_TRANSCRIPT: &str = "And so my fellow Americans ask not what your count
 /// timebase, i.e. all speech. Passing empty `sub_segments` is also "no VAD": the
 /// shipping API maps empty to
 /// [`SpeechSpans::all_speech`](asry::emissions::SpeechSpans::all_speech), NOT to
-/// "all silence" (see [`crate::aligner::Aligner::align_chunk`]); this helper just
+/// "all silence" (see [`crate::audio::align::aligner::Aligner::align_chunk`]); this helper just
 /// states the whole-chunk span explicitly.
 fn whole_chunk_is_speech(samples: &[f32]) -> [TimeRange; 1] {
   [TimeRange::new(0, samples.len() as i64, ANALYSIS_TIMEBASE)]

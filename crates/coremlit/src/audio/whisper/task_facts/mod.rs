@@ -9,8 +9,8 @@
 //! Each of these facts is *born* at the attempt/decode layer, must *survive*
 //! every aggregation boundary (temperature-fallback selection, the blank-audio
 //! drop, a VAD chunk merge, a streaming finalize, an errored-and-dropped
-//! chunk), and is finally *read* by [`Provenance`](crate::provenance::Provenance)
-//! to answer [`Provenance::is_reproducible`](crate::provenance::Provenance::is_reproducible)
+//! chunk), and is finally *read* by [`Provenance`](crate::audio::whisper::provenance::Provenance)
+//! to answer [`Provenance::is_reproducible`](crate::audio::whisper::provenance::Provenance::is_reproducible)
 //! and to describe the run. Carrying them as six separate fields — plus two
 //! ad-hoc decode-layer sinks and a scatter of `.any()`/`.find_map()`/`.first()`
 //! re-aggregations at each merge — is exactly how three of them came to be lost
@@ -38,7 +38,7 @@
 //! F1 — `Option<bool>`'s `None` for [`TaskFacts::drew_from_rng`],
 //! [`TaskFacts::early_stopped`], and (codex round 11) [`TaskFacts::had_swallowed_error`]
 //! too. A record built from options with no decode to
-//! speak for ([`Provenance::from_options`](crate::provenance::Provenance::from_options)),
+//! speak for ([`Provenance::from_options`](crate::audio::whisper::provenance::Provenance::from_options)),
 //! or a transcript assembled by hand, knows no worker coordinate, witnessed no
 //! language, and **cannot observe** whether the decode drew from the sampler, a
 //! callback truncated it, or a child error was swallowed — and says exactly that,
@@ -54,7 +54,7 @@
 //!   event (an RNG draw, a callback truncation) occurred must NOT promise
 //!   byte-reproducibility. The old `false`-means-both representation handed that
 //!   promise to a genuinely truncated segment recorded through
-//!   [`Provenance::for_segment`](crate::provenance::Provenance::for_segment),
+//!   [`Provenance::for_segment`](crate::audio::whisper::provenance::Provenance::for_segment),
 //!   whose constructor cannot see the truncation (F1). Only a fact POSITIVELY
 //!   observed as `Some(false)` — the shape a real decode carries out of the
 //!   window loop — earns the optimistic answer.
@@ -85,7 +85,7 @@
 mod tests;
 
 /// Deserializes a **required but nullable** `Option` field — the same
-/// required-field helper [`Provenance`](crate::provenance::Provenance) uses, so
+/// required-field helper [`Provenance`](crate::audio::whisper::provenance::Provenance) uses, so
 /// a dropped key is rejected rather than silently read back as `None`.
 ///
 /// Serde's derive special-cases a *missing* `Option` field to `None` even with
@@ -134,7 +134,7 @@ const fn kleene_or(a: Option<bool>, b: Option<bool>) -> Option<bool> {
 }
 
 /// What a transcript's decode knows about the number of segment-id ordinals it
-/// **allocated** — the id span [`merge_transcription_results_with_options`](crate::result::merge_transcription_results_with_options)
+/// **allocated** — the id span [`merge_transcription_results_with_options`](crate::audio::whisper::result::merge_transcription_results_with_options)
 /// advances its running base by. **Two states**, because the fact has to tell an
 /// EXACTLY-known total apart from a known LOWER BOUND on an otherwise-unknown
 /// one, and the pre-round-12 `Option<usize>` could express only "exactly `n`"
@@ -192,7 +192,7 @@ impl SpanKnowledge {
   }
 
   /// The known **lower bound** on the ordinal count — `n` for both `Exact(n)` and
-  /// `AtLeast(n)`. The single value [the merge's id-base advance](crate::result::merge_transcription_results_with_options)
+  /// `AtLeast(n)`. The single value [the merge's id-base advance](crate::audio::whisper::result::merge_transcription_results_with_options)
   /// derives from (floored at the survivors' own extent at read time), so every
   /// grouping advances by the same stored number and staged and one-shot merges
   /// number identically.
@@ -261,13 +261,13 @@ impl SpanKnowledge {
 }
 
 /// A carried record of the decode-time facts a transcription **run controls**,
-/// as opposed to the ones its [`DecodingOptions`](crate::options::DecodingOptions)
+/// as opposed to the ones its [`DecodingOptions`](crate::audio::whisper::options::DecodingOptions)
 /// configure: whether it drew from the token sampler, the language it genuinely
 /// observed, whether a progress callback truncated it, the worker coordinates
 /// its RNG streams rode, and the segment-id span its decode allocated.
 ///
-/// Lives on every [`TranscriptionResult`](crate::result::TranscriptionResult)
-/// and is embedded verbatim in [`Provenance`](crate::provenance::Provenance).
+/// Lives on every [`TranscriptionResult`](crate::audio::whisper::result::TranscriptionResult)
+/// and is embedded verbatim in [`Provenance`](crate::audio::whisper::provenance::Provenance).
 /// Build the hand-built / all-unknown value with [`Self::unknown`] and layer
 /// facts on with the `with_*` builders; merge two with [`Self::merge`], or fold
 /// a whole sequence of contributors with [`Self::fold`].
@@ -343,16 +343,16 @@ impl SpanKnowledge {
 pub struct TaskFacts {
   /// Whether the decode ever **drew from the token sampler** — any window
   /// accepted (or rejected) at a **non-zero** temperature, from the sampler's
-  /// own [`GreedyTokenSampler::drew_from_rng`](crate::decode::sampler::GreedyTokenSampler::drew_from_rng),
+  /// own [`GreedyTokenSampler::drew_from_rng`](crate::audio::whisper::decode::sampler::GreedyTokenSampler::drew_from_rng),
   /// OR-ed across every attempt including rejected ones and captured before any
   /// error could propagate. Backs [`Self::is_reproducible_under`]; a *carried*
   /// fact, never re-derived from the surviving segments' temperatures (which a
-  /// filter can empty). See [`crate::provenance::Provenance::is_reproducible`].
+  /// filter can empty). See [`crate::audio::whisper::provenance::Provenance::is_reproducible`].
   ///
   /// **`Option<bool>`, with `None` the explicit unknown** (F1, codex round 6
   /// post-consolidation): `Some(true)`/`Some(false)` is a decode that OBSERVED
   /// whether it drew, `None` a record that cannot know (an options-only
-  /// [`Provenance::from_options`](crate::provenance::Provenance::from_options),
+  /// [`Provenance::from_options`](crate::audio::whisper::provenance::Provenance::from_options),
   /// or a hand-built [`Self::unknown`] — an unknown contributor, not a merge
   /// identity). A `false` and an unknown are NOT
   /// the same fact: [`Self::is_reproducible_under`] trusts an observed
@@ -368,9 +368,9 @@ pub struct TaskFacts {
   /// The language a window **actually observed** (a probe ran or a `<|lang|>`
   /// token was predicted), or `None` when the run observed none. The
   /// **outcome**, distinct from the configured
-  /// [`DecodingOptions::language`](crate::options::DecodingOptions::language) and
+  /// [`DecodingOptions::language`](crate::audio::whisper::options::DecodingOptions::language) and
   /// from the Swift-compat display fallback
-  /// [`TranscriptionResult::language`](crate::result::TranscriptionResult::language)
+  /// [`TranscriptionResult::language`](crate::audio::whisper::result::TranscriptionResult::language)
   /// carries — this is never that `"en"` display string, and never inferred.
   ///
   /// Required on deserialize (present, nullable): `None` is itself the fact
@@ -390,8 +390,8 @@ pub struct TaskFacts {
   ///
   /// **`Option<bool>`, with `None` the explicit unknown** (F1, codex round 6
   /// post-consolidation): a constructor that cannot see the truncation —
-  /// [`Provenance::for_segment`](crate::provenance::Provenance::for_segment) and
-  /// [`Provenance::from_options`](crate::provenance::Provenance::from_options),
+  /// [`Provenance::for_segment`](crate::audio::whisper::provenance::Provenance::for_segment) and
+  /// [`Provenance::from_options`](crate::audio::whisper::provenance::Provenance::from_options),
   /// which are handed options and at most one segment, never the callback —
   /// records `None`, and [`Self::is_reproducible_under`] then refuses to promise
   /// reproducibility rather than fabricating a `not-truncated`. That fabrication
@@ -419,7 +419,7 @@ pub struct TaskFacts {
   /// POSITIVELY watched its child fallible steps and saw none swallowed (the
   /// [`Self::observed_clean`] seed a real run starts from), `Some(true)` a run
   /// that hid at least one, and `None` a record that cannot know — a hand-built or
-  /// options-/segment-only [`Provenance`](crate::provenance::Provenance) that
+  /// options-/segment-only [`Provenance`](crate::audio::whisper::provenance::Provenance) that
   /// never watched a child step. [`Self::is_reproducible_under`] treats that `None`
   /// like the other booleans' — conservatively non-reproducible — rather than
   /// fabricating an optimistic "nothing was swallowed".
@@ -432,12 +432,12 @@ pub struct TaskFacts {
   had_swallowed_error: Option<bool>,
   /// The ordered worker/chunk coordinates whose RNG streams produced this
   /// transcript's segments — a single decode task's own
-  /// [`window_id_offset`](crate::transcribe::TranscribeTask::set_window_id_offset)
+  /// [`window_id_offset`](crate::audio::whisper::transcribe::TranscribeTask::set_window_id_offset)
   /// as `[offset]`, a merge's the ordered concatenation of its children's
   /// (coordinates `[0]` and `[2]` merge to `[0, 2]`). Each coordinate
   /// domain-separates the seeded fallback ladder's sub-seed derivation
-  /// ([`crate::decode::sampler::derive_attempt_seed`]), so under a
-  /// [`DecodingOptions::seed`](crate::options::DecodingOptions::seed) two runs at
+  /// ([`crate::audio::whisper::decode::sampler::derive_attempt_seed`]), so under a
+  /// [`DecodingOptions::seed`](crate::audio::whisper::options::DecodingOptions::seed) two runs at
   /// different coordinates draw different streams and land different text.
   ///
   /// **Explicit unknown (`None`) for a hand-built or options-only record, never
@@ -457,7 +457,7 @@ pub struct TaskFacts {
   /// segments because a filter (the blank-audio drop, the word-timestamp
   /// zero-length filter) removes some *after* their ids are allocated, so the
   /// survivors' count under-reports the span.
-  /// [`merge_transcription_results_with_options`](crate::result::merge_transcription_results_with_options)
+  /// [`merge_transcription_results_with_options`](crate::audio::whisper::result::merge_transcription_results_with_options)
   /// advances its running id base by this span's [lower bound](SpanKnowledge::lower_bound)
   /// (floored at the survivors' extent, not inferred from it) so a wholly-dropped
   /// chunk still shifts the next chunk's ids past the ordinals it consumed, and
@@ -495,7 +495,7 @@ pub struct TaskFacts {
 /// compile until it is named here, and the new name then lands in
 /// `provenance::tests`' task-fact coverage as uncovered until it is exercised by
 /// a mutation. So a new run-controlled fact cannot be added to the record and
-/// left unread by [`Provenance::for_result`](crate::provenance::Provenance::for_result).
+/// left unread by [`Provenance::for_result`](crate::audio::whisper::provenance::Provenance::for_result).
 macro_rules! task_facts_field_names {
   ($($field:ident),+ $(,)?) => {
     /// The full field set of [`TaskFacts`], one entry per field. Kept
@@ -530,8 +530,8 @@ impl TaskFacts {
   /// (`None`, never the optimistic `Some(false)`), no observed language, an
   /// **unknown** worker schedule (`None`, never `[0]`), and a wholly-unknown span
   /// ([`AtLeast(0)`](SpanKnowledge::wholly_unknown)). The value a
-  /// hand-built [`TranscriptionResult`](crate::result::TranscriptionResult)
-  /// carries, an options-only [`Provenance`](crate::provenance::Provenance)
+  /// hand-built [`TranscriptionResult`](crate::audio::whisper::result::TranscriptionResult)
+  /// carries, an options-only [`Provenance`](crate::audio::whisper::provenance::Provenance)
   /// records, and — for zero contributors — what a
   /// `TaskFactsAccumulator` folds down to. **Not** the identity of
   /// [`Self::merge`]: under the Kleene OR (`kleene_or`) the boolean identity is
@@ -621,7 +621,7 @@ impl TaskFacts {
   /// Builder recording [`Self::early_stopped`] as a POSITIVELY observed fact
   /// (`Some(early_stopped)`). Leave it at [`Self::unknown`]'s `None` when the
   /// constructor cannot see the callback — the honest state for
-  /// [`Provenance::for_segment`](crate::provenance::Provenance::for_segment).
+  /// [`Provenance::for_segment`](crate::audio::whisper::provenance::Provenance::for_segment).
   #[must_use]
   #[inline(always)]
   pub const fn with_early_stopped(mut self, early_stopped: bool) -> Self {
@@ -814,10 +814,10 @@ impl TaskFacts {
   /// **A seeded draw also needs its worker schedule** (codex round 13, M2): the
   /// seed alone does not make an observed draw replayable, because each
   /// worker/chunk coordinate reseeds the fallback ladder
-  /// ([`derive_attempt_seed`](crate::decode::sampler::derive_attempt_seed)), so
+  /// ([`derive_attempt_seed`](crate::audio::whisper::decode::sampler::derive_attempt_seed)), so
   /// re-running the same seed at a coordinate the record no longer carries can
   /// land different text. When [`worker_schedule`](Self::worker_schedule) is
-  /// `None` — the shape [`LocalAgreement`](crate::stream::agreement::LocalAgreement)
+  /// `None` — the shape [`LocalAgreement`](crate::audio::whisper::stream::agreement::LocalAgreement)
   /// leaves after stripping the per-hypothesis schedules its interleaved confirmed
   /// text can no longer attribute — an observed draw is non-reproducible even
   /// seeded, exactly as an unobserved truncation is.
@@ -826,21 +826,21 @@ impl TaskFacts {
   /// post-consolidation): an unobserved draw, truncation, or swallowed error
   /// (`None`) answers `false`, never the optimistic value. A record that cannot
   /// see whether a transcript-controlling event happened — an options-only
-  /// [`Provenance::from_options`](crate::provenance::Provenance::from_options),
-  /// or a segment-only [`Provenance::for_segment`](crate::provenance::Provenance::for_segment)
+  /// [`Provenance::from_options`](crate::audio::whisper::provenance::Provenance::from_options),
+  /// or a segment-only [`Provenance::for_segment`](crate::audio::whisper::provenance::Provenance::for_segment)
   /// that is handed the truncated segment but never the callback — must not
   /// promise byte-reproducibility. Only a real decode's carried `Some(false)`
-  /// facts, read by [`Provenance::for_result`](crate::provenance::Provenance::for_result)
+  /// facts, read by [`Provenance::for_result`](crate::audio::whisper::provenance::Provenance::for_result)
   /// off the transcript, earns the optimistic answer. The bare [`Self::unknown`]
   /// is therefore NOT reproducible; a genuinely clean run is
   /// [`Self::observed_clean`] (all three booleans positively `Some(false)`).
   ///
-  /// The reproducibility predicate [`Provenance::is_reproducible`](crate::provenance::Provenance::is_reproducible)
+  /// The reproducibility predicate [`Provenance::is_reproducible`](crate::audio::whisper::provenance::Provenance::is_reproducible)
   /// is built on: it reads [`Self::drew_from_rng`], [`Self::early_stopped`], and
   /// [`Self::had_swallowed_error`] here and supplies whether
-  /// [`DecodingOptions::seed`](crate::options::DecodingOptions::seed)
+  /// [`DecodingOptions::seed`](crate::audio::whisper::options::DecodingOptions::seed)
   /// is set as `seeded`. Kept on the record so the facts it rests on have
-  /// one home; see the [`Provenance`](crate::provenance::Provenance) method for
+  /// one home; see the [`Provenance`](crate::audio::whisper::provenance::Provenance) method for
   /// the full rationale.
   #[inline]
   pub const fn is_reproducible_under(&self, seeded: bool) -> bool {
@@ -881,8 +881,8 @@ impl TaskFacts {
 /// `Empty` accumulator is `unknown()` — the correct "nothing was observed"
 /// answer for zero contributors.
 ///
-/// Consumed by [`merge_transcription_results_with_options`](crate::result::merge_transcription_results_with_options)'s
-/// task-facts fold and by [`LocalAgreement`](crate::stream::agreement::LocalAgreement)'s
+/// Consumed by [`merge_transcription_results_with_options`](crate::audio::whisper::result::merge_transcription_results_with_options)'s
+/// task-facts fold and by [`LocalAgreement`](crate::audio::whisper::stream::agreement::LocalAgreement)'s
 /// finalize sink (codex round 8, F1).
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TaskFactsAccumulator {

@@ -1,5 +1,7 @@
 use super::*;
-use crate::result::{TranscriptionResult, TranscriptionSegment, TranscriptionTimings, WordTiming};
+use crate::audio::whisper::result::{
+  TranscriptionResult, TranscriptionSegment, TranscriptionTimings, WordTiming,
+};
 
 // The brief's literal snippet called `TranscriptionResult::new()` with no
 // arguments and passed `.into()`'d string literals to `impl Into<String>`

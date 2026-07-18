@@ -40,7 +40,7 @@
 //!     [`Provenance::model_revision`]) and the tokenizer identity
 //!     ([`Provenance::tokenizer_id`]/[`Provenance::tokenizer_revision`]).
 //!     These are *load-time* facts: this crate loads models and tokenizers
-//!     from plain local folders ([`crate::options::Options`] holds nothing
+//!     from plain local folders ([`crate::audio::whisper::options::Options`] holds nothing
 //!     but two [`std::path::Path`]s; model auto-download is deferred, spec
 //!     §4.7), so nothing in the pipeline ever sees a Hub repo id or a git
 //!     revision. Only the caller — who *does* know which artifact it put
@@ -49,14 +49,14 @@
 //!   - The VAD detector ([`Provenance::vad_detector`]). It is
 //!     **doubly** unobservable: the pipeline holds it as a
 //!     `Box<dyn VoiceActivityDetector>`
-//!     ([`crate::transcribe::WhisperKit::vad_detector`]), and a trait
+//!     ([`crate::audio::whisper::transcribe::WhisperKit::vad_detector`]), and a trait
 //!     object carries no identity to read; and it lives on
-//!     [`WhisperKit`](crate::transcribe::WhisperKit), not in
+//!     [`WhisperKit`](crate::audio::whisper::transcribe::WhisperKit), not in
 //!     [`DecodingOptions`] or [`ComputeOptions`], so the constructors here
 //!     could not reach it even if it had a name. That is why the record's
 //!     [`DecodingOptions::chunking_strategy`] says only *whether* VAD ran.
 //!     Supplying the detector matters because swapping it
-//!     ([`crate::transcribe::WhisperKit::set_vad_detector`]) moves the
+//!     ([`crate::audio::whisper::transcribe::WhisperKit::set_vad_detector`]) moves the
 //!     chunk boundaries, and the boundaries move the transcript — so two
 //!     runs differing *only* in detector would otherwise leave
 //!     byte-identical records with no trace of what made their text
@@ -75,7 +75,7 @@
 //!   `0.0`, and [`DecodingOptions::seed`] is unset by default (OS-seeded,
 //!   matching Swift's own unseeded draw). Whether a decode actually drew is read
 //!   from the carried [`Provenance::task_facts`]'
-//!   [`drew_from_rng`](crate::task_facts::TaskFacts::drew_from_rng) — a fact the
+//!   [`drew_from_rng`](crate::audio::whisper::task_facts::TaskFacts::drew_from_rng) — a fact the
 //!   decode carried out of the window loop — and is **never** inferred from
 //!   [`Provenance::effective_temperature`], which summarizes only the segments
 //!   that survived: a window that sampled at `0.2` and then lost its text to the
@@ -90,13 +90,13 @@
 //!   It is `""` whenever the decoder is left to detect (the default
 //!   pairing), so a record built from options alone names no language at
 //!   all. The carried [`Provenance::task_facts`]'
-//!   [`observed_language`](crate::task_facts::TaskFacts::observed_language) is
+//!   [`observed_language`](crate::audio::whisper::task_facts::TaskFacts::observed_language) is
 //!   the fact that carries what was actually spoken, and only
 //!   [`Provenance::for_result`] — which is handed the transcript — can fill it in.
 
-use coremlit::ComputeUnits;
+use crate::ComputeUnits;
 
-use crate::{
+use crate::audio::whisper::{
   options::{ComputeOptions, DecodingOptions},
   result::{TranscriptionResult, TranscriptionSegment},
   task_facts::TaskFacts,
@@ -215,13 +215,16 @@ pub struct Provenance {
   /// The one outcome fact NOT in [`Self::task_facts`]: it is *derived* from
   /// the surviving segments (their unanimous temperature), where the record's
   /// facts are *carried* out of the decode. Required on deserialize, and
-  /// finite: bridged through `crate::options::finite_f32_option`, which keeps
+  /// finite: bridged through `crate::audio::whisper::options::finite_f32_option`, which keeps
   /// the field required (naming a `with` defeats serde's
   /// missing-`Option`-is-`None` special case) and refuses a non-finite value
   /// on both sides of the wire (codex round 3, F6). Without it, a `Some(-inf)`
   /// that `serde_json` collapses to `null` would read back as a forged `None`
   /// ("the ladder split the segments").
-  #[cfg_attr(feature = "serde", serde(with = "crate::options::finite_f32_option"))]
+  #[cfg_attr(
+    feature = "serde",
+    serde(with = "crate::audio::whisper::options::finite_f32_option")
+  )]
   effective_temperature: Option<f32>,
   /// The decode-time facts this run **controlled** — the RNG draw, the
   /// genuinely observed language, the early-stop truncation, the worker
@@ -277,17 +280,17 @@ pub struct Provenance {
   /// Never inferred — not from the detector's concrete type, not from
   /// [`std::any::type_name`], and not from
   /// [`DecodingOptions::chunking_strategy`] being
-  /// [`ChunkingStrategy::Vad`](crate::options::ChunkingStrategy::Vad). The
+  /// [`ChunkingStrategy::Vad`](crate::audio::whisper::options::ChunkingStrategy::Vad). The
   /// pipeline holds the detector as a
   /// `Box<dyn VoiceActivityDetector>`
-  /// ([`crate::transcribe::WhisperKit::vad_detector`]), which exposes no
+  /// ([`crate::audio::whisper::transcribe::WhisperKit::vad_detector`]), which exposes no
   /// identity to read, and it lives on
-  /// [`WhisperKit`](crate::transcribe::WhisperKit) rather than in
+  /// [`WhisperKit`](crate::audio::whisper::transcribe::WhisperKit) rather than in
   /// [`DecodingOptions`]/[`ComputeOptions`] — so no constructor here can
   /// reach it. Only the caller that installed it knows what it is.
   ///
   /// Worth supplying whenever it is not the default
-  /// [`EnergyVad`](crate::audio::vad::EnergyVad): the detector decides
+  /// [`EnergyVad`](crate::audio::whisper::audio::vad::EnergyVad): the detector decides
   /// where the chunk boundaries fall, and the boundaries decide the text,
   /// so two runs that differ *only* in detector yield different
   /// transcripts from records that are otherwise identical.
@@ -646,7 +649,7 @@ impl Provenance {
   /// `Some`): each coordinate reseeds the fallback ladder, so the same seed at a
   /// DIFFERENT coordinate lands different text, and `window_id_offset` is an
   /// in-process merge coordinate, not a [`DecodingOptions`] knob a re-run recovers
-  /// (codex round 13, M2). [`LocalAgreement`](crate::stream::agreement::LocalAgreement)
+  /// (codex round 13, M2). [`LocalAgreement`](crate::audio::whisper::stream::agreement::LocalAgreement)
   /// strips the schedule to `None` — its confirmed text interleaves MULTIPLE
   /// hypotheses, so no single ordered attribution survives — so a seeded
   /// LocalAgreement result whose text a dropped hypothesis's draw controlled is

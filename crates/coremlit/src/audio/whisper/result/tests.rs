@@ -1,5 +1,5 @@
 use super::*;
-use crate::{
+use crate::audio::whisper::{
   options::DecodingOptions,
   task_facts::{SpanKnowledge, TaskFacts},
 };
@@ -890,7 +890,7 @@ fn merging_an_unknown_facts_contributor_poisons_a_known_clean_result() {
   //   - revert `kleene_or` to the free monoid, and the UNKNOWN contributor stops
   //     poisoning, reading back `Some(false)`/reproducible (the `poisoned` block
   //     fails).
-  let compute = crate::options::ComputeOptions::new();
+  let compute = crate::audio::whisper::options::ComputeOptions::new();
   let clean = TranscriptionResult::new(
     "Hi",
     vec![TranscriptionSegment::new()],
@@ -908,8 +908,12 @@ fn merging_an_unknown_facts_contributor_poisons_a_known_clean_result() {
   assert_eq!(solo.task_facts().drew_from_rng(), Some(false));
   assert_eq!(solo.task_facts().early_stopped(), Some(false));
   assert!(
-    crate::provenance::Provenance::for_result(&DecodingOptions::new(), &compute, &solo)
-      .is_reproducible(),
+    crate::audio::whisper::provenance::Provenance::for_result(
+      &DecodingOptions::new(),
+      &compute,
+      &solo
+    )
+    .is_reproducible(),
     "a lone observed-clean result is reproducible",
   );
 
@@ -924,8 +928,12 @@ fn merging_an_unknown_facts_contributor_poisons_a_known_clean_result() {
   );
   assert_eq!(poisoned.task_facts().early_stopped(), None);
   assert!(
-    !crate::provenance::Provenance::for_result(&DecodingOptions::new(), &compute, &poisoned)
-      .is_reproducible(),
+    !crate::audio::whisper::provenance::Provenance::for_result(
+      &DecodingOptions::new(),
+      &compute,
+      &poisoned
+    )
+    .is_reproducible(),
     "the merge must not promise reproducibility once an unknown contributor joined",
   );
 }
@@ -1283,7 +1291,7 @@ fn empty_word_tokens_do_not_trigger_compression_fallback() {
   // ratio was f32::INFINITY, `INFINITY > 2.4` was true, and this same empty
   // window would have (wrongly) forced a fallback: the exact parity bug this
   // guards against.
-  let empty_ratio = crate::text::compression_ratio_of_tokens(&[]);
+  let empty_ratio = crate::audio::whisper::text::compression_ratio_of_tokens(&[]);
   assert_eq!(empty_ratio, 0.0);
   // Other signals kept clean so the compression branch is the one under
   // test: no_speech below its 0.6 default, avg_logprob above its -1.0

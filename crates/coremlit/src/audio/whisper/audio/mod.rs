@@ -2,7 +2,7 @@
 //!
 //! Decoding, resampling, and capture are the caller's domain; everything
 //! here operates on `&[f32]` samples already at
-//! [`SAMPLE_RATE`](crate::constants::SAMPLE_RATE). Ports the pure-math
+//! [`SAMPLE_RATE`](crate::audio::whisper::constants::SAMPLE_RATE). Ports the pure-math
 //! statics of `WhisperKit/Core/Audio/AudioProcessor.swift`.
 
 pub mod chunker;
@@ -15,7 +15,7 @@ mod tests;
 ///
 /// Ports `AudioProcessing.padOrTrimAudio`'s core semantics
 /// (`AudioProcessor.swift`): Whisper windows are always exactly
-/// [`WINDOW_SAMPLES`](crate::constants::WINDOW_SAMPLES) long.
+/// [`WINDOW_SAMPLES`](crate::audio::whisper::constants::WINDOW_SAMPLES) long.
 pub fn pad_or_trim(samples: &[f32], len: usize) -> Vec<f32> {
   let mut out = Vec::with_capacity(len);
   let copy = samples.len().min(len);
@@ -87,7 +87,7 @@ pub fn voice_activity_in_chunks(
 ///
 /// Ports `AudioProcessor.isVoiceDetected` (`AudioProcessor.swift:636-655`):
 /// `relative_energy` holds one entry per completed 0.1 s frame (oldest
-/// first — `crate::stream`'s `EnergyTracker` is what builds this history
+/// first — `crate::audio::whisper::stream`'s `EnergyTracker` is what builds this history
 /// in practice). `next_buffer_seconds` (the duration of audio just pushed)
 /// converts to a count of recent entries to `consider` (`/ 0.1`, one entry
 /// per frame); Swift's `max(0, Int(...))` clamp is redundant once ported —

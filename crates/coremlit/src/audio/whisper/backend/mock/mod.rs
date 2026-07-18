@@ -1,4 +1,4 @@
-//! [`MockBackend`]: a scripted, deterministic [`crate::backend::InferenceBackend`]
+//! [`MockBackend`]: a scripted, deterministic [`crate::audio::whisper::backend::InferenceBackend`]
 //! test double with no compiled model — kept in the public tree
 //! deliberately (spec §5.4 `MockBackend`), not behind a test-only `cfg`, so
 //! downstream crates get the same hermetic decode-loop/fallback/windowing
@@ -6,7 +6,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use crate::backend::{AlignmentView, BackendError, InferenceBackend, ModelDims};
+use crate::audio::whisper::backend::{AlignmentView, BackendError, InferenceBackend, ModelDims};
 
 #[cfg(test)]
 mod tests;

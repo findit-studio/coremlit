@@ -9,9 +9,9 @@
 //! [`LogitsFilter::filter`] instead mutates `logits: &mut [f32]` in place
 //! and returns nothing. The buffer is plain `f32` math throughout, not
 //! BNNS `FloatType` — the f16→f32 conversion already happened at the
-//! backend boundary (spec §4.8; see [`crate::backend`]).
+//! backend boundary (spec §4.8; see [`crate::audio::whisper::backend`]).
 
-use crate::tokenizer::SpecialTokens;
+use crate::audio::whisper::tokenizer::SpecialTokens;
 
 #[cfg(test)]
 mod tests;

@@ -1,5 +1,5 @@
 use super::*;
-use crate::{
+use crate::audio::whisper::{
   result::{TranscriptionResult, TranscriptionSegment, TranscriptionTimings, WordTiming},
   task_facts::TaskFacts,
 };
@@ -66,7 +66,8 @@ fn agreement_confirms_the_common_prefix_minus_the_agreed_tail() {
 
   // Options for the next stride carry the watermark + agreed prefix tokens
   // (:364-367).
-  let next = agreement.decoding_options_for_next(&crate::options::DecodingOptions::new());
+  let next =
+    agreement.decoding_options_for_next(&crate::audio::whisper::options::DecodingOptions::new());
   assert_eq!(next.clip_timestamps_slice(), &[0.4]);
   assert_eq!(next.prefix_tokens_slice().len(), 2);
 }
@@ -116,7 +117,7 @@ fn finalize_appends_agreed_tail_plus_different_suffix_and_merges() {
     word(" my", 0.7, 1.0),
     word(" fellow", 1.0, 1.5),
   ]));
-  let final_result = agreement.finalize(&crate::options::DecodingOptions::new());
+  let final_result = agreement.finalize(&crate::audio::whisper::options::DecodingOptions::new());
   // confirmed [And] + lastAgreed [so, my] + differentSuffix(prev, hyp) [fellow]
   assert_eq!(final_result.text(), " And so my fellow");
   assert_eq!(final_result.language(), "en");
@@ -156,7 +157,7 @@ fn finalize_threads_options_so_dropped_ids_survive() {
   );
 
   // drop-ON (the default): the gap must survive finalization.
-  let final_result = agreement.finalize(&crate::options::DecodingOptions::new());
+  let final_result = agreement.finalize(&crate::audio::whisper::options::DecodingOptions::new());
   assert_eq!(
     final_result
       .segments_slice()
@@ -251,7 +252,7 @@ fn tied_word_starts_never_confirm_twice() {
     .collect();
   assert_eq!(confirmed, vec![" A", " B"], "confirmed once and stable");
   let text = agreement
-    .finalize(&crate::options::DecodingOptions::new())
+    .finalize(&crate::audio::whisper::options::DecodingOptions::new())
     .text()
     .to_string();
   for token in ["A", "B", "C", "D", "E"] {
@@ -294,7 +295,7 @@ fn omitting_a_confirmed_tied_word_does_not_drop_provisional_words() {
     "and confirmed exactly once"
   );
   let text = agreement
-    .finalize(&crate::options::DecodingOptions::new())
+    .finalize(&crate::audio::whisper::options::DecodingOptions::new())
     .text()
     .to_string();
   for token in ["A", "B", "C", "D", "E"] {
@@ -347,8 +348,8 @@ fn a_dropped_disagreeing_hypothesiss_draw_survives_into_finalize() {
     "R3 kept -- the 2-word R2 is not here",
   );
 
-  let options = crate::options::DecodingOptions::new();
-  let compute = crate::options::ComputeOptions::new();
+  let options = crate::audio::whisper::options::DecodingOptions::new();
+  let compute = crate::audio::whisper::options::ComputeOptions::new();
   let finalized = agreement.finalize(&options);
   assert_eq!(
     finalized.task_facts().drew_from_rng(),
@@ -356,7 +357,8 @@ fn a_dropped_disagreeing_hypothesiss_draw_survives_into_finalize() {
     "the dropped control hypothesis's unseeded draw survives into finalize",
   );
   assert!(
-    !crate::provenance::Provenance::for_result(&options, &compute, &finalized).is_reproducible(),
+    !crate::audio::whisper::provenance::Provenance::for_result(&options, &compute, &finalized)
+      .is_reproducible(),
     "an unseeded draw happened (in a dropped hypothesis), so it is not reproducible",
   );
   // ORACLE CORRECTION (codex round 13, M2): a seed does NOT make the recovered
@@ -376,7 +378,7 @@ fn a_dropped_disagreeing_hypothesiss_draw_survives_into_finalize() {
     "agreement strips the schedule, so the seeded draw's coordinate is unknown",
   );
   assert!(
-    !crate::provenance::Provenance::for_result(
+    !crate::audio::whisper::provenance::Provenance::for_result(
       &options.clone().with_seed(11),
       &compute,
       &finalized,
@@ -427,8 +429,8 @@ fn finalize_keeps_the_earliest_ingested_language_over_a_later_survivor() {
     "only R1 and R3 are kept; the es-observing R2 was dropped",
   );
 
-  let options = crate::options::DecodingOptions::new();
-  let compute = crate::options::ComputeOptions::new();
+  let options = crate::audio::whisper::options::DecodingOptions::new();
+  let compute = crate::audio::whisper::options::ComputeOptions::new();
   let finalized = agreement.finalize(&options);
   assert_eq!(
     finalized.task_facts().observed_language(),
@@ -436,7 +438,7 @@ fn finalize_keeps_the_earliest_ingested_language_over_a_later_survivor() {
     "the earliest ingested genuine language wins, even from a dropped hypothesis",
   );
   assert_eq!(
-    crate::provenance::Provenance::for_result(&options, &compute, &finalized)
+    crate::audio::whisper::provenance::Provenance::for_result(&options, &compute, &finalized)
       .task_facts()
       .observed_language(),
     Some("es"),
@@ -479,7 +481,7 @@ fn finalize_reports_an_unknown_worker_schedule() {
   );
   // The surviving results R1 (worker 0) and R3 (worker 2) carry a knowable [0, 2],
   // but the confirmed transcript mixes their words -- attribution is unknown.
-  let finalized = agreement.finalize(&crate::options::DecodingOptions::new());
+  let finalized = agreement.finalize(&crate::audio::whisper::options::DecodingOptions::new());
   assert_eq!(
     finalized.task_facts().worker_schedule(),
     None,

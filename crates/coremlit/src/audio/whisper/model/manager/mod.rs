@@ -14,7 +14,7 @@
 
 use std::path::PathBuf;
 
-use crate::{
+use crate::audio::whisper::{
   error::ModelError,
   model::{LocalModelLoader, ModelLoader, ModelState, StateCallback},
   options::ComputeOptions,
@@ -34,14 +34,14 @@ mod tests;
 /// it.
 #[derive(Debug)]
 pub struct LoadedModels {
-  mel: coremlit::Model,
-  encoder: coremlit::Model,
-  decoder: coremlit::Model,
+  mel: crate::Model,
+  encoder: crate::Model,
+  decoder: crate::Model,
 }
 
 impl LoadedModels {
   /// Wraps three already-loaded models.
-  pub fn new(mel: coremlit::Model, encoder: coremlit::Model, decoder: coremlit::Model) -> Self {
+  pub fn new(mel: crate::Model, encoder: crate::Model, decoder: crate::Model) -> Self {
     Self {
       mel,
       encoder,
@@ -51,26 +51,26 @@ impl LoadedModels {
 
   /// The mel-spectrogram feature extractor.
   #[inline(always)]
-  pub const fn mel(&self) -> &coremlit::Model {
+  pub const fn mel(&self) -> &crate::Model {
     &self.mel
   }
 
   /// The audio encoder.
   #[inline(always)]
-  pub const fn encoder(&self) -> &coremlit::Model {
+  pub const fn encoder(&self) -> &crate::Model {
     &self.encoder
   }
 
   /// The text decoder.
   #[inline(always)]
-  pub const fn decoder(&self) -> &coremlit::Model {
+  pub const fn decoder(&self) -> &crate::Model {
     &self.decoder
   }
 
   /// Unwraps into owned `(mel, encoder, decoder)` — the positional shape
   /// `CoreMlBackend::new` (`backend::coreml`) takes.
   #[must_use]
-  pub fn into_parts(self) -> (coremlit::Model, coremlit::Model, coremlit::Model) {
+  pub fn into_parts(self) -> (crate::Model, crate::Model, crate::Model) {
     (self.mel, self.encoder, self.decoder)
   }
 }
@@ -141,7 +141,7 @@ impl ModelManager {
   /// Sequentially loads, then immediately drops, each model once — mel,
   /// decoder, then encoder (`WhisperKit.swift:382-427`'s `prewarmMode`
   /// order) — forcing ANE specialization/compilation up front rather than
-  /// at first real inference. Ports `coremlit::Model::prewarm`'s
+  /// at first real inference. Ports `crate::Model::prewarm`'s
   /// load-then-drop shape, run once per model in sequence rather than
   /// racing all three. Transitions [`ModelState::Prewarming`] →
   /// [`ModelState::Prewarmed`] on success, or back to
@@ -163,7 +163,7 @@ impl ModelManager {
   /// # Errors
   /// [`ModelError::InvalidState`] when called while models are resident
   /// ([`ModelState::Loaded`]); whatever [`LocalModelLoader::resolve`] or
-  /// `coremlit::Model::prewarm` returns otherwise.
+  /// `crate::Model::prewarm` returns otherwise.
   pub fn prewarm(&mut self) -> Result<(), ModelError> {
     match self.state {
       // ModelManager.swift:132-134 — already prewarmed: skip silently.
@@ -191,9 +191,9 @@ impl ModelManager {
 
   fn resolve_and_prewarm(&self) -> Result<(), ModelError> {
     let resolved = LocalModelLoader::new().resolve(&self.folder)?;
-    coremlit::Model::prewarm(resolved.mel_ref(), self.compute.mel())?;
-    coremlit::Model::prewarm(resolved.decoder_ref(), self.compute.decoder())?;
-    coremlit::Model::prewarm(resolved.encoder_ref(), self.compute.encoder())?;
+    crate::Model::prewarm(resolved.mel_ref(), self.compute.mel())?;
+    crate::Model::prewarm(resolved.decoder_ref(), self.compute.decoder())?;
+    crate::Model::prewarm(resolved.encoder_ref(), self.compute.encoder())?;
     Ok(())
   }
 
@@ -227,7 +227,7 @@ impl ModelManager {
   /// concurrent entry is impossible by construction.
   ///
   /// # Errors
-  /// Whatever [`LocalModelLoader::resolve`] or `coremlit::Model::load`
+  /// Whatever [`LocalModelLoader::resolve`] or `crate::Model::load`
   /// returns.
   pub fn ensure_loaded(&mut self) -> Result<&LoadedModels, ModelError> {
     if self.state != ModelState::Loaded {
@@ -258,9 +258,9 @@ impl ModelManager {
 
   fn resolve_and_load(&self) -> Result<LoadedModels, ModelError> {
     let resolved = LocalModelLoader::new().resolve(&self.folder)?;
-    let mel = coremlit::Model::load(resolved.mel_ref(), self.compute.mel())?;
-    let decoder = coremlit::Model::load(resolved.decoder_ref(), self.compute.decoder())?;
-    let encoder = coremlit::Model::load(resolved.encoder_ref(), self.compute.encoder())?;
+    let mel = crate::Model::load(resolved.mel_ref(), self.compute.mel())?;
+    let decoder = crate::Model::load(resolved.decoder_ref(), self.compute.decoder())?;
+    let encoder = crate::Model::load(resolved.encoder_ref(), self.compute.encoder())?;
     Ok(LoadedModels::new(mel, encoder, decoder))
   }
 

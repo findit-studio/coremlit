@@ -15,7 +15,7 @@ use std::path::Path;
 
 use unicode_categories::UnicodeCategories;
 
-use crate::{constants, error::TokenizerError, options::WordGrouping};
+use crate::audio::whisper::{constants, error::TokenizerError, options::WordGrouping};
 
 #[cfg(feature = "nl-recognizer")]
 pub mod nl_recognizer;

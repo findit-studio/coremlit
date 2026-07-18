@@ -1,7 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use super::*;
-use crate::{model::ModelState, options::ComputeOptions};
+use crate::audio::whisper::{model::ModelState, options::ComputeOptions};
 
 #[test]
 fn missing_folder_fails_and_restores_unloaded() {

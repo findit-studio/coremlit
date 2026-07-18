@@ -5,7 +5,7 @@ use std::{
 };
 
 use super::*;
-use crate::{
+use crate::audio::whisper::{
   backend::{InferenceBackend, mock::MockBackend},
   decode::sampler::GreedyTokenSampler,
   options::DecodingOptions,
@@ -44,7 +44,7 @@ fn run_mock(
   prompt: &[u32],
   options: &DecodingOptions,
   tokenizer: &WhisperTokenizer,
-) -> crate::result::DecodingResult {
+) -> crate::audio::whisper::result::DecodingResult {
   let encoded = mock
     .encode(&mock.extract_features(&[0.0; 16]).unwrap())
     .unwrap();
@@ -378,7 +378,10 @@ fn language_observed_only_for_a_predicted_language_token() {
     s.time_token_begin(),
   ];
   let fallback = run_mock(&mock, &prompt_no_lang, &DecodingOptions::new(), &t);
-  assert_eq!(fallback.language(), crate::constants::DEFAULT_LANGUAGE_CODE);
+  assert_eq!(
+    fallback.language(),
+    crate::audio::whisper::constants::DEFAULT_LANGUAGE_CODE
+  );
   assert_eq!(
     fallback.observed_language(),
     None,
@@ -563,14 +566,15 @@ fn early_stop_flag_breaks_loop_and_callback_sets_it() {
   let options = DecodingOptions::new();
   let mut sampler = GreedyTokenSampler::new(0.0, s.end_token(), &options);
   let mut timings = TranscriptionTimings::new();
-  let callback: &(dyn Fn(&crate::result::TranscriptionProgress) -> Option<bool> + Sync) =
-    &|_progress| {
-      let mut seen = steps_seen.lock().unwrap();
-      *seen += 1;
-      // Prefill steps get callbacks too, so `seen` reaches 5 on the 2nd
-      // non-prefill step; the stop reply is honored there.
-      Some(*seen < 5)
-    };
+  let callback: &(
+     dyn Fn(&crate::audio::whisper::result::TranscriptionProgress) -> Option<bool> + Sync
+   ) = &|_progress| {
+    let mut seen = steps_seen.lock().unwrap();
+    *seen += 1;
+    // Prefill steps get callbacks too, so `seen` reaches 5 on the 2nd
+    // non-prefill step; the stop reply is honored there.
+    Some(*seen < 5)
+  };
   let result = decode_text(
     &mock,
     &encoded,
@@ -662,7 +666,7 @@ fn detect_language_samples_through_the_callers_sampler() {
   let mut mock = MockBackend::new();
   // Two viable languages: close logits so a t = 0.7 draw genuinely
   // consults the RNG (argmax would always pick es).
-  let mut logits = vec![0.0f32; crate::backend::ModelDims::new().vocab()];
+  let mut logits = vec![0.0f32; crate::audio::whisper::backend::ModelDims::new().vocab()];
   logits[es as usize] = 10.0;
   logits[de as usize] = 9.5;
   mock.push_step(logits.clone());
@@ -677,7 +681,8 @@ fn detect_language_samples_through_the_callers_sampler() {
   // the identically filtered buffer.
   let mut reference =
     GreedyTokenSampler::new(0.7, s.end_token(), &DecodingOptions::new()).with_seed(7);
-  let filter = crate::decode::filter::LanguageLogitsFilter::new(t.all_language_tokens(), 0);
+  let filter =
+    crate::audio::whisper::decode::filter::LanguageLogitsFilter::new(t.all_language_tokens(), 0);
   let mut reference_logits = logits;
   filter.filter(&mut reference_logits, &[s.start_of_transcript_token()]);
   let expected = reference.sample(&reference_logits);

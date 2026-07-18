@@ -50,23 +50,23 @@
 //! - **`EMBED_SLOTS = 3`** matches dia's `SLOTS_PER_CHUNK`
 //!   (`diarization/src/offline/owned.rs:41`) / `MAX_SPEAKER_SLOTS`
 //!   (`diarization/src/segment/options.rs:43`, already cited by
-//!   [`crate::segment::SEG_NUM_SLOTS`]) and the introspected `waveform`/
+//!   [`crate::audio::speaker::segment::SEG_NUM_SLOTS`]) and the introspected `waveform`/
 //!   `mask`/`embedding` tensors' shared leading dimension.
 //! - **`&self`, not `&mut self`.** dia's `embed_chunk_with_frame_mask` is
 //!   `&mut self` over a `!Sync` ort session with input scratch
-//!   (`model.rs:611-615`). `coremlit::Model` is `Send` (but deliberately
+//!   (`model.rs:611-615`). `crate::Model` is `Send` (but deliberately
 //!   NOT `Sync` — Apple documents `MLModel` prediction as
 //!   one-thread-at-a-time; `coremlit/src/model/mod.rs` carries only
 //!   `unsafe impl Send`, with a `compile_fail` doctest pinning `!Sync`)
 //!   and predicts from borrowed inputs with no mutable scratch, so this
 //!   module's methods take `&self` — the same documented divergence
-//!   [`crate::segment::SegmentModel::infer`] already makes. Fan-out
+//!   [`crate::audio::speaker::segment::SegmentModel::infer`] already makes. Fan-out
 //!   therefore means one [`EmbedModel`] per worker (or external
 //!   synchronization), not a shared `Arc`.
 //!
 //! # Deliberate divergence from dia: pad, don't reject
 //!
-//! Unlike [`crate::segment::SegmentModel::infer`] (which REJECTS any
+//! Unlike [`crate::audio::speaker::segment::SegmentModel::infer`] (which REJECTS any
 //! non-`SEG_CHUNK_SAMPLES` input, matching dia's own segment-side
 //! reject-not-pad contract) — and unlike dia's OWN
 //! `embed_chunk_with_frame_mask`, which ALSO rejects on exact-length
@@ -244,9 +244,9 @@
 
 use std::path::Path;
 
-use coremlit::{ComputeUnits, DataType, Model, MultiArray};
+use crate::{ComputeUnits, DataType, Model, MultiArray};
 
-use crate::error::{InferError, ModelError};
+use crate::audio::speaker::error::{InferError, ModelError};
 
 /// Output dimensionality of the WeSpeaker embedding. Matches dia's
 /// `EMBEDDING_DIM` (`diarization/src/embed/options.rs:25`) and the
@@ -260,7 +260,7 @@ pub const EMBEDDING_DIM: usize = 256;
 /// `tests/model_io.rs::wespeaker_v2_io_matches_spec`). Matches dia's
 /// `SLOTS_PER_CHUNK` (`diarization/src/offline/owned.rs:41`) /
 /// `MAX_SPEAKER_SLOTS` (`diarization/src/segment/options.rs:43`) and this
-/// crate's own [`crate::segment::SEG_NUM_SLOTS`].
+/// crate's own [`crate::audio::speaker::segment::SEG_NUM_SLOTS`].
 pub const EMBED_SLOTS: usize = 3;
 
 /// Declared feature names on `wespeaker_v2.mlmodelc`
@@ -278,7 +278,7 @@ mod names {
 /// schedule across ANE/GPU/CPU (design spec §1's ~30x embedding uplift
 /// target). Model-gated tests in this module instead load with
 /// `ComputeUnits::CpuOnly` for determinism, matching
-/// [`crate::segment::DEFAULT_SEGMENT_COMPUTE`]'s and `tests/model_io.rs`'s
+/// [`crate::audio::speaker::segment::DEFAULT_SEGMENT_COMPUTE`]'s and `tests/model_io.rs`'s
 /// convention — production code keeps this default.
 pub const DEFAULT_EMBED_COMPUTE: ComputeUnits = ComputeUnits::All;
 
@@ -288,7 +288,7 @@ fn default_embed_compute() -> ComputeUnits {
 }
 
 /// Construction options for [`EmbedModel`] (rust-options-pattern). Mirrors
-/// [`crate::segment::SegmentModelOptions`] exactly — a single `compute`
+/// [`crate::audio::speaker::segment::SegmentModelOptions`] exactly — a single `compute`
 /// knob, `const new`/`Default` sharing one source of truth, `with_`/`set_`
 /// pair — down to sharing its `ComputeUnits` serde bridge
 /// (the crate-private `compute_units_serde` module, factored out of
@@ -299,7 +299,10 @@ fn default_embed_compute() -> ComputeUnits {
 pub struct EmbedModelOptions {
   #[cfg_attr(
     feature = "serde",
-    serde(default = "default_embed_compute", with = "crate::compute_units_serde")
+    serde(
+      default = "default_embed_compute",
+      with = "crate::audio::speaker::compute_units_serde"
+    )
   )]
   compute: ComputeUnits,
 }
@@ -341,7 +344,7 @@ impl EmbedModelOptions {
 
 /// Human-readable `shape dtype` rendering for
 /// [`ModelError::ContractMismatch`]'s `actual`/`expected` fields. Same
-/// tiny helper as `crate::segment`'s private `describe` — deliberately
+/// tiny helper as `crate::audio::speaker::segment`'s private `describe` — deliberately
 /// NOT unified with it: this task's review queue named only the
 /// `ComputeUnits` serde bridge (the crate-private `compute_units_serde`
 /// module) for sharing, so this one-off duplication is left as a future
@@ -394,7 +397,7 @@ impl EmbedModel {
 
     let waveform_expected = format!(
       "[{EMBED_SLOTS}, {}] float32",
-      crate::segment::SEG_CHUNK_SAMPLES
+      crate::audio::speaker::segment::SEG_CHUNK_SAMPLES
     );
     let waveform =
       description
@@ -404,7 +407,11 @@ impl EmbedModel {
           expected: waveform_expected.clone(),
           actual: "missing".to_string(),
         })?;
-    if waveform.shape() != [EMBED_SLOTS, crate::segment::SEG_CHUNK_SAMPLES]
+    if waveform.shape()
+      != [
+        EMBED_SLOTS,
+        crate::audio::speaker::segment::SEG_CHUNK_SAMPLES,
+      ]
       || waveform.data_type() != Some(DataType::F32)
     {
       return Err(ModelError::ContractMismatch {
@@ -426,7 +433,7 @@ impl EmbedModel {
     // `mask_shape[1] >= 1`: a zero-frame contract would "load fine" and
     // then make every embed call build a zero-length mask row — reject
     // the degenerate contract at construction instead, mirroring
-    // `crate::segment::SegmentModel::from_file_with`'s identical
+    // `crate::audio::speaker::segment::SegmentModel::from_file_with`'s identical
     // `shape[1] >= 1` guard on `segments`.
     let mask_shape_ok = mask_shape.len() == 2 && mask_shape[0] == EMBED_SLOTS && mask_shape[1] >= 1;
     if !mask_shape_ok || mask.data_type() != Some(DataType::F32) {
@@ -494,7 +501,7 @@ impl EmbedModel {
   /// the predict-time `embedding` tensor's shape diverges from
   /// `[EMBED_SLOTS, EMBEDDING_DIM]` — re-checked on every call for the
   /// same CoreML-runtime-is-a-trust-boundary reason
-  /// [`crate::segment::SegmentModel::infer`] re-checks its own output
+  /// [`crate::audio::speaker::segment::SegmentModel::infer`] re-checks its own output
   /// shape (see that module's doc). [`InferError::NonFiniteOutput`] if ANY
   /// of the `EMBED_SLOTS * EMBEDDING_DIM` output values is NaN/infinite —
   /// see the module doc's "NonFinite-output scan scope" section for why
@@ -568,7 +575,10 @@ impl EmbedModel {
     let mask_flat = build_masks(masks, self.num_mask_frames);
 
     let waveform = MultiArray::from_slice(
-      &[EMBED_SLOTS, crate::segment::SEG_CHUNK_SAMPLES],
+      &[
+        EMBED_SLOTS,
+        crate::audio::speaker::segment::SEG_CHUNK_SAMPLES,
+      ],
       &waveform_flat,
     )?;
     let mask = MultiArray::from_slice(&[EMBED_SLOTS, self.num_mask_frames], &mask_flat)?;
@@ -579,13 +589,13 @@ impl EmbedModel {
     let embedding =
       outputs
         .take(names::EMBEDDING)
-        .ok_or_else(|| coremlit::PredictionError::MissingOutput {
+        .ok_or_else(|| crate::PredictionError::MissingOutput {
           name: names::EMBEDDING.to_string(),
         })?;
     // Construction validated the DECLARED contract; the CoreML runtime
     // producing this specific prediction's tensor is a separate trust
     // boundary, re-checked on every call — same rationale as
-    // `crate::segment::SegmentModel::infer`'s `check_output_shape` (see
+    // `crate::audio::speaker::segment::SegmentModel::infer`'s `check_output_shape` (see
     // that module's doc, "Layout re-validation").
     check_output_shape(embedding.shape())?;
 
@@ -650,8 +660,8 @@ fn mask_row_f32(mask: &[bool]) -> Vec<f32> {
 /// is identical here (in contrast to FluidAudio, which only ever fills
 /// one real row per call).
 fn build_waveform(samples: &[f32]) -> Vec<f32> {
-  let row = repeat_pad_f32(samples, crate::segment::SEG_CHUNK_SAMPLES);
-  let mut out = Vec::with_capacity(EMBED_SLOTS * crate::segment::SEG_CHUNK_SAMPLES);
+  let row = repeat_pad_f32(samples, crate::audio::speaker::segment::SEG_CHUNK_SAMPLES);
+  let mut out = Vec::with_capacity(EMBED_SLOTS * crate::audio::speaker::segment::SEG_CHUNK_SAMPLES);
   for _ in 0..EMBED_SLOTS {
     out.extend_from_slice(&row);
   }
@@ -701,7 +711,7 @@ fn check_finite_input(samples: &[f32]) -> Result<(), InferError> {
 /// Scans `values` for the first non-finite value — "the exact `ort`
 /// CoreML-EP corruption mode this crate exists to replace" for the
 /// embedding stage (spec §6 gate 2), mirroring
-/// [`crate::segment`]'s identical-shaped `check_finite` but over embed's
+/// [`crate::audio::speaker::segment`]'s identical-shaped `check_finite` but over embed's
 /// own output buffers (either the full `EMBED_SLOTS * EMBEDDING_DIM` batch
 /// or a single `EMBEDDING_DIM` row — see the module doc's "NonFinite-
 /// output scan scope"). Extracted so it is hermetically testable without a
@@ -716,9 +726,9 @@ fn check_finite_output(values: &[f32]) -> Result<(), InferError> {
 /// Validates a predict-time `embedding` tensor's shape against the fixed
 /// `[EMBED_SLOTS, EMBEDDING_DIM]` contract — hermetically testable without
 /// a loaded model. Same structure as
-/// [`crate::segment`]'s `check_output_shape` (commit `fcbce74`'s
+/// [`crate::audio::speaker::segment`]'s `check_output_shape` (commit `fcbce74`'s
 /// precedent: a per-call, every-profile check, not a `debug_assert`),
-/// catching what [`coremlit::MultiArray::copy_into`] cannot: it validates
+/// catching what [`crate::MultiArray::copy_into`] cannot: it validates
 /// only total element count, so an axes-swapped `[EMBEDDING_DIM,
 /// EMBED_SLOTS]` tensor (identical element count) would otherwise pass
 /// silently and transpose slots and dimensions.

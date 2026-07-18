@@ -201,7 +201,7 @@ fn normalized_deletes_apostrophes_and_curly_quotes() {
 // find_longest_common_prefix / find_longest_different_suffix
 // ---------------------------------------------------------------------
 
-use crate::result::WordTiming;
+use crate::audio::whisper::result::WordTiming;
 
 fn word(text: &str, start: f32, end: f32) -> WordTiming {
   // NOTE (source-corrected per this task's own mandate): the brief's

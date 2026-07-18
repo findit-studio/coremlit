@@ -4,7 +4,7 @@
 //! This is the whole of vadkit's "detector" surface: a [`CoreMlBackend`] that
 //! turns one 256 ms (4096-sample) chunk of audio into one speech probability
 //! by running the FluidInference unified Silero VAD graph through
-//! [`crate::VadModel`], and a thin [`detect_speech`] that hands that backend to
+//! [`crate::audio::vad::VadModel`], and a thin [`detect_speech`] that hands that backend to
 //! silero's backend-agnostic [`silero::detect_speech_with`]. Every rule that
 //! turns probabilities into segments — thresholding, the start/end hysteresis,
 //! `min_speech`/`min_silence`, `speech_pad`, force-splitting — lives in the
@@ -18,7 +18,7 @@
 //! [`CHUNK_SAMPLES`] (4096) at 16 kHz — an 8× coarser frame than the ONNX
 //! backend's 512, which silero's geometry-parameterized detector consumes
 //! unchanged (spec §3). Its [`predict`](VadBackend::predict) advances the
-//! model's recurrent [`VadState`](crate::VadState) in place, so successive
+//! model's recurrent [`VadState`](crate::audio::vad::VadState) in place, so successive
 //! calls form one logical stream until [`reset`](VadBackend::reset); this is
 //! exactly the streaming contract [`silero::detect_speech_with`] and
 //! [`silero::SpeechSegmenter`] drive.
@@ -35,7 +35,7 @@ use std::path::Path;
 
 use silero::{SampleRate, SpeechOptions, SpeechSegment, VadBackend};
 
-use crate::{
+use crate::audio::vad::{
   error::{InferError, ModelError},
   model::{CHUNK_SAMPLES, VadModel, VadModelOptions},
 };
@@ -67,7 +67,7 @@ impl CoreMlBackend {
   }
 
   /// Loads the CoreML VAD model at `path` with custom [`VadModelOptions`]
-  /// (e.g. [`coremlit::ComputeUnits::CpuOnly`] for deterministic runs) and
+  /// (e.g. [`crate::ComputeUnits::CpuOnly`] for deterministic runs) and
   /// wraps it as a backend.
   ///
   /// # Errors
@@ -121,7 +121,7 @@ impl VadBackend for CoreMlBackend {
   }
 
   /// Runs one 4096-sample frame through the CoreML graph, advancing the model's
-  /// recurrent [`VadState`](crate::VadState) in place and returning the speech
+  /// recurrent [`VadState`](crate::audio::vad::VadState) in place and returning the speech
   /// probability in `[0, 1]`.
   ///
   /// Delegates to [`VadModel::predict_chunk`]; the detector always hands
@@ -136,7 +136,7 @@ impl VadBackend for CoreMlBackend {
   }
 
   /// Clears the model's recurrent state back to
-  /// [`VadState::initial`](crate::VadState::initial) — the next
+  /// [`VadState::initial`](crate::audio::vad::VadState::initial) — the next
   /// [`predict`](Self::predict) starts a fresh logical stream.
   #[inline(always)]
   fn reset(&mut self) {

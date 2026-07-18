@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use super::*;
-use crate::{
+use crate::audio::whisper::{
   backend::AlignmentView,
   constants::{APPEND_PUNCTUATION, PREPEND_PUNCTUATION},
   options::DecodingOptions,
@@ -714,8 +714,8 @@ fn add_word_timestamps_attaches_merged_monotonic_words() {
     "en",
     WordGrouping::FineGrained,
     0,
-    crate::constants::PREPEND_PUNCTUATION,
-    crate::constants::APPEND_PUNCTUATION,
+    crate::audio::whisper::constants::PREPEND_PUNCTUATION,
+    crate::audio::whisper::constants::APPEND_PUNCTUATION,
     0.0,
   )
   .unwrap();
@@ -723,7 +723,10 @@ fn add_word_timestamps_attaches_merged_monotonic_words() {
   let words = updated[0].words_slice();
   assert!(!words.is_empty(), "text tokens produced word timings");
   let joined: String = words.iter().map(|w| w.word()).collect();
-  assert_eq!(crate::text::normalized(&joined), "hello world");
+  assert_eq!(
+    crate::audio::whisper::text::normalized(&joined),
+    "hello world"
+  );
   for pair in words.windows(2) {
     assert!(
       pair[0].start() <= pair[1].start() + 1e-4,
@@ -760,8 +763,8 @@ fn add_word_timestamps_zero_pads_missing_rows() {
     "en",
     WordGrouping::FineGrained,
     0,
-    crate::constants::PREPEND_PUNCTUATION,
-    crate::constants::APPEND_PUNCTUATION,
+    crate::audio::whisper::constants::PREPEND_PUNCTUATION,
+    crate::audio::whisper::constants::APPEND_PUNCTUATION,
     0.0,
   )
   .unwrap();
@@ -791,8 +794,8 @@ fn add_word_timestamps_errors_on_empty_segments() {
     "en",
     WordGrouping::FineGrained,
     0,
-    crate::constants::PREPEND_PUNCTUATION,
-    crate::constants::APPEND_PUNCTUATION,
+    crate::audio::whisper::constants::PREPEND_PUNCTUATION,
+    crate::audio::whisper::constants::APPEND_PUNCTUATION,
     0.0,
   )
   .unwrap_err();

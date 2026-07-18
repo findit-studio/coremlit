@@ -1,12 +1,12 @@
-//! Shared serde bridge for `coremlit::ComputeUnits` (crate-private).
+//! Shared serde bridge for `crate::ComputeUnits` (crate-private).
 //!
-//! `coremlit::ComputeUnits` carries no serde impl of its own (coremlit has
+//! `crate::ComputeUnits` carries no serde impl of its own (coremlit has
 //! no serde dependency at all) — bridge it through its existing
 //! `as_str`/`FromStr`, the same shape whisperkit's private
 //! `options::compute_units_serde` module uses
 //! (`crates/whisperkit/src/options/mod.rs`). Used by both
-//! [`crate::segment::SegmentModelOptions`] and
-//! [`crate::embed::EmbedModelOptions`] via `serde(with = "crate::compute_units_serde")`.
+//! [`crate::audio::speaker::segment::SegmentModelOptions`] and
+//! [`crate::audio::speaker::embed::EmbedModelOptions`] via `serde(with = "crate::audio::speaker::compute_units_serde")`.
 //!
 //! Originally a private `segment`-local module (T2); T3's review queue
 //! flagged that a second per-module copy for `EmbedModelOptions` would be a
@@ -17,7 +17,7 @@
 
 use core::str::FromStr;
 
-use coremlit::ComputeUnits;
+use crate::ComputeUnits;
 use serde::{Deserialize, Deserializer, Serializer};
 
 pub(crate) fn serialize<S: Serializer>(

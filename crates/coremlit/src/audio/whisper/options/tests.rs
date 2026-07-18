@@ -384,14 +384,14 @@ fn compute_defaults_match_swift_model_compute_options() {
   // those tests, and `tests/pipeline.rs`, for the rule. Changing a value
   // here without re-capturing the goldens against the new compute path is a
   // silent parity break; that is what this test exists to stop.
-  assert_eq!(DEFAULT_MEL_COMPUTE_UNITS, coremlit::ComputeUnits::CpuAndGpu);
+  assert_eq!(DEFAULT_MEL_COMPUTE_UNITS, crate::ComputeUnits::CpuAndGpu);
   assert_eq!(
     DEFAULT_ENCODER_COMPUTE_UNITS,
-    coremlit::ComputeUnits::CpuAndNeuralEngine
+    crate::ComputeUnits::CpuAndNeuralEngine
   );
   assert_eq!(
     DEFAULT_DECODER_COMPUTE_UNITS,
-    coremlit::ComputeUnits::CpuAndNeuralEngine
+    crate::ComputeUnits::CpuAndNeuralEngine
   );
 
   // ...and `ComputeOptions::new()` — what `Options::new` hands the pipeline —
@@ -437,12 +437,12 @@ fn parse_errors_are_opaque_and_display() {
 #[test]
 fn compute_options_builder_and_default() {
   let c = ComputeOptions::new()
-    .with_mel(coremlit::ComputeUnits::CpuOnly)
-    .with_encoder(coremlit::ComputeUnits::CpuOnly)
-    .with_decoder(coremlit::ComputeUnits::CpuOnly);
-  assert_eq!(c.mel(), coremlit::ComputeUnits::CpuOnly);
-  assert_eq!(c.encoder(), coremlit::ComputeUnits::CpuOnly);
-  assert_eq!(c.decoder(), coremlit::ComputeUnits::CpuOnly);
+    .with_mel(crate::ComputeUnits::CpuOnly)
+    .with_encoder(crate::ComputeUnits::CpuOnly)
+    .with_decoder(crate::ComputeUnits::CpuOnly);
+  assert_eq!(c.mel(), crate::ComputeUnits::CpuOnly);
+  assert_eq!(c.encoder(), crate::ComputeUnits::CpuOnly);
+  assert_eq!(c.decoder(), crate::ComputeUnits::CpuOnly);
   assert_eq!(ComputeOptions::default(), ComputeOptions::new());
 }
 
@@ -460,9 +460,9 @@ fn options_new_requires_folders_and_defaults_rest() {
 fn options_builder_and_mutator_vocabulary() {
   let o = Options::new("a", "b")
     .with_prewarm()
-    .with_compute(ComputeOptions::new().with_mel(coremlit::ComputeUnits::CpuOnly));
+    .with_compute(ComputeOptions::new().with_mel(crate::ComputeUnits::CpuOnly));
   assert!(o.prewarm());
-  assert_eq!(o.compute().mel(), coremlit::ComputeUnits::CpuOnly);
+  assert_eq!(o.compute().mel(), crate::ComputeUnits::CpuOnly);
 
   let mut m = Options::new("a", "b");
   m.clear_load();
@@ -483,7 +483,7 @@ fn compute_options_serde_partial_uses_whisperkit_defaults() {
   // not bare `#[serde(default)]`, precisely to avoid this.
   let c: ComputeOptions = serde_json::from_str("{}").unwrap();
   assert_eq!(c, ComputeOptions::new());
-  assert_ne!(c.mel(), coremlit::ComputeUnits::default());
+  assert_ne!(c.mel(), crate::ComputeUnits::default());
   let json = serde_json::to_string(&ComputeOptions::new()).unwrap();
   assert_eq!(
     serde_json::from_str::<ComputeOptions>(&json).unwrap(),

@@ -1,5 +1,5 @@
 use super::*;
-use crate::window::{DEFAULT_STEP_SAMPLES, chunk_starts};
+use crate::audio::speaker::window::{DEFAULT_STEP_SAMPLES, chunk_starts};
 
 // =====================================================================
 // Hermetic: the geometry — argmax's chunk/window grid
@@ -822,7 +822,7 @@ fn non_finite_consumed_embedding_row_errors() {
 
 /// A non-finite value in a DISCARDED row (an inactive slot, or the unused
 /// 64th) does NOT error — those rows are outside the Extraction entirely, and
-/// dia computes no analog of them (`crate::extract`'s "NonFinite-output scan
+/// dia computes no analog of them (`crate::audio::speaker::extract`'s "NonFinite-output scan
 /// scope" draws the same line).
 #[test]
 fn non_finite_discarded_embedding_row_is_ignored() {
@@ -876,10 +876,10 @@ fn onset_is_inert_on_argmaxs_hard_binary_decode() {
     *v = f64::from(u8::from(i % 3 == 0 || i % 11 == 0));
   }
   let w_opts = WindowOptions::new();
-  let chunks_sw = crate::window::chunk_sliding_window(&w_opts);
-  let frames_sw = crate::window::frame_sliding_window();
+  let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&w_opts);
+  let frames_sw = crate::audio::speaker::window::frame_sliding_window();
   let count_at = |onset: f32| {
-    crate::window::try_count_from_segmentations(
+    crate::audio::speaker::window::try_count_from_segmentations(
       &segs,
       num_chunks,
       ARGMAX_FRAMES_PER_WINDOW,
@@ -891,12 +891,12 @@ fn onset_is_inert_on_argmaxs_hard_binary_decode() {
     .expect("count")
   };
 
-  let baseline = count_at(crate::window::DEFAULT_ONSET);
+  let baseline = count_at(crate::audio::speaker::window::DEFAULT_ONSET);
   // The buffer is non-trivial, so this cannot pass vacuously on an all-zero count.
   assert!(baseline.iter().any(|&c| c > 0));
   for onset in [f32::MIN_POSITIVE, 0.01, 0.1, 0.5, 0.9, 1.0] {
     assert!(
-      crate::window::check_onset(onset),
+      crate::audio::speaker::window::check_onset(onset),
       "onset={onset} must be a VALID onset for this to prove inertness"
     );
     assert_eq!(
@@ -1242,17 +1242,17 @@ fn argmax_and_fluid_audio_agree_on_geometry_not_values() {
     },
     PathBuf::from,
   );
-  let seg = crate::segment::SegmentModel::from_file_with(
+  let seg = crate::audio::speaker::segment::SegmentModel::from_file_with(
     models_dir.join("pyannote_segmentation.mlmodelc"),
-    crate::segment::SegmentModelOptions::new().with_compute(ComputeUnits::CpuOnly),
+    crate::audio::speaker::segment::SegmentModelOptions::new().with_compute(ComputeUnits::CpuOnly),
   )
   .expect("load pyannote_segmentation.mlmodelc");
-  let embed = crate::embed::EmbedModel::from_file_with(
+  let embed = crate::audio::speaker::embed::EmbedModel::from_file_with(
     models_dir.join("wespeaker_v2.mlmodelc"),
-    crate::embed::EmbedModelOptions::new().with_compute(ComputeUnits::CpuOnly),
+    crate::audio::speaker::embed::EmbedModelOptions::new().with_compute(ComputeUnits::CpuOnly),
   )
   .expect("load wespeaker_v2.mlmodelc");
-  let fluid = crate::source::FluidAudioSource::new(seg, embed)
+  let fluid = crate::audio::speaker::source::FluidAudioSource::new(seg, embed)
     .extract(&samples)
     .expect("fluid extract");
 

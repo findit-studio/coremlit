@@ -1,6 +1,6 @@
 //! The argmax [`ModelSource`]: `argmaxinc/speakerkit-coreml`'s
 //! **in-graph-decoded** segmenter + its two-stage embedder, mapped onto the
-//! same [`Extraction`] [`crate::source::FluidAudioSource`] produces (design
+//! same [`Extraction`] [`crate::audio::speaker::source::FluidAudioSource`] produces (design
 //! spec §3-§4,
 //! `docs/superpowers/specs/2026-07-13-speakerkit-multisource-diarizer-backend-design.md`).
 //!
@@ -8,9 +8,9 @@
 //!
 //! FluidAudio's segmenter emits per-frame powerset **log-probabilities**
 //! `[1, 589, 7]` — its graph's tail is `softmax` → `log`, not a bare
-//! linear ([`crate::segment`]'s module doc quotes the MIL) — and this
+//! linear ([`crate::audio::speaker::segment`]'s module doc quotes the MIL) — and this
 //! crate decodes them host-side with dia's exact semantics
-//! ([`crate::segment::multilabel`], [`crate::extract`]'s overlap-exclusion
+//! ([`crate::audio::speaker::segment::multilabel`], [`crate::audio::speaker::extract`]'s overlap-exclusion
 //! mask derivation), which is sound because a `log_softmax` shifts each
 //! row by a constant and so preserves its argmax. argmax's segmenter emits
 //! **already-decoded** tensors:
@@ -19,8 +19,8 @@
 //! detection and a VAD *inside the CoreML graph*, with **its own**
 //! semantics.
 //!
-//! So this source reuses **none** of [`crate::segment::multilabel`] /
-//! [`crate::extract`]'s masking / [`crate::window::chunk_starts`]: there is
+//! So this source reuses **none** of [`crate::audio::speaker::segment::multilabel`] /
+//! [`crate::audio::speaker::extract`]'s masking / [`crate::audio::speaker::window::chunk_starts`]: there is
 //! nothing left to decode. Its whole job is to READ argmax's decoded output
 //! exactly the way argmax's own Swift reads it, and to place those values
 //! into [`Extraction`]'s layout. The two sources can therefore diarize the
@@ -96,9 +96,9 @@
 //! `MLFeature` dtype. Allocating an F32 buffer for any of them would hand
 //! CoreML a mis-typed tensor.
 //!
-//! [`coremlit`] supports this natively — [`coremlit::f16`] implements
-//! [`coremlit::Element`] with `DATA_TYPE = DataType::F16`, so
-//! [`coremlit::MultiArray::from_slice`] / [`coremlit::MultiArray::copy_into`]
+//! [`crate`] supports this natively — [`crate::f16`] implements
+//! [`crate::Element`] with `DATA_TYPE = DataType::F16`, so
+//! [`crate::MultiArray::from_slice`] / [`crate::MultiArray::copy_into`]
 //! are typed F16 end to end. No coremlit change was needed. Every tensor this
 //! module builds or reads is `f16`, converted at the host boundary
 //! (`f16::from_f32` in, [`f32::from`] out) — the same conversion argmax's
@@ -122,9 +122,9 @@
 //! **exactly**, consecutive chunks' window grids abut with no gap and no
 //! overlap, and the union over all `(k, w)` is precisely the arithmetic
 //! sequence `c · 16 000` — i.e. **exactly** dia's own offline chunk grid
-//! ([`crate::window::chunk_starts`] at its default
-//! [`crate::window::DEFAULT_STEP_SAMPLES`] = 16 000, over the same 10 s
-//! [`crate::segment::SEG_CHUNK_SAMPLES`] window). The global chunk index is
+//! ([`crate::audio::speaker::window::chunk_starts`] at its default
+//! [`crate::audio::speaker::window::DEFAULT_STEP_SAMPLES`] = 16 000, over the same 10 s
+//! [`crate::audio::speaker::segment::SEG_CHUNK_SAMPLES`] window). The global chunk index is
 //!
 //! ```text
 //! c = k * ARGMAX_WINDOWS_PER_CHUNK + w        (= k * 21 + w)
@@ -140,7 +140,7 @@
 //! the two sources, and so do `chunks_sw`, `frames_sw` and `count`.
 //!
 //! Because that stride is baked into the compiled graph, this source cannot
-//! honor a different [`crate::window::WindowOptions::step_samples`]; it
+//! honor a different [`crate::audio::speaker::window::WindowOptions::step_samples`]; it
 //! rejects one with [`ExtractError::UnsupportedStepSamples`] rather than
 //! silently producing a grid that does not mean what the caller asked for.
 //!
@@ -173,7 +173,7 @@
 //! `startFrame[w] = trunc(w * 58.9f)` (see this module's `window_start_frame`).
 //! It is argmax's own grid and is entirely internal to the embedder call; it
 //! never meets [`Extraction`]'s frame timeline, which stays dia's
-//! ([`crate::window::frame_sliding_window`]).
+//! ([`crate::audio::speaker::window::frame_sliding_window`]).
 //!
 //! # The overlap-exclusion fallback: `dia`'s mask policy, on argmax's tensors
 //!
@@ -186,7 +186,7 @@
 //! Probing the real embedder with an all-zero mask row shows it returns a
 //! **finite, non-zero, CONSTANT** embedding (L2 norm ≈ 0.5356, bit-identical
 //! across every all-zero row) — *not* the NaN that FluidAudio's WeSpeaker
-//! produces from an empty mask ([`crate::error::InferError::EmptyMask`]). Its
+//! produces from an empty mask ([`crate::audio::speaker::error::InferError::EmptyMask`]). Its
 //! norm is ~54× ABOVE `PLDA_MIN_NORM` (0.01), so the norm guard cannot catch
 //! it, and it carries no speaker information at all.
 //!
@@ -216,7 +216,7 @@
 //! ## So this port takes the other half of the pair: `dia`'s FALLBACK
 //!
 //! `dia`'s host-side decode (`owned.rs:522,573-591`; ported for
-//! [`crate::source::FluidAudioSource`] by [`crate::extract`]'s
+//! [`crate::audio::speaker::source::FluidAudioSource`] by [`crate::audio::speaker::extract`]'s
 //! `derive_slot_plans`) never lets the clean mask starve a slot: when too few
 //! clean frames survive, it drops the overlap exclusion FOR THAT SLOT. Mapped
 //! onto argmax's tensors, per `(window, speaker)`:
@@ -231,7 +231,7 @@
 //! `dia`'s `!clean_frame[f]` (both mean "2 or more slots active in this frame";
 //! 12 369/12 369 against the real model), and argmax's binary `speaker_ids` IS
 //! `dia`'s `seg >= onset` raw mask. `EXCLUDE_OVERLAP_MIN_FRAMES` (2) is
-//! *imported* from [`crate::extract`], not re-declared, and the comparison is
+//! *imported* from [`crate::audio::speaker::extract`], not re-declared, and the comparison is
 //! `<=`, per pyannote's `np.sum(clean_mask) > min_num_frames` (`owned.rs:589`).
 //!
 //! Three consequences:
@@ -283,7 +283,7 @@
 //!   so no guard is needed for it;
 //! - mask construction stops being an argmax/`dia` hybrid. This port now applies
 //!   `dia`'s rule to `dia`'s clustering, exactly as
-//!   [`crate::source::FluidAudioSource`] does — and `dia` treats ITS own
+//!   [`crate::audio::speaker::source::FluidAudioSource`] does — and `dia` treats ITS own
 //!   segmenter's sparse-but-nonempty slots the same way, so the remaining
 //!   sparse-slot behavior is `dia`'s considered policy rather than an accident
 //!   of porting half of argmax's.
@@ -292,7 +292,7 @@
 //!
 //! `Extraction`'s contract couples the two tensors: a dropped `(chunk, slot)`
 //! has an all-zero `raw_embeddings` row **and** an all-zero `segmentations`
-//! column (`crate::extract`'s module doc; dia's `owned.rs:561-571,619-630`).
+//! column (`crate::audio::speaker::extract`'s module doc; dia's `owned.rs:561-571,619-630`).
 //! A nonzero column with a zero row would hand `dia` a chunk-slot that is
 //! active in the count tensor but has no embedding to cluster.
 //!
@@ -300,11 +300,11 @@
 //! column zeroed: the ones argmax's activity gate rejects (`<= 2` active
 //! frames — strictly more aggressive than dia's "no active frame at all"), and
 //! the PLDA-norm ones. `count` is then computed over the POST-zeroing buffer,
-//! preserving dia's own ordering (`owned.rs:663-673`; [`crate::extract`]'s
+//! preserving dia's own ordering (`owned.rs:663-673`; [`crate::audio::speaker::extract`]'s
 //! "Count runs after all zeroing").
 //!
 //! Inactive rows of the embedder's 64-slot output are simply left zero, exactly
-//! as argmax leaves them — this source needs none of [`crate::extract`]'s
+//! as argmax leaves them — this source needs none of [`crate::audio::speaker::extract`]'s
 //! placeholder-mask machinery, because an all-zero mask row here yields the
 //! finite constant above rather than a NaN. Safe because the 64 slots are
 //! **independent**: filling one row versus filling all 41 active rows returns
@@ -332,9 +332,9 @@
 
 use std::path::{Path, PathBuf};
 
-use coremlit::{ComputeUnits, DataType, Features, Model, MultiArray, f16};
+use crate::{ComputeUnits, DataType, Features, Model, MultiArray, f16};
 
-use crate::{
+use crate::audio::speaker::{
   embed::{EMBED_SLOTS, EMBEDDING_DIM},
   error::{ExtractError, InferError, ModelError},
   extract::{EXCLUDE_OVERLAP_MIN_FRAMES, Extraction},
@@ -438,7 +438,7 @@ pub const ARGMAX_CHUNK_HOP_SAMPLES: usize = ARGMAX_CHUNK_SAMPLES - ARGMAX_CHUNK_
 pub const ARGMAX_MIN_ACTIVE_FRAMES: f32 = 2.0;
 
 /// PLDA minimum raw-embedding L2 norm — the same guard
-/// [`crate::extract::Extractor::extract`] applies (dia's inline `0.01`,
+/// [`crate::audio::speaker::extract::Extractor::extract`] applies (dia's inline `0.01`,
 /// `diarization/src/offline/owned.rs:619-630`), re-applied here because
 /// `Extraction` feeds the same `dia` clustering either way.
 ///
@@ -535,8 +535,8 @@ fn default_compute() -> ComputeUnits {
 /// Default compute placement for each of argmax's three models.
 ///
 /// [`ComputeUnits::All`], matching this crate's own
-/// [`crate::segment::DEFAULT_SEGMENT_COMPUTE`] /
-/// [`crate::embed::DEFAULT_EMBED_COMPUTE`]. argmax's Swift instead hardcodes
+/// [`crate::audio::speaker::segment::DEFAULT_SEGMENT_COMPUTE`] /
+/// [`crate::audio::speaker::embed::DEFAULT_EMBED_COMPUTE`]. argmax's Swift instead hardcodes
 /// `.cpuOnly` for the preprocessor (`SpeakerPreEmbedderModel.swift:14`) and
 /// defaults the segmenter to `.cpuOnly` (`Seg.swift:27`) — placement is a
 /// scheduling choice, not a semantic one, so this crate keeps its own
@@ -546,7 +546,7 @@ pub const DEFAULT_ARGMAX_COMPUTE: ComputeUnits = ComputeUnits::All;
 /// Which hardware CoreML may schedule each of argmax's THREE models on
 /// (rust-options-pattern).
 ///
-/// Distinct from [`crate::extract::ComputeOptions`]'s two knobs because
+/// Distinct from [`crate::audio::speaker::extract::ComputeOptions`]'s two knobs because
 /// argmax splits embedding across two artifacts — a fbank
 /// `SpeakerEmbedderPreprocessor` and the `SpeakerEmbedder` proper — so it has
 /// a third model to place.
@@ -555,17 +555,26 @@ pub const DEFAULT_ARGMAX_COMPUTE: ComputeUnits = ComputeUnits::All;
 pub struct ArgmaxComputeOptions {
   #[cfg_attr(
     feature = "serde",
-    serde(default = "default_compute", with = "crate::compute_units_serde")
+    serde(
+      default = "default_compute",
+      with = "crate::audio::speaker::compute_units_serde"
+    )
   )]
   segmenter: ComputeUnits,
   #[cfg_attr(
     feature = "serde",
-    serde(default = "default_compute", with = "crate::compute_units_serde")
+    serde(
+      default = "default_compute",
+      with = "crate::audio::speaker::compute_units_serde"
+    )
   )]
   preprocessor: ComputeUnits,
   #[cfg_attr(
     feature = "serde",
-    serde(default = "default_compute", with = "crate::compute_units_serde")
+    serde(
+      default = "default_compute",
+      with = "crate::audio::speaker::compute_units_serde"
+    )
   )]
   embedder: ComputeUnits,
 }
@@ -774,7 +783,7 @@ impl ArgmaxOptions {
 /// [`ArgmaxSource::extract`] rejects empty input one layer up
 /// ([`ExtractError::EmptySamples`], mirroring `owned.rs:369-371`), so that
 /// divergence is unreachable; this function stays total over its domain like
-/// its FluidAudio sibling [`crate::window::chunk_starts`].
+/// its FluidAudio sibling [`crate::audio::speaker::window::chunk_starts`].
 fn argmax_chunk_starts(total_samples: usize) -> Vec<usize> {
   let mut starts = Vec::new();
   let mut chunk_end = 0usize;
@@ -826,13 +835,14 @@ fn window_start_frame(w: usize) -> usize {
 /// `Emb.swift:295`'s `secondsPerWindow` — `sliding_window_waveform.shape[2] /
 /// audioSampleRate` = 160 000 / 16 000 = 10.0 s.
 fn seconds_per_window() -> f32 {
-  ARGMAX_WINDOW_SAMPLES as f32 / crate::window::SAMPLE_RATE_HZ as f32
+  ARGMAX_WINDOW_SAMPLES as f32 / crate::audio::speaker::window::SAMPLE_RATE_HZ as f32
 }
 
 /// `Emb.swift:50-53`'s `secondsPerStride` — `(secondsPerChunk −
 /// secondsPerWindow) / (windowsCount − 1)` = (30 − 10) / 20 = 1.0 s.
 fn seconds_per_stride() -> f32 {
-  let seconds_per_chunk = ARGMAX_CHUNK_SAMPLES as f32 / crate::window::SAMPLE_RATE_HZ as f32;
+  let seconds_per_chunk =
+    ARGMAX_CHUNK_SAMPLES as f32 / crate::audio::speaker::window::SAMPLE_RATE_HZ as f32;
   (seconds_per_chunk - seconds_per_window()) / (ARGMAX_WINDOWS_PER_CHUNK - 1) as f32
 }
 
@@ -936,7 +946,7 @@ fn window_plans(
 /// `speaker_ids[w][f][s] * (1 - overlapped[w][f])` (`Emb.swift:245`) — UNLESS
 /// that leaves `<= EXCLUDE_OVERLAP_MIN_FRAMES` nonzero frames, in which case
 /// this slot falls back to its raw `speaker_ids` mask, exactly as `dia` does
-/// (`owned.rs:573-591`, ported for the other source by [`crate::extract`]'s
+/// (`owned.rs:573-591`, ported for the other source by [`crate::audio::speaker::extract`]'s
 /// `derive_slot_plans`). The fallback is PER-SLOT: it replaces only this row.
 ///
 /// This is the one place the port deliberately does NOT do what `Emb.swift`
@@ -1024,7 +1034,7 @@ fn mask_row_is_zero(masks: &[f16], row: usize) -> bool {
 }
 
 /// The flat `Extraction::segmentations` sub-slice for chunk `c` — the same
-/// `[c][f][s]` layout `crate::extract` writes (dia's `owned.rs:496`).
+/// `[c][f][s]` layout `crate::audio::speaker::extract` writes (dia's `owned.rs:496`).
 fn chunk_segmentation_range(c: usize) -> core::ops::Range<usize> {
   let stride = ARGMAX_FRAMES_PER_WINDOW * SEG_NUM_SLOTS;
   c * stride..(c + 1) * stride
@@ -1096,7 +1106,7 @@ fn check_f16_representable(samples: &[f32]) -> Result<(), InferError> {
 // ─────────────────────────────────────────────────────────────────────────
 
 /// Renders a shape/dtype pair for [`ModelError::ContractMismatch`], matching
-/// `crate::segment::describe` / `crate::embed::describe`.
+/// `crate::audio::speaker::segment::describe` / `crate::audio::speaker::embed::describe`.
 fn describe(shape: &[usize], dtype: Option<DataType>) -> String {
   match dtype {
     Some(dtype) => format!("{shape:?} {dtype:?}"),
@@ -1106,7 +1116,7 @@ fn describe(shape: &[usize], dtype: Option<DataType>) -> String {
 
 /// Validates one feature's shape and F16 dtype against the pinned contract.
 fn check_feature(
-  description: &coremlit::ModelDescription,
+  description: &crate::ModelDescription,
   feature: &'static str,
   expected: &[usize],
   input: bool,
@@ -1141,7 +1151,7 @@ fn check_feature(
 /// the segmenter's six outputs, plus the fbank). A NaN here would otherwise
 /// compare `false` against every threshold and masquerade as "inactive
 /// speaker" rather than surfacing the corrupted inference — the same
-/// rationale as `crate::window::count_from_segmentations`'s finiteness
+/// rationale as `crate::audio::speaker::window::count_from_segmentations`'s finiteness
 /// assert.
 fn read_f16_output(
   features: &Features,
@@ -1332,7 +1342,7 @@ impl ArgmaxSource {
     // NOT scanned for non-finite values here: the rows this source discards
     // (inactive slots, unbounded windows, the unused 64th slot) are outside
     // the Extraction entirely and dia computes no analog of them
-    // (`crate::extract`'s "NonFinite-output scan scope" makes the same
+    // (`crate::audio::speaker::extract`'s "NonFinite-output scan scope" makes the same
     // distinction). `place_embeddings` scans exactly the CONSUMED rows.
     let array = out
       .get(names::SPEAKER_EMBEDDINGS)
@@ -1490,7 +1500,7 @@ impl ModelSource for ArgmaxSource {
   ///   window stride is compiled into its graph and cannot be varied (module
   ///   doc). Rejected rather than silently ignored.
   /// - [`ExtractError::OnsetOutOfRange`] if `onset` is not finite in
-  ///   `(0.0, 1.0]` (same guard as [`crate::extract::Extractor::extract`]).
+  ///   `(0.0, 1.0]` (same guard as [`crate::audio::speaker::extract::Extractor::extract`]).
   ///   Note that every onset that PASSES this guard yields the identical
   ///   `Extraction` — `onset` is inert on argmax's hard-binary decode (module
   ///   doc). The guard is kept so an out-of-range value is still an error
@@ -1502,7 +1512,7 @@ impl ModelSource for ArgmaxSource {
   ///   holds a non-finite value.
   /// - [`ExtractError::OutputFrameCountOverflow`] if the derived
   ///   `num_output_frames` would not fit in `usize` (unreachable through this
-  ///   geometry; kept typed, as in [`crate::extract`]).
+  ///   geometry; kept typed, as in [`crate::audio::speaker::extract`]).
   fn extract(&self, samples: &[f32]) -> Result<Extraction, ExtractError> {
     if samples.is_empty() {
       return Err(ExtractError::EmptySamples);
@@ -1514,7 +1524,7 @@ impl ModelSource for ArgmaxSource {
         required: ARGMAX_WINDOW_STRIDE_SAMPLES as u32,
       });
     }
-    if !crate::window::check_onset(w_opts.onset()) {
+    if !crate::audio::speaker::window::check_onset(w_opts.onset()) {
       return Err(ExtractError::OnsetOutOfRange {
         onset: w_opts.onset(),
       });
@@ -1533,7 +1543,7 @@ impl ModelSource for ArgmaxSource {
     // The Extraction chunk grid IS dia's (module doc's theorem), so it is
     // computed from the very same function FluidAudioSource uses — the two
     // sources' geometry agrees by construction, not by coincidence.
-    let num_chunks = crate::window::chunk_starts(samples.len(), &w_opts).len();
+    let num_chunks = crate::audio::speaker::window::chunk_starts(samples.len(), &w_opts).len();
     let mut segmentations = vec![0.0f64; num_chunks * ARGMAX_FRAMES_PER_WINDOW * SEG_NUM_SLOTS];
     let mut raw_embeddings = vec![0.0f32; num_chunks * SEG_NUM_SLOTS * EMBEDDING_DIM];
     let mut padded = vec![f16::ZERO; ARGMAX_CHUNK_SAMPLES];
@@ -1562,7 +1572,7 @@ impl ModelSource for ArgmaxSource {
       // A chunk in which no window has an active speaker has no consumed
       // embedding row, so it makes no preprocessor/embedder call at all —
       // mirroring dia's "no planned slot -> zero embed calls"
-      // (`crate::extract`'s module doc).
+      // (`crate::audio::speaker::extract`'s module doc).
       if !plans.iter().any(WindowPlan::any_active) {
         continue;
       }
@@ -1585,10 +1595,10 @@ impl ModelSource for ArgmaxSource {
     }
 
     // `count` over the POST-zeroing buffer, on dia's own grid — identical to
-    // FluidAudioSource's (`crate::extract`'s "Count runs after all zeroing").
-    let chunks_sw = crate::window::chunk_sliding_window(&w_opts);
-    let frames_sw = crate::window::frame_sliding_window();
-    let count = crate::window::try_count_from_segmentations(
+    // FluidAudioSource's (`crate::audio::speaker::extract`'s "Count runs after all zeroing").
+    let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&w_opts);
+    let frames_sw = crate::audio::speaker::window::frame_sliding_window();
+    let count = crate::audio::speaker::window::try_count_from_segmentations(
       &segmentations,
       num_chunks,
       ARGMAX_FRAMES_PER_WINDOW,
@@ -1598,7 +1608,7 @@ impl ModelSource for ArgmaxSource {
       frames_sw,
     )
     .map_err(|e| match e {
-      crate::window::WindowError::OutputFrameCountOverflow => {
+      crate::audio::speaker::window::WindowError::OutputFrameCountOverflow => {
         ExtractError::OutputFrameCountOverflow
       }
     })?;
@@ -1622,7 +1632,9 @@ const _: () = {
   assert!(ARGMAX_NUM_SPEAKERS == SEG_NUM_SLOTS);
   assert!(ARGMAX_NUM_SPEAKERS == EMBED_SLOTS);
   assert!(ARGMAX_WINDOW_SAMPLES == SEG_CHUNK_SAMPLES);
-  assert!(ARGMAX_WINDOW_STRIDE_SAMPLES == crate::window::DEFAULT_STEP_SAMPLES as usize);
+  assert!(
+    ARGMAX_WINDOW_STRIDE_SAMPLES == crate::audio::speaker::window::DEFAULT_STEP_SAMPLES as usize
+  );
   // The identity the whole `c = k*21 + w` mapping rests on (module doc) — and,
   // equivalently, the premise that this port implements argmax's
   // `useFullRedundancy == true` branch (`Seg.swift:146`, its default at

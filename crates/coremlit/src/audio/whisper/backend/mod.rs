@@ -7,12 +7,12 @@
 //! cross-attention alignment slice word-timestamp code reads and snapshots).
 //!
 //! Two implementations live here: [`coreml::CoreMlBackend`] — the real
-//! one, owning the three `coremlit::Model`s (spec §5.4) — and
+//! one, owning the three `crate::Model`s (spec §5.4) — and
 //! [`mock::MockBackend`], the scripted, hermetic test double every
 //! decode-loop/fallback/windowing test downstream needs before a compiled
 //! model exists at all (spec §9.1).
 
-use crate::model::is_model_multilingual;
+use crate::audio::whisper::model::is_model_multilingual;
 
 pub mod coreml;
 pub mod mock;
@@ -41,16 +41,16 @@ pub const DEFAULT_EMBED_DIM: usize = 384;
 pub const DEFAULT_KV_DIM: usize = 1536;
 /// Default [`ModelDims::max_token_context`] — shared by every model size
 /// (Whisper's fixed `448 / 2` token budget, not tiny-specific), so this
-/// reuses [`crate::constants::MAX_TOKEN_CONTEXT`] rather than restating it.
-pub const DEFAULT_MAX_TOKEN_CONTEXT: usize = crate::constants::MAX_TOKEN_CONTEXT;
+/// reuses [`crate::audio::whisper::constants::MAX_TOKEN_CONTEXT`] rather than restating it.
+pub const DEFAULT_MAX_TOKEN_CONTEXT: usize = crate::audio::whisper::constants::MAX_TOKEN_CONTEXT;
 /// Default [`ModelDims::n_audio_ctx`] — tiny model encoder audio-context
 /// length (Task 1 ground truth: `encoder_output_embeds`/
 /// `alignment_heads_weights` trailing dim `1500`).
 pub const DEFAULT_N_AUDIO_CTX: usize = 1500;
 /// Default [`ModelDims::window_samples`] — shared by every model size
 /// (fixed 30 s @ 16 kHz, not tiny-specific), so this reuses
-/// [`crate::constants::WINDOW_SAMPLES`] rather than restating it.
-pub const DEFAULT_WINDOW_SAMPLES: usize = crate::constants::WINDOW_SAMPLES;
+/// [`crate::audio::whisper::constants::WINDOW_SAMPLES`] rather than restating it.
+pub const DEFAULT_WINDOW_SAMPLES: usize = crate::audio::whisper::constants::WINDOW_SAMPLES;
 
 /// Static shape/vocabulary description of a loaded Whisper model —
 /// [`InferenceBackend::dims`] reports these for variant detection, buffer
@@ -241,7 +241,7 @@ impl ModelDims {
   /// `ModelUtilities.isModelMultilingual(logitsDim:)`,
   /// `WhisperKit/Utilities/ModelUtilities.swift:124-126`). Delegates to
   /// [`is_model_multilingual`] — the same check
-  /// [`crate::model::detect_variant`] uses — instead of
+  /// [`crate::audio::whisper::model::detect_variant`] uses — instead of
   /// restating the `51864` literal a third time in this crate.
   #[inline(always)]
   pub const fn is_multilingual(&self) -> bool {
@@ -381,10 +381,10 @@ impl AlignmentView<'_> {
 pub enum BackendError {
   /// The CoreML runtime failed to run a prediction.
   #[error("backend prediction failed: {0}")]
-  Prediction(#[from] coremlit::PredictionError),
+  Prediction(#[from] crate::PredictionError),
   /// A backend tensor failed to construct or view.
   #[error("backend tensor failed: {0}")]
-  Tensor(#[from] coremlit::TensorError),
+  Tensor(#[from] crate::TensorError),
   /// A model's output feature dictionary lacks an expected named output.
   #[error("{model} model output is missing feature `{name}`")]
   MissingFeature {
@@ -426,7 +426,7 @@ pub enum BackendError {
 /// Seam over the three CoreML-shaped inference stages a Whisper pipeline
 /// drives per window: mel feature extraction, encoding, and the
 /// autoregressive decode step (spec §5.4). A real backend implements this
-/// against `coremlit::Model`s; [`mock::MockBackend`] implements it here
+/// against `crate::Model`s; [`mock::MockBackend`] implements it here
 /// with no compiled model at all, for hermetic decode-loop,
 /// fallback-ladder, windowing, and early-stop tests (spec §9.1).
 pub trait InferenceBackend {

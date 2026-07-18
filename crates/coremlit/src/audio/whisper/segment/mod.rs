@@ -7,7 +7,7 @@
 //! Swift threads `timeToken`/`specialToken`/`sampleRate` in as three
 //! separate parameters (`SegmentSeeker.swift:47-49`); this port reads the
 //! first two off `tokenizer.special_tokens()` (already a parameter here)
-//! and the third off [`crate::constants::SAMPLE_RATE`], collapsing three
+//! and the third off [`crate::audio::whisper::constants::SAMPLE_RATE`], collapsing three
 //! parameters into the one `tokenizer` this module already needs for
 //! decoding slice text.
 //!
@@ -26,13 +26,13 @@
 //! used to filter the raw CoreML alignment-weights array, then threads
 //! that through [`find_alignment`] -> the duration/truncation hack ->
 //! [`merge_punctuations`] -> [`update_segments_with_word_timings`] in
-//! sequence. [`crate::transcribe::TranscribeTask::run`]'s window loop
+//! sequence. [`crate::audio::whisper::transcribe::TranscribeTask::run`]'s window loop
 //! calls `add_word_timestamps` directly (`TranscribeTask.swift:196-233`)
 //! when `options.word_timestamps()` is set.
 
 use unicode_categories::UnicodeCategories;
 
-use crate::{
+use crate::audio::whisper::{
   backend::{AlignmentMatrix, AlignmentView},
   constants::{SAMPLE_RATE, SECONDS_PER_TIME_TOKEN},
   error::SegmentError,
@@ -47,7 +47,7 @@ use crate::{
 /// each new segment's [`TranscriptionSegment::id`] so ids stay unique
 /// across every window a caller has already processed; `segment_size` is
 /// the window's length in samples (normally
-/// [`crate::constants::WINDOW_SAMPLES`], smaller for a final short
+/// [`crate::audio::whisper::constants::WINDOW_SAMPLES`], smaller for a final short
 /// window).
 ///
 /// Three phases, ported structure-preserving from `findSeekPointAndSegments`:

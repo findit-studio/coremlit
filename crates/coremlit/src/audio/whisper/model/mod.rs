@@ -8,7 +8,7 @@
 //!
 //! [`manager`] hosts [`manager::ModelManager`]: Swift's coalesced
 //! load/unload/prewarm orchestrator (`ArgmaxCore/ModelManager.swift`),
-//! reshaped for synchronous, single-owner use over a live `coremlit::Model`
+//! reshaped for synchronous, single-owner use over a live `crate::Model`
 //! and driving the [`ModelState`] transitions below (see that module's doc
 //! for the sync reshape). Everything else here ships the model-lifecycle
 //! *vocabulary* that [`manager::ModelManager`] and the rest of the
@@ -47,10 +47,10 @@
 
 use std::path::{Path, PathBuf};
 
-use coremlit::ComputeUnits;
+use crate::ComputeUnits;
 use serde_json::Value;
 
-use crate::error::ModelError;
+use crate::audio::whisper::error::ModelError;
 
 // ---------------------------------------------------------------------
 // ModelState
@@ -95,8 +95,8 @@ pub enum ModelState {
 
 impl ModelState {
   /// Stable lowercase name of the variant — the crate's own `as_str`
-  /// convention (matching [`crate::options::Task`]/
-  /// [`crate::options::ChunkingStrategy`]), **not** Swift's `description`,
+  /// convention (matching [`crate::audio::whisper::options::Task`]/
+  /// [`crate::audio::whisper::options::ChunkingStrategy`]), **not** Swift's `description`,
   /// which separately renames `.prewarming`/`.prewarmed` to
   /// `"Specializing"`/`"Specialized"` for UI display
   /// (`ModelState.swift:36-37`). This port has no UI layer, so `as_str`
@@ -652,7 +652,7 @@ impl SupportConfig {
   /// Swift `computeDisabledModels`, `Models.swift:227-232`, which uses
   /// `Set` subtraction; this collects in `known_models` order instead for
   /// a deterministic result — the same "`Vec` instead of `Set`" tradeoff
-  /// [`crate::tokenizer::WhisperTokenizer::from_folder`] already makes for
+  /// [`crate::audio::whisper::tokenizer::WhisperTokenizer::from_folder`] already makes for
   /// `all_language_tokens`), plus [`Self::default_support`] (Swift's
   /// `defaultSupport`, `Models.swift:196-202`: no identifiers, default
   /// model [`DEFAULT_FALLBACK_MODEL_NAME`], every known model "supported").
@@ -1102,7 +1102,7 @@ pub fn device_identifier() -> String {
 /// anything above it (spec §5.3's `ModelLoader` seam; shaped after
 /// `MLModelLoading.swift` plus the local-resolve half of
 /// `ModelDownloader.swift`). The paths [`ResolvedModels`] returns are
-/// exactly what `coremlit::Model::load` takes — this module only resolves
+/// exactly what `crate::Model::load` takes — this module only resolves
 /// paths, it never loads a model (that is Plan 3's `backend` module).
 pub trait ModelLoader {
   /// Resolves the mel/encoder/decoder bundle paths from `folder`.

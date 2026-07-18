@@ -1,21 +1,72 @@
 [package]
 name = "coremlit"
-description = "Safe, synchronous CoreML runtime layer: model loading, prediction, stateful prediction, and typed multi-arrays"
+description = "Safe, synchronous CoreML runtime with opt-in on-device audio pipelines (Whisper STT, forced alignment, speaker diarization, Silero VAD)"
 version.workspace = true
 edition.workspace = true
+# Unpublishable: the optional `align` / `speaker` / `vad` features pull
+# rev-pinned git dependencies (`asry`, `dia`/diarization, `silero`) — crates.io
+# forbids git sources even behind optional features, and none are published.
+# Flip once they all land on released versions.
+publish = false
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "../../README.md"
-keywords = ["coreml", "machine-learning", "macos", "neural-engine", "ffi"]
-categories = ["api-bindings", "os::macos-apis", "science"]
+keywords = ["coreml", "machine-learning", "macos", "speech", "neural-engine"]
+categories = ["multimedia::audio", "os::macos-apis", "science", "api-bindings"]
 
 [package.metadata.docs.rs]
 all-features = true
 default-target = "aarch64-apple-darwin"
 targets = ["aarch64-apple-darwin"]
 
+[features]
+default = []
+
+# --- cross-cutting (unified from the former per-kit `serde`/`tracing`) ---
+serde = ["dep:serde"]
+tracing = ["dep:tracing"]
+
+# --- audio::whisper (former crate `whisperkit`) ---
+# whisperkit's `[dependencies]` were unconditional in that crate; collapsed
+# here they become optional and ride `whisper`, so the runtime core stays
+# dependency-lean and `default = []` pulls none of them.
+whisper = [
+  "dep:libc",
+  "dep:mach2",
+  "dep:rand",
+  "dep:serde_json",
+  "dep:tokenizers",
+  "dep:unicode_categories",
+]
+# Former whisperkit `nl-recognizer` (Apple `NLLanguageRecognizer` redetection).
+# Whisper-only code, so it implies `whisper`.
+nl-recognizer = ["whisper", "dep:objc2-natural-language"]
+
+# --- audio::align (former crate `alignkit`) ---
+# asry's clean `emissions` seam (NO ort / whisper.cpp) rides `align`.
+align = ["dep:asry"]
+# Former alignkit `parity-oracle`: asry's ONNX aligner (pulls ort + whisper.cpp)
+# as the word-timing parity oracle. DEV/TEST only — adds nothing to the library.
+align-oracle = ["align", "asry/alignment"]
+
+# --- audio::speaker (former crate `speakerkit`) ---
+# Former speakerkit `dia`: the lean, ort-free offline bridge into dia's
+# clustering / reconstruction core (dia `default-features = false`).
+speaker = ["dep:dia"]
+# Former speakerkit `dia-oracle`: dia's own ort inference (bundled segmentation
+# model) for the DER parity suites. DEV/TEST only — pulls ort + the ~6 MB model.
+speaker-oracle = ["speaker", "dia/ort", "dia/bundled-segmentation"]
+
+# --- audio::vad (former crate `vadkit`) ---
+# silero's logic-only detector seam (NO ort) rides `vad`.
+vad = ["dep:silero"]
+# Former vadkit dev-only `bundled`: silero's ONNX reference stack for the
+# cross-backend characterization oracle. DEV/TEST only — pulls ort.
+vad-bundled = ["vad", "silero/bundled"]
+
 [dependencies]
+# --- core CoreML runtime (always compiled) ---
 objc2.workspace = true
 objc2-core-ml.workspace = true
 objc2-foundation.workspace = true
@@ -26,11 +77,79 @@ half.workspace = true
 thiserror.workspace = true
 derive_more.workspace = true
 
-# `tests/fp16_guards.rs` corroborates its 2^-24 threshold against a real
-# fp16 rounding rather than trusting a hand-written constant. Integration
-# tests do not inherit `[dependencies]`, so `half` is named again here.
+# --- cross-cutting optionals ---
+serde = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+# --- audio::whisper optionals ---
+libc = { workspace = true, optional = true }
+mach2 = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+unicode_categories = { workspace = true, optional = true }
+objc2-natural-language = { workspace = true, optional = true }
+
+# --- audio::align optional git dep (the `align` feature) ---
+# The clean, ort-free dependency: asry's `emissions` seam only (no whispercpp,
+# no ort). Rev-pinned to a PUBLIC git source, NOT a sibling path: a clean
+# checkout of this repo alone resolves and builds, with no co-located `asry`
+# checkout required. A sibling `asry` is now only TEST DATA — for the ignored
+# oracle gates that read asry's `models/` fixtures (`ALIGNKIT_ASRY_MODELS`, see
+# `tests/align/common/mod.rs`). The rev is asry's reviewed `main` HEAD at the
+# time the align surface was cut. Co-developing asry and coremlit together?
+# Point both at your local `asry` with an UNCOMMITTED workspace-root patch (add
+# to the root `Cargo.toml`, never commit it):
+#
+#   [patch."https://github.com/findit-studio/asry"]
+#   asry = { path = "../asry" }
+#
+asry = { git = "https://github.com/findit-studio/asry", rev = "49cbfc9ca6fb75366d75a862212bdebb889021e5", default-features = false, features = ["emissions"], optional = true }
+
+# --- audio::speaker optional git dep (the `speaker` feature) ---
+# Renamed to `dia` (its own package name is `diarization`) so call sites read
+# `dia::offline::OfflineInput` etc. Pinned to the public diarization repo by
+# EXACT rev, not a sibling path: a path dep breaks a fresh `cargo metadata` on
+# any checkout lacking the sibling (Cargo loads a path-dep manifest at
+# resolution time even for an OPTIONAL dep). `default-features = false` pulls
+# only dia's backend-free offline core (clustering / PLDA / reconstruction) —
+# the surface `Extraction::into_offline_input` feeds — NOT dia's `ort` +
+# `bundled-segmentation` defaults; the dia-ort DER oracle lives behind the
+# test-only `speaker-oracle` feature. CO-DEV: patch at the WORKSPACE ROOT (see
+# its "CO-DEV RECIPE" comment); do not edit this line.
+dia = { package = "diarization", git = "https://github.com/findit-studio/diarization", rev = "b6a6f9adc8465f7a4c207dbaa2701d98e1be1ff2", default-features = false, optional = true }
+
+# --- audio::vad optional git dep (the `vad` feature) ---
+# The detection/streaming logic single-home: coremlit's vad layer implements
+# silero's `VadBackend` seam over CoreML and re-exports silero's detector
+# surface wired to that backend, authoring ZERO segmentation logic here.
+# `default-features = false` selects the LOGIC-ONLY silero crate — NO `ort`/ONNX
+# backend compiled, so `ort` never enters the `vad` runtime graph. The ONNX
+# reference stack is DEV/TEST-only behind `vad-bundled` (`silero/bundled`).
+# Pinned to the 0.5.0 seam by git REV; RE-PIN to `silero = "0.5.0"` once it
+# publishes (does not change this no-`ort`, logic-only posture).
+silero = { git = "https://github.com/Findit-AI/silero", rev = "9ad65749ada4da40a9086d528b12501f0b383791", default-features = false, optional = true }
+
 [dev-dependencies]
+# Integration tests / benches / examples are external consumers: they link the
+# crate + these dev-deps, never the lib's own `[dependencies]`. `half` (the
+# fp16_guards sweep) and the audio/test-support crates are named here again.
 half.workspace = true
+cpal.workspace = true
+criterion.workspace = true
+hound.workspace = true
+rubato.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+tokenizers.workspace = true
+# `tests/align/parity_words.rs` names `asry::Aligner` (the ONNX oracle) and
+# `asry::ort::api()` directly, so asry must appear as a dev-dep too. Cargo
+# unions its features with the optional runtime entry above; `align-oracle`
+# adds `alignment`. `emissions` here keeps a features-free default `cargo test`
+# from trying to build a zero-feature asry.
+asry = { git = "https://github.com/findit-studio/asry", rev = "49cbfc9ca6fb75366d75a862212bdebb889021e5", default-features = false, features = ["emissions"] }
 
 [lints]
 workspace = true

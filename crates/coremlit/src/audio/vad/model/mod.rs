@@ -35,7 +35,7 @@
 //! `new_cell_state`) that `VadManager` also drives; `vad_output` is a rank-3
 //! `[1, 1, 1]` tensor, not a bare scalar. The v6.2.1 artifact ships **only**
 //! as a compiled `.mlmodelc` (no `.mlpackage`), so — unlike alignkit — there
-//! is no `coremlcompiler` step: [`coremlit::Model::load`] consumes it directly.
+//! is no `coremlcompiler` step: [`crate::Model::load`] consumes it directly.
 //!
 //! # Context stitching (FluidAudio `VadManager` semantics)
 //!
@@ -70,9 +70,9 @@
 
 use std::path::Path;
 
-use coremlit::{ComputeUnits, DataType, FeatureInfo, Model, MultiArray};
+use crate::{ComputeUnits, DataType, FeatureInfo, Model, MultiArray};
 
-use crate::error::{InferError, ModelError};
+use crate::audio::vad::error::{InferError, ModelError};
 
 /// New audio samples consumed per VAD chunk — 256 ms at 16 kHz. Matches
 /// FluidAudio's `VadManager.chunkSize` (`VadManager.swift:22`) and the
@@ -348,7 +348,7 @@ impl VadModel {
   /// CoreML call. [`InferError::Prediction`]/[`InferError::Tensor`] on a
   /// CoreML or tensor-construction failure — including a prediction whose
   /// output set omits a declared feature
-  /// ([`coremlit::PredictionError::MissingOutput`]).
+  /// ([`crate::PredictionError::MissingOutput`]).
   /// [`InferError::OutputShape`] if any predict-time output tensor's shape
   /// diverges from its construction-time contract (the CoreML runtime is a
   /// trust boundary re-checked every call).
@@ -476,10 +476,10 @@ fn check_finite_input(window: &[f32]) -> Result<(), InferError> {
 /// Extracts the single `[1, 1, 1]` `vad_output` probability, re-validating its
 /// runtime shape (the CoreML runtime is a trust boundary — `copy_into` alone
 /// only checks element count) and rejecting a non-finite value.
-fn take_scalar(outputs: &mut coremlit::Features, name: &'static str) -> Result<f32, InferError> {
+fn take_scalar(outputs: &mut crate::Features, name: &'static str) -> Result<f32, InferError> {
   let tensor = outputs
     .take(name)
-    .ok_or_else(|| coremlit::PredictionError::MissingOutput {
+    .ok_or_else(|| crate::PredictionError::MissingOutput {
       name: name.to_string(),
     })?;
   check_output_shape(tensor.shape(), name, &[1, 1, 1])?;
@@ -497,12 +497,12 @@ fn take_scalar(outputs: &mut coremlit::Features, name: &'static str) -> Result<f
 /// Extracts a `[1, 128]` recurrent-state output, re-validating its runtime
 /// shape and rejecting any non-finite element.
 fn take_state(
-  outputs: &mut coremlit::Features,
+  outputs: &mut crate::Features,
   name: &'static str,
 ) -> Result<[f32; STATE_SIZE], InferError> {
   let tensor = outputs
     .take(name)
-    .ok_or_else(|| coremlit::PredictionError::MissingOutput {
+    .ok_or_else(|| crate::PredictionError::MissingOutput {
       name: name.to_string(),
     })?;
   check_output_shape(tensor.shape(), name, &[1, STATE_SIZE])?;

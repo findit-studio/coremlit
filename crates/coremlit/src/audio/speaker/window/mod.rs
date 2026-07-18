@@ -5,9 +5,9 @@
 //! This is the pure-geometry layer a future `Extractor` (plan Task 5,
 //! `docs/superpowers/plans/2026-07-12-dia-coreml.md`) orchestrates: no
 //! CoreML model, no I/O — [`chunk_starts`] schedules where each
-//! [`crate::segment::SegmentModel`]/[`crate::embed::EmbedModel`] chunk
+//! [`crate::audio::speaker::segment::SegmentModel`]/[`crate::audio::speaker::embed::EmbedModel`] chunk
 //! starts over a long recording, and [`count_from_segmentations`]
-//! aggregates the resulting per-chunk [`crate::segment::multilabel`]
+//! aggregates the resulting per-chunk [`crate::audio::speaker::segment::multilabel`]
 //! outputs into the per-output-frame `count` tensor dia's
 //! `offline::OfflineInput::new` requires.
 //!
@@ -44,7 +44,7 @@
 //!
 //! - **Chunk length**: 160 000 samples (10 s @ 16 kHz) — dia's
 //!   `WINDOW_SAMPLES` (`diarization/src/segment/options.rs:18`), already
-//!   pinned in this crate as [`crate::segment::SEG_CHUNK_SAMPLES`]
+//!   pinned in this crate as [`crate::audio::speaker::segment::SEG_CHUNK_SAMPLES`]
 //!   (`crates/speakerkit/src/segment/mod.rs:126`, verified against the
 //!   real `pyannote_segmentation.mlmodelc` contract by T1/T2). This
 //!   module reuses that constant rather than redefining it.
@@ -164,7 +164,7 @@
 //! row-major in the `[c][f][s]` order pyannote uses") and the offline
 //! boundary (`diarization/src/offline/algo.rs:209-210`: "per-(chunk,
 //! frame, speaker) activity flattened `[c][f][s]`") — it is the SAME
-//! tensor [`crate::segment::multilabel`] produces per chunk (frame-major,
+//! tensor [`crate::audio::speaker::segment::multilabel`] produces per chunk (frame-major,
 //! `[frame][slot]`, i.e. one chunk's `[f][s]` slab), so a future
 //! `Extractor` concatenates each chunk's `multilabel` output, in chunk
 //! order, to build the full `[c][f][s]` buffer this function expects.
@@ -194,7 +194,7 @@
 //! [`count_from_segmentations`] panics (never returns `Result` — matching
 //! the brief's pinned return type and this crate's established
 //! assert-on-shape-mismatch convention,
-//! [`crate::segment::multilabel`]) on the SAME preconditions dia's
+//! [`crate::audio::speaker::segment::multilabel`]) on the SAME preconditions dia's
 //! infallible `count_pyannote` wrapper inherits via its own
 //! `.expect(..)` on `try_count_pyannote`'s `Result` (`count.rs:589-600`):
 //! `num_chunks`/`num_frames_per_chunk`/`num_speakers` all `>= 1`
@@ -260,12 +260,12 @@
 //! last-line `try_count_pyannote` finiteness check, and nothing
 //! DOWNSTREAM of this function would catch a non-finite `onset` otherwise.
 
-use crate::segment::SEG_CHUNK_SAMPLES;
+use crate::audio::speaker::segment::SEG_CHUNK_SAMPLES;
 
 /// Audio sample rate this module's second-based geometry assumes —
 /// 16 kHz. Matches dia's `SAMPLE_RATE_HZ`
 /// (`diarization/src/segment/options.rs:11`) and this crate's own model
-/// contracts ([`crate::segment::SEG_CHUNK_SAMPLES`] is exactly `10 *
+/// contracts ([`crate::audio::speaker::segment::SEG_CHUNK_SAMPLES`] is exactly `10 *
 /// SAMPLE_RATE_HZ`).
 pub const SAMPLE_RATE_HZ: u32 = 16_000;
 
@@ -279,7 +279,7 @@ pub const FRAME_DURATION_S: f64 = 0.0619375;
 /// `= 270 / 16_000`).
 pub const FRAME_STEP_S: f64 = 0.016875;
 
-/// Chunk duration in seconds: [`crate::segment::SEG_CHUNK_SAMPLES`]
+/// Chunk duration in seconds: [`crate::audio::speaker::segment::SEG_CHUNK_SAMPLES`]
 /// samples at [`SAMPLE_RATE_HZ`] = `10.0` s. Matches dia's own
 /// derivation (`diarization/src/offline/owned.rs:653`: `WINDOW_SAMPLES
 /// as f64 / SAMPLE_RATE_HZ as f64`).
@@ -386,7 +386,7 @@ impl SlidingWindow {
 /// the module doc's "`SlidingWindow`: the visibility DECISION" section.
 /// Lossless and infallible: both types are unchecked `(f64, f64, f64)`
 /// tuples.
-#[cfg(feature = "dia")]
+#[cfg(feature = "speaker")]
 impl From<SlidingWindow> for dia::reconstruct::SlidingWindow {
   fn from(value: SlidingWindow) -> Self {
     Self::new(value.start, value.duration, value.step)
@@ -397,7 +397,7 @@ impl From<SlidingWindow> for dia::reconstruct::SlidingWindow {
 /// reverse of the `From` impl above. Built entirely through dia's public
 /// `start`/`duration`/`step` accessors: dia's fields are private, so
 /// there is no other way to reach them.
-#[cfg(feature = "dia")]
+#[cfg(feature = "speaker")]
 impl From<dia::reconstruct::SlidingWindow> for SlidingWindow {
   fn from(value: dia::reconstruct::SlidingWindow) -> Self {
     Self::new(value.start(), value.duration(), value.step())
@@ -414,7 +414,7 @@ impl From<dia::reconstruct::SlidingWindow> for SlidingWindow {
 /// crate's and dia's now-shared `rust-version` floor), so the check is
 /// phrased by hand via the `v != v` NaN idiom plus direct comparisons.
 ///
-/// `pub(crate)` so [`crate::extract::Extractor::extract`]'s own onset
+/// `pub(crate)` so [`crate::audio::speaker::extract::Extractor::extract`]'s own onset
 /// preflight can reuse this exact predicate (mirroring dia's
 /// `OwnedDiarizationPipeline::run` re-checking `check_onset` at
 /// `owned.rs:388-392`) rather than re-deriving the range test.
@@ -675,13 +675,13 @@ pub fn frame_sliding_window() -> SlidingWindow {
 
 /// Internal failure for [`try_num_output_frames`]'s guard, surfaced by
 /// [`try_count_from_segmentations`]. Not part of this crate's public
-/// error taxonomy (`crate::error::{ModelError, InferError, ExtractError}`,
+/// error taxonomy (`crate::audio::speaker::error::{ModelError, InferError, ExtractError}`,
 /// design spec §5) — [`count_from_segmentations`]'s established public
 /// contract stays `Result`-free (module doc, "Who validates dims"), so
 /// this type exists purely to make the overflow guard's control flow, and
 /// this module's regression tests, typed rather than an unguarded
-/// arithmetic op. [`crate::extract::Extractor::extract`] converts it to
-/// `crate::error::ExtractError::OutputFrameCountOverflow` via an
+/// arithmetic op. [`crate::audio::speaker::extract::Extractor::extract`] converts it to
+/// `crate::audio::speaker::error::ExtractError::OutputFrameCountOverflow` via an
 /// exhaustive manual match (NOT a `From` impl — see that variant's own
 /// doc for why); it stays crate-private either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
@@ -798,8 +798,8 @@ pub fn count_from_segmentations(
 /// `num_output_frames`-overflow guard as a typed
 /// [`WindowError::OutputFrameCountOverflow`] instead of unwrapping it.
 ///
-/// The seam exists so [`crate::extract::Extractor::extract`] can convert
-/// that one overflow case into its own `crate::error::ExtractError`
+/// The seam exists so [`crate::audio::speaker::extract::Extractor::extract`] can convert
+/// that one overflow case into its own `crate::audio::speaker::error::ExtractError`
 /// (a `Result`-typed public API) while direct callers of the public
 /// [`count_from_segmentations`] keep the identical panic contract. Every
 /// OTHER precondition here stays an `assert!` rather than a `Result` arm:

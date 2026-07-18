@@ -1,22 +1,22 @@
 //! Silero VAD as a whisperkit
-//! [`VoiceActivityDetector`](crate::audio::vad::VoiceActivityDetector) — the
-//! opt-in alternative to the default [`EnergyVad`](crate::audio::vad::EnergyVad),
+//! [`VoiceActivityDetector`](crate::audio::whisper::audio::vad::VoiceActivityDetector) — the
+//! opt-in alternative to the default [`EnergyVad`](crate::audio::whisper::audio::vad::EnergyVad),
 //! behind the `vadkit` feature.
 //!
 //! Runs the FluidInference unified Silero VAD graph (via the sibling `vadkit`
 //! crate's CoreML model layer) and reports one activity flag per 256 ms
 //! (4096-sample) frame: the learned speech probability thresholded at
-//! [`SileroVad::threshold`](crate::silero_vad::SileroVad::threshold). This is a
+//! [`SileroVad::threshold`](crate::audio::whisper::silero_vad::SileroVad::threshold). This is a
 //! drop-in for whisperkit's frame-level
 //! VAD seam — the same abstraction `EnergyVad` fills, learned instead of RMS —
 //! whose flags whisperkit's own
-//! [`active_chunks`](crate::audio::vad::VoiceActivityDetector::active_chunks)
+//! [`active_chunks`](crate::audio::whisper::audio::vad::VoiceActivityDetector::active_chunks)
 //! then merge into the long-form [`ChunkingStrategy::Vad`] chunk boundaries. It
 //! does NOT re-home silero's segment logic (that stays in `silero`, re-exported
 //! by `vadkit`); it plugs the Silero *model* into whisperkit's existing VAD
 //! contract.
 //!
-//! [`ChunkingStrategy::Vad`]: crate::options::ChunkingStrategy::Vad
+//! [`ChunkingStrategy::Vad`]: crate::audio::whisper::options::ChunkingStrategy::Vad
 //!
 //! # Opt-in, energy VAD untouched
 //!
@@ -34,27 +34,29 @@
 //!
 //! # Concurrency
 //!
-//! [`coremlit::Model`] is [`Send`] but deliberately not [`Sync`] (Apple's "one
+//! [`crate::Model`] is [`Send`] but deliberately not [`Sync`] (Apple's "one
 //! `MLModel` on one thread at a time"), yet whisperkit stores the detector as
 //! `Box<dyn VoiceActivityDetector + Send + Sync>`. So the model is held behind a
 //! [`Mutex`](std::sync::Mutex), which supplies both the [`Sync`] the seam
 //! requires and the exact serialization Apple's contract asks for —
-//! [`coremlit::Model`]'s own doc names this ("serialized behind an external
+//! [`crate::Model`]'s own doc names this ("serialized behind an external
 //! `Mutex`") as the way to fan a model across threads. Each
-//! [`voice_activity`](crate::audio::vad::VoiceActivityDetector::voice_activity)
+//! [`voice_activity`](crate::audio::whisper::audio::vad::VoiceActivityDetector::voice_activity)
 //! call locks once and drives the whole buffer as one logical stream.
 //!
 //! A shared detector may also be driven by *simultaneous* `transcribe` calls.
 //! The hard-failure latch is built for that: a monotonic generation counter
 //! (not a drainable error slot) is each caller's source of truth, so
 //! concurrent runs can't clear one another's failures — see
-//! [`detection_generation`](crate::audio::vad::VoiceActivityDetector::detection_generation).
+//! [`detection_generation`](crate::audio::whisper::audio::vad::VoiceActivityDetector::detection_generation).
 
 use std::sync::Mutex;
 
-use vadkit::{CHUNK_SAMPLES, InferError, ModelError, VadModel, VadModelOptions, VadState};
+use crate::audio::vad::{
+  CHUNK_SAMPLES, InferError, ModelError, VadModel, VadModelOptions, VadState,
+};
 
-use crate::audio::vad::VoiceActivityDetector;
+use crate::audio::whisper::audio::vad::VoiceActivityDetector;
 
 /// Default speech threshold: a 256 ms frame is active when its Silero
 /// probability is ≥ this. Matches silero's own `start_threshold` default (0.5).
@@ -91,10 +93,10 @@ pub struct SileroVad {
 }
 
 impl SileroVad {
-  /// Samples per analysis frame: [`vadkit::CHUNK_SAMPLES`] (4096 = 256 ms at
+  /// Samples per analysis frame: [`crate::audio::vad::CHUNK_SAMPLES`] (4096 = 256 ms at
   /// 16 kHz), the unified artifact's chunk size. Exposed as an associated const
   /// so the geometry can be asserted without a loaded model;
-  /// [`frame_length_samples`](crate::audio::vad::VoiceActivityDetector::frame_length_samples)
+  /// [`frame_length_samples`](crate::audio::whisper::audio::vad::VoiceActivityDetector::frame_length_samples)
   /// returns it.
   pub const FRAME_LENGTH_SAMPLES: usize = CHUNK_SAMPLES;
 
@@ -102,18 +104,18 @@ impl SileroVad {
   /// and [`DEFAULT_SPEECH_THRESHOLD`].
   ///
   /// # Errors
-  /// As [`vadkit::VadModel::load`] ([`ModelError`]).
+  /// As [`crate::audio::vad::VadModel::load`] ([`ModelError`]).
   pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self, ModelError> {
     Ok(Self::from_model(VadModel::load(path)?))
   }
 
   /// Loads the CoreML VAD model at `path` with custom
   /// [`VadModelOptions`] (e.g.
-  /// [`coremlit::ComputeUnits::CpuOnly`] for a deterministic run) and
+  /// [`crate::ComputeUnits::CpuOnly`] for a deterministic run) and
   /// [`DEFAULT_SPEECH_THRESHOLD`].
   ///
   /// # Errors
-  /// As [`vadkit::VadModel::load_with`] ([`ModelError`]).
+  /// As [`crate::audio::vad::VadModel::load_with`] ([`ModelError`]).
   pub fn load_with(
     path: impl AsRef<std::path::Path>,
     options: VadModelOptions,
@@ -156,24 +158,24 @@ impl SileroVad {
 impl VoiceActivityDetector for SileroVad {
   /// One activity flag per 256 ms frame: the Silero probability ≥
   /// [`Self::threshold()`]. The final partial frame is included (the model
-  /// repeat-pads a short chunk, [`vadkit::VadModel::predict_chunk_with_state`]).
+  /// repeat-pads a short chunk, [`crate::audio::vad::VadModel::predict_chunk_with_state`]).
   ///
   /// The buffer is processed as one logical stream from a fresh recurrent
   /// state, so the result is independent of any previous call. A per-frame
   /// inference failure — a CoreML runtime error or the non-finite corruption
   /// `vadkit` exists to catch — is reported as **inactive** for that frame
   /// (the trait's
-  /// [`voice_activity`](crate::audio::vad::VoiceActivityDetector::voice_activity)
+  /// [`voice_activity`](crate::audio::whisper::audio::vad::VoiceActivityDetector::voice_activity)
   /// is infallible, returning `Vec<bool>`), but unlike
-  /// [`EnergyVad`](crate::audio::vad::EnergyVad) — whose RMS is a total
+  /// [`EnergyVad`](crate::audio::whisper::audio::vad::EnergyVad) — whose RMS is a total
   /// function of any finite input — a hard *model* failure here is not a
   /// benign "no speech": it is **latched** instead of swallowed, bumping a
   /// monotonic
-  /// [`detection_generation`](crate::audio::vad::VoiceActivityDetector::detection_generation)
+  /// [`detection_generation`](crate::audio::whisper::audio::vad::VoiceActivityDetector::detection_generation)
   /// and recording the error for
-  /// [`last_detection_error`](crate::audio::vad::VoiceActivityDetector::last_detection_error).
+  /// [`last_detection_error`](crate::audio::whisper::audio::vad::VoiceActivityDetector::last_detection_error).
   /// `WhisperKit::transcribe` snapshots that generation across chunking and
-  /// surfaces a [`crate::error::VadError`], so a hard failure during VAD is
+  /// surfaces a [`crate::audio::whisper::error::VadError`], so a hard failure during VAD is
   /// observable from the same transcription call rather than silently
   /// degrading the chunk boundaries.
   fn voice_activity(&self, samples: &[f32]) -> Vec<bool> {

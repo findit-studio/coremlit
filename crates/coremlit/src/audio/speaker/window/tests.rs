@@ -29,7 +29,7 @@ fn sliding_window_is_copy() {
   assert_eq!(sw, copy);
 }
 
-#[cfg(feature = "dia")]
+#[cfg(feature = "speaker")]
 #[test]
 fn sliding_window_round_trips_into_dia_and_back() {
   let ours = SlidingWindow::new(0.25, 4.0, 1.5);
@@ -408,7 +408,7 @@ fn count_from_segmentations_hand_computed_3_chunk_overlap() {
   assert_eq!(got, vec![1, 2, 2, 0, 1, 2, 1, 0, 0]);
 }
 
-#[cfg(feature = "dia")]
+#[cfg(feature = "speaker")]
 #[test]
 fn count_from_segmentations_matches_dia_oracle_3_chunk_overlap() {
   // THE ORACLE IS CODE: dia's own `try_count_pyannote` is public
@@ -460,20 +460,20 @@ fn count_from_segmentations_matches_dia_oracle_3_chunk_overlap() {
 // hermetic test at this data volume — see that test's own doc for why),
 // so this whole fixture is `dia`-gated too; otherwise it's unused
 // (dead code) under the default/non-`dia` feature set.
-#[cfg(feature = "dia")]
+#[cfg(feature = "speaker")]
 const DEFAULT_10X_NUM_CHUNKS: usize = 15;
 /// dia's real `FRAMES_PER_WINDOW` (`diarization/src/segment/options.rs:
 /// 21`) — the actual pyannote segmentation model's per-chunk frame
 /// count (also this crate's own introspected model contract, the
-/// `crate::segment` module doc's `[1, 589, 7]`). A smaller synthetic
+/// `crate::audio::speaker::segment` module doc's `[1, 589, 7]`). A smaller synthetic
 /// frame count would NOT exercise genuine 10x overlap: consecutive
 /// chunks' `start_frame(c) = round_ties_even(c * chunk_step /
 /// frame_step)` values are ~59.26 frames apart (`1.0 / 0.016875`), so a
 /// chunk's own frame span must be close to this real value for ~10
 /// consecutive chunks' windows to overlap a common output frame at all.
-#[cfg(feature = "dia")]
+#[cfg(feature = "speaker")]
 const DEFAULT_10X_NUM_FRAMES_PER_CHUNK: usize = 589;
-#[cfg(feature = "dia")]
+#[cfg(feature = "speaker")]
 const DEFAULT_10X_NUM_SPEAKERS: usize = 2;
 
 /// Synthetic segmentations at this crate's DEFAULT production geometry
@@ -508,7 +508,7 @@ const DEFAULT_10X_NUM_SPEAKERS: usize = 2;
 /// `aggregated[711] = 5 * 1 + 5 * 0 = 5`, `overlapping_count[711] =
 /// 10`, ratio `0.5` exactly — `round_ties_even` rounds to the nearest
 /// EVEN integer, `0`.
-#[cfg(feature = "dia")]
+#[cfg(feature = "speaker")]
 fn default_geometry_10x_overlap_segmentations() -> Vec<f64> {
   let mut segs =
     vec![
@@ -545,7 +545,7 @@ fn default_geometry_10x_overlap_segmentations() -> Vec<f64> {
   segs
 }
 
-#[cfg(feature = "dia")]
+#[cfg(feature = "speaker")]
 #[test]
 fn count_from_segmentations_matches_dia_oracle_default_geometry_10x_overlap() {
   let segmentations = default_geometry_10x_overlap_segmentations();

@@ -1,5 +1,5 @@
 use super::*;
-use crate::tokenizer::SpecialTokens;
+use crate::audio::whisper::tokenizer::SpecialTokens;
 
 const VOCAB: usize = 51865;
 const NEG_INF: f32 = f32::NEG_INFINITY;

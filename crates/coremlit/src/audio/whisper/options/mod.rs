@@ -21,7 +21,7 @@
 //!
 //! Every value survives `serialize` -> `deserialize` unchanged, so a
 //! serialized [`DecodingOptions`] **reconstructs the exact configuration a
-//! run used**. That is what lets [`crate::provenance::Provenance`] embed one
+//! run used**. That is what lets [`crate::audio::whisper::provenance::Provenance`] embed one
 //! wholesale and still be an honest record of what produced a transcript
 //! (coremlit issue #14).
 //!
@@ -63,9 +63,9 @@ use std::{
   path::{Path, PathBuf},
 };
 
-use coremlit::ComputeUnits;
+use crate::ComputeUnits;
 
-use crate::constants::MAX_TOKEN_CONTEXT;
+use crate::audio::whisper::constants::MAX_TOKEN_CONTEXT;
 
 // ---------------------------------------------------------------------
 // Task
@@ -518,7 +518,7 @@ pub struct DecodingOptions {
   /// Which decode task to run.
   #[cfg_attr(feature = "serde", serde(default))]
   task: Task,
-  /// Spoken language, as an ISO code (see [`crate::constants::languages`]).
+  /// Spoken language, as an ISO code (see [`crate::audio::whisper::constants::languages`]).
   /// Empty means auto-detect (golden empty-means-absent).
   #[cfg_attr(
     feature = "serde",
@@ -974,16 +974,16 @@ impl DecodingOptions {
   /// Base seed for reproducible temperature-fallback sampling.
   ///
   /// `None` (the default) leaves every attempt's
-  /// [`GreedyTokenSampler`](crate::decode::sampler::GreedyTokenSampler)
+  /// [`GreedyTokenSampler`](crate::audio::whisper::decode::sampler::GreedyTokenSampler)
   /// OS-seeded, matching Swift's own unseeded `Float.random`
   /// (`TokenSampler.swift:169`) — nondeterministic at `temperature > 0`,
   /// by design, on both runtimes; this is the byte-unchanged default
   /// path.
   ///
   /// `Some(seed)` makes the whole transcription reproducible instead:
-  /// [`crate::transcribe::TranscribeTask`]'s fallback ladder derives an
+  /// [`crate::audio::whisper::transcribe::TranscribeTask`]'s fallback ladder derives an
   /// independent per-(worker, window, attempt) sub-seed from it via
-  /// [`derive_attempt_seed`](crate::decode::sampler::derive_attempt_seed)
+  /// [`derive_attempt_seed`](crate::audio::whisper::decode::sampler::derive_attempt_seed)
   /// rather than reusing `seed` verbatim everywhere (see that function's
   /// doc for why, and for the exact mixing function) — so re-running the
   /// same audio through the same options and `seed` always samples the
@@ -992,7 +992,7 @@ impl DecodingOptions {
   /// that output match Swift's, which has no seed knob of its own and
   /// always draws unseeded — record the effective temperature in
   /// provenance either way
-  /// ([`TranscriptionSegment::temperature`](crate::result::TranscriptionSegment::temperature)).
+  /// ([`TranscriptionSegment::temperature`](crate::audio::whisper::result::TranscriptionSegment::temperature)).
   #[inline(always)]
   pub const fn seed(&self) -> Option<u64> {
     self.seed
@@ -1250,8 +1250,8 @@ impl DecodingOptions {
   // -- word_timestamps (bool) ----------------------------------------------
   /// Compute word-level timestamps via DTW alignment.
   ///
-  /// When set, [`crate::transcribe::TranscribeTask::run`]'s window loop
-  /// runs [`crate::segment::add_word_timestamps`] against each window's
+  /// When set, [`crate::audio::whisper::transcribe::TranscribeTask::run`]'s window loop
+  /// runs [`crate::audio::whisper::segment::add_word_timestamps`] against each window's
   /// alignment-weight snapshot and writes the result onto that window's
   /// segments (Swift's `addWordTimestamps`, `TranscribeTask.swift:
   /// 196-233). `false` (the default) leaves every segment's `words` empty
@@ -1800,17 +1800,17 @@ impl DecodingOptions {
   /// them. **Defaults `true`** (coremlit issue #14).
   ///
   /// Some Whisper models decode silent or near-silent audio to the literal
-  /// text [`BLANK_AUDIO_MARKER`](crate::constants::BLANK_AUDIO_MARKER)
+  /// text [`BLANK_AUDIO_MARKER`](crate::audio::whisper::constants::BLANK_AUDIO_MARKER)
   /// (`"[BLANK_AUDIO]"`) — a training-data artifact the decoder genuinely
   /// samples, not a special token this crate inserts (see that constant's
   /// doc). When this is `true`,
-  /// [`TranscribeTask::run`](crate::transcribe::TranscribeTask::run)
+  /// [`TranscribeTask::run`](crate::audio::whisper::transcribe::TranscribeTask::run)
   /// applies a **post-decode filter** to the assembled segments: any
   /// segment whose *clean* text — its tokens with the special/timestamp
   /// ids stripped, decoded, and whitespace-trimmed, i.e. the same
-  /// projection [`TranscriptionResult::text`](crate::result::TranscriptionResult::text)
+  /// projection [`TranscriptionResult::text`](crate::audio::whisper::result::TranscriptionResult::text)
   /// is built from, **not** the raw
-  /// [`TranscriptionSegment::text`](crate::result::TranscriptionSegment::text),
+  /// [`TranscriptionSegment::text`](crate::audio::whisper::result::TranscriptionSegment::text),
   /// which still carries its special tokens — is exactly the marker gets
   /// removed before the result text is assembled. Pure silence therefore
   /// yields an **empty result** (zero segments, empty text) rather than a
@@ -1821,7 +1821,7 @@ impl DecodingOptions {
   /// gap (`[0, 2]` where segment 1 was blank) rather than relabelling the
   /// segments around it, so ids stay stable whichever way this is set and
   /// the hole itself says what happened. See
-  /// [`TranscribeTask::run`](crate::transcribe::TranscribeTask::run) for
+  /// [`TranscribeTask::run`](crate::audio::whisper::transcribe::TranscribeTask::run) for
   /// why (an id is an ordinal decode position, not an index, and nothing
   /// in the crate looks a segment up by one).
   ///
@@ -1847,19 +1847,19 @@ impl DecodingOptions {
   ///
   /// **This option is consequently a merge rule as well as a decode
   /// filter.** An emptied chunk has no text, and
-  /// [`merge_transcription_results`](crate::result::merge_transcription_results)
+  /// [`merge_transcription_results`](crate::audio::whisper::result::merge_transcription_results)
   /// joins *every* result's text with `" "` — so an emptied one would
   /// surface as a bare separator (a doubled space between two speech runs;
   /// a leading or trailing one at the clip's edges).
-  /// [`merge_transcription_results_with_options`](crate::result::merge_transcription_results_with_options)
+  /// [`merge_transcription_results_with_options`](crate::audio::whisper::result::merge_transcription_results_with_options)
   /// is the merge that reads this option and **skips empty texts in the
   /// join** when it is set;
-  /// [`WhisperKit::transcribe`](crate::transcribe::WhisperKit::transcribe)
+  /// [`WhisperKit::transcribe`](crate::audio::whisper::transcribe::WhisperKit::transcribe)
   /// uses it for its own VAD chunks, and it is what a caller folding a
-  /// [`WhisperKit::transcribe_all`](crate::transcribe::WhisperKit::transcribe_all)
+  /// [`WhisperKit::transcribe_all`](crate::audio::whisper::transcribe::WhisperKit::transcribe_all)
   /// batch by hand should use too. Every result is still *merged* — its
   /// timings stay in the summed metrics; only its empty text is skipped.
-  /// The plain [`merge_transcription_results`](crate::result::merge_transcription_results)
+  /// The plain [`merge_transcription_results`](crate::audio::whisper::result::merge_transcription_results)
   /// keeps Swift's join verbatim, empties included.
   ///
   /// Note the scope that gives the merge: it skips **empty texts**, not
@@ -1991,7 +1991,7 @@ fn default_decoder_compute_units() -> ComputeUnits {
 mod compute_units_serde {
   use core::str::FromStr;
 
-  use coremlit::ComputeUnits;
+  use crate::ComputeUnits;
   use serde::{Deserialize, Deserializer, Serializer};
 
   pub(super) fn serialize<S: Serializer>(

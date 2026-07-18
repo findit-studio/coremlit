@@ -18,19 +18,19 @@ use objc2::rc::autoreleasepool;
 use objc2_foundation::{NSData, NSDataCompressionAlgorithm};
 use unicode_categories::UnicodeCategories;
 
-use crate::result::WordTiming;
+use crate::audio::whisper::result::WordTiming;
 
 thread_local! {
   /// Latches `true` whenever [`zlib_compressed_len`] erases a genuine OS
   /// compression error (its `.ok()`) on this thread. The erasure is buried
   /// under the decode-attempt path's finalize/progress ratios
   /// ([`compression_ratio_of_tokens`] → `decode::finalize_decoding_result`) and
-  /// the streaming early-stop's window ratio ([`crate::stream::should_stop_early`]),
+  /// the streaming early-stop's window ratio ([`crate::audio::whisper::stream::should_stop_early`]),
   /// all of which funnel through [`zlib_compressed_len`] on the same thread. The
   /// fallback ladder reads and clears this once per attempt so a swallowed error
   /// — whose `+inf` ratio drives a temperature fallback to a DIFFERENT transcript
   /// — is recorded as
-  /// [`TaskFacts::had_swallowed_error`](crate::task_facts::TaskFacts::had_swallowed_error)
+  /// [`TaskFacts::had_swallowed_error`](crate::audio::whisper::task_facts::TaskFacts::had_swallowed_error)
   /// rather than left `Some(false)` while provenance claims byte reproducibility
   /// (coremlit issue #14, codex round 14). Swift swallows the same error
   /// (`TextUtilities.swift:20`), so the transcript stays parity-correct; only the
@@ -58,7 +58,7 @@ fn note_compression_error_swallowed() {
 }
 
 /// The crate-private compression fault seam (mirrors
-/// [`crate::backend::mock::MockBackend::fail_on_call`]): tests script the
+/// [`crate::audio::whisper::backend::mock::MockBackend::fail_on_call`]): tests script the
 /// `call`-th [`zlib_compressed_len`] on a thread to fail exactly as a genuine
 /// OS compression error would, so the swallowed-error provenance path can be
 /// exercised without an input that forces Foundation's zlib API to error.
@@ -129,7 +129,7 @@ fn scripted_compression_failure() -> bool {
 /// `objc2` owns the FFI.
 ///
 /// The [`autoreleasepool`] matches
-/// [`crate::tokenizer::nl_recognizer::redetect_language`]'s rationale: any
+/// [`crate::audio::whisper::tokenizer::nl_recognizer::redetect_language`]'s rationale: any
 /// Objective-C method may autorelease internally, so a pool must sit on the
 /// stack or temporaries leak on a thread with no Cocoa run-loop pool above
 /// it. Empty input needs no special-casing: Apple's libcompression

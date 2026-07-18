@@ -1,17 +1,17 @@
-//! Serde bridge for `coremlit::ComputeUnits` (crate-private).
+//! Serde bridge for `crate::ComputeUnits` (crate-private).
 //!
-//! `coremlit::ComputeUnits` carries no serde impl of its own (coremlit has
+//! `crate::ComputeUnits` carries no serde impl of its own (coremlit has
 //! no serde dependency at all) — bridge it through its existing
 //! `as_str`/`FromStr`, the same shape `dia-coreml`'s private
 //! `compute_units_serde` module uses
 //! (`crates/dia-coreml/src/compute_units_serde.rs`, itself mirroring
 //! whisperkit's private `options::compute_units_serde`). Used by
-//! [`crate::encode::EncoderOptions`] via
-//! `serde(with = "crate::compute_units_serde")`.
+//! [`crate::audio::align::encode::EncoderOptions`] via
+//! `serde(with = "crate::audio::align::compute_units_serde")`.
 
 use core::str::FromStr;
 
-use coremlit::ComputeUnits;
+use crate::ComputeUnits;
 use serde::{Deserialize, Deserializer, Serializer};
 
 pub(crate) fn serialize<S: Serializer>(

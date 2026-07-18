@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn model_error_wraps_load_via_from() {
-  let inner = coremlit::LoadError::NotFound {
+  let inner = crate::LoadError::NotFound {
     path: "seg.mlmodelc".into(),
   };
   let e: ModelError = inner.into();
@@ -24,10 +24,10 @@ fn model_error_contract_mismatch_displays_feature_and_shapes() {
 
 #[test]
 fn infer_error_wraps_prediction_and_tensor_via_from() {
-  let e: InferError = coremlit::PredictionError::StateUnsupported.into();
+  let e: InferError = crate::PredictionError::StateUnsupported.into();
   assert!(matches!(e, InferError::Prediction(_)));
 
-  let e: InferError = coremlit::TensorError::ShapeMismatch {
+  let e: InferError = crate::TensorError::ShapeMismatch {
     expected: 4,
     actual: 2,
   }
@@ -99,7 +99,7 @@ fn infer_error_empty_mask_displays_message() {
 
 #[test]
 fn extract_error_composes_model_arm() {
-  let model_err: ModelError = coremlit::LoadError::NotFound {
+  let model_err: ModelError = crate::LoadError::NotFound {
     path: "seg.mlmodelc".into(),
   }
   .into();
@@ -109,7 +109,7 @@ fn extract_error_composes_model_arm() {
 
 #[test]
 fn extract_error_composes_infer_arm() {
-  let infer_err: InferError = coremlit::TensorError::ShapeMismatch {
+  let infer_err: InferError = crate::TensorError::ShapeMismatch {
     expected: 4,
     actual: 2,
   }
@@ -145,7 +145,7 @@ fn extract_error_step_samples_exceeds_window_displays_both() {
 /// Distinct from `StepSamplesExceedsWindow` above: that one rejects a step
 /// too LARGE for any source, this one rejects a step the SELECTED source
 /// cannot honor at all because its stride is compiled into the model graph
-/// (`crate::source::ArgmaxSource`). Both must render both numbers, so a
+/// (`crate::audio::speaker::source::ArgmaxSource`). Both must render both numbers, so a
 /// caller can see what it asked for AND what the source requires.
 #[test]
 fn extract_error_unsupported_step_samples_displays_both() {

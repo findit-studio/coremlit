@@ -1,7 +1,7 @@
 use std::{path::PathBuf, sync::Mutex};
 
 use super::*;
-use crate::{
+use crate::audio::whisper::{
   backend::{ModelDims, mock::MockBackend},
   options::DecodingOptions,
   result::{TranscriptionProgress, TranscriptionSegment, TranscriptionTimings},

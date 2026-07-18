@@ -22,7 +22,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::result::TranscriptionResult;
+use crate::audio::whisper::result::TranscriptionResult;
 
 #[cfg(test)]
 mod tests;
@@ -83,7 +83,7 @@ fn format_timing(start: f32, end: f32, text: &str) -> String {
 /// Renders `result` as SRT subtitle content. Ports `WriteSRT.write`'s body
 /// (`ResultWriter.swift:76-101`): a single running 1-based index across
 /// the whole result; each segment contributes one `format_segment` block
-/// per word when [`TranscriptionSegment::words_slice`](crate::result::TranscriptionSegment::words_slice)
+/// per word when [`TranscriptionSegment::words_slice`](crate::audio::whisper::result::TranscriptionSegment::words_slice)
 /// is non-empty (`:83-88`), else one block for the segment itself
 /// (`:89-93`).
 pub fn srt_content(result: &TranscriptionResult) -> String {
@@ -117,7 +117,7 @@ pub fn srt_content(result: &TranscriptionResult) -> String {
 /// Renders `result` as WebVTT content. Ports `WriteVTT.write`'s body
 /// (`ResultWriter.swift:111-133`): a `"WEBVTT\n\n"` header, then one
 /// `format_timing` block per word when
-/// [`TranscriptionSegment::words_slice`](crate::result::TranscriptionSegment::words_slice)
+/// [`TranscriptionSegment::words_slice`](crate::audio::whisper::result::TranscriptionSegment::words_slice)
 /// is non-empty, else one block for the segment -- the same per-segment
 /// word/segment choice as [`srt_content`], minus the running index.
 pub fn vtt_content(result: &TranscriptionResult) -> String {

@@ -18,14 +18,14 @@
 //!
 //! # [`FluidAudioSource`]: the existing pipeline, unchanged
 //!
-//! This crate's segmentation + embedding pipeline ([`crate::segment`],
-//! [`crate::embed`], [`crate::window`], [`crate::extract`] — built before
+//! This crate's segmentation + embedding pipeline ([`crate::audio::speaker::segment`],
+//! [`crate::audio::speaker::embed`], [`crate::audio::speaker::window`], [`crate::audio::speaker::extract`] — built before
 //! the multi-source split, when this crate had only one source) already
 //! implements the FluidAudio path in full. [`FluidAudioSource`] does not
 //! reimplement any of it: it owns a loaded [`SegmentModel`]/[`EmbedModel`]
 //! pair plus an [`Options`], and its [`ModelSource::extract`] delegates
 //! directly to [`Extractor::extract`] — the exact orchestration every
-//! existing model-gated `extract_*` test in [`crate::extract`] already
+//! existing model-gated `extract_*` test in [`crate::audio::speaker::extract`] already
 //! exercises. No behavior changes here; this module only adds an
 //! owns-its-models, trait-shaped wrapper around it. [`Extractor`] itself
 //! is untouched and stays a fully working, independent public API (a
@@ -36,7 +36,7 @@
 //!
 //! argmax's segmenter does NOT emit a per-frame powerset row for this
 //! crate to decode (FluidAudio's emits `log(softmax(·))` log-probabilities;
-//! see [`crate::segment`]'s module doc) — it takes 30 s of waveform and
+//! see [`crate::audio::speaker::segment`]'s module doc) — it takes 30 s of waveform and
 //! returns already-decoded per-window/frame/speaker activity, having
 //! done the windowing, the powerset decode and the overlap detection inside
 //! the CoreML graph with its OWN semantics. So [`argmax::ArgmaxSource`]
@@ -48,7 +48,7 @@
 //!
 //! # [`Source`] and [`AnySource`]: the selector and the dispatcher
 //!
-//! [`crate::extract::Options`] carries a [`Source`] selector naming which
+//! [`crate::audio::speaker::extract::Options`] carries a [`Source`] selector naming which
 //! vendor's source to build — `FluidAudio` (default, cleanly licensed —
 //! design spec §6) or `Argmax`. [`AnySource`] is the runtime counterpart: a
 //! built, dispatchable `ModelSource`, one variant per `Source`, constructed
@@ -64,7 +64,7 @@
 
 use std::path::{Path, PathBuf};
 
-use crate::{
+use crate::audio::speaker::{
   embed::EmbedModel,
   error::{ExtractError, ModelError},
   extract::{Extraction, Extractor, Options},
@@ -136,12 +136,12 @@ impl ModelSource for FluidAudioSource {
   }
 }
 
-/// Default [`crate::extract::Options::source`] — [`Source::FluidAudio`],
+/// Default [`crate::audio::speaker::extract::Options::source`] — [`Source::FluidAudio`],
 /// the cleanly licensed default (design spec §6).
 pub const DEFAULT_SOURCE: Source = Source::FluidAudio;
 
 /// Which vendor's CoreML conversion computes the seg+embed tensors —
-/// [`crate::extract::Options`]'s source selector (design spec §4). Build the
+/// [`crate::audio::speaker::extract::Options`]'s source selector (design spec §4). Build the
 /// named source with [`AnySource::load`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -240,13 +240,13 @@ impl AnySource {
   ///   `speaker_segmenter/` and `speaker_embedder/` (this crate's
   ///   `Models/argmax-speakerkit`) — see [`ArgmaxSource::from_dir_with`].
   ///
-  /// `options`'s [`crate::window::WindowOptions`] and
-  /// [`crate::extract::ComputeOptions`] are threaded into both arms. The
+  /// `options`'s [`crate::audio::speaker::window::WindowOptions`] and
+  /// [`crate::audio::speaker::extract::ComputeOptions`] are threaded into both arms. The
   /// argmax arm additionally needs an [`ArgmaxVariant`] (quantization tier)
   /// and a third compute placement (its fbank preprocessor), neither of which
   /// exists on the shared [`Options`]; it uses [`ArgmaxOptions::new`]'s
   /// defaults for those, mapping the preprocessor onto
-  /// [`crate::extract::ComputeOptions::embedder`] (argmax's own Swift likewise
+  /// [`crate::audio::speaker::extract::ComputeOptions::embedder`] (argmax's own Swift likewise
   /// owns the preprocessor inside its embedder model,
   /// `SpeakerEmbedderModel.swift:142,148`). A caller who needs a different
   /// variant builds [`ArgmaxSource::from_dir_with`] directly and wraps it in
@@ -266,11 +266,12 @@ impl AnySource {
         let artifacts = FluidAudioArtifacts::resolve(root);
         let seg = SegmentModel::from_file_with(
           artifacts.segmenter(),
-          crate::segment::SegmentModelOptions::new().with_compute(compute.segmenter()),
+          crate::audio::speaker::segment::SegmentModelOptions::new()
+            .with_compute(compute.segmenter()),
         )?;
         let embed = EmbedModel::from_file_with(
           artifacts.embedder(),
-          crate::embed::EmbedModelOptions::new().with_compute(compute.embedder()),
+          crate::audio::speaker::embed::EmbedModelOptions::new().with_compute(compute.embedder()),
         )?;
         Ok(Self::FluidAudio(FluidAudioSource::with_options(
           seg, embed, options,

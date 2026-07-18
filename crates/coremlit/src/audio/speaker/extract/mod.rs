@@ -2,7 +2,7 @@
 //! and assemble the exact tensor set dia's offline diarizer consumes.
 //!
 //! [`Extractor::extract`] is the composition layer over Tasks 2-4
-//! ([`crate::segment`], [`crate::embed`], [`crate::window`]): it ports the
+//! ([`crate::audio::speaker::segment`], [`crate::audio::speaker::embed`], [`crate::audio::speaker::window`]): it ports the
 //! data-plane of dia's `OwnedDiarizationPipeline::run`
 //! (`diarization/src/offline/owned.rs:361-697`) — everything from the
 //! input guards through the `count` tensor — stopping exactly where dia
@@ -15,13 +15,13 @@
 //!
 //! 1. **Input guards** (`owned.rs:369-393`): empty samples, `step_samples`
 //!    range, and `onset` range — see [`Extractor::extract`]'s own step
-//!    list. One guard has no dia analog: [`crate::error::ExtractError::FrameCountMismatch`].
-//! 2. **Chunk grid + zero-padding** (`owned.rs:447-475`): [`crate::window::chunk_starts`]
+//!    list. One guard has no dia analog: [`crate::audio::speaker::error::ExtractError::FrameCountMismatch`].
+//! 2. **Chunk grid + zero-padding** (`owned.rs:447-475`): [`crate::audio::speaker::window::chunk_starts`]
 //!    schedules `start = c * step`; each chunk is copied into a reused
 //!    `SEG_CHUNK_SAMPLES` buffer with the out-of-range tail left zero
 //!    (`fill_padded_chunk`).
-//! 3. **Segment → multilabel** (`owned.rs:477-498`): [`crate::segment::SegmentModel::infer`]
-//!    then [`crate::segment::multilabel`] (whose own module doc proves it
+//! 3. **Segment → multilabel** (`owned.rs:477-498`): [`crate::audio::speaker::segment::SegmentModel::infer`]
+//!    then [`crate::audio::speaker::segment::multilabel`] (whose own module doc proves it
 //!    equals dia's inline `softmax_row` + `powerset_to_speakers_hard`
 //!    decode). Each chunk's `[f][s]` slab is written into the flat
 //!    `segmentations` buffer at `chunk_segmentation_range` — dia's
@@ -30,12 +30,12 @@
 //! 4. **Mask derivation** (`owned.rs:507-591`): the overlap-exclusion rule
 //!    (`derive_slot_plans`). See "The critical port" below.
 //! 5. **Masked embedding + drop paths** (`owned.rs:600-632`):
-//!    [`crate::embed::EmbedModel::embed_chunk`], the non-finite hard error
+//!    [`crate::audio::speaker::embed::EmbedModel::embed_chunk`], the non-finite hard error
 //!    (`owned.rs:611-618`), and the PLDA-norm drop (`owned.rs:619-630`).
 //! 6. **Count tensor + sliding windows** (`owned.rs:653-674`):
-//!    `crate::window::try_count_from_segmentations` over the
+//!    `crate::audio::speaker::window::try_count_from_segmentations` over the
 //!    POST-drop-zeroing `segmentations` buffer, plus
-//!    [`crate::window::chunk_sliding_window`] / [`crate::window::frame_sliding_window`].
+//!    [`crate::audio::speaker::window::chunk_sliding_window`] / [`crate::audio::speaker::window::frame_sliding_window`].
 //!
 //! Layouts, all pinned against dia: `segmentations` is `[c][f][s]` f64
 //! (`owned.rs:496`, `algo.rs:209-210`); `raw_embeddings` is `[c][s][d]`
@@ -57,7 +57,7 @@
 //! (community-1 default) bit-for-bit. Per chunk:
 //!
 //! - A per-frame "clean" indicator is computed ONCE, over all
-//!   [`crate::segment::SEG_NUM_SLOTS`] slots, BEFORE the per-slot loop:
+//!   [`crate::audio::speaker::segment::SEG_NUM_SLOTS`] slots, BEFORE the per-slot loop:
 //!   `clean_frame[f] = active_count < 2`, where a slot is active iff
 //!   `seg[f][s] >= onset` — INCLUSIVE `>=` (`owned.rs:536-549`; dia's
 //!   prose comment at `owned.rs:552` says "> onset" but its CODE at
@@ -94,10 +94,10 @@
 //! - **Batched embed with placeholder masks.** dia embeds one
 //!   `(chunk, slot)` at a time and never calls embed for a skipped slot
 //!   (`owned.rs:561-571,600`). This crate's model is inherently batch-3
-//!   ([`crate::embed`]'s "Batching design"), and an all-false mask row is
+//!   ([`crate::audio::speaker::embed`]'s "Batching design"), and an all-false mask row is
 //!   the known statistics-pooling divide-by-zero NaN mode
-//!   ([`crate::embed`]'s "NonFinite-output scan scope";
-//!   [`crate::error::InferError::EmptyMask`]'s doc). So a chunk with at
+//!   ([`crate::audio::speaker::embed`]'s "NonFinite-output scan scope";
+//!   [`crate::audio::speaker::error::InferError::EmptyMask`]'s doc). So a chunk with at
 //!   least one planned (`SlotPlan::Embed`) slot makes ONE batched call
 //!   in which every `SlotPlan::Skip` slot's mask row borrows the first
 //!   planned slot's mask (a non-degenerate placeholder), and those
@@ -107,7 +107,7 @@
 //!   makes no embed call at all (= dia's zero calls for such a chunk).
 //!
 //!   Divergence: `embed_chunk`'s 768-wide non-finite scan
-//!   ([`crate::embed`]'s "NonFinite-output scan scope") also covers the
+//!   ([`crate::audio::speaker::embed`]'s "NonFinite-output scan scope") also covers the
 //!   placeholder rows, so a NaN confined to a placeholder row would
 //!   hard-error here where dia computes no such row. Accepted, because the
 //!   placeholder mask is bit-identical to a real slot's mask over the same
@@ -115,7 +115,7 @@
 //!   (`owned.rs:616-618`).
 //! - **No `InvalidClip` / `DegenerateEmbedding` recoverable paths.** dia
 //!   silently drops a slot on those two embed errors (`owned.rs:602-608`).
-//!   Neither exists here: [`crate::embed::EmbedModel::embed_chunk`]
+//!   Neither exists here: [`crate::audio::speaker::embed::EmbedModel::embed_chunk`]
 //!   repeat-pads any length (no clip-length error) and the CoreML path has
 //!   no sliding-window aggregation (no degenerate-aggregation error).
 //!   `NonFiniteOutput` stays a HARD error (`owned.rs:616-618`), never a
@@ -129,7 +129,7 @@
 //!   multilabel where sub-onset noise (`0.0001` from softmax) could be
 //!   nonzero.
 
-use crate::{
+use crate::audio::speaker::{
   embed::{EMBED_SLOTS, EMBEDDING_DIM, EmbedModel},
   error::ExtractError,
   segment::{SEG_CHUNK_SAMPLES, SEG_NUM_SLOTS, SegmentModel},
@@ -145,7 +145,7 @@ use crate::{
 /// ceil(589 * 400 / (10 * 16000)) = 2`).
 ///
 /// `pub` (not `pub(crate)`) for two independent reasons rather than one:
-/// [`crate::source::ArgmaxSource`] applies the SAME rule to argmax's own
+/// [`crate::audio::speaker::source::ArgmaxSource`] applies the SAME rule to argmax's own
 /// tensors (its module doc's "The overlap-exclusion fallback" section), and
 /// `tests/parity_argmax_swift.rs` — a separate crate, so `pub(crate)` cannot
 /// reach it — asserts the fallback never fires on any consumed slot. All
@@ -161,13 +161,13 @@ pub const EXCLUDE_OVERLAP_MIN_FRAMES: usize = 2;
 const PLDA_MIN_NORM: f64 = 0.01;
 
 #[cfg(feature = "serde")]
-fn default_segmenter_compute() -> coremlit::ComputeUnits {
-  crate::segment::DEFAULT_SEGMENT_COMPUTE
+fn default_segmenter_compute() -> crate::ComputeUnits {
+  crate::audio::speaker::segment::DEFAULT_SEGMENT_COMPUTE
 }
 
 #[cfg(feature = "serde")]
-fn default_embedder_compute() -> coremlit::ComputeUnits {
-  crate::embed::DEFAULT_EMBED_COMPUTE
+fn default_embedder_compute() -> crate::ComputeUnits {
+  crate::audio::speaker::embed::DEFAULT_EMBED_COMPUTE
 }
 
 /// Which hardware CoreML may schedule each model on (rust-options-pattern).
@@ -177,8 +177,8 @@ fn default_embedder_compute() -> coremlit::ComputeUnits {
 /// them: `Options` is the one serializable configuration surface a
 /// consumer reads to LOAD the two models in the first place (design spec
 /// §5, `docs/superpowers/specs/2026-07-11-dia-coreml-backends-design.md`)
-/// — `segmenter` feeds [`crate::segment::SegmentModelOptions`], `embedder`
-/// feeds [`crate::embed::EmbedModelOptions`]. Keeping them here lets a
+/// — `segmenter` feeds [`crate::audio::speaker::segment::SegmentModelOptions`], `embedder`
+/// feeds [`crate::audio::speaker::embed::EmbedModelOptions`]. Keeping them here lets a
 /// single deserialized `Options` drive both the model loads and the
 /// extraction geometry.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -188,18 +188,18 @@ pub struct ComputeOptions {
     feature = "serde",
     serde(
       default = "default_segmenter_compute",
-      with = "crate::compute_units_serde"
+      with = "crate::audio::speaker::compute_units_serde"
     )
   )]
-  segmenter: coremlit::ComputeUnits,
+  segmenter: crate::ComputeUnits,
   #[cfg_attr(
     feature = "serde",
     serde(
       default = "default_embedder_compute",
-      with = "crate::compute_units_serde"
+      with = "crate::audio::speaker::compute_units_serde"
     )
   )]
-  embedder: coremlit::ComputeUnits,
+  embedder: crate::ComputeUnits,
 }
 
 impl Default for ComputeOptions {
@@ -210,50 +210,50 @@ impl Default for ComputeOptions {
 
 impl ComputeOptions {
   /// Options matching the crate defaults:
-  /// [`crate::segment::DEFAULT_SEGMENT_COMPUTE`] for the segmenter and
-  /// [`crate::embed::DEFAULT_EMBED_COMPUTE`] for the embedder (both
+  /// [`crate::audio::speaker::segment::DEFAULT_SEGMENT_COMPUTE`] for the segmenter and
+  /// [`crate::audio::speaker::embed::DEFAULT_EMBED_COMPUTE`] for the embedder (both
   /// `ComputeUnits::All`).
   pub const fn new() -> Self {
     Self {
-      segmenter: crate::segment::DEFAULT_SEGMENT_COMPUTE,
-      embedder: crate::embed::DEFAULT_EMBED_COMPUTE,
+      segmenter: crate::audio::speaker::segment::DEFAULT_SEGMENT_COMPUTE,
+      embedder: crate::audio::speaker::embed::DEFAULT_EMBED_COMPUTE,
     }
   }
 
   /// Hardware the segmentation model may be scheduled on.
   #[inline(always)]
-  pub const fn segmenter(&self) -> coremlit::ComputeUnits {
+  pub const fn segmenter(&self) -> crate::ComputeUnits {
     self.segmenter
   }
   /// Hardware the embedding model may be scheduled on.
   #[inline(always)]
-  pub const fn embedder(&self) -> coremlit::ComputeUnits {
+  pub const fn embedder(&self) -> crate::ComputeUnits {
     self.embedder
   }
 
   /// Builder form of [`Self::set_segmenter`].
   #[must_use]
   #[inline(always)]
-  pub const fn with_segmenter(mut self, segmenter: coremlit::ComputeUnits) -> Self {
+  pub const fn with_segmenter(mut self, segmenter: crate::ComputeUnits) -> Self {
     self.set_segmenter(segmenter);
     self
   }
   /// Sets [`Self::segmenter`] in place.
   #[inline(always)]
-  pub const fn set_segmenter(&mut self, segmenter: coremlit::ComputeUnits) -> &mut Self {
+  pub const fn set_segmenter(&mut self, segmenter: crate::ComputeUnits) -> &mut Self {
     self.segmenter = segmenter;
     self
   }
   /// Builder form of [`Self::set_embedder`].
   #[must_use]
   #[inline(always)]
-  pub const fn with_embedder(mut self, embedder: coremlit::ComputeUnits) -> Self {
+  pub const fn with_embedder(mut self, embedder: crate::ComputeUnits) -> Self {
     self.set_embedder(embedder);
     self
   }
   /// Sets [`Self::embedder`] in place.
   #[inline(always)]
-  pub const fn set_embedder(&mut self, embedder: coremlit::ComputeUnits) -> &mut Self {
+  pub const fn set_embedder(&mut self, embedder: crate::ComputeUnits) -> &mut Self {
     self.embedder = embedder;
     self
   }
@@ -268,7 +268,7 @@ impl ComputeOptions {
 ///
 /// `source` is NOT read by [`Extractor::extract`] — that method IS the
 /// FluidAudio orchestration and always runs it, whatever this field says.
-/// The field is read by [`crate::source::AnySource::load`], the dispatcher
+/// The field is read by [`crate::audio::speaker::source::AnySource::load`], the dispatcher
 /// that builds the named source; an `Extractor` obtained by other means
 /// simply ignores it.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -290,7 +290,7 @@ impl Default for Options {
 
 impl Options {
   /// Options composing [`WindowOptions::new`], [`ComputeOptions::new`],
-  /// and [`crate::source::DEFAULT_SOURCE`] — each component's own default
+  /// and [`crate::audio::speaker::source::DEFAULT_SOURCE`] — each component's own default
   /// is the single source of truth (the `serde(default)` on each field
   /// defers to it; nested partial configs are covered by each component's
   /// own per-field serde defaults).
@@ -298,11 +298,11 @@ impl Options {
     Self {
       window: WindowOptions::new(),
       compute: ComputeOptions::new(),
-      source: crate::source::DEFAULT_SOURCE,
+      source: crate::audio::speaker::source::DEFAULT_SOURCE,
     }
   }
 
-  /// The sliding-window geometry ([`crate::window::chunk_starts`] step and
+  /// The sliding-window geometry ([`crate::audio::speaker::window::chunk_starts`] step and
   /// `onset`).
   #[inline(always)]
   pub const fn window(&self) -> WindowOptions {
@@ -314,7 +314,7 @@ impl Options {
     self.compute
   }
   /// The selected model [`Source`] — read by
-  /// [`crate::source::AnySource::load`], not by [`Extractor::extract`] (see
+  /// [`crate::audio::speaker::source::AnySource::load`], not by [`Extractor::extract`] (see
   /// this field's struct-level doc).
   #[inline(always)]
   pub const fn source(&self) -> Source {
@@ -421,7 +421,7 @@ impl Extractor {
   ///   fails (`owned.rs:477,600`).
   /// - [`ExtractError::OutputFrameCountOverflow`] if the derived
   ///   `num_output_frames` would not fit in `usize` (converted from
-  ///   [`crate::window`]'s `WindowError` by exhaustive match —
+  ///   [`crate::audio::speaker::window`]'s `WindowError` by exhaustive match —
   ///   unreachable through `extract`'s own geometry, kept typed per this
   ///   crate's no-panic-on-untrusted-config posture; `owned.rs:663-673`).
   pub fn extract(
@@ -444,7 +444,7 @@ impl Extractor {
         window: SEG_CHUNK_SAMPLES,
       });
     }
-    if !crate::window::check_onset(w.onset()) {
+    if !crate::audio::speaker::window::check_onset(w.onset()) {
       return Err(ExtractError::OnsetOutOfRange { onset: w.onset() });
     }
 
@@ -458,7 +458,7 @@ impl Extractor {
     }
 
     // ── 6-7. Chunk grid + zero-cleared output buffers ─────────────────
-    let starts = crate::window::chunk_starts(samples.len(), &w); // owned.rs:447-451
+    let starts = crate::audio::speaker::window::chunk_starts(samples.len(), &w); // owned.rs:447-451
     let num_chunks = starts.len();
     let onset = f64::from(w.onset());
     // `segmentations` [c][f][s] f64 (owned.rs:461-464), `raw_embeddings`
@@ -476,7 +476,7 @@ impl Extractor {
       // b-d. Segment → multilabel → write this chunk's [f][s] slab
       // (owned.rs:477-498).
       let logits = seg.infer(&padded)?;
-      let slab = crate::segment::multilabel(&logits, num_frames);
+      let slab = crate::audio::speaker::segment::multilabel(&logits, num_frames);
       segmentations[chunk_segmentation_range(c, num_frames)].copy_from_slice(&slab);
 
       // e. Per-slot embedding plans from the overlap-exclusion rule
@@ -533,13 +533,13 @@ impl Extractor {
     }
 
     // ── 9-11. Count tensor + timing over the post-zeroing buffer ──────
-    let chunks_sw = crate::window::chunk_sliding_window(&w); // owned.rs:653-655
-    let frames_sw = crate::window::frame_sliding_window(); // owned.rs:656-657
+    let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&w); // owned.rs:653-655
+    let frames_sw = crate::audio::speaker::window::frame_sliding_window(); // owned.rs:656-657
     // Manual exhaustive match, deliberately not a `From` impl — see
     // `ExtractError::OutputFrameCountOverflow`'s doc. Unreachable through
     // extract's own geometry (num_chunks * step ≈ samples.len()), kept
     // typed regardless (owned.rs:663-673).
-    let count = crate::window::try_count_from_segmentations(
+    let count = crate::audio::speaker::window::try_count_from_segmentations(
       &segmentations,
       num_chunks,
       num_frames,
@@ -549,7 +549,7 @@ impl Extractor {
       frames_sw,
     )
     .map_err(|e| match e {
-      crate::window::WindowError::OutputFrameCountOverflow => {
+      crate::audio::speaker::window::WindowError::OutputFrameCountOverflow => {
         ExtractError::OutputFrameCountOverflow
       }
     })?;
@@ -586,9 +586,9 @@ pub struct Extraction {
 
 impl Extraction {
   /// The single construction site for an [`Extraction`], shared by every
-  /// [`crate::source::ModelSource`] (crate-private: the field set is an
+  /// [`crate::audio::speaker::source::ModelSource`] (crate-private: the field set is an
   /// implementation detail, and each source assembles it its own way — see
-  /// [`crate::source::argmax`], which builds the identical layout from
+  /// [`crate::audio::speaker::source::argmax`], which builds the identical layout from
   /// argmax's in-graph-decoded tensors instead of a host-side decode).
   ///
   /// `num_output_frames` is not a parameter: it IS `count.len()`
@@ -694,11 +694,11 @@ impl Extraction {
   /// (`diarization/src/plda/mod.rs:39`), NOT at its crate root, so the
   /// plan's `dia::PldaTransform` shorthand is written out in full here.
   /// The two [`SlidingWindow`] values convert into dia's own via
-  /// [`crate::window`]'s `dia`-gated `From` impls (`window/mod.rs:385-401`);
+  /// [`crate::audio::speaker::window`]'s `dia`-gated `From` impls (`window/mod.rs:385-401`);
   /// `OfflineInput::new` takes `dia::reconstruct::SlidingWindow` by value
   /// (`algo.rs:11,224-225`).
-  #[cfg(feature = "dia")]
-  #[cfg_attr(docsrs, doc(cfg(feature = "dia")))]
+  #[cfg(feature = "speaker")]
+  #[cfg_attr(docsrs, doc(cfg(feature = "speaker")))]
   pub fn into_offline_input<'a>(
     &'a self,
     plda: &'a dia::plda::PldaTransform,
@@ -779,7 +779,7 @@ enum SlotPlan {
 /// [`SlotPlan`] per slot.
 ///
 /// `chunk_segs` is `num_frames * SEG_NUM_SLOTS` f64 values, frame-major
-/// (`chunk_segs[f * SEG_NUM_SLOTS + s]`) — one chunk's [`crate::segment::multilabel`]
+/// (`chunk_segs[f * SEG_NUM_SLOTS + s]`) — one chunk's [`crate::audio::speaker::segment::multilabel`]
 /// output. `onset` is the (already-validated) f64 threshold.
 ///
 /// # Panics

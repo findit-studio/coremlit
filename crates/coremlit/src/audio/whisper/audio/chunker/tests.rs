@@ -1,5 +1,5 @@
 use super::*;
-use crate::{
+use crate::audio::whisper::{
   audio::vad::EnergyVad,
   constants::WINDOW_SAMPLES,
   result::{TranscriptionResult, TranscriptionSegment},
@@ -24,7 +24,7 @@ fn seek_clips_from_timestamps() {
 
 #[test]
 fn seek_clips_reject_negative_and_non_finite_timestamps() {
-  use crate::error::AudioError;
+  use crate::audio::whisper::error::AudioError;
   // A usize cast would saturate -0.5 to sample 0 and silently transcribe
   // from the start; Swift's signed indices make the loop guard skip such
   // clips instead. Loud rejection is the documented divergence.
@@ -139,7 +139,7 @@ fn trailing_silence_yields_wholly_silent_chunks() {
 
 #[test]
 fn apply_seek_offsets_shifts_segments_and_words() {
-  use crate::result::WordTiming;
+  use crate::audio::whisper::result::WordTiming;
   let mut segment = TranscriptionSegment::new();
   segment.set_seek(100).set_start(1.0).set_end(2.0);
   segment.set_words(vec![WordTiming::new("hi", vec![1], 1.0, 1.5, 0.9)]);
@@ -154,7 +154,7 @@ fn apply_seek_offsets_shifts_segments_and_words() {
 
 #[test]
 fn apply_result_seek_offset_stamps_seek_time_and_shifts_nested_times() {
-  use crate::result::WordTiming;
+  use crate::audio::whisper::result::WordTiming;
   let mut segment = TranscriptionSegment::new();
   segment.set_start(1.0).set_end(2.0);
   segment.set_words(vec![WordTiming::new("hi", vec![1], 1.0, 1.5, 0.9)]);
@@ -162,7 +162,7 @@ fn apply_result_seek_offset_stamps_seek_time_and_shifts_nested_times() {
     "hi",
     vec![segment],
     "en",
-    crate::result::TranscriptionTimings::new(),
+    crate::audio::whisper::result::TranscriptionTimings::new(),
   );
   apply_result_seek_offset(&mut result, 32_000);
   assert_eq!(result.seek_time(), Some(2.0));
