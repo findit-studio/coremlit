@@ -32,12 +32,17 @@ tokenizers.workspace = true
 serde = { workspace = true, optional = true }
 
 # The textclap oracle: rev-pinned to a PUBLIC git source (crates.io forbids git
-# sources, and textclap is unpublished), OPTIONAL and only linked under the
-# `parity-oracle` feature — an ordinary `cargo test -p clapkit` never resolves or
-# builds it. This rev is textclap's `origin/main` HEAD when this branch was cut;
-# it is ort-only (no `mlxrs`), so the oracle build downloads an ONNX Runtime
-# binary but compiles no native MLX runtime. clapkit calls only textclap's
-# `BUNDLED_TOKENIZER` const (no `ort` runtime), so the gate needs no
+# sources, and textclap is unpublished), OPTIONAL and only COMPILED/linked under
+# the `parity-oracle` feature. An ordinary `cargo test -p clapkit` never builds
+# or links it — so clapkit's default library pulls in no `ort` — but Cargo's
+# resolver still RESOLVES it: optional dependencies are always part of the
+# whole-graph resolution (Cargo locks as though every feature were enabled), so a
+# fresh default invocation fetches this git source and pins it in `Cargo.lock`
+# (which this repo gitignores). Only the compilation pass honors selected
+# features; resolution does not. This rev is textclap's `origin/main` HEAD when
+# this branch was cut; it is ort-only (no `mlxrs`), so the oracle build downloads
+# an ONNX Runtime binary but compiles no native MLX runtime. clapkit calls only
+# textclap's `BUNDLED_TOKENIZER` const (no `ort` runtime), so the gate needs no
 # `libonnxruntime` at run time.
 #
 # Co-developing textclap and clapkit together? Point at a local checkout with an
