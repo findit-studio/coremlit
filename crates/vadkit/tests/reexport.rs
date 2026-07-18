@@ -278,9 +278,10 @@ const E2E_FIXTURE: &str = "02_pyannote_sample";
 // the segment count).
 // Measured: one segment [106_016, 483_328) = 6.626 s .. 30.208 s. The start is
 // the raw first-speech frame boundary 106_496 (frame 26 × 4096) minus the 30 ms
-// (480-sample) `speech_pad`; the end is the full clip (118 × 4096 samples) —
-// speech runs to the end, so the trailing segment closes at `finish()`'s
-// current sample.
+// (480-sample) `speech_pad`. The clip is 480_000 samples (30.0 s) = 117 full
+// 4096-frames + one partial; speech runs to the end, so the trailing segment
+// closes at the padded frame boundary 483_328 (118 × 4096) — one frame past the
+// raw length, silero's zero-padded-tail semantics inherited faithfully.
 const E2E_EXPECTED_SEGMENTS: usize = 1;
 const E2E_FIRST_START_SAMPLE: u64 = 106_016;
 const E2E_LAST_END_SAMPLE: u64 = 483_328;
@@ -339,7 +340,15 @@ fn detect_speech_on_real_audio_is_pinned() {
       seg.end_sample() > seg.start_sample(),
       "empty/inverted segment"
     );
-    assert!(seg.end_sample() <= total, "segment past end of audio");
+    // `detect_speech_with` zero-pads a trailing PARTIAL frame and closes the
+    // segment at the padded frame boundary (`n_frames * CHUNK_SAMPLES`), which
+    // overhangs a clip that is not a whole number of frames by up to one frame
+    // (02 is 480_000 samples, so the trailing segment ends at 483_328 = 118 ×
+    // 4096). Tolerate up to that boundary, not the raw sample count.
+    assert!(
+      seg.end_sample() <= total.next_multiple_of(CHUNK_SAMPLES as u64),
+      "segment past the padded trailing-frame boundary"
+    );
     assert!(
       seg.start_sample() >= prev_end,
       "segments overlap / out of order"
