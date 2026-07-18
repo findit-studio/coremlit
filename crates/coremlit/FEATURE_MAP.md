@@ -18,6 +18,7 @@ rename or a dropped feature cannot land silently.
 | whisperkit / alignkit | `tracing` | `tracing` | unified cross-cutting |
 | alignkit | (crate) | `align` | asry's `emissions` seam rides this |
 | alignkit | `parity-oracle` | `align-oracle` | asry ONNX aligner oracle (DEV/TEST) |
+| speakerkit | (crate) | `speaker` | the CoreML segmentation + embedding backends (module `audio::speaker`) ride this |
 | speakerkit | `dia` | `speaker` | dia's backend-free offline bridge |
 | speakerkit | `dia-oracle` | `speaker-oracle` | dia's ort DER oracle (DEV/TEST) |
 | vadkit | (crate) | `vad` | silero's logic-only detector rides this |

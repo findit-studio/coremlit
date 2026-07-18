@@ -16,7 +16,7 @@
 #
 #   Usage:  crates/vadkit/tests/swift/regen_goldens.sh
 #
-#   FLUIDAUDIO_SRC     FluidAudio checkout        [default: ../../../../../FluidAudio]
+#   FLUIDAUDIO_SRC     FluidAudio checkout        [default: ../../../../../../FluidAudio]
 #   VADKIT_TEST_MODELS vadkit model artifacts dir [default: <workspace>/Models/vadkit]
 #
 # Both defaults match `tests/common/mod.rs`'s `models_dir()` and the sibling-
@@ -26,9 +26,9 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-workspace="$(cd "$here/../../../.." && pwd)"
+workspace="$(cd "$here/../../../../.." && pwd)"
 
-fluidaudio_src="${FLUIDAUDIO_SRC:-$(cd "$here/../../../../../FluidAudio" 2>/dev/null && pwd || true)}"
+fluidaudio_src="${FLUIDAUDIO_SRC:-$(cd "$here/../../../../../../FluidAudio" 2>/dev/null && pwd || true)}"
 if [[ -z "$fluidaudio_src" || ! -f "$fluidaudio_src/Package.swift" ]]; then
   echo "error: no FluidAudio checkout; set FLUIDAUDIO_SRC=<path>" >&2
   exit 1

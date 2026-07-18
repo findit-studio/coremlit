@@ -23,7 +23,7 @@
 import Foundation
 import PackageDescription
 
-let fluidAudioSource = Context.environment["FLUIDAUDIO_SRC"] ?? "../../../../../FluidAudio"
+let fluidAudioSource = Context.environment["FLUIDAUDIO_SRC"] ?? "../../../../../../FluidAudio"
 
 let package = Package(
   name: "vad-trace-dump",

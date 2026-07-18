@@ -16,7 +16,7 @@
 #
 #   Usage:  crates/speakerkit/tests/swift/regen_goldens.sh
 #
-#   ARGMAX_SWIFT_SRC    argmax-oss-swift checkout   [default: ../../../../../argmax-oss-swift]
+#   ARGMAX_SWIFT_SRC    argmax-oss-swift checkout   [default: ../../../../../../argmax-oss-swift]
 #   ARGMAX_TEST_MODELS  speakerkit-coreml artifacts [default: <workspace>/Models/argmax-speakerkit]
 #
 # Both defaults match `tests/common/mod.rs`'s `argmax_models_dir()` and the
@@ -26,9 +26,9 @@
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-workspace="$(cd "$here/../../../.." && pwd)"
+workspace="$(cd "$here/../../../../.." && pwd)"
 
-argmax_src="${ARGMAX_SWIFT_SRC:-$(cd "$here/../../../../../argmax-oss-swift" 2>/dev/null && pwd || true)}"
+argmax_src="${ARGMAX_SWIFT_SRC:-$(cd "$here/../../../../../../argmax-oss-swift" 2>/dev/null && pwd || true)}"
 if [[ -z "$argmax_src" || ! -f "$argmax_src/Package.swift" ]]; then
   echo "error: no argmax-oss-swift checkout; set ARGMAX_SWIFT_SRC=<path>" >&2
   exit 1

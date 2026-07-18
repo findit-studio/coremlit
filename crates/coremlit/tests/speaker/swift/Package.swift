@@ -21,7 +21,7 @@
 import Foundation
 import PackageDescription
 
-let argmaxSource = Context.environment["ARGMAX_SWIFT_SRC"] ?? "../../../../../argmax-oss-swift"
+let argmaxSource = Context.environment["ARGMAX_SWIFT_SRC"] ?? "../../../../../../argmax-oss-swift"
 
 let package = Package(
   name: "argmax-tensor-dump",

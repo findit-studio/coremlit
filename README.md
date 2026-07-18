@@ -38,7 +38,7 @@ The owner's architecture-confusion fix: who is authoritative for what, where the
    └────────┬───────────────────────┬───────────────┬───────────────┬────────┘
             │ whisper+vad            │ align          │ speaker        │ vad
             ▼ (opt-in)               ▼                ▼                ▼
-      audio::vad  ───────────►   asry  (git)    dia / diarization  silero (git)
+      audio::vad                 asry  (git)    dia / diarization  silero (git)
    (Silero long-form chunking) (alignment seam:  (git; VBx/PLDA    (detector logic
                                 emissions +       clustering —      single-home:
                                 ONNX oracle)      backend-free      thresholding,
@@ -56,7 +56,7 @@ The owner's architecture-confusion fix: who is authoritative for what, where the
 
 **Extraction triggers** (the `diaric` naming pattern — a model-branded crate's pure, backend-agnostic logic core is pulled into a standalone `*ic` crate). Two triggers fire an extraction:
 
-1. **A second backend/consumer needs the logic core.** `dia`'s clustering was extracted to [`diaric`](https://github.com/findit-studio/diaric) so both the ONNX port and coremlit's CoreML `audio::speaker` share one parity-proven core. `vadic` is **RESERVED** for `silero`'s detector logic under the same pattern — today `silero` single-homes it and coremlit's `audio::vad` is its only CoreML consumer, so no VAD extraction has fired.
+1. **A second backend/consumer needs the logic core.** coremlit's `audio::speaker` depends on the pinned [`dia`](https://github.com/findit-studio/diarization) crate, which owns clustering/PLDA/reconstruction **in-tree** — the backend-free offline core (no `ort`) that `speaker` pulls; [`diaric`](https://github.com/findit-studio/diaric) is a SEPARATE downstream extraction lineage — a different consumer's pull of that logic core, **not** a coremlit dependency and not the authority for coremlit's speaker path. `vadic` is **RESERVED** for `silero`'s detector logic under the same pattern — today `silero` single-homes it and coremlit's `audio::vad` is its only CoreML consumer, so no VAD extraction has fired.
 2. **The pure surface must escape backend-coupled CI/versioning.** The `--no-default-features` (ort/tch-free) surface moves out so it can build and publish free of the backend infrastructure's rot — the `diaric` split's second rationale.
 
 `coremlit` is downstream of all three seams; it authors CoreML execution, never the algorithms.
