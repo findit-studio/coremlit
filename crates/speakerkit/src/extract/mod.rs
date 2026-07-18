@@ -905,12 +905,39 @@ impl Extraction {
         let speech_duration = activity as f32 * frame_step;
 
         match clusterer.assign(&embedding, speech_duration) {
-          Assignment::New(id) | Assignment::Existing(id) => {
-            // Dense u64 ids from 1 → 0-based cluster indices. `try_from`
-            // cannot fail for realistic speaker counts; a pathological
-            // overflow surfaces later as reconstruct's HardClustersIdAboveMax
-            // (a typed error), never a panic here.
-            *slot = i32::try_from(id - 1).unwrap_or(i32::MAX);
+          Assignment::New(id) => {
+            // The online engine just appended global speaker `id` (dense u64
+            // from 1); its 0-based cluster label is `id - 1`. diaric's
+            // `reconstruct` rejects any label `> MAX_CLUSTER_ID`
+            // (reconstruct/algo.rs). Cap the loop at that ceiling HERE — the
+            // moment a newly-created speaker would exceed it — instead of
+            // labelling on and letting `reconstruct` reject late. Without this,
+            // a pathological but VALID option set (`speaker_threshold = 0` and
+            // `min_speech_duration = 0`, both accepted: with threshold 0 the
+            // cosine `distance >= 0` never matches, and with min-speech 0 every
+            // row's `duration >= 0` spawns a NEW speaker) creates one speaker
+            // per active slot, and each further `assign` keeps a centroid and
+            // rescans all priors — unbounded O(N^2) work / O(N) heap before the
+            // inevitable typed error. The error returned here is the identical
+            // `HardClustersIdAboveMax` that `reconstruct` would raise; only its
+            // timing changes, so the online loop retains at most
+            // `MAX_CLUSTER_ID + 1` (1024) speakers. Computed in u64 so `id - 1`
+            // cannot overflow i32 before the check.
+            if id - 1 > diaric::reconstruct::MAX_CLUSTER_ID as u64 {
+              return Err(diaric::offline::Error::Reconstruct(
+                diaric::reconstruct::Error::Shape(
+                  diaric::reconstruct::ShapeError::HardClustersIdAboveMax,
+                ),
+              ));
+            }
+            // Past the guard `id - 1 <= MAX_CLUSTER_ID` (1023), so it fits i32.
+            *slot = i32::try_from(id - 1).expect("id - 1 <= MAX_CLUSTER_ID fits i32");
+          }
+          Assignment::Existing(id) => {
+            // Existing matched a speaker whose label was already accepted
+            // (<= MAX_CLUSTER_ID): the New arm returns before any speaker past
+            // the ceiling is labelled, so an existing id cannot exceed it.
+            *slot = i32::try_from(id - 1).expect("existing id - 1 <= MAX_CLUSTER_ID fits i32");
           }
           Assignment::Dropped => {} // stays UNMATCHED
         }

@@ -1162,6 +1162,100 @@ fn diarize_online_over_cap_grid_is_a_typed_reconstruct_error_not_an_oom() {
   );
 }
 
+/// An online extraction of `num_chunks` chunks whose EVERY slot carries an
+/// identical all-ones (hence normalizable) embedding, active across all `F`
+/// frames. Under `speaker_threshold = 0` (cosine `distance >= 0` is never
+/// `< 0`, so the greedy match never fires) and `min_speech_duration = 0`
+/// (every `duration >= 0` clears the spawn gate), EVERY slot spawns a brand-new
+/// global speaker regardless of similarity — the ONLY shape that can push the
+/// online path past `MAX_CLUSTER_ID + 1 = 1024` speakers. (`{±e_i}` distinct far
+/// vectors cap at `2 * EMBEDDING_DIM = 512`, so `many_cluster_online_extraction`
+/// cannot reach the id ceiling.) Feed order is chunk-major then slot-major, so
+/// slot `g = c*SEG_NUM_SLOTS + s` seeds global speaker `g + 1` → 0-based label
+/// `g`. `F` is tiny: the cap fires in the assign loop long before reconstruct.
+fn all_new_online_extraction(num_chunks: usize) -> Extraction {
+  const F: usize = 4;
+  let mut segmentations = vec![0.0f64; num_chunks * F * SEG_NUM_SLOTS];
+  // Every slot: a non-zero (all-ones) row `normalize_from` keeps, active on
+  // every frame. Identical rows are fine — threshold 0 makes each one a New.
+  let raw_embeddings = vec![1.0f32; num_chunks * SEG_NUM_SLOTS * EMBEDDING_DIM];
+  for c in 0..num_chunks {
+    for s in 0..SEG_NUM_SLOTS {
+      for ff in 0..F {
+        segmentations[(c * F + ff) * SEG_NUM_SLOTS + s] = 1.0;
+      }
+    }
+  }
+  // Same geometry rationale as the other online fixtures: reconstruct ignores
+  // chunk DURATION, but the count helper derives num_output_frames from it.
+  let chunks_sw = crate::window::chunk_sliding_window(&WindowOptions::new())
+    .with_duration((F as f64 - 1.0) * crate::window::FRAME_STEP_S);
+  let frames_sw = crate::window::frame_sliding_window();
+  let count = crate::window::count_from_segmentations(
+    &segmentations,
+    num_chunks,
+    F,
+    SEG_NUM_SLOTS,
+    0.5,
+    chunks_sw,
+    frames_sw,
+  );
+  Extraction::from_parts(
+    raw_embeddings,
+    segmentations,
+    count,
+    num_chunks,
+    F,
+    chunks_sw,
+    frames_sw,
+  )
+}
+
+#[test]
+fn diarize_online_caps_at_reconstruction_ceiling_with_early_typed_error() {
+  // The finding's sibling cap, seeded economically. `speaker_threshold = 0` and
+  // `min_speech_duration = 0` are BOTH accepted by OnlineOptions' validation
+  // (finiteness / finite-non-negative), yet together they make the online
+  // clusterer spawn a NEW speaker for EVERY active slot. Once 1024 speakers
+  // exist, the next speaker's 0-based label `id - 1` would exceed diaric's
+  // `MAX_CLUSTER_ID` (1023); pre-cap the loop labelled on unboundedly and let
+  // `reconstruct` reject late (O(N^2) scan / O(N) heap growth first). The guard
+  // now returns that IDENTICAL typed `HardClustersIdAboveMax` the moment the
+  // 1025th speaker would be labelled, from INSIDE the assign loop.
+  //
+  // Structural early-return proof (no wall-clock timing assertion): the fixture
+  // has 400 * 3 = 1200 active slots — far past the 1024 ceiling — but the guard
+  // `return`s at the 1025th New (feed-order slot g = 1024, i.e. chunk 341 slot
+  // 1), so the trailing 175 slots are NEVER assigned and `reconstruct` NEVER
+  // runs. At most 1024 speakers are ever LABELLED, and this assertion is
+  // reachable ONLY via that early return.
+  const NUM_CHUNKS: usize = 400;
+  let ceiling = diaric::reconstruct::MAX_CLUSTER_ID as usize + 1;
+  assert!(
+    NUM_CHUNKS * SEG_NUM_SLOTS > ceiling,
+    "fixture ({} slots) must exceed the {ceiling}-speaker ceiling to reach the cap",
+    NUM_CHUNKS * SEG_NUM_SLOTS
+  );
+  let e = all_new_online_extraction(NUM_CHUNKS);
+
+  let opts = OnlineOptions::default()
+    .with_speaker_threshold(0.0)
+    .with_min_speech_duration(0.0);
+  let err = e
+    .diarize_online(opts)
+    .expect_err("past MAX_CLUSTER_ID the online loop must return the typed cap error early");
+
+  assert!(
+    matches!(
+      err,
+      diaric::offline::Error::Reconstruct(diaric::reconstruct::Error::Shape(
+        diaric::reconstruct::ShapeError::HardClustersIdAboveMax
+      ))
+    ),
+    "expected an EARLY Reconstruct(Shape(HardClustersIdAboveMax)) from the assign-loop cap, got {err:?}"
+  );
+}
+
 // =====================================================================
 // Model-gated (all #[ignore]): requires local speakerkit models
 // (SPEAKERKIT_TEST_MODELS or Models/speakerkit/) plus the cross-crate
