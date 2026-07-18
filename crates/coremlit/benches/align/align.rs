@@ -18,7 +18,7 @@
 //! loads an ASR model and never transcribes; the transcript is a constant. RTF
 //! here is *alignment* RTF over a chunk of known duration.
 //!
-//! Run: `cargo bench -p coremlit --bench align_align`
+//! Run: `cargo bench -p coremlit --features align --bench align_align`
 //!
 //! # This bench does not skip
 //!

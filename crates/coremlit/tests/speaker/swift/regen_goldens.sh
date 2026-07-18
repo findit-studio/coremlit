@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Regenerates the argmax Swift reference goldens read by
-# `crates/speakerkit/tests/parity_argmax_swift.rs` (design spec §5.1).
+# `crates/coremlit/tests/speaker/parity_argmax_swift.rs` (design spec §5.1).
 #
 # The oracle is argmax's OWN Swift — `SpeakerSegmenterModel.predict` +
 # `SpeakerEmbedderModel.embed` — driven by the XCTest in

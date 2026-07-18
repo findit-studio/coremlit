@@ -157,10 +157,10 @@
 //! # Gates
 //!
 //! ```text
-//! cargo test -p coremlit -- --ignored                            # e2e + determinism + model I/O
+//! cargo test -p coremlit --features align -- --ignored           # e2e + determinism + model I/O
 //! cargo test -p coremlit --features align-oracle -- --ignored    # + the word-timing parity gate
-//! cargo test -p coremlit --features tracing -- --ignored         # + the per-chunk span instrumentation
-//! cargo bench -p coremlit --bench align_align                    # encode / align_chunk, RTF
+//! cargo test -p coremlit --features align,tracing -- --ignored   # + the per-chunk span instrumentation
+//! cargo bench -p coremlit --features align --bench align_align   # encode / align_chunk, RTF
 //! ```
 //!
 //! None of them skip: a missing model or fixture is a hard failure, never a

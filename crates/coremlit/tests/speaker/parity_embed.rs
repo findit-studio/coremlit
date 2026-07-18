@@ -27,7 +27,7 @@
 //! never loosen the bound.
 //!
 //! `#[ignore]` (needs the gitignored `Models/speakerkit/` artifacts); run via
-//! `cargo test -p coremlit -- --ignored`.
+//! `cargo test -p coremlit --features speaker -- --ignored`.
 
 mod common;
 

@@ -1,5 +1,5 @@
 //  The argmax Swift reference dumper — the ORACLE behind
-//  `crates/speakerkit/tests/parity_argmax_swift.rs` (design spec §5.1).
+//  `crates/coremlit/tests/speaker/parity_argmax_swift.rs` (design spec §5.1).
 //
 //  argmax ships a `DiarizeCLI`, but it emits ONLY final RTTM
 //  (`Sources/ArgmaxCLI/DiarizeCLI.swift`: `SpeakerKit.generateRTTM(from:)`)
@@ -45,7 +45,7 @@
 //
 //  # Regeneration
 //
-//      crates/speakerkit/tests/swift/regen_goldens.sh
+//      crates/coremlit/tests/speaker/swift/regen_goldens.sh
 //
 //  See that script for the env contract. This test is a generator, not an
 //  assertion suite; it is only ever run by that script.
@@ -240,7 +240,7 @@ final class DumpArgmaxTensors: XCTestCase {
       let whisperkit = whisperkitLoaderProbe(fixture.path)
       let golden = Golden(
         fixture: fixture.name,
-        generator: "crates/speakerkit/tests/swift/Tests/ArgmaxTensorDump/DumpArgmaxTensors.swift",
+        generator: "crates/coremlit/tests/speaker/swift/Tests/ArgmaxTensorDump/DumpArgmaxTensors.swift",
         argmaxSwiftRevision: revision,
         variant: "baseline",
         computeUnits: [

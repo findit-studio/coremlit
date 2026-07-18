@@ -22,7 +22,7 @@
 //! `with_duration`/`with_step` API (all `pub const fn`, `algo.rs:52-113`).
 //!
 //! This crate builds WITHOUT the `dia` feature (T1's established
-//! contract — see `crates/speakerkit/Cargo.toml`'s optional `dia`
+//! contract — see `crates/coremlit/Cargo.toml`'s optional `dia`
 //! dependency), so [`SlidingWindow`] cannot simply BE a re-export of
 //! dia's own type: that path only exists when the feature is on. The
 //! decision (mirror-struct-always, the shape already established by
@@ -45,7 +45,7 @@
 //! - **Chunk length**: 160 000 samples (10 s @ 16 kHz) — dia's
 //!   `WINDOW_SAMPLES` (`diarization/src/segment/options.rs:18`), already
 //!   pinned in this crate as [`crate::audio::speaker::segment::SEG_CHUNK_SAMPLES`]
-//!   (`crates/speakerkit/src/segment/mod.rs:126`, verified against the
+//!   (`crates/coremlit/src/audio/speaker/segment/mod.rs:174`, verified against the
 //!   real `pyannote_segmentation.mlmodelc` contract by T1/T2). This
 //!   module reuses that constant rather than redefining it.
 //! - **Chunk step default**: 16 000 samples (1 s) — dia's

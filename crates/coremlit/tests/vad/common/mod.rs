@@ -103,7 +103,7 @@ pub fn golden_swift_dir() -> PathBuf {
 }
 
 /// Loads a 16 kHz mono WAV as `f32` samples — the single source of truth both
-/// the Swift dumper (`tests/swift/.../DumpVadTraces.swift`'s `readPcm16Mono16k`)
+/// the Swift dumper (`tests/vad/swift/.../DumpVadTraces.swift`'s `readPcm16Mono16k`)
 /// and the Rust gate feed their models, so the two sides are input-identical by
 /// construction; the [`fnv1a_f32`] recorded in each golden re-proves it at
 /// replay time (the alignkit/speakerkit Gate-1 lesson: prove the inputs match).

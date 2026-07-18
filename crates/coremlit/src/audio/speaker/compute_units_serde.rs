@@ -4,7 +4,7 @@
 //! no serde dependency at all) — bridge it through its existing
 //! `as_str`/`FromStr`, the same shape whisperkit's private
 //! `options::compute_units_serde` module uses
-//! (`crates/whisperkit/src/options/mod.rs`). Used by both
+//! (`crates/coremlit/src/audio/whisper/options/mod.rs`). Used by both
 //! [`crate::audio::speaker::segment::SegmentModelOptions`] and
 //! [`crate::audio::speaker::embed::EmbedModelOptions`] via `serde(with = "crate::audio::speaker::compute_units_serde")`.
 //!

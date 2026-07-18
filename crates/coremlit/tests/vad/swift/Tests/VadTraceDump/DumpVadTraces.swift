@@ -1,5 +1,5 @@
 //  The FluidAudio Swift reference dumper — the ORACLE behind
-//  `crates/vadkit/tests/parity_swift.rs` (design spec §6 model-layer gate).
+//  `crates/coremlit/tests/vad/parity_swift.rs` (design spec §6 model-layer gate).
 //
 //  It runs FluidAudio's OWN `VadManager`, not a reimplementation of it:
 //
@@ -26,7 +26,7 @@
 //
 //  # Regeneration
 //
-//      crates/vadkit/tests/swift/regen_goldens.sh
+//      crates/coremlit/tests/vad/swift/regen_goldens.sh
 //
 //  See that script for the env contract. This test is a generator, not an
 //  assertion suite; it is only ever run by that script.
@@ -146,7 +146,7 @@ final class DumpVadTraces: XCTestCase {
 
       let golden = Golden(
         fixture: fixture.name,
-        generator: "crates/vadkit/tests/swift/Tests/VadTraceDump/DumpVadTraces.swift",
+        generator: "crates/coremlit/tests/vad/swift/Tests/VadTraceDump/DumpVadTraces.swift",
         fluidAudioRevision: revision,
         computeUnits: "cpu_only",
         sampleRate: VadManager.sampleRate,
@@ -225,7 +225,7 @@ private func readPcm16Mono16k(_ url: URL) throws -> [Float] {
 }
 
 /// FNV-1a-64 over the little-endian bytes of `samples` — byte-for-byte the
-/// same construction as `crates/vadkit/tests/common/mod.rs`'s `fnv1a_f32`.
+/// same construction as `crates/coremlit/tests/vad/common/mod.rs`'s `fnv1a_f32`.
 private func fnv1aHex(_ samples: [Float]) -> String {
   var hash: UInt64 = 0xcbf2_9ce4_8422_2325
   for sample in samples {

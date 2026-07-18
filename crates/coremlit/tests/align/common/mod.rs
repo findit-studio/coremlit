@@ -69,7 +69,7 @@ pub fn ted_60_wav_path() -> PathBuf {
 ///
 /// Produced by **this workspace's own whisperkit** — the real production
 /// pipeline, ASR → forced alignment — via
-/// `cargo run -p coremlit --example whisper_transcribe_wav`, on
+/// `cargo run -p coremlit --features whisper --example whisper_transcribe_wav`, on
 /// `openai_whisper-large-v3` (`argmaxinc/whisperkit-coreml`). It is therefore
 /// the *kind* of text a caller actually aligns: readable ASR output, not a
 /// hand-made verbatim transcription.
@@ -219,7 +219,7 @@ pub fn sha256_samples_hex(samples: &[f32]) -> String {
 /// Directory holding asry's ONNX wav2vec2 oracle — the `models/` directory of a
 /// co-located `asry` checkout (a sibling of this repo). This is TEST DATA, not
 /// the code dependency: alignkit depends on asry as a rev-pinned git source
-/// (`crates/alignkit/Cargo.toml`), so building the crate does NOT put asry's
+/// (`crates/coremlit/Cargo.toml`), so building the crate does NOT put asry's
 /// `models/` on disk. The default path below assumes the dev-worktree layout (a
 /// sibling `asry`); set `ALIGNKIT_ASRY_MODELS` when it lives elsewhere.
 ///

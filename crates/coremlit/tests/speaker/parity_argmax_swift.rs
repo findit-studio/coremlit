@@ -17,14 +17,14 @@
 //!
 //! argmax ships a `DiarizeCLI`, but it emits only post-clustering **RTTM** —
 //! no flag, anywhere in it, exposes an intermediate tensor. So the oracle is
-//! `tests/swift/`: an out-of-tree SwiftPM package that `@testable import`s
+//! `tests/speaker/swift/`: an out-of-tree SwiftPM package that `@testable import`s
 //! `SpeakerKit` and drives argmax's own `SpeakerSegmenterModel.predict` +
 //! `SpeakerEmbedderModel.embed`, dumping the `[SpeakerEmbedding]` they
 //! produce. That array IS what [`Extraction`] carries, per `(chunk, slot)`:
 //! `windowIndex` → chunk `c`, `speakerIndex` → slot `s`, `activeFrames` →
 //! `segmentations[c][..][s]`, `embedding` → `raw_embeddings[c][s][..]`.
 //!
-//! Regenerate with `tests/swift/regen_goldens.sh` (documented there); the
+//! Regenerate with `tests/speaker/swift/regen_goldens.sh` (documented there); the
 //! goldens live in `tests/speaker/fixtures/golden_argmax_swift/`.
 //!
 //! # The inputs are PROVEN identical, not assumed (the alignkit lesson)
@@ -101,7 +101,7 @@
 //!
 //! `#[ignore]` (needs the gitignored `Models/argmax-speakerkit/` artifacts and
 //! the committed goldens); run via
-//! `ARGMAX_TEST_MODELS=… cargo test -p coremlit -- --ignored`.
+//! `ARGMAX_TEST_MODELS=… cargo test -p coremlit --features speaker -- --ignored`.
 
 mod common;
 
@@ -180,7 +180,7 @@ fn fixture_audio(name: &str) -> PathBuf {
 const GATE_FIXTURES: &[&str] = &["02_pyannote_sample", "07_yuhewei_dongbei_english", "ted_60"];
 
 // ─────────────────────────────────────────────────────────────────────────
-// The golden (written by tests/swift/Tests/ArgmaxTensorDump)
+// The golden (written by tests/speaker/swift/Tests/ArgmaxTensorDump)
 // ─────────────────────────────────────────────────────────────────────────
 
 /// One consumed `(chunk, slot)` as argmax's own Swift produced it.
@@ -260,7 +260,7 @@ fn load_swift_golden(name: &str) -> SwiftGolden {
     .join(format!("{name}.json"));
   let bytes = std::fs::read(&path).unwrap_or_else(|e| {
     panic!(
-      "read argmax-swift golden {}: {e}\n  regenerate: crates/speakerkit/tests/swift/regen_goldens.sh",
+      "read argmax-swift golden {}: {e}\n  regenerate: crates/coremlit/tests/speaker/swift/regen_goldens.sh",
       path.display()
     )
   });

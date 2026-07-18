@@ -7,7 +7,7 @@
 //! held to a near-bit-exact bound (measured, then pinned two-sided;
 //! [`TRACE_TOL`]).
 //!
-//! Regenerate the traces with `tests/swift/regen_goldens.sh`.
+//! Regenerate the traces with `tests/vad/swift/regen_goldens.sh`.
 //!
 //! # Why this catches a stitching bug
 //!
@@ -48,7 +48,7 @@ const TRACE_TOL: f64 = 1e-4;
 /// The pinned generator identity every committed golden must record: the Swift
 /// dumper that produced it (`DumpVadTraces.swift`). A golden whose `generator`
 /// differs was not produced by this crate's oracle harness.
-const GENERATOR: &str = "crates/vadkit/tests/swift/Tests/VadTraceDump/DumpVadTraces.swift";
+const GENERATOR: &str = "crates/coremlit/tests/vad/swift/Tests/VadTraceDump/DumpVadTraces.swift";
 
 /// The pinned FluidAudio revision the committed goldens were generated against
 /// (`regen_goldens.sh` stamps `FLUIDAUDIO_REVISION` into each golden). The
@@ -228,7 +228,7 @@ fn load_swift_golden(name: &str) -> SwiftGolden {
   let path = common::golden_swift_dir().join(format!("{name}.json"));
   let bytes = std::fs::read(&path).unwrap_or_else(|e| {
     panic!(
-      "read swift golden {}: {e}\n  regenerate: crates/vadkit/tests/swift/regen_goldens.sh",
+      "read swift golden {}: {e}\n  regenerate: crates/coremlit/tests/vad/swift/regen_goldens.sh",
       path.display()
     )
   });
@@ -349,7 +349,7 @@ fn vad_probabilities_match_fluidaudio_swift_trace() {
 fn well_formed() -> serde_json::Value {
   serde_json::json!({
     "fixture": "wf",
-    "generator": "crates/vadkit/tests/swift/Tests/VadTraceDump/DumpVadTraces.swift",
+    "generator": "crates/coremlit/tests/vad/swift/Tests/VadTraceDump/DumpVadTraces.swift",
     "fluidAudioRevision": "1a2da18",
     "determinismVerified": true,
     "computeUnits": "cpu_only",

@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
 # F1 gate-inventory check (codex r6): prove the fp16 graph sweep RUNS in an
 # ordinary `cargo test` when the models are present — i.e. it is NOT #[ignore]d
-# then, so a plain `cargo test -p coremlit` executes it. This is the inverse of
+# then, so a plain `cargo test -p coremlit --features whisper` executes it. This is the inverse of
 # der_gate_inventory.sh: there every load-bearing gate must be present AND still
 # #[ignore]d; here the sweep must be present AND, with models on disk, NOT
 # ignored.
 #
 # The defect this guards: build.rs emits `cfg(models_present)` when `Models/` is
 # on disk, which UN-ignores `every_shipped_model_graph_survives_fp16`. But CI's
-# model job ran `cargo test -p coremlit -- --ignored` — the ignored-ONLY filter
+# model job ran `cargo test -p coremlit --features whisper -- --ignored` — the ignored-ONLY filter
 # (libtest `RunIgnored::Only`) — so the sweep was excluded EXACTLY when the
 # models were present, while the modelless `check` job skipped it too (ignored
 # there). A newly vanishing fp16 guard would merge green. The fix wires the
@@ -34,7 +34,7 @@ echo "== ${BIN} :: ${SWEEP} =="
 # Full `--list`: one `NAME: test` line per test (ignored or not); stderr
 # (compile noise) dropped. Non-vacuity + presence. A compile FAILURE still
 # surfaces because `cargo` exits non-zero and the empty-list guard below trips.
-all="$(cargo test -p coremlit --test "${BIN}" -- --list 2>/dev/null || true)"
+all="$(cargo test -p coremlit --features whisper --test "${BIN}" -- --list 2>/dev/null || true)"
 count="$(printf '%s\n' "${all}" | grep -c ': test$' || true)"
 if [ "${count}" -eq 0 ]; then
   echo "  FAIL: 0 tests listed for ${BIN} — it compiled to nothing (a build error?)."
@@ -42,7 +42,7 @@ if [ "${count}" -eq 0 ]; then
 fi
 
 # `--list --ignored`: the SAME `NAME: test` shape, restricted to ignored tests.
-ignored="$(cargo test -p coremlit --test "${BIN}" -- --list --ignored 2>/dev/null || true)"
+ignored="$(cargo test -p coremlit --features whisper --test "${BIN}" -- --list --ignored 2>/dev/null || true)"
 ignored_count="$(printf '%s\n' "${ignored}" | grep -c ': test$' || true)"
 echo "  ${count} tests listed (${ignored_count} ignored)"
 
@@ -64,5 +64,5 @@ if printf '%s\n' "${ignored}" | grep -q "^${SWEEP}: test$"; then
   exit 1
 fi
 
-echo "  ok:   ${SWEEP} is present and NOT ignored (models present) — a plain \`cargo test -p coremlit\` runs it."
+echo "  ok:   ${SWEEP} is present and NOT ignored (models present) — a plain \`cargo test -p coremlit --features whisper\` runs it."
 echo "fp16 sweep inventory OK — the graph sweep executes in the ordinary suite when Models/ is present."

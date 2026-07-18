@@ -7,7 +7,7 @@
 //!   512-sample (32 ms) frames at 16 kHz — with silero's own `detect_speech`
 //!   segmenter (hysteresis, `min_speech`/`min_silence`, `speech_pad`). A
 //!   dev-dependency; `ort` never enters vadkit's runtime graph
-//!   (`cargo tree -p coremlit -e no-dev -i ort` finds nothing — the Cargo.toml
+//!   (`cargo tree -p coremlit --features vad -e no-dev -i ort` finds nothing — the Cargo.toml
 //!   note).
 //! - **vadkit-CoreML** (under test): the FluidInference unified 256 ms artifact
 //!   (`silero-vad-unified-256ms-v6.2.1`) — 4096-sample (256 ms) frames — turned

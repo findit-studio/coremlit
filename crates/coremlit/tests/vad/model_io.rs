@@ -64,7 +64,7 @@
 //!    `coremlcompiler` step is needed or possible.
 //! 4. Spec §5 / plan T2 called for the revision to be "revision-pinned in
 //!    `MODELS_LOCK`". Reality: `MODELS_LOCK` is held by a whisperkit hermetic
-//!    gate (`crates/whisperkit/tests/models_lock.rs`) to EXACTLY the two
+//!    gate (`crates/coremlit/tests/whisper/models_lock.rs`) to EXACTLY the two
 //!    whisper tables CI actually downloads, and the established convention for
 //!    an adopted, CI-untested model (alignkit, speakerkit) is to pin its
 //!    revision + per-file SHA-256 in the crate's own `model_io.rs` — which is

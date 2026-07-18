@@ -85,7 +85,7 @@ const FP16_MIN_NORMAL: f64 = 6.103_515_625e-5;
 // MIL parsing
 //
 // Hand-rolled over MIL's fixed one-statement-per-line shape, mirroring
-// `whisperkit/tests/models_lock.rs`'s hand-rolled lock reader: no parser
+// `crates/coremlit/tests/whisper/models_lock.rs`'s hand-rolled lock reader: no parser
 // dependency for a grammar this small and this fixed.
 //
 //   tensor<fp16, [1, 2999, 29]> var_849_cast_fp16 =

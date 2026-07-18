@@ -7,7 +7,7 @@
 //! side of the sans-I/O boundary.
 //!
 //! Usage:
-//! `cargo run -p coremlit --example whisper_mic_stream -- [model-folder] [tokenizer-folder]`
+//! `cargo run -p coremlit --features whisper --example whisper_mic_stream -- [model-folder] [tokenizer-folder]`
 //! Speak into the default input device; Ctrl-C to stop.
 
 use std::{

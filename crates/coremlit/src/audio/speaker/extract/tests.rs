@@ -582,7 +582,7 @@ fn load_embed_model() -> EmbedModel {
 
 /// Reads the cross-crate `ted_60.wav` fixture (16 kHz mono 16-bit PCM,
 /// 960_000 samples / 60 s), i16 → f32 / 32768.0 — the same loader shape as
-/// `crates/whisperkit/tests/common/mod.rs:45-55`. Reused across crates
+/// `crates/coremlit/tests/whisper/common/mod.rs:45-55`. Reused across crates
 /// because it is the one committed multi-speaker clip long enough to
 /// exercise the 30 s chunk grid.
 fn load_ted_60() -> Vec<f32> {
@@ -681,7 +681,7 @@ fn extract_empty_samples_errors() {
 // rationale, owned.rs:377-378). These reach `extract`'s own
 // defense-in-depth guards, which run BEFORE any inference. Model-gated
 // only because `extract`'s signature requires loaded models; they run
-// under `cargo test -p coremlit --features serde -- --ignored`.
+// under `cargo test -p coremlit --features speaker,serde -- --ignored`.
 
 #[cfg(feature = "serde")]
 #[test]

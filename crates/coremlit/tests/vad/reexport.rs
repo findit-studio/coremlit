@@ -5,7 +5,7 @@
 //! Three gates:
 //!
 //! 1. **`src_authors_no_detection_logic`** (hermetic) — the no-duplication
-//!    proof. Greps every `crates/vadkit/src/**/*.rs` file for the
+//!    proof. Greps every `crates/coremlit/src/audio/vad/**/*.rs` file for the
 //!    silero-segmenter vocabulary (thresholding, hysteresis, `min_speech`/
 //!    `min_silence`/`speech_pad`, driving/constructing a segmenter). vadkit's
 //!    `src/` contains NONE of it; a re-implementation of any segment-assembly
@@ -312,7 +312,7 @@ fn reexport_bridges_backend_error_through_backend_variant() {
 /// `S::new(..)` that the grep's vocabulary could miss), the two paths would
 /// diverge and this turns red.
 ///
-/// Mutation: shadow the `detect_speech_with` re-export in `vadkit/src/lib.rs`
+/// Mutation: shadow the `detect_speech_with` re-export in `src/audio/vad/mod.rs`
 /// with any locally-authored function → these comparisons go red.
 #[test]
 fn reexport_detect_speech_with_is_bit_identical_to_silero() {

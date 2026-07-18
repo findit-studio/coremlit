@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
 # Regenerates the FluidAudio Swift reference traces read by
-# `crates/vadkit/tests/parity_swift.rs` (design spec §6 model-layer gate).
+# `crates/coremlit/tests/vad/parity_swift.rs` (design spec §6 model-layer gate).
 #
 # The oracle is FluidAudio's OWN Swift — `VadManager.process([Float])` — driven
 # by the XCTest in `Tests/VadTraceDump/DumpVadTraces.swift`. That method

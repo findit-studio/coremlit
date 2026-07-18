@@ -13,7 +13,7 @@
 //! otherwise). `#[ignore]` so it never runs in an ordinary `cargo test`, AND
 //! gated on the `UPDATE_GOLDEN` environment variable so it never rewrites the
 //! committed oracle as a *side effect* of a routine `--ignored` sweep
-//! (whisperkit's convention, see `crates/whisperkit/tests/parity_jfk.rs`):
+//! (whisperkit's convention, see `crates/coremlit/tests/whisper/parity_jfk.rs`):
 //! `cargo test -p coremlit --features speaker-oracle -- --ignored` runs every
 //! `#[ignore]` test including this one,
 //! so without the env guard that standard gate would silently re-baseline the
