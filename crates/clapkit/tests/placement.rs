@@ -25,10 +25,12 @@ mod common;
 use clapkit::{AudioEncoder, AudioEncoderOptions, Embedding, TextEncoder, TextEncoderOptions};
 use coremlit::ComputeUnits;
 
-/// Lower bound on the audio tower's cross-placement cosine. MEASURED worst =
-/// 0.99998260 (All/CpuAndGpu/CpuOnly vs CpuOnly; the audio graph runs on GPU/CPU
-/// on every unit since ANE compile fails); pinned at 0.9999 with a small fp16
-/// margin. A drop below is a finding, not a threshold to loosen.
+/// Lower bound on the audio tower's cross-placement cosine over the FULL public
+/// matrix — `All`, `CpuAndNeuralEngine`, `CpuAndGpu`, `CpuOnly` — each vs the
+/// `CpuOnly` reference. The audio graph runs on GPU/CPU on every unit (ANECCompile
+/// fails for HTSAT, so even the ANE-naming selection falls back), so all four
+/// agree to fp16 tolerance. MEASURED worst = 0.99998260; pinned at 0.9999 with a
+/// small fp16 margin. A drop below is a finding, not a threshold to loosen.
 const AUDIO_MIN_COSINE: f32 = 0.9999;
 /// Lower bound on the text tower's cross-placement cosine. MEASURED worst =
 /// 0.99994725 (the CpuOnly-vs-ANE fp16/fp32 pair — the text graph DOES compile
@@ -37,6 +39,10 @@ const TEXT_MIN_COSINE: f32 = 0.9999;
 
 const AUDIO_UNITS: &[ComputeUnits] = &[
   ComputeUnits::All,
+  // The public ANE-naming variant MUST be exercised: the doc claims every ANE
+  // selection falls back to GPU/CPU (ANECCompile fails for HTSAT), so this is the
+  // characterized proof of that fallback, not an omitted case.
+  ComputeUnits::CpuAndNeuralEngine,
   ComputeUnits::CpuAndGpu,
   ComputeUnits::CpuOnly,
 ];
