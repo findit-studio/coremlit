@@ -5,9 +5,11 @@
 //!
 //! T1's conversion rejected an in-graph mel/STFT: a faithful HF
 //! `ClapFeatureExtractor` needs **float64** STFT numerics, which an fp16 ANE
-//! graph cannot carry (worst end-to-end cosine 0.5546 for an in-graph f32 STFT),
-//! and `power_to_db`'s `amin = 1e-10` floor is the exact fp16-vanishing-guard
-//! class the campaign forbids. So the graph takes a spectrogram
+//! graph cannot carry (worst end-to-end cosine 0.5830 for an in-graph fp32 STFT
+//! vs the HF-mel path, degrading further under fp16 — see
+//! `conversion/scripts/measure_melgraph.py`), and `power_to_db`'s `amin = 1e-10`
+//! floor is the exact fp16-vanishing-guard class the campaign forbids. So the
+//! graph takes a spectrogram
 //! (`input_features [1, 1, 1001, 64]`, perfect fp32 parity) and the mel is a
 //! Rust port, bit-validated against textclap's mel (the spec's stated oracle).
 //!

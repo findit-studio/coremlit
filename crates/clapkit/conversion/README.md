@@ -47,10 +47,14 @@ max-abs-diff ≈ 7.6e-6 = one f32 ULP). An in-graph mel was attempted
 (`mel_in_graph_probe.py`, `measure_melgraph.py`) and **rejected** on three
 measured grounds:
 
-1. **Faithfulness (decisive):** an in-graph f32 STFT lands 0.55–0.90 cosine (worst
-   0.5546 over 10 real clips) away from the correct HF-mel path end-to-end.
+1. **Faithfulness (decisive):** an in-graph **fp32** STFT lands only 0.58–0.96
+   cosine (worst 0.5830 over 10 real clips) from the correct HF-mel path
+   end-to-end, and the **fp16** in-graph STFT degrades further (0.95–1.00, worst
+   0.9534 vs the fp32 melgraph) — nowhere near the spectrogram path's clean fp16.
    Reproducing HF's `ClapFeatureExtractor` exactly needs **float64** STFT
-   numerics, hostile to an fp16 ANE graph.
+   numerics, hostile to an fp16 ANE graph. (Measured by `measure_melgraph.py`:
+   both separately-converted melgraph precisions vs the shipped fp32 spectrogram
+   graph, all arms fed the identical repeat-tiled 480 000-sample input.)
 2. **Guard class:** `power_to_db`'s `amin = 1e-10` floor is 1680× below `2^-24` —
    the exact fp16-vanishing-guard class the campaign forbids.
 3. **No ANE upside:** the audio graph does not compile for the ANE either way.
