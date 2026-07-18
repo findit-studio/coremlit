@@ -8,8 +8,10 @@ Two fixes over the original probe:
   * arm A now loads the SEPARATELY-converted fp32 melgraph (not a compiled copy of
     the fp16 one), and arm B compares the fp16 melgraph against that fp32 melgraph
     — two DIFFERENT conversions, not two executions of one;
-  * both arms receive the IDENTICAL 480k waveform (repeat-tiled to fill, exactly
-    as clapkit's mel `repeatpad`s), so the only variable is the mel computation.
+  * both arms receive the IDENTICAL 480k waveform (ceil-tiled to fill then
+    truncated — a PROBE padding, not production `repeatpad`, which floor-repeats
+    then zero-fills the remainder; see `to_480k`), so the only variable is the
+    mel computation.
 Both melgraphs load as mlpackages on CPU (no stale/absent `.mlmodelc`)."""
 import os
 import sys
@@ -37,10 +39,14 @@ def nan_prop_min(worst, c):
 
 
 def to_480k(clip):
-    """Repeat-tile (or head-truncate) a clip to EXACTLY TARGET_SAMPLES, matching
-    clapkit's mel `repeatpad`. The SAME 480k waveform feeds both arms, so arm A
-    isolates the mel computation (in-graph fp32 STFT vs HF float64 mel), not a
-    padding difference."""
+    """Ceil-tile (or head-truncate) a clip to EXACTLY TARGET_SAMPLES. This is a
+    PROBE padding, NOT production `repeatpad`: it tiles ceil(TARGET/len) whole
+    copies then TRUNCATES, so a sub-480k clip's tail is repeated audio. Production
+    mel (`src/audio/mel/mod.rs`) instead floor-repeats then ZERO-fills the
+    remainder — a different waveform for short clips. That divergence does not
+    affect this probe: the SAME 480k waveform feeds both arms, so arm A isolates
+    the mel computation (in-graph fp32 STFT vs HF float64 mel), not a padding
+    difference."""
     a = np.asarray(clip, np.float32)
     if len(a) >= TARGET_SAMPLES:
         return a[:TARGET_SAMPLES].astype(np.float32)

@@ -14,7 +14,7 @@
 //! (`audio_model_quantized.onnx` 33 MB / `text_model_quantized.onnx` 121 MB),
 //! while clapkit's conversion is fp16 from the fp32 source. The primary gates
 //! below therefore pin the audio/text cosine two-sided at MEASURED values, not at
-//! 1.0. A **same-precision control** runs the identical comparison against
+//! 1.0. An **unquantized fp32 control** runs the identical comparison against
 //! Xenova's **unquantized fp32** graphs (`audio_model.onnx` / `text_model.onnx`,
 //! which Xenova also ships): its cosine is higher, and the gap between the two
 //! bands is the **quantization contribution** — measured, not asserted away. The
@@ -148,7 +148,7 @@ fn text_parity_vs_textclap_quantized() {
 }
 
 #[test]
-#[ignore = "requires clapkit models + textclap UNQUANTIZED fp32 ONNX (same-precision control)"]
+#[ignore = "requires clapkit models + textclap UNQUANTIZED fp32 ONNX (unquantized fp32 control)"]
 fn audio_parity_vs_textclap_fp32_control() {
   assert!(
     textclap_onnx("audio_model.onnx").exists(),
@@ -177,7 +177,7 @@ fn audio_parity_vs_textclap_fp32_control() {
 }
 
 #[test]
-#[ignore = "requires clapkit models + textclap UNQUANTIZED fp32 ONNX (same-precision control)"]
+#[ignore = "requires clapkit models + textclap UNQUANTIZED fp32 ONNX (unquantized fp32 control)"]
 fn text_parity_vs_textclap_fp32_control() {
   assert!(
     textclap_onnx("text_model.onnx").exists(),

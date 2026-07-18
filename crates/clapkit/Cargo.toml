@@ -5,7 +5,10 @@ version.workspace = true
 edition.workspace = true
 # Unpublishable while the `parity-oracle` gate depends on the unpublished
 # `textclap` git source (crates.io forbids git sources); flip once textclap
-# lands on a released version. The DEFAULT build has no git dependencies.
+# lands on a released version. The DEFAULT build COMPILES no git dependency
+# (textclap links only under `parity-oracle`), but Cargo still RESOLVES the
+# optional textclap git source — a fresh default invocation fetches it and pins
+# it in `Cargo.lock`, so default resolution is not offline (see below).
 publish = false
 rust-version.workspace = true
 license.workspace = true

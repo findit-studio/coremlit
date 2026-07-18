@@ -122,7 +122,7 @@ front-end and tokenizer are the same ported/pinned artifacts (identity-gated in
 
 **Honesty clause.** textclap ships the **quantized** (int8-class) Xenova graphs,
 while clapkit converts fp16 from the fp32 source, so the primary gates pin the
-cosine two-sided at **measured** values, not 1.0. A **same-precision control**
+cosine two-sided at **measured** values, not 1.0. An **unquantized fp32 control**
 runs the identical comparison against Xenova's **unquantized fp32** graphs; its
 near-perfect agreement attributes essentially the entire gap to textclap's
 quantization, not to clapkit's fp16 (measured 2026-07-18):
@@ -202,7 +202,7 @@ CLAPKIT_TEST_MODELS=Models/clapkit cargo test -p clapkit -- --ignored
 
 # The parity gate additionally needs the textclap oracle + its ONNX (the
 # quantized pair drives the primary bands; the fp32 pair is the load-bearing
-# same-precision control — both fetched by the `hf download` above). Point the
+# unquantized fp32 control — both fetched by the `hf download` above). Point the
 # env var at the `onnx/` subdirectory the download creates:
 CLAPKIT_TEST_MODELS=Models/clapkit CLAPKIT_TEXTCLAP_ONNX=Models/textclap-onnx/onnx \
   cargo test -p clapkit --features parity-oracle --test parity_textclap -- --ignored
@@ -219,7 +219,10 @@ CLAPKIT_TEST_MODELS=Models/clapkit CLAPKIT_TEXTCLAP_ONNX=Models/textclap-onnx/on
 
 `0.1.0` (unreleased), `publish = false` — the `parity-oracle` gate depends on the
 unpublished `textclap` git source (crates.io forbids git sources); the DEFAULT
-build has no git dependencies. Both encoders are parity-pinned against textclap
+build COMPILES no git dependency (textclap links only under `parity-oracle`),
+but Cargo still RESOLVES the optional git source, so a fresh default build
+fetches it and pins it in `Cargo.lock` (default resolution is not offline). Both
+encoders are parity-pinned against textclap
 (table above); the long-audio pipeline (geometry, aggregation math, serde,
 zero-shot ranking) is hermetically pinned and mutation-verified; a multi-minute
 end-to-end run pins the window count, aggregate, and top zero-shot label.

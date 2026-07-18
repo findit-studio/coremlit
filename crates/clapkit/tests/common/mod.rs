@@ -41,7 +41,7 @@ pub fn text_model_path() -> PathBuf {
 /// (`tests/parity_textclap.rs`). Contains the quantized (int8-class) graphs
 /// `audio_model_quantized.onnx` / `text_model_quantized.onnx` that textclap
 /// ships, and optionally the fp32 unquantized `audio_model.onnx` /
-/// `text_model.onnx` used for the same-precision control.
+/// `text_model.onnx` used for the unquantized fp32 control.
 ///
 /// Overridable via `CLAPKIT_TEXTCLAP_ONNX`; otherwise
 /// `<workspace>/Models/textclap-onnx/onnx`. The Hugging Face Hub **preserves the
