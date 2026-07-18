@@ -9,7 +9,7 @@ use std::path::Path;
 use coremlit::{ComputeUnits, DataType, Model, MultiArray};
 
 use crate::{
-  embedding::{EMBEDDING_DIM, Embedding},
+  embedding::{EMBEDDING_DIM, Embedding, check_finite_output},
   error::{Error, Result},
   window::{WindowEmbedding, WindowPlan},
 };
@@ -183,8 +183,10 @@ impl AudioEncoder {
   /// otherwise propagate through the mel into a garbage embedding).
   /// [`Error::Tensor`] / [`Error::Prediction`] on a tensor or CoreML failure.
   /// [`Error::OutputShape`] if the predicted `audio_embeds` shape diverges from
-  /// `[1, `[`EMBEDDING_DIM`]`]`. [`Error::NonFiniteEmbedding`] /
-  /// [`Error::EmbeddingZero`] if the projection cannot be normalized.
+  /// `[1, `[`EMBEDDING_DIM`]`]`. [`Error::NonFiniteOutput`] if the model output
+  /// has a NaN/infinite component — model corruption, classified apart from a
+  /// caller's own non-finite embedding data ([`Error::NonFiniteEmbedding`]).
+  /// [`Error::EmbeddingZero`] if the (finite) projection has zero magnitude.
   pub fn embed_window(&self, samples: &[f32]) -> Result<Embedding> {
     if samples.is_empty() {
       return Err(Error::EmptyAudio);
@@ -217,6 +219,11 @@ impl AudioEncoder {
 
     let mut row = [0.0f32; EMBEDDING_DIM];
     embeds.copy_into::<f32>(&mut row)?;
+    // Classify a NaN/∞ the CoreML runtime produced as model-output corruption
+    // (`NonFiniteOutput`) before it reaches `from_slice_normalizing`, which would
+    // otherwise mislabel it as caller-supplied embedding data
+    // (`NonFiniteEmbedding`).
+    check_finite_output(&row)?;
     Embedding::from_slice_normalizing(&row)
   }
 
