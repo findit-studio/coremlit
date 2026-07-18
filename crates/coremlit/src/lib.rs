@@ -42,3 +42,6 @@ pub use model::{FeatureInfo, Model, ModelDescription};
 pub use multi_array::{Element, MultiArray};
 pub use state::State;
 pub use units::{ComputeUnits, ParseComputeUnitsError};
+
+pub mod audio;
+pub mod embeddings;

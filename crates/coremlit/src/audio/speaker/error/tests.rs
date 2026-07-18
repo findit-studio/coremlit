@@ -1,0 +1,184 @@
+use super::*;
+
+#[test]
+fn model_error_wraps_load_via_from() {
+  let inner = crate::LoadError::NotFound {
+    path: "seg.mlmodelc".into(),
+  };
+  let e: ModelError = inner.into();
+  assert!(matches!(e, ModelError::Load(_)));
+}
+
+#[test]
+fn model_error_contract_mismatch_displays_feature_and_shapes() {
+  let e = ModelError::ContractMismatch {
+    feature: "segments",
+    expected: "[1, 589, 7] f32".to_string(),
+    actual: "[1, 592, 7] f32".to_string(),
+  };
+  let rendered = e.to_string();
+  assert!(rendered.contains("segments"));
+  assert!(rendered.contains("589"));
+  assert!(rendered.contains("592"));
+}
+
+#[test]
+fn infer_error_wraps_prediction_and_tensor_via_from() {
+  let e: InferError = crate::PredictionError::StateUnsupported.into();
+  assert!(matches!(e, InferError::Prediction(_)));
+
+  let e: InferError = crate::TensorError::ShapeMismatch {
+    expected: 4,
+    actual: 2,
+  }
+  .into();
+  assert!(matches!(e, InferError::Tensor(_)));
+}
+
+#[test]
+fn infer_error_non_finite_output_displays_index() {
+  let e = InferError::NonFiniteOutput { index: 42 };
+  assert_eq!(
+    e.to_string(),
+    "output contains a non-finite value at index 42"
+  );
+}
+
+#[test]
+fn infer_error_input_length_displays_got_and_expected() {
+  let e = InferError::InputLength {
+    got: 100,
+    expected: 160_000,
+  };
+  let rendered = e.to_string();
+  assert!(rendered.contains("100"));
+  assert!(rendered.contains("160000"));
+}
+
+#[test]
+fn infer_error_output_shape_displays_got_and_expected() {
+  // Missing pin (T2 review-queue item): every other variant has a Display
+  // test, but `OutputShape` (added in fix round 1, commit fcbce74) never
+  // got one.
+  let e = InferError::OutputShape {
+    got: vec![1, 7, 589],
+    expected: vec![1, 589, 7],
+  };
+  let rendered = e.to_string();
+  assert!(rendered.contains("[1, 7, 589]"));
+  assert!(rendered.contains("[1, 589, 7]"));
+}
+
+#[test]
+fn infer_error_non_finite_input_displays_index() {
+  let e = InferError::NonFiniteInput { index: 7 };
+  assert_eq!(
+    e.to_string(),
+    "input contains a non-finite value at index 7"
+  );
+}
+
+#[test]
+fn infer_error_f16_overflow_input_displays_index_and_honest_reason() {
+  let e = InferError::F16OverflowInput { index: 42 };
+  let rendered = e.to_string();
+  assert!(rendered.contains("index 42"), "{rendered}");
+  // The message must be HONEST that the value is finite in f32 (unlike
+  // `NonFiniteInput`), and name f16 as the domain it overflows.
+  assert!(
+    rendered.contains("finite in f32") && rendered.contains("f16"),
+    "{rendered}"
+  );
+}
+
+#[test]
+fn infer_error_empty_mask_displays_message() {
+  let e = InferError::EmptyMask;
+  assert_eq!(e.to_string(), "mask has no active (true) frame");
+}
+
+#[test]
+fn extract_error_composes_model_arm() {
+  let model_err: ModelError = crate::LoadError::NotFound {
+    path: "seg.mlmodelc".into(),
+  }
+  .into();
+  let e: ExtractError = model_err.into();
+  assert!(matches!(e, ExtractError::Model(ModelError::Load(_))));
+}
+
+#[test]
+fn extract_error_composes_infer_arm() {
+  let infer_err: InferError = crate::TensorError::ShapeMismatch {
+    expected: 4,
+    actual: 2,
+  }
+  .into();
+  let e: ExtractError = infer_err.into();
+  assert!(matches!(e, ExtractError::Infer(InferError::Tensor(_))));
+}
+
+#[test]
+fn extract_error_empty_samples_displays_message() {
+  assert_eq!(ExtractError::EmptySamples.to_string(), "samples is empty");
+}
+
+#[test]
+fn extract_error_zero_step_samples_displays_message() {
+  assert_eq!(
+    ExtractError::ZeroStepSamples.to_string(),
+    "step_samples must be > 0"
+  );
+}
+
+#[test]
+fn extract_error_step_samples_exceeds_window_displays_both() {
+  let e = ExtractError::StepSamplesExceedsWindow {
+    step: 200_000,
+    window: 160_000,
+  };
+  let rendered = e.to_string();
+  assert!(rendered.contains("200000"));
+  assert!(rendered.contains("160000"));
+}
+
+/// Distinct from `StepSamplesExceedsWindow` above: that one rejects a step
+/// too LARGE for any source, this one rejects a step the SELECTED source
+/// cannot honor at all because its stride is compiled into the model graph
+/// (`crate::audio::speaker::source::ArgmaxSource`). Both must render both numbers, so a
+/// caller can see what it asked for AND what the source requires.
+#[test]
+fn extract_error_unsupported_step_samples_displays_both() {
+  let e = ExtractError::UnsupportedStepSamples {
+    step: 8_000,
+    required: 16_000,
+  };
+  let rendered = e.to_string();
+  assert!(rendered.contains("8000"));
+  assert!(rendered.contains("16000"));
+}
+
+#[test]
+fn extract_error_onset_out_of_range_displays_value() {
+  let e = ExtractError::OnsetOutOfRange { onset: 1.5 };
+  let rendered = e.to_string();
+  assert!(rendered.contains("1.5"));
+  assert!(rendered.contains("(0.0, 1.0]"));
+}
+
+#[test]
+fn extract_error_frame_count_mismatch_displays_both() {
+  let e = ExtractError::FrameCountMismatch {
+    segmenter: 589,
+    embedder: 588,
+  };
+  let rendered = e.to_string();
+  assert!(rendered.contains("589"));
+  assert!(rendered.contains("588"));
+}
+
+#[test]
+fn extract_error_output_frame_count_overflow_displays_message() {
+  let rendered = ExtractError::OutputFrameCountOverflow.to_string();
+  assert!(rendered.contains("num_output_frames overflows usize"));
+}

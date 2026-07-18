@@ -1,25 +1,19 @@
 [workspace]
 resolver = "3"
-members = [
-  "crates/alignkit",
-  "crates/clapkit",
-  "crates/coremlit",
-  "crates/whisperkit",
-  "crates/speakerkit",
-  "crates/vadkit",
-]
+members = ["crates/coremlit"]
+
 
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-# MSRV floor is set by two pinned git dependencies — alignkit's `asry` and
-# speakerkit's `dia` (diarization) — both of which need rustc 1.95.
+# MSRV floor is set by two pinned git dependencies — coremlit's `asry` (the
+# `align` feature) and `dia`/diarization (the `speaker` feature) — both of
+# which need rustc 1.95.
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/findit-studio/coremlit"
 
 [workspace.dependencies]
-coremlit = { version = "0.1.0", path = "crates/coremlit" }
 objc2 = "0.6"
 objc2-core-ml = { version = "0.3", features = ["block2", "objc2-core-video"] }
 objc2-foundation = "0.3"
@@ -50,21 +44,7 @@ rustfft = "6"
 npyz = "0.9"
 cpal = "0.16"
 rubato = "0.16"
-criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
-
-# CO-DEV RECIPE (do NOT commit the patch itself): speakerkit's optional `dia`
-# dependency is pinned to the diarization repo by exact git rev
-# (crates/speakerkit/Cargo.toml). To build the `dia` feature against a LOCAL
-# diarization checkout instead — e.g. while co-developing an unmerged change —
-# add this UNCOMMITTED `[patch]` here (Cargo honors `[patch]` only at the
-# workspace root):
-#
-#   [patch."https://github.com/findit-studio/diarization"]
-#   dia = { path = "../diarization", package = "diarization" }
-#
-# `../diarization` is the sibling checkout relative to THIS workspace root; Cargo
-# then resolves `dia` to it for every crate in the workspace. Keep it out of
-# commits so CI and fresh checkouts continue to resolve the pinned rev.
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 [workspace.lints.rust]
 missing_docs = "deny"

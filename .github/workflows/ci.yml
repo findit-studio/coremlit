@@ -8,35 +8,55 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-hack
       - run: cargo fmt --all --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
-      - run: cargo hack test -p whisperkit --each-feature
-      - run: cargo build -p whisperkit --examples
-      # speakerkit: compile the `dia` bridge surface and enforce the DER-gate
-      # suite, which the default-feature workspace steps above never touch. F1
-      # made the public `dia` feature lean (`default-features = false` on the dia
-      # dep — no `ort`, no bundled ONNX), so `--features dia` here builds only
-      # dia's pure-Rust offline core; no Models/ tree is downloaded.
-      - run: cargo test -p speakerkit --features dia
-      # The DER binaries are `#![cfg(feature = "dia-oracle")]`: without it they
-      # compile to nothing and a deleted gate, a lost `#[ignore]`, or a weakened
-      # mutation-proof pin would merge green. The inventory compiles them under
-      # `dia-oracle` (the ONLY step that pulls `ort`, to get dia's own
-      # segmentation/embedding oracle), lists each required gate as present +
-      # still ignored, and runs each binary's hermetic ordinary (falsifiability)
-      # suite. The heavy model-gated gates stay `#[ignore]`d — no models needed.
-      - run: crates/speakerkit/tests/der_gate_inventory.sh
-      # Feature-combination parity with the whisperkit step above. `dia-oracle`
-      # is excluded so this stays on dia's pure-Rust core (no `ort`); the oracle
-      # binaries are already compiled+exercised by the inventory step.
-      - run: cargo hack test -p speakerkit --each-feature --exclude-features dia-oracle
-      - run: cargo doc --workspace --no-deps
+      # `default = []` is the bare CoreML core; `--all-features` reaches every
+      # feature-gated audio module AND the oracle features under one
+      # `-D warnings` pass across all targets (lib/tests/benches/examples). ort
+      # is `load-dynamic`, so this builds without onnxruntime present.
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
+      - run: cargo build --features whisper --examples
+      # The speaker-oracle DER gate inventory: compiles the
+      # `#![cfg(feature = "speaker-oracle")]` DER binaries and runs their
+      # hermetic falsifiability suites (no models). Replaces the former
+      # `-p speakerkit --features dia-oracle` invocation.
+      - run: crates/coremlit/tests/speaker/der_gate_inventory.sh
+
+  # Curated feature-combination matrix — replaces the former per-crate
+  # `cargo hack --each-feature` powerset with the explicit, reviewable list
+  # (each kit feature alone, each oracle combo, all-on, none) pinned in
+  # crates/coremlit/FEATURE_MAP.md and by the `feature_map` golden test. Runs
+  # each combo's hermetic tests; model-gated tests stay `#[ignore]`d here.
+  features:
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""                                                              # none: the bare core
+          - "whisper"
+          - "align"
+          - "speaker"
+          - "vad"
+          - "whisper,vad"                                                   # the silero_vad composition
+          - "align-oracle"
+          - "speaker-oracle"
+          - "vad-bundled"
+          - "whisper,align,speaker,vad,serde,tracing,nl-recognizer"         # all non-oracle
+          - "whisper,align-oracle,speaker-oracle,vad-bundled,serde,tracing,nl-recognizer"  # all-on
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: "cargo test (features: ${{ matrix.features }})"
+        run: |
+          if [ -z "${{ matrix.features }}" ]; then
+            cargo test
+          else
+            cargo test --features "${{ matrix.features }}"
+          fi
+
   model-tests:
     runs-on: macos-15
     timeout-minutes: 45
@@ -108,27 +128,22 @@ jobs:
             --local-dir Models/whisperkit-coreml
           hf download "$tokenizer_repo" "${tokenizer_files_arr[@]}" --revision "$tokenizer_revision" \
             --local-dir Models/tokenizers/whisper-tiny
-      # codex r6 F1: build.rs UN-ignores the fp16 graph sweep
+      # build.rs UN-ignores the fp16 graph sweep
       # (`every_shipped_model_graph_survives_fp16`) when Models/ is present, so
       # the `-- --ignored` (ignored-ONLY) runs below EXCLUDE it exactly when the
       # models are here — and the modelless `check` job skips it too (ignored
       # there). Run the coremlit sweep binary's ordinary suite here so a newly
-      # vanishing fp16 guard cannot merge green; the inventory proves the sweep
-      # is ordinary-not-ignored under cfg(models_present). NOTE: this runner
-      # downloads WHISPER ONLY (per MODELS_LOCK), so the sweep here audits the
-      # whisper graphs; the speakerkit/alignkit/argmax defect pins have no vendor
-      # present and are a local/dev gate.
-      # codex r6 F3: the fp16 sweep enforces a vendor manifest — every vendor
-      # named by a KNOWN_DEFECTS pin must be present, or deleting a whole vendor
-      # would silently disable its pins. This runner is WHISPER-ONLY, so declare
-      # that scope EXPLICITLY: COREMLIT_FP16_SWEEP_VENDORS narrows the manifest to
-      # the vendor actually downloaded here. The absent speakerkit/alignkit/argmax
-      # pins are NOT verified on CI — a local/dev gate with the full Models/ tree
-      # does that. The override is fail-closed (unset would demand EVERY pinned
-      # vendor), so narrowing coverage is an explicit, reviewable act here, never a
-      # silent skip. See the coverage-boundary note in
+      # vanishing fp16 guard cannot merge green. This runner downloads WHISPER
+      # ONLY (per MODELS_LOCK), so COREMLIT_FP16_SWEEP_VENDORS narrows the
+      # vendor manifest to the vendor actually present (fail-closed: unset would
+      # demand EVERY pinned vendor). fp16_guards is a core test — no feature
+      # needed. See the coverage-boundary note in
       # crates/coremlit/tests/fp16_guards.rs.
       - run: COREMLIT_FP16_SWEEP_VENDORS=whisperkit-coreml cargo test -p coremlit --test fp16_guards
       - run: crates/coremlit/tests/fp16_sweep_inventory.sh
+      # Core model-gated suite (tiny_model etc., whisper-tiny via
+      # WHISPERKIT_TEST_MODELS); then the whisper pipeline's model-gated suite.
+      # The align/speaker/vad model gates need models this runner does not
+      # download and stay local/dev gates, exactly as before the restructure.
       - run: cargo test -p coremlit -- --ignored
-      - run: cargo test -p whisperkit -- --ignored
+      - run: cargo test -p coremlit --features whisper -- --ignored
