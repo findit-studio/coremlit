@@ -37,6 +37,64 @@ pub fn text_model_path() -> PathBuf {
   models_dir().join("clap_text.mlmodelc")
 }
 
+/// Directory holding textclap's Xenova ONNX graphs — the T4 parity oracle
+/// (`tests/parity_textclap.rs`). Contains the quantized (int8-class) graphs
+/// `audio_model_quantized.onnx` / `text_model_quantized.onnx` that textclap
+/// ships, and optionally the fp32 unquantized `audio_model.onnx` /
+/// `text_model.onnx` used for the same-precision control.
+///
+/// Overridable via `CLAPKIT_TEXTCLAP_ONNX`; otherwise
+/// `<workspace>/Models/textclap-onnx` — gitignored, fetched dev-time from
+/// `Xenova/clap-htsat-unfused` revision `c28f2883…` (the exact revision textclap
+/// pins in `models/MODELS.md`).
+#[allow(dead_code)]
+pub fn textclap_onnx_dir() -> PathBuf {
+  std::env::var_os("CLAPKIT_TEXTCLAP_ONNX").map_or_else(
+    || {
+      PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("Models")
+        .join("textclap-onnx")
+    },
+    PathBuf::from,
+  )
+}
+
+/// Absolute path to a committed test fixture under `crates/clapkit/tests/fixtures`.
+#[allow(dead_code)]
+pub fn fixture_path(relative: &str) -> PathBuf {
+  PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    .join("tests")
+    .join("fixtures")
+    .join(relative)
+}
+
+/// Decode a 48 kHz mono WAV fixture into `f32` samples in `[-1, 1]`. Asserts the
+/// rate/channel contract so a mis-encoded fixture fails loudly rather than
+/// feeding the wrong geometry into the encoders. Mirrors textclap's integration
+/// reader so an identical `&[f32]` reaches both crates in the parity gate.
+#[allow(dead_code)]
+pub fn read_wav_48k_mono(path: &Path) -> Vec<f32> {
+  let mut reader =
+    hound::WavReader::open(path).unwrap_or_else(|e| panic!("open wav {path:?}: {e}"));
+  let spec = reader.spec();
+  assert_eq!(spec.sample_rate, 48_000, "fixture {path:?} must be 48 kHz");
+  assert_eq!(spec.channels, 1, "fixture {path:?} must be mono");
+  match spec.sample_format {
+    hound::SampleFormat::Int => {
+      let scale = 1.0 / (1_i64 << (spec.bits_per_sample - 1)) as f32;
+      reader
+        .samples::<i32>()
+        .map(|s| s.expect("decode i32 sample") as f32 * scale)
+        .collect()
+    }
+    hound::SampleFormat::Float => reader
+      .samples::<f32>()
+      .map(|s| s.expect("decode f32 sample"))
+      .collect(),
+  }
+}
+
 /// Lowercase-hex SHA-256 of a file's contents. Backs the `model_io` provenance
 /// pins.
 #[allow(dead_code)]
