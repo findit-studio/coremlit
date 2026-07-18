@@ -11,6 +11,7 @@ use coremlit::{ComputeUnits, DataType, Model, MultiArray};
 use crate::{
   embedding::{EMBEDDING_DIM, Embedding},
   error::{Error, Result},
+  window::{WindowEmbedding, WindowPlan},
 };
 
 pub use self::mel::{N_MELS, T_FRAMES, TARGET_SAMPLES};
@@ -211,6 +212,37 @@ impl AudioEncoder {
     let mut row = [0.0f32; EMBEDDING_DIM];
     embeds.copy_into::<f32>(&mut row)?;
     Embedding::from_slice_normalizing(&row)
+  }
+
+  /// Embeds a long clip as overlapped windows per `plan`, one
+  /// [`WindowEmbedding`] (embedding + its span + coverage) per
+  /// [`WindowSpan`](crate::window::WindowSpan).
+  ///
+  /// This is the long-audio pipeline entry: it slices `samples` at the plan's
+  /// offsets and runs [`Self::embed_window`] on each (which `repeatpad`s a short
+  /// tail to the fixed window). The per-window embeddings are RETURNED, not
+  /// hidden inside aggregation, so a caller can aggregate them with an
+  /// [`AggregatePolicy`](crate::aggregate::AggregatePolicy), score each window
+  /// ([`crate::score::score_windows`]), or both.
+  ///
+  /// Runs sequentially: [`coremlit::Model`] is `!Sync`, so windows share one
+  /// encoder on one thread (fan out with one [`AudioEncoder`] per worker for
+  /// parallelism).
+  ///
+  /// # Errors
+  /// [`Error::EmptyAudio`] if `samples` is empty; otherwise any error
+  /// [`Self::embed_window`] raises for a window.
+  pub fn embed_windows(&self, samples: &[f32], plan: &WindowPlan) -> Result<Vec<WindowEmbedding>> {
+    if samples.is_empty() {
+      return Err(Error::EmptyAudio);
+    }
+    let spans = plan.spans(samples.len());
+    let mut out = Vec::with_capacity(spans.len());
+    for span in spans {
+      let embedding = self.embed_window(&samples[span.start()..span.end()])?;
+      out.push(WindowEmbedding::new(embedding, span));
+    }
+    Ok(out)
   }
 }
 

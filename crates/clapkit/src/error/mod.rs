@@ -113,6 +113,27 @@ pub enum Error {
   /// Encoding text into token ids failed.
   #[error("failed to tokenize text: {0}")]
   Tokenize(#[source] tokenizers::Error),
+
+  /// An [`crate::aggregate::AggregatePolicy`] was asked to combine zero window
+  /// embeddings. Every policy needs at least one window to produce a direction;
+  /// the caller should skip aggregation (or handle the empty clip) instead.
+  #[error("cannot aggregate zero window embeddings")]
+  EmptyWindows,
+
+  /// An aggregation policy was configured with an out-of-range numeric
+  /// parameter (e.g. [`crate::aggregate::EmaRenormalized`]'s `alpha` outside the
+  /// finite `[0, 1]` range). Reported when the policy runs, so a serde-loaded
+  /// config with a bad value fails loudly at aggregation rather than silently
+  /// producing a skewed embedding.
+  #[error("invalid {policy} parameter `{param}` = {value}")]
+  InvalidPolicyParameter {
+    /// The policy type whose parameter was rejected.
+    policy: &'static str,
+    /// Name of the offending parameter.
+    param: &'static str,
+    /// The out-of-range value supplied.
+    value: f32,
+  },
 }
 
 #[cfg(test)]
