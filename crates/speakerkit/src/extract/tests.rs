@@ -845,6 +845,117 @@ fn diarize_online_default_options_drops_subsecond_slots() {
   );
 }
 
+/// A 1-chunk extraction that exercises the DEFAULT online duration gate
+/// (`min_speech_duration = 1.0 s`) with BOTH above- and sub-threshold activity, so
+/// the production duration bridge (`speech_duration = active_frame_count ×
+/// frames_sw.step`, `extract/mod.rs`) is LOAD-BEARING. With `F = 64` frames and the
+/// community-1 frame step `0.016875 s`, a fully-active slot is `64 × 0.016875 =
+/// 1.08 s ≥ 1.0` (above the gate), while a 20-frame slot is `0.3375 s < 1.0` (below
+/// it). Each surviving slot's embedding is an orthogonal one-hot 64-dim block
+/// (near-antipodal in cosine space), so a sub-threshold slot sits far from every
+/// existing centroid and therefore reaches the duration gate (Dropped) rather than
+/// matching an existing speaker:
+///
+/// | slot  | block | active frames | duration | outcome (default gate)              |
+/// |-------|-------|---------------|----------|-------------------------------------|
+/// | c0 s0 | 0 (A) | 64            | 1.08 s   | New speaker 1 → cluster 0           |
+/// | c0 s1 | 1 (B) | 20            | 0.3375 s | Dropped (< 1.0 s, orthogonal) → -2  |
+/// | c0 s2 | 2 (C) | 64            | 1.08 s   | New speaker 2 → cluster 1           |
+///
+/// So `hard_clusters == [[0, -2, 1]]`, `num_clusters == 2`. Timing is community-1
+/// (frames_sw step `0.016875 s`); chunk 0 lands at output frame 0, so
+/// `num_output_frames = F = 64` (the tight fit reconstruct requires). Under the
+/// BROKEN bridge (`speech_duration = 0.0`) every slot is `0 < 1.0`, no speaker is
+/// ever seeded, and every candidate drops → `[[-2, -2, -2]]` with an empty
+/// diarization.
+fn online_extraction_default_gate() -> Extraction {
+  const F: usize = 64;
+  const ABOVE: usize = 64; // active frames; 1.08 s ≥ the 1.0 s gate
+  const BELOW: usize = 20; // active frames; 0.3375 s < the 1.0 s gate
+  let seg_idx = |c: usize, f: usize, s: usize| (c * F + f) * SEG_NUM_SLOTS + s;
+  let mut segmentations = vec![0.0f64; F * SEG_NUM_SLOTS];
+  for f in 0..ABOVE {
+    segmentations[seg_idx(0, f, 0)] = 1.0; // s0: above threshold
+  }
+  for f in 0..BELOW {
+    segmentations[seg_idx(0, f, 1)] = 1.0; // s1: below threshold
+  }
+  for f in 0..ABOVE {
+    segmentations[seg_idx(0, f, 2)] = 1.0; // s2: above threshold
+  }
+
+  let mut raw_embeddings = vec![0.0f32; SEG_NUM_SLOTS * EMBEDDING_DIM];
+  let mut set_block = |s: usize, block: usize| {
+    let base = s * EMBEDDING_DIM;
+    raw_embeddings[(base + block * 64)..(base + (block + 1) * 64)].fill(1.0);
+  };
+  set_block(0, 0); // A
+  set_block(1, 1); // B (orthogonal to A)
+  set_block(2, 2); // C (orthogonal to A and B)
+
+  // Two clustered speakers active over every output frame (s1 is dropped and
+  // contributes no cluster); count == num_output_frames == F.
+  let count = vec![2u8; F];
+
+  Extraction {
+    raw_embeddings,
+    segmentations,
+    count,
+    num_chunks: 1,
+    num_frames_per_chunk: F,
+    num_output_frames: F,
+    chunks_sw: crate::window::chunk_sliding_window(&WindowOptions::new()),
+    frames_sw: crate::window::frame_sliding_window(),
+  }
+}
+
+#[test]
+fn diarize_online_default_gate_keeps_above_threshold_drops_below() {
+  // End-to-end proof that the production duration bridge is exercised (codex M2b):
+  // with the DEFAULT gate (1.0 s), the two 64-frame slots (1.08 s) MUST seed
+  // speakers and the 20-frame orthogonal slot (0.3375 s) MUST drop. The fence's
+  // production mutation `speech_duration = 0.0` makes every candidate sub-threshold
+  // — no speaker is ever seeded — collapsing hard_clusters to all-UNMATCHED and the
+  // diarization to empty, which fails every assertion here. (The sibling
+  // `..._default_options_drops_subsecond_slots` test above, all sub-threshold, stays
+  // green under that mutation — this test is what turns it red.)
+  let e = online_extraction_default_gate();
+  let out = e
+    .diarize_online(OnlineOptions::default())
+    .expect("online reconstruction succeeds on the default-gate fixture");
+
+  // Exact per-slot labels: above-threshold slots seed clusters 0 and 1 (feed order
+  // c0 s0 then s2); the sub-threshold orthogonal slot is dropped.
+  assert_eq!(
+    out.hard_clusters_slice(),
+    &[[0, -2, 1]],
+    "default-gate labels: above-threshold slots create speakers, the sub-second slot drops"
+  );
+  assert_eq!(out.num_clusters(), 2, "two above-threshold speakers");
+
+  // Exact span geometry: both surviving clusters are active over the whole output
+  // grid, so each yields ONE span. `try_discrete_to_spans` closes an
+  // active-through-end region at `start = start + i_start·step + duration/2` and
+  // `end = start + (N-1)·step + duration/2` (i_start = 0 here). Recomputing via the
+  // SAME formula off `frames_sw` keeps the assertion bit-exact without magic floats.
+  let fs = e.frames_sw();
+  let center_offset = fs.duration() / 2.0;
+  let n = e.num_output_frames() as f64;
+  let span_start = fs.start() + center_offset; // i_start = 0
+  let span_end = fs.start() + (n - 1.0) * fs.step() + center_offset;
+  let span_dur = span_end - span_start;
+  let got: Vec<(usize, f64, f64)> = out
+    .spans_slice()
+    .iter()
+    .map(|s| (s.cluster(), s.start(), s.duration()))
+    .collect();
+  assert_eq!(
+    got,
+    vec![(0, span_start, span_dur), (1, span_start, span_dur)],
+    "default-gate spans: exactly clusters 0 and 1, each spanning the full output grid"
+  );
+}
+
 // =====================================================================
 // Model-gated (all #[ignore]): requires local speakerkit models
 // (SPEAKERKIT_TEST_MODELS or Models/speakerkit/) plus the cross-crate

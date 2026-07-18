@@ -19,12 +19,31 @@
 //! id / new / dropped + the updated centroid) as JSON. Regenerate the committed
 //! trace with `swift run online_oracle > .../golden_online_swift/trace.json`.
 //!
+//! The oracle emits the Swift-attested `generator` block (constants incl.
+//! `durationBase`/`durationSpan`) but NOT `durationsFnv1a` — that field is
+//! Rust-computed provenance (the hash of the durations this harness regenerates
+//! from the very constants the `generator` block pins). After any regeneration,
+//! re-add it: run this test once, and it prints the correct hash in its failure
+//! message; paste that into the trace's `durationsFnv1a`.
+//!
 //! # The inputs are PROVEN identical, not assumed (the alignkit lesson)
-//! Before any decision is compared, the Rust-regenerated embedding sequence is
-//! FNV-1a-64 hashed (byte-identical to the Swift dumper's hash of the vectors it
-//! fed `SpeakerManager`) and asserted equal to the trace's recorded hash — a
-//! mismatch fails as a HARNESS bug (a drifted LCG), never as a clusterer
-//! finding.
+//! Before any decision is compared, BOTH clusterer inputs are proven identical to
+//! the Swift dumper's:
+//! - the Rust-regenerated **embedding** sequence is FNV-1a-64 hashed (byte-
+//!   identical to the Swift hash of the vectors it fed `SpeakerManager`) and
+//!   asserted equal to the trace's recorded `inputFnv1a`;
+//! - the **duration** sequence — the SECOND input to `assign`, which gates
+//!   New-vs-Dropped — is proven two ways: the trace's Swift-emitted `generator`
+//!   block (`durationBase`/`durationSpan`/`seed`/…) is asserted against the Rust
+//!   generator constants, and the regenerated durations are FNV-1a-64 hashed
+//!   against the committed `durationsFnv1a`. The embedding hash alone does NOT
+//!   cover durations: `DUR_BASE`/`DUR_SPAN` are affine constants applied to the
+//!   LCG draw's OUTPUT, so a change shifts every duration while leaving the LCG
+//!   progression (and thus the embedding hash) untouched — the hole that let a
+//!   fully-broken duration bridge still pass 48/48.
+//!
+//! Any mismatch fails as a HARNESS bug (a drifted LCG or duration constant),
+//! never as a clusterer finding.
 //!
 //! # Tie-freeness (the T4 caveat)
 //! Swift's nearest-match iterates a `Dictionary` in nondeterministic order and
@@ -141,9 +160,30 @@ struct SwiftStep {
   centroid: Option<Vec<f32>>,
 }
 
+/// The committed trace's `generator` block: the EXACT constants the Swift oracle
+/// drew its `(embedding, duration)` sequence from — Swift-emitted provenance.
+/// Asserting the Rust generator constants against these proves the two sides
+/// generated identical inputs, including the affine duration constants
+/// (`durationBase`/`durationSpan`) the embedding hash cannot observe.
+struct TraceGenerator {
+  seed: u64,
+  steps: usize,
+  prototypes: usize,
+  block: usize,
+  dim: usize,
+  noise_scale: f32,
+  duration_base: f32,
+  duration_span: f32,
+}
+
 /// The committed Swift trace.
 struct SwiftTrace {
   input_fnv1a: String,
+  /// FNV-1a-64 (hex) of the exact `[f32]` speech-duration sequence — the second
+  /// clusterer input, committed alongside the embedding `inputFnv1a` so a
+  /// duration drift is caught before any decision is read (codex M2a).
+  durations_fnv1a: String,
+  generator: TraceGenerator,
   speaker_threshold: f32,
   embedding_threshold: f32,
   min_speech_duration: f32,
@@ -166,6 +206,20 @@ fn load_trace() -> SwiftTrace {
   });
   let v: serde_json::Value = serde_json::from_slice(&bytes).expect("parse trace json");
   let f32_at = |val: &serde_json::Value| -> f32 { val.as_f64().expect("f64") as f32 };
+  let gen_v = &v["generator"];
+  let seed_hex = gen_v["seed"].as_str().expect("generator.seed hex string");
+  let generator = TraceGenerator {
+    seed: u64::from_str_radix(seed_hex.trim_start_matches("0x"), 16).expect("parse generator.seed"),
+    steps: gen_v["steps"].as_u64().expect("generator.steps") as usize,
+    prototypes: gen_v["prototypes"].as_u64().expect("generator.prototypes") as usize,
+    block: gen_v["blockSize"].as_u64().expect("generator.blockSize") as usize,
+    dim: gen_v["embeddingDim"]
+      .as_u64()
+      .expect("generator.embeddingDim") as usize,
+    noise_scale: f32_at(&gen_v["noiseScale"]),
+    duration_base: f32_at(&gen_v["durationBase"]),
+    duration_span: f32_at(&gen_v["durationSpan"]),
+  };
   let opts = &v["options"];
   let steps = v["steps"]
     .as_array()
@@ -183,6 +237,11 @@ fn load_trace() -> SwiftTrace {
     .collect();
   SwiftTrace {
     input_fnv1a: v["inputFnv1a"].as_str().expect("inputFnv1a").to_string(),
+    durations_fnv1a: v["durationsFnv1a"]
+      .as_str()
+      .expect("durationsFnv1a")
+      .to_string(),
+    generator,
     speaker_threshold: f32_at(&opts["speakerThreshold"]),
     embedding_threshold: f32_at(&opts["embeddingThreshold"]),
     min_speech_duration: f32_at(&opts["minSpeechDuration"]),
@@ -212,6 +271,57 @@ fn online_clusterer_matches_fluidaudio_swift_trace() {
     "the regenerated embedding sequence hashes differently from the Swift dumper's — the two \
      sides are NOT driving the clusterer with identical inputs; fix the LCG/generator before \
      reading any parity number"
+  );
+
+  // ── Duration input-match proof (codex M2a), also BEFORE any decision ──
+  // Durations are the SECOND input to `assign` and gate New-vs-Dropped. The
+  // embedding hash above does NOT cover them: DUR_BASE/DUR_SPAN are affine
+  // constants applied to the LCG draw's OUTPUT, so changing DUR_BASE shifts every
+  // duration while leaving the LCG progression (and the embedding hash) untouched
+  // — exactly why a broken production duration bridge could still pass 48/48.
+  // Two independent proofs close it:
+  //   (1) the committed `generator` block is Swift-emitted provenance; assert
+  //       every Rust generator constant against it, so a DUR_BASE/DUR_SPAN (or
+  //       seed/steps/…) drift on the Rust side fails against the oracle's own
+  //       recorded values;
+  //   (2) hash the regenerated duration values against the committed
+  //       `durationsFnv1a`, mirroring the embedding hash — this ALSO catches a
+  //       change to the duration FORMULA that leaves the constants intact.
+  let g = &trace.generator;
+  assert_eq!(
+    SEED, g.seed,
+    "SEED differs from the committed generator.seed"
+  );
+  assert_eq!(
+    STEPS, g.steps,
+    "STEPS differs from the committed generator.steps"
+  );
+  assert_eq!(
+    PROTOTYPES, g.prototypes,
+    "PROTOTYPES differs from generator.prototypes"
+  );
+  assert_eq!(BLOCK, g.block, "BLOCK differs from generator.blockSize");
+  assert_eq!(DIM, g.dim, "DIM differs from generator.embeddingDim");
+  assert_eq!(
+    NOISE_SCALE, g.noise_scale,
+    "NOISE_SCALE differs from generator.noiseScale"
+  );
+  assert_eq!(
+    DUR_BASE, g.duration_base,
+    "DUR_BASE differs from the committed generator.durationBase"
+  );
+  assert_eq!(
+    DUR_SPAN, g.duration_span,
+    "DUR_SPAN differs from the committed generator.durationSpan"
+  );
+
+  let durations: Vec<f32> = seq.iter().map(|(_, d)| *d).collect();
+  assert_eq!(
+    common::fnv_hex(common::fnv1a_f32(&durations)),
+    trace.durations_fnv1a,
+    "the regenerated speech-duration sequence hashes differently from the committed trace — the \
+     two sides are NOT feeding `assign` identical durations (a drifted DUR_BASE/DUR_SPAN or the \
+     duration formula); fix the generator before reading any parity number"
   );
 
   // ── The wiring under test: speakerkit's OnlineOptions::default() → dia. The
