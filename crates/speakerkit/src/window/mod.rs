@@ -8,7 +8,7 @@
 //! [`crate::segment::SegmentModel`]/[`crate::embed::EmbedModel`] chunk
 //! starts over a long recording, and [`count_from_segmentations`]
 //! aggregates the resulting per-chunk [`crate::segment::multilabel`]
-//! outputs into the per-output-frame `count` tensor dia's
+//! outputs into the per-output-frame `count` tensor diaric's
 //! `offline::OfflineInput::new` requires.
 //!
 //! # `SlidingWindow`: the visibility DECISION
@@ -21,23 +21,22 @@
 //! ONLY through its public `new`/`start`/`duration`/`step`/`with_start`/
 //! `with_duration`/`with_step` API (all `pub const fn`, `algo.rs:52-113`).
 //!
-//! `dia` is a runtime dependency now (its ort-free clustering surface,
+//! `diaric` is a runtime dependency (its ort-free clustering surface,
 //! `diaric::reconstruct` included, is always linked), but its
 //! `SlidingWindow` fields stay private, and this crate keeps its OWN
-//! public [`SlidingWindow`] as a stable, dia-version-independent
-//! boundary type rather than re-exporting dia's (the mirror-struct
-//! decision, retained from when `dia` was an optional feature: the
-//! crate's public geometry surface should not shift if dia's type
-//! moves). The decision (mirror-struct): this module defines its OWN
-//! [`SlidingWindow`] — same three private `f64` fields, same public
-//! `new`/accessor/builder surface, field-for-field and
-//! method-for-method identical to dia's — and adds `From` conversions
-//! in both directions, built entirely through dia's own public accessor
+//! public [`SlidingWindow`] as a stable, diaric-version-independent
+//! boundary type rather than re-exporting diaric's (the mirror-struct
+//! decision: the crate's public geometry surface should not shift if
+//! diaric's type moves). The decision (mirror-struct): this module
+//! defines its OWN [`SlidingWindow`] — same three private `f64` fields,
+//! same public `new`/accessor/builder surface, field-for-field and
+//! method-for-method identical to diaric's — and adds `From` conversions
+//! in both directions, built entirely through diaric's own public accessor
 //! API (its fields are private, so there is no other way to reach
 //! them). The conversions
 //! are lossless and infallible: both types are plain `(f64, f64, f64)`
 //! tuples underneath, `Copy`, with no invariants enforced at
-//! construction on EITHER side (dia's own `SlidingWindow::new` performs
+//! construction on EITHER side (diaric's own `SlidingWindow::new` performs
 //! no validation either — validation happens one layer up, at the
 //! aggregate/reconstruct function boundaries that consume a
 //! `SlidingWindow`; see [`count_from_segmentations`]'s own doc).
@@ -222,11 +221,11 @@
 //! exact bound, ported from dia's `ShapeError::OutputFrameCountOverflow`
 //! guard (`count.rs:504-509, 522-533`).
 //!
-//! ## Downstream re-validation: what dia actually re-checks
+//! ## Downstream re-validation: what diaric actually re-checks
 //!
 //! This function's output — the `count` tensor, plus
 //! [`chunk_sliding_window`]/[`frame_sliding_window`]'s `SlidingWindow`
-//! values — ultimately feeds dia's `offline::OfflineInput::new`. That
+//! values — ultimately feeds diaric's `offline::OfflineInput::new`. That
 //! constructor (`diarization/src/offline/algo.rs:216-248`) is a bare
 //! `pub const fn` performing ONLY field assignment: it validates
 //! NOTHING. The real re-validation happens one call further in, inside
@@ -389,7 +388,7 @@ impl SlidingWindow {
 /// "`SlidingWindow`: the visibility DECISION" section. Lossless and
 /// infallible: both types are unchecked `(f64, f64, f64)` tuples.
 ///
-/// Un-gated: `dia` is a runtime dependency now, and `diaric::reconstruct` is
+/// Un-gated: `diaric` is a runtime dependency, and `diaric::reconstruct` is
 /// part of its ort-free clustering surface, so this conversion is always
 /// available (it is what `Extraction::into_offline_input` feeds into
 /// `diaric::offline::diarize_offline`).

@@ -85,7 +85,7 @@
 //! use speakerkit::{ClusterBackend, OfflineOptions, OnlineOptions};
 //!
 //! // The default backend is the offline pyannote-community-1 pipeline with
-//! // dia's community-1 hyperparameters.
+//! // diaric's community-1 hyperparameters.
 //! assert_eq!(
 //!   ClusterBackend::default(),
 //!   ClusterBackend::Offline(OfflineOptions::default()),

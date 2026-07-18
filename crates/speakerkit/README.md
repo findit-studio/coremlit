@@ -580,10 +580,10 @@ see `tests/swift/regen_goldens.sh`.
   shown to be *correct*. Human-labelled benchmark RTTM (AMI, DIHARD) is not part
   of this repository, so "are we right?" is a question none of these gates
   answer. They answer "do we match the reference implementation?".
-- **`0.1.0` (unreleased), `publish = false`** until the optional `dia`
-  (`diarization`) git dependency has a registry version — an exact-rev git
-  dependency, like a path dependency, carries no version Cargo can publish
-  against.
+- **`0.1.0` (unreleased), `publish = false`** until the always-on `diaric`
+  (runtime) git dependency — and the optional `dia` (`diarization`) oracle —
+  has a registry version: an exact-rev git dependency, like a path dependency,
+  carries no version Cargo can publish against.
 
 ## See also
 

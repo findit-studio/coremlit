@@ -8,7 +8,7 @@
 //!
 //! Unlike `parity_e2e` / `parity_shipping_der` (which score against dia's
 //! `ort`-backed ONNX oracle and so need `dia-oracle`), this suite runs the
-//! entire pipeline — CoreML seg+embed via [`FluidAudioSource`] → dia's
+//! entire pipeline — CoreML seg+embed via [`FluidAudioSource`] → diaric's
 //! ort-free `diarize_offline` — with NO onnxruntime. That is the point: it
 //! demonstrates T1's thesis directly, that offline clustering is a runtime
 //! capability of the ort-free build, not a test-only harness step. `ort` never

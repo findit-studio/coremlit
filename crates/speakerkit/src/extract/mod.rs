@@ -1,5 +1,5 @@
 //! The extraction bridge: run segmentation + embedding over a whole clip
-//! and assemble the exact tensor set dia's offline diarizer consumes.
+//! and assemble the exact tensor set diaric's offline diarizer consumes.
 //!
 //! [`Extractor::extract`] is the composition layer over Tasks 2-4
 //! ([`crate::segment`], [`crate::embed`], [`crate::window`]): it ports the
@@ -9,7 +9,7 @@
 //! hands off to `diarize_offline`. Its output, [`Extraction`], exposes
 //! precisely `diaric::offline::OfflineInput::new`'s parameter list
 //! (`diarization/src/offline/algo.rs:206-227`) and converts into it
-//! directly (`Extraction::into_offline_input`) — `dia` is a runtime
+//! directly (`Extraction::into_offline_input`) — `diaric` is a runtime
 //! dependency, so that bridge (and the clustering it feeds) is always
 //! available.
 //!
@@ -365,7 +365,7 @@ impl Options {
   }
 }
 
-/// Runs segmentation + embedding over a clip and assembles dia's offline
+/// Runs segmentation + embedding over a clip and assembles diaric's offline
 /// tensor set (design spec §5). Holds only [`Options`] — the models
 /// themselves are passed to [`Self::extract`], so one `Extractor` can
 /// drive many `(SegmentModel, EmbedModel)` pairs.
@@ -402,7 +402,7 @@ impl Extractor {
 
   /// Runs the full extraction over `samples` (16 kHz mono f32) using the
   /// pre-loaded `seg` and `embed` models, producing the [`Extraction`]
-  /// dia's offline diarizer consumes.
+  /// diaric's offline diarizer consumes.
   ///
   /// Ports the data-plane of dia's `OwnedDiarizationPipeline::run`
   /// (`diarization/src/offline/owned.rs:361-697`) — see the module doc for
@@ -568,7 +568,7 @@ impl Extractor {
   }
 }
 
-/// The assembled dia offline-input tensor set produced by
+/// The assembled diaric offline-input tensor set produced by
 /// [`Extractor::extract`]. Its accessors expose exactly
 /// `diaric::offline::OfflineInput::new`'s parameter list (minus `plda`, which
 /// the consumer supplies) — see `Self::into_offline_input`.
@@ -689,18 +689,18 @@ impl Extraction {
   ///
   /// Fills `OfflineInput::new`'s 10-parameter signature verbatim (pinned
   /// at `diarization/src/offline/algo.rs:216-227`); the returned value
-  /// carries dia's community-1 hyperparameter defaults (`threshold = 0.6`
-  /// etc., `algo.rs:239-246`), each overridable via dia's own `with_*`
+  /// carries diaric's community-1 hyperparameter defaults (`threshold = 0.6`
+  /// etc., `algo.rs:239-246`), each overridable via diaric's own `with_*`
   /// builders on the returned value.
   ///
   /// `plda` is spelled `diaric::plda::PldaTransform` — dia exports it there
   /// (`diarization/src/plda/mod.rs:39`), NOT at its crate root, so the
   /// plan's `diaric::PldaTransform` shorthand is written out in full here.
-  /// The two [`SlidingWindow`] values convert into dia's own via
+  /// The two [`SlidingWindow`] values convert into diaric's own via
   /// [`crate::window`]'s `From` impls (`window/mod.rs`); `OfflineInput::new`
   /// takes `diaric::reconstruct::SlidingWindow` by value (`algo.rs:11,224-225`).
   ///
-  /// Un-gated: `dia` is a runtime dependency and `diaric::offline` is part of
+  /// Un-gated: `diaric` is a runtime dependency and `diaric::offline` is part of
   /// its ort-free clustering surface, so this bridge is always available.
   pub fn into_offline_input<'a>(
     &'a self,
@@ -721,7 +721,7 @@ impl Extraction {
   }
 
   /// Cluster this extraction into speaker-labelled RTTM spans at the DEFAULT
-  /// backend — [`ClusterBackend::default`], i.e. dia's offline
+  /// backend — [`ClusterBackend::default`], i.e. diaric's offline
   /// pyannote-community-1 pipeline with its community-1 hyperparameters. Exactly
   /// [`self.diarize_with(plda, ClusterBackend::default())`](Self::diarize_with).
   ///
@@ -730,9 +730,9 @@ impl Extraction {
   /// `into_offline_input → diarize_offline` (or re-selecting a backend) itself,
   /// so the public API and the tested path cannot diverge (the alignkit
   /// canonical-wiring lesson). Because [`ClusterBackend::default`] applies
-  /// dia's own defaults, the assembled [`diaric::offline::OfflineInput`] is
+  /// diaric's own defaults, the assembled [`diaric::offline::OfflineInput`] is
   /// field-identical to the bare [`Self::into_offline_input`], so this is
-  /// byte-identical to feeding dia directly.
+  /// byte-identical to feeding diaric directly.
   ///
   /// # Errors
   /// As [`Self::diarize_with`].
@@ -773,7 +773,7 @@ impl Extraction {
   /// community-1 PLDA projection ([`diaric::plda::PldaTransform`]); see
   /// [`Self::into_offline_input`] for how it threads through the bridge.
   ///
-  /// Un-gated: `dia` is a runtime dependency and `diaric::offline` is part of its
+  /// Un-gated: `diaric` is a runtime dependency and `diaric::offline` is part of its
   /// ort-free clustering surface, so this runs without `ort` (the `dia-oracle`
   /// test feature only adds dia's ONNX reference oracle, never a runtime
   /// requirement).
@@ -805,7 +805,7 @@ impl Extraction {
   }
 
   /// Cluster this extraction into speaker-labelled spans with the ONLINE
-  /// (streaming) engine — FluidAudio's greedy centroid matcher, ported in dia as
+  /// (streaming) engine — FluidAudio's greedy centroid matcher, ported in diaric as
   /// [`diaric::cluster::online::OnlineClusterer`] — tuned by
   /// [`OnlineOptions`]. This is
   /// [`Self::diarize_with`]'s [`ClusterBackend::Online`] route, exposed directly
@@ -836,7 +836,7 @@ impl Extraction {
   /// reconstruction the offline path uses ([`diaric::reconstruct::reconstruct`] →
   /// [`diaric::reconstruct::try_discrete_to_spans`]); only the cluster labels come
   /// from a different engine. The result is a [`diaric::offline::OfflineOutput`]
-  /// (the type name refers to dia's `offline` module, not the engine — here it
+  /// (the type name refers to diaric's `offline` module, not the engine — here it
   /// carries the online greedy assignment) with the speaker-labelled spans, the
   /// frame-level grid, and the per-chunk hard assignment.
   ///
@@ -847,7 +847,7 @@ impl Extraction {
   /// The online engine is order-dependent and its gate is parity with
   /// FluidAudio's Swift `SpeakerManager` (`tests/parity_online_swift.rs`), never
   /// DER against pyannote. See
-  /// [`OnlineOptions`] and dia's `cluster::online`.
+  /// [`OnlineOptions`] and diaric's `cluster::online`.
   ///
   /// # Errors
   /// Every failure routes through [`diaric::offline::Error::Reconstruct`]: a

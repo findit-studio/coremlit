@@ -38,7 +38,7 @@
 //! ICASSP 2023), and speaker clustering / VBx (Landini et al., "Bayesian
 //! HMM clustering of x-vector sequences (VBx) in speaker diarization",
 //! Computer Speech & Language 2022) — the last is irrelevant to speakerkit
-//! (clustering stays in `dia`, spec §3) but ships in the same README and is
+//! (clustering stays in `diaric`, spec §3) but ships in the same README and is
 //! reproduced here for completeness.
 //!
 //! # DECISION

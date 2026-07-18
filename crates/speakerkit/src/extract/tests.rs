@@ -484,7 +484,7 @@ fn options_serde_round_trips() {
 // =====================================================================
 // into_offline_input — the compile/borrow proof AND the field round-trip.
 // plda is hermetic (compile-time-embedded weights, transform.rs:341-379),
-// so this needs no model. `dia` is a runtime dependency now, so this runs
+// so this needs no model. `diaric` is a runtime dependency now, so this runs
 // in the ordinary (feature-free) unit suite.
 // =====================================================================
 
@@ -519,7 +519,7 @@ fn into_offline_input_round_trips_against_real_dia() {
   assert_eq!(input.num_output_frames(), e.num_output_frames());
 
   // SlidingWindow fields, compared through the public accessors on both
-  // sides (dia's OfflineInput returns dia's SlidingWindow by value).
+  // sides (diaric's OfflineInput returns diaric's SlidingWindow by value).
   let cs = input.chunks_sw();
   assert_eq!(cs.start(), e.chunks_sw().start());
   assert_eq!(cs.duration(), e.chunks_sw().duration());
@@ -635,7 +635,7 @@ fn diarize_with_offline_routes_the_backend_options() {
   // diarize_offline(opts.apply_to(into_offline_input)) — i.e. diarize_with
   // threads the variant's OfflineOptions, not ClusterBackend::default()'s. A
   // mutation that ignored `backend` (always using the default) would break this
-  // (the non-default knobs would not reach dia).
+  // (the non-default knobs would not reach diaric).
   let e = tiny_extraction();
   let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
   let opts = crate::cluster::OfflineOptions::new()

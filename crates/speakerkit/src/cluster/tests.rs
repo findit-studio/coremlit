@@ -1,10 +1,10 @@
 use super::*;
 
-/// A minimal, self-consistent dia [`OfflineInput`](diaric::offline::OfflineInput)
+/// A minimal, self-consistent diaric [`OfflineInput`](diaric::offline::OfflineInput)
 /// over caller-owned buffers (num_chunks=1, num_speakers=3, one frame, one
 /// output frame). Its data tensors are irrelevant to the default/`apply_to`
-/// pins — only its (dia-default) hyperparameters and passthrough matter — so
-/// the caller owns trivial zero buffers and this wires them into dia's
+/// pins — only its (diaric-default) hyperparameters and passthrough matter — so
+/// the caller owns trivial zero buffers and this wires them into diaric's
 /// constructor with the community-1 sliding windows.
 fn base_offline_input<'a>(
   raw: &'a [f32],
@@ -134,7 +134,7 @@ fn cluster_backend_is_copy() {
 }
 
 // =====================================================================
-// OfflineOptions defaults — pinned BOTH to the literal consts AND to dia's
+// OfflineOptions defaults — pinned BOTH to the literal consts AND to diaric's
 // OWN OfflineInput accessors, so a drift on EITHER side fails.
 // =====================================================================
 
@@ -226,7 +226,7 @@ fn offline_options_builders_and_setters() {
 
 #[test]
 fn threshold_fa_fb_builders_accept_non_finite_like_dia() {
-  // dia's OfflineInput::with_threshold/with_fa/with_fb range-check NOTHING;
+  // diaric's OfflineInput::with_threshold/with_fa/with_fb range-check NOTHING;
   // OfflineOptions mirrors that (only the serde boundary rejects non-finite for
   // these three). This pins the deliberate asymmetry with min_duration_off — if
   // a guard is ever added to one of these builders, it diverges from dia and
@@ -276,8 +276,8 @@ fn with_min_duration_off_accepts_zero_and_positive() {
 }
 
 // =====================================================================
-// apply_to — the single OfflineOptions → dia OfflineInput mapping. Hermetic,
-// ort-free (dia's PLDA weights are compile-time embedded).
+// apply_to — the single OfflineOptions → diaric OfflineInput mapping. Hermetic,
+// ort-free (diaric's PLDA weights are compile-time embedded).
 // =====================================================================
 
 #[test]
@@ -308,7 +308,7 @@ fn apply_to_maps_each_knob_to_its_dia_field() {
 
 #[test]
 fn apply_to_default_is_a_no_op_over_dia_defaults() {
-  // Applying the DEFAULT OfflineOptions re-writes each field with dia's own
+  // Applying the DEFAULT OfflineOptions re-writes each field with diaric's own
   // default value, leaving the input's hyperparameters unchanged — the property
   // `Extraction::diarize` relies on for byte-identical default clustering.
   let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
@@ -430,7 +430,7 @@ fn serde_serialize_rejects_non_finite_threshold_fa_fb() {
 #[test]
 fn serde_deserialize_rejects_negative_min_duration_off() {
   // finite_nonneg_f64 refuses a negative (finite) min_duration_off at the wire,
-  // closing the serde-bypass path into dia's with_min_duration_off panic.
+  // closing the serde-bypass path into diaric's with_min_duration_off panic.
   assert!(serde_json::from_str::<OfflineOptions>(r#"{"min_duration_off":-1.0}"#).is_err());
   assert!(
     serde_json::from_str::<ClusterBackend>(r#"{"offline":{"min_duration_off":-0.001}}"#).is_err()
@@ -728,7 +728,7 @@ fn serde_online_non_default_round_trips_without_silent_flip() {
 #[test]
 fn serde_online_rejects_non_finite_and_out_of_range_thresholds() {
   // Deserialize side: NaN / ±inf / >2 / <0 all refused for both thresholds,
-  // closing the serde-bypass path into dia's panicking threshold setter.
+  // closing the serde-bypass path into diaric's panicking threshold setter.
   assert!(serde_json::from_str::<OnlineOptions>(r#"{"speaker_threshold":2.5}"#).is_err());
   assert!(serde_json::from_str::<OnlineOptions>(r#"{"speaker_threshold":-0.1}"#).is_err());
   assert!(serde_json::from_str::<OnlineOptions>(r#"{"embedding_threshold":3.0}"#).is_err());
