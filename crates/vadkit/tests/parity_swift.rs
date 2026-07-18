@@ -43,6 +43,18 @@ const GATE_FIXTURES: &[&str] = &["02_pyannote_sample", "07_yuhewei_dongbei_engli
 /// perturbation the trace-mutation gate injects, so neither can hide under it.
 const TRACE_TOL: f64 = 1e-4;
 
+/// The pinned generator identity every committed golden must record: the Swift
+/// dumper that produced it (`DumpVadTraces.swift`). A golden whose `generator`
+/// differs was not produced by this crate's oracle harness.
+const GENERATOR: &str = "crates/vadkit/tests/swift/Tests/VadTraceDump/DumpVadTraces.swift";
+
+/// The pinned FluidAudio revision the committed goldens were generated against
+/// (`regen_goldens.sh` stamps `FLUIDAUDIO_REVISION` into each golden). The
+/// oracle's semantics are only guaranteed at this exact revision, so a golden
+/// regenerated from a different (or dirty/unknown) FluidAudio checkout is
+/// rejected rather than silently trusted.
+const FLUIDAUDIO_REVISION: &str = "1a2da18";
+
 /// One committed Swift chunk: its index, the unpadded sample count fed for it,
 /// and FluidAudio's speech probability.
 #[derive(Debug)]
@@ -70,13 +82,17 @@ struct SwiftGolden {
 /// malformation before a single fidelity number is compared (the speakerkit
 /// strict-loader lesson). Split out of [`load_swift_golden`] so the
 /// `strict_loader_*` tests can drive it with synthetic malformed JSON and no
-/// model. Guards, in order: every top-level field present and well-typed; a
-/// NON-EMPTY `chunks` array; `chunkCount == chunks.len()`; every chunk's
-/// `chunkIndex` equal to its position (contiguous `0..n`); every `probability`
-/// finite and in `[0, 1]` (the noisy-OR output range); every `unpaddedSamples`
-/// in `1..=chunkSize`, and exactly `chunkSize` for every chunk BUT the last
-/// (only the final chunk may be short) — a structural pin on the 4096-stride
-/// chunking itself.
+/// model. Guards, in order: every top-level field present and well-typed;
+/// ORACLE PROVENANCE — `fixture` matches the fixture being loaded, `generator`
+/// is the pinned [`GENERATOR`] dumper, `fluidAudioRevision` is the pinned
+/// [`FLUIDAUDIO_REVISION`], and `determinismVerified` (the generator's `Bool?`:
+/// present-and-true on the first fixture where determinism was measured, absent
+/// on the rest) is never present-but-false; a NON-EMPTY `chunks` array;
+/// `chunkCount == chunks.len()`; every chunk's `chunkIndex` equal to its
+/// position (contiguous `0..n`); every `probability` finite and in `[0, 1]`
+/// (the noisy-OR output range); every `unpaddedSamples` in `1..=chunkSize`, and
+/// exactly `chunkSize` for every chunk BUT the last (only the final chunk may
+/// be short) — a structural pin on the 4096-stride chunking itself.
 fn parse_golden(name: &str, v: &serde_json::Value) -> Result<SwiftGolden, String> {
   let str_field = |key: &str| -> Result<String, String> {
     v[key]
@@ -90,6 +106,42 @@ fn parse_golden(name: &str, v: &serde_json::Value) -> Result<SwiftGolden, String
       .map(|n| n as usize)
       .ok_or_else(|| format!("{name}: `{key}` missing or not a non-negative integer"))
   };
+
+  // Oracle provenance: this golden must be the RIGHT fixture's, from the pinned
+  // dumper, against the pinned FluidAudio revision — otherwise the fidelity
+  // numbers below are being trusted from an unknown source.
+  let fixture = str_field("fixture")?;
+  if fixture != name {
+    return Err(format!(
+      "{name}: `fixture` is {fixture:?}, expected {name:?} — golden loaded for the wrong fixture"
+    ));
+  }
+  let generator = str_field("generator")?;
+  if generator != GENERATOR {
+    return Err(format!(
+      "{name}: `generator` is {generator:?}, expected {GENERATOR:?} — golden not from the pinned dumper"
+    ));
+  }
+  let fluid_audio_revision = str_field("fluidAudioRevision")?;
+  if fluid_audio_revision != FLUIDAUDIO_REVISION {
+    return Err(format!(
+      "{name}: `fluidAudioRevision` is {fluid_audio_revision:?}, expected {FLUIDAUDIO_REVISION:?} \
+       — golden regenerated from an unintended FluidAudio revision"
+    ));
+  }
+  // `determinismVerified` is the generator's `Bool?`: present-and-true on the
+  // first fixture (where reproducibility was measured), absent (`null`) on the
+  // rest. Tolerate absence; reject a golden that records it present-but-not-true
+  // (the oracle's own reproducibility check did not pass).
+  match v.get("determinismVerified") {
+    None | Some(serde_json::Value::Null) | Some(serde_json::Value::Bool(true)) => {}
+    Some(other) => {
+      return Err(format!(
+        "{name}: `determinismVerified` is {other} — present but not `true`; the oracle's own \
+         reproducibility check did not pass"
+      ));
+    }
+  }
 
   let chunk_size = usize_field("chunkSize")?;
   let chunk_count = usize_field("chunkCount")?;
@@ -294,6 +346,10 @@ fn vad_probabilities_match_fluidaudio_swift_trace() {
 /// below fail for the reason named, not because the base was already broken.
 fn well_formed() -> serde_json::Value {
   serde_json::json!({
+    "fixture": "wf",
+    "generator": "crates/vadkit/tests/swift/Tests/VadTraceDump/DumpVadTraces.swift",
+    "fluidAudioRevision": "1a2da18",
+    "determinismVerified": true,
     "computeUnits": "cpu_only",
     "sampleRate": 16000,
     "chunkSize": 4096,
@@ -322,7 +378,7 @@ fn strict_loader_accepts_a_well_formed_golden() {
 fn strict_loader_rejects_chunk_count_mismatch() {
   let mut v = well_formed();
   v["chunkCount"] = serde_json::json!(3); // says 3, has 2
-  assert!(parse_golden("bad", &v).unwrap_err().contains("chunkCount"));
+  assert!(parse_golden("wf", &v).unwrap_err().contains("chunkCount"));
 }
 
 #[test]
@@ -330,21 +386,21 @@ fn strict_loader_rejects_empty_chunks() {
   let mut v = well_formed();
   v["chunks"] = serde_json::json!([]);
   v["chunkCount"] = serde_json::json!(0);
-  assert!(parse_golden("bad", &v).unwrap_err().contains("empty"));
+  assert!(parse_golden("wf", &v).unwrap_err().contains("empty"));
 }
 
 #[test]
 fn strict_loader_rejects_non_contiguous_chunk_index() {
   let mut v = well_formed();
   v["chunks"][1]["chunkIndex"] = serde_json::json!(5); // should be 1
-  assert!(parse_golden("bad", &v).unwrap_err().contains("contiguous"));
+  assert!(parse_golden("wf", &v).unwrap_err().contains("contiguous"));
 }
 
 #[test]
 fn strict_loader_rejects_probability_out_of_range() {
   let mut v = well_formed();
   v["chunks"][0]["probability"] = serde_json::json!(1.5);
-  assert!(parse_golden("bad", &v).unwrap_err().contains("[0, 1]"));
+  assert!(parse_golden("wf", &v).unwrap_err().contains("[0, 1]"));
 }
 
 #[test]
@@ -352,11 +408,7 @@ fn strict_loader_rejects_non_finite_probability() {
   let mut v = well_formed();
   // JSON has no NaN literal; a string is simply "not a number" here.
   v["chunks"][0]["probability"] = serde_json::json!("NaN");
-  assert!(
-    parse_golden("bad", &v)
-      .unwrap_err()
-      .contains("not a number")
-  );
+  assert!(parse_golden("wf", &v).unwrap_err().contains("not a number"));
 }
 
 #[test]
@@ -364,7 +416,7 @@ fn strict_loader_rejects_short_non_final_chunk() {
   let mut v = well_formed();
   v["chunks"][0]["unpaddedSamples"] = serde_json::json!(100); // non-final, must be full
   assert!(
-    parse_golden("bad", &v)
+    parse_golden("wf", &v)
       .unwrap_err()
       .contains("only the final chunk may be short")
   );
@@ -374,12 +426,77 @@ fn strict_loader_rejects_short_non_final_chunk() {
 fn strict_loader_rejects_oversize_unpadded_samples() {
   let mut v = well_formed();
   v["chunks"][1]["unpaddedSamples"] = serde_json::json!(4097); // > chunkSize
-  assert!(parse_golden("bad", &v).unwrap_err().contains("1..="));
+  assert!(parse_golden("wf", &v).unwrap_err().contains("1..="));
 }
 
 #[test]
 fn strict_loader_rejects_missing_field() {
   let mut v = well_formed();
   v["inputFnv1a"] = serde_json::Value::Null;
-  assert!(parse_golden("bad", &v).unwrap_err().contains("inputFnv1a"));
+  assert!(parse_golden("wf", &v).unwrap_err().contains("inputFnv1a"));
+}
+
+#[test]
+fn strict_loader_rejects_wrong_fixture() {
+  // The golden must be the one for the fixture being loaded: a copy-pasted or
+  // misnamed golden (right shape, wrong clip) is rejected.
+  let v = well_formed(); // its `fixture` is "wf"
+  assert!(
+    parse_golden("02_pyannote_sample", &v)
+      .unwrap_err()
+      .contains("wrong fixture")
+  );
+}
+
+#[test]
+fn strict_loader_rejects_wrong_generator() {
+  let mut v = well_formed();
+  v["generator"] = serde_json::json!("some/other/tool.py");
+  assert!(
+    parse_golden("wf", &v)
+      .unwrap_err()
+      .contains("pinned dumper")
+  );
+}
+
+#[test]
+fn strict_loader_rejects_wrong_fluidaudio_revision() {
+  // Regenerated from an unintended (or dirty/unknown) FluidAudio checkout.
+  let mut v = well_formed();
+  v["fluidAudioRevision"] = serde_json::json!("deadbee");
+  assert!(
+    parse_golden("wf", &v)
+      .unwrap_err()
+      .contains("FluidAudio revision")
+  );
+}
+
+#[test]
+fn strict_loader_rejects_determinism_verified_false() {
+  // Absent is tolerated (non-first fixtures), but a golden that records the
+  // oracle's own reproducibility check as FAILED must be rejected.
+  let mut v = well_formed();
+  v["determinismVerified"] = serde_json::json!(false);
+  assert!(
+    parse_golden("wf", &v)
+      .unwrap_err()
+      .contains("determinismVerified")
+  );
+}
+
+#[test]
+fn strict_loader_tolerates_absent_determinism_verified() {
+  // The generator emits `determinismVerified` only on the FIRST fixture and
+  // leaves it `null`/absent on the rest (e.g. `07_yuhewei_dongbei_english`), so
+  // absence must parse — only a present-but-not-true value is a violation.
+  let mut absent = well_formed();
+  absent["determinismVerified"] = serde_json::Value::Null;
+  parse_golden("wf", &absent).expect("absent determinismVerified must be tolerated");
+
+  let mut missing = well_formed();
+  missing
+    .as_object_mut()
+    .unwrap()
+    .remove("determinismVerified");
+  parse_golden("wf", &missing).expect("missing determinismVerified must be tolerated");
 }
