@@ -44,7 +44,12 @@ pub fn text_model_path() -> PathBuf {
 /// `text_model.onnx` used for the same-precision control.
 ///
 /// Overridable via `CLAPKIT_TEXTCLAP_ONNX`; otherwise
-/// `<workspace>/Models/textclap-onnx` — gitignored, fetched dev-time from
+/// `<workspace>/Models/textclap-onnx/onnx`. The Hugging Face Hub **preserves the
+/// repository structure** under `--local-dir`, so `hf download
+/// Xenova/clap-htsat-unfused --include "onnx/*model*.onnx" --local-dir
+/// Models/textclap-onnx` lands the graphs under the `onnx/` subdirectory — the
+/// default resolves straight to it (and the README's `CLAPKIT_TEXTCLAP_ONNX`
+/// example points at the same `onnx/` path). Gitignored, fetched dev-time from
 /// `Xenova/clap-htsat-unfused` revision `c28f2883…` (the exact revision textclap
 /// pins in `models/MODELS.md`).
 #[allow(dead_code)]
@@ -55,6 +60,7 @@ pub fn textclap_onnx_dir() -> PathBuf {
         .join("../..")
         .join("Models")
         .join("textclap-onnx")
+        .join("onnx")
     },
     PathBuf::from,
   )

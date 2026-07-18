@@ -17,8 +17,10 @@
 //! 1.0. A **same-precision control** runs the identical comparison against
 //! Xenova's **unquantized fp32** graphs (`audio_model.onnx` / `text_model.onnx`,
 //! which Xenova also ships): its cosine is higher, and the gap between the two
-//! bands is the **quantization contribution** — measured, not asserted away. If
-//! the fp32 graphs are absent the control is skipped (documented absence).
+//! bands is the **quantization contribution** — measured, not asserted away. The
+//! control is `#[ignore]`d, so it never runs in a default `cargo test`; but once
+//! FORCED (`--ignored`, the parity suite the README documents) it is fail-closed —
+//! an absent fp32 oracle is a hard failure, never a green in-`#[test]` skip.
 //!
 //! Both crates receive the **identical** `&[f32]` (audio) or `&str` (text); the
 //! mel front-end and tokenizer are the same ported/pinned artifacts (T2/T3
@@ -148,10 +150,13 @@ fn text_parity_vs_textclap_quantized() {
 #[test]
 #[ignore = "requires clapkit models + textclap UNQUANTIZED fp32 ONNX (same-precision control)"]
 fn audio_parity_vs_textclap_fp32_control() {
-  if !textclap_onnx("audio_model.onnx").exists() {
-    eprintln!("SKIP: audio_model.onnx (fp32 control) absent — documented absence");
-    return;
-  }
+  assert!(
+    textclap_onnx("audio_model.onnx").exists(),
+    "fp32-control oracle `audio_model.onnx` absent under CLAPKIT_TEXTCLAP_ONNX ({:?}). The README \
+     marks the fp32 control load-bearing, so a FORCED run must not green-skip it — fetch the \
+     unquantized Xenova ONNX (README 'Test models') or don't force this #[ignore]d test.",
+    common::textclap_onnx_dir()
+  );
   let fp32 = audio_parity_worst("audio_model.onnx", "fp32");
   let quant = audio_parity_worst("audio_model_quantized.onnx", "quant");
   // The de-quantized oracle must agree at least as well as the quantized one:
@@ -174,10 +179,13 @@ fn audio_parity_vs_textclap_fp32_control() {
 #[test]
 #[ignore = "requires clapkit models + textclap UNQUANTIZED fp32 ONNX (same-precision control)"]
 fn text_parity_vs_textclap_fp32_control() {
-  if !textclap_onnx("text_model.onnx").exists() {
-    eprintln!("SKIP: text_model.onnx (fp32 control) absent — documented absence");
-    return;
-  }
+  assert!(
+    textclap_onnx("text_model.onnx").exists(),
+    "fp32-control oracle `text_model.onnx` absent under CLAPKIT_TEXTCLAP_ONNX ({:?}). The README \
+     marks the fp32 control load-bearing, so a FORCED run must not green-skip it — fetch the \
+     unquantized Xenova ONNX (README 'Test models') or don't force this #[ignore]d test.",
+    common::textclap_onnx_dir()
+  );
   let fp32 = text_parity_worst("text_model.onnx", "fp32");
   let quant = text_parity_worst("text_model_quantized.onnx", "quant");
   println!(

@@ -185,15 +185,26 @@ models are present.
 | Artifact | Env override | Default path | Fetch |
 |---|---|---|---|
 | clapkit CoreML | `CLAPKIT_TEST_MODELS` | `<workspace>/Models/clapkit` | `hf download FinDIT-Studio/clapkit-coreml --local-dir Models/clapkit` |
-| textclap ONNX (parity oracle) | `CLAPKIT_TEXTCLAP_ONNX` | `<workspace>/Models/textclap-onnx` | `hf download Xenova/clap-htsat-unfused --include "onnx/*model*.onnx" --revision c28f2883575e590e04d3146ff0713c2448d691ba --local-dir Models/textclap-onnx` |
+| textclap ONNX (parity oracle) | `CLAPKIT_TEXTCLAP_ONNX` | `<workspace>/Models/textclap-onnx/onnx` | `hf download Xenova/clap-htsat-unfused --include "onnx/*model*.onnx" --revision c28f2883575e590e04d3146ff0713c2448d691ba --local-dir Models/textclap-onnx` |
+
+The `hf download` command fetches **both** the quantized (`*_quantized.onnx`) and the
+unquantized fp32 (`audio_model.onnx` / `text_model.onnx`) pairs. Hugging Face
+**preserves the repo structure** under `--local-dir`, so the graphs land under
+`Models/textclap-onnx/onnx/` — which is exactly the default lookup and the
+`CLAPKIT_TEXTCLAP_ONNX` value below (point the env var at the `onnx/` subdirectory,
+not its parent). The fp32 pair is load-bearing: the fp32-control tests are
+`#[ignore]`d but **fail closed** when forced, so a parity run that is missing the
+unquantized graphs errors rather than silently skipping.
 
 ```sh
 # Model-gated hermetic gates (I/O pins, placement, e2e pipeline):
 CLAPKIT_TEST_MODELS=Models/clapkit cargo test -p clapkit -- --ignored
 
 # The parity gate additionally needs the textclap oracle + its ONNX (the
-# quantized pair is required; the fp32 pair enables the same-precision control):
-CLAPKIT_TEST_MODELS=Models/clapkit CLAPKIT_TEXTCLAP_ONNX=Models/textclap-onnx \
+# quantized pair drives the primary bands; the fp32 pair is the load-bearing
+# same-precision control — both fetched by the `hf download` above). Point the
+# env var at the `onnx/` subdirectory the download creates:
+CLAPKIT_TEST_MODELS=Models/clapkit CLAPKIT_TEXTCLAP_ONNX=Models/textclap-onnx/onnx \
   cargo test -p clapkit --features parity-oracle --test parity_textclap -- --ignored
 ```
 
