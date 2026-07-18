@@ -67,6 +67,14 @@ name = "tokenizer_identity_textclap"
 path = "tests/tokenizer_identity_textclap.rs"
 required-features = ["parity-oracle"]
 
+# The T4 model-level parity gate drives textclap's real inference (its Xenova
+# ONNX via `ort`), so — like the tokenizer oracle above — it builds only under
+# `parity-oracle`. Model-gated on top of that (`#[ignore]`).
+[[test]]
+name = "parity_textclap"
+path = "tests/parity_textclap.rs"
+required-features = ["parity-oracle"]
+
 [dev-dependencies]
 npyz.workspace = true
 hound.workspace = true
