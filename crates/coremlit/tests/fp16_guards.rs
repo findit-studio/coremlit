@@ -843,6 +843,32 @@ const WHISPER_MEL: &str = r#"
             tensor<fp16, [80, 3000]> log_0_cast_fp16 = log(epsilon = log_0_epsilon_0_to_fp16, x = mel_spec_cast_fp16)[name = tensor<string, []>("log_0_cast_fp16")];
 "#;
 
+/// The SECOND clean control (design spec §4 fp16 lens; vendor `vadkit`).
+/// `Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc/model.mil`,
+/// lines 120-127 — the STFT power-to-magnitude of the FluidInference unified
+/// Silero VAD graph. `sqrt(real^2 + imag^2 + 0x1p-24)`: the same discipline as
+/// whisper's mel above, an explicit `add(x, 0x1p-24)` at exactly fp16's
+/// smallest subnormal, this time feeding a `sqrt` rather than a `log`. Silero
+/// VAD is why `vadkit` joins the sweep: the graph is `Mixed(Float16, Float32)`
+/// and repeats this guarded `sqrt` at all eight STFT sites, so the sweep must
+/// prove they SURVIVE (they do) rather than assume it. The graph carries no
+/// `log`, `rsqrt`, `real_div` or norm anywhere, and its output is a noisy-OR of
+/// sigmoids bounded in `[0, 1]`, so there is no vanishing-guard site to pin —
+/// `vadkit` is a clean vendor with NO `KNOWN_DEFECTS` entry, exactly like
+/// whisper-mel. Pinning this excerpt keeps the checker's "a `sqrt` floored by a
+/// surviving `add` is clean" reading from rotting into a false finding (or a
+/// missed one, if the add's constant were ever misread).
+const VADKIT_STFT_SQRT: &str = r#"
+            tensor<fp16, []> var_201_promoted_to_fp16 = const()[name = tensor<string, []>("op_201_promoted_to_fp16"), val = tensor<fp16, []>(0x1p+1)];
+            tensor<fp16, [1, 129, 4]> var_227_cast_fp16 = pow(x = var_222_cast_fp16, y = var_201_promoted_to_fp16)[name = tensor<string, []>("op_227_cast_fp16")];
+            tensor<fp16, []> var_201_promoted_1_to_fp16 = const()[name = tensor<string, []>("op_201_promoted_1_to_fp16"), val = tensor<fp16, []>(0x1p+1)];
+            tensor<fp16, [1, 129, 4]> var_228_cast_fp16 = pow(x = var_225_cast_fp16, y = var_201_promoted_1_to_fp16)[name = tensor<string, []>("op_228_cast_fp16")];
+            tensor<fp16, [1, 129, 4]> var_229_cast_fp16 = add(x = var_227_cast_fp16, y = var_228_cast_fp16)[name = tensor<string, []>("op_229_cast_fp16")];
+            tensor<fp16, []> var_230_to_fp16 = const()[name = tensor<string, []>("op_230_to_fp16"), val = tensor<fp16, []>(0x1p-24)];
+            tensor<fp16, [1, 129, 4]> var_231_cast_fp16 = add(x = var_229_cast_fp16, y = var_230_to_fp16)[name = tensor<string, []>("op_231_cast_fp16")];
+            tensor<fp16, [1, 129, 4]> input_3_cast_fp16 = sqrt(x = var_231_cast_fp16)[name = tensor<string, []>("input_3_cast_fp16")];
+"#;
+
 /// Two INDEPENDENT sub-threshold guard constants on ONE `log` site: an
 /// `add(x, 0x1p-25)` floor feeding a `log(eps = 0x1p-25)`. Each constant is
 /// `2^-25` — exactly HALF fp16's smallest subnormal — so each rounds to zero in
@@ -1148,6 +1174,41 @@ fn accepts_whisperkits_mel_guard() {
     !log.is_decomposed_log_softmax(),
     "it logs a mel spectrogram, not a softmax"
   );
+}
+
+/// The second control. vadkit's Silero VAD graph guards its STFT
+/// power-to-magnitude `sqrt` with an explicit `add(x, 0x1p-24)` — exactly
+/// fp16's smallest subnormal — so it survives, and the gate must say so. A
+/// `sqrt` floored by a surviving `add` is the clean counterpart of PLDA's
+/// `clip(1e-12) -> sqrt` finding: the checker distinguishes them by the floor's
+/// magnitude, and this pins that it reads the surviving one as clean. vadkit is
+/// a clean vendor with no `KNOWN_DEFECTS` pin (see `VADKIT_STFT_SQRT`).
+#[test]
+fn accepts_vadkits_stft_sqrt_guard() {
+  assert_eq!(
+    vanishing(VADKIT_STFT_SQRT),
+    Vec::<String>::new(),
+    "vadkit's STFT add(x, 0x1p-24) -> sqrt is exactly at the fp16 floor and survives"
+  );
+
+  let graph = parse_mil(VADKIT_STFT_SQRT);
+  let audit = graph.audit();
+  assert!(
+    audit.unresolved.is_empty(),
+    "the real vadkit STFT excerpt must parse completely: {:?}",
+    audit.unresolved
+  );
+  let sqrt = audit
+    .findings
+    .iter()
+    .find(|f| f.op == "sqrt")
+    .expect("a sqrt site");
+  assert_eq!(sqrt.eps, 0.0, "sqrt carries no epsilon of its own");
+  assert_eq!(
+    sqrt.floor, FP16_MIN_SUBNORMAL,
+    "the guard is the preceding add(0x1p-24), not any epsilon on the sqrt"
+  );
+  assert!(sqrt.survives_fp16());
 }
 
 /// F3: two independently-materialized guard constants, each `2^-25` (half fp16's

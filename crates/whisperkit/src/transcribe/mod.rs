@@ -89,7 +89,7 @@ use crate::{
     self, TranscriptionProgressCallback,
     sampler::{self, GreedyTokenSampler},
   },
-  error::{DecodeError, ModelError, TranscribeError},
+  error::{DecodeError, ModelError, TranscribeError, VadError},
   model::{ModelVariant, detect_variant, manager::ModelManager},
   options::{DecodingOptions, Options},
   result::{
@@ -1558,12 +1558,36 @@ where
     if options.chunking_strategy().is_vad() && audio.len() > window_samples {
       let vad_chunker = chunker::VadChunker::new();
       let clip_ranges = chunker::prepare_seek_clips(options.clip_timestamps_slice(), audio.len())?;
+      // Snapshot the detector's monotonic hard-failure generation before
+      // driving it. Comparing this across chunking — rather than draining a
+      // shared error slot — is what keeps the check correct when the detector
+      // is shared across concurrent `transcribe` calls: no other run can clear
+      // a failure this one is about to observe (see
+      // `VoiceActivityDetector::detection_generation`).
+      let detection_generation = self.vad_detector.detection_generation();
       let chunks = vad_chunker.chunk_all(
         self.vad_detector.as_ref(),
         audio,
         window_samples,
         &clip_ranges,
       );
+      // The detector is infallible per frame (`voice_activity -> Vec<bool>`),
+      // so a hard model/runtime failure during chunking latches inside it
+      // rather than surfacing — bumping that generation. If it advanced, a
+      // swallowed VAD failure produced degraded chunk boundaries (speech
+      // misread as silence), so fail the whole transcription with a typed
+      // `VadError` instead of returning an `Ok` transcript off a
+      // silently-corrupted segmentation. The generation is the authority on
+      // *whether* to fail; `last_detection_error` only supplies the detail,
+      // which a concurrent run may have raced in to read (and, for a
+      // destructive detector, clear) — so fail closed even if it is `None`.
+      if self.vad_detector.detection_generation() != detection_generation {
+        let source = self
+          .vad_detector
+          .last_detection_error()
+          .unwrap_or_else(|| "hard model inference failure during VAD chunking".into());
+        return Err(TranscribeError::Vad(VadError::Detection(source)));
+      }
       let chunk_options = options.clone().with_clip_timestamps(Vec::new());
 
       // One [`TaskFacts`] sink shared across every chunk: `TranscribeTask::run`

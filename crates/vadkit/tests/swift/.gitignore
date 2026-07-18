@@ -1,0 +1,6 @@
+# SwiftPM build products / resolution state for the oracle package. The
+# oracle's INPUTS (Package.swift, the dumper, regen_goldens.sh) and its
+# OUTPUTS (../fixtures/golden_swift/*.json) are committed; nothing in
+# between is.
+.build/
+Package.resolved
