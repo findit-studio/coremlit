@@ -207,16 +207,25 @@ impl AggregatePolicy for CoverageWeightedMean {
 /// [`Self::into_policy`] converts a deserialized value into the trait object the
 /// pipeline runs.
 ///
-/// # Golden-enum contract
+/// # Golden-enum contract (what the tests actually force)
 ///
-/// The wire spelling of every variant is pinned by a wildcard-free golden test
-/// (`serde` feature): each representative in the test-only `REPRESENTATIVES` roster serializes
-/// to a pinned JSON literal and round-trips, and a non-`snake_case` spelling must
-/// not deserialize. Adding a variant forces both that test's match and
-/// [`Self::into_policy`]'s match to grow (neither has a `_` arm), so a variant
-/// cannot be half-added — the same lockstep guarantee alignkit's
-/// `define_alignment_fallback!` gives, adapted for the struct-carrying
-/// [`Self::EmaRenormalized`] a fieldless-spelling macro can't express.
+/// A wildcard-free golden test (`serde` feature) serializes each representative
+/// in the test-only `REPRESENTATIVES` roster to a pinned JSON literal, round-trips
+/// it, and rejects a non-`snake_case` spelling. Two exhaustive, no-`_` matches
+/// stop a new variant being added half-way in the ways that matter at runtime:
+///
+/// - [`Self::into_policy`] has no `_` arm, so a new variant fails to compile until
+///   it is dispatched to a policy.
+/// - The golden test's `match kind` has no `_` arm, so a new variant fails to
+///   compile until its expected JSON literal is written.
+///
+/// What is **not** compiler-enforced is roster completeness: the round-trip
+/// iterates the hand-maintained test-only `REPRESENTATIVES` slice, so *executing* a
+/// new variant's round-trip still requires adding it there (keep it complete).
+/// This is weaker than alignkit's `define_alignment_fallback!`, which
+/// co-generates the enum and its roster in one macro; the struct-carrying
+/// [`Self::EmaRenormalized`] is why the roster is hand-written here, so its
+/// completeness is a maintained invariant rather than a compile-time guarantee.
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
@@ -247,8 +256,10 @@ impl AggregatePolicyKind {
     }
   }
 
-  /// One representative per variant, in declaration order — the roster the
-  /// golden serde test iterates so a new variant must pin its wire form.
+  /// One representative per variant, in declaration order — the hand-maintained
+  /// roster the golden serde round-trip iterates. Keep it complete: the golden
+  /// test's exhaustive `match` forces a new variant's expected JSON to be written,
+  /// but only a roster entry here makes that variant's round-trip actually run.
   #[cfg(all(test, feature = "serde"))]
   pub(crate) const REPRESENTATIVES: &'static [Self] = &[
     Self::MeanRenormalized,
