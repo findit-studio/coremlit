@@ -39,6 +39,34 @@ fn describe_renders_shape_and_dtype() {
   assert_eq!(describe(&[1, 512], None), "[1, 512] none");
 }
 
+/// `embed_window` accepts `1..=TARGET_SAMPLES` and rejects an over-length clip
+/// with [`Error::AudioTooLong`] (naming `embed_windows`) instead of silently
+/// head-truncating it. Gated at the `check_window_len` seam so it needs no model.
+///
+/// Mutation tripwire: relaxing the bound (`>` → `>=`, or `TARGET_SAMPLES` →
+/// `TARGET_SAMPLES + 1`) makes the over-length case pass, and dropping the guard
+/// re-admits the silent-truncation defect.
+#[test]
+fn check_window_len_rejects_over_length_only() {
+  // The exact window and anything shorter are accepted.
+  assert!(check_window_len(TARGET_SAMPLES).is_ok());
+  assert!(check_window_len(TARGET_SAMPLES - 1).is_ok());
+  assert!(check_window_len(1).is_ok());
+  // One sample past the window is rejected, and the error carries len + limit and
+  // points the caller at the long-audio path.
+  let err = check_window_len(TARGET_SAMPLES + 1).unwrap_err();
+  let msg = err.to_string();
+  assert!(
+    matches!(err, Error::AudioTooLong { len, max } if len == TARGET_SAMPLES + 1 && max == TARGET_SAMPLES),
+    "expected AudioTooLong{{ len: {}, max: {TARGET_SAMPLES} }}, got {err:?}",
+    TARGET_SAMPLES + 1
+  );
+  assert!(
+    msg.contains("embed_windows"),
+    "AudioTooLong should name the long-audio path: {msg}"
+  );
+}
+
 #[cfg(feature = "serde")]
 #[test]
 fn options_serde_roundtrip() {

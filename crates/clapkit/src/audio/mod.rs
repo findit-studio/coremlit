@@ -166,14 +166,19 @@ impl AudioEncoder {
 
   /// Embeds one audio window into a unit-norm [`Embedding`].
   ///
-  /// `samples` is 48 kHz mono. Any non-empty length is accepted: the mel
-  /// front-end `repeatpad`s (or head-truncates) it to the model's fixed
-  /// [`TARGET_SAMPLES`] window exactly as HF's `ClapFeatureExtractor` does. The
-  /// long-audio pipeline (a later task) produces properly-hopped 480 000-sample
-  /// windows; this method is the per-window primitive.
+  /// `samples` is 48 kHz mono and must be `1..=`[`TARGET_SAMPLES`] long. A
+  /// shorter clip is `repeatpad`ed up to the fixed 480 000-sample window (exactly
+  /// as HF's `ClapFeatureExtractor` does); a **longer** clip is rejected with
+  /// [`Error::AudioTooLong`] rather than silently head-truncated. This is the
+  /// per-window primitive — feed a longer clip to [`Self::embed_windows`] (the
+  /// long-audio pipeline), which hops it into 480 000-sample windows first. (HF is
+  /// configured for `rand_trunc`, so head-truncating here would be neither
+  /// deterministic nor HF-faithful; clapkit will not truncate behind your back.)
   ///
   /// # Errors
   /// [`Error::EmptyAudio`] if `samples` is empty.
+  /// [`Error::AudioTooLong`] if `samples.len()` exceeds [`TARGET_SAMPLES`] (use
+  /// [`Self::embed_windows`] for long audio).
   /// [`Error::NonFiniteInput`] if any sample is NaN/infinite (it would
   /// otherwise propagate through the mel into a garbage embedding).
   /// [`Error::Tensor`] / [`Error::Prediction`] on a tensor or CoreML failure.
@@ -184,6 +189,7 @@ impl AudioEncoder {
     if samples.is_empty() {
       return Err(Error::EmptyAudio);
     }
+    check_window_len(samples.len())?;
     if let Some(index) = first_non_finite(samples) {
       return Err(Error::NonFiniteInput { index });
     }
@@ -255,6 +261,21 @@ fn describe(shape: &[usize], dtype: Option<DataType>) -> String {
 /// Flat index of the first non-finite (NaN/±∞) sample, if any.
 fn first_non_finite(samples: &[f32]) -> Option<usize> {
   samples.iter().position(|v| !v.is_finite())
+}
+
+/// Reject a per-window sample count over [`TARGET_SAMPLES`]. The mel front-end
+/// maps exactly one 480 000-sample window per inference, so an over-length clip
+/// is a caller error ([`Error::AudioTooLong`]) — it must be hopped into windows
+/// by [`AudioEncoder::embed_windows`], never silently head-truncated. Empty input
+/// is rejected separately by the caller ([`Error::EmptyAudio`]).
+fn check_window_len(len: usize) -> Result<()> {
+  if len > TARGET_SAMPLES {
+    return Err(Error::AudioTooLong {
+      len,
+      max: TARGET_SAMPLES,
+    });
+  }
+  Ok(())
 }
 
 #[cfg(test)]
