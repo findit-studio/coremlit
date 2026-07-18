@@ -70,6 +70,26 @@ pub enum Error {
   #[error("audio input is empty")]
   EmptyAudio,
 
+  /// [`AudioEncoder::embed_window`](crate::AudioEncoder::embed_window) received
+  /// more than [`TARGET_SAMPLES`](crate::audio::TARGET_SAMPLES) samples. That
+  /// method embeds exactly one fixed 480 000-sample window, so a longer clip must
+  /// be hopped into windows by
+  /// [`AudioEncoder::embed_windows`](crate::AudioEncoder::embed_windows) (the
+  /// long-audio pipeline) rather than silently head-truncated: HF's
+  /// `ClapFeatureExtractor` is configured for `rand_trunc`, so truncating a longer
+  /// clip here would be both non-deterministic and unfaithful to HF, which clapkit
+  /// refuses to do behind the caller's back.
+  #[error(
+    "audio window has {len} samples, over the {max}-sample per-window limit; use \
+     `AudioEncoder::embed_windows` for long audio"
+  )]
+  AudioTooLong {
+    /// Number of samples the caller supplied.
+    len: usize,
+    /// The per-window limit ([`TARGET_SAMPLES`](crate::audio::TARGET_SAMPLES)).
+    max: usize,
+  },
+
   /// The caller passed an empty text string; there is nothing to embed.
   #[error("text input is empty")]
   EmptyText,
