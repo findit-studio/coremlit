@@ -158,7 +158,7 @@ impl From<InferError> for silero::Error {
 }
 
 /// One-shot offline speech detection over the CoreML backend: the CoreML
-/// counterpart to [`silero::detect_speech`] (which runs the bundled ONNX
+/// counterpart to `silero::detect_speech` (which runs the bundled ONNX
 /// backend). Chunks `samples` into 4096-sample (256 ms) frames, runs `backend`
 /// once per frame, and applies silero's segmentation rules — a pure forward to
 /// [`silero::detect_speech_with`], authoring nothing.
