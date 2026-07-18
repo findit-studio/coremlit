@@ -1162,28 +1162,47 @@ fn diarize_online_over_cap_grid_is_a_typed_reconstruct_error_not_an_oom() {
   );
 }
 
-/// An online extraction of `num_chunks` chunks whose EVERY slot carries an
-/// identical all-ones (hence normalizable) embedding, active across all `F`
-/// frames. Under `speaker_threshold = 0` (cosine `distance >= 0` is never
-/// `< 0`, so the greedy match never fires) and `min_speech_duration = 0`
-/// (every `duration >= 0` clears the spawn gate), EVERY slot spawns a brand-new
-/// global speaker regardless of similarity — the ONLY shape that can push the
-/// online path past `MAX_CLUSTER_ID + 1 = 1024` speakers. (`{±e_i}` distinct far
-/// vectors cap at `2 * EMBEDDING_DIM = 512`, so `many_cluster_online_extraction`
-/// cannot reach the id ceiling.) Feed order is chunk-major then slot-major, so
-/// slot `g = c*SEG_NUM_SLOTS + s` seeds global speaker `g + 1` → 0-based label
-/// `g`. `F` is tiny: the cap fires in the assign loop long before reconstruct.
-fn all_new_online_extraction(num_chunks: usize) -> Extraction {
+/// An online extraction whose FIRST `num_speakers` slots — in feed order
+/// (chunk-major then slot-major) — each carry an identical all-ones (hence
+/// normalizable) embedding active across all `F` frames, with every remaining
+/// tail slot left zero (a zero embedding row `normalize_from` rejects, so the
+/// slot stays UNMATCHED and spawns no speaker). Under `speaker_threshold = 0`
+/// (cosine `distance >= 0` is never `< 0`, so the greedy match never fires) and
+/// `min_speech_duration = 0` (every `duration >= 0` clears the spawn gate),
+/// EVERY active slot spawns a brand-new global speaker regardless of similarity
+/// — the ONLY shape that can drive the online path to an arbitrary global count.
+/// (`{±e_i}` distinct far vectors cap at `2 * EMBEDDING_DIM = 512`, so
+/// `many_cluster_online_extraction` cannot reach the id ceiling.) Feed order
+/// makes active slot `g = c*SEG_NUM_SLOTS + s` seed global speaker `g + 1` →
+/// 0-based label `g`, so the labels are exactly `0..num_speakers` over
+/// `num_chunks = ceil(num_speakers / SEG_NUM_SLOTS)` chunks; a partial final
+/// chunk's trailing slots are the dropped remainder. `F` is tiny so reconstruct
+/// stays cheap.
+///
+/// `nan_cell = Some((c, ff, s))` overwrites one `segmentations` cell with
+/// `f64::NAN` AFTER the offline `count` is computed (`count_from_segmentations`
+/// itself panics on a non-finite cell). A NaN is not `> 0.0`, so it merely
+/// drops that one frame from slot `s`'s activity — the slot still spawns its
+/// New — but it is the poison `reconstruct` rejects as `NonFinite(Segmentations)`
+/// BEFORE it checks the cluster-id cap, which is what separates an early in-loop
+/// cap from a late reconstruct rejection.
+fn all_new_online_extraction(
+  num_speakers: usize,
+  nan_cell: Option<(usize, usize, usize)>,
+) -> Extraction {
   const F: usize = 4;
+  let num_chunks = num_speakers.div_ceil(SEG_NUM_SLOTS);
   let mut segmentations = vec![0.0f64; num_chunks * F * SEG_NUM_SLOTS];
-  // Every slot: a non-zero (all-ones) row `normalize_from` keeps, active on
-  // every frame. Identical rows are fine — threshold 0 makes each one a New.
-  let raw_embeddings = vec![1.0f32; num_chunks * SEG_NUM_SLOTS * EMBEDDING_DIM];
-  for c in 0..num_chunks {
-    for s in 0..SEG_NUM_SLOTS {
-      for ff in 0..F {
-        segmentations[(c * F + ff) * SEG_NUM_SLOTS + s] = 1.0;
-      }
+  let mut raw_embeddings = vec![0.0f32; num_chunks * SEG_NUM_SLOTS * EMBEDDING_DIM];
+  for g in 0..num_speakers {
+    let c = g / SEG_NUM_SLOTS;
+    let s = g % SEG_NUM_SLOTS;
+    // All-ones row: nonzero → `normalize_from` keeps it. Rows are identical,
+    // but `speaker_threshold = 0` still makes each active slot a New.
+    let base = (c * SEG_NUM_SLOTS + s) * EMBEDDING_DIM;
+    raw_embeddings[base..base + EMBEDDING_DIM].fill(1.0);
+    for ff in 0..F {
+      segmentations[(c * F + ff) * SEG_NUM_SLOTS + s] = 1.0;
     }
   }
   // Same geometry rationale as the other online fixtures: reconstruct ignores
@@ -1191,6 +1210,9 @@ fn all_new_online_extraction(num_chunks: usize) -> Extraction {
   let chunks_sw = crate::window::chunk_sliding_window(&WindowOptions::new())
     .with_duration((F as f64 - 1.0) * crate::window::FRAME_STEP_S);
   let frames_sw = crate::window::frame_sliding_window();
+  // Offline count from the CLEAN segmentations — `count_from_segmentations`
+  // panics on a non-finite cell — THEN plant the sentinel, so only `reconstruct`
+  // (reached via `diarize_online`) ever validates the NaN.
   let count = crate::window::count_from_segmentations(
     &segmentations,
     num_chunks,
@@ -1200,6 +1222,9 @@ fn all_new_online_extraction(num_chunks: usize) -> Extraction {
     chunks_sw,
     frames_sw,
   );
+  if let Some((c, ff, s)) = nan_cell {
+    segmentations[(c * F + ff) * SEG_NUM_SLOTS + s] = f64::NAN;
+  }
   Extraction::from_parts(
     raw_embeddings,
     segmentations,
@@ -1212,31 +1237,41 @@ fn all_new_online_extraction(num_chunks: usize) -> Extraction {
 }
 
 #[test]
-fn diarize_online_caps_at_reconstruction_ceiling_with_early_typed_error() {
-  // The finding's sibling cap, seeded economically. `speaker_threshold = 0` and
-  // `min_speech_duration = 0` are BOTH accepted by OnlineOptions' validation
-  // (finiteness / finite-non-negative), yet together they make the online
-  // clusterer spawn a NEW speaker for EVERY active slot. Once 1024 speakers
-  // exist, the next speaker's 0-based label `id - 1` would exceed diaric's
-  // `MAX_CLUSTER_ID` (1023); pre-cap the loop labelled on unboundedly and let
-  // `reconstruct` reject late (O(N^2) scan / O(N) heap growth first). The guard
-  // now returns that IDENTICAL typed `HardClustersIdAboveMax` the moment the
-  // 1025th speaker would be labelled, from INSIDE the assign loop.
+fn diarize_online_early_cap_not_late_reconstruction_rejection() {
+  // The finding's sibling cap, seeded economically AND strengthened to catch
+  // guard REMOVAL (not merely re-observe the error the old uncapped code also
+  // returned). `speaker_threshold = 0` and `min_speech_duration = 0` are BOTH
+  // accepted by OnlineOptions' validation (finiteness / finite-non-negative),
+  // yet together they make the online clusterer spawn a NEW speaker for EVERY
+  // active slot. Once 1024 speakers exist (labels 0..=1023), the 1025th's
+  // 0-based label 1024 would exceed diaric's `MAX_CLUSTER_ID` (1023); the guard
+  // returns the typed `HardClustersIdAboveMax` the moment that 1025th speaker
+  // would be labelled, from INSIDE the assign loop — before building the count
+  // or running `reconstruct`.
   //
-  // Structural early-return proof (no wall-clock timing assertion): the fixture
-  // has 400 * 3 = 1200 active slots — far past the 1024 ceiling — but the guard
-  // `return`s at the 1025th New (feed-order slot g = 1024, i.e. chunk 341 slot
-  // 1), so the trailing 175 slots are NEVER assigned and `reconstruct` NEVER
-  // runs. At most 1024 speakers are ever LABELLED, and this assertion is
-  // reachable ONLY via that early return.
-  const NUM_CHUNKS: usize = 400;
+  // The NaN sentinel is what distinguishes an EARLY in-loop cap from the LATE
+  // reconstruct rejection the old uncapped code produced. `reconstruct`
+  // validates segmentation finiteness (`NonFinite(Segmentations)`) BEFORE the
+  // cluster-id cap (reconstruct/algo.rs: finiteness scan, then the id-range
+  // check). The NaN sits in chunk 350 — AFTER chunk 341 slot 1, the feed-order
+  // slot g = 1024 where the 1025th New is created — so it is reached ONLY if the
+  // loop fails to stop at the cap:
+  //   • WITH the guard: `diarize_online` returns at that 1025th New, never
+  //     builds the count and never calls `reconstruct`, so the NaN is never
+  //     validated → `HardClustersIdAboveMax`.
+  //   • WITHOUT the guard: the loop runs all 1200 slots and hands the
+  //     NaN-bearing segmentations to `reconstruct`, which rejects the NaN FIRST
+  //     → `NonFinite(Segmentations)`, a DIFFERENT variant → this assertion reds.
+  // (Mutation-verified while authoring: deleting the early return flips the
+  // observed error to `NonFinite(Segmentations)` and this test fails.)
+  const NUM_SPEAKERS: usize = 1200; // 400 chunks × 3 slots, all New
   let ceiling = diaric::reconstruct::MAX_CLUSTER_ID as usize + 1;
   assert!(
-    NUM_CHUNKS * SEG_NUM_SLOTS > ceiling,
-    "fixture ({} slots) must exceed the {ceiling}-speaker ceiling to reach the cap",
-    NUM_CHUNKS * SEG_NUM_SLOTS
+    NUM_SPEAKERS > ceiling,
+    "fixture ({NUM_SPEAKERS} speakers) must exceed the {ceiling}-speaker ceiling to reach the cap"
   );
-  let e = all_new_online_extraction(NUM_CHUNKS);
+  // Poison one cell in chunk 350 (> chunk 341, where the 1025th New is created).
+  let e = all_new_online_extraction(NUM_SPEAKERS, Some((350, 0, 0)));
 
   let opts = OnlineOptions::default()
     .with_speaker_threshold(0.0)
@@ -1252,7 +1287,45 @@ fn diarize_online_caps_at_reconstruction_ceiling_with_early_typed_error() {
         diaric::reconstruct::ShapeError::HardClustersIdAboveMax
       ))
     ),
-    "expected an EARLY Reconstruct(Shape(HardClustersIdAboveMax)) from the assign-loop cap, got {err:?}"
+    "expected an EARLY Reconstruct(Shape(HardClustersIdAboveMax)) from the assign-loop cap \
+     (removing the guard surfaces NonFinite(Segmentations) from the planted NaN instead), got {err:?}"
+  );
+}
+
+#[test]
+fn diarize_online_accepts_exactly_max_cluster_id_plus_one_speakers() {
+  // Boundary companion to the over-ceiling cap above: EXACTLY
+  // `MAX_CLUSTER_ID + 1 = 1024` New speakers (labels 0..=1023) must SUCCEED. The
+  // guard fires on `id - 1 > MAX_CLUSTER_ID`, and the 1024th New's label 1023 is
+  // NOT `> 1023`, so no speaker is ever rejected. This test reds under a
+  // `>` → `>=` mutation of the guard: `>=` would reject that 1024th speaker with
+  // `HardClustersIdAboveMax`, and this `Ok` would fail.
+  // (Mutation-verified while authoring: `>=` turns this into that error.)
+  //
+  // `reconstruct` must accept the 1024-wide grid: with F = 4 and the default 1 s
+  // chunk step the grid is `num_output_frames × 1024` ≈ 2.07e7 cells, far under
+  // diaric's `MAX_RECONSTRUCT_GRID_CELLS` (4e8); and `try_discrete_to_spans`
+  // caps at `num_clusters > MAX_CLUSTER_ID + 1`, so exactly 1024 passes. The
+  // tail slots of the partial final chunk (342 = ceil(1024/3)) are dropped.
+  let ceiling = diaric::reconstruct::MAX_CLUSTER_ID as usize + 1;
+  assert_eq!(
+    ceiling, 1024,
+    "diaric's reconstruction ceiling is MAX_CLUSTER_ID + 1"
+  );
+  let e = all_new_online_extraction(ceiling, None);
+
+  let out = e
+    .diarize_online(
+      OnlineOptions::default()
+        .with_speaker_threshold(0.0)
+        .with_min_speech_duration(0.0),
+    )
+    .expect("exactly MAX_CLUSTER_ID + 1 speakers sit ON the ceiling and must reconstruct");
+
+  assert_eq!(
+    out.num_clusters(),
+    ceiling,
+    "every one of the 1024 all-New slots keeps its own cluster (labels 0..=1023)"
   );
 }
 
