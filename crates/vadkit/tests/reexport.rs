@@ -49,6 +49,27 @@ const FORBIDDEN_DETECTION_TOKENS: &[&str] = &[
   "> threshold",
 ];
 
+/// Structural float-comparison shapes a hand-rolled probability threshold would
+/// introduce — `p >= 0.5`, `p > 0.35`, `p < 0.35` — which are harder to alias
+/// than the vocabulary above (they catch the fence's `p >= 0.5` bypass that
+/// [`FORBIDDEN_DETECTION_TOKENS`] misses). The leading space keeps `->` return
+/// arrows from matching. Forbidden in vadkit's backend / re-export production
+/// layer, where any float comparison IS authored thresholding; the model module
+/// (its finite / contract checks) and test files (probability assertions)
+/// legitimately compare floats and are allowlisted by
+/// [`may_compare_floats`].
+const FORBIDDEN_FLOAT_COMPARISONS: &[&str] = &[" >= 0.", " > 0.", " <= 0.", " < 0."];
+
+/// Whether `rel` (a `vadkit/src`-relative path) is allowed to compare floats:
+/// the model module's finite / contract checks and any test file's probability
+/// assertions. Everywhere else — `backend.rs`, `lib.rs`, `error/mod.rs`, the
+/// re-export/backend layer — a float comparison would be smuggled-in detection
+/// logic and is forbidden by [`FORBIDDEN_FLOAT_COMPARISONS`].
+fn may_compare_floats(rel: &std::path::Path) -> bool {
+  let s = rel.to_string_lossy();
+  s.contains("model") || s.ends_with("tests.rs")
+}
+
 /// Collects every `.rs` file under `dir`, recursively.
 fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
   for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {dir:?}: {e}")) {
@@ -64,8 +85,13 @@ fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
 /// **THE NO-DUPLICATION GATE** (spec §2-§3, plan T5): vadkit's `src/` authors no
 /// thresholding / hysteresis / segment-assembly logic — all of it stays
 /// single-homed in `silero`, and vadkit only implements the backend seam and
-/// re-exports the detector surface. Scans every source file for
-/// [`FORBIDDEN_DETECTION_TOKENS`].
+/// re-exports the detector surface. Two layers per source file: the
+/// [`FORBIDDEN_DETECTION_TOKENS`] vocabulary, plus the
+/// [`FORBIDDEN_FLOAT_COMPARISONS`] structural check (a probability threshold
+/// outside the model module — harder to alias than the vocabulary). This grep
+/// is the FIRST, cheap layer; [`reexport_detect_speech_with_is_bit_identical_to_silero`]
+/// is the complementary equivalence proof that catches an aliased
+/// re-implementation this grep could still miss.
 #[test]
 fn src_authors_no_detection_logic() {
   let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -79,6 +105,8 @@ fn src_authors_no_detection_logic() {
 
   let mut violations = Vec::new();
   for file in &files {
+    let rel = file.strip_prefix(&src).unwrap_or(file);
+    let floats_allowed = may_compare_floats(rel);
     let text = std::fs::read_to_string(file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
     for (lineno, line) in text.lines().enumerate() {
       // Scan CODE only, not prose: the claim is that vadkit AUTHORS no
@@ -93,10 +121,25 @@ fn src_authors_no_detection_logic() {
         if code.contains(token) {
           violations.push(format!(
             "{}:{} authors segmentation logic (token `{token}`): {}",
-            file.strip_prefix(&src).unwrap_or(file).display(),
+            rel.display(),
             lineno + 1,
             line.trim(),
           ));
+        }
+      }
+      // Second layer: a float comparison outside the model module is a
+      // hand-rolled probability threshold the vocabulary list can miss.
+      if !floats_allowed {
+        for token in FORBIDDEN_FLOAT_COMPARISONS {
+          if code.contains(token) {
+            violations.push(format!(
+              "{}:{} compares a float outside the model module (token `{token}`) — a \
+               hand-rolled probability threshold belongs single-homed in `silero`: {}",
+              rel.display(),
+              lineno + 1,
+              line.trim(),
+            ));
+          }
         }
       }
     }
@@ -256,6 +299,45 @@ fn reexport_bridges_backend_error_through_backend_variant() {
     "backend error must bridge through silero::Error::Backend, got {error:?}"
   );
   assert_eq!(error.to_string(), "mock predict failure");
+}
+
+/// **THE EQUIVALENCE GATE** (hermetic, spec §2-§3): the behavioural complement
+/// to the no-duplication grep. Drives the SAME scripted inputs through vadkit's
+/// re-exported [`detect_speech_with`] and silero's OWN
+/// [`silero::detect_speech_with`], requiring the segment vectors bit-for-bit
+/// identical. It pins the re-export BY BEHAVIOUR, not vocabulary: today
+/// `vadkit::detect_speech_with` IS `silero::detect_speech_with` (a `pub use`),
+/// so they agree trivially — but if a future change replaced the re-export with
+/// a hand-rolled threshold loop in vadkit (e.g. `p >= 0.5` plus an aliased
+/// `S::new(..)` that the grep's vocabulary could miss), the two paths would
+/// diverge and this turns red.
+///
+/// Mutation: shadow the `detect_speech_with` re-export in `vadkit/src/lib.rs`
+/// with any locally-authored function → these comparisons go red.
+#[test]
+fn reexport_detect_speech_with_is_bit_identical_to_silero() {
+  let scenarios: &[Vec<f32>] = &[
+    vec![0.9, 0.9, 0.9, 0.0, 0.0],           // closes one segment
+    vec![0.9, 0.9, 0.9, 0.0],                // holds open to end-of-stream
+    vec![0.0, 0.0, 0.9, 0.9, 0.9, 0.9, 0.0], // starts mid-stream
+    vec![0.0; 6],                            // all silence
+    vec![0.9; 6],                            // all speech
+    vec![0.9, 0.0, 0.9, 0.0, 0.9, 0.0, 0.9], // alternating
+  ];
+  for probs in scenarios {
+    let samples = vec![0.0_f32; probs.len() * CHUNK_SAMPLES];
+    let mut backend_vadkit = MockVadBackend::new(probs.clone());
+    let mut backend_silero = MockVadBackend::new(probs.clone());
+    let via_vadkit = detect_speech_with(&mut backend_vadkit, &samples, SpeechOptions::default())
+      .expect("vadkit re-export");
+    let via_silero =
+      silero::detect_speech_with(&mut backend_silero, &samples, SpeechOptions::default())
+        .expect("silero direct");
+    assert_eq!(
+      via_vadkit, via_silero,
+      "vadkit::detect_speech_with must equal silero::detect_speech_with bit-for-bit on {probs:?}"
+    );
+  }
 }
 
 // ── 3. End-to-end model-gated detect on real audio (two-sided pins) ──────────
