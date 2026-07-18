@@ -151,7 +151,9 @@ mod serde_tests {
 
   #[test]
   fn kind_wire_spellings_are_pinned_and_round_trip() {
-    // Wildcard-free match: a new variant must pin its JSON here (F3 tripwire).
+    // Wildcard-free `match`: a new variant fails to compile until its expected
+    // JSON is written here. Executing that variant's round-trip additionally
+    // needs a `REPRESENTATIVES` entry — the hand-kept roster this loop iterates.
     for &kind in AggregatePolicyKind::REPRESENTATIVES {
       let expected = match kind {
         AggregatePolicyKind::MeanRenormalized => r#""mean_renormalized""#.to_string(),
