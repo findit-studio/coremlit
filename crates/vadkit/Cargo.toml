@@ -36,7 +36,7 @@ thiserror.workspace = true
 # Pinned to the 0.5.0 seam by git REV; RE-PIN to `silero = "0.5.0"` (a released
 # version dep, no git) once it publishes (spec §8.3) — which does not change
 # this no-`ort`, logic-only posture.
-silero = { git = "https://github.com/Findit-AI/silero", rev = "80f78c1a514f5c4e423e2a8d04d3b853b37079a0", default-features = false }
+silero = { git = "https://github.com/Findit-AI/silero", rev = "9ad65749ada4da40a9086d528b12501f0b383791", default-features = false }
 
 [dev-dependencies]
 hound.workspace = true
@@ -54,7 +54,7 @@ sha2.workspace = true
 # dep above (bumped from the crates.io 0.4.0 T4 used, since the seam's
 # `SpeechSegmenter`/`detect_speech_with` are 0.5.0 additions); RE-PIN to
 # `silero = { version = "0.5.0", features = ["bundled"] }` once it publishes.
-silero = { git = "https://github.com/Findit-AI/silero", rev = "80f78c1a514f5c4e423e2a8d04d3b853b37079a0", default-features = false, features = ["bundled"] }
+silero = { git = "https://github.com/Findit-AI/silero", rev = "9ad65749ada4da40a9086d528b12501f0b383791", default-features = false, features = ["bundled"] }
 
 [lints]
 workspace = true
