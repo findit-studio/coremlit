@@ -917,16 +917,90 @@ impl Extraction {
       }
     }
 
-    // The SAME reconstruction the offline path runs — only the cluster labels
-    // came from the online engine instead of AHC→VBx. `reconstruct` derives its
-    // own cluster count from `hard_clusters` + `count`.
+    // The online path CANNOT reuse `self.count`. `self.count` is the
+    // segmentation-derived count of active LOCAL slots per frame
+    // (`count_from_segmentations`), but the online engine can DROP a slot
+    // (`Assignment::Dropped` leaves it UNMATCHED, in no cluster) and can COLLIDE
+    // two local slots onto ONE global cluster, so `self.count[t]` can EXCEED the
+    // number of distinct global clusters active at frame `t`. Offline `reconstruct`
+    // treats its count as an injective per-cluster count: it sets `num_clusters =
+    // max(num_clusters_from_hard, max(count))` and its top-K binarize marks exactly
+    // `count[t]` clusters active by descending activation — so any `count[t]` above
+    // the real cluster count selects a zero-activation PADDED column and emits a
+    // phantom speaker/span. (The offline path is safe: its `count` and
+    // `hard_clusters` come from the SAME pyannote assignment, so the injective
+    // assumption holds.) Derive the count from the CLUSTERED segmentation instead,
+    // guaranteeing `max(online_count) <= num_clusters_from_hard` so no padded column
+    // can exist.
+    //
+    // `num_clusters_from_hard = (max non-negative label) + 1`, matching diaric's own
+    // `max_cluster + 1` (reconstruct/algo.rs); UNMATCHED (-2) slots are excluded.
+    let num_clusters_from_hard = hard_clusters
+      .iter()
+      .flatten()
+      .filter(|&&k| k >= 0)
+      .max()
+      .map_or(0, |&k| k as usize + 1);
+    let online_count = if num_clusters_from_hard == 0 {
+      // Every slot was dropped: `reconstruct` early-returns an all-zero grid
+      // (`max_cluster < 0`) BEFORE it reads `count`, so the value is unused here —
+      // but it must still be a correctly-sized (`num_output_frames`) slice.
+      vec![0u8; self.num_output_frames]
+    } else {
+      // Clustered segmentation, shape `num_chunks × num_frames_per_chunk ×
+      // num_clusters_from_hard` (row-major, same index order as the raw
+      // segmentations): `clustered_seg[(c, f, k)] = 1.0` iff ANY slot `s` with
+      // `hard_clusters[c][s] == k` is active (`> 0.0`) at `(c, f)` — the SAME
+      // "any nonzero entry is binary-active" predicate the activity loop above
+      // uses. A dropped slot (label `< 0`) contributes to no `k`.
+      let mut clustered_seg =
+        vec![0.0f64; self.num_chunks * self.num_frames_per_chunk * num_clusters_from_hard];
+      for (c, chunk_row) in hard_clusters.iter().enumerate() {
+        for (s, &k) in chunk_row.iter().enumerate() {
+          if k < 0 {
+            continue;
+          }
+          let k = k as usize;
+          for f in 0..self.num_frames_per_chunk {
+            if self.segmentations[(c * self.num_frames_per_chunk + f) * SEG_NUM_SLOTS + s] > 0.0 {
+              clustered_seg[(c * self.num_frames_per_chunk + f) * num_clusters_from_hard + k] = 1.0;
+            }
+          }
+        }
+      }
+      // Reuse extract()'s already-validated count helper over the clustered
+      // segmentation. `0.5` onset ≡ "nonzero active" because `clustered_seg` is
+      // exactly 0.0/1.0. The geometry (`num_chunks`/`num_frames_per_chunk`/
+      // `chunks_sw`/`frames_sw`) is IDENTICAL to the one `extract()` already ran to
+      // derive `self.num_output_frames`; only the speaker count differs, which does
+      // not affect the output-frame count — so `online_count.len() ==
+      // self.num_output_frames` and the overflow guard cannot recur.
+      crate::window::try_count_from_segmentations(
+        &clustered_seg,
+        self.num_chunks,
+        self.num_frames_per_chunk,
+        num_clusters_from_hard,
+        0.5,
+        self.chunks_sw,
+        self.frames_sw,
+      )
+      .expect(
+        "online count reuses extract()'s already-validated chunk/frame geometry, so the \
+         output-frame count cannot overflow here (num_output_frames is fixed)",
+      )
+    };
+
+    // The SAME reconstruction the offline path runs — only the cluster labels came
+    // from the online engine instead of AHC→VBx, and the count is the
+    // clustered-segmentation count derived just above (NOT `self.count`).
+    // `reconstruct` derives its own cluster count from `hard_clusters` + `count`.
     let recon_input = diaric::reconstruct::ReconstructInput::new(
       self.segmentations.as_slice(),
       self.num_chunks,
       self.num_frames_per_chunk,
       SEG_NUM_SLOTS,
       &hard_clusters,
-      self.count.as_slice(),
+      online_count.as_slice(),
       self.num_output_frames,
       self.chunks_sw.into(),
       self.frames_sw.into(),

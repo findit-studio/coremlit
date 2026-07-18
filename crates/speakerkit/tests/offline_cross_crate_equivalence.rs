@@ -56,7 +56,9 @@
 //! PLDA gate.
 #![cfg(feature = "dia-oracle")]
 
-use speakerkit::window::{WindowOptions, chunk_sliding_window, frame_sliding_window};
+use speakerkit::window::{
+  SlidingWindow, WindowOptions, chunk_sliding_window, frame_sliding_window,
+};
 
 // ── Scripted-input geometry ──────────────────────────────────────────
 // Small but rich enough to reach the failure regime: 8 chunks × 3 slots, one
@@ -175,8 +177,16 @@ enum Outcome {
 }
 
 fn diaric_outcome(fx: &OfflineFixture) -> Outcome {
+  diaric_outcome_cs(fx, chunk_sliding_window(&WindowOptions::new()))
+}
+
+/// As [`diaric_outcome`], but with an EXPLICIT chunk sliding window. The baseline
+/// and boundary fixtures pass the default community-1 window (its ~1 s step lands
+/// consecutive chunks ~59 output frames apart, so no output cell is multiply
+/// covered); the overlap-add fixture passes a small-step window so chunks OVERLAP
+/// in output-frame space. The frame window is always the fixed community-1 grid.
+fn diaric_outcome_cs(fx: &OfflineFixture, cs: SlidingWindow) -> Outcome {
   let plda = diaric::plda::PldaTransform::new().expect("diaric hermetic PLDA");
-  let w = WindowOptions::new();
   let input = diaric::offline::OfflineInput::new(
     &fx.raw_embeddings,
     fx.num_chunks,
@@ -185,7 +195,7 @@ fn diaric_outcome(fx: &OfflineFixture) -> Outcome {
     fx.num_frames,
     &fx.count,
     fx.num_output_frames,
-    chunk_sliding_window(&w).into(),
+    cs.into(),
     frame_sliding_window().into(),
     &plda,
   );
@@ -209,9 +219,13 @@ fn diaric_outcome(fx: &OfflineFixture) -> Outcome {
 }
 
 fn dia_outcome(fx: &OfflineFixture) -> Outcome {
+  dia_outcome_cs(fx, chunk_sliding_window(&WindowOptions::new()))
+}
+
+/// As [`dia_outcome`], but with an EXPLICIT chunk sliding window — the dia-side
+/// mirror of [`diaric_outcome_cs`], used identically by the overlap-add fixture.
+fn dia_outcome_cs(fx: &OfflineFixture, cs: SlidingWindow) -> Outcome {
   let plda = dia::plda::PldaTransform::new().expect("dia hermetic PLDA");
-  let w = WindowOptions::new();
-  let cs = chunk_sliding_window(&w);
   let fs = frame_sliding_window();
   let input = dia::offline::OfflineInput::new(
     &fx.raw_embeddings,
@@ -581,5 +595,233 @@ fn offline_cross_crate_equivalence_activity_boundary() {
       );
     }
     Outcome::Err(e) => panic!("expected a clustered result on the boundary fixture, got Err: {e}"),
+  }
+}
+
+// ── Overlap-add fixture ───────────────────────────────────────────────
+// A THIRD scripted input that fences the ONE reconstruction stage the two fixtures
+// above never exercise: diaric's overlap-add accumulation. Both crates' reconstruct
+// aggregates each chunk's clustered activation into the output grid with
+// `aggregated[out_f * num_clusters + k] += clustered[..]` (diaric
+// reconstruct/algo.rs:710; dia's mirror). The baseline (10 frames) and boundary (20
+// frames) fixtures use the default community-1 chunk window, whose ~1 s step lands
+// consecutive chunks ~59 output frames apart — so NO output cell is ever covered by
+// two chunks, and a one-sided regression of the `+= v` accumulation to `= v`
+// (last-chunk-wins) would leave BOTH of them bit-exact green. Real 589-frame chunks
+// overlap ~10 deep and feed DER through exactly this accumulation, so that gap is
+// load-bearing.
+//
+// This fixture makes the chunk step `OV_STEP_FRAMES` OUTPUT FRAMES (< `OV_FRAMES`),
+// so consecutive chunks OVERLAP in output-frame space. Identity A (chunks 0,1,
+// activation `OV_A_ACT = 0.6`) recurs so the two A chunks CLUSTER TOGETHER and their
+// activations are SUMMED where they overlap; identity B (chunks 2,3, activation
+// `OV_B_ACT = 1.0`) is the competing cluster. At the A-A-B triple-overlap frame
+// (`chunk_start_frame(2)`), `count[t] == 1`, so reconstruct's top-K keeps ONE
+// cluster: under the correct `+=`, A's SUMMED activation `0.6 + 0.6 = 1.2` beats B's
+// single `1.0`, so A is selected; under a `= v` regression A collapses to its single
+// `0.6 < 1.0` and B would win instead — flipping that cell's grid/spans and breaking
+// the bit-exact `diaric == dia` equality. The pinned crates cannot be mutated to show
+// the red inside one build, so this test asserts (1) `diaric == dia` bit-exact,
+// (2) the overlap is STRUCTURALLY real (some output frame covered by >= 2 chunks,
+// derived from the window geometry), and (3) the summed vote's outcome directly
+// (A active, B inactive at the overlap cell) — the observable a `+= → =` mutation
+// would flip.
+const OV_NUM_CHUNKS: usize = 4;
+const OV_FRAMES: usize = 10;
+const OV_STEP_FRAMES: usize = 4; // chunk step in OUTPUT FRAMES; < OV_FRAMES ⇒ overlap
+const OV_A_ID: usize = 0; // identity A: chunks 0,1 (cluster together, overlap-summed)
+const OV_B_ID: usize = 1; // identity B: chunks 2,3 (the competing cluster)
+const OV_A_ACT: f64 = 0.6; // A's per-chunk activation: single 0.6 < B, but 0.6+0.6 > B
+const OV_B_ACT: f64 = 1.0; // B's per-chunk activation
+
+/// Chunk sliding window whose STEP is `OV_STEP_FRAMES` output frames (not the ~1 s
+/// the baseline uses), so consecutive chunks overlap by `OV_FRAMES - OV_STEP_FRAMES`
+/// output frames. Duration spans exactly `OV_FRAMES` frames so
+/// `count_from_segmentations` derives a tight, reconstruct-valid `num_output_frames`
+/// (reconstruct ignores chunk duration — only start/step place chunks).
+fn overlap_chunks_sw() -> SlidingWindow {
+  let fs = frame_sliding_window();
+  SlidingWindow::new(
+    0.0,
+    (OV_FRAMES as f64 - 1.0) * fs.step(),
+    OV_STEP_FRAMES as f64 * fs.step(),
+  )
+}
+
+/// The output frame chunk `c` starts at, computed the SAME way reconstruct and
+/// `count_from_segmentations` place chunks: `round(chunk_start / frame_step)` (the
+/// `center_offset` cancels `frames_sw.duration / 2` in `closest_frame`).
+fn chunk_start_frame(c: usize, cs: SlidingWindow, fs: SlidingWindow) -> usize {
+  ((c as f64 * cs.step()) / fs.step()).round_ties_even() as usize
+}
+
+/// Per-output-frame covering-chunk count, from the same window geometry
+/// reconstruct's overlap-add uses — the structural proof that the fixture reaches
+/// the multiply-covered regime (rather than a hard-coded magic number).
+fn coverage(
+  num_chunks: usize,
+  num_frames: usize,
+  num_output_frames: usize,
+  cs: SlidingWindow,
+  fs: SlidingWindow,
+) -> Vec<usize> {
+  let mut cov = vec![0usize; num_output_frames];
+  for c in 0..num_chunks {
+    let sf = chunk_start_frame(c, cs, fs);
+    for f in 0..num_frames {
+      let t = sf + f;
+      if t < num_output_frames {
+        cov[t] += 1;
+      }
+    }
+  }
+  cov
+}
+
+/// Build the overlap-add fixture (geometry documented in the const block above).
+/// Reuses the shared `count_from_segmentations` derivation, so the tensor set is
+/// reconstruct-valid despite the deliberate output-frame overlap.
+fn build_overlap_fixture() -> OfflineFixture {
+  let mut raw_embeddings = vec![0.0f32; OV_NUM_CHUNKS * NUM_SPEAKERS * EMBED_DIM];
+  let mut segmentations = vec![0.0f64; OV_NUM_CHUNKS * OV_FRAMES * NUM_SPEAKERS];
+
+  // Slot 0 is single-active every frame (so every frame is clean); chunks 0,1 carry
+  // identity A at 0.6, chunks 2,3 carry identity B at 1.0.
+  let plan = [
+    (OV_A_ID, OV_A_ACT),
+    (OV_A_ID, OV_A_ACT),
+    (OV_B_ID, OV_B_ACT),
+    (OV_B_ID, OV_B_ACT),
+  ];
+  for (c, &(identity, act)) in plan.iter().enumerate() {
+    for f in 0..OV_FRAMES {
+      segmentations[(c * OV_FRAMES + f) * NUM_SPEAKERS] = act; // slot 0
+    }
+    let base = (c * NUM_SPEAKERS) * EMBED_DIM;
+    raw_embeddings[base..base + EMBED_DIM].copy_from_slice(&prototype(identity));
+  }
+
+  let cs = overlap_chunks_sw();
+  let fs = frame_sliding_window();
+  let count = speakerkit::window::count_from_segmentations(
+    &segmentations,
+    OV_NUM_CHUNKS,
+    OV_FRAMES,
+    NUM_SPEAKERS,
+    ONSET,
+    cs,
+    fs,
+  );
+  let num_output_frames = count.len();
+  OfflineFixture {
+    raw_embeddings,
+    segmentations,
+    count,
+    num_output_frames,
+    num_chunks: OV_NUM_CHUNKS,
+    num_frames: OV_FRAMES,
+  }
+}
+
+/// Fences diaric's reconstruction OVERLAP-ADD (`aggregated[idx] += v`,
+/// reconstruct/algo.rs:710). See the const block above for why the two existing
+/// fixtures cannot: their chunks never share an output cell, so a `+= → =`
+/// (last-chunk-wins) regression stays bit-exact green on both. Here chunks overlap
+/// in output-frame space and cluster A's activation is summed across two overlapping
+/// chunks, so that mutation would flip the overlap cell's top-K selection and break
+/// the `diaric == dia` equality this test asserts.
+#[test]
+fn offline_cross_crate_equivalence_overlap_add() {
+  let fx = build_overlap_fixture();
+  let cs = overlap_chunks_sw();
+  let fs = frame_sliding_window();
+
+  // ── (2) Non-vacuity for overlap: the fixture genuinely multiply-covers output
+  //        frames (derived from the window geometry, not hard-coded). ──
+  let cov = coverage(OV_NUM_CHUNKS, OV_FRAMES, fx.num_output_frames, cs, fs);
+  let multi = cov.iter().filter(|&&n| n >= 2).count();
+  let max_cov = cov.iter().copied().max().unwrap_or(0);
+  assert!(
+    max_cov >= 2,
+    "overlap fixture must cover at least one output frame with >= 2 chunks (the \
+     overlap-add regime); got max coverage {max_cov}"
+  );
+  println!(
+    "[offline-cross-crate overlap] {multi} of {} output frames are covered by >= 2 chunks \
+     (max coverage {max_cov})",
+    fx.num_output_frames
+  );
+
+  // ── (1) The gate: both crates' WHOLE offline output is bit-identical ──
+  let diaric = diaric_outcome_cs(&fx, cs);
+  let dia = dia_outcome_cs(&fx, cs);
+  assert_eq!(
+    diaric, dia,
+    "diaric and dia diverged on the overlap-add fixture (reconstruct accumulation / \
+     top-K / spans) for identical inputs"
+  );
+
+  // ── (3) Non-vacuity + the overlap-add outcome itself ──
+  match &diaric {
+    Outcome::Ok {
+      hard_clusters,
+      num_clusters,
+      grid_bits,
+      spans,
+    } => {
+      let distinct: std::collections::BTreeSet<i32> = hard_clusters
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|&k| k >= 0)
+        .collect();
+      assert!(
+        *num_clusters >= 2,
+        "overlap fixture must reach multi-cluster reconstruction (got {num_clusters})"
+      );
+      assert!(
+        distinct.len() >= 2,
+        "overlap fixture must assign >= 2 distinct speakers (got {distinct:?})"
+      );
+      assert!(!spans.is_empty(), "overlap fixture must produce spans");
+
+      // The summed-vote outcome: A (chunks 0,1) and B (chunks 2,3) form distinct
+      // clusters, and at the A-A-B triple-overlap frame A's SUMMED activation
+      // (0.6 + 0.6 = 1.2) beats B's single (1.0) under the correct `+=`, so A is the
+      // ONE cluster the top-K keeps (count[t] == 1). A `+= → =` regression collapses
+      // A to 0.6 < 1.0 and would select B instead — this is the observable it flips.
+      let a_cluster = hard_clusters[0][0];
+      let b_cluster = hard_clusters[2][0];
+      assert!(
+        a_cluster >= 0 && b_cluster >= 0 && a_cluster != b_cluster,
+        "identities A ({a_cluster}) and B ({b_cluster}) must form two distinct clusters"
+      );
+      let t = chunk_start_frame(2, cs, fs); // first frame of chunk 2 = the A-A-B triple cell
+      assert!(
+        cov[t] >= 2,
+        "the checked overlap frame {t} must be multiply covered (got {})",
+        cov[t]
+      );
+      let nc = *num_clusters;
+      let cell = |k: i32| grid_bits[t * nc + k as usize];
+      assert_eq!(
+        cell(a_cluster),
+        1.0f32.to_bits(),
+        "overlap-add: cluster A must be ACTIVE at the overlap cell (summed 1.2 > 1.0)"
+      );
+      assert_eq!(
+        cell(b_cluster),
+        0.0f32.to_bits(),
+        "overlap-add: cluster B must be INACTIVE at the overlap cell (last-wins would flip this)"
+      );
+      println!(
+        "[offline-cross-crate overlap] diaric == dia: {num_clusters} clusters, \
+         {} distinct speakers, {} spans; overlap frame {t} selects summed-vote cluster A \
+         ({a_cluster}) over B ({b_cluster})",
+        distinct.len(),
+        spans.len(),
+      );
+    }
+    Outcome::Err(e) => panic!("expected a clustered result on the overlap fixture, got Err: {e}"),
   }
 }

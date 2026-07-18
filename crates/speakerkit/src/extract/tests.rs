@@ -743,10 +743,22 @@ fn online_extraction() -> Extraction {
   set_block(1, 2, 2); // C
 
   // count[t]: 2 active clusters over each chunk's frames, 0 elsewhere. Valid
-  // (<= MAX_COUNT_PER_FRAME) and length == num_output_frames.
+  // (<= MAX_COUNT_PER_FRAME) and length == num_output_frames. NOTE: `diarize_online`
+  // no longer consumes this field (it derives its own clustered-segmentation count);
+  // it is retained as a valid `Extraction::count` (the offline path's contract).
   let mut count = vec![0u8; 63];
   count[0..4].fill(2);
   count[59..63].fill(2);
+
+  // Chunk window sized to this fixture's 63-frame output grid: duration =
+  // (F-1)·frame_step. Same rationale as `online_extraction_default_gate`'s chunk
+  // window — `reconstruct` ignores chunk DURATION (start/step, unchanged here, place
+  // the two chunks at output frames 0 and 59), but `diarize_online`'s own
+  // `try_count_from_segmentations` derives `num_output_frames` from it, so the
+  // nominal 10 s duration would make the derived count 653-long and mismatch this
+  // 63-frame grid.
+  let chunks_sw = crate::window::chunk_sliding_window(&WindowOptions::new())
+    .with_duration((F as f64 - 1.0) * crate::window::FRAME_STEP_S);
 
   Extraction {
     raw_embeddings,
@@ -755,7 +767,7 @@ fn online_extraction() -> Extraction {
     num_chunks: 2,
     num_frames_per_chunk: F,
     num_output_frames: 63,
-    chunks_sw: crate::window::chunk_sliding_window(&WindowOptions::new()),
+    chunks_sw,
     frames_sw: crate::window::frame_sliding_window(),
   }
 }
@@ -893,9 +905,37 @@ fn online_extraction_default_gate() -> Extraction {
   set_block(1, 1); // B (orthogonal to A)
   set_block(2, 2); // C (orthogonal to A and B)
 
-  // Two clustered speakers active over every output frame (s1 is dropped and
-  // contributes no cluster); count == num_output_frames == F.
-  let count = vec![2u8; F];
+  // Chunk window sized to this fixture's F-frame output grid: duration =
+  // (F-1)·frame_step. The community-1 `chunk_sliding_window` nominally spans 10 s
+  // (~594 output frames), but this fixture emits only F output frames, so its chunk
+  // duration must match for the per-output-frame count to be self-consistent.
+  // `reconstruct` ignores chunk DURATION (only start/step place chunks), so this
+  // leaves chunk placement and every span below unchanged; but
+  // `try_count_from_segmentations` derives `num_output_frames` FROM the duration, so
+  // a 10 s duration would make the count 594-long and mismatch this grid.
+  let chunks_sw = crate::window::chunk_sliding_window(&WindowOptions::new())
+    .with_duration((F as f64 - 1.0) * crate::window::FRAME_STEP_S);
+  let frames_sw = crate::window::frame_sliding_window();
+
+  // HONEST, segmentation-derived count (dia's `count_from_segmentations`): three
+  // active slots (s0,s1,s2) for frames `0..BELOW` and two (s0,s2) for `BELOW..F`,
+  // i.e. `[3; 20] ++ [2; 44]`. It counts the DROPPED slot s1 as a speaker while s1
+  // is active (frames 0..20). This is the count the production pipeline would hand
+  // `diarize_online`; the fix REQUIRES `diarize_online` to IGNORE it and derive its
+  // OWN clustered-segmentation count (2 speakers), emitting NO phantom third. Under
+  // the OLD code (which fed `self.count` straight to reconstruct) the 3 inflated
+  // `num_clusters` to 3 and produced a zero-activation phantom span — exactly the
+  // bug this fixture now proves.
+  let count = crate::window::try_count_from_segmentations(
+    &segmentations,
+    1,
+    F,
+    SEG_NUM_SLOTS,
+    0.5,
+    chunks_sw,
+    frames_sw,
+  )
+  .expect("fixture chunk/frame geometry yields exactly F output frames");
 
   Extraction {
     raw_embeddings,
@@ -904,8 +944,8 @@ fn online_extraction_default_gate() -> Extraction {
     num_chunks: 1,
     num_frames_per_chunk: F,
     num_output_frames: F,
-    chunks_sw: crate::window::chunk_sliding_window(&WindowOptions::new()),
-    frames_sw: crate::window::frame_sliding_window(),
+    chunks_sw,
+    frames_sw,
   }
 }
 
