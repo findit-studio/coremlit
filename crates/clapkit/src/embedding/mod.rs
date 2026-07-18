@@ -224,5 +224,27 @@ impl fmt::Debug for Embedding {
   }
 }
 
+/// Scans a raw model-output projection — the copied CoreML tensor, before it is
+/// normalized into an [`Embedding`] — for the first non-finite (NaN/±∞)
+/// component, classifying it as MODEL corruption ([`Error::NonFiniteOutput`]).
+/// This is the counterpart to the caller-data corruption
+/// ([`Error::NonFiniteEmbedding`]) that [`Embedding::from_slice_normalizing`]
+/// raises for a caller's own slice: the audio and text towers run this on the
+/// model output *before* normalizing, so a NaN the runtime produced is reported
+/// as model-output corruption rather than mislabeled as caller-supplied
+/// embedding data. That is the workspace convention (it mirrors speakerkit's
+/// identically shaped `check_finite_output`). Extracted so the classification is
+/// hermetically testable without a loaded model.
+///
+/// # Errors
+/// [`Error::NonFiniteOutput`] carrying the flat index of the first non-finite
+/// component.
+pub(crate) fn check_finite_output(values: &[f32]) -> Result<()> {
+  if let Some(index) = values.iter().position(|v| !v.is_finite()) {
+    return Err(Error::NonFiniteOutput { index });
+  }
+  Ok(())
+}
+
 #[cfg(test)]
 mod tests;

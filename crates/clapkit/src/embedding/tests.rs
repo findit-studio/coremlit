@@ -45,6 +45,41 @@ fn from_slice_normalizing_rejects_inf() {
 }
 
 #[test]
+fn check_finite_output_accepts_finite() {
+  // A finite model-output row (need not be unit-norm — this gate runs BEFORE
+  // normalization) passes.
+  let s: Vec<f32> = (0..EMBEDDING_DIM).map(|i| (i as f32) - 100.0).collect();
+  assert!(check_finite_output(&s).is_ok());
+}
+
+#[test]
+fn check_finite_output_rejects_model_nan_as_output_not_embedding() {
+  // A NaN the model produced is MODEL corruption (`NonFiniteOutput`), NOT
+  // caller-supplied embedding data (`NonFiniteEmbedding`). This is the seam the
+  // audio/text towers call before `from_slice_normalizing`, so the CoreML
+  // corruption mode is classified correctly. Removing that call site (or this
+  // gate) makes `NonFiniteOutput` unreachable again.
+  let mut s = e0();
+  s[5] = f32::NAN;
+  let err = check_finite_output(&s).unwrap_err();
+  assert!(
+    matches!(err, Error::NonFiniteOutput { index: 5 }),
+    "got {err:?}"
+  );
+}
+
+#[test]
+fn check_finite_output_rejects_inf() {
+  let mut s = e0();
+  s[9] = f32::NEG_INFINITY;
+  let err = check_finite_output(&s).unwrap_err();
+  assert!(
+    matches!(err, Error::NonFiniteOutput { index: 9 }),
+    "got {err:?}"
+  );
+}
+
+#[test]
 fn from_slice_normalizing_handles_overflow_magnitude() {
   // f32::MAX components would overflow an f32 norm accumulator; the f64 path
   // must still produce a finite unit vector.
