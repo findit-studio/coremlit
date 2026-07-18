@@ -869,6 +869,35 @@ const VADKIT_STFT_SQRT: &str = r#"
             tensor<fp16, [1, 129, 4]> input_3_cast_fp16 = sqrt(x = var_231_cast_fp16)[name = tensor<string, []>("input_3_cast_fp16")];
 "#;
 
+/// clapkit's converted CLAP graphs are CLEAN — the second clean control beside
+/// whisper's mel. Verbatim excerpts of the real shipped graphs:
+/// `Models/clapkit/clap_audio.mlmodelc/model.mil` lines 12/15 (the input
+/// `batch_norm`, `epsilon = 0x1.5p-17 ≈ 1.001e-5`) and
+/// `Models/clapkit/clap_text.mlmodelc/model.mil` lines 46/47 (the embeddings
+/// `layer_norm`, `epsilon = 0x1p-24`, RoBERTa's `1e-12` source eps auto-raised by
+/// the fp16 conversion to exactly the audit floor). The audio graph carries 29
+/// more `layer_norm`s at the same `0x1.5p-17` and the text graph 24 more at
+/// `0x1p-24`; both eps tiers clear `2^-24` (the text tier inclusively), and
+/// neither graph has any `log`/`sqrt`/`rsqrt`/`real_div` — L2-norm is kept OUT of
+/// the graphs, so the rsqrt-guard class is absent by construction. This snippet
+/// is the models-independent proof that clapkit's conversion guard shape audits
+/// clean; the live sweep covers every site when `Models/clapkit/` is present.
+const CLAPKIT_NORMS_CLEAN: &str = r#"
+            tensor<fp16, []> var_7_to_fp16 = const()[name = tensor<string, []>("op_7_to_fp16"), val = tensor<fp16, []>(0x1.5p-17)];
+            tensor<fp16, [1, 64, 1001, 1]> normalized_input_features_cast_fp16 = batch_norm(beta = audio_model_audio_encoder_batch_norm_bias_to_fp16, epsilon = var_7_to_fp16, gamma = audio_model_audio_encoder_batch_norm_weight_to_fp16, mean = audio_model_audio_encoder_batch_norm_running_mean_to_fp16, variance = audio_model_audio_encoder_batch_norm_running_var_to_fp16, x = input_1_cast_fp16)[name = tensor<string, []>("normalized_input_features_cast_fp16")];
+            tensor<fp16, []> var_23_to_fp16 = const()[name = tensor<string, []>("op_23_to_fp16"), val = tensor<fp16, []>(0x1p-24)];
+            tensor<fp16, [1, 512, 768]> input_5_cast_fp16 = layer_norm(axes = input_5_axes_0, beta = text_model_embeddings_LayerNorm_bias_to_fp16, epsilon = var_23_to_fp16, gamma = text_model_embeddings_LayerNorm_weight_to_fp16, x = input_3_cast_fp16)[name = tensor<string, []>("input_5_cast_fp16")];
+"#;
+
+/// The clapkit text `layer_norm` with its epsilon halved to `0x1p-25` (exactly
+/// half the fp16 floor) — the mutation a re-conversion would introduce if it
+/// dropped the eps below the floor. It MUST be caught as a vanishing `norm`
+/// finding, proving the clean control above is not vacuously green.
+const CLAPKIT_NORM_VANISHING_MUTANT: &str = r#"
+            tensor<fp16, []> var_23_to_fp16 = const()[name = tensor<string, []>("op_23_to_fp16"), val = tensor<fp16, []>(0x1p-25)];
+            tensor<fp16, [1, 512, 768]> input_5_cast_fp16 = layer_norm(axes = input_5_axes_0, beta = text_model_embeddings_LayerNorm_bias_to_fp16, epsilon = var_23_to_fp16, gamma = text_model_embeddings_LayerNorm_weight_to_fp16, x = input_3_cast_fp16)[name = tensor<string, []>("input_5_cast_fp16")];
+"#;
+
 /// Two INDEPENDENT sub-threshold guard constants on ONE `log` site: an
 /// `add(x, 0x1p-25)` floor feeding a `log(eps = 0x1p-25)`. Each constant is
 /// `2^-25` — exactly HALF fp16's smallest subnormal — so each rounds to zero in
@@ -1209,6 +1238,43 @@ fn accepts_vadkits_stft_sqrt_guard() {
     "the guard is the preceding add(0x1p-24), not any epsilon on the sqrt"
   );
   assert!(sqrt.survives_fp16());
+}
+
+/// clapkit's converted CLAP graphs are a CLEAN control (the second beside
+/// whisper's mel): the audio `batch_norm`/`layer_norm` guards at `0x1.5p-17` and
+/// the text `layer_norm` guards at `0x1p-24` all clear the fp16 floor (the text
+/// tier inclusively), so the sweep must report clapkit clean. Its companion
+/// mutant — the same text `layer_norm` with the epsilon halved to `0x1p-25` —
+/// MUST be flagged, proving this control is not vacuously green.
+#[test]
+fn accepts_clapkit_conversion_norm_guards() {
+  assert_eq!(
+    vanishing(CLAPKIT_NORMS_CLEAN),
+    Vec::<String>::new(),
+    "clapkit's audio 0x1.5p-17 and text 0x1p-24 norm guards both survive fp16"
+  );
+
+  let audit = parse_mil(CLAPKIT_NORMS_CLEAN).audit();
+  assert!(
+    audit.unresolved.is_empty(),
+    "the real clapkit norm excerpts must parse completely: {:?}",
+    audit.unresolved
+  );
+  // Two norm findings (batch_norm + layer_norm), both surviving; no log/div guard
+  // class present (L2-norm kept out of the graphs).
+  assert_eq!(
+    audit.findings.len(),
+    2,
+    "one batch_norm + one layer_norm site"
+  );
+  assert!(audit.findings.iter().all(|f| f.survives_fp16()));
+
+  // Mutation proof: below-floor epsilon is caught, not silently swept green.
+  assert_eq!(
+    vanishing(CLAPKIT_NORM_VANISHING_MUTANT),
+    ["layer_norm/fp16 guard=norm eff=2.9802322387695313e-8"],
+    "a clapkit norm eps halved to 0x1p-25 (below the fp16 floor) must be flagged"
+  );
 }
 
 /// F3: two independently-materialized guard constants, each `2^-25` (half fp16's
