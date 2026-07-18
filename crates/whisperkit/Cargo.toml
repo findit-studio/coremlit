@@ -37,10 +37,20 @@ unicode_categories.workspace = true
 serde = { workspace = true, optional = true }
 tracing = { workspace = true, optional = true }
 objc2-natural-language = { workspace = true, optional = true }
+# Optional Silero-VAD long-form chunking (`crate::silero_vad::SileroVad`), an
+# opt-in alternative to the default energy VAD. Path dep on the sibling crate;
+# silero's detection logic rides through it, still NO `ort`/ONNX — vadkit's
+# runtime silero dep is `default-features = false` and vadkit's ONNX dev-dep is
+# not transitive, so `cargo tree -p whisperkit --features vadkit -i ort` is
+# empty. Re-pin nothing here when silero publishes; that is vadkit's Cargo.toml.
+vadkit = { path = "../vadkit", optional = true }
 
 [features]
 serde = ["dep:serde"]
 tracing = ["dep:tracing"]
+# Silero VAD long-form chunking via the sibling `vadkit` crate (opt-in; the
+# energy VAD stays the default). See `crate::silero_vad`.
+vadkit = ["dep:vadkit"]
 # Optional transcript-based language redetection for word splitting
 # (`tokenizer::nl_recognizer::redetect_language`), via Apple's
 # `NLLanguageRecognizer`. Off by default: the pipeline's one source of

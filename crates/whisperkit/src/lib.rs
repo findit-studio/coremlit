@@ -143,7 +143,9 @@
 //!   ([`DecodingOptions::word_timestamps`](options::DecodingOptions::word_timestamps))
 //! - VAD strategy (the detector driving VAD chunking —
 //!   [`EnergyVad`](audio::vad::EnergyVad) by default, swappable via
-//!   [`WhisperKit::set_vad_detector`](transcribe::WhisperKit::set_vad_detector))
+//!   [`WhisperKit::set_vad_detector`](transcribe::WhisperKit::set_vad_detector);
+//!   Silero VAD is available opt-in behind the `vadkit` feature as
+//!   `silero_vad::SileroVad`)
 //!
 //! [`Provenance`](provenance::Provenance) assembles that record for you
 //! (coremlit issue #14). Of the items above, the **library-known** ones are
@@ -352,6 +354,12 @@ pub mod options;
 pub mod provenance;
 pub mod result;
 pub mod segment;
+/// Silero VAD (`vadkit`-backed) as an opt-in [`VoiceActivityDetector`], behind
+/// the `vadkit` feature — the energy VAD stays the default.
+///
+/// [`VoiceActivityDetector`]: audio::vad::VoiceActivityDetector
+#[cfg(feature = "vadkit")]
+pub mod silero_vad;
 pub mod stream;
 pub mod task_facts;
 pub mod text;
