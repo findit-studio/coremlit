@@ -1,0 +1,71 @@
+clapkit — third-party attribution NOTICE
+Copyright the coremlit / clapkit authors
+
+The clapkit Rust source is dual-licensed under MIT OR Apache-2.0 (caller's
+choice). See the workspace LICENSE-MIT and LICENSE-APACHE for those terms.
+
+NOTE: clapkit BUNDLES one third-party artifact — the Xenova `tokenizer.json`,
+embedded via `include_bytes!` (section 2) — and LOADS two more at runtime that a
+downstream user fetches separately from Hugging Face: the CoreML CLAP encoder
+graphs (section 1; see README.md and tests/model_io.rs for the repo id,
+revision, and per-file SHA-256). This NOTICE records the attribution a binary
+that distributes or bundles those components must honor. The tokenizer is
+redistributed by any binary linking clapkit; the model weights are redistributed
+only by a binary that also ships the fetched CoreML graphs.
+
+────────────────────────────────────────────────────────────────────────
+1. LAION CLAP (clap-htsat-unfused) — the encoder weights
+
+The audio and text encoders clapkit runs are CoreML conversions of LAION's
+`clap-htsat-unfused`. clapkit ships NO model files; it loads FinDIT-Studio's
+conversion (below), which is a derivative work of the LAION weights. CC-BY-4.0
+requires attribution when redistributing the weights (or a binary bundling
+them).
+
+  Original model:
+  laion/clap-htsat-unfused
+  https://huggingface.co/laion/clap-htsat-unfused
+  Snapshot revision: 8fa0f1c6d0433df6e97c127f64b2a1d6c0dcda8a
+
+  License: CC-BY-4.0
+  https://creativecommons.org/licenses/by/4.0/
+
+  Attribution:
+  LAION (Large-scale Artificial Intelligence Open Network) — CLAP
+  (Contrastive Language-Audio Pretraining), "Large-scale Contrastive
+  Language-Audio Pretraining with Feature Fusion and Keyword-to-Caption
+  Augmentation" (Wu et al., ICASSP 2023).
+
+  CoreML conversion actually loaded by clapkit:
+  FinDIT-Studio/clapkit-coreml
+  https://huggingface.co/FinDIT-Studio/clapkit-coreml
+  Snapshot revision (commit SHA): 97d631f3814e1e46b798a8e88c9aa2e2202fdf67
+  Artifacts: clap_audio.{mlpackage,mlmodelc}, clap_text.{mlpackage,mlmodelc}
+  (fp16; projection heads in-graph, L2-normalization out of the graph, log-mel
+  front-end externalized to Rust)
+
+  License note. Attribution to `laion/clap-htsat-unfused` is provided as
+  required. The consuming project and textclap's `models/MODELS.md` treat the
+  LAION CLAP checkpoints as CC-BY-4.0; the current upstream Hugging Face model
+  card declares apache-2.0. Both licenses require attribution, which this record
+  provides; a downstream redistributor should honor whichever the upstream
+  author intends.
+
+────────────────────────────────────────────────────────────────────────
+2. Xenova clap-htsat-unfused tokenizer (bundled via include_bytes!)
+
+clapkit embeds `tokenizer.json` in the crate (`assets/tokenizer.json`, exposed
+as `clapkit::BUNDLED_TOKENIZER`) — byte-for-byte the same artifact textclap
+pins, so tokenization is identity-comparable. Because it is compiled into the
+crate, any binary linking clapkit redistributes it.
+
+  Source: https://huggingface.co/Xenova/clap-htsat-unfused
+  Revision (commit SHA): c28f2883575e590e04d3146ff0713c2448d691ba
+  Artifact: tokenizer.json
+  SHA-256: dc239041d98de27ffc3975473a1a23e3db4c937b23c138c38bbc66588bd247e5
+
+  The artifact is the CLAP tokenizer configuration and vocabulary/merges — the
+  RoBERTa (roberta-base, MIT lineage) tokenizer as packaged for the
+  transformers.js / ONNX export; it carries no model weights. A redistributor
+  should honor the upstream Xenova export's terms and the RoBERTa tokenizer's
+  MIT license for the configuration.
