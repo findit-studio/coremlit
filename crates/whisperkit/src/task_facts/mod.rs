@@ -793,6 +793,8 @@ impl TaskFacts {
   /// assert_eq!(TaskFacts::fold([&clean]), clean);
   /// ```
   #[must_use]
+  // `'a` can't be elided: `&Self` in impl-Trait position is an unstable anonymous lifetime (E0658).
+  #[allow(single_use_lifetimes)]
   pub fn fold<'a>(contributors: impl IntoIterator<Item = &'a Self>) -> Self {
     let mut accumulator = TaskFactsAccumulator::new();
     for contributor in contributors {
