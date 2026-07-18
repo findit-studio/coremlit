@@ -88,25 +88,32 @@ def main():
     print(f"[raw-tower] torch output shape {tuple(emb.shape)}  (fp32 forward works)")
     ts = torch.jit.trace(raw, (audio_t,), check_trace=False)
 
-    # 2. attempt conversion (fp16).
-    print("\n[convert] attempting fp16 mel-in-graph conversion ...")
-    try:
-        ml = ct.convert(
-            ts,
-            inputs=[ct.TensorType(name="audio", shape=(1, TARGET_SAMPLES), dtype=np.float32)],
-            outputs=[ct.TensorType(name="audio_embeds", dtype=np.float32)],
-            minimum_deployment_target=ct.target.iOS17,
-            compute_precision=ct.precision.FLOAT16,
-            convert_to="mlprogram",
-        )
-        out = os.path.join(STAGE, "clap_audio_melgraph.mlpackage")
-        ml.save(out)
-        print(f"[convert] SUCCESS -> {out}")
-    except Exception as e:
-        print(f"[convert] FAILED: {type(e).__name__}: {str(e)[:300]}")
-        print("MEL-DECISION: in-graph conversion FAILED -> spectrogram-input (mel in Rust).")
-        return
-    print("[convert] converted; compile + audit next (run compile_and_audit_melgraph).")
+    # 2. Convert BOTH precisions from the SAME trace, so the measurement compares
+    #    an honest fp32 mel-in-graph against the shipped fp32 spectrogram path
+    #    (arm A, faithfulness) AND the fp16 mel-in-graph against its own fp32
+    #    (arm B, fp16 survival) — not two executions of one conversion.
+    #    FAIL-CLOSED: a conversion error exits nonzero (a legitimate "reject
+    #    mel-in-graph" outcome, but recorded HARD so measure_melgraph can never
+    #    read a stale/absent artifact and print a bogus cosine).
+    for prec_name, prec in [("fp32", ct.precision.FLOAT32), ("fp16", ct.precision.FLOAT16)]:
+        print(f"\n[convert] attempting {prec_name} mel-in-graph conversion ...")
+        try:
+            ml = ct.convert(
+                ts,
+                inputs=[ct.TensorType(name="audio", shape=(1, TARGET_SAMPLES), dtype=np.float32)],
+                outputs=[ct.TensorType(name="audio_embeds", dtype=np.float32)],
+                minimum_deployment_target=ct.target.iOS17,
+                compute_precision=prec,
+                convert_to="mlprogram",
+            )
+            out = os.path.join(STAGE, f"clap_audio_melgraph_{prec_name}.mlpackage")
+            ml.save(out)
+            print(f"[convert] {prec_name} SUCCESS -> {out}")
+        except Exception as e:
+            print(f"[convert] {prec_name} FAILED: {type(e).__name__}: {str(e)[:400]}")
+            print("MEL-DECISION: in-graph conversion FAILED -> spectrogram-input (mel in Rust).")
+            sys.exit(1)
+    print("[convert] both precisions converted; run measure_melgraph.py next.")
     print("DONE mel-probe")
 
 

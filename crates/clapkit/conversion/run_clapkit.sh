@@ -33,6 +33,11 @@ cd "$CK"
 "$PY" -u scripts/verify_encoders.py
 
 # 5. Mel-in-graph decision probe (records why the mel frontend stays in Rust).
+#    The probe converts BOTH precisions (clap_audio_melgraph_fp32/fp16.mlpackage)
+#    and fails closed (nonzero exit) if either conversion fails, so `set -e` halts
+#    before measurement can read a stale artifact. measure_melgraph then loads
+#    both melgraph mlpackages (no separate compile step) and the shipped fp32
+#    spectrogram graph, feeding all arms the identical repeat-tiled 480k input.
 "$PY" -u scripts/mel_in_graph_probe.py
 "$PY" -u scripts/measure_melgraph.py
 
