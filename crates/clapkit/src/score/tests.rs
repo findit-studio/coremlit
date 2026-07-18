@@ -11,8 +11,14 @@ fn emb(components: &[(usize, f32)]) -> Embedding {
 }
 
 #[test]
-fn logit_scales_are_pinned_from_the_model_config() {
-  // Round-trip check: the shortest f32 literals equal the f64 config values.
+fn logit_scales_are_pinned_from_the_learned_checkpoint() {
+  // These f64 widenings are the LEARNED checkpoint parameters
+  // `model.logit_scale_{a,t}.exp()` (via conversion/scripts/inspect_struct.py),
+  // NOT the config. The audio scale trained away from init to 18.661177. The text
+  // f64 literal is 14.285714149475098 — the learned value — and is distinct from
+  // the config's `logit_scale_init_value` exp (14.285714285714285); the two only
+  // coincide once rounded to the shipped f32 (14.285714). Pinning "from config"
+  // would therefore select the wrong f64 source (and the wrong audio temperature).
   assert_eq!(LOGIT_SCALE_AUDIO as f64, 18.661176681518555);
   assert_eq!(LOGIT_SCALE_TEXT as f64, 14.285714149475098);
 }
