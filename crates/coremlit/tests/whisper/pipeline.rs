@@ -364,8 +364,8 @@ fn silence_transcribes_to_the_blank_audio_marker_when_drop_is_cleared() {
   // default path is pinned by `silence_is_dropped_by_default` below.
   //
   // The byte-exact strings below are pins captured empirically against
-  // this exact tiny-model/option combination (`cargo test -p whisperkit
-  // --test pipeline -- --ignored --nocapture
+  // this exact tiny-model/option combination (`cargo test -p coremlit
+  // --test whisper_pipeline -- --ignored --nocapture
   // silence_transcribes_to_the_blank_audio_marker_when_drop_is_cleared`),
   // not derived from a spec: `result.text()` is exactly the marker, with
   // no surrounding whitespace. The sole segment's raw `text()` retains its

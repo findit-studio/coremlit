@@ -14,7 +14,7 @@
 # dependency. Nothing is written into it; this package's own `.build/` (here,
 # gitignored) takes every build product.
 #
-#   Usage:  crates/speakerkit/tests/swift/regen_goldens.sh
+#   Usage:  crates/coremlit/tests/speaker/swift/regen_goldens.sh
 #
 #   ARGMAX_SWIFT_SRC    argmax-oss-swift checkout   [default: ../../../../../../argmax-oss-swift]
 #   ARGMAX_TEST_MODELS  speakerkit-coreml artifacts [default: <workspace>/Models/argmax-speakerkit]

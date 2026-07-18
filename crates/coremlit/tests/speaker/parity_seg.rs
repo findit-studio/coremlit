@@ -74,7 +74,7 @@
 //!
 //! `#[ignore]` (needs the gitignored `Models/speakerkit/` artifacts, like
 //! `tests/model_io.rs`); run with local models via
-//! `cargo test -p speakerkit -- --ignored`.
+//! `cargo test -p coremlit -- --ignored`.
 
 mod common;
 

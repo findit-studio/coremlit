@@ -14,7 +14,7 @@
 # Nothing is written into it; this package's own `.build/` (here, gitignored)
 # takes every build product.
 #
-#   Usage:  crates/vadkit/tests/swift/regen_goldens.sh
+#   Usage:  crates/coremlit/tests/vad/swift/regen_goldens.sh
 #
 #   FLUIDAUDIO_SRC     FluidAudio checkout        [default: ../../../../../../FluidAudio]
 #   VADKIT_TEST_MODELS vadkit model artifacts dir [default: <workspace>/Models/vadkit]

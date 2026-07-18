@@ -549,7 +549,7 @@ mod tracing_spans {
   /// The per-chunk half: **one `alignkit.align_chunk` span per call**, with the
   /// CoreML predict nested inside it. Model-gated, because a span over an
   /// alignment needs an alignment — so it runs ONLY under
-  /// `cargo test -p alignkit --features tracing -- --ignored`, the one gate that
+  /// `cargo test -p coremlit --features tracing -- --ignored`, the one gate that
   /// both enables `tracing` and runs `#[ignore]` tests. `cargo hack test
   /// --each-feature` enables the feature but skips ignored tests; the plain
   /// `--ignored` runs do not enable `tracing`. Without that gate in the matrix,

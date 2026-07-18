@@ -124,7 +124,7 @@
 //! # This test does not skip
 //!
 //! `#[ignore]` is the opt-in gate and the only gate; `required-features =
-//! ["parity-oracle"]` (see `Cargo.toml`) keeps ort out of the default test
+//! ["align-oracle"]` (see `Cargo.toml`) keeps ort out of the default test
 //! build. A missing model, tokenizer or fixture is a hard `.expect()` failure,
 //! never an early `return`. A model-gated test that silently returns and still
 //! prints `ok` is a fake gate — that exact bug shipped in asry's CI and in
@@ -134,7 +134,7 @@
 //! # Running it
 //!
 //! ```text
-//! cargo test -p alignkit --features parity-oracle -- --ignored
+//! cargo test -p coremlit --features align-oracle -- --ignored
 //! ```
 //!
 //! Needs `Models/alignkit/` (or `ALIGNKIT_TEST_MODELS`), asry's ONNX oracle in
@@ -826,7 +826,7 @@ fn ort_preflight_init_child() {
 /// loadability**: the decoy is a real `is_file()`, so it would pass any existence
 /// check, yet `ort` cannot load it, so it hangs, so the kill must fire. Hermetic
 /// (a text file in a temp dir; no ONNX Runtime, no models) and NOT `#[ignore]`, so
-/// it runs wherever `parity-oracle` builds. The short timeout is deliberate: the
+/// it runs wherever `align-oracle` builds. The short timeout is deliberate: the
 /// property under test is that a hang is KILLED, not the 30 s the real preflight
 /// waits.
 #[test]

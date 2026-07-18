@@ -6,7 +6,7 @@
 //! `afconvert -f WAVE -d LEI16@16000 -c 1 input.m4a output.wav`.
 //!
 //! Usage:
-//! `cargo run -p whisperkit --example transcribe_wav -- [wav] [model-folder] [tokenizer-folder]`
+//! `cargo run -p coremlit --example whisper_transcribe_wav -- [wav] [model-folder] [tokenizer-folder]`
 //!
 //! Defaults: the committed jfk fixture and the `Models/` layout from the
 //! README's "Getting models" section (honoring `WHISPERKIT_TEST_MODELS`).

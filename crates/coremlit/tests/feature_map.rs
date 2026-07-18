@@ -12,8 +12,9 @@
 //!   2. `FEATURE_MAP.md`'s rename table — parsed (not substring-scanned) so a
 //!      removed/altered bare-crate row reds even if the token survives elsewhere
 //!      in the doc.
-//!   3. `.github/workflows/ci.yml` — the curated `--features` combo matrix, so
-//!      dropping `whisper,vad` or an all-on combo reds.
+//!   3. `.github/workflows/ci.yml` — the curated `--features` combo matrix,
+//!      parsed structurally and compared as an exact set, so dropping OR
+//!      commenting out any curated combo (including the bare-core `""`) reds.
 //!
 //! Hermetic: pure file reads (via `CARGO_MANIFEST_DIR`), no models, no cargo
 //! invocation, no feature needs enabling.
@@ -82,21 +83,25 @@ const BARE_CRATE_MAP: &[(&str, &str)] = &[
   ("vadkit", "vad"),
 ];
 
-/// The curated CI feature combos the restructure committed to. Substring-pinned
-/// against `ci.yml` (each token is quoted, so a single feature never matches
-/// inside a longer combo), so REMOVING any combo reds. The empty `""` (none)
-/// combo is not listed — it is not substring-checkable.
-const REQUIRED_CI_COMBOS: &[&str] = &[
-  "\"whisper\"",
-  "\"align\"",
-  "\"speaker\"",
-  "\"vad\"",
-  "\"whisper,vad\"",
-  "\"align-oracle\"",
-  "\"speaker-oracle\"",
-  "\"vad-bundled\"",
-  "\"whisper,align,speaker,vad,serde,tracing,nl-recognizer\"",
-  "\"whisper,align-oracle,speaker-oracle,vad-bundled,serde,tracing,nl-recognizer\"",
+/// The curated CI feature combos the mono-crate restructure committed to — the
+/// EXACT intended set of `jobs.features.strategy.matrix.features` entries in
+/// `.github/workflows/ci.yml`, as raw (unquoted) combo strings. The empty
+/// string is a real member: the bare-core `default = []` run (ci.yml `- ""`).
+/// `ci_feature_combos` parses the ACTIVE matrix and the test asserts exact set
+/// equality against this, so removing OR commenting out any entry (the bare-core
+/// `""` included) drops it from the parsed set and reds.
+const INTENDED_CI_COMBOS: &[&str] = &[
+  "", // bare core / none (`default = []`)
+  "whisper",
+  "align",
+  "speaker",
+  "vad",
+  "whisper,vad",
+  "align-oracle",
+  "speaker-oracle",
+  "vad-bundled",
+  "whisper,align,speaker,vad,serde,tracing,nl-recognizer",
+  "whisper,align-oracle,speaker-oracle,vad-bundled,serde,tracing,nl-recognizer",
 ];
 
 /// The text of the `[features]` table (its lines, blank/comment lines included).
@@ -173,6 +178,63 @@ fn feature_deps(block: &str, feature: &str) -> BTreeSet<String> {
     .skip(1)
     .step_by(2)
     .map(str::to_string)
+    .collect()
+}
+
+/// Parse the ACTIVE `jobs.features.strategy.matrix.features` list from a ci.yml
+/// text into the set of `--features` combo strings it runs.
+///
+/// Structural, not substring: it enters the list only at the `features:` key
+/// that FOLLOWS `matrix:` (so the `features` JOB name and the `cargo build
+/// --features` step cannot be mistaken for it), collects each `- "..."` item's
+/// inner value (the empty `- ""` is the empty-string member), SKIPS any line
+/// whose first non-space char is `#` (a commented-out `# - "..."` entry does NOT
+/// count as present, and does not end the list), and stops at the first dedent
+/// to the key's column or left of it.
+fn ci_feature_combos(yaml: &str) -> BTreeSet<String> {
+  let mut combos = BTreeSet::new();
+  let mut seen_matrix = false;
+  let mut key_indent: Option<usize> = None;
+  for line in yaml.lines() {
+    let indent = line.len() - line.trim_start().len();
+    let trimmed = line.trim_start();
+    let Some(ki) = key_indent else {
+      if trimmed == "matrix:" {
+        seen_matrix = true;
+      } else if seen_matrix && trimmed == "features:" {
+        key_indent = Some(indent);
+      }
+      continue;
+    };
+    // Comments and blanks are transparent: a commented-out entry is skipped
+    // (not counted) WITHOUT terminating the list.
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+      continue;
+    }
+    // A dedent to the key's column (or left of it) ends the list.
+    if indent <= ki {
+      break;
+    }
+    if let Some(inner) = trimmed.strip_prefix("- ").and_then(quoted_inner) {
+      combos.insert(inner);
+    }
+  }
+  combos
+}
+
+/// The text between the first pair of `"` in `s` (`""` → the empty string).
+fn quoted_inner(s: &str) -> Option<String> {
+  let start = s.find('"')?;
+  let rest = &s[start + 1..];
+  let end = rest.find('"')?;
+  Some(rest[..end].to_string())
+}
+
+/// The intended CI combos as an owned set.
+fn intended_ci_combos() -> BTreeSet<String> {
+  INTENDED_CI_COMBOS
+    .iter()
+    .map(|s| (*s).to_string())
     .collect()
 }
 
@@ -288,16 +350,101 @@ fn rename_table_pins_every_bare_crate_row() {
   }
 }
 
-/// `ci.yml` still runs every curated feature combo. Each required `--features`
-/// value is substring-pinned, so removing `whisper,vad`, an oracle combo, or an
-/// all-on combo reds.
+/// Assert two combo sets are equal, naming the symmetric difference so a drift
+/// reports exactly what moved (a `""` member prints as an empty string).
+fn assert_combo_sets_eq(actual: &BTreeSet<String>, expected: &BTreeSet<String>, what: &str) {
+  let missing: Vec<&String> = expected.difference(actual).collect();
+  let unexpected: Vec<&String> = actual.difference(expected).collect();
+  assert!(
+    missing.is_empty() && unexpected.is_empty(),
+    "{what} drifted from the pinned curated set — missing (pinned but not in the \
+     active matrix): {missing:?}; unexpected (in the active matrix but not pinned): {unexpected:?}"
+  );
+}
+
+/// `ci.yml`'s ACTIVE feature matrix is EXACTLY the curated combo set. The parsed
+/// `matrix.features` set is compared for exact equality with `INTENDED_CI_COMBOS`
+/// (not substring containment), so removing a combo, commenting one out, or
+/// adding an unexpected one all red — the bare-core `""` included.
 #[test]
 fn ci_pins_the_curated_feature_combos() {
-  let ci = ci_yml();
-  for combo in REQUIRED_CI_COMBOS {
-    assert!(
-      ci.contains(combo),
-      "ci.yml feature matrix must include the {combo} combo (a removed CI combination)"
-    );
-  }
+  assert_combo_sets_eq(
+    &ci_feature_combos(&ci_yml()),
+    &intended_ci_combos(),
+    "ci.yml feature matrix",
+  );
+}
+
+/// A well-formed matrix snippet whose active `features:` list is exactly the
+/// intended set — the fixture the mutation cases below perturb. Its surrounding
+/// keys (the `features` JOB name above `matrix:`, the `steps:` dedent below)
+/// prove the parser enters at the right `features:` and stops at the dedent,
+/// rather than latching onto the job name.
+const DOCTORED_MATRIX: &str = r#"
+  features:
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - ""
+          - "whisper"
+          - "align"
+          - "speaker"
+          - "vad"
+          - "whisper,vad"
+          - "align-oracle"
+          - "speaker-oracle"
+          - "vad-bundled"
+          - "whisper,align,speaker,vad,serde,tracing,nl-recognizer"
+          - "whisper,align-oracle,speaker-oracle,vad-bundled,serde,tracing,nl-recognizer"
+    steps:
+      - uses: actions/checkout@v7
+"#;
+
+/// The parser reads the intended set from the well-formed fixture — a guard on
+/// the mutation cases below (each perturbs this same fixture).
+#[test]
+fn ci_combo_parser_reads_the_wellformed_matrix() {
+  assert_combo_sets_eq(
+    &ci_feature_combos(DOCTORED_MATRIX),
+    &intended_ci_combos(),
+    "well-formed doctored matrix",
+  );
+}
+
+/// Deleting the bare-core `- ""` entry drops it from the parsed set — the
+/// set-equality check must red (the R2 gap: the bare-core run was unpinned).
+#[test]
+fn ci_combo_check_reds_when_bare_core_is_deleted() {
+  let doctored = DOCTORED_MATRIX.replace("          - \"\"\n", "");
+  assert_ne!(
+    ci_feature_combos(&doctored),
+    intended_ci_combos(),
+    "deleting the bare-core `- \"\"` entry must make the parsed set differ from the pinned set"
+  );
+}
+
+/// Commenting out the bare-core `- ""` entry (`# - ""`) must red: comment lines
+/// are skipped (not counted), so the parsed set loses `""` — this is what the
+/// old substring `.contains()` check silently ACCEPTED.
+#[test]
+fn ci_combo_check_reds_when_bare_core_is_commented_out() {
+  let doctored = DOCTORED_MATRIX.replace("          - \"\"\n", "          # - \"\"\n");
+  assert_ne!(
+    ci_feature_combos(&doctored),
+    intended_ci_combos(),
+    "commenting out the bare-core `- \"\"` entry must make the parsed set differ from the pinned set"
+  );
+}
+
+/// Dropping any other curated combo (`whisper,vad`) must red as well.
+#[test]
+fn ci_combo_check_reds_when_a_combo_is_dropped() {
+  let doctored = DOCTORED_MATRIX.replace("          - \"whisper,vad\"\n", "");
+  assert_ne!(
+    ci_feature_combos(&doctored),
+    intended_ci_combos(),
+    "dropping the `whisper,vad` combo must make the parsed set differ from the pinned set"
+  );
 }

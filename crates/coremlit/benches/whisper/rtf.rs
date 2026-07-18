@@ -6,7 +6,7 @@
 //! tokensPerSecond` / `realTimeFactor`), so results are directly comparable
 //! to a Swift run on the same machine.
 //!
-//! Run: `cargo bench -p whisperkit --bench rtf`
+//! Run: `cargo bench -p coremlit --bench whisper_rtf`
 //! Skips (exit 0) when the tiny model is not downloaded *or* incomplete
 //! (see [`models_ready`]) — see the README's "Getting models" section.
 //! `models_ready`'s own hermetic tests run separately, under `cargo test`,

@@ -431,8 +431,8 @@ pub const fn const_str_eq(a: &str, b: &str) -> bool {
 // Unit tests for the DER calc itself — they travel WITH the calculation, so
 // every test binary that includes this module re-proves it. No models and no
 // fixtures needed: these run in the ordinary (non-`--ignored`) `--features
-// dia-oracle` suite, in BOTH `parity_e2e` and `parity_shipping_der` — whose
-// binaries are `#![cfg(feature = "speaker-oracle")]`, so a bare `--features dia`
+// speaker-oracle` suite, in BOTH `parity_e2e` and `parity_shipping_der` — whose
+// binaries are `#![cfg(feature = "speaker-oracle")]`, so a bare `--features speaker`
 // compiles each to ZERO tests instead of running these.
 // ══════════════════════════════════════════════════════════════════════
 

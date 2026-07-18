@@ -101,7 +101,7 @@
 //!
 //! `#[ignore]` (needs the gitignored `Models/argmax-speakerkit/` artifacts and
 //! the committed goldens); run via
-//! `ARGMAX_TEST_MODELS=… cargo test -p speakerkit -- --ignored`.
+//! `ARGMAX_TEST_MODELS=… cargo test -p coremlit -- --ignored`.
 
 mod common;
 

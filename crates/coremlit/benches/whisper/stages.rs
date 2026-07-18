@@ -3,7 +3,7 @@
 //! These are the spec §9.4 micro-benches: logits filters at real vocab
 //! geometry, DTW at word-alignment shape, energy-VAD chunking on 60 s of
 //! synthetic audio, and token compression ratio. Run:
-//! `cargo bench -p whisperkit --bench stages`
+//! `cargo bench -p coremlit --bench whisper_stages`
 //!
 //! `criterion_group!` below expands to a `pub fn` with no doc comment of
 //! its own; outer `#[allow]` on a `macro_rules!` invocation does not

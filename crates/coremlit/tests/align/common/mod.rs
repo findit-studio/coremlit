@@ -69,7 +69,7 @@ pub fn ted_60_wav_path() -> PathBuf {
 ///
 /// Produced by **this workspace's own whisperkit** — the real production
 /// pipeline, ASR → forced alignment — via
-/// `cargo run -p whisperkit --example transcribe_wav`, on
+/// `cargo run -p coremlit --example whisper_transcribe_wav`, on
 /// `openai_whisper-large-v3` (`argmaxinc/whisperkit-coreml`). It is therefore
 /// the *kind* of text a caller actually aligns: readable ASR output, not a
 /// hand-made verbatim transcription.

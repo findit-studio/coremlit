@@ -681,7 +681,7 @@ fn extract_empty_samples_errors() {
 // rationale, owned.rs:377-378). These reach `extract`'s own
 // defense-in-depth guards, which run BEFORE any inference. Model-gated
 // only because `extract`'s signature requires loaded models; they run
-// under `cargo test -p speakerkit --features serde -- --ignored`.
+// under `cargo test -p coremlit --features serde -- --ignored`.
 
 #[cfg(feature = "serde")]
 #[test]

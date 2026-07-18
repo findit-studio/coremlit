@@ -137,7 +137,7 @@
 //! |---|---|---|
 //! | `serde` | no | `Serialize`/`Deserialize` for [`AlignerOptions`], [`encode::EncoderOptions`] and [`AlignmentFallback`] |
 //! | `tracing` | no | structured spans over load and per-chunk alignment — the four below |
-//! | `parity-oracle` | no | **dev/test only.** Turns on `asry`'s ONNX aligner (and with it `ort` + whisper.cpp) as the oracle for the word-timing parity gate. Adds nothing to this library; see `Cargo.toml`. |
+//! | `align-oracle` | no | **dev/test only.** Turns on `asry`'s ONNX aligner (and with it `ort` + whisper.cpp) as the oracle for the word-timing parity gate. Adds nothing to this library; see `Cargo.toml`. |
 //!
 //! ## `tracing` spans
 //!
@@ -157,10 +157,10 @@
 //! # Gates
 //!
 //! ```text
-//! cargo test -p alignkit -- --ignored                            # e2e + determinism + model I/O
-//! cargo test -p alignkit --features parity-oracle -- --ignored   # + the word-timing parity gate
-//! cargo test -p alignkit --features tracing -- --ignored         # + the per-chunk span instrumentation
-//! cargo bench -p alignkit --bench align                          # encode / align_chunk, RTF
+//! cargo test -p coremlit -- --ignored                            # e2e + determinism + model I/O
+//! cargo test -p coremlit --features align-oracle -- --ignored    # + the word-timing parity gate
+//! cargo test -p coremlit --features tracing -- --ignored         # + the per-chunk span instrumentation
+//! cargo bench -p coremlit --bench align_align                    # encode / align_chunk, RTF
 //! ```
 //!
 //! None of them skip: a missing model or fixture is a hard failure, never a
@@ -172,10 +172,10 @@
 //! needs a real model to open an alignment span — and **no other gate reaches
 //! that combination**: `cargo hack test --each-feature` enables `tracing` but
 //! skips ignored tests, and the `--ignored` runs above enable no features (or
-//! `parity-oracle`). Drop this line and deleting the per-call `#[instrument]`
+//! `align-oracle`). Drop this line and deleting the per-call `#[instrument]`
 //! attributes stops being caught by anything.
 //!
-//! The `parity-oracle` gate additionally needs ONNX Runtime at **run** time
+//! The `align-oracle` gate additionally needs ONNX Runtime at **run** time
 //! (`ort` is `load-dynamic`, so the *build* needs nothing), and on Apple
 //! Silicon `brew install onnxruntime` alone is not enough: Homebrew's
 //! `/opt/homebrew/lib` is on neither `DYLD_LIBRARY_PATH` nor dyld's fallback
@@ -183,7 +183,7 @@
 //!
 //! ```text
 //! ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib \
-//!   cargo test -p alignkit --features parity-oracle -- --ignored
+//!   cargo test -p coremlit --features align-oracle -- --ignored
 //! ```
 //!
 //! This matters more than a normal missing-dependency note, because when `ort`

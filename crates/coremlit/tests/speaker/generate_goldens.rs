@@ -8,13 +8,13 @@
 //! (`tests/parity_seg.rs`, `tests/parity_embed.rs`) then check CoreML against
 //! those committed goldens WITHOUT needing dia/ort at all.
 //!
-//! Gated on the `dia-oracle` feature (dia's own ort inference path) so the
+//! Gated on the `speaker-oracle` feature (dia's own ort inference path) so the
 //! default build compiles this file to nothing (it links `ort` + a 27 MB ONNX
 //! otherwise). `#[ignore]` so it never runs in an ordinary `cargo test`, AND
 //! gated on the `UPDATE_GOLDEN` environment variable so it never rewrites the
 //! committed oracle as a *side effect* of a routine `--ignored` sweep
 //! (whisperkit's convention, see `crates/whisperkit/tests/parity_jfk.rs`):
-//! `cargo test -p speakerkit --features dia-oracle -- --ignored` runs every
+//! `cargo test -p coremlit --features speaker-oracle -- --ignored` runs every
 //! `#[ignore]` test including this one,
 //! so without the env guard that standard gate would silently re-baseline the
 //! goldens it exists to validate. Without `UPDATE_GOLDEN` set this test is an
@@ -22,13 +22,13 @@
 //! human-verified act:
 //!
 //! ```text
-//! UPDATE_GOLDEN=1 cargo test -p speakerkit --features dia-oracle --test generate_goldens -- --ignored --nocapture
+//! UPDATE_GOLDEN=1 cargo test -p coremlit --features speaker-oracle --test speaker_generate_goldens -- --ignored --nocapture
 //! ```
 //!
 //! Provisioning (proven working standalone before this harness was wired):
 //! - Segmentation ONNX is `dia::segment::SegmentModel::bundled()` — embedded
 //!   in the `dia` crate via `include_bytes!` (`bundled-segmentation`, which the
-//!   `dia-oracle` feature enables), no file needed.
+//!   `speaker-oracle` feature enables), no file needed.
 //! - Embedding ONNX is the BYO fp32 `wespeaker_resnet34_lm.onnx`; path via
 //!   `DIA_EMBED_MODEL_PATH` or the sibling `diarization/models/` checkout.
 //! - `ort` self-provisions `libonnxruntime` via its default `download-binaries`
@@ -147,12 +147,12 @@ fn dia_hard_multilabel(logits: &[f32], num_frames: usize) -> Vec<f64> {
 }
 
 #[test]
-#[ignore = "rewrites committed goldens; set UPDATE_GOLDEN=1 + `dia-oracle` feature + wespeaker ONNX"]
+#[ignore = "rewrites committed goldens; set UPDATE_GOLDEN=1 + `speaker-oracle` feature + wespeaker ONNX"]
 fn generate_goldens() {
   // WRITE GUARD (whisperkit's `UPDATE_GOLDEN` convention, `parity_jfk.rs`):
   // this test's whole body OVERWRITES the committed golden oracle
   // (`tests/speaker/fixtures/golden/*.json`), so it must never fire from a routine
-  // `cargo test -p speakerkit --features dia-oracle -- --ignored` — that gate runs
+  // `cargo test -p coremlit --features speaker-oracle -- --ignored` — that gate runs
   // every `#[ignore]` test, and an unconditional writer here silently
   // re-baselines the very oracle `tests/parity_seg.rs` / `parity_embed.rs`
   // validate against. Unset ⇒ explicit no-op: no models loaded, no files

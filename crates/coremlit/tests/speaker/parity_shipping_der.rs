@@ -141,7 +141,7 @@
 //! `diarization` ONNX + fixtures, and `ort`). Run with:
 //!
 //! ```text
-//! cargo test -p speakerkit --features dia-oracle --test parity_shipping_der -- --ignored --nocapture
+//! cargo test -p coremlit --features speaker-oracle --test speaker_parity_shipping_der -- --ignored --nocapture
 //! ```
 #![cfg(feature = "speaker-oracle")]
 
