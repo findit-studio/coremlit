@@ -1,0 +1,136 @@
+coremlit — third-party attribution NOTICE
+Copyright the coremlit authors
+
+The coremlit Rust source is dual-licensed under MIT OR Apache-2.0 (caller's
+choice). See LICENSE-MIT and LICENSE-APACHE for those terms.
+
+NOTE: coremlit ships NO model files. Each feature-gated audio pipeline
+(audio::whisper / audio::align / audio::speaker / audio::vad) LOADS, at
+runtime, CoreML model artifacts that a downstream user fetches separately from
+Hugging Face (see the crate README and each module's tests/<kit>/model_io.rs
+for the repo id, revision, and per-file SHA-256). This NOTICE records the
+attribution a binary that distributes or bundles those models must honor.
+
+Sections 1-2 (the audio::vad models) are preserved verbatim from the former
+vadkit NOTICE. Sections 3-5 record the whisper, speaker, and align model
+attributions folded in by the mono-crate restructure. Both audio::vad
+components below are MIT.
+
+────────────────────────────────────────────────────────────────────────
+1. Silero VAD (upstream model)
+
+The voice-activity-detection model vadkit runs is Silero VAD, from the
+upstream Silero project. vadkit does not modify or redistribute the upstream
+model; it loads FluidInference's CoreML conversion of it (section 2).
+
+  Upstream project: https://github.com/snakers4/silero-vad
+  Upstream license at the time this crate was written: MIT
+
+The upstream Silero project distributes the model under the MIT license.
+Preserve the upstream copyright and permission notice when redistributing a
+binary that includes the model.
+
+Upstream MIT notice:
+
+  MIT License
+
+  Copyright (c) 2020-present Silero Team
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+
+────────────────────────────────────────────────────────────────────────
+2. FluidInference silero-vad-coreml (CoreML conversion)
+
+The exact artifact vadkit loads is FluidInference's CoreML conversion of
+Silero VAD — the unified 256 ms model `silero-vad-unified-256ms-v6.2.1`.
+
+  Source: https://huggingface.co/FluidInference/silero-vad-coreml
+  Revision (commit SHA): b419383c55c110e2c9271fa6ee0ea83d03c70d96
+  Artifact: silero-vad-unified-256ms-v6.2.1.mlmodelc
+  License: MIT (HuggingFace cardData.license = mit)
+
+The FluidInference conversion is distributed under the MIT license. MIT
+requires preserving the notice; this record (repo id, revision, license) is
+that preservation for the conversion, alongside the upstream Silero notice in
+section 1.
+
+────────────────────────────────────────────────────────────────────────
+3. Whisper models (audio::whisper)
+
+audio::whisper is a Rust port of Argmax's WhisperKit (MIT,
+https://github.com/argmaxinc/WhisperKit). It loads the compiled WhisperKit
+CoreML bundles from argmaxinc/whisperkit-coreml
+(https://huggingface.co/argmaxinc/whisperkit-coreml); the underlying Whisper
+model is OpenAI's (https://github.com/openai/whisper, MIT). Preserve the
+WhisperKit and OpenAI Whisper notices when redistributing a binary that
+includes these weights.
+
+────────────────────────────────────────────────────────────────────────
+4. Speaker-diarization models (audio::speaker)
+
+audio::speaker runs pyannote's segmentation net and the WeSpeaker embedder on
+CoreML and feeds dia's community-1 PLDA clustering. Attribution obligations:
+
+  - pyannote/speaker-diarization-community-1 (the PLDA dia clusters through):
+    CC-BY-4.0 — REQUIRES attribution.
+  - pyannote/segmentation-3.0 (both sources' segmenters derive from it): MIT.
+  - WeSpeaker embedder (wenet-e2e/wespeaker): see its model license
+    (https://github.com/wenet-e2e/wespeaker).
+  - FluidInference/speaker-diarization-coreml (the default source's CoreML
+    conversion): SDK Apache-2.0; parent pyannote model cc-by-4.0.
+  - argmaxinc/speakerkit-coreml (the optional argmax source's conversion):
+    NO declared license on the HF repo — undeclared defaults to all rights
+    reserved on the converted artifact; argmax's Swift code
+    (argmaxinc/argmax-oss-swift) is MIT. Enabling the argmax source in a
+    distributed product means the caller assumes the licensing risk on those
+    CoreML artifacts.
+
+If you ship a product built on this pipeline, include the CC-BY-4.0
+attribution (reproduced from FluidAudio's model card, citing the papers):
+
+  @inproceedings{Plaquet23,
+    author={Alexis Plaquet and Hervé Bredin},
+    title={{Powerset multi-class cross entropy loss for neural speaker diarization}},
+    year=2023,
+    booktitle={Proc. INTERSPEECH 2023},
+  }
+
+  @inproceedings{Wang2023,
+    title={Wespeaker: A research and production oriented speaker embedding learning toolkit},
+    author={Wang, Hongji and Liang, Chengdong and Wang, Shuai and Chen, Zhengyang and Zhang, Binbin and Xiang, Xu and Deng, Yanlei and Qian, Yanmin},
+    booktitle={ICASSP 2023, IEEE International Conference on Acoustics, Speech and Signal Processing (ICASSP)},
+    pages={1--5},
+    year={2023},
+    organization={IEEE}
+  }
+
+  @article{Landini2022,
+    author={Landini, Federico and Profant, J{\'a}n and Diez, Mireia and Burget, Luk{\'a}{\v{s}}},
+    title={{Bayesian HMM clustering of x-vector sequences (VBx) in speaker diarization: theory, implementation and analysis on standard tasks}},
+    year={2022},
+    journal={Computer Speech \& Language},
+  }
+
+────────────────────────────────────────────────────────────────────────
+5. Forced-alignment model (audio::align)
+
+audio::align pairs a CoreML wav2vec2 CTC acoustic encoder
+(chordai/wav2vec2-base960h-aligner-coreml, Apache-2.0) with asry's
+parity-tested alignment seam. Preserve the chordai Apache-2.0 notice when
+redistributing the encoder weights.

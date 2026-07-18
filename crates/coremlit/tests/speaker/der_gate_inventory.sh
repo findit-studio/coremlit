@@ -2,10 +2,10 @@
 # F1 gate-inventory check: prove the end-to-end DER gates are actually COMPILED
 # and still #[ignore]d — not silently feature-gated out, deleted, or un-ignored.
 #
-# The DER binaries (`tests/parity_e2e.rs`, `tests/parity_shipping_der.rs`) are
-# `#![cfg(feature = "dia-oracle")]` — they need dia's own ort inference path as
-# the parity oracle. Without `--features dia-oracle` they compile to nothing, so
-# `cargo test -p speakerkit -- --ignored` reports a green sweep containing
+# The DER binaries (`tests/speaker/parity_e2e.rs`, `tests/speaker/parity_shipping_der.rs`) are
+# `#![cfg(feature = "speaker-oracle")]` — they need dia's own ort inference path as
+# the parity oracle. Without `--features speaker-oracle` they compile to nothing, so
+# `cargo test -p coremlit --features speaker -- --ignored` reports a green sweep containing
 # ZERO DER tests. Every load-bearing gate here is ALSO `#[ignore]`d (each needs
 # the gitignored `Models/` tree plus the sibling `diarization` fixtures), and
 # the README drives them with `cargo test ... -- --ignored`.
@@ -42,7 +42,7 @@
 # (`check_ordinary`), asserted present-and-not-`#[ignore]`d BEFORE the suite runs,
 # the ordinary-test analogue of the `#[ignore]`d-gate manifests below.
 #
-# Run from the workspace root: crates/speakerkit/tests/der_gate_inventory.sh
+# Run from the workspace root: crates/coremlit/tests/speaker/der_gate_inventory.sh
 # Kept a shell script (not a `cargo test`) on purpose: it must shell out to
 # `cargo`, which cannot nest inside a `cargo test` run without deadlocking on
 # the target-dir lock. Written for bash 3.2 (macOS default) — no associative
@@ -59,16 +59,16 @@ check_bin() {
   # (compile noise) dropped. Used only for non-vacuity and to tell a DELETED
   # gate from an UN-IGNORED one. A compile FAILURE still surfaces because
   # `cargo` exits non-zero and the empty list below trips the hard-fail.
-  all="$(cargo test -p speakerkit --features dia-oracle --test "${bin}" -- --list 2>/dev/null || true)"
+  all="$(cargo test -p coremlit --features speaker-oracle --test "speaker_${bin}" -- --list 2>/dev/null || true)"
   count="$(printf '%s\n' "${all}" | grep -c ': test$' || true)"
   if [ "${count}" -eq 0 ]; then
     echo "  FAIL: 0 tests listed for ${bin} — it compiled to nothing."
-    echo "        (missing --features dia-oracle, a broken #![cfg(feature = \"dia-oracle\")] gate, or a build error)"
+    echo "        (missing --features speaker-oracle, a broken #![cfg(feature = \"speaker-oracle\")] gate, or a build error)"
     return 1
   fi
   # `--list --ignored`: the SAME `NAME: test` shape, but restricted to ignored
   # tests. This is what distinguishes an ignored gate from an un-ignored one.
-  ignored="$(cargo test -p speakerkit --features dia-oracle --test "${bin}" -- --list --ignored 2>/dev/null || true)"
+  ignored="$(cargo test -p coremlit --features speaker-oracle --test "speaker_${bin}" -- --list --ignored 2>/dev/null || true)"
   ignored_count="$(printf '%s\n' "${ignored}" | grep -c ': test$' || true)"
   echo "  ${count} tests listed (${ignored_count} ignored)"
   rc=0
@@ -97,7 +97,7 @@ check_bin() {
 run_ordinary() {
   bin="$1"
   echo "== ${bin} (ordinary suite) =="
-  out="$(cargo test -p speakerkit --features dia-oracle --test "${bin}" 2>&1)" || {
+  out="$(cargo test -p coremlit --features speaker-oracle --test "speaker_${bin}" 2>&1)" || {
     printf '%s\n' "${out}" | tail -25
     echo "  FAIL: ${bin} ordinary suite did not pass — a hermetic gate (der_calc math or a"
     echo "        mutation-proof pin guard) is red."
@@ -128,8 +128,8 @@ check_ordinary() {
   bin="$1"
   shift
   echo "== ${bin} (required ordinary gates) =="
-  all="$(cargo test -p speakerkit --features dia-oracle --test "${bin}" -- --list 2>/dev/null || true)"
-  ignored="$(cargo test -p speakerkit --features dia-oracle --test "${bin}" -- --list --ignored 2>/dev/null || true)"
+  all="$(cargo test -p coremlit --features speaker-oracle --test "speaker_${bin}" -- --list 2>/dev/null || true)"
+  ignored="$(cargo test -p coremlit --features speaker-oracle --test "speaker_${bin}" -- --list --ignored 2>/dev/null || true)"
   rc=0
   for name in "$@"; do
     if ! printf '%s\n' "${all}" | grep -q "^${name}: test$"; then
