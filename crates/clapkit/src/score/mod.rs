@@ -14,9 +14,13 @@ use crate::{embedding::Embedding, window::WindowEmbedding};
 #[cfg(test)]
 mod tests;
 
-/// CLAP **audio-side** logit scale, `logit_scale_a.exp()`, pinned from the
-/// `laion/clap-htsat-unfused` config (`@8fa0f1c6…`,
-/// `logit_scale_a.exp() == 18.661177` as f32).
+/// CLAP **audio-side** logit scale, the **learned** checkpoint parameter
+/// `model.logit_scale_a.exp() == 18.661177` (f32), read from the trained
+/// `laion/clap-htsat-unfused` weights (`@8fa0f1c6…`, via
+/// `conversion/scripts/inspect_struct.py`) — **not** the config. The config
+/// carries only the *initialization* value `logit_scale_init_value`
+/// (`exp() = 14.285714`); training moved the audio scale to 18.661177, so
+/// re-deriving "from config" would pin the wrong temperature.
 ///
 /// Zero-shot audio classification scales `audio·text` by this before a softmax
 /// over labels (HF `ClapModel.logits_per_audio`). Because it is a positive
@@ -24,10 +28,13 @@ mod tests;
 /// downstream softmax's temperature.
 pub const LOGIT_SCALE_AUDIO: f32 = 18.661177;
 
-/// CLAP **text-side** logit scale, `logit_scale_t.exp() == 14.285714` (f32) —
-/// the counterpart used for `logits_per_text`. clapkit scores audio against text
+/// CLAP **text-side** logit scale, the learned checkpoint parameter
+/// `model.logit_scale_t.exp() == 14.285714` (f32) — the counterpart used for
+/// `logits_per_text`. On this checkpoint the trained text scale coincides with
+/// the config's `logit_scale_init_value` exp (`14.285714`), but it is still read
+/// from the learned parameter, not the config. clapkit scores audio against text
 /// labels, so [`LOGIT_SCALE_AUDIO`] is the one [`ScoreMode::LogitScaled`] applies;
-/// this is provided for parity with the model config.
+/// this is provided for completeness.
 pub const LOGIT_SCALE_TEXT: f32 = 14.285714;
 
 /// How a zero-shot score is derived from the audio↔text cosine.
