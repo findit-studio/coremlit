@@ -150,11 +150,11 @@ use std::{
   time::{Duration, Instant},
 };
 
-use alignkit::{
+use asry::Aligner as OrtAligner;
+use coremlit::audio::align::{
   ANALYSIS_TIMEBASE, Aligner, EnglishNormalizer, Lang, OutputClock, TimeRange, Word,
   default_oov_decisions,
 };
-use asry::Aligner as OrtAligner;
 
 /// 16 kHz: 16 samples per millisecond. Word PTS are 16 kHz sample indices
 /// (both aligners are anchored at stream sample 0 in [`ANALYSIS_TIMEBASE`]),
@@ -234,7 +234,7 @@ const GROSS_DELTA_MS: f64 = 150.0;
 /// # Why a ledger and not a max-delta bound
 ///
 /// Because a max-delta bound here is not merely weak, it is **inverted** —
-/// measured, not argued. Mutating [`alignkit::encode::DEFAULT_ENCODER_COMPUTE`]
+/// measured, not argued. Mutating [`coremlit::audio::align::encode::DEFAULT_ENCODER_COMPUTE`]
 /// to `ComputeUnits::All` (the ANE placement, whose fp16 `log(softmax)` tail
 /// saturates 16.7% of emission cells to a `-45440` sentinel) gave — a
 /// pre-truncation-fix measurement, whose exact ms shifted with the fix (the
@@ -399,7 +399,7 @@ const MAX_TED_60_P90_BOUNDARY_DELTA_MS: f64 = FRAME_MS;
 /// # Why a ledger and not a max-delta bound — measured on THIS clip
 ///
 /// Because on ted_60 a max-delta bound is not merely weak, it is **inverted**,
-/// and more starkly than on jfk. Mutating [`alignkit::encode::DEFAULT_ENCODER_COMPUTE`]
+/// and more starkly than on jfk. Mutating [`coremlit::audio::align::encode::DEFAULT_ENCODER_COMPUTE`]
 /// to `ComputeUnits::All`:
 ///
 /// | | correct (`CpuOnly`) | **corrupted (`All`)** |
@@ -957,7 +957,7 @@ fn align_with_asry_ort(aligner: &mut OrtAligner, samples: &[f32], text: &str) ->
 ///
 /// | call | empty `sub_segments` means |
 /// |---|---|
-/// | `alignkit::Aligner::align_chunk` | `SpeechSpans::all_speech()` — every sample is speech |
+/// | `coremlit::audio::align::Aligner::align_chunk` | `SpeechSpans::all_speech()` — every sample is speech |
 /// | `asry::Aligner::align_chunk` | `SpeechSpans::from_time_ranges(&[])` → **no speech at all** |
 ///
 /// asry's own `SpeechSpans` doc calls this out ("mean 'no VAD' and get 'all
@@ -996,7 +996,7 @@ fn jfk_samples() -> Vec<f32> {
 /// fills the encoder window *exactly*.
 ///
 /// The length assertion is not a tautology of the digest — it is the one that
-/// says what this fixture is FOR. At exactly [`alignkit::encode::ENCODER_WINDOW_SAMPLES`]
+/// says what this fixture is FOR. At exactly [`coremlit::audio::align::encode::ENCODER_WINDOW_SAMPLES`]
 /// samples, `Encoder::emissions_raw` borrows the caller's buffer and appends no
 /// zeros at all; one sample fewer and it silently takes the zero-fill branch,
 /// which would quietly convert this test back into a second copy of the padded
@@ -1007,12 +1007,12 @@ fn ted_60_samples() -> Vec<f32> {
   let samples = common::load_wav_mono_f32(&common::ted_60_wav_path());
   assert_eq!(
     samples.len(),
-    alignkit::encode::ENCODER_WINDOW_SAMPLES,
+    coremlit::audio::align::encode::ENCODER_WINDOW_SAMPLES,
     "ted_60.wav is {} samples, not the {} that exactly fill the encoder window. This fixture's \
      entire purpose is the ZERO-PADDING-FREE path (`emissions_raw`'s `Cow::Borrowed` branch); at \
      any other length alignkit pads, and this test degenerates into a second padded clip.",
     samples.len(),
-    alignkit::encode::ENCODER_WINDOW_SAMPLES,
+    coremlit::audio::align::encode::ENCODER_WINDOW_SAMPLES,
   );
   assert_eq!(
     common::sha256_samples_hex(&samples),
@@ -1237,7 +1237,7 @@ fn fixed_window_padding_does_not_explain_the_divergence() {
   let text = common::JFK_TRANSCRIPT;
 
   let mut padded = samples.clone();
-  padded.resize(alignkit::encode::ENCODER_WINDOW_SAMPLES, 0.0);
+  padded.resize(coremlit::audio::align::encode::ENCODER_WINDOW_SAMPLES, 0.0);
 
   let mut ort = load_asry_ort();
   let bare = align_with_asry_ort(&mut ort, &samples, text);

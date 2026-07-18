@@ -42,7 +42,7 @@
 
 mod common;
 
-use whisperkit::{
+use coremlit::audio::whisper::{
   options::{
     DEFAULT_DECODER_COMPUTE_UNITS, DEFAULT_ENCODER_COMPUTE_UNITS, DEFAULT_MEL_COMPUTE_UNITS,
     DecodingOptions, Options,

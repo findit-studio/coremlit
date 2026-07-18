@@ -1345,7 +1345,7 @@ fn emissions_pass_the_normalization_guard_on_real_speech() {
 /// LOUDLY (never skips) if that path ever moves.
 fn load_jfk_wav() -> Vec<f32> {
   let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-    .join("../whisperkit/tests/fixtures/audio/jfk.wav");
+    .join("tests/whisper/fixtures/audio/jfk.wav");
   let mut reader = hound::WavReader::open(&path)
     .unwrap_or_else(|e| panic!("open the jfk.wav fixture at {path:?}: {e}"));
   let spec = reader.spec();
@@ -1365,7 +1365,7 @@ fn load_jfk_wav() -> Vec<f32> {
 /// the clip stops filling the window.
 fn load_ted_60_wav() -> Vec<f32> {
   let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-    .join("../whisperkit/tests/fixtures/audio/ted_60.wav");
+    .join("tests/whisper/fixtures/audio/ted_60.wav");
   let mut reader = hound::WavReader::open(&path)
     .unwrap_or_else(|e| panic!("open the ted_60.wav fixture at {path:?}: {e}"));
   let spec = reader.spec();

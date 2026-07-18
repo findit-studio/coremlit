@@ -6,19 +6,23 @@
 //!
 //! Gated on the `vadkit` feature, so the whole file compiles only when the
 //! source under test exists.
-#![cfg(feature = "vadkit")]
+#![cfg(feature = "vad")]
 
 mod common;
 
 use std::path::PathBuf;
 
-use coremlit::ComputeUnits;
-use vadkit::VadModelOptions;
-use whisperkit::{
-  audio::vad::DEFAULT_FRAME_LENGTH_SAMPLES,
-  options::{ChunkingStrategy, DecodingOptions, Options},
-  silero_vad::SileroVad,
-  transcribe::WhisperKit,
+use coremlit::{
+  ComputeUnits,
+  audio::{
+    vad::VadModelOptions,
+    whisper::{
+      audio::vad::DEFAULT_FRAME_LENGTH_SAMPLES,
+      options::{ChunkingStrategy, DecodingOptions, Options},
+      silero_vad::SileroVad,
+      transcribe::WhisperKit,
+    },
+  },
 };
 
 /// Path to the compiled vadkit VAD artifact — `VADKIT_TEST_MODELS` or

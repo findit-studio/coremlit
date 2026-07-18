@@ -289,7 +289,7 @@ impl SpanKnowledge {
 /// [`Self::observed_clean`].
 ///
 /// ```
-/// use whisperkit::task_facts::{SpanKnowledge, TaskFacts};
+/// use coremlit::audio::whisper::task_facts::{SpanKnowledge, TaskFacts};
 ///
 /// // A single run at worker 2 that observed Spanish, drew from the sampler,
 /// // was not truncated, and allocated exactly 3 segment ordinals.
@@ -781,7 +781,7 @@ impl TaskFacts {
   /// - every grouping agrees, because [the merge](Self::merge) is associative.
   ///
   /// ```
-  /// use whisperkit::task_facts::TaskFacts;
+  /// use coremlit::audio::whisper::task_facts::TaskFacts;
   ///
   /// // The empty fold IS the identity: it yields unknown().
   /// let no_contributors: [&TaskFacts; 0] = [];

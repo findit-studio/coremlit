@@ -37,14 +37,14 @@
 //! Both models run on ort's CPU EP (dia registers no execution provider here —
 //! `speakerkit`'s `dia` feature enables none of dia's per-EP features), the
 //! matched reference for CoreML's own deterministic `CpuOnly` parity runs.
-#![cfg(feature = "dia-oracle")]
+#![cfg(feature = "speaker-oracle")]
 
 mod common;
 
 use std::io::Write as _;
 
+use coremlit::audio::speaker::segment::{POWERSET_CLASSES, SEG_NUM_SLOTS};
 use dia::{embed::EmbedModel, segment::SegmentModel};
-use speakerkit::segment::{POWERSET_CLASSES, SEG_NUM_SLOTS};
 
 /// dia's community-1 onset (`diarization/src/offline/owned.rs:144`;
 /// speakerkit's `window::DEFAULT_ONSET`). On the hard 0/1 multilabel a slot is
@@ -125,7 +125,7 @@ fn derive_slot_masks(chunk_segs: &[f64], num_frames: usize) -> [Option<Vec<bool>
 /// the committed oracle is decoded byte-for-byte as dia's pipeline decodes it.
 /// speakerkit's shipping `multilabel` argmaxes the log-probs DIRECTLY (no
 /// softmax); that is order-for-order identical to this over reals (a per-row
-/// constant shift — see `speakerkit::segment`'s module doc), but over f32 the
+/// constant shift — see `coremlit::audio::speaker::segment`'s module doc), but over f32 the
 /// two can differ on a near-tie where `softmax`'s `exp` collapses two
 /// one-ULP-apart log-probs onto the same probability. The oracle must decode the
 /// way dia actually does; `parity_seg.rs::golden_direct_and_dia_decode_agree`
@@ -263,7 +263,7 @@ fn generate_goldens() {
       "sample_count": samples.len(),
       // Legacy provenance label, pinned in `common` and kept verbatim to match
       // the committed oracle (the values are log-probabilities — see
-      // `common::SEG_MODEL_LABEL` and `speakerkit::segment`'s module doc).
+      // `common::SEG_MODEL_LABEL` and `coremlit::audio::speaker::segment`'s module doc).
       "seg_model": common::SEG_MODEL_LABEL,
       "embed_model": "wespeaker_resnet34_lm.onnx (dia BYO, ort CPU EP, fp32)",
       "onset": ONSET,

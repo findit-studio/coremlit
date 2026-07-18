@@ -61,8 +61,9 @@
 
 mod common;
 
-use alignkit::encode::DEFAULT_ENCODER_COMPUTE;
-use coremlit::{DataType, Features, Model, MultiArray};
+use coremlit::{
+  DataType, Features, Model, MultiArray, audio::align::encode::DEFAULT_ENCODER_COMPUTE,
+};
 
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
@@ -182,7 +183,7 @@ fn run_emissions(model: &Model, waveform: &[f32]) -> Vec<f32> {
 ///
 /// SUPERSEDED AS EVIDENCE, retained as a check: the model's `.mil` graph
 /// settles the question directly — its final ops are `softmax` → `log` →
-/// `cast(fp32)` (quoted in `alignkit::encode`'s module doc). The verdict below
+/// `cast(fp32)` (quoted in `coremlit::audio::align::encode`'s module doc). The verdict below
 /// is inferred from measured values; the graph states it. The two agree.
 #[test]
 #[ignore = "requires local alignkit models (ALIGNKIT_TEST_MODELS)"]
@@ -207,7 +208,7 @@ fn emissions_are_log_probs_not_raw_logits() {
   // Do NOT "fix" a future positive max by clamping in `Encoder::emissions`: a
   // positive max is the signal that the model has been swapped for a
   // raw-logit CTC head, which `Emissions::from_log_probs` must be allowed to
-  // reject loudly. See `alignkit::encode`'s module doc.
+  // reject loudly. See `coremlit::audio::align::encode`'s module doc.
   let max_value = emissions.iter().copied().fold(f32::NEG_INFINITY, f32::max);
   assert!(
     max_value <= 1e-3,

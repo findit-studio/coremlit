@@ -48,7 +48,7 @@ fi
 # path from the speakerkit crate (`tests/common/mod.rs`'s FIXTURES). Together
 # they exceed 40 chunks over >= 2 clips and exercise the short-final-chunk
 # repeat-last padding path.
-audio="$workspace/crates/speakerkit/tests/fixtures/audio"
+audio="$workspace/crates/coremlit/tests/speaker/fixtures/audio"
 fixtures="02_pyannote_sample=$audio/02_pyannote_sample.wav"
 fixtures="$fixtures;07_yuhewei_dongbei_english=$audio/07_yuhewei_dongbei_english.wav"
 

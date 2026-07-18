@@ -2442,8 +2442,8 @@ pub fn merge_transcription_results(results: &[TranscriptionResult]) -> Transcrip
 /// `[0, 1]` therefore merge to `[0, 2, 3, 4]` dropped but `[0, 1, 1, 2]` not:
 ///
 /// ```
-/// use whisperkit::options::DecodingOptions;
-/// use whisperkit::result::{
+/// use coremlit::audio::whisper::options::DecodingOptions;
+/// use coremlit::audio::whisper::result::{
 ///   TranscriptionResult, TranscriptionSegment, TranscriptionTimings,
 ///   merge_transcription_results_with_options,
 /// };

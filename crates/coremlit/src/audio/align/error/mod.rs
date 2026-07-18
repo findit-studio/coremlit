@@ -139,7 +139,7 @@ pub enum AlignError {
      (min = {min}), the fp16 `log(0)` saturation sentinel. The encoder was scheduled on \
      {compute:?}: this model's fp16 `log(softmax(·))` tail underflows on the Apple Neural \
      Engine and its word timings shift by hundreds of milliseconds. Load the encoder on \
-     `alignkit::encode::DEFAULT_ENCODER_COMPUTE` (the default, and the fastest correct \
+     `coremlit::audio::align::encode::DEFAULT_ENCODER_COMPUTE` (the default, and the fastest correct \
      placement) — or re-convert the model with a fused `log_softmax` tail.",
     floor = crate::audio::align::encode::LOG_PROB_FLOOR,
   )]

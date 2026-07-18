@@ -40,7 +40,7 @@ use std::{
   path::{Path, PathBuf},
 };
 
-use alignkit::{
+use coremlit::audio::align::{
   ANALYSIS_TIMEBASE, Aligner, EnglishNormalizer, Lang, OutputClock, default_oov_decisions,
   encode::{Encoder, EncoderInput},
 };
@@ -83,7 +83,7 @@ fn load_wav_mono_f32(path: &Path) -> Vec<f32> {
 fn bench_align(c: &mut Criterion) {
   let model = models_dir().join("base960h_aligner.mlmodelc");
   let samples = load_wav_mono_f32(
-    &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../whisperkit/tests/fixtures/audio/jfk.wav"),
+    &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/whisper/fixtures/audio/jfk.wav"),
   );
 
   // `from_paths` / `from_file` → the SHIPPING defaults, never a hardcoded

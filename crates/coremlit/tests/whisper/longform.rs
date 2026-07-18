@@ -6,7 +6,7 @@
 
 mod common;
 
-use whisperkit::{
+use coremlit::audio::whisper::{
   options::{ChunkingStrategy, DecodingOptions, Options},
   transcribe::WhisperKit,
 };

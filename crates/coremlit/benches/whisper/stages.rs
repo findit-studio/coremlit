@@ -15,8 +15,7 @@
 
 use std::hint::black_box;
 
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
-use whisperkit::{
+use coremlit::audio::whisper::{
   audio::{
     chunker::VadChunker,
     vad::{EnergyVad, VoiceActivityDetector},
@@ -30,6 +29,7 @@ use whisperkit::{
   text::compression_ratio_of_tokens,
   tokenizer::SpecialTokens,
 };
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 
 /// Tiny-model vocabulary size — the buffer every filter scans.
 const VOCAB: usize = 51_865;

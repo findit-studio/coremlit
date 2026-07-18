@@ -3,7 +3,7 @@
 
 mod common;
 
-use whisperkit::{
+use coremlit::audio::whisper::{
   options::{DecodingOptions, Options},
   transcribe::WhisperKit,
 };
@@ -23,7 +23,7 @@ fn jfk_simulated_stream_confirms_the_transcript() {
     streamer.push_samples(chunk).unwrap();
   }
   let final_result = streamer.finalize();
-  let normalized = whisperkit::text::normalized(final_result.text());
+  let normalized = coremlit::audio::whisper::text::normalized(final_result.text());
   assert!(
     normalized.contains("ask not what your country can do for you"),
     "confirmed stream text diverged: {normalized}"

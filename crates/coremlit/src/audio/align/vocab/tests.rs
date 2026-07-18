@@ -49,7 +49,8 @@ const DICT_ENTRIES: [(&str, u32); VOCAB_SIZE] = [
 /// rustdoc caution about using it as a *runtime* asset path, that concern
 /// doesn't apply here.
 fn asset_path() -> PathBuf {
-  Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/chordai_base960h_tokenizer.json")
+  Path::new(env!("CARGO_MANIFEST_DIR"))
+    .join("src/audio/align/assets/chordai_base960h_tokenizer.json")
 }
 
 /// Parses the embedded asset. Same call asry's `load_tokenizer_with_compat`

@@ -170,7 +170,7 @@
 //! diarization output** on the clip, captured and committed — NOT human
 //! annotation. The files carry their own machine lineage: their segment
 //! durations are multiples of 0.017 s — pyannote's 16.875 ms output-frame step
-//! (`speakerkit::window::FRAME_STEP_S`) at the RTTM's 3 decimal places — and 10
+//! (`coremlit::audio::speaker::window::FRAME_STEP_S`) at the RTTM's 3 decimal places — and 10
 //! of the 14 contain a segment exactly one frame long. No human placed those
 //! boundaries.
 //!
@@ -197,7 +197,7 @@
 //! Part D dominates the runtime (~46 min of audio through three pipelines each,
 //! ~77 min of CPU); its four clips are separate `#[test]`s so cargo's default
 //! thread pool runs them concurrently.
-#![cfg(feature = "dia-oracle")]
+#![cfg(feature = "speaker-oracle")]
 
 mod common;
 mod der_calc;
@@ -207,17 +207,20 @@ use std::{
   path::{Path, PathBuf},
 };
 
-use coremlit::ComputeUnits;
+use coremlit::{
+  ComputeUnits,
+  audio::speaker::{
+    embed::{EmbedModel, EmbedModelOptions},
+    extract::{Extraction, Options},
+    segment::{SegmentModel, SegmentModelOptions},
+    source::{
+      ArgmaxComputeOptions, ArgmaxOptions, ArgmaxSource, ArgmaxVariant, FluidAudioSource,
+      ModelSource,
+    },
+  },
+};
 use der_calc::{
   Seg, approx, const_str_eq, der_std, der_strict, distinct_speakers, fmt_der, parse_rttm,
-};
-use speakerkit::{
-  embed::{EmbedModel, EmbedModelOptions},
-  extract::{Extraction, Options},
-  segment::{SegmentModel, SegmentModelOptions},
-  source::{
-    ArgmaxComputeOptions, ArgmaxOptions, ArgmaxSource, ArgmaxVariant, FluidAudioSource, ModelSource,
-  },
 };
 
 // ══════════════════════════════════════════════════════════════════════

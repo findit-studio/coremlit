@@ -31,8 +31,10 @@
 
 mod common;
 
-use coremlit::ComputeUnits;
-use speakerkit::embed::{EmbedModel, EmbedModelOptions};
+use coremlit::{
+  ComputeUnits,
+  audio::speaker::embed::{EmbedModel, EmbedModelOptions},
+};
 
 /// Gate-2 cosine floor: min per-`(chunk, slot)` cosine between fp32 CoreML and
 /// fp32 dia-ort raw embeddings. Starting point 0.9999 (spec §6.2), settled

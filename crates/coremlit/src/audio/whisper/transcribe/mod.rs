@@ -1351,8 +1351,8 @@ impl<B> WhisperKit<B> {
   ///
   /// ```compile_fail
   /// use std::{cell::Cell, rc::Rc};
-  /// use whisperkit::audio::vad::VoiceActivityDetector;
-  /// use whisperkit::transcribe::WhisperKit;
+  /// use coremlit::audio::whisper::audio::vad::VoiceActivityDetector;
+  /// use coremlit::audio::whisper::transcribe::WhisperKit;
   ///
   /// struct NotSendVad(Rc<Cell<u32>>);
   ///

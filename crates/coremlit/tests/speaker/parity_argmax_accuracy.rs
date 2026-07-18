@@ -100,11 +100,13 @@ mod common;
 
 use std::collections::BTreeSet;
 
-use coremlit::ComputeUnits;
-use speakerkit::{
-  embed::EMBEDDING_DIM,
-  segment::{SEG_NUM_SLOTS, multilabel},
-  source::{ArgmaxComputeOptions, ArgmaxOptions, ArgmaxSource, ArgmaxVariant, ModelSource},
+use coremlit::{
+  ComputeUnits,
+  audio::speaker::{
+    embed::EMBEDDING_DIM,
+    segment::{SEG_NUM_SLOTS, multilabel},
+    source::{ArgmaxComputeOptions, ArgmaxOptions, ArgmaxSource, ArgmaxVariant, ModelSource},
+  },
 };
 
 /// dia's non-overlapping chunk `j` is argmax Extraction chunk `c = 10*j`:

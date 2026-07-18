@@ -73,8 +73,10 @@
 
 mod common;
 
-use coremlit::{ComputeUnits, DataType, Model};
-use vadkit::{CHUNK_SAMPLES, MODEL_INPUT_SAMPLES, STATE_SIZE, VadModel, VadModelOptions};
+use coremlit::{
+  ComputeUnits, DataType, Model,
+  audio::vad::{CHUNK_SAMPLES, MODEL_INPUT_SAMPLES, STATE_SIZE, VadModel, VadModelOptions},
+};
 
 /// The model-layer contract, EXACT in both directions (design spec §4). Every
 /// input AND output feature's name, shape and dtype is pinned against the live

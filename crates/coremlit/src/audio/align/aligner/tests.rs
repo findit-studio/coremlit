@@ -658,7 +658,7 @@ mod tracing_spans {
   /// path (as `encode::tests` does) and failing LOUDLY if it ever moves.
   fn load_jfk_wav() -> Vec<f32> {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-      .join("../whisperkit/tests/fixtures/audio/jfk.wav");
+      .join("tests/whisper/fixtures/audio/jfk.wav");
     let mut reader = hound::WavReader::open(&path)
       .unwrap_or_else(|e| panic!("open the jfk.wav fixture at {path:?}: {e}"));
     assert_eq!(reader.spec().sample_rate, 16_000, "fixture must be 16 kHz");

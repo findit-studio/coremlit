@@ -24,7 +24,7 @@ mod common;
 
 use core::sync::atomic::AtomicBool;
 
-use alignkit::{
+use coremlit::audio::align::{
   ANALYSIS_TIMEBASE, Aligner, EnglishNormalizer, Lang, OutputClock, Word, default_oov_decisions,
 };
 

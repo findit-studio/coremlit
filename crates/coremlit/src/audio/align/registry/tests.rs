@@ -32,7 +32,7 @@ fn fallback_default_is_skip_chunk() {
 }
 
 // ---------------------------------------------------------------------
-// The enum contract (mirrors `whisperkit::log::LogLevel`): as_str, a Display
+// The enum contract (mirrors `coremlit::audio::whisper::log::LogLevel`): as_str, a Display
 // derived FROM as_str, a TOTAL FromStr, an opaque parse error, snake_case
 // serde, and IsVariant. A fallback policy arrives from a config file or a CLI
 // flag, so it has to survive a round trip through text — which it could not do
@@ -592,7 +592,7 @@ fn whole_chunk_is_speech(samples: &[f32]) -> [TimeRange; 1] {
 /// path (as the other src-level tests do) and failing LOUDLY if it ever moves.
 fn load_jfk_wav() -> Vec<f32> {
   let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-    .join("../whisperkit/tests/fixtures/audio/jfk.wav");
+    .join("tests/whisper/fixtures/audio/jfk.wav");
   let mut reader = hound::WavReader::open(&path)
     .unwrap_or_else(|e| panic!("open the jfk.wav fixture at {path:?}: {e}"));
   assert_eq!(reader.spec().sample_rate, 16_000, "fixture must be 16 kHz");

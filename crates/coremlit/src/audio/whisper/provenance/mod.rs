@@ -137,7 +137,7 @@ fn unanimous_temperature(segments: &[TranscriptionSegment]) -> Option<f32> {
 /// alone. Then attach what the library cannot know:
 ///
 /// ```
-/// use whisperkit::{
+/// use coremlit::audio::whisper::{
 ///   options::{ComputeOptions, DecodingOptions},
 ///   provenance::Provenance,
 /// };
@@ -492,7 +492,7 @@ impl Provenance {
   /// result cannot know it either.
   ///
   /// ```
-  /// use whisperkit::{
+  /// use coremlit::audio::whisper::{
   ///   options::{ComputeOptions, DecodingOptions},
   ///   provenance::Provenance,
   ///   result::{TranscriptionResult, TranscriptionTimings},
@@ -547,7 +547,7 @@ impl Provenance {
   /// one this replaced fell 19 knobs behind (module doc). One accessor cannot.
   ///
   /// ```
-  /// use whisperkit::{
+  /// use coremlit::audio::whisper::{
   ///   options::{ComputeOptions, DecodingOptions, WordGrouping},
   ///   provenance::Provenance,
   /// };

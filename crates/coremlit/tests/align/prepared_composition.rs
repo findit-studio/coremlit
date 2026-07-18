@@ -32,12 +32,12 @@ mod common;
 
 use core::sync::atomic::AtomicBool;
 
-use alignkit::{
+use asry::emissions::{EmissionsAligner, EmissionsError};
+use coremlit::audio::align::{
   ANALYSIS_TIMEBASE, EnglishNormalizer, Lang, OutputClock, SpeechSpans,
   encode::{Encoder, EncoderInput},
   vocab,
 };
-use asry::emissions::{EmissionsAligner, EmissionsError};
 
 /// Builds asry's public [`EmissionsAligner`] the way alignkit's own `Aligner`
 /// wires its seam — bundled 29-class chordai tokenizer + the MANDATORY explicit

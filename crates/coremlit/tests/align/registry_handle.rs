@@ -22,7 +22,7 @@ mod common;
 
 use core::sync::atomic::AtomicBool;
 
-use alignkit::{
+use coremlit::audio::align::{
   ANALYSIS_TIMEBASE, Aligner, AlignerKey, AlignmentBinding, AlignmentFallback, AlignmentSetBuilder,
   EnglishNormalizer, Lang, OutputClock, TimeRange, default_oov_decisions,
 };

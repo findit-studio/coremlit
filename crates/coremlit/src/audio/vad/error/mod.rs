@@ -1,6 +1,6 @@
 //! Structured, per-domain error types for the vadkit model layer (design
 //! spec §4). Foreign errors from [`crate`] are wrapped as typed `#[from]`
-//! variants, mirroring `speakerkit::error`.
+//! variants, mirroring `coremlit::audio::speaker::error`.
 
 /// Failure locating, loading, or validating the CoreML VAD model.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -51,7 +51,7 @@ pub enum InferError {
   /// ran — the exact `ort` CoreML-EP corruption mode the CoreML backends
   /// exist to replace. A NaN sample would otherwise reach CoreML and can be
   /// absorbed into a finite-looking but garbage probability no downstream
-  /// check would catch (mirrors `speakerkit::error::InferError::NonFiniteInput`).
+  /// check would catch (mirrors `coremlit::audio::speaker::error::InferError::NonFiniteInput`).
   #[error("input contains a non-finite value at index {index}")]
   NonFiniteInput {
     /// Flat index of the offending sample within the assembled model window.
@@ -61,7 +61,7 @@ pub enum InferError {
   /// validated once at construction. The CoreML runtime is a trust boundary
   /// independent of its declared metadata, so every prediction's output
   /// shapes are re-checked (mirrors
-  /// `speakerkit::error::InferError::OutputShape`).
+  /// `coremlit::audio::speaker::error::InferError::OutputShape`).
   #[error("output `{feature}` shape mismatch: expected {expected:?}, got {got:?}")]
   OutputShape {
     /// The output feature whose runtime shape diverged.
@@ -75,7 +75,7 @@ pub enum InferError {
   /// infinite. The VAD graph's output is a noisy-OR of sigmoids (bounded in
   /// `[0, 1]`) and its LSTM state is finite by construction, so a non-finite
   /// value is the CoreML-EP corruption mode this crate exists to replace, not
-  /// a valid result (mirrors `speakerkit::error::InferError::NonFiniteOutput`).
+  /// a valid result (mirrors `coremlit::audio::speaker::error::InferError::NonFiniteOutput`).
   #[error("output `{feature}` contains a non-finite value at index {index}")]
   NonFiniteOutput {
     /// The output feature that carried the non-finite value.

@@ -5,8 +5,10 @@
 
 mod common;
 
-use coremlit::ComputeUnits;
-use vadkit::{CHUNK_SAMPLES, CONTEXT_SAMPLES, VadModel, VadModelOptions, VadState};
+use coremlit::{
+  ComputeUnits,
+  audio::vad::{CHUNK_SAMPLES, CONTEXT_SAMPLES, VadModel, VadModelOptions, VadState},
+};
 
 /// Loads the VAD model on `cpu_only` (deterministic).
 fn load() -> VadModel {

@@ -143,22 +143,24 @@
 //! ```text
 //! cargo test -p speakerkit --features dia-oracle --test parity_shipping_der -- --ignored --nocapture
 //! ```
-#![cfg(feature = "dia-oracle")]
+#![cfg(feature = "speaker-oracle")]
 
 mod common;
 mod der_calc;
 
 use std::{path::Path, time::Instant};
 
-use coremlit::ComputeUnits;
+use coremlit::{
+  ComputeUnits,
+  audio::speaker::{
+    embed::{EmbedModel, EmbedModelOptions},
+    extract::{Extraction, Options},
+    segment::{SegmentModel, SegmentModelOptions},
+    source::{AnySource, FluidAudioArtifacts, FluidAudioSource, ModelSource},
+  },
+};
 use der_calc::{
   Der, Seg, const_str_eq, der_std, der_strict, distinct_speakers, fmt_der, parse_rttm,
-};
-use speakerkit::{
-  embed::{EmbedModel, EmbedModelOptions},
-  extract::{Extraction, Options},
-  segment::{SegmentModel, SegmentModelOptions},
-  source::{AnySource, FluidAudioArtifacts, FluidAudioSource, ModelSource},
 };
 
 // ══════════════════════════════════════════════════════════════════════

@@ -7,12 +7,12 @@
 
 use std::{collections::BTreeMap, path::PathBuf};
 
-use sha2::{Digest, Sha256};
-use speakerkit::{
+use coremlit::audio::speaker::{
   extract::EXCLUDE_OVERLAP_MIN_FRAMES,
   segment::{POWERSET_CLASSES, SEG_CHUNK_SAMPLES, SEG_NUM_SLOTS, multilabel},
   window::DEFAULT_ONSET,
 };
+use sha2::{Digest, Sha256};
 
 /// Directory containing the downloaded speakerkit model artifacts.
 ///
@@ -140,7 +140,7 @@ pub const FIXTURES: &[Fixture] = &[
 /// every committed golden (each ~270 KB) for zero behavioral gain, since no
 /// gate reads this string. The values are in fact powerset **log-probabilities**
 /// (`pyannote_segmentation.mlmodelc`'s MIL ends `softmax` → `log`, see
-/// `speakerkit::segment`'s module doc; the committed ORT golden agrees — every
+/// `coremlit::audio::speaker::segment`'s module doc; the committed ORT golden agrees — every
 /// value `<= 0`, every 7-class row `sum(exp(row)) == 1`). Read the string as a
 /// provenance tag, not a claim about the tensor's calibration.
 pub const SEG_MODEL_LABEL: &str =
@@ -148,7 +148,7 @@ pub const SEG_MODEL_LABEL: &str =
 
 /// Directory holding the committed parity fixtures (`audio/` + `golden/`).
 pub fn fixtures_dir() -> PathBuf {
-  PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures")
+  PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/speaker/fixtures")
 }
 
 /// Committed WAV path for a fixture `name`.
@@ -483,7 +483,7 @@ pub fn parse_bit_mask(context: &str, expected_len: usize, raw: &str) -> Vec<bool
 /// One embedded speaker slot within a golden chunk: the per-frame mask fed to
 /// the embedding model and the resulting dia-ort reference embedding.
 pub struct GoldenSlot {
-  /// Speaker-slot index (0..[`speakerkit::segment::SEG_NUM_SLOTS`]).
+  /// Speaker-slot index (0..[`coremlit::audio::speaker::segment::SEG_NUM_SLOTS`]).
   pub slot: usize,
   /// The per-frame pooling mask (length = segmentation frame count) fed to
   /// BOTH backends — stored verbatim so the parity side is mask-identical.

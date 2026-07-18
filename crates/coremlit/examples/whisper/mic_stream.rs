@@ -20,12 +20,12 @@ use std::{
   time::Duration,
 };
 
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use rubato::{FftFixedIn, Resampler};
-use whisperkit::{
+use coremlit::audio::whisper::{
   options::{DecodingOptions, Options},
   transcribe::WhisperKit,
 };
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use rubato::{FftFixedIn, Resampler};
 
 /// Resampler input chunk: 64 ms at 48 kHz — small enough for sub-100 ms
 /// push latency, large enough to keep the FFT resampler efficient.

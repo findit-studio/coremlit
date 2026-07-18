@@ -49,7 +49,7 @@ pub fn model_path() -> PathBuf {
 /// use it; the per-binary `common` copy in `tests/align_chunk.rs` does not.
 #[allow(dead_code)]
 pub fn ted_60_wav_path() -> PathBuf {
-  PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../whisperkit/tests/fixtures/audio/ted_60.wav")
+  PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/whisper/fixtures/audio/ted_60.wav")
 }
 
 /// The verified transcript for [`ted_60_wav_path`]'s audio — the opening 60 s
@@ -164,7 +164,7 @@ pub const TED_60_SAMPLES_SHA256: &str =
 /// `#[allow(dead_code)]`: only `tests/align_chunk.rs` uses it.
 #[allow(dead_code)]
 pub fn jfk_wav_path() -> PathBuf {
-  PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../whisperkit/tests/fixtures/audio/jfk.wav")
+  PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/whisper/fixtures/audio/jfk.wav")
 }
 
 /// The known transcript for [`jfk_wav_path`]'s audio (whisperkit's

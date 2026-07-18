@@ -1,5 +1,5 @@
 //! Full-pipeline integration: mel → encode → scripted decode steps through
-//! `whisperkit::backend::coreml::CoreMlBackend` against the real tiny model.
+//! `coremlit::audio::whisper::backend::coreml::CoreMlBackend` against the real tiny model.
 //!
 //! Ground truth pinned by `tests/model_io.rs` (Task 1 introspection); the
 //! decode-step expectations mirror Swift's first predictions on
@@ -7,12 +7,14 @@
 
 mod common;
 
-use coremlit::{ComputeUnits, Model};
-use whisperkit::{
-  backend::{InferenceBackend, coreml::CoreMlBackend},
-  model::{ModelState, manager::ModelManager},
-  options::{ChunkingStrategy, ComputeOptions, DecodingOptions, Options},
-  transcribe::WhisperKit,
+use coremlit::{
+  ComputeUnits, Model,
+  audio::whisper::{
+    backend::{InferenceBackend, coreml::CoreMlBackend},
+    model::{ModelState, manager::ModelManager},
+    options::{ChunkingStrategy, ComputeOptions, DecodingOptions, Options},
+    transcribe::WhisperKit,
+  },
 };
 
 /// CpuOnly is legitimate HERE — and only because of what this file asserts.
@@ -154,7 +156,7 @@ fn wrong_audio_length_is_structured_error() {
   let err = backend.extract_features(&[0.0; 100]).unwrap_err();
   assert!(matches!(
     err,
-    whisperkit::backend::BackendError::AudioLength {
+    coremlit::audio::whisper::backend::BackendError::AudioLength {
       got: 100,
       expected: 480_000
     }
@@ -272,7 +274,7 @@ fn prewarm_over_loaded_models_is_rejected() {
   // next ensure_loaded, and on failure strand the models behind unload's
   // state guard. It must reject instead, leaving state and models intact;
   // an already-Prewarmed manager skips silently.
-  use whisperkit::{
+  use coremlit::audio::whisper::{
     error::ModelError,
     model::{ModelState, manager::ModelManager},
     options::ComputeOptions,
@@ -322,7 +324,7 @@ fn jfk_word_timestamps_are_monotonic_and_cover_the_transcript() {
     assert!(word.end() <= 11.5, "inside the 11 s clip");
   }
   let joined: String = words.iter().map(|w| w.word()).collect();
-  let normalized = whisperkit::text::normalized(&joined);
+  let normalized = coremlit::audio::whisper::text::normalized(&joined);
   assert!(
     normalized.contains("ask not what your country"),
     "got: {normalized}"
@@ -379,7 +381,7 @@ fn silence_transcribes_to_the_blank_audio_marker_when_drop_is_cleared() {
   // is also exactly why the drop filter matches a segment's CLEAN decode
   // rather than this raw `text()`.
   let kit = WhisperKit::new(&tiny_options()).unwrap();
-  let audio = vec![0.0f32; 5 * whisperkit::constants::SAMPLE_RATE as usize];
+  let audio = vec![0.0f32; 5 * coremlit::audio::whisper::constants::SAMPLE_RATE as usize];
   let options = DecodingOptions::new()
     .with_use_prefill_prompt()
     .with_chunking_strategy(ChunkingStrategy::Disabled)
@@ -387,7 +389,7 @@ fn silence_transcribes_to_the_blank_audio_marker_when_drop_is_cleared() {
   let result = kit.transcribe(&audio, &options).unwrap();
   assert_eq!(
     result.text(),
-    whisperkit::constants::BLANK_AUDIO_MARKER,
+    coremlit::audio::whisper::constants::BLANK_AUDIO_MARKER,
     "got: {:?}",
     result.text()
   );
@@ -401,7 +403,7 @@ fn silence_transcribes_to_the_blank_audio_marker_when_drop_is_cleared() {
   );
   assert_ne!(
     segments[0].text(),
-    whisperkit::constants::BLANK_AUDIO_MARKER,
+    coremlit::audio::whisper::constants::BLANK_AUDIO_MARKER,
     "segment text must retain its special/timestamp tokens here, unlike result.text()"
   );
 }
@@ -420,7 +422,7 @@ fn silence_is_dropped_by_default() {
   // mutation evidence that this outcome is the filter's doing, not the
   // decode's.
   let kit = WhisperKit::new(&tiny_options()).unwrap();
-  let audio = vec![0.0f32; 5 * whisperkit::constants::SAMPLE_RATE as usize];
+  let audio = vec![0.0f32; 5 * coremlit::audio::whisper::constants::SAMPLE_RATE as usize];
   let options = DecodingOptions::new()
     .with_use_prefill_prompt()
     .with_chunking_strategy(ChunkingStrategy::Disabled);
@@ -446,7 +448,7 @@ fn half_second_clip_yields_no_segments() {
   // content, just too little of it: the first 0.5 s of `jfk.wav`).
   let kit = WhisperKit::new(&tiny_options()).unwrap();
   let mut audio = common::load_wav_mono_f32(&common::fixtures_dir().join("audio/jfk.wav"));
-  audio.truncate(whisperkit::constants::SAMPLE_RATE as usize / 2); // 0.5 s
+  audio.truncate(coremlit::audio::whisper::constants::SAMPLE_RATE as usize / 2); // 0.5 s
   let options = DecodingOptions::new()
     .with_use_prefill_prompt()
     .with_chunking_strategy(ChunkingStrategy::Disabled);

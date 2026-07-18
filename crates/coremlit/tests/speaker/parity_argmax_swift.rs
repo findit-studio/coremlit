@@ -107,14 +107,16 @@ mod common;
 
 use std::{collections::BTreeSet, path::PathBuf};
 
-use coremlit::ComputeUnits;
-use speakerkit::{
-  embed::EMBEDDING_DIM,
-  extract::{EXCLUDE_OVERLAP_MIN_FRAMES, Extraction},
-  segment::SEG_NUM_SLOTS,
-  source::{
-    ArgmaxComputeOptions, ArgmaxOptions, ArgmaxSource, ArgmaxVariant, ModelSource,
-    argmax::{ARGMAX_FRAMES_PER_WINDOW, ARGMAX_WINDOWS_PER_CHUNK},
+use coremlit::{
+  ComputeUnits,
+  audio::speaker::{
+    embed::EMBEDDING_DIM,
+    extract::{EXCLUDE_OVERLAP_MIN_FRAMES, Extraction},
+    segment::SEG_NUM_SLOTS,
+    source::{
+      ArgmaxComputeOptions, ArgmaxOptions, ArgmaxSource, ArgmaxVariant, ModelSource,
+      argmax::{ARGMAX_FRAMES_PER_WINDOW, ARGMAX_WINDOWS_PER_CHUNK},
+    },
   },
 };
 
@@ -167,8 +169,9 @@ const PLACEMENT_COS_TOL: f64 = 0.90;
 /// windows abutting at `c = 21` and `c = 42`.
 fn fixture_audio(name: &str) -> PathBuf {
   match name {
-    "ted_60" => PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-      .join("../whisperkit/tests/fixtures/audio/ted_60.wav"),
+    "ted_60" => {
+      PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/whisper/fixtures/audio/ted_60.wav")
+    }
     other => common::audio_path(other),
   }
 }

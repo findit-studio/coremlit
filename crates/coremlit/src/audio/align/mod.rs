@@ -28,7 +28,7 @@
 //! use core::sync::atomic::AtomicBool;
 //! use std::path::Path;
 //!
-//! use alignkit::{
+//! use coremlit::audio::align::{
 //!   ANALYSIS_TIMEBASE, Aligner, EnglishNormalizer, Lang, OutputClock,
 //!   default_oov_decisions,
 //! };

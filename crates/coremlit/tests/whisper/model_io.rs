@@ -1,6 +1,6 @@
 //! Ground-truth introspection of the tiny model's encoder + decoder I/O.
 //!
-//! Values feed `whisperkit::backend`: Task 2 (`ModelDims` tiny defaults) and
+//! Values feed `coremlit::audio::whisper::backend`: Task 2 (`ModelDims` tiny defaults) and
 //! Task 9 (`CoreMlBackend` feature names + `CoreMlDecoderState` allocation).
 //! Swift-side derivations: `TextDecoder.swift:309-331` (dims read positions),
 //! `Models.swift:970-1107` (generated I/O wrappers), `FeatureExtractor.swift:25-39`.

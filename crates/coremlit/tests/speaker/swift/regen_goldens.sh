@@ -48,7 +48,7 @@ fi
 # grid mapping's `k >= 1` branch at all.
 fixtures="02_pyannote_sample=$here/../fixtures/audio/02_pyannote_sample.wav"
 fixtures="$fixtures;07_yuhewei_dongbei_english=$here/../fixtures/audio/07_yuhewei_dongbei_english.wav"
-fixtures="$fixtures;ted_60=$workspace/crates/whisperkit/tests/fixtures/audio/ted_60.wav"
+fixtures="$fixtures;ted_60=$workspace/crates/coremlit/tests/whisper/fixtures/audio/ted_60.wav"
 
 revision="$(git -C "$argmax_src" rev-parse --short HEAD 2>/dev/null || echo unknown)"
 

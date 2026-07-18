@@ -273,8 +273,8 @@
 //! # Examples
 //!
 //! ```no_run
-//! use whisperkit::options::{DecodingOptions, Options};
-//! use whisperkit::transcribe::WhisperKit;
+//! use coremlit::audio::whisper::options::{DecodingOptions, Options};
+//! use coremlit::audio::whisper::transcribe::WhisperKit;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let options = Options::new(
@@ -296,8 +296,8 @@
 //! threshold asks for a retry at the next temperature:
 //!
 //! ```
-//! use whisperkit::options::{ChunkingStrategy, DecodingOptions};
-//! use whisperkit::result::{DecodingResult, FallbackReason, needs_fallback};
+//! use coremlit::audio::whisper::options::{ChunkingStrategy, DecodingOptions};
+//! use coremlit::audio::whisper::result::{DecodingResult, FallbackReason, needs_fallback};
 //!
 //! let options = DecodingOptions::new()
 //!   .with_temperature(0.2)
@@ -319,8 +319,8 @@
 //! # Streaming example
 //!
 //! ```no_run
-//! use whisperkit::options::{DecodingOptions, Options};
-//! use whisperkit::transcribe::WhisperKit;
+//! use coremlit::audio::whisper::options::{DecodingOptions, Options};
+//! use coremlit::audio::whisper::transcribe::WhisperKit;
 //!
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! let options = Options::new(

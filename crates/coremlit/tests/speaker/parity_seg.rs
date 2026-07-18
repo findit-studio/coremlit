@@ -78,9 +78,11 @@
 
 mod common;
 
-use coremlit::ComputeUnits;
-use speakerkit::segment::{
-  POWERSET_CLASSES, SEG_NUM_SLOTS, SegmentModel, SegmentModelOptions, multilabel,
+use coremlit::{
+  ComputeUnits,
+  audio::speaker::segment::{
+    POWERSET_CLASSES, SEG_NUM_SLOTS, SegmentModel, SegmentModelOptions, multilabel,
+  },
 };
 
 /// Re-framed Gate-1 pass criterion (spec §5): the minimum fraction of frames
@@ -102,7 +104,7 @@ const SEG_DECISION_AGREEMENT_MIN: f64 = 0.999;
 /// same frame-major order, as speakerkit's shipping [`multilabel`].
 ///
 /// speakerkit's `multilabel` argmaxes the log-probs DIRECTLY, without the
-/// `softmax_row`, which `speakerkit::segment`'s module doc proves is
+/// `softmax_row`, which `coremlit::audio::speaker::segment`'s module doc proves is
 /// order-for-order dia's decode *in exact arithmetic* — `log(softmax(z))` is
 /// `z` shifted by a per-row constant, which preserves both the argmax and its
 /// exact ties. Over f32 the shortcut and dia's real path can still diverge on a

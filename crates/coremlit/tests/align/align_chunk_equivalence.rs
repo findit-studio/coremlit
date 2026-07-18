@@ -41,7 +41,8 @@ mod common;
 
 use core::{num::NonZeroU32, sync::atomic::AtomicBool};
 
-use alignkit::{
+use asry::emissions::EmissionsAligner;
+use coremlit::audio::align::{
   ANALYSIS_TIMEBASE, Aligner, EnglishNormalizer, Lang, OutputClock, SpeechCoverage, SpeechSpans,
   TimeRange,
   aligner::{DEFAULT_MAX_INTRA_SILENT_RUN, DEFAULT_MIN_SPEECH_COVERAGE},
@@ -49,7 +50,6 @@ use alignkit::{
   encode::{Encoder, EncoderInput, HOP_SAMPLES},
   vocab,
 };
-use asry::emissions::EmissionsAligner;
 
 /// Builds asry's [`EmissionsAligner`] with the SAME wiring
 /// `Aligner::from_paths_with` bakes in through its private `build_seam`:

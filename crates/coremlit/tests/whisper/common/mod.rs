@@ -31,6 +31,7 @@ pub fn tokenizer_dir() -> PathBuf {
 pub fn fixtures_dir() -> PathBuf {
   PathBuf::from(env!("CARGO_MANIFEST_DIR"))
     .join("tests")
+    .join("whisper")
     .join("fixtures")
 }
 
@@ -196,12 +197,14 @@ pub fn assert_golden_tokens(label: &str, rust: &[u32], golden: &[u32], audio: &[
 /// reconstruct that from — so this refuses the replay rather than reporting
 /// logits from a stream the model never saw.
 fn replay_step_logits(audio: &[f32], prefix: &[u32]) -> Result<Vec<f32>, String> {
-  use coremlit::Model;
-  use whisperkit::{
-    audio::pad_or_trim,
-    backend::{InferenceBackend, coreml::CoreMlBackend},
-    options::{
-      DEFAULT_DECODER_COMPUTE_UNITS, DEFAULT_ENCODER_COMPUTE_UNITS, DEFAULT_MEL_COMPUTE_UNITS,
+  use coremlit::{
+    Model,
+    audio::whisper::{
+      audio::pad_or_trim,
+      backend::{InferenceBackend, coreml::CoreMlBackend},
+      options::{
+        DEFAULT_DECODER_COMPUTE_UNITS, DEFAULT_ENCODER_COMPUTE_UNITS, DEFAULT_MEL_COMPUTE_UNITS,
+      },
     },
   };
 

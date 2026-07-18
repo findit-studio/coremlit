@@ -21,7 +21,7 @@ use std::{
   time::Instant,
 };
 
-use whisperkit::{
+use coremlit::audio::whisper::{
   options::{DecodingOptions, Options},
   transcribe::WhisperKit,
 };
@@ -80,7 +80,7 @@ fn main() {
     return;
   }
 
-  let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
+  let fixtures = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/whisper/fixtures");
   let audio = load_wav_mono_f32(&fixtures.join("audio/jfk.wav"));
   let audio_seconds = audio.len() as f64 / 16_000.0;
 

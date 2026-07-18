@@ -1,5 +1,5 @@
 //! The FluidAudio Swift trace gate (design spec §6 model-layer oracle). Pins
-//! `vadkit::VadModel`'s per-chunk speech probabilities against committed traces
+//! `coremlit::audio::vad::VadModel`'s per-chunk speech probabilities against committed traces
 //! from FluidAudio's OWN `VadManager.process` — the reference implementation of
 //! the 256 ms chunking, 64-sample context stitching, repeat-last final-chunk
 //! padding and LSTM state carry-forward this crate ports. Both sides run the
@@ -21,9 +21,11 @@
 
 mod common;
 
-use coremlit::ComputeUnits;
-use vadkit::{
-  CHUNK_SAMPLES, CONTEXT_SAMPLES, MODEL_INPUT_SAMPLES, STATE_SIZE, VadModel, VadModelOptions,
+use coremlit::{
+  ComputeUnits,
+  audio::vad::{
+    CHUNK_SAMPLES, CONTEXT_SAMPLES, MODEL_INPUT_SAMPLES, STATE_SIZE, VadModel, VadModelOptions,
+  },
 };
 
 /// The two committed fixtures (spec §6: real speech, one multi-speaker, ≥ 2
@@ -32,7 +34,7 @@ use vadkit::{
 /// padding path): 217 chunks total.
 const GATE_FIXTURES: &[&str] = &["02_pyannote_sample", "07_yuhewei_dongbei_english"];
 
-/// Worst tolerated per-chunk |Δ| between `vadkit::VadModel` and FluidAudio's
+/// Worst tolerated per-chunk |Δ| between `coremlit::audio::vad::VadModel` and FluidAudio's
 /// `VadManager`, both on `cpu_only` over the SAME artifact. **Measured worst:
 /// `0.000e0`** — bit-identical across all 217 committed chunks
 /// (`vad_probabilities_match_fluidaudio_swift_trace`), as expected when both
@@ -237,7 +239,7 @@ fn load_swift_golden(name: &str) -> SwiftGolden {
 
 /// **THE TRACE GATE** (model-gated). For each fixture: prove the input is
 /// byte-identical to what the Swift oracle saw (FNV-1a), replay
-/// `vadkit::VadModel` over the same 4096-stride chunking on `cpu_only`, and
+/// `coremlit::audio::vad::VadModel` over the same 4096-stride chunking on `cpu_only`, and
 /// require every per-chunk probability within [`TRACE_TOL`] of FluidAudio's.
 ///
 /// Mutation: perturbing any one committed probability by ±1e-3

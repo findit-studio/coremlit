@@ -12,8 +12,8 @@
 //! - **vadkit-CoreML** (under test): the FluidInference unified 256 ms artifact
 //!   (`silero-vad-unified-256ms-v6.2.1`) — 4096-sample (256 ms) frames — turned
 //!   into segments by **silero's own segmenter through vadkit's re-export**
-//!   ([`vadkit::detect_speech`], which forwards to `silero::detect_speech_with`
-//!   over [`vadkit::CoreMlBackend`]). This REPLACES T4's interim test-local
+//!   ([`coremlit::audio::vad::detect_speech`], which forwards to `silero::detect_speech_with`
+//!   over [`coremlit::audio::vad::CoreMlBackend`]). This REPLACES T4's interim test-local
 //!   thresholding harness (T5): the vadkit side now runs the exact same
 //!   detection logic as the reference, differing only in model and geometry —
 //!   which is what makes the agreement a clean model-vs-model measurement.
@@ -66,9 +66,11 @@
 
 mod common;
 
-use coremlit::ComputeUnits;
+use coremlit::{
+  ComputeUnits,
+  audio::vad::{CHUNK_SAMPLES, CoreMlBackend, VadModel, VadModelOptions, detect_speech},
+};
 use silero::{SpeechOptions, SpeechSegmenter};
-use vadkit::{CHUNK_SAMPLES, CoreMlBackend, VadModel, VadModelOptions, detect_speech};
 
 /// 16 kHz — the corpus sample rate both stacks consume (asserted per clip).
 const SAMPLE_RATE: u64 = 16_000;

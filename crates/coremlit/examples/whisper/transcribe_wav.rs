@@ -13,7 +13,7 @@
 
 use std::path::PathBuf;
 
-use whisperkit::{
+use coremlit::audio::whisper::{
   options::{DecodingOptions, Options},
   result::format_segments,
   transcribe::WhisperKit,
@@ -33,7 +33,7 @@ fn models_dir() -> PathBuf {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
   let mut args = std::env::args().skip(1);
   let wav = args.next().map_or_else(
-    || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/audio/jfk.wav"),
+    || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/whisper/fixtures/audio/jfk.wav"),
     PathBuf::from,
   );
   let model_folder = args.next().map_or_else(

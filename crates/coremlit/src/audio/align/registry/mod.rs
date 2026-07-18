@@ -157,7 +157,7 @@ define_alignment_fallback! {
   /// [`AlignerKey::Any`] fallback registered either).
   ///
   /// A vocabulary enum with the workspace's full contract (mirrors
-  /// `whisperkit::log::LogLevel`): [`as_str`](Self::as_str) + a derived
+  /// `coremlit::audio::whisper::log::LogLevel`): [`as_str`](Self::as_str) + a derived
   /// [`Display`](core::fmt::Display), a total
   /// [`FromStr`](core::str::FromStr) whose error
   /// ([`ParseAlignmentFallbackError`]) is opaque, `snake_case` serde under the
@@ -337,7 +337,7 @@ impl AlignmentSet {
   /// from an external crate:
   ///
   /// ```compile_fail
-  /// use alignkit::{AlignmentSetBuilder, Lang};
+  /// use coremlit::audio::align::{AlignmentSetBuilder, Lang};
   /// let set = AlignmentSetBuilder::new().build();
   /// // `lookup` (and its `AlignmentLookup`, whose `AnyFallback` leaked a
   /// // cross-language `&Aligner`) are private: this does NOT compile. `resolve`

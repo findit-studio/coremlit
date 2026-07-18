@@ -25,7 +25,7 @@
 //! `drop_blank_audio`), through the existing runtime seam:
 //!
 //! ```no_run
-//! # use whisperkit::{options::Options, transcribe::WhisperKit, silero_vad::SileroVad};
+//! # use coremlit::audio::whisper::{options::Options, transcribe::WhisperKit, silero_vad::SileroVad};
 //! # fn f(options: &Options) -> Result<(), Box<dyn std::error::Error>> {
 //! let kit = WhisperKit::new(options)?
 //!   .with_vad_detector(Box::new(SileroVad::load("Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc")?));

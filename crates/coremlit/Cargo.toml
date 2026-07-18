@@ -126,9 +126,12 @@ dia = { package = "diarization", git = "https://github.com/findit-studio/diariza
 # `default-features = false` selects the LOGIC-ONLY silero crate — NO `ort`/ONNX
 # backend compiled, so `ort` never enters the `vad` runtime graph. The ONNX
 # reference stack is DEV/TEST-only behind `vad-bundled` (`silero/bundled`).
-# Pinned to the 0.5.0 seam by git REV; RE-PIN to `silero = "0.5.0"` once it
-# publishes (does not change this no-`ort`, logic-only posture).
-silero = { git = "https://github.com/Findit-AI/silero", rev = "9ad65749ada4da40a9086d528b12501f0b383791", default-features = false, optional = true }
+# Pinned to silero's merged `main` (0.5.0 seam) by full git REV — the earlier
+# `9ad65749` seam-branch rev was squashed away by silero#11's squash-merge
+# (the squash preserved the tree, so content is identical); RE-PIN to
+# `silero = "0.5.0"` once it publishes (does not change this no-`ort`,
+# logic-only posture).
+silero = { git = "https://github.com/Findit-AI/silero", rev = "a55ef2b2922ec14250e6a5b3a4b30596f018454c", default-features = false, optional = true }
 
 [dev-dependencies]
 # Integration tests / benches / examples are external consumers: they link the
@@ -150,6 +153,216 @@ tokenizers.workspace = true
 # adds `alignment`. `emissions` here keeps a features-free default `cargo test`
 # from trying to build a zero-feature asry.
 asry = { git = "https://github.com/findit-studio/asry", rev = "49cbfc9ca6fb75366d75a862212bdebb889021e5", default-features = false, features = ["emissions"] }
+
+# ---------------------------------------------------------------------------
+# Per-kit tests / benches / examples.
+#
+# Each former kit crate's tests now live in tests/<kit>/ (benches/<kit>/,
+# examples/<kit>/). Cargo auto-discovers only depth-1 files, so the coremlit
+# core's own tests (tests/*.rs) stay auto-discovered while every kit target is
+# registered explicitly here. `required-features` gates each on its module
+# feature (the whole `audio::<kit>` module is feature-gated, so its tests only
+# compile under that feature) — the oracle suites on the oracle feature.
+# ---------------------------------------------------------------------------
+
+# --- audio::whisper ---
+[[test]]
+name = "whisper_longform"
+path = "tests/whisper/longform.rs"
+required-features = ["whisper"]
+
+[[test]]
+name = "whisper_model_io"
+path = "tests/whisper/model_io.rs"
+required-features = ["whisper"]
+
+[[test]]
+name = "whisper_models_lock"
+path = "tests/whisper/models_lock.rs"
+required-features = ["whisper"]
+
+[[test]]
+name = "whisper_parity_es"
+path = "tests/whisper/parity_es.rs"
+required-features = ["whisper"]
+
+[[test]]
+name = "whisper_parity_jfk"
+path = "tests/whisper/parity_jfk.rs"
+required-features = ["whisper"]
+
+[[test]]
+name = "whisper_pipeline"
+path = "tests/whisper/pipeline.rs"
+required-features = ["whisper"]
+
+[[test]]
+name = "whisper_streaming"
+path = "tests/whisper/streaming.rs"
+required-features = ["whisper"]
+
+# The Silero-VAD source path is the whisper+vad composition (former whisperkit
+# `vadkit` feature).
+[[test]]
+name = "whisper_vad_source"
+path = "tests/whisper/vad_source.rs"
+required-features = ["whisper", "vad"]
+
+# rtf.rs is compiled BOTH as a harness-less bench (its real end-to-end main)
+# and, under the default libtest harness, as this test target so its inline
+# #[cfg(test)] `models_ready` gate runs under `cargo test`. Cargo prints an
+# informational "present in multiple build targets" note for the shared path,
+# which is expected and harmless.
+[[test]]
+name = "whisper_rtf_gate"
+path = "benches/whisper/rtf.rs"
+required-features = ["whisper"]
+
+[[bench]]
+name = "whisper_stages"
+path = "benches/whisper/stages.rs"
+harness = false
+required-features = ["whisper"]
+
+[[bench]]
+name = "whisper_rtf"
+path = "benches/whisper/rtf.rs"
+harness = false
+required-features = ["whisper"]
+
+# `test = true` compiles this example under the libtest harness too, so its
+# inline #[cfg(test)] hermetic BoundedAudioQueue tests run under `cargo test`;
+# `main` is compiled (type-checked) but never executed, so no microphone opens.
+[[example]]
+name = "whisper_mic_stream"
+path = "examples/whisper/mic_stream.rs"
+test = true
+required-features = ["whisper"]
+
+[[example]]
+name = "whisper_transcribe_wav"
+path = "examples/whisper/transcribe_wav.rs"
+required-features = ["whisper"]
+
+# --- audio::align ---
+[[test]]
+name = "align_align_chunk"
+path = "tests/align/align_chunk.rs"
+required-features = ["align"]
+
+[[test]]
+name = "align_align_chunk_equivalence"
+path = "tests/align/align_chunk_equivalence.rs"
+required-features = ["align"]
+
+[[test]]
+name = "align_model_io"
+path = "tests/align/model_io.rs"
+required-features = ["align"]
+
+[[test]]
+name = "align_prepared_composition"
+path = "tests/align/prepared_composition.rs"
+required-features = ["align"]
+
+[[test]]
+name = "align_registry_handle"
+path = "tests/align/registry_handle.rs"
+required-features = ["align"]
+
+# The word-timing parity gate needs asry's ONNX aligner oracle (ort +
+# whisper.cpp) — the former alignkit `parity-oracle`, now `align-oracle`.
+[[test]]
+name = "align_parity_words"
+path = "tests/align/parity_words.rs"
+required-features = ["align-oracle"]
+
+[[bench]]
+name = "align_align"
+path = "benches/align/align.rs"
+harness = false
+required-features = ["align"]
+
+# --- audio::speaker ---
+[[test]]
+name = "speaker_argmax_model_io"
+path = "tests/speaker/argmax_model_io.rs"
+required-features = ["speaker"]
+
+[[test]]
+name = "speaker_golden_metadata"
+path = "tests/speaker/golden_metadata.rs"
+required-features = ["speaker"]
+
+[[test]]
+name = "speaker_model_io"
+path = "tests/speaker/model_io.rs"
+required-features = ["speaker"]
+
+[[test]]
+name = "speaker_parity_argmax_accuracy"
+path = "tests/speaker/parity_argmax_accuracy.rs"
+required-features = ["speaker"]
+
+[[test]]
+name = "speaker_parity_argmax_swift"
+path = "tests/speaker/parity_argmax_swift.rs"
+required-features = ["speaker"]
+
+[[test]]
+name = "speaker_parity_embed"
+path = "tests/speaker/parity_embed.rs"
+required-features = ["speaker"]
+
+[[test]]
+name = "speaker_parity_seg"
+path = "tests/speaker/parity_seg.rs"
+required-features = ["speaker"]
+
+# The DER parity suites are #![cfg(feature = "speaker-oracle")] and drive dia's
+# own ort inference (former speakerkit `dia-oracle`).
+[[test]]
+name = "speaker_parity_e2e"
+path = "tests/speaker/parity_e2e.rs"
+required-features = ["speaker-oracle"]
+
+[[test]]
+name = "speaker_parity_shipping_der"
+path = "tests/speaker/parity_shipping_der.rs"
+required-features = ["speaker-oracle"]
+
+[[test]]
+name = "speaker_generate_goldens"
+path = "tests/speaker/generate_goldens.rs"
+required-features = ["speaker-oracle"]
+
+# --- audio::vad ---
+[[test]]
+name = "vad_model_io"
+path = "tests/vad/model_io.rs"
+required-features = ["vad"]
+
+[[test]]
+name = "vad_model_state"
+path = "tests/vad/model_state.rs"
+required-features = ["vad"]
+
+[[test]]
+name = "vad_parity_swift"
+path = "tests/vad/parity_swift.rs"
+required-features = ["vad"]
+
+[[test]]
+name = "vad_reexport"
+path = "tests/vad/reexport.rs"
+required-features = ["vad"]
+
+# The cross-backend characterization oracle drives silero's bundled ONNX stack
+# (former vadkit dev-only `bundled`, now `vad-bundled`).
+[[test]]
+name = "vad_cross_backend"
+path = "tests/vad/cross_backend.rs"
+required-features = ["vad-bundled"]
 
 [lints]
 workspace = true

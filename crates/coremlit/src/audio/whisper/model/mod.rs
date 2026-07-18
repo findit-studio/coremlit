@@ -59,7 +59,7 @@ use crate::audio::whisper::error::ModelError;
 /// Lifecycle state of a loaded CoreML model pipeline (Swift `ModelState`,
 /// `ArgmaxCore/ModelState.swift:19-50` — shared there by WhisperKit and
 /// TTSKit; TTSKit is out of scope for this port, spec §3, so this lives in
-/// `whisperkit::model` instead of a shared crate).
+/// `coremlit::audio::whisper::model` instead of a shared crate).
 ///
 /// State machine (Swift's own diagram, `ModelState.swift:13-18`):
 /// ```text

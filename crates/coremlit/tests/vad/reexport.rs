@@ -13,18 +13,18 @@
 //! 2. **The mock-backend scenarios** (hermetic) — silero's own 4096-geometry
 //!    detector-test scenarios, replayed over a CoreML-SHAPED mock
 //!    ([`MockVadBackend`]: `frame_samples() == 4096`, one canned probability
-//!    per frame) driven through the re-exported [`vadkit::detect_speech_with`].
+//!    per frame) driven through the re-exported [`coremlit::audio::vad::detect_speech_with`].
 //!    Same inputs, same pinned segment boundaries silero pins internally — so
 //!    the re-export provably drives silero's real segmenter, not a copy. Plus
 //!    the error-bridge shape an out-of-tree backend uses.
 //! 3. **`detect_speech_on_real_audio_is_pinned`** (model-gated) — the end-to-
-//!    end path: [`vadkit::detect_speech`] over a real [`CoreMlBackend`] on a
+//!    end path: [`coremlit::audio::vad::detect_speech`] over a real [`CoreMlBackend`] on a
 //!    committed fixture, segment starts/ends pinned two-sided.
 
 mod common;
 
+use coremlit::audio::vad::{CHUNK_SAMPLES, detect_speech_with};
 use silero::{SampleRate, SpeechOptions, VadBackend};
-use vadkit::{CHUNK_SAMPLES, detect_speech_with};
 
 // ── 1. No-duplication grep gate ─────────────────────────────────────────────
 
@@ -94,7 +94,7 @@ fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
 /// re-implementation this grep could still miss.
 #[test]
 fn src_authors_no_detection_logic() {
-  let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+  let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/audio/vad");
   let mut files = Vec::new();
   rust_files(&src, &mut files);
   assert!(
@@ -156,9 +156,9 @@ fn src_authors_no_detection_logic() {
 
 // ── 2. CoreML-shaped mock backend + silero's detector-test scenarios ─────────
 
-/// A backend error distinct from `vadkit`'s own [`vadkit::InferError`], present
+/// A backend error distinct from `vadkit`'s own [`coremlit::audio::vad::InferError`], present
 /// to exercise the out-of-tree error bridge the [`VadBackend::Error`] contract
-/// prescribes — the same shape [`vadkit::CoreMlBackend`] uses for real
+/// prescribes — the same shape [`coremlit::audio::vad::CoreMlBackend`] uses for real
 /// (`impl From<TheirError> for silero::Error` wrapping in
 /// [`silero::Error::Backend`]).
 #[derive(Debug)]
@@ -178,7 +178,7 @@ impl From<MockError> for silero::Error {
   }
 }
 
-/// A [`VadBackend`] shaped like [`vadkit::CoreMlBackend`] — 4096-sample
+/// A [`VadBackend`] shaped like [`coremlit::audio::vad::CoreMlBackend`] — 4096-sample
 /// (256 ms) frames at 16 kHz — returning one canned probability per frame. It
 /// authors no detection logic; it exists to replay silero's detector scenarios
 /// over the re-exported [`detect_speech_with`] at vadkit's exact geometry,
@@ -306,7 +306,7 @@ fn reexport_bridges_backend_error_through_backend_variant() {
 /// re-exported [`detect_speech_with`] and silero's OWN
 /// [`silero::detect_speech_with`], requiring the segment vectors bit-for-bit
 /// identical. It pins the re-export BY BEHAVIOUR, not vocabulary: today
-/// `vadkit::detect_speech_with` IS `silero::detect_speech_with` (a `pub use`),
+/// `coremlit::audio::vad::detect_speech_with` IS `silero::detect_speech_with` (a `pub use`),
 /// so they agree trivially — but if a future change replaced the re-export with
 /// a hand-rolled threshold loop in vadkit (e.g. `p >= 0.5` plus an aliased
 /// `S::new(..)` that the grep's vocabulary could miss), the two paths would
@@ -335,15 +335,17 @@ fn reexport_detect_speech_with_is_bit_identical_to_silero() {
         .expect("silero direct");
     assert_eq!(
       via_vadkit, via_silero,
-      "vadkit::detect_speech_with must equal silero::detect_speech_with bit-for-bit on {probs:?}"
+      "coremlit::audio::vad::detect_speech_with must equal silero::detect_speech_with bit-for-bit on {probs:?}"
     );
   }
 }
 
 // ── 3. End-to-end model-gated detect on real audio (two-sided pins) ──────────
 
-use coremlit::ComputeUnits;
-use vadkit::{CoreMlBackend, VadModelOptions, detect_speech};
+use coremlit::{
+  ComputeUnits,
+  audio::vad::{CoreMlBackend, VadModelOptions, detect_speech},
+};
 
 /// The committed fixture the e2e runs on (`common::FIXTURES`): pyannote's
 /// canonical 30 s multi-speaker demo, 118 full 256 ms chunks — the same clip

@@ -115,7 +115,7 @@ pub const DEFAULT_VAD_COMPUTE: ComputeUnits = ComputeUnits::All;
 
 /// Human-readable `shape dtype` rendering for
 /// [`ModelError::ContractMismatch`]'s `actual`/`expected` fields (mirrors
-/// `speakerkit::segment::describe`).
+/// `coremlit::audio::speaker::segment::describe`).
 fn describe(shape: &[usize], dtype: Option<DataType>) -> String {
   let dtype = dtype.map_or("none", |d| d.as_str());
   format!("{shape:?} {dtype}")

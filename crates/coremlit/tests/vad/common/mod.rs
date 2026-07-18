@@ -93,13 +93,13 @@ pub const FIXTURES: &[Fixture] = &[
 /// Absolute path to a borrowed fixture WAV by basename.
 pub fn fixture_wav_path(name: &str) -> PathBuf {
   PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-    .join("../speakerkit/tests/fixtures/audio")
+    .join("tests/speaker/fixtures/audio")
     .join(format!("{name}.wav"))
 }
 
 /// Directory holding this crate's committed Swift-trace goldens.
 pub fn golden_swift_dir() -> PathBuf {
-  PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/golden_swift")
+  PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vad/fixtures/golden_swift")
 }
 
 /// Loads a 16 kHz mono WAV as `f32` samples — the single source of truth both
@@ -139,7 +139,7 @@ pub fn load_wav_16k_mono(path: &Path) -> Vec<f32> {
 }
 
 /// FNV-1a-64 over the little-endian bytes of `samples` — byte-for-byte the
-/// same construction as `speakerkit::tests::common::fnv1a_f32` and the Swift
+/// same construction as `coremlit::audio::speaker::tests::common::fnv1a_f32` and the Swift
 /// dumper's `fnv1aHex`, so the golden's recorded input hash proves both sides
 /// fed the model element-identical audio.
 pub fn fnv1a_f32(samples: &[f32]) -> u64 {

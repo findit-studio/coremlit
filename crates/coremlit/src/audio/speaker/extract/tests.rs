@@ -587,7 +587,7 @@ fn load_embed_model() -> EmbedModel {
 /// exercise the 30 s chunk grid.
 fn load_ted_60() -> Vec<f32> {
   let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-    .join("../whisperkit/tests/fixtures/audio/ted_60.wav");
+    .join("tests/whisper/fixtures/audio/ted_60.wav");
   let mut reader = hound::WavReader::open(&path).expect("ted_60.wav opens");
   let spec = reader.spec();
   assert_eq!(spec.channels, 1, "fixture must be mono");
