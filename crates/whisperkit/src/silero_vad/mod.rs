@@ -43,6 +43,12 @@
 //! `Mutex`") as the way to fan a model across threads. Each
 //! [`voice_activity`](crate::audio::vad::VoiceActivityDetector::voice_activity)
 //! call locks once and drives the whole buffer as one logical stream.
+//!
+//! A shared detector may also be driven by *simultaneous* `transcribe` calls.
+//! The hard-failure latch is built for that: a monotonic generation counter
+//! (not a drainable error slot) is each caller's source of truth, so
+//! concurrent runs can't clear one another's failures — see
+//! [`detection_generation`](crate::audio::vad::VoiceActivityDetector::detection_generation).
 
 use std::sync::Mutex;
 
@@ -54,6 +60,17 @@ use crate::audio::vad::VoiceActivityDetector;
 /// probability is ≥ this. Matches silero's own `start_threshold` default (0.5).
 pub const DEFAULT_SPEECH_THRESHOLD: f32 = 0.5;
 
+/// The hard-failure latch behind [`SileroVad`]'s infallible
+/// [`voice_activity`](VoiceActivityDetector::voice_activity): a monotonic
+/// `generation` bumped once per latched inference failure, plus the most
+/// recent such error for reporting. One [`Mutex`] guards both so a reader
+/// sees them consistently. See the module's concurrency note.
+#[derive(Debug, Default)]
+struct DetectionLatch {
+  generation: u64,
+  last_error: Option<InferError>,
+}
+
 /// Silero-VAD [`VoiceActivityDetector`] over the `vadkit` CoreML model layer.
 ///
 /// Follows the options pattern: [`Self::load`] is the default configuration
@@ -64,13 +81,13 @@ pub const DEFAULT_SPEECH_THRESHOLD: f32 = 0.5;
 pub struct SileroVad {
   model: Mutex<VadModel>,
   threshold: f32,
-  // Latch for the FIRST inference failure seen during a `voice_activity`
-  // run. `voice_activity` is infallible per the trait, so a hard model
-  // failure is recorded here (not swallowed into false silence) and drained
-  // by `take_detection_error`, which whisperkit's transcribe consults after
-  // chunking to surface a typed error. Interior-mutable because the trait
-  // takes `&self`.
-  error: Mutex<Option<InferError>>,
+  // Hard-failure latch (interior-mutable: the trait takes `&self`). A
+  // per-frame model failure is infallible at the trait boundary, so rather
+  // than swallow it into false silence `voice_activity` records it here —
+  // bumping `generation` and storing the error. `detection_generation` /
+  // `last_detection_error` expose it non-destructively, so concurrent
+  // `transcribe` calls can't clear each other's failures (module doc).
+  latch: Mutex<DetectionLatch>,
 }
 
 impl SileroVad {
@@ -110,7 +127,7 @@ impl SileroVad {
     Self {
       model: Mutex::new(model),
       threshold: DEFAULT_SPEECH_THRESHOLD,
-      error: Mutex::new(None),
+      latch: Mutex::new(DetectionLatch::default()),
     }
   }
 
@@ -150,13 +167,15 @@ impl VoiceActivityDetector for SileroVad {
   /// is infallible, returning `Vec<bool>`), but unlike
   /// [`EnergyVad`](crate::audio::vad::EnergyVad) — whose RMS is a total
   /// function of any finite input — a hard *model* failure here is not a
-  /// benign "no speech": it is **latched** (first failure wins) instead of
-  /// swallowed, so
-  /// [`take_detection_error`](crate::audio::vad::VoiceActivityDetector::take_detection_error)
-  /// can drain it. `WhisperKit::transcribe` consults that latch after
-  /// chunking and surfaces a [`crate::error::VadError`], so a hard failure
-  /// during VAD is observable from the same transcription call rather than
-  /// silently degrading the chunk boundaries.
+  /// benign "no speech": it is **latched** instead of swallowed, bumping a
+  /// monotonic
+  /// [`detection_generation`](crate::audio::vad::VoiceActivityDetector::detection_generation)
+  /// and recording the error for
+  /// [`last_detection_error`](crate::audio::vad::VoiceActivityDetector::last_detection_error).
+  /// `WhisperKit::transcribe` snapshots that generation across chunking and
+  /// surfaces a [`crate::error::VadError`], so a hard failure during VAD is
+  /// observable from the same transcription call rather than silently
+  /// degrading the chunk boundaries.
   fn voice_activity(&self, samples: &[f32]) -> Vec<bool> {
     let model = self.model.lock().expect("SileroVad model mutex poisoned");
     let mut state = VadState::initial();
@@ -170,13 +189,18 @@ impl VoiceActivityDetector for SileroVad {
           }
           Err(error) => {
             // Infallible per the trait, so this frame is reported inactive —
-            // but the hard failure is LATCHED (first one wins) rather than
-            // lost, so `take_detection_error` can surface it. `state` is not
-            // advanced; later frames continue from the last good state.
-            let mut latch = self.error.lock().expect("SileroVad error latch poisoned");
-            if latch.is_none() {
-              *latch = Some(error);
-            }
+            // but the hard failure is LATCHED rather than lost: bump the
+            // monotonic generation and record the error (most recent wins).
+            // `transcribe` detects the generation advance and surfaces it; a
+            // concurrent run reading the latch can't clear this one (module
+            // doc). `state` is not advanced; later frames continue from the
+            // last good state.
+            let mut latch = self
+              .latch
+              .lock()
+              .expect("SileroVad detection latch poisoned");
+            latch.generation = latch.generation.wrapping_add(1);
+            latch.last_error = Some(error);
             false
           }
         },
@@ -184,15 +208,29 @@ impl VoiceActivityDetector for SileroVad {
       .collect()
   }
 
-  /// Drains the first inference failure latched by [`Self::voice_activity`]
-  /// (see its note), boxed as the trait's erased error. `None` when the
-  /// most recent run hit no hard failure.
-  fn take_detection_error(&self) -> Option<Box<dyn std::error::Error + Send + Sync + 'static>> {
+  /// The monotonic count of hard inference failures [`Self::voice_activity`]
+  /// has latched (see its note). `transcribe` snapshots this before chunking
+  /// and compares afterward; any advance is a failure it must surface. Never
+  /// reset, so a concurrent run can't hide this one.
+  fn detection_generation(&self) -> u64 {
     self
-      .error
+      .latch
       .lock()
-      .expect("SileroVad error latch poisoned")
-      .take()
+      .expect("SileroVad detection latch poisoned")
+      .generation
+  }
+
+  /// The most recent latched inference failure, cloned and boxed as the
+  /// trait's erased error, without clearing it — non-destructive, so
+  /// simultaneous callers each observing a generation advance can all read
+  /// it. `None` when nothing has been latched.
+  fn last_detection_error(&self) -> Option<Box<dyn std::error::Error + Send + Sync + 'static>> {
+    self
+      .latch
+      .lock()
+      .expect("SileroVad detection latch poisoned")
+      .last_error
+      .clone()
       .map(|error| Box::new(error) as Box<dyn std::error::Error + Send + Sync + 'static>)
   }
 

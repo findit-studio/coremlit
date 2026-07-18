@@ -1023,11 +1023,11 @@ fn transcribe_surfaces_a_latched_vad_failure_instead_of_ok() {
   // CoreML model failing mid-stream — reports all-inactive frames, which on
   // their own would let `chunk_all` split the window and `transcribe` return
   // an `Ok` transcript off silently-degraded boundaries. Whisperkit's
-  // transcribe instead drains the latch after chunking (via
-  // `VoiceActivityDetector::take_detection_error`) and surfaces
-  // `TranscribeError::Vad`.
+  // transcribe instead snapshots the detector's failure generation across
+  // chunking (via `VoiceActivityDetector::detection_generation`) and, seeing
+  // it advance, surfaces `TranscribeError::Vad`.
   //
-  // Mutation: drop the `take_detection_error` check in `WhisperKit::transcribe`
+  // Mutation: drop the `detection_generation` check in `WhisperKit::transcribe`
   // → the latched failure is ignored, the unscripted chunks decode/drop to an
   // empty `Ok`, and this `expect_err` goes red.
   #[derive(Default)]
@@ -1044,7 +1044,13 @@ fn transcribe_surfaces_a_latched_vad_failure_instead_of_ok() {
     fn frame_length_samples(&self) -> usize {
       crate::audio::vad::DEFAULT_FRAME_LENGTH_SAMPLES
     }
-    fn take_detection_error(&self) -> Option<Box<dyn std::error::Error + Send + Sync + 'static>> {
+    fn detection_generation(&self) -> u64 {
+      // One latched failure once `voice_activity` has run; monotonic, so the
+      // generation transcribe snapshots before chunking (0) differs from the
+      // one it reads after (1).
+      u64::from(*self.fired.lock().unwrap())
+    }
+    fn last_detection_error(&self) -> Option<Box<dyn std::error::Error + Send + Sync + 'static>> {
       self
         .fired
         .lock()
@@ -1074,6 +1080,118 @@ fn transcribe_surfaces_a_latched_vad_failure_instead_of_ok() {
       .to_string()
       .contains("voice-activity detection failed"),
     "the error should render the VAD stage, got: {error}"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn concurrent_transcribe_cannot_steal_a_latched_vad_failure() {
+  // Regression (vadkit-fence Medium): `SileroVad` is `Send + Sync` and
+  // documented as shareable, so two `transcribe` calls can drive one detector
+  // at once. The failure latch must not be a slot one caller can drain out from
+  // under another: with the old destructive `take`, caller B's pre-clear —
+  // landing between A's latch and A's post-chunk check — discarded A's error
+  // and A returned `Ok` off silently-degraded boundaries. The fix makes each
+  // run's source of truth a monotonic `detection_generation` it snapshots and
+  // re-reads, which no other run can clear, so A still fails closed even though
+  // B destructively drains the recorded error detail mid-race.
+  //
+  // Determinism: two barriers (no sleeps) pin the exact interleaving — A
+  // latches, THEN B drains, THEN A reaches its post-chunk generation check.
+  //
+  // Mutation: revert `transcribe` to decide via the drainable error slot
+  // (`last_detection_error().is_some()`, the old `take`-shaped check) instead
+  // of the generation delta → B's mid-race drain empties the slot, A reads
+  // `None`, returns `Ok`, and this assertion goes red.
+  use std::sync::{
+    Arc, Barrier, Mutex,
+    atomic::{AtomicBool, Ordering},
+  };
+
+  // Shared latch state, faithful to `SileroVad`'s: a monotonic generation and a
+  // most-recent-error slot, plus the two rendezvous the stealer thread uses. A
+  // plain `String` stands in for the model's `InferError` (which the whisperkit
+  // test crate cannot construct — it is `#[non_exhaustive]`).
+  struct Shared {
+    generation: Mutex<u64>,
+    last_error: Mutex<Option<String>>,
+    coordinated: AtomicBool,
+    after_latch: Barrier,
+    after_steal: Barrier,
+  }
+  impl Shared {
+    // The stealer's destructive drain — exactly what the old pre-clear `take`
+    // did to a concurrent run's recorded error.
+    fn steal(&self) {
+      self.last_error.lock().unwrap().take();
+    }
+  }
+
+  struct RacingVad(Arc<Shared>);
+  impl VoiceActivityDetector for RacingVad {
+    fn voice_activity(&self, samples: &[f32]) -> Vec<bool> {
+      let s = &self.0;
+      // Latch a hard failure exactly ONCE — on the first call — and hand off to
+      // the stealer while latched. `chunk_all` drives the detector once per
+      // window, so a later call must NOT re-record the error: that would paper
+      // over B's mid-race steal and mask the very bug under test.
+      if !s.coordinated.swap(true, Ordering::SeqCst) {
+        *s.generation.lock().unwrap() += 1;
+        *s.last_error.lock().unwrap() = Some("scripted concurrent VAD failure".to_owned());
+        s.after_latch.wait(); // release B to steal the recorded detail
+        s.after_steal.wait(); // B has stolen; let A proceed to its check
+      }
+      // A hard failure is indistinguishable from silence at the trait boundary.
+      vec![false; samples.len().div_ceil(self.frame_length_samples())]
+    }
+    fn frame_length_samples(&self) -> usize {
+      crate::audio::vad::DEFAULT_FRAME_LENGTH_SAMPLES
+    }
+    fn detection_generation(&self) -> u64 {
+      *self.0.generation.lock().unwrap()
+    }
+    fn last_detection_error(&self) -> Option<Box<dyn std::error::Error + Send + Sync + 'static>> {
+      self.0.last_error.lock().unwrap().clone().map(Into::into)
+    }
+  }
+
+  let shared = Arc::new(Shared {
+    generation: Mutex::new(0),
+    last_error: Mutex::new(None),
+    coordinated: AtomicBool::new(false),
+    after_latch: Barrier::new(2),
+    after_steal: Barrier::new(2),
+  });
+
+  let t = tiny_tokenizer();
+  let mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(48_000));
+  let kit =
+    WhisperKit::with_backend(mock, t).with_vad_detector(Box::new(RacingVad(shared.clone())));
+  // Longer than one window, so the VAD chunking branch runs the detector. A
+  // fails closed at the post-chunk check, BEFORE any decode, so the backend is
+  // never driven and needs no scripting.
+  let audio = vec![0.1f32; 96_000];
+  let options = DecodingOptions::new().with_chunking_strategy(ChunkingStrategy::Vad);
+
+  let result = std::thread::scope(|scope| {
+    // A: the real transcribe whose VAD run latches a hard failure.
+    let a = scope.spawn(|| kit.transcribe(&audio, &options));
+    // B: a concurrent run standing in for the old destructive pre-clear — it
+    // drains A's recorded error the instant A has latched it.
+    let b_shared = Arc::clone(&shared);
+    let b = scope.spawn(move || {
+      b_shared.after_latch.wait(); // A has latched
+      b_shared.steal(); // discard A's recorded error mid-flight
+      b_shared.after_steal.wait(); // let A reach its post-chunk check
+    });
+    b.join().unwrap();
+    a.join().unwrap()
+  });
+
+  assert!(
+    matches!(result, Err(TranscribeError::Vad(VadError::Detection(_)))),
+    "A must fail closed on its own generation delta even though B drained the \
+     recorded error mid-race, got {result:?}"
   );
 }
 

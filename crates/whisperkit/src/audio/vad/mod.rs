@@ -34,10 +34,9 @@ pub trait VoiceActivityDetector {
   /// Samples per analysis frame.
   fn frame_length_samples(&self) -> usize;
 
-  /// Drains and returns the first hard inference failure the detector
-  /// latched during its most recent [`voice_activity`](Self::voice_activity)
-  /// / [`active_chunks`](Self::active_chunks) run, or `None` if the
-  /// detector cannot fail or none occurred.
+  /// A monotonic count of the hard inference failures this detector has
+  /// latched over its whole lifetime. Never decreases and is never reset;
+  /// the default is `0` for detectors that cannot fail.
   ///
   /// [`voice_activity`](Self::voice_activity) is infallible by contract —
   /// it returns `Vec<bool>`, with no per-frame error channel — so a
@@ -45,17 +44,42 @@ pub trait VoiceActivityDetector {
   /// detector) that hits a hard model/runtime failure would otherwise
   /// have to report it as ordinary "no speech". Rather than let that
   /// failure masquerade as silence and silently corrupt chunk boundaries,
-  /// such a detector latches the first failure and exposes it here;
+  /// such a detector latches the failure — bumping this generation and
+  /// recording the error for [`last_detection_error`](Self::last_detection_error).
   /// [`WhisperKit::transcribe`](crate::transcribe::WhisperKit::transcribe)
-  /// consults this right after driving the detector for chunking and
-  /// surfaces a [`crate::error::VadError`] instead of returning an `Ok`
-  /// transcript off a degraded segmentation. Detectors that cannot fail —
-  /// the default [`EnergyVad`], whose RMS is total over any finite input —
-  /// keep this default `None`.
+  /// snapshots this generation before driving the detector for chunking
+  /// and compares it afterward: any advance means a hard failure occurred
+  /// during that window, so it surfaces a [`crate::error::VadError`]
+  /// instead of returning an `Ok` transcript off a degraded segmentation.
   ///
-  /// Draining (rather than peeking) keeps each transcription run's check
-  /// scoped to that run's own failures.
-  fn take_detection_error(&self) -> Option<Box<dyn std::error::Error + Send + Sync + 'static>> {
+  /// Comparing a monotonic generation — rather than draining a shared error
+  /// slot — is what makes the check concurrency-safe: the detector is
+  /// `Send + Sync` and may be shared across *simultaneous* `transcribe`
+  /// calls, and no caller can clear a generation another is about to
+  /// observe. A failure that lands inside two callers' overlapping windows
+  /// surfaces to both; that over-report is deliberate — the alternative, a
+  /// destructive drain, silently lost one caller's error. Detectors that
+  /// cannot fail — the default [`EnergyVad`], whose RMS is total over any
+  /// finite input — keep this default `0`.
+  fn detection_generation(&self) -> u64 {
+    0
+  }
+
+  /// The most recent hard inference failure this detector latched, or `None`
+  /// if it cannot fail or none has occurred. Reading it is
+  /// **non-destructive** — the failure stays recorded, so concurrent
+  /// [`transcribe`](crate::transcribe::WhisperKit::transcribe) callers that
+  /// each observe a [`detection_generation`](Self::detection_generation)
+  /// advance can all retrieve it.
+  ///
+  /// The [`detection_generation`](Self::detection_generation) counter — not
+  /// the presence of a value here — is the authority on *whether* a failure
+  /// occurred; this only supplies the error *detail* to render. A caller
+  /// that sees the generation advance but finds this `None` (a concurrent
+  /// run's detail races ahead, or a future detector reports only a count)
+  /// must still fail closed. Detectors that cannot fail keep this default
+  /// `None`.
+  fn last_detection_error(&self) -> Option<Box<dyn std::error::Error + Send + Sync + 'static>> {
     None
   }
 
