@@ -25,7 +25,7 @@
 //! `segmentations[c][..][s]`, `embedding` → `raw_embeddings[c][s][..]`.
 //!
 //! Regenerate with `tests/swift/regen_goldens.sh` (documented there); the
-//! goldens live in `tests/fixtures/golden_argmax_swift/`.
+//! goldens live in `tests/speaker/fixtures/golden_argmax_swift/`.
 //!
 //! # The inputs are PROVEN identical, not assumed (the alignkit lesson)
 //!

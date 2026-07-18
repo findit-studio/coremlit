@@ -1,6 +1,6 @@
 //! End-to-end parity against Swift WhisperKit on jfk.wav / openai_whisper-tiny.
 //!
-//! Golden: tests/fixtures/golden/jfk_tiny_golden.json (see plan Task 13 for
+//! Golden: tests/whisper/fixtures/golden/jfk_tiny_golden.json (see plan Task 13 for
 //! the pinned whisperkit-cli invocation). Contract (spec §2.1): exact token
 //! ids; segment boundaries within epsilon (timestamps are quantized to
 //! 0.02 s tokens, so epsilon 1e-3 catches any real divergence).

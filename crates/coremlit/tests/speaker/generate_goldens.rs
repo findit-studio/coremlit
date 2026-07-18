@@ -4,7 +4,7 @@
 //! reference blobs, it RUNS dia's own `ort` pipeline — the very
 //! `pyannote/segmentation-3.0` + WeSpeaker ResNet34-LM models speakerkit
 //! re-implements over CoreML — and writes each fixture's reference tensors to
-//! `tests/fixtures/golden/<name>.json`. The parity suites
+//! `tests/speaker/fixtures/golden/<name>.json`. The parity suites
 //! (`tests/parity_seg.rs`, `tests/parity_embed.rs`) then check CoreML against
 //! those committed goldens WITHOUT needing dia/ort at all.
 //!
@@ -151,7 +151,7 @@ fn dia_hard_multilabel(logits: &[f32], num_frames: usize) -> Vec<f64> {
 fn generate_goldens() {
   // WRITE GUARD (whisperkit's `UPDATE_GOLDEN` convention, `parity_jfk.rs`):
   // this test's whole body OVERWRITES the committed golden oracle
-  // (`tests/fixtures/golden/*.json`), so it must never fire from a routine
+  // (`tests/speaker/fixtures/golden/*.json`), so it must never fire from a routine
   // `cargo test -p speakerkit --features dia-oracle -- --ignored` — that gate runs
   // every `#[ignore]` test, and an unconditional writer here silently
   // re-baselines the very oracle `tests/parity_seg.rs` / `parity_embed.rs`

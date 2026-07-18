@@ -67,7 +67,7 @@
 //! # Value semantics (verified against the real models, not just the Swift)
 //!
 //! The Swift says *which* tensors; only running the model says *what is in
-//! them*. Probed on `tests/fixtures/audio/02_pyannote_sample.wav` through
+//! them*. Probed on `tests/speaker/fixtures/audio/02_pyannote_sample.wav` through
 //! the W32A32/W16A16 variants, and re-asserted by
 //! `tests`'s model-gated `argmax_decoded_output_value_semantics`:
 //!

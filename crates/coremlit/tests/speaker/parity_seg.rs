@@ -4,7 +4,7 @@
 //!
 //! Both sides run the SAME model (pyannote/segmentation-3.0) on the SAME raw
 //! 16 kHz waveform — dia-ort's powerset output is the committed golden
-//! (`tests/fixtures/golden/*.json`, produced by `tests/generate_goldens.rs`);
+//! (`tests/speaker/fixtures/golden/*.json`, produced by `tests/generate_goldens.rs`);
 //! CoreML re-runs the conversion (`pyannote_segmentation.mlmodelc`).
 //!
 //! **Both sides emit `log(softmax(·))`, not raw logits** — this file, the
@@ -357,7 +357,7 @@ fn near_tie_softmax_can_flip_the_argmax() {
 /// today). If a future re-cut golden ever disagrees, that is a genuine finding
 /// AND a deliberate golden decision, not a silent pass: this fails loudly and
 /// names every diverging frame. Reads only the committed
-/// `tests/fixtures/golden/*.json` — no models, no `dia`/`ort`.
+/// `tests/speaker/fixtures/golden/*.json` — no models, no `dia`/`ort`.
 #[test]
 fn golden_direct_and_dia_decode_agree() {
   let mut divergences: Vec<String> = Vec::new();
@@ -412,7 +412,7 @@ fn golden_direct_and_dia_decode_agree() {
 /// suites, yet break the invariant the whole `softmax → log` comparison rests on.
 /// This is the committed-side half of [`common::check_seg_log_probs`] (the
 /// generator runs the other half before serializing). Reads only the committed
-/// `tests/fixtures/golden/*.json` — no models, no `dia`/`ort`.
+/// `tests/speaker/fixtures/golden/*.json` — no models, no `dia`/`ort`.
 #[test]
 fn committed_golden_seg_rows_are_log_probs() {
   let mut total_rows = 0usize;

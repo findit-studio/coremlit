@@ -128,7 +128,7 @@ pub const FIXTURES: &[Fixture] = &[
 ];
 
 /// The exact `seg_model` provenance string frozen into every committed golden
-/// (`tests/fixtures/golden/*.json`) AND the single source of truth that
+/// (`tests/speaker/fixtures/golden/*.json`) AND the single source of truth that
 /// `tests/generate_goldens.rs` writes when it regenerates one. Pinned here so
 /// the two can never silently drift apart; `tests/golden_metadata.rs` asserts
 /// each committed golden still carries this exact string in the ordinary

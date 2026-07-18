@@ -78,13 +78,13 @@ pub struct Fixture {
 pub const FIXTURES: &[Fixture] = &[
   Fixture {
     name: "02_pyannote_sample",
-    source: "crates/speakerkit/tests/fixtures/audio/02_pyannote_sample.wav",
+    source: "crates/coremlit/tests/speaker/fixtures/audio/02_pyannote_sample.wav",
     sha256: "c319b4abca767b124e41432d364fd7df006cb26bb79d09326c487d606a134e6e",
     note: "pyannote's canonical 30.0 s multi-speaker demo → 118 full 256 ms chunks",
   },
   Fixture {
     name: "07_yuhewei_dongbei_english",
-    source: "crates/speakerkit/tests/fixtures/audio/07_yuhewei_dongbei_english.wav",
+    source: "crates/coremlit/tests/speaker/fixtures/audio/07_yuhewei_dongbei_english.wav",
     sha256: "096890ba8ffbaf10ca770c5373bf6c6664777f9421595c2cb7780af8cb2e46ff",
     note: "25.26 s clip → 98 full chunks + 1 short final chunk (exercises repeat-last padding)",
   },

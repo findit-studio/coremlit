@@ -1128,8 +1128,8 @@ fn load_source() -> ArgmaxSource {
 
 /// The committed 30.0 s parity fixture (`tests/common`'s `02_pyannote_sample`).
 fn load_pyannote_sample() -> Vec<f32> {
-  let path =
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/audio/02_pyannote_sample.wav");
+  let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    .join("tests/speaker/fixtures/audio/02_pyannote_sample.wav");
   let mut reader = hound::WavReader::open(&path).expect("02_pyannote_sample.wav opens");
   assert_eq!(reader.spec().sample_rate, 16_000);
   assert_eq!(reader.spec().channels, 1);
