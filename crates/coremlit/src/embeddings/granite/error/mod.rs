@@ -102,6 +102,31 @@ pub enum Error {
   /// Encoding text into token ids failed.
   #[error("failed to tokenize text: {0}")]
   Tokenize(#[source] tokenizers::Error),
+
+  /// The tokenized input exceeded the fixed
+  /// [`MAX_TOKENS`](crate::embeddings::granite::MAX_TOKENS) window. Every
+  /// constructor forces truncation at that length and disables the tokenizer's
+  /// own padding, so this is a defensive backstop — returned instead of an
+  /// out-of-bounds panic — against a tokenizer that still yields more ids than
+  /// the window (e.g. a padding policy that survived configuration).
+  #[error("tokenized input has {got} tokens, exceeding the fixed {max}-token window")]
+  TokenCount {
+    /// Number of token ids the tokenizer produced.
+    got: usize,
+    /// The fixed window length
+    /// ([`MAX_TOKENS`](crate::embeddings::granite::MAX_TOKENS)).
+    max: usize,
+  },
+
+  /// A token id did not fit the model's `int32` `input_ids` tensor. granite's
+  /// vocabulary is far below `i32::MAX`, so this only fires for a foreign
+  /// tokenizer with an out-of-range id — returned instead of a silently
+  /// wrapping cast.
+  #[error("token id {id} exceeds the model's int32 input range")]
+  TokenIdRange {
+    /// The offending token id.
+    id: u32,
+  },
 }
 
 #[cfg(test)]

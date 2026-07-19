@@ -20,7 +20,10 @@ use coremlit::embeddings::granite::BUNDLED_TOKENIZER;
 use tokenizers::{Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy};
 
 /// The bundled tokenizer, configured identically to the embedder's runtime seam
-/// (`configure_truncation`): `LongestFirst` at 512, stride 0, right direction.
+/// (`configure_tokenizer`): `LongestFirst` truncation at 512, stride 0, right
+/// direction, with the tokenizer's own padding disabled (the embedder does its
+/// own fixed-window padding). The bundled tokenizer carries no padding policy, so
+/// disabling it is a no-op here — it keeps this seam faithful to the runtime.
 fn configured_tokenizer() -> Tokenizer {
   let mut tok = Tokenizer::from_bytes(BUNDLED_TOKENIZER).expect("load bundled granite tokenizer");
   tok
@@ -31,6 +34,7 @@ fn configured_tokenizer() -> Tokenizer {
       direction: TruncationDirection::Right,
     }))
     .expect("configure truncation");
+  tok.with_padding(None);
   tok
 }
 

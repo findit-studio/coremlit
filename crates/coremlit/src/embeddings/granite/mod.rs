@@ -168,10 +168,10 @@ impl TextEmbedderOptions {
 /// granite text embedder: a `&str` in, a unit-norm 384-d [`Embedding`] out.
 ///
 /// Tokenizes with the bundled granite tokenizer (truncation `LongestFirst` at
-/// [`MAX_TOKENS`], matching the goldens' convention so token ids are identical),
-/// right-pads to the fixed `[1, 512]` window with an attention mask, runs the
-/// fp16 CoreML ModernBERT graph, and L2-normalizes the pre-normalization CLS
-/// projection.
+/// [`MAX_TOKENS`] and the tokenizer's own padding disabled, matching the goldens'
+/// convention so token ids are identical), right-pads to the fixed `[1, 512]`
+/// window with an attention mask, runs the fp16 CoreML ModernBERT graph, and
+/// L2-normalizes the pre-normalization CLS projection.
 #[derive(Debug)]
 pub struct TextEmbedder {
   model: Model,
@@ -240,15 +240,16 @@ impl TextEmbedder {
     mut tokenizer: Tokenizer,
     options: TextEmbedderOptions,
   ) -> Result<Self> {
-    configure_truncation(&mut tokenizer)?;
+    configure_tokenizer(&mut tokenizer)?;
     // The pad positions are attention-masked to 0 and CLS pooling reads position
     // 0 (never a pad), so the pad token value is immaterial to the output; a
     // valid vocabulary index is all that is required. Resolve granite's pad
-    // token `<|endoftext|>`, else fall back to `0` (the BOS/CLS index, always
-    // valid).
+    // token `<|endoftext|>` (checked into `i32` range), else fall back to `0`
+    // (the BOS/CLS index, always valid).
     let pad_id = tokenizer
       .token_to_id("<|endoftext|>")
-      .map_or(0, |id| id as i32);
+      .and_then(|id| i32::try_from(id).ok())
+      .unwrap_or(0);
 
     let model = Model::load(model_path, options.compute())?;
     let description = model.description();
@@ -315,7 +316,10 @@ impl TextEmbedder {
   ///
   /// # Errors
   /// [`Error::EmptyText`] if `text` is empty; [`Error::Tokenize`] on a tokenizer
-  /// failure; [`Error::Tensor`] / [`Error::Prediction`] on a tensor or CoreML
+  /// failure; [`Error::TokenCount`] if the tokenized input exceeds [`MAX_TOKENS`]
+  /// or [`Error::TokenIdRange`] if a token id is out of `int32` range (both
+  /// defensive — the tokenizer config makes neither reachable in practice);
+  /// [`Error::Tensor`] / [`Error::Prediction`] on a tensor or CoreML
   /// failure; [`Error::OutputShape`] if the predicted `embedding` shape diverges
   /// from `[1, `[`EMBEDDING_DIM`]`]`; [`Error::NonFiniteOutput`] if the model
   /// output has a NaN/infinite component — model corruption, classified apart
@@ -324,15 +328,10 @@ impl TextEmbedder {
   /// projection has zero magnitude.
   pub fn embed(&self, text: &str) -> Result<Embedding> {
     let ids = self.token_ids(text)?;
-    debug_assert!(ids.len() <= MAX_TOKENS, "truncation caps ids at the window");
-
-    // Right-pad to the fixed [1, 512] window; mask real tokens 1, pads 0.
-    let mut input_ids = [self.pad_id; MAX_TOKENS];
-    let mut attention_mask = [0i32; MAX_TOKENS];
-    for (i, &id) in ids.iter().enumerate() {
-      input_ids[i] = id as i32;
-      attention_mask[i] = 1;
-    }
+    // Right-pad to the fixed [1, 512] window; real tokens masked 1, pads 0. The
+    // tokenizer config guarantees `ids` is real and within the window, but
+    // `build_window` still guards it with a typed error instead of a panic.
+    let (input_ids, attention_mask) = build_window(&ids, self.pad_id)?;
 
     let ids_tensor = MultiArray::from_slice(&[1, MAX_TOKENS], &input_ids)?;
     let mask_tensor = MultiArray::from_slice(&[1, MAX_TOKENS], &attention_mask)?;
@@ -364,12 +363,21 @@ impl TextEmbedder {
   }
 }
 
-/// Applies the fixed truncation config shared by every constructor:
-/// `LongestFirst` at [`MAX_TOKENS`], stride 0, right direction — the convention
-/// the committed goldens were tokenized under (fixed 512, right truncation), so
-/// this module's token ids match them exactly. This is a hard model constraint
-/// (the export sequence length cannot be exceeded), not a knob.
-fn configure_truncation(tokenizer: &mut Tokenizer) -> Result<()> {
+/// Overrides the loaded tokenizer's truncation and padding policy to this
+/// module's fixed-window contract, so the contract holds for ANY tokenizer
+/// (bundled or caller-supplied) regardless of what it carried:
+///
+/// * **Truncation** `LongestFirst` at [`MAX_TOKENS`], stride 0, right direction —
+///   the convention the committed goldens were tokenized under (fixed 512, right
+///   truncation), so this module's token ids match them exactly. The export
+///   sequence length is a hard model constraint, not a knob.
+/// * **Padding disabled** (`with_padding(None)`) — this module does its own
+///   fixed-window right-padding in [`build_window`] and masks the pad positions.
+///   Leaving an inherited padding policy in place would let pad ids reach
+///   [`TextEmbedder::token_ids`] marked as real tokens (corrupt mask), push the
+///   CLS token off position 0 under left-padding (wrong CLS pooling), or overflow
+///   the window under fixed-padding beyond 512.
+fn configure_tokenizer(tokenizer: &mut Tokenizer) -> Result<()> {
   tokenizer
     .with_truncation(Some(TruncationParams {
       max_length: MAX_TOKENS,
@@ -378,7 +386,38 @@ fn configure_truncation(tokenizer: &mut Tokenizer) -> Result<()> {
       direction: TruncationDirection::Right,
     }))
     .map_err(Error::TokenizerConfig)?;
+  tokenizer.with_padding(None);
   Ok(())
+}
+
+/// Builds the fixed `[1, `[`MAX_TOKENS`]`]` `input_ids` / `attention_mask` window
+/// from the real token `ids`: the real tokens occupy the prefix (mask `1`) and
+/// the remainder is right-padded with `pad_id` (mask `0`). CLS therefore stays at
+/// position 0 and no pad position is ever attended.
+///
+/// [`configure_tokenizer`] forces truncation at [`MAX_TOKENS`] and disables the
+/// tokenizer's own padding, so `ids` is already real and within the window; this
+/// still returns a typed [`Error`] rather than panicking should that contract
+/// ever be violated (an over-long or out-of-range id must not become an
+/// out-of-bounds write or a wrapping cast).
+///
+/// # Errors
+/// [`Error::TokenCount`] if `ids` exceeds [`MAX_TOKENS`]; [`Error::TokenIdRange`]
+/// if a token id does not fit the model's `int32` `input_ids` tensor.
+fn build_window(ids: &[u32], pad_id: i32) -> Result<([i32; MAX_TOKENS], [i32; MAX_TOKENS])> {
+  if ids.len() > MAX_TOKENS {
+    return Err(Error::TokenCount {
+      got: ids.len(),
+      max: MAX_TOKENS,
+    });
+  }
+  let mut input_ids = [pad_id; MAX_TOKENS];
+  let mut attention_mask = [0i32; MAX_TOKENS];
+  for (i, &id) in ids.iter().enumerate() {
+    input_ids[i] = i32::try_from(id).map_err(|_| Error::TokenIdRange { id })?;
+    attention_mask[i] = 1;
+  }
+  Ok((input_ids, attention_mask))
 }
 
 /// Test-only seam: the module's actual tokenizer configuration, without loading
@@ -387,7 +426,7 @@ fn configure_truncation(tokenizer: &mut Tokenizer) -> Result<()> {
 #[cfg(test)]
 pub(crate) fn configured_tokenizer_from_bytes(bytes: &[u8]) -> Result<Tokenizer> {
   let mut tokenizer = Tokenizer::from_bytes(bytes).map_err(Error::TokenizerLoad)?;
-  configure_truncation(&mut tokenizer)?;
+  configure_tokenizer(&mut tokenizer)?;
   Ok(tokenizer)
 }
 
