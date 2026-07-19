@@ -1811,10 +1811,16 @@ where
         decoded_span,
       );
       *merged.task_facts_mut() = recovered;
-      // Load timings are identical for every chunk, and the merge
-      // max-combines them (all-zero out, since `run` never writes them), so
-      // stamping the merged result once is equivalent to stamping each chunk
-      // before the merge.
+      // Stamps the merged result once, not each chunk before merging — and
+      // the two are equivalent only for the five max-combined load fields.
+      // Load timings are identical for every chunk in this `WhisperKit`, so
+      // stamping post-merge lands the same value pre-merge stamping (then
+      // max-combining identical values) would. The two specialization
+      // fields differ: the merge (`merge_results`, `result/mod.rs:2381-2389`)
+      // always leaves them at zero regardless of what the inputs held, so
+      // pre-merge stamping would still merge away to 0.0 — stamping the
+      // merged result here is what carries real specialization values
+      // through.
       self.stamp_load_timings(&mut merged);
       return Ok(merged);
     }

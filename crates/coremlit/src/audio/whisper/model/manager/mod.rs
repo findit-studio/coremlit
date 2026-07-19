@@ -87,7 +87,7 @@ impl LoadedModels {
 /// [`ModelManager::into_loaded`] for a `WhisperKit` to fold into its
 /// per-run [`crate::audio::whisper::result::TranscriptionTimings`]. Mirrors
 /// the split Swift's `WhisperKit.loadModels(prewarmMode:)` records into
-/// `currentTimings` (`WhisperKit.swift:396-422`): the **prewarm** pass's
+/// `currentTimings` (`WhisperKit.swift:396-423`): the **prewarm** pass's
 /// per-model load elapsed is the *specialization* time (the one-time
 /// ANE/graph specialization the throwaway prewarm load pays up front), and
 /// the **real** load pass's per-model elapsed is the *load* time. The two

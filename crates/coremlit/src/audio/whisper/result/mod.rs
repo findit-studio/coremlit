@@ -637,9 +637,16 @@ pub struct TranscriptionTimings {
   /// `0.0` cannot distinguish "never fell back" from "one fallback at
   /// attempt 0"; a true count would be `attempt + 1`. A multi-window task
   /// overwrites per window, keeping only the last window's index, and
-  /// merged results sum these per-result values. For an unambiguous "a
-  /// fallback occurred" signal, use
-  /// [`TaskFacts::drew_from_rng`](crate::audio::whisper::task_facts::TaskFacts::drew_from_rng).
+  /// merged results sum these per-result values.
+  /// [`TaskFacts::drew_from_rng`](crate::audio::whisper::task_facts::TaskFacts::drew_from_rng)
+  /// is the unambiguous "a fallback occurred" signal only when the base
+  /// temperature is zero (the default) — attempt 0 then always argmaxes, so
+  /// any draw implies a fallback raised the temperature first. Under a
+  /// configured non-zero base temperature (e.g.
+  /// `DecodingOptions::new().with_temperature(0.5)`) attempt 0 itself draws
+  /// with zero fallbacks, and a degenerate retry (zero tokens decoded, or
+  /// `temperature_increment_on_fallback == 0.0`) can fall back without ever
+  /// drawing.
   #[cfg_attr(feature = "serde", serde(default))]
   total_decoding_fallbacks: f64,
   /// Number of 30 s windows decoded.
@@ -1114,9 +1121,16 @@ impl TranscriptionTimings {
   /// `0.0` cannot distinguish "never fell back" from "one fallback at
   /// attempt 0"; a true count would be `attempt + 1`. A multi-window task
   /// overwrites per window, keeping only the last window's index, and
-  /// merged results sum these per-result values. For an unambiguous "a
-  /// fallback occurred" signal, use
-  /// [`TaskFacts::drew_from_rng`](crate::audio::whisper::task_facts::TaskFacts::drew_from_rng).
+  /// merged results sum these per-result values.
+  /// [`TaskFacts::drew_from_rng`](crate::audio::whisper::task_facts::TaskFacts::drew_from_rng)
+  /// is the unambiguous "a fallback occurred" signal only when the base
+  /// temperature is zero (the default) — attempt 0 then always argmaxes, so
+  /// any draw implies a fallback raised the temperature first. Under a
+  /// configured non-zero base temperature (e.g.
+  /// `DecodingOptions::new().with_temperature(0.5)`) attempt 0 itself draws
+  /// with zero fallbacks, and a degenerate retry (zero tokens decoded, or
+  /// `temperature_increment_on_fallback == 0.0`) can fall back without ever
+  /// drawing.
   #[inline(always)]
   pub const fn total_decoding_fallbacks(&self) -> f64 {
     self.total_decoding_fallbacks
