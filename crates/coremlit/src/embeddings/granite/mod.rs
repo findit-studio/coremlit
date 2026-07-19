@@ -1,0 +1,401 @@
+//! Native CoreML **granite** text embeddings — a general sentence-embedding
+//! surface whose first model is IBM's
+//! `granite-embedding-97m-multilingual-r2` (a ModernBERT encoder with CLS
+//! pooling projecting to a 384-dim space).
+//!
+//! A `&str` in, a unit-norm 384-dim [`Embedding`] out ([`TextEmbedder::embed`]):
+//! the bundled granite tokenizer around the fp16 CoreML ModernBERT graph, with
+//! L2 normalization applied in Rust.
+//!
+//! Design spec: `docs/superpowers/specs/2026-07-18-embedkit-design.md`
+//! (Amendment 3: granite confirmed, `coremlit::embeddings::granite`, prompt-free,
+//! committed-golden oracle).
+//!
+//! macOS only (built on [`crate`]).
+//!
+//! # Prompt-free (raw strings)
+//!
+//! granite-embedding r2 retrieval is **prompt-free**: its
+//! `config_sentence_transformers.json` query/document prompts are empty. Feed
+//! **raw strings** — no task prefixes. (This is the model's documented retrieval
+//! contract; it differs from instruction-tuned embedders.)
+//!
+//! # Model artifacts
+//!
+//! The CoreML graph is distributed on the Hugging Face Hub at
+//! [`FinDIT-Studio/embedkit-coreml`](https://huggingface.co/FinDIT-Studio/embedkit-coreml),
+//! revision `81852f70`, converted from
+//! [`ibm-granite/granite-embedding-97m-multilingual-r2`](https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2)
+//! (**Apache-2.0**; see the crate `NOTICE`). It is a gitignored dev-time
+//! download under `Models/embedkit-granite/`; its per-file SHA-256 and I/O
+//! contract are pinned by `tests/granite/model_io.rs`.
+//!
+//! # Rust front-end around an fp16 CoreML graph
+//!
+//! The graph emits the **pre-normalization** CLS embedding (`hidden_states[:,
+//! 0]` after the final LayerNorm); this module applies the final L2
+//! normalization in Rust (keeping the fp16 rsqrt-guard class out of the graph,
+//! the workspace convention). The graph takes tokenized `input_ids` /
+//! `attention_mask` (`[1, 512]` int32), produced from the bundled granite
+//! tokenizer (see [`BUNDLED_TOKENIZER`]).
+//!
+//! # Committed-golden oracle (no ort)
+//!
+//! Parity is scored against **committed transformers-fp32 fixtures**
+//! (`tests/granite/fixtures/goldens/corpus.json`), never a live ONNX crate — the
+//! embedkit "no ort anywhere, not even dev" rule. The hermetic
+//! `tests/granite/tokenizer_identity.rs` proves the bundled tokenizer is
+//! byte-correct (token-ids match the goldens exactly, no model needed);
+//! `tests/granite/parity_embed.rs` scores the CoreML embeddings against the
+//! fp32 goldens by cosine (model-gated).
+//!
+//! # Compute placement (measured, never marketed)
+//!
+//! Placement is characterized, not asserted (`tests/granite/placement.rs`).
+//! Unlike CLAP's audio tower, the granite ModernBERT graph **does** compile for
+//! the ANE (the T1 probe measured ~97.8% ANE residency, fp16 cosine 0.99996 vs a
+//! `CpuOnly` reference). [`crate::ComputeUnits::All`] (the default) lets CoreML
+//! schedule it; the module characterizes the placement rather than claiming it.
+
+pub mod embedding;
+pub mod error;
+
+#[cfg(feature = "serde")]
+mod compute_units_serde;
+
+pub use embedding::Embedding;
+pub use error::Error;
+
+use std::path::Path;
+
+use crate::{ComputeUnits, DataType, Model, MultiArray};
+use tokenizers::{Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy};
+
+use crate::embeddings::granite::{
+  embedding::{EMBEDDING_DIM, check_finite_output},
+  error::Result,
+};
+
+/// Bytes of the bundled granite `tokenizer.json` compiled into the crate.
+///
+/// This is the tokenizer from the source model repo
+/// [`ibm-granite/granite-embedding-97m-multilingual-r2`](https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2),
+/// revision `835ad14087e140460703cf0fae09f97d469d65c2` (SHA-256
+/// `4f2842d568e2724370aec203652a42ac783c7937f8347a1a2cc7506d71f1582f`) — the
+/// exact tokenizer that produced the committed token-id goldens, proven
+/// byte-correct by `tests/granite/tokenizer_identity.rs`. Exposed for callers
+/// who construct [`TextEmbedder`] via [`TextEmbedder::from_memory`]; the
+/// [`TextEmbedder::load`] / [`TextEmbedder::from_file`] constructors use it
+/// directly.
+pub const BUNDLED_TOKENIZER: &[u8] = include_bytes!("assets/tokenizer.json");
+
+/// Declared feature names on the granite `.mlmodelc` (pinned by
+/// `tests/granite/model_io.rs`).
+mod names {
+  pub const INPUT_IDS: &str = "input_ids";
+  pub const ATTENTION_MASK: &str = "attention_mask";
+  pub const EMBEDDING: &str = "embedding";
+}
+
+/// Fixed token-sequence length the ModernBERT graph was converted at (the
+/// export sequence length, `[1, 512]`). Shorter inputs are right-padded to this
+/// length with the mask zeroed on the pad positions; longer inputs are truncated
+/// at this length. RoPE makes any fixed length sound, and CLS pooling reads
+/// position 0 (never a pad), so the pad token value never reaches the output.
+pub const MAX_TOKENS: usize = 512;
+
+/// Default [`TextEmbedderOptions::compute`]: [`ComputeUnits::All`]. The granite
+/// ModernBERT graph compiles for the ANE (T1); `All` lets CoreML schedule it.
+/// Placement is characterized, not asserted (`tests/granite/placement.rs`).
+pub const DEFAULT_COMPUTE: ComputeUnits = ComputeUnits::All;
+
+#[cfg(feature = "serde")]
+fn default_compute() -> ComputeUnits {
+  DEFAULT_COMPUTE
+}
+
+/// Construction options for [`TextEmbedder`] (rust-options-pattern): a single
+/// `compute` knob with one source of truth shared by `const new`/`Default`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TextEmbedderOptions {
+  #[cfg_attr(
+    feature = "serde",
+    serde(
+      default = "default_compute",
+      with = "crate::embeddings::granite::compute_units_serde"
+    )
+  )]
+  compute: ComputeUnits,
+}
+
+impl Default for TextEmbedderOptions {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl TextEmbedderOptions {
+  /// Options matching the module default: [`DEFAULT_COMPUTE`].
+  pub const fn new() -> Self {
+    Self {
+      compute: DEFAULT_COMPUTE,
+    }
+  }
+
+  /// Which hardware CoreML may schedule the graph on.
+  #[inline]
+  pub const fn compute(&self) -> ComputeUnits {
+    self.compute
+  }
+
+  /// Builder form of [`Self::set_compute`].
+  #[must_use]
+  #[inline]
+  pub const fn with_compute(mut self, compute: ComputeUnits) -> Self {
+    self.set_compute(compute);
+    self
+  }
+
+  /// Sets [`Self::compute`] in place.
+  #[inline]
+  pub const fn set_compute(&mut self, compute: ComputeUnits) -> &mut Self {
+    self.compute = compute;
+    self
+  }
+}
+
+/// granite text embedder: a `&str` in, a unit-norm 384-d [`Embedding`] out.
+///
+/// Tokenizes with the bundled granite tokenizer (truncation `LongestFirst` at
+/// [`MAX_TOKENS`], matching the goldens' convention so token ids are identical),
+/// right-pads to the fixed `[1, 512]` window with an attention mask, runs the
+/// fp16 CoreML ModernBERT graph, and L2-normalizes the pre-normalization CLS
+/// projection.
+#[derive(Debug)]
+pub struct TextEmbedder {
+  model: Model,
+  tokenizer: Tokenizer,
+  /// Right-padding token id for the fixed-length window. The pad positions are
+  /// masked to 0, so their embedding is never read, and CLS pooling reads
+  /// position 0 (never a pad); this only needs to be a valid vocabulary index.
+  /// Resolved from the tokenizer's pad token `<|endoftext|>` at load, else `0`
+  /// (a guaranteed-valid vocabulary index).
+  pad_id: i32,
+}
+
+impl TextEmbedder {
+  /// Loads the granite `.mlmodelc` from `model_path` with the bundled tokenizer
+  /// and custom `options` — the primary constructor. Pins the model's I/O
+  /// contract against the metadata at load.
+  ///
+  /// # Errors
+  /// As [`Self::from_files`] (with the bundled tokenizer bytes).
+  pub fn load(model_path: impl AsRef<Path>, options: TextEmbedderOptions) -> Result<Self> {
+    let tokenizer = Tokenizer::from_bytes(BUNDLED_TOKENIZER).map_err(Error::TokenizerLoad)?;
+    Self::from_parts(model_path, tokenizer, options)
+  }
+
+  /// Loads the granite `.mlmodelc` from `model_path` using the bundled tokenizer
+  /// and [`TextEmbedderOptions::new`].
+  ///
+  /// # Errors
+  /// As [`Self::from_files`].
+  pub fn from_file(model_path: impl AsRef<Path>) -> Result<Self> {
+    Self::load(model_path, TextEmbedderOptions::new())
+  }
+
+  /// Loads the model and a `tokenizer.json` from separate file paths.
+  ///
+  /// # Errors
+  /// [`Error::Load`] if CoreML rejects the model / [`Error::ContractMismatch`]
+  /// if its I/O contract mismatches; [`Error::TokenizerLoad`] if the tokenizer
+  /// JSON is unreadable/invalid; [`Error::TokenizerConfig`] if truncation cannot
+  /// be configured.
+  pub fn from_files(
+    model_path: impl AsRef<Path>,
+    tokenizer_json_path: impl AsRef<Path>,
+    options: TextEmbedderOptions,
+  ) -> Result<Self> {
+    let tokenizer =
+      Tokenizer::from_file(tokenizer_json_path.as_ref()).map_err(Error::TokenizerLoad)?;
+    Self::from_parts(model_path, tokenizer, options)
+  }
+
+  /// Loads the model from a path and the tokenizer from caller-supplied bytes.
+  ///
+  /// # Errors
+  /// As [`Self::from_files`].
+  pub fn from_memory(
+    model_path: impl AsRef<Path>,
+    tokenizer_json_bytes: &[u8],
+    options: TextEmbedderOptions,
+  ) -> Result<Self> {
+    let tokenizer = Tokenizer::from_bytes(tokenizer_json_bytes).map_err(Error::TokenizerLoad)?;
+    Self::from_parts(model_path, tokenizer, options)
+  }
+
+  fn from_parts(
+    model_path: impl AsRef<Path>,
+    mut tokenizer: Tokenizer,
+    options: TextEmbedderOptions,
+  ) -> Result<Self> {
+    configure_truncation(&mut tokenizer)?;
+    // The pad positions are attention-masked to 0 and CLS pooling reads position
+    // 0 (never a pad), so the pad token value is immaterial to the output; a
+    // valid vocabulary index is all that is required. Resolve granite's pad
+    // token `<|endoftext|>`, else fall back to `0` (the BOS/CLS index, always
+    // valid).
+    let pad_id = tokenizer
+      .token_to_id("<|endoftext|>")
+      .map_or(0, |id| id as i32);
+
+    let model = Model::load(model_path, options.compute())?;
+    let description = model.description();
+
+    let ids_expected = format!("[1, {MAX_TOKENS}] int32");
+    for name in [names::INPUT_IDS, names::ATTENTION_MASK] {
+      let input = description
+        .input(name)
+        .ok_or_else(|| Error::ContractMismatch {
+          feature: name,
+          expected: ids_expected.clone(),
+          actual: "missing".to_string(),
+        })?;
+      if input.shape() != [1, MAX_TOKENS] || input.data_type() != Some(DataType::I32) {
+        return Err(Error::ContractMismatch {
+          feature: name,
+          expected: ids_expected.clone(),
+          actual: describe(input.shape(), input.data_type()),
+        });
+      }
+    }
+
+    let output_expected = format!("[1, {EMBEDDING_DIM}] float32");
+    let output = description
+      .output(names::EMBEDDING)
+      .ok_or_else(|| Error::ContractMismatch {
+        feature: names::EMBEDDING,
+        expected: output_expected.clone(),
+        actual: "missing".to_string(),
+      })?;
+    if output.shape() != [1, EMBEDDING_DIM] || output.data_type() != Some(DataType::F32) {
+      return Err(Error::ContractMismatch {
+        feature: names::EMBEDDING,
+        expected: output_expected,
+        actual: describe(output.shape(), output.data_type()),
+      });
+    }
+
+    Ok(Self {
+      model,
+      tokenizer,
+      pad_id,
+    })
+  }
+
+  /// The real token-id sequence for `text` (post-truncation at [`MAX_TOKENS`],
+  /// pre-padding, granite special tokens included) — the sequence that is
+  /// identity-comparable to the committed goldens
+  /// (`tests/granite/tokenizer_identity.rs`).
+  ///
+  /// # Errors
+  /// [`Error::EmptyText`] if `text` is empty; [`Error::Tokenize`] on a tokenizer
+  /// failure.
+  pub fn token_ids(&self, text: &str) -> Result<Vec<u32>> {
+    if text.is_empty() {
+      return Err(Error::EmptyText);
+    }
+    let encoding = self.tokenizer.encode(text, true).map_err(Error::Tokenize)?;
+    Ok(encoding.get_ids().to_vec())
+  }
+
+  /// Embeds one text into a unit-norm [`Embedding`]. Prompt-free: feed the raw
+  /// string.
+  ///
+  /// # Errors
+  /// [`Error::EmptyText`] if `text` is empty; [`Error::Tokenize`] on a tokenizer
+  /// failure; [`Error::Tensor`] / [`Error::Prediction`] on a tensor or CoreML
+  /// failure; [`Error::OutputShape`] if the predicted `embedding` shape diverges
+  /// from `[1, `[`EMBEDDING_DIM`]`]`; [`Error::NonFiniteOutput`] if the model
+  /// output has a NaN/infinite component — model corruption, classified apart
+  /// from a caller's own non-finite embedding data
+  /// ([`Error::NonFiniteEmbedding`]); [`Error::EmbeddingZero`] if the (finite)
+  /// projection has zero magnitude.
+  pub fn embed(&self, text: &str) -> Result<Embedding> {
+    let ids = self.token_ids(text)?;
+    debug_assert!(ids.len() <= MAX_TOKENS, "truncation caps ids at the window");
+
+    // Right-pad to the fixed [1, 512] window; mask real tokens 1, pads 0.
+    let mut input_ids = [self.pad_id; MAX_TOKENS];
+    let mut attention_mask = [0i32; MAX_TOKENS];
+    for (i, &id) in ids.iter().enumerate() {
+      input_ids[i] = id as i32;
+      attention_mask[i] = 1;
+    }
+
+    let ids_tensor = MultiArray::from_slice(&[1, MAX_TOKENS], &input_ids)?;
+    let mask_tensor = MultiArray::from_slice(&[1, MAX_TOKENS], &attention_mask)?;
+    let mut outputs = self.model.predict_with(&[
+      (names::INPUT_IDS, &ids_tensor),
+      (names::ATTENTION_MASK, &mask_tensor),
+    ])?;
+    let embeds =
+      outputs
+        .take(names::EMBEDDING)
+        .ok_or_else(|| crate::PredictionError::MissingOutput {
+          name: names::EMBEDDING.to_string(),
+        })?;
+    if embeds.shape() != [1, EMBEDDING_DIM] {
+      return Err(Error::OutputShape {
+        got: embeds.shape().to_vec(),
+        expected: vec![1, EMBEDDING_DIM],
+      });
+    }
+
+    let mut row = [0.0f32; EMBEDDING_DIM];
+    embeds.copy_into::<f32>(&mut row)?;
+    // Classify a NaN/∞ the CoreML runtime produced as model-output corruption
+    // (`NonFiniteOutput`) before it reaches `from_slice_normalizing`, which would
+    // otherwise mislabel it as caller-supplied embedding data
+    // (`NonFiniteEmbedding`).
+    check_finite_output(&row)?;
+    Embedding::from_slice_normalizing(&row)
+  }
+}
+
+/// Applies the fixed truncation config shared by every constructor:
+/// `LongestFirst` at [`MAX_TOKENS`], stride 0, right direction — the convention
+/// the committed goldens were tokenized under (fixed 512, right truncation), so
+/// this module's token ids match them exactly. This is a hard model constraint
+/// (the export sequence length cannot be exceeded), not a knob.
+fn configure_truncation(tokenizer: &mut Tokenizer) -> Result<()> {
+  tokenizer
+    .with_truncation(Some(TruncationParams {
+      max_length: MAX_TOKENS,
+      strategy: TruncationStrategy::LongestFirst,
+      stride: 0,
+      direction: TruncationDirection::Right,
+    }))
+    .map_err(Error::TokenizerConfig)?;
+  Ok(())
+}
+
+/// Test-only seam: the module's actual tokenizer configuration, without loading
+/// a CoreML model — so `tests` can exercise the real tokenization path
+/// hermetically (the tokenizer-identity gate).
+#[cfg(test)]
+pub(crate) fn configured_tokenizer_from_bytes(bytes: &[u8]) -> Result<Tokenizer> {
+  let mut tokenizer = Tokenizer::from_bytes(bytes).map_err(Error::TokenizerLoad)?;
+  configure_truncation(&mut tokenizer)?;
+  Ok(tokenizer)
+}
+
+/// Human-readable `shape dtype` rendering for [`Error::ContractMismatch`].
+fn describe(shape: &[usize], dtype: Option<DataType>) -> String {
+  let dtype = dtype.map_or("none", |d| d.as_str());
+  format!("{shape:?} {dtype}")
+}
+
+#[cfg(test)]
+mod tests;

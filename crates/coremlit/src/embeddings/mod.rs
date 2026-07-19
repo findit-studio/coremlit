@@ -8,9 +8,11 @@
 //! - `clap` — CLAP-HTSAT dual-tower audio+text embeddings, a former standalone
 //!   kit crate collapsed here per the mono-crate restructure (feature `clap`;
 //!   `clap-oracle` adds the textclap parity oracle).
-//! - `granite` / `gemma` — sentence-embedding backends (the embedkit phase,
-//!   re-targeted from a crate to module form; feature `embeddinggemma`) — still
-//!   reserved, not yet landed.
+//! - `granite` — general text sentence-embeddings on CoreML (the embedkit
+//!   phase), first model `granite-embedding-97m-multilingual-r2` (feature
+//!   `granite`; committed transformers-fp32 goldens as the parity oracle — NO
+//!   ort). The T2/T3 core is landed; long-input windowing (T4) is a later phase.
+//!   `gemma` was DROPPED per the embedkit design's Amendment 3.
 //!
 //! See the crate README's layering map for module authority. The `video/`
 //! sibling namespace is likewise reserved, but is not created until a video kit
@@ -18,3 +20,6 @@
 
 #[cfg(feature = "clap")]
 pub mod clap;
+
+#[cfg(feature = "granite")]
+pub mod granite;

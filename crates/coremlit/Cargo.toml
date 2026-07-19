@@ -90,6 +90,16 @@ clap = ["dep:rustfft", "dep:tokenizers"]
 # const, so the gate needs no libonnxruntime at run time.
 clap-oracle = ["clap", "dep:textclap"]
 
+# --- embeddings::granite (the embedkit phase) ---
+# General text sentence-embeddings on CoreML; first model
+# `granite-embedding-97m-multilingual-r2` (ModernBERT + CLS pooling, 384-d). A
+# bundled granite tokenizer (`tokenizers`, shared with `whisper`/`clap`) around
+# the fp16 CoreML graph, L2-normalized in Rust. The parity oracle is COMMITTED
+# transformers-fp32 goldens (`tests/granite/fixtures/goldens/`), never a live
+# ONNX crate — so there is NO `granite-oracle` feature and NO `ort` in this path.
+# `default = []` pulls none of it.
+granite = ["dep:tokenizers"]
+
 [dependencies]
 # --- core CoreML runtime (always compiled) ---
 objc2.workspace = true
@@ -517,6 +527,32 @@ required-features = ["clap-oracle"]
 name = "clap_tokenizer_identity_textclap"
 path = "tests/clap/tokenizer_identity_textclap.rs"
 required-features = ["clap-oracle"]
+
+# --- embeddings::granite ---
+# The whole `embeddings::granite` module is feature-gated, so its tests compile
+# only under `granite`. The tokenizer-identity gate is hermetic (committed
+# goldens, no model) and runs in the default `granite` suite; the model_io /
+# parity / placement gates keep their `#[ignore]` + Models/ layout. There is NO
+# oracle feature — parity scores against COMMITTED transformers-fp32 goldens.
+[[test]]
+name = "granite_tokenizer_identity"
+path = "tests/granite/tokenizer_identity.rs"
+required-features = ["granite"]
+
+[[test]]
+name = "granite_model_io"
+path = "tests/granite/model_io.rs"
+required-features = ["granite"]
+
+[[test]]
+name = "granite_parity_embed"
+path = "tests/granite/parity_embed.rs"
+required-features = ["granite"]
+
+[[test]]
+name = "granite_placement"
+path = "tests/granite/placement.rs"
+required-features = ["granite"]
 
 [lints]
 workspace = true
