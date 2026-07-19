@@ -46,8 +46,8 @@ jobs:
           - "vad-bundled"
           - "clap"                                                          # CLAP encoders alone (Rust mel + tokenizers, no ort)
           - "clap-oracle"                                                   # + textclap model-level parity oracle (ort)
-          - "whisper,align,speaker,vad,serde,tracing,nl-recognizer"         # all non-oracle
-          - "whisper,align-oracle,speaker-oracle,vad-bundled,serde,tracing,nl-recognizer"  # all-on
+          - "whisper,align,speaker,vad,clap,serde,tracing,nl-recognizer"    # all non-oracle
+          - "whisper,align-oracle,speaker-oracle,vad-bundled,clap-oracle,serde,tracing,nl-recognizer"  # all-on
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

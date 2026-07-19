@@ -105,8 +105,8 @@ const INTENDED_CI_COMBOS: &[&str] = &[
   "vad-bundled",
   "clap",
   "clap-oracle",
-  "whisper,align,speaker,vad,serde,tracing,nl-recognizer",
-  "whisper,align-oracle,speaker-oracle,vad-bundled,serde,tracing,nl-recognizer",
+  "whisper,align,speaker,vad,clap,serde,tracing,nl-recognizer",
+  "whisper,align-oracle,speaker-oracle,vad-bundled,clap-oracle,serde,tracing,nl-recognizer",
 ];
 
 /// The text of the `[features]` table (its lines, blank/comment lines included).
@@ -403,8 +403,8 @@ const DOCTORED_MATRIX: &str = r#"
           - "vad-bundled"
           - "clap"
           - "clap-oracle"
-          - "whisper,align,speaker,vad,serde,tracing,nl-recognizer"
-          - "whisper,align-oracle,speaker-oracle,vad-bundled,serde,tracing,nl-recognizer"
+          - "whisper,align,speaker,vad,clap,serde,tracing,nl-recognizer"
+          - "whisper,align-oracle,speaker-oracle,vad-bundled,clap-oracle,serde,tracing,nl-recognizer"
     steps:
       - uses: actions/checkout@v7
 "#;
