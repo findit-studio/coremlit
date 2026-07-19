@@ -1,18 +1,20 @@
-//! Native CoreML segmentation and embedding backends for `dia`'s
-//! pyannote-community-1 diarization pipeline.
+//! Native CoreML segmentation and embedding backends for the
+//! pyannote-community-1 diarization pipeline (its clustering core `diaric`,
+//! extracted from the ancestor `dia` crate).
 //!
 //! Design spec:
 //! `docs/superpowers/specs/2026-07-11-dia-coreml-backends-design.md`.
 //! Product driver: [`findit-studio/desktop#120`][desktop-120] (components
 //! 3+4: speaker segmentation ~20x and speaker embedding ~30x uplift
-//! targets). The clustering *algorithms* are `dia`'s — this crate replaces
-//! `dia`'s `ort`-backed segmentation and embedding inference with native
-//! CoreML/ANE execution, producing tensors bit-compatible with `dia`'s public
-//! compute entry points so its parity-proven clustering/reconstruction runs
-//! unchanged. As of the clustering phase it also *drives* that clustering at
-//! runtime through a thin backend-selecting stage (see the clustering example
-//! below and the [`cluster`] module) — it does not reimplement the clustering
-//! algorithms.
+//! targets). The clustering *algorithms* are pyannote's, their implementation
+//! extracted from `dia` into `diaric` — the backend-free runtime clustering core
+//! this crate drives. This crate replaces `dia`'s `ort`-backed segmentation and
+//! embedding inference with native CoreML/ANE execution, producing tensors
+//! bit-compatible with `diaric`'s public compute entry points so its
+//! parity-proven clustering/reconstruction runs unchanged. As of the clustering
+//! phase it also *drives* that clustering at runtime through a thin
+//! backend-selecting stage (see the clustering example below and the [`cluster`]
+//! module) — it does not reimplement the clustering algorithms.
 //!
 //! [desktop-120]: https://github.com/findit-studio/desktop/issues/120
 //!
@@ -113,7 +115,7 @@
 //! # Clustering
 //!
 //! An [`extract::Extraction`] is not the end of the road: as of the clustering
-//! phase this crate drives `dia`'s clustering directly, turning the extracted
+//! phase this crate drives `diaric`'s clustering directly, turning the extracted
 //! tensors into speaker-labelled RTTM spans. Select a backend with
 //! [`ClusterBackend`] — the offline pyannote-community-1 pipeline (the default,
 //! DER-gated) or the online FluidAudio-semantics matcher (streaming,
@@ -170,9 +172,9 @@ pub mod window;
 ///
 /// The speaker module deliberately does NOT re-export dia's batch-clusterer
 /// vocabulary (`OfflineClusterOptions`/`OfflineMethod`/`Linkage`) that T1 briefly
-/// exposed: [`ClusterBackend::Offline`] wraps dia's pyannote-parity *pipeline*
+/// exposed: [`ClusterBackend::Offline`] wraps diaric's pyannote-parity *pipeline*
 /// ([`extract::Extraction::diarize`] → `diaric::offline::diarize_offline`), not the
 /// batch clusterer those types configure. The [`cluster`] module documents which
-/// dia entry point `Offline` wraps and why the batch vocabulary was removed
+/// diaric entry point `Offline` wraps and why the batch vocabulary was removed
 /// (design spec AMENDMENT 2026-07-16).
 pub use cluster::{ClusterBackend, OfflineOptions, OnlineOptions, ParseClusterBackendError};
