@@ -18,11 +18,21 @@
 //!
 //! macOS only (built on [`crate`]).
 //!
-//! Sans-I/O, like `whisper`: audio enters as 16 kHz mono `&[f32]`. **Not a
-//! standalone diarizer** — it never assigns a speaker label; behind the
-//! `speaker` feature, [`extract::Extraction::into_offline_input`] bridges into
-//! `dia::offline::diarize_offline` for the actual clustering (the former
-//! speakerkit `dia` feature; `speaker-oracle` adds dia's own ort DER oracle).
+//! Sans-I/O, like `whisper`: audio enters as 16 kHz mono `&[f32]`. Behind the
+//! `speaker` feature the runtime clustering core is `diaric` — the backend-free,
+//! `ort`-free crate that owns the clustering algorithms this module drives: the
+//! offline pyannote-community-1 AHC→VBx pipeline
+//! ([`diaric::offline::diarize_offline`]) and the online FluidAudio
+//! `SpeakerManager`-parity centroid matcher
+//! ([`diaric::cluster::online::OnlineClusterer`]), plus PLDA projection and
+//! reconstruction. So this module DOES assign speaker labels at runtime: cluster
+//! an [`extract::Extraction`] through its public
+//! [`extract::Extraction::diarize`] / [`extract::Extraction::diarize_with`] /
+//! [`extract::Extraction::diarize_online`] methods (backend selection lives in
+//! the [`cluster`] module), each returning a speaker-labelled
+//! [`diaric::offline::OfflineOutput`]. `dia` (the former speakerkit `dia`
+//! feature) is NOT the runtime dependency — it is the test-only DER reference
+//! oracle behind `speaker-oracle`, which alone pulls dia's `ort` inference.
 //!
 //! ```no_run
 //! use coremlit::audio::speaker::extract::Options;
@@ -31,7 +41,8 @@
 //! let options = Options::new().with_source(Source::FluidAudio); // the default
 //! let source = AnySource::load("Models/speakerkit", options)?;
 //! let extraction = source.extract(&audio)?;
-//! // behind `speaker`: extraction.into_offline_input(&plda) -> dia::offline::OfflineInput
+//! // cluster behind `speaker`: usual entry `extraction.diarize(&plda)?` (speaker-
+//! // labelled spans); lower-level bridge `into_offline_input(&plda) -> diaric::offline::OfflineInput`
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
