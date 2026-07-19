@@ -70,7 +70,9 @@ fn clap_text_io_matches_spec() {
 #[ignore = "requires local clapkit models (CLAPKIT_TEST_MODELS)"]
 fn clap_text_artifacts_match_pinned_sha256() {
   let dir = common::text_model_path();
-  // EVERY file in the `.mlmodelc` (per `CHECKSUMS.sha256` @ 02a99c6a).
+  // The EXACT pinned manifest: every file in the `.mlmodelc` (per
+  // `CHECKSUMS.sha256` @ 02a99c6a). The helper enumerates + set-compares against
+  // these keys before hashing, so an added/removed artifact reds too.
   let cases = [
     (
       "analytics/coremldata.bin",
@@ -93,10 +95,7 @@ fn clap_text_artifacts_match_pinned_sha256() {
       "7f4e15e9ccb0ffbc2341eec286e9d9934d3d3d8d6465dfddebed248bddc0e3dd",
     ),
   ];
-  for (relative, expected) in cases {
-    let actual = common::sha256_hex(&dir.join(relative));
-    assert_eq!(actual, expected, "sha256 drift on text artifact {relative}");
-  }
+  common::assert_exact_sha_manifest(&dir, &cases);
 }
 
 #[test]
@@ -124,7 +123,9 @@ fn clap_text_int8_io_matches_spec() {
 #[ignore = "requires local clapkit int8 models (CLAPKIT_TEST_MODELS)"]
 fn clap_text_int8_artifacts_match_pinned_sha256() {
   let dir = common::text_model_int8_path();
-  // EVERY file in the int8 `.mlmodelc` (per `CHECKSUMS.sha256` @ 02a99c6a).
+  // The EXACT pinned manifest for the int8 `.mlmodelc` (per `CHECKSUMS.sha256` @
+  // 02a99c6a); the helper enumerates + set-compares before hashing, so a
+  // missing/added artifact reds too.
   let cases = [
     (
       "analytics/coremldata.bin",
@@ -147,11 +148,5 @@ fn clap_text_int8_artifacts_match_pinned_sha256() {
       "f181a595cefce402335499c32ea2f9727ef334afea9c592a2eabebb4172350a0",
     ),
   ];
-  for (relative, expected) in cases {
-    let actual = common::sha256_hex(&dir.join(relative));
-    assert_eq!(
-      actual, expected,
-      "sha256 drift on text int8 artifact {relative}"
-    );
-  }
+  common::assert_exact_sha_manifest(&dir, &cases);
 }

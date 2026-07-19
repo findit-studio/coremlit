@@ -88,8 +88,10 @@ fn clap_audio_io_matches_spec() {
 #[ignore = "requires local clapkit models (CLAPKIT_TEST_MODELS)"]
 fn clap_audio_artifacts_match_pinned_sha256() {
   let dir = common::audio_model_path();
-  // EVERY file in the `.mlmodelc` (per `CHECKSUMS.sha256` @ 02a99c6a), not just
-  // model.mil + weight.bin — drift in any committed byte reds.
+  // The EXACT pinned manifest: every file in the `.mlmodelc` (per
+  // `CHECKSUMS.sha256` @ 02a99c6a), not just model.mil + weight.bin. The helper
+  // enumerates the bundle and set-compares against these keys before hashing, so
+  // an ADDED or REMOVED artifact reds as well as any byte drift.
   let cases = [
     (
       "analytics/coremldata.bin",
@@ -112,13 +114,7 @@ fn clap_audio_artifacts_match_pinned_sha256() {
       "723fe6aab7c4af1c671a210a35c289c67763bc6a7532b9df155a0c3fc0c3c9d7",
     ),
   ];
-  for (relative, expected) in cases {
-    let actual = common::sha256_hex(&dir.join(relative));
-    assert_eq!(
-      actual, expected,
-      "sha256 drift on audio artifact {relative}"
-    );
-  }
+  common::assert_exact_sha_manifest(&dir, &cases);
 }
 
 #[test]
@@ -144,7 +140,9 @@ fn clap_audio_int8_io_matches_spec() {
 #[ignore = "requires local clapkit int8 models (CLAPKIT_TEST_MODELS)"]
 fn clap_audio_int8_artifacts_match_pinned_sha256() {
   let dir = common::audio_model_int8_path();
-  // EVERY file in the int8 `.mlmodelc` (per `CHECKSUMS.sha256` @ 02a99c6a).
+  // The EXACT pinned manifest for the int8 `.mlmodelc` (per `CHECKSUMS.sha256` @
+  // 02a99c6a); the helper enumerates + set-compares before hashing, so a
+  // missing/added artifact reds too.
   let cases = [
     (
       "analytics/coremldata.bin",
@@ -167,11 +165,5 @@ fn clap_audio_int8_artifacts_match_pinned_sha256() {
       "b3a37ec5550dcdd6932b314b830275ebcba013748421e1a517760b9afeabafb8",
     ),
   ];
-  for (relative, expected) in cases {
-    let actual = common::sha256_hex(&dir.join(relative));
-    assert_eq!(
-      actual, expected,
-      "sha256 drift on audio int8 artifact {relative}"
-    );
-  }
+  common::assert_exact_sha_manifest(&dir, &cases);
 }

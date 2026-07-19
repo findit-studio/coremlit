@@ -524,10 +524,10 @@ name = "clap_tokenizer_identity_textclap"
 path = "tests/clap/tokenizer_identity_textclap.rs"
 required-features = ["clap-oracle"]
 
-# Dual-tower encode harness: cold/cached load, first + warm inference per tower ×
-# ComputeUnits (model-gated; `harness = false` custom main — the load phases are
-# one-shot costs criterion's resampling cannot see). Mirrors the whisper/align
-# bench registrations above.
+# Dual-tower encode harness: first-observed/cached load, first + warm inference
+# per tower × ComputeUnits (model-gated; `harness = false` custom main — the load
+# phases are one-shot costs criterion's resampling cannot see). Mirrors the
+# whisper/align bench registrations above.
 [[bench]]
 name = "clap_encode"
 path = "benches/clap/encode.rs"

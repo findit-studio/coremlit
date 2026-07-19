@@ -5,19 +5,26 @@
 //! reproducible measurement. `harness = false` (a custom `main`, like
 //! `benches/whisper/rtf.rs`): the load phases are **one-shot** costs — criterion's
 //! statistical resampling would reload each model dozens of times, and every load
-//! after the first hits the OS specialization cache, so it cannot see a cold or a
-//! first-inference cost at all.
+//! after the first hits the OS specialization cache, so it cannot see a
+//! first-observed-load or first-inference cost at all.
 //!
-//! # The four phases (spec §; audit #30)
+//! # The phases (spec §; audit #30)
 //!
-//! - **cold specialization** — the first-ever load of a model the OS has not yet
-//!   specialized for this device. A **one-time OS cost**, distinct from a cached
-//!   load. Measured only in the opt-in, reversible cold mode (see below), because
-//!   on any host that has already run the clap tests the model is already
-//!   specialized and every load is a cache hit.
-//! - **cached load** — [`crate::Model::load`] when the specialized artifact
-//!   already exists in the OS cache. This is what every production process start
-//!   pays after the one-time cold specialization; it is the steady-state load.
+//! - **first-observed load** — the first [`crate::Model::load`] of a
+//!   `(tower, placement)` in THIS fresh process. On a host that has never
+//!   specialized this model for this device it folds in the **one-time OS
+//!   specialization** cost; on a host that already has (e.g. after running the
+//!   clap tests) it is already a cache hit. Either way it is the honest,
+//!   real-world first-load number — no shared system state is touched to force
+//!   it, so read it as an upper bound that still carries any not-yet-paid
+//!   specialization.
+//! - **cached load** — a second [`crate::Model::load`] in the SAME process, after
+//!   the first-observed load has populated the OS specialization cache. It
+//!   isolates the specialization-cache-HIT load path (any cache-MISS cost is paid
+//!   by the first-observed load above). Being a back-to-back in-process call it
+//!   also inherits process-local CoreML/framework init and warm allocator state
+//!   that a fresh process does NOT, so read it as a lower bound on — not a
+//!   measurement of — a later process's cached-start latency.
 //! - **first inference** — the first `embed` after a load (the prediction path's
 //!   own MPSGraph/ANE program specialization).
 //! - **warm inference** — median / p90 over [`WARM_RUNS`] (≥ 20) steady-state
@@ -27,34 +34,35 @@
 //! hash (an 8-hex SHA-256 prefix over the warm embedding's bytes — a perf change
 //! that alters numerics changes the hash) AND its cosine against the
 //! [`ComputeUnits::CpuOnly`] reference (the semantic drift check the placement
-//! gate uses), and the process resident-memory footprint.
+//! gate uses), and a current process resident-memory snapshot.
 //!
-//! # Cold mode (opt-in, reversible)
+//! # True cold specialization is NOT measured here
 //!
-//! The default run measures **cached load / first inference / warm** for the full
-//! 2 × 4 matrix — always safe, never touches state outside the target dir. To
-//! also measure genuine **cold specialization**, set `CLAPKIT_BENCH_COLD=1`: for
-//! `ComputeUnits::All` on each tower, the harness renames the on-device ANE
-//! specialization cache (`~/Library/Caches/com.apple.e5rt.e5bundlecache`) aside,
-//! times a cold [`crate::Model::load`], then **restores** it — a cache the OS
-//! rebuilds transparently, left byte-for-byte as it was. Caveat: clearing the
-//! e5rt cache yields a genuine cold number for the ANE-compiling **text** tower;
-//! the **audio** (HTSAT) tower falls back to GPU/CPU (`ANECCompile` fails — see
-//! `tests/clap/placement.rs`), whose MPSGraph specialization is cached partly
-//! elsewhere, so the audio cold figure here is a lower bound on the true
-//! first-ever specialization.
+//! Genuine cold specialization — the first-ever load of a model the OS has never
+//! specialized for this device — is a one-time OS cost. Measuring it reliably
+//! requires a CLEAN, disposable environment (a fresh user profile or VM whose ANE
+//! specialization cache, `~/Library/Caches/com.apple.e5rt.e5bundlecache`, has
+//! never seen this model), NOT evicting the shared on-device cache, which is a
+//! resource other CoreML processes on the host rely on. This harness therefore
+//! never touches that cache and does not force a cold load; run it once in a
+//! disposable profile if you need the cold number. The `first-observed load`
+//! column already captures the cold cost whenever the host running the bench has
+//! not previously specialized the model.
+//!
+//! Note on iteration order: the [`UNITS`] are measured in sequence, so a later
+//! placement's `first-observed load` can be partly warmed by an earlier one. OS
+//! specialization is per-model, so this cross-placement warming is limited, but
+//! the first-observed column should be read with the iteration order in mind.
 //!
 //! Run (model-gated — set `CLAPKIT_TEST_MODELS`, or place models at
 //! `Models/clapkit/`):
 //! `cargo bench -p coremlit --features clap --bench clap_encode`
-//! Add `CLAPKIT_BENCH_COLD=1` to also measure cold specialization.
 //!
 //! `criterion_group!`-style benches carry a crate-level `#![allow(missing_docs)]`
 //! because the macro expands to an undocumented `pub fn`; this custom-`main`
 //! bench has no such expansion and no external API, so it needs no such allow.
 
 use std::{
-  fs,
   hint::black_box,
   path::{Path, PathBuf},
   time::Instant,
@@ -100,34 +108,31 @@ fn main() {
     return;
   }
 
-  let cold = std::env::var_os("CLAPKIT_BENCH_COLD").is_some_and(|v| v == "1");
   println!(
     "# clap_encode — CLAP dual-tower encode phases (measured, never marketed)\n\
      # models: {}\n\
-     # warm runs: {WARM_RUNS}   cold mode: {}\n\
+     # warm runs: {WARM_RUNS}\n\
      # latency in ms; cos = cosine vs CpuOnly reference (same tower/input); \
-     rss = cumulative process resident MB\n",
+     rss = current process resident MB (a snapshot, not a peak)\n",
     models.display(),
-    if cold {
-      "ON (genuine cold specialization, e5rt cache reversibly cleared)"
-    } else {
-      "off (set CLAPKIT_BENCH_COLD=1 for cold specialization)"
-    },
   );
 
-  bench_audio(&audio_model, cold);
-  bench_text(&text_model, cold);
+  bench_audio(&audio_model);
+  bench_text(&text_model);
 
-  println!("\n# peak process resident memory: {:.1} MB", rss_mb());
+  println!("\n# current process resident memory: {:.1} MB", rss_mb());
   println!(
-    "# note: rss is cumulative — every configuration above is loaded in this one \
-     process, so each rss column is a running total, not that configuration's \
-     isolated footprint."
+    "# note: rss is a single current snapshot (task resident_size at the moment \
+     each row prints), NOT a peak and NOT a cumulative running total — encoders \
+     are dropped between configurations, so a row is neither monotonic nor that \
+     configuration's isolated footprint. A true peak would need sampling across \
+     load + inference."
   );
 }
 
-/// Audio tower: cold / cached load, first + warm `embed_window`, per unit.
-fn bench_audio(model: &Path, cold: bool) {
+/// Audio tower: first-observed + cached load, first + warm `embed_window`, per
+/// unit.
+fn bench_audio(model: &Path) {
   println!("## audio tower (HTSAT) — {}", model.display());
   print_header();
 
@@ -135,19 +140,24 @@ fn bench_audio(model: &Path, cold: bool) {
   let mut reference: Option<Embedding> = None;
 
   for unit in UNITS {
-    let cold_ms = (cold && unit == ComputeUnits::All)
-      .then(|| {
-        measure_cold(model, "audio", || {
-          AudioEncoder::from_file_with(model, AudioEncoderOptions::new().with_compute(unit))
-            .map(drop)
-        })
-      })
-      .flatten();
+    // First-observed load: the first load of this (tower, unit) in this fresh
+    // process — folds in the one-time OS specialization on a host that has not
+    // yet specialized this model. Dropped before the cached measurement.
+    let first_load_start = Instant::now();
+    let priming =
+      AudioEncoder::from_file_with(model, AudioEncoderOptions::new().with_compute(unit))
+        .unwrap_or_else(|e| panic!("first-observed load audio [{unit}]: {e}"));
+    let first_load_ms = ms(first_load_start);
+    drop(priming);
 
+    // Cached load: a second in-process load after the first populated the OS
+    // specialization cache — isolates the specialization-cache-hit path. Being
+    // back-to-back in-process, it is a lower bound on (not a measurement of) a
+    // fresh process's cached start.
     let load_start = Instant::now();
     let encoder =
       AudioEncoder::from_file_with(model, AudioEncoderOptions::new().with_compute(unit))
-        .unwrap_or_else(|e| panic!("load audio [{unit}]: {e}"));
+        .unwrap_or_else(|e| panic!("cached load audio [{unit}]: {e}"));
     let cached_load_ms = ms(load_start);
 
     let first_start = Instant::now();
@@ -171,7 +181,7 @@ fn bench_audio(model: &Path, cold: bool) {
     let cos = record_cosine(unit, &last, &mut reference);
     print_row(
       unit,
-      cold_ms,
+      first_load_ms,
       cached_load_ms,
       first_ms,
       &mut warm,
@@ -182,27 +192,32 @@ fn bench_audio(model: &Path, cold: bool) {
   println!();
 }
 
-/// Text tower: cold / cached load, first + warm `embed`, per unit.
-fn bench_text(model: &Path, cold: bool) {
+/// Text tower: first-observed + cached load, first + warm `embed`, per unit.
+fn bench_text(model: &Path) {
   println!("## text tower (RoBERTa) — {}", model.display());
   print_header();
 
   let mut reference: Option<Embedding> = None;
 
   for unit in UNITS {
-    let cold_ms = (cold && unit == ComputeUnits::All)
-      .then(|| {
-        measure_cold(model, "text", || {
-          TextEncoder::from_bundled_tokenizer(model, TextEncoderOptions::new().with_compute(unit))
-            .map(drop)
-        })
-      })
-      .flatten();
+    // First-observed load: the first load of this (tower, unit) in this fresh
+    // process — folds in the one-time OS specialization on a host that has not
+    // yet specialized this model. Dropped before the cached measurement.
+    let first_load_start = Instant::now();
+    let priming =
+      TextEncoder::from_bundled_tokenizer(model, TextEncoderOptions::new().with_compute(unit))
+        .unwrap_or_else(|e| panic!("first-observed load text [{unit}]: {e}"));
+    let first_load_ms = ms(first_load_start);
+    drop(priming);
 
+    // Cached load: a second in-process load after the first populated the OS
+    // specialization cache — isolates the specialization-cache-hit path. Being
+    // back-to-back in-process, it is a lower bound on (not a measurement of) a
+    // fresh process's cached start.
     let load_start = Instant::now();
     let encoder =
       TextEncoder::from_bundled_tokenizer(model, TextEncoderOptions::new().with_compute(unit))
-        .unwrap_or_else(|e| panic!("load text [{unit}]: {e}"));
+        .unwrap_or_else(|e| panic!("cached load text [{unit}]: {e}"));
     let cached_load_ms = ms(load_start);
 
     let first_start = Instant::now();
@@ -226,7 +241,7 @@ fn bench_text(model: &Path, cold: bool) {
     let cos = record_cosine(unit, &last, &mut reference);
     print_row(
       unit,
-      cold_ms,
+      first_load_ms,
       cached_load_ms,
       first_ms,
       &mut warm,
@@ -250,71 +265,11 @@ fn record_cosine(unit: ComputeUnits, emb: &Embedding, reference: &mut Option<Emb
     .map_or_else(|| emb.cosine(emb), |r| emb.cosine(r))
 }
 
-/// Times a cold [`crate::Model::load`] with the OS ANE specialization cache
-/// reversibly cleared, then restores the cache. Returns the cold load in ms, or
-/// `None` if the cache could not be safely moved aside (reported, never faked).
-fn measure_cold(
-  _model: &Path,
-  tower: &str,
-  load: impl Fn() -> Result<(), coremlit::embeddings::clap::Error>,
-) -> Option<f64> {
-  let cache = e5rt_cache_dir()?;
-  let backup = cache.with_extension(format!("clapbench-bak-{}", std::process::id()));
-
-  // Rename the specialization cache aside so the next load is genuinely cold.
-  // Atomic on the same filesystem; skip (report None) if it is absent or the
-  // move fails, rather than fabricate a cold number.
-  if !cache.exists() {
-    eprintln!(
-      "[cold] {tower}: no e5rt cache present — cannot force a cold load; reporting cached only"
-    );
-    return None;
-  }
-  if let Err(e) = fs::rename(&cache, &backup) {
-    eprintln!("[cold] {tower}: could not move e5rt cache aside ({e}); reporting cached only");
-    return None;
-  }
-
-  let start = Instant::now();
-  let result = load();
-  let elapsed = ms(start);
-
-  // Restore: discard whatever the cold load repopulated, then move the original
-  // cache back so the user's on-device cache is left exactly as it was.
-  let _ = fs::remove_dir_all(&cache);
-  if let Err(e) = fs::rename(&backup, &cache) {
-    eprintln!(
-      "[cold] {tower}: WARNING failed to restore e5rt cache from {} ({e}) — the OS will \
-       transparently rebuild it on next use",
-      backup.display()
-    );
-  }
-
-  match result {
-    Ok(()) => Some(elapsed),
-    Err(e) => {
-      eprintln!("[cold] {tower}: cold load failed: {e}");
-      None
-    }
-  }
-}
-
-/// `~/Library/Caches/com.apple.e5rt.e5bundlecache`, the on-device ANE
-/// specialization cache, if `HOME` is set.
-fn e5rt_cache_dir() -> Option<PathBuf> {
-  std::env::var_os("HOME").map(|home| {
-    PathBuf::from(home)
-      .join("Library")
-      .join("Caches")
-      .join("com.apple.e5rt.e5bundlecache")
-  })
-}
-
 fn print_header() {
   println!(
     "{:<26} {:>12} {:>11} {:>10} {:>11} {:>10} {:>12} {:>9} {:>10}",
     "unit",
-    "cold_load",
+    "first_load",
     "cached_load",
     "first_inf",
     "warm_median",
@@ -328,7 +283,7 @@ fn print_header() {
 #[allow(clippy::too_many_arguments)]
 fn print_row(
   unit: ComputeUnits,
-  cold_ms: Option<f64>,
+  first_load_ms: f64,
   cached_load_ms: f64,
   first_ms: f64,
   warm: &mut [f64],
@@ -336,11 +291,10 @@ fn print_row(
   emb: &Embedding,
 ) {
   let (median, p90) = median_p90(warm);
-  let cold = cold_ms.map_or_else(|| "—".to_string(), |v| format!("{v:.1}"));
   println!(
-    "{:<26} {:>12} {:>11.1} {:>10.2} {:>11.2} {:>10.2} {:>12.6} {:>9.1} {:>10}",
+    "{:<26} {:>12.1} {:>11.1} {:>10.2} {:>11.2} {:>10.2} {:>12.6} {:>9.1} {:>10}",
     unit.as_str(),
-    cold,
+    first_load_ms,
     cached_load_ms,
     first_ms,
     median,
