@@ -30,6 +30,23 @@ mod names {
 /// CoreML falls back to GPU/CPU (fp16-clean there); the text graph does compile
 /// for the ANE. `All` is the honest default — it never *asserts* ANE residency,
 /// which `tests/clap/placement.rs` characterizes rather than claims.
+///
+/// The issue #30 perf pass (the `clap_encode` bench) measured every placement and
+/// **kept** `All` here — unlike the text tower, no non-`All` unit clears the
+/// meaningful-speedup bar. Warm-median latency (Apple M1 Max, macOS 26.5 25F71,
+/// fp16, 25 runs × 3 sweeps): `CpuAndGpu` ~44.2 ms, `All` ~48.6 ms, `CpuOnly`
+/// ~47.8 ms, `CpuAndNeuralEngine` ~120.6 ms. `CpuAndGpu` is only ~9 % faster than
+/// `All` (below the ~15 % threshold a default change would need), `All`/`CpuOnly`
+/// are within noise, and naming the ANE is ~2.5× *slower* (the HTSAT `ANECCompile`
+/// fallback thrash). So `All` stays the default.
+///
+/// One honest caveat the bench also surfaced: because `All` names the ANE, every
+/// *load* re-attempts the HTSAT `ANECCompile` (which fails and falls back), a
+/// ~1.5–2 s cost `CpuAndGpu` skips entirely (it loads in ~0.1 s). Since the crate
+/// mandates construct-once / reuse / prewarm, that load is paid once and does not
+/// touch per-request latency — but a load-latency-sensitive caller can pin
+/// [`AudioEncoderOptions::with_compute`]`(ComputeUnits::CpuAndGpu)` for the faster
+/// load (and ~9 % warm win) at identical parity.
 pub const DEFAULT_AUDIO_COMPUTE: ComputeUnits = ComputeUnits::All;
 
 #[cfg(feature = "serde")]
@@ -260,6 +277,38 @@ impl AudioEncoder {
       out.push(WindowEmbedding::new(embedding, span));
     }
     Ok(out)
+  }
+
+  /// Runs one throwaway [`Self::embed_window`] to fully specialize the prediction
+  /// path, so the first user-facing request is warm.
+  ///
+  /// Construction ([`Self::from_file`] &c.) already pays the model *load* /
+  /// device specialization; what it does **not** pay is the first prediction's
+  /// own graph specialization. The `clap_encode` bench measures that first
+  /// inference at several times the warm latency (e.g. ~200 ms first vs ~48 ms
+  /// warm on `All`), so calling `prewarm` once — after construction, before
+  /// serving — moves that one-time cost off the first real clip. Then **reuse**
+  /// this same encoder for every request (it is `&self`, so it stays resident and
+  /// there is nothing to reconstruct).
+  ///
+  /// This is the whole prewarm delta over the construct-once-and-reuse pattern:
+  /// the load is the constructor's job, and this is deliberately *only* the dummy
+  /// inference the reuse pattern otherwise leaves for the first live request. The
+  /// warm-up runs a fixed synthetic 1 s tone (`repeatpad`ed to the fixed window),
+  /// so it neither reads caller audio nor allocates a full-window buffer up front.
+  ///
+  /// # Errors
+  /// As [`Self::embed_window`]; a failure here surfaces a broken model at prewarm
+  /// time rather than on the first request.
+  pub fn prewarm(&self) -> Result<()> {
+    const SR: f32 = 48_000.0;
+    // 1 s of a fixed 440 Hz tone: a valid, non-silent window (avoids the
+    // zero-magnitude path) that `embed_window` `repeatpad`s to the full window.
+    let signal: Vec<f32> = (0..48_000)
+      .map(|i| 0.5 * (std::f32::consts::TAU * 440.0 * (i as f32 / SR)).sin())
+      .collect();
+    self.embed_window(&signal)?;
+    Ok(())
   }
 }
 

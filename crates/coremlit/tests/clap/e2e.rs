@@ -125,6 +125,39 @@ fn multi_minute_pipeline_int8_pins_top_label() {
   run_pipeline_and_pin(&audio, &text, "int8", TOP_SCORE_INT8_LO, TOP_SCORE_INT8_HI);
 }
 
+/// The documented prewarm/reuse path (issue #30 perf pass): constructing an
+/// encoder pays the load, [`AudioEncoder::prewarm`] / [`TextEncoder::prewarm`]
+/// absorb the first-inference specialization, and the SAME encoder is then reused
+/// for real requests. Pins that prewarm succeeds on both towers and leaves each
+/// encoder fully usable (a real `embed*` after prewarm returns a valid unit
+/// embedding).
+#[test]
+#[ignore = "requires clapkit models (CLAPKIT_TEST_MODELS)"]
+fn prewarm_then_reuse_both_towers() {
+  let audio = AudioEncoder::from_file(common::audio_model_path()).unwrap();
+  let text = TextEncoder::from_file(common::text_model_path()).unwrap();
+
+  audio.prewarm().expect("audio prewarm");
+  text.prewarm().expect("text prewarm");
+
+  // Reuse after prewarm: both encoders still produce valid unit-norm embeddings.
+  let window = common::deterministic_window(coremlit::embeddings::clap::audio::TARGET_SAMPLES);
+  let a = audio
+    .embed_window(&window)
+    .expect("audio embed after prewarm");
+  let t = text
+    .embed("a violin playing a slow melody")
+    .expect("text embed after prewarm");
+  assert!(
+    (a.cosine(&a) - 1.0).abs() <= 1e-5,
+    "audio embedding is unit-norm after prewarm"
+  );
+  assert!(
+    (t.cosine(&t) - 1.0).abs() <= 1e-5,
+    "text embedding is unit-norm after prewarm"
+  );
+}
+
 /// Drive the full long-audio pipeline for one tier and pin the geometry, the
 /// aggregate self-consistency, the top zero-shot label, and the top logit band.
 fn run_pipeline_and_pin(

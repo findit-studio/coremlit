@@ -11,6 +11,34 @@
 //!   runs on the ANE.
 //! - **Text (RoBERTa).** Compiles for the ANE.
 //!
+//! # Measured warm latency & the placement defaults (issue #30 perf pass)
+//!
+//! This test pins numeric *agreement* across placements; the committed
+//! `clap_encode` bench (`benches/clap/encode.rs`) measures the *latency* of each,
+//! and the two towers' defaults are set from that measured table
+//! (measure-then-pin). Warm-median `embed` latency and the cross-placement cosine,
+//! on **Apple M1 Max / macOS 26.5 (25F71)**, fp16, 25 runs × 3 sweeps:
+//!
+//! | tower | `CpuOnly` | `All` | `CpuAndGpu` | `CpuAndNeuralEngine` |
+//! |-------|-----------|-------|-------------|----------------------|
+//! | audio | ~47.8 ms (ref) | ~48.6 ms · 0.999983 | ~44.2 ms · 0.999983 | ~120.6 ms · 0.999987 |
+//! | text  | ~42.1 ms (ref) | ~29.7 ms · 0.999947 | **~16.8 ms · 0.999956** | ~28.6 ms · 0.999950 |
+//!
+//! - **Text → [`ComputeUnits::CpuAndGpu`]** (changed from `All`). The tiny `[1,
+//!   512]` RoBERTa graph pays ANE-dispatch overhead on `All`; `CpuAndGpu` is ~43 %
+//!   faster warm and holds the parity floor below (0.9999). See
+//!   [`coremlit::embeddings::clap::text::DEFAULT_TEXT_COMPUTE`].
+//! - **Audio → [`ComputeUnits::All`]** (kept). `CpuAndGpu` is only ~9 % faster
+//!   (below the ~15 % bar a default change needs); `All`/`CpuOnly` are within
+//!   noise, and the ANE selection is ~2.5× slower (HTSAT `ANECCompile` fallback).
+//!   See [`coremlit::embeddings::clap::audio::DEFAULT_AUDIO_COMPUTE`].
+//!
+//! Regenerate the numbers with
+//! `CLAPKIT_TEST_MODELS=… cargo bench -p coremlit --features clap --bench clap_encode`.
+//! int8 is a **size** tier, not a speed tier: weight-only quantization leaves the
+//! fp16 activations, so it is measured no faster (the audit saw text ~21 % slower);
+//! the defaults above are tower-level and apply to both tiers.
+//!
 //! # What is pinned
 //!
 //! For each encoder, one deterministic input is embedded under every placement
