@@ -18,6 +18,19 @@
 //! skew moving ~10 % of chunks by up to ~5e-3, an order above the bound). The
 //! `strict_loader_*` hermetic tests additionally prove a MALFORMED golden is
 //! rejected before a single fidelity number is read.
+//!
+//! # The bound is a SAME-HOST-CLASS bound (host-aware gate)
+//!
+//! CoreML `CpuOnly` kernels ship with the OS (BNNS/Accelerate/Espresso) and are
+//! not contracted to produce identical floats across macOS builds or chip
+//! generations — cross-host drift up to ~1.2e-2 has been measured on this very
+//! trace after LSTM recurrence amplification (#36). Each golden therefore records
+//! the `generationHost` it was dumped on; the gate enforces [`TRACE_TOL`]
+//! unchanged when the running host-class matches, and on a mismatch fails with a
+//! regenerate-a-same-host-oracle diagnosis instead of blaming the port. The bound
+//! itself is NEVER widened for cross-host runs — a wide band would blind the gate
+//! to the stitching regressions it exists to catch. Goldens predating the
+//! `generationHost` field get the tight bounds with an ambiguity note on failure.
 
 mod common;
 
@@ -43,7 +56,16 @@ const GATE_FIXTURES: &[&str] = &["02_pyannote_sample", "07_yuhewei_dongbei_engli
 /// order of magnitude below the ~5e-3 a one-sample context skew moves the
 /// output (`tests/model_state.rs`), and 10x below the ±1e-3 probability
 /// perturbation the trace-mutation gate injects, so neither can hide under it.
+/// The bound is enforced only against a same-host-class golden (see the module
+/// doc's host-aware-gate section); a host-class mismatch fails toward
+/// regeneration, never toward a wider tolerance.
 const TRACE_TOL: f64 = 1e-4;
+
+/// The regeneration script the host-aware gate points a mismatched (or legacy,
+/// unstamped) host at. Same-host regeneration IS the port-correctness test off
+/// the golden's generation host, so the diagnosis names it rather than blaming
+/// the port or inviting a widened tolerance.
+const VAD_REGEN_SCRIPT: &str = "crates/coremlit/tests/vad/swift/regen_goldens.sh";
 
 /// The pinned generator identity every committed golden must record: the Swift
 /// dumper that produced it (`DumpVadTraces.swift`). A golden whose `generator`
@@ -78,6 +100,11 @@ struct SwiftGolden {
   input_samples: usize,
   input_fnv1a: String,
   chunks: Vec<SwiftChunk>,
+  /// The host-class the golden was generated on, or `None` for a legacy golden
+  /// that predates host provenance. FORM-validated by
+  /// [`common::HostClass::from_golden`]; the host MATCH is the model-gated
+  /// gate's job (`check_host_class`), never the parser's.
+  generation_host: Option<common::HostClass>,
 }
 
 /// STRICTLY parses a Swift trace golden from its JSON, hard-erroring on ANY
@@ -216,6 +243,10 @@ fn parse_golden(name: &str, v: &serde_json::Value) -> Result<SwiftGolden, String
     input_samples: usize_field("inputSamples")?,
     input_fnv1a: str_field("inputFnv1a")?,
     chunks,
+    // FORM only — parses `generationHost` if present, tolerates its absence
+    // (legacy golden). The host MATCH happens in the model-gated gate, so the
+    // strict-loader and committed-golden hermetic tests parse on every host.
+    generation_host: common::HostClass::from_golden(name, v)?,
   })
 }
 
@@ -251,6 +282,9 @@ fn vad_probabilities_match_fluidaudio_swift_trace() {
   let mut overall_worst = 0.0f64;
   let mut total_chunks = 0usize;
 
+  // The running host-class, read once (all fixtures share this machine).
+  let running = common::HostClass::running();
+
   for &fixture in GATE_FIXTURES {
     let golden = load_swift_golden(fixture);
 
@@ -283,6 +317,35 @@ fn vad_probabilities_match_fluidaudio_swift_trace() {
       golden.input_fnv1a,
       "{fixture}: input FNV-1a mismatch — the gate and the oracle saw different audio"
     );
+
+    // Host-class gate — the LAST precondition before the first CoreML-produced
+    // number. The fixture/generator/revision/geometry/input guards above are
+    // host-independent harness-validity checks and must keep failing first (a
+    // harness bug must never be reported as a host mismatch); only once they
+    // pass does host-class attribution become the question. A recorded-but-
+    // different host panics here with the regenerate diagnosis before any
+    // probability is compared; a legacy (unstamped) golden yields the ambiguity
+    // note appended to the fidelity failure below.
+    let host_note = match common::check_host_class(
+      fixture,
+      golden.generation_host.as_ref(),
+      &running,
+      VAD_REGEN_SCRIPT,
+    ) {
+      Ok(common::HostVerdict::Match) => {
+        println!("[host] {fixture}: golden generationHost matches this host: {running}");
+        String::new()
+      }
+      Ok(common::HostVerdict::LegacyUnknown) => {
+        println!(
+          "[host] {fixture}: golden has no generationHost (pre-host-provenance); tight \
+           bounds enforced — a failure would be ambiguous between port defect and host \
+           drift"
+        );
+        common::legacy_failure_note(VAD_REGEN_SCRIPT)
+      }
+      Err(diagnosis) => panic!("{diagnosis}"),
+    };
 
     // Replay vadkit over the SAME 4096-stride chunking (the short final chunk
     // is included and padded inside predict_chunk, exactly as VadManager does).
@@ -317,7 +380,7 @@ fn vad_probabilities_match_fluidaudio_swift_trace() {
       assert!(
         delta <= TRACE_TOL,
         "{fixture}: chunk {}: |Δ| {delta:.3e} exceeds {TRACE_TOL:.0e} \
-         (vadkit={p_rust}, swift={})",
+         (vadkit={p_rust}, swift={}){host_note}",
         gold.chunk_index,
         gold.probability
       );
@@ -351,6 +414,15 @@ fn well_formed() -> serde_json::Value {
     "fixture": "wf",
     "generator": "crates/coremlit/tests/vad/swift/Tests/VadTraceDump/DumpVadTraces.swift",
     "fluidAudioRevision": "1a2da18",
+    // A deliberately UNREAL host: it can never equal a running host-class, so
+    // any accidental parse-time host enforcement would fail the hermetic suite
+    // on every machine (the D4 trap guard).
+    "generationHost": {
+      "osBuild": "99Z999",
+      "osProductVersion": "99.9",
+      "chip": "Synthetic Chip",
+      "arch": "arm64"
+    },
     "determinismVerified": true,
     "computeUnits": "cpu_only",
     "sampleRate": 16000,
@@ -374,6 +446,15 @@ fn strict_loader_accepts_a_well_formed_golden() {
   assert_eq!(g.chunks.len(), 2);
   assert_eq!(g.chunks[0].probability, 1.0);
   assert_eq!(g.chunks[1].unpadded_samples, 2805);
+  assert_eq!(
+    g.generation_host,
+    Some(common::HostClass {
+      os_build: "99Z999".to_string(),
+      os_product_version: "99.9".to_string(),
+      chip: "Synthetic Chip".to_string(),
+      arch: "arm64".to_string(),
+    })
+  );
 }
 
 #[test]
@@ -501,4 +582,166 @@ fn strict_loader_tolerates_absent_determinism_verified() {
     .unwrap()
     .remove("determinismVerified");
   parse_golden("wf", &missing).expect("missing determinismVerified must be tolerated");
+}
+
+#[test]
+fn strict_loader_tolerates_absent_generation_host() {
+  // Mirror the determinismVerified absent-tolerance: both an explicit `null`
+  // and a removed key parse to `generation_host == None` (a legacy golden), so
+  // committed unstamped goldens keep loading on every host.
+  let mut null = well_formed();
+  null["generationHost"] = serde_json::Value::Null;
+  assert_eq!(
+    parse_golden("wf", &null)
+      .expect("null generationHost must be tolerated")
+      .generation_host,
+    None
+  );
+
+  let mut missing = well_formed();
+  missing.as_object_mut().unwrap().remove("generationHost");
+  assert_eq!(
+    parse_golden("wf", &missing)
+      .expect("absent generationHost must be tolerated")
+      .generation_host,
+    None
+  );
+}
+
+#[test]
+fn strict_loader_rejects_malformed_generation_host() {
+  // A string, not an object.
+  let mut a_string = well_formed();
+  a_string["generationHost"] = serde_json::json!("Apple M1");
+  assert!(
+    parse_golden("wf", &a_string)
+      .unwrap_err()
+      .contains("generationHost")
+  );
+
+  // An object missing `chip`.
+  let mut missing_chip = well_formed();
+  missing_chip["generationHost"]
+    .as_object_mut()
+    .unwrap()
+    .remove("chip");
+  assert!(
+    parse_golden("wf", &missing_chip)
+      .unwrap_err()
+      .contains("generationHost")
+  );
+
+  // An object with an empty `osBuild`.
+  let mut empty_build = well_formed();
+  empty_build["generationHost"]["osBuild"] = serde_json::json!("");
+  assert!(
+    parse_golden("wf", &empty_build)
+      .unwrap_err()
+      .contains("generationHost")
+  );
+}
+
+// ── Hermetic host-class gate tests (no model; synthetic host-classes) ───────
+
+/// A synthetic host-class for the pure-predicate tests below.
+fn synthetic_host() -> common::HostClass {
+  common::HostClass {
+    os_build: "24F74".to_string(),
+    os_product_version: "15.5".to_string(),
+    chip: "Apple M1".to_string(),
+    arch: "arm64".to_string(),
+  }
+}
+
+#[test]
+fn host_gate_matches_identical_host_class() {
+  let h = synthetic_host();
+  assert_eq!(
+    common::check_host_class("wf", Some(&h), &h, VAD_REGEN_SCRIPT),
+    Ok(common::HostVerdict::Match)
+  );
+}
+
+#[test]
+fn host_gate_mismatch_diagnoses_regeneration_not_port_defect() {
+  let base = synthetic_host();
+  // One pair differs in osBuild only; the other in chip only.
+  let other_build = common::HostClass {
+    os_build: "24G84".to_string(),
+    ..base.clone()
+  };
+  let other_chip = common::HostClass {
+    chip: "Apple M1 Pro".to_string(),
+    ..base.clone()
+  };
+  for (recorded, running) in [(&base, &other_build), (&base, &other_chip)] {
+    let diagnosis = common::check_host_class("wf", Some(recorded), running, VAD_REGEN_SCRIPT)
+      .expect_err("a differing host-class must be diagnosed, not matched");
+    let golden_render = recorded.to_string();
+    let running_render = running.to_string();
+    assert!(
+      diagnosis.contains(golden_render.as_str()),
+      "diagnosis must name the golden host: {diagnosis}"
+    );
+    assert!(
+      diagnosis.contains(running_render.as_str()),
+      "diagnosis must name the running host: {diagnosis}"
+    );
+    assert!(
+      diagnosis.contains("regen_goldens.sh"),
+      "diagnosis must point at regeneration: {diagnosis}"
+    );
+    assert!(
+      diagnosis.contains("NOT evidence of a port defect"),
+      "diagnosis must not blame the port: {diagnosis}"
+    );
+  }
+}
+
+#[test]
+fn host_gate_treats_unstamped_golden_as_legacy_ambiguous() {
+  let running = synthetic_host();
+  assert_eq!(
+    common::check_host_class("wf", None, &running, VAD_REGEN_SCRIPT),
+    Ok(common::HostVerdict::LegacyUnknown)
+  );
+  let note = common::legacy_failure_note(VAD_REGEN_SCRIPT);
+  assert!(
+    note.contains("AMBIGUOUS"),
+    "legacy note must flag ambiguity"
+  );
+  assert!(
+    note.contains("regen_goldens.sh"),
+    "legacy note must point at regeneration"
+  );
+}
+
+#[test]
+fn running_host_class_is_well_formed() {
+  // The only hermetic test that shells out to sysctl; CI is macos-15 on every
+  // job, so this is safe and catches a sysctl-key typo without any model.
+  let h = common::HostClass::running();
+  assert!(!h.os_build.is_empty(), "osBuild empty");
+  assert!(!h.os_product_version.is_empty(), "osProductVersion empty");
+  assert!(!h.chip.is_empty(), "chip empty");
+  assert!(
+    h.arch == "arm64" || h.arch == "x86_64",
+    "arch {:?} is neither arm64 nor x86_64",
+    h.arch
+  );
+}
+
+/// Hermetic: every committed VAD golden parses through the strict
+/// [`load_swift_golden`] loader (reads committed JSON only, no model). Pins the
+/// interim legacy behavior — goldens without `generationHost` still load, on
+/// every host — and is the designated flip-site for the post-regen
+/// host-presence assert (the owner-gated regen runbook). It also gives this
+/// suite the committed-golden hermetic coverage the speaker suite already has.
+#[test]
+fn committed_goldens_parse_through_the_strict_loader() {
+  for &fixture in GATE_FIXTURES {
+    let golden = load_swift_golden(fixture);
+    assert_eq!(golden.chunk_size, CHUNK_SAMPLES, "{fixture}: chunk size");
+    assert!(!golden.chunks.is_empty(), "{fixture}: golden has no chunks");
+  }
 }

@@ -43,6 +43,14 @@
 //!   its own [`ArgmaxComputeOptions`] matches what the golden was generated
 //!   with. Comparing a `.all`-placed Rust preprocessor against a `.cpuOnly`
 //!   Swift one would measure CoreML's scheduler and blame the port.
+//! - the golden records the `generationHost` (macOS build, chip, arch) it was
+//!   dumped on. CoreML `CpuOnly` floats are not contracted portable across macOS
+//!   builds/chips — the very drift the placement study acknowledges for `All` —
+//!   so the fidelity gate enforces its exact/1e-6 bounds only on a matching
+//!   host-class and fails a mismatched host toward `regen_goldens.sh` (same-host
+//!   regeneration IS the port test off the generation host). The tight bounds are
+//!   never widened. Goldens predating the field are enforced tightly with an
+//!   ambiguity note on failure.
 //!
 //! (As a free bonus the goldens record that WhisperKit's own AVFoundation
 //! loader — the one `DiarizeCLI` uses — decodes these WAVs to the *identical*
@@ -102,7 +110,10 @@
 //!
 //! `#[ignore]` (needs the gitignored `Models/argmax-speakerkit/` artifacts and
 //! the committed goldens); run via
-//! `ARGMAX_TEST_MODELS=… cargo test -p coremlit --features speaker -- --ignored`.
+//! `ARGMAX_TEST_MODELS=… cargo test -p coremlit --features speaker -- --ignored
+//! --test-threads=1` (serial recommended on memory-constrained hosts: several
+//! tests in this binary each load all three models, and libtest's default
+//! parallelism multiplies peak RSS).
 
 mod common;
 
@@ -133,7 +144,12 @@ use coremlit::{
 /// `MLMultiArray` for the segmenter's `.float16` `waveform` input and lets it
 /// convert), and both being IEEE round-to-nearest-even is a fact about the
 /// implementations rather than a contract. A value materially above zero is a
-/// FINDING (our mask or index mapping), never a tolerance to raise.
+/// FINDING — our mask or index mapping when the running host-class matches the
+/// golden's `generationHost`, or host-CoreML CpuOnly float drift when it does
+/// not (the same macOS/hardware sensitivity the `All`-placement study
+/// acknowledges; `CpuOnly` is not exempt across macOS builds/chips) — never a
+/// tolerance to raise. The host-aware gate fails a mismatched host toward
+/// same-host regeneration before this bound is ever consulted.
 const EMBED_MAX_ABS_TOL: f64 = 1e-6;
 
 /// Min cosine between our raw embedding and argmax's, per consumed
@@ -179,6 +195,12 @@ fn fixture_audio(name: &str) -> PathBuf {
 
 /// The fixture names, in golden order.
 const GATE_FIXTURES: &[&str] = &["02_pyannote_sample", "07_yuhewei_dongbei_english", "ted_60"];
+
+/// The regeneration script the host-aware gate points a mismatched (or legacy,
+/// unstamped) host at. Same-host regeneration IS the port-correctness test off
+/// the golden's generation host, so the fidelity gate names it rather than
+/// blaming the port or inviting a widened tolerance.
+const SPEAKER_REGEN_SCRIPT: &str = "crates/coremlit/tests/speaker/swift/regen_goldens.sh";
 
 // ─────────────────────────────────────────────────────────────────────────
 // The golden (written by tests/speaker/swift/Tests/ArgmaxTensorDump)
@@ -229,6 +251,11 @@ struct SwiftGolden {
   fresh_mask_alloc_all_zero: bool,
   chunks: Vec<SwiftChunk>,
   slots: Vec<SwiftSlot>,
+  /// The host-class the golden was generated on, or `None` for a legacy golden
+  /// that predates host provenance. FORM-validated by
+  /// [`common::HostClass::from_golden`]; the host MATCH is the model-gated
+  /// fidelity gate's job (`check_host_class` in [`measure`]), never the loader's.
+  generation_host: Option<common::HostClass>,
 }
 
 /// Decodes one slot's `activeFrames` bit string, hard-failing unless it is
@@ -339,6 +366,11 @@ fn load_swift_golden(name: &str) -> SwiftGolden {
       .expect("freshMaskAllocAllZero"),
     chunks,
     slots,
+    // FORM only — parses `generationHost` if present, tolerates its absence
+    // (legacy golden). This loader panics rather than returning Result, so keep
+    // that style; the host MATCH happens in the model-gated fidelity gate.
+    generation_host: common::HostClass::from_golden(name, &v)
+      .unwrap_or_else(|e| panic!("malformed golden: {e}")),
   }
 }
 
@@ -443,6 +475,13 @@ struct Fidelity {
   /// the embedding loop's `ours.contains(..)` filter silently shrinking
   /// coverage instead of failing — a bug that check would share with neither.
   golden_slots: usize,
+  /// Suffix for fidelity failure messages: empty when the golden's
+  /// `generationHost` matches the running host-class (or for the placement
+  /// study, which never consults the host gate); the ambiguity note when the
+  /// golden predates host provenance. A recorded-but-mismatched host has
+  /// already panicked with the regenerate diagnosis before any fidelity
+  /// number was produced.
+  host_failure_note: String,
 }
 
 /// Replays one fixture through [`ArgmaxSource`] at `compute` and measures it
@@ -470,7 +509,14 @@ fn measure(
   );
 
   // ── Placement-match proof: argmax's preprocessor is hardcoded .cpuOnly ──
-  if expect_golden_placement {
+  //
+  // The fidelity gate (`expect_golden_placement`) also runs the host-class gate
+  // here — the last precondition before the models load — producing the suffix
+  // appended to its fidelity failure messages. The placement STUDY
+  // (`expect_golden_placement == false`) sets the suffix empty and performs NO
+  // host check: it runs on `ComputeUnits::All` and its loose bounds absorb
+  // cross-host `CpuOnly` drift by design (see the placement-study doc).
+  let host_failure_note = if expect_golden_placement {
     let ours = [
       ("segmenter", compute.segmenter()),
       ("preprocessor", compute.preprocessor()),
@@ -491,7 +537,32 @@ fn measure(
         units.as_str()
       );
     }
-  }
+
+    // Host-class gate — after the placement proof, before any model loads.
+    let running = common::HostClass::running();
+    match common::check_host_class(
+      fixture,
+      golden.generation_host.as_ref(),
+      &running,
+      SPEAKER_REGEN_SCRIPT,
+    ) {
+      Ok(common::HostVerdict::Match) => {
+        println!("[host] {fixture}: golden generationHost matches this host: {running}");
+        String::new()
+      }
+      Ok(common::HostVerdict::LegacyUnknown) => {
+        println!(
+          "[host] {fixture}: golden has no generationHost (pre-host-provenance); tight \
+           bounds enforced — a failure would be ambiguous between port defect and host \
+           drift"
+        );
+        common::legacy_failure_note(SPEAKER_REGEN_SCRIPT)
+      }
+      Err(diagnosis) => panic!("{diagnosis}"),
+    }
+  } else {
+    String::new()
+  };
 
   // ── The pinned model contract the golden was dumped through ──
   assert_eq!(golden.windows_count, ARGMAX_WINDOWS_PER_CHUNK);
@@ -645,6 +716,7 @@ fn measure(
     exact_rows,
     compared_rows,
     golden_slots: golden.slots.len(),
+    host_failure_note,
   }
 }
 
@@ -660,6 +732,10 @@ fn measure(
 /// them (the mutation that used to make the segmentation comparison vacuous)
 /// fails HERE, without the model-gated fidelity run below. The model-gated
 /// gates additionally assert the realized compared-cell count in [`measure`].
+///
+/// It now also exercises [`common::HostClass::from_golden`] on every committed
+/// golden (each parses to legacy `None` today — the designated flip-site for
+/// the post-regen host-presence assert; see the owner-gated regen runbook).
 #[test]
 fn committed_goldens_load_through_the_strict_loader() {
   for fixture in GATE_FIXTURES {
@@ -710,6 +786,10 @@ fn argmax_execution_fidelity_vs_swift() {
 
   let (mut worst_abs, mut worst_cos) = (0.0f64, 1.0f64);
   let (mut exact_rows, mut compared_rows, mut seg_cells) = (0usize, 0usize, 0usize);
+  // The host-class suffix, captured from the per-fixture gate. All committed
+  // goldens share one provenance state (all matched, or all legacy-unstamped),
+  // so any fixture's note is the note for the aggregate bit-identity assert.
+  let mut host_failure_note = String::new();
   for fixture in GATE_FIXTURES {
     let f = measure(fixture, compute, true);
 
@@ -717,27 +797,32 @@ fn argmax_execution_fidelity_vs_swift() {
       f.only_ours.is_empty() && f.only_theirs.is_empty(),
       "{fixture}: the consumed (chunk, slot) set differs from argmax's.\n  only ours: {:?}\n  \
        only theirs: {:?}\nThe activity gate, the bounded() filter and Extraction's zero-column \
-       invariant all land here — this is a mapping bug.",
+       invariant all land here — on a matching host-class this is a mapping bug.{}",
       f.only_ours,
-      f.only_theirs
+      f.only_theirs,
+      f.host_failure_note
     );
     assert_eq!(
       f.seg_mismatches, 0,
       "{fixture}: {} of {} segmentation cells disagree with argmax's speaker_ids. Both sides read \
-       the SAME hard tensor, so this is an indexing bug, not a tolerance.",
-      f.seg_mismatches, f.seg_cells
+       the SAME hard tensor, so on a matching host-class this is an indexing bug, not a \
+       tolerance.{}",
+      f.seg_mismatches, f.seg_cells, f.host_failure_note
     );
     assert!(
       f.worst_abs <= EMBED_MAX_ABS_TOL,
       "{fixture}: embedding max|diff| {:.6e} exceeds {EMBED_MAX_ABS_TOL:e}. Placement is matched \
-       and the masks are provably identical (dia's fallback fires 0x), so this is OUR mask or \
-       index mapping — a FINDING, not a bound to raise.",
-      f.worst_abs
+       and the masks are provably identical (dia's fallback fires 0x), so on a matching \
+       host-class this is OUR mask or index mapping — a FINDING, not a bound to raise.{}",
+      f.worst_abs,
+      f.host_failure_note
     );
     assert!(
       f.worst_cos >= EMBED_COS_TOL,
-      "{fixture}: embedding cosine {:.9} below {EMBED_COS_TOL}. See above — this is a FINDING.",
-      f.worst_cos
+      "{fixture}: embedding cosine {:.9} below {EMBED_COS_TOL}. See above — on a matching \
+       host-class this is a FINDING.{}",
+      f.worst_cos,
+      f.host_failure_note
     );
 
     worst_abs = worst_abs.max(f.worst_abs);
@@ -745,6 +830,7 @@ fn argmax_execution_fidelity_vs_swift() {
     exact_rows += f.exact_rows;
     compared_rows += f.compared_rows;
     seg_cells += f.seg_cells;
+    host_failure_note = f.host_failure_note;
   }
 
   println!(
@@ -759,8 +845,9 @@ fn argmax_execution_fidelity_vs_swift() {
     compared_rows,
     "every consumed embedding row was bit-identical when this gate was written ({compared_rows} of \
      them); {} now differ within tolerance. Investigate before relaxing this: same models, same \
-     placement, same input and same mask should be bit-reproducible.",
-    compared_rows - exact_rows
+     placement, same input and same mask should be bit-reproducible.{}",
+    compared_rows - exact_rows,
+    host_failure_note
   );
 }
 
@@ -774,7 +861,11 @@ fn argmax_execution_fidelity_vs_swift() {
 /// loosened. argmax's own Swift is subject to the identical effect (its
 /// segmenter defaults to `.cpuOnly` but `PyannoteModelManager` places it
 /// wherever its `ModelInfo` says), so this is a property of the MODEL on this
-/// hardware, not of the port.
+/// hardware, not of the port. On a host-class differing from the golden's
+/// generationHost, the measured divergence additionally includes cross-host
+/// CpuOnly drift; the loose bounds absorb it by design — this study
+/// characterizes scheduling, it is not the fidelity gate and performs no host
+/// check.
 ///
 /// **What it measures (and it is not nothing):** ANE/GPU placement flips
 /// **66 of 72 447** hard `speaker_ids` cells (**0.0911%**) and moves EVERY
@@ -860,5 +951,142 @@ fn argmax_default_placement_vs_the_cpu_only_reference() {
     worst_cos >= PLACEMENT_COS_TOL,
     "ANE/GPU placement degrades an embedding to cosine {worst_cos:.9}, below the measured \
      {PLACEMENT_COS_TOL}. See above."
+  );
+}
+
+// ── Hermetic host-class gate tests (no model; drive THIS suite's common copy) ─
+
+/// A synthetic host-class for the pure-predicate tests below.
+fn synthetic_host() -> common::HostClass {
+  common::HostClass {
+    os_build: "24F74".to_string(),
+    os_product_version: "15.5".to_string(),
+    chip: "Apple M1".to_string(),
+    arch: "arm64".to_string(),
+  }
+}
+
+/// [`common::HostClass::from_golden`] is strict on a present `generationHost`
+/// but legacy-tolerant of its absence — driven directly with `serde_json::json!`
+/// values, independent of the full golden loader.
+#[test]
+fn generation_host_parse_is_strict_and_legacy_tolerant() {
+  // Absent → legacy (`None`), never an error: unstamped committed goldens must
+  // keep parsing on every host.
+  let absent = serde_json::json!({});
+  assert_eq!(
+    common::HostClass::from_golden("wf", &absent).expect("absent must be Ok"),
+    None
+  );
+
+  // Well-formed synthetic → `Some`, fields verified.
+  let ok = serde_json::json!({
+    "generationHost": {
+      "osBuild": "99Z999",
+      "osProductVersion": "99.9",
+      "chip": "Synthetic Chip",
+      "arch": "arm64"
+    }
+  });
+  assert_eq!(
+    common::HostClass::from_golden("wf", &ok).expect("well-formed must be Ok"),
+    Some(common::HostClass {
+      os_build: "99Z999".to_string(),
+      os_product_version: "99.9".to_string(),
+      chip: "Synthetic Chip".to_string(),
+      arch: "arm64".to_string(),
+    })
+  );
+
+  // Malformed (missing `arch`) → `Err` naming the field.
+  let bad = serde_json::json!({
+    "generationHost": {
+      "osBuild": "99Z999",
+      "osProductVersion": "99.9",
+      "chip": "Synthetic Chip"
+    }
+  });
+  assert!(
+    common::HostClass::from_golden("wf", &bad)
+      .unwrap_err()
+      .contains("generationHost")
+  );
+}
+
+#[test]
+fn host_gate_matches_identical_host_class() {
+  let h = synthetic_host();
+  assert_eq!(
+    common::check_host_class("wf", Some(&h), &h, SPEAKER_REGEN_SCRIPT),
+    Ok(common::HostVerdict::Match)
+  );
+}
+
+#[test]
+fn host_gate_mismatch_diagnoses_regeneration_not_port_defect() {
+  let base = synthetic_host();
+  // One pair differs in osBuild only; the other in chip only.
+  let other_build = common::HostClass {
+    os_build: "24G84".to_string(),
+    ..base.clone()
+  };
+  let other_chip = common::HostClass {
+    chip: "Apple M1 Pro".to_string(),
+    ..base.clone()
+  };
+  for (recorded, running) in [(&base, &other_build), (&base, &other_chip)] {
+    let diagnosis = common::check_host_class("wf", Some(recorded), running, SPEAKER_REGEN_SCRIPT)
+      .expect_err("a differing host-class must be diagnosed, not matched");
+    let golden_render = recorded.to_string();
+    let running_render = running.to_string();
+    assert!(
+      diagnosis.contains(golden_render.as_str()),
+      "diagnosis must name the golden host: {diagnosis}"
+    );
+    assert!(
+      diagnosis.contains(running_render.as_str()),
+      "diagnosis must name the running host: {diagnosis}"
+    );
+    assert!(
+      diagnosis.contains("regen_goldens.sh"),
+      "diagnosis must point at regeneration: {diagnosis}"
+    );
+    assert!(
+      diagnosis.contains("NOT evidence of a port defect"),
+      "diagnosis must not blame the port: {diagnosis}"
+    );
+  }
+}
+
+#[test]
+fn host_gate_treats_unstamped_golden_as_legacy_ambiguous() {
+  let running = synthetic_host();
+  assert_eq!(
+    common::check_host_class("wf", None, &running, SPEAKER_REGEN_SCRIPT),
+    Ok(common::HostVerdict::LegacyUnknown)
+  );
+  let note = common::legacy_failure_note(SPEAKER_REGEN_SCRIPT);
+  assert!(
+    note.contains("AMBIGUOUS"),
+    "legacy note must flag ambiguity"
+  );
+  assert!(
+    note.contains("regen_goldens.sh"),
+    "legacy note must point at regeneration"
+  );
+}
+
+#[test]
+fn running_host_class_is_well_formed() {
+  // The only hermetic test that shells out to sysctl; CI is macos-15 on every
+  // job, so this is safe and catches a sysctl-key typo without any model.
+  let h = common::HostClass::running();
+  assert!(!h.os_build.is_empty(), "osBuild empty");
+  assert!(!h.os_product_version.is_empty(), "osProductVersion empty");
+  assert!(!h.chip.is_empty(), "chip empty");
+  assert!(
+    h.arch == "arm64" || h.arch == "x86_64",
+    "arch {:?} is neither arm64 nor x86_64",
+    h.arch
   );
 }
