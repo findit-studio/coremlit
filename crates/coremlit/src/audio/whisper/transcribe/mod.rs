@@ -74,7 +74,7 @@ use std::{
     Mutex, PoisonError,
     atomic::{AtomicBool, Ordering},
   },
-  time::Instant,
+  time::{Duration, Instant},
 };
 
 use unicode_categories::UnicodeCategories;
@@ -90,7 +90,10 @@ use crate::audio::whisper::{
     sampler::{self, GreedyTokenSampler},
   },
   error::{DecodeError, ModelError, TranscribeError, VadError},
-  model::{ModelVariant, detect_variant, manager::ModelManager},
+  model::{
+    ModelVariant, detect_variant,
+    manager::{ModelLoadTimings, ModelManager},
+  },
   options::{DecodingOptions, Options},
   result::{
     DecodingResult, TranscriptionProgress, TranscriptionResult, TranscriptionSegment,
@@ -1184,6 +1187,56 @@ impl LanguageDetection {
 }
 
 // ---------------------------------------------------------------------
+// LoadTimings
+// ---------------------------------------------------------------------
+
+/// The one-time model/tokenizer load durations [`WhisperKit::<CoreMlBackend>::new`]
+/// measures at construction and [`WhisperKit`] then stamps into every run's
+/// fresh [`TranscriptionTimings`] — the port's stand-in for Swift's
+/// persistent `currentTimings`, whose load fields (populated in
+/// `loadModels`) ride into each result the same way
+/// (`WhisperKit.swift:396-441`, plumbed through `setupTranscribeTask`).
+/// [`Default`] (all [`Duration::ZERO`]) is the honest value for a
+/// [`WhisperKit::with_backend`] pipeline, which loads no models to time.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LoadTimings {
+  /// Whole-construction load total: prewarm pass + real model load + tokenizer
+  /// (Swift's `modelLoading = load-pass + prewarmLoadTime`,
+  /// `WhisperKit.swift:439`).
+  model_loading: Duration,
+  /// The prewarm pass as a whole; [`Duration::ZERO`] when prewarm was off.
+  prewarm_load_time: Duration,
+  /// Real-load-pass encoder load (`ModelLoadTimings::encoder_load`).
+  encoder_load: Duration,
+  /// Real-load-pass decoder load (`ModelLoadTimings::decoder_load`).
+  decoder_load: Duration,
+  /// Prewarm-pass encoder specialization; [`Duration::ZERO`] without prewarm.
+  encoder_specialization: Duration,
+  /// Prewarm-pass decoder specialization; [`Duration::ZERO`] without prewarm.
+  decoder_specialization: Duration,
+  /// Tokenizer load.
+  tokenizer_load_time: Duration,
+}
+
+impl LoadTimings {
+  /// Writes all seven load durations (as fractional seconds, the unit
+  /// [`TranscriptionTimings`] stores) into `timings`. The load fields are
+  /// never touched by [`TranscribeTask::run`], so stamping them onto a
+  /// run's result overwrites only their zero defaults, leaving every
+  /// compute-stage timing the run accumulated intact.
+  fn stamp(&self, timings: &mut TranscriptionTimings) {
+    timings
+      .set_model_loading(self.model_loading.as_secs_f64())
+      .set_prewarm_load_time(self.prewarm_load_time.as_secs_f64())
+      .set_encoder_load_time(self.encoder_load.as_secs_f64())
+      .set_decoder_load_time(self.decoder_load.as_secs_f64())
+      .set_encoder_specialization_time(self.encoder_specialization.as_secs_f64())
+      .set_decoder_specialization_time(self.decoder_specialization.as_secs_f64())
+      .set_tokenizer_load_time(self.tokenizer_load_time.as_secs_f64());
+  }
+}
+
+// ---------------------------------------------------------------------
 // WhisperKit
 // ---------------------------------------------------------------------
 
@@ -1208,6 +1261,10 @@ pub struct WhisperKit<B> {
   /// pluggable or configurable rather than locking product behavior to
   /// the default energy VAD").
   vad_detector: Box<dyn audio::vad::VoiceActivityDetector + Send + Sync>,
+  /// One-time load durations measured at construction, stamped into every
+  /// run's [`TranscriptionTimings`] (see [`LoadTimings`]). All-zero for a
+  /// [`Self::with_backend`] pipeline, which loads no models.
+  load_timings: LoadTimings,
 }
 
 impl WhisperKit<CoreMlBackend> {
@@ -1253,19 +1310,48 @@ impl WhisperKit<CoreMlBackend> {
       );
     }
     let mut manager = ModelManager::new(options.model_folder(), options.compute());
-    if options.prewarm() {
+    // Time the load the same way the compute pipeline already times its
+    // stages (`Instant::elapsed`), populating the seven load fields Swift
+    // stamps into `currentTimings` inside `loadModels`
+    // (`WhisperKit.swift:396-441`). These are DURATIONS of a construction
+    // step that inherently loads models from disk, not the absolute
+    // wall-clock stamps the sans-I/O transcription rule (and #37.2) reject:
+    // the whole prewarm pass is `prewarm_load_time`; the encoder/decoder
+    // per-model splits come from the manager; and `model_loading` folds the
+    // real load pass and the prewarm total together as Swift does (`:439`).
+    let prewarm_load_time = if options.prewarm() {
+      let start = Instant::now();
       manager.prewarm()?;
-    }
-    let models = manager.into_loaded()?;
+      start.elapsed()
+    } else {
+      Duration::ZERO
+    };
+    let model_load_start = Instant::now();
+    let (models, model_splits): (_, ModelLoadTimings) = manager.into_loaded()?;
     let backend = CoreMlBackend::from_loaded(models).map_err(DecodeError::from)?;
+    let tokenizer_start = Instant::now();
     let tokenizer = WhisperTokenizer::from_folder(options.tokenizer_folder())?;
+    let tokenizer_load_time = tokenizer_start.elapsed();
     let dims = backend.dims();
     let variant = detect_variant(dims.vocab(), dims.embed_dim());
+    // Swift's `modelLoading = now - modelLoadStart + prewarmLoadTime`
+    // (`:439`): the whole real-load pass (models, tokenizer, and the dims
+    // introspection variant detection needs) plus the earlier prewarm pass.
+    let model_loading = model_load_start.elapsed() + prewarm_load_time;
     Ok(Self {
       backend,
       tokenizer,
       variant,
       vad_detector: Box::new(audio::vad::EnergyVad::new()),
+      load_timings: LoadTimings {
+        model_loading,
+        prewarm_load_time,
+        encoder_load: model_splits.encoder_load(),
+        decoder_load: model_splits.decoder_load(),
+        encoder_specialization: model_splits.encoder_specialization(),
+        decoder_specialization: model_splits.decoder_specialization(),
+        tokenizer_load_time,
+      },
     })
   }
 }
@@ -1289,6 +1375,9 @@ impl<B> WhisperKit<B> {
       tokenizer,
       variant: None,
       vad_detector: Box::new(audio::vad::EnergyVad::new()),
+      // No models loaded through this seam, so nothing to time: the honest
+      // load timings are all-zero (see [`LoadTimings`]).
+      load_timings: LoadTimings::default(),
     }
   }
 
@@ -1415,6 +1504,20 @@ impl<B> WhisperKit<B> {
     options: DecodingOptions,
   ) -> LocalAgreementTranscriber<'_, B> {
     LocalAgreementTranscriber::new(self, options)
+  }
+
+  /// Folds this pipeline's construction-time [`LoadTimings`] into `result`'s
+  /// timings — the port's counterpart to Swift carrying `currentTimings`'
+  /// load fields into every `TranscriptionResult`
+  /// (`WhisperKit.swift:396-441`, plumbed via `setupTranscribeTask`). Called
+  /// on every result [`Self::transcribe`]/[`Self::transcribe_all`] hands
+  /// back, after [`TranscribeTask::run`] built it: the run leaves the seven
+  /// load fields at their zero defaults, so this only fills them in. No
+  /// backend bound — this touches no [`InferenceBackend`] method.
+  fn stamp_load_timings(&self, result: &mut TranscriptionResult) {
+    let mut timings = result.timings().clone();
+    self.load_timings.stamp(&mut timings);
+    result.set_timings(timings);
   }
 }
 
@@ -1708,10 +1811,23 @@ where
         decoded_span,
       );
       *merged.task_facts_mut() = recovered;
+      // Stamps the merged result once, not each chunk before merging — and
+      // the two are equivalent only for the five max-combined load fields.
+      // Load timings are identical for every chunk in this `WhisperKit`, so
+      // stamping post-merge lands the same value pre-merge stamping (then
+      // max-combining identical values) would. The two specialization
+      // fields differ: the merge (`merge_results`, `result/mod.rs:2381-2389`)
+      // always leaves them at zero regardless of what the inputs held, so
+      // pre-merge stamping would still merge away to 0.0 — stamping the
+      // merged result here is what carries real specialization values
+      // through.
+      self.stamp_load_timings(&mut merged);
       return Ok(merged);
     }
 
-    TranscribeTask::new(&self.backend, &self.tokenizer).run(audio, options)
+    let mut result = TranscribeTask::new(&self.backend, &self.tokenizer).run(audio, options)?;
+    self.stamp_load_timings(&mut result);
+    Ok(result)
   }
 
   /// Runs one [`TranscribeTask`] per entry of `audios`, batched
@@ -1775,6 +1891,11 @@ where
       results.extend(batch_results);
     }
 
+    // Stamp construction-time load timings onto every successful result,
+    // mirroring Swift's `currentTimings` riding into each task's result.
+    for result in results.iter_mut().flatten() {
+      self.stamp_load_timings(result);
+    }
     results
   }
 

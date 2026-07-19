@@ -53,3 +53,17 @@ fn unload_on_nothing_resident_is_silent() {
   assert!(seen.lock().unwrap().is_empty(), "no transitions fired");
   assert_eq!(manager.state(), ModelState::Unloaded);
 }
+
+#[test]
+fn model_load_timings_default_is_all_zero() {
+  // The all-zero default is the honest value a manager hands off when no
+  // prewarm pass ran (the two `*_specialization` durations) — and, more
+  // broadly, what `WhisperKit::with_backend` reports for a pipeline that
+  // loaded no models. Per-model non-zero measurement needs a real model and
+  // is covered by the gated pipeline test.
+  let t = ModelLoadTimings::default();
+  assert_eq!(t.encoder_load(), Duration::ZERO);
+  assert_eq!(t.decoder_load(), Duration::ZERO);
+  assert_eq!(t.encoder_specialization(), Duration::ZERO);
+  assert_eq!(t.decoder_specialization(), Duration::ZERO);
+}

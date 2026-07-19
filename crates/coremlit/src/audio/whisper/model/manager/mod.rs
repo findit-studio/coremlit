@@ -12,7 +12,10 @@
 //! Swift's `LoadModelsCoordinator` actor (`ModelManager.swift:73-86`,
 //! `:214-232`) with plain `&mut self` serialization.
 
-use std::path::PathBuf;
+use std::{
+  path::PathBuf,
+  time::{Duration, Instant},
+};
 
 use crate::audio::whisper::{
   error::ModelError,
@@ -76,6 +79,63 @@ impl LoadedModels {
 }
 
 // ---------------------------------------------------------------------
+// ModelLoadTimings
+// ---------------------------------------------------------------------
+
+/// Per-model load/specialization durations a [`ModelManager`] observes while
+/// bringing the encoder and decoder up, handed off by
+/// [`ModelManager::into_loaded`] for a `WhisperKit` to fold into its
+/// per-run [`crate::audio::whisper::result::TranscriptionTimings`]. Mirrors
+/// the split Swift's `WhisperKit.loadModels(prewarmMode:)` records into
+/// `currentTimings` (`WhisperKit.swift:396-423`): the **prewarm** pass's
+/// per-model load elapsed is the *specialization* time (the one-time
+/// ANE/graph specialization the throwaway prewarm load pays up front), and
+/// the **real** load pass's per-model elapsed is the *load* time. The two
+/// `*_specialization` durations therefore stay [`Duration::ZERO`] whenever
+/// no prewarm pass ran ([`ModelManager::prewarm`] was not called), exactly
+/// as Swift leaves them unset without a `prewarmMode` load.
+///
+/// The mel feature-extractor's own load is not split out here (Swift records
+/// no per-mel field either); it is captured only in the whole-pass totals a
+/// `WhisperKit` measures around [`ModelManager::prewarm`]/
+/// [`ModelManager::into_loaded`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModelLoadTimings {
+  encoder_load: Duration,
+  decoder_load: Duration,
+  encoder_specialization: Duration,
+  decoder_specialization: Duration,
+}
+
+impl ModelLoadTimings {
+  /// Time the real (non-prewarm) load pass spent loading the audio encoder.
+  #[inline(always)]
+  pub const fn encoder_load(&self) -> Duration {
+    self.encoder_load
+  }
+
+  /// Time the real (non-prewarm) load pass spent loading the text decoder.
+  #[inline(always)]
+  pub const fn decoder_load(&self) -> Duration {
+    self.decoder_load
+  }
+
+  /// Time the prewarm pass spent loading (specializing) the audio encoder;
+  /// [`Duration::ZERO`] when no prewarm pass ran.
+  #[inline(always)]
+  pub const fn encoder_specialization(&self) -> Duration {
+    self.encoder_specialization
+  }
+
+  /// Time the prewarm pass spent loading (specializing) the text decoder;
+  /// [`Duration::ZERO`] when no prewarm pass ran.
+  #[inline(always)]
+  pub const fn decoder_specialization(&self) -> Duration {
+    self.decoder_specialization
+  }
+}
+
+// ---------------------------------------------------------------------
 // ModelManager
 // ---------------------------------------------------------------------
 
@@ -87,6 +147,7 @@ pub struct ModelManager {
   state: ModelState,
   callback: Option<StateCallback>,
   models: Option<LoadedModels>,
+  timings: ModelLoadTimings,
 }
 
 impl std::fmt::Debug for ModelManager {
@@ -97,6 +158,7 @@ impl std::fmt::Debug for ModelManager {
       .field("state", &self.state)
       .field("callback", &self.callback.as_ref().map(|_| "<installed>"))
       .field("models", &self.models)
+      .field("timings", &self.timings)
       .finish()
   }
 }
@@ -113,6 +175,7 @@ impl ModelManager {
       state: ModelState::Unloaded,
       callback: None,
       models: None,
+      timings: ModelLoadTimings::default(),
     }
   }
 
@@ -189,11 +252,20 @@ impl ModelManager {
     }
   }
 
-  fn resolve_and_prewarm(&self) -> Result<(), ModelError> {
+  fn resolve_and_prewarm(&mut self) -> Result<(), ModelError> {
     let resolved = LocalModelLoader::new().resolve(&self.folder)?;
     crate::Model::prewarm(resolved.mel_ref(), self.compute.mel())?;
+    // The prewarm-pass per-model load is Swift's `*SpecializationTime`
+    // (`WhisperKit.swift:401-403,420-422`): the throwaway load-then-drop
+    // pays the one-time ANE/graph specialization so the real load below is
+    // fast. `resolved` owns its paths and `compute` is `Copy`, so neither
+    // outlives its use — the `self.timings` writes borrow freely between loads.
+    let decoder_start = Instant::now();
     crate::Model::prewarm(resolved.decoder_ref(), self.compute.decoder())?;
+    self.timings.decoder_specialization = decoder_start.elapsed();
+    let encoder_start = Instant::now();
     crate::Model::prewarm(resolved.encoder_ref(), self.compute.encoder())?;
+    self.timings.encoder_specialization = encoder_start.elapsed();
     Ok(())
   }
 
@@ -256,11 +328,20 @@ impl ModelManager {
     }
   }
 
-  fn resolve_and_load(&self) -> Result<LoadedModels, ModelError> {
+  fn resolve_and_load(&mut self) -> Result<LoadedModels, ModelError> {
     let resolved = LocalModelLoader::new().resolve(&self.folder)?;
     let mel = crate::Model::load(resolved.mel_ref(), self.compute.mel())?;
+    // The real (non-prewarm) per-model load is Swift's `*LoadTime`
+    // (`WhisperKit.swift:404-406,423-425`). Timed individually so a
+    // `WhisperKit` can populate `encoder_load_time`/`decoder_load_time`
+    // separately from the whole-pass `model_loading` total it measures
+    // around `into_loaded`.
+    let decoder_start = Instant::now();
     let decoder = crate::Model::load(resolved.decoder_ref(), self.compute.decoder())?;
+    self.timings.decoder_load = decoder_start.elapsed();
+    let encoder_start = Instant::now();
     let encoder = crate::Model::load(resolved.encoder_ref(), self.compute.encoder())?;
+    self.timings.encoder_load = encoder_start.elapsed();
     Ok(LoadedModels::new(mel, encoder, decoder))
   }
 
@@ -283,19 +364,24 @@ impl ModelManager {
   }
 
   /// [`Self::ensure_loaded`], then hands off ownership of the resulting
-  /// [`LoadedModels`] — the construction-time path a `WhisperKit::new`
-  /// (a later task) uses when its load-at-construction option is set.
+  /// [`LoadedModels`] together with the [`ModelLoadTimings`] observed while
+  /// bringing them up — the construction-time path `WhisperKit::new` uses
+  /// when its load-at-construction option is set, so it can fold the
+  /// per-model load/specialization splits into each run's timings. The
+  /// returned timings carry the specialization durations from a prior
+  /// [`Self::prewarm`] (all-zero if none ran) as well as this call's
+  /// per-model load durations.
   ///
   /// # Errors
   /// As [`Self::ensure_loaded`].
-  pub fn into_loaded(mut self) -> Result<LoadedModels, ModelError> {
+  pub fn into_loaded(mut self) -> Result<(LoadedModels, ModelLoadTimings), ModelError> {
     self.ensure_loaded()?;
-    Ok(
-      self
-        .models
-        .take()
-        .expect("ensure_loaded() above returned Ok, so models is populated"),
-    )
+    let timings = self.timings;
+    let models = self
+      .models
+      .take()
+      .expect("ensure_loaded() above returned Ok, so models is populated");
+    Ok((models, timings))
   }
 
   /// Moves to `new`, firing the installed callback (if any) with the prior
