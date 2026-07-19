@@ -786,9 +786,17 @@ fn argmax_execution_fidelity_vs_swift() {
 
   let (mut worst_abs, mut worst_cos) = (0.0f64, 1.0f64);
   let (mut exact_rows, mut compared_rows, mut seg_cells) = (0usize, 0usize, 0usize);
-  // The host-class suffix, captured from the per-fixture gate. All committed
-  // goldens share one provenance state (all matched, or all legacy-unstamped),
-  // so any fixture's note is the note for the aggregate bit-identity assert.
+  // The host-class suffix for the aggregate bit-identity assert below. All
+  // committed goldens today share one provenance state (all matched, or all
+  // legacy-unstamped) -- and `measure` already fails eagerly on a real host
+  // MISMATCH -- so within a single run the only two notes reachable here are
+  // "" (matched) and the one shared legacy-ambiguity string; a non-empty note
+  // is therefore never fixture-specific content, just a flag that this run
+  // touched an unstamped golden. Keeping the first NON-EMPTY note (rather
+  // than unconditionally overwriting with the LAST fixture's) keeps this
+  // cause-neutral if a future golden set ever mixed stamped and legacy
+  // goldens, instead of silently attributing one fixture's host state to a
+  // divergence a different fixture caused.
   let mut host_failure_note = String::new();
   for fixture in GATE_FIXTURES {
     let f = measure(fixture, compute, true);
@@ -830,7 +838,12 @@ fn argmax_execution_fidelity_vs_swift() {
     exact_rows += f.exact_rows;
     compared_rows += f.compared_rows;
     seg_cells += f.seg_cells;
-    host_failure_note = f.host_failure_note;
+    // Cause-neutral: keep the note only if it is non-empty, rather than
+    // unconditionally overwriting with the LAST fixture's -- see the
+    // `host_failure_note` declaration above.
+    if !f.host_failure_note.is_empty() {
+      host_failure_note = f.host_failure_note;
+    }
   }
 
   println!(
