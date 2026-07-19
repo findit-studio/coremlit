@@ -11,8 +11,18 @@ scratchpad locations and must be adapted to re-run.
   `8fa0f1c6d0433df6e97c127f64b2a1d6c0dcda8a`.
 - **Distributed CoreML artifacts:**
   [`FinDIT-Studio/clapkit-coreml`](https://huggingface.co/FinDIT-Studio/clapkit-coreml),
-  revision `97d631f3814e1e46b798a8e88c9aa2e2202fdf67` (fp16). Pinned in
-  `tests/clap/model_io.rs` / `tests/clap/text_model_io.rs` (SHA-256 + shapes).
+  revision `02a99c6a8be21da1e9a947499ea503a10c80c4f1` — ships both the **fp16**
+  tier (byte-identical to the original fp16-only publication
+  `97d631f3814e1e46b798a8e88c9aa2e2202fdf67`) and the 2×-smaller **int8** tier
+  (`clap_{audio,text}_int8.mlmodelc`). Fetch at the immutable revision (never
+  mutable `main`):
+  ```sh
+  hf download FinDIT-Studio/clapkit-coreml \
+    --revision 02a99c6a8be21da1e9a947499ea503a10c80c4f1 \
+    --local-dir Models/clapkit
+  ```
+  Every artifact file's SHA-256 (both tiers) + I/O shapes are pinned in
+  `tests/clap/model_io.rs` / `tests/clap/text_model_io.rs`.
 - **Toolchain (pinned):** coremltools 9.0 · torch 2.5.1 · transformers 5.14.0 ·
   numpy 1.26.4 · python 3.11.15.
 

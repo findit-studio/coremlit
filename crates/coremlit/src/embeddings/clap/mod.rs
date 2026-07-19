@@ -19,12 +19,30 @@
 //!
 //! # Model artifacts
 //!
-//! The two CoreML graphs are distributed on the Hugging Face Hub at
+//! The CoreML graphs are distributed on the Hugging Face Hub at
 //! [`FinDIT-Studio/clapkit-coreml`](https://huggingface.co/FinDIT-Studio/clapkit-coreml),
-//! revision `97d631f3814e1e46b798a8e88c9aa2e2202fdf67` (fp16, converted from
+//! revision `02a99c6a8be21da1e9a947499ea503a10c80c4f1` (converted from
 //! `laion/clap-htsat-unfused` — **CC-BY-4.0**, attribution required; see the
-//! crate `NOTICE`). They are gitignored dev-time downloads under
-//! `Models/clapkit/`; their SHA-256 and I/O contracts are pinned by
+//! crate `NOTICE`). That revision ships **two tiers**, both loaded through the
+//! same encoders (identical I/O contract; pick per tower at load time):
+//!
+//! - **fp16** (`clap_audio.mlmodelc` / `clap_text.mlmodelc`) — the validated,
+//!   shipped default; every parity / placement / e2e gate runs on it.
+//! - **int8** (`clap_audio_int8.mlmodelc` / `clap_text_int8.mlmodelc`) — a
+//!   2×-smaller **opt-in** tier, measured-parity-clean per the int8 gates in
+//!   `tests/clap/`. (The per-tower production default is the owner's decision;
+//!   this crate records only that fp16 is validated and int8 is opt-in.)
+//!
+//! They are gitignored dev-time downloads under `Models/clapkit/`, fetched at the
+//! immutable revision (never mutable `main`):
+//!
+//! ```text
+//! hf download FinDIT-Studio/clapkit-coreml \
+//!   --revision 02a99c6a8be21da1e9a947499ea503a10c80c4f1 \
+//!   --local-dir Models/clapkit
+//! ```
+//!
+//! Every artifact file's SHA-256 and the I/O contracts are pinned by
 //! `tests/clap/model_io.rs` / `tests/clap/text_model_io.rs`.
 //!
 //! # Encoder split: Rust front-ends around fp16 CoreML graphs

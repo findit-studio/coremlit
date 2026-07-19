@@ -1,9 +1,10 @@
 //! Shared helpers for clapkit's model-gated integration tests.
 //!
-//! The CoreML artifacts (`clap_audio.mlmodelc` / `clap_text.mlmodelc`) are
-//! gitignored dev-time downloads from `FinDIT-Studio/clapkit-coreml`
-//! (revision `97d631f3814e1e46b798a8e88c9aa2e2202fdf67`). Model-gated tests are
-//! `#[ignore]` by default and run only when the tree is present.
+//! The CoreML artifacts (fp16 `clap_{audio,text}.mlmodelc` + int8
+//! `clap_{audio,text}_int8.mlmodelc`) are gitignored dev-time downloads from
+//! `FinDIT-Studio/clapkit-coreml` (revision
+//! `02a99c6a8be21da1e9a947499ea503a10c80c4f1`). Model-gated tests are `#[ignore]`
+//! by default and run only when the tree is present.
 
 use std::path::{Path, PathBuf};
 

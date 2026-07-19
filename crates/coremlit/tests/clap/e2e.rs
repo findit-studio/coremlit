@@ -32,6 +32,14 @@ const TOP_SCORE_LO: f32 = 8.3;
 const TOP_SCORE_HI: f32 = 9.3;
 const AGG_SELF_COSINE_LO: f32 = 0.97;
 
+// int8 tier (opt-in): same DECISION (top label unchanged), top logit pinned in an
+// int8-specific two-sided band around the measured 8.880292 (measured LOCALLY
+// 2026-07-19 on artifact `clapkit-coreml@02a99c6a`; matches issue #30's 8.885357).
+// The window geometry and aggregate self-consistency are tier-agnostic and reuse
+// the fp16 pins above.
+const TOP_SCORE_INT8_LO: f32 = 8.4;
+const TOP_SCORE_INT8_HI: f32 = 9.4;
+
 // The canonical CLAP zero-shot prompt template ("This is a sound of {label}",
 // used by LAION/HF's own zero-shot-audio-classification examples). With bare
 // nouns the audio↔text cosines are tiny and speech/music rank ambiguously; the
@@ -53,8 +61,49 @@ fn tiled_speech_clip() -> Vec<f32> {
   clip
 }
 
+/// Cosine of two unit-norm embeddings (== dot product), **fail-closed**: a
+/// length mismatch (`zip` would silently truncate) or any non-finite input/output
+/// panics rather than returning a wrong-but-finite / NaN value that a downstream
+/// comparison could pass blindly. Same guard as the parity reducer
+/// (`tests/clap/parity_textclap.rs`); the inputs are L2-normalized embeddings so
+/// cosine == the raw dot product — that contract is unchanged.
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
-  a.iter().zip(b).map(|(x, y)| x * y).sum()
+  assert_eq!(
+    a.len(),
+    b.len(),
+    "cosine operands differ in length: {} vs {}",
+    a.len(),
+    b.len()
+  );
+  assert!(
+    a.iter().chain(b).all(|v| v.is_finite()),
+    "cosine operand contains a non-finite value (NaN/inf) — the reducer must fail closed"
+  );
+  let c: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+  assert!(c.is_finite(), "cosine produced a non-finite value: {c}");
+  c
+}
+
+/// Fail-closed proof (HERMETIC — no model, runs in the default `cargo test` under
+/// the `clap` feature): a `NaN` operand must PANIC, not slip through the
+/// self-consistency check. Removing the finite guard reds this test.
+#[test]
+#[should_panic(expected = "non-finite")]
+fn cosine_rejects_non_finite_operand() {
+  let a = [f32::NAN, 0.0, 0.0];
+  let b = [1.0, 0.0, 0.0];
+  let _ = cosine(&a, &b);
+}
+
+/// Fail-closed proof (HERMETIC): mismatched operand lengths must PANIC rather
+/// than let `zip` truncate to the shorter side. Removing the length assertion
+/// reds this test.
+#[test]
+#[should_panic(expected = "differ in length")]
+fn cosine_rejects_length_mismatch() {
+  let a = [1.0, 0.0, 0.0];
+  let b = [1.0, 0.0];
+  let _ = cosine(&a, &b);
 }
 
 #[test]
@@ -62,13 +111,36 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 fn multi_minute_pipeline_pins_windows_aggregate_and_top_label() {
   let audio = AudioEncoder::from_file(common::audio_model_path()).unwrap();
   let text = TextEncoder::from_file(common::text_model_path()).unwrap();
+  run_pipeline_and_pin(&audio, &text, "fp16", TOP_SCORE_LO, TOP_SCORE_HI);
+}
+
+/// int8 tier (opt-in): the SAME multi-minute pipeline with the int8 encoders. The
+/// DECISION (top zero-shot label) must be unchanged and the top logit lands in the
+/// int8-specific band; window geometry / aggregate coherence are tier-agnostic.
+#[test]
+#[ignore = "requires clapkit int8 models (CLAPKIT_TEST_MODELS)"]
+fn multi_minute_pipeline_int8_pins_top_label() {
+  let audio = AudioEncoder::from_file(common::audio_model_int8_path()).unwrap();
+  let text = TextEncoder::from_file(common::text_model_int8_path()).unwrap();
+  run_pipeline_and_pin(&audio, &text, "int8", TOP_SCORE_INT8_LO, TOP_SCORE_INT8_HI);
+}
+
+/// Drive the full long-audio pipeline for one tier and pin the geometry, the
+/// aggregate self-consistency, the top zero-shot label, and the top logit band.
+fn run_pipeline_and_pin(
+  audio: &AudioEncoder,
+  text: &TextEncoder,
+  tier: &str,
+  top_score_lo: f32,
+  top_score_hi: f32,
+) {
   let clip = tiled_speech_clip();
 
   // 1. Plan → 2. per-window embeddings (always exposed to the caller).
   let plan = WindowPlan::new(); // no overlap, keep the padded tail
   let windows = audio.embed_windows(&clip, &plan).unwrap();
   println!(
-    "[e2e] {} windows over {} samples",
+    "[e2e/{tier}] {} windows over {} samples",
     windows.len(),
     clip.len()
   );
@@ -93,7 +165,7 @@ fn multi_minute_pipeline_pins_windows_aggregate_and_top_label() {
   let norm_sq: f32 = clip_embedding.as_slice().iter().map(|x| x * x).sum();
   assert!((norm_sq - 1.0).abs() < 1e-5, "aggregate not unit-norm");
   let self_cos = cosine(clip_embedding.as_slice(), windows[0].embedding().as_slice());
-  println!("[e2e] aggregate↔window[0] cosine = {self_cos:.6}");
+  println!("[e2e/{tier}] aggregate↔window[0] cosine = {self_cos:.6}");
   assert!(
     self_cos >= AGG_SELF_COSINE_LO,
     "aggregate {self_cos:.6} diverged from its windows (below {AGG_SELF_COSINE_LO})"
@@ -112,14 +184,14 @@ fn multi_minute_pipeline_pins_windows_aggregate_and_top_label() {
     .collect();
   let ranked = score(&clip_embedding, &anchors, ScoreMode::LogitScaled);
   for r in &ranked {
-    println!("[e2e] {:<30} logit = {:.6}", r.label(), r.score());
+    println!("[e2e/{tier}] {:<30} logit = {:.6}", r.label(), r.score());
   }
 
   assert_eq!(ranked[0].label(), TOP_LABEL, "top zero-shot label drifted");
   let top = ranked[0].score();
   assert!(
-    (TOP_SCORE_LO..=TOP_SCORE_HI).contains(&top),
-    "top logit {top:.6} outside pinned band [{TOP_SCORE_LO}, {TOP_SCORE_HI}]"
+    (top_score_lo..=top_score_hi).contains(&top),
+    "top logit {top:.6} outside pinned band [{top_score_lo}, {top_score_hi}]"
   );
   // The decision is unambiguous: the speech anchor beats the runner-up.
   assert!(
