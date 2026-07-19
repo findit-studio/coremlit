@@ -898,6 +898,33 @@ const CLAPKIT_NORM_VANISHING_MUTANT: &str = r#"
             tensor<fp16, [1, 512, 768]> input_5_cast_fp16 = layer_norm(axes = input_5_axes_0, beta = text_model_embeddings_LayerNorm_bias_to_fp16, epsilon = var_23_to_fp16, gamma = text_model_embeddings_LayerNorm_weight_to_fp16, x = input_3_cast_fp16)[name = tensor<string, []>("input_5_cast_fp16")];
 "#;
 
+/// granite's converted ModernBERT graph is CLEAN — the third norm-only clean
+/// control beside clapkit's. Verbatim excerpts of the real shipped graph
+/// `Models/embedkit-granite/granite-97m-multilingual-r2/granite_97m_512.mlmodelc/model.mil`
+/// lines 17-18 (the embeddings `layer_norm`, `epsilon = 0x1.5p-17 ≈ 1.001e-5`)
+/// and lines 106-107 (a transformer-layer `layer_norm` at the same eps). The
+/// graph carries 25 `layer_norm`s, ALL at `0x1.5p-17` (well above the fp16 floor
+/// `2^-24`), and NO `log`/`sqrt`/`rsqrt`/`real_div` anywhere — L2-norm is kept
+/// OUT of the graph (applied in Rust), so the rsqrt-guard class is absent by
+/// construction, exactly like clapkit. This snippet is the models-independent
+/// proof that granite's conversion guard shape audits clean; the live sweep
+/// covers every site when `Models/embedkit-granite/` is present.
+const GRANITE_NORMS_CLEAN: &str = r#"
+            tensor<fp16, []> var_42_to_fp16 = const()[name = tensor<string, []>("op_42_to_fp16"), val = tensor<fp16, []>(0x1.5p-17)];
+            tensor<fp16, [1, 512, 384]> input_5_cast_fp16 = layer_norm(axes = input_5_axes_0, epsilon = var_42_to_fp16, gamma = embeddings_norm_weight_to_fp16, x = input_3_cast_fp16)[name = tensor<string, []>("input_5_cast_fp16")];
+            tensor<fp16, []> var_95_to_fp16 = const()[name = tensor<string, []>("op_95_to_fp16"), val = tensor<fp16, []>(0x1.5p-17)];
+            tensor<fp16, [1, 512, 384]> input_15_cast_fp16 = layer_norm(axes = input_15_axes_0, epsilon = var_95_to_fp16, gamma = layers_0_mlp_norm_weight_to_fp16, x = input_13_cast_fp16)[name = tensor<string, []>("input_15_cast_fp16")];
+"#;
+
+/// The granite embeddings `layer_norm` with its epsilon halved to `0x1p-25`
+/// (exactly half the fp16 floor) — the mutation a re-conversion would introduce
+/// if it dropped the eps below the floor. It MUST be caught as a vanishing `norm`
+/// finding, proving the clean control above is not vacuously green.
+const GRANITE_NORM_VANISHING_MUTANT: &str = r#"
+            tensor<fp16, []> var_42_to_fp16 = const()[name = tensor<string, []>("op_42_to_fp16"), val = tensor<fp16, []>(0x1p-25)];
+            tensor<fp16, [1, 512, 384]> input_5_cast_fp16 = layer_norm(axes = input_5_axes_0, epsilon = var_42_to_fp16, gamma = embeddings_norm_weight_to_fp16, x = input_3_cast_fp16)[name = tensor<string, []>("input_5_cast_fp16")];
+"#;
+
 /// Two INDEPENDENT sub-threshold guard constants on ONE `log` site: an
 /// `add(x, 0x1p-25)` floor feeding a `log(eps = 0x1p-25)`. Each constant is
 /// `2^-25` — exactly HALF fp16's smallest subnormal — so each rounds to zero in
@@ -1274,6 +1301,43 @@ fn accepts_clapkit_conversion_norm_guards() {
     vanishing(CLAPKIT_NORM_VANISHING_MUTANT),
     ["layer_norm/fp16 guard=norm eff=2.9802322387695313e-8"],
     "a clapkit norm eps halved to 0x1p-25 (below the fp16 floor) must be flagged"
+  );
+}
+
+/// granite's converted ModernBERT graph is a CLEAN control (the third norm-only
+/// control beside clapkit's audio/text towers): all 25 `layer_norm` guards at
+/// `0x1.5p-17` clear the fp16 floor, and no `log`/`sqrt`/`rsqrt`/`real_div` class
+/// is present (L2-norm kept out of the graph), so the sweep must report granite
+/// clean. Its companion mutant — the same embeddings `layer_norm` with the
+/// epsilon halved to `0x1p-25` — MUST be flagged, proving this control is not
+/// vacuously green.
+#[test]
+fn accepts_granite_conversion_norm_guards() {
+  assert_eq!(
+    vanishing(GRANITE_NORMS_CLEAN),
+    Vec::<String>::new(),
+    "granite's 0x1.5p-17 layer_norm guards all survive fp16"
+  );
+
+  let audit = parse_mil(GRANITE_NORMS_CLEAN).audit();
+  assert!(
+    audit.unresolved.is_empty(),
+    "the real granite norm excerpts must parse completely: {:?}",
+    audit.unresolved
+  );
+  // Two layer_norm findings, both surviving; no log/div/sqrt guard class present.
+  assert_eq!(audit.findings.len(), 2, "two layer_norm sites");
+  assert!(audit.findings.iter().all(|f| f.survives_fp16()));
+  assert!(
+    audit.findings.iter().all(|f| f.op == "layer_norm"),
+    "granite carries only layer_norm guard sites"
+  );
+
+  // Mutation proof: below-floor epsilon is caught, not silently swept green.
+  assert_eq!(
+    vanishing(GRANITE_NORM_VANISHING_MUTANT),
+    ["layer_norm/fp16 guard=norm eff=2.9802322387695313e-8"],
+    "a granite norm eps halved to 0x1p-25 (below the fp16 floor) must be flagged"
   );
 }
 

@@ -1,0 +1,71 @@
+{
+ "worst_cosine_canonical_vs_driver": 0.999999977090618,
+ "stop_threshold_divergence": 0.0001,
+ "verdict": "AGREE",
+ "per_entry": [
+  {
+   "id": "en_q",
+   "cosine_canonical_vs_driver": 1.0000000547412746
+  },
+  {
+   "id": "en_doc",
+   "cosine_canonical_vs_driver": 1.0000000225849048
+  },
+  {
+   "id": "zh",
+   "cosine_canonical_vs_driver": 1.000000025138874
+  },
+  {
+   "id": "ja",
+   "cosine_canonical_vs_driver": 1.0000001005859067
+  },
+  {
+   "id": "ar",
+   "cosine_canonical_vs_driver": 0.999999977090618
+  },
+  {
+   "id": "ko",
+   "cosine_canonical_vs_driver": 1.0000000298967098
+  },
+  {
+   "id": "ru",
+   "cosine_canonical_vs_driver": 1.0000000132301932
+  },
+  {
+   "id": "es",
+   "cosine_canonical_vs_driver": 1.0000000901245913
+  },
+  {
+   "id": "de",
+   "cosine_canonical_vs_driver": 1.0000000469046577
+  },
+  {
+   "id": "emoji",
+   "cosine_canonical_vs_driver": 1.0000000721854558
+  },
+  {
+   "id": "mixed",
+   "cosine_canonical_vs_driver": 1.0000000910286295
+  },
+  {
+   "id": "code",
+   "cosine_canonical_vs_driver": 0.9999999923092937
+  },
+  {
+   "id": "url_num",
+   "cosine_canonical_vs_driver": 1.00000005996385
+  },
+  {
+   "id": "near512",
+   "cosine_canonical_vs_driver": 1.0000000493880572
+  },
+  {
+   "id": "short",
+   "cosine_canonical_vs_driver": 1.0000000634174397
+  },
+  {
+   "id": "special",
+   "cosine_canonical_vs_driver": 1.0000000771828614
+  }
+ ]
+}

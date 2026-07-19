@@ -73,6 +73,7 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
     ("vad-bundled", vec!["vad", "silero/bundled"]),
     ("clap", vec!["dep:rustfft", "dep:tokenizers"]),
     ("clap-oracle", vec!["clap", "dep:textclap"]),
+    ("granite", vec!["dep:tokenizers"]),
   ]
 }
 
@@ -105,8 +106,9 @@ const INTENDED_CI_COMBOS: &[&str] = &[
   "vad-bundled",
   "clap",
   "clap-oracle",
-  "whisper,align,speaker,vad,clap,serde,tracing,nl-recognizer",
-  "whisper,align-oracle,speaker-oracle,vad-bundled,clap-oracle,serde,tracing,nl-recognizer",
+  "granite",
+  "whisper,align,speaker,vad,clap,granite,serde,tracing,nl-recognizer",
+  "whisper,align-oracle,speaker-oracle,vad-bundled,clap-oracle,granite,serde,tracing,nl-recognizer",
 ];
 
 /// The text of the `[features]` table (its lines, blank/comment lines included).
@@ -403,8 +405,9 @@ const DOCTORED_MATRIX: &str = r#"
           - "vad-bundled"
           - "clap"
           - "clap-oracle"
-          - "whisper,align,speaker,vad,clap,serde,tracing,nl-recognizer"
-          - "whisper,align-oracle,speaker-oracle,vad-bundled,clap-oracle,serde,tracing,nl-recognizer"
+          - "granite"
+          - "whisper,align,speaker,vad,clap,granite,serde,tracing,nl-recognizer"
+          - "whisper,align-oracle,speaker-oracle,vad-bundled,clap-oracle,granite,serde,tracing,nl-recognizer"
     steps:
       - uses: actions/checkout@v7
 "#;

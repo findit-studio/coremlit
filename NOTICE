@@ -4,20 +4,23 @@ Copyright the coremlit authors
 The coremlit Rust source is dual-licensed under MIT OR Apache-2.0 (caller's
 choice). See LICENSE-MIT and LICENSE-APACHE for those terms.
 
-NOTE: coremlit ships NO model weight files, but embeddings::clap BUNDLES one
-third-party artifact (the Xenova tokenizer, via include_bytes! — section 6b).
-Each feature-gated pipeline (audio::whisper / audio::align / audio::speaker /
-audio::vad / embeddings::clap) otherwise LOADS, at runtime, CoreML model
-artifacts that a downstream user fetches separately from Hugging Face (see the
-crate README and each module's model_io tests for the repo id, revision, and
-per-file SHA-256). This NOTICE records the attribution a binary that
-distributes or bundles those components must honor.
+NOTE: coremlit ships NO model weight files, but embeddings::clap and
+embeddings::granite each BUNDLE a third-party tokenizer artifact (via
+include_bytes! — sections 6b and 7b). Each feature-gated pipeline
+(audio::whisper / audio::align / audio::speaker / audio::vad / embeddings::clap
+/ embeddings::granite) otherwise LOADS, at runtime, CoreML model artifacts that
+a downstream user fetches separately from Hugging Face (see the crate README and
+each module's model_io tests for the repo id, revision, and per-file SHA-256).
+This NOTICE records the attribution a binary that distributes or bundles those
+components must honor.
 
 Sections 1-2 (the audio::vad models) are preserved verbatim from the former
 vadkit NOTICE. Sections 3-5 record the whisper, speaker, and align model
 attributions folded in by the mono-crate restructure. Section 6 records the
 CLAP audio+text encoder weights and the bundled Xenova tokenizer, folded in by
-the clapkit port. Both audio::vad components below are MIT.
+the clapkit port. Section 7 records the granite text-embedding encoder and its
+bundled tokenizer, added by the embedkit phase. Both audio::vad components below
+are MIT.
 
 ────────────────────────────────────────────────────────────────────────
 1. Silero VAD (upstream model)
@@ -185,3 +188,45 @@ via `include_bytes!` (exposed as `coremlit::embeddings::clap::BUNDLED_TOKENIZER`
       transformers.js / ONNX export; it carries no model weights. A redistributor
       should honor the upstream Xenova export's terms and the RoBERTa tokenizer's
       MIT license for the configuration.
+
+────────────────────────────────────────────────────────────────────────
+7. granite text-embedding encoder and bundled tokenizer (embeddings::granite)
+
+embeddings::granite runs a CoreML conversion of IBM's
+`granite-embedding-97m-multilingual-r2` text encoder (a ModernBERT encoder with
+CLS pooling, 384-dim), and BUNDLES that model's tokenizer into the compiled
+crate via `include_bytes!` (exposed as
+`coremlit::embeddings::granite::BUNDLED_TOKENIZER`).
+
+  7a) Encoder weights — IBM granite-embedding-97m-multilingual-r2. The crate
+      ships NO model files; it loads FinDIT-Studio's CoreML conversion, a format
+      conversion (no weights retrained or altered in value) of the IBM weights.
+
+        Original model: ibm-granite/granite-embedding-97m-multilingual-r2
+        https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2
+        License: Apache-2.0 — preserve the Apache-2.0 attribution when
+        redistributing the weights (or a binary bundling them).
+        Attribution: IBM Granite Team, Granite Embedding models.
+
+        CoreML conversion actually loaded: FinDIT-Studio/embedkit-coreml
+        https://huggingface.co/FinDIT-Studio/embedkit-coreml
+        revision 81852f70. Per-file SHA-256 pinned in tests/granite/model_io.rs.
+
+      As an Apache-2.0 work, a redistributor must retain the license and
+      copyright notices and state any changes; the CoreML conversion is a change
+      of format (lowering to Apple CoreML at a fixed 512 sequence length), noted
+      here.
+
+  7b) Bundled tokenizer — granite-embedding-97m-multilingual-r2 (via
+      include_bytes!). Compiled into the crate, so any binary linking coremlit
+      with the `granite` feature redistributes it.
+
+        Source: https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2
+        Revision (commit SHA): 835ad14087e140460703cf0fae09f97d469d65c2
+        Artifact: tokenizer.json
+        SHA-256: 4f2842d568e2724370aec203652a42ac783c7937f8347a1a2cc7506d71f1582f
+
+      The artifact is the granite tokenizer configuration and vocabulary/merges
+      (an o200k-style BPE); it carries no model weights. It is distributed under
+      the same upstream Apache-2.0 terms as the model; retain the license notice
+      when redistributing it.

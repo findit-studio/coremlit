@@ -32,12 +32,20 @@ rename or a dropped feature cannot land silently.
 `default = []` (the bare CoreML runtime core). Additive features:
 
 `whisper`, `nl-recognizer`, `align`, `align-oracle`, `speaker`,
-`speaker-oracle`, `vad`, `vad-bundled`, `clap`, `clap-oracle`, `serde`,
-`tracing`.
+`speaker-oracle`, `vad`, `vad-bundled`, `clap`, `clap-oracle`, `granite`,
+`serde`, `tracing`.
+
+`granite` is not a former per-crate kit but a NEW module (`embeddings::granite`,
+the embedkit phase): general text sentence-embeddings on CoreML, first model
+`granite-embedding-97m-multilingual-r2`. Its parity oracle is COMMITTED
+transformers-fp32 goldens, not a live crate, so it has NO `granite-oracle`
+sibling and pulls no `ort` — hence it appears in the rename table below only as a
+new-module note, not an old-crate row.
 
 Compositions (pinned by the golden test): `nl-recognizer` → `whisper`;
 `align-oracle` → `align`; `speaker-oracle` → `speaker`; `vad-bundled` → `vad`;
-`clap-oracle` → `clap`.
+`clap-oracle` → `clap`. (`granite` composes with nothing — a single leaf
+feature.)
 
 ## Curated CI feature-combination list
 
@@ -58,8 +66,9 @@ none. It is pinned here and driven by CI (`.github/workflows/ci.yml`):
 | `vad-bundled` | + silero ONNX cross-backend oracle |
 | `clap` | CLAP audio+text encoders alone (Rust mel + tokenizers, no ort) |
 | `clap-oracle` | + textclap model-level parity oracle (ort) |
-| `whisper,align,speaker,vad,serde,tracing,nl-recognizer` | all non-oracle features on |
-| `whisper,align-oracle,speaker-oracle,vad-bundled,serde,tracing,nl-recognizer` | all-on (every feature, oracles included) |
+| `granite` | granite text embeddings alone (bundled tokenizer + committed transformers-fp32 goldens, no ort) |
+| `whisper,align,speaker,vad,clap,granite,serde,tracing,nl-recognizer` | all non-oracle features on |
+| `whisper,align-oracle,speaker-oracle,vad-bundled,clap-oracle,granite,serde,tracing,nl-recognizer` | all-on (every feature, oracles included) |
 
 `serde` and `tracing` are cross-cutting and covered by the all-on runs. The
 list embodies the combinatorial-honesty rule: it is explicit and reviewable,
