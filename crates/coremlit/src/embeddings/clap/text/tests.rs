@@ -6,7 +6,11 @@ use super::*;
 fn options_default_equals_new() {
   assert_eq!(TextEncoderOptions::default(), TextEncoderOptions::new());
   assert_eq!(TextEncoderOptions::new().compute(), DEFAULT_TEXT_COMPUTE);
-  assert_eq!(DEFAULT_TEXT_COMPUTE, ComputeUnits::All);
+  // Measure-then-pin default: moved off `All` to `CpuAndGpu` by the #30 perf pass
+  // (the tiny RoBERTa graph pays ANE dispatch overhead on `All`; `CpuAndGpu` is
+  // ~43% faster warm and holds the placement parity floor — see the const's docs
+  // and `benches/clap/encode.rs`).
+  assert_eq!(DEFAULT_TEXT_COMPUTE, ComputeUnits::CpuAndGpu);
 }
 
 #[test]

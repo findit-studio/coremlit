@@ -11,6 +11,34 @@
 //!   runs on the ANE.
 //! - **Text (RoBERTa).** Compiles for the ANE.
 //!
+//! # Measured warm latency & the placement defaults (issue #30 perf pass)
+//!
+//! This test pins numeric *agreement* across placements; the committed
+//! `clap_encode` bench (`benches/clap/encode.rs`) measures the *latency* of each,
+//! and the two towers' defaults are set from that measured table
+//! (measure-then-pin). Warm-median `embed` latency and the cross-placement cosine,
+//! on **Apple M1 Max / macOS 26.5 (25F71)**, fp16, 25 runs × 3 sweeps:
+//!
+//! | tower | `CpuOnly` | `All` | `CpuAndGpu` | `CpuAndNeuralEngine` |
+//! |-------|-----------|-------|-------------|----------------------|
+//! | audio | ~47.8 ms (ref) | ~48.6 ms · 0.999983 | ~44.2 ms · 0.999983 | ~120.6 ms · 0.999987 |
+//! | text  | ~42.1 ms (ref) | ~29.7 ms · 0.999947 | **~16.8 ms · 0.999956** | ~28.6 ms · 0.999950 |
+//!
+//! - **Text → [`ComputeUnits::CpuAndGpu`]** (changed from `All`). The tiny `[1,
+//!   512]` RoBERTa graph pays ANE-dispatch overhead on `All`; `CpuAndGpu` is ~43 %
+//!   faster warm and holds the parity floor below (0.9999). See
+//!   [`coremlit::embeddings::clap::text::DEFAULT_TEXT_COMPUTE`].
+//! - **Audio → [`ComputeUnits::All`]** (kept). `CpuAndGpu` is only ~9 % faster
+//!   (below the ~15 % bar a default change needs); `All`/`CpuOnly` are within
+//!   noise, and the ANE selection is ~2.5× slower (HTSAT `ANECCompile` fallback).
+//!   See [`coremlit::embeddings::clap::audio::DEFAULT_AUDIO_COMPUTE`].
+//!
+//! Regenerate the numbers with
+//! `CLAPKIT_TEST_MODELS=… cargo bench -p coremlit --features clap --bench clap_encode`.
+//! int8 is a **size** tier, not a speed tier: weight-only quantization leaves the
+//! fp16 activations, so it is measured no faster (the audit saw text ~21 % slower);
+//! the defaults above are tower-level and apply to both tiers.
+//!
 //! # What is pinned
 //!
 //! For each encoder, one deterministic input is embedded under every placement
@@ -40,6 +68,18 @@ const AUDIO_MIN_COSINE: f32 = 0.9999;
 /// 0.99994725 (the CpuOnly-vs-ANE fp16/fp32 pair — the text graph DOES compile
 /// for the ANE); pinned at 0.9999.
 const TEXT_MIN_COSINE: f32 = 0.9999;
+
+/// Lower bound on the **int8** audio tower's cross-placement cosine over the same
+/// public matrix. Same characterization as fp16 (HTSAT still falls back off the
+/// ANE — `ANECCompile()` fails at int8 too, confirmed at run time — so all units
+/// agree to compression tolerance). MEASURED worst = 0.99998385 (locally
+/// 2026-07-19 on `clapkit-coreml@02a99c6a`; matches issue #30's 0.99998385);
+/// pinned at 0.9999. A drop below is a finding, not a threshold to loosen.
+const AUDIO_INT8_MIN_COSINE: f32 = 0.9999;
+/// Lower bound on the **int8** text tower's cross-placement cosine. MEASURED
+/// worst = 0.99993771 (locally 2026-07-19 on `clapkit-coreml@02a99c6a`; matches
+/// issue #30's 0.99993682); pinned at 0.9999.
+const TEXT_INT8_MIN_COSINE: f32 = 0.9999;
 
 const AUDIO_UNITS: &[ComputeUnits] = &[
   ComputeUnits::All,
@@ -117,4 +157,60 @@ fn text_placement_agreement_characterized() {
   }
   assert!((reference.cosine(&reference) - 1.0).abs() <= 1e-5);
   eprintln!("[placement] text worst cross-unit cosine = {worst:.8}");
+}
+
+// ── int8 tier (opt-in): the SAME placement characterization on the int8 encoders.
+//    The audio int8 graph still falls back off the ANE (same as fp16); the text
+//    int8 graph compiles for the ANE. Never asserts ANE residency for audio. ──
+
+#[test]
+#[ignore = "requires local clapkit int8 models (CLAPKIT_TEST_MODELS)"]
+fn audio_int8_placement_agreement_characterized() {
+  let samples = common::deterministic_window(coremlit::embeddings::clap::audio::TARGET_SAMPLES);
+
+  let embed = |unit: ComputeUnits| -> Embedding {
+    AudioEncoder::from_file_with(
+      common::audio_model_int8_path(),
+      AudioEncoderOptions::new().with_compute(unit),
+    )
+    .unwrap_or_else(|e| panic!("load audio int8 [{}]: {e}", unit.as_str()))
+    .embed_window(&samples)
+    .unwrap_or_else(|e| panic!("embed audio int8 [{}]: {e}", unit.as_str()))
+  };
+
+  let reference = embed(ComputeUnits::CpuOnly);
+  let mut worst = 1.0f32;
+  for &unit in AUDIO_UNITS {
+    let cos = embed(unit).cosine(&reference);
+    worst = worst.min(cos);
+    assert_band("audio int8", unit, cos, AUDIO_INT8_MIN_COSINE);
+  }
+  assert!((reference.cosine(&reference) - 1.0).abs() <= 1e-5);
+  eprintln!("[placement] audio int8 worst cross-unit cosine = {worst:.8}");
+}
+
+#[test]
+#[ignore = "requires local clapkit int8 models (CLAPKIT_TEST_MODELS)"]
+fn text_int8_placement_agreement_characterized() {
+  const PROMPT: &str = "a violin playing a slow melody in a concert hall";
+
+  let embed = |unit: ComputeUnits| -> Embedding {
+    TextEncoder::from_bundled_tokenizer(
+      common::text_model_int8_path(),
+      TextEncoderOptions::new().with_compute(unit),
+    )
+    .unwrap_or_else(|e| panic!("load text int8 [{}]: {e}", unit.as_str()))
+    .embed(PROMPT)
+    .unwrap_or_else(|e| panic!("embed text int8 [{}]: {e}", unit.as_str()))
+  };
+
+  let reference = embed(ComputeUnits::CpuOnly);
+  let mut worst = 1.0f32;
+  for &unit in TEXT_UNITS {
+    let cos = embed(unit).cosine(&reference);
+    worst = worst.min(cos);
+    assert_band("text int8", unit, cos, TEXT_INT8_MIN_COSINE);
+  }
+  assert!((reference.cosine(&reference) - 1.0).abs() <= 1e-5);
+  eprintln!("[placement] text int8 worst cross-unit cosine = {worst:.8}");
 }

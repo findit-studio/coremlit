@@ -26,10 +26,30 @@ mod names {
 /// so they can never index past the position table.
 pub const TEXT_MAX_TOKENS: usize = 512;
 
-/// Default [`TextEncoderOptions::compute`]. [`ComputeUnits::All`]. As converted
-/// (T1), the RoBERTa text graph **does** compile for the ANE (unlike the audio
-/// graph); placement is still characterized, not asserted (`tests/clap/placement.rs`).
-pub const DEFAULT_TEXT_COMPUTE: ComputeUnits = ComputeUnits::All;
+/// Default [`TextEncoderOptions::compute`]: [`ComputeUnits::CpuAndGpu`] — a
+/// **measure-then-pin** default, moved off `All` by the issue #30 perf pass (the
+/// committed `clap_encode` bench, `benches/clap/encode.rs`).
+///
+/// The RoBERTa text graph is tiny (a fixed `[1, 512]` window). On `All`, CoreML
+/// pulls the ANE into the schedule, and for a graph this small the per-dispatch
+/// coordination cost dominates the actual compute — so `All` is *slower* than
+/// scheduling on the GPU alone. Measured **warm-median** latency (Apple M1 Max,
+/// macOS 26.5 25F71, fp16, 25 runs, consistent across 3 sweeps):
+///
+/// | unit                      | warm median | cosine vs `CpuOnly` |
+/// |---------------------------|-------------|---------------------|
+/// | `CpuAndGpu` (new default) | ~16.8 ms    | 0.999956            |
+/// | `CpuAndNeuralEngine`      | ~28.6 ms    | 0.999950            |
+/// | `All` (former default)    | ~29.7 ms    | 0.999947            |
+/// | `CpuOnly`                 | ~42.1 ms    | 1.000000 (ref)      |
+///
+/// `CpuAndGpu` is ~43 % faster than the former `All` default and holds the
+/// cross-placement parity floor the `tests/clap/placement.rs` gate pins (0.9999).
+/// Only the *default* moves — every unit stays selectable via
+/// [`TextEncoderOptions::with_compute`] / [`TextEncoderOptions::set_compute`]
+/// (`All` and `CpuOnly` remain parity-clean). The text graph **does** compile for
+/// the ANE (unlike the audio graph); placement is characterized, not asserted.
+pub const DEFAULT_TEXT_COMPUTE: ComputeUnits = ComputeUnits::CpuAndGpu;
 
 #[cfg(feature = "serde")]
 fn default_text_compute() -> ComputeUnits {
@@ -279,6 +299,31 @@ impl TextEncoder {
     // (`NonFiniteEmbedding`).
     check_finite_output(&row)?;
     Embedding::from_slice_normalizing(&row)
+  }
+
+  /// Runs one throwaway [`Self::embed`] to fully specialize the prediction path,
+  /// so the first user-facing request is warm.
+  ///
+  /// Construction ([`Self::from_file`] &c.) already pays the model *load* /
+  /// device specialization; what it does **not** pay is the first prediction's
+  /// own graph specialization. The `clap_encode` bench measures that first
+  /// inference at several times the warm latency (e.g. ~120 ms first vs ~17 ms
+  /// warm on `CpuAndGpu`), so calling `prewarm` once — after construction, before
+  /// serving — moves that one-time cost off the first real query. Then **reuse**
+  /// this same encoder for every request (it is `&self`, so it stays resident and
+  /// there is nothing to reconstruct).
+  ///
+  /// This is the whole prewarm delta over the construct-once-and-reuse pattern:
+  /// the load is the constructor's job, and this is deliberately *only* the dummy
+  /// inference the reuse pattern otherwise leaves for the first live request.
+  ///
+  /// # Errors
+  /// As [`Self::embed`] (the warm-up query is a fixed non-empty string, so the
+  /// empty-text path cannot fire); a failure here surfaces a broken model at
+  /// prewarm time rather than on the first request.
+  pub fn prewarm(&self) -> Result<()> {
+    self.embed("warmup")?;
+    Ok(())
   }
 }
 

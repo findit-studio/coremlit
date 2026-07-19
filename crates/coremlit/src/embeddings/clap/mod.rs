@@ -19,12 +19,30 @@
 //!
 //! # Model artifacts
 //!
-//! The two CoreML graphs are distributed on the Hugging Face Hub at
+//! The CoreML graphs are distributed on the Hugging Face Hub at
 //! [`FinDIT-Studio/clapkit-coreml`](https://huggingface.co/FinDIT-Studio/clapkit-coreml),
-//! revision `97d631f3814e1e46b798a8e88c9aa2e2202fdf67` (fp16, converted from
+//! revision `02a99c6a8be21da1e9a947499ea503a10c80c4f1` (converted from
 //! `laion/clap-htsat-unfused` — **CC-BY-4.0**, attribution required; see the
-//! crate `NOTICE`). They are gitignored dev-time downloads under
-//! `Models/clapkit/`; their SHA-256 and I/O contracts are pinned by
+//! crate `NOTICE`). That revision ships **two tiers**, both loaded through the
+//! same encoders (identical I/O contract; pick per tower at load time):
+//!
+//! - **fp16** (`clap_audio.mlmodelc` / `clap_text.mlmodelc`) — the validated,
+//!   shipped default; every parity / placement / e2e gate runs on it.
+//! - **int8** (`clap_audio_int8.mlmodelc` / `clap_text_int8.mlmodelc`) — a
+//!   2×-smaller **opt-in** tier, measured-parity-clean per the int8 gates in
+//!   `tests/clap/`. (The per-tower production default is the owner's decision;
+//!   this crate records only that fp16 is validated and int8 is opt-in.)
+//!
+//! They are gitignored dev-time downloads under `Models/clapkit/`, fetched at the
+//! immutable revision (never mutable `main`):
+//!
+//! ```text
+//! hf download FinDIT-Studio/clapkit-coreml \
+//!   --revision 02a99c6a8be21da1e9a947499ea503a10c80c4f1 \
+//!   --local-dir Models/clapkit
+//! ```
+//!
+//! Every artifact file's SHA-256 and the I/O contracts are pinned by
 //! `tests/clap/model_io.rs` / `tests/clap/text_model_io.rs`.
 //!
 //! # Encoder split: Rust front-ends around fp16 CoreML graphs
@@ -42,8 +60,69 @@
 //! Placement is characterized, not asserted (`tests/clap/placement.rs`). As converted
 //! (T1), the **audio** (HTSAT Swin) graph does **not** compile for the ANE and
 //! falls back to GPU/CPU; the **text** (RoBERTa) graph does compile for the ANE.
-//! [`crate::ComputeUnits::All`] lets CoreML schedule either way; the crate
-//! never claims ANE residency for the audio tower.
+//! The crate never claims ANE residency for the audio tower.
+//!
+//! The per-tower **defaults are measure-then-pin** (the `clap_encode` bench, issue
+//! #30): the **audio** default is [`crate::ComputeUnits::All`] (no non-`All` unit
+//! is meaningfully faster — see [`audio::DEFAULT_AUDIO_COMPUTE`]); the **text**
+//! default is [`crate::ComputeUnits::CpuAndGpu`], ~43 % faster warm than `All`
+//! because the tiny text graph pays ANE-dispatch overhead on `All` (see
+//! [`text::DEFAULT_TEXT_COMPUTE`]). Both stay overridable per encoder via
+//! `with_compute` / `set_compute`; the full latency × placement table lives in
+//! `tests/clap/placement.rs` and is reproduced by the bench.
+//!
+//! # Performance: construct once, reuse, prewarm (measured, never marketed)
+//!
+//! The committed `clap_encode` bench (`benches/clap/encode.rs`) separates the four
+//! cost phases per tower × placement, model-gated. Regenerate with
+//! `CLAPKIT_TEST_MODELS=… cargo bench -p coremlit --features clap --bench clap_encode`
+//! (the numbers below are Apple M1 Max / macOS 26.5, fp16 — the bench is the
+//! reproducible source of truth, not this prose).
+//!
+//! **Construct each encoder once and reuse it.** An [`AudioEncoder`] /
+//! [`TextEncoder`] loads its CoreML model at construction and reuses that one
+//! resident [`crate::Model`] across every `embed*` call (`&self` inference, no
+//! per-call load). Reconstructing per request would re-pay the whole load below —
+//! don't.
+//!
+//! **Prewarm before the first user-facing request.** Construction pays the model
+//! *load* / device specialization, but the *first* `embed` still pays the
+//! prediction path's own graph specialization — measured at several × the warm
+//! latency (audio ~200 ms first vs ~48 ms warm; text ~120 ms first vs ~17 ms
+//! warm). [`AudioEncoder::prewarm`] / [`TextEncoder::prewarm`] run one throwaway
+//! inference to absorb that up front, so the first real request is warm. The
+//! recipe:
+//!
+//! ```no_run
+//! # use coremlit::embeddings::clap::{AudioEncoder, TextEncoder};
+//! # fn demo(audio_path: &str, text_path: &str) -> Result<(), coremlit::embeddings::clap::Error> {
+//! let audio = AudioEncoder::from_file(audio_path)?; // load (one-time)
+//! let text = TextEncoder::from_file(text_path)?;
+//! audio.prewarm()?; // absorb first-inference specialization before serving
+//! text.prewarm()?;
+//! // …reuse `audio` / `text` for every request from here on.
+//! # Ok(())
+//! # }
+//! ```
+//!
+//! **Cold vs cached load (the one-time specialization).** The first-ever load of
+//! these graphs on a given device pays a large **one-time** OS specialization cost
+//! (the #30 audit measured ~24.2 s audio / ~7.25 s text on `All`, vs sub-second
+//! for the ONNX reference). It is cached thereafter: on an already-specialized
+//! host every later process start is fast (measured cached loads: text ~0.3–0.7 s,
+//! audio ~0.05–0.16 s on `CpuOnly`/`CpuAndGpu`), and the specialization survives
+//! process restarts — clearing the ANE (`e5rt`) cache barely moved load time
+//! (audio-`All` 2.0 s → 2.3 s, text-`All` 0.28 s → 0.34 s), so the bulk of it is
+//! cached outside that ANE cache and persists. Net: budget the one-time
+//! specialization at install/first-run, and prewarm at process start so the
+//! steady-state cached-load + warm-inference path is what users actually hit.
+//! (The audio tower's ANE-naming placements re-attempt the failing HTSAT
+//! `ANECCompile` on *every* load — see [`audio::DEFAULT_AUDIO_COMPUTE`] — an
+//! `All`-only load cost, not a per-request one.)
+//!
+//! **int8 is a size tier, not a speed tier.** Its weight-only quantization keeps
+//! the fp16 activations, so it is not faster (the audit measured text ~21 %
+//! *slower*); use it to halve on-disk / weight memory, not to cut latency.
 //!
 //! # Long-audio pipeline
 //!
