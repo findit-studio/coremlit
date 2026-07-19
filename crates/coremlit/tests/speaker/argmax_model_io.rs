@@ -208,14 +208,29 @@ fn artifact_path(rel: &str) -> PathBuf {
   common::argmax_models_dir().join(rel)
 }
 
-/// Recursively collects every FILE under `dir` as a path relative to `root`,
-/// inserting each into `out` with `/` separators to match [`ARTIFACT_SHA256`]'s
-/// keys. Used to enumerate a `.mlmodelc` bundle's actual tree so it can be
-/// checked against the pinned key set (no unpinned extras, none missing).
+/// Recursively collects every real FILE under `dir` as a path relative to
+/// `root`, inserting each into `out` with `/` separators to match
+/// [`ARTIFACT_SHA256`]'s keys. Used to enumerate a `.mlmodelc` bundle's actual
+/// tree so it can be checked against the pinned key set (no unpinned extras,
+/// none missing).
+///
+/// OS-generated sidecars are skipped: AppleDouble `._*` files and `.DS_Store`.
+/// macOS materializes these inside bundles on non-native filesystems
+/// (exFAT/FAT/SMB); CoreML's loader never reads them, so excluding them from
+/// discovery cannot mask a functional artifact change — whereas NOT excluding
+/// them would false-fail the exact-set gate below as a phantom "unpinned
+/// extra" even though every pinned byte is untouched.
 fn collect_files_rel(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
   for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
   {
     let entry = entry.expect("read dir entry");
+    // Drop OS-generated sidecars (AppleDouble `._*`, `.DS_Store`) at every
+    // depth, before the file/dir split — see the doc comment above.
+    let name = entry.file_name();
+    let name = name.to_string_lossy();
+    if name.starts_with("._") || name == ".DS_Store" {
+      continue;
+    }
     let path = entry.path();
     if entry.file_type().expect("file type").is_dir() {
       collect_files_rel(root, &path, out);
@@ -229,6 +244,63 @@ fn collect_files_rel(root: &Path, dir: &Path, out: &mut BTreeSet<String>) {
       out.insert(rel);
     }
   }
+}
+
+/// Hermetic non-vacuity proof for [`collect_files_rel`]'s sidecar filter (no
+/// staged model needed). On exFAT/FAT/SMB volumes macOS materializes
+/// AppleDouble `._*` and `.DS_Store` sidecars inside `.mlmodelc` bundles;
+/// discovery must drop EXACTLY those, while every real file — crucially
+/// including an unpinned real extra — still reaches the exact-set gate in
+/// [`argmax_artifact_bytes_match_pinned_sha256`]. This proves the filter fixes
+/// the false-failure WITHOUT blanket-suppressing genuine extras.
+#[test]
+fn collect_files_rel_skips_sidecars_but_surfaces_real_extras() {
+  let tmp = tempfile::tempdir().expect("create temp dir");
+  let root = tmp.path();
+  let bundle = root.join("Model.mlmodelc");
+  std::fs::create_dir_all(bundle.join("weights")).expect("mkdir bundle weights/");
+
+  // Two real, pinned-style artifacts (one nested).
+  std::fs::write(bundle.join("model.mil"), b"mil").expect("write model.mil");
+  std::fs::write(bundle.join("weights/weight.bin"), b"w").expect("write weight.bin");
+  // OS-generated sidecars at two depths — every one must be skipped.
+  std::fs::write(bundle.join("._model.mil"), b"ad").expect("write ._model.mil");
+  std::fs::write(bundle.join(".DS_Store"), b"ds").expect("write .DS_Store");
+  std::fs::write(bundle.join("weights/._weight.bin"), b"ad").expect("write nested ._");
+  // A real, ordinary-named file that is NOT a sidecar and NOT pinned.
+  std::fs::write(bundle.join("rogue.bin"), b"x").expect("write rogue.bin");
+
+  let mut discovered: BTreeSet<String> = BTreeSet::new();
+  collect_files_rel(root, &bundle, &mut discovered);
+
+  // Discovery keeps every real file and drops every sidecar (at both depths).
+  assert_eq!(
+    discovered,
+    BTreeSet::from([
+      "Model.mlmodelc/model.mil".to_string(),
+      "Model.mlmodelc/rogue.bin".to_string(),
+      "Model.mlmodelc/weights/weight.bin".to_string(),
+    ]),
+    "discovery must exclude `._*`/.DS_Store sidecars and keep every real file"
+  );
+
+  // The filter did NOT blanket-suppress extras: an ordinary unpinned file still
+  // breaks the exact-set equality and shows up as the sole difference against a
+  // pin listing only the two real artifacts.
+  let pinned: BTreeSet<String> = BTreeSet::from([
+    "Model.mlmodelc/model.mil".to_string(),
+    "Model.mlmodelc/weights/weight.bin".to_string(),
+  ]);
+  assert_ne!(
+    discovered, pinned,
+    "a real unpinned extra must still break the exact-set equality"
+  );
+  let extras: Vec<String> = discovered.difference(&pinned).cloned().collect();
+  assert_eq!(
+    extras,
+    vec!["Model.mlmodelc/rogue.bin".to_string()],
+    "the surviving extra must be exactly the real unpinned file, not a sidecar"
+  );
 }
 
 #[test]

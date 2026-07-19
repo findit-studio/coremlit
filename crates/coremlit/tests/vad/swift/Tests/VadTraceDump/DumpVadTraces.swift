@@ -38,6 +38,18 @@ import XCTest
 
 // MARK: - Golden schema (mirrored by `parity_swift.rs`)
 
+/// The host-class the golden was generated on — the four sysctl-derived fields
+/// `coremlit`'s `HostClass` compares to gate the tight parity bound. CoreML
+/// `CpuOnly` floats are not contracted portable across macOS builds or chips
+/// (#36), so a golden is trustworthy as a bit-exact oracle only on a matching
+/// host. Mirrored by `parity_swift.rs`.
+private struct GoldenHost: Encodable {
+  let osBuild: String
+  let osProductVersion: String
+  let chip: String
+  let arch: String
+}
+
 /// One 256 ms chunk: its index, the unpadded sample count fed for it (the
 /// final chunk is shorter and repeat-last-padded inside `VadManager`), and the
 /// speech probability `VadManager` produced.
@@ -51,6 +63,10 @@ private struct Golden: Encodable {
   let fixture: String
   let generator: String
   let fluidAudioRevision: String
+  /// The host-class this golden was generated on. `parity_swift.rs`'s
+  /// host-aware gate enforces the tight bound only when the running host
+  /// matches this, and points a mismatch at regeneration.
+  let generationHost: GoldenHost
   /// Placement of the VAD model, as `coremlit::ComputeUnits` spells it. The
   /// Rust gate asserts its own placement matches.
   let computeUnits: String
@@ -108,6 +124,17 @@ final class DumpVadTraces: XCTestCase {
       return VadManager(config: VadConfig(computeUnits: .cpuOnly), vadModel: model)
     }
 
+    // The host-class every golden in this run is stamped with. Read ONCE via
+    // the identical sysctl keys `parity_swift.rs` reads, so string equality is
+    // well-defined by construction; a read failure hard-fails the dump rather
+    // than stamping a fake host.
+    let generationHost = GoldenHost(
+      osBuild: try sysctlString("kern.osversion"),
+      osProductVersion: try sysctlString("kern.osproductversion"),
+      chip: try sysctlString("machdep.cpu.brand_string"),
+      arch: processArch
+    )
+
     for (index, fixture) in fixtures.enumerated() {
       let samples = try readPcm16Mono16k(URL(fileURLWithPath: fixture.path))
       XCTAssertFalse(samples.isEmpty, "\(fixture.name): decoded zero samples")
@@ -148,6 +175,7 @@ final class DumpVadTraces: XCTestCase {
         fixture: fixture.name,
         generator: "crates/coremlit/tests/vad/swift/Tests/VadTraceDump/DumpVadTraces.swift",
         fluidAudioRevision: revision,
+        generationHost: generationHost,
         computeUnits: "cpu_only",
         sampleRate: VadManager.sampleRate,
         chunkSize: chunkSize,
@@ -165,9 +193,49 @@ final class DumpVadTraces: XCTestCase {
       encoder.outputFormatting = [.sortedKeys]
       let path = outDir.appendingPathComponent("\(fixture.name).json")
       try encoder.encode(golden).write(to: path)
-      print("[dump] \(fixture.name): \(samples.count) samples, \(results.count) chunks -> \(path.path)")
+      print(
+        "[dump] \(fixture.name): \(samples.count) samples, \(results.count) chunks, "
+          + "host \(generationHost.osProductVersion)/\(generationHost.osBuild)/"
+          + "\(generationHost.chip)/\(generationHost.arch) -> \(path.path)")
     }
   }
+}
+
+// MARK: - Host
+
+/// Reads a sysctl string by name using the two-call protocol (size query, then
+/// read), NUL-terminated by `String(cString:)` and whitespace-trimmed. The Rust
+/// gate reads the IDENTICAL keys via `/usr/sbin/sysctl -n`, so the recorded
+/// strings compare by construction — do NOT substitute
+/// `ProcessInfo.operatingSystemVersion` (it formats "15.5.0" where
+/// `kern.osproductversion` is "15.5"). Throws rather than stamping a fake host.
+private func sysctlString(_ name: String) throws -> String {
+  var size = 0
+  guard sysctlbyname(name, nil, &size, nil, 0) == 0, size > 0 else {
+    throw DumpError.badEnvironment("sysctl \(name): size query failed")
+  }
+  var buffer = [CChar](repeating: 0, count: size)
+  guard sysctlbyname(name, &buffer, &size, nil, 0) == 0 else {
+    throw DumpError.badEnvironment("sysctl \(name): read failed")
+  }
+  let value = String(cString: buffer).trimmingCharacters(in: .whitespacesAndNewlines)
+  guard !value.isEmpty else {
+    throw DumpError.badEnvironment("sysctl \(name): empty value")
+  }
+  return value
+}
+
+/// The process architecture governing which CPU kernels run in-process, spelled
+/// as `coremlit`'s `HostClass` normalizes it (`arm64`/`x86_64`). Compile-time
+/// arch IS the process arch.
+private var processArch: String {
+  #if arch(arm64)
+    return "arm64"
+  #elseif arch(x86_64)
+    return "x86_64"
+  #else
+    #error("unsupported host architecture for golden generation")
+  #endif
 }
 
 // MARK: - Audio

@@ -133,6 +133,47 @@ pub fn sha256_hex(path: &Path) -> String {
     .collect()
 }
 
+/// Recursively collects the forward-slash relative path of every FILE under
+/// `dir` (nested dirs such as `analytics/` and `weights/` are walked; only the
+/// files they contain become entries) into `out`. Pure path enumeration — no
+/// hashing — so it is hermetically testable without real model bytes; see
+/// `collect_files_rel_skips_sidecars_but_surfaces_real_extras` in
+/// `tests/clap/model_io.rs`. [`assert_exact_sha_manifest`] is the sole
+/// production caller.
+///
+/// OS-generated sidecars are skipped: AppleDouble `._*` files and `.DS_Store`.
+/// macOS materializes these inside bundles on non-native filesystems
+/// (exFAT/FAT/SMB); CoreML's loader never reads them, so excluding them from
+/// discovery cannot mask a functional artifact change — whereas NOT excluding
+/// them would false-fail [`assert_exact_sha_manifest`]'s exact-set gate as a
+/// phantom "unpinned extra" even though every pinned byte is untouched.
+#[allow(dead_code)]
+pub fn collect_files_rel(dir: &Path, prefix: &str, out: &mut Vec<String>) {
+  let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {dir:?}: {e}"));
+  for entry in entries {
+    let entry = entry.unwrap_or_else(|e| panic!("dir entry under {dir:?}: {e}"));
+    let name = entry.file_name().to_string_lossy().into_owned();
+    // Drop OS-generated sidecars (AppleDouble `._*`, `.DS_Store`) at every
+    // depth, before the file/dir split — see the doc comment above.
+    if name.starts_with("._") || name == ".DS_Store" {
+      continue;
+    }
+    let rel = if prefix.is_empty() {
+      name
+    } else {
+      format!("{prefix}/{name}")
+    };
+    let file_type = entry
+      .file_type()
+      .unwrap_or_else(|e| panic!("file_type {:?}: {e}", entry.path()));
+    if file_type.is_dir() {
+      collect_files_rel(&entry.path(), &rel, out);
+    } else {
+      out.push(rel);
+    }
+  }
+}
+
 /// Assert that the compiled-model bundle at `dir` matches an EXACT pinned
 /// manifest. `cases` is the pinned `(relative_path, sha256)` list.
 ///
@@ -149,32 +190,8 @@ pub fn sha256_hex(path: &Path) -> String {
 pub fn assert_exact_sha_manifest(dir: &Path, cases: &[(&str, &str)]) {
   use std::collections::BTreeSet;
 
-  // Recursively collect the forward-slash relative path of every FILE under
-  // `dir` (nested dirs such as `analytics/` and `weights/` are walked; only the
-  // files they contain become entries).
-  fn collect_files(dir: &Path, prefix: &str, out: &mut Vec<String>) {
-    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {dir:?}: {e}"));
-    for entry in entries {
-      let entry = entry.unwrap_or_else(|e| panic!("dir entry under {dir:?}: {e}"));
-      let name = entry.file_name().to_string_lossy().into_owned();
-      let rel = if prefix.is_empty() {
-        name
-      } else {
-        format!("{prefix}/{name}")
-      };
-      let file_type = entry
-        .file_type()
-        .unwrap_or_else(|e| panic!("file_type {:?}: {e}", entry.path()));
-      if file_type.is_dir() {
-        collect_files(&entry.path(), &rel, out);
-      } else {
-        out.push(rel);
-      }
-    }
-  }
-
   let mut found = Vec::new();
-  collect_files(dir, "", &mut found);
+  collect_files_rel(dir, "", &mut found);
   let on_disk: BTreeSet<String> = found.into_iter().collect();
   let pinned: BTreeSet<String> = cases.iter().map(|(rel, _)| (*rel).to_owned()).collect();
 

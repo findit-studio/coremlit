@@ -134,16 +134,30 @@ pub fn cosine_checked(a: &[f32], b: &[f32]) -> f32 {
   (dot / (na.sqrt() * nb.sqrt())) as f32
 }
 
-/// Recursively collects every FILE under `dir` as a path relative to `root`,
-/// with `/` separators, into `out`. Used to enumerate a `.mlmodelc` bundle's
-/// actual tree so it can be set-compared against a pinned key manifest (no
-/// unpinned extras, none missing) BEFORE hashing — the #30 exact-enumerate
+/// Recursively collects every real FILE under `dir` as a path relative to
+/// `root`, with `/` separators, into `out`. Used to enumerate a `.mlmodelc`
+/// bundle's actual tree so it can be set-compared against a pinned key manifest
+/// (no unpinned extras, none missing) BEFORE hashing — the #30 exact-enumerate
 /// pattern.
+///
+/// OS-generated sidecars are skipped: AppleDouble `._*` files and `.DS_Store`.
+/// macOS materializes these inside bundles on non-native filesystems
+/// (exFAT/FAT/SMB); CoreML's loader never reads them, so excluding them from
+/// discovery cannot mask a functional artifact change — whereas NOT excluding
+/// them would false-fail the exact-set gate as a phantom "unpinned extra" even
+/// though every pinned byte is untouched.
 #[allow(dead_code)]
 pub fn collect_files_rel(root: &Path, dir: &Path, out: &mut std::collections::BTreeSet<String>) {
   for entry in std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()))
   {
     let entry = entry.expect("read dir entry");
+    // Drop OS-generated sidecars (AppleDouble `._*`, `.DS_Store`) at every
+    // depth, before the file/dir split — see the doc comment above.
+    let name = entry.file_name();
+    let name = name.to_string_lossy();
+    if name.starts_with("._") || name == ".DS_Store" {
+      continue;
+    }
     let path = entry.path();
     if entry.file_type().expect("file type").is_dir() {
       collect_files_rel(root, &path, out);

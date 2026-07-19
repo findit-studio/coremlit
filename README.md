@@ -126,7 +126,7 @@ hf download openai/whisper-tiny tokenizer.json tokenizer_config.json config.json
   --local-dir Models/tokenizers/whisper-tiny
 ```
 
-Each pipeline resolves its models root from its own env var (`WHISPERKIT_TEST_MODELS`, `ALIGNKIT_TEST_MODELS`, `SPEAKERKIT_TEST_MODELS`/`ARGMAX_TEST_MODELS`, `VADKIT_TEST_MODELS`), defaulting to `<repo>/Models/...` (gitignored). See each module's `tests/<kit>/model_io.rs` for the pinned repo id, revision, and per-file SHA-256, and the module docs for fetch commands.
+Each pipeline resolves its models root from its own env var (`WHISPERKIT_TEST_MODELS`, `ALIGNKIT_TEST_MODELS`, `SPEAKERKIT_TEST_MODELS`/`ARGMAX_TEST_MODELS`, `VADKIT_TEST_MODELS`), defaulting to `<repo>/Models/...` (gitignored). See each module's `tests/<kit>/model_io.rs` for the pinned repo id, revision, and per-file SHA-256, and the module docs for fetch commands. The model-gated suites load multi-hundred-MB CoreML models per test and libtest runs tests in one binary concurrently by default; on memory-constrained hosts (< 16 GB) append `--test-threads=1` after `--ignored` to run them serially.
 
 ## Examples & benches
 

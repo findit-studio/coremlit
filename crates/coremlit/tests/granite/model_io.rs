@@ -139,3 +139,59 @@ fn granite_artifact_bytes_match_pinned_sha256() {
     );
   }
 }
+
+/// Hermetic non-vacuity proof for [`common::collect_files_rel`]'s sidecar
+/// filter (no staged model needed). On exFAT/FAT/SMB volumes macOS
+/// materializes AppleDouble `._*` and `.DS_Store` sidecars inside `.mlmodelc`
+/// bundles; discovery must drop EXACTLY those, while every real file —
+/// crucially including an unpinned real extra — still reaches the exact-set
+/// gate in [`granite_artifact_bytes_match_pinned_sha256`]. This proves the
+/// filter fixes the false-failure WITHOUT blanket-suppressing genuine extras.
+#[test]
+fn collect_files_rel_skips_sidecars_but_surfaces_real_extras() {
+  let tmp = tempfile::tempdir().expect("create temp dir");
+  let bundle = tmp.path().join("granite_97m_512.mlmodelc");
+  std::fs::create_dir_all(bundle.join("weights")).expect("mkdir bundle weights/");
+
+  // Two real, pinned-style artifacts (one nested).
+  std::fs::write(bundle.join("model.mil"), b"mil").expect("write model.mil");
+  std::fs::write(bundle.join("weights/weight.bin"), b"w").expect("write weight.bin");
+  // OS-generated sidecars at two depths — every one must be skipped.
+  std::fs::write(bundle.join("._model.mil"), b"ad").expect("write ._model.mil");
+  std::fs::write(bundle.join(".DS_Store"), b"ds").expect("write .DS_Store");
+  std::fs::write(bundle.join("weights/._weight.bin"), b"ad").expect("write nested ._");
+  // A real, ordinary-named file that is NOT a sidecar and NOT pinned.
+  std::fs::write(bundle.join("rogue.bin"), b"x").expect("write rogue.bin");
+
+  // Enumerate relative to the bundle root, exactly as
+  // `granite_artifact_bytes_match_pinned_sha256` does (`root == bundle`).
+  let mut discovered: BTreeSet<String> = BTreeSet::new();
+  common::collect_files_rel(&bundle, &bundle, &mut discovered);
+
+  // Discovery keeps every real file and drops every sidecar (at both depths).
+  assert_eq!(
+    discovered,
+    BTreeSet::from([
+      "model.mil".to_string(),
+      "rogue.bin".to_string(),
+      "weights/weight.bin".to_string(),
+    ]),
+    "discovery must exclude `._*`/.DS_Store sidecars and keep every real file"
+  );
+
+  // The filter did NOT blanket-suppress extras: an ordinary unpinned file still
+  // breaks the exact-set equality and shows up as the sole difference against a
+  // pin listing only the two real artifacts.
+  let pinned: BTreeSet<String> =
+    BTreeSet::from(["model.mil".to_string(), "weights/weight.bin".to_string()]);
+  assert_ne!(
+    discovered, pinned,
+    "a real unpinned extra must still break the exact-set equality"
+  );
+  let extras: Vec<String> = discovered.difference(&pinned).cloned().collect();
+  assert_eq!(
+    extras,
+    vec!["rogue.bin".to_string()],
+    "the surviving extra must be exactly the real unpinned file, not a sidecar"
+  );
+}
