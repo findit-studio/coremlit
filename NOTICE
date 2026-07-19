@@ -4,17 +4,20 @@ Copyright the coremlit authors
 The coremlit Rust source is dual-licensed under MIT OR Apache-2.0 (caller's
 choice). See LICENSE-MIT and LICENSE-APACHE for those terms.
 
-NOTE: coremlit ships NO model files. Each feature-gated audio pipeline
-(audio::whisper / audio::align / audio::speaker / audio::vad) LOADS, at
-runtime, CoreML model artifacts that a downstream user fetches separately from
-Hugging Face (see the crate README and each module's tests/<kit>/model_io.rs
-for the repo id, revision, and per-file SHA-256). This NOTICE records the
-attribution a binary that distributes or bundles those models must honor.
+NOTE: coremlit ships NO model weight files, but embeddings::clap BUNDLES one
+third-party artifact (the Xenova tokenizer, via include_bytes! — section 6b).
+Each feature-gated pipeline (audio::whisper / audio::align / audio::speaker /
+audio::vad / embeddings::clap) otherwise LOADS, at runtime, CoreML model
+artifacts that a downstream user fetches separately from Hugging Face (see the
+crate README and each module's model_io tests for the repo id, revision, and
+per-file SHA-256). This NOTICE records the attribution a binary that
+distributes or bundles those components must honor.
 
 Sections 1-2 (the audio::vad models) are preserved verbatim from the former
 vadkit NOTICE. Sections 3-5 record the whisper, speaker, and align model
-attributions folded in by the mono-crate restructure. Both audio::vad
-components below are MIT.
+attributions folded in by the mono-crate restructure. Section 6 records the
+CLAP audio+text encoder weights and the bundled Xenova tokenizer, folded in by
+the clapkit port. Both audio::vad components below are MIT.
 
 ────────────────────────────────────────────────────────────────────────
 1. Silero VAD (upstream model)
@@ -134,3 +137,51 @@ audio::align pairs a CoreML wav2vec2 CTC acoustic encoder
 (chordai/wav2vec2-base960h-aligner-coreml, Apache-2.0) with asry's
 parity-tested alignment seam. Preserve the chordai Apache-2.0 notice when
 redistributing the encoder weights.
+
+────────────────────────────────────────────────────────────────────────
+6. CLAP audio + text encoders and bundled tokenizer (embeddings::clap)
+
+embeddings::clap runs CoreML conversions of LAION's `clap-htsat-unfused` audio
+and text encoders, and BUNDLES the Xenova CLAP tokenizer into the compiled crate
+via `include_bytes!` (exposed as `coremlit::embeddings::clap::BUNDLED_TOKENIZER`).
+
+  6a) Encoder weights — LAION CLAP (clap-htsat-unfused). The crate ships NO model
+      files; it loads FinDIT-Studio's CoreML conversion, a derivative work of the
+      LAION weights.
+
+        Original model: laion/clap-htsat-unfused
+        https://huggingface.co/laion/clap-htsat-unfused
+        Snapshot revision: 8fa0f1c6d0433df6e97c127f64b2a1d6c0dcda8a
+        License: CC-BY-4.0 — REQUIRES attribution when redistributing the weights
+        (or a binary bundling them).
+        Attribution: LAION (Large-scale Artificial Intelligence Open Network) —
+        CLAP (Contrastive Language-Audio Pretraining), "Large-scale Contrastive
+        Language-Audio Pretraining with Feature Fusion and Keyword-to-Caption
+        Augmentation" (Wu et al., ICASSP 2023).
+
+        CoreML conversion actually loaded: FinDIT-Studio/clapkit-coreml
+        https://huggingface.co/FinDIT-Studio/clapkit-coreml
+        fp16 revision 97d631f3814e1e46b798a8e88c9aa2e2202fdf67; int8 revision
+        02a99c6a. Per-file SHA-256 pinned in tests/clap/model_io.rs and
+        tests/clap/text_model_io.rs.
+
+      License note. Attribution to `laion/clap-htsat-unfused` is provided as
+      required. textclap's models/MODELS.md treats the LAION CLAP checkpoints as
+      CC-BY-4.0; the current upstream Hugging Face card declares apache-2.0. Both
+      require attribution, which this record provides; a downstream redistributor
+      should honor whichever the upstream author intends.
+
+  6b) Bundled tokenizer — Xenova clap-htsat-unfused (via include_bytes!).
+      Compiled into the crate, so any binary linking coremlit with the `clap`
+      feature redistributes it.
+
+        Source: https://huggingface.co/Xenova/clap-htsat-unfused
+        Revision (commit SHA): c28f2883575e590e04d3146ff0713c2448d691ba
+        Artifact: tokenizer.json
+        SHA-256: dc239041d98de27ffc3975473a1a23e3db4c937b23c138c38bbc66588bd247e5
+
+      The artifact is the CLAP tokenizer configuration and vocabulary/merges —
+      the RoBERTa (roberta-base, MIT lineage) tokenizer as packaged for the
+      transformers.js / ONNX export; it carries no model weights. A redistributor
+      should honor the upstream Xenova export's terms and the RoBERTa tokenizer's
+      MIT license for the configuration.

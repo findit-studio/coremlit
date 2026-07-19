@@ -71,6 +71,8 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
     ),
     ("vad", vec!["dep:silero"]),
     ("vad-bundled", vec!["vad", "silero/bundled"]),
+    ("clap", vec!["dep:rustfft", "dep:tokenizers"]),
+    ("clap-oracle", vec!["clap", "dep:textclap"]),
   ]
 }
 
@@ -81,6 +83,7 @@ const BARE_CRATE_MAP: &[(&str, &str)] = &[
   ("alignkit", "align"),
   ("speakerkit", "speaker"),
   ("vadkit", "vad"),
+  ("clapkit", "clap"),
 ];
 
 /// The curated CI feature combos the mono-crate restructure committed to — the
@@ -100,6 +103,8 @@ const INTENDED_CI_COMBOS: &[&str] = &[
   "align-oracle",
   "speaker-oracle",
   "vad-bundled",
+  "clap",
+  "clap-oracle",
   "whisper,align,speaker,vad,serde,tracing,nl-recognizer",
   "whisper,align-oracle,speaker-oracle,vad-bundled,serde,tracing,nl-recognizer",
 ];
@@ -396,6 +401,8 @@ const DOCTORED_MATRIX: &str = r#"
           - "align-oracle"
           - "speaker-oracle"
           - "vad-bundled"
+          - "clap"
+          - "clap-oracle"
           - "whisper,align,speaker,vad,serde,tracing,nl-recognizer"
           - "whisper,align-oracle,speaker-oracle,vad-bundled,serde,tracing,nl-recognizer"
     steps:

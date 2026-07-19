@@ -65,6 +65,18 @@ vad = ["dep:silero"]
 # cross-backend characterization oracle. DEV/TEST only — pulls ort.
 vad-bundled = ["vad", "silero/bundled"]
 
+# --- embeddings::clap (former crate `clapkit`) ---
+# CLAP-HTSAT dual-tower audio+text encoders on CoreML: a Rust mel/STFT front-end
+# (`rustfft`) around two fp16 graphs, plus the pinned Xenova tokenizer
+# (`tokenizers`, shared with `whisper`). NO ort in this path; `default = []`
+# pulls none of it.
+clap = ["dep:rustfft", "dep:tokenizers"]
+# Former clapkit `parity-oracle`: the textclap model-level parity oracle (its
+# Xenova ONNX via `ort`) for the characterized parity gates. DEV/TEST only —
+# adds nothing to the library. clapkit links only textclap's BUNDLED_TOKENIZER
+# const, so the gate needs no libonnxruntime at run time.
+clap-oracle = ["clap", "dep:textclap"]
+
 [dependencies]
 # --- core CoreML runtime (always compiled) ---
 objc2.workspace = true
@@ -133,6 +145,29 @@ dia = { package = "diarization", git = "https://github.com/findit-studio/diariza
 # logic-only posture).
 silero = { git = "https://github.com/Findit-AI/silero", rev = "a55ef2b2922ec14250e6a5b3a4b30596f018454c", default-features = false, optional = true }
 
+# --- embeddings::clap optionals (the `clap` feature) ---
+# f64 forward FFT for the Slaney-mel front-end — the same crate + major version
+# textclap's `mel.rs` uses, so the ported numerics match on the scalar path
+# (see `src/embeddings/clap/audio/mel/mod.rs`). clap-only; the pinned Xenova
+# `tokenizers` load is shared with `whisper` (declared above, rides `clap` too).
+rustfft = { workspace = true, optional = true }
+
+# --- embeddings::clap oracle git dep (the `clap-oracle` feature) ---
+# The textclap oracle: rev-pinned to a PUBLIC git source (crates.io forbids git
+# sources, and textclap is unpublished), OPTIONAL and only COMPILED/linked under
+# `clap-oracle`. An ordinary default build never links it — so clap's default
+# path pulls in no `ort` — but Cargo's resolver still RESOLVES it (optional deps
+# are always part of whole-graph resolution), so a fresh default invocation
+# fetches this git source and pins it in `Cargo.lock`. clapkit calls only
+# textclap's `BUNDLED_TOKENIZER` const (no `ort` runtime), so the gate needs no
+# `libonnxruntime` at run time. CO-DEV: patch at the WORKSPACE ROOT (never
+# commit it):
+#
+#   [patch."https://github.com/Findit-AI/textclap"]
+#   textclap = { path = "../textclap" }
+#
+textclap = { git = "https://github.com/Findit-AI/textclap", rev = "584f21754337a0f6cc7575fa83e9e49a38e99ee9", optional = true }
+
 [dev-dependencies]
 # Integration tests / benches / examples are external consumers: they link the
 # crate + these dev-deps, never the lib's own `[dependencies]`. `half` (the
@@ -147,6 +182,10 @@ serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 tokenizers.workspace = true
+# The mel-parity unit tests (`src/embeddings/clap/audio/mel/tests.rs`, feature
+# `clap`) read committed librosa `.npy` mel oracles via `npyz` (former clapkit
+# dev-dep).
+npyz.workspace = true
 # `tests/align/parity_words.rs` names `asry::Aligner` (the ONNX oracle) and
 # `asry::ort::api()` directly, so asry must appear as a dev-dep too. Cargo
 # unions its features with the optional runtime entry above; `align-oracle`
@@ -363,6 +402,48 @@ required-features = ["vad"]
 name = "vad_cross_backend"
 path = "tests/vad/cross_backend.rs"
 required-features = ["vad-bundled"]
+
+# --- embeddings::clap ---
+# The whole `embeddings::clap` module is feature-gated, so its tests compile
+# only under `clap`; the model-gated ones keep their `#[ignore]` + Models/
+# layout.
+[[test]]
+name = "clap_e2e"
+path = "tests/clap/e2e.rs"
+required-features = ["clap"]
+
+[[test]]
+name = "clap_model_io"
+path = "tests/clap/model_io.rs"
+required-features = ["clap"]
+
+[[test]]
+name = "clap_text_model_io"
+path = "tests/clap/text_model_io.rs"
+required-features = ["clap"]
+
+[[test]]
+name = "clap_placement"
+path = "tests/clap/placement.rs"
+required-features = ["clap"]
+
+[[test]]
+name = "clap_tokenizer_identity"
+path = "tests/clap/tokenizer_identity.rs"
+required-features = ["clap"]
+
+# The textclap parity oracles (former clapkit `parity-oracle`, now `clap-oracle`)
+# link the sibling textclap crate (pulls ort) for the model-level parity gate
+# and the live tokenizer cross-check.
+[[test]]
+name = "clap_parity_textclap"
+path = "tests/clap/parity_textclap.rs"
+required-features = ["clap-oracle"]
+
+[[test]]
+name = "clap_tokenizer_identity_textclap"
+path = "tests/clap/tokenizer_identity_textclap.rs"
+required-features = ["clap-oracle"]
 
 [lints]
 workspace = true

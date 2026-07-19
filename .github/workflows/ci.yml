@@ -44,6 +44,8 @@ jobs:
           - "align-oracle"
           - "speaker-oracle"
           - "vad-bundled"
+          - "clap"                                                          # CLAP encoders alone (Rust mel + tokenizers, no ort)
+          - "clap-oracle"                                                   # + textclap model-level parity oracle (ort)
           - "whisper,align,speaker,vad,serde,tracing,nl-recognizer"         # all non-oracle
           - "whisper,align-oracle,speaker-oracle,vad-bundled,serde,tracing,nl-recognizer"  # all-on
     steps:
