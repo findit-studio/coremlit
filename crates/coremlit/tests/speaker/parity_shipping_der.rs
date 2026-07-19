@@ -378,18 +378,48 @@ fn dia_wespeaker_onnx() -> std::path::PathBuf {
 // Pipeline runners
 // ══════════════════════════════════════════════════════════════════════
 
-/// The shared community-1 PLDA both the speakerkit path and dia's own pipeline
-/// consume — one instance, so the clustering runs cannot diverge on the
-/// projection. NB it takes NO data: a frozen, pretrained LDA+PLDA (see the
-/// module doc's rotation-invariance note).
+/// dia's in-crate community-1 PLDA — the REFERENCE (dia-ort) side's projection.
+/// Its measured-side twin is [`load_plda_diaric`]; both `include_bytes!` the
+/// same community-1 blobs, and the `plda_cross_crate_equivalence` gate asserts
+/// their transforms are bit-identical, so the two crate-typed instances cannot
+/// diverge on the projection. NB `new()` takes NO data: a frozen, pretrained
+/// LDA+PLDA (see the module doc's rotation-invariance note).
 fn load_plda() -> dia::plda::PldaTransform {
   dia::plda::PldaTransform::new().expect("load community-1 PldaTransform")
 }
 
-/// dia `OfflineOutput` RTTM spans → [`Seg`]s.
-fn output_segs(out: &dia::offline::OfflineOutput) -> Vec<Seg> {
+/// diaric's in-crate community-1 PLDA — the MEASURED (speakerkit) side's
+/// projection, the one `Extraction::diarize` consumes. Bit-identical to
+/// [`load_plda`]'s dia instance (asserted by `plda_cross_crate_equivalence`),
+/// so measuring through diaric while the oracle runs through dia does not move
+/// the projection.
+fn load_plda_diaric() -> diaric::plda::PldaTransform {
+  diaric::plda::PldaTransform::new().expect("load community-1 PldaTransform (diaric)")
+}
+
+/// Boundary adapter: diaric's `OfflineOutput` (the MEASURED clustering result)
+/// → dia's `RttmSpan`s (the REFERENCE output type), so both sides funnel their
+/// spans through the one dia-typed [`output_segs`] for the DER comparison.
+///
+/// Total at the span level: every diaric span's full public state
+/// (`cluster`/`start`/`duration`) is mapped through dia's positional
+/// `RttmSpan::new`, which fails to compile if that constructor's shape changes.
+/// A whole-`OfflineOutput` → `OfflineOutput` map is impossible — dia's
+/// `SpillBytes::from_vec` is `pub(crate)`, so `dia::offline::OfflineOutput`
+/// cannot be constructed outside `dia` — and the DER comparison consumes only
+/// spans, so the span vector is the complete DER-relevant output.
+fn to_dia_spans(out: &diaric::offline::OfflineOutput) -> Vec<dia::reconstruct::RttmSpan> {
   out
     .spans_slice()
+    .iter()
+    .map(|s| dia::reconstruct::RttmSpan::new(s.cluster(), s.start(), s.duration()))
+    .collect()
+}
+
+/// dia `RttmSpan`s → [`Seg`]s — the single DER span-extractor both the reference
+/// (dia-ort) and the measured (speakerkit, via [`to_dia_spans`]) sides share.
+fn output_segs(spans: &[dia::reconstruct::RttmSpan]) -> Vec<Seg> {
+  spans
     .iter()
     .map(|s| Seg {
       start: s.start(),
@@ -429,7 +459,7 @@ fn dia_ort_run(samples: &[f32], plda: &dia::plda::PldaTransform) -> DiaOrtRun {
     .checked_div(num_clusters)
     .unwrap_or(0);
   DiaOrtRun {
-    segs: output_segs(&out),
+    segs: output_segs(out.spans_slice()),
     num_chunks,
     num_output_frames,
   }
@@ -450,25 +480,29 @@ fn fluidaudio_extraction(samples: &[f32], embed_path: &Path, cu: ComputeUnits) -
     .expect("FluidAudioSource::extract")
 }
 
-/// Run `diarize_offline` on an `Extraction` + the shared PLDA → its spans.
+/// Run the public `Extraction::diarize` clustering path on an `Extraction` +
+/// the measured-side (diaric) PLDA → its spans (one code path with the runtime
+/// API), converting diaric's output to dia spans at the boundary via
+/// [`to_dia_spans`].
 ///
-/// Returns dia's TYPED error rather than unwrapping or stringifying it: dia's
-/// clustering can REFUSE to produce an answer (e.g.
+/// Returns diaric's TYPED error rather than unwrapping or stringifying it:
+/// diaric's clustering can REFUSE to produce an answer (e.g.
 /// `Pipeline(Centroid(AmbiguousAliveCluster { .. }))`, its deliberate bail-out
 /// when a cluster's alive-value lands in the SIMD guard band around the
 /// threshold). Whether a given arm hits that is itself a first-class
 /// measurement — if the shipping int8 arm errors where the fp32 control
 /// succeeds, the shipping default cannot diarize that audio AT ALL, which is a
 /// far worse defect than any DER. Unwrapping would report it as an opaque
-/// harness panic; and keeping the TYPED [`dia::offline::Error`] (not a
+/// harness panic; and keeping the TYPED [`diaric::offline::Error`] (not a
 /// `String`) is what lets [`assert_clip09_known_defect`] match the exact
 /// `AmbiguousAliveCluster` variant, not merely assert `is_err`.
 fn diarize_extraction_segs(
   ext: &Extraction,
-  plda: &dia::plda::PldaTransform,
-) -> Result<Vec<Seg>, dia::offline::Error> {
-  let input = ext.into_offline_input(plda);
-  dia::offline::diarize_offline(&input).map(|out| output_segs(&out))
+  plda: &diaric::plda::PldaTransform,
+) -> Result<Vec<Seg>, diaric::offline::Error> {
+  ext
+    .diarize(plda)
+    .map(|out| output_segs(&to_dia_spans(&out)))
 }
 
 /// One measured speakerkit arm. `segs` is `Err` when dia's clustering refused
@@ -476,7 +510,7 @@ fn diarize_extraction_segs(
 /// [`diarize_extraction_segs`]).
 struct Arm {
   tag: &'static str,
-  segs: Result<Vec<Seg>, dia::offline::Error>,
+  segs: Result<Vec<Seg>, diaric::offline::Error>,
   spk: Option<usize>,
   extract_s: f64,
 }
@@ -508,14 +542,14 @@ impl Arm {
 }
 
 /// Everything an arm must hold CONSTANT: the one audio buffer, its
-/// fingerprint, the one PLDA, the oracle's grid geometry, and the clip name.
-/// Bundled so the only things an arm varies are the embedder artifact and the
-/// compute placement — which is exactly the experiment.
+/// fingerprint, the measured-side (diaric) PLDA, the oracle's grid geometry,
+/// and the clip name. Bundled so the only things an arm varies are the embedder
+/// artifact and the compute placement — which is exactly the experiment.
 struct ClipCtx<'a> {
   clip: &'a str,
   samples: &'a [f32],
   audio_fnv: u64,
-  plda: &'a dia::plda::PldaTransform,
+  plda: &'a diaric::plda::PldaTransform,
   dia: &'a DiaOrtRun,
 }
 
@@ -622,7 +656,11 @@ fn measure(clip: &MultiSpkClip) -> Measurement {
     common::models_dir().display()
   );
 
+  // dia's PLDA drives the dia-ort oracle; diaric's drives the measured
+  // speakerkit arms. The two are bit-identical (asserted by
+  // `plda_cross_crate_equivalence`), so the split does not move the projection.
   let plda = load_plda();
+  let plda_dc = load_plda_diaric();
 
   // ── ONE audio buffer. Every arm gets this exact slice; its fingerprint is
   // re-asserted after each arm.
@@ -681,13 +719,14 @@ fn measure(clip: &MultiSpkClip) -> Measurement {
   );
   let dia_spk = distinct_speakers(&dia.segs).len();
 
-  // ── The three speakerkit arms, all on the SAME buffer, the SAME PLDA and
-  // the SAME grid. Only the embedder artifact and the placement vary.
+  // ── The three speakerkit arms, all on the SAME buffer, the SAME (measured,
+  // diaric) PLDA and the SAME grid. Only the embedder artifact and the
+  // placement vary.
   let ctx = ClipCtx {
     clip: clip.name,
     samples: &samples,
     audio_fnv,
-    plda: &plda,
+    plda: &plda_dc,
     dia: &dia,
   };
   // The int8 embedder path comes from the SAME resolver production uses
@@ -1081,9 +1120,9 @@ struct Clip09Observed<'a> {
   ref_spk: usize,
   /// dia-ort's (the ONNX oracle's) speaker count.
   dia_spk: usize,
-  /// The fp32 CONTROL's clustering outcome, carrying dia's TYPED error so the pin
-  /// can match the exact `AmbiguousAliveCluster` variant, not just `is_err`.
-  fp32: &'a Result<Vec<Seg>, dia::offline::Error>,
+  /// The fp32 CONTROL's clustering outcome, carrying diaric's TYPED error so the
+  /// pin can match the exact `AmbiguousAliveCluster` variant, not just `is_err`.
+  fp32: &'a Result<Vec<Seg>, diaric::offline::Error>,
   /// int8/CpuOnly's speaker count.
   int8_cpu_spk: usize,
   /// int8/All (the shipping default) speaker count.
@@ -1126,16 +1165,18 @@ fn assert_clip09_known_defect(o: &Clip09Observed<'_>) {
      moved; re-establish it before trusting the defect pin",
     o.dia_spk
   );
-  // THE DEFECT: the fp32 CoreML control does not merely fail — it fails with dia's
-  // TYPED AmbiguousAliveCluster bail-out (a near-zero cluster weight inside the
-  // SIMD guard band). Matching the VARIANT (not just `is_err`, and not the fragile
-  // `cluster`/`value` fields) is what makes "the known defect is fixed" the only
-  // way this can go green.
+  // THE DEFECT: the fp32 CoreML control does not merely fail — it fails with
+  // diaric's TYPED AmbiguousAliveCluster bail-out (a near-zero cluster weight
+  // inside the SIMD guard band). Matching the VARIANT (not just `is_err`, and not
+  // the fragile `cluster`/`value` fields) is what makes "the known defect is
+  // fixed" the only way this can go green.
   assert!(
     matches!(
       o.fp32,
-      Err(dia::offline::Error::Pipeline(
-        dia::pipeline::Error::Centroid(dia::cluster::centroid::Error::AmbiguousAliveCluster { .. })
+      Err(diaric::offline::Error::Pipeline(
+        diaric::pipeline::Error::Centroid(
+          diaric::cluster::centroid::Error::AmbiguousAliveCluster { .. }
+        )
       ))
     ),
     "09: the fp32 CoreML control no longer fails with Pipeline(Centroid(AmbiguousAliveCluster)). \
@@ -1280,16 +1321,17 @@ shipping_der_gate! {
 /// unpinned, and a real clip-09 regression in it would pass green.
 #[test]
 fn clip09_known_defect_pins_every_field() {
-  // dia's typed bail-out — the exact variant the fp32 control hits.
-  let fp32_defect: Result<Vec<Seg>, dia::offline::Error> = Err(dia::offline::Error::Pipeline(
-    dia::pipeline::Error::Centroid(dia::cluster::centroid::Error::AmbiguousAliveCluster {
-      cluster: 13,
-      value: 1.70e-7,
-      threshold: 1e-7,
-      lo: 5e-8,
-      hi: 2e-7,
-    }),
-  ));
+  // diaric's typed bail-out — the exact variant the fp32 control hits.
+  let fp32_defect: Result<Vec<Seg>, diaric::offline::Error> =
+    Err(diaric::offline::Error::Pipeline(
+      diaric::pipeline::Error::Centroid(diaric::cluster::centroid::Error::AmbiguousAliveCluster {
+        cluster: 13,
+        value: 1.70e-7,
+        threshold: 1e-7,
+        lo: 5e-8,
+        hi: 2e-7,
+      }),
+    ));
 
   let cpu_der = clip09_synth_der(0.164_590);
   let all_der = clip09_synth_der(0.165_904);
@@ -1309,9 +1351,9 @@ fn clip09_known_defect_pins_every_field() {
   // The VARIANT is matched, not its field values: a DIFFERENT
   // AmbiguousAliveCluster still passes, so the pin does not over-fit the fragile
   // `cluster: 13` / `value: 1.70e-7`.
-  let fp32_other_fields: Result<Vec<Seg>, dia::offline::Error> =
-    Err(dia::offline::Error::Pipeline(
-      dia::pipeline::Error::Centroid(dia::cluster::centroid::Error::AmbiguousAliveCluster {
+  let fp32_other_fields: Result<Vec<Seg>, diaric::offline::Error> =
+    Err(diaric::offline::Error::Pipeline(
+      diaric::pipeline::Error::Centroid(diaric::cluster::centroid::Error::AmbiguousAliveCluster {
         cluster: 99,
         value: -1.0,
         threshold: 5e-8,
@@ -1392,7 +1434,7 @@ fn clip09_known_defect_pins_every_field() {
   );
 
   // fp32 control: "fixed" (clusters) and a DIFFERENT error variant both fail.
-  let fp32_fixed: Result<Vec<Seg>, dia::offline::Error> = Ok(Vec::new());
+  let fp32_fixed: Result<Vec<Seg>, diaric::offline::Error> = Ok(Vec::new());
   reject(
     "fp32 fixed (Ok)",
     &Clip09Observed {
@@ -1400,8 +1442,8 @@ fn clip09_known_defect_pins_every_field() {
       ..good
     },
   );
-  let fp32_wrong_variant: Result<Vec<Seg>, dia::offline::Error> = Err(
-    dia::offline::Error::Pipeline(dia::pipeline::Error::InvalidActiveRatio(0.5)),
+  let fp32_wrong_variant: Result<Vec<Seg>, diaric::offline::Error> = Err(
+    diaric::offline::Error::Pipeline(diaric::pipeline::Error::InvalidActiveRatio(0.5)),
   );
   reject(
     "fp32 wrong variant",

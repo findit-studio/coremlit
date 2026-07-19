@@ -64,10 +64,10 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
     ),
     ("align", vec!["dep:asry"]),
     ("align-oracle", vec!["align", "asry/alignment"]),
-    ("speaker", vec!["dep:dia"]),
+    ("speaker", vec!["dep:diaric"]),
     (
       "speaker-oracle",
-      vec!["speaker", "dia/ort", "dia/bundled-segmentation"],
+      vec!["speaker", "dep:dia", "dia/ort", "dia/bundled-segmentation"],
     ),
     ("vad", vec!["dep:silero"]),
     ("vad-bundled", vec!["vad", "silero/bundled"]),

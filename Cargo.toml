@@ -6,9 +6,9 @@ members = ["crates/coremlit"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-# MSRV floor is set by two pinned git dependencies — coremlit's `asry` (the
-# `align` feature) and `dia`/diarization (the `speaker` feature) — both of
-# which need rustc 1.95.
+# MSRV floor is set by three pinned git dependencies — coremlit's `asry` (the
+# `align` feature), `diaric` (the `speaker` runtime clustering core), and the
+# `dia`/diarization DER oracle (`speaker-oracle`) — all of which need rustc 1.95.
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/findit-studio/coremlit"

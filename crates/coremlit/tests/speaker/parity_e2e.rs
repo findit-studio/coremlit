@@ -7,7 +7,7 @@
 //! agreement (`parity_seg`), embedding cosine (`parity_embed`), argmax
 //! Swift bit-exactness (`parity_argmax_swift`). This suite closes the loop:
 //! it runs the whole pipeline — seg + embed → `Extraction` →
-//! `Extraction::into_offline_input(plda)` → `dia::offline::diarize_offline`
+//! `Extraction::into_offline_input(plda)` → `diaric::offline::diarize_offline`
 //! → RTTM speaker spans — and scores the spans with **DER** (Diarization
 //! Error Rate). It also adjudicates the two questions the design spec
 //! explicitly deferred "to the DER gate":
@@ -936,9 +936,11 @@ fn assert_clip_pins(
 // Pipeline runners
 // ══════════════════════════════════════════════════════════════════════
 
-/// The shared community-1 PLDA both the speakerkit path
-/// (`into_offline_input`) and dia's own pipeline consume — one instance, so
-/// the two clustering runs cannot diverge on the projection.
+/// dia's in-crate community-1 PLDA — the REFERENCE (dia-ort) side's projection.
+/// Its measured-side twin is [`load_plda_diaric`]; both `include_bytes!` the
+/// same community-1 blobs and the `plda_cross_crate_equivalence` gate asserts
+/// their transforms are bit-identical, so the two crate-typed instances cannot
+/// diverge on the projection.
 ///
 /// NB `new()` takes no data: it is a FROZEN, pretrained projection
 /// (`include_bytes!`) fit on the native kaldi-fbank WeSpeaker distribution.
@@ -947,6 +949,14 @@ fn assert_clip_pins(
 /// is projected through a basis that was never fit for it.
 fn load_plda() -> dia::plda::PldaTransform {
   dia::plda::PldaTransform::new().expect("load community-1 PldaTransform")
+}
+
+/// diaric's in-crate community-1 PLDA — the MEASURED (speakerkit) side's
+/// projection, the one `Extraction::diarize` / `into_offline_input` consume.
+/// Bit-identical to [`load_plda`]'s dia instance (asserted by
+/// `plda_cross_crate_equivalence`).
+fn load_plda_diaric() -> diaric::plda::PldaTransform {
+  diaric::plda::PldaTransform::new().expect("load community-1 PldaTransform (diaric)")
 }
 
 /// dia's OWN ort path (the parity oracle): dia-ort seg (bundled
@@ -990,19 +1000,37 @@ fn dia_ort_run(samples: &[f32], plda: &dia::plda::PldaTransform) -> DiaOrtRun {
   let disc = out.discrete_diarization_slice();
   let num_output_frames = disc.len().checked_div(num_clusters).unwrap_or(0);
   DiaOrtRun {
-    segs: output_segs(&out),
+    segs: output_segs(out.spans_slice()),
     num_chunks,
     num_output_frames,
     num_clusters,
   }
 }
 
-/// dia `OfflineOutput` RTTM spans → [`Seg`]s (cluster id is already a
-/// 0-indexed integer speaker id). Names only `OfflineOutput`, never
-/// `RttmSpan`, so no extra import.
-fn output_segs(out: &dia::offline::OfflineOutput) -> Vec<Seg> {
+/// Boundary adapter: diaric's `OfflineOutput` (the MEASURED clustering result)
+/// → dia's `RttmSpan`s (the REFERENCE output type), so both sides funnel their
+/// spans through the one dia-typed [`output_segs`] for the DER comparison.
+///
+/// Total at the span level: every diaric span's full public state
+/// (`cluster`/`start`/`duration`) maps through dia's positional `RttmSpan::new`,
+/// which fails to compile if that constructor's shape changes. A whole-
+/// `OfflineOutput` → `OfflineOutput` map is impossible — dia's
+/// `SpillBytes::from_vec` is `pub(crate)`, so `dia::offline::OfflineOutput`
+/// cannot be constructed outside `dia` — and the DER comparison consumes only
+/// spans, so the span vector is the complete DER-relevant output.
+fn to_dia_spans(out: &diaric::offline::OfflineOutput) -> Vec<dia::reconstruct::RttmSpan> {
   out
     .spans_slice()
+    .iter()
+    .map(|s| dia::reconstruct::RttmSpan::new(s.cluster(), s.start(), s.duration()))
+    .collect()
+}
+
+/// dia `RttmSpan`s → [`Seg`]s (cluster id is already a 0-indexed integer
+/// speaker id) — the single DER span-extractor both the reference (dia-ort) and
+/// the measured (speakerkit, via [`to_dia_spans`]) sides share.
+fn output_segs(spans: &[dia::reconstruct::RttmSpan]) -> Vec<Seg> {
+  spans
     .iter()
     .map(|s| Seg {
       start: s.start(),
@@ -1066,12 +1094,17 @@ fn argmax_models_root() -> PathBuf {
   root
 }
 
-/// Run `diarize_offline` on an `Extraction` + shared PLDA → its spans as
-/// [`Seg`]s. Borrows keep the `Extraction` alive across the call.
-fn diarize_extraction_segs(ext: &Extraction, plda: &dia::plda::PldaTransform) -> Vec<Seg> {
-  let input = ext.into_offline_input(plda);
-  let out = dia::offline::diarize_offline(&input).expect("diarize_offline over speakerkit tensors");
-  output_segs(&out)
+/// Run the public `Extraction::diarize` clustering path on an `Extraction` +
+/// the measured-side (diaric) PLDA → its spans as [`Seg`]s (converting diaric's
+/// output to dia spans at the boundary via [`to_dia_spans`]). This suite scores
+/// exactly the runtime method (which internally is
+/// `into_offline_input → diarize_offline`), not a re-plumbed copy — the public
+/// API and the tested path are ONE code path.
+fn diarize_extraction_segs(ext: &Extraction, plda: &diaric::plda::PldaTransform) -> Vec<Seg> {
+  let out = ext
+    .diarize(plda)
+    .expect("Extraction::diarize over speakerkit tensors");
+  output_segs(&to_dia_spans(&out))
 }
 
 /// Assert speakerkit's sliding-window grid is dia-ort's — the framing half of
@@ -1374,6 +1407,7 @@ fn fixture_facts_match_the_corpus_on_disk() {
 #[ignore = "requires Models/speakerkit + sibling diarization ONNX/fixtures + ort"]
 fn fluidaudio_der_parity_vs_dia_ort_and_determinism() {
   let plda = load_plda();
+  let plda_dc = load_plda_diaric();
   // GATED: standard-collar parity DER + the absolute-DER delta (both spec
   // readings of "DER delta ≤ 0.1%"). REPORTED: strict frame-exact jitter.
   let mut worst_parity_std = 0.0_f64;
@@ -1403,7 +1437,7 @@ fn fluidaudio_der_parity_vs_dia_ort_and_determinism() {
     );
     assert_grid_matches(fixture.name, "fluidaudio", &ext, &dia);
 
-    let sk_segs = diarize_extraction_segs(&ext, &plda);
+    let sk_segs = diarize_extraction_segs(&ext, &plda_dc);
 
     // ── DETERMINISM: a second CpuOnly run must be bit-identical, tensors AND
     // spans.
@@ -1418,7 +1452,7 @@ fn fluidaudio_der_parity_vs_dia_ort_and_determinism() {
       "{}: FluidAudio extraction is non-deterministic on CpuOnly (tensors differ)",
       fixture.name
     );
-    let sk_segs2 = diarize_extraction_segs(&ext2, &plda);
+    let sk_segs2 = diarize_extraction_segs(&ext2, &plda_dc);
     let span_key = |segs: &[Seg]| -> Vec<(usize, u64, u64)> {
       segs
         .iter()
@@ -1583,6 +1617,7 @@ fn fluidaudio_der_parity_vs_dia_ort_and_determinism() {
 fn argmax_source_der_characterization() {
   let argmax_root = argmax_models_root();
   let plda = load_plda();
+  let plda_dc = load_plda_diaric();
 
   for name in e2e_fixture_names() {
     let samples = fixture_audio(name);
@@ -1607,7 +1642,7 @@ fn argmax_source_der_characterization() {
       ComputeUnits::CpuOnly,
       &common::embed_fp32_path(),
     );
-    let fa_segs = diarize_extraction_segs(&fa_ext, &plda);
+    let fa_segs = diarize_extraction_segs(&fa_ext, &plda_dc);
 
     // argmax Baseline (W32A32 seg / W16A16 embed), CpuOnly — the parity
     // control (spec §5.3/§5.4). Its ~0.94 embedding divergence is the risk
@@ -1622,7 +1657,7 @@ fn argmax_source_der_characterization() {
     );
     assert_grid_matches(name, "fluidaudio", &fa_ext, &dia);
     assert_grid_matches(name, "argmax", &ax_ext, &dia);
-    let ax_segs = diarize_extraction_segs(&ax_ext, &plda);
+    let ax_segs = diarize_extraction_segs(&ax_ext, &plda_dc);
 
     // THE §5.6 CHARACTERIZATION, asserted — the same scoring Part D applies to
     // the ≥3-speaker clips, so the easy and hard halves are directly comparable.
@@ -1755,7 +1790,7 @@ fn equal_delta_der_hides_disjoint_placement_errors() {
 #[test]
 #[ignore = "requires Models/speakerkit (+ argmax) + sibling diarization + ort; runs the ANE"]
 fn compute_unit_der_study_all_vs_cpuonly() {
-  let plda = load_plda();
+  let plda_dc = load_plda_diaric();
   let argmax_root = argmax_models_root();
 
   // Finding 4: a per-source WITNESS that the ANE placement was genuinely
@@ -1790,7 +1825,7 @@ fn compute_unit_der_study_all_vs_cpuonly() {
         ComputeUnits::CpuOnly,
         &common::embed_fp32_path(),
       ),
-      &plda,
+      &plda_dc,
     );
     let fa_all = diarize_extraction_segs(
       &fluidaudio_extraction(
@@ -1799,7 +1834,7 @@ fn compute_unit_der_study_all_vs_cpuonly() {
         ComputeUnits::All,
         &common::embed_fp32_path(),
       ),
-      &plda,
+      &plda_dc,
     );
     let ax_cpu = diarize_extraction_segs(
       &argmax_extraction(
@@ -1810,7 +1845,7 @@ fn compute_unit_der_study_all_vs_cpuonly() {
         ComputeUnits::CpuOnly,
         ComputeUnits::CpuOnly,
       ),
-      &plda,
+      &plda_dc,
     );
     let ax_all = diarize_extraction_segs(
       &argmax_extraction(
@@ -1821,7 +1856,7 @@ fn compute_unit_der_study_all_vs_cpuonly() {
         ComputeUnits::All,
         ComputeUnits::All,
       ),
-      &plda,
+      &plda_dc,
     );
 
     for (tag, cpu, all) in [
@@ -1956,6 +1991,7 @@ fn compute_unit_der_study_all_vs_cpuonly() {
 fn stress_clip(name: &str) {
   let argmax_root = argmax_models_root();
   let plda = load_plda();
+  let plda_dc = load_plda_diaric();
 
   let ref_speakers = facts(name).ref_speakers;
   assert!(
@@ -2004,8 +2040,8 @@ fn stress_clip(name: &str) {
     dia.num_chunks, dia.num_output_frames
   );
 
-  let fa_segs = diarize_extraction_segs(&fa_ext, &plda);
-  let ax_segs = diarize_extraction_segs(&ax_ext, &plda);
+  let fa_segs = diarize_extraction_segs(&fa_ext, &plda_dc);
+  let ax_segs = diarize_extraction_segs(&ax_ext, &plda_dc);
 
   assert_clip_pins(name, &dia, &fa_segs, &ax_segs, &reference);
 }

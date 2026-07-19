@@ -206,12 +206,23 @@
 //! `allEmbeddingsFloats` (`VBxClustering.swift:52,111,126`): argmax withholds
 //! them from cluster formation, it does not drop them.
 //!
-//! This port cannot reuse that protection. Per the design spec §4 the
-//! clustering is `dia`'s, and [`Extraction`] has no "present, but do not
-//! cluster on me" channel — every slot it carries is a slot `dia` clusters on.
-//! Porting argmax's mask policy WITHOUT argmax's filter would be the worst of
-//! both vendors: argmax's sparse mask, handed to clustering that has no idea it
-//! is sparse.
+//! This port does not need to reuse that protection at the mask, because the
+//! clustering it feeds already provides it. Per the design spec §4 the
+//! clustering is `dia`'s — and `dia`'s `diarize_offline` opens with a bit-exact
+//! port of the SAME pyannote community-1 `VBxClustering.filter_embeddings` that
+//! argmax's `VBxClustering.swift:50` ports (`offline/algo.rs:598-656`, with
+//! `MIN_ACTIVE_RATIO = 0.2` at `:622`), applied UNCONDITIONALLY to every
+//! [`Extraction`], from either source. It withholds exactly the sparse
+//! `clean_count <= 117` slots from cluster FORMATION and then re-attaches each
+//! to its nearest centroid (`pipeline/algo.rs:636-712`, reached from the
+//! offline path's `assign_embeddings` call at `offline/algo.rs:747`) — argmax's
+//! own withhold-then-`clusterReassignment` (`VBxClustering.swift:52,111`),
+//! reproduced downstream. So [`Extraction`] needs no "present, but do not
+//! cluster on me" channel: `dia` is that channel. What the mask still has to
+//! solve is a DIFFERENT, mask-level problem — a slot whose clean mask is
+//! (almost) all-zero pools over nothing and returns the degenerate constant
+//! above. For that — and only that — the port takes `dia`'s own mask-level
+//! fallback.
 //!
 //! ## So this port takes the other half of the pair: `dia`'s FALLBACK
 //!
@@ -255,38 +266,47 @@
 //! The fallback is a RARE path, exactly as it is in `dia`: on
 //! `02_pyannote_sample` it fires for 0 of the 41 active slots (no slot has `<= 2`
 //! clean frames). It is the *unreachability* it buys, not a routine rewrite of
-//! the mask, that earns it — see the divergence note below before reading it as
+//! the mask, that earns it — see the two-rules note below before reading it as
 //! a fix for sparse masks in general.
 //!
-//! ## The knowing divergence from argmax's Swift, stated plainly
+//! ## Two rules at two different bars — both live, at different layers
 //!
-//! This port does **not** implement `nonOverlappedFrameRatio` /
-//! `minActiveRatio`, and the fallback above is NOT a substitute for it. The two
-//! rules sit at very different bars, and conflating them would be easy:
+//! It is easy to conflate `dia`'s exclude-overlap FALLBACK (which this port's
+//! mask construction implements) with argmax's `minActiveRatio` cluster-
+//! formation filter (which `dia`'s clustering applies). They are different
+//! rules, at very different bars, in different layers — and BOTH are live end
+//! to end:
 //!
-//! | | fires when | on `02_pyannote_sample` |
-//! |---|---|---|
-//! | `dia`'s fallback (ported) | `clean_count <= 2` | 0 of 41 active slots |
-//! | argmax's filter (NOT ported) | `clean_count <= 117` (`ratio <= 0.2`) | 5 of 41 active slots |
+//! | rule | applied by | fires when | on `02_pyannote_sample` |
+//! |---|---|---|---|
+//! | exclude-overlap fallback (`clean_count <= 2` ⇒ use the raw mask) | THIS port's `build_speaker_masks` | starved clean mask | 0 of 41 active slots |
+//! | `minActiveRatio` filter (`clean_count <= 117`, `ratio <= 0.2`) | `dia`'s clustering (`offline/algo.rs:598-656`; reassignment `pipeline/algo.rs:636-712`) | sparse / overlap-heavy slot | 5 of 41 active slots |
 //!
-//! So a slot with, say, 40 clean frames of 589 keeps its SPARSE clean mask
-//! here, and `dia` clusters on it. argmax would have withheld it from cluster
-//! formation; this port does not, because `Extraction` has no channel to say so
-//! (spec §4 puts clustering on `dia`'s side, and every slot `Extraction` carries
-//! is one `dia` clusters). Adding one is a design change, not a port detail.
+//! So a slot with, say, 40 clean frames of 589 keeps its SPARSE clean mask in
+//! the [`Extraction`] this port builds — but `dia` does NOT then cluster on it.
+//! `dia`'s Stage 1 withholds exactly those `clean_count <= 117` slots (the same
+//! 5 argmax's own filter would) from cluster FORMATION, and its reassignment
+//! re-attaches each to its nearest centroid. That is argmax's behaviour,
+//! reproduced by `dia` for every source — not an un-ported divergence, and
+//! nothing an [`Extraction`] channel needs to add. The lone nuance is a
+//! boundary: `dia`'s `>=` keeps a slot with `clean == 0.2 * num_frames` where
+//! argmax's strict `>` drops it, but at `num_frames = 589` that threshold
+//! (`117.8`) is non-integral, so no integer clean-frame count can land on it and
+//! the two filters select the identical set here.
 //!
-//! What the fallback DOES buy is worth being precise about, because it is not
-//! "sparse masks are fixed":
+//! What the fallback DOES buy — separately from that filter — is worth being
+//! precise about, because it is not "sparse masks are fixed":
 //!
 //! - the all-zero mask row — the one case where the embedding is not merely
 //!   sparse but *meaningless* (the norm-0.5356 constant) — becomes unreachable,
 //!   so no guard is needed for it;
-//! - mask construction stops being an argmax/`dia` hybrid. This port now applies
-//!   `dia`'s rule to `dia`'s clustering, exactly as
+//! - mask construction stops being an argmax/`dia` hybrid. This port now builds
+//!   `dia`'s mask and feeds `dia`'s clustering, exactly as
 //!   [`crate::audio::speaker::source::FluidAudioSource`] does — and `dia` treats ITS own
-//!   segmenter's sparse-but-nonempty slots the same way, so the remaining
-//!   sparse-slot behavior is `dia`'s considered policy rather than an accident
-//!   of porting half of argmax's.
+//!   segmenter's sparse-but-nonempty slots the same way (the same Stage 1 filter
+//!   and reassignment run on both sources), so the remaining sparse-slot
+//!   behaviour is `dia`'s considered policy, applied uniformly, rather than an
+//!   accident of porting half of argmax's.
 //!
 //! # The `Extraction` invariant this source upholds
 //!
@@ -952,10 +972,12 @@ fn window_plans(
 /// This is the one place the port deliberately does NOT do what `Emb.swift`
 /// does, and the module doc gives the full argument. In short: argmax's
 /// unconditional clean mask starves a slot whose active frames are mostly
-/// overlap, and argmax compensates for that downstream, in a clustering stage
-/// this port does not own (`VBxClustering.swift:50`). Falling back makes the
-/// embedding real instead, and makes an all-zero mask row unreachable for any
-/// slot that cleared the gate.
+/// overlap. argmax handles that sparse slot with its downstream `minActiveRatio`
+/// filter — which `dia`'s clustering applies too, for every source
+/// (`VBxClustering.swift:50` ⇄ `offline/algo.rs:598-656`), so that protection is
+/// reproduced regardless. The fallback is a SEPARATE, mask-level fix: it makes
+/// the embedding real instead of the degenerate all-zero-mask constant, and
+/// makes an all-zero mask row unreachable for any slot that cleared the gate.
 ///
 /// Note this uses each plan's `active` but NOT its `bounded`: argmax builds
 /// masks for ALL 21 windows (`Emb.swift:230`) and applies `bounded` only when
