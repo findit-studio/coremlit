@@ -51,12 +51,25 @@ align = ["dep:asry"]
 align-oracle = ["align", "asry/alignment"]
 
 # --- audio::speaker (former crate `speakerkit`) ---
-# Former speakerkit `dia`: the lean, ort-free offline bridge into dia's
-# clustering / reconstruction core (dia `default-features = false`).
-speaker = ["dep:dia"]
-# Former speakerkit `dia-oracle`: dia's own ort inference (bundled segmentation
-# model) for the DER parity suites. DEV/TEST only — pulls ort + the ~6 MB model.
-speaker-oracle = ["speaker", "dia/ort", "dia/bundled-segmentation"]
+# `diaric` is the backend-free runtime clustering CORE — offline AHC→VBx
+# (`diaric::offline::diarize_offline`), the online centroid matcher
+# (`diaric::cluster::online`), PLDA projection, and reconstruction. Clustering
+# is a PUBLIC RUNTIME capability of the speaker module (`Extraction::diarize` /
+# `diarize_with` / `diarize_online`), not a test-only harness step. `diaric` is
+# backend-free BY CONSTRUCTION (the ONNX/Torch runners live in the separate
+# `diarization` crate, never here), so the `speaker` runtime graph pulls no
+# `ort` in ANY configuration. The former speakerkit `dia` feature is gone: the
+# runtime clustering dep is now `diaric`, and `dia` is demoted to the test-only
+# DER oracle below.
+speaker = ["dep:diaric"]
+# Former speakerkit `dia-oracle`: the TEST-ONLY DER reference oracle. Pulls the
+# optional `dia` (`diarization`) crate and turns ON its OWN ort inference
+# (bundled `segmentation-3.0` + BYO fp32 WeSpeaker ONNX) so the DER parity
+# suites score the speaker module's CoreML output against dia-ort. Pulls `ort` +
+# `libonnxruntime` and the ~6 MB embedded model — never in the runtime graph;
+# the always-on (under `speaker`) `diaric` bridge stays ort-free.
+# `dia/bundled-segmentation` already implies `dia/ort`; both named for clarity.
+speaker-oracle = ["speaker", "dep:dia", "dia/ort", "dia/bundled-segmentation"]
 
 # --- audio::vad (former crate `vadkit`) ---
 # silero's logic-only detector seam (NO ort) rides `vad`.
@@ -118,17 +131,48 @@ objc2-natural-language = { workspace = true, optional = true }
 #
 asry = { git = "https://github.com/findit-studio/asry", rev = "49cbfc9ca6fb75366d75a862212bdebb889021e5", default-features = false, features = ["emissions"], optional = true }
 
-# --- audio::speaker optional git dep (the `speaker` feature) ---
-# Renamed to `dia` (its own package name is `diarization`) so call sites read
-# `dia::offline::OfflineInput` etc. Pinned to the public diarization repo by
-# EXACT rev, not a sibling path: a path dep breaks a fresh `cargo metadata` on
-# any checkout lacking the sibling (Cargo loads a path-dep manifest at
-# resolution time even for an OPTIONAL dep). `default-features = false` pulls
-# only dia's backend-free offline core (clustering / PLDA / reconstruction) —
-# the surface `Extraction::into_offline_input` feeds — NOT dia's `ort` +
-# `bundled-segmentation` defaults; the dia-ort DER oracle lives behind the
-# test-only `speaker-oracle` feature. CO-DEV: patch at the WORKSPACE ROOT (see
-# its "CO-DEV RECIPE" comment); do not edit this line.
+# --- audio::speaker optional git deps ---
+# `diaric` is the backend-free speaker-diarization CORE consumed as the RUNTIME
+# clustering dependency (the `speaker` feature): offline clustering
+# (`diaric::offline::diarize_offline`, AHC→VBx), the online centroid matcher
+# (`diaric::cluster::online`), PLDA projection, and reconstruction. Call sites
+# read `diaric::offline::diarize_offline` etc. `optional = true` + pulled by
+# `speaker` because the whole `audio::speaker` module is feature-gated; when the
+# module compiles, `diaric` is always present, so its bridge / clustering is
+# unconditional within the module.
+#
+# No `default-features` to strip: `diaric` is backend-free BY CONSTRUCTION — the
+# ONNX/Torch model runners live in the separate `diarization` crate, never here
+# — so the runtime clustering graph pulls no `ort`/onnxruntime in ANY
+# configuration (diaric's own default feature set is empty).
+#
+# ORT-FREE PROOF — the runtime configuration pulls no `ort` crate:
+#   cargo tree -p coremlit --features speaker -e normal | grep -iw ort   # → no match
+# Contrast — the test-only `speaker-oracle` feature DOES pull it (via the `dia`
+# oracle dep below):
+#   cargo tree -p coremlit --features speaker-oracle -e normal | grep -iw ort
+#
+# Pinned to the public diaric repo by EXACT rev, not a sibling path (a path dep
+# breaks a fresh `cargo metadata` on any checkout lacking the sibling). CO-DEV:
+# to build against a LOCAL diaric checkout, add an UNCOMMITTED `[patch]` to the
+# WORKSPACE ROOT Cargo.toml — mirror the asry recipe above:
+#
+#   [patch."https://github.com/findit-studio/diaric"]
+#   diaric = { path = "../diaric" }
+#
+# TODO re-pin to diaric 0.1 (published, and its `feat/import-core` PR has
+# merged); this port pins the exact rev the clustering feature was fence-approved
+# against, so the re-pin is a separate follow-up.
+diaric = { git = "https://github.com/findit-studio/diaric", rev = "877189e434aff080c1340313caf8801cea946af3", optional = true }
+
+# `dia` (package `diarization`) is the TEST-ONLY DER reference oracle, pulled
+# ONLY by `speaker-oracle` — never in the runtime graph. It carries dia's OWN
+# `ort` inference path (bundled `segmentation-3.0` + BYO fp32 WeSpeaker ONNX) so
+# the parity suites score the speaker module's CoreML output against dia-ort.
+# Pinned by EXACT rev, not a sibling path (a path dep breaks a fresh
+# `cargo metadata`); `default-features = false` keeps the bare dep lean until
+# `speaker-oracle` turns on its ONNX inference. CO-DEV: patch at the WORKSPACE
+# ROOT Cargo.toml, mirroring the diaric/asry recipes; do not edit this line.
 dia = { package = "diarization", git = "https://github.com/findit-studio/diarization", rev = "b6a6f9adc8465f7a4c207dbaa2701d98e1be1ff2", default-features = false, optional = true }
 
 # --- audio::vad optional git dep (the `vad` feature) ---
@@ -358,6 +402,22 @@ name = "speaker_parity_seg"
 path = "tests/speaker/parity_seg.rs"
 required-features = ["speaker"]
 
+# Hermetic online-clusterer parity vs FluidAudio's Swift `SpeakerManager`: a
+# committed synthetic trace, no dia oracle and no models, so it rides the
+# default `speaker` suite (diaric + committed fixtures only).
+[[test]]
+name = "speaker_parity_online_swift"
+path = "tests/speaker/parity_online_swift.rs"
+required-features = ["speaker"]
+
+# Model-gated proof that `Extraction::diarize` is one code path with the manual
+# `into_offline_input → diarize_offline` plumbing. diaric-only (no dia oracle),
+# so it gates on `speaker`; its assertions are `#[ignore]`d behind the models.
+[[test]]
+name = "speaker_parity_diarize_wiring"
+path = "tests/speaker/parity_diarize_wiring.rs"
+required-features = ["speaker"]
+
 # The DER parity suites are #![cfg(feature = "speaker-oracle")] and drive dia's
 # own ort inference (former speakerkit `dia-oracle`).
 [[test]]
@@ -373,6 +433,19 @@ required-features = ["speaker-oracle"]
 [[test]]
 name = "speaker_generate_goldens"
 path = "tests/speaker/generate_goldens.rs"
+required-features = ["speaker-oracle"]
+
+# Cross-crate equivalence gates under the dual-crate DER oracle: they compare
+# the measured (diaric) offline path against the dia-ort reference, so both
+# `diaric` and the `dia` oracle must be linked — hence `speaker-oracle`.
+[[test]]
+name = "speaker_offline_cross_crate_equivalence"
+path = "tests/speaker/offline_cross_crate_equivalence.rs"
+required-features = ["speaker-oracle"]
+
+[[test]]
+name = "speaker_plda_cross_crate_equivalence"
+path = "tests/speaker/plda_cross_crate_equivalence.rs"
 required-features = ["speaker-oracle"]
 
 # --- audio::vad ---

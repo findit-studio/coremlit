@@ -174,7 +174,7 @@ pub enum ExtractError {
   /// Rejected rather than ignored: silently overriding the caller's
   /// `step_samples` would return an `Extraction` whose `chunks_sw.step()`
   /// did not describe its own chunk grid, corrupting every downstream time
-  /// offset `dia` reconstructs from it.
+  /// offset `diaric` reconstructs from it.
   #[error(
     "step_samples ({step}) is not supported by this source: its window stride is fixed at \
      {required} by the model graph"

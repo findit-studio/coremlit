@@ -1,0 +1,6 @@
+# SwiftPM build products / resolution state for the oracle package. The
+# oracle's INPUTS (Package.swift, Sources/, README.md) and its OUTPUT
+# (../../fixtures/golden_online_swift/trace.json) are committed; nothing in
+# between is.
+.build/
+Package.resolved

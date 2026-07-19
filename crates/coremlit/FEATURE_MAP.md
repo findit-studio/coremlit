@@ -19,7 +19,7 @@ rename or a dropped feature cannot land silently.
 | alignkit | (crate) | `align` | asry's `emissions` seam rides this |
 | alignkit | `parity-oracle` | `align-oracle` | asry ONNX aligner oracle (DEV/TEST) |
 | speakerkit | (crate) | `speaker` | the CoreML segmentation + embedding backends (module `audio::speaker`) ride this |
-| speakerkit | `dia` | `speaker` | dia's backend-free offline bridge |
+| speakerkit | `dia` | `speaker` | diaric's backend-free runtime clustering core (formerly the `dia` offline bridge) |
 | speakerkit | `dia-oracle` | `speaker-oracle` | dia's ort DER oracle (DEV/TEST) |
 | vadkit | (crate) | `vad` | silero's logic-only detector rides this |
 | vadkit | dev-dep `silero/bundled` | `vad-bundled` | silero ONNX cross-backend oracle (DEV/TEST) |
@@ -50,7 +50,7 @@ none. It is pinned here and driven by CI (`.github/workflows/ci.yml`):
 | (none, `default = []`) | the bare core builds/tests dependency-lean |
 | `whisper` | the STT pipeline alone |
 | `align` | forced alignment alone (asry emissions, no ort) |
-| `speaker` | diarization backends + dia offline core (no ort) |
+| `speaker` | diarization backends + diaric clustering core (no ort) |
 | `vad` | Silero model layer alone (silero logic-only, no ort) |
 | `whisper,vad` | the `silero_vad` composition (former `vadkit` feature) |
 | `align-oracle` | + asry ONNX aligner (ort + whisper.cpp) |

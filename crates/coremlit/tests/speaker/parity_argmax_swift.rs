@@ -8,10 +8,11 @@
 //! embeddings is `dia`'s clustering (spec §4, §7), so an end-to-end gate
 //! would be measuring `dia`'s clusterer against argmax's, which is not what
 //! this source is being validated for. In particular argmax's
-//! `minActiveRatio` cluster-formation filter is **not** ported (spec §5.2, a
-//! recorded decision); it lives *after* the embeddings, so it is out of this
-//! gate's surface. This suite REPORTS how often it would have fired and gates
-//! nothing on it.
+//! `minActiveRatio` cluster-formation filter lives *after* the embeddings — it
+//! is the same `filter_embeddings` `dia`'s clustering applies to every
+//! `Extraction`, from either source (`offline/algo.rs`), so it is downstream of
+//! this tier-1 gate's surface, not absent from the pipeline. This suite REPORTS
+//! how often argmax's own filter would have fired and gates nothing on it.
 //!
 //! # Why a bespoke Swift oracle
 //!
@@ -194,9 +195,11 @@ struct SwiftSlot {
   /// for this slot, hard-binary.
   active_frames: Vec<bool>,
   /// `SpeakerEmbedding.nonOverlappedFrameRatio` — `clean_frames / 589`. The
-  /// input to argmax's NOT-ported `minActiveRatio` filter (spec §5.2), used
-  /// here only to (a) prove `dia`'s fallback stays inert and (b) report how
-  /// often argmax would have withheld the slot from cluster formation.
+  /// input to argmax's `minActiveRatio` filter — the same filter `dia`'s
+  /// clustering applies for every `Extraction`, downstream of this gate (see
+  /// the module doc) — used here only to (a) prove `dia`'s fallback stays inert
+  /// and (b) report how often argmax's own filter would have withheld the slot
+  /// from cluster formation.
   non_overlapped_frame_ratio: f64,
   /// `SpeakerEmbedding.embedding` — the raw 256-d WeSpeaker vector.
   embedding: Vec<f32>,
@@ -615,7 +618,8 @@ fn measure(
      mismatched, first {first_seg_mismatch:?}) | slot set: +{} / -{} | embed: max|diff|={worst_abs:.3e} \
      (chunk {}, slot {}) cos_min={worst_cos:.9} (chunk {}, slot {}) bit-identical {exact_rows}/{compared_rows} \
      rows | min clean_count={min_clean} (dia's fallback fires 0x) | argmax's minActiveRatio would \
-     withhold {would_withhold}/{} slots from cluster FORMATION (spec §5.2: not ported, not gated) | \
+     withhold {would_withhold}/{} slots from cluster FORMATION (applied downstream by dia for every \
+     source, out of this gate's surface) | \
      argmax's fresh mask alloc all-zero: {}",
     samples.len(),
     extraction.num_chunks(),
