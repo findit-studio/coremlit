@@ -1,9 +1,10 @@
 //! Shared helpers for clapkit's model-gated integration tests.
 //!
-//! The CoreML artifacts (`clap_audio.mlmodelc` / `clap_text.mlmodelc`) are
-//! gitignored dev-time downloads from `FinDIT-Studio/clapkit-coreml`
-//! (revision `97d631f3814e1e46b798a8e88c9aa2e2202fdf67`). Model-gated tests are
-//! `#[ignore]` by default and run only when the tree is present.
+//! The CoreML artifacts (fp16 `clap_{audio,text}.mlmodelc` + int8
+//! `clap_{audio,text}_int8.mlmodelc`) are gitignored dev-time downloads from
+//! `FinDIT-Studio/clapkit-coreml` (revision
+//! `02a99c6a8be21da1e9a947499ea503a10c80c4f1`). Model-gated tests are `#[ignore]`
+//! by default and run only when the tree is present.
 
 use std::path::{Path, PathBuf};
 
@@ -130,6 +131,72 @@ pub fn sha256_hex(path: &Path) -> String {
     .iter()
     .map(|b| format!("{b:02x}"))
     .collect()
+}
+
+/// Assert that the compiled-model bundle at `dir` matches an EXACT pinned
+/// manifest. `cases` is the pinned `(relative_path, sha256)` list.
+///
+/// Two gates, both of which must hold:
+/// 1. **Exact membership** — the set of relative paths of every FILE under `dir`
+///    (recursively) must equal the set of `cases` keys, so a **missing** artifact
+///    AND an **added** one both red (hashing a fixed named list alone would let a
+///    newly-added file slip through unnoticed — the gap this closes).
+/// 2. **Content** — each file's SHA-256 must equal its pinned value.
+///
+/// Uses a `std`-only recursive walk (no `walkdir` dependency); relative paths are
+/// forward-slash joined to match the pinned keys (e.g. `weights/weight.bin`).
+#[allow(dead_code)]
+pub fn assert_exact_sha_manifest(dir: &Path, cases: &[(&str, &str)]) {
+  use std::collections::BTreeSet;
+
+  // Recursively collect the forward-slash relative path of every FILE under
+  // `dir` (nested dirs such as `analytics/` and `weights/` are walked; only the
+  // files they contain become entries).
+  fn collect_files(dir: &Path, prefix: &str, out: &mut Vec<String>) {
+    let entries = std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {dir:?}: {e}"));
+    for entry in entries {
+      let entry = entry.unwrap_or_else(|e| panic!("dir entry under {dir:?}: {e}"));
+      let name = entry.file_name().to_string_lossy().into_owned();
+      let rel = if prefix.is_empty() {
+        name
+      } else {
+        format!("{prefix}/{name}")
+      };
+      let file_type = entry
+        .file_type()
+        .unwrap_or_else(|e| panic!("file_type {:?}: {e}", entry.path()));
+      if file_type.is_dir() {
+        collect_files(&entry.path(), &rel, out);
+      } else {
+        out.push(rel);
+      }
+    }
+  }
+
+  let mut found = Vec::new();
+  collect_files(dir, "", &mut found);
+  let on_disk: BTreeSet<String> = found.into_iter().collect();
+  let pinned: BTreeSet<String> = cases.iter().map(|(rel, _)| (*rel).to_owned()).collect();
+
+  if on_disk != pinned {
+    let missing: Vec<&String> = pinned.difference(&on_disk).collect();
+    let extra: Vec<&String> = on_disk.difference(&pinned).collect();
+    panic!(
+      "artifact manifest mismatch under {dir:?}:\n  \
+       missing (pinned but not on disk): {missing:?}\n  \
+       extra (on disk but not pinned): {extra:?}\n  \
+       if the bundle changed intentionally, update the pinned `cases` list AND \
+       the doc SHA table"
+    );
+  }
+
+  for (relative, expected) in cases {
+    let actual = sha256_hex(&dir.join(relative));
+    assert_eq!(
+      &actual, expected,
+      "sha256 drift on artifact {relative} under {dir:?}"
+    );
+  }
 }
 
 /// A deterministic 48 kHz mono window of `len` samples: a sum of a few fixed
