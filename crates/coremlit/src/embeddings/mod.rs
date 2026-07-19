@@ -1,14 +1,20 @@
-//! Embedding producers — reserved namespace.
+//! Embedding producers.
 //!
-//! A documented placeholder. The embedding pipelines land in later waves as
-//! feature-gated submodules mirroring [`crate::audio`]:
+//! A namespace of feature-gated submodules mirroring [`crate::audio`], each a
+//! self-contained CoreML embedding pipeline built over the always-compiled
+//! runtime core (`Model` / `MultiArray` / `Features`). Enabling a module's
+//! feature is the only way it compiles, and `default = []` pulls none of them.
 //!
-//! - `clap` — CLAP-HTSAT dual-tower audio+text embeddings (arrives with the
-//!   clapkit port; features `clap` / `clap-oracle`).
+//! - `clap` — CLAP-HTSAT dual-tower audio+text embeddings, a former standalone
+//!   kit crate collapsed here per the mono-crate restructure (feature `clap`;
+//!   `clap-oracle` adds the textclap parity oracle).
 //! - `granite` / `gemma` — sentence-embedding backends (the embedkit phase,
-//!   re-targeted from a crate to module form; feature `embeddinggemma`).
+//!   re-targeted from a crate to module form; feature `embeddinggemma`) — still
+//!   reserved, not yet landed.
 //!
-//! No embedding code compiles yet; the namespace is reserved so the crate's
-//! module map and the README layering map name a stable home for it. The
-//! `video/` sibling namespace is likewise reserved, but is not created until a
-//! video kit exists (README note).
+//! See the crate README's layering map for module authority. The `video/`
+//! sibling namespace is likewise reserved, but is not created until a video kit
+//! exists (README note).
+
+#[cfg(feature = "clap")]
+pub mod clap;

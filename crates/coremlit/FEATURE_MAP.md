@@ -23,16 +23,21 @@ rename or a dropped feature cannot land silently.
 | speakerkit | `dia-oracle` | `speaker-oracle` | dia's ort DER oracle (DEV/TEST) |
 | vadkit | (crate) | `vad` | silero's logic-only detector rides this |
 | vadkit | dev-dep `silero/bundled` | `vad-bundled` | silero ONNX cross-backend oracle (DEV/TEST) |
+| clapkit | (crate) | `clap` | CLAP-HTSAT dual-tower audio+text encoders (module `embeddings::clap`) ride this; Rust mel front-end + shared `tokenizers`, no ort |
+| clapkit | `parity-oracle` | `clap-oracle` | textclap model-level parity oracle (DEV/TEST) |
+| clapkit | `serde` | `serde` | unified cross-cutting |
 
 ## Flat feature set
 
 `default = []` (the bare CoreML runtime core). Additive features:
 
 `whisper`, `nl-recognizer`, `align`, `align-oracle`, `speaker`,
-`speaker-oracle`, `vad`, `vad-bundled`, `serde`, `tracing`.
+`speaker-oracle`, `vad`, `vad-bundled`, `clap`, `clap-oracle`, `serde`,
+`tracing`.
 
 Compositions (pinned by the golden test): `nl-recognizer` → `whisper`;
-`align-oracle` → `align`; `speaker-oracle` → `speaker`; `vad-bundled` → `vad`.
+`align-oracle` → `align`; `speaker-oracle` → `speaker`; `vad-bundled` → `vad`;
+`clap-oracle` → `clap`.
 
 ## Curated CI feature-combination list
 
@@ -51,6 +56,8 @@ none. It is pinned here and driven by CI (`.github/workflows/ci.yml`):
 | `align-oracle` | + asry ONNX aligner (ort + whisper.cpp) |
 | `speaker-oracle` | + dia ort DER oracle |
 | `vad-bundled` | + silero ONNX cross-backend oracle |
+| `clap` | CLAP audio+text encoders alone (Rust mel + tokenizers, no ort) |
+| `clap-oracle` | + textclap model-level parity oracle (ort) |
 | `whisper,align,speaker,vad,serde,tracing,nl-recognizer` | all non-oracle features on |
 | `whisper,align-oracle,speaker-oracle,vad-bundled,serde,tracing,nl-recognizer` | all-on (every feature, oracles included) |
 
