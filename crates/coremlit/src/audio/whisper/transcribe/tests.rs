@@ -2809,3 +2809,56 @@ fn vad_run_with_zero_chunks_is_known_clean_not_unknown() {
     "a zero-chunk run did nothing to redo -- reproducible",
   );
 }
+
+// ---------------------------------------------------------------------
+// LoadTimings stamping (#37.3)
+// ---------------------------------------------------------------------
+
+#[test]
+fn load_timings_stamp_writes_all_seven_fields_as_seconds() {
+  // Dyadic (n/8 s) millisecond durations so `as_secs_f64` and the literal
+  // both land on the exact same f64 — the equality is bit-exact, not
+  // tolerance-based.
+  let load = LoadTimings {
+    model_loading: Duration::from_millis(750),
+    prewarm_load_time: Duration::from_millis(250),
+    encoder_load: Duration::from_millis(125),
+    decoder_load: Duration::from_millis(375),
+    encoder_specialization: Duration::from_millis(625),
+    decoder_specialization: Duration::from_millis(875),
+    tokenizer_load_time: Duration::from_millis(500),
+  };
+  let mut timings = TranscriptionTimings::new();
+  load.stamp(&mut timings);
+
+  assert_eq!(timings.model_loading(), 0.75);
+  assert_eq!(timings.prewarm_load_time(), 0.25);
+  assert_eq!(timings.encoder_load_time(), 0.125);
+  assert_eq!(timings.decoder_load_time(), 0.375);
+  assert_eq!(timings.encoder_specialization_time(), 0.625);
+  assert_eq!(timings.decoder_specialization_time(), 0.875);
+  assert_eq!(timings.tokenizer_load_time(), 0.5);
+
+  // The stamp touches only the seven load fields; a representative
+  // compute-stage bucket the run would own is left untouched.
+  assert_eq!(timings.decoding_loop(), 0.0);
+}
+
+#[test]
+fn load_timings_default_stamps_all_zero() {
+  // The `with_backend` (mock) path carries `LoadTimings::default()`, so its
+  // stamped load fields are honestly 0.0 -- no models were loaded to time.
+  let mut timings = TranscriptionTimings::new();
+  LoadTimings::default().stamp(&mut timings);
+  for value in [
+    timings.model_loading(),
+    timings.prewarm_load_time(),
+    timings.encoder_load_time(),
+    timings.decoder_load_time(),
+    timings.encoder_specialization_time(),
+    timings.decoder_specialization_time(),
+    timings.tokenizer_load_time(),
+  ] {
+    assert_eq!(value, 0.0);
+  }
+}

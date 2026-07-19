@@ -209,7 +209,8 @@ fn manager_loads_tiny_idempotently_and_backend_builds() {
   assert_eq!(manager.state(), ModelState::Loaded);
   manager.ensure_loaded().unwrap(); // idempotent — no reload, still Loaded
   assert_eq!(manager.state(), ModelState::Loaded);
-  let backend = CoreMlBackend::from_loaded(manager.into_loaded().unwrap()).unwrap();
+  let (models, _timings) = manager.into_loaded().unwrap();
+  let backend = CoreMlBackend::from_loaded(models).unwrap();
   assert_eq!(backend.dims().vocab(), 51865);
 }
 
@@ -297,6 +298,77 @@ fn prewarm_over_loaded_models_is_rejected() {
   assert_eq!(manager.state(), ModelState::Prewarmed);
   manager.prewarm().unwrap(); // silent skip, no re-prewarm transitions
   assert_eq!(manager.state(), ModelState::Prewarmed);
+}
+
+#[test]
+#[ignore = "requires local tiny model (WHISPERKIT_TEST_MODELS)"]
+fn load_timings_are_populated_on_real_construction_with_prewarm() {
+  // #37.3: `WhisperKit::new` now measures the seven load/specialization/
+  // tokenizer durations and stamps them into every run's timings. With
+  // prewarm on, all seven are measured, so all seven must be finite and
+  // strictly positive on a real result -- they reported a flat 0.0 before
+  // this wiring.
+  let kit = WhisperKit::new(&tiny_options().with_prewarm()).unwrap();
+  let audio = common::load_wav_mono_f32(&common::fixtures_dir().join("audio/jfk.wav"));
+  let result = kit.transcribe(&audio, &DecodingOptions::new()).unwrap();
+  let t = result.timings();
+  for (name, value) in [
+    ("model_loading", t.model_loading()),
+    ("prewarm_load_time", t.prewarm_load_time()),
+    ("encoder_load_time", t.encoder_load_time()),
+    ("decoder_load_time", t.decoder_load_time()),
+    (
+      "encoder_specialization_time",
+      t.encoder_specialization_time(),
+    ),
+    (
+      "decoder_specialization_time",
+      t.decoder_specialization_time(),
+    ),
+    ("tokenizer_load_time", t.tokenizer_load_time()),
+  ] {
+    assert!(
+      value.is_finite() && value > 0.0,
+      "{name} should be finite and > 0 after wiring, got {value}"
+    );
+  }
+  // The grand total folds in the prewarm pass, so it is at least as large.
+  assert!(t.model_loading() >= t.prewarm_load_time());
+}
+
+#[test]
+#[ignore = "requires local tiny model (WHISPERKIT_TEST_MODELS)"]
+fn specialization_timings_stay_zero_without_prewarm() {
+  // Swift-faithful: `*SpecializationTime` is recorded only during a prewarm
+  // pass (`WhisperKit.swift:401-403,420-422`). Without prewarm the two
+  // specialization fields and `prewarm_load_time` stay 0.0, while the real
+  // load/tokenizer fields are still measured > 0.
+  let kit = WhisperKit::new(&tiny_options()).unwrap();
+  let audio = common::load_wav_mono_f32(&common::fixtures_dir().join("audio/jfk.wav"));
+  let result = kit.transcribe(&audio, &DecodingOptions::new()).unwrap();
+  let t = result.timings();
+  assert_eq!(t.prewarm_load_time(), 0.0, "no prewarm pass ran");
+  assert_eq!(
+    t.encoder_specialization_time(),
+    0.0,
+    "specialization is prewarm-only"
+  );
+  assert_eq!(
+    t.decoder_specialization_time(),
+    0.0,
+    "specialization is prewarm-only"
+  );
+  for (name, value) in [
+    ("model_loading", t.model_loading()),
+    ("encoder_load_time", t.encoder_load_time()),
+    ("decoder_load_time", t.decoder_load_time()),
+    ("tokenizer_load_time", t.tokenizer_load_time()),
+  ] {
+    assert!(
+      value.is_finite() && value > 0.0,
+      "{name} should be finite and > 0 even without prewarm, got {value}"
+    );
+  }
 }
 
 #[test]

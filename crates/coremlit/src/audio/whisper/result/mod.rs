@@ -564,7 +564,12 @@ pub struct TranscriptionTimings {
   /// Time spent loading audio input.
   #[cfg_attr(feature = "serde", serde(default))]
   audio_loading: f64,
-  /// Time spent on audio pre-processing (pad/trim, energy, VAD).
+  /// Time spent padding/trimming decode windows to length — the per-window
+  /// [`audio::pad_or_trim`](crate::audio::whisper::audio::pad_or_trim) in the
+  /// seek loop, matching what Swift's `audioProcessing` bucket wraps
+  /// (`TranscribeTask.swift`: slice + pad/trim + window preprocess). It does
+  /// NOT include VAD chunking (`chunk_all`), which is untimed here and in
+  /// Swift, nor mel extraction (tracked separately by [`Self::logmels`]).
   #[cfg_attr(feature = "serde", serde(default))]
   audio_processing: f64,
   /// Time spent computing mel-spectrogram features.
@@ -624,7 +629,17 @@ pub struct TranscriptionTimings {
   /// Number of word-timestamp alignment passes run.
   #[cfg_attr(feature = "serde", serde(default))]
   total_timestamp_alignment_runs: f64,
-  /// Number of temperature-fallback retries performed.
+  /// Zero-based attempt index of the most recent temperature fallback — a
+  /// faithful port of Swift's `totalDecodingFallbacks = Double(i)`
+  /// (`TranscribeTask.swift`), *assigned* (not accumulated) on each
+  /// fallback, so despite the name it is NOT a fallback count. The first
+  /// fallback writes `0.0`, which is also this field's initial value, so
+  /// `0.0` cannot distinguish "never fell back" from "one fallback at
+  /// attempt 0"; a true count would be `attempt + 1`. A multi-window task
+  /// overwrites per window, keeping only the last window's index, and
+  /// merged results sum these per-result values. For an unambiguous "a
+  /// fallback occurred" signal, use
+  /// [`TaskFacts::drew_from_rng`](crate::audio::whisper::task_facts::TaskFacts::drew_from_rng).
   #[cfg_attr(feature = "serde", serde(default))]
   total_decoding_fallbacks: f64,
   /// Number of 30 s windows decoded.
@@ -833,7 +848,12 @@ impl TranscriptionTimings {
   }
 
   // -- audio_processing ----------------------------------------------------
-  /// Time spent on audio pre-processing (pad/trim, energy, VAD).
+  /// Time spent padding/trimming decode windows to length — the per-window
+  /// [`audio::pad_or_trim`](crate::audio::whisper::audio::pad_or_trim) in the
+  /// seek loop, matching what Swift's `audioProcessing` bucket wraps
+  /// (`TranscribeTask.swift`: slice + pad/trim + window preprocess). It does
+  /// NOT include VAD chunking (`chunk_all`), which is untimed here and in
+  /// Swift, nor mel extraction (tracked separately by [`Self::logmels`]).
   #[inline(always)]
   pub const fn audio_processing(&self) -> f64 {
     self.audio_processing
@@ -1086,7 +1106,17 @@ impl TranscriptionTimings {
   }
 
   // -- total_decoding_fallbacks --------------------------------------------
-  /// Number of temperature-fallback retries performed.
+  /// Zero-based attempt index of the most recent temperature fallback — a
+  /// faithful port of Swift's `totalDecodingFallbacks = Double(i)`
+  /// (`TranscribeTask.swift`), *assigned* (not accumulated) on each
+  /// fallback, so despite the name it is NOT a fallback count. The first
+  /// fallback writes `0.0`, which is also this field's initial value, so
+  /// `0.0` cannot distinguish "never fell back" from "one fallback at
+  /// attempt 0"; a true count would be `attempt + 1`. A multi-window task
+  /// overwrites per window, keeping only the last window's index, and
+  /// merged results sum these per-result values. For an unambiguous "a
+  /// fallback occurred" signal, use
+  /// [`TaskFacts::drew_from_rng`](crate::audio::whisper::task_facts::TaskFacts::drew_from_rng).
   #[inline(always)]
   pub const fn total_decoding_fallbacks(&self) -> f64 {
     self.total_decoding_fallbacks
