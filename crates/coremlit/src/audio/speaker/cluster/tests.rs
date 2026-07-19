@@ -599,7 +599,7 @@ fn from_clustering_threshold_overflow_panics() {
 }
 
 // =====================================================================
-// to_dia_options — the single OnlineOptions → dia OnlineClusterOptions mapping.
+// to_dia_options — the single OnlineOptions → diaric OnlineClusterOptions mapping.
 // =====================================================================
 
 #[test]
@@ -618,7 +618,7 @@ fn online_to_dia_options_maps_each_knob() {
 
 #[test]
 fn online_to_dia_options_default_equals_dia_default() {
-  // The default OnlineOptions maps to exactly dia's default OnlineClusterOptions
+  // The default OnlineOptions maps to exactly diaric's default OnlineClusterOptions
   // — the property diarize_online relies on for FluidAudio-default clustering.
   let dia = OnlineOptions::default().to_dia_options();
   let dia_default = diaric::cluster::online::OnlineClusterOptions::default();
@@ -629,7 +629,7 @@ fn online_to_dia_options_default_equals_dia_default() {
 
 // =====================================================================
 // Determinism — the online engine, driven through the speakerkit wiring
-// (`to_dia_options` → dia's OnlineClusterer), is total-deterministic given a
+// (`to_dia_options` → diaric's OnlineClusterer), is total-deterministic given a
 // fixed feed order. Hermetic (no models, no golden).
 // =====================================================================
 
@@ -686,7 +686,7 @@ fn online_clusterer_is_deterministic_given_fixed_order() {
 // =====================================================================
 // OnlineOptions serde — per-field defaults, no silent flip, and the SAME
 // finite/range rejection OfflineOptions applies (extended to the [0,2] cosine
-// bound and the >= 0 duration bound dia's setters assert).
+// bound and the >= 0 duration bound diaric's setters assert).
 // =====================================================================
 
 #[cfg(feature = "serde")]

@@ -384,7 +384,7 @@ impl SlidingWindow {
   }
 }
 
-/// Conversion INTO dia's own `SlidingWindow` — see the module doc's
+/// Conversion INTO diaric's own `SlidingWindow` — see the module doc's
 /// "`SlidingWindow`: the visibility DECISION" section. Lossless and
 /// infallible: both types are unchecked `(f64, f64, f64)` tuples.
 ///
@@ -398,9 +398,9 @@ impl From<SlidingWindow> for diaric::reconstruct::SlidingWindow {
   }
 }
 
-/// Conversion FROM dia's own `SlidingWindow` — the reverse of the `From`
-/// impl above. Built entirely through dia's public `start`/`duration`/`step`
-/// accessors: dia's fields are private, so there is no other way to reach
+/// Conversion FROM diaric's own `SlidingWindow` — the reverse of the `From`
+/// impl above. Built entirely through diaric's public `start`/`duration`/`step`
+/// accessors: diaric's fields are private, so there is no other way to reach
 /// them.
 impl From<diaric::reconstruct::SlidingWindow> for SlidingWindow {
   fn from(value: diaric::reconstruct::SlidingWindow) -> Self {

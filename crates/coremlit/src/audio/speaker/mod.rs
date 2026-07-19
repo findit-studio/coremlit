@@ -136,7 +136,7 @@
 //!   AnySource::load("Models/speakerkit", Options::new().with_source(Source::FluidAudio))?;
 //! let extraction = source.extract(&audio)?;
 //!
-//! // Offline (the default backend): dia's pyannote-community-1 AHC→VBx pipeline,
+//! // Offline (the default backend): diaric's pyannote-community-1 AHC→VBx pipeline,
 //! // through the frozen community-1 PLDA projection it clusters in.
 //! let plda = diaric::plda::PldaTransform::new()?;
 //! let offline = extraction.diarize(&plda)?;
@@ -170,7 +170,7 @@ pub mod window;
 /// [`extract::Extraction::diarize_online`] for the plda-free online engine). See
 /// [`cluster`] for the full surface.
 ///
-/// The speaker module deliberately does NOT re-export dia's batch-clusterer
+/// The speaker module deliberately does NOT re-export diaric's batch-clusterer
 /// vocabulary (`OfflineClusterOptions`/`OfflineMethod`/`Linkage`) that T1 briefly
 /// exposed: [`ClusterBackend::Offline`] wraps diaric's pyannote-parity *pipeline*
 /// ([`extract::Extraction::diarize`] → `diaric::offline::diarize_offline`), not the

@@ -9,7 +9,7 @@
 //! # Two engines: `Offline` and `Online`
 //!
 //! [`ClusterBackend`] is `#[non_exhaustive]` and carries two variants:
-//! - [`Offline`](ClusterBackend::Offline) wraps dia's pyannote-community-1
+//! - [`Offline`](ClusterBackend::Offline) wraps diaric's pyannote-community-1
 //!   offline pipeline ([`diaric::offline::diarize_offline`], AHC→VBx over
 //!   PLDA-projected embeddings) — the default, and the backend every DER parity
 //!   gate drives. Tuned by [`OfflineOptions`].
@@ -23,9 +23,9 @@
 //!   remains for a future third engine — there is no stub variant (honest
 //!   surface: what compiles, runs).
 //!
-//! ## Which dia entry point `Offline` wraps (and which it does NOT)
+//! ## Which diaric entry point `Offline` wraps (and which it does NOT)
 //!
-//! dia has TWO disjoint offline entry points, and this is the subtle one:
+//! diaric has TWO disjoint offline entry points, and this is the subtle one:
 //!
 //! - [`diaric::offline::diarize_offline`] — the pyannote-parity PIPELINE (AHC
 //!   initialization → VBx refinement; `threshold = 0.6`; the
@@ -45,7 +45,7 @@
 //! batch clusterer's vocabulary as speakerkit's clustering surface would have
 //! been misleading for an unpublished crate whose only validated offline path is
 //! the pipeline (design spec AMENDMENT 2026-07-16). A caller who genuinely wants
-//! dia's batch clusterer can still reach it through the `dia` dependency
+//! diaric's batch clusterer can still reach it through the `diaric` dependency
 //! directly; a first-class batch mode, if ever wanted, would arrive as its own
 //! [`ClusterBackend`] variant with its own gates.
 //!
@@ -168,11 +168,11 @@ const NON_FINITE_FLOAT_MSG: &str = "non-finite float (NaN or infinity) is not re
   JSON and is rejected to keep the serde round trip lossless";
 
 /// The error a non-finite OR negative `f64` raises at the `serde` boundary for
-/// [`OfflineOptions::min_duration_off`], whose dia consumer
+/// [`OfflineOptions::min_duration_off`], whose diaric consumer
 /// ([`diaric::offline::OfflineInput::with_min_duration_off`]) PANICS on a
 /// non-finite or negative value. Rejecting the same predicate here (and in the
 /// builder) means no `OfflineOptions` value — however constructed, serde
-/// included — can drive dia into that panic.
+/// included — can drive diaric into that panic.
 #[cfg(feature = "serde")]
 const NEGATIVE_OR_NON_FINITE_MSG: &str = "min_duration_off must be a finite, non-negative float \
   (seconds); NaN, infinity, and negative values are rejected";
@@ -206,10 +206,10 @@ pub(crate) mod finite_f64 {
 
 /// `serde` bridge for [`OfflineOptions::min_duration_off`]: refuses a
 /// non-finite OR negative value on both sides of the boundary — the exact
-/// predicate dia's [`diaric::offline::OfflineInput::with_min_duration_off`]
+/// predicate diaric's [`diaric::offline::OfflineInput::with_min_duration_off`]
 /// asserts (`check_min_duration_off`, see [`super::check_min_duration_off`]),
 /// so a serde-deserialized `OfflineOptions` (which bypasses the panicking
-/// builder) can never carry a value that would later panic dia. See
+/// builder) can never carry a value that would later panic diaric. See
 /// [`NEGATIVE_OR_NON_FINITE_MSG`].
 #[cfg(feature = "serde")]
 pub(crate) mod finite_nonneg_f64 {
@@ -406,7 +406,7 @@ impl OfflineOptions {
   /// consumes this as a non-negative seconds quantity, and `+∞` merges every
   /// same-cluster gap while `NaN` silently disables the merge. The serde
   /// boundary rejects the same values (the crate-private `finite_nonneg_f64`
-  /// serde helper), so no `OfflineOptions` ever reaches dia's assert.
+  /// serde helper), so no `OfflineOptions` ever reaches diaric's assert.
   #[inline(always)]
   pub const fn set_min_duration_off(&mut self, min_duration_off: f64) -> &mut Self {
     assert!(
@@ -420,11 +420,11 @@ impl OfflineOptions {
   /// Apply these five hyperparameters onto a [`diaric::offline::OfflineInput`],
   /// returning the tuned input ready for [`diaric::offline::diarize_offline`].
   ///
-  /// The SINGLE place [`OfflineOptions`] maps onto dia's `OfflineInput`
+  /// The SINGLE place [`OfflineOptions`] maps onto diaric's `OfflineInput`
   /// hyperparameter fields — one `with_*` builder per knob, in field order.
   /// [`crate::audio::speaker::extract::Extraction::diarize_with`] calls this over
   /// [`crate::audio::speaker::extract::Extraction::into_offline_input`]; the
-  /// `apply_to_maps_each_knob_to_its_dia_field` test pins each knob to its dia
+  /// `apply_to_maps_each_knob_to_its_dia_field` test pins each knob to its diaric
   /// field so a swapped mapping fails.
   ///
   /// With [`Self::default`] every applied value equals diaric's own default (see
@@ -433,7 +433,7 @@ impl OfflineOptions {
   /// [`crate::audio::speaker::extract::Extraction::diarize`] relies on for byte-identical
   /// default clustering.
   ///
-  /// Cannot panic dia's `with_min_duration_off`: [`Self::min_duration_off`] is
+  /// Cannot panic diaric's `with_min_duration_off`: [`Self::min_duration_off`] is
   /// finite and `>= 0` for every `OfflineOptions` (rejected at both the builder
   /// and the serde boundary), so the assert it re-checks always holds.
   #[must_use]
@@ -454,7 +454,7 @@ impl OfflineOptions {
 // Online engine options — FluidAudio SpeakerManager knobs, ported by dia's
 // `cluster::online::OnlineClusterOptions`. Mirror dia's contract 1:1 (defaults,
 // range predicates), then harden the serde boundary the same way OfflineOptions
-// does, so no OnlineOptions can drive dia's validating setters into a panic.
+// does, so no OnlineOptions can drive diaric's validating setters into a panic.
 // =====================================================================
 
 /// Default [`OnlineOptions::speaker_threshold`] — the assignment cosine
@@ -493,10 +493,10 @@ fn default_min_speech_duration() -> f32 {
 /// distance in `[0.0, 2.0]`. `v >= 0.0` rejects NaN and `-∞`; `v <= 2.0`
 /// rejects NaN, `+∞`, and any value past `cosine_distance`'s codomain — so no
 /// separate NaN clause is needed (unlike [`check_min_speech_duration`], whose
-/// upper bound is `+∞`). Matches the range dia's
+/// upper bound is `+∞`). Matches the range diaric's
 /// [`diaric::cluster::online::OnlineClusterOptions`] threshold setters assert
 /// (`diarization/src/cluster/online/options.rs`), so a value passing this
-/// cannot panic dia's setter in [`OnlineOptions::to_dia_options`].
+/// cannot panic diaric's setter in [`OnlineOptions::to_dia_options`].
 #[inline]
 #[allow(clippy::manual_range_contains)] // const fn: RangeInclusive::contains is not const at MSRV.
 const fn check_online_threshold(v: f32) -> bool {
@@ -516,15 +516,15 @@ const fn check_min_speech_duration(v: f32) -> bool {
 }
 
 /// The error a non-finite / out-of-range online threshold raises at the `serde`
-/// boundary. dia's threshold setters PANIC outside `[0.0, 2.0]`; rejecting the
+/// boundary. diaric's threshold setters PANIC outside `[0.0, 2.0]`; rejecting the
 /// same predicate here (and in the builder) means no serde-deserialized
-/// `OnlineOptions` can later panic dia in [`OnlineOptions::to_dia_options`].
+/// `OnlineOptions` can later panic diaric in [`OnlineOptions::to_dia_options`].
 #[cfg(feature = "serde")]
 const ONLINE_THRESHOLD_MSG: &str = "online cluster threshold must be a finite cosine distance in \
   [0.0, 2.0]; NaN, infinity, and out-of-range values are rejected";
 
 /// The error a non-finite / negative `min_speech_duration` raises at the
-/// `serde` boundary — the predicate dia's duration setter asserts.
+/// `serde` boundary — the predicate diaric's duration setter asserts.
 #[cfg(feature = "serde")]
 const ONLINE_DURATION_MSG: &str = "min_speech_duration must be a finite, non-negative float \
   (seconds); NaN, infinity, and negative values are rejected";
@@ -553,7 +553,7 @@ pub(crate) mod finite_threshold_f32 {
 }
 
 /// `serde` bridge for [`OnlineOptions::min_speech_duration`]: refuses a
-/// non-finite OR negative value on both sides — the exact predicate dia's
+/// non-finite OR negative value on both sides — the exact predicate diaric's
 /// duration setter asserts. See [`ONLINE_DURATION_MSG`].
 #[cfg(feature = "serde")]
 pub(crate) mod finite_nonneg_f32 {
@@ -606,7 +606,7 @@ pub(crate) mod finite_nonneg_f32 {
 /// [`Default`]) is the single source of the defaults, with a getter / `with_*`
 /// builder / `set_*` in-place setter per knob. Unlike [`OfflineOptions`]'s
 /// unchecked `threshold`/`fa`/`fb` (which mirror dia's unchecked `OfflineInput`
-/// setters), ALL three online setters panic-validate — because dia's
+/// setters), ALL three online setters panic-validate — because diaric's
 /// `OnlineClusterOptions` setters do, and [`Self::to_dia_options`] drives them.
 /// No `Eq`: the three `f32` knobs make it unsound, exactly as [`OfflineOptions`].
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -664,7 +664,7 @@ impl OnlineOptions {
   /// # Panics
   /// Panics if either derived threshold is non-finite or outside `[0.0, 2.0]`
   /// (e.g. `base > 1.666…` overflows `speaker_threshold` past `2.0`) — the same
-  /// predicate dia asserts.
+  /// predicate diaric asserts.
   #[must_use]
   pub const fn from_clustering_threshold(base: f32) -> Self {
     Self::new()
@@ -709,7 +709,7 @@ impl OnlineOptions {
   /// mirroring dia's [`diaric::cluster::online::OnlineClusterOptions`] threshold
   /// setter (a cosine distance has codomain `[0.0, 2.0]`). The serde boundary
   /// rejects the same values (the crate-private `finite_threshold_f32` helper),
-  /// so no `OnlineOptions` ever reaches dia's assert.
+  /// so no `OnlineOptions` ever reaches diaric's assert.
   #[inline(always)]
   pub const fn set_speaker_threshold(&mut self, speaker_threshold: f32) -> &mut Self {
     assert!(
@@ -773,18 +773,18 @@ impl OnlineOptions {
   /// [`diaric::cluster::online::OnlineClusterOptions`] — the input to
   /// [`diaric::cluster::online::OnlineClusterer::try_new`].
   ///
-  /// The SINGLE place [`OnlineOptions`] maps onto dia's online options (one
+  /// The SINGLE place [`OnlineOptions`] maps onto diaric's online options (one
   /// `with_*` builder per knob, in field order), the online analogue of
   /// [`OfflineOptions`]'s `apply_to`.
   /// [`crate::audio::speaker::extract::Extraction::diarize_online`] builds the clusterer from
   /// this, and the out-of-crate Swift-trace oracle
   /// (`tests/parity_online_swift.rs`) drives the engine through it — so the gate
   /// exercises the REAL wiring, not a re-implementation of it. The
-  /// `online_to_dia_options_maps_each_knob` test pins each knob to its dia
+  /// `online_to_dia_options_maps_each_knob` test pins each knob to its diaric
   /// field.
   ///
-  /// Cannot panic dia's validating setters: every `OnlineOptions` field
-  /// satisfies dia's predicate (finite thresholds in `[0.0, 2.0]`, finite
+  /// Cannot panic diaric's validating setters: every `OnlineOptions` field
+  /// satisfies diaric's predicate (finite thresholds in `[0.0, 2.0]`, finite
   /// non-negative duration), enforced at both this crate's builder and its
   /// serde boundary. With [`Self::default`] the result equals
   /// [`diaric::cluster::online::OnlineClusterOptions::default`].
@@ -883,7 +883,7 @@ define_cluster_backend! {
   #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
   #[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
   pub enum ClusterBackend {
-    /// dia's pyannote-community-1 offline pipeline
+    /// diaric's pyannote-community-1 offline pipeline
     /// ([`diaric::offline::diarize_offline`]), tuned by [`OfflineOptions`]. The
     /// default backend, and the one every DER parity gate drives.
     Offline(OfflineOptions) => "offline",

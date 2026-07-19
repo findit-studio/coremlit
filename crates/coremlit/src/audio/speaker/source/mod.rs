@@ -2,7 +2,7 @@
 //! `docs/superpowers/specs/2026-07-13-speakerkit-multisource-diarizer-backend-design.md`):
 //! [`ModelSource`] is the common interface every seg+embed backend
 //! implements, all normalizing to the same [`Extraction`] that feeds
-//! `dia`'s clustering via `Extraction::into_offline_input`.
+//! `diaric`'s clustering via `Extraction::into_offline_input`.
 //!
 //! # Why this exists
 //!
@@ -13,7 +13,7 @@
 //! packaging and in-graph preprocessing (design spec §3). So `speakerkit`
 //! is a *multi-source* backend: a caller selects which vendor's CoreML
 //! conversion computes the seg+embed tensors, and every source normalizes
-//! to the identical [`Extraction`] shape so `dia`'s clustering runs
+//! to the identical [`Extraction`] shape so `diaric`'s clustering runs
 //! unchanged regardless of which source produced it.
 //!
 //! # [`FluidAudioSource`]: the existing pipeline, unchanged
@@ -76,7 +76,7 @@ pub mod argmax;
 pub use argmax::{ArgmaxComputeOptions, ArgmaxOptions, ArgmaxSource, ArgmaxVariant};
 
 /// A pluggable seg+embed backend: given 16 kHz mono `samples`, produces the
-/// [`Extraction`] tensor set `dia`'s offline diarizer consumes. See the
+/// [`Extraction`] tensor set `diaric`'s offline diarizer consumes. See the
 /// module doc for why this crate has more than one implementation.
 pub trait ModelSource {
   /// Runs the full extraction over `samples`. Every implementation

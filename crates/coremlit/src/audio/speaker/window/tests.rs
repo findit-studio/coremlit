@@ -333,17 +333,17 @@ fn frame_sliding_window_matches_dia_constants() {
 
 // ---------------------------------------------------------------------
 // count_from_segmentations: hand-computed 3-chunk overlap (brief Step 1)
-// plus the dia code-oracle cross-check (brief Step 1, "THE ORACLE IS
+// plus the diaric code-oracle cross-check (brief Step 1, "THE ORACLE IS
 // CODE")
 // ---------------------------------------------------------------------
 
 /// Synthetic 3-chunk overlap scenario shared between the hand-computed
-/// hermetic test and the `dia`-gated code-oracle test: `num_chunks=3`,
+/// hermetic test and the `diaric` code-oracle test: `num_chunks=3`,
 /// `num_frames_per_chunk=4`, `num_speakers=2`, `chunks_sw = (0.0, 4.0,
 /// 2.0)`, `frames_sw = (0.0, 1.0, 1.0)`, `onset=0.5`.
 ///
-/// Hand derivation (also independently re-derived by dia's own
-/// `try_count_pyannote` in the `dia`-gated oracle test below):
+/// Hand derivation (also independently re-derived by diaric's own
+/// `try_count_pyannote` in the `diaric` oracle test below):
 ///
 /// `chunk_count[c][f]` (active-speaker count per (chunk, frame), `v >=
 /// 0.5`):
@@ -479,7 +479,7 @@ fn count_from_segmentations_matches_dia_oracle_3_chunk_overlap() {
 // fixture above)
 // ---------------------------------------------------------------------
 
-// Consumed only by the dia-oracle cross-check test below (unlike
+// Consumed only by the diaric code-oracle cross-check test below (unlike
 // `three_chunk_overlap_segmentations` above, there is no separate
 // hermetic hand-derived test at this data volume — see that test's own
 // doc for why). `diaric` is a runtime dependency, so `diaric::aggregate` is

@@ -1139,7 +1139,7 @@ fn load_pyannote_sample() -> Vec<f32> {
     .collect()
 }
 
-/// Asserts every [`Extraction`] invariant `dia`'s `OfflineInput` requires.
+/// Asserts every [`Extraction`] invariant `diaric`'s `OfflineInput` requires.
 fn assert_extraction_invariants(x: &Extraction, expected_chunks: usize) {
   assert_eq!(x.num_chunks(), expected_chunks);
   assert_eq!(x.num_frames_per_chunk(), ARGMAX_FRAMES_PER_WINDOW);
@@ -1392,7 +1392,7 @@ fn all_zero_mask_row_yields_a_finite_degenerate_constant() {
 ///   `SpeakerClustering.swift:23`) — and which `dia`'s clustering, the SAME
 ///   `filter_embeddings`, withholds too (`offline/algo.rs:598-656`) before
 ///   re-attaching them at nearest-centroid reassignment. This port carries
-///   their still-sparse clean masks into `dia`; `dia` then treats them exactly
+///   their still-sparse clean masks into `diaric`; `diaric` then treats them exactly
 ///   as argmax would.
 ///
 /// The second set is ~50× the first, and the fallback does NOT rescue it — that
@@ -1489,7 +1489,7 @@ fn no_consumed_slot_yields_the_degenerate_constant() {
   // The sparse-slot population the module doc distinguishes is REAL on this
   // fixture: these are the slots `dia`'s Stage 1 filter (the same one argmax's
   // own clustering uses) withholds from cluster formation and reassigns — this
-  // port hands their real embeddings to dia, every one just proven
+  // port hands their real embeddings to diaric, every one just proven
   // non-degenerate.
   assert!(
     sparse > 0,

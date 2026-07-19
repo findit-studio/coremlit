@@ -51,7 +51,7 @@
 //! `Sources/WhisperKit/Core/Audio/VoiceActivityDetector.swift`). They are
 //! computed by the graph and dropped on the floor. This port does the same,
 //! for the same reason: `Extraction` has no field either could fill, and
-//! inventing one would change the tensor set `dia` consumes.
+//! inventing one would change the tensor set `diaric` consumes.
 //!
 //! `sliding_window_waveform`'s **data** is likewise never read: the embedder
 //! is fed the *host's own* 30 s padded chunk waveform
@@ -208,7 +208,7 @@
 //!
 //! This port does not need to reuse that protection at the mask, because the
 //! clustering it feeds already provides it. Per the design spec §4 the
-//! clustering is `dia`'s — and `dia`'s `diarize_offline` opens with a bit-exact
+//! clustering is `diaric`'s — and `diaric`'s `diarize_offline` opens with a bit-exact
 //! port of the SAME pyannote community-1 `VBxClustering.filter_embeddings` that
 //! argmax's `VBxClustering.swift:50` ports (`offline/algo.rs:598-656`, with
 //! `MIN_ACTIVE_RATIO = 0.2` at `:622`), applied UNCONDITIONALLY to every
@@ -218,7 +218,7 @@
 //! offline path's `assign_embeddings` call at `offline/algo.rs:747`) — argmax's
 //! own withhold-then-`clusterReassignment` (`VBxClustering.swift:52,111`),
 //! reproduced downstream. So [`Extraction`] needs no "present, but do not
-//! cluster on me" channel: `dia` is that channel. What the mask still has to
+//! cluster on me" channel: `diaric` is that channel. What the mask still has to
 //! solve is a DIFFERENT, mask-level problem — a slot whose clean mask is
 //! (almost) all-zero pools over nothing and returns the degenerate constant
 //! above. For that — and only that — the port takes `dia`'s own mask-level
@@ -273,21 +273,21 @@
 //!
 //! It is easy to conflate `dia`'s exclude-overlap FALLBACK (which this port's
 //! mask construction implements) with argmax's `minActiveRatio` cluster-
-//! formation filter (which `dia`'s clustering applies). They are different
+//! formation filter (which `diaric`'s clustering applies). They are different
 //! rules, at very different bars, in different layers — and BOTH are live end
 //! to end:
 //!
 //! | rule | applied by | fires when | on `02_pyannote_sample` |
 //! |---|---|---|---|
 //! | exclude-overlap fallback (`clean_count <= 2` ⇒ use the raw mask) | THIS port's `build_speaker_masks` | starved clean mask | 0 of 41 active slots |
-//! | `minActiveRatio` filter (`clean_count <= 117`, `ratio <= 0.2`) | `dia`'s clustering (`offline/algo.rs:598-656`; reassignment `pipeline/algo.rs:636-712`) | sparse / overlap-heavy slot | 5 of 41 active slots |
+//! | `minActiveRatio` filter (`clean_count <= 117`, `ratio <= 0.2`) | `diaric`'s clustering (`offline/algo.rs:598-656`; reassignment `pipeline/algo.rs:636-712`) | sparse / overlap-heavy slot | 5 of 41 active slots |
 //!
 //! So a slot with, say, 40 clean frames of 589 keeps its SPARSE clean mask in
-//! the [`Extraction`] this port builds — but `dia` does NOT then cluster on it.
-//! `dia`'s Stage 1 withholds exactly those `clean_count <= 117` slots (the same
+//! the [`Extraction`] this port builds — but `diaric` does NOT then cluster on it.
+//! `diaric`'s Stage 1 withholds exactly those `clean_count <= 117` slots (the same
 //! 5 argmax's own filter would) from cluster FORMATION, and its reassignment
 //! re-attaches each to its nearest centroid. That is argmax's behaviour,
-//! reproduced by `dia` for every source — not an un-ported divergence, and
+//! reproduced by `diaric` for every source — not an un-ported divergence, and
 //! nothing an [`Extraction`] channel needs to add. The lone nuance is a
 //! boundary: `dia`'s `>=` keeps a slot with `clean == 0.2 * num_frames` where
 //! argmax's strict `>` drops it, but at `num_frames = 589` that threshold
@@ -301,7 +301,7 @@
 //!   sparse but *meaningless* (the norm-0.5356 constant) — becomes unreachable,
 //!   so no guard is needed for it;
 //! - mask construction stops being an argmax/`dia` hybrid. This port now builds
-//!   `dia`'s mask and feeds `dia`'s clustering, exactly as
+//!   `dia`'s mask and feeds `diaric`'s clustering, exactly as
 //!   [`crate::audio::speaker::source::FluidAudioSource`] does — and `dia` treats ITS own
 //!   segmenter's sparse-but-nonempty slots the same way (the same Stage 1 filter
 //!   and reassignment run on both sources), so the remaining sparse-slot
@@ -313,7 +313,7 @@
 //! `Extraction`'s contract couples the two tensors: a dropped `(chunk, slot)`
 //! has an all-zero `raw_embeddings` row **and** an all-zero `segmentations`
 //! column (`crate::audio::speaker::extract`'s module doc; dia's `owned.rs:561-571,619-630`).
-//! A nonzero column with a zero row would hand `dia` a chunk-slot that is
+//! A nonzero column with a zero row would hand `diaric` a chunk-slot that is
 //! active in the count tensor but has no embedding to cluster.
 //!
 //! Every slot this source leaves un-embedded therefore gets its segmentation
@@ -460,7 +460,7 @@ pub const ARGMAX_MIN_ACTIVE_FRAMES: f32 = 2.0;
 /// PLDA minimum raw-embedding L2 norm — the same guard
 /// [`crate::audio::speaker::extract::Extractor::extract`] applies (dia's inline `0.01`,
 /// `diarization/src/offline/owned.rs:619-630`), re-applied here because
-/// `Extraction` feeds the same `dia` clustering either way.
+/// `Extraction` feeds the same `diaric` clustering either way.
 ///
 /// It could never have substituted for an all-zero-mask guard — that
 /// embedding's norm is ≈ 0.5356, ~54× above this (module doc) — but with
@@ -973,7 +973,7 @@ fn window_plans(
 /// does, and the module doc gives the full argument. In short: argmax's
 /// unconditional clean mask starves a slot whose active frames are mostly
 /// overlap. argmax handles that sparse slot with its downstream `minActiveRatio`
-/// filter — which `dia`'s clustering applies too, for every source
+/// filter — which `diaric`'s clustering applies too, for every source
 /// (`VBxClustering.swift:50` ⇄ `offline/algo.rs:598-656`), so that protection is
 /// reproduced regardless. The fallback is a SEPARATE, mask-level fix: it makes
 /// the embedding real instead of the degenerate all-zero-mask constant, and

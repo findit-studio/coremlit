@@ -774,7 +774,7 @@ impl Extraction {
   /// [`Self::into_offline_input`] for how it threads through the bridge.
   ///
   /// Un-gated: `diaric` is a runtime dependency and `diaric::offline` is part of its
-  /// ort-free clustering surface, so this runs without `ort` (the `dia-oracle`
+  /// ort-free clustering surface, so this runs without `ort` (the `speaker-oracle`
   /// test feature only adds dia's ONNX reference oracle, never a runtime
   /// requirement).
   ///
