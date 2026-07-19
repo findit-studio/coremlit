@@ -137,6 +137,7 @@ Each pipeline resolves its models root from its own env var (`WHISPERKIT_TEST_MO
 | `cargo bench -p coremlit --features whisper --bench whisper_stages` | Hermetic criterion benches: logits filters, DTW, VAD chunking, compression ratio |
 | `cargo bench -p coremlit --features whisper --bench whisper_rtf` | End-to-end tokens/sec + real-time factor on the tiny model (skips without models) |
 | `cargo bench -p coremlit --features align --bench align_align` | Alignment encode / align_chunk RTF |
+| `cargo bench -p coremlit --features clap --bench clap_encode` | CLAP dual-tower encode phases (cold/cached load, first + warm inference) per tower × ComputeUnits, with output hash / cosine / RSS (skips without models; `CLAPKIT_BENCH_COLD=1` also measures cold specialization) |
 
 ## Feature flags
 

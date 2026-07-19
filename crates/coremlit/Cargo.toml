@@ -230,6 +230,12 @@ tokenizers.workspace = true
 # `clap`) read committed librosa `.npy` mel oracles via `npyz` (former clapkit
 # dev-dep).
 npyz.workspace = true
+# The `clap_encode` bench reports process RSS via `task_info(MACH_TASK_BASIC_INFO)`
+# (the same query as `audio::whisper::log::resident_memory_bytes`, which rides the
+# `whisper` feature the bench does not enable). Dev-deps compile only for
+# tests/benches/examples, so this adds nothing to the library's feature graph.
+libc.workspace = true
+mach2.workspace = true
 # `tests/align/parity_words.rs` names `asry::Aligner` (the ONNX oracle) and
 # `asry::ort::api()` directly, so asry must appear as a dev-dep too. Cargo
 # unions its features with the optional runtime entry above; `align-oracle`
@@ -517,6 +523,16 @@ required-features = ["clap-oracle"]
 name = "clap_tokenizer_identity_textclap"
 path = "tests/clap/tokenizer_identity_textclap.rs"
 required-features = ["clap-oracle"]
+
+# Dual-tower encode harness: cold/cached load, first + warm inference per tower ×
+# ComputeUnits (model-gated; `harness = false` custom main — the load phases are
+# one-shot costs criterion's resampling cannot see). Mirrors the whisper/align
+# bench registrations above.
+[[bench]]
+name = "clap_encode"
+path = "benches/clap/encode.rs"
+harness = false
+required-features = ["clap"]
 
 [lints]
 workspace = true
