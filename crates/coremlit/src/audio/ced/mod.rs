@@ -16,10 +16,12 @@
 
 use crate::ComputeUnits;
 
+pub mod aggregate;
 pub mod error;
 pub mod prediction;
 pub mod window;
 
+pub use aggregate::{ChunkAggregation, aggregate_windows};
 pub use error::Error;
 pub use prediction::{Confidences, EventPrediction, RatedSoundEvent, WindowConfidences};
 pub use window::{Span, TailPolicy, WindowPlan};

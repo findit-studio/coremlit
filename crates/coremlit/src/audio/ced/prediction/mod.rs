@@ -103,7 +103,6 @@ impl Confidences {
   /// # Panics
   /// If `values.len() != NUM_CLASSES` — an internal invariant (every producer
   /// is post-shape-check), not a caller-reachable path.
-  #[allow(dead_code)] // constructed by aggregate_windows; the sibling tests are the only caller so far
   pub(crate) fn new(values: Vec<f32>) -> Self {
     assert!(
       values.len() == NUM_CLASSES,
