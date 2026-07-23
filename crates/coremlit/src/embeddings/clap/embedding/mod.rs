@@ -224,6 +224,45 @@ impl fmt::Debug for Embedding {
   }
 }
 
+/// The windit aggregation seam: exposes the embedding's stored `f32` scalars and
+/// rebuilds a unit-norm [`Embedding`] from windit's `f64` compute-domain output,
+/// so the long-audio pipeline can aggregate per-window embeddings through
+/// windit's engine.
+///
+/// The inward error map is lossy by design and documented only here: a dimension
+/// mismatch keeps its `got`/`expected` payload, while both
+/// [`Error::NonFiniteEmbedding`] (dropping its `component_index`) and
+/// [`Error::EmbeddingZero`] collapse into [`WinditError::NonFinite`](windit::WinditError::NonFinite)
+/// — exactly windit's documented meaning, "no finite unit direction".
+impl windit::windowed::Vector for Embedding {
+  type Scalar = f32;
+
+  fn as_slice(&self) -> &[f32] {
+    // UFCS: the inherent `as_slice` shadows this trait method, so this is a call
+    // to the inherent accessor, not unbounded self-recursion.
+    Embedding::as_slice(self)
+  }
+
+  fn from_unnormalized(v: &[f64]) -> core::result::Result<Self, windit::WinditError> {
+    if v.len() != EMBEDDING_DIM {
+      return Err(windit::WinditError::DimMismatch {
+        got: v.len(),
+        expected: EMBEDDING_DIM,
+      });
+    }
+    // windit hands back an already-unit-normalized vector, so every component is
+    // in [-1, 1] and the f64→f32 narrowing cannot overflow; a pathological
+    // non-finite lands in `from_slice_normalizing`'s finite/zero guards.
+    let narrowed: [f32; EMBEDDING_DIM] = core::array::from_fn(|i| v[i] as f32);
+    Embedding::from_slice_normalizing(&narrowed).map_err(|e| match e {
+      Error::EmbeddingDimMismatch { got, expected } => {
+        windit::WinditError::DimMismatch { got, expected }
+      }
+      _ => windit::WinditError::NonFinite,
+    })
+  }
+}
+
 /// Scans a raw model-output projection — the copied CoreML tensor, before it is
 /// normalized into an [`Embedding`] — for the first non-finite (NaN/±∞)
 /// component, classifying it as MODEL corruption ([`Error::NonFiniteOutput`]).

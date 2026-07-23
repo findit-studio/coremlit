@@ -1,5 +1,8 @@
 use super::*;
-use crate::embeddings::clap::{embedding::EMBEDDING_DIM, window::WindowSpan};
+use crate::embeddings::clap::{
+  embedding::EMBEDDING_DIM,
+  window::{Span, WINDOW_SAMPLES},
+};
 
 /// A unit-norm embedding from the given `(index, weight)` components.
 fn emb(components: &[(usize, f32)]) -> Embedding {
@@ -90,8 +93,11 @@ fn per_window_scores_are_exposed() {
   let cat = emb(&[(1, 1.0)]);
   let anchors = [TextAnchor::new("dog", &dog), TextAnchor::new("cat", &cat)];
   let windows = [
-    WindowEmbedding::new(emb(&[(0, 1.0)]), WindowSpan::new(0, 480_000)),
-    WindowEmbedding::new(emb(&[(1, 1.0)]), WindowSpan::new(480_000, 480_000)),
+    WindowEmbedding::new(emb(&[(0, 1.0)]), Span::new(0, 480_000, WINDOW_SAMPLES)),
+    WindowEmbedding::new(
+      emb(&[(1, 1.0)]),
+      Span::new(480_000, 480_000, WINDOW_SAMPLES),
+    ),
   ];
   let per_window = score_windows(&windows, &anchors, ScoreMode::Cosine);
   assert_eq!(per_window.len(), 2);

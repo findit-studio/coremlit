@@ -1,11 +1,11 @@
 use super::*;
 
-/// Extract `(start, real_len)` pairs so the pinned geometry reads as data.
+/// Extract `(start, len)` pairs so the pinned geometry reads as data.
 fn offsets(plan: &WindowPlan, total: usize) -> Vec<(usize, usize)> {
   plan
     .spans(total)
     .iter()
-    .map(|s| (s.start(), s.real_len()))
+    .map(|s| (s.start(), s.len()))
     .collect()
 }
 
@@ -43,6 +43,23 @@ fn short_clip_is_one_window_regardless_of_hop() {
     assert_eq!(offsets(&plan, 100), vec![(0, 100)], "hop {hop}");
     assert_eq!(offsets(&plan, 480_000), vec![(0, 480_000)], "hop {hop}");
   }
+}
+
+#[test]
+fn short_clip_survives_drop_below_min() {
+  // Mismatch #1: windit's DropBelowMin drops a short clip's sole span; clap's
+  // contract keeps it — a clip's only representation is never dropped.
+  let plan = WindowPlan::new().with_tail_policy(TailPolicy::DropBelowMin {
+    min_samples: 200_000,
+  });
+  assert_eq!(
+    plan
+      .spans(100_000)
+      .iter()
+      .map(|s| (s.start(), s.len()))
+      .collect::<Vec<_>>(),
+    vec![(0, 100_000)]
+  );
 }
 
 #[test]
@@ -130,10 +147,11 @@ fn window_just_over_boundary_keeps_a_one_sample_tail_under_pad() {
 
 #[test]
 fn span_geometry_accessors() {
-  let s = WindowSpan::new(720_000, 280_000);
+  let s = Span::new(720_000, 280_000, WINDOW_SAMPLES);
   assert_eq!(s.start(), 720_000);
-  assert_eq!(s.real_len(), 280_000);
+  assert_eq!(s.len(), 280_000);
   assert_eq!(s.end(), 1_000_000);
+  assert_eq!(s.window(), WINDOW_SAMPLES);
   assert!((s.coverage() - 280_000.0 / 480_000.0).abs() < 1e-7);
 }
 
@@ -142,11 +160,11 @@ fn window_embedding_pairs_embedding_with_span() {
   let mut raw = [0.0f32; crate::embeddings::clap::embedding::EMBEDDING_DIM];
   raw[0] = 1.0;
   let emb = Embedding::from_slice_normalizing(&raw).unwrap();
-  let span = WindowSpan::new(0, 240_000);
+  let span = Span::new(0, 240_000, WINDOW_SAMPLES);
   let we = WindowEmbedding::new(emb, span);
   assert_eq!(we.span(), span);
-  assert_eq!(we.coverage(), 0.5);
-  assert_eq!(we.embedding().as_slice()[0], 1.0);
+  assert_eq!(we.span().coverage(), 0.5);
+  assert_eq!(we.value().as_slice()[0], 1.0);
 }
 
 #[test]

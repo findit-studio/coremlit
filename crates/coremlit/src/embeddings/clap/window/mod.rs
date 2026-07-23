@@ -1,17 +1,68 @@
 //! Overlapped long-audio chunking: [`WindowPlan`] turns a clip length into a
-//! list of [`WindowSpan`]s the [`AudioEncoder`](crate::embeddings::clap::AudioEncoder) embeds one
-//! at a time, and [`WindowEmbedding`] pairs each resulting embedding with the
-//! span it came from (start, real length, and tail-padding-aware coverage) so an
+//! list of [`Span`]s the [`AudioEncoder`](crate::embeddings::clap::AudioEncoder) embeds one at a
+//! time, and [`WindowEmbedding`] pairs each resulting embedding with the [`Span`]
+//! it came from (start, real length, and tail-padding-aware coverage) so an
 //! [`AggregatePolicy`](crate::embeddings::clap::aggregate::AggregatePolicy) can weight by time,
 //! overlap, or coverage.
 //!
+//! # windit engine + two clap-contract guards
+//!
+//! The window GEOMETRY and per-window AGGREGATION are the generic `windit`
+//! windowed-sequence engine: [`Span`] is `windit::plan::Span`, [`WindowEmbedding`]
+//! is `windit::windowed::WindowEmbedding<Embedding>`, and [`WindowPlan::spans`]
+//! plans the head through `windit::plan::WindowPlan`. Two behaviours are clap's
+//! own contract, reproduced as thin guards on top of the windit plan so the
+//! pinned geometry stays bit-for-bit what it always was:
+//!
+//! 1. **Short clip** (`total <= WINDOW_SAMPLES`): exactly one span, whatever the
+//!    hop AND tail policy — windit's `DropBelowMin` would drop the sole span of a
+//!    short clip, but clap never drops a clip's only representation.
+//! 2. **Multi-tail continuation**: windit stops at the first ragged tail, whereas
+//!    clap's overlapped plan (`hop < window`) keeps striding, emitting
+//!    progressively shorter tails until the stride passes the clip end.
+//!
+//! For `total > W`, windit visits starts `0, H, 2H, …` and stops at the first
+//! `start` with `total − start ≤ W`, i.e. `first_tail_start = ceil((total − W)/H)·H`;
+//! head spans and that first tail match clap's old loop term for term, and the
+//! continuation reproduces its remaining iterations verbatim.
+//!
+//! # What windit does NOT replace: the mel `repeatpad`
+//!
+//! windit owns geometry and aggregation ONLY. The audio path still slices
+//! `&samples[span.start()..span.end()]` and hands the (possibly short) slice to
+//! the encoder, whose mel front-end `repeatpad`s it up to the fixed window —
+//! windit's constant-right-pad helper is not used, and the mel path is untouched.
+//!
+//! # Wire format
+//!
+//! [`TailPolicy`] and [`WindowPlan`] keep their own clap-owned serde
+//! representations (windit's `serde` feature is off), so the golden-pinned wire
+//! spellings and the validated deserialization are unchanged by the windit port.
+//!
 //! The window length is **fixed** at [`WINDOW_SAMPLES`] (480 000 = 10 s at
 //! 48 kHz) — the model's geometry, not a knob. Only the hop and the tail policy
-//! are configurable. This module is pure geometry: it holds no audio and touches
-//! no model, so its offsets and coverages are hermetically pinned
-//! (`tests/`-free — see the sibling `tests.rs`).
+//! are configurable. This module holds no audio and touches no model, so its
+//! offsets and coverages are hermetically pinned (see the sibling `tests.rs`).
 
 use crate::embeddings::clap::{audio::TARGET_SAMPLES, embedding::Embedding};
+
+/// windit's window span (`windit::plan::Span`), re-exported as clap's window
+/// geometry unit — the half-open real range `[start, end)` a [`WindowPlan`]
+/// plans and the [`AudioEncoder`](crate::embeddings::clap::AudioEncoder) embeds. Every
+/// clap-produced span carries `window() == `[`WINDOW_SAMPLES`], so
+/// [`Span::coverage`] is the padding-aware `real length / 480_000` fraction a
+/// coverage-weighting policy uses. (`Span::new` is 3-arg — `(start, len,
+/// window)` — and reports `len()`/`end()`; there is no `real_len()`.)
+pub use windit::plan::Span;
+
+/// A per-window embedding paired with the [`Span`] it was computed from — the
+/// input unit to aggregation, `windit::windowed::WindowEmbedding<Embedding>`.
+/// Carrying the span (and thus [`Span::coverage`]) alongside the embedding is
+/// what lets a policy weight windows by time, overlap, or tail coverage. Build
+/// one with [`WindowEmbedding::new`](windit::windowed::Windowed::new); read it
+/// back with [`value`](windit::windowed::Windowed::value) and
+/// [`span`](windit::windowed::Windowed::span).
+pub type WindowEmbedding = windit::windowed::WindowEmbedding<Embedding>;
 
 #[cfg(test)]
 mod tests;
@@ -20,7 +71,7 @@ mod tests;
 ///
 /// The CLAP HTSAT graph consumes exactly this many samples per inference (via
 /// the mel front-end, which `repeatpad`s a shorter tail up to it), so it is the
-/// window every [`WindowSpan`] is measured against — the geometry, not a tunable
+/// window every [`Span`] is measured against — the geometry, not a tunable
 /// preference. Equal to [`crate::embeddings::clap::audio::TARGET_SAMPLES`].
 pub const WINDOW_SAMPLES: usize = TARGET_SAMPLES;
 
@@ -38,7 +89,7 @@ pub const DEFAULT_TAIL_MIN_SAMPLES: u32 = (WINDOW_SAMPLES / 4) as u32;
 /// full [`WINDOW_SAMPLES`] window.
 ///
 /// A short tail is embedded by `repeatpad`ing it up to the fixed window, so a
-/// kept tail's [`WindowSpan::coverage`] is `< 1.0` — the padding-aware fraction a
+/// kept tail's [`Span::coverage`] is `< 1.0` — the padding-aware fraction a
 /// coverage-weighting policy uses to down-weight it. This policy chooses whether
 /// such a tail is kept at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -59,97 +110,6 @@ pub enum TailPolicy {
     /// by [`WindowPlan`]'s checked setters and serde path.
     min_samples: u32,
   },
-}
-
-/// One planned inference window over a caller's sample buffer: where it starts
-/// and how many **real** samples it covers.
-///
-/// Interior windows cover a full [`WINDOW_SAMPLES`]; a kept tail (or a clip
-/// shorter than one window) covers fewer, and [`Self::coverage`] reports the
-/// padding-aware fraction. The half-open real range is `[start, end)` with
-/// `end == start + real_len` — exactly the slice
-/// [`AudioEncoder::embed_windows`](crate::embeddings::clap::AudioEncoder::embed_windows) hands to
-/// the encoder (which `repeatpad`s it to the fixed window).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct WindowSpan {
-  start: usize,
-  real_len: usize,
-}
-
-impl WindowSpan {
-  /// A span starting at `start` covering `real_len` real samples.
-  ///
-  /// `real_len` is expected in `1..=`[`WINDOW_SAMPLES`] (every span
-  /// [`WindowPlan::spans`] produces is), so [`Self::coverage`] lands in
-  /// `(0, 1]`; a larger `real_len` is not rejected but yields a coverage above 1.
-  pub const fn new(start: usize, real_len: usize) -> Self {
-    Self { start, real_len }
-  }
-
-  /// First sample index this window covers.
-  #[inline]
-  pub const fn start(&self) -> usize {
-    self.start
-  }
-
-  /// Number of **real** (non-padding) samples this window covers.
-  #[inline]
-  pub const fn real_len(&self) -> usize {
-    self.real_len
-  }
-
-  /// One past the last real sample: `start + real_len`. The end of the slice fed
-  /// to the encoder.
-  #[inline]
-  pub const fn end(&self) -> usize {
-    self.start + self.real_len
-  }
-
-  /// Real-coverage fraction `real_len / `[`WINDOW_SAMPLES`] — `1.0` for a full
-  /// interior window, `< 1.0` for a `repeatpad`-padded tail. The weight a
-  /// coverage-aware [`AggregatePolicy`](crate::embeddings::clap::aggregate::AggregatePolicy) uses.
-  #[inline]
-  pub fn coverage(&self) -> f32 {
-    self.real_len as f32 / WINDOW_SAMPLES as f32
-  }
-}
-
-/// A per-window embedding paired with the [`WindowSpan`] it was computed from —
-/// the input unit to an [`AggregatePolicy`](crate::embeddings::clap::aggregate::AggregatePolicy).
-///
-/// Carrying the span (and thus [`Self::coverage`]) alongside the embedding is
-/// what lets a custom policy weight windows by time, overlap, or tail coverage
-/// rather than treating them all equally.
-#[derive(Debug, Clone)]
-pub struct WindowEmbedding {
-  embedding: Embedding,
-  span: WindowSpan,
-}
-
-impl WindowEmbedding {
-  /// Pair `embedding` with the `span` it was computed from.
-  pub const fn new(embedding: Embedding, span: WindowSpan) -> Self {
-    Self { embedding, span }
-  }
-
-  /// The window's unit-norm embedding.
-  #[inline]
-  pub const fn embedding(&self) -> &Embedding {
-    &self.embedding
-  }
-
-  /// The span this embedding was computed from.
-  #[inline]
-  pub const fn span(&self) -> WindowSpan {
-    self.span
-  }
-
-  /// The window's real-coverage fraction — [`WindowSpan::coverage`] of
-  /// [`Self::span`].
-  #[inline]
-  pub fn coverage(&self) -> f32 {
-    self.span.coverage()
-  }
 }
 
 /// Whether `hop_samples` is in the valid `1..=WINDOW_SAMPLES` range: positive
@@ -177,7 +137,7 @@ const fn check_tail(tail: TailPolicy) -> bool {
 /// [`WINDOW_SAMPLES`] window (rust-options-pattern).
 ///
 /// [`Self::spans`] is the pure-geometry core — it maps a clip length to the list
-/// of [`WindowSpan`]s to embed, with no audio and no model involved, so the
+/// of [`Span`]s to embed, with no audio and no model involved, so the
 /// offsets and coverages are hermetically testable.
 ///
 /// # Validated deserialization
@@ -325,44 +285,71 @@ impl WindowPlan {
     self
   }
 
-  /// Map a clip of `total_samples` to the [`WindowSpan`]s to embed.
+  /// The windit [`WindowOptions`](windit::plan::WindowOptions) that reproduce
+  /// clap's head + first-tail geometry: the fixed [`WINDOW_SAMPLES`] window, this
+  /// plan's hop, and the tail policy mapped to windit's. `Pad` maps to `PadFull`
+  /// (whose spans are identical to `KeepWithCoverage`, chosen because it
+  /// documents clap's intent — the mel front-end `repeatpad`s the kept tail).
+  fn windit_options(&self) -> windit::plan::WindowOptions {
+    windit::plan::WindowOptions::new(WINDOW_SAMPLES)
+      .with_hop(self.hop_samples as usize)
+      .with_tail(match self.tail {
+        TailPolicy::Pad => windit::plan::TailPolicy::PadFull,
+        TailPolicy::DropBelowMin { min_samples } => {
+          windit::plan::TailPolicy::DropBelowMin(min_samples as usize)
+        }
+      })
+  }
+
+  /// Map a clip of `total_samples` to the [`Span`]s to embed.
   ///
   /// Geometry (window `W` = [`WINDOW_SAMPLES`], hop `H` = [`Self::hop_samples`]):
   ///
   /// - `total_samples == 0` → no windows (an empty clip has nothing to embed).
   /// - `total_samples <= W` → exactly one span `[0, total_samples)`, coverage
-  ///   `total_samples / W` (`≤ 1.0`) — so a short clip is embedded once,
-  ///   `repeatpad`-padded, regardless of hop, matching textclap's single-chunk
-  ///   rule (a smaller hop would otherwise re-embed the same content).
-  /// - `total_samples > W` → spans at `0, H, 2H, …` while the start is below
-  ///   `total_samples`. Each covers `min(W, total_samples - start)` real
-  ///   samples; the interior ones are full windows and the final one may be a
-  ///   short tail, kept or dropped per [`Self::tail_policy`]. The first span is
-  ///   always kept.
+  ///   `total_samples / W` (`≤ 1.0`) — a short clip is embedded once,
+  ///   `repeatpad`-padded, regardless of hop AND tail policy (clap contract 1:
+  ///   windit's `DropBelowMin` would drop a short clip's sole span, but clap
+  ///   never drops a clip's only representation).
+  /// - `total_samples > W` → the windit plan (spans at `0, H, 2H, …` up to the
+  ///   first ragged tail), then clap's multi-tail continuation (clap contract 2:
+  ///   windit stops at the first tail, clap keeps striding, emitting
+  ///   progressively shorter tails, each kept iff its real length meets the
+  ///   policy threshold).
+  ///
+  /// The output is bit-for-bit clap's pre-windit geometry; see the module docs
+  /// for the equivalence argument.
   #[must_use]
-  pub fn spans(&self, total_samples: usize) -> Vec<WindowSpan> {
+  pub fn spans(&self, total_samples: usize) -> Vec<Span> {
     if total_samples == 0 {
       return Vec::new();
     }
+    // clap contract 1 (SHORT CLIP): total <= window ⇒ exactly one span,
+    // regardless of hop AND tail policy.
     if total_samples <= WINDOW_SAMPLES {
-      return vec![WindowSpan::new(0, total_samples)];
+      return vec![Span::new(0, total_samples, WINDOW_SAMPLES)];
     }
-
+    let mut spans = windit::plan::WindowPlan::spans(&self.windit_options(), total_samples).expect(
+      "windit options are valid by construction: WINDOW_SAMPLES is a non-zero const, \
+       hop is setter/serde-validated into 1..=WINDOW_SAMPLES, and no max_windows cap is set; \
+       the only remaining failure is allocator refusal, where the pre-windit Vec growth aborted too",
+    );
+    // clap contract 2 (MULTI-TAIL): windit stops at the first span that reaches
+    // the clip end; clap's overlapped plan (hop < window) keeps striding,
+    // emitting progressively shorter tails until the stride passes the end. The
+    // first tail start is derived arithmetically because DropBelowMin may have
+    // dropped that span from the windit plan.
     let hop = self.hop_samples as usize;
     let min_keep = match self.tail {
       TailPolicy::Pad => 1,
       TailPolicy::DropBelowMin { min_samples } => min_samples as usize,
     };
-
-    let mut spans = Vec::new();
-    let mut start = 0;
+    let first_tail_start = (total_samples - WINDOW_SAMPLES).div_ceil(hop) * hop;
+    let mut start = first_tail_start + hop;
     while start < total_samples {
-      let real_len = (total_samples - start).min(WINDOW_SAMPLES);
-      // Keep a full interior window always; keep a short tail only if it meets
-      // the policy threshold, and always keep the very first span so a clip
-      // longer than one window can never plan to nothing.
-      if real_len == WINDOW_SAMPLES || real_len >= min_keep || spans.is_empty() {
-        spans.push(WindowSpan::new(start, real_len));
+      let len = total_samples - start; // < WINDOW_SAMPLES here, >= 1
+      if len >= min_keep {
+        spans.push(Span::new(start, len, WINDOW_SAMPLES));
       }
       start += hop;
     }

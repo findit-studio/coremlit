@@ -10,6 +10,11 @@
 /// Convenience alias for `Result<T, `[`Error`]`>`.
 pub type Result<T> = core::result::Result<T, Error>;
 
+/// Re-exported so callers (and tests) can name and match the typed error
+/// [`Error::Windowing`] carries from the windit windowed-sequence engine
+/// (`embed_long`'s content-aware chunking and window aggregation).
+pub use windit::WinditError;
+
 /// Any failure loading the granite text embedder, running inference, tokenizing
 /// text, or constructing an [`crate::embeddings::granite::Embedding`].
 #[derive(Debug, thiserror::Error)]
@@ -126,6 +131,32 @@ pub enum Error {
   TokenIdRange {
     /// The offending token id.
     id: u32,
+  },
+
+  /// A windowed-sequence operation ([`TextEmbedder::embed_long`]'s content-aware
+  /// chunking or window aggregation) failed inside the windit engine. Carries
+  /// windit's own typed error unchanged ([`WinditError`] is `#[non_exhaustive]`,
+  /// so match it with a wildcard arm). Notably `WinditError::NonFinite` here is
+  /// windit's determinacy gate — an aggregate whose per-chunk embeddings cancel
+  /// exactly has no direction at working precision.
+  ///
+  /// [`TextEmbedder::embed_long`]: crate::embeddings::granite::TextEmbedder::embed_long
+  #[error("windowed-sequence processing failed: {0}")]
+  Windowing(#[from] WinditError),
+
+  /// [`TextEmbedder::embed_long_with`] was configured with a per-chunk token
+  /// budget above the model's fixed input window ([`MAX_TOKENS`]), so every chunk
+  /// would be silently truncated by the tokenizer. Rejected before any chunking
+  /// or prediction runs.
+  ///
+  /// [`TextEmbedder::embed_long_with`]: crate::embeddings::granite::TextEmbedder::embed_long_with
+  /// [`MAX_TOKENS`]: crate::embeddings::granite::MAX_TOKENS
+  #[error("embed_long window budget {window} exceeds the model's fixed {max}-token input window")]
+  WindowOverBudget {
+    /// The requested per-chunk token budget (`opts.window()`).
+    window: usize,
+    /// The model's fixed input window ([`MAX_TOKENS`](crate::embeddings::granite::MAX_TOKENS)).
+    max: usize,
   },
 }
 

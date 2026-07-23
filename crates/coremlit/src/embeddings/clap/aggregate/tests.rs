@@ -1,5 +1,9 @@
 use super::*;
-use crate::embeddings::clap::window::WindowSpan;
+use crate::embeddings::clap::{
+  embedding::EMBEDDING_DIM,
+  error::WinditError,
+  window::{Span, WINDOW_SAMPLES},
+};
 
 const FRAC_1_SQRT_2: f32 = std::f32::consts::FRAC_1_SQRT_2; // 1/√2 ≈ 0.70710677
 
@@ -9,7 +13,7 @@ fn axis(i: usize, real_len: usize) -> WindowEmbedding {
   let mut v = [0.0f32; EMBEDDING_DIM];
   v[i] = 1.0;
   let e = Embedding::from_slice_normalizing(&v).unwrap();
-  WindowEmbedding::new(e, WindowSpan::new(0, real_len))
+  WindowEmbedding::new(e, Span::new(0, real_len, WINDOW_SAMPLES))
 }
 
 fn assert_close(got: &Embedding, expected: &[(usize, f32)]) {
@@ -28,15 +32,13 @@ fn assert_close(got: &Embedding, expected: &[(usize, f32)]) {
 
 #[test]
 fn mean_of_two_orthogonal_windows_is_the_bisector() {
-  let out = MeanRenormalized
-    .aggregate(&[axis(0, 480_000), axis(1, 480_000)])
-    .unwrap();
+  let out = aggregate(&MeanRenormalized, &[axis(0, 480_000), axis(1, 480_000)]).unwrap();
   assert_close(&out, &[(0, FRAC_1_SQRT_2), (1, FRAC_1_SQRT_2)]);
 }
 
 #[test]
 fn mean_of_one_window_is_that_window() {
-  let out = MeanRenormalized.aggregate(&[axis(3, 240_000)]).unwrap();
+  let out = aggregate(&MeanRenormalized, &[axis(3, 240_000)]).unwrap();
   assert_close(&out, &[(3, 1.0)]);
 }
 
@@ -44,26 +46,30 @@ fn mean_of_one_window_is_that_window() {
 fn ema_alpha_edges_pick_first_and_last() {
   let windows = [axis(0, 480_000), axis(1, 480_000)];
   // alpha = 0 keeps the first window; alpha = 1 keeps the last.
-  let first = EmaRenormalized::new(0.0).aggregate(&windows).unwrap();
+  let first = aggregate(&EmaRenormalized::new(0.0), &windows).unwrap();
   assert_close(&first, &[(0, 1.0), (1, 0.0)]);
-  let last = EmaRenormalized::new(1.0).aggregate(&windows).unwrap();
+  let last = aggregate(&EmaRenormalized::new(1.0), &windows).unwrap();
   assert_close(&last, &[(0, 0.0), (1, 1.0)]);
 }
 
 #[test]
 fn ema_half_over_two_windows_is_the_bisector() {
-  let out = EmaRenormalized::new(0.5)
-    .aggregate(&[axis(0, 480_000), axis(1, 480_000)])
-    .unwrap();
+  let out = aggregate(
+    &EmaRenormalized::new(0.5),
+    &[axis(0, 480_000), axis(1, 480_000)],
+  )
+  .unwrap();
   assert_close(&out, &[(0, FRAC_1_SQRT_2), (1, FRAC_1_SQRT_2)]);
 }
 
 #[test]
 fn ema_half_over_three_windows() {
   // ema = (0.25, 0.25, 0.5) before renormalization (‖·‖ = √0.375).
-  let out = EmaRenormalized::new(0.5)
-    .aggregate(&[axis(0, 480_000), axis(1, 480_000), axis(2, 480_000)])
-    .unwrap();
+  let out = aggregate(
+    &EmaRenormalized::new(0.5),
+    &[axis(0, 480_000), axis(1, 480_000), axis(2, 480_000)],
+  )
+  .unwrap();
   assert_close(
     &out,
     &[(0, 0.408_248_3), (1, 0.408_248_3), (2, 0.816_496_6)],
@@ -74,9 +80,7 @@ fn ema_half_over_three_windows() {
 fn coverage_weighting_down_weights_a_padded_tail() {
   // Full window on axis 0 (coverage 1.0) + quarter-coverage tail on axis 1
   // (coverage 0.25): weighted mean = (0.8, 0.2), renormalized.
-  let out = CoverageWeightedMean
-    .aggregate(&[axis(0, 480_000), axis(1, 120_000)])
-    .unwrap();
+  let out = aggregate(&CoverageWeightedMean, &[axis(0, 480_000), axis(1, 120_000)]).unwrap();
   assert_close(&out, &[(0, 0.970_142_5), (1, 0.242_535_63)]);
   // Contrast: an equal-weight mean would put both at 1/√2 ≈ 0.707 — the tail is
   // demonstrably down-weighted (0.24 < 0.71).
@@ -86,8 +90,8 @@ fn coverage_weighting_down_weights_a_padded_tail() {
 #[test]
 fn coverage_weighting_equals_mean_at_full_coverage() {
   let windows = [axis(0, 480_000), axis(1, 480_000)];
-  let cov = CoverageWeightedMean.aggregate(&windows).unwrap();
-  let mean = MeanRenormalized.aggregate(&windows).unwrap();
+  let cov = aggregate(&CoverageWeightedMean, &windows).unwrap();
+  let mean = aggregate(&MeanRenormalized, &windows).unwrap();
   assert!(cov.is_close(&mean, 1e-6));
 }
 
@@ -99,7 +103,7 @@ fn every_policy_rejects_empty_windows() {
     &CoverageWeightedMean,
   ];
   for p in policies {
-    assert!(matches!(p.aggregate(&[]), Err(Error::EmptyWindows)));
+    assert!(matches!(aggregate(p, &[]), Err(Error::EmptyWindows)));
   }
 }
 
@@ -107,17 +111,10 @@ fn every_policy_rejects_empty_windows() {
 fn ema_rejects_out_of_range_alpha_at_aggregation() {
   let windows = [axis(0, 480_000)];
   for bad in [1.5f32, -0.1, f32::NAN, f32::INFINITY] {
-    let err = EmaRenormalized::new(bad).aggregate(&windows).unwrap_err();
+    let err = aggregate(&EmaRenormalized::new(bad), &windows).unwrap_err();
     assert!(
-      matches!(
-        err,
-        Error::InvalidPolicyParameter {
-          policy: "EmaRenormalized",
-          param: "alpha",
-          ..
-        }
-      ),
-      "alpha {bad} should be rejected, got {err:?}"
+      matches!(err, Error::Windowing(WinditError::AlphaOutOfRange)),
+      "alpha {bad} should be rejected as Windowing(AlphaOutOfRange), got {err:?}"
     );
   }
 }
@@ -127,17 +124,17 @@ fn into_policy_dispatches_to_the_matching_built_in() {
   let windows = [axis(0, 480_000), axis(1, 120_000)];
   let cases = [
     (AggregatePolicyKind::MeanRenormalized, {
-      MeanRenormalized.aggregate(&windows).unwrap()
+      aggregate(&MeanRenormalized, &windows).unwrap()
     }),
     (AggregatePolicyKind::EmaRenormalized { alpha: 0.5 }, {
-      EmaRenormalized::new(0.5).aggregate(&windows).unwrap()
+      aggregate(&EmaRenormalized::new(0.5), &windows).unwrap()
     }),
     (AggregatePolicyKind::CoverageWeightedMean, {
-      CoverageWeightedMean.aggregate(&windows).unwrap()
+      aggregate(&CoverageWeightedMean, &windows).unwrap()
     }),
   ];
   for (kind, expected) in cases {
-    let via_box = kind.into_policy().aggregate(&windows).unwrap();
+    let via_box = aggregate(kind.into_policy().as_ref(), &windows).unwrap();
     assert!(
       via_box.is_close(&expected, 1e-6),
       "{kind:?} box disagreed with the concrete policy"

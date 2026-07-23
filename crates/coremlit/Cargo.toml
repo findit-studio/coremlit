@@ -83,7 +83,7 @@ vad-bundled = ["vad", "silero/bundled"]
 # (`rustfft`) around two fp16 graphs, plus the pinned Xenova tokenizer
 # (`tokenizers`, shared with `whisper`). NO ort in this path; `default = []`
 # pulls none of it.
-clap = ["dep:rustfft", "dep:tokenizers"]
+clap = ["dep:rustfft", "dep:tokenizers", "dep:windit"]
 # Former clapkit `parity-oracle`: the textclap model-level parity oracle (its
 # Xenova ONNX via `ort`) for the characterized parity gates. DEV/TEST only —
 # adds nothing to the library. clapkit links only textclap's BUNDLED_TOKENIZER
@@ -98,7 +98,7 @@ clap-oracle = ["clap", "dep:textclap"]
 # transformers-fp32 goldens (`tests/granite/fixtures/goldens/`), never a live
 # ONNX crate — so there is NO `granite-oracle` feature and NO `ort` in this path.
 # `default = []` pulls none of it.
-granite = ["dep:tokenizers"]
+granite = ["dep:tokenizers", "dep:windit", "windit/text"]
 
 [dependencies]
 # --- core CoreML runtime (always compiled) ---
@@ -221,6 +221,27 @@ rustfft = { workspace = true, optional = true }
 #   textclap = { path = "../textclap" }
 #
 textclap = { git = "https://github.com/Findit-AI/textclap", rev = "584f21754337a0f6cc7575fa83e9e49a38e99ee9", optional = true }
+
+# --- embeddings shared windowing engine (the `clap` + `granite` features) ---
+# `windit` is the generic windowed-sequence engine (plan / split / aggregate)
+# both embedding families consume: CLAP's long-audio window geometry +
+# aggregation and granite's `embed_long` content-aware chunking + aggregation
+# ride it. Rev-pinned to the PUBLIC windit repo at its reviewed main HEAD (the
+# asry/diaric convention). windit 0.1.0 is also published on crates.io with the
+# same API surface; RE-PIN to `windit = "0.1"` in the same follow-up wave as
+# the silero/diaric re-pins (does not change the feature posture below).
+# windit's default features stay on (`alloc` — the planner/aggregate/split `Vec`
+# APIs live there); `serde` is NOT enabled (clap keeps its own wire-pinned config
+# types; granite serializes nothing of windit's), nor `half`, nor `std` (windit
+# uses `core::error::Error`). `windit/text` rides `granite` only (content-aware
+# chunking → `unicode-segmentation`); a clap-only build stays free of it.
+# CO-DEV: to build against a LOCAL windit checkout, add an UNCOMMITTED patch to
+# the WORKSPACE ROOT Cargo.toml (never commit it):
+#
+#   [patch."https://github.com/findit-studio/windit"]
+#   windit = { path = "../windit" }
+#
+windit = { git = "https://github.com/findit-studio/windit", rev = "b49888002bcbf4927cf69e83323f15652655eed0", optional = true }
 
 [dev-dependencies]
 # Integration tests / benches / examples are external consumers: they link the
@@ -558,6 +579,14 @@ required-features = ["granite"]
 [[test]]
 name = "granite_placement"
 path = "tests/granite/placement.rs"
+required-features = ["granite"]
+
+# The long-input windowing gate: content-aware chunk geometry is proven hermetic
+# in-lib; this suite gates the CoreML per-chunk embedding + windit aggregation on
+# the staged granite artifact (`#[ignore]` + Models/ layout, like the others).
+[[test]]
+name = "granite_embed_long"
+path = "tests/granite/embed_long.rs"
 required-features = ["granite"]
 # Dual-tower encode harness: first-observed/cached load, first + warm inference
 # per tower × ComputeUnits (model-gated; `harness = false` custom main — the load

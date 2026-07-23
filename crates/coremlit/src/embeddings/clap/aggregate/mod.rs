@@ -1,15 +1,16 @@
-//! Window-embedding aggregation: the open [`AggregatePolicy`] seam, its three
-//! shipped built-ins, and the serde-able [`AggregatePolicyKind`] wrapper for
-//! config surfaces.
+//! Window-embedding aggregation: coremlit re-exports windit's aggregation engine
+//! — the object-safe [`AggregatePolicy`] seam and its built-in strategies
+//! ([`CoverageWeightedMean`], [`MeanRenormalized`], [`EmaRenormalized`]) — and
+//! adds a thin clap-typed [`aggregate`] wrapper plus the serde-able
+//! [`AggregatePolicyKind`] selector for config surfaces.
 //!
 //! A long clip becomes a list of [`WindowEmbedding`]s (one per
-//! [`WindowSpan`](crate::embeddings::clap::window::WindowSpan) produced by
+//! [`Span`](crate::embeddings::clap::window::Span) produced by
 //! [`WindowPlan`](crate::embeddings::clap::window::WindowPlan) and embedded by
-//! [`AudioEncoder::embed_windows`](crate::embeddings::clap::AudioEncoder::embed_windows)); a policy
-//! combines them into one clip-level [`Embedding`]. The set is deliberately
-//! **open** — end users implement [`AggregatePolicy`] for strategies the
-//! built-ins don't cover — so the seam is a trait, mirroring whisperkit's
-//! object-safe `VoiceActivityDetector`.
+//! [`AudioEncoder::embed_windows`](crate::embeddings::clap::AudioEncoder::embed_windows));
+//! [`aggregate`] combines them into one clip-level [`Embedding`] under any
+//! [`AggregatePolicy`]. The seam is windit's object-safe trait, so end users
+//! implement it for strategies the built-ins don't cover.
 //!
 //! Per-window embeddings are always exposed upstream (see
 //! [`AudioEncoder::embed_windows`](crate::embeddings::clap::AudioEncoder::embed_windows)) and
@@ -17,57 +18,76 @@
 //! [`score_windows`](crate::embeddings::clap::score::score_windows), so score-level smoothing or
 //! voting needs no second trait seam (the deliberate cut recorded in the spec
 //! amendment).
+//!
+//! windit's `serde` feature is deliberately NOT enabled, so its own
+//! differently-spelled `AggregatePolicyKind` never compiles; the golden-pinned
+//! wire spellings live on clap's own [`AggregatePolicyKind`] below, mapped to
+//! windit policies in [`AggregatePolicyKind::into_policy`]. `SaliencyWeighted` is
+//! deliberately not re-exported: [`aggregate`] feeds already-unit embeddings,
+//! where saliency degenerates to the mean, so exposing it would ship a
+//! misleading knob (experts can reach it via windit directly).
 
 use crate::embeddings::clap::{
-  embedding::{EMBEDDING_DIM, Embedding},
+  embedding::Embedding,
   error::{Error, Result},
   window::WindowEmbedding,
+};
+
+pub use windit::aggregate::{
+  AggregatePolicy, CoverageWeightedMean, EmaRenormalized, MeanRenormalized,
 };
 
 #[cfg(test)]
 mod tests;
 
-/// Combines per-window embeddings into a single clip-level [`Embedding`].
+/// Aggregate per-window embeddings into one clip-level [`Embedding`] under
+/// `policy`, translating windit's errors into clap's ([`Error::EmptyWindows`]
+/// for an empty window slice, [`Error::Windowing`] otherwise).
 ///
-/// This is the customization seam: the built-ins ([`MeanRenormalized`],
-/// [`EmaRenormalized`], [`CoverageWeightedMean`]) implement it, and so can your
-/// own type. It is **object-safe** — one `&self` method taking a slice and
-/// returning an owned [`Embedding`], no generics and no `Self`-typed return — so
-/// a config surface can hold one behind `Box<dyn AggregatePolicy + Send + Sync>`
-/// (what [`AggregatePolicyKind::into_policy`] hands back) and a caller can pass
-/// `&dyn AggregatePolicy` without monomorphizing the pipeline.
+/// This is the clap-typed wrapper over [`windit::aggregate::aggregate`]: the
+/// generic `P` mirrors windit's, so both a concrete policy
+/// (`&CoverageWeightedMean`) and a boxed one (`kind.into_policy().as_ref()`) fit.
 ///
-/// Each [`WindowEmbedding`] carries its embedding **and** its span, so a policy
-/// can weight by time, overlap, or tail coverage — not only average uniformly.
-///
-/// # Contract
-///
-/// - Aggregating zero windows returns [`Error::EmptyWindows`]; every policy
-///   needs at least one window to define a direction.
-/// - The returned embedding is unit-norm (the built-ins renormalize; a custom
-///   policy should return a value from an [`Embedding`] constructor, which
-///   enforces the invariant).
+/// # Errors
+/// [`Error::EmptyWindows`] if `windows` is empty; [`Error::Windowing`] carrying
+/// windit's typed error for any aggregation failure (an out-of-range
+/// [`EmaRenormalized`] alpha, a determinacy-gate `NonFinite`, an allocator
+/// refusal, …).
 ///
 /// # Implementing a custom policy
 ///
-/// The set is open. Here a policy that trusts only the highest-coverage window
-/// — exercised through the public trait, no model required:
+/// The set is open. windit's trait is slice-level — values arrive already
+/// widened to the `f64` compute domain and unit-normalized, and [`aggregate`]
+/// reconstructs the [`Embedding`] from what the policy returns — so a custom
+/// policy implements [`AggregatePolicy`] over `&[&[f64]]`. Here one that trusts
+/// only the highest-coverage window, exercised through the public seam, no model
+/// required:
 ///
 /// ```
-/// use coremlit::embeddings::clap::aggregate::AggregatePolicy;
+/// use coremlit::embeddings::clap::aggregate::{AggregatePolicy, aggregate};
 /// use coremlit::embeddings::clap::embedding::Embedding;
-/// use coremlit::embeddings::clap::window::{WindowEmbedding, WindowSpan};
-/// use coremlit::embeddings::clap::Error;
+/// use coremlit::embeddings::clap::window::{Span, WindowEmbedding, WINDOW_SAMPLES};
+/// use coremlit::embeddings::clap::error::WinditError;
 ///
 /// struct MostCovered;
 ///
 /// impl AggregatePolicy for MostCovered {
-///     fn aggregate(&self, windows: &[WindowEmbedding]) -> Result<Embedding, Error> {
-///         windows
+///     fn aggregate_values(
+///         &self,
+///         embeddings: &[&[f64]],
+///         coverages: &[f32],
+///         dim: usize,
+///     ) -> Result<Vec<f64>, WinditError> {
+///         let (best, _) = coverages
 ///             .iter()
-///             .max_by(|a, b| a.coverage().total_cmp(&b.coverage()))
-///             .map(|w| w.embedding().clone())
-///             .ok_or(Error::EmptyWindows)
+///             .enumerate()
+///             .max_by(|a, b| a.1.total_cmp(b.1))
+///             .ok_or(WinditError::Empty)?;
+///         let e = embeddings[best];
+///         if e.len() != dim {
+///             return Err(WinditError::DimMismatch { got: e.len(), expected: dim });
+///         }
+///         Ok(e.to_vec())
 ///     }
 /// }
 ///
@@ -76,127 +96,25 @@ mod tests;
 /// let mut b = [0.0f32; 512];
 /// b[1] = 1.0;
 /// let windows = vec![
-///     WindowEmbedding::new(Embedding::from_slice_normalizing(&a)?, WindowSpan::new(0, 120_000)),
-///     WindowEmbedding::new(Embedding::from_slice_normalizing(&b)?, WindowSpan::new(120_000, 480_000)),
+///     WindowEmbedding::new(
+///         Embedding::from_slice_normalizing(&a)?,
+///         Span::new(0, 120_000, WINDOW_SAMPLES),
+///     ),
+///     WindowEmbedding::new(
+///         Embedding::from_slice_normalizing(&b)?,
+///         Span::new(120_000, WINDOW_SAMPLES, WINDOW_SAMPLES),
+///     ),
 /// ];
 ///
-/// let clip = MostCovered.aggregate(&windows)?;
+/// let clip = aggregate(&MostCovered, &windows)?;
 /// assert_eq!(clip.as_slice()[1], 1.0); // the full-coverage window won
 /// # Ok::<(), coremlit::embeddings::clap::Error>(())
 /// ```
-pub trait AggregatePolicy {
-  /// Combine `windows` into one unit-norm [`Embedding`].
-  ///
-  /// # Errors
-  /// [`Error::EmptyWindows`] if `windows` is empty; otherwise any error the
-  /// policy's own normalization raises (e.g. [`Error::EmbeddingZero`] if the
-  /// combined vector cancels to zero magnitude).
-  fn aggregate(&self, windows: &[WindowEmbedding]) -> Result<Embedding>;
-}
-
-/// Component-wise mean of the window embeddings, renormalized to unit length —
-/// the default policy.
-///
-/// Because every window embedding is already unit-norm, this is a spherical mean
-/// (average the unit vectors, then renormalize). Equal weight per window,
-/// regardless of coverage or overlap.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct MeanRenormalized;
-
-impl AggregatePolicy for MeanRenormalized {
-  fn aggregate(&self, windows: &[WindowEmbedding]) -> Result<Embedding> {
-    if windows.is_empty() {
-      return Err(Error::EmptyWindows);
-    }
-    // Accumulate in f64 for order-independent stability, then renormalize (the
-    // /n is immaterial to direction but keeps the value a true mean).
-    let mut acc = [0.0f64; EMBEDDING_DIM];
-    for w in windows {
-      for (a, &v) in acc.iter_mut().zip(w.embedding().as_slice()) {
-        *a += v as f64;
-      }
-    }
-    let inv_n = 1.0 / windows.len() as f64;
-    let mean: Vec<f32> = acc.iter().map(|&x| (x * inv_n) as f32).collect();
-    Embedding::from_slice_normalizing(&mean)
-  }
-}
-
-/// Exponential moving average across windows in order, renormalized.
-///
-/// `ema₀ = windows[0]`, then `emaᵢ = alpha·windowᵢ + (1−alpha)·emaᵢ₋₁`, and the
-/// result is L2-renormalized. Temporal smoothing that leans on later windows as
-/// `alpha → 1` (`alpha == 1` reduces to the last window; `alpha == 0` to the
-/// first). `alpha` is validated finite in `[0, 1]` when [`Self::aggregate`] runs.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct EmaRenormalized {
-  /// Smoothing factor in `[0, 1]`: higher weights recent windows more.
-  pub alpha: f32,
-}
-
-impl EmaRenormalized {
-  /// An EMA policy with smoothing factor `alpha` (validated at aggregation
-  /// time, not here — construction is infallible so this stays a `const fn`).
-  pub const fn new(alpha: f32) -> Self {
-    Self { alpha }
-  }
-}
-
-impl AggregatePolicy for EmaRenormalized {
-  fn aggregate(&self, windows: &[WindowEmbedding]) -> Result<Embedding> {
-    if windows.is_empty() {
-      return Err(Error::EmptyWindows);
-    }
-    if !self.alpha.is_finite() || !(0.0..=1.0).contains(&self.alpha) {
-      return Err(Error::InvalidPolicyParameter {
-        policy: "EmaRenormalized",
-        param: "alpha",
-        value: self.alpha,
-      });
-    }
-    let a = self.alpha as f64;
-    let mut ema = [0.0f64; EMBEDDING_DIM];
-    for (e, &v) in ema.iter_mut().zip(windows[0].embedding().as_slice()) {
-      *e = v as f64;
-    }
-    for w in &windows[1..] {
-      for (e, &v) in ema.iter_mut().zip(w.embedding().as_slice()) {
-        *e = a * (v as f64) + (1.0 - a) * *e;
-      }
-    }
-    let out: Vec<f32> = ema.iter().map(|&x| x as f32).collect();
-    Embedding::from_slice_normalizing(&out)
-  }
-}
-
-/// Coverage-weighted mean, renormalized: each window contributes in proportion
-/// to its [`WindowEmbedding::coverage`], so a `repeatpad`-padded tail is
-/// down-weighted relative to full interior windows.
-///
-/// `Σ(coverageᵢ · windowᵢ) / Σ coverageᵢ`, then renormalized. With every window
-/// at full coverage this equals [`MeanRenormalized`].
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CoverageWeightedMean;
-
-impl AggregatePolicy for CoverageWeightedMean {
-  fn aggregate(&self, windows: &[WindowEmbedding]) -> Result<Embedding> {
-    if windows.is_empty() {
-      return Err(Error::EmptyWindows);
-    }
-    let mut acc = [0.0f64; EMBEDDING_DIM];
-    let mut weight_sum = 0.0f64;
-    for w in windows {
-      let cov = w.coverage() as f64; // in (0, 1]; never zero (real_len >= 1)
-      weight_sum += cov;
-      for (a, &v) in acc.iter_mut().zip(w.embedding().as_slice()) {
-        *a += cov * v as f64;
-      }
-    }
-    // weight_sum > 0: windows is non-empty and every coverage is > 0.
-    let inv = 1.0 / weight_sum;
-    let weighted: Vec<f32> = acc.iter().map(|&x| (x * inv) as f32).collect();
-    Embedding::from_slice_normalizing(&weighted)
-  }
+pub fn aggregate<P>(policy: &P, windows: &[WindowEmbedding]) -> Result<Embedding>
+where
+  P: windit::aggregate::AggregatePolicy + ?Sized,
+{
+  windit::aggregate::aggregate(policy, windows).map_err(Error::from)
 }
 
 /// A serde-able closed enum over the built-in policies, for config surfaces
@@ -205,7 +123,9 @@ impl AggregatePolicy for CoverageWeightedMean {
 /// Custom policies use [`AggregatePolicy`] directly — this wrapper exists only
 /// so the *built-ins* survive a round trip through text.
 /// [`Self::into_policy`] converts a deserialized value into the trait object the
-/// pipeline runs.
+/// pipeline runs. The wire spellings are clap-owned and pinned (windit's `serde`
+/// feature is off, so its own kind enum never compiles); the mapping to windit
+/// policies happens in [`Self::into_policy`].
 ///
 /// # Golden-enum contract (what the tests actually force)
 ///
@@ -234,7 +154,7 @@ pub enum AggregatePolicyKind {
   MeanRenormalized,
   /// Selects [`EmaRenormalized`] with the given smoothing factor.
   EmaRenormalized {
-    /// The EMA smoothing factor; see [`EmaRenormalized::alpha`].
+    /// The EMA smoothing factor, forwarded to [`EmaRenormalized::new`].
     alpha: f32,
   },
   /// Selects [`CoverageWeightedMean`].
@@ -242,16 +162,17 @@ pub enum AggregatePolicyKind {
 }
 
 impl AggregatePolicyKind {
-  /// Convert to the boxed trait object the pipeline aggregates with.
+  /// Convert to the boxed trait object [`aggregate`] runs.
   ///
-  /// Infallible: [`Self::EmaRenormalized`]'s `alpha` is validated when the
-  /// policy runs ([`AggregatePolicy::aggregate`]), so a config that names a
-  /// built-in always yields a policy, and a bad `alpha` fails loudly at
-  /// aggregation with [`Error::InvalidPolicyParameter`] rather than here.
+  /// Infallible: [`Self::EmaRenormalized`]'s `alpha` is validated when the policy
+  /// runs (through [`aggregate`]), so a config that names a built-in always
+  /// yields a policy, and a bad `alpha` fails loudly at aggregation as
+  /// [`Error::Windowing`] carrying `WinditError::AlphaOutOfRange` rather than
+  /// here.
   pub fn into_policy(self) -> Box<dyn AggregatePolicy + Send + Sync> {
     match self {
       Self::MeanRenormalized => Box::new(MeanRenormalized),
-      Self::EmaRenormalized { alpha } => Box::new(EmaRenormalized { alpha }),
+      Self::EmaRenormalized { alpha } => Box::new(EmaRenormalized::new(alpha)),
       Self::CoverageWeightedMean => Box::new(CoverageWeightedMean),
     }
   }

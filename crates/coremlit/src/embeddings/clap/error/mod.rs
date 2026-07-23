@@ -8,6 +8,11 @@
 /// Convenience alias for `Result<T, `[`Error`]`>`.
 pub type Result<T> = core::result::Result<T, Error>;
 
+/// Re-exported so callers (and tests) can name and match the typed error
+/// [`Error::Windowing`] carries from the windit windowed-sequence engine (the
+/// long-audio window geometry and aggregation).
+pub use windit::WinditError;
+
 /// Any failure loading a CLAP encoder, running inference, tokenizing text, or
 /// constructing an [`crate::embeddings::clap::Embedding`].
 #[derive(Debug, thiserror::Error)]
@@ -136,24 +141,38 @@ pub enum Error {
 
   /// An [`crate::embeddings::clap::aggregate::AggregatePolicy`] was asked to combine zero window
   /// embeddings. Every policy needs at least one window to produce a direction;
-  /// the caller should skip aggregation (or handle the empty clip) instead.
+  /// the caller should skip aggregation (or handle the empty clip) instead. This
+  /// is the one windit error given its own clap variant:
+  /// [`From<WinditError>`](Error::from) maps [`WinditError::Empty`] here so the
+  /// pinned empty-aggregation taxonomy is stable across the windit port.
   #[error("cannot aggregate zero window embeddings")]
   EmptyWindows,
 
-  /// An aggregation policy was configured with an out-of-range numeric
-  /// parameter (e.g. [`crate::embeddings::clap::aggregate::EmaRenormalized`]'s `alpha` outside the
-  /// finite `[0, 1]` range). Reported when the policy runs, so a serde-loaded
-  /// config with a bad value fails loudly at aggregation rather than silently
-  /// producing a skewed embedding.
-  #[error("invalid {policy} parameter `{param}` = {value}")]
-  InvalidPolicyParameter {
-    /// The policy type whose parameter was rejected.
-    policy: &'static str,
-    /// Name of the offending parameter.
-    param: &'static str,
-    /// The out-of-range value supplied.
-    value: f32,
-  },
+  /// A windowed-sequence operation failed inside the windit engine (an
+  /// aggregation domain / determinacy gate, geometry validation, or an allocator
+  /// refusal). Carries windit's own typed error unchanged ([`WinditError`] is
+  /// `#[non_exhaustive]`, so match it with a wildcard arm). Notably
+  /// `WinditError::NonFinite` here is windit's determinacy gate — an aggregate
+  /// whose windows cancel exactly has no direction at working precision (the
+  /// pre-windit code reported the same condition as [`Error::EmbeddingZero`]);
+  /// and `WinditError::AlphaOutOfRange` is an out-of-range [`EmaRenormalized`](crate::embeddings::clap::aggregate::EmaRenormalized)
+  /// smoothing factor.
+  #[error("windowed-sequence processing failed: {0}")]
+  Windowing(#[source] WinditError),
+}
+
+impl From<WinditError> for Error {
+  /// The ONE outward translation from windit into clap's taxonomy.
+  /// [`WinditError::Empty`] maps onto the pinned [`Error::EmptyWindows`] variant
+  /// (same meaning, kept so the empty-aggregation taxonomy is stable across the
+  /// port); every other windit error is wrapped losslessly in
+  /// [`Error::Windowing`].
+  fn from(e: WinditError) -> Self {
+    match e {
+      WinditError::Empty => Error::EmptyWindows,
+      other => Error::Windowing(other),
+    }
+  }
 }
 
 #[cfg(test)]

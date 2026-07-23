@@ -13,7 +13,7 @@ mod common;
 
 use coremlit::embeddings::clap::{
   AudioEncoder, MeanRenormalized, ScoreMode, TextAnchor, TextEncoder, WindowPlan,
-  aggregate::{AggregatePolicy, CoverageWeightedMean},
+  aggregate::{CoverageWeightedMean, aggregate},
   score,
 };
 
@@ -188,16 +188,16 @@ fn run_pipeline_and_pin(
     "pinned window count drifted"
   );
   // The final window is a padded tail; interiors are full coverage.
-  assert_eq!(windows[0].coverage(), 1.0);
-  assert!((windows[EXPECTED_WINDOWS - 1].coverage() - 0.25).abs() < 1e-6);
+  assert_eq!(windows[0].span().coverage(), 1.0);
+  assert!((windows[EXPECTED_WINDOWS - 1].span().coverage() - 0.25).abs() < 1e-6);
 
   // 3. Aggregate (the shipped default policy) into one clip embedding.
-  let clip_embedding = MeanRenormalized.aggregate(&windows).unwrap();
+  let clip_embedding = aggregate(&MeanRenormalized, &windows).unwrap();
   // Aggregate is unit-norm and — since every window is speech — stays close to
   // any single window.
   let norm_sq: f32 = clip_embedding.as_slice().iter().map(|x| x * x).sum();
   assert!((norm_sq - 1.0).abs() < 1e-5, "aggregate not unit-norm");
-  let self_cos = cosine(clip_embedding.as_slice(), windows[0].embedding().as_slice());
+  let self_cos = cosine(clip_embedding.as_slice(), windows[0].value().as_slice());
   println!("[e2e/{tier}] aggregate↔window[0] cosine = {self_cos:.6}");
   assert!(
     self_cos >= AGG_SELF_COSINE_LO,
@@ -205,7 +205,7 @@ fn run_pipeline_and_pin(
   );
   // A second built-in produces a valid, near-identical aggregate on homogeneous
   // audio (exercises the coverage path end to end).
-  let cov_embedding = CoverageWeightedMean.aggregate(&windows).unwrap();
+  let cov_embedding = aggregate(&CoverageWeightedMean, &windows).unwrap();
   assert!(cov_embedding.is_close_cosine(&clip_embedding, 1e-3));
 
   // 4. Zero-shot score the aggregate against the label anchors.

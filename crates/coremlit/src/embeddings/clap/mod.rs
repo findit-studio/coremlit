@@ -2,7 +2,7 @@
 //! encoder and a text encoder that project into a shared 512-dim joint
 //! embedding space, plus the improved long-audio pipeline textclap lacks —
 //! overlapped chunking ([`window`]), customizable window-embedding aggregation
-//! ([`aggregate`]), and zero-shot scoring ([`score`](mod@score)).
+//! ([`aggregate`](mod@aggregate)), and zero-shot scoring ([`score`](mod@score)).
 //!
 //! Design spec: `docs/superpowers/specs/2026-07-18-clapkit-design.md` (including
 //! its `AggregatePolicy` amendment). textclap is the model-level oracle: the
@@ -127,15 +127,21 @@
 //! # Long-audio pipeline
 //!
 //! A clip longer than one 10 s window is handled in three composable, sans-model
-//! steps (nothing is hidden inside a monolithic pipeline object):
+//! steps (nothing is hidden inside a monolithic pipeline object). The window
+//! GEOMETRY and per-window AGGREGATION ride the generic `windit` engine; the mel
+//! `repeatpad` front-end and the golden-pinned serde config types stay clap's own
+//! (windit's `serde` feature is off):
 //!
-//! 1. [`WindowPlan`] maps the clip length to overlapped [`WindowSpan`]s
-//!    (configurable hop; explicit tail policy; serde-validated construction).
-//! 2. [`AudioEncoder::embed_windows`] embeds each span into a [`WindowEmbedding`]
-//!    (embedding + span + tail-padding-aware coverage). These per-window
-//!    embeddings are always returned to the caller.
-//! 3. An [`AggregatePolicy`] combines them into one clip embedding. The seam is
-//!    an **open trait**: the built-ins [`MeanRenormalized`] (default),
+//! 1. [`WindowPlan`] maps the clip length to overlapped [`Span`]s via
+//!    `windit::plan::WindowPlan` plus two clap-contract guards (short-clip and
+//!    multi-tail; see [`window`]). Its hop / tail policy keep clap's own
+//!    serde-validated construction.
+//! 2. [`AudioEncoder::embed_windows`] slices each span and embeds it into a
+//!    [`WindowEmbedding`] (`windit::windowed::WindowEmbedding<Embedding>`) — the
+//!    mel front-end `repeatpad`s a short tail up to the fixed window. These
+//!    per-window embeddings are always returned to the caller.
+//! 3. An [`AggregatePolicy`] (windit's object-safe trait) combines them into one
+//!    clip embedding via [`aggregate()`]. The built-ins [`MeanRenormalized`],
 //!    [`EmaRenormalized`], and [`CoverageWeightedMean`] ship, and end users
 //!    implement the trait for their own strategies. A serde-able
 //!    [`AggregatePolicyKind`] names the built-ins for config surfaces.
@@ -157,13 +163,14 @@ pub mod window;
 
 pub use aggregate::{
   AggregatePolicy, AggregatePolicyKind, CoverageWeightedMean, EmaRenormalized, MeanRenormalized,
+  aggregate,
 };
 pub use audio::{AudioEncoder, AudioEncoderOptions};
 pub use embedding::Embedding;
 pub use error::Error;
 pub use score::{LabeledScore, ScoreMode, TextAnchor, score, score_windows};
 pub use text::{TextEncoder, TextEncoderOptions};
-pub use window::{TailPolicy, WindowEmbedding, WindowPlan, WindowSpan};
+pub use window::{Span, TailPolicy, WindowEmbedding, WindowPlan};
 
 /// Bytes of the pinned Xenova `tokenizer.json` bundled with the crate (~2 MB).
 ///

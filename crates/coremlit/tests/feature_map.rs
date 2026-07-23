@@ -71,9 +71,12 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
     ),
     ("vad", vec!["dep:silero"]),
     ("vad-bundled", vec!["vad", "silero/bundled"]),
-    ("clap", vec!["dep:rustfft", "dep:tokenizers"]),
+    ("clap", vec!["dep:rustfft", "dep:tokenizers", "dep:windit"]),
     ("clap-oracle", vec!["clap", "dep:textclap"]),
-    ("granite", vec!["dep:tokenizers"]),
+    (
+      "granite",
+      vec!["dep:tokenizers", "dep:windit", "windit/text"],
+    ),
   ]
 }
 
