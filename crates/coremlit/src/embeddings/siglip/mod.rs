@@ -28,6 +28,11 @@
 //! `pixel_values` contract at load ([`ImageEmbedder::max_num_patches`]), never a
 //! code constant, so a 256/1024 tier is a drop-in artifact.
 //!
+//! Callers who reproduce the exact NaFlex pipeline offline can bypass the
+//! in-crate preprocessing via [`ImageEmbedder::embed_preprocessed`]
+//! ([`PreprocessedImage`]); [`ImageEmbedder::preprocess`] is the pipeline's
+//! public producer, and [`ImageEmbedder::embed`] remains the safe default.
+//!
 //! # Text: single-input, full-window
 //!
 //! The SigLIP text graph takes **only** `input_ids` (`[1, T]`) — no attention
@@ -93,7 +98,9 @@ mod compute_units_serde;
 
 pub use embedding::Embedding;
 pub use error::Error;
-pub use image::{DEFAULT_IMAGE_COMPUTE, ImageEmbedder, ImageEmbedderOptions, Rgb8Image};
+pub use image::{
+  DEFAULT_IMAGE_COMPUTE, ImageEmbedder, ImageEmbedderOptions, PreprocessedImage, Rgb8Image,
+};
 pub use text::{DEFAULT_TEXT_COMPUTE, TextEmbedder, TextEmbedderOptions};
 
 /// Bytes of the bundled SigLIP 2 Gemma `tokenizer.json` compiled into the crate.

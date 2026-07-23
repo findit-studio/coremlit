@@ -118,3 +118,68 @@ fn token_variants_carry_values() {
       .contains(&u32::MAX.to_string())
   );
 }
+
+#[test]
+fn preprocessed_length_display_names_feature() {
+  let msg = Error::PreprocessedLength {
+    feature: "pixel_values",
+    got: 100,
+    expected: 393_216,
+  }
+  .to_string();
+  assert!(msg.contains("pixel_values"), "{msg}");
+  assert!(msg.contains("100"), "{msg}");
+  assert!(msg.contains("393216"), "{msg}");
+  assert!(
+    Error::PreprocessedPatchBudget { max_num_patches: 0 }
+      .to_string()
+      .contains('0')
+  );
+}
+
+#[test]
+fn preprocessed_mask_and_pad_variants_display_carry_diagnostics() {
+  let non_finite = Error::PreprocessedNonFinite {
+    feature: "position_embeddings",
+    index: 7,
+  }
+  .to_string();
+  assert!(
+    non_finite.contains("position_embeddings") && non_finite.contains('7'),
+    "{non_finite}"
+  );
+
+  let mask_value = Error::PreprocessedMaskValue {
+    index: 1,
+    value: 0.5,
+  }
+  .to_string();
+  assert!(
+    mask_value.contains('1') && mask_value.contains("0.5"),
+    "{mask_value}"
+  );
+
+  assert!(
+    Error::PreprocessedMaskOrder { index: 2 }
+      .to_string()
+      .contains('2')
+  );
+  assert!(Error::PreprocessedMaskEmpty.to_string().contains("no real"));
+
+  let pad = Error::PreprocessedPadNonZero {
+    feature: "pixel_values",
+    index: 9,
+  }
+  .to_string();
+  assert!(pad.contains("pixel_values") && pad.contains('9'), "{pad}");
+}
+
+#[test]
+fn patch_budget_mismatch_display_shows_both() {
+  let msg = Error::PatchBudgetMismatch {
+    input: 256,
+    model: 512,
+  }
+  .to_string();
+  assert!(msg.contains("256") && msg.contains("512"), "{msg}");
+}

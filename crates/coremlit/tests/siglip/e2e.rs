@@ -27,3 +27,30 @@ fn each_caption_ranks_its_image_top1() {
   //         captions (text.embed), then siglip::rank each caption over the images
   //         and assert its matched image is top-1.
 }
+
+/// `embed(img)` and `embed_preprocessed(preprocess(img))` agree: `embed` routes
+/// through `embed_preprocessed` by construction, so the two calls feed
+/// byte-identical tensors to CoreML and the tolerance only absorbs run-to-run
+/// prediction jitter (tighten toward 0.0 if Wave C measures bit-stability on
+/// the pinned GPU arm). Also round-trips the pipeline's bundle through the
+/// public validator at the model's real budget.
+#[test]
+#[ignore = "requires staged siglip models + committed corpus — Wave C"]
+fn embed_preprocessed_matches_embed_identity() {
+  let _embedder = ImageEmbedder::from_files(common::vision_model_path(), common::pos_embed_path())
+    .expect("load vision");
+  // Wave C: decode one corpus PNG → Rgb8Image `img`, then:
+  //   let a = embedder.embed(img).expect("embed");
+  //   let pre = embedder.preprocess(img).expect("preprocess");
+  //   let b = embedder.embed_preprocessed(&pre).expect("embed_preprocessed");
+  //   assert!(a.is_close(&b, 1e-6));
+  //   assert!(
+  //     PreprocessedImage::try_new(
+  //       pre.pixel_values().to_vec(),
+  //       pre.position_embeddings().to_vec(),
+  //       pre.attention_mask().to_vec(),
+  //       embedder.max_num_patches(),
+  //     )
+  //     .is_ok()
+  //   );
+}

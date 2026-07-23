@@ -4,6 +4,7 @@
 
 mod preprocess;
 
+use core::fmt;
 use std::path::Path;
 
 use crate::{ComputeUnits, DataType, Model, ModelDescription, MultiArray};
@@ -11,8 +12,10 @@ use crate::{ComputeUnits, DataType, Model, ModelDescription, MultiArray};
 use crate::embeddings::siglip::{
   embedding::{EMBEDDING_DIM, Embedding, check_finite_output},
   error::{Error, Result},
-  image::preprocess::{PATCH_DIM, parse_base_pos_grid, preprocess_image},
+  image::preprocess::{parse_base_pos_grid, preprocess_image},
 };
+
+pub use preprocess::PATCH_DIM;
 
 /// Declared feature names on the siglip vision `.mlmodelc` (pinned by
 /// `tests/siglip/model_io.rs`).
@@ -162,6 +165,174 @@ impl<'a> Rgb8Image<'a> {
   }
 }
 
+/// Caller-supplied NaFlex-preprocessed vision tensors for
+/// [`ImageEmbedder::embed_preprocessed`]: the graph's three inputs —
+/// `pixel_values` `[1, P, `[`PATCH_DIM`]`]`, `position_embeddings`
+/// `[1, P, `[`EMBEDDING_DIM`]`]`, `attention_mask` `[1, P]` — flattened
+/// row-major and **already padded to the patch budget** `P`
+/// ([`ImageEmbedder::max_num_patches`]), exactly as the NaFlex pipeline emits
+/// them: real patch rows as a contiguous prefix (mask `1.0`), zero-filled pad
+/// rows after (mask `0.0`).
+///
+/// [`PreprocessedImage::try_new`] validates shape and structure once; the
+/// tensors are immutable afterwards (private fields, no mutators), so a
+/// constructed value stays valid. [`ImageEmbedder::preprocess`] produces this
+/// type from a decoded [`Rgb8Image`] — the in-crate reference for what
+/// `try_new` accepts.
+///
+/// **What validation cannot see:** whether the tensors were produced by the
+/// exact NaFlex pipeline this model was converted against — the
+/// antialiased-bilinear resize coefficients, the `((x/255) − 0.5)/0.5`
+/// normalization, the `(patch_row, patch_col, py, px, channel)` flatten order,
+/// and the base-grid position-embedding lift. Tensors from a deviating
+/// pipeline pass validation and **silently degrade** the embedding — no error
+/// is raised. Unless inputs must be precomputed offline, use
+/// [`ImageEmbedder::embed`], the safe default.
+#[derive(Clone)]
+pub struct PreprocessedImage {
+  /// `[max_num_patches · PATCH_DIM]`: real patch rows, then zero pad rows.
+  pixel_values: Vec<f32>,
+  /// `[max_num_patches · EMBEDDING_DIM]`: lifted rows, then zero pad rows.
+  position_embeddings: Vec<f32>,
+  /// `[max_num_patches]`: exactly `1.0` on the real-patch prefix, `0.0` after.
+  attention_mask: Vec<f32>,
+  /// The patch budget `P` the lengths were validated against.
+  max_num_patches: usize,
+}
+
+impl PreprocessedImage {
+  /// Validates and wraps a padded NaFlex tensor bundle for a model whose
+  /// resolved patch budget is `max_num_patches`
+  /// ([`ImageEmbedder::max_num_patches`]).
+  ///
+  /// Checks, in order: the budget is usable (non-zero, lengths representable);
+  /// exact lengths (`pixel_values` = `max_num_patches · `[`PATCH_DIM`],
+  /// `position_embeddings` = `max_num_patches · `[`EMBEDDING_DIM`],
+  /// `attention_mask` = `max_num_patches`); `pixel_values` and
+  /// `position_embeddings` are finite; the mask is an exact binary
+  /// prefix mask (every entry exactly `0.0` or `1.0`, all `1.0`s before the
+  /// first `0.0`, at least one `1.0` — the mask's domain check subsumes its
+  /// finiteness); and every padded (mask `0.0`) row of `pixel_values` and
+  /// `position_embeddings` is all-zero, as the NaFlex pipeline emits and as
+  /// the module's parity evidence covers (fail-closed).
+  ///
+  /// It **cannot** validate that the values came from the exact NaFlex
+  /// pipeline (see the type docs): that is the caller's contract.
+  ///
+  /// # Errors
+  /// [`Error::PreprocessedPatchBudget`] if `max_num_patches` is zero or too
+  /// large for the tensor lengths to be representable;
+  /// [`Error::PreprocessedLength`] on a wrong tensor length;
+  /// [`Error::PreprocessedNonFinite`] on a NaN/infinite `pixel_values` or
+  /// `position_embeddings` element; [`Error::PreprocessedMaskValue`] /
+  /// [`Error::PreprocessedMaskOrder`] / [`Error::PreprocessedMaskEmpty`] on a
+  /// non-binary, non-prefix, or all-pad mask;
+  /// [`Error::PreprocessedPadNonZero`] on a nonzero value inside a padded row.
+  pub fn try_new(
+    pixel_values: Vec<f32>,
+    position_embeddings: Vec<f32>,
+    attention_mask: Vec<f32>,
+    max_num_patches: usize,
+  ) -> Result<Self> {
+    validate_budget_and_lengths(
+      &pixel_values,
+      &position_embeddings,
+      &attention_mask,
+      max_num_patches,
+    )?;
+    check_tensor_finite(names::PIXEL_VALUES, &pixel_values)?;
+    check_tensor_finite(names::POSITION_EMBEDDINGS, &position_embeddings)?;
+    let num_real = validate_mask(&attention_mask)?;
+    validate_pad_rows(names::PIXEL_VALUES, &pixel_values, num_real, PATCH_DIM)?;
+    validate_pad_rows(
+      names::POSITION_EMBEDDINGS,
+      &position_embeddings,
+      num_real,
+      EMBEDDING_DIM,
+    )?;
+    Ok(Self {
+      pixel_values,
+      position_embeddings,
+      attention_mask,
+      max_num_patches,
+    })
+  }
+
+  /// Module-internal constructor for the pipeline's own outputs, whose
+  /// structural invariants (lengths, binary prefix mask, zero pads) hold by
+  /// construction in `patchify` / `lift_position_embeddings` (cf.
+  /// `Embedding::from_array_trusted_unit_norm`). Deliberately does NOT assert
+  /// finiteness: a non-finite value in a caller-supplied position-grid sidecar
+  /// must keep flowing to the same typed predict-time error it always did, not
+  /// become a debug panic.
+  fn from_pipeline(
+    pixel_values: Vec<f32>,
+    position_embeddings: Vec<f32>,
+    attention_mask: Vec<f32>,
+    max_num_patches: usize,
+  ) -> Self {
+    debug_assert!(
+      validate_structural(
+        &pixel_values,
+        &position_embeddings,
+        &attention_mask,
+        max_num_patches
+      )
+      .is_ok(),
+      "internal NaFlex pipeline emitted a structurally invalid tensor bundle"
+    );
+    Self {
+      pixel_values,
+      position_embeddings,
+      attention_mask,
+      max_num_patches,
+    }
+  }
+
+  /// The patch budget `P` this bundle was validated against — must equal the
+  /// target embedder's [`ImageEmbedder::max_num_patches`].
+  #[inline]
+  pub const fn max_num_patches(&self) -> usize {
+    self.max_num_patches
+  }
+
+  /// The flattened `[max_num_patches · `[`PATCH_DIM`]`]` `pixel_values` rows.
+  #[inline]
+  pub fn pixel_values(&self) -> &[f32] {
+    &self.pixel_values
+  }
+
+  /// The flattened `[max_num_patches · `[`EMBEDDING_DIM`]`]`
+  /// `position_embeddings` rows.
+  #[inline]
+  pub fn position_embeddings(&self) -> &[f32] {
+    &self.position_embeddings
+  }
+
+  /// The `[max_num_patches]` real/pad `attention_mask` (`1.0` real prefix,
+  /// `0.0` pads).
+  #[inline]
+  pub fn attention_mask(&self) -> &[f32] {
+    &self.attention_mask
+  }
+}
+
+impl fmt::Debug for PreprocessedImage {
+  /// Compact — elides the megabyte-scale tensors (the `Embedding` Debug
+  /// convention), showing the budget and the mask's real-prefix length.
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    let num_real = self
+      .attention_mask
+      .iter()
+      .take_while(|&&v| v == 1.0)
+      .count();
+    f.debug_struct("PreprocessedImage")
+      .field("max_num_patches", &self.max_num_patches)
+      .field("num_real_patches", &num_real)
+      .finish_non_exhaustive()
+  }
+}
+
 /// siglip vision embedder: a decoded [`Rgb8Image`] in, a unit-norm 768-d
 /// [`Embedding`] out — the same joint-space [`Embedding`] the text tower emits.
 ///
@@ -257,6 +428,32 @@ impl ImageEmbedder {
     self.max_num_patches
   }
 
+  /// Runs the module's own NaFlex pipeline on `image` without predicting:
+  /// pure host-side math (no CoreML call), producing the validated
+  /// [`PreprocessedImage`] that [`Self::embed_preprocessed`] accepts.
+  /// `embed(image)` is exactly `embed_preprocessed(&preprocess(image)?)`;
+  /// capture the bundle to embed later, or to feed another embedder of the
+  /// same patch budget.
+  ///
+  /// # Errors
+  /// [`Error::PatchCount`] if preprocessing overflows the budget (a solver
+  /// bug — the defensive backstop, as in [`Self::embed`]).
+  pub fn preprocess(&self, image: Rgb8Image<'_>) -> Result<PreprocessedImage> {
+    let inputs = preprocess_image(
+      image.data(),
+      image.width(),
+      image.height(),
+      &self.base_pos_embed,
+      self.max_num_patches,
+    )?;
+    Ok(PreprocessedImage::from_pipeline(
+      inputs.pixel_values,
+      inputs.position_embeddings,
+      inputs.attention_mask,
+      self.max_num_patches,
+    ))
+  }
+
   /// Embeds one decoded image into a unit-norm [`Embedding`].
   ///
   /// # Errors
@@ -270,22 +467,59 @@ impl ImageEmbedder {
   /// caller's own non-finite embedding data ([`Error::NonFiniteEmbedding`]);
   /// [`Error::EmbeddingZero`] if the (finite) projection has zero magnitude.
   pub fn embed(&self, image: Rgb8Image<'_>) -> Result<Embedding> {
-    let inputs = preprocess_image(
-      image.data(),
-      image.width(),
-      image.height(),
-      &self.base_pos_embed,
-      self.max_num_patches,
-    )?;
+    let inputs = self.preprocess(image)?;
+    self.embed_preprocessed(&inputs)
+  }
 
-    let pixel_values =
-      MultiArray::from_slice(&[1, self.max_num_patches, PATCH_DIM], &inputs.pixel_values)?;
+  /// Embeds caller-supplied NaFlex-preprocessed tensors, skipping this
+  /// embedder's own preprocessing — the bring-your-own-tensors bypass for
+  /// pipelines that run the exact NaFlex front-end offline/batch.
+  /// [`Self::embed`] routes through this method, so `embed(image)` ≡
+  /// `embed_preprocessed(&preprocess(image)?)` by construction.
+  ///
+  /// The bundle's shape and structure were validated at
+  /// [`PreprocessedImage::try_new`]; here only the patch-budget binding is
+  /// checked against this model's resolved `P`
+  /// ([`Self::max_num_patches`]). coremlit cannot verify the tensor VALUES
+  /// came from the exact NaFlex pipeline this model was converted against —
+  /// tensors from a deviating pipeline pass validation and **silently
+  /// degrade** the embedding (see [`PreprocessedImage`]). Prefer
+  /// [`Self::embed`] unless inputs must be precomputed.
+  ///
+  /// # Errors
+  /// [`Error::PatchBudgetMismatch`] if `inputs` was validated against a
+  /// different patch budget than this model resolved at load (e.g. a
+  /// 256-tier bundle fed to a 512-tier model); otherwise as
+  /// [`Self::embed`]'s predict path: [`Error::Tensor`] /
+  /// [`Error::Prediction`] on a tensor or CoreML failure;
+  /// [`Error::OutputShape`] if the predicted `image_features` shape diverges
+  /// from `[1, `[`EMBEDDING_DIM`]`]`; [`Error::NonFiniteOutput`] on a
+  /// NaN/infinite model output; [`Error::EmbeddingZero`] if the (finite)
+  /// projection has zero magnitude.
+  pub fn embed_preprocessed(&self, inputs: &PreprocessedImage) -> Result<Embedding> {
+    check_patch_budget(inputs.max_num_patches(), self.max_num_patches)?;
+    self.predict_embedding(
+      inputs.pixel_values(),
+      inputs.position_embeddings(),
+      inputs.attention_mask(),
+    )
+  }
+
+  /// Shared predict tail of [`Self::embed`] / [`Self::embed_preprocessed`]:
+  /// builds the three input tensors, predicts, validates the `image_features`
+  /// contract, and L2-normalizes.
+  fn predict_embedding(
+    &self,
+    pixel_values: &[f32],
+    position_embeddings: &[f32],
+    attention_mask: &[f32],
+  ) -> Result<Embedding> {
+    let pixel_values = MultiArray::from_slice(&[1, self.max_num_patches, PATCH_DIM], pixel_values)?;
     let position_embeddings = MultiArray::from_slice(
       &[1, self.max_num_patches, EMBEDDING_DIM],
-      &inputs.position_embeddings,
+      position_embeddings,
     )?;
-    let attention_mask =
-      MultiArray::from_slice(&[1, self.max_num_patches], &inputs.attention_mask)?;
+    let attention_mask = MultiArray::from_slice(&[1, self.max_num_patches], attention_mask)?;
 
     let mut outputs = self.model.predict_with(&[
       (names::PIXEL_VALUES, &pixel_values),
@@ -419,6 +653,151 @@ fn check_input(
       expected,
       actual: describe(input.shape(), input.data_type()),
     });
+  }
+  Ok(())
+}
+
+/// Budget + exact-length validation for a preprocessed bundle. The budget
+/// guard makes every `max_num_patches · row_dim` product below (and in
+/// [`validate_pad_rows`]) provably in-range, so plain multiplication is safe.
+fn validate_budget_and_lengths(
+  pixel_values: &[f32],
+  position_embeddings: &[f32],
+  attention_mask: &[f32],
+  max_num_patches: usize,
+) -> Result<()> {
+  // PATCH_DIM and EMBEDDING_DIM coincide (768) but are distinct quantities;
+  // guard against the larger so both products stay in range by construction.
+  const MAX_ROW_DIM: usize = if PATCH_DIM > EMBEDDING_DIM {
+    PATCH_DIM
+  } else {
+    EMBEDDING_DIM
+  };
+  if max_num_patches == 0 || max_num_patches > usize::MAX / MAX_ROW_DIM {
+    return Err(Error::PreprocessedPatchBudget { max_num_patches });
+  }
+  check_len(
+    names::PIXEL_VALUES,
+    pixel_values.len(),
+    max_num_patches * PATCH_DIM,
+  )?;
+  check_len(
+    names::POSITION_EMBEDDINGS,
+    position_embeddings.len(),
+    max_num_patches * EMBEDDING_DIM,
+  )?;
+  check_len(names::ATTENTION_MASK, attention_mask.len(), max_num_patches)?;
+  Ok(())
+}
+
+/// One exact-length check, reported as [`Error::PreprocessedLength`].
+fn check_len(feature: &'static str, got: usize, expected: usize) -> Result<()> {
+  if got != expected {
+    return Err(Error::PreprocessedLength {
+      feature,
+      got,
+      expected,
+    });
+  }
+  Ok(())
+}
+
+/// Scans a caller-supplied preprocessed tensor for the first non-finite
+/// (NaN/±∞) component (cf. `check_finite_output`, which classifies the same
+/// defect on the MODEL-output side).
+fn check_tensor_finite(feature: &'static str, values: &[f32]) -> Result<()> {
+  if let Some(index) = values.iter().position(|v| !v.is_finite()) {
+    return Err(Error::PreprocessedNonFinite { feature, index });
+  }
+  Ok(())
+}
+
+/// Validates the `[P]` attention mask is an exact NaFlex real/pad mask —
+/// every entry exactly `0.0` or `1.0` (IEEE equality, so `-0.0` counts as
+/// `0.0`; a NaN entry fails the domain check, which subsumes finiteness), the
+/// `1.0`s a contiguous prefix, at least one real patch — and returns the
+/// real-patch count (the prefix length). Exact comparison is deliberate: the
+/// pipeline writes these constants literally, and an approximate check would
+/// defeat the domain validation.
+fn validate_mask(mask: &[f32]) -> Result<usize> {
+  let mut num_real = 0usize;
+  let mut in_pad = false;
+  for (index, &value) in mask.iter().enumerate() {
+    if value == 1.0 {
+      if in_pad {
+        return Err(Error::PreprocessedMaskOrder { index });
+      }
+      num_real += 1;
+    } else if value == 0.0 {
+      in_pad = true;
+    } else {
+      return Err(Error::PreprocessedMaskValue { index, value });
+    }
+  }
+  if num_real == 0 {
+    return Err(Error::PreprocessedMaskEmpty);
+  }
+  Ok(num_real)
+}
+
+/// Validates rows `num_real..` of a `[P · row_dim]` tensor are all-zero: the
+/// NaFlex pipeline zero-fills pad rows and the module's parity evidence covers
+/// only zero pads, so nonzero pad content is rejected fail-closed rather than
+/// trusted to be masked out by the graph. Callers guarantee
+/// `num_real · row_dim ≤ values.len()` (both bounded by the budget guard and
+/// the mask length check).
+fn validate_pad_rows(
+  feature: &'static str,
+  values: &[f32],
+  num_real: usize,
+  row_dim: usize,
+) -> Result<()> {
+  let pad_start = num_real * row_dim;
+  if let Some(offset) = values[pad_start..].iter().position(|&v| v != 0.0) {
+    return Err(Error::PreprocessedPadNonZero {
+      feature,
+      index: pad_start + offset,
+    });
+  }
+  Ok(())
+}
+
+/// The structural (non-finiteness) subset of [`PreprocessedImage::try_new`]'s
+/// validation — budget, lengths, mask shape, zero pads: exactly the invariants
+/// the internal pipeline guarantees by construction, debug-asserted by
+/// `PreprocessedImage::from_pipeline`.
+fn validate_structural(
+  pixel_values: &[f32],
+  position_embeddings: &[f32],
+  attention_mask: &[f32],
+  max_num_patches: usize,
+) -> Result<()> {
+  validate_budget_and_lengths(
+    pixel_values,
+    position_embeddings,
+    attention_mask,
+    max_num_patches,
+  )?;
+  let num_real = validate_mask(attention_mask)?;
+  validate_pad_rows(names::PIXEL_VALUES, pixel_values, num_real, PATCH_DIM)?;
+  validate_pad_rows(
+    names::POSITION_EMBEDDINGS,
+    position_embeddings,
+    num_real,
+    EMBEDDING_DIM,
+  )?;
+  Ok(())
+}
+
+/// Validates a [`PreprocessedImage`]'s budget binding against the loaded
+/// model's resolved `P`. Extracted so the classification is hermetically
+/// testable without a loaded model (the `check_finite_output` pattern).
+///
+/// # Errors
+/// [`Error::PatchBudgetMismatch`] carrying both budgets.
+fn check_patch_budget(input: usize, model: usize) -> Result<()> {
+  if input != model {
+    return Err(Error::PatchBudgetMismatch { input, model });
   }
   Ok(())
 }

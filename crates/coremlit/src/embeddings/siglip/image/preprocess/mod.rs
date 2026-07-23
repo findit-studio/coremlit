@@ -45,9 +45,10 @@ pub(crate) const PATCH_SIZE: usize = 16;
 pub(crate) const CHANNELS: usize = 3;
 
 /// Flattened per-patch dimension `CHANNELS · PATCH_SIZE · PATCH_SIZE = 3·16·16 =
-/// 768` — the `pixel_values` inner dimension. Coincides with [`EMBEDDING_DIM`]
-/// for `base-patch16`, but is a distinct quantity.
-pub(crate) const PATCH_DIM: usize = CHANNELS * PATCH_SIZE * PATCH_SIZE;
+/// 768` — the `pixel_values` inner dimension: a [`crate::embeddings::siglip::PreprocessedImage`]
+/// carries `max_num_patches · PATCH_DIM` pixel values. Coincides with
+/// [`EMBEDDING_DIM`] for `base-patch16`, but is a distinct quantity.
+pub const PATCH_DIM: usize = CHANNELS * PATCH_SIZE * PATCH_SIZE;
 
 /// Side of the base position-embedding grid: the model's `num_patches = 256`
 /// position table reshaped to `16×16` (per the probe). Architecture constant.

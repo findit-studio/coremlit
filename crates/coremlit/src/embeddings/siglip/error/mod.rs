@@ -199,6 +199,94 @@ pub enum Error {
     /// The offending token id.
     id: u32,
   },
+
+  /// A [`crate::embeddings::siglip::PreprocessedImage`] patch budget was zero,
+  /// or so large that the `[P · 768]` tensor lengths would overflow `usize`.
+  /// A real budget is the loaded model's resolved `P` (e.g. 512) — small and
+  /// non-zero.
+  #[error("invalid preprocessed patch budget {max_num_patches} (zero, or tensor lengths overflow)")]
+  PreprocessedPatchBudget {
+    /// The budget supplied to `try_new`.
+    max_num_patches: usize,
+  },
+
+  /// A caller-supplied preprocessed tensor's length did not match the padded
+  /// contract at the supplied patch budget (`pixel_values` = `P · 768`,
+  /// `position_embeddings` = `P · 768`, `attention_mask` = `P`).
+  #[error("preprocessed `{feature}` length mismatch: expected {expected}, got {got}")]
+  PreprocessedLength {
+    /// The model input feature (`pixel_values` / `position_embeddings` /
+    /// `attention_mask`) whose length mismatched.
+    feature: &'static str,
+    /// The length the caller supplied.
+    got: usize,
+    /// The required length at the supplied budget.
+    expected: usize,
+  },
+
+  /// A caller-supplied preprocessed tensor contained a NaN or infinite value
+  /// — caller-data corruption, classified apart from the model-output
+  /// counterpart ([`Error::NonFiniteOutput`]).
+  #[error("preprocessed `{feature}` contains a non-finite value at index {index}")]
+  PreprocessedNonFinite {
+    /// The model input feature containing the non-finite value.
+    feature: &'static str,
+    /// Flat index of the first non-finite element.
+    index: usize,
+  },
+
+  /// A preprocessed attention-mask entry was not exactly `0.0` or `1.0`. The
+  /// NaFlex pipeline emits an exact binary real/pad mask; anything else is
+  /// not its output. (A NaN mask entry is classified here rather than as
+  /// [`Error::PreprocessedNonFinite`] — the mask's domain check subsumes
+  /// finiteness.)
+  #[error("preprocessed attention mask entry {index} is {value}, not exactly 0.0 or 1.0")]
+  PreprocessedMaskValue {
+    /// Index of the offending entry.
+    index: usize,
+    /// The offending value.
+    value: f32,
+  },
+
+  /// A preprocessed attention mask had a real (`1.0`) entry after a pad
+  /// (`0.0`). The NaFlex pipeline packs real patches as a contiguous prefix
+  /// with pads only at the tail; a non-prefix mask is not its output.
+  #[error("preprocessed attention mask has a real (1.0) entry at index {index} after a pad")]
+  PreprocessedMaskOrder {
+    /// Index of the out-of-order `1.0`.
+    index: usize,
+  },
+
+  /// A preprocessed attention mask had no real (`1.0`) entries. The budget
+  /// solver guarantees at least one real patch; an all-pad input would make
+  /// the graph attend over nothing.
+  #[error("preprocessed attention mask has no real (1.0) entries")]
+  PreprocessedMaskEmpty,
+
+  /// A padded (mask `0.0`) row of a preprocessed tensor contained a nonzero
+  /// value. The NaFlex pipeline zero-fills pad rows and the module's parity
+  /// evidence covers only zero pads, so nonzero pad content is rejected
+  /// fail-closed rather than trusted to be masked out by the graph.
+  #[error("preprocessed `{feature}` has a nonzero value at index {index} inside a padded row")]
+  PreprocessedPadNonZero {
+    /// The model input feature (`pixel_values` / `position_embeddings`).
+    feature: &'static str,
+    /// Flat index of the first nonzero pad element.
+    index: usize,
+  },
+
+  /// A [`crate::embeddings::siglip::PreprocessedImage`] was validated against
+  /// a different patch budget than the loaded model resolved at load (e.g. a
+  /// 256-tier bundle fed to a 512-tier model). Rebuild the bundle with this
+  /// embedder's
+  /// [`crate::embeddings::siglip::ImageEmbedder::max_num_patches`].
+  #[error("preprocessed patch budget {input} does not match the model's resolved budget {model}")]
+  PatchBudgetMismatch {
+    /// The budget the input bundle was validated against.
+    input: usize,
+    /// The budget the loaded model resolved at load.
+    model: usize,
+  },
 }
 
 #[cfg(test)]
