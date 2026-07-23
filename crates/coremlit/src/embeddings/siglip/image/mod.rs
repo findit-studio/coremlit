@@ -437,7 +437,9 @@ impl ImageEmbedder {
   ///
   /// # Errors
   /// [`Error::PatchCount`] if preprocessing overflows the budget (a solver
-  /// bug — the defensive backstop, as in [`Self::embed`]).
+  /// bug — the defensive backstop, as in [`Self::embed`]);
+  /// [`Error::PreprocessAllocation`] if a resize working buffer cannot be sized
+  /// or reserved for an extreme source geometry.
   pub fn preprocess(&self, image: Rgb8Image<'_>) -> Result<PreprocessedImage> {
     let inputs = preprocess_image(
       image.data(),
