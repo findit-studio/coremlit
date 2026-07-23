@@ -13,8 +13,7 @@ mod common;
 use coremlit::embeddings::granite::{Error, MAX_TOKENS, TextEmbedder, WindowOptions};
 
 fn embedder() -> TextEmbedder {
-  TextEmbedder::from_file(common::model_path())
-    .unwrap_or_else(|e| panic!("load granite: {e}"))
+  TextEmbedder::from_file(common::model_path()).unwrap_or_else(|e| panic!("load granite: {e}"))
 }
 
 /// A deterministic multi-paragraph document comfortably over several 512-token

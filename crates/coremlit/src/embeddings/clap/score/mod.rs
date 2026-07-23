@@ -191,6 +191,6 @@ pub fn score_windows<'a>(
 ) -> Vec<Vec<LabeledScore<'a>>> {
   windows
     .iter()
-    .map(|w| score(w.embedding(), anchors, mode))
+    .map(|w| score(w.value(), anchors, mode))
     .collect()
 }

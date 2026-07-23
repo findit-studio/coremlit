@@ -422,7 +422,10 @@ fn long_text_chunks_multi_window_within_budget() {
       "every chunk stays within the token budget, got {count}"
     );
     if let Some(prev) = prev_start {
-      assert!(chunk.start() > prev, "chunk starts strictly increase (no overlap)");
+      assert!(
+        chunk.start() > prev,
+        "chunk starts strictly increase (no overlap)"
+      );
     }
     prev_start = Some(chunk.start());
   }
@@ -487,7 +490,10 @@ fn overlap_repeats_trailing_tokens_within_budget() {
     // the packer measured, with special tokens, is `<= 16`).
     let repeated = &doc[pair[1].start()..pair[0].end()];
     let n = mt.encode(repeated, true).expect("encode").get_ids().len();
-    assert!(n <= 16, "repeated region within the 16-token overlap budget, got {n}");
+    assert!(
+      n <= 16,
+      "repeated region within the 16-token overlap budget, got {n}"
+    );
   }
 }
 

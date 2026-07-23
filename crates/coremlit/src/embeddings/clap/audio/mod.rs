@@ -250,7 +250,7 @@ impl AudioEncoder {
 
   /// Embeds a long clip as overlapped windows per `plan`, one
   /// [`WindowEmbedding`] (embedding + its span + coverage) per
-  /// [`WindowSpan`](crate::embeddings::clap::window::WindowSpan).
+  /// [`Span`](crate::embeddings::clap::window::Span).
   ///
   /// This is the long-audio pipeline entry: it slices `samples` at the plan's
   /// offsets and runs [`Self::embed_window`] on each (which `repeatpad`s a short
