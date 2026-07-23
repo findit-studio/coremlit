@@ -342,3 +342,167 @@ fn build_window_accepts_a_full_window() {
   let (_input_ids, mask) = build_window(&vec![1u32; MAX_TOKENS], 0).expect("full window builds");
   assert_eq!(mask.iter().sum::<i32>(), i32::try_from(MAX_TOKENS).unwrap());
 }
+
+// ── embed_long: content-aware chunk geometry (hermetic; measuring tokenizer,
+//    no model). The CoreML aggregation path is proven model-gated in
+//    tests/granite/embed_long.rs. ─────────────────────────────────────────────
+
+/// A deterministic multi-paragraph document comfortably over several 512-token
+/// windows: 24 paragraphs of 40 distinct words each, `\n\n`-separated.
+fn long_doc() -> String {
+  (0..24)
+    .map(|p| {
+      (0..40)
+        .map(|w| format!("para{p}word{w}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+    })
+    .collect::<Vec<_>>()
+    .join("\n\n")
+}
+
+/// THE hazard regression (design correction #1): the CONFIGURED (production)
+/// tokenizer truncates a long input's id count to exactly [`MAX_TOKENS`], while
+/// the MEASURING tokenizer (truncation disabled) reports the true, larger count.
+/// `embed_long`'s chunker MUST measure with the latter — measuring with the
+/// former would judge EVERY long document to "fit one window" and silently
+/// degenerate `embed_long` into a truncated `embed`.
+#[test]
+fn measuring_tokenizer_reports_untruncated_counts() {
+  // Non-repetitive, comfortably over one window: "1 2 3 … 1000".
+  let long: String = (1..=1000)
+    .map(|n| n.to_string())
+    .collect::<Vec<_>>()
+    .join(" ");
+  let configured = configured_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("configure");
+  let measuring = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+
+  let configured_count = configured
+    .encode(long.as_str(), true)
+    .expect("encode")
+    .get_ids()
+    .len();
+  let measuring_count = measuring
+    .encode(long.as_str(), true)
+    .expect("encode")
+    .get_ids()
+    .len();
+
+  assert_eq!(
+    configured_count, MAX_TOKENS,
+    "the production tokenizer saturates a long input at the window"
+  );
+  assert!(
+    measuring_count > MAX_TOKENS,
+    "the measuring tokenizer must see the true (untruncated) count, got {measuring_count}"
+  );
+}
+
+/// A long document splits into multiple chunks, each within the token budget,
+/// with strictly increasing (non-overlapping) starts under the default geometry.
+#[test]
+fn long_text_chunks_multi_window_within_budget() {
+  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let doc = long_doc();
+  let chunks = chunk_long(&mt, &doc, &WindowOptions::new(MAX_TOKENS)).expect("chunk");
+
+  assert!(
+    chunks.len() > 1,
+    "a document over several windows must split into multiple chunks, got {}",
+    chunks.len()
+  );
+  let mut prev_start: Option<usize> = None;
+  for chunk in &chunks {
+    let s = chunk
+      .as_str(&doc)
+      .expect("chunk falls on a char boundary of its own text");
+    let count = mt.encode(s, true).expect("encode").get_ids().len();
+    assert!(
+      count <= MAX_TOKENS,
+      "every chunk stays within the token budget, got {count}"
+    );
+    if let Some(prev) = prev_start {
+      assert!(chunk.start() > prev, "chunk starts strictly increase (no overlap)");
+    }
+    prev_start = Some(chunk.start());
+  }
+}
+
+/// A short text that fits one window is a single chunk spanning the whole text.
+#[test]
+fn single_window_text_is_one_whole_chunk() {
+  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let text = "a compact sentence that fits comfortably inside one window";
+  let chunks = chunk_long(&mt, text, &WindowOptions::new(MAX_TOKENS)).expect("chunk");
+  assert_eq!(chunks.len(), 1, "short text is one chunk");
+  assert_eq!(chunks[0].start(), 0);
+  assert_eq!(chunks[0].end(), text.len());
+}
+
+/// The chunk geometry adapts to `WindowOptions` alone (the spec's genericity at
+/// granite's seam): a smaller window yields more, smaller chunks, each within its
+/// own budget.
+#[test]
+fn chunk_geometry_adapts_by_window_options_alone() {
+  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let doc = long_doc();
+  let coarse = chunk_long(&mt, &doc, &WindowOptions::new(128)).expect("chunk @128");
+  let fine = chunk_long(&mt, &doc, &WindowOptions::new(64)).expect("chunk @64");
+
+  assert!(
+    fine.len() > coarse.len(),
+    "a smaller window yields more chunks: {} @64 vs {} @128",
+    fine.len(),
+    coarse.len()
+  );
+  for chunk in &coarse {
+    let s = chunk.as_str(&doc).expect("char boundary");
+    assert!(mt.encode(s, true).expect("encode").get_ids().len() <= 128);
+  }
+  for chunk in &fine {
+    let s = chunk.as_str(&doc).expect("char boundary");
+    assert!(mt.encode(s, true).expect("encode").get_ids().len() <= 64);
+  }
+}
+
+/// With a non-zero overlap, consecutive chunks repeat a trailing region whose
+/// measured length stays within the overlap token budget.
+#[test]
+fn overlap_repeats_trailing_tokens_within_budget() {
+  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let doc = long_doc();
+  let opts = WindowOptions::new(128).with_overlap(16);
+  let chunks = chunk_long(&mt, &doc, &opts).expect("chunk");
+
+  assert!(chunks.len() > 1, "an overlapped long doc still splits");
+  for pair in chunks.windows(2) {
+    // Consecutive chunks share a trailing region…
+    assert!(
+      pair[1].start() < pair[0].end(),
+      "consecutive chunks overlap: next start {} vs prev end {}",
+      pair[1].start(),
+      pair[0].end()
+    );
+    // …and that repeated text measures within the overlap budget (the exact text
+    // the packer measured, with special tokens, is `<= 16`).
+    let repeated = &doc[pair[1].start()..pair[0].end()];
+    let n = mt.encode(repeated, true).expect("encode").get_ids().len();
+    assert!(n <= 16, "repeated region within the 16-token overlap budget, got {n}");
+  }
+}
+
+/// `validate_long_options` (and thus `embed_long_with`) rejects a per-chunk
+/// budget above the model's fixed window before any tokenization — hermetically,
+/// no model.
+#[test]
+fn window_over_budget_is_rejected() {
+  match validate_long_options(&WindowOptions::new(MAX_TOKENS + 1)) {
+    Err(Error::WindowOverBudget { window, max }) => {
+      assert_eq!(window, MAX_TOKENS + 1);
+      assert_eq!(max, MAX_TOKENS);
+    }
+    other => panic!("expected Err(WindowOverBudget), got {other:?}"),
+  }
+  // The exact budget is accepted.
+  assert!(validate_long_options(&WindowOptions::new(MAX_TOKENS)).is_ok());
+}

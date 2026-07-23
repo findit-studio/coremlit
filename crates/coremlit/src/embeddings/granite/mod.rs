@@ -66,7 +66,12 @@ mod compute_units_serde;
 pub use embedding::Embedding;
 pub use error::Error;
 
-use std::path::Path;
+/// windit's window geometry, re-exported as the one windit type in granite's
+/// public surface: the per-chunk token budget, overlap, and window cap
+/// [`TextEmbedder::embed_long_with`] accepts.
+pub use windit::plan::WindowOptions;
+
+use std::{path::Path, sync::OnceLock};
 
 use crate::{ComputeUnits, DataType, Model, MultiArray};
 use tokenizers::{Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy};
@@ -182,6 +187,13 @@ pub struct TextEmbedder {
   /// Resolved from the tokenizer's pad token `<|endoftext|>` at load, else `0`
   /// (a guaranteed-valid vocabulary index).
   pad_id: i32,
+  /// Lazily built clone of `tokenizer` with truncation DISABLED — the tokenizer
+  /// [`Self::embed_long`] measures chunk lengths with. The embed path's
+  /// `tokenizer` truncates at [`MAX_TOKENS`], so its id counts saturate at 512
+  /// and would tell the content-aware chunker that EVERY document fits one
+  /// window; measurement must see the true, untruncated count. Lazy so
+  /// embed-only callers pay nothing, and shared across every `embed_long` call.
+  measure_tokenizer: OnceLock<Tokenizer>,
 }
 
 impl TextEmbedder {
@@ -292,6 +304,7 @@ impl TextEmbedder {
       model,
       tokenizer,
       pad_id,
+      measure_tokenizer: OnceLock::new(),
     })
   }
 
@@ -328,10 +341,27 @@ impl TextEmbedder {
   /// projection has zero magnitude.
   pub fn embed(&self, text: &str) -> Result<Embedding> {
     let ids = self.token_ids(text)?;
+    self.embed_tokenized(&ids)
+  }
+
+  /// Everything after tokenization: right-pads `ids` to the fixed `[1, 512]`
+  /// window, runs the CoreML graph, checks the output is finite, and
+  /// L2-normalizes it. [`Self::embed`] is [`Self::token_ids`] composed with this;
+  /// [`Self::embed_long`] runs it once per content-aware chunk.
+  ///
+  /// # Errors
+  /// As the tensor / prediction / output tail of [`Self::embed`]:
+  /// [`Error::TokenCount`] if `ids` exceeds [`MAX_TOKENS`] or
+  /// [`Error::TokenIdRange`] if a token id is out of `int32` range (both
+  /// defensive); [`Error::Tensor`] / [`Error::Prediction`] on a tensor or CoreML
+  /// failure; [`Error::OutputShape`] on a shape divergence;
+  /// [`Error::NonFiniteOutput`] on a NaN/infinite model output;
+  /// [`Error::EmbeddingZero`] if the projection has zero magnitude.
+  fn embed_tokenized(&self, ids: &[u32]) -> Result<Embedding> {
     // Right-pad to the fixed [1, 512] window; real tokens masked 1, pads 0. The
     // tokenizer config guarantees `ids` is real and within the window, but
     // `build_window` still guards it with a typed error instead of a panic.
-    let (input_ids, attention_mask) = build_window(&ids, self.pad_id)?;
+    let (input_ids, attention_mask) = build_window(ids, self.pad_id)?;
 
     let ids_tensor = MultiArray::from_slice(&[1, MAX_TOKENS], &input_ids)?;
     let mask_tensor = MultiArray::from_slice(&[1, MAX_TOKENS], &attention_mask)?;
@@ -360,6 +390,113 @@ impl TextEmbedder {
     // (`NonFiniteEmbedding`).
     check_finite_output(&row)?;
     Embedding::from_slice_normalizing(&row)
+  }
+
+  /// A clone of the stored tokenizer with truncation DISABLED, built once and
+  /// cached in [`Self::measure_tokenizer`]. This is the tokenizer
+  /// [`Self::embed_long`] measures chunk lengths with: the embed path's
+  /// tokenizer truncates at [`MAX_TOKENS`], so its counts saturate at 512 and
+  /// would report every long document as fitting a single window.
+  ///
+  /// # Errors
+  /// [`Error::TokenizerConfig`] if truncation cannot be reconfigured.
+  fn measuring_tokenizer(&self) -> Result<&Tokenizer> {
+    if let Some(t) = self.measure_tokenizer.get() {
+      return Ok(t);
+    }
+    // Padding is already disabled on the stored tokenizer (construction), and the
+    // clone inherits that; only truncation is lifted.
+    let mut t = self.tokenizer.clone();
+    t.with_truncation(None).map_err(Error::TokenizerConfig)?;
+    // Racing initializers build identical values; the loser's clone is dropped.
+    let _ = self.measure_tokenizer.set(t);
+    Ok(
+      self
+        .measure_tokenizer
+        .get()
+        .expect("measure_tokenizer was set just above, on this thread or another"),
+    )
+  }
+
+  /// Embeds arbitrarily long text: splits it into content-aware chunks of at
+  /// most [`MAX_TOKENS`] tokens (respecting paragraph, sentence, and word
+  /// boundaries), embeds each chunk with one CoreML prediction, and combines the
+  /// per-chunk embeddings by a coverage-weighted spherical mean into one
+  /// unit-norm [`Embedding`]. Prompt-free, like [`Self::embed`], and equivalent
+  /// to `embed_long_with(text, &WindowOptions::new(MAX_TOKENS))`.
+  ///
+  /// Text that fits a single window returns exactly [`Self::embed`]'s embedding.
+  ///
+  /// # Errors
+  /// As [`Self::embed_long_with`].
+  pub fn embed_long(&self, text: &str) -> Result<Embedding> {
+    self.embed_long_with(text, &WindowOptions::new(MAX_TOKENS))
+  }
+
+  /// [`Self::embed_long`] with caller-controlled chunk geometry: `opts.window()`
+  /// is the per-chunk token budget (must be `1..=`[`MAX_TOKENS`]), the overlap
+  /// sets the repeated-token budget between consecutive chunks, and
+  /// `opts.max_windows()` caps the chunk count. `opts.tail()` is ignored —
+  /// content-aware chunking has no ragged-tail concept, the final chunk is
+  /// simply short.
+  ///
+  /// The per-chunk token budget counts granite's special tokens (`[CLS]`/`[SEP]`,
+  /// +2), because both the length measurement and each chunk's embedding run
+  /// `encode(s, add_special_tokens = true)` — self-consistent by construction, so
+  /// the effective content budget is `window − 2`.
+  ///
+  /// # Errors
+  /// [`Error::WindowOverBudget`] if `opts.window()` exceeds [`MAX_TOKENS`] (every
+  /// chunk would be silently truncated); [`Error::EmptyText`] for `""` (as
+  /// [`Self::embed`]); [`Error::Tokenize`] on a tokenizer failure;
+  /// [`Error::Windowing`] carrying a [`WinditError`](crate::embeddings::granite::error::WinditError)
+  /// from chunking (e.g. `ZeroWindow`, `OverlapGeWindow`, `TooManyWindows`) or
+  /// aggregation (e.g. `NonFinite` when the per-chunk embeddings cancel exactly);
+  /// plus any per-chunk tensor / prediction / output error (the same set
+  /// [`Self::embed`] can raise).
+  pub fn embed_long_with(&self, text: &str, opts: &WindowOptions) -> Result<Embedding> {
+    validate_long_options(opts)?;
+    let chunks = chunk_long(self.measuring_tokenizer()?, text, opts)?;
+    match chunks.len() {
+      // Empty or whitespace-only text yields no chunks; `embed` defines the
+      // contract there (EmptyText for "", a specials-only embedding for
+      // whitespace), so delegate to keep those semantics identical.
+      0 => self.embed(text),
+      // A text that fits one window chunks to exactly one range over its own
+      // bytes, so this is `embed` on the same content — and skipping the
+      // one-window aggregation keeps it numerically identical rather than
+      // identical-up-to-an-f64-renormalization-rounding.
+      1 => {
+        let s = chunks[0]
+          .as_str(text)
+          .expect("ContentAware chunks fall on char boundaries of the text they were cut from");
+        self.embed_tokenized(&self.token_ids(s)?)
+      }
+      _ => {
+        let mut windows = Vec::with_capacity(chunks.len());
+        // Cumulative token offset; informational only — aggregation reads
+        // coverage, not position. Under overlap the offsets overstate positions
+        // (overlapped tokens counted twice), which is exactly the double-weighting
+        // overlap is meant to express.
+        let mut offset = 0usize;
+        for chunk in &chunks {
+          let s = chunk
+            .as_str(text)
+            .expect("ContentAware chunks fall on char boundaries of the text they were cut from");
+          let ids = self.token_ids(s)?;
+          let embedding = self.embed_tokenized(&ids)?;
+          // `embed_tokenized` just proved `ids.len() <= MAX_TOKENS` (build_window's
+          // typed guard) and a chunk is never empty, so `Span::new` cannot panic.
+          let span = windit::plan::Span::new(offset, ids.len(), MAX_TOKENS);
+          windows.push(windit::windowed::Windowed::new(embedding, span));
+          offset += ids.len();
+        }
+        Ok(windit::aggregate::aggregate(
+          &windit::aggregate::CoverageWeightedMean,
+          &windows,
+        )?)
+      }
+    }
   }
 }
 
@@ -420,6 +557,64 @@ fn build_window(ids: &[u32], pad_id: i32) -> Result<([i32; MAX_TOKENS], [i32; MA
   Ok((input_ids, attention_mask))
 }
 
+/// Rejects an [`TextEmbedder::embed_long`] chunk budget above the model's fixed
+/// input window before any chunking or prediction: a larger budget would let
+/// [`TextEmbedder::token_ids`] silently truncate every chunk. Factored out so the
+/// check is hermetically testable. `window == 0` and `overlap >= window` are left
+/// to windit's own validation (surfacing as [`Error::Windowing`]).
+///
+/// # Errors
+/// [`Error::WindowOverBudget`] if `opts.window()` exceeds [`MAX_TOKENS`].
+fn validate_long_options(opts: &WindowOptions) -> Result<()> {
+  if opts.window() > MAX_TOKENS {
+    return Err(Error::WindowOverBudget {
+      window: opts.window(),
+      max: MAX_TOKENS,
+    });
+  }
+  Ok(())
+}
+
+/// The pure text-splitting stage of [`TextEmbedder::embed_long`]: token-budgeted,
+/// boundary-aware byte ranges over `text`, measured with `measure_tok` (the
+/// truncation-disabled tokenizer). Model-free, so the chunk geometry is
+/// hermetically testable.
+///
+/// Measurement and per-chunk embedding run the SAME tokenization
+/// (`encode(s, add_special_tokens = true)`) on the SAME substring, so a chunk
+/// measured at `<= window <= MAX_TOKENS` re-tokenizes to exactly the counted ids
+/// and [`build_window`] never truncates or rejects it. windit's one escape hatch
+/// — a lone `char` whose own measure exceeds the window is emitted anyway — is
+/// unreachable for a real tokenizer (a single char is a handful of tokens), and
+/// even then `token_ids`' truncation plus `build_window`'s typed guard keep it
+/// sound.
+///
+/// # Errors
+/// [`Error::Windowing`] carrying whatever windit's `ContentAware::chunk` rejects
+/// (a zero window, an overlap at or above the window, or a `max_windows` overrun).
+fn chunk_long(
+  measure_tok: &Tokenizer,
+  text: &str,
+  opts: &WindowOptions,
+) -> Result<Vec<windit::split::Chunk>> {
+  // Blanket `MeasureText` impl over any `Fn(&str) -> usize`. A tokenizer error
+  // folds to `usize::MAX` ("does not fit"), so the chunker descends to a smaller
+  // range; a persistent failure resurfaces as `Error::Tokenize` from the
+  // per-chunk `token_ids` in `embed_long_with`. The closure cannot stop early
+  // (the tokenizers crate exposes no incremental token count on its stable
+  // surface), so a giant untrusted input is scanned a few times even under a
+  // `max_windows` cap — a recorded limitation, not silently fine.
+  let measure = |s: &str| -> usize {
+    measure_tok
+      .encode(s, true)
+      .map(|e| e.get_ids().len())
+      .unwrap_or(usize::MAX)
+  };
+  windit::split::ContentAware::new(&measure)
+    .chunk(text, opts)
+    .map_err(Error::from)
+}
+
 /// Test-only seam: the module's actual tokenizer configuration, without loading
 /// a CoreML model — so `tests` can exercise the real tokenization path
 /// hermetically (the tokenizer-identity gate).
@@ -427,6 +622,19 @@ fn build_window(ids: &[u32], pad_id: i32) -> Result<([i32; MAX_TOKENS], [i32; MA
 pub(crate) fn configured_tokenizer_from_bytes(bytes: &[u8]) -> Result<Tokenizer> {
   let mut tokenizer = Tokenizer::from_bytes(bytes).map_err(Error::TokenizerLoad)?;
   configure_tokenizer(&mut tokenizer)?;
+  Ok(tokenizer)
+}
+
+/// Test-only seam: the module's MEASURING tokenizer — the production
+/// configuration ([`configured_tokenizer_from_bytes`]) with truncation then
+/// DISABLED — without loading a CoreML model, so `tests` can exercise the real
+/// `chunk_long` measurement path (and pin the truncation hazard) hermetically.
+#[cfg(test)]
+pub(crate) fn measuring_tokenizer_from_bytes(bytes: &[u8]) -> Result<Tokenizer> {
+  let mut tokenizer = configured_tokenizer_from_bytes(bytes)?;
+  tokenizer
+    .with_truncation(None)
+    .map_err(Error::TokenizerConfig)?;
   Ok(tokenizer)
 }
 

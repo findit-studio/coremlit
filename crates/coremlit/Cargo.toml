@@ -580,6 +580,14 @@ required-features = ["granite"]
 name = "granite_placement"
 path = "tests/granite/placement.rs"
 required-features = ["granite"]
+
+# The long-input windowing gate: content-aware chunk geometry is proven hermetic
+# in-lib; this suite gates the CoreML per-chunk embedding + windit aggregation on
+# the staged granite artifact (`#[ignore]` + Models/ layout, like the others).
+[[test]]
+name = "granite_embed_long"
+path = "tests/granite/embed_long.rs"
+required-features = ["granite"]
 # Dual-tower encode harness: first-observed/cached load, first + warm inference
 # per tower × ComputeUnits (model-gated; `harness = false` custom main — the load
 # phases are one-shot costs criterion's resampling cannot see). Mirrors the
