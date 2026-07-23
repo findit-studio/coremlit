@@ -14,7 +14,9 @@
 //!    22-bit coefficients, per-pass u8 rounding), matching the SigLIP2 processor
 //!    (resize on u8, THEN rescale+normalize). Its sibling f64
 //!    [`resize_bilinear_antialias`] is the position-embedding lift's kernel
-//!    (stage 5), which the reference genuinely computes in float.
+//!    (stage 5), which the reference genuinely computes in float. The u8
+//!    kernel's bit-exactness holds for source axes ≤ [`MAX_IMAGE_AXIS`], which
+//!    [`preprocess_image`] enforces.
 //! 3. [`normalize_u8`] — rescale + normalize `((v/255) − 0.5)/0.5`.
 //! 4. [`patchify`] — reshape the resized+normalized image to `[P, 768]` patch
 //!    rows plus the `[P]` real/pad mask.
@@ -49,6 +51,34 @@ pub(crate) const CHANNELS: usize = 3;
 /// carries `max_num_patches · PATCH_DIM` pixel values. Coincides with
 /// [`EMBEDDING_DIM`] for `base-patch16`, but is a distinct quantity.
 pub const PATCH_DIM: usize = CHANNELS * PATCH_SIZE * PATCH_SIZE;
+
+/// Maximum accepted source-image extent per axis, `2²⁰ = 1 048 576` pixels.
+/// `preprocess_image` rejects a larger axis with
+/// [`Error::ImageDimensions`] before any resize work. The bound is a property
+/// of the resize kernels, not of the model:
+///
+/// * **Pillow-exactness envelope.** Pillow passes the resize box through
+///   `float box[4]` (`_imaging.c` parses `(ffff)`; `Resample.c`
+///   `precompute_coeffs(int inSize, float in0, float in1, …)` computes
+///   `scale = (double)(in1 - in0) / outSize`), so the source extent is rounded
+///   to `f32` before the `f64` coefficient math. Every integer extent `≤ 2²⁴`
+///   is exactly `f32`-representable, making the pure-`f64`
+///   `precompute_coeffs` here bit-identical to Pillow's; from `2²⁴ + 1`
+///   upward Pillow computes with a different extent (`16 777 219 →
+///   16 777 220.0f32`) and the uint8 kernel's bit-exact contract would
+///   silently break. The cap keeps every accepted extent 16× inside the
+///   envelope.
+/// * **Bounded working memory.** The per-axis coefficient tables (`~2·axis`
+///   taps) and the horizontal pass's `u8` intermediate (`src_h · dst_w · 3`
+///   bytes) grow linearly with the accepted axis — hundreds of MB to over a
+///   GB for degenerate strips the budget solver otherwise accepts. Under the
+///   cap the whole resize working set stays ≈ 100 MB even at the boundary.
+///
+/// `2²⁰` px per axis is far beyond any physically decodable image (record
+/// stitched panoramas peak near `8.5 × 10⁵` px on the long axis), so the
+/// bound rejects nothing realistic while making the Pillow-parity contract
+/// hold over the entire accepted domain.
+pub const MAX_IMAGE_AXIS: usize = 1 << 20;
 
 /// Side of the base position-embedding grid: the model's `num_patches = 256`
 /// position table reshaped to `16×16` (per the probe). Architecture constant.
@@ -143,6 +173,10 @@ fn triangle(t: f64) -> f64 {
 /// downsampling low-passes; upsampling (`scale ≤ 1`) keeps unit support (plain
 /// bilinear). `align_corners=False` sample centers `(o + 0.5)·scale`. Each entry
 /// is `(start_input_index, normalized_weights)`.
+///
+/// Image-path callers bound `in_size` by [`MAX_IMAGE_AXIS`], under which this
+/// pure-`f64` extent math coincides bit-for-bit with Pillow's `float box[4]`
+/// semantics (see the const's doc for the threshold).
 ///
 /// # Errors
 /// [`Error::PreprocessAllocation`] if a pathological source extent makes the
@@ -283,11 +317,16 @@ pub(crate) fn resize_bilinear_antialias(
 /// away from zero. Bilinear weights are non-negative in practice; the negative
 /// branch mirrors PIL exactly for any residual.
 ///
+/// Consumes `coeffs` by value: each entry's `f64` weights vector drops as soon
+/// as its `i32` twin is built, so the two precisions never fully coexist —
+/// the safe-Rust analogue of Pillow's in-place `kk = (INT32 *)prekk` reuse
+/// (`normalize_coeffs_8bpc`).
+///
 /// # Errors
 /// [`Error::PreprocessAllocation`] if a quantized coefficient vector cannot be
 /// reserved (the input table is already bounded, so only the reservation can
 /// fail; the quantized values are unchanged from the infallible form).
-fn quantize_coeffs_8bpc(coeffs: &[(usize, Vec<f64>)]) -> Result<Vec<(usize, Vec<i32>)>, Error> {
+fn quantize_coeffs_8bpc(coeffs: Vec<(usize, Vec<f64>)>) -> Result<Vec<(usize, Vec<i32>)>, Error> {
   let scale = f64::from(1i32 << PRECISION_BITS);
   let mut out = Vec::new();
   out
@@ -303,7 +342,7 @@ fn quantize_coeffs_8bpc(coeffs: &[(usize, Vec<f64>)]) -> Result<Vec<(usize, Vec<
       .map_err(|_| Error::PreprocessAllocation {
         bytes: weights.len().saturating_mul(core::mem::size_of::<i32>()),
       })?;
-    for &w in weights {
+    for &w in &weights {
       let q = if w < 0.0 {
         (-0.5 + w * scale) as i32
       } else {
@@ -311,7 +350,7 @@ fn quantize_coeffs_8bpc(coeffs: &[(usize, Vec<f64>)]) -> Result<Vec<(usize, Vec<
       };
       kk.push(q);
     }
-    out.push((*start, kk));
+    out.push((start, kk));
   }
   Ok(out)
 }
@@ -361,6 +400,17 @@ fn alloc_u8(len: usize) -> Result<Vec<u8>, Error> {
 /// rather than aborting. A `src` shorter than `src_h·src_w·channels` panics on
 /// an out-of-bounds tap — a caller-internal invariant.
 ///
+/// [`quantize_coeffs_8bpc`] consumes its `f64` input table, so the `f64` and
+/// `i32` tables never fully coexist; this fn also drops the horizontal `i32`
+/// table with `drop` before the vertical one is built, so peak coefficient
+/// memory is one table at a time. The only caller, [`preprocess_image`],
+/// bounds `src_h`/`src_w` by [`MAX_IMAGE_AXIS`], which keeps every table and
+/// the horizontal intermediate under ≈ 100 MB and — because every accepted
+/// axis is then exactly `f32`-representable — keeps this kernel inside
+/// Pillow's `float box[4]` exact envelope (see [`MAX_IMAGE_AXIS`]'s doc for
+/// the threshold); the bound is an invariant of the caller, not re-checked
+/// here.
+///
 /// # Errors
 /// [`Error::PreprocessAllocation`] if a working buffer or coefficient table's
 /// size overflows `usize` or cannot be reserved.
@@ -375,7 +425,7 @@ pub(crate) fn resize_bilinear_antialias_u8(
   const OFFSET: i64 = 1 << (PRECISION_BITS - 1);
 
   // Horizontal pass: (src_h, src_w, C) → (src_h, dst_w, C), u8 intermediate.
-  let wc = quantize_coeffs_8bpc(&precompute_coeffs(src_w, dst_w)?)?;
+  let wc = quantize_coeffs_8bpc(precompute_coeffs(src_w, dst_w)?)?;
   let mut tmp = alloc_u8(checked_len3(src_h, dst_w, channels)?)?;
   for y in 0..src_h {
     for (ox, (start, weights)) in wc.iter().enumerate() {
@@ -388,9 +438,10 @@ pub(crate) fn resize_bilinear_antialias_u8(
       }
     }
   }
+  drop(wc); // horizontal table is dead before the vertical pass builds its own
 
   // Vertical pass: (src_h, dst_w, C) → (dst_h, dst_w, C).
-  let hc = quantize_coeffs_8bpc(&precompute_coeffs(src_h, dst_h)?)?;
+  let hc = quantize_coeffs_8bpc(precompute_coeffs(src_h, dst_h)?)?;
   let mut out = alloc_u8(checked_len3(dst_h, dst_w, channels)?)?;
   for (oy, (start, weights)) in hc.iter().enumerate() {
     for x in 0..dst_w {
@@ -529,6 +580,7 @@ pub(crate) fn lift_position_embeddings(
 
 /// The three vision-graph input tensors produced from one decoded image, plus
 /// the resolved `(grid_h, grid_w)` patch grid.
+#[derive(Debug)]
 pub(crate) struct VisionInputs {
   /// Patchified pixels `[budget · PATCH_DIM]` (the `pixel_values` input).
   pub pixel_values: Vec<f32>,
@@ -557,6 +609,7 @@ pub(crate) struct VisionInputs {
 /// parsed `POS_EMBED_ELEMS` base position grid.
 ///
 /// # Errors
+/// [`Error::ImageDimensions`] if an image axis exceeds [`MAX_IMAGE_AXIS`];
 /// [`Error::PatchCount`] if the solved grid exceeds `budget` (a solver bug);
 /// [`Error::PreprocessAllocation`] if a resize working buffer cannot be sized or
 /// reserved (pathological source geometry).
@@ -567,6 +620,10 @@ pub(crate) fn preprocess_image(
   base_grid: &[f32],
   budget: usize,
 ) -> Result<VisionInputs, Error> {
+  if width > MAX_IMAGE_AXIS || height > MAX_IMAGE_AXIS {
+    return Err(Error::ImageDimensions { width, height });
+  }
+
   let (grid_h, grid_w) = fit_to_patch_budget(height, width, PATCH_SIZE, budget);
 
   // Resize in the u8 domain (PIL-parity fixed-point kernel), then

@@ -61,10 +61,16 @@ pub enum Error {
     index: usize,
   },
 
-  /// An [`crate::embeddings::siglip::Rgb8Image`] view had a zero dimension, or
-  /// its `width · height · 3` byte length overflowed `usize`. A real decoded RGB
-  /// image has non-zero dimensions and a length that fits.
-  #[error("invalid image dimensions: {width}×{height} (zero dimension or size overflow)")]
+  /// An [`crate::embeddings::siglip::Rgb8Image`] view had a zero dimension, a
+  /// `width · height · 3` byte length overflowing `usize`, or an axis exceeding
+  /// the preprocessing bound
+  /// [`crate::embeddings::siglip::image::MAX_IMAGE_AXIS`] (which keeps every
+  /// accepted extent inside Pillow's `f32` box envelope and bounds resize
+  /// working memory). A real decoded RGB image has non-zero, in-bound
+  /// dimensions and a length that fits.
+  #[error(
+    "invalid image dimensions: {width}×{height} (zero, over the per-axis maximum, or size overflow)"
+  )]
   ImageDimensions {
     /// The width supplied.
     width: usize,

@@ -622,3 +622,76 @@ fn preprocess_image_is_deterministic() {
   assert_eq!(a.attention_mask, b.attention_mask);
   assert_eq!(a.position_embeddings, b.position_embeddings);
 }
+
+// ── Image-axis bound ─────────────────────────────────────────────────────────
+
+/// Wide over-bound strip: a valid `Rgb8Image` geometry one past
+/// [`MAX_IMAGE_AXIS`] is rejected, typed, before any resize allocation.
+#[test]
+fn preprocess_rejects_width_over_axis_bound() {
+  let w = MAX_IMAGE_AXIS + 1;
+  let rgb = vec![0u8; w * 3];
+  let base = vec![0.0f32; POS_EMBED_ELEMS];
+  let err = preprocess_image(&rgb, w, 1, &base, P).unwrap_err();
+  assert!(matches!(err, Error::ImageDimensions { width, height } if width == w && height == 1));
+}
+
+/// Tall twin — the worse unbounded orientation (the horizontal pass would
+/// materialize a `src_h · dst_w · 3` intermediate, ~805 MB at 16.7M px).
+#[test]
+fn preprocess_rejects_height_over_axis_bound() {
+  let h = MAX_IMAGE_AXIS + 1;
+  let rgb = vec![0u8; h * 3];
+  let base = vec![0.0f32; POS_EMBED_ELEMS];
+  let err = preprocess_image(&rgb, 1, h, &base, P).unwrap_err();
+  assert!(matches!(err, Error::ImageDimensions { width, height } if width == 1 && height == h));
+}
+
+/// The Pillow `f32`-box divergence zone is unreachable: Pillow rounds the
+/// extent through `float box[4]` (`16 777 219 → 16 777 220.0f32`, first
+/// inexact integer `2²⁴ + 1`), so above `2²⁴` its coefficients diverge from
+/// exact-`f64` ones (quantized tables differ; a crafted 0/255 pattern flips
+/// output bytes). The axis bound rejects such extents long before the kernel
+/// runs, keeping the uint8 kernel's bit-exact contract honest over the whole
+/// accepted domain.
+#[test]
+fn preprocess_rejects_pillow_f32_inexact_extent() {
+  let w = 16_777_219usize; // ~50 MB transient buffer; freed at test end
+  let rgb = vec![0u8; w * 3];
+  let base = vec![0.0f32; POS_EMBED_ELEMS];
+  let err = preprocess_image(&rgb, w, 1, &base, P).unwrap_err();
+  assert!(matches!(err, Error::ImageDimensions { width, height } if width == w && height == 1));
+}
+
+/// The boundary panorama IS accepted: `MAX_IMAGE_AXIS × 1` (the largest
+/// accepted wide strip) preprocesses to a valid bundle with bounded tables
+/// (≈ 17 MB f64 peak per axis).
+#[test]
+fn preprocess_accepts_axis_bound_wide_panorama() {
+  let rgb = vec![127u8; MAX_IMAGE_AXIS * 3];
+  let base = vec![0.0f32; POS_EMBED_ELEMS];
+  let out = preprocess_image(&rgb, MAX_IMAGE_AXIS, 1, &base, P).unwrap();
+  let (gh, gw) = out.grid;
+  assert_eq!(gh, 1);
+  assert!((1..=P).contains(&gw));
+  assert_eq!(out.pixel_values.len(), P * PATCH_DIM);
+  assert_eq!(out.attention_mask.len(), P);
+  let real = out.attention_mask.iter().filter(|&&m| m == 1.0).count();
+  assert_eq!(real, gh * gw);
+}
+
+/// Tall boundary twin: `1 × MAX_IMAGE_AXIS` — exercises the bounded worst-case
+/// horizontal intermediate (`MAX_IMAGE_AXIS · 16 · 3 ≈ 50 MB`) end to end.
+#[test]
+fn preprocess_accepts_axis_bound_tall_strip() {
+  let rgb = vec![127u8; MAX_IMAGE_AXIS * 3];
+  let base = vec![0.0f32; POS_EMBED_ELEMS];
+  let out = preprocess_image(&rgb, 1, MAX_IMAGE_AXIS, &base, P).unwrap();
+  let (gh, gw) = out.grid;
+  assert_eq!(gw, 1);
+  assert!((1..=P).contains(&gh));
+  assert_eq!(out.pixel_values.len(), P * PATCH_DIM);
+  assert_eq!(out.attention_mask.len(), P);
+  let real = out.attention_mask.iter().filter(|&&m| m == 1.0).count();
+  assert_eq!(real, gh * gw);
+}

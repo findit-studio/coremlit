@@ -15,7 +15,7 @@ use crate::embeddings::siglip::{
   image::preprocess::{parse_base_pos_grid, preprocess_image},
 };
 
-pub use preprocess::PATCH_DIM;
+pub use preprocess::{MAX_IMAGE_AXIS, PATCH_DIM};
 
 /// Declared feature names on the siglip vision `.mlmodelc` (pinned by
 /// `tests/siglip/model_io.rs`).
@@ -436,6 +436,7 @@ impl ImageEmbedder {
   /// same patch budget.
   ///
   /// # Errors
+  /// [`Error::ImageDimensions`] if an image axis exceeds [`MAX_IMAGE_AXIS`];
   /// [`Error::PatchCount`] if preprocessing overflows the budget (a solver
   /// bug — the defensive backstop, as in [`Self::embed`]);
   /// [`Error::PreprocessAllocation`] if a resize working buffer cannot be sized
@@ -459,6 +460,7 @@ impl ImageEmbedder {
   /// Embeds one decoded image into a unit-norm [`Embedding`].
   ///
   /// # Errors
+  /// [`Error::ImageDimensions`] if an image axis exceeds [`MAX_IMAGE_AXIS`];
   /// [`Error::PatchCount`] if preprocessing overflows the budget (a solver bug);
   /// [`Error::PreprocessAllocation`] if a resize working buffer cannot be sized
   /// or reserved (pathological source geometry);
