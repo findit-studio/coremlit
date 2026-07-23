@@ -685,6 +685,67 @@ fn gap_repair_cannot_exceed_max_windows() {
   }
 }
 
+/// Contentless (whitespace-only) nonempty text chunks to no content, yet
+/// embedding it still costs one whole-input CoreML prediction; the cap must
+/// see that cost. Cap 0 refuses before any model work with the true count;
+/// cap 1 (and no cap) admits it as a single whole-input chunk — full
+/// coverage, one prediction.
+#[test]
+fn whitespace_only_text_counts_one_window_against_the_cap() {
+  use windit::WinditError;
+
+  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+
+  match chunk_long(
+    &mt,
+    "   ",
+    &WindowOptions::new(MAX_TOKENS).with_max_windows(0),
+  ) {
+    Err(Error::Windowing(WinditError::TooManyWindows { got, max })) => {
+      assert_eq!(got, 1, "the whole-input fallback counts as one window");
+      assert_eq!(max, 0);
+    }
+    other => panic!("expected Err(Windowing(TooManyWindows)), got {other:?}"),
+  }
+
+  let capped = chunk_long(
+    &mt,
+    "   ",
+    &WindowOptions::new(MAX_TOKENS).with_max_windows(1),
+  )
+  .expect("cap 1 admits the whole-input fallback");
+  assert_eq!(
+    capped
+      .iter()
+      .map(|c| (c.start(), c.end()))
+      .collect::<Vec<_>>(),
+    vec![(0, 3)],
+    "one chunk spanning the whole input"
+  );
+
+  let uncapped =
+    chunk_long(&mt, "   ", &WindowOptions::new(MAX_TOKENS)).expect("uncapped whitespace");
+  assert_eq!(
+    uncapped
+      .iter()
+      .map(|c| (c.start(), c.end()))
+      .collect::<Vec<_>>(),
+    vec![(0, 3)],
+    "the fallback chunk is synthesized regardless of any cap"
+  );
+}
+
+/// `""` costs zero predictions (`embed_long_with` delegates it to `embed`,
+/// which fails `EmptyText` before the model), so no fallback chunk is
+/// synthesized and even a cap of 0 passes chunking.
+#[test]
+fn empty_text_chunks_to_nothing_under_any_cap() {
+  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let chunks = chunk_long(&mt, "", &WindowOptions::new(MAX_TOKENS).with_max_windows(0))
+    .expect("empty text chunks to nothing under a cap of 0");
+  assert!(chunks.is_empty());
+}
+
 /// A short text that fits one window is a single chunk spanning the whole text.
 #[test]
 fn single_window_text_is_one_whole_chunk() {

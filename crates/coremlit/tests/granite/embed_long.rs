@@ -92,3 +92,42 @@ fn over_budget_window_rejected_before_any_prediction() {
     "expected WindowOverBudget, got {err:?}"
   );
 }
+
+/// A `max_windows` of 0 can never be satisfied by nonempty text — even
+/// whitespace-only text, whose content-aware chunking yields no content,
+/// still costs one whole-input prediction — so `embed_long_with` refuses it
+/// before any prediction, reporting the one-window cost against the cap.
+#[test]
+#[ignore = "requires local granite model (EMBEDKIT_TEST_MODELS)"]
+fn whitespace_at_cap_zero_rejected_before_any_prediction() {
+  use coremlit::embeddings::granite::error::WinditError;
+
+  let emb = embedder();
+  let err = emb
+    .embed_long_with("   ", &WindowOptions::new(MAX_TOKENS).with_max_windows(0))
+    .unwrap_err();
+  assert!(
+    matches!(
+      err,
+      Error::Windowing(WinditError::TooManyWindows { got: 1, max: 0 })
+    ),
+    "expected Windowing(TooManyWindows {{ got: 1, max: 0 }}), got {err:?}"
+  );
+}
+
+/// At cap 1 the same whitespace-only text embeds through the single
+/// whole-input fallback chunk — the identical `token_ids` ∘ `embed_tokenized`
+/// call `embed` makes on the same bytes, so the embeddings match.
+#[test]
+#[ignore = "requires local granite model (EMBEDKIT_TEST_MODELS)"]
+fn whitespace_at_cap_one_matches_embed() {
+  let emb = embedder();
+  let via_long = emb
+    .embed_long_with("   ", &WindowOptions::new(MAX_TOKENS).with_max_windows(1))
+    .expect("cap 1 admits the one whole-input prediction");
+  let via_embed = emb.embed("   ").expect("embed whitespace");
+  assert!(
+    via_long.is_close(&via_embed, 1e-5),
+    "whole-input fallback must match embed"
+  );
+}

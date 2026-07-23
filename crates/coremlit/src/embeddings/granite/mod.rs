@@ -442,7 +442,10 @@ impl TextEmbedder {
   /// is the per-chunk token budget (must be `1..=`[`MAX_TOKENS`]), the overlap
   /// sets the repeated-token budget between consecutive chunks, and
   /// `opts.max_windows()` caps the final chunk count — separator reattachment
-  /// included — and thereby the number of per-chunk CoreML predictions.
+  /// and the whole-input fallback chunk for contentless text included — which
+  /// is exactly the number of CoreML predictions the call may dispatch. A cap
+  /// of `0` therefore rejects every nonempty text, while `""` still fails
+  /// [`Error::EmptyText`].
   /// `opts.tail()` is ignored — content-aware chunking has no ragged-tail
   /// concept, the final chunk is simply short.
   ///
@@ -467,7 +470,8 @@ impl TextEmbedder {
   /// [`Self::embed`]); [`Error::Tokenize`] on a tokenizer failure;
   /// [`Error::Windowing`] carrying a [`WinditError`](crate::embeddings::granite::error::WinditError)
   /// from chunking (e.g. `ZeroWindow`, `OverlapGeWindow`, `TooManyWindows` — the
-  /// `max_windows` cap binds the final, post-reattachment chunk count, `got`
+  /// `max_windows` cap binds the final chunk count — post-reattachment,
+  /// contentless nonempty text counting as one whole-input chunk — `got`
   /// reporting that full count) or
   /// aggregation (e.g. `NonFinite` when the per-chunk embeddings cancel exactly);
   /// plus any per-chunk tensor / prediction / output error (the same set
@@ -476,9 +480,9 @@ impl TextEmbedder {
     validate_long_options(opts)?;
     let chunks = chunk_long(self.measuring_tokenizer()?, text, opts)?;
     match chunks.len() {
-      // Empty or whitespace-only text yields no chunks; `embed` defines the
-      // contract there (EmptyText for "", a specials-only embedding for
-      // whitespace), so delegate to keep those semantics identical.
+      // Only `""` chunks to nothing (`chunk_long` gives contentless nonempty
+      // text a single whole-input chunk); `embed` defines the empty-input
+      // contract, so delegate for its `EmptyText`.
       0 => self.embed(text),
       // After gap reattachment a single chunk always spans `[0, text.len())`, so
       // this is `embed` on the same bytes — and skipping the one-window
@@ -486,7 +490,7 @@ impl TextEmbedder {
       // identical-up-to-an-f64-renormalization-rounding.
       1 => {
         let s = chunks[0].as_str(text).expect(
-          "chunk_long yields char-aligned boundaries (windit cuts, or 0/len from attach_gaps)",
+          "chunk_long yields char-aligned boundaries (windit cuts, or 0/len from gap repair / the whole-input fallback)",
         );
         self.embed_tokenized(&self.token_ids(s)?)
       }
@@ -499,7 +503,7 @@ impl TextEmbedder {
         let mut offset = 0usize;
         for chunk in &chunks {
           let s = chunk.as_str(text).expect(
-            "chunk_long yields char-aligned boundaries (windit cuts, or 0/len from attach_gaps)",
+            "chunk_long yields char-aligned boundaries (windit cuts, or 0/len from gap repair / the whole-input fallback)",
           );
           let ids = self.token_ids(s)?;
           let embedding = self.embed_tokenized(&ids)?;
@@ -605,25 +609,34 @@ fn validate_long_options(opts: &WindowOptions) -> Result<()> {
 /// repaired substring against the window — before the chunks are returned. With
 /// `overlap == 0` the chunks partition `text` (the first starts at byte 0, each
 /// begins where the previous ends, the last ends at `text.len()`); a non-zero
-/// overlap covers `text` while preserving its repeats.
+/// overlap covers `text` while preserving its repeats. Nonempty text always
+/// yields at least one chunk: text with no tokenizable content at all
+/// (whitespace-only) becomes a single whole-input chunk, the cost of the
+/// whole-input `embed` fallback it is embedded by. Only `""` yields no
+/// chunks.
 ///
 /// Measurement and per-chunk embedding run the SAME tokenization
 /// (`encode(s, add_special_tokens = true)`) on the SAME substring, so a chunk
 /// measured at `<= window <= MAX_TOKENS` re-tokenizes to exactly the counted ids
-/// and [`build_window`] never truncates or rejects it. Two escapes can exceed the
-/// window: windit's lone `char` whose own measure exceeds it, and a
-/// pure-separator gap whose run alone measures past it (emitted as its own chunk
-/// when neither neighbor can absorb it). Both are unreachable for a real
-/// tokenizer on natural text, and even then `token_ids`' truncation plus
-/// [`build_window`]'s typed guard keep them sound.
+/// and [`build_window`] never truncates or rejects it. Three escapes can
+/// exceed the window: windit's lone oversized `char` whose own measure
+/// exceeds it, a pure-separator gap whose run alone measures past it (emitted
+/// as its own chunk when neither neighbor can absorb it), and the whole-input
+/// fallback chunk for contentless text, which is never measured (with the
+/// real tokenizer it holds only the specials, within any window ≥ 2). The
+/// first two are unreachable for a real tokenizer on natural text;
+/// `token_ids`' truncation plus [`build_window`]'s typed guard keep all three
+/// sound regardless.
 ///
 /// # Errors
 /// [`Error::Windowing`] carrying whatever windit's `ContentAware::chunk` rejects
 /// (a zero window, an overlap at or above the window, or a `max_windows`
-/// overrun), or `TooManyWindows` raised here when gap reattachment grows the
-/// repaired list past `opts.max_windows()` — the cap binds the FINAL chunk
-/// count, `got` reporting that full count (windit's own raise aborts at
-/// `max + 1`; this one reports the whole overrun).
+/// overrun), or `TooManyWindows` raised here when gap reattachment or the
+/// whole-input fallback chunk grows the final list past `opts.max_windows()`
+/// — the cap binds the FINAL chunk count, exactly the per-chunk predictions
+/// [`TextEmbedder::embed_long_with`] dispatches, `got` reporting that full
+/// count (windit's own raise aborts at `max + 1`; this one reports the whole
+/// overrun).
 fn chunk_long(
   measure_tok: &Tokenizer,
   text: &str,
@@ -645,13 +658,26 @@ fn chunk_long(
   let chunks = windit::split::ContentAware::new(&measure)
     .chunk(text, opts)
     .map_err(Error::from)?;
-  let repaired = attach_gaps(text, chunks, &measure, opts.window());
+  let mut repaired = attach_gaps(text, chunks, &measure, opts.window());
+  // Nonempty text with no tokenizable content (whitespace-only) chunks to
+  // nothing, yet `embed_long_with` still embeds it — the whole input through
+  // `embed`, one CoreML prediction. Represent that cost as a single
+  // whole-input chunk so the cap below bounds every prediction the result can
+  // dispatch; only `""` stays chunkless (it fails `EmptyText` before any
+  // prediction). Like a pure-separator own-chunk, this chunk is not measured
+  // against `window` — there is no smaller unit to fall back to — and is kept
+  // sound the same way (`token_ids` truncation, `build_window`'s typed guard).
+  if repaired.is_empty() && !text.is_empty() {
+    repaired.push(windit::split::Chunk::new(0, text.len()));
+  }
   // windit enforced `max_windows` on ITS output; each own-chunk the repair
-  // inserts grows the count past that check, and every chunk costs one CoreML
-  // prediction, so the cap re-binds on the final list. Fail-closed: coverage
-  // and the cap cannot both hold here, and silently exceeding the caller's
-  // work bound (or silently dropping bytes) would be worse than a typed
-  // refusal. `got` is the full repaired count, not windit's abort count.
+  // inserts — and the whole-input fallback chunk above — grows the count past
+  // that check, and every chunk costs one CoreML prediction, so the cap
+  // re-binds on the final list: it is exactly the number of predictions
+  // `embed_long_with` may dispatch. Fail-closed: coverage and the cap cannot
+  // both hold here, and silently exceeding the caller's work bound (or
+  // silently dropping bytes) would be worse than a typed refusal. `got` is
+  // the full final count, not windit's abort count.
   if let Some(max) = opts.max_windows()
     && repaired.len() > max
   {
