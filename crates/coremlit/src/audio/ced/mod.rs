@@ -17,9 +17,11 @@
 use crate::ComputeUnits;
 
 pub mod error;
+pub mod prediction;
 pub mod window;
 
 pub use error::Error;
+pub use prediction::{Confidences, EventPrediction, RatedSoundEvent, WindowConfidences};
 pub use window::{Span, TailPolicy, WindowPlan};
 
 #[cfg(test)]
