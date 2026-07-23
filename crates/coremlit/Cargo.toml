@@ -113,6 +113,18 @@ granite = ["dep:tokenizers", "dep:windit", "windit/text"]
 # path. `default = []` pulls none of it.
 siglip = ["dep:tokenizers"]
 
+# --- audio::ced (CED-tiny AudioSet sound-event tagging) ---
+# Native CoreML CED-tiny multi-label classifier: 16 kHz mono waveform in, ranked
+# AudioSet predictions out (527 rated classes via the ort-free
+# `soundevents-dataset` data crate). A Rust log-mel front-end (`rustfft`, shared
+# with `clap`) around one fp16 mel→logits transformer graph; long clips chunk
+# via `windit` (geometry only) and aggregate Mean/Max in confidence space. The
+# parity oracle is COMMITTED fp32 goldens (mel + logits, Wave B), never a live
+# ONNX crate — so there is NO `ced-oracle` feature and NO `ort` in this path in
+# ANY configuration, runtime or dev (the ort-based `soundevents` crate is never
+# a dependency). `default = []` pulls none of it.
+ced = ["dep:rustfft", "dep:soundevents-dataset", "dep:windit"]
+
 [dependencies]
 # --- core CoreML runtime (always compiled) ---
 objc2.workspace = true
@@ -218,6 +230,10 @@ silero = { git = "https://github.com/Findit-AI/silero", rev = "a55ef2b2922ec1425
 # (see `src/embeddings/clap/audio/mel/mod.rs`). clap-only; the pinned Xenova
 # `tokenizers` load is shared with `whisper` (declared above, rides `clap` too).
 rustfft = { workspace = true, optional = true }
+
+# audio::ced's 527-class rated AudioSet label set (ort-free data crate; see the
+# workspace table for the feature pins).
+soundevents-dataset = { workspace = true, optional = true }
 
 # --- embeddings::clap oracle git dep (the `clap-oracle` feature) ---
 # The textclap oracle: rev-pinned to a PUBLIC git source (crates.io forbids git

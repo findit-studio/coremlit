@@ -48,8 +48,9 @@ jobs:
           - "clap-oracle"                                                   # + textclap model-level parity oracle (ort)
           - "granite"                                                       # granite text embeddings alone (committed goldens, no ort)
           - "siglip"                                                        # SigLIP 2 image+text embeddings alone (committed goldens, no ort)
-          - "whisper,align,speaker,vad,clap,granite,siglip,serde,tracing,nl-recognizer"    # all non-oracle
-          - "whisper,align-oracle,speaker-oracle,vad-bundled,clap-oracle,granite,siglip,serde,tracing,nl-recognizer"  # all-on
+          - "ced"                                                           # CED-tiny sound-event tagging alone (Rust mel + soundevents-dataset, no ort)
+          - "whisper,align,speaker,vad,clap,granite,siglip,ced,serde,tracing,nl-recognizer"    # all non-oracle
+          - "whisper,align-oracle,speaker-oracle,vad-bundled,clap-oracle,granite,siglip,ced,serde,tracing,nl-recognizer"  # all-on
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
