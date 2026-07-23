@@ -398,8 +398,12 @@ fn measuring_tokenizer_reports_untruncated_counts() {
   );
 }
 
-/// A long document splits into multiple chunks, each within the token budget,
-/// with strictly increasing (non-overlapping) starts under the default geometry.
+/// A long document splits into multiple chunks that PARTITION the text under the
+/// default (overlap-free) geometry — the first starts at byte 0, each begins
+/// where the previous ended, the last ends at `doc.len()` — with every chunk
+/// within the token budget. The partition triplet is the coverage regression:
+/// pre-repair windit left `\n\n` gaps between chunks, so `chunk.start()` ran
+/// strictly ahead of the previous end rather than meeting it.
 #[test]
 fn long_text_chunks_multi_window_within_budget() {
   let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
@@ -411,7 +415,8 @@ fn long_text_chunks_multi_window_within_budget() {
     "a document over several windows must split into multiple chunks, got {}",
     chunks.len()
   );
-  let mut prev_start: Option<usize> = None;
+  assert_eq!(chunks[0].start(), 0, "the first chunk starts at byte 0");
+  let mut prev_end = 0usize;
   for chunk in &chunks {
     let s = chunk
       .as_str(&doc)
@@ -421,13 +426,213 @@ fn long_text_chunks_multi_window_within_budget() {
       count <= MAX_TOKENS,
       "every chunk stays within the token budget, got {count}"
     );
-    if let Some(prev) = prev_start {
-      assert!(
-        chunk.start() > prev,
-        "chunk starts strictly increase (no overlap)"
-      );
+    assert_eq!(
+      chunk.start(),
+      prev_end,
+      "each chunk begins where the previous ended (no gap, no overlap)"
+    );
+    prev_end = chunk.end();
+  }
+  assert_eq!(prev_end, doc.len(), "the last chunk ends at doc.len()");
+}
+
+/// Every byte of the document survives chunking, and every paragraph separator
+/// stays in the token stream exactly once. windit drops the `\n\n` runs that fall
+/// on chunk boundaries; `attach_gaps` reattaches them, so (a) the chunks
+/// concatenate back to the document byte-for-byte and (b) the ByteLevel separator
+/// token appears once per `\n\n` across the union of the chunk encodings —
+/// interior and reattached-boundary separators alike.
+#[test]
+fn boundary_separators_stay_in_the_token_stream() {
+  // `\n\n` tokenizes to `[<|startoftext|>, ĊĊ, <|return|>]`, so id 239 is the
+  // paragraph separator's sole content token; counting it counts separators.
+  const PARAGRAPH_SEPARATOR_TOKEN: u32 = 239;
+  assert_eq!(
+    ids("\n\n"),
+    vec![179934, PARAGRAPH_SEPARATOR_TOKEN, 179938],
+    "the paragraph separator's token id is pinned"
+  );
+
+  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let doc = long_doc();
+  let chunks = chunk_long(&mt, &doc, &WindowOptions::new(MAX_TOKENS)).expect("chunk");
+
+  let concat: String = chunks
+    .iter()
+    .map(|c| {
+      c.as_str(&doc)
+        .expect("chunk falls on a char boundary of its own text")
+    })
+    .collect();
+  assert_eq!(
+    concat, doc,
+    "the chunks must concatenate back to the document byte-for-byte"
+  );
+
+  let separators: usize = chunks
+    .iter()
+    .map(|c| {
+      let s = c.as_str(&doc).expect("char boundary");
+      mt.encode(s, true)
+        .expect("encode")
+        .get_ids()
+        .iter()
+        .filter(|&&id| id == PARAGRAPH_SEPARATOR_TOKEN)
+        .count()
+    })
+    .sum();
+  assert_eq!(
+    separators,
+    doc.matches("\n\n").count(),
+    "every `\\n\\n` is tokenized exactly once across the chunks"
+  );
+}
+
+/// The word-level fallback (an oversized sentence with no paragraph or sentence
+/// break) excludes inter-word punctuation from its chunks; `attach_gaps`
+/// reattaches it. One 400-term comma-separated sentence at window 128 partitions
+/// into byte-exact chunks — every `", "` preserved, none over budget.
+#[test]
+fn word_fallback_punctuation_is_reattached() {
+  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let sentence = (0..400)
+    .map(|w| format!("term{w}"))
+    .collect::<Vec<_>>()
+    .join(", ");
+  let chunks = chunk_long(&mt, &sentence, &WindowOptions::new(128)).expect("chunk");
+
+  assert!(
+    chunks.len() > 1,
+    "a 400-term sentence must split into multiple chunks, got {}",
+    chunks.len()
+  );
+  assert_eq!(chunks[0].start(), 0, "the first chunk starts at byte 0");
+  let mut prev_end = 0usize;
+  for chunk in &chunks {
+    let s = chunk.as_str(&sentence).expect("char boundary");
+    assert_eq!(
+      chunk.start(),
+      prev_end,
+      "each chunk begins where the previous ended"
+    );
+    assert!(
+      mt.encode(s, true).expect("encode").get_ids().len() <= 128,
+      "every chunk stays within the 128-token budget"
+    );
+    prev_end = chunk.end();
+  }
+  assert_eq!(
+    prev_end,
+    sentence.len(),
+    "the last chunk ends at the text length"
+  );
+
+  let concat: String = chunks
+    .iter()
+    .map(|c| c.as_str(&sentence).expect("char boundary"))
+    .collect();
+  assert_eq!(
+    concat, sentence,
+    "the chunks reproduce the sentence byte-for-byte"
+  );
+}
+
+/// Leading and trailing separators are covered too: a document wrapped in `\n\n`
+/// still partitions — the first chunk starts at byte 0 despite the leading
+/// separator and the last ends at the text length despite the trailing one
+/// (`attach_gaps`' leading and trailing branches).
+#[test]
+fn leading_and_trailing_separators_are_covered() {
+  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let doc = format!("\n\n{}\n\n", long_doc());
+  let chunks = chunk_long(&mt, &doc, &WindowOptions::new(MAX_TOKENS)).expect("chunk");
+
+  assert!(
+    chunks.len() > 1,
+    "the wrapped document still splits, got {}",
+    chunks.len()
+  );
+  assert_eq!(
+    chunks[0].start(),
+    0,
+    "the first chunk starts at 0 despite the leading separator"
+  );
+  let mut prev_end = 0usize;
+  for chunk in &chunks {
+    assert_eq!(
+      chunk.start(),
+      prev_end,
+      "each chunk begins where the previous ended"
+    );
+    prev_end = chunk.end();
+  }
+  assert_eq!(
+    prev_end,
+    doc.len(),
+    "the last chunk ends at len despite the trailing separator"
+  );
+
+  let concat: String = chunks
+    .iter()
+    .map(|c| c.as_str(&doc).expect("char boundary"))
+    .collect();
+  assert_eq!(concat, doc, "the chunks reproduce the wrapped document");
+}
+
+/// The overflow fallback chain — right-prepend, own-chunk, leading, trailing — is
+/// unreachable with the real tokenizer on natural corpora (packed chunks never
+/// sit exactly at the window), so pin it with a `char`-count measure that drives
+/// `ContentAware` + `attach_gaps` directly. Each windit trace is checked by hand
+/// against the pinned rev; each case asserts the exact repaired ranges, which are
+/// a partition of the input.
+#[test]
+fn gap_attachment_falls_back_right_then_own_chunk() {
+  use windit::split::ContentAware;
+
+  let measure = |s: &str| -> usize { s.chars().count() };
+  // windit's raw chunks for `text` at `window`, repaired by `attach_gaps`, as
+  // (start, end) byte ranges.
+  let repair = |text: &str, window: usize| -> Vec<(usize, usize)> {
+    let chunks = ContentAware::new(&measure)
+      .chunk(text, &WindowOptions::new(window))
+      .expect("chunk");
+    attach_gaps(text, chunks, &measure, window)
+      .iter()
+      .map(|c| (c.start(), c.end()))
+      .collect()
+  };
+
+  let cases: &[(&str, &[(usize, usize)])] = &[
+    // Left neighbor full (`aaaaa` = 5); the `\n\n` gap cannot append (`aaaaa\n\n`
+    // = 7 > 5) but prepends to the right neighbor, which still fits (`\n\nbbb`
+    // = 5). windit: [0,5),[7,10).
+    ("aaaaa\n\nbbb", &[(0, 5), (5, 10)]),
+    // Both neighbors full; neither can absorb the `\n\n`, so it becomes its own
+    // chunk between them. windit: [0,5),[7,12).
+    ("aaaaa\n\nbbbbb", &[(0, 5), (5, 7), (7, 12)]),
+    // windit's lone chunk [2,7) omits the leading `\n\n` (the 1-chunk coverage
+    // hole at micro scale); it cannot prepend (`\n\naaaaa` = 7 > 5), so the
+    // leading run is its own chunk.
+    ("\n\naaaaa", &[(0, 2), (2, 7)]),
+    // The trailing `\n\n` cannot append (`aaaaa\n\n` = 7 > 5), so it is its own
+    // chunk. windit: [0,5).
+    ("aaaaa\n\n", &[(0, 5), (5, 7)]),
+  ];
+
+  for &(text, expected) in cases {
+    let got = repair(text, 5);
+    assert_eq!(got.as_slice(), expected, "repaired ranges for {text:?}");
+    // The exact ranges above are a partition: first start 0, adjacent tiling,
+    // last end == text length.
+    assert_eq!(got.first().unwrap().0, 0, "{text:?}: first start 0");
+    assert_eq!(
+      got.last().unwrap().1,
+      text.len(),
+      "{text:?}: last end == text length"
+    );
+    for w in got.windows(2) {
+      assert_eq!(w[0].1, w[1].0, "{text:?}: adjacent chunks tile");
     }
-    prev_start = Some(chunk.start());
   }
 }
 

@@ -422,8 +422,13 @@ impl TextEmbedder {
   /// most [`MAX_TOKENS`] tokens (respecting paragraph, sentence, and word
   /// boundaries), embeds each chunk with one CoreML prediction, and combines the
   /// per-chunk embeddings by a coverage-weighted spherical mean into one
-  /// unit-norm [`Embedding`]. Prompt-free, like [`Self::embed`], and equivalent
-  /// to `embed_long_with(text, &WindowOptions::new(MAX_TOKENS))`.
+  /// unit-norm [`Embedding`]. The chunks jointly cover every byte of `text` —
+  /// separator bytes the content-aware splitter leaves at chunk boundaries
+  /// (paragraph breaks; inter-word punctuation under its oversized-sentence
+  /// fallback) are reattached to an adjacent chunk before embedding — so the
+  /// aggregate represents the caller's whole text, as `embed` does within one
+  /// window. Prompt-free, like [`Self::embed`], and equivalent to
+  /// `embed_long_with(text, &WindowOptions::new(MAX_TOKENS))`.
   ///
   /// Text that fits a single window returns exactly [`Self::embed`]'s embedding.
   ///
@@ -445,6 +450,14 @@ impl TextEmbedder {
   /// `encode(s, add_special_tokens = true)` — self-consistent by construction, so
   /// the effective content budget is `window − 2`.
   ///
+  /// With `overlap == 0` the chunks partition `text` (the first starts at byte 0,
+  /// each begins where the previous ends, the last ends at `text.len()`); a
+  /// non-zero overlap additionally repeats trailing regions. Reattached
+  /// separators are re-measured against the budget; a pure-separator run neither
+  /// neighbor can absorb becomes a chunk of its own and can exceed `window` only
+  /// when the run alone measures past it — the same recorded escape as windit's
+  /// lone oversized `char`, kept sound by the embed path's truncation guard.
+  ///
   /// # Errors
   /// [`Error::WindowOverBudget`] if `opts.window()` exceeds [`MAX_TOKENS`] (every
   /// chunk would be silently truncated); [`Error::EmptyText`] for `""` (as
@@ -462,14 +475,14 @@ impl TextEmbedder {
       // contract there (EmptyText for "", a specials-only embedding for
       // whitespace), so delegate to keep those semantics identical.
       0 => self.embed(text),
-      // A text that fits one window chunks to exactly one range over its own
-      // bytes, so this is `embed` on the same content — and skipping the
-      // one-window aggregation keeps it numerically identical rather than
+      // After gap reattachment a single chunk always spans `[0, text.len())`, so
+      // this is `embed` on the same bytes — and skipping the one-window
+      // aggregation keeps it numerically identical rather than
       // identical-up-to-an-f64-renormalization-rounding.
       1 => {
-        let s = chunks[0]
-          .as_str(text)
-          .expect("ContentAware chunks fall on char boundaries of the text they were cut from");
+        let s = chunks[0].as_str(text).expect(
+          "chunk_long yields char-aligned boundaries (windit cuts, or 0/len from attach_gaps)",
+        );
         self.embed_tokenized(&self.token_ids(s)?)
       }
       _ => {
@@ -480,9 +493,9 @@ impl TextEmbedder {
         // overlap is meant to express.
         let mut offset = 0usize;
         for chunk in &chunks {
-          let s = chunk
-            .as_str(text)
-            .expect("ContentAware chunks fall on char boundaries of the text they were cut from");
+          let s = chunk.as_str(text).expect(
+            "chunk_long yields char-aligned boundaries (windit cuts, or 0/len from attach_gaps)",
+          );
           let ids = self.token_ids(s)?;
           let embedding = self.embed_tokenized(&ids)?;
           // `embed_tokenized` just proved `ids.len() <= MAX_TOKENS` (build_window's
@@ -580,14 +593,24 @@ fn validate_long_options(opts: &WindowOptions) -> Result<()> {
 /// truncation-disabled tokenizer). Model-free, so the chunk geometry is
 /// hermetically testable.
 ///
+/// The chunks jointly cover `text`: windit's `ContentAware` extracts tokenized
+/// content only, leaving separator bytes (paragraph breaks, whitespace-only
+/// interiors, and word-fallback inter-word punctuation) uncovered at chunk
+/// boundaries, so [`attach_gaps`] reattaches every such gap — re-measuring the
+/// repaired substring against the window — before the chunks are returned. With
+/// `overlap == 0` the chunks partition `text` (the first starts at byte 0, each
+/// begins where the previous ends, the last ends at `text.len()`); a non-zero
+/// overlap covers `text` while preserving its repeats.
+///
 /// Measurement and per-chunk embedding run the SAME tokenization
 /// (`encode(s, add_special_tokens = true)`) on the SAME substring, so a chunk
 /// measured at `<= window <= MAX_TOKENS` re-tokenizes to exactly the counted ids
-/// and [`build_window`] never truncates or rejects it. windit's one escape hatch
-/// — a lone `char` whose own measure exceeds the window is emitted anyway — is
-/// unreachable for a real tokenizer (a single char is a handful of tokens), and
-/// even then `token_ids`' truncation plus `build_window`'s typed guard keep it
-/// sound.
+/// and [`build_window`] never truncates or rejects it. Two escapes can exceed the
+/// window: windit's lone `char` whose own measure exceeds it, and a
+/// pure-separator gap whose run alone measures past it (emitted as its own chunk
+/// when neither neighbor can absorb it). Both are unreachable for a real
+/// tokenizer on natural text, and even then `token_ids`' truncation plus
+/// [`build_window`]'s typed guard keep them sound.
 ///
 /// # Errors
 /// [`Error::Windowing`] carrying whatever windit's `ContentAware::chunk` rejects
@@ -610,9 +633,94 @@ fn chunk_long(
       .map(|e| e.get_ids().len())
       .unwrap_or(usize::MAX)
   };
-  windit::split::ContentAware::new(&measure)
+  let chunks = windit::split::ContentAware::new(&measure)
     .chunk(text, opts)
-    .map_err(Error::from)
+    .map_err(Error::from)?;
+  Ok(attach_gaps(text, chunks, &measure, opts.window()))
+}
+
+/// Reattaches the byte gaps windit leaves between chunks, so [`chunk_long`]'s
+/// output covers every byte of `text`. windit's `ContentAware` extracts
+/// tokenized content only: paragraph separators (`\n\n` runs), whitespace-only
+/// paragraph interiors, and — under its oversized-sentence word fallback — the
+/// whitespace and punctuation between words are excluded, so a gap opens wherever
+/// such bytes fall on a chunk boundary (including a leading gap before the first
+/// chunk and a trailing gap after the last).
+///
+/// A single left-to-right sweep closes every positive gap by re-measuring the
+/// exact candidate substring against `window` (BPE is not additive — the repaired
+/// range is re-measured, never assumed to gain a fixed token count), trying in
+/// order:
+///
+/// 1. append the gap to the left neighbor if the extended range still fits —
+///    left-first because terminal punctuation and paragraph breaks belong to the
+///    preceding content, and it keeps every chunk starting where content starts;
+/// 2. otherwise prepend it to the right neighbor if that range fits;
+/// 3. otherwise emit the gap as its own chunk (pure separator bytes), reachable
+///    only when both neighbors are already packed to exactly `window`.
+///
+/// With `overlap == 0` the result partitions `text`: the first chunk starts at
+/// byte 0, each starts where the previous ends, the last ends at `text.len()`,
+/// and the chunks concatenate back to `text`. With `overlap > 0` the pre-existing
+/// overlaps are negative gaps, left untouched, so coverage is completed without
+/// disturbing the repeats.
+///
+/// Every accepted attachment re-measures within `window`; the sole escape is a
+/// pure-separator own-chunk whose run alone measures past `window` — the same
+/// shape as windit's lone oversized-`char` escape, and kept sound the same way:
+/// [`TextEmbedder::token_ids`] truncates at [`MAX_TOKENS`] and [`build_window`]
+/// guards with a typed error rather than panicking. Every constructed boundary is
+/// a windit cut or `0`/`text.len()`, all on `char` boundaries, so `Chunk::new`
+/// never straddles a `char` and `as_str` never returns `None`.
+fn attach_gaps(
+  text: &str,
+  chunks: Vec<windit::split::Chunk>,
+  measure: &dyn Fn(&str) -> usize,
+  window: usize,
+) -> Vec<windit::split::Chunk> {
+  use windit::split::Chunk;
+  let Some(&first) = chunks.first() else {
+    return chunks;
+  };
+  let mut out = Vec::with_capacity(chunks.len());
+  let mut cur = first;
+  // Leading gap: extend the first chunk left to byte 0, else emit the gap alone.
+  if cur.start() > 0 {
+    if measure(&text[..cur.end()]) <= window {
+      cur = Chunk::new(0, cur.end());
+    } else {
+      out.push(Chunk::new(0, cur.start()));
+    }
+  }
+  for mut next in chunks.into_iter().skip(1) {
+    let (gap_start, gap_end) = (cur.end(), next.start());
+    if gap_start < gap_end {
+      if measure(&text[cur.start()..gap_end]) <= window {
+        cur = Chunk::new(cur.start(), gap_end);
+      } else if measure(&text[gap_start..next.end()]) <= window {
+        next = Chunk::new(gap_start, next.end());
+      } else {
+        out.push(cur);
+        out.push(Chunk::new(gap_start, gap_end));
+        cur = next;
+        continue;
+      }
+    }
+    out.push(cur);
+    cur = next;
+  }
+  // Trailing gap: extend the last chunk to `text.len()`, else emit the gap alone.
+  if cur.end() < text.len() {
+    if measure(&text[cur.start()..]) <= window {
+      cur = Chunk::new(cur.start(), text.len());
+    } else {
+      let tail = Chunk::new(cur.end(), text.len());
+      out.push(cur);
+      cur = tail;
+    }
+  }
+  out.push(cur);
+  out
 }
 
 /// Test-only seam: the module's actual tokenizer configuration, without loading
