@@ -100,6 +100,19 @@ clap-oracle = ["clap", "dep:textclap"]
 # `default = []` pulls none of it.
 granite = ["dep:tokenizers", "dep:windit", "windit/text"]
 
+# --- embeddings::siglip (the SigLIP 2 image+text phase) ---
+# SigLIP 2 (`siglip2-base-patch16-naflex`) dual-tower image+text embeddings on
+# CoreML: a shared 768-dim joint space. A Rust NaFlex vision front-end
+# (aspect-preserving patch-budget solver + antialiased-bilinear resize +
+# position-embedding lift; resize/patchify hand-rolled, no `image`/decoder dep)
+# around two fp16 graphs, plus a bundled Gemma tokenizer (`tokenizers`, shared
+# with `whisper`/`clap`/`granite`), L2-normalized in Rust. NaFlex resizes
+# natively to a fixed patch budget, so no windowing is used. The parity oracle is
+# COMMITTED transformers-fp32 goldens (`tests/siglip/fixtures/goldens/`), never a
+# live ONNX crate — so there is NO `siglip-oracle` feature and NO `ort` in this
+# path. `default = []` pulls none of it.
+siglip = ["dep:tokenizers"]
+
 [dependencies]
 # --- core CoreML runtime (always compiled) ---
 objc2.workspace = true
@@ -259,8 +272,13 @@ tempfile.workspace = true
 tokenizers.workspace = true
 # The mel-parity unit tests (`src/embeddings/clap/audio/mel/tests.rs`, feature
 # `clap`) read committed librosa `.npy` mel oracles via `npyz` (former clapkit
-# dev-dep).
+# dev-dep). The siglip full-tensor preprocessing gate (model-gated) reads staged
+# `.npy` NaFlex fixtures via the same dep.
 npyz.workspace = true
+# The siglip corpus PNG fixtures are decoded to RGB8 for the (model-gated) e2e /
+# parity gates via the pure-Rust `png` dev-dep; the library itself takes decoded
+# `Rgb8Image` (sans-I/O), so `png` never enters the library's feature graph.
+png.workspace = true
 # The `clap_encode` bench reports process RSS via `task_info(MACH_TASK_BASIC_INFO)`
 # (the same query as `audio::whisper::log::resident_memory_bytes`, which rides the
 # `whisper` feature the bench does not enable). Dev-deps compile only for
@@ -588,6 +606,47 @@ required-features = ["granite"]
 name = "granite_embed_long"
 path = "tests/granite/embed_long.rs"
 required-features = ["granite"]
+
+# --- embeddings::siglip ---
+# The whole `embeddings::siglip` module is feature-gated, so its tests compile
+# only under `siglip`. The tokenizer-identity + preprocess small-oracle gates are
+# hermetic (committed goldens, no model); the model_io / parity / placement / e2e
+# gates keep their `#[ignore]` + Models/ layout. There is NO oracle feature —
+# parity scores against COMMITTED transformers-fp32 goldens.
+[[test]]
+name = "siglip_tokenizer_identity"
+path = "tests/siglip/tokenizer_identity.rs"
+required-features = ["siglip"]
+
+[[test]]
+name = "siglip_preprocess"
+path = "tests/siglip/preprocess.rs"
+required-features = ["siglip"]
+
+[[test]]
+name = "siglip_model_io"
+path = "tests/siglip/model_io.rs"
+required-features = ["siglip"]
+
+[[test]]
+name = "siglip_text_model_io"
+path = "tests/siglip/text_model_io.rs"
+required-features = ["siglip"]
+
+[[test]]
+name = "siglip_parity_embed"
+path = "tests/siglip/parity_embed.rs"
+required-features = ["siglip"]
+
+[[test]]
+name = "siglip_placement"
+path = "tests/siglip/placement.rs"
+required-features = ["siglip"]
+
+[[test]]
+name = "siglip_e2e"
+path = "tests/siglip/e2e.rs"
+required-features = ["siglip"]
 # Dual-tower encode harness: first-observed/cached load, first + warm inference
 # per tower × ComputeUnits (model-gated; `harness = false` custom main — the load
 # phases are one-shot costs criterion's resampling cannot see). Mirrors the

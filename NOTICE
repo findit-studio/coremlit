@@ -4,23 +4,24 @@ Copyright the coremlit authors
 The coremlit Rust source is dual-licensed under MIT OR Apache-2.0 (caller's
 choice). See LICENSE-MIT and LICENSE-APACHE for those terms.
 
-NOTE: coremlit ships NO model weight files, but embeddings::clap and
-embeddings::granite each BUNDLE a third-party tokenizer artifact (via
-include_bytes! — sections 6b and 7b). Each feature-gated pipeline
-(audio::whisper / audio::align / audio::speaker / audio::vad / embeddings::clap
-/ embeddings::granite) otherwise LOADS, at runtime, CoreML model artifacts that
-a downstream user fetches separately from Hugging Face (see the crate README and
-each module's model_io tests for the repo id, revision, and per-file SHA-256).
-This NOTICE records the attribution a binary that distributes or bundles those
-components must honor.
+NOTE: coremlit ships NO model weight files, but embeddings::clap,
+embeddings::granite, and embeddings::siglip each BUNDLE a third-party tokenizer
+artifact (via include_bytes! — sections 6b, 7b, and 8b). Each feature-gated
+pipeline (audio::whisper / audio::align / audio::speaker / audio::vad /
+embeddings::clap / embeddings::granite / embeddings::siglip) otherwise LOADS, at
+runtime, CoreML model artifacts that a downstream user fetches separately from
+Hugging Face (see the crate README and each module's model_io tests for the repo
+id, revision, and per-file SHA-256). This NOTICE records the attribution a binary
+that distributes or bundles those components must honor.
 
 Sections 1-2 (the audio::vad models) are preserved verbatim from the former
 vadkit NOTICE. Sections 3-5 record the whisper, speaker, and align model
 attributions folded in by the mono-crate restructure. Section 6 records the
 CLAP audio+text encoder weights and the bundled Xenova tokenizer, folded in by
 the clapkit port. Section 7 records the granite text-embedding encoder and its
-bundled tokenizer, added by the embedkit phase. Both audio::vad components below
-are MIT.
+bundled tokenizer, added by the embedkit phase. Section 8 records the SigLIP 2
+image+text encoder weights and the bundled Gemma tokenizer, added by the siglip
+phase. Both audio::vad components below are MIT.
 
 ────────────────────────────────────────────────────────────────────────
 1. Silero VAD (upstream model)
@@ -230,3 +231,54 @@ crate via `include_bytes!` (exposed as
       (an o200k-style BPE); it carries no model weights. It is distributed under
       the same upstream Apache-2.0 terms as the model; retain the license notice
       when redistributing it.
+
+────────────────────────────────────────────────────────────────────────
+8. SigLIP 2 image + text encoders and bundled tokenizer (embeddings::siglip)
+
+embeddings::siglip runs CoreML conversions of Google DeepMind's SigLIP 2
+`siglip2-base-patch16-naflex` vision and text encoders (a shared 768-dim joint
+embedding space), and BUNDLES that model's Gemma tokenizer into the compiled
+crate via `include_bytes!` (exposed as
+`coremlit::embeddings::siglip::BUNDLED_TOKENIZER`).
+
+  8a) Encoder weights — google/siglip2-base-patch16-naflex. The crate ships NO
+      model files; it loads FinDIT-Studio's CoreML conversion of the Google
+      weights.
+
+        Original model: google/siglip2-base-patch16-naflex
+        https://huggingface.co/google/siglip2-base-patch16-naflex
+        License: Apache-2.0 (verify on the model card at staging — STOP if not) —
+        preserve the Apache-2.0 attribution when redistributing the weights (or a
+        binary bundling them).
+        Attribution: Google DeepMind — SigLIP 2 (Tschannen et al., 2025).
+
+        CoreML conversion actually loaded: FinDIT-Studio/siglip2-naflex-coreml
+        https://huggingface.co/FinDIT-Studio/siglip2-naflex-coreml
+        revision: PENDING (recorded at the conversion runbook's upload step — the
+        immutable commit SHA and per-file SHA-256 are pinned in
+        tests/siglip/model_io.rs / tests/siglip/text_model_io.rs when staged).
+
+      As an Apache-2.0 work, a redistributor must retain the license and
+      copyright notices AND STATE ANY CHANGES. Unlike a pure format conversion,
+      the CoreML graph is RESTRUCTURED: the per-image position-embedding resize is
+      lifted to a host-side `position_embeddings` input, the attention-pooling
+      head is re-expressed from the identical packed weights with static Q/K/V
+      projections, and the encoder uses eager attention. The weight VALUES are
+      unchanged (parity receipts in the model card); these graph changes are the
+      stated changes.
+
+  8b) Bundled tokenizer — siglip2-base-patch16-naflex Gemma tokenizer (via
+      include_bytes!). Compiled into the crate, so any binary linking coremlit
+      with the `siglip` feature redistributes it.
+
+        Source: https://huggingface.co/google/siglip2-base-patch16-naflex
+        Revision (commit SHA): PENDING (recorded at staging)
+        Artifact: tokenizer.json
+        SHA-256: PENDING (pinned in tests/siglip/tokenizer_identity.rs at staging)
+
+      The artifact is the SigLIP 2 Gemma tokenizer configuration and vocabulary
+      (256000 entries); it carries no model weights. It is distributed under the
+      same upstream Apache-2.0 terms as the model; retain the license notice when
+      redistributing it. (The committed `assets/tokenizer.json` is a placeholder
+      until the source-revision bytes are staged; the identity gate forces the
+      real artifact in.)

@@ -47,8 +47,9 @@ jobs:
           - "clap"                                                          # CLAP encoders alone (Rust mel + tokenizers, no ort)
           - "clap-oracle"                                                   # + textclap model-level parity oracle (ort)
           - "granite"                                                       # granite text embeddings alone (committed goldens, no ort)
-          - "whisper,align,speaker,vad,clap,granite,serde,tracing,nl-recognizer"    # all non-oracle
-          - "whisper,align-oracle,speaker-oracle,vad-bundled,clap-oracle,granite,serde,tracing,nl-recognizer"  # all-on
+          - "siglip"                                                        # SigLIP 2 image+text embeddings alone (committed goldens, no ort)
+          - "whisper,align,speaker,vad,clap,granite,siglip,serde,tracing,nl-recognizer"    # all non-oracle
+          - "whisper,align-oracle,speaker-oracle,vad-bundled,clap-oracle,granite,siglip,serde,tracing,nl-recognizer"  # all-on
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

@@ -33,7 +33,7 @@ rename or a dropped feature cannot land silently.
 
 `whisper`, `nl-recognizer`, `align`, `align-oracle`, `speaker`,
 `speaker-oracle`, `vad`, `vad-bundled`, `clap`, `clap-oracle`, `granite`,
-`serde`, `tracing`.
+`siglip`, `serde`, `tracing`.
 
 `granite` is not a former per-crate kit but a NEW module (`embeddings::granite`,
 the embedkit phase): general text sentence-embeddings on CoreML, first model
@@ -44,10 +44,17 @@ new-module note, not an old-crate row. Its long-input `embed_long` path pulls th
 rev-pinned `windit` git dep (with `windit/text` for content-aware chunking); the
 single-text `embed` path does not depend on it.
 
+`siglip` is likewise a NEW module (`embeddings::siglip`): SigLIP 2
+(`siglip2-base-patch16-naflex`) dual-tower image+text embeddings on CoreML (a
+shared 768-dim joint space). Same posture as `granite` — COMMITTED
+transformers-fp32 goldens, so NO `siglip-oracle` sibling and no `ort` — and it
+composes with nothing (a single leaf feature). NaFlex resizes natively to a fixed
+patch budget, so it is a `windit` non-consumer (no windowing).
+
 Compositions (pinned by the golden test): `nl-recognizer` → `whisper`;
 `align-oracle` → `align`; `speaker-oracle` → `speaker`; `vad-bundled` → `vad`;
-`clap-oracle` → `clap`. (`granite` composes with nothing — a single leaf
-feature.)
+`clap-oracle` → `clap`. (`granite` and `siglip` each compose with nothing — a
+single leaf feature.)
 
 ## Curated CI feature-combination list
 
@@ -69,8 +76,9 @@ none. It is pinned here and driven by CI (`.github/workflows/ci.yml`):
 | `clap` | CLAP audio+text encoders alone (Rust mel + tokenizers, no ort) |
 | `clap-oracle` | + textclap model-level parity oracle (ort) |
 | `granite` | granite text embeddings alone (bundled tokenizer + committed transformers-fp32 goldens, no ort; `embed_long` rides the rev-pinned `windit` engine + `windit/text`) |
-| `whisper,align,speaker,vad,clap,granite,serde,tracing,nl-recognizer` | all non-oracle features on |
-| `whisper,align-oracle,speaker-oracle,vad-bundled,clap-oracle,granite,serde,tracing,nl-recognizer` | all-on (every feature, oracles included) |
+| `siglip` | SigLIP 2 image+text embeddings alone (bundled tokenizer + committed transformers-fp32 goldens, no ort) |
+| `whisper,align,speaker,vad,clap,granite,siglip,serde,tracing,nl-recognizer` | all non-oracle features on |
+| `whisper,align-oracle,speaker-oracle,vad-bundled,clap-oracle,granite,siglip,serde,tracing,nl-recognizer` | all-on (every feature, oracles included) |
 
 `serde` and `tracing` are cross-cutting and covered by the all-on runs. The
 list embodies the combinatorial-honesty rule: it is explicit and reviewable,

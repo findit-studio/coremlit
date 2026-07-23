@@ -45,6 +45,10 @@ npyz = "0.9"
 cpal = "0.16"
 rubato = "0.16"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+# Pure-Rust PNG decoder — a DEV-dep only, for decoding the committed siglip
+# corpus PNG fixtures in tests (the crate itself is sans-I/O: `Rgb8Image` takes
+# already-decoded RGB, so no image-decoder enters the library's own graph).
+png = "0.17"
 
 [workspace.lints.rust]
 missing_docs = "deny"
