@@ -21,6 +21,11 @@ pub mod error;
 pub mod prediction;
 pub mod window;
 
+// Consumed by the classifier's mel path once it lands; the sibling tests are
+// the only caller so far, so this whole private module is otherwise dead.
+#[allow(dead_code)]
+mod mel;
+
 pub use aggregate::{ChunkAggregation, aggregate_windows};
 pub use error::Error;
 pub use prediction::{Confidences, EventPrediction, RatedSoundEvent, WindowConfidences};
