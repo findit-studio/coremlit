@@ -23,7 +23,7 @@ rename or a dropped feature cannot land silently.
 | speakerkit | `dia-oracle` | `speaker-oracle` | dia's ort DER oracle (DEV/TEST) |
 | vadkit | (crate) | `vad` | silero's logic-only detector rides this |
 | vadkit | dev-dep `silero/bundled` | `vad-bundled` | silero ONNX cross-backend oracle (DEV/TEST) |
-| clapkit | (crate) | `clap` | CLAP-HTSAT dual-tower audio+text encoders (module `embeddings::clap`) ride this; Rust mel front-end + shared `tokenizers`, no ort |
+| clapkit | (crate) | `clap` | CLAP-HTSAT dual-tower audio+text encoders (module `embeddings::clap`) ride this; Rust mel front-end + shared `tokenizers`, no ort; the long-audio window geometry + aggregation ride the rev-pinned `windit` git dep |
 | clapkit | `parity-oracle` | `clap-oracle` | textclap model-level parity oracle (DEV/TEST) |
 | clapkit | `serde` | `serde` | unified cross-cutting |
 
@@ -40,7 +40,9 @@ the embedkit phase): general text sentence-embeddings on CoreML, first model
 `granite-embedding-97m-multilingual-r2`. Its parity oracle is COMMITTED
 transformers-fp32 goldens, not a live crate, so it has NO `granite-oracle`
 sibling and pulls no `ort` — hence it appears in the rename table below only as a
-new-module note, not an old-crate row.
+new-module note, not an old-crate row. Its long-input `embed_long` path pulls the
+rev-pinned `windit` git dep (with `windit/text` for content-aware chunking); the
+single-text `embed` path does not depend on it.
 
 Compositions (pinned by the golden test): `nl-recognizer` → `whisper`;
 `align-oracle` → `align`; `speaker-oracle` → `speaker`; `vad-bundled` → `vad`;
@@ -66,7 +68,7 @@ none. It is pinned here and driven by CI (`.github/workflows/ci.yml`):
 | `vad-bundled` | + silero ONNX cross-backend oracle |
 | `clap` | CLAP audio+text encoders alone (Rust mel + tokenizers, no ort) |
 | `clap-oracle` | + textclap model-level parity oracle (ort) |
-| `granite` | granite text embeddings alone (bundled tokenizer + committed transformers-fp32 goldens, no ort) |
+| `granite` | granite text embeddings alone (bundled tokenizer + committed transformers-fp32 goldens, no ort; `embed_long` rides the rev-pinned `windit` engine + `windit/text`) |
 | `whisper,align,speaker,vad,clap,granite,serde,tracing,nl-recognizer` | all non-oracle features on |
 | `whisper,align-oracle,speaker-oracle,vad-bundled,clap-oracle,granite,serde,tracing,nl-recognizer` | all-on (every feature, oracles included) |
 
