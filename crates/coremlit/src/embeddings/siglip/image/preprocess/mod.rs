@@ -143,13 +143,36 @@ fn triangle(t: f64) -> f64 {
 /// downsampling low-passes; upsampling (`scale ≤ 1`) keeps unit support (plain
 /// bilinear). `align_corners=False` sample centers `(o + 0.5)·scale`. Each entry
 /// is `(start_input_index, normalized_weights)`.
-fn precompute_coeffs(in_size: usize, out_size: usize) -> Vec<(usize, Vec<f64>)> {
+///
+/// # Errors
+/// [`Error::PreprocessAllocation`] if a pathological source extent makes the
+/// coefficient table's element count overflow `usize`, or a coefficient vector
+/// cannot be reserved.
+fn precompute_coeffs(in_size: usize, out_size: usize) -> Result<Vec<(usize, Vec<f64>)>, Error> {
   let scale = in_size as f64 / out_size as f64;
   let filterscale = if scale < 1.0 { 1.0 } else { scale };
   let support = filterscale; // triangle filter support is 1.0
   let inv_filterscale = 1.0 / filterscale;
 
-  let mut coeffs = Vec::with_capacity(out_size);
+  // Representability pre-guard: every clamped output draws at most
+  // `2·⌈support⌉ + 1` taps, so the table holds at most
+  // `out_size·(2·⌈support⌉ + 1)` weights. If that element count cannot even be
+  // expressed in `usize` (a pathological source extent), no table could be
+  // allocated — refuse with the size-overflow sentinel rather than aborting in
+  // the fallible reservations below. Computed fully checked so the bound's own
+  // arithmetic cannot overflow-abort.
+  (support.ceil() as usize)
+    .checked_mul(2)
+    .and_then(|two_support| two_support.checked_add(1))
+    .and_then(|ksize_bound| out_size.checked_mul(ksize_bound))
+    .ok_or(Error::PreprocessAllocation { bytes: usize::MAX })?;
+
+  let mut coeffs = Vec::new();
+  coeffs
+    .try_reserve_exact(out_size)
+    .map_err(|_| Error::PreprocessAllocation {
+      bytes: out_size.saturating_mul(core::mem::size_of::<(usize, Vec<f64>)>()),
+    })?;
   for o in 0..out_size {
     let center = (o as f64 + 0.5) * scale;
 
@@ -169,7 +192,12 @@ fn precompute_coeffs(in_size: usize, out_size: usize) -> Vec<(usize, Vec<f64>)> 
     let start = xmin as usize;
     let taps = (xmax - xmin) as usize;
 
-    let mut weights = Vec::with_capacity(taps);
+    let mut weights = Vec::new();
+    weights
+      .try_reserve_exact(taps)
+      .map_err(|_| Error::PreprocessAllocation {
+        bytes: taps.saturating_mul(core::mem::size_of::<f64>()),
+      })?;
     let mut sum = 0.0f64;
     for k in 0..taps {
       let x = (start + k) as f64;
@@ -184,7 +212,7 @@ fn precompute_coeffs(in_size: usize, out_size: usize) -> Vec<(usize, Vec<f64>)> 
     }
     coeffs.push((start, weights));
   }
-  coeffs
+  Ok(coeffs)
 }
 
 /// Antialiased-bilinear resample of an `(src_h, src_w, channels)` row-major
@@ -197,6 +225,12 @@ fn precompute_coeffs(in_size: usize, out_size: usize) -> Vec<(usize, Vec<f64>)> 
 /// (the SigLIP2 processor resizes on `u8`, then rescale+normalizes). Panics only
 /// on an inconsistent `src` length (`src.len() != src_h·src_w·channels`) — a
 /// caller-internal invariant.
+///
+/// # Errors
+/// [`Error::PreprocessAllocation`] if a coefficient table cannot be sized or
+/// reserved (a pathological axis extent). The pos-emb lift's `16×16` source
+/// makes this unreachable in practice; the `Result` propagates the shared
+/// kernel's allocation fallibility to its callers.
 pub(crate) fn resize_bilinear_antialias(
   src: &[f32],
   src_h: usize,
@@ -204,7 +238,7 @@ pub(crate) fn resize_bilinear_antialias(
   channels: usize,
   dst_h: usize,
   dst_w: usize,
-) -> Vec<f32> {
+) -> Result<Vec<f32>, Error> {
   assert_eq!(
     src.len(),
     src_h * src_w * channels,
@@ -213,7 +247,7 @@ pub(crate) fn resize_bilinear_antialias(
 
   // Horizontal pass: (src_h, src_w, C) → (src_h, dst_w, C), kept in f64 to avoid
   // an intermediate rounding between the two separable passes.
-  let wc = precompute_coeffs(src_w, dst_w);
+  let wc = precompute_coeffs(src_w, dst_w)?;
   let mut tmp = vec![0.0f64; src_h * dst_w * channels];
   for y in 0..src_h {
     for (ox, (start, weights)) in wc.iter().enumerate() {
@@ -228,7 +262,7 @@ pub(crate) fn resize_bilinear_antialias(
   }
 
   // Vertical pass: (src_h, dst_w, C) → (dst_h, dst_w, C).
-  let hc = precompute_coeffs(src_h, dst_h);
+  let hc = precompute_coeffs(src_h, dst_h)?;
   let mut out = vec![0.0f32; dst_h * dst_w * channels];
   for (oy, (start, weights)) in hc.iter().enumerate() {
     for x in 0..dst_w {
@@ -241,31 +275,45 @@ pub(crate) fn resize_bilinear_antialias(
       }
     }
   }
-  out
+  Ok(out)
 }
 
 /// Quantizes one axis's `f64` resample coefficients to Pillow's 22-bit fixed
 /// point (`normalize_coeffs_8bpc`): `kk = (int)(±0.5 + w·2²²)`, rounding half
 /// away from zero. Bilinear weights are non-negative in practice; the negative
 /// branch mirrors PIL exactly for any residual.
-fn quantize_coeffs_8bpc(coeffs: &[(usize, Vec<f64>)]) -> Vec<(usize, Vec<i32>)> {
+///
+/// # Errors
+/// [`Error::PreprocessAllocation`] if a quantized coefficient vector cannot be
+/// reserved (the input table is already bounded, so only the reservation can
+/// fail; the quantized values are unchanged from the infallible form).
+fn quantize_coeffs_8bpc(coeffs: &[(usize, Vec<f64>)]) -> Result<Vec<(usize, Vec<i32>)>, Error> {
   let scale = f64::from(1i32 << PRECISION_BITS);
-  coeffs
-    .iter()
-    .map(|(start, weights)| {
-      let kk = weights
-        .iter()
-        .map(|&w| {
-          if w < 0.0 {
-            (-0.5 + w * scale) as i32
-          } else {
-            (0.5 + w * scale) as i32
-          }
-        })
-        .collect();
-      (*start, kk)
-    })
-    .collect()
+  let mut out = Vec::new();
+  out
+    .try_reserve_exact(coeffs.len())
+    .map_err(|_| Error::PreprocessAllocation {
+      bytes: coeffs
+        .len()
+        .saturating_mul(core::mem::size_of::<(usize, Vec<i32>)>()),
+    })?;
+  for (start, weights) in coeffs {
+    let mut kk = Vec::new();
+    kk.try_reserve_exact(weights.len())
+      .map_err(|_| Error::PreprocessAllocation {
+        bytes: weights.len().saturating_mul(core::mem::size_of::<i32>()),
+      })?;
+    for &w in weights {
+      let q = if w < 0.0 {
+        (-0.5 + w * scale) as i32
+      } else {
+        (0.5 + w * scale) as i32
+      };
+      kk.push(q);
+    }
+    out.push((*start, kk));
+  }
+  Ok(out)
 }
 
 /// Pillow's `clip8`: arithmetic-shift the fixed-point accumulator back to the
@@ -307,12 +355,15 @@ fn alloc_u8(len: usize) -> Result<Vec<u8>, Error> {
 /// The accumulator is `i64`; PIL relies on `ss ≤ 2²¹ + 255·(2²² + ksize/2) ≈
 /// 1.07e9 < i32::MAX` holding, and `i64` gives the identical result while
 /// immunizing debug-overflow. The src-dependent horizontal intermediate is
-/// sized with [`checked_len3`] and reserved with [`alloc_u8`] (fallible), so a
-/// pathological geometry returns a typed error rather than aborting.
+/// sized with [`checked_len3`] and reserved with [`alloc_u8`] (fallible), and
+/// the coefficient tables are reserved fallibly by [`precompute_coeffs`] /
+/// [`quantize_coeffs_8bpc`], so a pathological geometry returns a typed error
+/// rather than aborting. A `src` shorter than `src_h·src_w·channels` panics on
+/// an out-of-bounds tap — a caller-internal invariant.
 ///
 /// # Errors
-/// [`Error::PreprocessAllocation`] if a working buffer's size overflows `usize`
-/// or cannot be reserved.
+/// [`Error::PreprocessAllocation`] if a working buffer or coefficient table's
+/// size overflows `usize` or cannot be reserved.
 pub(crate) fn resize_bilinear_antialias_u8(
   src: &[u8],
   src_h: usize,
@@ -324,7 +375,7 @@ pub(crate) fn resize_bilinear_antialias_u8(
   const OFFSET: i64 = 1 << (PRECISION_BITS - 1);
 
   // Horizontal pass: (src_h, src_w, C) → (src_h, dst_w, C), u8 intermediate.
-  let wc = quantize_coeffs_8bpc(&precompute_coeffs(src_w, dst_w));
+  let wc = quantize_coeffs_8bpc(&precompute_coeffs(src_w, dst_w)?)?;
   let mut tmp = alloc_u8(checked_len3(src_h, dst_w, channels)?)?;
   for y in 0..src_h {
     for (ox, (start, weights)) in wc.iter().enumerate() {
@@ -339,7 +390,7 @@ pub(crate) fn resize_bilinear_antialias_u8(
   }
 
   // Vertical pass: (src_h, dst_w, C) → (dst_h, dst_w, C).
-  let hc = quantize_coeffs_8bpc(&precompute_coeffs(src_h, dst_h));
+  let hc = quantize_coeffs_8bpc(&precompute_coeffs(src_h, dst_h)?)?;
   let mut out = alloc_u8(checked_len3(dst_h, dst_w, channels)?)?;
   for (oy, (start, weights)) in hc.iter().enumerate() {
     for x in 0..dst_w {
@@ -451,12 +502,17 @@ pub(crate) fn parse_base_pos_grid(bytes: &[u8]) -> Result<Vec<f32>, Error> {
 /// `base_grid` must be `POS_EMBED_ELEMS` long (as [`parse_base_pos_grid`]
 /// returns) and `grid_h · grid_w ≤ budget` (the budget solver guarantees it;
 /// excess is defensively truncated rather than panicking).
+///
+/// # Errors
+/// [`Error::PreprocessAllocation`] if the resize's coefficient tables cannot be
+/// sized or reserved (propagated from [`resize_bilinear_antialias`]; the fixed
+/// `16×16` base grid makes this unreachable in practice).
 pub(crate) fn lift_position_embeddings(
   base_grid: &[f32],
   grid_h: usize,
   grid_w: usize,
   budget: usize,
-) -> Vec<f32> {
+) -> Result<Vec<f32>, Error> {
   let resized = resize_bilinear_antialias(
     base_grid,
     POS_GRID_SIDE,
@@ -464,11 +520,11 @@ pub(crate) fn lift_position_embeddings(
     EMBEDDING_DIM,
     grid_h,
     grid_w,
-  );
+  )?;
   let mut out = vec![0.0f32; budget * EMBEDDING_DIM];
   let copy_len = resized.len().min(out.len());
   out[..copy_len].copy_from_slice(&resized[..copy_len]);
-  out
+  Ok(out)
 }
 
 /// The three vision-graph input tensors produced from one decoded image, plus
@@ -524,7 +580,7 @@ pub(crate) fn preprocess_image(
   let resized: Vec<f32> = resized_u8.iter().map(|&v| normalize_u8(v)).collect();
 
   let (pixel_values, attention_mask) = patchify(&resized, grid_h, grid_w, budget)?;
-  let position_embeddings = lift_position_embeddings(base_grid, grid_h, grid_w, budget);
+  let position_embeddings = lift_position_embeddings(base_grid, grid_h, grid_w, budget)?;
 
   Ok(VisionInputs {
     pixel_values,

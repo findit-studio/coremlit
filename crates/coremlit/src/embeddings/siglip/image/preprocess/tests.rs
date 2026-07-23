@@ -102,7 +102,7 @@ fn budget_solver_extreme_aspect_clamps_short_side_to_one_patch() {
 fn resize_identity_is_exact() {
   // 2×2, three channels, distinct values.
   let src: Vec<f32> = (0..2 * 2 * 3).map(|i| i as f32).collect();
-  let out = resize_bilinear_antialias(&src, 2, 2, 3, 2, 2);
+  let out = resize_bilinear_antialias(&src, 2, 2, 3, 2, 2).expect("identity resize");
   assert_eq!(out, src);
 }
 
@@ -110,12 +110,12 @@ fn resize_identity_is_exact() {
 #[test]
 fn resize_of_constant_field_is_constant() {
   let src = vec![0.375f32; 3 * 5 * 2]; // 3×5, 2 channels
-  let up = resize_bilinear_antialias(&src, 3, 5, 2, 7, 9);
+  let up = resize_bilinear_antialias(&src, 3, 5, 2, 7, 9).expect("upscale");
   assert!(
     up.iter().all(|&v| (v - 0.375).abs() <= 1e-6),
     "upscale drifted"
   );
-  let down = resize_bilinear_antialias(&src, 3, 5, 2, 2, 2);
+  let down = resize_bilinear_antialias(&src, 3, 5, 2, 2, 2).expect("downscale");
   assert!(
     down.iter().all(|&v| (v - 0.375).abs() <= 1e-6),
     "downscale drifted"
@@ -127,7 +127,7 @@ fn resize_of_constant_field_is_constant() {
 /// interior).
 #[test]
 fn resize_upscale_matches_hand_computed_bilinear() {
-  let out = resize_bilinear_antialias(&[0.0, 1.0], 1, 2, 1, 1, 4);
+  let out = resize_bilinear_antialias(&[0.0, 1.0], 1, 2, 1, 1, 4).expect("upscale resize");
   assert_eq!(out, vec![0.0, 0.25, 0.75, 1.0]);
 }
 
@@ -138,7 +138,7 @@ fn resize_upscale_matches_hand_computed_bilinear() {
 fn resize_checker_upscale_matches_hand_computed_surface() {
   // [[0,1],[1,0]] row-major, single channel.
   let src = [0.0f32, 1.0, 1.0, 0.0];
-  let out = resize_bilinear_antialias(&src, 2, 2, 1, 4, 4);
+  let out = resize_bilinear_antialias(&src, 2, 2, 1, 4, 4).expect("checker upscale");
   let at = |r: usize, c: usize| out[r * 4 + c];
   // Corners replicate.
   assert_eq!(
@@ -166,7 +166,8 @@ fn resize_checker_upscale_matches_hand_computed_surface() {
 /// (a non-antialiased 2-tap bilinear would just subsample to `[0, 255]`).
 #[test]
 fn resize_antialias_downscale_is_symmetric_lowpass() {
-  let out = resize_bilinear_antialias(&[0.0, 0.0, 255.0, 255.0], 1, 4, 1, 1, 2);
+  let out = resize_bilinear_antialias(&[0.0, 0.0, 255.0, 255.0], 1, 4, 1, 1, 2)
+    .expect("antialias downscale");
   assert!(out[0] < out[1], "must be monotonic increasing");
   assert!(
     (out[0] + out[1] - 255.0).abs() <= 1e-3,
@@ -185,7 +186,7 @@ fn resize_antialias_downscale_is_symmetric_lowpass() {
 #[test]
 fn resize_keeps_channels_independent() {
   let src = [0.0f32, 10.0, 20.0, 40.0, 50.0, 60.0]; // 1×2, RGB
-  let out = resize_bilinear_antialias(&src, 1, 2, 3, 1, 4);
+  let out = resize_bilinear_antialias(&src, 1, 2, 3, 1, 4).expect("channel resize");
   // Reconstruct expected per channel.
   let up1d = |a: f32, b: f32| [a, 0.75 * a + 0.25 * b, 0.25 * a + 0.75 * b, b];
   for c in 0..3 {
@@ -207,7 +208,7 @@ fn resize_keeps_channels_independent() {
 fn resize_preserves_vertical_constancy() {
   // 4×2×1 with all rows == [3.0, 7.0].
   let src = [3.0f32, 7.0, 3.0, 7.0, 3.0, 7.0, 3.0, 7.0];
-  let out = resize_bilinear_antialias(&src, 4, 2, 1, 2, 2); // 2×2
+  let out = resize_bilinear_antialias(&src, 4, 2, 1, 2, 2).expect("height resize"); // 2×2
   assert!((out[0] - out[2]).abs() <= 1e-6, "column 0 not constant");
   assert!((out[1] - out[3]).abs() <= 1e-6, "column 1 not constant");
 }
@@ -224,8 +225,9 @@ fn resize_u8_identity_is_exact() {
 }
 
 /// Any constant field stays exactly constant under up- and down-scale: the
-/// quantized weight sum is within `ksize/2` of `2²²`, so `c·δ < 2²¹` for every
-/// reachable `ksize` and the offset truncates back to `c`.
+/// quantized weight sum is within `ksize/2` of `2²²`, so `c·δ < 2²¹` for this
+/// test's geometries (the margin holds while `ksize < 16448`) and the offset
+/// truncates back to `c`.
 #[test]
 fn resize_u8_constant_field_is_constant() {
   let src = vec![123u8; 5 * 7 * 3]; // 5×7, 3 channels
@@ -280,11 +282,31 @@ fn resize_u8_per_pass_rounding_discriminates_from_float() {
 }
 
 /// Pathologically large source dims return a typed
-/// [`Error::PreprocessAllocation`] from the `checked_mul` sizing arm — no panic,
-/// no abort. (The `try_reserve` arm is not portably forcible.)
+/// [`Error::PreprocessAllocation`] from [`checked_len3`]'s `checked_mul`
+/// working-buffer sizing arm — no panic, no abort. (The `try_reserve` arm is
+/// not portably forcible.)
 #[test]
 fn resize_u8_rejects_overflowing_geometry() {
   match resize_bilinear_antialias_u8(&[0u8; 12], usize::MAX / 2, 2, 3, 2, 2) {
+    Err(Error::PreprocessAllocation { bytes }) => assert_eq!(bytes, usize::MAX),
+    other => panic!("expected PreprocessAllocation, got {other:?}"),
+  }
+}
+
+/// A pathologically large *source* extent trips the coefficient-table
+/// representability pre-guard inside [`precompute_coeffs`] (the horizontal
+/// axis' `out·(2⌈support⌉+1)` element count overflows `usize`), returning a
+/// typed [`Error::PreprocessAllocation`] before any tap is indexed — no panic,
+/// no abort. This is the coefficient-table arm, distinct from the working-buffer
+/// [`checked_len3`] arm above. (The `try_reserve` arms are not portably
+/// forcible.)
+#[test]
+fn resize_u8_rejects_coeff_table_overflow() {
+  // src_w = usize::MAX/2, dst_w = 16 ⇒ support ≈ 2⁵⁹, so 2⌈support⌉+1 = 2⁶⁰+1
+  // and 16·(2⁶⁰+1) overflows usize. precompute_coeffs(src_w, dst_w) is the u8
+  // kernel's first action, so the guard fires before any buffer or src indexing;
+  // the tiny src is never read.
+  match resize_bilinear_antialias_u8(&[0u8; 12], 2, usize::MAX / 2, 3, 2, 16) {
     Err(Error::PreprocessAllocation { bytes }) => assert_eq!(bytes, usize::MAX),
     other => panic!("expected PreprocessAllocation, got {other:?}"),
   }
@@ -325,7 +347,8 @@ fn preprocess_image_pixel_values_come_from_u8_resize() {
   // kernel for this source, so preprocess_image is provably off the old float
   // path.
   let rgb_f32: Vec<f32> = rgb.iter().map(|&b| f32::from(b)).collect();
-  let float_resized = resize_bilinear_antialias(&rgb_f32, 2, 2, CHANNELS, 16, 16);
+  let float_resized =
+    resize_bilinear_antialias(&rgb_f32, 2, 2, CHANNELS, 16, 16).expect("float resize");
   let float_u8: Vec<u8> = float_resized
     .iter()
     .map(|&v| v.round().clamp(0.0, 255.0) as u8)
@@ -486,7 +509,7 @@ fn lift_position_embeddings_flattens_and_zero_pads() {
   let grid_h = 3;
   let grid_w = 4; // 12 real patches
   let budget = 20;
-  let lifted = lift_position_embeddings(&base, grid_h, grid_w, budget);
+  let lifted = lift_position_embeddings(&base, grid_h, grid_w, budget).expect("lift");
   assert_eq!(lifted.len(), budget * EMBEDDING_DIM);
 
   let n_real = grid_h * grid_w;
@@ -519,7 +542,7 @@ fn lift_position_embeddings_row_order_matches_patch_order() {
   }
   // Identity grid (16×16) → resize is exact, one position row per cell.
   let budget = POS_GRID_SIDE * POS_GRID_SIDE + 5;
-  let lifted = lift_position_embeddings(&base, POS_GRID_SIDE, POS_GRID_SIDE, budget);
+  let lifted = lift_position_embeddings(&base, POS_GRID_SIDE, POS_GRID_SIDE, budget).expect("lift");
   for gy in 0..POS_GRID_SIDE {
     for gx in 0..POS_GRID_SIDE {
       let row = gy * POS_GRID_SIDE + gx;
