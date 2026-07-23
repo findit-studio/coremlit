@@ -26,6 +26,9 @@ pub mod window;
 #[allow(dead_code)]
 mod mel;
 
+#[cfg(feature = "serde")]
+mod compute_units_serde;
+
 pub use aggregate::{ChunkAggregation, aggregate_windows};
 pub use error::Error;
 pub use prediction::{Confidences, EventPrediction, RatedSoundEvent, WindowConfidences};
@@ -63,3 +66,61 @@ const _: () = assert!(
 /// anticipates `CpuAndGpu`; ANE-capable ≠ floor-holding — the siglip lesson)
 /// and this doc then carries the measured latency × placement table.
 pub const DEFAULT_COMPUTE: ComputeUnits = ComputeUnits::All;
+
+#[cfg(feature = "serde")]
+fn default_compute() -> ComputeUnits {
+  DEFAULT_COMPUTE
+}
+
+/// Construction options for the CED `Classifier` (rust-options-pattern): a
+/// single `compute` knob with one source of truth shared by
+/// `const new`/`Default`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct ClassifierOptions {
+  #[cfg_attr(
+    feature = "serde",
+    serde(
+      default = "default_compute",
+      with = "crate::audio::ced::compute_units_serde"
+    )
+  )]
+  compute: ComputeUnits,
+}
+
+impl Default for ClassifierOptions {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl ClassifierOptions {
+  /// Options matching the module default: [`DEFAULT_COMPUTE`] (PROVISIONAL —
+  /// see its doc).
+  pub const fn new() -> Self {
+    Self {
+      compute: DEFAULT_COMPUTE,
+    }
+  }
+
+  /// Which hardware CoreML may schedule the graph on.
+  #[inline]
+  pub const fn compute(&self) -> ComputeUnits {
+    self.compute
+  }
+
+  /// Builder form of [`Self::set_compute`].
+  #[must_use]
+  #[inline]
+  pub const fn with_compute(mut self, compute: ComputeUnits) -> Self {
+    self.set_compute(compute);
+    self
+  }
+
+  /// Sets [`Self::compute`] in place.
+  #[inline]
+  pub const fn set_compute(&mut self, compute: ComputeUnits) -> &mut Self {
+    self.compute = compute;
+    self
+  }
+}
