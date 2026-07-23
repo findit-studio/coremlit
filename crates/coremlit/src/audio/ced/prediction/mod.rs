@@ -117,7 +117,6 @@ impl Confidences {
   ///
   /// # Panics
   /// As [`Self::new`], on a wrong-length slice (internal invariant).
-  #[allow(dead_code)] // constructed by the classifier's raw-logit decoding path; the sibling tests are the only caller so far
   pub(crate) fn from_logits(logits: &[f32]) -> Self {
     Self::new(logits.iter().copied().map(sigmoid).collect())
   }
@@ -141,7 +140,6 @@ impl Confidences {
 }
 
 /// The soundevents sigmoid, verbatim: `1 / (1 + e^{-x})` in f32.
-#[allow(dead_code)] // reached only via `Confidences::from_logits` until the classifier lands; the sibling tests call it directly
 pub(crate) fn sigmoid(x: f32) -> f32 {
   1.0 / (1.0 + (-x).exp())
 }

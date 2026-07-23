@@ -1,4 +1,5 @@
 use super::*;
+use crate::DataType;
 use soundevents_dataset::RatedSoundEvent;
 
 #[test]
@@ -57,4 +58,57 @@ fn options_missing_compute_defaults_to_provisional_all() {
 #[test]
 fn options_unknown_compute_spelling_is_rejected() {
   assert!(serde_json::from_str::<ClassifierOptions>("{\"compute\":\"gpu\"}").is_err());
+}
+
+// ── Input validation + output guards (the hermetic classifier seams) ───────
+
+#[test]
+fn validate_rejects_empty_audio() {
+  assert!(matches!(validate_window_input(&[]), Err(Error::EmptyAudio)));
+}
+
+#[test]
+fn validate_rejects_overlong_audio_never_truncates() {
+  let long = vec![0.0f32; WINDOW_SAMPLES + 1];
+  assert!(matches!(
+    validate_window_input(&long),
+    Err(Error::AudioTooLong { len, max }) if len == WINDOW_SAMPLES + 1 && max == WINDOW_SAMPLES
+  ));
+}
+
+#[test]
+fn validate_reports_the_first_non_finite_sample() {
+  let mut samples = vec![0.0f32; 100];
+  samples[41] = f32::NAN;
+  samples[43] = f32::INFINITY;
+  assert!(matches!(
+    validate_window_input(&samples),
+    Err(Error::NonFiniteInput { index: 41 })
+  ));
+}
+
+#[test]
+fn validate_accepts_one_sample_and_a_full_window() {
+  assert!(validate_window_input(&[0.5]).is_ok());
+  assert!(validate_window_input(&vec![0.0f32; WINDOW_SAMPLES]).is_ok());
+}
+
+#[test]
+fn finite_logit_check_reports_the_index() {
+  let mut logits = vec![0.0f32; NUM_CLASSES];
+  assert!(check_finite_logits(&logits).is_ok());
+  logits[7] = f32::NEG_INFINITY;
+  assert!(matches!(
+    check_finite_logits(&logits),
+    Err(Error::NonFiniteOutput { index: 7 })
+  ));
+}
+
+#[test]
+fn describe_renders_shape_and_dtype() {
+  assert_eq!(
+    describe(&[1, 64, 1001], Some(DataType::F32)),
+    "[1, 64, 1001] float32"
+  );
+  assert_eq!(describe(&[1, 527], None), "[1, 527] none");
 }
