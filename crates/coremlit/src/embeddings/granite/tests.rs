@@ -636,6 +636,55 @@ fn gap_attachment_falls_back_right_then_own_chunk() {
   }
 }
 
+/// Gap repair must not silently defeat the caller's `max_windows` work bound
+/// (each chunk is one CoreML prediction): windit's own cap passes pre-repair,
+/// but an unabsorbable separator run becomes an extra own-chunk, so the cap is
+/// re-enforced on the FINAL chunk count. With the bundled tokenizer at window
+/// 3, `a`/`b` pack a window exactly (3 ids with specials) while `a\n\n` /
+/// `\n\nb` measure 4, so a `\n\n` between them fits neither neighbor.
+#[test]
+fn gap_repair_cannot_exceed_max_windows() {
+  use windit::WinditError;
+
+  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+
+  // windit passes at two content chunks; repair inserts the interior `\n\n` as
+  // a third. `got` is the full repaired count.
+  match chunk_long(&mt, "a\n\nb", &WindowOptions::new(3).with_max_windows(2)) {
+    Err(Error::Windowing(WinditError::TooManyWindows { got, max })) => {
+      assert_eq!(got, 3, "the full repaired chunk count is reported");
+      assert_eq!(max, 2);
+    }
+    other => panic!("expected Err(Windowing(TooManyWindows)), got {other:?}"),
+  }
+
+  // Uncapped, the same geometry chunks fine — three covering chunks — so the
+  // error above is the cap, not the geometry.
+  let uncapped = chunk_long(&mt, "a\n\nb", &WindowOptions::new(3)).expect("uncapped");
+  let ranges: Vec<_> = uncapped.iter().map(|c| (c.start(), c.end())).collect();
+  assert_eq!(ranges, vec![(0, 1), (1, 3), (3, 4)]);
+
+  // Leading, interior, and trailing insertions co-occur and are all counted:
+  // windit yields `a` and `b` (2 content chunks, within the cap of 3, so
+  // windit's own check passes); repair adds all three `\n\n` runs, so the
+  // final count (5) exceeds `max + 1` (4) by one — `got` is the full
+  // repaired count, not windit's abort-at-`max + 1` value.
+  match chunk_long(
+    &mt,
+    "\n\na\n\nb\n\n",
+    &WindowOptions::new(3).with_max_windows(3),
+  ) {
+    Err(Error::Windowing(WinditError::TooManyWindows { got, max })) => {
+      assert_eq!(
+        got, 5,
+        "leading + interior + trailing insertions all counted"
+      );
+      assert_eq!(max, 3);
+    }
+    other => panic!("expected Err(Windowing(TooManyWindows)), got {other:?}"),
+  }
+}
+
 /// A short text that fits one window is a single chunk spanning the whole text.
 #[test]
 fn single_window_text_is_one_whole_chunk() {

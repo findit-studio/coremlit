@@ -441,9 +441,10 @@ impl TextEmbedder {
   /// [`Self::embed_long`] with caller-controlled chunk geometry: `opts.window()`
   /// is the per-chunk token budget (must be `1..=`[`MAX_TOKENS`]), the overlap
   /// sets the repeated-token budget between consecutive chunks, and
-  /// `opts.max_windows()` caps the chunk count. `opts.tail()` is ignored —
-  /// content-aware chunking has no ragged-tail concept, the final chunk is
-  /// simply short.
+  /// `opts.max_windows()` caps the final chunk count — separator reattachment
+  /// included — and thereby the number of per-chunk CoreML predictions.
+  /// `opts.tail()` is ignored — content-aware chunking has no ragged-tail
+  /// concept, the final chunk is simply short.
   ///
   /// The per-chunk token budget counts granite's special tokens (`[CLS]`/`[SEP]`,
   /// +2), because both the length measurement and each chunk's embedding run
@@ -457,13 +458,17 @@ impl TextEmbedder {
   /// neighbor can absorb becomes a chunk of its own and can exceed `window` only
   /// when the run alone measures past it — the same recorded escape as windit's
   /// lone oversized `char`, kept sound by the embed path's truncation guard.
+  /// Such insertions count against `opts.max_windows()`: the cap is enforced on
+  /// the repaired chunk list, never silently exceeded.
   ///
   /// # Errors
   /// [`Error::WindowOverBudget`] if `opts.window()` exceeds [`MAX_TOKENS`] (every
   /// chunk would be silently truncated); [`Error::EmptyText`] for `""` (as
   /// [`Self::embed`]); [`Error::Tokenize`] on a tokenizer failure;
   /// [`Error::Windowing`] carrying a [`WinditError`](crate::embeddings::granite::error::WinditError)
-  /// from chunking (e.g. `ZeroWindow`, `OverlapGeWindow`, `TooManyWindows`) or
+  /// from chunking (e.g. `ZeroWindow`, `OverlapGeWindow`, `TooManyWindows` — the
+  /// `max_windows` cap binds the final, post-reattachment chunk count, `got`
+  /// reporting that full count) or
   /// aggregation (e.g. `NonFinite` when the per-chunk embeddings cancel exactly);
   /// plus any per-chunk tensor / prediction / output error (the same set
   /// [`Self::embed`] can raise).
@@ -614,7 +619,11 @@ fn validate_long_options(opts: &WindowOptions) -> Result<()> {
 ///
 /// # Errors
 /// [`Error::Windowing`] carrying whatever windit's `ContentAware::chunk` rejects
-/// (a zero window, an overlap at or above the window, or a `max_windows` overrun).
+/// (a zero window, an overlap at or above the window, or a `max_windows`
+/// overrun), or `TooManyWindows` raised here when gap reattachment grows the
+/// repaired list past `opts.max_windows()` — the cap binds the FINAL chunk
+/// count, `got` reporting that full count (windit's own raise aborts at
+/// `max + 1`; this one reports the whole overrun).
 fn chunk_long(
   measure_tok: &Tokenizer,
   text: &str,
@@ -636,7 +645,22 @@ fn chunk_long(
   let chunks = windit::split::ContentAware::new(&measure)
     .chunk(text, opts)
     .map_err(Error::from)?;
-  Ok(attach_gaps(text, chunks, &measure, opts.window()))
+  let repaired = attach_gaps(text, chunks, &measure, opts.window());
+  // windit enforced `max_windows` on ITS output; each own-chunk the repair
+  // inserts grows the count past that check, and every chunk costs one CoreML
+  // prediction, so the cap re-binds on the final list. Fail-closed: coverage
+  // and the cap cannot both hold here, and silently exceeding the caller's
+  // work bound (or silently dropping bytes) would be worse than a typed
+  // refusal. `got` is the full repaired count, not windit's abort count.
+  if let Some(max) = opts.max_windows()
+    && repaired.len() > max
+  {
+    return Err(Error::Windowing(windit::WinditError::TooManyWindows {
+      got: repaired.len(),
+      max,
+    }));
+  }
+  Ok(repaired)
 }
 
 /// Reattaches the byte gaps windit leaves between chunks, so [`chunk_long`]'s
@@ -663,7 +687,10 @@ fn chunk_long(
 /// byte 0, each starts where the previous ends, the last ends at `text.len()`,
 /// and the chunks concatenate back to `text`. With `overlap > 0` the pre-existing
 /// overlaps are negative gaps, left untouched, so coverage is completed without
-/// disturbing the repeats.
+/// disturbing the repeats. The sweep never fuses two input chunks — each maps to
+/// exactly one output chunk — so the output count is the input count plus one
+/// per own-chunk emitted; [`chunk_long`] re-enforces `max_windows` on that
+/// final count.
 ///
 /// Every accepted attachment re-measures within `window`; the sole escape is a
 /// pure-separator own-chunk whose run alone measures past `window` — the same
