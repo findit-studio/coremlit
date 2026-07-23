@@ -9,24 +9,31 @@
 //! 1. [`fit_to_patch_budget`] — the aspect-preserving budget solver: binary-
 //!    search the largest multiple-of-`patch` target whose patch count `h_p·w_p`
 //!    fits `P`.
-//! 2. [`resize_bilinear_antialias`] — the shared antialiased-bilinear resample
-//!    (PIL/torch `F.interpolate(mode="bilinear", antialias=True,
-//!    align_corners=False)` coefficients), generic over channel count, used both
-//!    to resize the image and to lift the position-embedding grid.
-//! 3. [`normalize_pixel`] — rescale + normalize `((x/255) − 0.5)/0.5`.
+//! 2. [`resize_bilinear_antialias_u8`] — the PIL-parity antialiased-bilinear
+//!    image resize in the **uint8 domain** (Pillow `Resample.c` fixed-point:
+//!    22-bit coefficients, per-pass u8 rounding), matching the SigLIP2 processor
+//!    (resize on u8, THEN rescale+normalize). Its sibling f64
+//!    [`resize_bilinear_antialias`] is the position-embedding lift's kernel
+//!    (stage 5), which the reference genuinely computes in float.
+//! 3. [`normalize_u8`] — rescale + normalize `((v/255) − 0.5)/0.5`.
 //! 4. [`patchify`] — reshape the resized+normalized image to `[P, 768]` patch
 //!    rows plus the `[P]` real/pad mask.
 //! 5. [`lift_position_embeddings`] — resize the base `16×16×768` grid to the
-//!    `(h_p, w_p)` grid, flatten row-major, and zero-pad to `[P, 768]`.
+//!    `(h_p, w_p)` grid, flatten row-major, and zero-pad to `[P, 768]`. Pad rows
+//!    are zero-filled — a deliberate deviation from transformers (which fills
+//!    them with the first resized row); pad positions are attention-masked, so
+//!    the model output is exactly invariant to the fill (see the fn doc).
 //!
 //! The pixel-normalization constants and patch flatten order are pinned by
 //! committed fixtures (`tests/siglip/fixtures/goldens/preprocess.json`, Wave B)
 //! and the full-tensor parity against staged `.npy` fixtures (Wave C); the pure
 //! stage math here is proven hermetically in `tests.rs`.
 //!
-//! Accumulation is in `f64` (weights and dot-products) for determinism; the
-//! measured-then-pinned resize tolerance (Wave B3) absorbs any residual delta
-//! against the torch reference's working precision.
+//! The image resize is bit-exact fixed-point (uint8 taps, per-pass rounding), so
+//! its `pixel_values` match the slow-processor fixture exactly (Wave B3/C2, no
+//! tolerance). The position-embedding lift accumulates in `f64` for determinism,
+//! with the measured-then-pinned tolerance (Wave B3) absorbing any residual
+//! delta against the torch reference's working precision.
 
 use crate::embeddings::siglip::{embedding::EMBEDDING_DIM, error::Error};
 
@@ -56,12 +63,22 @@ pub(crate) const POS_EMBED_ELEMS: usize = POS_GRID_SIDE * POS_GRID_SIDE * EMBEDD
 /// (the load-time hard-validation of D5).
 pub(crate) const POS_EMBED_BYTES: usize = POS_EMBED_ELEMS * 4;
 
-/// Pixel rescale factor `1/255` (`preprocessor_config.json` `rescale_factor`).
-const RESCALE_FACTOR: f32 = 1.0 / 255.0;
+/// Pixel rescale factor `1/255` as `f64` — bit-for-bit the checkpoint's
+/// `preprocessor_config.json` `rescale_factor` literal `0.00392156862745098`
+/// (the shortest round-trip repr of `1.0/255.0`). The reference multiplies the
+/// `u8` pixel by this Python float (`f64`) and casts the product to `f32`
+/// (`rescale(..., dtype=np.float32)`), so [`normalize_u8`] mirrors that order.
+const RESCALE_FACTOR_F64: f64 = 1.0 / 255.0;
 /// Per-channel normalization mean `0.5` (`image_mean`).
 const IMAGE_MEAN: f32 = 0.5;
 /// Per-channel normalization std `0.5` (`image_std`).
 const IMAGE_STD: f32 = 0.5;
+
+/// Fixed-point precision of the uint8 resample coefficients, Pillow's
+/// `PRECISION_BITS = 32 − 8 − 2 = 22` (`Resample.c`): weights are quantized to
+/// `2²²`, accumulated over `u8` taps with a `1 << 21` half-unit rounding offset,
+/// then shifted right by 22 and clamped to `u8`.
+const PRECISION_BITS: u32 = 22;
 
 /// Aspect-preserving patch-budget solver: the largest multiple-of-`patch`
 /// target size whose patch grid `h_p · w_p` fits `budget`, returned as the
@@ -170,12 +187,15 @@ fn precompute_coeffs(in_size: usize, out_size: usize) -> Vec<(usize, Vec<f64>)> 
 }
 
 /// Antialiased-bilinear resample of an `(src_h, src_w, channels)` row-major
-/// buffer to `(dst_h, dst_w, channels)`. Separable: resize width, then height
-/// (the PIL horizontal-then-vertical order), accumulating in `f64`.
+/// `f32` buffer to `(dst_h, dst_w, channels)`. Separable: resize width, then
+/// height (the PIL horizontal-then-vertical order), accumulating in `f64`.
 ///
-/// Shared by the image resize (`channels = 3`) and the position-embedding grid
-/// lift (`channels = 768`). Panics only on an inconsistent `src` length
-/// (`src.len() != src_h·src_w·channels`) — a caller-internal invariant.
+/// This is the **position-embedding lift's** kernel (`channels = 768`), which
+/// the reference computes in float (`F.interpolate` on the fp32 grid). The
+/// image pixels take the uint8 kernel [`resize_bilinear_antialias_u8`] instead
+/// (the SigLIP2 processor resizes on `u8`, then rescale+normalizes). Panics only
+/// on an inconsistent `src` length (`src.len() != src_h·src_w·channels`) — a
+/// caller-internal invariant.
 pub(crate) fn resize_bilinear_antialias(
   src: &[f32],
   src_h: usize,
@@ -223,11 +243,123 @@ pub(crate) fn resize_bilinear_antialias(
   out
 }
 
-/// Rescale + normalize one pixel channel value from `[0, 255]` to
-/// `((x/255) − 0.5)/0.5 ∈ [−1, 1]` — the SigLIP2 processor's `do_rescale` +
-/// `do_normalize` (mean `0.5`, std `0.5`), evaluated in that order.
-pub(crate) fn normalize_pixel(x: f32) -> f32 {
-  (x * RESCALE_FACTOR - IMAGE_MEAN) / IMAGE_STD
+/// Quantizes one axis's `f64` resample coefficients to Pillow's 22-bit fixed
+/// point (`normalize_coeffs_8bpc`): `kk = (int)(±0.5 + w·2²²)`, rounding half
+/// away from zero. Bilinear weights are non-negative in practice; the negative
+/// branch mirrors PIL exactly for any residual.
+fn quantize_coeffs_8bpc(coeffs: &[(usize, Vec<f64>)]) -> Vec<(usize, Vec<i32>)> {
+  let scale = f64::from(1i32 << PRECISION_BITS);
+  coeffs
+    .iter()
+    .map(|(start, weights)| {
+      let kk = weights
+        .iter()
+        .map(|&w| {
+          if w < 0.0 {
+            (-0.5 + w * scale) as i32
+          } else {
+            (0.5 + w * scale) as i32
+          }
+        })
+        .collect();
+      (*start, kk)
+    })
+    .collect()
+}
+
+/// Pillow's `clip8`: arithmetic-shift the fixed-point accumulator back to the
+/// integer domain (`>> 22`) and clamp to `u8`. Equivalent to PIL's clip lookup
+/// over the reachable accumulator range.
+fn clip8(ss: i64) -> u8 {
+  (ss >> PRECISION_BITS).clamp(0, 255) as u8
+}
+
+/// Element count `a·b·c`, or [`Error::PreprocessAllocation`]
+/// `{ bytes: usize::MAX }` on `usize` overflow — a pathological source geometry
+/// whose working buffer cannot even be represented, let alone allocated.
+fn checked_len3(a: usize, b: usize, c: usize) -> Result<usize, Error> {
+  a.checked_mul(b)
+    .and_then(|ab| ab.checked_mul(c))
+    .ok_or(Error::PreprocessAllocation { bytes: usize::MAX })
+}
+
+/// A zeroed `Vec<u8>` of `len` bytes reserved fallibly (`try_reserve_exact`), so
+/// a pathological source geometry returns [`Error::PreprocessAllocation`]
+/// instead of aborting the process on allocator failure.
+fn alloc_u8(len: usize) -> Result<Vec<u8>, Error> {
+  let mut v = Vec::new();
+  v.try_reserve_exact(len)
+    .map_err(|_| Error::PreprocessAllocation { bytes: len })?;
+  v.resize(len, 0);
+  Ok(v)
+}
+
+/// PIL-parity antialiased-bilinear resample in the **uint8 domain** (Pillow
+/// `Resample.c`, `PRECISION_BITS = 22`): per pass, [`precompute_coeffs`] taps
+/// are quantized to 22-bit fixed point, accumulated over `u8` taps with a
+/// `1 << 21` rounding offset, then shifted (`>> 22`) and clamped back to `u8` —
+/// **including the `u8` horizontal intermediate between the two passes**. This
+/// is the image path of the SigLIP2 processor (resize on `u8`, then
+/// rescale+normalize); the per-pass rounding is part of the reference semantics
+/// and is what the `f64` kernel cannot emulate.
+///
+/// The accumulator is `i64`; PIL relies on `ss ≤ 2²¹ + 255·(2²² + ksize/2) ≈
+/// 1.07e9 < i32::MAX` holding, and `i64` gives the identical result while
+/// immunizing debug-overflow. The src-dependent horizontal intermediate is
+/// sized with [`checked_len3`] and reserved with [`alloc_u8`] (fallible), so a
+/// pathological geometry returns a typed error rather than aborting.
+///
+/// # Errors
+/// [`Error::PreprocessAllocation`] if a working buffer's size overflows `usize`
+/// or cannot be reserved.
+pub(crate) fn resize_bilinear_antialias_u8(
+  src: &[u8],
+  src_h: usize,
+  src_w: usize,
+  channels: usize,
+  dst_h: usize,
+  dst_w: usize,
+) -> Result<Vec<u8>, Error> {
+  const OFFSET: i64 = 1 << (PRECISION_BITS - 1);
+
+  // Horizontal pass: (src_h, src_w, C) → (src_h, dst_w, C), u8 intermediate.
+  let wc = quantize_coeffs_8bpc(&precompute_coeffs(src_w, dst_w));
+  let mut tmp = alloc_u8(checked_len3(src_h, dst_w, channels)?)?;
+  for y in 0..src_h {
+    for (ox, (start, weights)) in wc.iter().enumerate() {
+      for c in 0..channels {
+        let mut ss: i64 = OFFSET;
+        for (k, &wk) in weights.iter().enumerate() {
+          ss += i64::from(src[(y * src_w + start + k) * channels + c]) * i64::from(wk);
+        }
+        tmp[(y * dst_w + ox) * channels + c] = clip8(ss);
+      }
+    }
+  }
+
+  // Vertical pass: (src_h, dst_w, C) → (dst_h, dst_w, C).
+  let hc = quantize_coeffs_8bpc(&precompute_coeffs(src_h, dst_h));
+  let mut out = alloc_u8(checked_len3(dst_h, dst_w, channels)?)?;
+  for (oy, (start, weights)) in hc.iter().enumerate() {
+    for x in 0..dst_w {
+      for c in 0..channels {
+        let mut ss: i64 = OFFSET;
+        for (k, &wk) in weights.iter().enumerate() {
+          ss += i64::from(tmp[((start + k) * dst_w + x) * channels + c]) * i64::from(wk);
+        }
+        out[(oy * dst_w + x) * channels + c] = clip8(ss);
+      }
+    }
+  }
+  Ok(out)
+}
+
+/// Rescale + normalize one `u8` pixel channel to `((v/255) − 0.5)/0.5 ∈ [−1, 1]`
+/// — the SigLIP2 processor's `do_rescale` + `do_normalize` (mean `0.5`, std
+/// `0.5`). Mirrors the reference dtype order: multiply the `u8` by the `f64`
+/// rescale factor, cast the product to `f32`, then normalize in `f32`.
+pub(crate) fn normalize_u8(v: u8) -> f32 {
+  ((f64::from(v) * RESCALE_FACTOR_F64) as f32 - IMAGE_MEAN) / IMAGE_STD
 }
 
 /// Reshape a resized+normalized `(grid_h·PATCH_SIZE, grid_w·PATCH_SIZE, 3)`
@@ -302,9 +434,18 @@ pub(crate) fn parse_base_pos_grid(bytes: &[u8]) -> Result<Vec<f32>, Error> {
 
 /// Lift the base `16×16×768` position grid to the `(grid_h, grid_w)` patch grid
 /// and flatten to the `[budget, 768]` `position_embeddings` input: resize the
-/// grid with the shared antialiased-bilinear kernel, take its row-major
+/// grid with the f64 antialiased-bilinear kernel, take its row-major
 /// `(grid_h·grid_w, 768)` flattening (the resize already emits that layout), and
 /// zero-pad the remaining `budget − grid_h·grid_w` rows.
+///
+/// Pad rows are **zero-filled — a deliberate deviation** from transformers
+/// `resize_positional_embeddings`, which fills them with the first resized row
+/// (an artifact of its `torch.empty` initialization). Pad positions are
+/// attention-masked in the encoder and the pooling head (additive `−1e4` →
+/// exactly zero softmax weight), so the model output is exactly invariant to the
+/// fill; zero is chosen because it is validatable and matches the pixel-pad
+/// convention. Wave C compares the lifted real rows against the reference and
+/// asserts the pad rows zero.
 ///
 /// `base_grid` must be `POS_EMBED_ELEMS` long (as [`parse_base_pos_grid`]
 /// returns) and `grid_h · grid_w ≤ budget` (the budget solver guarantees it;
@@ -350,16 +491,18 @@ pub(crate) struct VisionInputs {
 
 /// The full model-free NaFlex image pipeline: decoded RGB8 in, the three vision-
 /// graph input tensors out. Fits the image to the patch `budget`, resizes it
-/// with the antialiased-bilinear kernel to `(grid·PATCH_SIZE)` pixels, rescale+
-/// normalizes, patchifies to `pixel_values` + `attention_mask`, and lifts the
-/// base position grid to `position_embeddings`.
+/// with the uint8 PIL-parity antialiased-bilinear kernel to `(grid·PATCH_SIZE)`
+/// pixels, rescale+normalizes, patchifies to `pixel_values` + `attention_mask`,
+/// and lifts the base position grid to `position_embeddings`.
 ///
 /// `rgb` is row-major RGB-interleaved (`width · height · 3`, as a validated
 /// [`crate::embeddings::siglip::Rgb8Image`] guarantees); `base_grid` is the
 /// parsed `POS_EMBED_ELEMS` base position grid.
 ///
 /// # Errors
-/// [`Error::PatchCount`] if the solved grid exceeds `budget` (a solver bug).
+/// [`Error::PatchCount`] if the solved grid exceeds `budget` (a solver bug);
+/// [`Error::PreprocessAllocation`] if a resize working buffer cannot be sized or
+/// reserved (pathological source geometry).
 pub(crate) fn preprocess_image(
   rgb: &[u8],
   width: usize,
@@ -369,16 +512,15 @@ pub(crate) fn preprocess_image(
 ) -> Result<VisionInputs, Error> {
   let (grid_h, grid_w) = fit_to_patch_budget(height, width, PATCH_SIZE, budget);
 
-  // Decode to f32 [0, 255] in (H, W, C) row-major (the Rgb8Image layout).
-  let img_f32: Vec<f32> = rgb.iter().map(|&b| b as f32).collect();
-
-  // Resize (on 0..255 floats), then rescale+normalize — the processor's order.
+  // Resize in the u8 domain (PIL-parity fixed-point kernel), then
+  // rescale+normalize to f32 — the SigLIP2 processor's order AND dtype (it
+  // resizes the u8 image, rounding each pass to u8, then casts to f32). No
+  // whole-image f32 buffer is materialized; the only src-dependent allocation is
+  // the kernel's fallibly-reserved u8 intermediate.
   let dst_h = grid_h * PATCH_SIZE;
   let dst_w = grid_w * PATCH_SIZE;
-  let mut resized = resize_bilinear_antialias(&img_f32, height, width, CHANNELS, dst_h, dst_w);
-  for v in &mut resized {
-    *v = normalize_pixel(*v);
-  }
+  let resized_u8 = resize_bilinear_antialias_u8(rgb, height, width, CHANNELS, dst_h, dst_w)?;
+  let resized: Vec<f32> = resized_u8.iter().map(|&v| normalize_u8(v)).collect();
 
   let (pixel_values, attention_mask) = patchify(&resized, grid_h, grid_w, budget)?;
   let position_embeddings = lift_position_embeddings(base_grid, grid_h, grid_w, budget);

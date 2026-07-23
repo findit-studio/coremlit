@@ -144,3 +144,123 @@ fn configured_tokenizer_truncates_to_window_and_disables_padding() {
   let window = build_window(&short, 0, PadSide::Right, max_tokens).expect("window");
   assert_eq!(window, vec![1i32, 2, 0, 0]);
 }
+
+// ── E1: fail-closed placeholder tokenizer ─────────────────────────────────────
+
+/// `load` and `from_memory` reject the shipping placeholder `tokenizer.json`
+/// with [`Error::TokenizerPlaceholder`] BEFORE any I/O — a nonexistent model
+/// path proves the guard fires ahead of `Model::load` (else the error would be
+/// [`Error::Load`]).
+///
+/// Wave B note: when the real Gemma bytes replace the placeholder,
+/// `ensure_not_placeholder(BUNDLED_TOKENIZER)` becomes `Ok` and both
+/// constructors proceed to `Error::Load` on the nonexistent path — this test's
+/// two assertions flip accordingly (tracked in the port plan's Wave B flip list).
+#[test]
+fn load_and_from_memory_fail_closed_on_placeholder() {
+  let bundled = crate::embeddings::siglip::BUNDLED_TOKENIZER;
+  match TextEmbedder::load("/nonexistent/model.mlmodelc", TextEmbedderOptions::new()) {
+    Err(Error::TokenizerPlaceholder) => {}
+    other => panic!("expected TokenizerPlaceholder from load, got {other:?}"),
+  }
+  match TextEmbedder::from_memory(
+    "/nonexistent/model.mlmodelc",
+    bundled,
+    TextEmbedderOptions::new(),
+  ) {
+    Err(Error::TokenizerPlaceholder) => {}
+    other => panic!("expected TokenizerPlaceholder from from_memory, got {other:?}"),
+  }
+}
+
+/// The guard is a placeholder sentinel scan, not a blanket reject: a small
+/// non-placeholder tokenizer (the length fast-path is an optimization, not a
+/// semantic) passes.
+#[test]
+fn placeholder_guard_accepts_real_tokenizer_bytes() {
+  assert!(ensure_not_placeholder(TINY_TOKENIZER.as_bytes()).is_ok());
+}
+
+// ── E2: lowercase composition (mixed-case oracles) ────────────────────────────
+
+/// A tiny WordLevel tokenizer whose vocab carries BOTH a lowercase and an
+/// uppercase entry for the same letter — proves the composed `Lowercase`
+/// normalizer runs before the model lookup (the uppercase id is never chosen).
+const CASE_COLLISION_TOKENIZER: &str = r#"{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": { "type": "Whitespace" },
+  "post_processor": null,
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": { "<pad>": 0, "a": 1, "b": 2, "A": 6 },
+    "unk_token": "<pad>"
+  }
+}"#;
+
+/// A tiny WordLevel tokenizer carrying its OWN `Replace` normalizer (`x` → `a`).
+/// Composing `Lowercase` AHEAD of it turns `X` into `x` into `a`; composing it
+/// AFTER would leave `X` unmatched — so the encoded id discriminates the order.
+const REPLACE_NORMALIZER_TOKENIZER: &str = r#"{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [],
+  "normalizer": { "type": "Replace", "pattern": { "String": "x" }, "content": "a" },
+  "pre_tokenizer": { "type": "Whitespace" },
+  "post_processor": null,
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": { "<pad>": 0, "a": 1, "b": 2 },
+    "unk_token": "<pad>"
+  }
+}"#;
+
+/// The configured tokenizer lowercases before the model lookup: mixed-case
+/// `"A B"` encodes to the lowercase ids `[1, 2]`. Non-vacuity: `TINY_TOKENIZER`
+/// carries NO normalizer, so without the composition `A`/`B` are out-of-vocab
+/// and fall to the `<pad>` unk (`[0, 0]`) — the mixed-case oracle is sharp.
+/// (Covers the `None`-normalizer arm of the composition.)
+#[test]
+fn configured_tokenizer_lowercases_before_lookup() {
+  let tok =
+    configured_tokenizer_from_bytes(TINY_TOKENIZER.as_bytes(), 8).expect("configure tokenizer");
+  let ids = tok.encode("A B", false).expect("encode").get_ids().to_vec();
+  assert_eq!(
+    ids,
+    vec![1u32, 2],
+    "mixed case must lowercase to [a, b] ids"
+  );
+}
+
+/// With both `"a"` and `"A"` in the vocab, `"A"` still resolves to the lowercase
+/// id `1` (never the uppercase `6`) — the normalizer runs before the lookup.
+#[test]
+fn configured_tokenizer_prefers_lowercase_vocab_entry() {
+  let tok = configured_tokenizer_from_bytes(CASE_COLLISION_TOKENIZER.as_bytes(), 8)
+    .expect("configure tokenizer");
+  let ids = tok.encode("A", false).expect("encode").get_ids().to_vec();
+  assert_eq!(ids, vec![1u32], "must pick the lowercase entry, not id 6");
+}
+
+/// `Lowercase` is composed AHEAD of the loaded normalizer, and the loaded
+/// normalizer is preserved (not clobbered): `"X b"` lowercases to `"x b"`, then
+/// the loaded `Replace` maps `x` → `a`, giving `[1, 2]`. Composed the other way,
+/// `X` never reaches `Replace` and would fall to unk `[0, 2]` — so this pins the
+/// ordering.
+#[test]
+fn configured_tokenizer_composes_ahead_of_existing_normalizer() {
+  let tok = configured_tokenizer_from_bytes(REPLACE_NORMALIZER_TOKENIZER.as_bytes(), 8)
+    .expect("configure tokenizer");
+  let ids = tok.encode("X b", false).expect("encode").get_ids().to_vec();
+  assert_eq!(
+    ids,
+    vec![1u32, 2],
+    "Lowercase must run before the loaded Replace normalizer"
+  );
+}

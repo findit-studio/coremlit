@@ -166,12 +166,12 @@ impl<'a> Rgb8Image<'a> {
 /// [`Embedding`] out — the same joint-space [`Embedding`] the text tower emits.
 ///
 /// The front-end is a Rust NaFlex port (the private `preprocess` submodule):
-/// it fits the image to the resolved patch budget `P`, resizes with an
-/// antialiased-bilinear kernel, normalizes, patchifies into the graph's `[1, P,
-/// 768]` `pixel_values` + `[1, P]` `attention_mask`, and lifts the base position
-/// grid into `[1, P, 768]` `position_embeddings`. The fp16 CoreML graph maps
-/// those to a pre-normalization 768-d projection, which this embedder
-/// L2-normalizes.
+/// it fits the image to the resolved patch budget `P`, resizes with a uint8
+/// PIL-parity antialiased-bilinear kernel, normalizes, patchifies into the
+/// graph's `[1, P, 768]` `pixel_values` + `[1, P]` `attention_mask`, and lifts
+/// the base position grid into `[1, P, 768]` `position_embeddings`. The fp16
+/// CoreML graph maps those to a pre-normalization 768-d projection, which this
+/// embedder L2-normalizes.
 ///
 /// `&self` inference: preprocessing scratch is per-call local, so fan-out means
 /// one [`ImageEmbedder`] per worker over a `Send` (but deliberately `!Sync`)
@@ -261,6 +261,8 @@ impl ImageEmbedder {
   ///
   /// # Errors
   /// [`Error::PatchCount`] if preprocessing overflows the budget (a solver bug);
+  /// [`Error::PreprocessAllocation`] if a resize working buffer cannot be sized
+  /// or reserved (pathological source geometry);
   /// [`Error::Tensor`] / [`Error::Prediction`] on a tensor or CoreML failure;
   /// [`Error::OutputShape`] if the predicted `image_features` shape diverges from
   /// `[1, `[`EMBEDDING_DIM`]`]`; [`Error::NonFiniteOutput`] if the model output

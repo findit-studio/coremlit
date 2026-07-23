@@ -1,6 +1,9 @@
 //! The siglip [`TextEmbedder`]: the bundled Gemma tokenizer around the fp16
 //! CoreML text graph, with L2 normalization applied in Rust.
 //!
+//! Text is lowercased before tokenization (the SigLIP2 training convention;
+//! checkpoint `do_lower_case: true`), mirroring transformers `Siglip2Tokenizer`.
+//!
 //! Unlike `granite`/`clap`, the SigLIP text graph takes **only** `input_ids`
 //! (`[1, T]` int32) — the processor emits no attention mask (canonical SigLIP
 //! attends all `T` positions) and the tower pools the final position. Because
@@ -12,7 +15,10 @@
 use std::path::Path;
 
 use crate::{ComputeUnits, DataType, Model, ModelDescription, MultiArray};
-use tokenizers::{Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy};
+use tokenizers::{
+  Tokenizer, TruncationDirection, TruncationParams, TruncationStrategy,
+  normalizers::{Lowercase, NormalizerWrapper, Sequence as NormalizerSequence},
+};
 
 use crate::embeddings::siglip::{
   embedding::{EMBEDDING_DIM, Embedding, check_finite_output},
@@ -25,6 +31,32 @@ use crate::embeddings::siglip::{
 mod names {
   pub const INPUT_IDS: &str = "input_ids";
   pub const TEXT_FEATURES: &str = "text_features";
+}
+
+/// Sentinel embedded in the Wave-A placeholder `assets/tokenizer.json`; the real
+/// source-revision Gemma artifact cannot contain it. Kept after Wave B as a
+/// regression guard against re-committing the placeholder.
+const PLACEHOLDER_SENTINEL: &[u8] =
+  b"PLACEHOLDER_REPLACE_WITH_SOURCE_REVISION_GEMMA_TOKENIZER_IN_WAVE_B";
+
+/// Fails closed if `bytes` is the build-time placeholder tokenizer, whose vocab
+/// maps every ordinary word to `<pad>` (so embedding with it would silently
+/// yield meaningless vectors). Called before any tokenizer parse or model load
+/// so the failure is deterministic and hermetically testable.
+///
+/// # Errors
+/// [`Error::TokenizerPlaceholder`] if `bytes` carries the placeholder sentinel.
+fn ensure_not_placeholder(bytes: &[u8]) -> Result<()> {
+  // The real Gemma artifact is tens of MB; only a small file can be the
+  // placeholder, so the scan is skipped once the real bytes are staged.
+  if bytes.len() < 1_000_000
+    && bytes
+      .windows(PLACEHOLDER_SENTINEL.len())
+      .any(|w| w == PLACEHOLDER_SENTINEL)
+  {
+    return Err(Error::TokenizerPlaceholder);
+  }
+  Ok(())
 }
 
 /// Default [`TextEmbedderOptions::compute`]: [`ComputeUnits::CpuAndGpu`] — the
@@ -114,7 +146,8 @@ pub(crate) enum PadSide {
 /// siglip text embedder: a `&str` in, a unit-norm 768-d [`Embedding`] out — the
 /// same joint-space [`Embedding`] the image tower emits.
 ///
-/// Tokenizes with the bundled Gemma tokenizer (truncation `LongestFirst` at the
+/// Lowercases the text (SigLIP2 convention; checkpoint `do_lower_case: true`),
+/// tokenizes with the bundled Gemma tokenizer (truncation `LongestFirst` at the
 /// resolved window `T`, the tokenizer's own padding disabled), builds the fixed
 /// `[1, T]` padded window (side/id per D6), runs the single-input fp16 CoreML
 /// graph, and L2-normalizes the pre-normalization projection.
@@ -141,8 +174,11 @@ impl TextEmbedder {
   /// validates the I/O contract against the metadata at load.
   ///
   /// # Errors
-  /// As [`Self::from_files`] (with the bundled tokenizer bytes).
+  /// [`Error::TokenizerPlaceholder`] if the bundled `tokenizer.json` is still the
+  /// build-time placeholder (fails closed before any I/O); otherwise as
+  /// [`Self::from_files`] (with the bundled tokenizer bytes).
   pub fn load(model_path: impl AsRef<Path>, options: TextEmbedderOptions) -> Result<Self> {
+    ensure_not_placeholder(crate::embeddings::siglip::BUNDLED_TOKENIZER)?;
     let tokenizer = Tokenizer::from_bytes(crate::embeddings::siglip::BUNDLED_TOKENIZER)
       .map_err(Error::TokenizerLoad)?;
     Self::from_parts(model_path, tokenizer, options)
@@ -157,7 +193,10 @@ impl TextEmbedder {
     Self::load(model_path, TextEmbedderOptions::new())
   }
 
-  /// Loads the model and a `tokenizer.json` from separate file paths.
+  /// Loads the model and a `tokenizer.json` from separate file paths. The
+  /// caller-supplied file is deliberately NOT placeholder-checked — a
+  /// caller-chosen tokenizer is the caller's contract; the placeholder ships
+  /// only as the bundled bytes that [`Self::load`] / [`Self::from_memory`] guard.
   ///
   /// # Errors
   /// [`Error::Load`] if CoreML rejects the model / [`Error::ContractMismatch`]
@@ -177,12 +216,15 @@ impl TextEmbedder {
   /// Loads the model from a path and the tokenizer from caller-supplied bytes.
   ///
   /// # Errors
-  /// As [`Self::from_files`].
+  /// [`Error::TokenizerPlaceholder`] if `tokenizer_json_bytes` is the build-time
+  /// placeholder (e.g. the current [`crate::embeddings::siglip::BUNDLED_TOKENIZER`];
+  /// fails closed before any I/O); otherwise as [`Self::from_files`].
   pub fn from_memory(
     model_path: impl AsRef<Path>,
     tokenizer_json_bytes: &[u8],
     options: TextEmbedderOptions,
   ) -> Result<Self> {
+    ensure_not_placeholder(tokenizer_json_bytes)?;
     let tokenizer = Tokenizer::from_bytes(tokenizer_json_bytes).map_err(Error::TokenizerLoad)?;
     Self::from_parts(model_path, tokenizer, options)
   }
@@ -215,10 +257,10 @@ impl TextEmbedder {
     self.max_tokens
   }
 
-  /// The fixed `[T]` **padded** `input_ids` window for `text` (post-truncation,
-  /// then padded to `T` on the pinned side with the pad id) — the exact sequence
-  /// fed to the graph, and the one the Wave B token-identity gate compares
-  /// byte-for-byte against the committed goldens.
+  /// The fixed `[T]` **padded** `input_ids` window for `text` (lowercased, then
+  /// post-truncation, then padded to `T` on the pinned side with the pad id) —
+  /// the exact sequence fed to the graph, and the one the Wave B token-identity
+  /// gate compares byte-for-byte against the committed goldens.
   ///
   /// This deliberately differs from `granite::token_ids` (which returns the
   /// UNPADDED ids): SigLIP attends every position and pools the final one, so the
@@ -345,13 +387,29 @@ fn resolve_text_window(description: &ModelDescription) -> Result<usize> {
   Ok(t)
 }
 
-/// Overrides the loaded tokenizer's truncation and padding policy to this
-/// module's fixed-window contract: `LongestFirst` truncation at `max_tokens`,
+/// Overrides the loaded tokenizer's normalization, truncation, and padding
+/// policy to this module's fixed-window contract: a `Lowercase` normalizer
+/// composed ahead of the loaded one, `LongestFirst` truncation at `max_tokens`,
 /// stride 0, right direction (the export window is a hard model constraint), and
 /// the tokenizer's own padding DISABLED — the module builds its own padded
 /// window in [`build_window`] on the pinned side (D6), so an inherited padding
 /// policy must not leak into the ids.
 fn configure_tokenizer(tokenizer: &mut Tokenizer, max_tokens: usize) -> Result<()> {
+  // SigLIP2 lowercases text before tokenization (checkpoint tokenizer_config
+  // `do_lower_case: true`; transformers `Siglip2Tokenizer` composes
+  // `normalizers.Lowercase()` ahead of the loaded tokenizer.json normalizer).
+  // `Lowercase` here IS the same Rust implementation the Python reference calls.
+  // Unlike upstream's defensive `is not None` guard, the composition applies
+  // even when the loaded file carries no normalizer — the lowercase contract is
+  // the module's, not the file's. Special/added tokens are matched before
+  // normalization, so this cannot corrupt them.
+  let lowercased: NormalizerWrapper = match tokenizer.get_normalizer() {
+    Some(existing) => NormalizerSequence::new(vec![Lowercase.into(), existing.clone()]).into(),
+    None => Lowercase.into(),
+  };
+  tokenizer
+    .with_normalizer(Some(lowercased))
+    .map_err(Error::TokenizerConfig)?;
   tokenizer
     .with_truncation(Some(TruncationParams {
       max_length: max_tokens,

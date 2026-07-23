@@ -212,15 +212,140 @@ fn resize_preserves_vertical_constancy() {
   assert!((out[1] - out[3]).abs() <= 1e-6, "column 1 not constant");
 }
 
+// ── E3: uint8 PIL-parity resize kernel (fixed-point oracles) ──────────────────
+
+/// Identity dims return the input bytes exactly: each output is a single
+/// unit-weight tap, and the `1 << 21` offset truncates back to the input value.
+#[test]
+fn resize_u8_identity_is_exact() {
+  let src = [17u8, 200, 3, 250, 9, 128, 44, 71, 255]; // 3×3, 1 channel
+  let out = resize_bilinear_antialias_u8(&src, 3, 3, 1, 3, 3).expect("resize");
+  assert_eq!(out, src);
+}
+
+/// Any constant field stays exactly constant under up- and down-scale: the
+/// quantized weight sum is within `ksize/2` of `2²²`, so `c·δ < 2²¹` for every
+/// reachable `ksize` and the offset truncates back to `c`.
+#[test]
+fn resize_u8_constant_field_is_constant() {
+  let src = vec![123u8; 5 * 7 * 3]; // 5×7, 3 channels
+  let up = resize_bilinear_antialias_u8(&src, 5, 7, 3, 9, 4).expect("upscale");
+  assert!(
+    up.iter().all(|&v| v == 123),
+    "upscale drifted from constant"
+  );
+  let down = resize_bilinear_antialias_u8(&src, 5, 7, 3, 2, 2).expect("downscale");
+  assert!(
+    down.iter().all(|&v| v == 123),
+    "downscale drifted from constant"
+  );
+}
+
+/// A 2×2 checker `[[0,255],[255,0]]` upscaled to 4×4 matches the hand-derived
+/// Pillow 12.3.0 fixed-point grid EXACTLY (2→4 weights `[1]`, `[.75,.25]`,
+/// `[.25,.75]`, `[1]`; quantized `[4194304]`, `[3145728,1048576]`, …).
+#[test]
+fn resize_u8_matches_hand_computed_pil_grid_checker() {
+  let src = [0u8, 255, 255, 0];
+  let out = resize_bilinear_antialias_u8(&src, 2, 2, 1, 4, 4).expect("resize");
+  #[rustfmt::skip]
+  let expected: [u8; 16] = [
+      0,  64, 191, 255,
+     64,  96, 159, 191,
+    191, 159,  96,  64,
+    255, 191,  64,   0,
+  ];
+  assert_eq!(out, expected);
+}
+
+/// A 2×2 `[[0,1],[255,255]]` upscaled to 4×4 matches the hand-derived grid, with
+/// the discriminant cells `[1][2] = 65` and `[2][2] = 192`. A float pipeline
+/// rounded once at the end yields 64 and 191 there (`0.75·0.75 + 0.25·255 =
+/// 64.3125`; `0.25·0.75 + 0.75·255 = 191.4375`), so these cells pin the uint8
+/// per-pass (u8 intermediate) rounding as non-vacuous.
+#[test]
+fn resize_u8_per_pass_rounding_discriminates_from_float() {
+  let src = [0u8, 1, 255, 255];
+  let out = resize_bilinear_antialias_u8(&src, 2, 2, 1, 4, 4).expect("resize");
+  #[rustfmt::skip]
+  let expected: [u8; 16] = [
+      0,   0,   1,   1,
+     64,  64,  65,  65,
+    191, 191, 192, 192,
+    255, 255, 255, 255,
+  ];
+  assert_eq!(out, expected);
+  // Cells [1][2] and [2][2] (indices 6 and 10) are the float-vs-uint8 tell.
+  assert_eq!((out[6], out[10]), (65, 192));
+}
+
+/// Pathologically large source dims return a typed
+/// [`Error::PreprocessAllocation`] from the `checked_mul` sizing arm — no panic,
+/// no abort. (The `try_reserve` arm is not portably forcible.)
+#[test]
+fn resize_u8_rejects_overflowing_geometry() {
+  match resize_bilinear_antialias_u8(&[0u8; 12], usize::MAX / 2, 2, 3, 2, 2) {
+    Err(Error::PreprocessAllocation { bytes }) => assert_eq!(bytes, usize::MAX),
+    other => panic!("expected PreprocessAllocation, got {other:?}"),
+  }
+}
+
+/// `preprocess_image` routes pixels through the uint8 kernel + [`normalize_u8`],
+/// NOT the float path. Budget 1 makes the whole image a single 16×16 patch, so
+/// the real patch row equals `normalize_u8` of the u8-resized bytes exactly; and
+/// the u8 resize provably differs from a float-then-round resize for this source
+/// (the per-pass rounding), so the routing is observable, not vacuous.
+#[test]
+fn preprocess_image_pixel_values_come_from_u8_resize() {
+  // src pattern [[0,1],[255,255]] replicated on all 3 channels — this diverges
+  // from a float resize under 2→16 (the per-pass u8 rounding).
+  let pattern = [0u8, 1, 255, 255];
+  let mut rgb = vec![0u8; 2 * 2 * CHANNELS];
+  for (px, &v) in pattern.iter().enumerate() {
+    for c in 0..CHANNELS {
+      rgb[px * CHANNELS + c] = v;
+    }
+  }
+  let base = vec![0.0f32; POS_EMBED_ELEMS];
+  let out = preprocess_image(&rgb, 2, 2, &base, 1).expect("preprocess");
+  assert_eq!(out.grid, (1, 1), "budget 1 → single-patch grid");
+
+  // The single real patch is normalize_u8 of the u8-resized image, exactly.
+  let resized_u8 = resize_bilinear_antialias_u8(&rgb, 2, 2, CHANNELS, 16, 16).expect("resize");
+  assert_eq!(resized_u8.len(), 16 * 16 * CHANNELS);
+  for (k, &v) in resized_u8.iter().enumerate() {
+    assert_eq!(
+      out.pixel_values[k],
+      normalize_u8(v),
+      "pixel_values[{k}] must be normalize_u8 of the u8-resized byte"
+    );
+  }
+
+  // Non-vacuity: a float resize rounded to u8 diverges from the per-pass u8
+  // kernel for this source, so preprocess_image is provably off the old float
+  // path.
+  let rgb_f32: Vec<f32> = rgb.iter().map(|&b| f32::from(b)).collect();
+  let float_resized = resize_bilinear_antialias(&rgb_f32, 2, 2, CHANNELS, 16, 16);
+  let float_u8: Vec<u8> = float_resized
+    .iter()
+    .map(|&v| v.round().clamp(0.0, 255.0) as u8)
+    .collect();
+  assert!(
+    resized_u8.iter().zip(&float_u8).any(|(&u, &f)| u != f),
+    "uint8 per-pass resize must differ from a float-then-round resize here"
+  );
+}
+
 // ── A7: normalize + patchify + mask ──────────────────────────────────────────
 
-/// The rescale+normalize maps the pixel range `[0, 255]` onto `[-1, 1]` at the
-/// pinned constants `((x/255) − 0.5)/0.5`.
+/// The rescale+normalize maps the u8 range `[0, 255]` onto `[-1, 1]` at the
+/// pinned constants `((v/255) − 0.5)/0.5`: the endpoints are exact and the
+/// midpoint is near zero.
 #[test]
-fn normalize_pixel_maps_range_to_unit_interval() {
-  assert!((normalize_pixel(0.0) - (-1.0)).abs() <= 1e-6);
-  assert!((normalize_pixel(255.0) - 1.0).abs() <= 1e-6);
-  assert!(normalize_pixel(127.5).abs() <= 1e-6);
+fn normalize_u8_maps_range_to_unit_interval() {
+  assert_eq!(normalize_u8(0), -1.0);
+  assert_eq!(normalize_u8(255), 1.0);
+  assert!(normalize_u8(128).abs() < 0.01);
 }
 
 /// Patchify places each pixel at the exact `(patch_row, patch_col)` × `(py, px,

@@ -100,6 +100,12 @@ fn patch_count_display_shows_both() {
 }
 
 #[test]
+fn tokenizer_placeholder_display_names_the_placeholder() {
+  let msg = Error::TokenizerPlaceholder.to_string();
+  assert!(msg.contains("placeholder"), "{msg}");
+}
+
+#[test]
 fn token_variants_carry_values() {
   assert!(
     Error::TokenCount { got: 70, max: 64 }

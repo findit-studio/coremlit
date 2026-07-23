@@ -111,6 +111,17 @@ pub enum Error {
     max: usize,
   },
 
+  /// Preprocessing could not allocate a resize working buffer of `bytes` bytes
+  /// (a pathologically large source geometry, or memory exhaustion). Returned
+  /// instead of aborting the process on allocator failure. `bytes` is
+  /// [`usize::MAX`] when the buffer's element count overflowed `usize` (a
+  /// geometry that could never be allocated).
+  #[error("image preprocessing failed to allocate a {bytes}-byte resize buffer")]
+  PreprocessAllocation {
+    /// The size of the refused allocation, or [`usize::MAX`] on size overflow.
+    bytes: usize,
+  },
+
   /// The caller passed an empty text string; there is nothing to embed.
   #[error("text input is empty")]
   EmptyText,
@@ -147,6 +158,15 @@ pub enum Error {
   /// The tokenizer failed to load from its JSON definition.
   #[error("failed to load tokenizer: {0}")]
   TokenizerLoad(#[source] tokenizers::Error),
+
+  /// The bundled `tokenizer.json` is still the build-time placeholder (its
+  /// vocab carries the `PLACEHOLDER_…_IN_WAVE_B` sentinel), which maps every
+  /// ordinary word to `<pad>` — embedding with it would silently produce
+  /// meaningless vectors. Stage the source-revision Gemma tokenizer bytes (the
+  /// golden-generation step of the port plan), or supply a real tokenizer via
+  /// [`crate::embeddings::siglip::TextEmbedder::from_files`].
+  #[error("bundled tokenizer is the build-time placeholder; stage the real Gemma tokenizer.json")]
+  TokenizerPlaceholder,
 
   /// Configuring the tokenizer (truncation) failed.
   #[error("failed to configure tokenizer: {0}")]

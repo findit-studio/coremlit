@@ -36,5 +36,11 @@ fn full_tensor_parity_against_staged_npy() {
   let _dir = common::models_dir();
   // Wave C: for each corpus image, decode PNG (common::decode_png_rgb8), run the
   //         ImageEmbedder preprocessing, compare pixel_values/mask/pos-emb to the
-  //         staged `.npy`; exact mask equality; pad rows bitwise zero.
+  //         staged `.npy`. Exact mask equality; pixel_values exact against the
+  //         slow-processor (use_fast=False, pillow 12.3.0) fixture on the u8
+  //         resize. For position_embeddings, compare the lifted REAL rows
+  //         (`.. h_p·w_p`) to the fixture but assert the pad rows bitwise zero
+  //         against the coremlit contract — the reference fills them with
+  //         resized[0] (masked, output-invariant), so canonicalize/exclude the
+  //         pad rows rather than comparing them to the raw dump.
 }

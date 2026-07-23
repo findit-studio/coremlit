@@ -32,9 +32,11 @@
 //!
 //! The SigLIP text graph takes **only** `input_ids` (`[1, T]`) — no attention
 //! mask (canonical SigLIP attends every position) — and pools the final
-//! position. The module builds a fixed `[1, T]` padded window whose pad id and
-//! side are semantically load-bearing and are pinned by the committed goldens.
-//! `T` is resolved from the loaded model at load ([`TextEmbedder::max_tokens`]).
+//! position. Text is lowercased before tokenization (SigLIP2 convention;
+//! checkpoint `do_lower_case: true`; mirrors transformers `Siglip2Tokenizer`).
+//! The module builds a fixed `[1, T]` padded window whose pad id and side are
+//! semantically load-bearing and are pinned by the committed goldens. `T` is
+//! resolved from the loaded model at load ([`TextEmbedder::max_tokens`]).
 //!
 //! # Model artifacts
 //!
@@ -107,7 +109,10 @@ pub use text::{DEFAULT_TEXT_COMPUTE, TextEmbedder, TextEmbedderOptions};
 /// NOTE: the committed `assets/tokenizer.json` is a small **placeholder** until
 /// the owner stages the source-revision Gemma bytes (the golden-generation step
 /// of the port plan); the SHA / identity pin in `tests/siglip/tokenizer_identity.rs`
-/// is what forces the real artifact in.
+/// is what forces the real artifact in, and [`TextEmbedder::load`] /
+/// [`TextEmbedder::from_memory`] fail closed on it
+/// ([`Error::TokenizerPlaceholder`]) so it can never silently produce
+/// meaningless embeddings.
 pub const BUNDLED_TOKENIZER: &[u8] = include_bytes!("assets/tokenizer.json");
 
 /// A candidate paired with its precomputed [`Embedding`] — the input unit to
