@@ -17,8 +17,10 @@
 use crate::ComputeUnits;
 
 pub mod error;
+pub mod window;
 
 pub use error::Error;
+pub use window::{Span, TailPolicy, WindowPlan};
 
 #[cfg(test)]
 mod tests;
