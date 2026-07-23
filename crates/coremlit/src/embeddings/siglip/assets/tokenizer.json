@@ -1,0 +1,18 @@
+{
+  "version": "1.0",
+  "truncation": null,
+  "padding": null,
+  "added_tokens": [],
+  "normalizer": null,
+  "pre_tokenizer": { "type": "Whitespace" },
+  "post_processor": null,
+  "decoder": null,
+  "model": {
+    "type": "WordLevel",
+    "vocab": {
+      "<pad>": 0,
+      "PLACEHOLDER_REPLACE_WITH_SOURCE_REVISION_GEMMA_TOKENIZER_IN_WAVE_B": 1
+    },
+    "unk_token": "<pad>"
+  }
+}

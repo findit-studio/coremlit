@@ -12,6 +12,7 @@ Initial release: a safe, synchronous CoreML runtime layer.
 - `Features`: insertion-ordered named I/O bridging `MLFeatureProvider` in both directions (output extraction de-aliases buffers shared with inputs or other outputs).
 - Threading: `Model`, `MultiArray`, and `State` are `Send` but deliberately **not** `Sync` — move them between threads or hold one per worker; concurrent shared access is outside the contract.
 - `ComputeUnits`/`DataType` vocabularies; structured `thiserror` errors capturing `NSError` domain/code/message.
+- `embeddings::siglip` (feature `siglip`): SigLIP 2 (`siglip2-base-patch16-naflex`) image+text embeddings into a shared 768-dim joint space — NaFlex host-side preprocessing (aspect-preserving patch-budget solver, antialiased-bilinear resize, position-embedding lift; no image-decoder dep), a single-input 64-token text tower, and cross-modal `rank`, L2-normalized in Rust; committed transformers-fp32 goldens (no `ort`). Hermetic preprocessing + embedding core landed; model-gated parity gates await the staged conversion.
 
 ## whisperkit 0.1.0 (unreleased)
 

@@ -20,7 +20,7 @@
 | [`audio::align`](crates/coremlit/src/audio/align) | `align` (`align-oracle`) | CoreML wav2vec2 forced word-level alignment: audio + a known transcript → per-word time spans with confidence, over `asry`'s parity-tested alignment seam. |
 | [`audio::speaker`](crates/coremlit/src/audio/speaker) | `speaker` (`speaker-oracle`) | CoreML segmentation + embedding backends for `dia`'s diarization: runs pyannote's `segmentation-3.0` and WeSpeaker on the ANE and produces the `dia`-shaped tensors (`Extraction`) that feed [`dia`](https://github.com/findit-studio/diarization)'s VBx/PLDA clustering. Multi-source (FluidAudio default + Argmax). Never assigns a speaker label — clustering stays in `dia`. |
 | [`audio::vad`](crates/coremlit/src/audio/vad) | `vad` (`vad-bundled`) | Silero VAD on CoreML: runs the FluidInference unified 256 ms model and implements the published [`silero`](https://github.com/Findit-AI/silero) crate's `VadBackend` seam, re-exporting its detector so a consumer gets the full offline + streaming API with **zero** detection logic duplicated; `ort`/ONNX never enters the runtime graph. |
-| `embeddings` | (reserved) | Reserved namespace for embedding producers (CLAP, sentence embeddings) — documented, filled by later waves. `video` is likewise reserved and **not** created until a video kit exists. |
+| [`embeddings`](crates/coremlit/src/embeddings) | `clap` / `granite` / `siglip` | Embedding producers, each a feature-gated CoreML pipeline projecting into a shared joint space, L2-normalized in Rust: CLAP-HTSAT audio+text (`clap`), granite sentence embeddings (`granite`), and SigLIP 2 (`siglip2-base-patch16-naflex`) image+text (`siglip`, NaFlex — no windowing). Parity against committed transformers-fp32 goldens, no `ort`. `video` is likewise reserved and **not** created until a video kit exists. |
 
 ## Layering map
 
@@ -149,6 +149,7 @@ Flat and additive; `default = []`.
 | `align` / `align-oracle` | forced alignment / + the asry ONNX word-timing parity oracle (DEV/TEST) |
 | `speaker` / `speaker-oracle` | diarization backends + dia offline bridge / + dia's ort DER oracle (DEV/TEST) |
 | `vad` / `vad-bundled` | Silero VAD model layer / + silero's ONNX cross-backend oracle (DEV/TEST) |
+| `clap` / `granite` / `siglip` | embedding producers: CLAP audio+text / granite sentence / SigLIP 2 image+text — each committed-golden parity, no `ort` (`clap-oracle` adds the textclap ort oracle) |
 | `serde` | `Serialize`/`Deserialize` on options/results/provenance (+ the whisper JSON writer) |
 | `tracing` | internal log events additionally emitted as `tracing` events |
 
