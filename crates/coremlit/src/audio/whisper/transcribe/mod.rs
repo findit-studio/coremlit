@@ -261,6 +261,21 @@ impl<'ctx, B> TranscribeTask<'ctx, B> {
   }
 }
 
+/// The `lastSpeechTimestamp` seed [`TranscribeTask::run`] feeds
+/// [`crate::audio::whisper::segment::add_word_timestamps`] for a window: the
+/// previous seek offset in samples, converted to seconds. Ports
+/// `TranscribeTask.swift:209`'s `Float(Double(previousSeek) /
+/// Double(WhisperKit.sampleRate))` — the divide happens in f64 and is
+/// narrowed to f32 exactly once, so a `previous_seek` at or above 2^24
+/// samples (~1048.6 s) is NOT pre-rounded to f32 the way a bare
+/// `previous_seek as f32 / SAMPLE_RATE as f32` rounds its numerator (`usize
+/// as f64` is exact below 2^53, matching Swift's `Double(Int)`;
+/// `f64::from(SAMPLE_RATE)` is exact). Pinned at the first divergent seed by
+/// `last_speech_timestamp_seed_divides_in_f64_above_two_pow_24`.
+pub(crate) fn last_speech_timestamp_seed(previous_seek: usize) -> f32 {
+  (previous_seek as f64 / f64::from(SAMPLE_RATE)) as f32
+}
+
 impl<B> TranscribeTask<'_, B>
 where
   B: InferenceBackend,
@@ -541,7 +556,7 @@ where
             previous_seek,
             PREPEND_PUNCTUATION,
             APPEND_PUNCTUATION,
-            previous_seek as f32 / SAMPLE_RATE as f32, // :209
+            last_speech_timestamp_seed(previous_seek), // :209
           )?;
           timings.set_decoding_word_timestamps(
             timings.decoding_word_timestamps() + word_timestamps_start.elapsed().as_secs_f64(),
@@ -847,12 +862,16 @@ where
   /// per-attempt `decodingResult.cache?.alignmentWeights` capture). A later
   /// attempt's snapshot always overwrites an earlier one, so by the time
   /// this function returns, the snapshot belongs to the accepted (last-run)
-  /// attempt — it cannot instead be taken once, after the loop, because
-  /// [`InferenceBackend::reset_decoder_state`] zeroes the live accumulator
-  /// [`InferenceBackend::alignment_weights`] borrows from in place on every
-  /// fallback and again before the caller's next window (see
-  /// [`AlignmentMatrix`]'s own doc). `None` when `options.word_timestamps()`
-  /// is `false` or the backend has no alignment data for this window.
+  /// attempt — it cannot instead be taken once, after the loop, because a
+  /// later attempt's (or the next window's)
+  /// [`InferenceBackend::commit_alignment_row`] overwrites rows of the live
+  /// accumulator [`InferenceBackend::alignment_weights`] borrows from IN
+  /// PLACE ([`InferenceBackend::reset_decoder_state`] deliberately leaves the
+  /// buffer's contents, mirroring Swift's once-allocated tensor — see
+  /// [`AlignmentMatrix`]'s own doc), so a borrowed view would not survive
+  /// those overwrites. `None` when `options.word_timestamps()` is `false`,
+  /// or the accepted attempt committed no alignment row this window (the
+  /// `hasAlignment` gate; e.g. a model without the word-timestamp head).
   ///
   /// **Rust-only addition, no Swift equivalent:** each attempt's sampler is
   /// seeded from `options.seed()` when set, via
@@ -1083,11 +1102,12 @@ where
         );
       let result = outcome?;
 
-      // TranscribeTask.swift:198 — snapshot THIS attempt's alignment
-      // weights now, before the fallback branch below can reset (and
-      // thereby zero) the live accumulator they borrow from; see this
-      // function's own doc for why the snapshot can't just be read once
-      // after the loop instead.
+      // TranscribeTask.swift:198 — snapshot THIS attempt's alignment weights
+      // now: the fallback branch below re-runs `decode_text`, whose commits
+      // overwrite the live accumulator's rows in place (reset no longer
+      // clears it — Swift's once-allocated tensor), so the borrowed view
+      // would not survive the next attempt; see this function's own doc for
+      // why the snapshot can't just be read once after the loop instead.
       if options.word_timestamps() {
         captured_alignment = self
           .backend

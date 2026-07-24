@@ -254,9 +254,16 @@ impl ModelDims {
 // ---------------------------------------------------------------------
 
 /// Borrowed, read-only view over a flat `rows * cols` cross-attention
-/// alignment-weight buffer — one row per decoded token, one column per
-/// encoder audio-context step (spec §5.4's `AlignmentView<'_>`; mirrors
-/// Swift's raw `alignmentWeights` `MLMultiArray` without copying it).
+/// alignment-weight buffer, one column per encoder audio-context step
+/// (spec §5.4's `AlignmentView<'_>`; mirrors Swift's raw `alignmentWeights`
+/// `MLMultiArray` without copying it). When a backend produces it the row
+/// count is FIXED at that backend's once-allocated size, not a high-water
+/// mark: row `i` holds the weights the last
+/// [`InferenceBackend::commit_alignment_row`] wrote for context token `i` —
+/// committed by THIS window, left stale by an earlier one, or the
+/// construction-time zero if no window ever committed it, exactly like
+/// Swift's once-allocated tensor (`TextDecoder.swift:141`) which
+/// `DecodingInputs.reset` never clears (`Models.swift:312-322`).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct AlignmentView<'a> {
   data: &'a [f32],
@@ -314,13 +321,19 @@ impl<'a> AlignmentView<'a> {
 /// Owned `rows * cols` cross-attention alignment-weight buffer — the port
 /// of Swift's per-attempt `decodingResult.cache?.alignmentWeights`
 /// snapshot (`TranscribeTask.swift:198`). A fallback ladder tries several
-/// decode attempts per window, and [`InferenceBackend::reset_decoder_state`]
-/// zeroes the live accumulator between attempts and windows (Task 9's
-/// `CoreMlDecoderState::alignment`/`MockDecoderState::alignment`, both
-/// filled with `0.0` on reset); an [`AlignmentView`] borrowed from that
-/// live state would not survive past the next reset, so the accepted
-/// attempt's weights must be copied out into owned data before then. See
-/// [`AlignmentView::to_matrix`] for the copy-out.
+/// decode attempts per window, and every later attempt's (or the next
+/// window's) [`InferenceBackend::commit_alignment_row`] overwrites rows of
+/// the shared live accumulator IN PLACE —
+/// [`InferenceBackend::reset_decoder_state`] deliberately leaves the
+/// buffer's contents, mirroring Swift's once-allocated tensor
+/// (`TextDecoder.swift:141`) that `DecodingInputs.reset` never clears
+/// (`Models.swift:312-322`) — so an [`AlignmentView`] borrowed from that
+/// live state would not survive those overwrites, and the accepted
+/// attempt's weights must be copied out into owned data before then.
+/// Swift's by-reference `DecodingCache` is temporally safe only because
+/// `addWordTimestamps` runs before the next decode; this owned snapshot is
+/// the sync-Rust equivalent. See [`AlignmentView::to_matrix`] for the
+/// copy-out.
 #[derive(Debug, Clone, PartialEq)]
 pub struct AlignmentMatrix {
   data: Vec<f32>,
@@ -364,7 +377,12 @@ impl AlignmentMatrix {
 
 impl AlignmentView<'_> {
   /// Copies this view's data out into an owned [`AlignmentMatrix`] (see
-  /// its doc for why word-timestamp code needs the copy).
+  /// its doc for why word-timestamp code needs the copy). The copy is the
+  /// full fixed-size accumulator (`(max_token_context + 1) * n_audio_ctx`
+  /// f32), not a written prefix — negligible against a window's decode
+  /// cost, and a rows-cap "optimization" here would reintroduce the
+  /// truncated-view divergence this fixed-size contract exists to prevent
+  /// (whisper #41).
   pub fn to_matrix(&self) -> AlignmentMatrix {
     AlignmentMatrix::new(self.data.to_vec(), self.rows, self.cols)
   }
@@ -460,7 +478,12 @@ pub trait InferenceBackend {
 
   /// One autoregressive step: consume `token` at `position`, write the full
   /// vocab logits (converted to f32 once) into the reused `logits` buffer,
-  /// and advance the KV cache/masks/alignment inside `state`.
+  /// advance the KV cache/masks inside `state`, and STAGE this step's
+  /// alignment row (row `position + 1`) — the row lands in the persistent
+  /// accumulator only if the decode loop then calls
+  /// [`Self::commit_alignment_row`], never from within this step (Swift
+  /// updates alignment weights only on non-completing steps,
+  /// `TextDecoder.swift:673-717`).
   ///
   /// `position` is 0-based and must be in `0..dims().max_token_context()`:
   /// it is the KV-cache slot this step fills (the caches are
@@ -480,9 +503,29 @@ pub trait InferenceBackend {
     logits: &mut Vec<f32>,
   ) -> Result<(), BackendError>;
 
-  /// Accumulated per-token alignment weights, when the model has the
-  /// word-timestamp head (rows = the high-water row index — `position +
-  /// 2` across steps that produced a row; cols = audio ctx).
+  /// Commits the alignment row staged by the immediately preceding
+  /// [`Self::decode_step`] into the persistent accumulator, at row
+  /// `position + 1`. Ports the placement of `updateAlignmentWeights`
+  /// (`TextDecoder.swift:709-717`): the decode loop calls this only after a
+  /// step's completion check fails, so a completing step's staged row is
+  /// never committed — its slot instead retains the previous window's value
+  /// (or the initial zero), exactly like Swift's once-allocated tensor
+  /// (`TextDecoder.swift:141`, `Models.swift:312-322`). No-op when the
+  /// preceding step staged nothing (model without the alignment head, or a
+  /// step whose outputs lacked the feature).
+  fn commit_alignment_row(&self, state: &mut Self::DecoderState);
+
+  /// Accumulated per-token alignment weights: the FULL fixed-size
+  /// accumulator (`max_token_context + 1` rows, one column per audio-ctx
+  /// step), mirroring Swift's once-allocated `[kvCacheMaxSequenceLength,
+  /// n_audio_ctx]` tensor. Rows the current window did not commit read back
+  /// as an earlier window's bytes or the construction-time zero, exactly
+  /// like Swift's tensor across `DecodingInputs.reset` (`Models.swift:312-322`).
+  /// `None` unless the current window has committed at least one row via
+  /// [`Self::commit_alignment_row`] — the port of Swift's `hasAlignment`
+  /// nil-cache gate (`TextDecoder.swift:568,711,764-771`): a window whose
+  /// steps produced no alignment slice yields no view, so the caller's whole
+  /// word-timestamp block is skipped (`TranscribeTask.swift:197-199`).
   fn alignment_weights<'state>(
     &self,
     state: &'state Self::DecoderState,

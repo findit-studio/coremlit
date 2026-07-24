@@ -77,6 +77,48 @@ fn drop_blank_audio_defaults_on_and_opts_out_to_swift_parity() {
   assert!(!m.drop_blank_audio());
 }
 
+#[test]
+fn swift_parity_option_deviations_are_exactly_two() {
+  // Executable form of the DecodingOptions doc contract (`options/mod.rs`):
+  // `new()` diverges from Swift's `Configurations.swift` defaults in EXACTLY
+  // two knobs, each with an exact-parity escape hatch; every other ported
+  // default equals Swift's. (whisper #41 §3 P2 — the token-leak refutation's
+  // parity-recipe lock. The behavioral consequences are already pinned by
+  // `word_timestamps_drop_cleared_reproduces_swifts_duplicate_ids` and
+  // `word_grouping_splits_chinese_and_only_chinese`; this locks the recipe.)
+  let o = DecodingOptions::new();
+
+  // Deviation 1 — `drop_blank_audio` defaults `true` (Swift emits
+  // `[BLANK_AUDIO]`); `maybe_drop_blank_audio(false)` is the exact-parity
+  // escape hatch.
+  assert!(o.drop_blank_audio());
+  assert!(
+    !DecodingOptions::new()
+      .maybe_drop_blank_audio(false)
+      .drop_blank_audio()
+  );
+  // Deviation 2 — `word_grouping` defaults `FineGrained` (Swift's coarse CJK
+  // grouping is the opt-in); `with_word_grouping(SwiftParity)` is the hatch.
+  assert_eq!(o.word_grouping(), WordGrouping::FineGrained);
+  assert!(
+    DecodingOptions::new()
+      .with_word_grouping(WordGrouping::SwiftParity)
+      .word_grouping()
+      .is_swift_parity()
+  );
+
+  // The parity-relevant Swift-equal defaults the refutation rests on: the
+  // issue's coremlit sample is the `skip_special_tokens == false` rendering,
+  // and neither word timestamps nor a non-greedy/short decode is on by default.
+  assert!(
+    !o.skip_special_tokens(),
+    "Swift default: special tokens rendered"
+  );
+  assert!(!o.word_timestamps());
+  assert_eq!(o.sample_length(), 224);
+  assert_eq!(o.temperature(), 0.0);
+}
+
 #[cfg(feature = "serde")]
 #[test]
 fn drop_blank_audio_serde_default_is_true_not_bool_default() {

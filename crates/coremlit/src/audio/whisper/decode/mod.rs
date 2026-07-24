@@ -276,11 +276,16 @@ pub(crate) fn create_logits_filters(
 /// model's new key/value slices into `decoderInputs`' persistent KV
 /// tensors and advances two mask arrays (`TextDecoder.swift:688-721`).
 /// This port's [`InferenceBackend::decode_step`] contract already folds
-/// that advance into the backend call itself (see its own doc comment) —
-/// there is no separate "commit this step's KV" call for this loop to
-/// make, so `TranscriptionTimings::decoding_kv_caching` stays `0.0` (see
-/// this module's doc for the full list of timing fields this port does
-/// and doesn't populate).
+/// that KV/mask advance into the backend call itself (see its own doc
+/// comment) — there is no separate "commit this step's KV" call for this
+/// loop to make, so `TranscriptionTimings::decoding_kv_caching` stays `0.0`
+/// (see this module's doc for the full list of timing fields this port does
+/// and doesn't populate). The alignment weights are the one exception: they
+/// are observed after the loop with no intervening prediction, so a
+/// completing step's row must NOT land (whisper #41); `decode_step` only
+/// STAGES the row and this loop commits it via
+/// [`InferenceBackend::commit_alignment_row`] on the non-completing path
+/// (Swift's `:709-717` slot), matching Swift's conditional update.
 ///
 /// `observed_language_token` is an out-parameter for the genuine language
 /// OBSERVATION, captured at token-RECOGNITION time (the first `<|lang|>` token
@@ -436,8 +441,14 @@ where
       current_tokens.push(next_token); // :682-686
       log_probs.push(next_token_log_prob);
     }
-    // KV/mask/alignment advance already happened inside `decode_step` —
-    // see this function's doc comment.
+    // :709-717 — commit the step's staged alignment row. Reached only when
+    // the `is_segment_completed` break above did NOT fire (Swift's `else`
+    // branch), for prefill steps too (Swift's update block sits outside the
+    // `!isPrefill` append gate); the early-stop break below comes AFTER this,
+    // so an early-stopped final step's row is committed exactly as Swift's
+    // is. The KV/mask advance still happened inside `decode_step` (see this
+    // function's doc); only the alignment write is split out here.
+    backend.commit_alignment_row(state);
 
     if let Some(callback) = callback {
       // :723-741 — dispatched inline; see `TranscriptionProgressCallback`'s
