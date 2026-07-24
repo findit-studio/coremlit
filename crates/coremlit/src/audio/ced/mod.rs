@@ -64,7 +64,7 @@ pub use prediction::{Confidences, EventPrediction, RatedSoundEvent, WindowConfid
 pub use window::{Span, TailPolicy, WindowPlan};
 
 use crate::audio::ced::{
-  error::Result,
+  error::{Result, WinditError},
   mel::{MelExtractor, N_FRAMES, N_MELS},
 };
 
@@ -333,7 +333,10 @@ impl Classifier {
   /// share one classifier on one thread.
   ///
   /// # Errors
-  /// [`Error::EmptyAudio`] if `samples_16k` is empty; otherwise any per-window
+  /// [`Error::EmptyAudio`] if `samples_16k` is empty; [`Error::Windowing`] if
+  /// the plan exceeds [`WindowPlan::max_windows`]
+  /// ([`WinditError::TooManyWindows`]) or the span/result buffer cannot be
+  /// allocated ([`WinditError::AllocFailed`]); otherwise any per-window
   /// [`Self::raw_scores`] error (a [`Error::NonFiniteInput`] index is relative
   /// to the offending window's start).
   pub fn classify_windows(
@@ -344,8 +347,16 @@ impl Classifier {
     if samples_16k.is_empty() {
       return Err(Error::EmptyAudio);
     }
-    let spans = plan.spans(samples_16k.len());
-    let mut out = Vec::with_capacity(spans.len());
+    let spans = plan.spans(samples_16k.len())?;
+    // Fallible reservation: the cap already bounds `spans.len()`, but the result
+    // vector is still caller-geometry-sized, so reserve it checked rather than
+    // risk an infallible `with_capacity` abort under memory pressure.
+    let mut out = Vec::new();
+    out.try_reserve_exact(spans.len()).map_err(|_| {
+      Error::Windowing(WinditError::AllocFailed {
+        elements: spans.len(),
+      })
+    })?;
     for span in spans {
       let logits = self.raw_scores(&samples_16k[span.start()..span.end()])?;
       out.push(WindowConfidences::new(
@@ -356,15 +367,25 @@ impl Classifier {
     Ok(out)
   }
 
-  /// The composed long-clip convenience: [`Self::classify_windows`] →
-  /// [`aggregate_windows`] (`aggregation`, in confidence space) →
-  /// [`Confidences::top_k`]`(k)`. `k == 0` returns an empty vec without
-  /// running the model.
+  /// The composed long-clip convenience: scores each planned window and folds
+  /// the per-window confidences (`aggregation`, in confidence space) into one
+  /// clip-level [`Confidences`], then returns its [`Confidences::top_k`]`(k)`.
+  ///
+  /// The fold streams through a shared O([`NUM_CLASSES`]) accumulator — the
+  /// per-window vectors are never all held at once, so a long clip that plans
+  /// many windows does not retain one 527-float vector per window; use
+  /// [`Self::classify_windows`] when per-window access is wanted. `k == 0`
+  /// returns an empty vec without running the model OR any windowing, so the
+  /// [`WindowPlan::max_windows`] cap does not apply to it (it does the same
+  /// finite-sample check the model path would).
   ///
   /// # Errors
-  /// As [`Self::classify_windows`] and [`aggregate_windows`]
-  /// ([`Error::EmptyWindows`] is unreachable here — a nonempty clip always
-  /// plans at least one span).
+  /// [`Error::EmptyAudio`] if `samples_16k` is empty; [`Error::Windowing`] if
+  /// the plan exceeds [`WindowPlan::max_windows`]
+  /// ([`WinditError::TooManyWindows`]) or a buffer cannot be allocated
+  /// ([`WinditError::AllocFailed`]); otherwise any per-window
+  /// [`Self::raw_scores`] error. ([`Error::EmptyWindows`] is unreachable — a
+  /// nonempty clip always plans at least one span.)
   pub fn classify_long(
     &self,
     samples_16k: &[f32],
@@ -372,15 +393,22 @@ impl Classifier {
     plan: &WindowPlan,
     aggregation: ChunkAggregation,
   ) -> Result<Vec<EventPrediction>> {
+    if samples_16k.is_empty() {
+      return Err(Error::EmptyAudio);
+    }
     if k == 0 {
-      if samples_16k.is_empty() {
-        return Err(Error::EmptyAudio);
-      }
+      // k == 0 skips ALL windowing (and thus the cap), matching the pre-stream
+      // behavior; it still rejects a NaN/±∞ clip rather than wave it through.
       check_finite_samples(samples_16k)?;
       return Ok(Vec::new());
     }
-    let windows = self.classify_windows(samples_16k, plan)?;
-    let confidences = aggregate_windows(aggregation, &windows)?;
+    let spans = plan.spans(samples_16k.len())?;
+    let mut acc = aggregate::Accumulator::new(aggregation);
+    for span in spans {
+      let logits = self.raw_scores(&samples_16k[span.start()..span.end()])?;
+      acc.push(&Confidences::from_logits(&logits));
+    }
+    let confidences = acc.finish()?;
     confidences.top_k(k)
   }
 

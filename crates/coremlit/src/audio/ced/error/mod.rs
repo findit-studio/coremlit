@@ -91,12 +91,16 @@ pub enum Error {
   #[error("no windows to aggregate")]
   EmptyWindows,
 
-  /// A windowed-sequence operation failed inside the windit engine. Carries
-  /// windit's own typed error unchanged ([`WinditError`] is
-  /// `#[non_exhaustive]`, so match it with a wildcard arm). Not constructed by
-  /// any Wave-A path (`WindowPlan::spans` is infallible by construction and
-  /// windit's aggregation engine is deliberately unused) — the taxonomy's
-  /// forward seam, spec §4.
+  /// A windowed-sequence operation failed. Carries windit's own typed error
+  /// unchanged ([`WinditError`] is `#[non_exhaustive]`, so match it with a
+  /// wildcard arm). Constructed by the `WindowPlan::spans` resource rail:
+  /// (a) [`WinditError::TooManyWindows`] manufactured by the O(1) cap pre-check
+  /// when the planned window count exceeds `max_windows`, whose `got` is the
+  /// FULL planned count — deviating from windit's own abort-at-`max + 1`
+  /// convention, matching granite's post-windit raise; (b)
+  /// [`WinditError::AllocFailed`] propagated from windit's planner (including its
+  /// defense-in-depth cap); (c) [`WinditError::AllocFailed`] manufactured when a
+  /// span or per-window result buffer's `try_reserve_exact` is refused.
   #[error("windowed-sequence processing failed: {0}")]
   Windowing(#[from] WinditError),
 

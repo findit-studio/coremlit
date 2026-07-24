@@ -93,6 +93,41 @@ fn aggregation_runs_in_confidence_space_not_logit_space() {
   );
 }
 
+#[test]
+fn accumulator_finish_without_pushes_is_empty_windows() {
+  // The streaming fold's empty case matches `aggregate_windows(&[])`: a typed
+  // EmptyWindows, never a panic on the empty `values`.
+  for aggregation in [ChunkAggregation::Mean, ChunkAggregation::Max] {
+    let err = Accumulator::new(aggregation).finish().unwrap_err();
+    assert!(
+      matches!(err, crate::audio::ced::Error::EmptyWindows),
+      "{aggregation:?}: got {err:?}"
+    );
+  }
+}
+
+#[test]
+fn accumulator_matches_aggregate_windows_bit_exactly() {
+  // The streaming fold (what `classify_long` drives via push/finish) must equal
+  // the batch `aggregate_windows` BIT for bit — the accumulator refactor is
+  // pure single-sourcing, not a numeric change. Multi-window so Mean's divide
+  // and Max's peak both engage.
+  let windows = [
+    window(0, 0.2, 0.9),
+    window(1, 0.6, 0.1),
+    window(2, 0.123_456_7, 0.000_001),
+  ];
+  for aggregation in [ChunkAggregation::Mean, ChunkAggregation::Max] {
+    let batch = aggregate_windows(aggregation, &windows).unwrap();
+    let mut acc = Accumulator::new(aggregation);
+    for w in &windows {
+      acc.push(w.value());
+    }
+    let streamed = acc.finish().unwrap();
+    assert_eq!(streamed.as_slice(), batch.as_slice(), "{aggregation:?}");
+  }
+}
+
 #[cfg(feature = "serde")]
 mod serde_tests {
   use super::*;
