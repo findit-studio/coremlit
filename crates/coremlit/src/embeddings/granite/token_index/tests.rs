@@ -277,3 +277,288 @@ fn direct_only_fallback_is_still_exact() {
     }
   }
 }
+
+// ── F7: the four killer classes Fable's adversarial differential surfaced ──────
+//
+// The layer-1/2 corpora above miss every class that can actually dissolve a
+// full-parse boundary under a cut: their whitespace probe `"a   b   c"` has runs
+// GLUED by the surrounding letters (branch-1's leading ` ?` pulls the run's last
+// space into the next word), so it can never diverge. These generators add the
+// classes that CAN — swept over every `char`-boundary pair they reproduce the
+// ~500 pre-fix divergences and MUST now be zero:
+//   K1  a whitespace run split by a NON-glue follower (digit/punct/emoji): only a
+//       literal ' ' glues forward, so a tab/NBSP/NEL/thin/ideographic run before a
+//       digit, symbol, or emoji is split by the full parse yet merged by
+//       `\s+(?!\S)` at end-of-substring.
+//   K2  the punct branch's `[\r\n/]*` tail folds CRLFs into a symbol pre-token, so
+//       a whitespace back-scan can land mid-pre-token.
+//   K3  a contraction suffix `(?i:'s|'t|'re|'ve|'m|'ll|'d)` whose letters rejoin
+//       the following word once the left context is cut.
+//   K4  combining / Other_Alphabetic marks (`\p{M}`, and Mn/Mc the regex glues but
+//       `is_alphanumeric` does not).
+const KILLERS: &[&str] = &[
+  // K1 — whitespace run split by a non-glue follower.
+  "456  1",
+  "a  1",
+  "12  34  56",
+  "x   9",
+  "a\t\t9",
+  "a\u{00A0}\u{00A0}9",
+  "a\u{0085}\u{0085}9",
+  "a\u{2009}\u{2009}9",
+  "a  !",
+  "a\t\t.",
+  "a\u{00A0}\u{00A0}#",
+  "a  🍕",
+  "b\u{2009}\u{2009}🌿",
+  "a  b",
+  "a   b   c",
+  "a\t\tb",
+  "a\u{2003}\u{2003}b",
+  "a\u{3000}\u{3000}b",
+  "1 2  3   4",
+  "n\u{00A0}9\u{00A0}\u{00A0}8",
+  // K2 — punct `[\r\n/]*` tail folds CRLF into a symbol pre-token.
+  "a!\r\n\r\n Next t",
+  "x.\r\n\r\ny",
+  "p!\r\nq",
+  "u/\r\n/v",
+  "end.\r\n\r\n\r\nStart here",
+  "a?!\r\n\r\nB",
+  "a!\r\n1",
+  "a!\r\n  b",
+  "a!\r\n\r\nb",
+  // K3 — contraction suffix letters rejoin the next word once cut.
+  " it'station end",
+  "can'ther",
+  "we'reunited now",
+  "I'lloop back",
+  "he'daily",
+  "you'venue",
+  "she'small",
+  "It'STELLAR",
+  // K4 — combining / Other_Alphabetic marks.
+  "cafe\u{0301}s here",
+  "a\u{0345}b",
+  "क\u{093E}ख",
+  "ন\u{09BE}দ",
+  "a\u{05B4}b",
+  "a\u{064B}c",
+  "re\u{0301}sume\u{0301} now",
+  // Digit runs across scripts (`\p{N}{1,3}` triplet re-anchoring).
+  "1234567890",
+  "٠١٢٣٤٥٦٧٨٩",
+  "０１２３４５６７８９",
+  "a1234567890b",
+  "192.168.100.254",
+  "v1234\u{0660}\u{0661}\u{0662}z",
+  // Emoji-ZWJ families / variation selectors, glue-punct siblings, slashes/URLs.
+  "👨\u{200D}👩\u{200D}👧\u{200D}👦x",
+  "🏳️\u{200D}🌈y",
+  "a👍🏽b",
+  "!!!???...",
+  "a,,,b",
+  "(()){}[]",
+  "http://a/b/c/d",
+  "/usr/local/bin",
+  "a//b//c",
+  "x.\r\n/y/z",
+];
+
+/// A seeded fragment-soup: random short fragments drawn from an alphabet of every
+/// killer char, concatenated — the cross-class adjacencies the fixed strings miss.
+fn fragment_soup(seed: u64, target_chars: usize) -> String {
+  const FRAGS: &[&str] = &[
+    "a",
+    "b",
+    "c",
+    "Z",
+    "it",
+    "café",
+    "no",
+    "  ",
+    "   ",
+    "\t",
+    "\t\t",
+    "\u{00A0}",
+    "\u{00A0}\u{00A0}",
+    "\u{2009}",
+    "\u{2003}",
+    "\u{3000}",
+    "\r\n",
+    "\r\n\r\n",
+    "\n",
+    "\n\n",
+    "1",
+    "12",
+    "123",
+    "1234",
+    "٧",
+    "٨٩",
+    "５",
+    "'s",
+    "'t",
+    "'re",
+    "'ll",
+    "!",
+    "!!",
+    ".",
+    "...",
+    "/",
+    "//",
+    "#",
+    ",",
+    "(",
+    ")",
+    "🍕",
+    "🌿",
+    "\u{0301}",
+    "\u{093E}",
+    "\u{064B}",
+    " ",
+    "x",
+    "y",
+  ];
+  let mut rng = Rng(seed);
+  let mut s = String::new();
+  while s.chars().count() < target_chars {
+    s.push_str(FRAGS[rng.below(FRAGS.len())]);
+  }
+  s
+}
+
+/// Every `char`-boundary pair `(a, b)`, `a < b`, exhaustive up to `cap` boundaries
+/// then seeded-sampled, pushing each `measure_range != oracle` into `out` as
+/// `(text, a, b, got, want)`. Returns the number of pairs tested.
+fn count_divergences(
+  tok: &Tokenizer,
+  text: &str,
+  cap: usize,
+  out: &mut Vec<(String, usize, usize, usize, usize)>,
+) -> usize {
+  if text.is_empty() {
+    return 0;
+  }
+  let index = TokenIndex::build(tok, text).expect("build index");
+  let bounds = char_boundaries(text);
+  let m = bounds.len();
+  let mut tested = 0usize;
+  let one = |a: usize, b: usize, out: &mut Vec<_>| {
+    let got = index.measure_range(tok, text, a, b).expect("measure_range");
+    let want = oracle(tok, &text[a..b]);
+    if got != want {
+      out.push((text.to_string(), a, b, got, want));
+    }
+  };
+  if m <= cap {
+    for i in 0..m {
+      for j in (i + 1)..m {
+        one(bounds[i], bounds[j], out);
+        tested += 1;
+      }
+    }
+  } else {
+    let mut rng = Rng(0xC0DE_F00D ^ text.len() as u64);
+    for _ in 0..(cap * cap) {
+      let mut a = bounds[rng.below(m)];
+      let mut b = bounds[rng.below(m)];
+      if a == b {
+        continue;
+      }
+      if a > b {
+        std::mem::swap(&mut a, &mut b);
+      }
+      one(a, b, out);
+      tested += 1;
+    }
+  }
+  tested
+}
+
+/// THE MERGE GATE (exhaustive adversarial differential). Over the four killer
+/// classes, one big cross-class concatenation, and seeded fragment-soup, every
+/// `measure_range(a, b)` MUST equal `encode(&text[a..b], true).len()`. This
+/// reproduced ~500 divergences against the pre-fix single pass; it must be zero.
+#[test]
+fn measure_range_zero_divergence_over_killers() {
+  let tok = measuring_tok();
+  let mut out: Vec<(String, usize, usize, usize, usize)> = Vec::new();
+  let mut pairs = 0usize;
+
+  for &text in KILLERS {
+    pairs += count_divergences(&tok, text, 96, &mut out);
+  }
+  // One big cross-class string: every killer boundary meets every other.
+  let big: String = KILLERS.join(" | ");
+  pairs += count_divergences(&tok, &big, 200, &mut out);
+  // Seeded fragment-soup, several documents.
+  for seed in 0..6u64 {
+    let soup = fragment_soup(0xA5A5_0000 ^ (seed.wrapping_mul(0x9E37_79B9)), 160);
+    pairs += count_divergences(&tok, &soup, 200, &mut out);
+  }
+
+  eprintln!(
+    "[killer-sweep] pairs_tested={pairs} divergences={}",
+    out.len()
+  );
+  for (t, a, b, got, want) in out.iter().take(25) {
+    eprintln!(
+      "  DIVERGE measure_range({a},{b})={got} != encode({:?})={want}  in {:.48?}",
+      &t[*a..*b],
+      t
+    );
+  }
+  assert!(
+    out.is_empty(),
+    "{} divergences over {pairs} killer-class pairs (see the list above) — the single-pass \
+     measure is not exact",
+    out.len()
+  );
+}
+
+/// F1 witness (whitespace run split by a following digit, overcount +1): the two
+/// spaces of `"456  1"[3..5]` are ONE pre-token at end-of-substring (`\s+(?!\S)`
+/// merges), but the full parse splits them because a digit — which takes no
+/// space-glue — follows at `b`.
+#[test]
+fn witness_f1_ws_run_split_by_following_digit() {
+  let tok = measuring_tok();
+  let text = "456  1";
+  let index = TokenIndex::build(&tok, text).expect("build");
+  assert_eq!(
+    index.measure_range(&tok, text, 3, 5).unwrap(),
+    oracle(&tok, "  "),
+    "F1: [3,5) must be encode(\"  \"), not the split-run overcount"
+  );
+}
+
+/// F2 witness (back-scan lands mid-pre-token, undercount): the punct `[\r\n/]*`
+/// tail makes `"!\r\n\r\n"` one pre-token; scanning whitespace back from the right
+/// zone walks into it, and without snapping DOWN to its start the partition drops
+/// the `!` head.
+#[test]
+fn witness_f2_scan_back_snaps_out_of_punct_crlf_tail() {
+  let tok = measuring_tok();
+  let text = "a!\r\n\r\n Next t";
+  let index = TokenIndex::build(&tok, text).expect("build");
+  assert_eq!(
+    index.measure_range(&tok, text, 0, 8).unwrap(),
+    oracle(&tok, &text[0..8]),
+    "F2: the `!` head of the punct+CRLF pre-token must not be dropped"
+  );
+}
+
+/// F3 witness (contraction-suffix letter|letter adjacency, overcount): the word
+/// branch ends at the `'s` suffix even with letters after, so `" it's"|"tation"`
+/// is a real full boundary; cutting at the `'s` re-joins `"station"` as one word.
+#[test]
+fn witness_f3_contraction_suffix_letter_adjacency() {
+  let tok = measuring_tok();
+  let text = " it'station end";
+  let index = TokenIndex::build(&tok, text).expect("build");
+  assert_eq!(
+    index.measure_range(&tok, text, 4, 11).unwrap(),
+    oracle(&tok, "station"),
+    "F3: [4,11) must be encode(\"station\"), not \"s\"+\"tation\""
+  );
+}

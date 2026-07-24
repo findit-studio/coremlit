@@ -1502,6 +1502,59 @@ fn chunk_long_matches_slow_twin_over_corpus_and_geometry() {
   }
 }
 
+/// The four killer classes that broke the pre-fix single-pass measure (whitespace
+/// runs split by a non-glue follower, the punct `[\r\n/]*` CRLF tail, contraction
+/// suffixes rejoining the next word, combining/Other_Alphabetic marks), each
+/// repeated so it spans multiple windows, plus one big cross-class concatenation —
+/// the shapes gate 2's corpus lacks, driven through the WHOLE chunk pipeline.
+fn killer_chunk_texts() -> Vec<String> {
+  let units = [
+    "456  1 word ",
+    "a\u{00A0}\u{00A0}9 sep ",
+    "b\u{2009}\u{2009}🌿 emoji ",
+    "a!\r\n\r\n Next term ",
+    "end.\r\n\r\n\r\nStart here ",
+    " it'station end ",
+    "we'reunited now ",
+    "cafe\u{0301}s re\u{0301}sume\u{0301} ",
+    "192.168.100.254 ٠١٢٣ ０１２３ ",
+    "http://a/b/c/d /usr/local/bin ",
+    "👨\u{200D}👩\u{200D}👧\u{200D}👦 x ",
+  ];
+  let mut texts: Vec<String> = units.iter().map(|u| u.repeat(24)).collect();
+  texts.push(units.concat().repeat(12));
+  texts
+}
+
+/// GATE 2 (killer classes): `chunk_long` and the direct-encode slow twin produce
+/// byte-IDENTICAL `Vec<Chunk>` across the killer texts × the geometry grid — the
+/// chunk-level counterpart of the exhaustive `measure_range` sweep, on exactly the
+/// classes that exposed the pre-fix divergences.
+#[test]
+fn chunk_long_matches_slow_twin_over_killer_classes() {
+  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let grid = geometry_grid();
+  for text in killer_chunk_texts() {
+    for opts in &grid {
+      let (window, overlap) = (opts.window(), opts.overlap());
+      match (
+        chunk_long(&mt, &text, opts),
+        chunk_long_slow(&mt, &text, opts),
+      ) {
+        (Ok(fast), Ok(slow)) => assert_eq!(
+          fast, slow,
+          "fast/slow killer chunk mismatch (window={window}, overlap={overlap}) for {text:.40?}"
+        ),
+        (Err(_), Err(_)) => {}
+        (fast, slow) => panic!(
+          "fast/slow Ok-vs-Err disagreement (window={window}, overlap={overlap}) for {text:.40?}: \
+           {fast:?} vs {slow:?}"
+        ),
+      }
+    }
+  }
+}
+
 /// RED-FIRST (non-vacuity): a windit measure that over-counts every range by ONE
 /// token packs one fewer atom wherever a chunk otherwise ended exactly at the
 /// window, moving a boundary — so the `Vec<Chunk>` differs from the exact run. A
