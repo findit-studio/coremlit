@@ -38,11 +38,11 @@ cp -R "$SIGLIP_STAGE/siglip2_vision_512.mlmodelc" "$ROOT/"
 cp -R "$SIGLIP_STAGE/siglip2_text_64.mlmodelc" "$ROOT/"
 cp "$SIGLIP_STAGE/pos_embed_16x16x768.f32le.bin" "$ROOT/"
 
-echo "== 4/6 CHECKSUMS.sha256 + MANIFEST.json over the shipped bundle =="
-"$PY" -u "$HERE/scripts/stage_manifest.py"
-
-echo "== 5/6 fail-closed verify matrix (fp32-vs-torch >= 0.9999; CpuAndGpu fp16 gate >= 0.99917) =="
+echo "== 4/6 fail-closed verify matrix (fp32-vs-torch >= 0.9999; CpuAndGpu fp16 gate >= 0.99917) =="
 "$PY" -u "$HERE/scripts/verify_towers.py"
+
+echo "== 5/6 CHECKSUMS.sha256 + MANIFEST.json over the shipped bundle (runs AFTER verify so verify_metrics.json is captured) =="
+"$PY" -u "$HERE/scripts/stage_manifest.py"
 
 echo "== 6/6 committed goldens (corpus.json + preprocess.json) + staged .npy fixtures =="
 "$PY" -u "$HERE/scripts/generate_goldens.py"
