@@ -112,14 +112,19 @@ const _: () = assert!(
 
 /// Default compute placement: [`ComputeUnits::All`].
 ///
-/// **PROVISIONAL** and shared by the whole family — placement is measured,
-/// never marketed, and no CED conversion has been measured yet: the Wave-C
-/// placement pass (`tests/ced/placement.rs`) characterizes each size and
-/// re-pins this to the measured winner (the spec anticipates `CpuAndGpu`;
-/// ANE-capable ≠ floor-holding — the siglip lesson), then this doc carries the
-/// measured latency × placement table. Only a *measured* per-size divergence
-/// would promote this to a per-[`CedModel`] table; until then one shared
-/// default is the honest claim.
+/// MEASURED, not provisional: the Wave-C placement pass
+/// (`tests/ced/placement.rs`) characterized every unit (`CpuOnly`,
+/// `CpuAndGpu`, `CpuAndNeuralEngine`, `All`) across all four sizes. Every
+/// unit agrees with the `CpuOnly` reference at ≥ 0.99999 cosine and is
+/// NaN-free, and warm latency is flat across units (~0.6–0.8 s/clip,
+/// dominated by the Rust mel front end, not the CoreML forward) — so
+/// `CpuAndGpu` is not faster here, contra the spec's original expectation.
+/// The default `All` (ANE) arm is in fact the numerically *tightest* vs the
+/// committed PyTorch fp32 goldens (`tests/ced/parity_logits.rs`: worst cos
+/// ~0.99999988, max|Δlogit| ~0.03) — unlike siglip's vision tower, CED's ANE
+/// did not collapse, so `All` stays the default. Only a *measured* per-size
+/// divergence would promote this to a per-[`CedModel`] table; Wave-C found
+/// none, so one shared default stands.
 pub const DEFAULT_COMPUTE: ComputeUnits = ComputeUnits::All;
 
 /// Declared feature names on the CED `.mlmodelc` (pinned by

@@ -31,13 +31,93 @@ use coremlit::{
 // Each starts empty; Wave B fills the matching size's table from its staged
 // `CHECKSUMS.sha256`:
 const TINY_SHA256: &[(&str, &str)] = &[
-  // ("coremldata.bin", "<sha256 — Wave B>"),
-  // ("model.mil", "<sha256 — Wave B>"),
-  // ("weights/weight.bin", "<sha256 — Wave B>"),
+  (
+    "analytics/coremldata.bin",
+    "2f763a1ec4904b1a4b56de1ee505d0908ae37d359c996965f73c754ecd93b2d1",
+  ),
+  (
+    "coremldata.bin",
+    "08ff19df019b19df9dff1d838fe4814e2fd50fb0f5280da5847e60751c301e66",
+  ),
+  (
+    "metadata.json",
+    "4d315e3f1e8dbdc95ad6d6a3b6b387ea527c829c528925494f22926929079603",
+  ),
+  (
+    "model.mil",
+    "fbdfc23c5d89e2395e034e0bc5a58cb6c3caaad3e4ea04333c5d0fefc07e1d05",
+  ),
+  (
+    "weights/weight.bin",
+    "5635cd9f932583105d1bf40bd07eb54e3f715a70d8319923cd0617a1dea3db01",
+  ),
 ];
-const MINI_SHA256: &[(&str, &str)] = &[];
-const SMALL_SHA256: &[(&str, &str)] = &[];
-const BASE_SHA256: &[(&str, &str)] = &[];
+const MINI_SHA256: &[(&str, &str)] = &[
+  (
+    "analytics/coremldata.bin",
+    "4b2fd2952ef76ebf73a70a7b91d8f6694941967e614aa062c08dd35e311cd82f",
+  ),
+  (
+    "coremldata.bin",
+    "c5f1c8b0b078d89880a15d5271e77e5c9ca478704e0b14cb6e3601dbcb8b57ab",
+  ),
+  (
+    "metadata.json",
+    "91bbae280e8777bc464064c885ccf6d81fb50eed2bc696738565ad3371cbfb42",
+  ),
+  (
+    "model.mil",
+    "98605d30a89dc6ab352cc9679c6c6c14a7def969c5f7738baf67d9eae09ce153",
+  ),
+  (
+    "weights/weight.bin",
+    "daf9f1fa64c8eb2a00fc5325ecfc6c45670b4e15c69a0277a16cacf0dba44c6c",
+  ),
+];
+const SMALL_SHA256: &[(&str, &str)] = &[
+  (
+    "analytics/coremldata.bin",
+    "c4d275dca741a0b7358202d62e4fe3f3ebdf60fa35d68ffdd412f709384dc337",
+  ),
+  (
+    "coremldata.bin",
+    "7ca0aac05c69e3315f88590b8870e783130987a4f7ad95669efdee0e11cacc48",
+  ),
+  (
+    "metadata.json",
+    "61c2dc29a14c0b15989c8f9e5841ca2aec0ab7c95bfd5e844cd7a88aa87989f0",
+  ),
+  (
+    "model.mil",
+    "e7974466d1a373964bbf99414623a7900f62a944c7baa00aa8950ad9255e73c4",
+  ),
+  (
+    "weights/weight.bin",
+    "af2c05ff6f7de533aa649f0d765499fd6a7bc43b1e3237e25f6a7a8cf35c44a0",
+  ),
+];
+const BASE_SHA256: &[(&str, &str)] = &[
+  (
+    "analytics/coremldata.bin",
+    "260b83886ef274a7f785281019722d8f4c7a201475144bc8b4edad704016945e",
+  ),
+  (
+    "coremldata.bin",
+    "5b26521f2b699040b12fe239d016cd5783680b9a1b6e33f49afba3cbdad50ea4",
+  ),
+  (
+    "metadata.json",
+    "aed58c97c54c58b7968c8fe35e7d1ffb0e291f9dcca22775f3d11db9fb9d6cd4",
+  ),
+  (
+    "model.mil",
+    "ffb76dd2cac55c0b571c97565b9874c1804854c79f5b9969a4f62276ceebef2f",
+  ),
+  (
+    "weights/weight.bin",
+    "bc80c08ef907a07ab153083a31bef836154e83bf88c919747157d36b86e6b5f2",
+  ),
+];
 
 /// The exact per-file SHA-256 manifest for `model`'s bundle. Totality is
 /// compiler-enforced by the closed [`CedModel`] enum, so a fifth size would
@@ -154,7 +234,7 @@ fn model_path_composes_per_size_under_the_family_root() {
 #[should_panic(expected = "does not match")]
 fn golden_corpus_rejects_a_cross_size_oracle() {
   let json = br#"{
-    "oracle": {"repo": "mispeech/ced-tiny", "revision": "r", "file": "model.onnx", "sha256": "00"},
+    "oracle": {"repo": "mispeech/ced-tiny", "revision": "r", "file": "model.safetensors", "sha256": "00"},
     "clips": []
   }"#;
   common::parse_golden_corpus(json, CedModel::Small);
@@ -165,7 +245,7 @@ fn golden_corpus_rejects_a_cross_size_oracle() {
 #[test]
 fn golden_corpus_accepts_a_matching_oracle() {
   let json = br#"{
-    "oracle": {"repo": "mispeech/ced-small", "revision": "r", "file": "model.onnx", "sha256": "00"},
+    "oracle": {"repo": "mispeech/ced-small", "revision": "r", "file": "model.safetensors", "sha256": "00"},
     "clips": [{"id": "c0", "file": "clips/c0.wav", "n_samples": 160000, "logits": [0.0, 1.0]}]
   }"#;
   let corpus = common::parse_golden_corpus(json, CedModel::Small);

@@ -7,9 +7,12 @@
 //!   16 kHz mono WAV clips are committed ONCE and shared across sizes
 //!   (`fixtures/mel/`, `fixtures/goldens/clips/`); only the per-size logits
 //!   differ, as `fixtures/goldens/<size>/corpus.json` — a [`GoldenCorpus`]
-//!   whose [`OracleProvenance`] header names the `mispeech/ced-<size>` ONNX
-//!   fp32 CPU oracle the logits came from (generated owner-side — ort never
-//!   enters this repo, not even dev). [`load_golden_corpus`] cross-checks that
+//!   whose [`OracleProvenance`] header names the `mispeech/ced-<size>` PyTorch
+//!   fp32 CPU oracle the logits came from (the exact pre-sigmoid of the
+//!   unmodified `CedForAudioClassification` forward — `model.safetensors` via
+//!   `conversion/ced`; the shipped `model.onnx` is post-sigmoid so it cannot be
+//!   the pre-sigmoid oracle, and ort never enters this repo, not even dev).
+//!   [`load_golden_corpus`] cross-checks that
 //!   header against [`CedModel::hf_repo`], so a cross-size golden mix-up (four
 //!   I/O-identical models make it otherwise invisible) fails closed. Read
 //!   hermetically; no model, no network.
@@ -23,17 +26,20 @@ use std::path::{Path, PathBuf};
 
 use coremlit::audio::ced::CedModel;
 
-// Per-size placeholders for the HF revision (commit SHA) each CED artifact and
-// its SHA-256 pins are recorded at — filled independently by the conversion
-// runbook's upload step (Wave C), one size at a time.
-const TINY_REVISION: &str = "<pending conversion upload (Wave C)>";
-const MINI_REVISION: &str = "<pending conversion upload (Wave C)>";
-const SMALL_REVISION: &str = "<pending conversion upload (Wave C)>";
-const BASE_REVISION: &str = "<pending conversion upload (Wave C)>";
+// Per-size HF SOURCE revision (commit SHA) each CED artifact + its golden
+// oracle (`model.safetensors`) + SHA-256 pins were converted from
+// (`conversion/ced`); an artifact-repo revision is added later if the owner
+// re-uploads the compiled bundles publicly.
+const TINY_REVISION: &str = "ace276d29dd0bb3f3517b0fa8cf300738c409019";
+const MINI_REVISION: &str = "26c3ebcae85d4330f4fc26763f029539a3afcda0";
+const SMALL_REVISION: &str = "06bb40c5ec089e96867ebc5246be02441f4a71e4";
+const BASE_REVISION: &str = "db3e14a8db4c21b56b165261c39649741a900e7f";
 
-/// The HF revision the given size's artifact and per-file SHA-256 pins are
-/// recorded at (a placeholder until that size's Wave-C upload). Totality is
-/// compiler-enforced by the closed [`CedModel`] enum.
+/// The HF SOURCE revision the given size's artifact and per-file SHA-256 pins
+/// were converted from (commit SHA; see the per-const comment above) — an
+/// artifact-repo revision is a separate, later addition if the owner
+/// re-uploads the compiled bundles publicly. Totality is compiler-enforced by
+/// the closed [`CedModel`] enum.
 #[allow(dead_code)]
 pub const fn ced_revision(model: CedModel) -> &'static str {
   match model {
@@ -87,8 +93,8 @@ pub fn fixture_path(relative: &str) -> PathBuf {
     .join(relative)
 }
 
-/// One committed golden clip: a 16 kHz mono WAV fixture and the CED ONNX fp32
-/// CPU oracle's `[527]` pre-sigmoid logits for it. The corpus must include at
+/// One committed golden clip: a 16 kHz mono WAV fixture and the CED PyTorch
+/// fp32 CPU oracle's `[527]` pre-sigmoid logits for it. The corpus must include at
 /// least one sub-window clip (tail-padding semantics) and one multi-window
 /// clip (aggregation e2e) — spec §7.
 #[derive(Debug, serde::Deserialize)]
@@ -106,7 +112,7 @@ pub struct GoldenClip {
   pub logits: Vec<f32>,
 }
 
-/// Provenance header of a per-size [`GoldenCorpus`]: the exact ONNX fp32 CPU
+/// Provenance header of a per-size [`GoldenCorpus`]: the exact PyTorch fp32 CPU
 /// oracle its logits were generated from. [`load_golden_corpus`] asserts
 /// [`Self::repo`] equals the size's [`CedModel::hf_repo`] — the fail-closed
 /// guard against a cross-size golden mix-up, which four I/O-identical models
@@ -119,7 +125,7 @@ pub struct OracleProvenance {
   pub repo: String,
   /// The oracle's pinned HF revision (commit SHA).
   pub revision: String,
-  /// The oracle file within the repo (e.g. `model.onnx`).
+  /// The oracle file within the repo (e.g. `model.safetensors`).
   pub file: String,
   /// Lowercase-hex SHA-256 of the oracle file.
   pub sha256: String,
@@ -130,7 +136,8 @@ pub struct OracleProvenance {
 #[derive(Debug, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct GoldenCorpus {
-  /// Which `mispeech/ced-<size>` ONNX oracle produced `clips`' logits.
+  /// Which `mispeech/ced-<size>` PyTorch fp32 CPU oracle (`model.safetensors`)
+  /// produced `clips`' logits.
   pub oracle: OracleProvenance,
   /// The golden clips (≥ 1 sub-window + ≥ 1 full-window — spec §7).
   pub clips: Vec<GoldenClip>,
