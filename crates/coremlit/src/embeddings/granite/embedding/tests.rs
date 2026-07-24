@@ -7,6 +7,18 @@ fn e0() -> [f32; EMBEDDING_DIM] {
   s
 }
 
+/// f64-accumulated norm² of a stored embedding. The renormalization tests
+/// measure norm in f64: the f32 accumulation error over 384 terms (up to
+/// ~2e-5) would drown the ~1e-7 deviation the post-renormalization invariant
+/// asserts, so an f32 measure could not tell a renormalized vector from a
+/// raw-copied budget-edge one.
+fn norm_sq_f64(e: &Embedding) -> f64 {
+  e.as_slice()
+    .iter()
+    .map(|&x| f64::from(x) * f64::from(x))
+    .sum()
+}
+
 #[test]
 fn from_slice_normalizing_produces_unit_norm() {
   let s: Vec<f32> = (0..EMBEDDING_DIM).map(|i| (i as f32) + 1.0).collect();
@@ -117,11 +129,135 @@ fn from_slice_normalizing_wrong_len() {
 
 #[test]
 fn try_from_unit_slice_accepts_at_budget_edge() {
-  // norm² = 1 + 0.5·NORM_BUDGET must pass (≤ inclusive).
+  // norm² = 1 + 0.5·NORM_BUDGET must pass (≤ inclusive). Acceptance is the
+  // pinned behavior; the accepted vector is additionally stored renormalized.
   let target_sq = 1.0 + 0.5 * NORM_BUDGET;
   let mut s = [0.0f32; EMBEDDING_DIM];
   s[0] = target_sq.sqrt();
-  Embedding::try_from_unit_slice(&s).expect("within budget");
+  let e = Embedding::try_from_unit_slice(&s).expect("within budget");
+  assert!(
+    (norm_sq_f64(&e) - 1.0).abs() <= 1e-6,
+    "accepted vector must be stored unit-norm (f64 norm² = {})",
+    norm_sq_f64(&e)
+  );
+}
+
+#[test]
+fn restored_budget_edge_vector_is_renormalized() {
+  // The audit replay: norm² ≈ 1.0000522 (dev 5.22e-5, inside NORM_BUDGET).
+  // Copied raw, cos(x, x) = 1.0000522 > 1 and cos(x, −x) < −1; renormalized,
+  // the stored vector is unit-norm and cosine stays in [−1, 1].
+  let mut s = [0.0f32; EMBEDDING_DIM];
+  s[0] = (1.0f32 + 0.522e-4).sqrt();
+  let e = Embedding::try_from_unit_slice(&s).expect("within budget");
+
+  assert!(
+    (norm_sq_f64(&e) - 1.0).abs() <= 1e-6,
+    "stored vector must be renormalized to unit norm (f64 norm² = {})",
+    norm_sq_f64(&e)
+  );
+  let self_cos = e.cosine(&e);
+  assert!(
+    (1.0 - 1e-5..=1.0 + 1e-5).contains(&self_cos),
+    "cos(x, x) must stay in [−1, 1] (got {self_cos})"
+  );
+  assert!(
+    1.0 - self_cos >= -1e-5,
+    "cosine distance must be non-negative (1 − cos = {})",
+    1.0 - self_cos
+  );
+
+  let mut neg_s = [0.0f32; EMBEDDING_DIM];
+  neg_s[0] = -s[0];
+  let neg = Embedding::try_from_unit_slice(&neg_s).expect("−s is also within budget");
+  let opp = e.cosine(&neg);
+  assert!(
+    (-1.0 - 1e-5..=-1.0 + 1e-5).contains(&opp),
+    "cos(x, −x) must stay in [−1, 1] (got {opp})"
+  );
+}
+
+#[test]
+fn near_budget_vectors_restore_unit_norm_property() {
+  // A deterministic grid straddling the budget edge, over three vector shapes.
+  // The ACTUAL f32-accumulated deviation (the production gate's own metric)
+  // decides expected accept/reject in-test, so f32 rounding at the boundary
+  // cannot make the test brittle.
+  let devs = [-1.0f32, -0.75, -0.5, -0.25, 0.25, 0.5, 0.75, 0.95, 1.0];
+  let uniform = (1.0f32 / EMBEDDING_DIM as f32).sqrt();
+  for &d in &devs {
+    let scale = (1.0f32 + d * NORM_BUDGET).sqrt();
+    let shapes: [Vec<f32>; 3] = [
+      {
+        let mut v = vec![0.0f32; EMBEDDING_DIM];
+        v[0] = scale; // single axis: e0 · scale
+        v
+      },
+      (0..EMBEDDING_DIM).map(|_| uniform * scale).collect(), // uniform
+      (0..EMBEDDING_DIM) // alternating-sign uniform
+        .map(|i| {
+          if i % 2 == 0 {
+            uniform * scale
+          } else {
+            -uniform * scale
+          }
+        })
+        .collect(),
+    ];
+    for s in &shapes {
+      let norm_sq: f32 = s.iter().map(|x| x * x).sum();
+      let expect_accept = (norm_sq - 1.0).abs() <= NORM_BUDGET;
+      match Embedding::try_from_unit_slice(s) {
+        Ok(e) => {
+          assert!(
+            expect_accept,
+            "accepted a vector the gate should reject (norm² = {norm_sq})"
+          );
+          assert!(
+            (norm_sq_f64(&e) - 1.0).abs() <= 1e-6,
+            "accepted vector not stored unit-norm (f64 norm² = {})",
+            norm_sq_f64(&e)
+          );
+          let c = e.cosine(&e);
+          assert!(
+            (1.0 - 1e-5..=1.0 + 1e-5).contains(&c),
+            "cos(x, x) escaped [−1, 1]: {c}"
+          );
+          assert!(1.0 - c >= -1e-5, "negative cosine distance: {}", 1.0 - c);
+          let neg: Vec<f32> = e.to_vec().iter().map(|v| -v).collect();
+          let neg_e =
+            Embedding::try_from_unit_slice(&neg).expect("a negated unit vector is unit-norm");
+          let o = e.cosine(&neg_e);
+          assert!(
+            (-1.0 - 1e-5..=-1.0 + 1e-5).contains(&o),
+            "cos(x, −x) escaped [−1, 1]: {o}"
+          );
+        }
+        Err(Error::EmbeddingNotUnitNorm { .. }) => {
+          assert!(
+            !expect_accept,
+            "rejected a vector the gate should accept (norm² = {norm_sq})"
+          );
+        }
+        Err(other) => panic!("unexpected error: {other:?}"),
+      }
+    }
+  }
+}
+
+#[test]
+fn try_from_unit_slice_is_idempotent_on_its_output() {
+  // Renormalizing an already-renormalized vector is a no-op to ULP scale.
+  let uniform = (1.0f32 / EMBEDDING_DIM as f32).sqrt();
+  let scale = (1.0f32 + 0.5 * NORM_BUDGET).sqrt();
+  let s: Vec<f32> = (0..EMBEDDING_DIM).map(|_| uniform * scale).collect();
+  let first = Embedding::try_from_unit_slice(&s).expect("within budget");
+  let second =
+    Embedding::try_from_unit_slice(&first.to_vec()).expect("renormalized output re-accepts");
+  assert!(
+    second.is_close(&first, 1e-6),
+    "renormalizing an already-renormalized vector must be a no-op to ULP scale"
+  );
 }
 
 #[test]

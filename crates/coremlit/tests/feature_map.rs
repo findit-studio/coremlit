@@ -75,7 +75,7 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
     ("clap-oracle", vec!["clap", "dep:textclap"]),
     (
       "granite",
-      vec!["dep:tokenizers", "dep:windit", "windit/text"],
+      vec!["dep:tokenizers", "dep:windit", "windit/text", "dep:sha2"],
     ),
     (
       "ced",

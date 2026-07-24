@@ -10,7 +10,9 @@
 
 mod common;
 
-use coremlit::embeddings::granite::{Error, MAX_TOKENS, TextEmbedder, WindowOptions};
+use coremlit::embeddings::granite::{
+  Error, LongTextOptions, MAX_TOKENS, TextEmbedder, WindowOptions,
+};
 
 fn embedder() -> TextEmbedder {
   TextEmbedder::from_file(common::model_path()).unwrap_or_else(|e| panic!("load granite: {e}"))
@@ -85,7 +87,10 @@ fn empty_text_errors_like_embed() {
 fn over_budget_window_rejected_before_any_prediction() {
   let emb = embedder();
   let err = emb
-    .embed_long_with("any text", &WindowOptions::new(MAX_TOKENS + 1))
+    .embed_long_with(
+      "any text",
+      &LongTextOptions::from(WindowOptions::new(MAX_TOKENS + 1)),
+    )
     .unwrap_err();
   assert!(
     matches!(err, Error::WindowOverBudget { window, max } if window == MAX_TOKENS + 1 && max == MAX_TOKENS),
@@ -104,7 +109,10 @@ fn whitespace_at_cap_zero_rejected_before_any_prediction() {
 
   let emb = embedder();
   let err = emb
-    .embed_long_with("   ", &WindowOptions::new(MAX_TOKENS).with_max_windows(0))
+    .embed_long_with(
+      "   ",
+      &LongTextOptions::from(WindowOptions::new(MAX_TOKENS).with_max_windows(0)),
+    )
     .unwrap_err();
   assert!(
     matches!(
@@ -123,11 +131,47 @@ fn whitespace_at_cap_zero_rejected_before_any_prediction() {
 fn whitespace_at_cap_one_matches_embed() {
   let emb = embedder();
   let via_long = emb
-    .embed_long_with("   ", &WindowOptions::new(MAX_TOKENS).with_max_windows(1))
+    .embed_long_with(
+      "   ",
+      &LongTextOptions::from(WindowOptions::new(MAX_TOKENS).with_max_windows(1)),
+    )
     .expect("cap 1 admits the one whole-input prediction");
   let via_embed = emb.embed("   ").expect("embed whitespace");
   assert!(
     via_long.is_close(&via_embed, 1e-5),
     "whole-input fallback must match embed"
+  );
+}
+
+/// A whitespace-only input too long to embed as one window is refused with
+/// `Error::ContentlessInputOverBudget` — the public end-to-end proof of the
+/// measured-fallback fix (the chunk geometry is proven model-free in the in-lib
+/// granite suite; this is the CoreML-path contract).
+#[test]
+#[ignore = "requires local granite model (EMBEDKIT_TEST_MODELS)"]
+fn contentless_over_budget_input_is_refused() {
+  let emb = embedder();
+  let err = emb.embed_long(&" ".repeat(100_000)).unwrap_err();
+  assert!(
+    matches!(err, Error::ContentlessInputOverBudget { .. }),
+    "expected ContentlessInputOverBudget, got {err:?}"
+  );
+}
+
+/// An oversized input is refused by the byte gate before any tokenizer or
+/// chunker work (`Error::InputTooLarge`). Error-identity only — no timing
+/// assertions (flaky in CI); the reject-cost characterization belongs in the PR
+/// notes, per the issue's gate.
+#[test]
+#[ignore = "requires local granite model (EMBEDKIT_TEST_MODELS)"]
+fn oversized_input_rejected_with_input_too_large() {
+  let emb = embedder();
+  let big = "x".repeat(8 * 1024 * 1024);
+  let err = emb
+    .embed_long_with(&big, &LongTextOptions::new().with_max_input_bytes(1 << 20))
+    .unwrap_err();
+  assert!(
+    matches!(err, Error::InputTooLarge { got, max } if got == big.len() && max == (1 << 20)),
+    "expected InputTooLarge, got {err:?}"
   );
 }

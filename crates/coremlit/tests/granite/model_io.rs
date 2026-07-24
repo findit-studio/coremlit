@@ -29,7 +29,9 @@ use std::collections::BTreeSet;
 
 use coremlit::{
   ComputeUnits, DataType, Model,
-  embeddings::granite::{MAX_TOKENS, embedding::EMBEDDING_DIM},
+  embeddings::granite::{
+    Error, MAX_TOKENS, TextEmbedder, TextEmbedderOptions, embedding::EMBEDDING_DIM,
+  },
 };
 
 /// The `.mlmodelc` bundle's per-file SHA-256, EXACTLY enumerated (the #30
@@ -137,6 +139,73 @@ fn granite_artifact_bytes_match_pinned_sha256() {
       path.display(),
       common::EMBEDKIT_REVISION
     );
+  }
+}
+
+/// A caller-supplied tokenizer that parses but does not match the Granite
+/// contract is refused at construction, fail-closed — the audit's live repro (a
+/// tiny WordLevel tokenizer via `from_memory`). The contract gate runs before
+/// `Model::load`, so this proves the constructor's fail-closed order end-to-end.
+#[test]
+#[ignore = "requires local granite model (EMBEDKIT_TEST_MODELS)"]
+fn from_memory_rejects_foreign_tokenizer() {
+  const TINY_WORDLEVEL: &[u8] = br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"hello":0,"world":1},"unk_token":"<unk>"}}"#;
+  let err = TextEmbedder::from_memory(
+    common::model_path(),
+    TINY_WORDLEVEL,
+    TextEmbedderOptions::new(),
+  )
+  .expect_err("a foreign tokenizer must be refused at construction");
+  assert!(
+    matches!(err, Error::TokenizerContractMismatch { .. }),
+    "expected TokenizerContractMismatch, got {err:?}"
+  );
+}
+
+/// A caller-supplied tokenizer that is behaviorally VALID but not byte-identical
+/// to the pinned artifact is refused at construction by the SHA-256 identity
+/// backstop — the codex repro (two base-vocab ids, 5000 ↔ 6000, swapped;
+/// invisible to every behavioral check). Asserting the `check` FIELD proves the
+/// behavioral stage passed first and the identity stage fired, end to end, before
+/// `Model::load`.
+#[test]
+#[ignore = "requires local granite model (EMBEDKIT_TEST_MODELS)"]
+fn from_memory_rejects_corrupted_tokenizer_with_identity_check() {
+  // Parse → swap two non-sentinel base-vocab ids → re-serialize. `serde_json` is
+  // a dev-dependency; a small local copy of the in-lib fixture is fine here.
+  let mut value: serde_json::Value =
+    serde_json::from_slice(coremlit::embeddings::granite::BUNDLED_TOKENIZER)
+      .expect("parse bundled tokenizer.json");
+  {
+    let vocab = value["model"]["vocab"]
+      .as_object_mut()
+      .expect("model.vocab object");
+    let mut key_a = None;
+    let mut key_b = None;
+    for (key, id) in vocab.iter() {
+      match id.as_u64() {
+        Some(5_000) => key_a = Some(key.clone()),
+        Some(6_000) => key_b = Some(key.clone()),
+        _ => {}
+      }
+    }
+    let key_a = key_a.expect("id 5000 present in base vocab");
+    let key_b = key_b.expect("id 6000 present in base vocab");
+    vocab.insert(key_a, serde_json::json!(6_000));
+    vocab.insert(key_b, serde_json::json!(5_000));
+  }
+  let bytes = serde_json::to_vec(&value).expect("re-serialize mutated tokenizer.json");
+
+  let err = TextEmbedder::from_memory(common::model_path(), &bytes, TextEmbedderOptions::new())
+    .expect_err("a non-identical tokenizer must be refused at construction");
+  match err {
+    Error::TokenizerContractMismatch { check, .. } => {
+      assert_eq!(
+        check, "tokenizer identity (sha-256)",
+        "the behavioral stage must pass first, then the identity backstop fires"
+      );
+    }
+    other => panic!("expected identity TokenizerContractMismatch, got {other:?}"),
   }
 }
 
