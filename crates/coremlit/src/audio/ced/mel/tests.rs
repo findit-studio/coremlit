@@ -16,10 +16,13 @@ fn extract(samples: &[f32]) -> Vec<f32> {
   out
 }
 
-/// STRUCTURAL GATE 1 (spec §8): frame count for the fixed window. center=True
-/// at hop 160 over 160_000 samples ⇒ 1 + 160_000/160 = 1001 frames, and
-/// extraction must fill EVERY element (the NaN seed proves no index is
-/// skipped).
+/// STRUCTURAL GATE 1 (spec §8): frame/bin count for the fixed window.
+/// center=True at hop 160 over 160_000 samples ⇒ 1 + 160_000/160 = 1001
+/// frames. The NaN seed on `out` only proves the buffer is fully WRITTEN (no
+/// length/zip under-run leaves a stale NaN): `db` is zero-initialized in
+/// `extract_into` and the final `top_db` clamp loop writes every element
+/// unconditionally, so a skipped STFT frame/bin (still 0.0, still finite)
+/// would NOT surface here — GATE 2/3/4 are the real numeric catchers.
 #[test]
 fn frame_count_matches_the_believed_hop_geometry() {
   assert_eq!(N_FRAMES, 1 + WINDOW_SAMPLES / 160);

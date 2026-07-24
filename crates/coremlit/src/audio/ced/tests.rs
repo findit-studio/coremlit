@@ -88,6 +88,22 @@ fn validate_reports_the_first_non_finite_sample() {
 }
 
 #[test]
+fn classify_long_zero_k_guard_catches_non_finite_samples_beyond_one_window() {
+  // classify_long's k == 0 arm must still reject a NaN/±∞ clip (previously it
+  // returned Ok(vec![]) unconditionally once EmptyAudio was ruled out). The
+  // guard must work on clips LONGER than WINDOW_SAMPLES — the whole point of
+  // the long-clip path — so it calls check_finite_samples directly rather
+  // than validate_window_input, which would reject on AudioTooLong first.
+  let mut samples = vec![0.0f32; WINDOW_SAMPLES + 500];
+  samples[WINDOW_SAMPLES + 300] = f32::NAN;
+  assert!(matches!(
+    check_finite_samples(&samples),
+    Err(Error::NonFiniteInput { index }) if index == WINDOW_SAMPLES + 300
+  ));
+  assert!(check_finite_samples(&vec![0.0f32; WINDOW_SAMPLES + 500]).is_ok());
+}
+
+#[test]
 fn validate_accepts_one_sample_and_a_full_window() {
   assert!(validate_window_input(&[0.5]).is_ok());
   assert!(validate_window_input(&vec![0.0f32; WINDOW_SAMPLES]).is_ok());

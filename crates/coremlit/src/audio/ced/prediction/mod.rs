@@ -7,7 +7,10 @@
 //! broken by **ascending class index**. Single-window ranking runs the heap
 //! over raw logits and maps sigmoid at extraction (monotonic ⇒ identical
 //! ranking, no 527-element sort — soundevents' exact trick); long-clip ranking
-//! runs the same heap over aggregated confidences with the identity map.
+//! runs the same heap over aggregated confidences with the identity map. Ties
+//! in the raw logit are broken by ascending class index; distinct logits that
+//! saturate to equal f32 confidences keep logit order (the tie-break key is
+//! always the pre-sigmoid score, never the extracted confidence).
 
 use core::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
@@ -129,7 +132,10 @@ impl Confidences {
   }
 
   /// The top `k` classes by confidence, descending, ties broken by ascending
-  /// class index. `k == 0` yields an empty vec; `k > NUM_CLASSES` saturates.
+  /// class index. Unlike the single-window logit path, ranking runs directly
+  /// on these confidence values (the identity map), so what is compared IS
+  /// what is returned — no separate raw key, hence no f32-saturation subtlety
+  /// here. `k == 0` yields an empty vec; `k > NUM_CLASSES` saturates.
   ///
   /// # Errors
   /// [`Error::UnknownClassIndex`] — defensive only (see
@@ -194,7 +200,14 @@ pub(crate) fn top_k_from_scores(
     return Ok(Vec::new());
   }
 
-  let mut heap = BinaryHeap::with_capacity(k);
+  // Capacity is `k.min(NUM_CLASSES)`, not the raw caller `k`: every
+  // in-module score stream holds at most NUM_CLASSES items, so the heap
+  // never needs more regardless of `k`. The unclamped `k` previously let a
+  // natural "give me everything" sentinel like `usize::MAX` panic on
+  // capacity overflow (and `k ~= 2^40` abort via `handle_alloc_error`)
+  // before the saturation loop below ever ran. Output is unchanged for
+  // `k <= NUM_CLASSES`; only this pre-allocation is clamped.
+  let mut heap = BinaryHeap::with_capacity(k.min(NUM_CLASSES));
   for (class_index, score) in scores {
     let candidate = Reverse(RankedScore { class_index, score });
     if heap.len() < k {

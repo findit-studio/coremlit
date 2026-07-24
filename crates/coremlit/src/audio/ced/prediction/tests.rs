@@ -80,13 +80,13 @@ fn zero_k_is_empty_not_an_error() {
 #[test]
 fn oversized_k_saturates_at_num_classes() {
   let scores = scripted_scores();
-  let preds = top_k_from_scores(
-    scores.iter().copied().enumerate(),
-    NUM_CLASSES + 100,
-    sigmoid,
-  )
-  .unwrap();
-  assert_eq!(preds.len(), NUM_CLASSES);
+  // `usize::MAX` is a natural "give me everything" sentinel: it must saturate
+  // like any other oversized `k`, not panic on `BinaryHeap` capacity overflow
+  // (`usize::MAX * size_of::<Entry>() > isize::MAX`) before saturation runs.
+  for k in [NUM_CLASSES + 100, usize::MAX] {
+    let preds = top_k_from_scores(scores.iter().copied().enumerate(), k, sigmoid).unwrap();
+    assert_eq!(preds.len(), NUM_CLASSES, "k={k}");
+  }
 }
 
 #[test]
@@ -158,6 +158,9 @@ fn confidences_top_k_ranks_in_confidence_space() {
   assert_eq!(preds[0].confidence(), 0.9);
   assert_eq!(preds[1].index(), 300);
   assert!(c.top_k(0).unwrap().is_empty());
+  // Same unbounded-k saturation guarantee as top_k_from_scores: no panic, no
+  // abort, exactly NUM_CLASSES back.
+  assert_eq!(c.top_k(usize::MAX).unwrap().len(), NUM_CLASSES);
 }
 
 #[test]

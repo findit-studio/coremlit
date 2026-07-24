@@ -294,9 +294,11 @@ impl Classifier {
   }
 
   /// Classifies one window: the top `k` classes, descending confidence, ties
-  /// broken by ascending class index (the soundevents contract). Runs the
-  /// min-heap over raw logits and maps sigmoid at extraction. `k == 0` returns
-  /// an empty vec without running the model; `k > `[`NUM_CLASSES`] saturates.
+  /// broken by ascending class index (the soundevents contract) — ties in the
+  /// raw logit are broken by ascending class index; distinct logits that
+  /// saturate to equal confidences keep logit order. Runs the min-heap over
+  /// raw logits and maps sigmoid at extraction. `k == 0` returns an empty vec
+  /// without running the model; `k > `[`NUM_CLASSES`] saturates.
   ///
   /// # Errors
   /// As [`Self::raw_scores`]; [`Error::UnknownClassIndex`] is defensive-only.
@@ -374,6 +376,7 @@ impl Classifier {
       if samples_16k.is_empty() {
         return Err(Error::EmptyAudio);
       }
+      check_finite_samples(samples_16k)?;
       return Ok(Vec::new());
     }
     let windows = self.classify_windows(samples_16k, plan)?;
@@ -421,6 +424,16 @@ fn validate_window_input(samples: &[f32]) -> Result<()> {
       max: WINDOW_SAMPLES,
     });
   }
+  check_finite_samples(samples)
+}
+
+/// Reject a NaN/±∞ sample ([`Error::NonFiniteInput`]) — it would silently
+/// poison the mel. The finite-scan shared by [`validate_window_input`] (the
+/// single-window path) and `Classifier::classify_long`'s `k == 0` early
+/// return, which must skip `validate_window_input`'s `AudioTooLong` bound (a
+/// long clip is expected to exceed [`WINDOW_SAMPLES`]) but must still not
+/// wave a NaN/∞ clip through as an empty result.
+fn check_finite_samples(samples: &[f32]) -> Result<()> {
   if let Some(index) = samples.iter().position(|v| !v.is_finite()) {
     return Err(Error::NonFiniteInput { index });
   }

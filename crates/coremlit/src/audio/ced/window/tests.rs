@@ -205,15 +205,24 @@ mod serde_tests {
 
   #[test]
   fn tail_policy_wire_spellings_are_pinned() {
-    // Golden spellings (snake_case) — a rename is a wire break.
-    assert_eq!(serde_json::to_string(&TailPolicy::Pad).unwrap(), "\"pad\"");
-    assert_eq!(
-      serde_json::to_string(&TailPolicy::DropBelowMin {
-        min_samples: 40_000
-      })
-      .unwrap(),
-      "{\"drop_below_min\":{\"min_samples\":40000}}"
-    );
+    // Wildcard-free: a new variant fails to compile until its spelling is
+    // pinned here (the ChunkAggregation golden pattern, `aggregate/tests.rs`).
+    for kind in [
+      TailPolicy::Pad,
+      TailPolicy::DropBelowMin {
+        min_samples: 40_000,
+      },
+    ] {
+      let expected = match kind {
+        TailPolicy::Pad => "\"pad\"".to_string(),
+        TailPolicy::DropBelowMin { min_samples } => {
+          format!("{{\"drop_below_min\":{{\"min_samples\":{min_samples}}}}}")
+        }
+      };
+      assert_eq!(serde_json::to_string(&kind).unwrap(), expected);
+      let back: TailPolicy = serde_json::from_str(&expected).unwrap();
+      assert_eq!(back, kind);
+    }
     assert_eq!(
       serde_json::to_string(&WindowPlan::new()).unwrap(),
       "{\"hop_samples\":160000,\"tail\":\"pad\"}"
