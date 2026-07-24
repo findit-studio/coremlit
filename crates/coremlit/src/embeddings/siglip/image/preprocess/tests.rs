@@ -213,14 +213,47 @@ fn resize_preserves_vertical_constancy() {
   assert!((out[1] - out[3]).abs() <= 1e-6, "column 1 not constant");
 }
 
-// ── E3: uint8 PIL-parity resize kernel (fixed-point oracles) ──────────────────
+// ── E3: uint8 PIL-parity resize oracles (colconv q8 engine) ───────────────────
+//
+// The u8 resize is delegated to colconv's byte-exact PIL-parity q8 resampler,
+// whose source frame is packed RGB8 (3-channel). The kernel is
+// channel-independent, so most of these oracles drive a single-channel Pillow
+// grid by replicating it across the three RGB channels and asserting the same
+// grid on each channel — the committed values are unchanged truth.
+// `resize_u8_distinct_channels_match_independent_pil_grids` below instead
+// gives R, G, and B three independently-derived grids, so a channel-order
+// regression cannot hide behind the replication.
 
-/// Identity dims return the input bytes exactly: each output is a single
-/// unit-weight tap, and the `1 << 21` offset truncates back to the input value.
+/// Replicate a single-channel `u8` pattern across all three RGB channels, the
+/// harness form for driving the RGB8 [`resize_bilinear_antialias_u8`] with a
+/// mono oracle grid.
+fn mono_to_rgb(mono: &[u8]) -> Vec<u8> {
+  let mut rgb = Vec::with_capacity(mono.len() * CHANNELS);
+  for &v in mono {
+    rgb.extend_from_slice(&[v; CHANNELS]);
+  }
+  rgb
+}
+
+/// Extract channel `c` from a packed `(…, 3)` RGB8 buffer as a mono grid.
+fn channel(rgb: &[u8], c: usize) -> Vec<u8> {
+  rgb.iter().skip(c).step_by(CHANNELS).copied().collect()
+}
+
+/// Identity dims (`src == dst`) pass the input bytes through byte-exactly on
+/// every channel — colconv plans a direct copy. 27 distinct bytes (no value
+/// repeated, unlike a mono-replicated `R=G=B` pattern) so a channel-order
+/// permutation on the direct-copy plan would move a value to the wrong slot
+/// and fail this exact comparison.
 #[test]
 fn resize_u8_identity_is_exact() {
-  let src = [17u8, 200, 3, 250, 9, 128, 44, 71, 255]; // 3×3, 1 channel
-  let out = resize_bilinear_antialias_u8(&src, 3, 3, 1, 3, 3).expect("resize");
+  #[rustfmt::skip]
+  let src: [u8; 27] = [
+     1,  2,  3,  4,  5,  6,  7,  8,  9,
+    10, 11, 12, 13, 14, 15, 16, 17, 18,
+    19, 20, 21, 22, 23, 24, 25, 26, 27,
+  ]; // 3×3, RGB-interleaved, every byte distinct
+  let out = resize_bilinear_antialias_u8(&src, 3, 3, 3, 3).expect("resize");
   assert_eq!(out, src);
 }
 
@@ -231,12 +264,12 @@ fn resize_u8_identity_is_exact() {
 #[test]
 fn resize_u8_constant_field_is_constant() {
   let src = vec![123u8; 5 * 7 * 3]; // 5×7, 3 channels
-  let up = resize_bilinear_antialias_u8(&src, 5, 7, 3, 9, 4).expect("upscale");
+  let up = resize_bilinear_antialias_u8(&src, 5, 7, 9, 4).expect("upscale");
   assert!(
     up.iter().all(|&v| v == 123),
     "upscale drifted from constant"
   );
-  let down = resize_bilinear_antialias_u8(&src, 5, 7, 3, 2, 2).expect("downscale");
+  let down = resize_bilinear_antialias_u8(&src, 5, 7, 2, 2).expect("downscale");
   assert!(
     down.iter().all(|&v| v == 123),
     "downscale drifted from constant"
@@ -248,8 +281,8 @@ fn resize_u8_constant_field_is_constant() {
 /// `[.25,.75]`, `[1]`; quantized `[4194304]`, `[3145728,1048576]`, …).
 #[test]
 fn resize_u8_matches_hand_computed_pil_grid_checker() {
-  let src = [0u8, 255, 255, 0];
-  let out = resize_bilinear_antialias_u8(&src, 2, 2, 1, 4, 4).expect("resize");
+  let src = mono_to_rgb(&[0u8, 255, 255, 0]);
+  let out = resize_bilinear_antialias_u8(&src, 2, 2, 4, 4).expect("resize");
   #[rustfmt::skip]
   let expected: [u8; 16] = [
       0,  64, 191, 255,
@@ -257,7 +290,13 @@ fn resize_u8_matches_hand_computed_pil_grid_checker() {
     191, 159,  96,  64,
     255, 191,  64,   0,
   ];
-  assert_eq!(out, expected);
+  for c in 0..CHANNELS {
+    assert_eq!(
+      channel(&out, c),
+      expected,
+      "channel {c} diverged from the PIL grid"
+    );
+  }
 }
 
 /// A 2×2 `[[0,1],[255,255]]` upscaled to 4×4 matches the hand-derived grid, with
@@ -267,8 +306,8 @@ fn resize_u8_matches_hand_computed_pil_grid_checker() {
 /// per-pass (u8 intermediate) rounding as non-vacuous.
 #[test]
 fn resize_u8_per_pass_rounding_discriminates_from_float() {
-  let src = [0u8, 1, 255, 255];
-  let out = resize_bilinear_antialias_u8(&src, 2, 2, 1, 4, 4).expect("resize");
+  let src = mono_to_rgb(&[0u8, 1, 255, 255]);
+  let out = resize_bilinear_antialias_u8(&src, 2, 2, 4, 4).expect("resize");
   #[rustfmt::skip]
   let expected: [u8; 16] = [
       0,   0,   1,   1,
@@ -276,37 +315,133 @@ fn resize_u8_per_pass_rounding_discriminates_from_float() {
     191, 191, 192, 192,
     255, 255, 255, 255,
   ];
-  assert_eq!(out, expected);
-  // Cells [1][2] and [2][2] (indices 6 and 10) are the float-vs-uint8 tell.
-  assert_eq!((out[6], out[10]), (65, 192));
+  for c in 0..CHANNELS {
+    let ch = channel(&out, c);
+    assert_eq!(ch, expected, "channel {c} diverged from the PIL grid");
+    // Cells [1][2] and [2][2] (indices 6 and 10) are the float-vs-uint8 tell.
+    assert_eq!(
+      (ch[6], ch[10]),
+      (65, 192),
+      "channel {c} per-pass discriminant"
+    );
+  }
 }
 
-/// Pathologically large source dims return a typed
-/// [`Error::PreprocessAllocation`] from [`checked_len3`]'s `checked_mul`
-/// working-buffer sizing arm — no panic, no abort. (The `try_reserve` arm is
-/// not portably forcible.)
+/// Interleave three distinct single-channel `u8` patterns into one packed
+/// RGB8 buffer, one pattern per channel — the harness form for driving
+/// [`resize_bilinear_antialias_u8`] with per-channel-independent oracle grids.
+/// Unlike [`mono_to_rgb`] (which replicates one grid across R, G, and B, and
+/// so cannot see a channel-order permutation), this puts a different pattern
+/// in each channel.
+fn rgb_from_channels(r: &[u8], g: &[u8], b: &[u8]) -> Vec<u8> {
+  assert_eq!(r.len(), g.len());
+  assert_eq!(r.len(), b.len());
+  let mut rgb = Vec::with_capacity(r.len() * CHANNELS);
+  for i in 0..r.len() {
+    rgb.extend_from_slice(&[r[i], g[i], b[i]]);
+  }
+  rgb
+}
+
+/// Distinct-per-channel E3 oracle: R, G, and B carry three DIFFERENT patterns
+/// — the checker grid, its mirror, and the per-pass discriminant grid — each
+/// with its own independently hand-derived PIL fixed-point expectation. Every
+/// other E3 oracle replicates one pattern across all three channels
+/// (`mono_to_rgb`), so a channel-order permutation (RGB↔BGR) in a future
+/// colconv bump would pass them all unchanged; asserting each output channel
+/// against its OWN grid here makes that regression visible — swapping any two
+/// output channels below fails at least one of the three assertions.
+#[test]
+fn resize_u8_distinct_channels_match_independent_pil_grids() {
+  let r_src = [0u8, 255, 255, 0]; // the checker grid (2×2)
+  let g_src = [255u8, 0, 0, 255]; // its mirror
+  let b_src = [0u8, 1, 255, 255]; // the per-pass discriminant grid
+  let src = rgb_from_channels(&r_src, &g_src, &b_src);
+  let out = resize_bilinear_antialias_u8(&src, 2, 2, 4, 4).expect("resize");
+
+  // R: the checker grid's hand-derived surface (same values as
+  // `resize_u8_matches_hand_computed_pil_grid_checker`).
+  #[rustfmt::skip]
+  let r_expected: [u8; 16] = [
+      0,  64, 191, 255,
+     64,  96, 159, 191,
+    191, 159,  96,  64,
+    255, 191,  64,   0,
+  ];
+  // G: the mirror grid's own surface, derived by the same per-tap fixed-point
+  // method as R (not read back from colconv's output). The mirror source is
+  // the checker source's bytewise complement (`255 − v`), and every quantized
+  // weight pair in this 2→4 upscale sums to exactly 2²² with no output
+  // landing on a half-integer tie, so the complement carries through both
+  // passes exactly — this grid is `255 − r_expected` elementwise, confirmed by
+  // direct per-cell computation.
+  #[rustfmt::skip]
+  let g_expected: [u8; 16] = [
+    255, 191,  64,   0,
+    191, 159,  96,  64,
+     64,  96, 159, 191,
+      0,  64, 191, 255,
+  ];
+  // B: the per-pass discriminant grid's hand-derived surface (same values as
+  // `resize_u8_per_pass_rounding_discriminates_from_float`).
+  #[rustfmt::skip]
+  let b_expected: [u8; 16] = [
+      0,   0,   1,   1,
+     64,  64,  65,  65,
+    191, 191, 192, 192,
+    255, 255, 255, 255,
+  ];
+
+  assert_eq!(
+    channel(&out, 0),
+    r_expected,
+    "R channel diverged from its own PIL grid"
+  );
+  assert_eq!(
+    channel(&out, 1),
+    g_expected,
+    "G channel diverged from its own PIL grid"
+  );
+  assert_eq!(
+    channel(&out, 2),
+    b_expected,
+    "B channel diverged from its own PIL grid"
+  );
+}
+
+/// An over-tall source height that overflows colconv's `u32` frame geometry
+/// returns a typed [`Error::PreprocessAllocation`] `{ bytes: usize::MAX }` — no
+/// panic, no abort — before any resize work. (`preprocess_image` caps both axes
+/// far inside `u32`; this exercises the wrapper's own backstop via a direct
+/// call.)
 #[test]
 fn resize_u8_rejects_overflowing_geometry() {
-  match resize_bilinear_antialias_u8(&[0u8; 12], usize::MAX / 2, 2, 3, 2, 2) {
+  match resize_bilinear_antialias_u8(&[0u8; 12], usize::MAX / 2, 2, 2, 2) {
     Err(Error::PreprocessAllocation { bytes }) => assert_eq!(bytes, usize::MAX),
     other => panic!("expected PreprocessAllocation, got {other:?}"),
   }
 }
 
-/// A pathologically large *source* extent trips the coefficient-table
-/// representability pre-guard inside [`precompute_coeffs`] (the horizontal
-/// axis' `out·(2⌈support⌉+1)` element count overflows `usize`), returning a
-/// typed [`Error::PreprocessAllocation`] before any tap is indexed — no panic,
-/// no abort. This is the coefficient-table arm, distinct from the working-buffer
-/// [`checked_len3`] arm above. (The `try_reserve` arms are not portably
-/// forcible.)
+/// The over-wide twin: a source width that overflows colconv's `u32` frame
+/// geometry is rejected with the same typed [`Error::PreprocessAllocation`]
+/// `{ bytes: usize::MAX }`, before any tap is indexed — no panic, no abort. The
+/// tiny `src` is never read.
 #[test]
-fn resize_u8_rejects_coeff_table_overflow() {
-  // src_w = usize::MAX/2, dst_w = 16 ⇒ support ≈ 2⁵⁹, so 2⌈support⌉+1 = 2⁶⁰+1
-  // and 16·(2⁶⁰+1) overflows usize. precompute_coeffs(src_w, dst_w) is the u8
-  // kernel's first action, so the guard fires before any buffer or src indexing;
-  // the tiny src is never read.
-  match resize_bilinear_antialias_u8(&[0u8; 12], 2, usize::MAX / 2, 3, 2, 16) {
+fn resize_u8_rejects_over_wide_source_extent() {
+  match resize_bilinear_antialias_u8(&[0u8; 12], 2, usize::MAX / 2, 2, 16) {
+    Err(Error::PreprocessAllocation { bytes }) => assert_eq!(bytes, usize::MAX),
+    other => panic!("expected PreprocessAllocation, got {other:?}"),
+  }
+}
+
+/// The `dst_len` checked-mul twin: a destination geometry whose `dst_w · dst_h
+/// · 3` byte count overflows `usize` is rejected with the same typed
+/// [`Error::PreprocessAllocation`] `{ bytes: usize::MAX }`, from the output
+/// sizing arm rather than the source-geometry guards above — the tiny `src` is
+/// never resized.
+#[test]
+fn resize_u8_rejects_overflowing_destination_length() {
+  match resize_bilinear_antialias_u8(&[0u8; 12], 2, 2, 2, usize::MAX / 2) {
     Err(Error::PreprocessAllocation { bytes }) => assert_eq!(bytes, usize::MAX),
     other => panic!("expected PreprocessAllocation, got {other:?}"),
   }
@@ -333,7 +468,7 @@ fn preprocess_image_pixel_values_come_from_u8_resize() {
   assert_eq!(out.grid, (1, 1), "budget 1 → single-patch grid");
 
   // The single real patch is normalize_u8 of the u8-resized image, exactly.
-  let resized_u8 = resize_bilinear_antialias_u8(&rgb, 2, 2, CHANNELS, 16, 16).expect("resize");
+  let resized_u8 = resize_bilinear_antialias_u8(&rgb, 2, 2, 16, 16).expect("resize");
   assert_eq!(resized_u8.len(), 16 * 16 * CHANNELS);
   for (k, &v) in resized_u8.iter().enumerate() {
     assert_eq!(
@@ -636,8 +771,9 @@ fn preprocess_rejects_width_over_axis_bound() {
   assert!(matches!(err, Error::ImageDimensions { width, height } if width == w && height == 1));
 }
 
-/// Tall twin — the worse unbounded orientation (the horizontal pass would
-/// materialize a `src_h · dst_w · 3` intermediate, ~805 MB at 16.7M px).
+/// Tall twin — the same rejection on the other orientation. Without the cap an
+/// unbounded source height would drive the resize working set without limit; the
+/// guard fires before any resize allocation.
 #[test]
 fn preprocess_rejects_height_over_axis_bound() {
   let h = MAX_IMAGE_AXIS + 1;
@@ -680,8 +816,8 @@ fn preprocess_accepts_axis_bound_wide_panorama() {
   assert_eq!(real, gh * gw);
 }
 
-/// Tall boundary twin: `1 × MAX_IMAGE_AXIS` — exercises the bounded worst-case
-/// horizontal intermediate (`MAX_IMAGE_AXIS · 16 · 3 ≈ 50 MB`) end to end.
+/// Tall boundary twin: `1 × MAX_IMAGE_AXIS` — drives the bounded worst-case
+/// resize (a `MAX_IMAGE_AXIS`-tall source down to a 1-wide grid) end to end.
 #[test]
 fn preprocess_accepts_axis_bound_tall_strip() {
   let rgb = vec![127u8; MAX_IMAGE_AXIS * 3];

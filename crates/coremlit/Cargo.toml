@@ -104,14 +104,21 @@ granite = ["dep:tokenizers", "dep:windit", "windit/text"]
 # SigLIP 2 (`siglip2-base-patch16-naflex`) dual-tower image+text embeddings on
 # CoreML: a shared 768-dim joint space. A Rust NaFlex vision front-end
 # (aspect-preserving patch-budget solver + antialiased-bilinear resize +
-# position-embedding lift; resize/patchify hand-rolled, no `image`/decoder dep)
-# around two fp16 graphs, plus a bundled Gemma tokenizer (`tokenizers`, shared
-# with `whisper`/`clap`/`granite`), L2-normalized in Rust. NaFlex resizes
-# natively to a fixed patch budget, so no windowing is used. The parity oracle is
-# COMMITTED transformers-fp32 goldens (`tests/siglip/fixtures/goldens/`), never a
-# live ONNX crate — so there is NO `siglip-oracle` feature and NO `ort` in this
-# path. `default = []` pulls none of it.
-siglip = ["dep:tokenizers"]
+# position-embedding lift; the u8 image resize is delegated to `colconv`'s
+# byte-exact PIL-parity q8 resampler, while the patch-budget solver / patchify /
+# pos-emb lift stay hand-rolled — no `image`/decoder dep) around two fp16 graphs,
+# plus a bundled Gemma tokenizer (`tokenizers`, shared with
+# `whisper`/`clap`/`granite`), L2-normalized in Rust. NaFlex resizes natively to
+# a fixed patch budget, so no windowing is used. The parity oracle is COMMITTED
+# transformers-fp32 goldens (`tests/siglip/fixtures/goldens/`), never a live ONNX
+# crate — so there is NO `siglip-oracle` feature and NO `ort` in this path.
+# `default = []` pulls none of it.
+#
+# LICENSE PREREQUISITE (owner-gated, NOT resolved by this change): `colconv` is
+# currently licensed GPL-3.0-or-later; the owner will relicense it permissive
+# (MIT OR Apache-2.0) before this branch merges. It is a flagged merge blocker
+# tracked outside this change, not something wired here.
+siglip = ["dep:tokenizers", "dep:colconv"]
 
 [dependencies]
 # --- core CoreML runtime (always compiled) ---
@@ -255,6 +262,27 @@ textclap = { git = "https://github.com/Findit-AI/textclap", rev = "584f21754337a
 #   windit = { path = "../windit" }
 #
 windit = { git = "https://github.com/findit-studio/windit", rev = "b49888002bcbf4927cf69e83323f15652655eed0", optional = true }
+
+# --- embeddings::siglip image resampler (the `siglip` feature) ---
+# `colconv` supplies the byte-exact PIL-parity q8 image resampler the NaFlex u8
+# resize path delegates to, retiring the former hand-rolled fixed-point kernel.
+# `default-features = false` with EXACTLY `["std", "rgb"]`: `std` gates colconv's
+# `Convert` / `resample` tiers (the `Convert::from(Rgb24Frame).resize_with(
+# Triangle, …).rgb(…).run()` path this crate drives), and `rgb` gates the
+# packed-RGB24 source frame — the `frame` umbrella (every YUV/bayer/xyz format)
+# is NOT needed for the RGB→RGB resize, so it stays off. Transitive deps are
+# pure-Rust and ort-free (`mediaframe`, `derive_more`, `half`, `thiserror`).
+# Rev-pinned to the reviewed colconv HEAD (the asry/diaric/windit convention).
+# CO-DEV against a LOCAL colconv checkout: add an UNCOMMITTED patch to the
+# WORKSPACE ROOT Cargo.toml (never commit it):
+#
+#   [patch."https://github.com/findit-studio/colconv"]
+#   colconv = { path = "../colconv" }
+#
+# LICENSE: colconv is GPL-3.0-or-later today; its owner-gated relicense to
+# MIT OR Apache-2.0 is a merge blocker for this branch (see the `siglip` feature
+# comment above).
+colconv = { git = "https://github.com/findit-studio/colconv", rev = "0e2cef95498bbcbb6f500ce14f2137c38ed66470", default-features = false, features = ["std", "rgb"], optional = true }
 
 [dev-dependencies]
 # Integration tests / benches / examples are external consumers: they link the
