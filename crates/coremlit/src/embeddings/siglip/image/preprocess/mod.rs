@@ -169,9 +169,13 @@ fn triangle(t: f64) -> f64 {
 /// bilinear). `align_corners=False` sample centers `(o + 0.5)·scale`. Each entry
 /// is `(start_input_index, normalized_weights)`.
 ///
-/// Image-path callers bound `in_size` by [`MAX_IMAGE_AXIS`], under which this
-/// pure-`f64` extent math coincides bit-for-bit with Pillow's `float box[4]`
-/// semantics (see the const's doc for the threshold).
+/// The sole live caller is the position-embedding lift
+/// ([`lift_position_embeddings`], via [`resize_bilinear_antialias`]), whose
+/// source is the fixed `16×16` base grid ([`POS_GRID_SIDE`]) — the image
+/// resize path uses colconv's `u8` resampler instead
+/// ([`resize_bilinear_antialias_u8`]). `16 ≪ 2²⁴`, so this pure-`f64` extent
+/// math trivially coincides bit-for-bit with Pillow's `float box[4]` semantics
+/// (see [`MAX_IMAGE_AXIS`]'s doc for the threshold).
 ///
 /// # Errors
 /// [`Error::PreprocessAllocation`] if a pathological source extent makes the
@@ -331,9 +335,10 @@ pub(crate) fn resize_bilinear_antialias(
 /// dimension does not fit colconv's `u32` frame geometry, or colconv rejects the
 /// resize plan — returned instead of aborting the process (`colconv` reserves
 /// fallibly and [`Rgb24Frame::try_new`](colconv::frame::Rgb24Frame::try_new)
-/// validates the geometry rather than panicking). `bytes` is the refused
-/// output-buffer size, or [`usize::MAX`] for a geometry that could never be
-/// represented.
+/// validates the geometry rather than panicking). `bytes` is the `dst_h · dst_w
+/// · 3` output-buffer size — representable even when its reservation or
+/// colconv's own resize plan is what actually failed — or [`usize::MAX`] for a
+/// geometry that could never be represented.
 pub(crate) fn resize_bilinear_antialias_u8(
   src: &[u8],
   src_h: usize,
@@ -375,12 +380,16 @@ pub(crate) fn resize_bilinear_antialias_u8(
     .map_err(|_| Error::PreprocessAllocation { bytes: usize::MAX })?;
 
   // Filtered (windowed-triangle = PIL BILINEAR) resample, any ratio; the sole
-  // fallible call assembles the sink and walks the frame into `out`.
+  // fallible call assembles the sink and walks the frame into `out`. `out` is
+  // already sized to `dst_len` (a representable value) at this point, so a
+  // colconv-side plan rejection or internal reservation failure here is
+  // reported at that real size — not aliased onto the `usize::MAX` sentinel,
+  // which is reserved for a geometry that could not be represented at all.
   Convert::from(&frame)
     .resize_with(Triangle, dst_w, dst_h)
     .rgb(&mut out)
     .run()
-    .map_err(|_| Error::PreprocessAllocation { bytes: usize::MAX })?;
+    .map_err(|_| Error::PreprocessAllocation { bytes: dst_len })?;
 
   Ok(out)
 }
