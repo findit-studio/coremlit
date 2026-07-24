@@ -46,16 +46,16 @@
 //! # Model artifacts
 //!
 //! The CoreML graphs (one fp16 artifact per tower) and the base position-grid
-//! sidecar (`pos_embed_16x16x768.f32le.bin`) are distributed on the Hugging Face
-//! Hub at `FinDIT-Studio/siglip2-naflex-coreml`, under the `512`-tier path
-//! prefix, converted from
+//! sidecar (`pos_embed_16x16x768.f32le.bin`) are **converted locally** from the
+//! official
 //! [`google/siglip2-base-patch16-naflex`](https://huggingface.co/google/siglip2-base-patch16-naflex)
-//! (**Apache-2.0**; see the crate `NOTICE`). They are gitignored dev-time
-//! downloads under `Models/siglip2-naflex/` (overridable via
-//! `SIGLIP_TEST_MODELS`); their immutable revision, per-file SHA-256, and I/O
-//! contract are pinned by `tests/siglip/model_io.rs` / `tests/siglip/text_model_io.rs`
-//! once the owner stages the conversion (the conversion runbook in the port
-//! plan).
+//! checkpoint (**Apache-2.0**; see the crate `NOTICE`) by the recipes in
+//! `conversion/siglip/` — not consumed from any pre-uploaded artifact repo. They
+//! are staged gitignored under `Models/siglip2-naflex/` (overridable via
+//! `SIGLIP_TEST_MODELS`); the source revision, per-file SHA-256, and I/O contract
+//! are pinned by `tests/siglip/model_io.rs` / `tests/siglip/text_model_io.rs`. A
+//! public re-upload of the converted artifacts is a later owner decision and would
+//! add its own artifact-repo revision pin.
 //!
 //! # Rust front-end around fp16 CoreML graphs
 //!

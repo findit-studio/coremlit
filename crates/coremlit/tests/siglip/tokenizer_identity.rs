@@ -53,7 +53,11 @@ fn bundled_tokenizer_matches_pinned_sha256_and_is_real() {
     "bundled tokenizer.json is not the pinned google/siglip2-base-patch16-naflex \
      revision artifact"
   );
-  assert_eq!(BUNDLED_TOKENIZER.len(), 34_356_304, "unexpected tokenizer byte length");
+  assert_eq!(
+    BUNDLED_TOKENIZER.len(),
+    34_356_304,
+    "unexpected tokenizer byte length"
+  );
   assert!(
     BUNDLED_TOKENIZER.len() > 1_000_000,
     "the real Gemma tokenizer is tens of MB, never the small placeholder"
@@ -75,7 +79,11 @@ fn every_corpus_text_builds_its_golden_padded_window() {
   let mut saw_mixedcase = false;
   let mut saw_truncated = false;
   for entry in &texts {
-    assert_eq!(entry.token_ids_padded.len(), WINDOW, "golden window must be {WINDOW}");
+    assert_eq!(
+      entry.token_ids_padded.len(),
+      WINDOW,
+      "golden window must be {WINDOW}"
+    );
     let built = build_padded_window(&tok, &entry.text);
     assert_eq!(
       built, entry.token_ids_padded,
@@ -84,7 +92,11 @@ fn every_corpus_text_builds_its_golden_padded_window() {
     );
 
     // n_real matches the non-<pad>(0) count of the golden window.
-    let n_real = entry.token_ids_padded.iter().take_while(|&&id| id != 0).count();
+    let n_real = entry
+      .token_ids_padded
+      .iter()
+      .take_while(|&&id| id != 0)
+      .count();
     assert_eq!(n_real, entry.n_real, "n_real mismatch for {:?}", entry.id);
 
     if entry.id == "mixedcase_cat" {
@@ -112,8 +124,14 @@ fn every_corpus_text_builds_its_golden_padded_window() {
       );
     }
   }
-  assert!(saw_mixedcase, "corpus must include the MixedCase twin entry");
-  assert!(saw_truncated, "corpus must include the >64-token truncated entry");
+  assert!(
+    saw_mixedcase,
+    "corpus must include the MixedCase twin entry"
+  );
+  assert!(
+    saw_truncated,
+    "corpus must include the >64-token truncated entry"
+  );
 
   // Non-vacuity: a one-token perturbation of a caption changes its window.
   let base = &texts[0].text;

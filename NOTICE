@@ -242,43 +242,49 @@ crate via `include_bytes!` (exposed as
 `coremlit::embeddings::siglip::BUNDLED_TOKENIZER`).
 
   8a) Encoder weights — google/siglip2-base-patch16-naflex. The crate ships NO
-      model files; it loads FinDIT-Studio's CoreML conversion of the Google
-      weights.
+      model files; it loads a CoreML conversion produced LOCALLY from the official
+      Google weights (the conversion/siglip recipes) — not consumed from any
+      pre-uploaded artifact repo.
 
         Original model: google/siglip2-base-patch16-naflex
         https://huggingface.co/google/siglip2-base-patch16-naflex
-        License: Apache-2.0 (verify on the model card at staging — STOP if not) —
-        preserve the Apache-2.0 attribution when redistributing the weights (or a
-        binary bundling them).
+        License: Apache-2.0 — preserve the Apache-2.0 attribution when
+        redistributing the weights (or a binary bundling them).
         Attribution: Google DeepMind — SigLIP 2 (Tschannen et al., 2025).
 
-        CoreML conversion actually loaded: FinDIT-Studio/siglip2-naflex-coreml
-        https://huggingface.co/FinDIT-Studio/siglip2-naflex-coreml
-        revision: PENDING (recorded at the conversion runbook's upload step — the
-        immutable commit SHA and per-file SHA-256 are pinned in
-        tests/siglip/model_io.rs / tests/siglip/text_model_io.rs when staged).
+        Converted from source revision (commit SHA):
+        b53b807d3a2d5e2b3911292f2d69e5341cdc064c
+        (model.safetensors SHA-256
+        ac5f28bbdf92c0c1696ccbd3ce716426049cd67ad8045b66d0d938b0f9c8bbec).
+        The converted artifacts are staged locally (gitignored); a public
+        re-upload of them is a later owner decision and would add its own
+        artifact-repo revision. The per-file SHA-256 of the converted bundles is
+        pinned in tests/siglip/model_io.rs / tests/siglip/text_model_io.rs.
 
       As an Apache-2.0 work, a redistributor must retain the license and
       copyright notices AND STATE ANY CHANGES. Unlike a pure format conversion,
-      the CoreML graph is RESTRUCTURED: the per-image position-embedding resize is
-      lifted to a host-side `position_embeddings` input, the attention-pooling
-      head is re-expressed from the identical packed weights with static Q/K/V
-      projections, and the encoder uses eager attention. The weight VALUES are
-      unchanged (parity receipts in the model card); these graph changes are the
-      stated changes.
+      the CoreML vision graph is RESTRUCTURED: the per-image position-embedding
+      resize (a data-dependent antialiased F.interpolate) is lifted OUT of the
+      graph to a host-side `position_embeddings` input that the Rust runtime
+      computes per image. The attention lowering is the checkpoint's own
+      scaled-dot-product attention as traced to CoreML, and the attention-pooling
+      head is traced from the identical packed weights. The weight VALUES are
+      unchanged (fp32 parity cosine 1.0000000 vs the stock model; the shipped fp16
+      GPU arm is granite-class); the host-side position-embedding lift is the
+      stated structural change.
 
   8b) Bundled tokenizer — siglip2-base-patch16-naflex Gemma tokenizer (via
       include_bytes!). Compiled into the crate, so any binary linking coremlit
       with the `siglip` feature redistributes it.
 
         Source: https://huggingface.co/google/siglip2-base-patch16-naflex
-        Revision (commit SHA): PENDING (recorded at staging)
+        Revision (commit SHA): b53b807d3a2d5e2b3911292f2d69e5341cdc064c
         Artifact: tokenizer.json
-        SHA-256: PENDING (pinned in tests/siglip/tokenizer_identity.rs at staging)
+        SHA-256: 58a1696e79c9d97937389ed116f552a15c84811d7b8023918b86f4bc5775b1b0
 
       The artifact is the SigLIP 2 Gemma tokenizer configuration and vocabulary
       (256000 entries); it carries no model weights. It is distributed under the
       same upstream Apache-2.0 terms as the model; retain the license notice when
-      redistributing it. (The committed `assets/tokenizer.json` is a placeholder
-      until the source-revision bytes are staged; the identity gate forces the
-      real artifact in.)
+      redistributing it. (The committed `assets/tokenizer.json` is the real
+      source-revision artifact, pinned by SHA-256 and proven byte-correct by the
+      identity gate in tests/siglip/tokenizer_identity.rs.)

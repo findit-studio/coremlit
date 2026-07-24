@@ -21,11 +21,13 @@
 
 mod common;
 
+use coremlit::embeddings::siglip::{ImageEmbedder, Rgb8Image};
 use serde::Deserialize;
 
 const PATCH_SIZE: usize = 16;
 const PATCH_BUDGET: usize = 512;
 const PATCH_DIM: usize = 3 * 16 * 16;
+const EMBED_DIM: usize = 768;
 
 #[derive(Deserialize)]
 struct Preprocess {
@@ -199,9 +201,11 @@ fn small_oracles_match_committed_torch_reference() {
   for row in &pp.budget_table {
     let (gh, gw) = fit_to_patch_budget(row.height, row.width, PATCH_SIZE, PATCH_BUDGET);
     assert_eq!(
-      [gh, gw], row.grid,
+      [gh, gw],
+      row.grid,
       "budget grid mismatch for {}x{}",
-      row.height, row.width
+      row.height,
+      row.width
     );
     assert!(gh >= 1 && gw >= 1 && gh * gw <= PATCH_BUDGET);
   }
@@ -228,7 +232,10 @@ fn small_oracles_match_committed_torch_reference() {
     assert_eq!(case.dst.len(), case.dst_h * case.dst_w, "resize dst length");
     if case.src == [0, 255, 255, 0] && (case.dst_h, case.dst_w) == (4, 4) {
       saw_checker = true;
-      assert_eq!(case.dst, checker, "checker PIL grid diverged from hand-verified pillow");
+      assert_eq!(
+        case.dst, checker,
+        "checker PIL grid diverged from hand-verified pillow"
+      );
     } else if case.src == [0, 1, 255, 255] && (case.dst_h, case.dst_w) == (4, 4) {
       saw_discriminant = true;
       assert_eq!(
@@ -238,16 +245,26 @@ fn small_oracles_match_committed_torch_reference() {
     } else if (case.dst_h, case.dst_w) == (2, 2) {
       saw_downscale = true;
       let d = &case.dst;
-      assert_eq!((d[0], d[1]), (d[2], d[3]), "constant columns stay row-identical");
+      assert_eq!(
+        (d[0], d[1]),
+        (d[2], d[3]),
+        "constant columns stay row-identical"
+      );
       assert_eq!(
         u16::from(d[0]) + u16::from(d[1]),
         255,
         "antialias downscale must be symmetric about 127.5"
       );
-      assert!(d[0] > 0 && d[0] < d[1] && d[1] < 255, "must low-pass, not hard-subsample");
+      assert!(
+        d[0] > 0 && d[0] < d[1] && d[1] < 255,
+        "must low-pass, not hard-subsample"
+      );
     }
   }
-  assert!(saw_checker && saw_discriminant && saw_downscale, "missing a resize_u8 case");
+  assert!(
+    saw_checker && saw_discriminant && saw_downscale,
+    "missing a resize_u8 case"
+  );
 
   // (3) normalize — exact ((v/255)-0.5)/0.5.
   assert_eq!(pp.normalize.rescale_factor, 1.0 / 255.0);
@@ -263,10 +280,21 @@ fn small_oracles_match_committed_torch_reference() {
   // (4) position lift — reimplemented f64 antialias-bilinear within the committed
   // measured-then-pinned tolerance vs the torch F.interpolate reference values.
   assert!(pp.pos_lift.tolerance > 0.0 && pp.pos_lift.tolerance < 1e-3);
-  assert!(pp.pos_lift.cases.len() >= 2, "need up- and down-scale pos-lift cases");
+  assert!(
+    pp.pos_lift.cases.len() >= 2,
+    "need up- and down-scale pos-lift cases"
+  );
   for case in &pp.pos_lift.cases {
-    assert_eq!(case.input.len(), case.src_h * case.src_w, "pos input length");
-    assert_eq!(case.values.len(), case.dst_h * case.dst_w, "pos values length");
+    assert_eq!(
+      case.input.len(),
+      case.src_h * case.src_w,
+      "pos input length"
+    );
+    assert_eq!(
+      case.values.len(),
+      case.dst_h * case.dst_w,
+      "pos values length"
+    );
     let got = resize2d(&case.input, case.src_h, case.src_w, case.dst_h, case.dst_w);
     let worst = got
       .iter()
@@ -313,19 +341,86 @@ fn small_oracles_match_committed_torch_reference() {
   }
 }
 
+/// Load a committed/staged `.npy` as a flat `Vec<T>`.
+fn load_npy<T: npyz::Deserialize>(path: &std::path::Path) -> Vec<T> {
+  let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+  npyz::NpyFile::new(&bytes[..])
+    .unwrap_or_else(|e| panic!("parse npy {path:?}: {e}"))
+    .into_vec::<T>()
+    .unwrap_or_else(|e| panic!("decode npy {path:?}: {e}"))
+}
+
 /// Full-tensor parity of the Rust NaFlex tensors against the staged per-image
-/// `.npy` fixtures. Wave C implements against `SIGLIP_TEST_MODELS`.
+/// `.npy` fixtures (the slow processor + the official lift). `pixel_values` and
+/// the mask must be BITWISE equal (the pillow-fixed-point contract, delegated to
+/// colconv). For `position_embeddings`, the lifted REAL rows match within the
+/// pinned tolerance while the Rust pad rows are asserted bitwise ZERO — the
+/// reference fills pad rows with `resized[0]` (masked, output-invariant), so the
+/// pad rows are canonicalized, not compared to the raw dump.
 #[test]
-#[ignore = "requires staged siglip preprocessing fixtures (SIGLIP_TEST_MODELS)"]
+#[ignore = "requires staged siglip models (SIGLIP_TEST_MODELS)"]
 fn full_tensor_parity_against_staged_npy() {
-  let _dir = common::models_dir();
-  // Wave C: for each corpus image, decode PNG (common::decode_png_rgb8), run the
-  //         ImageEmbedder preprocessing, compare pixel_values/mask/pos-emb to the
-  //         staged `.npy`. Exact mask equality; pixel_values exact against the
-  //         slow-processor (use_fast=False, pillow 12.3.0) fixture on the u8
-  //         resize. For position_embeddings, compare the lifted REAL rows
-  //         (`.. h_p·w_p`) to the fixture but assert the pad rows bitwise zero
-  //         against the coremlit contract — the reference fills them with
-  //         resized[0] (masked, output-invariant), so canonicalize/exclude the
-  //         pad rows rather than comparing them to the raw dump.
+  const POS_TOL: f32 = 1e-4; // measured-then-pinned; the real-grid lift delta is ~1e-5 class
+  let fdir = common::models_dir().join("fixtures").join("preprocess");
+  let (images, _texts) = common::golden_corpus();
+  // `preprocess` needs the loaded model only for the resolved budget.
+  let embedder = ImageEmbedder::from_files(common::vision_model_path(), common::pos_embed_path())
+    .expect("load vision");
+  let p = embedder.max_num_patches();
+
+  for g in &images {
+    let (rgb, w, h) =
+      common::decode_png_rgb8(&common::fixture_path(&format!("goldens/{}", g.file)));
+    let pre = embedder
+      .preprocess(Rgb8Image::new(&rgb, w, h).expect("rgb"))
+      .expect("preprocess");
+
+    let pv_ref: Vec<f32> = load_npy(&fdir.join(format!("{}.pixel_values.npy", g.id)));
+    let mask_ref: Vec<f32> = load_npy(&fdir.join(format!("{}.attention_mask.npy", g.id)));
+    let pos_ref: Vec<f32> = load_npy(&fdir.join(format!("{}.position_embeddings.npy", g.id)));
+    let ss: Vec<i64> = load_npy(&fdir.join(format!("{}.spatial_shapes.npy", g.id)));
+    assert_eq!(pv_ref.len(), p * PATCH_DIM, "npy pixel_values length");
+    assert_eq!(mask_ref.len(), p, "npy mask length");
+
+    // pixel_values + mask: bitwise (whole array, pads included — both zero-pad).
+    assert_eq!(
+      pre.pixel_values(),
+      pv_ref.as_slice(),
+      "{}: pixel_values not bitwise-equal",
+      g.id
+    );
+    assert_eq!(
+      pre.attention_mask(),
+      mask_ref.as_slice(),
+      "{}: mask not bitwise-equal",
+      g.id
+    );
+
+    // spatial_shapes cross-check against the committed golden.
+    assert_eq!(
+      [ss[0] as usize, ss[1] as usize],
+      g.spatial_shapes,
+      "{}: spatial_shapes",
+      g.id
+    );
+    let n_real = g.spatial_shapes[0] * g.spatial_shapes[1];
+
+    // position_embeddings: real rows within tol; Rust pad rows bitwise zero.
+    let pos = pre.position_embeddings();
+    let worst = pos[..n_real * EMBED_DIM]
+      .iter()
+      .zip(&pos_ref[..n_real * EMBED_DIM])
+      .map(|(a, b)| (a - b).abs())
+      .fold(0.0f32, f32::max);
+    assert!(
+      worst <= POS_TOL,
+      "{}: pos-emb real-row worst delta {worst:e} > {POS_TOL:e}",
+      g.id
+    );
+    assert!(
+      pos[n_real * EMBED_DIM..].iter().all(|&v| v == 0.0),
+      "{}: Rust position_embeddings pad rows must be bitwise zero",
+      g.id
+    );
+  }
 }

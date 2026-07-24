@@ -925,6 +925,34 @@ const GRANITE_NORM_VANISHING_MUTANT: &str = r#"
             tensor<fp16, [1, 512, 384]> input_5_cast_fp16 = layer_norm(axes = input_5_axes_0, epsilon = var_42_to_fp16, gamma = embeddings_norm_weight_to_fp16, x = input_3_cast_fp16)[name = tensor<string, []>("input_5_cast_fp16")];
 "#;
 
+/// siglip's converted SigLIP2 graphs are CLEAN — the fourth norm-only control
+/// beside clapkit's and granite's. Verbatim excerpts of the real shipped graphs
+/// `Models/siglip2-naflex/…/siglip2_vision_512.mlmodelc/model.mil` (an encoder
+/// `layer_norm`, `epsilon = 0x1.1p-20 ≈ 1.013e-6`, source eps 1e-6 rounded to
+/// fp16) and `…/siglip2_text_64.mlmodelc/model.mil` (the first text encoder
+/// `layer_norm` at the same eps). The vision graph carries 26 `layer_norm`s and
+/// the text graph 25, ALL at `0x1.1p-20` — ~17× above the fp16 floor `2^-24` — and
+/// NEITHER graph has any `log`/`sqrt`/`rsqrt`/`real_div` (L2-norm is applied in
+/// Rust, so the rsqrt-guard class is absent by construction, exactly like clapkit
+/// and granite). This snippet is the models-independent proof that siglip's
+/// conversion guard shape audits clean; the live sweep covers every site when
+/// `Models/siglip2-naflex/` is present.
+const SIGLIP_NORMS_CLEAN: &str = r#"
+            tensor<fp16, []> var_63_to_fp16 = const()[name = tensor<string, []>("op_63_to_fp16"), val = tensor<fp16, []>(0x1.1p-20)];
+            tensor<fp16, [1, 512, 768]> input_7_cast_fp16 = layer_norm(axes = input_7_axes_0, beta = encoder_layers_0_layer_norm2_bias_to_fp16, epsilon = var_63_to_fp16, gamma = encoder_layers_0_layer_norm2_weight_to_fp16, x = input_5_cast_fp16)[name = tensor<string, []>("input_7_cast_fp16")];
+            tensor<fp16, []> var_11_to_fp16 = const()[name = tensor<string, []>("op_11_to_fp16"), val = tensor<fp16, []>(0x1.1p-20)];
+            tensor<fp16, [1, 64, 768]> hidden_states_1_cast_fp16 = layer_norm(axes = hidden_states_1_axes_0, beta = text_model_encoder_layers_0_layer_norm1_bias_to_fp16, epsilon = var_11_to_fp16, gamma = text_model_encoder_layers_0_layer_norm1_weight_to_fp16, x = input_3_cast_fp16)[name = tensor<string, []>("hidden_states_1_cast_fp16")];
+"#;
+
+/// The siglip text `layer_norm` with its epsilon halved to `0x1p-25` (exactly half
+/// the fp16 floor) — the mutation a re-conversion would introduce if it dropped the
+/// eps below the floor. It MUST be caught as a vanishing `norm` finding, proving
+/// the clean control above is not vacuously green.
+const SIGLIP_NORM_VANISHING_MUTANT: &str = r#"
+            tensor<fp16, []> var_11_to_fp16 = const()[name = tensor<string, []>("op_11_to_fp16"), val = tensor<fp16, []>(0x1p-25)];
+            tensor<fp16, [1, 64, 768]> hidden_states_1_cast_fp16 = layer_norm(axes = hidden_states_1_axes_0, beta = text_model_encoder_layers_0_layer_norm1_bias_to_fp16, epsilon = var_11_to_fp16, gamma = text_model_encoder_layers_0_layer_norm1_weight_to_fp16, x = input_3_cast_fp16)[name = tensor<string, []>("hidden_states_1_cast_fp16")];
+"#;
+
 /// Two INDEPENDENT sub-threshold guard constants on ONE `log` site: an
 /// `add(x, 0x1p-25)` floor feeding a `log(eps = 0x1p-25)`. Each constant is
 /// `2^-25` — exactly HALF fp16's smallest subnormal — so each rounds to zero in
@@ -1338,6 +1366,46 @@ fn accepts_granite_conversion_norm_guards() {
     vanishing(GRANITE_NORM_VANISHING_MUTANT),
     ["layer_norm/fp16 guard=norm eff=2.9802322387695313e-8"],
     "a granite norm eps halved to 0x1p-25 (below the fp16 floor) must be flagged"
+  );
+}
+
+/// siglip's converted SigLIP2 towers are a CLEAN control (the fourth norm-only
+/// control): both towers' `layer_norm` guards at `0x1.1p-20` clear the fp16 floor,
+/// and no `log`/`sqrt`/`rsqrt`/`real_div` class is present (L2-norm kept out of the
+/// graphs), so the sweep must report siglip clean. Its companion mutant — the text
+/// `layer_norm` with the epsilon halved to `0x1p-25` — MUST be flagged, proving
+/// this control is not vacuously green.
+#[test]
+fn accepts_siglip_conversion_norm_guards() {
+  assert_eq!(
+    vanishing(SIGLIP_NORMS_CLEAN),
+    Vec::<String>::new(),
+    "siglip's 0x1.1p-20 vision+text layer_norm guards all survive fp16"
+  );
+
+  let audit = parse_mil(SIGLIP_NORMS_CLEAN).audit();
+  assert!(
+    audit.unresolved.is_empty(),
+    "the real siglip norm excerpts must parse completely: {:?}",
+    audit.unresolved
+  );
+  // Two layer_norm findings (one per tower), both surviving; no log/div/sqrt class.
+  assert_eq!(
+    audit.findings.len(),
+    2,
+    "one vision + one text layer_norm site"
+  );
+  assert!(audit.findings.iter().all(|f| f.survives_fp16()));
+  assert!(
+    audit.findings.iter().all(|f| f.op == "layer_norm"),
+    "siglip carries only layer_norm guard sites"
+  );
+
+  // Mutation proof: below-floor epsilon is caught, not silently swept green.
+  assert_eq!(
+    vanishing(SIGLIP_NORM_VANISHING_MUTANT),
+    ["layer_norm/fp16 guard=norm eff=2.9802322387695313e-8"],
+    "a siglip norm eps halved to 0x1p-25 (below the fp16 floor) must be flagged"
   );
 }
 
