@@ -95,7 +95,8 @@ use crate::embeddings::granite::{
 /// directly. It passes the construction-time tokenizer contract
 /// (`validate_tokenizer_contract`) trivially; a caller-supplied tokenizer (via
 /// [`TextEmbedder::from_memory`] / [`TextEmbedder::from_files`]) is checked
-/// against that same contract, fail-closed.
+/// against that same contract AND against this artifact's SHA-256 (byte
+/// identity), fail-closed.
 pub const BUNDLED_TOKENIZER: &[u8] = include_bytes!("assets/tokenizer.json");
 
 /// Declared feature names on the granite `.mlmodelc` (pinned by
@@ -131,6 +132,13 @@ mod contract {
   /// included) — the same pin `token_ids_match_pinned_golden_subset` asserts.
   pub const SENTINEL_TEXT: &str = "hello world";
   pub const SENTINEL_IDS: [u32; 4] = [CLS_ID, 24_313, 2_318, EOS_ID];
+  /// SHA-256 (lowercase hex) of the pinned granite `tokenizer.json` artifact —
+  /// the exact bytes of `BUNDLED_TOKENIZER` — the byte identity a caller-supplied
+  /// tokenizer must match (the `validate_tokenizer_identity` backstop). Tied to
+  /// the artifact bytes and the golden-source SHA literal by
+  /// `bundled_tokenizer_sha_matches_golden_source_pin`.
+  pub const TOKENIZER_SHA256_HEX: &str =
+    "4f2842d568e2724370aec203652a42ac783c7937f8347a1a2cc7506d71f1582f";
 }
 
 /// Fixed token-sequence length the ModernBERT graph was converted at (the
@@ -321,7 +329,7 @@ impl TextEmbedder {
   /// As [`Self::from_files`] (with the bundled tokenizer bytes).
   pub fn load(model_path: impl AsRef<Path>, options: TextEmbedderOptions) -> Result<Self> {
     let tokenizer = Tokenizer::from_bytes(BUNDLED_TOKENIZER).map_err(Error::TokenizerLoad)?;
-    Self::from_parts(model_path, tokenizer, options)
+    Self::from_parts(model_path, tokenizer, options, TokenizerProvenance::Bundled)
   }
 
   /// Loads the granite `.mlmodelc` from `model_path` using the bundled tokenizer
@@ -340,15 +348,22 @@ impl TextEmbedder {
   /// if its I/O contract mismatches; [`Error::TokenizerLoad`] if the tokenizer
   /// JSON is unreadable/invalid; [`Error::TokenizerConfig`] if truncation cannot
   /// be configured; [`Error::TokenizerContractMismatch`] if the tokenizer does
-  /// not match the Granite tokenizer/model contract (`validate_tokenizer_contract`).
+  /// not match the Granite tokenizer/model contract (`validate_tokenizer_contract`)
+  /// or is not byte-identical (SHA-256) to the pinned granite `tokenizer.json` —
+  /// granite is a fixed model with exactly one correct tokenizer artifact; supply
+  /// the pinned bytes or [`BUNDLED_TOKENIZER`].
   pub fn from_files(
     model_path: impl AsRef<Path>,
     tokenizer_json_path: impl AsRef<Path>,
     options: TextEmbedderOptions,
   ) -> Result<Self> {
-    let tokenizer =
-      Tokenizer::from_file(tokenizer_json_path.as_ref()).map_err(Error::TokenizerLoad)?;
-    Self::from_parts(model_path, tokenizer, options)
+    // Read the file ONCE and delegate to `from_memory`, so the identity hash and
+    // the parse see the SAME bytes (no re-read, no TOCTOU). An unreadable file
+    // keeps today's `Error::TokenizerLoad` identity — `tokenizers::Error` is a
+    // boxed `dyn Error`, so `io::Error` converts with `.into()`.
+    let bytes =
+      std::fs::read(tokenizer_json_path.as_ref()).map_err(|e| Error::TokenizerLoad(e.into()))?;
+    Self::from_memory(model_path, &bytes, options)
   }
 
   /// Loads the model from a path and the tokenizer from caller-supplied bytes.
@@ -360,22 +375,36 @@ impl TextEmbedder {
     tokenizer_json_bytes: &[u8],
     options: TextEmbedderOptions,
   ) -> Result<Self> {
+    // Hash the RAW supplied bytes (never a re-serialization of the parsed
+    // `Tokenizer`, which would not reproduce the artifact's formatting/ordering)
+    // for the byte-identity backstop in `from_parts`.
+    let sha256_hex = sha256_hex(tokenizer_json_bytes);
     let tokenizer = Tokenizer::from_bytes(tokenizer_json_bytes).map_err(Error::TokenizerLoad)?;
-    Self::from_parts(model_path, tokenizer, options)
+    Self::from_parts(
+      model_path,
+      tokenizer,
+      options,
+      TokenizerProvenance::Supplied { sha256_hex },
+    )
   }
 
   fn from_parts(
     model_path: impl AsRef<Path>,
     mut tokenizer: Tokenizer,
     options: TextEmbedderOptions,
+    provenance: TokenizerProvenance,
   ) -> Result<Self> {
     configure_tokenizer(&mut tokenizer)?;
-    // Reject a caller-supplied tokenizer that does not match the Granite
-    // tokenizer/model contract, fail-closed and BEFORE the expensive
-    // `Model::load` — every public constructor passes through here, so no
-    // `TextEmbedder` can exist with an unvalidated tokenizer (the bundled
-    // tokenizer passes trivially; this also guards a corrupted build asset).
+    // Two-stage tokenizer gate, fail-closed and BEFORE the expensive `Model::load`
+    // — every public constructor passes through here, so no `TextEmbedder` can
+    // exist with an unvalidated tokenizer. FIRST the behavioral contract (named,
+    // actionable diagnostics for an accidentally foreign tokenizer; the bundled
+    // tokenizer passes trivially, and this also guards a corrupted build asset);
+    // THEN, for caller-supplied bytes, the byte-identity backstop that catches
+    // corruption or version skew outside the behavioral spot-checks' coverage
+    // (bundled bytes are identity-by-construction, so their provenance is a no-op).
     validate_tokenizer_contract(&tokenizer)?;
+    validate_tokenizer_identity(&provenance)?;
     // The pad positions are attention-masked to 0 and CLS pooling reads position
     // 0 (never a pad), so the pad token value is immaterial to the output; a
     // valid vocabulary index is all that is required. `validate_tokenizer_contract`
@@ -700,7 +729,9 @@ fn configure_tokenizer(tokenizer: &mut Tokenizer) -> Result<()> {
 ///
 /// Checks, first failure wins: the three special-token ids, the total vocabulary
 /// size, the maximum token id (the out-of-vocabulary gate), then the pinned
-/// sentinel encoding.
+/// sentinel encoding. These behavioral checks are a spot-check; on the
+/// caller-supplied path `validate_tokenizer_identity` runs next as the exact
+/// byte-identity backstop for corruption or version skew outside their coverage.
 ///
 /// # Errors
 /// [`Error::TokenizerContractMismatch`] naming the first failed check;
@@ -767,6 +798,62 @@ fn validate_tokenizer_contract(tokenizer: &Tokenizer) -> Result<()> {
   }
 
   Ok(())
+}
+
+/// Lowercase-hex SHA-256 of `bytes` — the tokenizer-identity digest. Mirrors the
+/// dev-time provenance folds (`granite/tests.rs`, `tests/granite/common`).
+fn sha256_hex(bytes: &[u8]) -> String {
+  use sha2::{Digest, Sha256};
+  Sha256::digest(bytes)
+    .iter()
+    .map(|b| format!("{b:02x}"))
+    .collect()
+}
+
+/// Where a constructor's tokenizer bytes came from — decides whether the
+/// byte-identity backstop ([`validate_tokenizer_identity`]) computes a hash.
+enum TokenizerProvenance {
+  /// The compiled-in [`BUNDLED_TOKENIZER`] bytes: byte identity holds by
+  /// construction (pinned dev-time by
+  /// `bundled_tokenizer_sha_matches_golden_source_pin` and
+  /// `tests/granite/tokenizer_identity.rs`), so no runtime hash is computed — the
+  /// bundled constructors stay zero-overhead.
+  Bundled,
+  /// Caller-supplied bytes (`from_files` / `from_memory`): the lowercase-hex
+  /// SHA-256 of the RAW input bytes, exactly as supplied (never a re-serialization
+  /// of the parsed tokenizer).
+  Supplied { sha256_hex: String },
+}
+
+/// Byte-identity backstop for caller-supplied tokenizers, fail-closed. granite is
+/// a FIXED model, so exactly one tokenizer artifact is correct — the pinned
+/// `tokenizer.json`, SHA-256 [`contract::TOKENIZER_SHA256_HEX`], the exact bytes
+/// of [`BUNDLED_TOKENIZER`]. The behavioral contract
+/// ([`validate_tokenizer_contract`]) runs FIRST (named, actionable diagnostics
+/// for accidentally foreign tokenizers); this then catches what no behavioral
+/// spot-check can — corruption or version skew outside the sentinel's coverage
+/// (swapped vocab entries, divergent merges, normalizer drift) that would
+/// silently produce wrong embeddings. A re-serialized but behaviorally identical
+/// tokenizer is rejected BY DESIGN: supply the pinned artifact bytes (or
+/// [`BUNDLED_TOKENIZER`]) instead.
+///
+/// # Errors
+/// [`Error::TokenizerContractMismatch`] with `check = "tokenizer identity
+/// (sha-256)"` if a supplied digest differs from the pin.
+fn validate_tokenizer_identity(provenance: &TokenizerProvenance) -> Result<()> {
+  match provenance {
+    TokenizerProvenance::Bundled => Ok(()),
+    TokenizerProvenance::Supplied { sha256_hex }
+      if sha256_hex == contract::TOKENIZER_SHA256_HEX =>
+    {
+      Ok(())
+    }
+    TokenizerProvenance::Supplied { sha256_hex } => Err(Error::TokenizerContractMismatch {
+      check: "tokenizer identity (sha-256)",
+      expected: contract::TOKENIZER_SHA256_HEX.to_string(),
+      actual: sha256_hex.clone(),
+    }),
+  }
 }
 
 /// Builds the fixed `[1, `[`MAX_TOKENS`]`]` `input_ids` / `attention_mask` window
@@ -888,7 +975,10 @@ fn chunk_long(
   // per-chunk `token_ids` in `embed_long_with`. The closure cannot stop early
   // (the tokenizers crate exposes no incremental token count on its stable
   // surface), so a giant untrusted input is scanned a few times even under a
-  // `max_windows` cap — a recorded limitation, not silently fine.
+  // `max_windows` cap — a recorded limitation, not silently fine. Mitigated by
+  // `LongTextOptions::max_input_bytes` (the pre-tokenization byte gate); windit's
+  // `measure_within` hook exists should the tokenizer ever grow incremental
+  // encoding.
   let measure = |s: &str| -> usize {
     measure_tok
       .encode(s, true)

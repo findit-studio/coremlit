@@ -112,12 +112,17 @@ pub enum Error {
   /// tokenizer/model contract (vocabulary size, special-token ids, the model's
   /// id range, or the pinned sentinel encoding), so it would produce finite but
   /// semantically meaningless embeddings — or out-of-vocabulary ids the model
-  /// can only gather as zeros. Checked at construction, fail-closed, by every
-  /// constructor.
+  /// can only gather as zeros; OR it is behaviorally valid but not byte-identical
+  /// (SHA-256) to the pinned granite `tokenizer.json`, catching corruption or
+  /// version skew outside the behavioral checks' coverage. Checked at
+  /// construction, fail-closed, by every constructor; the byte-identity stage
+  /// runs on the caller-supplied constructors (`from_memory` / `from_files`) —
+  /// the bundled tokenizer's identity is pinned at dev time.
   #[error("tokenizer contract mismatch on `{check}`: expected {expected}, got {actual}")]
   TokenizerContractMismatch {
     /// Name of the contract check that failed (e.g. `vocab size`,
-    /// `special token <|startoftext|>`, `max token id`, `sentinel encoding`).
+    /// `special token <|startoftext|>`, `max token id`, `sentinel encoding`,
+    /// `tokenizer identity (sha-256)`).
     check: &'static str,
     /// The contract this module expects, rendered for display.
     expected: String,

@@ -98,7 +98,7 @@ clap-oracle = ["clap", "dep:textclap"]
 # transformers-fp32 goldens (`tests/granite/fixtures/goldens/`), never a live
 # ONNX crate — so there is NO `granite-oracle` feature and NO `ort` in this path.
 # `default = []` pulls none of it.
-granite = ["dep:tokenizers", "dep:windit", "windit/text"]
+granite = ["dep:tokenizers", "dep:windit", "windit/text", "dep:sha2"]
 
 # --- embeddings::siglip (the SigLIP 2 image+text phase) ---
 # SigLIP 2 (`siglip2-base-patch16-naflex`) dual-tower image+text embeddings on
@@ -280,6 +280,15 @@ textclap = { git = "https://github.com/Findit-AI/textclap", rev = "584f21754337a
 #   windit = { path = "../windit" }
 #
 windit = { git = "https://github.com/findit-studio/windit", rev = "b49888002bcbf4927cf69e83323f15652655eed0", optional = true }
+
+# --- embeddings::granite runtime tokenizer-identity digest (the `granite` feature) ---
+# Pure-Rust SHA-256 for granite's supplied-tokenizer byte-identity backstop:
+# `from_memory`/`from_files` hash the RAW input bytes and compare against the
+# pinned `tokenizer.json` SHA-256, fail-closed. Rides `granite` ONLY (a
+# granite-less build never pulls it — proven by the no-default-features check),
+# and is a dev-dependency too (the model/tokenizer provenance SHA pins), which
+# cargo unifies with this optional entry.
+sha2 = { workspace = true, optional = true }
 
 # --- embeddings::siglip image resampler (the `siglip` feature) ---
 # `colconv` supplies the byte-exact PIL-parity q8 image resampler the NaFlex u8

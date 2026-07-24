@@ -52,6 +52,13 @@ fn bundled_tokenizer_sha_matches_golden_source_pin() {
     sha, "4f2842d568e2724370aec203652a42ac783c7937f8347a1a2cc7506d71f1582f",
     "bundled tokenizer.json diverged from the granite tokenizer that cut the goldens"
   );
+  // Tie the runtime identity const to the same literal, so const ↔ literal ↔
+  // artifact-bytes cannot drift apart (the assert above ties bytes ↔ literal).
+  assert_eq!(
+    contract::TOKENIZER_SHA256_HEX,
+    "4f2842d568e2724370aec203652a42ac783c7937f8347a1a2cc7506d71f1582f",
+    "the tokenizer-identity contract const must equal the pinned golden-source SHA"
+  );
 }
 
 /// Encode `text` through granite's ACTUAL configured tokenizer seam (the same
@@ -1067,15 +1074,22 @@ fn input_too_large_takes_precedence_over_window_budget() {
 
 // ── #6: tokenizer contract validation (hermetic) ─────────────────────────────
 
-/// Parse the bundled tokenizer JSON, apply `mutate`, re-serialize, and build the
-/// module's CONFIGURED tokenizer from the result — so a contract check sees
-/// exactly the production tokenization. `serde_json` is a dev-dependency.
-fn mutated_bundled_tokenizer(mutate: impl FnOnce(&mut serde_json::Value)) -> Tokenizer {
+/// Parse the bundled tokenizer JSON, apply `mutate`, and re-serialize to bytes —
+/// the raw input a caller-supplied constructor receives. `serde_json` is a
+/// dev-dependency.
+fn mutated_bundled_tokenizer_bytes(mutate: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
   let mut value: serde_json::Value =
     serde_json::from_slice(BUNDLED_TOKENIZER).expect("parse bundled tokenizer.json");
   mutate(&mut value);
-  let bytes = serde_json::to_vec(&value).expect("re-serialize mutated tokenizer.json");
-  configured_tokenizer_from_bytes(&bytes).expect("configure mutated tokenizer")
+  serde_json::to_vec(&value).expect("re-serialize mutated tokenizer.json")
+}
+
+/// Parse the bundled tokenizer JSON, apply `mutate`, re-serialize, and build the
+/// module's CONFIGURED tokenizer from the result — so a contract check sees
+/// exactly the production tokenization.
+fn mutated_bundled_tokenizer(mutate: impl FnOnce(&mut serde_json::Value)) -> Tokenizer {
+  configured_tokenizer_from_bytes(&mutated_bundled_tokenizer_bytes(mutate))
+    .expect("configure mutated tokenizer")
 }
 
 /// The bundled granite tokenizer passes every contract check — the invariant on
@@ -1200,4 +1214,129 @@ fn tokenizer_contract_rejects_divergent_encoding() {
     }
     other => panic!("expected TokenizerContractMismatch on sentinel encoding, got {other:?}"),
   }
+}
+
+// ── #6: tokenizer BYTE-IDENTITY backstop (hermetic) ──────────────────────────
+//
+// The behavioral contract above is a spot-check (specials, count, max id, one
+// sentinel), so a corrupted-but-behaviorally-valid supplied tokenizer slips
+// through it. `validate_tokenizer_identity` closes that gap on the
+// caller-supplied path by pinning the exact artifact SHA-256, fail-closed. These
+// tests drive the digest + provenance seam directly (no model).
+
+/// THE codex repro: two ordinary base-vocab entries with their ids swapped
+/// (5000 ↔ 6000, neither a special nor a sentinel content id) sail through every
+/// BEHAVIORAL check — specials, count, max id, and the `"hello world"` sentinel
+/// are all untouched — yet any text using those two tokens would embed with wrong
+/// ids. The byte-identity backstop REJECTS this behaviorally-valid but
+/// non-identical tokenizer (the gap this fix closes).
+#[test]
+fn tokenizer_identity_rejects_non_sentinel_vocab_corruption() {
+  const SWAP_A: u64 = 5_000;
+  const SWAP_B: u64 = 6_000;
+  // Guard: the swapped ids must avoid the specials and sentinel content ids, so
+  // the corruption stays invisible to every behavioral check.
+  const RESERVED: [u64; 5] = [24_313, 2_318, 179_934, 179_935, 179_938];
+  assert!(
+    !RESERVED.contains(&SWAP_A) && !RESERVED.contains(&SWAP_B),
+    "swap ids must avoid the specials and sentinel content ids"
+  );
+
+  let bytes = mutated_bundled_tokenizer_bytes(|value| {
+    let vocab = value["model"]["vocab"]
+      .as_object_mut()
+      .expect("model.vocab object");
+    let mut key_a = None;
+    let mut key_b = None;
+    for (key, id) in vocab.iter() {
+      match id.as_u64() {
+        Some(SWAP_A) => key_a = Some(key.clone()),
+        Some(SWAP_B) => key_b = Some(key.clone()),
+        _ => {}
+      }
+    }
+    let key_a = key_a.expect("id 5000 present in base vocab");
+    let key_b = key_b.expect("id 6000 present in base vocab");
+    vocab.insert(key_a, serde_json::json!(SWAP_B));
+    vocab.insert(key_b, serde_json::json!(SWAP_A));
+  });
+
+  // (a) finding pin: the BEHAVIORAL gate alone ACCEPTS this corruption (documents
+  // the gap; a future behavioral check that starts catching it flags the fixture
+  // for rework).
+  let configured = configured_tokenizer_from_bytes(&bytes).expect("configure mutated");
+  validate_tokenizer_contract(&configured)
+    .expect("behavioral contract accepts non-sentinel vocab corruption");
+
+  // (b) premise guard: the mutated bytes are not the pinned artifact.
+  assert_ne!(
+    bytes.as_slice(),
+    BUNDLED_TOKENIZER,
+    "the swap must actually change the bytes"
+  );
+
+  // (c) the identity backstop REJECTS it, naming the identity check with the
+  // pinned expected / computed actual digests.
+  let actual = sha256_hex(&bytes);
+  match validate_tokenizer_identity(&TokenizerProvenance::Supplied {
+    sha256_hex: actual.clone(),
+  }) {
+    Err(Error::TokenizerContractMismatch {
+      check,
+      expected,
+      actual: reported,
+    }) => {
+      assert_eq!(check, "tokenizer identity (sha-256)");
+      assert_eq!(expected, contract::TOKENIZER_SHA256_HEX);
+      assert_eq!(reported, actual);
+    }
+    other => panic!("expected identity TokenizerContractMismatch, got {other:?}"),
+  }
+}
+
+/// Policy pin: byte identity, NOT behavioral identity, on the supplied path. A
+/// parse→re-serialize round-trip of the bundled JSON (no semantic change) stays
+/// behaviorally valid yet is byte-different (serde_json reorders keys / drops the
+/// artifact's formatting), so the backstop REJECTS it — callers must supply the
+/// pinned artifact bytes, not a re-emitted equivalent.
+#[test]
+fn tokenizer_identity_rejects_reserialized_bundled_json() {
+  let bytes = mutated_bundled_tokenizer_bytes(|_| {});
+
+  let configured = configured_tokenizer_from_bytes(&bytes).expect("configure round-trip");
+  validate_tokenizer_contract(&configured).expect("a re-serialized bundle is behaviorally valid");
+
+  assert_ne!(
+    bytes.as_slice(),
+    BUNDLED_TOKENIZER,
+    "a serde_json round-trip must actually differ from the pinned bytes"
+  );
+
+  let actual = sha256_hex(&bytes);
+  match validate_tokenizer_identity(&TokenizerProvenance::Supplied {
+    sha256_hex: actual.clone(),
+  }) {
+    Err(Error::TokenizerContractMismatch {
+      check,
+      actual: reported,
+      ..
+    }) => {
+      assert_eq!(check, "tokenizer identity (sha-256)");
+      assert_eq!(reported, actual);
+    }
+    other => panic!("expected identity TokenizerContractMismatch, got {other:?}"),
+  }
+}
+
+/// The backstop ACCEPTS the two legitimate supplied-byte sources: the pinned
+/// artifact bytes (`BUNDLED_TOKENIZER`) via `Supplied`, and the zero-overhead
+/// `Bundled` provenance the internal constructors pass (no hash computed).
+#[test]
+fn tokenizer_identity_accepts_bundled_bytes_and_bundled_provenance() {
+  validate_tokenizer_identity(&TokenizerProvenance::Supplied {
+    sha256_hex: sha256_hex(BUNDLED_TOKENIZER),
+  })
+  .expect("the pinned bundled bytes are the identity");
+  validate_tokenizer_identity(&TokenizerProvenance::Bundled)
+    .expect("bundled provenance is identity by construction");
 }

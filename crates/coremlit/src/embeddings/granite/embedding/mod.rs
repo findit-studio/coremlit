@@ -71,7 +71,7 @@ impl Embedding {
   }
 
   /// Reconstruct from a stored unit vector. Validates length, finiteness, AND
-  /// unit-norm (`(norm² − 1).abs() ≤ ``NORM_BUDGET`), then re-normalizes the
+  /// unit-norm (`(norm² − 1).abs() ≤ NORM_BUDGET`), then re-normalizes the
   /// accepted vector through the f64 path, so the stored embedding is unit-norm
   /// to fp32 ULP and [`Self::cosine`] stays in `[−1, 1]` (within fp rounding)
   /// for every successfully constructed pair — a budget-edge vector stored raw
