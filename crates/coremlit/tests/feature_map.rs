@@ -77,7 +77,7 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
       "granite",
       vec!["dep:tokenizers", "dep:windit", "windit/text"],
     ),
-    ("siglip", vec!["dep:tokenizers"]),
+    ("siglip", vec!["dep:tokenizers", "dep:colconv"]),
   ]
 }
 

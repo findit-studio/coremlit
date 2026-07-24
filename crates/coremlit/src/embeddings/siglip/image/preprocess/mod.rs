@@ -11,11 +11,12 @@
 //!    fits `P`.
 //! 2. [`resize_bilinear_antialias_u8`] — the PIL-parity antialiased-bilinear
 //!    image resize in the **uint8 domain** (Pillow `Resample.c` fixed-point:
-//!    22-bit coefficients, per-pass u8 rounding), matching the SigLIP2 processor
-//!    (resize on u8, THEN rescale+normalize). Its sibling f64
-//!    [`resize_bilinear_antialias`] is the position-embedding lift's kernel
-//!    (stage 5), which the reference genuinely computes in float. The u8
-//!    kernel's bit-exactness holds for source axes ≤ [`MAX_IMAGE_AXIS`], which
+//!    22-bit coefficients, per-pass u8 rounding), delegated to [`colconv`]'s
+//!    byte-exact q8 resampler and matching the SigLIP2 processor (resize on u8,
+//!    THEN rescale+normalize). Its sibling f64 [`resize_bilinear_antialias`] is
+//!    the position-embedding lift's kernel (stage 5), which the reference
+//!    genuinely computes in float and which stays native here. The u8 path's
+//!    bit-exactness holds for source axes ≤ [`MAX_IMAGE_AXIS`], which
 //!    [`preprocess_image`] enforces.
 //! 3. [`normalize_u8`] — rescale + normalize `((v/255) − 0.5)/0.5`.
 //! 4. [`patchify`] — reshape the resized+normalized image to `[P, 768]` patch
@@ -62,17 +63,17 @@ pub const PATCH_DIM: usize = CHANNELS * PATCH_SIZE * PATCH_SIZE;
 ///   `precompute_coeffs(int inSize, float in0, float in1, …)` computes
 ///   `scale = (double)(in1 - in0) / outSize`), so the source extent is rounded
 ///   to `f32` before the `f64` coefficient math. Every integer extent `≤ 2²⁴`
-///   is exactly `f32`-representable, making the pure-`f64`
-///   `precompute_coeffs` here bit-identical to Pillow's; from `2²⁴ + 1`
-///   upward Pillow computes with a different extent (`16 777 219 →
-///   16 777 220.0f32`) and the uint8 kernel's bit-exact contract would
-///   silently break. The cap keeps every accepted extent 16× inside the
+///   is exactly `f32`-representable, keeping both colconv's q8 image resampler
+///   and the native `f64` `precompute_coeffs` (the pos-emb lift) bit-identical
+///   to Pillow's; from `2²⁴ + 1` upward Pillow computes with a different extent
+///   (`16 777 219 → 16 777 220.0f32`) and the u8 resize's bit-exact contract
+///   would silently break. The cap keeps every accepted extent 16× inside the
 ///   envelope.
-/// * **Bounded working memory.** The per-axis coefficient tables (`~2·axis`
-///   taps) and the horizontal pass's `u8` intermediate (`src_h · dst_w · 3`
-///   bytes) grow linearly with the accepted axis — hundreds of MB to over a
-///   GB for degenerate strips the budget solver otherwise accepts. Under the
-///   cap the whole resize working set stays ≈ 100 MB even at the boundary.
+/// * **Bounded working memory.** The resize output (`dst_h · dst_w · 3` bytes)
+///   and colconv's streaming working set both grow with the accepted axis — a
+///   degenerate strip the budget solver otherwise accepts could demand
+///   hundreds of MB. Under the cap the whole resize working set stays modest
+///   even at the boundary.
 ///
 /// `2²⁰` px per axis is far beyond any physically decodable image (record
 /// stitched panoramas peak near `8.5 × 10⁵` px on the long axis), so the
@@ -104,12 +105,6 @@ const RESCALE_FACTOR_F64: f64 = 1.0 / 255.0;
 const IMAGE_MEAN: f32 = 0.5;
 /// Per-channel normalization std `0.5` (`image_std`).
 const IMAGE_STD: f32 = 0.5;
-
-/// Fixed-point precision of the uint8 resample coefficients, Pillow's
-/// `PRECISION_BITS = 32 − 8 − 2 = 22` (`Resample.c`): weights are quantized to
-/// `2²²`, accumulated over `u8` taps with a `1 << 21` half-unit rounding offset,
-/// then shifted right by 22 and clamped to `u8`.
-const PRECISION_BITS: u32 = 22;
 
 /// Aspect-preserving patch-budget solver: the largest multiple-of-`patch`
 /// target size whose patch grid `h_p · w_p` fits `budget`, returned as the
@@ -312,148 +307,81 @@ pub(crate) fn resize_bilinear_antialias(
   Ok(out)
 }
 
-/// Quantizes one axis's `f64` resample coefficients to Pillow's 22-bit fixed
-/// point (`normalize_coeffs_8bpc`): `kk = (int)(±0.5 + w·2²²)`, rounding half
-/// away from zero. Bilinear weights are non-negative in practice; the negative
-/// branch mirrors PIL exactly for any residual.
+/// PIL-parity antialiased-bilinear resize of a packed RGB8 image
+/// (`(src_h, src_w, 3)` row-major, RGB-interleaved) to `(dst_h, dst_w, 3)`,
+/// delegated to [`colconv`]'s fixed-point q8 resampler.
 ///
-/// Consumes `coeffs` by value: each entry's `f64` weights vector drops as soon
-/// as its `i32` twin is built, so the two precisions never fully coexist —
-/// the safe-Rust analogue of Pillow's in-place `kk = (INT32 *)prekk` reuse
-/// (`normalize_coeffs_8bpc`).
+/// colconv's `Triangle` (PIL BILINEAR) u8 path reproduces Pillow's 8bpc
+/// `Resample.c` pipeline byte-for-byte — 22-bit coefficients, per-pass `u8`
+/// rounding of the horizontal intermediate — which is exactly the SigLIP2
+/// processor's image-resize semantics (resize on `u8`, THEN rescale+normalize;
+/// the per-pass rounding is part of the reference and is what a pure-`f64`
+/// resize cannot emulate). The byte-exactness is enforced upstream by colconv's
+/// tolerance-0 Pillow golden suite and downstream by this module's committed E3
+/// oracles (`tests.rs`).
 ///
-/// # Errors
-/// [`Error::PreprocessAllocation`] if a quantized coefficient vector cannot be
-/// reserved (the input table is already bounded, so only the reservation can
-/// fail; the quantized values are unchanged from the infallible form).
-fn quantize_coeffs_8bpc(coeffs: Vec<(usize, Vec<f64>)>) -> Result<Vec<(usize, Vec<i32>)>, Error> {
-  let scale = f64::from(1i32 << PRECISION_BITS);
-  let mut out = Vec::new();
-  out
-    .try_reserve_exact(coeffs.len())
-    .map_err(|_| Error::PreprocessAllocation {
-      bytes: coeffs
-        .len()
-        .saturating_mul(core::mem::size_of::<(usize, Vec<i32>)>()),
-    })?;
-  for (start, weights) in coeffs {
-    let mut kk = Vec::new();
-    kk.try_reserve_exact(weights.len())
-      .map_err(|_| Error::PreprocessAllocation {
-        bytes: weights.len().saturating_mul(core::mem::size_of::<i32>()),
-      })?;
-    for &w in &weights {
-      let q = if w < 0.0 {
-        (-0.5 + w * scale) as i32
-      } else {
-        (0.5 + w * scale) as i32
-      };
-      kk.push(q);
-    }
-    out.push((start, kk));
-  }
-  Ok(out)
-}
-
-/// Pillow's `clip8`: arithmetic-shift the fixed-point accumulator back to the
-/// integer domain (`>> 22`) and clamp to `u8`. Equivalent to PIL's clip lookup
-/// over the reachable accumulator range.
-fn clip8(ss: i64) -> u8 {
-  (ss >> PRECISION_BITS).clamp(0, 255) as u8
-}
-
-/// Element count `a·b·c`, or [`Error::PreprocessAllocation`]
-/// `{ bytes: usize::MAX }` on `usize` overflow — a pathological source geometry
-/// whose working buffer cannot even be represented, let alone allocated.
-fn checked_len3(a: usize, b: usize, c: usize) -> Result<usize, Error> {
-  a.checked_mul(b)
-    .and_then(|ab| ab.checked_mul(c))
-    .ok_or(Error::PreprocessAllocation { bytes: usize::MAX })
-}
-
-/// A zeroed `Vec<u8>` of `len` bytes reserved fallibly (`try_reserve_exact`), so
-/// a pathological source geometry returns [`Error::PreprocessAllocation`]
-/// instead of aborting the process on allocator failure.
-fn alloc_u8(len: usize) -> Result<Vec<u8>, Error> {
-  let mut v = Vec::new();
-  v.try_reserve_exact(len)
-    .map_err(|_| Error::PreprocessAllocation { bytes: len })?;
-  v.resize(len, 0);
-  Ok(v)
-}
-
-/// PIL-parity antialiased-bilinear resample in the **uint8 domain** (Pillow
-/// `Resample.c`, `PRECISION_BITS = 22`): per pass, [`precompute_coeffs`] taps
-/// are quantized to 22-bit fixed point, accumulated over `u8` taps with a
-/// `1 << 21` rounding offset, then shifted (`>> 22`) and clamped back to `u8` —
-/// **including the `u8` horizontal intermediate between the two passes**. This
-/// is the image path of the SigLIP2 processor (resize on `u8`, then
-/// rescale+normalize); the per-pass rounding is part of the reference semantics
-/// and is what the `f64` kernel cannot emulate.
-///
-/// The accumulator is `i64`; PIL relies on `ss ≤ 2²¹ + 255·(2²² + ksize/2) ≈
-/// 1.07e9 < i32::MAX` holding, and `i64` gives the identical result while
-/// immunizing debug-overflow. The src-dependent horizontal intermediate is
-/// sized with [`checked_len3`] and reserved with [`alloc_u8`] (fallible), and
-/// the coefficient tables are reserved fallibly by [`precompute_coeffs`] /
-/// [`quantize_coeffs_8bpc`], so a pathological geometry returns a typed error
-/// rather than aborting. A `src` shorter than `src_h·src_w·channels` panics on
-/// an out-of-bounds tap — a caller-internal invariant.
-///
-/// [`quantize_coeffs_8bpc`] consumes its `f64` input table, so the `f64` and
-/// `i32` tables never fully coexist; this fn also drops the horizontal `i32`
-/// table with `drop` before the vertical one is built, so peak coefficient
-/// memory is one table at a time. The only caller, [`preprocess_image`],
-/// bounds `src_h`/`src_w` by [`MAX_IMAGE_AXIS`], which keeps every table and
-/// the horizontal intermediate under ≈ 100 MB and — because every accepted
-/// axis is then exactly `f32`-representable — keeps this kernel inside
-/// Pillow's `float box[4]` exact envelope (see [`MAX_IMAGE_AXIS`]'s doc for
-/// the threshold); the bound is an invariant of the caller, not re-checked
-/// here.
+/// The only caller, [`preprocess_image`], bounds `src_h`/`src_w` by
+/// [`MAX_IMAGE_AXIS`], which keeps every accepted extent exactly
+/// `f32`-representable — inside Pillow's `float box[4]` envelope, so colconv's
+/// coefficient math matches Pillow's (see [`MAX_IMAGE_AXIS`]) — and keeps
+/// colconv's streaming working set small.
 ///
 /// # Errors
-/// [`Error::PreprocessAllocation`] if a working buffer or coefficient table's
-/// size overflows `usize` or cannot be reserved.
+/// [`Error::PreprocessAllocation`] if the output buffer cannot be reserved, a
+/// dimension does not fit colconv's `u32` frame geometry, or colconv rejects the
+/// resize plan — returned instead of aborting the process (`colconv` reserves
+/// fallibly and [`Rgb24Frame::try_new`](colconv::frame::Rgb24Frame::try_new)
+/// validates the geometry rather than panicking). `bytes` is the refused
+/// output-buffer size, or [`usize::MAX`] for a geometry that could never be
+/// represented.
 pub(crate) fn resize_bilinear_antialias_u8(
   src: &[u8],
   src_h: usize,
   src_w: usize,
-  channels: usize,
   dst_h: usize,
   dst_w: usize,
 ) -> Result<Vec<u8>, Error> {
-  const OFFSET: i64 = 1 << (PRECISION_BITS - 1);
+  use colconv::{Convert, frame::Rgb24Frame, resample::Triangle};
 
-  // Horizontal pass: (src_h, src_w, C) → (src_h, dst_w, C), u8 intermediate.
-  let wc = quantize_coeffs_8bpc(precompute_coeffs(src_w, dst_w)?)?;
-  let mut tmp = alloc_u8(checked_len3(src_h, dst_w, channels)?)?;
-  for y in 0..src_h {
-    for (ox, (start, weights)) in wc.iter().enumerate() {
-      for c in 0..channels {
-        let mut ss: i64 = OFFSET;
-        for (k, &wk) in weights.iter().enumerate() {
-          ss += i64::from(src[(y * src_w + start + k) * channels + c]) * i64::from(wk);
-        }
-        tmp[(y * dst_w + ox) * channels + c] = clip8(ss);
-      }
-    }
-  }
-  drop(wc); // horizontal table is dead before the vertical pass builds its own
+  // colconv's frame geometry is `u32`; a source extent that does not fit could
+  // never be represented, let alone allocated. Only reachable through a direct
+  // pathological-geometry call — `preprocess_image` caps both axes by
+  // `MAX_IMAGE_AXIS`, far inside `u32`.
+  let width =
+    u32::try_from(src_w).map_err(|_| Error::PreprocessAllocation { bytes: usize::MAX })?;
+  let height =
+    u32::try_from(src_h).map_err(|_| Error::PreprocessAllocation { bytes: usize::MAX })?;
+  let stride = width
+    .checked_mul(CHANNELS as u32)
+    .ok_or(Error::PreprocessAllocation { bytes: usize::MAX })?;
 
-  // Vertical pass: (src_h, dst_w, C) → (dst_h, dst_w, C).
-  let hc = quantize_coeffs_8bpc(precompute_coeffs(src_h, dst_h)?)?;
-  let mut out = alloc_u8(checked_len3(dst_h, dst_w, channels)?)?;
-  for (oy, (start, weights)) in hc.iter().enumerate() {
-    for x in 0..dst_w {
-      for c in 0..channels {
-        let mut ss: i64 = OFFSET;
-        for (k, &wk) in weights.iter().enumerate() {
-          ss += i64::from(tmp[((start + k) * dst_w + x) * channels + c]) * i64::from(wk);
-        }
-        out[(oy * dst_w + x) * channels + c] = clip8(ss);
-      }
-    }
-  }
+  // Output buffer (`dst_h · dst_w · 3` bytes), reserved fallibly so a
+  // pathological target geometry returns a typed error instead of aborting on
+  // allocator failure.
+  let dst_len = dst_w
+    .checked_mul(dst_h)
+    .and_then(|hw| hw.checked_mul(CHANNELS))
+    .ok_or(Error::PreprocessAllocation { bytes: usize::MAX })?;
+  let mut out = Vec::new();
+  out
+    .try_reserve_exact(dst_len)
+    .map_err(|_| Error::PreprocessAllocation { bytes: dst_len })?;
+  out.resize(dst_len, 0);
+
+  // The tightly-packed RGB24 source frame; `try_new` (not the panicking `new`)
+  // validates dimensions and plane length, returning a typed error on a
+  // pathological direct-call extent.
+  let frame = Rgb24Frame::try_new(src, width, height, stride)
+    .map_err(|_| Error::PreprocessAllocation { bytes: usize::MAX })?;
+
+  // Filtered (windowed-triangle = PIL BILINEAR) resample, any ratio; the sole
+  // fallible call assembles the sink and walks the frame into `out`.
+  Convert::from(&frame)
+    .resize_with(Triangle, dst_w, dst_h)
+    .rgb(&mut out)
+    .run()
+    .map_err(|_| Error::PreprocessAllocation { bytes: usize::MAX })?;
+
   Ok(out)
 }
 
@@ -626,14 +554,14 @@ pub(crate) fn preprocess_image(
 
   let (grid_h, grid_w) = fit_to_patch_budget(height, width, PATCH_SIZE, budget);
 
-  // Resize in the u8 domain (PIL-parity fixed-point kernel), then
+  // Resize in the u8 domain (colconv's PIL-parity q8 resampler), then
   // rescale+normalize to f32 — the SigLIP2 processor's order AND dtype (it
   // resizes the u8 image, rounding each pass to u8, then casts to f32). No
-  // whole-image f32 buffer is materialized; the only src-dependent allocation is
-  // the kernel's fallibly-reserved u8 intermediate.
+  // whole-image f32 buffer is materialized; colconv streams the resize and the
+  // only owned buffer is its fallibly-reserved u8 output.
   let dst_h = grid_h * PATCH_SIZE;
   let dst_w = grid_w * PATCH_SIZE;
-  let resized_u8 = resize_bilinear_antialias_u8(rgb, height, width, CHANNELS, dst_h, dst_w)?;
+  let resized_u8 = resize_bilinear_antialias_u8(rgb, height, width, dst_h, dst_w)?;
   let resized: Vec<f32> = resized_u8.iter().map(|&v| normalize_u8(v)).collect();
 
   let (pixel_values, attention_mask) = patchify(&resized, grid_h, grid_w, budget)?;
