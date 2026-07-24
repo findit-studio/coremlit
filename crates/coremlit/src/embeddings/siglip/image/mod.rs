@@ -262,11 +262,10 @@ impl PreprocessedImage {
 
   /// Module-internal constructor for the pipeline's own outputs, whose
   /// structural invariants (lengths, binary prefix mask, zero pads) hold by
-  /// construction in `patchify` / `lift_position_embeddings` (cf.
-  /// `Embedding::from_array_trusted_unit_norm`). Deliberately does NOT assert
-  /// finiteness: a non-finite value in a caller-supplied position-grid sidecar
-  /// must keep flowing to the same typed predict-time error it always did, not
-  /// become a debug panic.
+  /// construction in `patchify` / `lift_position_embeddings`. Deliberately does
+  /// NOT assert finiteness: a non-finite value in a caller-supplied
+  /// position-grid sidecar must keep flowing to the same typed predict-time
+  /// error it always did, not become a debug panic.
   fn from_pipeline(
     pixel_values: Vec<f32>,
     position_embeddings: Vec<f32>,
