@@ -60,13 +60,19 @@ impl MockCounters {
 
 /// Pre-allocated per-window decoder state for [`MockBackend`] — a Swift
 /// `DecodingInputs` analogue scaled down to what the mock needs: a script
-/// cursor, the KV-advance record, and the alignment-weight scratch buffer.
+/// cursor, the KV-advance record, the fixed alignment-weight buffer, the
+/// row staged by the last step (`pending`), and the per-window
+/// `hasAlignment` gate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MockDecoderState {
   step: usize,
   consumed: Vec<(u32, usize)>,
   alignment: Vec<f32>,
-  written_rows: usize,
+  /// `(position, row)` staged by the last [`InferenceBackend::decode_step`],
+  /// awaiting a [`InferenceBackend::commit_alignment_row`]; `None` when that
+  /// step scripted no row.
+  pending: Option<(usize, Vec<f32>)>,
+  window_has_alignment: bool,
 }
 
 impl MockDecoderState {
@@ -97,6 +103,11 @@ pub struct MockBackend {
   // is what lets a replayed script fail on one window/attempt only.
   fail_calls: Vec<usize>,
   attempted: Arc<Mutex<usize>>,
+  // When set, `reset_decoder_state` does NOT rewind the script cursor, so
+  // consecutive windows/attempts consume consecutive script slices (see
+  // `with_continuous_script`). Reset-immune scripting state, like
+  // `fail_calls` above; the default (false) rewinds for fallback-replay.
+  continuous_script: bool,
 }
 
 impl Default for MockBackend {
@@ -115,7 +126,32 @@ impl MockBackend {
       counters: Arc::new(Mutex::new(MockCounters::default())),
       fail_calls: Vec::new(),
       attempted: Arc::new(Mutex::new(0)),
+      continuous_script: false,
     }
+  }
+
+  /// Puts this mock in continuous-script mode: [`InferenceBackend::reset_decoder_state`]
+  /// no longer rewinds the script cursor, so consecutive windows (and
+  /// fallback attempts) consume consecutive script slices instead of
+  /// replaying the same one from the top. Reset-immune like
+  /// [`Self::fail_on_call`]'s ordinal (see the `fail_calls` field) — the
+  /// default rewind backs the fallback-replay tests; this backs multi-window
+  /// fixtures where each window must decode a different token/alignment
+  /// sequence (whisper #41's cross-window alignment staleness is observable
+  /// only when a later, shorter window consults a row an earlier, longer
+  /// window committed).
+  #[must_use]
+  #[inline(always)]
+  pub fn with_continuous_script(mut self) -> Self {
+    self.set_continuous_script(true);
+    self
+  }
+
+  /// Sets [`Self::with_continuous_script`]'s cursor mode in place.
+  #[inline(always)]
+  pub fn set_continuous_script(&mut self, continuous: bool) -> &mut Self {
+    self.continuous_script = continuous;
+    self
   }
 
   /// Scripts the `call`-th (1-based, counted across resets)
@@ -188,8 +224,9 @@ impl MockBackend {
   }
 
   /// Appends one scripted step with explicit `logits` and an
-  /// `alignment_row`, written at row `position + 1` when this step runs
-  /// (see [`InferenceBackend::alignment_weights`]).
+  /// `alignment_row`, staged by that step and committed to row `position + 1`
+  /// only when the decode loop calls [`InferenceBackend::commit_alignment_row`]
+  /// (see that method and [`InferenceBackend::alignment_weights`]).
   ///
   /// # Panics
   /// If `logits.len() != self.dims().vocab()`.
@@ -244,19 +281,30 @@ impl InferenceBackend for MockBackend {
     Ok(MockDecoderState {
       step: 0,
       consumed: Vec::new(),
-      // One row of headroom: `decode_step` at `position` writes its
+      // One row of headroom: `decode_step` at `position` commits its
       // alignment row at `position + 1`, so the last legal position
-      // (`max_token_context - 1`) must still have a row to land in.
+      // (`max_token_context - 1`) must still have a row to land in. Zeroed
+      // here once per run — reset never re-clears it (Swift's once-allocated
+      // tensor, TextDecoder.swift:141).
       alignment: vec![0.0; (self.dims.max_token_context() + 1) * self.dims.n_audio_ctx()],
-      written_rows: 0,
+      pending: None,
+      window_has_alignment: false,
     })
   }
 
   fn reset_decoder_state(&self, state: &mut Self::DecoderState) {
-    state.step = 0;
+    // Continuous-script mode leaves the cursor so consecutive windows
+    // consume consecutive script slices (see `with_continuous_script`); the
+    // default rewinds it for the fallback-replay tests.
+    if !self.continuous_script {
+      state.step = 0;
+    }
     state.consumed.clear();
-    state.alignment.fill(0.0);
-    state.written_rows = 0;
+    // Alignment buffer deliberately NOT cleared — mirrors the real backend
+    // and Swift's once-allocated tensor (Models.swift:312-322 resets only
+    // cacheLength + masks). Only the per-window commit bookkeeping resets.
+    state.window_has_alignment = false;
+    state.pending = None;
     self
       .counters
       .lock()
@@ -291,15 +339,23 @@ impl InferenceBackend for MockBackend {
     logits.clear();
     logits.extend_from_slice(&scripted.logits);
 
-    if let Some(row) = &scripted.alignment_row {
-      let cols = self.dims.n_audio_ctx();
-      let start = (position + 1) * cols;
-      state.alignment[start..start + cols].copy_from_slice(row);
-      // Gated exactly like the real backend (and Swift's
-      // `if let ... = cache?.alignmentWeights`): steps without an
-      // alignment row do not extend the view.
-      state.written_rows = state.written_rows.max(position + 2);
+    if position == 0 {
+      // A fresh window begins at position 0: Swift's per-window
+      // `var hasAlignment = false` (:568), plus dropping any row the prior
+      // window's completing step staged but never committed. Reset clears
+      // both too; this keeps them honest on the dormant silent-window
+      // `continue` that skips reset.
+      state.window_has_alignment = false;
+      state.pending = None;
     }
+    // Stage this step's scripted row (if any) — committed into the buffer
+    // only by a following `commit_alignment_row`, exactly like the real
+    // backend (Swift updates alignment on non-completing steps only,
+    // TextDecoder.swift:709-717).
+    state.pending = scripted
+      .alignment_row
+      .as_ref()
+      .map(|row| (position, row.clone()));
     state.step += 1;
 
     self
@@ -310,17 +366,31 @@ impl InferenceBackend for MockBackend {
     Ok(())
   }
 
+  fn commit_alignment_row(&self, state: &mut Self::DecoderState) {
+    // Take the row staged by the preceding `decode_step` and write it at row
+    // `position + 1` (Swift's non-completing-step slot,
+    // TextDecoder.swift:709-717); no-op when nothing was staged.
+    let Some((position, row)) = state.pending.take() else {
+      return;
+    };
+    let cols = self.dims.n_audio_ctx();
+    let start = (position + 1) * cols;
+    state.alignment[start..start + cols].copy_from_slice(&row);
+    state.window_has_alignment = true;
+  }
+
   fn alignment_weights<'state>(
     &self,
     state: &'state Self::DecoderState,
   ) -> Option<AlignmentView<'state>> {
-    let cols = self.dims.n_audio_ctx();
-    let rows = state.written_rows;
-    Some(AlignmentView::new(
-      &state.alignment[..rows * cols],
-      rows,
-      cols,
-    ))
+    // Same gate + full-buffer view as the real backend: `None` for a
+    // zero-commit window (Swift's `hasAlignment ? tensor : nil`,
+    // TextDecoder.swift:764-771), else the fixed `(max_ctx + 1) * cols`
+    // accumulator with its stale/committed rows intact (whisper #41).
+    state.window_has_alignment.then(|| {
+      let cols = self.dims.n_audio_ctx();
+      AlignmentView::new(&state.alignment, self.dims.max_token_context() + 1, cols)
+    })
   }
 
   fn dims(&self) -> ModelDims {

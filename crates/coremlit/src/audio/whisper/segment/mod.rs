@@ -1007,12 +1007,17 @@ pub fn add_word_timestamps(
   // construction (`:432` unconditionally appends `index + indexOffset`,
   // and `:441` advances `indexOffset` by exactly the previous segment's
   // token count), so "filtering" the alignment weights collapses to a
-  // prefix take over rows `0..word_token_ids.len()`. Swift's destination
-  // `MLMultiArray` is zero-initialized (`initialValue: FloatType(0)`,
-  // `:450`) and only rows `0..alignmentWeights.rows` are ever memcpy'd in
-  // (`:454-459`), so rows beyond that read back as zero there too -- this
-  // mirrors that exactly, rather than requiring
-  // `word_token_ids.len() <= alignment.rows()`.
+  // prefix take over rows `0..word_token_ids.len()`. The view is the
+  // backend's FIXED-size accumulator now, so `alignment.rows() == max_ctx +
+  // 1 >= needed` for every real window (`needed <= 224 < 225`): the
+  // `.min(needed)` below always copies all `needed` rows and this `data`
+  // zero-init is defensive-only. Whichever rows this window did not commit
+  // carry an earlier window's bytes or the construction-time zero, and that
+  // stale/zero content is the parity-bearing payload (whisper #41) -- exactly
+  // like Swift's memcpy (`:454-459`) out of its once-allocated
+  // `alignmentWeights` tensor whose uncommitted rows read back as the
+  // previous window's values, into the per-call zero-initialized destination
+  // (`initialValue: FloatType(0)`, `:450`).
   let needed = word_token_ids.len();
   let cols = alignment.cols();
   // The doc's zero-columns promise, honored HERE: `chunks_mut(0)` below

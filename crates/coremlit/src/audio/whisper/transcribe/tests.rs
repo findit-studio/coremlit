@@ -1771,10 +1771,33 @@ fn silence_skipped_window_with_word_timestamps_surfaces_a_segment_error() {
   // `no_speech_prob` is permanently `0.0` (`decode/mod.rs`'s own
   // faithfully-ported upstream TODO) — no positive threshold, including
   // the default, can trigger the silence skip through a real decode.
+  //
+  // The window must COMMIT at least one alignment row, else the `hasAlignment`
+  // gate (whisper #41) makes `alignment_weights` return `None`, the whole
+  // word-timestamp block is skipped, and `run` succeeds with no error. That
+  // gate is Swift-correct (an alignment-less model skips word timestamps
+  // entirely); this test's purpose — pinning the typed analogue of Swift's
+  // `1...0` crash, which presupposes an alignment-carrying window — is
+  // preserved by scripting alignment rows onto the window's steps.
   let t = tiny_tokenizer();
-  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  let s = special();
   let hello = t.encode(" Hello").unwrap()[0];
-  script_clean_window(&mut mock, hello);
+  let mut mock = MockBackend::new().with_dims(
+    ModelDims::new()
+      .with_window_samples(16_000)
+      .with_n_audio_ctx(100),
+  );
+  for (token, peak) in [
+    (s.english_token(), 1),
+    (s.transcribe_token(), 2),
+    (ts(0), 3),
+    (hello, 4),
+    (ts(100), 5),
+    (ts(100), 6),
+    (s.end_token(), 7),
+  ] {
+    push_aligned(&mut mock, token, peak);
+  }
   let task = TranscribeTask::new(&mock, &t);
   let options = DecodingOptions::new()
     .with_word_timestamps()
@@ -2861,4 +2884,443 @@ fn load_timings_default_stamps_all_zero() {
   ] {
     assert_eq!(value, 0.0);
   }
+}
+
+// ---------------------------------------------------------------------
+// AC-2: alignment-lifecycle parity fixtures (whisper #41, design §4)
+// ---------------------------------------------------------------------
+
+/// The `(word, start, end)` tuples of one segment, for pinning word timings.
+fn seg_word_tuples(seg: &TranscriptionSegment) -> Vec<(String, f32, f32)> {
+  seg
+    .words_slice()
+    .iter()
+    .map(|w| (w.word().to_string(), w.start(), w.end()))
+    .collect()
+}
+
+/// One scripted step whose logits are one-hot on `token` and whose 100-col
+/// alignment row peaks (value `1.0`) at column `peak`. `peak * 0.02 s` is
+/// where the DTW places that token's frame; kept `< 50` (`< 1.0 s`) so a
+/// word end stays inside its 1 s window and the seek refine cannot overshoot.
+fn push_aligned(mock: &mut MockBackend, token: u32, peak: usize) {
+  let mut row = vec![0.0f32; 100];
+  row[peak] = 1.0;
+  mock.push_step_with_alignment(one_hot(token), row);
+}
+
+/// Builds the four-window shape fixture of design §4 Test A on a fresh mock
+/// (continuous-script, so each window consumes the next script slice and the
+/// alignment accumulator carries across windows). Returns the mock; the
+/// caller pairs it with `tiny_tokenizer` audio `vec![0.1; 80_000]` (5 s ->
+/// exactly four 1 s windows at seek 0/16k/32k/48k) under
+/// `.with_word_timestamps().with_without_timestamps().maybe_drop_blank_audio(false)`.
+///
+/// Peak columns encode the discriminator: W1's `world` row (committed at row
+/// 7) peaks at 30 (C_STALE), so W2 — which drops its own completing EOT row
+/// (would-be row 7, peaked 45 = C_FRESH) — reads W1's stale 30 for its last
+/// word's end. W3/W4 consult only fresh rows (controls).
+fn four_shape_alignment_fixture(t: &WhisperTokenizer) -> MockBackend {
+  let s = special();
+  let hello = t.encode(" Hello").unwrap()[0];
+  let world = t.encode(" World").unwrap()[0];
+  let again = t.encode(" again").unwrap()[0];
+  let more = t.encode(" more").unwrap()[0];
+  let alpha = t.encode(" alpha").unwrap()[0];
+  let beta = t.encode(" beta").unwrap()[0];
+  let gamma = t.encode(" gamma").unwrap()[0];
+  let x = s.no_timestamps_token(); // last-prefill sample, discarded by forcing
+  let mut mock = MockBackend::new()
+    .with_dims(
+      ModelDims::new()
+        .with_window_samples(16_000)
+        .with_n_audio_ctx(100),
+    )
+    .with_continuous_script();
+
+  // W1 — noTimestampEnding (slicing), offset 0 s. Committed rows 1..9; row
+  // 10 (s9/EOT, peak 30) is the completing step, dropped. `more` (row 9)
+  // peaks HIGH at 40; its divergent row 10 would clip it back to `again`'s
+  // column 20 if it landed (mutation A) — post-fix it is dropped so `more`
+  // keeps its own peak.
+  for (token, peak) in [
+    (s.english_token(), 3),
+    (s.transcribe_token(), 5),
+    (x, 7),
+    (hello, 9),
+    (ts(25), 11),
+    (ts(25), 13),
+    (world, 30),         // C_STALE: row 7, read stale by W2's dropped EOT row
+    (again, 20),         // `more`'s predecessor — the clip target column
+    (more, 40),          // W1's last real word, HIGH peak
+    (s.end_token(), 30), // would-be row 10, dropped (clips `more` if landed)
+  ] {
+    push_aligned(&mut mock, token, peak);
+  }
+  // W2 — lump, offset 1 s, the staleness jewel. Committed rows 1..6; row 7
+  // (s16/EOT, peak 45 = C_FRESH) is the completing step, dropped -> row 7
+  // keeps W1's stale peak 30. `gamma` (row 6) peaks HIGH at 40 with `beta`
+  // (row 5) at 20: the stale row-7 peak 30 sits between them and CLIPS gamma
+  // back to column 20 (correct), whereas the fresh 45 (> 40, mutation A) or a
+  // zeroed row (mutation B) would not clip it.
+  for (token, peak) in [
+    (s.english_token(), 5),
+    (s.transcribe_token(), 8),
+    (x, 11),
+    (alpha, 14),
+    (beta, 20),          // gamma's predecessor — the clip target column
+    (gamma, 40),         // W2's last real word, HIGH peak
+    (s.end_token(), 45), // would-be row 7, dropped -> stale 30 survives
+  ] {
+    push_aligned(&mut mock, token, peak);
+  }
+  // W3 — singleTimestampEnding, offset 2 s, control (all consulted rows
+  // fresh). Ends `.. world ts(50) EOT`.
+  for (token, peak) in [
+    (s.english_token(), 5),
+    (s.transcribe_token(), 8),
+    (x, 11),
+    (hello, 14),
+    (ts(25), 17),
+    (ts(25), 19),
+    (world, 22),
+    (ts(50), 25),
+    (s.end_token(), 48),
+  ] {
+    push_aligned(&mut mock, token, peak);
+  }
+  // W4 — consecutive ending (the JFK shape), offset 3 s, control. Ends
+  // `.. hello ts(50) ts(50) EOT`.
+  for (token, peak) in [
+    (s.english_token(), 5),
+    (s.transcribe_token(), 8),
+    (x, 11),
+    (hello, 14),
+    (ts(50), 17),
+    (ts(50), 19),
+    (s.end_token(), 48),
+  ] {
+    push_aligned(&mut mock, token, peak);
+  }
+  mock
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn four_window_shapes_read_stale_and_dropped_alignment_rows() {
+  // Design §4 Test A. Four windows share one continuous script and one
+  // never-cleared alignment accumulator (seek 0/16k/32k/48k over 5 s). W1
+  // (noTs slicing) and W2 (lump) each DROP their completing EOT row; W2 then
+  // reads W1's stale row 7 (peak 30), which sits between W2's `beta` (col 20)
+  // and `gamma` (col 40) and CLIPS `gamma` back to column 20. W3 (singleTs)
+  // and W4 (consecutive) consult only fresh rows — controls, byte-identical
+  // pre/post fix.
+  //
+  // Word-end literals were MEASURED post-fix, then hand-checked against the
+  // DTW row-selection rule (last real word's end = the column its divergent
+  // next row forces) and the three-way separation before pinning. Mutation
+  // matrix (design §4; run each, the named tuple then changes):
+  //   A. re-commit inside `decode_step` (revert stage/commit): W1 `more`
+  //      0.8 -> 0.4 AND W2 `gamma` 1.4 -> 1.8 (both completing rows land).
+  //   B. re-add `alignment.fill(0.0)` in reset: ONLY W2 `gamma` 1.4 -> 1.8
+  //      (W1's row 10 was already zero; W2 loses its stale row 7).
+  //   D. move the loop's commit above the completion break: same as A.
+  let t = tiny_tokenizer();
+  let options = DecodingOptions::new()
+    .with_word_timestamps()
+    .with_without_timestamps()
+    .maybe_drop_blank_audio(false);
+  let mock = four_shape_alignment_fixture(&t);
+  let result = TranscribeTask::new(&mock, &t)
+    .run(&vec![0.1; 80_000], &options)
+    .unwrap();
+  assert_eq!(mock.counters().encode_calls(), 4, "exactly four windows");
+
+  let segs = result.segments_slice();
+  let ids: Vec<usize> = segs.iter().map(TranscriptionSegment::id).collect();
+  assert_eq!(
+    ids,
+    vec![0, 1, 2, 3, 4, 5],
+    "six segments across four windows"
+  );
+  let words: Vec<Vec<(String, f32, f32)>> = segs.iter().map(seg_word_tuples).collect();
+  let w = |text: &str, start: f32, end: f32| (text.to_string(), start, end);
+
+  // W1 — noTimestampEnding, offset 0, two slices. `more` (row 9, peak 40)
+  // keeps its own column: its divergent row 10 is dropped (post-fix zero).
+  assert_eq!(words[0], vec![w(" Hello", 0.14, 0.18)]);
+  assert_eq!(
+    words[1],
+    vec![
+      w(" World", 0.24, 0.26),
+      w(" again", 0.26, 0.4),
+      w(" more", 0.4, 0.8),
+    ]
+  );
+  // W2 — lump, offset 1, the staleness jewel: `gamma` CLIPPED to `beta`'s
+  // column (end 1.4, zero-length) by the stale row-7 peak 30.
+  assert_eq!(
+    words[2],
+    vec![
+      w(" alpha", 1.22, 1.28),
+      w(" beta", 1.28, 1.4),
+      w(" gamma", 1.4, 1.4),
+    ]
+  );
+  // W3 — singleTimestampEnding control, offset 2 (all fresh rows).
+  assert_eq!(words[3], vec![w(" Hello", 2.22, 2.28)]);
+  assert_eq!(words[4], vec![w(" World", 2.38, 2.44)]);
+  // W4 — consecutive-ending control (the JFK shape), offset 3.
+  assert_eq!(words[5], vec![w(" Hello", 3.22, 3.28)]);
+
+  // AC-7 determinism twin: a fresh fixture reproduces the run byte-for-byte.
+  let twin = TranscribeTask::new(&four_shape_alignment_fixture(&t), &t)
+    .run(&vec![0.1; 80_000], &options)
+    .unwrap();
+  let twin_words: Vec<Vec<(String, f32, f32)>> =
+    twin.segments_slice().iter().map(seg_word_tuples).collect();
+  assert_eq!(words, twin_words, "the fixture is deterministic (AC-7)");
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn cap_hit_window_drops_the_completing_row() {
+  // Design §4 Test B: a 224-token-cap window. Prefill [SOT,en,transcribe,
+  // no_ts] then 219 `hello` + a final `hello` whose row peaks at 49 (C_F);
+  // the cap (`current_tokens.len() >= 223`) completes step T=222 with a
+  // non-EOT sample, `finalize` appends EOT -> 224 tokens, lump, N=224,
+  // committed rows 1..222, divergent row 223 = zero (correct) vs s222's C_F
+  // (pre-fix). 223 decode steps prove the cap fired, not an EOT.
+  let t = tiny_tokenizer();
+  let s = special();
+  let hello = t.encode(" Hello").unwrap()[0];
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_n_audio_ctx(100));
+  push_aligned(&mut mock, s.english_token(), 3);
+  push_aligned(&mut mock, s.transcribe_token(), 5);
+  push_aligned(&mut mock, s.no_timestamps_token(), 7);
+  // 217 `hello`s with gently rising peaks (rows 4..220), then the last real
+  // `hello` HIGH at 40 (row 222) with its predecessor at 20 (row 221), so the
+  // dropped divergent row 223 (s222, peak 30, between 20 and 40) would clip
+  // the last word if it landed.
+  for step in 3..220 {
+    push_aligned(&mut mock, hello, (8 + (step - 3) / 25).min(15));
+  }
+  push_aligned(&mut mock, hello, 20); // s220 -> row 221 (predecessor)
+  push_aligned(&mut mock, hello, 40); // s221 -> row 222 (last real word)
+  push_aligned(&mut mock, hello, 30); // s222 -> row 223, completing, dropped
+  // Identical tokens would trip the compression/logprob fallback and replay
+  // the window; disable those thresholds so the run is a single 223-step
+  // attempt and `decode_steps` reads the cap directly.
+  let options = DecodingOptions::new()
+    .with_word_timestamps()
+    .with_without_timestamps()
+    .maybe_drop_blank_audio(false)
+    .maybe_compression_ratio_threshold(None)
+    .maybe_logprob_threshold(None)
+    .maybe_first_token_logprob_threshold(None);
+  let result = TranscribeTask::new(&mock, &t)
+    .run(&vec![0.1; 480_000], &options)
+    .unwrap();
+  assert_eq!(
+    mock.counters().decode_steps(),
+    223,
+    "the 224-token cap fired (a single attempt of MAX_TOKEN_CONTEXT - 1 steps), not an EOT sample"
+  );
+  assert_eq!(mock.counters().encode_calls(), 1, "a single window");
+  let segs = result.segments_slice();
+  assert_eq!(segs.len(), 1, "one lump segment");
+  let last = segs[0]
+    .words_slice()
+    .last()
+    .expect("the cap window carries words");
+  assert_eq!(last.word(), " Hello");
+  // Divergent row 223 (the cap's completing step) is dropped, so the last
+  // word keeps its own peak-40 column (0.8). Mutation A lands that row (peak
+  // 30, between the predecessor's 20 and this word's 40) and clips it to 0.4.
+  assert_eq!((last.start(), last.end()), (0.4, 0.8), "row 223 dropped");
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn zero_commit_window_skips_word_timestamps() {
+  // Design §4 Test C: the hasAlignment gate. Step 0 (forced SOT input)
+  // samples EOT with a scripted alignment row, so the completion break fires
+  // before any commit -> `alignment_weights` is `None` -> the whole
+  // word-timestamp block is skipped (TranscribeTask.swift:197-199). One
+  // wordless lump segment, coarse end = 1.0 s (segment_size), NOT dropped
+  // (the zero-length filter lives inside the skipped block).
+  let t = tiny_tokenizer();
+  let s = special();
+  let mut mock = MockBackend::new().with_dims(
+    ModelDims::new()
+      .with_window_samples(16_000)
+      .with_n_audio_ctx(100),
+  );
+  push_aligned(&mut mock, s.end_token(), 20); // staged, never committed
+  let options = DecodingOptions::new().with_word_timestamps();
+  let result = TranscribeTask::new(&mock, &t)
+    .run(&vec![0.1; 32_000], &options)
+    .unwrap();
+  assert_eq!(result.segments_slice().len(), 1, "one lump segment");
+  let seg = &result.segments_slice()[0];
+  assert!(
+    seg.words_slice().is_empty(),
+    "zero-commit window attaches no words (hasAlignment gate shut)"
+  );
+  // Coarse `segment_size` end (1 s window), NOT word-refined, and the segment
+  // is NOT dropped (the zero-length filter lives inside the skipped block).
+  //
+  // Mutation C (make `alignment_weights` unconditionally `Some`) does NOT
+  // fail here, and never can: a zero-commit window structurally carries zero
+  // text tokens too (any appended token implies a prior non-completing step,
+  // which commits a row), so even with the block running,
+  // `update_segments_with_word_timings` breaks before attaching anything --
+  // this lump segment is wordless either way (Fable review, whisper #41
+  // follow-up). Mutation C is caught instead by the three backend-level gate
+  // pins in `backend/mock/tests.rs`, which assert
+  // `alignment_weights(..).is_none()` directly and fail under it:
+  //   - `alignment_rows_accumulate_at_position_plus_one`
+  //   - `steps_without_alignment_rows_keep_the_has_alignment_gate_shut`
+  //   - `a_committed_row_survives_reset_as_stale_data`
+  // ...and by `alignment_less_window_with_text_tokens_skips_word_timestamps`
+  // below, whose text-bearing-but-alignment-less window DOES flip under it.
+  assert_eq!((seg.start(), seg.end()), (0.0, 1.0));
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn alignment_less_window_with_text_tokens_skips_word_timestamps() {
+  // The genuinely discriminating hasAlignment-gate witness (Fable review,
+  // whisper #41 follow-up), companion to `zero_commit_window_skips_word_
+  // timestamps` above. That test's window is structurally wordless, so
+  // mutation C has nothing to attach and it cannot detect the mutation (see
+  // its own doc). This window decodes REAL text (`script_clean_window`: all
+  // `push_token_steps`, no `push_step_with_alignment` anywhere) but never
+  // stages an alignment row on any step, so `commit_alignment_row` is a
+  // no-op throughout, the `hasAlignment` gate never opens, and
+  // `alignment_weights` returns `None` even though the window carries text
+  // -- the real-world alignment-less-model case the gate exists for
+  // (TextDecoder.swift:568,711,764-771; TranscribeTask.swift:197-199).
+  //
+  // Measured, not assumed (the gate was mutated in place, run, then
+  // reverted -- `git diff` confirmed production code byte-identical before
+  // commit): under mutation C (make `alignment_weights` unconditionally
+  // `Some`), the block runs against the never-written, all-zero accumulator,
+  // and the degenerate boundary it produces collapses the segment to zero
+  // length, so the zero-length filter (:217-218) drops it entirely --
+  // `result.segments_slice().len()` goes from 1 (a real "Hello" segment) to
+  // 0. A transcribed word silently vanishes; that is the concrete failure
+  // this gate prevents.
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  let hello = t.encode(" Hello").unwrap()[0];
+  script_clean_window(&mut mock, hello);
+  let options = DecodingOptions::new().with_word_timestamps();
+  let result = TranscribeTask::new(&mock, &t)
+    .run(&vec![0.1; 32_000], &options)
+    .unwrap();
+  assert_eq!(
+    result.text(),
+    "Hello",
+    "real decoded text, unlike the zero-commit companion"
+  );
+  assert_eq!(result.segments_slice().len(), 1);
+  let seg = &result.segments_slice()[0];
+  assert!(
+    seg.words_slice().is_empty(),
+    "no alignment ever committed -> hasAlignment gate shut -> word-timestamp \
+     block skipped"
+  );
+  // Coarse <|0.00|>..<|2.00|> boundary, untouched by word-refinement (which
+  // never ran) -- identical to the un-word-timestamped baseline in
+  // `single_window_run_produces_segments_and_text`.
+  assert!((seg.start() - 0.0).abs() < 1e-4);
+  assert!((seg.end() - 2.0).abs() < 1e-4);
+}
+
+#[test]
+fn last_speech_timestamp_seed_divides_in_f64_above_two_pow_24() {
+  // Design §2 (H5). Above 2^24 samples `previous_seek as f32` can no longer
+  // hold every integer, so the pre-fix `previous_seek as f32 / SAMPLE_RATE as
+  // f32` pre-rounds its numerator while the helper's f64 divide (narrowed
+  // once) does not — Swift's `Float(Double(previousSeek) /
+  // Double(sampleRate))` (:209).
+  //
+  // Seed derivation (searched, not assumed): scanning odd seeds above 2^24,
+  // 16_777_219 (= 2^24 + 3) is the first where the two paths diverge.
+  // 16_777_219 / 16_000 = 1048.5761875 exactly; `16_777_219 as f32` rounds to
+  // 16_777_220 (nearest even at the 2-ulp gap), so the pre-fix path computes
+  // 16_777_220 / 16_000 = 1048.57625 -> 1048.5763_f32, while the f64 path
+  // narrows 1048.5761875 -> 1048.5762_f32.
+  let seek = 16_777_219usize;
+  let f64_path = last_speech_timestamp_seed(seek);
+  let f32_path = seek as f32 / crate::audio::whisper::constants::SAMPLE_RATE as f32;
+  assert_ne!(
+    f64_path, f32_path,
+    "the two divide orders diverge above 2^24"
+  );
+  assert_eq!(f64_path, 1048.5762_f32, "helper: f64 divide, one narrowing");
+  assert_eq!(
+    f32_path, 1048.5763_f32,
+    "pre-fix: f32 numerator pre-rounded"
+  );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn skip_special_tokens_governs_segment_text_on_both_writer_branches() {
+  // Design §3 P1: the token-leak refutation's behavioral pin. `skip_special_tokens`
+  // gates BOTH segment-text writer branches — the lump write
+  // (`segment/mod.rs` :146-151) and the slice write (:216-221) — so a run
+  // under the flag leaves no `<|...|>` marker in any segment, while the
+  // default (`false`) renders them verbatim (the issue's coremlit sample is
+  // exactly that flag-clear rendering, on either implementation — never a
+  // library leak). The joined `TranscriptionResult::text` is special-filtered
+  // in BOTH cases (`transcribe/mod.rs` ↔ TranscribeTask.swift:304-305). The
+  // four-shape fixture exercises both branches (W1/W3 slice, W2/W4 lump).
+  let t = tiny_tokenizer();
+  let begin = special().special_token_begin();
+  let base = DecodingOptions::new()
+    .with_word_timestamps()
+    .with_without_timestamps()
+    .maybe_drop_blank_audio(false);
+
+  // Flag ON: no segment carries a special/timestamp marker, and each
+  // segment's text is exactly the decode of its `< special_token_begin`
+  // tokens.
+  let on = TranscribeTask::new(&four_shape_alignment_fixture(&t), &t)
+    .run(&vec![0.1; 80_000], &base.clone().with_skip_special_tokens())
+    .unwrap();
+  for seg in on.segments_slice() {
+    assert!(
+      !seg.text().contains("<|"),
+      "skip_special_tokens leaves no marker: {:?}",
+      seg.text()
+    );
+    let word_only: Vec<u32> = seg
+      .tokens_slice()
+      .iter()
+      .copied()
+      .filter(|&token| token < begin)
+      .collect();
+    assert_eq!(seg.text(), t.decode(&word_only, false).unwrap());
+  }
+  assert!(!on.text().contains("<|"), "joined transcript is clean");
+
+  // Flag OFF (default): the markers are present in the segment text (the
+  // observed "leak"), yet the joined transcript stays clean.
+  let off = TranscribeTask::new(&four_shape_alignment_fixture(&t), &t)
+    .run(&vec![0.1; 80_000], &base)
+    .unwrap();
+  assert!(
+    off
+      .segments_slice()
+      .iter()
+      .all(|seg| seg.text().contains("<|")),
+    "the default renders special/timestamp markers into every segment"
+  );
+  assert!(
+    !off.text().contains("<|"),
+    "joined transcript is special-filtered regardless of the flag"
+  );
 }

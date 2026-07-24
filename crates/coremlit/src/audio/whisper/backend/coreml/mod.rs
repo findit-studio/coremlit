@@ -6,8 +6,9 @@
 //! `DecodingInputs` tensor set (`Models.swift:291-323`, allocation
 //! `TextDecoder.swift:137-147`), the per-step input writes (`:600-602`),
 //! `updateKVCache` (`:218-270`), the mask flips (`:704-707`),
-//! `updateAlignmentWeights` (`:272-296`), and `DecodingInputs.reset`
-//! (`Models.swift:312-322`).
+//! `updateAlignmentWeights` (`:272-296`, split here into a `decode_step`
+//! stage + a `commit_alignment_row` commit — see that method), and
+//! `DecodingInputs.reset` (`Models.swift:312-322`).
 //!
 //! Tensor names/shapes/dtypes are the tiny model's introspected ground
 //! truth, pinned by `tests/model_io.rs` (Task 1); the private `names`
@@ -108,14 +109,20 @@ fn output_dim(
 /// `TextDecoder.swift:137-147`). One instance serves a whole transcription:
 /// [`CoreMlBackend::decode_step`] mutates it in place and
 /// [`CoreMlBackend::reset_decoder_state`] restores the fresh-window
-/// invariant between windows.
+/// invariant between windows — for `cache_length` and both masks. The
+/// alignment accumulator is deliberately NOT part of that reset: it keeps
+/// the previous window's committed rows, so a later, shorter window reads
+/// an earlier window's row wherever its own tokens never reached, exactly
+/// as Swift's once-allocated tensor does (`Models.swift:312-322` resets
+/// only cacheLength + masks). See [`CoreMlBackend::commit_alignment_row`]
+/// for the stage/commit split that decides which rows a window writes.
 ///
 /// **Documented deviation — f32 alignment accumulator:** Swift accumulates
 /// alignment weights in an f16 `MLMultiArray` (`alignmentWeights`,
 /// `TextDecoder.swift:141`). Here the accumulator is a plain
-/// `Vec<f32>` (`max_token_context * n_audio_ctx`, row-major): DTW consumes
-/// f32 ([`AlignmentView`] is f32), and the buffer is never a model input,
-/// so nothing requires the CoreML tensor type or f16 storage.
+/// `Vec<f32>` (`(max_token_context + 1) * n_audio_ctx`, row-major): DTW
+/// consumes f32 ([`AlignmentView`] is f32), and the buffer is never a model
+/// input, so nothing requires the CoreML tensor type or f16 storage.
 ///
 /// The three scratch `Vec<f16>` buffers are sized once at construction so
 /// the per-step output extraction (`copy_into` gathers, see the module
@@ -140,11 +147,25 @@ pub struct CoreMlDecoderState {
   /// `[1, max_token_context] f16`; `[0, 0] = 0`, rest `-10000`
   /// (`:143`, `:147`).
   decoder_key_padding_mask: MultiArray,
-  /// f32 alignment accumulator (see the struct doc), row `position + 1`
-  /// per decoded token; Swift's `alignmentWeights` (`:141`).
+  /// f32 alignment accumulator (see the struct doc): a FIXED
+  /// `(max_token_context + 1) * n_audio_ctx` buffer, zero-initialized once
+  /// at construction and thereafter only overwritten row-by-row by
+  /// [`CoreMlBackend::commit_alignment_row`] (row `position + 1`), never
+  /// cleared — Swift's once-allocated `alignmentWeights` (`:141`) that
+  /// `DecodingInputs.reset` leaves untouched (`Models.swift:312-322`).
   alignment: Vec<f32>,
-  /// Rows of `alignment` written so far (the [`AlignmentView`] row count).
-  alignment_rows: usize,
+  /// Position of the row [`CoreMlBackend::decode_step`] just staged into
+  /// `align_scratch`, awaiting a [`CoreMlBackend::commit_alignment_row`].
+  /// `None` when the last step staged nothing (no alignment head, or a step
+  /// whose outputs lacked the feature). Describes only the immediately
+  /// preceding step — each step's staging supersedes the last.
+  pending_alignment: Option<usize>,
+  /// Whether any row has been committed in the CURRENT window — Swift's
+  /// per-window `hasAlignment` local (`TextDecoder.swift:568,711`), gating
+  /// [`CoreMlBackend::alignment_weights`] to `None` for a zero-commit
+  /// window (`:764-771`). Cleared at each window's position-0 step and on
+  /// reset.
+  window_has_alignment: bool,
   /// Reused per-step gather target for the `[1, kv_dim, 1, 1]` KV updates.
   kv_scratch: Vec<f16>,
   /// Reused per-step gather target for the `[1, 1, vocab]` logits.
@@ -274,22 +295,33 @@ impl CoreMlBackend {
 }
 
 /// **Documented deviation — KV/mask updates live inside `decode_step`:**
-/// Swift's decode loop updates the KV cache, both masks, and the alignment
-/// weights *in the loop body*, and skips all of them when the
-/// completion-check breaks (`TextDecoder.swift:673-720`). The
-/// [`InferenceBackend`] trait keeps decoder tensors opaque, so this port
-/// performs the same updates *inside* [`InferenceBackend::decode_step`],
-/// unconditionally. Equivalent because (i) after the completion break the
-/// loop never issues another step against the same state before a reset,
-/// so the extra advance is never observed by a prediction; (ii) the
-/// loop keeps positions `<= max_token_context - 2` (`loop_count <=
-/// MAX_TOKEN_CONTEXT - 1`), exactly where Swift's conditional updates
-/// run — and at the trait-legal last slot, which Swift never reaches,
-/// the next-step mask preparation is skipped (nothing to prepare) while
-/// the KV/alignment writes still land in their headroom; and (iii)
-/// [`InferenceBackend::reset_decoder_state`] restores the full mask/
-/// cache-visibility invariant, so the next window starts from the same
-/// state either way.
+/// Swift's decode loop updates the KV cache and both masks *in the loop
+/// body*, skipping them when the completion-check breaks
+/// (`TextDecoder.swift:673-707`). The [`InferenceBackend`] trait keeps
+/// decoder tensors opaque, so this port performs those KV/mask updates
+/// *inside* [`InferenceBackend::decode_step`], unconditionally. Equivalent
+/// because (i) after the completion break the loop never issues another
+/// step against the same state before a reset, so the extra KV/mask advance
+/// is never observed by a prediction; (ii) the loop keeps positions `<=
+/// max_token_context - 2` (`loop_count <= MAX_TOKEN_CONTEXT - 1`), exactly
+/// where Swift's conditional updates run — and at the trait-legal last
+/// slot, which Swift never reaches, the next-step mask preparation is
+/// skipped (nothing to prepare) while the KV writes still land in their
+/// headroom; and (iii) [`InferenceBackend::reset_decoder_state`] restores
+/// the full mask/cache-visibility invariant, so the next window starts from
+/// the same state either way.
+///
+/// The **alignment** weights are the one output where (i) does NOT hold:
+/// they are observed AFTER the loop, with no intervening prediction, by
+/// `add_word_timestamps` (which snapshots them through
+/// [`InferenceBackend::alignment_weights`], `transcribe/mod.rs`). Folding an
+/// unconditional alignment write into `decode_step` would let a completing
+/// step's row — which Swift never writes (`:673-678` breaks before the
+/// update at `:709-717`) — reach that consumer, diverging word timestamps
+/// on no-timestamp-ending and lump windows (whisper #41). So the alignment
+/// write ALONE is split into a stage (in [`InferenceBackend::decode_step`])
+/// plus a commit ([`InferenceBackend::commit_alignment_row`]) the decode
+/// loop issues only in Swift's non-completing `:709-717` slot.
 impl InferenceBackend for CoreMlBackend {
   type Features = MultiArray;
   type EncoderOutput = MultiArray;
@@ -382,10 +414,13 @@ impl InferenceBackend for CoreMlBackend {
       kv_cache_update_mask,
       decoder_key_padding_mask,
       // One row of headroom, exactly like MockBackend: a step at the
-      // trait-legal last position (`max_ctx - 1`) writes alignment row
+      // trait-legal last position (`max_ctx - 1`) commits alignment row
       // `position + 1 == max_ctx`, so the buffer holds `max_ctx + 1` rows.
+      // Zeroed here ONCE per run — reset never re-clears it (Swift's
+      // once-allocated tensor, TextDecoder.swift:141).
       alignment: vec![0.0; (max_ctx + 1) * self.dims.n_audio_ctx()],
-      alignment_rows: 0,
+      pending_alignment: None,
+      window_has_alignment: false,
       // Sized up front so even the first decode step allocates nothing.
       kv_scratch: vec![f16::ZERO; kv_dim],
       logits_scratch: vec![f16::ZERO; self.dims.vocab()],
@@ -417,11 +452,14 @@ impl InferenceBackend for CoreMlBackend {
       .expect("update mask is a self-allocated contiguous f16 array");
     update.fill(f16::ZERO);
     update[0] = f16::ONE;
-    // Swift leaves the weights tensor itself; our view exposes
-    // `alignment_rows`, and zeroing keeps a view honest even at row
-    // granularity after the row count resets.
-    state.alignment.fill(0.0);
-    state.alignment_rows = 0;
+    // Ports Models.swift:312-322 for alignment too: the weights tensor is
+    // deliberately LEFT as-is (Swift never clears it — allocated once,
+    // TextDecoder.swift:141), so its rows stay observable across windows and
+    // fallback attempts. Only the per-window commit bookkeeping resets — the
+    // `hasAlignment` gate drops and any row the ending window staged but
+    // never committed is discarded.
+    state.window_has_alignment = false;
+    state.pending_alignment = None;
   }
 
   fn decode_step(
@@ -526,43 +564,75 @@ impl InferenceBackend for CoreMlBackend {
         .fill_at(&[0, position + 1], f16::ONE)?;
     }
 
-    // Alignment (updateAlignmentWeights, TextDecoder.swift:272-296 via
-    // :709-717): row `position + 1`, converted to the f32 accumulator
-    // (deviation documented on `CoreMlDecoderState`). Presence-gated per
-    // step exactly like Swift's `if let ... = cache?.alignmentWeights`.
+    // Alignment STAGING (updateAlignmentWeights, TextDecoder.swift:272-296):
+    // gather this step's cross-attention slice into `align_scratch` and
+    // record its position as pending — the write into the persistent
+    // accumulator happens only if the decode loop then calls
+    // `commit_alignment_row` (Swift updates alignment only on non-completing
+    // steps, the `else` branch at :709-717). Presence-gated per step exactly
+    // like Swift's `if let ... = cache?.alignmentWeights`; a step without the
+    // feature stages nothing, so its commit is a no-op.
+    if position == 0 {
+      // A fresh decode pass begins at position 0 on every path — every
+      // `decode_text`/probe pass starts there (`decode/mod.rs`). This is
+      // Swift's per-window `var hasAlignment = false` (:568); it also drops
+      // any row the previous window's completing step staged but never
+      // committed. Reset clears both too, but this position-0 clear is what
+      // keeps them honest on the dormant silent-window `continue` that skips
+      // reset (`transcribe/mod.rs`).
+      state.window_has_alignment = false;
+      state.pending_alignment = None;
+    }
     if self.supports_alignment
       && let Some(alignment) = outputs.take(names::ALIGNMENT)
     {
       let cols = self.dims.n_audio_ctx();
       state.align_scratch.resize(cols, f16::ZERO);
       alignment.copy_into::<f16>(&mut state.align_scratch)?;
-      let start = (position + 1) * cols;
-      // In bounds: position < max_ctx (checked at entry), so
-      // start + cols == (position + 2) * cols <= (max_ctx + 1) * cols
-      // == alignment.len() (the buffer's one-row headroom).
-      for (dst, src) in state.alignment[start..start + cols]
-        .iter_mut()
-        .zip(&state.align_scratch)
-      {
-        *dst = src.to_f32();
-      }
-      state.alignment_rows = state.alignment_rows.max(position + 2);
+      state.pending_alignment = Some(position);
+    } else {
+      state.pending_alignment = None;
     }
 
     Ok(())
+  }
+
+  fn commit_alignment_row(&self, state: &mut Self::DecoderState) {
+    // Ports updateAlignmentWeights' placement (TextDecoder.swift:709-717):
+    // the decode loop calls this only after a non-completing step, so a
+    // completing step's staged row never lands and its slot keeps the
+    // previous window's value (or the construction-time zero). No-op when
+    // the preceding step staged nothing.
+    let Some(position) = state.pending_alignment.take() else {
+      return;
+    };
+    let cols = self.dims.n_audio_ctx();
+    let start = (position + 1) * cols;
+    // In bounds: position < max_ctx (checked at `decode_step` entry), so
+    // start + cols == (position + 2) * cols <= (max_ctx + 1) * cols
+    // == alignment.len() (the buffer's one-row headroom).
+    for (dst, src) in state.alignment[start..start + cols]
+      .iter_mut()
+      .zip(&state.align_scratch)
+    {
+      *dst = src.to_f32();
+    }
+    state.window_has_alignment = true;
   }
 
   fn alignment_weights<'state>(
     &self,
     state: &'state Self::DecoderState,
   ) -> Option<AlignmentView<'state>> {
-    self.supports_alignment.then(|| {
+    // The FULL fixed-size accumulator, gated on this window having committed
+    // at least one row (Swift's `hasAlignment ? tensor : nil`,
+    // TextDecoder.swift:764-771). Uncommitted rows read as an earlier
+    // window's bytes or the construction-time zero — the parity-bearing
+    // staleness (whisper #41). `alignment.len() == (max_ctx + 1) * cols` by
+    // construction, so the row count is exact.
+    (self.supports_alignment && state.window_has_alignment).then(|| {
       let cols = self.dims.n_audio_ctx();
-      AlignmentView::new(
-        &state.alignment[..state.alignment_rows * cols],
-        state.alignment_rows,
-        cols,
-      )
+      AlignmentView::new(&state.alignment, self.dims.max_token_context() + 1, cols)
     })
   }
 
