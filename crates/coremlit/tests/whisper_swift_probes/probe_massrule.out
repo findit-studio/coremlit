@@ -1,0 +1,36 @@
+=== Q1/Q2 decisive: logSoftmax internal precision ===
+lp[0]:  bnns=-0.01819(0xa4a8)  A=-0.01819(0xa4a8)  B=-0.01819(0xa4a8)  C=0.0(0x0000)
+lp[1]:  bnns=-11.016(0xc982)  A=-11.016(0xc982)  B=-11.016(0xc982)  C=-11.0(0xc980)
+lp[1100]: bnns=-11.016(0xc982)  A=-11.016(0xc982)
+=== Q2 decisive: logSumExp reduction internal precision ===
+LSE([8,-3x1100]): bnns=8.016(0x4802) stable_f32=8.016(0x4802) naive_f32=8.016(0x4802) f16seq=8.0(0x4800)
+=== Q3 decisive: max subtraction in logSumExp ===
+LSE([-110 x1101]): bnns=-inf(0xfc00) stable_f32=-103.0(0xd670) naive_f32=-inf(0xfc00)
+=== -inf handling ===
+LSE([-inf,-inf,0.5,-inf,1.25]): bnns=1.637(0x3e8c) stable_f32=1.637(0x3e8c)
+LSE(all -inf x7): bnns=-inf(0xfc00) stable_f32=-inf(0xfc00)
+MAX(all -inf x7): bnns=-65504.0(0xfbff) emu=-inf(0xfc00)
+logSoftmax with -inf entries: bnns lp[0]=-inf(0xfc00) lp[63]=-3.465(0xc2ee) A lp[0]=-inf(0xfc00) A lp[63]=-3.465(0xc2ee)
+=== reduction size ladder (blocking/order visibility) ===
+n=3: bnns=-1.188(0xbcc1) f32stable=-1.188(0xbcc1) f16seq=-1.188(0xbcc1)  [==f32stable]
+n=8: bnns=-4.496(0xc47f) f32stable=-4.496(0xc47f) f16seq=-4.496(0xc47f)  [==f32stable]
+n=9: bnns=0.534(0x3846) f32stable=0.534(0x3846) f16seq=0.534(0x3846)  [==f32stable]
+n=16: bnns=0.6855(0x397c) f32stable=0.6855(0x397c) f16seq=0.6846(0x397a)  [==f32stable]
+n=17: bnns=0.163(0x3137) f32stable=0.163(0x3137) f16seq=0.1631(0x3138)  [==f32stable]
+n=64: bnns=2.129(0x4042) f32stable=2.129(0x4042) f16seq=2.129(0x4042)  [==f32stable]
+n=100: bnns=2.094(0x4030) f32stable=2.094(0x4030) f16seq=2.096(0x4031)  [==f32stable]
+n=1501: bnns=4.73(0x44bb) f32stable=4.73(0x44bb) f16seq=4.715(0x44b7)  [==f32stable]
+=== SWEEP 1: reduction-only, random logprob vectors ===
+n=7: stable_f32 3000/3000  naive_f32 3000/3000  f16seq 1647/3000  first_stable_mismatch: 
+n=32: stable_f32 2998/3000  naive_f32 2999/3000  f16seq 766/3000  first_stable_mismatch: it=2033 bnns=0.2434(0x33ca) stable=0.2435(0x33cb)
+n=251: stable_f32 3000/3000  naive_f32 3000/3000  f16seq 828/3000  first_stable_mismatch: 
+n=1501: stable_f32 2999/3000  naive_f32 2999/3000  f16seq 21/3000  first_stable_mismatch: it=2864 bnns=4.637(0x44a3) stable=4.633(0x44a2)
+=== SWEEP 2: full mass rule, mid-size (n=4096, tb=3000) ===
+n=4096 tb=3000 iters=1500 fires=759: scalar ts==A 1494/1500, mx==A 1492/1500; bool A 1500/1500, B 1500/1500, C(f16) 1446/1500
+=== SWEEP 3: full mass rule, real shape (n=51865, tb=50364) ===
+n=51865 tb=50364 iters=300 fires=146: scalar ts==A 295/300, mx==A 291/300; bool A 299/300, B 299/300, C(f16) 289/300
+  MISMATCH it=252 bnns(ts=-0.9136(0xbb4f),mx=-0.914(0xbb50),fires=true) emuA(ts=-0.9136(0xbb4f),mx=-0.9136(0xbb4f),fires=false)
+=== NEAR-MARGIN SCAN: f16-ulp steps of one text logit across the flip ===
+flip points (text-logit bitPattern) bnns=[]
+flip points (text-logit bitPattern) emuA=[]
+=== done; bnnsErrorCount=0 ===
