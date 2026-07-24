@@ -48,7 +48,7 @@ rustfft = "6"
 # `serde` stay off.
 soundevents-dataset = { version = "0.2", default-features = false, features = ["std", "rated"] }
 npyz = "0.9"
-cpal = "0.16"
+cpal = "0.18"
 rubato = "0.16"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 # Pure-Rust PNG decoder — a DEV-dep only, for decoding the committed siglip
