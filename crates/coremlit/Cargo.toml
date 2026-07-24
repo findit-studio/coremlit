@@ -663,6 +663,26 @@ required-features = ["siglip"]
 name = "siglip_e2e"
 path = "tests/siglip/e2e.rs"
 required-features = ["siglip"]
+
+[[test]]
+name = "ced_model_io"
+path = "tests/ced/model_io.rs"
+required-features = ["ced"]
+
+[[test]]
+name = "ced_parity_logits"
+path = "tests/ced/parity_logits.rs"
+required-features = ["ced"]
+
+[[test]]
+name = "ced_placement"
+path = "tests/ced/placement.rs"
+required-features = ["ced"]
+
+[[test]]
+name = "ced_e2e"
+path = "tests/ced/e2e.rs"
+required-features = ["ced"]
 # Dual-tower encode harness: first-observed/cached load, first + warm inference
 # per tower × ComputeUnits (model-gated; `harness = false` custom main — the load
 # phases are one-shot costs criterion's resampling cannot see). Mirrors the
