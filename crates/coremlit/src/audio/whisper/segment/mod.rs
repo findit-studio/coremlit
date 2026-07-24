@@ -535,8 +535,8 @@ pub fn merge_punctuations(
 /// `NLLanguageRecognizer` detection (spec §5.3; see
 /// [`WhisperTokenizer::split_to_word_tokens`]'s own doc for the same
 /// substitution there), and `grouping` chooses how that splitter groups
-/// (coremlit issue #14 — [`WordGrouping::FineGrained`] is the default and
-/// this port's long-standing behavior).
+/// (coremlit issue #14 — [`WordGrouping::SwiftParity`] is the default after
+/// #41; [`WordGrouping::FineGrained`] is this port's long-standing opt-in).
 ///
 /// Returns an empty vec when `split_to_word_tokens` groups `word_token_ids`
 /// into one word or fewer (`:351-353`) — DTW timing is meaningless for a
@@ -950,8 +950,8 @@ pub(crate) fn rounded_to_places(value: f32, decimal_places: i32) -> f32 {
 /// `NLLanguageRecognizer` replacement documented on [`find_alignment`] and
 /// [`WhisperTokenizer::split_to_word_tokens`] (spec §5.3), plus the
 /// explicit word-grouping mode from coremlit issue #14
-/// ([`WordGrouping::FineGrained`] is the default and reproduces this port's
-/// long-standing behavior). Swift's
+/// ([`WordGrouping::SwiftParity`] is the default after #41;
+/// [`WordGrouping::FineGrained`] is this port's long-standing opt-in). Swift's
 /// `segmentSize` and `options` parameters are unused in the function body
 /// (verified against `SegmentSeeker.swift:410-496`), and `timings` is
 /// only passed through to `findAlignment` (`:471`), which ignores it —

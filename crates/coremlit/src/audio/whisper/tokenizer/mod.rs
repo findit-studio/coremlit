@@ -413,9 +413,9 @@ impl WhisperTokenizer {
   /// `grouping` is the second half of that decision, made explicit
   /// (coremlit issue #14).
   ///
-  /// [`WordGrouping::FineGrained`] — the default, and this port's
-  /// long-standing behavior — takes the Unicode arm for all six of the
-  /// languages above.
+  /// [`WordGrouping::FineGrained`] — the product-quality opt-in (coremlit
+  /// issue #11), and this port's long-standing behavior — takes the Unicode
+  /// arm for all six of the languages above.
   ///
   /// [`WordGrouping::SwiftParity`] reproduces **Swift's own** arm selection,
   /// which is not "spaces for all CJK": Swift matches its
@@ -479,7 +479,7 @@ impl WhisperTokenizer {
   ) -> Result<Vec<(String, Vec<u32>)>, TokenizerError> {
     let unicode_split = match grouping {
       // Every non-whitespace-delimited language, fine-grained. This port's
-      // default and its issue-#11 pin.
+      // issue-#11 opt-in (no longer the default after #41).
       WordGrouping::FineGrained => {
         matches!(language_code, "zh" | "ja" | "th" | "lo" | "my" | "yue")
       }

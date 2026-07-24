@@ -220,8 +220,10 @@ impl core::str::FromStr for ChunkingStrategy {
 pub enum WordGrouping {
   /// Unicode splitting for every language that is not whitespace-delimited
   /// (`zh`/`ja`/`th`/`lo`/`my`/`yue`), and ordinary space/punctuation
-  /// splitting for the rest. **The default, and this port's long-standing
-  /// behavior exactly.**
+  /// splitting for the rest. **The product-quality opt-in for fine-grained
+  /// CJK word timestamps** (coremlit issue #11), and this port's long-standing
+  /// behavior — but no longer the default: [`Self::SwiftParity`] became the
+  /// default in #41 for stream parity with Swift.
   ///
   /// "Unicode splitting" means the **smallest group of BPE tokens that
   /// completes a Unicode scalar** — not one word per scalar. Whisper's BPE
@@ -237,19 +239,20 @@ pub enum WordGrouping {
   /// utterance into one undifferentiated blob with a single start/end time,
   /// and word timestamps stop meaning anything. Test-pinned in coremlit issue
   /// #11: 85 fine-grained words on the ZH clip, against Swift's 24 blobs.
-  #[default]
   FineGrained,
   /// Swift WhisperKit's own grouping, reproduced deliberately: the space
   /// splitter for `zh` and `yue`, and the same Unicode splitting as
   /// [`Self::FineGrained`] everywhere else — `ja`, `th`, `lo` and `my`
   /// included.
   ///
-  /// Choose this when word grouping must be byte-comparable against Swift.
-  /// It is not a default and should not be: for Chinese it produces the
-  /// coarse phrase blob Swift only lands on by accident (see the type's own
-  /// doc — `NLLanguageRecognizer` answers `zh-Hant`/`zh-Hans`, which Swift's
-  /// bare-code CJK check then fails to match), and that blob carries a single
-  /// start/end time for an entire utterance.
+  /// **The default** (coremlit issue #41 — stream parity with Swift as the
+  /// default posture; reverses the issue-#11 pin, user-approved). For Chinese
+  /// it produces the coarse phrase blob Swift lands on by accident (see the
+  /// type's own doc — `NLLanguageRecognizer` answers `zh-Hant`/`zh-Hans`,
+  /// which Swift's bare-code CJK check then fails to match), a single
+  /// start/end time for an entire utterance; a caller who wants fine-grained
+  /// CJK word timestamps instead opts into [`Self::FineGrained`], which is
+  /// exactly why that variant still exists.
   ///
   /// **This is not "space-split everything".** An earlier shape of this
   /// variant forced the space splitter for *all* CJK and documented itself as
@@ -269,6 +272,7 @@ pub enum WordGrouping {
   /// `tokenizer::nl_recognizer::redetect_language`'s result — it normalizes
   /// `zh-Hant`/`zh-Hans` to a bare `zh`, which this variant then
   /// space-splits, exactly as Swift does with the regional code.
+  #[default]
   SwiftParity,
 }
 
@@ -496,22 +500,22 @@ pub(crate) mod finite_f32_vec {
 /// segment filter) and [`Self::word_grouping`] (the explicit CJK
 /// word-grouping mode). `new()`/`Default` apply Swift's defaults verbatim
 /// for every ported knob; `seed` defaults unset (`None`), matching today's
-/// OS-seeded behavior exactly, and `word_grouping` defaults to the
-/// fine-grained grouping this port already used.
+/// OS-seeded behavior exactly, and `word_grouping` defaults to Swift's own
+/// grouping (coremlit issue #41).
 ///
-/// **Two knobs' defaults deliberately diverge from Swift, each with an exact
-/// parity escape hatch** — and they are the only such deviations; every other
-/// default here is Swift's. [`Self::drop_blank_audio`] defaults `true`,
-/// dropping the `[BLANK_AUDIO]` segments Swift emits (a product decision, with
-/// `false` the exact parity escape hatch). [`Self::word_grouping`] defaults to
-/// [`WordGrouping::FineGrained`] — the fine-grained CJK grouping this port
-/// already used (coremlit issue #11), **not** Swift's — while
-/// [`WordGrouping::SwiftParity`] is the opt-in that reproduces Swift's own
-/// Chinese/Cantonese space-fallthrough grouping. Default options on a Mandarin
-/// clip therefore Unicode-split into fine-grained words where Swift falls
-/// through to space splitting; that exact divergence is pinned by the named
-/// invariant `word_grouping_splits_chinese_and_only_chinese`
-/// (`tokenizer/tests.rs`). See each field's own doc.
+/// **One knob's default deliberately diverges from Swift, with an exact parity
+/// escape hatch** — it is the only such deviation; every other default here is
+/// Swift's. [`Self::drop_blank_audio`] defaults `true`, dropping the
+/// `[BLANK_AUDIO]` segments Swift emits (a product decision, with `false` the
+/// exact parity escape hatch). [`Self::word_grouping`] defaults to
+/// [`WordGrouping::SwiftParity`] — Swift's own Chinese/Cantonese
+/// space-fallthrough grouping (coremlit issue #41, reversing the #11 pin,
+/// user-approved) — while [`WordGrouping::FineGrained`] is the product-quality
+/// opt-in that Unicode-splits CJK into fine-grained words. Default options on a
+/// Mandarin clip therefore space-split as Swift does; the behavioral contrast
+/// between the two variants is pinned by the named invariant
+/// `word_grouping_splits_chinese_and_only_chinese` (`tokenizer/tests.rs`). See
+/// each field's own doc.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DecodingOptions {
@@ -703,7 +707,9 @@ pub struct DecodingOptions {
   #[cfg_attr(feature = "serde", serde(default = "default_drop_blank_audio"))]
   drop_blank_audio: bool,
   /// How decoded tokens are grouped into words for word-level timestamps.
-  /// Defaults to [`WordGrouping::FineGrained`] — today's behavior exactly.
+  /// Defaults to [`WordGrouping::SwiftParity`] (coremlit issue #41; serde
+  /// follows via the enum's `Default`). [`WordGrouping::FineGrained`] is the
+  /// product-quality opt-in.
   #[cfg_attr(feature = "serde", serde(default))]
   word_grouping: WordGrouping,
 }
@@ -814,7 +820,7 @@ impl DecodingOptions {
       chunking_strategy: ChunkingStrategy::Disabled,
       verbose: false,
       drop_blank_audio: DEFAULT_DROP_BLANK_AUDIO,
-      word_grouping: WordGrouping::FineGrained,
+      word_grouping: WordGrouping::SwiftParity,
     }
   }
 
@@ -1915,20 +1921,21 @@ impl DecodingOptions {
   // -- word_grouping --------------------------------------------------------
   /// How decoded tokens are grouped into words when
   /// [`Self::word_timestamps`] is on (coremlit issue #14). Defaults to
-  /// [`WordGrouping::FineGrained`], which is this port's long-standing
-  /// behavior **exactly**: Unicode splitting for the non-whitespace-delimited
-  /// languages (`zh`/`ja`/`th`/`lo`/`my`/`yue`), space/punctuation splitting
-  /// for everything else.
+  /// [`WordGrouping::SwiftParity`] (coremlit issue #41 — stream parity with
+  /// Swift as the default posture, reversing the #11 pin), which, read against
+  /// Apple's actual `NLLanguage` raw values, means the space splitter for
+  /// `zh`/`yue` and Unicode splitting for everything else,
+  /// `ja`/`th`/`lo`/`my` included.
   ///
-  /// [`WordGrouping::SwiftParity`] reproduces Swift WhisperKit's own
-  /// grouping instead — which, read against Apple's actual `NLLanguage` raw
-  /// values, means the space splitter for `zh`/`yue` and Unicode splitting
-  /// for everything else, `ja`/`th`/`lo`/`my` included. See
-  /// [`WordGrouping`]'s own doc for the table and for why the coarse
-  /// phrase-blob grouping is a **Chinese-only** accident rather than a CJK
-  /// policy. The two variants consequently differ only for `zh` and `yue`;
-  /// this crate keeps the fine-grained default pinned (issue #11) and lets a
-  /// caller ask for Swift's grouping by name.
+  /// [`WordGrouping::FineGrained`] is the product-quality opt-in instead — this
+  /// port's long-standing behavior: Unicode splitting for all of the
+  /// non-whitespace-delimited languages (`zh`/`ja`/`th`/`lo`/`my`/`yue`),
+  /// space/punctuation splitting for everything else, so CJK gets fine-grained
+  /// word timestamps (issue #11). See [`WordGrouping`]'s own doc for the table
+  /// and for why the coarse phrase-blob grouping is a **Chinese-only** accident
+  /// rather than a CJK policy. The two variants consequently differ only for
+  /// `zh` and `yue`; this crate defaults to Swift's grouping and lets a caller
+  /// ask for the fine-grained split by name.
   ///
   /// Inert unless [`Self::word_timestamps`] is set: word grouping only runs
   /// inside the DTW alignment pass. It never affects the transcript text,

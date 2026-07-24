@@ -41,10 +41,10 @@ fn decoding_defaults_match_swift() {
   // by `drop_blank_audio_defaults_on_and_opts_out_to_swift_parity`.
   assert!(o.drop_blank_audio());
   // Rust-only addition (coremlit issue #14). Swift has no grouping knob at
-  // all — it picks one from a language it detects internally, landing on
-  // the coarse `Phrase` shape for CJK. This default preserves THIS port's
-  // #11-pinned fine-grained CJK grouping; Swift's is the explicit opt-in.
-  assert_eq!(o.word_grouping(), WordGrouping::FineGrained);
+  // all — it picks one from a language it detects internally. #41 default:
+  // Swift's own grouping (space-fallthrough for zh/yue); FineGrained is the
+  // #11-pinned fine-grained CJK opt-in.
+  assert_eq!(o.word_grouping(), WordGrouping::SwiftParity);
   assert_eq!(DecodingOptions::default(), DecodingOptions::new());
 }
 
@@ -78,33 +78,34 @@ fn drop_blank_audio_defaults_on_and_opts_out_to_swift_parity() {
 }
 
 #[test]
-fn swift_parity_option_deviations_are_exactly_two() {
+fn swift_parity_option_deviations_are_exactly_one() {
   // Executable form of the DecodingOptions doc contract (`options/mod.rs`):
   // `new()` diverges from Swift's `Configurations.swift` defaults in EXACTLY
-  // two knobs, each with an exact-parity escape hatch; every other ported
-  // default equals Swift's. (whisper #41 §3 P2 — the token-leak refutation's
+  // one knob, with an exact-parity escape hatch; every other ported default
+  // equals Swift's. (whisper #41 §3 P2 — the token-leak refutation's
   // parity-recipe lock. The behavioral consequences are already pinned by
   // `word_timestamps_drop_cleared_reproduces_swifts_duplicate_ids` and
   // `word_grouping_splits_chinese_and_only_chinese`; this locks the recipe.)
   let o = DecodingOptions::new();
 
-  // Deviation 1 — `drop_blank_audio` defaults `true` (Swift emits
-  // `[BLANK_AUDIO]`); `maybe_drop_blank_audio(false)` is the exact-parity
-  // escape hatch.
+  // Deviation 1 (the only one) — `drop_blank_audio` defaults `true` (Swift
+  // emits `[BLANK_AUDIO]`); `maybe_drop_blank_audio(false)` is the
+  // exact-parity escape hatch.
   assert!(o.drop_blank_audio());
   assert!(
     !DecodingOptions::new()
       .maybe_drop_blank_audio(false)
       .drop_blank_audio()
   );
-  // Deviation 2 — `word_grouping` defaults `FineGrained` (Swift's coarse CJK
-  // grouping is the opt-in); `with_word_grouping(SwiftParity)` is the hatch.
-  assert_eq!(o.word_grouping(), WordGrouping::FineGrained);
+  // NOT a deviation — `word_grouping` now DEFAULTS to Swift's own grouping
+  // (coremlit issue #41, reversing the #11 pin); `with_word_grouping(
+  // FineGrained)` is the product-quality opt-in for fine-grained CJK words.
+  assert_eq!(o.word_grouping(), WordGrouping::SwiftParity);
   assert!(
     DecodingOptions::new()
-      .with_word_grouping(WordGrouping::SwiftParity)
+      .with_word_grouping(WordGrouping::FineGrained)
       .word_grouping()
-      .is_swift_parity()
+      .is_fine_grained()
   );
 
   // The parity-relevant Swift-equal defaults the refutation rests on: the
@@ -200,39 +201,39 @@ fn enums_round_trip_and_display() {
 }
 
 #[test]
-fn word_grouping_defaults_to_fine_grained() {
-  // The #11-pinned CJK behavior stays the default: a caller who never
-  // mentions grouping gets the fine-grained split, and Swift's coarse
-  // phrase-blob grouping is reachable only by naming it (coremlit #14).
-  assert_eq!(WordGrouping::default(), WordGrouping::FineGrained);
+fn word_grouping_defaults_to_swift_parity() {
+  // #41 default: a caller who never mentions grouping gets Swift's own
+  // grouping (space-fallthrough for zh/yue), and the #11-pinned fine-grained
+  // split is reachable only by naming it (reverses the #11 default, coremlit
+  // #14/#41).
+  assert_eq!(WordGrouping::default(), WordGrouping::SwiftParity);
   assert_eq!(
     DecodingOptions::new().word_grouping(),
-    WordGrouping::FineGrained
+    WordGrouping::SwiftParity
   );
-  assert!(DecodingOptions::new().word_grouping().is_fine_grained());
+  assert!(DecodingOptions::new().word_grouping().is_swift_parity());
 
-  let built = DecodingOptions::new().with_word_grouping(WordGrouping::SwiftParity);
-  assert_eq!(built.word_grouping(), WordGrouping::SwiftParity);
-  assert!(built.word_grouping().is_swift_parity());
+  let built = DecodingOptions::new().with_word_grouping(WordGrouping::FineGrained);
+  assert_eq!(built.word_grouping(), WordGrouping::FineGrained);
+  assert!(built.word_grouping().is_fine_grained());
 
   let mut m = DecodingOptions::new();
-  m.set_word_grouping(WordGrouping::SwiftParity);
-  assert_eq!(m.word_grouping(), WordGrouping::SwiftParity);
   m.set_word_grouping(WordGrouping::FineGrained);
   assert_eq!(m.word_grouping(), WordGrouping::FineGrained);
+  m.set_word_grouping(WordGrouping::SwiftParity);
+  assert_eq!(m.word_grouping(), WordGrouping::SwiftParity);
 }
 
 #[cfg(feature = "serde")]
 #[test]
-fn word_grouping_serde_omitted_stays_fine_grained() {
-  // An omitted field must NOT silently opt a config into Swift's coarse
-  // grouping — the whole point of making `Phrase` explicit.
+fn word_grouping_serde_omitted_stays_swift_parity() {
+  // An omitted field follows the enum `Default` — now SwiftParity (coremlit
+  // issue #41, reversing the #11 pin); an explicit value still wins.
   let omitted: DecodingOptions = serde_json::from_str("{}").unwrap();
-  assert_eq!(omitted.word_grouping(), WordGrouping::FineGrained);
+  assert_eq!(omitted.word_grouping(), WordGrouping::SwiftParity);
 
-  let phrase: DecodingOptions =
-    serde_json::from_str(r#"{"word_grouping":"swift_parity"}"#).unwrap();
-  assert_eq!(phrase.word_grouping(), WordGrouping::SwiftParity);
+  let fine: DecodingOptions = serde_json::from_str(r#"{"word_grouping":"fine_grained"}"#).unwrap();
+  assert_eq!(fine.word_grouping(), WordGrouping::FineGrained);
 
   for wanted in [WordGrouping::FineGrained, WordGrouping::SwiftParity] {
     let options = DecodingOptions::new().with_word_grouping(wanted);
