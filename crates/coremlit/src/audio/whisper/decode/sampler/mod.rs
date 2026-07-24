@@ -495,21 +495,25 @@ pub const fn derive_attempt_seed(
   splitmix64(state ^ attempt_index.wrapping_mul(GAMMA_ATTEMPT))
 }
 
-/// Index of the largest entry in `logits`, comparing with `f32::total_cmp`
-/// and keeping the first index on an exact tie. Ports the argmax branch of
-/// Swift's `sampleWithMLTensor`/`sampleWithBNNS`
-/// (`TokenSampler.swift:75,182-196`) — Swift's actual argmax is
-/// `MLTensor.argmax` or `BNNS.ReductionFunction.argMax` picked by OS
-/// availability, both opaque about tie-breaking, so first-index-wins
-/// (numpy's convention) is this port's pinned choice, not verified Swift
-/// parity; exact ties between distinct vocab entries on real f32 decoder
-/// logits are measure-zero.
+/// Index of the largest entry in `logits` under IEEE `>` comparison: the
+/// FIRST index wins every tie (exact ties and signed-zero ties — IEEE `==`
+/// treats `-0.0 == +0.0`), and NaN entries are skipped wherever they sit.
+/// Probe-verified Swift parity (tests/whisper_swift_probes/probe_argmax2.out,
+/// macOS 26.5/M1 Max): `MLTensor.argmax(alongAxis:)` on the f32-cast logits
+/// (the macOS 15+ path, `TokenSampler.swift:45,75`) and
+/// `BNNS.ReductionFunction.argMax` at f16 (legacy, `:182-196`) both return
+/// the first index on every crafted tie and both skip NaN. All-NaN input is
+/// unspecified upstream (MLTensor -> 0, BNNS -> last); this port pins 0,
+/// matching the shipping MLTensor path. Empty input returns 0 (unreachable:
+/// the decoder always emits `vocab()` logits).
 fn argmax(logits: &[f32]) -> usize {
-  let mut best = 0;
-  for (index, &value) in logits.iter().enumerate().skip(1) {
-    if value.total_cmp(&logits[best]).is_gt() {
-      best = index;
+  let mut best: Option<usize> = None;
+  for (index, &value) in logits.iter().enumerate() {
+    match best {
+      None if !value.is_nan() => best = Some(index),
+      Some(b) if value > logits[b] => best = Some(index),
+      _ => {}
     }
   }
-  best
+  best.unwrap_or(0)
 }
