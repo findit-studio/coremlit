@@ -53,9 +53,13 @@
 //!
 //! Placement is characterized, not asserted (`tests/granite/placement.rs`).
 //! Unlike CLAP's audio tower, the granite ModernBERT graph **does** compile for
-//! the ANE (the T1 probe measured ~97.8% ANE residency, fp16 cosine 0.99996 vs a
-//! `CpuOnly` reference). [`crate::ComputeUnits::All`] (the default) lets CoreML
-//! schedule it; the module characterizes the placement rather than claiming it.
+//! the ANE: T1's ANECCompile accepted it and the `CPU_AND_NE` compile plan
+//! reported 482/493 ops (97.8%) preferring the ANE — a planner/compile-eligibility
+//! report, not measured runtime residency. fp16 under `CpuAndNeuralEngine` scored
+//! worst cosine 0.99996 vs the fp32 reference build. [`crate::ComputeUnits::All`]
+//! (the default) lets CoreML schedule it — on T1's Mac the planner chose the GPU
+//! for this small graph; `CpuAndNeuralEngine` targets the ANE. The module
+//! characterizes the placement rather than claiming it.
 
 pub mod embedding;
 pub mod error;
@@ -149,7 +153,9 @@ mod contract {
 pub const MAX_TOKENS: usize = 512;
 
 /// Default [`TextEmbedderOptions::compute`]: [`ComputeUnits::All`]. The granite
-/// ModernBERT graph compiles for the ANE (T1); `All` lets CoreML schedule it.
+/// ModernBERT graph is ANE-capable (T1's `CPU_AND_NE` compile plan: 97.8% of ops
+/// ANE-preferred); `All` lets CoreML schedule it — T1 saw the planner pick the
+/// GPU on Macs for this small graph; `CpuAndNeuralEngine` targets the ANE.
 /// Placement is characterized, not asserted (`tests/granite/placement.rs`).
 pub const DEFAULT_COMPUTE: ComputeUnits = ComputeUnits::All;
 
