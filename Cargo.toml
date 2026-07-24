@@ -49,7 +49,7 @@ rustfft = "6"
 soundevents-dataset = { version = "0.2", default-features = false, features = ["std", "rated"] }
 npyz = "0.9"
 cpal = "0.16"
-rubato = "0.16"
+rubato = "4.0"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 # Pure-Rust PNG decoder — a DEV-dep only, for decoding the committed siglip
 # corpus PNG fixtures in tests (the crate itself is sans-I/O: `Rgb8Image` takes
