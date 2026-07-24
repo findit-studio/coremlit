@@ -3169,9 +3169,73 @@ fn zero_commit_window_skips_word_timestamps() {
   );
   // Coarse `segment_size` end (1 s window), NOT word-refined, and the segment
   // is NOT dropped (the zero-length filter lives inside the skipped block).
-  // Mutation C (make `alignment_weights` unconditionally `Some`) runs the
-  // block and attaches a word, so `words_slice()` is no longer empty.
+  //
+  // Mutation C (make `alignment_weights` unconditionally `Some`) does NOT
+  // fail here, and never can: a zero-commit window structurally carries zero
+  // text tokens too (any appended token implies a prior non-completing step,
+  // which commits a row), so even with the block running,
+  // `update_segments_with_word_timings` breaks before attaching anything --
+  // this lump segment is wordless either way (Fable review, whisper #41
+  // follow-up). Mutation C is caught instead by the three backend-level gate
+  // pins in `backend/mock/tests.rs`, which assert
+  // `alignment_weights(..).is_none()` directly and fail under it:
+  //   - `alignment_rows_accumulate_at_position_plus_one`
+  //   - `steps_without_alignment_rows_keep_the_has_alignment_gate_shut`
+  //   - `a_committed_row_survives_reset_as_stale_data`
+  // ...and by `alignment_less_window_with_text_tokens_skips_word_timestamps`
+  // below, whose text-bearing-but-alignment-less window DOES flip under it.
   assert_eq!((seg.start(), seg.end()), (0.0, 1.0));
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn alignment_less_window_with_text_tokens_skips_word_timestamps() {
+  // The genuinely discriminating hasAlignment-gate witness (Fable review,
+  // whisper #41 follow-up), companion to `zero_commit_window_skips_word_
+  // timestamps` above. That test's window is structurally wordless, so
+  // mutation C has nothing to attach and it cannot detect the mutation (see
+  // its own doc). This window decodes REAL text (`script_clean_window`: all
+  // `push_token_steps`, no `push_step_with_alignment` anywhere) but never
+  // stages an alignment row on any step, so `commit_alignment_row` is a
+  // no-op throughout, the `hasAlignment` gate never opens, and
+  // `alignment_weights` returns `None` even though the window carries text
+  // -- the real-world alignment-less-model case the gate exists for
+  // (TextDecoder.swift:568,711,764-771; TranscribeTask.swift:197-199).
+  //
+  // Measured, not assumed (the gate was mutated in place, run, then
+  // reverted -- `git diff` confirmed production code byte-identical before
+  // commit): under mutation C (make `alignment_weights` unconditionally
+  // `Some`), the block runs against the never-written, all-zero accumulator,
+  // and the degenerate boundary it produces collapses the segment to zero
+  // length, so the zero-length filter (:217-218) drops it entirely --
+  // `result.segments_slice().len()` goes from 1 (a real "Hello" segment) to
+  // 0. A transcribed word silently vanishes; that is the concrete failure
+  // this gate prevents.
+  let t = tiny_tokenizer();
+  let mut mock = MockBackend::new().with_dims(ModelDims::new().with_window_samples(16_000));
+  let hello = t.encode(" Hello").unwrap()[0];
+  script_clean_window(&mut mock, hello);
+  let options = DecodingOptions::new().with_word_timestamps();
+  let result = TranscribeTask::new(&mock, &t)
+    .run(&vec![0.1; 32_000], &options)
+    .unwrap();
+  assert_eq!(
+    result.text(),
+    "Hello",
+    "real decoded text, unlike the zero-commit companion"
+  );
+  assert_eq!(result.segments_slice().len(), 1);
+  let seg = &result.segments_slice()[0];
+  assert!(
+    seg.words_slice().is_empty(),
+    "no alignment ever committed -> hasAlignment gate shut -> word-timestamp \
+     block skipped"
+  );
+  // Coarse <|0.00|>..<|2.00|> boundary, untouched by word-refinement (which
+  // never ran) -- identical to the un-word-timestamped baseline in
+  // `single_window_run_produces_segments_and_text`.
+  assert!((seg.start() - 0.0).abs() < 1e-4);
+  assert!((seg.end() - 2.0).abs() < 1e-4);
 }
 
 #[test]
