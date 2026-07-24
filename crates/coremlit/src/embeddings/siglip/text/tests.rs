@@ -147,29 +147,30 @@ fn configured_tokenizer_truncates_to_window_and_disables_padding() {
 
 // ── E1: fail-closed placeholder tokenizer ─────────────────────────────────────
 
-/// `load` and `from_memory` reject the shipping placeholder `tokenizer.json`
-/// with [`Error::TokenizerPlaceholder`] BEFORE any I/O — a nonexistent model
-/// path proves the guard fires ahead of `Model::load` (else the error would be
-/// [`Error::Load`]).
-///
-/// Wave B note: when the real Gemma bytes replace the placeholder,
-/// `ensure_not_placeholder(BUNDLED_TOKENIZER)` becomes `Ok` and both
-/// constructors proceed to `Error::Load` on the nonexistent path — this test's
-/// two assertions flip accordingly (tracked in the port plan's Wave B flip list).
+/// Post-Wave-B (the real Gemma bytes now back `BUNDLED_TOKENIZER`): the
+/// placeholder guard passes, so `load` / `from_memory` proceed PAST it to
+/// `Model::load`, which fails on a nonexistent path with [`Error::Load`] — proving
+/// the guard no longer short-circuits and the bundled bytes parse as a real
+/// tokenizer. (Wave-A shipped this asserting [`Error::TokenizerPlaceholder`]; the
+/// tokenizer-swap flipped it, exactly as the Wave-A doc anticipated.)
 #[test]
-fn load_and_from_memory_fail_closed_on_placeholder() {
+fn load_and_from_memory_accept_the_real_bundled_tokenizer() {
   let bundled = crate::embeddings::siglip::BUNDLED_TOKENIZER;
+  assert!(
+    ensure_not_placeholder(bundled).is_ok(),
+    "the real bundled Gemma tokenizer must pass the placeholder guard"
+  );
   match TextEmbedder::load("/nonexistent/model.mlmodelc", TextEmbedderOptions::new()) {
-    Err(Error::TokenizerPlaceholder) => {}
-    other => panic!("expected TokenizerPlaceholder from load, got {other:?}"),
+    Err(Error::Load(_)) => {}
+    other => panic!("expected Error::Load past the guard, got {other:?}"),
   }
   match TextEmbedder::from_memory(
     "/nonexistent/model.mlmodelc",
     bundled,
     TextEmbedderOptions::new(),
   ) {
-    Err(Error::TokenizerPlaceholder) => {}
-    other => panic!("expected TokenizerPlaceholder from from_memory, got {other:?}"),
+    Err(Error::Load(_)) => {}
+    other => panic!("expected Error::Load past the guard, got {other:?}"),
   }
 }
 
@@ -179,6 +180,21 @@ fn load_and_from_memory_fail_closed_on_placeholder() {
 #[test]
 fn placeholder_guard_accepts_real_tokenizer_bytes() {
   assert!(ensure_not_placeholder(TINY_TOKENIZER.as_bytes()).is_ok());
+}
+
+/// The durable regression guard (now that the bundled bytes are real): a small
+/// buffer carrying the sentinel is still refused with
+/// [`Error::TokenizerPlaceholder`], so re-committing the build-time placeholder
+/// `tokenizer.json` fails closed rather than shipping a meaningless tokenizer.
+#[test]
+fn placeholder_guard_rejects_the_sentinel_buffer() {
+  let mut buf = br#"{"junk":""#.to_vec();
+  buf.extend_from_slice(PLACEHOLDER_SENTINEL);
+  buf.extend_from_slice(br#""}"#);
+  match ensure_not_placeholder(&buf) {
+    Err(Error::TokenizerPlaceholder) => {}
+    other => panic!("expected TokenizerPlaceholder for a sentinel buffer, got {other:?}"),
+  }
 }
 
 // ── E2: lowercase composition (mixed-case oracles) ────────────────────────────

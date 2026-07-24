@@ -8,18 +8,21 @@
 //!   corpus PNGs. Read hermetically; no model, no network. Staged by the port
 //!   plan's golden-generation step (Wave B).
 //! - **CoreML artifacts** (`siglip2_vision_512.mlmodelc`, `siglip2_text_64.mlmodelc`,
-//!   and `pos_embed_16x16x768.f32le.bin`) — gitignored dev-time downloads from
-//!   `FinDIT-Studio/siglip2-naflex-coreml` under `Models/siglip2-naflex/`
-//!   (overridable via `SIGLIP_TEST_MODELS`). Model-gated tests are `#[ignore]` by
-//!   default and run only when the owner stages the conversion (Wave C).
+//!   and `pos_embed_16x16x768.f32le.bin`) — gitignored, converted LOCALLY from the
+//!   official `google/siglip2-base-patch16-naflex` (the `conversion/siglip`
+//!   runbook), staged under `Models/siglip2-naflex/` (overridable via
+//!   `SIGLIP_TEST_MODELS`). Model-gated tests are `#[ignore]` by default and run
+//!   only when the owner stages the conversion (Wave C).
 
 use std::path::{Path, PathBuf};
 
-/// The HF revision (commit SHA) of `FinDIT-Studio/siglip2-naflex-coreml` the
-/// model artifacts and their per-file SHA-256 pins are recorded at. Pinned by
-/// the conversion runbook's upload step (Wave C / U2); a placeholder until then.
+/// The OFFICIAL SOURCE revision (commit SHA of `google/siglip2-base-patch16-naflex`)
+/// the staged artifacts were converted FROM (the `conversion/siglip` runbook); the
+/// per-source-file SHA-256 pins in the model-io gates are recorded at this
+/// revision. If/when the owner re-uploads the converted artifacts publicly, that
+/// artifact-repo revision is added alongside this one.
 #[allow(dead_code)]
-pub const SIGLIP_REVISION: &str = "<pending conversion upload (Wave C / runbook U2)>";
+pub const SIGLIP_REVISION: &str = "b53b807d3a2d5e2b3911292f2d69e5341cdc064c";
 
 /// Directory containing the downloaded siglip CoreML artifact tree.
 ///

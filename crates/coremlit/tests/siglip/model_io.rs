@@ -19,20 +19,45 @@ use std::collections::BTreeSet;
 
 use coremlit::{ComputeUnits, DataType, Model, embeddings::siglip::embedding::EMBEDDING_DIM};
 
-/// Vision `.mlmodelc` per-file SHA-256, EXACTLY enumerated (the #30 pattern).
-/// Pinned from `CHECKSUMS.sha256` at `common::SIGLIP_REVISION` — filled when the
-/// conversion is staged (Wave C).
+/// Vision `.mlmodelc` per-file SHA-256, EXACTLY enumerated (the #30 pattern),
+/// from `CHECKSUMS.sha256` of the staged conversion (`conversion/siglip`). The
+/// graph bytes (`model.mil`, `weights/weight.bin`) are deterministic from the
+/// pinned checkpoint + toolchain; `coremldata.bin` / `metadata.json` also carry a
+/// coremltools conversion-instance stamp (a `conversion_date` and a non-repeatable
+/// blob), so a re-conversion re-pins these two — the exact-set gate's intended
+/// "deliberate re-stage" behavior. A later public artifact re-upload freezes them.
 const ARTIFACT_SHA256: &[(&str, &str)] = &[
-  // ("coremldata.bin", "<sha256 — Wave C>"),
-  // ("model.mil", "<sha256 — Wave C>"),
-  // ("weights/weight.bin", "<sha256 — Wave C>"),
+  (
+    "analytics/coremldata.bin",
+    "0abe1152b48156d8a41a116660d8848fafa7de70643aac864a6e842caed75d37",
+  ),
+  (
+    "coremldata.bin",
+    "96ce055e241ab4302d563965ee5f70f36200794b73331d548d264be62ddff2f1",
+  ),
+  (
+    "metadata.json",
+    "1c9c16e43fc421919ea91a9792e386f62a8ab6da08d88a50d69e1dca54be849c",
+  ),
+  (
+    "model.mil",
+    "427a2cfe2b6b9caef6f34ae93b9bfc4441541513621b12daaec679d8cd844747",
+  ),
+  (
+    "weights/weight.bin",
+    "31fc44e771553c5b28b7af6561b46650ce5e1e4711dfef9f471ed32d502077b6",
+  ),
 ];
+
+/// The base position-grid sidecar's SHA-256 (deterministic: the checkpoint's
+/// `position_embedding.weight` reshaped 16×16×768, little-endian f32).
+const SIDECAR_SHA256: &str = "3ba1ba032ad8d97e0a1afebf4513615fbfedb56f646c14dcdb83d3c228c12860";
 
 /// Vision graph I/O contract (§0): resolves `P` from `pixel_values [1, P, 768]`
 /// and cross-checks `position_embeddings`, `attention_mask`, and the exact input
 /// SET against it. Wave C: extend with the exact-SHA manifest.
 #[test]
-#[ignore = "requires staged siglip vision model (SIGLIP_TEST_MODELS) — Wave C"]
+#[ignore = "requires staged siglip models (SIGLIP_TEST_MODELS)"]
 fn vision_io_matches_spec() {
   let model = Model::load(common::vision_model_path(), ComputeUnits::CpuOnly).unwrap();
   let d = model.description();
@@ -70,10 +95,14 @@ fn vision_io_matches_spec() {
 /// Exact-SHA manifest for the vision bundle + the pos-emb sidecar. Wave C fills
 /// `ARTIFACT_SHA256` and the sidecar SHA from `CHECKSUMS.sha256`.
 #[test]
-#[ignore = "requires staged siglip vision model (SIGLIP_TEST_MODELS) — Wave C"]
+#[ignore = "requires staged siglip models (SIGLIP_TEST_MODELS)"]
 fn vision_artifact_bytes_match_pinned_sha256() {
   common::assert_exact_sha_manifest(&common::vision_model_path(), ARTIFACT_SHA256);
-  // Wave C: pin the pos-emb sidecar SHA (common::sha256_file(&common::pos_embed_path())).
+  assert_eq!(
+    common::sha256_file(&common::pos_embed_path()),
+    SIDECAR_SHA256,
+    "pos-emb sidecar bytes drifted from the pinned 16×16×768 grid"
+  );
 }
 
 /// Hermetic non-vacuity proof for [`common::collect_files_rel`]'s sidecar filter
