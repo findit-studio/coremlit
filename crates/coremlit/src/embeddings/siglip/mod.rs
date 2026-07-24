@@ -105,21 +105,21 @@ pub use text::{DEFAULT_TEXT_COMPUTE, TextEmbedder, TextEmbedderOptions};
 
 /// Bytes of the bundled SigLIP 2 Gemma `tokenizer.json` compiled into the crate.
 ///
-/// This is the tokenizer from the source model repo
-/// [`google/siglip2-base-patch16-naflex`](https://huggingface.co/google/siglip2-base-patch16-naflex),
-/// the exact revision that produces the committed token-id goldens (proven
-/// byte-correct by `tests/siglip/tokenizer_identity.rs`). Exposed for callers who
-/// construct [`TextEmbedder`] via [`TextEmbedder::from_memory`]; the
+/// These are the exact `tokenizer.json` bytes of the source model repo
+/// [`google/siglip2-base-patch16-naflex`](https://huggingface.co/google/siglip2-base-patch16-naflex)
+/// at revision `b53b807d3a2d5e2b3911292f2d69e5341cdc064c` (SHA-256
+/// `58a1696e…b1b0`), the revision that produces the committed token-id goldens —
+/// proven byte-correct by `tests/siglip/tokenizer_identity.rs`. Exposed for
+/// callers who construct [`TextEmbedder`] via [`TextEmbedder::from_memory`]; the
 /// [`TextEmbedder::load`] / [`TextEmbedder::from_file`] constructors use it
 /// directly.
 ///
-/// NOTE: the committed `assets/tokenizer.json` is a small **placeholder** until
-/// the owner stages the source-revision Gemma bytes (the golden-generation step
-/// of the port plan); the SHA / identity pin in `tests/siglip/tokenizer_identity.rs`
-/// is what forces the real artifact in, and [`TextEmbedder::load`] /
-/// [`TextEmbedder::from_memory`] fail closed on it
-/// ([`Error::TokenizerPlaceholder`]) so it can never silently produce
-/// meaningless embeddings.
+/// The `include_bytes!` embeds ~34 MB into the rlib/binary — the Wave-A design
+/// accepted this cost (`BUNDLED_TOKENIZER` is the API). A build-time placeholder
+/// guard remains as a regression backstop: [`TextEmbedder::load`] /
+/// [`TextEmbedder::from_memory`] fail closed ([`Error::TokenizerPlaceholder`]) if
+/// the placeholder is ever re-committed, so a stripped tokenizer can never
+/// silently produce meaningless embeddings.
 pub const BUNDLED_TOKENIZER: &[u8] = include_bytes!("assets/tokenizer.json");
 
 /// A candidate paired with its precomputed [`Embedding`] — the input unit to

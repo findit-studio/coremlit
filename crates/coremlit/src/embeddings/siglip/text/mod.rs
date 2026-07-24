@@ -457,14 +457,16 @@ fn build_window(
   Ok(window)
 }
 
-/// Test-only seam: the module's actual tokenizer configuration, without loading
-/// a CoreML model — so `tests` can exercise the real tokenization path
-/// hermetically with a caller-supplied tokenizer and window `T`.
-#[cfg(test)]
-pub(crate) fn configured_tokenizer_from_bytes(
-  bytes: &[u8],
-  max_tokens: usize,
-) -> Result<Tokenizer> {
+/// Hermetic seam: the module's actual tokenizer configuration (the composed
+/// `Lowercase` normalizer + `LongestFirst` truncation at `T` + disabled padding),
+/// without loading a CoreML model — so the real tokenization path can be exercised
+/// with a caller-supplied tokenizer and window `T`. Exposed (rather than
+/// `#[cfg(test)]`) for the Wave B token-identity integration gate
+/// (`tests/siglip/tokenizer_identity.rs`), which builds each golden window from
+/// [`crate::embeddings::siglip::BUNDLED_TOKENIZER`] with no model load; hidden from
+/// docs because it is a test seam, not part of the supported surface.
+#[doc(hidden)]
+pub fn configured_tokenizer_from_bytes(bytes: &[u8], max_tokens: usize) -> Result<Tokenizer> {
   let mut tokenizer = Tokenizer::from_bytes(bytes).map_err(Error::TokenizerLoad)?;
   configure_tokenizer(&mut tokenizer, max_tokens)?;
   Ok(tokenizer)
