@@ -598,12 +598,12 @@ fn gap_attachment_falls_back_right_then_own_chunk() {
   use windit::split::ContentAware;
 
   let measure = |s: &str| -> usize { s.chars().count() };
-  // `attach_gaps` now takes a fallible measure; a `char`-count never fails, so
-  // the own-chunks (all far below MAX_TOKENS) attach exactly as before.
-  let measure_checked = |s: &str| -> Result<usize> { Ok(s.chars().count()) };
   // windit's raw chunks for `text` at `window`, repaired by `attach_gaps`, as
-  // (start, end) byte ranges.
+  // (start, end) byte ranges. `attach_gaps` now takes a fallible RANGE measure
+  // (byte offsets into `text`); a `char`-count never fails, so the own-chunks
+  // (all far below MAX_TOKENS) attach exactly as before.
   let repair = |text: &str, window: usize| -> Vec<(usize, usize)> {
+    let measure_checked = |a: usize, b: usize| -> Result<usize> { Ok(text[a..b].chars().count()) };
     let chunks = ContentAware::new(&measure)
       .chunk(text, &WindowOptions::new(window))
       .expect("chunk");
@@ -889,11 +889,13 @@ fn leading_and_trailing_over_budget_gaps_are_refused() {
   }
 }
 
-/// An encode failure during the fallback measure surfaces as `Error::Tokenize`,
-/// NOT a bogus `ContentlessInputOverBudget { tokens: usize::MAX }`: the fallible
-/// measure closure must preserve the tokenizer error's identity. A tiny
-/// WordLevel tokenizer whose unk token is absent from its vocab fails to encode
-/// the whitespace-only fallback input.
+/// An encode failure surfaces as `Error::Tokenize`, NOT a bogus
+/// `ContentlessInputOverBudget { tokens: usize::MAX }`. `chunk_long` now builds
+/// the `TokenIndex` from one whole-input encode BEFORE any chunking, so a
+/// tokenizer that cannot encode the input fails at that index-build seam — still
+/// `Error::Tokenize`, one call earlier than the old per-chunk `token_ids` would.
+/// A tiny WordLevel tokenizer whose unk token is absent from its vocab fails to
+/// encode the whitespace-only input.
 #[test]
 fn tokenizer_failure_on_fallback_measure_keeps_tokenize_identity() {
   // WordLevel, no pre-tokenizer, unk token `<unk>` not in vocab: encoding the
@@ -1339,4 +1341,344 @@ fn tokenizer_identity_accepts_bundled_bytes_and_bundled_provenance() {
   .expect("the pinned bundled bytes are the identity");
   validate_tokenizer_identity(&TokenizerProvenance::Bundled)
     .expect("bundled provenance is identity by construction");
+}
+
+// ── #3: single-pass chunking — layer-2 chunk differential + perf gates ────────
+//
+// The `TokenIndex`-backed `chunk_long` must produce byte-IDENTICAL `Vec<Chunk>`
+// to a reference that re-encodes every candidate range directly (the old
+// behaviour). Identical chunks + the unchanged embed tail ⇒ bit-identical
+// embeddings, so output identity reduces to this equality. The perf gates prove
+// the single pass replaced the old ~11× re-encode.
+
+/// The windit + `attach_gaps` chunking pipeline over arbitrary measures — the
+/// seam both the exact slow twin and the load-bearing perturbation drive.
+fn run_pipeline<W, R>(
+  text: &str,
+  opts: &WindowOptions,
+  win_measure: W,
+  range_measure: R,
+) -> Result<Vec<windit::split::Chunk>>
+where
+  W: Fn(&str) -> usize,
+  R: Fn(usize, usize) -> Result<usize>,
+{
+  let chunks = windit::split::ContentAware::new(&win_measure)
+    .chunk(text, opts)
+    .map_err(Error::from)?;
+  let mut repaired = attach_gaps(text, chunks, &range_measure, opts.window())?;
+  if repaired.is_empty() && !text.is_empty() {
+    let tokens = range_measure(0, text.len())?;
+    if tokens > MAX_TOKENS {
+      return Err(Error::ContentlessInputOverBudget {
+        start: 0,
+        end: text.len(),
+        tokens,
+        max: MAX_TOKENS,
+      });
+    }
+    repaired.push(windit::split::Chunk::new(0, text.len()));
+  }
+  if let Some(max) = opts.max_windows()
+    && repaired.len() > max
+  {
+    return Err(Error::Windowing(windit::WinditError::TooManyWindows {
+      got: repaired.len(),
+      max,
+    }));
+  }
+  Ok(repaired)
+}
+
+/// The reference twin: every candidate range measured by a DIRECT
+/// `encode(&text[a..b], true)` — the exact behaviour before the single-pass
+/// index. Slow by construction (re-encodes growing prefixes), used only to pin
+/// the fast path.
+fn chunk_long_slow(
+  mt: &Tokenizer,
+  text: &str,
+  opts: &WindowOptions,
+) -> Result<Vec<windit::split::Chunk>> {
+  run_pipeline(
+    text,
+    opts,
+    |s: &str| {
+      mt.encode(s, true)
+        .map(|e| e.get_ids().len())
+        .unwrap_or(usize::MAX)
+    },
+    |a: usize, b: usize| {
+      mt.encode(&text[a..b], true)
+        .map(|e| e.get_ids().len())
+        .map_err(Error::Tokenize)
+    },
+  )
+}
+
+/// The committed multilingual golden texts.
+fn golden_texts() -> Vec<String> {
+  const CORPUS: &str = include_str!("../../../tests/granite/fixtures/goldens/corpus.json");
+  let v: serde_json::Value = serde_json::from_str(CORPUS).expect("parse corpus.json");
+  v["entries"]
+    .as_array()
+    .expect("entries array")
+    .iter()
+    .map(|e| e["text"].as_str().expect("entry text").to_string())
+    .collect()
+}
+
+/// The gate-2 corpus: the 16 goldens plus the adversarial shapes the design calls
+/// out (paragraph doc, punctuation storm, digit storms, whitespace pathologies, a
+/// no-space char-fallback word, multibyte/emoji). Kept ≤ ~1.5 KiB each so the
+/// quadratic slow twin stays fast; the 4 MiB scale is the `#[ignore]` gate.
+fn differential_texts() -> Vec<String> {
+  let mut texts = golden_texts();
+  // A compact multi-paragraph doc (distinct words → real word/sentence descent).
+  let doc: String = (0..8)
+    .map(|p| {
+      (0..16)
+        .map(|w| format!("para{p}word{w}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+    })
+    .collect::<Vec<_>>()
+    .join("\n\n");
+  texts.push(format!("\n\n{doc}\n\n"));
+  texts.push(doc);
+  texts.push(
+    (0..120)
+      .map(|w| format!("term{w}"))
+      .collect::<Vec<_>>()
+      .join(", "),
+  );
+  texts.push("192.168.1.1 10.0.0.255 call 555-0142 order #A1234-99 on 2026-07-18. ".repeat(10));
+  texts.push(" \t \u{00A0}\u{2009}mixed  ws\r\n\r\n runs\t here and there ".repeat(10));
+  texts.push("x".repeat(2048));
+  texts.push("café\u{0301} 你好 🍕 👨\u{200D}👩\u{200D}👧\u{200D}👦 tëst ".repeat(12));
+  texts
+}
+
+/// The window/overlap/max_windows grid (overlap 16 only paired with windows above
+/// it, so windit never rejects overlap >= window).
+fn geometry_grid() -> Vec<WindowOptions> {
+  let mut g = Vec::new();
+  for &w in &[8usize, 32, 128, 512] {
+    g.push(WindowOptions::new(w));
+    if w > 16 {
+      g.push(WindowOptions::new(w).with_overlap(16));
+    }
+  }
+  g.push(WindowOptions::new(128).with_max_windows(4));
+  g.push(WindowOptions::new(512).with_max_windows(2));
+  g
+}
+
+/// GATE 2: the index-backed fast path and the direct-encode slow twin agree
+/// EXACTLY as `Vec<Chunk>` across the corpus × geometry grid (both `Ok` with equal
+/// chunks, or both `Err`). Identical chunks are the reduction of embedding
+/// bit-identity.
+#[test]
+fn chunk_long_matches_slow_twin_over_corpus_and_geometry() {
+  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let grid = geometry_grid();
+  for text in differential_texts() {
+    for opts in &grid {
+      let (window, overlap) = (opts.window(), opts.overlap());
+      match (
+        chunk_long(&mt, &text, opts),
+        chunk_long_slow(&mt, &text, opts),
+      ) {
+        (Ok(fast), Ok(slow)) => assert_eq!(
+          fast, slow,
+          "fast/slow chunk mismatch (window={window}, overlap={overlap}) for {text:.40?}"
+        ),
+        (Err(_), Err(_)) => {}
+        (fast, slow) => panic!(
+          "fast/slow Ok-vs-Err disagreement (window={window}, overlap={overlap}) for {text:.40?}: \
+           {fast:?} vs {slow:?}"
+        ),
+      }
+    }
+  }
+}
+
+/// RED-FIRST (non-vacuity): a windit measure that over-counts every range by ONE
+/// token packs one fewer atom wherever a chunk otherwise ended exactly at the
+/// window, moving a boundary — so the `Vec<Chunk>` differs from the exact run. A
+/// `measure_range` off by a single token would therefore red the gate above; the
+/// equality is load-bearing, not trivially true.
+///
+/// Uses space-separated single letters, each exactly one token, so the packed
+/// measure hits every integer and a chunk necessarily ends exactly at the window
+/// (`window - 2` letters after the two template specials) — where `+1` tips the
+/// threshold and drops a letter, a guaranteed boundary move.
+#[test]
+fn chunk_differential_is_load_bearing_against_a_shifted_measure() {
+  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let doc: String = "a b c d e f g h i j k l m n o p q r s t u v w x y z "
+    .repeat(8)
+    .trim_end()
+    .to_string();
+  let opts = WindowOptions::new(16);
+  let exact_range = |a: usize, b: usize| {
+    mt.encode(&doc[a..b], true)
+      .map(|e| e.get_ids().len())
+      .map_err(Error::Tokenize)
+  };
+  let correct = run_pipeline(
+    &doc,
+    &opts,
+    |s: &str| {
+      mt.encode(s, true)
+        .map(|e| e.get_ids().len())
+        .unwrap_or(usize::MAX)
+    },
+    exact_range,
+  )
+  .expect("exact pipeline");
+  let shifted = run_pipeline(
+    &doc,
+    &opts,
+    |s: &str| {
+      mt.encode(s, true)
+        .map(|e| e.get_ids().len() + 1)
+        .unwrap_or(usize::MAX)
+    },
+    exact_range,
+  )
+  .expect("shifted pipeline");
+  assert_ne!(
+    correct, shifted,
+    "a one-token measure over-count must move a chunk boundary — the fast==slow gate is \
+     load-bearing"
+  );
+}
+
+/// A deterministic natural-ish document: sentences of dictionary words with the
+/// odd number, packed into `\n\n`-separated paragraphs, up to `target_bytes`.
+fn natural_doc(target_bytes: usize) -> String {
+  const WORDS: &[&str] = &[
+    "the",
+    "quantum",
+    "entanglement",
+    "system",
+    "provides",
+    "native",
+    "on-device",
+    "inference",
+    "for",
+    "text",
+    "embeddings",
+    "and",
+    "retrieval",
+    "across",
+    "many",
+    "languages",
+    "with",
+    "stable",
+    "latency",
+    "under",
+    "load",
+    "because",
+    "model",
+    "compiles",
+    "efficiently",
+    "into",
+    "a",
+    "fixed",
+    "graph",
+  ];
+  let mut s = String::with_capacity(target_bytes + 64);
+  let mut r: u64 = 0x9E37_79B9_7F4A_7C15;
+  let mut step = || {
+    r = r
+      .wrapping_mul(6_364_136_223_846_793_005)
+      .wrapping_add(1_442_695_040_888_963_407);
+    (r >> 33) as usize
+  };
+  let mut sentences_in_para = 0u32;
+  while s.len() < target_bytes {
+    let words = 8 + step() % 9;
+    for k in 0..words {
+      if k > 0 {
+        s.push(' ');
+      }
+      s.push_str(WORDS[step() % WORDS.len()]);
+    }
+    if step() % 4 == 0 {
+      s.push_str(&format!(" {}", 1000 + step() % 90_000));
+    }
+    s.push('.');
+    sentences_in_para += 1;
+    if sentences_in_para >= 5 {
+      s.push_str("\n\n");
+      sentences_in_para = 0;
+    } else {
+      s.push(' ');
+    }
+  }
+  s
+}
+
+/// PERF GATE (structural, hermetic, non-flaky): on a ~256 KiB natural document the
+/// measurement path re-encodes at most 1.5× the input in bytes (the old per-range
+/// closure re-encoded ~11×). Structural — one index pass plus tiny edge fragments
+/// — so robust across corpora.
+#[test]
+fn measure_path_reencodes_at_most_1_5x_input() {
+  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let doc = natural_doc(256 * 1024);
+  super::token_index::encode_meter::reset();
+  let chunks = chunk_long(&mt, &doc, &WindowOptions::new(MAX_TOKENS)).expect("chunk");
+  let encoded = super::token_index::encode_meter::get();
+  let ratio = encoded as f64 / doc.len() as f64;
+  println!(
+    "[byte-ratio] input={} bytes, encoded={} bytes, ratio={ratio:.3}x, chunks={}",
+    doc.len(),
+    encoded,
+    chunks.len()
+  );
+  assert!(
+    ratio <= 1.5,
+    "measure path re-encoded {ratio:.3}x the input (> 1.5x) — the single-pass index regressed \
+     toward the old per-range re-encode"
+  );
+}
+
+/// GATE 4 (`#[ignore]`, run locally for the PR notes): fast == slow chunks on
+/// 1 MiB / 4 MiB natural documents, with wall-clock speedup and the re-encode
+/// byte ratio printed. The slow twin is too slow for CI (its classes are covered
+/// hermetically by gate 2); this is the scale/perf witness.
+#[test]
+#[ignore = "4 MiB fast-vs-slow chunk differential + timing (run locally for PR notes)"]
+fn big_document_fast_matches_slow_with_timing() {
+  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let opts = WindowOptions::new(MAX_TOKENS);
+  for size in [1usize << 20, 4usize << 20] {
+    let doc = natural_doc(size);
+
+    super::token_index::encode_meter::reset();
+    let t0 = std::time::Instant::now();
+    let fast = chunk_long(&mt, &doc, &opts).expect("fast chunk");
+    let fast_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let fast_bytes = super::token_index::encode_meter::get();
+
+    let t1 = std::time::Instant::now();
+    let slow = chunk_long_slow(&mt, &doc, &opts).expect("slow chunk");
+    let slow_ms = t1.elapsed().as_secs_f64() * 1e3;
+
+    assert_eq!(fast, slow, "fast/slow chunk mismatch at {size} bytes");
+    let ratio = fast_bytes as f64 / doc.len() as f64;
+    println!(
+      "[big-diff] size={} chunks={} fast={fast_ms:.1}ms slow={slow_ms:.1}ms \
+       speedup={:.1}x reencode_ratio={ratio:.3}x",
+      doc.len(),
+      fast.len(),
+      slow_ms / fast_ms,
+    );
+    assert!(
+      ratio <= 1.5,
+      "reencode ratio {ratio:.3}x > 1.5x at {size} bytes"
+    );
+  }
 }
