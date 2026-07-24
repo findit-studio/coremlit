@@ -29,20 +29,22 @@ mod names {
 /// Default [`ImageEmbedderOptions::compute`]: [`ComputeUnits::CpuAndGpu`] — the
 /// **measured floor-holding** placement, deliberately NOT [`ComputeUnits::All`].
 ///
-/// The conversion probe measured the vision graph as **99.1% ANE-preferred** in
-/// its CoreML compute plan, yet its fp16-on-ANE parity is **0.998118 worst**,
-/// *below* the committed **0.99917** floor; the identical fp16 weights reach
-/// **0.999959** on the GPU (fp32 accumulation). Because the planner prefers the
-/// ANE for nearly every op, [`ComputeUnits::All`] risks silently dispatching the
-/// vision tower to the below-floor ANE arm. `CpuAndGpu` pins the graph to the
-/// floor-holding GPU path (mirroring `clap`'s measure-then-pin `text` default).
+/// The CoreML compute planner prefers the ANE for nearly all of the vision
+/// graph, but on the staged conversion the ANE arm COLLAPSES: fp16-on-ANE worst
+/// corpus cosine ≈ **0.31** (systematic across the corpus; the earlier probe's
+/// 0.998118 no longer holds), and [`ComputeUnits::All`] follows the ANE
+/// dispatch, so both sit far below the committed **0.99917** floor. The
+/// identical fp16 weights reach **≈ 0.99999** on the GPU, so `CpuAndGpu` pins
+/// the graph to the floor-holding path (mirroring `clap`'s measure-then-pin
+/// `text` default).
 ///
-/// This is a deliberate spec deviation pending the conversion runbook's `All`-arm
-/// characterization (placement + parity + compute-plan dispatch); if `All`
-/// measures GPU-identical and floor-holding, the default may move to `All` in a
-/// follow-up — with the measurement in hand. Every unit stays selectable via
+/// The measured per-arm bands live in `tests/siglip/placement.rs` (the
+/// characterization gate) and the staged bundle's `MANIFEST.json`; a
+/// re-conversion that changes the ANE band REDs that gate, forcing a deliberate
+/// re-characterization. `All` could become the default only after a measurement
+/// shows it GPU-identical and floor-holding. Every unit stays selectable via
 /// [`ImageEmbedderOptions::with_compute`] / [`ImageEmbedderOptions::set_compute`];
-/// placement is characterized, not asserted (`tests/siglip/placement.rs`).
+/// placement is characterized, not asserted.
 pub const DEFAULT_IMAGE_COMPUTE: ComputeUnits = ComputeUnits::CpuAndGpu;
 
 #[cfg(feature = "serde")]
