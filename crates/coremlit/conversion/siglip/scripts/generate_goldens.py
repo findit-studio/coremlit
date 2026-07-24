@@ -32,6 +32,7 @@ from _siglip_common import (
     load_slow_image_processor,
     official_lift,
     padded_ids,
+    src_dir,
 )
 from _fixtures import IMAGES, TEXTS, goldens_dir, load_pil
 
@@ -340,10 +341,37 @@ def write_npy_fixtures(model, proc):
     print(f"  staged .npy fixtures -> {fdir}")
 
 
+def advisory_slow_vs_fast_tokenizer(fast_tok):
+    """Non-blocking advisory (§7): the SLOW sentencepiece GemmaTokenizer should
+    produce the same ids as the FAST tokenizer.json on the ASCII corpus. Printed,
+    never asserted — the Rust path only ever executes tokenizer.json (== the fast
+    tokenizer), pinned by SHA + the byte-parity identity gate; this is a defensive
+    cross-check against a fast-vs-slow HF skew, not a gate."""
+    try:
+        from transformers import GemmaTokenizer
+
+        slow = GemmaTokenizer.from_pretrained(src_dir())
+    except Exception as e:  # noqa: BLE001 — advisory only
+        print(f"  [advisory] slow tokenizer unavailable ({type(e).__name__}); skipped")
+        return
+    import tokenizers
+
+    mismatches = 0
+    for entry in TEXTS:
+        lower = tokenizers.normalizers.Lowercase().normalize_str(entry["text"])
+        fast_ids = fast_tok(lower, add_special_tokens=True)["input_ids"]
+        slow_ids = slow(lower, add_special_tokens=True)["input_ids"]
+        if fast_ids != slow_ids:
+            mismatches += 1
+            print(f"  [advisory] slow!=fast ids for {entry['id']!r} (non-blocking)")
+    print(f"  [advisory] slow-vs-fast tokenizer ids: {len(TEXTS) - mismatches}/{len(TEXTS)} agree")
+
+
 def main():
     model = load_model()
     proc = load_slow_image_processor()
     tok = load_fast_tokenizer()
+    advisory_slow_vs_fast_tokenizer(tok)
 
     gdir = goldens_dir()
     os.makedirs(gdir, exist_ok=True)
