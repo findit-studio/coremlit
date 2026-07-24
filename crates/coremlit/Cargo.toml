@@ -121,16 +121,16 @@ granite = ["dep:tokenizers", "dep:windit", "windit/text", "dep:sha2"]
 siglip = ["dep:tokenizers", "dep:colconv"]
 
 # --- audio::ced (CED tiny/mini/small/base AudioSet sound-event tagging) ---
-# Native CoreML CED multi-label classifier (four size-invariant sizes): 16 kHz
-# mono waveform in, ranked
-# AudioSet predictions out (527 rated classes via the ort-free
-# `soundevents-dataset` data crate). A Rust log-mel front-end (`rustfft`, shared
-# with `clap`) around one fp16 mel→logits transformer graph; long clips chunk
-# via `windit` (geometry only) and aggregate Mean/Max in confidence space. The
-# parity oracle is COMMITTED fp32 goldens (mel + logits, Wave B), never a live
-# ONNX crate — so there is NO `ced-oracle` feature and NO `ort` in this path in
-# ANY configuration, runtime or dev (the ort-based `soundevents` crate is never
-# a dependency). `default = []` pulls none of it.
+# Native CoreML CED multi-label classifier (tiny/mini/small/base — one
+# size-invariant mel→logits contract): 16 kHz mono waveform in, ranked AudioSet
+# predictions out (527 rated classes via the ort-free `soundevents-dataset` data
+# crate). A Rust log-mel front-end (`rustfft`, shared with `clap`) around one
+# fp16 mel→logits transformer graph; long clips chunk via `windit` (geometry
+# only) and aggregate Mean/Max in confidence space. The parity oracle is
+# COMMITTED fp32 goldens (mel + logits, Wave B), never a live ONNX crate — so
+# there is NO `ced-oracle` feature and NO `ort` in this path in ANY
+# configuration, runtime or dev (the ort-based `soundevents` crate is never a
+# dependency). `default = []` pulls none of it.
 # Structural proof (re-run on dep changes):
 #   cargo tree -p coremlit --features ced -e normal | grep -iw ort   → no match
 ced = ["dep:rustfft", "dep:soundevents-dataset", "dep:windit"]

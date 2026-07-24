@@ -53,9 +53,9 @@ patch budget, so it is a `windit` non-consumer (no windowing).
 
 `ced` is likewise a NEW module (`audio::ced`): CED (tiny/mini/small/base)
 AudioSet sound-event tagging on CoreML — 16 kHz mono waveform in, ranked
-predictions over the 527
-rated AudioSet classes out (`soundevents-dataset`, the ort-free data crate;
-the ort-based `soundevents` crate is never a dependency). A Rust log-mel
+predictions over the 527 rated AudioSet classes out (`soundevents-dataset`,
+the ort-free data crate; the ort-based `soundevents` crate is never a
+dependency). A Rust log-mel
 front-end (`rustfft`) feeds one fp16 mel→logits graph; long clips ride the
 rev-pinned `windit` engine (geometry only). Same posture as `granite` —
 COMMITTED fp32 goldens, so NO `ced-oracle` sibling and no `ort` — and it

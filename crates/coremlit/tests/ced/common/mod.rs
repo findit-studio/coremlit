@@ -96,8 +96,9 @@ pub fn fixture_path(relative: &str) -> PathBuf {
 pub struct GoldenClip {
   /// Stable per-entry id.
   pub id: String,
-  /// Corpus-relative WAV path (`../fixtures/mel/<file>` or a goldens-local
-  /// clip), 16 kHz mono.
+  /// Corpus-relative WAV path: `../../mel/<file>` for a clip shared via
+  /// `fixtures/mel/`, or `../clips/<file>` for one shared via
+  /// `fixtures/goldens/clips/`. 16 kHz mono.
   pub file: String,
   /// Decoded sample count (a cheap decode cross-check).
   pub n_samples: usize,
