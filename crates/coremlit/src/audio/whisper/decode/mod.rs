@@ -65,9 +65,11 @@ mod tests;
 /// Numerically stable `max + ln(Σ exp(v - max))` (the log-sum-exp
 /// normalizer of `logits`): subtracts the running max before
 /// exponentiating so large logits don't overflow `f32::exp`, the same
-/// shape as Swift's BNNS/MLTensor `logSoftmax` normalizer at `f32`
-/// precision (spec §4.8). Shared by [`filter`]'s timestamp-mass
-/// comparison and [`sampler`]'s zero-temperature log-softmax. Returns
+/// shape as Swift's MLTensor `logSoftmax` normalizer at `f32` precision.
+/// Used by [`sampler`]'s zero-temperature log-softmax to score the sampled
+/// token. ([`filter`]'s timestamp-mass comparison used to share this, but
+/// now replicates BNNS's f16 rounding structure directly in its own
+/// `bnns_mass_rule_scalars`.) Returns
 /// [`f32::NEG_INFINITY`] when `logits` is empty or every entry is already
 /// [`f32::NEG_INFINITY`], rather than the `NaN` that `(-inf) - (-inf)`
 /// would otherwise produce.

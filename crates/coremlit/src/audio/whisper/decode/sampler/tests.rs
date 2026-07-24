@@ -502,3 +502,126 @@ fn attempt_seed_derivation_changes_sampled_draws_across_workers() {
     "(worker=0, window=1) and (worker=1, window=0) must not share a stream"
   );
 }
+
+// ---------------------------------------------------------------------
+// argmax tie-break parity (H2, coremlit issue #41)
+//
+// Direct tests of the private `argmax` primitive against the pinned Swift
+// oracle behavior (tests/whisper_swift_probes/probe_argmax2.out, macOS
+// 26.5/M1 Max): `MLTensor.argmax` on the f32-cast logits (shipping macOS
+// 15+ path) and BNNS `.argMax` (legacy) both return the FIRST index on
+// every crafted tie and both skip NaN. Each test names its probe case.
+// ---------------------------------------------------------------------
+
+#[test]
+fn argmax_tie_keeps_first_index() {
+  // Probe cases `tie_2_and_5_small`, `adjacent_tie_100_101`,
+  // `tie_0_and_last_small`, `vocab_manyway_tie_every_5000`: the first index
+  // of an exact tie wins, whatever the tie's shape or vector size (the probe
+  // confirmed size-independence n=16..51865).
+  let mut distant = [0.0f32; 16];
+  distant[2] = 5.0;
+  distant[5] = 5.0;
+  assert_eq!(
+    argmax(&distant),
+    2,
+    "distant tie -> first (tie_2_and_5_small)"
+  );
+
+  let mut adjacent = [0.0f32; 1024];
+  adjacent[100] = 5.0;
+  adjacent[101] = 5.0;
+  assert_eq!(
+    argmax(&adjacent),
+    100,
+    "adjacent tie -> first (adjacent_tie_100_101)"
+  );
+
+  let mut zero_and_last = [0.0f32; 16];
+  zero_and_last[0] = 5.0;
+  zero_and_last[15] = 5.0;
+  assert_eq!(
+    argmax(&zero_and_last),
+    0,
+    "tie at 0 & last -> 0 (tie_0_and_last_small)"
+  );
+
+  let mut manyway = [0.0f32; 16];
+  for v in manyway.iter_mut().step_by(5) {
+    *v = 7.0;
+  }
+  assert_eq!(
+    argmax(&manyway),
+    0,
+    "many-way tie -> first (vocab_manyway_tie_every_5000)"
+  );
+}
+
+#[test]
+fn argmax_all_equal_returns_zero() {
+  // Probe cases `all_equal_zero_small`, `vocab_all_equal`: with no strict
+  // maximum, index 0 wins.
+  assert_eq!(argmax(&[0.0f32; 16]), 0);
+  assert_eq!(argmax(&[1.0f32; 16]), 0);
+}
+
+#[test]
+fn argmax_neg_infinity_floor_tie() {
+  // Probe case `vocab_all_neginf_except_tie_123_50400`: every entry masked
+  // to -inf except a tied finite pair -> the first of the pair.
+  let mut v = [f32::NEG_INFINITY; 16];
+  v[2] = 1.5;
+  v[5] = 1.5;
+  assert_eq!(
+    argmax(&v),
+    2,
+    "first finite of the tied pair over an -inf floor"
+  );
+}
+
+#[test]
+fn argmax_signed_zero_ties_keep_first() {
+  // Probe cases `signed_zero_tie_neg0_at_2_pos0_at_5` and
+  // `signed_zero_tie_pos0_at_2_neg0_at_5`: IEEE `==` treats `-0.0 == +0.0`,
+  // so the FIRST zero wins in BOTH orders (the two signed zeros are the max
+  // over a -1 floor). Red-first discriminator: the previous `total_cmp`
+  // body ranked `+0.0 > -0.0` and returned 5 for the first order.
+  let mut neg_then_pos = [-1.0f32; 16];
+  neg_then_pos[2] = -0.0;
+  neg_then_pos[5] = 0.0;
+  assert_eq!(argmax(&neg_then_pos), 2, "-0.0@2, +0.0@5 -> 2");
+
+  let mut pos_then_neg = [-1.0f32; 16];
+  pos_then_neg[2] = 0.0;
+  pos_then_neg[5] = -0.0;
+  assert_eq!(argmax(&pos_then_neg), 2, "+0.0@2, -0.0@5 -> 2");
+}
+
+#[test]
+fn argmax_skips_nan_anywhere() {
+  // Probe cases `nan_at_4_max_at_7` and `nan_at_0_max_at_7`: NaN is skipped
+  // wherever it sits (including index 0, which must not seed `best`), and
+  // the finite max wins. Red-first discriminator: the previous `total_cmp`
+  // body ranked NaN above +inf and returned the NaN index (4, or 0 when the
+  // NaN led).
+  let mut nan_mid = [0.0f32; 16];
+  nan_mid[4] = f32::NAN;
+  nan_mid[7] = 5.0;
+  assert_eq!(argmax(&nan_mid), 7, "NaN@4 skipped, max@7 wins");
+
+  let mut nan_first = [0.0f32; 16];
+  nan_first[0] = f32::NAN;
+  nan_first[7] = 5.0;
+  assert_eq!(
+    argmax(&nan_first),
+    7,
+    "NaN@0 must not seed best, max@7 wins"
+  );
+}
+
+#[test]
+fn argmax_all_nan_pins_zero() {
+  // Probe case `all_nan`: unspecified upstream (MLTensor -> 0, BNNS -> last);
+  // this port pins 0, matching the shipping MLTensor path.
+  assert_eq!(argmax(&[f32::NAN; 16]), 0);
+}
