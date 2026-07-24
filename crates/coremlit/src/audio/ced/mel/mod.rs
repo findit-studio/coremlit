@@ -30,6 +30,25 @@
 //! probe decides the final orientation. Compute runs in f64 (the clap mel
 //! infrastructure; CED's front-end is f32-native upstream — the Wave-B parity
 //! measurement decides whether f32 is required for the budget).
+//!
+//! # `N_FRAMES = 1001` vs upstream `target_length = 1012`
+//!
+//! Upstream CED's `target_length = 1012` (RicherMans/CED `audiotransformer.py`)
+//! is NOT the input length: it is the transformer's time positional-embedding
+//! *capacity* (`AudioPatchEmbed(input_size=(64, 1012))`, 16×16 patches ⇒ 63
+//! time-patch columns) and its long-form mel *chunk size* (mels longer than
+//! 1012 frames split into 1012-frame chunks, last padded/dropped, logits
+//! averaged). The fixed 10 s window is 160 000 samples ⇒ `1 + 160_000/160 =
+//! 1001` frames (`center=True`) ⇒ `(1001−16)/16 + 1 = 62` of those 63 patch
+//! columns; upstream runs a ≤ 1012-frame mel **unpadded** with the pos embed
+//! sliced to the actual patch count, dropping the trailing 9 mel frames past
+//! `62×16 = 992` in the patch conv — exactly what any 10 s clip does. Padding
+//! 1001 → 1012 would add a 63rd column and compute a *different* function, so
+//! [`N_FRAMES`] stays 1001; the relation `N_FRAMES <= 1012` (pinned in the
+//! sibling `tests.rs`) is what makes a fixed `[1, 64, 1001]` export a faithful
+//! evaluation of the upstream model. Verified against RicherMans/CED
+//! `audiotransformer.py` and the mispeech feature extractor (which never pads a
+//! 10 s clip to 1012). Shared, unchanged, across all four CED sizes.
 
 use core::fmt;
 use std::sync::Arc;

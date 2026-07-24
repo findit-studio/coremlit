@@ -14,7 +14,7 @@
 //!   DER oracle).
 //! - `vad` — Silero voice-activity detection (feature `vad`; `vad-bundled`
 //!   adds the silero ONNX cross-backend oracle).
-//! - `ced` — CED-tiny AudioSet sound-event tagging (feature `ced`).
+//! - `ced` — CED (tiny/mini/small/base) AudioSet sound-event tagging (feature `ced`).
 //!
 //! See the crate README's layering map for module authority and the dependency
 //! arrows to the `silero`, `asry`, and `dia` seams.

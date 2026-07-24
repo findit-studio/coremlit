@@ -1,24 +1,31 @@
-//! Native CoreML **CED-tiny** AudioSet sound-event tagging — coremlit's first
-//! multi-label classifier: 16 kHz mono waveform in, ranked AudioSet predictions
-//! out (527 rated classes: name + `/m/…` id + class index + sigmoid
-//! confidence), long clips via windowed chunking + Mean/Max aggregation.
+//! Native CoreML **CED** (tiny/mini/small/base) AudioSet sound-event tagging —
+//! coremlit's first multi-label classifier: 16 kHz mono waveform in, ranked
+//! AudioSet predictions out (527 rated classes: name + `/m/…` id + class index +
+//! sigmoid confidence), long clips via windowed chunking + Mean/Max aggregation.
 //!
 //! CED (Consistent Ensemble Distillation, arXiv 2308.11957; upstream
-//! RicherMans/CED, `mispeech/ced-tiny`) is a distilled AudioSet transformer.
-//! The mel front-end runs in Rust (the private `mel` submodule) and the
-//! mel→logits transformer runs natively on Apple silicon as one fp16
-//! `.mlmodelc` — an in-graph STFT/mel is the exact fragility class behind the
-//! ORT CoreML EP zeroed-logits bug this feature closes. NO `ort` anywhere.
+//! RicherMans/CED, `mispeech/ced-{tiny,mini,small,base}`) is a distilled
+//! AudioSet transformer. The four sizes are contract-identical here — one
+//! size-invariant mel→logits I/O; they differ only in internal transformer
+//! width (see [`CedModel`]). The mel front-end runs in Rust (the private `mel`
+//! submodule) and the mel→logits transformer runs natively on Apple silicon as
+//! one fp16 `.mlmodelc` — an in-graph STFT/mel is the exact fragility class
+//! behind the ORT CoreML EP zeroed-logits bug this feature closes. NO `ort`
+//! anywhere.
 //!
 //! Design spec: `docs/superpowers/specs/2026-07-23-ced-native-ane-design.md`.
 //!
 //! # Model artifacts
 //!
-//! No model is bundled (a `.mlmodelc` is a directory artifact). The fp16 CED
-//! graph is converted owner-side (Wave B), distributed via Hugging Face, and
-//! staged as a gitignored dev-time download under `Models/ced/` (env override
-//! `CED_TEST_MODELS`); its per-file SHA-256 and I/O contract are pinned by
-//! `tests/ced/model_io.rs` once staged.
+//! No model is bundled (a `.mlmodelc` is a directory artifact). Each size's
+//! fp16 CED graph is converted owner-side (Wave B), distributed via Hugging
+//! Face, and staged as a gitignored dev-time download under
+//! `Models/ced/ced-<size>/` (env override `CED_TEST_MODELS` points at the
+//! `Models/ced` family root); per-file SHA-256 and I/O contract are pinned per
+//! size by `tests/ced/model_io.rs` once staged. [`CedModel`] owns the repo ids
+//! and the `<dir>/<bundle>` path spelling ([`CedModel::mlmodelc_path`]). The
+//! four graphs are I/O-identical, so model identity is caller-supplied:
+//! coremlit cannot — and does not — detect which size a `.mlmodelc` is.
 //!
 //! # Rust front-end around an fp16 CoreML graph
 //!
@@ -26,7 +33,16 @@
 //! by this module's Rust front-end and emits `[1, 527]` **pre-sigmoid** logits
 //! (`logits`, f32); sigmoid, ranking, and long-clip aggregation run in Rust.
 //! The believed mel numerics are probe-pinned in Wave B (see the `mel`
-//! submodule docs).
+//! submodule docs). This `[1, 64, 1001]` shape is shared by all four sizes.
+//!
+//! Upstream's `target_length = 1012` is NOT this input width: it is the
+//! transformer's time positional-embedding capacity and its long-form mel
+//! chunk size. A canonical 10 s window is 160 000 samples → 1001 mel frames
+//! (hop 160, `center=True`), consumed unpadded with the pos embed sliced to 62
+//! of its 63 patch columns; padding to 1012 would compute a different
+//! function. So `1001 <= 1012` is on-distribution, not a truncation (verified
+//! against RicherMans/CED `audiotransformer.py` and the mispeech feature
+//! extractor); the `mel` submodule carries the full derivation.
 //!
 //! # Compute placement (measured, never marketed)
 //!
@@ -50,6 +66,7 @@ use crate::{ComputeUnits, DataType, Model, MultiArray};
 
 pub mod aggregate;
 pub mod error;
+pub mod model;
 pub mod prediction;
 pub mod window;
 
@@ -60,6 +77,7 @@ mod compute_units_serde;
 
 pub use aggregate::{ChunkAggregation, aggregate_windows};
 pub use error::Error;
+pub use model::{CedModel, ParseCedModelError};
 pub use prediction::{Confidences, EventPrediction, RatedSoundEvent, WindowConfidences};
 pub use window::{Span, TailPolicy, WindowPlan};
 
@@ -94,11 +112,14 @@ const _: () = assert!(
 
 /// Default compute placement: [`ComputeUnits::All`].
 ///
-/// **PROVISIONAL** — placement is measured, never marketed, and the CED
-/// conversion has not been measured yet: the Wave-C placement pass
-/// (`tests/ced/placement.rs`) re-pins this to the measured winner (the spec
-/// anticipates `CpuAndGpu`; ANE-capable ≠ floor-holding — the siglip lesson)
-/// and this doc then carries the measured latency × placement table.
+/// **PROVISIONAL** and shared by the whole family — placement is measured,
+/// never marketed, and no CED conversion has been measured yet: the Wave-C
+/// placement pass (`tests/ced/placement.rs`) characterizes each size and
+/// re-pins this to the measured winner (the spec anticipates `CpuAndGpu`;
+/// ANE-capable ≠ floor-holding — the siglip lesson), then this doc carries the
+/// measured latency × placement table. Only a *measured* per-size divergence
+/// would promote this to a per-[`CedModel`] table; until then one shared
+/// default is the honest claim.
 pub const DEFAULT_COMPUTE: ComputeUnits = ComputeUnits::All;
 
 /// Declared feature names on the CED `.mlmodelc` (pinned by
@@ -168,12 +189,23 @@ impl ClassifierOptions {
   }
 }
 
-/// CED-tiny sound-event classifier: 16 kHz mono `&[f32]` in, ranked AudioSet
-/// predictions out.
+/// CED sound-event classifier: 16 kHz mono `&[f32]` in, ranked AudioSet
+/// predictions out. Loads any of the four [`CedModel`] sizes — they share one
+/// mel→logits contract, so this type is size-agnostic and stores no identity.
 ///
 /// The front-end is a Rust log-mel port (the private `mel` submodule); the
 /// fp16 CoreML transformer maps the believed `[1, 64, 1001]` mel to `[1, 527]`
 /// PRE-sigmoid logits, and sigmoid + ranking run in Rust.
+///
+/// Point [`Self::from_file`] / [`Self::load`] at the size you staged, composing
+/// the path with [`CedModel::mlmodelc_path`]:
+///
+/// ```no_run
+/// use coremlit::audio::ced::{CedModel, Classifier};
+/// let models_root = "Models/ced";
+/// Classifier::from_file(CedModel::Small.mlmodelc_path(models_root))?;
+/// # Ok::<(), coremlit::audio::ced::Error>(())
+/// ```
 ///
 /// `&self` inference (no mutable scratch): the FFT plan and filterbank are
 /// built once at load and per-call buffers are local, so fan-out means one
