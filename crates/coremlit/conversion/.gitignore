@@ -1,0 +1,5 @@
+# Python bytecode cache for the conversion scripts (clap/, siglip/, …). These
+# are machine-local build artifacts (absolute paths baked in) regenerated on
+# every run; never commit them.
+__pycache__/
+*.pyc
