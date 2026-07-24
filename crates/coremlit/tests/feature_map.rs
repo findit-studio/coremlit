@@ -77,6 +77,10 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
       "granite",
       vec!["dep:tokenizers", "dep:windit", "windit/text"],
     ),
+    (
+      "ced",
+      vec!["dep:rustfft", "dep:soundevents-dataset", "dep:windit"],
+    ),
     ("siglip", vec!["dep:tokenizers", "dep:colconv"]),
   ]
 }
@@ -112,8 +116,9 @@ const INTENDED_CI_COMBOS: &[&str] = &[
   "clap-oracle",
   "granite",
   "siglip",
-  "whisper,align,speaker,vad,clap,granite,siglip,serde,tracing,nl-recognizer",
-  "whisper,align-oracle,speaker-oracle,vad-bundled,clap-oracle,granite,siglip,serde,tracing,nl-recognizer",
+  "ced",
+  "whisper,align,speaker,vad,clap,granite,siglip,ced,serde,tracing,nl-recognizer",
+  "whisper,align-oracle,speaker-oracle,vad-bundled,clap-oracle,granite,siglip,ced,serde,tracing,nl-recognizer",
 ];
 
 /// The text of the `[features]` table (its lines, blank/comment lines included).
@@ -412,8 +417,9 @@ const DOCTORED_MATRIX: &str = r#"
           - "clap-oracle"
           - "granite"
           - "siglip"
-          - "whisper,align,speaker,vad,clap,granite,siglip,serde,tracing,nl-recognizer"
-          - "whisper,align-oracle,speaker-oracle,vad-bundled,clap-oracle,granite,siglip,serde,tracing,nl-recognizer"
+          - "ced"
+          - "whisper,align,speaker,vad,clap,granite,siglip,ced,serde,tracing,nl-recognizer"
+          - "whisper,align-oracle,speaker-oracle,vad-bundled,clap-oracle,granite,siglip,ced,serde,tracing,nl-recognizer"
     steps:
       - uses: actions/checkout@v7
 "#;

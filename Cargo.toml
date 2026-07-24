@@ -41,6 +41,12 @@ rand = "0.9"
 hound = "3.5"
 sha2 = "0.11"
 rustfft = "6"
+# The 527-class rated AudioSet label set for audio::ced (`RatedSoundEvent`,
+# `from_index`, `events()` — all `const fn`). ORT-FREE data codegen by
+# construction (deps: thiserror/phf/uncased only). Published on crates.io, so a
+# plain version dep (no git pin needed, unlike asry/diaric). `ontology` and its
+# `serde` stay off.
+soundevents-dataset = { version = "0.2", default-features = false, features = ["std", "rated"] }
 npyz = "0.9"
 cpal = "0.16"
 rubato = "0.16"
