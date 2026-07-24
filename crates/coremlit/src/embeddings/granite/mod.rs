@@ -67,8 +67,9 @@ pub use embedding::Embedding;
 pub use error::Error;
 
 /// windit's window geometry, re-exported as the one windit type in granite's
-/// public surface: the per-chunk token budget, overlap, and window cap
-/// [`TextEmbedder::embed_long_with`] accepts.
+/// public surface: the per-chunk token budget, overlap, and window cap. Carried
+/// by [`LongTextOptions`] (alongside granite's own `max_input_bytes` bound), the
+/// options [`TextEmbedder::embed_long_with`] accepts.
 pub use windit::plan::WindowOptions;
 
 use std::{path::Path, sync::OnceLock};
@@ -91,7 +92,10 @@ use crate::embeddings::granite::{
 /// byte-correct by `tests/granite/tokenizer_identity.rs`. Exposed for callers
 /// who construct [`TextEmbedder`] via [`TextEmbedder::from_memory`]; the
 /// [`TextEmbedder::load`] / [`TextEmbedder::from_file`] constructors use it
-/// directly.
+/// directly. It passes the construction-time tokenizer contract
+/// (`validate_tokenizer_contract`) trivially; a caller-supplied tokenizer (via
+/// [`TextEmbedder::from_memory`] / [`TextEmbedder::from_files`]) is checked
+/// against that same contract, fail-closed.
 pub const BUNDLED_TOKENIZER: &[u8] = include_bytes!("assets/tokenizer.json");
 
 /// Declared feature names on the granite `.mlmodelc` (pinned by
@@ -100,6 +104,33 @@ mod names {
   pub const INPUT_IDS: &str = "input_ids";
   pub const ATTENTION_MASK: &str = "attention_mask";
   pub const EMBEDDING: &str = "embedding";
+}
+
+/// The Granite tokenizer/model contract, verified against the bundled asset and
+/// the committed goldens: the total vocabulary INCLUDING added tokens, the
+/// highest id the model's embedding table can gather, the special tokens
+/// [`TextEmbedder::token_ids`] brackets every sequence with, and one pinned
+/// sentinel encoding. [`validate_tokenizer_contract`] checks every constructor's
+/// tokenizer against these, fail-closed.
+mod contract {
+  /// Total vocabulary size (base + added tokens) `get_vocab_size(true)` reports.
+  pub const VOCAB_SIZE: usize = 180_000;
+  /// Highest token id the model's embedding table can gather; an id past this
+  /// indexes outside the table and gathers zeros.
+  pub const MAX_TOKEN_ID: u32 = 179_999;
+  /// CLS / start-of-text special, pooled at position 0.
+  pub const CLS_TOKEN: &str = "<|startoftext|>";
+  pub const CLS_ID: u32 = 179_934;
+  /// Padding special (also the fixed-window pad id).
+  pub const PAD_TOKEN: &str = "<|endoftext|>";
+  pub const PAD_ID: u32 = 179_935;
+  /// End-of-sequence special.
+  pub const EOS_TOKEN: &str = "<|return|>";
+  pub const EOS_ID: u32 = 179_938;
+  /// Pinned sentinel: `SENTINEL_TEXT` encodes to `SENTINEL_IDS` (special tokens
+  /// included) — the same pin `token_ids_match_pinned_golden_subset` asserts.
+  pub const SENTINEL_TEXT: &str = "hello world";
+  pub const SENTINEL_IDS: [u32; 4] = [CLS_ID, 24_313, 2_318, EOS_ID];
 }
 
 /// Fixed token-sequence length the ModernBERT graph was converted at (the
@@ -170,6 +201,91 @@ impl TextEmbedderOptions {
   }
 }
 
+/// Options for [`TextEmbedder::embed_long_with`] (rust-options-pattern): windit's
+/// chunk geometry ([`WindowOptions`]) plus granite's pre-tokenization input
+/// bound.
+///
+/// Not serializable: coremlit deliberately does not enable `windit/serde`
+/// (granite serializes nothing of windit's), so the composed [`WindowOptions`]
+/// carries no serde impls in this build. If serialization is ever needed, add
+/// `windit?/serde` to coremlit's `serde` feature and derive here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LongTextOptions {
+  window_options: WindowOptions,
+  max_input_bytes: Option<usize>,
+}
+
+impl Default for LongTextOptions {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl From<WindowOptions> for LongTextOptions {
+  /// Geometry-only options: the given windit geometry, no input byte limit.
+  fn from(window_options: WindowOptions) -> Self {
+    Self {
+      window_options,
+      max_input_bytes: None,
+    }
+  }
+}
+
+impl LongTextOptions {
+  /// Options matching [`TextEmbedder::embed_long`]: a full-window geometry
+  /// (`WindowOptions::new(MAX_TOKENS)`) and no input byte limit.
+  pub const fn new() -> Self {
+    Self {
+      window_options: WindowOptions::new(MAX_TOKENS),
+      max_input_bytes: None,
+    }
+  }
+
+  /// The windit chunk geometry (per-chunk token budget, overlap, window cap).
+  #[inline]
+  pub const fn window_options(&self) -> WindowOptions {
+    self.window_options
+  }
+
+  /// Builder form of [`Self::set_window_options`].
+  #[must_use]
+  #[inline]
+  pub const fn with_window_options(mut self, window_options: WindowOptions) -> Self {
+    self.set_window_options(window_options);
+    self
+  }
+
+  /// Sets [`Self::window_options`] in place.
+  #[inline]
+  pub const fn set_window_options(&mut self, window_options: WindowOptions) -> &mut Self {
+    self.window_options = window_options;
+    self
+  }
+
+  /// The maximum accepted input length in UTF-8 bytes, if any. `None` (the
+  /// default) means unbounded. Enforced before any tokenizer or chunker work —
+  /// the limit callers embedding UNTRUSTED text should set.
+  #[inline]
+  pub const fn max_input_bytes(&self) -> Option<usize> {
+    self.max_input_bytes
+  }
+
+  /// Builder form of [`Self::set_max_input_bytes`].
+  #[must_use]
+  #[inline]
+  pub const fn with_max_input_bytes(mut self, max_input_bytes: usize) -> Self {
+    self.set_max_input_bytes(max_input_bytes);
+    self
+  }
+
+  /// Sets [`Self::max_input_bytes`] in place (to `Some(max_input_bytes)`).
+  #[inline]
+  pub const fn set_max_input_bytes(&mut self, max_input_bytes: usize) -> &mut Self {
+    self.max_input_bytes = Some(max_input_bytes);
+    self
+  }
+}
+
 /// granite text embedder: a `&str` in, a unit-norm 384-d [`Embedding`] out.
 ///
 /// Tokenizes with the bundled granite tokenizer (truncation `LongestFirst` at
@@ -223,7 +339,8 @@ impl TextEmbedder {
   /// [`Error::Load`] if CoreML rejects the model / [`Error::ContractMismatch`]
   /// if its I/O contract mismatches; [`Error::TokenizerLoad`] if the tokenizer
   /// JSON is unreadable/invalid; [`Error::TokenizerConfig`] if truncation cannot
-  /// be configured.
+  /// be configured; [`Error::TokenizerContractMismatch`] if the tokenizer does
+  /// not match the Granite tokenizer/model contract (`validate_tokenizer_contract`).
   pub fn from_files(
     model_path: impl AsRef<Path>,
     tokenizer_json_path: impl AsRef<Path>,
@@ -253,11 +370,18 @@ impl TextEmbedder {
     options: TextEmbedderOptions,
   ) -> Result<Self> {
     configure_tokenizer(&mut tokenizer)?;
+    // Reject a caller-supplied tokenizer that does not match the Granite
+    // tokenizer/model contract, fail-closed and BEFORE the expensive
+    // `Model::load` — every public constructor passes through here, so no
+    // `TextEmbedder` can exist with an unvalidated tokenizer (the bundled
+    // tokenizer passes trivially; this also guards a corrupted build asset).
+    validate_tokenizer_contract(&tokenizer)?;
     // The pad positions are attention-masked to 0 and CLS pooling reads position
     // 0 (never a pad), so the pad token value is immaterial to the output; a
-    // valid vocabulary index is all that is required. Resolve granite's pad
-    // token `<|endoftext|>` (checked into `i32` range), else fall back to `0`
-    // (the BOS/CLS index, always valid).
+    // valid vocabulary index is all that is required. `validate_tokenizer_contract`
+    // above proved `<|endoftext|>` resolves to `contract::PAD_ID` (in `i32`
+    // range), so the `unwrap_or(0)` fallback is now unreachable defensive code,
+    // kept for its guarantee of a valid index.
     let pad_id = tokenizer
       .token_to_id("<|endoftext|>")
       .and_then(|id| i32::try_from(id).ok())
@@ -428,26 +552,27 @@ impl TextEmbedder {
   /// fallback) are reattached to an adjacent chunk before embedding — so the
   /// aggregate represents the caller's whole text, as `embed` does within one
   /// window. Prompt-free, like [`Self::embed`], and equivalent to
-  /// `embed_long_with(text, &WindowOptions::new(MAX_TOKENS))`.
+  /// `embed_long_with(text, &LongTextOptions::new())`.
   ///
   /// Text that fits a single window returns exactly [`Self::embed`]'s embedding.
   ///
   /// # Errors
   /// As [`Self::embed_long_with`].
   pub fn embed_long(&self, text: &str) -> Result<Embedding> {
-    self.embed_long_with(text, &WindowOptions::new(MAX_TOKENS))
+    self.embed_long_with(text, &LongTextOptions::new())
   }
 
-  /// [`Self::embed_long`] with caller-controlled chunk geometry: `opts.window()`
-  /// is the per-chunk token budget (must be `1..=`[`MAX_TOKENS`]), the overlap
-  /// sets the repeated-token budget between consecutive chunks, and
-  /// `opts.max_windows()` caps the final chunk count — separator reattachment
-  /// and the whole-input fallback chunk for contentless text included — which
-  /// is exactly the number of CoreML predictions the call may dispatch. A cap
-  /// of `0` therefore rejects every nonempty text, while `""` still fails
-  /// [`Error::EmptyText`].
-  /// `opts.tail()` is ignored — content-aware chunking has no ragged-tail
-  /// concept, the final chunk is simply short.
+  /// [`Self::embed_long`] with caller-controlled chunk geometry and an optional
+  /// input-size bound ([`LongTextOptions`]). In the geometry
+  /// ([`LongTextOptions::window_options`]): `window()` is the per-chunk token
+  /// budget (must be `1..=`[`MAX_TOKENS`]), the overlap sets the repeated-token
+  /// budget between consecutive chunks, and `max_windows()` caps the final chunk
+  /// count — separator reattachment and the whole-input fallback chunk for
+  /// contentless text included — which is exactly the number of CoreML
+  /// predictions the call may dispatch. A cap of `0` therefore rejects every
+  /// nonempty text, while `""` still fails [`Error::EmptyText`]. `tail()` is
+  /// ignored — content-aware chunking has no ragged-tail concept, the final
+  /// chunk is simply short.
   ///
   /// The per-chunk token budget counts granite's special tokens (`[CLS]`/`[SEP]`,
   /// +2), because both the length measurement and each chunk's embedding run
@@ -458,27 +583,43 @@ impl TextEmbedder {
   /// each begins where the previous ends, the last ends at `text.len()`); a
   /// non-zero overlap additionally repeats trailing regions. Reattached
   /// separators are re-measured against the budget; a pure-separator run neither
-  /// neighbor can absorb becomes a chunk of its own and can exceed `window` only
-  /// when the run alone measures past it — the same recorded escape as windit's
-  /// lone oversized `char`, kept sound by the embed path's truncation guard.
-  /// Such insertions count against `opts.max_windows()`: the cap is enforced on
-  /// the repaired chunk list, never silently exceeded.
+  /// neighbor can absorb becomes a chunk of its own and may exceed `window` up to
+  /// [`MAX_TOKENS`] — the same tolerance as windit's lone oversized `char` — but a
+  /// run measuring past [`MAX_TOKENS`] is refused with
+  /// [`Error::ContentlessInputOverBudget`] rather than silently truncated. Such
+  /// insertions count against `max_windows()`: the cap is enforced on the
+  /// repaired chunk list, never silently exceeded.
+  ///
+  /// # Resource bounds
+  /// Three independent limits, in the order the reject path applies them:
+  /// * [`LongTextOptions::max_input_bytes`] — an input-size gate in UTF-8 bytes,
+  ///   enforced BEFORE any tokenizer or chunker work; the only bound whose reject
+  ///   cost is O(1) in the input size (`None` by default — the bound to set when
+  ///   embedding untrusted text).
+  /// * `window()` / `overlap()` — the per-chunk token geometry above.
+  /// * `max_windows()` — a prediction-count cap: it bounds the CoreML predictions
+  ///   dispatched and windit's chunk packing (which is cap-lazy), but NOT the
+  ///   measurement cost of chunking — even a `max_windows()` of `0` tokenizes the
+  ///   whole input unless `max_input_bytes` is set.
   ///
   /// # Errors
-  /// [`Error::WindowOverBudget`] if `opts.window()` exceeds [`MAX_TOKENS`] (every
-  /// chunk would be silently truncated); [`Error::EmptyText`] for `""` (as
-  /// [`Self::embed`]); [`Error::Tokenize`] on a tokenizer failure;
-  /// [`Error::Windowing`] carrying a [`WinditError`](crate::embeddings::granite::error::WinditError)
-  /// from chunking (e.g. `ZeroWindow`, `OverlapGeWindow`, `TooManyWindows` — the
-  /// `max_windows` cap binds the final chunk count — post-reattachment,
-  /// contentless nonempty text counting as one whole-input chunk — `got`
-  /// reporting that full count) or
+  /// [`Error::InputTooLarge`] if `text` exceeds `max_input_bytes`;
+  /// [`Error::WindowOverBudget`] if `window()` exceeds [`MAX_TOKENS`] (every chunk
+  /// would be silently truncated); [`Error::EmptyText`] for `""` (as
+  /// [`Self::embed`]); [`Error::ContentlessInputOverBudget`] if a contentless run
+  /// that must be embedded whole measures past [`MAX_TOKENS`]; [`Error::Tokenize`]
+  /// on a tokenizer failure; [`Error::Windowing`] carrying a
+  /// [`WinditError`](crate::embeddings::granite::error::WinditError) from chunking
+  /// (e.g. `ZeroWindow`, `OverlapGeWindow`, `TooManyWindows` — the `max_windows`
+  /// cap binds the final chunk count — post-reattachment, contentless nonempty
+  /// text counting as one whole-input chunk — `got` reporting that full count) or
   /// aggregation (e.g. `NonFinite` when the per-chunk embeddings cancel exactly);
   /// plus any per-chunk tensor / prediction / output error (the same set
   /// [`Self::embed`] can raise).
-  pub fn embed_long_with(&self, text: &str, opts: &WindowOptions) -> Result<Embedding> {
-    validate_long_options(opts)?;
-    let chunks = chunk_long(self.measuring_tokenizer()?, text, opts)?;
+  pub fn embed_long_with(&self, text: &str, opts: &LongTextOptions) -> Result<Embedding> {
+    validate_long_input(text, opts)?;
+    let wopts = opts.window_options();
+    let chunks = chunk_long(self.measuring_tokenizer()?, text, &wopts)?;
     match chunks.len() {
       // Only `""` chunks to nothing (`chunk_long` gives contentless nonempty
       // text a single whole-input chunk); `embed` defines the empty-input
@@ -549,6 +690,85 @@ fn configure_tokenizer(tokenizer: &mut Tokenizer) -> Result<()> {
   Ok(())
 }
 
+/// Validates a tokenizer against the Granite model contract, fail-closed: a
+/// parseable-but-foreign tokenizer would otherwise produce finite, unit-norm,
+/// semantically meaningless embeddings, or emit ids past the model's embedding
+/// table that gather to zeros and surface only as a misleading
+/// [`Error::EmbeddingZero`]. Run by every constructor on the CONFIGURED tokenizer
+/// (after [`configure_tokenizer`]), so the sentinel check proves the exact
+/// production [`TextEmbedder::token_ids`] behavior.
+///
+/// Checks, first failure wins: the three special-token ids, the total vocabulary
+/// size, the maximum token id (the out-of-vocabulary gate), then the pinned
+/// sentinel encoding.
+///
+/// # Errors
+/// [`Error::TokenizerContractMismatch`] naming the first failed check;
+/// [`Error::Tokenize`] if the sentinel encode itself fails.
+fn validate_tokenizer_contract(tokenizer: &Tokenizer) -> Result<()> {
+  for (check, token, expected_id) in [
+    (
+      "special token <|startoftext|>",
+      contract::CLS_TOKEN,
+      contract::CLS_ID,
+    ),
+    (
+      "special token <|endoftext|>",
+      contract::PAD_TOKEN,
+      contract::PAD_ID,
+    ),
+    (
+      "special token <|return|>",
+      contract::EOS_TOKEN,
+      contract::EOS_ID,
+    ),
+  ] {
+    let actual = tokenizer.token_to_id(token);
+    if actual != Some(expected_id) {
+      return Err(Error::TokenizerContractMismatch {
+        check,
+        expected: expected_id.to_string(),
+        actual: actual.map_or_else(|| "missing".to_string(), |id| id.to_string()),
+      });
+    }
+  }
+
+  let vocab_size = tokenizer.get_vocab_size(true);
+  if vocab_size != contract::VOCAB_SIZE {
+    return Err(Error::TokenizerContractMismatch {
+      check: "vocab size",
+      expected: contract::VOCAB_SIZE.to_string(),
+      actual: vocab_size.to_string(),
+    });
+  }
+
+  // The out-of-vocabulary gate: an id past the model's embedding table gathers
+  // zeros. The count check above does not imply this bound — added tokens carry
+  // explicit, possibly non-contiguous ids. `get_vocab(true)` allocates a ~180k
+  // entry map, one-time at construction and trivial next to the model load.
+  let max_id = tokenizer.get_vocab(true).values().copied().max();
+  if !matches!(max_id, Some(id) if id <= contract::MAX_TOKEN_ID) {
+    return Err(Error::TokenizerContractMismatch {
+      check: "max token id",
+      expected: format!("<= {}", contract::MAX_TOKEN_ID),
+      actual: max_id.map_or_else(|| "empty vocab".to_string(), |id| id.to_string()),
+    });
+  }
+
+  let sentinel = tokenizer
+    .encode(contract::SENTINEL_TEXT, true)
+    .map_err(Error::Tokenize)?;
+  if sentinel.get_ids() != contract::SENTINEL_IDS.as_slice() {
+    return Err(Error::TokenizerContractMismatch {
+      check: "sentinel encoding",
+      expected: format!("{:?}", contract::SENTINEL_IDS),
+      actual: format!("{:?}", sentinel.get_ids()),
+    });
+  }
+
+  Ok(())
+}
+
 /// Builds the fixed `[1, `[`MAX_TOKENS`]`]` `input_ids` / `attention_mask` window
 /// from the real token `ids`: the real tokens occupy the prefix (mask `1`) and
 /// the remainder is right-padded with `pad_id` (mask `0`). CLS therefore stays at
@@ -579,18 +799,33 @@ fn build_window(ids: &[u32], pad_id: i32) -> Result<([i32; MAX_TOKENS], [i32; MA
   Ok((input_ids, attention_mask))
 }
 
-/// Rejects an [`TextEmbedder::embed_long`] chunk budget above the model's fixed
-/// input window before any chunking or prediction: a larger budget would let
-/// [`TextEmbedder::token_ids`] silently truncate every chunk. Factored out so the
-/// check is hermetically testable. `window == 0` and `overlap >= window` are left
-/// to windit's own validation (surfacing as [`Error::Windowing`]).
+/// Rejects an oversized or mis-budgeted [`TextEmbedder::embed_long_with`] call
+/// before any tokenizer or chunker work. Checked in order: the input byte limit
+/// ([`Error::InputTooLarge`]), then the per-chunk budget
+/// ([`Error::WindowOverBudget`]) — an over-budget window would let
+/// [`TextEmbedder::token_ids`] silently truncate every chunk. Reads only
+/// `text.len()` and the options — O(1), no tokenizer access — so the reject
+/// path's cost is independent of the input size by construction. Factored out so
+/// the check is hermetically testable. `window == 0` and `overlap >= window` are
+/// left to windit's own validation (surfacing as [`Error::Windowing`]).
 ///
 /// # Errors
-/// [`Error::WindowOverBudget`] if `opts.window()` exceeds [`MAX_TOKENS`].
-fn validate_long_options(opts: &WindowOptions) -> Result<()> {
-  if opts.window() > MAX_TOKENS {
+/// [`Error::InputTooLarge`] if `text` exceeds
+/// [`LongTextOptions::max_input_bytes`]; [`Error::WindowOverBudget`] if the
+/// window exceeds [`MAX_TOKENS`].
+fn validate_long_input(text: &str, opts: &LongTextOptions) -> Result<()> {
+  if let Some(max) = opts.max_input_bytes()
+    && text.len() > max
+  {
+    return Err(Error::InputTooLarge {
+      got: text.len(),
+      max,
+    });
+  }
+  let window = opts.window_options().window();
+  if window > MAX_TOKENS {
     return Err(Error::WindowOverBudget {
-      window: opts.window(),
+      window,
       max: MAX_TOKENS,
     });
   }
@@ -618,15 +853,16 @@ fn validate_long_options(opts: &WindowOptions) -> Result<()> {
 /// Measurement and per-chunk embedding run the SAME tokenization
 /// (`encode(s, add_special_tokens = true)`) on the SAME substring, so a chunk
 /// measured at `<= window <= MAX_TOKENS` re-tokenizes to exactly the counted ids
-/// and [`build_window`] never truncates or rejects it. Three escapes can
-/// exceed the window: windit's lone oversized `char` whose own measure
-/// exceeds it, a pure-separator gap whose run alone measures past it (emitted
-/// as its own chunk when neither neighbor can absorb it), and the whole-input
-/// fallback chunk for contentless text, which is never measured (with the
-/// real tokenizer it holds only the specials, within any window ≥ 2). The
-/// first two are unreachable for a real tokenizer on natural text;
-/// `token_ids`' truncation plus [`build_window`]'s typed guard keep all three
-/// sound regardless.
+/// and [`build_window`] never truncates or rejects it. Every chunk returned has
+/// an untruncated measure `<= MAX_TOKENS`, with a single exception: windit's
+/// lone oversized `char` (one `char` encodes to at most a handful of ids, far
+/// below [`MAX_TOKENS`], so it can exceed a small `window` but never the model
+/// window). Both contentless escapes — a pure-separator gap [`attach_gaps`]
+/// would emit as its own chunk, and the whole-input fallback chunk for text with
+/// no tokenizable content — are now MEASURED and refused past [`MAX_TOKENS`]
+/// with [`Error::ContentlessInputOverBudget`] rather than silently truncated by
+/// the embed path. The production tokenizer's truncation therefore never engages
+/// on the `embed_long` path.
 ///
 /// # Errors
 /// [`Error::Windowing`] carrying whatever windit's `ContentAware::chunk` rejects
@@ -636,7 +872,11 @@ fn validate_long_options(opts: &WindowOptions) -> Result<()> {
 /// — the cap binds the FINAL chunk count, exactly the per-chunk predictions
 /// [`TextEmbedder::embed_long_with`] dispatches, `got` reporting that full
 /// count (windit's own raise aborts at `max + 1`; this one reports the whole
-/// overrun).
+/// overrun); [`Error::ContentlessInputOverBudget`] if a contentless run that
+/// must be embedded whole (the whole input, or a pure-separator gap
+/// [`attach_gaps`] emits) measures past [`MAX_TOKENS`] — measured at synthesis,
+/// BEFORE the `max_windows` re-check; [`Error::Tokenize`] if the measuring
+/// tokenizer fails to encode such a run.
 fn chunk_long(
   measure_tok: &Tokenizer,
   text: &str,
@@ -655,19 +895,43 @@ fn chunk_long(
       .map(|e| e.get_ids().len())
       .unwrap_or(usize::MAX)
   };
+  // Fallible companion for the granite-side own-chunk / whole-input decisions.
+  // The infallible `measure` above folds encode errors to `usize::MAX` ("does
+  // not fit"), which is right for windit's descent but would misreport an
+  // encode failure as `ContentlessInputOverBudget { tokens: usize::MAX }` here;
+  // this one surfaces the failure as `Error::Tokenize` — the same variant the
+  // per-chunk `token_ids` re-raise, one call earlier. The two are deliberately
+  // NOT unified.
+  let measure_checked = |s: &str| -> Result<usize> {
+    measure_tok
+      .encode(s, true)
+      .map(|e| e.get_ids().len())
+      .map_err(Error::Tokenize)
+  };
   let chunks = windit::split::ContentAware::new(&measure)
     .chunk(text, opts)
     .map_err(Error::from)?;
-  let mut repaired = attach_gaps(text, chunks, &measure, opts.window());
+  let mut repaired = attach_gaps(text, chunks, &measure_checked, opts.window())?;
   // Nonempty text with no tokenizable content (whitespace-only) chunks to
   // nothing, yet `embed_long_with` still embeds it — the whole input through
-  // `embed`, one CoreML prediction. Represent that cost as a single
-  // whole-input chunk so the cap below bounds every prediction the result can
-  // dispatch; only `""` stays chunkless (it fails `EmptyText` before any
-  // prediction). Like a pure-separator own-chunk, this chunk is not measured
-  // against `window` — there is no smaller unit to fall back to — and is kept
-  // sound the same way (`token_ids` truncation, `build_window`'s typed guard).
+  // `embed`, one CoreML prediction. Measure it first: a run measuring past
+  // MAX_TOKENS would be silently right-truncated by the embed path (dropping
+  // its suffix tokens), so refuse it with `ContentlessInputOverBudget`;
+  // otherwise represent the cost as a single whole-input chunk so the cap below
+  // bounds every prediction the result can dispatch. Only `""` stays chunkless
+  // (it fails `EmptyText` before any prediction). The measure runs BEFORE the
+  // `max_windows` re-check, so contentless over-budget input under
+  // `max_windows == 0` yields `ContentlessInputOverBudget`, not `TooManyWindows`.
   if repaired.is_empty() && !text.is_empty() {
+    let tokens = measure_checked(text)?;
+    if tokens > MAX_TOKENS {
+      return Err(Error::ContentlessInputOverBudget {
+        start: 0,
+        end: text.len(),
+        tokens,
+        max: MAX_TOKENS,
+      });
+    }
     repaired.push(windit::split::Chunk::new(0, text.len()));
   }
   // windit enforced `max_windows` on ITS output; each own-chunk the repair
@@ -718,43 +982,52 @@ fn chunk_long(
 /// per own-chunk emitted; [`chunk_long`] re-enforces `max_windows` on that
 /// final count.
 ///
-/// Every accepted attachment re-measures within `window`; the sole escape is a
-/// pure-separator own-chunk whose run alone measures past `window` — the same
-/// shape as windit's lone oversized-`char` escape, and kept sound the same way:
-/// [`TextEmbedder::token_ids`] truncates at [`MAX_TOKENS`] and [`build_window`]
-/// guards with a typed error rather than panicking. Every constructed boundary is
-/// a windit cut or `0`/`text.len()`, all on `char` boundaries, so `Chunk::new`
+/// Every accepted attachment re-measures within `window`. A pure-separator
+/// own-chunk (emitted when neither neighbor can absorb the gap) may still exceed
+/// `window` up to [`MAX_TOKENS`] — the same tolerance as windit's lone
+/// oversized-`char` escape — but its run is MEASURED, and a gap measuring past
+/// [`MAX_TOKENS`] is refused with [`Error::ContentlessInputOverBudget`] rather
+/// than left for the embed path to silently truncate. Every constructed boundary
+/// is a windit cut or `0`/`text.len()`, all on `char` boundaries, so `Chunk::new`
 /// never straddles a `char` and `as_str` never returns `None`.
+///
+/// # Errors
+/// [`Error::ContentlessInputOverBudget`] if a pure-separator gap emitted as its
+/// own chunk measures more than [`MAX_TOKENS`] tokens; [`Error::Tokenize`] if
+/// the measuring tokenizer fails to encode a candidate substring (surfaced here,
+/// one call earlier than the per-chunk `token_ids` would).
 fn attach_gaps(
   text: &str,
   chunks: Vec<windit::split::Chunk>,
-  measure: &dyn Fn(&str) -> usize,
+  measure: &dyn Fn(&str) -> Result<usize>,
   window: usize,
-) -> Vec<windit::split::Chunk> {
+) -> Result<Vec<windit::split::Chunk>> {
   use windit::split::Chunk;
   let Some(&first) = chunks.first() else {
-    return chunks;
+    return Ok(chunks);
   };
   let mut out = Vec::with_capacity(chunks.len());
   let mut cur = first;
-  // Leading gap: extend the first chunk left to byte 0, else emit the gap alone.
+  // Leading gap: extend the first chunk left to byte 0, else emit the gap alone
+  // (measured and refused past MAX_TOKENS, never left for the embed path to
+  // silently truncate).
   if cur.start() > 0 {
-    if measure(&text[..cur.end()]) <= window {
+    if measure(&text[..cur.end()])? <= window {
       cur = Chunk::new(0, cur.end());
     } else {
-      out.push(Chunk::new(0, cur.start()));
+      out.push(own_chunk(text, 0, cur.start(), measure)?);
     }
   }
   for mut next in chunks.into_iter().skip(1) {
     let (gap_start, gap_end) = (cur.end(), next.start());
     if gap_start < gap_end {
-      if measure(&text[cur.start()..gap_end]) <= window {
+      if measure(&text[cur.start()..gap_end])? <= window {
         cur = Chunk::new(cur.start(), gap_end);
-      } else if measure(&text[gap_start..next.end()]) <= window {
+      } else if measure(&text[gap_start..next.end()])? <= window {
         next = Chunk::new(gap_start, next.end());
       } else {
         out.push(cur);
-        out.push(Chunk::new(gap_start, gap_end));
+        out.push(own_chunk(text, gap_start, gap_end, measure)?);
         cur = next;
         continue;
       }
@@ -764,16 +1037,44 @@ fn attach_gaps(
   }
   // Trailing gap: extend the last chunk to `text.len()`, else emit the gap alone.
   if cur.end() < text.len() {
-    if measure(&text[cur.start()..]) <= window {
+    if measure(&text[cur.start()..])? <= window {
       cur = Chunk::new(cur.start(), text.len());
     } else {
-      let tail = Chunk::new(cur.end(), text.len());
+      let tail = own_chunk(text, cur.end(), text.len(), measure)?;
       out.push(cur);
       cur = tail;
     }
   }
   out.push(cur);
-  out
+  Ok(out)
+}
+
+/// Builds the pure-separator own-chunk spanning `text[start..end]`, measuring
+/// its run first: a gap measuring past [`MAX_TOKENS`] would be silently
+/// right-truncated by the embed path (dropping its suffix tokens), so it is
+/// refused with [`Error::ContentlessInputOverBudget`] instead. The `(window,
+/// MAX_TOKENS]` tolerance is kept — the same shape as windit's lone oversized
+/// `char`.
+///
+/// # Errors
+/// [`Error::ContentlessInputOverBudget`] if the run exceeds [`MAX_TOKENS`];
+/// [`Error::Tokenize`] if the measuring tokenizer fails to encode it.
+fn own_chunk(
+  text: &str,
+  start: usize,
+  end: usize,
+  measure: &dyn Fn(&str) -> Result<usize>,
+) -> Result<windit::split::Chunk> {
+  let tokens = measure(&text[start..end])?;
+  if tokens > MAX_TOKENS {
+    return Err(Error::ContentlessInputOverBudget {
+      start,
+      end,
+      tokens,
+      max: MAX_TOKENS,
+    });
+  }
+  Ok(windit::split::Chunk::new(start, end))
 }
 
 /// Test-only seam: the module's actual tokenizer configuration, without loading

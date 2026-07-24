@@ -71,7 +71,11 @@ impl Embedding {
   }
 
   /// Reconstruct from a stored unit vector. Validates length, finiteness, AND
-  /// unit-norm (`(norm² − 1).abs() ≤ ``NORM_BUDGET`).
+  /// unit-norm (`(norm² − 1).abs() ≤ ``NORM_BUDGET`), then re-normalizes the
+  /// accepted vector through the f64 path, so the stored embedding is unit-norm
+  /// to fp32 ULP and [`Self::cosine`] stays in `[−1, 1]` (within fp rounding)
+  /// for every successfully constructed pair — a budget-edge vector stored raw
+  /// would let `cosine` escape `[−1, 1]`.
   ///
   /// # Errors
   /// [`Error::EmbeddingDimMismatch`] if `s.len() != `[`EMBEDDING_DIM`];
@@ -96,9 +100,12 @@ impl Embedding {
         norm_sq_deviation: dev,
       });
     }
-    let mut inner = [0.0f32; EMBEDDING_DIM];
-    inner.copy_from_slice(s);
-    Ok(Self { inner })
+    // Within budget: rebuild through the f64 normalization path so the STORED
+    // vector is unit-norm to fp32 ULP regardless of where in the budget the
+    // input fell — a budget-edge vector copied raw makes `cosine` escape
+    // [−1, 1]. `EmbeddingZero` is unreachable here (norm² ≥ 1 − NORM_BUDGET > 0)
+    // and the dim/finite re-checks inside are already-proven cheap passes.
+    Self::from_slice_normalizing(s)
   }
 
   /// Construct from any non-zero finite slice, re-normalizing to unit length.
@@ -137,17 +144,6 @@ impl Embedding {
       *out = ((v as f64) * inv_norm_f64) as f32;
     }
     Ok(Self { inner })
-  }
-
-  /// Module-internal constructor for producers whose upstream guard already
-  /// validated unit-norm within `NORM_BUDGET`. Bypasses re-normalization.
-  #[allow(dead_code)]
-  pub(crate) fn from_array_trusted_unit_norm(arr: [f32; EMBEDDING_DIM]) -> Self {
-    debug_assert!({
-      let n: f32 = arr.iter().map(|x| x * x).sum();
-      (n - 1.0).abs() <= NORM_BUDGET
-    });
-    Self { inner: arr }
   }
 
   /// Inner product. For two unit vectors this equals [`Self::cosine`] to fp32

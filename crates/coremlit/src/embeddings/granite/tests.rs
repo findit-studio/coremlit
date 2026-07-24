@@ -165,8 +165,9 @@ fn long_input_truncation_keeps_the_right_directional_prefix() {
 
 /// "hello world" through the granite tokenizer: `<|startoftext|>`=179934 (CLS,
 /// pooled), then `hello`/`world`, then `<|return|>`=179938 (EOS). The exact
-/// sequence is pinned by `token_ids_match_pinned_golden_subset` above.
-const HELLO_WORLD_IDS: [u32; 4] = [179934, 24313, 2318, 179938];
+/// sequence is pinned by `token_ids_match_pinned_golden_subset` above; sourced
+/// from the module contract (single source of truth).
+const HELLO_WORLD_IDS: [u32; 4] = contract::SENTINEL_IDS;
 
 /// A fresh bundled tokenizer carrying an adversarial fixed-window padding policy
 /// (the kind a caller-supplied tokenizer might inherit), BEFORE this module's
@@ -590,13 +591,17 @@ fn gap_attachment_falls_back_right_then_own_chunk() {
   use windit::split::ContentAware;
 
   let measure = |s: &str| -> usize { s.chars().count() };
+  // `attach_gaps` now takes a fallible measure; a `char`-count never fails, so
+  // the own-chunks (all far below MAX_TOKENS) attach exactly as before.
+  let measure_checked = |s: &str| -> Result<usize> { Ok(s.chars().count()) };
   // windit's raw chunks for `text` at `window`, repaired by `attach_gaps`, as
   // (start, end) byte ranges.
   let repair = |text: &str, window: usize| -> Vec<(usize, usize)> {
     let chunks = ContentAware::new(&measure)
       .chunk(text, &WindowOptions::new(window))
       .expect("chunk");
-    attach_gaps(text, chunks, &measure, window)
+    attach_gaps(text, chunks, &measure_checked, window)
+      .expect("own-chunks measure within MAX_TOKENS")
       .iter()
       .map(|c| (c.start(), c.end()))
       .collect()
@@ -735,6 +740,165 @@ fn whitespace_only_text_counts_one_window_against_the_cap() {
   );
 }
 
+/// Contentless over-budget input is REFUSED, not silently truncated. windit
+/// drops the whitespace-only text; the whole-input fallback would then embed it
+/// through the truncating production tokenizer, dropping every token past the
+/// 512-window. The measured fallback refuses it instead. Fixtures span spaces,
+/// tabs, CRLF, NBSP, and a mixed run (em/thin spaces); `tokens` is compared to
+/// the test's own untruncated encode so the pin is self-consistent under any
+/// tokenizer.
+#[test]
+fn contentless_over_budget_input_is_refused_not_truncated() {
+  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let fixtures = [
+    " ".repeat(100_000),
+    "\t".repeat(100_000),
+    "\r\n".repeat(50_000),
+    "\u{00A0}".repeat(100_000),
+    " \t\r\n\u{00A0}\u{2003}\u{2009}".repeat(15_000),
+  ];
+  for s in &fixtures {
+    let expected_tokens = mt.encode(s.as_str(), true).expect("encode").get_ids().len();
+    assert!(
+      expected_tokens > MAX_TOKENS,
+      "fixture must actually exceed the window (got {expected_tokens})"
+    );
+    match chunk_long(&mt, s, &WindowOptions::new(MAX_TOKENS)) {
+      Err(Error::ContentlessInputOverBudget {
+        start,
+        end,
+        tokens,
+        max,
+      }) => {
+        assert_eq!(start, 0, "the whole input is the offending run");
+        assert_eq!(end, s.len());
+        assert_eq!(
+          tokens, expected_tokens,
+          "reported count is the untruncated measure"
+        );
+        assert_eq!(max, MAX_TOKENS);
+      }
+      other => panic!("expected ContentlessInputOverBudget, got {other:?}"),
+    }
+  }
+}
+
+/// The at-budget boundary is embedded whole; the first over-budget count is
+/// refused. Binary-searches the largest space run that fits the window, so the
+/// boundary is exact regardless of the pinned tokenizer.
+#[test]
+fn contentless_input_at_or_under_budget_still_embeds_whole() {
+  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let measure = |n: usize| {
+    mt.encode(" ".repeat(n).as_str(), true)
+      .expect("encode")
+      .get_ids()
+      .len()
+  };
+  let mut lo = 1usize;
+  let mut hi = 100_000usize;
+  assert!(measure(lo) <= MAX_TOKENS, "one space fits");
+  assert!(measure(hi) > MAX_TOKENS, "100k spaces overflow");
+  while lo + 1 < hi {
+    let mid = (lo + hi) / 2;
+    if measure(mid) <= MAX_TOKENS {
+      lo = mid;
+    } else {
+      hi = mid;
+    }
+  }
+  // `lo` is the largest in-budget count; `hi == lo + 1` the first over-budget.
+  let at_budget = " ".repeat(lo);
+  let chunks = chunk_long(&mt, &at_budget, &WindowOptions::new(MAX_TOKENS))
+    .expect("in-budget contentless input embeds whole");
+  assert_eq!(
+    chunks
+      .iter()
+      .map(|c| (c.start(), c.end()))
+      .collect::<Vec<_>>(),
+    vec![(0, at_budget.len())],
+    "in-budget contentless input is one whole-input chunk"
+  );
+  let over = " ".repeat(hi);
+  match chunk_long(&mt, &over, &WindowOptions::new(MAX_TOKENS)) {
+    Err(Error::ContentlessInputOverBudget { .. }) => {}
+    other => panic!("expected ContentlessInputOverBudget just past the budget, got {other:?}"),
+  }
+}
+
+/// A pure-separator gap between two content chunks that neither neighbor can
+/// absorb (the `attach_gaps` own-chunk escape, interior case) is refused when
+/// its run measures past the window. `a<100k spaces>b` at window 3 forces the
+/// escape; the in-budget own-chunk escape (`a\n\nb`) still chunks Ok.
+#[test]
+fn separator_gap_over_budget_is_refused() {
+  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let text = format!("a{}b", " ".repeat(100_000));
+  match chunk_long(&mt, &text, &WindowOptions::new(3)) {
+    Err(Error::ContentlessInputOverBudget {
+      start,
+      end,
+      tokens,
+      max,
+    }) => {
+      assert_eq!(start, 1, "the gap starts right after `a`");
+      assert_eq!(end, 100_001, "the gap ends right before `b`");
+      assert!(tokens > MAX_TOKENS, "the gap run measures over the window");
+      assert_eq!(max, MAX_TOKENS);
+    }
+    other => panic!("expected ContentlessInputOverBudget, got {other:?}"),
+  }
+  // Control: an in-budget own-chunk gap still chunks Ok — the escape stays.
+  let ok = chunk_long(&mt, "a\n\nb", &WindowOptions::new(3)).expect("in-budget own-chunk escape");
+  assert_eq!(
+    ok.iter().map(|c| (c.start(), c.end())).collect::<Vec<_>>(),
+    vec![(0, 1), (1, 3), (3, 4)]
+  );
+}
+
+/// Leading and trailing pure-separator gaps that measure past the window are
+/// refused with the correct byte span (the `attach_gaps` leading and trailing
+/// branches, measuring the GAP itself, not the extended candidate).
+#[test]
+fn leading_and_trailing_over_budget_gaps_are_refused() {
+  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+
+  let leading = format!("{}a", " ".repeat(100_000));
+  match chunk_long(&mt, &leading, &WindowOptions::new(MAX_TOKENS)) {
+    Err(Error::ContentlessInputOverBudget { start, end, .. }) => {
+      assert_eq!(start, 0, "leading gap starts at byte 0");
+      assert_eq!(end, 100_000, "leading gap ends right before `a`");
+    }
+    other => panic!("expected leading ContentlessInputOverBudget, got {other:?}"),
+  }
+
+  let trailing = format!("a{}", " ".repeat(100_000));
+  match chunk_long(&mt, &trailing, &WindowOptions::new(MAX_TOKENS)) {
+    Err(Error::ContentlessInputOverBudget { start, end, .. }) => {
+      assert_eq!(start, 1, "trailing gap starts right after `a`");
+      assert_eq!(end, 100_001, "trailing gap ends at text length");
+    }
+    other => panic!("expected trailing ContentlessInputOverBudget, got {other:?}"),
+  }
+}
+
+/// An encode failure during the fallback measure surfaces as `Error::Tokenize`,
+/// NOT a bogus `ContentlessInputOverBudget { tokens: usize::MAX }`: the fallible
+/// measure closure must preserve the tokenizer error's identity. A tiny
+/// WordLevel tokenizer whose unk token is absent from its vocab fails to encode
+/// the whitespace-only fallback input.
+#[test]
+fn tokenizer_failure_on_fallback_measure_keeps_tokenize_identity() {
+  // WordLevel, no pre-tokenizer, unk token `<unk>` not in vocab: encoding the
+  // whole-string `"   "` (not in vocab) errors instead of truncating.
+  const TINY_NO_UNK: &[u8] = br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"hello":0,"world":1},"unk_token":"<unk>"}}"#;
+  let mt = tokenizers::Tokenizer::from_bytes(TINY_NO_UNK).expect("load tiny WordLevel");
+  match chunk_long(&mt, "   ", &WindowOptions::new(MAX_TOKENS)) {
+    Err(Error::Tokenize(_)) => {}
+    other => panic!("expected Err(Tokenize), got {other:?}"),
+  }
+}
+
 /// `""` costs zero predictions (`embed_long_with` delegates it to `embed`,
 /// which fails `EmptyText` before the model), so no fallback chunk is
 /// synthesized and even a cap of 0 passes chunking.
@@ -812,12 +976,15 @@ fn overlap_repeats_trailing_tokens_within_budget() {
   }
 }
 
-/// `validate_long_options` (and thus `embed_long_with`) rejects a per-chunk
-/// budget above the model's fixed window before any tokenization — hermetically,
-/// no model.
+/// `validate_long_input` (and thus `embed_long_with`) rejects a per-chunk budget
+/// above the model's fixed window before any tokenization — hermetically, no
+/// model.
 #[test]
 fn window_over_budget_is_rejected() {
-  match validate_long_options(&WindowOptions::new(MAX_TOKENS + 1)) {
+  match validate_long_input(
+    "any text",
+    &LongTextOptions::from(WindowOptions::new(MAX_TOKENS + 1)),
+  ) {
     Err(Error::WindowOverBudget { window, max }) => {
       assert_eq!(window, MAX_TOKENS + 1);
       assert_eq!(max, MAX_TOKENS);
@@ -825,5 +992,212 @@ fn window_over_budget_is_rejected() {
     other => panic!("expected Err(WindowOverBudget), got {other:?}"),
   }
   // The exact budget is accepted.
-  assert!(validate_long_options(&WindowOptions::new(MAX_TOKENS)).is_ok());
+  assert!(
+    validate_long_input(
+      "any text",
+      &LongTextOptions::from(WindowOptions::new(MAX_TOKENS)),
+    )
+    .is_ok()
+  );
+}
+
+// ── #2: LongTextOptions + input-size gate (hermetic) ─────────────────────────
+
+/// `Default` == `new`, the documented defaults (full window, no byte limit), the
+/// builder/setter round-trips, and the `From<WindowOptions>` geometry-only form.
+#[test]
+fn long_text_options_default_equals_new() {
+  assert_eq!(LongTextOptions::default(), LongTextOptions::new());
+  assert_eq!(
+    LongTextOptions::new().window_options(),
+    WindowOptions::new(MAX_TOKENS)
+  );
+  assert_eq!(LongTextOptions::new().max_input_bytes(), None);
+
+  let built = LongTextOptions::new()
+    .with_window_options(WindowOptions::new(64))
+    .with_max_input_bytes(4096);
+  assert_eq!(built.window_options(), WindowOptions::new(64));
+  assert_eq!(built.max_input_bytes(), Some(4096));
+
+  let mut set = LongTextOptions::new();
+  set.set_window_options(WindowOptions::new(32));
+  set.set_max_input_bytes(2048);
+  assert_eq!(set.window_options(), WindowOptions::new(32));
+  assert_eq!(set.max_input_bytes(), Some(2048));
+
+  let from = LongTextOptions::from(WindowOptions::new(64));
+  assert_eq!(from.window_options().window(), 64);
+  assert_eq!(from.max_input_bytes(), None);
+}
+
+/// The input-size gate refuses an oversized input reading only `text.len()` (no
+/// tokenizer); at-limit passes (`>` rejects, `==` accepts), and a `None` limit
+/// accepts the same oversized input.
+#[test]
+fn input_too_large_is_rejected_before_any_tokenizer_work() {
+  let big = "x".repeat(8 * 1024 * 1024);
+  let opts = LongTextOptions::new().with_max_input_bytes(1024 * 1024);
+  match validate_long_input(&big, &opts) {
+    Err(Error::InputTooLarge { got, max }) => {
+      assert_eq!(got, big.len());
+      assert_eq!(max, 1024 * 1024);
+    }
+    other => panic!("expected InputTooLarge, got {other:?}"),
+  }
+  // At-limit is accepted.
+  let at_limit = "x".repeat(1024 * 1024);
+  assert!(validate_long_input(&at_limit, &opts).is_ok());
+  // No limit accepts the same 8 MiB input.
+  assert!(validate_long_input(&big, &LongTextOptions::new()).is_ok());
+}
+
+/// The untrusted-input gate is the outermost shield: an oversized input AND an
+/// over-budget window yields `InputTooLarge`, not `WindowOverBudget`.
+#[test]
+fn input_too_large_takes_precedence_over_window_budget() {
+  let big = "x".repeat(2 * 1024 * 1024);
+  let opts =
+    LongTextOptions::from(WindowOptions::new(MAX_TOKENS + 1)).with_max_input_bytes(1024 * 1024);
+  match validate_long_input(&big, &opts) {
+    Err(Error::InputTooLarge { .. }) => {}
+    other => panic!("expected InputTooLarge to win over WindowOverBudget, got {other:?}"),
+  }
+}
+
+// ── #6: tokenizer contract validation (hermetic) ─────────────────────────────
+
+/// Parse the bundled tokenizer JSON, apply `mutate`, re-serialize, and build the
+/// module's CONFIGURED tokenizer from the result — so a contract check sees
+/// exactly the production tokenization. `serde_json` is a dev-dependency.
+fn mutated_bundled_tokenizer(mutate: impl FnOnce(&mut serde_json::Value)) -> Tokenizer {
+  let mut value: serde_json::Value =
+    serde_json::from_slice(BUNDLED_TOKENIZER).expect("parse bundled tokenizer.json");
+  mutate(&mut value);
+  let bytes = serde_json::to_vec(&value).expect("re-serialize mutated tokenizer.json");
+  configured_tokenizer_from_bytes(&bytes).expect("configure mutated tokenizer")
+}
+
+/// The bundled granite tokenizer passes every contract check — the invariant on
+/// which all keep-green constructor/golden behavior rests. If this fails the
+/// contract constants are wrong; strengthen the constants, never the checks.
+#[test]
+fn tokenizer_contract_accepts_the_bundled_tokenizer() {
+  let tok = configured_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("configure bundled");
+  validate_tokenizer_contract(&tok).expect("bundled tokenizer must satisfy the contract");
+}
+
+/// A tiny foreign tokenizer with none of granite's specials fails the first
+/// check (`<|startoftext|>`), reported as `missing`.
+#[test]
+fn tokenizer_contract_rejects_missing_specials() {
+  const TINY: &[u8] = br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"hello":0,"world":1},"unk_token":"<unk>"}}"#;
+  let tok = configured_tokenizer_from_bytes(TINY).expect("configure tiny");
+  match validate_tokenizer_contract(&tok) {
+    Err(Error::TokenizerContractMismatch { check, actual, .. }) => {
+      assert!(
+        check.contains("<|startoftext|>"),
+        "check names the missing special: {check}"
+      );
+      assert_eq!(actual, "missing");
+    }
+    other => panic!("expected TokenizerContractMismatch, got {other:?}"),
+  }
+}
+
+/// The bundled tokenizer with one trailing (non-special) added token removed
+/// keeps granite's three specials but drops the vocabulary to 179999, so the
+/// vocab-size check fires. The pinned `tokenizers` reassigns added-token ids
+/// densely as `base + array_index` (ignoring the JSON `id` field), and the three
+/// specials are the array's first entries, so removing the LAST entry leaves
+/// their ids intact — the fixture edits structure, not a declared id.
+#[test]
+fn tokenizer_contract_rejects_wrong_vocab_size() {
+  let tok = mutated_bundled_tokenizer(|value| {
+    let added = value["added_tokens"]
+      .as_array_mut()
+      .expect("added_tokens array");
+    added.pop().expect("added_tokens is non-empty");
+  });
+  match validate_tokenizer_contract(&tok) {
+    Err(Error::TokenizerContractMismatch {
+      check,
+      expected,
+      actual,
+    }) => {
+      assert_eq!(check, "vocab size");
+      assert!(
+        expected.contains("180000"),
+        "expected names the contract size: {expected}"
+      );
+      assert!(
+        actual.contains("179999"),
+        "actual names the reduced size: {actual}"
+      );
+    }
+    other => panic!("expected TokenizerContractMismatch on vocab size, got {other:?}"),
+  }
+}
+
+/// The bundled tokenizer with its highest BASE-vocab id pushed past the model's
+/// table (to 180000) keeps the count at 180000 and the specials intact, so the
+/// specials and vocab-size checks pass but the max-token-id gate fires — the
+/// out-of-vocabulary case a larger foreign tokenizer would hit. (Added-token ids
+/// are reassigned densely by this `tokenizers`, so an OOV id can only come from
+/// the base vocab; the fixture moves a base id, leaving a hole the count check
+/// tolerates.)
+#[test]
+fn tokenizer_contract_rejects_out_of_model_vocab_id() {
+  let tok = mutated_bundled_tokenizer(|value| {
+    let vocab = value["model"]["vocab"]
+      .as_object_mut()
+      .expect("model.vocab object");
+    let key = vocab
+      .iter()
+      .max_by_key(|(_, id)| id.as_u64().unwrap_or(0))
+      .map(|(k, _)| k.clone())
+      .expect("non-empty base vocab");
+    vocab.insert(key, serde_json::json!(180_000));
+  });
+  match validate_tokenizer_contract(&tok) {
+    Err(Error::TokenizerContractMismatch { check, actual, .. }) => {
+      assert_eq!(check, "max token id");
+      assert!(
+        actual.contains("180000"),
+        "actual carries the offending id: {actual}"
+      );
+    }
+    other => panic!("expected TokenizerContractMismatch on max token id, got {other:?}"),
+  }
+}
+
+/// Two base-vocab entries with their ids swapped (`hello`↔`Ġworld`, 24313↔2318)
+/// leave the specials, vocab size, and max id intact but change the sentinel
+/// encoding, so only the final check fires.
+#[test]
+fn tokenizer_contract_rejects_divergent_encoding() {
+  let tok = mutated_bundled_tokenizer(|value| {
+    let vocab = value["model"]["vocab"]
+      .as_object_mut()
+      .expect("model.vocab object");
+    let mut key_a = None;
+    let mut key_b = None;
+    for (key, id) in vocab.iter() {
+      match id.as_u64() {
+        Some(24_313) => key_a = Some(key.clone()),
+        Some(2_318) => key_b = Some(key.clone()),
+        _ => {}
+      }
+    }
+    let key_a = key_a.expect("id 24313 present in base vocab");
+    let key_b = key_b.expect("id 2318 present in base vocab");
+    vocab.insert(key_a, serde_json::json!(2_318));
+    vocab.insert(key_b, serde_json::json!(24_313));
+  });
+  match validate_tokenizer_contract(&tok) {
+    Err(Error::TokenizerContractMismatch { check, .. }) => {
+      assert_eq!(check, "sentinel encoding");
+    }
+    other => panic!("expected TokenizerContractMismatch on sentinel encoding, got {other:?}"),
+  }
 }

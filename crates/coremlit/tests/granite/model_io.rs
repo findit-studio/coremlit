@@ -29,7 +29,9 @@ use std::collections::BTreeSet;
 
 use coremlit::{
   ComputeUnits, DataType, Model,
-  embeddings::granite::{MAX_TOKENS, embedding::EMBEDDING_DIM},
+  embeddings::granite::{
+    Error, MAX_TOKENS, TextEmbedder, TextEmbedderOptions, embedding::EMBEDDING_DIM,
+  },
 };
 
 /// The `.mlmodelc` bundle's per-file SHA-256, EXACTLY enumerated (the #30
@@ -138,6 +140,26 @@ fn granite_artifact_bytes_match_pinned_sha256() {
       common::EMBEDKIT_REVISION
     );
   }
+}
+
+/// A caller-supplied tokenizer that parses but does not match the Granite
+/// contract is refused at construction, fail-closed — the audit's live repro (a
+/// tiny WordLevel tokenizer via `from_memory`). The contract gate runs before
+/// `Model::load`, so this proves the constructor's fail-closed order end-to-end.
+#[test]
+#[ignore = "requires local granite model (EMBEDKIT_TEST_MODELS)"]
+fn from_memory_rejects_foreign_tokenizer() {
+  const TINY_WORDLEVEL: &[u8] = br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"hello":0,"world":1},"unk_token":"<unk>"}}"#;
+  let err = TextEmbedder::from_memory(
+    common::model_path(),
+    TINY_WORDLEVEL,
+    TextEmbedderOptions::new(),
+  )
+  .expect_err("a foreign tokenizer must be refused at construction");
+  assert!(
+    matches!(err, Error::TokenizerContractMismatch { .. }),
+    "expected TokenizerContractMismatch, got {err:?}"
+  );
 }
 
 /// Hermetic non-vacuity proof for [`common::collect_files_rel`]'s sidecar
