@@ -271,11 +271,16 @@ fn mass_rule_all_masked_text_fires() {
 
 #[test]
 fn mass_rule_nan_poisons_to_non_firing() {
-  // NaN anywhere -> the comparison is poisoned to non-firing. Contract: BNNS
-  // skips NaN lanes in its normalizer, this port poisons to false; both never
-  // fire (the scalars differ), and a model emitting NaN logits is already
-  // undefined upstream. Without the NaN this config (favored timestamps)
-  // would fire; the NaN is what suppresses it.
+  // NaN in the TIMESTAMP region (index 10, time_begin=8) -> poisoned to
+  // non-firing on both sides here, but only because of WHERE it sits: the
+  // port poisons to false on any NaN, anywhere, while BNNS agrees only
+  // because its own naive (non-NaN-skipping) `.logSumExp` over the timestamp
+  // region is poisoned by this same placement. A NaN confined to the TEXT
+  // region would not reproduce this agreement -- BNNS's `.max` skips that NaN
+  // lane and its rule can still fire; only the port poisons universally.
+  // NaN inputs remain outside the parity contract either way, and a model
+  // emitting NaN logits is already undefined upstream. Without the NaN this
+  // config (favored timestamps) would fire; the NaN is what suppresses it.
   let mut v = vec![0.0f32; 16];
   for x in v[8..16].iter_mut() {
     *x = 1.0;

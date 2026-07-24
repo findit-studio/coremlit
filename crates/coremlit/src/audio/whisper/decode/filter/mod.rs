@@ -249,10 +249,13 @@ impl LogitsFilter for TimestampRulesFilter {
 ///
 /// Returns `None` when the whole vector is masked (Swift's pipeline then
 /// yields NaN/-inf comparands and never fires; callers treat `None` as "don't
-/// fire"). NaN logits are outside the parity contract: BNNS skips NaN lanes in
-/// its normalizer, this port poisons the comparison to non-firing — both never
-/// fire, but the scalars differ; a model emitting NaN logits is already
-/// undefined upstream.
+/// fire"). NaN logits are outside the parity contract either way: this port
+/// poisons the comparison to non-firing on any NaN, anywhere in the vector.
+/// BNNS is not uniformly this conservative — its `.max`/`logSoftmax` skip NaN
+/// lanes, so a NaN confined to the TEXT region leaves BNNS's comparands
+/// finite and its rule CAN still fire (only a NaN in the TIMESTAMP region
+/// poisons BNNS's naive, non-skipping `.logSumExp` the same way, so the two
+/// agree there); a model emitting NaN logits is already undefined upstream.
 ///
 /// Numeric domain (all probe-verified): `sum >= 1` always (the max element
 /// contributes `exp(0)`), so `l` is finite in `[0, ln(vocab)]`; inputs are

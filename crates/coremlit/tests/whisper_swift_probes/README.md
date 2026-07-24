@@ -47,7 +47,7 @@ path; BNNS f16 `argMax` is the legacy path. Both are probed here.
 | --- | --- | --- |
 | `probe_argmax.swift`   | H2 | Source: 16 crafted argmax tie/NaN/signed-zero cases, MLTensor and BNNS paths, 3 repeats each. |
 | `probe_argmax.out`     | H2 | Earlier partial run — 11 cases (through `vocab_all_equal`). |
-| `probe_argmax2.out`    | H2 | Later run — 15 cases, **includes the signed-zero and `nan_at_4` cases** that discriminate first-index-IEEE from `total_cmp`. |
+| `probe_argmax2.out`    | H2 | Complete run — all 16 cases, **includes the signed-zero, `nan_at_4`/`nan_at_0`, and `all_nan` cases** that discriminate first-index-IEEE from `total_cmp`. |
 | `probe_massrule.swift` | H1 | Source: Q1–Q4 decisive probes (internal-precision, max-subtract, edge semantics, random sweeps, near-margin scans, V3 bit-pinned dump). |
 | `probe_massrule.out`   | H1 | Earlier partial run — flip-point scans empty, truncated before the V3 dump. |
 | `probe_massrule2.out`  | H1 | **Complete run** — the authoritative capture: flip points `0xb17c` (scan1) / `0xc05e` (scan2), the V3 pins `lse=0xb7ae max=0xc4f2`, and the NaN / all-`-inf` edge semantics. |
@@ -63,9 +63,10 @@ identical in both.
 - **H2 (`probe_argmax2.out`):** Swift's argmax is deterministic **first-index**
   on every crafted tie (small/vocab-size, adjacent/distant, many-way, all-equal,
   `-inf`-dominated), signed zeros compare IEEE-equal (`[-0.0@2, +0.0@5]` and the
-  reverse both pick 2), and NaN is skipped wherever it sits (`nan_at_4` → 7).
-  The all-NaN case (MLTensor→0, BNNS→last) is unspecified upstream; the port
-  pins 0 (the shipping MLTensor path).
+  reverse both pick 2), and NaN is skipped wherever it sits (`nan_at_4` and
+  `nan_at_0` both → 7). The all-NaN case (`all_nan`) diverges by path —
+  MLTensor→0, BNNS→last (index 15 at n=16) — unspecified/inconsistent
+  upstream; the port pins 0 (the shipping MLTensor path).
 - **H1 (`probe_massrule2.out`):** BNNS computes internally in **f32** and rounds
   to f16 only at each operation's output (crafted `[8, -3×1100]`:
   `bnns=0x4802` = f32-sequential, ≠ `0x4800` = pure-f16). Its `.logSumExp`

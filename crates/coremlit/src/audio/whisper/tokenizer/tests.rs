@@ -370,8 +370,8 @@ fn word_grouping_splits_chinese_and_only_chinese() {
   let t = tiny();
   let zh = t.encode("我今天很高兴见到你").unwrap();
 
-  // DEFAULT -- the #11-pinned behavior, unchanged: the Unicode splitter
-  // carves the utterance into its Unicode-complete units. Those units are
+  // OPT-IN -- the #11-pinned behavior: the Unicode splitter carves the
+  // utterance into its Unicode-complete units. Those units are
   // BPE-token-shaped, not one-per-character ("今天" is a single token); the
   // guarantee is that they are FINE-GRAINED, never one-per-scalar.
   let fine = t
@@ -384,11 +384,11 @@ fn word_grouping_splits_chinese_and_only_chinese() {
   );
   assert_eq!(
     crate::audio::whisper::options::DecodingOptions::new().word_grouping(),
-    WordGrouping::FineGrained,
-    "and fine-grained is what a caller gets without asking"
+    WordGrouping::SwiftParity,
+    "and swift-parity is what a caller gets without asking -- #41; FineGrained is the opt-in"
   );
 
-  // OPT-IN -- the space splitter finds no space anywhere in Chinese, so the
+  // DEFAULT -- the space splitter finds no space anywhere in Chinese, so the
   // whole utterance collapses into a single blob with one start/end time:
   // Swift's `zh-Hant`-fallthrough grouping, reproduced deliberately rather
   // than stumbled into.
