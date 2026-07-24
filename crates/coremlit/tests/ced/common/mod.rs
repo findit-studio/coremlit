@@ -1,25 +1,48 @@
-//! Shared helpers for the CED classifier tests.
+//! Shared helpers for the CED classifier tests, parameterized over the four
+//! [`CedModel`] sizes (tiny/mini/small/base).
 //!
 //! Two data sources, kept distinct:
 //!
-//! - **Committed fixtures** (`tests/ced/fixtures/`) — staged by Wave B:
-//!   `fixtures/mel/` holds 16 kHz mono WAV clip(s) + reference fp32 mel `.npy`
-//!   for the in-src mel parity gate; `fixtures/goldens/corpus.json` holds the
-//!   committed fp32 logits from the CED ONNX fp32 CPU oracle (generated
-//!   owner-side — ort never enters this repo, not even dev). Read
+//! - **Committed fixtures** (`tests/ced/fixtures/`) — staged by Wave B: the
+//!   16 kHz mono WAV clips are committed ONCE and shared across sizes
+//!   (`fixtures/mel/`, `fixtures/goldens/clips/`); only the per-size logits
+//!   differ, as `fixtures/goldens/<size>/corpus.json` — a [`GoldenCorpus`]
+//!   whose [`OracleProvenance`] header names the `mispeech/ced-<size>` ONNX
+//!   fp32 CPU oracle the logits came from (generated owner-side — ort never
+//!   enters this repo, not even dev). [`load_golden_corpus`] cross-checks that
+//!   header against [`CedModel::hf_repo`], so a cross-size golden mix-up (four
+//!   I/O-identical models make it otherwise invisible) fails closed. Read
 //!   hermetically; no model, no network.
-//! - **CoreML artifact** (`ced_tiny.mlmodelc`) — a gitignored dev-time
-//!   download staged under `Models/ced/ced-tiny/` (overridable via
-//!   `CED_TEST_MODELS`). Model-gated tests are `#[ignore]` by default and run
-//!   only when the owner stages the Wave-B conversion.
+//! - **CoreML artifact** (`ced_<size>.mlmodelc`) — a gitignored dev-time
+//!   download staged under `Models/ced/ced-<size>/` (the `Models/ced` family
+//!   root is overridable via `CED_TEST_MODELS`). Model-gated tests are
+//!   `#[ignore]` by default and run per size only when the owner stages that
+//!   size's Wave-B conversion.
 
 use std::path::{Path, PathBuf};
 
-/// The HF revision (commit SHA) the CED artifact and its per-file SHA-256 pins
-/// are recorded at. Pinned by the conversion runbook's upload step (Wave C); a
-/// placeholder until then.
+use coremlit::audio::ced::CedModel;
+
+// Per-size placeholders for the HF revision (commit SHA) each CED artifact and
+// its SHA-256 pins are recorded at — filled independently by the conversion
+// runbook's upload step (Wave C), one size at a time.
+const TINY_REVISION: &str = "<pending conversion upload (Wave C)>";
+const MINI_REVISION: &str = "<pending conversion upload (Wave C)>";
+const SMALL_REVISION: &str = "<pending conversion upload (Wave C)>";
+const BASE_REVISION: &str = "<pending conversion upload (Wave C)>";
+
+/// The HF revision the given size's artifact and per-file SHA-256 pins are
+/// recorded at (a placeholder until that size's Wave-C upload). Totality is
+/// compiler-enforced by the closed [`CedModel`] enum.
 #[allow(dead_code)]
-pub const CED_REVISION: &str = "<pending conversion upload (Wave C)>";
+pub const fn ced_revision(model: CedModel) -> &'static str {
+  match model {
+    CedModel::Tiny => TINY_REVISION,
+    CedModel::Mini => MINI_REVISION,
+    CedModel::Small => SMALL_REVISION,
+    CedModel::Base => BASE_REVISION,
+  }
+}
 
 /// Directory containing the downloaded CED CoreML artifact tree.
 ///
@@ -39,18 +62,19 @@ pub fn models_dir() -> PathBuf {
   )
 }
 
-/// The CED-tiny bundle's parent directory (`.../ced-tiny`) — the variant
-/// namespace (mini/small/base are future siblings), holding the `.mlmodelc`
-/// and `CHECKSUMS.sha256`.
+/// The given size's bundle directory (`.../ced-<size>`) under the family root,
+/// holding the `.mlmodelc` and `CHECKSUMS.sha256`.
 #[allow(dead_code)]
-pub fn model_root() -> PathBuf {
-  models_dir().join("ced-tiny")
+pub fn model_root(model: CedModel) -> PathBuf {
+  models_dir().join(model.dir_name())
 }
 
-/// Path to the compiled CED-tiny mel→logits graph, `ced_tiny.mlmodelc`.
+/// Path to the given size's compiled mel→logits graph
+/// (`.../ced-<size>/ced_<size>.mlmodelc`) — [`CedModel::mlmodelc_path`] rooted
+/// at [`models_dir`], so Tiny resolves to the byte-identical Wave-A path.
 #[allow(dead_code)]
-pub fn model_path() -> PathBuf {
-  model_root().join("ced_tiny.mlmodelc")
+pub fn model_path(model: CedModel) -> PathBuf {
+  model.mlmodelc_path(models_dir())
 }
 
 /// Absolute path to a committed fixture under `crates/coremlit/tests/ced/fixtures`.
@@ -81,15 +105,68 @@ pub struct GoldenClip {
   pub logits: Vec<f32>,
 }
 
-/// Load the committed golden corpus (`fixtures/goldens/corpus.json`).
-/// Hermetic — reads the in-tree fixture, never `Models/`. (Staged by Wave B;
-/// until then the fixture is absent and only the `#[ignore]`d gates that call
-/// this are affected.)
+/// Provenance header of a per-size [`GoldenCorpus`]: the exact ONNX fp32 CPU
+/// oracle its logits were generated from. [`load_golden_corpus`] asserts
+/// [`Self::repo`] equals the size's [`CedModel::hf_repo`] — the fail-closed
+/// guard against a cross-size golden mix-up, which four I/O-identical models
+/// make otherwise undetectable until parity mysteriously fails (precedent:
+/// vad's goldens embed and assert their generator revision).
+#[derive(Debug, serde::Deserialize)]
 #[allow(dead_code)]
-pub fn load_golden_corpus() -> Vec<GoldenClip> {
-  let path = fixture_path("goldens/corpus.json");
+pub struct OracleProvenance {
+  /// The oracle's Hugging Face repo id (must equal `model.hf_repo()`).
+  pub repo: String,
+  /// The oracle's pinned HF revision (commit SHA).
+  pub revision: String,
+  /// The oracle file within the repo (e.g. `model.onnx`).
+  pub file: String,
+  /// Lowercase-hex SHA-256 of the oracle file.
+  pub sha256: String,
+}
+
+/// A committed per-size golden corpus: its [`OracleProvenance`] header plus the
+/// oracle's pre-sigmoid logits for each shared clip.
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+pub struct GoldenCorpus {
+  /// Which `mispeech/ced-<size>` ONNX oracle produced `clips`' logits.
+  pub oracle: OracleProvenance,
+  /// The golden clips (≥ 1 sub-window + ≥ 1 full-window — spec §7).
+  pub clips: Vec<GoldenClip>,
+}
+
+/// Deserialize a [`GoldenCorpus`] from raw JSON bytes and FAIL CLOSED unless its
+/// oracle header matches `model` — the hermetic core of [`load_golden_corpus`],
+/// factored out so the cross-size guard is testable without the filesystem.
+///
+/// # Panics
+/// If `bytes` is not a valid [`GoldenCorpus`], or if `oracle.repo` is not
+/// `model.`[`hf_repo`](CedModel::hf_repo)`()`.
+#[allow(dead_code)]
+pub fn parse_golden_corpus(bytes: &[u8], model: CedModel) -> GoldenCorpus {
+  let corpus: GoldenCorpus =
+    serde_json::from_slice(bytes).unwrap_or_else(|e| panic!("parse golden corpus: {e}"));
+  assert_eq!(
+    corpus.oracle.repo,
+    model.hf_repo(),
+    "golden corpus oracle repo `{}` does not match {} (`{}`) — cross-size mix-up",
+    corpus.oracle.repo,
+    model,
+    model.hf_repo()
+  );
+  corpus
+}
+
+/// Load the given size's committed golden corpus
+/// (`fixtures/goldens/<size>/corpus.json`) and cross-check its oracle header
+/// against [`CedModel::hf_repo`]. Hermetic — reads the in-tree fixture, never
+/// `Models/`. (Staged per size by Wave B; until then the fixture is absent and
+/// only the `#[ignore]`d gates that call this are affected.)
+#[allow(dead_code)]
+pub fn load_golden_corpus(model: CedModel) -> GoldenCorpus {
+  let path = fixture_path(&format!("goldens/{}/corpus.json", model.as_str()));
   let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
-  serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+  parse_golden_corpus(&bytes, model)
 }
 
 /// Read a committed WAV into normalized mono f32, asserting its 16 kHz mono

@@ -120,8 +120,9 @@ granite = ["dep:tokenizers", "dep:windit", "windit/text", "dep:sha2"]
 # tracked outside this change, not something wired here.
 siglip = ["dep:tokenizers", "dep:colconv"]
 
-# --- audio::ced (CED-tiny AudioSet sound-event tagging) ---
-# Native CoreML CED-tiny multi-label classifier: 16 kHz mono waveform in, ranked
+# --- audio::ced (CED tiny/mini/small/base AudioSet sound-event tagging) ---
+# Native CoreML CED multi-label classifier (four size-invariant sizes): 16 kHz
+# mono waveform in, ranked
 # AudioSet predictions out (527 rated classes via the ort-free
 # `soundevents-dataset` data crate). A Rust log-mel front-end (`rustfft`, shared
 # with `clap`) around one fp16 mel→logits transformer graph; long clips chunk

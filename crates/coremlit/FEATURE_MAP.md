@@ -51,8 +51,9 @@ transformers-fp32 goldens, so NO `siglip-oracle` sibling and no `ort` — and it
 composes with nothing (a single leaf feature). NaFlex resizes natively to a fixed
 patch budget, so it is a `windit` non-consumer (no windowing).
 
-`ced` is likewise a NEW module (`audio::ced`): CED-tiny AudioSet sound-event
-tagging on CoreML — 16 kHz mono waveform in, ranked predictions over the 527
+`ced` is likewise a NEW module (`audio::ced`): CED (tiny/mini/small/base)
+AudioSet sound-event tagging on CoreML — 16 kHz mono waveform in, ranked
+predictions over the 527
 rated AudioSet classes out (`soundevents-dataset`, the ort-free data crate;
 the ort-based `soundevents` crate is never a dependency). A Rust log-mel
 front-end (`rustfft`) feeds one fp16 mel→logits graph; long clips ride the
@@ -86,7 +87,7 @@ none. It is pinned here and driven by CI (`.github/workflows/ci.yml`):
 | `clap-oracle` | + textclap model-level parity oracle (ort) |
 | `granite` | granite text embeddings alone (bundled tokenizer + committed transformers-fp32 goldens, no ort; `embed_long` rides the rev-pinned `windit` engine + `windit/text`) |
 | `siglip` | SigLIP 2 image+text embeddings alone (bundled tokenizer + committed transformers-fp32 goldens, no ort) |
-| `ced` | CED-tiny sound-event tagging alone (Rust mel + `soundevents-dataset` + `windit`, no ort) |
+| `ced` | CED (tiny/mini/small/base) sound-event tagging alone (Rust mel + `soundevents-dataset` + `windit`, no ort) |
 | `whisper,align,speaker,vad,clap,granite,siglip,ced,serde,tracing,nl-recognizer` | all non-oracle features on |
 | `whisper,align-oracle,speaker-oracle,vad-bundled,clap-oracle,granite,siglip,ced,serde,tracing,nl-recognizer` | all-on (every feature, oracles included) |
 

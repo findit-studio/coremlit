@@ -35,6 +35,32 @@ fn frame_count_matches_the_believed_hop_geometry() {
   );
 }
 
+/// Capacity pin (spec §2): the fixed-window mel width must FIT upstream's
+/// positional-embedding capacity. Upstream CED's `target_length = 1012`
+/// (RicherMans/CED `audiotransformer.py`) is the time-pos-embed capacity /
+/// long-form chunk size, NOT an input width; a ≤ 1012-frame mel is consumed
+/// unpadded with the pos embed sliced to its own patch count, so the canonical
+/// 1001-frame 10 s window (62 of 63 patch columns) is on-distribution. If
+/// `WINDOW_SAMPLES`/hop ever pushed `N_FRAMES` past 1012, a fixed
+/// `[1, 64, 1001]` export would stop being a valid evaluation of the model —
+/// this screams before any conversion is even attempted. Shared by all four
+/// CED sizes.
+#[test]
+fn frame_count_fits_upstream_pos_embed_capacity() {
+  // Upstream time-pos-embed capacity / long-form chunk size (`target_length`),
+  // RicherMans/CED `audiotransformer.py` — verified live, not an input length.
+  // Both operands are consts, so this is a compile-time capacity pin (a const
+  // block, the crate idiom): it fails the build, not a run, if the fixed window
+  // ever outgrows the graph's pos-embed capacity.
+  const UPSTREAM_TARGET_LENGTH: usize = 1012;
+  const {
+    assert!(
+      N_FRAMES <= UPSTREAM_TARGET_LENGTH,
+      "believed mel width must fit upstream pos-embed capacity (target_length 1012)"
+    );
+  }
+}
+
 /// STRUCTURAL GATE 2 (spec §8): dB floor on silence. All-zero input ⇒ power 0
 /// everywhere ⇒ the amin floor: 10·log10(1e-10) = −100 dB exactly, and with
 /// zero dynamic range the top_db clamp never engages.
