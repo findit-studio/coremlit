@@ -1,3 +1,5 @@
+use half::f16;
+
 use super::*;
 use crate::audio::whisper::tokenizer::SpecialTokens;
 
@@ -139,6 +141,147 @@ fn timestamp_sum_probability_forces_timestamp_sampling() {
   logits[ts(&s, 3) as usize] = 1.0;
   filter.filter(&mut logits, &[50258, 100]);
   assert_eq!(logits[100], 20.0);
+}
+
+// ---------------------------------------------------------------------
+// f16 timestamp-mass rule parity (H1, coremlit issue #41)
+//
+// The mass comparison replicates BNNS's probed precision structure
+// (tests/whisper_swift_probes/probe_massrule2.out, macOS 26.5/M1 Max): a
+// stable f32 log-softmax rounded per-element to f16, a naive f32 sum-of-exp
+// over the f16 timestamp logprobs rounded to f16, an exact max over the f16
+// text logprobs, then compare the two f16 scalars. Every expected hex is a
+// committed BNNS output; each test names its probe source.
+// ---------------------------------------------------------------------
+
+#[test]
+fn mass_rule_scalars_match_bnns_pinned_vector() {
+  // Probe DUMP vector V3 (probe_massrule2.out:46-48): 251 f16 values
+  // generated purely from bit patterns (no transcendentals in generation),
+  // time_begin = 100. BNNS produced (lse, max) = (0xb7ae, 0xc4f2); the
+  // sequential-f32 + f16-RNE emulation reproduces both bit-for-bit.
+  let mut v3 = vec![0.0f32; 251];
+  for (i, slot) in v3.iter_mut().enumerate() {
+    let mut bits = 0x2C00u16 + ((i * 37) % 0x1000) as u16;
+    if i % 3 == 0 {
+      bits |= 0x8000;
+    }
+    *slot = f16::from_bits(bits).to_f32();
+  }
+  let (ts, mx) = bnns_mass_rule_scalars(&v3, 100).expect("finite max");
+  assert_eq!(ts.to_bits(), 0xb7ae, "timestamp logSumExp scalar (V3)");
+  assert_eq!(mx.to_bits(), 0xc4f2, "text max scalar (V3)");
+}
+
+#[test]
+fn mass_rule_flip_points_match_bnns_scan1() {
+  // probe_massrule2.out near-margin scan1 (16-wide): text -6.0 x8 except
+  // v[3], timestamps -2.25 x8, time_begin = 8. BNNS flips between 0xb17c and
+  // 0xb17d. Red-first note: the OLD f32 rule fired at BOTH (its f32 mass
+  // -0.1706 exceeds both f16 neighbors), so it over-fired at 0xb17c.
+  let mk = |v3_bits: u16| -> Vec<f32> {
+    let mut v = vec![-6.0f32; 16];
+    for x in v[8..16].iter_mut() {
+      *x = -2.25;
+    }
+    v[3] = f16::from_bits(v3_bits).to_f32();
+    v
+  };
+  assert!(
+    timestamp_mass_exceeds_text(&mk(0xb17d), 8),
+    "0xb17d -> fires"
+  );
+  assert!(
+    !timestamp_mass_exceeds_text(&mk(0xb17c), 8),
+    "0xb17c -> does not fire"
+  );
+}
+
+#[test]
+fn mass_rule_flip_points_match_bnns_scan2() {
+  // probe_massrule2.out scan2 (1541-wide): text -8.0 x40 except v[7],
+  // timestamps -9.5 x1501, time_begin = 40. BNNS flips between 0xc05e and
+  // 0xc05f. Red-first note: the OLD f32 rule fired at NEITHER (its f32 mass
+  // -2.1862 is below both f16 neighbors), so it under-fired at 0xc05f.
+  let mk = |v7_bits: u16| -> Vec<f32> {
+    let mut v = vec![-8.0f32; 1541];
+    for x in v[40..1541].iter_mut() {
+      *x = -9.5;
+    }
+    v[7] = f16::from_bits(v7_bits).to_f32();
+    v
+  };
+  assert!(
+    timestamp_mass_exceeds_text(&mk(0xc05f), 40),
+    "0xc05f -> fires"
+  );
+  assert!(
+    !timestamp_mass_exceeds_text(&mk(0xc05e), 40),
+    "0xc05e -> does not fire"
+  );
+}
+
+#[test]
+fn mass_rule_sub_f16_margin_no_longer_resolved_in_f32() {
+  // THE #41 divergence channel, in one test. Two equal top text logits
+  // (indices 0,1 = 0.0) and a single timestamp (index 8 = 0.0001) a hair
+  // above them: the true f32 timestamp-vs-text margin is +1e-4, so the OLD
+  // f32 rule FIRED, but both normalized comparands round to the same f16
+  // (0xbc65 ~ -ln 3), so the new rule resolves them EQUAL and does not fire.
+  // Margin 1e-4 < half an f16 ulp (2^-11 ~ 4.9e-4) at this magnitude -- the
+  // exact sub-f16-margin the old rule resolved in f32 and Swift never could.
+  let mut logits = vec![f32::NEG_INFINITY; 12];
+  logits[0] = 0.0;
+  logits[1] = 0.0;
+  logits[8] = 0.0001;
+  let (ts, mx) = bnns_mass_rule_scalars(&logits, 8).expect("finite max");
+  assert_eq!(ts.to_bits(), mx.to_bits(), "comparands collapse to one f16");
+  assert!(
+    !timestamp_mass_exceeds_text(&logits, 8),
+    "sub-f16-ulp positive margin no longer fires (the old f32 rule did)"
+  );
+}
+
+#[test]
+fn mass_rule_all_masked_never_fires() {
+  // Every entry -inf: the None guard yields false (probed LSE(all -inf) = -inf).
+  assert!(!timestamp_mass_exceeds_text(&[f32::NEG_INFINITY; 16], 8));
+}
+
+#[test]
+fn mass_rule_masked_timestamp_region_never_fires() {
+  // Finite text, all-(-inf) timestamps -> ts_sum = 0 -> ts = -inf -> false
+  // (probed LSE(all -inf) = -inf).
+  let mut v = vec![f32::NEG_INFINITY; 16];
+  v[0] = 1.0;
+  v[3] = 0.5;
+  assert!(!timestamp_mass_exceeds_text(&v, 8));
+}
+
+#[test]
+fn mass_rule_all_masked_text_fires() {
+  // All-(-inf) text, finite timestamps -> the finite ts scalar exceeds mx.
+  // (Probed BNNS quirk: .max(all -inf) = -65504, not -inf; boolean-immaterial
+  // -- this port's mx is -inf here, and the finite ts exceeds both.)
+  let mut v = vec![f32::NEG_INFINITY; 16];
+  v[10] = 1.0;
+  v[12] = 0.5;
+  assert!(timestamp_mass_exceeds_text(&v, 8));
+}
+
+#[test]
+fn mass_rule_nan_poisons_to_non_firing() {
+  // NaN anywhere -> the comparison is poisoned to non-firing. Contract: BNNS
+  // skips NaN lanes in its normalizer, this port poisons to false; both never
+  // fire (the scalars differ), and a model emitting NaN logits is already
+  // undefined upstream. Without the NaN this config (favored timestamps)
+  // would fire; the NaN is what suppresses it.
+  let mut v = vec![0.0f32; 16];
+  for x in v[8..16].iter_mut() {
+    *x = 1.0;
+  }
+  v[10] = f32::NAN;
+  assert!(!timestamp_mass_exceeds_text(&v, 8));
 }
 
 #[test]

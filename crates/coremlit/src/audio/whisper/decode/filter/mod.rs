@@ -7,9 +7,15 @@
 //! Swift's protocol method mutates and returns the same `MLMultiArray`
 //! (`filterLogits(_:withTokens:) -> MLMultiArray`) to support chaining;
 //! [`LogitsFilter::filter`] instead mutates `logits: &mut [f32]` in place
-//! and returns nothing. The buffer is plain `f32` math throughout, not
-//! BNNS `FloatType` — the f16→f32 conversion already happened at the
-//! backend boundary (spec §4.8; see [`crate::audio::whisper::backend`]).
+//! and returns nothing. The masking logic is plain `f32` — the f16→f32
+//! conversion already happened at the backend boundary (see
+//! [`crate::audio::whisper::backend`]). The one place precision is
+//! load-bearing is the timestamp-mass comparison
+//! (`bnns_mass_rule_scalars`), which deliberately replicates the f16
+//! rounding *structure* of Swift's BNNS pipeline rather than comparing in
+//! f32 — see that function's doc for the probed contract.
+
+use half::f16;
 
 use crate::audio::whisper::tokenizer::SpecialTokens;
 
@@ -230,28 +236,75 @@ impl LogitsFilter for TimestampRulesFilter {
   }
 }
 
-/// Numerically stable equivalent of the BNNS `logSoftmax` +
-/// `logSumExp`/`max` reduction pair Swift runs to decide whether the
-/// timestamp region's combined probability mass exceeds every individual
-/// text token's (`LogitsFilter.swift:144-242`), computed here as plain
-/// `f32` math via [`super::log_sum_exp`] instead of BNNS (spec §4.8).
-/// `logits[time_begin..]` is the timestamp region, `logits[..time_begin]`
-/// the text region.
-fn timestamp_mass_exceeds_text(logits: &[f32], time_begin: usize) -> bool {
-  let log_z = super::log_sum_exp(logits);
-  if !log_z.is_finite() {
-    // Every entry is masked (-inf): there is no distribution to compare.
-    return false;
+/// The two `Float16` comparands of Swift's timestamp-mass rule
+/// (`LogitsFilter.swift:144-242`), replicated at BNNS's probed precision
+/// structure (tests/whisper_swift_probes/probe_massrule2.out, macOS 26.5/M1
+/// Max): BNNS computes internally in f32 and rounds to f16 only at each
+/// operation's output — a stable (max-subtracted) `logSoftmax` over the full
+/// vector rounded per-element to f16, a NAIVE (no max subtraction; probed:
+/// `LSE([-110 x1101]) = -inf`, not the stable `-103`) f32 sum-of-exp over the
+/// f16 timestamp logprobs rounded to f16, and an exact max over the f16 text
+/// logprobs. `logits[time_begin..]` is the timestamp region,
+/// `logits[..time_begin]` the text region.
+///
+/// Returns `None` when the whole vector is masked (Swift's pipeline then
+/// yields NaN/-inf comparands and never fires; callers treat `None` as "don't
+/// fire"). NaN logits are outside the parity contract: BNNS skips NaN lanes in
+/// its normalizer, this port poisons the comparison to non-firing — both never
+/// fire, but the scalars differ; a model emitting NaN logits is already
+/// undefined upstream.
+///
+/// Numeric domain (all probe-verified): `sum >= 1` always (the max element
+/// contributes `exp(0)`), so `l` is finite in `[0, ln(vocab)]`; inputs are
+/// exact f16 values `<= 65504` so no overflow; a fully-masked timestamp region
+/// gives `ts_sum = 0 -> ts = -inf -> false`, exactly BNNS's probed
+/// `LSE(all -inf) = -inf`. The per-element `v - m - l` double-subtraction is
+/// the probed formula (probe emuA; `v - (m + l)` was indistinguishable).
+fn bnns_mass_rule_scalars(logits: &[f32], time_begin: usize) -> Option<(f16, f16)> {
+  let m = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+  if !m.is_finite() {
+    return None;
   }
+  let mut sum = 0f32;
+  for &v in logits {
+    sum += (v - m).exp();
+  }
+  let l = sum.ln();
+  // Timestamp scalar: BNNS `.logSumExp` (naive) over f16-rounded logprobs.
+  let mut ts_sum = 0f32;
+  for &v in &logits[time_begin..] {
+    ts_sum += f16::from_f32(v - m - l).to_f32().exp();
+  }
+  let ts = f16::from_f32(ts_sum.ln());
+  // Text scalar: BNNS `.max` over f16-rounded logprobs. (Probed BNNS quirk:
+  // an all-(-inf) input returns -65504, not -inf — boolean-immaterial, the
+  // timestamp scalar is then finite and exceeds both; plain max here.)
+  let mut mx = f16::NEG_INFINITY;
+  for &v in &logits[..time_begin] {
+    let lp = f16::from_f32(v - m - l);
+    if lp > mx {
+      mx = lp;
+    }
+  }
+  Some((ts, mx))
+}
 
-  let timestamp_logprob = super::log_sum_exp(&logits[time_begin..]) - log_z;
-  let max_text_logprob = logits[..time_begin]
-    .iter()
-    .copied()
-    .fold(f32::NEG_INFINITY, f32::max)
-    - log_z;
-
-  timestamp_logprob > max_text_logprob
+/// Whether the timestamp region's combined probability mass exceeds every
+/// individual text token's, deciding whether text is masked so a timestamp is
+/// forced (`LogitsFilter.swift:124-127` + `144-242`). Compares the two
+/// f16-rounded scalars of [`bnns_mass_rule_scalars`]; a fully-masked vector
+/// (`None`) does not fire. This resolves the margin on the same f16 grid as
+/// Swift instead of in f32 — the #41 rank-1 token-divergence channel. Bounded
+/// parity contract: boolean agreement with Swift's BNNS pipeline except where
+/// BNNS's unspecified f32 vector-kernel rounding differs from sequential libm
+/// by enough to cross the f16 rounding boundary of a comparand; empirically
+/// `<= 0.3%` of deliberately margin-straddling adversarial inputs, 0 observed
+/// on ordinary inputs and at both probed flip-point scans.
+fn timestamp_mass_exceeds_text(logits: &[f32], time_begin: usize) -> bool {
+  match bnns_mass_rule_scalars(logits, time_begin) {
+    Some((ts, mx)) => ts > mx,
+    None => false,
+  }
 }
 
 // ---------------------------------------------------------------------
