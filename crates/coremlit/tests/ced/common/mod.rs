@@ -35,9 +35,11 @@ const MINI_REVISION: &str = "26c3ebcae85d4330f4fc26763f029539a3afcda0";
 const SMALL_REVISION: &str = "06bb40c5ec089e96867ebc5246be02441f4a71e4";
 const BASE_REVISION: &str = "db3e14a8db4c21b56b165261c39649741a900e7f";
 
-/// The HF revision the given size's artifact and per-file SHA-256 pins are
-/// recorded at (a placeholder until that size's Wave-C upload). Totality is
-/// compiler-enforced by the closed [`CedModel`] enum.
+/// The HF SOURCE revision the given size's artifact and per-file SHA-256 pins
+/// were converted from (commit SHA; see the per-const comment above) — an
+/// artifact-repo revision is a separate, later addition if the owner
+/// re-uploads the compiled bundles publicly. Totality is compiler-enforced by
+/// the closed [`CedModel`] enum.
 #[allow(dead_code)]
 pub const fn ced_revision(model: CedModel) -> &'static str {
   match model {
@@ -134,7 +136,8 @@ pub struct OracleProvenance {
 #[derive(Debug, serde::Deserialize)]
 #[allow(dead_code)]
 pub struct GoldenCorpus {
-  /// Which `mispeech/ced-<size>` ONNX oracle produced `clips`' logits.
+  /// Which `mispeech/ced-<size>` PyTorch fp32 CPU oracle (`model.safetensors`)
+  /// produced `clips`' logits.
   pub oracle: OracleProvenance,
   /// The golden clips (≥ 1 sub-window + ≥ 1 full-window — spec §7).
   pub clips: Vec<GoldenClip>,

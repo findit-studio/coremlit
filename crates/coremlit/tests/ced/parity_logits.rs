@@ -14,11 +14,13 @@
 //! with margin — never loosened; a shift in either direction is a finding.
 //!
 //! The **CpuOnly** arm is PRIMARY: the shipped graph is fp16, but CoreML computes
-//! it in ~fp32 on the CPU, so this arm is the tight parity gate vs the PyTorch
-//! fp32 goldens (residual = the Rust f64 mel vs the torchaudio f32 mel + the
-//! fp16 weight quantization). The **default-compute** (`All` ⇒ ANE/GPU) arm is
-//! true fp16 and characterized in its own, wider band. Negative control: a
-//! mismatched clip↔golden pair scores far below the matched floor.
+//! it in ~fp32 on the CPU, making this the deterministic REFERENCE arm vs the
+//! PyTorch fp32 goldens (residual = the Rust f64 mel vs the torchaudio f32 mel +
+//! the fp16 weight quantization) — reference, not tightest: the measured envelope
+//! shows the **default-compute** (`All` ⇒ ANE/GPU) arm actually lands closer to
+//! the goldens (worst cos 0.99999988 vs CpuOnly's 0.99999803), characterized in
+//! its own band below. Negative control: a mismatched clip↔golden pair scores
+//! far below the matched floor.
 
 mod common;
 
@@ -144,16 +146,25 @@ fn parity_arm(
 
   // Negative control (non-vacuity): the two most distinct clips (a 440 Hz sine
   // vs 2 s of silence) must cross-score FAR below the matched floor, proving the
-  // gate is not vacuously passing identical vectors.
-  let find = |id: &str| corpus.clips.iter().position(|c| c.id == id);
-  if let (Some(si), Some(zi)) = (find("sine440_10s"), find("silence_2s")) {
-    let cross = common::cosine_checked(&produced[si], &corpus.clips[zi].logits);
-    println!("[{label}] {model} non-vacuity cos(sine440 logits, silence golden)={cross:.6}");
-    assert!(
-      cross < MISMATCH_COS_CEIL,
-      "[{label}] {model}: mismatched pair cos {cross:.6} not < {MISMATCH_COS_CEIL} (vacuous gate?)"
-    );
-  }
+  // gate is not vacuously passing identical vectors. Both ids are REQUIRED in
+  // every committed corpus — assert their presence rather than silently skipping
+  // the check, which would let the gate go vacuous without anyone noticing.
+  let find = |id: &str| {
+    corpus
+      .clips
+      .iter()
+      .position(|c| c.id == id)
+      .unwrap_or_else(|| {
+        panic!("[{label}] {model}: golden corpus missing required negative-control clip `{id}`")
+      })
+  };
+  let (si, zi) = (find("sine440_10s"), find("silence_2s"));
+  let cross = common::cosine_checked(&produced[si], &corpus.clips[zi].logits);
+  println!("[{label}] {model} non-vacuity cos(sine440 logits, silence golden)={cross:.6}");
+  assert!(
+    cross < MISMATCH_COS_CEIL,
+    "[{label}] {model}: mismatched pair cos {cross:.6} not < {MISMATCH_COS_CEIL} (vacuous gate?)"
+  );
 }
 
 /// PRIMARY: the CpuOnly arm holds the tight logit-parity band vs the PyTorch fp32

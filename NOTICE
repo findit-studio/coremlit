@@ -8,11 +8,12 @@ NOTE: coremlit ships NO model weight files, but embeddings::clap,
 embeddings::granite, and embeddings::siglip each BUNDLE a third-party tokenizer
 artifact (via include_bytes! — sections 6b, 7b, and 8b). Each feature-gated
 pipeline (audio::whisper / audio::align / audio::speaker / audio::vad /
-embeddings::clap / embeddings::granite / embeddings::siglip) otherwise LOADS, at
-runtime, CoreML model artifacts that a downstream user fetches separately from
-Hugging Face (see the crate README and each module's model_io tests for the repo
-id, revision, and per-file SHA-256). This NOTICE records the attribution a binary
-that distributes or bundles those components must honor.
+audio::ced / embeddings::clap / embeddings::granite / embeddings::siglip)
+otherwise LOADS, at runtime, CoreML model artifacts that a downstream user
+fetches separately from Hugging Face (see the crate README and each module's
+model_io tests for the repo id, revision, and per-file SHA-256). This NOTICE
+records the attribution a binary that distributes or bundles those components
+must honor.
 
 Sections 1-2 (the audio::vad models) are preserved verbatim from the former
 vadkit NOTICE. Sections 3-5 record the whisper, speaker, and align model
@@ -21,7 +22,8 @@ CLAP audio+text encoder weights and the bundled Xenova tokenizer, folded in by
 the clapkit port. Section 7 records the granite text-embedding encoder and its
 bundled tokenizer, added by the embedkit phase. Section 8 records the SigLIP 2
 image+text encoder weights and the bundled Gemma tokenizer, added by the siglip
-phase. Both audio::vad components below are MIT.
+phase. Section 9 records the CED source-model attribution, added by the CED
+port. Both audio::vad components below are MIT.
 
 ────────────────────────────────────────────────────────────────────────
 1. Silero VAD (upstream model)
