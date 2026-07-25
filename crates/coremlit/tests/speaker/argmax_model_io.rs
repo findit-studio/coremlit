@@ -117,12 +117,30 @@
 //!    own, unrelated `PLDA.mlmodelc` — the two sources don't share a
 //!    contract here either, consistent with them being unrelated
 //!    conversions (pyannote-v4 vs. FluidAudio's own). This is argmax's own
-//!    PLDA, and unlike FluidAudio's it is fp16-SAFE, hence its absence from
-//!    `fp16_guards`' `KNOWN_DEFECTS`: both its normalizations do carry a
+//!    PLDA, and it PASSES THE STATIC MINIMUM-SUBNORMAL GUARD where the
+//!    FluidAudio pair does not — which is why it carries no `fp16_guards`
+//!    `KNOWN_DEFECTS` pin and they do. Both its normalizations do carry a
 //!    1e-12 `rsqrt` epsilon, but each sits behind an `add(variance, 1e-6)`
-//!    on its input, and 1e-6 clears fp16's smallest subnormal by ~17x. The
-//!    FluidAudio pair's only floor is the 1e-12 `clip` itself, which is why
-//!    they are pinned and this is not.
+//!    on that op's input, and 1e-6 is representable in fp16 at ~17x the
+//!    smallest subnormal (`2^-24`); the FluidAudio pair's only floor is
+//!    the bare 1e-12 `clip` itself. That contrast is solid, and it is the
+//!    whole reason for the differing pin status.
+//!
+//!    Do NOT restate that as "fp16-safe". An earlier revision of this doc
+//!    did, as did issue #16; both are corrected, and this is the wording
+//!    they agree on. **Established:** static representability — this
+//!    graph clears the check `fp16_guards` actually performs, which reads
+//!    the MIL text and compares floors against `2^-24`. **Not
+//!    established:** runtime safety. 1e-6 is itself SUBNORMAL in fp16 (it
+//!    is below `2^-14`, fp16's smallest NORMAL), and `fp16_guards` records
+//!    at its `FP16_MIN_NORMAL` constant that some kernels flush subnormals
+//!    to zero; on such a kernel, with a zero variance, the 1e-6 floor and
+//!    the 1e-12 epsilon vanish together and the `rsqrt` takes a bare 0,
+//!    i.e. `1/sqrt(0)`.
+//!    **What would settle it:** a runtime placement test feeding
+//!    zero-variance input on the intended compute units and checking the
+//!    output. No such test exists, and none is warranted while nothing in
+//!    this crate loads this graph.
 //! 5. None of the seven artifacts declare any shape flexibility
 //!    (`hasShapeFlexibility: "0"` on every input/output in every
 //!    `metadata.json`) — unlike some of `tests/model_io.rs`'s
