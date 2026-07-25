@@ -228,7 +228,9 @@
 //!   [`DecodingOptions::seed`](options::DecodingOptions::seed) left `None` (the default) this port's
 //!   sampler matches that non-determinism
 //!   ([`GreedyTokenSampler::new`](decode::sampler::GreedyTokenSampler::new)
-//!   seeds from the OS via `StdRng::from_os_rng`) — two identical unseeded
+//!   seeds from the OS (`StdRng::from_rng` fed the OS-seeded
+//!   `rand::rng()` thread RNG, so its full internal state is OS-derived,
+//!   not just a 64-bit value) — two identical unseeded
 //!   runs that fall back can legitimately differ, by design, exactly like
 //!   Swift, and this is the byte-unchanged default path. Setting
 //!   [`DecodingOptions::seed`](options::DecodingOptions::seed) to `Some(_)` makes the full

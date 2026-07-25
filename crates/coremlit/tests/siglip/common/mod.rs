@@ -251,10 +251,16 @@ pub fn assert_exact_sha_manifest(dir: &Path, cases: &[(&str, &str)]) {
 #[allow(dead_code)]
 pub fn decode_png_rgb8(path: &Path) -> (Vec<u8>, usize, usize) {
   let file = std::fs::File::open(path).unwrap_or_else(|e| panic!("open {path:?}: {e}"));
-  let mut reader = png::Decoder::new(file)
+  // png 0.18's `Decoder::new` requires `BufRead + Seek`; `File` is `Read + Seek`
+  // only, so wrap it in a `BufReader`.
+  let mut reader = png::Decoder::new(std::io::BufReader::new(file))
     .read_info()
     .unwrap_or_else(|e| panic!("read png header {path:?}: {e}"));
-  let mut buf = vec![0u8; reader.output_buffer_size()];
+  // `output_buffer_size` returns `Option<usize>` in png 0.18 (`None` on overflow).
+  let out_size = reader
+    .output_buffer_size()
+    .unwrap_or_else(|| panic!("png output buffer size unavailable {path:?}"));
+  let mut buf = vec![0u8; out_size];
   let info = reader
     .next_frame(&mut buf)
     .unwrap_or_else(|e| panic!("decode png {path:?}: {e}"));
