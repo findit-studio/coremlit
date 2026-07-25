@@ -903,3 +903,77 @@ fn k5_free_soup_exercises_index_path() {
     out.len()
   );
 }
+
+/// codex #57 (perf) — an OVERSIZED single pre-token double-encoded every probe.
+/// A multi-megabyte lowercase run is ONE word-branch pre-token (`pretoken_ends ==
+/// [n]`), so no interior full-parse boundary exists for any cut to land on. windit's
+/// char fallback then measures growing prefixes `[a, b)` with `0 < a < b < n`; each
+/// makes `left_resync` cap its window at `b` and encode the whole `[a, b)`, find no
+/// boundary, and — pre-fix — return `None`, whereupon the caller RE-ENCODED the
+/// identical `[a, b)`: two tokenizer encodes of the same range per probe. The fix
+/// hands that window's own already-computed whole-query count back
+/// (`Resync::WholeQuery`) so the caller reuses it: ONE encode per probe.
+///
+/// RED pre-fix / GREEN post-fix, asserted on the hermetic encode meter: each probe
+/// now encodes its range EXACTLY ONCE (`calls == 1`, `bytes == b - a`) where the
+/// pre-fix double-encode metered `calls == 2`, `bytes == 2 * (b - a)`. The reused
+/// count stays output-identical — spot-checked against the direct oracle here, and
+/// swept over the full killer differential (`measure_range == encode`) elsewhere.
+#[test]
+fn oversized_single_pretoken_encodes_each_probe_once() {
+  let tok = measuring_tok();
+  // A multi-megabyte single unbroken pre-token: the lowercase run matches one
+  // word-branch span, so the whole input tiles as ONE pre-token.
+  let n = 4 * 1024 * 1024;
+  let text = "a".repeat(n);
+  let index = TokenIndex::build(&tok, &text).expect("build");
+  assert!(
+    !index.direct_only,
+    "'a'*n stays on the live index path (no dropped byte, no added literal)"
+  );
+  assert_eq!(
+    index.pretoken_ends.len(),
+    1,
+    "the oversized-single case requires the whole input to be ONE pre-token"
+  );
+
+  // windit's char-fallback probe shape: a growing prefix from a fixed post-first
+  // segment start, plus interior windows and one reaching the last char — every
+  // one has `0 < a < b < n` and no interior boundary, so each takes the reuse path.
+  let probes = [
+    (1_000usize, 1_001usize), // minimal window
+    (1_000, 1_010),
+    (1_000, 11_000),
+    (1_000, 211_000),       // a large growing prefix
+    (2_000_000, 2_050_000), // an interior window far from the start
+    (n - 50, n - 1),        // b at the last char (still strictly < n)
+  ];
+  for &(a, b) in &probes {
+    super::encode_meter::reset();
+    let got = index
+      .measure_range(&tok, &text, a, b)
+      .expect("measure_range must not fail on the granite tokenizer");
+    let calls = super::encode_meter::calls();
+    let bytes = super::encode_meter::get();
+    // ONE encode of EXACTLY the probe range — the single-encode property (pre-fix:
+    // 2 calls, 2*(b-a) bytes).
+    assert_eq!(
+      calls, 1,
+      "probe [{a},{b}) must encode ONCE, not twice: metered {calls} encode calls"
+    );
+    assert_eq!(
+      bytes,
+      b - a,
+      "probe [{a},{b}) must encode exactly its own {} bytes once, not {} (the pre-fix \
+       double-encode)",
+      b - a,
+      2 * (b - a)
+    );
+    // Output identity: the reused whole-query count equals a fresh direct encode.
+    assert_eq!(
+      got,
+      oracle(&tok, &text[a..b]),
+      "reused whole-query count must equal encode(&text[{a}..{b}], true).len()"
+    );
+  }
+}

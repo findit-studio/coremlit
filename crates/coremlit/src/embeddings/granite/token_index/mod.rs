@@ -123,11 +123,13 @@ pub(crate) mod encode_meter {
 
   thread_local! {
     static BYTES: Cell<usize> = const { Cell::new(0) };
+    static CALLS: Cell<usize> = const { Cell::new(0) };
   }
 
-  /// Zero the per-thread counter before a measured run.
+  /// Zero the per-thread counters before a measured run.
   pub(crate) fn reset() {
     BYTES.with(|b| b.set(0));
+    CALLS.with(|c| c.set(0));
   }
 
   /// The bytes encoded since the last [`reset`].
@@ -135,9 +137,18 @@ pub(crate) mod encode_meter {
     BYTES.with(Cell::get)
   }
 
-  /// Record `n` encoded bytes.
+  /// The number of measurement-path `encode` calls since the last [`reset`] — one
+  /// per [`add`], so a range encoded twice shows as two calls where the single-pass
+  /// path performs one.
+  pub(crate) fn calls() -> usize {
+    CALLS.with(Cell::get)
+  }
+
+  /// Record one `encode` of `n` bytes: bump both the byte total and the call count
+  /// (every measurement-path encode calls this exactly once).
   pub(crate) fn add(n: usize) {
     BYTES.with(|b| b.set(b.get().saturating_add(n)));
+    CALLS.with(|c| c.set(c.get().saturating_add(1)));
   }
 }
 
@@ -186,6 +197,25 @@ pub(crate) struct TokenIndex {
   /// Unreachable for the pinned granite tokenizer on real text; insurance, not a
   /// path to design around.
   direct_only: bool,
+}
+
+/// The outcome of [`TokenIndex::left_resync`]. Three cases the caller handles
+/// distinctly, so the shared-boundary count and the whole-query reuse count are
+/// never conflated with the "must re-encode" signal.
+enum Resync {
+  /// A shared boundary `z` — a pre-token boundary of BOTH `text[a..]`'s parse and
+  /// the full parse — was found; `count` is the content-token count of `[a, z)`.
+  /// The caller resumes the interior/right decomposition from `z`.
+  Boundary { z: usize, count: usize },
+  /// The re-sync window WAS the whole query `[a, b)` (`hi == b`) and held no
+  /// interior shared boundary, so its own encode already produced the exact
+  /// whole-query content-token count. The caller returns `count + 2` (the two
+  /// template specials) directly, WITHOUT re-encoding the identical `[a, b)`.
+  WholeQuery { count: usize },
+  /// No reusable result — the window was a proper prefix (`hi < b`) with no usable
+  /// boundary, or the defensive empty-window guard — so the caller encodes `[a, b)`
+  /// whole. Unreachable for the pinned tokenizer.
+  Direct,
 }
 
 impl TokenIndex {
@@ -432,14 +462,24 @@ impl TokenIndex {
         while pp + 1 < n && self.digit[pp + 1] {
           pp += 1;
         }
-        if let Some((zz, cnt)) = self.left_resync(tok, text, a, b, pp)? {
-          z = zz;
-          i = ends.partition_point(|&e| e <= zz as u32);
-          left_count = cnt;
-        } else {
-          // No shared boundary inside the bounded window (unreachable for the
-          // pinned tokenizer): the always-exact whole-substring encode.
-          return Ok(encode_content_len(tok, &text[a..b])? + 2);
+        match self.left_resync(tok, text, a, b, pp)? {
+          Resync::Boundary { z: zz, count: cnt } => {
+            z = zz;
+            i = ends.partition_point(|&e| e <= zz as u32);
+            left_count = cnt;
+          }
+          Resync::WholeQuery { count } => {
+            // The window was the whole query and held no interior boundary, so
+            // `left_resync`'s own encode already counted `[a, b)` exactly — reuse
+            // it plus the two template specials instead of re-encoding the
+            // identical oversized single pre-token (codex #57).
+            return Ok(count + 2);
+          }
+          Resync::Direct => {
+            // No shared boundary inside the bounded window (unreachable for the
+            // pinned tokenizer): the always-exact whole-substring encode.
+            return Ok(encode_content_len(tok, &text[a..b])? + 2);
+          }
         }
       }
     }
@@ -503,22 +543,28 @@ impl TokenIndex {
     Ok(total + 2)
   }
 
-  /// The inside-pre-token re-sync: re-encode a bounded window from `a` and return
-  /// `(z, count)` where `z` is the first position that is a pre-token boundary of
-  /// BOTH `text[a..]`'s parse (a word-id change) and the full parse, and `count`
-  /// is the content-token count of `[a, z)` read off that same encode. EVERY cut
-  /// strictly inside a pre-token takes this path — no char-class test pre-screens
-  /// it — so a dissolved boundary (a forward-attached punct char, a contraction
-  /// suffix's letters, a re-anchored digit triplet) is always re-synced, never
-  /// trusted.
+  /// The inside-pre-token re-sync: re-encode a bounded window from `a` and report a
+  /// [`Resync`]. On [`Resync::Boundary`] `{ z, count }`, `z` is the first position
+  /// that is a pre-token boundary of BOTH `text[a..]`'s parse (a word-id change)
+  /// and the full parse, and `count` is the content-token count of `[a, z)` read
+  /// off that same encode. EVERY cut strictly inside a pre-token takes this path —
+  /// no char-class test pre-screens it — so a dissolved boundary (a forward-attached
+  /// punct char, a contraction suffix's letters, a re-anchored digit triplet) is
+  /// always re-synced, never trusted.
   ///
   /// The window ends two pre-tokens past the digit-extended `pp` (capped at `b`) —
   /// the forward-attachment reach is one pre-token, so a surviving boundary is
   /// found with margin. A boundary at the window's own right edge (`abs == hi`)
   /// with `hi < b` is REJECTED: the window's EOS can merge a whitespace run that
   /// `[a, b)` keeps split (the `\s+(?!\S)` mechanism), so it need not be a boundary
-  /// of `[a, b)`'s parse and its count can be stale. `None` (unreachable for the
-  /// pinned tokenizer) tells the caller to encode `[a, b)` whole.
+  /// of `[a, b)`'s parse and its count can be stale.
+  ///
+  /// When no usable interior boundary is found and the window WAS the whole query
+  /// (`hi == b`, the oversized single-pre-token case), this same encode already
+  /// counted `[a, b)` exactly, returned as [`Resync::WholeQuery`] so the caller
+  /// reuses it rather than re-encoding the identical range (codex #57). Otherwise
+  /// [`Resync::Direct`] (unreachable for the pinned tokenizer) tells the caller to
+  /// encode `[a, b)` whole.
   ///
   /// # Errors
   /// [`Error::Tokenize`] if the windowed encode fails.
@@ -529,12 +575,12 @@ impl TokenIndex {
     a: usize,
     b: usize,
     pp: usize,
-  ) -> Result<Option<(usize, usize)>> {
+  ) -> Result<Resync> {
     let ends = &self.pretoken_ends;
     let n = ends.len();
     let hi = (ends[(pp + 2).min(n - 1)] as usize).min(b);
     if hi <= a {
-      return Ok(None);
+      return Ok(Resync::Direct);
     }
     #[cfg(test)]
     encode_meter::add(hi - a);
@@ -554,12 +600,24 @@ impl TokenIndex {
         // `\s+(?!\S)` mechanism), so `abs` need not be a boundary of `[a, b)`'s
         // parse and `k + 1` may miscount — reject and encode `[a, b)` whole.
         if abs == hi && hi < b {
-          return Ok(None);
+          return Ok(Resync::Direct);
         }
-        return Ok(Some((abs, k + 1)));
+        return Ok(Resync::Boundary {
+          z: abs,
+          count: k + 1,
+        });
       }
     }
-    Ok(None)
+    // No usable interior boundary. When the window WAS the whole query (`hi == b`),
+    // this encode already counted `[a, b)` exactly (`m` == `encode(&text[a..b],
+    // false).len()`), so hand `m` back and let the caller skip a second identical
+    // encode of an oversized single pre-token (codex #57). Otherwise the window was
+    // a proper prefix carrying no whole-query count → direct.
+    if hi == b {
+      Ok(Resync::WholeQuery { count: m })
+    } else {
+      Ok(Resync::Direct)
+    }
   }
 
   /// Whether `pos` is a full-parse pre-token boundary (`0`, or an entry of
