@@ -10,7 +10,7 @@ use crate::{ComputeUnits, DataType, Model, MultiArray};
 
 use crate::embeddings::clap::{
   embedding::{EMBEDDING_DIM, Embedding, check_finite_output},
-  error::{Error, Result},
+  error::{Error, Result, WinditError},
   window::{WindowEmbedding, WindowPlan},
 };
 
@@ -265,17 +265,31 @@ impl AudioEncoder {
   ///
   /// # Errors
   /// [`Error::EmptyAudio`] if `samples` is empty;
-  /// [`Error::Windowing`]`(`[`WinditError::TooManyWindows`](crate::embeddings::clap::error::WinditError::TooManyWindows)`)`
+  /// [`Error::Windowing`]`(`[`WinditError::TooManyWindows`]`)`
   /// if `plan` would plan more than its
   /// [`max_windows`](crate::embeddings::clap::WindowPlan::max_windows) over this clip (the
-  /// resource rail — refused before any window is embedded); otherwise any error
-  /// [`Self::embed_window`] raises for a window.
+  /// resource rail — refused before any window is embedded), or
+  /// [`Error::Windowing`]`(`[`WinditError::AllocFailed`]`)`
+  /// if an admitted (at-cap) plan's output vector cannot be reserved — done
+  /// fallibly, so an allocator refusal is typed rather than a process abort;
+  /// otherwise any error [`Self::embed_window`] raises for a window.
   pub fn embed_windows(&self, samples: &[f32], plan: &WindowPlan) -> Result<Vec<WindowEmbedding>> {
     if samples.is_empty() {
       return Err(Error::EmptyAudio);
     }
     let spans = plan.spans(samples.len())?;
-    let mut out = Vec::with_capacity(spans.len());
+    // The at-cap plan can name up to `plan.max_windows` spans, each an inline
+    // ~2 KiB `WindowEmbedding` — hundreds of MiB for a small clip. Reserve it
+    // FALLIBLY (mirroring `spans()` itself), so an allocator refusal surfaces as
+    // the typed `AllocFailed` rather than aborting the process the way the prior
+    // infallible `with_capacity` would. The reservation is exact, so the in-loop
+    // `push`es stay within capacity and never reallocate.
+    let mut out = Vec::new();
+    out.try_reserve_exact(spans.len()).map_err(|_| {
+      Error::Windowing(WinditError::AllocFailed {
+        elements: spans.len(),
+      })
+    })?;
     for span in spans {
       let embedding = self.embed_window(&samples[span.start()..span.end()])?;
       out.push(WindowEmbedding::new(embedding, span));
