@@ -101,8 +101,14 @@ CoreML and feeds dia's community-1 PLDA clustering. Attribution obligations:
   - pyannote/segmentation-3.0 (both sources' segmenters derive from it): MIT.
   - WeSpeaker embedder (wenet-e2e/wespeaker): see its model license
     (https://github.com/wenet-e2e/wespeaker).
-  - FluidInference/speaker-diarization-coreml (the default source's CoreML
-    conversion): SDK Apache-2.0; parent pyannote model cc-by-4.0.
+  - FinDIT-Studio/speakerkit-coreml (the SEGMENTATION artifact only,
+    pyannote_segmentation.mlmodelc): HF license "other"/mixed-upstream. A
+    re-conversion of the same segmentation-3.0 weights with an fp16-survivable
+    log-softmax tail, so the upstream term above (MIT) still governs.
+  - FluidInference/speaker-diarization-coreml (the CoreML conversion this crate
+    was built against, and still the source of every other speakerkit artifact
+    including the shipping WeSpeaker embedder): SDK Apache-2.0; parent pyannote
+    model cc-by-4.0.
   - argmaxinc/speakerkit-coreml (the optional argmax source's conversion):
     NO declared license on the HF repo — undeclared defaults to all rights
     reserved on the converted artifact; argmax's Swift code

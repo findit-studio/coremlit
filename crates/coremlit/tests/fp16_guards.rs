@@ -54,11 +54,11 @@
 //! manifest EXPLICITLY: there the sweep proves it runs and that the whisper mel
 //! and granite norm controls are clean, but it CANNOT verify the speakerkit /
 //! alignkit / argmax defect pins — those models are not downloaded. Full pin
-//! verification (all ten defect pins) is a local/dev gate that needs the complete
-//! `Models/` tree. The override is fail-closed — absence of it requires ALL
-//! pinned vendors — so narrowing coverage is always an explicit, reviewable act
-//! in ci.yml, never the silent side effect of a deleted directory, which is the
-//! whole point of the manifest.
+//! verification (every [`KNOWN_DEFECTS`] entry) is a local/dev gate that needs
+//! the complete `Models/` tree. The override is fail-closed — absence of it
+//! requires ALL pinned vendors — so narrowing coverage is always an explicit,
+//! reviewable act in ci.yml, never the silent side effect of a deleted
+//! directory, which is the whole point of the manifest.
 //!
 //! When `Models/` is absent the sweep is `ignored`, never a green `ok`
 //! over zero models (see `build.rs`). The parser tests below are hermetic
@@ -706,8 +706,16 @@ struct KnownDefect {
   note: &'static str,
 }
 
-/// Every fp16-vanishing guard in the tree, as of the sweep that created
-/// this gate. Each entry is a defect, not an exemption.
+/// Every fp16-vanishing guard in the tree. Each entry is a defect, not an
+/// exemption.
+///
+/// The sweep that created this gate found ten sites across nine models. ONE of
+/// those models — `speakerkit/pyannote_segmentation` — has since been replaced
+/// by a guard-repaired re-conversion (issue #15) and its pin is gone: that
+/// graph no longer contains a `log` op at all, so there is no epsilon left to
+/// vanish. Every other pin below still stands, including the ones whose
+/// re-conversions exist but are NOT adopted (see the `wespeaker` note, and
+/// `alignkit/base960h_aligner`).
 const KNOWN_DEFECTS: &[KnownDefect] = &[
   KnownDefect {
     path: "alignkit/base960h_aligner.mlmodelc",
@@ -715,14 +723,6 @@ const KNOWN_DEFECTS: &[KnownDefect] = &[
     note: "Decomposed log-softmax; eps 0x1p-149 rounds to 0 in fp16. `emissions` IS the log \
            output, so ANE log(0) -> ~-45440 lands directly in the shipped tensor: 16.7% of \
            output cells corrupted, word timings shifted up to 881 ms.",
-  },
-  KnownDefect {
-    path: "speakerkit/pyannote_segmentation.mlmodelc",
-    sites: &["log/fp16 guard=softmax->log eff=0e0"],
-    note: "The fp16 sibling of Segmentation.mlmodelc: coremltools already folded the epsilon to \
-           a literal 0x0p+0 at conversion. `segments` IS the log output. Worst logit delta \
-           45,422; the shipping diarizer returns 5 of 8 speakers at 16.6% DER where the ONNX \
-           reference is frame-perfect.",
   },
   KnownDefect {
     path: "speakerkit/Segmentation.mlmodelc",
@@ -747,7 +747,11 @@ const KNOWN_DEFECTS: &[KnownDefect] = &[
     note: "Attentive-stat pooling divides by `count + 1e-8` at THREE sites (the weighted mean \
            and the two divisions behind the weighted variance/std). 1e-8 is 0.168x fp16's \
            smallest subnormal, so on the ANE all three divisor guards are zero. Same fp32 \
-           artifact, same input, only CpuOnly -> All: cosine collapses to 0.035.",
+           artifact, same input, only CpuOnly -> All: cosine collapses to 0.035. A guard-repaired \
+           re-conversion is published (FinDIT-Studio/speakerkit-coreml) but is NOT adopted: for \
+           the int8 sibling it is also a RE-PALETTIZATION, and that moves clip 14's shipping \
+           ANE arm from 0.8178 % to 1.4860 % DER — past `parity_shipping_der`'s +-1 pp bound. \
+           Adopting it is an owner call, measured in issue #15, not a silent swap.",
   },
   KnownDefect {
     path: "speakerkit/wespeaker_v2.mlmodelc",
@@ -756,7 +760,8 @@ const KNOWN_DEFECTS: &[KnownDefect] = &[
       "real_div/fp32 guard=denom:add(+9.99999993922529e-9) eff=9.99999993922529e-9",
       "real_div/fp32 guard=denom:add(+9.99999993922529e-9) eff=9.99999993922529e-9",
     ],
-    note: "Same three-site pooling epsilon as wespeaker.mlmodelc.",
+    note: "Same three-site pooling epsilon as wespeaker.mlmodelc — and this is the SHIPPING \
+           embedder, so this is the one that matters.",
   },
   KnownDefect {
     path: "speakerkit/wespeaker_int8.mlmodelc",
@@ -826,14 +831,22 @@ const ALIGNKIT_LOG_SOFTMAX: &str = r#"
             tensor<fp16, [1, 2999, 29]> var_849_cast_fp16 = log(epsilon = var_849_epsilon_0, x = var_849_softmax_cast_fp16)[name = tensor<string, []>("op_849_cast_fp16")];
 "#;
 
-/// `Models/speakerkit/pyannote_segmentation.mlmodelc/model.mil`, lines 137-139.
+/// `speakerkit/pyannote_segmentation.mlmodelc/model.mil` lines 137-139 **as
+/// shipped before the issue-#15 re-conversion** — the shipped graph now ends
+/// `reduce_log_sum_exp` → `sub` and carries no `log` at all. Retained verbatim:
+/// this is the exact text that produced the 8-speaker collapse, and the parser
+/// must keep catching it if it ever reappears from a re-conversion.
 const SPEAKERKIT_SEG_FP16: &str = r#"
             tensor<fp16, [1, 589, 7]> var_231_softmax_cast_fp16 = softmax(axis = var_230, x = linear_2_cast_fp16)[name = tensor<string, []>("op_231_softmax_cast_fp16")];
             tensor<fp16, []> var_231_epsilon_0_to_fp16 = const()[name = tensor<string, []>("op_231_epsilon_0_to_fp16"), val = tensor<fp16, []>(0x0p+0)];
             tensor<fp16, [1, 589, 7]> var_231_cast_fp16 = log(epsilon = var_231_epsilon_0_to_fp16, x = var_231_softmax_cast_fp16)[name = tensor<string, []>("op_231_cast_fp16")];
 "#;
 
-/// `Models/speakerkit/wespeaker.mlmodelc/model.mil`, lines 4444-4450.
+/// `Models/speakerkit/wespeaker.mlmodelc/model.mil`, lines 4444-4450 — still
+/// what ships. The published re-conversion raises this constant (and its
+/// `op_5807` twin) from `0x1.5798eep-27` (1e-8) to `0x1p-24` and leaves every
+/// other byte of the graph and all weights identical, but it is not adopted;
+/// see this model's [`KNOWN_DEFECTS`] note.
 const WESPEAKER_POOLING: &str = r#"
             tensor<fp32, []> var_5790 = const()[name = tensor<string, []>("op_5790"), val = tensor<fp32, []>(0x1.5798eep-27)];
             tensor<fp32, [3, 1]> v1 = add(x = var_5789, y = var_5790)[name = tensor<string, []>("v1")];

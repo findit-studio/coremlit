@@ -139,10 +139,11 @@ pub const FIXTURES: &[Fixture] = &[
 /// documents for the golden's `seg_logits` field name: renaming it would churn
 /// every committed golden (each ~270 KB) for zero behavioral gain, since no
 /// gate reads this string. The values are in fact powerset **log-probabilities**
-/// (`pyannote_segmentation.mlmodelc`'s MIL ends `softmax` → `log`, see
-/// `coremlit::audio::speaker::segment`'s module doc; the committed ORT golden agrees — every
-/// value `<= 0`, every 7-class row `sum(exp(row)) == 1`). Read the string as a
-/// provenance tag, not a claim about the tensor's calibration.
+/// (`pyannote_segmentation.mlmodelc`'s MIL ends `reduce_log_sum_exp` → `sub`,
+/// see `coremlit::audio::speaker::segment`'s module doc; the committed ORT
+/// golden agrees — every value `<= 0`, every 7-class row
+/// `sum(exp(row)) == 1`). Read the string as a provenance tag, not a claim
+/// about the tensor's calibration.
 pub const SEG_MODEL_LABEL: &str =
   "segmentation-3.0.onnx (dia bundled, ort CPU EP, raw powerset logits)";
 
@@ -357,8 +358,9 @@ pub const SEG_ROW_SUM_EXP_TOL: f64 = 1e-4;
 /// each [`POWERSET_CLASSES`]-wide row normalized so `Σ exp = 1` (within
 /// [`SEG_ROW_SUM_EXP_TOL`]).
 ///
-/// dia-ort's segmentation MIL ends `softmax → log` and the CoreML side matches;
-/// the committed goldens store that quantity under the legacy `seg_logits` name.
+/// dia-ort's segmentation graph ends `softmax → log` and the CoreML side emits
+/// the same quantity through the fused `reduce_log_sum_exp → sub` tail; the
+/// committed goldens store it under the legacy `seg_logits` name.
 /// A future model emitting RAW logits (positive values, rows that do not sum-exp
 /// to 1) with the argmax ORDERING preserved would decode to the same speakers yet
 /// break this invariant — which `generate_goldens.rs`'s prose used to only

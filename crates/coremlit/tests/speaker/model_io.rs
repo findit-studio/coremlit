@@ -59,6 +59,50 @@
 //!   above; they are spelled out here so the restoration needs no `git log`
 //!   archaeology.
 //!
+//! # Segmentation provenance (the fp16-safe re-conversion, issue #15)
+//!
+//! `pyannote_segmentation.mlmodelc` — and ONLY that artifact — comes from
+//! <https://huggingface.co/FinDIT-Studio/speakerkit-coreml>, revision (commit
+//! SHA) `3db69988bf2de12bab250614d6ac2b03d35132a2`. Every one of its files is
+//! byte-pinned by [`fp16_safe_segmentation_matches_pinned_sha256`]. Every other
+//! artifact in `Models/speakerkit/` is still FluidInference's
+//! `speaker-diarization-coreml` conversion.
+//!
+//! ```text
+//! hf download FinDIT-Studio/speakerkit-coreml \
+//!   --revision 3db69988bf2de12bab250614d6ac2b03d35132a2 \
+//!   --include 'pyannote_segmentation.mlmodelc/*' --local-dir Models/speakerkit
+//! ```
+//!
+//! It is a **re-conversion of the same upstream weights**, not a different
+//! model. FluidInference's fp16 conversion ended `softmax` →
+//! `log(epsilon = 0x0p+0)`; `0` is below fp16's smallest subnormal (`2^-24`),
+//! so wherever the graph computes in fp16 the guard is inert and an underflowed
+//! softmax reaches an unguarded `log(0)`. Measured on `09_mrbeast_dollar_date`,
+//! 1033 chunks, the shipping `ComputeUnits::All` placement: minimum `segments`
+//! value **−45440.0** against **−32.31** on `CpuOnly`. The re-conversion emits
+//! the fused `reduce_log_sum_exp` → `sub` form — no `log` op at all, nothing to
+//! saturate — and the same measurement gives **−31.80** on `All`.
+//!
+//! **What this swap does NOT do.** It is end-to-end inert on the whole
+//! multi-speaker DER corpus: with only this artifact changed, every gated
+//! number on clips 06 / 09 / 10 / 14 is bit-identical to the pre-swap
+//! measurement, including clip 09's 5-of-8-speaker collapse
+//! (`parity_shipping_der`'s known-defect pin, unchanged). The clip-09 defect is
+//! a segmentation-conversion defect — the model cross-product attributes it
+//! there, and the embedder is exonerated at cosine 1.000000 — but its mechanism
+//! is the fp16 conversion's ordinary tail precision (1091 of 608 437 powerset
+//! argmax frames flip against dia-ort's fp32 ONNX), not the vanished epsilon,
+//! and the re-conversion is still fp16, so it does not move it. The swap
+//! removes a real, silent, four-orders-of-magnitude corruption on the default
+//! placement; it does not repair clip 09.
+//!
+//! The published re-conversions of `wespeaker`/`wespeaker_int8` are
+//! deliberately NOT adopted: the int8 one is also a re-palettization, and it
+//! moves clip 14's shipping ANE arm from 0.8178 % to 1.4860 % DER, past
+//! `parity_shipping_der`'s ±1 pp bound (isolated by swapping one artifact at a
+//! time; see issue #15). Their `fp16_guards` pins therefore stand.
+//!
 //! # Licenses (`Models/speakerkit/README.md`)
 //!
 //! The repo's HuggingFace frontmatter declares `license: cc-by-4.0` for the
@@ -87,7 +131,7 @@
 //!   hold, see `segmentation_alt_io_recorded_not_targeted` below. It is
 //!   chosen anyway because its single-chunk, fixed-shape `segments` output
 //!   (per-frame powerset **log-probabilities** — the graph's tail is
-//!   `softmax` → `log`, see `crate::segment`'s module doc) matches both the
+//!   `reduce_log_sum_exp` → `sub`, see `crate::segment`'s module doc) matches both the
 //!   spec's pinned contract (§4 table) and the `SegmentModel::infer`
 //!   single-chunk API (§5) exactly, and it is FluidAudio's shipping name —
 //!   the brief's fallback tiebreaker.
@@ -97,14 +141,40 @@
 //!   int8-palettized model, not a distinct fp32 architecture; see
 //!   `wespeaker_v2_and_wespeaker_int8_are_byte_identical` below.
 //!   `wespeaker.mlmodelc` is contract-equal but ships uncompressed fp32
-//!   weights (27 MB vs 6.9 MB, `du -sh */weights`); not targeted, since the
-//!   smaller int8 footprint better serves the issue's ANE uplift targets —
-//!   a parity gate (spec §6.2) confirms quantization doesn't reintroduce
-//!   the NaN/Inf corruption dia already routes around `ort`'s CoreML EP
-//!   for (spec §1). `FBank.mlmodelc` + `Embedding.mlmodelc` (the split
-//!   fbank-then-embed pipeline) are NOT targeted per spec §2.4: wespeaker_v2
-//!   computes fbank in-graph from raw waveform, so the split frontend is
-//!   unnecessary.
+//!   weights (27 MB vs 6.9 MB, `du -sh */weights`).
+//!
+//!   **The rationale recorded here until 2026-07-26 was false.** It read
+//!   "the smaller int8 footprint better serves the issue's ANE uplift
+//!   targets". There is no uplift, and `parity_shipping_der.rs`'s
+//!   `shipping_embedder_cost_int8_vs_fp32` measures it directly. On 120 s of
+//!   `10_mrbeast_clean_water`, warm, one config at a time: on the shipping
+//!   `All` placement int8 EXTRACTS SLOWER than fp32 (4.92 s vs 4.41 s,
+//!   24.4× vs 27.2× realtime); on `CpuOnly` it is faster (25.03 s vs
+//!   28.89 s). No consistent speed advantage in either direction, and the
+//!   sign is negative on the placement we ship. Palettization buys 21.5 MB of
+//!   on-disk footprint (8.0 MB vs 29.4 MB, 3.7×) and nothing else. Reasoning
+//!   from "smaller ⇒ faster on the ANE" without measuring is what produced
+//!   the wrong claim.
+//!
+//!   The DECISION is still correct, for a different reason: int8 does not
+//!   move the CLUSTERING decision. On `10_mrbeast_clean_water` — the clip
+//!   that exposed the argmax source's spurious 8th speaker — the
+//!   precision-isolated int8 arm clusters identically to fp32 (0.0000 %
+//!   standard-collar DER, zero confusion) while carrying a *worse*
+//!   embedding cosine (~0.90-0.92) than argmax's ~0.94, and no clip in the
+//!   gated set has ever shown int8 and fp32 disagreeing on the speaker
+//!   count. That is the noise-vs-warp distinction: quantization scatter is
+//!   roughly isotropic and survives the frozen community-1 LDA+PLDA basis,
+//!   whereas argmax's front-end change is a systematic rotation that does
+//!   not. So int8 is chosen because it is free in accuracy terms and cheap
+//!   in footprint — NOT because it is faster. The evidence lives in
+//!   `parity_shipping_der.rs`; a parity gate (spec §6.2) separately confirms
+//!   quantization doesn't reintroduce the NaN/Inf corruption dia already
+//!   routes around `ort`'s CoreML EP for (spec §1).
+//!
+//!   `FBank.mlmodelc` + `Embedding.mlmodelc` (the split fbank-then-embed
+//!   pipeline) are NOT targeted per spec §2.4: wespeaker_v2 computes fbank
+//!   in-graph from raw waveform, so the split frontend is unnecessary.
 //!
 //! # Spec-vs-reality deltas
 //!
@@ -380,6 +450,86 @@ fn wespeaker_v2_and_wespeaker_int8_are_byte_identical() {
   assert_eq!(description.input("waveform").unwrap().shape(), &[3, 160000]);
   assert_eq!(description.input("mask").unwrap().shape(), &[3, 589]);
   assert_eq!(description.output("embedding").unwrap().shape(), &[3, 256]);
+}
+
+/// Byte-pins every file of the fp16-safe segmentation artifact against the
+/// published `FinDIT-Studio/speakerkit-coreml` revision (module doc,
+/// "Segmentation provenance").
+///
+/// This is the gate that makes the issue-#15 swap non-reversible by accident.
+/// The whole difference between the two conversions lives inside `model.mil`:
+/// the pre-swap FluidInference artifact has the identical filename, the
+/// identical `audio [1,1,160000]` → `segments [1,589,7]` contract, and passes
+/// every other test in this file — while restoring a `segments` minimum of
+/// −45440 on the shipping `ComputeUnits::All` placement. Only these bytes carry
+/// the repair, so only a byte pin can defend it.
+#[test]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
+fn fp16_safe_segmentation_matches_pinned_sha256() {
+  const FILES: &[(&str, &str)] = &[
+    (
+      "metadata.json",
+      "2926b811344e40ab6ce5406354bf5aaac35a297d0e67e3c0d3f6dd766e9f5f8f",
+    ),
+    (
+      "model.mil",
+      "ded0d1ee11d77976b5c706ce667d0c8cb49977d3fe4367cccbd7b582bdb86dec",
+    ),
+    (
+      "weights/weight.bin",
+      "0266f4ad4d843ecf31ef9220ad6b80616b3ec64a4404b64f3ea0371554e236ec",
+    ),
+    (
+      "coremldata.bin",
+      "e75fc0ac9641de87e3514369455c8c8a65b00aae339817b20642f115d5d8861e",
+    ),
+    (
+      "analytics/coremldata.bin",
+      "f283c01fa863188733c33c6fddac4c5dca42ca7cb22580918e1bc55877897e69",
+    ),
+  ];
+
+  let root = common::seg_path();
+  for (relative, expected) in FILES {
+    let path = root.join(relative);
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    assert_eq!(
+      common::sha256_hex(&bytes),
+      *expected,
+      "sha256 drift on pyannote_segmentation.mlmodelc/{relative}. These bytes ARE the issue-#15 \
+       fp16-guard repair; the pre-repair FluidInference artifact is contract-identical and would \
+       pass every other gate while restoring a −45440 `segments` minimum on ComputeUnits::All. \
+       Re-download from FinDIT-Studio/speakerkit-coreml at the pinned revision, or re-baseline \
+       this pin deliberately."
+    );
+  }
+}
+
+/// The shipped segmentation graph reaches its powerset log-probabilities through
+/// the FUSED `reduce_log_sum_exp` → `sub` tail, and contains no `log` op that a
+/// vanishing epsilon could leave unguarded. Reading the MIL is what the whole
+/// issue-#15 investigation turned on — the docs asserted "raw powerset logits"
+/// and nobody went looking for the `log` — so the structural claim is asserted,
+/// not narrated. `tests/fp16_guards.rs` checks epsilon FLOORS across every
+/// vendor; this checks the one structural property that makes this graph
+/// epsilon-free in the first place.
+#[test]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
+fn segmentation_graph_has_no_log_op() {
+  let mil = common::seg_path().join("model.mil");
+  let text =
+    std::fs::read_to_string(&mil).unwrap_or_else(|e| panic!("read {}: {e}", mil.display()));
+  assert!(
+    text.contains("reduce_log_sum_exp"),
+    "pyannote_segmentation/model.mil has no `reduce_log_sum_exp`: this is not the fused-tail \
+     conversion the fp16 repair rests on"
+  );
+  assert!(
+    !text.contains("= log("),
+    "pyannote_segmentation/model.mil grew a `log` op back. The decomposed `softmax` → `log` tail \
+     is what saturated to −45440 on the ANE; a re-conversion that reintroduces it must be \
+     re-audited, not accepted."
+  );
 }
 
 #[test]
