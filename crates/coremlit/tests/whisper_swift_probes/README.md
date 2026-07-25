@@ -129,6 +129,39 @@ identical in both.
   (`SegmentError::AlignmentPitchUnavailable`) rather than quietly degrading to
   `AlignmentGather::Complete`.
 
+## The Swift short-form word-timestamp golden
+
+`crates/coremlit/tests/whisper/fixtures/golden/jfk_tiny_words_golden.json` is a
+verbatim capture of the same oracle (`argmax-oss-swift @ dcf3a00`, same host)
+running `jfk.wav` on `openai_whisper-tiny` with **word timestamps on**, taken
+through an out-of-tree SwiftPM driver that depends on the pinned checkout by
+path and writes nothing into it (the `crates/coremlit/tests/speaker/swift/`
+precedent). The driver calls `WhisperKit.transcribe(audioArray:decodeOptions:)`
+with:
+
+```swift
+DecodingOptions(
+  verbose: true, task: .transcribe, language: nil,
+  temperature: 0.0, temperatureFallbackCount: 0,
+  usePrefillPrompt: true, skipSpecialTokens: true, withoutTimestamps: false,
+  wordTimestamps: true, concurrentWorkerCount: 1,
+  chunkingStrategy: ChunkingStrategy.none)
+```
+
+under `ModelComputeOptions(audioEncoderCompute: .cpuAndNeuralEngine,
+textDecoderCompute: .cpuAndNeuralEngine)` — the same pinned invocation the #41
+long-form evidence used, so short-form and long-form are one option set.
+`whisper_parity_jfk`'s
+`jfk_tiny_word_timestamps_match_swift_and_do_not_move_with_the_gather` mirrors
+those options exactly and asserts every word (text, start, end, probability,
+token ids) with no epsilon, plus that `AlignmentGather::Complete` yields the
+identical list. That second half is what makes "the #41 gather does not change
+short-form output" a checked claim rather than a comment: the gather runs on
+every word-timestamp window, long-form or not, and at 30 gathered rows over
+1500 columns the measured pitch of 1504 does truncate the final row here (it
+keeps 1384 of 1500 columns) — the truncation simply does not move this clip's
+DTW path.
+
 ## Rust transfer check (superseded by hermetic tests)
 
 An exploratory Rust probe (`half 2.7.1` + system libm) confirmed every dumped

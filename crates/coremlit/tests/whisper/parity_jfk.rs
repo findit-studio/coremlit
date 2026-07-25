@@ -5,6 +5,15 @@
 //! ids; segment boundaries within epsilon (timestamps are quantized to
 //! 0.02 s tokens, so epsilon 1e-3 catches any real divergence).
 //!
+//! Second golden: tests/whisper/fixtures/golden/jfk_tiny_words_golden.json —
+//! the same clip and model with **word timestamps on**, captured from the
+//! same Swift library at the same pin (provenance and the exact
+//! `DecodingOptions` in `tests/whisper_swift_probes/README.md`). It carries a
+//! stricter contract than the token golden: every word matches exactly, no
+//! epsilon. It exists because `alignment_gather` (whisper #41) runs on every
+//! word-timestamp window, short-form included, and the token golden above
+//! leaves `word_timestamps` off — so nothing here covered that path.
+//!
 //! Compute path — THE RULE: **a gate validating a shipping default must run
 //! on the shipping default.** This test runs on the DEFAULT compute units
 //! (mel CPU+GPU, encoder/decoder CPU+ANE — spec Goal 2, and byte-identical
@@ -40,8 +49,8 @@ mod common;
 
 use coremlit::audio::whisper::{
   options::{
-    DEFAULT_DECODER_COMPUTE_UNITS, DEFAULT_ENCODER_COMPUTE_UNITS, DEFAULT_MEL_COMPUTE_UNITS,
-    DecodingOptions, Options,
+    AlignmentGather, ChunkingStrategy, DEFAULT_DECODER_COMPUTE_UNITS,
+    DEFAULT_ENCODER_COMPUTE_UNITS, DEFAULT_MEL_COMPUTE_UNITS, DecodingOptions, Options,
   },
   transcribe::WhisperKit,
 };
@@ -155,4 +164,215 @@ fn jfk_tiny_matches_golden_tokens_and_segments() {
     assert_eq!(rust.text(), gold.text);
   }
   assert_eq!(result.text(), golden.text);
+}
+
+// ---------------------------------------------------------------------
+// Short-form word timestamps (whisper #41 follow-up)
+// ---------------------------------------------------------------------
+
+/// The Swift oracle's own word record, verbatim from
+/// `fixtures/golden/jfk_tiny_words_golden.json`.
+#[derive(serde::Deserialize)]
+struct WordsGolden {
+  text: String,
+  language: String,
+  #[serde(rename = "totalDecodingWindows")]
+  total_decoding_windows: f64,
+  segments: Vec<WordsGoldenSegment>,
+}
+
+#[derive(serde::Deserialize)]
+struct WordsGoldenSegment {
+  id: usize,
+  seek: usize,
+  start: f32,
+  end: f32,
+  text: String,
+  tokens: Vec<u32>,
+  words: Vec<GoldenWord>,
+}
+
+#[derive(serde::Deserialize)]
+struct GoldenWord {
+  word: String,
+  start: f32,
+  end: f32,
+  probability: f32,
+  tokens: Vec<u32>,
+}
+
+/// `(word, start, end, probability, tokens)` for every word of every
+/// segment, flattened — the comparison unit for both directions below.
+type WordRow = (String, f32, f32, f32, Vec<u32>);
+
+fn golden_word_rows(golden: &WordsGolden) -> Vec<WordRow> {
+  golden
+    .segments
+    .iter()
+    .flat_map(|segment| {
+      segment.words.iter().map(|word| {
+        (
+          word.word.clone(),
+          word.start,
+          word.end,
+          word.probability,
+          word.tokens.clone(),
+        )
+      })
+    })
+    .collect()
+}
+
+fn result_word_rows(
+  result: &coremlit::audio::whisper::result::TranscriptionResult,
+) -> Vec<WordRow> {
+  result
+    .segments_slice()
+    .iter()
+    .flat_map(|segment| {
+      segment.words_slice().iter().map(|word| {
+        (
+          word.word().to_string(),
+          word.start(),
+          word.end(),
+          word.probability(),
+          word.tokens_slice().to_vec(),
+        )
+      })
+    })
+    .collect()
+}
+
+/// The options the Swift oracle ran under, mirrored exactly: this is the
+/// same pinned invocation the whisper #41 long-form evidence used
+/// (`crates/coremlit/tests/whisper_swift_probes/README.md`), so one option
+/// set covers the short-form and long-form halves of the same claim.
+///
+/// `alignment_gather` is deliberately NOT set — the point is to exercise the
+/// shipping default.
+fn oracle_options() -> DecodingOptions {
+  DecodingOptions::new()
+    .with_temperature(0.0)
+    .with_temperature_fallback_count(0)
+    .with_use_prefill_prompt()
+    .with_skip_special_tokens()
+    .with_word_timestamps()
+    .with_concurrent_worker_count(std::num::NonZeroUsize::new(1).unwrap())
+    .with_chunking_strategy(ChunkingStrategy::Disabled)
+}
+
+/// Short-form word timestamps, pinned against official Swift and against
+/// themselves across both [`AlignmentGather`] modes.
+///
+/// **Why this exists.** `alignment_gather` (whisper #41) is selected for
+/// EVERY word-timestamp window, not only for long-form or for windows after
+/// the first: `TranscribeTask::run` passes `options.alignment_gather()`
+/// straight into `add_word_timestamps` with no guard. So a single-window
+/// clip goes through the truncating gather too — and it is genuinely
+/// truncated here, not vacuously: 30 gathered rows over 1500 columns at the
+/// measured pitch of 1504 leaves the copied prefix ending inside the last
+/// row, which keeps 1384 of its 1500 columns. #41's claim that short-form
+/// output is unchanged was therefore a real claim about a real code path,
+/// and before this test nothing committed checked it — the sibling
+/// `jfk_tiny_matches_golden_tokens_and_segments` runs with
+/// `word_timestamps` OFF.
+///
+/// Two assertions, in the order that matters:
+///
+/// 1. Under the shipping default ([`AlignmentGather::SwiftParity`]) every
+///    word matches the Swift oracle exactly — text, start, end, probability
+///    and token ids, no epsilon.
+/// 2. [`AlignmentGather::Complete`] produces the identical word list. That
+///    is what "the gather does not change short-form output" means, and it
+///    is an assertion rather than a comment: if the truncated final row ever
+///    does move a short-form boundary, this fails instead of the claim
+///    quietly becoming false.
+///
+/// Compute path: the shipping default, for the same reason this file's
+/// module doc gives — the oracle was captured on the ANE, so the gate runs
+/// there too.
+#[test]
+#[ignore = "requires local tiny model (WHISPERKIT_TEST_MODELS)"]
+fn jfk_tiny_word_timestamps_match_swift_and_do_not_move_with_the_gather() {
+  let audio = common::load_wav_mono_f32(&common::fixtures_dir().join("audio/jfk.wav"));
+  let model_options = Options::new(common::tiny_dir(), common::tokenizer_dir());
+  assert_eq!(model_options.compute().mel(), DEFAULT_MEL_COMPUTE_UNITS);
+  assert_eq!(
+    model_options.compute().encoder(),
+    DEFAULT_ENCODER_COMPUTE_UNITS
+  );
+  assert_eq!(
+    model_options.compute().decoder(),
+    DEFAULT_DECODER_COMPUTE_UNITS
+  );
+  let kit = WhisperKit::new(&model_options).unwrap();
+
+  let golden: WordsGolden = serde_json::from_str(
+    &std::fs::read_to_string(common::fixtures_dir().join("golden/jfk_tiny_words_golden.json"))
+      .unwrap(),
+  )
+  .unwrap();
+
+  let default_options = oracle_options();
+  assert_eq!(
+    default_options.alignment_gather(),
+    AlignmentGather::SwiftParity,
+    "this gate must run the shipping gather, not an explicit one"
+  );
+  let parity = kit.transcribe(&audio, &default_options).unwrap();
+
+  // (1) exact parity with Swift.
+  assert_eq!(parity.language(), golden.language);
+  assert_eq!(parity.text(), golden.text);
+  assert_eq!(
+    parity.timings().total_decoding_windows(),
+    golden.total_decoding_windows,
+    "jfk is a single window; a second one would mean the seek moved"
+  );
+  assert_eq!(parity.segments_slice().len(), golden.segments.len());
+  for (rust, gold) in parity.segments_slice().iter().zip(&golden.segments) {
+    assert_eq!(rust.id(), gold.id);
+    assert_eq!(rust.seek(), gold.seek);
+    assert_eq!(rust.tokens_slice(), gold.tokens.as_slice());
+    assert_eq!(rust.text(), gold.text);
+    // Exact, not epsilon: the word-timestamp path is integer encoder
+    // columns times a constant, so a real divergence lands whole frames
+    // away and a tolerance would only hide it.
+    assert_eq!((rust.start(), rust.end()), (gold.start, gold.end));
+  }
+  let parity_words = result_word_rows(&parity);
+  assert_eq!(
+    parity_words,
+    golden_word_rows(&golden),
+    "short-form word timestamps must match official Swift exactly"
+  );
+  assert_eq!(parity_words.len(), 22, "jfk/tiny yields 22 words");
+
+  // (2) the gather does not move any of it.
+  let complete = kit
+    .transcribe(
+      &audio,
+      &oracle_options().with_alignment_gather(AlignmentGather::Complete),
+    )
+    .unwrap();
+  assert_eq!(
+    result_word_rows(&complete),
+    parity_words,
+    "the #41 gather changed a SHORT-FORM word timing: the branch's \
+     short-form-is-unaffected claim no longer holds"
+  );
+  assert_eq!(complete.text(), parity.text());
+  assert_eq!(
+    complete
+      .segments_slice()
+      .iter()
+      .map(|s| (s.seek(), s.start(), s.end(), s.tokens_slice().to_vec()))
+      .collect::<Vec<_>>(),
+    parity
+      .segments_slice()
+      .iter()
+      .map(|s| (s.seek(), s.start(), s.end(), s.tokens_slice().to_vec()))
+      .collect::<Vec<_>>(),
+    "and neither the seek nor the segment bounds move with it"
+  );
 }

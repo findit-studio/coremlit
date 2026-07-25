@@ -402,8 +402,19 @@ pub enum AlignmentGather {
   /// measured against official Swift on the pinned model, the 1417 s fixture
   /// cost 984 words of edit distance and an entire extra window (52 against
   /// Swift's 51) before this variant existed, and matched token-for-token
-  /// after. Short-form (JFK) is bit-exact either way — the divergence needs
-  /// the seek cascade to accumulate.
+  /// after.
+  ///
+  /// Short-form is bit-exact either way — the divergence needs the seek
+  /// cascade to accumulate — but that is a *measured* result, not a
+  /// structural one: the gather runs on every word-timestamp window, with no
+  /// long-form or subsequent-window guard (Swift has none either, so a guard
+  /// would itself be a deviation), and the truncation is real even on a
+  /// single window. On jfk/tiny, 30 gathered rows over 1500 columns leave the
+  /// final row keeping 1384 of them. The integration test
+  /// `jfk_tiny_word_timestamps_match_swift_and_do_not_move_with_the_gather`
+  /// (`crates/coremlit/tests/whisper/parity_jfk.rs`) is what keeps the claim
+  /// honest: it pins every short-form word against the Swift oracle exactly
+  /// AND asserts [`Self::Complete`] produces the identical list.
   #[default]
   SwiftParity,
   /// Gather every row in full — no truncation. This port's behavior before
@@ -2138,6 +2149,12 @@ impl DecodingOptions {
   /// last word's end, which moves the segment's end, which moves the next
   /// window's seek, so with word timestamps on it reaches the transcript
   /// itself.
+  ///
+  /// It applies to **every** word-timestamp window, including a single-window
+  /// short-form clip with no seek cascade to accumulate — matching Swift,
+  /// which has no such guard either. Short-form output is nevertheless
+  /// unchanged between the two variants, and that is asserted rather than
+  /// assumed: see [`AlignmentGather::SwiftParity`].
   #[inline(always)]
   pub const fn alignment_gather(&self) -> AlignmentGather {
     self.alignment_gather
