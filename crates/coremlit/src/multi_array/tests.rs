@@ -320,6 +320,37 @@ fn f16_surface_contiguous_is_zero_before_any_write() {
 }
 
 #[test]
+fn f16_surface_probing_fresh_tail_still_zero_fills_everything() {
+  // The probe variant exists to report what CoreVideo left past the logical
+  // element count BEFORE the zero fill; the array it hands back must still
+  // honor `f16_surface`'s contract that every logical element (and every
+  // padding byte) reads zero. Both must hold at once, or a caller reading a
+  // padded row would see whatever the tail report was describing.
+  for shape in [[1usize, 4], [3, 9], [225, 100]] {
+    let (arr, nonzero) = MultiArray::f16_surface_probing_fresh_tail(&shape).unwrap();
+    assert_eq!(arr.shape(), shape, "shape must survive the probe");
+    for i0 in 0..shape[0] {
+      for i1 in 0..shape[1] {
+        assert_eq!(
+          arr.read_at::<f16>(&[i0, i1]).unwrap(),
+          f16::from_f32(0.0),
+          "shape {shape:?} index [{i0}, {i1}] was not zeroed"
+        );
+      }
+    }
+    // Not an assertion about CoreVideo — a report about it. The whisper
+    // gather is the caller that cares, and it fails closed on nonzero rather
+    // than pretending; recorded here so a host where this stops being 0 is
+    // diagnosable at the tensor layer too.
+    assert_eq!(
+      nonzero, 0,
+      "shape {shape:?}: CoreVideo left {nonzero} nonzero byte(s) past the logical element count \
+       on this host, so `AlignmentGather::SwiftParity` will refuse to run here"
+    );
+  }
+}
+
+#[test]
 fn zeros_rejects_shape_overflow() {
   let err = MultiArray::zeros(&[usize::MAX, 2], DataType::F32).unwrap_err();
   assert_eq!(
