@@ -111,14 +111,18 @@
 //!    byte-identity alone.
 //! 4. `PldaProjector.mlmodelc` (`speaker_clusterer`, out of scope): input
 //!    `embeddings [1, 64, 256]`, output `plda_embeddings [1, 64, 128]` —
-//!    recorded for completeness (mirroring `tests/model_io.rs`'s
-//!    PLDA-recording precedent) with no expected contract to check it
-//!    against, so this is recorded, not a delta.
-//!    Note the name is `plda_embeddings`, not the FluidAudio-side PLDA
-//!    artifact's `plda_features` (`tests/model_io.rs`'s
-//!    `plda_io_recorded_out_of_scope`) — the two sources don't share a
+//!    recorded for completeness, with no expected contract to check it
+//!    against, so this is recorded, not a delta. Note the name is
+//!    `plda_embeddings`, not the `plda_features` emitted by FluidAudio's
+//!    own, unrelated `PLDA.mlmodelc` — the two sources don't share a
 //!    contract here either, consistent with them being unrelated
-//!    conversions (pyannote-v4 vs. FluidAudio's own).
+//!    conversions (pyannote-v4 vs. FluidAudio's own). This is argmax's own
+//!    PLDA, and unlike FluidAudio's it is fp16-SAFE, hence its absence from
+//!    `fp16_guards`' `KNOWN_DEFECTS`: both its normalizations do carry a
+//!    1e-12 `rsqrt` epsilon, but each sits behind an `add(variance, 1e-6)`
+//!    on its input, and 1e-6 clears fp16's smallest subnormal by ~17x. The
+//!    FluidAudio pair's only floor is the 1e-12 `clip` itself, which is why
+//!    they are pinned and this is not.
 //! 5. None of the seven artifacts declare any shape flexibility
 //!    (`hasShapeFlexibility: "0"` on every input/output in every
 //!    `metadata.json`) — unlike some of `tests/model_io.rs`'s

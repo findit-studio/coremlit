@@ -1,8 +1,7 @@
 //! Ground-truth introspection of every candidate segmentation and embedding
 //! artifact named in the design spec
 //! (`docs/superpowers/specs/2026-07-11-dia-coreml-backends-design.md` §4, §9
-//! open item) plus the out-of-scope PLDA artifact the plan brief also names.
-//! Every value below comes from loading the real `.mlmodelc` via
+//! open item). Every value below comes from loading the real `.mlmodelc` via
 //! `coremlit::Model::load` + `.description()` — the spec's table is a
 //! HYPOTHESIS; reality wins, and every place it differs is marked `SPEC
 //! DELTA`. Feeds Task 2 (`SegmentModel`) and later tasks (`EmbedModel`,
@@ -19,7 +18,12 @@
 //! | `wespeaker.mlmodelc` | embedding, fp32, contract-equal | no |
 //! | `FBank.mlmodelc` | embedding frontend, split-pipeline alt | no |
 //! | `Embedding.mlmodelc` | embedding backend, split-pipeline alt | no |
-//! | `PLDA.mlmodelc` | clustering input transform | out of scope (spec §3 non-goal) |
+//!
+//! The repo also ships `PLDA.mlmodelc` / `PldaRho.mlmodelc`. Neither is a
+//! candidate and neither is introspected here: clustering — and with it the
+//! PLDA projection — stays in `diaric` (spec §3 non-goal), which projects in
+//! f64 on the host. `coremlit::audio::speaker::extract`'s `into_offline_input`
+//! records why the CoreML graphs are unusable even if that ever changed.
 //!
 //! # Licenses (`Models/speakerkit/README.md`)
 //!
@@ -432,25 +436,4 @@ fn embedding_split_io_recorded_not_targeted() {
     "dynamic output shape tracking the flexible `fbank_features`/`weights` inputs"
   );
   assert_eq!(embedding.data_type(), Some(DataType::F32));
-}
-
-#[test]
-#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
-fn plda_io_recorded_out_of_scope() {
-  // Out of scope per spec §3 non-goals ("Any clustering/VBx/PLDA port") —
-  // recorded because the plan brief names it as a candidate artifact to
-  // introspect. Fixed-shape throughout; no flexibility declared at all.
-  let path = common::models_dir().join("PLDA.mlmodelc");
-  let model = Model::load(path, ComputeUnits::CpuOnly).unwrap();
-  let description = model.description();
-
-  let embeddings = description.input("embeddings").expect("embeddings input");
-  assert_eq!(embeddings.shape(), &[1, 256]);
-  assert_eq!(embeddings.data_type(), Some(DataType::F32));
-
-  let plda_features = description
-    .output("plda_features")
-    .expect("plda_features output");
-  assert_eq!(plda_features.shape(), &[1, 128]);
-  assert_eq!(plda_features.data_type(), Some(DataType::F32));
 }

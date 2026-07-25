@@ -775,8 +775,13 @@ const KNOWN_DEFECTS: &[KnownDefect] = &[
     ],
     note: "Normalization clips to 1e-12 before `sqrt` at TWO sites, then divides by it. 1e-12 is \
            1.7e-5x fp16's smallest subnormal: on the ANE the clip floor is zero, giving sqrt(0) \
-           and a divide by zero. Not yet observed in a shipping path (found by this sweep, not by \
-           a failure).",
+           and a divide by zero. Never seen in a shipping path because nothing loads it: THIS \
+           finding is why the runtime projects with diaric's f64 `PldaTransform` (weights \
+           `include_bytes!`d, host arithmetic, no compute-unit demotion) instead of the CoreML \
+           PLDA the same model repo ships — see `Extraction::into_offline_input`. The graph \
+           arrives with the vendor tree whatever this crate decides, so the pin stays: it is what \
+           forces a re-conversion that repairs the epsilon to be SEEN, rather than leaving the \
+           rejection as folklore a future contributor would have to rediscover.",
   },
   KnownDefect {
     path: "speakerkit/PldaRho.mlmodelc",
@@ -784,7 +789,7 @@ const KNOWN_DEFECTS: &[KnownDefect] = &[
       "sqrt/fp32 guard=clip(alpha=9.999999960041972e-13) eff=9.999999960041972e-13",
       "sqrt/fp32 guard=clip(alpha=9.999999960041972e-13) eff=9.999999960041972e-13",
     ],
-    note: "Same two-site 1e-12 clip floor as PLDA.mlmodelc.",
+    note: "Same two-site 1e-12 clip floor as PLDA.mlmodelc, unloaded for the same reason.",
   },
   KnownDefect {
     path: "argmax-speakerkit/speaker_segmenter/pyannote-v3/W32A32/SpeakerSegmenter.mlmodelc",

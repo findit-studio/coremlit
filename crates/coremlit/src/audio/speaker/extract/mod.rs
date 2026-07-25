@@ -702,6 +702,25 @@ impl Extraction {
   ///
   /// Un-gated: `diaric` is a runtime dependency and `diaric::offline` is part of
   /// its ort-free clustering surface, so this bridge is always available.
+  ///
+  /// # Why the projection is Rust arithmetic and not the vendor's CoreML PLDA
+  ///
+  /// The speakerkit model repo ships the same community-1 projection as CoreML
+  /// graphs (`PLDA.mlmodelc`, `PldaRho.mlmodelc`), and this crate deliberately
+  /// loads neither. Both normalize with `clip(x, 1e-12) -> sqrt` and then divide
+  /// by the result, at TWO sites each. 1e-12 is 1.7e-5x fp16's smallest
+  /// subnormal (`2^-24`), so under the default [`crate::ComputeUnits::All`] the
+  /// clip floor rounds to zero on the ANE, leaving `sqrt(0)` and a divide by
+  /// zero — silently, and only on the placement that actually ships.
+  /// [`diaric::plda::PldaTransform`] instead `include_bytes!`s the fitted LDA +
+  /// PLDA weights and projects in f64 on the host, so no compute-unit choice can
+  /// demote the arithmetic and the projection is bit-reproducible across
+  /// placements.
+  ///
+  /// Both graphs stay pinned in `tests/fp16_guards.rs`'s `KNOWN_DEFECTS`. That
+  /// pin is what makes this decision revisitable rather than folkloric: the gate
+  /// fails if a re-converted graph ever repairs the epsilon, forcing the choice
+  /// to be re-made deliberately instead of a fixed model going unnoticed.
   pub fn into_offline_input<'a>(
     &'a self,
     plda: &'a diaric::plda::PldaTransform,
