@@ -568,6 +568,19 @@ const DER_PIN_TOL: f64 = 0.0005;
 /// hears the same speech and assigns it to the wrong person, which is why no
 /// collar absorbs it.
 ///
+/// One rival explanation IS eliminated, and not by measurement. argmax's
+/// `minActiveRatio` sparse-slot exclusion was once a live suspect, on the
+/// premise that this port had not taken it. That premise is false: `diaric`'s
+/// `diarize_offline` applies the same `filter_embeddings` rule unconditionally
+/// to every [`Extraction`] from either source (`offline/algo.rs:620-680`,
+/// `MIN_ACTIVE_RATIO = 0.2` at `:644`), so every number in the table above was
+/// already measured WITH the exclusion in effect — for the failing argmax runs
+/// and the clean FluidAudio runs alike. Same filter, both sources, opposite
+/// outcomes: the filter cannot be what separates them, and the proposed
+/// ratio-ON-vs-OFF experiment has no OFF arm to run. The front-end warp remains
+/// the leading explanation, now with one fewer rival — still not an isolated
+/// variable, because the segmenter and in-graph decode swap with the embedder.
+///
 /// Note what the data does NOT say. It does not say "argmax fails at ≥3
 /// speakers": `06_long_recording` has 3 and is clean. It does not say the defect
 /// is only a spurious speaker: on `12_mrbeast_schools` argmax gets the speaker

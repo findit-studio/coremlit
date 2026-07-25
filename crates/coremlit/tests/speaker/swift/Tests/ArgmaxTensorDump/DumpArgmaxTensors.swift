@@ -84,8 +84,11 @@ private struct GoldenSlot: Encodable {
   let activeFrames: String
   /// `SpeakerEmbedding.nonOverlappedFrameRatio` — recorded so the Rust side
   /// can REPORT how often argmax's `minActiveRatio` clustering filter would
-  /// have fired. Deliberately NOT ported (spec §5.2); it lives downstream of
-  /// the embeddings, so it is out of this gate's surface.
+  /// have fired. The filter is NOT missing from the Rust pipeline: `diaric`'s
+  /// clustering applies the same pyannote `filter_embeddings` rule, at the same
+  /// 0.2 ratio, to every `Extraction` from either source. It simply lives
+  /// downstream of the embeddings, so it is out of this gate's surface — which
+  /// is why this value is reported and never asserted on.
   let nonOverlappedFrameRatio: Float
   /// `SpeakerEmbedding.embedding` — the raw 256-d WeSpeaker vector.
   let embedding: [Float]
