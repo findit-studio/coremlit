@@ -32,13 +32,16 @@
 
 use unicode_categories::UnicodeCategories;
 
-use crate::audio::whisper::{
-  backend::{AlignmentMatrix, AlignmentView},
-  constants::{SAMPLE_RATE, SECONDS_PER_TIME_TOKEN},
-  error::SegmentError,
-  options::{AlignmentGather, DecodingOptions, WordGrouping},
-  result::{DecodingResult, TranscriptionSegment, WordTiming},
-  tokenizer::WhisperTokenizer,
+use crate::{
+  MultiArray,
+  audio::whisper::{
+    backend::{AlignmentMatrix, AlignmentView},
+    constants::{SAMPLE_RATE, SECONDS_PER_TIME_TOKEN},
+    error::SegmentError,
+    options::{AlignmentGather, DecodingOptions, WordGrouping},
+    result::{DecodingResult, TranscriptionSegment, WordTiming},
+    tokenizer::WhisperTokenizer,
+  },
 };
 
 /// Turns `decoding` — the just-decoded window starting at `current_seek`
@@ -935,18 +938,94 @@ pub(crate) fn rounded_to_places(value: f32, decimal_places: i32) -> f32 {
 // add_word_timestamps: the orchestration wrapper
 // ---------------------------------------------------------------------
 
-/// CoreVideo's row pitch, in Float16 elements, for the IOSurface-backed
-/// `MLMultiArray`s WhisperKit allocates
-/// (`ArgmaxCore/MLMultiArrayExtensions.swift:11-53`, `:121-136`): row bytes
-/// are padded up to a 64-byte boundary, i.e. 32 Float16 elements. Probed
-/// (`tests/whisper_swift_probes/probe_alignment_stride.out`): cols 8 -> 32,
-/// 9 -> 32, 100 -> 128, 1496/1500/1504 -> 1504.
+/// Measures **this host's** CoreVideo row pitch, in Float16 elements, for
+/// the IOSurface-backed `MLMultiArray` Swift's alignment gather allocates —
+/// `MLMultiArray(shape: [rows, cols], dataType: .float16, initialValue: 0)`
+/// (`ArgmaxCore/MLMultiArrayExtensions.swift:11-53`), which for `.float16`
+/// is a `kCVPixelFormatType_OneComponent16Half` `CVPixelBuffer`
+/// (`:121-136`) — by allocating the equivalent array through
+/// [`MultiArray::f16_surface`] and reading the strides CoreVideo actually
+/// chose.
 ///
-/// The 32-element quantum is load-bearing: `div_ceil(8) * 8` coincidentally
-/// agrees at the shipping `cols = 1500`, and is wrong at `cols = 100` (104,
-/// against the probed 128).
-const fn coreml_f16_row_pitch(cols: usize) -> usize {
-  cols.div_ceil(32) * 32
+/// **Not a constant, deliberately.** Apple documents `CVPixelBuffer` row
+/// alignment as hardware-dependent and requires it to be queried (QA1829,
+/// "Understanding CVPixelBuffer memory alignment"), and
+/// [`MultiArray::f16_surface`]'s own contract calls the padding
+/// platform-chosen. The reference host for whisper #41 (M1 Max, macOS 26.5)
+/// aligns rows to 64 bytes — 32 Float16 elements — which is what
+/// `tests/whisper_swift_probes/probe_alignment_stride.out` recorded (cols
+/// 8 -> 32, 9 -> 32, 100 -> 128, 1496/1500/1504 -> 1504); that table is
+/// evidence of the layout, not a rule about it. A host that pads
+/// differently would have Swift's gather truncate *different* cells, so a
+/// compiled-in quantum would zero the wrong ones and make
+/// [`AlignmentGather::SwiftParity`] silently non-parity there. Querying the
+/// same allocator Swift's array comes from is what makes the mode correct
+/// on every host rather than on one.
+///
+/// The probe uses the gather's exact `[rows, cols]` shape rather than a
+/// cheaper 1-row stand-in, so nothing here assumes the pitch is independent
+/// of the row count either. One `CVPixelBufferCreate` plus its zero-fill
+/// per word-timestamped window is immaterial next to that window's encoder
+/// and decoder runs.
+///
+/// # Errors
+/// [`SegmentError::AlignmentPitchUnavailable`] if the probe allocation
+/// fails (e.g. [`TensorError::SurfaceUnsupported`](crate::TensorError) below
+/// macOS 12, where `MLMultiArray` has no pixel-buffer initializer);
+/// [`SegmentError::AlignmentPitchUnexpectedLayout`] if it succeeds but
+/// reports strides other than `[pitch, 1]` with `pitch >= cols`. Both are
+/// fail-closed: see [`SegmentError::AlignmentPitchUnavailable`] for why a
+/// silent fall back to [`AlignmentGather::Complete`] is not offered.
+// `pub(crate)`, not private: `transcribe::tests`' own gather fixture
+// (`swift_parity_gather_moves_the_next_window_seek`) is built around where
+// this host's pitch cuts the gather, and has to ask the same helper the
+// pipeline asks rather than restate a number.
+pub(crate) fn coreml_f16_row_pitch(rows: usize, cols: usize) -> Result<usize, SegmentError> {
+  let probe = MultiArray::f16_surface(&[rows, cols])
+    .map_err(|source| SegmentError::AlignmentPitchUnavailable { rows, cols, source })?;
+  let strides = probe.strides();
+  // CoreML pads only BETWEEN rows (the invariant `MultiArray::copy_into`'s
+  // padded-gather already relies on), so the only layout the truncation
+  // models is a unit last-dimension stride under a row pitch that is at
+  // least the logical width. Anything else is a layout this port has never
+  // seen and cannot claim to replicate.
+  match *strides {
+    [pitch, 1] if pitch >= cols => Ok(pitch),
+    _ => Err(SegmentError::AlignmentPitchUnexpectedLayout {
+      rows,
+      cols,
+      strides: strides.to_vec(),
+    }),
+  }
+}
+
+/// Applies Swift's gather truncation in place to `data`, a `rows * cols`
+/// row-major gather whose destination storage CoreVideo pitches at `pitch`
+/// Float16 elements per row.
+///
+/// Swift's memcpy loop (`SegmentSeeker.swift:454-459`) writes only storage
+/// `[0, rows * cols)` because it pitches by `columnCount`, while
+/// `dynamicTimeWarping`'s flat subscript (`:217`) reads logical row `r` at
+/// the array's TRUE pitch, `[r * pitch, r * pitch + cols)`. Wherever those
+/// two windows overlap the errors cancel exactly; past the copied prefix the
+/// read lands on storage neither the memcpy nor the `initialValue:` fill
+/// ever wrote — zero in practice. So row `r` keeps
+/// `min(cols, rows * cols - r * pitch)` columns (saturating at zero) and
+/// reads zeros after them.
+///
+/// Split out from [`add_word_timestamps`] so the parity-bearing arithmetic
+/// is testable against explicit pitches, independent of whatever pitch the
+/// running host happens to choose. `pitch == cols` (a host that does not pad
+/// at this width) makes it a no-op, which is correct: Swift's gather has
+/// nothing to truncate when storage pitch equals the column count.
+fn truncate_gathered_rows(data: &mut [f32], rows: usize, cols: usize, pitch: usize) {
+  let copied = rows * cols;
+  for row in 0..rows {
+    let kept = copied.saturating_sub(row * pitch).min(cols);
+    if kept < cols {
+      data[row * cols + kept..(row + 1) * cols].fill(0.0);
+    }
+  }
 }
 
 /// Assembles one window's word-level timestamps end to end. Ports
@@ -975,7 +1054,9 @@ const fn coreml_f16_row_pitch(cols: usize) -> usize {
 /// subscript (`:217`) *is* stride-aware and CoreVideo pads the Float16
 /// backing's rows (`ArgmaxCore/MLMultiArrayExtensions.swift:121-136`), so
 /// row `r` keeps only its first `min(cols, needed * cols - r * pitch)`
-/// columns and reads zeros past that. [`AlignmentGather::Complete`] gathers
+/// columns and reads zeros past that — where `pitch` is measured on the
+/// running host by this module's `coreml_f16_row_pitch`, not assumed.
+/// [`AlignmentGather::Complete`] gathers
 /// every row whole — see [`AlignmentGather`] for why the truncated form is
 /// the parity-bearing one (whisper #41). Swift's
 /// `segmentSize` and `options` parameters are unused in the function body
@@ -991,7 +1072,13 @@ const fn coreml_f16_row_pitch(cols: usize) -> usize {
 /// all-empty-tokens) `segments` input, which Swift's own unguarded
 /// `1...0` range would instead crash on (see [`dynamic_time_warping`]'s
 /// doc); [`SegmentError::Tokenizer`] if `split_to_word_tokens` or a
-/// partial-special retokenize fails.
+/// partial-special retokenize fails;
+/// [`SegmentError::AlignmentPitchUnavailable`] /
+/// [`SegmentError::AlignmentPitchUnexpectedLayout`] under
+/// [`AlignmentGather::SwiftParity`] only, if this host's CoreVideo row pitch
+/// cannot be measured or is not a row-padded row-major layout — parity
+/// cannot be claimed against a layout this port cannot see, so it is refused
+/// rather than approximated (see this module's `coreml_f16_row_pitch`).
 #[allow(clippy::too_many_arguments)] // Mirrors Swift's addWordTimestamps argument
 // surface (mirroring decode_text's own precedent for this exact lint, per its
 // doc comment); no natural subset of these forms a cohesive struct without
@@ -1074,17 +1161,21 @@ pub fn add_word_timestamps(
   // + cols > needed * cols`; only the LAST row can be while `cols >= (needed -
   // 2) * (pitch - cols)`, which holds for every real Whisper model (1500/1504,
   // `needed <= 224`) but not at the small `n_audio_ctx` a test backend can set
-  // -- hence the general per-row loop, not a last-row special case. See
-  // [`AlignmentGather`] for the derivation.
-  if gather == AlignmentGather::SwiftParity {
-    let pitch = coreml_f16_row_pitch(cols);
-    let copied = needed * cols;
-    for row in 0..needed {
-      let kept = copied.saturating_sub(row * pitch).min(cols);
-      if kept < cols {
-        data[row * cols + kept..(row + 1) * cols].fill(0.0);
-      }
-    }
+  // -- hence the general per-row loop in [`truncate_gathered_rows`], not a
+  // last-row special case. See [`AlignmentGather`] for the derivation.
+  //
+  // The pitch is MEASURED on this host, never assumed: see
+  // [`coreml_f16_row_pitch`] for why a compiled-in alignment quantum would
+  // make this mode silently non-parity on a host CoreVideo pads differently,
+  // and why the failure to measure one is an error rather than a quiet
+  // downgrade to [`AlignmentGather::Complete`]. `needed == 0` skips the probe
+  // (and the no-op loop): there is no gather to truncate, and the empty
+  // `segments` input it comes from is already
+  // `SegmentError::InvalidAlignmentShape`'s -- reported below by
+  // `dynamic_time_warping`, as this function's `# Errors` doc promises.
+  if gather == AlignmentGather::SwiftParity && needed > 0 {
+    let pitch = coreml_f16_row_pitch(needed, cols)?;
+    truncate_gathered_rows(&mut data, needed, cols, pitch);
   }
 
   let filtered = AlignmentMatrix::new(data, needed, cols);

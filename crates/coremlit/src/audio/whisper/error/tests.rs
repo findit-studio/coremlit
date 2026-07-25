@@ -63,6 +63,40 @@ fn segment_error_composes_tokenizer_arm() {
 }
 
 #[test]
+fn alignment_pitch_errors_name_the_shape_and_the_explicit_way_out() {
+  // Both arms are FAIL-CLOSED refusals of `AlignmentGather::SwiftParity`, so
+  // their whole job is telling a caller what could not be measured and which
+  // option gathers every row instead. Neither is reachable on a supported
+  // host (the probe allocation is the same one the decoder's f16 tensors
+  // use), which is exactly why the messages are pinned here rather than by a
+  // path that can produce them.
+  let unavailable = SegmentError::AlignmentPitchUnavailable {
+    rows: 30,
+    cols: 1500,
+    source: crate::TensorError::SurfaceUnsupported,
+  };
+  let text = unavailable.to_string();
+  assert!(text.contains("30 x 1500"), "{text}");
+  assert!(text.contains("AlignmentGather::Complete"), "{text}");
+  assert!(
+    std::error::Error::source(&unavailable).is_some(),
+    "the tensor failure must survive as the source"
+  );
+
+  let unexpected = SegmentError::AlignmentPitchUnexpectedLayout {
+    rows: 30,
+    cols: 1500,
+    strides: vec![1504, 2],
+  };
+  let text = unexpected.to_string();
+  assert!(text.contains("[1504, 2]"), "{text}");
+  assert!(text.contains("AlignmentGather::Complete"), "{text}");
+
+  let composed: TranscribeError = unexpected.into();
+  assert!(matches!(composed, TranscribeError::Segment(_)));
+}
+
+#[test]
 fn transcribe_error_composes_segment_arm() {
   let e: TranscribeError = SegmentError::InvalidAlignmentShape {
     rows: 4,

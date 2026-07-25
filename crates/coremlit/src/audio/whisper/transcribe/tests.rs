@@ -3029,7 +3029,8 @@ fn four_window_shapes_read_stale_and_dropped_alignment_rows() {
   // `AlignmentGather::Complete` is REQUIRED here, not incidental: this pins
   // which alignment ROWS the accumulator hands over, and the #41 gather
   // (`SwiftParity`, the pipeline default) zeroes the tail of the last gathered
-  // row before DTW ever sees it. With 100 columns the pitch is 128, so the
+  // row before DTW ever sees it. At any measured pitch above the column count
+  // (128 for 100 columns on the reference host) that erasure lands, so the
   // discriminating column of the last row — the whole signal above — is
   // erased and every mutation in the matrix reads the same. The gather is
   // pinned separately by `swift_parity_gather_moves_the_next_window_seek`.
@@ -3122,7 +3123,8 @@ fn cap_hit_window_drops_the_completing_row() {
   // attempt and `decode_steps` reads the cap directly.
   //
   // `AlignmentGather::Complete` is REQUIRED for this pin to discriminate. At
-  // N = 224 gathered rows over 100 columns (pitch 128) the #41 gather's copied
+  // N = 224 gathered rows over 100 columns (measured pitch 128 on the
+  // reference host) the #41 gather's copied
   // prefix runs dry at row 175, so under the pipeline default rows 175..=223 —
   // including the predecessor/last-word/dropped triple this test is built on —
   // arrive entirely zeroed and Mutation A becomes invisible. The gather itself
@@ -3354,18 +3356,39 @@ fn swift_parity_gather_moves_the_next_window_seek() {
   // turned a 476-column tail into 984 words of edit distance and one extra
   // window across the 1417 s fixture.
   //
-  // Shape: 100 encoder columns (pitch 128), a segment of 6 gathered tokens
+  // Shape: 100 encoder columns, a segment of 6 gathered tokens
   // (`<|startoftranscript|><|en|><|transcribe|><|0.00|> Hello<|0.80|>` — the
-  // prompt rides along, `SegmentSeeker.swift:427-442`), so the copied prefix
-  // runs out 88 columns into row 4 and never reaches row 5 at all. Rows 4 and
-  // 5 are the pair that brackets the only text word, and the mock commits
-  // script step `k`'s row at accumulator row `k + 1`, so they are scripted at
-  // steps 3 and 4. Row 4 pays for every column past 59; row 5 has a +1.0
-  // plateau from column 44 that only the un-truncated gather can see.
+  // prompt rides along, `SegmentSeeker.swift:427-442`), so at the reference
+  // host's measured pitch of 128 the copied prefix runs out 88 columns into
+  // row 4 and never reaches row 5 at all. Rows 4 and 5 are the pair that
+  // brackets the only text word, and the mock commits script step `k`'s row at
+  // accumulator row `k + 1`, so they are scripted at steps 3 and 4. Row 4 pays
+  // for every column past 59; row 5 has a +1.0 plateau from column 44 that
+  // only the un-truncated gather can see.
+  //
+  // Those columns straddle a truncation point the SHIPPING gather measures on
+  // the running host rather than assumes, so the fixture states the layout it
+  // was built for and fails there first if this host pads differently — see
+  // `segment::tests::the_recorded_swift_probe_still_describes_this_host`,
+  // which is the single place that check belongs.
   let t = tiny_tokenizer();
   let s = special();
   let hello = t.encode(" Hello").unwrap()[0];
   let cols = 100usize;
+  let rows = 6usize;
+  let pitch = crate::audio::whisper::segment::coreml_f16_row_pitch(rows, cols).unwrap();
+  assert_eq!(
+    (rows * cols).saturating_sub(4 * pitch).min(cols),
+    88,
+    "this host measured a Float16 row pitch of {pitch} for {cols} columns; the reference \
+     host's 128 is what puts the gather's cut inside row 4 and past row 5, which is the \
+     whole discriminating shape of this fixture"
+  );
+  assert_eq!(
+    (rows * cols).saturating_sub(5 * pitch).min(cols),
+    0,
+    "row 5 must be gathered entirely blank under `SwiftParity`"
+  );
 
   let run = |gather| {
     let mut mock = MockBackend::new().with_dims(

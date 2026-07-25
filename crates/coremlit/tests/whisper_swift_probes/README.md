@@ -8,7 +8,8 @@ coremlit issue #41 parity fixes:
 - `crates/coremlit/src/audio/whisper/decode/sampler/mod.rs` — `argmax`
   (H2: first-index, NaN-skipping tie-break)
 - `crates/coremlit/src/audio/whisper/segment/mod.rs` — `coreml_f16_row_pitch` /
-  `add_word_timestamps`, and `options/mod.rs` — `AlignmentGather`
+  `truncate_gathered_rows` / `add_word_timestamps`, and `options/mod.rs` —
+  `AlignmentGather`
   (H6: the CoreVideo row pitch Swift's alignment gather ignores)
 
 These files are **captured verbatim** from a one-off probe run and are **not
@@ -87,10 +88,11 @@ identical in both.
 - **H6 (`probe_alignment_stride.out`):** WhisperKit's Float16 `MLMultiArray`s
   are **not contiguous**. `MLMultiArray(shape:dataType:initialValue:)`
   (`ArgmaxCore/MLMultiArrayExtensions.swift:11-53`) backs `.float16` with an
-  IOSurface `CVPixelBuffer` (`:121-136`), and CoreVideo pads each row to a
-  64-byte boundary — 32 Float16 elements — so `strides[0]` is **1504** for
-  `cols = 1500` (and 128 for 100, 32 for 8 and for 9), while the plain
-  `MLMultiArray(shape:dataType:)` initializer reports the contiguous 1500.
+  IOSurface `CVPixelBuffer` (`:121-136`), and CoreVideo pads each row out to a
+  platform-chosen boundary — 64 bytes, i.e. 32 Float16 elements, **on this
+  host** — so `strides[0]` is 1504 for `cols = 1500` (and 128 for 100, 32 for 8
+  and for 9), while the plain `MLMultiArray(shape:dataType:)` initializer
+  reports the contiguous 1500.
   `SegmentSeeker.addWordTimestamps` binds both stride arrays and then pitches
   its `memcpy` by `columnCount` (`:444-461`), so the gather writes only storage
   `[0, N * cols)`; `dynamicTimeWarping`'s flat subscript (`:217`) is
@@ -107,9 +109,25 @@ identical in both.
   CoreVideo guarantee). That row is the whole of the
   long-form divergence: it moves the last word's end, hence the segment's end,
   hence the next window's seek. Pinned in `segment/tests.rs` by
-  `coreml_f16_row_pitch_matches_the_probed_core_video_padding`,
+  `coreml_f16_row_pitch_is_measured_from_a_live_pixel_buffer_allocation`,
+  `the_recorded_swift_probe_still_describes_this_host`,
   `swift_gather_keeps_only_the_final_rows_prefix` and
   `swift_parity_gather_truncates_final_alignment_row`.
+
+  **The pitch table above is evidence about this host, not a compiled-in
+  rule.** `coreml_f16_row_pitch` MEASURES the running host — it allocates the
+  same `[N, cols]` Float16 IOSurface Swift's gather allocates
+  (`MultiArray::f16_surface`) and reads CoreVideo's own strides back — because
+  Apple's QA1829 states `CVPixelBuffer` row alignment is hardware-dependent and
+  must be queried. An earlier cut of this fix promoted the 32-element quantum
+  observed here into a `const fn`, which would have zeroed the WRONG cells (and
+  so silently produced non-parity word timings, segment ends and seeks) on a
+  host that pads differently. The recorded table survives here and in
+  `the_recorded_swift_probe_still_describes_this_host` as the environment check
+  behind the hand-computed columns in the gather fixtures; if the measurement
+  cannot be made at all, `AlignmentGather::SwiftParity` fails closed
+  (`SegmentError::AlignmentPitchUnavailable`) rather than quietly degrading to
+  `AlignmentGather::Complete`.
 
 ## Rust transfer check (superseded by hermetic tests)
 

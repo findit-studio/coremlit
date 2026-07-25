@@ -851,30 +851,46 @@ fn add_word_timestamps_errors_on_zero_columns() {
 // stride-aware flat subscript (`:217`), so the final gathered row loses its
 // tail.
 
+/// Widths worth probing: the shipping `n_audio_ctx` and its neighbours, the
+/// small `n_audio_ctx` the mock backend uses, and widths the recorded Swift
+/// probe never covered (3, 37, 63, 64, 511, 4096) -- the point of a runtime
+/// query is that it answers for widths nobody wrote down.
+const PROBE_WIDTHS: [usize; 13] = [1, 3, 8, 9, 37, 63, 64, 100, 511, 1496, 1500, 1504, 4096];
+
 #[test]
-fn coreml_f16_row_pitch_matches_the_probed_core_video_padding() {
-  // Pinned against the Swift capture in
-  // `crates/coremlit/tests/whisper_swift_probes/probe_alignment_stride.out`
-  // (`MLMultiArray.strides[0]` of the pixel-buffer-backed Float16 arrays):
-  // rows align to 64 bytes, i.e. 32 Float16 elements.
-  for (cols, pitch) in [
-    (8, 32),
-    (9, 32),
-    (100, 128),
-    (1496, 1504),
-    (1500, 1504),
-    (1504, 1504),
-  ] {
-    assert_eq!(
-      coreml_f16_row_pitch(cols),
-      pitch,
-      "probed pitch for cols={cols}"
-    );
+fn coreml_f16_row_pitch_is_measured_from_a_live_pixel_buffer_allocation() {
+  // THE property the whole Swift-parity gather rests on, and the one #41's
+  // first cut got wrong by promoting one host's 32-element alignment quantum
+  // into a `const fn`: the pitch is whatever THIS host's CoreVideo chose, read
+  // back off the same allocation Swift's gather makes -- never a compiled-in
+  // rule. Apple's QA1829 says the alignment is hardware-dependent and must be
+  // queried; `MultiArray::f16_surface`'s own doc says the same.
+  for cols in PROBE_WIDTHS {
+    for rows in [1usize, 3, 120, 224] {
+      let pitch = coreml_f16_row_pitch(rows, cols).unwrap();
+      // Same shape, allocated independently of the production helper: the
+      // helper must be reporting CoreVideo's answer, not deriving one.
+      let independent = MultiArray::f16_surface(&[rows, cols]).unwrap();
+      assert_eq!(
+        independent.strides(),
+        [pitch, 1],
+        "rows={rows} cols={cols}: the helper must return the surface's own strides"
+      );
+      assert!(
+        pitch >= cols,
+        "rows={rows} cols={cols}: a row pitch below the logical width ({pitch}) would make \
+         the gather truncation nonsense"
+      );
+      // The helper probes with the gather's exact `[rows, cols]` shape, so it
+      // does not need this -- but the doc claims the pitch is a function of
+      // the width alone, and an unchecked claim in a doc is how #41 started.
+      assert_eq!(
+        pitch,
+        coreml_f16_row_pitch(1, cols).unwrap(),
+        "rows={rows} cols={cols}: pitch must not depend on the row count"
+      );
+    }
   }
-  // The quantum has to come from the probe, not from the shipping shape: an
-  // 8-element quantum agrees at cols=1500 and disagrees at cols=100.
-  assert_eq!(1500_usize.div_ceil(8) * 8, coreml_f16_row_pitch(1500));
-  assert_ne!(100_usize.div_ceil(8) * 8, coreml_f16_row_pitch(100));
 }
 
 #[test]
@@ -887,8 +903,11 @@ fn swift_gather_keeps_only_the_final_rows_prefix() {
   /// survived. `NAN` stands for the storage neither the memcpy nor the
   /// `initialValue: FloatType(0)` fill ever writes -- the bytes that read
   /// back as zero in practice.
-  fn kept_per_row(rows: usize, cols: usize) -> Vec<usize> {
-    let pitch = coreml_f16_row_pitch(cols);
+  ///
+  /// `pitch` is a parameter, not a lookup: the arithmetic must be right for
+  /// ANY row padding a host might choose, so the worked examples below drive
+  /// it explicitly instead of asking the machine the test happens to run on.
+  fn kept_per_row(rows: usize, cols: usize, pitch: usize) -> Vec<usize> {
     let mut storage = vec![f32::NAN; rows * pitch];
     storage[..rows * cols].fill(1.0);
     (0..rows)
@@ -901,9 +920,11 @@ fn swift_gather_keeps_only_the_final_rows_prefix() {
       .collect()
   }
 
-  // The shipping shape, and the probe's own worked example ("logical row 119
-  // reads 476 element(s) past the copied prefix (kept columns = 1024)").
-  let kept = kept_per_row(120, 1500);
+  // The shipping shape at the pitch the Swift probe recorded on the reference
+  // host (`crates/coremlit/tests/whisper_swift_probes/probe_alignment_stride.out`:
+  // 1500 -> 1504), and that probe's own worked example -- "logical row 119
+  // reads 476 element(s) past the copied prefix (kept columns = 1024)".
+  let kept = kept_per_row(120, 1500, 1504);
   assert_eq!(kept[119], 1024, "the final row keeps 1024 of 1500 columns");
   assert_eq!(1500 - kept[119], 476, "and reads 476 zeros after them");
   assert!(
@@ -911,35 +932,79 @@ fn swift_gather_keeps_only_the_final_rows_prefix() {
     "no row but the last is touched"
   );
 
-  assert_eq!(*kept_per_row(31, 1500).last().unwrap(), 1380);
-  assert_eq!(*kept_per_row(2, 1500).last().unwrap(), 1496);
+  assert_eq!(*kept_per_row(31, 1500, 1504).last().unwrap(), 1380);
+  assert_eq!(*kept_per_row(2, 1500, 1504).last().unwrap(), 1496);
   assert_eq!(
-    kept_per_row(1, 1500),
+    kept_per_row(1, 1500, 1504),
     vec![1500],
     "a lone row is never truncated: it starts at storage 0"
   );
+  // An unpadded host is not a special case to guard, it is the identity: with
+  // pitch == cols the two errors cancel everywhere and Swift's gather loses
+  // nothing, so `SwiftParity` and `Complete` coincide there.
+  assert_eq!(kept_per_row(120, 1500, 1500), vec![1500; 120]);
 
-  // The production arithmetic reproduces the replay shape for shape --
-  // including shapes where more than one row is truncated, which is why
-  // `add_word_timestamps` runs the general per-row form rather than special-
-  // casing the last row.
-  for (rows, cols) in [
-    (120, 1500),
-    (31, 1500),
-    (2, 1500),
-    (1, 1500),
-    (3, 100),
-    (7, 40),
+  // The production truncation reproduces the replay for every shape AND every
+  // pitch -- including shapes where more than one row is truncated, which is
+  // why `add_word_timestamps` runs the general per-row form rather than
+  // special-casing the last row.
+  for (rows, cols, pitch) in [
+    (120, 1500, 1504),
+    (31, 1500, 1504),
+    (2, 1500, 1504),
+    (1, 1500, 1504),
+    (3, 100, 128),
+    (7, 40, 64),
+    // Hypothetical hosts: a bigger quantum truncates a run of rows, and no
+    // padding at all truncates none.
+    (120, 1500, 1536),
+    (120, 1500, 2048),
+    (7, 40, 40),
   ] {
-    let pitch = coreml_f16_row_pitch(cols);
-    let copied = rows * cols;
-    let production: Vec<usize> = (0..rows)
-      .map(|row| copied.saturating_sub(row * pitch).min(cols))
-      .collect();
+    // Whole-buffer equality, not a per-row kept count: it pins that the tails
+    // are zeroed AND that nothing before them was touched.
+    let mut expected_data = vec![0.0f32; rows * cols];
+    for (row, &kept) in kept_per_row(rows, cols, pitch).iter().enumerate() {
+      expected_data[row * cols..row * cols + kept].fill(1.0);
+    }
+    let mut data = vec![1.0f32; rows * cols];
+    truncate_gathered_rows(&mut data, rows, cols, pitch);
+    assert_eq!(data, expected_data, "rows={rows} cols={cols} pitch={pitch}");
+  }
+}
+
+/// The layout `crates/coremlit/tests/whisper_swift_probes/probe_alignment_stride.out`
+/// captured from Swift on the whisper #41 reference host (M1 Max / macOS
+/// 26.5): `MLMultiArray.strides[0]` for pixel-buffer-backed Float16 arrays,
+/// i.e. rows aligned to 64 bytes = 32 Float16 elements.
+///
+/// **Evidence about a host, not a rule about CoreVideo.** No production path
+/// consults it: `coreml_f16_row_pitch` measures the running host. It lives
+/// here so the two fixtures that hand-compute DTW paths around a specific
+/// truncation point -- `swift_parity_gather_truncates_final_alignment_row`
+/// here and `swift_parity_gather_moves_the_next_window_seek` in
+/// `transcribe::tests` -- have ONE diagnosable place to fail if this host
+/// pads differently, instead of failing later as unexplained word timings.
+const RECORDED_REFERENCE_HOST_PITCH: [(usize, usize); 6] = [
+  (8, 32),
+  (9, 32),
+  (100, 128),
+  (1496, 1504),
+  (1500, 1504),
+  (1504, 1504),
+];
+
+#[test]
+fn the_recorded_swift_probe_still_describes_this_host() {
+  for (cols, recorded) in RECORDED_REFERENCE_HOST_PITCH {
     assert_eq!(
-      production,
-      kept_per_row(rows, cols),
-      "rows={rows} cols={cols}"
+      coreml_f16_row_pitch(224, cols).unwrap(),
+      recorded,
+      "cols={cols}: this host's CoreVideo Float16 row pitch differs from the reference host \
+       the whisper #41 probe and long-form parity numbers were captured on. The shipping \
+       gather is UNAFFECTED -- it measures this host rather than assuming a quantum -- but \
+       the hand-computed columns in the gather fixtures, and the recorded 1417 s/1042 s \
+       parity results, describe the reference layout only"
     );
   }
 }
@@ -948,18 +1013,21 @@ fn swift_gather_keeps_only_the_final_rows_prefix() {
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn swift_parity_gather_truncates_final_alignment_row() {
   // The behavioral consequence, end to end through `add_word_timestamps`:
-  // three gathered rows over 100 columns (pitch 128), so the copied prefix
-  // runs out 44 columns into row 2 and Swift reads zeros for columns 44..100
-  // of it.
+  // three gathered rows over 100 columns, so the copied prefix runs out
+  // `truncated_at` columns into row 2 and Swift reads zeros for the rest of
+  // it. `truncated_at` is DERIVED from the pitch the gather measures on this
+  // host (44 at the reference host's 128), not written in -- the fixture
+  // exercises the real production path, so it has to be built on the same
+  // number that path found.
   //
   // The weights are built so that row 2's ZEROED TAIL is what decides where
   // the DTW path leaves row 1 -- and the row-1 -> row-2 boundary is the last
   // text word's end, because the trailing timestamp token forms its own word
   // group (`split_tokens_on_spaces` starts a new group at every special id)
   // and `update_segments_with_word_timings` then drops it. Row 1 pays for
-  // every column past 79, so with row 2 blank the path stays in row 1 to
-  // column 79; with row 2's tail intact the +1.0 plateau from column 44 pulls
-  // the boundary back there instead.
+  // every column past `truncated_at + 35`, so with row 2 blank the path stays
+  // in row 1 to that column; with row 2's tail intact the +1.0 plateau from
+  // `truncated_at` pulls the boundary back there instead.
   let t = tiny_tokenizer();
   let s = SpecialTokens::whisper_defaults();
   let hello = t.encode(" Hello").unwrap()[0];
@@ -977,16 +1045,30 @@ fn swift_parity_gather_truncates_final_alignment_row() {
     .set_end(3.0);
 
   let cols = 100usize;
-  let mut weights = vec![0.0f32; 3 * cols];
+  let rows = 3usize;
+  // Where this host's gather actually stops copying, from the same helper
+  // `add_word_timestamps` uses.
+  let pitch = coreml_f16_row_pitch(rows, cols).unwrap();
+  let truncated_at = (rows * cols).saturating_sub((rows - 1) * pitch).min(cols);
+  assert_eq!(
+    truncated_at, 44,
+    "at the reference host's pitch of 128 the final row keeps 44 of {cols} columns; this host \
+     measured a pitch of {pitch}, so the plateau/cutoff columns below no longer straddle the \
+     truncation and this fixture would not discriminate (see \
+     `the_recorded_swift_probe_still_describes_this_host`)"
+  );
+  let row_one_cutoff = truncated_at + 36;
+
+  let mut weights = vec![0.0f32; rows * cols];
   weights[0] = 3.0; // row 0: one spike, so the path enters row 1 immediately
   for column in 0..cols {
-    weights[cols + column] = if column < 80 { 0.5 } else { -0.1 };
-    weights[2 * cols + column] = if column < 44 { 0.0 } else { 1.0 };
+    weights[cols + column] = if column < row_one_cutoff { 0.5 } else { -0.1 };
+    weights[2 * cols + column] = if column < truncated_at { 0.0 } else { 1.0 };
   }
   // The same matrix with Swift's truncation already applied by hand: row 2's
-  // columns 44..100 zeroed, nothing else.
+  // columns `truncated_at..cols` zeroed, nothing else.
   let mut pre_truncated = weights.clone();
-  pre_truncated[2 * cols + 44..3 * cols].fill(0.0);
+  pre_truncated[2 * cols + truncated_at..rows * cols].fill(0.0);
 
   let last_word_end = |weights: &[f32], gather| {
     let view = AlignmentView::new(weights, 3, cols);
@@ -1021,16 +1103,21 @@ fn swift_parity_gather_truncates_final_alignment_row() {
     "the gather modes must disagree, or this fixture proves nothing"
   );
   // The boundary columns the fixture is built around, at 0.02 s per encoder
-  // frame: column 44, where row 2's surviving plateau starts, against column
-  // 79, row 1's last profitable column (the diagonal step into row 2 spends
-  // the 80th).
+  // frame: `truncated_at` (44 here), where row 2's surviving plateau starts,
+  // against `row_one_cutoff - 1` (79), row 1's last profitable column (the
+  // diagonal step into row 2 spends the cutoff column itself).
+  // (Literal, not `truncated_at as f32 * 0.02`: `truncated_at == 44` is
+  // already asserted above, and `SECONDS_PER_TIME_TOKEN` arithmetic in f32
+  // would be comparing a re-derivation of the code under test.)
   assert_eq!(
     complete_end, 0.88,
-    "row 2's tail pulls the boundary to col 44"
+    "row 2's tail pulls the boundary to col {truncated_at}"
   );
   assert_eq!(
-    parity_end, 1.58,
-    "with that tail zeroed, row 1 keeps the path to col 79"
+    parity_end,
+    1.58,
+    "with that tail zeroed, row 1 keeps the path to col {}",
+    row_one_cutoff - 1
   );
   assert_eq!(
     parity_end, reference_end,

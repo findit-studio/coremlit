@@ -325,11 +325,21 @@ impl core::str::FromStr for WordGrouping {
 /// `MLMultiArray(shape:dataType:initialValue:)`
 /// (`ArgmaxCore/MLMultiArrayExtensions.swift:11-53`), which for `.float16`
 /// backs the array with an IOSurface `CVPixelBuffer` (`:121-136`,
-/// `kCVPixelFormatType_OneComponent16Half`), and CoreVideo pads every row up
-/// to a 64-byte boundary — 32 Float16 elements — so `cols = 1500` is stored
-/// at a pitch of **1504**. (The plain `MLMultiArray(shape:dataType:)`
+/// `kCVPixelFormatType_OneComponent16Half`), and CoreVideo pads every row out
+/// to a **platform-chosen** boundary. (The plain `MLMultiArray(shape:dataType:)`
 /// initializer is contiguous; the padding belongs to the pixel-buffer path,
 /// and the pixel-buffer path is the one WhisperKit takes.)
+///
+/// How much padding is a property of the host, not of this code: Apple's
+/// QA1829 states `CVPixelBuffer` row alignment varies by hardware and must be
+/// queried, and [`MultiArray::f16_surface`](crate::MultiArray::f16_surface)
+/// documents the same. So this port **measures** the pitch at run time, by
+/// allocating the identical `[N, cols]` Float16 surface Swift's gather
+/// allocates and reading back CoreVideo's own strides
+/// (`segment::coreml_f16_row_pitch`); nothing below is compiled in. On the
+/// reference host for whisper #41 (M1 Max, macOS 26.5) rows align to 64 bytes
+/// — 32 Float16 elements — so `cols = 1500` is stored at a pitch of 1504, and
+/// that is the layout every worked example here uses.
 ///
 /// Two errors follow, and they cancel almost everywhere:
 ///
@@ -352,17 +362,22 @@ impl core::str::FromStr for WordGrouping {
 /// ```
 ///
 /// Only the LAST row can be affected while `cols >= (N - 2) * (pitch - cols)`.
-/// That is a property of the shipping shape, not a general one: it holds for
-/// every real Whisper model (`cols = n_audio_ctx = 1500`, `pitch = 1504`,
-/// `N <= 224`, so reaching the second-to-last row would take `N > 377`), and
-/// fails at the small `n_audio_ctx` a test backend can configure, where a run
-/// of whole rows goes. At `N = 120`, `cols = 1500` the final row keeps 1024
+/// That is a property of the shipping shape and the reference host's pitch,
+/// not a general one: it holds for every real Whisper model (`cols =
+/// n_audio_ctx = 1500`, measured `pitch = 1504`, `N <= 224`, so reaching the
+/// second-to-last row would take `N > 377`), and fails at the small
+/// `n_audio_ctx` a test backend can configure, where a run of whole rows goes
+/// — hence the general per-row form above rather than a last-row special
+/// case. At `N = 120`, `cols = 1500`, `pitch = 1504` the final row keeps 1024
 /// columns and reads the remaining 476 out of storage nothing ever wrote.
 /// Those bytes read back as zero in practice — an **observation, not a
 /// contract**: no part of CoreVideo promises a freshly created IOSurface is
 /// zeroed, and no part of WhisperKit writes them. Every number above is
 /// probed — see `probe_alignment_stride.swift`/`.out` under
-/// `crates/coremlit/tests/whisper_swift_probes/`.
+/// `crates/coremlit/tests/whisper_swift_probes/`. A host whose CoreVideo does
+/// not pad `cols` at all measures `pitch == cols`, which makes this variant
+/// identical to [`Self::Complete`] there — correctly, because Swift's gather
+/// then has nothing to truncate either.
 #[derive(
   Debug, Default, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display, derive_more::IsVariant,
 )]
@@ -373,7 +388,8 @@ impl core::str::FromStr for WordGrouping {
 pub enum AlignmentGather {
   /// Swift's gather reproduced deliberately, truncated final row and all
   /// (`kept` columns per the type's own doc — 1024 of 1500 on a full
-  /// 120-token window, the rest zero).
+  /// 120-token window at the reference host's measured pitch, the rest
+  /// zero).
   ///
   /// **The default**, and the fix for coremlit issue #41. That one row's
   /// tail picks the DTW path, which picks the pre-merge word-duration
@@ -2104,9 +2120,12 @@ impl DecodingOptions {
   /// when [`Self::word_timestamps`] is on (coremlit issue #41). Defaults to
   /// [`AlignmentGather::SwiftParity`]: Swift's gather ignores its own
   /// `MLMultiArray` row strides and indexes both sides by the column count,
-  /// which — against the 64-byte-padded rows CoreVideo gives its Float16
+  /// which — against the padded rows CoreVideo gives its Float16
   /// pixel-buffer backing — silently truncates the final gathered row to its
-  /// first `N * cols - (N - 1) * pitch` columns and zero-fills the rest.
+  /// first `N * cols - (N - 1) * pitch` columns and zero-fills the rest. That
+  /// `pitch` is measured on the running host, never assumed; the mode fails
+  /// closed rather than guess one (see
+  /// [`SegmentError::AlignmentPitchUnavailable`](crate::audio::whisper::error::SegmentError::AlignmentPitchUnavailable)).
   ///
   /// [`AlignmentGather::Complete`] gathers every row in full instead, this
   /// port's behavior before #41. See [`AlignmentGather`]'s own doc for the
