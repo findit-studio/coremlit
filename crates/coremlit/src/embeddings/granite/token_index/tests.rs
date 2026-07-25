@@ -286,8 +286,10 @@ fn direct_only_fallback_is_still_exact() {
 // space into the next word), so it can never diverge. These generators add the
 // classes that CAN — swept over every `char`-boundary pair they reproduce the
 // ~500 pre-fix divergences and MUST now be zero:
-//   K1  a whitespace run split by a NON-glue follower (digit/punct/emoji): only a
-//       literal ' ' glues forward, so a tab/NBSP/NEL/thin/ideographic run before a
+//   K1  a whitespace run split by a NON-glue follower (digit/punct/emoji): the
+//       forward glue is narrow — the word branches pull a single non-CR/LF
+//       whitespace into a following letter/mark, the punct branch only a literal
+//       ' ', a digit nothing — so a tab/NBSP/NEL/thin/ideographic run before a
 //       digit, symbol, or emoji is split by the full parse yet merged by
 //       `\s+(?!\S)` at end-of-substring.
 //   K2  the punct branch's `[\r\n/]*` tail folds CRLFs into a symbol pre-token, so
@@ -296,6 +298,16 @@ fn direct_only_fallback_is_still_exact() {
 //       the following word once the left context is cut.
 //   K4  combining / Other_Alphabetic marks (`\p{M}`, and Mn/Mc the regex glues but
 //       `is_alphanumeric` does not).
+//   K5  a vocab-dropped byte-level char: the pinned BPE has `unk_token: null` and
+//       is MISSING some single-byte ByteLevel tokens (VT 0x0B, FF 0x0C, NUL, other
+//       C0 controls, the 0xF1-0xF4 plane-4+ lead bytes), so `tokenizers` silently
+//       DROPS that byte-level char AND mis-attributes the surviving tokens'
+//       offsets. `TokenIndex::build` chains those offsets into `ends` that stay
+//       monotone, covering, and char-aligned, so every tiling check passes and the
+//       corruption is invisible to `direct_only` — only the byte-coverage guard
+//       catches it. The dropped byte must sit inside a piece with OTHER surviving
+//       tokens (a LONE dropped char is a zero-token piece the word-id-gap check
+//       already catches).
 const KILLERS: &[&str] = &[
   // K1 — whitespace run split by a non-glue follower.
   "456  1",
@@ -363,6 +375,18 @@ const KILLERS: &[&str] = &[
   "/usr/local/bin",
   "a//b//c",
   "x.\r\n/y/z",
+  // K5 — vocab-dropped byte-level chars (each string carries at least one, sitting
+  // inside a piece with surviving tokens). Post-guard these all fall back to the
+  // exact direct encode; pre-guard the corrupted offsets under/over-count.
+  "\u{c}\n\u{2003}\u{202f}\nﬃ\u{5b4}\u{64b}23", // the minimal witness (FF leads a ws run)
+  "\u{b}\n\u{2003}\u{202f}\nﬃ\u{5b4}\u{64b}23", // VT variant
+  "a\u{c}\n\u{2003}word 12",
+  "x\u{b}\ny\u{2009}\u{2009}9",
+  "p\u{0}q\nﬃ\u{5b4}z8",       // NUL inside a run
+  "m\u{7}\n\u{2003}n\u{64b}5", // BEL (a 0x04-0x1F C0 control)
+  "\u{c}\u{c}\n\u{3000}\u{3000}ﬃ\u{93e}9",
+  "tag\u{E0067}\u{E0067}\nﬀ\u{5b4}7", // plane-4 TAG chars (0xF3 lead) + ligature+mark
+  "list:\u{1f}item\n\u{2003}\u{5b4}4", // 0x1F control mid-word
 ];
 
 /// A seeded fragment-soup: random short fragments drawn from an alphabet of every
@@ -418,6 +442,13 @@ fn fragment_soup(seed: u64, target_chars: usize) -> String {
     " ",
     "x",
     "y",
+    // K5 — vocab-droppable byte-level chars (silently dropped, byte-coverage
+    // guard catches the resulting offset corruption).
+    "\u{000B}",  // VT
+    "\u{000C}",  // FF
+    "\u{0000}",  // NUL
+    "\u{0007}",  // BEL (a 0x04-0x1F C0 control)
+    "\u{E0067}", // a plane-4 TAG char (0xF3 lead byte)
   ];
   let mut rng = Rng(seed);
   let mut s = String::new();
@@ -560,5 +591,47 @@ fn witness_f3_contraction_suffix_letter_adjacency() {
     index.measure_range(&tok, text, 4, 11).unwrap(),
     oracle(&tok, "station"),
     "F3: [4,11) must be encode(\"station\"), not \"s\"+\"tation\""
+  );
+}
+
+/// F8 witness (a vocab-dropped byte corrupts the reconstructed offsets): the
+/// leading form feed `\u{c}` has NO single-byte vocab token and the BPE
+/// `unk_token` is null, so `tokenizers` silently DROPS its byte-level char and
+/// mis-attributes the surviving tokens' offsets. The chained `ends` stay
+/// monotone, covering, and char-aligned, so no tiling check trips `direct_only` —
+/// only the byte-coverage guard sees the shortfall. Pre-guard,
+/// `measure_range(8, 16)` returned 6 for what `encode` counts as 7.
+#[test]
+fn witness_f8_vocab_dropped_byte_corrupts_index_offsets() {
+  let tok = measuring_tok();
+  let text = "\u{c}\n\u{2003}\u{202f}\nﬃ\u{5b4}\u{64b}23";
+  // The drop is real and invisible to the tiling checks: ByteLevel emits exactly
+  // one byte-level char per original byte, so fewer surviving chars than
+  // `text.len()` proves a byte-level char vanished.
+  let survived: usize = tok
+    .encode(text, false)
+    .expect("encode")
+    .get_tokens()
+    .iter()
+    .map(|t| t.chars().count())
+    .sum();
+  assert!(
+    survived < text.len(),
+    "the form feed's byte-level char must be dropped: {survived} chars vs {} bytes",
+    text.len()
+  );
+  // The public contract holds exactly at the ranges the corrupted offsets skewed.
+  let index = TokenIndex::build(&tok, text).expect("build");
+  for &(a, b) in &[(8usize, 16usize), (8, 17), (8, 18)] {
+    assert_eq!(
+      index.measure_range(&tok, text, a, b).unwrap(),
+      oracle(&tok, &text[a..b]),
+      "F8: [{a},{b}) must equal the direct encode, not the dropped-byte undercount"
+    );
+  }
+  // The guard's chosen repair: the whole index falls back to exact direct encoding.
+  assert!(
+    index.direct_only,
+    "the byte-coverage guard must reject the corrupted reconstruction (direct_only)"
   );
 }

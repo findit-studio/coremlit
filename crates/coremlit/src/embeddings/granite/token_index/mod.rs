@@ -27,8 +27,16 @@
 //! Guaranteed for the pinned granite `tokenizer.json` by #48's construction-time
 //! contract + SHA-identity gate (production `chunk_long` only ever sees this one
 //! artifact):
-//! * `normalizer: null` → offsets are literal original bytes; no cross-boundary
-//!   normalization.
+//! * `normalizer: null` → reported offsets are literal original-text bytes; no
+//!   cross-boundary normalization — with ONE caveat [`TokenIndex::build`] guards
+//!   against: the BPE vocab is MISSING a few single-byte ByteLevel-alphabet tokens
+//!   and has `unk_token: null`, so `tokenizers` silently DROPS those byte-level
+//!   chars (VT 0x0B, FF 0x0C, NUL, other C0 controls, the 0xF1-0xF4 plane-4+ lead
+//!   bytes) from the id stream AND mis-attributes the surviving tokens' offsets.
+//!   The reconstructed tiling still passes every monotone/covering/char-aligned
+//!   check, so `build` detects the drop by a byte-coverage count
+//!   (`Σ chars(token) == text.len()`) and falls back to `direct_only` rather than
+//!   trust a corrupted offset chain.
 //! * `pre_tokenizer` = `Sequence[ Split(o200k-style regex, Isolated),
 //!   ByteLevel(add_prefix_space=false, use_regex=false) ]` → pre-tokens are the
 //!   Split-regex pieces; they **tile** the text (every char matches some branch,
@@ -59,10 +67,14 @@
 //!      a trailing CR/LF/`/` run INTO the symbol pre-token (so a whitespace
 //!      back-scan can walk into a symbol pre-token, not a real boundary);
 //!   4. `\s+(?!\S)` vs `\s+` — a whitespace run is one pre-token only when nothing
-//!      but whitespace follows; a NON-glue char after the run (a digit/punct/emoji
-//!      — only a literal ' ' glues forward via rule 1) SPLITS it. A cut whose right
-//!      edge lands in a run merges it (end-of-substring), so `b` on a pre-token
-//!      boundary is not enough — the run must be re-encoded looking beyond `b`.
+//!      but whitespace follows. When a non-whitespace char follows, the full parse
+//!      reshapes the run's tail and SPLITS it: a following letter/mark pulls one
+//!      NON-CR/LF whitespace forward via the word branches' lead `[^\r\n\p{L}\p{N}]?`
+//!      (space, tab, NBSP, thin space — the glue set is `[^\r\n\p{L}\p{N}]`, wider
+//!      than a literal ' '), the punct branch's ` ?` pulls only a literal ' ', and a
+//!      digit pulls nothing. A cut whose right edge lands in a run merges it
+//!      (end-of-substring), so `b` on a pre-token boundary is not enough — the run
+//!      must be re-encoded looking beyond `b`.
 
 use tokenizers::Tokenizer;
 
@@ -166,6 +178,28 @@ impl TokenIndex {
       return Ok(Self::direct_only());
     }
 
+    // Byte-coverage guard (the vocab-drop hazard). The pinned granite BPE has
+    // `unk_token: null` and its vocab is MISSING some single-byte ByteLevel-alphabet
+    // tokens (VT 0x0B, FF 0x0C, NUL, other C0 controls, the 0xF1-0xF4 plane-4+ lead
+    // bytes, …). `tokenizers` then SILENTLY DROPS any byte-level char whose one-byte
+    // token is absent — emitting no id AND no token — and mis-attributes the
+    // surviving tokens' offsets. ByteLevel maps each ORIGINAL byte to exactly one
+    // byte-level char, so the byte-level chars retained across ALL token strings
+    // must number `text.len()`; a shortfall proves a drop happened. The chained
+    // `ends` stay monotone, covering, and char-aligned even then, so NO downstream
+    // tiling check sees the corruption — only this count does. A drop cannot be
+    // locally repaired (it skews ranges far from the dropped byte, over- and
+    // under-counting alike), so the whole index falls back to exact direct
+    // encoding. This is one linear pass over the ALREADY-materialized
+    // `get_tokens()` — no second encode — and OUTPUT-IDENTICAL: the production
+    // per-chunk `token_ids` re-encode drops the SAME chars, so chunk boundaries and
+    // embeddings are unchanged; only the measure path switches to direct-encode for
+    // these rare inputs.
+    let byte_level_chars: usize = enc.get_tokens().iter().map(|t| t.chars().count()).sum();
+    if byte_level_chars != text.len() {
+      return Ok(Self::direct_only());
+    }
+
     let mut pretoken_ends: Vec<u32> = Vec::new();
     let mut count_prefix: Vec<u32> = vec![0];
     let mut acc: u32 = 0;
@@ -266,7 +300,8 @@ impl TokenIndex {
   /// 2. **Right.** `b` is clean only when it is a full boundary AND `text[b-1]` is
   ///    non-whitespace. A whitespace char at `b-1` means a run touches `b`:
   ///    `text[a..b]` merges it under `\s+(?!\S)`, but the full parse may split it
-  ///    at a non-glue char after `b` (only a literal ' ' glues forward), so even a
+  ///    at whatever follows `b` (a letter/mark pulls one non-CR/LF whitespace
+  ///    forward, the punct branch only a literal ' ', a digit nothing), so even a
   ///    full boundary at `b` is NOT clean. Otherwise extend LEFT across the maximal
   ///    whitespace run touching `b`, then snap the landing DOWN to a true boundary
   ///    ([`snap_down_boundary`](TokenIndex::snap_down_boundary) — the back-scan can
@@ -362,9 +397,10 @@ impl TokenIndex {
       // `b` is TRULY clean only when it is a full boundary AND the char just before
       // it is non-whitespace. A whitespace char at `b-1` means a run touches `b`:
       // `text[a..b]` ENDS the run, so `\s+(?!\S)` merges it, while the full parse
-      // may split it at whatever follows `b` (a digit/punct/emoji takes no
-      // space-glue — only a literal ' ' glues forward), so a full boundary at `b`
-      // is not sufficient; extend LEFT across the run.
+      // may split it at whatever follows `b` (a following letter/mark pulls one
+      // non-CR/LF whitespace forward, the punct branch only a literal ' ', a digit
+      // nothing), so a full boundary at `b` is not sufficient; extend LEFT across
+      // the run.
       let b_is_boundary = ends[q] == b32;
       let prev_ws = text[..b]
         .chars()
