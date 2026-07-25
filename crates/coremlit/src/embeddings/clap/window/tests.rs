@@ -4,6 +4,7 @@ use super::*;
 fn offsets(plan: &WindowPlan, total: usize) -> Vec<(usize, usize)> {
   plan
     .spans(total)
+    .unwrap()
     .iter()
     .map(|s| (s.start(), s.len()))
     .collect()
@@ -31,7 +32,7 @@ fn default_plan_is_no_overlap_pad() {
 
 #[test]
 fn empty_clip_plans_no_windows() {
-  assert!(WindowPlan::new().spans(0).is_empty());
+  assert!(WindowPlan::new().spans(0).unwrap().is_empty());
 }
 
 #[test]
@@ -55,6 +56,7 @@ fn short_clip_survives_drop_below_min() {
   assert_eq!(
     plan
       .spans(100_000)
+      .unwrap()
       .iter()
       .map(|s| (s.start(), s.len()))
       .collect::<Vec<_>>(),
@@ -64,10 +66,10 @@ fn short_clip_survives_drop_below_min() {
 
 #[test]
 fn short_clip_coverage_is_padding_aware() {
-  let spans = WindowPlan::new().spans(240_000);
+  let spans = WindowPlan::new().spans(240_000).unwrap();
   assert_eq!(spans.len(), 1);
   assert_eq!(spans[0].coverage(), 0.5); // 240_000 / 480_000
-  assert_eq!(WindowPlan::new().spans(480_000)[0].coverage(), 1.0);
+  assert_eq!(WindowPlan::new().spans(480_000).unwrap()[0].coverage(), 1.0);
 }
 
 #[test]
@@ -185,6 +187,142 @@ fn zero_drop_min_setter_panics() {
   let _ = WindowPlan::new().with_tail_policy(TailPolicy::DropBelowMin { min_samples: 0 });
 }
 
+#[test]
+fn huge_total_is_rejected_typed_not_panic() {
+  // THE DoS REGRESSION. Pre-fix, `spans` had no cap: with hop=1 (setter-accepted)
+  // it asked windit to reserve ~`usize::MAX` spans, `try_reserve_exact` overflowed
+  // capacity, windit returned `AllocFailed`, and clap's `.expect()` PANICKED. The
+  // O(1) cap now refuses this exact input typed, in constant time, with NO
+  // allocation and NO panic — `got` is the FULL planned count.
+  let plan = WindowPlan::new().with_hop_samples(1);
+  let err = plan.spans(usize::MAX).unwrap_err();
+  assert!(
+    matches!(
+      err,
+      Error::Windowing(WinditError::TooManyWindows { got: usize::MAX, max })
+        if max == DEFAULT_MAX_WINDOWS as usize
+    ),
+    "expected TooManyWindows {{ got: usize::MAX, max: {} }}, got {err:?}",
+    DEFAULT_MAX_WINDOWS
+  );
+}
+
+#[test]
+fn hop_one_over_long_clip_is_rejected_typed() {
+  // The codex [high] regression, clap-cut: a serde-supplied hop of 1 over a 20 s
+  // clip would plan 960 000 windows (~1.9 GiB of retained embeddings + 960 000
+  // CoreML inferences). The O(1) cap refuses it typed BEFORE materializing
+  // anything — this test completing at all (no OOM, no 960 000 pushes) is half
+  // the point; the exact `got` pins the FULL-count semantics.
+  let plan = WindowPlan::new().with_hop_samples(1);
+  let total = 2 * WINDOW_SAMPLES; // 960_000 = 20 s at 48 kHz
+  let err = plan.spans(total).unwrap_err();
+  assert!(
+    matches!(
+      err,
+      Error::Windowing(WinditError::TooManyWindows { got: 960_000, max })
+        if max == DEFAULT_MAX_WINDOWS as usize
+    ),
+    "expected TooManyWindows {{ got: 960_000, max: {} }}, got {err:?}",
+    DEFAULT_MAX_WINDOWS
+  );
+}
+
+#[test]
+fn cap_boundary_exact_count_passes_and_plus_one_fails() {
+  // hop 240_000 over 1_000_000 is the pinned 5-span geometry
+  // (`overlapping_hop_produces_full_windows_then_tails`). A cap of exactly the
+  // planned count admits it unchanged; one below refuses with the full count.
+  let expected = vec![
+    (0, 480_000),
+    (240_000, 480_000),
+    (480_000, 480_000),
+    (720_000, 280_000),
+    (960_000, 40_000),
+  ];
+  let at_cap = WindowPlan::new()
+    .with_hop_samples(240_000)
+    .with_max_windows(5);
+  assert_eq!(offsets(&at_cap, 1_000_000), expected);
+
+  let under_cap = WindowPlan::new()
+    .with_hop_samples(240_000)
+    .with_max_windows(4);
+  let err = under_cap.spans(1_000_000).unwrap_err();
+  assert!(
+    matches!(
+      err,
+      Error::Windowing(WinditError::TooManyWindows { got: 5, max: 4 })
+    ),
+    "got {err:?}"
+  );
+}
+
+#[test]
+fn planned_windows_matches_materialized_len() {
+  // The O(1) formula MUST equal the real materialized length for every
+  // admissible geometry — otherwise the cap check would guard the wrong count.
+  // The cap is lifted (`u32::MAX`) so only geometry, never the rail, is tested.
+  let pad = |hop: u32| {
+    WindowPlan::new()
+      .with_hop_samples(hop)
+      .with_max_windows(u32::MAX)
+  };
+  let drop_min = |hop: u32, min: u32| {
+    WindowPlan::new()
+      .with_hop_samples(hop)
+      .with_tail_policy(TailPolicy::DropBelowMin { min_samples: min })
+      .with_max_windows(u32::MAX)
+  };
+  let cases: [(WindowPlan, usize); 18] = [
+    // Pad geometry (the pinned grid) + boundary totals.
+    (pad(480_000), 1_000_000),
+    (pad(240_000), 1_000_000),
+    (pad(120_000), 1_000_000),
+    (pad(100_000), 1_000_000),
+    (pad(480_000), 960_000),
+    (pad(480_000), 480_001),
+    (pad(480_000), 0),
+    (pad(480_000), 100),
+    (pad(480_000), WINDOW_SAMPLES - 1),
+    (pad(480_000), WINDOW_SAMPLES),
+    (pad(1), WINDOW_SAMPLES), // guard-1 immunity: 1 span, no materialization blowup
+    // DropBelowMin geometry (the pinned 1_000_000 @ 120_000/40_000 cases + edges).
+    (drop_min(480_000, 120_000), 1_000_000),
+    (drop_min(480_000, 40_000), 1_000_000),
+    (drop_min(240_000, 120_000), 1_000_000),
+    (drop_min(240_000, 40_000), 1_000_000),
+    (drop_min(480_000, 2), 480_001),
+    (drop_min(480_000, 120_000), 100),
+    (drop_min(480_000, 120_000), 0),
+  ];
+  for (plan, total) in cases {
+    assert_eq!(
+      plan.planned_windows(total),
+      plan.spans(total).unwrap().len(),
+      "planned_windows != materialized len for hop={} tail={:?} total={total}",
+      plan.hop_samples(),
+      plan.tail_policy(),
+    );
+  }
+}
+
+#[test]
+fn short_clip_never_trips_cap() {
+  // Guard-1 immunity: a short clip is one span regardless of hop/cap, so even
+  // the tightest cap admits it (planned == 1 <= any valid cap).
+  let plan = WindowPlan::new().with_max_windows(1).with_hop_samples(1);
+  let spans = plan.spans(WINDOW_SAMPLES).unwrap();
+  assert_eq!(spans.len(), 1);
+  assert_eq!((spans[0].start(), spans[0].len()), (0, WINDOW_SAMPLES));
+}
+
+#[test]
+#[should_panic(expected = "max_windows")]
+fn zero_max_windows_setter_panics() {
+  let _ = WindowPlan::new().with_max_windows(0);
+}
+
 #[cfg(feature = "serde")]
 mod serde_tests {
   use super::*;
@@ -197,6 +335,12 @@ mod serde_tests {
       WindowPlan::new().with_tail_policy(TailPolicy::DropBelowMin {
         min_samples: 120_000,
       }),
+      WindowPlan::new()
+        .with_hop_samples(240_000)
+        .with_tail_policy(TailPolicy::DropBelowMin {
+          min_samples: 120_000,
+        })
+        .with_max_windows(50_000),
     ] {
       let json = serde_json::to_string(&plan).unwrap();
       let back: WindowPlan = serde_json::from_str(&json).unwrap();
@@ -208,9 +352,12 @@ mod serde_tests {
   fn defaults_fill_for_a_partial_config() {
     let plan: WindowPlan = serde_json::from_str("{}").unwrap();
     assert_eq!(plan, WindowPlan::new());
+    // The omitted cap fills the default — it is default-on for every config.
+    assert_eq!(plan.max_windows(), DEFAULT_MAX_WINDOWS);
     let hop_only: WindowPlan = serde_json::from_str(r#"{"hop_samples": 240000}"#).unwrap();
     assert_eq!(hop_only.hop_samples(), 240_000);
     assert_eq!(hop_only.tail_policy(), TailPolicy::Pad);
+    assert_eq!(hop_only.max_windows(), DEFAULT_MAX_WINDOWS);
   }
 
   #[test]
@@ -222,6 +369,11 @@ mod serde_tests {
       })
       .unwrap(),
       r#"{"drop_below_min":{"min_samples":120000}}"#
+    );
+    // The full-plan wire form pins the new `max_windows` field's spelling.
+    assert_eq!(
+      serde_json::to_string(&WindowPlan::new()).unwrap(),
+      r#"{"hop_samples":480000,"tail":"pad","max_windows":100000}"#
     );
   }
 
@@ -245,5 +397,12 @@ mod serde_tests {
       )
       .is_err()
     );
+  }
+
+  #[test]
+  fn zero_max_windows_fails_to_deserialize() {
+    // A zero cap can never embed any clip; the validated repr rejects it, just
+    // as the setter panics on it.
+    assert!(serde_json::from_str::<WindowPlan>(r#"{"max_windows": 0}"#).is_err());
   }
 }

@@ -264,13 +264,17 @@ impl AudioEncoder {
   /// parallelism).
   ///
   /// # Errors
-  /// [`Error::EmptyAudio`] if `samples` is empty; otherwise any error
+  /// [`Error::EmptyAudio`] if `samples` is empty;
+  /// [`Error::Windowing`]`(`[`WinditError::TooManyWindows`](crate::embeddings::clap::error::WinditError::TooManyWindows)`)`
+  /// if `plan` would plan more than its
+  /// [`max_windows`](crate::embeddings::clap::WindowPlan::max_windows) over this clip (the
+  /// resource rail — refused before any window is embedded); otherwise any error
   /// [`Self::embed_window`] raises for a window.
   pub fn embed_windows(&self, samples: &[f32], plan: &WindowPlan) -> Result<Vec<WindowEmbedding>> {
     if samples.is_empty() {
       return Err(Error::EmptyAudio);
     }
-    let spans = plan.spans(samples.len());
+    let spans = plan.spans(samples.len())?;
     let mut out = Vec::with_capacity(spans.len());
     for span in spans {
       let embedding = self.embed_window(&samples[span.start()..span.end()])?;
