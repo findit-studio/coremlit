@@ -1,13 +1,18 @@
-//! Compute-placement **characterization** for the granite embedder — measured,
-//! never marketed. Pins per-unit embedding agreement (cosine across placements
-//! vs the `CpuOnly` reference) and documents the MEASURED placement reality.
+//! Cross-compute-unit **numerical-consistency** characterization for the granite
+//! embedder — measured, never marketed. Pins per-unit embedding agreement (cosine
+//! across placements vs the `CpuOnly` reference) and documents the MEASURED
+//! placement reality.
 //!
 //! # Measured placement reality (T1)
 //!
 //! Unlike CLAP's audio (HTSAT) tower, the granite ModernBERT graph **does**
-//! compile for the ANE — the T1 probe measured ~97.8% ANE residency and a fp16
-//! cosine of 0.99996 vs a `CpuOnly` reference. This test characterizes that: it
-//! never asserts residency, only that every placement agrees to fp16 tolerance.
+//! compile for the ANE — T1's ANECCompile accepted the graph and its
+//! `CPU_AND_NE` compile plan reported 482/493 ops (97.8%) preferring the ANE — a
+//! planner/compile-eligibility report, NOT measured runtime residency (under
+//! `All`, T1 saw the planner pick the GPU on Macs). fp16 worst cosine 0.99996 vs
+//! the fp32 reference. This test asserts cross-compute-unit numerical consistency
+//! only — every placement agrees with the `CpuOnly` reference to fp16 tolerance;
+//! where ops actually run is never measured nor asserted.
 //!
 //! # What is pinned
 //!
@@ -27,9 +32,10 @@ use coremlit::{
 
 /// Lower bound on the cross-placement cosine over the full public matrix — `All`,
 /// `CpuAndNeuralEngine`, `CpuAndGpu`, `CpuOnly` — each vs the `CpuOnly`
-/// reference. MEASURED worst = 0.99998212 (2026-07-19; the CpuOnly-vs-ANE
-/// fp16/fp32 pair); pinned at 0.9999 with a small fp16 margin. A drop below is a
-/// finding.
+/// reference. MEASURED worst = 0.99998212 (2026-07-19; the
+/// CpuOnly-vs-CpuAndNeuralEngine pair — both arms run the shipped fp16 artifact;
+/// CpuOnly uses CPU arithmetic); pinned at 0.9999 with a small fp16 margin. A drop
+/// below is a finding.
 const MIN_COSINE: f32 = 0.9999;
 
 const UNITS: &[ComputeUnits] = &[

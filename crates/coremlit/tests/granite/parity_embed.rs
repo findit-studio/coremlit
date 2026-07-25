@@ -9,12 +9,15 @@
 //!
 //! # Bands (measure-then-pin)
 //!
-//! The fp32-CPU arm (`ComputeUnits::CpuOnly`) is the PRIMARY gate: CoreML fp32
-//! against transformers fp32 agrees near 1.0. Its two-sided band clears the
-//! MEASURED worst by a margin; a shift in EITHER direction is a finding, not a
-//! threshold to loosen. The default-compute arm (`ComputeUnits::All`, which the
-//! T1 probe measured at ~97.8% ANE / fp16) is CHARACTERIZED separately — its
-//! band is the measured fp16 reality, not floored to the fp32 arm.
+//! The `CpuOnly` arm is the PRIMARY gate: the shipped **fp16** artifact under CPU
+//! compute (`ComputeUnits::CpuOnly` — fp16 weights, CPU arithmetic) against the
+//! committed transformers-**fp32** reference goldens agrees near 1.0. Its
+//! two-sided band clears the MEASURED worst by a margin; a shift in EITHER
+//! direction is a finding, not a threshold to loosen. The default-compute arm
+//! (`ComputeUnits::All`, planner-scheduled — T1 saw the GPU chosen on Macs; the
+//! 97.8% figure is the `CPU_AND_NE` compile plan's ANE-preference report, not an
+//! `All` residency measurement) is CHARACTERIZED separately — its band is the
+//! measured fp16 reality, not floored to the CpuOnly arm.
 //!
 //! Measured 2026-07-19 on this machine (printed by the tests below).
 
@@ -29,16 +32,17 @@ use coremlit::{
 
 // ── MEASURED-then-pinned two-sided bands (measured 2026-07-19; worst cosine over
 //    the 16-entry committed corpus; cosine of two unit-norm vectors == dot). ──
-// fp32-CPU arm (the PRIMARY gate): measured worst = 0.99997884 (entry `near512`);
-// floor pinned at 0.9998 — clears the worst by ~1.9e-4, comfortably over the
-// ~1.8e-5 cross-placement drift (placement.rs) — ceiling just over 1.0 for ULP
-// slop. A shift in EITHER direction is a finding, not a threshold to loosen.
+// CpuOnly arm (the PRIMARY gate; fp16 artifact vs fp32 goldens): measured worst =
+// 0.99997884 (entry `near512`); floor pinned at 0.9998 — clears the worst by
+// ~1.9e-4, comfortably over the ~1.8e-5 cross-placement drift (placement.rs) —
+// ceiling just over 1.0 for ULP slop. A shift in EITHER direction is a finding,
+// not a threshold to loosen.
 const CPU_LO: f32 = 0.9998;
 const CPU_HI: f32 = 1.0 + 1e-4;
-// default-compute (All / fp16-ANE) arm, CHARACTERIZED separately (measured, not
-// floored to the fp32 arm): measured worst = 0.99999928 (entries `url_num` /
-// `short`). The fp16/ANE lowering agrees even TIGHTER than fp32-CPU here, so its
-// floor is pinned higher (0.9999) — this is the measured fp16 reality.
+// default-compute (`All`) arm, CHARACTERIZED separately (measured, not floored to
+// the CpuOnly arm): measured worst = 0.99999928 (entries `url_num` / `short`). It
+// agrees even TIGHTER than the CpuOnly arm here, so its floor is pinned higher
+// (0.9999) — this is the measured fp16 reality.
 const FP16_LO: f32 = 0.9999;
 const FP16_HI: f32 = 1.0 + 1e-4;
 // Non-vacuity ceiling for the negative controls: the measured cross-entry MAX
@@ -76,11 +80,11 @@ fn parity_worst(units: ComputeUnits, tier: &str) -> f32 {
 
 #[test]
 #[ignore = "requires local granite model (EMBEDKIT_TEST_MODELS)"]
-fn parity_vs_goldens_cpu_fp32() {
-  let worst = parity_worst(ComputeUnits::CpuOnly, "cpu-fp32");
+fn parity_vs_fp32_goldens_cpu_only() {
+  let worst = parity_worst(ComputeUnits::CpuOnly, "cpu-only");
   assert!(
     (CPU_LO..=CPU_HI).contains(&worst),
-    "granite fp32-CPU parity worst cosine {worst:.8} outside pinned band [{CPU_LO}, {CPU_HI}] \
+    "granite CpuOnly-vs-fp32-goldens parity worst cosine {worst:.8} outside pinned band [{CPU_LO}, {CPU_HI}] \
      — a shift in EITHER direction is a finding (re-measure, do not just widen)"
   );
 }

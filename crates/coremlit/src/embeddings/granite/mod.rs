@@ -53,12 +53,18 @@
 //!
 //! Placement is characterized, not asserted (`tests/granite/placement.rs`).
 //! Unlike CLAP's audio tower, the granite ModernBERT graph **does** compile for
-//! the ANE (the T1 probe measured ~97.8% ANE residency, fp16 cosine 0.99996 vs a
-//! `CpuOnly` reference). [`crate::ComputeUnits::All`] (the default) lets CoreML
-//! schedule it; the module characterizes the placement rather than claiming it.
+//! the ANE: T1's ANECCompile accepted it and the `CPU_AND_NE` compile plan
+//! reported 482/493 ops (97.8%) preferring the ANE — a planner/compile-eligibility
+//! report, not measured runtime residency. fp16 under `CpuAndNeuralEngine` scored
+//! worst cosine 0.99996 vs the fp32 reference build. [`crate::ComputeUnits::All`]
+//! (the default) lets CoreML schedule it — on T1's Mac the planner chose the GPU
+//! for this small graph; `CpuAndNeuralEngine` targets the ANE. The module
+//! characterizes the placement rather than claiming it.
 
 pub mod embedding;
 pub mod error;
+
+mod token_index;
 
 #[cfg(feature = "serde")]
 mod compute_units_serde;
@@ -80,6 +86,7 @@ use tokenizers::{Tokenizer, TruncationDirection, TruncationParams, TruncationStr
 use crate::embeddings::granite::{
   embedding::{EMBEDDING_DIM, check_finite_output},
   error::Result,
+  token_index::{IndexMeasure, TokenIndex},
 };
 
 /// Bytes of the bundled granite `tokenizer.json` compiled into the crate.
@@ -149,7 +156,9 @@ mod contract {
 pub const MAX_TOKENS: usize = 512;
 
 /// Default [`TextEmbedderOptions::compute`]: [`ComputeUnits::All`]. The granite
-/// ModernBERT graph compiles for the ANE (T1); `All` lets CoreML schedule it.
+/// ModernBERT graph is ANE-capable (T1's `CPU_AND_NE` compile plan: 97.8% of ops
+/// ANE-preferred); `All` lets CoreML schedule it — T1 saw the planner pick the
+/// GPU on Macs for this small graph; `CpuAndNeuralEngine` targets the ANE.
 /// Placement is characterized, not asserted (`tests/granite/placement.rs`).
 pub const DEFAULT_COMPUTE: ComputeUnits = ComputeUnits::All;
 
@@ -628,8 +637,10 @@ impl TextEmbedder {
   /// * `window()` / `overlap()` — the per-chunk token geometry above.
   /// * `max_windows()` — a prediction-count cap: it bounds the CoreML predictions
   ///   dispatched and windit's chunk packing (which is cap-lazy), but NOT the
-  ///   measurement cost of chunking — even a `max_windows()` of `0` tokenizes the
-  ///   whole input unless `max_input_bytes` is set.
+  ///   chunker's measurement cost — even a `max_windows()` of `0` tokenizes the
+  ///   whole input once to build the single-pass token index (which then answers
+  ///   every candidate-range measure without re-encoding) unless `max_input_bytes`
+  ///   is set.
   ///
   /// # Errors
   /// [`Error::InputTooLarge`] if `text` exceeds `max_input_bytes`;
@@ -969,36 +980,31 @@ fn chunk_long(
   text: &str,
   opts: &WindowOptions,
 ) -> Result<Vec<windit::split::Chunk>> {
-  // Blanket `MeasureText` impl over any `Fn(&str) -> usize`. A tokenizer error
-  // folds to `usize::MAX` ("does not fit"), so the chunker descends to a smaller
-  // range; a persistent failure resurfaces as `Error::Tokenize` from the
-  // per-chunk `token_ids` in `embed_long_with`. The closure cannot stop early
-  // (the tokenizers crate exposes no incremental token count on its stable
-  // surface), so a giant untrusted input is scanned a few times even under a
-  // `max_windows` cap — a recorded limitation, not silently fine. Mitigated by
-  // `LongTextOptions::max_input_bytes` (the pre-tokenization byte gate); windit's
-  // `measure_within` hook exists should the tokenizer ever grow incremental
-  // encoding.
-  let measure = |s: &str| -> usize {
-    measure_tok
-      .encode(s, true)
-      .map(|e| e.get_ids().len())
-      .unwrap_or(usize::MAX)
-  };
-  // Fallible companion for the granite-side own-chunk / whole-input decisions.
-  // The infallible `measure` above folds encode errors to `usize::MAX` ("does
-  // not fit"), which is right for windit's descent but would misreport an
-  // encode failure as `ContentlessInputOverBudget { tokens: usize::MAX }` here;
-  // this one surfaces the failure as `Error::Tokenize` — the same variant the
-  // per-chunk `token_ids` re-raise, one call earlier. The two are deliberately
-  // NOT unified.
-  let measure_checked = |s: &str| -> Result<usize> {
-    measure_tok
-      .encode(s, true)
-      .map(|e| e.get_ids().len())
-      .map_err(Error::Tokenize)
-  };
-  let chunks = windit::split::ContentAware::new(&measure)
+  // Tokenize the whole input ONCE into a `TokenIndex`, then answer every range
+  // measure from it: `index.measure_range(a, b)` returns exactly
+  // `encode(&text[a..b], true).len()` — the count the old per-call
+  // `encode(substring)` closure returned — but without re-encoding the growing
+  // pack prefix that made chunking re-encode ~11× the input. An encode failure
+  // during the build surfaces as `Error::Tokenize`, the same variant the
+  // per-chunk `token_ids` in `embed_long_with` would raise one call later; the
+  // `input_too_large` / window gate in `validate_long_input` has already run, so
+  // this build is the first (and only whole-input) tokenization, exactly the cost
+  // the old descent's first whole-input measure carried.
+  let index = TokenIndex::build(measure_tok, text)?;
+  // windit measures through this adapter — a real `MeasureText` impl, not a
+  // blanket closure. It recovers each subslice's byte range by pointer offset and
+  // folds an encode error to `usize::MAX` ("does not fit"), so windit descends to
+  // a smaller range and a persistent failure resurfaces from the per-chunk
+  // `token_ids` later — the same behaviour the old infallible `measure` closure
+  // had. The granite-side repair below instead calls `measure_range` directly
+  // (fallible), surfacing an encode failure as `Error::Tokenize` at synthesis
+  // rather than a bogus `ContentlessInputOverBudget { tokens: usize::MAX }` — the
+  // same split the old `measure` / `measure_checked` pair drew, deliberately not
+  // unified.
+  let measurer = IndexMeasure::new(text, &index, measure_tok);
+  let measure_checked =
+    |a: usize, b: usize| -> Result<usize> { index.measure_range(measure_tok, text, a, b) };
+  let chunks = windit::split::ContentAware::new(&measurer)
     .chunk(text, opts)
     .map_err(Error::from)?;
   let mut repaired = attach_gaps(text, chunks, &measure_checked, opts.window())?;
@@ -1013,7 +1019,7 @@ fn chunk_long(
   // `max_windows` re-check, so contentless over-budget input under
   // `max_windows == 0` yields `ContentlessInputOverBudget`, not `TooManyWindows`.
   if repaired.is_empty() && !text.is_empty() {
-    let tokens = measure_checked(text)?;
+    let tokens = measure_checked(0, text.len())?;
     if tokens > MAX_TOKENS {
       return Err(Error::ContentlessInputOverBudget {
         start: 0,
@@ -1089,7 +1095,7 @@ fn chunk_long(
 fn attach_gaps(
   text: &str,
   chunks: Vec<windit::split::Chunk>,
-  measure: &dyn Fn(&str) -> Result<usize>,
+  measure: &dyn Fn(usize, usize) -> Result<usize>,
   window: usize,
 ) -> Result<Vec<windit::split::Chunk>> {
   use windit::split::Chunk;
@@ -1100,24 +1106,25 @@ fn attach_gaps(
   let mut cur = first;
   // Leading gap: extend the first chunk left to byte 0, else emit the gap alone
   // (measured and refused past MAX_TOKENS, never left for the embed path to
-  // silently truncate).
+  // silently truncate). `measure(a, b)` is the exact untruncated count of
+  // `text[a..b]`, answered from the `TokenIndex`.
   if cur.start() > 0 {
-    if measure(&text[..cur.end()])? <= window {
+    if measure(0, cur.end())? <= window {
       cur = Chunk::new(0, cur.end());
     } else {
-      out.push(own_chunk(text, 0, cur.start(), measure)?);
+      out.push(own_chunk(0, cur.start(), measure)?);
     }
   }
   for mut next in chunks.into_iter().skip(1) {
     let (gap_start, gap_end) = (cur.end(), next.start());
     if gap_start < gap_end {
-      if measure(&text[cur.start()..gap_end])? <= window {
+      if measure(cur.start(), gap_end)? <= window {
         cur = Chunk::new(cur.start(), gap_end);
-      } else if measure(&text[gap_start..next.end()])? <= window {
+      } else if measure(gap_start, next.end())? <= window {
         next = Chunk::new(gap_start, next.end());
       } else {
         out.push(cur);
-        out.push(own_chunk(text, gap_start, gap_end, measure)?);
+        out.push(own_chunk(gap_start, gap_end, measure)?);
         cur = next;
         continue;
       }
@@ -1127,10 +1134,10 @@ fn attach_gaps(
   }
   // Trailing gap: extend the last chunk to `text.len()`, else emit the gap alone.
   if cur.end() < text.len() {
-    if measure(&text[cur.start()..])? <= window {
+    if measure(cur.start(), text.len())? <= window {
       cur = Chunk::new(cur.start(), text.len());
     } else {
-      let tail = own_chunk(text, cur.end(), text.len(), measure)?;
+      let tail = own_chunk(cur.end(), text.len(), measure)?;
       out.push(cur);
       cur = tail;
     }
@@ -1139,8 +1146,8 @@ fn attach_gaps(
   Ok(out)
 }
 
-/// Builds the pure-separator own-chunk spanning `text[start..end]`, measuring
-/// its run first: a gap measuring past [`MAX_TOKENS`] would be silently
+/// Builds the pure-separator own-chunk spanning the `start..end` byte range,
+/// measuring its run first: a gap measuring past [`MAX_TOKENS`] would be silently
 /// right-truncated by the embed path (dropping its suffix tokens), so it is
 /// refused with [`Error::ContentlessInputOverBudget`] instead. The `(window,
 /// MAX_TOKENS]` tolerance is kept — the same shape as windit's lone oversized
@@ -1150,12 +1157,11 @@ fn attach_gaps(
 /// [`Error::ContentlessInputOverBudget`] if the run exceeds [`MAX_TOKENS`];
 /// [`Error::Tokenize`] if the measuring tokenizer fails to encode it.
 fn own_chunk(
-  text: &str,
   start: usize,
   end: usize,
-  measure: &dyn Fn(&str) -> Result<usize>,
+  measure: &dyn Fn(usize, usize) -> Result<usize>,
 ) -> Result<windit::split::Chunk> {
-  let tokens = measure(&text[start..end])?;
+  let tokens = measure(start, end)?;
   if tokens > MAX_TOKENS {
     return Err(Error::ContentlessInputOverBudget {
       start,
