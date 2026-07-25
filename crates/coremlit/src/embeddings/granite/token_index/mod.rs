@@ -28,15 +28,9 @@
 //! contract + SHA-identity gate (production `chunk_long` only ever sees this one
 //! artifact):
 //! * `normalizer: null` → reported offsets are literal original-text bytes; no
-//!   cross-boundary normalization — with ONE caveat [`TokenIndex::build`] guards
-//!   against: the BPE vocab is MISSING a few single-byte ByteLevel-alphabet tokens
-//!   and has `unk_token: null`, so `tokenizers` silently DROPS those byte-level
-//!   chars (VT 0x0B, FF 0x0C, NUL, other C0 controls, the 0xF1-0xF4 plane-4+ lead
-//!   bytes) from the id stream AND mis-attributes the surviving tokens' offsets.
-//!   The reconstructed tiling still passes every monotone/covering/char-aligned
-//!   check, so `build` detects the drop by a byte-coverage count
-//!   (`Σ chars(token) == text.len()`) and falls back to `direct_only` rather than
-//!   trust a corrupted offset chain.
+//!   cross-boundary normalization. (A vocab drop can still corrupt the offset CHAIN
+//!   while every tiling check keeps passing — the byte-coverage guard under
+//!   "Build-time fallback guards" below is what catches that.)
 //! * `pre_tokenizer` = `Sequence[ Split(o200k-style regex, Isolated),
 //!   ByteLevel(add_prefix_space=false, use_regex=false) ]` → pre-tokens are the
 //!   Split-regex pieces; they **tile** the text (every char matches some branch,
@@ -75,6 +69,44 @@
 //!      digit pulls nothing. A cut whose right edge lands in a run merges it
 //!      (end-of-substring), so `b` on a pre-token boundary is not enough — the run
 //!      must be re-encoded looking beyond `b`.
+//!
+//! # Build-time fallback guards
+//!
+//! Two conditions void the offset reconstruction the range machinery reads back;
+//! [`TokenIndex::build`] detects each with one cheap linear pass — never a second
+//! `encode` — and returns a `direct_only` index that answers every measure by an
+//! exact substring encode (today's behaviour at today's cost). Both are
+//! output-identical: the production per-chunk `token_ids` re-encode runs the SAME
+//! tokenizer, so chunk boundaries and embeddings are unchanged; only the measure
+//! path switches to direct-encode for these rare inputs.
+//!
+//! 1. **Byte-coverage (dropped byte-level chars).** The BPE has `unk_token: null`
+//!    and its vocab is MISSING a handful of single-byte ByteLevel-alphabet tokens,
+//!    so `tokenizers` silently DROPS any such char — emitting no id AND no token —
+//!    and mis-attributes the surviving tokens' offsets. The missing single-byte set
+//!    is exactly NUL 0x00, the C0 controls 0x04-0x07 / 0x0B / 0x0C / 0x0E-0x1A /
+//!    0x1C-0x1F (but NOT 0x01-0x03 / 0x08-0x0A / 0x0D / 0x1B / 0x7F, which ARE
+//!    present), 0xC0 / 0xC1, and the 4-byte lead bytes 0xF1 / 0xF2 / 0xF4-0xFF —
+//!    planes 4-11 and 16. 0xF3 (planes 12-15, incl. the TAG and PUA-A blocks) IS
+//!    present, and 0xC0 / 0xC1 / 0xF5-0xFF never occur in valid UTF-8. ByteLevel
+//!    maps each ORIGINAL byte to exactly one byte-level char, so the chars retained
+//!    across all token strings must number `text.len()`; a shortfall proves a drop.
+//!    The chained `ends` stay monotone, covering, and char-aligned even then, so no
+//!    downstream tiling check sees it — only this count does.
+//! 2. **Added-token lookaround.** The "no lookbehind ⇒ two deterministic parses
+//!    agree forward from any shared boundary" premise the pre-token machinery rests
+//!    on is FALSE for the artifact's `single_word` added tokens (the 44
+//!    `<|reserved_2000xx|>` literals): each matches ONLY when flanked by non-word
+//!    chars or a text edge, so a clean cut that strips a word-char neighbour makes a
+//!    SUBSTRING match a literal the full text never did, and the measure then
+//!    OVER-counts against a true re-encode. `build` fetches every added-vocabulary
+//!    literal and falls back whenever ANY occurs in `text`: absent from `text` ⇒
+//!    absent from every substring ⇒ no added-token match can fire on EITHER side of
+//!    any comparison, leaving a pure Split-regex+BPE encode (sweep-proven exact);
+//!    present ⇒ `direct_only` ⇒ exact by definition. Covering ALL added tokens — the
+//!    context-free specials too, not just the `single_word` ones — is deliberate
+//!    over-coverage: no per-flag proof, harmless since added literals are
+//!    vanishingly rare in real text.
 
 use tokenizers::Tokenizer;
 
@@ -180,9 +212,11 @@ impl TokenIndex {
 
     // Byte-coverage guard (the vocab-drop hazard). The pinned granite BPE has
     // `unk_token: null` and its vocab is MISSING some single-byte ByteLevel-alphabet
-    // tokens (VT 0x0B, FF 0x0C, NUL, other C0 controls, the 0xF1-0xF4 plane-4+ lead
-    // bytes, …). `tokenizers` then SILENTLY DROPS any byte-level char whose one-byte
-    // token is absent — emitting no id AND no token — and mis-attributes the
+    // tokens (NUL, VT 0x0B, FF 0x0C, most C0 controls, and the 0xC0/0xC1 & 0xF1/0xF2/
+    // 0xF4-0xFF lead bytes — NOT 0xF3, nor 0x01-0x03/0x08-0x0A/0x0D/0x1B/0x7F, which
+    // are present; the module docs list the exact set). `tokenizers` then SILENTLY
+    // DROPS any byte-level char whose one-byte token is absent — emitting no id AND
+    // no token — and mis-attributes the
     // surviving tokens' offsets. ByteLevel maps each ORIGINAL byte to exactly one
     // byte-level char, so the byte-level chars retained across ALL token strings
     // must number `text.len()`; a shortfall proves a drop happened. The chained
@@ -197,6 +231,31 @@ impl TokenIndex {
     // these rare inputs.
     let byte_level_chars: usize = enc.get_tokens().iter().map(|t| t.chars().count()).sum();
     if byte_level_chars != text.len() {
+      return Ok(Self::direct_only());
+    }
+
+    // Added-token lookaround guard (module docs, "Build-time fallback guards" #2):
+    // the artifact's `single_word` added tokens match only when flanked by non-word
+    // chars or a text edge, so a cut that strips a word-char neighbour can make a
+    // SUBSTRING match a literal the full text never did — over-counting the measure.
+    // Fall back to exact direct encoding whenever ANY added-vocabulary literal occurs
+    // in `text` (absent ⇒ absent from every substring ⇒ no added-token match fires on
+    // either side; present ⇒ direct_only, exact by definition). `get_vocab()` BORROWS
+    // the content→id map (no per-build clone); a lead-byte pre-filter derived from the
+    // literals themselves — for the pinned artifact exactly `<` and `[`, the `<|…|>`
+    // forms and `[MASK]`, NOT one shared prefix — skips the whole-literal scan on
+    // natural text. Neither step calls `encode`, so the hermetic byte-ratio gate is
+    // untouched.
+    let added = measure_tok.get_added_vocabulary().get_vocab();
+    let mut literal_lead = [false; 256];
+    for lit in added.keys() {
+      if let Some(&b) = lit.as_bytes().first() {
+        literal_lead[b as usize] = true;
+      }
+    }
+    if text.bytes().any(|b| literal_lead[b as usize])
+      && added.keys().any(|lit| text.contains(lit.as_str()))
+    {
       return Ok(Self::direct_only());
     }
 

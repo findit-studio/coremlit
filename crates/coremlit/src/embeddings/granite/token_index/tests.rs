@@ -278,14 +278,17 @@ fn direct_only_fallback_is_still_exact() {
   }
 }
 
-// ── F7: the four killer classes Fable's adversarial differential surfaced ──────
+// ── F7: the killer classes Fable's adversarial differential surfaced ──────
 //
 // The layer-1/2 corpora above miss every class that can actually dissolve a
 // full-parse boundary under a cut: their whitespace probe `"a   b   c"` has runs
 // GLUED by the surrounding letters (branch-1's leading ` ?` pulls the run's last
 // space into the next word), so it can never diverge. These generators add the
 // classes that CAN — swept over every `char`-boundary pair they reproduce the
-// ~500 pre-fix divergences and MUST now be zero:
+// ~500 pre-fix divergences and MUST now be zero. K1-K4 keep the INDEX path live (no
+// dropped byte, no added literal), so the big cross-class join built from them
+// exercises the fast path; the byte-coverage FALLBACK classes live in
+// `DROPPABLE_KILLERS`, and the added-token class in the F9/K6 tests below.
 //   K1  a whitespace run split by a NON-glue follower (digit/punct/emoji): the
 //       forward glue is narrow — the word branches pull a single non-CR/LF
 //       whitespace into a following letter/mark, the punct branch only a literal
@@ -298,16 +301,6 @@ fn direct_only_fallback_is_still_exact() {
 //       the following word once the left context is cut.
 //   K4  combining / Other_Alphabetic marks (`\p{M}`, and Mn/Mc the regex glues but
 //       `is_alphanumeric` does not).
-//   K5  a vocab-dropped byte-level char: the pinned BPE has `unk_token: null` and
-//       is MISSING some single-byte ByteLevel tokens (VT 0x0B, FF 0x0C, NUL, other
-//       C0 controls, the 0xF1-0xF4 plane-4+ lead bytes), so `tokenizers` silently
-//       DROPS that byte-level char AND mis-attributes the surviving tokens'
-//       offsets. `TokenIndex::build` chains those offsets into `ends` that stay
-//       monotone, covering, and char-aligned, so every tiling check passes and the
-//       corruption is invisible to `direct_only` — only the byte-coverage guard
-//       catches it. The dropped byte must sit inside a piece with OTHER surviving
-//       tokens (a LONE dropped char is a zero-token piece the word-id-gap check
-//       already catches).
 const KILLERS: &[&str] = &[
   // K1 — whitespace run split by a non-glue follower.
   "456  1",
@@ -375,23 +368,47 @@ const KILLERS: &[&str] = &[
   "/usr/local/bin",
   "a//b//c",
   "x.\r\n/y/z",
-  // K5 — vocab-dropped byte-level chars (each string carries at least one, sitting
-  // inside a piece with surviving tokens). Post-guard these all fall back to the
-  // exact direct encode; pre-guard the corrupted offsets under/over-count.
-  "\u{c}\n\u{2003}\u{202f}\nﬃ\u{5b4}\u{64b}23", // the minimal witness (FF leads a ws run)
+  // 4-byte chars with a 0xF3 lead (TAG plane 14, PUA-A plane 15) are PRESENT in the
+  // vocab → NO drop; the index path stays live and must measure exactly (the
+  // correction to the wrong "0xF1-0xF4 all drop" claim — 0xF3 is in the vocab).
+  "tag\u{E0067}\u{E0067}\nﬀ\u{5b4}7", // plane-14 TAG chars (0xF3 lead) + ligature+mark
+];
+
+/// K5 — vocab-DROPPED byte-level chars. Each string carries a char whose single-byte
+/// ByteLevel token is MISSING from the pinned BPE (`unk_token: null`), so
+/// `tokenizers` silently DROPS it and mis-attributes the surviving tokens' offsets;
+/// `TokenIndex::build` chains those into `ends` that stay monotone, covering, and
+/// char-aligned (every tiling check passes), so only the byte-coverage guard catches
+/// it → the `direct_only` fallback (exact by direct encode). The missing single-byte
+/// set is NUL 0x00, the C0 controls 0x04-0x07 / 0x0B / 0x0C / 0x0E-0x1A / 0x1C-0x1F
+/// (NOT 0x01-0x03 / 0x08-0x0A / 0x0D / 0x1B / 0x7F, which are present), and the
+/// 4-byte lead bytes 0xC0 / 0xC1 and 0xF1 / 0xF2 / 0xF4-0xFF (0xF3 — planes 12-15,
+/// incl. TAG/PUA — IS present). Each dropped char sits inside a piece with OTHER
+/// surviving tokens (a LONE dropped char is a zero-token piece the word-id-gap check
+/// already catches).
+const DROPPABLE_KILLERS: &[&str] = &[
+  // C0 controls (the byte-coverage witnesses).
+  "\u{c}\n\u{2003}\u{202f}\nﬃ\u{5b4}\u{64b}23", // FF leads a ws run (minimal witness)
   "\u{b}\n\u{2003}\u{202f}\nﬃ\u{5b4}\u{64b}23", // VT variant
   "a\u{c}\n\u{2003}word 12",
   "x\u{b}\ny\u{2009}\u{2009}9",
   "p\u{0}q\nﬃ\u{5b4}z8",       // NUL inside a run
   "m\u{7}\n\u{2003}n\u{64b}5", // BEL (a 0x04-0x1F C0 control)
   "\u{c}\u{c}\n\u{3000}\u{3000}ﬃ\u{93e}9",
-  "tag\u{E0067}\u{E0067}\nﬀ\u{5b4}7", // plane-4 TAG chars (0xF3 lead) + ligature+mark
   "list:\u{1f}item\n\u{2003}\u{5b4}4", // 0x1F control mid-word
+  // Real non-BMP drops (0xF1/0xF2/0xF4 leads — the planes the old K5 "TAG" string, a
+  // 0xF3 lead, wrongly claimed to cover; verified codepoint→lead-byte in the tests).
+  "a\u{40000}b 12",                // U+40000 → 0xF1 lead (plane 4)
+  "q\u{80000}\n\u{2003}r 3",       // U+80000 → 0xF2 lead (plane 8)
+  "t\u{100000}u\u{2009}\u{2009}8", // U+100000 → 0xF4 lead (plane 16)
 ];
 
-/// A seeded fragment-soup: random short fragments drawn from an alphabet of every
-/// killer char, concatenated — the cross-class adjacencies the fixed strings miss.
-fn fragment_soup(seed: u64, target_chars: usize) -> String {
+/// A seeded DROPPABLE fragment-soup: random short fragments over an alphabet that
+/// ALWAYS includes vocab-dropped byte-level chars, so `build` takes the byte-coverage
+/// FALLBACK arm — the merge gate uses it to sweep the `direct_only` path under
+/// cross-class adjacency. (The K5-free index-path twin is
+/// `k5_free_soup_exercises_index_path`.)
+fn droppable_fragment_soup(seed: u64, target_chars: usize) -> String {
   const FRAGS: &[&str] = &[
     "a",
     "b",
@@ -442,13 +459,15 @@ fn fragment_soup(seed: u64, target_chars: usize) -> String {
     " ",
     "x",
     "y",
-    // K5 — vocab-droppable byte-level chars (silently dropped, byte-coverage
-    // guard catches the resulting offset corruption).
-    "\u{000B}",  // VT
-    "\u{000C}",  // FF
-    "\u{0000}",  // NUL
-    "\u{0007}",  // BEL (a 0x04-0x1F C0 control)
-    "\u{E0067}", // a plane-4 TAG char (0xF3 lead byte)
+    // K5 — vocab-droppable byte-level chars (silently dropped → byte-coverage guard →
+    // direct_only). C0 controls plus REAL non-BMP droppers (0xF1/0xF2/0xF4 leads); the
+    // old TAG entry (0xF3) is PRESENT and did NOT drop, so it is removed.
+    "\u{000B}",   // VT (0x0B)
+    "\u{000C}",   // FF (0x0C)
+    "\u{0000}",   // NUL (0x00)
+    "\u{0007}",   // BEL (a 0x04-0x1F C0 control)
+    "\u{40000}",  // U+40000 → 0xF1 lead (plane 4)
+    "\u{100000}", // U+100000 → 0xF4 lead (plane 16)
   ];
   let mut rng = Rng(seed);
   let mut s = String::new();
@@ -506,25 +525,51 @@ fn count_divergences(
   tested
 }
 
-/// THE MERGE GATE (exhaustive adversarial differential). Over the four killer
-/// classes, one big cross-class concatenation, and seeded fragment-soup, every
+/// THE MERGE GATE (exhaustive adversarial differential). Over the killer classes,
+/// one big cross-class concatenation, and seeded fragment-soups, every
 /// `measure_range(a, b)` MUST equal `encode(&text[a..b], true).len()`. This
 /// reproduced ~500 divergences against the pre-fix single pass; it must be zero.
+///
+/// F10 integrity: the clean `KILLERS` and the big join are droppable-free and
+/// added-literal-free, and the join is LIVENESS-ASSERTED `!direct_only`, so they
+/// exercise the INDEX path — not the trivial `direct_only` arm. `DROPPABLE_KILLERS`
+/// and the droppable soups separately sweep the byte-coverage FALLBACK arm.
 #[test]
 fn measure_range_zero_divergence_over_killers() {
   let tok = measuring_tok();
   let mut out: Vec<(String, usize, usize, usize, usize)> = Vec::new();
   let mut pairs = 0usize;
 
+  // Clean killers — the INDEX path.
   for &text in KILLERS {
     pairs += count_divergences(&tok, text, 96, &mut out);
   }
-  // One big cross-class string: every killer boundary meets every other.
+  // Droppable killers — the byte-coverage FALLBACK arm (still exactly 0-divergence by
+  // direct encode); assert each genuinely trips a build-time guard.
+  for &text in DROPPABLE_KILLERS {
+    assert!(
+      TokenIndex::build(&tok, text)
+        .expect("build droppable")
+        .direct_only,
+      "droppable killer must trip a build-time guard (direct_only): {text:?}"
+    );
+    pairs += count_divergences(&tok, text, 96, &mut out);
+  }
+  // One big cross-class string, built from the CLEAN killers so every clean boundary
+  // meets every other ON THE INDEX PATH. Liveness-asserted: a dropped byte or added
+  // literal sneaking in would trip a build guard and silently gut this strongest
+  // cross-class generator (the F10 regression this guards against).
   let big: String = KILLERS.join(" | ");
+  assert!(
+    !TokenIndex::build(&tok, &big)
+      .expect("build big join")
+      .direct_only,
+    "the big cross-class join must exercise the INDEX path, not the direct_only arm"
+  );
   pairs += count_divergences(&tok, &big, 200, &mut out);
-  // Seeded fragment-soup, several documents.
+  // Droppable fragment-soups — the fallback arm under cross-class adjacency.
   for seed in 0..6u64 {
-    let soup = fragment_soup(0xA5A5_0000 ^ (seed.wrapping_mul(0x9E37_79B9)), 160);
+    let soup = droppable_fragment_soup(0xA5A5_0000 ^ (seed.wrapping_mul(0x9E37_79B9)), 160);
     pairs += count_divergences(&tok, &soup, 200, &mut out);
   }
 
@@ -633,5 +678,228 @@ fn witness_f8_vocab_dropped_byte_corrupts_index_offsets() {
   assert!(
     index.direct_only,
     "the byte-coverage guard must reject the corrupted reconstruction (direct_only)"
+  );
+}
+
+/// F9 witness (added-token lookaround, over-count): `<|reserved_200020|>` is a
+/// `single_word` added token — it matches ONLY when flanked by non-word chars or a
+/// text edge. In `"a<|reserved_200020|>b 12  3"` the literal is glued between the
+/// word chars `a` and `b`, so the FULL parse tokenizes it as ordinary Split+BPE; but
+/// the substring `[1,20)` IS the bare literal, which re-encodes to the single
+/// added-token id. Pre-guard the index measured 10 for what `encode` counts as 3 —
+/// the forward-determinism premise fails for single-word added tokens. The
+/// added-token guard rejects the reconstruction (direct_only), restoring exactness.
+#[test]
+fn witness_f9_added_token_lookaround_guard() {
+  let tok = measuring_tok();
+  let text = "a<|reserved_200020|>b 12  3";
+  assert_eq!(&text[1..20], "<|reserved_200020|>");
+  let index = TokenIndex::build(&tok, text).expect("build");
+  assert!(
+    index.direct_only,
+    "the added-token guard must reject the reconstruction (direct_only)"
+  );
+  assert_eq!(
+    index.measure_range(&tok, text, 1, 20).unwrap(),
+    oracle(&tok, "<|reserved_200020|>"),
+    "F9: [1,20) must equal encode(\"<|reserved_200020|>\") = 3, not the index over-count"
+  );
+}
+
+/// K6 — added-vocabulary literals in text (44 `single_word` reserved + 22 specials,
+/// 66 total). ANY of them can make a SUBSTRING match a literal the full text never
+/// did (F9), so the added-token guard fires on every one: `build` is `direct_only`
+/// and every pair measures exactly by direct encode. (Fable's review template proved
+/// the RED pre-fix behaviour; this asserts the FIXED behaviour.)
+#[test]
+fn added_literals_guard_fires_and_measures_exactly() {
+  let tok = measuring_tok();
+  for text in [
+    "pre <|endoftext|> post",
+    "<|startoftext|>x<|return|>",
+    "a<|reserved_200020|>b 12  3",
+    "no<|end|>break\u{2009}\u{2009}9",
+    "[MASK] in text",
+    "mix <|reserved_200063|> and <|call|> here",
+  ] {
+    let index = TokenIndex::build(&tok, text).expect("build");
+    assert!(
+      index.direct_only,
+      "the added-token guard must fire (direct_only) for {text:?}"
+    );
+    let bounds = char_boundaries(text);
+    for i in 0..bounds.len() {
+      for j in (i + 1)..bounds.len() {
+        check(&index, &tok, text, bounds[i], bounds[j]);
+      }
+    }
+  }
+}
+
+/// F11 — REAL non-BMP droppers. The vocab is missing the 4-byte lead bytes 0xF1 /
+/// 0xF2 / 0xF4-0xFF (planes 4-11 and 16), so a codepoint in those planes drops a
+/// byte-level char → byte-coverage guard → `direct_only` (exact by direct encode).
+/// The codepoint→lead-byte mappings are verified in-test. (The old K5 "TAG" string,
+/// a 0xF3 lead, is PRESENT and does NOT drop; these are the classes that actually
+/// do.)
+#[test]
+fn real_nonbmp_drops_fall_back_and_stay_exact() {
+  // Lead byte of a codepoint's UTF-8: confirm the plane→lead mapping the fixtures
+  // rely on, so a wrong codepoint cannot silently pass by NOT dropping.
+  fn lead(cp: char) -> u8 {
+    let mut buf = [0u8; 4];
+    cp.encode_utf8(&mut buf).as_bytes()[0]
+  }
+  assert_eq!(lead('\u{40000}'), 0xF1);
+  assert_eq!(lead('\u{80000}'), 0xF2);
+  assert_eq!(lead('\u{100000}'), 0xF4);
+  assert_eq!(lead('\u{7FFFF}'), 0xF1);
+  assert_eq!(lead('\u{10FFFD}'), 0xF4);
+
+  let tok = measuring_tok();
+  for text in [
+    "a\u{40000}b 12",                           // U+40000 → 0xF1 (plane 4)
+    "a\u{40000}b 12  3",                        // + trailing ws-run split
+    "q\u{80000}\n\u{2003}r 3",                  // U+80000 → 0xF2 (plane 8)
+    "q\u{80000}\n\u{2003}\u{FB03}\u{5b4}r 3",   // + ligature + combining mark
+    "t\u{100000}u\u{2009}\u{2009}8",            // U+100000 → 0xF4 (plane 16)
+    "x \u{7FFFF}\u{7FFFF} y9\u{2009}\u{2009}8", // U+7FFFF → 0xF1
+    "\u{10FFFD}\u{10FFFD} end.\r\n\r\nNext",    // U+10FFFD → 0xF4
+  ] {
+    let index = TokenIndex::build(&tok, text).expect("build");
+    assert!(
+      index.direct_only,
+      "non-BMP drop must fall back to direct_only for {text:?}"
+    );
+    let bounds = char_boundaries(text);
+    for i in 0..bounds.len() {
+      for j in (i + 1)..bounds.len() {
+        check(&index, &tok, text, bounds[i], bounds[j]);
+      }
+    }
+  }
+}
+
+/// F11 — 0xF3-lead 4-byte chars (TAG plane 14, PUA-A plane 15) are PRESENT in the
+/// vocab: NO drop, so the index path stays LIVE and must still measure every pair
+/// exactly. This is the correction to the wrong "0xF1-0xF4 all drop" claim — 0xF3
+/// is in the vocab, so its planes index cleanly.
+#[test]
+fn tag_and_pua_do_not_drop_and_index_stays_exact() {
+  fn lead(cp: char) -> u8 {
+    let mut buf = [0u8; 4];
+    cp.encode_utf8(&mut buf).as_bytes()[0]
+  }
+  assert_eq!(lead('\u{E0067}'), 0xF3); // TAG (plane 14)
+  assert_eq!(lead('\u{F0000}'), 0xF3); // PUA-A (plane 15)
+
+  let tok = measuring_tok();
+  for text in [
+    "tag\u{E0067}\u{E0067}\nﬀ\u{5b4}7",
+    "lang\u{E0001}tag 12  3",
+    "pua\u{F0000}\u{FFFFD}z\u{2009}\u{2009}9",
+  ] {
+    let index = TokenIndex::build(&tok, text).expect("build");
+    assert!(
+      !index.direct_only,
+      "0xF3-lead chars do not drop; the index path must stay live for {text:?}"
+    );
+    let bounds = char_boundaries(text);
+    for i in 0..bounds.len() {
+      for j in (i + 1)..bounds.len() {
+        check(&index, &tok, text, bounds[i], bounds[j]);
+      }
+    }
+  }
+}
+
+/// F10 — the cross-class INDEX-path coverage the accidental K5 fragments removed from
+/// the committed soups (which now all trip the byte-coverage guard and run the direct
+/// arm). These soups draw ONLY from droppable-free, added-literal-free fragments, so
+/// `build` stays on the index fast path (asserted), and every pair must still measure
+/// exactly. This restores the strongest index-path cross-class generator.
+#[test]
+fn k5_free_soup_exercises_index_path() {
+  fn clean_soup(seed: u64, target_chars: usize) -> String {
+    // No vocab-droppable byte-level char and no added-token literal, so `build` keeps
+    // the index path.
+    const FRAGS: &[&str] = &[
+      "a",
+      "b",
+      "c",
+      "Z",
+      "it",
+      "café",
+      "no",
+      "  ",
+      "   ",
+      "\t",
+      "\t\t",
+      "\u{00A0}",
+      "\u{00A0}\u{00A0}",
+      "\u{2009}",
+      "\u{2003}",
+      "\u{3000}",
+      "\r\n",
+      "\r\n\r\n",
+      "\n",
+      "\n\n",
+      "1",
+      "12",
+      "123",
+      "1234",
+      "٧",
+      "٨٩",
+      "５",
+      "'s",
+      "'t",
+      "'re",
+      "'ll",
+      "!",
+      "!!",
+      ".",
+      "...",
+      "/",
+      "//",
+      "#",
+      ",",
+      "(",
+      ")",
+      "🍕",
+      "🌿",
+      "\u{0301}",
+      "\u{093E}",
+      "\u{064B}",
+      " ",
+      "x",
+      "y",
+    ];
+    let mut rng = Rng(seed);
+    let mut s = String::new();
+    while s.chars().count() < target_chars {
+      s.push_str(FRAGS[rng.below(FRAGS.len())]);
+    }
+    s
+  }
+  let tok = measuring_tok();
+  let mut out: Vec<(String, usize, usize, usize, usize)> = Vec::new();
+  let mut pairs = 0usize;
+  for seed in 100..106u64 {
+    let soup = clean_soup(0x5EED_0000 ^ (seed.wrapping_mul(0x9E37_79B9)), 160);
+    let index = TokenIndex::build(&tok, &soup).expect("build");
+    assert!(
+      !index.direct_only,
+      "clean soup must take the index path (not direct_only): {soup:?}"
+    );
+    pairs += count_divergences(&tok, &soup, 200, &mut out);
+  }
+  eprintln!("[k5-free-soup] pairs={pairs} divergences={}", out.len());
+  for (t, a, b, got, want) in out.iter().take(10) {
+    eprintln!("  DIVERGE ({a},{b}) got={got} want={want} in {t:?}");
+  }
+  assert!(
+    out.is_empty(),
+    "{} divergences over {pairs} pairs",
+    out.len()
   );
 }
