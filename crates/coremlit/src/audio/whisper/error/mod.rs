@@ -193,6 +193,42 @@ pub enum SegmentError {
     /// The element strides the probe allocation actually reported.
     strides: Vec<usize>,
   },
+  /// This host's CoreVideo handed back a Float16 surface whose storage past
+  /// the logical element count was **not** zero, so the tail Swift's gather
+  /// reads but never writes cannot be reproduced.
+  ///
+  /// Swift's destination array
+  /// (`SegmentSeeker.swift:450`,
+  /// `MLMultiArray(shape:dataType:initialValue: FloatType(0))`) fills only
+  /// its logical `count` elements — the row pitch's padding, and every
+  /// element the gather's `columnCount`-pitched `memcpy` overruns into, keep
+  /// whatever `CVPixelBufferCreate` left. `dynamicTimeWarping` then reads
+  /// those cells as alignment weights. This port reproduces them by
+  /// allocating the same surface and looking at that region before touching
+  /// it; when the region comes back zero — as it does on every host measured
+  /// so far — Swift's DTW input is fully determined and reproducible.
+  ///
+  /// Nonzero means it is not: the values Swift would feed DTW came from
+  /// *its* allocation, which this port cannot observe and could not
+  /// reproduce even if it could. Fail-closed for the same reason as
+  /// [`Self::AlignmentPitchUnavailable`] — an unreproducible input is not an
+  /// absent one, and silently substituting zeros (or
+  /// [`AlignmentGather::Complete`](crate::audio::whisper::options::AlignmentGather::Complete))
+  /// would report parity for a different DTW input.
+  #[error(
+    "this host's CoreVideo left {nonzero_bytes} nonzero byte(s) in the untouched storage past the \
+     {rows} x {cols} alignment gather's logical elements, which Swift's gather reads but never \
+     writes, so its DTW input is not reproducible here (select `AlignmentGather::Complete` to \
+     gather every row in full instead)"
+  )]
+  AlignmentGatherTailNotZero {
+    /// Rows the gather allocated (gathered tokens).
+    rows: usize,
+    /// Columns the gather allocated (audio tokens).
+    cols: usize,
+    /// Nonzero bytes found past the surface's logical element count.
+    nonzero_bytes: usize,
+  },
   /// Decoding a slice's tokens back to text failed.
   #[error("tokenizer decode failed: {0}")]
   Tokenizer(#[from] TokenizerError),

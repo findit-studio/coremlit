@@ -3366,11 +3366,14 @@ fn swift_parity_gather_moves_the_next_window_seek() {
   // for every column past 59; row 5 has a +1.0 plateau from column 44 that
   // only the un-truncated gather can see.
   //
-  // Those columns straddle a truncation point the SHIPPING gather measures on
-  // the running host rather than assumes, so the fixture states the layout it
-  // was built for and fails there first if this host pads differently — see
-  // `segment::tests::the_recorded_swift_probe_still_describes_this_host`,
-  // which is the single place that check belongs.
+  // Those columns straddle a cut the SHIPPING gather measures on the running
+  // host rather than assumes, so the fixture states the layout it was built
+  // for and fails here first if this host pads differently — see
+  // `segment::tests::reference_host_pitch_table`, the (ignored) probe that
+  // records what that layout was. The assertions below use ONE pitch because
+  // this fixture's source and destination shapes share the accumulator width;
+  // where a host pitches the two heights differently, `gather_swift_rows`
+  // reproduces the shifted read and the numbers below stop describing it.
   let t = tiny_tokenizer();
   let s = special();
   let hello = t.encode(" Hello").unwrap()[0];

@@ -333,29 +333,36 @@ impl core::str::FromStr for WordGrouping {
 /// How much padding is a property of the host, not of this code: Apple's
 /// QA1829 states `CVPixelBuffer` row alignment varies by hardware and must be
 /// queried, and [`MultiArray::f16_surface`](crate::MultiArray::f16_surface)
-/// documents the same. So this port **measures** the pitch at run time, by
-/// allocating the identical `[N, cols]` Float16 surface Swift's gather
-/// allocates and reading back CoreVideo's own strides
-/// (`segment::coreml_f16_row_pitch`); nothing below is compiled in. On the
-/// reference host for whisper #41 (M1 Max, macOS 26.5) rows align to 64 bytes
-/// — 32 Float16 elements — so `cols = 1500` is stored at a pitch of 1504, and
-/// that is the layout every worked example here uses.
+/// documents the same. So this port **measures** it at run time, allocating
+/// the identical Float16 surfaces Swift's gather allocates and reading back
+/// CoreVideo's own strides (`segment::coreml_f16_row_pitch`); nothing below
+/// is compiled in. There are TWO such surfaces and they are probed
+/// separately — the once-allocated `[max_token_context + 1, cols]` source
+/// (`TextDecoder.swift:141`) and the per-call `[N, cols]` destination
+/// (`SegmentSeeker.swift:450`) — because "the pitch does not depend on the
+/// row count" is something this host was measured to do, not something
+/// CoreVideo promises. On the reference host for whisper #41 (M1 Max, macOS
+/// 26.5) rows align to 64 bytes — 32 Float16 elements — so `cols = 1500` is
+/// stored at a pitch of 1504 at every height, and that is the layout every
+/// worked example here uses.
 ///
-/// Two errors follow, and they cancel almost everywhere:
+/// Two errors follow:
 ///
-/// 1. Swift's `filteredIndices` are `0..<N` by construction, so source pitch
-///    equals destination pitch and the loop degenerates into one verbatim
-///    contiguous copy of the destination's first `N * cols` elements.
+/// 1. Swift's `filteredIndices` are `0..<N` by construction, so both sides'
+///    offsets are `index * columnCount` and the copies tile contiguously:
+///    destination STORAGE offset `o` ends up holding source STORAGE offset
+///    `o`, for every `o < N * cols`. (Contiguous *storage* offsets — the
+///    logical rows they land on depend on each surface's own pitch.)
 /// 2. `dynamicTimeWarping` then reads `matrix[(row - 1) * numberOfColumns +
 ///    (column - 1)]` (`SegmentSeeker.swift:217`) through `MLMultiArray`'s
 ///    flat subscript, which *is* stride-aware — so logical row `r` reads
-///    storage `[r * pitch, r * pitch + cols)`.
+///    destination storage `[r * dst_pitch, r * dst_pitch + cols)`.
 ///
-/// Wherever that read window still lies inside the copied prefix the two
-/// errors annihilate and the row is exactly right; row `r` is truncated
-/// exactly when `r * pitch + cols > N * cols`, overrunning into destination
-/// storage the `initialValue:` fill never covered either — that fill covers
-/// only the logical `count`. Per row:
+/// **When the two pitches agree** the errors annihilate wherever that read
+/// window still lies inside the copied prefix, and the gather reduces to a
+/// truncation: row `r` is cut exactly when `r * pitch + cols > N * cols`,
+/// overrunning into destination storage the `initialValue:` fill never
+/// covered either — that fill covers only the logical `count`. Per row:
 ///
 /// ```text
 /// kept = min(cols, N * cols - r * pitch)   // saturating at 0
@@ -370,14 +377,36 @@ impl core::str::FromStr for WordGrouping {
 /// — hence the general per-row form above rather than a last-row special
 /// case. At `N = 120`, `cols = 1500`, `pitch = 1504` the final row keeps 1024
 /// columns and reads the remaining 476 out of storage nothing ever wrote.
-/// Those bytes read back as zero in practice — an **observation, not a
-/// contract**: no part of CoreVideo promises a freshly created IOSurface is
-/// zeroed, and no part of WhisperKit writes them. Every number above is
-/// probed — see `probe_alignment_stride.swift`/`.out` under
+///
+/// **When they disagree** it is not a truncation at all: row `r` reads a
+/// SHIFTED window of the source, splicing the tail of one logical row onto
+/// the head of the next across the source's own (zero) padding. `segment::
+/// gather_swift_rows` reproduces that general mapping rather than the
+/// equal-pitch special case, so a host whose CoreVideo pitches the two
+/// heights differently gets Swift's actual DTW input instead of a silently
+/// wrong "parity".
+///
+/// The storage nothing ever wrote is the one part of Swift's DTW input that
+/// no amount of arithmetic settles: no part of CoreVideo promises a freshly
+/// created IOSurface is zeroed, and no part of WhisperKit writes it. So it
+/// is **verified, not assumed** — the destination probe reports what its own
+/// fresh allocation held there before anything touched it, and a dirty tail
+/// fails the gather closed
+/// ([`SegmentError::AlignmentGatherTailNotZero`](crate::audio::whisper::error::SegmentError::AlignmentGatherTailNotZero))
+/// rather than substituting zeros. The source's padding needs no such check:
+/// its array is allocated through the same `initialValue: FloatType(0)`
+/// initializer, whose fill runs over the LOGICAL element count and so zeroes
+/// storage `[0, src_rows * cols)` — padding cells included — and its only
+/// writer (`TextDecoder.updateAlignmentWeights`, `:272-295`) is stride-aware,
+/// so every padding cell the gather can reach still holds that zero on any
+/// host.
+///
+/// Every measured number above is probed — see
+/// `probe_alignment_stride.swift`/`.out` under
 /// `crates/coremlit/tests/whisper_swift_probes/`. A host whose CoreVideo does
-/// not pad `cols` at all measures `pitch == cols`, which makes this variant
-/// identical to [`Self::Complete`] there — correctly, because Swift's gather
-/// then has nothing to truncate either.
+/// not pad `cols` at all measures `pitch == cols` for both surfaces, which
+/// makes this variant identical to [`Self::Complete`] there — correctly,
+/// because Swift's gather then has nothing to disturb either.
 #[derive(
   Debug, Default, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display, derive_more::IsVariant,
 )]

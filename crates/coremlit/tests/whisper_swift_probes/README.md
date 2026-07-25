@@ -8,8 +8,8 @@ coremlit issue #41 parity fixes:
 - `crates/coremlit/src/audio/whisper/decode/sampler/mod.rs` — `argmax`
   (H2: first-index, NaN-skipping tie-break)
 - `crates/coremlit/src/audio/whisper/segment/mod.rs` — `coreml_f16_row_pitch` /
-  `truncate_gathered_rows` / `add_word_timestamps`, and `options/mod.rs` —
-  `AlignmentGather`
+  `coreml_f16_gather_destination_pitch` / `gather_swift_rows` /
+  `add_word_timestamps`, and `options/mod.rs` — `AlignmentGather`
   (H6: the CoreVideo row pitch Swift's alignment gather ignores)
 
 These files are **captured verbatim** from a one-off probe run and are **not
@@ -94,40 +94,72 @@ identical in both.
   and for 9), while the plain `MLMultiArray(shape:dataType:)` initializer
   reports the contiguous 1500.
   `SegmentSeeker.addWordTimestamps` binds both stride arrays and then pitches
-  its `memcpy` by `columnCount` (`:444-461`), so the gather writes only storage
-  `[0, N * cols)`; `dynamicTimeWarping`'s flat subscript (`:217`) is
-  stride-aware and reads logical row `r` at `[r * pitch, r * pitch + cols)`.
-  The two errors cancel wherever that read window still lies inside the copied
-  prefix: row `r` is truncated exactly when `r * pitch + cols > N * cols`, and
+  its `memcpy` by `columnCount` (`:452-460`), so the gather writes only storage
+  `[0, N * cols)` and, because `filteredIndices` are `0..<N`, destination
+  storage offset `o` ends up holding SOURCE storage offset `o`;
+  `dynamicTimeWarping`'s flat subscript (`:217`) is stride-aware and reads
+  logical row `r` at `[r * dst_pitch, r * dst_pitch + cols)`.
+  **When the two surfaces share a pitch** the two errors cancel wherever that
+  read window still lies inside the copied prefix: row `r` is truncated
+  exactly when `r * pitch + cols > N * cols`, and
   only the LAST row can be while `cols >= (N - 2) * (pitch - cols)`. That bound
   is a property of the shipping shape rather than a general one — it holds at
   1500/1504 for any `N <= 224` (the second-to-last row would need `N > 377`)
   and fails at the small `n_audio_ctx` a test backend can set, where a run of
   whole rows goes. At `N = 120` the final row keeps **1024** of its 1500
   columns and reads the other 476 out of storage neither the `memcpy` nor the
-  `initialValue:` fill ever wrote (zero in practice — an observation, not a
-  CoreVideo guarantee). That row is the whole of the
+  `initialValue:` fill ever wrote. That row is the whole of the
   long-form divergence: it moves the last word's end, hence the segment's end,
   hence the next window's seek. Pinned in `segment/tests.rs` by
   `coreml_f16_row_pitch_is_measured_from_a_live_pixel_buffer_allocation`,
-  `the_recorded_swift_probe_still_describes_this_host`,
   `swift_gather_keeps_only_the_final_rows_prefix` and
   `swift_parity_gather_truncates_final_alignment_row`.
 
+  **When they do NOT share a pitch it is not a truncation at all** — row `r`
+  reads a shifted window that splices one logical source row's tail onto the
+  next one's head across the source's own padding. Row-count invariance is
+  something this host was measured to have, not something CoreVideo promises,
+  so the port probes BOTH shapes — the once-allocated `[max_token_context + 1,
+  cols]` source (`TextDecoder.swift:141`) and the per-call `[N, cols]`
+  destination (`:450`) — and `segment::gather_swift_rows` reproduces the
+  general mapping. `swift_gather_reproduces_the_copy_when_the_two_surfaces_
+  pitch_differently` drives it against a storage-level replay at pitches this
+  host will never choose. The source's padding needs no probe: the same
+  `initialValue: FloatType(0)` initializer zeroes the LOGICAL element count
+  flat over a pitched buffer, so storage `[0, src_rows * cols)` — padding
+  included — starts at zero, and `TextDecoder.updateAlignmentWeights`
+  (`:272-295`), the array's only writer, is stride-aware. The gather never
+  reads past `N * cols <= src_rows * cols`, so every source padding cell it
+  can reach is zero on any host.
+
   **The pitch table above is evidence about this host, not a compiled-in
   rule.** `coreml_f16_row_pitch` MEASURES the running host — it allocates the
-  same `[N, cols]` Float16 IOSurface Swift's gather allocates
+  same Float16 IOSurface Swift's gather allocates
   (`MultiArray::f16_surface`) and reads CoreVideo's own strides back — because
   Apple's QA1829 states `CVPixelBuffer` row alignment is hardware-dependent and
   must be queried. An earlier cut of this fix promoted the 32-element quantum
   observed here into a `const fn`, which would have zeroed the WRONG cells (and
   so silently produced non-parity word timings, segment ends and seeks) on a
-  host that pads differently. The recorded table survives here and in
-  `the_recorded_swift_probe_still_describes_this_host` as the environment check
-  behind the hand-computed columns in the gather fixtures; if the measurement
-  cannot be made at all, `AlignmentGather::SwiftParity` fails closed
+  host that pads differently. The recorded table survives here and in the
+  **`#[ignore]`d** `reference_host_pitch_table` as provenance for the
+  hand-computed columns in the model-gated gather fixtures — ignored because
+  it compares this machine against one recorded machine, which no production
+  path depends on. If a measurement cannot be made at all,
+  `AlignmentGather::SwiftParity` fails closed
   (`SegmentError::AlignmentPitchUnavailable`) rather than quietly degrading to
   `AlignmentGather::Complete`.
+
+  **The destination's untouched tail is verified, not assumed.** The storage
+  past `N * cols` is read by `dynamicTimeWarping` and written by nobody — the
+  `initialValue:` fill covers only the logical `count`, and the `memcpy`
+  covers the same prefix — so it is whatever `CVPixelBufferCreate` returned,
+  and no part of CoreVideo promises that is zero.
+  `MultiArray::f16_surface_probing_fresh_tail` reports what a real allocation
+  of the same shape held there before anything touched it; a dirty tail fails
+  the gather closed (`SegmentError::AlignmentGatherTailNotZero`) instead of
+  substituting zeros for values this port cannot reproduce.
+  `coreml_f16_gather_destination_probe_reports_a_clean_tail_on_this_host`
+  pins that the verification passes here.
 
 ## The Swift short-form word-timestamp golden
 
