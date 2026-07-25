@@ -179,7 +179,7 @@ fn run_pipeline_and_pin(
   );
   assert_eq!(
     windows.len(),
-    plan.spans(clip.len()).len(),
+    plan.spans(clip.len()).unwrap().len(),
     "embed_windows count must match the plan geometry"
   );
   assert_eq!(

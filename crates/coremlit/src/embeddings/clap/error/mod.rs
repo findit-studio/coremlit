@@ -157,6 +157,18 @@ pub enum Error {
   /// pre-windit code reported the same condition as [`Error::EmbeddingZero`]);
   /// and `WinditError::AlphaOutOfRange` is an out-of-range [`EmaRenormalized`](crate::embeddings::clap::aggregate::EmaRenormalized)
   /// smoothing factor.
+  ///
+  /// It is also the window planner's resource rail (see
+  /// [`WindowPlan::spans`](crate::embeddings::clap::window::WindowPlan::spans)):
+  /// (a) [`WinditError::TooManyWindows`] manufactured by the O(1) cap pre-check
+  /// when the planned window count exceeds
+  /// [`max_windows`](crate::embeddings::clap::window::WindowPlan::max_windows), whose `got` is
+  /// the FULL planned count — deviating from windit's own abort-at-`max + 1`
+  /// convention, matching granite's post-windit raise; and (b)
+  /// [`WinditError::AllocFailed`] propagated from windit's planner or manufactured
+  /// when the multi-tail continuation's `try_reserve_exact` is refused. This is
+  /// what makes an untrusted clip length + hop a typed refusal rather than an
+  /// unbounded allocation or a panic.
   #[error("windowed-sequence processing failed: {0}")]
   Windowing(#[source] WinditError),
 }

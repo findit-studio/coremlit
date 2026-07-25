@@ -40,11 +40,26 @@
 //! spellings and the validated deserialization are unchanged by the windit port.
 //!
 //! The window length is **fixed** at [`WINDOW_SAMPLES`] (480 000 = 10 s at
-//! 48 kHz) — the model's geometry, not a knob. Only the hop and the tail policy
-//! are configurable. This module holds no audio and touches no model, so its
-//! offsets and coverages are hermetically pinned (see the sibling `tests.rs`).
+//! 48 kHz) — the model's geometry, not a knob. The hop, the tail policy, and the
+//! [`WindowPlan::max_windows`] resource cap are configurable. This module holds
+//! no audio and touches no model, so its offsets and coverages are hermetically
+//! pinned (see the sibling `tests.rs`).
+//!
+//! # Resource cap
+//!
+//! [`WindowPlan::spans`] counts its plan in O(1) and refuses one exceeding
+//! [`WindowPlan::max_windows`] ([`DEFAULT_MAX_WINDOWS`], default-on) with a typed
+//! [`Error::Windowing`]`(`[`WinditError::TooManyWindows`]`)` BEFORE materializing
+//! any span — so a serde-supplied `hop_samples: 1` over a modest clip (a hop
+//! every sample plans ~`total_samples` windows, gigabytes of retained embeddings
+//! and one CoreML inference each) is a typed refusal, not an unbounded
+//! allocation or a `.expect()` panic on the allocator's refusal.
 
-use crate::embeddings::clap::{audio::TARGET_SAMPLES, embedding::Embedding};
+use crate::embeddings::clap::{
+  audio::TARGET_SAMPLES,
+  embedding::Embedding,
+  error::{Error, Result, WinditError},
+};
 
 /// windit's window span (`windit::plan::Span`), re-exported as clap's window
 /// geometry unit — the half-open real range `[start, end)` a [`WindowPlan`]
@@ -84,6 +99,21 @@ pub const DEFAULT_HOP_SAMPLES: u32 = WINDOW_SAMPLES as u32;
 /// quarter window (120 000 = 2.5 s), matching textclap's `embed_chunked`
 /// `window / 4` keep threshold.
 pub const DEFAULT_TAIL_MIN_SAMPLES: u32 = (WINDOW_SAMPLES / 4) as u32;
+
+/// Default [`WindowPlan::max_windows`]: 100 000 windows.
+///
+/// The cap is a resource rail, not a latency policy: each planned window costs
+/// one full CoreML inference, and
+/// [`AudioEncoder::embed_windows`](crate::embeddings::clap::AudioEncoder::embed_windows) retains a
+/// [`Embedding`] ([`EMBEDDING_DIM`](crate::embeddings::clap::embedding::EMBEDDING_DIM) = 512 floats,
+/// ~2 KiB) per window, so 100 000 caps that retention at ~200 MiB. It admits
+/// every realistic clip — 24 h of audio at a 1 s hop is 86 400 windows; at the
+/// default no-overlap hop the cap is ~11 days of audio — while rejecting
+/// hop-abuse: at `hop_samples == 1` ANY clip long enough to window at all
+/// (> 10 s) plans more than 480 000 windows and fails typed. Latency-sensitive
+/// services should lower it; raising it is a deliberate opt-in to more memory
+/// and inference work. Mirrors the CED classifier's identical rail.
+pub const DEFAULT_MAX_WINDOWS: u32 = 100_000;
 
 /// What [`WindowPlan`] does with a final chunk whose real samples fall short of a
 /// full [`WINDOW_SAMPLES`] window.
@@ -133,29 +163,44 @@ const fn check_tail(tail: TailPolicy) -> bool {
   }
 }
 
+/// Whether `max_windows` is a usable cap: strictly positive. A zero cap would
+/// admit no plan at all (even the single-span short clip), so a default-carrying
+/// field that can never embed anything is a misconfiguration, the same class as
+/// `hop == 0`. `u32::MAX` is the deliberate "effectively uncapped" escape hatch.
+const fn check_max_windows(v: u32) -> bool {
+  v > 0
+}
+
 /// Overlapped-chunking plan: a validated hop and tail policy over the fixed
-/// [`WINDOW_SAMPLES`] window (rust-options-pattern).
+/// [`WINDOW_SAMPLES`] window, plus a [`Self::max_windows`] resource cap
+/// (rust-options-pattern).
 ///
 /// [`Self::spans`] is the pure-geometry core — it maps a clip length to the list
-/// of [`Span`]s to embed, with no audio and no model involved, so the
-/// offsets and coverages are hermetically testable.
+/// of [`Span`]s to embed, with no audio and no model involved, so the offsets
+/// and coverages are hermetically testable. `max_windows` bounds that count in
+/// O(1) BEFORE any span is materialized, so an untrusted length + hop cannot
+/// expand into an out-of-memory allocation or a flood of inferences.
 ///
 /// # Validated deserialization
 ///
 /// `Deserialize` routes through a private `WindowPlanRepr` via
 /// `serde(try_from)`, holding a config-file or hand-written `WindowPlan` to the
-/// SAME `hop_samples`/`min_samples` invariants the checked setters enforce.
-/// Deriving `Deserialize` on the fields directly would bypass
+/// SAME `hop_samples`/`min_samples`/`max_windows` invariants the checked setters
+/// enforce. Deriving `Deserialize` on the fields directly would bypass
 /// [`Self::set_hop_samples`]: `{"hop_samples": 0}` would deserialize and then
-/// loop forever (a zero hop never advances), and `{"hop_samples": 960000}` would
-/// silently leave 10 s gaps of un-embedded audio between chunks. Invalid input
-/// now fails to deserialize instead (mirrors speakerkit's `WindowOptions`).
+/// loop forever (a zero hop never advances), `{"hop_samples": 960000}` would
+/// silently leave 10 s gaps of un-embedded audio between chunks, and
+/// `{"max_windows": 0}` could never embed anything. Invalid input now fails to
+/// deserialize instead (mirrors speakerkit's `WindowOptions`). An omitted
+/// `max_windows` fills [`DEFAULT_MAX_WINDOWS`], so the cap is default-on for
+/// every deserialized plan.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(try_from = "WindowPlanRepr"))]
 pub struct WindowPlan {
   hop_samples: u32,
   tail: TailPolicy,
+  max_windows: u32,
 }
 
 /// The plain wire form [`WindowPlan`]'s `Deserialize` deserializes FIRST
@@ -169,6 +214,8 @@ struct WindowPlanRepr {
   hop_samples: u32,
   #[serde(default)]
   tail: TailPolicy,
+  #[serde(default = "default_max_windows")]
+  max_windows: u32,
 }
 
 #[cfg(feature = "serde")]
@@ -177,15 +224,21 @@ fn default_hop_samples() -> u32 {
 }
 
 #[cfg(feature = "serde")]
+fn default_max_windows() -> u32 {
+  DEFAULT_MAX_WINDOWS
+}
+
+#[cfg(feature = "serde")]
 impl TryFrom<WindowPlanRepr> for WindowPlan {
   type Error = String;
 
-  /// Applies [`check_hop_samples`] and [`check_tail`] — the exact invariants
-  /// [`WindowPlan::set_hop_samples`] / [`WindowPlan::set_tail_policy`] assert —
+  /// Applies [`check_hop_samples`], [`check_tail`], and [`check_max_windows`] —
+  /// the exact invariants [`WindowPlan::set_hop_samples`] /
+  /// [`WindowPlan::set_tail_policy`] / [`WindowPlan::set_max_windows`] assert —
   /// as fallible checks, so a serde-deserialized plan can never construct the
   /// infinite-loop (`hop == 0`) or audio-skipping (`hop > window`) geometry the
-  /// builders reject.
-  fn try_from(r: WindowPlanRepr) -> Result<Self, Self::Error> {
+  /// builders reject, nor an embed-nothing (`max_windows == 0`) cap.
+  fn try_from(r: WindowPlanRepr) -> core::result::Result<Self, Self::Error> {
     if !check_hop_samples(r.hop_samples) {
       return Err(format!(
         "hop_samples ({}) must be > 0 and <= WINDOW_SAMPLES ({WINDOW_SAMPLES})",
@@ -198,9 +251,13 @@ impl TryFrom<WindowPlanRepr> for WindowPlan {
         r.tail
       ));
     }
+    if !check_max_windows(r.max_windows) {
+      return Err(format!("max_windows ({}) must be > 0", r.max_windows));
+    }
     Ok(Self {
       hop_samples: r.hop_samples,
       tail: r.tail,
+      max_windows: r.max_windows,
     })
   }
 }
@@ -212,13 +269,14 @@ impl Default for WindowPlan {
 }
 
 impl WindowPlan {
-  /// A plan with [`DEFAULT_HOP_SAMPLES`] (no overlap) and [`TailPolicy::Pad`]
-  /// (keep every tail). Tiles a clip into back-to-back 10 s windows, the last
-  /// `repeatpad`-padded.
+  /// A plan with [`DEFAULT_HOP_SAMPLES`] (no overlap), [`TailPolicy::Pad`]
+  /// (keep every tail), and [`DEFAULT_MAX_WINDOWS`] (the resource cap). Tiles a
+  /// clip into back-to-back 10 s windows, the last `repeatpad`-padded.
   pub const fn new() -> Self {
     Self {
       hop_samples: DEFAULT_HOP_SAMPLES,
       tail: TailPolicy::Pad,
+      max_windows: DEFAULT_MAX_WINDOWS,
     }
   }
 
@@ -285,11 +343,47 @@ impl WindowPlan {
     self
   }
 
+  /// The maximum number of windows [`Self::spans`] may plan before it refuses
+  /// the clip with [`WinditError::TooManyWindows`]. See [`DEFAULT_MAX_WINDOWS`].
+  #[inline]
+  pub const fn max_windows(&self) -> u32 {
+    self.max_windows
+  }
+
+  /// Builder form of [`Self::set_max_windows`].
+  ///
+  /// # Panics
+  /// If `max_windows` is `0`.
+  #[must_use]
+  pub const fn with_max_windows(mut self, max_windows: u32) -> Self {
+    self.set_max_windows(max_windows);
+    self
+  }
+
+  /// Sets [`Self::max_windows`] in place.
+  ///
+  /// # Panics
+  /// If `max_windows` is `0` — a zero cap would refuse every clip, even the
+  /// single-span short one. The serde path reports the same violation as a
+  /// deserialize error instead.
+  pub const fn set_max_windows(&mut self, max_windows: u32) -> &mut Self {
+    assert!(check_max_windows(max_windows), "max_windows must be > 0");
+    self.max_windows = max_windows;
+    self
+  }
+
   /// The windit [`WindowOptions`](windit::plan::WindowOptions) that reproduce
   /// clap's head + first-tail geometry: the fixed [`WINDOW_SAMPLES`] window, this
   /// plan's hop, and the tail policy mapped to windit's. `Pad` maps to `PadFull`
   /// (whose spans are identical to `KeepWithCoverage`, chosen because it
   /// documents clap's intent — the mel front-end `repeatpad`s the kept tail).
+  ///
+  /// The cap is passed through as `with_max_windows` for defense in depth: the
+  /// O(1) pre-check in [`Self::spans`] already refuses an over-cap plan before
+  /// windit is reached, so windit's kept count is always `<= max` here and its
+  /// own [`WinditError::TooManyWindows`]/[`WinditError::AllocFailed`] never fire
+  /// — but if `planned_windows` ever undercounted (a bug), windit would fail
+  /// typed at `max + 1` rather than over-materialize.
   fn windit_options(&self) -> windit::plan::WindowOptions {
     windit::plan::WindowOptions::new(WINDOW_SAMPLES)
       .with_hop(self.hop_samples as usize)
@@ -299,9 +393,43 @@ impl WindowPlan {
           windit::plan::TailPolicy::DropBelowMin(min_samples as usize)
         }
       })
+      .with_max_windows(self.max_windows as usize)
+  }
+
+  /// Exactly `spans(total_samples).len()` for an admissible plan, in O(1) — the
+  /// cap check must never materialize-then-count. Both branches count the same
+  /// starts [`Self::spans`] keeps: under `Pad` every hop-multiple start in
+  /// `[0, total)` (`⌈total / hop⌉`); under `DropBelowMin` the hop-multiples in
+  /// `[0, total - min]` (a full window is always kept; a tail is kept iff its
+  /// real length meets `min`, i.e. its start is `<= total - min`). Pinned
+  /// against the real construction by `planned_windows_matches_materialized_len`
+  /// and the `debug_assert_eq!` at the end of [`Self::spans`].
+  ///
+  /// No arithmetic here can overflow: `div_ceil` never overflows on `usize`,
+  /// and in the `DropBelowMin` arm `total_samples > WINDOW_SAMPLES >= min_samples >= 1`
+  /// gives `(total_samples - min_samples) / hop + 1 <= total_samples`.
+  fn planned_windows(&self, total_samples: usize) -> usize {
+    if total_samples == 0 {
+      return 0;
+    }
+    // clap contract 1: a short clip is exactly one span, any hop/tail.
+    if total_samples <= WINDOW_SAMPLES {
+      return 1;
+    }
+    let hop = self.hop_samples as usize;
+    match self.tail {
+      TailPolicy::Pad => total_samples.div_ceil(hop),
+      TailPolicy::DropBelowMin { min_samples } => (total_samples - min_samples as usize) / hop + 1,
+    }
   }
 
   /// Map a clip of `total_samples` to the [`Span`]s to embed.
+  ///
+  /// The planned window count is bounded FIRST, in O(1), by
+  /// [`Self::max_windows`]: an untrusted `total_samples` and small hop that would
+  /// expand into millions of spans is refused before a single span (or CoreML
+  /// inference) is materialized, so the plan can never become an out-of-memory or
+  /// inference-flood lever.
   ///
   /// Geometry (window `W` = [`WINDOW_SAMPLES`], hop `H` = [`Self::hop_samples`]):
   ///
@@ -319,21 +447,35 @@ impl WindowPlan {
   ///
   /// The output is bit-for-bit clap's pre-windit geometry; see the module docs
   /// for the equivalence argument.
-  #[must_use]
-  pub fn spans(&self, total_samples: usize) -> Vec<Span> {
+  ///
+  /// # Errors
+  /// [`Error::Windowing`] carrying [`WinditError::TooManyWindows`] if the planned
+  /// count exceeds [`Self::max_windows`] — `got` is the FULL planned count,
+  /// following granite's post-windit convention (windit's own raise aborts at
+  /// `max + 1`) — or [`WinditError::AllocFailed`] if the span buffer cannot be
+  /// allocated.
+  pub fn spans(&self, total_samples: usize) -> Result<Vec<Span>> {
+    // Cap FIRST, before any branch or allocation: the O(1) planned count is the
+    // full would-be span count, so an over-cap clip dies here — no gigabyte
+    // buffer, no flood of pushes, no `.expect()` panic on the allocator's
+    // refusal, no inferences.
+    let planned = self.planned_windows(total_samples);
+    let max = self.max_windows as usize;
+    if planned > max {
+      return Err(Error::Windowing(WinditError::TooManyWindows {
+        got: planned,
+        max,
+      }));
+    }
     if total_samples == 0 {
-      return Vec::new();
+      return Ok(Vec::new());
     }
     // clap contract 1 (SHORT CLIP): total <= window ⇒ exactly one span,
     // regardless of hop AND tail policy.
     if total_samples <= WINDOW_SAMPLES {
-      return vec![Span::new(0, total_samples, WINDOW_SAMPLES)];
+      return Ok(vec![Span::new(0, total_samples, WINDOW_SAMPLES)]);
     }
-    let mut spans = windit::plan::WindowPlan::spans(&self.windit_options(), total_samples).expect(
-      "windit options are valid by construction: WINDOW_SAMPLES is a non-zero const, \
-       hop is setter/serde-validated into 1..=WINDOW_SAMPLES, and no max_windows cap is set; \
-       the only remaining failure is allocator refusal, where the pre-windit Vec growth aborted too",
-    );
+    let mut spans = windit::plan::WindowPlan::spans(&self.windit_options(), total_samples)?;
     // clap contract 2 (MULTI-TAIL): windit stops at the first span that reaches
     // the clip end; clap's overlapped plan (hop < window) keeps striding,
     // emitting progressively shorter tails until the stride passes the end. The
@@ -344,6 +486,14 @@ impl WindowPlan {
       TailPolicy::Pad => 1,
       TailPolicy::DropBelowMin { min_samples } => min_samples as usize,
     };
+    // Contract 2 appends exactly `planned - spans.len()` more spans (windit's
+    // kept spans are a subset of the full plan), so reserve that exact count up
+    // front: the pushes then stay within capacity, never an infallible growth
+    // that would abort under an allocator refusal.
+    let extra = planned - spans.len();
+    spans
+      .try_reserve_exact(extra)
+      .map_err(|_| Error::Windowing(WinditError::AllocFailed { elements: extra }))?;
     let first_tail_start = (total_samples - WINDOW_SAMPLES).div_ceil(hop) * hop;
     let mut start = first_tail_start + hop;
     while start < total_samples {
@@ -353,6 +503,11 @@ impl WindowPlan {
       }
       start += hop;
     }
-    spans
+    debug_assert_eq!(
+      spans.len(),
+      planned,
+      "planned_windows drifted from construction"
+    );
+    Ok(spans)
   }
 }

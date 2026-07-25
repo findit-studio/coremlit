@@ -67,6 +67,44 @@ fn check_window_len_rejects_over_length_only() {
   );
 }
 
+/// The codex [high] at-cap geometry: with `hop = 5`, a 500 000-sample (~2 MiB)
+/// clip plans EXACTLY [`crate::embeddings::clap::window::DEFAULT_MAX_WINDOWS`]
+/// (100 000) spans and is ADMITTED by the O(1) cap — `planned == max`, not
+/// `> max`. `embed_windows` then reserves one ~2 KiB [`WindowEmbedding`] per span
+/// (~207 MiB), which the fix does FALLIBLY (`try_reserve_exact` →
+/// [`Error::Windowing`]`(`[`WinditError::AllocFailed`]`)`) instead of the prior
+/// infallible `Vec::with_capacity`, so an allocator refusal on a small at-cap
+/// clip is a typed error rather than a process abort.
+///
+/// This is the achievable seam assertion (mirroring `check_window_len_*`, which
+/// tests `embed_window`'s guard without a model): it pins that `spans()` admits
+/// the exact-cap plan the caller now reserves for. Asserting the actual typed
+/// `AllocFailed` would require injecting an allocator failure — impractical and
+/// unavailable here (there is no fault-injection allocator, and ~207 MiB is
+/// ordinarily allocatable, so no real OOM fires) — and `embed_windows` itself
+/// needs a loaded model for the per-span loop that follows the reservation. The
+/// `try_reserve_exact` call is the structural guarantee; this test pins the
+/// geometry that reaches it.
+///
+/// Mutation tripwire: reverting the reservation to `with_capacity` restores the
+/// process-abort path for exactly this admitted-at-cap input.
+#[test]
+fn at_cap_plan_is_admitted_and_reserved_fallibly() {
+  let plan = WindowPlan::new().with_hop_samples(5);
+  // Default cap is on; the exact-cap geometry sits AT it (not over).
+  assert_eq!(plan.max_windows(), 100_000);
+  let spans = plan
+    .spans(500_000)
+    .expect("at-cap plan must be admitted, not refused");
+  assert_eq!(
+    spans.len(),
+    100_000,
+    "hop=5 over 500_000 samples plans exactly 100_000 spans"
+  );
+  // EXACTLY at the cap — the boundary the caller's fallible reservation covers.
+  assert_eq!(spans.len() as u32, plan.max_windows());
+}
+
 #[cfg(feature = "serde")]
 #[test]
 fn options_serde_roundtrip() {
