@@ -25,7 +25,7 @@ use coremlit::audio::whisper::{
   transcribe::WhisperKit,
 };
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use rubato::{FftFixedIn, Resampler};
+use rubato::{Fft, FixedSync, Indexing, Resampler, audioadapter_buffers::direct::InterleavedSlice};
 
 /// Resampler input chunk: 64 ms at 48 kHz — small enough for sub-100 ms
 /// push latency, large enough to keep the FFT resampler efficient.
@@ -185,11 +185,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     return Err(format!("unsupported input format {:?}", supported.sample_format()).into());
   }
   let channels = usize::from(supported.channels());
-  let device_rate = supported.sample_rate().0 as usize;
+  // cpal 0.18: `SampleRate` is a `u32` alias (no `.0` newtype field), and the
+  // device label now comes from the `Display` impl (the fallible `name()` is
+  // gone).
+  let device_rate = supported.sample_rate() as usize;
   eprintln!(
-    "capturing from {} at {device_rate} Hz, {channels} ch, {QUEUE_CAPACITY_SECONDS}s buffer \
+    "capturing from {device} at {device_rate} Hz, {channels} ch, {QUEUE_CAPACITY_SECONDS}s buffer \
      (Ctrl-C to stop)",
-    device.name().unwrap_or_else(|_| "<unnamed>".into()),
   );
 
   // The cpal callback runs on a realtime thread: downmix and copy straight
@@ -200,7 +202,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   let callback_queue = Arc::clone(&queue);
   let config: cpal::StreamConfig = supported.into();
   let stream = device.build_input_stream(
-    &config,
+    config,
     move |data: &[f32], _: &cpal::InputCallbackInfo| {
       let mono = data
         .chunks_exact(channels)
@@ -212,7 +214,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   )?;
   stream.play()?;
 
-  let mut resampler = FftFixedIn::<f32>::new(device_rate, 16_000, RESAMPLE_CHUNK, 2, 1)?;
+  // rubato 4.0: the unified `Fft` resampler (`FixedSync::Input` consumes a fixed
+  // RESAMPLE_CHUNK input frames per call — the former `FftFixedIn` role) that
+  // writes into a preallocated audioadapter buffer instead of returning a fresh
+  // Vec. `Fft::new` picks its sub-chunk count as `chunk / 256` (12 here for the
+  // 3072-frame RESAMPLE_CHUNK), replacing the old `FftFixedIn` explicit argument
+  // `2` — the larger count slightly reduces leading latency. `Fft::new_custom`
+  // is the knob if that ever matters, but a live-mic reference stream pins no
+  // resampled output.
+  let mut resampler = Fft::<f32>::new(device_rate, 16_000, RESAMPLE_CHUNK, 1, FixedSync::Input)?;
+  let mut resample_out = vec![0.0f32; resampler.output_frames_max()];
+  let indexing = Indexing::new();
   let mut captured: Vec<f32> = Vec::new();
   let mut pending: Vec<f32> = Vec::new();
   let mut resampled: Vec<f32> = Vec::new();
@@ -228,8 +240,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     while pending.len() >= RESAMPLE_CHUNK {
       let chunk: Vec<f32> = pending.drain(..RESAMPLE_CHUNK).collect();
-      let output = resampler.process(&[chunk], None)?;
-      resampled.extend_from_slice(&output[0]);
+      // Mono (1 channel) so interleaved == sequential: wrap the fixed input
+      // chunk and the reusable output buffer as audioadapter views, resample
+      // into the buffer, then copy out only the frames actually written.
+      let input = InterleavedSlice::new(&chunk, 1, RESAMPLE_CHUNK)?;
+      let out_capacity = resample_out.len();
+      let frames_written = {
+        let mut output = InterleavedSlice::new_mut(&mut resample_out, 1, out_capacity)?;
+        let (_, written) = resampler.process_into_buffer(&input, &mut output, Some(&indexing))?;
+        written
+      };
+      resampled.extend_from_slice(&resample_out[..frames_written]);
     }
     if resampled.is_empty() {
       continue;

@@ -34,7 +34,7 @@
 
 use std::num::NonZeroUsize;
 
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 
 use crate::audio::whisper::options::DecodingOptions;
 
@@ -113,8 +113,10 @@ impl GreedyTokenSampler {
   /// Builds a sampler for `temperature`/`eot_token`, capturing `options`'
   /// [`DecodingOptions::top_k`] (`top_k` is a plain `usize` knob with no
   /// non-zero invariant of its own, so `0` clamps up to
-  /// `NonZeroUsize::MIN`). Seeds its RNG from the OS
-  /// (`StdRng::from_os_rng`) — `temperature == 0.0` never consults the
+  /// `NonZeroUsize::MIN`). Seeds its RNG from the OS (`StdRng::from_rng`
+  /// fed the OS-seeded `rand::rng()` thread RNG, so the sampler's full
+  /// internal state is OS-derived, not just a 64-bit seed) —
+  /// `temperature == 0.0` never consults the
   /// RNG, so this only matters for reproducibility at `temperature !=
   /// 0.0`; see [`Self::with_seed`] for the deterministic alternative,
   /// which [`crate::audio::whisper::transcribe::TranscribeTask`]'s fallback ladder now
@@ -126,7 +128,7 @@ impl GreedyTokenSampler {
       temperature,
       eot_token,
       top_k: NonZeroUsize::new(options.top_k()).unwrap_or(NonZeroUsize::MIN),
-      rng: StdRng::from_os_rng(),
+      rng: StdRng::from_rng(&mut rand::rng()),
       drew_from_rng: false,
       probs: Vec::new(),
       indices: Vec::new(),
