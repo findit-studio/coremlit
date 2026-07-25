@@ -45,6 +45,10 @@ fn decoding_defaults_match_swift() {
   // Swift's own grouping (space-fallthrough for zh/yue); FineGrained is the
   // #11-pinned fine-grained CJK opt-in.
   assert_eq!(o.word_grouping(), WordGrouping::SwiftParity);
+  // Rust-only addition (coremlit issue #41). Swift has no gather knob either
+  // — it has one gather, whose stride-ignoring memcpy truncates the final
+  // alignment row; the default replicates that, `Complete` opts out.
+  assert_eq!(o.alignment_gather(), AlignmentGather::SwiftParity);
   assert_eq!(DecodingOptions::default(), DecodingOptions::new());
 }
 
@@ -106,6 +110,16 @@ fn swift_parity_option_deviations_are_exactly_one() {
       .with_word_grouping(WordGrouping::FineGrained)
       .word_grouping()
       .is_fine_grained()
+  );
+  // NOT a deviation either — `alignment_gather` defaults to Swift's own
+  // truncating gather (coremlit issue #41), and `Complete` is the
+  // un-truncated opt-in away from it.
+  assert_eq!(o.alignment_gather(), AlignmentGather::SwiftParity);
+  assert!(
+    DecodingOptions::new()
+      .with_alignment_gather(AlignmentGather::Complete)
+      .alignment_gather()
+      .is_complete()
   );
 
   // The parity-relevant Swift-equal defaults the refutation rests on: the
@@ -198,6 +212,13 @@ fn enums_round_trip_and_display() {
   assert_eq!(WordGrouping::FineGrained.to_string(), "fine_grained");
   assert_eq!(WordGrouping::SwiftParity.as_str(), "swift_parity");
   assert!("bogus".parse::<WordGrouping>().is_err());
+
+  for g in [AlignmentGather::SwiftParity, AlignmentGather::Complete] {
+    assert_eq!(g.as_str().parse::<AlignmentGather>().unwrap(), g);
+  }
+  assert_eq!(AlignmentGather::Complete.to_string(), "complete");
+  assert_eq!(AlignmentGather::SwiftParity.as_str(), "swift_parity");
+  assert!("bogus".parse::<AlignmentGather>().is_err());
 }
 
 #[test]
@@ -237,6 +258,52 @@ fn word_grouping_serde_omitted_stays_swift_parity() {
 
   for wanted in [WordGrouping::FineGrained, WordGrouping::SwiftParity] {
     let options = DecodingOptions::new().with_word_grouping(wanted);
+    let json = serde_json::to_string(&options).unwrap();
+    assert_eq!(
+      serde_json::from_str::<DecodingOptions>(&json).unwrap(),
+      options
+    );
+  }
+}
+
+#[test]
+fn alignment_gather_defaults_to_swift_parity() {
+  // #41 default: a caller who never mentions the gather replicates Swift's
+  // truncated final alignment row — the mechanism behind the long-form
+  // divergence — and reaches the un-truncated gather only by naming it.
+  assert_eq!(AlignmentGather::default(), AlignmentGather::SwiftParity);
+  assert_eq!(
+    DecodingOptions::new().alignment_gather(),
+    AlignmentGather::SwiftParity
+  );
+  assert!(DecodingOptions::new().alignment_gather().is_swift_parity());
+
+  let built = DecodingOptions::new().with_alignment_gather(AlignmentGather::Complete);
+  assert_eq!(built.alignment_gather(), AlignmentGather::Complete);
+  assert!(built.alignment_gather().is_complete());
+
+  let mut m = DecodingOptions::new();
+  m.set_alignment_gather(AlignmentGather::Complete);
+  assert_eq!(m.alignment_gather(), AlignmentGather::Complete);
+  m.set_alignment_gather(AlignmentGather::SwiftParity);
+  assert_eq!(m.alignment_gather(), AlignmentGather::SwiftParity);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn alignment_gather_serde_omitted_stays_swift_parity() {
+  // An omitted field follows the enum `Default` — SwiftParity, so a config
+  // that never heard of #41 still gets the parity-bearing gather; an explicit
+  // value still wins.
+  let omitted: DecodingOptions = serde_json::from_str("{}").unwrap();
+  assert_eq!(omitted.alignment_gather(), AlignmentGather::SwiftParity);
+
+  let complete: DecodingOptions =
+    serde_json::from_str(r#"{"alignment_gather":"complete"}"#).unwrap();
+  assert_eq!(complete.alignment_gather(), AlignmentGather::Complete);
+
+  for wanted in [AlignmentGather::SwiftParity, AlignmentGather::Complete] {
+    let options = DecodingOptions::new().with_alignment_gather(wanted);
     let json = serde_json::to_string(&options).unwrap();
     assert_eq!(
       serde_json::from_str::<DecodingOptions>(&json).unwrap(),

@@ -305,6 +305,131 @@ impl core::str::FromStr for WordGrouping {
 }
 
 // ---------------------------------------------------------------------
+// AlignmentGather
+// ---------------------------------------------------------------------
+
+/// How a window's per-token cross-attention rows are gathered into the
+/// matrix DTW runs over (coremlit issue #41). Rust-only: Swift has no such
+/// switch — it has exactly one gather, and that gather silently drops the
+/// tail of its final row.
+///
+/// # What Swift actually does, and why the two variants differ at all
+///
+/// `SegmentSeeker.addWordTimestamps` (`SegmentSeeker.swift:444-461`) copies
+/// the gathered rows by hand. It binds both arrays' stride vectors
+/// (`weightsStride`/`filteredWeightsStride`) and then ignores them, using
+/// `columnCount` — the *logical* column count, 1500 for a 30 s window — as
+/// the row pitch on the source and on the destination alike. That is correct
+/// only while storage pitch equals column count, and for WhisperKit's
+/// Float16 arrays it does not: every one of them is allocated through
+/// `MLMultiArray(shape:dataType:initialValue:)`
+/// (`ArgmaxCore/MLMultiArrayExtensions.swift:11-53`), which for `.float16`
+/// backs the array with an IOSurface `CVPixelBuffer` (`:121-136`,
+/// `kCVPixelFormatType_OneComponent16Half`), and CoreVideo pads every row up
+/// to a 64-byte boundary — 32 Float16 elements — so `cols = 1500` is stored
+/// at a pitch of **1504**. (The plain `MLMultiArray(shape:dataType:)`
+/// initializer is contiguous; the padding belongs to the pixel-buffer path,
+/// and the pixel-buffer path is the one WhisperKit takes.)
+///
+/// Two errors follow, and they cancel almost everywhere:
+///
+/// 1. Swift's `filteredIndices` are `0..<N` by construction, so source pitch
+///    equals destination pitch and the loop degenerates into one verbatim
+///    contiguous copy of the destination's first `N * cols` elements.
+/// 2. `dynamicTimeWarping` then reads `matrix[(row - 1) * numberOfColumns +
+///    (column - 1)]` (`SegmentSeeker.swift:217`) through `MLMultiArray`'s
+///    flat subscript, which *is* stride-aware — so logical row `r` reads
+///    storage `[r * pitch, r * pitch + cols)`.
+///
+/// Wherever that read window still lies inside the copied prefix the two
+/// errors annihilate and the row is exactly right; row `r` is truncated
+/// exactly when `r * pitch + cols > N * cols`, overrunning into destination
+/// storage the `initialValue:` fill never covered either — that fill covers
+/// only the logical `count`. Per row:
+///
+/// ```text
+/// kept = min(cols, N * cols - r * pitch)   // saturating at 0
+/// ```
+///
+/// Only the LAST row can be affected while `cols >= (N - 2) * (pitch - cols)`.
+/// That is a property of the shipping shape, not a general one: it holds for
+/// every real Whisper model (`cols = n_audio_ctx = 1500`, `pitch = 1504`,
+/// `N <= 224`, so reaching the second-to-last row would take `N > 377`), and
+/// fails at the small `n_audio_ctx` a test backend can configure, where a run
+/// of whole rows goes. At `N = 120`, `cols = 1500` the final row keeps 1024
+/// columns and reads the remaining 476 out of storage nothing ever wrote.
+/// Those bytes read back as zero in practice — an **observation, not a
+/// contract**: no part of CoreVideo promises a freshly created IOSurface is
+/// zeroed, and no part of WhisperKit writes them. Every number above is
+/// probed — see `probe_alignment_stride.swift`/`.out` under
+/// `crates/coremlit/tests/whisper_swift_probes/`.
+#[derive(
+  Debug, Default, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display, derive_more::IsVariant,
+)]
+#[display("{}", self.as_str())]
+#[non_exhaustive]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum AlignmentGather {
+  /// Swift's gather reproduced deliberately, truncated final row and all
+  /// (`kept` columns per the type's own doc — 1024 of 1500 on a full
+  /// 120-token window, the rest zero).
+  ///
+  /// **The default**, and the fix for coremlit issue #41. That one row's
+  /// tail picks the DTW path, which picks the pre-merge word-duration
+  /// multiset behind `constrainedMedianDuration`/`maxDuration`, which picks
+  /// the last word's end, which picks the segment's end and therefore —
+  /// through `seek = max(seek, Int(lastSpeechTimestamp * sampleRate))`
+  /// (`TranscribeTask.swift:221-223`) — the **next window's seek**. So a
+  /// gather that keeps the row in full is "more correct" and yet lands the
+  /// pipeline on different windows from Swift's within a minute of audio:
+  /// measured against official Swift on the pinned model, the 1417 s fixture
+  /// cost 984 words of edit distance and an entire extra window (52 against
+  /// Swift's 51) before this variant existed, and matched token-for-token
+  /// after. Short-form (JFK) is bit-exact either way — the divergence needs
+  /// the seek cascade to accumulate.
+  #[default]
+  SwiftParity,
+  /// Gather every row in full — no truncation. This port's behavior before
+  /// coremlit issue #41.
+  ///
+  /// The honest reading of the alignment weights: it feeds DTW everything
+  /// the model actually produced, which is what the code appears to promise
+  /// and what a caller who wants this port's best word timings should ask
+  /// for. It does **not** track Swift, and on long-form audio it will not —
+  /// see [`Self::SwiftParity`] for the cascade.
+  Complete,
+}
+
+impl AlignmentGather {
+  /// Stable snake_case name of the variant.
+  #[inline(always)]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::SwiftParity => "swift_parity",
+      Self::Complete => "complete",
+    }
+  }
+}
+
+/// Error parsing an [`AlignmentGather`] name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("unknown alignment gather name")]
+pub struct ParseAlignmentGatherError(());
+
+impl core::str::FromStr for AlignmentGather {
+  type Err = ParseAlignmentGatherError;
+
+  fn from_str(s: &str) -> Result<Self, Self::Err> {
+    Ok(match s {
+      "swift_parity" => Self::SwiftParity,
+      "complete" => Self::Complete,
+      _ => return Err(ParseAlignmentGatherError(())),
+    })
+  }
+}
+
+// ---------------------------------------------------------------------
 // DecodingOptions
 // ---------------------------------------------------------------------
 
@@ -493,15 +618,17 @@ pub(crate) mod finite_f32_vec {
 }
 
 /// Decode-time configuration: Swift's 27-knob `DecodingOptions` surface
-/// (spec §6.2), plus three Rust-only additions — [`Self::seed`], for
+/// (spec §6.2), plus four Rust-only additions — [`Self::seed`], for
 /// reproducible temperature-fallback sampling (coremlit issue #9; see the
-/// crate root's "Reproducibility and provenance" docs), and, from coremlit
-/// issue #14, [`Self::drop_blank_audio`] (the post-decode blank-audio
+/// crate root's "Reproducibility and provenance" docs), from coremlit
+/// issue #14 [`Self::drop_blank_audio`] (the post-decode blank-audio
 /// segment filter) and [`Self::word_grouping`] (the explicit CJK
-/// word-grouping mode). `new()`/`Default` apply Swift's defaults verbatim
-/// for every ported knob; `seed` defaults unset (`None`), matching today's
-/// OS-seeded behavior exactly, and `word_grouping` defaults to Swift's own
-/// grouping (coremlit issue #41).
+/// word-grouping mode), and from coremlit issue #41
+/// [`Self::alignment_gather`] (how the per-token alignment rows are gathered
+/// before DTW). `new()`/`Default` apply Swift's defaults verbatim for every
+/// ported knob; `seed` defaults unset (`None`), matching today's OS-seeded
+/// behavior exactly, and `word_grouping`/`alignment_gather` both default to
+/// Swift's own behavior (coremlit issue #41).
 ///
 /// **One knob's default deliberately diverges from Swift, with an exact parity
 /// escape hatch** — it is the only such deviation; every other default here is
@@ -514,8 +641,13 @@ pub(crate) mod finite_f32_vec {
 /// opt-in that Unicode-splits CJK into fine-grained words. Default options on a
 /// Mandarin clip therefore space-split as Swift does; the behavioral contrast
 /// between the two variants is pinned by the named invariant
-/// `word_grouping_splits_chinese_and_only_chinese` (`tokenizer/tests.rs`). See
-/// each field's own doc.
+/// `word_grouping_splits_chinese_and_only_chinese` (`tokenizer/tests.rs`).
+/// [`Self::alignment_gather`] is the same shape: it defaults to
+/// [`AlignmentGather::SwiftParity`], replicating the truncated final alignment
+/// row Swift's stride-ignoring gather produces — the mechanism behind the
+/// long-form divergence of coremlit issue #41 — while
+/// [`AlignmentGather::Complete`] is the un-truncated opt-in. See each field's
+/// own doc.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct DecodingOptions {
@@ -712,6 +844,12 @@ pub struct DecodingOptions {
   /// product-quality opt-in.
   #[cfg_attr(feature = "serde", serde(default))]
   word_grouping: WordGrouping,
+  /// How the per-token alignment rows are gathered before DTW. Defaults to
+  /// [`AlignmentGather::SwiftParity`] (coremlit issue #41; serde follows via
+  /// the enum's `Default`). [`AlignmentGather::Complete`] is the un-truncated
+  /// opt-in.
+  #[cfg_attr(feature = "serde", serde(default))]
+  alignment_gather: AlignmentGather,
 }
 
 /// Names every field of [`DecodingOptions`] exactly once, generating (for
@@ -779,6 +917,7 @@ decoding_option_field_names!(
   verbose,
   drop_blank_audio,
   word_grouping,
+  alignment_gather,
 );
 
 impl Default for DecodingOptions {
@@ -821,6 +960,7 @@ impl DecodingOptions {
       verbose: false,
       drop_blank_audio: DEFAULT_DROP_BLANK_AUDIO,
       word_grouping: WordGrouping::SwiftParity,
+      alignment_gather: AlignmentGather::SwiftParity,
     }
   }
 
@@ -1956,6 +2096,44 @@ impl DecodingOptions {
   #[inline(always)]
   pub const fn set_word_grouping(&mut self, word_grouping: WordGrouping) -> &mut Self {
     self.word_grouping = word_grouping;
+    self
+  }
+
+  // -- alignment_gather -----------------------------------------------------
+  /// How the per-token cross-attention rows are gathered into the DTW input
+  /// when [`Self::word_timestamps`] is on (coremlit issue #41). Defaults to
+  /// [`AlignmentGather::SwiftParity`]: Swift's gather ignores its own
+  /// `MLMultiArray` row strides and indexes both sides by the column count,
+  /// which — against the 64-byte-padded rows CoreVideo gives its Float16
+  /// pixel-buffer backing — silently truncates the final gathered row to its
+  /// first `N * cols - (N - 1) * pitch` columns and zero-fills the rest.
+  ///
+  /// [`AlignmentGather::Complete`] gathers every row in full instead, this
+  /// port's behavior before #41. See [`AlignmentGather`]'s own doc for the
+  /// mechanism, the cited Swift lines, and why the truncated row — not the
+  /// complete one — is what keeps long-form transcripts on Swift's windows.
+  ///
+  /// Inert unless [`Self::word_timestamps`] is set: the gather only runs
+  /// inside the DTW alignment pass. Unlike [`Self::word_grouping`] it is not
+  /// confined to a segment's words, though — a changed final row moves the
+  /// last word's end, which moves the segment's end, which moves the next
+  /// window's seek, so with word timestamps on it reaches the transcript
+  /// itself.
+  #[inline(always)]
+  pub const fn alignment_gather(&self) -> AlignmentGather {
+    self.alignment_gather
+  }
+  /// Builder form of [`Self::set_alignment_gather`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_alignment_gather(mut self, alignment_gather: AlignmentGather) -> Self {
+    self.set_alignment_gather(alignment_gather);
+    self
+  }
+  /// Sets [`Self::alignment_gather`] in place.
+  #[inline(always)]
+  pub const fn set_alignment_gather(&mut self, alignment_gather: AlignmentGather) -> &mut Self {
+    self.alignment_gather = alignment_gather;
     self
   }
 }

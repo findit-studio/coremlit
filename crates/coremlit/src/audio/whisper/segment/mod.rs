@@ -36,7 +36,7 @@ use crate::audio::whisper::{
   backend::{AlignmentMatrix, AlignmentView},
   constants::{SAMPLE_RATE, SECONDS_PER_TIME_TOKEN},
   error::SegmentError,
-  options::{DecodingOptions, WordGrouping},
+  options::{AlignmentGather, DecodingOptions, WordGrouping},
   result::{DecodingResult, TranscriptionSegment, WordTiming},
   tokenizer::WhisperTokenizer,
 };
@@ -935,6 +935,20 @@ pub(crate) fn rounded_to_places(value: f32, decimal_places: i32) -> f32 {
 // add_word_timestamps: the orchestration wrapper
 // ---------------------------------------------------------------------
 
+/// CoreVideo's row pitch, in Float16 elements, for the IOSurface-backed
+/// `MLMultiArray`s WhisperKit allocates
+/// (`ArgmaxCore/MLMultiArrayExtensions.swift:11-53`, `:121-136`): row bytes
+/// are padded up to a 64-byte boundary, i.e. 32 Float16 elements. Probed
+/// (`tests/whisper_swift_probes/probe_alignment_stride.out`): cols 8 -> 32,
+/// 9 -> 32, 100 -> 128, 1496/1500/1504 -> 1504.
+///
+/// The 32-element quantum is load-bearing: `div_ceil(8) * 8` coincidentally
+/// agrees at the shipping `cols = 1500`, and is wrong at `cols = 100` (104,
+/// against the probed 128).
+const fn coreml_f16_row_pitch(cols: usize) -> usize {
+  cols.div_ceil(32) * 32
+}
+
 /// Assembles one window's word-level timestamps end to end. Ports
 /// `SegmentSeeker.addWordTimestamps` (`SegmentSeeker.swift:410-496`):
 /// flattens `segments`' tokens/log-probs into the flat list
@@ -951,7 +965,19 @@ pub(crate) fn rounded_to_places(value: f32, decimal_places: i32) -> f32 {
 /// [`WhisperTokenizer::split_to_word_tokens`] (spec §5.3), plus the
 /// explicit word-grouping mode from coremlit issue #14
 /// ([`WordGrouping::SwiftParity`] is the default after #41;
-/// [`WordGrouping::FineGrained`] is this port's long-standing opt-in). Swift's
+/// [`WordGrouping::FineGrained`] is this port's long-standing opt-in).
+///
+/// `gather` selects what the prefix take hands to DTW.
+/// [`AlignmentGather::SwiftParity`] (the pipeline default) additionally
+/// replicates the truncation Swift's own gather performs: its `memcpy` loop
+/// (`SegmentSeeker.swift:454-459`) binds both `MLMultiArray`s' strides and
+/// then indexes with `columnCount`, while `dynamicTimeWarping`'s flat
+/// subscript (`:217`) *is* stride-aware and CoreVideo pads the Float16
+/// backing's rows (`ArgmaxCore/MLMultiArrayExtensions.swift:121-136`), so
+/// row `r` keeps only its first `min(cols, needed * cols - r * pitch)`
+/// columns and reads zeros past that. [`AlignmentGather::Complete`] gathers
+/// every row whole — see [`AlignmentGather`] for why the truncated form is
+/// the parity-bearing one (whisper #41). Swift's
 /// `segmentSize` and `options` parameters are unused in the function body
 /// (verified against `SegmentSeeker.swift:410-496`), and `timings` is
 /// only passed through to `findAlignment` (`:471`), which ignores it —
@@ -976,6 +1002,7 @@ pub fn add_word_timestamps(
   tokenizer: &WhisperTokenizer,
   language_code: &str,
   grouping: WordGrouping,
+  gather: AlignmentGather,
   seek: usize,
   prepended: &str,
   appended: &str,
@@ -1038,6 +1065,28 @@ pub fn add_word_timestamps(
   {
     row.copy_from_slice(alignment.row(row_index));
   }
+
+  // Swift's gather truncates: its memcpy writes only storage `[0, needed *
+  // cols)` (`:454-459`, pitched by `columnCount`), while `dynamicTimeWarping`
+  // reads logical row `r` at the TRUE pitch (`:217`), so `r` keeps only what
+  // still falls inside that copied prefix and reads never-written storage --
+  // zero in practice -- past it. Row `r` is truncated exactly when `r * pitch
+  // + cols > needed * cols`; only the LAST row can be while `cols >= (needed -
+  // 2) * (pitch - cols)`, which holds for every real Whisper model (1500/1504,
+  // `needed <= 224`) but not at the small `n_audio_ctx` a test backend can set
+  // -- hence the general per-row loop, not a last-row special case. See
+  // [`AlignmentGather`] for the derivation.
+  if gather == AlignmentGather::SwiftParity {
+    let pitch = coreml_f16_row_pitch(cols);
+    let copied = needed * cols;
+    for row in 0..needed {
+      let kept = copied.saturating_sub(row * pitch).min(cols);
+      if kept < cols {
+        data[row * cols + kept..(row + 1) * cols].fill(0.0);
+      }
+    }
+  }
+
   let filtered = AlignmentMatrix::new(data, needed, cols);
 
   // :465-472. The construction above guarantees `filtered.rows() ==

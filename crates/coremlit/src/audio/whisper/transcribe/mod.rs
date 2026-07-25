@@ -553,6 +553,7 @@ where
             self.tokenizer,
             language,
             options.word_grouping(), // coremlit issue #14; default: swift-parity (#41)
+            options.alignment_gather(), // coremlit issue #41; default: swift-parity
             previous_seek,
             PREPEND_PUNCTUATION,
             APPEND_PUNCTUATION,

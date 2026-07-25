@@ -668,6 +668,12 @@ fn empty_segments_returns_empty_without_consuming_alignment() {
 // wrapper composing gather -> prefix-take/zero-pad -> find_alignment ->
 // duration constraints/truncation -> merge_punctuations -> word-timing
 // re-anchoring.
+//
+// The four tests below predate the #41 gather split and their expectations
+// were written against the un-truncated gather, so they pass
+// `AlignmentGather::Complete` to keep their original intent; the pipeline
+// default (`SwiftParity`) is exercised by
+// `swift_parity_gather_truncates_final_alignment_row` below.
 
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
@@ -713,6 +719,7 @@ fn add_word_timestamps_attaches_merged_monotonic_words() {
     &t,
     "en",
     WordGrouping::FineGrained,
+    AlignmentGather::Complete,
     0,
     crate::audio::whisper::constants::PREPEND_PUNCTUATION,
     crate::audio::whisper::constants::APPEND_PUNCTUATION,
@@ -762,6 +769,7 @@ fn add_word_timestamps_zero_pads_missing_rows() {
     &t,
     "en",
     WordGrouping::FineGrained,
+    AlignmentGather::Complete,
     0,
     crate::audio::whisper::constants::PREPEND_PUNCTUATION,
     crate::audio::whisper::constants::APPEND_PUNCTUATION,
@@ -793,6 +801,7 @@ fn add_word_timestamps_errors_on_empty_segments() {
     &t,
     "en",
     WordGrouping::FineGrained,
+    AlignmentGather::Complete,
     0,
     crate::audio::whisper::constants::PREPEND_PUNCTUATION,
     crate::audio::whisper::constants::APPEND_PUNCTUATION,
@@ -821,6 +830,7 @@ fn add_word_timestamps_errors_on_zero_columns() {
     &t,
     "en",
     WordGrouping::FineGrained,
+    AlignmentGather::Complete,
     0,
     "",
     "",
@@ -831,4 +841,208 @@ fn add_word_timestamps_errors_on_zero_columns() {
     err,
     SegmentError::InvalidAlignmentShape { cols: 0, .. }
   ));
+}
+
+// whisper #41 -- the Swift-parity alignment gather. CoreVideo pads the rows of
+// the Float16 pixel-buffer backing every WhisperKit `MLMultiArray` uses
+// (`ArgmaxCore/MLMultiArrayExtensions.swift:11-53`, `:121-136`);
+// `addWordTimestamps`' gather memcpy indexes by `columnCount` instead
+// (`SegmentSeeker.swift:444-461`) while `dynamicTimeWarping` reads through the
+// stride-aware flat subscript (`:217`), so the final gathered row loses its
+// tail.
+
+#[test]
+fn coreml_f16_row_pitch_matches_the_probed_core_video_padding() {
+  // Pinned against the Swift capture in
+  // `crates/coremlit/tests/whisper_swift_probes/probe_alignment_stride.out`
+  // (`MLMultiArray.strides[0]` of the pixel-buffer-backed Float16 arrays):
+  // rows align to 64 bytes, i.e. 32 Float16 elements.
+  for (cols, pitch) in [
+    (8, 32),
+    (9, 32),
+    (100, 128),
+    (1496, 1504),
+    (1500, 1504),
+    (1504, 1504),
+  ] {
+    assert_eq!(
+      coreml_f16_row_pitch(cols),
+      pitch,
+      "probed pitch for cols={cols}"
+    );
+  }
+  // The quantum has to come from the probe, not from the shipping shape: an
+  // 8-element quantum agrees at cols=1500 and disagrees at cols=100.
+  assert_eq!(1500_usize.div_ceil(8) * 8, coreml_f16_row_pitch(1500));
+  assert_ne!(100_usize.div_ceil(8) * 8, coreml_f16_row_pitch(100));
+}
+
+#[test]
+fn swift_gather_keeps_only_the_final_rows_prefix() {
+  /// Replays Swift's gather on ITS OWN terms rather than restating the
+  /// production formula: allocate the padded destination storage, memcpy the
+  /// contiguous `rows * cols` prefix as `SegmentSeeker.swift:454-459` does,
+  /// then read logical row `r` back at the true pitch as
+  /// `dynamicTimeWarping`'s flat subscript does (`:217`), and count what
+  /// survived. `NAN` stands for the storage neither the memcpy nor the
+  /// `initialValue: FloatType(0)` fill ever writes -- the bytes that read
+  /// back as zero in practice.
+  fn kept_per_row(rows: usize, cols: usize) -> Vec<usize> {
+    let pitch = coreml_f16_row_pitch(cols);
+    let mut storage = vec![f32::NAN; rows * pitch];
+    storage[..rows * cols].fill(1.0);
+    (0..rows)
+      .map(|row| {
+        storage[row * pitch..row * pitch + cols]
+          .iter()
+          .take_while(|value| !value.is_nan())
+          .count()
+      })
+      .collect()
+  }
+
+  // The shipping shape, and the probe's own worked example ("logical row 119
+  // reads 476 element(s) past the copied prefix (kept columns = 1024)").
+  let kept = kept_per_row(120, 1500);
+  assert_eq!(kept[119], 1024, "the final row keeps 1024 of 1500 columns");
+  assert_eq!(1500 - kept[119], 476, "and reads 476 zeros after them");
+  assert!(
+    kept[..119].iter().all(|&columns| columns == 1500),
+    "no row but the last is touched"
+  );
+
+  assert_eq!(*kept_per_row(31, 1500).last().unwrap(), 1380);
+  assert_eq!(*kept_per_row(2, 1500).last().unwrap(), 1496);
+  assert_eq!(
+    kept_per_row(1, 1500),
+    vec![1500],
+    "a lone row is never truncated: it starts at storage 0"
+  );
+
+  // The production arithmetic reproduces the replay shape for shape --
+  // including shapes where more than one row is truncated, which is why
+  // `add_word_timestamps` runs the general per-row form rather than special-
+  // casing the last row.
+  for (rows, cols) in [
+    (120, 1500),
+    (31, 1500),
+    (2, 1500),
+    (1, 1500),
+    (3, 100),
+    (7, 40),
+  ] {
+    let pitch = coreml_f16_row_pitch(cols);
+    let copied = rows * cols;
+    let production: Vec<usize> = (0..rows)
+      .map(|row| copied.saturating_sub(row * pitch).min(cols))
+      .collect();
+    assert_eq!(
+      production,
+      kept_per_row(rows, cols),
+      "rows={rows} cols={cols}"
+    );
+  }
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn swift_parity_gather_truncates_final_alignment_row() {
+  // The behavioral consequence, end to end through `add_word_timestamps`:
+  // three gathered rows over 100 columns (pitch 128), so the copied prefix
+  // runs out 44 columns into row 2 and Swift reads zeros for columns 44..100
+  // of it.
+  //
+  // The weights are built so that row 2's ZEROED TAIL is what decides where
+  // the DTW path leaves row 1 -- and the row-1 -> row-2 boundary is the last
+  // text word's end, because the trailing timestamp token forms its own word
+  // group (`split_tokens_on_spaces` starts a new group at every special id)
+  // and `update_segments_with_word_timings` then drops it. Row 1 pays for
+  // every column past 79, so with row 2 blank the path stays in row 1 to
+  // column 79; with row 2's tail intact the +1.0 plateau from column 44 pulls
+  // the boundary back there instead.
+  let t = tiny_tokenizer();
+  let s = SpecialTokens::whisper_defaults();
+  let hello = t.encode(" Hello").unwrap()[0];
+  let world = t.encode(" world").unwrap()[0];
+  let tokens = vec![hello, world, s.time_token_begin() + 100];
+  let log_probs: Vec<(u32, f32)> = tokens.iter().map(|&token| (token, -0.2)).collect();
+  let mut segment = TranscriptionSegment::new();
+  segment
+    .set_tokens(tokens)
+    .set_token_log_probs(log_probs)
+    .set_start(0.0)
+    // Generously past every column time (99 * 0.02 = 1.98 s) so the segment
+    // keeps the last word's own end (`:642-649`'s else branch) instead of
+    // clamping it, which would hide the very difference under test.
+    .set_end(3.0);
+
+  let cols = 100usize;
+  let mut weights = vec![0.0f32; 3 * cols];
+  weights[0] = 3.0; // row 0: one spike, so the path enters row 1 immediately
+  for column in 0..cols {
+    weights[cols + column] = if column < 80 { 0.5 } else { -0.1 };
+    weights[2 * cols + column] = if column < 44 { 0.0 } else { 1.0 };
+  }
+  // The same matrix with Swift's truncation already applied by hand: row 2's
+  // columns 44..100 zeroed, nothing else.
+  let mut pre_truncated = weights.clone();
+  pre_truncated[2 * cols + 44..3 * cols].fill(0.0);
+
+  let last_word_end = |weights: &[f32], gather| {
+    let view = AlignmentView::new(weights, 3, cols);
+    let updated = add_word_timestamps(
+      std::slice::from_ref(&segment),
+      &view,
+      &t,
+      "en",
+      WordGrouping::FineGrained,
+      gather,
+      0,
+      PREPEND_PUNCTUATION,
+      APPEND_PUNCTUATION,
+      0.0,
+    )
+    .unwrap();
+    let words = updated[0].words_slice();
+    assert_eq!(
+      words.iter().map(WordTiming::word).collect::<Vec<_>>(),
+      vec![" Hello", " world"],
+      "the trailing timestamp token is dropped, so ` world` is the last word"
+    );
+    (words.last().unwrap().end(), updated[0].end())
+  };
+
+  let (complete_end, complete_segment_end) = last_word_end(&weights, AlignmentGather::Complete);
+  let (parity_end, parity_segment_end) = last_word_end(&weights, AlignmentGather::SwiftParity);
+  let (reference_end, _) = last_word_end(&pre_truncated, AlignmentGather::Complete);
+
+  assert_ne!(
+    complete_end, parity_end,
+    "the gather modes must disagree, or this fixture proves nothing"
+  );
+  // The boundary columns the fixture is built around, at 0.02 s per encoder
+  // frame: column 44, where row 2's surviving plateau starts, against column
+  // 79, row 1's last profitable column (the diagonal step into row 2 spends
+  // the 80th).
+  assert_eq!(
+    complete_end, 0.88,
+    "row 2's tail pulls the boundary to col 44"
+  );
+  assert_eq!(
+    parity_end, 1.58,
+    "with that tail zeroed, row 1 keeps the path to col 79"
+  );
+  assert_eq!(
+    parity_end, reference_end,
+    "SwiftParity over the full matrix == Complete over the hand-truncated one"
+  );
+  assert_ne!(
+    complete_end, reference_end,
+    "the hand truncation must actually move the boundary"
+  );
+  // The segment's end follows the last word's (`:642-649`), which is what
+  // reaches `seek = max(seek, lastSpeechTimestamp * sampleRate)`
+  // (`TranscribeTask.swift:221-223`) and cascades into the next window.
+  assert_eq!(complete_segment_end, complete_end);
+  assert_eq!(parity_segment_end, parity_end);
 }

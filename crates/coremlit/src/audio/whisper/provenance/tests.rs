@@ -6,7 +6,7 @@ use crate::audio::whisper::{
     chunker::{AudioChunk, VadChunker, prepare_seek_clips},
     vad::{EnergyVad, VoiceActivityDetector},
   },
-  options::{ChunkingStrategy, Task, WordGrouping},
+  options::{AlignmentGather, ChunkingStrategy, Task, WordGrouping},
   result::TranscriptionTimings,
   task_facts::{SpanKnowledge, TaskFacts},
 };
@@ -100,6 +100,11 @@ fn mutations() -> Vec<OptionMutation> {
       // keep this row an actual value change (else the completeness gate below
       // sees a byte-identical record and rightly fails).
       o.with_word_grouping(WordGrouping::FineGrained)
+    }),
+    ("alignment_gather", |o| {
+      // Same story as `word_grouping`: SwiftParity is the #41 default, so the
+      // value change has to be the un-truncated `Complete`.
+      o.with_alignment_gather(AlignmentGather::Complete)
     }),
   ]
 }

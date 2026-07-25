@@ -1,0 +1,26 @@
+== Float16, pixel-buffer backed (WhisperKit's initialValue: path) ==
+rows cols | shape strides count  storage_rows*pitch
+224 1500 | shape=[224, 1500] strides=[1504, 1] count=336000 storage=336896
+120 1500 | shape=[120, 1500] strides=[1504, 1] count=180000 storage=180480
+31 1500 | shape=[31, 1500] strides=[1504, 1] count=46500 storage=46624
+2 1500 | shape=[2, 1500] strides=[1504, 1] count=3000 storage=3008
+1 1500 | shape=[1, 1500] strides=[1504, 1] count=1500 storage=1504
+224 1496 | shape=[224, 1496] strides=[1504, 1] count=335104 storage=336896
+224 1504 | shape=[224, 1504] strides=[1504, 1] count=336896 storage=336896
+224 100 | shape=[224, 100] strides=[128, 1] count=22400 storage=28672
+224 8 | shape=[224, 8] strides=[32, 1] count=1792 storage=7168
+224 9 | shape=[224, 9] strides=[32, 1] count=2016 storage=7168
+
+== Float16, plain MLMultiArray(shape:dataType:) ==
+224 1500 | strides=[1500, 1] count=336000
+120 1500 | strides=[1500, 1] count=180000
+
+== gather mismatch, rows=120 cols=1500 ==
+row 0: true-stride first/last=0.0/0.0  columnCount-stride first/last=0.0/0.0  mismatched=0
+row 1: true-stride first/last=1.0/1.0  columnCount-stride first/last=0.0/1.0  mismatched=4
+row 2: true-stride first/last=2.0/2.0  columnCount-stride first/last=1.0/2.0  mismatched=8
+row 118: true-stride first/last=118.0/118.0  columnCount-stride first/last=117.0/118.0  mismatched=472
+row 119: true-stride first/last=119.0/119.0  columnCount-stride first/last=118.0/119.0  mismatched=476
+logical row 117 reads 0 element(s) past the copied prefix (kept columns = 1500)
+logical row 118 reads 0 element(s) past the copied prefix (kept columns = 1500)
+logical row 119 reads 476 element(s) past the copied prefix (kept columns = 1024)

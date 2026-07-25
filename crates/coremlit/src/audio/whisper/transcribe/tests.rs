@@ -5,7 +5,7 @@ use crate::audio::whisper::{
   audio::vad::VoiceActivityDetector,
   backend::{ModelDims, mock::MockBackend},
   error::{SegmentError, TranscribeError, VadError},
-  options::{ChunkingStrategy, DecodingOptions},
+  options::{AlignmentGather, ChunkingStrategy, DecodingOptions},
   tokenizer::{SpecialTokens, WhisperTokenizer},
 };
 
@@ -3025,11 +3025,20 @@ fn four_window_shapes_read_stale_and_dropped_alignment_rows() {
   //   B. re-add `alignment.fill(0.0)` in reset: ONLY W2 `gamma` 1.4 -> 1.8
   //      (W1's row 10 was already zero; W2 loses its stale row 7).
   //   D. move the loop's commit above the completion break: same as A.
+  //
+  // `AlignmentGather::Complete` is REQUIRED here, not incidental: this pins
+  // which alignment ROWS the accumulator hands over, and the #41 gather
+  // (`SwiftParity`, the pipeline default) zeroes the tail of the last gathered
+  // row before DTW ever sees it. With 100 columns the pitch is 128, so the
+  // discriminating column of the last row — the whole signal above — is
+  // erased and every mutation in the matrix reads the same. The gather is
+  // pinned separately by `swift_parity_gather_moves_the_next_window_seek`.
   let t = tiny_tokenizer();
   let options = DecodingOptions::new()
     .with_word_timestamps()
     .with_without_timestamps()
-    .maybe_drop_blank_audio(false);
+    .maybe_drop_blank_audio(false)
+    .with_alignment_gather(AlignmentGather::Complete);
   let mock = four_shape_alignment_fixture(&t);
   let result = TranscribeTask::new(&mock, &t)
     .run(&vec![0.1; 80_000], &options)
@@ -3111,13 +3120,21 @@ fn cap_hit_window_drops_the_completing_row() {
   // Identical tokens would trip the compression/logprob fallback and replay
   // the window; disable those thresholds so the run is a single 223-step
   // attempt and `decode_steps` reads the cap directly.
+  //
+  // `AlignmentGather::Complete` is REQUIRED for this pin to discriminate. At
+  // N = 224 gathered rows over 100 columns (pitch 128) the #41 gather's copied
+  // prefix runs dry at row 175, so under the pipeline default rows 175..=223 —
+  // including the predecessor/last-word/dropped triple this test is built on —
+  // arrive entirely zeroed and Mutation A becomes invisible. The gather itself
+  // is pinned by `swift_parity_gather_moves_the_next_window_seek`.
   let options = DecodingOptions::new()
     .with_word_timestamps()
     .with_without_timestamps()
     .maybe_drop_blank_audio(false)
     .maybe_compression_ratio_threshold(None)
     .maybe_logprob_threshold(None)
-    .maybe_first_token_logprob_threshold(None);
+    .maybe_first_token_logprob_threshold(None)
+    .with_alignment_gather(AlignmentGather::Complete);
   let result = TranscribeTask::new(&mock, &t)
     .run(&vec![0.1; 480_000], &options)
     .unwrap();
@@ -3323,4 +3340,103 @@ fn skip_special_tokens_governs_segment_text_on_both_writer_branches() {
     !off.text().contains("<|"),
     "joined transcript is special-filtered regardless of the flag"
   );
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn swift_parity_gather_moves_the_next_window_seek() {
+  // whisper #41 in miniature, on the mock backend: the alignment gather is
+  // not confined to one window's word list. The final gathered row's tail
+  // moves the last word's end (`SegmentSeeker.swift:642-649` hands it to the
+  // segment), the segment's end moves `seek` (`:221-223`'s
+  // `seek = max(seek, Int(lastSpeechTimestamp * sampleRate))`), and the next
+  // window therefore decodes a different slice of audio. That cascade is what
+  // turned a 476-column tail into 984 words of edit distance and one extra
+  // window across the 1417 s fixture.
+  //
+  // Shape: 100 encoder columns (pitch 128), a segment of 6 gathered tokens
+  // (`<|startoftranscript|><|en|><|transcribe|><|0.00|> Hello<|0.80|>` — the
+  // prompt rides along, `SegmentSeeker.swift:427-442`), so the copied prefix
+  // runs out 88 columns into row 4 and never reaches row 5 at all. Rows 4 and
+  // 5 are the pair that brackets the only text word, and the mock commits
+  // script step `k`'s row at accumulator row `k + 1`, so they are scripted at
+  // steps 3 and 4. Row 4 pays for every column past 59; row 5 has a +1.0
+  // plateau from column 44 that only the un-truncated gather can see.
+  let t = tiny_tokenizer();
+  let s = special();
+  let hello = t.encode(" Hello").unwrap()[0];
+  let cols = 100usize;
+
+  let run = |gather| {
+    let mut mock = MockBackend::new().with_dims(
+      ModelDims::new()
+        .with_window_samples(16_000)
+        .with_n_audio_ctx(cols),
+    );
+    let script = [
+      s.english_token(),
+      s.transcribe_token(),
+      ts(0),
+      hello,
+      ts(40),
+      ts(40),
+      s.end_token(),
+    ];
+    for (step, token) in script.iter().enumerate() {
+      let row: Vec<f32> = (0..cols)
+        .map(|column| match step {
+          3 if column < 60 => 0.5,
+          3 => -0.1,
+          4 if column >= 44 => 1.0,
+          _ => 0.0,
+        })
+        .collect();
+      mock.push_step_with_alignment(one_hot(*token), row);
+    }
+    let task = TranscribeTask::new(&mock, &t);
+    let options = DecodingOptions::new()
+      .with_word_timestamps()
+      .with_alignment_gather(gather);
+    // 3 s of audio: how far it gets is itself an output here, so the window
+    // count is not scripted but observed.
+    let result = task.run(&vec![0.1; 48_000], &options).unwrap();
+    let seeks: Vec<usize> = result
+      .segments_slice()
+      .iter()
+      .map(TranscriptionSegment::seek)
+      .collect();
+    let ends: Vec<f32> = result
+      .segments_slice()
+      .iter()
+      .map(TranscriptionSegment::end)
+      .collect();
+    (mock.counters().encode_calls(), seeks, ends)
+  };
+
+  let (complete_windows, complete_seeks, complete_ends) = run(AlignmentGather::Complete);
+  let (parity_windows, parity_seeks, parity_ends) = run(AlignmentGather::SwiftParity);
+
+  // Window 1 is identical audio and an identical script under both gathers,
+  // and still ends somewhere else.
+  assert_eq!(
+    complete_ends[0], 0.88,
+    "row 5's plateau ends window 1 at col 44"
+  );
+  assert_eq!(
+    parity_ends[0], 1.18,
+    "with row 5 blank, row 4 holds it to col 59"
+  );
+
+  // ... so window 2 starts somewhere else. THE assertion: the next window's
+  // seek is a function of the gather.
+  assert_eq!(complete_seeks[1], 14_080, "0.88 s * 16 kHz");
+  assert_eq!(parity_seeks[1], 18_880, "1.18 s * 16 kHz");
+  assert_ne!(complete_seeks[1], parity_seeks[1]);
+
+  // ... and the drift compounds: the un-truncated gather advances in smaller
+  // steps and fits one more window into the same 3 s, exactly as the port did
+  // against Swift's 51 windows before #41.
+  assert_eq!((complete_windows, parity_windows), (3, 2));
+  assert_eq!(complete_seeks, vec![0, 14_080, 28_160]);
+  assert_eq!(parity_seeks, vec![0, 18_880]);
 }
