@@ -689,8 +689,12 @@ const SENTENCE_END_MARKS: [&str; 6] = [".", "。", "!", "！", "?", "？"];
 /// needed the way Swift's `1..<0` `ClosedRange` would require). For each
 /// later word whose `duration()` exceeds `max_duration`:
 /// - if the word's own text EXACTLY matches a mark in the internal
-///   `SENTENCE_END_MARKS` table (whole-word — `" ."` with a leading space
-///   does not qualify), its `end` is pulled back to `start + max_duration`;
+///   `SENTENCE_END_MARKS` table (whole-word — a caller passing `" ."` with
+///   a leading space does not qualify; note that words reaching here from
+///   [`find_alignment`] never carry that space, because
+///   [`WhisperTokenizer::decode`]'s tokenization-space cleanup strips it,
+///   just as Swift's does), its `end` is pulled back to
+///   `start + max_duration`;
 /// - otherwise, if the PRECEDING word's text exactly matches a mark, this
 ///   word's `start` is pushed forward to `end - max_duration`.
 ///

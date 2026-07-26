@@ -9,7 +9,9 @@
 //! ModelUtilities.swift:16-71`) are out of scope here, matching this
 //! crate's existing "folders are always local" scoping (see
 //! `options::Options`'s doc): [`WhisperTokenizer::from_folder`] only ever
-//! looks for `tokenizer.json` directly inside the given folder.
+//! looks directly inside the given folder, at `tokenizer.json` (required)
+//! and `tokenizer_config.json` (optional — read for one flag, see
+//! `clean_up_tokenization_spaces_from`).
 
 use std::path::Path;
 
@@ -251,6 +253,96 @@ fn is_single_punctuation_scalar(s: &str) -> bool {
   }
 }
 
+/// Resolves Swift's `cleanUpTokenizationSpaces` flag (`Tokenizer.swift:407`)
+/// for a tokenizer folder: `tokenizer_config.json`'s
+/// `clean_up_tokenization_spaces`, defaulting to `true`.
+///
+/// Swift spells that `tokenizerConfig.cleanUpTokenizationSpaces.boolean(or:
+/// true)` — a `Config` lookup that yields `true` for a missing key and for a
+/// present-but-non-boolean value alike. This reproduces both, and extends the
+/// same leniency one step further, to a missing or unparseable file. Swift
+/// cannot reach that case (its `AutoTokenizer` fails the whole load if
+/// `tokenizer_config.json` is not readable JSON), but this crate's
+/// [`WhisperTokenizer::from_folder`] requires only `tokenizer.json` — a
+/// contract predating this flag, and not worth narrowing over one boolean
+/// whose default is what every OpenAI Whisper checkpoint ships anyway
+/// (verified: `whisper-tiny` and `whisper-small` both set it to `true`
+/// explicitly). A corrupt sibling file therefore degrades to Swift's own
+/// default rather than failing a `tokenizer.json` that is perfectly good.
+fn clean_up_tokenization_spaces_from(folder: &Path) -> bool {
+  std::fs::read(folder.join("tokenizer_config.json"))
+    .ok()
+    .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+    .as_ref()
+    .and_then(|config| config.get("clean_up_tokenization_spaces"))
+    .and_then(serde_json::Value::as_bool)
+    .unwrap_or(true)
+}
+
+/// Applies Swift's `Tokenizer.cleanUp` (`Tokenizer.swift:434-449`) — the
+/// HuggingFace `clean_up_tokenization_spaces` layer, which the `tokenizers`
+/// crate has no equivalent of — to an already-joined decode.
+///
+/// Swift's rule set is exactly ten literal (non-regex), non-overlapping,
+/// left-to-right replacements, run as a chain so each one sees the previous
+/// one's output. The chain below is those ten transcribed from
+/// `Tokenizer.swift:439-448` in Swift's order, and is the only copy of the
+/// list — `swift_clean_up_reference` in this module's tests transcribes it a
+/// second time, unguarded, so the two cannot drift silently apart.
+///
+/// That order is load-bearing and is Swift's, not a re-derivation. The
+/// witness is `" ' ,"`: `" ,"` runs first and consumes the comma's space,
+/// leaving `" ',"`, where running `" ' "` first would have consumed both
+/// spaces and left `"',"`. More generally, each rule deletes a space and so
+/// brings its neighbours together, which can expose a match for a later one.
+///
+/// These ten are also exactly HuggingFace's own
+/// `PreTrainedTokenizerBase.clean_up_tokenization` set, so nothing had to be
+/// dropped to match Swift. Nothing is added either — in particular, Swift's
+/// *other* cleanup, `WordPieceDecoder.cleanUpTokenization`
+/// (`Decoder.swift:104-108`), is deliberately NOT ported: it is a different
+/// rule set (regex-driven, and with an extra `" do not"` -> `" don't"`
+/// rule), it is gated on its own `cleanup` config flag, and it belongs to
+/// the WordPiece decoder, which a Whisper `tokenizer.json` never
+/// instantiates — its `decoder` is `ByteLevel` (verified on the
+/// `whisper-tiny` and `whisper-small` fixtures). Applying it here would
+/// close this divergence by opening a new one.
+///
+/// `str::replace` matches Swift's `String.replacingOccurrences(of:with:)`
+/// with no options: literal, non-overlapping, left-to-right. Every search
+/// string here is pure ASCII, so Swift's canonical-equivalence-aware string
+/// comparison cannot differ from Rust's byte comparison on them.
+///
+/// The leading scan is a pure short-circuit, not a behavioral rule: every one
+/// of the ten patterns starts with a space followed by one of `.?!,'n`, so a
+/// text with no such pair cannot match the first rule — and, being therefore
+/// unchanged, cannot match the second, and so on down the chain. Replacements
+/// only ever *delete* the leading space of a match and never insert one, so
+/// the chain cannot manufacture a pair that the original text lacked. When
+/// the scan finds nothing, the backend's `String` is handed back untouched
+/// rather than rebuilt ten times — which matters because
+/// [`WhisperTokenizer::split_tokens_on_unicode`] decodes once per token.
+fn clean_up_tokenization(text: String) -> String {
+  let can_match = text
+    .as_bytes()
+    .windows(2)
+    .any(|pair| pair[0] == b' ' && matches!(pair[1], b'.' | b'?' | b'!' | b',' | b'\'' | b'n'));
+  if !can_match {
+    return text;
+  }
+  text
+    .replace(" .", ".")
+    .replace(" ?", "?")
+    .replace(" !", "!")
+    .replace(" ,", ",")
+    .replace(" ' ", "'")
+    .replace(" n't", "n't")
+    .replace(" 'm", "'m")
+    .replace(" 's", "'s")
+    .replace(" 've", "'ve")
+    .replace(" 're", "'re")
+}
+
 /// Whisper BPE tokenizer facade: raw encode/decode, the resolved
 /// special-token table, per-language token ids, and the word-split
 /// heuristics used to align decoder token output to words. Ports Swift's
@@ -259,6 +351,10 @@ fn is_single_punctuation_scalar(s: &str) -> bool {
 pub struct WhisperTokenizer {
   tokenizer: tokenizers::Tokenizer,
   special_tokens: SpecialTokens,
+  // Swift's `Tokenizer.cleanUpTokenizationSpaces` (`Tokenizer.swift:356`,
+  // resolved at `:407`), read once at load: see
+  // `clean_up_tokenization_spaces_from` and [`Self::decode`].
+  clean_up_tokenization_spaces: bool,
   // `language_table` is the source of truth, probed once at load
   // (`Models.swift:1219-1223`); `language_ids` is a cached view of its
   // first components, kept because `all_language_tokens` must return a
@@ -284,7 +380,8 @@ impl WhisperTokenizer {
   /// [`TokenizerError::FileNotFound`] if `folder` has no `tokenizer.json`;
   /// [`TokenizerError::Backend`] if the file exists but fails to parse.
   pub fn from_folder(folder: impl AsRef<Path>) -> Result<Self, TokenizerError> {
-    let path = folder.as_ref().join("tokenizer.json");
+    let folder = folder.as_ref();
+    let path = folder.join("tokenizer.json");
     if !path.is_file() {
       return Err(TokenizerError::FileNotFound {
         searched: vec![path],
@@ -292,6 +389,7 @@ impl WhisperTokenizer {
     }
     let tokenizer = tokenizers::Tokenizer::from_file(&path)?;
     let special_tokens = SpecialTokens::probe(&tokenizer);
+    let clean_up_tokenization_spaces = clean_up_tokenization_spaces_from(folder);
 
     let mut language_table: Vec<(u32, &'static str)> = Vec::new();
     for &(_, code) in constants::languages() {
@@ -309,6 +407,7 @@ impl WhisperTokenizer {
     Ok(Self {
       tokenizer,
       special_tokens,
+      clean_up_tokenization_spaces,
       language_table,
       language_ids,
     })
@@ -354,11 +453,43 @@ impl WhisperTokenizer {
   /// [`Self::split_to_word_tokens`]'s doc for why this module relies on
   /// that shared behavior instead of pre-filtering.
   ///
+  /// # The tokenization-space cleanup
+  /// The joined decode is then passed through Swift's `cleanUp`
+  /// (`Tokenizer.swift:434-449`) when this tokenizer folder enables it —
+  /// see `clean_up_tokenization` for the ten rules and
+  /// `clean_up_tokenization_spaces_from` for the flag. That is a real
+  /// output change, not a formality: `decode(&[1097])`, the `Ġ...` token,
+  /// is `" ..."` from the backend and `"..."` after cleanup, and the lost
+  /// leading space flips the `starts_with_space` arm of the space-based
+  /// word splitter behind [`Self::split_to_word_tokens`] (coremlit issue
+  /// #59), merging that unit into the preceding word.
+  ///
+  /// This is the single place the layer lives, because it is the single
+  /// place Swift puts it: `Tokenizer.decode` applies `cleanUp` to the
+  /// *joined* string (`Tokenizer.swift:524`), and every Swift caller —
+  /// `WhisperTokenizerWrapper.decode` (`Models.swift:1175-1176`),
+  /// `splitTokensOnUnicode`'s full and per-prefix decodes
+  /// (`Models.swift:1227`, `:1237`), and `splitToWordTokens`'s
+  /// language-detection decode (`:1294`) — reaches it through that one
+  /// method, exactly as every caller in this crate reaches it through this
+  /// one. Two consequences of the *joined* placement are load-bearing and
+  /// are why this is not instead a `tokenizers`-crate `Decoder`: that
+  /// crate's decoders run per token and only then join, so a `" ."` split
+  /// across two tokens would escape cleanup where Swift cleans it; and
+  /// `tokenizers::Tokenizer` is a concrete `TokenizerImpl<..,
+  /// DecoderWrapper>` whose `from_file` deserializes into fixed wrapper
+  /// enums, with no seam for a custom decoder at all.
+  ///
   /// # Errors
   /// [`TokenizerError::Backend`] if the tokenizer backend fails to decode
   /// `ids`.
   pub fn decode(&self, ids: &[u32], skip_special: bool) -> Result<String, TokenizerError> {
-    Ok(self.tokenizer.decode(ids, skip_special)?)
+    let decoded = self.tokenizer.decode(ids, skip_special)?;
+    Ok(if self.clean_up_tokenization_spaces {
+      clean_up_tokenization(decoded)
+    } else {
+      decoded
+    })
   }
 
   /// Looks up a token string's id, if the vocabulary has it.
@@ -536,6 +667,17 @@ impl WhisperTokenizer {
   /// is a byte-prefix-preserving operation by construction, but strictly
   /// safer than the Swift original for the same result on every reachable
   /// input.
+  ///
+  /// Note that [`Self::decode`]'s tokenization-space cleanup is the one
+  /// thing that can perturb that byte-prefix property, since it deletes
+  /// spaces from `decoded` and `decoded_full` independently (a prefix
+  /// ending in `" n"` is untouched where the full text's `" n't"` is not).
+  /// This is not a deviation to correct: Swift routes both of its decodes
+  /// through the same `cleanUp` (`Models.swift:1227`, `:1237` ->
+  /// `Tokenizer.swift:524`), so its offsets are perturbed identically. It
+  /// is only reachable at all when `decoded` holds a U+FFFD, i.e. mid
+  /// multi-byte character, and the cleanup's patterns are pure ASCII —
+  /// and where Swift would read a shifted range, this reads `None`.
   fn split_tokens_on_unicode(
     &self,
     tokens: &[u32],
@@ -570,6 +712,14 @@ impl WhisperTokenizer {
   /// ([`is_single_punctuation_scalar`]), or no word has started yet;
   /// otherwise it is appended (text and tokens both) onto the previous
   /// word. Ports `splitTokensOnSpaces` (`Models.swift:1255-1277`) exactly.
+  ///
+  /// The leading-space test reads a *cleaned* decode, which is what makes
+  /// [`Self::decode`]'s cleanup visible in word grouping rather than only
+  /// in text: `" ..."` becomes `"..."`, which is neither space-prefixed nor
+  /// a single punctuation scalar, so it joins the preceding word instead of
+  /// starting a new one. Swift groups it the same way, for the same reason
+  /// (coremlit issue #59). A single `" ."` is unaffected — it loses its
+  /// space too, but `"."` is one punctuation scalar and still starts a word.
   fn split_tokens_on_spaces(
     &self,
     tokens: &[u32],
