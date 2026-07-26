@@ -104,7 +104,7 @@ granite = ["dep:tokenizers", "dep:windit", "windit/text", "dep:sha2"]
 # SigLIP 2 (`siglip2-base-patch16-naflex`) dual-tower image+text embeddings on
 # CoreML: a shared 768-dim joint space. A Rust NaFlex vision front-end
 # (aspect-preserving patch-budget solver + antialiased-bilinear resize +
-# position-embedding lift; the u8 image resize is delegated to `colconv`'s
+# position-embedding lift; the u8 image resize is delegated to `pixon`'s
 # byte-exact PIL-parity q8 resampler, while the patch-budget solver / patchify /
 # pos-emb lift stay hand-rolled — no `image`/decoder dep) around two fp16 graphs,
 # plus a bundled Gemma tokenizer (`tokenizers`, shared with
@@ -114,11 +114,11 @@ granite = ["dep:tokenizers", "dep:windit", "windit/text", "dep:sha2"]
 # crate — so there is NO `siglip-oracle` feature and NO `ort` in this path.
 # `default = []` pulls none of it.
 #
-# LICENSE PREREQUISITE (owner-gated, NOT resolved by this change): `colconv` is
+# LICENSE PREREQUISITE (owner-gated, NOT resolved by this change): `pixon` is
 # currently licensed GPL-3.0-or-later; the owner will relicense it permissive
 # (MIT OR Apache-2.0) before this branch merges. It is a flagged merge blocker
 # tracked outside this change, not something wired here.
-siglip = ["dep:tokenizers", "dep:colconv"]
+siglip = ["dep:tokenizers", "dep:pixon"]
 
 # --- audio::ced (CED tiny/mini/small/base AudioSet sound-event tagging) ---
 # Native CoreML CED multi-label classifier (tiny/mini/small/base — one
@@ -292,25 +292,27 @@ windit = { git = "https://github.com/findit-studio/windit", rev = "b49888002bcbf
 sha2 = { workspace = true, optional = true }
 
 # --- embeddings::siglip image resampler (the `siglip` feature) ---
-# `colconv` supplies the byte-exact PIL-parity q8 image resampler the NaFlex u8
+# `pixon` supplies the byte-exact PIL-parity q8 image resampler the NaFlex u8
 # resize path delegates to, retiring the former hand-rolled fixed-point kernel.
-# `default-features = false` with EXACTLY `["std", "rgb"]`: `std` gates colconv's
+# `default-features = false` with EXACTLY `["std", "rgb"]`: `std` gates pixon's
 # `Convert` / `resample` tiers (the `Convert::from(Rgb24Frame).resize_with(
 # Triangle, …).rgb(…).run()` path this crate drives), and `rgb` gates the
 # packed-RGB24 source frame — the `frame` umbrella (every YUV/bayer/xyz format)
 # is NOT needed for the RGB→RGB resize, so it stays off. Transitive deps are
 # pure-Rust and ort-free (`mediaframe`, `derive_more`, `half`, `thiserror`).
-# Rev-pinned to the reviewed colconv HEAD (the asry/diaric/windit convention).
-# CO-DEV against a LOCAL colconv checkout: add an UNCOMMITTED patch to the
+# A published crates.io range, no longer a rev pin: `pixon` is the renamed
+# `colconv`, and `pixon` 0.1.0 carries the API `colconv` 0.2.1 shipped, so the
+# resampler bytes are the ones the goldens were taken against.
+# CO-DEV against a LOCAL pixon checkout: add an UNCOMMITTED patch to the
 # WORKSPACE ROOT Cargo.toml (never commit it):
 #
-#   [patch."https://github.com/findit-studio/colconv"]
-#   colconv = { path = "../colconv" }
+#   [patch.crates-io]
+#   pixon = { path = "../pixon" }
 #
-# LICENSE: colconv is GPL-3.0-or-later today; its owner-gated relicense to
+# LICENSE: pixon is GPL-3.0-or-later today; its owner-gated relicense to
 # MIT OR Apache-2.0 is a merge blocker for this branch (see the `siglip` feature
 # comment above).
-colconv = { git = "https://github.com/findit-studio/colconv", rev = "0e2cef95498bbcbb6f500ce14f2137c38ed66470", default-features = false, features = ["std", "rgb"], optional = true }
+pixon = { version = "0.1", default-features = false, features = ["std", "rgb"], optional = true }
 
 [dev-dependencies]
 # Integration tests / benches / examples are external consumers: they link the

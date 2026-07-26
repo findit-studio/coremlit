@@ -108,7 +108,7 @@ def load_model(attn_implementation="sdpa"):
 def load_slow_image_processor():
     """The SLOW ``Siglip2ImageProcessor`` (explicit class, NOT AutoProcessor / the
     declared Fast one): its uint8 PIL resize (pillow BILINEAR) is what the Rust
-    colconv q8 path is bit-exact against. use_fast is irrelevant for an explicit
+    pixon q8 path is bit-exact against. use_fast is irrelevant for an explicit
     slow class."""
     return Siglip2ImageProcessor.from_pretrained(src_dir())
 

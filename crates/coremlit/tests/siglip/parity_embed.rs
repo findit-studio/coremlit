@@ -6,7 +6,7 @@
 //! `#[ignore]`d until the owner stages the conversion (`SIGLIP_TEST_MODELS`) and
 //! the committed goldens (Wave B). The `CpuAndGpu` arm is THE GATE (floor never
 //! below 0.99917; measured worst here ≈ 0.99999 both towers — the vision path
-//! preprocesses via colconv and the text path feeds the golden ids). The ANE /
+//! preprocesses via pixon and the text path feeds the golden ids). The ANE /
 //! CpuOnly arms are CHARACTERIZED in `placement.rs`, not floor-gated. Non-vacuity:
 //! zeroed `position_embeddings` collapses vision parity far below the floor.
 

@@ -353,7 +353,7 @@ fn load_npy<T: npyz::Deserialize>(path: &std::path::Path) -> Vec<T> {
 /// Full-tensor parity of the Rust NaFlex tensors against the staged per-image
 /// `.npy` fixtures (the slow processor + the official lift). `pixel_values` and
 /// the mask must be BITWISE equal (the pillow-fixed-point contract, delegated to
-/// colconv). For `position_embeddings`, the lifted REAL rows match within the
+/// pixon). For `position_embeddings`, the lifted REAL rows match within the
 /// pinned tolerance while the Rust pad rows are asserted bitwise ZERO — the
 /// reference fills pad rows with `resized[0]` (masked, output-invariant), so the
 /// pad rows are canonicalized, not compared to the raw dump.
