@@ -947,6 +947,10 @@ pub(crate) fn rounded_to_places(value: f32, decimal_places: i32) -> f32 {
 /// [`MultiArray::f16_surface`] and reading the strides CoreVideo actually
 /// chose.
 ///
+/// **Only [`AlignmentGather::SwiftParity`] — the opt-in mode — calls this.**
+/// The default gather ([`AlignmentGather::Complete`]) allocates no surface,
+/// measures nothing and depends on no property of this host.
+///
 /// **Not a constant, deliberately.** Apple documents `CVPixelBuffer` row
 /// alignment as hardware-dependent and requires it to be queried (QA1829,
 /// "Understanding CVPixelBuffer memory alignment"), and
@@ -964,11 +968,27 @@ pub(crate) fn rounded_to_places(value: f32, decimal_places: i32) -> f32 {
 ///
 /// The probe uses the caller's exact `[rows, cols]` shape rather than a
 /// cheaper 1-row stand-in, so nothing here assumes the pitch is independent
-/// of the row count — which is why [`gather_swift_rows`] asks for the SOURCE
-/// and DESTINATION shapes separately instead of reusing one answer for both.
-/// One `CVPixelBufferCreate` plus its zero-fill per shape per
+/// of the row count — which is why [`gather_swift_parity_into`] asks for the
+/// SOURCE and DESTINATION shapes separately instead of reusing one answer for
+/// both. One `CVPixelBufferCreate` plus its zero-fill per shape per
 /// word-timestamped window is immaterial next to that window's encoder and
 /// decoder runs.
+///
+/// # What this establishes, and what it does not
+///
+/// **Established:** the row pitch of the surface THIS call allocated, read
+/// back from CoreVideo's own strides.
+///
+/// **Not established:** the row pitch of the surface Swift's process
+/// allocated. Nothing in CoreVideo promises two allocations of one shape
+/// share a layout, and this port cannot observe Swift's. `SwiftParity`
+/// assumes they agree — assumption **A1** on
+/// [`AlignmentGather::SwiftParity`], stated there rather than left implicit.
+///
+/// **What would settle it:** a documented CoreVideo/IOSurface guarantee that
+/// row alignment is a pure function of pixel format and dimensions. No such
+/// guarantee is published; QA1829 says the opposite in spirit by requiring
+/// the value to be queried per buffer.
 ///
 /// # Errors
 /// [`SegmentError::AlignmentPitchUnavailable`] if the probe allocation
@@ -983,7 +1003,7 @@ pub(crate) fn rounded_to_places(value: f32, decimal_places: i32) -> f32 {
 // this host's pitch cuts the gather, and has to ask the same helper the
 // pipeline asks rather than restate a number.
 pub(crate) fn coreml_f16_row_pitch(rows: usize, cols: usize) -> Result<usize, SegmentError> {
-  let (probe, _) = MultiArray::f16_surface_probing_fresh_tail(&[rows, cols])
+  let probe = MultiArray::f16_surface(&[rows, cols])
     .map_err(|source| SegmentError::AlignmentPitchUnavailable { rows, cols, source })?;
   row_pitch_of(&probe, rows, cols)
 }
@@ -1008,40 +1028,82 @@ fn row_pitch_of(probe: &MultiArray, rows: usize, cols: usize) -> Result<usize, S
   }
 }
 
-/// Measures the DESTINATION surface Swift's gather allocates per call
-/// (`SegmentSeeker.swift:450`) — its row pitch, plus the one property of
-/// that surface the pitch does not capture: whether the storage past its
-/// logical `rows * cols` elements comes back zero.
+/// The row-pitch measurement [`gather_swift_parity_into`] runs, as a
+/// parameter rather than a hard-wired call.
 ///
-/// That tail is read by `dynamicTimeWarping` and written by nobody. Swift's
-/// `initialValue: FloatType(0)` fill covers only the logical `count`
-/// (`ArgmaxCore/MLMultiArrayExtensions.swift:11-53`, over a buffer the row
-/// pitch made larger), and the gather's `memcpy` covers the same `rows *
-/// cols` prefix, so every cell past it is whatever `CVPixelBufferCreate`
-/// returned. [`MultiArray::f16_surface_probing_fresh_tail`] reports exactly
-/// that region, sampled on a real allocation of the same shape before
-/// anything writes to it — an observation of this host's allocator, not an
-/// assumption about it.
+/// Production passes [`coreml_f16_row_pitch`], which measures the running
+/// host. `segment::tests` passes layouts this host will never produce — above
+/// all a host that pitches Swift's 224-row source array differently from this
+/// port's 225-row accumulator, which is the ONLY way to check that the probe
+/// asks CoreVideo about Swift's height rather than the port's (whisper #41,
+/// codex round 3, F2).
+type RowPitchProbe<'a> = &'a dyn Fn(usize, usize) -> Result<usize, SegmentError>;
+
+/// Reproduces Swift's alignment gather into `out` (supplied zero-filled),
+/// measuring both surfaces' row pitches through `row_pitch`.
+///
+/// # The two heights are NOT the same number
+///
+/// `alignment.rows()` is this port's accumulator height,
+/// `max_token_context + 1` — 225 — because
+/// [`commit_alignment_row`](crate::audio::whisper::backend::InferenceBackend::commit_alignment_row)
+/// commits step `position`'s row at `position + 1`, so the last trait-legal
+/// position needs one slot of headroom past the KV dimension. Swift has no
+/// such headroom: `alignmentWeights` is allocated at
+/// `[kvCacheMaxSequenceLength, n_audio_ctx]` (`TextDecoder.swift:141`) — the
+/// **224**-slot KV dimension itself.
+///
+/// The pitch is a function of the shape CoreVideo is handed, and this branch
+/// exists precisely because pitch may vary with height. Probing `[225, cols]`
+/// would therefore decode Swift's storage offsets with a pitch Swift's array
+/// never had wherever `pitch(224, cols) != pitch(225, cols)`, splicing the
+/// wrong weights (or the wrong padding) into DTW's input while still
+/// reporting parity. `swift_source_rows` is Swift's physical height, passed
+/// down from the model's own `max_token_context` — never derived from the
+/// view — and it is the shape this probes.
+///
+/// The reproduction's read bound is the smaller of the two: an offset past
+/// `swift_source_rows` is past Swift's array (Swift would read off its end),
+/// and an offset past `alignment.rows()` is past this port's data. Neither is
+/// reachable for a real window (`needed <= 224 <= min(224, 225)`); the bound
+/// is the same defensive branch the prefix take has always carried.
 ///
 /// # Errors
 /// [`SegmentError::AlignmentPitchUnavailable`] /
-/// [`SegmentError::AlignmentPitchUnexpectedLayout`] as
-/// [`coreml_f16_row_pitch`], and
-/// [`SegmentError::AlignmentGatherTailNotZero`] when the probe found the
-/// tail dirty — see that variant for why an unreproducible DTW input is
-/// refused rather than approximated.
-fn coreml_f16_gather_destination_pitch(rows: usize, cols: usize) -> Result<usize, SegmentError> {
-  let (probe, nonzero_bytes) = MultiArray::f16_surface_probing_fresh_tail(&[rows, cols])
-    .map_err(|source| SegmentError::AlignmentPitchUnavailable { rows, cols, source })?;
-  let pitch = row_pitch_of(&probe, rows, cols)?;
-  if nonzero_bytes > 0 {
-    return Err(SegmentError::AlignmentGatherTailNotZero {
-      rows,
-      cols,
-      nonzero_bytes,
-    });
-  }
-  Ok(pitch)
+/// [`SegmentError::AlignmentPitchUnexpectedLayout`] from `row_pitch`, for
+/// either surface — see [`coreml_f16_row_pitch`].
+fn gather_swift_parity_into(
+  out: &mut [f32],
+  alignment: &AlignmentView<'_>,
+  needed: usize,
+  cols: usize,
+  swift_source_rows: usize,
+  row_pitch: RowPitchProbe<'_>,
+) -> Result<(), SegmentError> {
+  let src_rows = alignment.rows().min(swift_source_rows);
+  // A row-less source has no surface for Swift to have allocated, and the
+  // gather reads nothing from it whatever CoreVideo would have pitched it at
+  // (every offset lands past row `src_rows`), so the reproduction is all
+  // zeros. Skipping the probe keeps a caller-built empty view out of
+  // `AlignmentPitchUnavailable`, which reports an unmeasurable HOST rather
+  // than an empty input. No backend produces one: both build the FIXED
+  // `max_token_context + 1` accumulator against a nonzero `max_token_context`.
+  let src_pitch = if src_rows == 0 {
+    cols
+  } else {
+    row_pitch(swift_source_rows, cols)?
+  };
+  let dst_pitch = row_pitch(needed, cols)?;
+  gather_swift_rows(
+    out,
+    alignment.data(),
+    src_rows,
+    needed,
+    cols,
+    src_pitch,
+    dst_pitch,
+  );
+  Ok(())
 }
 
 /// Reproduces Swift's alignment gather: what `dynamicTimeWarping` actually
@@ -1065,25 +1127,40 @@ fn coreml_f16_gather_destination_pitch(rows: usize, cols: usize) -> Result<usize
 ///
 /// - `o >= needed * cols` — past the copy. Neither the `memcpy` nor the
 ///   `initialValue:` fill (logical `count` elements, `:450`) ever wrote
-///   there, so it is the destination allocation's untouched tail:
-///   [`coreml_f16_gather_destination_pitch`] verified it comes back zero on
-///   this host, and refused the gather otherwise.
+///   there, so it is the destination allocation's untouched tail, and what
+///   DTW reads from it is whatever `CVPixelBufferCreate` returned. This
+///   function substitutes ZERO, which is assumption **A2** of the opt-in
+///   mode — see [`AlignmentGather::SwiftParity`], where it is stated in full
+///   rather than presented as established. It is not verified here and
+///   cannot be: an earlier revision sampled a *different*, disposable
+///   allocation's tail, which proves nothing about the one Swift's process
+///   gathered into (codex round 3, F3), and the sampling itself read
+///   uninitialized memory (F1).
 /// - `o < needed * cols` — source storage `o`, which is source logical row
 ///   `o / src_pitch`, column `o % src_pitch`. A column below `cols` is a
-///   real weight; at or above it, the source's own inter-row padding.
+///   real weight; at or above it, the source's own inter-row padding, for
+///   which this function likewise substitutes ZERO.
 ///
-/// **The source's padding is zero, and that is Swift's guarantee rather than
-/// this host's.** `alignmentWeights` is allocated once
-/// (`TextDecoder.swift:141`) through the same `initialValue: FloatType(0)`
-/// initializer, whose `initialize(repeating:count:)` runs over the LOGICAL
-/// element count — flat, ignoring the pitch — and so zeroes storage `[0,
-/// src_rows * cols)`, padding cells included. It is never a model input or
-/// output backing (`TextDecoder.swift:394-401`, `:414`) and `DecodingInputs.
-/// reset` never clears it (`Models.swift:312-322`); its only writer is
-/// `updateAlignmentWeights` (`:272-295`), which is stride-aware and
-/// therefore never touches a padding cell. The gather reads storage below
-/// `needed * cols <= src_rows * cols`, so every padding cell it can reach is
-/// still carrying that initial zero — on any host, at any pitch.
+/// **What the source-padding zero rests on.** `alignmentWeights` is allocated
+/// once (`TextDecoder.swift:141`) through the same `initialValue:
+/// FloatType(0)` initializer, whose `initialize(repeating:count:)` runs over
+/// the LOGICAL element count — flat, ignoring the pitch — and so zeroes
+/// storage `[0, src_rows * cols)` at construction, padding cells included. It
+/// is never a model input or output backing (`TextDecoder.swift:394-401`,
+/// `:414`) and `DecodingInputs.reset` never clears it
+/// (`Models.swift:312-322`); its only writer is `updateAlignmentWeights`
+/// (`:272-295`), which is stride-aware and so writes no padding cell. The
+/// gather reads storage below `needed * cols <= src_rows * cols`, so every
+/// padding cell it can reach was zero *at construction*.
+///
+/// That its construction-time value SURVIVES is a separate step, and an
+/// unverified one: both the writer and the gather reach the array through
+/// `withUnsafeMutableBytes`, whose contract states the strides handed to the
+/// closure may differ from the value before invocation — so no cited contract
+/// rules out a relayout or a replacement of the backing storage introducing
+/// padding that construction never zeroed. That is assumption **A3** of the
+/// opt-in mode, stated on [`AlignmentGather::SwiftParity`] (codex round 3,
+/// F4).
 ///
 /// # Why the two pitches are measured separately
 ///
@@ -1137,15 +1214,15 @@ fn gather_swift_rows(
         out_row[column..column + run].copy_from_slice(&source[start..start + run]);
         run
       } else {
-        // Source-side inter-row padding: zero, per this function's doc, and
-        // `out` already holds zero.
+        // Source-side inter-row padding: zero under assumption A3, per this
+        // function's doc, and `out` already holds zero.
         (src_pitch - source_column).min(end - offset)
       };
       offset += run;
       column += run;
     }
-    // `[column, cols)` is the destination tail (verified zero) — already
-    // zero in `out`.
+    // `[column, cols)` is the destination tail: zero under assumption A2,
+    // per this function's doc, and already zero in `out`.
   }
 }
 
@@ -1168,19 +1245,25 @@ fn gather_swift_rows(
 /// [`WordGrouping::FineGrained`] is this port's long-standing opt-in).
 ///
 /// `gather` selects what the prefix take hands to DTW.
-/// [`AlignmentGather::SwiftParity`] (the pipeline default) instead
-/// reproduces Swift's own gather: its `memcpy` loop
-/// (`SegmentSeeker.swift:452-460`) binds both `MLMultiArray`s' strides and
-/// then indexes with `columnCount`, while `dynamicTimeWarping`'s flat
-/// subscript (`:217`) *is* stride-aware and CoreVideo pads the Float16
-/// backing's rows (`ArgmaxCore/MLMultiArrayExtensions.swift:121-136`), so
-/// what DTW reads back is a function of BOTH surfaces' row pitches — each
-/// measured on the running host by this module's `coreml_f16_row_pitch`,
-/// neither assumed, and the destination's untouched tail verified rather
-/// than presumed zero. This module's `gather_swift_rows` derives the mapping;
-/// [`AlignmentGather::Complete`] gathers
-/// every row whole — see [`AlignmentGather`] for why the reproduced form is
-/// the parity-bearing one (whisper #41). Swift's
+/// [`AlignmentGather::Complete`] — **the default** — gathers every row whole:
+/// a plain prefix take, allocating no surface, measuring nothing about the
+/// host and assuming nothing about it.
+/// [`AlignmentGather::SwiftParity`] is the opt-in that instead reproduces
+/// Swift's own gather: its `memcpy` loop (`SegmentSeeker.swift:452-460`) binds
+/// both `MLMultiArray`s' strides and then indexes with `columnCount`, while
+/// `dynamicTimeWarping`'s flat subscript (`:217`) *is* stride-aware and
+/// CoreVideo pads the Float16 backing's rows
+/// (`ArgmaxCore/MLMultiArrayExtensions.swift:121-136`), so what DTW reads back
+/// is a function of BOTH surfaces' row pitches — each measured on the running
+/// host by this module's `coreml_f16_row_pitch`, at each surface's own height.
+/// This module's `gather_swift_parity_into`/`gather_swift_rows` derive the
+/// mapping; see [`AlignmentGather::SwiftParity`] for the three assumptions
+/// that mode carries and why they are acceptable only because it is opt-in
+/// (whisper #41). `swift_source_rows` is Swift's PHYSICAL source height —
+/// `kvCacheMaxSequenceLength`, i.e. the model's `max_token_context` — which
+/// is one row SHORTER than `alignment.rows()`; it is ignored under `Complete`
+/// and load-bearing under `SwiftParity` (see `gather_swift_parity_into`).
+/// Swift's
 /// `segmentSize` and `options` parameters are unused in the function body
 /// (verified against `SegmentSeeker.swift:410-496`), and `timings` is
 /// only passed through to `findAlignment` (`:471`), which ignores it —
@@ -1196,14 +1279,12 @@ fn gather_swift_rows(
 /// doc); [`SegmentError::Tokenizer`] if `split_to_word_tokens` or a
 /// partial-special retokenize fails;
 /// [`SegmentError::AlignmentPitchUnavailable`] /
-/// [`SegmentError::AlignmentPitchUnexpectedLayout`] /
-/// [`SegmentError::AlignmentGatherTailNotZero`] under
+/// [`SegmentError::AlignmentPitchUnexpectedLayout`] under
 /// [`AlignmentGather::SwiftParity`] only, if either surface's CoreVideo row
-/// pitch cannot be measured or is not a row-padded row-major layout, or the
-/// destination's untouched tail does not come back zero — parity cannot be
-/// claimed against storage this port cannot see, so it is refused rather
-/// than approximated (see this module's `coreml_f16_row_pitch` and
-/// `coreml_f16_gather_destination_pitch`).
+/// pitch cannot be measured or is not a row-padded row-major layout — parity
+/// cannot be claimed against a layout this port cannot describe, so it is
+/// refused rather than approximated (see this module's
+/// `coreml_f16_row_pitch`). The default gather returns none of the three.
 #[allow(clippy::too_many_arguments)] // Mirrors Swift's addWordTimestamps argument
 // surface (mirroring decode_text's own precedent for this exact lint, per its
 // doc comment); no natural subset of these forms a cohesive struct without
@@ -1215,6 +1296,7 @@ pub fn add_word_timestamps(
   language_code: &str,
   grouping: WordGrouping,
   gather: AlignmentGather,
+  swift_source_rows: usize,
   seek: usize,
   prepended: &str,
   appended: &str,
@@ -1271,48 +1353,34 @@ pub fn add_word_timestamps(
   }
   let mut data = vec![0.0f32; needed * cols];
 
-  // Under `SwiftParity` the gather is REPRODUCED rather than copied: what
-  // `dynamicTimeWarping` reads back out of Swift's destination array is a
-  // function of BOTH surfaces' CoreVideo row pitches, and neither is a
-  // constant -- see [`gather_swift_rows`] for the derivation and
-  // [`coreml_f16_row_pitch`] for why a compiled-in alignment quantum would
-  // make this mode silently non-parity on a host CoreVideo pads differently.
-  // The source shape is the accumulator Swift allocates once
-  // (`TextDecoder.swift:141`), the destination the per-call `[needed, cols]`
-  // one (`SegmentSeeker.swift:450`); measuring only the destination would
-  // assume the pitch does not vary with height, which is exactly the class of
-  // assumption this mode exists to stop making.
+  // Under the opt-in `SwiftParity` the gather is REPRODUCED rather than
+  // copied: what `dynamicTimeWarping` reads back out of Swift's destination
+  // array is a function of BOTH surfaces' CoreVideo row pitches, and neither
+  // is a constant -- see `gather_swift_parity_into` for the two heights and
+  // `coreml_f16_row_pitch` for why a compiled-in alignment quantum would make
+  // this mode silently non-parity on a host CoreVideo pads differently. The
+  // source shape is the accumulator Swift allocates once
+  // (`TextDecoder.swift:141`, `swift_source_rows` rows -- NOT this port's
+  // `alignment.rows()`, which carries one extra commit slot), the destination
+  // the per-call `[needed, cols]` one (`SegmentSeeker.swift:450`).
   //
   // `needed == 0` skips the probes (and the no-op gather): there is nothing to
   // reproduce, and the empty `segments` input it comes from is already
   // `SegmentError::InvalidAlignmentShape`'s -- reported below by
   // `dynamic_time_warping`, as this function's `# Errors` doc promises.
   if gather == AlignmentGather::SwiftParity && needed > 0 {
-    let src_rows = alignment.rows();
-    // A row-less view has no source surface for Swift to have allocated, and
-    // the gather reads nothing from it whatever CoreVideo would have pitched
-    // it at (every offset lands past row `src_rows`), so the reproduction is
-    // all zeros. Skipping the probe keeps a caller-built empty view out of
-    // `AlignmentPitchUnavailable`, which reports an unmeasurable HOST rather
-    // than an empty input. No backend produces one: both build the FIXED
-    // `max_token_context + 1` accumulator.
-    let src_pitch = if src_rows == 0 {
-      cols
-    } else {
-      coreml_f16_row_pitch(src_rows, cols)?
-    };
-    let dst_pitch = coreml_f16_gather_destination_pitch(needed, cols)?;
-    gather_swift_rows(
+    gather_swift_parity_into(
       &mut data,
-      alignment.data(),
-      src_rows,
+      alignment,
       needed,
       cols,
-      src_pitch,
-      dst_pitch,
-    );
+      swift_source_rows,
+      &coreml_f16_row_pitch,
+    )?;
   } else {
-    // `Complete`: the prefix take with no gather artifacts at all.
+    // `Complete`, the DEFAULT: the prefix take with no gather artifacts at
+    // all -- and, just as importantly, no surface allocation, no pitch
+    // measurement and no host-dependent assumption anywhere on this path.
     for (row_index, row) in data
       .chunks_mut(cols)
       .enumerate()

@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use super::*;
 use crate::audio::whisper::{
   backend::AlignmentView,
-  constants::{APPEND_PUNCTUATION, PREPEND_PUNCTUATION},
+  constants::{APPEND_PUNCTUATION, MAX_TOKEN_CONTEXT, PREPEND_PUNCTUATION},
   options::DecodingOptions,
   result::{DecodingResult, WordTiming},
   tokenizer::{SpecialTokens, WhisperTokenizer},
@@ -670,10 +670,14 @@ fn empty_segments_returns_empty_without_consuming_alignment() {
 // re-anchoring.
 //
 // The four tests below predate the #41 gather split and their expectations
-// were written against the un-truncated gather, so they pass
-// `AlignmentGather::Complete` to keep their original intent; the pipeline
-// default (`SwiftParity`) is exercised by
-// `swift_parity_gather_truncates_final_alignment_row` below.
+// were written against the un-truncated gather, which is also the pipeline
+// DEFAULT, so they name `AlignmentGather::Complete` explicitly to say which
+// gather they mean rather than to opt out of one. The opt-in `SwiftParity` is
+// exercised by `swift_parity_gather_truncates_final_alignment_row` below.
+//
+// Every call also passes `MAX_TOKEN_CONTEXT` as Swift's physical source
+// height: inert under `Complete` (which probes nothing), load-bearing under
+// `SwiftParity` (see `gather_swift_parity_into`).
 
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
@@ -720,6 +724,7 @@ fn add_word_timestamps_attaches_merged_monotonic_words() {
     "en",
     WordGrouping::FineGrained,
     AlignmentGather::Complete,
+    MAX_TOKEN_CONTEXT,
     0,
     crate::audio::whisper::constants::PREPEND_PUNCTUATION,
     crate::audio::whisper::constants::APPEND_PUNCTUATION,
@@ -770,6 +775,7 @@ fn add_word_timestamps_zero_pads_missing_rows() {
     "en",
     WordGrouping::FineGrained,
     AlignmentGather::Complete,
+    MAX_TOKEN_CONTEXT,
     0,
     crate::audio::whisper::constants::PREPEND_PUNCTUATION,
     crate::audio::whisper::constants::APPEND_PUNCTUATION,
@@ -802,6 +808,7 @@ fn add_word_timestamps_errors_on_empty_segments() {
     "en",
     WordGrouping::FineGrained,
     AlignmentGather::Complete,
+    MAX_TOKEN_CONTEXT,
     0,
     crate::audio::whisper::constants::PREPEND_PUNCTUATION,
     crate::audio::whisper::constants::APPEND_PUNCTUATION,
@@ -831,6 +838,7 @@ fn add_word_timestamps_errors_on_zero_columns() {
     "en",
     WordGrouping::FineGrained,
     AlignmentGather::Complete,
+    MAX_TOKEN_CONTEXT,
     0,
     "",
     "",
@@ -858,69 +866,84 @@ fn add_word_timestamps_errors_on_zero_columns() {
 const PROBE_WIDTHS: [usize; 13] = [1, 3, 8, 9, 37, 63, 64, 100, 511, 1496, 1500, 1504, 4096];
 
 #[test]
-fn coreml_f16_row_pitch_is_measured_from_a_live_pixel_buffer_allocation() {
-  // THE property the whole Swift-parity gather rests on, and the one #41's
-  // first cut got wrong by promoting one host's 32-element alignment quantum
-  // into a `const fn`: the pitch is whatever THIS host's CoreVideo chose, read
-  // back off the same allocation Swift's gather makes -- never a compiled-in
-  // rule. Apple's QA1829 says the alignment is hardware-dependent and must be
-  // queried; `MultiArray::f16_surface`'s own doc says the same.
+fn coreml_f16_row_pitch_answers_with_a_usable_pitch_or_a_typed_refusal() {
+  // THE portable contract of the probe, and all of it: whatever this host's
+  // CoreVideo does, `coreml_f16_row_pitch` either returns a pitch the gather
+  // can actually reproduce (`>= cols`, matching the surface's own strides) or
+  // it REFUSES with one of the two typed errors. Both outcomes are legitimate
+  // -- a host with an allocation-dependent or otherwise undescribable layout
+  // is a supported host on which `AlignmentGather::SwiftParity` correctly
+  // declines, and `AlignmentGather::Complete` (the default) is unaffected
+  // either way.
   //
-  // Every assertion here compares the helper against a LIVE allocation, so it
-  // holds on any host. It deliberately does NOT assert that the pitch is
-  // independent of the row count: `add_word_timestamps` probes the source and
-  // destination shapes separately and reproduces the unequal case, so
-  // row-count invariance is a fact about this host (see
-  // `reference_host_pitch_table`) rather than something the gather needs.
+  // Round-3 finding #5: the previous version of this test hard-asserted host
+  // allocator behavior -- that two independent allocations of one shape pitch
+  // identically -- which turns a perfectly valid host into a red `cargo test`
+  // while production is behaving exactly as designed. That assertion now lives
+  // in the `#[ignore]`d allocator diagnostic below.
   for cols in PROBE_WIDTHS {
-    for rows in [1usize, 3, 120, 224] {
+    for rows in [1usize, 3, 120, 224, 225] {
+      match coreml_f16_row_pitch(rows, cols) {
+        Ok(pitch) => assert!(
+          pitch >= cols,
+          "rows={rows} cols={cols}: a row pitch below the logical width ({pitch}) would make \
+           the gather reproduction nonsense, and must have been refused instead"
+        ),
+        Err(
+          SegmentError::AlignmentPitchUnavailable {
+            rows: r, cols: c, ..
+          }
+          | SegmentError::AlignmentPitchUnexpectedLayout {
+            rows: r, cols: c, ..
+          },
+        ) => {
+          assert_eq!(
+            (r, c),
+            (rows, cols),
+            "the refusal must name the shape it refused"
+          );
+        }
+        Err(other) => panic!("rows={rows} cols={cols}: unexpected error {other}"),
+      }
+    }
+  }
+}
+
+#[test]
+#[ignore = "host allocator diagnostic: asserts this machine's CoreVideo answers one shape with \
+            one layout, which nothing in production requires (SwiftParity fails closed on a host \
+            that does otherwise, and Complete never asks)"]
+fn coreml_f16_row_pitch_reports_this_hosts_live_allocation_layout() {
+  // The stronger claims, kept as a DIAGNOSTIC rather than a gate (round-3
+  // finding #5). Each is a fact about this machine's allocator:
+  //
+  //   * the helper reports the surface's own strides rather than deriving a
+  //     number -- the property #41's first cut got wrong by promoting one
+  //     host's 32-element quantum into a `const fn`;
+  //   * two independently allocated surfaces of one shape agree, which is
+  //     assumption A1 of `AlignmentGather::SwiftParity` holding here.
+  //
+  // Neither is a CoreVideo guarantee (QA1829 requires the alignment to be
+  // queried per buffer), so neither belongs in a portable test. It deliberately
+  // does NOT assert that the pitch is independent of the ROW COUNT:
+  // `gather_swift_parity_into` probes the source and destination heights
+  // separately and reproduces the unequal case, so row-count invariance is a
+  // fact about this host (see `reference_host_pitch_table`) rather than
+  // something the gather needs.
+  for cols in PROBE_WIDTHS {
+    for rows in [1usize, 3, 120, 224, 225] {
       let pitch = coreml_f16_row_pitch(rows, cols).unwrap();
-      // Same shape, allocated independently of the production helper: the
-      // helper must be reporting CoreVideo's answer, not deriving one.
       let independent = MultiArray::f16_surface(&[rows, cols]).unwrap();
       assert_eq!(
         independent.strides(),
         [pitch, 1],
         "rows={rows} cols={cols}: the helper must return the surface's own strides"
       );
-      assert!(
-        pitch >= cols,
-        "rows={rows} cols={cols}: a row pitch below the logical width ({pitch}) would make \
-         the gather reproduction nonsense"
-      );
-      // Repeat allocations of one shape must agree, or no single measurement
-      // could describe the surface Swift's gather allocates.
       assert_eq!(
         pitch,
         coreml_f16_row_pitch(rows, cols).unwrap(),
-        "rows={rows} cols={cols}: the pitch moved between two allocations of the same shape"
-      );
-    }
-  }
-}
-
-#[test]
-fn coreml_f16_gather_destination_probe_reports_a_clean_tail_on_this_host() {
-  // Finding #2 of the round-2 review: `SwiftParity` feeds DTW zeros for the
-  // storage past the gather's copied prefix, which Swift reads and nobody
-  // writes. That is now VERIFIED per call rather than assumed --
-  // `MultiArray::f16_surface_probing_fresh_tail` looks at a real allocation
-  // before anything touches it -- and this pins that the verification passes
-  // here, i.e. that `AlignmentGather::SwiftParity` is actually usable on this
-  // host.
-  //
-  // Unlike the recorded pitch table, a failure here is NOT cosmetic: the
-  // shipping gather takes the identical probe and returns
-  // `AlignmentGatherTailNotZero`, so a host that fails this test is a host
-  // where the default gather refuses to run. That is exactly what the test
-  // should report.
-  for cols in PROBE_WIDTHS {
-    for rows in [1usize, 3, 120, 224] {
-      assert_eq!(
-        coreml_f16_gather_destination_pitch(rows, cols).unwrap(),
-        coreml_f16_row_pitch(rows, cols).unwrap(),
-        "rows={rows} cols={cols}: the destination probe must report the same pitch as the plain \
-         one, and must not have found a dirty tail"
+        "rows={rows} cols={cols}: the pitch moved between two allocations of the same shape, so \
+         assumption A1 of `AlignmentGather::SwiftParity` does not hold here"
       );
     }
   }
@@ -1166,6 +1189,72 @@ fn swift_gather_reads_the_sources_padding_as_zero() {
   );
 }
 
+#[test]
+fn swift_parity_probes_swifts_source_height_not_this_ports_commit_headroom() {
+  // Round-3 finding #2. `alignment.rows()` is `max_token_context + 1` = 225:
+  // this port commits step `position`'s row at `position + 1`, so it carries
+  // one slot of headroom Swift does not. Swift allocates `alignmentWeights` at
+  // the KV dimension ITSELF (`TextDecoder.swift:141`) -- 224 rows. The pitch is
+  // a function of the shape CoreVideo is handed, and this whole branch exists
+  // because it may vary with height, so probing `[225, cols]` would decode
+  // Swift's storage offsets with a pitch Swift's array never had and splice the
+  // wrong cells into DTW while still reporting parity.
+  //
+  // No host this port has measured pitches the two heights differently, so the
+  // layout is INJECTED -- which is exactly why `gather_swift_parity_into` takes
+  // its probe as a parameter. The point is not the numbers; it is WHICH HEIGHT
+  // the code asks CoreVideo about.
+  const COLS: usize = 8;
+  const SWIFT_ROWS: usize = MAX_TOKEN_CONTEXT; // 224 -- Swift's physical array
+  const VIEW_ROWS: usize = SWIFT_ROWS + 1; // 225 -- this port's accumulator
+  const NEEDED: usize = 5;
+
+  // A host that pads the 225-row surface and leaves every other height
+  // unpadded, so the two heights cannot produce the same gather.
+  let asked = std::cell::RefCell::new(Vec::new());
+  let injected = |rows: usize, cols: usize| -> Result<usize, SegmentError> {
+    asked.borrow_mut().push((rows, cols));
+    Ok(if rows == VIEW_ROWS { cols * 2 } else { cols })
+  };
+
+  let source: Vec<f32> = (0..VIEW_ROWS * COLS).map(|i| i as f32 + 1.0).collect();
+  let view = AlignmentView::new(&source, VIEW_ROWS, COLS);
+  let mut data = vec![0.0f32; NEEDED * COLS];
+  gather_swift_parity_into(&mut data, &view, NEEDED, COLS, SWIFT_ROWS, &injected).unwrap();
+
+  // (1) THE assertion: the source probe named Swift's height, never the port's.
+  let asked_shapes: Vec<(usize, usize)> = asked.borrow().clone();
+  assert!(
+    asked_shapes.contains(&(SWIFT_ROWS, COLS)),
+    "the source probe must ask CoreVideo about Swift's own {SWIFT_ROWS}-row array; asked \
+     {asked_shapes:?}"
+  );
+  assert!(
+    !asked_shapes.contains(&(VIEW_ROWS, COLS)),
+    "the source probe must NOT ask about this port's {VIEW_ROWS}-row commit accumulator; asked \
+     {asked_shapes:?}"
+  );
+  assert!(
+    asked_shapes.contains(&(NEEDED, COLS)),
+    "and the destination probe must ask about the per-call `[needed, cols]` surface; asked \
+     {asked_shapes:?}"
+  );
+
+  // (2) the gathered matrix is the one Swift's 224-row layout produces ...
+  let at_swift_height = replay_swift_gather(&source, SWIFT_ROWS, NEEDED, COLS, COLS, COLS);
+  assert_eq!(
+    data, at_swift_height,
+    "the reproduction must decode Swift's storage at Swift's own source pitch"
+  );
+  // (3) ... and the injected layout genuinely discriminates, so (2) is not
+  // passing vacuously: at the port's height the same gather is another matrix.
+  let at_port_height = replay_swift_gather(&source, SWIFT_ROWS, NEEDED, COLS, COLS * 2, COLS);
+  assert_ne!(
+    at_swift_height, at_port_height,
+    "the fixture proves nothing unless the two heights disagree"
+  );
+}
+
 /// The layout `crates/coremlit/tests/whisper_swift_probes/probe_alignment_stride.out`
 /// captured from Swift on the whisper #41 reference host (M1 Max / macOS
 /// 26.5): `MLMultiArray.strides[0]` for pixel-buffer-backed Float16 arrays,
@@ -1191,12 +1280,14 @@ const RECORDED_REFERENCE_HOST_PITCH: [(usize, usize); 6] = [
 fn reference_host_pitch_table() {
   // Deliberately NOT an ordinary test. It compares this machine against ONE
   // recorded machine, so a different-but-perfectly-supported host fails it
-  // while the shipping gather -- which measures rather than assumes, and now
-  // reproduces unequal source/destination pitches too -- keeps working. An
+  // while the OPT-IN gather -- which measures rather than assumes, and
+  // reproduces unequal source/destination pitches too -- keeps working, and
+  // the DEFAULT gather never consults any of it. An
   // unignored version of this was a red CI on valid hardware whose own
   // diagnostic said the gather was unaffected; the portable replacements are
-  // `coreml_f16_row_pitch_is_measured_from_a_live_pixel_buffer_allocation`
-  // (live allocations only) and the injected-pitch reproduction tests.
+  // `coreml_f16_row_pitch_answers_with_a_usable_pitch_or_a_typed_refusal`
+  // (which accepts the typed refusals as legitimate host outcomes) and the
+  // injected-layout reproduction tests.
   //
   // Run it when re-capturing `probe_alignment_stride.out`, or to explain why
   // a model-gated gather fixture's hand-computed columns no longer line up.
@@ -1299,6 +1390,7 @@ fn swift_parity_gather_truncates_final_alignment_row() {
       "en",
       WordGrouping::FineGrained,
       gather,
+      MAX_TOKEN_CONTEXT,
       0,
       PREPEND_PUNCTUATION,
       APPEND_PUNCTUATION,

@@ -64,15 +64,13 @@ fn segment_error_composes_tokenizer_arm() {
 
 #[test]
 fn alignment_pitch_errors_name_the_shape_and_the_explicit_way_out() {
-  // All three arms are FAIL-CLOSED refusals of
+  // Both arms are FAIL-CLOSED refusals of the OPT-IN
   // `AlignmentGather::SwiftParity`, so their whole job is telling a caller
-  // what could not be measured or reproduced and which option gathers every
-  // row instead. None is reachable on a supported host (the probe allocation
-  // is the same one the decoder's f16 tensors use, and its untouched tail
-  // comes back zero — see
-  // `segment::tests::coreml_f16_gather_destination_probe_reports_a_clean_tail_on_this_host`),
-  // which is exactly why the messages are pinned here rather than by a path
-  // that can produce them.
+  // what could not be measured and which option gathers every row instead.
+  // Neither is reachable on a supported host (the probe allocation is the same
+  // one the decoder's f16 tensors use), which is exactly why the messages are
+  // pinned here rather than by a path that can produce them. The default
+  // gather returns neither: it allocates no surface and measures nothing.
   let unavailable = SegmentError::AlignmentPitchUnavailable {
     rows: 30,
     cols: 1500,
@@ -95,19 +93,9 @@ fn alignment_pitch_errors_name_the_shape_and_the_explicit_way_out() {
   assert!(text.contains("[1504, 2]"), "{text}");
   assert!(text.contains("AlignmentGather::Complete"), "{text}");
 
-  let dirty_tail = SegmentError::AlignmentGatherTailNotZero {
-    rows: 30,
-    cols: 1500,
-    nonzero_bytes: 7,
-  };
-  let text = dirty_tail.to_string();
-  assert!(text.contains("7 nonzero byte(s)"), "{text}");
-  assert!(text.contains("30 x 1500"), "{text}");
-  assert!(text.contains("AlignmentGather::Complete"), "{text}");
-
   let composed: TranscribeError = unexpected.into();
   assert!(matches!(composed, TranscribeError::Segment(_)));
-  let composed: TranscribeError = dirty_tail.into();
+  let composed: TranscribeError = unavailable.into();
   assert!(matches!(composed, TranscribeError::Segment(_)));
 }
 

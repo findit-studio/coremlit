@@ -8,8 +8,8 @@ coremlit issue #41 parity fixes:
 - `crates/coremlit/src/audio/whisper/decode/sampler/mod.rs` — `argmax`
   (H2: first-index, NaN-skipping tie-break)
 - `crates/coremlit/src/audio/whisper/segment/mod.rs` — `coreml_f16_row_pitch` /
-  `coreml_f16_gather_destination_pitch` / `gather_swift_rows` /
-  `add_word_timestamps`, and `options/mod.rs` — `AlignmentGather`
+  `gather_swift_parity_into` / `gather_swift_rows` / `add_word_timestamps`, and
+  `options/mod.rs` — `AlignmentGather`
   (H6: the CoreVideo row pitch Swift's alignment gather ignores)
 
 These files are **captured verbatim** from a one-off probe run and are **not
@@ -111,7 +111,7 @@ identical in both.
   `initialValue:` fill ever wrote. That row is the whole of the
   long-form divergence: it moves the last word's end, hence the segment's end,
   hence the next window's seek. Pinned in `segment/tests.rs` by
-  `coreml_f16_row_pitch_is_measured_from_a_live_pixel_buffer_allocation`,
+  `coreml_f16_row_pitch_answers_with_a_usable_pitch_or_a_typed_refusal`,
   `swift_gather_keeps_only_the_final_rows_prefix` and
   `swift_parity_gather_truncates_final_alignment_row`.
 
@@ -119,18 +119,34 @@ identical in both.
   reads a shifted window that splices one logical source row's tail onto the
   next one's head across the source's own padding. Row-count invariance is
   something this host was measured to have, not something CoreVideo promises,
-  so the port probes BOTH shapes — the once-allocated `[max_token_context + 1,
-  cols]` source (`TextDecoder.swift:141`) and the per-call `[N, cols]`
-  destination (`:450`) — and `segment::gather_swift_rows` reproduces the
-  general mapping. `swift_gather_reproduces_the_copy_when_the_two_surfaces_
-  pitch_differently` drives it against a storage-level replay at pitches this
-  host will never choose. The source's padding needs no probe: the same
-  `initialValue: FloatType(0)` initializer zeroes the LOGICAL element count
-  flat over a pitched buffer, so storage `[0, src_rows * cols)` — padding
-  included — starts at zero, and `TextDecoder.updateAlignmentWeights`
-  (`:272-295`), the array's only writer, is stride-aware. The gather never
-  reads past `N * cols <= src_rows * cols`, so every source padding cell it
-  can reach is zero on any host.
+  so the port probes BOTH shapes — the once-allocated **`[kvCacheMaxSequence
+  Length, cols]` = `[224, cols]`** source (`TextDecoder.swift:141`) and the
+  per-call `[N, cols]` destination (`:450`) — and
+  `segment::gather_swift_parity_into`/`gather_swift_rows` reproduce the general
+  mapping. `swift_gather_reproduces_the_copy_when_the_two_surfaces_pitch_
+  differently` drives it against a storage-level replay at pitches this host
+  will never choose.
+
+  **The source height is Swift's 224, not the port's 225.** This port's
+  accumulator is `max_token_context + 1` rows because it commits step
+  `position`'s row at `position + 1`; Swift has no such headroom. Probing the
+  port's height would decode Swift's storage offsets with a pitch Swift's
+  array never had wherever `pitch(224, cols) != pitch(225, cols)`, which the
+  branch explicitly allows. `swift_parity_probes_swifts_source_height_not_
+  this_ports_commit_headroom` injects exactly such a host and asserts which
+  height the probe names (round-3 finding #2).
+
+  **`AlignmentGather::Complete` is the DEFAULT; `SwiftParity` is an opt-in
+  that fails closed** (owner decision, round 3 of the #41 review). `Complete`
+  is the numerically correct gather and has no platform dependency at all — no
+  IOSurface allocation, no pitch measurement, no inspection of storage it did
+  not write, no `unsafe`. `SwiftParity` reproduces a Swift defect whose
+  behavior rests on unspecified CoreVideo layout, and three review rounds each
+  uncovered a further unspecified layer beneath the previous one, so it is
+  what a caller explicitly asks for having accepted three stated assumptions
+  (A1 layout determinism, A2 fresh-allocation zero fill, A3 layout stability
+  across `withUnsafeMutableBytes`) enumerated on the variant itself. Nothing
+  below claims those assumptions are established.
 
   **The pitch table above is evidence about this host, not a compiled-in
   rule.** `coreml_f16_row_pitch` MEASURES the running host — it allocates the
@@ -144,22 +160,51 @@ identical in both.
   **`#[ignore]`d** `reference_host_pitch_table` as provenance for the
   hand-computed columns in the model-gated gather fixtures — ignored because
   it compares this machine against one recorded machine, which no production
-  path depends on. If a measurement cannot be made at all,
+  path depends on. The live-allocation diagnostics
+  (`coreml_f16_row_pitch_reports_this_hosts_live_allocation_layout`) are
+  `#[ignore]`d for the same reason: they assert that two independent
+  allocations of one shape pitch identically, which is assumption A1 holding
+  here rather than anything CoreVideo owes. The portable gate,
+  `coreml_f16_row_pitch_answers_with_a_usable_pitch_or_a_typed_refusal`,
+  accepts the typed refusals as legitimate outcomes on a valid host (round-3
+  finding #5). If a measurement cannot be made at all,
   `AlignmentGather::SwiftParity` fails closed
   (`SegmentError::AlignmentPitchUnavailable`) rather than quietly degrading to
   `AlignmentGather::Complete`.
 
-  **The destination's untouched tail is verified, not assumed.** The storage
-  past `N * cols` is read by `dynamicTimeWarping` and written by nobody — the
-  `initialValue:` fill covers only the logical `count`, and the `memcpy`
-  covers the same prefix — so it is whatever `CVPixelBufferCreate` returned,
-  and no part of CoreVideo promises that is zero.
-  `MultiArray::f16_surface_probing_fresh_tail` reports what a real allocation
-  of the same shape held there before anything touched it; a dirty tail fails
-  the gather closed (`SegmentError::AlignmentGatherTailNotZero`) instead of
-  substituting zeros for values this port cannot reproduce.
-  `coreml_f16_gather_destination_probe_reports_a_clean_tail_on_this_host`
-  pins that the verification passes here.
+  **The destination's untouched tail is ASSUMED zero, and that assumption is
+  stated rather than disguised (A2).** The storage past `N * cols` is read by
+  `dynamicTimeWarping` and written by nobody — the `initialValue:` fill covers
+  only the logical `count`, and the `memcpy` covers the same prefix — so it is
+  whatever `CVPixelBufferCreate` returned, and no part of CoreVideo promises
+  that is zero. An earlier revision claimed to VERIFY it by sampling a freshly
+  allocated surface's tail before zeroing it. That was wrong twice over, and
+  both errors are now removed:
+
+  - reading those bytes was **undefined behavior** — `read_volatile` prevents
+    elision and reordering, not undefinedness, and the safe `f16_surface`
+    constructor could execute it under exactly the dirty-tail condition the
+    scan existed to detect (round-3 finding #1). `f16_surface` is now
+    write-only: it zeroes `CVPixelBufferGetDataSize` bytes and never observes
+    the prior contents.
+  - one clean allocation proves nothing about a **different** allocation. The
+    probe sampled a disposable surface, dropped it, and then synthesized zeros
+    for the surface the gather actually described; reuse or a concurrent
+    allocation yields a clean probe and a dirty real tail (round-3
+    finding #3). No probe replaces it, because none can: the allocation Swift
+    gathered into lives in another process.
+
+  **The source padding's zero is likewise an assumption past construction
+  (A3).** The `initialValue: FloatType(0)` initializer zeroes the LOGICAL
+  element count flat over a pitched buffer, so storage `[0, src_rows * cols)`
+  — padding included — *starts* at zero, and `TextDecoder.updateAlignment
+  Weights` (`:272-295`), the array's only writer, is stride-aware. That the
+  zero SURVIVES is unverified: writer and gather both reach the array through
+  `withUnsafeMutableBytes`, whose contract states the closure-provided strides
+  may differ from the value before invocation, so no cited contract rules out
+  a relayout introducing padding construction never zeroed (round-3
+  finding #4). A lifecycle-equivalent native probe at the 224-row height would
+  upgrade this to a one-host observation; it would still not be a contract.
 
 ## The Swift short-form word-timestamp golden
 
@@ -186,13 +231,16 @@ long-form evidence used, so short-form and long-form are one option set.
 `whisper_parity_jfk`'s
 `jfk_tiny_word_timestamps_match_swift_and_do_not_move_with_the_gather` mirrors
 those options exactly and asserts every word (text, start, end, probability,
-token ids) with no epsilon, plus that `AlignmentGather::Complete` yields the
-identical list. That second half is what makes "the #41 gather does not change
-short-form output" a checked claim rather than a comment: the gather runs on
-every word-timestamp window, long-form or not, and at 30 gathered rows over
-1500 columns the measured pitch of 1504 does truncate the final row here (it
-keeps 1384 of 1500 columns) — the truncation simply does not move this clip's
-DTW path.
+token ids) with no epsilon **under the shipping default,
+`AlignmentGather::Complete`**, plus that the opt-in `AlignmentGather::
+SwiftParity` yields the identical list. The first half is what the round-3
+default flip had to re-establish — the correct-everywhere gather still
+reproduces official Swift on this clip. The second is what makes "the #41
+gather does not change short-form output" a checked claim rather than a
+comment: the gather runs on every word-timestamp window, long-form or not, and
+at 30 gathered rows over 1500 columns the measured pitch of 1504 does truncate
+the final row under `SwiftParity` (it keeps 1384 of 1500 columns) — the
+truncation simply does not move this clip's DTW path.
 
 ## Rust transfer check (superseded by hermetic tests)
 

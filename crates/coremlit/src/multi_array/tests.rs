@@ -320,15 +320,18 @@ fn f16_surface_contiguous_is_zero_before_any_write() {
 }
 
 #[test]
-fn f16_surface_probing_fresh_tail_still_zero_fills_everything() {
-  // The probe variant exists to report what CoreVideo left past the logical
-  // element count BEFORE the zero fill; the array it hands back must still
-  // honor `f16_surface`'s contract that every logical element (and every
-  // padding byte) reads zero. Both must hold at once, or a caller reading a
-  // padded row would see whatever the tail report was describing.
-  for shape in [[1usize, 4], [3, 9], [225, 100]] {
-    let (arr, nonzero) = MultiArray::f16_surface_probing_fresh_tail(&shape).unwrap();
-    assert_eq!(arr.shape(), shape, "shape must survive the probe");
+fn f16_surface_zero_fills_every_logical_element_at_every_shape() {
+  // `f16_surface`'s contract at the shapes the whisper alignment gather uses,
+  // including the tall 225-row accumulator: every logical element reads zero
+  // immediately after construction, whether or not CoreVideo padded the rows.
+  //
+  // This asserts what THIS crate wrote, and nothing about what CoreVideo left
+  // behind first — the constructor is write-only by design (reading a fresh
+  // pixel buffer's bytes is UB, whatever the read is spelled as), so there is
+  // no prior content any test could legitimately observe.
+  for shape in [[1usize, 4], [3, 9], [225, 100], [224, 100]] {
+    let arr = MultiArray::f16_surface(&shape).unwrap();
+    assert_eq!(arr.shape(), shape);
     for i0 in 0..shape[0] {
       for i1 in 0..shape[1] {
         assert_eq!(
@@ -338,15 +341,6 @@ fn f16_surface_probing_fresh_tail_still_zero_fills_everything() {
         );
       }
     }
-    // Not an assertion about CoreVideo — a report about it. The whisper
-    // gather is the caller that cares, and it fails closed on nonzero rather
-    // than pretending; recorded here so a host where this stops being 0 is
-    // diagnosable at the tensor layer too.
-    assert_eq!(
-      nonzero, 0,
-      "shape {shape:?}: CoreVideo left {nonzero} nonzero byte(s) past the logical element count \
-       on this host, so `AlignmentGather::SwiftParity` will refuse to run here"
-    );
   }
 }
 

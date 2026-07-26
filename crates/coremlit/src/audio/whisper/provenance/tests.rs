@@ -102,9 +102,9 @@ fn mutations() -> Vec<OptionMutation> {
       o.with_word_grouping(WordGrouping::FineGrained)
     }),
     ("alignment_gather", |o| {
-      // Same story as `word_grouping`: SwiftParity is the #41 default, so the
-      // value change has to be the un-truncated `Complete`.
-      o.with_alignment_gather(AlignmentGather::Complete)
+      // `Complete` is the default after the round-3 owner decision, so the
+      // value change has to be the opt-in `SwiftParity`.
+      o.with_alignment_gather(AlignmentGather::SwiftParity)
     }),
   ]
 }

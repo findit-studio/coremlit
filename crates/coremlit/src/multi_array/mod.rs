@@ -677,6 +677,20 @@ impl MultiArray {
   /// inter-row padding — before returning, so every logical element is safe
   /// to read immediately, whether or not the layout turned out padded.
   ///
+  /// # Initialization is write-only, deliberately
+  ///
+  /// Nothing here READS the freshly created buffer. CoreVideo does not
+  /// promise a new `CVPixelBuffer`'s bytes are initialized, and reading an
+  /// uninitialized byte is undefined behavior in Rust whatever the read is
+  /// spelled as — `read_volatile` suppresses elision and reordering, not
+  /// undefinedness, and `MaybeUninit` only moves the obligation to whatever
+  /// would inspect the value. An earlier revision of this constructor scanned
+  /// the allocation's tail before zeroing it in order to report what CoreVideo
+  /// had left there; that scan was UB on exactly the hosts it existed to
+  /// detect, so this safe constructor now performs a single `write_bytes`
+  /// over `CVPixelBufferGetDataSize` bytes and never observes the prior
+  /// contents (whisper #41, codex round 3, F1).
+  ///
   /// # Errors
   /// [`TensorError::UnsupportedShape`] (reason
   /// [`ShapeRequirement::NonEmpty`]) if `shape` is empty — a rank-0 shape
@@ -697,35 +711,6 @@ impl MultiArray {
   /// the unrecognized selector surfaces as an error, never an Objective-C
   /// exception.
   pub fn f16_surface(shape: &[usize]) -> Result<Self, TensorError> {
-    Self::f16_surface_probing_fresh_tail(shape).map(|(array, _)| array)
-  }
-
-  /// [`Self::f16_surface`], plus the one thing that constructor's own zero
-  /// fill destroys: how many bytes CoreVideo left **nonzero** in the storage
-  /// PAST the array's logical `count()` elements, sampled between the
-  /// allocation and the fill.
-  ///
-  /// That region is exactly the storage a caller replicating Swift's
-  /// `MLMultiArray(shape:dataType:initialValue:)`
-  /// (`ArgmaxCore/MLMultiArrayExtensions.swift:11-53`) would inherit
-  /// untouched: for `.float16` that initializer allocates this same
-  /// `CVPixelBuffer` and then fills `dataPointer` with `initialize(repeating:
-  /// count: count)` — `count` being the array's LOGICAL element count, so
-  /// everything the row pitch adds on top of it keeps whatever CoreVideo
-  /// returned. Nothing in CoreVideo promises that is zero (see the zero-fill
-  /// rationale in [`Self::f16_surface`]), so a caller that needs to know
-  /// rather than hope has to look before the fill — which is the only reason
-  /// this variant exists.
-  ///
-  /// A `0` result means CoreVideo's fresh allocation was already all-zero
-  /// there. The returned array is fully zero-filled either way, exactly as
-  /// [`Self::f16_surface`] promises.
-  ///
-  /// # Errors
-  /// Identical to [`Self::f16_surface`].
-  pub(crate) fn f16_surface_probing_fresh_tail(
-    shape: &[usize],
-  ) -> Result<(Self, usize), TensorError> {
     use objc2_core_foundation::{CFDictionary, CFRetained, CFType};
     use objc2_core_video::{
       CVPixelBuffer, CVPixelBufferCreate, kCVPixelBufferIOSurfacePropertiesKey,
@@ -762,15 +747,19 @@ impl MultiArray {
     // is the exact final dimension with no clamping.
     let width = *shape.last().expect("shape checked non-empty above");
     let height = checked_element_count(&shape[..shape.len() - 1])?;
-    // The array's logical element count, in bytes: where a replication of
-    // Swift's `initialValue:` fill stops and the untouched tail this
-    // constructor reports on begins.
-    let logical_bytes = height
+    // Overflow guard, not a size the fill below uses: the byte count actually
+    // zeroed is CoreVideo's own `CVPixelBufferGetDataSize`. A shape whose
+    // element count (or that count's byte size) is unrepresentable is refused
+    // here, before any native allocation is attempted.
+    if height
       .checked_mul(width)
       .and_then(|count| count.checked_mul(size_of::<f16>()))
-      .ok_or_else(|| TensorError::ShapeOverflow {
+      .is_none()
+    {
+      return Err(TensorError::ShapeOverflow {
         shape: shape.to_vec(),
-      })?;
+      });
+    }
 
     // An empty IOSurface-properties dictionary as the value of
     // `kCVPixelBufferIOSurfacePropertiesKey` opts the buffer into IOSurface
@@ -830,15 +819,13 @@ impl MultiArray {
     // uninitialized bytes.
     // SAFETY: `buffer` is the live pixel buffer created above; lock/base/
     // size/unlock is the documented CPU-access protocol, base is non-null
-    // after a successful lock of a successfully created buffer, and both the
-    // tail scan and `write_bytes` stay within `CVPixelBufferGetDataSize`
-    // bytes of the locked base. The scan reads bytes CoreVideo allocated but
-    // may not have written, so it goes through `read_volatile`: every bit
-    // pattern is a valid `u8`, and the volatile read keeps the compiler from
-    // folding the comparison away on the grounds that the content is
-    // unspecified — the whole point of the scan is to report what is there.
-    // All-zero bits are valid `f16` (0.0).
-    let fresh_tail_nonzero_bytes = unsafe {
+    // after a successful lock of a successfully created buffer, and the
+    // `write_bytes` stays within `CVPixelBufferGetDataSize` bytes of the
+    // locked base. The buffer's prior contents are never read — the only
+    // access is this write, so no uninitialized byte is ever observed (see
+    // the constructor doc's write-only section). All-zero bits are valid
+    // `f16` (0.0).
+    unsafe {
       use objc2_core_video::{
         CVPixelBufferGetBaseAddress, CVPixelBufferGetDataSize, CVPixelBufferLockBaseAddress,
         CVPixelBufferLockFlags, CVPixelBufferUnlockBaseAddress,
@@ -853,14 +840,9 @@ impl MultiArray {
         return Err(TensorError::PixelBuffer { code: lock });
       }
       let data_size = CVPixelBufferGetDataSize(&buffer);
-      let bytes = base.cast::<u8>();
-      let nonzero = (logical_bytes..data_size)
-        .filter(|&offset| bytes.add(offset).read_volatile() != 0)
-        .count();
-      core::ptr::write_bytes(bytes, 0, data_size);
+      core::ptr::write_bytes(base.cast::<u8>(), 0, data_size);
       CVPixelBufferUnlockBaseAddress(&buffer, CVPixelBufferLockFlags::empty());
-      nonzero
-    };
+    }
 
     // SAFETY: `buffer`'s pixel format matches Float16, `shape`'s last
     // dimension equals `width` exactly (zero dims were rejected above, so
@@ -871,7 +853,7 @@ impl MultiArray {
     let inner = unsafe {
       MLMultiArray::initWithPixelBuffer_shape(MLMultiArray::alloc(), &buffer, &ns_shape(shape))
     };
-    Ok((Self::from_raw(inner), fresh_tail_nonzero_bytes))
+    Ok(Self::from_raw(inner))
   }
 }
 

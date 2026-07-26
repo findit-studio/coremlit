@@ -3026,14 +3026,16 @@ fn four_window_shapes_read_stale_and_dropped_alignment_rows() {
   //      (W1's row 10 was already zero; W2 loses its stale row 7).
   //   D. move the loop's commit above the completion break: same as A.
   //
-  // `AlignmentGather::Complete` is REQUIRED here, not incidental: this pins
-  // which alignment ROWS the accumulator hands over, and the #41 gather
-  // (`SwiftParity`, the pipeline default) zeroes the tail of the last gathered
-  // row before DTW ever sees it. At any measured pitch above the column count
-  // (128 for 100 columns on the reference host) that erasure lands, so the
-  // discriminating column of the last row — the whole signal above — is
-  // erased and every mutation in the matrix reads the same. The gather is
-  // pinned separately by `swift_parity_gather_moves_the_next_window_seek`.
+  // `AlignmentGather::Complete` is named explicitly, not incidentally: it is
+  // the pipeline DEFAULT (round-3 owner decision) but this pin depends on it
+  // rather than merely inheriting it. This test pins which alignment ROWS the
+  // accumulator hands over, and the opt-in #41 gather (`SwiftParity`) zeroes
+  // the tail of the last gathered row before DTW ever sees it. At any measured
+  // pitch above the column count (128 for 100 columns on the reference host)
+  // that erasure lands, so the discriminating column of the last row — the
+  // whole signal above — would be erased and every mutation in the matrix
+  // would read the same. The opt-in gather is pinned separately by
+  // `swift_parity_gather_moves_the_next_window_seek`.
   let t = tiny_tokenizer();
   let options = DecodingOptions::new()
     .with_word_timestamps()
@@ -3122,13 +3124,14 @@ fn cap_hit_window_drops_the_completing_row() {
   // the window; disable those thresholds so the run is a single 223-step
   // attempt and `decode_steps` reads the cap directly.
   //
-  // `AlignmentGather::Complete` is REQUIRED for this pin to discriminate. At
-  // N = 224 gathered rows over 100 columns (measured pitch 128 on the
-  // reference host) the #41 gather's copied
-  // prefix runs dry at row 175, so under the pipeline default rows 175..=223 —
-  // including the predecessor/last-word/dropped triple this test is built on —
-  // arrive entirely zeroed and Mutation A becomes invisible. The gather itself
-  // is pinned by `swift_parity_gather_moves_the_next_window_seek`.
+  // `AlignmentGather::Complete` — the pipeline default — is REQUIRED for this
+  // pin to discriminate, and is named rather than inherited so the dependency
+  // is legible. At N = 224 gathered rows over 100 columns (measured pitch 128
+  // on the reference host) the opt-in #41 gather's copied prefix runs dry at
+  // row 175, so under `SwiftParity` rows 175..=223 — including the
+  // predecessor/last-word/dropped triple this test is built on — would arrive
+  // entirely zeroed and Mutation A would become invisible. That gather is
+  // pinned by `swift_parity_gather_moves_the_next_window_seek`.
   let options = DecodingOptions::new()
     .with_word_timestamps()
     .with_without_timestamps()
@@ -3347,8 +3350,8 @@ fn skip_special_tokens_governs_segment_text_on_both_writer_branches() {
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn swift_parity_gather_moves_the_next_window_seek() {
-  // whisper #41 in miniature, on the mock backend: the alignment gather is
-  // not confined to one window's word list. The final gathered row's tail
+  // whisper #41 in miniature, on the mock backend: the OPT-IN alignment gather
+  // is not confined to one window's word list. The final gathered row's tail
   // moves the last word's end (`SegmentSeeker.swift:642-649` hands it to the
   // segment), the segment's end moves `seek` (`:221-223`'s
   // `seek = max(seek, Int(lastSpeechTimestamp * sampleRate))`), and the next
@@ -3366,7 +3369,7 @@ fn swift_parity_gather_moves_the_next_window_seek() {
   // for every column past 59; row 5 has a +1.0 plateau from column 44 that
   // only the un-truncated gather can see.
   //
-  // Those columns straddle a cut the SHIPPING gather measures on the running
+  // Those columns straddle a cut the opt-in gather measures on the running
   // host rather than assumes, so the fixture states the layout it was built
   // for and fails here first if this host pads differently — see
   // `segment::tests::reference_host_pitch_table`, the (ignored) probe that
