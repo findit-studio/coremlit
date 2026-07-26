@@ -1,8 +1,7 @@
 //! Ground-truth introspection of every candidate segmentation and embedding
 //! artifact named in the design spec
 //! (`docs/superpowers/specs/2026-07-11-dia-coreml-backends-design.md` §4, §9
-//! open item) plus the out-of-scope PLDA artifact the plan brief also names.
-//! Every value below comes from loading the real `.mlmodelc` via
+//! open item). Every value below comes from loading the real `.mlmodelc` via
 //! `coremlit::Model::load` + `.description()` — the spec's table is a
 //! HYPOTHESIS; reality wins, and every place it differs is marked `SPEC
 //! DELTA`. Feeds Task 2 (`SegmentModel`) and later tasks (`EmbedModel`,
@@ -19,7 +18,46 @@
 //! | `wespeaker.mlmodelc` | embedding, fp32, contract-equal | no |
 //! | `FBank.mlmodelc` | embedding frontend, split-pipeline alt | no |
 //! | `Embedding.mlmodelc` | embedding backend, split-pipeline alt | no |
-//! | `PLDA.mlmodelc` | clustering input transform | out of scope (spec §3 non-goal) |
+//!
+//! The repo also ships `PLDA.mlmodelc` / `PldaRho.mlmodelc`. Neither is a
+//! candidate and neither is introspected here: clustering — and with it the
+//! PLDA projection — stays in `diaric` (spec §3 non-goal), which projects in
+//! f64 on the host. `coremlit::audio::speaker::extract`'s `into_offline_input`
+//! records why the CoreML graphs are unusable even if that ever changed.
+//!
+//! ## Retired coverage: `plda_io_recorded_out_of_scope` (a deliberate loss)
+//!
+//! `PLDA.mlmodelc` once had a row in the table above and an `#[ignore]`d
+//! introspection test, `plda_io_recorded_out_of_scope`. Both were DELETED, not
+//! relocated, and deleting the test did cost coverage that nothing else
+//! provides. "No coverage was lost" would be false, so here is the ledger:
+//!
+//! - **What it uniquely asserted:** that `PLDA.mlmodelc` loads at all
+//!   (`Model::load`, `CpuOnly`), and that its description carries the input
+//!   `embeddings [1, 256]` F32 and the output `plda_features [1, 128]` F32.
+//! - **What still touches the artifact, and how far that reaches:** only
+//!   `tests/fp16_guards.rs`. Its sweep requires the bundle to be present with a
+//!   parseable `model.mil` and hard-fails if the pinned guard sites change or
+//!   vanish — so deletion of the artifact and drift in its numerical guards are
+//!   still caught. But it reads the MIL as TEXT: it never calls `Model::load`,
+//!   so it says nothing about CoreML loadability, and it never reads the model
+//!   description, so it says nothing about feature names, shapes or dtypes.
+//! - **So the loadability and schema assertions are simply gone**, and nothing
+//!   replaces them. A re-conversion that reshaped the I/O while leaving the
+//!   guard sites alone would now pass unnoticed.
+//! - **Why that is the intended trade rather than an oversight:** the artifact
+//!   is on no runtime path — nothing in this crate calls `Model::load` on it,
+//!   and nothing is planned to, because the projection is
+//!   `diaric::plda::PldaTransform` in f64 on the host. The test pinned the I/O
+//!   contract of a graph this crate will never consume, and being `#[ignore]`d
+//!   it ran only when someone staged the models and asked for it by name.
+//!   Retiring it with this record beats keeping a check whose presence implies
+//!   the graph is still a live candidate; the one scenario in which the lost
+//!   assertions would matter — the graph becoming a candidate again — is also
+//!   the one scenario in which it would be re-introspected from scratch anyway.
+//! - **If it ever does become one**, restore exactly the assertions listed
+//!   above; they are spelled out here so the restoration needs no `git log`
+//!   archaeology.
 //!
 //! # Licenses (`Models/speakerkit/README.md`)
 //!
@@ -432,25 +470,4 @@ fn embedding_split_io_recorded_not_targeted() {
     "dynamic output shape tracking the flexible `fbank_features`/`weights` inputs"
   );
   assert_eq!(embedding.data_type(), Some(DataType::F32));
-}
-
-#[test]
-#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
-fn plda_io_recorded_out_of_scope() {
-  // Out of scope per spec §3 non-goals ("Any clustering/VBx/PLDA port") —
-  // recorded because the plan brief names it as a candidate artifact to
-  // introspect. Fixed-shape throughout; no flexibility declared at all.
-  let path = common::models_dir().join("PLDA.mlmodelc");
-  let model = Model::load(path, ComputeUnits::CpuOnly).unwrap();
-  let description = model.description();
-
-  let embeddings = description.input("embeddings").expect("embeddings input");
-  assert_eq!(embeddings.shape(), &[1, 256]);
-  assert_eq!(embeddings.data_type(), Some(DataType::F32));
-
-  let plda_features = description
-    .output("plda_features")
-    .expect("plda_features output");
-  assert_eq!(plda_features.shape(), &[1, 128]);
-  assert_eq!(plda_features.data_type(), Some(DataType::F32));
 }

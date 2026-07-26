@@ -111,14 +111,51 @@
 //!    byte-identity alone.
 //! 4. `PldaProjector.mlmodelc` (`speaker_clusterer`, out of scope): input
 //!    `embeddings [1, 64, 256]`, output `plda_embeddings [1, 64, 128]` —
-//!    recorded for completeness (mirroring `tests/model_io.rs`'s
-//!    PLDA-recording precedent) with no expected contract to check it
-//!    against, so this is recorded, not a delta.
-//!    Note the name is `plda_embeddings`, not the FluidAudio-side PLDA
-//!    artifact's `plda_features` (`tests/model_io.rs`'s
-//!    `plda_io_recorded_out_of_scope`) — the two sources don't share a
+//!    recorded for completeness, with no expected contract to check it
+//!    against, so this is recorded, not a delta. Note the name is
+//!    `plda_embeddings`, not the `plda_features` emitted by FluidAudio's
+//!    own, unrelated `PLDA.mlmodelc` — the two sources don't share a
 //!    contract here either, consistent with them being unrelated
-//!    conversions (pyannote-v4 vs. FluidAudio's own).
+//!    conversions (pyannote-v4 vs. FluidAudio's own). This is argmax's own
+//!    PLDA, and it PASSES THE STATIC MINIMUM-SUBNORMAL GUARD where the
+//!    FluidAudio pair does not — which is why it carries no `fp16_guards`
+//!    `KNOWN_DEFECTS` pin and they do. Both its normalizations do carry a
+//!    1e-12 `rsqrt` epsilon, but each sits behind an `add(variance, 1e-6)`
+//!    on that op's input, and 1e-6 is representable in fp16 at ~17x the
+//!    smallest subnormal (`2^-24`); the FluidAudio pair's only floor is
+//!    the bare 1e-12 `clip` itself. That contrast is solid, and it is the
+//!    whole reason for the differing pin status.
+//!
+//!    Do NOT restate that as "fp16-safe". An earlier revision of this doc
+//!    did, as did issue #16; both are corrected, and this is the wording
+//!    they agree on. **Established:** static representability — this
+//!    graph clears the check `fp16_guards` actually performs, which reads
+//!    the MIL text and compares floors against `2^-24`. **Not
+//!    established:** runtime safety. 1e-6 is itself SUBNORMAL in fp16 (it
+//!    is below `2^-14`, fp16's smallest NORMAL), and `fp16_guards` records
+//!    at its `FP16_MIN_NORMAL` constant that some kernels flush subnormals
+//!    to zero; on such a kernel, with a zero variance, the 1e-6 floor and
+//!    the 1e-12 epsilon vanish together and the `rsqrt` takes a bare 0,
+//!    i.e. `1/sqrt(0)`.
+//!    **What would settle it — and what a naive probe would NOT.** Not
+//!    "feed a zero-variance input and check the output". This graph has TWO
+//!    sequential normalization sites (`model.mil`'s `op_26` and `op_54`
+//!    `rsqrt`s), and a generic zero-variance MODEL input is not shown to
+//!    drive either into the zero/subnormal regime, let alone both. Site
+//!    one's `rsqrt` sees `mean_c((x - xvectors_mean)^2) + 1e-6` — the
+//!    external input is CENTERED first, so an all-zero `embeddings` yields
+//!    `mean_c(xvectors_mean^2)`, not `0`; only a slot of `x` equal to
+//!    `xvectors_mean` itself zeroes that reduction. Site two's sits AFTER
+//!    the LDA `conv` and its bias, so it is not directly addressable from
+//!    the model input at all — reaching it needs a solved pre-image. A test
+//!    that settles runtime safety therefore has to (i) use inputs PROVEN,
+//!    per site, to drive that site's `rsqrt` argument into the regime, and
+//!    (ii) compare EVERY supported `ComputeUnits` placement against a
+//!    CPU/f32 reference, since a finite number on one placement is neither
+//!    numerical correctness nor portability. Short of both, such a probe is
+//!    evidence about one input, one host and one placement — not about
+//!    runtime safety. No such test exists, and none is warranted while
+//!    nothing in this crate loads this graph.
 //! 5. None of the seven artifacts declare any shape flexibility
 //!    (`hasShapeFlexibility: "0"` on every input/output in every
 //!    `metadata.json`) — unlike some of `tests/model_io.rs`'s

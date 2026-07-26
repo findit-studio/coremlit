@@ -210,12 +210,12 @@
 //! clustering it feeds already provides it. Per the design spec §4 the
 //! clustering is `diaric`'s — and `diaric`'s `diarize_offline` opens with a bit-exact
 //! port of the SAME pyannote community-1 `VBxClustering.filter_embeddings` that
-//! argmax's `VBxClustering.swift:50` ports (`offline/algo.rs:598-656`, with
-//! `MIN_ACTIVE_RATIO = 0.2` at `:622`), applied UNCONDITIONALLY to every
+//! argmax's `VBxClustering.swift:50` ports (`offline/algo.rs:620-680`, with
+//! `MIN_ACTIVE_RATIO = 0.2` at `:644`), applied UNCONDITIONALLY to every
 //! [`Extraction`], from either source. It withholds exactly the sparse
 //! `clean_count <= 117` slots from cluster FORMATION and then re-attaches each
 //! to its nearest centroid (`pipeline/algo.rs:636-712`, reached from the
-//! offline path's `assign_embeddings` call at `offline/algo.rs:747`) — argmax's
+//! offline path's `assign_embeddings` call at `offline/algo.rs:769`) — argmax's
 //! own withhold-then-`clusterReassignment` (`VBxClustering.swift:52,111`),
 //! reproduced downstream. So [`Extraction`] needs no "present, but do not
 //! cluster on me" channel: `diaric` is that channel. What the mask still has to
@@ -280,7 +280,7 @@
 //! | rule | applied by | fires when | on `02_pyannote_sample` |
 //! |---|---|---|---|
 //! | exclude-overlap fallback (`clean_count <= 2` ⇒ use the raw mask) | THIS port's `build_speaker_masks` | starved clean mask | 0 of 41 active slots |
-//! | `minActiveRatio` filter (`clean_count <= 117`, `ratio <= 0.2`) | `diaric`'s clustering (`offline/algo.rs:598-656`; reassignment `pipeline/algo.rs:636-712`) | sparse / overlap-heavy slot | 5 of 41 active slots |
+//! | `minActiveRatio` filter (`clean_count <= 117`, `ratio <= 0.2`) | `diaric`'s clustering (`offline/algo.rs:620-680`; reassignment `pipeline/algo.rs:636-712`) | sparse / overlap-heavy slot | 5 of 41 active slots |
 //!
 //! So a slot with, say, 40 clean frames of 589 keeps its SPARSE clean mask in
 //! the [`Extraction`] this port builds — but `diaric` does NOT then cluster on it.
