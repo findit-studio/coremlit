@@ -14,8 +14,8 @@ use sha2::{Digest, Sha256};
 /// §5; the v6.2.1 artifact ships pre-compiled, so this loads directly with no
 /// `coremlcompiler` step). Its HF revision + per-file SHA-256 are pinned in
 /// `tests/model_io.rs` — the alignkit/speakerkit convention for adopted models,
-/// NOT `MODELS_LOCK` (which a whisperkit hermetic gate holds to exactly the two
-/// CI-downloaded whisper tables).
+/// NOT `MODELS_LOCK` (which a whisperkit hermetic gate holds to exactly the
+/// tables CI actually downloads; vad is not among them).
 pub const ARTIFACT: &str = "silero-vad-unified-256ms-v6.2.1.mlmodelc";
 
 /// Directory containing the downloaded vadkit model artifact.

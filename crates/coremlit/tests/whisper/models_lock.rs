@@ -5,7 +5,7 @@
 //! rot: the lock stops parsing, or the workflow stops actually reading it.
 //!
 //! No TOML crate: this is a deliberately tiny hand-rolled reader over the
-//! lock's fixed two-table shape (`["repo/name"]` headers, single-line
+//! lock's fixed three-table shape (`["repo/name"]` headers, single-line
 //! `key = "value"` fields), mirroring the sed/awk parsing `ci.yml` itself
 //! performs at CI time — not a general TOML parser.
 
@@ -96,8 +96,8 @@ fn lock_parses_and_every_table_has_a_selector_and_a_revision() {
 
   assert_eq!(
     tables.len(),
-    2,
-    "MODELS_LOCK: expected exactly two tables, found {}",
+    3,
+    "MODELS_LOCK: expected exactly three tables, found {}",
     tables.len()
   );
   for table in &tables {
@@ -124,11 +124,18 @@ fn ci_workflow_derives_downloads_from_the_lock_instead_of_hardcoding_them() {
   let tables = parse_lock(&lock_contents);
   let ci_contents = fs::read_to_string(workflow_path).expect(".github/workflows/ci.yml reads");
 
+  // ORDER matters as much as membership: ci.yml's parser selects a table by
+  // INDEX, so a reordered lock silently re-points every `hf download` at the
+  // wrong repo's selector and revision. `assert_eq!` on the Vec pins both.
   let repo_names: Vec<&str> = tables.iter().map(|t| t.name.as_str()).collect();
   assert_eq!(
     repo_names,
-    vec!["argmaxinc/whisperkit-coreml", "openai/whisper-tiny"],
-    "MODELS_LOCK's table names changed — update this test alongside it"
+    vec![
+      "argmaxinc/whisperkit-coreml",
+      "openai/whisper-tiny",
+      "FinDIT-Studio/embedkit-coreml"
+    ],
+    "MODELS_LOCK's table names or their order changed — update this test alongside it"
   );
 
   // The literal repo strings belong to MODELS_LOCK alone. If ci.yml also
@@ -158,11 +165,29 @@ fn ci_workflow_derives_downloads_from_the_lock_instead_of_hardcoding_them() {
     "download step doesn't invoke hf with a lock-derived $tokenizer_repo"
   );
   assert!(
+    ci_contents.contains("hf download \"$granite_repo\""),
+    "download step doesn't invoke hf with a lock-derived $granite_repo"
+  );
+  assert!(
     ci_contents.contains("--revision \"$model_revision\""),
     "download step doesn't pass a lock-derived --revision for the model repo"
   );
   assert!(
     ci_contents.contains("--revision \"$tokenizer_revision\""),
     "download step doesn't pass a lock-derived --revision for the tokenizer repo"
+  );
+  assert!(
+    ci_contents.contains("--revision \"$granite_revision\""),
+    "download step doesn't pass a lock-derived --revision for the granite repo"
+  );
+
+  // MODELS_LOCK's header states that the granite bytes are checked against the
+  // `CHECKSUMS.sha256` the artifact ships. A lock file that documents an
+  // integrity check ci.yml no longer performs is a lock file lying about what
+  // CI does — the same rot this test exists to catch one level down.
+  assert!(
+    ci_contents.contains("shasum -a 256 -c CHECKSUMS.sha256"),
+    "ci.yml no longer verifies the granite bundle against its shipped CHECKSUMS.sha256, which \
+     MODELS_LOCK's header claims it does"
   );
 }

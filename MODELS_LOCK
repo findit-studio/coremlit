@@ -3,20 +3,25 @@
 # different revisions) to force a re-download.
 #
 # This file is CONSUMED, not decorative: ci.yml's "Download models (cache
-# miss)" step hand-parses the two tables below (small sed/awk block, no
-# TOML crate — see the comment there) to build both `hf download`
+# miss)" step hand-parses the three tables below (small sed/awk block, no
+# TOML crate — see the comment there) to build all three `hf download`
 # commands, including `--revision`. Editing a repo name, selector, or
 # revision here changes what CI actually downloads next run, exactly like
-# editing any other lock file.
+# editing any other lock file. Table ORDER is load-bearing: that parser
+# selects a table by INDEX (1 = whisper model, 2 = whisper tokenizer,
+# 3 = granite), so tables may be appended but never reordered without
+# editing ci.yml to match.
 #
-# LOUD FOLLOW-UP: `revision = "main"` below is a MOVING target, not a real
-# lock — CI can still download different upstream bytes on two runs of an
-# unchanged MODELS_LOCK if `main` moves between them. Pinning immutable,
-# content-addressed commit hashes for both repos is a deliberate user
-# follow-up: it requires live network access (`hf api ...` or the HF web
-# UI) to look up each repo's current commit SHA, which this environment
-# does not have. Until that lands, treat `cache-epoch` bumps as the only
-# reliable way to force a fresh, verified download.
+# LOUD FOLLOW-UP: `revision = "main"` on the two whisper tables is a MOVING
+# target, not a real lock — CI can still download different upstream bytes
+# on two runs of an unchanged MODELS_LOCK if `main` moves between them.
+# Pinning immutable, content-addressed commit hashes for those two repos is
+# a deliberate user follow-up: it requires live network access (`hf api ...`
+# or the HF web UI) to look up each repo's current commit SHA. Until that
+# lands, treat `cache-epoch` bumps as the only reliable way to force a
+# fresh, verified download of them. The granite table is NOT in that state:
+# it pins an immutable commit SHA, and ci.yml verifies the downloaded bytes
+# against the `CHECKSUMS.sha256` that artifact ships.
 cache-epoch = 1
 
 ["argmaxinc/whisperkit-coreml"]
@@ -26,3 +31,12 @@ revision = "main"
 ["openai/whisper-tiny"]
 files    = "tokenizer.json tokenizer_config.json config.json"
 revision = "main"
+
+# The granite embeddings artifact (`embeddings::granite`), staged under
+# Models/embedkit-granite/ — the layout tests/granite/common/mod.rs resolves
+# by default (overridable via EMBEDKIT_TEST_MODELS). `include` pulls the whole
+# bundle directory: the `.mlmodelc` the gates load, the `.mlpackage`, and the
+# `CHECKSUMS.sha256` ci.yml checks every one of them against.
+["FinDIT-Studio/embedkit-coreml"]
+include  = "granite-97m-multilingual-r2/*"
+revision = "81852f707848407a4f3059f47a34e2bad71f1c6d"
