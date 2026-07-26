@@ -125,28 +125,87 @@ fn reset_restores_step_zero_logits_exactly() {
 
 #[test]
 #[ignore = "requires local tiny model (WHISPERKIT_TEST_MODELS)"]
-fn alignment_weights_accumulate_when_supported() {
+fn alignment_row_stages_on_decode_step_and_lands_only_on_commit() {
+  // The stage/commit split (whisper #41) against the REAL decoder — until
+  // now only `backend/mock/tests.rs` pinned it, so nothing checked that
+  // CoreML honours it on a live prediction.
+  //
+  // ONE PREDICTION MUST NOT MAKE WEIGHTS READABLE. Swift's decode loop
+  // breaks on a completed segment BEFORE the `else` branch that runs
+  // `updateAlignmentWeights` and sets `hasAlignment`
+  // (`TextDecoder.swift:673-717`), and exposes the tensor to the caller
+  // only as `hasAlignment ? inputs.alignmentWeights : nil` (`:764-771`),
+  // which the word-timestamp block consumes through an `if let`
+  // (`TranscribeTask.swift:197-199`). So a completing step's row must never
+  // reach `add_word_timestamps` — letting it through is the divergence #41
+  // reported and #47 fixed — and a window that committed nothing must yield
+  // no view at all rather than an empty or stale one.
   let backend = load_backend();
   if !backend.supports_word_timestamps() {
     eprintln!("skipping: model lacks alignment_heads_weights (recorded in Task 1)");
     return;
   }
+  let dims = backend.dims();
   let mut window = common::load_wav_mono_f32(&common::fixtures_dir().join("audio/jfk.wav"));
-  window.resize(480_000, 0.0);
+  window.resize(dims.window_samples(), 0.0);
   let encoded = backend
     .encode(&backend.extract_features(&window).unwrap())
     .unwrap();
   let mut state = backend.new_decoder_state().unwrap();
   let mut logits = Vec::new();
+
   backend
     .decode_step(50258, 0, &encoded, &mut state, &mut logits)
     .unwrap();
+  assert!(
+    backend.alignment_weights(&state).is_none(),
+    "a staged row must leave the hasAlignment gate shut"
+  );
+
+  backend.commit_alignment_row(&mut state);
+  {
+    let view = backend
+      .alignment_weights(&state)
+      .expect("the commit opens the hasAlignment gate");
+    // The view is the whole once-allocated accumulator, never a written
+    // prefix (Swift's `[kvCacheMaxSequenceLength, n_audio_ctx]` tensor,
+    // `TextDecoder.swift:141`); a row cap here is what truncated the final
+    // window's alignment in #41.
+    assert_eq!(view.rows(), dims.max_token_context() + 1);
+    assert_eq!(view.cols(), dims.n_audio_ctx());
+    assert!(
+      view.row(1).iter().any(|&v| v != 0.0),
+      "the committed row landed at position + 1 (updateAlignmentWeights, :286)"
+    );
+    assert!(
+      view.row(0).iter().all(|&v| v == 0.0),
+      "row 0 is never a commit target"
+    );
+  }
+
+  // The other half of the split: the row a step stages is inert until the
+  // decode loop commits it, which is what keeps Swift's completing step —
+  // the one that breaks before `:709-717` — out of the accumulator.
+  backend
+    .decode_step(50259, 1, &encoded, &mut state, &mut logits)
+    .unwrap();
+  {
+    let view = backend
+      .alignment_weights(&state)
+      .expect("the gate stays open once this window has committed a row");
+    assert!(
+      view.row(2).iter().all(|&v| v == 0.0),
+      "an uncommitted step's staged row must not reach the accumulator"
+    );
+  }
+  backend.commit_alignment_row(&mut state);
   let view = backend
     .alignment_weights(&state)
-    .expect("supported => view");
-  assert_eq!(view.cols(), 1500);
-  assert!(view.rows() >= 2, "row position+1 written");
-  assert!(view.row(1).iter().any(|&v| v != 0.0), "weights landed");
+    .expect("the gate stays open");
+  assert!(
+    view.row(2).iter().any(|&v| v != 0.0),
+    "the commit, and only the commit, lands the staged row"
+  );
 }
 
 #[test]
@@ -169,9 +228,10 @@ fn last_kv_slot_decode_step_succeeds() {
   // Regression (task-9 review, Critical): the trait legalizes every
   // position in 0..max_token_context, but the mask flips prepare
   // position + 1 — at the last slot there is no next slot to prepare and
-  // the flips must be skipped, while the KV append and the alignment row
-  // (headroom row max_ctx) still land. Pre-fix this returned a structured
-  // IndexOutOfBounds AFTER mutating the KV cache.
+  // the flips must be skipped, while the KV append still lands and the
+  // staged alignment row stays committable into its headroom row max_ctx.
+  // Pre-fix this returned a structured IndexOutOfBounds AFTER mutating the
+  // KV cache.
   let backend = load_backend();
   let dims = backend.dims();
   let last = dims.max_token_context() - 1;
@@ -185,9 +245,20 @@ fn last_kv_slot_decode_step_succeeds() {
     .decode_step(50258, last, &encoded, &mut state, &mut logits)
     .expect("the last KV slot is a legal position");
   assert_eq!(logits.len(), dims.vocab());
-  if let Some(view) = backend.alignment_weights(&state) {
+  if backend.supports_word_timestamps() {
+    // The commit is load-bearing, not ceremony: the view is `None` until a
+    // row lands (the stage/commit split above), so reading the weights
+    // without it asserts nothing at all.
+    backend.commit_alignment_row(&mut state);
+    let view = backend
+      .alignment_weights(&state)
+      .expect("the last slot's committed row opens the gate");
     assert_eq!(view.rows(), dims.max_token_context() + 1);
     assert_eq!(view.cols(), dims.n_audio_ctx());
+    assert!(
+      view.row(dims.max_token_context()).iter().any(|&v| v != 0.0),
+      "the headroom row is the last legal position's commit target"
+    );
   }
 }
 
