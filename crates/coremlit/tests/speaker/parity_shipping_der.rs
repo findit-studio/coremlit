@@ -72,12 +72,27 @@
 //!    conversion itself, int8, or ANE placement) moves a marginal assignment.
 //!    int8's increment is of the same order as the conversion's own, and costs
 //!    only +0.22 DER points against the reference.
-//! 2. **The CoreML path has a real defect on 8-speaker audio, and it is NOT
-//!    int8's.** On clip 09 the *fp32 control* makes dia's clustering return
+//! 2. **The CoreML path has a real defect on 8-speaker audio.** On clip 09 the
+//!    *fp32 control* makes dia's clustering return
 //!    `Err(Centroid(AmbiguousAliveCluster { .. }))` — no diarization at all —
 //!    while dia-ort clusters it fine and int8 still answers (undercounting,
 //!    5-6 of 8). Pinned in
 //!    [`shipping_int8_der_09_mrbeast_dollar_date_8spk_known_defect`].
+//!
+//!    WHICH CoreML conversion produces it is a question this suite cannot
+//!    answer — every one of its speakerkit arms runs CoreML segmentation AND
+//!    CoreML embedding, so the two never vary independently.
+//!    `backend_factorial.rs` runs that cross-product at this suite's own
+//!    shipping configuration and finds the CoreML **embedding** path
+//!    sufficient on its own (5 of 8 speakers at 16.5904 % over dia's reference
+//!    segmentation — this suite's pinned shipping numbers, exactly), with the
+//!    segmentation conversion contributing a separate, smaller overcount
+//!    (9 speakers, 1.3011 %). So the older reading of this bullet — that the
+//!    defect is "not int8's" — holds only in the narrow sense the fp32 control
+//!    licenses: the fp32/`CpuOnly` arm fails WORSE (it cannot answer at all).
+//!    It is not evidence that the shipping embedding path is uninvolved,
+//!    because the shipping embedding path is int8 on `All`, which no arm here
+//!    isolates.
 //!
 //! # The diagnostic: confusion, not DER
 //!
@@ -1271,10 +1286,15 @@ shipping_der_gate! {
   ///   (16.5904 % DER, 100 % confusion).
   /// - reference (pyannote 4.0.4): **8** speakers.
   ///
-  /// So on 8-speaker audio the CoreML path is defective *regardless of precision*
-  /// — and int8 is not the culprit; it is the arm that still returns an answer.
-  /// This is a real, separately-actionable defect (see the task report), and it is
-  /// pinned here rather than deleted so it cannot be forgotten.
+  /// So on 8-speaker audio the CoreML path is defective at BOTH precisions this
+  /// suite measures — the fp32 control worse than int8, since it cannot answer at
+  /// all. That is as far as these four arms reach: they never vary the two CoreML
+  /// conversions independently, so "int8 is not the culprit" is NOT among the
+  /// things they establish. `backend_factorial.rs`, which does vary them, finds
+  /// the CoreML embedding path on `All` sufficient on its own to reproduce the
+  /// int8/All numbers pinned below (see the module doc's point 2). This is a real,
+  /// separately-actionable defect, and it is pinned here rather than deleted so it
+  /// cannot be forgotten.
   ///
   /// The assertion is on the KNOWN-BAD state, pinned field by field by
   /// [`assert_clip09_known_defect`]: clip identity, the reference and oracle counts,

@@ -128,7 +128,7 @@
 //! never reads a magnitude, which is what keeps the decode correct in
 //! spite of the next section.
 //!
-//! # fp16 safety of the shipped graph (a REPAIRED defect)
+//! # fp16 safety of the shipped graph (one mechanism removed, not a proof)
 //!
 //! The artifact this module loaded until 2026-07-26 reached the same
 //! log-probabilities through `softmax` → `log(epsilon = 0x0p+0)`. Every
@@ -136,34 +136,69 @@
 //! wherever the graph actually computes in fp16 — i.e. on the default
 //! [`crate::ComputeUnits::All`] — so a softmax output that underflowed to 0
 //! reached an unguarded `log(0)` and saturated instead of being clamped.
-//! Measured over 1033 chunks of a real 17-minute recording, the minimum
-//! `segments` value was **−45440** on `All` against **−32.31** on `CpuOnly`
-//! (issue #15).
+//! Measured over 1033 chunks of a real 17-minute recording
+//! (`09_mrbeast_dollar_date`), the minimum `segments` value was **−45440** on
+//! `All` against **−32.31** on `CpuOnly` (issue #15).
 //!
-//! The shipped graph now has **no `log` op at all**. `reduce_log_sum_exp` →
-//! `sub` computes `z − logsumexp(z)` directly, and for finite `z` its output
-//! is bounded below by `min(z) − logsumexp(z)` — there is no value it can
-//! saturate on, at any precision, on any placement. The same measurement
-//! gives −31.80 on `All`. `tests/fp16_guards.rs` holds this graph and every
-//! other shipped graph to the `2^-24` floor in BOTH directions, and
-//! `tests/speaker/model_io.rs` asserts the fused tail structurally and pins
-//! the artifact's bytes, so neither a regression nor a silent repair can land
-//! unseen.
+//! The shipped graph has **no `log` op at all**: `reduce_log_sum_exp` → `sub`
+//! computes `z − logsumexp(z)` directly. **That removes the mechanism above,
+//! and removing that mechanism is the whole claim.** No `log` means no guard
+//! epsilon, so the measured "underflowed softmax reaches `log(0)`" path cannot
+//! occur.
 //!
-//! **What this did NOT cause, despite the coincidence in timing.** The
-//! 8-speaker clip on which the CoreML path returns 5 speakers at 16.6 % DER
-//! (`tests/speaker/parity_shipping_der.rs`'s clip-09 pin) is a segmentation
-//! defect, but not THIS one: swapping in the repaired artifact and changing
-//! nothing else leaves every gated DER number on that corpus bit-identical.
-//! The clip-09 divergence is this graph's ordinary fp16-vs-fp32 precision in
-//! the log-probability tail — enough to flip 0.18 % of powerset argmax frames
-//! against dia-ort — and both conversions are fp16, so both carry it.
+//! It is NOT a proof that no value can saturate at any precision on any
+//! placement, and the wording that said so was reasoning one step past its
+//! evidence. `sub` is not immune on its own terms: two finite fp16 operands
+//! near the format's ±65504 maximum subtract to ≈ ∓131008, outside fp16's
+//! range — and nothing here bounds the intermediates the trunk feeds it.
+//! What the repo's gates actually bound is narrower than the old claim
+//! sounded: `tests/fp16_guards.rs` bounds guard CONSTANTS against the `2^-24`
+//! floor, and `tests/speaker/model_io.rs` bounds the artifact's BYTES (sha256)
+//! and the tail's STRUCTURE (no `log` op, `reduce_log_sum_exp` present). None
+//! of the three bounds a runtime value.
+//!
+//! - *Established*: the decomposed-softmax `log(0)` mechanism is gone, and on
+//!   the same 1033-chunk measurement the minimum `segments` value on `All` is
+//!   **−31.80** rather than −45440.
+//! - *Not established*: any bound on `segments` for other inputs, other
+//!   placements, or other hosts. An observed range on one recording is not a
+//!   range guarantee.
+//! - *What would settle it*: explicit finite/range testing — drive the graph
+//!   at each placement with inputs chosen to push the trunk toward the fp16
+//!   extremes and assert a bound on the output. This crate has no such test.
+//!
+//! **What this repair did NOT fix, and what this graph is NOT responsible
+//! for.** The 8-speaker clip on which the shipping CoreML path returns 5
+//! speakers at 16.6 % DER (`tests/speaker/parity_shipping_der.rs`'s clip-09
+//! pin) is not repaired by the swap: re-running that suite's four gated clips
+//! with only the artifact changed reproduced every gated number, clip 09
+//! included.
+//!
+//! It is also **not this stage's collapse**. Measured at the shipping
+//! configuration by `tests/speaker/backend_factorial.rs` — int8 embedder, both
+//! CoreML models on [`crate::ComputeUnits::All`], dia's ONNX as the reference
+//! for whichever stage is not swapped — this graph on its own OVERcounts by
+//! one speaker (9 of 8, 1.3011 % DER), while the CoreML *embedding* path on
+//! its own reproduces the 5-of-8 collapse exactly (16.5904 %). An earlier
+//! cross-product run with the fp32 embedder on `CpuOnly` attributed the whole
+//! thing here; it does not survive re-measurement at the configuration this
+//! crate ships. See `tests/speaker/model_io.rs`'s "Clip 09" section for both
+//! tables side by side.
+//!
+//! Which PART of this graph produces its own overcount is a further step, and
+//! it is NOT established: `segments` is the only tensor either graph exposes,
+//! so a divergence in it cannot be attributed to this tail rather than to the
+//! trunk that feeds it. `backend_factorial`'s `seg_divergence` doc carries the
+//! one decomposition the observable outputs do support (a monotone per-row
+//! shift can only collapse an ordering into a tie, never invert one) and what
+//! would settle the rest.
 //!
 //! What callers get: [`multilabel`] consumes per-row ORDERING only, and that
-//! was never at risk. Magnitudes are now unsaturated on every placement, but
-//! they are still computed in fp16 on the ANE/GPU (`All` can return a value a
-//! few thousandths above 0 where one class dominates), so read them as
-//! fp16-precise log-probabilities, not as an fp32-accurate log-likelihood.
+//! was never at risk from the epsilon. Magnitudes are unsaturated in the
+//! measurements above, but they are still computed in fp16 on the ANE/GPU
+//! (`All` can return a value a few thousandths above 0 where one class
+//! dominates), so read them as fp16-precise log-probabilities — not as an
+//! fp32-accurate log-likelihood, and not as a quantity this crate bounds.
 //!
 //! # Tie handling
 //!
@@ -369,11 +404,13 @@ impl SegmentModel {
   /// `[frame][class]` — layout-identical to dia's `SegmentModel::infer`
   /// (`diarization/src/segment/model.rs:280-357`).
   ///
-  /// These are `log(softmax(z))`, not the raw logits `z`: the graph's tail
-  /// is a decomposed `log_softmax` (module doc, "`segments` is
-  /// `log(softmax(·))`"). Consume the per-row ORDERING — which is
-  /// identical to the logits' — and not the magnitudes, which the graph's
-  /// inert fp16 `log` epsilon saturates on ANE/GPU paths.
+  /// These are `log(softmax(z))`, not the raw logits `z`: the shipped
+  /// graph's tail is the FUSED `reduce_log_sum_exp` → `sub` (module doc,
+  /// "`segments` is `log_softmax(·)`"). Consume the per-row ORDERING — the
+  /// property [`multilabel`] needs, and the one a per-row constant shift
+  /// preserves — rather than the magnitudes, which are computed in fp16 on
+  /// ANE/GPU placements and are not bounded by anything this crate tests
+  /// (module doc, "fp16 safety of the shipped graph").
   ///
   /// # Errors
   /// [`InferError::InputLength`] unless `samples.len() == SEG_CHUNK_SAMPLES`

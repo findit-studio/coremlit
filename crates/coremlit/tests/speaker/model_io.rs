@@ -84,24 +84,114 @@
 //! the fused `reduce_log_sum_exp` → `sub` form — no `log` op at all, nothing to
 //! saturate — and the same measurement gives **−31.80** on `All`.
 //!
-//! **What this swap does NOT do.** It is end-to-end inert on the whole
-//! multi-speaker DER corpus: with only this artifact changed, every gated
-//! number on clips 06 / 09 / 10 / 14 is bit-identical to the pre-swap
-//! measurement, including clip 09's 5-of-8-speaker collapse
-//! (`parity_shipping_der`'s known-defect pin, unchanged). The clip-09 defect is
-//! a segmentation-conversion defect — the model cross-product attributes it
-//! there, and the embedder is exonerated at cosine 1.000000 — but its mechanism
-//! is the fp16 conversion's ordinary tail precision (1091 of 608 437 powerset
-//! argmax frames flip against dia-ort's fp32 ONNX), not the vanished epsilon,
-//! and the re-conversion is still fp16, so it does not move it. The swap
-//! removes a real, silent, four-orders-of-magnitude corruption on the default
-//! placement; it does not repair clip 09.
+//! **What this swap does NOT do — an OBSERVATION, not an enforced property.**
+//! Re-running `parity_shipping_der`'s four gated clips (06 / 14 / 10 / 09)
+//! with only this artifact changed reproduced every gated number, clip 09's
+//! 5-of-8-speaker collapse included (its known-defect pin still passes
+//! unchanged). Environment: Apple M1 Max, macOS 26.5 (build 25F71), arm64;
+//! CoreML through this crate at each arm's own placement (`CpuOnly` for the
+//! fp32 control, `CpuOnly` and `All` for the int8 arms); the reference side is
+//! dia's ONNX on `ort`'s CPU EP.
+//!
+//! No test turns that into a guarantee, and the wording must not pretend
+//! otherwise. Nothing compares a pre-swap number against a post-swap number:
+//! the gates that run afterwards bound reference-agreement within ±1 pp on the
+//! gated clips (`SHIPPING_ABS_DELTA_MAX`) and ±0.05 pp on clip 09's pins
+//! (`DER_PIN_TOL`), so a swap that moved a number by anything short of those
+//! bounds would still pass every one of them.
+//!
+//! - *Established*: on those FOUR clips — four of the eight ≥ 3-speaker clips
+//!   in dia's parity corpus, not the whole multi-speaker corpus — on this
+//!   host, the two artifacts produced the same gated numbers.
+//! - *Not established*: inertness on the other four ≥ 3-speaker clips
+//!   (08 / 11 / 12 / 13), on any other host or macOS build, or at exact bit
+//!   level anywhere.
+//! - *What would settle it*: a differential gate storing each clip's pre-swap
+//!   speaker count and DER and asserting EXACT equality against the post-swap
+//!   run, across all eight ≥ 3-speaker clips. That gate does not exist; this
+//!   paragraph is its honest substitute.
+//!
+//! The swap removes a real, silent, four-orders-of-magnitude corruption on the
+//! default placement (see the measurement above); it does not repair clip 09.
+//! For what does and does not cause clip 09, see "Clip 09" below — the
+//! attribution belongs to a cross-product run at the SHIPPING configuration,
+//! not to this swap.
 //!
 //! The published re-conversions of `wespeaker`/`wespeaker_int8` are
 //! deliberately NOT adopted: the int8 one is also a re-palettization, and it
 //! moves clip 14's shipping ANE arm from 0.8178 % to 1.4860 % DER, past
 //! `parity_shipping_der`'s ±1 pp bound (isolated by swapping one artifact at a
 //! time; see issue #15). Their `fp16_guards` pins therefore stand.
+//!
+//! # Clip 09: what the cross-products establish, and at WHICH configuration
+//!
+//! Two model cross-products exist. They were run at different configurations,
+//! **they disagree**, and neither speaks for the other. Both hold one audio
+//! buffer, one chunk grid, one decode and one clustering constant, varying
+//! only which conversion computes a stage.
+//!
+//! **(a) fp32 embedder (`wespeaker.mlmodelc`) on `CpuOnly`** — the original
+//! run (issue #15). In that configuration the CoreML path does not undercount;
+//! it produces no answer at all:
+//!
+//! ```text
+//! ONNX-seg   + ONNX-emb     8 spk, 0.0000 %   the dia-ort reference
+//! COREML-seg + ONNX-emb     Err(AmbiguousAliveCluster sp[13] = 1.706e-7)
+//! ONNX-seg   + COREML-emb   8 spk, 0.0000 %
+//! COREML-seg + COREML-emb   Err(AmbiguousAliveCluster sp[13] = 1.700e-7)
+//! ```
+//!
+//! - *Established*: at fp32/`CpuOnly`, the segmentation conversion alone is
+//!   SUFFICIENT to produce that `Err`, and the fp32 embedder alone is not.
+//! - *Not established by (a)*: anything about the int8 embedder or about
+//!   `ComputeUnits::All` — a different artifact, different kernels, and not
+//!   even the same failure (a refusal to cluster, versus the silent 5-of-8
+//!   undercount this crate ships). The sentence this doc carried until
+//!   2026-07-26, "the embedder is exonerated", generalized (a) to a
+//!   configuration it never touched.
+//!
+//! **(b) int8 embedder (`wespeaker_v2.mlmodelc`) on `ComputeUnits::All` — the
+//! SHIPPING configuration.** `tests/speaker/backend_factorial.rs` runs the
+//! identical design where the defect actually lives, same clip, same host:
+//!
+//! ```text
+//! segmentation | embedding | spk |      DER |     conf
+//! -------------+-----------+-----+----------+---------
+//!         ONNX |      ONNX |   8 |  0.0000% |  0.0000%
+//!         ONNX |    COREML |   5 | 16.5904% | 16.5904%
+//!       COREML |      ONNX |   9 |  1.3011% |  1.3011%
+//!       COREML |    COREML |   5 | 16.5904% | 16.5904%
+//! ```
+//!
+//! - *Established at the shipping configuration*: swapping ONLY the
+//!   **embedding** conversion, over dia's own reference segmentation,
+//!   reproduces the shipping collapse exactly — 5 of 8 speakers, 16.5904 %
+//!   DER, 11 999 confusion units, the same numbers as the all-CoreML corner.
+//!   Swapping ONLY the **segmentation** conversion does not: it OVERcounts by
+//!   one (9 speakers, 1.3011 %), a real defect an order of magnitude smaller
+//!   that the shipping arm masks. Both corners reproduce their independently
+//!   pinned numbers (dia-ort's 8 / 0.0000 %; `parity_shipping_der`'s
+//!   5 / 16.5904 %), which is what makes the hybrid cells readable at all.
+//! - *Not established*: WHICH property of the CoreML embedding path carries
+//!   it. The factor varied is the BACKEND, so the implicated object is the
+//!   shipping bundle — int8 palettization **plus** `All` placement **plus**
+//!   that conversion — as one unit. Nor does any of it extend beyond clip 09,
+//!   this host, or these two configurations.
+//! - *What would settle the remainder*: the same hybrid harness with the
+//!   reference segmentation held fixed and the embedding arm run as fp32
+//!   CoreML on `All` and as int8 CoreML on `CpuOnly`. Those two cells separate
+//!   quantization from placement; nothing measured so far does.
+//!
+//! The mechanism INSIDE the segmentation graph is a further step again, and it
+//! is not established either: `segments` is the only tensor either graph
+//! exposes, so a divergence in it cannot be attributed to the log-softmax tail
+//! rather than to the trunk feeding it. Measured on this clip at `All`, the
+//! CoreML segmentation differs from dia's ONNX by at most 0.6574 in
+//! log-probability and flips 565 of 608 437 powerset argmax frames (0.0929 %);
+//! of those flips only 50 carry an exact tie at the CoreML row maximum, and a
+//! tie is the ONLY argmax change a monotone per-row shift can produce — so at
+//! least 515 of them originate upstream of the tail. `backend_factorial`'s
+//! `seg_divergence` carries the full argument and its caveats.
 //!
 //! # Licenses (`Models/speakerkit/README.md`)
 //!
@@ -156,21 +246,57 @@
 //!   from "smaller ⇒ faster on the ANE" without measuring is what produced
 //!   the wrong claim.
 //!
-//!   The DECISION is still correct, for a different reason: int8 does not
-//!   move the CLUSTERING decision. On `10_mrbeast_clean_water` — the clip
+//!   The DECISION still stands, on different evidence: int8 **preserves the
+//!   measured speaker count and stays inside the DER bounds this suite
+//!   selected**. It is not accuracy-free, and the replacement rationale must
+//!   not repeat the original's mistake of claiming more than was measured.
+//!
+//!   *Established* — `parity_shipping_der.rs`, four gated clips
+//!   (06 / 14 / 10 / 09), Apple M1 Max, macOS 26.5 (build 25F71), arm64:
+//!   int8 and fp32 agree on the speaker count on every clip whose fp32
+//!   control clusters at all, and on `10_mrbeast_clean_water` — the clip
 //!   that exposed the argmax source's spurious 8th speaker — the
-//!   precision-isolated int8 arm clusters identically to fp32 (0.0000 %
-//!   standard-collar DER, zero confusion) while carrying a *worse*
-//!   embedding cosine (~0.90-0.92) than argmax's ~0.94, and no clip in the
-//!   gated set has ever shown int8 and fp32 disagreeing on the speaker
-//!   count. That is the noise-vs-warp distinction: quantization scatter is
-//!   roughly isotropic and survives the frozen community-1 LDA+PLDA basis,
-//!   whereas argmax's front-end change is a systematic rotation that does
-//!   not. So int8 is chosen because it is free in accuracy terms and cheap
-//!   in footprint — NOT because it is faster. The evidence lives in
-//!   `parity_shipping_der.rs`; a parity gate (spec §6.2) separately confirms
-//!   quantization doesn't reintroduce the NaN/Inf corruption dia already
-//!   routes around `ort`'s CoreML EP for (spec §1).
+//!   precision-isolated `int8/CpuOnly` arm clusters so that not one
+//!   collar-scored frame differs from the fp32 control
+//!   (`der_std(fp32, int8).err_units() == 0`, asserted, not narrated), while
+//!   carrying a *worse* embedding cosine (~0.90-0.92) than argmax's ~0.94.
+//!   That is the noise-vs-warp distinction: quantization scatter is roughly
+//!   isotropic and survives the frozen community-1 LDA+PLDA basis, whereas
+//!   argmax's front-end change is a systematic rotation that does not.
+//!
+//!   *The accuracy cost int8 does carry*, from that same suite: against the
+//!   independent pyannote reference, int8 agrees worse than the fp32 control
+//!   by up to +0.2209 pp (`int8/CpuOnly`) and +0.4217 pp (`int8/All`, the
+//!   literal shipping config) — inside `SHIPPING_ABS_DELTA_MAX`'s ±1 pp
+//!   bound, but not zero. On `14_mrbeast_strongman_robot` int8 moves
+//!   0.7832 % of collar-scored speech to a different speaker than the fp32
+//!   control put it under — on a clip whose fp32 CoreML control already
+//!   carries ~0.39 % confusion against dia-ort with no quantization involved
+//!   (`SHIPPING_CONFUSION_TRIPWIRE`'s doc), so the increment is of the same
+//!   order as the conversion's own. "Within the selected bound" is the
+//!   claim; "free" is not.
+//!
+//!   *Not established*: that int8 is accuracy-neutral on 8-speaker audio.
+//!   Clip 09 cannot adjudicate the precision axis at all — its fp32 control
+//!   returns `Err(AmbiguousAliveCluster)` and produces no diarization to
+//!   compare against — so int8-vs-fp32 there is UNMEASURED, not equal. What
+//!   IS measured on clip 09 is worse for this DECISION than "unmeasured":
+//!   `backend_factorial.rs` shows the shipping embedding path (this int8
+//!   artifact on `All`) sufficient on its own to collapse 8 speakers to 5
+//!   there — see "Clip 09" above. That does not overturn the DECISION, which
+//!   rests on the clips whose fp32 control clusters, but it is the open
+//!   question against it. Nothing here extends past these four clips, this
+//!   host, or these two placements.
+//!
+//!   *What would settle it*: the fp32 control clustering on clip 09 (which
+//!   is the clip-09 defect itself, see "Segmentation provenance" above),
+//!   plus the four remaining ≥ 3-speaker corpus clips (08 / 11 / 12 / 13)
+//!   measured on the same precision axis.
+//!
+//!   The evidence lives in `parity_shipping_der.rs`; a parity gate
+//!   (spec §6.2) separately confirms quantization doesn't reintroduce the
+//!   NaN/Inf corruption dia already routes around `ort`'s CoreML EP for
+//!   (spec §1).
 //!
 //!   `FBank.mlmodelc` + `Embedding.mlmodelc` (the split fbank-then-embed
 //!   pipeline) are NOT targeted per spec §2.4: wespeaker_v2 computes fbank
