@@ -587,18 +587,29 @@ const DER_PIN_TOL: f64 = 0.0005;
 /// sources produce those differently, which is the very thing under
 /// investigation. It can therefore retain a DIFFERENT set of embeddings for
 /// cluster FORMATION on the argmax side than on the FluidAudio side, and a
-/// different retained set means different centroids and so different final
+/// different retained set CAN move the centroids and so the final
 /// assignments. Shared filter, per-source input, possibly divergent effect:
 /// that is the shape of a mediator, and nothing measured here excludes it.
 ///
-/// **What would settle it.** Either (a) a 0.2-versus-disabled ablation, which
-/// has no OFF arm today because `diarize_offline` hardcodes `MIN_ACTIVE_RATIO`
-/// as a `const` and exposes no knob for it; or (b), cheaper and sufficient,
-/// dumping the RETAINED slot set per source per clip — `diaric`'s Stage-1
-/// `train_chunk_idx`/`train_speaker_idx` pair — and comparing them: identical
-/// retained sets on the failing clips would demote the filter to a genuine
-/// non-factor, differing sets would make it a live mediator whose contribution
-/// has to be quantified. Neither experiment exists today.
+/// **What would settle it — and what would NOT.** Settling it takes the
+/// ABLATION: run both sources with the 0.2 rule ON and OFF and measure how the
+/// CROSS-SOURCE divergence itself moves. That difference-in-differences is the
+/// filter's causal contribution to the gap; nothing weaker is. It has no OFF
+/// arm today because `diarize_offline` hardcodes `MIN_ACTIVE_RATIO` as a
+/// `const` and exposes no knob for it.
+///
+/// Dumping the RETAINED slot set per source per clip — `diaric`'s Stage-1
+/// `train_chunk_idx`/`train_speaker_idx` pair — is far cheaper and worth doing,
+/// but it is DIAGNOSTIC EVIDENCE ONLY, not a substitute. Those index arrays
+/// answer exactly one question: whether the rule selects different COORDINATES
+/// on the two sides. They settle causal impact in neither direction. Identical
+/// retained sets would NOT demote the filter to a non-factor — the EXCLUDED
+/// embeddings stay source-dependent, so disabling the rule hands each side a
+/// different set of restored vectors and can still move argmax and FluidAudio
+/// unequally. Differing retained sets would NOT establish a live mediator
+/// either — a different retained set need not shift the centroids, and shifted
+/// centroids need not flip any assignment. A difference is a REASON to spend
+/// the ablation; a match merely withholds one. Neither experiment exists today.
 /// So **§5.2/§5.6 is NARROWED, not closed** — one hypothesis eliminated, the
 /// mediator hypothesis still open. The front-end warp remains the leading
 /// explanation, and still not an isolated variable, because the segmenter and
