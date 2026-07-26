@@ -144,6 +144,57 @@ pub enum SegmentError {
     /// Actual flattened element count.
     len: usize,
   },
+  /// This host's CoreVideo row pitch for the Float16 surface Swift's
+  /// alignment gather allocates could not be measured, so
+  /// [`AlignmentGather::SwiftParity`](crate::audio::whisper::options::AlignmentGather::SwiftParity)
+  /// — whose whole content is replicating what that pitch truncates —
+  /// cannot be honored.
+  ///
+  /// Fail-closed by design: the alternative, quietly gathering every row in
+  /// full, is the behavior
+  /// [`AlignmentGather::Complete`](crate::audio::whisper::options::AlignmentGather::Complete)
+  /// names, and substituting it under a `SwiftParity` request would be the
+  /// same silent, host-dependent swap of transcript-changing behavior that
+  /// whisper #41 exists to remove. `SwiftParity` is opt-in, so refusing an
+  /// environment where it cannot be honored costs a caller nothing they did
+  /// not explicitly ask for — a caller who prefers timings over parity simply
+  /// does not opt in, and gets `Complete` by default.
+  #[error(
+    "cannot measure this host's CoreVideo Float16 row pitch for the {rows} x {cols} alignment \
+     gather, so the Swift-parity gather cannot be reproduced (select \
+     `AlignmentGather::Complete` to gather every row in full instead): {source}"
+  )]
+  AlignmentPitchUnavailable {
+    /// Rows the gather would have allocated (gathered tokens).
+    rows: usize,
+    /// Columns the gather would have allocated (audio tokens).
+    cols: usize,
+    /// Why the probe allocation could not supply a pitch.
+    #[source]
+    source: crate::TensorError,
+  },
+  /// The probe allocation behind
+  /// [`AlignmentGather::SwiftParity`](crate::audio::whisper::options::AlignmentGather::SwiftParity)
+  /// succeeded but reported a layout the gather's model cannot describe —
+  /// anything other than `[pitch, 1]` element strides with `pitch >= cols`,
+  /// i.e. rows padded only *between* each other.
+  ///
+  /// Fail-closed for the same reason as [`Self::AlignmentPitchUnavailable`]:
+  /// an unmodellable layout means the truncation Swift's gather performs is
+  /// unknown, not absent.
+  #[error(
+    "this host's CoreVideo Float16 surface for the {rows} x {cols} alignment gather reports \
+     element strides {strides:?}, which is not the row-padded row-major layout the Swift-parity \
+     gather models (select `AlignmentGather::Complete` to gather every row in full instead)"
+  )]
+  AlignmentPitchUnexpectedLayout {
+    /// Rows the gather allocated (gathered tokens).
+    rows: usize,
+    /// Columns the gather allocated (audio tokens).
+    cols: usize,
+    /// The element strides the probe allocation actually reported.
+    strides: Vec<usize>,
+  },
   /// Decoding a slice's tokens back to text failed.
   #[error("tokenizer decode failed: {0}")]
   Tokenizer(#[from] TokenizerError),

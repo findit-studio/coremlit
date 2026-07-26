@@ -677,6 +677,20 @@ impl MultiArray {
   /// inter-row padding — before returning, so every logical element is safe
   /// to read immediately, whether or not the layout turned out padded.
   ///
+  /// # Initialization is write-only, deliberately
+  ///
+  /// Nothing here READS the freshly created buffer. CoreVideo does not
+  /// promise a new `CVPixelBuffer`'s bytes are initialized, and reading an
+  /// uninitialized byte is undefined behavior in Rust whatever the read is
+  /// spelled as — `read_volatile` suppresses elision and reordering, not
+  /// undefinedness, and `MaybeUninit` only moves the obligation to whatever
+  /// would inspect the value. An earlier revision of this constructor scanned
+  /// the allocation's tail before zeroing it in order to report what CoreVideo
+  /// had left there; that scan was UB on exactly the hosts it existed to
+  /// detect, so this safe constructor now performs a single `write_bytes`
+  /// over `CVPixelBufferGetDataSize` bytes and never observes the prior
+  /// contents (whisper #41, codex round 3, F1).
+  ///
   /// # Errors
   /// [`TensorError::UnsupportedShape`] (reason
   /// [`ShapeRequirement::NonEmpty`]) if `shape` is empty — a rank-0 shape
@@ -733,11 +747,19 @@ impl MultiArray {
     // is the exact final dimension with no clamping.
     let width = *shape.last().expect("shape checked non-empty above");
     let height = checked_element_count(&shape[..shape.len() - 1])?;
-    height
+    // Overflow guard, not a size the fill below uses: the byte count actually
+    // zeroed is CoreVideo's own `CVPixelBufferGetDataSize`. A shape whose
+    // element count (or that count's byte size) is unrepresentable is refused
+    // here, before any native allocation is attempted.
+    if height
       .checked_mul(width)
-      .ok_or_else(|| TensorError::ShapeOverflow {
+      .and_then(|count| count.checked_mul(size_of::<f16>()))
+      .is_none()
+    {
+      return Err(TensorError::ShapeOverflow {
         shape: shape.to_vec(),
-      })?;
+      });
+    }
 
     // An empty IOSurface-properties dictionary as the value of
     // `kCVPixelBufferIOSurfacePropertiesKey` opts the buffer into IOSurface
@@ -797,9 +819,12 @@ impl MultiArray {
     // uninitialized bytes.
     // SAFETY: `buffer` is the live pixel buffer created above; lock/base/
     // size/unlock is the documented CPU-access protocol, base is non-null
-    // after a successful lock of a successfully created buffer, and
+    // after a successful lock of a successfully created buffer, and the
     // `write_bytes` stays within `CVPixelBufferGetDataSize` bytes of the
-    // locked base. All-zero bits are valid `f16` (0.0).
+    // locked base. The buffer's prior contents are never read — the only
+    // access is this write, so no uninitialized byte is ever observed (see
+    // the constructor doc's write-only section). All-zero bits are valid
+    // `f16` (0.0).
     unsafe {
       use objc2_core_video::{
         CVPixelBufferGetBaseAddress, CVPixelBufferGetDataSize, CVPixelBufferLockBaseAddress,
@@ -814,7 +839,8 @@ impl MultiArray {
         CVPixelBufferUnlockBaseAddress(&buffer, CVPixelBufferLockFlags::empty());
         return Err(TensorError::PixelBuffer { code: lock });
       }
-      core::ptr::write_bytes(base.cast::<u8>(), 0, CVPixelBufferGetDataSize(&buffer));
+      let data_size = CVPixelBufferGetDataSize(&buffer);
+      core::ptr::write_bytes(base.cast::<u8>(), 0, data_size);
       CVPixelBufferUnlockBaseAddress(&buffer, CVPixelBufferLockFlags::empty());
     }
 

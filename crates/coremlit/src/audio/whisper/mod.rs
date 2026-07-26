@@ -168,6 +168,8 @@
 //! the provenance code, and `provenance`'s mutation table — whose coverage
 //! is derived from [`DecodingOptions`](options::DecodingOptions)' own field
 //! set, not hand-written — fails the suite if one ever is not.
+//! `alignment_gather` (whisper #41) is a third such transcript-changing knob,
+//! captured with no change to the provenance code.
 //!
 //! The remaining three are **consumer-supplied**: settable `Option` fields,
 //! left `None` and never guessed, because this crate genuinely cannot

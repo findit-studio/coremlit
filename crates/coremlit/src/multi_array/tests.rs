@@ -320,6 +320,31 @@ fn f16_surface_contiguous_is_zero_before_any_write() {
 }
 
 #[test]
+fn f16_surface_zero_fills_every_logical_element_at_every_shape() {
+  // `f16_surface`'s contract at the shapes the whisper alignment gather uses,
+  // including the tall 225-row accumulator: every logical element reads zero
+  // immediately after construction, whether or not CoreVideo padded the rows.
+  //
+  // This asserts what THIS crate wrote, and nothing about what CoreVideo left
+  // behind first — the constructor is write-only by design (reading a fresh
+  // pixel buffer's bytes is UB, whatever the read is spelled as), so there is
+  // no prior content any test could legitimately observe.
+  for shape in [[1usize, 4], [3, 9], [225, 100], [224, 100]] {
+    let arr = MultiArray::f16_surface(&shape).unwrap();
+    assert_eq!(arr.shape(), shape);
+    for i0 in 0..shape[0] {
+      for i1 in 0..shape[1] {
+        assert_eq!(
+          arr.read_at::<f16>(&[i0, i1]).unwrap(),
+          f16::from_f32(0.0),
+          "shape {shape:?} index [{i0}, {i1}] was not zeroed"
+        );
+      }
+    }
+  }
+}
+
+#[test]
 fn zeros_rejects_shape_overflow() {
   let err = MultiArray::zeros(&[usize::MAX, 2], DataType::F32).unwrap_err();
   assert_eq!(

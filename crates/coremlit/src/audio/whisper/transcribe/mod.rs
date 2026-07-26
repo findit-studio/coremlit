@@ -553,6 +553,15 @@ where
             self.tokenizer,
             language,
             options.word_grouping(), // coremlit issue #14; default: swift-parity (#41)
+            options.alignment_gather(), // coremlit issue #41; default: complete
+            // Swift's PHYSICAL `alignmentWeights` height
+            // (`kvCacheMaxSequenceLength`, `TextDecoder.swift:141`), which is
+            // one row SHORTER than the view above -- this port commits step
+            // `position`'s row at `position + 1` and so allocates
+            // `max_token_context + 1`. Only `SwiftParity` reads it, and it
+            // must be Swift's height or the pitch probe describes a surface
+            // Swift never allocated (whisper #41, codex round 3, F2).
+            self.backend.dims().max_token_context(),
             previous_seek,
             PREPEND_PUNCTUATION,
             APPEND_PUNCTUATION,

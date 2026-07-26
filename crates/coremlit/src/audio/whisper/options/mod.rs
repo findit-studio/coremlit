@@ -305,6 +305,292 @@ impl core::str::FromStr for WordGrouping {
 }
 
 // ---------------------------------------------------------------------
+// AlignmentGather
+// ---------------------------------------------------------------------
+
+/// How a window's per-token cross-attention rows are gathered into the
+/// matrix DTW runs over (coremlit issue #41). Rust-only: Swift has no such
+/// switch — it has exactly one gather, and that gather silently drops the
+/// tail of its final row.
+///
+/// **[`Self::Complete`] is the default; [`Self::SwiftParity`] is an opt-in
+/// that fails closed.** `Complete` is the numerically correct gather and has
+/// no platform dependency at all. `SwiftParity` reproduces a Swift defect
+/// whose behavior rests on unspecified CoreVideo layout, so it carries three
+/// stated assumptions (A1–A3, enumerated on that variant) and refuses
+/// outright on any layout it cannot describe. Correct everywhere by default;
+/// bit-parity for callers who explicitly ask and accept the constraint.
+///
+/// # What Swift actually does, and why the two variants differ at all
+///
+/// `SegmentSeeker.addWordTimestamps` (`SegmentSeeker.swift:444-461`) copies
+/// the gathered rows by hand. It binds both arrays' stride vectors
+/// (`weightsStride`/`filteredWeightsStride`) and then ignores them, using
+/// `columnCount` — the *logical* column count, 1500 for a 30 s window — as
+/// the row pitch on the source and on the destination alike. That is correct
+/// only while storage pitch equals column count, and for WhisperKit's
+/// Float16 arrays it does not: every one of them is allocated through
+/// `MLMultiArray(shape:dataType:initialValue:)`
+/// (`ArgmaxCore/MLMultiArrayExtensions.swift:11-53`), which for `.float16`
+/// backs the array with an IOSurface `CVPixelBuffer` (`:121-136`,
+/// `kCVPixelFormatType_OneComponent16Half`), and CoreVideo pads every row out
+/// to a **platform-chosen** boundary. (The plain `MLMultiArray(shape:dataType:)`
+/// initializer is contiguous; the padding belongs to the pixel-buffer path,
+/// and the pixel-buffer path is the one WhisperKit takes.)
+///
+/// How much padding is a property of the host, not of this code: Apple's
+/// QA1829 states `CVPixelBuffer` row alignment varies by hardware and must be
+/// queried, and [`MultiArray::f16_surface`](crate::MultiArray::f16_surface)
+/// documents the same. So this port **measures** it at run time, allocating
+/// the identical Float16 surfaces Swift's gather allocates and reading back
+/// CoreVideo's own strides (`segment::coreml_f16_row_pitch`); nothing below
+/// is compiled in. There are TWO such surfaces and they are probed
+/// separately — the once-allocated `[max_token_context + 1, cols]` source
+/// (`TextDecoder.swift:141`) and the per-call `[N, cols]` destination
+/// (`SegmentSeeker.swift:450`) — because "the pitch does not depend on the
+/// row count" is something this host was measured to do, not something
+/// CoreVideo promises. On the reference host for whisper #41 (M1 Max, macOS
+/// 26.5) rows align to 64 bytes — 32 Float16 elements — so `cols = 1500` is
+/// stored at a pitch of 1504 at every height, and that is the layout every
+/// worked example here uses.
+///
+/// Two errors follow:
+///
+/// 1. Swift's `filteredIndices` are `0..<N` by construction, so both sides'
+///    offsets are `index * columnCount` and the copies tile contiguously:
+///    destination STORAGE offset `o` ends up holding source STORAGE offset
+///    `o`, for every `o < N * cols`. (Contiguous *storage* offsets — the
+///    logical rows they land on depend on each surface's own pitch.)
+/// 2. `dynamicTimeWarping` then reads `matrix[(row - 1) * numberOfColumns +
+///    (column - 1)]` (`SegmentSeeker.swift:217`) through `MLMultiArray`'s
+///    flat subscript, which *is* stride-aware — so logical row `r` reads
+///    destination storage `[r * dst_pitch, r * dst_pitch + cols)`.
+///
+/// **When the two pitches agree** the errors annihilate wherever that read
+/// window still lies inside the copied prefix, and the gather reduces to a
+/// truncation: row `r` is cut exactly when `r * pitch + cols > N * cols`,
+/// overrunning into destination storage the `initialValue:` fill never
+/// covered either — that fill covers only the logical `count`. Per row:
+///
+/// ```text
+/// kept = min(cols, N * cols - r * pitch)   // saturating at 0
+/// ```
+///
+/// Only the LAST row can be affected while `cols >= (N - 2) * (pitch - cols)`.
+/// That is a property of the shipping shape and the reference host's pitch,
+/// not a general one: it holds for every real Whisper model (`cols =
+/// n_audio_ctx = 1500`, measured `pitch = 1504`, `N <= 224`, so reaching the
+/// second-to-last row would take `N > 377`), and fails at the small
+/// `n_audio_ctx` a test backend can configure, where a run of whole rows goes
+/// — hence the general per-row form above rather than a last-row special
+/// case. At `N = 120`, `cols = 1500`, `pitch = 1504` the final row keeps 1024
+/// columns and reads the remaining 476 out of storage nothing ever wrote.
+///
+/// **When they disagree** it is not a truncation at all: row `r` reads a
+/// SHIFTED window of the source, splicing the tail of one logical row onto
+/// the head of the next across the source's own (zero) padding. `segment::
+/// gather_swift_rows` reproduces that general mapping rather than the
+/// equal-pitch special case, so a host whose CoreVideo pitches the two
+/// heights differently gets Swift's actual DTW input instead of a silently
+/// wrong "parity".
+///
+/// Every measured number above is probed — see
+/// `probe_alignment_stride.swift`/`.out` under
+/// `crates/coremlit/tests/whisper_swift_probes/`. A host whose CoreVideo does
+/// not pad `cols` at all measures `pitch == cols` for both surfaces, which
+/// makes [`Self::SwiftParity`] identical to [`Self::Complete`] there —
+/// correctly, because Swift's gather then has nothing to disturb either.
+#[derive(
+  Debug, Default, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display, derive_more::IsVariant,
+)]
+#[display("{}", self.as_str())]
+#[non_exhaustive]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+pub enum AlignmentGather {
+  /// Swift's gather reproduced deliberately, truncated final row and all
+  /// (`kept` columns per the type's own doc — 1024 of 1500 on a full
+  /// 120-token window at the reference host's measured pitch, the rest
+  /// zero).
+  ///
+  /// **Opt-in, and it fails closed.** That one row's tail is an input to the
+  /// DTW path, and the path is what the last word's end — and through it the
+  /// segment's end, and the **next window's seek** — is read off. Being an
+  /// input is not the same as moving the output; where it does move, it
+  /// **can** compound across windows, so a gather that keeps the row in full
+  /// can be "more correct" and still put the pipeline on windows Swift never
+  /// used. That is what the long-form measurement found: against official
+  /// Swift on the pinned model, the 1417 s fixture cost 984 words of edit
+  /// distance and an entire extra window (52 against Swift's 51) under
+  /// [`Self::Complete`], and matched token-for-token under this variant. That
+  /// is what this variant is for, and the only thing it is for.
+  ///
+  /// # The three assumptions this mode carries
+  ///
+  /// Reproducing a defect whose behavior rests on unspecified CoreVideo
+  /// layout means reproducing its unspecified parts too. Three of them are
+  /// **assumed, not established**, and none of them is contractual. They are
+  /// listed here rather than buried because opting in means accepting them.
+  ///
+  /// **A1 — layout determinism.** The pitches are measured by allocating the
+  /// same Float16 IOSurface Swift's gather allocates and reading CoreVideo's
+  /// strides back (`segment::coreml_f16_row_pitch`). That establishes the
+  /// pitch of *this port's* allocation. Nothing in CoreVideo promises two
+  /// allocations of one shape share a layout, and Swift's allocation lives in
+  /// another process this port cannot observe. *Would settle it:* a published
+  /// guarantee that row alignment is a pure function of pixel format and
+  /// dimensions. Apple's QA1829 requires the value to be queried per buffer,
+  /// which is the opposite posture.
+  ///
+  /// **A2 — fresh-allocation zero fill.** `dynamicTimeWarping` reads
+  /// destination storage past the gather's copied prefix; Swift's
+  /// `initialValue: FloatType(0)` fill covers only the logical `count` and
+  /// the `memcpy` covers only that same prefix, so those cells are whatever
+  /// `CVPixelBufferCreate` returned. This mode substitutes **zero**. No part
+  /// of CoreVideo promises a fresh IOSurface-backed buffer is zeroed —
+  /// `IOSurfaceSetPurgeable(kIOSurfacePurgeableEmpty)` explicitly makes
+  /// contents undefined, which is hard to reconcile with an implicit
+  /// always-zero guarantee. A previous revision claimed to *verify* this by
+  /// sampling a freshly allocated surface's tail; that was wrong twice over —
+  /// reading those bytes was undefined behavior, and one clean allocation
+  /// says nothing about a different, possibly reused one. Both the reading
+  /// and the claim are gone. *Would settle it:* a documented IOSurface/
+  /// CoreVideo initialization guarantee, or an in-process handle on the
+  /// exact allocation Swift gathered into — neither exists.
+  ///
+  /// **A3 — layout stability across mutable access.** The reproduction reads
+  /// the source array's inter-row padding as zero. Construction does zero it
+  /// (the `initialValue:` fill runs over the LOGICAL count, flat, so storage
+  /// `[0, src_rows * cols)` starts zero, padding included) and its only
+  /// writer, `TextDecoder.updateAlignmentWeights` (`:272-295`), is
+  /// stride-aware. But writer and gather both reach the array through
+  /// `withUnsafeMutableBytes`, whose contract states the strides handed to
+  /// the closure may differ from the value before invocation — so no cited
+  /// contract rules out a relayout or a replacement of the backing storage
+  /// introducing padding that construction never zeroed. *Would settle it:* a
+  /// lifecycle-equivalent native probe at the exact 224-row source height —
+  /// repeated stride-aware writes, then a gather-style access, recording the
+  /// closure strides and the gather-reachable padding each time — and even
+  /// that would be one host's observation, not a contract.
+  ///
+  /// **Consequence.** This variant claims parity **only where A1–A3 hold**.
+  /// It does not detect their violation; where the layout is one this port
+  /// cannot describe at all it refuses outright
+  /// ([`SegmentError::AlignmentPitchUnavailable`](crate::audio::whisper::error::SegmentError::AlignmentPitchUnavailable),
+  /// [`AlignmentPitchUnexpectedLayout`](crate::audio::whisper::error::SegmentError::AlignmentPitchUnexpectedLayout))
+  /// rather than guessing. On a host whose CoreVideo does not pad at all,
+  /// A2 and A3 are vacuous and this variant equals [`Self::Complete`].
+  ///
+  /// # Short-form
+  ///
+  /// The gather runs on **every** word-timestamp window, with no long-form
+  /// guard and no subsequent-window guard (Swift has none either, so a guard
+  /// would itself be a deviation), and the truncation is real on a single
+  /// window: on jfk/tiny, 30 gathered rows over 1500 columns at the measured
+  /// pitch of 1504 leave the final row keeping 1384 of them.
+  ///
+  /// **Established.** On `jfk.wav` / `openai_whisper-tiny`, under the pinned
+  /// oracle options, this variant and [`Self::Complete`] produce the same 22
+  /// words, and that list matches official Swift exactly — text, start, end,
+  /// probability and token ids, no epsilon — as do the segment seeks and
+  /// bounds. The integration test
+  /// `jfk_tiny_word_timestamps_match_swift_and_this_clip_is_gather_invariant`
+  /// (`crates/coremlit/tests/whisper/parity_jfk.rs`) pins both halves.
+  ///
+  /// **Not established: that short-form output is invariant in general.** It
+  /// is not, and a previous revision of this doc said it was. Gather
+  /// selection can move a word's end — and with it the segment's end —
+  /// **inside a single window**, which this branch's own fixtures measure.
+  /// Over ONE `add_word_timestamps` call, with no seek, no second window and
+  /// no cascade of any kind, the last word's end and the segment's end come
+  /// out **0.88 s under [`Self::Complete`] against 1.58 s under this
+  /// variant**
+  /// (`segment::tests::swift_parity_gather_truncates_final_alignment_row`).
+  /// End to end, a run diverges in its **first** window — same audio, same
+  /// decoded script, `seek` 0 under both — at **0.88 s against 1.18 s**,
+  /// which is what then places window 2 at a different sample offset
+  /// (`transcribe::tests`'
+  /// `swift_parity_gather_moves_the_first_windows_end_and_the_next_seek`).
+  /// Both fixtures drive constructed alignment matrices rather than a real
+  /// decode's, so neither says that some particular clip diverges; what they
+  /// establish is that nothing about a short clip exempts it. **A caller who
+  /// changes this knob for a short clip can receive different word and
+  /// segment timestamps.**
+  ///
+  /// *Would settle it:* Swift-oracle word goldens over a corpus — several
+  /// clips, models and window occupancies — characterizing when a real
+  /// decode's DTW path is sensitive to the truncated tail. One clip's
+  /// insensitivity is one clip's, and the mechanism predicts no other.
+  /// Until that exists, the supportable reading is that the two variants may
+  /// differ on any word-timestamp window, and jfk/tiny is the one where they
+  /// are measured not to.
+  SwiftParity,
+  /// Gather every row in full — no truncation.
+  ///
+  /// **The default.** It is the numerically correct gather: it feeds DTW
+  /// everything the model actually produced, which is what the code appears
+  /// to promise and what a caller who wants this port's best word timings
+  /// should get without asking.
+  ///
+  /// Just as decisively, it is the gather with **nothing to assume**. It
+  /// allocates no IOSurface, measures no row pitch, inspects no storage past
+  /// what it wrote, and executes no `unsafe`; none of A1–A3 on
+  /// [`Self::SwiftParity`] applies to it, and no property of the host can
+  /// move its output. A default whose behavior depends on unspecified
+  /// CoreVideo layout is a defect surface for every caller, including every
+  /// caller who never heard of this knob — and three review rounds each
+  /// uncovered a further unspecified layer under the previous one. So the
+  /// correct-everywhere gather is what a caller gets by default, and
+  /// bit-parity with a Swift defect is what a caller opts into, having
+  /// accepted the constraint.
+  ///
+  /// It does **not reproduce Swift's gather**: it measures no row pitch and
+  /// truncates nothing. That is unconditional, and it is a claim about the
+  /// algorithm rather than about the output — so this variant is **not
+  /// guaranteed** to track Swift's output, and where it has been measured
+  /// against official Swift it has gone both ways. On the 1417 s long-form
+  /// fixture it diverged: 984 words of edit distance and an extra window (see
+  /// [`Self::SwiftParity`] for those numbers). On `jfk.wav` /
+  /// `openai_whisper-tiny`, under the pinned oracle options, it matched
+  /// official Swift word for word, exactly as [`Self::SwiftParity`] did. Each
+  /// result is that fixture's and that model's, not a rule for long or short
+  /// audio generally; short form carries no exemption either, and that
+  /// variant's "Short-form" section states what is and is not established
+  /// there. On a host whose CoreVideo does not pad, the two variants are one
+  /// gather and the question does not arise.
+  #[default]
+  Complete,
+}
+
+impl AlignmentGather {
+  /// Stable snake_case name of the variant.
+  #[inline(always)]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::SwiftParity => "swift_parity",
+      Self::Complete => "complete",
+    }
+  }
+}
+
+/// Error parsing an [`AlignmentGather`] name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[error("unknown alignment gather name")]
+pub struct ParseAlignmentGatherError(());
+
+impl core::str::FromStr for AlignmentGather {
+  type Err = ParseAlignmentGatherError;
+
+  fn from_str(s: &str) -> Result<Self, Self::Err> {
+    Ok(match s {
+      "swift_parity" => Self::SwiftParity,
+      "complete" => Self::Complete,
+      _ => return Err(ParseAlignmentGatherError(())),
+    })
+  }
+}
+
+// ---------------------------------------------------------------------
 // DecodingOptions
 // ---------------------------------------------------------------------
 
@@ -493,21 +779,39 @@ pub(crate) mod finite_f32_vec {
 }
 
 /// Decode-time configuration: Swift's 27-knob `DecodingOptions` surface
-/// (spec §6.2), plus three Rust-only additions — [`Self::seed`], for
+/// (spec §6.2), plus four Rust-only additions — [`Self::seed`], for
 /// reproducible temperature-fallback sampling (coremlit issue #9; see the
-/// crate root's "Reproducibility and provenance" docs), and, from coremlit
-/// issue #14, [`Self::drop_blank_audio`] (the post-decode blank-audio
+/// crate root's "Reproducibility and provenance" docs), from coremlit
+/// issue #14 [`Self::drop_blank_audio`] (the post-decode blank-audio
 /// segment filter) and [`Self::word_grouping`] (the explicit CJK
-/// word-grouping mode). `new()`/`Default` apply Swift's defaults verbatim
-/// for every ported knob; `seed` defaults unset (`None`), matching today's
-/// OS-seeded behavior exactly, and `word_grouping` defaults to Swift's own
-/// grouping (coremlit issue #41).
+/// word-grouping mode), and from coremlit issue #41
+/// [`Self::alignment_gather`] (how the per-token alignment rows are gathered
+/// before DTW). `new()`/`Default` apply Swift's defaults verbatim for every
+/// ported knob; `seed` defaults unset (`None`), matching today's OS-seeded
+/// behavior exactly, and `word_grouping` defaults to Swift's own behavior
+/// (coremlit issue #41).
 ///
-/// **One knob's default deliberately diverges from Swift, with an exact parity
-/// escape hatch** — it is the only such deviation; every other default here is
-/// Swift's. [`Self::drop_blank_audio`] defaults `true`, dropping the
-/// `[BLANK_AUDIO]` segments Swift emits (a product decision, with `false` the
-/// exact parity escape hatch). [`Self::word_grouping`] defaults to
+/// **Exactly TWO knobs' defaults deliberately diverge from Swift, each with an
+/// exact-parity escape hatch** — they are the only such deviations; every other
+/// default here is Swift's.
+///
+/// 1. [`Self::drop_blank_audio`] defaults `true`, dropping the `[BLANK_AUDIO]`
+///    segments Swift emits (a product decision, with `false` the exact-parity
+///    escape hatch).
+/// 2. [`Self::alignment_gather`] defaults to [`AlignmentGather::Complete`],
+///    which gathers every alignment row in full where Swift's stride-ignoring
+///    gather truncates the last one. `Complete` is the numerically correct
+///    gather and depends on no property of the host;
+///    [`AlignmentGather::SwiftParity`] replicates the truncation — the
+///    mechanism behind the long-form divergence of coremlit issue #41 — and is
+///    the exact-parity escape hatch, opt-in because its behavior rests on
+///    unspecified CoreVideo layout (see that variant's stated assumptions
+///    A1–A3). Long-form is where the divergence was *measured*, not where the
+///    mechanism is confined: it runs on every word-timestamp window, and can
+///    move timestamps within a single short-form one — see that variant's
+///    "Short-form" section.
+///
+/// [`Self::word_grouping`] is NOT one of them: it defaults to
 /// [`WordGrouping::SwiftParity`] — Swift's own Chinese/Cantonese
 /// space-fallthrough grouping (coremlit issue #41, reversing the #11 pin,
 /// user-approved) — while [`WordGrouping::FineGrained`] is the product-quality
@@ -712,6 +1016,13 @@ pub struct DecodingOptions {
   /// product-quality opt-in.
   #[cfg_attr(feature = "serde", serde(default))]
   word_grouping: WordGrouping,
+  /// How the per-token alignment rows are gathered before DTW. Defaults to
+  /// [`AlignmentGather::Complete`], the un-truncated, platform-independent
+  /// gather (coremlit issue #41; serde follows via the enum's `Default`).
+  /// [`AlignmentGather::SwiftParity`] is the fail-closed opt-in that
+  /// reproduces Swift's truncating gather.
+  #[cfg_attr(feature = "serde", serde(default))]
+  alignment_gather: AlignmentGather,
 }
 
 /// Names every field of [`DecodingOptions`] exactly once, generating (for
@@ -779,6 +1090,7 @@ decoding_option_field_names!(
   verbose,
   drop_blank_audio,
   word_grouping,
+  alignment_gather,
 );
 
 impl Default for DecodingOptions {
@@ -821,6 +1133,7 @@ impl DecodingOptions {
       verbose: false,
       drop_blank_audio: DEFAULT_DROP_BLANK_AUDIO,
       word_grouping: WordGrouping::SwiftParity,
+      alignment_gather: AlignmentGather::Complete,
     }
   }
 
@@ -1956,6 +2269,69 @@ impl DecodingOptions {
   #[inline(always)]
   pub const fn set_word_grouping(&mut self, word_grouping: WordGrouping) -> &mut Self {
     self.word_grouping = word_grouping;
+    self
+  }
+
+  // -- alignment_gather -----------------------------------------------------
+  /// How the per-token cross-attention rows are gathered into the DTW input
+  /// when [`Self::word_timestamps`] is on (coremlit issue #41).
+  ///
+  /// Defaults to [`AlignmentGather::Complete`]: every row in full, no
+  /// truncation, no IOSurface allocation, no row-pitch measurement and no
+  /// dependence on any property of the host.
+  ///
+  /// [`AlignmentGather::SwiftParity`] is the opt-in. Swift's gather ignores
+  /// its own `MLMultiArray` row strides and indexes both sides by the column
+  /// count, which — against the padded rows CoreVideo gives its Float16
+  /// pixel-buffer backing — silently truncates the final gathered row to its
+  /// first `N * cols - (N - 1) * pitch` columns and leaves the rest reading
+  /// storage nothing wrote. That `pitch` is measured on the running host,
+  /// never assumed; the mode fails closed rather than guess one (see
+  /// [`SegmentError::AlignmentPitchUnavailable`](crate::audio::whisper::error::SegmentError::AlignmentPitchUnavailable)),
+  /// and what it substitutes for the unwritten storage is a stated assumption
+  /// rather than an observation. See [`AlignmentGather`]'s own doc for the
+  /// mechanism, the cited Swift lines, the three assumptions the opt-in
+  /// carries, and why it was the truncated row — not the complete one — that
+  /// held the 1417 s fixture on Swift's own windows.
+  ///
+  /// Inert unless [`Self::word_timestamps`] is set: the gather only runs
+  /// inside the DTW alignment pass. Unlike [`Self::word_grouping`], though,
+  /// its reach is not confined to a segment's words — changing it **can**
+  /// move a word's end, and with it the segment's end, the next window's seek
+  /// and the rest of the transcript. It applies to **every** word-timestamp
+  /// window, including a single-window short-form clip with no seek cascade
+  /// to accumulate — matching Swift, which has no such guard either — so
+  /// short form is not exempt.
+  ///
+  /// Whether it *does* move anything on a given clip is that clip's measured
+  /// result, not something the mechanism settles in advance. Measured: over
+  /// one `add_word_timestamps` call the two variants put the last word's end,
+  /// and the segment's, at 0.88 s against 1.58 s (`segment::tests`'
+  /// `swift_parity_gather_truncates_final_alignment_row`); end to end they
+  /// move a first window's end and the seek taken from it (`transcribe::
+  /// tests`' `swift_parity_gather_moves_the_first_windows_end_and_the_next_seek`);
+  /// and on `jfk.wav` / `openai_whisper-tiny` they instead agree word for
+  /// word and both match official Swift
+  /// (`jfk_tiny_word_timestamps_match_swift_and_this_clip_is_gather_invariant`,
+  /// `crates/coremlit/tests/whisper/parity_jfk.rs`). Each of those tests pins
+  /// the measured output of its own fixture and nothing wider; see also
+  /// [`AlignmentGather::SwiftParity`]'s "Short-form" section for the
+  /// established / not-established split and what would settle it.
+  #[inline(always)]
+  pub const fn alignment_gather(&self) -> AlignmentGather {
+    self.alignment_gather
+  }
+  /// Builder form of [`Self::set_alignment_gather`].
+  #[must_use]
+  #[inline(always)]
+  pub const fn with_alignment_gather(mut self, alignment_gather: AlignmentGather) -> Self {
+    self.set_alignment_gather(alignment_gather);
+    self
+  }
+  /// Sets [`Self::alignment_gather`] in place.
+  #[inline(always)]
+  pub const fn set_alignment_gather(&mut self, alignment_gather: AlignmentGather) -> &mut Self {
+    self.alignment_gather = alignment_gather;
     self
   }
 }

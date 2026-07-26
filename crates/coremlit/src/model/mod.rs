@@ -2,7 +2,7 @@
 
 use std::path::{Path, PathBuf};
 
-use objc2::rc::Retained;
+use objc2::rc::{Retained, autoreleasepool};
 use objc2_core_ml::{MLDictionaryFeatureProvider, MLModel, MLModelConfiguration};
 use objc2_foundation::NSURL;
 
@@ -206,18 +206,55 @@ impl Model {
 
   /// Runs a synchronous prediction.
   ///
+  /// # Autorelease pool
+  ///
+  /// The whole body runs inside an [`autoreleasepool`], and so do
+  /// [`Self::predict_with`] and [`Self::predict_with_state`]. These three
+  /// are the only places this crate crosses into CoreML's prediction API,
+  /// and every kit — whisper, speaker, siglip, granite, clap, vad, ced,
+  /// align — reaches the ANE through one of them, so draining here bounds
+  /// every consumer at once rather than one caller's loop.
+  ///
+  /// A pool is needed because a Rust binary has no ambient one. Objective-C
+  /// hosts get theirs from the run loop or from the `@autoreleasepool` the
+  /// caller writes; a plain `main` has neither, and libobjc's response to
+  /// an `autorelease` with no pool in place is to install a first page and
+  /// accumulate into it *for the lifetime of the process* — nothing ever
+  /// pops it. Every object CoreML autoreleases per prediction (and every
+  /// one this crate's own bridging autoreleases: the `MLFeatureValue`s
+  /// `provider_from_pairs` builds, the `NSArray` shape/stride reads behind
+  /// [`MultiArray`], the `NSString` names `Features::from_provider`
+  /// converts) therefore stays live until the process exits. That is
+  /// coremlit issue #62: the live count grows strictly with the number of
+  /// predictions, so a long-form transcription's footprint is a function of
+  /// audio length with no ceiling.
+  ///
+  /// **Draining does not invalidate anything this returns.** [`Features`]
+  /// owns its arrays through `Retained<MLMultiArray>` — a `+1` strong
+  /// reference that is entirely independent of the pool's — and
+  /// [`PredictionError`] carries only owned `String`/`isize`
+  /// ([`NsErrorInfo`]). Nothing pool-bound can escape by construction
+  /// either: [`autoreleasepool`]'s bound is
+  /// `for<'pool> F: FnOnce(AutoreleasePool<'pool>) -> T`, so `T` is chosen
+  /// independently of `'pool` and a `&T` borrowed from the pool token
+  /// cannot appear in the return type. This crate never calls the borrowing
+  /// APIs (`Retained::autorelease*`) that would produce such a reference in
+  /// the first place — the token is ignored at all three sites.
+  ///
   /// # Errors
   /// [`PredictionError::Native`] if CoreML fails; missing/mistyped outputs
   /// surface as structured variants when extracted;
   /// [`PredictionError::AliasCopyFailed`] if de-aliasing an output that
   /// shared a buffer with an input (or another output) fails.
   pub fn predict(&self, inputs: &Features) -> Result<Features, PredictionError> {
-    let provider = inputs.to_provider()?;
-    // Seed with every input's buffer identity: inputs outlive this call (the
-    // caller still owns `inputs`), so an identity/zero-copy model echoing
-    // one back as an output is the same aliasing hazard as two output names
-    // sharing one array, which `from_provider` also catches on its own.
-    self.predict_from_provider(&provider, inputs.byte_ranges())
+    autoreleasepool(|_| {
+      let provider = inputs.to_provider()?;
+      // Seed with every input's buffer identity: inputs outlive this call (the
+      // caller still owns `inputs`), so an identity/zero-copy model echoing
+      // one back as an output is the same aliasing hazard as two output names
+      // sharing one array, which `from_provider` also catches on its own.
+      self.predict_from_provider(&provider, inputs.byte_ranges())
+    })
   }
 
   /// Runs a synchronous prediction from borrowed inputs.
@@ -244,13 +281,20 @@ impl Model {
   /// the aliasing detector either way.
   ///
   /// # Errors
-  /// As [`Self::predict`].
+  /// As [`Self::predict`], whose `# Autorelease pool` section also covers
+  /// this method's pool.
   pub fn predict_with(&self, inputs: &[(&str, &MultiArray)]) -> Result<Features, PredictionError> {
-    let provider = crate::features::provider_from_pairs(inputs.iter().copied())?;
-    // As in `predict`: these borrowed inputs outlive this call too (the
-    // caller still owns each array), so seed `known_regions` the same way.
-    let known_regions = inputs.iter().map(|(_, a)| a.byte_range()).collect();
-    self.predict_from_provider(&provider, known_regions)
+    // Per-prediction pool: see `predict`'s `# Autorelease pool`. This is the
+    // per-step decoder entry, so it is also the site the accumulation scales
+    // with — one pool per prediction, not one per window, is what keeps the
+    // live count flat across a transcription of any length.
+    autoreleasepool(|_| {
+      let provider = crate::features::provider_from_pairs(inputs.iter().copied())?;
+      // As in `predict`: these borrowed inputs outlive this call too (the
+      // caller still owns each array), so seed `known_regions` the same way.
+      let known_regions = inputs.iter().map(|(_, a)| a.byte_range()).collect();
+      self.predict_from_provider(&provider, known_regions)
+    })
   }
 
   // Shared prediction tail for `predict`/`predict_with`: runs
@@ -348,6 +392,10 @@ impl Model {
   /// [`PredictionError::Native`] on CoreML failure;
   /// [`PredictionError::AliasCopyFailed`] if de-aliasing an output that
   /// shared a buffer with an input (or another output) fails.
+  ///
+  /// The body runs inside an [`autoreleasepool`] for the same reason
+  /// [`Self::predict`]'s does; `state` is mutated in place and outlives the
+  /// pool as a `Retained<MLState>`, so the drain does not touch it.
   pub fn predict_with_state(
     &self,
     inputs: &Features,
@@ -356,19 +404,21 @@ impl Model {
     if !self.supports_state() {
       return Err(PredictionError::StateUnsupported);
     }
-    let provider = inputs.to_provider()?;
-    // SAFETY: provider + state are live; &mut state gives exclusivity.
-    let outputs = unsafe {
-      self.inner.predictionFromFeatures_usingState_error(
-        objc2::runtime::ProtocolObject::from_ref(&*provider),
-        state.raw(),
-      )
-    }
-    .map_err(|e| PredictionError::Native(NsErrorInfo::from_ns_error(&e)))?;
-    // See `predict`'s comment: inputs outlive this call, so seed known_regions
-    // with their buffer identities too.
-    let mut known_regions = inputs.byte_ranges();
-    Features::from_provider(&outputs, &mut known_regions)
+    autoreleasepool(|_| {
+      let provider = inputs.to_provider()?;
+      // SAFETY: provider + state are live; &mut state gives exclusivity.
+      let outputs = unsafe {
+        self.inner.predictionFromFeatures_usingState_error(
+          objc2::runtime::ProtocolObject::from_ref(&*provider),
+          state.raw(),
+        )
+      }
+      .map_err(|e| PredictionError::Native(NsErrorInfo::from_ns_error(&e)))?;
+      // See `predict`'s comment: inputs outlive this call, so seed known_regions
+      // with their buffer identities too.
+      let mut known_regions = inputs.byte_ranges();
+      Features::from_provider(&outputs, &mut known_regions)
+    })
   }
 }
 

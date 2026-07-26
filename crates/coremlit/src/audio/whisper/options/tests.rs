@@ -45,6 +45,12 @@ fn decoding_defaults_match_swift() {
   // Swift's own grouping (space-fallthrough for zh/yue); FineGrained is the
   // #11-pinned fine-grained CJK opt-in.
   assert_eq!(o.word_grouping(), WordGrouping::SwiftParity);
+  // Rust-only addition (coremlit issue #41). Swift has no gather knob either
+  // — it has one gather, whose stride-ignoring memcpy truncates the final
+  // alignment row. The default is the un-truncated, platform-independent
+  // `Complete`; `SwiftParity` is the fail-closed opt-in that replicates the
+  // truncation (owner decision, round 3).
+  assert_eq!(o.alignment_gather(), AlignmentGather::Complete);
   assert_eq!(DecodingOptions::default(), DecodingOptions::new());
 }
 
@@ -78,19 +84,19 @@ fn drop_blank_audio_defaults_on_and_opts_out_to_swift_parity() {
 }
 
 #[test]
-fn swift_parity_option_deviations_are_exactly_one() {
+fn swift_parity_option_deviations_are_exactly_two() {
   // Executable form of the DecodingOptions doc contract (`options/mod.rs`):
   // `new()` diverges from Swift's `Configurations.swift` defaults in EXACTLY
-  // one knob, with an exact-parity escape hatch; every other ported default
-  // equals Swift's. (whisper #41 §3 P2 — the token-leak refutation's
+  // two knobs, each with an exact-parity escape hatch; every other ported
+  // default equals Swift's. (whisper #41 §3 P2 — the token-leak refutation's
   // parity-recipe lock. The behavioral consequences are already pinned by
   // `word_timestamps_drop_cleared_reproduces_swifts_duplicate_ids` and
   // `word_grouping_splits_chinese_and_only_chinese`; this locks the recipe.)
   let o = DecodingOptions::new();
 
-  // Deviation 1 (the only one) — `drop_blank_audio` defaults `true` (Swift
-  // emits `[BLANK_AUDIO]`); `maybe_drop_blank_audio(false)` is the
-  // exact-parity escape hatch.
+  // Deviation 1 — `drop_blank_audio` defaults `true` (Swift emits
+  // `[BLANK_AUDIO]`); `maybe_drop_blank_audio(false)` is the exact-parity
+  // escape hatch.
   assert!(o.drop_blank_audio());
   assert!(
     !DecodingOptions::new()
@@ -106,6 +112,19 @@ fn swift_parity_option_deviations_are_exactly_one() {
       .with_word_grouping(WordGrouping::FineGrained)
       .word_grouping()
       .is_fine_grained()
+  );
+  // Deviation 2 — `alignment_gather` defaults to the un-truncated `Complete`
+  // where Swift's stride-ignoring gather truncates the final alignment row
+  // (owner decision, round 3 of the #41 review: `Complete` is numerically
+  // correct and carries no platform dependency, so it is what a caller gets
+  // without asking). `with_alignment_gather(SwiftParity)` is the exact-parity
+  // escape hatch, opt-in and fail-closed.
+  assert_eq!(o.alignment_gather(), AlignmentGather::Complete);
+  assert!(
+    DecodingOptions::new()
+      .with_alignment_gather(AlignmentGather::SwiftParity)
+      .alignment_gather()
+      .is_swift_parity()
   );
 
   // The parity-relevant Swift-equal defaults the refutation rests on: the
@@ -198,6 +217,13 @@ fn enums_round_trip_and_display() {
   assert_eq!(WordGrouping::FineGrained.to_string(), "fine_grained");
   assert_eq!(WordGrouping::SwiftParity.as_str(), "swift_parity");
   assert!("bogus".parse::<WordGrouping>().is_err());
+
+  for g in [AlignmentGather::SwiftParity, AlignmentGather::Complete] {
+    assert_eq!(g.as_str().parse::<AlignmentGather>().unwrap(), g);
+  }
+  assert_eq!(AlignmentGather::Complete.to_string(), "complete");
+  assert_eq!(AlignmentGather::SwiftParity.as_str(), "swift_parity");
+  assert!("bogus".parse::<AlignmentGather>().is_err());
 }
 
 #[test]
@@ -237,6 +263,53 @@ fn word_grouping_serde_omitted_stays_swift_parity() {
 
   for wanted in [WordGrouping::FineGrained, WordGrouping::SwiftParity] {
     let options = DecodingOptions::new().with_word_grouping(wanted);
+    let json = serde_json::to_string(&options).unwrap();
+    assert_eq!(
+      serde_json::from_str::<DecodingOptions>(&json).unwrap(),
+      options
+    );
+  }
+}
+
+#[test]
+fn alignment_gather_defaults_to_complete() {
+  // The round-3 owner decision, pinned: a caller who never mentions the gather
+  // gets the numerically correct, platform-independent `Complete` — no
+  // IOSurface allocation, no row-pitch measurement, no assumption about this
+  // host — and reaches Swift's truncating gather only by naming it.
+  assert_eq!(AlignmentGather::default(), AlignmentGather::Complete);
+  assert_eq!(
+    DecodingOptions::new().alignment_gather(),
+    AlignmentGather::Complete
+  );
+  assert!(DecodingOptions::new().alignment_gather().is_complete());
+
+  let built = DecodingOptions::new().with_alignment_gather(AlignmentGather::SwiftParity);
+  assert_eq!(built.alignment_gather(), AlignmentGather::SwiftParity);
+  assert!(built.alignment_gather().is_swift_parity());
+
+  let mut m = DecodingOptions::new();
+  m.set_alignment_gather(AlignmentGather::SwiftParity);
+  assert_eq!(m.alignment_gather(), AlignmentGather::SwiftParity);
+  m.set_alignment_gather(AlignmentGather::Complete);
+  assert_eq!(m.alignment_gather(), AlignmentGather::Complete);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn alignment_gather_serde_omitted_stays_complete() {
+  // An omitted field follows the enum `Default` — Complete, so a config that
+  // never heard of #41 gets the gather with nothing to assume; an explicit
+  // value still wins, including the opt-in one.
+  let omitted: DecodingOptions = serde_json::from_str("{}").unwrap();
+  assert_eq!(omitted.alignment_gather(), AlignmentGather::Complete);
+
+  let parity: DecodingOptions =
+    serde_json::from_str(r#"{"alignment_gather":"swift_parity"}"#).unwrap();
+  assert_eq!(parity.alignment_gather(), AlignmentGather::SwiftParity);
+
+  for wanted in [AlignmentGather::SwiftParity, AlignmentGather::Complete] {
+    let options = DecodingOptions::new().with_alignment_gather(wanted);
     let json = serde_json::to_string(&options).unwrap();
     assert_eq!(
       serde_json::from_str::<DecodingOptions>(&json).unwrap(),

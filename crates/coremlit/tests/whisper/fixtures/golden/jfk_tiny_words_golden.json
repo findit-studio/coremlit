@@ -1,0 +1,255 @@
+{
+  "model": "openai_whisper-tiny",
+  "source": "official Swift WhisperKit (argmax-oss-swift@dcf3a00), captured verbatim on macOS 26.5 / M1 Max; see crates/coremlit/tests/whisper_swift_probes/README.md",
+  "options": "task=transcribe language=nil temperature=0 temperatureFallbackCount=0 usePrefillPrompt=true skipSpecialTokens=true withoutTimestamps=false wordTimestamps=true concurrentWorkerCount=1 chunkingStrategy=none; ModelComputeOptions(audioEncoderCompute: .cpuAndNeuralEngine, textDecoderCompute: .cpuAndNeuralEngine)",
+  "text": "And so my fellow Americans ask not what your country can do for you, ask what you can do for your country.",
+  "language": "en",
+  "totalDecodingLoops": 29,
+  "totalDecodingWindows": 1,
+  "segments": [
+    {
+      "avgLogprob": -0.24543896,
+      "compressionRatio": 1.6271186,
+      "end": 10.46,
+      "id": 0,
+      "seek": 0,
+      "start": 0.32,
+      "temperature": 0,
+      "text": " And so my fellow Americans ask not what your country can do for you, ask what you can do for your country.",
+      "tokens": [
+        50258,
+        50259,
+        50359,
+        50364,
+        400,
+        370,
+        452,
+        7177,
+        6280,
+        1029,
+        406,
+        437,
+        428,
+        1941,
+        393,
+        360,
+        337,
+        291,
+        11,
+        1029,
+        437,
+        291,
+        393,
+        360,
+        337,
+        428,
+        1941,
+        13,
+        50889,
+        50257
+      ],
+      "words": [
+        {
+          "end": 0.68,
+          "probability": 0.75,
+          "start": 0.32,
+          "tokens": [
+            400
+          ],
+          "word": " And"
+        },
+        {
+          "end": 1.1,
+          "probability": 0.93,
+          "start": 0.68,
+          "tokens": [
+            370
+          ],
+          "word": " so"
+        },
+        {
+          "end": 1.34,
+          "probability": 0.68,
+          "start": 1.1,
+          "tokens": [
+            452
+          ],
+          "word": " my"
+        },
+        {
+          "end": 1.74,
+          "probability": 1,
+          "start": 1.34,
+          "tokens": [
+            7177
+          ],
+          "word": " fellow"
+        },
+        {
+          "end": 2.26,
+          "probability": 0.96,
+          "start": 1.74,
+          "tokens": [
+            6280
+          ],
+          "word": " Americans"
+        },
+        {
+          "end": 3.82,
+          "probability": 0.49,
+          "start": 2.26,
+          "tokens": [
+            1029
+          ],
+          "word": " ask"
+        },
+        {
+          "end": 4.56,
+          "probability": 0.82,
+          "start": 3.82,
+          "tokens": [
+            406
+          ],
+          "word": " not"
+        },
+        {
+          "end": 5.68,
+          "probability": 0.72,
+          "start": 4.56,
+          "tokens": [
+            437
+          ],
+          "word": " what"
+        },
+        {
+          "end": 5.92,
+          "probability": 0.93,
+          "start": 5.68,
+          "tokens": [
+            428
+          ],
+          "word": " your"
+        },
+        {
+          "end": 6.38,
+          "probability": 0.99,
+          "start": 5.92,
+          "tokens": [
+            1941
+          ],
+          "word": " country"
+        },
+        {
+          "end": 6.76,
+          "probability": 0.98,
+          "start": 6.38,
+          "tokens": [
+            393
+          ],
+          "word": " can"
+        },
+        {
+          "end": 6.98,
+          "probability": 0.99,
+          "start": 6.76,
+          "tokens": [
+            360
+          ],
+          "word": " do"
+        },
+        {
+          "end": 7.22,
+          "probability": 0.97,
+          "start": 6.98,
+          "tokens": [
+            337
+          ],
+          "word": " for"
+        },
+        {
+          "end": 8.06,
+          "probability": 0.99,
+          "start": 7.22,
+          "tokens": [
+            291,
+            11
+          ],
+          "word": " you,"
+        },
+        {
+          "end": 8.66,
+          "probability": 0.78,
+          "start": 8.36,
+          "tokens": [
+            1029
+          ],
+          "word": " ask"
+        },
+        {
+          "end": 8.86,
+          "probability": 0.94,
+          "start": 8.66,
+          "tokens": [
+            437
+          ],
+          "word": " what"
+        },
+        {
+          "end": 9.22,
+          "probability": 0.98,
+          "start": 8.86,
+          "tokens": [
+            291
+          ],
+          "word": " you"
+        },
+        {
+          "end": 9.44,
+          "probability": 0.98,
+          "start": 9.22,
+          "tokens": [
+            393
+          ],
+          "word": " can"
+        },
+        {
+          "end": 9.64,
+          "probability": 0.96,
+          "start": 9.44,
+          "tokens": [
+            360
+          ],
+          "word": " do"
+        },
+        {
+          "end": 9.86,
+          "probability": 0.96,
+          "start": 9.64,
+          "tokens": [
+            337
+          ],
+          "word": " for"
+        },
+        {
+          "end": 10.06,
+          "probability": 0.95,
+          "start": 9.86,
+          "tokens": [
+            428
+          ],
+          "word": " your"
+        },
+        {
+          "end": 10.46,
+          "probability": 0.99,
+          "start": 10.06,
+          "tokens": [
+            1941,
+            13
+          ],
+          "word": " country."
+        }
+      ]
+    }
+  ]
+}
