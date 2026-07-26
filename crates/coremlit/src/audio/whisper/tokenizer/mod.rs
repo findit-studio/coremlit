@@ -272,28 +272,90 @@ fn is_single_punctuation_scalar(s: &str) -> bool {
 /// The number rule reaches floats too — not because floats are coerced
 /// (`Config.Data.boolean()` has no `.floating` case at all) but because
 /// `Config`'s decoder tries `Int` *before* `Float` (`Config.swift:657-666`), so
-/// a JSON number whose exact value is an integer `Int` can hold becomes
-/// `.integer` however it was spelled. `1.0` and `1e0` are therefore `true`, and
-/// `0.0`, `-0.0` and `1.5e1` are `false`, while `0.5` (a real fraction) and
-/// `1e19` (past `Int64`) stay `.floating` and yield no value. That ordering was
-/// read off the pinned oracle's own `JSONDecoder` behavior rather than inferred
-/// from the enum, which shows only the second half of it.
+/// a JSON number an `Int` can hold generally becomes `.integer` however it was
+/// spelled. `1.0` and `1e0` are therefore `true`, and `0.0`, `-0.0` and `1.5e1`
+/// are `false`, while `0.5` (a real fraction) and `1e19` (past `Int64`) stay
+/// `.floating` and yield no value. That ordering was read off the pinned
+/// oracle's own `JSONDecoder` behavior rather than inferred from the enum,
+/// which shows only the second half of it.
+///
+/// # Where this stops matching Swift
+///
+/// "However it was spelled" is *not* exact, and the gap is stated here rather
+/// than papered over. `serde_json` keeps a number's spelling only while it fits
+/// `i64`/`u64`; give it a fraction or an exponent and all that survives is an
+/// `f64`, whereas the oracle's decoder reads the digits. The two agree on every
+/// literal an `f64` carries faithfully — which is every value a real
+/// `tokenizer_config.json` holds, `true` and `false` included — and can part
+/// company on one carrying more precision than an `f64` has. What follows is
+/// measured against the pinned oracle rather than predicted, and pinned by
+/// `config_boolean_matches_swift_except_where_the_f64_lost_the_literal`.
+///
+/// **One `f64`, two oracle answers.** Three spellings arrive here as the
+/// identical `f64` `-2^63`:
+///
+/// | JSON scalar              | oracle      | oracle's `boolean()` | this fn      |
+/// |--------------------------|-------------|----------------------|--------------|
+/// | `-9223372036854775808`   | `.integer`  | `Some(false)`        | `Some(false)`|
+/// | `-9223372036854775808.0` | `.floating` | `None`               | `None`       |
+/// | `-9223372036854775809`   | `.floating` | `None`               | `None`       |
+/// | `-9223372036854775807.0` | `.integer`  | `Some(false)`        | **`None`**   |
+///
+/// Rows two to four are one `f64` and two oracle answers, so no rule reading
+/// that `f64` can serve both — the choice is which side to be right on. This
+/// arm decides only where the `f64` settles the question by itself and declines
+/// at `-2^63` exactly, which makes the first three rows exact, row one included
+/// because `serde_json` still holds its bare spelling as an `i64`. Row four is
+/// the residue: a fraction- or exponent-spelled literal whose exact value lies
+/// in `-9223372036854775807 ..= -9223372036854775296`, the 512 integers that
+/// round to `-2^63` from above. The oracle calls those `.integer`, so cleanup
+/// ends up *disabled* there and *enabled* here. The positive edge needs no such
+/// concession: the oracle's own cutoff is `9223372036854775296`, the first
+/// value that rounds up to the `f64` `2^63`, exactly where the upper bound
+/// below already sits.
+///
+/// **Fractions past the precision an `f64` carries.** The same one-eyed view
+/// shows up wherever a literal's digits outrun its `f64`, and the differences
+/// do not all run the same way. Two measured representatives, both pinned:
+/// `1844674407370955162.5` is `.floating` to the oracle (its integer path
+/// gives up just past `1844674407370955161.5`, which is `.integer`) but rounds
+/// to a whole `f64` and is taken here, so cleanup ends up *enabled* in Swift
+/// and *disabled* here — the reverse of the table above. And
+/// `0.9999999999999999` rounds all the way up to the `f64` `1.0`, so this
+/// answers `Some(true)` where the oracle, still seeing a fraction, answers
+/// nothing — which happens to resolve to the same flag, `or: true` being
+/// `true`.
+///
+/// So the honest boundary is not a range but a property: this matches the
+/// oracle wherever the `f64` is faithful to the literal. Beyond that, the list
+/// of representatives above is measured, not exhaustive. In every case
+/// measured, a divergence trades a definite answer for a default rather than
+/// inverting `true` and `false`. Closing any of it would mean keeping the
+/// lexeme — `serde_json`'s `arbitrary_precision`, which changes `Number`'s
+/// representation for every crate in the graph — and then reproducing an
+/// undocumented `JSONDecoder` numeric path exactly. For a config key whose
+/// real-world values are `true` and `false`, that trade is not worth taking.
 fn config_boolean(value: &serde_json::Value) -> Option<bool> {
   match value {
     serde_json::Value::Bool(b) => Some(*b),
     serde_json::Value::Number(n) => match n.as_i64() {
       Some(int) => Some(int == 1),
-      // Written with a fraction or an exponent: `serde_json` keeps the number
-      // a float where Swift's `Int`-first decode does not, so ask the same
-      // question that decode asks — is the exact value an integer `Int` can
-      // hold? If so it is `.integer` in Swift and `== 1` decides; if not it is
-      // `.floating`, which coerces to nothing.
+      // Written with a fraction or an exponent (or past `i64`): the spelling is
+      // gone and only an `f64` is left, so ask the question the `f64` can still
+      // answer — is it an integer strictly inside `Int`'s range? Inside, that
+      // agrees with Swift's `Int`-first decode and `== 1` decides; outside, the
+      // decode's `Int` attempt fails there too and `.floating` coerces to
+      // nothing. `2^63` is excluded because it is past `Int.max`; `-2^63` is
+      // excluded because it is the one `f64` two different Swift answers share,
+      // so declining is the only way to be right about the rest of its cell.
+      // See this function's doc for exactly what that costs and what else the
+      // lost spelling costs.
       None => {
         const INT_MIN: f64 = -9_223_372_036_854_775_808.0; // -2^63
-        const PAST_INT_MAX: f64 = 9_223_372_036_854_775_808.0; // 2^63, exclusive
+        const PAST_INT_MAX: f64 = 9_223_372_036_854_775_808.0; // 2^63
 
         let float = n.as_f64()?;
-        ((INT_MIN..PAST_INT_MAX).contains(&float) && float.fract() == 0.0).then_some(float == 1.0)
+        (float > INT_MIN && float < PAST_INT_MAX && float.fract() == 0.0).then_some(float == 1.0)
       }
     },
     // Swift lowercases (`Config.swift:160`) before matching; `str::to_lowercase`

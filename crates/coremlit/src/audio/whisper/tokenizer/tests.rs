@@ -630,6 +630,10 @@ fn config_boolean_coerces_like_swift() {
     ("0.5", None),
     ("1e19", None),
     ("9223372036854775808", None), // 2^63, one past `Int.max`
+    // The spellings at the edges of `Int`'s range, where this port and the
+    // oracle do not agree everywhere, are tabulated in
+    // `config_boolean_matches_swift_except_where_the_f64_lost_the_literal` instead --
+    // every row of THIS table is a row the two answer alike.
     // `.string`: lowercased (`Config.swift:160`), then two fixed sets.
     (r#""true""#, Some(true)),
     (r#""t""#, Some(true)),
@@ -656,6 +660,105 @@ fn config_boolean_coerces_like_swift() {
       config_boolean(&serde_json::from_str(json).unwrap()),
       expected,
       "value {json}"
+    );
+  }
+}
+
+#[test]
+fn config_boolean_matches_swift_except_where_the_f64_lost_the_literal() {
+  // `serde_json` keeps a number's spelling only while it fits `i64`/`u64`. A
+  // fraction or an exponent leaves an `f64`, while the oracle's decoder reads
+  // the digits, so a literal carrying more precision than an `f64` holds can
+  // land differently on the two sides. This table carries BOTH columns -- what
+  // the pinned oracle answers and what this port answers -- so the residue is
+  // visible rather than asserted away.
+  //
+  // The oracle column was measured the same way the other tables were --
+  // compiling its `Config.swift` and `BinaryDistinct.swift` against
+  // `JSONDecoder` and reading back `Config.boolean()` -- not predicted from
+  // this port. `9223372036854775296` and `9223372036854775807` are the two
+  // magnitudes the oracle actually flips at near `Int`'s edge, and
+  // `1844674407370955161` the one it flips at for a nonzero fraction; all
+  // three were found by sweeping magnitudes, not by modelling the decoder.
+  //
+  // A row where the two columns differ is not automatically a gate that moves:
+  // `or: true` can absorb the difference. The rows where the RESOLVED flag
+  // really does differ are enumerated separately below, so that set stays
+  // small, explicit and reviewable.
+  const GATE_MOVES: &[&str] = &[
+    "-9223372036854775807.0",
+    "-9.223372036854775807e18",
+    "-9223372036854775296.0",
+    "1844674407370955162.5",
+  ];
+
+  for (json, swift, port) in [
+    // Bare integers inside `i64`: `serde_json` holds these exactly, so the
+    // `as_i64` arm answers and the two agree by construction.
+    ("-9223372036854775807", Some(false), Some(false)),
+    ("-9223372036854775808", Some(false), Some(false)), // `Int.min`
+    // Bare integers past `i64` reach the float arm with `|f64| >= 2^63`. The
+    // oracle's own `Int` decode fails on them too, so both decline.
+    ("-9223372036854775809", None, None),
+    ("-9223372036854776832", None, None), // -2^63 - 1024, still the `-2^63` f64
+    ("-9223372036854776833", None, None), // one step further, a distinct f64
+    // Fraction and exponent spellings landing on the `-2^63` f64 whose exact
+    // magnitude is `2^63` or more. The oracle declines these as well, and this
+    // is the larger half of that f64's cell.
+    ("-9223372036854775808.0", None, None),
+    ("-9223372036854775809.0", None, None),
+    ("-9.223372036854775808e18", None, None),
+    // THE RESIDUE. Same f64, exact magnitude below `2^63`, so the oracle
+    // decodes `.integer` and DISABLES the cleanup while this port declines and
+    // leaves the caller's `or: true` in place. The band runs from
+    // `-(2^63 - 1)` to `-(2^63 - 512)`; both ends are pinned here.
+    ("-9223372036854775807.0", Some(false), None),
+    ("-9.223372036854775807e18", Some(false), None),
+    ("-9223372036854775296.0", Some(false), None),
+    // One integer past that band the value rounds to a different f64, which is
+    // decisive again -- so the divergence really is bounded, not a cliff.
+    ("-9223372036854775295.0", Some(false), Some(false)),
+    ("-9223372036854774784.0", Some(false), Some(false)),
+    // The positive edge has no such band: the oracle's cutoff is exactly the
+    // first magnitude that rounds up to the f64 `2^63`, which is where the
+    // port's exclusive upper bound already puts it.
+    ("9223372036854775295.0", Some(false), Some(false)),
+    ("9223372036854775296.0", None, None),
+    ("9223372036854775807", Some(false), Some(false)), // `Int.max`, bare
+    ("9223372036854775807.0", None, None),             // ...but not spelled `.0`
+    ("9223372036854775808.0", None, None),
+    // The SECOND divergence class, and it runs the opposite way. Past
+    // `1844674407370955161` a nonzero fractional part stops decoding as
+    // `.integer` in the oracle, while both spellings below still round to a
+    // whole `f64` and are accepted here. The two rows straddle that flip.
+    ("1844674407370955161.5", Some(false), Some(false)),
+    ("1844674407370955162.5", None, Some(false)),
+    // Nearby fractions that do agree, so the class above is pinned as a
+    // boundary rather than as "fractions are unreliable": a fraction the `f64`
+    // keeps is declined by both, and one it rounds away is taken by both.
+    ("2251799813685248.5", None, None),
+    ("9007199254740993.5", Some(false), Some(false)),
+    ("4503599627370496.0001", Some(false), Some(false)),
+    // A THIRD class, and the reason "they differ" and "the gate moves" have to
+    // be asked separately. At 16 nines the `f64` has rounded all the way up to
+    // `1.0` while the oracle still sees a fraction, so the two disagree -- yet
+    // `Some(true)` and `or: true` are the same flag, and nothing moves. 15
+    // nines is the control the `f64` still keeps apart from 1, and 19 is where
+    // the oracle's own decode has rounded up too.
+    ("0.999999999999999", None, None),
+    ("0.9999999999999999", None, Some(true)),
+    ("0.9999999999999999999", Some(true), Some(true)),
+  ] {
+    assert_eq!(
+      config_boolean(&serde_json::from_str(json).unwrap()),
+      port,
+      "port's answer for {json}"
+    );
+    assert_eq!(
+      swift.unwrap_or(true) != port.unwrap_or(true),
+      GATE_MOVES.contains(&json),
+      "whether the RESOLVED cleanup flag differs from Swift's for {json} \
+       (swift={swift:?}, port={port:?})"
     );
   }
 }
@@ -720,6 +823,27 @@ fn clean_up_flag_follows_tokenizer_config_like_swift() {
     ("{ not json", true),
     ("[]", true),
     ("3", true),
+    // The `Int`-range edge, at the call site that actually gates the cleanup.
+    // The first three match the oracle; the fourth is the documented residue,
+    // where Swift resolves `false` and this resolves `true` because the `.0`
+    // spelling did not survive `serde_json`. See
+    // `config_boolean_matches_swift_except_where_the_f64_lost_the_literal`.
+    (
+      r#"{"clean_up_tokenization_spaces": -9223372036854775808}"#,
+      false,
+    ),
+    (
+      r#"{"clean_up_tokenization_spaces": -9223372036854775808.0}"#,
+      true,
+    ),
+    (
+      r#"{"clean_up_tokenization_spaces": -9223372036854775809}"#,
+      true,
+    ),
+    (
+      r#"{"clean_up_tokenization_spaces": -9223372036854775807.0}"#,
+      true,
+    ),
   ] {
     std::fs::write(&path, body).unwrap();
     assert_eq!(
