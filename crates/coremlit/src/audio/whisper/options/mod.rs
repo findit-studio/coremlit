@@ -413,19 +413,24 @@ pub enum AlignmentGather {
   /// 120-token window at the reference host's measured pitch, the rest
   /// zero).
   ///
-  /// **Opt-in, and it fails closed.** That one row's tail picks the DTW path,
-  /// which picks the pre-merge word-duration multiset behind
-  /// `constrainedMedianDuration`/`maxDuration`, which picks the last word's
-  /// end, which picks the segment's end and therefore — through `seek =
-  /// max(seek, Int(lastSpeechTimestamp * sampleRate))`
-  /// (`TranscribeTask.swift:221-223`) — the **next window's seek**. So a
-  /// gather that keeps the row in full is "more correct" and yet lands the
-  /// pipeline on different windows from Swift's within a minute of audio:
-  /// measured against official Swift on the pinned model, the 1417 s fixture
-  /// cost 984 words of edit distance and an entire extra window (52 against
-  /// Swift's 51) under [`Self::Complete`], and matched token-for-token under
-  /// this variant. That is what this variant is for, and the only thing it is
-  /// for.
+  /// **Opt-in, and it fails closed.** That one row's tail is an input to the
+  /// DTW path, the path is what the pre-merge word-duration multiset behind
+  /// `constrainedMedianDuration`/`maxDuration` is read off, that multiset is
+  /// what fixes the last word's end, the segment's end takes that word's end
+  /// unless `SegmentSeeker.swift:642-649` clamps the word instead, and —
+  /// through `seek = max(seek, Int(lastSpeechTimestamp * sampleRate))`
+  /// (`TranscribeTask.swift:221-223`) — the segment's end is what the **next
+  /// window's seek** is taken from. Being an input is not the same as moving
+  /// the output: each link moves only if the one before it moved something
+  /// far enough, and the `max` leaves the seek untouched by a segment end
+  /// that does not land later than it. Where the links do all move, though,
+  /// they compound, so a gather that keeps the row in full can be "more
+  /// correct" and still put the pipeline on windows Swift never used. That is
+  /// what the long-form measurement found: against official Swift on the
+  /// pinned model, the 1417 s fixture cost 984 words of edit distance and an
+  /// entire extra window (52 against Swift's 51) under [`Self::Complete`],
+  /// and matched token-for-token under this variant. That is what this
+  /// variant is for, and the only thing it is for.
   ///
   /// # The three assumptions this mode carries
   ///
@@ -550,11 +555,25 @@ pub enum AlignmentGather {
   /// bit-parity with a Swift defect is what a caller opts into, having
   /// accepted the constraint.
   ///
-  /// It does **not** track Swift. On long-form audio the divergence is
-  /// measured — see [`Self::SwiftParity`] for the seek cascade and the
-  /// 1417 s numbers. Short form is not exempt from the mechanism either;
-  /// that variant's "Short-form" section states what is and is not
-  /// established there.
+  /// It does **not reproduce Swift's gather**: it measures no row pitch and
+  /// truncates nothing. That much is unconditional — and it is a claim about
+  /// the algorithm, not about the output. What follows for the output is
+  /// weaker. Where the host pads and a window gathers more than one row, the
+  /// matrix DTW runs over differs from the one Swift's gather builds;
+  /// whether the *path* through it differs, and whether any boundary then
+  /// moves, is a property of the numbers in that matrix. So this variant is
+  /// **not guaranteed** to track Swift's output — and where it has been
+  /// measured against official Swift it has gone both ways. On the 1417 s
+  /// long-form fixture it diverged: 984 words of edit distance and an extra
+  /// window (see [`Self::SwiftParity`] for those numbers and the seek path
+  /// behind them). On `jfk.wav` / `openai_whisper-tiny`, under the pinned
+  /// oracle options, it matched official Swift word for word, exactly as
+  /// [`Self::SwiftParity`] did. Each result is that fixture's and that
+  /// model's, not a rule for long or short audio generally. Short form
+  /// carries no exemption from the mechanism either; that variant's
+  /// "Short-form" section states what is and is not established there. And
+  /// on a host whose CoreVideo does not pad, the two variants are one gather
+  /// and the question does not arise.
   #[default]
   Complete,
 }
@@ -2288,15 +2307,29 @@ impl DecodingOptions {
   /// and what it substitutes for the unwritten storage is a stated assumption
   /// rather than an observation. See [`AlignmentGather`]'s own doc for the
   /// mechanism, the cited Swift lines, the three assumptions the opt-in
-  /// carries, and why the truncated row — not the complete one — is what
-  /// keeps long-form transcripts on Swift's windows.
+  /// carries, and why it was the truncated row — not the complete one — that
+  /// held the 1417 s fixture on Swift's own windows.
   ///
   /// Inert unless [`Self::word_timestamps`] is set: the gather only runs
-  /// inside the DTW alignment pass. Unlike [`Self::word_grouping`] it is not
-  /// confined to a segment's words, though — a changed final row moves the
-  /// last word's end, which moves the segment's end, which moves the next
-  /// window's seek, so with word timestamps on it reaches the transcript
-  /// itself.
+  /// inside the DTW alignment pass. Unlike [`Self::word_grouping`], though,
+  /// its reach is not confined to a segment's words — and every step of that
+  /// reach is conditional on magnitude rather than automatic. A changed final
+  /// row **can** change the DTW path. If the path moves the boundary the last
+  /// word's end is read off, that end moves — and the segment's end **can**
+  /// move with it, though `SegmentSeeker.swift:642-649` instead clamps the
+  /// WORD and leaves the segment's end alone — which it does only where the
+  /// word would end more than 0.5 s past that segment end. And because the
+  /// next window's seek is taken as `seek =
+  /// max(seek, Int(lastSpeechTimestamp * sampleRate))`
+  /// (`TranscribeTask.swift:221-223`), a segment end that moves LATER **can**
+  /// carry that seek — and the rest of the transcript — with it, while one
+  /// that moves earlier, or not past the seek already set, leaves it exactly
+  /// where it was. The first link is the one visibly shown not to fire on its
+  /// own: on `jfk.wav` / `openai_whisper-tiny` the two gathers hand DTW
+  /// different matrices and it picks the same path, so the words come out
+  /// identical. So with word timestamps on, this knob **can** reach the
+  /// transcript itself; whether it does on a given clip is that clip's
+  /// measured result, not something the mechanism settles in advance.
   ///
   /// It applies to **every** word-timestamp window, including a single-window
   /// short-form clip with no seek cascade to accumulate — matching Swift,

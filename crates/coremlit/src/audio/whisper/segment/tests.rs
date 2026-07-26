@@ -1446,9 +1446,13 @@ fn swift_parity_gather_truncates_final_alignment_row() {
     complete_end, reference_end,
     "the hand truncation must actually move the boundary"
   );
-  // The segment's end follows the last word's (`:642-649`), which is what
-  // reaches `seek = max(seek, lastSpeechTimestamp * sampleRate)`
-  // (`TranscribeTask.swift:221-223`) and cascades into the next window.
+  // Here the segment's end follows the last word's -- `:642-649`'s else
+  // branch, which the generous 3.0 s segment end above selects. That end is
+  // what `seek = max(seek, lastSpeechTimestamp * sampleRate)`
+  // (`TranscribeTask.swift:221-223`) is taken from -- so a segment end that
+  // lands later than the standing seek can carry the next window with it, and
+  // one that does not is discarded by the `max`. Only the within-call equality
+  // is asserted here; nothing past this one call is.
   assert_eq!(complete_segment_end, complete_end);
   assert_eq!(parity_segment_end, parity_end);
 }

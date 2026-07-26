@@ -108,9 +108,13 @@ identical in both.
   and fails at the small `n_audio_ctx` a test backend can set, where a run of
   whole rows goes. At `N = 120` the final row keeps **1024** of its 1500
   columns and reads the other 476 out of storage neither the `memcpy` nor the
-  `initialValue:` fill ever wrote. That row is the whole of the
-  long-form divergence: it moves the last word's end, hence the segment's end,
-  hence the next window's seek. Pinned in `segment/tests.rs` by
+  `initialValue:` fill ever wrote. That row is the whole of the mechanism
+  behind the measured long-form divergence, and every link in it is
+  conditional: the row's tail can change the DTW path; a changed path can move
+  the last word's end and with it the segment's end; and because the update is
+  `seek = max(seek, ...)`, a segment end that lands later than the standing
+  seek can carry the next window with it, while one that does not leaves the
+  seek alone. Pinned in `segment/tests.rs` by
   `coreml_f16_row_pitch_answers_with_a_usable_pitch_or_a_typed_refusal`,
   `swift_gather_keeps_only_the_final_rows_prefix` and
   `swift_parity_gather_truncates_final_alignment_row`.

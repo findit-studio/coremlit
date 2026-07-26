@@ -3351,13 +3351,17 @@ fn skip_special_tokens_governs_segment_text_on_both_writer_branches() {
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn swift_parity_gather_moves_the_first_windows_end_and_the_next_seek() {
   // whisper #41 in miniature, on the mock backend: the OPT-IN alignment gather
-  // is not confined to one window's word list. The final gathered row's tail
-  // moves the last word's end (`SegmentSeeker.swift:642-649` hands it to the
-  // segment), the segment's end moves `seek` (`:221-223`'s
-  // `seek = max(seek, Int(lastSpeechTimestamp * sampleRate))`), and the next
-  // window therefore decodes a different slice of audio. That cascade is what
-  // turned a 476-column tail into 984 words of edit distance and one extra
-  // window across the 1417 s fixture.
+  // is not confined to one window's word list. In THIS fixture every link of
+  // that reach moves — the final gathered row's tail moves the last word's end
+  // (`SegmentSeeker.swift:642-649` hands it to the segment), that segment end
+  // lands later than the standing `seek` (`:221-223`'s
+  // `seek = max(seek, Int(lastSpeechTimestamp * sampleRate))`) and so replaces
+  // it, and the next window therefore decodes a different slice of audio. None
+  // of those links is automatic: each moves only if the one before it moved
+  // something far enough, and the `max` discards a segment end that does not
+  // land later. Where they all do move they compound, which is what turned a
+  // 476-column tail into 984 words of edit distance and one extra window
+  // across the 1417 s fixture.
   //
   // Both halves of the name are asserted, and the FIRST half is the one that
   // bounds the public doc claim: window 1 already ends somewhere else, on
