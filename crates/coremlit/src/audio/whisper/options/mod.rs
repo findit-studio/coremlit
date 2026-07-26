@@ -485,18 +485,51 @@ pub enum AlignmentGather {
   ///
   /// # Short-form
   ///
-  /// Short-form is bit-exact either way — the divergence needs the seek
-  /// cascade to accumulate — but that is a *measured* result, not a
-  /// structural one: the gather runs on every word-timestamp window, with no
-  /// long-form or subsequent-window guard (Swift has none either, so a guard
-  /// would itself be a deviation), and the truncation is real even on a
-  /// single window. On jfk/tiny, 30 gathered rows over 1500 columns leave the
-  /// final row keeping 1384 of them. The integration test
-  /// `jfk_tiny_word_timestamps_match_swift_and_do_not_move_with_the_gather`
-  /// (`crates/coremlit/tests/whisper/parity_jfk.rs`) is what keeps the claim
-  /// honest: it pins every short-form word of the DEFAULT gather against the
-  /// Swift oracle exactly AND asserts this variant produces the identical
-  /// list.
+  /// The gather runs on **every** word-timestamp window, with no long-form
+  /// guard and no subsequent-window guard (Swift has none either, so a guard
+  /// would itself be a deviation), and the truncation is real on a single
+  /// window: on jfk/tiny, 30 gathered rows over 1500 columns at the measured
+  /// pitch of 1504 leave the final row keeping 1384 of them. The matrix DTW
+  /// runs over therefore differs between the two variants on a short clip
+  /// too. Whether the *path* DTW picks through it also differs is a property
+  /// of the numbers in that matrix — not of the clip's length, and not of
+  /// whether a seek cascade follows.
+  ///
+  /// **Established.** On `jfk.wav` / `openai_whisper-tiny`, under the pinned
+  /// oracle options, this variant and [`Self::Complete`] produce the same 22
+  /// words, and that list matches official Swift exactly — text, start, end,
+  /// probability and token ids, no epsilon — as do the segment seeks and
+  /// bounds. The integration test
+  /// `jfk_tiny_word_timestamps_match_swift_and_this_clip_is_gather_invariant`
+  /// (`crates/coremlit/tests/whisper/parity_jfk.rs`) pins both halves.
+  ///
+  /// **Not established: that short-form output is invariant in general.** It
+  /// is not, and a previous revision of this doc said it was. Gather
+  /// selection can move a word's end — and with it the segment's end —
+  /// **inside a single window**, which this branch's own fixtures measure.
+  /// Over ONE `add_word_timestamps` call, with no seek, no second window and
+  /// no cascade of any kind, the last word's end and the segment's end come
+  /// out **0.88 s under [`Self::Complete`] against 1.58 s under this
+  /// variant**
+  /// (`segment::tests::swift_parity_gather_truncates_final_alignment_row`).
+  /// End to end, a run diverges in its **first** window — same audio, same
+  /// decoded script, `seek` 0 under both — at **0.88 s against 1.18 s**,
+  /// which is what then places window 2 at a different sample offset
+  /// (`transcribe::tests`'
+  /// `swift_parity_gather_moves_the_first_windows_end_and_the_next_seek`).
+  /// Both fixtures drive constructed alignment matrices rather than a real
+  /// decode's, so neither says that some particular clip diverges; what they
+  /// establish is that nothing about a short clip exempts it. **A caller who
+  /// changes this knob for a short clip can receive different word and
+  /// segment timestamps.**
+  ///
+  /// *Would settle it:* Swift-oracle word goldens over a corpus — several
+  /// clips, models and window occupancies — characterizing when a real
+  /// decode's DTW path is sensitive to the truncated tail. One clip's
+  /// insensitivity is one clip's, and the mechanism predicts no other.
+  /// Until that exists, the supportable reading is that the two variants may
+  /// differ on any word-timestamp window, and jfk/tiny is the one where they
+  /// are measured not to.
   SwiftParity,
   /// Gather every row in full — no truncation.
   ///
@@ -517,9 +550,11 @@ pub enum AlignmentGather {
   /// bit-parity with a Swift defect is what a caller opts into, having
   /// accepted the constraint.
   ///
-  /// It does **not** track Swift, and on long-form audio it will not — see
-  /// [`Self::SwiftParity`] for the seek cascade and the measured 1417 s
-  /// numbers.
+  /// It does **not** track Swift. On long-form audio the divergence is
+  /// measured — see [`Self::SwiftParity`] for the seek cascade and the
+  /// 1417 s numbers. Short form is not exempt from the mechanism either;
+  /// that variant's "Short-form" section states what is and is not
+  /// established there.
   #[default]
   Complete,
 }
@@ -768,7 +803,10 @@ pub(crate) mod finite_f32_vec {
 ///    mechanism behind the long-form divergence of coremlit issue #41 — and is
 ///    the exact-parity escape hatch, opt-in because its behavior rests on
 ///    unspecified CoreVideo layout (see that variant's stated assumptions
-///    A1–A3).
+///    A1–A3). Long-form is where the divergence was *measured*, not where the
+///    mechanism is confined: it runs on every word-timestamp window, and can
+///    move timestamps within a single short-form one — see that variant's
+///    "Short-form" section.
 ///
 /// [`Self::word_grouping`] is NOT one of them: it defaults to
 /// [`WordGrouping::SwiftParity`] — Swift's own Chinese/Cantonese
@@ -2262,9 +2300,15 @@ impl DecodingOptions {
   ///
   /// It applies to **every** word-timestamp window, including a single-window
   /// short-form clip with no seek cascade to accumulate — matching Swift,
-  /// which has no such guard either. Short-form output is nevertheless
-  /// unchanged between the two variants, and that is asserted rather than
-  /// assumed: see [`AlignmentGather::SwiftParity`].
+  /// which has no such guard either. Short form is therefore **not** exempt:
+  /// changing this knob can move a word's end, and with it the segment's
+  /// end, within one window, which the branch's own single-call fixture
+  /// measures at 0.88 s against 1.58 s. What is *established* is narrower —
+  /// on `jfk.wav` / `openai_whisper-tiny` the two variants agree word for
+  /// word and both match official Swift. That is one clip's measured result,
+  /// not a guarantee for short clips generally; see
+  /// [`AlignmentGather::SwiftParity`]'s "Short-form" section for the
+  /// established / not-established split and what would settle it.
   #[inline(always)]
   pub const fn alignment_gather(&self) -> AlignmentGather {
     self.alignment_gather

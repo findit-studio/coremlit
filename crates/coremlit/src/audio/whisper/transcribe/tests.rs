@@ -3035,7 +3035,7 @@ fn four_window_shapes_read_stale_and_dropped_alignment_rows() {
   // that erasure lands, so the discriminating column of the last row — the
   // whole signal above — would be erased and every mutation in the matrix
   // would read the same. The opt-in gather is pinned separately by
-  // `swift_parity_gather_moves_the_next_window_seek`.
+  // `swift_parity_gather_moves_the_first_windows_end_and_the_next_seek`.
   let t = tiny_tokenizer();
   let options = DecodingOptions::new()
     .with_word_timestamps()
@@ -3131,7 +3131,7 @@ fn cap_hit_window_drops_the_completing_row() {
   // row 175, so under `SwiftParity` rows 175..=223 — including the
   // predecessor/last-word/dropped triple this test is built on — would arrive
   // entirely zeroed and Mutation A would become invisible. That gather is
-  // pinned by `swift_parity_gather_moves_the_next_window_seek`.
+  // pinned by `swift_parity_gather_moves_the_first_windows_end_and_the_next_seek`.
   let options = DecodingOptions::new()
     .with_word_timestamps()
     .with_without_timestamps()
@@ -3349,7 +3349,7 @@ fn skip_special_tokens_governs_segment_text_on_both_writer_branches() {
 
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
-fn swift_parity_gather_moves_the_next_window_seek() {
+fn swift_parity_gather_moves_the_first_windows_end_and_the_next_seek() {
   // whisper #41 in miniature, on the mock backend: the OPT-IN alignment gather
   // is not confined to one window's word list. The final gathered row's tail
   // moves the last word's end (`SegmentSeeker.swift:642-649` hands it to the
@@ -3358,6 +3358,16 @@ fn swift_parity_gather_moves_the_next_window_seek() {
   // window therefore decodes a different slice of audio. That cascade is what
   // turned a 476-column tail into 984 words of edit distance and one extra
   // window across the 1417 s fixture.
+  //
+  // Both halves of the name are asserted, and the FIRST half is the one that
+  // bounds the public doc claim: window 1 already ends somewhere else, on
+  // identical audio and an identical decoded script, with `seek` 0 under both
+  // gathers and no preceding window to have moved anything. The divergence
+  // therefore does NOT need a cascade to appear — the cascade is only what
+  // compounds it. `AlignmentGather::SwiftParity`'s "Short-form" section cites
+  // this alongside `segment::tests::
+  // swift_parity_gather_truncates_final_alignment_row`, which shows the same
+  // thing over a single `add_word_timestamps` call with no pipeline at all.
   //
   // Shape: 100 encoder columns, a segment of 6 gathered tokens
   // (`<|startoftranscript|><|en|><|transcribe|><|0.00|> Hello<|0.80|>` — the

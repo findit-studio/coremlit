@@ -229,18 +229,30 @@ under `ModelComputeOptions(audioEncoderCompute: .cpuAndNeuralEngine,
 textDecoderCompute: .cpuAndNeuralEngine)` — the same pinned invocation the #41
 long-form evidence used, so short-form and long-form are one option set.
 `whisper_parity_jfk`'s
-`jfk_tiny_word_timestamps_match_swift_and_do_not_move_with_the_gather` mirrors
-those options exactly and asserts every word (text, start, end, probability,
-token ids) with no epsilon **under the shipping default,
+`jfk_tiny_word_timestamps_match_swift_and_this_clip_is_gather_invariant`
+mirrors those options exactly and asserts every word (text, start, end,
+probability, token ids) with no epsilon **under the shipping default,
 `AlignmentGather::Complete`**, plus that the opt-in `AlignmentGather::
 SwiftParity` yields the identical list. The first half is what the round-3
 default flip had to re-establish — the correct-everywhere gather still
-reproduces official Swift on this clip. The second is what makes "the #41
-gather does not change short-form output" a checked claim rather than a
-comment: the gather runs on every word-timestamp window, long-form or not, and
-at 30 gathered rows over 1500 columns the measured pitch of 1504 does truncate
-the final row under `SwiftParity` (it keeps 1384 of 1500 columns) — the
-truncation simply does not move this clip's DTW path.
+reproduces official Swift on this clip.
+
+The second half establishes gather-invariance **for this clip and nothing
+wider**, and the wording matters because an earlier revision generalized it.
+The gather runs on every word-timestamp window, long-form or not, and at 30
+gathered rows over 1500 columns the measured pitch of 1504 does truncate the
+final row under `SwiftParity` (it keeps 1384 of 1500 columns) — so the matrix
+DTW consumes here genuinely differs between the modes, and it is only the path
+through it that coincides. That coincidence is a property of this clip's
+numbers: the port's own fixtures measure the modes producing different
+word/segment ends **inside a single window** (0.88 s vs 1.58 s over one
+`add_word_timestamps` call in `segment::tests::
+swift_parity_gather_truncates_final_alignment_row`; 0.88 s vs 1.18 s in the
+first window of `transcribe::tests::
+swift_parity_gather_moves_the_first_windows_end_and_the_next_seek`, with no
+cascade behind it). Settling the general short-form question needs a corpus of
+Swift word goldens across clips, models and window occupancies; this golden is
+one point in it. See `AlignmentGather::SwiftParity`'s "Short-form" section.
 
 ## Rust transfer check (superseded by hermetic tests)
 

@@ -262,21 +262,35 @@ fn oracle_options() -> DecodingOptions {
     .with_chunking_strategy(ChunkingStrategy::Disabled)
 }
 
-/// Short-form word timestamps, pinned against official Swift and against
+/// jfk/tiny's word timestamps, pinned against official Swift and against
 /// themselves across both [`AlignmentGather`] modes.
 ///
-/// **Why this exists.** `alignment_gather` (whisper #41) is selected for
+/// **Scope, stated first because it was once overstated.** This pins ONE
+/// clip on ONE model. It does not establish — and must not be cited as
+/// establishing — that the gather leaves short-form output alone in general.
+/// It does not: `segment::tests::
+/// swift_parity_gather_truncates_final_alignment_row` measures the two
+/// gathers producing last-word and segment ends of 0.88 s against 1.58 s
+/// over a single `add_word_timestamps` call, and `transcribe::tests::
+/// swift_parity_gather_moves_the_first_windows_end_and_the_next_seek`
+/// measures a first-window divergence with no cascade behind it. What this
+/// test establishes is that jfk/tiny is not one of the clips where that
+/// happens, and that under the shipping default it reproduces official
+/// Swift.
+///
+/// **Why it exists.** `alignment_gather` (whisper #41) is selected for
 /// EVERY word-timestamp window, not only for long-form or for windows after
 /// the first: `TranscribeTask::run` passes `options.alignment_gather()`
 /// straight into `add_word_timestamps` with no guard. So a caller who opts
 /// into `SwiftParity` runs a single-window clip through the truncating gather
 /// too — and it is genuinely truncated here, not vacuously: 30 gathered rows
 /// over 1500 columns at the measured pitch of 1504 leaves the copied prefix
-/// ending inside the last row, which keeps 1384 of its 1500 columns. #41's
-/// claim that short-form output is unchanged was therefore a real claim about
-/// a real code path, and before this test nothing committed checked it — the
-/// sibling `jfk_tiny_matches_golden_tokens_and_segments` runs with
-/// `word_timestamps` OFF.
+/// ending inside the last row, which keeps 1384 of its 1500 columns. The DTW
+/// input on this clip therefore really does differ between the modes; only
+/// the path through it happens not to. #41 asserted the short-form outcome
+/// with nothing committed checking it — the sibling
+/// `jfk_tiny_matches_golden_tokens_and_segments` runs with `word_timestamps`
+/// OFF.
 ///
 /// Two assertions, in the order that matters:
 ///
@@ -286,17 +300,18 @@ fn oracle_options() -> DecodingOptions {
 ///    review, so THIS is the claim that had to be re-established: the
 ///    correct-everywhere gather still reproduces official Swift on this clip.
 /// 2. The opt-in [`AlignmentGather::SwiftParity`] produces the identical word
-///    list. That is what "the gather does not change short-form output"
-///    means, and it is an assertion rather than a comment: if the truncated
-///    final row ever does move a short-form boundary, this fails instead of
-///    the claim quietly becoming false.
+///    list *on this clip*. That is the whole of the gather-invariance the
+///    branch has measured on real model output, and it is an assertion rather
+///    than a comment: if the truncated final row ever does move this clip's
+///    boundaries, this fails instead of the documented scope quietly becoming
+///    wrong.
 ///
 /// Compute path: the shipping default, for the same reason this file's
 /// module doc gives — the oracle was captured on the ANE, so the gate runs
 /// there too.
 #[test]
 #[ignore = "requires local tiny model (WHISPERKIT_TEST_MODELS)"]
-fn jfk_tiny_word_timestamps_match_swift_and_do_not_move_with_the_gather() {
+fn jfk_tiny_word_timestamps_match_swift_and_this_clip_is_gather_invariant() {
   let audio = common::load_wav_mono_f32(&common::fixtures_dir().join("audio/jfk.wav"));
   let model_options = Options::new(common::tiny_dir(), common::tokenizer_dir());
   assert_eq!(model_options.compute().mel(), DEFAULT_MEL_COMPUTE_UNITS);
@@ -347,7 +362,7 @@ fn jfk_tiny_word_timestamps_match_swift_and_do_not_move_with_the_gather() {
   assert_eq!(
     default_words,
     golden_word_rows(&golden),
-    "short-form word timestamps under the DEFAULT gather must match official Swift exactly"
+    "jfk/tiny's word timestamps under the DEFAULT gather must match official Swift exactly"
   );
   assert_eq!(default_words.len(), 22, "jfk/tiny yields 22 words");
 
@@ -361,8 +376,9 @@ fn jfk_tiny_word_timestamps_match_swift_and_do_not_move_with_the_gather() {
   assert_eq!(
     result_word_rows(&parity),
     default_words,
-    "the #41 gather changed a SHORT-FORM word timing: the branch's \
-     short-form-is-unaffected claim no longer holds"
+    "the #41 gather moved a word timing on jfk/tiny: the one clip on which the two gathers \
+     were measured to agree no longer agrees, so the scope documented on \
+     `AlignmentGather::SwiftParity` is now wrong too"
   );
   assert_eq!(parity.text(), default_result.text());
   assert_eq!(
@@ -376,6 +392,6 @@ fn jfk_tiny_word_timestamps_match_swift_and_do_not_move_with_the_gather() {
       .iter()
       .map(|s| (s.seek(), s.start(), s.end(), s.tokens_slice().to_vec()))
       .collect::<Vec<_>>(),
-    "and neither the seek nor the segment bounds move with it"
+    "and on this clip neither the seek nor the segment bounds move with it"
   );
 }

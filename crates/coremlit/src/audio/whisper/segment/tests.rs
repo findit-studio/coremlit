@@ -1328,6 +1328,13 @@ fn swift_parity_gather_truncates_final_alignment_row() {
   // exercises the real production path, so it has to be built on the same
   // number that path found.
   //
+  // This is ONE `add_word_timestamps` call: no pipeline, no seek, no second
+  // window, no cascade of any kind. It is therefore the tightest evidence
+  // that gather selection reaches word and segment timestamps WITHIN a single
+  // window, which is why `AlignmentGather::SwiftParity`'s "Short-form" section
+  // cites the 0.88/1.58 pair below as the bound on what the jfk/tiny golden
+  // establishes.
+  //
   // The weights are built so that row 2's ZEROED TAIL is what decides where
   // the DTW path leaves row 1 -- and the row-1 -> row-2 boundary is the last
   // text word's end, because the trailing timestamp token forms its own word

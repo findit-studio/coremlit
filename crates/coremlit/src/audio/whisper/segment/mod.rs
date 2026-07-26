@@ -1003,7 +1003,7 @@ pub(crate) fn rounded_to_places(value: f32, decimal_places: i32) -> f32 {
 /// fail-closed: see [`SegmentError::AlignmentPitchUnavailable`] for why a
 /// silent fall back to [`AlignmentGather::Complete`] is not offered.
 // `pub(crate)`, not private: `transcribe::tests`' own gather fixture
-// (`swift_parity_gather_moves_the_next_window_seek`) is built around where
+// (`swift_parity_gather_moves_the_first_windows_end_and_the_next_seek`) is built around where
 // this host's pitch cuts the gather, and has to ask the same helper the
 // pipeline asks rather than restate a number.
 pub(crate) fn coreml_f16_row_pitch(rows: usize, cols: usize) -> Result<usize, SegmentError> {
