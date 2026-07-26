@@ -172,15 +172,49 @@
 //!   that the shipping arm masks. Both corners reproduce their independently
 //!   pinned numbers (dia-ort's 8 / 0.0000 %; `parity_shipping_der`'s
 //!   5 / 16.5904 %), which is what makes the hybrid cells readable at all.
-//! - *Not established*: WHICH property of the CoreML embedding path carries
-//!   it. The factor varied is the BACKEND, so the implicated object is the
-//!   shipping bundle — int8 palettization **plus** `All` placement **plus**
-//!   that conversion — as one unit. Nor does any of it extend beyond clip 09,
-//!   this host, or these two configurations.
-//! - *What would settle the remainder*: the same hybrid harness with the
-//!   reference segmentation held fixed and the embedding arm run as fp32
-//!   CoreML on `All` and as int8 CoreML on `CpuOnly`. Those two cells separate
-//!   quantization from placement; nothing measured so far does.
+//! - *Not established by (b)*: WHICH property of the CoreML embedding path
+//!   carries it. The factor varied is the BACKEND, so the implicated object is
+//!   the shipping bundle — int8 palettization **plus** `All` placement **plus**
+//!   that conversion — as one unit. That is what (c) separates.
+//!
+//! **(c) The embedding path's three properties, separated.**
+//! `backend_factorial.rs`'s `embedding_precision_x_placement` holds dia's
+//! reference segmentation fixed for every arm and runs the embedding arm across
+//! precision x placement, same clip and host:
+//!
+//! ```text
+//! cell | embedding arm            | spk |      DER |     conf | err units
+//! -----+--------------------------+-----+----------+----------+----------
+//!    A | ONNX fp32 / ort CPU EP   |   8 |  0.0000% |  0.0000% |         0
+//!    B | CoreML int8 / All        |   5 | 16.5904% | 16.5904% |     11999
+//!    C | CoreML fp32 / All        |   7 |  2.5427% |  2.5427% |      1839
+//!    D | CoreML int8 / CpuOnly    |   6 | 16.3636% | 16.3636% |     11835
+//!    E | CoreML fp32 / CpuOnly    |   8 |  0.0000% |  0.0000% |         0
+//! ```
+//!
+//! - *Established*: **the embedding CONVERSION is exonerated.** Cell E — the
+//!   same CoreML graph with both other factors removed — reproduces dia-ort
+//!   frame-perfectly: 8 of 8 speakers and `err_units == 0`, not one
+//!   collar-scored speaker-frame different, at mean AND minimum cosine
+//!   1.000000 against dia's fp32 ONNX over all 2 114 `(chunk, slot)` rows.
+//!   *(b)*'s "the CoreML embedding path" must not be read as "the CoreML
+//!   embedding conversion".
+//! - *Established*: the two remaining factors are separable, additive on
+//!   speaker count, and very unequal on error mass. **int8 palettization costs
+//!   2 speakers at BOTH placements** (E 8 -> D 6; C 7 -> B 5) and 11 835 of the
+//!   shipping arm's 11 999 error units — 98.6 % of it. **The `All` placement
+//!   costs 1 speaker at BOTH precisions** (E 8 -> C 7; D 6 -> B 5) and 1 839 /
+//!   164 error units respectively. Neither factor alone reproduces the shipping
+//!   5-of-8 collapse.
+//! - *Not established*: anything about the REMEDY's cost. Every arm here runs
+//!   over ONNX segmentation, which is not what this crate ships, and no
+//!   fp32/`All` DER arm exists for the gated clips (06 / 14 / 10) —
+//!   `parity_shipping_der` measures fp32 only on `CpuOnly`. Nor does any of it
+//!   extend beyond clip 09 or this host.
+//! - *What would settle the remainder*: an fp32/`All` arm added to
+//!   `parity_shipping_der`'s per-clip measurement, so the speakers cell C
+//!   recovers on clip 09 can be priced against what fp32 does to clip 14 — the
+//!   clip that already sits nearest a clustering decision boundary.
 //!
 //! The mechanism INSIDE the segmentation graph is a further step again, and it
 //! is not established either: `segments` is the only tensor either graph
@@ -276,22 +310,34 @@
 //!   order as the conversion's own. "Within the selected bound" is the
 //!   claim; "free" is not.
 //!
-//!   *Not established*: that int8 is accuracy-neutral on 8-speaker audio.
-//!   Clip 09 cannot adjudicate the precision axis at all — its fp32 control
-//!   returns `Err(AmbiguousAliveCluster)` and produces no diarization to
-//!   compare against — so int8-vs-fp32 there is UNMEASURED, not equal. What
-//!   IS measured on clip 09 is worse for this DECISION than "unmeasured":
-//!   `backend_factorial.rs` shows the shipping embedding path (this int8
-//!   artifact on `All`) sufficient on its own to collapse 8 speakers to 5
-//!   there — see "Clip 09" above. That does not overturn the DECISION, which
-//!   rests on the clips whose fp32 control clusters, but it is the open
-//!   question against it. Nothing here extends past these four clips, this
-//!   host, or these two placements.
+//!   *Refuted on 8-speaker audio, and this is the open question against the
+//!   DECISION.* This paragraph used to say clip 09 "cannot adjudicate the
+//!   precision axis at all", because `parity_shipping_der`'s fp32 control
+//!   there returns `Err(AmbiguousAliveCluster)` and produces nothing to
+//!   compare against. That control is confounded: it runs CoreML
+//!   segmentation, and the segmentation conversion has its own clip-09
+//!   defect. With dia's reference segmentation held fixed instead, the fp32
+//!   control clusters fine and the precision axis IS measurable —
+//!   `backend_factorial.rs`'s `embedding_precision_x_placement`, "Clip 09"
+//!   table (c) above. It costs **2 speakers at both placements** (8 -> 6 on
+//!   `CpuOnly`, 7 -> 5 on `All`) and 11 835 of the shipping arm's 11 999
+//!   error units. On this clip int8 is not accuracy-neutral by a wide margin;
+//!   it is the dominant term in the collapse.
 //!
-//!   *What would settle it*: the fp32 control clustering on clip 09 (which
-//!   is the clip-09 defect itself, see "Segmentation provenance" above),
-//!   plus the four remaining ≥ 3-speaker corpus clips (08 / 11 / 12 / 13)
-//!   measured on the same precision axis.
+//!   That does not overturn the DECISION, which rests on the clips whose fp32
+//!   control clusters and where the count is preserved — but it converts "the
+//!   open question against it" from a suspicion into a measurement. Nothing
+//!   here extends past these four clips, this host, or these two placements.
+//!
+//!   *What would settle it*: an fp32/`All` arm in `parity_shipping_der`'s
+//!   per-clip measurement, so the two speakers fp32 recovers on clip 09 can be
+//!   priced against what fp32 does to clip 14 (the clip nearest a clustering
+//!   decision boundary) — plus the four remaining ≥ 3-speaker corpus clips
+//!   (08 / 11 / 12 / 13) measured on the same precision axis. Note the
+//!   candidate remedy here is the ALREADY-STAGED fp32 `wespeaker.mlmodelc`,
+//!   not the published re-palettized `wespeaker_int8` re-conversion whose
+//!   clip-14 regression is recorded above; they are different artifacts and
+//!   only the latter has been measured to cost clip 14.
 //!
 //!   The evidence lives in `parity_shipping_der.rs`; a parity gate
 //!   (spec §6.2) separately confirms quantization doesn't reintroduce the

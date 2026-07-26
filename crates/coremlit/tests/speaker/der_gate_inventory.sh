@@ -11,6 +11,16 @@
 # the gitignored `Models/` tree plus the sibling `diarization` fixtures), and
 # the README drives them with `cargo test ... -- --ignored`.
 #
+# `--features speaker-oracle` is also the ONLY workable feature set for actually
+# RUNNING these gates — `--all-features` hangs them. `align-oracle` pulls `asry`,
+# which turns on `ort/load-dynamic`; Cargo unifies that onto the single `ort` in
+# the build, dia's first Session then fails to `dlopen` an ONNX Runtime dylib
+# that is not installed, and ort's error path re-enters the `OnceLock` it is
+# initializing (setup_api -> Error::new_internal -> ort::api() -> Once::wait)
+# and blocks forever. `cargo test -p coremlit --all-features` stays green only
+# because, without `--ignored`, it never opens an ort session. So every cargo
+# invocation below names `--features speaker-oracle` deliberately.
+#
 # Two failure modes this must catch, which a plain `--list` cannot:
 #   * a gate DELETED (or renamed) — e.g. dropping `stress_10...`, the central
 #     argmax multi-speaker regression — leaves the sweep green with the gate
@@ -176,12 +186,15 @@ check_bin parity_shipping_der \
   clip09_content_pin_catches_an_audio_swap || fail=1
 
 # backend_factorial.rs — the seg-vs-embed cross-product at the SHIPPING
-# configuration. It is the only gate that localizes the clip-09 collapse to a
-# STAGE where the defect actually lives (int8 embedder, ComputeUnits::All), and
-# `model_io.rs`'s recorded attribution cites it, so it must not be deletable
+# configuration, plus the precision x placement experiment that disambiguates
+# what that cross-product could only implicate as a bundle. The first localizes
+# the clip-09 collapse to a STAGE where the defect actually lives (int8 embedder,
+# ComputeUnits::All); the second says WHICH property of that stage carries it.
+# `model_io.rs`'s recorded attribution cites both, so neither must be deletable
 # without a red build.
 check_bin backend_factorial \
-  shipping_config_backend_factorial || fail=1
+  shipping_config_backend_factorial \
+  embedding_precision_x_placement || fail=1
 
 # ── Require each binary's load-bearing ORDINARY (hermetic) gates by NAME, then
 #    execute the ordinary suite (codex r7 F2 + r6 F4). The name manifest runs
@@ -194,7 +207,8 @@ check_ordinary parity_e2e \
 check_ordinary parity_shipping_der \
   clip09_known_defect_pins_every_field || fail=1
 check_ordinary backend_factorial \
-  factorial_verdict_pins_every_cell || fail=1
+  factorial_verdict_pins_every_cell \
+  precision_placement_verdict_pins_every_cell || fail=1
 
 run_ordinary parity_e2e || fail=1
 run_ordinary parity_shipping_der || fail=1

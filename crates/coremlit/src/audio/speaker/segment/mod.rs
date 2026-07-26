@@ -182,8 +182,11 @@
 //! its own reproduces the 5-of-8 collapse exactly (16.5904 %). An earlier
 //! cross-product run with the fp32 embedder on `CpuOnly` attributed the whole
 //! thing here; it does not survive re-measurement at the configuration this
-//! crate ships. See `tests/speaker/model_io.rs`'s "Clip 09" section for both
-//! tables side by side.
+//! crate ships. Within that embedding path the responsibility splits further —
+//! the int8 palettization costs 2 speakers and the `All` placement 1, while the
+//! embedding CONVERSION on its own is frame-perfect against dia-ort. See
+//! `tests/speaker/model_io.rs`'s "Clip 09" section for all three tables side by
+//! side.
 //!
 //! Which PART of this graph produces its own overcount is a further step, and
 //! it is NOT established: `segments` is the only tensor either graph exposes,

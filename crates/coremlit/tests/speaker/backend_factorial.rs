@@ -81,6 +81,18 @@
 //! configuration did not transfer to the one this crate ships, which is
 //! precisely why it had to be re-measured here.
 //!
+//! # The follow-up this file also carries
+//!
+//! The cross-product above varies the whole BACKEND, so its finding implicates
+//! the CoreML embedding path as shipped — int8-palettized artifact **plus**
+//! `All` placement **plus** that conversion — as one bundle.
+//! [`embedding_precision_x_placement`] separates the three: same harness, same
+//! clip, dia's reference segmentation held fixed for every arm, and the
+//! embedding arm run across precision x placement. Its verdict
+//! ([`assert_precision_placement_verdict`]) carries the measured table; in
+//! short, the conversion alone is frame-perfect, the int8 palettization costs 2
+//! speakers at either placement, and `All` costs 1 at either precision.
+//!
 //! # What this suite does NOT establish
 //!
 //! It localizes the collapse to a STAGE, on ONE clip, at ONE configuration, on
@@ -89,7 +101,9 @@
 //! - **It does not separate int8 from `All` from the conversion itself.** The
 //!   factor varied is the BACKEND; the CoreML embedding arm is the shipping
 //!   bundle (int8-palettized artifact + `All` placement + that conversion) as
-//!   one unit. See [`assert_factorial_verdict`]'s "What it does NOT pin".
+//!   one unit. See [`assert_factorial_verdict`]'s "What it does NOT pin" — and
+//!   [`embedding_precision_x_placement`], which is the experiment that does
+//!   separate them.
 //! - **It does not say which op inside a stage is responsible, and it cannot.**
 //!   Both segmentation graphs expose only their post-tail output
 //!   (`z - logsumexp(z)`), never the pre-tail logits `z`, so no measurement
@@ -106,6 +120,17 @@
 //! ```text
 //! cargo test -p coremlit --features speaker-oracle --test speaker_backend_factorial -- --ignored --nocapture
 //! ```
+//!
+//! **`--features speaker-oracle`, never `--all-features`.** Under
+//! `--all-features` this binary HANGS instead of running: `align-oracle` pulls
+//! `asry`, which enables `ort/load-dynamic`, and Cargo unifies that onto the
+//! single `ort` in the build — so `dia`'s first `Session` tries to `dlopen` an
+//! ONNX Runtime dylib that is not there, and `ort`'s failure path re-enters the
+//! same `OnceLock` it is initializing (`setup_api` -> error construction ->
+//! `ort::api()` -> `Once::wait`) and deadlocks forever. A plain
+//! `cargo test -p coremlit --all-features` does not notice, because without
+//! `--ignored` it never opens an `ort` session. The same applies to every
+//! `speaker-oracle` DER binary.
 #![cfg(feature = "speaker-oracle")]
 
 mod common;
@@ -242,6 +267,92 @@ fn coreml_embed_path() -> PathBuf {
   common::embed_path()
 }
 
+/// The CoreML embedding artifact's **weight precision** — the quantization
+/// axis of [`embedding_precision_x_placement`].
+///
+/// Both artifacts are contract-equal (`model_io`'s
+/// `wespeaker_fp32_io_contract_equal_but_not_targeted`), so they are
+/// substitutable for each other in [`EmbedSide`] and differ only in whether the
+/// weights were palettized.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Precision {
+  /// `wespeaker.mlmodelc` — 27 MB of unquantized float32 weights.
+  Fp32,
+  /// `wespeaker_v2.mlmodelc` — the int8-palettized artifact `ModelSource`
+  /// ships.
+  Int8,
+}
+
+impl Precision {
+  fn path(self) -> PathBuf {
+    match self {
+      Self::Fp32 => common::embed_fp32_path(),
+      Self::Int8 => coreml_embed_path(),
+    }
+  }
+  const fn artifact(self) -> &'static str {
+    match self {
+      Self::Fp32 => "wespeaker.mlmodelc",
+      Self::Int8 => "wespeaker_v2.mlmodelc",
+    }
+  }
+  const fn tag(self) -> &'static str {
+    match self {
+      Self::Fp32 => "fp32",
+      Self::Int8 => "int8",
+    }
+  }
+}
+
+/// **One embedding arm**: which conversion computes the embeddings and, for the
+/// CoreML conversion, at which precision and on which compute placement.
+///
+/// [`shipping_config_backend_factorial`] only ever needs the two ends of the
+/// [`Backend`] axis, so it uses [`Self::SHIPPING`] for its CoreML cells and
+/// nothing else. [`embedding_precision_x_placement`] is the suite that opens
+/// the other two dimensions up.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum EmbedArm {
+  /// dia's fp32 `wespeaker_resnet34_lm.onnx` on `ort`'s CPU EP — the reference
+  /// implementation, and the only arm that is not a CoreML conversion.
+  Onnx,
+  /// speakerkit's CoreML conversion at a chosen precision and placement.
+  CoreMl {
+    precision: Precision,
+    placement: ComputeUnits,
+  },
+}
+
+impl EmbedArm {
+  /// The literal shipping embedding path: the int8-palettized artifact on
+  /// [`ComputeUnits::All`]. This is the bundle
+  /// [`shipping_config_backend_factorial`] varies as a single unit.
+  const SHIPPING: Self = Self::CoreMl {
+    precision: Precision::Int8,
+    placement: PLACEMENT,
+  };
+
+  /// The [`Backend`] this arm belongs to — the coarse factor the 2x2
+  /// cross-product varies.
+  const fn backend(self) -> Backend {
+    match self {
+      Self::Onnx => Backend::Onnx,
+      Self::CoreMl { .. } => Backend::CoreMl,
+    }
+  }
+
+  /// `"ONNX (fp32) / CPU"`-style label for the report tables.
+  fn label(self) -> String {
+    match self {
+      Self::Onnx => "ONNX fp32 / ort CPU EP".to_string(),
+      Self::CoreMl {
+        precision,
+        placement,
+      } => format!("CoreML {} / {placement:?}", precision.tag()),
+    }
+  }
+}
+
 // ══════════════════════════════════════════════════════════════════════
 // Stage 1 — segmentation log-probabilities, one backend at a time
 // ══════════════════════════════════════════════════════════════════════
@@ -340,16 +451,25 @@ enum EmbedSide {
 }
 
 impl EmbedSide {
-  fn load(backend: Backend) -> Self {
-    match backend {
-      Backend::CoreMl => Self::CoreMl(
+  fn load(arm: EmbedArm) -> Self {
+    match arm {
+      EmbedArm::CoreMl {
+        precision,
+        placement,
+      } => Self::CoreMl(
         EmbedModel::from_file_with(
-          coreml_embed_path(),
-          EmbedModelOptions::new().with_compute(PLACEMENT),
+          precision.path(),
+          EmbedModelOptions::new().with_compute(placement),
         )
-        .expect("load wespeaker_v2.mlmodelc (int8, shipping)"),
+        .unwrap_or_else(|e| {
+          panic!(
+            "load {} ({}) on {placement:?}: {e}",
+            precision.artifact(),
+            precision.tag()
+          )
+        }),
       ),
-      Backend::Onnx => {
+      EmbedArm::Onnx => {
         let onnx = dia_wespeaker_onnx();
         assert!(
           onnx.exists(),
@@ -771,8 +891,9 @@ fn shipping_config_backend_factorial() {
   // ── Stage 2: the four cells.
   let mut cells: Vec<CellResult> = Vec::with_capacity(4);
   for (seg_backend, seg_run) in [(Backend::Onnx, &seg_onnx), (Backend::CoreMl, &seg_coreml)] {
-    for embed_backend in [Backend::Onnx, Backend::CoreMl] {
-      let mut embed = EmbedSide::load(embed_backend);
+    for embed_arm in [EmbedArm::Onnx, EmbedArm::SHIPPING] {
+      let embed_backend = embed_arm.backend();
+      let mut embed = EmbedSide::load(embed_arm);
       let cell = assemble(seg_run, &mut embed, &samples, &starts);
       assert_eq!(
         common::fnv1a_f32(&samples),
@@ -932,10 +1053,14 @@ struct FactorialObserved {
 /// not precision and not placement. `ONNX-seg + COREML-emb` therefore
 /// implicates "the CoreML embedding path as shipped" — int8-palettized
 /// artifact, `All` placement, that conversion — as one bundle. Which of those
-/// three properties carries the failure is NOT isolated here; separating them
-/// needs the same hybrid harness run with the fp32 CoreML embedder on `All`
-/// and with the int8 CoreML embedder on `CpuOnly`, reference segmentation held
-/// fixed.
+/// three properties carries the failure is NOT isolated here.
+///
+/// [`embedding_precision_x_placement`] is the experiment that isolates them,
+/// and it re-measures this very cell as its own cell B. Its finding, in one
+/// line: the conversion carries none of it (fp32 on `CpuOnly` is frame-perfect
+/// against dia-ort), the palettization carries 2 of the 3 lost speakers, and
+/// the `All` placement carries 1 — so this cell's "the CoreML embedding path"
+/// must not be read as "the CoreML embedding conversion".
 ///
 /// # Panics
 /// On any divergence from the pinned record, naming the cell and what the
@@ -1107,6 +1232,787 @@ fn factorial_verdict_pins_every_cell() {
     (
       |o: &mut FactorialObserved| o.coreml_onnx = None,
       "a segmenter-only clustering refusal",
+    ),
+  ] {
+    let mut o = good;
+    mutate(&mut o);
+    fails(o, what);
+  }
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// The disambiguating experiment: precision x placement, reference
+// segmentation held fixed
+// ══════════════════════════════════════════════════════════════════════
+
+/// The five embedding arms, in report order. Reference segmentation is held
+/// fixed for all of them, so the ONLY thing that varies down this list is a
+/// property of the embedding path.
+///
+/// | cell | arm | what its outcome establishes |
+/// |---|---|---|
+/// | A | ONNX fp32 on `ort`'s CPU EP | the reference; harness validity |
+/// | B | CoreML int8 on `All` | the shipping bundle; reproduces `shipping_config_backend_factorial`'s `ONNX-seg + COREML-emb` cell |
+/// | C | CoreML **fp32** on `All` | placement + conversion, quantization removed |
+/// | D | CoreML int8 on **`CpuOnly`** | quantization + conversion, placement removed |
+/// | E | CoreML fp32 on `CpuOnly` | the conversion alone, both other factors removed |
+const PRECISION_PLACEMENT_ARMS: [EmbedArm; 5] = [
+  EmbedArm::Onnx,
+  EmbedArm::SHIPPING,
+  EmbedArm::CoreMl {
+    precision: Precision::Fp32,
+    placement: ComputeUnits::All,
+  },
+  EmbedArm::CoreMl {
+    precision: Precision::Int8,
+    placement: ComputeUnits::CpuOnly,
+  },
+  EmbedArm::CoreMl {
+    precision: Precision::Fp32,
+    placement: ComputeUnits::CpuOnly,
+  },
+];
+
+/// One embedding arm's measured result over the fixed reference segmentation.
+struct ArmResult {
+  cell: char,
+  arm: EmbedArm,
+  outcome: Result<Vec<Seg>, diaric::offline::Error>,
+  embed_s: f64,
+  /// The arm's `[num_chunks * SEG_NUM_SLOTS * EMBEDDING_DIM]` raw embeddings,
+  /// kept so [`embed_agreement`] can report how far each arm's embedding SPACE
+  /// moved — the intermediate the DER table's outcomes are downstream of.
+  embeddings: Vec<f32>,
+}
+
+impl ArmResult {
+  fn spk(&self) -> Option<usize> {
+    self
+      .outcome
+      .as_ref()
+      .ok()
+      .map(|s| distinct_speakers(s).len())
+  }
+  fn der(&self, reference: &[Seg]) -> Option<Der> {
+    self.outcome.as_ref().ok().map(|s| der_std(reference, s))
+  }
+}
+
+/// How far one arm's embeddings sit from the ONNX reference arm's, over the
+/// `(chunk, slot)` rows both arms actually produced.
+///
+/// Reported, not asserted: it is the mechanism-side companion to the DER table,
+/// and its job is to say whether two arms that land on the same DER got there
+/// through the same size of embedding perturbation. The DER outcomes are what
+/// the verdict is pinned on.
+struct EmbedAgreement {
+  /// Rows non-zero on BOTH sides — the ones a cosine is defined on.
+  rows: usize,
+  mean_cos: f64,
+  min_cos: f64,
+  /// Rows non-zero on exactly one side: dia's [`PLDA_MIN_NORM`] pre-check
+  /// dropped the `(chunk, slot)` on one arm and kept it on the other. A cosine
+  /// is undefined against a zeroed row, so these are counted rather than
+  /// folded in — and they are themselves a divergence, since a dropped slot
+  /// also zeroes that slot's segmentation column.
+  drop_disagreements: usize,
+}
+
+/// Compares one arm's `raw_embeddings` against the reference arm's, row by row.
+///
+/// An all-zero row means the slot was never embedded: either the
+/// overlap-exclusion rule skipped it (identical across arms — the plans derive
+/// from the ONE fixed reference segmentation) or [`PLDA_MIN_NORM`] dropped it
+/// (which CAN differ per arm). Rows zero on both sides carry no information.
+fn embed_agreement(arm: &[f32], reference: &[f32]) -> EmbedAgreement {
+  assert_eq!(
+    arm.len(),
+    reference.len(),
+    "embedding tensors have different lengths ({} vs {})",
+    arm.len(),
+    reference.len()
+  );
+  let mut d = EmbedAgreement {
+    rows: 0,
+    mean_cos: 0.0,
+    min_cos: f64::INFINITY,
+    drop_disagreements: 0,
+  };
+  let mut total = 0.0f64;
+  for (a, r) in arm
+    .as_chunks::<EMBEDDING_DIM>()
+    .0
+    .iter()
+    .zip(reference.as_chunks::<EMBEDDING_DIM>().0)
+  {
+    let a_live = a.iter().any(|v| *v != 0.0);
+    let r_live = r.iter().any(|v| *v != 0.0);
+    match (a_live, r_live) {
+      (true, true) => {
+        let c = common::cosine(a, r);
+        d.rows += 1;
+        total += c;
+        d.min_cos = d.min_cos.min(c);
+      }
+      (false, false) => {}
+      _ => d.drop_disagreements += 1,
+    }
+  }
+  if d.rows > 0 {
+    d.mean_cos = total / d.rows as f64;
+  } else {
+    d.min_cos = f64::NAN;
+  }
+  d
+}
+
+/// **Which property of the CoreML embedding path carries the clip-09 collapse:
+/// the int8 palettization, the `ComputeUnits::All` placement, or the conversion
+/// itself?**
+///
+/// [`shipping_config_backend_factorial`] established that swapping ONLY the
+/// embedding conversion, over dia's own reference segmentation, reproduces the
+/// shipping collapse exactly (5 of 8 speakers, 16.5904 %). But the factor it
+/// varied is the whole BACKEND, so three properties were implicated as one
+/// bundle. This suite separates them: same harness, same clip, same reference
+/// segmentation slabs, five embedding arms.
+///
+/// The DER verdict is [`assert_precision_placement_verdict`]. The report also
+/// prints an unpinned embedding-space companion ([`embed_agreement`]), and it
+/// is worth reading against the verdict because the two disagree about which
+/// factor is "bigger". Measured on the same run as the pinned table, mean and
+/// minimum cosine against cell A over all 2 114 `(chunk, slot)` rows, with zero
+/// [`PLDA_MIN_NORM`] drop disagreements on any arm:
+///
+/// ```text
+/// B  CoreML int8 / All        mean 0.985777 | min 0.042112
+/// C  CoreML fp32 / All        mean 0.987201 | min 0.035367
+/// D  CoreML int8 / CpuOnly    mean 0.998545 | min 0.963721
+/// E  CoreML fp32 / CpuOnly    mean 1.000000 | min 1.000000
+/// ```
+///
+/// Two things to take from it. First, cell E is not merely "clean at the DER
+/// level": the CoreML embedding conversion on `CpuOnly` agrees with dia's fp32
+/// ONNX to 1.000000 on EVERY row, minimum included — the conversion is
+/// numerically the same function, which is the strongest form the exoneration
+/// could take.
+///
+/// Second, **the embedding perturbation is anti-correlated with the clustering
+/// damage here.** The `All` placement moves the embeddings roughly 9x further
+/// in mean cosine distance than the palettization does (~0.013 vs ~0.0015) and
+/// drags some rows to near-orthogonality (min cosine 0.035), yet it costs 1
+/// speaker and 1 839 error units; int8's much smaller, much more uniform
+/// perturbation costs 2 speakers and 11 835. So the size of the embedding
+/// perturbation does not predict the clustering outcome — consistent with
+/// `parity_shipping_der`'s module doc, which already argues that the KIND of
+/// perturbation matters rather than its magnitude, but pointing the opposite
+/// way from that doc's specific rationale: there, quantization was expected to
+/// be the benign, roughly isotropic one. On this clip it is the harmful one.
+/// What structure in the palettization error the frozen community-1 LDA/PLDA
+/// basis is sensitive to is NOT established here; it would need the
+/// perturbation decomposed against that basis, which nothing in this repo
+/// currently does.
+///
+/// **The `embed_s` column is not a latency measurement.** It is wall time for
+/// one un-warmed pass, so it carries each arm's cold CoreML/ANE specialization,
+/// and it is not stable: across two runs of this suite the identical int8/`All`
+/// arm measured 31.7 s and 51.9 s, and fp32/`CpuOnly` 61.1 s and 100.3 s. It is
+/// printed to show an arm ran and roughly how long to expect, nothing else. The
+/// int8-vs-fp32 cost question is answered by
+/// `parity_shipping_der::shipping_embedder_cost_int8_vs_fp32`, which warms up
+/// first and times the whole extract.
+///
+/// The report prints in full BEFORE any assertion fires.
+#[test]
+#[ignore = "requires speakerkit models, dia parity fixtures + WeSpeaker ONNX (17 min of audio, 1 seg + 5 embed passes)"]
+fn embedding_precision_x_placement() {
+  let audio = fixtures_root().join(CLIP).join("clip_16k.wav");
+  assert!(
+    audio.exists(),
+    "clip audio not found at {} (set DIA_PARITY_FIXTURES)",
+    audio.display()
+  );
+  assert!(
+    common::embed_path().exists() && common::embed_fp32_path().exists(),
+    "need BOTH wespeaker_v2.mlmodelc (int8) and wespeaker.mlmodelc (fp32) under {} (set \
+     SPEAKERKIT_TEST_MODELS) — this experiment's whole point is varying the precision, so a \
+     missing artifact must fail loudly rather than be substituted",
+    common::models_dir().display()
+  );
+
+  let samples = common::load_wav_16k_mono(&audio);
+  let audio_fnv = common::fnv1a_f32(&samples);
+  assert_eq!(
+    samples.len(),
+    CLIP_SAMPLES,
+    "{CLIP}: decoded {} samples, pinned {CLIP_SAMPLES} — the audio identity changed",
+    samples.len()
+  );
+  assert_eq!(
+    audio_fnv, CLIP_AUDIO_FNV,
+    "{CLIP}: audio content hash {audio_fnv} != pinned {CLIP_AUDIO_FNV}"
+  );
+
+  let reference = parse_rttm(&fixtures_root().join(CLIP).join("reference.rttm"));
+  let ref_spk = distinct_speakers(&reference).len();
+  assert_eq!(
+    ref_spk, CLIP_REF_SPK,
+    "{CLIP}: reference.rttm has {ref_spk} speakers, expected {CLIP_REF_SPK}"
+  );
+
+  let window = Options::new().window();
+  let starts = chunk_starts(samples.len(), &window);
+  let plda = diaric::plda::PldaTransform::new().expect("load community-1 PldaTransform (diaric)");
+
+  println!(
+    "\n╔══ embedding precision x placement — {CLIP} ══\n║ {:.2} s, {} samples, fnv1a={}\n║ \
+     segmentation: dia ONNX (the REFERENCE), held fixed for every arm | {} chunks",
+    samples.len() as f64 / 16_000.0,
+    samples.len(),
+    common::fnv_hex(audio_fnv),
+    starts.len()
+  );
+
+  // ── The reference segmentation, computed ONCE. Every arm consumes these
+  // exact slabs, so nothing downstream of the embedder can differ for a
+  // segmentation reason.
+  let seg = run_seg(Backend::Onnx, &samples, &starts);
+  assert_eq!(
+    common::fnv1a_f32(&samples),
+    audio_fnv,
+    "the audio buffer changed under segmentation — comparison invalid"
+  );
+  println!(
+    "║ seg: ONNX {:.1} s, {} frames/chunk\n║",
+    seg.elapsed_s, seg.num_frames
+  );
+
+  let mut arms: Vec<ArmResult> = Vec::with_capacity(PRECISION_PLACEMENT_ARMS.len());
+  for (i, arm) in PRECISION_PLACEMENT_ARMS.into_iter().enumerate() {
+    let cell = char::from(b'A' + u8::try_from(i).expect("five arms"));
+    let mut embed = EmbedSide::load(arm);
+    let assembled = assemble(&seg, &mut embed, &samples, &starts);
+    assert_eq!(
+      common::fnv1a_f32(&samples),
+      audio_fnv,
+      "cell {cell} ({}): the audio buffer changed under the arm — comparison invalid",
+      arm.label()
+    );
+    assert_eq!(
+      assembled.num_chunks,
+      starts.len(),
+      "cell {cell} ({}): chunk grid diverged",
+      arm.label()
+    );
+    let outcome = cluster(&assembled, &window, &plda);
+    println!(
+      "║ ran {cell}: {:<24} ({:>5.1} s embed): {}",
+      arm.label(),
+      assembled.embed_s,
+      match &outcome {
+        Ok(s) => format!("{} speakers", distinct_speakers(s).len()),
+        Err(e) => format!("CLUSTERING FAILED — {e}"),
+      }
+    );
+    arms.push(ArmResult {
+      cell,
+      arm,
+      outcome,
+      embed_s: assembled.embed_s,
+      embeddings: assembled.raw_embeddings,
+    });
+  }
+
+  // ── The table.
+  println!(
+    "║\n║ {:>4} | {:>24} | {:>4} | {:>9} | {:>9} | {:>9} | {:>9} | {:>9} | outcome",
+    "cell", "embedding arm", "spk", "DER", "miss", "fa", "conf", "err units"
+  );
+  println!(
+    "║ {:-<4}-+-{:-<24}-+-{:-<4}-+-{:-<9}-+-{:-<9}-+-{:-<9}-+-{:-<9}-+-{:-<9}-+--------",
+    "", "", "", "", "", "", "", ""
+  );
+  for a in &arms {
+    match (a.spk(), a.der(&reference)) {
+      (Some(spk), Some(d)) => println!(
+        "║ {:>4} | {:>24} | {spk:>4} | {:>8.4}% | {:>8.4}% | {:>8.4}% | {:>8.4}% | {:>9} | \
+         clustered ({:.1} s embed)",
+        a.cell,
+        a.arm.label(),
+        d.der * 100.0,
+        d.miss * 100.0,
+        d.fa * 100.0,
+        d.confusion * 100.0,
+        d.err_units(),
+        a.embed_s,
+      ),
+      _ => println!(
+        "║ {:>4} | {:>24} | {:>4} | {:>9} | {:>9} | {:>9} | {:>9} | {:>9} | Err: {}",
+        a.cell,
+        a.arm.label(),
+        "ERR",
+        "-",
+        "-",
+        "-",
+        "-",
+        "-",
+        a.outcome
+          .as_ref()
+          .expect_err("no speaker count implies Err"),
+      ),
+    }
+  }
+  for a in &arms {
+    if let Some(d) = a.der(&reference) {
+      println!(
+        "║   {}",
+        fmt_der(&format!("{} {}", a.cell, a.arm.label()), &d)
+      );
+    }
+  }
+
+  // ── The embedding space each arm handed to clustering, against cell A's.
+  // Reported, not pinned: it says whether arms that land on the same DER got
+  // there through the same size of perturbation.
+  let reference_embeddings: &[f32] = &arms
+    .iter()
+    .find(|a| a.arm == EmbedArm::Onnx)
+    .expect("cell A ran")
+    .embeddings;
+  println!("║\n║ embedding agreement vs cell A (ONNX fp32), per (chunk, slot) row:");
+  for a in arms.iter().filter(|a| a.arm != EmbedArm::Onnx) {
+    let g = embed_agreement(&a.embeddings, reference_embeddings);
+    println!(
+      "║   {} {:<24} mean cos {:.6} | min cos {:.6} | {} rows | {} PLDA_MIN_NORM drop \
+       disagreements",
+      a.cell,
+      a.arm.label(),
+      g.mean_cos,
+      g.min_cos,
+      g.rows,
+      g.drop_disagreements,
+    );
+  }
+  println!("╚══ reference (pyannote 4.0.4): {ref_spk} speakers\n");
+
+  let at = |arm: EmbedArm| -> Option<CellOutcome> {
+    let a = arms
+      .iter()
+      .find(|a| a.arm == arm)
+      .unwrap_or_else(|| panic!("every arm ran ({})", arm.label()));
+    let d = a.der(&reference)?;
+    Some(CellOutcome {
+      spk: a.spk()?,
+      der: d.der,
+      err_units: d.err_units(),
+    })
+  };
+
+  assert_precision_placement_verdict(&PrecisionPlacementObserved {
+    onnx_cpu: at(EmbedArm::Onnx),
+    int8_all: at(EmbedArm::SHIPPING),
+    fp32_all: at(EmbedArm::CoreMl {
+      precision: Precision::Fp32,
+      placement: ComputeUnits::All,
+    }),
+    int8_cpu: at(EmbedArm::CoreMl {
+      precision: Precision::Int8,
+      placement: ComputeUnits::CpuOnly,
+    }),
+    fp32_cpu: at(EmbedArm::CoreMl {
+      precision: Precision::Fp32,
+      placement: ComputeUnits::CpuOnly,
+    }),
+  });
+}
+
+/// One arm's decision-relevant outcome. `err_units` is the DER numerator in raw
+/// speaker-frames — the axis on which "0" means *not one scored frame differs*
+/// rather than "rounds to 0.0000 %", which is the whole strength of cells A
+/// and E.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct CellOutcome {
+  spk: usize,
+  der: f64,
+  err_units: u64,
+}
+
+/// The five arms' outcomes, or `None` where an arm's clustering refused to
+/// answer. Extracted from the measurement (or synthesized by
+/// [`precision_placement_verdict_pins_every_cell`]) so
+/// [`assert_precision_placement_verdict`] is a pure function both can call.
+#[derive(Clone, Copy, Debug)]
+struct PrecisionPlacementObserved {
+  onnx_cpu: Option<CellOutcome>,
+  int8_all: Option<CellOutcome>,
+  fp32_all: Option<CellOutcome>,
+  int8_cpu: Option<CellOutcome>,
+  fp32_cpu: Option<CellOutcome>,
+}
+
+/// `CoreML fp32 / All` (cell C) — the placement + conversion, quantization
+/// removed.
+const CELL_C_SPK: usize = 7;
+const CELL_C_DER: f64 = 0.025_427;
+
+/// `CoreML int8 / CpuOnly` (cell D) — the quantization + conversion, placement
+/// removed.
+const CELL_D_SPK: usize = 6;
+const CELL_D_DER: f64 = 0.163_636;
+
+/// `CoreML fp32 / CpuOnly` (cell E) — the conversion ALONE. It reproduces the
+/// dia-ort reference exactly, which is why its pin is `err_units == 0` rather
+/// than a DER band.
+const CELL_E_SPK: usize = 8;
+
+/// **The measured precision x placement record on clip 09**, reference
+/// segmentation held fixed (Apple M1 Max, macOS 26.5 build 25F71, arm64):
+///
+/// ```text
+/// cell | embedding arm            | spk |      DER |     conf | err units
+/// -----+--------------------------+-----+----------+----------+----------
+///    A | ONNX fp32 / ort CPU EP   |   8 |  0.0000% |  0.0000% |         0
+///    B | CoreML int8 / All        |   5 | 16.5904% | 16.5904% |     11999
+///    C | CoreML fp32 / All        |   7 |  2.5427% |  2.5427% |      1839
+///    D | CoreML int8 / CpuOnly    |   6 | 16.3636% | 16.3636% |     11835
+///    E | CoreML fp32 / CpuOnly    |   8 |  0.0000% |  0.0000% |         0
+/// ```
+///
+/// Laid out as the 2x2 it is, speakers / err units:
+///
+/// ```text
+///          | CpuOnly        | All
+/// ---------+----------------+---------------
+///     fp32 | 8 /      0 (E) | 7 /  1 839 (C)
+///     int8 | 6 / 11 835 (D) | 5 / 11 999 (B)
+/// ```
+///
+/// # What this establishes
+///
+/// - **The conversion itself is exonerated.** Cell E — the CoreML embedding
+///   conversion with BOTH other factors removed — reproduces dia-ort's answer
+///   frame-perfectly: 8 of 8 speakers and `err_units == 0`, not one
+///   collar-scored speaker-frame different from the ONNX reference. Whatever
+///   the clip-09 embedding defect is, it is not "speakerkit converted this
+///   graph wrong".
+/// - **Quantization is the dominant term, and it is placement-independent.**
+///   Holding placement fixed, int8 costs exactly 2 speakers at BOTH
+///   placements (E 8 -> D 6 on `CpuOnly`; C 7 -> B 5 on `All`) and it moves
+///   11 835 of cell B's 11 999 error units — 98.6 % of the shipping arm's
+///   entire error mass — on `CpuOnly` alone.
+/// - **Placement is a real but minority term, and it too is
+///   precision-independent.** Holding precision fixed, `All` costs exactly 1
+///   speaker at BOTH precisions (E 8 -> C 7 on fp32; D 6 -> B 5 on int8). Its
+///   error-unit cost is 1 839 in the fp32 arm (E 0 -> C 1 839) and 164 in the
+///   int8 arm (D 11 835 -> B 11 999) — the latter 1.4 % of the shipping arm's
+///   total, against quantization's 98.6 %.
+/// - **Neither factor alone reproduces the shipping collapse.** Cell B is 5
+///   speakers at 16.5904 %; the best either single factor manages is D's 6
+///   speakers at 16.3636 % (nearly all the DER, one speaker short) or C's 7
+///   speakers at 2.5427 % (one speaker short of the reference, and 6.5x
+///   smaller in DER). On speaker count the two factors are cleanly ADDITIVE:
+///   -2 for quantization, -1 for placement, at every level of the other.
+///
+/// # What it does NOT establish
+///
+/// - **It is one clip, one host, one segmentation backend.** Every arm here
+///   runs over dia's ONNX reference segmentation, which is NOT what this crate
+///   ships; `parity_shipping_der`'s arms run CoreML segmentation and land
+///   nearby but not identically (its int8/`CpuOnly` clip-09 arm is 6 speakers
+///   at 16.4590 %, against cell D's 16.3636 %).
+/// - **It does not price the remedy.** That fp32 recovers speakers HERE says
+///   nothing about what fp32 does to the other corpus clips, and no fp32/`All`
+///   DER arm exists for the gated clips (06 / 14 / 10) — `parity_shipping_der`
+///   measures fp32 only on `CpuOnly`. Deciding to ship fp32 needs that arm
+///   measured, clip 14 especially.
+/// - **It does not say WHY int8 costs two speakers.** Palettization changes the
+///   weights, not the graph: the two artifacts' op histograms are identical
+///   apart from 38 `constexpr_lut_to_dense` decompressions replacing 36 `const`
+///   weight tensors (and one dropped no-op `identity`). Which layer's
+///   perturbation the frozen LDA/PLDA basis is sensitive to is unmeasured.
+///
+/// # Panics
+/// On any divergence from the pinned record, naming the cell and what the
+/// divergence means for the attribution recorded in `model_io.rs`.
+fn assert_precision_placement_verdict(o: &PrecisionPlacementObserved) {
+  // ── Cell A: the harness reproduces the dia-ort reference.
+  let a = o.onnx_cpu.unwrap_or_else(|| {
+    panic!(
+      "cell A (ONNX fp32 / ort CPU EP) did not cluster. The reference arm must reproduce dia-ort; \
+       that is a harness failure, not a finding about the CoreML path — no other cell can be \
+       trusted."
+    )
+  });
+  assert_eq!(
+    a.spk, REFERENCE_CORNER_SPK,
+    "cell A found {} speakers, not dia-ort's pinned {REFERENCE_CORNER_SPK} — the harness does not \
+     reproduce the reference, so no cell it produced can be trusted",
+    a.spk
+  );
+  assert_eq!(
+    a.err_units, 0,
+    "cell A scored {} error units against reference.rttm; dia-ort is frame-perfect on this clip, \
+     so the harness has diverged from the reference pipeline",
+    a.err_units
+  );
+
+  // ── Cell B: this suite's arm B is `shipping_config_backend_factorial`'s
+  // `ONNX-seg + COREML-emb` cell, re-measured. Same segmentation backend, same
+  // artifact, same placement — so it lands on that suite's pin or the two
+  // suites are not measuring the same thing.
+  let b = o.int8_all.unwrap_or_else(|| {
+    panic!(
+      "cell B (CoreML int8 / All) did not cluster. It is pinned as REPRODUCING the shipping \
+       collapse (an answer of {EMBED_ONLY_SPK} of 8 speakers), which is also \
+       `shipping_config_backend_factorial`'s pinned `ONNX-seg + COREML-emb` cell — a change of \
+       failure MODE is a new finding, not a flake."
+    )
+  });
+  assert_eq!(
+    b.spk, EMBED_ONLY_SPK,
+    "cell B found {} speakers, not the {EMBED_ONLY_SPK} that \
+     `shipping_config_backend_factorial` pins for the identical arm. These two suites share a \
+     cell on purpose; if it moved, they are no longer measuring the same configuration and this \
+     experiment's baseline is gone.",
+    b.spk
+  );
+  assert!(
+    (b.der - SHIPPING_CORNER_DER).abs() <= CORNER_DER_TOL,
+    "cell B scored {:.4} % DER; the identical arm is pinned at {:.4} % (±{:.4} %) by \
+     `shipping_config_backend_factorial` and by `parity_shipping_der`'s int8/All clip-09 pin",
+    b.der * 100.0,
+    SHIPPING_CORNER_DER * 100.0,
+    CORNER_DER_TOL * 100.0
+  );
+
+  // ── THE FINDING, part 1: the conversion alone is CLEAN.
+  let e = o.fp32_cpu.unwrap_or_else(|| {
+    panic!(
+      "cell E (CoreML fp32 / CpuOnly) did not cluster. It is pinned as reproducing the reference \
+       EXACTLY; a refusal to answer would mean the CoreML embedding conversion is defective on \
+       its own, overturning this suite's central result."
+    )
+  });
+  assert_eq!(
+    e.spk, CELL_E_SPK,
+    "cell E found {} speakers, not the pinned {CELL_E_SPK}. This cell is the whole reason \
+     `model_io.rs` records the CoreML embedding CONVERSION as exonerated and attributes clip 09 \
+     to the int8 palettization plus the `All` placement instead. If it moved, that attribution is \
+     stale and must be rewritten — do NOT delete this assertion.",
+    e.spk
+  );
+  assert_eq!(
+    e.err_units, 0,
+    "cell E scored {} error units. The pinned claim is not 'small DER' but frame-perfect identity \
+     with the dia-ort reference — with quantization and the `All` placement both removed, the \
+     CoreML embedding conversion does not move one collar-scored speaker-frame. A non-zero value \
+     here weakens that to 'nearly clean', which is a different finding.",
+    e.err_units
+  );
+
+  // ── THE FINDING, part 2: quantization, placement held at CpuOnly.
+  let d = o.int8_cpu.unwrap_or_else(|| {
+    panic!(
+      "cell D (CoreML int8 / CpuOnly) did not cluster. It is pinned as ANSWERING with \
+       {CELL_D_SPK} speakers; a refusal is a new failure mode, not a flake."
+    )
+  });
+  assert_eq!(
+    d.spk, CELL_D_SPK,
+    "cell D found {} speakers, not the pinned {CELL_D_SPK}. Against cell E's {CELL_E_SPK}, this \
+     cell is what prices the int8 palettization on its own: 2 speakers, with the placement held \
+     at `CpuOnly`.",
+    d.spk
+  );
+  assert!(
+    (d.der - CELL_D_DER).abs() <= CORNER_DER_TOL,
+    "cell D scored {:.4} % DER, off the pinned {:.4} % (±{:.4} %). Its landing within 0.23 pp of \
+     the shipping arm's 16.5904 % is what says quantization carries almost the whole error mass.",
+    d.der * 100.0,
+    CELL_D_DER * 100.0,
+    CORNER_DER_TOL * 100.0
+  );
+
+  // ── THE FINDING, part 3: placement, precision held at fp32.
+  let c = o.fp32_all.unwrap_or_else(|| {
+    panic!(
+      "cell C (CoreML fp32 / All) did not cluster. It is pinned as ANSWERING with {CELL_C_SPK} \
+       speakers; a refusal is a new failure mode, not a flake."
+    )
+  });
+  assert_eq!(
+    c.spk, CELL_C_SPK,
+    "cell C found {} speakers, not the pinned {CELL_C_SPK}. Against cell E's {CELL_E_SPK}, this \
+     cell is what prices the `All` placement on its own: 1 speaker, with the precision held at \
+     fp32. If it now recovers all {CELL_E_SPK}, the placement is no longer implicated at all and \
+     the record must say so.",
+    c.spk
+  );
+  assert!(
+    (c.der - CELL_C_DER).abs() <= CORNER_DER_TOL,
+    "cell C scored {:.4} % DER, off the pinned {:.4} % (±{:.4} %). Its being 6.5x SMALLER than \
+     the shipping arm's 16.5904 % is what says the placement is the minority term.",
+    c.der * 100.0,
+    CELL_C_DER * 100.0,
+    CORNER_DER_TOL * 100.0
+  );
+}
+
+/// [`assert_precision_placement_verdict`] pins EVERY cell, in BOTH directions —
+/// proven here hermetically (no models, no fixtures, no audio): the measured
+/// record passes, and every single-cell perturbation fails. Same falsifiability
+/// contract as [`factorial_verdict_pins_every_cell`]; without it a cell could
+/// silently go unpinned and a real change in which factor carries the collapse
+/// would pass green.
+#[test]
+fn precision_placement_verdict_pins_every_cell() {
+  /// A frame-perfect outcome: `spk` speakers and not one differing scored
+  /// speaker-frame. Free-standing rather than a closure so the mutation table
+  /// below can still coerce to `fn(&mut _)`.
+  const fn clean(spk: usize) -> CellOutcome {
+    CellOutcome {
+      spk,
+      der: 0.0,
+      err_units: 0,
+    }
+  }
+  let good = PrecisionPlacementObserved {
+    onnx_cpu: Some(clean(REFERENCE_CORNER_SPK)),
+    int8_all: Some(CellOutcome {
+      spk: EMBED_ONLY_SPK,
+      der: SHIPPING_CORNER_DER,
+      err_units: 11_999,
+    }),
+    fp32_all: Some(CellOutcome {
+      spk: CELL_C_SPK,
+      der: CELL_C_DER,
+      err_units: 1_839,
+    }),
+    int8_cpu: Some(CellOutcome {
+      spk: CELL_D_SPK,
+      der: CELL_D_DER,
+      err_units: 11_835,
+    }),
+    fp32_cpu: Some(clean(CELL_E_SPK)),
+  };
+  assert_precision_placement_verdict(&good);
+
+  let fails = |o: PrecisionPlacementObserved, what: &str| {
+    assert!(
+      std::panic::catch_unwind(move || assert_precision_placement_verdict(&o)).is_err(),
+      "assert_precision_placement_verdict accepted a record with {what} — that cell is NOT pinned"
+    );
+  };
+
+  for (mutate, what) in [
+    (
+      (|o: &mut PrecisionPlacementObserved| o.onnx_cpu = Some(clean(9)))
+        as fn(&mut PrecisionPlacementObserved),
+      "a moved cell-A speaker count",
+    ),
+    (
+      |o: &mut PrecisionPlacementObserved| {
+        o.onnx_cpu = Some(CellOutcome {
+          spk: REFERENCE_CORNER_SPK,
+          der: 0.0,
+          err_units: 1,
+        });
+      },
+      "a cell A that is no longer frame-perfect",
+    ),
+    (
+      |o: &mut PrecisionPlacementObserved| o.onnx_cpu = None,
+      "a cell-A clustering refusal",
+    ),
+    (
+      |o: &mut PrecisionPlacementObserved| {
+        o.int8_all = Some(CellOutcome {
+          spk: 6,
+          der: SHIPPING_CORNER_DER,
+          err_units: 11_999,
+        });
+      },
+      "a moved cell-B speaker count",
+    ),
+    (
+      |o: &mut PrecisionPlacementObserved| {
+        o.int8_all = Some(CellOutcome {
+          spk: EMBED_ONLY_SPK,
+          der: 0.17,
+          err_units: 11_999,
+        });
+      },
+      "a moved cell-B DER",
+    ),
+    (
+      |o: &mut PrecisionPlacementObserved| o.int8_all = None,
+      "a cell-B clustering refusal",
+    ),
+    (
+      |o: &mut PrecisionPlacementObserved| {
+        o.fp32_all = Some(CellOutcome {
+          spk: CELL_E_SPK,
+          der: CELL_C_DER,
+          err_units: 1_839,
+        });
+      },
+      "a cell C that recovers every speaker (the placement no longer implicated)",
+    ),
+    (
+      |o: &mut PrecisionPlacementObserved| {
+        o.fp32_all = Some(CellOutcome {
+          spk: CELL_C_SPK,
+          der: SHIPPING_CORNER_DER,
+          err_units: 11_999,
+        });
+      },
+      "a cell-C DER that moved to the shipping arm's",
+    ),
+    (
+      |o: &mut PrecisionPlacementObserved| o.fp32_all = None,
+      "a cell-C clustering refusal",
+    ),
+    (
+      |o: &mut PrecisionPlacementObserved| {
+        o.int8_cpu = Some(CellOutcome {
+          spk: CELL_E_SPK,
+          der: CELL_D_DER,
+          err_units: 11_835,
+        });
+      },
+      "a cell D that recovers every speaker (quantization no longer implicated)",
+    ),
+    (
+      |o: &mut PrecisionPlacementObserved| {
+        o.int8_cpu = Some(CellOutcome {
+          spk: CELL_D_SPK,
+          der: 0.0,
+          err_units: 0,
+        });
+      },
+      "a moved cell-D DER",
+    ),
+    (
+      |o: &mut PrecisionPlacementObserved| o.int8_cpu = None,
+      "a cell-D clustering refusal",
+    ),
+    (
+      |o: &mut PrecisionPlacementObserved| o.fp32_cpu = Some(clean(CELL_C_SPK)),
+      "a cell E that loses a speaker (the conversion no longer exonerated)",
+    ),
+    (
+      |o: &mut PrecisionPlacementObserved| {
+        o.fp32_cpu = Some(CellOutcome {
+          spk: CELL_E_SPK,
+          der: 0.0,
+          err_units: 1,
+        });
+      },
+      "a cell E that is no longer frame-perfect",
+    ),
+    (
+      |o: &mut PrecisionPlacementObserved| o.fp32_cpu = None,
+      "a cell-E clustering refusal",
     ),
   ] {
     let mut o = good;

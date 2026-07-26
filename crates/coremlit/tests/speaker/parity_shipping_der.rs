@@ -94,6 +94,19 @@
 //!    because the shipping embedding path is int8 on `All`, which no arm here
 //!    isolates.
 //!
+//!    That older reading is now **refuted**, and this suite's own fp32 control
+//!    is why it survived so long: the control is CONFOUNDED, because it runs
+//!    CoreML segmentation, and the segmentation conversion's separate clip-09
+//!    defect is what makes it unable to answer.
+//!    `backend_factorial.rs`'s `embedding_precision_x_placement` holds dia's
+//!    reference segmentation fixed instead, at which point the fp32 control
+//!    clusters and the precision axis is measurable: int8 costs **2 speakers at
+//!    both placements** (8 → 6 on `CpuOnly`, 7 → 5 on `All`) and 11 835 of the
+//!    shipping arm's 11 999 error units, while the CoreML embedding conversion
+//!    at fp32 on `CpuOnly` reproduces dia-ort frame-perfectly. On clip 09 the
+//!    defect is mostly int8's; the `All` placement adds the third lost speaker;
+//!    the conversion itself adds none.
+//!
 //! # The diagnostic: confusion, not DER
 //!
 //! DER decomposes into miss + false-alarm + confusion. Miss/FA move with
@@ -1295,6 +1308,16 @@ shipping_der_gate! {
   /// int8/All numbers pinned below (see the module doc's point 2). This is a real,
   /// separately-actionable defect, and it is pinned here rather than deleted so it
   /// cannot be forgotten.
+  ///
+  /// The fp32 control being "worse than int8" HERE is an artifact of this
+  /// suite's design, not a property of fp32: every arm above runs CoreML
+  /// segmentation, so the control carries the segmentation conversion's own
+  /// clip-09 defect on top of whatever the embedder does. Swap in dia's
+  /// reference segmentation and the ordering reverses — fp32/`CpuOnly` becomes
+  /// frame-perfect (8 speakers, 0 error units) and int8 is what costs 2
+  /// speakers. See `backend_factorial.rs`'s `embedding_precision_x_placement`.
+  /// Read the fp32 rows below as "fp32 plus a defective segmenter", never as
+  /// "fp32".
   ///
   /// The assertion is on the KNOWN-BAD state, pinned field by field by
   /// [`assert_clip09_known_defect`]: clip identity, the reference and oracle counts,
