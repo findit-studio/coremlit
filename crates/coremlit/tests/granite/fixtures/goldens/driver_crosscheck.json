@@ -1,71 +1,90 @@
 {
- "worst_cosine_canonical_vs_driver": 0.999999977090618,
+ "worst_cosine_canonical_vs_driver": 0.9999999999996902,
+ "min_max_abs_component_delta": 9.283082320551972e-08,
  "stop_threshold_divergence": 0.0001,
  "verdict": "AGREE",
  "per_entry": [
   {
    "id": "en_q",
-   "cosine_canonical_vs_driver": 1.0000000547412746
+   "cosine_canonical_vs_driver": 0.9999999999998216,
+   "max_abs_component_delta": 2.1864493060519408e-07
   },
   {
    "id": "en_doc",
-   "cosine_canonical_vs_driver": 1.0000000225849048
+   "cosine_canonical_vs_driver": 0.9999999999998612,
+   "max_abs_component_delta": 9.967029535734584e-08
   },
   {
    "id": "zh",
-   "cosine_canonical_vs_driver": 1.000000025138874
+   "cosine_canonical_vs_driver": 0.9999999999997627,
+   "max_abs_component_delta": 2.8246530159314887e-07
   },
   {
    "id": "ja",
-   "cosine_canonical_vs_driver": 1.0000001005859067
+   "cosine_canonical_vs_driver": 0.9999999999997515,
+   "max_abs_component_delta": 1.4117087636378312e-07
   },
   {
    "id": "ar",
-   "cosine_canonical_vs_driver": 0.999999977090618
+   "cosine_canonical_vs_driver": 0.9999999999998137,
+   "max_abs_component_delta": 1.2173496179157528e-07
   },
   {
    "id": "ko",
-   "cosine_canonical_vs_driver": 1.0000000298967098
+   "cosine_canonical_vs_driver": 0.9999999999998405,
+   "max_abs_component_delta": 9.827847721743943e-08
   },
   {
    "id": "ru",
-   "cosine_canonical_vs_driver": 1.0000000132301932
+   "cosine_canonical_vs_driver": 0.9999999999998083,
+   "max_abs_component_delta": 1.105069217521848e-07
   },
   {
    "id": "es",
-   "cosine_canonical_vs_driver": 1.0000000901245913
+   "cosine_canonical_vs_driver": 0.9999999999998455,
+   "max_abs_component_delta": 9.506347728449605e-08
   },
   {
    "id": "de",
-   "cosine_canonical_vs_driver": 1.0000000469046577
+   "cosine_canonical_vs_driver": 0.9999999999997482,
+   "max_abs_component_delta": 1.565244962531409e-07
   },
   {
    "id": "emoji",
-   "cosine_canonical_vs_driver": 1.0000000721854558
+   "cosine_canonical_vs_driver": 0.9999999999998452,
+   "max_abs_component_delta": 9.283082320551972e-08
   },
   {
    "id": "mixed",
-   "cosine_canonical_vs_driver": 1.0000000910286295
+   "cosine_canonical_vs_driver": 0.9999999999998697,
+   "max_abs_component_delta": 1.0504496311680711e-07
   },
   {
    "id": "code",
-   "cosine_canonical_vs_driver": 0.9999999923092937
+   "cosine_canonical_vs_driver": 0.9999999999998395,
+   "max_abs_component_delta": 1.0509627068611138e-07
   },
   {
    "id": "url_num",
-   "cosine_canonical_vs_driver": 1.00000005996385
+   "cosine_canonical_vs_driver": 0.9999999999997926,
+   "max_abs_component_delta": 1.4066889583719266e-07
   },
   {
    "id": "near512",
-   "cosine_canonical_vs_driver": 1.0000000493880572
+   "cosine_canonical_vs_driver": 0.9999999999997754,
+   "max_abs_component_delta": 1.037572758683103e-07
   },
   {
    "id": "short",
-   "cosine_canonical_vs_driver": 1.0000000634174397
+   "cosine_canonical_vs_driver": 0.9999999999998238,
+   "max_abs_component_delta": 1.0839834132039816e-07
   },
   {
    "id": "special",
-   "cosine_canonical_vs_driver": 1.0000000771828614
+   "cosine_canonical_vs_driver": 0.9999999999996902,
+   "max_abs_component_delta": 1.2700552055183723e-07
   }
- ]
+ ],
+ "run_id": "c1916111fe17402d862739c2c0ded582",
+ "corpus_sha256": "5689190d8b6efbf2e4c23388b8be94a0577b3fd9e2e4768f18b7c63fb0eef8df"
 }
