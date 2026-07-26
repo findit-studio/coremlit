@@ -11,6 +11,12 @@
 //!   download from `FinDIT-Studio/embedkit-coreml` (revision `81852f70`), under
 //!   `Models/embedkit-granite/` (overridable via `EMBEDKIT_TEST_MODELS`).
 //!   Model-gated tests are `#[ignore]` by default and run only when present.
+//!
+//! Both are re-derivable from the upstream Apache-2.0 checkpoint by
+//! `crates/coremlit/conversion/granite/` — to the cosine floors that recipe
+//! gates on, NOT byte-for-byte (its README records the measured byte-identity
+//! result). The hashes pinned in `model_io.rs` are the PUBLISHED bundle's, so a
+//! locally re-derived bundle will not satisfy that gate.
 
 use std::path::{Path, PathBuf};
 
@@ -99,6 +105,69 @@ pub fn golden_corpus() -> Vec<GoldenEntry> {
     "the committed granite golden corpus must have 16 entries"
   );
   corpus.entries
+}
+
+/// One recorded per-entry cosine from `goldens/driver_crosscheck.json`.
+///
+/// The cosine is `f64` because that is the precision the fixture stores AND the
+/// precision the trap lives in: several recorded values sit a few ULP ABOVE 1.0
+/// (see `driver_crosscheck.rs`), and narrowing them to `f32` would round that
+/// excess away and silently hide it.
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+pub struct CrosscheckEntry {
+  /// The corpus entry id this cosine belongs to (`en_q`, `zh`, `near512`, …).
+  pub id: String,
+  /// Cosine of the canonical transformers-fp32 pipeline against the fixed-512
+  /// static-mask driver that was traced to CoreML.
+  pub cosine_canonical_vs_driver: f64,
+  /// Largest per-component difference between the unit-normalized driver vector
+  /// and the canonical one. This — not the cosine — is what shows the two sides
+  /// were computed independently; see `driver_crosscheck.rs`.
+  pub max_abs_component_delta: f64,
+}
+
+/// The committed canonical-vs-driver crosscheck record — the measurement the
+/// conversion gated on before tracing, published verbatim, kept as a golden so
+/// the claim is checkable without the model or the Python toolchain.
+#[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)]
+pub struct DriverCrosscheck {
+  /// The minimum of `per_entry`.
+  pub worst_cosine_canonical_vs_driver: f64,
+  /// The smallest per-entry `max_abs_component_delta` — the tightest the two
+  /// computations came anywhere in the corpus.
+  pub min_max_abs_component_delta: f64,
+  /// The divergence budget the recipe reported against (looser than the floor
+  /// the recipe gates on, and looser than the floor this crate asserts).
+  pub stop_threshold_divergence: f64,
+  /// `AGREE` when the worst cosine stayed inside `stop_threshold_divergence`.
+  pub verdict: String,
+  /// SHA-256 of the `corpus.json` bytes this record was PUBLISHED alongside —
+  /// stamped on at publication, not an input to the measurement. Binds the two
+  /// goldens as a pair rather than by id alone.
+  pub corpus_sha256: String,
+  /// One row per corpus entry, same ids as `corpus.json`.
+  pub per_entry: Vec<CrosscheckEntry>,
+}
+
+/// Load the committed driver crosscheck. Hermetic — reads the in-tree fixture,
+/// never `Models/`.
+#[allow(dead_code)]
+pub fn driver_crosscheck() -> DriverCrosscheck {
+  let path = fixture_path("goldens/driver_crosscheck.json");
+  let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+  serde_json::from_slice(&bytes).unwrap_or_else(|e| panic!("parse {}: {e}", path.display()))
+}
+
+/// SHA-256 of the committed `corpus.json` bytes, for the crosscheck's pair
+/// binding. Hashes the file exactly as written — the generator digests the same
+/// serialized text it puts on disk.
+#[allow(dead_code)]
+pub fn corpus_sha256() -> String {
+  let path = fixture_path("goldens/corpus.json");
+  let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+  sha256_hex(&bytes)
 }
 
 /// Lowercase-hex SHA-256 of a byte slice. Backs the `model_io` provenance pins
