@@ -543,6 +543,14 @@ name = "speaker_parity_shipping_der"
 path = "tests/speaker/parity_shipping_der.rs"
 required-features = ["speaker-oracle"]
 
+# The segmentation-vs-embedding backend cross-product at the SHIPPING
+# configuration: mixes both CoreML conversions with dia's ONNX pair in one
+# process, so it needs the oracle linked alongside the CoreML models.
+[[test]]
+name = "speaker_backend_factorial"
+path = "tests/speaker/backend_factorial.rs"
+required-features = ["speaker-oracle"]
+
 [[test]]
 name = "speaker_generate_goldens"
 path = "tests/speaker/generate_goldens.rs"

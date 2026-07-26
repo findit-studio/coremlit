@@ -2,7 +2,8 @@
 # F1 gate-inventory check: prove the end-to-end DER gates are actually COMPILED
 # and still #[ignore]d — not silently feature-gated out, deleted, or un-ignored.
 #
-# The DER binaries (`tests/speaker/parity_e2e.rs`, `tests/speaker/parity_shipping_der.rs`) are
+# The DER binaries (`tests/speaker/parity_e2e.rs`, `tests/speaker/parity_shipping_der.rs`,
+# `tests/speaker/backend_factorial.rs`) are
 # `#![cfg(feature = "speaker-oracle")]` — they need dia's own ort inference path as
 # the parity oracle. Without `--features speaker-oracle` they compile to nothing, so
 # `cargo test -p coremlit --features speaker -- --ignored` reports a green sweep containing
@@ -174,6 +175,14 @@ check_bin parity_shipping_der \
   shipping_clip_selection_is_the_documented_subset \
   clip09_content_pin_catches_an_audio_swap || fail=1
 
+# backend_factorial.rs — the seg-vs-embed cross-product at the SHIPPING
+# configuration. It is the only gate that localizes the clip-09 collapse to a
+# STAGE where the defect actually lives (int8 embedder, ComputeUnits::All), and
+# `model_io.rs`'s recorded attribution cites it, so it must not be deletable
+# without a red build.
+check_bin backend_factorial \
+  shipping_config_backend_factorial || fail=1
+
 # ── Require each binary's load-bearing ORDINARY (hermetic) gates by NAME, then
 #    execute the ordinary suite (codex r7 F2 + r6 F4). The name manifest runs
 #    FIRST so a deleted/`#[ignore]`d pin-falsifiability guard fails even though
@@ -184,9 +193,12 @@ check_ordinary parity_e2e \
   stress_gate_roster_is_consistent || fail=1
 check_ordinary parity_shipping_der \
   clip09_known_defect_pins_every_field || fail=1
+check_ordinary backend_factorial \
+  factorial_verdict_pins_every_cell || fail=1
 
 run_ordinary parity_e2e || fail=1
 run_ordinary parity_shipping_der || fail=1
+run_ordinary backend_factorial || fail=1
 
 if [ "${fail}" -ne 0 ]; then
   echo "DER gate inventory FAILED — the gates above are not all compiled, present, and #[ignore]d." >&2
