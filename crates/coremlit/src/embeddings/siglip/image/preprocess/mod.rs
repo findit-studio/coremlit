@@ -11,7 +11,7 @@
 //!    fits `P`.
 //! 2. [`resize_bilinear_antialias_u8`] — the PIL-parity antialiased-bilinear
 //!    image resize in the **uint8 domain** (Pillow `Resample.c` fixed-point:
-//!    22-bit coefficients, per-pass u8 rounding), delegated to [`colconv`]'s
+//!    22-bit coefficients, per-pass u8 rounding), delegated to [`pixon`]'s
 //!    byte-exact q8 resampler and matching the SigLIP2 processor (resize on u8,
 //!    THEN rescale+normalize). Its sibling f64 [`resize_bilinear_antialias`] is
 //!    the position-embedding lift's kernel (stage 5), which the reference
@@ -63,14 +63,14 @@ pub const PATCH_DIM: usize = CHANNELS * PATCH_SIZE * PATCH_SIZE;
 ///   `precompute_coeffs(int inSize, float in0, float in1, …)` computes
 ///   `scale = (double)(in1 - in0) / outSize`), so the source extent is rounded
 ///   to `f32` before the `f64` coefficient math. Every integer extent `≤ 2²⁴`
-///   is exactly `f32`-representable, keeping both colconv's q8 image resampler
+///   is exactly `f32`-representable, keeping both pixon's q8 image resampler
 ///   and the native `f64` `precompute_coeffs` (the pos-emb lift) bit-identical
 ///   to Pillow's; from `2²⁴ + 1` upward Pillow computes with a different extent
 ///   (`16 777 219 → 16 777 220.0f32`) and the u8 resize's bit-exact contract
 ///   would silently break. The cap keeps every accepted extent 16× inside the
 ///   envelope.
 /// * **Bounded working memory.** The resize output (`dst_h · dst_w · 3` bytes)
-///   and colconv's streaming working set both grow with the accepted axis — a
+///   and pixon's streaming working set both grow with the accepted axis — a
 ///   degenerate strip the budget solver otherwise accepts could demand
 ///   hundreds of MB. Under the cap the whole resize working set stays modest
 ///   even at the boundary.
@@ -172,7 +172,7 @@ fn triangle(t: f64) -> f64 {
 /// The sole live caller is the position-embedding lift
 /// ([`lift_position_embeddings`], via [`resize_bilinear_antialias`]), whose
 /// source is the fixed `16×16` base grid ([`POS_GRID_SIDE`]) — the image
-/// resize path uses colconv's `u8` resampler instead
+/// resize path uses pixon's `u8` resampler instead
 /// ([`resize_bilinear_antialias_u8`]). `16 ≪ 2²⁴`, so this pure-`f64` extent
 /// math trivially coincides bit-for-bit with Pillow's `float box[4]` semantics
 /// (see [`MAX_IMAGE_AXIS`]'s doc for the threshold).
@@ -313,31 +313,31 @@ pub(crate) fn resize_bilinear_antialias(
 
 /// PIL-parity antialiased-bilinear resize of a packed RGB8 image
 /// (`(src_h, src_w, 3)` row-major, RGB-interleaved) to `(dst_h, dst_w, 3)`,
-/// delegated to [`colconv`]'s fixed-point q8 resampler.
+/// delegated to [`pixon`]'s fixed-point q8 resampler.
 ///
-/// colconv's `Triangle` (PIL BILINEAR) u8 path reproduces Pillow's 8bpc
+/// pixon's `Triangle` (PIL BILINEAR) u8 path reproduces Pillow's 8bpc
 /// `Resample.c` pipeline byte-for-byte — 22-bit coefficients, per-pass `u8`
 /// rounding of the horizontal intermediate — which is exactly the SigLIP2
 /// processor's image-resize semantics (resize on `u8`, THEN rescale+normalize;
 /// the per-pass rounding is part of the reference and is what a pure-`f64`
-/// resize cannot emulate). The byte-exactness is enforced upstream by colconv's
+/// resize cannot emulate). The byte-exactness is enforced upstream by pixon's
 /// tolerance-0 Pillow golden suite and downstream by this module's committed E3
 /// oracles (`tests.rs`).
 ///
 /// The only caller, [`preprocess_image`], bounds `src_h`/`src_w` by
 /// [`MAX_IMAGE_AXIS`], which keeps every accepted extent exactly
-/// `f32`-representable — inside Pillow's `float box[4]` envelope, so colconv's
+/// `f32`-representable — inside Pillow's `float box[4]` envelope, so pixon's
 /// coefficient math matches Pillow's (see [`MAX_IMAGE_AXIS`]) — and keeps
-/// colconv's streaming working set small.
+/// pixon's streaming working set small.
 ///
 /// # Errors
 /// [`Error::PreprocessAllocation`] if the output buffer cannot be reserved, a
-/// dimension does not fit colconv's `u32` frame geometry, or colconv rejects the
-/// resize plan — returned instead of aborting the process (`colconv` reserves
-/// fallibly and [`Rgb24Frame::try_new`](colconv::frame::Rgb24Frame::try_new)
+/// dimension does not fit pixon's `u32` frame geometry, or pixon rejects the
+/// resize plan — returned instead of aborting the process (`pixon` reserves
+/// fallibly and [`Rgb24Frame::try_new`](pixon::frame::Rgb24Frame::try_new)
 /// validates the geometry rather than panicking). `bytes` is the `dst_h · dst_w
 /// · 3` output-buffer size — representable even when its reservation or
-/// colconv's own resize plan is what actually failed — or [`usize::MAX`] for a
+/// pixon's own resize plan is what actually failed — or [`usize::MAX`] for a
 /// geometry that could never be represented.
 pub(crate) fn resize_bilinear_antialias_u8(
   src: &[u8],
@@ -346,9 +346,9 @@ pub(crate) fn resize_bilinear_antialias_u8(
   dst_h: usize,
   dst_w: usize,
 ) -> Result<Vec<u8>, Error> {
-  use colconv::{Convert, frame::Rgb24Frame, resample::Triangle};
+  use pixon::{Convert, frame::Rgb24Frame, resample::Triangle};
 
-  // colconv's frame geometry is `u32`; a source extent that does not fit could
+  // pixon's frame geometry is `u32`; a source extent that does not fit could
   // never be represented, let alone allocated. Only reachable through a direct
   // pathological-geometry call — `preprocess_image` caps both axes by
   // `MAX_IMAGE_AXIS`, far inside `u32`.
@@ -382,7 +382,7 @@ pub(crate) fn resize_bilinear_antialias_u8(
   // Filtered (windowed-triangle = PIL BILINEAR) resample, any ratio; the sole
   // fallible call assembles the sink and walks the frame into `out`. `out` is
   // already sized to `dst_len` (a representable value) at this point, so a
-  // colconv-side plan rejection or internal reservation failure here is
+  // pixon-side plan rejection or internal reservation failure here is
   // reported at that real size — not aliased onto the `usize::MAX` sentinel,
   // which is reserved for a geometry that could not be represented at all.
   Convert::from(&frame)
@@ -563,10 +563,10 @@ pub(crate) fn preprocess_image(
 
   let (grid_h, grid_w) = fit_to_patch_budget(height, width, PATCH_SIZE, budget);
 
-  // Resize in the u8 domain (colconv's PIL-parity q8 resampler), then
+  // Resize in the u8 domain (pixon's PIL-parity q8 resampler), then
   // rescale+normalize to f32 — the SigLIP2 processor's order AND dtype (it
   // resizes the u8 image, rounding each pass to u8, then casts to f32). No
-  // whole-image f32 buffer is materialized; colconv streams the resize and the
+  // whole-image f32 buffer is materialized; pixon streams the resize and the
   // only owned buffer is its fallibly-reserved u8 output.
   let dst_h = grid_h * PATCH_SIZE;
   let dst_w = grid_w * PATCH_SIZE;

@@ -213,9 +213,9 @@ fn resize_preserves_vertical_constancy() {
   assert!((out[1] - out[3]).abs() <= 1e-6, "column 1 not constant");
 }
 
-// ── E3: uint8 PIL-parity resize oracles (colconv q8 engine) ───────────────────
+// ── E3: uint8 PIL-parity resize oracles (pixon q8 engine) ───────────────────
 //
-// The u8 resize is delegated to colconv's byte-exact PIL-parity q8 resampler,
+// The u8 resize is delegated to pixon's byte-exact PIL-parity q8 resampler,
 // whose source frame is packed RGB8 (3-channel). The kernel is
 // channel-independent, so most of these oracles drive a single-channel Pillow
 // grid by replicating it across the three RGB channels and asserting the same
@@ -241,7 +241,7 @@ fn channel(rgb: &[u8], c: usize) -> Vec<u8> {
 }
 
 /// Identity dims (`src == dst`) pass the input bytes through byte-exactly on
-/// every channel — colconv plans a direct copy. 27 distinct bytes (no value
+/// every channel — pixon plans a direct copy. 27 distinct bytes (no value
 /// repeated, unlike a mono-replicated `R=G=B` pattern) so a channel-order
 /// permutation on the direct-copy plan would move a value to the wrong slot
 /// and fail this exact comparison.
@@ -348,7 +348,7 @@ fn rgb_from_channels(r: &[u8], g: &[u8], b: &[u8]) -> Vec<u8> {
 /// with its own independently hand-derived PIL fixed-point expectation. Every
 /// other E3 oracle replicates one pattern across all three channels
 /// (`mono_to_rgb`), so a channel-order permutation (RGB↔BGR) in a future
-/// colconv bump would pass them all unchanged; asserting each output channel
+/// pixon bump would pass them all unchanged; asserting each output channel
 /// against its OWN grid here makes that regression visible — swapping any two
 /// output channels below fails at least one of the three assertions.
 #[test]
@@ -369,7 +369,7 @@ fn resize_u8_distinct_channels_match_independent_pil_grids() {
     255, 191,  64,   0,
   ];
   // G: the mirror grid's own surface, derived by the same per-tap fixed-point
-  // method as R (not read back from colconv's output). The mirror source is
+  // method as R (not read back from pixon's output). The mirror source is
   // the checker source's bytewise complement (`255 − v`), and every quantized
   // weight pair in this 2→4 upscale sums to exactly 2²² with no output
   // landing on a half-integer tie, so the complement carries through both
@@ -409,7 +409,7 @@ fn resize_u8_distinct_channels_match_independent_pil_grids() {
   );
 }
 
-/// An over-tall source height that overflows colconv's `u32` frame geometry
+/// An over-tall source height that overflows pixon's `u32` frame geometry
 /// returns a typed [`Error::PreprocessAllocation`] `{ bytes: usize::MAX }` — no
 /// panic, no abort — before any resize work. (`preprocess_image` caps both axes
 /// far inside `u32`; this exercises the wrapper's own backstop via a direct
@@ -422,7 +422,7 @@ fn resize_u8_rejects_overflowing_geometry() {
   }
 }
 
-/// The over-wide twin: a source width that overflows colconv's `u32` frame
+/// The over-wide twin: a source width that overflows pixon's `u32` frame
 /// geometry is rejected with the same typed [`Error::PreprocessAllocation`]
 /// `{ bytes: usize::MAX }`, before any tap is indexed — no panic, no abort. The
 /// tiny `src` is never read.
