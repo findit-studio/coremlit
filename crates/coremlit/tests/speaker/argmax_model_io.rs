@@ -137,10 +137,25 @@
 //!    to zero; on such a kernel, with a zero variance, the 1e-6 floor and
 //!    the 1e-12 epsilon vanish together and the `rsqrt` takes a bare 0,
 //!    i.e. `1/sqrt(0)`.
-//!    **What would settle it:** a runtime placement test feeding
-//!    zero-variance input on the intended compute units and checking the
-//!    output. No such test exists, and none is warranted while nothing in
-//!    this crate loads this graph.
+//!    **What would settle it — and what a naive probe would NOT.** Not
+//!    "feed a zero-variance input and check the output". This graph has TWO
+//!    sequential normalization sites (`model.mil`'s `op_26` and `op_54`
+//!    `rsqrt`s), and a generic zero-variance MODEL input is not shown to
+//!    drive either into the zero/subnormal regime, let alone both. Site
+//!    one's `rsqrt` sees `mean_c((x - xvectors_mean)^2) + 1e-6` — the
+//!    external input is CENTERED first, so an all-zero `embeddings` yields
+//!    `mean_c(xvectors_mean^2)`, not `0`; only a slot of `x` equal to
+//!    `xvectors_mean` itself zeroes that reduction. Site two's sits AFTER
+//!    the LDA `conv` and its bias, so it is not directly addressable from
+//!    the model input at all — reaching it needs a solved pre-image. A test
+//!    that settles runtime safety therefore has to (i) use inputs PROVEN,
+//!    per site, to drive that site's `rsqrt` argument into the regime, and
+//!    (ii) compare EVERY supported `ComputeUnits` placement against a
+//!    CPU/f32 reference, since a finite number on one placement is neither
+//!    numerical correctness nor portability. Short of both, such a probe is
+//!    evidence about one input, one host and one placement — not about
+//!    runtime safety. No such test exists, and none is warranted while
+//!    nothing in this crate loads this graph.
 //! 5. None of the seven artifacts declare any shape flexibility
 //!    (`hasShapeFlexibility: "0"` on every input/output in every
 //!    `metadata.json`) — unlike some of `tests/model_io.rs`'s
