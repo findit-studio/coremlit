@@ -2313,8 +2313,8 @@ impl DecodingOptions {
   /// and on `jfk.wav` / `openai_whisper-tiny` they instead agree word for
   /// word and both match official Swift
   /// (`jfk_tiny_word_timestamps_match_swift_and_this_clip_is_gather_invariant`,
-  /// `crates/coremlit/tests/whisper/parity_jfk.rs`). Those tests are where
-  /// the mechanism is written out and kept true; see also
+  /// `crates/coremlit/tests/whisper/parity_jfk.rs`). Each of those tests pins
+  /// the measured output of its own fixture and nothing wider; see also
   /// [`AlignmentGather::SwiftParity`]'s "Short-form" section for the
   /// established / not-established split and what would settle it.
   #[inline(always)]

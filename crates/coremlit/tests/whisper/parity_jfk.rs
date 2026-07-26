@@ -283,14 +283,14 @@ fn oracle_options() -> DecodingOptions {
 /// the first: `TranscribeTask::run` passes `options.alignment_gather()`
 /// straight into `add_word_timestamps` with no guard. So a caller who opts
 /// into `SwiftParity` runs a single-window clip through the truncating gather
-/// too — and it is genuinely truncated here, not vacuously: 30 gathered rows
-/// over 1500 columns at the measured pitch of 1504 leaves the copied prefix
-/// ending inside the last row, which keeps 1384 of its 1500 columns. The DTW
-/// input on this clip therefore really does differ between the modes; only
-/// the path through it happens not to. #41 asserted the short-form outcome
-/// with nothing committed checking it — the sibling
-/// `jfk_tiny_matches_golden_tokens_and_segments` runs with `word_timestamps`
-/// OFF.
+/// too: at 30 gathered rows over 1500 columns and the measured pitch of 1504
+/// the copied prefix ends inside the last row, which keeps 1384 of its 1500
+/// columns. What this test then compares is the two modes' WORD LISTS — it
+/// inspects neither mode's DTW input, so what it records is that the OUTPUTS
+/// agree on this clip, not anything about whether the inputs did. #41
+/// asserted the short-form outcome with nothing committed checking it — the
+/// sibling `jfk_tiny_matches_golden_tokens_and_segments` runs with
+/// `word_timestamps` OFF.
 ///
 /// Two assertions, in the order that matters:
 ///
