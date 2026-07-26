@@ -253,16 +253,85 @@ fn is_single_punctuation_scalar(s: &str) -> bool {
   }
 }
 
+/// Swift's `Config.boolean()` (`Config.swift:373-375`, delegating to the
+/// `Config.Data.boolean()` coercion at `:152-170`) over a `serde_json` value —
+/// the reason a tokenizer config's `true`, `"True"` and `1` are one answer:
+///
+/// - a JSON boolean is itself;
+/// - a JSON **number** is `true` iff it is `1`, because Swift coerces through
+///   `Int` (`val == 1`) — so every other integer, `0` and `2` included, is
+///   `false`, not "no value";
+/// - a JSON **string** is matched case-insensitively against `"true"`/`"t"`/
+///   `"1"` and `"false"`/`"f"`/`"0"`; anything else yields no value, and Swift
+///   does not trim, so `" true "` is nothing;
+/// - `null`, arrays and objects yield no value.
+///
+/// "No value" is emphatically not `false`: the caller supplies Swift's `or:`
+/// default for that case, which for the cleanup flag is `true`.
+///
+/// The number rule reaches floats too — not because floats are coerced
+/// (`Config.Data.boolean()` has no `.floating` case at all) but because
+/// `Config`'s decoder tries `Int` *before* `Float` (`Config.swift:657-666`), so
+/// a JSON number whose exact value is an integer `Int` can hold becomes
+/// `.integer` however it was spelled. `1.0` and `1e0` are therefore `true`, and
+/// `0.0`, `-0.0` and `1.5e1` are `false`, while `0.5` (a real fraction) and
+/// `1e19` (past `Int64`) stay `.floating` and yield no value. That ordering was
+/// read off the pinned oracle's own `JSONDecoder` behavior rather than inferred
+/// from the enum, which shows only the second half of it.
+fn config_boolean(value: &serde_json::Value) -> Option<bool> {
+  match value {
+    serde_json::Value::Bool(b) => Some(*b),
+    serde_json::Value::Number(n) => match n.as_i64() {
+      Some(int) => Some(int == 1),
+      // Written with a fraction or an exponent: `serde_json` keeps the number
+      // a float where Swift's `Int`-first decode does not, so ask the same
+      // question that decode asks — is the exact value an integer `Int` can
+      // hold? If so it is `.integer` in Swift and `== 1` decides; if not it is
+      // `.floating`, which coerces to nothing.
+      None => {
+        const INT_MIN: f64 = -9_223_372_036_854_775_808.0; // -2^63
+        const PAST_INT_MAX: f64 = 9_223_372_036_854_775_808.0; // 2^63, exclusive
+
+        let float = n.as_f64()?;
+        ((INT_MIN..PAST_INT_MAX).contains(&float) && float.fract() == 0.0).then_some(float == 1.0)
+      }
+    },
+    // Swift lowercases (`Config.swift:160`) before matching; `str::to_lowercase`
+    // is the same locale-independent full Unicode mapping as `lowercased()`.
+    serde_json::Value::String(s) => match s.to_lowercase().as_str() {
+      "true" | "t" | "1" => Some(true),
+      "false" | "f" | "0" => Some(false),
+      _ => None,
+    },
+    serde_json::Value::Null | serde_json::Value::Array(_) | serde_json::Value::Object(_) => None,
+  }
+}
+
 /// Resolves Swift's `cleanUpTokenizationSpaces` flag (`Tokenizer.swift:407`)
 /// for a tokenizer folder: `tokenizer_config.json`'s
-/// `clean_up_tokenization_spaces`, defaulting to `true`.
+/// **`cleanUpTokenizationSpaces`, else `clean_up_tokenization_spaces`**, run
+/// through [`config_boolean`], defaulting to `true` only when neither key
+/// yields a value.
 ///
 /// Swift spells that `tokenizerConfig.cleanUpTokenizationSpaces.boolean(or:
-/// true)` — a `Config` lookup that yields `true` for a missing key and for a
-/// present-but-non-boolean value alike. This reproduces both, and extends the
-/// same leniency one step further, to a missing or unparseable file. Swift
-/// cannot reach that case (its `AutoTokenizer` fails the whole load if
-/// `tokenizer_config.json` is not readable JSON), but this crate's
+/// true)`, which looks like one snake_case lookup of a strict boolean and is
+/// neither. `Config`'s dynamic-member subscript (`Config.swift:593-599`) tries
+/// the member name *verbatim* first and only then its `uncamelCase` transform
+/// (`:601-621`, which turns `cleanUpTokenizationSpaces` into exactly
+/// `clean_up_tokenization_spaces`), so a camelCase key wins outright — and wins
+/// on **presence**, not on coercibility, because `??` chains the two dictionary
+/// lookups rather than their booleans. `{"cleanUpTokenizationSpaces": "yes",
+/// "clean_up_tokenization_spaces": false}` is thus `true` in Swift, never
+/// `false`, and a key present with `null` shadows the other spelling just as
+/// firmly. Both lookups are byte-exact (`BinaryDistinctString`, the whole point
+/// of that type), matching `serde_json`'s map keys with no normalization gap.
+///
+/// A root that is not a JSON object misses both keys and defaults, matching the
+/// `dictionary()`-returned-nil arm of that same subscript (`Config.swift:598`).
+///
+/// This extends the same leniency one step further, to a missing or unparseable
+/// file. Swift cannot reach that case (its `AutoTokenizer` fails the whole load
+/// if `tokenizer_config.json` is not readable JSON), but this crate's
 /// [`WhisperTokenizer::from_folder`] requires only `tokenizer.json` — a
 /// contract predating this flag, and not worth narrowing over one boolean
 /// whose default is what every OpenAI Whisper checkpoint ships anyway
@@ -270,12 +339,16 @@ fn is_single_punctuation_scalar(s: &str) -> bool {
 /// explicitly). A corrupt sibling file therefore degrades to Swift's own
 /// default rather than failing a `tokenizer.json` that is perfectly good.
 fn clean_up_tokenization_spaces_from(folder: &Path) -> bool {
-  std::fs::read(folder.join("tokenizer_config.json"))
+  let Some(config) = std::fs::read(folder.join("tokenizer_config.json"))
     .ok()
     .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-    .as_ref()
-    .and_then(|config| config.get("clean_up_tokenization_spaces"))
-    .and_then(serde_json::Value::as_bool)
+  else {
+    return true;
+  };
+  config
+    .get("cleanUpTokenizationSpaces")
+    .or_else(|| config.get("clean_up_tokenization_spaces"))
+    .and_then(config_boolean)
     .unwrap_or(true)
 }
 

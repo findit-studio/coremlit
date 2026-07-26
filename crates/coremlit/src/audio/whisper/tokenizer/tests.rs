@@ -601,9 +601,73 @@ fn clean_up_short_circuit_never_changes_the_answer() {
 }
 
 #[test]
+fn config_boolean_coerces_like_swift() {
+  // `Config.Data.boolean()` (`Config.swift:152-170`) as a table. Every row is
+  // the answer the pinned oracle's own `Config` gives for that JSON scalar --
+  // read back from it, not derived from what this port happens to return.
+  for (json, expected) in [
+    // `.boolean`: itself.
+    ("true", Some(true)),
+    ("false", Some(false)),
+    // `.integer`: `val == 1`. `0`, `2` and `-1` are all a definite `false`,
+    // not "no value" -- which is the whole reason a `0` disables the cleanup.
+    ("1", Some(true)),
+    ("0", Some(false)),
+    ("2", Some(false)),
+    ("-1", Some(false)),
+    // An integer spelled with a fraction or an exponent is still `.integer`:
+    // `Config`'s decoder tries `Int` before `Float` (`Config.swift:657-666`).
+    ("1.0", Some(true)),
+    ("1e0", Some(true)),
+    ("0.0", Some(false)),
+    ("-0.0", Some(false)),
+    ("1.5e1", Some(false)), // = 15
+    // `Int.max` and `Int.min` are integers, and are not 1.
+    ("9223372036854775807", Some(false)),
+    ("-9223372036854775808", Some(false)),
+    // A real fraction, or a value past `Int64`, stays `.floating` -- and
+    // `boolean()` has no `.floating` case, so it coerces to nothing.
+    ("0.5", None),
+    ("1e19", None),
+    ("9223372036854775808", None), // 2^63, one past `Int.max`
+    // `.string`: lowercased (`Config.swift:160`), then two fixed sets.
+    (r#""true""#, Some(true)),
+    (r#""t""#, Some(true)),
+    (r#""1""#, Some(true)),
+    (r#""false""#, Some(false)),
+    (r#""f""#, Some(false)),
+    (r#""0""#, Some(false)),
+    (r#""True""#, Some(true)),
+    (r#""TRUE""#, Some(true)),
+    (r#""FALSE""#, Some(false)),
+    (r#""T""#, Some(true)),
+    // Every other string is nothing -- Swift matches the whole string and
+    // does not trim it first.
+    (r#""yes""#, None),
+    (r#""maybe""#, None),
+    (r#""""#, None),
+    (r#"" true ""#, None),
+    // `boolean()` has no case for these three either.
+    ("null", None),
+    ("[]", None),
+    ("{}", None),
+  ] {
+    assert_eq!(
+      config_boolean(&serde_json::from_str(json).unwrap()),
+      expected,
+      "value {json}"
+    );
+  }
+}
+
+#[test]
 fn clean_up_flag_follows_tokenizer_config_like_swift() {
   // Swift: `tokenizerConfig.cleanUpTokenizationSpaces.boolean(or: true)`
-  // (`Tokenizer.swift:407`) — `true` unless the file says otherwise.
+  // (`Tokenizer.swift:407`). The member name is camelCase, and `Config`'s
+  // dynamic-member subscript (`Config.swift:593-599`) tries it verbatim before
+  // falling back to its `uncamelCase` form (`:601-621`), which for this name
+  // is exactly `clean_up_tokenization_spaces`. `or: true` then applies only
+  // where the chosen value coerces to nothing.
   let dir = tempfile::tempdir().unwrap();
   let path = dir.path().join("tokenizer_config.json");
 
@@ -611,17 +675,51 @@ fn clean_up_flag_follows_tokenizer_config_like_swift() {
   assert!(clean_up_tokenization_spaces_from(dir.path()));
 
   for (body, expected) in [
+    // The snake_case spelling every OpenAI checkpoint ships.
     (r#"{"clean_up_tokenization_spaces": true}"#, true),
     (r#"{"clean_up_tokenization_spaces": false}"#, false),
-    // Key absent -> Swift's `or: true`.
-    (r#"{"model_max_length": 448}"#, true),
-    // Present but not a boolean -> `.boolean()` yields nil, so `or: true`.
-    (r#"{"clean_up_tokenization_spaces": "false"}"#, true),
+    // The camelCase spelling Swift actually looks for FIRST.
+    (r#"{"cleanUpTokenizationSpaces": true}"#, true),
+    (r#"{"cleanUpTokenizationSpaces": false}"#, false),
+    // The value is coerced, not required to be a JSON boolean: `0` and
+    // `"false"` DISABLE the cleanup in Swift. Pinning those two as `true` here
+    // was this port's bug, so they are the regression rows.
+    (r#"{"clean_up_tokenization_spaces": 0}"#, false),
+    (r#"{"clean_up_tokenization_spaces": "false"}"#, false),
+    (r#"{"cleanUpTokenizationSpaces": "0"}"#, false),
+    (r#"{"clean_up_tokenization_spaces": 1}"#, true),
+    (r#"{"clean_up_tokenization_spaces": "TRUE"}"#, true),
+    // Present but uncoercible -> `or: true`, which is the default and not a
+    // `false` in disguise.
     (r#"{"clean_up_tokenization_spaces": null}"#, true),
-    (r#"{"clean_up_tokenization_spaces": 0}"#, true),
+    (r#"{"clean_up_tokenization_spaces": "maybe"}"#, true),
+    // Key absent -> `or: true`.
+    (r#"{"model_max_length": 448}"#, true),
+    ("{}", true),
+    // Precedence: camelCase wins outright when both spellings are present...
+    (
+      r#"{"cleanUpTokenizationSpaces": false, "clean_up_tokenization_spaces": true}"#,
+      false,
+    ),
+    (
+      r#"{"cleanUpTokenizationSpaces": true, "clean_up_tokenization_spaces": false}"#,
+      true,
+    ),
+    // ...and it wins on PRESENCE, not on coercibility: Swift's `??` chains the
+    // two dictionary lookups, not their booleans, so an uncoercible camelCase
+    // value falls through to `or: true` and never to the snake_case key.
+    (
+      r#"{"cleanUpTokenizationSpaces": "yes", "clean_up_tokenization_spaces": false}"#,
+      true,
+    ),
+    (
+      r#"{"cleanUpTokenizationSpaces": null, "clean_up_tokenization_spaces": false}"#,
+      true,
+    ),
     // Unparseable, and valid JSON that is not an object: same default.
     ("{ not json", true),
     ("[]", true),
+    ("3", true),
   ] {
     std::fs::write(&path, body).unwrap();
     assert_eq!(
@@ -648,7 +746,12 @@ fn decode_cleans_the_leading_space_off_the_ellipsis_token() {
   assert!(t.clean_up_tokenization_spaces);
   assert_eq!(t.decode(&[1097], false).unwrap(), "...");
 
-  // And the real fixture folder is what turns it on.
+  // And the real fixture folder resolves to `true` -- by Swift's `or:` default
+  // rather than by reading the flag, which is worth saying out loud: the folder
+  // `from_folder` is handed holds only `tokenizer.json`. The checkpoint's own
+  // `tokenizer_config.json` does set `"clean_up_tokenization_spaces": true`,
+  // i.e. the same answer, but it sits a HuggingFace snapshot layer below (at
+  // `models/openai/whisper-tiny/`) and is not on the path this function reads.
   let root = std::env::var_os("WHISPERKIT_TEST_MODELS").map_or_else(
     || {
       PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -657,9 +760,9 @@ fn decode_cleans_the_leading_space_off_the_ellipsis_token() {
     },
     PathBuf::from,
   );
-  assert!(clean_up_tokenization_spaces_from(
-    &root.join("tokenizers/whisper-tiny")
-  ));
+  let folder = root.join("tokenizers/whisper-tiny");
+  assert!(!folder.join("tokenizer_config.json").exists());
+  assert!(clean_up_tokenization_spaces_from(&folder));
 }
 
 #[test]
