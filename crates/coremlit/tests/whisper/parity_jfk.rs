@@ -285,9 +285,10 @@ fn oracle_options() -> DecodingOptions {
 /// into `SwiftParity` runs a single-window clip through the truncating gather
 /// too: at 30 gathered rows over 1500 columns and the measured pitch of 1504
 /// the copied prefix ends inside the last row, which keeps 1384 of its 1500
-/// columns. What this test then compares is the two modes' WORD LISTS — it
-/// inspects neither mode's DTW input, so what it records is that the OUTPUTS
-/// agree on this clip, not anything about whether the inputs did. #41
+/// columns. What this test then compares is the two modes' WORD LISTS,
+/// transcript text, and segment seeks, bounds and tokens — it inspects
+/// neither mode's DTW input, so what it records is that the OUTPUTS agree on
+/// this clip, not anything about whether the inputs did. #41
 /// asserted the short-form outcome with nothing committed checking it — the
 /// sibling `jfk_tiny_matches_golden_tokens_and_segments` runs with
 /// `word_timestamps` OFF.

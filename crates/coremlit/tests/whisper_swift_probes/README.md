@@ -246,9 +246,9 @@ wider**, and the wording matters because an earlier revision generalized it.
 The gather runs on every word-timestamp window, long-form or not, and at 30
 gathered rows over 1500 columns the measured pitch of 1504 does truncate the
 final row under `SwiftParity` (it keeps 1384 of 1500 columns). The test
-compares the two modes' word lists and nothing else — it inspects neither
-mode's DTW input — so the agreement it records is an agreement of outputs on
-this clip. That does not carry to short form in general: the port's own
+compares the two modes' word lists, transcript text, and segment seeks,
+bounds and tokens — it inspects neither mode's DTW input — so the agreement
+it records is an agreement of outputs on this clip. That does not carry to short form in general: the port's own
 fixtures measure the modes producing different word/segment ends **inside a
 single window** (0.88 s vs 1.58 s over one `add_word_timestamps` call in
 `segment::tests::
