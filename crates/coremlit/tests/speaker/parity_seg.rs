@@ -10,8 +10,10 @@
 //! **Both sides emit `log(softmax(·))`, not raw logits** — this file, the
 //! golden's `seg_logits` field name, and `generate_goldens.rs` all said
 //! "raw logits, neither side softmaxes" until the graphs were read.
-//! `pyannote_segmentation.mlmodelc/model.mil` ends `softmax` → `log` →
-//! `-> (segments)` (quoted in `crate::segment`'s module doc), and the
+//! `pyannote_segmentation.mlmodelc/model.mil` ends `reduce_log_sum_exp` →
+//! `sub` → `-> (segments)` — the fused form of the `softmax` → `log` tail it
+//! carried before the issue-#15 re-conversion, both quoted in
+//! `crate::segment`'s module doc — and the
 //! committed ORT golden is log-probabilities on its own arithmetic: all
 //! 4123 values are `<= 0` and every 7-class row satisfies
 //! `sum(exp(row)) == 1.000000`. The comparison below is therefore still

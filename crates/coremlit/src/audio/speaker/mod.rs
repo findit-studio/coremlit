@@ -60,7 +60,11 @@
 //! (argmax bakes preprocessing/decoding into its graph; FluidAudio does host-
 //! side powerset/mask/window decode), not interchangeable weight swaps:
 //!
-//! - **FluidAudio** (`Source::FluidAudio`, default; `FluidInference/speaker-diarization-coreml`):
+//! - **FluidAudio** (`Source::FluidAudio`, default;
+//!   `FluidInference/speaker-diarization-coreml`, except the segmentation
+//!   graph, which is the fp16-safe re-conversion published as
+//!   `FinDIT-Studio/speakerkit-coreml` — see `tests/speaker/model_io.rs` for
+//!   the pinned revision and per-file SHA-256):
 //!   powerset log-probs `[1,589,7]`, host-side decode; seg 99.97% / embed
 //!   cosine 0.99999989 vs fp32 dia-ort. **Validated** default.
 //! - **argmax** (`Source::Argmax`, optional; `argmaxinc/speakerkit-coreml`):

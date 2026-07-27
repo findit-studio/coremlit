@@ -67,22 +67,22 @@ pub fn argmax_models_dir() -> PathBuf {
   )
 }
 
-/// Path to the decided embedding artifact: the raw-waveform, in-graph-fbank
-/// WeSpeaker v2 model (spec §2.4 — no separate fbank stage needed).
+/// Path to the RETIRED int8 embedding artifact (`wespeaker_v2.mlmodelc`, the
+/// raw-waveform, in-graph-fbank WeSpeaker model).
 ///
-/// See `tests/model_io.rs`'s `// DECISION:` comment for why this is
-/// `wespeaker_v2.mlmodelc` and not `wespeaker.mlmodelc`/`wespeaker_int8.mlmodelc`.
-/// This is the **int8-palettized** shipping artifact; Gate 2's
-/// conversion-fidelity comparison uses [`embed_fp32_path`] instead (matched
-/// against dia-ort's fp32 ONNX — see `tests/parity_embed.rs`).
+/// This was the shipping artifact until issue #15 measured its palettization
+/// silently collapsing 8-speaker audio; the shipping embedder is now the fp32
+/// [`embed_fp32_path`] (see `tests/model_io.rs`'s DECISION). The int8 bytes
+/// stay on disk and byte-pinned because the factorial and mechanism records
+/// (`tests/speaker/backend_factorial.rs`) run on them.
 pub fn embed_path() -> PathBuf {
   models_dir().join("wespeaker_v2.mlmodelc")
 }
 
-/// Path to the **true fp32** embedding artifact, `wespeaker.mlmodelc`
+/// Path to the **fp32 SHIPPING** embedding artifact, `wespeaker.mlmodelc`
 /// (27 MB uncompressed float32 weights — `tests/model_io.rs`'s
-/// `wespeaker_fp32_io_contract_equal_but_not_targeted`). Contract-equal to
-/// the shipping int8 `wespeaker_v2.mlmodelc` but not quantized.
+/// `wespeaker_fp32_io_matches_spec`; the shipping selection since issue #15).
+/// Contract-equal to the retired int8 `wespeaker_v2.mlmodelc`.
 ///
 /// Gate 2 (embedding conversion fidelity, cosine ≥ 0.9999) is only
 /// meaningful at MATCHED precision: dia-ort runs the fp32
@@ -139,10 +139,11 @@ pub const FIXTURES: &[Fixture] = &[
 /// documents for the golden's `seg_logits` field name: renaming it would churn
 /// every committed golden (each ~270 KB) for zero behavioral gain, since no
 /// gate reads this string. The values are in fact powerset **log-probabilities**
-/// (`pyannote_segmentation.mlmodelc`'s MIL ends `softmax` → `log`, see
-/// `coremlit::audio::speaker::segment`'s module doc; the committed ORT golden agrees — every
-/// value `<= 0`, every 7-class row `sum(exp(row)) == 1`). Read the string as a
-/// provenance tag, not a claim about the tensor's calibration.
+/// (`pyannote_segmentation.mlmodelc`'s MIL ends `reduce_log_sum_exp` → `sub`,
+/// see `coremlit::audio::speaker::segment`'s module doc; the committed ORT
+/// golden agrees — every value `<= 0`, every 7-class row
+/// `sum(exp(row)) == 1`). Read the string as a provenance tag, not a claim
+/// about the tensor's calibration.
 pub const SEG_MODEL_LABEL: &str =
   "segmentation-3.0.onnx (dia bundled, ort CPU EP, raw powerset logits)";
 
@@ -357,8 +358,9 @@ pub const SEG_ROW_SUM_EXP_TOL: f64 = 1e-4;
 /// each [`POWERSET_CLASSES`]-wide row normalized so `Σ exp = 1` (within
 /// [`SEG_ROW_SUM_EXP_TOL`]).
 ///
-/// dia-ort's segmentation MIL ends `softmax → log` and the CoreML side matches;
-/// the committed goldens store that quantity under the legacy `seg_logits` name.
+/// dia-ort's segmentation graph ends `softmax → log` and the CoreML side emits
+/// the same quantity through the fused `reduce_log_sum_exp → sub` tail; the
+/// committed goldens store it under the legacy `seg_logits` name.
 /// A future model emitting RAW logits (positive values, rows that do not sum-exp
 /// to 1) with the argmax ORDERING preserved would decode to the same speakers yet
 /// break this invariant — which `generate_goldens.rs`'s prose used to only

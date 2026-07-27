@@ -448,7 +448,7 @@ fn from_file_loads_and_reports_mask_frame_count_v2() {
 fn from_file_loads_and_reports_mask_frame_count_fp32() {
   let model = load_embed_model(embed_fp32_path());
   // Ground truth pinned by
-  // `tests/model_io.rs::wespeaker_fp32_io_contract_equal_but_not_targeted`.
+  // `tests/model_io.rs::wespeaker_fp32_io_matches_spec`.
   assert_eq!(model.num_mask_frames(), 589);
 }
 

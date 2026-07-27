@@ -196,8 +196,9 @@ fn generate_goldens() {
 
     for (c, chunk) in chunks.iter().enumerate() {
       // dia-ort segmentation: [num_frames * POWERSET_CLASSES] powerset
-      // LOG-PROBABILITIES (the CoreML side matches: its MIL ends `softmax` ->
-      // `log`, so `parity_seg.rs` compares like with like). The `logits` /
+      // LOG-PROBABILITIES (the CoreML side emits the same quantity through its
+      // fused `reduce_log_sum_exp` -> `sub` tail, so `parity_seg.rs` compares
+      // like with like). The `logits` /
       // `seg_logits` names are legacy, kept to avoid churning every committed
       // golden. That these ARE log-probs — every element <= 0 and each row
       // normalized so sum(exp) == 1 — is ENFORCED by `common::check_seg_log_probs`
