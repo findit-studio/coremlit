@@ -33,3 +33,33 @@ pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
   let name = String::deserialize(deserializer)?;
   ComputeUnits::from_str(&name).map_err(serde::de::Error::custom)
 }
+
+/// The same bridge for an `Option<ComputeUnits>` field, where absence is
+/// semantic rather than a stand-in for the default — used by
+/// [`crate::audio::speaker::source::FluidAudioArtifactConfig`], whose
+/// `None` means "defer to the caller's `Options`", not `ComputeUnits::All`.
+///
+/// A `with` module deserializes the field's OWN type, so the outer
+/// `Option` has to be handled here: the parent module's `deserialize`
+/// would reject `None` by demanding a string.
+pub(crate) mod option {
+  use super::{ComputeUnits, Deserialize, Deserializer, FromStr, Serializer};
+
+  pub(crate) fn serialize<S: Serializer>(
+    value: &Option<ComputeUnits>,
+    serializer: S,
+  ) -> Result<S::Ok, S::Error> {
+    match value {
+      Some(units) => serializer.serialize_some(units.as_str()),
+      None => serializer.serialize_none(),
+    }
+  }
+
+  pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+    deserializer: D,
+  ) -> Result<Option<ComputeUnits>, D::Error> {
+    Option::<String>::deserialize(deserializer)?
+      .map(|name| ComputeUnits::from_str(&name).map_err(serde::de::Error::custom))
+      .transpose()
+  }
+}
