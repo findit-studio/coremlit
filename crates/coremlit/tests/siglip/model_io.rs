@@ -1,13 +1,15 @@
 //! Ground-truth introspection + provenance pins for the siglip VISION artifact
 //! `siglip2_vision_512.mlmodelc` and the base position-grid sidecar.
 //!
-//! # Status: Wave C shell (model-gated)
+//! # Status: complete, model-gated
 //!
-//! The I/O + exact-SHA gates below are `#[ignore]`d until the owner stages the
-//! conversion under `Models/siglip2-naflex/` (`SIGLIP_TEST_MODELS`) per the port
-//! plan's conversion runbook, at which point the pinned SHA manifest
-//! (`ARTIFACT_SHA256`, the sidecar SHA) is filled from `CHECKSUMS.sha256` at the
-//! recorded revision. The contract mirrors the plan's §0 table:
+//! The I/O + exact-SHA gates below are `#[ignore]`d until the artifacts are staged
+//! under `Models/siglip2-naflex/` (`SIGLIP_TEST_MODELS`) — fetched from the
+//! published bundle (`FinDIT-Studio/siglip2-naflex-coreml`) or re-derived per the
+//! `conversion/siglip` runbook. The pinned SHA manifest (`ARTIFACT_SHA256`, the
+//! sidecar SHA) is already filled and matches that bundle's `CHECKSUMS.sha256`
+//! file-for-file, so the published artifacts satisfy these gates unmodified. The
+//! contract mirrors the plan's §0 table:
 //! `pixel_values` f32 `[1, P, 768]` + `position_embeddings` f32 `[1, P, 768]` +
 //! `attention_mask` f32 `[1, P]` → `image_features` f32 `[1, 768]`.
 //!
@@ -25,7 +27,9 @@ use coremlit::{ComputeUnits, DataType, Model, embeddings::siglip::embedding::EMB
 /// pinned checkpoint + toolchain; `coremldata.bin` / `metadata.json` also carry a
 /// coremltools conversion-instance stamp (a `conversion_date` and a non-repeatable
 /// blob), so a re-conversion re-pins these two — the exact-set gate's intended
-/// "deliberate re-stage" behavior. A later public artifact re-upload freezes them.
+/// "deliberate re-stage" behavior. The public re-upload has since happened and
+/// froze them: these ARE the bytes published at
+/// `FinDIT-Studio/siglip2-naflex-coreml` @ `62c97df451a4906f0ee3ab93b9213113a51740ba`.
 const ARTIFACT_SHA256: &[(&str, &str)] = &[
   (
     "analytics/coremldata.bin",
@@ -55,7 +59,8 @@ const SIDECAR_SHA256: &str = "3ba1ba032ad8d97e0a1afebf4513615fbfedb56f646c14dcdb
 
 /// Vision graph I/O contract (§0): resolves `P` from `pixel_values [1, P, 768]`
 /// and cross-checks `position_embeddings`, `attention_mask`, and the exact input
-/// SET against it. Wave C: extend with the exact-SHA manifest.
+/// SET against it. The byte-level pin is its sibling,
+/// [`vision_artifact_bytes_match_pinned_sha256`].
 #[test]
 #[ignore = "requires staged siglip models (SIGLIP_TEST_MODELS)"]
 fn vision_io_matches_spec() {
@@ -92,8 +97,9 @@ fn vision_io_matches_spec() {
   assert_eq!(out.data_type(), Some(DataType::F32));
 }
 
-/// Exact-SHA manifest for the vision bundle + the pos-emb sidecar. Wave C fills
-/// `ARTIFACT_SHA256` and the sidecar SHA from `CHECKSUMS.sha256`.
+/// Exact-SHA manifest for the vision bundle + the pos-emb sidecar.
+/// `ARTIFACT_SHA256` and [`SIDECAR_SHA256`] are populated, and match the
+/// published bundle's `CHECKSUMS.sha256` file-for-file.
 #[test]
 #[ignore = "requires staged siglip models (SIGLIP_TEST_MODELS)"]
 fn vision_artifact_bytes_match_pinned_sha256() {

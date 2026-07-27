@@ -2,7 +2,10 @@
 
 Source of truth: the OFFICIAL public checkpoint ``google/siglip2-base-patch16-naflex``
 pinned to ``REV`` below (Apache-2.0). The recipes convert FROM this official model;
-nothing is consumed from any pre-uploaded artifact repo. Local staging only.
+nothing is consumed from any pre-uploaded artifact repo. The converted bundle is
+published at ``FinDIT-Studio/siglip2-naflex-coreml`` @
+``62c97df451a4906f0ee3ab93b9213113a51740ba`` — that repo is this recipe's OUTPUT,
+never an input to it, so the source of truth above is unchanged by its existence.
 
 All filesystem paths come from the environment (never hardcoded — the clapkit
 recipes' stale-absolute-path mistake):

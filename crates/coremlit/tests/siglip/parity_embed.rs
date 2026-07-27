@@ -3,8 +3,8 @@
 //!
 //! # Status: Wave C (model-gated)
 //!
-//! `#[ignore]`d until the owner stages the conversion (`SIGLIP_TEST_MODELS`) and
-//! the committed goldens (Wave B). The `CpuAndGpu` arm is THE GATE (floor never
+//! `#[ignore]`d until the artifacts are staged (`SIGLIP_TEST_MODELS`, fetched or
+//! re-derived) and the committed goldens (Wave B). The `CpuAndGpu` arm is THE GATE (floor never
 //! below 0.99917; measured worst here ≈ 0.99999 both towers — the vision path
 //! preprocesses via pixon and the text path feeds the golden ids). The ANE /
 //! CpuOnly arms are CHARACTERIZED in `placement.rs`, not floor-gated. Non-vacuity:

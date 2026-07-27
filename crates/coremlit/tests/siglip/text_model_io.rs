@@ -1,12 +1,14 @@
 //! Ground-truth introspection + provenance pins for the siglip TEXT artifact
 //! `siglip2_text_64.mlmodelc`.
 //!
-//! # Status: Wave C shell (model-gated)
+//! # Status: complete, model-gated
 //!
-//! `#[ignore]`d until the owner stages the conversion (`SIGLIP_TEST_MODELS`). The
-//! contract (§0): `input_ids` int32 `[1, T]` → `text_features` f32 `[1, 768]`,
-//! and — the SigLIP text specificity — the input SET is EXACTLY `{input_ids}`
-//! (NO `attention_mask`). Wave C fills the exact-SHA manifest.
+//! `#[ignore]`d until the artifacts are staged (`SIGLIP_TEST_MODELS`) — fetched
+//! from the published bundle (`FinDIT-Studio/siglip2-naflex-coreml`) or re-derived
+//! per the `conversion/siglip` runbook. The contract (§0): `input_ids` int32
+//! `[1, T]` → `text_features` f32 `[1, 768]`, and — the SigLIP text specificity —
+//! the input SET is EXACTLY `{input_ids}` (NO `attention_mask`). The exact-SHA
+//! manifest is already filled and matches that bundle's `CHECKSUMS.sha256`.
 
 mod common;
 
@@ -70,7 +72,8 @@ fn text_io_matches_spec_and_has_no_attention_mask() {
   assert_eq!(out.data_type(), Some(DataType::F32));
 }
 
-/// Exact-SHA manifest for the text bundle. Wave C fills `ARTIFACT_SHA256`.
+/// Exact-SHA manifest for the text bundle. `ARTIFACT_SHA256` is populated, and
+/// matches the published bundle's `CHECKSUMS.sha256` file-for-file.
 #[test]
 #[ignore = "requires staged siglip models (SIGLIP_TEST_MODELS)"]
 fn text_artifact_bytes_match_pinned_sha256() {
