@@ -5,8 +5,9 @@
 //!
 //! dia-ort runs the **fp32** `wespeaker_resnet34_lm.onnx` (26.7 MB float32).
 //! The conversion-fidelity gate therefore compares it against the **fp32**
-//! CoreML sibling `wespeaker.mlmodelc` ([`common::embed_fp32_path`]) — NOT the
-//! int8-palettized shipping artifact `wespeaker_v2.mlmodelc`. T3 measured
+//! CoreML sibling `wespeaker.mlmodelc` ([`common::embed_fp32_path`], the
+//! SHIPPING artifact since issue #15) — NOT the retired int8-palettized
+//! `wespeaker_v2.mlmodelc`. T3 measured
 //! ~0.90-0.92 cosine int8-vs-fp32 (pure quantization cost); comparing int8
 //! CoreML against fp32 ort would fold that quantization loss into the gate and
 //! produce a FALSE fail. The int8 path is measured separately below as
@@ -155,7 +156,7 @@ fn embedding_parity_fp32_vs_dia_ort() {
   );
 }
 
-/// INFORMATIONAL — int8 CoreML (`wespeaker_v2.mlmodelc`, the shipping artifact)
+/// INFORMATIONAL — int8 CoreML (`wespeaker_v2.mlmodelc`, the RETIRED sibling)
 /// vs fp32 dia-ort. Characterizes int8 quantization cost (T3: ~0.90-0.92); NOT
 /// a conversion-fidelity gate, asserts only [`INT8_SANITY_FLOOR`].
 #[test]

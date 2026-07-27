@@ -67,22 +67,22 @@ pub fn argmax_models_dir() -> PathBuf {
   )
 }
 
-/// Path to the decided embedding artifact: the raw-waveform, in-graph-fbank
-/// WeSpeaker v2 model (spec §2.4 — no separate fbank stage needed).
+/// Path to the RETIRED int8 embedding artifact (`wespeaker_v2.mlmodelc`, the
+/// raw-waveform, in-graph-fbank WeSpeaker model).
 ///
-/// See `tests/model_io.rs`'s `// DECISION:` comment for why this is
-/// `wespeaker_v2.mlmodelc` and not `wespeaker.mlmodelc`/`wespeaker_int8.mlmodelc`.
-/// This is the **int8-palettized** shipping artifact; Gate 2's
-/// conversion-fidelity comparison uses [`embed_fp32_path`] instead (matched
-/// against dia-ort's fp32 ONNX — see `tests/parity_embed.rs`).
+/// This was the shipping artifact until issue #15 measured its palettization
+/// silently collapsing 8-speaker audio; the shipping embedder is now the fp32
+/// [`embed_fp32_path`] (see `tests/model_io.rs`'s DECISION). The int8 bytes
+/// stay on disk and byte-pinned because the factorial and mechanism records
+/// (`tests/speaker/backend_factorial.rs`) run on them.
 pub fn embed_path() -> PathBuf {
   models_dir().join("wespeaker_v2.mlmodelc")
 }
 
-/// Path to the **true fp32** embedding artifact, `wespeaker.mlmodelc`
+/// Path to the **fp32 SHIPPING** embedding artifact, `wespeaker.mlmodelc`
 /// (27 MB uncompressed float32 weights — `tests/model_io.rs`'s
-/// `wespeaker_fp32_io_contract_equal_but_not_targeted`). Contract-equal to
-/// the shipping int8 `wespeaker_v2.mlmodelc` but not quantized.
+/// `wespeaker_fp32_io_matches_spec`; the shipping selection since issue #15).
+/// Contract-equal to the retired int8 `wespeaker_v2.mlmodelc`.
 ///
 /// Gate 2 (embedding conversion fidelity, cosine ≥ 0.9999) is only
 /// meaningful at MATCHED precision: dia-ort runs the fp32

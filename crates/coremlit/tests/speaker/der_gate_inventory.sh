@@ -172,29 +172,29 @@ check_bin parity_e2e \
   stress_12_mrbeast_schools_15_speakers \
   stress_14_mrbeast_strongman_robot_4_speakers || fail=1
 
-# parity_shipping_der.rs — ALL FOUR shipping-int8 DER clips (06, 14, 10, 09),
-# plus the shipping-default resolver gate, the corpus-selection gate, and the
-# clip-09 audio-content pin. Clip 14 and the resolver/corpus/content-pin gates
-# were previously unlisted.
+# parity_shipping_der.rs — ALL FOUR shipping DER clips (06, 14, 10, 09; the
+# fp32 shipping configuration + placement controls since issue #15), plus the
+# shipping-default resolver gate, the corpus-selection gate, and the clip-09
+# audio-content pin.
 check_bin parity_shipping_der \
-  shipping_int8_der_06_long_recording_3spk \
-  shipping_int8_der_14_mrbeast_strongman_robot_4spk \
-  shipping_int8_der_10_mrbeast_clean_water_7spk \
-  shipping_int8_der_09_mrbeast_dollar_date_8spk_known_defect \
-  shipping_default_is_the_int8_embedder \
+  shipping_der_06_long_recording_3spk \
+  shipping_der_14_mrbeast_strongman_robot_4spk \
+  shipping_der_10_mrbeast_clean_water_7spk \
+  shipping_der_09_mrbeast_dollar_date_8spk \
+  shipping_default_is_the_fp32_embedder \
   shipping_clip_selection_is_the_documented_subset \
   clip09_content_pin_catches_an_audio_swap || fail=1
 
-# backend_factorial.rs — the seg-vs-embed cross-product at the SHIPPING
-# configuration, plus the precision x placement experiment that disambiguates
-# what that cross-product could only implicate as a bundle. The first localizes
-# the clip-09 collapse to a STAGE where the defect actually lives (int8 embedder,
-# ComputeUnits::All); the second says WHICH property of that stage carries it.
-# `model_io.rs`'s recorded attribution cites both, so neither must be deletable
-# without a red build.
+# backend_factorial.rs — the seg-vs-embed cross-product at the int8-era
+# shipping configuration, the precision x placement experiment that
+# disambiguates what that cross-product could only implicate as a bundle, and
+# the mechanism probe that says WHAT KIND of perturbation each factor applies.
+# `model_io.rs`'s recorded attribution (and the issue-#15 embedder retirement)
+# cites all three, so none must be deletable without a red build.
 check_bin backend_factorial \
   shipping_config_backend_factorial \
-  embedding_precision_x_placement || fail=1
+  embedding_precision_x_placement \
+  quantization_error_structure || fail=1
 
 # ── Require each binary's load-bearing ORDINARY (hermetic) gates by NAME, then
 #    execute the ordinary suite (codex r7 F2 + r6 F4). The name manifest runs
@@ -205,10 +205,11 @@ check_ordinary parity_e2e \
   equal_delta_der_hides_disjoint_placement_errors \
   stress_gate_roster_is_consistent || fail=1
 check_ordinary parity_shipping_der \
-  clip09_known_defect_pins_every_field || fail=1
+  clip09_record_pins_every_field || fail=1
 check_ordinary backend_factorial \
   factorial_verdict_pins_every_cell \
-  precision_placement_verdict_pins_every_cell || fail=1
+  precision_placement_verdict_pins_every_cell \
+  mechanism_verdict_pins_every_field || fail=1
 
 run_ordinary parity_e2e || fail=1
 run_ordinary parity_shipping_der || fail=1

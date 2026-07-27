@@ -13,10 +13,11 @@
 //! which is every path by default, because
 //! [`ComputeUnits::default()`][coremlit::ComputeUnits] is
 //! `All`. A model's *declared* MIL dtype is therefore **not** protection:
-//! `speakerkit/wespeaker.mlmodelc` is fp32 end-to-end in its MIL and still
-//! collapses to a cosine of 0.035 when the same fp32 artifact is loaded
-//! `CpuOnly → All`. This gate consequently holds **every** graph to the
-//! fp16 floor, whatever dtype it declares.
+//! the pre-repair FluidInference `wespeaker.mlmodelc` was fp32 end-to-end in
+//! its MIL and still collapsed to a cosine of 0.035 when the same fp32
+//! artifact was loaded `CpuOnly → All` (issue #15; the shipping artifact now
+//! carries the repaired `0x1p-24` guards). This gate consequently holds
+//! **every** graph to the fp16 floor, whatever dtype it declares.
 //!
 //! # Why a graph gate and not an output check
 //!
@@ -709,13 +710,14 @@ struct KnownDefect {
 /// Every fp16-vanishing guard in the tree. Each entry is a defect, not an
 /// exemption.
 ///
-/// The sweep that created this gate found ten sites across nine models. ONE of
-/// those models — `speakerkit/pyannote_segmentation` — has since been replaced
-/// by a guard-repaired re-conversion (issue #15) and its pin is gone: that
-/// graph no longer contains a `log` op at all, so there is no epsilon left to
-/// vanish. Every other pin below still stands, including the ones whose
-/// re-conversions exist but are NOT adopted (see the `wespeaker` note, and
-/// `alignkit/base960h_aligner`).
+/// The sweep that created this gate found ten sites across nine models. TWO of
+/// those models — the two the speakerkit pipeline SHIPS — have since been
+/// replaced by guard-repaired re-conversions (issue #15) and their pins are
+/// gone: `speakerkit/pyannote_segmentation` no longer contains a `log` op at
+/// all, and `speakerkit/wespeaker` (the fp32 shipping embedder) carries its
+/// three pooling divisor guards at `0x1p-24`, the fp16 floor. Every other pin
+/// below still stands, including the ones whose re-conversions exist but are
+/// NOT adopted (see the `wespeaker_v2` note, and `alignkit/base960h_aligner`).
 const KNOWN_DEFECTS: &[KnownDefect] = &[
   KnownDefect {
     path: "alignkit/base960h_aligner.mlmodelc",
@@ -734,7 +736,7 @@ const KNOWN_DEFECTS: &[KnownDefect] = &[
            its fp16 sibling.",
   },
   KnownDefect {
-    path: "speakerkit/wespeaker.mlmodelc",
+    path: "speakerkit/wespeaker_v2.mlmodelc",
     // THREE identical divisor guards, one per attentive-stat pooling division
     // (the weighted mean and the two divisions feeding the weighted variance /
     // `std`). Listed thrice, not deduped: the multiplicity is the blast radius
@@ -746,22 +748,14 @@ const KNOWN_DEFECTS: &[KnownDefect] = &[
     ],
     note: "Attentive-stat pooling divides by `count + 1e-8` at THREE sites (the weighted mean \
            and the two divisions behind the weighted variance/std). 1e-8 is 0.168x fp16's \
-           smallest subnormal, so on the ANE all three divisor guards are zero. Same fp32 \
-           artifact, same input, only CpuOnly -> All: cosine collapses to 0.035. A guard-repaired \
-           re-conversion is published (FinDIT-Studio/speakerkit-coreml) but is NOT adopted: for \
-           the int8 sibling it is also a RE-PALETTIZATION, and that moves clip 14's shipping \
-           ANE arm from 0.8178 % to 1.4860 % DER — past `parity_shipping_der`'s +-1 pp bound. \
-           Adopting it is an owner call, measured in issue #15, not a silent swap.",
-  },
-  KnownDefect {
-    path: "speakerkit/wespeaker_v2.mlmodelc",
-    sites: &[
-      "real_div/fp32 guard=denom:add(+9.99999993922529e-9) eff=9.99999993922529e-9",
-      "real_div/fp32 guard=denom:add(+9.99999993922529e-9) eff=9.99999993922529e-9",
-      "real_div/fp32 guard=denom:add(+9.99999993922529e-9) eff=9.99999993922529e-9",
-    ],
-    note: "Same three-site pooling epsilon as wespeaker.mlmodelc — and this is the SHIPPING \
-           embedder, so this is the one that matters.",
+           smallest subnormal, so on the ANE all three divisor guards are zero. This is the int8 \
+           embedder issue #15 RETIRED from shipping (its per-tensor palettization silently \
+           collapses 8-speaker audio — tests/speaker/model_io.rs's DECISION); it stays on disk \
+           as the tested sibling the factorial record runs on, guards unrepaired. The published \
+           re-conversion is NOT adopted for it: that artifact is also a RE-PALETTIZATION \
+           (different LUTs), and it moves clip 14's int8 ANE arm from 0.8178 % to 1.4860 % DER. \
+           The fp32 `wespeaker.mlmodelc` the pipeline ships instead carries these SAME pooling \
+           guards repaired to 0x1p-24 — which is why the shipping embedder has no entry here.",
   },
   KnownDefect {
     path: "speakerkit/wespeaker_int8.mlmodelc",
@@ -770,7 +764,7 @@ const KNOWN_DEFECTS: &[KnownDefect] = &[
       "real_div/fp32 guard=denom:add(+9.99999993922529e-9) eff=9.99999993922529e-9",
       "real_div/fp32 guard=denom:add(+9.99999993922529e-9) eff=9.99999993922529e-9",
     ],
-    note: "Same three-site pooling epsilon as wespeaker.mlmodelc.",
+    note: "Same three-site pooling epsilon as wespeaker_v2.mlmodelc (byte-identical artifact).",
   },
   KnownDefect {
     path: "speakerkit/PLDA.mlmodelc",
@@ -834,19 +828,27 @@ const ALIGNKIT_LOG_SOFTMAX: &str = r#"
 /// `speakerkit/pyannote_segmentation.mlmodelc/model.mil` lines 137-139 **as
 /// shipped before the issue-#15 re-conversion** — the shipped graph now ends
 /// `reduce_log_sum_exp` → `sub` and carries no `log` at all. Retained verbatim:
-/// this is the exact text that produced the 8-speaker collapse, and the parser
-/// must keep catching it if it ever reappears from a re-conversion.
+/// this is the exact pre-repair tail whose inert `log(epsilon = 0)` saturated
+/// `segments` to −45440 on the ANE, and the parser must keep catching it if it
+/// ever reappears from a re-conversion. It did NOT cause the 8-speaker
+/// clip-09 collapse — the factorial attributes that to the int8 EMBEDDER
+/// (swapping only the segmentation conversion left the collapse unchanged;
+/// `tests/speaker/model_io.rs`, "Clip 09"). Conflating the two defects is the
+/// attribution error the factorial exists to prevent.
 const SPEAKERKIT_SEG_FP16: &str = r#"
             tensor<fp16, [1, 589, 7]> var_231_softmax_cast_fp16 = softmax(axis = var_230, x = linear_2_cast_fp16)[name = tensor<string, []>("op_231_softmax_cast_fp16")];
             tensor<fp16, []> var_231_epsilon_0_to_fp16 = const()[name = tensor<string, []>("op_231_epsilon_0_to_fp16"), val = tensor<fp16, []>(0x0p+0)];
             tensor<fp16, [1, 589, 7]> var_231_cast_fp16 = log(epsilon = var_231_epsilon_0_to_fp16, x = var_231_softmax_cast_fp16)[name = tensor<string, []>("op_231_cast_fp16")];
 "#;
 
-/// `Models/speakerkit/wespeaker.mlmodelc/model.mil`, lines 4444-4450 — still
-/// what ships. The published re-conversion raises this constant (and its
-/// `op_5807` twin) from `0x1.5798eep-27` (1e-8) to `0x1p-24` and leaves every
-/// other byte of the graph and all weights identical, but it is not adopted;
-/// see this model's [`KNOWN_DEFECTS`] note.
+/// The pre-repair FluidInference `wespeaker.mlmodelc/model.mil`, lines
+/// 4444-4450 — the exact text that shipped until issue #15. The adopted
+/// FinDIT-Studio re-conversion raises this constant (and its `op_5807` twin)
+/// from `0x1.5798eep-27` (1e-8) to `0x1p-24` and leaves every other byte of
+/// the graph and all weights identical; the retired int8 siblings
+/// (`wespeaker_v2`/`wespeaker_int8`) still carry it — see their
+/// [`KNOWN_DEFECTS`] notes. Kept verbatim so the parser keeps catching this
+/// pattern if a re-conversion ever reintroduces it.
 const WESPEAKER_POOLING: &str = r#"
             tensor<fp32, []> var_5790 = const()[name = tensor<string, []>("op_5790"), val = tensor<fp32, []>(0x1.5798eep-27)];
             tensor<fp32, [3, 1]> v1 = add(x = var_5789, y = var_5790)[name = tensor<string, []>("v1")];
@@ -992,8 +994,9 @@ const TWO_HALF_SUBNORMAL_GUARDS: &str = r#"
 
 /// Two INDEPENDENT decomposed-`log_softmax` sites, distinct vars but an
 /// identical vanishing signature — the multiset shape finding 5 is about, and
-/// the exact one the live wespeaker/PLDA graphs carry (3 and 2 same-signature
-/// sites). Both render to `log/fp16 guard=softmax->log eff=0e0`, so a `dedup` or
+/// the exact one the live wespeaker_v2/PLDA graphs carry (3 and 2
+/// same-signature sites; the shipping fp32 wespeaker's three were repaired,
+/// issue #15). Both render to `log/fp16 guard=softmax->log eff=0e0`, so a `dedup` or
 /// set would collapse them into one and hide the second defect under a green
 /// pin. Synthesized from two copies of the real `SPEAKERKIT_SEG_FP16` shape.
 const TWO_SITE_LOG_SOFTMAX: &str = r#"

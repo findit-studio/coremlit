@@ -1,4 +1,7 @@
-//! CoreML wrapper for `wespeaker_v2.mlmodelc` (spec §4): raw waveform +
+//! CoreML wrapper for the WeSpeaker embedder family (spec §4) — the shipping
+//! fp32 `wespeaker.mlmodelc` and its contract-equal int8 siblings
+//! `wespeaker_v2`/`wespeaker_int8` (which artifact ships is
+//! `source::FluidAudioArtifacts`'s decision, issue #15): raw waveform +
 //! per-frame speaker-activity mask in, raw (un-normalized) 256-d WeSpeaker
 //! embeddings out, batched across all 3 pyannote speaker slots per call.
 //!

@@ -13,9 +13,9 @@
 //! |---|---|---|
 //! | `pyannote_segmentation.mlmodelc` | segmentation | **yes** — see DECISION |
 //! | `Segmentation.mlmodelc` | segmentation, alt conversion | no |
-//! | `wespeaker_v2.mlmodelc` | embedding | **yes** — see DECISION |
+//! | `wespeaker.mlmodelc` | embedding, fp32 | **yes** — see DECISION (issue #15) |
+//! | `wespeaker_v2.mlmodelc` | embedding, int8 — RETIRED from shipping | no (tested sibling) |
 //! | `wespeaker_int8.mlmodelc` | embedding, byte-identical to `wespeaker_v2` | no (same file) |
-//! | `wespeaker.mlmodelc` | embedding, fp32, contract-equal | no |
 //! | `FBank.mlmodelc` | embedding frontend, split-pipeline alt | no |
 //! | `Embedding.mlmodelc` | embedding backend, split-pipeline alt | no |
 //!
@@ -59,69 +59,88 @@
 //!   above; they are spelled out here so the restoration needs no `git log`
 //!   archaeology.
 //!
-//! # Segmentation provenance (the fp16-safe re-conversion, issue #15)
+//! # Artifact provenance (issue #15)
 //!
-//! `pyannote_segmentation.mlmodelc` — and ONLY that artifact — comes from
+//! Two artifacts — the two the shipping pipeline loads — come from
 //! <https://huggingface.co/FinDIT-Studio/speakerkit-coreml>, revision (commit
-//! SHA) `3db69988bf2de12bab250614d6ac2b03d35132a2`. Every one of its files is
-//! byte-pinned by [`fp16_safe_segmentation_matches_pinned_sha256`]. Every other
-//! artifact in `Models/speakerkit/` is still FluidInference's
-//! `speaker-diarization-coreml` conversion.
+//! SHA) `3db69988bf2de12bab250614d6ac2b03d35132a2`, and every file of each is
+//! byte-pinned in this suite:
+//!
+//! - `pyannote_segmentation.mlmodelc`
+//!   ([`fp16_safe_segmentation_matches_pinned_sha256`]);
+//! - `wespeaker.mlmodelc` ([`fp16_safe_wespeaker_fp32_matches_pinned_sha256`]).
 //!
 //! ```text
 //! hf download FinDIT-Studio/speakerkit-coreml \
 //!   --revision 3db69988bf2de12bab250614d6ac2b03d35132a2 \
-//!   --include 'pyannote_segmentation.mlmodelc/*' --local-dir Models/speakerkit
+//!   --include 'pyannote_segmentation.mlmodelc/*' 'wespeaker.mlmodelc/*' \
+//!   --local-dir Models/speakerkit
 //! ```
 //!
-//! It is a **re-conversion of the same upstream weights**, not a different
-//! model. FluidInference's fp16 conversion ended `softmax` →
-//! `log(epsilon = 0x0p+0)`; `0` is below fp16's smallest subnormal (`2^-24`),
-//! so wherever the graph computes in fp16 the guard is inert and an underflowed
-//! softmax reaches an unguarded `log(0)`. Measured on `09_mrbeast_dollar_date`,
-//! 1033 chunks, the shipping `ComputeUnits::All` placement: minimum `segments`
-//! value **−45440.0** against **−32.31** on `CpuOnly`. The re-conversion emits
-//! the fused `reduce_log_sum_exp` → `sub` form — no `log` op at all, nothing to
-//! saturate — and the same measurement gives **−31.80** on `All`.
+//! Every other artifact in `Models/speakerkit/` is FluidInference's
+//! `speaker-diarization-coreml` conversion at revision
+//! `1ed7a662fdc7109e36d822db793ee6eebdaf8594`, verified 2026-07-27 against the
+//! HuggingFace API (LFS sha256 for `weights/weight.bin`, git blob SHA-1 for
+//! `model.mil`) and byte-pinned for the tested int8 sibling by
+//! [`int8_wespeaker_matches_fluidinference_pinned_sha256`]:
 //!
-//! **What this swap does NOT do — an OBSERVATION, not an enforced property.**
-//! Re-running `parity_shipping_der`'s four gated clips (06 / 14 / 10 / 09)
-//! with only this artifact changed reproduced every gated number, clip 09's
-//! 5-of-8-speaker collapse included (its known-defect pin still passes
-//! unchanged). Environment: Apple M1 Max, macOS 26.5 (build 25F71), arm64;
-//! CoreML through this crate at each arm's own placement (`CpuOnly` for the
-//! fp32 control, `CpuOnly` and `All` for the int8 arms); the reference side is
-//! dia's ONNX on `ort`'s CPU EP.
+//! ```text
+//! hf download FluidInference/speaker-diarization-coreml \
+//!   --revision 1ed7a662fdc7109e36d822db793ee6eebdaf8594 \
+//!   --local-dir Models/speakerkit
+//! ```
 //!
-//! No test turns that into a guarantee, and the wording must not pretend
-//! otherwise. Nothing compares a pre-swap number against a post-swap number:
-//! the gates that run afterwards bound reference-agreement within ±1 pp on the
-//! gated clips (`SHIPPING_ABS_DELTA_MAX`) and ±0.05 pp on clip 09's pins
-//! (`DER_PIN_TOL`), so a swap that moved a number by anything short of those
-//! bounds would still pass every one of them.
+//! (Fetch FluidInference first, then overlay the two FinDIT-Studio artifacts —
+//! the second download replaces `pyannote_segmentation.mlmodelc` and
+//! `wespeaker.mlmodelc` in place. A tree that skips the overlay fails the two
+//! byte-pin tests with re-download instructions rather than silently running
+//! the pre-repair artifacts.)
 //!
-//! - *Established*: on those FOUR clips — four of the eight ≥ 3-speaker clips
-//!   in dia's parity corpus, not the whole multi-speaker corpus — on this
-//!   host, the two artifacts produced the same gated numbers.
-//! - *Not established*: inertness on the other four ≥ 3-speaker clips
-//!   (08 / 11 / 12 / 13), on any other host or macOS build, or at exact bit
-//!   level anywhere.
-//! - *What would settle it*: a differential gate storing each clip's pre-swap
-//!   speaker count and DER and asserting EXACT equality against the post-swap
-//!   run, across all eight ≥ 3-speaker clips. That gate does not exist; this
-//!   paragraph is its honest substitute.
+//! Both FinDIT-Studio artifacts are **re-conversions of the same upstream
+//! weights**, not different models:
 //!
-//! The swap removes a real, silent, four-orders-of-magnitude corruption on the
-//! default placement (see the measurement above); it does not repair clip 09.
-//! For what does and does not cause clip 09, see "Clip 09" below — the
-//! attribution belongs to a cross-product run at the SHIPPING configuration,
-//! not to this swap.
+//! - `pyannote_segmentation.mlmodelc`: FluidInference's fp16 conversion ended
+//!   `softmax` → `log(epsilon = 0x0p+0)`; `0` is below fp16's smallest
+//!   subnormal (`2^-24`), so wherever the graph computes in fp16 the guard is
+//!   inert and an underflowed softmax reaches an unguarded `log(0)`. Measured
+//!   on `09_mrbeast_dollar_date`, 1033 chunks, the shipping
+//!   `ComputeUnits::All` placement: minimum `segments` value **−45440.0**
+//!   against **−32.31** on `CpuOnly`. The re-conversion emits the fused
+//!   `reduce_log_sum_exp` → `sub` form — no `log` op at all, nothing to
+//!   saturate — and the same measurement gives **−31.80** on `All`.
+//! - `wespeaker.mlmodelc`: byte-identical weights (`weights/weight.bin`
+//!   sha256 `680837ec…` on both sides — the Phase-A repair was MIL-only) and a
+//!   `model.mil` differing ONLY in the two attentive-stat pooling guard
+//!   constants (`1e-8` → `0x1p-24`, the fp16 floor) plus coremlc buildInfo
+//!   strings. On this host the two MILs measured EQUAL to the last DER error
+//!   unit on every clip-09 remedy-matrix arm — the guard sites add their
+//!   epsilon to mask sums that are never near zero — so the repair is a
+//!   static fp16-floor guarantee (`tests/fp16_guards.rs`'s defect class), not
+//!   a measured quality change. Adopting it removes the shipping embedder
+//!   from the sub-fp16-guard defect roster.
 //!
-//! The published re-conversions of `wespeaker`/`wespeaker_int8` are
-//! deliberately NOT adopted: the int8 one is also a re-palettization, and it
-//! moves clip 14's shipping ANE arm from 0.8178 % to 1.4860 % DER, past
-//! `parity_shipping_der`'s ±1 pp bound (isolated by swapping one artifact at a
-//! time; see issue #15). Their `fp16_guards` pins therefore stand.
+//! **What the SEGMENTATION swap did NOT do — an OBSERVATION from the int8
+//! era, kept for attribution.** Re-running the then-current four gated clips
+//! (06 / 14 / 10 / 09, int8 shipping arms) with only the segmentation
+//! artifact changed reproduced every gated number, clip 09's 5-of-8-speaker
+//! collapse included. Environment: Apple M1 Max, macOS 26.5 (build 25F71),
+//! arm64; the reference side dia's ONNX on `ort`'s CPU EP. That measurement
+//! is why the collapse was never the segmentation tail's to fix: it removed a
+//! real, silent, four-orders-of-magnitude corruption on the default placement
+//! and moved no gated DER. The collapse belonged to the embedder — see
+//! "Clip 09" below — and its repair is the EMBEDDING decision, not this
+//! swap.
+//!
+//! The published `wespeaker_int8` re-conversion stays NOT adopted: it is also
+//! a RE-PALETTIZATION (different LUTs), and it moves clip 14's int8 ANE arm
+//! from 0.8178 % to 1.4860 % DER (isolated by swapping one artifact at a
+//! time; see issue #15). Its `fp16_guards` pin therefore stands, and the
+//! retired-but-tested int8 sibling keeps FluidInference's original bytes
+//! ([`int8_wespeaker_matches_fluidinference_pinned_sha256`]). The published
+//! fp32 `wespeaker` re-conversion IS adopted — the clip-14 regression
+//! belongs to the re-palettized LUTs, which the fp32 artifact does not have,
+//! and its remedy-matrix arms are measured DER-equal to FluidInference's
+//! fp32 on this host (see "Artifact provenance" above).
 //!
 //! # Clip 09: what the cross-products establish, and at WHICH configuration
 //!
@@ -146,12 +165,12 @@
 //! - *Not established by (a)*: anything about the int8 embedder or about
 //!   `ComputeUnits::All` — a different artifact, different kernels, and not
 //!   even the same failure (a refusal to cluster, versus the silent 5-of-8
-//!   undercount this crate ships). The sentence this doc carried until
+//!   undercount this crate shipped). The sentence this doc carried until
 //!   2026-07-26, "the embedder is exonerated", generalized (a) to a
 //!   configuration it never touched.
 //!
 //! **(b) int8 embedder (`wespeaker_v2.mlmodelc`) on `ComputeUnits::All` — the
-//! SHIPPING configuration.** `tests/speaker/backend_factorial.rs` runs the
+//! configuration that SHIPPED until issue #15 retired it.** `tests/speaker/backend_factorial.rs` runs the
 //! identical design where the defect actually lives, same clip, same host:
 //!
 //! ```text
@@ -174,7 +193,7 @@
 //!   5 / 16.5904 %), which is what makes the hybrid cells readable at all.
 //! - *Not established by (b)*: WHICH property of the CoreML embedding path
 //!   carries it. The factor varied is the BACKEND, so the implicated object is
-//!   the shipping bundle — int8 palettization **plus** `All` placement **plus**
+//!   the then-shipping bundle — int8 palettization **plus** `All` placement **plus**
 //!   that conversion — as one unit. That is what (c) separates.
 //!
 //! **(c) The embedding path's three properties, separated.**
@@ -201,20 +220,36 @@
 //!   embedding conversion".
 //! - *Established*: the two remaining factors are separable, additive on
 //!   speaker count, and very unequal on error mass. **int8 palettization costs
-//!   2 speakers at BOTH placements** (E 8 -> D 6; C 7 -> B 5) and 11 835 of the
-//!   shipping arm's 11 999 error units — 98.6 % of it. **The `All` placement
-//!   costs 1 speaker at BOTH precisions** (E 8 -> C 7; D 6 -> B 5) and 1 839 /
-//!   164 error units respectively. Neither factor alone reproduces the shipping
-//!   5-of-8 collapse.
-//! - *Not established*: anything about the REMEDY's cost. Every arm here runs
-//!   over ONNX segmentation, which is not what this crate ships, and no
-//!   fp32/`All` DER arm exists for the gated clips (06 / 14 / 10) —
-//!   `parity_shipping_der` measures fp32 only on `CpuOnly`. Nor does any of it
-//!   extend beyond clip 09 or this host.
-//! - *What would settle the remainder*: an fp32/`All` arm added to
-//!   `parity_shipping_der`'s per-clip measurement, so the speakers cell C
-//!   recovers on clip 09 can be priced against what fp32 does to clip 14 — the
-//!   clip that already sits nearest a clustering decision boundary.
+//!   2 speakers at BOTH placements** (E 8 -> D 6; C 7 -> B 5), moving 11 835
+//!   of the shipping arm's 11 999 error units — 98.6 % — in the measured run.
+//!   **The `All` placement costs 1 speaker at BOTH precisions** (E 8 -> C 7;
+//!   D 6 -> B 5), 1 839 / 164 error units respectively in that run. The
+//!   speaker counts and per-cell units are guarded
+//!   (`backend_factorial`'s verdicts, cells to ±10 units); the derived
+//!   splits (164, 98.6 %) are REPORTED measurements of that run. Neither
+//!   factor alone reproduces the shipping 5-of-8 collapse.
+//! - *Not established by (c) alone*: the arms run over ONNX segmentation,
+//!   which is not what this crate ships, and nothing here extends beyond clip
+//!   09 or this host. (d) below is the real-pipeline pricing that settled the
+//!   remedy.
+//!
+//! **(d) The mechanism, and the remedy priced in the REAL pipeline.**
+//! `backend_factorial.rs`'s `quantization_error_structure` decomposes each
+//! arm's embedding perturbation against cell E and projects it through
+//! diaric's own frozen community-1 transform: the int8 delta is a COHERENT
+//! shared displacement (coherence 0.50 vs the 0.022 isotropic null, 98.7 % of
+//! rows aligned) that compresses between-speaker centroid margins by up to
+//! +0.05 cosine, concentrated on pairs involving the clusters that then lose
+//! their identity (the probe's printed contingency names them), with
+//! within-cluster tightness unchanged; the `All` placement's delta is 1.5x
+//! larger per row
+//! but near-isotropic (coherence 0.06). Perturbation SIZE anti-correlates
+//! with damage; the coherent component predicts it. The full DECISION section
+//! carries the artifact-level cause (38 per-tensor 256-entry LUTs) and the
+//! remedy-matrix table (real pipeline: `seg@All + fp32@All` = 8/8 at
+//! 2.9810 %; the CPU-embedder arms sit on the segmentation knife edge — 9
+//! speakers / `Err(AmbiguousAliveCluster)`); `parity_shipping_der.rs` gates
+//! the adopted configuration per clip and pins the clip-09 record.
 //!
 //! The mechanism INSIDE the segmentation graph is a further step again, and it
 //! is not established either: `segments` is the only tensor either graph
@@ -225,7 +260,12 @@
 //! of those flips only 50 carry an exact tie at the CoreML row maximum, and a
 //! tie is the ONLY argmax change a monotone per-row shift can produce — so at
 //! least 515 of them originate upstream of the tail. `backend_factorial`'s
-//! `seg_divergence` carries the full argument and its caveats.
+//! `seg_divergence` carries the full argument and its caveats. On clip 09
+//! that trunk divergence surfaces as the shipping suite's three
+//! separately-pinned placement outcomes (9 spk / `Err` / 8-with-confusion);
+//! reading them as one near-threshold cluster whose state flips with
+//! placement is the interpretation the pattern supports — the pinned record
+//! (`assert_clip09_record`) states the distinction.
 //!
 //! # Licenses (`Models/speakerkit/README.md`)
 //!
@@ -259,94 +299,93 @@
 //!   spec's pinned contract (§4 table) and the `SegmentModel::infer`
 //!   single-chunk API (§5) exactly, and it is FluidAudio's shipping name —
 //!   the brief's fallback tiebreaker.
-//! - **Embedding: `wespeaker_v2.mlmodelc`.** Verified byte-identical
-//!   (`diff -rq`, sha256 of `model.mil` and `weights/weight.bin`, at plan
-//!   time) to `wespeaker_int8.mlmodelc` — "v2" is an alias for the
-//!   int8-palettized model, not a distinct fp32 architecture; see
-//!   `wespeaker_v2_and_wespeaker_int8_are_byte_identical` below.
-//!   `wespeaker.mlmodelc` is contract-equal but ships uncompressed fp32
-//!   weights (27 MB vs 6.9 MB, `du -sh */weights`).
+//! - **Embedding: `wespeaker.mlmodelc` (fp32, the FinDIT-Studio fp16-safe
+//!   MIL) — issue #15.** The original DECISION here was the int8-palettized
+//!   `wespeaker_v2.mlmodelc` (byte-identical to `wespeaker_int8.mlmodelc`;
+//!   see `wespeaker_v2_and_wespeaker_int8_are_byte_identical` below). It was
+//!   retired on measurement:
 //!
-//!   **The rationale recorded here until 2026-07-26 was false.** It read
-//!   "the smaller int8 footprint better serves the issue's ANE uplift
-//!   targets". There is no uplift, and `parity_shipping_der.rs`'s
-//!   `shipping_embedder_cost_int8_vs_fp32` measures it directly. On 120 s of
-//!   `10_mrbeast_clean_water`, warm, one config at a time: on the shipping
-//!   `All` placement int8 EXTRACTS SLOWER than fp32 (4.92 s vs 4.41 s,
-//!   24.4× vs 27.2× realtime); on `CpuOnly` it is faster (25.03 s vs
-//!   28.89 s). No consistent speed advantage in either direction, and the
-//!   sign is negative on the placement we ship. Palettization buys 21.5 MB of
-//!   on-disk footprint (8.0 MB vs 29.4 MB, 3.7×) and nothing else. Reasoning
-//!   from "smaller ⇒ faster on the ANE" without measuring is what produced
-//!   the wrong claim.
+//!   *The collapse.* On 8-speaker audio the int8 embedder silently loses
+//!   speakers: `09_mrbeast_dollar_date`, 5 of 8 speakers at 16.5904 % DER
+//!   (100 % confusion) at the then-shipping `int8/All`, where dia-ort is
+//!   frame-perfect. `backend_factorial.rs` isolated the factors over dia's
+//!   reference segmentation: the CoreML embedding CONVERSION is exonerated
+//!   (fp32/`CpuOnly` reproduces dia-ort frame-perfectly, mean AND minimum
+//!   cosine 1.000000 over all 2 114 rows), the int8 palettization costs 2
+//!   speakers at either placement (98.6 % of the shipping arm's error mass —
+//!   a reported figure of the measured run, cells guarded to ±10 units),
+//!   and the `All` placement costs 1 more at either precision.
 //!
-//!   The DECISION still stands, on different evidence: int8 **preserves the
-//!   measured speaker count and stays inside the DER bounds this suite
-//!   selected**. It is not accuracy-free, and the replacement rationale must
-//!   not repeat the original's mistake of claiming more than was measured.
+//!   *The mechanism* (`backend_factorial.rs`'s
+//!   `quantization_error_structure`, same clip/host): the palettization
+//!   error is NOT isotropic noise — it is a COHERENT shared displacement.
+//!   Against the fp32/`CpuOnly` base, the int8 arm's per-row delta carries
+//!   half its mass in ONE shared direction (coherence 0.50 vs the 0.022
+//!   independent-scatter null; 98.7 % of rows aligned), producing a
+//!   near-constant ~2.4 %-of-norm shift on every embedding. Through diaric's
+//!   frozen community-1 projection (center on a FROZEN mean → L2-normalize →
+//!   LDA → re-center → re-normalize → PLDA-whiten) that shared shift
+//!   compresses BETWEEN-speaker centroid margins by up to +0.05 cosine,
+//!   concentrated on pairs involving the clusters that then lose their
+//!   identity (the probe's printed contingency names them), while
+//!   within-cluster tightness is unchanged to three decimals. The `All` placement's fp16 scatter is the
+//!   opposite shape — 1.5× LARGER per row but near-isotropic (coherence
+//!   0.06) — which is why the perturbation SIZE anti-correlates with the
+//!   damage. The earlier "quantization is roughly isotropic and survives the
+//!   frozen basis" rationale in `parity_shipping_der` was refuted by this
+//!   measurement: palettization is the coherent, basis-hostile perturbation;
+//!   the placement is the noisy benign one. The structural reason is in the
+//!   artifact: 38 `constexpr_lut_to_dense` sites, each ONE flat 256-entry
+//!   fp32 codebook for the WHOLE tensor (~0.8-1.0 % rel-RMS weight error per
+//!   ResNet conv, compounding over 34 layers), covering even the
+//!   deterministic DSP constants (STFT cos/sin bases, mel filterbank) and
+//!   the 5120→256 embedding head — the same ΔW applied to every input's
+//!   shared activation statistics is a constant output-space bias. A
+//!   repaired quantization must break that coherence (per-channel/grouped
+//!   LUTs, higher bits, exempting the head and DSP constants) and re-enter
+//!   the full DER validation; the one published re-palettization
+//!   (`wespeaker_int8` at the FinDIT revision) is measured to REGRESS clip
+//!   14's ANE arm from 0.8178 % to 1.4860 % and stays rejected.
 //!
-//!   *Established* — `parity_shipping_der.rs`, four gated clips
-//!   (06 / 14 / 10 / 09), Apple M1 Max, macOS 26.5 (build 25F71), arm64:
-//!   int8 and fp32 agree on the speaker count on every clip whose fp32
-//!   control clusters at all, and on `10_mrbeast_clean_water` — the clip
-//!   that exposed the argmax source's spurious 8th speaker — the
-//!   precision-isolated `int8/CpuOnly` arm clusters so that not one
-//!   collar-scored frame differs from the fp32 control
-//!   (`der_std(fp32, int8).err_units() == 0`, asserted, not narrated), while
-//!   carrying a *worse* embedding cosine (~0.90-0.92) than argmax's ~0.94.
-//!   That is the noise-vs-warp distinction: quantization scatter is roughly
-//!   isotropic and survives the frozen community-1 LDA+PLDA basis, whereas
-//!   argmax's front-end change is a systematic rotation that does not.
+//!   *The remedy pricing* (issue #15 remedy matrix, real pipeline — CoreML
+//!   fp16-safe segmentation + each embedder arm, Apple M1 Max, macOS 26.5
+//!   build 25F71, arm64, release harness): on clip 09, `seg@All +
+//!   fp32@All` = **8 of 8 speakers at 2.9810 %** (the only composition with
+//!   the right count); `seg@All + fp32@CpuOnly` = 9 speakers at 1.3011 %
+//!   (a spurious cluster survives against a bit-near-ONNX embedder — the
+//!   segmentation conversion's overcount class); `seg@CpuOnly +
+//!   fp32@CpuOnly` = `Err(AmbiguousAliveCluster)` (an alive-band refusal;
+//!   one shared near-threshold cluster is the supported interpretation, not
+//!   an asserted identity — the pinned record states the distinction); the
+//!   retired `seg@All + int8@All` = 5 at 16.5904 %. Speed does not
+//!   adjudicate the artifact choice: two warm runs of THIS bench
+//!   (`shipping_embedder_cost_int8_vs_fp32`, 120 s of clip 10, one config at
+//!   a time, this host, post-swap artifacts) put the int8-vs-fp32 extraction
+//!   difference ≤ ~15 % on every placement WITH THE SIGN FLIPPING BETWEEN
+//!   RUNS (`All`: fp32 4.33 s vs int8 4.95 s in the first run, then int8
+//!   4.13 s vs fp32 4.65 s in the second; the CPU rows flipped likewise) —
+//!   inside warm-run scheduler variability, so neither artifact holds a
+//!   stable edge and the bench prints rather than asserts a winner. The
+//!   stable cost axis is PLACEMENT (CPU-embedder configs run ~2x slower than
+//!   `All`, both artifacts, both runs). Palettization's remaining edge is
+//!   ~21 MB of footprint (8.0 MB vs 29.4 MB) — retired as the price of not
+//!   silently losing 3 speakers.
 //!
-//!   *The accuracy cost int8 does carry*, from that same suite: against the
-//!   independent pyannote reference, int8 agrees worse than the fp32 control
-//!   by up to +0.2209 pp (`int8/CpuOnly`) and +0.4217 pp (`int8/All`, the
-//!   literal shipping config) — inside `SHIPPING_ABS_DELTA_MAX`'s ±1 pp
-//!   bound, but not zero. On `14_mrbeast_strongman_robot` int8 moves
-//!   0.7832 % of collar-scored speech to a different speaker than the fp32
-//!   control put it under — on a clip whose fp32 CoreML control already
-//!   carries ~0.39 % confusion against dia-ort with no quantization involved
-//!   (`SHIPPING_CONFUSION_TRIPWIRE`'s doc), so the increment is of the same
-//!   order as the conversion's own. "Within the selected bound" is the
-//!   claim; "free" is not.
+//!   *The artifact choice within fp32*: the FinDIT-Studio fp16-safe MIL
+//!   (pooling eps `1e-8` → `0x1p-24`) over FluidInference's original —
+//!   measured EQUAL to the last DER error unit on every clip-09 arm on this
+//!   host, adopted for the static fp16-floor guarantee (see "Artifact
+//!   provenance" above and `tests/fp16_guards.rs`).
 //!
-//!   *Refuted on 8-speaker audio, and this is the open question against the
-//!   DECISION.* This paragraph used to say clip 09 "cannot adjudicate the
-//!   precision axis at all", because `parity_shipping_der`'s fp32 control
-//!   there returns `Err(AmbiguousAliveCluster)` and produces nothing to
-//!   compare against. That control is confounded: it runs CoreML
-//!   segmentation, and the segmentation conversion has its own clip-09
-//!   defect. With dia's reference segmentation held fixed instead, the fp32
-//!   control clusters fine and the precision axis IS measurable —
-//!   `backend_factorial.rs`'s `embedding_precision_x_placement`, "Clip 09"
-//!   table (c) above. It costs **2 speakers at both placements** (8 -> 6 on
-//!   `CpuOnly`, 7 -> 5 on `All`) and 11 835 of the shipping arm's 11 999
-//!   error units. On this clip int8 is not accuracy-neutral by a wide margin;
-//!   it is the dominant term in the collapse.
-//!
-//!   That does not overturn the DECISION, which rests on the clips whose fp32
-//!   control clusters and where the count is preserved — but it converts "the
-//!   open question against it" from a suspicion into a measurement. Nothing
-//!   here extends past these four clips, this host, or these two placements.
-//!
-//!   *What would settle it*: an fp32/`All` arm in `parity_shipping_der`'s
-//!   per-clip measurement, so the two speakers fp32 recovers on clip 09 can be
-//!   priced against what fp32 does to clip 14 (the clip nearest a clustering
-//!   decision boundary) — plus the four remaining ≥ 3-speaker corpus clips
-//!   (08 / 11 / 12 / 13) measured on the same precision axis. Note the
-//!   candidate remedy here is the ALREADY-STAGED fp32 `wespeaker.mlmodelc`,
-//!   not the published re-palettized `wespeaker_int8` re-conversion whose
-//!   clip-14 regression is recorded above; they are different artifacts and
-//!   only the latter has been measured to cost clip 14.
-//!
-//!   The evidence lives in `parity_shipping_der.rs`; a parity gate
-//!   (spec §6.2) separately confirms quantization doesn't reintroduce the
-//!   NaN/Inf corruption dia already routes around `ort`'s CoreML EP for
+//!   The remaining gate evidence lives in `parity_shipping_der.rs` (per-clip
+//!   placement matrix + clip-09 record); a parity gate (spec §6.2)
+//!   separately confirms the fp32 conversion carries no NaN/Inf corruption
 //!   (spec §1).
 //!
 //!   `FBank.mlmodelc` + `Embedding.mlmodelc` (the split fbank-then-embed
-//!   pipeline) are NOT targeted per spec §2.4: wespeaker_v2 computes fbank
-//!   in-graph from raw waveform, so the split frontend is unnecessary.
+//!   pipeline) are NOT targeted per spec §2.4: the wespeaker artifacts
+//!   compute fbank in-graph from raw waveform, so the split frontend is
+//!   unnecessary.
 //!
 //! # Spec-vs-reality deltas
 //!
@@ -546,7 +585,9 @@ fn wespeaker_v2_io_matches_spec() {
   let model = Model::load(common::embed_path(), ComputeUnits::CpuOnly).unwrap();
   let description = model.description();
 
-  // DECISION: this is the Task 2 embedding target — see the module doc.
+  // The RETIRED int8 sibling (issue #15) — kept introspected because the
+  // factorial and mechanism records run on it; the shipping target is
+  // `wespeaker.mlmodelc`, see the module doc's DECISION.
   let waveform = description.input("waveform").expect("waveform input");
   assert_eq!(waveform.shape(), &[3, 160000]);
   assert_eq!(waveform.data_type(), Some(DataType::F32));
@@ -580,7 +621,7 @@ fn wespeaker_v2_and_wespeaker_int8_are_byte_identical() {
   // byte-compares them file-for-file: equal relative path sets, and equal bytes
   // for every file. A divergence breaks the DECISION's premise and is a finding
   // to surface, NOT a test to relax.
-  let v2 = common::embed_path(); // wespeaker_v2.mlmodelc (the shipping int8 alias)
+  let v2 = common::embed_path(); // wespeaker_v2.mlmodelc (the retired int8 alias)
   let int8 = common::models_dir().join("wespeaker_int8.mlmodelc");
 
   let mut v2_tree = BTreeSet::new();
@@ -677,6 +718,112 @@ fn fp16_safe_segmentation_matches_pinned_sha256() {
   }
 }
 
+/// Byte-pins every file of the fp16-safe fp32 embedder against the published
+/// `FinDIT-Studio/speakerkit-coreml` revision (module doc, "Artifact
+/// provenance") — the shipping-embedder twin of
+/// [`fp16_safe_segmentation_matches_pinned_sha256`], and the issue-#15 gate
+/// that makes the int8 retirement non-reversible by accident.
+///
+/// The whole difference between this artifact and FluidInference's original
+/// fp32 conversion lives inside `model.mil` (two pooling guard constants and
+/// buildInfo strings; the weights are byte-identical), and the two are
+/// measured DER-equal on this host — so nothing but a byte pin can tell them
+/// apart, and only these bytes carry the static fp16-floor repair that keeps
+/// `tests/fp16_guards.rs`'s roster clean for the shipping embedder.
+#[test]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
+fn fp16_safe_wespeaker_fp32_matches_pinned_sha256() {
+  const FILES: &[(&str, &str)] = &[
+    (
+      "metadata.json",
+      "330d8018e32a2c056ace110b3079aafacaaef37f70eae6cdad7296e85e9687c1",
+    ),
+    (
+      "model.mil",
+      "cff0cfe914078e9336754a9b38a68c2cdd88ca7b6bf97568ad551ab03ae1b666",
+    ),
+    (
+      "weights/weight.bin",
+      "680837ec172d67c3197bba93800e1623eebfd35c3b17011802f5f98b8026a0aa",
+    ),
+    (
+      "coremldata.bin",
+      "4a2840e7abc9aafa02ca23f6a3cb37fd8c8d9a95887336dae3d1e09f6ba7f9f6",
+    ),
+    (
+      "analytics/coremldata.bin",
+      "30528b97b29e0f0221b99c1c3456484f3123a68214b777f324a8b85ef5634c9a",
+    ),
+  ];
+
+  let root = common::embed_fp32_path();
+  for (relative, expected) in FILES {
+    let path = root.join(relative);
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    assert_eq!(
+      common::sha256_hex(&bytes),
+      *expected,
+      "sha256 drift on wespeaker.mlmodelc/{relative}. These bytes ARE the shipping fp32 embedder \
+       (issue #15): the pre-repair FluidInference artifact is contract-identical, DER-equal on \
+       this host, and would pass every other gate while re-introducing the sub-fp16 pooling \
+       guards. Re-download from FinDIT-Studio/speakerkit-coreml at the pinned revision (module \
+       doc), or re-baseline this pin deliberately."
+    );
+  }
+}
+
+/// Byte-pins the retired int8 sibling (`wespeaker_v2.mlmodelc`) against
+/// FluidInference's `speaker-diarization-coreml` at the pinned revision
+/// (module doc, "Artifact provenance").
+///
+/// The artifact no longer ships, but the issue-#15 record RUNS on it:
+/// `backend_factorial.rs`'s B/D cells and the `quantization_error_structure`
+/// mechanism probe reproduce the collapse from exactly these bytes. A silent
+/// swap (for instance to the published re-palettization, whose different LUTs
+/// regress clip 14) would quietly re-baseline that whole record, so the bytes
+/// are pinned like the shipping artifacts'.
+#[test]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
+fn int8_wespeaker_matches_fluidinference_pinned_sha256() {
+  const FILES: &[(&str, &str)] = &[
+    (
+      "metadata.json",
+      "ddc4858b4051254098015cd0b97080149839d697faf7b036f933190e70b26758",
+    ),
+    (
+      "model.mil",
+      "2850f775d6ba659f01f616fed77ce6a45a25de3eb7e4bf3a4b07b658be4e13dd",
+    ),
+    (
+      "weights/weight.bin",
+      "34004f6798d35cad7071e2fdc67e63faaa782f53697e1cb49bcb452cf81ae151",
+    ),
+    (
+      "coremldata.bin",
+      "6feb2472a71fa9d8a84020c85206138a4f6261c565c9884bf518d59dd5838da7",
+    ),
+    (
+      "analytics/coremldata.bin",
+      "d2b1fcde6121aea3ff0e14c1dc50d09dacb0314a2e89156353c31804230a422f",
+    ),
+  ];
+
+  let root = common::embed_path();
+  for (relative, expected) in FILES {
+    let path = root.join(relative);
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    assert_eq!(
+      common::sha256_hex(&bytes),
+      *expected,
+      "sha256 drift on wespeaker_v2.mlmodelc/{relative}. This is the RETIRED int8 artifact the \
+       issue-#15 factorial and mechanism records were measured on (FluidInference revision in \
+       the module doc); a different int8 conversion here silently re-baselines those records. \
+       Re-download from FluidInference/speaker-diarization-coreml at the pinned revision, or \
+       re-baseline this pin deliberately."
+    );
+  }
+}
+
 /// The shipped segmentation graph reaches its powerset log-probabilities through
 /// the FUSED `reduce_log_sum_exp` → `sub` tail, and contains no `log` op that a
 /// vanishing epsilon could leave unguarded. Reading the MIL is what the whole
@@ -706,14 +853,13 @@ fn segmentation_graph_has_no_log_op() {
 
 #[test]
 #[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
-fn wespeaker_fp32_io_contract_equal_but_not_targeted() {
-  // `wespeaker.mlmodelc` shares the identical I/O contract with
-  // `wespeaker_v2`/`wespeaker_int8` (same names/shapes/dtypes below) but is
-  // a DIFFERENT, non-palettized artifact: 27 MB of weights vs 6.9 MB
-  // (`du -sh */weights`, recorded at plan time) — full float32 storage
-  // precision instead of 8-bit palettized. Not targeted (see DECISION in
-  // the module doc), but contract equality means Task 2 could fall back to
-  // it without any shape-handling changes.
+fn wespeaker_fp32_io_matches_spec() {
+  // DECISION (issue #15): this is the SHIPPING embedding target. It shares
+  // the identical I/O contract with the retired `wespeaker_v2`/
+  // `wespeaker_int8` siblings (same names/shapes/dtypes below) but carries
+  // full float32 weights instead of per-tensor 8-bit palettization
+  // (27 MB vs 6.9 MB of weights) — the contract equality is what made the
+  // retirement a pure artifact swap with no shape-handling changes.
   let path = common::models_dir().join("wespeaker.mlmodelc");
   let model = Model::load(path, ComputeUnits::CpuOnly).unwrap();
   let description = model.description();

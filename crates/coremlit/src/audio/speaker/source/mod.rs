@@ -91,7 +91,7 @@ pub trait ModelSource {
 }
 
 /// The FluidAudio model source: `pyannote_segmentation.mlmodelc` +
-/// `wespeaker_v2.mlmodelc` via [`SegmentModel`]/[`EmbedModel`], decoded
+/// `wespeaker.mlmodelc` via [`SegmentModel`]/[`EmbedModel`], decoded
 /// host-side by [`Extractor::extract`] — this crate's original (and,
 /// until the multi-source split, only) pipeline. See the module doc's
 /// "`FluidAudioSource`: the existing pipeline, unchanged" section.
@@ -167,13 +167,21 @@ impl Default for Source {
 ///
 /// [`AnySource::load`] resolves the FluidAudio paths through this and nothing
 /// else, so a gate can assert the shipping selection at its source of truth
-/// instead of re-encoding it. [`Self::embedder`] is the int8-palettized
-/// `wespeaker_v2.mlmodelc` (the shipping default; byte-identical to
-/// `wespeaker_int8.mlmodelc`, `tests/model_io.rs`). Repointing it at the fp32
-/// `wespeaker.mlmodelc` — the fp32-tested/int8-shipped hazard — then moves
-/// production AND the test that pins it together, so the two cannot silently
-/// diverge (a test that loaded its OWN `wespeaker_v2` path while production
-/// loaded something else is exactly how that hazard hides).
+/// instead of re-encoding it. [`Self::embedder`] is the fp32
+/// `wespeaker.mlmodelc` (issue #15): the previously shipped int8-palettized
+/// `wespeaker_v2.mlmodelc` silently collapses 8-speaker audio (5 of 8
+/// speakers, 16.59 % DER on the measured clip) because its per-tensor
+/// palettization error is a COHERENT shared displacement that compresses
+/// between-speaker margins in the frozen community-1 PLDA space — while
+/// holding no stable extraction-speed edge over fp32 on any placement
+/// (≤ ~15 % apart with the sign varying run to run; the measured trade is in
+/// `tests/speaker/model_io.rs`'s DECISION). The mechanism, the factorial
+/// that isolated
+/// it, and the retirement rationale live in `tests/speaker/model_io.rs` (the
+/// DECISION section) and `tests/speaker/backend_factorial.rs`
+/// (`quantization_error_structure`). Repointing this resolver moves
+/// production AND every gate that pins the selection through it, so the two
+/// cannot silently diverge.
 ///
 /// **Pure**: path selection only — no filesystem access, no model load — so a
 /// hermetic unit test can pin the selection with no models present.
@@ -191,7 +199,7 @@ impl FluidAudioArtifacts {
     let root = models_root.as_ref();
     Self {
       segmenter: root.join("pyannote_segmentation.mlmodelc"),
-      embedder: root.join("wespeaker_v2.mlmodelc"),
+      embedder: root.join("wespeaker.mlmodelc"),
     }
   }
 
@@ -202,8 +210,8 @@ impl FluidAudioArtifacts {
     &self.segmenter
   }
 
-  /// The embedder artifact path (`<root>/wespeaker_v2.mlmodelc`, the int8
-  /// shipping default).
+  /// The embedder artifact path (`<root>/wespeaker.mlmodelc`, the fp32
+  /// shipping default — issue #15).
   #[inline]
   #[must_use]
   pub fn embedder(&self) -> &Path {
@@ -234,7 +242,7 @@ impl AnySource {
   /// both:
   ///
   /// - [`Source::FluidAudio`]: a directory holding
-  ///   `pyannote_segmentation.mlmodelc` and `wespeaker_v2.mlmodelc`
+  ///   `pyannote_segmentation.mlmodelc` and `wespeaker.mlmodelc`
   ///   (this crate's `Models/speakerkit`).
   /// - [`Source::Argmax`]: the `speakerkit-coreml` root holding
   ///   `speaker_segmenter/` and `speaker_embedder/` (this crate's
