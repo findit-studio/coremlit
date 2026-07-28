@@ -34,6 +34,10 @@ unicode_categories = "0.1"
 serde = { version = "1", features = ["derive"] }
 tracing = "0.1"
 serde_json = "1"
+# Dev-only: parses the TOML wire form documented on
+# `audio::speaker::source::FluidAudioArtifactConfig` so that example is executed
+# rather than trusted. Never enters any library feature graph.
+toml = "1"
 libc = "0.2"
 mach2 = "0.6"
 tempfile = "3"

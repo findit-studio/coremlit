@@ -3,8 +3,17 @@
 Deterministically re-derives the two **SigLIP 2** (`siglip2-base-patch16-naflex`)
 CoreML towers that `coremlit::embeddings::siglip` runs, converted **from the
 official public checkpoint** — not consumed from any pre-uploaded artifact repo.
-Local staging only; a public re-upload of the converted artifacts is a later owner
-decision.
+
+The converted artifacts are **published**, as this recipe's OUTPUT, at
+[`FinDIT-Studio/siglip2-naflex-coreml`](https://huggingface.co/FinDIT-Studio/siglip2-naflex-coreml)
+revision `62c97df451a4906f0ee3ab93b9213113a51740ba`. That repo is the PRODUCT of
+running this recipe, never an input to it: the conversion below still starts at
+`google/siglip2-base-patch16-naflex` and re-derives the graphs from those weights.
+Publishing changed where a *consumer* obtains the artifacts, not what the recipe
+reads. That bundle holds the fp16 ship set only — the two `.mlmodelc` trees, the
+`pos_embed_16x16x768.f32le.bin` sidecar, and `CHECKSUMS.sha256`. The fp32 towers
+built below are conversion intermediates for the verification matrix and are not
+published.
 
 ## Source (pinned)
 
@@ -88,6 +97,16 @@ bash crates/coremlit/conversion/siglip/run_siglip.sh
 
 The corpus PNGs (`$SIGLIP_GOLDENS/images/`) are committed; their source URLs +
 licenses are in `scripts/_fixtures.py` and `corpus.json`.
+
+Consuming rather than re-deriving? Unlike the other kits, this checkout stages no
+local `Models/siglip2-naflex/` tree, so the model-gated tests (`SIGLIP_TEST_MODELS`,
+else `Models/siglip2-naflex/`) need the published bundle fetched first:
+
+```sh
+hf download FinDIT-Studio/siglip2-naflex-coreml \
+  --revision 62c97df451a4906f0ee3ab93b9213113a51740ba \
+  --local-dir Models/siglip2-naflex
+```
 
 ## Scripts
 

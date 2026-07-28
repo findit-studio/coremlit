@@ -327,6 +327,12 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
+# `audio::speaker::source`'s unit tests parse the TOML wire form documented on
+# `FluidAudioArtifactConfig` (both the accepted top-level document and the
+# rejected `[speaker]`-headed one), so the documented example is executed rather
+# than reasoned about. Dev-only — the library itself reads no config file and
+# has no format dependency.
+toml.workspace = true
 tokenizers.workspace = true
 # The mel-parity unit tests (`src/embeddings/clap/audio/mel/tests.rs`, feature
 # `clap`) read committed librosa `.npy` mel oracles via `npyz` (former clapkit

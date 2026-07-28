@@ -8,19 +8,28 @@
 //!   corpus PNGs. Read hermetically; no model, no network. Staged by the port
 //!   plan's golden-generation step (Wave B).
 //! - **CoreML artifacts** (`siglip2_vision_512.mlmodelc`, `siglip2_text_64.mlmodelc`,
-//!   and `pos_embed_16x16x768.f32le.bin`) — gitignored, converted LOCALLY from the
-//!   official `google/siglip2-base-patch16-naflex` (the `conversion/siglip`
-//!   runbook), staged under `Models/siglip2-naflex/` (overridable via
-//!   `SIGLIP_TEST_MODELS`). Model-gated tests are `#[ignore]` by default and run
-//!   only when the owner stages the conversion (Wave C).
+//!   and `pos_embed_16x16x768.f32le.bin`) — gitignored, staged under
+//!   `Models/siglip2-naflex/` (overridable via `SIGLIP_TEST_MODELS`). Either
+//!   fetched from the published bundle (`FinDIT-Studio/siglip2-naflex-coreml`) or
+//!   re-derived locally from the official `google/siglip2-base-patch16-naflex`;
+//!   the `conversion/siglip` runbook covers both, since that bundle is its
+//!   OUTPUT. Unlike the other kits, this repo stages no such tree by default, so
+//!   model-gated tests are `#[ignore]` and run only once one is fetched or
+//!   converted.
 
 use std::path::{Path, PathBuf};
 
 /// The OFFICIAL SOURCE revision (commit SHA of `google/siglip2-base-patch16-naflex`)
 /// the staged artifacts were converted FROM (the `conversion/siglip` runbook); the
 /// per-source-file SHA-256 pins in the model-io gates are recorded at this
-/// revision. If/when the owner re-uploads the converted artifacts publicly, that
-/// artifact-repo revision is added alongside this one.
+/// revision.
+///
+/// Distinct from the ARTIFACT repo revision: the converted bundle is published at
+/// `FinDIT-Studio/siglip2-naflex-coreml` @
+/// `62c97df451a4906f0ee3ab93b9213113a51740ba`, which is this recipe's output. That
+/// revision is recorded in `conversion/siglip/README.md` rather than pinned here,
+/// because nothing in these tests resolves an artifact by revision — they read
+/// whatever tree `SIGLIP_TEST_MODELS` points at.
 #[allow(dead_code)]
 pub const SIGLIP_REVISION: &str = "b53b807d3a2d5e2b3911292f2d69e5341cdc064c";
 

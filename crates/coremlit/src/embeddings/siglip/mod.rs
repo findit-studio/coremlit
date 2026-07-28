@@ -46,16 +46,21 @@
 //! # Model artifacts
 //!
 //! The CoreML graphs (one fp16 artifact per tower) and the base position-grid
-//! sidecar (`pos_embed_16x16x768.f32le.bin`) are **converted locally** from the
-//! official
+//! sidecar (`pos_embed_16x16x768.f32le.bin`) are **derived from the official**
 //! [`google/siglip2-base-patch16-naflex`](https://huggingface.co/google/siglip2-base-patch16-naflex)
 //! checkpoint (**Apache-2.0**; see the crate `NOTICE`) by the recipes in
-//! `conversion/siglip/` — not consumed from any pre-uploaded artifact repo. They
+//! `conversion/siglip/` — never consumed from a third-party artifact repo. They
 //! are staged gitignored under `Models/siglip2-naflex/` (overridable via
 //! `SIGLIP_TEST_MODELS`); the source revision, per-file SHA-256, and I/O contract
-//! are pinned by `tests/siglip/model_io.rs` / `tests/siglip/text_model_io.rs`. A
-//! public re-upload of the converted artifacts is a later owner decision and would
-//! add its own artifact-repo revision pin.
+//! are pinned by `tests/siglip/model_io.rs` / `tests/siglip/text_model_io.rs`.
+//!
+//! The converted bundle is published at
+//! [`FinDIT-Studio/siglip2-naflex-coreml`](https://huggingface.co/FinDIT-Studio/siglip2-naflex-coreml)
+//! (revision `62c97df451a4906f0ee3ab93b9213113a51740ba`), so those artifacts can
+//! be fetched instead of re-converted. That repo is the OUTPUT of the recipes
+//! above, not an upstream this crate trusts: the SHA-256 pins cited above are the
+//! authority either way, and they match that revision's `CHECKSUMS.sha256`
+//! file-for-file.
 //!
 //! # Rust front-end around fp16 CoreML graphs
 //!
