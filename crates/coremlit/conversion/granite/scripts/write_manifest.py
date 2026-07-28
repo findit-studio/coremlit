@@ -17,9 +17,29 @@ contract, measured verify numbers) and is deliberately NOT listed in CHECKSUMS:
 it is written after the hashes and is not part of the distributed artifact set.
 
 Nothing here is written until ``require_verify_evidence`` has accepted complete,
-passing verification evidence that is digest-bound to this exact build. Publishing
-an artifact whose evidence is missing, partial, failing, or left over from an
-earlier run is the failure this step exists to prevent.
+passing verification evidence that is digest-bound to this exact build — which
+includes the run-bound compilation record for the shipped ``.mlmodelc`` and both
+committed goldens, re-validated here as a pair. Publishing an artifact whose
+evidence is missing, partial, failing, or left over from an earlier run is the
+failure this step exists to prevent.
+
+Publication itself is a THREE-state transition, not two writes. Every
+precondition runs first and both payloads are built in full; only then are the
+previous outputs invalidated, and each new payload is renamed into place from a
+unique temp — manifest first, checksums last. An interruption therefore leaves
+the root unpublished or visibly half-published, never a truncated checksum list
+that ``shasum -c`` accepts, and never new checksums beside a manifest from
+another run.
+
+"Interruption" there means this PROCESS stopping — an exception, ENOSPC, a
+Ctrl-C, a SIGKILL — which is what ``os.replace``'s atomicity covers. It is not a
+power-loss claim: the fsyncs around these renames are the best-effort flush
+``fsync_dir`` describes, and recovery from a power cut is to re-run the
+conversion.
+
+Nothing before that block touches the previous publication, which is what keeps a
+failed precondition — an unset ``GRANITE_GOLDENS``, a mistyped stage path — from
+destroying a valid attestation in a tree this step then refuses to publish to.
 
 The hashes recorded here are what a byte-identity check against a published
 CHECKSUMS.sha256 compares. Re-derivation is proven by ``verify_granite.py``'s
@@ -34,7 +54,9 @@ import uuid
 sys.path.insert(0, os.path.dirname(__file__))
 from _fixtures import goldens_dir
 from _granite_common import (
+    CHECKSUMS_FILE,
     EMBED_DIM,
+    MANIFEST_FILE,
     MODEL_CARD,
     MODEL_CARD_SHA256,
     MODEL_ID,
@@ -44,12 +66,16 @@ from _granite_common import (
     TOKENIZER_FILE,
     assert_artifact_file_set,
     digest_files,
+    discard_publication_outputs,
+    fsync_dir,
+    fsync_file,
     FP32_REFERENCE,
     RUN_ID_KEY,
     SHIPPED_PACKAGE,
     digest_tree,
     model_root,
     read_producer_record,
+    replace_file_atomic,
     require_verify_evidence,
     sha256_file,
     src_dir,
@@ -67,7 +93,18 @@ def stage_model_card(root):
     supplied path may simply be the wrong file, and either would otherwise be
     checksummed into the manifest as though it were the published card. The copy
     goes through a unique temp name and is renamed into place, so an interrupted
-    copy cannot leave a truncated card behind."""
+    copy cannot leave a truncated card behind — and the temp is removed on ANY
+    exit from the copy, not only on a digest mismatch. A leftover
+    ``README.md.<hex>.tmp`` is not adoptable, but it fails the exact-file-set gate
+    on every retry. A hard kill runs no handler at all, so that case is not
+    recoverable from inside the process; ``assert_no_stale_publication_temps``
+    names the file and the remedy instead of guessing that it is safe to delete.
+
+    Contents are flushed before the rename and the directory after it, for no
+    reason beyond matching what ``replace_file_atomic`` does with its own temp.
+    Both are the best-effort flush ``fsync_dir`` describes; neither is load-bearing
+    for anything above, and the difference was only ever an inconsistency between
+    two neighbouring writers."""
     dst = os.path.join(root, MODEL_CARD)
     if os.path.isfile(dst):
         got = sha256_file(dst)
@@ -93,11 +130,17 @@ def stage_model_card(root):
             f"  got  {got}\n  want {MODEL_CARD_SHA256}"
         )
     tmp = f"{dst}.{uuid.uuid4().hex}.tmp"
-    shutil.copyfile(src, tmp)
-    if sha256_file(tmp) != MODEL_CARD_SHA256:
-        os.remove(tmp)
-        raise SystemExit(f"model card copy from {src} did not land intact; retry")
-    os.replace(tmp, dst)
+    try:
+        shutil.copyfile(src, tmp)
+        if sha256_file(tmp) != MODEL_CARD_SHA256:
+            raise SystemExit(f"model card copy from {src} did not land intact; retry")
+        fsync_file(tmp)
+        os.replace(tmp, dst)
+        fsync_dir(root)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
     print(f"[ok] staged the published model card from {src}")
 
 
@@ -117,7 +160,14 @@ def stage_tokenizer(root):
     be the wrong revision — either would otherwise be checksummed into the
     manifest as though it were the pinned tokenizer. The copy goes through a
     unique temp name and is renamed into place, so an interrupted copy cannot
-    leave a truncated tokenizer behind."""
+    leave a truncated tokenizer behind — and, exactly as in ``stage_model_card``,
+    the temp is removed on ANY exit from the copy, not only on a digest mismatch.
+    A hard kill runs no handler, so that case is left to
+    ``assert_no_stale_publication_temps``, which recognises this file's temps too.
+
+    The flushes around the rename carry no more weight here than they do there:
+    both are the best-effort flush ``fsync_dir`` describes, and they exist so the
+    two copiers into the artifact root behave identically."""
     want = SOURCE_SHA256[TOKENIZER_FILE]
     dst = os.path.join(root, TOKENIZER_FILE)
     if os.path.isfile(dst):
@@ -145,11 +195,17 @@ def stage_tokenizer(root):
             f"  got  {got}\n  want {want}"
         )
     tmp = f"{dst}.{uuid.uuid4().hex}.tmp"
-    shutil.copyfile(src, tmp)
-    if sha256_file(tmp) != want:
-        os.remove(tmp)
-        raise SystemExit(f"tokenizer copy from {src} did not land intact; retry")
-    os.replace(tmp, dst)
+    try:
+        shutil.copyfile(src, tmp)
+        if sha256_file(tmp) != want:
+            raise SystemExit(f"tokenizer copy from {src} did not land intact; retry")
+        fsync_file(tmp)
+        os.replace(tmp, dst)
+        fsync_dir(root)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
     print(f"[ok] staged the pinned tokenizer from {src}")
 
 
@@ -157,7 +213,11 @@ def main():
     root = model_root()
     stage = stage_dir()
 
-    corpus_path = os.path.join(goldens_dir(), "corpus.json")
+    # Everything from here to the publication block is preflight: read-only, or
+    # constructive (the model card and the tokenizer). The previous publication
+    # is NOT touched until both payloads exist and every precondition has passed
+    # — see the invalidation below.
+    goldens = goldens_dir()
     produced = {
         name: digest_tree(os.path.join(stage, name))
         for name in (SHIPPED_PACKAGE, FP32_REFERENCE)
@@ -167,18 +227,13 @@ def main():
     stage_model_card(root)
     stage_tokenizer(root)
     rels = assert_artifact_file_set(root)
-    verify = require_verify_evidence(root, stage, corpus_path, run_id)
+    verify = require_verify_evidence(root, stage, goldens, run_id)
     # The PRODUCER's environment, carried in the digest-bound evidence — never
     # this writer's, which can trivially be a different shell.
     toolchain = verify["toolchain"]
 
     checks = digest_files(root, rels)
-    with open(os.path.join(root, "CHECKSUMS.sha256"), "w") as f:
-        for rel in rels:
-            f.write(f"{checks[rel]}  {rel}\n")
-    print(f"[ok] CHECKSUMS.sha256: {len(rels)} files")
-    for rel in rels:
-        print(f"      {rel}  {checks[rel][:16]}…")
+    checksums_text = "".join(f"{checks[rel]}  {rel}\n" for rel in rels)
 
     manifest = {
         "source": {
@@ -215,9 +270,35 @@ def main():
             "the CoreML compiler and torch's fp32 reduction order are not pinned by these versions"
         ),
     }
-    with open(os.path.join(root, "MANIFEST.json"), "w") as f:
-        json.dump(manifest, f, indent=2)
-    print(f"[ok] MANIFEST.json ({len(verify)} verify metrics recorded)")
+    manifest_text = json.dumps(manifest, indent=2)
+
+    # ---- publication: the ONLY destructive region in this step ----------------
+    #
+    # Both payloads are complete in memory and every precondition has passed, so
+    # from here the only ways out are success or a crash. That is why the
+    # invalidation lives HERE and not on entry: an unset GRANITE_GOLDENS or a
+    # mistyped stage path used to delete a valid CHECKSUMS/MANIFEST pair and only
+    # then abort, and the directory sync pushed that loss straight out to the
+    # drive. A failed precondition now leaves an existing publication exactly as
+    # it was.
+    discard_publication_outputs(root)
+
+    # Each payload goes down as one atomic rename, so no interruption can leave
+    # the checksum SUBSET a line-by-line writer would — the kind `shasum -c`
+    # accepts as a full verdict.
+    #
+    # CHECKSUMS.sha256 is written LAST, deliberately. With both prior outputs just
+    # invalidated, the reachable states are: neither file (unpublished), the
+    # manifest alone (visibly unfinished), or both from this run. That ordering is
+    # what holds the invariant — CHECKSUMS.sha256 present implies a MANIFEST.json
+    # for the same run is already beside it, and no interruption can leave an
+    # older manifest next to newer checksums.
+    replace_file_atomic(os.path.join(root, MANIFEST_FILE), manifest_text)
+    replace_file_atomic(os.path.join(root, CHECKSUMS_FILE), checksums_text)
+    print(f"[ok] {MANIFEST_FILE} ({len(verify)} verify metrics recorded)")
+    print(f"[ok] {CHECKSUMS_FILE}: {len(rels)} files")
+    for rel in rels:
+        print(f"      {rel}  {checks[rel][:16]}…")
 
 
 if __name__ == "__main__":

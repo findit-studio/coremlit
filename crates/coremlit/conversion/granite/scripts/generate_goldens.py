@@ -13,6 +13,15 @@
     its numbers. Consumed hermetically by ``tests/granite/driver_crosscheck.rs``.
     Conversion must therefore run before goldens may be regenerated.
 
+Two bindings sit on that record and they are NOT the same claim.
+``corpus_input_sha256`` is computed during the measurement, over the ordered
+``(id, text)`` it consumed, and is REQUIRED here to equal the ordered inputs
+these goldens are written from — that is what makes "this crosscheck measured
+this corpus" checkable, and what stops a goldens-only re-run after a fixture edit
+from relabelling an older measurement. ``corpus_sha256`` is stamped on afterwards
+over the serialized ``corpus.json`` bytes, which do not exist while the
+measurement runs; it binds the two files as a published PAIR and nothing more.
+
 Embeddings are serialized at 7 DECIMAL PLACES — the committed goldens' format.
 Unit-norm components here are ~0.05, where an fp32 ULP is ~4e-9, so this is a
 deliberate quantization to +-5e-8, coarser than fp32 but orders of magnitude
@@ -38,6 +47,8 @@ sys.path.insert(0, os.path.dirname(__file__))
 from _granite_common import (
     DRIVER_FLOOR,
     EMBED_DIM,
+    GOLDEN_CORPUS,
+    GOLDEN_CROSSCHECK,
     MODEL_ID,
     REV,
     SEQ_LEN,
@@ -46,7 +57,9 @@ from _granite_common import (
     SHIPPED_PACKAGE,
     assert_corpus_identity,
     assert_prompt_free,
+    corpus_input_sha256,
     digest_tree,
+    discard_file,
     load_sentence_transformer,
     read_producer_record,
     read_staged_crosscheck,
@@ -136,6 +149,33 @@ def main():
     corpus_text = serialize({"_provenance": provenance, "entries": entries})
 
     crosscheck = read_staged_crosscheck(stage, run_id)
+
+    # The crosscheck must have MEASURED the inputs this corpus is being written
+    # from — not merely have been produced by the same run.
+    #
+    # Matching run ids are not enough: the packages are unchanged by a fixture
+    # edit, so editing a `text` in _fixtures.py and re-running ONLY this step
+    # passes every id, shape and run-identity check while republishing a
+    # measurement taken over the PREVIOUS texts, relabelled with the new
+    # corpus's digest. The ordered-input digest is recorded during the
+    # measurement itself, so that re-run reds here instead.
+    measured_inputs = crosscheck.get("corpus_input_sha256")
+    written_inputs = corpus_input_sha256([(e["id"], e["text"]) for e in entries])
+    if not measured_inputs:
+        raise SystemExit(
+            f"STAGED CROSSCHECK CARRIES NO `corpus_input_sha256`: it predates the binding that "
+            f"ties the measurement to its inputs, so publishing it here would assert nothing "
+            f"about which texts were measured. Re-run convert_granite.py."
+        )
+    if measured_inputs != written_inputs:
+        raise SystemExit(
+            f"CROSSCHECK MEASURED DIFFERENT INPUTS than these goldens are being written from:\n"
+            f"  measured  {measured_inputs}\n  writing   {written_inputs}\n"
+            f"  The conversion's faithfulness measurement consumed a different ordered (id, text) "
+            f"corpus than the one about to be committed. Re-run convert_granite.py against the "
+            f"current fixtures — a goldens-only re-run would relabel that older measurement."
+        )
+
     worst = crosscheck["worst_cosine_canonical_vs_driver"]
     print(f"  driver crosscheck: {crosscheck['verdict']}, worst {worst:.16f}, "
           f"min component delta {crosscheck['min_max_abs_component_delta']:.3e}")
@@ -150,10 +190,22 @@ def main():
     crosscheck["corpus_sha256"] = hashlib.sha256(corpus_text.encode("utf-8")).hexdigest()
     crosscheck_text = serialize(crosscheck)
 
-    # Both payloads are complete before either is put in place.
-    replace_file_atomic(os.path.join(out, "corpus.json"), corpus_text)
-    replace_file_atomic(os.path.join(out, "driver_crosscheck.json"), crosscheck_text)
-    print(f"  wrote corpus.json + driver_crosscheck.json to {out}")
+    # Both payloads are complete before either is put in place, and the previous
+    # pair is invalidated before either half is replaced. Without that, a
+    # regeneration killed between the two renames left the NEW corpus beside the
+    # PREVIOUS crosscheck — two files that each look fine and together describe
+    # nothing, which every later stage used to attest to happily.
+    #
+    # The corpus lands first and the crosscheck last, because the crosscheck is
+    # what names the corpus (`corpus_sha256`): its presence can then only mean
+    # the corpus it names is already there. Reachable states are neither file,
+    # the corpus alone — every gate fails loudly on the missing crosscheck — or
+    # both from this run. A plausible mismatched pair is not among them.
+    discard_file(os.path.join(out, GOLDEN_CORPUS))
+    discard_file(os.path.join(out, GOLDEN_CROSSCHECK))
+    replace_file_atomic(os.path.join(out, GOLDEN_CORPUS), corpus_text)
+    replace_file_atomic(os.path.join(out, GOLDEN_CROSSCHECK), crosscheck_text)
+    print(f"  wrote {GOLDEN_CORPUS} + {GOLDEN_CROSSCHECK} to {out}")
     print("goldens DONE")
 
 

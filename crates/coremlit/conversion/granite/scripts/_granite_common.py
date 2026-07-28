@@ -29,6 +29,10 @@ import hashlib
 import json
 import os
 import platform
+import re
+import shlex
+import shutil
+import subprocess
 import uuid
 
 import numpy as np
@@ -71,8 +75,8 @@ COMPUTE_UNIT_NAMES = ("CpuOnly", "CpuAndGpu", "CpuAndNeuralEngine", "All")
 # The published artifact's EXACT file set (the enumerate-then-hash discipline
 # `tests/granite/model_io.rs` applies to the bundle). The model card and the
 # tokenizer are part of the distributed set but are staged, never generated here;
-# the two names below them are this recipe's own outputs and are excluded from
-# discovery.
+# the two generated names below them are this recipe's own outputs and are
+# excluded from discovery.
 MODEL_CARD = "README.md"
 # The runtime tokenizer sidecar. It ships WITH the model because the Rust crate
 # stopped embedding it (a 24 MB include_bytes! in a crates.io package), so
@@ -82,13 +86,31 @@ MODEL_CARD = "README.md"
 # distributed file. Its bytes are the pinned SOURCE tokenizer, copied unmodified:
 # SOURCE_SHA256["tokenizer.json"] IS the identity the crate enforces at load.
 TOKENIZER_FILE = "tokenizer.json"
-GENERATED_AT_ROOT = ("CHECKSUMS.sha256", "MANIFEST.json")
+CHECKSUMS_FILE = "CHECKSUMS.sha256"
+MANIFEST_FILE = "MANIFEST.json"
+GENERATED_AT_ROOT = (CHECKSUMS_FILE, MANIFEST_FILE)
 FP32_REFERENCE = f"{MODEL_STEM}_fp32.mlpackage"
 SHIPPED_PACKAGE = f"{MODEL_STEM}.mlpackage"
 SHIPPED_BUNDLE = f"{MODEL_STEM}.mlmodelc"
+FP32_BUNDLE = f"{MODEL_STEM}_fp32.mlmodelc"
 VERIFY_METRICS = "verify_metrics.json"
 PRODUCER_RECORD = "producer.json"
 STAGED_CROSSCHECK = "driver_crosscheck.json"
+COMPILE_RECORD = "compile.json"
+
+# The two committed goldens, written and consumed as a PAIR: the crosscheck names
+# the corpus bytes it was published beside, so neither half says anything
+# trustworthy about the other's contents on its own.
+GOLDEN_CORPUS = "corpus.json"
+GOLDEN_CROSSCHECK = "driver_crosscheck.json"
+
+# Every ``(mlpackage -> mlmodelc)`` pair the compile step produces, named ONCE so
+# the step that compiles them, the run-start invalidation that removes them, and
+# the record that binds them cannot drift apart.
+COMPILED_PAIRS = (
+    (SHIPPED_PACKAGE, SHIPPED_BUNDLE),
+    (FP32_REFERENCE, FP32_BUNDLE),
+)
 
 # Every attestation this recipe writes carries the id of the run that produced
 # it, and every consumer requires that id to match. The stages are separately
@@ -121,7 +143,7 @@ EXPECTED_ARTIFACT_FILES = sorted(
 # ``torch.finfo(dtype).min``: the shipped artifact is fp16, and -3.4e38 overflows
 # to -inf in coremltools' fp16 cast. A fully-padded query row is then all -inf,
 # whose softmax is NaN — measured on the CpuOnly backend as 15/16 corpus entries
-# returning non-finite output, while CpuAndGpu/ANE/All stayed clean (they
+# returning non-finite output, while CpuAndGpu/CpuAndNeuralEngine/All stayed clean (they
 # evidently evaluate the row differently), so this fails on ONE arm only. -1e4 is
 # exactly representable in fp16 and far below any attention logit this graph
 # produces, so blocked keys underflow to zero in the softmax and an all-blocked
@@ -229,7 +251,20 @@ def assert_no_os_sidecars(root, discovered):
     but they are real files: leaving them in place would either break the
     exact-set gate or (if excused by name) hide whatever sits behind that name.
     Removing files under someone's tree is not this script's call, so it names
-    them and the remedy instead."""
+    them and the remedy instead.
+
+    The remedies are built with ``shlex.join`` for the reason spelled out in
+    ``assert_no_stale_publication_temps``: an unquoted root containing a space
+    silently splits into two arguments in whatever the operator pastes. The
+    ``find`` branches are parenthesised so ``-delete`` applies to BOTH names —
+    unparenthesised, ``-o`` binds looser and only ``.DS_Store`` is removed.
+
+    The root is made ABSOLUTE, which is a DIFFERENT fix from quoting. A relative
+    root beginning with ``-`` survives ``shlex`` intact and is then read as an
+    option by the tool receiving it (measured: ``dot_clean: invalid option -- a``,
+    ``find: illegal option -- a``). Every absolute path starts with ``/`` and can
+    never be an option. ``--`` is passed as well; both tools were verified
+    non-vacuously to accept it and still act on the operand."""
     sidecars = [
         rel for rel in discovered
         if rel.rsplit("/", 1)[-1].startswith("._") or rel.rsplit("/", 1)[-1] == ".DS_Store"
@@ -238,9 +273,66 @@ def assert_no_os_sidecars(root, discovered):
         raise SystemExit(
             f"OS SIDECAR FILES under {root} — refusing to publish a tree containing them:\n"
             f"  {sidecars}\n"
-            f"  These appear when the tree lives on exFAT/FAT/SMB. Remove them "
-            f"(`dot_clean {root}`, or `find {root} -name '._*' -o -name .DS_Store -delete`) "
-            f"and re-run; staging onto a native APFS/HFS+ volume avoids them entirely."
+            f"  These appear when the tree lives on exFAT/FAT/SMB. Remove them and re-run;\n"
+            f"  staging onto a native APFS/HFS+ volume avoids them entirely.\n"
+            f"    {shlex.join(['dot_clean', '--', os.path.abspath(root)])}\n"
+            f"    {shlex.join(['find', '--', os.path.abspath(root), '(', '-name', '._*',
+                               '-o', '-name', '.DS_Store', ')', '-delete'])}"
+        )
+
+
+def assert_no_stale_publication_temps(root, discovered):
+    """Fail-closed on a temp left behind by an interrupted publication.
+
+    These appear when a publication write, a model-card copy or a tokenizer copy
+    is hard-killed between creating the temp and renaming it — no handler runs, so the temp
+    survives. It can never be adopted (every generated name is unique), but it
+    fails the exact-file-set gate on every retry, and that gate says only
+    "unexpected", which sends the operator looking for a fault in the artifact.
+
+    This REPORTS and refuses. It does NOT delete, and that is a deliberate
+    reversal: an earlier version swept these automatically and was wrong three
+    times about which names only this recipe could have produced. Prefix matching
+    removed ``README.md.notes.tmp``; a ``<32 hex>`` match still removed
+    ``README.md.00000000000000000000000000000000.tmp``, which ``uuid4`` cannot
+    emit because it pins the version nibble to ``4`` and the variant to
+    ``[89ab]``; and a UUIDv4 grammar would still be a GUESS about provenance.
+    Each iteration narrowed an irreversible blast radius without eliminating it,
+    and what it destroys is someone else's file.
+
+    Removing files under someone's tree is not this recipe's call — the same
+    judgement ``assert_no_os_sidecars`` already makes for AppleDouble files. So
+    the pattern below chooses only WHICH refusal the operator reads: a name it
+    misjudges still stops at the exact-set gate, and nothing is destroyed either
+    way.
+
+    The suggested command is built with ``shlex.join``, not string concatenation.
+    A configured root of ``/tmp/work tree`` otherwise emits ``rm /tmp/work
+    tree/...``, which hands ``rm`` two operands and deletes ``/tmp/work``. A path
+    is data and a command line is code; that is what ``shlex`` is for.
+
+    The paths are also made ABSOLUTE, and ``--`` guards a leading ``-``. These are
+    two separate hazards that both present as "the path broke the command":
+    quoting (a space splits one operand into two) and option parsing (a relative
+    root beginning with ``-`` is read as a flag). ``shlex`` fixes only the first —
+    a leading-dash path round-trips through it perfectly and is still misread."""
+    generated_tmp = re.compile(
+        "|".join(rf"{re.escape(n)}\.[0-9a-f]{{32}}\.tmp"
+                 for n in tuple(GENERATED_AT_ROOT) + (MODEL_CARD, TOKENIZER_FILE))
+    )
+    stale = [rel for rel in discovered if generated_tmp.fullmatch(rel.rsplit("/", 1)[-1])]
+    if stale:
+        raise SystemExit(
+            f"STALE PUBLICATION TEMP under {root} — refusing to publish over a tree that still "
+            f"holds a half-finished write:\n"
+            f"  {stale}\n"
+            f"  A publication, model-card or tokenizer copy was killed between writing the "
+            f"temp and renaming it. Nothing here removes them: this recipe does not delete "
+            f"files it cannot prove it created.\n"
+            f"  Confirm they are not yours, remove them, and re-run:\n"
+            f"    {shlex.join(['rm', '--',
+                               *(os.path.abspath(os.path.join(root, rel[2:]))
+                                 for rel in stale)])}"
         )
 
 
@@ -265,6 +357,7 @@ def assert_artifact_file_set(root, expected=None):
     want = sorted(EXPECTED_ARTIFACT_FILES if expected is None else expected)
     got = enumerate_artifact_root(root)
     assert_no_os_sidecars(root, got)
+    assert_no_stale_publication_temps(root, got)
     if got != want:
         missing = sorted(set(want) - set(got))
         extra = sorted(set(got) - set(want))
@@ -312,34 +405,126 @@ def assert_staged_matches_staging(root, stage):
     print("[ok] shipped tree is byte-identical to the staging build")
 
 
-def evidence_digests(root, stage, corpus_path):
-    """The bytes ``verify_granite.py``'s numbers were measured from.
+def evidence_digests(root, stage, goldens):
+    """The bytes ``verify_granite.py``'s numbers were measured from, and the
+    goldens they were measured against.
 
-    All three parts matter and together they cover the whole matrix: the per-unit
+    Every part matters and together they cover the whole matrix: the per-unit
     fp16 arms run the staged ``.mlmodelc`` under ``root`` (a byte copy of the
     staging one), the I/O contract reads the staged fp16 ``.mlpackage``, the fp32
     oracle arm runs the fp32 reference package — which lives ONLY in staging and
     is never shipped, so it is digested from there — and every cosine is scored
     against ``corpus.json``, which is itself regenerable. Without the corpus
     digest, regenerating the oracle would leave a manifest describing comparisons
-    against goldens that no longer exist under that name."""
+    against goldens that no longer exist under that name.
+
+    ``driver_crosscheck.json`` is digested for exactly the same reason, and it was
+    the gap: it is the corpus's PAIR, and until it was bonded here NO later stage
+    read or digested it. A regeneration interrupted between the two renames could
+    therefore leave the corpus from one run beside the crosscheck from another,
+    and verification, the manifest and the checksums would every one of them
+    attest successfully to a pair the Rust gate rejects."""
     return {
         "artifact": digest_files(root, EXPECTED_BUNDLE_FILES),
         "fp32_reference": digest_tree(os.path.join(stage, FP32_REFERENCE)),
-        "corpus": sha256_file(corpus_path),
+        "corpus": sha256_file(os.path.join(goldens, GOLDEN_CORPUS)),
+        "crosscheck": sha256_file(os.path.join(goldens, GOLDEN_CROSSCHECK)),
     }
 
 
-def replace_file_atomic(path, text):
-    """Write ``text`` to a sibling temp file, then rename it into place.
+def fsync_dir(path):
+    """Push ``path``'s own changes — the renames and unlinks made IN it — out of
+    host memory. Best effort, and NOT a power-loss ordering primitive.
 
-    A reader either sees the previous complete file or the new complete one. A
-    crashed or failing writer cannot leave a half-written record that a later
-    stage would read as valid."""
-    tmp = f"{path}.tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-    os.replace(tmp, path)
+    What it does. A rename is a change to the DIRECTORY rather than to the file,
+    so a directory whose new entries live only in the buffer cache is a directory
+    a kernel panic loses. ``fsync`` hands them to the drive, which bounds that
+    window.
+
+    What it does NOT do, spelled out because both the name and the placement
+    suggest otherwise: order two renames across a POWER loss. macOS ``fsync(2)``
+    says outright that once the data reaches the drive, the drive "may not
+    physically write the data to the platters for quite some time and it may be
+    written in an out-of-order sequence", so "later writes may be present, while
+    earlier writes are not" — and adds "This is not a theoretical edge case."
+    Ordering there needs
+    ``F_FULLFSYNC``/``F_BARRIERFSYNC``, and even those would not make a
+    multi-rename, multi-directory publication recover as a unit. No caller may
+    read this as a crash-consistency barrier. The publication invariants this
+    recipe does hold are PROCESS-crash invariants, and ``os.replace``'s atomicity
+    gives those on its own.
+
+    Fail-closed like every other precondition here. A directory whose sync fails
+    is reporting a real I/O problem on the volume being published to."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def fsync_file(path):
+    """Push ``path``'s CONTENTS out of host memory. Same scope as ``fsync_dir``:
+    best effort, not a power-loss primitive.
+
+    A file is not on the drive because ``write`` or ``shutil.copyfile`` returned.
+    Both places here that rename a temp into place flush it first —
+    ``write_manifest.stage_model_card`` through this helper, and
+    ``replace_file_atomic`` inline — so neither reads as an oversight beside the
+    other."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def fsync_tree(base):
+    """Push every file and directory under ``base`` out of host memory.
+
+    A copied tree is not on the drive because ``shutil.copytree`` returned, and
+    promotion renames it into the artifact root. Files first, then their
+    directory, matching ``fsync_dir``'s contract — and carrying ``fsync_dir``'s
+    scope: this bounds what a kernel panic can lose and claims nothing about a
+    power cut."""
+    for dirpath, _dirs, files in os.walk(base):
+        for name in files:
+            fsync_file(os.path.join(dirpath, name))
+        fsync_dir(dirpath)
+
+
+def replace_file_atomic(path, text):
+    """Serialize ``text`` COMPLETELY to a unique temp file, then rename it into place.
+
+    A reader either sees the previous complete file or the new complete one; no
+    reader ever sees a prefix. The whole payload is passed in rather than
+    streamed, so an interrupted writer cannot leave a plausible SUBSET — the
+    failure mode that matters for a checksum list, where a truncated file is
+    still one ``shasum -c`` accepts.
+
+    The temp name is unique, so a concurrent or previously-killed writer cannot
+    have its partial file adopted by this one, and it is removed on any failure
+    rather than left beside the artifact.
+
+    The all-or-nothing property comes from the RENAME, not from the fsyncs: a
+    process killed at any point leaves either the previous complete file or the
+    new complete one, because ``os.replace`` is atomic and the page cache outlives
+    the process. The two fsyncs — contents before the rename, parent directory
+    after it — are the best-effort flush ``fsync_dir`` describes, and neither is a
+    power-loss guarantee."""
+    tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+    parent = os.path.dirname(os.path.abspath(path))
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        fsync_dir(parent)
+    except BaseException:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise
 
 
 def discard_file(path):
@@ -350,20 +535,74 @@ def discard_file(path):
         os.remove(path)
 
 
+def discard_tree(path):
+    """Remove directory ``path`` and everything under it, if present. The
+    directory-shaped counterpart of ``discard_file`` — CoreML artifacts are
+    directories, so invalidating one is a tree removal."""
+    if os.path.isdir(path):
+        shutil.rmtree(path)
+
+
+def discard_publication_outputs(root):
+    """Remove the previous ``CHECKSUMS.sha256`` and ``MANIFEST.json``.
+
+    Two exact names, nothing else. This is not a sweeper: stale temps are
+    REPORTED by ``assert_no_stale_publication_temps`` and never deleted, because
+    a recovery step that guesses which files it created eventually guesses wrong
+    and the loss is irreversible.
+
+    Call this IMMEDIATELY BEFORE publication — after every precondition has
+    passed and after both payloads are fully built — never on entry. Invalidating
+    on entry made the independently-runnable writer destroy a valid attestation
+    whenever any precondition failed: an unset ``GRANITE_GOLDENS`` or a mistyped
+    stage path removed both files and only then aborted, and the sync below
+    pushed that loss straight out to the drive. A failed run must leave an
+    existing valid publication exactly as it found it.
+
+    The pipeline still clears both at the other genuine mutation point, by a
+    different mechanism and not through this function: ``stage_artifact.py``
+    renames them out of the root into its scratch, in the phase before it
+    replaces the bundles. So a staging step that succeeds followed by a
+    verification that fails cannot leave a complete attestation standing over
+    bytes that are no longer there.
+
+    The removals are fsynced on the same best-effort terms as every other flush
+    here — see ``fsync_dir``. What keeps a failed run non-destructive is WHERE
+    this is called from, not the flush."""
+    if not os.path.isdir(root):
+        return
+    removed = [name for name in GENERATED_AT_ROOT if os.path.exists(os.path.join(root, name))]
+    for name in removed:
+        os.remove(os.path.join(root, name))
+    if removed:
+        fsync_dir(root)
+        print(f"[ok] invalidated the previous publication under {root}: {removed}")
+
+
 def begin_run(stage):
-    """Open a new conversion run: mint its id and INVALIDATE every attestation a
-    previous run left in ``stage``.
+    """Open a new conversion run: mint its id and INVALIDATE every attestation and
+    every compiled bundle a previous run left in ``stage``.
 
     This happens before any failure-prone work. Conversion loads the checkpoint,
     checks the driver and traces — any of which can fail — and if a previous
     run's producer record, verification and crosscheck were still lying around,
     a failed conversion would leave them intact and downstream stages would
     happily certify the packages they describe. Invalidating first means a failed
-    run leaves nothing that can be mistaken for a result."""
-    for name in (PRODUCER_RECORD, VERIFY_METRICS, STAGED_CROSSCHECK):
+    run leaves nothing that can be mistaken for a result.
+
+    The staged ``.mlmodelc`` bundles go for a sharper reason: compilation happens
+    AFTER ``producer.json`` is written, and that record binds only the two
+    ``.mlpackage``s. A bundle left by an earlier run therefore satisfies every
+    later check — the staging copy makes root and staging equal, and the manifest
+    stamps THIS run's identity onto compiled bytes another run produced. Deleting
+    them means a resume that skips compilation fails loudly at the copy instead."""
+    for name in (PRODUCER_RECORD, VERIFY_METRICS, STAGED_CROSSCHECK, COMPILE_RECORD):
         discard_file(os.path.join(stage, name))
+    for _package, bundle in COMPILED_PAIRS:
+        discard_tree(os.path.join(stage, bundle))
     run_id = uuid.uuid4().hex
-    print(f"[ok] run {run_id[:12]} started; prior producer/verification/crosscheck discarded")
+    print(f"[ok] run {run_id[:12]} started; prior producer/verification/crosscheck/compilation "
+          f"records and every staged .mlmodelc discarded")
     return run_id
 
 
@@ -428,6 +667,132 @@ def read_producer_record(stage, produced):
     return record
 
 
+def observed_compiler():
+    """The toolchain that turns an ``.mlpackage`` into an ``.mlmodelc``, read from
+    what is ACTUALLY installed.
+
+    README records that the residual run-to-run instability in this recipe is the
+    CoreML compiler and the package UUID, not the conversion — the compiled
+    ``coremldata.bin`` files move between two runs whose ``model.mil`` and
+    ``weight.bin`` are identical. Compiled bytes are therefore only attributable
+    if the compiler that emitted them is recorded beside them; ``producer.json``
+    describes torch and coremltools, neither of which compiled anything.
+
+    Every probe is fail-closed. The same ``xcrun`` that answers them is the one
+    that compiles, so a probe that cannot run means the compile could not have
+    either, and a record naming no compiler must not be written."""
+    def probe(argv):
+        try:
+            done = subprocess.run(argv, capture_output=True, text=True, check=True)
+        except (OSError, subprocess.CalledProcessError) as e:
+            raise SystemExit(
+                f"COMPILER PROBE FAILED for `{' '.join(argv)}`: {e}\n"
+                f"  The compilation record must name the toolchain that produced the bundle. "
+                f"Install the Xcode command line tools and re-run."
+            ) from e
+        return done.stdout.strip()
+
+    return {
+        "coremlcompiler": probe(["xcrun", "coremlcompiler", "version"]),
+        "developer_dir": probe(["xcode-select", "-p"]),
+        "macos_product_version": probe(["sw_vers", "-productVersion"]),
+        "macos_build_version": probe(["sw_vers", "-buildVersion"]),
+    }
+
+
+def compiled_digests(stage):
+    """What each ``.mlmodelc`` in ``stage`` was compiled FROM and what it is, read
+    from disk right now — one entry per ``COMPILED_PAIRS`` member."""
+    out = {}
+    for package, bundle in COMPILED_PAIRS:
+        for sub in (package, bundle):
+            path = os.path.join(stage, sub)
+            if not os.path.isdir(path):
+                raise SystemExit(
+                    f"missing {path} — run convert_granite.py then compile_granite.py, in order"
+                )
+        out[bundle] = {
+            "input_package": package,
+            "input_package_sha256": digest_tree(os.path.join(stage, package)),
+            "output_bundle_sha256": digest_tree(os.path.join(stage, bundle)),
+        }
+    return out
+
+
+def write_compile_record(stage, run_id, compiled):
+    """Record WHICH run compiled the staged bundles, from WHICH packages, under
+    WHICH compiler.
+
+    ``producer.json`` binds only the two ``.mlpackage``s, because compilation
+    happens after it is written. Without this second record the compiled bundle —
+    which is what actually ships and what every Rust gate loads — has no
+    run-bound provenance at all, and the equality checks downstream all pass on a
+    bundle that some earlier run produced."""
+    record = {
+        RUN_ID_KEY: run_id,
+        "compiled_utc": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+        "compiler": observed_compiler(),
+        "bundles": compiled,
+    }
+    replace_file_atomic(os.path.join(stage, COMPILE_RECORD),
+                        json.dumps(record, indent=2) + "\n")
+    print(f"[ok] recorded compilation for run {run_id[:12]} over {len(compiled)} bundles")
+    return record
+
+
+def require_compile_record(stage, run_id):
+    """Fail-closed: REQUIRE a run-bound compilation record that still describes the
+    packages and bundles on disk.
+
+    This is what makes the compiled bytes attributable. Its absence means the
+    compile step did not run for this conversion; a foreign ``run_id`` means the
+    bundle came from another run; a digest mismatch means the packages were
+    re-converted after compiling, or a bundle from a different build is staged."""
+    path = os.path.join(stage, COMPILE_RECORD)
+    if not os.path.exists(path):
+        raise SystemExit(
+            f"MISSING COMPILATION RECORD: {path} does not exist.\n"
+            f"  Run compile_granite.py for this conversion. producer.json binds only the two "
+            f"mlpackages, so without this record the compiled bundle — the thing that actually "
+            f"ships — carries no evidence that this run built it from these packages."
+        )
+    with open(path) as f:
+        record = json.load(f)
+    require_run_id(record, run_id, "the compilation record", path)
+    if not record.get("compiler"):
+        raise SystemExit(
+            f"COMPILATION RECORD ({path}) names no compiler environment; re-run "
+            f"compile_granite.py."
+        )
+    got = compiled_digests(stage)
+    if record.get("bundles") != got:
+        raise SystemExit(
+            f"COMPILATION RECORD IS STALE ({path}): it does not describe the packages and "
+            f"compiled bundles now in {stage}.\n"
+            f"  Either the packages were re-converted without recompiling, or a bundle from "
+            f"another build is staged. Re-run compile_granite.py."
+        )
+    return record
+
+
+def corpus_input_sha256(pairs):
+    """SHA-256 over the ORDERED ``(id, text)`` inputs a measurement consumed.
+
+    This is the digest that makes a measurement's INPUT checkable. The published
+    ``corpus_sha256`` hashes the serialized ``corpus.json`` bytes, which do not
+    exist while the crosscheck is being measured — it binds a publication pair
+    and nothing more. This one is computed FROM the inputs as they are consumed,
+    so the same value is reproducible by anyone holding the same fixtures, and a
+    later step can prove it is writing goldens for the corpus that was measured
+    rather than relabelling an older measurement.
+
+    Order-sensitive and separator-fixed on purpose: a reordered corpus is a
+    different ordered input, and an ``indent``/``ensure_ascii`` change in some
+    other serializer must not move this digest."""
+    payload = json.dumps([[i, t] for i, t in pairs], ensure_ascii=False, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def write_staged_crosscheck(stage, run_id, crosscheck):
     """Persist the CONVERSION-TIME crosscheck so the goldens step can commit that
     exact measurement instead of recomputing its own."""
@@ -463,7 +828,7 @@ def expected_metric_keys():
     so a metrics file that simply omits an arm cannot pass as complete, plus the
     non-numeric checks whose absence would otherwise be silently acceptable."""
     keys = {"fp32_CpuOnly_vs_committed_goldens", "floors", "evidence", "checks",
-            "toolchain", RUN_ID_KEY}
+            "toolchain", "compile", RUN_ID_KEY}
     for unit in COMPUTE_UNIT_NAMES:
         keys.add(f"fp16_{unit}_vs_fp32")
         keys.add(f"fp16_{unit}_nonfinite_entries")
@@ -472,19 +837,124 @@ def expected_metric_keys():
 
 # Non-numeric verifications whose success must be recorded explicitly. A metrics
 # file that merely omits them must not read as "nothing failed".
-REQUIRED_CHECKS = ("io_contract", "tokenizer_identity", "corpus_identity")
+REQUIRED_CHECKS = ("io_contract", "tokenizer_identity", "corpus_identity", "golden_pair")
 
 
-def require_verify_evidence(root, stage, corpus_path, run_id):
+def require_published_crosscheck(goldens):
+    """Fail-closed: the two published goldens must actually be a PAIR.
+
+    Takes no run id on purpose. There is no sound unconditional run-identity
+    check here — a plain replay legitimately scores against a committed pair from
+    an earlier conversion — and the conditional one this used to carry is exactly
+    what made the check evadable. The bindings below hold regardless of which run
+    cut the pair.
+
+    ``generate_goldens.py`` puts ``corpus.json`` and ``driver_crosscheck.json``
+    down as two renames, and nothing downstream used to read the crosscheck at
+    all — it was absent from ``evidence_digests`` and neither verification nor the
+    manifest step referenced it. So a regeneration interrupted between those two
+    renames left the corpus from one run beside the crosscheck from another, and
+    verification, ``MANIFEST.json`` and ``CHECKSUMS.sha256`` all attested
+    successfully to a pair that ``tests/granite/driver_crosscheck.rs`` rejects.
+    That is a failed run leaving a stale file — inside this recipe's stated
+    boundary, reachable with no tampering — so it is checked here.
+
+    ``corpus_sha256`` is REQUIRED and must name the corpus bytes on disk. That is
+    the binding that catches the split pair.
+
+    ``corpus_input_sha256`` is REQUIRED UNCONDITIONALLY, and that is load-bearing.
+    An earlier version demanded it only when the crosscheck's ``run_id`` matched
+    the run being verified, reasoning that a plain replay legitimately scores
+    against a committed pair from an earlier run. That exemption is evadable
+    exactly where it matters: the committed pair carries a ``run_id`` and no
+    digest, so on ANY fresh run the ids differ AND the field is absent — neither
+    condition fires, and the pair is accepted. It also accepts a record the old
+    generator republished over an EDITED corpus, because that generator stamped
+    the new ``corpus_sha256`` on while leaving the measurement untouched. A
+    conditional guard whose condition is false in the common case is not a guard.
+
+    The consequence is accepted rather than worked around: the pair committed to
+    this repository predates the field, so verification REFUSES to attest until it
+    is regenerated by a conversion run. Loudly unrunnable is the correct failure;
+    the alternative is quietly certifying a pair that nothing ties to its
+    measurement.
+
+    What the two digests together CATCH: a stale pair, a mismatched pair, a
+    regeneration interrupted between the two renames, and a fixture edit published
+    without re-running the conversion. Those are mistakes and failed runs, which is
+    what this recipe's gates claim.
+
+    What they do NOT catch: a digest computed from the corpus it is stamped beside
+    and written into the record by hand. It matches by construction, and nothing
+    here can distinguish it from one a conversion recorded. That is circumvention
+    — editing a fixture specifically to defeat the refusal above — not a mistake
+    or a failed run, and it sits outside this recipe's boundary alongside the two
+    scenarios README.md already declines to claim. Binding a record to a real
+    conversion of these exact texts would need either re-deriving the measurement
+    (a conversion run) or a signed attestation; neither exists here, and neither is
+    claimed."""
+    corpus_path = os.path.join(goldens, GOLDEN_CORPUS)
+    path = os.path.join(goldens, GOLDEN_CROSSCHECK)
+    if not os.path.exists(path):
+        raise SystemExit(
+            f"MISSING PUBLISHED CROSSCHECK: {path} does not exist.\n"
+            f"  It is the corpus's pair and the conversion's faithfulness evidence; an artifact "
+            f"must not be verified or published against a corpus whose crosscheck is gone."
+        )
+    with open(path) as f:
+        record = json.load(f)
+
+    problems = []
+    want_pair = sha256_file(corpus_path)
+    if record.get("corpus_sha256") != want_pair:
+        problems.append(
+            f"it was published beside a corpus.json hashing to "
+            f"{record.get('corpus_sha256')!r}, but {GOLDEN_CORPUS} here hashes to {want_pair!r}"
+        )
+    measured = record.get("corpus_input_sha256")
+    if not measured:
+        problems.append(
+            "it carries no `corpus_input_sha256`, so NOTHING ties the measurement it records to "
+            "the corpus it is published with — the record could have been measured over any "
+            "other text and republished here"
+        )
+    else:
+        with open(corpus_path) as f:
+            entries = json.load(f)["entries"]
+        want_inputs = corpus_input_sha256([(e.get("id"), e.get("text")) for e in entries])
+        if measured != want_inputs:
+            problems.append(
+                f"it measured ordered inputs {measured!r}, but {GOLDEN_CORPUS} here holds "
+                f"{want_inputs!r}"
+            )
+
+    if problems:
+        raise SystemExit(
+            f"SPLIT GOLDEN PAIR ({goldens}) — refusing to attest to goldens that do not belong "
+            f"together:\n  " + "\n  ".join(problems) + "\n"
+            f"  REMEDY: regenerate BOTH goldens in one run — `GRANITE_REGEN_GOLDENS=1 bash "
+            f"crates/coremlit/conversion/granite/run_granite.sh`.\n"
+            f"  That needs a full CONVERSION run (the goldens step PUBLISHES the conversion's "
+            f"crosscheck, it does not compute one), which is owner-gated.\n"
+            f"  If the missing field is `corpus_input_sha256`: the pair committed to this "
+            f"repository predates it, so it fails here until it is regenerated. That is "
+            f"deliberate."
+        )
+    print("[ok] published golden pair: the crosscheck names this corpus")
+    return record
+
+
+def require_verify_evidence(root, stage, goldens, run_id):
     """Fail-closed: REQUIRE complete, passing, artifact-bound verification evidence.
 
     Downstream steps must not treat missing evidence as permission to proceed.
     This asserts, in order: the file exists; its key set is exactly
     ``expected_metric_keys()``; the recorded floors equal the constants in force
     now (so evidence cut under loosened floors cannot certify); every worst is
-    finite and clears its floor; every non-finite counter is zero; and the
-    recorded digests still match the bytes on disk, so metrics from an earlier
-    run cannot certify a different bundle."""
+    finite and clears its floor; every non-finite counter is zero; the recorded
+    compilation record is the one still on disk for this run; and the recorded
+    digests still match the bytes on disk, so metrics from an earlier run cannot
+    certify a different bundle."""
     path = os.path.join(stage, VERIFY_METRICS)
     if not os.path.exists(path):
         raise SystemExit(
@@ -529,7 +999,21 @@ def require_verify_evidence(root, stage, corpus_path, run_id):
             problems.append(
                 f"evidence belongs to run {metrics.get(RUN_ID_KEY)!r}, not this build's {run_id!r}"
             )
-        got = evidence_digests(root, stage, corpus_path)
+        # The compiled bundle is what ships, and it is not covered by the
+        # producer record. Re-read its compilation record here rather than trust
+        # the copy inside the metrics: a bundle recompiled after verification
+        # would leave the metrics' copy intact while the record on disk moved.
+        if metrics["compile"] != require_compile_record(stage, run_id):
+            problems.append(
+                "the compilation record inside the evidence is not the one on disk — the bundle "
+                "was recompiled after it was verified"
+            )
+        # The goldens are the oracle every number above was scored against, and
+        # they are a pair. Re-validate the pair here as well as in verification:
+        # the digests below catch a golden that MOVED, this catches one that was
+        # never consistent with its partner in the first place.
+        require_published_crosscheck(goldens)
+        got = evidence_digests(root, stage, goldens)
         if metrics["evidence"] != got:
             problems.append(
                 "evidence is STALE: the recorded digests do not match the bytes on disk, so "
@@ -937,15 +1421,25 @@ def driver_crosscheck(st, net):
     vector scored against ITSELF also lands at 1.0 up to reduction roundoff. So a
     positive distinctness statistic is recorded alongside it — the largest
     component difference between the unit-normalized driver vector and the
-    canonical one — and a byte-identical pair aborts outright."""
+    canonical one — and a byte-identical pair aborts outright.
+
+    ``corpus_input_sha256`` records the ORDERED ``(id, text)`` inputs this
+    measurement consumed. It is the one field here computed from the measurement
+    input rather than stamped on afterwards, and it is what stops a later
+    goldens-only re-run from republishing this record over a different corpus."""
     from _fixtures import CORPUS
 
     tokenizer = st.tokenizer
     pad_id = st[0].auto_model.config.pad_token_id
     per_entry = []
+    consumed = []
     worst = 1.0
     min_delta = float("inf")
     for entry in CORPUS:
+        # Accumulated from the entries this loop actually feeds the two models,
+        # so the recorded digest describes the measurement's input rather than
+        # some other reading of the fixture module.
+        consumed.append((entry["id"], entry["text"]))
         input_ids, attention_mask, _ids = padded_inputs(tokenizer, entry["text"], pad_id)
         with torch.no_grad():
             driven = net(
@@ -983,6 +1477,7 @@ def driver_crosscheck(st, net):
     return {
         "worst_cosine_canonical_vs_driver": worst,
         "min_max_abs_component_delta": min_delta,
+        "corpus_input_sha256": corpus_input_sha256(consumed),
         "stop_threshold_divergence": CROSSCHECK_STOP_DIVERGENCE,
         "verdict": "AGREE" if (1.0 - worst) <= CROSSCHECK_STOP_DIVERGENCE else "DIVERGE",
         "per_entry": per_entry,

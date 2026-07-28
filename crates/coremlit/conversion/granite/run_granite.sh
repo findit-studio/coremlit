@@ -23,7 +23,21 @@ set -euo pipefail
 : "${GRANITE_CONV:?set GRANITE_CONV to the scratch dir holding .venv and src-model}"
 : "${GRANITE_GOLDENS:?set GRANITE_GOLDENS to crates/coremlit/tests/granite/fixtures/goldens}"
 : "${GRANITE_MODELS_OUT:?set GRANITE_MODELS_OUT to the gitignored Models/embedkit-granite tree}"
-export GRANITE_STAGE="${GRANITE_STAGE:-$GRANITE_CONV/granite/staging}"
+# ABSOLUTE before anything uses them. A relative value beginning with `-` is read
+# as an OPTION by mkdir/rm/cp — `cp: illegal option -- t` — and every absolute
+# path starts with `/`, so none can be. This is a string rewrite, not a `cd`, so
+# it works before the directories exist and has no failure mode of its own.
+#
+# main was protected here only by accident: step 2 ran `cd "$GRANITE_STAGE"`,
+# which failed on such a value and stopped the run before step 3. Moving
+# compilation into Python removed that guard, and absolutising the compiler's
+# operands then let step 2 SUCCEED — so the first failure moved to `cp` in step 3,
+# AFTER the artifact root had been cleared. Neither change was destructive alone.
+abspath_of() { case "$1" in /*) printf '%s' "$1" ;; *) printf '%s' "$PWD/$1" ;; esac; }
+GRANITE_CONV="$(abspath_of "$GRANITE_CONV")"
+GRANITE_MODELS_OUT="$(abspath_of "$GRANITE_MODELS_OUT")"
+export GRANITE_CONV GRANITE_MODELS_OUT
+export GRANITE_STAGE="$(abspath_of "${GRANITE_STAGE:-$GRANITE_CONV/granite/staging}")"
 export TOKENIZERS_PARALLELISM=false
 PY="$GRANITE_CONV/.venv/bin/python"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -33,18 +47,40 @@ STEM=granite_97m_512
 echo "== 1/6 driver faithfulness + trace -> fp16 (shipped) + fp32 (reference) mlpackages =="
 "$PY" -u "$HERE/scripts/convert_granite.py"
 
-echo "== 2/6 compile every mlpackage -> mlmodelc (the Rust gates consume model.mil) =="
-cd "$GRANITE_STAGE"
-for p in "$STEM" "${STEM}_fp32"; do
-  rm -rf "$p.mlmodelc"
-  xcrun coremlcompiler compile "$p.mlpackage" .
-done
+echo "== 2/6 compile every mlpackage -> mlmodelc + record the compilation (run-bound) =="
+"$PY" -u "$HERE/scripts/compile_granite.py"
 
 echo "== 3/6 stage the shipped fp16 mlpackage + mlmodelc into the Models tree =="
-mkdir -p "$ROOT"
-rm -rf "${ROOT:?}/$STEM.mlmodelc" "${ROOT:?}/$STEM.mlpackage"
-cp -R "$GRANITE_STAGE/$STEM.mlmodelc" "$ROOT/"
-cp -R "$GRANITE_STAGE/$STEM.mlpackage" "$ROOT/"
+# Transactional: copy into scratch beside the artifact root, validate the copies
+# against their sources by digest, then promote by rename with rollback. Nothing
+# in $ROOT is touched until the new bundles are known good, and the attestations
+# move aside BEFORE the bundles, so no interruption leaves CHECKSUMS.sha256 or
+# MANIFEST.json describing bytes that are gone. Step 6 regenerates both.
+#
+# The scope of "no interruption", stated rather than left to be assumed: this is a
+# PROCESS-crash property. An exception, ENOSPC, EIO, a Ctrl-C or a SIGKILL at any
+# point leaves the previous publication recoverable and never leaves an
+# attestation over bytes that are gone, because a rename is atomic and the page
+# cache outlives the process. It is NOT power-loss ordering — macOS fsync hands
+# bytes to the drive and the drive may still write them out of order — so recovery
+# from a power cut is to RE-RUN this pipeline, which regenerable artifacts can
+# afford. Nor is it resumability: a run killed mid-promotion leaves its scratch
+# beside $ROOT holding the only copy of what it had moved out, and the next run
+# REFUSES while that scratch exists rather than sweep the remainder into a second
+# one and delete it on success. Reassembly is by hand; the refusal prints where to
+# look.
+#
+# One run at a time. Nothing locks $ROOT, and this pipeline already assumes a
+# single run: steps 1 and 2 share $GRANITE_STAGE and would clobber each other long
+# before step 3 is reached.
+#
+# This was four rm/cp lines. A preflight stopped a MISSING source from triggering
+# the removals, but could not stop a FAILING copy: the first cp landing and the
+# second hitting an unreadable file left the root stripped of both attestations
+# and both prior bundles. Python, not shell, because the copy has to be staged,
+# digest-validated against its source and rolled back as a unit — which reuses the
+# recipe's own digest_tree and has no reasonable shell equivalent.
+"$PY" -u "$HERE/scripts/stage_artifact.py"
 
 # The goldens step REWRITES $GRANITE_GOLDENS/corpus.json + driver_crosscheck.json,
 # which verify_granite.py then reads as its oracle and write_manifest.py records a
