@@ -305,10 +305,10 @@
 //!
 //! # Compute placement (measured, never marketed)
 //!
-//! [`DEFAULT_COMPUTE`] ships as [`crate::ComputeUnits::All`] and is
-//! **PROVISIONAL**: no CED conversion has been measured yet. The Wave-C
-//! placement pass (`tests/ced/placement.rs`) characterizes per-unit parity and
-//! latency and re-pins the measured winner.
+//! [`DEFAULT_COMPUTE`] ships as [`crate::ComputeUnits::All`], MEASURED: the
+//! Wave-C pass (`tests/ced/placement.rs`) characterized per-unit parity and
+//! latency across all four sizes and this default is what it pinned. See
+//! [`DEFAULT_COMPUTE`] for the numbers.
 //!
 //! # Performance: construct once, reuse, prewarm
 //!
@@ -378,10 +378,11 @@ const _: () = assert!(
 /// NaN-free, and warm latency is flat across units (~0.6–0.8 s/clip,
 /// dominated by the Rust mel front end, not the CoreML forward) — so
 /// `CpuAndGpu` is not faster here, contra the spec's original expectation.
-/// The default `All` (ANE) arm is in fact the numerically *tightest* vs the
-/// committed PyTorch fp32 goldens (`tests/ced/parity_logits.rs`: worst cos
-/// ~0.99999988, max|Δlogit| ~0.03) — unlike siglip's vision tower, CED's ANE
-/// did not collapse, so `All` stays the default. Only a *measured* per-size
+/// The default `All` arm is in fact the numerically
+/// *tightest* vs the committed PyTorch fp32 goldens
+/// (`tests/ced/parity_logits.rs`: worst cos ~0.99999988, max|Δlogit| ~0.03),
+/// and unlike siglip's vision tower the `CpuAndNeuralEngine` arm did not
+/// collapse either, so `All` stays the default. Only a *measured* per-size
 /// divergence would promote this to a per-[`CedModel`] table; Wave-C found
 /// none, so one shared default stands.
 pub const DEFAULT_COMPUTE: ComputeUnits = ComputeUnits::All;
@@ -423,8 +424,7 @@ impl Default for ClassifierOptions {
 }
 
 impl ClassifierOptions {
-  /// Options matching the module default: [`DEFAULT_COMPUTE`] (PROVISIONAL —
-  /// see its doc).
+  /// Options matching the module default: [`DEFAULT_COMPUTE`].
   pub const fn new() -> Self {
     Self {
       compute: DEFAULT_COMPUTE,
