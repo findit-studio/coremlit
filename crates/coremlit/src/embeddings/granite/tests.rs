@@ -1772,8 +1772,15 @@ fn natural_doc(target_bytes: usize) -> String {
 
 /// PERF GATE (structural, hermetic, non-flaky): on a ~256 KiB natural document the
 /// measurement path re-encodes at most 1.5× the input in bytes (the old per-range
-/// closure re-encoded ~11×). Structural — one index pass plus tiny edge fragments
-/// — so robust across corpora.
+/// closure re-encoded ~11×).
+///
+/// Scope: this holds for text whose pre-tokens are short — i.e. separated by
+/// whitespace or punctuation, as `natural_doc` is. It does NOT generalize to text
+/// the o200k Split regex parses into one document-spanning pre-token (unspaced CJK,
+/// an unbroken letter run); there the index has no interior boundary to answer
+/// from and every measure direct-encodes, driving the ratio into the hundreds.
+/// `separatorless_text_is_one_pretoken` pins that structural cause and
+/// `measure_path_reencode_ratio_on_separatorless_text` characterizes the cost.
 #[test]
 #[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn measure_path_reencodes_at_most_1_5x_input() {
@@ -1794,6 +1801,112 @@ fn measure_path_reencodes_at_most_1_5x_input() {
     "measure path re-encoded {ratio:.3}x the input (> 1.5x) — the single-pass index regressed \
      toward the old per-range re-encode"
   );
+}
+
+/// Dense unspaced CJK — no ASCII space, no ASCII sentence terminator. windit's
+/// `ContentAware` finds no paragraph, sentence, or word boundary and descends to
+/// its `char` fallback.
+fn cjk_doc(target_bytes: usize) -> String {
+  const RUN: &str = "你好世界模型推理文本嵌入检索";
+  let mut s = String::with_capacity(target_bytes + RUN.len());
+  while s.len() < target_bytes {
+    s.push_str(RUN);
+  }
+  s
+}
+
+/// The structural cause of the separatorless blow-up, pinned cheaply (one encode,
+/// no chunking): the o200k Split regex's word branches glue an unbroken
+/// `\p{L}`/`\p{M}` run into a SINGLE pre-token, so an unspaced CJK document —
+/// however long — parses to exactly one pre-token.
+///
+/// `TokenIndex` is indexed BY pre-token, so a one-pre-token text gives it no
+/// interior boundary: every `measure_range(a, b)` with `a` inside that pre-token
+/// has to re-encode `[a, b)` in full, which is the pre-index cost. The single-pass
+/// property the sibling gate asserts is therefore a property of the CORPUS (short
+/// pre-tokens), not of the index alone.
+///
+/// Goes red if the pinned tokenizer's pre-tokenization ever splits such a run —
+/// at which point the separatorless cost characterization below is stale too.
+/// "Cheap" is about the work, not about reach: like every gate that needs REAL
+/// granite tokenization, it reads the staged artifact sidecar and is `#[ignore]`d
+/// on it, so it runs where the sibling 1.5× gate runs and nowhere else.
+#[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
+fn separatorless_text_is_one_pretoken() {
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
+  for (label, doc) in [("cjk", cjk_doc(4096)), ("ascii-letters", "x".repeat(4096))] {
+    let enc = mt.encode(doc.as_str(), false).expect("encode");
+    let pretokens = enc
+      .get_word_ids()
+      .iter()
+      .flatten()
+      .copied()
+      .max()
+      .map_or(0, |m| m as usize + 1);
+    assert_eq!(
+      pretokens,
+      1,
+      "{label}: expected one document-spanning pre-token over {} bytes, got {pretokens} — the \
+       separatorless measure-cost characterization rests on this",
+      doc.len()
+    );
+    assert!(
+      enc.get_ids().len() > 1,
+      "{label}: the one pre-token must still carry many BPE tokens"
+    );
+  }
+}
+
+/// CHARACTERIZATION (`#[ignore]`, quadratic — too slow for CI): on separatorless
+/// text the measurement path re-encodes ORDERS OF MAGNITUDE more than the 1.5× the
+/// sibling gate asserts for whitespace-delimited prose, and the `TokenIndex` fast
+/// path is no faster than the pre-index slow twin.
+///
+/// Measured on this branch (release, Apple Silicon, 31,374 CJK bytes → 18 chunks):
+/// fast 2,316 ms vs slow 2,298 ms — a 1.0× speedup — at a 584× re-encode ratio,
+/// against 1.007× and ~10× on `natural_doc` at the same size. The cause is
+/// `separatorless_text_is_one_pretoken`; windit's `char` fallback then issues one
+/// growing-prefix measure per `char`, so the whole-range re-encodes are quadratic
+/// in the chunk length.
+///
+/// Asserts the regime is still degenerate rather than a target to beat: it goes red
+/// once the measure path stops direct-encoding separatorless ranges, which is the
+/// signal to retire this test and widen the sibling gate's corpus.
+#[test]
+#[ignore = "quadratic on separatorless text, and the staged granite tokenizer.json \
+            (run locally); characterizes the open cost"]
+fn measure_path_reencode_ratio_on_separatorless_text() {
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
+  let opts = WindowOptions::new(MAX_TOKENS);
+  for (label, doc) in [
+    ("cjk", cjk_doc(15_666)),
+    ("ascii-letters", "x".repeat(7_833)),
+  ] {
+    super::token_index::encode_meter::reset();
+    let t0 = std::time::Instant::now();
+    let fast = chunk_long(&mt, &doc, &opts).expect("fast chunk");
+    let fast_ms = t0.elapsed().as_secs_f64() * 1e3;
+    let ratio = super::token_index::encode_meter::get() as f64 / doc.len() as f64;
+
+    let t1 = std::time::Instant::now();
+    let slow = chunk_long_slow(&mt, &doc, &opts).expect("slow chunk");
+    let slow_ms = t1.elapsed().as_secs_f64() * 1e3;
+
+    assert_eq!(fast, slow, "{label}: fast/slow chunk mismatch");
+    println!(
+      "[separatorless:{label}] bytes={} chunks={} fast={fast_ms:.1}ms slow={slow_ms:.1}ms \
+       speedup={:.1}x reencode_ratio={ratio:.1}x",
+      doc.len(),
+      fast.len(),
+      slow_ms / fast_ms,
+    );
+    assert!(
+      ratio > 10.0,
+      "{label}: re-encode ratio {ratio:.1}x is no longer degenerate — the separatorless measure \
+       cost was fixed; retire this characterization and widen the 1.5x gate's corpus"
+    );
+  }
 }
 
 /// GATE 4 (`#[ignore]`, run locally for the PR notes): fast == slow chunks on
