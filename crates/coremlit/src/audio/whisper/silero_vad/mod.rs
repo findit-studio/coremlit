@@ -12,7 +12,7 @@
 //! whose flags whisperkit's own
 //! [`active_chunks`](crate::audio::whisper::audio::vad::VoiceActivityDetector::active_chunks)
 //! then merge into the long-form [`ChunkingStrategy::Vad`] chunk boundaries. It
-//! does NOT re-home silero's segment logic (that stays in `silero`, re-exported
+//! does NOT re-home the segment logic (that stays in `zuoer`, re-exported
 //! by `vadkit`); it plugs the Silero *model* into whisperkit's existing VAD
 //! contract.
 //!
@@ -59,7 +59,7 @@ use crate::audio::vad::{
 use crate::audio::whisper::audio::vad::VoiceActivityDetector;
 
 /// Default speech threshold: a 256 ms frame is active when its Silero
-/// probability is ≥ this. Matches silero's own `start_threshold` default (0.5).
+/// probability is ≥ this. Matches zuoer's own `start_threshold` default (0.5).
 pub const DEFAULT_SPEECH_THRESHOLD: f32 = 0.5;
 
 /// The hard-failure latch behind [`SileroVad`]'s infallible

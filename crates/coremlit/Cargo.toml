@@ -3,10 +3,11 @@ name = "coremlit"
 description = "Safe, synchronous CoreML runtime with opt-in on-device audio pipelines (Whisper STT, forced alignment, speaker diarization, Silero VAD)"
 version.workspace = true
 edition.workspace = true
-# Unpublishable: the optional `align` / `speaker` / `vad` features pull
-# rev-pinned git dependencies (`asry`, `dia`/diarization, `silero`) — crates.io
-# forbids git sources even behind optional features, and none are published.
-# Flip once they all land on released versions.
+# Unpublishable: the optional `align` / `speaker` features pull rev-pinned git
+# dependencies (`asry`, `dia`/diarization) — crates.io forbids git sources even
+# behind optional features, and neither is published. `vad` is clear: it rides
+# the published `zuoer`, and its `vad-bundled` oracle the published `silero`.
+# Flip once the remaining two land on released versions.
 publish = false
 rust-version.workspace = true
 license.workspace = true
@@ -72,11 +73,14 @@ speaker = ["dep:diaric"]
 speaker-oracle = ["speaker", "dep:dia", "dia/ort", "dia/bundled-segmentation"]
 
 # --- audio::vad (former crate `vadkit`) ---
-# silero's logic-only detector seam (NO ort) rides `vad`.
-vad = ["dep:silero"]
-# Former vadkit dev-only `bundled`: silero's ONNX reference stack for the
-# cross-backend characterization oracle. DEV/TEST only — pulls ort.
-vad-bundled = ["vad", "silero/bundled"]
+# `zuoer`, the backend-agnostic VAD core (the `VadBackend` seam plus the
+# Silero-derived segmentation logic), rides `vad`. Zero dependencies, no model,
+# no inference runtime — so `ort` cannot enter the `vad` runtime graph.
+vad = ["dep:zuoer"]
+# Former vadkit dev-only `bundled`: the `silero` crate's ONNX reference stack
+# for the cross-backend characterization oracle. DEV/TEST only — pulls ort.
+# `silero/bundled` implies `silero/onnx`, which is what compiles `ort`.
+vad-bundled = ["vad", "dep:silero", "silero/bundled"]
 
 # --- embeddings::clap (former crate `clapkit`) ---
 # CLAP-HTSAT dual-tower audio+text encoders on CoreML: a Rust mel/STFT front-end
@@ -220,19 +224,22 @@ diaric = { git = "https://github.com/findit-studio/diaric", rev = "877189e434aff
 # ROOT Cargo.toml, mirroring the diaric/asry recipes; do not edit this line.
 dia = { package = "diarization", git = "https://github.com/findit-studio/diarization", rev = "b6a6f9adc8465f7a4c207dbaa2701d98e1be1ff2", default-features = false, optional = true }
 
-# --- audio::vad optional git dep (the `vad` feature) ---
+# --- audio::vad optional deps (the `vad` / `vad-bundled` features) ---
 # The detection/streaming logic single-home: coremlit's vad layer implements
-# silero's `VadBackend` seam over CoreML and re-exports silero's detector
+# `zuoer`'s `VadBackend` seam over CoreML and re-exports zuoer's detector
 # surface wired to that backend, authoring ZERO segmentation logic here.
-# `default-features = false` selects the LOGIC-ONLY silero crate — NO `ort`/ONNX
-# backend compiled, so `ort` never enters the `vad` runtime graph. The ONNX
-# reference stack is DEV/TEST-only behind `vad-bundled` (`silero/bundled`).
-# Pinned to silero's merged `main` (0.5.0 seam) by full git REV — the earlier
-# `9ad65749` seam-branch rev was squashed away by silero#11's squash-merge
-# (the squash preserved the tree, so content is identical); RE-PIN to
-# `silero = "0.5.0"` once it publishes (does not change this no-`ort`,
-# logic-only posture).
-silero = { git = "https://github.com/Findit-AI/silero", rev = "a55ef2b2922ec14250e6a5b3a4b30596f018454c", default-features = false, optional = true }
+# `zuoer` is the model-free VAD core with NO dependencies of its own — no
+# model, no inference runtime, no audio I/O — so `ort` cannot enter the `vad`
+# runtime graph, nor a downstream `whisper`'s.
+zuoer = { version = "0.1.0", optional = true }
+# `silero` is DEV/TEST-only, pulled in by `vad-bundled` alone: its bundled ONNX
+# Silero stack (`Session` / `detect_speech`) is the cross-backend
+# characterization oracle in `tests/vad/cross_backend.rs`. Since 0.6 silero is
+# itself a `zuoer` consumer that re-exports the core's detector surface, so the
+# oracle's segmenter and coremlit's are the same types from the same crate.
+# `default-features = false` keeps the bare dependency ort-free; `vad-bundled`
+# turns `silero/bundled` (⇒ `silero/onnx` ⇒ `ort`) back on.
+silero = { version = "0.6.0", default-features = false, optional = true }
 
 # --- embeddings::clap optionals (the `clap` feature) ---
 # f64 forward FFT for the Slaney-mel front-end — the same crate + major version
@@ -268,7 +275,9 @@ textclap = { git = "https://github.com/Findit-AI/textclap", rev = "584f21754337a
 # ride it. Rev-pinned to the PUBLIC windit repo at its reviewed main HEAD (the
 # asry/diaric convention). windit 0.1.0 is also published on crates.io with the
 # same API surface; RE-PIN to `windit = "0.1"` in the same follow-up wave as
-# the silero/diaric re-pins (does not change the feature posture below).
+# the diaric re-pin (the silero one has landed: the `vad` feature now rides the
+# published `zuoer` core, `vad-bundled` the published `silero`). Does not change
+# the feature posture below.
 # windit's default features stay on (`alloc` — the planner/aggregate/split `Vec`
 # APIs live there); `serde` is NOT enabled (clap keeps its own wire-pinned config
 # types; granite serializes nothing of windit's), nor `half`, nor `std` (windit

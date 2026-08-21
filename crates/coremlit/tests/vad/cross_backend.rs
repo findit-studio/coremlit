@@ -2,7 +2,7 @@
 //! **behavioral agreement** of two independent VAD stacks on the parity-corpus
 //! clips, at the segment level:
 //!
-//! - **silero-ONNX** (the reference): the `silero` crate at its default
+//! - **silero-ONNX** (the reference): the DEV/TEST-only `silero` crate at its default
 //!   features, running the bundled Silero VAD ONNX graph through ONNX Runtime —
 //!   512-sample (32 ms) frames at 16 kHz — with silero's own `detect_speech`
 //!   segmenter (hysteresis, `min_speech`/`min_silence`, `speech_pad`). A
@@ -11,8 +11,8 @@
 //!   note).
 //! - **vadkit-CoreML** (under test): the FluidInference unified 256 ms artifact
 //!   (`silero-vad-unified-256ms-v6.2.1`) — 4096-sample (256 ms) frames — turned
-//!   into segments by **silero's own segmenter through vadkit's re-export**
-//!   ([`coremlit::audio::vad::detect_speech`], which forwards to `silero::detect_speech_with`
+//!   into segments by **the same segmenter, through vadkit's re-export**
+//!   ([`coremlit::audio::vad::detect_speech`], which forwards to `zuoer::detect_speech_with`
 //!   over [`coremlit::audio::vad::CoreMlBackend`]). This REPLACES T4's interim test-local
 //!   thresholding harness (T5): the vadkit side now runs the exact same
 //!   detection logic as the reference, differing only in model and geometry —
@@ -54,9 +54,9 @@
 //!   stays here after T5's harness removal.)
 //! - **The mask/span metrics catch a geometry lie.** Sample-level overlap, speech
 //!   IoU, duration ratio and the outer speech-envelope boundary deltas all
-//!   collapse when silero's real [`SpeechSegmenter`] is driven over vadkit's
+//!   collapse when the real [`SpeechSegmenter`] is driven over vadkit's
 //!   256 ms probabilities at silero's 512-sample stride
-//!   ([`SpeechSegmenter::set_frame_samples`] 4096 → 512): the timeline
+//!   ([`SpeechSegmenter::set_frame_hop`] 4096 → 512): the timeline
 //!   compresses 8×, so overlap and IoU crater and the envelope end-delta blows
 //!   out by tens of seconds. (The grid metric is frame-decision based and so is
 //!   deliberately blind to this — the two families do not overlap.)
@@ -93,7 +93,7 @@ const GRID_THRESHOLD_HEALTHY: f32 = 0.5;
 /// past the pinned bound.
 const GRID_THRESHOLD_MUTANT: f32 = 0.9;
 
-/// Mutation 2 — the geometry lie (spec §6 "geometry"): drive silero's real
+/// Mutation 2 — the geometry lie (spec §6 "geometry"): drive the real
 /// segmenter over vadkit's 256 ms probabilities at silero's 512-sample stride
 /// instead of the true [`CHUNK_SAMPLES`] (4096). Compresses vadkit's timeline
 /// 8×, collapsing overlap/IoU and blowing out the envelope boundary deltas.
@@ -256,9 +256,9 @@ fn characterize(
   }
 
   // Outer speech-envelope span deltas. Ends are clamped to the audio length
-  // (as T4's harness clamped every segment end to `total_samples`): silero's
-  // `detect_speech_with` zero-pads a trailing PARTIAL frame and closes the
-  // segment at the padded FRAME boundary (`n_frames * frame_samples`), which
+  // (as T4's harness clamped every segment end to `total_samples`): both
+  // backends zero-pad a trailing PARTIAL frame, so a segment closes at the
+  // padded FRAME boundary (`n_frames * frame_hop`), which
   // can overhang the true sample count by up to one frame (e.g. 07's 99·4096 =
   // 405 504 past its 404 160 samples). That overhang is a timeline artifact,
   // not real speech past the end of the audio, so the honest in-audio envelope
@@ -402,9 +402,9 @@ fn vadkit_probs(samples: &[f32]) -> Vec<f32> {
     .collect()
 }
 
-/// **The real re-export path** (T5): vadkit's segments as produced by silero's
-/// own segmenter over the CoreML backend — [`detect_speech`] forwarding to
-/// `silero::detect_speech_with`. Default `SpeechOptions`, `cpu_only`
+/// **The real re-export path** (T5): vadkit's segments as produced by the
+/// shared segmenter over the CoreML backend — [`detect_speech`] forwarding to
+/// `zuoer::detect_speech_with`. Default `SpeechOptions`, `cpu_only`
 /// (deterministic). This is the healthy vadkit stack the gate measures — the
 /// same detection logic as the reference, only a different model and geometry.
 fn vadkit_detect_segments(samples: &[f32]) -> Vec<Segment> {
@@ -420,15 +420,16 @@ fn vadkit_detect_segments(samples: &[f32]) -> Vec<Segment> {
     .collect()
 }
 
-/// Drives silero's REAL [`SpeechSegmenter`] over vadkit's per-256 ms `probs` at a
-/// chosen `frame_samples` stride, collecting the segments — the same segmenter
+/// Drives the REAL [`SpeechSegmenter`] over vadkit's per-256 ms `probs` at a
+/// chosen `frame_hop` stride, collecting the segments — the same segmenter
 /// [`detect_speech`] uses internally, exposed here so the geometry-lie mutation
 /// can feed it silero's 512-sample stride instead of the true 4096 while the
 /// probabilities stay vadkit's real 256 ms outputs. Authors no detection logic:
-/// `SpeechSegmenter` is silero's.
-fn silero_segmenter_segments(probs: &[f32], frame_samples: usize) -> Vec<Segment> {
+/// `SpeechSegmenter` is zuoer's (re-exported by `silero`, so both stacks in
+/// this file drive the same type from the same crate).
+fn silero_segmenter_segments(probs: &[f32], frame_hop: usize) -> Vec<Segment> {
   let mut segmenter = SpeechSegmenter::new(SpeechOptions::default());
-  segmenter.set_frame_samples(frame_samples);
+  segmenter.set_frame_hop(frame_hop);
   let mut segments = Vec::new();
   for &probability in probs {
     if let Some(segment) = segmenter.push_probability(probability) {
@@ -519,7 +520,7 @@ fn mutation_threshold_swap_breaks_gate() {
   }
 }
 
-/// Mutation 2 (recorded red): lying about the geometry — driving silero's real
+/// Mutation 2 (recorded red): lying about the geometry — driving the real
 /// segmenter over vadkit's 256 ms probabilities at silero's 512-sample stride —
 /// collapses the sample-level agreement and blows out the envelope boundary
 /// deltas, tripping the mask/span bounds. The grid metric (frame-decision based)

@@ -69,8 +69,8 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
       "speaker-oracle",
       vec!["speaker", "dep:dia", "dia/ort", "dia/bundled-segmentation"],
     ),
-    ("vad", vec!["dep:silero"]),
-    ("vad-bundled", vec!["vad", "silero/bundled"]),
+    ("vad", vec!["dep:zuoer"]),
+    ("vad-bundled", vec!["vad", "dep:silero", "silero/bundled"]),
     ("clap", vec!["dep:rustfft", "dep:tokenizers", "dep:windit"]),
     ("clap-oracle", vec!["clap", "dep:textclap"]),
     (

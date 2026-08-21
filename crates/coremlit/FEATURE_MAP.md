@@ -21,8 +21,8 @@ rename or a dropped feature cannot land silently.
 | speakerkit | (crate) | `speaker` | the CoreML segmentation + embedding backends (module `audio::speaker`) ride this |
 | speakerkit | `dia` | `speaker` | diaric's backend-free runtime clustering core (formerly the `dia` offline bridge) |
 | speakerkit | `dia-oracle` | `speaker-oracle` | dia's ort DER oracle (DEV/TEST) |
-| vadkit | (crate) | `vad` | silero's logic-only detector rides this |
-| vadkit | dev-dep `silero/bundled` | `vad-bundled` | silero ONNX cross-backend oracle (DEV/TEST) |
+| vadkit | (crate) | `vad` | the `zuoer` detector core rides this |
+| vadkit | dev-dep `silero/bundled` | `vad-bundled` | the `silero` crate's ONNX cross-backend oracle (DEV/TEST) |
 | clapkit | (crate) | `clap` | CLAP-HTSAT dual-tower audio+text encoders (module `embeddings::clap`) ride this; Rust mel front-end + shared `tokenizers`, no ort; the long-audio window geometry + aggregation ride the rev-pinned `windit` git dep |
 | clapkit | `parity-oracle` | `clap-oracle` | textclap model-level parity oracle (DEV/TEST) |
 | clapkit | `serde` | `serde` | unified cross-cutting |
@@ -78,11 +78,11 @@ none. It is pinned here and driven by CI (`.github/workflows/ci.yml`):
 | `whisper` | the STT pipeline alone |
 | `align` | forced alignment alone (asry emissions, no ort) |
 | `speaker` | diarization backends + diaric clustering core (no ort) |
-| `vad` | Silero model layer alone (silero logic-only, no ort) |
+| `vad` | Silero model layer alone (`zuoer` detector core, no ort) |
 | `whisper,vad` | the `silero_vad` composition (former `vadkit` feature) |
 | `align-oracle` | + asry ONNX aligner (ort + whisper.cpp) |
 | `speaker-oracle` | + dia ort DER oracle |
-| `vad-bundled` | + silero ONNX cross-backend oracle |
+| `vad-bundled` | + the `silero` crate's ONNX cross-backend oracle |
 | `clap` | CLAP audio+text encoders alone (Rust mel + tokenizers, no ort) |
 | `clap-oracle` | + textclap model-level parity oracle (ort) |
 | `granite` | granite text embeddings alone (bundled tokenizer + committed transformers-fp32 goldens, no ort; `embed_long` rides the rev-pinned `windit` engine + `windit/text`) |

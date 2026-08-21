@@ -19,7 +19,7 @@
 | [`audio::whisper`](crates/coremlit/src/audio/whisper) | `whisper` | The Whisper pipeline on CoreML: mel → encoder → autoregressive decoder with prefill, KV caching, temperature-fallback ladder; energy-VAD long-form chunking (opt-in Silero VAD via `whisper`+`vad`); scoped-thread batch pool; DTW word timestamps; push-based streaming with LocalAgreement-2; SRT/VTT/JSON writers. Token-for-token parity-tested against Swift WhisperKit on `openai_whisper-tiny`. |
 | [`audio::align`](crates/coremlit/src/audio/align) | `align` (`align-oracle`) | CoreML wav2vec2 forced word-level alignment: audio + a known transcript → per-word time spans with confidence, over `asry`'s parity-tested alignment seam. |
 | [`audio::speaker`](crates/coremlit/src/audio/speaker) | `speaker` (`speaker-oracle`) | CoreML segmentation + embedding backends for `dia`'s diarization: runs pyannote's `segmentation-3.0` and WeSpeaker on the ANE and produces the `dia`-shaped tensors (`Extraction`) that feed [`dia`](https://github.com/findit-studio/diarization)'s VBx/PLDA clustering. Multi-source (FluidAudio default + Argmax). Never assigns a speaker label — clustering stays in `dia`. |
-| [`audio::vad`](crates/coremlit/src/audio/vad) | `vad` (`vad-bundled`) | Silero VAD on CoreML: runs the FluidInference unified 256 ms model and implements the published [`silero`](https://github.com/Findit-AI/silero) crate's `VadBackend` seam, re-exporting its detector so a consumer gets the full offline + streaming API with **zero** detection logic duplicated; `ort`/ONNX never enters the runtime graph. |
+| [`audio::vad`](crates/coremlit/src/audio/vad) | `vad` (`vad-bundled`) | Silero VAD on CoreML: runs the FluidInference unified 256 ms model and implements the published [`zuoer`](https://crates.io/crates/zuoer) crate's `VadBackend` seam, re-exporting its detector so a consumer gets the full offline + streaming API with **zero** detection logic duplicated; `ort`/ONNX never enters the runtime graph. |
 | [`audio::ced`](crates/coremlit/src/audio/ced) | `ced` | CED (tiny/mini/small/base) AudioSet sound-event tagging on CoreML: 16 kHz mono waveform → Rust log-mel front-end → fp16 mel→logits transformer natively on Apple silicon → sigmoid + ranked predictions over the 527 rated AudioSet classes (`soundevents-dataset`, ort-free); long clips via `windit` window geometry + Mean/Max confidence aggregation. The four sizes share one size-invariant mel→logits contract (`CedModel`). Closes the ORT-CoreML-EP zeroed-logits gap (`soundevents` stays the ort lineage); parity against committed fp32 goldens lands per size as staged, no `ort`. |
 | [`embeddings`](crates/coremlit/src/embeddings) | `clap` / `granite` / `siglip` | Embedding producers, each a feature-gated CoreML pipeline projecting into a shared joint space, L2-normalized in Rust: CLAP-HTSAT audio+text (`clap`), granite sentence embeddings (`granite`), and SigLIP 2 (`siglip2-base-patch16-naflex`) image+text (`siglip`, NaFlex — no windowing). Parity against committed transformers-fp32 goldens, no `ort`. `video` is likewise reserved and **not** created until a video kit exists. |
 
@@ -39,7 +39,7 @@ The owner's architecture-confusion fix: who is authoritative for what, where the
    └────────┬───────────────────────┬───────────────┬───────────────┬────────┘
             │ whisper+vad            │ align          │ speaker        │ vad
             ▼ (opt-in)               ▼                ▼                ▼
-      audio::vad                 asry  (git)    dia / diarization  silero (git)
+      audio::vad                 asry  (git)    dia / diarization  zuoer (crates.io)
    (Silero long-form chunking) (alignment seam:  (git; VBx/PLDA    (detector logic
                                 emissions +       clustering —      single-home:
                                 ONNX oracle)      backend-free      thresholding,
@@ -57,14 +57,14 @@ construction — the ort-based `soundevents` crate is never a dependency).
 
 - `audio::align` runs the CoreML CTC encoder; **`asry`** owns the tokenizer, silence mask, and CTC trellis/beam (the alignment vocabulary is re-exported from `asry`). `align-oracle` adds asry's ONNX aligner as the word-timing parity oracle.
 - `audio::speaker` runs CoreML segmentation/embedding; **`dia`** owns clustering/PLDA/reconstruction. `speaker` pulls dia's **backend-free offline core** (no `ort`); `speaker-oracle` adds dia's own ort inference as the DER oracle.
-- `audio::vad` runs the CoreML Silero graph and implements **`silero`**'s `VadBackend` seam; **`silero`** owns all detection logic. `vad-bundled` adds silero's ONNX reference stack (DEV/TEST only).
+- `audio::vad` runs the CoreML Silero graph and implements **`zuoer`**'s `VadBackend` seam; **`zuoer`** owns all detection logic. `vad-bundled` adds the `silero` crate's ONNX reference stack as the cross-backend oracle (DEV/TEST only) — the only configuration that pulls `silero` at all.
 - `audio::ced` runs the CoreML CED mel→logits graph (tiny/mini/small/base, one size-invariant contract) and owns the whole pipeline in-crate (Rust mel, sigmoid, top-k, aggregation); **`soundevents-dataset`** owns only the rated AudioSet vocabulary (`RatedSoundEvent`, re-exported). The ort-based `soundevents` crate remains the separate ONNX lineage — never a coremlit dependency.
 
-**Dependency arrows are rev-pinned git deps** (`asry`, `dia`/`diarization`, `silero`), gated behind their feature so a fresh, sibling-free clone resolves; co-develop against a local checkout via an uncommitted workspace-root `[patch]` (see `Cargo.toml`).
+**Two dependency arrows are rev-pinned git deps** (`asry`, `dia`/`diarization`), gated behind their feature so a fresh, sibling-free clone resolves; co-develop against a local checkout via an uncommitted workspace-root `[patch]` (see `Cargo.toml`). `zuoer` (and the DEV/TEST `silero` oracle) come from crates.io.
 
 **Extraction triggers** (the `diaric` naming pattern — a model-branded crate's pure, backend-agnostic logic core is pulled into a standalone `*ic` crate). Two triggers fire an extraction:
 
-1. **A second backend/consumer needs the logic core.** coremlit's `audio::speaker` depends on the pinned [`dia`](https://github.com/findit-studio/diarization) crate, which owns clustering/PLDA/reconstruction **in-tree** — the backend-free offline core (no `ort`) that `speaker` pulls; [`diaric`](https://github.com/findit-studio/diaric) is a SEPARATE downstream extraction lineage — a different consumer's pull of that logic core, **not** a coremlit dependency and not the authority for coremlit's speaker path. `vadic` is **RESERVED** for `silero`'s detector logic under the same pattern — today `silero` single-homes it and coremlit's `audio::vad` is its only CoreML consumer, so no VAD extraction has fired.
+1. **A second backend/consumer needs the logic core.** coremlit's `audio::speaker` depends on the pinned [`dia`](https://github.com/findit-studio/diarization) crate, which owns clustering/PLDA/reconstruction **in-tree** — the backend-free offline core (no `ort`) that `speaker` pulls; [`diaric`](https://github.com/findit-studio/diaric) is a SEPARATE downstream extraction lineage — a different consumer's pull of that logic core, **not** a coremlit dependency and not the authority for coremlit's speaker path. The VAD extraction HAS fired under this pattern: [`zuoer`](https://crates.io/crates/zuoer) is the standalone, dependency-free detector core pulled out of `silero` (which now re-exports it), and coremlit's `audio::vad` depends on `zuoer` directly — `silero` itself is reached only by the DEV/TEST `vad-bundled` oracle.
 2. **The pure surface must escape backend-coupled CI/versioning.** The `--no-default-features` (ort/tch-free) surface moves out so it can build and publish free of the backend infrastructure's rot — the `diaric` split's second rationale.
 
 `coremlit` is downstream of all three seams; it authors CoreML execution, never the algorithms.
@@ -115,7 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Installation
 
-Not yet on crates.io (release pending — `publish = false` while `asry`/`dia`/`silero` are git deps). Use a git dependency and enable the pipelines you need:
+Not yet on crates.io (release pending — `publish = false` while `asry`/`dia` are git deps). Use a git dependency and enable the pipelines you need:
 
 ```toml
 [dependencies]
@@ -156,7 +156,7 @@ Flat and additive; `default = []`.
 | `whisper` | the `audio::whisper` STT pipeline |
 | `align` / `align-oracle` | forced alignment / + the asry ONNX word-timing parity oracle (DEV/TEST) |
 | `speaker` / `speaker-oracle` | diarization backends + dia offline bridge / + dia's ort DER oracle (DEV/TEST) |
-| `vad` / `vad-bundled` | Silero VAD model layer / + silero's ONNX cross-backend oracle (DEV/TEST) |
+| `vad` / `vad-bundled` | Silero VAD model layer (`zuoer` detector core) / + the `silero` crate's ONNX cross-backend oracle (DEV/TEST) |
 | `clap` / `granite` / `siglip` | embedding producers: CLAP audio+text / granite sentence / SigLIP 2 image+text — each committed-golden parity, no `ort` (`clap-oracle` adds the textclap ort oracle) |
 | `ced` | CED (tiny/mini/small/base) AudioSet sound-event tagging — Rust mel + `soundevents-dataset` + `windit`, committed-golden parity per size as staged, no `ort` |
 | `serde` | `Serialize`/`Deserialize` on options/results/provenance (+ the whisper JSON writer) |
@@ -170,7 +170,7 @@ Rust **1.95**, edition 2024. macOS only (Apple Silicon primary; `x86_64-apple-da
 
 ## Acknowledgments & licensing
 
-`audio::whisper` is a Rust port of [Argmax's WhisperKit](https://github.com/argmaxinc/WhisperKit) (MIT); the underlying model is [OpenAI's Whisper](https://github.com/openai/whisper). The forced aligner, diarization backends, and VAD build on the `asry`, `dia`, and `silero` seams respectively. Every third-party **model** attribution the crate's pipelines load at runtime — Silero/FluidInference, Whisper/argmax/OpenAI, pyannote community-1 (**CC-BY-4.0, attribution required**)/segmentation-3.0/WeSpeaker/argmax, and the chordai wav2vec2 aligner — is recorded in [`NOTICE`](NOTICE).
+`audio::whisper` is a Rust port of [Argmax's WhisperKit](https://github.com/argmaxinc/WhisperKit) (MIT); the underlying model is [OpenAI's Whisper](https://github.com/openai/whisper). The forced aligner, diarization backends, and VAD build on the `asry`, `dia`, and `zuoer` seams respectively. Every third-party **model** attribution the crate's pipelines load at runtime — Silero/FluidInference, Whisper/argmax/OpenAI, pyannote community-1 (**CC-BY-4.0, attribution required**)/segmentation-3.0/WeSpeaker/argmax, and the chordai wav2vec2 aligner — is recorded in [`NOTICE`](NOTICE).
 
 #### License
 
