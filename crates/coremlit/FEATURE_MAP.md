@@ -35,7 +35,7 @@ manifests and BOTH CI matrices.
 | speakerkit | `dia-oracle` | `speaker-oracle` | dia's ort DER oracle (DEV/TEST) — now a **`coremlit-parity`** feature |
 | vadkit | (crate) | `vad` | the `zuoer` detector core rides this |
 | vadkit | dev-dep `silero/bundled` | `vad-bundled` | the `silero` crate's ONNX cross-backend oracle (DEV/TEST) — now a **`coremlit-parity`** feature |
-| clapkit | (crate) | `clap` | CLAP-HTSAT dual-tower audio+text encoders (module `embeddings::clap`) ride this; Rust mel front-end + shared `tokenizers`, no ort; the long-audio window geometry + aggregation ride the rev-pinned `windit` git dep |
+| clapkit | (crate) | `clap` | CLAP-HTSAT dual-tower audio+text encoders (module `embeddings::clap`) ride this; Rust mel front-end + shared `tokenizers`, no ort; the long-audio window geometry + aggregation ride the crates.io `windit` dep |
 | clapkit | `parity-oracle` | `clap-oracle` | textclap model-level parity oracle (DEV/TEST) — now a **`coremlit-parity`** feature |
 | clapkit | `serde` | `serde` | unified cross-cutting |
 
@@ -57,7 +57,7 @@ the embedkit phase): general text sentence-embeddings on CoreML, first model
 transformers-fp32 goldens, not a live crate, so it has NO `granite-oracle`
 sibling and pulls no `ort` — hence it appears in the rename table below only as a
 new-module note, not an old-crate row. Its long-input `embed_long` path pulls the
-rev-pinned `windit` git dep (with `windit/text` for content-aware chunking); the
+crates.io `windit` dep (with `windit/text` for content-aware chunking); the
 single-text `embed` path does not depend on it.
 
 `siglip` is likewise a NEW module (`embeddings::siglip`): SigLIP 2
@@ -73,7 +73,7 @@ predictions over the 527 rated AudioSet classes out (`soundevents-dataset`,
 the ort-free data crate; the ort-based `soundevents` crate is never a
 dependency). A Rust log-mel
 front-end (`rustfft`) feeds one fp16 mel→logits graph; long clips ride the
-rev-pinned `windit` engine (geometry only). Same posture as `granite` —
+crates.io `windit` engine (geometry only). Same posture as `granite` —
 COMMITTED fp32 goldens, so NO `ced-oracle` sibling and no `ort` — and it
 composes with nothing (a single leaf feature).
 
@@ -100,7 +100,7 @@ and driven by the `features` job of CI (`.github/workflows/ci.yml`), which runs
 | `whisper,vad` | the `silero_vad` composition (former `vadkit` feature) |
 | `align-oracle` | + asry ONNX aligner (ort + whisper.cpp) |
 | `clap` | CLAP audio+text encoders alone (Rust mel + tokenizers, no ort) |
-| `granite` | granite text embeddings alone (bundled tokenizer + committed transformers-fp32 goldens, no ort; `embed_long` rides the rev-pinned `windit` engine + `windit/text`) |
+| `granite` | granite text embeddings alone (bundled tokenizer + committed transformers-fp32 goldens, no ort; `embed_long` rides the crates.io `windit` engine + `windit/text`) |
 | `siglip` | SigLIP 2 image+text embeddings alone (bundled tokenizer + committed transformers-fp32 goldens, no ort) |
 | `ced` | CED (tiny/mini/small/base) sound-event tagging alone (Rust mel + `soundevents-dataset` + `windit`, no ort) |
 | `whisper,align,speaker,vad,clap,granite,siglip,ced,serde,tracing,nl-recognizer` | all non-oracle features on |

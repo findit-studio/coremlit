@@ -49,7 +49,7 @@ The owner's architecture-confusion fix: who is authoritative for what, where the
 
 `audio::ced` (feature `ced`) sits beside the four diagrammed modules on the same
 core: its mel front-end is in-crate Rust (no external logic-seam crate), its
-window geometry rides the rev-pinned `windit` engine, and its 527-class rated
+window geometry rides the crates.io `windit` engine, and its 527-class rated
 label set is the crates.io `soundevents-dataset` data crate (ort-free by
 construction — the ort-based `soundevents` crate is never a dependency).
 
@@ -60,7 +60,7 @@ construction — the ort-based `soundevents` crate is never a dependency).
 - `audio::vad` runs the CoreML Silero graph and implements **`zuoer`**'s `VadBackend` seam; **`zuoer`** owns all detection logic. `coremlit-parity`'s `vad-bundled` adds the `silero` crate's ONNX reference stack as the cross-backend oracle (DEV/TEST only) — the only configuration that pulls `silero` at all, and it is no longer reachable from coremlit's own manifest.
 - `audio::ced` runs the CoreML CED mel→logits graph (tiny/mini/small/base, one size-invariant contract) and owns the whole pipeline in-crate (Rust mel, sigmoid, top-k, aggregation); **`soundevents-dataset`** owns only the rated AudioSet vocabulary (`RatedSoundEvent`, re-exported). The ort-based `soundevents` crate remains the separate ONNX lineage — never a coremlit dependency.
 
-**coremlit's remaining rev-pinned git deps** are `asry`, `diaric` and `windit`, gated behind their feature so a fresh, sibling-free clone resolves; the unpublished `dia`/`diarization` and `textclap` oracles moved to the never-published `coremlit-parity` package. Co-develop against a local checkout via an uncommitted workspace-root `[patch]` (see `Cargo.toml`). `zuoer` (and the DEV/TEST `silero` oracle) come from crates.io.
+**Every coremlit dependency now comes from crates.io** — `asry` 0.1, `diaric` 0.1 and `windit` 0.2 landed as released versions, joining `zuoer`, so the manifest is `publish = true`. The unpublished `dia`/`diarization` and `textclap` oracles are git sources still, and stay confined to the never-published `coremlit-parity` package (as does the DEV/TEST `silero` oracle's home). Co-develop against a local checkout via an uncommitted workspace-root `[patch.crates-io]` (see `Cargo.toml`).
 
 **Extraction triggers** (the `diaric` naming pattern — a model-branded crate's pure, backend-agnostic logic core is pulled into a standalone `*ic` crate). Two triggers fire an extraction:
 
@@ -115,7 +115,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
 ## Installation
 
-Not yet on crates.io (release pending — `publish = false` while `asry`/`dia` are git deps). Use a git dependency and enable the pipelines you need:
+Not yet on crates.io — the first release is still pending, though the manifest is publishable now that every dependency resolves from the registry. Until it lands, use a git dependency and enable the pipelines you need:
 
 ```toml
 [dependencies]

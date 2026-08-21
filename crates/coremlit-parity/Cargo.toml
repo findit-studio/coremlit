@@ -62,9 +62,13 @@ dia = { package = "diarization", git = "https://github.com/findit-studio/diariza
 
 # `diaric` — the backend-free clustering core the speaker cross-crate
 # equivalence gates drive directly (`diaric::offline::diarize_offline`,
-# `diaric::plda::PldaTransform`). Same rev as `coremlit`'s runtime pin, so the
-# oracle and the measured path share one build of it.
-diaric = { git = "https://github.com/findit-studio/diaric", rev = "877189e434aff080c1340313caf8801cea946af3", optional = true }
+# `diaric::plda::PldaTransform`). MUST resolve to the SAME build as `coremlit`'s
+# runtime dep: these gates hand diaric values across the coremlit boundary
+# (`Extraction::diarize(plda)`, `SlidingWindow: Into<_>`), and two copies of
+# diaric in the graph make those distinct types — a hard E0308/E0277 compile
+# failure, not a silent divergence. So this tracks coremlit's published version,
+# not a git rev; re-pinning either side alone reds this package.
+diaric = { version = "0.1.0", optional = true }
 
 # The textclap oracle — likewise an unpublished rev-pinned git source. CO-DEV:
 #

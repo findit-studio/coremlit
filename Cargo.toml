@@ -6,10 +6,10 @@ members = ["crates/coremlit", "crates/coremlit-parity"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-# MSRV floor is set by pinned git dependencies — coremlit's `asry` (the `align`
-# feature) and `diaric` (the `speaker` runtime clustering core), plus the
-# `dia`/diarization DER oracle now owned by `coremlit-parity` (`speaker-oracle`)
-# — all of which need rustc 1.95.
+# 1.95 is the floor several dependencies already declare, not a coremlit-only
+# choice: `asry` 0.1 (`align`), `diaric` 0.1 (`speaker`), `windit` 0.2
+# (`clap`/`granite`), `pixon` 0.1 + `mediaframe` (`siglip`), and the
+# `dia`/diarization + `whispercpp` oracles owned by `coremlit-parity`.
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/findit-studio/coremlit"
@@ -48,9 +48,8 @@ sha2 = "0.11"
 rustfft = "6"
 # The 527-class rated AudioSet label set for audio::ced (`RatedSoundEvent`,
 # `from_index`, `events()` — all `const fn`). ORT-FREE data codegen by
-# construction (deps: thiserror/phf/uncased only). Published on crates.io, so a
-# plain version dep (no git pin needed, unlike asry/diaric). `ontology` and its
-# `serde` stay off.
+# construction (deps: thiserror/phf/uncased only). `ontology` and its `serde`
+# stay off.
 soundevents-dataset = { version = "0.2", default-features = false, features = ["std", "rated"] }
 npyz = "0.9"
 cpal = "0.18"

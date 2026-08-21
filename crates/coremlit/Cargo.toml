@@ -3,14 +3,13 @@ name = "coremlit"
 description = "Safe, synchronous CoreML runtime with opt-in on-device audio pipelines (Whisper STT, forced alignment, speaker diarization, Silero VAD)"
 version.workspace = true
 edition.workspace = true
-# Still unpublishable, but for FEWER reasons than before: the optional `align`,
-# `speaker` and `clap`/`granite` features pull rev-pinned git dependencies
-# (`asry`, `diaric`, `windit`) and crates.io forbids git sources even behind an
-# optional feature. The two UNPUBLISHED oracles that used to sit here (`dia`,
-# `textclap`) are gone — they moved, with their features and test binaries, to
-# the never-published `crates/coremlit-parity`. `vad` is clear: it rides the
-# published `zuoer`. Flip once the remaining three land on released versions.
-publish = false
+# Publishable: every dependency in this package — including the optional
+# `align` / `speaker` / `clap` / `granite` ones — now resolves from crates.io.
+# The UNPUBLISHED parity oracles (`dia`, `textclap`) that once blocked this
+# live in the never-published `crates/coremlit-parity`, and must stay there:
+# crates.io rejects a git source even behind an optional feature, so adding one
+# back here re-breaks publishing.
+publish = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -189,23 +188,22 @@ tokenizers = { workspace = true, optional = true }
 unicode_categories = { workspace = true, optional = true }
 objc2-natural-language = { workspace = true, optional = true }
 
-# --- audio::align optional git dep (the `align` feature) ---
+# --- audio::align optional dep (the `align` feature) ---
 # The clean, ort-free dependency: asry's `emissions` seam only (no whispercpp,
-# no ort). Rev-pinned to a PUBLIC git source, NOT a sibling path: a clean
-# checkout of this repo alone resolves and builds, with no co-located `asry`
-# checkout required. A sibling `asry` is now only TEST DATA — for the ignored
-# oracle gates that read asry's `models/` fixtures (`ALIGNKIT_ASRY_MODELS`, see
-# `tests/align/common/mod.rs`). The rev is asry's reviewed `main` HEAD at the
-# time the align surface was cut. Co-developing asry and coremlit together?
-# Point both at your local `asry` with an UNCOMMITTED workspace-root patch (add
-# to the root `Cargo.toml`, never commit it):
+# no ort). A published crates.io version, NOT a sibling path: a clean checkout
+# of this repo alone resolves and builds, with no co-located `asry` checkout
+# required. A sibling `asry` is now only TEST DATA — for the ignored oracle
+# gates that read asry's `models/` fixtures (`ALIGNKIT_ASRY_MODELS`, see
+# `tests/align/common/mod.rs`). Co-developing asry and coremlit together? Point
+# both at your local `asry` with an UNCOMMITTED workspace-root patch (add to
+# the root `Cargo.toml`, never commit it):
 #
-#   [patch."https://github.com/findit-studio/asry"]
+#   [patch.crates-io]
 #   asry = { path = "../asry" }
 #
-asry = { git = "https://github.com/findit-studio/asry", rev = "49cbfc9ca6fb75366d75a862212bdebb889021e5", default-features = false, features = ["emissions"], optional = true }
+asry = { version = "0.1.0", default-features = false, features = ["emissions"], optional = true }
 
-# --- audio::speaker optional git deps ---
+# --- audio::speaker optional dep (the `speaker` feature) ---
 # `diaric` is the backend-free speaker-diarization CORE consumed as the RUNTIME
 # clustering dependency (the `speaker` feature): offline clustering
 # (`diaric::offline::diarize_offline`, AHC→VBx), the online centroid matcher
@@ -226,18 +224,15 @@ asry = { git = "https://github.com/findit-studio/asry", rev = "49cbfc9ca6fb75366
 # (via that package's `dia` oracle dep):
 #   cargo tree -p coremlit-parity --features speaker-oracle -e normal | grep -iw ort
 #
-# Pinned to the public diaric repo by EXACT rev, not a sibling path (a path dep
-# breaks a fresh `cargo metadata` on any checkout lacking the sibling). CO-DEV:
-# to build against a LOCAL diaric checkout, add an UNCOMMITTED `[patch]` to the
+# A published crates.io version, not a sibling path (a path dep breaks a fresh
+# `cargo metadata` on any checkout lacking the sibling). CO-DEV: to build
+# against a LOCAL diaric checkout, add an UNCOMMITTED `[patch]` to the
 # WORKSPACE ROOT Cargo.toml — mirror the asry recipe above:
 #
-#   [patch."https://github.com/findit-studio/diaric"]
+#   [patch.crates-io]
 #   diaric = { path = "../diaric" }
 #
-# TODO re-pin to diaric 0.1 (published, and its `feat/import-core` PR has
-# merged); this port pins the exact rev the clustering feature was fence-approved
-# against, so the re-pin is a separate follow-up.
-diaric = { git = "https://github.com/findit-studio/diaric", rev = "877189e434aff080c1340313caf8801cea946af3", optional = true }
+diaric = { version = "0.1.0", optional = true }
 
 # --- audio::vad optional dep (the `vad` feature) ---
 # The detection/streaming logic single-home: coremlit's vad layer implements
@@ -263,12 +258,7 @@ soundevents-dataset = { workspace = true, optional = true }
 # `windit` is the generic windowed-sequence engine (plan / split / aggregate)
 # both embedding families consume: CLAP's long-audio window geometry +
 # aggregation and granite's `embed_long` content-aware chunking + aggregation
-# ride it. Rev-pinned to the PUBLIC windit repo at its reviewed main HEAD (the
-# asry/diaric convention). windit 0.1.0 is also published on crates.io with the
-# same API surface; RE-PIN to `windit = "0.1"` in the same follow-up wave as
-# the diaric re-pin (the silero one has landed: the `vad` feature now rides the
-# published `zuoer` core, and `coremlit-parity`'s `vad-bundled` the published
-# `silero`). Does not change the feature posture below.
+# ride it. A published crates.io version (the asry/diaric convention).
 # windit's default features stay on (`alloc` — the planner/aggregate/split `Vec`
 # APIs live there); `serde` is NOT enabled (clap keeps its own wire-pinned config
 # types; granite serializes nothing of windit's), nor `half`, nor `std` (windit
@@ -277,10 +267,10 @@ soundevents-dataset = { workspace = true, optional = true }
 # CO-DEV: to build against a LOCAL windit checkout, add an UNCOMMITTED patch to
 # the WORKSPACE ROOT Cargo.toml (never commit it):
 #
-#   [patch."https://github.com/findit-studio/windit"]
+#   [patch.crates-io]
 #   windit = { path = "../windit" }
 #
-windit = { git = "https://github.com/findit-studio/windit", rev = "b49888002bcbf4927cf69e83323f15652655eed0", optional = true }
+windit = { version = "0.2.0", optional = true }
 
 # --- embeddings::granite runtime tokenizer-identity digest (the `granite` feature) ---
 # Pure-Rust SHA-256 for granite's supplied-tokenizer byte-identity backstop:
@@ -354,7 +344,7 @@ mach2.workspace = true
 # unions its features with the optional runtime entry above; `align-oracle`
 # adds `alignment`. `emissions` here keeps a features-free default `cargo test`
 # from trying to build a zero-feature asry.
-asry = { git = "https://github.com/findit-studio/asry", rev = "49cbfc9ca6fb75366d75a862212bdebb889021e5", default-features = false, features = ["emissions"] }
+asry = { version = "0.1.0", default-features = false, features = ["emissions"] }
 
 # ---------------------------------------------------------------------------
 # Per-kit tests / benches / examples.
