@@ -27,6 +27,9 @@
 //! gates), so any residual gap is the encoder graph (precision + lowering), which
 //! is exactly what this measures.
 
+// One shared copy, owned by the `coremlit` package (four of its clap test
+// binaries include it as a plain `mod common;`).
+#[path = "../../../coremlit/tests/clap/common/mod.rs"]
 mod common;
 
 use std::path::Path;
@@ -411,5 +414,20 @@ fn cross_modal_cosine_is_far_below_the_parity_floor() {
   assert!(
     cross < 0.90,
     "cross-modal cosine {cross:.8} is implausibly high — the parity metric is not discriminating"
+  );
+}
+
+/// The shared clap `common` module resolves committed fixtures relative to the
+/// **`coremlit`** crate root while this binary is compiled in
+/// `coremlit-parity`; the `coremlit_dir` hop in that module is what keeps both
+/// sides correct. Hermetic (no model, no textclap ONNX), so a broken hop reds
+/// here rather than masquerading as a missing download on the `#[ignore]`d runs.
+#[test]
+fn shared_fixture_paths_resolve_from_the_parity_package() {
+  let wav = common::fixture_path("audio/speech_jfk_48k.wav");
+  assert!(
+    wav.is_file(),
+    "committed clap fixture WAV unreachable from coremlit-parity: {}",
+    wav.display()
   );
 }

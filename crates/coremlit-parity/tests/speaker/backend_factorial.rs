@@ -129,7 +129,7 @@
 //! `ort`). Run with:
 //!
 //! ```text
-//! cargo test -p coremlit --features speaker-oracle --test speaker_backend_factorial -- --ignored --nocapture
+//! cargo test -p coremlit-parity --features speaker-oracle --test speaker_backend_factorial -- --ignored --nocapture
 //! ```
 //!
 //! **`--features speaker-oracle`, never `--all-features`.** Under
@@ -144,7 +144,12 @@
 //! `speaker-oracle` DER binary.
 #![cfg(feature = "speaker-oracle")]
 
+// The shared speaker test-support module lives in the `coremlit` package (13 of
+// its test binaries include it as a plain `mod common;`); this oracle binary
+// pulls in that ONE copy rather than a fork that could drift.
+#[path = "../../../coremlit/tests/speaker/common/mod.rs"]
 mod common;
+#[path = "../../../coremlit/tests/speaker/der_calc/mod.rs"]
 mod der_calc;
 
 use std::path::PathBuf;

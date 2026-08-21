@@ -4,14 +4,15 @@
 //!
 //! # Why this exists: the desync the parity suites cannot see
 //!
-//! `tests/generate_goldens.rs` writes each golden's `seg_model` provenance
+//! `coremlit-parity`'s `tests/speaker/generate_goldens.rs` writes each golden's `seg_model` provenance
 //! string, but that string is metadata the parity gates
 //! (`tests/parity_seg.rs`, `tests/parity_embed.rs`, via `common::load_golden`)
 //! never read. So a divergence between the string the generator writes and the
 //! string frozen into the committed goldens is invisible to every other test
 //! until someone runs the `#[ignore]`d regenerator — and under the old
-//! unconditional writer, running it (as the standard `cargo test -p coremlit
-//! --features speaker-oracle -- --ignored` gate does) silently REWROTE the oracle.
+//! unconditional writer, running it (as the standard `cargo test -p
+//! coremlit-parity --features speaker-oracle -- --ignored` gate does) silently
+//! REWROTE the oracle.
 //!
 //! Exactly that desync landed on this branch: a doc/label correction changed
 //! the generator's `seg_model` string from "raw powerset logits" to

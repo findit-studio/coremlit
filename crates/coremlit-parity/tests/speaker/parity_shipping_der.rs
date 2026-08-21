@@ -116,7 +116,7 @@
 //! `diarization` ONNX + fixtures, and `ort`). Run with:
 //!
 //! ```text
-//! cargo test -p coremlit --features speaker-oracle --test speaker_parity_shipping_der -- --ignored --nocapture
+//! cargo test -p coremlit-parity --features speaker-oracle --test speaker_parity_shipping_der -- --ignored --nocapture
 //! ```
 //!
 //! When swapping a `Models/speakerkit` artifact, finish staging the WHOLE
@@ -130,7 +130,12 @@
 //! checkout's manifest path).
 #![cfg(feature = "speaker-oracle")]
 
+// The shared speaker test-support module lives in the `coremlit` package (13 of
+// its test binaries include it as a plain `mod common;`); this oracle binary
+// pulls in that ONE copy rather than a fork that could drift.
+#[path = "../../../coremlit/tests/speaker/common/mod.rs"]
 mod common;
+#[path = "../../../coremlit/tests/speaker/der_calc/mod.rs"]
 mod der_calc;
 
 use std::{path::Path, time::Instant};

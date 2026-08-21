@@ -191,7 +191,7 @@
 //! in the ordinary `--features speaker-oracle` suite. Run the gate with:
 //!
 //! ```text
-//! cargo test -p coremlit --features speaker-oracle --test speaker_parity_e2e -- --ignored --nocapture
+//! cargo test -p coremlit-parity --features speaker-oracle --test speaker_parity_e2e -- --ignored --nocapture
 //! ```
 //!
 //! Part D dominates the runtime (~46 min of audio through three pipelines each,
@@ -199,7 +199,12 @@
 //! thread pool runs them concurrently.
 #![cfg(feature = "speaker-oracle")]
 
+// The shared speaker test-support module lives in the `coremlit` package (13 of
+// its test binaries include it as a plain `mod common;`); this oracle binary
+// pulls in that ONE copy rather than a fork that could drift.
+#[path = "../../../coremlit/tests/speaker/common/mod.rs"]
 mod common;
+#[path = "../../../coremlit/tests/speaker/der_calc/mod.rs"]
 mod der_calc;
 
 use std::{
@@ -2226,5 +2231,28 @@ fn stress_gate_roster_is_consistent() {
     ],
     "the ≥3-speaker stress selection moved — update this roster deliberately (and the \
      der_gate_inventory.sh manifest), do NOT silently drop or retarget a gate"
+  );
+}
+
+/// The shared `common` module resolves committed fixtures relative to the
+/// **`coremlit`** crate root, and this binary is compiled in `coremlit-parity`.
+/// `env!("CARGO_MANIFEST_DIR")` expands against the crate being compiled, so
+/// without the `coremlit_dir` hop in that module every path here would point at
+/// `crates/coremlit-parity/tests/...`, which does not exist — and the failure
+/// would only surface on the model-gated runs, where a missing fixture reads
+/// like a missing download. Hermetic, so it reds in the ordinary suite instead.
+#[test]
+fn shared_fixture_paths_resolve_from_the_parity_package() {
+  let dir = common::fixtures_dir();
+  assert!(
+    dir.is_dir(),
+    "speaker fixtures unreachable from coremlit-parity: {}",
+    dir.display()
+  );
+  let wav = common::audio_path("02_pyannote_sample");
+  assert!(
+    wav.is_file(),
+    "committed speaker fixture WAV unreachable from coremlit-parity: {}",
+    wav.display()
   );
 }

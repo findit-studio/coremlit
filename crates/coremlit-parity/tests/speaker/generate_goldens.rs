@@ -4,7 +4,9 @@
 //! reference blobs, it RUNS dia's own `ort` pipeline — the very
 //! `pyannote/segmentation-3.0` + WeSpeaker ResNet34-LM models speakerkit
 //! re-implements over CoreML — and writes each fixture's reference tensors to
-//! `tests/speaker/fixtures/golden/<name>.json`. The parity suites
+//! the `coremlit` package's `tests/speaker/fixtures/golden/<name>.json` (the
+//! goldens live beside the shared `common` module this binary
+//! `#[path]`-includes, not in `coremlit-parity`). The parity suites
 //! (`tests/parity_seg.rs`, `tests/parity_embed.rs`) then check CoreML against
 //! those committed goldens WITHOUT needing dia/ort at all.
 //!
@@ -14,7 +16,7 @@
 //! gated on the `UPDATE_GOLDEN` environment variable so it never rewrites the
 //! committed oracle as a *side effect* of a routine `--ignored` sweep
 //! (whisperkit's convention, see `crates/coremlit/tests/whisper/parity_jfk.rs`):
-//! `cargo test -p coremlit --features speaker-oracle -- --ignored` runs every
+//! `cargo test -p coremlit-parity --features speaker-oracle -- --ignored` runs every
 //! `#[ignore]` test including this one,
 //! so without the env guard that standard gate would silently re-baseline the
 //! goldens it exists to validate. Without `UPDATE_GOLDEN` set this test is an
@@ -22,7 +24,7 @@
 //! human-verified act:
 //!
 //! ```text
-//! UPDATE_GOLDEN=1 cargo test -p coremlit --features speaker-oracle --test speaker_generate_goldens -- --ignored --nocapture
+//! UPDATE_GOLDEN=1 cargo test -p coremlit-parity --features speaker-oracle --test speaker_generate_goldens -- --ignored --nocapture
 //! ```
 //!
 //! Provisioning (proven working standalone before this harness was wired):
@@ -39,6 +41,10 @@
 //! matched reference for CoreML's own deterministic `CpuOnly` parity runs.
 #![cfg(feature = "speaker-oracle")]
 
+// The shared speaker test-support module lives in the `coremlit` package (13 of
+// its test binaries include it as a plain `mod common;`); this oracle binary
+// pulls in that ONE copy rather than a fork that could drift.
+#[path = "../../../coremlit/tests/speaker/common/mod.rs"]
 mod common;
 
 use std::io::Write as _;
@@ -152,7 +158,7 @@ fn generate_goldens() {
   // WRITE GUARD (whisperkit's `UPDATE_GOLDEN` convention, `parity_jfk.rs`):
   // this test's whole body OVERWRITES the committed golden oracle
   // (`tests/speaker/fixtures/golden/*.json`), so it must never fire from a routine
-  // `cargo test -p coremlit --features speaker-oracle -- --ignored` — that gate runs
+  // `cargo test -p coremlit-parity --features speaker-oracle -- --ignored` — that gate runs
   // every `#[ignore]` test, and an unconditional writer here silently
   // re-baselines the very oracle `tests/parity_seg.rs` / `parity_embed.rs`
   // validate against. Unset ⇒ explicit no-op: no models loaded, no files

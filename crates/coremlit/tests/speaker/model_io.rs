@@ -170,7 +170,7 @@
 //!   configuration it never touched.
 //!
 //! **(b) int8 embedder (`wespeaker_v2.mlmodelc`) on `ComputeUnits::All` — the
-//! configuration that SHIPPED until issue #15 retired it.** `tests/speaker/backend_factorial.rs` runs the
+//! configuration that SHIPPED until issue #15 retired it.** `coremlit-parity`'s `tests/speaker/backend_factorial.rs` runs the
 //! identical design where the defect actually lives, same clip, same host:
 //!
 //! ```text

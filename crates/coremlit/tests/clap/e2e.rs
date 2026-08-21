@@ -65,7 +65,7 @@ fn tiled_speech_clip() -> Vec<f32> {
 /// length mismatch (`zip` would silently truncate) or any non-finite input/output
 /// panics rather than returning a wrong-but-finite / NaN value that a downstream
 /// comparison could pass blindly. Same guard as the parity reducer
-/// (`tests/clap/parity_textclap.rs`); the inputs are L2-normalized embeddings so
+/// (`coremlit-parity`'s `tests/clap/parity_textclap.rs`); the inputs are L2-normalized embeddings so
 /// cosine == the raw dot product — that contract is unchanged.
 fn cosine(a: &[f32], b: &[f32]) -> f32 {
   assert_eq!(

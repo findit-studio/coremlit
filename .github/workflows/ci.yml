@@ -20,15 +20,17 @@ jobs:
       - run: cargo build --features whisper --examples
       # The speaker-oracle DER gate inventory: compiles the
       # `#![cfg(feature = "speaker-oracle")]` DER binaries and runs their
-      # hermetic falsifiability suites (no models). Replaces the former
-      # `-p speakerkit --features dia-oracle` invocation.
-      - run: crates/coremlit/tests/speaker/der_gate_inventory.sh
+      # hermetic falsifiability suites (no models). Those binaries live in the
+      # never-published `coremlit-parity` package, which owns the unpublished
+      # `dia` git oracle.
+      - run: crates/coremlit-parity/tests/speaker/der_gate_inventory.sh
 
-  # Curated feature-combination matrix — replaces the former per-crate
-  # `cargo hack --each-feature` powerset with the explicit, reviewable list
-  # (each kit feature alone, each oracle combo, all-on, none) pinned in
+  # Curated feature-combination matrix for the PUBLISHABLE crate — replaces the
+  # former per-crate `cargo hack --each-feature` powerset with the explicit,
+  # reviewable list (each kit feature alone, all-on, none) pinned in
   # crates/coremlit/FEATURE_MAP.md and by the `feature_map` golden test. Runs
-  # each combo's hermetic tests; model-gated tests stay `#[ignore]`d here.
+  # each combo's hermetic tests; model-gated tests stay `#[ignore]`d here. The
+  # third-party parity oracles are NOT here — they are the `parity` job below.
   features:
     runs-on: macos-15
     strategy:
@@ -41,26 +43,45 @@ jobs:
           - "speaker"
           - "vad"
           - "whisper,vad"                                                   # the silero_vad composition
-          - "align-oracle"
-          - "speaker-oracle"
-          - "vad-bundled"
+          - "align-oracle"                                                  # asry's ONNX aligner — a FEATURE of a dep coremlit already has, so it stays here
           - "clap"                                                          # CLAP encoders alone (Rust mel + tokenizers, no ort)
-          - "clap-oracle"                                                   # + textclap model-level parity oracle (ort)
           - "granite"                                                       # granite text embeddings alone (committed goldens, no ort)
           - "siglip"                                                        # SigLIP 2 image+text embeddings alone (committed goldens, no ort)
           - "ced"                                                           # CED-tiny sound-event tagging alone (Rust mel + soundevents-dataset, no ort)
           - "whisper,align,speaker,vad,clap,granite,siglip,ced,serde,tracing,nl-recognizer"    # all non-oracle
-          - "whisper,align-oracle,speaker-oracle,vad-bundled,clap-oracle,granite,siglip,ced,serde,tracing,nl-recognizer"  # all-on
+          - "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,serde,tracing,nl-recognizer"  # all-on
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - name: "cargo test (features: ${{ matrix.features }})"
+      - name: "cargo test -p coremlit (features: ${{ matrix.features }})"
         run: |
           if [ -z "${{ matrix.features }}" ]; then
-            cargo test
+            cargo test -p coremlit
           else
-            cargo test --features "${{ matrix.features }}"
+            cargo test -p coremlit --features "${{ matrix.features }}"
           fi
+
+  # The third-party parity oracles (`dia`/ort DER, textclap, silero-ONNX). They
+  # live in the never-published `coremlit-parity` package because two of them are
+  # unpublished git dependencies that `cargo publish` would reject in coremlit's
+  # own manifest. One row per oracle plus an all-on row; pinned by the same
+  # `feature_map` golden test. Hermetic tests only — the model-gated gates stay
+  # `#[ignore]`d here.
+  parity:
+    runs-on: macos-15
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - "speaker-oracle"                                                # dia's ort DER reference oracle
+          - "clap-oracle"                                                   # textclap model-level parity oracle (ort)
+          - "vad-bundled"                                                   # the `silero` crate's ONNX cross-backend oracle
+          - "speaker-oracle,clap-oracle,vad-bundled"                        # all-on
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - name: "cargo test -p coremlit-parity (features: ${{ matrix.features }})"
+        run: cargo test -p coremlit-parity --features "${{ matrix.features }}"
 
   model-tests:
     runs-on: macos-15

@@ -3,11 +3,13 @@ name = "coremlit"
 description = "Safe, synchronous CoreML runtime with opt-in on-device audio pipelines (Whisper STT, forced alignment, speaker diarization, Silero VAD)"
 version.workspace = true
 edition.workspace = true
-# Unpublishable: the optional `align` / `speaker` features pull rev-pinned git
-# dependencies (`asry`, `dia`/diarization) — crates.io forbids git sources even
-# behind optional features, and neither is published. `vad` is clear: it rides
-# the published `zuoer`, and its `vad-bundled` oracle the published `silero`.
-# Flip once the remaining two land on released versions.
+# Still unpublishable, but for FEWER reasons than before: the optional `align`,
+# `speaker` and `clap`/`granite` features pull rev-pinned git dependencies
+# (`asry`, `diaric`, `windit`) and crates.io forbids git sources even behind an
+# optional feature. The two UNPUBLISHED oracles that used to sit here (`dia`,
+# `textclap`) are gone — they moved, with their features and test binaries, to
+# the never-published `crates/coremlit-parity`. `vad` is clear: it rides the
+# published `zuoer`. Flip once the remaining three land on released versions.
 publish = false
 rust-version.workspace = true
 license.workspace = true
@@ -60,27 +62,26 @@ align-oracle = ["align", "asry/alignment"]
 # backend-free BY CONSTRUCTION (the ONNX/Torch runners live in the separate
 # `diarization` crate, never here), so the `speaker` runtime graph pulls no
 # `ort` in ANY configuration. The former speakerkit `dia` feature is gone: the
-# runtime clustering dep is now `diaric`, and `dia` is demoted to the test-only
-# DER oracle below.
+# runtime clustering dep is now `diaric`, and `dia` is demoted to a test-only
+# DER oracle that is not even a dependency of this crate any more (it lives in
+# `coremlit-parity`).
 speaker = ["dep:diaric"]
-# Former speakerkit `dia-oracle`: the TEST-ONLY DER reference oracle. Pulls the
-# optional `dia` (`diarization`) crate and turns ON its OWN ort inference
-# (bundled `segmentation-3.0` + BYO fp32 WeSpeaker ONNX) so the DER parity
-# suites score the speaker module's CoreML output against dia-ort. Pulls `ort` +
-# `libonnxruntime` and the ~6 MB embedded model — never in the runtime graph;
-# the always-on (under `speaker`) `diaric` bridge stays ort-free.
-# `dia/bundled-segmentation` already implies `dia/ort`; both named for clarity.
-speaker-oracle = ["speaker", "dep:dia", "dia/ort", "dia/bundled-segmentation"]
+# There is NO `speaker-oracle` feature here any more. The dia-ort DER oracle is
+# an UNPUBLISHED rev-pinned git dependency, which `cargo publish` rejects even
+# behind an optional feature, so it and its six parity binaries live in the
+# never-published `coremlit-parity` package:
+#   cargo test -p coremlit-parity --features speaker-oracle
+# Those binaries still `#[path]`-include this package's shared
+# `tests/speaker/{common,der_calc}` modules, so there is exactly one copy.
 
 # --- audio::vad (former crate `vadkit`) ---
 # `zuoer`, the backend-agnostic VAD core (the `VadBackend` seam plus the
 # Silero-derived segmentation logic), rides `vad`. Zero dependencies, no model,
 # no inference runtime — so `ort` cannot enter the `vad` runtime graph.
 vad = ["dep:zuoer"]
-# Former vadkit dev-only `bundled`: the `silero` crate's ONNX reference stack
-# for the cross-backend characterization oracle. DEV/TEST only — pulls ort.
-# `silero/bundled` implies `silero/onnx`, which is what compiles `ort`.
-vad-bundled = ["vad", "dep:silero", "silero/bundled"]
+# There is NO `vad-bundled` feature here any more: the `silero` ONNX
+# cross-backend oracle moved, with the other parity stacks, to
+# `coremlit-parity` — `cargo test -p coremlit-parity --features vad-bundled`.
 
 # --- embeddings::clap (former crate `clapkit`) ---
 # CLAP-HTSAT dual-tower audio+text encoders on CoreML: a Rust mel/STFT front-end
@@ -88,11 +89,9 @@ vad-bundled = ["vad", "dep:silero", "silero/bundled"]
 # (`tokenizers`, shared with `whisper`). NO ort in this path; `default = []`
 # pulls none of it.
 clap = ["dep:rustfft", "dep:tokenizers", "dep:windit"]
-# Former clapkit `parity-oracle`: the textclap model-level parity oracle (its
-# Xenova ONNX via `ort`) for the characterized parity gates. DEV/TEST only —
-# adds nothing to the library. clapkit links only textclap's BUNDLED_TOKENIZER
-# const, so the gate needs no libonnxruntime at run time.
-clap-oracle = ["clap", "dep:textclap"]
+# There is NO `clap-oracle` feature here any more: `textclap` is unpublished, so
+# the model-level parity oracle moved to `coremlit-parity` —
+# `cargo test -p coremlit-parity --features clap-oracle`.
 
 # --- embeddings::granite (the embedkit phase) ---
 # General text sentence-embeddings on CoreML; first model
@@ -197,9 +196,9 @@ asry = { git = "https://github.com/findit-studio/asry", rev = "49cbfc9ca6fb75366
 #
 # ORT-FREE PROOF — the runtime configuration pulls no `ort` crate:
 #   cargo tree -p coremlit --features speaker -e normal | grep -iw ort   # → no match
-# Contrast — the test-only `speaker-oracle` feature DOES pull it (via the `dia`
-# oracle dep below):
-#   cargo tree -p coremlit --features speaker-oracle -e normal | grep -iw ort
+# Contrast — `coremlit-parity`'s test-only `speaker-oracle` feature DOES pull it
+# (via that package's `dia` oracle dep):
+#   cargo tree -p coremlit-parity --features speaker-oracle -e normal | grep -iw ort
 #
 # Pinned to the public diaric repo by EXACT rev, not a sibling path (a path dep
 # breaks a fresh `cargo metadata` on any checkout lacking the sibling). CO-DEV:
@@ -214,17 +213,7 @@ asry = { git = "https://github.com/findit-studio/asry", rev = "49cbfc9ca6fb75366
 # against, so the re-pin is a separate follow-up.
 diaric = { git = "https://github.com/findit-studio/diaric", rev = "877189e434aff080c1340313caf8801cea946af3", optional = true }
 
-# `dia` (package `diarization`) is the TEST-ONLY DER reference oracle, pulled
-# ONLY by `speaker-oracle` — never in the runtime graph. It carries dia's OWN
-# `ort` inference path (bundled `segmentation-3.0` + BYO fp32 WeSpeaker ONNX) so
-# the parity suites score the speaker module's CoreML output against dia-ort.
-# Pinned by EXACT rev, not a sibling path (a path dep breaks a fresh
-# `cargo metadata`); `default-features = false` keeps the bare dep lean until
-# `speaker-oracle` turns on its ONNX inference. CO-DEV: patch at the WORKSPACE
-# ROOT Cargo.toml, mirroring the diaric/asry recipes; do not edit this line.
-dia = { package = "diarization", git = "https://github.com/findit-studio/diarization", rev = "b6a6f9adc8465f7a4c207dbaa2701d98e1be1ff2", default-features = false, optional = true }
-
-# --- audio::vad optional deps (the `vad` / `vad-bundled` features) ---
+# --- audio::vad optional dep (the `vad` feature) ---
 # The detection/streaming logic single-home: coremlit's vad layer implements
 # `zuoer`'s `VadBackend` seam over CoreML and re-exports zuoer's detector
 # surface wired to that backend, authoring ZERO segmentation logic here.
@@ -232,14 +221,6 @@ dia = { package = "diarization", git = "https://github.com/findit-studio/diariza
 # model, no inference runtime, no audio I/O — so `ort` cannot enter the `vad`
 # runtime graph, nor a downstream `whisper`'s.
 zuoer = { version = "0.1.0", optional = true }
-# `silero` is DEV/TEST-only, pulled in by `vad-bundled` alone: its bundled ONNX
-# Silero stack (`Session` / `detect_speech`) is the cross-backend
-# characterization oracle in `tests/vad/cross_backend.rs`. Since 0.6 silero is
-# itself a `zuoer` consumer that re-exports the core's detector surface, so the
-# oracle's segmenter and coremlit's are the same types from the same crate.
-# `default-features = false` keeps the bare dependency ort-free; `vad-bundled`
-# turns `silero/bundled` (⇒ `silero/onnx` ⇒ `ort`) back on.
-silero = { version = "0.6.0", default-features = false, optional = true }
 
 # --- embeddings::clap optionals (the `clap` feature) ---
 # f64 forward FFT for the Slaney-mel front-end — the same crate + major version
@@ -252,22 +233,6 @@ rustfft = { workspace = true, optional = true }
 # workspace table for the feature pins).
 soundevents-dataset = { workspace = true, optional = true }
 
-# --- embeddings::clap oracle git dep (the `clap-oracle` feature) ---
-# The textclap oracle: rev-pinned to a PUBLIC git source (crates.io forbids git
-# sources, and textclap is unpublished), OPTIONAL and only COMPILED/linked under
-# `clap-oracle`. An ordinary default build never links it — so clap's default
-# path pulls in no `ort` — but Cargo's resolver still RESOLVES it (optional deps
-# are always part of whole-graph resolution), so a fresh default invocation
-# fetches this git source and pins it in `Cargo.lock`. clapkit calls only
-# textclap's `BUNDLED_TOKENIZER` const (no `ort` runtime), so the gate needs no
-# `libonnxruntime` at run time. CO-DEV: patch at the WORKSPACE ROOT (never
-# commit it):
-#
-#   [patch."https://github.com/Findit-AI/textclap"]
-#   textclap = { path = "../textclap" }
-#
-textclap = { git = "https://github.com/Findit-AI/textclap", rev = "584f21754337a0f6cc7575fa83e9e49a38e99ee9", optional = true }
-
 # --- embeddings shared windowing engine (the `clap` + `granite` features) ---
 # `windit` is the generic windowed-sequence engine (plan / split / aggregate)
 # both embedding families consume: CLAP's long-audio window geometry +
@@ -276,8 +241,8 @@ textclap = { git = "https://github.com/Findit-AI/textclap", rev = "584f21754337a
 # asry/diaric convention). windit 0.1.0 is also published on crates.io with the
 # same API surface; RE-PIN to `windit = "0.1"` in the same follow-up wave as
 # the diaric re-pin (the silero one has landed: the `vad` feature now rides the
-# published `zuoer` core, `vad-bundled` the published `silero`). Does not change
-# the feature posture below.
+# published `zuoer` core, and `coremlit-parity`'s `vad-bundled` the published
+# `silero`). Does not change the feature posture below.
 # windit's default features stay on (`alloc` — the planner/aggregate/split `Vec`
 # APIs live there); `serde` is NOT enabled (clap keeps its own wire-pinned config
 # types; granite serializes nothing of windit's), nor `half`, nor `std` (windit
@@ -546,43 +511,10 @@ name = "speaker_parity_diarize_wiring"
 path = "tests/speaker/parity_diarize_wiring.rs"
 required-features = ["speaker"]
 
-# The DER parity suites are #![cfg(feature = "speaker-oracle")] and drive dia's
-# own ort inference (former speakerkit `dia-oracle`).
-[[test]]
-name = "speaker_parity_e2e"
-path = "tests/speaker/parity_e2e.rs"
-required-features = ["speaker-oracle"]
-
-[[test]]
-name = "speaker_parity_shipping_der"
-path = "tests/speaker/parity_shipping_der.rs"
-required-features = ["speaker-oracle"]
-
-# The segmentation-vs-embedding backend cross-product at the SHIPPING
-# configuration: mixes both CoreML conversions with dia's ONNX pair in one
-# process, so it needs the oracle linked alongside the CoreML models.
-[[test]]
-name = "speaker_backend_factorial"
-path = "tests/speaker/backend_factorial.rs"
-required-features = ["speaker-oracle"]
-
-[[test]]
-name = "speaker_generate_goldens"
-path = "tests/speaker/generate_goldens.rs"
-required-features = ["speaker-oracle"]
-
-# Cross-crate equivalence gates under the dual-crate DER oracle: they compare
-# the measured (diaric) offline path against the dia-ort reference, so both
-# `diaric` and the `dia` oracle must be linked — hence `speaker-oracle`.
-[[test]]
-name = "speaker_offline_cross_crate_equivalence"
-path = "tests/speaker/offline_cross_crate_equivalence.rs"
-required-features = ["speaker-oracle"]
-
-[[test]]
-name = "speaker_plda_cross_crate_equivalence"
-path = "tests/speaker/plda_cross_crate_equivalence.rs"
-required-features = ["speaker-oracle"]
+# The six dia-ort DER / cross-crate parity binaries are NOT registered here:
+# they moved to the never-published `coremlit-parity` package along with the
+# `dia` oracle dependency itself. They still `#[path]`-include this package's
+# shared `tests/speaker/{common,der_calc}` modules, so there is one copy.
 
 # --- audio::vad ---
 [[test]]
@@ -605,13 +537,8 @@ name = "vad_reexport"
 path = "tests/vad/reexport.rs"
 required-features = ["vad"]
 
-# The cross-backend characterization oracle drives silero's bundled ONNX stack
-# (former vadkit dev-only `bundled`, now `vad-bundled`).
-[[test]]
-name = "vad_cross_backend"
-path = "tests/vad/cross_backend.rs"
-required-features = ["vad-bundled"]
-
+# `tests/vad/cross_backend.rs`, the silero-ONNX cross-backend oracle, moved to
+# `coremlit-parity` with the `silero` dependency.
 # --- embeddings::clap ---
 # The whole `embeddings::clap` module is feature-gated, so its tests compile
 # only under `clap`; the model-gated ones keep their `#[ignore]` + Models/
@@ -641,19 +568,8 @@ name = "clap_tokenizer_identity"
 path = "tests/clap/tokenizer_identity.rs"
 required-features = ["clap"]
 
-# The textclap parity oracles (former clapkit `parity-oracle`, now `clap-oracle`)
-# link the sibling textclap crate (pulls ort) for the model-level parity gate
-# and the live tokenizer cross-check.
-[[test]]
-name = "clap_parity_textclap"
-path = "tests/clap/parity_textclap.rs"
-required-features = ["clap-oracle"]
-
-[[test]]
-name = "clap_tokenizer_identity_textclap"
-path = "tests/clap/tokenizer_identity_textclap.rs"
-required-features = ["clap-oracle"]
-
+# The two textclap oracle binaries moved to `coremlit-parity` with the
+# `textclap` dependency.
 # --- embeddings::granite ---
 # The whole `embeddings::granite` module is feature-gated, so its tests compile
 # only under `granite`. The tokenizer-identity and driver-crosscheck gates are

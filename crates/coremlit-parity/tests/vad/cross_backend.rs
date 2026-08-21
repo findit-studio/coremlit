@@ -64,6 +64,9 @@
 //! Model-gated (`#[ignore]`): needs `Models/vadkit` (`VADKIT_TEST_MODELS`) for
 //! the CoreML side; the silero side uses its bundled model, no download.
 
+// One shared copy, owned by the `coremlit` package (four of its vad test
+// binaries include it as a plain `mod common;`).
+#[path = "../../../coremlit/tests/vad/common/mod.rs"]
 mod common;
 
 use coremlit::{
@@ -549,4 +552,25 @@ fn mutation_geometry_lie_breaks_gate() {
       "{clip}: geometry lie must trip the envelope boundary bound; violations were {violations:?}"
     );
   }
+}
+
+/// The shared vad `common` module resolves committed fixtures relative to the
+/// **`coremlit`** crate root while this binary is compiled in
+/// `coremlit-parity`; the `coremlit_dir` hop in that module is what keeps both
+/// sides correct. Hermetic (no model), so a broken hop reds here rather than
+/// masquerading as a missing download on the `#[ignore]`d runs.
+#[test]
+fn shared_fixture_paths_resolve_from_the_parity_package() {
+  let goldens = common::golden_swift_dir();
+  assert!(
+    goldens.is_dir(),
+    "vad Swift goldens unreachable from coremlit-parity: {}",
+    goldens.display()
+  );
+  let wav = common::fixture_wav_path("02_pyannote_sample");
+  assert!(
+    wav.is_file(),
+    "borrowed speaker fixture WAV unreachable from coremlit-parity: {}",
+    wav.display()
+  );
 }

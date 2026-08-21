@@ -1,0 +1,160 @@
+[package]
+name = "coremlit-parity"
+description = "Third-party parity oracles for coremlit's CoreML pipelines (DEV/TEST only, never published)"
+version.workspace = true
+edition.workspace = true
+# NEVER published, and that is the whole point of this package: it owns the
+# rev-pinned, unpublished git oracles (`dia`, `textclap`) that `cargo publish`
+# refuses to accept in `coremlit`'s manifest — even behind an optional feature.
+# Do not flip this; move code out instead.
+publish = false
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The `ort`-backed oracle stacks are heavy and mutually independent, so each one
+# rides its own feature and CI builds them on separate rows. The names are the
+# ones these gates always had (they moved here verbatim from `coremlit`'s
+# manifest), so every `#![cfg(feature = "…")]` and documented command keeps
+# reading the same.
+[features]
+default = []
+
+# The TEST-ONLY DER reference oracle. Turns on `dia`'s OWN ort inference
+# (bundled `segmentation-3.0` + BYO fp32 WeSpeaker ONNX) so the DER parity
+# suites score coremlit's CoreML output against dia-ort, and pulls `diaric` for
+# the cross-crate equivalence gates (the runtime clustering core coremlit's
+# `speaker` feature also rides). `dia/bundled-segmentation` already implies
+# `dia/ort`; both are named for clarity.
+speaker-oracle = [
+  "coremlit/speaker",
+  "dep:dia",
+  "dep:diaric",
+  "dia/ort",
+  "dia/bundled-segmentation",
+]
+
+# The textclap model-level parity oracle (its Xenova ONNX via `ort`). coremlit
+# links only textclap's `BUNDLED_TOKENIZER` const, so the gate needs no
+# `libonnxruntime` at run time.
+clap-oracle = ["coremlit/clap", "dep:textclap"]
+
+# The `silero` crate's ONNX reference stack for the cross-backend
+# characterization oracle. `silero/bundled` implies `silero/onnx`, which is what
+# compiles `ort`.
+vad-bundled = ["coremlit/vad", "dep:silero", "silero/bundled"]
+
+# Oracle stacks. They sit in `[dependencies]` rather than `[dev-dependencies]`
+# because Cargo forbids optional dev-dependencies, and each must be feature-
+# gated so one oracle's `ort` build is not forced on the other two. The lib
+# target is empty, so nothing here is linked into anything but the test
+# binaries.
+[dependencies]
+# `dia` (package `diarization`) — the DER reference oracle. Rev-pinned git, and
+# it stays that way: `diarization` is unpublished, which is precisely why this
+# package is `publish = false`. CO-DEV against a local checkout: add an
+# UNCOMMITTED patch to the WORKSPACE ROOT Cargo.toml (never commit it):
+#
+#   [patch."https://github.com/findit-studio/diarization"]
+#   diarization = { path = "../diarization" }
+#
+dia = { package = "diarization", git = "https://github.com/findit-studio/diarization", rev = "b6a6f9adc8465f7a4c207dbaa2701d98e1be1ff2", default-features = false, optional = true }
+
+# `diaric` — the backend-free clustering core the speaker cross-crate
+# equivalence gates drive directly (`diaric::offline::diarize_offline`,
+# `diaric::plda::PldaTransform`). Same rev as `coremlit`'s runtime pin, so the
+# oracle and the measured path share one build of it.
+diaric = { git = "https://github.com/findit-studio/diaric", rev = "877189e434aff080c1340313caf8801cea946af3", optional = true }
+
+# The textclap oracle — likewise an unpublished rev-pinned git source. CO-DEV:
+#
+#   [patch."https://github.com/Findit-AI/textclap"]
+#   textclap = { path = "../textclap" }
+#
+textclap = { git = "https://github.com/Findit-AI/textclap", rev = "584f21754337a0f6cc7575fa83e9e49a38e99ee9", optional = true }
+
+# `silero` IS published, so it rides a plain version (no git pin needed). Since
+# 0.6 it is itself a `zuoer` consumer that re-exports the core's detector
+# surface, so the oracle's segmenter and coremlit's are the same types from the
+# same crate. `default-features = false` keeps the bare dependency ort-free;
+# `vad-bundled` turns `silero/bundled` (⇒ `silero/onnx` ⇒ `ort`) back on.
+silero = { version = "0.6.0", default-features = false, optional = true }
+
+[dev-dependencies]
+# The crate under test. A path dep with only the runtime features these gates
+# need; each oracle feature above turns on the one it measures, so a single-row
+# CI build does not compile the other two module trees.
+coremlit = { path = "../coremlit", default-features = false }
+# Fixture WAV decoding + the golden/provenance digests, matching the shared
+# `common` modules this package `#[path]`-includes from `crates/coremlit/tests`.
+hound.workspace = true
+sha2.workspace = true
+# `generate_goldens.rs` serializes the regenerated segmentation goldens.
+serde_json.workspace = true
+
+# ---------------------------------------------------------------------------
+# Oracle test targets. Every one moved here verbatim from `coremlit`'s manifest
+# (same target name, same `required-features`); only the paths changed. Cargo
+# auto-discovers only depth-1 `tests/*.rs`, so the per-kit directories below are
+# registered explicitly.
+# ---------------------------------------------------------------------------
+
+# The DER parity suites are `#![cfg(feature = "speaker-oracle")]` and drive dia's
+# own ort inference (former speakerkit `dia-oracle`).
+[[test]]
+name = "speaker_parity_e2e"
+path = "tests/speaker/parity_e2e.rs"
+required-features = ["speaker-oracle"]
+
+[[test]]
+name = "speaker_parity_shipping_der"
+path = "tests/speaker/parity_shipping_der.rs"
+required-features = ["speaker-oracle"]
+
+# The segmentation-vs-embedding backend cross-product at the SHIPPING
+# configuration: mixes both CoreML conversions with dia's ONNX pair in one
+# process, so it needs the oracle linked alongside the CoreML models.
+[[test]]
+name = "speaker_backend_factorial"
+path = "tests/speaker/backend_factorial.rs"
+required-features = ["speaker-oracle"]
+
+[[test]]
+name = "speaker_generate_goldens"
+path = "tests/speaker/generate_goldens.rs"
+required-features = ["speaker-oracle"]
+
+# Cross-crate equivalence gates under the dual-crate DER oracle: they compare
+# the measured (diaric) offline path against the dia-ort reference, so both
+# `diaric` and the `dia` oracle must be linked — hence `speaker-oracle`.
+[[test]]
+name = "speaker_offline_cross_crate_equivalence"
+path = "tests/speaker/offline_cross_crate_equivalence.rs"
+required-features = ["speaker-oracle"]
+
+[[test]]
+name = "speaker_plda_cross_crate_equivalence"
+path = "tests/speaker/plda_cross_crate_equivalence.rs"
+required-features = ["speaker-oracle"]
+
+# The textclap parity oracles link the sibling textclap crate (pulls ort) for
+# the model-level parity gate and the live tokenizer cross-check.
+[[test]]
+name = "clap_parity_textclap"
+path = "tests/clap/parity_textclap.rs"
+required-features = ["clap-oracle"]
+
+[[test]]
+name = "clap_tokenizer_identity_textclap"
+path = "tests/clap/tokenizer_identity_textclap.rs"
+required-features = ["clap-oracle"]
+
+# The cross-backend characterization oracle drives silero's bundled ONNX stack
+# (former vadkit dev-only `bundled`).
+[[test]]
+name = "vad_cross_backend"
+path = "tests/vad/cross_backend.rs"
+required-features = ["vad-bundled"]
+
+[lints]
+workspace = true

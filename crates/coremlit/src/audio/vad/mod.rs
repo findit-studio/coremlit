@@ -30,8 +30,9 @@
 //! The module depends on `zuoer`, which owns no model, no inference runtime
 //! and no dependencies at all, so **`ort`/ONNX never enters the `vad` runtime
 //! graph** — nor a downstream `whisper`'s. The ONNX stack appears only behind
-//! the DEV/TEST `vad-bundled` feature, the only thing that pulls the `silero`
-//! crate (`silero/bundled`), for the cross-backend gate.
+//! the DEV/TEST `vad-bundled` feature of the sibling `coremlit-parity` package,
+//! the only thing that pulls the `silero` crate (`silero/bundled`), for the
+//! cross-backend gate.
 //!
 //! ```no_run
 //! use coremlit::audio::vad::{CoreMlBackend, SpeechOptions, detect_speech};
@@ -81,8 +82,8 @@
 //! the exact I/O + state contract in `tests/vad/model_io.rs` /
 //! `tests/vad/model_state.rs`; the no-duplication + re-export gate
 //! (`tests/vad/reexport.rs`); the cross-backend characterization against the
-//! `silero` crate's ONNX stack (`tests/vad/cross_backend.rs`, feature
-//! `vad-bundled`);
+//! `silero` crate's ONNX stack (`coremlit-parity`'s
+//! `tests/vad/cross_backend.rs`, feature `vad-bundled`);
 //! and the fp16-guard sweep in the crate's `tests/fp16_guards.rs` (the graph
 //! is fp16-clean). Model-gated tests are `#[ignore]`d.
 //!

@@ -430,10 +430,13 @@ pub const fn const_str_eq(a: &str, b: &str) -> bool {
 // ══════════════════════════════════════════════════════════════════════
 // Unit tests for the DER calc itself — they travel WITH the calculation, so
 // every test binary that includes this module re-proves it. No models and no
-// fixtures needed: these run in the ordinary (non-`--ignored`) `--features
-// speaker-oracle` suite, in BOTH `parity_e2e` and `parity_shipping_der` — whose
-// binaries are `#![cfg(feature = "speaker-oracle")]`, so a bare `--features speaker`
-// compiles each to ZERO tests instead of running these.
+// fixtures needed: these run in the ordinary (non-`--ignored`) `cargo test
+// -p coremlit-parity --features speaker-oracle` suite, in BOTH `parity_e2e` and
+// `parity_shipping_der` — whose binaries are
+// `#![cfg(feature = "speaker-oracle")]`, so omitting that feature compiles each
+// to ZERO tests instead of running these. This module itself stays in the
+// `coremlit` package (the parity binaries `#[path]`-include it) so there is
+// exactly one copy of the DER math.
 // ══════════════════════════════════════════════════════════════════════
 
 /// Float compare for the DER unit tests. `pub` because the suites including

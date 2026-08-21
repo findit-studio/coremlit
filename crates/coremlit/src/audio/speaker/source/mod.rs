@@ -516,7 +516,7 @@ fn resolve_model_options(
 /// `tests/speaker/model_io.rs`'s DECISION). The mechanism, the factorial
 /// that isolated
 /// it, and the retirement rationale live in `tests/speaker/model_io.rs` (the
-/// DECISION section) and `tests/speaker/backend_factorial.rs`
+/// DECISION section) and `coremlit-parity`'s `tests/speaker/backend_factorial.rs`
 /// (`quantization_error_structure`). Repointing this resolver moves
 /// production AND every gate that pins the selection through it, so the two
 /// cannot silently diverge.

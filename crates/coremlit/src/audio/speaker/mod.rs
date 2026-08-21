@@ -34,7 +34,9 @@
 //! the [`cluster`] module), each returning a speaker-labelled
 //! [`diaric::offline::OfflineOutput`]. `dia` (the former speakerkit `dia`
 //! feature) is NOT the runtime dependency — it is the test-only DER reference
-//! oracle behind `speaker-oracle`, which alone pulls dia's `ort` inference.
+//! oracle, and it is not even a dependency of this crate: it lives in the
+//! never-published `coremlit-parity` package, behind that package's
+//! `speaker-oracle` feature, which alone pulls dia's `ort` inference.
 //!
 //! ```no_run
 //! use coremlit::audio::speaker::extract::Options;
@@ -87,7 +89,7 @@
 //! clip, but 0.12% / 0.39% on `12`/`14`, over this module's 0.1% DER-parity
 //! bound. It never gets the speaker *count* wrong and is ~23× more faithful
 //! than argmax; the "0.1% parity" claim was only ever tested on 1-2 speaker
-//! audio. Both limitations are pinned in `tests/speaker/parity_e2e.rs`, which
+//! audio. Both limitations are pinned in `coremlit-parity`'s `tests/speaker/parity_e2e.rs`, which
 //! fires if behavior moves in either direction (a fix must be a deliberate
 //! re-baseline, not a silent pass).
 //!
@@ -106,12 +108,14 @@
 //! ```text
 //! SPEAKERKIT_TEST_MODELS=Models/speakerkit \
 //!   cargo test -p coremlit --features speaker -- --ignored          # seg/embed/argmax
-//! cargo test -p coremlit --features speaker-oracle --test speaker_parity_e2e -- --ignored
-//! crates/coremlit/tests/speaker/der_gate_inventory.sh               # DER binaries compiled + hermetic suite
+//! cargo test -p coremlit-parity --features speaker-oracle --test speaker_parity_e2e -- --ignored
+//! crates/coremlit-parity/tests/speaker/der_gate_inventory.sh        # DER binaries compiled + hermetic suite
 //! ```
 //!
-//! The DER binaries are `#![cfg(feature = "speaker-oracle")]` (dia's own ort
-//! path as the oracle); without it they compile to nothing. Model attribution
+//! The DER binaries live in `coremlit-parity` and are
+//! `#![cfg(feature = "speaker-oracle")]` (dia's own ort path as the oracle);
+//! without that feature they compile to nothing. They still share this crate's
+//! `tests/speaker/{common,der_calc}` modules — one copy, `#[path]`-included. Model attribution
 //! (pyannote community-1 **CC-BY-4.0 — attribution required**, segmentation-3.0
 //! MIT, WeSpeaker, and the argmax repo's **undeclared** license) is recorded in
 //! the crate `NOTICE` (§4).
