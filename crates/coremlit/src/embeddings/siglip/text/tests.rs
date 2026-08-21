@@ -97,8 +97,8 @@ fn build_window_rejects_out_of_range_token_id() {
 // ── A11: tokenizer seam (hermetic; a caller-supplied synthetic tokenizer) ─────
 
 /// A minimal valid WordLevel `tokenizer.json` — enough to exercise the module's
-/// truncation/padding configuration seam without the (Wave-B-staged) bundled
-/// Gemma tokenizer.
+/// truncation/padding configuration seam without the multi-megabyte Gemma
+/// tokenizer the artifact carries.
 const TINY_TOKENIZER: &str = r#"{
   "version": "1.0",
   "truncation": null,
@@ -147,30 +147,95 @@ fn configured_tokenizer_truncates_to_window_and_disables_padding() {
 
 // ── E1: fail-closed placeholder tokenizer ─────────────────────────────────────
 
-/// Post-Wave-B (the real Gemma bytes now back `BUNDLED_TOKENIZER`): the
-/// placeholder guard passes, so `load` / `from_memory` proceed PAST it to
-/// `Model::load`, which fails on a nonexistent path with [`Error::Load`] — proving
-/// the guard no longer short-circuits and the bundled bytes parse as a real
-/// tokenizer. (Wave-A shipped this asserting [`Error::TokenizerPlaceholder`]; the
-/// tokenizer-swap flipped it, exactly as the Wave-A doc anticipated.)
+/// The placeholder guard does not short-circuit a REAL tokenizer: `from_memory`
+/// with non-placeholder bytes proceeds PAST it to `Model::load`, which fails on a
+/// nonexistent path with [`Error::Load`]. (Wave-A shipped this asserting
+/// [`Error::TokenizerPlaceholder`] against the stub asset; the tokenizer-swap
+/// flipped it, exactly as the Wave-A doc anticipated. The asset itself is gone —
+/// the tokenizer ships with the model artifact — so the real-bytes half of this
+/// now lives in the artifact gates.)
 #[test]
-fn load_and_from_memory_accept_the_real_bundled_tokenizer() {
-  let bundled = crate::embeddings::siglip::BUNDLED_TOKENIZER;
+fn from_memory_accepts_a_real_tokenizer_past_the_guard() {
+  let real = TINY_TOKENIZER.as_bytes();
   assert!(
-    ensure_not_placeholder(bundled).is_ok(),
-    "the real bundled Gemma tokenizer must pass the placeholder guard"
+    ensure_not_placeholder(real).is_ok(),
+    "a real (non-sentinel) tokenizer must pass the placeholder guard"
   );
-  match TextEmbedder::load("/nonexistent/model.mlmodelc", TextEmbedderOptions::new()) {
-    Err(Error::Load(_)) => {}
-    other => panic!("expected Error::Load past the guard, got {other:?}"),
-  }
   match TextEmbedder::from_memory(
     "/nonexistent/model.mlmodelc",
-    bundled,
+    real,
     TextEmbedderOptions::new(),
   ) {
     Err(Error::Load(_)) => {}
     other => panic!("expected Error::Load past the guard, got {other:?}"),
+  }
+}
+
+/// `load` resolves the tokenizer from the ARTIFACT ROOT — the directory
+/// CONTAINING the `.mlmodelc`, where the published bundle stages it beside the
+/// two graphs and the pos-emb sidecar. Hermetic: path arithmetic only.
+#[test]
+fn artifact_tokenizer_path_is_the_bundle_sibling() {
+  assert_eq!(
+    artifact_tokenizer_path(Path::new(
+      "/m/siglip2-base-patch16-naflex-512/siglip2_text_64.mlmodelc"
+    )),
+    Path::new("/m/siglip2-base-patch16-naflex-512/tokenizer.json"),
+  );
+  // A bare bundle name has an empty parent: the sidecar resolves in the current
+  // directory, the same place the bundle itself would.
+  assert_eq!(
+    artifact_tokenizer_path(Path::new("siglip2_text_64.mlmodelc")),
+    Path::new("tokenizer.json"),
+  );
+}
+
+/// A missing sidecar is its own typed, actionable failure — not a confusing
+/// `Model::load` error — and it names the file.
+#[test]
+fn load_reports_a_missing_artifact_tokenizer() {
+  match TextEmbedder::load("/nonexistent/model.mlmodelc", TextEmbedderOptions::new()) {
+    Err(Error::ArtifactTokenizerRead { path, .. }) => {
+      assert_eq!(path, Path::new("/nonexistent/tokenizer.json"));
+    }
+    other => panic!("expected ArtifactTokenizerRead, got {other:?}"),
+  }
+}
+
+/// BOTH guards the embedded bytes used to carry now run on the file `load`
+/// actually reads, BEFORE any model load: a placeholder staged into an artifact
+/// tree fails closed, and so does a tokenizer that is merely *not the pinned
+/// one*. Without the second, moving the tokenizer out of the crate would have
+/// traded guaranteed-correct bytes for unverified ones.
+#[test]
+fn load_guards_the_sidecar_it_reads() {
+  let dir = tempfile::tempdir().expect("tempdir");
+  // The model path never exists, so reaching `Model::load` would surface as
+  // `Error::Load` — anything else proves the guard fired first.
+  let model_path = dir.path().join("siglip2_text_64.mlmodelc");
+  let tokenizer_path = dir.path().join("tokenizer.json");
+
+  let mut placeholder = br#"{"junk":""#.to_vec();
+  placeholder.extend_from_slice(PLACEHOLDER_SENTINEL);
+  placeholder.extend_from_slice(br#""}"#);
+  std::fs::write(&tokenizer_path, &placeholder).expect("write placeholder sidecar");
+  match TextEmbedder::load(&model_path, TextEmbedderOptions::new()) {
+    Err(Error::TokenizerPlaceholder) => {}
+    other => panic!("expected TokenizerPlaceholder for a placeholder sidecar, got {other:?}"),
+  }
+
+  std::fs::write(&tokenizer_path, TINY_TOKENIZER.as_bytes()).expect("write foreign sidecar");
+  match TextEmbedder::load(&model_path, TextEmbedderOptions::new()) {
+    Err(Error::ArtifactTokenizerIdentity {
+      path,
+      expected,
+      actual,
+    }) => {
+      assert_eq!(path, tokenizer_path);
+      assert_eq!(expected, contract::TOKENIZER_SHA256_HEX);
+      assert_ne!(actual, contract::TOKENIZER_SHA256_HEX);
+    }
+    other => panic!("expected ArtifactTokenizerIdentity for a foreign sidecar, got {other:?}"),
   }
 }
 
@@ -182,9 +247,9 @@ fn placeholder_guard_accepts_real_tokenizer_bytes() {
   assert!(ensure_not_placeholder(TINY_TOKENIZER.as_bytes()).is_ok());
 }
 
-/// The durable regression guard (now that the bundled bytes are real): a small
-/// buffer carrying the sentinel is still refused with
-/// [`Error::TokenizerPlaceholder`], so re-committing the build-time placeholder
+/// The durable regression guard: a small buffer carrying the sentinel is refused
+/// with
+/// [`Error::TokenizerPlaceholder`], so staging the build-time placeholder
 /// `tokenizer.json` fails closed rather than shipping a meaningless tokenizer.
 #[test]
 fn placeholder_guard_rejects_the_sentinel_buffer() {

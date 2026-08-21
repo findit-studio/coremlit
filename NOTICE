@@ -20,9 +20,9 @@ vadkit NOTICE. Sections 3-5 record the whisper, speaker, and align model
 attributions folded in by the mono-crate restructure. Section 6 records the
 CLAP audio+text encoder weights and the bundled Xenova tokenizer, folded in by
 the clapkit port. Section 7 records the granite text-embedding encoder and its
-bundled tokenizer, added by the embedkit phase. Section 8 records the SigLIP 2
-image+text encoder weights and the bundled Gemma tokenizer, added by the siglip
-phase. Section 9 records the CED source-model attribution, added by the CED
+artifact-distributed tokenizer, added by the embedkit phase. Section 8 records
+the SigLIP 2 image+text encoder weights and their artifact-distributed Gemma
+tokenizer, added by the siglip phase. Section 9 records the CED source-model attribution, added by the CED
 port. Both audio::vad components below are MIT.
 
 ────────────────────────────────────────────────────────────────────────
@@ -201,13 +201,14 @@ via `include_bytes!` (exposed as `coremlit::embeddings::clap::BUNDLED_TOKENIZER`
       MIT license for the configuration.
 
 ────────────────────────────────────────────────────────────────────────
-7. granite text-embedding encoder and bundled tokenizer (embeddings::granite)
+7. granite text-embedding encoder and its tokenizer (embeddings::granite)
 
 embeddings::granite runs a CoreML conversion of IBM's
 `granite-embedding-97m-multilingual-r2` text encoder (a ModernBERT encoder with
-CLS pooling, 384-dim), and BUNDLES that model's tokenizer into the compiled
-crate via `include_bytes!` (exposed as
-`coremlit::embeddings::granite::BUNDLED_TOKENIZER`).
+CLS pooling, 384-dim). The crate BUNDLES NO granite tokenizer: that model's
+`tokenizer.json` is distributed WITH the CoreML artifact and read from disk at
+load (`coremlit::embeddings::granite::TOKENIZER_FILE_NAME`), so linking coremlit
+does not redistribute it.
 
   7a) Encoder weights — IBM granite-embedding-97m-multilingual-r2. The crate
       ships NO model files; it loads FinDIT-Studio's CoreML conversion, a format
@@ -228,9 +229,11 @@ crate via `include_bytes!` (exposed as
       of format (lowering to Apple CoreML at a fixed 512 sequence length), noted
       here.
 
-  7b) Bundled tokenizer — granite-embedding-97m-multilingual-r2 (via
-      include_bytes!). Compiled into the crate, so any binary linking coremlit
-      with the `granite` feature redistributes it.
+  7b) Tokenizer — granite-embedding-97m-multilingual-r2. NOT compiled into the
+      crate: it is distributed alongside the CoreML graph in the artifact
+      directory (FinDIT-Studio/embedkit-coreml) and read from
+      `<artifact root>/tokenizer.json` at load, its SHA-256 checked fail-closed.
+      Whoever redistributes that artifact redistributes the tokenizer.
 
         Source: https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2
         Revision (commit SHA): 835ad14087e140460703cf0fae09f97d469d65c2
@@ -240,16 +243,18 @@ crate via `include_bytes!` (exposed as
       The artifact is the granite tokenizer configuration and vocabulary/merges
       (an o200k-style BPE); it carries no model weights. It is distributed under
       the same upstream Apache-2.0 terms as the model; retain the license notice
-      when redistributing it.
+      when redistributing it (i.e. when redistributing the CoreML artifact
+      directory that carries it).
 
 ────────────────────────────────────────────────────────────────────────
-8. SigLIP 2 image + text encoders and bundled tokenizer (embeddings::siglip)
+8. SigLIP 2 image + text encoders and their tokenizer (embeddings::siglip)
 
 embeddings::siglip runs CoreML conversions of Google DeepMind's SigLIP 2
 `siglip2-base-patch16-naflex` vision and text encoders (a shared 768-dim joint
-embedding space), and BUNDLES that model's Gemma tokenizer into the compiled
-crate via `include_bytes!` (exposed as
-`coremlit::embeddings::siglip::BUNDLED_TOKENIZER`).
+embedding space). The crate BUNDLES NO Gemma tokenizer: that model's
+`tokenizer.json` is distributed WITH the CoreML artifacts and read from disk at
+load (`coremlit::embeddings::siglip::TOKENIZER_FILE_NAME`), so linking coremlit
+does not redistribute it.
 
   8a) Encoder weights — google/siglip2-base-patch16-naflex. The crate ships NO
       model files; it loads a CoreML conversion produced LOCALLY from the official
@@ -283,9 +288,11 @@ crate via `include_bytes!` (exposed as
       GPU arm is granite-class); the host-side position-embedding lift is the
       stated structural change.
 
-  8b) Bundled tokenizer — siglip2-base-patch16-naflex Gemma tokenizer (via
-      include_bytes!). Compiled into the crate, so any binary linking coremlit
-      with the `siglip` feature redistributes it.
+  8b) Tokenizer — siglip2-base-patch16-naflex Gemma tokenizer. NOT compiled into
+      the crate: it is distributed alongside the CoreML graphs in the artifact
+      directory (FinDIT-Studio/siglip2-naflex-coreml) and read from
+      `<artifact root>/tokenizer.json` at load, its SHA-256 checked fail-closed.
+      Whoever redistributes that artifact redistributes the tokenizer.
 
         Source: https://huggingface.co/google/siglip2-base-patch16-naflex
         Revision (commit SHA): b53b807d3a2d5e2b3911292f2d69e5341cdc064c
@@ -295,9 +302,10 @@ crate via `include_bytes!` (exposed as
       The artifact is the SigLIP 2 Gemma tokenizer configuration and vocabulary
       (256000 entries); it carries no model weights. It is distributed under the
       same upstream Apache-2.0 terms as the model; retain the license notice when
-      redistributing it. (The committed `assets/tokenizer.json` is the real
-      source-revision artifact, pinned by SHA-256 and proven byte-correct by the
-      identity gate in tests/siglip/tokenizer_identity.rs.)
+      redistributing it (i.e. when redistributing the CoreML artifact directory
+      that carries it). The staged `tokenizer.json` must be the real
+      source-revision artifact: it is pinned by SHA-256 at load and proven
+      byte-correct by the identity gate in tests/siglip/tokenizer_identity.rs.)
 
 ────────────────────────────────────────────────────────────────────────
 9. CED AudioSet sound-event taggers (audio::ced)

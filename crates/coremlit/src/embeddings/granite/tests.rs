@@ -1,6 +1,11 @@
 use super::*;
 use tokenizers::{PaddingDirection, PaddingParams, PaddingStrategy};
 
+use super::test_artifact::{
+  GOLDEN_SOURCE_TOKENIZER_SHA256, tokenizer_bytes as artifact_tokenizer_bytes,
+  tokenizer_path as artifact_tokenizer_path_for_tests,
+};
+
 // ── Options ────────────────────────────────────────────────────────────────
 
 #[test]
@@ -37,26 +42,33 @@ fn options_serde_roundtrip() {
 
 // ── Tokenizer identity gate (hermetic; the real tokenizer seam) ─────────────
 
-/// SHA-256 of the bundled tokenizer must equal the tokenizer that produced the
+/// SHA-256 of the staged artifact tokenizer must equal the tokenizer that produced the
 /// committed goldens (the source model repo revision) — byte-identity is the
-/// foundation of token-id identity. Any drift in `assets/tokenizer.json` fails
-/// here.
+/// foundation of token-id identity. Any drift in the staged
+/// `tokenizer.json` fails here.
 #[test]
-fn bundled_tokenizer_sha_matches_golden_source_pin() {
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
+fn artifact_tokenizer_sha_matches_golden_source_pin() {
   use sha2::{Digest, Sha256};
-  let sha: String = Sha256::digest(BUNDLED_TOKENIZER)
+  let sha: String = Sha256::digest(artifact_tokenizer_bytes())
     .iter()
     .map(|b| format!("{b:02x}"))
     .collect();
   assert_eq!(
-    sha, "4f2842d568e2724370aec203652a42ac783c7937f8347a1a2cc7506d71f1582f",
-    "bundled tokenizer.json diverged from the granite tokenizer that cut the goldens"
+    sha, GOLDEN_SOURCE_TOKENIZER_SHA256,
+    "the staged tokenizer.json diverged from the granite tokenizer that cut the goldens"
   );
-  // Tie the runtime identity const to the same literal, so const ↔ literal ↔
-  // artifact-bytes cannot drift apart (the assert above ties bytes ↔ literal).
+}
+
+/// The runtime identity const equals the pinned golden-source SHA literal —
+/// hermetic, so the const ↔ literal half of the const ↔ literal ↔ artifact-bytes
+/// chain still runs with no artifact staged. Its sibling
+/// [`artifact_tokenizer_sha_matches_golden_source_pin`] ties bytes ↔ literal.
+#[test]
+fn tokenizer_sha_pin_matches_golden_source_literal() {
   assert_eq!(
     contract::TOKENIZER_SHA256_HEX,
-    "4f2842d568e2724370aec203652a42ac783c7937f8347a1a2cc7506d71f1582f",
+    GOLDEN_SOURCE_TOKENIZER_SHA256,
     "the tokenizer-identity contract const must equal the pinned golden-source SHA"
   );
 }
@@ -64,7 +76,8 @@ fn bundled_tokenizer_sha_matches_golden_source_pin() {
 /// Encode `text` through granite's ACTUAL configured tokenizer seam (the same
 /// path [`TextEmbedder::token_ids`] uses), hermetically (no model).
 fn ids(text: &str) -> Vec<u32> {
-  let tok = configured_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("configure tokenizer");
+  let tok =
+    configured_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("configure tokenizer");
   tok.encode(text, true).expect("encode").get_ids().to_vec()
 }
 
@@ -74,6 +87,7 @@ fn ids(text: &str) -> Vec<u32> {
 /// file. `<|startoftext|>`=179934 (CLS, pooled) and `<|return|>`=179938 (EOS)
 /// bracket every sequence.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn token_ids_match_pinned_golden_subset() {
   let cases: &[(&str, &[u32])] = &[
     ("hello world", &[179934, 24313, 2318, 179938]),
@@ -100,6 +114,7 @@ fn token_ids_match_pinned_golden_subset() {
 /// encoding's PREFIX. A `Right → Left` flip (which keeps the SUFFIX instead)
 /// changes the interior of distinct tokens and trips this.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn long_input_truncation_keeps_the_right_directional_prefix() {
   // Non-repetitive, comfortably over one window: "1 2 3 … 1000", all distinct.
   let long: String = (1..=1000)
@@ -121,7 +136,7 @@ fn long_input_truncation_keeps_the_right_directional_prefix() {
   );
 
   // Untruncated reference: the SAME tokenizer bytes with truncation OFF.
-  let full = tokenizers::Tokenizer::from_bytes(BUNDLED_TOKENIZER)
+  let full = tokenizers::Tokenizer::from_bytes(artifact_tokenizer_bytes())
     .expect("load tokenizer")
     .encode(long.as_str(), true)
     .expect("encode")
@@ -176,11 +191,12 @@ fn long_input_truncation_keeps_the_right_directional_prefix() {
 /// from the module contract (single source of truth).
 const HELLO_WORLD_IDS: [u32; 4] = contract::SENTINEL_IDS;
 
-/// A fresh bundled tokenizer carrying an adversarial fixed-window padding policy
+/// A fresh artifact tokenizer carrying an adversarial fixed-window padding policy
 /// (the kind a caller-supplied tokenizer might inherit), BEFORE this module's
 /// config runs.
-fn bundled_with_padding(direction: PaddingDirection) -> Tokenizer {
-  let mut tok = Tokenizer::from_bytes(BUNDLED_TOKENIZER).expect("load bundled tokenizer");
+fn artifact_tokenizer_with_padding(direction: PaddingDirection) -> Tokenizer {
+  let mut tok =
+    Tokenizer::from_bytes(artifact_tokenizer_bytes()).expect("load the artifact tokenizer");
   tok.with_padding(Some(PaddingParams {
     strategy: PaddingStrategy::Fixed(MAX_TOKENS),
     direction,
@@ -195,8 +211,9 @@ fn bundled_with_padding(direction: PaddingDirection) -> Tokenizer {
 /// tokenizer's own padding so only the real ids survive, and the window then
 /// masks EXACTLY those.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn configured_tokenizer_disables_fixed_right_padding_mask_stays_correct() {
-  let mut tok = bundled_with_padding(PaddingDirection::Right);
+  let mut tok = artifact_tokenizer_with_padding(PaddingDirection::Right);
 
   // Precondition: the adversarial policy really does pad to the full window.
   let padded = tok
@@ -244,8 +261,9 @@ fn configured_tokenizer_disables_fixed_right_padding_mask_stays_correct() {
 /// leading PADs push CLS (`<|startoftext|>`) off position 0, so CLS pooling would
 /// read a PAD. `configure_tokenizer` must disable padding so CLS stays at 0.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn configured_tokenizer_disables_left_padding_keeps_cls_at_zero() {
-  let mut tok = bundled_with_padding(PaddingDirection::Left);
+  let mut tok = artifact_tokenizer_with_padding(PaddingDirection::Left);
 
   // Precondition: left padding pushes CLS off position 0 (the hazard).
   let padded = tok
@@ -282,6 +300,7 @@ fn configured_tokenizer_disables_left_padding_keeps_cls_at_zero() {
 /// [`MAX_TOKENS`] through the configured seam and fills the window with real
 /// tokens — no panic, CLS still at position 0.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn overlong_input_truncates_and_fills_the_window_without_panic() {
   // Non-repetitive, comfortably over one window: "1 2 3 … 1000".
   let long: String = (1..=1000)
@@ -376,14 +395,15 @@ fn long_doc() -> String {
 /// former would judge EVERY long document to "fit one window" and silently
 /// degenerate `embed_long` into a truncated `embed`.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn measuring_tokenizer_reports_untruncated_counts() {
   // Non-repetitive, comfortably over one window: "1 2 3 … 1000".
   let long: String = (1..=1000)
     .map(|n| n.to_string())
     .collect::<Vec<_>>()
     .join(" ");
-  let configured = configured_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("configure");
-  let measuring = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let configured = configured_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("configure");
+  let measuring = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
 
   let configured_count = configured
     .encode(long.as_str(), true)
@@ -413,8 +433,9 @@ fn measuring_tokenizer_reports_untruncated_counts() {
 /// pre-repair windit left `\n\n` gaps between chunks, so `chunk.start()` ran
 /// strictly ahead of the previous end rather than meeting it.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn long_text_chunks_multi_window_within_budget() {
-  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
   let doc = long_doc();
   let chunks = chunk_long(&mt, &doc, &WindowOptions::new(MAX_TOKENS)).expect("chunk");
 
@@ -451,6 +472,7 @@ fn long_text_chunks_multi_window_within_budget() {
 /// token appears once per `\n\n` across the union of the chunk encodings —
 /// interior and reattached-boundary separators alike.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn boundary_separators_stay_in_the_token_stream() {
   // `\n\n` tokenizes to `[<|startoftext|>, ĊĊ, <|return|>]`, so id 239 is the
   // paragraph separator's sole content token; counting it counts separators.
@@ -461,7 +483,7 @@ fn boundary_separators_stay_in_the_token_stream() {
     "the paragraph separator's token id is pinned"
   );
 
-  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
   let doc = long_doc();
   let chunks = chunk_long(&mt, &doc, &WindowOptions::new(MAX_TOKENS)).expect("chunk");
 
@@ -501,8 +523,9 @@ fn boundary_separators_stay_in_the_token_stream() {
 /// reattaches it. One 400-term comma-separated sentence at window 128 partitions
 /// into byte-exact chunks — every `", "` preserved, none over budget.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn word_fallback_punctuation_is_reattached() {
-  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
   let sentence = (0..400)
     .map(|w| format!("term{w}"))
     .collect::<Vec<_>>()
@@ -550,8 +573,9 @@ fn word_fallback_punctuation_is_reattached() {
 /// separator and the last ends at the text length despite the trailing one
 /// (`attach_gaps`' leading and trailing branches).
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn leading_and_trailing_separators_are_covered() {
-  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
   let doc = format!("\n\n{}\n\n", long_doc());
   let chunks = chunk_long(&mt, &doc, &WindowOptions::new(MAX_TOKENS)).expect("chunk");
 
@@ -651,14 +675,15 @@ fn gap_attachment_falls_back_right_then_own_chunk() {
 /// Gap repair must not silently defeat the caller's `max_windows` work bound
 /// (each chunk is one CoreML prediction): windit's own cap passes pre-repair,
 /// but an unabsorbable separator run becomes an extra own-chunk, so the cap is
-/// re-enforced on the FINAL chunk count. With the bundled tokenizer at window
+/// re-enforced on the FINAL chunk count. With the granite tokenizer at window
 /// 3, `a`/`b` pack a window exactly (3 ids with specials) while `a\n\n` /
 /// `\n\nb` measure 4, so a `\n\n` between them fits neither neighbor.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn gap_repair_cannot_exceed_max_windows() {
   use windit::WinditError;
 
-  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
 
   // windit passes at two content chunks; repair inserts the interior `\n\n` as
   // a third. `got` is the full repaired count.
@@ -703,10 +728,11 @@ fn gap_repair_cannot_exceed_max_windows() {
 /// cap 1 (and no cap) admits it as a single whole-input chunk — full
 /// coverage, one prediction.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn whitespace_only_text_counts_one_window_against_the_cap() {
   use windit::WinditError;
 
-  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
 
   match chunk_long(
     &mt,
@@ -755,8 +781,9 @@ fn whitespace_only_text_counts_one_window_against_the_cap() {
 /// the test's own untruncated encode so the pin is self-consistent under any
 /// tokenizer.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn contentless_over_budget_input_is_refused_not_truncated() {
-  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
   let fixtures = [
     " ".repeat(100_000),
     "\t".repeat(100_000),
@@ -794,8 +821,9 @@ fn contentless_over_budget_input_is_refused_not_truncated() {
 /// refused. Binary-searches the largest space run that fits the window, so the
 /// boundary is exact regardless of the pinned tokenizer.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn contentless_input_at_or_under_budget_still_embeds_whole() {
-  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
   let measure = |n: usize| {
     mt.encode(" ".repeat(n).as_str(), true)
       .expect("encode")
@@ -838,8 +866,9 @@ fn contentless_input_at_or_under_budget_still_embeds_whole() {
 /// its run measures past the window. `a<100k spaces>b` at window 3 forces the
 /// escape; the in-budget own-chunk escape (`a\n\nb`) still chunks Ok.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn separator_gap_over_budget_is_refused() {
-  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
   let text = format!("a{}b", " ".repeat(100_000));
   match chunk_long(&mt, &text, &WindowOptions::new(3)) {
     Err(Error::ContentlessInputOverBudget {
@@ -867,8 +896,9 @@ fn separator_gap_over_budget_is_refused() {
 /// refused with the correct byte span (the `attach_gaps` leading and trailing
 /// branches, measuring the GAP itself, not the extended candidate).
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn leading_and_trailing_over_budget_gaps_are_refused() {
-  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
 
   let leading = format!("{}a", " ".repeat(100_000));
   match chunk_long(&mt, &leading, &WindowOptions::new(MAX_TOKENS)) {
@@ -912,8 +942,9 @@ fn tokenizer_failure_on_fallback_measure_keeps_tokenize_identity() {
 /// which fails `EmptyText` before the model), so no fallback chunk is
 /// synthesized and even a cap of 0 passes chunking.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn empty_text_chunks_to_nothing_under_any_cap() {
-  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
   let chunks = chunk_long(&mt, "", &WindowOptions::new(MAX_TOKENS).with_max_windows(0))
     .expect("empty text chunks to nothing under a cap of 0");
   assert!(chunks.is_empty());
@@ -921,8 +952,9 @@ fn empty_text_chunks_to_nothing_under_any_cap() {
 
 /// A short text that fits one window is a single chunk spanning the whole text.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn single_window_text_is_one_whole_chunk() {
-  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
   let text = "a compact sentence that fits comfortably inside one window";
   let chunks = chunk_long(&mt, text, &WindowOptions::new(MAX_TOKENS)).expect("chunk");
   assert_eq!(chunks.len(), 1, "short text is one chunk");
@@ -934,8 +966,9 @@ fn single_window_text_is_one_whole_chunk() {
 /// granite's seam): a smaller window yields more, smaller chunks, each within its
 /// own budget.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn chunk_geometry_adapts_by_window_options_alone() {
-  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
   let doc = long_doc();
   let coarse = chunk_long(&mt, &doc, &WindowOptions::new(128)).expect("chunk @128");
   let fine = chunk_long(&mt, &doc, &WindowOptions::new(64)).expect("chunk @64");
@@ -959,8 +992,9 @@ fn chunk_geometry_adapts_by_window_options_alone() {
 /// With a non-zero overlap, consecutive chunks repeat a trailing region whose
 /// measured length stays within the overlap token budget.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn overlap_repeats_trailing_tokens_within_budget() {
-  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
   let doc = long_doc();
   let opts = WindowOptions::new(128).with_overlap(16);
   let chunks = chunk_long(&mt, &doc, &opts).expect("chunk");
@@ -1076,31 +1110,33 @@ fn input_too_large_takes_precedence_over_window_budget() {
 
 // ── #6: tokenizer contract validation (hermetic) ─────────────────────────────
 
-/// Parse the bundled tokenizer JSON, apply `mutate`, and re-serialize to bytes —
+/// Parse the artifact tokenizer JSON, apply `mutate`, and re-serialize to bytes —
 /// the raw input a caller-supplied constructor receives. `serde_json` is a
 /// dev-dependency.
-fn mutated_bundled_tokenizer_bytes(mutate: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
+fn mutated_artifact_tokenizer_bytes(mutate: impl FnOnce(&mut serde_json::Value)) -> Vec<u8> {
   let mut value: serde_json::Value =
-    serde_json::from_slice(BUNDLED_TOKENIZER).expect("parse bundled tokenizer.json");
+    serde_json::from_slice(artifact_tokenizer_bytes()).expect("parse the artifact tokenizer.json");
   mutate(&mut value);
   serde_json::to_vec(&value).expect("re-serialize mutated tokenizer.json")
 }
 
-/// Parse the bundled tokenizer JSON, apply `mutate`, re-serialize, and build the
+/// Parse the artifact tokenizer JSON, apply `mutate`, re-serialize, and build the
 /// module's CONFIGURED tokenizer from the result — so a contract check sees
 /// exactly the production tokenization.
-fn mutated_bundled_tokenizer(mutate: impl FnOnce(&mut serde_json::Value)) -> Tokenizer {
-  configured_tokenizer_from_bytes(&mutated_bundled_tokenizer_bytes(mutate))
+fn mutated_artifact_tokenizer(mutate: impl FnOnce(&mut serde_json::Value)) -> Tokenizer {
+  configured_tokenizer_from_bytes(&mutated_artifact_tokenizer_bytes(mutate))
     .expect("configure mutated tokenizer")
 }
 
-/// The bundled granite tokenizer passes every contract check — the invariant on
+/// The granite artifact tokenizer passes every contract check — the invariant on
 /// which all keep-green constructor/golden behavior rests. If this fails the
 /// contract constants are wrong; strengthen the constants, never the checks.
 #[test]
-fn tokenizer_contract_accepts_the_bundled_tokenizer() {
-  let tok = configured_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("configure bundled");
-  validate_tokenizer_contract(&tok).expect("bundled tokenizer must satisfy the contract");
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
+fn tokenizer_contract_accepts_the_artifact_tokenizer() {
+  let tok =
+    configured_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("configure the artifact");
+  validate_tokenizer_contract(&tok).expect("the artifact tokenizer must satisfy the contract");
 }
 
 /// A tiny foreign tokenizer with none of granite's specials fails the first
@@ -1121,15 +1157,16 @@ fn tokenizer_contract_rejects_missing_specials() {
   }
 }
 
-/// The bundled tokenizer with one trailing (non-special) added token removed
+/// The artifact tokenizer with one trailing (non-special) added token removed
 /// keeps granite's three specials but drops the vocabulary to 179999, so the
 /// vocab-size check fires. The pinned `tokenizers` reassigns added-token ids
 /// densely as `base + array_index` (ignoring the JSON `id` field), and the three
 /// specials are the array's first entries, so removing the LAST entry leaves
 /// their ids intact — the fixture edits structure, not a declared id.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn tokenizer_contract_rejects_wrong_vocab_size() {
-  let tok = mutated_bundled_tokenizer(|value| {
+  let tok = mutated_artifact_tokenizer(|value| {
     let added = value["added_tokens"]
       .as_array_mut()
       .expect("added_tokens array");
@@ -1155,7 +1192,7 @@ fn tokenizer_contract_rejects_wrong_vocab_size() {
   }
 }
 
-/// The bundled tokenizer with its highest BASE-vocab id pushed past the model's
+/// The artifact tokenizer with its highest BASE-vocab id pushed past the model's
 /// table (to 180000) keeps the count at 180000 and the specials intact, so the
 /// specials and vocab-size checks pass but the max-token-id gate fires — the
 /// out-of-vocabulary case a larger foreign tokenizer would hit. (Added-token ids
@@ -1163,8 +1200,9 @@ fn tokenizer_contract_rejects_wrong_vocab_size() {
 /// the base vocab; the fixture moves a base id, leaving a hole the count check
 /// tolerates.)
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn tokenizer_contract_rejects_out_of_model_vocab_id() {
-  let tok = mutated_bundled_tokenizer(|value| {
+  let tok = mutated_artifact_tokenizer(|value| {
     let vocab = value["model"]["vocab"]
       .as_object_mut()
       .expect("model.vocab object");
@@ -1191,8 +1229,9 @@ fn tokenizer_contract_rejects_out_of_model_vocab_id() {
 /// leave the specials, vocab size, and max id intact but change the sentinel
 /// encoding, so only the final check fires.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn tokenizer_contract_rejects_divergent_encoding() {
-  let tok = mutated_bundled_tokenizer(|value| {
+  let tok = mutated_artifact_tokenizer(|value| {
     let vocab = value["model"]["vocab"]
       .as_object_mut()
       .expect("model.vocab object");
@@ -1233,6 +1272,7 @@ fn tokenizer_contract_rejects_divergent_encoding() {
 /// ids. The byte-identity backstop REJECTS this behaviorally-valid but
 /// non-identical tokenizer (the gap this fix closes).
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn tokenizer_identity_rejects_non_sentinel_vocab_corruption() {
   const SWAP_A: u64 = 5_000;
   const SWAP_B: u64 = 6_000;
@@ -1244,7 +1284,7 @@ fn tokenizer_identity_rejects_non_sentinel_vocab_corruption() {
     "swap ids must avoid the specials and sentinel content ids"
   );
 
-  let bytes = mutated_bundled_tokenizer_bytes(|value| {
+  let bytes = mutated_artifact_tokenizer_bytes(|value| {
     let vocab = value["model"]["vocab"]
       .as_object_mut()
       .expect("model.vocab object");
@@ -1273,7 +1313,7 @@ fn tokenizer_identity_rejects_non_sentinel_vocab_corruption() {
   // (b) premise guard: the mutated bytes are not the pinned artifact.
   assert_ne!(
     bytes.as_slice(),
-    BUNDLED_TOKENIZER,
+    artifact_tokenizer_bytes(),
     "the swap must actually change the bytes"
   );
 
@@ -1297,20 +1337,21 @@ fn tokenizer_identity_rejects_non_sentinel_vocab_corruption() {
 }
 
 /// Policy pin: byte identity, NOT behavioral identity, on the supplied path. A
-/// parse→re-serialize round-trip of the bundled JSON (no semantic change) stays
+/// parse→re-serialize round-trip of the artifact JSON (no semantic change) stays
 /// behaviorally valid yet is byte-different (serde_json reorders keys / drops the
 /// artifact's formatting), so the backstop REJECTS it — callers must supply the
 /// pinned artifact bytes, not a re-emitted equivalent.
 #[test]
-fn tokenizer_identity_rejects_reserialized_bundled_json() {
-  let bytes = mutated_bundled_tokenizer_bytes(|_| {});
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
+fn tokenizer_identity_rejects_reserialized_artifact_json() {
+  let bytes = mutated_artifact_tokenizer_bytes(|_| {});
 
   let configured = configured_tokenizer_from_bytes(&bytes).expect("configure round-trip");
   validate_tokenizer_contract(&configured).expect("a re-serialized bundle is behaviorally valid");
 
   assert_ne!(
     bytes.as_slice(),
-    BUNDLED_TOKENIZER,
+    artifact_tokenizer_bytes(),
     "a serde_json round-trip must actually differ from the pinned bytes"
   );
 
@@ -1330,17 +1371,70 @@ fn tokenizer_identity_rejects_reserialized_bundled_json() {
   }
 }
 
-/// The backstop ACCEPTS the two legitimate supplied-byte sources: the pinned
-/// artifact bytes (`BUNDLED_TOKENIZER`) via `Supplied`, and the zero-overhead
-/// `Bundled` provenance the internal constructors pass (no hash computed).
+/// The backstop ACCEPTS the pinned artifact bytes through BOTH provenances —
+/// `Supplied` (`from_memory` / `from_files`) and `Artifact` (the sidecar `load`
+/// reads). Neither is exempt: with nothing compiled in, "identity by
+/// construction" no longer exists, so both must actually hash and match.
 #[test]
-fn tokenizer_identity_accepts_bundled_bytes_and_bundled_provenance() {
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
+fn tokenizer_identity_accepts_the_pinned_bytes_through_both_provenances() {
+  let sha256_hex = sha256_hex(artifact_tokenizer_bytes());
   validate_tokenizer_identity(&TokenizerProvenance::Supplied {
-    sha256_hex: sha256_hex(BUNDLED_TOKENIZER),
+    sha256_hex: sha256_hex.clone(),
   })
-  .expect("the pinned bundled bytes are the identity");
-  validate_tokenizer_identity(&TokenizerProvenance::Bundled)
-    .expect("bundled provenance is identity by construction");
+  .expect("the pinned bytes are the identity, supplied");
+  validate_tokenizer_identity(&TokenizerProvenance::Artifact {
+    path: artifact_tokenizer_path_for_tests(),
+    sha256_hex,
+  })
+  .expect("the pinned bytes are the identity, read from the artifact");
+}
+
+/// A corrupted SIDECAR is refused exactly like corrupted caller-supplied bytes,
+/// and the diagnostic names the file — the regression that would otherwise make
+/// an on-disk tokenizer strictly weaker than the embedded bytes it replaced.
+#[test]
+fn artifact_provenance_is_not_exempt_from_the_identity_pin() {
+  let err = validate_tokenizer_identity(&TokenizerProvenance::Artifact {
+    path: std::path::PathBuf::from("/models/granite/tokenizer.json"),
+    sha256_hex: "0".repeat(64),
+  })
+  .expect_err("a sidecar that is not the pinned artifact must be refused");
+  match err {
+    Error::TokenizerContractMismatch {
+      check,
+      expected,
+      actual,
+    } => {
+      assert_eq!(check, "artifact tokenizer identity (sha-256)");
+      assert_eq!(expected, contract::TOKENIZER_SHA256_HEX);
+      assert!(
+        actual.contains("/models/granite/tokenizer.json"),
+        "the diagnostic must name the offending file, got {actual}"
+      );
+    }
+    other => panic!("expected TokenizerContractMismatch, got {other:?}"),
+  }
+}
+
+/// `load` resolves the tokenizer from the ARTIFACT ROOT — the directory
+/// CONTAINING the `.mlmodelc`, where the published `CHECKSUMS.sha256` places it
+/// (`./granite_97m_512.mlmodelc/...` with siblings at `./`). Hermetic: path
+/// arithmetic only, no file needed.
+#[test]
+fn artifact_tokenizer_path_is_the_bundle_sibling() {
+  assert_eq!(
+    artifact_tokenizer_path(Path::new(
+      "/m/granite-97m-multilingual-r2/granite_97m_512.mlmodelc"
+    )),
+    Path::new("/m/granite-97m-multilingual-r2/tokenizer.json"),
+  );
+  // A bare bundle name has an empty parent: the sidecar resolves in the current
+  // directory, the same place the bundle itself would.
+  assert_eq!(
+    artifact_tokenizer_path(Path::new("granite_97m_512.mlmodelc")),
+    Path::new("tokenizer.json"),
+  );
 }
 
 // ── #3: single-pass chunking — layer-2 chunk differential + perf gates ────────
@@ -1478,8 +1572,9 @@ fn geometry_grid() -> Vec<WindowOptions> {
 /// chunks, or both `Err`). Identical chunks are the reduction of embedding
 /// bit-identity.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn chunk_long_matches_slow_twin_over_corpus_and_geometry() {
-  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
   let grid = geometry_grid();
   for text in differential_texts() {
     for opts in &grid {
@@ -1531,8 +1626,9 @@ fn killer_chunk_texts() -> Vec<String> {
 /// chunk-level counterpart of the exhaustive `measure_range` sweep, on exactly the
 /// classes that exposed the pre-fix divergences.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn chunk_long_matches_slow_twin_over_killer_classes() {
-  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
   let grid = geometry_grid();
   for text in killer_chunk_texts() {
     for opts in &grid {
@@ -1566,8 +1662,9 @@ fn chunk_long_matches_slow_twin_over_killer_classes() {
 /// (`window - 2` letters after the two template specials) — where `+1` tips the
 /// threshold and drops a letter, a guaranteed boundary move.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn chunk_differential_is_load_bearing_against_a_shifted_measure() {
-  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
   let doc: String = "a b c d e f g h i j k l m n o p q r s t u v w x y z "
     .repeat(8)
     .trim_end()
@@ -1678,8 +1775,9 @@ fn natural_doc(target_bytes: usize) -> String {
 /// closure re-encoded ~11×). Structural — one index pass plus tiny edge fragments
 /// — so robust across corpora.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn measure_path_reencodes_at_most_1_5x_input() {
-  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
   let doc = natural_doc(256 * 1024);
   super::token_index::encode_meter::reset();
   let chunks = chunk_long(&mt, &doc, &WindowOptions::new(MAX_TOKENS)).expect("chunk");
@@ -1703,9 +1801,10 @@ fn measure_path_reencodes_at_most_1_5x_input() {
 /// byte ratio printed. The slow twin is too slow for CI (its classes are covered
 /// hermetically by gate 2); this is the scale/perf witness.
 #[test]
-#[ignore = "4 MiB fast-vs-slow chunk differential + timing (run locally for PR notes)"]
+#[ignore = "4 MiB fast-vs-slow chunk differential + timing, and the staged granite \
+            tokenizer.json (run locally for PR notes)"]
 fn big_document_fast_matches_slow_with_timing() {
-  let mt = measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring");
+  let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
   let opts = WindowOptions::new(MAX_TOKENS);
   for size in [1usize << 20, 4usize << 20] {
     let doc = natural_doc(size);

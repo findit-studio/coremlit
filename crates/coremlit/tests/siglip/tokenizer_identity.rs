@@ -1,10 +1,14 @@
-//! Hermetic tokenizer-identity gate — the proof the bundled SigLIP Gemma
-//! tokenizer is byte-correct and reproduces the committed padded token windows,
-//! with NO model and NO network.
+//! Tokenizer-identity gate — the proof the SigLIP Gemma tokenizer the ARTIFACT
+//! ships is byte-correct and reproduces the committed padded token windows, with
+//! NO model load and NO network.
 //!
-//! # Status: Wave B (goldens-gated, hermetic)
+//! # Status: Wave B (goldens-gated, artifact-gated)
 //!
-//! The bundled `src/embeddings/siglip/assets/tokenizer.json` is the
+//! The crate embeds no Gemma tokenizer: it is a ~34 MB `tokenizer.json` staged
+//! beside the `.mlmodelc` bundles, which `TextEmbedder::load` reads and pins by
+//! SHA-256. These gates therefore read the staged artifact tree
+//! (`SIGLIP_TEST_MODELS`) and are `#[ignore]`d on it, like the other siglip model
+//! gates. The staged `tokenizer.json` is the
 //! source-revision Gemma artifact, and the committed corpus
 //! (`fixtures/goldens/corpus.json`) carries every text's golden padded window.
 //! These gates pin the tokenizer SHA-256 and assert every text entry's built
@@ -14,7 +18,20 @@
 
 mod common;
 
-use coremlit::embeddings::siglip::{BUNDLED_TOKENIZER, text::configured_tokenizer_from_bytes};
+use std::sync::OnceLock;
+
+use coremlit::embeddings::siglip::text::configured_tokenizer_from_bytes;
+
+/// The `tokenizer.json` the artifact stages beside the `.mlmodelc` bundles — the
+/// exact file `TextEmbedder::load` reads. Read once and shared.
+fn artifact_tokenizer() -> &'static [u8] {
+  static BYTES: OnceLock<Vec<u8>> = OnceLock::new();
+  BYTES.get_or_init(|| {
+    let path = common::model_root().join(coremlit::embeddings::siglip::TOKENIZER_FILE_NAME);
+    std::fs::read(&path)
+      .unwrap_or_else(|e| panic!("read the staged siglip tokenizer {}: {e}", path.display()))
+  })
+}
 
 /// The committed goldens' text window `T` (the shipped 64-token tier).
 const WINDOW: usize = 64;
@@ -42,24 +59,27 @@ fn build_padded_window(tok: &tokenizers::Tokenizer, text: &str) -> Vec<i32> {
   window
 }
 
-/// The bundled tokenizer is the exact source-revision Gemma artifact that cut the
+/// The staged tokenizer is the exact source-revision Gemma artifact that cut the
 /// goldens (SHA-256) and is the real multi-megabyte tokenizer — not the Wave-A
-/// placeholder.
+/// placeholder. This is the same pin `TextEmbedder::load` enforces at runtime
+/// (`contract::TOKENIZER_SHA256_HEX`); here it also proves the DISTRIBUTED file
+/// is the right one.
 #[test]
-fn bundled_tokenizer_matches_pinned_sha256_and_is_real() {
-  let sha = common::sha256_hex(BUNDLED_TOKENIZER);
+#[ignore = "requires the siglip tokenizer.json staged beside the model bundles (SIGLIP_TEST_MODELS)"]
+fn artifact_tokenizer_matches_pinned_sha256_and_is_real() {
+  let sha = common::sha256_hex(artifact_tokenizer());
   assert_eq!(
     sha, "58a1696e79c9d97937389ed116f552a15c84811d7b8023918b86f4bc5775b1b0",
-    "bundled tokenizer.json is not the pinned google/siglip2-base-patch16-naflex \
+    "the staged tokenizer.json is not the pinned google/siglip2-base-patch16-naflex \
      revision artifact"
   );
   assert_eq!(
-    BUNDLED_TOKENIZER.len(),
+    artifact_tokenizer().len(),
     34_356_304,
     "unexpected tokenizer byte length"
   );
   assert!(
-    BUNDLED_TOKENIZER.len() > 1_000_000,
+    artifact_tokenizer().len() > 1_000_000,
     "the real Gemma tokenizer is tens of MB, never the small placeholder"
   );
 }
@@ -70,11 +90,12 @@ fn bundled_tokenizer_matches_pinned_sha256_and_is_real() {
 /// truncation — filled window, `<eos>` at the last slot, no pad). A one-token
 /// perturbation of an input must change the window (non-vacuity).
 #[test]
+#[ignore = "requires the siglip tokenizer.json staged beside the model bundles (SIGLIP_TEST_MODELS)"]
 fn every_corpus_text_builds_its_golden_padded_window() {
   let (_images, texts) = common::golden_corpus();
   assert!(!texts.is_empty(), "committed corpus has no texts");
-  let tok = configured_tokenizer_from_bytes(BUNDLED_TOKENIZER, WINDOW)
-    .expect("configure bundled tokenizer");
+  let tok = configured_tokenizer_from_bytes(artifact_tokenizer(), WINDOW)
+    .expect("configure the staged tokenizer");
 
   let mut saw_mixedcase = false;
   let mut saw_truncated = false;

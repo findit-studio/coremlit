@@ -1,6 +1,7 @@
 """Emit CHECKSUMS.sha256 + MANIFEST.json for the staged shipped bundle.
 
-Walks the two shipped .mlmodelc bundles + the pos-emb sidecar under
+Walks the two shipped .mlmodelc bundles + the pos-emb sidecar + the runtime
+tokenizer.json under
 $SIGLIP_MODELS_OUT/siglip2-base-patch16-naflex-512, writing forward-slash-relative
 SHA-256 lines (the exact-set manifest the Rust gates pin from) and a MANIFEST.json
 recording source repo+REV, per-source-file SHA-256, toolchain pins, the attention
@@ -23,6 +24,14 @@ STAGE = stage_dir()
 
 SHIPPED = ["siglip2_vision_512.mlmodelc", "siglip2_text_64.mlmodelc"]
 SIDECAR = "pos_embed_16x16x768.f32le.bin"
+# The runtime tokenizer sidecar. It ships WITH the model because the Rust crate
+# stopped embedding it (a 34 MB include_bytes! in a crates.io package), so
+# `siglip::TextEmbedder::load` reads `<artifact root>/tokenizer.json` beside the
+# .mlmodelc bundles and pins its SHA-256. It is copied verbatim from the verified
+# source snapshot, so SOURCE_SHA256["tokenizer.json"] IS the identity the crate
+# enforces at load. An artifact published without it has no working default
+# text constructor, so it belongs in CHECKSUMS.sha256 like any other shipped file.
+TOKENIZER = "tokenizer.json"
 
 
 def sha256_file(path):
@@ -57,14 +66,62 @@ def read_scalar(name):
         return float(f.get_tensor(keys[0]).ravel()[0])
 
 
+def stage_tokenizer():
+    """Copy the pinned source tokenizer.json beside the bundles, by digest.
+
+    Validated on both paths — an existing destination may be stale or
+    half-written, and a source snapshot may be the wrong revision — and written
+    through a unique temp name so an interrupted copy cannot leave a truncated
+    tokenizer behind."""
+    import shutil
+    import uuid
+
+    want = SOURCE_SHA256[TOKENIZER]
+    dst = os.path.join(MODEL_ROOT, TOKENIZER)
+    if os.path.isfile(dst):
+        got = sha256_file(dst)
+        if got == want:
+            return
+        raise SystemExit(
+            f"STAGED TOKENIZER IS NOT THE PINNED ONE ({dst}):\n"
+            f"  got  {got}\n  want {want}\n"
+            f"  Remove it and re-run; it is copied from the verified source snapshot."
+        )
+    src = os.path.join(src_dir(), TOKENIZER)
+    if not os.path.isfile(src):
+        raise SystemExit(
+            f"{TOKENIZER} is missing from {MODEL_ROOT} and from the source snapshot {src}.\n"
+            f"  The tokenizer is part of the published artifact set — the Rust crate loads it "
+            f"from beside the bundles — so an artifact without it has no working default text "
+            f"constructor.\n"
+            f"  Download the source checkpoint (SIGLIP_SRC_MODEL) and re-run."
+        )
+    got = sha256_file(src)
+    if got != want:
+        raise SystemExit(
+            f"SOURCE TOKENIZER IS NOT THE PINNED ONE ({src}):\n"
+            f"  got  {got}\n  want {want}"
+        )
+    tmp = f"{dst}.{uuid.uuid4().hex}.tmp"
+    shutil.copyfile(src, tmp)
+    if sha256_file(tmp) != want:
+        os.remove(tmp)
+        raise SystemExit(f"tokenizer copy from {src} did not land intact; retry")
+    os.replace(tmp, dst)
+    print(f"[ok] staged the pinned tokenizer from {src}")
+
+
 def main():
     import math
 
-    # 1. CHECKSUMS.sha256 over every shipped file (both bundles + sidecar).
+    # 1. CHECKSUMS.sha256 over every shipped file (both bundles + sidecar +
+    #    the runtime tokenizer the Rust crate loads from the artifact root).
+    stage_tokenizer()
     rels = []
     for sub in SHIPPED:
         rels += rel_files(MODEL_ROOT, sub)
     rels.append(SIDECAR)
+    rels.append(TOKENIZER)
     rels = sorted(rels)
     checks = {rel: sha256_file(os.path.join(MODEL_ROOT, rel)) for rel in rels}
     with open(os.path.join(MODEL_ROOT, "CHECKSUMS.sha256"), "w") as f:

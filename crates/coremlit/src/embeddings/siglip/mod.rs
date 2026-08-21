@@ -108,24 +108,26 @@ pub use image::{
 };
 pub use text::{DEFAULT_TEXT_COMPUTE, TextEmbedder, TextEmbedderOptions};
 
-/// Bytes of the bundled SigLIP 2 Gemma `tokenizer.json` compiled into the crate.
+/// File name of the SigLIP 2 Gemma `tokenizer.json` sidecar inside the model
+/// artifact directory — the file [`TextEmbedder::load`] /
+/// [`TextEmbedder::from_file`] read from the directory *containing* the text
+/// `.mlmodelc`.
 ///
-/// These are the exact `tokenizer.json` bytes of the source model repo
+/// The tokenizer is the exact `tokenizer.json` of the source model repo
 /// [`google/siglip2-base-patch16-naflex`](https://huggingface.co/google/siglip2-base-patch16-naflex)
 /// at revision `b53b807d3a2d5e2b3911292f2d69e5341cdc064c` (SHA-256
-/// `58a1696e…b1b0`), the revision that produces the committed token-id goldens —
-/// proven byte-correct by `tests/siglip/tokenizer_identity.rs`. Exposed for
-/// callers who construct [`TextEmbedder`] via [`TextEmbedder::from_memory`]; the
-/// [`TextEmbedder::load`] / [`TextEmbedder::from_file`] constructors use it
-/// directly.
+/// `58a1696e…b1b0`), the revision that produces the committed token-id goldens.
+/// It is ~34 MB, so it is distributed with the CoreML graphs at
+/// [`FinDIT-Studio/siglip2-naflex-coreml`](https://huggingface.co/FinDIT-Studio/siglip2-naflex-coreml)
+/// rather than compiled into this crate.
 ///
-/// The `include_bytes!` embeds ~34 MB into the rlib/binary — the Wave-A design
-/// accepted this cost (`BUNDLED_TOKENIZER` is the API). A build-time placeholder
-/// guard remains as a regression backstop: [`TextEmbedder::load`] /
-/// [`TextEmbedder::from_memory`] fail closed ([`Error::TokenizerPlaceholder`]) if
-/// the placeholder is ever re-committed, so a stripped tokenizer can never
-/// silently produce meaningless embeddings.
-pub const BUNDLED_TOKENIZER: &[u8] = include_bytes!("assets/tokenizer.json");
+/// The bytes read from disk are NOT trusted: [`TextEmbedder::load`] fails closed
+/// on the build-time placeholder sentinel AND on any file whose SHA-256 is not
+/// the pinned artifact's, so a wrong, truncated, or stale sidecar can never
+/// silently produce meaningless embeddings. Callers who stage the tokenizer
+/// elsewhere use [`TextEmbedder::from_files`] / [`TextEmbedder::from_memory`],
+/// which remain the caller-supplies-bytes escape hatches.
+pub const TOKENIZER_FILE_NAME: &str = "tokenizer.json";
 
 /// A candidate paired with its precomputed [`Embedding`] — the input unit to
 /// [`rank`]. Borrowing keeps ranking allocation-free and lets the label flow

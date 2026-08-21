@@ -173,9 +173,16 @@ fn from_memory_rejects_foreign_tokenizer() {
 fn from_memory_rejects_corrupted_tokenizer_with_identity_check() {
   // Parse → swap two non-sentinel base-vocab ids → re-serialize. `serde_json` is
   // a dev-dependency; a small local copy of the in-lib fixture is fine here.
+  let tokenizer_path =
+    common::model_root().join(coremlit::embeddings::granite::TOKENIZER_FILE_NAME);
+  let tokenizer_bytes = std::fs::read(&tokenizer_path).unwrap_or_else(|e| {
+    panic!(
+      "read the staged granite tokenizer {}: {e}",
+      tokenizer_path.display()
+    )
+  });
   let mut value: serde_json::Value =
-    serde_json::from_slice(coremlit::embeddings::granite::BUNDLED_TOKENIZER)
-      .expect("parse bundled tokenizer.json");
+    serde_json::from_slice(&tokenizer_bytes).expect("parse the staged tokenizer.json");
   {
     let vocab = value["model"]["vocab"]
       .as_object_mut()

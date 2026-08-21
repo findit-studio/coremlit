@@ -35,8 +35,17 @@ revision = "main"
 # The granite embeddings artifact (`embeddings::granite`), staged under
 # Models/embedkit-granite/ — the layout tests/granite/common/mod.rs resolves
 # by default (overridable via EMBEDKIT_TEST_MODELS). `include` pulls the whole
-# bundle directory: the `.mlmodelc` the gates load, the `.mlpackage`, and the
-# `CHECKSUMS.sha256` ci.yml checks every one of them against.
+# bundle directory: the `.mlmodelc` the gates load, the `.mlpackage`, the
+# `CHECKSUMS.sha256` ci.yml checks every one of them against, and — from a
+# revision that carries it — the `tokenizer.json` the crate reads from the
+# artifact root.
+#
+# LOUD FOLLOW-UP: the revision below PREDATES that tokenizer.json. The crate
+# stopped embedding the granite tokenizer (a 24 MB include_bytes! past the
+# crates.io size cap), so every granite gate that tokenizes now needs the
+# sidecar, and they fail against this revision — deliberately, rather than
+# skipping. Bump `revision` to the artifact revision that ships tokenizer.json
+# once it is uploaded.
 ["FinDIT-Studio/embedkit-coreml"]
 include  = "granite-97m-multilingual-r2/*"
 revision = "81852f707848407a4f3059f47a34e2bad71f1c6d"

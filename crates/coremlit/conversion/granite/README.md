@@ -43,8 +43,11 @@ should be read as promising more.
 - Per-file SHA-256 (verified on load, fail-closed — `scripts/_granite_common.py`):
   - `model.safetensors` — `f3ea88b230492811046145513710e76b4cc8c2ad49e8708da0e7247e548903be`
   - `tokenizer.json` — `4f2842d568e2724370aec203652a42ac783c7937f8347a1a2cc7506d71f1582f`
-    (also the `coremlit::embeddings::granite::BUNDLED_TOKENIZER` identity pin,
-    asserted in `tests/granite/tokenizer_identity.rs`)
+    (this file is COPIED INTO the published artifact by `write_manifest.py` —
+    the Rust crate no longer embeds it and `TextEmbedder::load` reads it from
+    beside the `.mlmodelc` — so this digest is also
+    `granite::contract::TOKENIZER_SHA256_HEX`, the identity the crate enforces at
+    load and `tests/granite/tokenizer_identity.rs` asserts)
   - plus `config.json`, `tokenizer_config.json`, `special_tokens_map.json`,
     `config_sentence_transformers.json`, `sentence_bert_config.json`,
     `modules.json`, `1_Pooling/config.json` — pinned because the graph shape
@@ -193,7 +196,7 @@ matched, 6 did not.**
 - **Differed**: `model.mil`, `model.mlmodel`, `metadata.json`,
   `coremldata.bin` ×2, and the mlpackage `Manifest.json`.
 
-`write_manifest.py` pins the published 9-path set in
+`write_manifest.py` pins the published 10-path set in
 `_granite_common.EXPECTED_ARTIFACT_FILES` and compares it against a **recursive,
 unfiltered walk of the whole artifact root** before writing, so `CHECKSUMS.sha256` is always
 set-comparable with the published manifest: a missing path, or a stray file
@@ -203,9 +206,13 @@ failure, not a note. Only the two files this step itself generates
 macOS AppleDouble (`._*`) and `.DS_Store` files are real files that appear on
 their own on exFAT/FAT/SMB volumes, so the walk surfaces them and the step stops
 with the removal command rather than excusing them and hiding whatever carries
-those names. The model card
-is the one member the recipe cannot produce: it must already be staged, or
-`GRANITE_MODEL_CARD` must point at it, and the step fails otherwise.
+those names. Two members are not produced by the conversion itself and are
+staged by this step instead: the model card (already staged, or
+`GRANITE_MODEL_CARD` points at it — the step fails otherwise) and
+`tokenizer.json`, copied verbatim from the verified source snapshot. Both are
+digest-checked on the way in, so a stale or wrong copy fails rather than being
+published. The tokenizer is not optional packaging: the crate loads it from the
+artifact root, so an artifact without it has no working default constructor.
 
 The differences are container-level, and were characterized rather than assumed:
 `model.mil` has the same 1051 ops with an **identical 493-op non-const

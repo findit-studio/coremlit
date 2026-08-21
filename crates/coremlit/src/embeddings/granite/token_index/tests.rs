@@ -13,12 +13,14 @@
 use tokenizers::Tokenizer;
 
 use super::TokenIndex;
-use crate::embeddings::granite::{BUNDLED_TOKENIZER, measuring_tokenizer_from_bytes};
+use crate::embeddings::granite::{measuring_tokenizer_from_bytes, test_artifact};
 
 /// The truncation-disabled MEASURING tokenizer — the exact one `chunk_long` builds
-/// its index with.
+/// its index with, from the granite `tokenizer.json` the ARTIFACT carries (the
+/// crate embeds none). Every test that calls this is `#[ignore]`d on that staged
+/// artifact.
 fn measuring_tok() -> Tokenizer {
-  measuring_tokenizer_from_bytes(BUNDLED_TOKENIZER).expect("measuring tokenizer")
+  measuring_tokenizer_from_bytes(test_artifact::tokenizer_bytes()).expect("measuring tokenizer")
 }
 
 /// The oracle: the count the OLD per-call closure returned.
@@ -166,6 +168,7 @@ fn golden_texts() -> Vec<String> {
 }
 
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn measure_range_matches_encode_over_adversarial_corpus() {
   let tok = measuring_tok();
   let mut rng = Rng(0x0DDB_1A5E_5EED_1234);
@@ -175,6 +178,7 @@ fn measure_range_matches_encode_over_adversarial_corpus() {
 }
 
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn measure_range_matches_encode_over_goldens() {
   let tok = measuring_tok();
   let mut rng = Rng(0xF00D_CAFE_1357_9BDF);
@@ -187,6 +191,7 @@ fn measure_range_matches_encode_over_goldens() {
 /// storms and whitespace pathologies interleaved, cut at thousands of random
 /// boundaries — the density the corpus alone does not reach.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn measure_range_matches_encode_over_seeded_random_document() {
   let tok = measuring_tok();
   let mut rng = Rng(0xABCD_1234_5678_9EF0);
@@ -214,6 +219,7 @@ fn measure_range_matches_encode_over_seeded_random_document() {
 /// exact defect the single-pass rewrite risks — would red the differential above.
 /// `measure_range` returns the un-shifted truth at each witness.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn differential_is_load_bearing_against_a_shifted_boundary() {
   let tok = measuring_tok();
   // (text, a, b): a one-char right shift of `b` must change the encoded count.
@@ -244,6 +250,7 @@ fn differential_is_load_bearing_against_a_shifted_boundary() {
 /// The `direct_only` fail-safe answers exactly (by full substring encode), so even
 /// if reconstruction were ever rejected the measures stay correct — only slower.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn direct_only_fallback_is_still_exact() {
   let tok = measuring_tok();
   let mut rng = Rng(0x1122_3344_5566_7788);
@@ -535,6 +542,7 @@ fn count_divergences(
 /// exercise the INDEX path — not the trivial `direct_only` arm. `DROPPABLE_KILLERS`
 /// and the droppable soups separately sweep the byte-coverage FALLBACK arm.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn measure_range_zero_divergence_over_killers() {
   let tok = measuring_tok();
   let mut out: Vec<(String, usize, usize, usize, usize)> = Vec::new();
@@ -597,6 +605,7 @@ fn measure_range_zero_divergence_over_killers() {
 /// merges), but the full parse splits them because a digit — which takes no
 /// space-glue — follows at `b`.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn witness_f1_ws_run_split_by_following_digit() {
   let tok = measuring_tok();
   let text = "456  1";
@@ -613,6 +622,7 @@ fn witness_f1_ws_run_split_by_following_digit() {
 /// zone walks into it, and without snapping DOWN to its start the partition drops
 /// the `!` head.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn witness_f2_scan_back_snaps_out_of_punct_crlf_tail() {
   let tok = measuring_tok();
   let text = "a!\r\n\r\n Next t";
@@ -628,6 +638,7 @@ fn witness_f2_scan_back_snaps_out_of_punct_crlf_tail() {
 /// branch ends at the `'s` suffix even with letters after, so `" it's"|"tation"`
 /// is a real full boundary; cutting at the `'s` re-joins `"station"` as one word.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn witness_f3_contraction_suffix_letter_adjacency() {
   let tok = measuring_tok();
   let text = " it'station end";
@@ -647,6 +658,7 @@ fn witness_f3_contraction_suffix_letter_adjacency() {
 /// only the byte-coverage guard sees the shortfall. Pre-guard,
 /// `measure_range(8, 16)` returned 6 for what `encode` counts as 7.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn witness_f8_vocab_dropped_byte_corrupts_index_offsets() {
   let tok = measuring_tok();
   let text = "\u{c}\n\u{2003}\u{202f}\nﬃ\u{5b4}\u{64b}23";
@@ -690,6 +702,7 @@ fn witness_f8_vocab_dropped_byte_corrupts_index_offsets() {
 /// the forward-determinism premise fails for single-word added tokens. The
 /// added-token guard rejects the reconstruction (direct_only), restoring exactness.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn witness_f9_added_token_lookaround_guard() {
   let tok = measuring_tok();
   let text = "a<|reserved_200020|>b 12  3";
@@ -712,6 +725,7 @@ fn witness_f9_added_token_lookaround_guard() {
 /// and every pair measures exactly by direct encode. (Fable's review template proved
 /// the RED pre-fix behaviour; this asserts the FIXED behaviour.)
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn added_literals_guard_fires_and_measures_exactly() {
   let tok = measuring_tok();
   for text in [
@@ -743,6 +757,7 @@ fn added_literals_guard_fires_and_measures_exactly() {
 /// a 0xF3 lead, is PRESENT and does NOT drop; these are the classes that actually
 /// do.)
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn real_nonbmp_drops_fall_back_and_stay_exact() {
   // Lead byte of a codepoint's UTF-8: confirm the plane→lead mapping the fixtures
   // rely on, so a wrong codepoint cannot silently pass by NOT dropping.
@@ -785,6 +800,7 @@ fn real_nonbmp_drops_fall_back_and_stay_exact() {
 /// exactly. This is the correction to the wrong "0xF1-0xF4 all drop" claim — 0xF3
 /// is in the vocab, so its planes index cleanly.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn tag_and_pua_do_not_drop_and_index_stays_exact() {
   fn lead(cp: char) -> u8 {
     let mut buf = [0u8; 4];
@@ -819,6 +835,7 @@ fn tag_and_pua_do_not_drop_and_index_stays_exact() {
 /// `build` stays on the index fast path (asserted), and every pair must still measure
 /// exactly. This restores the strongest index-path cross-class generator.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn k5_free_soup_exercises_index_path() {
   fn clean_soup(seed: u64, target_chars: usize) -> String {
     // No vocab-droppable byte-level char and no added-token literal, so `build` keeps
@@ -920,6 +937,7 @@ fn k5_free_soup_exercises_index_path() {
 /// count stays output-identical — spot-checked against the direct oracle here, and
 /// swept over the full killer differential (`measure_range == encode`) elsewhere.
 #[test]
+#[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn oversized_single_pretoken_encodes_each_probe_once() {
   let tok = measuring_tok();
   // A multi-megabyte single unbroken pre-token: the lowercase run matches one

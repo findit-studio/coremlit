@@ -18,6 +18,28 @@ readme = "../../README.md"
 keywords = ["coreml", "machine-learning", "macos", "speech", "neural-engine"]
 categories = ["multimedia::audio", "os::macos-apis", "science", "api-bindings"]
 
+# Keep the published `.crate` under the 10 MiB crates.io cap. Everything listed
+# here is DEV-ONLY data: parity fixtures (audio, golden images, mel/logit
+# oracles, Swift probe transcripts) and the model-conversion recipes. None of it
+# is reachable from `src/`, and none of it is usable without the gitignored
+# `Models/` trees the gated tests need anyway, so a consumer of the published
+# crate loses nothing.
+#
+# `tests/` is NOT excluded wholesale: `src/embeddings/granite` `include_str!`s
+# `tests/granite/fixtures/goldens/corpus.json`, so that one fixture tree must
+# stay in the package or the LIBRARY fails to compile from crates.io.
+exclude = [
+  "conversion/",
+  "tests/align/fixtures/",
+  "tests/ced/fixtures/",
+  "tests/clap/fixtures/",
+  "tests/siglip/fixtures/",
+  "tests/speaker/fixtures/",
+  "tests/vad/fixtures/",
+  "tests/whisper/fixtures/",
+  "tests/whisper_swift_probes/",
+]
+
 [package.metadata.docs.rs]
 all-features = true
 default-target = "aarch64-apple-darwin"
@@ -95,9 +117,11 @@ clap = ["dep:rustfft", "dep:tokenizers", "dep:windit"]
 
 # --- embeddings::granite (the embedkit phase) ---
 # General text sentence-embeddings on CoreML; first model
-# `granite-embedding-97m-multilingual-r2` (ModernBERT + CLS pooling, 384-d). A
-# bundled granite tokenizer (`tokenizers`, shared with `whisper`/`clap`) around
-# the fp16 CoreML graph, L2-normalized in Rust. The parity oracle is COMMITTED
+# `granite-embedding-97m-multilingual-r2` (ModernBERT + CLS pooling, 384-d). The
+# granite tokenizer (`tokenizers`, shared with `whisper`/`clap`) around the fp16
+# CoreML graph, L2-normalized in Rust. The tokenizer.json is NOT embedded — it
+# ships with the model artifact and is read from beside the `.mlmodelc`, its
+# SHA-256 pinned at load (`dep:sha2`). The parity oracle is COMMITTED
 # transformers-fp32 goldens (`tests/granite/fixtures/goldens/`), never a live
 # ONNX crate — so there is NO `granite-oracle` feature and NO `ort` in this path.
 # `default = []` pulls none of it.
@@ -110,8 +134,10 @@ granite = ["dep:tokenizers", "dep:windit", "windit/text", "dep:sha2"]
 # position-embedding lift; the u8 image resize is delegated to `pixon`'s
 # byte-exact PIL-parity q8 resampler, while the patch-budget solver / patchify /
 # pos-emb lift stay hand-rolled — no `image`/decoder dep) around two fp16 graphs,
-# plus a bundled Gemma tokenizer (`tokenizers`, shared with
-# `whisper`/`clap`/`granite`), L2-normalized in Rust. NaFlex resizes natively to
+# plus the Gemma tokenizer (`tokenizers`, shared with `whisper`/`clap`/`granite`),
+# L2-normalized in Rust. The tokenizer.json is NOT embedded — it ships with the
+# model artifact and is read from beside the `.mlmodelc`, its SHA-256 pinned at
+# load (`dep:sha2`). NaFlex resizes natively to
 # a fixed patch budget, so no windowing is used. The parity oracle is COMMITTED
 # transformers-fp32 goldens (`tests/siglip/fixtures/goldens/`), never a live ONNX
 # crate — so there is NO `siglip-oracle` feature and NO `ort` in this path.
@@ -121,7 +147,7 @@ granite = ["dep:tokenizers", "dep:windit", "windit/text", "dep:sha2"]
 # currently licensed GPL-3.0-or-later; the owner will relicense it permissive
 # (MIT OR Apache-2.0) before this branch merges. It is a flagged merge blocker
 # tracked outside this change, not something wired here.
-siglip = ["dep:tokenizers", "dep:pixon"]
+siglip = ["dep:tokenizers", "dep:pixon", "dep:sha2"]
 
 # --- audio::ced (CED tiny/mini/small/base AudioSet sound-event tagging) ---
 # Native CoreML CED multi-label classifier (tiny/mini/small/base — one

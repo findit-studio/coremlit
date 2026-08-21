@@ -165,6 +165,10 @@ jobs:
           # `include` keeps the bundle's own directory, so this lands at
           # Models/embedkit-granite/granite-97m-multilingual-r2/ — the layout
           # tests/granite/common/mod.rs resolves without EMBEDKIT_TEST_MODELS.
+          # The selector pulls the WHOLE bundle directory, so it also fetches the
+          # tokenizer.json the crate now loads from the artifact root — but only
+          # from a revision that HAS it: the granite gates fail until MODELS_LOCK
+          # pins one, which is the intended fail-closed behavior.
           hf download "$granite_repo" --include "$granite_include" --revision "$granite_revision" \
             --local-dir Models/embedkit-granite
       # Runs on EVERY run, not just cache misses, so a truncated download AND a
@@ -227,7 +231,13 @@ jobs:
             echo "::error::granite bundle $bundle is absent — the model gates below must FAIL here, never skip" >&2
             exit 1
           fi
-          for target in granite_model_io granite_parity_embed granite_placement granite_embed_long; do
+          # granite_tokenizer_identity and the in-lib (`--lib`) tokenizer gates
+          # are HERE, not in the hermetic `features` job: the crate no longer
+          # embeds the granite tokenizer (it is a ~24 MB sidecar the artifact
+          # ships and `TextEmbedder::load` reads), so those gates read the staged
+          # artifact tree and are `#[ignore]`d like every other model gate.
+          for target in granite_model_io granite_parity_embed granite_placement granite_embed_long \
+                        granite_tokenizer_identity; do
             listed=$(cargo test -p coremlit --features granite --test "$target" -- --list --ignored 2>/dev/null | grep -c ': test$' || true)
             if [ "$listed" -eq 0 ]; then
               echo "::error::$target lists 0 ignored tests — it failed to build, or its model gates were deleted, renamed, or un-ignored, so an ignored-only run would pass vacuously" >&2
@@ -236,3 +246,12 @@ jobs:
             echo "== $target: $listed model gate(s) =="
             cargo test -p coremlit --features granite --test "$target" -- --ignored
           done
+          # The in-lib granite tokenizer/chunking gates (`--lib`), same reason
+          # and the same anti-vacuum guard.
+          listed=$(cargo test -p coremlit --features granite --lib -- --list --ignored 2>/dev/null | grep -c ': test$' || true)
+          if [ "$listed" -eq 0 ]; then
+            echo "::error::the granite --lib suite lists 0 ignored tests — it failed to build, or its tokenizer gates were deleted, renamed, or un-ignored, so an ignored-only run would pass vacuously" >&2
+            exit 1
+          fi
+          echo "== --lib: $listed model gate(s) =="
+          cargo test -p coremlit --features granite --lib -- --ignored
