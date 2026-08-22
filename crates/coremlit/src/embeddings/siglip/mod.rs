@@ -56,7 +56,7 @@
 //!
 //! The converted bundle is published at
 //! [`FinDIT-Studio/siglip2-naflex-coreml`](https://huggingface.co/FinDIT-Studio/siglip2-naflex-coreml)
-//! (revision `62c97df451a4906f0ee3ab93b9213113a51740ba`), so those artifacts can
+//! (revision `eb514c2ab66fb702d43c742add0be5b091b02dab`), so those artifacts can
 //! be fetched instead of re-converted. That repo is the OUTPUT of the recipes
 //! above, not an upstream this crate trusts: the SHA-256 pins cited above are the
 //! authority either way, and they match that revision's `CHECKSUMS.sha256`

@@ -97,6 +97,7 @@ jobs:
             Models/whisperkit-coreml/openai_whisper-tiny
             Models/tokenizers/whisper-tiny
             Models/embedkit-granite/granite-97m-multilingual-r2
+            Models/siglip2-naflex/siglip2-base-patch16-naflex-512
           key: models-${{ hashFiles('MODELS_LOCK') }}
       - name: Download models (cache miss)
         if: steps.models.outputs.cache-hit != 'true'
@@ -104,13 +105,14 @@ jobs:
           set -euo pipefail
 
           # MODELS_LOCK is the source of truth for what gets downloaded, not
-          # just a cache-busting key: it has a fixed three-table shape (the
+          # just a cache-busting key: it has a fixed four-table shape (the
           # whisperkit-coreml model repo, selector field `include`; the
           # tokenizer repo, selector field `files`; the embedkit-coreml granite
-          # repo, selector field `include`), each with its own `revision`. Pull
-          # repo/selector/revision out by hand instead of hardcoding them here,
-          # so a MODELS_LOCK edit is what changes what this job downloads — no
-          # TOML crate needed for three fixed tables. Tables are selected by
+          # repo, selector field `include`; the siglip2-naflex-coreml tokenizer
+          # sidecar, selector field `include`), each with its own `revision`.
+          # Pull repo/selector/revision out by hand instead of hardcoding them
+          # here, so a MODELS_LOCK edit is what changes what this job downloads
+          # — no TOML crate needed for four fixed tables. Tables are selected by
           # INDEX, so appending is safe but reordering MODELS_LOCK is not.
           lock=MODELS_LOCK
 
@@ -140,17 +142,34 @@ jobs:
           granite_repo=$(table_header 3)
           granite_include=$(table_field 3 include)
           granite_revision=$(table_field 3 revision)
+          siglip_repo=$(table_header 4)
+          siglip_include=$(table_field 4 include)
+          siglip_revision=$(table_field 4 revision)
+
+          # Index-selected tables mean an APPENDED table this parser does not
+          # know about is silently ignored — MODELS_LOCK would say CI downloads
+          # something CI never downloads, and the empty-extraction guard below
+          # (which only inspects the variables that WERE extracted) cannot see
+          # it. Pin the count so teaching the lock a new table forces teaching
+          # the parser too.
+          table_count=$(sed -n 's/^\["\(.*\)"\]$/\1/p' "$lock" | grep -c . || true)
+          if [ "$table_count" -ne 4 ]; then
+            echo "::error::MODELS_LOCK has $table_count tables but this parser handles exactly 4 — a table was added or removed without updating the download step, so it would be silently ignored" >&2
+            exit 1
+          fi
 
           echo "MODELS_LOCK: model=$model_repo@$model_revision include=$model_include"
           echo "MODELS_LOCK: tokenizer=$tokenizer_repo@$tokenizer_revision files=$tokenizer_files"
           echo "MODELS_LOCK: granite=$granite_repo@$granite_revision include=$granite_include"
+          echo "MODELS_LOCK: siglip=$siglip_repo@$siglip_revision include=$siglip_include"
 
           # Fail LOUD on any empty extraction: `hf download repo` with no
           # selector silently fetches the WHOLE repository, so a future
           # MODELS_LOCK format drift must stop the job here, not download
           # different content than the lock intends.
           for v in model_repo model_include model_revision tokenizer_repo tokenizer_files tokenizer_revision \
-                   granite_repo granite_include granite_revision; do
+                   granite_repo granite_include granite_revision \
+                   siglip_repo siglip_include siglip_revision; do
             if [ -z "${!v}" ]; then
               echo "::error::MODELS_LOCK parse produced empty '$v' — format drift? fix the lock or the parser" >&2
               exit 1
@@ -171,6 +190,16 @@ jobs:
           # pins one, which is the intended fail-closed behavior.
           hf download "$granite_repo" --include "$granite_include" --revision "$granite_revision" \
             --local-dir Models/embedkit-granite
+          # The siglip TOKENIZER SIDECAR only (34 MB), not the ~784 MB bundle:
+          # tests/siglip/tokenizer_identity.rs calls no `Model::load`, so the
+          # towers buy those two gates nothing. `include` keeps the bundle's tier
+          # directory, so `--local-dir Models/siglip2-naflex` lands the file at
+          # Models/siglip2-naflex/siglip2-base-patch16-naflex-512/tokenizer.json
+          # — the `model_root()` tests/siglip/common/mod.rs resolves without
+          # SIGLIP_TEST_MODELS. The remaining siglip model gates need the towers
+          # and stay local/dev gates.
+          hf download "$siglip_repo" --include "$siglip_include" --revision "$siglip_revision" \
+            --local-dir Models/siglip2-naflex
       # Runs on EVERY run, not just cache misses, so a truncated download AND a
       # tampered or partially-restored cache entry both fail here rather than
       # surfacing later as a confusing parity or model_io failure. The bundle
@@ -255,3 +284,32 @@ jobs:
           fi
           echo "== --lib: $listed model gate(s) =="
           cargo test -p coremlit --features granite --lib -- --ignored
+      # The two siglip TOKENIZER gates. They are `#[ignore]`d like every other
+      # siglip model gate — not because they load a model (they call no
+      # `Model::load` at all) but because they read the staged artifact tree:
+      # the crate embeds no Gemma tokenizer, so `tokenizer.json` is a 34 MB
+      # sidecar the bundle ships and `TextEmbedder::load` reads. That makes them
+      # the only siglip gates this job can afford: MODELS_LOCK stages the
+      # sidecar alone, and the tower-dependent gates (model_io, parity_embed,
+      # placement, e2e) remain local/dev gates against the full bundle.
+      #
+      # Same two vacuum holes as the granite step, closed the same way: an
+      # absent sidecar must FAIL here rather than let every gate die on a
+      # missing file, and an ignored-only run over a target whose gates were
+      # deleted, renamed, un-ignored, or that failed to BUILD runs 0 tests and
+      # exits 0, so the ignored-only `--list` count refuses it.
+      - name: SigLIP tokenizer gates
+        run: |
+          set -euo pipefail
+          tokenizer=Models/siglip2-naflex/siglip2-base-patch16-naflex-512/tokenizer.json
+          if [ ! -f "$tokenizer" ]; then
+            echo "::error::siglip tokenizer $tokenizer is absent after download/cache-restore — the gates below must FAIL here, never skip" >&2
+            exit 1
+          fi
+          listed=$(cargo test -p coremlit --features siglip --test siglip_tokenizer_identity -- --list --ignored 2>/dev/null | grep -c ': test$' || true)
+          if [ "$listed" -eq 0 ]; then
+            echo "::error::siglip_tokenizer_identity lists 0 ignored tests — it failed to build, or its gates were deleted, renamed, or un-ignored, so an ignored-only run would pass vacuously" >&2
+            exit 1
+          fi
+          echo "== siglip_tokenizer_identity: $listed gate(s) =="
+          cargo test -p coremlit --features siglip --test siglip_tokenizer_identity -- --ignored

@@ -107,9 +107,17 @@ else `Models/siglip2-naflex/`) need the published bundle fetched first:
 
 ```sh
 hf download FinDIT-Studio/siglip2-naflex-coreml \
-  --revision 62c97df451a4906f0ee3ab93b9213113a51740ba \
+  --revision eb514c2ab66fb702d43c742add0be5b091b02dab \
   --local-dir Models/siglip2-naflex
 ```
+
+CI stages **less than that**: the `model-tests` job downloads only
+`siglip2-base-patch16-naflex-512/tokenizer.json` (34 MB, per `MODELS_LOCK`'s
+fourth table), because the two gates it runs —
+`tests/siglip/tokenizer_identity.rs` — call no `Model::load` and need only the
+tokenizer plus the committed golden corpus. The tower-dependent gates
+(`model_io`, `text_model_io`, `parity_embed`, `placement`, `e2e`) need the full
+~784 MB bundle above and stay local/dev gates.
 
 ## Scripts
 

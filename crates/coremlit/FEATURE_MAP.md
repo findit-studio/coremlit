@@ -117,8 +117,11 @@ and hash-checks against a pinned SHA-256. Only `clap` and `align` still
 `include_bytes!` their tokenizers. Consequence for this table: the `features`
 job is hermetic, so the `granite`/`siglip` rows build and run everything EXCEPT
 the tokenizer gates — those are `#[ignore]`d on a staged artifact and belong to
-the `model-tests` job, which stages granite via `MODELS_LOCK`. SigLIP has no
-`MODELS_LOCK` entry, so its two tokenizer gates run only locally for now.
+the `model-tests` job, which stages both via `MODELS_LOCK`. SigLIP's entry is
+the 34 MB `tokenizer.json` ALONE, not the ~784 MB bundle: its two tokenizer
+gates call no `Model::load`, so the towers would buy them nothing. The
+tower-dependent siglip gates (`model_io`, `text_model_io`, `parity_embed`,
+`placement`, `e2e`) still run only locally.
 
 ## Curated CI parity-oracle list
 

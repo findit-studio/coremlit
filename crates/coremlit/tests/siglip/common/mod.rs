@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 ///
 /// Distinct from the ARTIFACT repo revision: the converted bundle is published at
 /// `FinDIT-Studio/siglip2-naflex-coreml` @
-/// `62c97df451a4906f0ee3ab93b9213113a51740ba`, which is this recipe's output. That
+/// `eb514c2ab66fb702d43c742add0be5b091b02dab`, which is this recipe's output. That
 /// revision is recorded in `conversion/siglip/README.md` rather than pinned here,
 /// because nothing in these tests resolves an artifact by revision — they read
 /// whatever tree `SIGLIP_TEST_MODELS` points at.

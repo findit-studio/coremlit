@@ -47,7 +47,31 @@ ignored_count="$(printf '%s\n' "${ignored}" | grep -c ': test$' || true)"
 echo "  ${count} tests listed (${ignored_count} ignored)"
 
 # The sweep must be PRESENT in the full list (not deleted or renamed)...
-if ! printf '%s\n' "${all}" | grep -q "^${SWEEP}: test$"; then
+#
+# Matched with a HERESTRING, never `printf ... | grep -q`, which is a SIGPIPE
+# BUG that made this gate fail ~4 runs in 5.
+#
+# `grep -q` exits on its FIRST match and closes the read end of the pipe. Bash's
+# `printf` builtin writes through a 512-byte stdio buffer (measured on macOS
+# bash 3.2), so any payload over 512 bytes costs it TWO OR MORE `write`s — and
+# if `grep` matches in an early chunk and exits before the later one lands,
+# `printf` takes SIGPIPE (141). `set -o pipefail` then promotes 141 to the
+# pipeline's status, so the MATCHING case — the healthy one — reports failure.
+#
+# Measured here, needle in the first chunk, 40 runs per size: <=512 bytes gives
+# rc=141 zero times; 513 bytes gives it 37 times; 4 KB gives it 40 times. Put
+# the needle in the LAST chunk instead and it drops back to zero, because grep
+# must then consume everything. So the trigger is payload size AND match
+# position, with scheduling deciding the rest — the real `--list` here is
+# ~1.3 KB with an early match, which measured 33/40 failures. Note the relevant
+# buffer is stdio's 512 bytes, NOT the 64 KB pipe buffer: this fires far below
+# the size at which a pipe could ever block.
+#
+# The ignored-only list below is under the threshold TODAY and would cross it
+# as tests are added, so do not reason about sizes — remove the writer. A
+# herestring feeds grep from a temp file: nothing can take SIGPIPE, and the
+# status is grep's alone. Keep every membership test below in this form.
+if ! grep -q "^${SWEEP}: test$" <<<"${all}"; then
   echo "  FAIL: sweep '${SWEEP}' is not in ${BIN}'s test list (deleted or renamed)."
   exit 1
 fi
@@ -57,7 +81,7 @@ fi
 # is absent (run this only WITH the models) or build.rs no longer emits
 # `cfg(models_present)`; both mean the model job's ordinary suite would silently
 # stop executing the sweep exactly when there is something to sweep.
-if printf '%s\n' "${ignored}" | grep -q "^${SWEEP}: test$"; then
+if grep -q "^${SWEEP}: test$" <<<"${ignored}"; then
   echo "  FAIL: sweep '${SWEEP}' is #[ignore]d — Models/ is absent, or build.rs no longer"
   echo "        emits cfg(models_present). A plain \`cargo test\` would NOT run the sweep, so"
   echo "        the model job's ordinary suite would skip it exactly when models are present."

@@ -60,6 +60,38 @@
 # `cargo`, which cannot nest inside a `cargo test` run without deadlocking on
 # the target-dir lock. Written for bash 3.2 (macOS default) — no associative
 # arrays.
+#
+# Every membership test below matches with a HERESTRING, never
+# `printf ... | grep -q`. That idiom is a latent SIGPIPE bug: `grep -q` exits on
+# its FIRST match and closes the read end of the pipe, while bash's `printf`
+# builtin writes through a 512-byte stdio buffer (measured on macOS bash 3.2),
+# so a payload over 512 bytes costs it two or more `write`s and the later one
+# can land on a closed pipe — SIGPIPE, 141, which `pipefail` promotes to the
+# pipeline's status. Here that corrupts the HEALTHY branch: "present + ignored"
+# falls through, and when its `elif` fallback races too the gate reports a
+# present, correctly `#[ignore]`d DER gate as "deleted or renamed".
+#
+# Measured (needle in the first chunk, 40 runs per size): <=512 bytes never
+# fails, 513 bytes fails 37/40, 4 KB fails 40/40; move the needle into the last
+# chunk and it never fails, because grep must consume everything first. So it
+# depends on payload size AND match position.
+#
+# These payloads straddle the threshold. Measured `--list` sizes here:
+#
+#     binary                 all      ignored
+#     parity_e2e            1104          391
+#     parity_shipping_der    751          397
+#     backend_factorial      583          135
+#
+# Every `all` is OVER 512 and every `ignored` is UNDER it, which is the only
+# reason this script is not failing today: `check_bin` tests `ignored` first,
+# and `check_ordinary`'s racing `all` test happens to fall through to the branch
+# that was correct anyway. Neither is a property anyone chose. `ignored` is ~120
+# bytes — three gate names — from crossing, and on the far side `check_bin`
+# starts reporting present, correctly `#[ignore]`d gates as "deleted or
+# renamed", in the `check` job, on every push and PR. Do not reason about sizes;
+# remove the writer. A herestring feeds grep from a temp file, so nothing can
+# take SIGPIPE.
 set -euo pipefail
 
 # Verify one DER binary: $1 = test binary name, $2.. = expected `#[ignore]`d
@@ -86,9 +118,9 @@ check_bin() {
   echo "  ${count} tests listed (${ignored_count} ignored)"
   rc=0
   for name in "$@"; do
-    if printf '%s\n' "${ignored}" | grep -q "^${name}: test$"; then
+    if grep -q "^${name}: test$" <<<"${ignored}"; then
       echo "  ok:   ${name} (present + ignored)"
-    elif printf '%s\n' "${all}" | grep -q "^${name}: test$"; then
+    elif grep -q "^${name}: test$" <<<"${all}"; then
       echo "  FAIL: gate '${name}' is present in ${bin} but is NO LONGER #[ignore]d —"
       echo "        the README's \`-- --ignored\` command would silently stop running it."
       rc=1
@@ -145,10 +177,10 @@ check_ordinary() {
   ignored="$(cargo test -p coremlit-parity --features speaker-oracle --test "speaker_${bin}" -- --list --ignored 2>/dev/null || true)"
   rc=0
   for name in "$@"; do
-    if ! printf '%s\n' "${all}" | grep -q "^${name}: test$"; then
+    if ! grep -q "^${name}: test$" <<<"${all}"; then
       echo "  FAIL: required ordinary gate '${name}' is not in ${bin} (deleted or renamed)."
       rc=1
-    elif printf '%s\n' "${ignored}" | grep -q "^${name}: test$"; then
+    elif grep -q "^${name}: test$" <<<"${ignored}"; then
       echo "  FAIL: required ordinary gate '${name}' is now #[ignore]d in ${bin} —"
       echo "        run_ordinary would SKIP it while still reporting a green pass count."
       rc=1
