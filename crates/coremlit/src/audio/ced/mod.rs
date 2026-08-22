@@ -98,13 +98,23 @@
 //!
 //! ## Dependencies
 //!
-//! `windit` and `zuoer` are coremlit's own dependencies, but only [`Span`] and
-//! [`WindowConfidences`] cross into coremlit's API. To run the stack above,
-//! depend on them directly:
+//! `windit` and `zuoer` are coremlit's own dependencies. Only [`Span`] and
+//! [`WindowConfidences`] cross into *this* module's API, and the smoothing tier
+//! is not re-exported anywhere, so depend on `windit` directly:
 //!
 //! ```toml
 //! windit = "0.2"   # smoothing; already in your graph via `ced`
-//! zuoer  = "0.2"   # the segmenter (coremlit itself pulls it only under `vad`)
+//! ```
+//!
+//! `zuoer` is the other case. With the `vad` feature on, `audio::vad`
+//! re-exports the whole set needed to drive a segmenter — `Run`,
+//! `RunSegmenter`, `RunOptions`, `SampleRate` and its `Error` / `Result` — so
+//! the segmenting block below names them through coremlit and needs no direct
+//! dependency. Under `ced` alone, `zuoer` is not in your graph at all, and you
+//! add it yourself:
+//!
+//! ```toml
+//! zuoer = "0.2"    # only for `ced` WITHOUT `vad`
 //! ```
 //!
 //! `windit` also ships its own gate/segment tier
@@ -116,50 +126,77 @@
 //!
 //! ## Scoring the clip
 //!
-//! This block is `no_run`: it needs a staged `.mlmodelc`, so `cargo test --doc`
-//! **compiles it and never executes it**. Nothing in it is verified behavior —
-//! unlike the runnable blocks that follow.
+//! Loading a model and running it is the ONE step that needs a staged
+//! `.mlmodelc`, so this block — and only this block — is `no_run`:
+//! `cargo test --doc` **compiles it and never executes it**. Nothing in it is
+//! verified behavior. Everything downstream of it is, because everything
+//! downstream of it is arithmetic on the returned numbers:
 //!
 //! ```no_run
-//! use coremlit::audio::ced::{CedModel, Classifier, RatedSoundEvent, WindowPlan};
-//! use windit::windowed::Windowed;
+//! use coremlit::audio::ced::{CedModel, Classifier, WindowConfidences, WindowPlan};
 //!
 //! # let samples_16k: Vec<f32> = Vec::new();
 //! let classifier = Classifier::from_file(CedModel::Small.mlmodelc_path("Models/ced"))?;
 //! // A 1 s hop across the fixed 10 s window: 90% overlap, one score per second.
 //! let plan = WindowPlan::new().with_hop_samples(16_000);
-//! let windows = classifier.classify_windows(&samples_16k, &plan)?;
-//!
-//! // One column out of 527. The span rides along untouched.
-//! let dog = RatedSoundEvent::from_key("Dog")[0].index();
-//! let track: Vec<Windowed<f32>> = windows
-//!   .iter()
-//!   .map(|w| Windowed::new(w.value().as_slice()[dog], w.span()))
-//!   .collect();
+//! let windows: Vec<WindowConfidences> = classifier.classify_windows(&samples_16k, &plan)?;
 //! # Ok::<(), coremlit::audio::ced::Error>(())
 //! ```
 //!
-//! ## Smoothing the class track
+//! ## Projecting one class, and smoothing it
 //!
-//! Smoothing needs no model, so this block **runs**:
+//! [`Confidences::try_from_slice`] builds that `windows` vector by hand, which
+//! is what lets the rest of the pipeline **run** here with no model staged —
+//! and what lets a consumer unit-test their own event logic the same way:
 //!
 //! ```
-//! use coremlit::audio::ced::{RatedSoundEvent, Span, WINDOW_SAMPLES};
+//! use coremlit::audio::ced::{
+//!   Confidences, Error, NUM_CLASSES, RatedSoundEvent, Span, WINDOW_SAMPLES, WindowConfidences,
+//! };
 //! use windit::{
 //!   smooth::{Ema, SmoothPolicy},
 //!   windowed::Windowed,
 //! };
 //!
 //! let hop = 16_000; // the `WindowPlan` hop the scores were produced at
-//! assert_eq!(RatedSoundEvent::from_key("Dog")[0].index(), 74);
+//! let dog = RatedSoundEvent::from_key("Dog")[0].index();
+//! let music = RatedSoundEvent::from_key("Music")[0].index();
+//! assert_eq!((dog, music), (74, 137));
 //!
-//! // Standing in for one column of `classify_windows` output.
-//! let raw = [0.02, 0.04, 0.71, 0.86, 0.31, 0.90, 0.88, 0.09, 0.03, 0.01, 0.01, 0.02];
-//! let track: Vec<Windowed<f32>> = raw
+//! // Twelve windows of 527 scores, standing in for `classify_windows` output.
+//! // `Music` outscores `Dog` in every one of them: the 527 sigmoids are
+//! // independent, so two classes can both be loud and they never sum to one.
+//! let barks = [0.02, 0.04, 0.71, 0.86, 0.31, 0.90, 0.88, 0.09, 0.03, 0.01, 0.01, 0.02];
+//! let windows = barks
 //!   .iter()
 //!   .enumerate()
-//!   .map(|(i, &p)| Windowed::new(p, Span::new(i * hop, WINDOW_SAMPLES, WINDOW_SAMPLES)))
+//!   .map(|(i, &p)| {
+//!     let mut scores = vec![0.0; NUM_CLASSES];
+//!     scores[dog] = p;
+//!     scores[music] = 0.93;
+//!     Ok(WindowConfidences::new(
+//!       Confidences::try_from_slice(&scores)?,
+//!       Span::new(i * hop, WINDOW_SAMPLES, WINDOW_SAMPLES),
+//!     ))
+//!   })
+//!   .collect::<Result<Vec<WindowConfidences>, Error>>()?;
+//!
+//! // Stored exactly as handed over: `try_from_slice` takes confidences, not
+//! // logits, so it applies no sigmoid (which would read 0.7027 here) and no
+//! // renormalization (0.4804 here, and a sum that could never pass one).
+//! assert_eq!(windows[3].value().as_slice()[dog], 0.86);
+//! assert!(windows[3].value().as_slice().iter().sum::<f32>() > 1.0);
+//!
+//! // One column out of 527. The span rides along untouched.
+//! let track: Vec<Windowed<f32>> = windows
+//!   .iter()
+//!   .map(|w| Windowed::new(w.value().as_slice()[dog], w.span()))
 //!   .collect();
+//!
+//! // The asked-for class, never the loudest one — projecting an argmax would
+//! // have followed `Music` and returned a flat 0.93 track.
+//! assert_eq!(*track[3].value(), 0.86);
+//! assert_eq!(track[3].span(), windows[3].span());
 //!
 //! // `Ema`'s alpha is per push; `CadenceEma` denominates its time constant in
 //! // input samples instead, so one setting survives an irregular hop.
@@ -167,9 +204,11 @@
 //!
 //! // Spans are preserved and values rewritten: the lone 0.31 dip at window 4
 //! // lifts to ~0.46, so a 0.5/0.35 hysteresis will not tear the event in two.
+//! // Unsmoothed that window still reads 0.31; read alpha as the decay weight
+//! // rather than the innovation weight and it reads 0.4387.
 //! assert_eq!(smoothed[4].span(), track[4].span());
 //! assert!((smoothed[4].value() - 0.46).abs() < 5e-3);
-//! # Ok::<(), windit::WinditError>(())
+//! # Ok::<(), Error>(())
 //! ```
 //!
 #![cfg_attr(
@@ -177,27 +216,47 @@
   doc = "## Segmenting the track into events",
   doc = "",
   doc = "`zuoer` reaches this crate through the `vad` feature, so this block is shown",
-  doc = "and run under `ced` + `vad`. Like the smoothing above, it **runs** — the",
-  doc = "segmenter takes probabilities, not audio:",
+  doc = "and run under `ced` + `vad`. Like the projection above, it **runs** — the",
+  doc = "segmenter takes probabilities, not audio — and it continues that same",
+  doc = "example: the hidden preamble is the previous block's code verbatim, so the",
+  doc = "whole chain from hand-built window scores to this event's confidence",
+  doc = "executes. Note where the segmenter comes from: `audio::vad` re-exports it,",
+  doc = "so nothing here names `zuoer`.",
   doc = "",
   doc = "```",
   doc = "use core::time::Duration;",
   doc = "",
-  doc = "use coremlit::audio::ced::{Span, WINDOW_SAMPLES};",
-  doc = "use windit::{",
-  doc = "  smooth::{Ema, SmoothPolicy},",
-  doc = "  windowed::Windowed,",
-  doc = "};",
-  doc = "use zuoer::{RunOptions, RunSegmenter, SampleRate};",
+  doc = "use coremlit::audio::vad::{RunOptions, RunSegmenter, SampleRate};",
+  doc = "# use coremlit::audio::ced::{",
+  doc = "#   Confidences, Error, NUM_CLASSES, RatedSoundEvent, Span, WINDOW_SAMPLES, WindowConfidences,",
+  doc = "# };",
+  doc = "# use windit::{",
+  doc = "#   smooth::{Ema, SmoothPolicy},",
+  doc = "#   windowed::Windowed,",
+  doc = "# };",
   doc = "",
   doc = "let hop = 16_000;",
-  doc = "let raw = [0.02, 0.04, 0.71, 0.86, 0.31, 0.90, 0.88, 0.09, 0.03, 0.01, 0.01, 0.02];",
-  doc = "let track: Vec<Windowed<f32>> = raw",
-  doc = "  .iter()",
-  doc = "  .enumerate()",
-  doc = "  .map(|(i, &p)| Windowed::new(p, Span::new(i * hop, WINDOW_SAMPLES, WINDOW_SAMPLES)))",
-  doc = "  .collect();",
-  doc = "let smoothed = Ema::new(0.6).smooth(&track)?;",
+  doc = "// `smoothed` is the previous block's result verbatim: twelve hand-built",
+  doc = "// `WindowConfidences`, the `Dog` column projected out, `Ema::new(0.6)`.",
+  doc = "# let dog = RatedSoundEvent::from_key(\"Dog\")[0].index();",
+  doc = "# let barks = [0.02, 0.04, 0.71, 0.86, 0.31, 0.90, 0.88, 0.09, 0.03, 0.01, 0.01, 0.02];",
+  doc = "# let windows = barks",
+  doc = "#   .iter()",
+  doc = "#   .enumerate()",
+  doc = "#   .map(|(i, &p)| {",
+  doc = "#     let mut scores = vec![0.0; NUM_CLASSES];",
+  doc = "#     scores[dog] = p;",
+  doc = "#     Ok(WindowConfidences::new(",
+  doc = "#       Confidences::try_from_slice(&scores)?,",
+  doc = "#       Span::new(i * hop, WINDOW_SAMPLES, WINDOW_SAMPLES),",
+  doc = "#     ))",
+  doc = "#   })",
+  doc = "#   .collect::<Result<Vec<WindowConfidences>, Error>>()?;",
+  doc = "# let track: Vec<Windowed<f32>> = windows",
+  doc = "#   .iter()",
+  doc = "#   .map(|w| Windowed::new(w.value().as_slice()[dog], w.span()))",
+  doc = "#   .collect();",
+  doc = "# let smoothed = Ema::new(0.6).smooth(&track)?;",
   doc = "",
   doc = "// Every number here is a scenario choice for this one class. coremlit picks",
   doc = "// none of them, and there is no CED default set to fall back on.",
@@ -224,14 +283,23 @@
   doc = "",
   doc = "assert_eq!(events.len(), 1);",
   doc = "let event = events[0];",
+  doc = "// Both thresholds are load-bearing, and the track straddles them: windows 2",
+  doc = "// (0.4388) and 7 (0.3812) clear the 0.35 end threshold but not the 0.5 start",
+  doc = "// one. Collapse the pair to a single 0.35 gate and the run opens a window",
+  doc = "// early, at 2.0; raise the end threshold to 0.40 and it closes a window",
+  doc = "// early, at 7.0. (An end threshold at or above the start one is not a third",
+  doc = "// option: `RunOptions` normalizes that back to its derived value.)",
   doc = "assert_eq!((event.start_seconds(), event.end_seconds()), (3.0, 8.0));",
   doc = "",
   doc = "// The event's confidence, on zuoer's terms: mean and peak over the run's own",
   doc = "// frames — padding excluded, bridged frames included. See `audio::vad`'s",
-  doc = "// \"Segment confidence\" section for the full statement of those rules.",
+  doc = "// \"Segment confidence\" section for the full statement of those rules. So",
+  doc = "// this is the mean of the five SMOOTHED in-run windows — over the whole clip",
+  doc = "// it would be 0.3230, and smoothing left out entirely (`Ema::new(1.0)`) the",
+  doc = "// same options report a 2.0..7.0 event with mean 0.7320.",
   doc = "assert!((event.mean_probability() - 0.6157).abs() < 1e-3);",
   doc = "assert!((event.peak_probability() - 0.8180).abs() < 1e-3);",
-  doc = "# Ok::<(), windit::WinditError>(())",
+  doc = "# Ok::<(), Error>(())",
   doc = "```"
 )]
 //!

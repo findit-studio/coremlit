@@ -148,6 +148,31 @@ impl Confidences {
   /// [`Error::InvalidConfidence`] on any value outside `[0, 1]` — this type's
   /// stated invariant, which the model path gets for free from sigmoid and a
   /// hand-built vector has to be checked for.
+  ///
+  /// # Examples
+  /// ```
+  /// use coremlit::audio::ced::{Confidences, Error, NUM_CLASSES};
+  ///
+  /// let mut values = vec![0.0f32; NUM_CLASSES];
+  /// values[74] = 0.86; // `Dog`
+  ///
+  /// // Copied in, never transformed: a sigmoid here would read 0.7027, and a
+  /// // renormalizing constructor 1.0 (this is the only non-zero class).
+  /// let scores = Confidences::try_from_slice(&values)?;
+  /// assert_eq!(scores.as_slice()[74], 0.86);
+  ///
+  /// // Both rejections are typed, never the panic `new` would raise.
+  /// assert!(matches!(
+  ///   Confidences::try_from_slice(&values[..NUM_CLASSES - 1]),
+  ///   Err(Error::ClassCountMismatch { got, .. }) if got == NUM_CLASSES - 1
+  /// ));
+  /// values[74] = f32::NAN;
+  /// assert!(matches!(
+  ///   Confidences::try_from_slice(&values),
+  ///   Err(Error::InvalidConfidence { index: 74, .. })
+  /// ));
+  /// # Ok::<(), Error>(())
+  /// ```
   pub fn try_from_slice(values: &[f32]) -> Result<Self> {
     if values.len() != NUM_CLASSES {
       return Err(Error::ClassCountMismatch {
