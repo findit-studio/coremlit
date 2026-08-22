@@ -16,11 +16,17 @@
 //! models.
 //!
 //! The committed VAD graph is not thereby left unswept. Once the cfg is on the
-//! sweep walks `Models/` WHOLE, so CI's model job — which downloads whisper and
-//! granite on every PR — audits the vendored VAD graph too, and its one fp16
-//! guard site is additionally pinned hermetically by the parser test
-//! `accepts_vadkits_stft_sqrt_guard`, which runs everywhere with no models at
-//! all.
+//! sweep walks `Models/` WHOLE, so CI's model job — which downloads whisper,
+//! granite and ced-tiny on every PR — audits the vendored VAD graph too, and
+//! its one fp16 guard site is additionally pinned hermetically by the parser
+//! test `accepts_vadkits_stft_sqrt_guard`, which runs everywhere with no models
+//! at all.
+//!
+//! Downloaded model families added to `MODELS_LOCK` need no change here, and
+//! must not be added to `VENDORED`: `Models/ced/` is gitignored like
+//! whisper's and granite's trees, so its presence DOES mean somebody fetched
+//! models — exactly what this predicate is asking. Only a path `.gitignore`
+//! un-ignores belongs in that list.
 //!
 //! `rerun-if-changed` on `Models/` re-runs this script when that tree changes,
 //! so the cfg flips on as soon as the models are downloaded — a stale `ignored`

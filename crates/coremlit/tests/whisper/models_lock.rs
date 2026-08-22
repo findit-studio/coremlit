@@ -5,7 +5,7 @@
 //! rot: the lock stops parsing, or the workflow stops actually reading it.
 //!
 //! No TOML crate: this is a deliberately tiny hand-rolled reader over the
-//! lock's fixed four-table shape (`["repo/name"]` headers, single-line
+//! lock's fixed five-table shape (`["repo/name"]` headers, single-line
 //! `key = "value"` fields), mirroring the sed/awk parsing `ci.yml` itself
 //! performs at CI time — not a general TOML parser.
 
@@ -96,8 +96,8 @@ fn lock_parses_and_every_table_has_a_selector_and_a_revision() {
 
   assert_eq!(
     tables.len(),
-    4,
-    "MODELS_LOCK: expected exactly four tables, found {}",
+    5,
+    "MODELS_LOCK: expected exactly five tables, found {}",
     tables.len()
   );
   for table in &tables {
@@ -134,7 +134,8 @@ fn ci_workflow_derives_downloads_from_the_lock_instead_of_hardcoding_them() {
       "argmaxinc/whisperkit-coreml",
       "openai/whisper-tiny",
       "FinDIT-Studio/embedkit-coreml",
-      "FinDIT-Studio/siglip2-naflex-coreml"
+      "FinDIT-Studio/siglip2-naflex-coreml",
+      "FinDIT-Studio/cedkit-coreml"
     ],
     "MODELS_LOCK's table names or their order changed — update this test alongside it"
   );
@@ -174,6 +175,10 @@ fn ci_workflow_derives_downloads_from_the_lock_instead_of_hardcoding_them() {
     "download step doesn't invoke hf with a lock-derived $siglip_repo"
   );
   assert!(
+    ci_contents.contains("hf download \"$ced_repo\""),
+    "download step doesn't invoke hf with a lock-derived $ced_repo"
+  );
+  assert!(
     ci_contents.contains("--revision \"$model_revision\""),
     "download step doesn't pass a lock-derived --revision for the model repo"
   );
@@ -188,6 +193,10 @@ fn ci_workflow_derives_downloads_from_the_lock_instead_of_hardcoding_them() {
   assert!(
     ci_contents.contains("--revision \"$siglip_revision\""),
     "download step doesn't pass a lock-derived --revision for the siglip repo"
+  );
+  assert!(
+    ci_contents.contains("--revision \"$ced_revision\""),
+    "download step doesn't pass a lock-derived --revision for the ced repo"
   );
 
   // ci.yml selects tables by INDEX, so an appended table it does not extract is
@@ -211,5 +220,91 @@ fn ci_workflow_derives_downloads_from_the_lock_instead_of_hardcoding_them() {
     ci_contents.contains("shasum -a 256 -c CHECKSUMS.sha256"),
     "ci.yml no longer verifies the granite bundle against its shipped CHECKSUMS.sha256, which \
      MODELS_LOCK's header claims it does"
+  );
+
+  // Same claim for CED, and NOT the same string: CED's checksum file lists
+  // paths relative to the `.mlmodelc` root rather than to the directory holding
+  // it, so its step reads `../CHECKSUMS.sha256` from inside the bundle. A
+  // copy-paste of granite's `-c CHECKSUMS.sha256` would report five missing
+  // files — this pins the CED-shaped invocation specifically.
+  assert!(
+    ci_contents.contains("shasum -a 256 -c ../CHECKSUMS.sha256"),
+    "ci.yml no longer verifies the CED bundle against its shipped CHECKSUMS.sha256 (read from \
+     inside the .mlmodelc, whose root its paths are relative to), which MODELS_LOCK's header \
+     claims it does"
+  );
+}
+
+/// MODELS_LOCK stages ONE CED size (`ced-tiny`: 10.64 MB of the artifact repo's
+/// 234 MB), but `tests/ced/*` declares every gate four times — one `#[ignore]`d
+/// module per size — and an ignored-ONLY run selects ALL FOUR. So ci.yml's CED
+/// gate step must filter to the staged size, and the two must agree.
+///
+/// Both drift directions are silent without this pin. Widen the lock's
+/// `include` to another size and CI downloads bytes no gate reads; change the
+/// gate filter and CI runs gates against a bundle the lock never staged.
+#[test]
+fn ci_runs_the_ced_gates_for_exactly_the_size_the_lock_stages() {
+  let Some((lock_path, workflow_path)) = repo_files() else {
+    return;
+  };
+  let lock_contents = fs::read_to_string(lock_path).expect("MODELS_LOCK reads");
+  let tables = parse_lock(&lock_contents);
+  let ci_contents = fs::read_to_string(workflow_path).expect(".github/workflows/ci.yml reads");
+
+  let ced = tables
+    .iter()
+    .find(|t| t.name == "FinDIT-Studio/cedkit-coreml")
+    .expect("MODELS_LOCK has no CED table");
+  let include = field(ced, "include").expect("the CED table has an `include` selector");
+
+  // `ced-<size>/*` — exactly one size, no glob over the family. A selector this
+  // parse rejects (`ced-*/*`, `*`, a bare file) is one whose staged size cannot
+  // be named, so it cannot be checked against the gate filter either.
+  let size = include
+    .strip_prefix("ced-")
+    .and_then(|rest| rest.strip_suffix("/*"))
+    .unwrap_or_else(|| {
+      panic!(
+        "MODELS_LOCK's CED `include` is {include:?}; this pin needs the single-size \
+         `ced-<size>/*` shape so the staged size can be matched against ci.yml's gate filter"
+      )
+    });
+  assert!(
+    !size.is_empty() && size.chars().all(|c| c.is_ascii_lowercase()),
+    "MODELS_LOCK's CED `include` names {size:?}, which is not a CedModel size name"
+  );
+
+  // The download lands the size directory under the family root the tests
+  // resolve by default.
+  assert!(
+    ci_contents.contains("--local-dir Models/ced"),
+    "ci.yml doesn't download CED into Models/ced, the family root tests/ced/common/mod.rs \
+     resolves without CED_TEST_MODELS"
+  );
+
+  let bundle = format!("Models/ced/ced-{size}/ced_{size}.mlmodelc");
+  assert!(
+    ci_contents.contains(&bundle),
+    "MODELS_LOCK stages CED size {size:?}, but ci.yml never names its bundle {bundle:?} — the \
+     absent-artifact guard and the checksum verification would be pointed at a different size \
+     than the one downloaded"
+  );
+
+  // The run filter and the anti-vacuum count must BOTH carry the size. Counting
+  // an unfiltered list would let a renamed `tiny` module still report the other
+  // sizes' gates and then run zero.
+  let run_filter = format!("-- --ignored {size}::");
+  assert!(
+    ci_contents.contains(&run_filter),
+    "ci.yml's CED gate step doesn't run the {size:?} gates ({run_filter:?}); an unfiltered \
+     `-- --ignored` selects all four sizes and would fail on the three MODELS_LOCK never staged"
+  );
+  let list_filter = format!("-- --list --ignored {size}::");
+  assert!(
+    ci_contents.contains(&list_filter),
+    "ci.yml's CED anti-vacuum count doesn't go through the same {size:?} filter as the run \
+     ({list_filter:?}), so a deleted or renamed `{size}` module could still count the other \
+     sizes' gates and then run none"
   );
 }

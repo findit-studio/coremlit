@@ -3,17 +3,17 @@
 # different revisions) to force a re-download.
 #
 # This file is CONSUMED, not decorative: ci.yml's "Download models (cache
-# miss)" step hand-parses the four tables below (small sed/awk block, no
-# TOML crate — see the comment there) to build all four `hf download`
+# miss)" step hand-parses the five tables below (small sed/awk block, no
+# TOML crate — see the comment there) to build all five `hf download`
 # commands, including `--revision`. Editing a repo name, selector, or
 # revision here changes what CI actually downloads next run, exactly like
 # editing any other lock file. Table ORDER is load-bearing: that parser
 # selects a table by INDEX (1 = whisper model, 2 = whisper tokenizer,
-# 3 = granite, 4 = siglip tokenizer), so tables may be appended but never
-# reordered without editing ci.yml to match. Appending is only safe because
-# ci.yml ALSO asserts the table COUNT it knows how to parse: a fifth table
-# added here without teaching the parser about it fails that job loudly
-# instead of being silently ignored.
+# 3 = granite, 4 = siglip tokenizer, 5 = ced-tiny), so tables may be
+# appended but never reordered without editing ci.yml to match. Appending is
+# only safe because ci.yml ALSO asserts the table COUNT it knows how to
+# parse: a sixth table added here without teaching the parser about it fails
+# that job loudly instead of being silently ignored.
 #
 # LOUD FOLLOW-UP: `revision = "main"` on the two whisper tables is a MOVING
 # target, not a real lock — CI can still download different upstream bytes
@@ -22,9 +22,9 @@
 # a deliberate user follow-up: it requires live network access (`hf api ...`
 # or the HF web UI) to look up each repo's current commit SHA. Until that
 # lands, treat `cache-epoch` bumps as the only reliable way to force a
-# fresh, verified download of them. The granite table is NOT in that state:
-# it pins an immutable commit SHA, and ci.yml verifies the downloaded bytes
-# against the `CHECKSUMS.sha256` that artifact ships.
+# fresh, verified download of them. The granite and ced tables are NOT in
+# that state: each pins an immutable commit SHA, and ci.yml verifies the
+# downloaded bytes against the `CHECKSUMS.sha256` those artifacts ship.
 cache-epoch = 1
 
 ["argmaxinc/whisperkit-coreml"]
@@ -67,3 +67,40 @@ revision = "a61241cb18689de1a8b83c315875807030e2878f"
 ["FinDIT-Studio/siglip2-naflex-coreml"]
 include  = "siglip2-base-patch16-naflex-512/tokenizer.json"
 revision = "eb514c2ab66fb702d43c742add0be5b091b02dab"
+
+# The CED sound-event classifier artifact (`audio::ced`), **`ced-tiny` ALONE**.
+# The repo publishes four I/O-identical sizes totalling 234 MiB — tiny 10.64,
+# mini 18.64, small 41.38, base 163.62 — and CI stages the smallest, a 22×
+# saving that buys the same coverage: the four graphs differ only in
+# transformer width, so tiny exercises every code path the other three do.
+#
+# vadkit went the other way (COMMITTED, PR #82) because it is 1.1 MiB. CED
+# cannot: `ced-base` alone is 163.62 MiB, past GitHub's 100 MB single-file hard
+# limit, so the whole family rides MODELS_LOCK.
+#
+# `include` keeps the bundle's own size directory, so ci.yml downloads with
+# `--local-dir Models/ced` and lands the tree at
+# `Models/ced/ced-tiny/ced_tiny.mlmodelc` — the layout
+# `tests/ced/common/mod.rs` resolves by default (overridable via
+# `CED_TEST_MODELS`). The bundle ships `CHECKSUMS.sha256` (paths relative to
+# the `.mlmodelc` root, NOT to `ced-tiny/` as granite's are) and `MANIFEST.json`;
+# ci.yml verifies the bytes against the former on every run.
+#
+# SELECTOR AND GATE FILTER MOVE TOGETHER. The per-size gates in `tests/ced/`
+# are `#[ignore]`d one module per size (`tiny::`/`mini::`/`small::`/`base::`),
+# and an ignored-ONLY run selects ALL FOUR — so ci.yml's "CED model gates" step
+# filters on `tiny::`. Widening this `include` to another size without adding
+# that size to the gate step downloads bytes no gate reads; narrowing the gate
+# step below what `include` stages does the same. The hermetic test
+# `ci_runs_the_ced_gates_for_exactly_the_size_the_lock_stages`
+# (tests/whisper/models_lock.rs) pins the two together.
+#
+# The revision is the ARTIFACT repo's commit SHA. Do not confuse it with the
+# per-size upstream `mispeech/ced-*` SOURCE revisions in
+# `tests/ced/common/mod.rs`: those name the PyTorch checkpoints the conversion
+# and the goldens' oracle consumed, and are a different chain entirely. The
+# bytes at this revision are byte-identical to the `TINY_SHA256` table in
+# `tests/ced/model_io.rs`.
+["FinDIT-Studio/cedkit-coreml"]
+include  = "ced-tiny/*"
+revision = "96d504716c4e2ebe6182312f65c4ee6c23921a5d"
