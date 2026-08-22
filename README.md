@@ -1,7 +1,7 @@
 <div align="center">
 <h1>coremlit</h1>
 
-**On-device audio understanding for macOS in Rust**: a safe CoreML runtime layer, plus opt-in feature-gated pipelines — a faithful port of [WhisperKit](https://github.com/argmaxinc/WhisperKit), forced alignment, speaker diarization, and Silero VAD — in one crate.
+**On-device multimodal inference for macOS in Rust**: a safe CoreML runtime layer, plus opt-in feature-gated pipelines — speech (a faithful port of [WhisperKit](https://github.com/argmaxinc/WhisperKit), forced alignment, speaker diarization, Silero VAD), AudioSet sound-event tagging, and audio/text/image embeddings (CLAP, granite, SigLIP 2) — in one crate.
 
 [<img alt="CI" src="https://img.shields.io/github/actions/workflow/status/findit-studio/coremlit/ci.yml?branch=main&style=for-the-badge&logo=github-actions" height="22">](https://github.com/findit-studio/coremlit/actions/workflows/ci.yml)
 <img alt="MSRV" src="https://img.shields.io/badge/MSRV-1.95-orange?style=for-the-badge&logo=rust" height="22">
@@ -11,7 +11,7 @@
 
 ## One crate, grouped modules, flat features
 
-`coremlit` is a single crate. The runtime **core** is always compiled; each audio pipeline is a feature-gated module under `audio::`. `default = []` — the core pulls no pipeline dependencies; consumers opt in per feature.
+`coremlit` is a single crate. The runtime **core** is always compiled; each pipeline is a feature-gated module under `audio::` or `embeddings::`. `default = []` — the core pulls no pipeline dependencies; consumers opt in per feature.
 
 | Module | Feature | What it is |
 |---|---|---|

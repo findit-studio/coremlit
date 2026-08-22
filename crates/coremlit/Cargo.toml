@@ -1,6 +1,6 @@
 [package]
 name = "coremlit"
-description = "Safe, synchronous CoreML runtime with opt-in on-device audio pipelines (Whisper STT, forced alignment, speaker diarization, Silero VAD)"
+description = "Safe, synchronous CoreML runtime for macOS (CPU/GPU/Neural Engine) with opt-in on-device multimodal pipelines: speech (Whisper STT, forced alignment, speaker diarization, Silero VAD), AudioSet sound-event tagging, and audio/text/image embeddings (CLAP, granite, SigLIP)"
 version.workspace = true
 edition.workspace = true
 # Publishable: every dependency in this package — including the optional
@@ -14,8 +14,8 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 readme = "../../README.md"
-keywords = ["coreml", "machine-learning", "macos", "speech", "neural-engine"]
-categories = ["multimedia::audio", "os::macos-apis", "science", "api-bindings"]
+keywords = ["coreml", "macos", "speech", "embeddings", "multimodal"]
+categories = ["multimedia::audio", "os::macos-apis", "artificial-intelligence", "computer-vision", "api-bindings"]
 
 # Keep the published `.crate` under the 10 MiB crates.io cap. Everything listed
 # here is DEV-ONLY data: parity fixtures (audio, golden images, mel/logit
