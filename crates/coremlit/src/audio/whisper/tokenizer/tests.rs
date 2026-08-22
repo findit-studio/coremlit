@@ -2,7 +2,18 @@ use std::path::PathBuf;
 
 use super::*;
 
-fn tiny() -> WhisperTokenizer {
+/// The staged whisper-tiny tokenizer folder.
+///
+/// Its CONTENTS beyond `tokenizer.json` are a staging detail, not a property
+/// of this crate, and no test may assert on them: a local
+/// `hf download openai/whisper-tiny tokenizer.json` leaves the folder holding
+/// that file alone, while the three-file `files` selector MODELS_LOCK hands CI
+/// (`tokenizer.json tokenizer_config.json config.json`) lands the checkpoint's
+/// own `tokenizer_config.json` beside it. Both stagings resolve the cleanup
+/// flag to `true` -- the first through Swift's `or:` default, the second by
+/// reading the `"clean_up_tokenization_spaces": true` every OpenAI Whisper
+/// checkpoint ships -- so a test that needs one shape must CONSTRUCT it.
+fn tiny_folder() -> PathBuf {
   let root = std::env::var_os("WHISPERKIT_TEST_MODELS").map_or_else(
     || {
       PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -11,7 +22,11 @@ fn tiny() -> WhisperTokenizer {
     },
     PathBuf::from,
   );
-  WhisperTokenizer::from_folder(root.join("tokenizers/whisper-tiny")).unwrap()
+  root.join("tokenizers/whisper-tiny")
+}
+
+fn tiny() -> WhisperTokenizer {
+  WhisperTokenizer::from_folder(tiny_folder()).unwrap()
 }
 
 #[test]
@@ -870,23 +885,30 @@ fn decode_cleans_the_leading_space_off_the_ellipsis_token() {
   assert!(t.clean_up_tokenization_spaces);
   assert_eq!(t.decode(&[1097], false).unwrap(), "...");
 
-  // And the real fixture folder resolves to `true` -- by Swift's `or:` default
-  // rather than by reading the flag, which is worth saying out loud: the folder
-  // `from_folder` is handed holds only `tokenizer.json`. The checkpoint's own
-  // `tokenizer_config.json` does set `"clean_up_tokenization_spaces": true`,
-  // i.e. the same answer, but it sits a HuggingFace snapshot layer below (at
-  // `models/openai/whisper-tiny/`) and is not on the path this function reads.
-  let root = std::env::var_os("WHISPERKIT_TEST_MODELS").map_or_else(
-    || {
-      PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("Models")
-    },
-    PathBuf::from,
-  );
-  let folder = root.join("tokenizers/whisper-tiny");
-  assert!(!folder.join("tokenizer_config.json").exists());
-  assert!(clean_up_tokenization_spaces_from(&folder));
+  // And the cleanup that produces that answer is reached by Swift's `or:`
+  // DEFAULT, not by a configured flag -- worth saying out loud, because a
+  // folder carrying no `tokenizer_config.json` at all is a shape this crate
+  // supports (`from_folder` requires only `tokenizer.json`) and the one where
+  // the ellipsis fix could silently stop applying.
+  //
+  // That folder is CONSTRUCTED, not looked for. Asserting the staged folder
+  // has no `tokenizer_config.json` is an assertion about whoever staged it,
+  // not about this crate -- see `tiny_folder` -- and it is what made this test
+  // pass on a dev box and fail on CI for a month.
+  let bare = tempfile::tempdir().unwrap();
+  std::fs::copy(
+    tiny_folder().join("tokenizer.json"),
+    bare.path().join("tokenizer.json"),
+  )
+  .unwrap();
+  assert!(!bare.path().join("tokenizer_config.json").exists());
+  let bare_tokenizer = WhisperTokenizer::from_folder(bare.path()).unwrap();
+  assert!(bare_tokenizer.clean_up_tokenization_spaces);
+  assert_eq!(bare_tokenizer.decode(&[1097], false).unwrap(), "...");
+
+  // The staged folder then resolves `true` under EITHER shape, which is the
+  // only thing about it this test is entitled to depend on.
+  assert!(clean_up_tokenization_spaces_from(&tiny_folder()));
 }
 
 #[test]

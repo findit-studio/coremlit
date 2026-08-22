@@ -1,8 +1,10 @@
 //! `MODELS_LOCK` governs what CI's `model-tests` job downloads (see the
 //! lock file's own header comment and `.github/workflows/ci.yml`'s
 //! "Download models (cache miss)" step). These checks are hermetic — no
-//! network, no models — and guard the two ways that contract can silently
-//! rot: the lock stops parsing, or the workflow stops actually reading it.
+//! network, no models — and guard the three ways that contract can silently
+//! rot: the lock stops parsing, the workflow stops actually reading it, or
+//! the workflow keeps downloading the artifacts but stops RUNNING the gates
+//! that read them.
 //!
 //! No TOML crate: this is a deliberately tiny hand-rolled reader over the
 //! lock's fixed five-table shape (`["repo/name"]` headers, single-line
@@ -34,6 +36,48 @@ fn repo_files() -> Option<(PathBuf, PathBuf)> {
     eprintln!("models_lock checks skipped: not in the repository workspace");
     None
   }
+}
+
+/// The step condition every gate in ci.yml's `model-tests` job must carry.
+///
+/// `!cancelled()` is what makes a gate independent of the ones before it;
+/// `steps.download.outcome != 'failure'` keeps the ONE genuine dependency —
+/// nothing below can run without the artifacts. `outcome` is `skipped`, not
+/// `failure`, when the download is itself skipped on a cache hit, so the
+/// common path stays unaffected.
+const GATE_GUARD: &str = "if: ${{ !cancelled() && steps.download.outcome != 'failure' }}";
+
+/// The `model-tests` job's steps, in order, each as its own raw YAML text.
+///
+/// Text-based like `parse_lock`, and for the same reason: the point is to read
+/// what ci.yml literally says, not to model YAML. A step begins at exactly six
+/// columns of indent followed by `- name:`/`- uses:`/`- run:`, which no line
+/// inside a `run: |` block (indented ten) can imitate, and the job ends at the
+/// next key indented two columns.
+fn model_tests_steps(ci: &str) -> Vec<String> {
+  let job = ci
+    .split_once("\n  model-tests:\n")
+    .expect("ci.yml has no `model-tests` job")
+    .1;
+  let mut steps: Vec<String> = Vec::new();
+  for line in job.lines() {
+    let body = line.trim_start();
+    if !body.is_empty() && line.len() - body.len() == 2 {
+      break;
+    }
+    if ["- name:", "- uses:", "- run:"].iter().any(|start| {
+      line
+        .strip_prefix("      ")
+        .is_some_and(|l| l.starts_with(start))
+    }) {
+      steps.push(String::new());
+    }
+    if let Some(step) = steps.last_mut() {
+      step.push_str(line);
+      step.push('\n');
+    }
+  }
+  steps
 }
 
 fn field<'a>(table: &'a LockTable, key: &str) -> Option<&'a str> {
@@ -307,4 +351,85 @@ fn ci_runs_the_ced_gates_for_exactly_the_size_the_lock_stages() {
      ({list_filter:?}), so a deleted or renamed `{size}` module could still count the other \
      sizes' gates and then run none"
   );
+}
+
+/// GitHub's default step condition is `success()`, so one red step marks every
+/// step after it `skipped` — and `skipped` is silent. `model-tests` ran that
+/// way for four weeks: a stale assertion in the whisper suite went red the day
+/// it merged, and the four gate steps below it (Whisper+VAD, granite, SigLIP,
+/// CED) have between them never executed on CI at all — each was added after
+/// the step above it was already permanently red.
+///
+/// These gates are independent — a corrupt granite bundle says nothing about
+/// whether the CED graph loads — so each carries [`GATE_GUARD`] and reports its
+/// own verdict. A failed DOWNLOAD is the one genuine dependency and still
+/// short-circuits them all.
+///
+/// ci.yml's own `Gate ledger` step catches a gate that did not run, but only on
+/// a run where something else already failed; in a green run a gate step added
+/// without the guard is invisible until the day it matters. This catches that
+/// at authoring time, in the modelless `check` job.
+#[test]
+fn ci_model_tests_gates_cannot_be_silently_skipped() {
+  let Some((_, workflow_path)) = repo_files() else {
+    return;
+  };
+  let ci_contents = fs::read_to_string(workflow_path).expect(".github/workflows/ci.yml reads");
+  let steps = model_tests_steps(&ci_contents);
+
+  let download = steps
+    .iter()
+    .position(|step| step.contains("id: download"))
+    .expect("ci.yml's model-tests job has no step with `id: download`");
+  let (gates, ledger) = steps[download + 1..]
+    .split_last()
+    .map(|(last, rest)| (rest, last))
+    .expect("ci.yml's model-tests job has no steps after the download");
+
+  assert!(
+    ledger.contains("name: Gate ledger") && ledger.contains("if: ${{ !cancelled() }}"),
+    "ci.yml's model-tests job must END with the `Gate ledger` step, guarded by `!cancelled()` \
+     alone so it reports even when the download died and took every gate with it; its last step \
+     is instead:\n{ledger}"
+  );
+
+  // Vacuum guard: a parse that produced no steps would pass every loop below.
+  // These five are the gate steps the four-week outage darkened.
+  for gate in [
+    "name: Whisper model gates",
+    "name: Whisper + Silero-VAD composition gates",
+    "name: Granite model gates",
+    "name: SigLIP tokenizer gates",
+    "name: CED model gates (tiny)",
+  ] {
+    assert!(
+      gates.iter().any(|step| step.contains(gate)),
+      "ci.yml's model-tests job has no `{gate}` step after the download — either it was removed, \
+       or this test stopped parsing the job (it found {} step(s))",
+      gates.len()
+    );
+  }
+
+  for step in gates {
+    assert!(
+      step.contains(GATE_GUARD),
+      "this model-tests step does not carry `{GATE_GUARD}`, so a failure in any step before it \
+       marks it `skipped` and the job reports nothing about the gate that never ran:\n{step}"
+    );
+    let id = step
+      .lines()
+      .find_map(|line| line.trim().strip_prefix("id: "))
+      .unwrap_or_else(|| {
+        panic!(
+          "this model-tests step has no `id:`, so the `Gate ledger` step cannot \
+           report whether it ran:\n{step}"
+        )
+      });
+    let entry = format!("=${{{{ steps.{id}.outcome }}}}");
+    assert!(
+      ledger.contains(&entry),
+      "the `Gate ledger` step never reads step {id:?} ({entry:?}), so that gate could be skipped \
+       without the job saying so"
+    );
+  }
 }
