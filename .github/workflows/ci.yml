@@ -134,6 +134,7 @@ jobs:
             Models/tokenizers/whisper-tiny
             Models/embedkit-granite/granite-97m-multilingual-r2
             Models/siglip2-naflex/siglip2-base-patch16-naflex-512
+            Models/ced/ced-tiny
           key: models-${{ hashFiles('MODELS_LOCK') }}
       - name: Download models (cache miss)
         if: steps.models.outputs.cache-hit != 'true'
@@ -141,14 +142,15 @@ jobs:
           set -euo pipefail
 
           # MODELS_LOCK is the source of truth for what gets downloaded, not
-          # just a cache-busting key: it has a fixed four-table shape (the
+          # just a cache-busting key: it has a fixed five-table shape (the
           # whisperkit-coreml model repo, selector field `include`; the
           # tokenizer repo, selector field `files`; the embedkit-coreml granite
           # repo, selector field `include`; the siglip2-naflex-coreml tokenizer
-          # sidecar, selector field `include`), each with its own `revision`.
+          # sidecar, selector field `include`; the cedkit-coreml `ced-tiny`
+          # bundle, selector field `include`), each with its own `revision`.
           # Pull repo/selector/revision out by hand instead of hardcoding them
           # here, so a MODELS_LOCK edit is what changes what this job downloads
-          # — no TOML crate needed for four fixed tables. Tables are selected by
+          # — no TOML crate needed for five fixed tables. Tables are selected by
           # INDEX, so appending is safe but reordering MODELS_LOCK is not.
           lock=MODELS_LOCK
 
@@ -181,6 +183,9 @@ jobs:
           siglip_repo=$(table_header 4)
           siglip_include=$(table_field 4 include)
           siglip_revision=$(table_field 4 revision)
+          ced_repo=$(table_header 5)
+          ced_include=$(table_field 5 include)
+          ced_revision=$(table_field 5 revision)
 
           # Index-selected tables mean an APPENDED table this parser does not
           # know about is silently ignored — MODELS_LOCK would say CI downloads
@@ -189,8 +194,8 @@ jobs:
           # it. Pin the count so teaching the lock a new table forces teaching
           # the parser too.
           table_count=$(sed -n 's/^\["\(.*\)"\]$/\1/p' "$lock" | grep -c . || true)
-          if [ "$table_count" -ne 4 ]; then
-            echo "::error::MODELS_LOCK has $table_count tables but this parser handles exactly 4 — a table was added or removed without updating the download step, so it would be silently ignored" >&2
+          if [ "$table_count" -ne 5 ]; then
+            echo "::error::MODELS_LOCK has $table_count tables but this parser handles exactly 5 — a table was added or removed without updating the download step, so it would be silently ignored" >&2
             exit 1
           fi
 
@@ -198,6 +203,7 @@ jobs:
           echo "MODELS_LOCK: tokenizer=$tokenizer_repo@$tokenizer_revision files=$tokenizer_files"
           echo "MODELS_LOCK: granite=$granite_repo@$granite_revision include=$granite_include"
           echo "MODELS_LOCK: siglip=$siglip_repo@$siglip_revision include=$siglip_include"
+          echo "MODELS_LOCK: ced=$ced_repo@$ced_revision include=$ced_include"
 
           # Fail LOUD on any empty extraction: `hf download repo` with no
           # selector silently fetches the WHOLE repository, so a future
@@ -205,7 +211,8 @@ jobs:
           # different content than the lock intends.
           for v in model_repo model_include model_revision tokenizer_repo tokenizer_files tokenizer_revision \
                    granite_repo granite_include granite_revision \
-                   siglip_repo siglip_include siglip_revision; do
+                   siglip_repo siglip_include siglip_revision \
+                   ced_repo ced_include ced_revision; do
             if [ -z "${!v}" ]; then
               echo "::error::MODELS_LOCK parse produced empty '$v' — format drift? fix the lock or the parser" >&2
               exit 1
@@ -236,6 +243,15 @@ jobs:
           # and stay local/dev gates.
           hf download "$siglip_repo" --include "$siglip_include" --revision "$siglip_revision" \
             --local-dir Models/siglip2-naflex
+          # `ced-tiny` ALONE — 10.64 MB of the artifact repo's 234 MB. The four
+          # CED sizes are I/O-identical (they differ only in transformer width),
+          # so tiny exercises every gate the others would, and `ced-base` at
+          # 163.62 MB is why this family cannot be committed like vadkit was.
+          # `include` keeps the bundle's size directory, so `--local-dir
+          # Models/ced` lands the tree at Models/ced/ced-tiny/ced_tiny.mlmodelc
+          # — the layout tests/ced/common/mod.rs resolves without CED_TEST_MODELS.
+          hf download "$ced_repo" --include "$ced_include" --revision "$ced_revision" \
+            --local-dir Models/ced
       # Runs on EVERY run, not just cache misses, so a truncated download AND a
       # tampered or partially-restored cache entry both fail here rather than
       # surfacing later as a confusing parity or model_io failure. The bundle
@@ -253,13 +269,32 @@ jobs:
           fi
           cd "$bundle_root"
           shasum -a 256 -c CHECKSUMS.sha256
+      # Same contract as the granite step above — every run, not just cache
+      # misses — with one layout difference that is easy to get silently wrong:
+      # CED's `CHECKSUMS.sha256` lists paths relative to the `.mlmodelc` ROOT
+      # (`model.mil`, `weights/weight.bin`), not to the `ced-tiny/` directory it
+      # sits in (granite's are relative to the directory holding the checksum
+      # file). So this `cd`s INTO the bundle and reads the checksum file from
+      # its parent. Verifying from `ced-tiny/` instead would report five
+      # "No such file or directory" lines, which `shasum -c` exits non-zero on —
+      # fail-closed either way, but loudly wrong rather than quietly wrong.
+      - name: Verify CED artifact checksums
+        run: |
+          set -euo pipefail
+          bundle=Models/ced/ced-tiny/ced_tiny.mlmodelc
+          if [ ! -d "$bundle" ]; then
+            echo "::error::$bundle is absent after download/cache-restore — the CED model gates would have nothing to run against" >&2
+            exit 1
+          fi
+          cd "$bundle"
+          shasum -a 256 -c ../CHECKSUMS.sha256
       # build.rs UN-ignores the fp16 graph sweep
       # (`every_shipped_model_graph_survives_fp16`) when Models/ is present, so
       # the `-- --ignored` (ignored-ONLY) runs below EXCLUDE it exactly when the
       # models are here — and the modelless `check` job skips it too (ignored
       # there). Run the coremlit sweep binary's ordinary suite here so a newly
-      # vanishing fp16 guard cannot merge green. This runner downloads WHISPER
-      # and GRANITE ONLY (per MODELS_LOCK), so COREMLIT_FP16_SWEEP_VENDORS
+      # vanishing fp16 guard cannot merge green. This runner downloads WHISPER,
+      # GRANITE and CED-TINY (per MODELS_LOCK), so COREMLIT_FP16_SWEEP_VENDORS
       # narrows the vendor manifest to exactly the vendors staged here
       # (fail-closed: unset would demand EVERY pinned vendor), plus `vadkit`,
       # which needs no download — it is committed, so requiring it here makes
@@ -267,6 +302,12 @@ jobs:
       # of the sweep's second clean control. Naming them ALL is what makes a
       # vanished vendor tree a failure instead of a quiet drop in coverage; the
       # absent speakerkit/alignkit/argmax vendors stay the documented escape.
+      # `ced` is a THIRD clean control: the sweep walks Models/ whole, so the
+      # staged CED graph is audited either way — naming it in the manifest is
+      # what turns "the CED download vanished" into a failure instead of a
+      # silent loss of that coverage. `siglip2-naflex` is deliberately NOT here:
+      # MODELS_LOCK stages its tokenizer sidecar alone, so that vendor tree
+      # holds no `.mlmodelc` for the sweep to audit.
       # fp16_guards is a core test — no feature needed. See the
       # coverage-boundary note in crates/coremlit/tests/fp16_guards.rs.
       #
@@ -274,7 +315,7 @@ jobs:
       # runner has downloaded vendors, so build.rs emits cfg(models_present) and
       # the walk covers all of Models/, vadkit included. The modelless
       # check/features jobs deliberately leave the sweep #[ignore]d (build.rs).
-      - run: COREMLIT_FP16_SWEEP_VENDORS=whisperkit-coreml,embedkit-granite,vadkit cargo test -p coremlit --test fp16_guards
+      - run: COREMLIT_FP16_SWEEP_VENDORS=whisperkit-coreml,embedkit-granite,vadkit,ced cargo test -p coremlit --test fp16_guards
       - run: crates/coremlit/tests/fp16_sweep_inventory.sh
       # Core model-gated suite (tiny_model etc., whisper-tiny via
       # WHISPERKIT_TEST_MODELS); then the whisper pipeline's model-gated suite.
@@ -371,3 +412,36 @@ jobs:
           fi
           echo "== siglip_tokenizer_identity: $listed gate(s) =="
           cargo test -p coremlit --features siglip --test siglip_tokenizer_identity -- --ignored
+      # The CED model gates — TINY ONLY, and the filter is not optional.
+      #
+      # Each `tests/ced/*` target declares its gates FOUR TIMES, one `#[ignore]`d
+      # module per size (`tiny::`/`mini::`/`small::`/`base::`), and an
+      # ignored-ONLY run selects ALL FOUR. MODELS_LOCK stages `ced-tiny` alone
+      # (10.64 MB of 234 MB — see its comment), so a bare `-- --ignored` here
+      # would run 32 gates against one staged bundle and fail 24 of them on a
+      # missing `.mlmodelc`. The `tiny::` filter is what makes a per-size lock
+      # entry mean a per-size CI run; MODELS_LOCK's `include` and this filter
+      # move together, pinned by tests/whisper/models_lock.rs.
+      #
+      # Same two vacuum holes as the granite/siglip steps, closed the same way,
+      # with one addition: the `--list --ignored` count is taken THROUGH THE SAME
+      # FILTER as the run. Counting the unfiltered list would let a renamed or
+      # deleted `tiny` module still report the OTHER three sizes' gates as a
+      # non-zero count and then run zero — the exact vacuum the guard refuses.
+      - name: CED model gates (tiny)
+        run: |
+          set -euo pipefail
+          bundle=Models/ced/ced-tiny/ced_tiny.mlmodelc
+          if [ ! -d "$bundle" ]; then
+            echo "::error::CED bundle $bundle is absent — the model gates below must FAIL here, never skip" >&2
+            exit 1
+          fi
+          for target in ced_model_io ced_parity_logits ced_placement ced_e2e; do
+            listed=$(cargo test -p coremlit --features ced --test "$target" -- --list --ignored tiny:: 2>/dev/null | grep -c ': test$' || true)
+            if [ "$listed" -eq 0 ]; then
+              echo "::error::$target lists 0 ignored tiny:: tests — it failed to build, or its tiny model gates were deleted, renamed, or un-ignored, so an ignored-only run would pass vacuously" >&2
+              exit 1
+            fi
+            echo "== $target: $listed tiny model gate(s) =="
+            cargo test -p coremlit --features ced --test "$target" -- --ignored tiny::
+          done

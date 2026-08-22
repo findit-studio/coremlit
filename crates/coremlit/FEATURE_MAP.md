@@ -123,6 +123,16 @@ gates call no `Model::load`, so the towers would buy them nothing. The
 tower-dependent siglip gates (`model_io`, `text_model_io`, `parity_embed`,
 `placement`, `e2e`) still run only locally.
 
+`ced` has no tokenizer, but the same split applies to its model gates: the
+`features` job runs the hermetic `ced` suite, and the model-gated
+`ced_model_io`/`ced_parity_logits`/`ced_placement`/`ced_e2e` targets belong to
+`model-tests`, which stages the artifact via `MODELS_LOCK`. The entry is
+`ced-tiny` ALONE — 10.64 MB of the repo's 234 MB, since the four sizes are
+I/O-identical and `ced-base` at 163.62 MB is past GitHub's 100 MB file limit
+that let vadkit be committed instead. Each target declares its gates once per
+size, so the CI step filters on `tiny::`; the `mini`/`small`/`base` gates stay
+local/dev gates against an owner-staged `CED_TEST_MODELS` tree.
+
 ## Curated CI parity-oracle list
 
 The three third-party oracles get their own CI job (`parity`), which runs
