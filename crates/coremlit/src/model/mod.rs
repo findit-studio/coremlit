@@ -212,7 +212,7 @@ impl Model {
   /// [`Self::predict_with`] and [`Self::predict_with_state`]. These three
   /// are the only places this crate crosses into CoreML's prediction API,
   /// and every kit — whisper, speaker, siglip, granite, clap, vad, ced,
-  /// align — reaches the ANE through one of them, so draining here bounds
+  /// align — reaches CoreML through one of them, so draining here bounds
   /// every consumer at once rather than one caller's loop.
   ///
   /// A pool is needed because a Rust binary has no ambient one. Objective-C
@@ -343,10 +343,14 @@ impl Model {
     Ok(PathBuf::from(path.to_string()))
   }
 
-  /// Loads a model and immediately drops it.
+  /// Loads a model and immediately drops it, so the cost of a first load is
+  /// paid where the caller puts it rather than inside a later one.
   ///
-  /// Serializes ANE compilation and caps peak memory before a real
-  /// concurrent load — ports Swift's `prewarmMode`.
+  /// Ports Swift's `prewarmMode`. The body is exactly [`Self::load`] followed
+  /// by a drop: it takes no lock, compiles nothing, and bounds nothing on its
+  /// own. Whether a later load is cheaper for having run this depends on what
+  /// CoreML caches, which this crate does not measure; any serialization comes
+  /// from the caller invoking it before the loads it cares about.
   ///
   /// # Errors
   /// As [`Self::load`].

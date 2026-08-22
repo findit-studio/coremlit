@@ -1113,7 +1113,7 @@ fn fluidaudio_extraction(
     .expect("FluidAudioSource::extract")
 }
 
-/// speakerkit's argmax source over the given variant/placement.
+/// speakerkit's argmax source over the given variant and compute-unit request.
 fn argmax_extraction(
   root: &Path,
   samples: &[f32],
@@ -1721,36 +1721,36 @@ fn argmax_source_der_characterization() {
 // C — compute-unit DER: shipping default (All) vs CpuOnly (§5.3)
 // ══════════════════════════════════════════════════════════════════════
 
-/// The standard-collar disagreement BETWEEN two compute placements of the SAME
-/// pipeline — `der_std(cpu, all)`, scoring one placement's spans directly
-/// against the other's. Zero `err_units` is the real "placement changed no
+/// The standard-collar disagreement BETWEEN the two compute-unit REQUESTS of the
+/// SAME pipeline — `der_std(cpu, all)`, scoring one request's spans directly
+/// against the other's. Zero `err_units` is the real "the request changed no
 /// DECISION" statement: not one standard-collar-scored speaker-frame is labelled
-/// differently by the two placements.
+/// differently by the two.
 ///
 /// It is STRICTLY stronger than the ΔDER bound the study also applies. ΔDER
 /// compares two distances-to-reference — `|der_std(ref, all) − der_std(ref,
-/// cpu)|`, two scalars — and is zero whenever the placements are EQUALLY far
+/// cpu)|`, two scalars — and is zero whenever the two are EQUALLY far
 /// from the reference, INCLUDING when CpuOnly errs on frame A and All errs on a
-/// disjoint frame B for the same total. Only comparing the placements to EACH
+/// disjoint frame B for the same total. Only comparing the two arms to EACH
 /// OTHER catches that (the hermetic test below constructs exactly that case).
 ///
 /// Pure over the two segmentations, so the hermetic example exercises the very
 /// function the live gate asserts on.
-fn placement_disagreement(cpu: &[Seg], all: &[Seg]) -> der_calc::Der {
+fn request_disagreement(cpu: &[Seg], all: &[Seg]) -> der_calc::Der {
   der_std(cpu, all)
 }
 
-/// The gap the ΔDER bound leaves open, closed hermetically: two placements can
+/// The gap the ΔDER bound leaves open, closed hermetically: two arms can
 /// be EQUALLY far from the reference (ΔDER = 0, the bound's pass condition)
 /// while disagreeing with EACH OTHER on every one of those frames. CpuOnly drops
 /// a 10 s span here, All drops a DIFFERENT 10 s span there; each scores an
 /// identical miss against the reference, so ΔDER is exactly zero — yet the
-/// placements share no decision on either span. Only [`placement_disagreement`]
-/// (comparing the placements to each other) sees it, which is why the live gate
+/// arms share no decision on either span. Only [`request_disagreement`]
+/// (comparing the two arms to each other) sees it, which is why the live gate
 /// asserts that, not just ΔDER. Reverting the live gate to the ΔDER bound alone
 /// re-opens this hole.
 #[test]
-fn equal_delta_der_hides_disjoint_placement_errors() {
+fn equal_delta_der_hides_disjoint_arm_errors() {
   // One reference speaker across the whole clip, so the hypothesis "errors" are
   // pure MISS (a silent gap) — no speaker mapping to reason about, and the
   // reference's only boundaries (0 s, 200 s) keep both gaps clear of the collar.
@@ -1785,7 +1785,7 @@ fn equal_delta_der_hides_disjoint_placement_errors() {
     },
   ];
 
-  // Each placement misses an identical 10 s (1000-frame) span against the
+  // Each arm misses an identical 10 s (1000-frame) span against the
   // reference, so their DISTANCES to the reference are equal — ΔDER is exactly
   // zero and the old bound passes.
   let cpu_vs_ref = der_std(&reference, &cpu);
@@ -1793,11 +1793,11 @@ fn equal_delta_der_hides_disjoint_placement_errors() {
   assert_eq!(
     cpu_vs_ref.err_units(),
     all_vs_ref.err_units(),
-    "the two placements must be constructed EQUALLY far from the reference"
+    "the two arms must be constructed EQUALLY far from the reference"
   );
   assert!(
     cpu_vs_ref.err_units() > 0,
-    "both placements must really err (else there is nothing for ΔDER to hide)"
+    "both arms must really err (else there is nothing for ΔDER to hide)"
   );
   assert_eq!(
     (all_vs_ref.der - cpu_vs_ref.der).abs(),
@@ -1805,20 +1805,20 @@ fn equal_delta_der_hides_disjoint_placement_errors() {
     "ΔDER is exactly zero — the aggregate bound the study also applies waves this through"
   );
 
-  // But the placements disagree with EACH OTHER on both spans (CpuOnly's gap is
+  // But the arms disagree with EACH OTHER on both spans (CpuOnly's gap is
   // All's speech and vice-versa): the pairwise err units are non-zero, so the
   // live `== 0` assertion fires exactly where the ΔDER bound could not.
-  let pairwise = placement_disagreement(&cpu, &all);
+  let pairwise = request_disagreement(&cpu, &all);
   assert!(
     pairwise.err_units() > 0,
-    "disjoint placement errors must surface as pairwise disagreement, got {} units — the live \
+    "disjoint per-arm errors must surface as pairwise disagreement, got {} units — the live \
      gate would miss a real decision change",
     pairwise.err_units()
   );
 }
 
 /// §5.3, asserted for BOTH sources: does running on the shipping default
-/// (`All` — the ANE gets first pick) change a diarization DECISION, or only
+/// (`All`) change a diarization DECISION, or only
 /// jitter span boundaries that DER absorbs?
 ///
 /// The verdict (pairwise standard-collar DER = 0.0000 %, speaker counts
@@ -1827,37 +1827,45 @@ fn equal_delta_der_hides_disjoint_placement_errors() {
 /// half of the study with no assertion at all, i.e. it could have diverged
 /// arbitrarily and still passed.
 ///
-/// The placement really is exercised (not silently falling back to CPU): the
-/// strict no-collar jitter between the two placements is NON-zero (0.12-0.29 %),
-/// which an identical execution could not produce. And the decision-equivalence
-/// is asserted DIRECTLY — the two placements are scored against EACH OTHER
+/// The strict no-collar jitter between the two arms is NON-zero (0.12-0.29 %).
+/// That is a statement about OUTPUTS and nothing else: the two compute-unit
+/// requests did not produce identical spans. It does not establish that they ran
+/// on different devices, or on different paths — run-to-run nondeterminism on one
+/// path produces the same signal. This crate has no residency telemetry;
+/// establishing where either arm executed would require runtime instrumentation
+/// this test does not have, and that limitation is not scheduled work.
+/// The decision-equivalence
+/// is asserted DIRECTLY — the two arms are scored against EACH OTHER
 /// (`der_std(cpu, all).err_units() == 0`), not merely shown equally far from the
-/// reference: an equal distance-to-reference passes even when each placement errs
+/// reference: an equal distance-to-reference passes even when each arm errs
 /// on DIFFERENT frames. So they agree on every standard-collar-scored frame and
 /// differ only inside the collar. That pairwise zero is reachable only because
-/// both placements score 0.0000 % standard-collar DER against the reference on
+/// both arms score 0.0000 % standard-collar DER against the reference on
 /// these ≤2-speaker clips (mutual exactness ⇒ pairwise agreement); a nonzero-DER
 /// clip could expose a real decision change, which this assertion would pin
 /// rather than absorb.
 #[test]
-#[ignore = "requires Models/speakerkit (+ argmax) + sibling diarization + ort; runs the ANE"]
+#[ignore = "requires Models/speakerkit (+ argmax) + sibling diarization + ort; runs the default `All` compute-unit request"]
 fn compute_unit_der_study_all_vs_cpuonly() {
   let plda_dc = load_plda_diaric();
   let argmax_root = argmax_models_root();
 
-  // Finding 4: a per-source WITNESS that the ANE placement was genuinely
-  // exercised. Every upper bound below (ΔDER, speaker count, strict tripwire) is
-  // satisfied by ZERO jitter — i.e. by both arms silently running the SAME
-  // placement (a CPU fallback), which is exactly what would make "All is
-  // decision-equivalent to CpuOnly" a vacuous claim (the README says the
-  // placement is genuinely exercised; without this, the test does not check it).
-  // So the strict no-collar jitter must be NON-zero on at least one pinned
-  // fixture per source. Weakest sufficient witness: non-zero err_units on ANY
-  // fixture — NOT a magnitude bound — measured 0.12-0.29 % here, four
-  // independent chances per source. TRADE-OFF: this is a new gate that would
-  // flake if Apple ever made this graph bit-identical across ANE and CPU; the
-  // floor is deliberately the weakest thing that still tells "the ANE ran"
-  // apart from "it didn't", so it fires only on a true no-op placement.
+  // A per-source non-vacuity check on the OUTPUTS: the two compute-unit requests
+  // must not produce identical spans on every fixture. Every upper bound below
+  // (ΔDER, speaker count, strict tripwire) is satisfied by ZERO jitter, i.e. by
+  // two runs that agree exactly, which would make "All is decision-equivalent to
+  // CpuOnly" a claim about nothing. So the strict no-collar jitter must be
+  // NON-zero on at least one pinned fixture per source: non-zero err_units on ANY
+  // fixture, NOT a magnitude bound — measured 0.12-0.29 % here, four independent
+  // chances per source.
+  //
+  // What this does NOT show, and must not be read as showing: which device
+  // either arm ran on, or that they ran on different devices or different paths.
+  // Non-identical output is equally consistent with one path executing
+  // nondeterministically. Only the outputs are observed.
+  //
+  // TRADE-OFF: this would flake if Apple ever made this graph bit-identical
+  // across every compute-unit request.
   let mut strict_jitter_units: BTreeMap<&str, u64> = BTreeMap::new();
 
   for name in e2e_fixture_names() {
@@ -1868,8 +1876,9 @@ fn compute_unit_der_study_all_vs_cpuonly() {
       samples.len()
     );
 
-    // Only the placement varies (precision fixed), so ΔDER isolates the
-    // ANE-vs-CPU scheduling drift (spec §5.3).
+    // Only the compute-unit REQUEST varies (precision fixed), so ΔDER isolates
+    // the effect of that request on the output (spec §5.3). What CoreML did with
+    // either request is not observed here.
     let fa_cpu = diarize_extraction_segs(
       &fluidaudio_extraction(
         &samples,
@@ -1920,12 +1929,12 @@ fn compute_unit_der_study_all_vs_cpuonly() {
       let delta = (all_der.der - cpu_der.der).abs();
       let jitter_full = der_strict(cpu, all);
       let jitter = jitter_full.der;
-      // The DIRECT decision-equivalence metric: the two placements scored
+      // The DIRECT decision-equivalence metric: the two arms scored
       // against EACH OTHER on the standard collar (finding: aggregate ΔDER is
       // not decision agreement). Computed here so it is reported every run, and
       // asserted `== 0` below.
-      let pairwise = placement_disagreement(cpu, all);
-      // Record the placement-exercised witness for this source (finding 4).
+      let pairwise = request_disagreement(cpu, all);
+      // Accumulate the per-source output-difference floor checked after the loop.
       let w = strict_jitter_units.entry(tag).or_insert(0);
       *w = (*w).max(jitter_full.err_units());
       let (n_cpu, n_all) = (distinct_speakers(cpu).len(), distinct_speakers(all).len());
@@ -1938,7 +1947,7 @@ fn compute_unit_der_study_all_vs_cpuonly() {
         fmt_der(&format!("{tag} All     vs ref"), &all_der)
       );
       println!(
-        "[{name}] §5.3 {tag}: ΔDER(All−CpuOnly vs ref) = {:+.4}% (bound {:.4}%) | placement \
+        "[{name}] §5.3 {tag}: ΔDER(All−CpuOnly vs ref) = {:+.4}% (bound {:.4}%) | \
          strict jitter (All vs CpuOnly spans) = {:.4}% (tripwire {:.4}%) | PAIRWISE All-vs-CpuOnly \
          standard DER = {:.4}% ({} err units, {} confusion) | speaker counts All={n_all} \
          CpuOnly={n_cpu}",
@@ -1952,10 +1961,10 @@ fn compute_unit_der_study_all_vs_cpuonly() {
       );
 
       // §5.3 decision 4, in force. The DER-level analogue of the tensor gate's
-      // `slot_diffs == 0`: the placement must not add or drop a speaker...
+      // `slot_diffs == 0`: the compute-unit request must not add or drop a speaker...
       assert_eq!(
         n_all, n_cpu,
-        "{name}/{tag}: compute-unit placement changed the speaker count (All {n_all} vs \
+        "{name}/{tag}: the compute-unit request changed the speaker count (All {n_all} vs \
          CpuOnly {n_cpu}) — that is a DECISION change, not the boundary jitter §5.3 accepted. \
          The shipping default does not diarize like the gated configuration."
       );
@@ -1968,13 +1977,13 @@ fn compute_unit_der_study_all_vs_cpuonly() {
         (all_der.der - cpu_der.der) * 100.0,
         PARITY_DER_MAX * 100.0
       );
-      // ...and — the DIRECT form of that claim — the two placements must agree
+      // ...and — the DIRECT form of that claim — the two arms must agree
       // with EACH OTHER, not merely be equally far from the reference. The ΔDER
       // bound above compares two distances-to-reference; it passes the disjoint-
       // error case (CpuOnly wrong on frame A, All wrong on frame B, same total).
       // This is the sibling shipping gate's `der_std(a, b).err_units() == 0`
-      // pattern (parity_shipping_der.rs), scoring the placements against each
-      // other. It is reachable-at-zero here only because both placements score 0
+      // pattern (parity_shipping_der.rs), scoring the two arms against each
+      // other. It is reachable-at-zero here only because both arms score 0
       // against the reference on these ≤2-speaker clips (mutual exactness ⇒
       // pairwise agreement); a clip with nonzero DER could make this positive,
       // and that would be a real decision change to PIN, never to loosen.
@@ -1982,9 +1991,9 @@ fn compute_unit_der_study_all_vs_cpuonly() {
         pairwise.err_units(),
         0,
         "{name}/{tag}: CpuOnly and All disagree on {} standard-collar speaker-frame(s) ({:.4}% \
-         pairwise DER, {} of them confusion) — the shipping placement changed a DECISION, not just \
+         pairwise DER, {} of them confusion) — the shipping request changed a DECISION, not just \
          sub-collar span jitter. Equal ΔDER against the reference does NOT imply this: each \
-         placement can err on different frames for the same aggregate. Do NOT loosen; if this is a \
+         arm can err on different frames for the same aggregate. Do NOT loosen; if this is a \
          genuine nonzero-DER clip, pin the measured value and narrow the §5.3 claim.",
         pairwise.err_units(),
         pairwise.der * 100.0,
@@ -1994,7 +2003,7 @@ fn compute_unit_der_study_all_vs_cpuonly() {
       // tripwire the parity gate uses.
       assert!(
         jitter <= STRICT_JITTER_TRIPWIRE,
-        "{name}/{tag}: strict placement jitter {:.4}% exceeds the gross-regression tripwire \
+        "{name}/{tag}: strict inter-arm jitter {:.4}% exceeds the gross-regression tripwire \
          {:.4}% — far past the sub-collar drift §5.3 measured.",
         jitter * 100.0,
         STRICT_JITTER_TRIPWIRE * 100.0
@@ -2002,22 +2011,23 @@ fn compute_unit_der_study_all_vs_cpuonly() {
     }
   }
 
-  // Finding 4: the placement-exercised witness, one per claimed source. A source
+  // A per-source floor on OUTPUT difference, one per claimed source. A source
   // that showed ZERO strict jitter across EVERY pinned fixture produced
-  // bit-identical All and CpuOnly spans — the ANE never diverged from the CPU,
-  // so "All is decision-equivalent to CpuOnly" would be vacuously true here (it
-  // is only meaningful once All has been observed doing something different).
-  // The upper bounds above cannot catch this; only a non-zero floor can. See the
-  // accumulator's comment for the (deliberately accepted) flake trade-off.
+  // bit-identical All and CpuOnly spans — the two requests produced the same
+  // output everywhere, so "All is decision-equivalent to CpuOnly" would be
+  // vacuously true (it is only meaningful once the two have been observed
+  // producing anything different). The upper bounds above cannot catch this;
+  // only a non-zero floor can. See the accumulator's comment for the
+  // (deliberately accepted) flake trade-off.
   for tag in ["fluidaudio", "argmax"] {
     let units = strict_jitter_units.get(tag).copied().unwrap_or(0);
     assert!(
       units > 0,
-      "{tag}: strict All-vs-CpuOnly jitter was ZERO on every pinned fixture — the two placements \
-       produced bit-identical spans, so ComputeUnits::All never actually diverged from the CPU on \
-       this source. This study cannot claim 'All is decision-equivalent to CpuOnly' when it never \
-       observed All doing anything different: either the ANE silently fell back to CPU, or the \
-       fixtures stopped exercising it. Investigate before trusting the ΔDER=0 result (finding 4)."
+      "{tag}: strict All-vs-CpuOnly jitter was ZERO on every pinned fixture — the two compute-unit \
+       requests produced bit-identical spans on this source. This study cannot claim 'All is \
+       decision-equivalent to CpuOnly' when it never observed the two producing anything \
+       different; the fixtures may have stopped distinguishing them. Investigate before trusting \
+       the ΔDER=0 result."
     );
   }
 }
@@ -2030,12 +2040,12 @@ fn compute_unit_der_study_all_vs_cpuonly() {
 ///
 /// Three pipelines over ONE audio buffer — dia-ort (the oracle), FluidAudio and
 /// argmax, all `CpuOnly` (the fidelity control: dia-ort runs the ONNX CPU EP, so
-/// matching the placement is what isolates the CONVERSION and EMBEDDING axes from
-/// the PLACEMENT axis, which is Part C's job). One consequence worth stating
+/// matching the compute-unit request is what isolates the CONVERSION and EMBEDDING axes from
+/// the COMPUTE-UNIT axis, which is Part C's job). One consequence worth stating
 /// plainly rather than burying: this gate therefore does NOT prove anything about
-/// the shipping `All` placement on multi-speaker audio. Part C proves `All` is
+/// the shipping `All` request on multi-speaker audio. Part C proves `All` is
 /// decision-equivalent on ≤2-speaker clips; extending that to ≥3 speakers is
-/// inferred, not measured. Recorded in the crate README as an open item.
+/// inferred, not measured.
 ///
 /// Everything is asserted through [`assert_clip_pins`] — the same scoring Part B
 /// applies to the ≤2-speaker clips, so the easy and hard halves of the

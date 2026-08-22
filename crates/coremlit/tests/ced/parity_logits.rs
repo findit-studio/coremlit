@@ -13,14 +13,13 @@
 //! on this machine (Apple silicon) against the shipped fp16 artifacts and pinned
 //! with margin — never loosened; a shift in either direction is a finding.
 //!
-//! The **CpuOnly** arm is PRIMARY: the shipped graph is fp16, but CoreML computes
-//! it in ~fp32 on the CPU, making this the deterministic REFERENCE arm vs the
-//! PyTorch fp32 goldens (residual = the Rust f64 mel vs the torchaudio f32 mel +
-//! the fp16 weight quantization) — reference, not tightest: the measured envelope
-//! shows the **default-compute** (`All` ⇒ ANE/GPU) arm actually lands closer to
-//! the goldens (worst cos 0.99999988 vs CpuOnly's 0.99999803), characterized in
-//! its own band below. Negative control: a mismatched clip↔golden pair scores
-//! far below the matched floor.
+//! The **`CpuOnly`** arm is PRIMARY — the reference the other arm is read
+//! against. Both arms load the same shipped fp16 artifact and differ only in the
+//! requested [`ComputeUnits`]; the goldens are PyTorch fp32. Reference, not
+//! tightest: the measured envelope shows the **default-compute** (`All`) arm
+//! landing closer to the goldens (worst cos 0.99999988 vs `CpuOnly`'s
+//! 0.99999803), characterized in its own band below. Negative control: a
+//! mismatched clip↔golden pair scores far below the matched floor.
 
 mod common;
 
@@ -38,10 +37,10 @@ use common::GoldenClip;
 //   mismatch : cos(sine440 logits, silence golden) ≤ 0.9886
 // max|Δlogit| is a single-outlier-logit metric under fp16 (top-1/top-10 stay exact and cosine
 // stays ~1.0), so its ceiling carries ~2× margin; cosine is the tight, meaningful floor.
-// CpuOnly (PRIMARY): the fp16 graph computed on the CPU vs the PyTorch fp32 goldens.
+// CpuOnly (PRIMARY): the shipped fp16 artifact vs the PyTorch fp32 goldens.
 const CPU_COS_FLOOR: f32 = 0.9999;
 const CPU_MAXABS_CEIL: f32 = 0.30;
-// default-compute (All ⇒ ANE/GPU): true fp16, CHARACTERIZED in its own wider band.
+// default-compute (`All`): the same artifact, CHARACTERIZED in its own wider band.
 const DEFAULT_COS_FLOOR: f32 = 0.999;
 const DEFAULT_MAXABS_CEIL: f32 = 0.10;
 // Negative control: a mismatched clip↔golden pair must fall below this (measured ≤ 0.9886).
@@ -167,9 +166,10 @@ fn parity_arm(
   );
 }
 
-/// PRIMARY: the CpuOnly arm holds the tight logit-parity band vs the PyTorch fp32
-/// goldens.
-fn fp32_cpu_arm(model: CedModel) {
+/// PRIMARY: the `CpuOnly` arm holds the tight logit-parity band vs the PyTorch
+/// fp32 goldens. Only the GOLDENS are fp32 — this arm loads the same shipped fp16
+/// artifact every other arm does.
+fn cpu_only_arm(model: CedModel) {
   parity_arm(
     model,
     ComputeUnits::CpuOnly,
@@ -179,7 +179,7 @@ fn fp32_cpu_arm(model: CedModel) {
   );
 }
 
-/// CHARACTERIZED: the default-compute (fp16, ANE/GPU) arm in its own wider band.
+/// CHARACTERIZED: the default-compute (`All`) arm in its own wider band.
 fn default_compute_arm(model: CedModel) {
   parity_arm(
     model,
@@ -197,8 +197,8 @@ macro_rules! per_model_gates {
 
       #[test]
       #[ignore = "requires staged CED model + committed goldens (CED_TEST_MODELS) — Wave B"]
-      fn fp32_cpu_arm_holds_the_logit_parity_band() {
-        super::fp32_cpu_arm($v);
+      fn cpu_only_arm_holds_the_logit_parity_band() {
+        super::cpu_only_arm($v);
       }
 
       #[test]

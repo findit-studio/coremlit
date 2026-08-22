@@ -16,8 +16,9 @@
 //! This file is that measurement, not a later re-run of it: `convert_granite.py`
 //! computes it, gates the conversion on it, and stages it; `generate_goldens.py`
 //! publishes the staged record verbatim, adding only the `corpus_sha256` binding,
-//! and refuses to run when the staged record is missing or from a different
-//! conversion run.
+//! and refuses to run when the staged record is missing, from a different
+//! conversion run, or recorded over different ordered inputs than the corpus
+//! being written beside it.
 //!
 //! Every other granite gate scores against `corpus.json`, whose embeddings come
 //! from the canonical pipeline. So nothing else in this crate would notice if
@@ -154,7 +155,15 @@ fn per_entry_ids_match_the_corpus_exactly() {
 /// serializes `corpus.json`, hashes those bytes, and stamps the digest onto the
 /// staged record as it emits both. So the field binds the two files as a unit
 /// and catches a separated pair. It is NOT evidence that the measurement
-/// consumed these bytes — no field here carries that, and none claims to.
+/// consumed these bytes.
+///
+/// The recipe records a separate `corpus_input_sha256` during the measurement
+/// itself, over the ordered `(id, text)` it consumed, and refuses to publish
+/// goldens whose ordered inputs differ from it — that is the measurement-input
+/// binding. It is enforced at generation time and required UNCONDITIONALLY by
+/// `verify_granite.py`. This COMMITTED fixture predates the field and gains it at
+/// the next regeneration, so nothing in this crate checks it yet — and the
+/// recipe's own verification refuses to attest to this pair until then.
 #[test]
 fn crosscheck_is_bound_to_this_corpus() {
   let cc = common::driver_crosscheck();

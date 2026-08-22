@@ -236,7 +236,7 @@ check_bin backend_factorial \
 #    der_calc's math units would keep run_ordinary's pass count nonzero. ──
 check_ordinary parity_e2e \
   assert_pinned_fires_when_a_value_crosses_the_parity_bound \
-  equal_delta_der_hides_disjoint_placement_errors \
+  equal_delta_der_hides_disjoint_arm_errors \
   stress_gate_roster_is_consistent || fail=1
 check_ordinary parity_shipping_der \
   clip09_record_pins_every_field || fail=1

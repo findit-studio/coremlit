@@ -1,10 +1,18 @@
 """Fail-closed conversion-verification matrix for the granite artifact.
 
-  (0) CORPUS IDENTITY — the loaded ``corpus.json`` must be exactly the committed
-      fixture set (same ids, same count, no duplicates), asserted before any
-      model is loaded. Every measurement below is a fold seeded at 1.0, so an
-      empty or truncated corpus would otherwise clear every floor having made
-      no prediction at all.
+  (0) PRECONDITIONS — the producer record and the run-bound COMPILATION record
+      must both describe the packages and bundles on disk, and the loaded
+      ``corpus.json`` must be exactly the committed fixture set (same ids, same
+      count, no duplicates), all asserted before any model is loaded. Every
+      measurement below is a fold seeded at 1.0, so an empty or truncated corpus
+      would otherwise clear every floor having made no prediction at all; and
+      the fp16 matrix runs the COMPILED bundle, which ``producer.json`` does not
+      cover, so without the compilation record these numbers could be measured
+      from a bundle an earlier run built. The two committed goldens are checked
+      as a PAIR too — the crosscheck must name the corpus bytes beside it —
+      because an interrupted regeneration otherwise leaves the corpus from one
+      run next to the crosscheck from another, and every attestation below still
+      succeeds over goldens the Rust gate rejects.
   (a) I/O CONTRACT — the shipped fp16 bundle's input/output names, dtypes, and
       shapes must be EXACTLY ``input_ids`` int32 [1,512] + ``attention_mask``
       int32 [1,512] -> ``embedding`` fp32 [1,384]. A contract drift is a hard
@@ -13,7 +21,7 @@
       goldens (``$GRANITE_GOLDENS/corpus.json``, unit-normalized; cosine is
       scale-invariant so the pre-L2-norm graph output compares directly), over
       all 16 entries -> worst cosine, floor ``FP32_FLOOR``.
-  (c) PRECISION x PLACEMENT — CoreML fp16 vs CoreML fp32-CPUOnly on EVERY
+  (c) PRECISION x COMPUTE-UNIT REQUEST — CoreML fp16 vs CoreML fp32-CPUOnly on EVERY
       compute unit {CpuOnly, CpuAndGpu, CpuAndNeuralEngine, All} -> worst cosine,
       floor ``FP16_FLOOR`` on each, and ZERO non-finite outputs on each. Unlike
       siglip, no arm here is merely characterized: granite ships fp16 on the
@@ -59,6 +67,8 @@ from _granite_common import (
     padded_inputs,
     read_producer_record,
     replace_file_atomic,
+    require_compile_record,
+    require_published_crosscheck,
     stage_dir,
     worst_update,
 )
@@ -128,9 +138,20 @@ def main():
             f"  Both satisfy the pins, but the manifest must name ONE environment. "
             f"Re-run convert_granite.py and verify_granite.py in the same venv."
         )
+    # The fp16 matrix below runs the COMPILED bundle, which producer.json does
+    # not bind. Require the compilation record for this run before measuring
+    # anything, so the numbers cannot describe a bundle another run built.
+    compile_record = require_compile_record(stage, run_id)
     assert_staged_matches_staging(root, stage)
 
-    corpus_path = os.path.join(goldens_dir(), "corpus.json")
+    goldens = goldens_dir()
+    corpus_path = os.path.join(goldens, "corpus.json")
+    # The goldens are a PAIR and the crosscheck names the corpus it belongs to.
+    # Checked before the corpus is even parsed: scoring against a corpus whose
+    # crosscheck describes a different one is the split-pair state an interrupted
+    # regeneration leaves, and nothing downstream used to look.
+    require_published_crosscheck(goldens)
+    checks["golden_pair"] = True
     entries = json.load(open(corpus_path))["entries"]
     # Before any model is loaded: the oracle must be the full committed corpus.
     # Every measurement below is a fold over these entries seeded at 1.0, so an
@@ -212,7 +233,8 @@ def main():
     metrics[RUN_ID_KEY] = run_id
     metrics["checks"] = checks
     metrics["toolchain"] = producer["toolchain"]
-    metrics["evidence"] = evidence_digests(root, stage, corpus_path)
+    metrics["compile"] = compile_record
+    metrics["evidence"] = evidence_digests(root, stage, goldens)
     replace_file_atomic(os.path.join(stage, VERIFY_METRICS),
                         json.dumps(metrics, indent=2) + "\n")
     print(f"\n  wrote {VERIFY_METRICS} (bound to this build's digests)")

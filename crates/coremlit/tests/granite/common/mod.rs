@@ -149,7 +149,9 @@ pub struct DriverCrosscheck {
   pub verdict: String,
   /// SHA-256 of the `corpus.json` bytes this record was PUBLISHED alongside —
   /// stamped on at publication, not an input to the measurement. Binds the two
-  /// goldens as a pair rather than by id alone.
+  /// goldens as a pair rather than by id alone. The measurement-INPUT binding is
+  /// a separate `corpus_input_sha256` the recipe records while measuring; this
+  /// committed fixture predates that field, so it is not deserialized here.
   pub corpus_sha256: String,
   /// One row per corpus entry, same ids as `corpus.json`.
   pub per_entry: Vec<CrosscheckEntry>,
