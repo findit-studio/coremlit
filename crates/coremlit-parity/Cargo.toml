@@ -79,8 +79,13 @@ textclap = { git = "https://github.com/Findit-AI/textclap", rev = "584f21754337a
 
 # `silero` IS published, so it rides a plain version (no git pin needed). Since
 # 0.6 it is itself a `zuoer` consumer that re-exports the core's detector
-# surface, so the oracle's segmenter and coremlit's are the same types from the
-# same crate. `default-features = false` keeps the bare dependency ort-free;
+# surface — but it pins `zuoer` 0.1 while coremlit is on `zuoer` 0.2, so the two
+# versions COEXIST in the lock and the oracle's segment/options types are
+# distinct from coremlit's. `tests/vad/cross_backend.rs` normalizes both into
+# its own `Segment` and drives the geometry-lie mutation through coremlit's
+# re-export (the version actually under test); it does not pass a type across
+# the two. Collapsing this back to one `zuoer` needs a `silero` release built
+# against 0.2. `default-features = false` keeps the bare dependency ort-free;
 # `vad-bundled` turns `silero/bundled` (⇒ `silero/onnx` ⇒ `ort`) back on.
 silero = { version = "0.6.0", default-features = false, optional = true }
 

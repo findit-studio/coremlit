@@ -214,7 +214,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   )?;
   stream.play()?;
 
-  // rubato 4.0: the unified `Fft` resampler (`FixedSync::Input` consumes a fixed
+  // rubato 5.0: the unified `Fft` resampler (`FixedSync::Input` consumes a fixed
   // RESAMPLE_CHUNK input frames per call — the former `FftFixedIn` role) that
   // writes into a preallocated audioadapter buffer instead of returning a fresh
   // Vec. `Fft::new` picks its sub-chunk count as `chunk / 256` (12 here for the
