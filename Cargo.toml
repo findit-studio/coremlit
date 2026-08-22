@@ -50,7 +50,7 @@ rustfft = "6"
 # `from_index`, `events()` — all `const fn`). ORT-FREE data codegen by
 # construction (deps: thiserror/phf/uncased only). `ontology` and its `serde`
 # stay off.
-soundevents-dataset = { version = "0.2", default-features = false, features = ["std", "rated"] }
+soundevents-dataset = { version = "0.3", default-features = false, features = ["std", "rated"] }
 npyz = "0.9"
 cpal = "0.18"
 rubato = "4.0"
