@@ -61,11 +61,18 @@
 //! reviewable act in ci.yml, never the silent side effect of a deleted
 //! directory, which is the whole point of the manifest.
 //!
-//! When `Models/` is absent the sweep is `ignored`, never a green `ok`
-//! over zero models (see `build.rs`). The parser tests below are hermetic
-//! and always run: they pin the checker against verbatim excerpts of the
-//! real known-bad and known-good graphs, so the gate itself cannot rot
-//! into something that always passes.
+//! When no DOWNLOADED model tree is on disk the sweep is `ignored`, never a
+//! green `ok` over zero models (see `build.rs`). "Downloaded" excludes the one
+//! model this repository commits — the `vadkit` VAD artifact — because a
+//! checkout always has it, and un-ignoring the sweep on that alone would put
+//! every fresh clone under the fail-closed manifest above and fail it for
+//! vendors nobody fetched. The committed VAD graph is still swept wherever the
+//! cfg is on (CI's model job included, on every PR), and its single guard site
+//! is pinned hermetically by `accepts_vadkits_stft_sqrt_guard` regardless.
+//!
+//! The parser tests below are hermetic and always run: they pin the checker
+//! against verbatim excerpts of the real known-bad and known-good graphs, so
+//! the gate itself cannot rot into something that always passes.
 
 use std::{
   collections::{BTreeMap, BTreeSet},
@@ -1984,7 +1991,8 @@ fn sweep_tree(root: &Path, expected_vendors: &BTreeSet<String>) -> io::Result<Sw
 
 #[cfg_attr(
   not(models_present),
-  ignore = "Models/ is gitignored and absent — nothing to sweep (build.rs)"
+  ignore = "no downloaded model tree on disk — nothing to sweep beyond the committed \
+            vadkit artifact (build.rs)"
 )]
 #[test]
 fn every_shipped_model_graph_survives_fp16() {
@@ -2093,15 +2101,19 @@ fn a_missing_pinned_vendor_fails_the_sweep_not_silently_skips() {
 }
 
 /// F3/F1 reconciliation: the CI model job's scope sweeps CLEAN. With
-/// `expected_vendors = {whisperkit-coreml, embedkit-granite}` — what that job sets
-/// via `COREMLIT_FP16_SWEEP_VENDORS`, matching the two vendors MODELS_LOCK stages
-/// — a tree containing the clean whisper mel and the clean granite norms sweeps
-/// green: both staged vendors are present and their graphs are clean, and the
-/// absent speakerkit/alignkit/argmax pins are the DOCUMENTED escape (verified by
-/// the full local/dev gate, not here). This is the exact scenario the model job
+/// `expected_vendors = {whisperkit-coreml, embedkit-granite, vadkit}` — what that
+/// job sets via `COREMLIT_FP16_SWEEP_VENDORS`: the two vendors MODELS_LOCK
+/// stages, plus `vadkit`, which that job does not download because the artifact
+/// is COMMITTED to the repository — a tree containing the clean whisper mel, the
+/// clean granite norms and the real vadkit STFT guard sweeps green: all three
+/// expected vendors are present and their graphs are clean, and the absent
+/// speakerkit/alignkit/argmax pins are the DOCUMENTED escape (verified by the
+/// full local/dev gate, not here). This is the exact scenario the model job
 /// runs; proving it here keeps the ci.yml wiring honest even though Actions cannot
-/// run in-repo. It also proves the narrowed manifest does NOT demand the pinned
-/// vendors — the fail-closed default does that only when the override is unset.
+/// run in-repo, and it is what would go red if the vendored model were deleted
+/// while ci.yml still demanded it. It also proves the narrowed manifest does NOT
+/// demand the pinned vendors — the fail-closed default does that only when the
+/// override is unset.
 #[test]
 fn the_ci_model_job_scope_sweeps_clean() {
   let tree = TempTree::new("ci_model_job_scope");
@@ -2115,22 +2127,28 @@ fn the_ci_model_job_scope_sweeps_clean() {
     "embedkit-granite/granite-97m-multilingual-r2/granite_97m_512.mlmodelc",
     GRANITE_NORMS_CLEAN,
   );
+  write_model(
+    tree.path(),
+    "vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc",
+    VADKIT_STFT_SQRT,
+  );
   let expected = BTreeSet::from([
     "whisperkit-coreml".to_string(),
     "embedkit-granite".to_string(),
+    "vadkit".to_string(),
   ]);
 
   let outcome = sweep_tree(tree.path(), &expected).expect("walk the temp tree");
   assert!(
     outcome.failures.is_empty(),
-    "the CI model job's scope must sweep clean (both staged vendors present + clean; the pins \
+    "the CI model job's scope must sweep clean (every expected vendor present + clean; the pins \
      are the documented escape) — got {:?}",
     outcome.failures
   );
-  assert_eq!(outcome.models_len, 2, "both synthetic models");
+  assert_eq!(outcome.models_len, 3, "all three synthetic models");
   assert!(
-    outcome.audited_sites >= 2,
-    "the mel log site and a granite norm site were audited"
+    outcome.audited_sites >= 3,
+    "the mel log site, a granite norm site and vadkit's STFT sqrt were audited"
   );
 }
 

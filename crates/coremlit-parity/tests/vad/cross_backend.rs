@@ -77,7 +77,11 @@
 //!   deliberately blind to this — the two families do not overlap.)
 //!
 //! Model-gated (`#[ignore]`): needs `Models/vadkit` (`VADKIT_TEST_MODELS`) for
-//! the CoreML side; the silero side uses its bundled model, no download.
+//! the CoreML side; the silero side uses its bundled model. Neither side
+//! downloads anything any more — the vadkit artifact is committed to this
+//! repository — so this gate is now runnable anywhere the `vad-bundled`
+//! feature builds, CI included, should the cross-backend tolerances be shown
+//! stable across host classes.
 
 // One shared copy, owned by the `coremlit` package (four of its vad test
 // binaries include it as a plain `mod common;`).

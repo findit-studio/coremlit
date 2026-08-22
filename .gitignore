@@ -17,4 +17,15 @@
 **.claude/
 
 .superpowers/
-Models/
+
+# Model artifacts are dev-time downloads and stay untracked — EXCEPT the
+# vendored VAD model, which is COMMITTED so CI and every clone have it with no
+# download step (1.1 MiB; see NOTICE sections 1-2 for its MIT provenance).
+# Re-including a path under an excluded directory needs the parent re-included
+# first, hence the `Models/*` / `!dir/` / `dir/*` ladder rather than a bare
+# `Models/`. Everything else under Models/ — including vadkit's own
+# `.cache/huggingface/` download bookkeeping — stays ignored.
+Models/*
+!Models/vadkit/
+Models/vadkit/*
+!Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc/

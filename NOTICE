@@ -4,40 +4,67 @@ Copyright the coremlit authors
 The coremlit Rust source is dual-licensed under MIT OR Apache-2.0 (caller's
 choice). See LICENSE-MIT and LICENSE-APACHE for those terms.
 
-NOTE: coremlit ships NO model weight files, but embeddings::clap,
-embeddings::granite, and embeddings::siglip each BUNDLE a third-party tokenizer
-artifact (via include_bytes! — sections 6b, 7b, and 8b). Each feature-gated
-pipeline (audio::whisper / audio::align / audio::speaker / audio::vad /
-audio::ced / embeddings::clap / embeddings::granite / embeddings::siglip)
-otherwise LOADS, at runtime, CoreML model artifacts that a downstream user
-fetches separately from Hugging Face (see the crate README and each module's
+NOTE: the PUBLISHED coremlit crate ships no model weight files, but
+embeddings::clap, embeddings::granite, and embeddings::siglip each BUNDLE a
+third-party tokenizer artifact (via include_bytes! — sections 6b, 7b, and 8b).
+
+This REPOSITORY redistributes exactly one model: the audio::vad CoreML
+artifact, vendored at
+`Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc/` (1.1 MiB, MIT —
+sections 1-2, plus a LICENSE file inside that directory). It is committed so CI
+and every clone have it with no download step. It lives outside the published
+package directory, so `cargo publish` does not carry it to crates.io — a
+`cargo add coremlit` consumer still fetches every model itself.
+
+Every feature-gated pipeline (audio::whisper / audio::align / audio::speaker /
+audio::vad / audio::ced / embeddings::clap / embeddings::granite /
+embeddings::siglip) LOADS its CoreML model artifacts at runtime; for all of
+them except audio::vad in this repository, a downstream user fetches those
+artifacts separately from Hugging Face (see the crate README and each module's
 model_io tests for the repo id, revision, and per-file SHA-256). This NOTICE
 records the attribution a binary that distributes or bundles those components
 must honor.
 
-Sections 1-2 (the audio::vad models) are preserved verbatim from the former
-vadkit NOTICE. Sections 3-5 record the whisper, speaker, and align model
-attributions folded in by the mono-crate restructure. Section 6 records the
-CLAP audio+text encoder weights and the bundled Xenova tokenizer, folded in by
-the clapkit port. Section 7 records the granite text-embedding encoder and its
+Sections 1-2 (the audio::vad models) began as the former vadkit NOTICE and were
+rewritten when the CoreML artifact was vendored into this repository — what was
+a conditional obligation on downstream redistributors became a live one here.
+Sections 3-5 record the whisper, speaker, and align model attributions folded
+in by the mono-crate restructure. Section 6 records the CLAP audio+text encoder
+weights and the bundled Xenova tokenizer, folded in by the clapkit port.
+Section 7 records the granite text-embedding encoder and its
 artifact-distributed tokenizer, added by the embedkit phase. Section 8 records
 the SigLIP 2 image+text encoder weights and their artifact-distributed Gemma
-tokenizer, added by the siglip phase. Section 9 records the CED source-model attribution, added by the CED
-port. Both audio::vad components below are MIT.
+tokenizer, added by the siglip phase. Section 9 records the CED source-model
+attribution, added by the CED port. Both audio::vad components below are MIT.
 
 ────────────────────────────────────────────────────────────────────────
 1. Silero VAD (upstream model)
 
-The voice-activity-detection model vadkit runs is Silero VAD, from the
-upstream Silero project. vadkit does not modify or redistribute the upstream
-model; it loads FluidInference's CoreML conversion of it (section 2).
+The voice-activity-detection model audio::vad runs is Silero VAD, from the
+upstream Silero project. coremlit does not modify it — but it DOES redistribute
+it. FluidInference's CoreML conversion (section 2) is vendored into this
+repository at `Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc/`,
+committed so CI and every clone have it with no download step. Those bytes are
+copied verbatim from the Hub at the pinned revision, and every one of them is
+re-verified per file by SHA-256 in `crates/coremlit/tests/vad/model_io.rs`.
 
   Upstream project: https://github.com/snakers4/silero-vad
   Upstream license at the time this crate was written: MIT
 
-The upstream Silero project distributes the model under the MIT license.
-Preserve the upstream copyright and permission notice when redistributing a
-binary that includes the model.
+MIT's obligation is to preserve "the above copyright notice and this permission
+notice". Because this repository redistributes the model, that obligation is
+LIVE here — not merely a condition on downstream binaries. It is met twice: the
+notice is reproduced in full below, and a second copy travels with the artifact
+itself, in the LICENSE file inside
+`Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc/`, so the directory
+carries its own terms if it is ever copied out of this repository. A binary
+that redistributes the model must preserve the same notice.
+
+`Copyright (c) 2020-present Silero Team` is the ONLY copyright line asserted
+anywhere in this model's provenance chain. It appears verbatim in the upstream
+project's LICENSE and, byte-identically, in the LICENSE of
+`onnx-community/silero-vad` — the base model FluidInference's conversion
+declares. Both were checked at the pinned revision.
 
 Upstream MIT notice:
 
@@ -64,20 +91,40 @@ Upstream MIT notice:
   SOFTWARE.
 
 ────────────────────────────────────────────────────────────────────────
-2. FluidInference silero-vad-coreml (CoreML conversion)
+2. FluidInference silero-vad-coreml (the CoreML conversion this repo vendors)
 
-The exact artifact vadkit loads is FluidInference's CoreML conversion of
-Silero VAD — the unified 256 ms model `silero-vad-unified-256ms-v6.2.1`.
+The exact artifact audio::vad loads — and the one file tree this repository
+redistributes — is FluidInference's CoreML conversion of Silero VAD: the
+unified 256 ms model `silero-vad-unified-256ms-v6.2.1`.
 
-  Source: https://huggingface.co/FluidInference/silero-vad-coreml
+  Source:   https://huggingface.co/FluidInference/silero-vad-coreml
   Revision (commit SHA): b419383c55c110e2c9271fa6ee0ea83d03c70d96
   Artifact: silero-vad-unified-256ms-v6.2.1.mlmodelc
-  License: MIT (HuggingFace cardData.license = mit)
+  Vendored: Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc/
+  License:  MIT
 
-The FluidInference conversion is distributed under the MIT license. MIT
-requires preserving the notice; this record (repo id, revision, license) is
-that preservation for the conversion, alongside the upstream Silero notice in
-section 1.
+Recorded exactly as found, because this conversion asserts its license in
+metadata rather than in a file. At the pinned revision FluidInference states
+MIT in three places and nowhere else:
+
+  - the model card's front matter, `license: mit`;
+  - the Hugging Face model tag `license:mit`;
+  - the README line `**License:** MIT`.
+
+The repository ships NO LICENSE file and NO NOTICE file, and states NO
+copyright line. No copyright is therefore asserted on FluidInference's behalf,
+here or in the vendored LICENSE file: inventing one would attribute ownership
+to a party that has not claimed it. The only attribution the artifact itself
+carries is the `author` field of its own metadata.json, reproduced verbatim,
+their spelling included:
+
+  Fluid Infernece + Silero Team
+
+The substantive rights therefore sit upstream with the Silero Team, whose
+notice section 1 reproduces in full — and that notice is what MIT requires this
+repository to preserve for the vendored bytes. This record (repo id, revision,
+where the license is asserted, and the absence of a license file or copyright
+line on their side) is the preservation for the conversion itself.
 
 ────────────────────────────────────────────────────────────────────────
 3. Whisper models (audio::whisper)

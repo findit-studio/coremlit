@@ -27,13 +27,21 @@ use coremlit_dir::coremlit_path;
 /// tables CI actually downloads; vad is not among them).
 pub const ARTIFACT: &str = "silero-vad-unified-256ms-v6.2.1.mlmodelc";
 
-/// Directory containing the downloaded vadkit model artifact.
+/// Directory containing the vadkit model artifact.
 ///
 /// Overridable via `VADKIT_TEST_MODELS`; otherwise falls back to
-/// `<workspace>/Models/vadkit` — gitignored, fetched dev-time (mirrors
-/// `speakerkit`'s `SPEAKERKIT_TEST_MODELS`/`Models/speakerkit` and
-/// `alignkit`'s `ALIGNKIT_TEST_MODELS`/`Models/alignkit`, one directory level
-/// down for this crate's own model set). Fetch with:
+/// `<workspace>/Models/vadkit` (mirroring `speakerkit`'s
+/// `SPEAKERKIT_TEST_MODELS`/`Models/speakerkit` and `alignkit`'s
+/// `ALIGNKIT_TEST_MODELS`/`Models/alignkit`, one directory level down for this
+/// crate's own model set).
+///
+/// Unlike every sibling kit's, that fallback needs NO download: the artifact
+/// is COMMITTED at
+/// `Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc/` — 1.1 MiB, MIT,
+/// un-ignored by name in `.gitignore` — so a fresh clone resolves it and CI
+/// runs the vad model gates with no fetch step (`.github/workflows/ci.yml`,
+/// the `check` job). To re-fetch it from the Hub instead (a re-vendor, or to
+/// verify the committed bytes against the source):
 ///
 /// ```text
 /// hf download FluidInference/silero-vad-coreml \
@@ -41,6 +49,9 @@ pub const ARTIFACT: &str = "silero-vad-unified-256ms-v6.2.1.mlmodelc";
 ///   --revision b419383c55c110e2c9271fa6ee0ea83d03c70d96 \
 ///   --local-dir Models/vadkit
 /// ```
+///
+/// That download also writes a `Models/vadkit/.cache/huggingface/` bookkeeping
+/// tree, which stays gitignored — only the `.mlmodelc` is committed.
 pub fn models_dir() -> PathBuf {
   std::env::var_os("VADKIT_TEST_MODELS").map_or_else(
     || {

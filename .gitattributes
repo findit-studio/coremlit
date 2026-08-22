@@ -1,0 +1,12 @@
+# The vendored VAD CoreML artifact is byte-pinned by SHA-256
+# (crates/coremlit/tests/vad/model_io.rs). Two of its five files — `model.mil`
+# and `metadata.json` — are TEXT, so a clone with `core.autocrlf=true` (the
+# Windows default) would rewrite their line endings in the working tree and
+# every pinned hash would mismatch. Mark the whole artifact binary so no
+# checkout can alter the bytes we redistribute. `LICENSE` is coremlit's own
+# addition and is deliberately left as ordinary text.
+Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc/metadata.json -text
+Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc/model.mil -text
+Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc/coremldata.bin -text
+Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc/weights/weight.bin -text
+Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc/analytics/coremldata.bin -text
