@@ -1,7 +1,7 @@
 //! Silero VAD on CoreML (feature `vad`) — the FluidInference unified 256 ms
 //! artifact (`silero-vad-unified-256ms-v6.2.1`), run through the [`crate`]
 //! runtime instead of ONNX Runtime, with all voice-activity *detection* logic
-//! single-homed in the published `silero` crate behind a backend seam.
+//! single-homed in the published `zuoer` crate behind a backend seam.
 //!
 //! Design spec:
 //! `docs/superpowers/specs/2026-07-18-vadkit-design.md` (§4 model layer, §5
@@ -18,21 +18,21 @@
 //! stitching that graph expects (the FluidAudio `VadManager` semantics,
 //! `FluidAudio/Sources/FluidAudio/VAD/VadManager.swift:21-26`). It authors
 //! **zero** speech-detection or streaming-segmentation logic: that lives, and
-//! stays single-homed, in the published `silero` crate behind its backend
+//! stays single-homed, in the published `zuoer` crate behind its backend
 //! seam (spec §2-§3). [`CoreMlBackend`] implements that seam over CoreML and
-//! [`detect_speech`] plus the re-exported [`silero`] detector surface
+//! [`detect_speech`] plus the re-exported [`zuoer`] detector surface
 //! ([`SpeechOptions`], [`SpeechSegment`], [`SpeechSegmenter`],
 //! [`detect_speech_with`]) wire it up (spec §4) — so a consumer gets the full
 //! offline + streaming detection API with zero segmentation logic authored
 //! here. The `src/audio/vad/` grep gate in `tests/vad/reexport.rs` pins that
 //! single-home invariant.
 //!
-//! The module depends on `silero` with `default-features = false` (logic
-//! only), so **`ort`/ONNX never enters the `vad` runtime graph** — nor a
-//! downstream `whisper`'s. The ONNX stack appears only behind the DEV/TEST
-//! `vad-bundled` feature (`silero/bundled`), for the cross-backend gate. The
-//! git-pinned `silero` re-pins to `silero = "0.5.0"` once it publishes (no
-//! behavior change).
+//! The module depends on `zuoer`, which owns no model, no inference runtime
+//! and no dependencies at all, so **`ort`/ONNX never enters the `vad` runtime
+//! graph** — nor a downstream `whisper`'s. The ONNX stack appears only behind
+//! the DEV/TEST `vad-bundled` feature of the sibling `coremlit-parity` package,
+//! the only thing that pulls the `silero` crate (`silero/bundled`), for the
+//! cross-backend gate.
 //!
 //! ```no_run
 //! use coremlit::audio::vad::{CoreMlBackend, SpeechOptions, detect_speech};
@@ -62,8 +62,13 @@
 //! (a noisy-OR of eight sigmoids); the recurrent LSTM state is explicit
 //! feature I/O (`hidden_state`/`cell_state [1, 128]`, an empty `stateSchema`
 //! — not an `MLState` model). One probability per 256 ms — an 8× coarser
-//! frame than `silero`'s ONNX geometry, consumed unchanged by its
+//! frame than the ONNX Silero geometry, consumed unchanged by `zuoer`'s
 //! geometry-parameterized detector.
+//!
+//! Because zuoer's seam is push-based, [`CoreMlBackend`] also owns the input
+//! windowing and the end-of-stream policy: it buffers the un-chunked PCM tail
+//! across [`VadBackend::push`] calls and, on [`VadBackend::finish`],
+//! zero-pads a non-empty trailing partial frame and emits its probability.
 //!
 //! # Compute placement, oracles & gates
 //!
@@ -77,7 +82,8 @@
 //! the exact I/O + state contract in `tests/vad/model_io.rs` /
 //! `tests/vad/model_state.rs`; the no-duplication + re-export gate
 //! (`tests/vad/reexport.rs`); the cross-backend characterization against the
-//! `silero` ONNX stack (`tests/vad/cross_backend.rs`, feature `vad-bundled`);
+//! `silero` crate's ONNX stack (`coremlit-parity`'s
+//! `tests/vad/cross_backend.rs`, feature `vad-bundled`);
 //! and the fp16-guard sweep in the crate's `tests/fp16_guards.rs` (the graph
 //! is fp16-clean). Model-gated tests are `#[ignore]`d.
 //!
@@ -98,13 +104,13 @@ pub use model::{
   VadState,
 };
 
-// The silero detector surface, re-exported unchanged and wired (via
+// The zuoer detector surface, re-exported unchanged and wired (via
 // [`CoreMlBackend`] / [`detect_speech`]) to run over the CoreML backend. vadkit
-// adds NO detection logic (spec §2-§4); these are silero's own types. `Error`
-// / `Result` are silero's detector error (into which the model layer's
-// [`InferError`] bridges through [`silero::Error::Backend`]), distinct from the
+// adds NO detection logic (spec §2-§4); these are zuoer's own types. `Error`
+// / `Result` are zuoer's detector error (into which the model layer's
+// [`InferError`] bridges through [`zuoer::Error::Backend`]), distinct from the
 // model-layer [`ModelError`] / [`InferError`] above.
-pub use silero::{
+pub use zuoer::{
   Error, Result, SampleRate, SpeechDetector, SpeechOptions, SpeechSegment, SpeechSegmenter,
   VadBackend, detect_speech_with,
 };

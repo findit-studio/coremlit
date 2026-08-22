@@ -169,13 +169,13 @@
 //!
 //! **What this repair did NOT fix, and what this graph is NOT responsible
 //! for.** The 8-speaker clip on which the shipping CoreML path returns 5
-//! speakers at 16.6 % DER (`tests/speaker/parity_shipping_der.rs`'s clip-09
-//! pin) is not repaired by the swap: re-running that suite's four gated clips
+//! speakers at 16.6 % DER (the clip-09 pin in `coremlit-parity`'s
+//! `tests/speaker/parity_shipping_der.rs`) is not repaired by the swap: re-running that suite's four gated clips
 //! with only the artifact changed reproduced every gated number, clip 09
 //! included.
 //!
 //! It is also **not this stage's collapse**. Measured at the shipping
-//! configuration by `tests/speaker/backend_factorial.rs` — int8 embedder, both
+//! configuration by `coremlit-parity`'s `tests/speaker/backend_factorial.rs` — int8 embedder, both
 //! CoreML models on [`crate::ComputeUnits::All`], dia's ONNX as the reference
 //! for whichever stage is not swapped — this graph on its own OVERcounts by
 //! one speaker (9 of 8, 1.3011 % DER), while the CoreML *embedding* path on

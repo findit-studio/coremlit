@@ -9,6 +9,15 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+// The `coremlit_dir` hop that keeps every crate-relative fixture path below
+// correct from BOTH packages that compile this shared module (`coremlit`'s own
+// test binaries and `coremlit-parity`'s oracle binaries, which `#[path]`-include
+// this very file). Kept in one place — see its module doc.
+#[path = "../../support/coremlit_dir.rs"]
+#[allow(dead_code)]
+mod coremlit_dir;
+use coremlit_dir::coremlit_path;
+
 /// The compiled VAD artifact's directory name within [`models_dir`] — the
 /// FluidInference `silero-vad-unified-256ms-v6.2.1` `.mlmodelc` (design spec
 /// §5; the v6.2.1 artifact ships pre-compiled, so this loads directly with no
@@ -92,14 +101,12 @@ pub const FIXTURES: &[Fixture] = &[
 
 /// Absolute path to a borrowed fixture WAV by basename.
 pub fn fixture_wav_path(name: &str) -> PathBuf {
-  PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-    .join("tests/speaker/fixtures/audio")
-    .join(format!("{name}.wav"))
+  coremlit_path("tests/speaker/fixtures/audio").join(format!("{name}.wav"))
 }
 
 /// Directory holding this crate's committed Swift-trace goldens.
 pub fn golden_swift_dir() -> PathBuf {
-  PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/vad/fixtures/golden_swift")
+  coremlit_path("tests/vad/fixtures/golden_swift")
 }
 
 /// Loads a 16 kHz mono WAV as `f32` samples — the single source of truth both

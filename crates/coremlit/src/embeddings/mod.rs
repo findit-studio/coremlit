@@ -7,7 +7,8 @@
 //!
 //! - `clap` — CLAP-HTSAT dual-tower audio+text embeddings, a former standalone
 //!   kit crate collapsed here per the mono-crate restructure (feature `clap`;
-//!   `clap-oracle` adds the textclap parity oracle).
+//!   the textclap parity oracle lives in the sibling `coremlit-parity`
+//!   package's `clap-oracle` feature).
 //! - `granite` — general text sentence-embeddings on CoreML (the embedkit
 //!   phase), first model `granite-embedding-97m-multilingual-r2` (feature
 //!   `granite`; committed transformers-fp32 goldens as the parity oracle — NO

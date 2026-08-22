@@ -165,13 +165,53 @@ pub enum Error {
   #[error("failed to load tokenizer: {0}")]
   TokenizerLoad(#[source] tokenizers::Error),
 
-  /// The bundled `tokenizer.json` is still the build-time placeholder (its
-  /// vocab carries the `PLACEHOLDER_…_IN_WAVE_B` sentinel), which maps every
-  /// ordinary word to `<pad>` — embedding with it would silently produce
-  /// meaningless vectors. Stage the source-revision Gemma tokenizer bytes (the
-  /// golden-generation step of the port plan), or supply a real tokenizer via
+  /// The model artifact's `tokenizer.json` sidecar could not be read.
+  ///
+  /// [`crate::embeddings::siglip::TextEmbedder::load`] reads the tokenizer from
+  /// the directory CONTAINING the text `.mlmodelc`, where the published bundle
+  /// stages it. This is the "the artifact tree is incomplete" failure — an older
+  /// download that predates the sidecar, a partial fetch, or a `.mlmodelc` copied
+  /// out of its artifact directory. Distinct from [`Error::TokenizerLoad`], which
+  /// means the bytes were read but are not a valid tokenizer.
+  #[error("failed to read the artifact tokenizer `{path}`: {source}")]
+  ArtifactTokenizerRead {
+    /// The sidecar path that could not be read.
+    path: std::path::PathBuf,
+    /// The underlying I/O failure.
+    #[source]
+    source: std::io::Error,
+  },
+
+  /// The `tokenizer.json` read from the model artifact directory is not the
+  /// pinned source-revision Gemma artifact (SHA-256).
+  ///
+  /// SigLIP 2 NaFlex is a fixed model with exactly one correct tokenizer, and the
+  /// tokenizer now travels with the artifact instead of being compiled into the
+  /// crate — so its identity is checked at load rather than assumed. A wrong,
+  /// truncated, or re-serialized sidecar would otherwise produce finite but
+  /// meaningless embeddings. Supply your own bytes through
+  /// [`crate::embeddings::siglip::TextEmbedder::from_files`] /
+  /// [`crate::embeddings::siglip::TextEmbedder::from_memory`] if you deliberately
+  /// want a different tokenizer.
+  #[error(
+    "artifact tokenizer `{path}` is not the pinned Gemma tokenizer: expected sha-256 {expected}, got {actual}"
+  )]
+  ArtifactTokenizerIdentity {
+    /// The sidecar path whose bytes were hashed.
+    path: std::path::PathBuf,
+    /// The pinned SHA-256 (lowercase hex).
+    expected: &'static str,
+    /// The SHA-256 (lowercase hex) of the bytes actually read.
+    actual: String,
+  },
+
+  /// A `tokenizer.json` is still the build-time placeholder (its vocab carries
+  /// the `PLACEHOLDER_…_IN_WAVE_B` sentinel), which maps every ordinary word to
+  /// `<pad>` — embedding with it would silently produce meaningless vectors.
+  /// Stage the source-revision Gemma tokenizer bytes beside the model bundle, or
+  /// supply a real tokenizer via
   /// [`crate::embeddings::siglip::TextEmbedder::from_files`].
-  #[error("bundled tokenizer is the build-time placeholder; stage the real Gemma tokenizer.json")]
+  #[error("tokenizer is the build-time placeholder; stage the real Gemma tokenizer.json")]
   TokenizerPlaceholder,
 
   /// Configuring the tokenizer (truncation) failed.

@@ -61,7 +61,7 @@
 //!   last padding instead of zeros to avoid energy distortion"). An empty
 //!   chunk pads with `0.0` (`chunk.last ?? 0.0`). A chunk LONGER than 4096 is
 //!   rejected ([`InferError::ChunkTooLong`]) rather than truncated: the
-//!   streaming caller (silero's detector, T5) and the trace harness both feed
+//!   streaming caller (zuoer's detector, T5) and the trace harness both feed
 //!   at most one 256 ms window per call, so an over-long chunk is a caller
 //!   bug whose silently-dropped tail would be lost speech, not a case to
 //!   paper over. (`VadManager` truncates it, but never reaches that branch.)
@@ -237,8 +237,9 @@ impl Default for VadState {
 
 /// CoreML wrapper over the unified Silero VAD graph, carrying the recurrent
 /// [`VadState`] between chunks. One [`CHUNK_SAMPLES`]-sample chunk in, one
-/// speech probability out, state advanced in place — the shape the silero
-/// backend seam's `predict`/`reset` expects (spec §3; the trait impl is T5).
+/// speech probability out, state advanced in place — the per-frame step the
+/// zuoer backend seam's `push`/`finish`/`reset` are built on (spec §3; the
+/// trait impl is T5).
 #[derive(Debug)]
 pub struct VadModel {
   model: Model,
@@ -313,7 +314,7 @@ impl VadModel {
     &self.state
   }
 
-  /// Clears the recurrent state back to [`VadState::initial`] — the silero
+  /// Clears the recurrent state back to [`VadState::initial`] — the zuoer
   /// seam's `reset` (spec §3). The next [`Self::predict_chunk`] then behaves
   /// as if it were the first chunk of a fresh stream.
   pub fn reset(&mut self) {
@@ -322,7 +323,7 @@ impl VadModel {
 
   /// Runs one chunk of up to [`CHUNK_SAMPLES`] new samples, advancing the
   /// internal [`VadState`] in place and returning the speech probability in
-  /// `[0, 1]` — the silero seam's `predict` shape (spec §3).
+  /// `[0, 1]` — the per-frame shape the zuoer seam's `push` emits (spec §3).
   ///
   /// Context stitching, short-chunk padding, and the state carry-forward
   /// follow FluidAudio's `VadManager` exactly (see the module doc).

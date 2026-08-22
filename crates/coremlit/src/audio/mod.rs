@@ -10,14 +10,14 @@
 //! - `align` — wav2vec2 forced word-level alignment (feature `align`;
 //!   `align-oracle` adds the asry ONNX parity oracle).
 //! - `speaker` — native CoreML segmentation/embedding backends for the `dia`
-//!   diarization pipeline (feature `speaker`; `speaker-oracle` adds the dia-ort
-//!   DER oracle).
-//! - `vad` — Silero voice-activity detection (feature `vad`; `vad-bundled`
-//!   adds the silero ONNX cross-backend oracle).
+//!   diarization pipeline (feature `speaker`; the dia-ort DER oracle lives in
+//!   the sibling `coremlit-parity` package's `speaker-oracle` feature).
+//! - `vad` — Silero voice-activity detection (feature `vad`; the `silero`-crate
+//!   ONNX cross-backend oracle lives in `coremlit-parity`'s `vad-bundled`).
 //! - `ced` — CED (tiny/mini/small/base) AudioSet sound-event tagging (feature `ced`).
 //!
 //! See the crate README's layering map for module authority and the dependency
-//! arrows to the `silero`, `asry`, and `dia` seams.
+//! arrows to the `zuoer`, `asry`, and `dia` seams.
 
 #[cfg(feature = "whisper")]
 pub mod whisper;

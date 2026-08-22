@@ -8,7 +8,7 @@
 //!   ground truth (the embedkit "no ort anywhere" rule), committed the way the
 //!   speaker/vad Swift goldens are.
 //! - **CoreML artifact** (`granite_97m_512.mlmodelc`) — a gitignored dev-time
-//!   download from `FinDIT-Studio/embedkit-coreml` (revision `81852f70`), under
+//!   download from `FinDIT-Studio/embedkit-coreml` (revision `a61241cb`), under
 //!   `Models/embedkit-granite/` (overridable via `EMBEDKIT_TEST_MODELS`).
 //!   Model-gated tests are `#[ignore]` by default and run only when present.
 //!
@@ -21,9 +21,13 @@
 use std::path::{Path, PathBuf};
 
 /// The HF revision (commit SHA) of `FinDIT-Studio/embedkit-coreml` the model
-/// artifact and its per-file SHA-256 pins are recorded at.
+/// artifact and its per-file SHA-256 pins are recorded at — the revision
+/// `MODELS_LOCK` pins, so this is what CI actually stages. It supersedes
+/// `81852f70` by ADDING the `tokenizer.json` sidecar; the `.mlmodelc` and
+/// `.mlpackage` bytes the pins below cover are unchanged between the two, which
+/// is why bumping this did not require re-pinning any hash.
 #[allow(dead_code)]
-pub const EMBEDKIT_REVISION: &str = "81852f70";
+pub const EMBEDKIT_REVISION: &str = "a61241cb";
 
 /// Directory containing the downloaded granite CoreML artifact tree.
 ///

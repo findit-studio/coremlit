@@ -29,7 +29,7 @@ use coremlit::{ComputeUnits, DataType, Model, embeddings::siglip::embedding::EMB
 /// blob), so a re-conversion re-pins these two — the exact-set gate's intended
 /// "deliberate re-stage" behavior. The public re-upload has since happened and
 /// froze them: these ARE the bytes published at
-/// `FinDIT-Studio/siglip2-naflex-coreml` @ `62c97df451a4906f0ee3ab93b9213113a51740ba`.
+/// `FinDIT-Studio/siglip2-naflex-coreml` @ `eb514c2ab66fb702d43c742add0be5b091b02dab`.
 const ARTIFACT_SHA256: &[(&str, &str)] = &[
   (
     "analytics/coremldata.bin",

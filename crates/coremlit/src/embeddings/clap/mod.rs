@@ -7,7 +7,7 @@
 //! Design spec: `docs/superpowers/specs/2026-07-18-clapkit-design.md` (including
 //! its `AggregatePolicy` amendment). textclap is the model-level oracle: the
 //! logic here is being *improved*, not merely reused (the asry→alignkit
-//! relationship, not silero→vadkit).
+//! relationship, not zuoer→vadkit).
 //!
 //! macOS only (built on [`crate`]).
 //!

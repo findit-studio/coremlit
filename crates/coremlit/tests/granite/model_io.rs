@@ -6,7 +6,7 @@
 //! # Artifact
 //!
 //! Source: [`FinDIT-Studio/embedkit-coreml`](https://huggingface.co/FinDIT-Studio/embedkit-coreml),
-//! revision `81852f70`, converted by embedkit T1 from
+//! revision `a61241cb`, converted by embedkit T1 from
 //! [`ibm-granite/granite-embedding-97m-multilingual-r2`](https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2)
 //! (ModernBERT encoder + CLS pooling, fp16). Gitignored, fetched dev-time under
 //! `Models/embedkit-granite/` (`EMBEDKIT_TEST_MODELS`).
@@ -38,7 +38,9 @@ use coremlit::{
 /// pattern): the discovered file set is compared against these keys before any
 /// hashing, so a file added to or removed from the bundle fails the gate rather
 /// than slipping past a fixed named list. Paths are relative to the `.mlmodelc`
-/// directory; hashes are from `CHECKSUMS.sha256` at revision `81852f70`.
+/// directory; hashes are from `CHECKSUMS.sha256`, unchanged across the
+/// `81852f70` → `a61241cb` bump (that revision only ADDED the artifact-root
+/// `tokenizer.json`, which is outside this `.mlmodelc` tree).
 const ARTIFACT_SHA256: &[(&str, &str)] = &[
   (
     "analytics/coremldata.bin",
@@ -173,9 +175,16 @@ fn from_memory_rejects_foreign_tokenizer() {
 fn from_memory_rejects_corrupted_tokenizer_with_identity_check() {
   // Parse → swap two non-sentinel base-vocab ids → re-serialize. `serde_json` is
   // a dev-dependency; a small local copy of the in-lib fixture is fine here.
+  let tokenizer_path =
+    common::model_root().join(coremlit::embeddings::granite::TOKENIZER_FILE_NAME);
+  let tokenizer_bytes = std::fs::read(&tokenizer_path).unwrap_or_else(|e| {
+    panic!(
+      "read the staged granite tokenizer {}: {e}",
+      tokenizer_path.display()
+    )
+  });
   let mut value: serde_json::Value =
-    serde_json::from_slice(coremlit::embeddings::granite::BUNDLED_TOKENIZER)
-      .expect("parse bundled tokenizer.json");
+    serde_json::from_slice(&tokenizer_bytes).expect("parse the staged tokenizer.json");
   {
     let vocab = value["model"]["vocab"]
       .as_object_mut()

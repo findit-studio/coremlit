@@ -96,6 +96,24 @@ pub enum Error {
     norm_sq_deviation: f32,
   },
 
+  /// The model artifact's `tokenizer.json` sidecar could not be read.
+  ///
+  /// [`crate::embeddings::granite::TextEmbedder::load`] reads the tokenizer from
+  /// the directory CONTAINING the `.mlmodelc`, where the published bundle stages
+  /// it. This is the "the artifact tree is incomplete" failure — an older
+  /// download that predates the sidecar, a partial fetch, or a `.mlmodelc`
+  /// copied out of its artifact directory. Distinct from
+  /// [`Error::TokenizerLoad`], which means the bytes were read but are not a
+  /// valid tokenizer.
+  #[error("failed to read the artifact tokenizer `{path}`: {source}")]
+  ArtifactTokenizerRead {
+    /// The sidecar path that could not be read.
+    path: std::path::PathBuf,
+    /// The underlying I/O failure.
+    #[source]
+    source: std::io::Error,
+  },
+
   /// The tokenizer failed to load from its JSON definition.
   #[error("failed to load tokenizer: {0}")]
   TokenizerLoad(#[source] tokenizers::Error),
@@ -108,21 +126,20 @@ pub enum Error {
   #[error("failed to tokenize text: {0}")]
   Tokenize(#[source] tokenizers::Error),
 
-  /// A caller-supplied tokenizer parsed but does not match the Granite
-  /// tokenizer/model contract (vocabulary size, special-token ids, the model's
-  /// id range, or the pinned sentinel encoding), so it would produce finite but
-  /// semantically meaningless embeddings — or out-of-vocabulary ids the model
-  /// can only gather as zeros; OR it is behaviorally valid but not byte-identical
-  /// (SHA-256) to the pinned granite `tokenizer.json`, catching corruption or
-  /// version skew outside the behavioral checks' coverage. Checked at
-  /// construction, fail-closed, by every constructor; the byte-identity stage
-  /// runs on the caller-supplied constructors (`from_memory` / `from_files`) —
-  /// the bundled tokenizer's identity is pinned at dev time.
+  /// A tokenizer parsed but does not match the Granite tokenizer/model contract
+  /// (vocabulary size, special-token ids, the model's id range, or the pinned
+  /// sentinel encoding), so it would produce finite but semantically meaningless
+  /// embeddings — or out-of-vocabulary ids the model can only gather as zeros;
+  /// OR it is behaviorally valid but not byte-identical (SHA-256) to the pinned
+  /// granite `tokenizer.json`, catching corruption or version skew outside the
+  /// behavioral checks' coverage. Checked at construction, fail-closed, by every
+  /// constructor — BOTH stages, for the artifact sidecar `load` reads and for
+  /// caller-supplied bytes (`from_memory` / `from_files`) alike.
   #[error("tokenizer contract mismatch on `{check}`: expected {expected}, got {actual}")]
   TokenizerContractMismatch {
     /// Name of the contract check that failed (e.g. `vocab size`,
     /// `special token <|startoftext|>`, `max token id`, `sentinel encoding`,
-    /// `tokenizer identity (sha-256)`).
+    /// `tokenizer identity (sha-256)`, `artifact tokenizer identity (sha-256)`).
     check: &'static str,
     /// The contract this module expects, rendered for display.
     expected: String,

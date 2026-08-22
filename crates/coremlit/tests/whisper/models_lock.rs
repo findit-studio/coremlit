@@ -5,7 +5,7 @@
 //! rot: the lock stops parsing, or the workflow stops actually reading it.
 //!
 //! No TOML crate: this is a deliberately tiny hand-rolled reader over the
-//! lock's fixed three-table shape (`["repo/name"]` headers, single-line
+//! lock's fixed four-table shape (`["repo/name"]` headers, single-line
 //! `key = "value"` fields), mirroring the sed/awk parsing `ci.yml` itself
 //! performs at CI time — not a general TOML parser.
 
@@ -96,8 +96,8 @@ fn lock_parses_and_every_table_has_a_selector_and_a_revision() {
 
   assert_eq!(
     tables.len(),
-    3,
-    "MODELS_LOCK: expected exactly three tables, found {}",
+    4,
+    "MODELS_LOCK: expected exactly four tables, found {}",
     tables.len()
   );
   for table in &tables {
@@ -133,7 +133,8 @@ fn ci_workflow_derives_downloads_from_the_lock_instead_of_hardcoding_them() {
     vec![
       "argmaxinc/whisperkit-coreml",
       "openai/whisper-tiny",
-      "FinDIT-Studio/embedkit-coreml"
+      "FinDIT-Studio/embedkit-coreml",
+      "FinDIT-Studio/siglip2-naflex-coreml"
     ],
     "MODELS_LOCK's table names or their order changed — update this test alongside it"
   );
@@ -169,6 +170,10 @@ fn ci_workflow_derives_downloads_from_the_lock_instead_of_hardcoding_them() {
     "download step doesn't invoke hf with a lock-derived $granite_repo"
   );
   assert!(
+    ci_contents.contains("hf download \"$siglip_repo\""),
+    "download step doesn't invoke hf with a lock-derived $siglip_repo"
+  );
+  assert!(
     ci_contents.contains("--revision \"$model_revision\""),
     "download step doesn't pass a lock-derived --revision for the model repo"
   );
@@ -179,6 +184,23 @@ fn ci_workflow_derives_downloads_from_the_lock_instead_of_hardcoding_them() {
   assert!(
     ci_contents.contains("--revision \"$granite_revision\""),
     "download step doesn't pass a lock-derived --revision for the granite repo"
+  );
+  assert!(
+    ci_contents.contains("--revision \"$siglip_revision\""),
+    "download step doesn't pass a lock-derived --revision for the siglip repo"
+  );
+
+  // ci.yml selects tables by INDEX, so an appended table it does not extract is
+  // silently ignored: MODELS_LOCK would document a download CI never performs,
+  // and ci.yml's empty-extraction guard — which only inspects variables that
+  // WERE extracted — cannot catch it. The workflow therefore pins the table
+  // count it can parse; assert that pin exists and agrees with the lock, so the
+  // two cannot drift apart in either direction.
+  assert!(
+    ci_contents.contains(&format!("\"$table_count\" -ne {} ]", tables.len())),
+    "ci.yml's download step doesn't pin MODELS_LOCK's table count at {}, so a table appended to \
+     the lock would be silently ignored by its index-selected parser",
+    tables.len()
   );
 
   // MODELS_LOCK's header states that the granite bytes are checked against the

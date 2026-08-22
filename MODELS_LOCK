@@ -3,14 +3,17 @@
 # different revisions) to force a re-download.
 #
 # This file is CONSUMED, not decorative: ci.yml's "Download models (cache
-# miss)" step hand-parses the three tables below (small sed/awk block, no
-# TOML crate — see the comment there) to build all three `hf download`
+# miss)" step hand-parses the four tables below (small sed/awk block, no
+# TOML crate — see the comment there) to build all four `hf download`
 # commands, including `--revision`. Editing a repo name, selector, or
 # revision here changes what CI actually downloads next run, exactly like
 # editing any other lock file. Table ORDER is load-bearing: that parser
 # selects a table by INDEX (1 = whisper model, 2 = whisper tokenizer,
-# 3 = granite), so tables may be appended but never reordered without
-# editing ci.yml to match.
+# 3 = granite, 4 = siglip tokenizer), so tables may be appended but never
+# reordered without editing ci.yml to match. Appending is only safe because
+# ci.yml ALSO asserts the table COUNT it knows how to parse: a fifth table
+# added here without teaching the parser about it fails that job loudly
+# instead of being silently ignored.
 #
 # LOUD FOLLOW-UP: `revision = "main"` on the two whisper tables is a MOVING
 # target, not a real lock — CI can still download different upstream bytes
@@ -35,8 +38,32 @@ revision = "main"
 # The granite embeddings artifact (`embeddings::granite`), staged under
 # Models/embedkit-granite/ — the layout tests/granite/common/mod.rs resolves
 # by default (overridable via EMBEDKIT_TEST_MODELS). `include` pulls the whole
-# bundle directory: the `.mlmodelc` the gates load, the `.mlpackage`, and the
-# `CHECKSUMS.sha256` ci.yml checks every one of them against.
+# bundle directory: the `.mlmodelc` the gates load, the `.mlpackage`, the
+# `CHECKSUMS.sha256` ci.yml checks every one of them against, and the
+# `tokenizer.json` the crate reads from the artifact root.
+#
+# The revision below is the first to carry that `tokenizer.json` (24 MB — the
+# crate stopped embedding it because `include_bytes!` of that size overruns the
+# crates.io size cap), so every granite gate that tokenizes resolves the sidecar
+# from this pin. Its `.mlmodelc`/`.mlpackage` bytes are unchanged from the
+# preceding `81852f70` revision the per-file SHA-256 pins in
+# tests/granite/model_io.rs were cut against; the tokenizer is purely additive.
 ["FinDIT-Studio/embedkit-coreml"]
 include  = "granite-97m-multilingual-r2/*"
-revision = "81852f707848407a4f3059f47a34e2bad71f1c6d"
+revision = "a61241cb18689de1a8b83c315875807030e2878f"
+
+# The siglip2-naflex artifact's TOKENIZER SIDECAR, and nothing else. The two
+# gates in tests/siglip/tokenizer_identity.rs never call `Model::load`: they read
+# `model_root()/tokenizer.json` plus the committed golden corpus and do pure
+# tokenization. So CI stages the 34 MB `tokenizer.json` rather than the whole
+# ~784 MB bundle — the `.mlmodelc` towers and the pos-embed sidecar buy nothing
+# for these two tests. The other siglip model gates (model_io, parity_embed,
+# placement, e2e) DO need the towers and stay local/dev gates, exactly as before.
+#
+# `include` keeps the bundle's own directory, and the tests resolve
+# `model_root()` as `Models/siglip2-naflex/siglip2-base-patch16-naflex-512`, so
+# ci.yml downloads with `--local-dir Models/siglip2-naflex` and the tier
+# directory from `include` supplies the second path component.
+["FinDIT-Studio/siglip2-naflex-coreml"]
+include  = "siglip2-base-patch16-naflex-512/tokenizer.json"
+revision = "eb514c2ab66fb702d43c742add0be5b091b02dab"

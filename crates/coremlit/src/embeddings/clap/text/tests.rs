@@ -68,7 +68,8 @@ fn ids(text: &str) -> Vec<u32> {
 /// are identity-comparable to textclap: the tokenizer artifact is byte-identical
 /// (SHA above) and the truncation config matches textclap's
 /// `force_max_length_truncation`. The live cross-check against the textclap crate
-/// itself is `tests/clap/tokenizer_identity_textclap.rs` (feature `clap-oracle`).
+/// itself is `coremlit-parity`'s `tests/clap/tokenizer_identity_textclap.rs`
+/// (feature `clap-oracle`).
 ///
 /// Measure-then-pin: mutate the tokenizer bytes or the encode call and these
 /// exact sequences change.

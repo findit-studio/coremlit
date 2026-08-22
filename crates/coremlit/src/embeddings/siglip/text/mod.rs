@@ -1,4 +1,4 @@
-//! The siglip [`TextEmbedder`]: the bundled Gemma tokenizer around the fp16
+//! The siglip [`TextEmbedder`]: the artifact's Gemma tokenizer around the fp16
 //! CoreML text graph, with L2 normalization applied in Rust.
 //!
 //! Text is lowercased before tokenization (the SigLIP2 training convention;
@@ -33,6 +33,23 @@ mod names {
   pub const TEXT_FEATURES: &str = "text_features";
 }
 
+/// The tokenizer identity contract. SigLIP 2 NaFlex is a FIXED model, so exactly
+/// one tokenizer artifact is correct — the source-revision Gemma `tokenizer.json`
+/// that cut the committed token-id goldens.
+///
+/// This pin is what keeps the artifact SIDECAR from being weaker than the bytes
+/// the crate used to embed: a compiled-in asset was identity-by-construction, a
+/// file on disk is not. [`TextEmbedder::load`] hashes what it read and refuses
+/// anything else, fail-closed, before any model load.
+mod contract {
+  /// SHA-256 (lowercase hex) of `google/siglip2-base-patch16-naflex`'s
+  /// `tokenizer.json` at revision `b53b807d3a2d5e2b3911292f2d69e5341cdc064c` —
+  /// the bytes `tests/siglip/tokenizer_identity.rs` proves reproduce every
+  /// committed golden token window.
+  pub const TOKENIZER_SHA256_HEX: &str =
+    "58a1696e79c9d97937389ed116f552a15c84811d7b8023918b86f4bc5775b1b0";
+}
+
 /// Sentinel embedded in the Wave-A placeholder `assets/tokenizer.json`; the real
 /// source-revision Gemma artifact cannot contain it. Kept after Wave B as a
 /// regression guard against re-committing the placeholder.
@@ -57,6 +74,50 @@ fn ensure_not_placeholder(bytes: &[u8]) -> Result<()> {
     return Err(Error::TokenizerPlaceholder);
   }
   Ok(())
+}
+
+/// The artifact-root path [`TextEmbedder::load`] reads its tokenizer from: the
+/// directory CONTAINING `model_path`, joined with the sidecar file name.
+///
+/// The published bundle lays the artifact out with `tokenizer.json` beside the
+/// `.mlmodelc` bundles and the pos-emb sidecar, all under the tier directory the
+/// `CHECKSUMS.sha256` is rooted at. A `model_path` with no parent component
+/// yields the bare file name, i.e. the current directory — the same place the
+/// bundle itself would resolve from.
+fn artifact_tokenizer_path(model_path: &Path) -> std::path::PathBuf {
+  model_path
+    .parent()
+    .unwrap_or_else(|| Path::new(""))
+    .join(crate::embeddings::siglip::TOKENIZER_FILE_NAME)
+}
+
+/// Fails closed unless `bytes` is byte-identical (SHA-256) to the pinned
+/// source-revision Gemma `tokenizer.json`.
+///
+/// The placeholder scan above only catches the ONE stub this repo ever shipped;
+/// it says nothing about a truncated download, a different checkpoint's
+/// tokenizer, or a re-serialized copy whose vocab drifted. When the tokenizer was
+/// compiled in, byte identity held by construction and a dev-time test was
+/// enough. Read from a staged artifact directory, it has to be checked at load —
+/// otherwise moving the file out of the crate would trade a guaranteed-correct
+/// tokenizer for an unverified one, which is strictly worse.
+///
+/// # Errors
+/// [`Error::ArtifactTokenizerIdentity`] if the digest differs from the pin.
+fn ensure_pinned_identity(bytes: &[u8], path: &Path) -> Result<()> {
+  use sha2::{Digest, Sha256};
+  let actual: String = Sha256::digest(bytes)
+    .iter()
+    .map(|b| format!("{b:02x}"))
+    .collect();
+  if actual == contract::TOKENIZER_SHA256_HEX {
+    return Ok(());
+  }
+  Err(Error::ArtifactTokenizerIdentity {
+    path: path.to_path_buf(),
+    expected: contract::TOKENIZER_SHA256_HEX,
+    actual,
+  })
 }
 
 /// Default [`TextEmbedderOptions::compute`]: [`ComputeUnits::CpuAndGpu`] — the
@@ -147,7 +208,7 @@ pub(crate) enum PadSide {
 /// same joint-space [`Embedding`] the image tower emits.
 ///
 /// Lowercases the text (SigLIP2 convention; checkpoint `do_lower_case: true`),
-/// tokenizes with the bundled Gemma tokenizer (truncation `LongestFirst` at the
+/// tokenizes with the Gemma tokenizer (truncation `LongestFirst` at the
 /// resolved window `T`, the tokenizer's own padding disabled), builds the fixed
 /// `[1, T]` padded window (side/id per D6), runs the single-input fp16 CoreML
 /// graph, and L2-normalizes the pre-normalization projection.
@@ -169,34 +230,53 @@ pub struct TextEmbedder {
 }
 
 impl TextEmbedder {
-  /// Loads the text `.mlmodelc` from `model_path` with the bundled tokenizer and
-  /// custom `options` — the primary constructor. Resolves the window `T` and
-  /// validates the I/O contract against the metadata at load.
+  /// Loads the text `.mlmodelc` from `model_path` with the artifact's own
+  /// [`TOKENIZER_FILE_NAME`](crate::embeddings::siglip::TOKENIZER_FILE_NAME)
+  /// sidecar and custom `options` — the primary constructor. Resolves the window
+  /// `T` and validates the I/O contract against the metadata at load.
+  ///
+  /// The tokenizer is read from the model artifact's ROOT — the directory
+  /// *containing* `model_path`, where the published bundle places
+  /// `tokenizer.json` beside the `.mlmodelc` bundles. Both guards run on the
+  /// bytes actually read, before any model load: the placeholder sentinel scan
+  /// and the SHA-256 identity pin.
   ///
   /// # Errors
-  /// [`Error::TokenizerPlaceholder`] if the bundled `tokenizer.json` is still the
-  /// build-time placeholder (fails closed before any I/O); otherwise as
-  /// [`Self::from_files`] (with the bundled tokenizer bytes).
+  /// [`Error::ArtifactTokenizerRead`] if the sidecar is missing or unreadable;
+  /// [`Error::TokenizerPlaceholder`] if it is the build-time placeholder;
+  /// [`Error::ArtifactTokenizerIdentity`] if it is not the pinned Gemma
+  /// artifact; otherwise as [`Self::from_files`].
   pub fn load(model_path: impl AsRef<Path>, options: TextEmbedderOptions) -> Result<Self> {
-    ensure_not_placeholder(crate::embeddings::siglip::BUNDLED_TOKENIZER)?;
-    let tokenizer = Tokenizer::from_bytes(crate::embeddings::siglip::BUNDLED_TOKENIZER)
-      .map_err(Error::TokenizerLoad)?;
+    let model_path = model_path.as_ref();
+    let tokenizer_path = artifact_tokenizer_path(model_path);
+    let bytes = std::fs::read(&tokenizer_path).map_err(|source| Error::ArtifactTokenizerRead {
+      path: tokenizer_path.clone(),
+      source,
+    })?;
+    // The guard the embedded bytes used to carry, applied to the file that is
+    // ACTUALLY loaded — a placeholder staged into an artifact tree must fail
+    // exactly as a placeholder compiled into the crate did.
+    ensure_not_placeholder(&bytes)?;
+    ensure_pinned_identity(&bytes, &tokenizer_path)?;
+    let tokenizer = Tokenizer::from_bytes(&bytes).map_err(Error::TokenizerLoad)?;
     Self::from_parts(model_path, tokenizer, options)
   }
 
-  /// Loads the text `.mlmodelc` from `model_path` using the bundled tokenizer and
-  /// [`TextEmbedderOptions::new`].
+  /// Loads the text `.mlmodelc` from `model_path` using the artifact's
+  /// [`TOKENIZER_FILE_NAME`](crate::embeddings::siglip::TOKENIZER_FILE_NAME)
+  /// sidecar and [`TextEmbedderOptions::new`].
   ///
   /// # Errors
-  /// As [`Self::from_files`].
+  /// As [`Self::load`].
   pub fn from_file(model_path: impl AsRef<Path>) -> Result<Self> {
     Self::load(model_path, TextEmbedderOptions::new())
   }
 
   /// Loads the model and a `tokenizer.json` from separate file paths. The
   /// caller-supplied file is deliberately NOT placeholder-checked — a
-  /// caller-chosen tokenizer is the caller's contract; the placeholder ships
-  /// only as the bundled bytes that [`Self::load`] / [`Self::from_memory`] guard.
+  /// caller-chosen tokenizer is the caller's contract. [`Self::load`] guards the
+  /// artifact sidecar it reads, and [`Self::from_memory`] guards the bytes handed
+  /// to it; this constructor deliberately does neither.
   ///
   /// # Errors
   /// [`Error::Load`] if CoreML rejects the model / [`Error::ContractMismatch`]
@@ -217,8 +297,8 @@ impl TextEmbedder {
   ///
   /// # Errors
   /// [`Error::TokenizerPlaceholder`] if `tokenizer_json_bytes` is the build-time
-  /// placeholder (e.g. the current [`crate::embeddings::siglip::BUNDLED_TOKENIZER`];
-  /// fails closed before any I/O); otherwise as [`Self::from_files`].
+  /// placeholder (fails closed before any I/O); otherwise as
+  /// [`Self::from_files`].
   pub fn from_memory(
     model_path: impl AsRef<Path>,
     tokenizer_json_bytes: &[u8],
@@ -463,8 +543,8 @@ fn build_window(
 /// with a caller-supplied tokenizer and window `T`. Exposed (rather than
 /// `#[cfg(test)]`) for the Wave B token-identity integration gate
 /// (`tests/siglip/tokenizer_identity.rs`), which builds each golden window from
-/// [`crate::embeddings::siglip::BUNDLED_TOKENIZER`] with no model load; hidden from
-/// docs because it is a test seam, not part of the supported surface.
+/// the artifact's staged `tokenizer.json` with no model load; hidden from docs
+/// because it is a test seam, not part of the supported surface.
 #[doc(hidden)]
 pub fn configured_tokenizer_from_bytes(bytes: &[u8], max_tokens: usize) -> Result<Tokenizer> {
   let mut tokenizer = Tokenizer::from_bytes(bytes).map_err(Error::TokenizerLoad)?;

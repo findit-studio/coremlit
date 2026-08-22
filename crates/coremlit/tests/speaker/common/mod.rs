@@ -14,6 +14,15 @@ use coremlit::audio::speaker::{
 };
 use sha2::{Digest, Sha256};
 
+// The `coremlit_dir` hop that keeps every crate-relative fixture path below
+// correct from BOTH packages that compile this shared module (`coremlit`'s own
+// test binaries and `coremlit-parity`'s oracle binaries, which `#[path]`-include
+// this very file). Kept in one place — see its module doc.
+#[path = "../../support/coremlit_dir.rs"]
+#[allow(dead_code)]
+mod coremlit_dir;
+use coremlit_dir::coremlit_path;
+
 /// Directory containing the downloaded speakerkit model artifacts.
 ///
 /// Overridable via `SPEAKERKIT_TEST_MODELS`; otherwise falls back to
@@ -74,7 +83,7 @@ pub fn argmax_models_dir() -> PathBuf {
 /// silently collapsing 8-speaker audio; the shipping embedder is now the fp32
 /// [`embed_fp32_path`] (see `tests/model_io.rs`'s DECISION). The int8 bytes
 /// stay on disk and byte-pinned because the factorial and mechanism records
-/// (`tests/speaker/backend_factorial.rs`) run on them.
+/// (`coremlit-parity`'s `tests/speaker/backend_factorial.rs`) run on them.
 pub fn embed_path() -> PathBuf {
   models_dir().join("wespeaker_v2.mlmodelc")
 }
@@ -149,7 +158,7 @@ pub const SEG_MODEL_LABEL: &str =
 
 /// Directory holding the committed parity fixtures (`audio/` + `golden/`).
 pub fn fixtures_dir() -> PathBuf {
-  PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/speaker/fixtures")
+  coremlit_path("tests/speaker/fixtures")
 }
 
 /// Committed WAV path for a fixture `name`.

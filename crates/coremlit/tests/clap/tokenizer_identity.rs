@@ -9,9 +9,10 @@
 //! 2. `src/text/tests.rs` exercises clapkit's ACTUAL configured tokenizer seam
 //!    over a pinned corpus (English, CJK, emoji, >512-token truncation) and pins
 //!    the exact token-id sequences.
-//! 3. `tests/clap/tokenizer_identity_textclap.rs` (feature `clap-oracle`) is the
-//!    LIVE cross-check: it links the sibling textclap crate and asserts the two
-//!    crates' bundled tokenizer bytes are byte-for-byte identical.
+//! 3. `coremlit-parity`'s `tests/clap/tokenizer_identity_textclap.rs` (feature
+//!    `clap-oracle`) is the LIVE cross-check: it links the sibling textclap
+//!    crate and asserts the two crates' bundled tokenizer bytes are
+//!    byte-for-byte identical.
 
 /// The pinned Xenova `tokenizer.json` SHA-256 (revision `c28f2883…`), identical
 /// to textclap's pin.

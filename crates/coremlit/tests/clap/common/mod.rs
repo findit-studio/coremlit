@@ -8,6 +8,15 @@
 
 use std::path::{Path, PathBuf};
 
+// The `coremlit_dir` hop that keeps every crate-relative fixture path below
+// correct from BOTH packages that compile this shared module (`coremlit`'s own
+// test binaries and `coremlit-parity`'s oracle binaries, which `#[path]`-include
+// this very file). Kept in one place — see its module doc.
+#[path = "../../support/coremlit_dir.rs"]
+#[allow(dead_code)]
+mod coremlit_dir;
+use coremlit_dir::coremlit_path;
+
 /// Directory containing the downloaded clapkit CoreML artifacts.
 ///
 /// Overridable via `CLAPKIT_TEST_MODELS`; otherwise `<workspace>/Models/clapkit`
@@ -57,7 +66,7 @@ pub fn text_model_int8_path() -> PathBuf {
 }
 
 /// Directory holding textclap's Xenova ONNX graphs — the T4 parity oracle
-/// (`tests/clap/parity_textclap.rs`). Contains the quantized (int8-class) graphs
+/// (`coremlit-parity`'s `tests/clap/parity_textclap.rs`). Contains the quantized (int8-class) graphs
 /// `audio_model_quantized.onnx` / `text_model_quantized.onnx` that textclap
 /// ships, and optionally the fp32 unquantized `audio_model.onnx` /
 /// `text_model.onnx` used for the unquantized fp32 control.
@@ -88,11 +97,7 @@ pub fn textclap_onnx_dir() -> PathBuf {
 /// Absolute path to a committed test fixture under `crates/coremlit/tests/clap/fixtures`.
 #[allow(dead_code)]
 pub fn fixture_path(relative: &str) -> PathBuf {
-  PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-    .join("tests")
-    .join("clap")
-    .join("fixtures")
-    .join(relative)
+  coremlit_path("tests/clap/fixtures").join(relative)
 }
 
 /// Decode a 48 kHz mono WAV fixture into `f32` samples in `[-1, 1]`. Asserts the

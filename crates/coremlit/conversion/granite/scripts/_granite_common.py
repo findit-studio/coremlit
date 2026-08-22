@@ -38,11 +38,14 @@ MODEL_ID = "ibm-granite/granite-embedding-97m-multilingual-r2"
 REV = "835ad14087e140460703cf0fae09f97d469d65c2"
 
 # Per-source-file SHA-256 at REV (verified 2026-07-26). model.safetensors and
-# tokenizer.json are the load-bearing weight/tokenizer identities (tokenizer.json
-# is ALSO the `coremlit::embeddings::granite::BUNDLED_TOKENIZER` pin, asserted in
-# tests/granite/tokenizer_identity.rs); the JSON configs are pinned because the
-# graph shape (layer_types, rope thetas, local_attention, norm_eps) and the
-# pooling/prompt contract are read from them, not hardcoded here.
+# tokenizer.json are the load-bearing weight/tokenizer identities. tokenizer.json
+# is ALSO the file this recipe STAGES INTO the published artifact (the crate no
+# longer embeds it: `TextEmbedder::load` reads it from beside the .mlmodelc and
+# checks it against `contract::TOKENIZER_SHA256_HEX`, which is this same digest),
+# and it is asserted in tests/granite/tokenizer_identity.rs. The JSON configs are
+# pinned because the graph shape (layer_types, rope thetas, local_attention,
+# norm_eps) and the pooling/prompt contract are read from them, not hardcoded
+# here.
 SOURCE_SHA256 = {
     "model.safetensors": "f3ea88b230492811046145513710e76b4cc8c2ad49e8708da0e7247e548903be",
     "tokenizer.json": "4f2842d568e2724370aec203652a42ac783c7937f8347a1a2cc7506d71f1582f",
@@ -66,10 +69,19 @@ BUNDLE_SUBDIR = "granite-97m-multilingual-r2"
 COMPUTE_UNIT_NAMES = ("CpuOnly", "CpuAndGpu", "CpuAndNeuralEngine", "All")
 
 # The published artifact's EXACT file set (the enumerate-then-hash discipline
-# `tests/granite/model_io.rs` applies to the bundle). The model card is part of
-# the distributed set but is staged, never generated here; the two names below it
-# are this recipe's own outputs and are excluded from discovery.
+# `tests/granite/model_io.rs` applies to the bundle). The model card and the
+# tokenizer are part of the distributed set but are staged, never generated here;
+# the two names below them are this recipe's own outputs and are excluded from
+# discovery.
 MODEL_CARD = "README.md"
+# The runtime tokenizer sidecar. It ships WITH the model because the Rust crate
+# stopped embedding it (a 24 MB include_bytes! in a crates.io package), so
+# `TextEmbedder::load` reads `<artifact root>/tokenizer.json` beside the
+# .mlmodelc. Dropping it from the artifact breaks every default constructor, so
+# it belongs in the exact-set gate and in CHECKSUMS.sha256 like any other
+# distributed file. Its bytes are the pinned SOURCE tokenizer, copied unmodified:
+# SOURCE_SHA256["tokenizer.json"] IS the identity the crate enforces at load.
+TOKENIZER_FILE = "tokenizer.json"
 GENERATED_AT_ROOT = ("CHECKSUMS.sha256", "MANIFEST.json")
 FP32_REFERENCE = f"{MODEL_STEM}_fp32.mlpackage"
 SHIPPED_PACKAGE = f"{MODEL_STEM}.mlpackage"
@@ -101,7 +113,9 @@ EXPECTED_BUNDLE_FILES = sorted([
     f"./{MODEL_STEM}.mlpackage/Data/com.apple.CoreML/weights/weight.bin",
     f"./{MODEL_STEM}.mlpackage/Manifest.json",
 ])
-EXPECTED_ARTIFACT_FILES = sorted(EXPECTED_BUNDLE_FILES + [f"./{MODEL_CARD}"])
+EXPECTED_ARTIFACT_FILES = sorted(
+    EXPECTED_BUNDLE_FILES + [f"./{MODEL_CARD}", f"./{TOKENIZER_FILE}"]
+)
 
 # The additive attention-mask "blocked" value. LOAD-BEARING, and NOT
 # ``torch.finfo(dtype).min``: the shipped artifact is fp16, and -3.4e38 overflows
