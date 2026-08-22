@@ -137,6 +137,7 @@ jobs:
             Models/ced/ced-tiny
           key: models-${{ hashFiles('MODELS_LOCK') }}
       - name: Download models (cache miss)
+        id: download
         if: steps.models.outputs.cache-hit != 'true'
         run: |
           set -euo pipefail
@@ -252,6 +253,32 @@ jobs:
           # — the layout tests/ced/common/mod.rs resolves without CED_TEST_MODELS.
           hf download "$ced_repo" --include "$ced_include" --revision "$ced_revision" \
             --local-dir Models/ced
+      # EVERY step below carries
+      # `if: ${{ !cancelled() && steps.download.outcome != 'failure' }}`, and
+      # that is not boilerplate — it is the fix for a failure mode this job
+      # actually had. GitHub's default step condition is `success()`, so ONE red
+      # gate marks every later gate `skipped`, and `skipped` is silent: the job
+      # reports the single failure it hit and says nothing about the ones it
+      # never attempted. That is exactly what happened here — a stale assertion
+      # in the whisper suite went red the day it merged and stayed red for four
+      # weeks, and the four gate steps below it (Whisper+VAD, granite, SigLIP,
+      # CED) have between them NEVER executed on CI: each was added after the
+      # step above it was already permanently red, so every one of them has
+      # reported `skipped` on every run it has ever been part of — the granite
+      # gates since the day after they were written.
+      #
+      # These gates are INDEPENDENT of each other: a corrupt granite bundle
+      # says nothing about whether the CED graph loads. So each reports its own
+      # verdict and the job aggregates them, and one red gate can no longer hide
+      # another's result. A failed DOWNLOAD is the one real dependency (nothing
+      # below can run without the artifacts), so that alone still short-circuits
+      # — and `steps.download.outcome` is `skipped`, not `failure`, on a cache
+      # hit, so the common path is unaffected.
+      #
+      # The `Gate ledger` step at the end of the job then refuses the residue:
+      # a step added later WITHOUT this condition would reintroduce the silent
+      # skip, so the ledger fails the job if any named gate did not run.
+
       # Runs on EVERY run, not just cache misses, so a truncated download AND a
       # tampered or partially-restored cache entry both fail here rather than
       # surfacing later as a confusing parity or model_io failure. The bundle
@@ -260,6 +287,8 @@ jobs:
       # file that is missing, a hash mismatch, and a checksum file with no valid
       # lines each exit non-zero.
       - name: Verify granite artifact checksums
+        id: granite_checksums
+        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
         run: |
           set -euo pipefail
           bundle_root=Models/embedkit-granite/granite-97m-multilingual-r2
@@ -279,6 +308,8 @@ jobs:
       # "No such file or directory" lines, which `shasum -c` exits non-zero on —
       # fail-closed either way, but loudly wrong rather than quietly wrong.
       - name: Verify CED artifact checksums
+        id: ced_checksums
+        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
         run: |
           set -euo pipefail
           bundle=Models/ced/ced-tiny/ced_tiny.mlmodelc
@@ -315,19 +346,33 @@ jobs:
       # runner has downloaded vendors, so build.rs emits cfg(models_present) and
       # the walk covers all of Models/, vadkit included. The modelless
       # check/features jobs deliberately leave the sweep #[ignore]d (build.rs).
-      - run: COREMLIT_FP16_SWEEP_VENDORS=whisperkit-coreml,embedkit-granite,vadkit,ced cargo test -p coremlit --test fp16_guards
-      - run: crates/coremlit/tests/fp16_sweep_inventory.sh
+      - name: fp16 graph sweep
+        id: fp16_guards
+        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
+        run: COREMLIT_FP16_SWEEP_VENDORS=whisperkit-coreml,embedkit-granite,vadkit,ced cargo test -p coremlit --test fp16_guards
+      - name: fp16 sweep inventory
+        id: fp16_inventory
+        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
+        run: crates/coremlit/tests/fp16_sweep_inventory.sh
       # Core model-gated suite (tiny_model etc., whisper-tiny via
       # WHISPERKIT_TEST_MODELS); then the whisper pipeline's model-gated suite.
       # The align/speaker/vad model gates need models this runner does not
       # download and stay local/dev gates, exactly as before the restructure.
-      - run: cargo test -p coremlit -- --ignored
-      - run: cargo test -p coremlit --features whisper -- --ignored
+      - name: Core model gates
+        id: core_gates
+        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
+        run: cargo test -p coremlit -- --ignored
+      - name: Whisper model gates
+        id: whisper_gates
+        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
+        run: cargo test -p coremlit --features whisper -- --ignored
       # The `whisper,vad` composition gates (Silero-driven long-form chunking).
       # They need whisper-tiny, so they belong here rather than in `check`, and
       # they were dark until the VAD model was committed — this runner has no
       # other way to get it. Same anti-vacuum guard as the granite/siglip steps.
       - name: Whisper + Silero-VAD composition gates
+        id: whisper_vad_gates
+        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
         run: |
           set -euo pipefail
           listed=$(cargo test -p coremlit --features whisper,vad --test whisper_vad_source -- --list --ignored 2>/dev/null | grep -c ': test$' || true)
@@ -352,6 +397,8 @@ jobs:
       # The hermetic granite suites (tokenizer identity, in-lib) are the
       # `features` job's, not this one's.
       - name: Granite model gates
+        id: granite_gates
+        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
         run: |
           set -euo pipefail
           bundle=Models/embedkit-granite/granite-97m-multilingual-r2/granite_97m_512.mlmodelc
@@ -398,6 +445,8 @@ jobs:
       # deleted, renamed, un-ignored, or that failed to BUILD runs 0 tests and
       # exits 0, so the ignored-only `--list` count refuses it.
       - name: SigLIP tokenizer gates
+        id: siglip_gates
+        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
         run: |
           set -euo pipefail
           tokenizer=Models/siglip2-naflex/siglip2-base-patch16-naflex-512/tokenizer.json
@@ -429,6 +478,8 @@ jobs:
       # deleted `tiny` module still report the OTHER three sizes' gates as a
       # non-zero count and then run zero — the exact vacuum the guard refuses.
       - name: CED model gates (tiny)
+        id: ced_gates
+        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
         run: |
           set -euo pipefail
           bundle=Models/ced/ced-tiny/ced_tiny.mlmodelc
@@ -445,3 +496,43 @@ jobs:
             echo "== $target: $listed tiny model gate(s) =="
             cargo test -p coremlit --features ced --test "$target" -- --ignored tiny::
           done
+      # The anti-vacuum guard for the JOB, mirroring the per-target
+      # `--list --ignored` counts inside the gates above: those refuse a gate
+      # that runs zero tests, and this refuses a gate that never runs at all.
+      #
+      # `!cancelled()` alone, deliberately — this must report even when the
+      # download failed, because "the download died and took ten gates with it"
+      # is precisely the fact the old job swallowed. A `skipped` outcome here
+      # can only mean a step lost its condition or the download failed; either
+      # way the job must be red and must SAY which gates did not execute.
+      #
+      # Adding a gate step above means adding its id here. Forgetting to is the
+      # benign direction (the new gate is simply unwatched); forgetting the
+      # `if:` on it is the harmful one, and it is the one this catches.
+      - name: Gate ledger (a gate that never ran proves nothing)
+        if: ${{ !cancelled() }}
+        env:
+          LEDGER: |
+            granite-checksums=${{ steps.granite_checksums.outcome }}
+            ced-checksums=${{ steps.ced_checksums.outcome }}
+            fp16-graph-sweep=${{ steps.fp16_guards.outcome }}
+            fp16-sweep-inventory=${{ steps.fp16_inventory.outcome }}
+            core-model-gates=${{ steps.core_gates.outcome }}
+            whisper-model-gates=${{ steps.whisper_gates.outcome }}
+            whisper-vad-gates=${{ steps.whisper_vad_gates.outcome }}
+            granite-model-gates=${{ steps.granite_gates.outcome }}
+            siglip-tokenizer-gates=${{ steps.siglip_gates.outcome }}
+            ced-model-gates=${{ steps.ced_gates.outcome }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$LEDGER"
+          # `skipped` is the gate that never ran; an EMPTY outcome is a typo in
+          # an id above, which would leave that gate unwatched — both are the
+          # same defect (a gate whose fate this step cannot report) and both
+          # fail here.
+          missing=$(printf '%s' "$LEDGER" | sed -nE 's/^ *([^=]*)=(skipped)?$/\1/p' | paste -sd' ' -)
+          if [ -n "$missing" ]; then
+            echo "::error::these gate steps did not run, or this step cannot tell: $missing — a red step must not silently disable the gates after it (see the note above the first gate), so this job fails on their absence, not on their result" >&2
+            exit 1
+          fi
+          echo "all gates executed"
