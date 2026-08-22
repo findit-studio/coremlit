@@ -35,7 +35,8 @@ mod tests;
 /// [`value`](windit::windowed::Windowed::value) /
 /// [`span`](windit::windowed::Windowed::span). Carrying the span is what makes
 /// time-localized tagging ("when did the dog bark") a caller-side read — no
-/// second API needed.
+/// second API needed. To build one in a test without running a model, get the
+/// value from [`Confidences::try_from_slice`].
 pub type WindowConfidences = windit::windowed::Windowed<Confidences>;
 
 /// One ranked AudioSet prediction: a rated event row plus its sigmoid
@@ -122,6 +123,46 @@ impl Confidences {
   /// As [`Self::new`], on a wrong-length slice (internal invariant).
   pub(crate) fn from_logits(logits: &[f32]) -> Self {
     Self::new(logits.iter().copied().map(sigmoid).collect())
+  }
+
+  /// Build a confidence vector by hand, for a consumer's own tests: it is what
+  /// lets downstream event logic — class projection, smoothing, segmentation —
+  /// be unit-tested on synthetic window scores with no staged `.mlmodelc` and
+  /// no inference. It is not a general-purpose builder, and the classify path
+  /// does not go through it.
+  ///
+  /// `values` is read positionally as confidences that are ALREADY in
+  /// confidence space, one per class, indexed exactly as [`Self::as_slice`]
+  /// returns them ([`EventPrediction::index`] / [`RatedSoundEvent::index`]).
+  /// How the model path reaches those numbers is deliberately not part of this
+  /// contract: it takes no logits and applies no sigmoid, so the internal
+  /// logit→confidence step stays free to change. The slice is copied rather
+  /// than adopted, so neither is the storage `Confidences` chooses.
+  ///
+  /// Pair it with [`WindowConfidences::new`](windit::windowed::Windowed::new)
+  /// to stand in for one window of [`Classifier::classify_windows`](crate::audio::ced::Classifier::classify_windows)
+  /// output; `audio::ced`'s module docs run the whole pipeline that way.
+  ///
+  /// # Errors
+  /// [`Error::ClassCountMismatch`] if `values.len() != `[`NUM_CLASSES`];
+  /// [`Error::InvalidConfidence`] on any value outside `[0, 1]` — this type's
+  /// stated invariant, which the model path gets for free from sigmoid and a
+  /// hand-built vector has to be checked for.
+  pub fn try_from_slice(values: &[f32]) -> Result<Self> {
+    if values.len() != NUM_CLASSES {
+      return Err(Error::ClassCountMismatch {
+        expected: NUM_CLASSES,
+        got: values.len(),
+      });
+    }
+    for (index, &value) in values.iter().enumerate() {
+      // NaN and both infinities fail this containment test too, so it is the
+      // whole "finite and in [0, 1]" check, not just the bounds half.
+      if !(0.0..=1.0).contains(&value) {
+        return Err(Error::InvalidConfidence { index, value });
+      }
+    }
+    Ok(Self::new(values.to_vec()))
   }
 
   /// The per-class confidences, indexed by class index

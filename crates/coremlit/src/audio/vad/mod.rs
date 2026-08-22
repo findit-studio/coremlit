@@ -49,6 +49,38 @@
 //! composition: `audio::whisper::silero_vad::SileroVad` plugs the Silero model
 //! into whisper's own frame-level VAD seam for long-form chunking.
 //!
+//! # Two spellings, one set of types
+//!
+//! zuoer names its detector types for the general thing they detect — a [`Run`]
+//! of frames above threshold, assembled by a [`RunSegmenter`] configured with
+//! [`RunOptions`] — and declares the speech-flavoured names as plain type
+//! **aliases** of those:
+//!
+//! | neutral          | speech alias(es)                        |
+//! | ---------------- | --------------------------------------- |
+//! | [`Run`]          | [`SpeechSegment`]                       |
+//! | [`RunSegmenter`] | [`SpeechSegmenter`], [`SpeechDetector`] |
+//! | [`RunOptions`]   | [`SpeechOptions`]                       |
+//!
+//! Both spellings are re-exported here and they are the SAME items, not
+//! parallel types: rustdoc renders each type once under its neutral name with
+//! the aliases pointing at it, and a value produced through one spelling is
+//! consumed through the other with no conversion. So this is a naming choice,
+//! never a behavioural one — pick by what the probabilities you feed in
+//! actually mean. Driven by [`CoreMlBackend`] they are speech probabilities and
+//! [`detect_speech`] plus the `Speech*` names read true. Driven by anything
+//! else — one class column of a CED sound-event track is the worked example in
+//! `audio::ced` — nothing about them is speech, and the `Run*` spelling is the
+//! honest one.
+//!
+//! Those three names plus [`SampleRate`] (already neutral, and shared) and
+//! [`Error`] / [`Result`] are the whole set needed to construct a
+//! [`RunSegmenter`], push probabilities into it and read the [`Run`]s back, so
+//! a consumer doing per-class segmentation never needs `zuoer` as a direct
+//! dependency. The `detect_speech*` entry points are the speech-only part of
+//! the surface: they own a [`VadBackend`], which is where the audio — and the
+//! speech assumption — enters.
+//!
 //! # Segment confidence
 //!
 //! A [`SpeechSegment`] carries more than a timespan. `zuoer` accumulates the
@@ -182,6 +214,6 @@ pub use model::{
 // [`InferError`] bridges through [`zuoer::Error::Backend`]), distinct from the
 // model-layer [`ModelError`] / [`InferError`] above.
 pub use zuoer::{
-  Error, Result, SampleRate, SpeechDetector, SpeechOptions, SpeechSegment, SpeechSegmenter,
-  VadBackend, detect_speech_with,
+  Error, Result, Run, RunOptions, RunSegmenter, SampleRate, SpeechDetector, SpeechOptions,
+  SpeechSegment, SpeechSegmenter, VadBackend, detect_speech_with,
 };

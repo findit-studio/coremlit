@@ -137,6 +137,76 @@ fn confidences_reject_a_wrong_length_vector() {
 }
 
 #[test]
+fn try_from_slice_accepts_a_hand_built_confidence_vector() {
+  let mut values = vec![0.0f32; NUM_CLASSES];
+  values[74] = 0.86;
+  values[NUM_CLASSES - 1] = 1.0;
+  let c = Confidences::try_from_slice(&values).expect("valid confidences");
+  // Read back positionally, unchanged: the constructor is a copy, not a
+  // transform — no sigmoid, no renormalization.
+  assert_eq!(c.as_slice(), values.as_slice());
+}
+
+#[test]
+fn try_from_slice_rejects_a_wrong_length_vector_without_panicking() {
+  // The caller-reachable counterpart to `Confidences::new`'s internal assert:
+  // same mistake, a typed error instead of an unwind.
+  for got in [NUM_CLASSES - 1, NUM_CLASSES + 1, 0] {
+    let err = Confidences::try_from_slice(&vec![0.5f32; got]).unwrap_err();
+    assert!(
+      matches!(
+        err,
+        crate::audio::ced::Error::ClassCountMismatch { expected, got: g }
+          if expected == NUM_CLASSES && g == got
+      ),
+      "len {got} gave {err:?}"
+    );
+  }
+}
+
+#[test]
+fn try_from_slice_rejects_values_outside_the_stated_invariant() {
+  // `Confidences` documents "finite values in [0, 1]"; the model path gets
+  // that from sigmoid, so this path is the only one that can break it.
+  for (index, bad) in [
+    (0usize, -0.001f32),
+    (74, 1.001),
+    (300, f32::NAN),
+    (NUM_CLASSES - 1, f32::INFINITY),
+    (5, f32::NEG_INFINITY),
+  ] {
+    let mut values = vec![0.5f32; NUM_CLASSES];
+    values[index] = bad;
+    let err = Confidences::try_from_slice(&values).unwrap_err();
+    assert!(
+      matches!(
+        err,
+        crate::audio::ced::Error::InvalidConfidence { index: i, value }
+          if i == index && (value == bad || (value.is_nan() && bad.is_nan()))
+      ),
+      "{bad} at {index} gave {err:?}"
+    );
+  }
+  // The boundaries themselves are inside the invariant, and so is -0.0.
+  let mut edges = vec![0.5f32; NUM_CLASSES];
+  edges[0] = 0.0;
+  edges[1] = 1.0;
+  edges[2] = -0.0;
+  assert!(Confidences::try_from_slice(&edges).is_ok());
+}
+
+#[test]
+fn try_from_slice_and_from_logits_agree_on_the_same_confidences() {
+  // The public hand-build path and the internal model path produce equal
+  // values when handed the same numbers — `try_from_slice` is the identity on
+  // confidence space, `from_logits` the sigmoid onto it.
+  let logits = scripted_scores();
+  let via_logits = Confidences::from_logits(&logits);
+  let via_slice = Confidences::try_from_slice(via_logits.as_slice()).expect("sigmoid is in range");
+  assert_eq!(via_slice, via_logits);
+}
+
+#[test]
 fn from_logits_maps_sigmoid_elementwise() {
   let mut logits = vec![0.0f32; NUM_CLASSES];
   logits[0] = 2.0;

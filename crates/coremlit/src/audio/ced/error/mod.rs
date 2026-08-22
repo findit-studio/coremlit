@@ -91,6 +91,33 @@ pub enum Error {
   #[error("no windows to aggregate")]
   EmptyWindows,
 
+  /// A caller-built confidence vector did not have exactly one entry per
+  /// class. Raised only by
+  /// [`Confidences::try_from_slice`](crate::audio::ced::Confidences::try_from_slice) —
+  /// the model path is shape-checked at the graph boundary long before it
+  /// reaches confidence space, so this is the hand-built path's error and no
+  /// other.
+  #[error("confidence vector has {got} values, expected exactly {expected} (one per class)")]
+  ClassCountMismatch {
+    /// The required length ([`NUM_CLASSES`](crate::audio::ced::NUM_CLASSES)).
+    expected: usize,
+    /// The length the caller supplied.
+    got: usize,
+  },
+
+  /// A caller-built confidence was not a finite value in `[0, 1]`. Same origin
+  /// as [`Self::ClassCountMismatch`]: the model path gets the range for free
+  /// from sigmoid, so only a hand-built vector can violate it, and
+  /// [`Confidences`](crate::audio::ced::Confidences) states that range as its
+  /// invariant.
+  #[error("confidence at class index {index} is {value}, not a finite value in [0, 1]")]
+  InvalidConfidence {
+    /// Class index of the offending value.
+    index: usize,
+    /// The value the caller supplied.
+    value: f32,
+  },
+
   /// A windowed-sequence operation failed. Carries windit's own typed error
   /// unchanged ([`WinditError`] is `#[non_exhaustive]`, so match it with a
   /// wildcard arm). Constructed by the `WindowPlan::spans` resource rail:
