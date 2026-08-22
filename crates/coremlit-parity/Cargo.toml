@@ -79,15 +79,23 @@ textclap = { git = "https://github.com/Findit-AI/textclap", rev = "584f21754337a
 
 # `silero` IS published, so it rides a plain version (no git pin needed). Since
 # 0.6 it is itself a `zuoer` consumer that re-exports the core's detector
-# surface — but it pins `zuoer` 0.1 while coremlit is on `zuoer` 0.2, so the two
-# versions COEXIST in the lock and the oracle's segment/options types are
-# distinct from coremlit's. `tests/vad/cross_backend.rs` normalizes both into
-# its own `Segment` and drives the geometry-lie mutation through coremlit's
-# re-export (the version actually under test); it does not pass a type across
-# the two. Collapsing this back to one `zuoer` needs a `silero` release built
-# against 0.2. `default-features = false` keeps the bare dependency ort-free;
-# `vad-bundled` turns `silero/bundled` (⇒ `silero/onnx` ⇒ `ort`) back on.
-silero = { version = "0.6.0", default-features = false, optional = true }
+# surface, and 0.7 is built against `zuoer` 0.2 — the SAME version `coremlit`
+# depends on — so exactly ONE `zuoer` resolves in this package's graph and the
+# oracle's segment/options types ARE coremlit's, not look-alikes. Check with
+# `cargo tree -p coremlit-parity --features vad-bundled -e normal`: one
+# `zuoer v0.2.x`, no second copy.
+#
+# That single `zuoer` is load-bearing, not housekeeping. The whole premise of
+# `tests/vad/cross_backend.rs` is that segment ASSEMBLY is a shared baseline
+# across the two stacks, so every measured difference is attributable to model
+# inference and frame geometry. Under `silero` 0.6 (`zuoer` 0.1) the two sides
+# ran different segmenter builds and that premise was false. Do NOT hold this
+# package back on a `silero` whose `zuoer` trails `coremlit`'s: it re-splits
+# the baseline the gate is built on, and the segment types stop unifying (the
+# gate's one `Segment::of` constructor is the compile-time tripwire).
+# `default-features = false` keeps the bare dependency ort-free; `vad-bundled`
+# turns `silero/bundled` (⇒ `silero/onnx` ⇒ `ort`) back on.
+silero = { version = "0.7.0", default-features = false, optional = true }
 
 [dev-dependencies]
 # The crate under test. A path dep with only the runtime features these gates

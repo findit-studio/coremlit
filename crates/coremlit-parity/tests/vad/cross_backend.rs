@@ -13,10 +13,25 @@
 //!   (`silero-vad-unified-256ms-v6.2.1`) — 4096-sample (256 ms) frames — turned
 //!   into segments by **the same segmenter, through vadkit's re-export**
 //!   ([`coremlit::audio::vad::detect_speech`], which forwards to `zuoer::detect_speech_with`
-//!   over [`coremlit::audio::vad::CoreMlBackend`]). This REPLACES T4's interim test-local
-//!   thresholding harness (T5): the vadkit side now runs the exact same
-//!   detection logic as the reference, differing only in model and geometry —
-//!   which is what makes the agreement a clean model-vs-model measurement.
+//!   over [`coremlit::audio::vad::CoreMlBackend`]). This REPLACES T4's interim
+//!   test-local thresholding harness (T5): the vadkit side now runs the exact
+//!   same detection logic as the reference, differing only in model and
+//!   geometry — which is what makes the agreement a clean model-vs-model
+//!   measurement.
+//!
+//! **"The same segmenter" is literal, not approximate.** `silero` 0.7 and
+//! `coremlit` both build against `zuoer` 0.2, so exactly ONE `zuoer` resolves
+//! in this package's graph and both stacks call the identical
+//! `SpeechSegmenter` code out of the identical crate build — the reference's
+//! `silero::SpeechSegment` and the subject's
+//! [`coremlit::audio::vad::SpeechSegment`] are one type re-exported twice.
+//! That shared assembly is the design premise this whole gate rests on: it is
+//! what makes every measured difference attributable to model inference and
+//! frame geometry rather than to two segmenters drifting apart. It was briefly
+//! false while this package sat on `silero` 0.6 (`zuoer` 0.1) against
+//! coremlit's `zuoer` 0.2; `silero` 0.7 restores it, and the measured figures
+//! below are unchanged to four decimals across that repair — evidence that the
+//! `zuoer` 0.1 → 0.2 refactor did not move segmentation on these clips.
 //!
 //! # This is behavioral agreement, NOT bit parity — by construction
 //!
@@ -113,22 +128,17 @@ struct Segment {
 }
 
 impl Segment {
-  /// From a segment of the crate under test — coremlit's re-exported
-  /// [`zuoer::SpeechSegment`](coremlit::audio::vad::SpeechSegment).
+  /// From a `zuoer::SpeechSegment` — the segment type of BOTH stacks.
+  ///
+  /// `silero` 0.7 and `coremlit` build against the same `zuoer` 0.2, so
+  /// `silero::SpeechSegment` and [`coremlit::audio::vad::SpeechSegment`] are
+  /// one type re-exported twice, and one constructor serves the reference and
+  /// the subject alike. That is load-bearing rather than tidy: if either side
+  /// is ever moved onto a different `zuoer`, [`silero_segments`]'s
+  /// `.map(Segment::of)` stops type-checking (E0308) instead of quietly
+  /// reintroducing two segmenter builds into a gate whose premise is that
+  /// segment assembly is shared.
   fn of(seg: coremlit::audio::vad::SpeechSegment) -> Self {
-    Self {
-      start: seg.start_sample(),
-      end: seg.end_sample(),
-    }
-  }
-
-  /// From a segment of the silero-ONNX REFERENCE stack. `silero` 0.6 pins
-  /// `zuoer` 0.1 while coremlit is on `zuoer` 0.2, so the two versions coexist
-  /// in the lock and `silero::SpeechSegment` is a DISTINCT type from the one
-  /// above — a second constructor, not a redundant one. Both normalize to this
-  /// file's own `Segment`, which is what every metric below reads, so the split
-  /// changes no measurement.
-  fn of_silero(seg: silero::SpeechSegment) -> Self {
     Self {
       start: seg.start_sample(),
       end: seg.end_sample(),
@@ -195,8 +205,9 @@ const DUR_RATIO_MAX: f64 = 1.20;
 /// 6 400 samples (0.40 s ≈ 1.5 frames), covering one 256 ms frame of
 /// quantization plus silero's pad plus margin. The geometry lie blows the
 /// envelope end-delta out to 21–26 s. This value is deterministic (`cpu_only`,
-/// SHA-pinned artifact, pinned silero rev); a dependency bump is the correct
-/// trigger to re-measure it.
+/// SHA-pinned artifact, the pinned `silero` version and the single `zuoer` both
+/// stacks share); a dependency bump is the correct trigger to re-measure it —
+/// as the `silero` 0.6 → 0.7 bump was, and it re-measured identical.
 const SPAN_DELTA_MAX_SAMPLES: u64 = 6_400;
 
 // ── Metrics ─────────────────────────────────────────────────────────────────
@@ -402,7 +413,7 @@ fn silero_segments(samples: &[f32]) -> Vec<Segment> {
   silero::detect_speech(&mut session, samples, options)
     .expect("silero detect_speech")
     .into_iter()
-    .map(Segment::of_silero)
+    .map(Segment::of)
     .collect()
 }
 
@@ -445,11 +456,21 @@ fn vadkit_detect_segments(samples: &[f32]) -> Vec<Segment> {
 /// [`detect_speech`] uses internally, exposed here so the geometry-lie mutation
 /// can feed it silero's 512-sample stride instead of the true 4096 while the
 /// probabilities stay vadkit's real 256 ms outputs. Authors no detection logic:
-/// `SpeechSegmenter` is zuoer's, taken from coremlit's own re-export. It is
-/// deliberately NOT `silero`'s re-export: `silero` 0.6 pins `zuoer` 0.1 and
-/// coremlit is on `zuoer` 0.2, so only coremlit's is the segmenter this gate's
-/// subject actually runs — a mutation driven through the other version would
-/// falsify a stack nothing ships.
+/// `SpeechSegmenter` is zuoer's, named through coremlit's re-export.
+///
+/// Under `silero` 0.7 that re-export and `silero::SpeechSegmenter` are the SAME
+/// item (one `zuoer` 0.2 in the graph), so this spelling no longer *selects*
+/// anything — the older "the other version would falsify a stack nothing ships"
+/// rationale died with the version split, and the helper is not restored to
+/// `silero::` merely because that is where it used to sit. It keeps naming the
+/// segmenter through coremlit for two reasons that survive the merge. First,
+/// what is being mutated is the SUBJECT: vadkit's real 256 ms probabilities fed
+/// to the shared segmenter at a stride vadkit does not have, standing in for a
+/// vadkit stack that misdeclared its geometry — so the helper should read as
+/// "vadkit's segmenter, run wrong", and the reference stack should appear
+/// nowhere in it. Second, it fails safe: should the two re-exports ever diverge
+/// again, the mutation stays pointed at the shipping stack rather than
+/// following the oracle.
 fn real_segmenter_segments(probs: &[f32], frame_hop: usize) -> Vec<Segment> {
   let mut segmenter = SpeechSegmenter::new(SpeechOptions::default());
   segmenter.set_frame_hop(frame_hop);
