@@ -154,13 +154,21 @@
 //!
 //! # Model & geometry
 //!
-//! Adopted from Hugging Face, revision-pinned, never republished:
+//! Adopted from Hugging Face and revision-pinned:
 //! `FluidInference/silero-vad-coreml` rev
 //! `b419383c55c110e2c9271fa6ee0ea83d03c70d96`, artifact
 //! `silero-vad-unified-256ms-v6.2.1.mlmodelc` (ships pre-compiled), MIT. The
-//! revision and per-file SHA-256 are pinned in `tests/vad/model_io.rs`; the
-//! model is not committed (`Models/vadkit/` is gitignored, fetched dev-time,
-//! `VADKIT_TEST_MODELS` overrides the path). I/O contract (all f32, pinned):
+//! revision and per-file SHA-256 are pinned in `tests/vad/model_io.rs`.
+//!
+//! Alone among this crate's models, it is COMMITTED to the coremlit repository
+//! at `Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc/` — 1.1 MiB, so
+//! CI and every clone get it with no download step and the model gates run on
+//! a fresh checkout (`VADKIT_TEST_MODELS` still overrides the path). That is a
+//! REDISTRIBUTION: MIT permits it, and the notice it obliges is preserved in
+//! the repository `NOTICE` (sections 1-2) and in a `LICENSE` file inside the
+//! artifact directory. Nothing changes for a crates.io consumer — the vendored
+//! tree sits outside the published package, so `cargo add coremlit` still
+//! fetches the model itself. I/O contract (all f32, pinned):
 //! `audio_input [1, 4160]` (64 context + 4096 new) → `vad_output [1, 1, 1]`
 //! (a noisy-OR of eight sigmoids); the recurrent LSTM state is explicit
 //! feature I/O (`hidden_state`/`cell_state [1, 128]`, an empty `stateSchema`

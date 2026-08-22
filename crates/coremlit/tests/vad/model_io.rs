@@ -4,35 +4,52 @@
 //! running it — the artifact's own `metadata.json` is a HYPOTHESIS re-verified
 //! here, not trusted blind, and it wins over the plan wherever they differ.
 //!
-//! # Artifact (`Models/vadkit/`, gitignored, fetched dev-time)
+//! # Artifact (`Models/vadkit/`, COMMITTED — not a dev-time download)
 //!
 //! Source: <https://huggingface.co/FluidInference/silero-vad-coreml>, revision
 //! (commit SHA) `b419383c55c110e2c9271fa6ee0ea83d03c70d96` — pinned at download
 //! time (`hf api`/the HF API `sha` field). Artifact
 //! `silero-vad-unified-256ms-v6.2.1.mlmodelc`.
 //!
+//! Unlike every other model this crate loads, these bytes are VENDORED into the
+//! repository (1.1 MiB total, MIT; `.gitignore` un-ignores exactly this path,
+//! and NOTICE sections 1-2 plus a LICENSE inside the artifact record the
+//! redistribution). The gates below therefore need no fetch step and run in CI
+//! on a fresh checkout. The `hf download` in `tests/vad/common/mod.rs`
+//! re-fetches the same bytes from the Hub, which is how the committed copy is
+//! verified against its source.
+//!
 //! | File | Role |
 //! |---|---|
-//! | `silero-vad-unified-256ms-v6.2.1.mlmodelc/metadata.json` | I/O contract (downloaded) |
-//! | `silero-vad-unified-256ms-v6.2.1.mlmodelc/model.mil` | model graph (downloaded) |
-//! | `silero-vad-unified-256ms-v6.2.1.mlmodelc/weights/weight.bin` | weights (downloaded) |
-//! | `silero-vad-unified-256ms-v6.2.1.mlmodelc/coremldata.bin` | compiled model data (downloaded) |
-//! | `silero-vad-unified-256ms-v6.2.1.mlmodelc/analytics/coremldata.bin` | analytics blob (downloaded) |
+//! | `silero-vad-unified-256ms-v6.2.1.mlmodelc/metadata.json` | I/O contract |
+//! | `silero-vad-unified-256ms-v6.2.1.mlmodelc/model.mil` | model graph |
+//! | `silero-vad-unified-256ms-v6.2.1.mlmodelc/weights/weight.bin` | weights |
+//! | `silero-vad-unified-256ms-v6.2.1.mlmodelc/coremldata.bin` | compiled model data |
+//! | `silero-vad-unified-256ms-v6.2.1.mlmodelc/analytics/coremldata.bin` | analytics blob |
 //!
-//! Unlike alignkit, the targeted `.mlmodelc` is itself a DOWNLOADED artifact
-//! (v6.2.1 ships pre-compiled, with no `.mlpackage`), so every one of its files
-//! is byte-pinned below by SHA-256 — there is no local `coremlcompiler` output
-//! whose bytes could legitimately drift.
+//! Unlike alignkit, the targeted `.mlmodelc` came off the Hub pre-compiled
+//! (v6.2.1 ships no `.mlpackage`), so every one of its files is byte-pinned
+//! below by SHA-256 — there is no local `coremlcompiler` output whose bytes
+//! could legitimately drift. Those pins now guard the COMMITTED copy too: they
+//! are what would catch a checkout that rewrote the two TEXT files
+//! (`model.mil`, `metadata.json`), which is why `.gitattributes` marks the whole
+//! artifact `-text`. The `LICENSE` file inside the directory is coremlit's own
+//! addition and is deliberately NOT pinned — it did not come from the Hub.
 //!
 //! # License
 //!
 //! HuggingFace `cardData.license` = `mit`. MIT end to end: upstream Silero VAD
 //! is MIT, and FluidInference's CoreML conversion is MIT. MIT requires
-//! preserving the notice, not a specific attribution string; this record (repo
-//! id, revision, license) is that preservation, and the crate README/NOTICE
-//! (T6) carries the human-readable attribution.
+//! preserving the notice, not a specific attribution string. Because the
+//! artifact is now REDISTRIBUTED here rather than only loaded, that obligation
+//! is live in this repository: NOTICE sections 1-2 carry the full upstream
+//! notice and record both where FluidInference asserts MIT (card front matter,
+//! HF tag, README) and that they ship no license file and assert no copyright
+//! line; a second copy of the notice travels inside the artifact directory as
+//! `LICENSE`. This module's record (repo id, revision, per-file SHA-256) is the
+//! byte-level half of the same provenance.
 //!
-//! # Per-file SHA-256 (downloaded artifacts)
+//! # Per-file SHA-256 (the artifacts as published on the Hub)
 //!
 //! | File | SHA-256 |
 //! |---|---|
@@ -70,6 +87,11 @@
 //!    revision + per-file SHA-256 in the crate's own `model_io.rs` — which is
 //!    where this record lives. Following that gated convention, not the plan's
 //!    letter, keeps the workspace green and consistent with the sibling kits.
+//!    Vendoring settled it for good: at 1.1 MiB the artifact is COMMITTED
+//!    instead, so CI never downloads it and a `MODELS_LOCK` table would buy
+//!    nothing — no lock entry, no cache key, no ci.yml parser change. The model
+//!    gates below are no longer CI-untested either; they run in the `check`
+//!    job against the committed bytes.
 
 mod common;
 

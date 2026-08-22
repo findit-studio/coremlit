@@ -20,9 +20,12 @@ categories = ["multimedia::audio", "os::macos-apis", "science", "api-bindings"]
 # Keep the published `.crate` under the 10 MiB crates.io cap. Everything listed
 # here is DEV-ONLY data: parity fixtures (audio, golden images, mel/logit
 # oracles, Swift probe transcripts) and the model-conversion recipes. None of it
-# is reachable from `src/`, and none of it is usable without the gitignored
-# `Models/` trees the gated tests need anyway, so a consumer of the published
-# crate loses nothing.
+# is reachable from `src/`, and none of it is usable without the `Models/` trees
+# the gated tests need anyway — which a published-crate consumer does not have,
+# the committed VAD artifact included: `Models/` sits OUTSIDE this package
+# directory, so `cargo package` never carries it. A consumer of the published
+# crate therefore loses nothing (and gains no 1.1 MiB of model it would not
+# use).
 #
 # `tests/` is NOT excluded wholesale: `src/embeddings/granite` `include_str!`s
 # `tests/granite/fixtures/goldens/corpus.json`, so that one fixture tree must

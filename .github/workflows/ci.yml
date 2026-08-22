@@ -24,6 +24,42 @@ jobs:
       # never-published `coremlit-parity` package, which owns the unpublished
       # `dia` git oracle.
       - run: crates/coremlit-parity/tests/speaker/der_gate_inventory.sh
+      # The VAD model gates run HERE, in the job that downloads nothing: the
+      # FluidInference silero-vad `.mlmodelc` is COMMITTED (1.1 MiB; .gitignore
+      # un-ignores exactly that path), so `<workspace>/Models/vadkit` resolves
+      # in a fresh checkout. No MODELS_LOCK table, no cache key, no download
+      # step. They stay `#[ignore]`d — the repo's model-gate convention — so CI
+      # asks for them by name, per target.
+      #
+      # `vad_parity_swift` is deliberately NOT here, and cannot be until its
+      # goldens are regenerated on a runner. Its committed Swift traces carry no
+      # `generationHost` stamp, and CoreML `CpuOnly` floats are not contracted
+      # portable across macOS builds or chips (#36), so a 1e-4 per-chunk compare
+      # on a runner of unknown host-class would report host drift as a port
+      # defect — and once the goldens ARE stamped, `check_host_class` would
+      # refuse a mismatched host outright. It stays a local/dev gate against a
+      # same-host oracle.
+      #
+      # Anti-vacuum, the granite/siglip idiom: an ignored-only run over a target
+      # whose gates were deleted, renamed, un-ignored, or that failed to BUILD
+      # runs 0 tests and exits 0, so the ignored-only `--list` count refuses it.
+      - name: VAD model gates (committed model, no download)
+        run: |
+          set -euo pipefail
+          model=Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc
+          if [ ! -d "$model" ]; then
+            echo "::error::the committed VAD model $model is absent from this checkout — the gates below must FAIL here, never skip" >&2
+            exit 1
+          fi
+          for target in vad_model_io vad_model_state vad_reexport; do
+            listed=$(cargo test -p coremlit --features vad --test "$target" -- --list --ignored 2>/dev/null | grep -c ': test$' || true)
+            if [ "$listed" -eq 0 ]; then
+              echo "::error::$target lists 0 ignored tests — it failed to build, or its model gates were deleted, renamed, or un-ignored, so an ignored-only run would pass vacuously" >&2
+              exit 1
+            fi
+            echo "== $target: $listed model gate(s) =="
+            cargo test -p coremlit --features vad --test "$target" -- --ignored
+          done
 
   # Curated feature-combination matrix for the PUBLISHABLE crate — replaces the
   # former per-crate `cargo hack --each-feature` powerset with the explicit,
@@ -225,12 +261,20 @@ jobs:
       # vanishing fp16 guard cannot merge green. This runner downloads WHISPER
       # and GRANITE ONLY (per MODELS_LOCK), so COREMLIT_FP16_SWEEP_VENDORS
       # narrows the vendor manifest to exactly the vendors staged here
-      # (fail-closed: unset would demand EVERY pinned vendor). Naming BOTH is
-      # what makes a vanished vendor tree a failure instead of a quiet drop in
-      # coverage; the absent speakerkit/alignkit/argmax vendors stay the
-      # documented escape. fp16_guards is a core test — no feature needed. See
-      # the coverage-boundary note in crates/coremlit/tests/fp16_guards.rs.
-      - run: COREMLIT_FP16_SWEEP_VENDORS=whisperkit-coreml,embedkit-granite cargo test -p coremlit --test fp16_guards
+      # (fail-closed: unset would demand EVERY pinned vendor), plus `vadkit`,
+      # which needs no download — it is committed, so requiring it here makes
+      # DELETING the vendored model a hard CI failure rather than a silent drop
+      # of the sweep's second clean control. Naming them ALL is what makes a
+      # vanished vendor tree a failure instead of a quiet drop in coverage; the
+      # absent speakerkit/alignkit/argmax vendors stay the documented escape.
+      # fp16_guards is a core test — no feature needed. See the
+      # coverage-boundary note in crates/coremlit/tests/fp16_guards.rs.
+      #
+      # This job is also the ONLY place the committed VAD graph is swept: this
+      # runner has downloaded vendors, so build.rs emits cfg(models_present) and
+      # the walk covers all of Models/, vadkit included. The modelless
+      # check/features jobs deliberately leave the sweep #[ignore]d (build.rs).
+      - run: COREMLIT_FP16_SWEEP_VENDORS=whisperkit-coreml,embedkit-granite,vadkit cargo test -p coremlit --test fp16_guards
       - run: crates/coremlit/tests/fp16_sweep_inventory.sh
       # Core model-gated suite (tiny_model etc., whisper-tiny via
       # WHISPERKIT_TEST_MODELS); then the whisper pipeline's model-gated suite.
@@ -238,6 +282,20 @@ jobs:
       # download and stay local/dev gates, exactly as before the restructure.
       - run: cargo test -p coremlit -- --ignored
       - run: cargo test -p coremlit --features whisper -- --ignored
+      # The `whisper,vad` composition gates (Silero-driven long-form chunking).
+      # They need whisper-tiny, so they belong here rather than in `check`, and
+      # they were dark until the VAD model was committed — this runner has no
+      # other way to get it. Same anti-vacuum guard as the granite/siglip steps.
+      - name: Whisper + Silero-VAD composition gates
+        run: |
+          set -euo pipefail
+          listed=$(cargo test -p coremlit --features whisper,vad --test whisper_vad_source -- --list --ignored 2>/dev/null | grep -c ': test$' || true)
+          if [ "$listed" -eq 0 ]; then
+            echo "::error::whisper_vad_source lists 0 ignored tests — it failed to build, or its model gates were deleted, renamed, or un-ignored, so an ignored-only run would pass vacuously" >&2
+            exit 1
+          fi
+          echo "== whisper_vad_source: $listed model gate(s) =="
+          cargo test -p coremlit --features whisper,vad --test whisper_vad_source -- --ignored
       # The granite model gates. They are plain `#[ignore]` (not the sweep's
       # build.rs cfg), so nothing un-ignores them implicitly: CI has to ask for
       # them by name, per test target, under `--features granite`. Two ways they

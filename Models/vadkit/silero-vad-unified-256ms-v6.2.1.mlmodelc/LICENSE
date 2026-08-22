@@ -1,0 +1,68 @@
+This directory is a REDISTRIBUTED third-party model artifact, vendored into the
+coremlit repository so that CI and every clone have it without a download step.
+It is NOT coremlit code and is NOT covered by coremlit's own MIT OR Apache-2.0
+dual license. Its terms are MIT, recorded in full below.
+
+────────────────────────────────────────────────────────────────────────
+What this artifact is
+
+  Artifact   silero-vad-unified-256ms-v6.2.1.mlmodelc  (compiled CoreML model)
+  Source     https://huggingface.co/FluidInference/silero-vad-coreml
+  Revision   b419383c55c110e2c9271fa6ee0ea83d03c70d96
+  Upstream   Silero VAD — https://github.com/snakers4/silero-vad
+  Via        onnx-community/silero-vad (the conversion's declared base model)
+
+The bytes here are FluidInference's CoreML conversion of Silero VAD, copied
+verbatim from that repository at that revision. Nothing was modified. The
+per-file SHA-256 of every file that came from the Hub is pinned in
+crates/coremlit/tests/vad/model_io.rs and re-verified by a model-gated test;
+this LICENSE file is coremlit's own addition and is not part of the download.
+
+────────────────────────────────────────────────────────────────────────
+License provenance — stated precisely, because two of the three links in the
+chain assert MIT without shipping a license file
+
+  1. Silero VAD (upstream, snakers4/silero-vad) — MIT, and it SHIPS the MIT
+     text with the copyright line `Copyright (c) 2020-present Silero Team`.
+     That is the notice reproduced below.
+
+  2. onnx-community/silero-vad (the conversion's declared base model) — MIT,
+     and it ships a LICENSE file whose text and copyright line are byte-
+     identical to upstream's. No additional claimant appears.
+
+  3. FluidInference/silero-vad-coreml (the artifact vendored here) — asserts
+     MIT in three places at the pinned revision: the model card's
+     `license: mit` front matter, the Hugging Face `license:mit` tag, and the
+     README's `**License:** MIT` line. It ships NO LICENSE file and states NO
+     copyright line, so no copyright is asserted on their behalf here; the only
+     attribution the artifact itself carries is its metadata.json
+     `author` field, verbatim: `Fluid Infernece + Silero Team` (their spelling).
+
+MIT's obligation is to preserve "the above copyright notice and this permission
+notice". The only copyright notice asserted anywhere in this chain is the
+Silero Team's, and it is reproduced in full below. The same record, with the
+surrounding attribution for every other model coremlit touches, is in the
+repository-root NOTICE, sections 1-2.
+
+────────────────────────────────────────────────────────────────────────
+MIT License
+
+Copyright (c) 2020-present Silero Team
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
