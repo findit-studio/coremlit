@@ -241,7 +241,7 @@ diaric = { version = "0.1.0", optional = true }
 # `zuoer` is the model-free VAD core with NO dependencies of its own — no
 # model, no inference runtime, no audio I/O — so `ort` cannot enter the `vad`
 # runtime graph, nor a downstream `whisper`'s.
-zuoer = { version = "0.1.0", optional = true }
+zuoer = { version = "0.2.0", optional = true }
 
 # --- embeddings::clap optionals (the `clap` feature) ---
 # f64 forward FFT for the Slaney-mel front-end — the same crate + major version
@@ -291,8 +291,13 @@ sha2 = { workspace = true, optional = true }
 # is NOT needed for the RGB→RGB resize, so it stays off. Transitive deps are
 # pure-Rust and ort-free (`mediaframe`, `derive_more`, `half`, `thiserror`).
 # A published crates.io range, no longer a rev pin: `pixon` is the renamed
-# `colconv`, and `pixon` 0.1.0 carries the API `colconv` 0.2.1 shipped, so the
-# resampler bytes are the ones the goldens were taken against.
+# `colconv`. `pixon` 0.2's breaking changes are entirely colorimetric (closed
+# `KernelMatrix`/`KernelGamut` selectors, a refused-matrix error, the walker /
+# sink seam move) and cross `mediaframe` 0.1 -> 0.4 with them; NONE of it
+# reaches this RGB24 -> RGB24 resize. `src/resample` is byte-identical between
+# 0.1.0 and 0.2.0 apart from `TransferFunction::for_matrix` taking `&ColorMatrix`
+# (a transfer-curve helper this crate never calls), so the resampler bytes are
+# still the ones the PIL-parity goldens were taken against.
 # CO-DEV against a LOCAL pixon checkout: add an UNCOMMITTED patch to the
 # WORKSPACE ROOT Cargo.toml (never commit it):
 #
@@ -302,7 +307,7 @@ sha2 = { workspace = true, optional = true }
 # LICENSE: pixon is GPL-3.0-or-later today; its owner-gated relicense to
 # MIT OR Apache-2.0 is a merge blocker for this branch (see the `siglip` feature
 # comment above).
-pixon = { version = "0.1", default-features = false, features = ["std", "rgb"], optional = true }
+pixon = { version = "0.2", default-features = false, features = ["std", "rgb"], optional = true }
 
 [dev-dependencies]
 # Integration tests / benches / examples are external consumers: they link the

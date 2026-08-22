@@ -8,7 +8,7 @@ version = "0.1.0"
 edition = "2024"
 # 1.95 is the floor several dependencies already declare, not a coremlit-only
 # choice: `asry` 0.1 (`align`), `diaric` 0.1 (`speaker`), `windit` 0.2
-# (`clap`/`granite`), `pixon` 0.1 + `mediaframe` (`siglip`), and the
+# (`clap`/`granite`), `pixon` 0.2 + `mediaframe` 0.4 (`siglip`), and the
 # `dia`/diarization + `whispercpp` oracles owned by `coremlit-parity`.
 rust-version = "1.95"
 license = "MIT OR Apache-2.0"
@@ -50,10 +50,10 @@ rustfft = "6"
 # `from_index`, `events()` — all `const fn`). ORT-FREE data codegen by
 # construction (deps: thiserror/phf/uncased only). `ontology` and its `serde`
 # stay off.
-soundevents-dataset = { version = "0.2", default-features = false, features = ["std", "rated"] }
+soundevents-dataset = { version = "0.3", default-features = false, features = ["std", "rated"] }
 npyz = "0.9"
 cpal = "0.18"
-rubato = "4.0"
+rubato = "5.0"
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 # Pure-Rust PNG decoder — a DEV-dep only, for decoding the committed siglip
 # corpus PNG fixtures in tests (the crate itself is sans-I/O: `Rgb8Image` takes

@@ -71,9 +71,11 @@ mod common;
 
 use coremlit::{
   ComputeUnits,
-  audio::vad::{CHUNK_SAMPLES, CoreMlBackend, VadModel, VadModelOptions, detect_speech},
+  audio::vad::{
+    CHUNK_SAMPLES, CoreMlBackend, SpeechOptions, SpeechSegmenter, VadModel, VadModelOptions,
+    detect_speech,
+  },
 };
-use silero::{SpeechOptions, SpeechSegmenter};
 
 /// 16 kHz — the corpus sample rate both stacks consume (asserted per clip).
 const SAMPLE_RATE: u64 = 16_000;
@@ -88,7 +90,7 @@ const GATE_FIXTURES: &[&str] = &["02_pyannote_sample", "07_yuhewei_dongbei_engli
 /// 256 ms frame speech when its probability ≥ this. Anchored on silero's
 /// `start_threshold` default. This is a TEST-SIDE measurement threshold over the
 /// models' raw probabilities, not vadkit's detection threshold (that lives in
-/// silero's segmenter, driven at its own default through the re-export).
+/// zuoer's segmenter, driven at its own default through coremlit's re-export).
 const GRID_THRESHOLD_HEALTHY: f32 = 0.5;
 /// Mutation 1 — the threshold-swap knob (spec §6 "swaps thresholds"): raise the
 /// grid characterization threshold 0.5 → 0.9. At 0.9, vadkit drops 2–3 boundary
@@ -111,7 +113,22 @@ struct Segment {
 }
 
 impl Segment {
-  fn of(seg: silero::SpeechSegment) -> Self {
+  /// From a segment of the crate under test — coremlit's re-exported
+  /// [`zuoer::SpeechSegment`](coremlit::audio::vad::SpeechSegment).
+  fn of(seg: coremlit::audio::vad::SpeechSegment) -> Self {
+    Self {
+      start: seg.start_sample(),
+      end: seg.end_sample(),
+    }
+  }
+
+  /// From a segment of the silero-ONNX REFERENCE stack. `silero` 0.6 pins
+  /// `zuoer` 0.1 while coremlit is on `zuoer` 0.2, so the two versions coexist
+  /// in the lock and `silero::SpeechSegment` is a DISTINCT type from the one
+  /// above — a second constructor, not a redundant one. Both normalize to this
+  /// file's own `Segment`, which is what every metric below reads, so the split
+  /// changes no measurement.
+  fn of_silero(seg: silero::SpeechSegment) -> Self {
     Self {
       start: seg.start_sample(),
       end: seg.end_sample(),
@@ -376,7 +393,7 @@ fn render(clip: &str, tag: &str, a: &Agreement) -> String {
 /// the 16 kHz timeline.
 fn silero_segments(samples: &[f32]) -> Vec<Segment> {
   let mut session = silero::Session::bundled().expect("load bundled silero ONNX model");
-  let options = SpeechOptions::default();
+  let options = silero::SpeechOptions::default();
   assert_eq!(
     options.sample_rate(),
     silero::SampleRate::Rate16k,
@@ -385,7 +402,7 @@ fn silero_segments(samples: &[f32]) -> Vec<Segment> {
   silero::detect_speech(&mut session, samples, options)
     .expect("silero detect_speech")
     .into_iter()
-    .map(Segment::of)
+    .map(Segment::of_silero)
     .collect()
 }
 
@@ -428,9 +445,12 @@ fn vadkit_detect_segments(samples: &[f32]) -> Vec<Segment> {
 /// [`detect_speech`] uses internally, exposed here so the geometry-lie mutation
 /// can feed it silero's 512-sample stride instead of the true 4096 while the
 /// probabilities stay vadkit's real 256 ms outputs. Authors no detection logic:
-/// `SpeechSegmenter` is zuoer's (re-exported by `silero`, so both stacks in
-/// this file drive the same type from the same crate).
-fn silero_segmenter_segments(probs: &[f32], frame_hop: usize) -> Vec<Segment> {
+/// `SpeechSegmenter` is zuoer's, taken from coremlit's own re-export. It is
+/// deliberately NOT `silero`'s re-export: `silero` 0.6 pins `zuoer` 0.1 and
+/// coremlit is on `zuoer` 0.2, so only coremlit's is the segmenter this gate's
+/// subject actually runs — a mutation driven through the other version would
+/// falsify a stack nothing ships.
+fn real_segmenter_segments(probs: &[f32], frame_hop: usize) -> Vec<Segment> {
   let mut segmenter = SpeechSegmenter::new(SpeechOptions::default());
   segmenter.set_frame_hop(frame_hop);
   let mut segments = Vec::new();
@@ -537,7 +557,7 @@ fn mutation_geometry_lie_breaks_gate() {
     let total = samples.len();
     let silero = silero_segments(&samples);
     let probs = vadkit_probs(&samples);
-    let vadkit_lied = silero_segmenter_segments(&probs, MUTANT_FRAME_SAMPLES);
+    let vadkit_lied = real_segmenter_segments(&probs, MUTANT_FRAME_SAMPLES);
 
     let agreement = characterize(&silero, &vadkit_lied, &probs, GRID_THRESHOLD_HEALTHY, total);
     println!("{}", render(clip, "mut:geom", &agreement));
