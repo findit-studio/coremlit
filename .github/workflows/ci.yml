@@ -358,14 +358,22 @@ jobs:
       # WHISPERKIT_TEST_MODELS); then the whisper pipeline's model-gated suite.
       # The align/speaker/vad model gates need models this runner does not
       # download and stay local/dev gates, exactly as before the restructure.
+      #
+      # `--no-fail-fast` for the same reason the steps carry `!cancelled()`,
+      # one level down: these two invocations span MANY test targets, and cargo
+      # stops at the first target that fails. That is not theoretical here —
+      # `whisper_parity_es` was red before the tokenizer assertion above it ever
+      # existed, and hid `whisper_parity_jfk`, `whisper_pipeline`,
+      # `whisper_streaming` and `whisper_rtf_gate` behind it for a month. One
+      # red target must cost you that target's verdict, not the four after it.
       - name: Core model gates
         id: core_gates
         if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
-        run: cargo test -p coremlit -- --ignored
+        run: cargo test -p coremlit --no-fail-fast -- --ignored
       - name: Whisper model gates
         id: whisper_gates
         if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
-        run: cargo test -p coremlit --features whisper -- --ignored
+        run: cargo test -p coremlit --features whisper --no-fail-fast -- --ignored
       # The `whisper,vad` composition gates (Silero-driven long-form chunking).
       # They need whisper-tiny, so they belong here rather than in `check`, and
       # they were dark until the VAD model was committed — this runner has no
@@ -411,6 +419,12 @@ jobs:
           # embeds the granite tokenizer (it is a ~24 MB sidecar the artifact
           # ships and `TextEmbedder::load` reads), so those gates read the staged
           # artifact tree and are `#[ignore]`d like every other model gate.
+          # A red target reports ITS verdict and the loop keeps going: six gate
+          # suites run here, and under `set -e` the first failure would hide the
+          # five after it — the same masking this job just spent a month in, one
+          # level down. A VACUUM still aborts immediately, because that is a
+          # configuration error rather than a gate result.
+          failed=""
           for target in granite_model_io granite_parity_embed granite_placement granite_embed_long \
                         granite_tokenizer_identity; do
             listed=$(cargo test -p coremlit --features granite --test "$target" -- --list --ignored 2>/dev/null | grep -c ': test$' || true)
@@ -419,7 +433,7 @@ jobs:
               exit 1
             fi
             echo "== $target: $listed model gate(s) =="
-            cargo test -p coremlit --features granite --test "$target" -- --ignored
+            cargo test -p coremlit --features granite --test "$target" -- --ignored || failed="$failed $target"
           done
           # The in-lib granite tokenizer/chunking gates (`--lib`), same reason
           # and the same anti-vacuum guard.
@@ -429,7 +443,11 @@ jobs:
             exit 1
           fi
           echo "== --lib: $listed model gate(s) =="
-          cargo test -p coremlit --features granite --lib -- --ignored
+          cargo test -p coremlit --features granite --lib -- --ignored || failed="$failed --lib"
+          if [ -n "$failed" ]; then
+            echo "::error::granite gates failed:$failed" >&2
+            exit 1
+          fi
       # The two siglip TOKENIZER gates. They are `#[ignore]`d like every other
       # siglip model gate — not because they load a model (they call no
       # `Model::load` at all) but because they read the staged artifact tree:
@@ -487,6 +505,9 @@ jobs:
             echo "::error::CED bundle $bundle is absent — the model gates below must FAIL here, never skip" >&2
             exit 1
           fi
+          # Failure-collecting for the same reason as the granite loop above: a
+          # red target must cost its own verdict, not the three after it.
+          failed=""
           for target in ced_model_io ced_parity_logits ced_placement ced_e2e; do
             listed=$(cargo test -p coremlit --features ced --test "$target" -- --list --ignored tiny:: 2>/dev/null | grep -c ': test$' || true)
             if [ "$listed" -eq 0 ]; then
@@ -494,8 +515,12 @@ jobs:
               exit 1
             fi
             echo "== $target: $listed tiny model gate(s) =="
-            cargo test -p coremlit --features ced --test "$target" -- --ignored tiny::
+            cargo test -p coremlit --features ced --test "$target" -- --ignored tiny:: || failed="$failed $target"
           done
+          if [ -n "$failed" ]; then
+            echo "::error::CED tiny gates failed:$failed" >&2
+            exit 1
+          fi
       # The anti-vacuum guard for the JOB, mirroring the per-target
       # `--list --ignored` counts inside the gates above: those refuse a gate
       # that runs zero tests, and this refuses a gate that never runs at all.
