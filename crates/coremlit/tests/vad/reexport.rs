@@ -44,13 +44,22 @@ use zuoer::{SampleRate, SpeechOptions, VadBackend};
 /// Silero-segmenter identifiers and thresholding vocabulary that would appear
 /// in vadkit's `src/` ONLY if it re-implemented some part of the segment
 /// assembly the `zuoer` crate single-homes (spec §2-§3). Re-exporting the
-/// segmenter types by name (`SpeechSegmenter`, `SpeechSegment` — no `::new`)
-/// does not match any of these, so the gate stays green on a pure re-export and
-/// red on any authored detection logic.
+/// segmenter types by name (`SpeechSegmenter`, `SpeechSegment` and their
+/// neutral `RunSegmenter` / `Run` spellings — no `::new`) does not match any of
+/// these, so the gate stays green on a pure re-export and red on any authored
+/// detection logic.
+///
+/// The construction tokens are listed under BOTH spellings on purpose: zuoer
+/// declares `SpeechSegment`/`SpeechSegmenter` as type aliases of `Run`/
+/// `RunSegmenter`, and this crate re-exports both, so a re-implementation could
+/// otherwise drive the very same segmenter through the neutral names and slip
+/// past a `Speech*`-only list.
 const FORBIDDEN_DETECTION_TOKENS: &[&str] = &[
   "push_probability",
   "SpeechSegment::new",
   "SpeechSegmenter::new",
+  "Run::new",
+  "RunSegmenter::new",
   "start_threshold",
   "end_threshold",
   "min_silence",
@@ -714,4 +723,45 @@ fn detect_speech_on_real_audio_is_pinned() {
     "{E2E_FIXTURE}: last end {last_end} outside {E2E_LAST_END_SAMPLE} \
      ± {E2E_BOUNDARY_TOL_SAMPLES}"
   );
+}
+
+// ── 5. The neutral `Run*` spellings are the same items as the `Speech*` ones ─
+
+/// `audio::vad`'s "Two spellings, one set of types": zuoer declares
+/// `SpeechOptions` / `SpeechSegmenter` / `SpeechSegment` as plain type aliases
+/// of `RunOptions` / `RunSegmenter` / `Run`, and this crate re-exports both
+/// sets, so the two spellings must stay ONE set of types rather than drifting
+/// into parallel ones. Every binding below is annotated with the *other*
+/// spelling than the expression that produces it, so this test stops compiling
+/// the moment either side becomes a distinct type (a wrapper, a newtype, a
+/// fork).
+///
+/// It also drives a complete segmentation through `coremlit::audio::vad` paths
+/// ONLY — no `zuoer::` anywhere in the function — which is the "a consumer doing
+/// per-class segmentation never needs `zuoer` as a direct dependency" claim the
+/// `audio::ced` pipeline docs are written on. The pinned numbers are the ones
+/// the `audio::vad` module's runnable example asserts, reached the neutral way.
+#[test]
+fn neutral_run_spellings_are_one_set_of_types_and_segment_on_their_own() {
+  use coremlit::audio::vad::{Run, RunOptions, RunSegmenter, SpeechOptions, SpeechSegmenter};
+
+  let options: RunOptions = SpeechOptions::default();
+  let mut segmenter: SpeechSegmenter = RunSegmenter::new(options);
+  segmenter.set_frame_hop(CHUNK_SAMPLES);
+
+  let mut runs: Vec<coremlit::audio::vad::SpeechSegment> = Vec::new();
+  for p in [0.02, 0.90, 0.80, 0.10, 0.85, 0.95, 0.02, 0.01, 0.01] {
+    if let Some(run) = segmenter.push_probability(p) {
+      runs.push(run);
+    }
+  }
+  if let Some(run) = segmenter.finish() {
+    runs.push(run);
+  }
+
+  assert_eq!(runs.len(), 1);
+  let run: Run = runs[0];
+  assert_eq!((run.start_sample(), run.end_sample()), (3616, 25056));
+  assert!((run.mean_probability() - 0.72).abs() < 1e-4);
+  assert!((run.peak_probability() - 0.95).abs() < 1e-6);
 }

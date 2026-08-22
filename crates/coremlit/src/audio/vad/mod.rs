@@ -49,6 +49,109 @@
 //! composition: `audio::whisper::silero_vad::SileroVad` plugs the Silero model
 //! into whisper's own frame-level VAD seam for long-form chunking.
 //!
+//! # Two spellings, one set of types
+//!
+//! zuoer names its detector types for the general thing they detect — a [`Run`]
+//! of frames above threshold, assembled by a [`RunSegmenter`] configured with
+//! [`RunOptions`] — and declares the speech-flavoured names as plain type
+//! **aliases** of those:
+//!
+//! | neutral          | speech alias(es)                        |
+//! | ---------------- | --------------------------------------- |
+//! | [`Run`]          | [`SpeechSegment`]                       |
+//! | [`RunSegmenter`] | [`SpeechSegmenter`], [`SpeechDetector`] |
+//! | [`RunOptions`]   | [`SpeechOptions`]                       |
+//!
+//! Both spellings are re-exported here and they are the SAME items, not
+//! parallel types: rustdoc renders each type once under its neutral name with
+//! the aliases pointing at it, and a value produced through one spelling is
+//! consumed through the other with no conversion. So this is a naming choice,
+//! never a behavioural one — pick by what the probabilities you feed in
+//! actually mean. Driven by [`CoreMlBackend`] they are speech probabilities and
+//! [`detect_speech`] plus the `Speech*` names read true. Driven by anything
+//! else — one class column of a CED sound-event track is the worked example in
+//! `audio::ced` — nothing about them is speech, and the `Run*` spelling is the
+//! honest one.
+//!
+//! Those three names plus [`SampleRate`] (already neutral, and shared) and
+//! [`Error`] / [`Result`] are the whole set needed to construct a
+//! [`RunSegmenter`], push probabilities into it and read the [`Run`]s back, so
+//! a consumer doing per-class segmentation never needs `zuoer` as a direct
+//! dependency. The `detect_speech*` entry points are the speech-only part of
+//! the surface: they own a [`VadBackend`], which is where the audio — and the
+//! speech assumption — enters.
+//!
+//! # Segment confidence
+//!
+//! A [`SpeechSegment`] carries more than a timespan. `zuoer` accumulates the
+//! model frame probabilities each segment was built from and hands them back as
+//! [`mean_probability`](zuoer::Run::mean_probability) /
+//! [`peak_probability`](zuoer::Run::peak_probability) — the segment's
+//! confidence. They need no opt-in: [`SpeechSegment`] is a plain type **alias**
+//! for [`zuoer::Run`], not a wrapper, so every accessor zuoer defines is already
+//! on the values [`detect_speech`] returns.
+//!
+//! Three semantics decide what those numbers mean, and none of them can be read
+//! off the signature. They are zuoer's contract, not this module's invention —
+//! [`zuoer::Run`](zuoer::Run#probability-aggregates) is authoritative, and this
+//! summary must not be trusted over it:
+//!
+//! - **Padding is excluded.** The aggregate covers the segment's raw
+//!   model-frame span only. [`speech_pad`](zuoer::RunOptions::speech_pad) widens
+//!   the emitted `[start_sample, end_sample)` on both sides as a timeline
+//!   courtesy; there are no observations out there to average.
+//! - **Bridged frames are included.** A dip shorter than
+//!   [`min_silence_duration`](zuoer::RunOptions::min_silence_duration) does not
+//!   close the segment, and its frames stay in the mean and pull it down. That
+//!   is the correct signal: a mean well below the peak is a segment with quiet
+//!   stretches inside it, not a defect.
+//! - **A force-split cuts the accumulator too.** When
+//!   [`max_speech_duration`](zuoer::RunOptions::max_speech_duration)
+//!   force-splits a long segment, the emitted segment carries only the
+//!   pre-split aggregate and the continuation restarts its own; frames in the
+//!   gap the split landed on appear in neither.
+//!
+//! Both values are finite and inside `[0, 1]` on every segment the segmenter
+//! emits. A [`SpeechSegment`] built by hand has them zeroed — only
+//! segmenter-emitted segments carry observations.
+//!
+//! [`SpeechSegmenter`] consumes probabilities rather than audio, so the
+//! aggregates are demonstrable with no model at all. This is the same state
+//! machine [`detect_speech`] drives over [`CoreMlBackend`], fed by hand at the
+//! hop the backend reports:
+//!
+//! ```
+//! use coremlit::audio::vad::{CHUNK_SAMPLES, SpeechOptions, SpeechSegmenter};
+//!
+//! // The upstream Silero defaults zuoer's hysteresis derives from: 0.5 start
+//! // threshold, 250 ms minimum speech, 100 ms minimum silence, 30 ms pad.
+//! let mut segmenter = SpeechSegmenter::new(SpeechOptions::default());
+//! segmenter.set_frame_hop(CHUNK_SAMPLES); // one probability per 256 ms chunk
+//!
+//! // Frame 3 is a one-chunk dip inside the speech; frames 6-8 end it.
+//! let mut segments = Vec::new();
+//! for p in [0.02, 0.90, 0.80, 0.10, 0.85, 0.95, 0.02, 0.01, 0.01] {
+//!   if let Some(segment) = segmenter.push_probability(p) {
+//!     segments.push(segment);
+//!   }
+//! }
+//! if let Some(segment) = segmenter.finish() {
+//!   segments.push(segment);
+//! }
+//!
+//! assert_eq!(segments.len(), 1);
+//! let segment = segments[0];
+//!
+//! // The emitted span is padded: 480 samples (30 ms) either side of the raw
+//! // model frames at 4096..24576.
+//! assert_eq!((segment.start_sample(), segment.end_sample()), (3616, 25056));
+//!
+//! assert!((segment.peak_probability() - 0.95).abs() < 1e-6);
+//! // Five raw frames, mean 0.72 — the bridged 0.10 is in it. Dropping that
+//! // frame would read 0.875; the padding contributes to neither aggregate.
+//! assert!((segment.mean_probability() - 0.72).abs() < 1e-4);
+//! ```
+//!
 //! # Model & geometry
 //!
 //! Adopted from Hugging Face, revision-pinned, never republished:
@@ -111,6 +214,6 @@ pub use model::{
 // [`InferError`] bridges through [`zuoer::Error::Backend`]), distinct from the
 // model-layer [`ModelError`] / [`InferError`] above.
 pub use zuoer::{
-  Error, Result, SampleRate, SpeechDetector, SpeechOptions, SpeechSegment, SpeechSegmenter,
-  VadBackend, detect_speech_with,
+  Error, Result, Run, RunOptions, RunSegmenter, SampleRate, SpeechDetector, SpeechOptions,
+  SpeechSegment, SpeechSegmenter, VadBackend, detect_speech_with,
 };
