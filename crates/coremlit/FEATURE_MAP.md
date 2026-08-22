@@ -100,8 +100,8 @@ and driven by the `features` job of CI (`.github/workflows/ci.yml`), which runs
 | `whisper,vad` | the `silero_vad` composition (former `vadkit` feature) |
 | `align-oracle` | + asry ONNX aligner (ort + whisper.cpp) |
 | `clap` | CLAP audio+text encoders alone (Rust mel + tokenizers, no ort) |
-| `granite` | granite text embeddings alone (bundled tokenizer + committed transformers-fp32 goldens, no ort; `embed_long` rides the crates.io `windit` engine + `windit/text`) |
-| `siglip` | SigLIP 2 image+text embeddings alone (bundled tokenizer + committed transformers-fp32 goldens, no ort) |
+| `granite` | granite text embeddings alone (artifact-sidecar tokenizer + committed transformers-fp32 goldens, no ort; `embed_long` rides the crates.io `windit` engine + `windit/text`) |
+| `siglip` | SigLIP 2 image+text embeddings alone (artifact-sidecar tokenizer + committed transformers-fp32 goldens, no ort) |
 | `ced` | CED (tiny/mini/small/base) sound-event tagging alone (Rust mel + `soundevents-dataset` + `windit`, no ort) |
 | `whisper,align,speaker,vad,clap,granite,siglip,ced,serde,tracing,nl-recognizer` | all non-oracle features on |
 | `whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,serde,tracing,nl-recognizer` | all-on (every coremlit feature, `align-oracle` included) |
@@ -109,6 +109,16 @@ and driven by the `features` job of CI (`.github/workflows/ci.yml`), which runs
 `serde` and `tracing` are cross-cutting and covered by the all-on runs. The
 list embodies the combinatorial-honesty rule: it is explicit and reviewable,
 not an implicit powerset.
+
+"Artifact-sidecar tokenizer" (`granite`, `siglip`) means the crate embeds no
+`tokenizer.json` for those two — each is a multi-megabyte file the published
+model artifact ships beside the `.mlmodelc`, which `TextEmbedder::load` reads
+and hash-checks against a pinned SHA-256. Only `clap` and `align` still
+`include_bytes!` their tokenizers. Consequence for this table: the `features`
+job is hermetic, so the `granite`/`siglip` rows build and run everything EXCEPT
+the tokenizer gates — those are `#[ignore]`d on a staged artifact and belong to
+the `model-tests` job, which stages granite via `MODELS_LOCK`. SigLIP has no
+`MODELS_LOCK` entry, so its two tokenizer gates run only locally for now.
 
 ## Curated CI parity-oracle list
 

@@ -186,7 +186,12 @@ to all eight printed decimals.
 
 `shasum -a 256 -c` of the re-derived tree against the published
 `CHECKSUMS.sha256` (`FinDIT-Studio/embedkit-coreml` @ `81852f70`): **3 of 9 files
-matched, 6 did not.**
+matched, 6 did not.** The revision is named because it is the one this
+measurement was taken against; it predates the artifact-root `tokenizer.json`,
+so that file is not among the 9 and the counts here do not move when
+`MODELS_LOCK` advances to a revision carrying it. (The tokenizer is staged
+verbatim from the digest-verified source snapshot, so byte-identity for it is
+guaranteed by construction rather than measured.)
 
 - **Matched**: `granite_97m_512.mlmodelc/weights/weight.bin` and
   `granite_97m_512.mlpackage/Data/com.apple.CoreML/weights/weight.bin` — every

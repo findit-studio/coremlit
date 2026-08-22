@@ -6,14 +6,15 @@ official public checkpoint** — not consumed from any pre-uploaded artifact rep
 
 The converted artifacts are **published**, as this recipe's OUTPUT, at
 [`FinDIT-Studio/siglip2-naflex-coreml`](https://huggingface.co/FinDIT-Studio/siglip2-naflex-coreml)
-revision `62c97df451a4906f0ee3ab93b9213113a51740ba`. That repo is the PRODUCT of
+revision `eb514c2ab66fb702d43c742add0be5b091b02dab`. That repo is the PRODUCT of
 running this recipe, never an input to it: the conversion below still starts at
 `google/siglip2-base-patch16-naflex` and re-derives the graphs from those weights.
 Publishing changed where a *consumer* obtains the artifacts, not what the recipe
-reads. That bundle holds the fp16 ship set only — the two `.mlmodelc` trees, the
-`pos_embed_16x16x768.f32le.bin` sidecar, and `CHECKSUMS.sha256`. The fp32 towers
-built below are conversion intermediates for the verification matrix and are not
-published.
+reads. That bundle holds the fp16 ship set — the two `.mlmodelc` trees, the
+`pos_embed_16x16x768.f32le.bin` sidecar, `CHECKSUMS.sha256`, and the source
+checkpoint's `tokenizer.json` copied verbatim (34 MB; the crate reads it from the
+artifact root rather than embedding it, see below). The fp32 towers built below
+are conversion intermediates for the verification matrix and are not published.
 
 ## Source (pinned)
 
@@ -23,7 +24,9 @@ published.
 - Per-file SHA-256 (verified on load, fail-closed — `scripts/_siglip_common.py`):
   - `model.safetensors` — `ac5f28bbdf92c0c1696ccbd3ce716426049cd67ad8045b66d0d938b0f9c8bbec`
   - `tokenizer.json` — `58a1696e79c9d97937389ed116f552a15c84811d7b8023918b86f4bc5775b1b0`
-    (also the bundled `src/embeddings/siglip/assets/tokenizer.json` identity pin)
+    (the crate embeds no copy: this file is republished verbatim in the artifact
+    bundle above, and `siglip::text::contract::TOKENIZER_SHA256_HEX` is this same
+    digest, enforced fail-closed at `TextEmbedder::load` before any model load)
   - `tokenizer.model` — `61a7b147390c64585d6c3543dd6fc636906c9af3865a5548f27f31aee1d4c8e2`
     (advisory sentencepiece cross-check; not bundled)
 

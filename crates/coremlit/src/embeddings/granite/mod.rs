@@ -24,7 +24,7 @@
 //!
 //! The CoreML graph is distributed on the Hugging Face Hub at
 //! [`FinDIT-Studio/embedkit-coreml`](https://huggingface.co/FinDIT-Studio/embedkit-coreml),
-//! revision `81852f70`, converted from
+//! revision `a61241cb`, converted from
 //! [`ibm-granite/granite-embedding-97m-multilingual-r2`](https://huggingface.co/ibm-granite/granite-embedding-97m-multilingual-r2)
 //! (**Apache-2.0**; see the crate `NOTICE`). It is a gitignored dev-time
 //! download under `Models/embedkit-granite/`; its per-file SHA-256 and I/O
