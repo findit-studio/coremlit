@@ -8,6 +8,12 @@
 //! macOS only. Mirrors the CoreML surface used by Argmax's WhisperKit
 //! (`MLModelExtensions` / `MLMultiArrayExtensions` in argmax-oss-swift).
 //!
+//! That core is always compiled, and `default = []` pulls no pipeline
+//! dependencies. The opt-in pipelines built on it are feature-gated submodules
+//! of [`audio`] (`whisper`, `align`, `speaker`, `vad`, `ced`) and
+//! [`embeddings`] (`clap`, `granite`, `siglip`) — speech, sound-event tagging,
+//! and audio/text/image embeddings respectively.
+//!
 //! # Example
 //!
 //! ```no_run
