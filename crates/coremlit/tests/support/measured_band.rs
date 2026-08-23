@@ -172,9 +172,10 @@ pub fn band_verdict(recorded: Option<&CharacterizedHost>, running: &HostClass) -
 ///
 /// Open it ONCE at the top of a test — before any measurement — then route
 /// every measured band through [`check_floor`](Self::check_floor),
-/// [`check_ceiling`](Self::check_ceiling) or [`check_band`](Self::check_band).
-/// Portable spec contracts do NOT go through here; they stay bare `assert!`s so
-/// no verdict can ever silence them.
+/// [`check_ceiling`](Self::check_ceiling) or [`check_band`](Self::check_band),
+/// and every measured non-numeric observation through
+/// [`check_holds`](Self::check_holds). Portable spec contracts do NOT go through
+/// here; they stay bare `assert!`s so no verdict can ever silence them.
 pub struct BandGate {
   suite: String,
   verdict: BandVerdict,
@@ -332,18 +333,57 @@ impl BandGate {
     )
   }
 
+  /// Measured NON-NUMERIC observation: asserts `holds` when armed, and reports
+  /// it everywhere, exactly as a numeric band is reported.
+  ///
+  /// Not every host-characterized measurement is a float. `whisper_streaming`'s
+  /// confirmed phrase is a boolean — the stream either contained the clip's
+  /// canonical phrase or it did not — but it is a measurement of ONE machine for
+  /// the same reason a cosine band is: a sub-nat logit margin decides a filter's
+  /// boolean gate, and CoreML does not contract that margin across hosts (#36).
+  /// It therefore needs the same three-way scoping, not a portable `assert!`.
+  ///
+  /// `expected` names what was looked for and `failure` is the full diagnosis;
+  /// the attribution footer is appended to it exactly as for a band.
+  ///
+  /// # Panics
+  /// When armed and `holds` is false.
+  pub fn check_holds(&self, what: &str, holds: bool, expected: &str, failure: &str) -> String {
+    let status = if holds { "ok     " } else { "MISSING" };
+    self.report(what, holds, status, expected, failure)
+  }
+
+  /// Measured numeric observation. Formats the value into the shared
+  /// [`report`](Self::report) line.
+  fn check(&self, what: &str, value: f32, holds: bool, band: &str, failure: &str) -> String {
+    let status = if holds { "ok     " } else { "OUTSIDE" };
+    self.report(
+      &format!("{what} = {value:.8}"),
+      holds,
+      status,
+      band,
+      failure,
+    )
+  }
+
   /// The one enforcement path: ALWAYS print the measurement and whether it fits,
   /// on every host and under every verdict; assert only when armed.
   ///
   /// The print happens BEFORE the assert, so even an armed failure leaves the
-  /// number in the log.
-  fn check(&self, what: &str, value: f32, holds: bool, band: &str, failure: &str) -> String {
-    let status = if holds { "ok     " } else { "OUTSIDE" };
+  /// measurement in the log.
+  fn report(
+    &self,
+    measurement: &str,
+    holds: bool,
+    status: &str,
+    expectation: &str,
+    failure: &str,
+  ) -> String {
     let line = if self.armed() {
-      format!("[band] {status} {what} = {value:.8}  vs {band}  [ASSERTED]")
+      format!("[band] {status} {measurement}  vs {expectation}  [ASSERTED]")
     } else {
       format!(
-        "[band] {status} {what} = {value:.8}  vs {band}  [BAND NOT ASSERTED — {}]",
+        "[band] {status} {measurement}  vs {expectation}  [BAND NOT ASSERTED — {}]",
         self.skip_reason()
       )
     };

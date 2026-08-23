@@ -15,6 +15,21 @@ mod host_class;
 #[allow(unused_imports)]
 pub use host_class::{HostClass, HostVerdict, check_host_class, legacy_failure_note};
 
+// ── Host-class scoping for MEASURED observations ────────────────────────────
+//
+// The gates above compare against a COMMITTED Swift golden, so a foreign host
+// panics: the comparison is the whole test and there is nothing left to run.
+// `streaming.rs` asserts no golden — it characterizes what THIS machine's
+// LocalAgreement-2 confirms — so it needs the opposite non-`Match` behaviour:
+// measure, print, do not assert. `tests/support/measured_band.rs` is that
+// contract, shared with the siglip band suites; `measured_band.rs` resolves
+// `super::HostClass` through the re-export above.
+#[path = "../../support/measured_band.rs"]
+#[allow(dead_code)]
+mod measured_band;
+#[allow(unused_imports)]
+pub use measured_band::{BandGate, BandVerdict, CharacterizedHost, band_verdict};
+
 /// The exact command that regenerates the whisper goldens **from the external
 /// Swift oracle**, quoted verbatim into every host-class diagnosis so the
 /// failure names its own fix.
