@@ -49,18 +49,29 @@
 //! # Coverage boundary (`COREMLIT_FP16_SWEEP_VENDORS`)
 //!
 //! By default the sweep requires EVERY vendor named by a [`KNOWN_DEFECTS`] pin to
-//! be present. CI's model job stages only part of the tree (per MODELS_LOCK), so
-//! it names what it stages —
-//! `COREMLIT_FP16_SWEEP_VENDORS=whisperkit-coreml,embedkit-granite,vadkit,ced,speakerkit`
-//! — narrowing the manifest EXPLICITLY. There the sweep proves it runs, that the
-//! whisper mel, granite norm, vadkit STFT and CED controls are clean, and that
-//! the FIVE `speakerkit/` defect pins still hold in both directions; it CANNOT
-//! verify the alignkit / argmax pins, whose models that job does not download.
-//! Full pin verification (every [`KNOWN_DEFECTS`] entry) is a local/dev gate that
-//! needs the complete `Models/` tree. The override is fail-closed — absence of it
-//! requires ALL pinned vendors — so narrowing coverage is always an explicit,
-//! reviewable act in ci.yml, never the silent side effect of a deleted
-//! directory, which is the whole point of the manifest.
+//! be present. CI runs it once per `model-tests` SHARD, and each shard stages
+//! only its own kit's part of the tree (per MODELS_LOCK), so each names exactly
+//! what it stages — `vadkit,speakerkit` for the speaker shard,
+//! `whisperkit-coreml,vadkit` for whisper, and so on — narrowing the manifest
+//! EXPLICITLY. That works because the per-pin check fires on
+//! `root.join(vendor).is_dir()`: in a whisper-only shard `Models/speakerkit/`
+//! does not exist, so its five pins are skipped rather than reported missing,
+//! while the manifest still refuses a vendor the shard DID stage and then lost.
+//!
+//! The real coverage is therefore the UNION across shards, and the union is
+//! pinned rather than assumed: `ci_fp16_sweep_shards_cover_every_pinned_vendor`
+//! in `tests/whisper/models_lock.rs` fails if a [`KNOWN_DEFECTS`] vendor is
+//! swept by no shard, and fails if a shard stages a vendor tree it does not
+//! sweep. Today that union proves the whisper mel, granite norm, vadkit STFT,
+//! CED, CLAP and SigLIP graphs are clean controls, and that the FIVE
+//! `speakerkit/` defect pins still hold in BOTH directions. It still CANNOT
+//! verify the `alignkit` and `argmax-speakerkit` pins — no shard downloads
+//! those models — so full pin verification (every [`KNOWN_DEFECTS`] entry)
+//! remains a local/dev gate needing the complete `Models/` tree; that gap is
+//! recorded by name as `UNSTAGED_DEFECT_VENDORS` in the same test. The override
+//! is fail-closed — absence of it requires ALL pinned vendors — so narrowing
+//! coverage is always an explicit, reviewable act in ci.yml, never the silent
+//! side effect of a deleted directory, which is the whole point of the manifest.
 //!
 //! When no DOWNLOADED model tree is on disk the sweep is `ignored`, never a
 //! green `ok` over zero models (see `build.rs`). "Downloaded" excludes the one
@@ -68,8 +79,10 @@
 //! checkout always has it, and un-ignoring the sweep on that alone would put
 //! every fresh clone under the fail-closed manifest above and fail it for
 //! vendors nobody fetched. The committed VAD graph is still swept wherever the
-//! cfg is on (CI's model job included, on every PR), and its single guard site
-//! is pinned hermetically by `accepts_vadkits_stft_sqrt_guard` regardless.
+//! cfg is on — EVERY `model-tests` shard names `vadkit` in its manifest, so
+//! deleting the vendored artifact fails all six on every PR — and its single
+//! guard site is pinned hermetically by `accepts_vadkits_stft_sqrt_guard`
+//! regardless.
 //!
 //! The parser tests below are hermetic and always run: they pin the checker
 //! against verbatim excerpts of the real known-bad and known-good graphs, so
@@ -2100,21 +2113,28 @@ fn a_missing_pinned_vendor_fails_the_sweep_not_silently_skips() {
   );
 }
 
-/// F3/F1 reconciliation: the CLEAN-CONTROL half of the CI model job's scope
-/// sweeps clean. `expected_vendors = {whisperkit-coreml, embedkit-granite,
-/// vadkit}` is the subset of `COREMLIT_FP16_SWEEP_VENDORS` that carries no
-/// [`KNOWN_DEFECTS`] pin: two vendors MODELS_LOCK stages, plus `vadkit`, which
-/// that job does not download because the artifact is COMMITTED to the
-/// repository. A tree containing the clean whisper mel, the clean granite norms
-/// and the real vadkit STFT guard sweeps green — every expected vendor present
-/// and clean, with the pinned vendors' absence the DOCUMENTED escape. Proving it
-/// here keeps the ci.yml wiring honest even though Actions cannot run in-repo,
-/// and it is what would go red if the vendored model were deleted while ci.yml
-/// still demanded it. It also proves the narrowed manifest does NOT demand the
-/// pinned vendors — the fail-closed default does that only when the override is
-/// unset. The pinned vendors the job DOES stage (`speakerkit`, five pins) are
-/// audited against the real tree on the runner; the missing-vendor direction is
-/// [`a_missing_pinned_vendor_fails_the_sweep_not_silently_skips`].
+/// F3/F1 reconciliation, and the proof that the sweep SHARDS: a manifest naming
+/// only clean vendors sweeps green over a tree that has only those vendors.
+///
+/// `expected_vendors = {whisperkit-coreml, embedkit-granite, vadkit}` is a
+/// clean-control set carrying no [`KNOWN_DEFECTS`] pin: two vendors MODELS_LOCK
+/// stages, plus `vadkit`, which no shard downloads because the artifact is
+/// COMMITTED to the repository. A tree containing the clean whisper mel, the
+/// clean granite norms and the real vadkit STFT guard sweeps green — every
+/// expected vendor present and clean, with the PINNED vendors entirely absent.
+///
+/// That absence is the load-bearing part now that ci.yml runs one shard per
+/// kit. Each shard stages only its own kit's tree, so `Models/speakerkit/` does
+/// not exist in the whisper shard at all — and its five pins must be SKIPPED
+/// there rather than reported missing, because the per-pin check fires on
+/// `root.join(vendor).is_dir()`. This test is that behavior, exercised on a real
+/// partial tree rather than assumed. The narrowed manifest does not demand the
+/// pinned vendors; the fail-closed default demands them only when the override
+/// is unset. The opposite direction — a vendor a shard DOES name going missing —
+/// is [`a_missing_pinned_vendor_fails_the_sweep_not_silently_skips`], and the
+/// cross-shard question of whether the UNION still covers every pin is
+/// `ci_fp16_sweep_shards_cover_every_pinned_vendor` in
+/// `tests/whisper/models_lock.rs`.
 #[test]
 fn the_ci_model_job_scope_sweeps_clean() {
   let tree = TempTree::new("ci_model_job_scope");

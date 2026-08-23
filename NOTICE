@@ -25,6 +25,19 @@ model_io tests for the repo id, revision, and per-file SHA-256). This NOTICE
 records the attribution a binary that distributes or bundles those components
 must honor.
 
+CI DOWNLOADS; IT DOES NOT REDISTRIBUTE. The `model-tests` shards in
+`.github/workflows/ci.yml` fetch every artifact MODELS_LOCK pins — whisper-tiny,
+granite, CED-tiny, the speakerkit pair, the CLAP encoders and the SigLIP 2
+encoders — into a runner's gitignored `Models/` tree for the duration of a job.
+Fetching a Hugging Face artifact to run tests against it is use, not
+distribution: nothing downloaded there is committed to this repository, ships in
+the published crate, or is served onward to anyone. `Models/` stays gitignored
+apart from the single vendored VAD bundle named above, and widening what CI
+stages therefore adds no redistribution obligation that was not already
+recorded per component below. It does not narrow one either: the argmax
+undeclared-license note in section 4 stands unchanged, and those graphs are
+deliberately fetched by NO shard.
+
 Sections 1-2 (the audio::vad models) began as the former vadkit NOTICE and were
 rewritten when the CoreML artifact was vendored into this repository — what was
 a conditional obligation on downstream redistributors became a live one here.
@@ -226,6 +239,16 @@ via `include_bytes!` (exposed as `coremlit::embeddings::clap::BUNDLED_TOKENIZER`
         02a99c6a. Per-file SHA-256 pinned in tests/clap/model_io.rs and
         tests/clap/text_model_io.rs.
 
+        MODELS_LOCK pins revision 02a99c6a8be21da1e9a947499ea503a10c80c4f1,
+        which carries both precisions, and CI's `clap` shard stages its four
+        compiled `.mlmodelc` bundles (448 MB: clap_text, clap_text_int8,
+        clap_audio, clap_audio_int8) to run the model gates. The four sibling
+        `.mlpackage` directories are deliberately not fetched — their weights
+        are byte-identical to the compiled bundles' and nothing reads them. The
+        CC-BY-4.0 attribution above is the obligation on anyone who
+        REDISTRIBUTES those weights; a CI runner that downloads them to test
+        against does not, and this repository commits none of them.
+
       License note. Attribution to `laion/clap-htsat-unfused` is provided as
       required. textclap's models/MODELS.md treats the LAION CLAP checkpoints as
       CC-BY-4.0; the current upstream Hugging Face card declares apache-2.0. Both
@@ -304,9 +327,11 @@ load (`coremlit::embeddings::siglip::TOKENIZER_FILE_NAME`), so linking coremlit
 does not redistribute it.
 
   8a) Encoder weights — google/siglip2-base-patch16-naflex. The crate ships NO
-      model files; it loads a CoreML conversion produced LOCALLY from the official
-      Google weights (the conversion/siglip recipes) — not consumed from any
-      pre-uploaded artifact repo.
+      model files; it loads a CoreML conversion of the official Google weights
+      produced by the conversion/siglip recipes. That conversion has since been
+      PUBLISHED (see the artifact-repo record below) and is what CI now stages,
+      superseding this section's earlier statement that the converted artifacts
+      existed only locally.
 
         Original model: google/siglip2-base-patch16-naflex
         https://huggingface.co/google/siglip2-base-patch16-naflex
@@ -318,10 +343,23 @@ does not redistribute it.
         b53b807d3a2d5e2b3911292f2d69e5341cdc064c
         (model.safetensors SHA-256
         ac5f28bbdf92c0c1696ccbd3ce716426049cd67ad8045b66d0d938b0f9c8bbec).
-        The converted artifacts are staged locally (gitignored); a public
-        re-upload of them is a later owner decision and would add its own
-        artifact-repo revision. The per-file SHA-256 of the converted bundles is
-        pinned in tests/siglip/model_io.rs / tests/siglip/text_model_io.rs.
+
+        CoreML conversion actually loaded: FinDIT-Studio/siglip2-naflex-coreml
+        https://huggingface.co/FinDIT-Studio/siglip2-naflex-coreml
+        Revision (commit SHA): eb514c2ab66fb702d43c742add0be5b091b02dab
+        HF-declared license: apache-2.0, matching the upstream weights.
+        MODELS_LOCK pins that revision and CI's `siglip` shard stages the whole
+        512-tier bundle (748 MB: the vision and text `.mlmodelc` towers, the
+        position-grid sidecar, and the tokenizer of section 8b) to run the model
+        gates. Previously only the tokenizer sidecar was fetched, because only
+        the two tokenizer gates ran in CI. The per-file SHA-256 of the converted
+        bundles is pinned in tests/siglip/model_io.rs /
+        tests/siglip/text_model_io.rs and matches that bundle's own
+        CHECKSUMS.sha256 file-for-file.
+
+        As with every other artifact here, downloading these weights onto a CI
+        runner is use rather than distribution; the Apache-2.0 obligations below
+        bind whoever redistributes them or a binary bundling them.
 
       As an Apache-2.0 work, a redistributor must retain the license and
       copyright notices AND STATE ANY CHANGES. Unlike a pure format conversion,
