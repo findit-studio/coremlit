@@ -296,3 +296,51 @@ pub fn decode_png_rgb8(path: &Path) -> (Vec<u8>, usize, usize) {
   );
   (rgb, w, h)
 }
+
+// ── Host-class provenance for the MEASURED-then-pinned bands ────────────────
+//
+// `parity_embed.rs` and `placement.rs` each assert two DIFFERENT kinds of
+// number: the spec §3 ship floor (portable, asserted everywhere) and bands that
+// were measured on one machine and pinned (`MEASURED_FLOOR`, the vision-ANE
+// `[0.20, 0.70]` collapse band, its non-vacuity ceiling, and the All-tracks-ANE
+// tolerance). CoreML contracts neither the `CpuOnly` kernels nor the Neural
+// Engine's fp16 arithmetic to reproduce across macOS builds or chips (#36), so
+// the second kind describes a host, not the port — and CI proved it, reddening
+// both on a runner whose ANE numbers were fine.
+//
+// `tests/support/host_class.rs` is the SAME mechanism for goldens (speaker, vad,
+// whisper), and `tests/support/measured_band.rs` adapts its three-way contract
+// from "a golden JSON carries `generationHost`" to "a source constant carries
+// the host it was measured on". Both are pulled in by `#[path]`, the
+// `tests/support/coremlit_dir.rs` convention, so there is one copy of each.
+#[path = "../../support/host_class.rs"]
+#[allow(dead_code)]
+mod host_class;
+// Only `HostClass` is re-exported: this suite has no golden JSON to host-stamp,
+// so `check_host_class` / `HostVerdict` / `legacy_failure_note` stay unused here
+// (the `allow(dead_code)` above covers them). `measured_band.rs` resolves
+// `super::HostClass` through this re-export.
+#[allow(unused_imports)]
+pub use host_class::HostClass;
+
+#[path = "../../support/measured_band.rs"]
+#[allow(dead_code)]
+mod measured_band;
+#[allow(unused_imports)]
+pub use measured_band::{BandGate, BandVerdict, CharacterizedHost, band_verdict};
+
+/// The exact command that re-measures one siglip band suite on THIS machine,
+/// quoted verbatim into every band-gate banner so a log names its own fix.
+///
+/// `test_target` is the `[[test]]` name (e.g. `siglip_placement`) and
+/// `source_rel` the file holding the band constants, so the two halves of a
+/// re-characterization — run it, then pin what it printed — are both spelled
+/// out.
+#[allow(dead_code)]
+pub fn recharacterize_command(test_target: &str, source_rel: &str) -> String {
+  format!(
+    "cargo test -p coremlit --features siglip --test {test_target} -- --ignored --nocapture\n                \
+     then pin the printed `[band]` numbers in {source_rel} and set its\n                \
+     CHARACTERIZED_ON to the `this host` line above."
+  )
+}

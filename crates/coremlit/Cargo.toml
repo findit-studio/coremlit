@@ -688,6 +688,21 @@ name = "siglip_e2e"
 path = "tests/siglip/e2e.rs"
 required-features = ["siglip"]
 
+# Hermetic (no model, no `SIGLIP_TEST_MODELS`): drives the measured-band host
+# gate that `parity_embed.rs` / `placement.rs` route their pinned numbers
+# through. Deliberately NOT model-gated — that gate is what stands between a
+# host-specific measurement and a false red, so it must be proven on every push
+# rather than only where the artifacts are staged.
+#
+# It therefore belongs in the `features` job and NOT in ci.yml's `model-tests`
+# siglip gate list: it lists ZERO ignored tests, which would correctly trip that
+# job's anti-vacuum guard — the same reason `clap_tokenizer_identity` is absent
+# from the clap row.
+[[test]]
+name = "siglip_band_provenance"
+path = "tests/siglip/band_provenance.rs"
+required-features = ["siglip"]
+
 [[test]]
 name = "ced_model_io"
 path = "tests/ced/model_io.rs"
