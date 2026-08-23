@@ -3,41 +3,57 @@
 # different revisions) to force a re-download.
 #
 # This file is CONSUMED, not decorative: ci.yml's "Download models (cache
-# miss)" step hand-parses the seven tables below (small sed/awk block, no
-# TOML crate — see the comment there) to build all seven `hf download`
-# commands, including `--revision`. Editing a repo name, selector, or
-# revision here changes what CI actually downloads next run, exactly like
-# editing any other lock file. Table ORDER is load-bearing: that parser
-# selects a table by INDEX (1 = whisper model, 2 = whisper tokenizer,
-# 3 = granite, 4 = siglip tokenizer, 5 = ced-tiny, 6 = speakerkit BASE,
-# 7 = speakerkit OVERLAY), so tables may be appended but never reordered
-# without editing ci.yml to match. Appending is only safe because ci.yml
-# ALSO asserts the table COUNT it knows how to parse: an eighth table added
-# here without teaching the parser about it fails that job loudly instead of
-# being silently ignored.
+# miss)" step hand-parses the tables below (small sed/awk block, no TOML
+# crate — see the comment there) to build every `hf download` command,
+# including `--revision` and `--local-dir`. Editing a repo name, selector,
+# revision or destination here changes what CI actually downloads next run,
+# exactly like editing any other lock file.
+#
+# EVERY TABLE CARRIES A `kit`, AND THE KIT IS HOW CI SELECTS IT. ci.yml runs
+# ONE SHARD PER KIT — a separate parallel job with its own cache, its own
+# download subset, its own checksum verification, its own gates and its own
+# fp16 sweep — and each shard's download step extracts the tables whose `kit`
+# equals its own. Table ORDER ACROSS kits is therefore NOT load-bearing any
+# more: tables may be reordered, appended, or regrouped freely as long as each
+# keeps its `kit`. (Order WITHIN the `speaker` kit still is — see the ORDER
+# box below.)
+#
+# The old index-selected parser is gone, and so is the `table_count` tripwire
+# that guarded it. Two checks replace it, and between them they still refuse
+# every way a table can go silently unread:
+#
+#   - ci.yml's download step fails if ANY table lacks a `kit`, and fails if
+#     the shard's own kit matches NO table (which would otherwise leave a
+#     shard downloading nothing and gating a bare checkout).
+#   - the hermetic `ci_shards_every_kit_in_the_lock` gate in
+#     crates/coremlit/tests/whisper/models_lock.rs fails if a kit named here
+#     has no shard in ci.yml's matrix, or a shard names a kit no table
+#     defines. That is the cross-shard half no single shard can see, and it
+#     runs in the modelless `features` job on every PR.
 #
 # ###########################################################################
-# # ORDER IS AN ARTIFACT-CORRECTNESS INVARIANT, NOT JUST A PARSER INDEX.    #
+# # ORDER WITHIN THE `speaker` KIT IS AN ARTIFACT-CORRECTNESS INVARIANT.     #
 # #                                                                         #
-# # Tables 6 and 7 BOTH download into `Models/speakerkit/`, and they BOTH   #
-# # publish files named `pyannote_segmentation.mlmodelc/` and               #
-# # `wespeaker.mlmodelc/`. The second download OVERWRITES the first, so the #
-# # LAST table to run decides which bytes the shipping pipeline gets.       #
+# # The two `kit = "speaker"` tables BOTH download into `Models/speakerkit/`,#
+# # and they BOTH publish files named `pyannote_segmentation.mlmodelc/` and  #
+# # `wespeaker.mlmodelc/`. The second download OVERWRITES the first, so the  #
+# # LAST speaker table to run decides which bytes the shipping pipeline gets.#
+# # The shard's download loop walks its kit's tables in the order they       #
+# # appear HERE, so this file's order is what picks the winner.              #
 # #                                                                         #
-# # Table 6 (FluidInference) is the BASE layer: seven of the nine staged    #
-# # bundles come from it and nothing else publishes them, and it also       #
-# # carries PRE-REPAIR copies of the other two. Table 7 (FinDIT-Studio) is  #
-# # the OVERLAY: those other two, as the issue-#15 fp16-guard-repaired      #
-# # re-conversions, and they MUST WIN.                                      #
+# # FluidInference is the BASE layer: seven of the nine staged bundles come  #
+# # from it and nothing else publishes them, and it also carries PRE-REPAIR  #
+# # copies of the other two. FinDIT-Studio is the OVERLAY: those other two,  #
+# # as the issue-#15 fp16-guard-repaired re-conversions, and they MUST WIN.  #
 # #                                                                         #
-# # Swap those two tables and CI silently stages the pre-repair             #
-# # segmentation graph — whose inert `log(epsilon = 0)` saturates           #
-# # `segments` to −45440 on the default ANE placement — and the pre-repair  #
-# # embedder, whose pooling guards vanish in fp16. Both are                 #
-# # contract-identical and pass every load/shape test. Only bytes tell them #
-# # apart, which is why ci.yml's "Verify speakerkit overlay and artifact    #
-# # checksums" step hashes both graphs against the pins in                  #
-# # crates/coremlit/tests/speaker/model_io.rs BEFORE any gate runs, and     #
+# # Swap those two tables and CI silently stages the pre-repair              #
+# # segmentation graph — whose inert `log(epsilon = 0)` saturates            #
+# # `segments` to −45440 on the default ANE placement — and the pre-repair   #
+# # embedder, whose pooling guards vanish in fp16. Both are                  #
+# # contract-identical and pass every load/shape test. Only bytes tell them  #
+# # apart, which is why ci.yml's "Verify speakerkit overlay" step hashes     #
+# # both graphs against the pins in                                          #
+# # crates/coremlit/tests/speaker/model_io.rs BEFORE any gate runs, and      #
 # # fails the job naming this ordering as the cause.                        #
 # ###########################################################################
 #
@@ -48,9 +64,9 @@
 # a deliberate user follow-up: it requires live network access (`hf api ...`
 # or the HF web UI) to look up each repo's current commit SHA. Until that
 # lands, treat `cache-epoch` bumps as the only reliable way to force a
-# fresh, verified download of them. The granite, ced and speakerkit tables
-# are NOT in that state: each pins an immutable commit SHA. Of those, the
-# granite, ced and FinDIT-Studio speakerkit artifacts additionally ship a
+# fresh, verified download of them. Every other table is NOT in that state:
+# each pins an immutable commit SHA. Of those, granite, siglip, ced, clap and
+# the FinDIT-Studio speakerkit artifacts additionally ship a
 # `CHECKSUMS.sha256` that ci.yml verifies the downloaded bytes against;
 # FluidInference's repo ships NO checksum file, so its bundles are covered
 # instead by the per-file SHA-256 pins in
@@ -60,19 +76,24 @@
 cache-epoch = 1
 
 ["argmaxinc/whisperkit-coreml"]
-include  = "openai_whisper-tiny/*"
-revision = "main"
+kit       = "whisper"
+include   = "openai_whisper-tiny/*"
+revision  = "main"
+local-dir = "Models/whisperkit-coreml"
 
 ["openai/whisper-tiny"]
-files    = "tokenizer.json tokenizer_config.json config.json"
-revision = "main"
+kit       = "whisper"
+files     = "tokenizer.json tokenizer_config.json config.json"
+revision  = "main"
+local-dir = "Models/tokenizers/whisper-tiny"
 
 # The granite embeddings artifact (`embeddings::granite`), staged under
 # Models/embedkit-granite/ — the layout tests/granite/common/mod.rs resolves
-# by default (overridable via EMBEDKIT_TEST_MODELS). `include` pulls the whole
-# bundle directory: the `.mlmodelc` the gates load, the `.mlpackage`, the
-# `CHECKSUMS.sha256` ci.yml checks every one of them against, and the
-# `tokenizer.json` the crate reads from the artifact root.
+# by default (the `granite` shard sets EMBEDKIT_TEST_MODELS to the same path
+# explicitly). `include` pulls the whole bundle directory: the `.mlmodelc` the
+# gates load, the `.mlpackage`, the `CHECKSUMS.sha256` ci.yml checks every one
+# of them against, and the `tokenizer.json` the crate reads from the artifact
+# root.
 #
 # The revision below is the first to carry that `tokenizer.json` (24 MB — the
 # crate stopped embedding it because `include_bytes!` of that size overruns the
@@ -81,24 +102,41 @@ revision = "main"
 # preceding `81852f70` revision the per-file SHA-256 pins in
 # tests/granite/model_io.rs were cut against; the tokenizer is purely additive.
 ["FinDIT-Studio/embedkit-coreml"]
-include  = "granite-97m-multilingual-r2/*"
-revision = "a61241cb18689de1a8b83c315875807030e2878f"
+kit       = "granite"
+include   = "granite-97m-multilingual-r2/*"
+revision  = "a61241cb18689de1a8b83c315875807030e2878f"
+local-dir = "Models/embedkit-granite"
 
-# The siglip2-naflex artifact's TOKENIZER SIDECAR, and nothing else. The two
-# gates in tests/siglip/tokenizer_identity.rs never call `Model::load`: they read
-# `model_root()/tokenizer.json` plus the committed golden corpus and do pure
-# tokenization. So CI stages the 34 MB `tokenizer.json` rather than the whole
-# ~784 MB bundle — the `.mlmodelc` towers and the pos-embed sidecar buy nothing
-# for these two tests. The other siglip model gates (model_io, parity_embed,
-# placement, e2e) DO need the towers and stay local/dev gates, exactly as before.
+# The siglip2-naflex artifact — the WHOLE 512-tier bundle, 748 MB: both
+# `.mlmodelc` towers, the pos-embed sidecar, the 33 MB `tokenizer.json`, and
+# the `CHECKSUMS.sha256` that covers all twelve files.
+#
+# It was the tokenizer sidecar ALONE while every siglip gate but
+# `tokenizer_identity` was a local/dev gate. The kit now has its own shard, so
+# the towers buy six gate suites instead of two: model_io and text_model_io
+# (whose exact-SHA manifests are the same twelve lines this bundle's checksum
+# file carries), parity_embed and e2e against the committed transformers-fp32
+# goldens, and placement. Folding the tokenizer into this one table is
+# deliberate — a second table pinning the same repo and revision for one file
+# would download the sidecar twice and make "which table stages the bundle"
+# ambiguous.
+#
+# `siglip_preprocess` is the one siglip suite the shard does NOT run: its only
+# model gate (`full_tensor_parity_against_staged_npy`) reads
+# `<SIGLIP_TEST_MODELS>/fixtures/preprocess/*.npy`, which this repo does not
+# publish — it is a locally-generated torch dump. Its hermetic sibling
+# (`small_oracles_match_committed_torch_reference`) runs in the `features` job
+# like every other hermetic suite.
 #
 # `include` keeps the bundle's own directory, and the tests resolve
 # `model_root()` as `Models/siglip2-naflex/siglip2-base-patch16-naflex-512`, so
-# ci.yml downloads with `--local-dir Models/siglip2-naflex` and the tier
-# directory from `include` supplies the second path component.
+# `local-dir` is the family root and the tier directory from `include` supplies
+# the second path component.
 ["FinDIT-Studio/siglip2-naflex-coreml"]
-include  = "siglip2-base-patch16-naflex-512/tokenizer.json"
-revision = "eb514c2ab66fb702d43c742add0be5b091b02dab"
+kit       = "siglip"
+include   = "siglip2-base-patch16-naflex-512/*"
+revision  = "eb514c2ab66fb702d43c742add0be5b091b02dab"
+local-dir = "Models/siglip2-naflex"
 
 # The CED sound-event classifier artifact (`audio::ced`), **`ced-tiny` ALONE**.
 # The repo publishes four I/O-identical sizes totalling 234 MiB — tiny 10.64,
@@ -110,20 +148,20 @@ revision = "eb514c2ab66fb702d43c742add0be5b091b02dab"
 # cannot: `ced-base` alone is 163.62 MiB, past GitHub's 100 MB single-file hard
 # limit, so the whole family rides MODELS_LOCK.
 #
-# `include` keeps the bundle's own size directory, so ci.yml downloads with
-# `--local-dir Models/ced` and lands the tree at
-# `Models/ced/ced-tiny/ced_tiny.mlmodelc` — the layout
-# `tests/ced/common/mod.rs` resolves by default (overridable via
-# `CED_TEST_MODELS`). The bundle ships `CHECKSUMS.sha256` (paths relative to
-# the `.mlmodelc` root, NOT to `ced-tiny/` as granite's are) and `MANIFEST.json`;
-# ci.yml verifies the bytes against the former on every run.
+# `include` keeps the bundle's own size directory, so `local-dir` is the family
+# root and the tree lands at `Models/ced/ced-tiny/ced_tiny.mlmodelc` — the
+# layout `tests/ced/common/mod.rs` resolves by default (the `ced` shard sets
+# `CED_TEST_MODELS` to the same path explicitly). The bundle ships
+# `CHECKSUMS.sha256` (paths relative to the `.mlmodelc` root, NOT to
+# `ced-tiny/` as granite's are) and `MANIFEST.json`; ci.yml verifies the bytes
+# against the former on every run.
 #
 # SELECTOR AND GATE FILTER MOVE TOGETHER. The per-size gates in `tests/ced/`
 # are `#[ignore]`d one module per size (`tiny::`/`mini::`/`small::`/`base::`),
-# and an ignored-ONLY run selects ALL FOUR — so ci.yml's "CED model gates" step
+# and an ignored-ONLY run selects ALL FOUR — so the `ced` shard's gate plan
 # filters on `tiny::`. Widening this `include` to another size without adding
-# that size to the gate step downloads bytes no gate reads; narrowing the gate
-# step below what `include` stages does the same. The hermetic test
+# that size to the gate plan downloads bytes no gate reads; narrowing the gate
+# plan below what `include` stages does the same. The hermetic test
 # `ci_runs_the_ced_gates_for_exactly_the_size_the_lock_stages`
 # (tests/whisper/models_lock.rs) pins the two together.
 #
@@ -134,8 +172,10 @@ revision = "eb514c2ab66fb702d43c742add0be5b091b02dab"
 # bytes at this revision are byte-identical to the `TINY_SHA256` table in
 # `tests/ced/model_io.rs`.
 ["FinDIT-Studio/cedkit-coreml"]
-include  = "ced-tiny/*"
-revision = "96d504716c4e2ebe6182312f65c4ee6c23921a5d"
+kit       = "ced"
+include   = "ced-tiny/*"
+revision  = "96d504716c4e2ebe6182312f65c4ee6c23921a5d"
+local-dir = "Models/ced"
 
 # ===========================================================================
 # speakerkit, layer 1 of 2 — the BASE. **MUST STAY BEFORE the table below.**
@@ -143,9 +183,10 @@ revision = "96d504716c4e2ebe6182312f65c4ee6c23921a5d"
 # ===========================================================================
 #
 # The `audio::speaker` artifact set (`Models/speakerkit/`, the directory
-# tests/speaker/common/mod.rs resolves by default, overridable via
-# `SPEAKERKIT_TEST_MODELS`). Nine `.mlmodelc` bundles end up staged; SEVEN of
-# them come from here and nothing else publishes them:
+# tests/speaker/common/mod.rs resolves by default, and the one the `speaker`
+# shard names explicitly via `SPEAKERKIT_TEST_MODELS`). Nine `.mlmodelc`
+# bundles end up staged; SEVEN of them come from here and nothing else
+# publishes them:
 #
 #   | bundle                    | read by                                   |
 #   |---------------------------|-------------------------------------------|
@@ -182,8 +223,10 @@ revision = "96d504716c4e2ebe6182312f65c4ee6c23921a5d"
 # defect. The revision is the one tests/speaker/model_io.rs's provenance
 # section names and every one of those pins was cut against.
 ["FluidInference/speaker-diarization-coreml"]
-include  = "*.mlmodelc/*"
-revision = "1ed7a662fdc7109e36d822db793ee6eebdaf8594"
+kit       = "speaker"
+include   = "*.mlmodelc/*"
+revision  = "1ed7a662fdc7109e36d822db793ee6eebdaf8594"
+local-dir = "Models/speakerkit"
 
 # ===========================================================================
 # speakerkit, layer 2 of 2 — the OVERLAY. **MUST STAY AFTER the table above.**
@@ -206,19 +249,53 @@ revision = "1ed7a662fdc7109e36d822db793ee6eebdaf8594"
 # is NOT adopted (it regresses clip 14's int8 ANE arm from 0.8178 % to
 # 1.4860 % DER) and whose arrival would break both the
 # `wespeaker_v2 == wespeaker_int8` byte-identity gate and that bundle's
-# fp16_guards pin. The int8 sibling must stay FluidInference's, from table 6.
+# fp16_guards pin. The int8 sibling must stay FluidInference's, from the base
+# table above.
 #
 # `CHECKSUMS.sha256` is in the list on purpose: this repo DOES ship one, and
 # ci.yml verifies every staged file against it. Two cautions for whoever
 # touches that step — the checksum file lists its own name with the sha256 of
 # an EMPTY file, and it also lists the `wespeaker_int8`/`.mlpackage` paths this
 # selector deliberately skips, so a bare `shasum -c CHECKSUMS.sha256` fails in
-# three ways at once. ci.yml therefore verifies the filtered subset covering
-# exactly the two staged bundles, and pins the expected line count so a
-# filter that rots into matching nothing cannot pass vacuously.
+# three ways at once. The `speaker` shard therefore verifies the FILTERED
+# subset covering exactly the two staged bundles, and pins the expected line
+# count so a filter that rots into matching nothing cannot pass vacuously.
+# (`clap`'s checksum file has the second of those two problems and not the
+# first, and is filtered the same way.)
 #
-# Total staged from here: 35.2 MB, overwriting the same two bundles from
-# table 6.
+# Total staged from here: 35.2 MB, overwriting the same two bundles from the
+# base table.
 ["FinDIT-Studio/speakerkit-coreml"]
-include  = "pyannote_segmentation.mlmodelc/* wespeaker.mlmodelc/* CHECKSUMS.sha256"
-revision = "3db69988bf2de12bab250614d6ac2b03d35132a2"
+kit       = "speaker"
+include   = "pyannote_segmentation.mlmodelc/* wespeaker.mlmodelc/* CHECKSUMS.sha256"
+revision  = "3db69988bf2de12bab250614d6ac2b03d35132a2"
+local-dir = "Models/speakerkit"
+
+# The CLAP audio+text encoders (`embeddings::clap`), staged under
+# Models/clapkit/ — the directory tests/clap/common/mod.rs resolves by default
+# (the `clap` shard sets `CLAPKIT_TEST_MODELS` to the same path explicitly).
+#
+# FOUR `.mlmodelc` bundles, 448 MB: `clap_text` 240 MB, `clap_text_int8`
+# 120 MB, `clap_audio` 58 MB, `clap_audio_int8` 29 MB. All four are staged
+# because all four are gated — tests/clap/{model_io,text_model_io} byte-pin the
+# fp16 AND int8 towers, placement characterizes four arms, and e2e pins the
+# int8 pipeline's top label separately from the fp16 one.
+#
+# The FOUR SIBLING `.mlpackage` DIRECTORIES ARE DELIBERATELY EXCLUDED, and
+# `*.mlmodelc/*` rather than a bare `*` is what excludes them. They are the
+# uncompiled source packages the `.mlmodelc` bundles were compiled from: their
+# `weights/weight.bin` is BYTE-IDENTICAL to the compiled bundle's (the
+# repo's own CHECKSUMS.sha256 lists the same sha256 for both), nothing in this
+# crate resolves a `.mlpackage` path, and including them would take the
+# download from 448 MB to 895 MB for zero coverage.
+#
+# `CHECKSUMS.sha256` is staged and verified. It does NOT carry the speakerkit
+# overlay's empty-file self-listing trap, but it DOES list all twelve
+# `.mlpackage` paths this selector skips, so `shasum -c` over the whole file
+# fails on a correct tree. The shard verifies the filtered `.mlmodelc` subset
+# and pins its line count (20 = four bundles × five files).
+["FinDIT-Studio/clapkit-coreml"]
+kit       = "clap"
+include   = "*.mlmodelc/* CHECKSUMS.sha256"
+revision  = "02a99c6a8be21da1e9a947499ea503a10c80c4f1"
+local-dir = "Models/clapkit"

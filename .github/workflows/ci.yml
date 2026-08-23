@@ -31,6 +31,23 @@ jobs:
       # step. They stay `#[ignore]`d — the repo's model-gate convention — so CI
       # asks for them by name, per target.
       #
+      # THEY STAYED HERE WHEN `model-tests` WAS SHARDED BY KIT, and that was a
+      # decision rather than an oversight. Every shard there selects MODELS_LOCK
+      # tables by `kit` and fails if its kit matches none; vadkit has no table
+      # and needs none, so a `vad` shard would either be an empty download or a
+      # special case carved through that invariant. Putting these gates in some
+      # OTHER kit's shard would be worse still — the VAD verdict would then
+      # depend on, say, granite's 400 MB download succeeding. They belong in the
+      # job whose whole premise is "no artifacts required", which is this one.
+      #
+      # The `whisper,vad` COMPOSITION gates went the other way, to the `whisper`
+      # shard, because they need whisper-tiny: the composition is only reachable
+      # where a downloaded model is. So the VAD model itself is gated once, here,
+      # and the composition once, there — neither twice, neither dropped. The
+      # committed graph is still swept for fp16 guards on every shard: each
+      # `model-tests` row names `vadkit` in its sweep manifest, so deleting the
+      # vendored artifact fails all six.
+      #
       # `vad_parity_swift` is deliberately NOT here, and cannot be until its
       # goldens are regenerated on a runner. Its committed Swift traces carry no
       # `generationHost` stamp, and CoreML `CpuOnly` floats are not contracted
@@ -40,9 +57,10 @@ jobs:
       # refuse a mismatched host outright. It stays a local/dev gate against a
       # same-host oracle.
       #
-      # Anti-vacuum, the granite/siglip idiom: an ignored-only run over a target
-      # whose gates were deleted, renamed, un-ignored, or that failed to BUILD
-      # runs 0 tests and exits 0, so the ignored-only `--list` count refuses it.
+      # Anti-vacuum, the same idiom `model-tests`'s gate runner applies to every
+      # shard: an ignored-only run over a target whose gates were deleted,
+      # renamed, un-ignored, or that failed to BUILD runs 0 tests and exits 0,
+      # so the ignored-only `--list` count refuses it.
       - name: VAD model gates (committed model, no download)
         run: |
           set -euo pipefail
@@ -119,671 +137,680 @@ jobs:
       - name: "cargo test -p coremlit-parity (features: ${{ matrix.features }})"
         run: cargo test -p coremlit-parity --features "${{ matrix.features }}"
 
+  # ONE SHARD PER MODEL KIT, and the shape is the whole point of this job.
+  #
+  # This was a single 667-line job with one cache, one download step and one red
+  # light for every model family, and that structure caused a month-long outage
+  # rather than merely being untidy. GitHub's default step condition is
+  # `success()`, so when three whisper gates went red in late July the whole job
+  # went red, and the four gate steps added AFTERWARDS (granite, SigLIP,
+  # whisper+VAD, CED) never executed once — the job died before reaching them,
+  # and `actions/cache` never got to save either. Per-step `!cancelled()` guards
+  # fixed the masking WITHIN a job; sharding removes the shared fate entirely.
+  #
+  # Each kit now gets its own runner, its own `actions/cache` entry keyed on the
+  # kit AND MODELS_LOCK's hash, its own download subset, its own checksum
+  # verification, its own gates and its own fp16 sweep. `fail-fast: false` keeps
+  # one red shard from cancelling the other five, and GitHub names each check
+  # after its kit (`model-tests (granite)`), so a family's verdict is legible
+  # from the PR page without opening a log.
+  #
+  # EVERY SHARD RUNS THE IDENTICAL STEP LIST. Nothing here is `if: matrix.kit ==
+  # ...`; the per-kit differences are DATA in the matrix rows below, which is
+  # what lets one `Gate ledger` step, one anti-vacuum guard and one set of
+  # hermetic pins cover all six shards instead of six near-copies drifting apart.
+  # A new kit is a new matrix row plus a new MODELS_LOCK table, and
+  # `ci_shards_every_kit_in_the_lock` (tests/whisper/models_lock.rs) fails if you
+  # add one without the other in either direction.
+  #
+  # Per-row fields:
+  #   kit            selects MODELS_LOCK tables by their `kit` field, and names
+  #                  the cache entry and the GitHub check.
+  #   cache          newline-separated paths for actions/cache (what the
+  #                  download step stages, and nothing else).
+  #   probe          space-separated paths that MUST exist before the gates run,
+  #                  so an absent artifact FAILS loudly instead of letting every
+  #                  gate die on a missing file.
+  #   checksum-dir   directory to verify from, or the literal `none` for a kit
+  #                  whose repos ship no CHECKSUMS.sha256. `none` is a declared
+  #                  decision, not an empty field: the hermetic pin refuses it
+  #                  for every kit but `whisper`.
+  #   checksum-file  the checksum file, RELATIVE TO checksum-dir. Not always
+  #                  `CHECKSUMS.sha256` — see the `ced` row.
+  #   checksum-filter / checksum-lines
+  #                  for the two repos whose checksum file cannot be fed to
+  #                  `shasum -c` whole; the line count is what stops a rotted
+  #                  filter from "verifying" an empty set.
+  #   overlay-pins   `<bundle>:<sha256 of its model.mil>` pairs proving WHICH
+  #                  layer won a filename collision. REQUIRED (and enforced at
+  #                  run time) for any kit whose MODELS_LOCK tables share a
+  #                  `local-dir`.
+  #   fp16-vendors   the fp16 sweep's vendor manifest for this shard — see the
+  #                  sweep step.
+  #   gates          the gate plan, one `features|selectors|filter` group per
+  #                  line — see the gate step.
   model-tests:
+    name: model-tests (${{ matrix.kit }})
     runs-on: macos-15
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 10.6 MB. `ced-tiny` alone of the artifact repo's four I/O-identical
+          # sizes; the `tiny::` filter is not optional — each tests/ced/ target
+          # declares its gates four times, one #[ignore]d module per size, and
+          # an ignored-ONLY run selects ALL FOUR. MODELS_LOCK's `include` and
+          # this filter move together, pinned by
+          # `ci_runs_the_ced_gates_for_exactly_the_size_the_lock_stages`.
+          #
+          # CED's CHECKSUMS.sha256 lists paths relative to the `.mlmodelc` ROOT
+          # (`model.mil`, `weights/weight.bin`), not to the `ced-tiny/`
+          # directory it sits in the way granite's are — hence the `..`. Verify
+          # from `ced-tiny/` instead and `shasum -c` reports five "No such
+          # file"s: fail-closed either way, but loudly wrong rather than quietly
+          # wrong.
+          - kit: ced
+            cache: Models/ced/ced-tiny
+            probe: Models/ced/ced-tiny/ced_tiny.mlmodelc
+            checksum-dir: Models/ced/ced-tiny/ced_tiny.mlmodelc
+            checksum-file: ../CHECKSUMS.sha256
+            fp16-vendors: vadkit,ced
+            gates: |
+              ced|ced_model_io ced_parity_logits ced_placement ced_e2e|tiny::
+          # 78 MB: the 73 MB whisper-tiny bundle plus a 5 MB tokenizer sidecar,
+          # from two repos into two separate directories.
+          #
+          # The only kit with `checksum-dir: none`: neither of its two upstream
+          # repos ships a CHECKSUMS.sha256, and both tables are still on
+          # `revision = "main"` (MODELS_LOCK's LOUD FOLLOW-UP), so there is
+          # nothing to verify against that would mean anything. Their names stay
+          # in the lock and out of here — `ci_workflow_derives_downloads_...`
+          # fails on a locked repo id appearing in this file. `probe` names one
+          # file from each of the two trees so a half-restored cache fails here.
+          #
+          # THREE gate groups, and the empty-feature one is not redundant with
+          # the second: `cargo test -p coremlit -- --ignored` is the bare-core
+          # suite (`tiny_model` etc.) that CI has always run as its own step.
+          # `whisper,vad` is the Silero-driven long-form chunking composition —
+          # it needs whisper-tiny, which is why it lives here and not in the
+          # `check` job with the other VAD gates (see that job's comment).
+          - kit: whisper
+            cache: |
+              Models/whisperkit-coreml/openai_whisper-tiny
+              Models/tokenizers/whisper-tiny
+            probe: Models/whisperkit-coreml/openai_whisper-tiny/MelSpectrogram.mlmodelc Models/tokenizers/whisper-tiny/tokenizer.json
+            checksum-dir: none
+            fp16-vendors: whisperkit-coreml,vadkit
+            gates: |
+              |@all
+              whisper|@all
+              whisper,vad|whisper_vad_source
+          # 108 MB downloaded, 70 MB on disk — staged in TWO layers into ONE
+          # directory, the second overwriting 35 MB of the first. The only kit
+          # with more than one table writing to the same `local-dir`, and
+          # therefore the only one that needs `overlay-pins`.
+          #
+          # Both speaker tables publish `pyannote_segmentation.mlmodelc` and
+          # `wespeaker.mlmodelc`; the LAST one downloaded wins those two
+          # filenames, and the winner must be the fp16-guard-repaired overlay.
+          # The pre-repair originals are contract-identical — same feature
+          # names, shapes and dtypes — so they load, run and pass every
+          # structural gate while `segments` saturates to -45440 on the default
+          # ComputeUnits::All placement (issue #15). Only the bytes tell them
+          # apart, which is what these two sha256s are for. They are a
+          # deliberate SECOND copy of the `model.mil` pins in
+          # crates/coremlit/tests/speaker/model_io.rs
+          # (`fp16_safe_segmentation_matches_pinned_sha256`,
+          # `fp16_safe_wespeaker_fp32_matches_pinned_sha256`), so this check is
+          # independent of the gate that runs much later;
+          # `ci_stages_the_speakerkit_overlay_last_and_proves_it_won` keeps the
+          # two copies from drifting.
+          #
+          # The overlay repo's CHECKSUMS.sha256 cannot be fed to `shasum -c`
+          # whole: it lists its OWN name with the sha256 of an EMPTY file, and
+          # it lists the `wespeaker_int8`/`.mlpackage` paths MODELS_LOCK's
+          # selector deliberately skips. Hence the filter, and the pinned line
+          # count (2 bundles x 5 files) so a filter that rots into matching
+          # nothing cannot pass vacuously.
+          #
+          # `speaker_parity_diarize_wiring` is NOT gated: its fixtures live in
+          # the sibling `diarization` repository (DIA_PARITY_FIXTURES), which no
+          # runner has. The three argmax targets are excluded for a firmer
+          # reason — argmaxinc/speakerkit-coreml declares NO license on Hugging
+          # Face, so undeclared-means-all-rights-reserved applies and this
+          # repository does not fetch those graphs in CI at all. NOTICE records
+          # that; adding them here would quietly reverse a licensing decision.
+          - kit: speaker
+            cache: Models/speakerkit
+            probe: Models/speakerkit/pyannote_segmentation.mlmodelc Models/speakerkit/wespeaker_v2.mlmodelc
+            checksum-dir: Models/speakerkit
+            checksum-file: CHECKSUMS.sha256
+            checksum-filter: '^[0-9a-f]{64}  \./(pyannote_segmentation|wespeaker)\.mlmodelc/'
+            checksum-lines: 10
+            overlay-pins: pyannote_segmentation.mlmodelc:ded0d1ee11d77976b5c706ce667d0c8cb49977d3fe4367cccbd7b582bdb86dec wespeaker.mlmodelc:cff0cfe914078e9336754a9b38a68c2cdd88ca7b6bf97568ad551ab03ae1b666
+            fp16-vendors: vadkit,speakerkit
+            gates: |
+              speaker|speaker_model_io speaker_parity_seg speaker_parity_embed
+          # 400 MB. The whole granite bundle directory, `CHECKSUMS.sha256` and
+          # the 24 MB `tokenizer.json` sidecar included — the crate stopped
+          # embedding that tokenizer (`include_bytes!` of that size overruns the
+          # crates.io cap), so `TextEmbedder::load` reads it from the artifact
+          # root and `granite_tokenizer_identity` plus the in-lib (`@lib`)
+          # tokenizer gates are model gates like the rest. The hermetic granite
+          # suites (driver crosscheck) stay the `features` job's.
+          - kit: granite
+            cache: Models/embedkit-granite/granite-97m-multilingual-r2
+            probe: Models/embedkit-granite/granite-97m-multilingual-r2/granite_97m_512.mlmodelc
+            checksum-dir: Models/embedkit-granite/granite-97m-multilingual-r2
+            checksum-file: CHECKSUMS.sha256
+            fp16-vendors: vadkit,embedkit-granite
+            gates: |
+              granite|granite_model_io granite_parity_embed granite_placement granite_embed_long granite_tokenizer_identity @lib
+          # 448 MB — the four compiled `.mlmodelc` towers, NOT the four
+          # `.mlpackage` siblings (see MODELS_LOCK: byte-duplicate weights,
+          # nothing resolves a `.mlpackage` path, and they would take the
+          # download to 895 MB). All four towers are gated: model_io and
+          # text_model_io byte-pin the fp16 AND int8 graphs, placement
+          # characterizes four arms, e2e pins the int8 pipeline's top label
+          # separately from the fp16 one.
+          #
+          # `clap_tokenizer_identity` is NOT here: the Xenova tokenizer is
+          # `include_bytes!`d into the crate, so that gate is hermetic and runs
+          # unignored in the `features` job. It lists ZERO ignored tests, which
+          # would (correctly) trip this job's anti-vacuum guard.
+          #
+          # The parity oracle against textclap's ONNX graphs
+          # (`coremlit-parity`, feature `clap-oracle`) is not here either: it
+          # needs a SECOND artifact repo (Xenova/clap-htsat-unfused, via
+          # CLAPKIT_TEXTCLAP_ONNX) that MODELS_LOCK does not stage.
+          #
+          # The checksum file has the same `.mlpackage` problem as speakerkit's
+          # and not its empty-file self-listing one; filtered the same way, 4
+          # bundles x 5 files.
+          - kit: clap
+            cache: Models/clapkit
+            probe: Models/clapkit/clap_text.mlmodelc Models/clapkit/clap_audio_int8.mlmodelc
+            checksum-dir: Models/clapkit
+            checksum-file: CHECKSUMS.sha256
+            checksum-filter: '^[0-9a-f]{64}  \./clap_(audio|text)(_int8)?\.mlmodelc/'
+            checksum-lines: 20
+            fp16-vendors: vadkit,clapkit
+            gates: |
+              clap|clap_model_io clap_text_model_io clap_placement clap_e2e
+          # 748 MB — the whole 512-tier bundle. It was the 33 MB tokenizer
+          # sidecar alone while every siglip gate but `tokenizer_identity` was a
+          # local/dev gate; the kit's own shard makes the towers affordable, and
+          # they buy six gate suites instead of two. The bundle's
+          # CHECKSUMS.sha256 covers all twelve staged files with no filtering
+          # needed, and its two `.mlmodelc` blocks are the same bytes
+          # tests/siglip/{model_io,text_model_io}.rs pin file-for-file.
+          #
+          # `siglip_preprocess` is NOT here. Its one model gate
+          # (`full_tensor_parity_against_staged_npy`) reads
+          # `<SIGLIP_TEST_MODELS>/fixtures/preprocess/*.npy`, a locally-generated
+          # torch dump the artifact repo does not publish, so no staged tree can
+          # satisfy it. Its hermetic sibling runs in the `features` job.
+          - kit: siglip
+            cache: Models/siglip2-naflex/siglip2-base-patch16-naflex-512
+            probe: Models/siglip2-naflex/siglip2-base-patch16-naflex-512/siglip2_vision_512.mlmodelc Models/siglip2-naflex/siglip2-base-patch16-naflex-512/tokenizer.json
+            checksum-dir: Models/siglip2-naflex/siglip2-base-patch16-naflex-512
+            checksum-file: CHECKSUMS.sha256
+            fp16-vendors: vadkit,siglip2-naflex
+            gates: |
+              siglip|siglip_tokenizer_identity siglip_model_io siglip_text_model_io siglip_parity_embed siglip_placement siglip_e2e
+    # Every kit's test-model override, set for every shard. Each of these
+    # resolves to the same path the suite's `common/mod.rs` falls back to, so
+    # nothing changes behaviorally — the point is that the gates NAME the
+    # directory this job staged instead of silently depending on a
+    # workspace-relative fallback, and that the variable names live in one
+    # readable place. A shard that stages none of a given tree simply never runs
+    # the suite that reads its variable.
+    env:
+      WHISPERKIT_TEST_MODELS: ${{ github.workspace }}/Models
+      CED_TEST_MODELS: ${{ github.workspace }}/Models/ced
+      EMBEDKIT_TEST_MODELS: ${{ github.workspace }}/Models/embedkit-granite
+      SPEAKERKIT_TEST_MODELS: ${{ github.workspace }}/Models/speakerkit
+      CLAPKIT_TEST_MODELS: ${{ github.workspace }}/Models/clapkit
+      SIGLIP_TEST_MODELS: ${{ github.workspace }}/Models/siglip2-naflex
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      # Per-KIT cache key. The old single key meant one family's re-pin
+      # invalidated every family's download; worse, a job that died before
+      # `actions/cache`'s post step never saved anything at all, so the whole
+      # 1.2 GB was re-fetched on every run for a month. Now a MODELS_LOCK edit
+      # only re-downloads the kits whose bytes actually moved (the hash covers
+      # the whole file, but the other five shards' caches are keyed
+      # independently, so a miss in one is not a miss in the others once this
+      # file's hash settles).
       - name: Restore model cache
         id: models
         uses: actions/cache@v4
         with:
-          path: |
-            Models/whisperkit-coreml/openai_whisper-tiny
-            Models/tokenizers/whisper-tiny
-            Models/embedkit-granite/granite-97m-multilingual-r2
-            Models/siglip2-naflex/siglip2-base-patch16-naflex-512
-            Models/ced/ced-tiny
-            Models/speakerkit
-          key: models-${{ hashFiles('MODELS_LOCK') }}
+          path: ${{ matrix.cache }}
+          key: models-${{ matrix.kit }}-${{ hashFiles('MODELS_LOCK') }}
       - name: Download models (cache miss)
         id: download
         if: steps.models.outputs.cache-hit != 'true'
+        env:
+          KIT: ${{ matrix.kit }}
         run: |
           set -euo pipefail
 
           # MODELS_LOCK is the source of truth for what gets downloaded, not
-          # just a cache-busting key: it has a fixed seven-table shape (the
-          # whisperkit-coreml model repo, selector field `include`; the
-          # tokenizer repo, selector field `files`; the embedkit-coreml granite
-          # repo, selector field `include`; the siglip2-naflex-coreml tokenizer
-          # sidecar, selector field `include`; the cedkit-coreml `ced-tiny`
-          # bundle, selector field `include`; the speakerkit BASE layer,
-          # selector field `include`; the speakerkit OVERLAY, selector field
-          # `include`, a SPACE-SEPARATED pattern list), each with its own
-          # `revision`. Pull repo/selector/revision out by hand instead of
-          # hardcoding them here, so a MODELS_LOCK edit is what changes what
-          # this job downloads — no TOML crate needed for seven fixed tables.
-          # Tables are selected by INDEX, so appending is safe but reordering
-          # MODELS_LOCK is not.
+          # just a cache-busting key. Every table carries a `kit`, a selector
+          # (`include`, whose value is a SPACE-SEPARATED glob list expanded to
+          # one `--include` flag each, or `files`, a space-separated list of
+          # exact filenames passed positionally), a `revision`, and a
+          # `local-dir`. This shard extracts the tables whose `kit` is its own,
+          # IN LOCK ORDER, and runs one `hf download` per table.
           #
-          # For tables 6 and 7 the index is more than a parser detail: both
-          # land in Models/speakerkit/ and both publish
-          # `pyannote_segmentation.mlmodelc` and `wespeaker.mlmodelc`, so the
-          # LAST one downloaded decides which bytes the shipping pipeline gets.
-          # 6 is the base layer, 7 is the fp16-guard-repaired overlay that must
-          # win. See the ORDER box in MODELS_LOCK's header, and the
-          # "Verify speakerkit overlay" step below, which proves the winner.
+          # Selecting by kit rather than by index is what removed the old
+          # reordering hazard: tables can be added, moved or regrouped freely.
+          # Order still matters WITHIN a kit whose tables share a `local-dir`,
+          # because the last download wins the filename collisions — that is the
+          # speaker kit, and the very next step proves which layer won by hash.
+          #
+          # Still no TOML crate: a small awk pass over the lock's fixed
+          # `["repo/name"]` + `key = "value"` shape, mirrored hermetically by
+          # `parse_lock` in crates/coremlit/tests/whisper/models_lock.rs.
           lock=MODELS_LOCK
 
-          table_header() { # Nth `["..."]` header line, unquoted.
-            sed -n 's/^\["\(.*\)"\]$/\1/p' "$lock" | sed -n "${1}p"
-          }
-          table_field() { # value of `key = "..."` inside the Nth table.
-            awk -v n="$1" -v key="$2" '
-              /^\[/ { seen++; in_table = (seen == n); next }
-              in_table && $1 == key {
-                line = $0
-                sub(/^[^=]*=[ \t]*"/, "", line)
-                sub(/"[ \t]*$/, "", line)
-                print line
-                exit
-              }
-            ' "$lock"
-          }
-
-          model_repo=$(table_header 1)
-          model_include=$(table_field 1 include)
-          model_revision=$(table_field 1 revision)
-          tokenizer_repo=$(table_header 2)
-          tokenizer_files=$(table_field 2 files)
-          tokenizer_revision=$(table_field 2 revision)
-          read -ra tokenizer_files_arr <<< "$tokenizer_files"
-          granite_repo=$(table_header 3)
-          granite_include=$(table_field 3 include)
-          granite_revision=$(table_field 3 revision)
-          siglip_repo=$(table_header 4)
-          siglip_include=$(table_field 4 include)
-          siglip_revision=$(table_field 4 revision)
-          ced_repo=$(table_header 5)
-          ced_include=$(table_field 5 include)
-          ced_revision=$(table_field 5 revision)
-          # 6 = the speakerkit BASE layer, 7 = the OVERLAY. Downloaded in THAT
-          # order below; see MODELS_LOCK's header.
-          speakerkit_base_repo=$(table_header 6)
-          speakerkit_base_include=$(table_field 6 include)
-          speakerkit_base_revision=$(table_field 6 revision)
-          speakerkit_overlay_repo=$(table_header 7)
-          speakerkit_overlay_include=$(table_field 7 include)
-          speakerkit_overlay_revision=$(table_field 7 revision)
-          # The overlay selector is a SPACE-SEPARATED pattern list, expanded to
-          # one `--include` flag per pattern (`hf` 1.19 accepts the flag
-          # repeatedly; verified against 1.19.0). A single glob cannot express
-          # it: `*.mlmodelc/*` would also drag in that repo's NOT-adopted
-          # `wespeaker_int8` re-conversion over the base-layer bytes the
-          # byte-identity gate and the fp16_guards pin are cut against. See
-          # MODELS_LOCK's table 7.
-          #
-          # `pipx install` above pins no version, so a future `hf` COULD stop
-          # accepting the repeated flag. That direction is fail-closed either
-          # way: an unknown-option error fails here, and a last-flag-wins
-          # regression would stage only `CHECKSUMS.sha256`, leaving the base
-          # layer's pre-repair graphs in place — which the overlay check below
-          # refuses by hash.
-          read -ra speakerkit_overlay_patterns <<< "$speakerkit_overlay_include"
-          speakerkit_overlay_flags=()
-          for pattern in "${speakerkit_overlay_patterns[@]}"; do
-            speakerkit_overlay_flags+=(--include "$pattern")
-          done
-
-          # Index-selected tables mean an APPENDED table this parser does not
-          # know about is silently ignored — MODELS_LOCK would say CI downloads
-          # something CI never downloads, and the empty-extraction guard below
-          # (which only inspects the variables that WERE extracted) cannot see
-          # it. Pin the count so teaching the lock a new table forces teaching
-          # the parser too.
+          # TRIPWIRE 1 (replaces the old `table_count -ne 7` pin): every table
+          # must carry a `kit`, or it can never be selected and MODELS_LOCK
+          # would document a download CI never performs. Counting headers
+          # against `kit` fields catches an added table AND a table that lost
+          # its tag, neither of which the empty-extraction guard below can see
+          # (it only inspects tables that WERE selected).
           table_count=$(sed -n 's/^\["\(.*\)"\]$/\1/p' "$lock" | grep -c . || true)
-          if [ "$table_count" -ne 7 ]; then
-            echo "::error::MODELS_LOCK has $table_count tables but this parser handles exactly 7 — a table was added or removed without updating the download step, so it would be silently ignored" >&2
+          kit_count=$(grep -cE '^kit[[:space:]]*=' "$lock" || true)
+          if [ "$table_count" -eq 0 ] || [ "$table_count" -ne "$kit_count" ]; then
+            echo "::error::MODELS_LOCK has $table_count table(s) but $kit_count 'kit' field(s) — every table must declare the kit whose shard downloads it, or it is silently unreachable. (Zero tables means this parser stopped matching the lock's format at all.)" >&2
             exit 1
           fi
 
-          echo "MODELS_LOCK: model=$model_repo@$model_revision include=$model_include"
-          echo "MODELS_LOCK: tokenizer=$tokenizer_repo@$tokenizer_revision files=$tokenizer_files"
-          echo "MODELS_LOCK: granite=$granite_repo@$granite_revision include=$granite_include"
-          echo "MODELS_LOCK: siglip=$siglip_repo@$siglip_revision include=$siglip_include"
-          echo "MODELS_LOCK: ced=$ced_repo@$ced_revision include=$ced_include"
-          echo "MODELS_LOCK: speakerkit-base=$speakerkit_base_repo@$speakerkit_base_revision include=$speakerkit_base_include"
-          echo "MODELS_LOCK: speakerkit-overlay=$speakerkit_overlay_repo@$speakerkit_overlay_revision include=$speakerkit_overlay_include"
+          # One TAB-separated record per table of THIS kit, in lock order:
+          #   repo <TAB> selector-field <TAB> selector <TAB> revision <TAB> local-dir
+          tables=$(awk -v want="$KIT" '
+            function flush() {
+              if (repo != "" && kit == want) {
+                if (files != "") { field = "files"; sel = files }
+                else             { field = "include"; sel = include }
+                printf "%s\t%s\t%s\t%s\t%s\n", repo, field, sel, revision, localdir
+              }
+            }
+            /^\["/ {
+              flush()
+              repo = $0; sub(/^\["/, "", repo); sub(/"\]$/, "", repo)
+              kit = ""; include = ""; files = ""; revision = ""; localdir = ""
+              next
+            }
+            $1 == "kit" || $1 == "include" || $1 == "files" || $1 == "revision" || $1 == "local-dir" {
+              value = $0
+              sub(/^[^=]*=[ \t]*"/, "", value)
+              sub(/"[ \t]*$/, "", value)
+              if      ($1 == "kit")       kit = value
+              else if ($1 == "include")   include = value
+              else if ($1 == "files")     files = value
+              else if ($1 == "revision")  revision = value
+              else                        localdir = value
+            }
+            END { flush() }
+          ' "$lock")
 
-          # Fail LOUD on any empty extraction: `hf download repo` with no
-          # selector silently fetches the WHOLE repository, so a future
-          # MODELS_LOCK format drift must stop the job here, not download
-          # different content than the lock intends.
-          for v in model_repo model_include model_revision tokenizer_repo tokenizer_files tokenizer_revision \
-                   granite_repo granite_include granite_revision \
-                   siglip_repo siglip_include siglip_revision \
-                   ced_repo ced_include ced_revision \
-                   speakerkit_base_repo speakerkit_base_include speakerkit_base_revision \
-                   speakerkit_overlay_repo speakerkit_overlay_include speakerkit_overlay_revision; do
-            if [ -z "${!v}" ]; then
-              echo "::error::MODELS_LOCK parse produced empty '$v' — format drift? fix the lock or the parser" >&2
-              exit 1
-            fi
-          done
-          # The overlay's expansion is checked separately: the emptiness loop
-          # above sees the RAW string, not the flag array actually passed to
-          # `hf`, so a value that is non-empty but expands to no pattern would
-          # slip through and fetch the WHOLE repository.
-          if [ "${#speakerkit_overlay_flags[@]}" -eq 0 ]; then
-            echo "::error::MODELS_LOCK's speakerkit overlay include ($speakerkit_overlay_include) expanded to no --include pattern; hf would fetch the whole repository" >&2
+          # TRIPWIRE 2: a shard whose kit matches no table would download
+          # nothing and then run its gates against a bare checkout, reporting
+          # artifact-absent failures instead of "the lock and the matrix
+          # disagree". The cross-shard half of this — a table whose kit NO shard
+          # consumes — cannot be seen from inside one shard and is pinned
+          # hermetically by `ci_shards_every_kit_in_the_lock`.
+          if [ -z "$tables" ]; then
+            echo "::error::MODELS_LOCK defines no table with kit = \"$KIT\", but ci.yml's matrix has a \"$KIT\" shard — add the table, or drop the shard" >&2
             exit 1
           fi
 
           pipx install "huggingface_hub[cli]"
-          hf download "$model_repo" --include "$model_include" --revision "$model_revision" \
-            --local-dir Models/whisperkit-coreml
-          hf download "$tokenizer_repo" "${tokenizer_files_arr[@]}" --revision "$tokenizer_revision" \
-            --local-dir Models/tokenizers/whisper-tiny
-          # `include` keeps the bundle's own directory, so this lands at
-          # Models/embedkit-granite/granite-97m-multilingual-r2/ — the layout
-          # tests/granite/common/mod.rs resolves without EMBEDKIT_TEST_MODELS.
-          # The selector pulls the WHOLE bundle directory, so it also fetches the
-          # tokenizer.json the crate now loads from the artifact root — but only
-          # from a revision that HAS it: the granite gates fail until MODELS_LOCK
-          # pins one, which is the intended fail-closed behavior.
-          hf download "$granite_repo" --include "$granite_include" --revision "$granite_revision" \
-            --local-dir Models/embedkit-granite
-          # The siglip TOKENIZER SIDECAR only (34 MB), not the ~784 MB bundle:
-          # tests/siglip/tokenizer_identity.rs calls no `Model::load`, so the
-          # towers buy those two gates nothing. `include` keeps the bundle's tier
-          # directory, so `--local-dir Models/siglip2-naflex` lands the file at
-          # Models/siglip2-naflex/siglip2-base-patch16-naflex-512/tokenizer.json
-          # — the `model_root()` tests/siglip/common/mod.rs resolves without
-          # SIGLIP_TEST_MODELS. The remaining siglip model gates need the towers
-          # and stay local/dev gates.
-          hf download "$siglip_repo" --include "$siglip_include" --revision "$siglip_revision" \
-            --local-dir Models/siglip2-naflex
-          # `ced-tiny` ALONE — 10.64 MB of the artifact repo's 234 MB. The four
-          # CED sizes are I/O-identical (they differ only in transformer width),
-          # so tiny exercises every gate the others would, and `ced-base` at
-          # 163.62 MB is why this family cannot be committed like vadkit was.
-          # `include` keeps the bundle's size directory, so `--local-dir
-          # Models/ced` lands the tree at Models/ced/ced-tiny/ced_tiny.mlmodelc
-          # — the layout tests/ced/common/mod.rs resolves without CED_TEST_MODELS.
-          hf download "$ced_repo" --include "$ced_include" --revision "$ced_revision" \
-            --local-dir Models/ced
-          # ---------------------------------------------------------------
-          # speakerkit, in TWO layers into ONE directory. THE ORDER OF THESE
-          # TWO COMMANDS IS A CORRECTNESS INVARIANT, not a style choice.
-          #
-          # Both repos publish `pyannote_segmentation.mlmodelc` and
-          # `wespeaker.mlmodelc`, and the second download overwrites the first.
-          # The BASE layer goes first; the OVERLAY — the two issue-#15
-          # re-conversions whose fp16 guards actually survive the ANE — goes
-          # last and wins. Reverse them and CI stages contract-identical
-          # PRE-REPAIR graphs that pass every load/shape test while saturating
-          # `segments` to -45440 on the default placement. The order comes from
-          # MODELS_LOCK's table order (6 then 7), so it is reviewable in the
-          # lock file rather than buried here, and the very next step re-hashes
-          # both graphs to prove which bytes actually landed.
-          #
-          # `--local-dir Models/speakerkit` is the directory
-          # tests/speaker/common/mod.rs resolves without SPEAKERKIT_TEST_MODELS
-          # (the gate step below sets it anyway, explicitly).
-          hf download "$speakerkit_base_repo" --include "$speakerkit_base_include" \
-            --revision "$speakerkit_base_revision" --local-dir Models/speakerkit
-          hf download "$speakerkit_overlay_repo" "${speakerkit_overlay_flags[@]}" \
-            --revision "$speakerkit_overlay_revision" --local-dir Models/speakerkit
+
+          # A herestring, never `echo ... | while`: the loop must run in THIS
+          # shell so a failure inside it exits the step (and, per
+          # fp16_sweep_inventory.sh's SIGPIPE lesson, so nothing writes into a
+          # pipe a reader may close early).
+          while IFS=$'\t' read -r repo field selector revision localdir; do
+            # Fail LOUD on any empty extraction: `hf download repo` with no
+            # selector silently fetches the WHOLE repository, so a MODELS_LOCK
+            # format drift must stop the job here rather than download
+            # something other than what the lock intends.
+            for v in repo field selector revision localdir; do
+              if [ -z "${!v}" ]; then
+                echo "::error::MODELS_LOCK's \"$repo\" table (kit $KIT) parsed to an empty '$v' — format drift? fix the lock or this parser" >&2
+                exit 1
+              fi
+            done
+            read -ra patterns <<< "$selector"
+            # The emptiness loop above sees the RAW selector string; this sees
+            # what is actually passed to `hf`. A value that is non-empty but
+            # expands to no word would otherwise slip through and fetch the
+            # whole repository.
+            if [ "${#patterns[@]}" -eq 0 ]; then
+              echo "::error::MODELS_LOCK's \"$repo\" $field selector ($selector) expanded to no pattern; hf would fetch the whole repository" >&2
+              exit 1
+            fi
+            args=()
+            if [ "$field" = "files" ]; then
+              args=("${patterns[@]}")
+            else
+              # `hf` 1.19 accepts `--include` repeatedly (verified against
+              # 1.19.0), which is what lets a selector be a pattern LIST. That
+              # matters for the speakerkit overlay, whose obvious single glob
+              # `*.mlmodelc/*` would drag in a NOT-adopted int8 re-conversion.
+              # `pipx install` above pins no version, so a future `hf` could
+              # stop accepting it — fail-closed either way: an unknown-option
+              # error stops here, and a last-flag-wins regression would stage
+              # too little, which the overlay and checksum steps refuse.
+              for pattern in "${patterns[@]}"; do args+=(--include "$pattern"); done
+            fi
+            echo "MODELS_LOCK[$KIT]: $repo@$revision $field=\"$selector\" -> $localdir"
+            hf download "$repo" "${args[@]}" --revision "$revision" --local-dir "$localdir" </dev/null
+          done <<< "$tables"
       # EVERY step below carries
       # `if: ${{ !cancelled() && steps.download.outcome != 'failure' }}`, and
-      # that is not boilerplate — it is the fix for a failure mode this job
-      # actually had. GitHub's default step condition is `success()`, so ONE red
-      # gate marks every later gate `skipped`, and `skipped` is silent: the job
-      # reports the single failure it hit and says nothing about the ones it
-      # never attempted. That is exactly what happened here — a stale assertion
-      # in the whisper suite went red the day it merged and stayed red for four
-      # weeks, and the four gate steps below it (Whisper+VAD, granite, SigLIP,
-      # CED) have between them NEVER executed on CI: each was added after the
-      # step above it was already permanently red, so every one of them has
-      # reported `skipped` on every run it has ever been part of — the granite
-      # gates since the day after they were written.
+      # that is not boilerplate — it is the fix for the failure mode described
+      # at the top of this job, one level down from sharding. GitHub's default
+      # step condition is `success()`, so ONE red step marks every later step
+      # `skipped`, and `skipped` is silent.
       #
-      # These gates are INDEPENDENT of each other: a corrupt granite bundle
-      # says nothing about whether the CED graph loads. So each reports its own
-      # verdict and the job aggregates them, and one red gate can no longer hide
-      # another's result. A failed DOWNLOAD is the one real dependency (nothing
-      # below can run without the artifacts), so that alone still short-circuits
-      # — and `steps.download.outcome` is `skipped`, not `failure`, on a cache
-      # hit, so the common path is unaffected.
+      # These checks are INDEPENDENT of each other: a bad checksum says nothing
+      # about whether the fp16 sweep passes. So each reports its own verdict and
+      # the `Gate ledger` step aggregates them. A failed DOWNLOAD is the one
+      # real dependency (nothing below can run without the artifacts), so that
+      # alone still short-circuits — and `steps.download.outcome` is `skipped`,
+      # not `failure`, on a cache hit, so the common path is unaffected.
       #
-      # The `Gate ledger` step at the end of the job then refuses the residue:
-      # a step added later WITHOUT this condition would reintroduce the silent
-      # skip, so the ledger fails the job if any named gate did not run.
-
       # Runs on EVERY run, not just cache misses, so a truncated download AND a
       # tampered or partially-restored cache entry both fail here rather than
-      # surfacing later as a confusing parity or model_io failure. The bundle
-      # ships its own CHECKSUMS.sha256 (paths relative to the bundle root);
-      # `shasum -c` is fail-closed in all three degenerate directions — a listed
-      # file that is missing, a hash mismatch, and a checksum file with no valid
-      # lines each exit non-zero.
-      - name: Verify granite artifact checksums
-        id: granite_checksums
+      # surfacing later as a confusing parity or model_io failure.
+      - name: Verify staged overlay ordering
+        id: overlay
         if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
+        env:
+          KIT: ${{ matrix.kit }}
+          OVERLAY_PINS: ${{ matrix.overlay-pins }}
         run: |
           set -euo pipefail
-          bundle_root=Models/embedkit-granite/granite-97m-multilingual-r2
-          if [ ! -d "$bundle_root" ]; then
-            echo "::error::$bundle_root is absent after download/cache-restore — the granite model gates would have nothing to run against" >&2
+          # A kit whose tables share a `local-dir` stages one directory in
+          # LAYERS: the last table to download wins every filename both publish,
+          # so which bytes ship is decided by lock order alone. That kind of kit
+          # MUST pin the winner by hash — otherwise a swapped order stages
+          # contract-identical wrong bytes that load, run and pass every
+          # structural gate. Deriving the requirement from the lock rather than
+          # hardcoding "speaker" means a SECOND layered kit cannot be added
+          # without pins.
+          dirs=$(awk -v want="$KIT" '
+            function flush() { if (kit == want && localdir != "") print localdir }
+            /^\["/ { flush(); kit = ""; localdir = ""; next }
+            $1 == "kit" || $1 == "local-dir" {
+              value = $0; sub(/^[^=]*=[ \t]*"/, "", value); sub(/"[ \t]*$/, "", value)
+              if ($1 == "kit") kit = value; else localdir = value
+            }
+            END { flush() }
+          ' MODELS_LOCK)
+          # The download step's "kit matches no table" tripwire is SKIPPED on a
+          # cache hit, so re-derive it here, where every run passes.
+          if [ -z "$dirs" ]; then
+            echo "::error::MODELS_LOCK defines no table with kit = \"$KIT\", but ci.yml's matrix has a \"$KIT\" shard — add the table, or drop the shard" >&2
             exit 1
           fi
-          cd "$bundle_root"
-          shasum -a 256 -c CHECKSUMS.sha256
-      # Same contract as the granite step above — every run, not just cache
-      # misses — with one layout difference that is easy to get silently wrong:
-      # CED's `CHECKSUMS.sha256` lists paths relative to the `.mlmodelc` ROOT
-      # (`model.mil`, `weights/weight.bin`), not to the `ced-tiny/` directory it
-      # sits in (granite's are relative to the directory holding the checksum
-      # file). So this `cd`s INTO the bundle and reads the checksum file from
-      # its parent. Verifying from `ced-tiny/` instead would report five
-      # "No such file or directory" lines, which `shasum -c` exits non-zero on —
-      # fail-closed either way, but loudly wrong rather than quietly wrong.
-      - name: Verify CED artifact checksums
-        id: ced_checksums
-        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
-        run: |
-          set -euo pipefail
-          bundle=Models/ced/ced-tiny/ced_tiny.mlmodelc
-          if [ ! -d "$bundle" ]; then
-            echo "::error::$bundle is absent after download/cache-restore — the CED model gates would have nothing to run against" >&2
+          layered=$(printf '%s\n' "$dirs" | sort | uniq -d | tr '\n' ' ')
+          if [ -n "$layered" ] && [ -z "$OVERLAY_PINS" ]; then
+            echo "::error::kit '$KIT' stages more than one MODELS_LOCK table into $layered, so the LAST download wins their shared filenames — but this shard declares no overlay-pins, so nothing proves which layer landed. Add the winning bundles' model.mil sha256s to the matrix row." >&2
             exit 1
           fi
-          cd "$bundle"
-          shasum -a 256 -c ../CHECKSUMS.sha256
-      # The speakerkit tree is staged in TWO layers into ONE directory (see the
-      # download step and MODELS_LOCK's ORDER box), so it needs one check the
-      # single-source granite and CED trees do not: proof of WHICH layer won the
-      # two filename collisions. That proof comes first, before the byte-level
-      # checksum verification, because a wrong overlay order is a specific,
-      # nameable mistake and must be reported as itself rather than as anonymous
-      # hash drift 100 MB and one full build later.
-      - name: Verify speakerkit overlay and artifact checksums
-        id: speakerkit_checksums
-        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
-        run: |
-          set -euo pipefail
-          root=Models/speakerkit
+          if [ -z "$OVERLAY_PINS" ]; then
+            echo "kit '$KIT' stages no layered directory and declares no overlay pins — nothing to prove here"
+            exit 0
+          fi
+          # The expected hashes are a deliberate SECOND copy of the pins in
+          # crates/coremlit/tests/speaker/model_io.rs, so this check is
+          # independent of the gate that runs much later;
+          # `ci_stages_the_speakerkit_overlay_last_and_proves_it_won` keeps the
+          # two copies from drifting.
+          root=$(printf '%s\n' "$dirs" | tail -n 1)
           if [ ! -d "$root" ]; then
-            echo "::error::$root is absent after download/cache-restore — the speaker model gates would have nothing to run against" >&2
+            echo "::error::$root is absent after download/cache-restore — the $KIT model gates would have nothing to run against" >&2
             exit 1
           fi
-
-          # 1. DID THE OVERLAY LAND? The two graphs the pipeline SHIPS must be
-          # the fp16-guard-repaired re-conversions, not the base layer's
-          # pre-repair originals. Those originals are contract-identical —
-          # same filenames, same feature names, shapes and dtypes — so they
-          # load, they run, and they pass every structural gate while
-          # `segments` saturates to -45440 on the default ComputeUnits::All
-          # placement (issue #15). Only the bytes tell them apart.
-          #
-          # The two sha256s below are the `model.mil` pins from
-          # crates/coremlit/tests/speaker/model_io.rs
-          # (`fp16_safe_segmentation_matches_pinned_sha256` and
-          # `fp16_safe_wespeaker_fp32_matches_pinned_sha256`). They are copied
-          # here deliberately, so this check is INDEPENDENT of the gate that
-          # runs much later; the hermetic test
-          # `ci_stages_the_speakerkit_overlay_last_and_proves_it_won` in
-          # tests/whisper/models_lock.rs keeps the two copies from drifting.
-          overlay_bad=""
-          for pin in \
-            "pyannote_segmentation.mlmodelc:ded0d1ee11d77976b5c706ce667d0c8cb49977d3fe4367cccbd7b582bdb86dec" \
-            "wespeaker.mlmodelc:cff0cfe914078e9336754a9b38a68c2cdd88ca7b6bf97568ad551ab03ae1b666"; do
+          bad=""
+          for pin in $OVERLAY_PINS; do
             bundle="${pin%%:*}"
             expected="${pin##*:}"
             mil="$root/$bundle/model.mil"
             if [ ! -f "$mil" ]; then
-              echo "::error::$mil is absent — the speakerkit overlay download did not land its shipping graphs" >&2
+              echo "::error::$mil is absent — the $KIT overlay download did not land its shipping graphs" >&2
               exit 1
             fi
             actual=$(shasum -a 256 "$mil" | cut -d' ' -f1)
             echo "== $bundle/model.mil: $actual =="
             if [ "$actual" != "$expected" ]; then
-              overlay_bad="$overlay_bad $bundle(got=$actual want=$expected)"
+              bad="$bad $bundle(got=$actual want=$expected)"
             fi
           done
-          if [ -n "$overlay_bad" ]; then
-            echo "::error::speakerkit OVERLAY DID NOT WIN:$overlay_bad — the shipping graphs are not the fp16-guard-repaired re-conversions MODELS_LOCK's last speakerkit table pins. The overwhelmingly likely cause is download ORDER: both speakerkit tables land in Models/speakerkit/ and publish these same filenames, so the LAST one downloaded wins, and the base layer must not be last. Check MODELS_LOCK's table order (base then overlay) and the order of the two hf download commands in the step above. If the bytes changed deliberately, re-baseline tests/speaker/model_io.rs's pins and these two together." >&2
+          if [ -n "$bad" ]; then
+            echo "::error::$KIT OVERLAY DID NOT WIN:$bad — the shipping graphs are not the fp16-guard-repaired re-conversions MODELS_LOCK's last '$KIT' table pins. The overwhelmingly likely cause is download ORDER: both '$KIT' tables land in $root and publish these same filenames, so the LAST one downloaded wins, and the base layer must not be last. Check MODELS_LOCK's table order (base then overlay). If the bytes changed deliberately, re-baseline tests/speaker/model_io.rs's pins and this matrix row together." >&2
             exit 1
           fi
-
-          # 2. Byte-level verification of every staged file from the overlay
-          # repo, against the `CHECKSUMS.sha256` it ships — the granite/CED
-          # contract, on every run rather than only on cache misses, so a
-          # truncated download and a tampered or partially-restored cache entry
-          # both fail here. The BASE layer's repo ships no checksum file
-          # (MODELS_LOCK says so); its bytes are covered by the per-file pins in
-          # tests/speaker/model_io.rs and by the fp16 graph sweep below.
-          #
-          # The checksum file cannot be fed to `shasum -c` whole. It lists its
-          # OWN name with the sha256 of an empty file, and it lists the
-          # `wespeaker_int8` and `.mlpackage` paths MODELS_LOCK's overlay
-          # selector deliberately does not stage. So verify the filtered subset
-          # covering exactly the two staged bundles — and pin the line count,
-          # because a filter that rots into matching nothing would otherwise
-          # "verify" an empty set. (`shasum -c` is itself fail-closed on a
-          # missing file, a hash mismatch, and a file with no valid lines; the
-          # count guard is what makes the FILTER non-vacuous.)
-          cd "$root"
+      - name: Verify staged artifact checksums
+        id: checksums
+        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
+        env:
+          KIT: ${{ matrix.kit }}
+          CHECKSUM_DIR: ${{ matrix.checksum-dir }}
+          CHECKSUM_FILE: ${{ matrix.checksum-file }}
+          CHECKSUM_FILTER: ${{ matrix.checksum-filter }}
+          CHECKSUM_LINES: ${{ matrix.checksum-lines }}
+        run: |
+          set -euo pipefail
+          # `none` is a DECLARED absence, not an empty field: the hermetic pin
+          # `ci_shards_every_kit_in_the_lock` refuses it for every kit but
+          # whisper, so a kit cannot lose its verification by having the value
+          # go missing.
+          if [ "$CHECKSUM_DIR" = "none" ]; then
+            echo "kit '$KIT' stages no repo that ships a CHECKSUMS.sha256 — its bytes are covered by the gates' own per-file SHA-256 pins"
+            exit 0
+          fi
+          if [ ! -d "$CHECKSUM_DIR" ]; then
+            echo "::error::$CHECKSUM_DIR is absent after download/cache-restore — the $KIT model gates would have nothing to run against" >&2
+            exit 1
+          fi
+          cd "$CHECKSUM_DIR"
+          # `shasum -c` is fail-closed in all three degenerate directions — a
+          # listed file that is missing, a hash mismatch, and a checksum file
+          # with no valid lines each exit non-zero.
+          if [ -z "$CHECKSUM_FILTER" ]; then
+            shasum -a 256 -c "$CHECKSUM_FILE"
+            exit 0
+          fi
+          # Two repos ship a checksum file that CANNOT be fed to `shasum -c`
+          # whole: speakerkit's lists its OWN name against the sha256 of an
+          # EMPTY file, and both it and clapkit's list paths their MODELS_LOCK
+          # selector deliberately does not stage. Verify the filtered subset
+          # instead — and pin the line count, because a filter that rots into
+          # matching nothing would otherwise "verify" an empty set. (`shasum -c`
+          # is fail-closed on its own; the count is what makes the FILTER
+          # non-vacuous.)
           filtered=$(mktemp)
-          grep -E '^[0-9a-f]{64}  \./(pyannote_segmentation|wespeaker)\.mlmodelc/' CHECKSUMS.sha256 > "$filtered" || true
+          grep -E "$CHECKSUM_FILTER" "$CHECKSUM_FILE" > "$filtered" || true
           filtered_lines=$(grep -c . "$filtered" || true)
-          if [ "$filtered_lines" -ne 10 ]; then
-            echo "::error::expected 10 CHECKSUMS.sha256 lines covering the two staged speakerkit bundles, found $filtered_lines — the overlay repo's file list changed at the pinned revision, or the filter no longer matches it" >&2
+          if [ "$filtered_lines" -ne "$CHECKSUM_LINES" ]; then
+            echo "::error::expected $CHECKSUM_LINES $CHECKSUM_FILE lines covering the staged $KIT bundles, found $filtered_lines — the repo's file list changed at the pinned revision, or the filter no longer matches it" >&2
             exit 1
           fi
           echo "== verifying $filtered_lines checksummed files =="
           shasum -a 256 -c "$filtered"
       # build.rs UN-ignores the fp16 graph sweep
-      # (`every_shipped_model_graph_survives_fp16`) when Models/ is present, so
-      # the `-- --ignored` (ignored-ONLY) runs below EXCLUDE it exactly when the
-      # models are here — and the modelless `check` job skips it too (ignored
-      # there). Run the coremlit sweep binary's ordinary suite here so a newly
-      # vanishing fp16 guard cannot merge green. This runner downloads WHISPER,
-      # GRANITE, CED-TINY and SPEAKERKIT (per MODELS_LOCK), so
-      # COREMLIT_FP16_SWEEP_VENDORS narrows the vendor manifest to exactly the
-      # vendors staged here (fail-closed: unset would demand EVERY pinned
-      # vendor), plus `vadkit`, which needs no download — it is committed, so
-      # requiring it here makes DELETING the vendored model a hard CI failure
-      # rather than a silent drop of the sweep's second clean control. Naming
-      # them ALL is what makes a vanished vendor tree a failure instead of a
-      # quiet drop in coverage; the absent alignkit/argmax vendors stay the
-      # documented escape. `ced` is a THIRD clean control: the sweep walks
-      # Models/ whole, so the staged CED graph is audited either way — naming
-      # it in the manifest is what turns "the CED download vanished" into a
-      # failure instead of a silent loss of that coverage.
+      # (`every_shipped_model_graph_survives_fp16`) when a DOWNLOADED tree is
+      # present under Models/, so the `-- --ignored` (ignored-ONLY) gate runs
+      # below EXCLUDE it exactly when the models are here — and the modelless
+      # check/features jobs skip it too (ignored there). Run the sweep binary's
+      # ordinary suite here so a newly vanishing fp16 guard cannot merge green.
       #
-      # `speakerkit` is different in kind from the other four, and that is why
-      # adding it is worth more than one more clean control: it is the first
-      # vendor named here that carries PINNED DEFECTS. FIVE of the sweep's ten
-      # KNOWN_DEFECTS entries live under it (Segmentation, wespeaker_v2,
-      # wespeaker_int8, PLDA, PldaRho), so half the defect roster moves from
-      # local/dev-only verification to every PR — pinned in BOTH directions, so
-      # an unannounced re-conversion that REPAIRS one of them is as loud as a
-      # new defect would be. The sweep also reaches the two shipping graphs,
-      # which have no pin precisely because issue #15 repaired them, making it a
-      # second, independent witness that the overlay step above staged the right
-      # bytes. `siglip2-naflex` is deliberately NOT here: MODELS_LOCK stages its
-      # tokenizer sidecar alone, so that vendor tree holds no `.mlmodelc` for
-      # the sweep to audit.
+      # COREMLIT_FP16_SWEEP_VENDORS narrows the vendor manifest to exactly what
+      # THIS shard stages (fail-closed: unset would demand every pinned vendor,
+      # including two no runner fetches). Naming them all is what makes a
+      # vanished vendor tree a FAILURE rather than a quiet drop in coverage.
+      # Every row names `vadkit`, which needs no download — it is committed — so
+      # deleting the vendored VAD model is a hard failure in all six shards
+      # rather than a silent loss of the sweep's clean control.
+      #
+      # THE UNION ACROSS SHARDS IS THE COVERAGE, and it is pinned:
+      # `ci_fp16_sweep_shards_cover_every_pinned_vendor`
+      # (tests/whisper/models_lock.rs) fails if a KNOWN_DEFECTS vendor is swept
+      # by no shard, and fails if a shard stages a vendor tree it does not
+      # sweep. The `speaker` shard carries FIVE of the eight KNOWN_DEFECTS pins
+      # (Segmentation, wespeaker_v2, wespeaker_int8, PLDA, PldaRho) — pinned in
+      # BOTH directions, so an unannounced re-conversion that REPAIRS one is as
+      # loud as a new defect. The remaining three (alignkit, and the two argmax
+      # SpeakerSegmenter variants) have NO MODELS_LOCK table and so no shard:
+      # that is a real, named coverage gap, recorded as
+      # `UNSTAGED_DEFECT_VENDORS` in that test rather than left implicit.
+      #
       # fp16_guards is a core test — no feature needed. See the
       # coverage-boundary note in crates/coremlit/tests/fp16_guards.rs.
-      #
-      # This job is also the ONLY place the committed VAD graph is swept: this
-      # runner has downloaded vendors, so build.rs emits cfg(models_present) and
-      # the walk covers all of Models/, vadkit included. The modelless
-      # check/features jobs deliberately leave the sweep #[ignore]d (build.rs).
       - name: fp16 graph sweep
         id: fp16_guards
         if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
-        run: COREMLIT_FP16_SWEEP_VENDORS=whisperkit-coreml,embedkit-granite,vadkit,ced,speakerkit cargo test -p coremlit --test fp16_guards
+        env:
+          COREMLIT_FP16_SWEEP_VENDORS: ${{ matrix.fp16-vendors }}
+        run: cargo test -p coremlit --test fp16_guards
+      # The anti-vacuum guard for the step above, and the reason it must run in
+      # EVERY shard rather than once: if build.rs did not emit
+      # `cfg(models_present)` for THIS shard's tree, the sweep would be
+      # `#[ignore]`d and the step above would report a green "1 ignored" over
+      # zero models. This proves, per shard, that a plain `cargo test` reaches
+      # the sweep.
       - name: fp16 sweep inventory
         id: fp16_inventory
         if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
         run: crates/coremlit/tests/fp16_sweep_inventory.sh
-      # Core model-gated suite (tiny_model etc., whisper-tiny via
-      # WHISPERKIT_TEST_MODELS); then the whisper pipeline's model-gated suite.
-      # The align/speaker/vad model gates need models this runner does not
-      # download and stay local/dev gates, exactly as before the restructure.
+      # ONE gate runner for all six shards, driven by the matrix row's `gates`
+      # plan: one `features|selectors|filter` group per line, where a selector
+      # is a test-target name, `@lib` for the in-lib gates, or `@all` for the
+      # whole suite under those features. An empty `features` field is the
+      # crate's bare default.
       #
-      # `--no-fail-fast` for the same reason the steps carry `!cancelled()`,
-      # one level down: these two invocations span MANY test targets, and cargo
-      # stops at the first target that fails. That is not theoretical here —
-      # `whisper_parity_es` was red before the tokenizer assertion above it ever
-      # existed, and hid `whisper_parity_jfk`, `whisper_pipeline`,
-      # `whisper_streaming` and `whisper_rtf_gate` behind it for a month. One
-      # red target must cost you that target's verdict, not the four after it.
-      - name: Core model gates
-        id: core_gates
-        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
-        run: cargo test -p coremlit --no-fail-fast -- --ignored
-      - name: Whisper model gates
-        id: whisper_gates
-        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
-        run: cargo test -p coremlit --features whisper --no-fail-fast -- --ignored
-      # The `whisper,vad` composition gates (Silero-driven long-form chunking).
-      # They need whisper-tiny, so they belong here rather than in `check`, and
-      # they were dark until the VAD model was committed — this runner has no
-      # other way to get it. Same anti-vacuum guard as the granite/siglip steps.
-      - name: Whisper + Silero-VAD composition gates
-        id: whisper_vad_gates
-        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
-        run: |
-          set -euo pipefail
-          listed=$(cargo test -p coremlit --features whisper,vad --test whisper_vad_source -- --list --ignored 2>/dev/null | grep -c ': test$' || true)
-          if [ "$listed" -eq 0 ]; then
-            echo "::error::whisper_vad_source lists 0 ignored tests — it failed to build, or its model gates were deleted, renamed, or un-ignored, so an ignored-only run would pass vacuously" >&2
-            exit 1
-          fi
-          echo "== whisper_vad_source: $listed model gate(s) =="
-          cargo test -p coremlit --features whisper,vad --test whisper_vad_source -- --ignored
-      # The granite model gates. They are plain `#[ignore]` (not the sweep's
-      # build.rs cfg), so nothing un-ignores them implicitly: CI has to ask for
-      # them by name, per test target, under `--features granite`. Two ways they
-      # could pass while proving nothing, both closed here:
-      #   - artifact absent: the gates would still be selected but every one
-      #     would fail on a missing bundle. Checked FIRST so the job reports the
-      #     real cause once instead of a wall of load failures.
-      #   - target emptied: `-- --ignored` over a suite whose model gates were
-      #     deleted, renamed, or un-ignored runs 0 tests and exits 0. The
-      #     ignored-only `--list` count refuses that vacuum, and a target that
-      #     failed to BUILD lists nothing either, so it trips the same guard
-      #     (the fp16_sweep_inventory.sh idiom).
-      # The hermetic granite suites (tokenizer identity, in-lib) are the
-      # `features` job's, not this one's.
-      - name: Granite model gates
-        id: granite_gates
-        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
-        run: |
-          set -euo pipefail
-          bundle=Models/embedkit-granite/granite-97m-multilingual-r2/granite_97m_512.mlmodelc
-          if [ ! -d "$bundle" ]; then
-            echo "::error::granite bundle $bundle is absent — the model gates below must FAIL here, never skip" >&2
-            exit 1
-          fi
-          # granite_tokenizer_identity and the in-lib (`--lib`) tokenizer gates
-          # are HERE, not in the hermetic `features` job: the crate no longer
-          # embeds the granite tokenizer (it is a ~24 MB sidecar the artifact
-          # ships and `TextEmbedder::load` reads), so those gates read the staged
-          # artifact tree and are `#[ignore]`d like every other model gate.
-          # A red target reports ITS verdict and the loop keeps going: six gate
-          # suites run here, and under `set -e` the first failure would hide the
-          # five after it — the same masking this job just spent a month in, one
-          # level down. A VACUUM still aborts immediately, because that is a
-          # configuration error rather than a gate result.
-          failed=""
-          for target in granite_model_io granite_parity_embed granite_placement granite_embed_long \
-                        granite_tokenizer_identity; do
-            listed=$(cargo test -p coremlit --features granite --test "$target" -- --list --ignored 2>/dev/null | grep -c ': test$' || true)
-            if [ "$listed" -eq 0 ]; then
-              echo "::error::$target lists 0 ignored tests — it failed to build, or its model gates were deleted, renamed, or un-ignored, so an ignored-only run would pass vacuously" >&2
-              exit 1
-            fi
-            echo "== $target: $listed model gate(s) =="
-            cargo test -p coremlit --features granite --test "$target" -- --ignored || failed="$failed $target"
-          done
-          # The in-lib granite tokenizer/chunking gates (`--lib`), same reason
-          # and the same anti-vacuum guard.
-          listed=$(cargo test -p coremlit --features granite --lib -- --list --ignored 2>/dev/null | grep -c ': test$' || true)
-          if [ "$listed" -eq 0 ]; then
-            echo "::error::the granite --lib suite lists 0 ignored tests — it failed to build, or its tokenizer gates were deleted, renamed, or un-ignored, so an ignored-only run would pass vacuously" >&2
-            exit 1
-          fi
-          echo "== --lib: $listed model gate(s) =="
-          cargo test -p coremlit --features granite --lib -- --ignored || failed="$failed --lib"
-          if [ -n "$failed" ]; then
-            echo "::error::granite gates failed:$failed" >&2
-            exit 1
-          fi
-      # The two siglip TOKENIZER gates. They are `#[ignore]`d like every other
-      # siglip model gate — not because they load a model (they call no
-      # `Model::load` at all) but because they read the staged artifact tree:
-      # the crate embeds no Gemma tokenizer, so `tokenizer.json` is a 34 MB
-      # sidecar the bundle ships and `TextEmbedder::load` reads. That makes them
-      # the only siglip gates this job can afford: MODELS_LOCK stages the
-      # sidecar alone, and the tower-dependent gates (model_io, parity_embed,
-      # placement, e2e) remain local/dev gates against the full bundle.
+      # Every model gate in this repository is `#[ignore]`d — the convention —
+      # so CI has to ask for them by name, and that opens two ways to pass while
+      # proving nothing. Both are closed here, for every shard at once, which is
+      # the point of having one runner:
       #
-      # Same two vacuum holes as the granite step, closed the same way: an
-      # absent sidecar must FAIL here rather than let every gate die on a
-      # missing file, and an ignored-only run over a target whose gates were
-      # deleted, renamed, un-ignored, or that failed to BUILD runs 0 tests and
-      # exits 0, so the ignored-only `--list` count refuses it.
-      - name: SigLIP tokenizer gates
-        id: siglip_gates
-        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
-        run: |
-          set -euo pipefail
-          tokenizer=Models/siglip2-naflex/siglip2-base-patch16-naflex-512/tokenizer.json
-          if [ ! -f "$tokenizer" ]; then
-            echo "::error::siglip tokenizer $tokenizer is absent after download/cache-restore — the gates below must FAIL here, never skip" >&2
-            exit 1
-          fi
-          listed=$(cargo test -p coremlit --features siglip --test siglip_tokenizer_identity -- --list --ignored 2>/dev/null | grep -c ': test$' || true)
-          if [ "$listed" -eq 0 ]; then
-            echo "::error::siglip_tokenizer_identity lists 0 ignored tests — it failed to build, or its gates were deleted, renamed, or un-ignored, so an ignored-only run would pass vacuously" >&2
-            exit 1
-          fi
-          echo "== siglip_tokenizer_identity: $listed gate(s) =="
-          cargo test -p coremlit --features siglip --test siglip_tokenizer_identity -- --ignored
-      # The CED model gates — TINY ONLY, and the filter is not optional.
+      #   - ARTIFACT ABSENT: the gates would still be selected but every one
+      #     would fail on a missing bundle. `probe` is checked FIRST so the shard
+      #     reports the real cause once instead of a wall of load failures.
+      #   - TARGET EMPTIED: `-- --ignored` over a suite whose model gates were
+      #     deleted, renamed, or un-ignored runs 0 tests and exits 0. A target
+      #     that failed to BUILD lists nothing either. The ignored-only `--list`
+      #     count refuses both — taken THROUGH THE SAME FILTER as the run, so a
+      #     renamed `tiny` module cannot count the other three CED sizes' gates
+      #     and then run none.
       #
-      # Each `tests/ced/*` target declares its gates FOUR TIMES, one `#[ignore]`d
-      # module per size (`tiny::`/`mini::`/`small::`/`base::`), and an
-      # ignored-ONLY run selects ALL FOUR. MODELS_LOCK stages `ced-tiny` alone
-      # (10.64 MB of 234 MB — see its comment), so a bare `-- --ignored` here
-      # would run 32 gates against one staged bundle and fail 24 of them on a
-      # missing `.mlmodelc`. The `tiny::` filter is what makes a per-size lock
-      # entry mean a per-size CI run; MODELS_LOCK's `include` and this filter
-      # move together, pinned by tests/whisper/models_lock.rs.
-      #
-      # Same two vacuum holes as the granite/siglip steps, closed the same way,
-      # with one addition: the `--list --ignored` count is taken THROUGH THE SAME
-      # FILTER as the run. Counting the unfiltered list would let a renamed or
-      # deleted `tiny` module still report the OTHER three sizes' gates as a
-      # non-zero count and then run zero — the exact vacuum the guard refuses.
-      - name: CED model gates (tiny)
-        id: ced_gates
-        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
-        run: |
-          set -euo pipefail
-          bundle=Models/ced/ced-tiny/ced_tiny.mlmodelc
-          if [ ! -d "$bundle" ]; then
-            echo "::error::CED bundle $bundle is absent — the model gates below must FAIL here, never skip" >&2
-            exit 1
-          fi
-          # Failure-collecting for the same reason as the granite loop above: a
-          # red target must cost its own verdict, not the three after it.
-          failed=""
-          for target in ced_model_io ced_parity_logits ced_placement ced_e2e; do
-            listed=$(cargo test -p coremlit --features ced --test "$target" -- --list --ignored tiny:: 2>/dev/null | grep -c ': test$' || true)
-            if [ "$listed" -eq 0 ]; then
-              echo "::error::$target lists 0 ignored tiny:: tests — it failed to build, or its tiny model gates were deleted, renamed, or un-ignored, so an ignored-only run would pass vacuously" >&2
-              exit 1
-            fi
-            echo "== $target: $listed tiny model gate(s) =="
-            cargo test -p coremlit --features ced --test "$target" -- --ignored tiny:: || failed="$failed $target"
-          done
-          if [ -n "$failed" ]; then
-            echo "::error::CED tiny gates failed:$failed" >&2
-            exit 1
-          fi
-      # The speaker (diarization) model gates, now that MODELS_LOCK stages the
-      # speakerkit artifact set. Three targets, and the set is deliberately
-      # smaller than `tests/speaker/` holds:
-      #
-      #   - `speaker_model_io` introspects every staged bundle and byte-pins the
-      #     three that carry a provenance decision;
-      #   - `speaker_parity_seg` / `speaker_parity_embed` run the two shipping
-      #     graphs against committed goldens and fixtures.
-      #
-      # `speaker_parity_diarize_wiring` is NOT here and cannot be: its fixtures
-      # live in the SIBLING `diarization` repository
-      # (`../../../diarization/tests/parity/fixtures/`, overridable via
-      # DIA_PARITY_FIXTURES), which no runner has at any staging size. It stays a
-      # local/dev gate.
-      #
-      # The three argmax targets (`speaker_argmax_model_io`,
-      # `speaker_parity_argmax_accuracy`, `speaker_parity_argmax_swift`) are NOT
-      # here for a different and firmer reason: the argmax artifact repo declares
-      # NO license on Hugging Face, so undeclared-means-all-rights-reserved
-      # applies to those converted graphs and this repository does not fetch them
-      # in CI at all. NOTICE records that; adding an ARGMAX_TEST_MODELS download
-      # here would quietly reverse a licensing decision, not just widen coverage.
-      #
-      # SPEAKERKIT_TEST_MODELS is set explicitly even though the default resolves
-      # to the same path: the gates then name the directory this job staged,
-      # rather than silently depending on the workspace-relative fallback.
-      #
-      # Same two vacuum holes as the granite/siglip/CED steps, closed the same
-      # way, and the same failure-collecting loop: a red target costs its own
-      # verdict, not the two after it.
-      - name: Speaker model gates
-        id: speaker_gates
+      # A red target reports ITS verdict and the loop keeps going: under `set -e`
+      # the first failure would hide the ones after it — the same masking this
+      # job spent a month in, one level down. A VACUUM still aborts immediately,
+      # because that is a configuration error rather than a gate result.
+      - name: Model gates
+        id: gates
         if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
         env:
-          SPEAKERKIT_TEST_MODELS: ${{ github.workspace }}/Models/speakerkit
+          KIT: ${{ matrix.kit }}
+          PROBE: ${{ matrix.probe }}
+          GATES: ${{ matrix.gates }}
         run: |
           set -euo pipefail
-          seg=Models/speakerkit/pyannote_segmentation.mlmodelc
-          if [ ! -d "$seg" ]; then
-            echo "::error::speakerkit bundle $seg is absent — the model gates below must FAIL here, never skip" >&2
-            exit 1
-          fi
-          failed=""
-          for target in speaker_model_io speaker_parity_seg speaker_parity_embed; do
-            listed=$(cargo test -p coremlit --features speaker --test "$target" -- --list --ignored 2>/dev/null | grep -c ': test$' || true)
-            if [ "$listed" -eq 0 ]; then
-              echo "::error::$target lists 0 ignored tests — it failed to build, or its model gates were deleted, renamed, or un-ignored, so an ignored-only run would pass vacuously" >&2
+          for path in $PROBE; do
+            if [ ! -e "$path" ]; then
+              echo "::error::the $KIT shard's staged artifact $path is absent after download/cache-restore — the model gates below must FAIL here, never skip" >&2
               exit 1
             fi
-            echo "== $target: $listed model gate(s) =="
-            cargo test -p coremlit --features speaker --test "$target" -- --ignored || failed="$failed $target"
           done
-          if [ -n "$failed" ]; then
-            echo "::error::speaker gates failed:$failed" >&2
+          ran=0
+          failed=""
+          while IFS='|' read -r features selectors_line filter; do
+            [ -n "${selectors_line:-}" ] || continue
+            for selector in $selectors_line; do
+              case "$selector" in
+                @all) target=() ;;
+                @lib) target=(--lib) ;;
+                *)    target=(--test "$selector") ;;
+              esac
+              # bash 3.2 (the macOS runner's) errors on "${arr[@]}" when arr is
+              # empty under `set -u`; `${arr[@]+...}` is the portable guard.
+              listed=$(cargo test -p coremlit --features "$features" ${target[@]+"${target[@]}"} -- --list --ignored ${filter:+"$filter"} 2>/dev/null </dev/null | grep -c ': test$' || true)
+              if [ "$listed" -eq 0 ]; then
+                echo "::error::$KIT gate '$selector' (features \"$features\"${filter:+, filter $filter}) lists 0 ignored tests — it failed to build, or its model gates were deleted, renamed, or un-ignored, so an ignored-only run would pass vacuously" >&2
+                exit 1
+              fi
+              echo "== $KIT :: $selector (features \"$features\"): $listed model gate(s) =="
+              ran=$((ran + 1))
+              cargo test -p coremlit --features "$features" ${target[@]+"${target[@]}"} --no-fail-fast -- --ignored ${filter:+"$filter"} </dev/null || failed="$failed $selector"
+            done
+          done <<< "$GATES"
+          # A gate plan that parsed to nothing would sail through the loop above
+          # having run no test at all — the job-level face of the per-target
+          # vacuum the `--list` counts refuse.
+          if [ "$ran" -eq 0 ]; then
+            echo "::error::the $KIT shard's gate plan selected no test target; a shard that gates nothing must fail, not pass" >&2
             exit 1
           fi
-      # The anti-vacuum guard for the JOB, mirroring the per-target
-      # `--list --ignored` counts inside the gates above: those refuse a gate
-      # that runs zero tests, and this refuses a gate that never runs at all.
+          if [ -n "$failed" ]; then
+            echo "::error::$KIT gates failed:$failed" >&2
+            exit 1
+          fi
+      # The anti-vacuum guard for the SHARD, mirroring the per-target
+      # `--list --ignored` counts inside the gate runner: those refuse a gate
+      # that runs zero tests, and this refuses a check that never runs at all.
       #
       # `!cancelled()` alone, deliberately — this must report even when the
-      # download failed, because "the download died and took ten gates with it"
-      # is precisely the fact the old job swallowed. A `skipped` outcome here
+      # download failed, because "the download died and took every check with
+      # it" is precisely the fact the old job swallowed. A `skipped` outcome here
       # can only mean a step lost its condition or the download failed; either
-      # way the job must be red and must SAY which gates did not execute.
+      # way the shard must be red and must SAY which checks did not execute.
       #
-      # Adding a gate step above means adding its id here. Forgetting to is the
-      # benign direction (the new gate is simply unwatched); forgetting the
-      # `if:` on it is the harmful one, and it is the one this catches.
+      # Sharding moved half of what the old ledger did into GitHub itself: each
+      # kit is now its own check name, so a whole family going dark is visible
+      # on the PR page rather than buried as a `skipped` step. What GitHub does
+      # NOT notice is a shard that exists but whose checks quietly stopped
+      # running, which is what this still catches — and because every shard runs
+      # the identical step list, one ledger covers all six.
+      #
+      # Adding a step above means adding its id here. Forgetting to is the
+      # benign direction (the new check is simply unwatched); forgetting the
+      # `if:` on it is the harmful one, and it is the one this catches. The
+      # hermetic `ci_model_tests_gates_cannot_be_silently_skipped` fails on
+      # either.
       - name: Gate ledger (a gate that never ran proves nothing)
         if: ${{ !cancelled() }}
         env:
+          KIT: ${{ matrix.kit }}
           LEDGER: |
-            granite-checksums=${{ steps.granite_checksums.outcome }}
-            ced-checksums=${{ steps.ced_checksums.outcome }}
+            overlay-ordering=${{ steps.overlay.outcome }}
+            artifact-checksums=${{ steps.checksums.outcome }}
             fp16-graph-sweep=${{ steps.fp16_guards.outcome }}
             fp16-sweep-inventory=${{ steps.fp16_inventory.outcome }}
-            core-model-gates=${{ steps.core_gates.outcome }}
-            whisper-model-gates=${{ steps.whisper_gates.outcome }}
-            whisper-vad-gates=${{ steps.whisper_vad_gates.outcome }}
-            granite-model-gates=${{ steps.granite_gates.outcome }}
-            siglip-tokenizer-gates=${{ steps.siglip_gates.outcome }}
-            ced-model-gates=${{ steps.ced_gates.outcome }}
-            speakerkit-checksums=${{ steps.speakerkit_checksums.outcome }}
-            speaker-model-gates=${{ steps.speaker_gates.outcome }}
+            model-gates=${{ steps.gates.outcome }}
         run: |
           set -euo pipefail
-          printf '%s' "$LEDGER"
-          # `skipped` is the gate that never ran; an EMPTY outcome is a typo in
-          # an id above, which would leave that gate unwatched — both are the
-          # same defect (a gate whose fate this step cannot report) and both
+          echo "== model-tests ($KIT) =="
+          # `%s\n`, not `%s`: the block scalar already ends in a newline, and
+          # without a second one an `::error::` below would be glued onto the
+          # last ledger line where GitHub's annotation parser cannot see it.
+          printf '%s\n' "$LEDGER"
+          # `skipped` is the check that never ran; an EMPTY outcome is a typo in
+          # an id above, which would leave that check unwatched — both are the
+          # same defect (a check whose fate this step cannot report) and both
           # fail here.
           missing=$(printf '%s' "$LEDGER" | sed -nE 's/^ *([^=]*)=(skipped)?$/\1/p' | paste -sd' ' -)
           if [ -n "$missing" ]; then
-            echo "::error::these gate steps did not run, or this step cannot tell: $missing — a red step must not silently disable the gates after it (see the note above the first gate), so this job fails on their absence, not on their result" >&2
+            echo "::error::these checks did not run in the $KIT shard, or this step cannot tell: $missing — a red step must not silently disable the ones after it (see the note above the first check), so this shard fails on their absence, not on their result" >&2
             exit 1
           fi
-          echo "all gates executed"
+          echo "all checks executed"
