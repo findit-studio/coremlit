@@ -1,5 +1,73 @@
 use std::path::PathBuf;
 
+// ── Host-class provenance ───────────────────────────────────────────────────
+//
+// The whisper goldens are an EXTERNAL Swift oracle captured on the Neural
+// Engine, and this pipeline decodes greedily, so one borderline argmax flipped
+// by fp16 drift on a different Apple Silicon generation or macOS build cascades
+// through every token after it (CI run 97115941847: a +0.0078 margin, one fp16
+// ULP, at decode step 11 of es_test_clip). `generationHost` is what tells that
+// apart from a port defect. The predicate lives in `tests/support/host_class.rs`
+// — one copy, shared with the speaker and vad suites.
+#[path = "../../support/host_class.rs"]
+#[allow(dead_code)]
+mod host_class;
+#[allow(unused_imports)]
+pub use host_class::{HostClass, HostVerdict, check_host_class, legacy_failure_note};
+
+/// The exact command that regenerates the whisper goldens **from the external
+/// Swift oracle**, quoted verbatim into every host-class diagnosis so the
+/// failure names its own fix.
+///
+/// Two spellings of one script: run it locally to get a golden matching THIS
+/// machine, or dispatch the workflow to get one matching the CI runner's
+/// host-class. `.github/workflows/regen-whisper-goldens.yml` runs this same
+/// script, so the two cannot diverge.
+#[allow(dead_code)]
+pub const WHISPER_REGEN_SCRIPT: &str = "crates/coremlit/tests/whisper/swift/regen_goldens.sh\n\
+   \x20   (for the CI runner's host-class instead: `gh workflow run \
+   regen-whisper-goldens.yml`,\n\
+   \x20    then download the `whisper-goldens` artifact and commit it — the job \
+   never commits)";
+
+/// Reads a committed golden from `fixtures/golden/` as untyped JSON, so the
+/// host-class gate can read `generationHost` before the suite deserializes the
+/// rest into its own typed shape. One read, not two.
+#[allow(dead_code)]
+pub fn load_golden_json(fixture: &str) -> serde_json::Value {
+  let path = fixtures_dir().join("golden").join(fixture);
+  let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+  serde_json::from_str(&text).unwrap_or_else(|e| panic!("{fixture}: not valid JSON: {e}"))
+}
+
+/// Runs the host-class gate for one golden and returns the note to append to a
+/// fidelity failure — empty on a matching host, the ambiguity note on a legacy
+/// (unstamped) one.
+///
+/// Call this BEFORE producing any CoreML number: a recorded-but-different host
+/// panics here with the regeneration diagnosis, so the suite never reports host
+/// drift as a token divergence.
+#[allow(dead_code)]
+pub fn golden_host_note(fixture: &str, golden: &serde_json::Value) -> String {
+  let recorded = HostClass::from_golden(fixture, golden).unwrap_or_else(|e| panic!("{e}"));
+  let running = HostClass::running();
+  match check_host_class(fixture, recorded.as_ref(), &running, WHISPER_REGEN_SCRIPT) {
+    Ok(HostVerdict::Match) => {
+      println!("[host] {fixture}: golden generationHost matches this host: {running}");
+      String::new()
+    }
+    Ok(HostVerdict::LegacyUnknown) => {
+      println!(
+        "[host] {fixture}: golden has no generationHost (pre-host-provenance); exact token \
+         parity still enforced — but a FAILURE would be ambiguous between a port defect and \
+         host fp16 drift. Running host: {running}"
+      );
+      legacy_failure_note(WHISPER_REGEN_SCRIPT)
+    }
+    Err(diagnosis) => panic!("{diagnosis}"),
+  }
+}
+
 pub fn models_dir() -> PathBuf {
   std::env::var_os("WHISPERKIT_TEST_MODELS").map_or_else(
     || {
@@ -43,6 +111,10 @@ pub fn fixtures_dir() -> PathBuf {
 /// 176,000 samples, es_test_clip 7.664562s / 122,633 samples, ja_test_clip
 /// 2.773s / 44,368 samples) — no `afconvert` resampling was needed for any
 /// of them, though only `jfk.wav`'s sample count is asserted below.
+///
+/// `allow(dead_code)` for the reason `tokenizer_dir` carries one: the hermetic
+/// `golden_provenance.rs` binary compiles this module but decodes no audio.
+#[allow(dead_code)]
 pub fn load_wav_mono_f32(path: &std::path::Path) -> Vec<f32> {
   let mut reader = hound::WavReader::open(path).expect("fixture wav opens");
   let spec = reader.spec();
@@ -84,8 +156,19 @@ pub fn load_wav_mono_f32(path: &std::path::Path) -> Vec<f32> {
 /// golden prefix, so `golden[k]` is the token fed at cache position `k` —
 /// see [`replay_step_logits`] for the invariant that makes this exact, and
 /// the guard that refuses the replay when it would not be.
+///
+/// `host_note` is [`golden_host_note`]'s verdict for this golden, appended
+/// last. A mismatched host never reaches here — that panics up front — so this
+/// carries either nothing (host matched: the divergence is the port's) or the
+/// legacy-ambiguity note (golden unstamped: it could be either).
 #[allow(dead_code)]
-pub fn assert_golden_tokens(label: &str, rust: &[u32], golden: &[u32], audio: &[f32]) {
+pub fn assert_golden_tokens(
+  label: &str,
+  rust: &[u32],
+  golden: &[u32],
+  audio: &[f32],
+  host_note: &str,
+) {
   if rust == golden {
     return;
   }
@@ -105,43 +188,43 @@ pub fn assert_golden_tokens(label: &str, rust: &[u32], golden: &[u32], audio: &[
   );
 
   match (rust.get(first_diff), golden.get(first_diff)) {
-    (Some(&ours), Some(&gold)) => {
-      // Step k feeds tokens[k] at cache position k and predicts tokens[k+1]
-      // (`decode::decode_text`'s loop), so the step that produced the token
-      // at `first_diff` is `first_diff - 1`.
-      let Some(step) = first_diff.checked_sub(1) else {
-        report.push_str(
-          "  ...at index 0 — the start-of-transcript token itself. That is a \
-           prefill/prompt-construction bug, not a sampled-token flip; no decode \
-           step produced it, so there is no margin to report.\n",
-        );
-        panic!("{report}");
-      };
-      report.push_str(&format!(
-        "  produced by decode step {step} (fed golden token {})\n\
+    // Step k feeds tokens[k] at cache position k and predicts tokens[k+1]
+    // (`decode::decode_text`'s loop), so the step that produced the token at
+    // `first_diff` is `first_diff - 1` — and at index 0 there is no such step.
+    // That case falls THROUGH to the shared tail rather than panicking here, so
+    // it still carries the regeneration rule and the host note.
+    (Some(&ours), Some(&gold)) => match first_diff.checked_sub(1) {
+      None => report.push_str(
+        "  ...at index 0 — the start-of-transcript token itself. That is a \
+         prefill/prompt-construction bug, not a sampled-token flip; no decode \
+         step produced it, so there is no margin to report.\n",
+      ),
+      Some(step) => {
+        report.push_str(&format!(
+          "  produced by decode step {step} (fed golden token {})\n\
          \x20 ours:   {ours}\n\
          \x20 golden: {gold}\n",
-        golden[step],
-      ));
+          golden[step],
+        ));
 
-      match replay_step_logits(audio, &golden[..=step]) {
-        Ok(logits) => {
-          let ours_logit = logits.get(ours as usize).copied().unwrap_or(f32::NAN);
-          let gold_logit = logits.get(gold as usize).copied().unwrap_or(f32::NAN);
-          let ((top1, top1_logit), (top2, top2_logit)) = top_two(&logits);
-          report.push_str(&format!(
-            "\n  raw decoder logits at step {step}\n\
+        match replay_step_logits(audio, &golden[..=step]) {
+          Ok(logits) => {
+            let ours_logit = logits.get(ours as usize).copied().unwrap_or(f32::NAN);
+            let gold_logit = logits.get(gold as usize).copied().unwrap_or(f32::NAN);
+            let ((top1, top1_logit), (top2, top2_logit)) = top_two(&logits);
+            report.push_str(&format!(
+              "\n  raw decoder logits at step {step}\n\
              \x20   ours   {ours:>6}: {ours_logit:>10.4}\n\
              \x20   golden {gold:>6}: {gold_logit:>10.4}\n\
              \x20   MARGIN (ours - golden): {:>+.4}\n\
              \x20   raw top-1 {top1:>6}: {top1_logit:>10.4}\n\
              \x20   raw top-2 {top2:>6}: {top2_logit:>10.4}\n\
              \x20   MARGIN (top1 - top2):   {:>+.4}\n",
-            ours_logit - gold_logit,
-            top1_logit - top2_logit,
-          ));
-          report.push_str(
-            "\n  A THIN margin here (order 0.1-1.0) means the two machines \
+              ours_logit - gold_logit,
+              top1_logit - top2_logit,
+            ));
+            report.push_str(
+              "\n  A THIN margin here (order 0.1-1.0) means the two machines \
              disagreed on a\n  BORDERLINE ARGMAX: ANE fp16 drift on a different \
              Apple Silicon generation can\n  flip it, and greedy autoregression \
              then cascades the flip through every token\n  after this one. \
@@ -155,11 +238,12 @@ pub fn assert_golden_tokens(label: &str, rust: &[u32], golden: &[u32], audio: &[
              margin the sampler saw; if one of the two\n  is a token the chain \
              suppresses, expect the raw numbers to disagree with the\n  sampled \
              outcome, and read that as the tell.\n",
-          );
+            );
+          }
+          Err(why) => report.push_str(&format!("\n  (no logit replay: {why})\n")),
         }
-        Err(why) => report.push_str(&format!("\n  (no logit replay: {why})\n")),
       }
-    }
+    },
     _ => report.push_str(
       "  ...as a LENGTH difference: one stream is a strict prefix of the other, \
        so there is\n  no competing token pair at this index to weigh. The \
@@ -169,11 +253,23 @@ pub fn assert_golden_tokens(label: &str, rust: &[u32], golden: &[u32], audio: &[
   }
 
   report.push_str(
-    "\n  DO NOT regenerate the golden, and DO NOT add a tolerance. The golden is \
-     an\n  EXTERNAL Swift oracle (whisperkit-cli @ argmax-oss-swift); a \
-     divergence from it is\n  a real difference to be explained, never smoothed \
-     over.\n",
+    "\n  DO NOT add a tolerance, and DO NOT re-baseline this golden against our own \
+     output.\n  The golden's whole value is that it comes from somewhere else: an EXTERNAL \
+     Swift\n  oracle (whisperkit-cli @ argmax-oss-swift). A divergence from it is a real\n  \
+     difference to be explained, never smoothed over — and a golden rewritten from \
+     the\n  Rust side would assert only that coremlit agrees with coremlit.\n\n  \
+     REGENERATION is permitted, but only on those terms:\n\
+     \x20   - produced by `whisperkit-cli`, never by this crate. The regeneration script \
+     runs\n\
+     \x20     the CLI and reshapes its `--report` JSON; it does not build or link coremlit,\n\
+     \x20     and `whisper_golden_provenance` fails if it ever does.\n\
+     \x20   - stamped with the `generationHost` it was produced on, so the next reader of \
+     a\n\
+     \x20     failure can tell a port defect from this machine's fp16 drift.\n\
+     \x20   - reviewed as a diff by a human, because a changed oracle output is news.\n\
+     \x20 Anything else — including a tolerance — puts the gate to sleep.\n",
   );
+  report.push_str(host_note);
   panic!("{report}");
 }
 
