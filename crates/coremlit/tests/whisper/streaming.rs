@@ -237,15 +237,24 @@ fn check_confirmed_is_prefix_of_batch(
       confirmed_words[index], batch_words[index],
     )),
     // Every shared position matched, so the confirmation ran PAST the batch
-    // transcript. `LocalAgreement::finalize` appends the held-back words and
-    // then `find_longest_different_suffix` of the last ingested pair, and both
-    // land when the final hypothesis disagreed — look there before the decode.
+    // transcript — the signature of a word confirmed twice. Two mechanisms
+    // produce it. `LocalAgreement::finalize` folding in BOTH the held-back words
+    // and the last pair's differing suffix is now guarded (`holdback_superseded`)
+    // and has hermetic falsifiers in `stream/agreement/tests.rs`. The
+    // re-admission strip in `LocalAgreement::watermark_filtered` is NOT fixed —
+    // it only catches a reproduction at the front of the offered list, and the
+    // sequences that slide past it are the `_today` characterization tests in
+    // that same file (issue #94). Check the second before the decode, and the
+    // first before both.
     None => report.push_str(&format!(
       "  every shared position matched, but the confirmation is {} word(s) LONGER \
        than the batch transcript — i.e. it emitted words the batch decode never \
-       produced. Suspect duplication in `LocalAgreement::finalize` (it folds in \
-       BOTH the held-back words and the last pair's differing suffix) before \
-       suspecting the decode.\n",
+       produced. Suspect a word confirmed TWICE before suspecting the decode: \
+       `LocalAgreement::watermark_filtered`'s re-admission strip has KNOWN OPEN \
+       gaps (issue #94, the `_today` characterization tests in \
+       `stream/agreement/tests.rs`), \
+       and `LocalAgreement::finalize` folds in both the held-back words and the \
+       last pair's differing suffix behind the `holdback_superseded` guard.\n",
       confirmed_words.len().saturating_sub(batch_words.len()),
     )),
   }
@@ -472,7 +481,10 @@ fn a_rewritten_word_is_not_a_truncation() {
 }
 
 /// A confirmation that runs PAST the batch transcript is not a truncation
-/// either — the shape `LocalAgreement::finalize`'s double fold would produce.
+/// either — the shape a word confirmed TWICE produces, whether from
+/// `LocalAgreement::finalize`'s double fold with its `holdback_superseded` guard
+/// not doing its job, or from the re-admission strip letting an
+/// already-confirmed word back into a hypothesis.
 #[test]
 fn a_confirmation_longer_than_the_batch_is_not_a_truncation() {
   let why = check_confirmed_is_prefix_of_batch(&format!("{BATCH} for you"), BATCH, 2)
