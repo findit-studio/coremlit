@@ -7,7 +7,7 @@
 //! that read them.
 //!
 //! No TOML crate: this is a deliberately tiny hand-rolled reader over the
-//! lock's fixed five-table shape (`["repo/name"]` headers, single-line
+//! lock's fixed seven-table shape (`["repo/name"]` headers, single-line
 //! `key = "value"` fields), mirroring the sed/awk parsing `ci.yml` itself
 //! performs at CI time — not a general TOML parser.
 
@@ -140,8 +140,8 @@ fn lock_parses_and_every_table_has_a_selector_and_a_revision() {
 
   assert_eq!(
     tables.len(),
-    5,
-    "MODELS_LOCK: expected exactly five tables, found {}",
+    7,
+    "MODELS_LOCK: expected exactly seven tables, found {}",
     tables.len()
   );
   for table in &tables {
@@ -179,9 +179,15 @@ fn ci_workflow_derives_downloads_from_the_lock_instead_of_hardcoding_them() {
       "openai/whisper-tiny",
       "FinDIT-Studio/embedkit-coreml",
       "FinDIT-Studio/siglip2-naflex-coreml",
-      "FinDIT-Studio/cedkit-coreml"
+      "FinDIT-Studio/cedkit-coreml",
+      "FluidInference/speaker-diarization-coreml",
+      "FinDIT-Studio/speakerkit-coreml"
     ],
-    "MODELS_LOCK's table names or their order changed — update this test alongside it"
+    "MODELS_LOCK's table names or their order changed — update this test alongside it. The last \
+     two are not interchangeable: both download into Models/speakerkit/ and both publish \
+     `pyannote_segmentation.mlmodelc` and `wespeaker.mlmodelc`, so the LAST one wins those two \
+     filenames and it must be the fp16-guard-repaired overlay. See \
+     `ci_stages_the_speakerkit_overlay_last_and_proves_it_won`"
   );
 
   // The literal repo strings belong to MODELS_LOCK alone. If ci.yml also
@@ -223,6 +229,14 @@ fn ci_workflow_derives_downloads_from_the_lock_instead_of_hardcoding_them() {
     "download step doesn't invoke hf with a lock-derived $ced_repo"
   );
   assert!(
+    ci_contents.contains("hf download \"$speakerkit_base_repo\""),
+    "download step doesn't invoke hf with a lock-derived $speakerkit_base_repo"
+  );
+  assert!(
+    ci_contents.contains("hf download \"$speakerkit_overlay_repo\""),
+    "download step doesn't invoke hf with a lock-derived $speakerkit_overlay_repo"
+  );
+  assert!(
     ci_contents.contains("--revision \"$model_revision\""),
     "download step doesn't pass a lock-derived --revision for the model repo"
   );
@@ -241,6 +255,14 @@ fn ci_workflow_derives_downloads_from_the_lock_instead_of_hardcoding_them() {
   assert!(
     ci_contents.contains("--revision \"$ced_revision\""),
     "download step doesn't pass a lock-derived --revision for the ced repo"
+  );
+  assert!(
+    ci_contents.contains("--revision \"$speakerkit_base_revision\""),
+    "download step doesn't pass a lock-derived --revision for the speakerkit base repo"
+  );
+  assert!(
+    ci_contents.contains("--revision \"$speakerkit_overlay_revision\""),
+    "download step doesn't pass a lock-derived --revision for the speakerkit overlay repo"
   );
 
   // ci.yml selects tables by INDEX, so an appended table it does not extract is
@@ -276,6 +298,17 @@ fn ci_workflow_derives_downloads_from_the_lock_instead_of_hardcoding_them() {
     "ci.yml no longer verifies the CED bundle against its shipped CHECKSUMS.sha256 (read from \
      inside the .mlmodelc, whose root its paths are relative to), which MODELS_LOCK's header \
      claims it does"
+  );
+
+  // And a third shape for the speakerkit overlay, which cannot reuse either of
+  // the two above: its checksum file lists its OWN name with the sha256 of an
+  // empty file, plus the `wespeaker_int8`/`.mlpackage` paths MODELS_LOCK's
+  // selector deliberately does not stage, so `shasum -c` over the whole file
+  // fails on a correct tree. ci.yml verifies the filtered subset from stdin.
+  assert!(
+    ci_contents.contains("shasum -a 256 -c \"$filtered\""),
+    "ci.yml no longer verifies the staged speakerkit overlay files against the CHECKSUMS.sha256 \
+     that artifact ships, which MODELS_LOCK's header claims it does"
   );
 }
 
@@ -353,6 +386,131 @@ fn ci_runs_the_ced_gates_for_exactly_the_size_the_lock_stages() {
   );
 }
 
+/// The two speakerkit tables are the one place in MODELS_LOCK where table order
+/// decides which BYTES ship, not merely which parser variable gets which value.
+///
+/// Both download into `Models/speakerkit/` and both publish
+/// `pyannote_segmentation.mlmodelc` and `wespeaker.mlmodelc`, so the last one
+/// downloaded wins those two filenames. The base layer's copies are
+/// FluidInference's PRE-REPAIR conversions: contract-identical — same feature
+/// names, shapes and dtypes — so they load, run, and pass every structural gate
+/// while an inert `log(epsilon = 0)` saturates `segments` to -45440 on the
+/// default `ComputeUnits::All` placement (issue #15). Only bytes tell them
+/// apart.
+///
+/// So this pins three things that must move together: the lock's order, the
+/// order of the two `hf download` commands ci.yml derives from it, and the
+/// early overlay check that re-hashes both graphs. That last one is what turns
+/// a wrong order into a named failure instead of anonymous "sha256 drift"
+/// reported a full build later by `speaker_model_io` — and its expected hashes
+/// are a deliberate SECOND copy of that gate's pins, so this test also holds
+/// the two copies together.
+#[test]
+fn ci_stages_the_speakerkit_overlay_last_and_proves_it_won() {
+  let Some((lock_path, workflow_path)) = repo_files() else {
+    return;
+  };
+  let lock_contents = fs::read_to_string(lock_path).expect("MODELS_LOCK reads");
+  let tables = parse_lock(&lock_contents);
+  let ci_contents = fs::read_to_string(workflow_path).expect(".github/workflows/ci.yml reads");
+
+  let index_of = |name: &str| {
+    tables
+      .iter()
+      .position(|t| t.name == name)
+      .unwrap_or_else(|| panic!("MODELS_LOCK has no {name:?} table"))
+  };
+  let base = index_of("FluidInference/speaker-diarization-coreml");
+  let overlay = index_of("FinDIT-Studio/speakerkit-coreml");
+  assert!(
+    base < overlay,
+    "MODELS_LOCK stages the speakerkit OVERLAY (table {}) before the BASE layer (table {}), so \
+     the base layer's PRE-REPAIR pyannote_segmentation/wespeaker graphs would overwrite the \
+     fp16-guard-repaired ones the pipeline ships",
+    overlay + 1,
+    base + 1
+  );
+
+  // The overlay selector must not be widened to a bare `*.mlmodelc/*`: that
+  // would also stage the overlay repo's `wespeaker_int8` re-conversion over the
+  // base layer's bytes, breaking both the `wespeaker_v2 == wespeaker_int8`
+  // byte-identity gate and that bundle's fp16_guards pin (the re-palettization
+  // regresses clip 14's int8 ANE arm from 0.8178 % to 1.4860 % DER).
+  let overlay_include =
+    field(&tables[overlay], "include").expect("the speakerkit overlay table has an `include`");
+  for bundle in ["pyannote_segmentation.mlmodelc/*", "wespeaker.mlmodelc/*"] {
+    assert!(
+      overlay_include.split(' ').any(|p| p == bundle),
+      "MODELS_LOCK's speakerkit overlay `include` ({overlay_include:?}) does not name {bundle:?}, \
+       so that shipping graph would stay the base layer's pre-repair conversion"
+    );
+  }
+  assert!(
+    !overlay_include.split(' ').any(|p| p == "*.mlmodelc/*"),
+    "MODELS_LOCK's speakerkit overlay `include` ({overlay_include:?}) globs every bundle, which \
+     stages that repo's NOT-adopted wespeaker_int8 re-conversion over the base layer's bytes"
+  );
+
+  // ci.yml emits the two downloads in lock order; pin that it still does, since
+  // the lock order above is only load-bearing if the workflow follows it.
+  let base_cmd = ci_contents
+    .find("hf download \"$speakerkit_base_repo\"")
+    .expect("ci.yml never downloads the speakerkit base layer");
+  let overlay_cmd = ci_contents
+    .find("hf download \"$speakerkit_overlay_repo\"")
+    .expect("ci.yml never downloads the speakerkit overlay");
+  assert!(
+    base_cmd < overlay_cmd,
+    "ci.yml downloads the speakerkit overlay BEFORE the base layer, so the base layer's \
+     pre-repair graphs overwrite the shipping ones no matter what MODELS_LOCK's table order says"
+  );
+
+  // The early overlay check, and its two expected hashes — which must be the
+  // same bytes `tests/speaker/model_io.rs` pins. A re-baseline there that
+  // forgets ci.yml (or the reverse) leaves CI asserting bytes no gate accepts.
+  let model_io = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/speaker/model_io.rs");
+  let model_io =
+    fs::read_to_string(&model_io).unwrap_or_else(|e| panic!("read {}: {e}", model_io.display()));
+  for (bundle, gate) in [
+    (
+      "pyannote_segmentation.mlmodelc",
+      "fp16_safe_segmentation_matches_pinned_sha256",
+    ),
+    (
+      "wespeaker.mlmodelc",
+      "fp16_safe_wespeaker_fp32_matches_pinned_sha256",
+    ),
+  ] {
+    let needle = format!("\"{bundle}:");
+    let rest = ci_contents
+      .split_once(&needle)
+      .unwrap_or_else(|| {
+        panic!(
+          "ci.yml's speakerkit overlay check carries no `{bundle}:<sha256>` pin, so a wrong \
+           download order would only surface later as anonymous hash drift"
+        )
+      })
+      .1;
+    let hash = rest.get(..64).unwrap_or_default();
+    assert!(
+      hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()),
+      "ci.yml's `{bundle}` overlay pin is not a 64-hex-digit sha256: {hash:?}"
+    );
+    assert!(
+      model_io.contains(gate),
+      "tests/speaker/model_io.rs no longer defines {gate:?}, the gate ci.yml's overlay pin for \
+       {bundle:?} is a second copy of"
+    );
+    assert!(
+      model_io.contains(hash),
+      "ci.yml pins {bundle}/model.mil at sha256 {hash}, which appears nowhere in \
+       tests/speaker/model_io.rs — the early overlay check and the {gate} gate have drifted \
+       apart, so CI would demand bytes that gate rejects (or accept bytes it would reject). \
+       Re-baseline both together."
+    );
+  }
+}
+
 /// GitHub's default step condition is `success()`, so one red step marks every
 /// step after it `skipped` — and `skipped` is silent. `model-tests` ran that
 /// way for four weeks: a stale assertion in the whisper suite went red the day
@@ -401,6 +559,7 @@ fn ci_model_tests_gates_cannot_be_silently_skipped() {
     "name: Granite model gates",
     "name: SigLIP tokenizer gates",
     "name: CED model gates (tiny)",
+    "name: Speaker model gates",
   ] {
     assert!(
       gates.iter().any(|step| step.contains(gate)),

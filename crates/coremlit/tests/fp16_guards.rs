@@ -49,14 +49,15 @@
 //! # Coverage boundary (`COREMLIT_FP16_SWEEP_VENDORS`)
 //!
 //! By default the sweep requires EVERY vendor named by a [`KNOWN_DEFECTS`] pin to
-//! be present. CI's model job, however, downloads WHISPER and GRANITE only (per
-//! MODELS_LOCK), so it sets
-//! `COREMLIT_FP16_SWEEP_VENDORS=whisperkit-coreml,embedkit-granite` to narrow the
-//! manifest EXPLICITLY: there the sweep proves it runs and that the whisper mel
-//! and granite norm controls are clean, but it CANNOT verify the speakerkit /
-//! alignkit / argmax defect pins — those models are not downloaded. Full pin
-//! verification (every [`KNOWN_DEFECTS`] entry) is a local/dev gate that needs
-//! the complete `Models/` tree. The override is fail-closed — absence of it
+//! be present. CI's model job stages only part of the tree (per MODELS_LOCK), so
+//! it names what it stages —
+//! `COREMLIT_FP16_SWEEP_VENDORS=whisperkit-coreml,embedkit-granite,vadkit,ced,speakerkit`
+//! — narrowing the manifest EXPLICITLY. There the sweep proves it runs, that the
+//! whisper mel, granite norm, vadkit STFT and CED controls are clean, and that
+//! the FIVE `speakerkit/` defect pins still hold in both directions; it CANNOT
+//! verify the alignkit / argmax pins, whose models that job does not download.
+//! Full pin verification (every [`KNOWN_DEFECTS`] entry) is a local/dev gate that
+//! needs the complete `Models/` tree. The override is fail-closed — absence of it
 //! requires ALL pinned vendors — so narrowing coverage is always an explicit,
 //! reviewable act in ci.yml, never the silent side effect of a deleted
 //! directory, which is the whole point of the manifest.
@@ -1762,13 +1763,12 @@ fn vendor_of(path: &str) -> &str {
 /// absence of the override is the strictest setting.
 ///
 /// `COREMLIT_FP16_SWEEP_VENDORS` (comma-separated) OVERRIDES the manifest for a
-/// deliberately-partial tree: CI's model job downloads WHISPER and GRANITE only
-/// (per MODELS_LOCK) and sets
-/// `COREMLIT_FP16_SWEEP_VENDORS=whisperkit-coreml,embedkit-granite`, so there the
-/// sweep requires both staged vendors and audits their graphs while the absent
-/// speakerkit/alignkit/argmax vendors are the DOCUMENTED escape, not a silent
-/// skip. Narrowing coverage is thus an explicit, reviewable act; the full pin
-/// verification remains a local/dev gate (see the module docs' coverage boundary).
+/// deliberately-partial tree: CI's model job stages part of the tree (per
+/// MODELS_LOCK) and names exactly that part, so there the sweep requires every
+/// staged vendor and audits its graphs while the absent alignkit/argmax vendors
+/// are the DOCUMENTED escape, not a silent skip. Narrowing coverage is thus an
+/// explicit, reviewable act; the full pin verification remains a local/dev gate
+/// (see the module docs' coverage boundary, which carries the current value).
 ///
 /// A present-but-EMPTY override (`""`, whitespace, or only commas) is a HARD
 /// ERROR, not an empty manifest — see [`vendor_manifest`].
@@ -2100,20 +2100,21 @@ fn a_missing_pinned_vendor_fails_the_sweep_not_silently_skips() {
   );
 }
 
-/// F3/F1 reconciliation: the CI model job's scope sweeps CLEAN. With
-/// `expected_vendors = {whisperkit-coreml, embedkit-granite, vadkit}` — what that
-/// job sets via `COREMLIT_FP16_SWEEP_VENDORS`: the two vendors MODELS_LOCK
-/// stages, plus `vadkit`, which that job does not download because the artifact
-/// is COMMITTED to the repository — a tree containing the clean whisper mel, the
-/// clean granite norms and the real vadkit STFT guard sweeps green: all three
-/// expected vendors are present and their graphs are clean, and the absent
-/// speakerkit/alignkit/argmax pins are the DOCUMENTED escape (verified by the
-/// full local/dev gate, not here). This is the exact scenario the model job
-/// runs; proving it here keeps the ci.yml wiring honest even though Actions cannot
-/// run in-repo, and it is what would go red if the vendored model were deleted
-/// while ci.yml still demanded it. It also proves the narrowed manifest does NOT
-/// demand the pinned vendors — the fail-closed default does that only when the
-/// override is unset.
+/// F3/F1 reconciliation: the CLEAN-CONTROL half of the CI model job's scope
+/// sweeps clean. `expected_vendors = {whisperkit-coreml, embedkit-granite,
+/// vadkit}` is the subset of `COREMLIT_FP16_SWEEP_VENDORS` that carries no
+/// [`KNOWN_DEFECTS`] pin: two vendors MODELS_LOCK stages, plus `vadkit`, which
+/// that job does not download because the artifact is COMMITTED to the
+/// repository. A tree containing the clean whisper mel, the clean granite norms
+/// and the real vadkit STFT guard sweeps green — every expected vendor present
+/// and clean, with the pinned vendors' absence the DOCUMENTED escape. Proving it
+/// here keeps the ci.yml wiring honest even though Actions cannot run in-repo,
+/// and it is what would go red if the vendored model were deleted while ci.yml
+/// still demanded it. It also proves the narrowed manifest does NOT demand the
+/// pinned vendors — the fail-closed default does that only when the override is
+/// unset. The pinned vendors the job DOES stage (`speakerkit`, five pins) are
+/// audited against the real tree on the runner; the missing-vendor direction is
+/// [`a_missing_pinned_vendor_fails_the_sweep_not_silently_skips`].
 #[test]
 fn the_ci_model_job_scope_sweeps_clean() {
   let tree = TempTree::new("ci_model_job_scope");

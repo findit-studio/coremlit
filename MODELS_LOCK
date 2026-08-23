@@ -3,17 +3,43 @@
 # different revisions) to force a re-download.
 #
 # This file is CONSUMED, not decorative: ci.yml's "Download models (cache
-# miss)" step hand-parses the five tables below (small sed/awk block, no
-# TOML crate — see the comment there) to build all five `hf download`
+# miss)" step hand-parses the seven tables below (small sed/awk block, no
+# TOML crate — see the comment there) to build all seven `hf download`
 # commands, including `--revision`. Editing a repo name, selector, or
 # revision here changes what CI actually downloads next run, exactly like
 # editing any other lock file. Table ORDER is load-bearing: that parser
 # selects a table by INDEX (1 = whisper model, 2 = whisper tokenizer,
-# 3 = granite, 4 = siglip tokenizer, 5 = ced-tiny), so tables may be
-# appended but never reordered without editing ci.yml to match. Appending is
-# only safe because ci.yml ALSO asserts the table COUNT it knows how to
-# parse: a sixth table added here without teaching the parser about it fails
-# that job loudly instead of being silently ignored.
+# 3 = granite, 4 = siglip tokenizer, 5 = ced-tiny, 6 = speakerkit BASE,
+# 7 = speakerkit OVERLAY), so tables may be appended but never reordered
+# without editing ci.yml to match. Appending is only safe because ci.yml
+# ALSO asserts the table COUNT it knows how to parse: an eighth table added
+# here without teaching the parser about it fails that job loudly instead of
+# being silently ignored.
+#
+# ###########################################################################
+# # ORDER IS AN ARTIFACT-CORRECTNESS INVARIANT, NOT JUST A PARSER INDEX.    #
+# #                                                                         #
+# # Tables 6 and 7 BOTH download into `Models/speakerkit/`, and they BOTH   #
+# # publish files named `pyannote_segmentation.mlmodelc/` and               #
+# # `wespeaker.mlmodelc/`. The second download OVERWRITES the first, so the #
+# # LAST table to run decides which bytes the shipping pipeline gets.       #
+# #                                                                         #
+# # Table 6 (FluidInference) is the BASE layer: seven of the nine staged    #
+# # bundles come from it and nothing else publishes them, and it also       #
+# # carries PRE-REPAIR copies of the other two. Table 7 (FinDIT-Studio) is  #
+# # the OVERLAY: those other two, as the issue-#15 fp16-guard-repaired      #
+# # re-conversions, and they MUST WIN.                                      #
+# #                                                                         #
+# # Swap those two tables and CI silently stages the pre-repair             #
+# # segmentation graph — whose inert `log(epsilon = 0)` saturates           #
+# # `segments` to −45440 on the default ANE placement — and the pre-repair  #
+# # embedder, whose pooling guards vanish in fp16. Both are                 #
+# # contract-identical and pass every load/shape test. Only bytes tell them #
+# # apart, which is why ci.yml's "Verify speakerkit overlay and artifact    #
+# # checksums" step hashes both graphs against the pins in                  #
+# # crates/coremlit/tests/speaker/model_io.rs BEFORE any gate runs, and     #
+# # fails the job naming this ordering as the cause.                        #
+# ###########################################################################
 #
 # LOUD FOLLOW-UP: `revision = "main"` on the two whisper tables is a MOVING
 # target, not a real lock — CI can still download different upstream bytes
@@ -22,9 +48,15 @@
 # a deliberate user follow-up: it requires live network access (`hf api ...`
 # or the HF web UI) to look up each repo's current commit SHA. Until that
 # lands, treat `cache-epoch` bumps as the only reliable way to force a
-# fresh, verified download of them. The granite and ced tables are NOT in
-# that state: each pins an immutable commit SHA, and ci.yml verifies the
-# downloaded bytes against the `CHECKSUMS.sha256` those artifacts ship.
+# fresh, verified download of them. The granite, ced and speakerkit tables
+# are NOT in that state: each pins an immutable commit SHA. Of those, the
+# granite, ced and FinDIT-Studio speakerkit artifacts additionally ship a
+# `CHECKSUMS.sha256` that ci.yml verifies the downloaded bytes against;
+# FluidInference's repo ships NO checksum file, so its bundles are covered
+# instead by the per-file SHA-256 pins in
+# crates/coremlit/tests/speaker/model_io.rs (`wespeaker_v2.mlmodelc`) and by
+# the `tests/fp16_guards.rs` graph sweep, which reads every staged
+# `model.mil` and pins its guard sites in both directions.
 cache-epoch = 1
 
 ["argmaxinc/whisperkit-coreml"]
@@ -104,3 +136,89 @@ revision = "eb514c2ab66fb702d43c742add0be5b091b02dab"
 ["FinDIT-Studio/cedkit-coreml"]
 include  = "ced-tiny/*"
 revision = "96d504716c4e2ebe6182312f65c4ee6c23921a5d"
+
+# ===========================================================================
+# speakerkit, layer 1 of 2 — the BASE. **MUST STAY BEFORE the table below.**
+# See the ORDER box in this file's header for what breaks if it does not.
+# ===========================================================================
+#
+# The `audio::speaker` artifact set (`Models/speakerkit/`, the directory
+# tests/speaker/common/mod.rs resolves by default, overridable via
+# `SPEAKERKIT_TEST_MODELS`). Nine `.mlmodelc` bundles end up staged; SEVEN of
+# them come from here and nothing else publishes them:
+#
+#   | bundle                    | read by                                   |
+#   |---------------------------|-------------------------------------------|
+#   | `wespeaker_v2.mlmodelc`   | speaker_model_io, fp16 sweep pin          |
+#   | `wespeaker_int8.mlmodelc` | speaker_model_io, fp16 sweep pin          |
+#   | `Segmentation.mlmodelc`   | speaker_model_io, fp16 sweep pin          |
+#   | `Embedding.mlmodelc`      | speaker_model_io                          |
+#   | `FBank.mlmodelc`          | speaker_model_io                          |
+#   | `PLDA.mlmodelc`           | fp16 sweep pin                            |
+#   | `PldaRho.mlmodelc`        | fp16 sweep pin                            |
+#
+# `include = "*.mlmodelc/*"` deliberately also pulls this repo's
+# `pyannote_segmentation.mlmodelc` and `wespeaker.mlmodelc` (35.2 MB that the
+# next table then overwrites). That is not an oversight and not waste to
+# "optimize away" by narrowing the selector: it is the SAME base-then-overlay
+# sequence the dev-time procedure in tests/speaker/model_io.rs documents, so
+# CI builds byte-for-byte the tree a developer builds, and the ordering
+# invariant this file shouts about is a REAL one that a real check can catch
+# rather than a claim that happens to be inert today. Narrow this and the
+# overlay verification stops proving anything about ordering.
+#
+# The selector excludes the ~56 MB nothing reads: `mlpackages/` (uncompiled
+# source packages), `plots/`, the loose `.png` timing charts, `README.md`,
+# `config.json` and `plda-parameters.json`. 72.8 MB is downloaded here, of
+# which the 35.2 MB in those two colliding bundles is replaced immediately by
+# the next table; 37.6 MB of it survives as the seven bundles above.
+#
+# This repo ships NO `CHECKSUMS.sha256`. Its bytes are pinned instead by
+# `int8_wespeaker_matches_fluidinference_pinned_sha256` in
+# tests/speaker/model_io.rs (every file of `wespeaker_v2.mlmodelc`), by the
+# byte-identity gate against `wespeaker_int8.mlmodelc`, and by
+# tests/fp16_guards.rs, which parses every staged `model.mil` and pins its
+# guard sites in BOTH directions — a repair is as much a failure as a new
+# defect. The revision is the one tests/speaker/model_io.rs's provenance
+# section names and every one of those pins was cut against.
+["FluidInference/speaker-diarization-coreml"]
+include  = "*.mlmodelc/*"
+revision = "1ed7a662fdc7109e36d822db793ee6eebdaf8594"
+
+# ===========================================================================
+# speakerkit, layer 2 of 2 — the OVERLAY. **MUST STAY AFTER the table above.**
+# This table wins the two filename collisions, and the whole shipping
+# pipeline's numerical behavior depends on it winning them.
+# ===========================================================================
+#
+# The two artifacts `audio::speaker` actually SHIPS, both issue-#15
+# re-conversions of the same upstream weights with fp16-survivable guards:
+#
+#   | bundle                             | read by                            |
+#   |------------------------------------|------------------------------------|
+#   | `pyannote_segmentation.mlmodelc`   | speaker_parity_seg, speaker_model_io |
+#   | `wespeaker.mlmodelc`               | speaker_parity_embed, speaker_model_io |
+#
+# `include` is a SPACE-SEPARATED pattern list (ci.yml expands it into one
+# `--include` flag per pattern; `hf` 1.19 accepts the flag repeatedly). It has
+# to be a list rather than one glob because the obvious `*.mlmodelc/*` would
+# ALSO drag in this repo's `wespeaker_int8.mlmodelc` — a re-palettization that
+# is NOT adopted (it regresses clip 14's int8 ANE arm from 0.8178 % to
+# 1.4860 % DER) and whose arrival would break both the
+# `wespeaker_v2 == wespeaker_int8` byte-identity gate and that bundle's
+# fp16_guards pin. The int8 sibling must stay FluidInference's, from table 6.
+#
+# `CHECKSUMS.sha256` is in the list on purpose: this repo DOES ship one, and
+# ci.yml verifies every staged file against it. Two cautions for whoever
+# touches that step — the checksum file lists its own name with the sha256 of
+# an EMPTY file, and it also lists the `wespeaker_int8`/`.mlpackage` paths this
+# selector deliberately skips, so a bare `shasum -c CHECKSUMS.sha256` fails in
+# three ways at once. ci.yml therefore verifies the filtered subset covering
+# exactly the two staged bundles, and pins the expected line count so a
+# filter that rots into matching nothing cannot pass vacuously.
+#
+# Total staged from here: 35.2 MB, overwriting the same two bundles from
+# table 6.
+["FinDIT-Studio/speakerkit-coreml"]
+include  = "pyannote_segmentation.mlmodelc/* wespeaker.mlmodelc/* CHECKSUMS.sha256"
+revision = "3db69988bf2de12bab250614d6ac2b03d35132a2"
