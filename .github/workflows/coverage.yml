@@ -1,0 +1,547 @@
+name: coverage
+
+# ONE LEG PER MODEL KIT, PLUS A MODELLESS ONE, and the axis is the whole point.
+#
+# The usual reason to shard a coverage run is the one the reference workflow this
+# is modelled on (al8n/hick's coverage.yml) has: platform `cfg`s. Code behind
+# `cfg(windows)` only COMPILES on Windows, so a Linux host cannot measure it at
+# any price, and merging per-OS reports is the only way the number covers the
+# whole crate.
+#
+# coremlit is macOS-only — objc2 + CoreML, one `runs-on` — so OS is not the axis
+# here. The analogous axis IS present, though, and it is the model kit. Every
+# inference path in `src/audio/{whisper,speaker,ced,vad}` and
+# `src/embeddings/{granite,siglip,clap}` is exercised ONLY by `#[ignore]`d gates
+# that need their kit's `.mlmodelc` staged (MODELS_LOCK, and ci.yml's
+# `model-tests` shards). A run that did not stage a kit's artifacts does not skip
+# that kit's lines — it reports them UNCOVERED, which is a lie of exactly the
+# kind the per-OS split exists to prevent. So the legs below stage one kit each
+# and run that kit's gates WITH `--ignored`, and the merge job unions them.
+#
+# MEASURED, NOT ARGUED. `cargo llvm-cov -p coremlit --features ced`, run twice on
+# the same checkout — once with nothing staged, once with `ced-tiny` staged and
+# the `ced` leg's own `-- --ignored tiny::` plan — and diffed line by line:
+#
+#     121 lines are covered ONLY by the staged run
+#       90  src/audio/ced/mod.rs     (the load -> predict -> aggregate path)
+#       28  src/model/mod.rs         (the shared CoreML Model loader)
+#        3  src/units/mod.rs
+#
+#     src/audio/ced   77.0% -> 92.2% once the two are merged (456 -> 546 of 592)
+#     src/model       59.6% -> 77.6%                          (93 -> 121 of 156)
+#
+# That is ONE kit, and the cheapest one. Note also that the staged leg ALONE
+# reports `audio/ced` at 69.1%, BELOW the modelless run's 77.0% — it runs only
+# the ignored gates, so it misses the hermetic tests. Neither leg's number is the
+# answer; the union is, which is why the merge job exists and why no model leg
+# carries a threshold.
+#
+# Dropping `--ignored` from a model leg would make it an expensive duplicate of
+# the hermetic leg: the artifacts would be downloaded, no gate would select, and
+# the model paths would still read as dead. If a leg ever reports zero gates, the
+# anti-vacuum guard in its gate runner fails it rather than letting it publish a
+# quietly empty report.
+#
+# TOOL: cargo-llvm-cov, and the reference workflow's stated reason for preferring
+# it over cargo-tarpaulin does NOT transfer — hick rejects tarpaulin because its
+# ptrace engine fails to credit coverage executed inside `spawn_detach`'d async
+# tasks. coremlit is synchronous and sans-I/O; it has no async runtime and no
+# detached tasks, so that specific defect has nothing here to under-report. The
+# conclusion holds for two other reasons instead. First, on macOS tarpaulin's
+# default collection method IS llvm instrumentation — the same `-C
+# instrument-coverage` profile data cargo-llvm-cov reads — so it buys no
+# measurement fidelity here, only another layer between the profraw and the
+# report. Second, and decisively for this shape: cargo-llvm-cov's documented
+# `--no-report` / `report` split is what lets ONE leg accumulate many
+# differently-featured, differently-filtered `cargo test` invocations into a
+# single report. A kit's gate plan is exactly that (up to six targets, up to
+# three feature sets, an `--ignored` filter); tarpaulin has no documented
+# accumulate-then-report seam to match it.
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE-*"
+      - "NOTICE"
+  pull_request:
+    paths-ignore:
+      - "**.md"
+      - "LICENSE-*"
+      - "NOTICE"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # THE HARD GATE. hick gates its Linux leg because that leg builds the
+  # platform-agnostic bulk and the per-OS legs' numbers are not comparable to it.
+  # The hermetic leg is coremlit's equivalent, and for the same two reasons.
+  #
+  # It is the bulk: the feature combo below compiles every module, and
+  # everything that is not an inference call is reachable with no artifact at
+  # all — the mel/STFT front-ends, the tokenizer wrappers, the options and
+  # builder types, the AHC/VBx clustering and online matcher, the windowing and
+  # aggregation, the decode heuristics, and the error paths. That is most of the
+  # crate's lines, and it is the part where a regression is a REAL loss of test
+  # coverage rather than an artifact that failed to download.
+  #
+  # And the model legs' numbers are not comparable to it: each runs one kit's
+  # ignored-only gates against a crate built with one feature, so its line
+  # percentage is structurally low (most of the compiled crate is not that kit)
+  # and it moves with download luck and runner placement. Gating any of them on a
+  # number would be gating on the weather. They contribute to the merge and
+  # report their own summary; only this leg says no.
+  coverage-hermetic:
+    name: Coverage (hermetic)
+    runs-on: macos-15
+    # ci.yml's equivalent shards are capped at 45; this leg builds every module
+    # of the crate with `-C instrument-coverage`, which is materially slower.
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      # `build.rs` emits `cfg(models_present)` when `Models/` holds a vendor
+      # directory that is not committed, which UN-ignores the fp16 graph sweep.
+      # This leg's premise is that no such tree exists, and the gate threshold
+      # below was measured under that premise, so a checkout that somehow
+      # arrived with models staged would silently change what this number means.
+      # Assert the premise instead of assuming it. (`vadkit` is committed and so
+      # does not count — see build.rs's `VENDORED`.)
+      - name: Assert this checkout carries no downloaded models
+        run: |
+          set -euo pipefail
+          extra=$(find Models -mindepth 1 -maxdepth 1 -type d ! -name '.*' ! -name vadkit 2>/dev/null || true)
+          if [ -n "$extra" ]; then
+            echo "::error::the hermetic leg found downloaded model trees in Models/, which flips cfg(models_present) and changes what this leg measures: $extra" >&2
+            exit 1
+          fi
+          echo "Models/ holds only the committed vadkit artifact, as this leg requires"
+      # `--no-fail-fast` is cargo-llvm-cov's OWN flag ("Run all tests regardless
+      # of failure"), not something forwarded blind, and it is safe in both
+      # directions: on a green run every test binary executes either way, so the
+      # profraw set — and therefore the number — is identical; on a red run it
+      # still exits non-zero and no report is published as passing. The flag that
+      # WOULD swallow a failing test and report coverage anyway is
+      # `--ignore-run-fail`, and it must never appear in this file.
+      #
+      # `-p coremlit`, not `--workspace`: `coremlit-parity` is a never-published
+      # package of third-party parity oracles (dia/ort DER, textclap, silero
+      # ONNX). Measuring the oracles' own lines would inflate this number with
+      # test-harness code and move the gate for reasons that have nothing to do
+      # with the library. The library is what the owner asked to see.
+      #
+      # THE FEATURE LIST IS ci.yml's "all non-oracle" ROW, VERBATIM (its
+      # `features` matrix, pinned by the `feature_map` golden test), and NOT
+      # `--all-features`. The difference is `align-oracle`, and it is worth
+      # naming because "just use --all-features" is the obvious edit someone
+      # will make. That feature adds no coremlit code — nothing in `src/` is
+      # `#[cfg(feature = "align-oracle")]`; it only switches on `asry/alignment`
+      # in a DEPENDENCY, dragging in `ort` and a bindgen'd whisper.cpp. Its only
+      # coverage contribution is the three hermetic tests in the
+      # `align_parity_words` target, whose module the five other `align_*`
+      # targets already exercise. So `--all-features` would buy a multi-minute
+      # third-party C++ build for approximately zero library lines, on every
+      # cache miss. The measured floor below was taken with THIS list; changing
+      # it means re-measuring.
+      #
+      # The report is generated, summarised and uploaded BEFORE the threshold is
+      # applied, so a leg that trips the gate still publishes the number that
+      # tripped it. A gate that hides the measurement is worse than no gate.
+      #
+      # Same reason for the `--no-report` / `report` split rather than one
+      # `cargo llvm-cov --cobertura` call: a RED run of the single-call form
+      # writes no report at all, so a failing test would cost you the number as
+      # well as the build. Here the report is written either way and the step
+      # STILL exits non-zero on a failing test — which is the whole distinction
+      # from `--ignore-run-fail`, the flag that would report coverage as if the
+      # test had passed, and which appears nowhere in this file.
+      - name: Generate coverage (Cobertura)
+        run: |
+          set -euo pipefail
+          mkdir -p coverage
+          failed=0
+          cargo llvm-cov --no-report --no-fail-fast -p coremlit \
+            --features whisper,align,speaker,vad,clap,granite,siglip,ced,serde,tracing,nl-recognizer \
+            || failed=1
+          cargo llvm-cov report --cobertura --output-path coverage/cobertura.xml
+          if [ "$failed" -ne 0 ]; then
+            echo "::error::the hermetic suite failed. The coverage report above was still written and is uploaded, but this leg is red on the test result, not on the number." >&2
+            exit 1
+          fi
+      - name: Coverage summary
+        if: ${{ !cancelled() }}
+        run: |
+          python3 .github/scripts/coverage_summary.py \
+            --title "Coverage (hermetic)" \
+            --note "Every non-oracle feature, no model artifacts staged. Model-gated tests stay \`#[ignore]\`d here, so the inference paths in \`audio/*\` and \`embeddings/*\` read as uncovered BY DESIGN — the per-kit legs cover them, and the merged summary is the one to read for those modules." \
+            coverage/cobertura.xml
+      - name: Upload coverage artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-hermetic
+          path: coverage/cobertura.xml
+          # Re-running a single leg must replace its report, not collide with
+          # the one the first attempt uploaded.
+          overwrite: true
+      # THE THRESHOLD IS A MEASUREMENT. Running exactly the command above on a
+      # clean checkout of this branch — aarch64-apple-darwin, `Models/` holding
+      # only the committed vadkit artifact, every test green — reported:
+      #
+      #   TOTAL   regions 58.87%   functions 73.02%   LINES 63.96%
+      #                                               (14327 lines, 5163 missed)
+      #
+      # 60 floors that with ~4 points of headroom (≈6% relative). The margin is
+      # for cross-host and dependency-churn drift between that reading and a
+      # macos-15 runner, not slack for rot: 4 points of this crate is ~570 lines,
+      # which is a regression somebody did, not noise. Both directions were
+      # falsified against that profile data — `--fail-under-lines 60` exits 0,
+      # `--fail-under-lines 64` (just above the reading) exits 1 — so this is a
+      # gate that can actually fail, not a vacuous one.
+      #
+      # Raise it when a measured run shows real headroom. Never raise it to a
+      # number no run has produced.
+      #
+      # This is llvm-cov's own line metric, which is what `--fail-under-lines`
+      # compares against. The summary table above is rendered from the Cobertura
+      # export and reports a total a few tenths higher (64.37%, 8989/13965): the
+      # converter's line set is not identical to llvm-cov's. Read the table for
+      # WHICH code is covered and this step for the gate.
+      - name: Enforce the hermetic line-coverage floor
+        if: ${{ !cancelled() }}
+        run: cargo llvm-cov report --fail-under-lines 60
+
+  # ONE LEG PER KIT, mirroring `ci.yml`'s `model-tests` shards. The kits are the
+  # same six, the staged artifacts are the same bytes (same lock, same parser,
+  # same cache key), and the gate plans are the same plans — because a coverage
+  # leg that measured a DIFFERENT set of gates than the job that enforces them
+  # would report on code the repository does not actually gate.
+  #
+  # `gates` is the per-kit plan, one `features|selectors|filter` group per line,
+  # exactly as in ci.yml's `model-tests` matrix: `@all` means the whole package,
+  # `@lib` the in-lib suite, anything else a `--test` target name. Keeping it as
+  # matrix DATA is what lets every leg run an identical step list — there is no
+  # `if: matrix.kit == ...` anywhere below — so one gate runner and one
+  # anti-vacuum guard cover all six instead of six near-copies drifting apart.
+  #
+  # If a plan here ever rots (a target renamed, a gate un-ignored, a filter that
+  # stops matching), the leg does not quietly report a lower number: the
+  # `--list --ignored` count taken THROUGH THE SAME FILTER as the run fails it.
+  # That is the property that matters, because a coverage job has no natural
+  # red — an empty run and a passing run both exit 0.
+  coverage-models:
+    name: Coverage (${{ matrix.kit }})
+    runs-on: macos-15
+    # ci.yml's equivalent shards are capped at 45; these legs do the same
+    # download and then build every group of the gate plan with
+    # `-C instrument-coverage`, which is materially slower.
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # 10.6 MB — the cheapest kit, `ced-tiny` alone. The `tiny::` filter is
+          # not optional: each tests/ced/ target declares its gates four times,
+          # one #[ignore]d module per size, and an ignored-ONLY run selects all
+          # four, of which three have no staged bundle. MODELS_LOCK's `include`
+          # and this filter move together.
+          - kit: ced
+            gates: |
+              ced|ced_model_io ced_parity_logits ced_placement ced_e2e|tiny::
+          # Three groups, and the first is not redundant with the second: the
+          # empty-feature group is the bare-core model suite (`tiny_model`),
+          # which lives outside `--features whisper`. The `whisper,vad` group is
+          # the Silero-driven long-form chunking composition; it needs
+          # whisper-tiny, which is why it is here and not with the other VAD
+          # gates in ci.yml's modelless `check` job.
+          - kit: whisper
+            gates: |
+              |@all
+              whisper|@all
+              whisper,vad|whisper_vad_source
+          # Two MODELS_LOCK tables into ONE directory, base then overlay. Which
+          # bytes land is decided by lock order and PROVEN by ci.yml's overlay
+          # step, which hashes both graphs; this leg deliberately does not
+          # re-verify that (see the note on checksums below) — it consumes the
+          # same cache entry ci.yml's speaker shard verified on the same commit.
+          - kit: speaker
+            gates: |
+              speaker|speaker_model_io speaker_parity_seg speaker_parity_embed
+          # `@lib` is load-bearing here: the granite tokenizer is a 24 MB sidecar
+          # the artifact ships rather than something `include_bytes!`d, so the
+          # in-lib tokenizer/chunking gates are model gates like the rest and
+          # their lines are unreachable without this leg.
+          - kit: granite
+            gates: |
+              granite|granite_model_io granite_parity_embed granite_placement granite_embed_long granite_tokenizer_identity @lib
+          # `clap_tokenizer_identity` is deliberately absent: the Xenova
+          # tokenizer IS embedded in the crate, so that suite is hermetic, lists
+          # ZERO ignored tests, and would (correctly) trip the anti-vacuum guard.
+          # Its lines are covered by the hermetic leg.
+          - kit: clap
+            gates: |
+              clap|clap_model_io clap_text_model_io clap_placement clap_e2e
+          # `siglip_preprocess` is absent for a different reason: its one model
+          # gate reads `<SIGLIP_TEST_MODELS>/fixtures/preprocess/*.npy`, a
+          # locally-generated torch dump the artifact repo does not publish, so
+          # no staged tree can satisfy it.
+          - kit: siglip
+            gates: |
+              siglip|siglip_tokenizer_identity siglip_model_io siglip_text_model_io siglip_parity_embed siglip_placement siglip_e2e
+    # Every kit's test-model override, set for every leg — the same block
+    # ci.yml's `model-tests` sets, and for the same reason: each resolves to the
+    # path the suite's `common/mod.rs` already falls back to, so nothing changes
+    # behaviourally, but the gates NAME the directory this job staged instead of
+    # depending silently on a workspace-relative fallback. A leg that stages none
+    # of a given tree simply never runs the suite that reads its variable.
+    env:
+      WHISPERKIT_TEST_MODELS: ${{ github.workspace }}/Models
+      CED_TEST_MODELS: ${{ github.workspace }}/Models/ced
+      EMBEDKIT_TEST_MODELS: ${{ github.workspace }}/Models/embedkit-granite
+      SPEAKERKIT_TEST_MODELS: ${{ github.workspace }}/Models/speakerkit
+      CLAPKIT_TEST_MODELS: ${{ github.workspace }}/Models/clapkit
+      SIGLIP_TEST_MODELS: ${{ github.workspace }}/Models/siglip2-naflex
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      # Resolve the kit's `local-dir`s from MODELS_LOCK BEFORE the cache step, so
+      # `actions/cache`'s `path:` is derived from the lock rather than being a
+      # second hand-maintained per-kit copy in this matrix. This also runs the
+      # lock tripwires on the cache-hit path, where no download happens.
+      - name: Resolve staged directories from MODELS_LOCK
+        id: plan
+        uses: ./.github/actions/stage-models
+        with:
+          kit: ${{ matrix.kit }}
+          mode: resolve
+      # The SAME cache key as ci.yml's `model-tests` shard for this kit, on
+      # purpose: both jobs stage the same bytes from the same lock on the same
+      # commit, so sharing the entry halves the download bill instead of paying
+      # up to 1.8 GB twice per PR. Whichever job runs first populates it. The two
+      # `path:` lists differ slightly in width — this one is the lock's
+      # `local-dir` (so it also carries `hf`'s `.cache/huggingface/` bookkeeping)
+      # and ci.yml's is the bundle directory inside it — which is harmless in
+      # both directions: a restore replays whatever was archived, and both trees
+      # satisfy both jobs' probes. `build.rs` and the fp16 sweep skip
+      # dot-directories, so the bookkeeping tree is inert.
+      - name: Restore model cache
+        id: models
+        uses: actions/cache@v4
+        with:
+          path: ${{ steps.plan.outputs.local-dirs }}
+          key: models-${{ matrix.kit }}-${{ hashFiles('MODELS_LOCK') }}
+      # `verify` on a cache hit is not a formality: a half-restored or truncated
+      # entry looks exactly like a successful download from here, and must fail
+      # in this step — where the cause is one line — rather than an hour later as
+      # a wall of model-load failures inside the gates.
+      #
+      # This leg does NOT re-verify artifact CHECKSUMS. ci.yml's `model-tests`
+      # shard for the same kit does that on the same commit, against the same
+      # cache entry, and its checksum machinery needs per-kit filter/line-count
+      # data that copying here would duplicate for no new signal. Coverage is a
+      # measurement job; artifact integrity is that job's.
+      - name: Stage this kit's models
+        uses: ./.github/actions/stage-models
+        with:
+          kit: ${{ matrix.kit }}
+          mode: ${{ steps.models.outputs.cache-hit == 'true' && 'verify' || 'download' }}
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      # The gate plan, run under coverage. `--no-report` accumulates profraw
+      # across every group; `report` at the end merges them into one Cobertura —
+      # the documented cargo-llvm-cov flow for coverages generated under
+      # different test conditions, which is exactly what a multi-feature gate
+      # plan is.
+      #
+      # The anti-vacuum `--list` count goes through `cargo llvm-cov` too, not
+      # plain `cargo test`. That is not cosmetic: cargo-llvm-cov builds with
+      # `-C instrument-coverage`, so a bare `cargo test --list` would have a
+      # different fingerprint and rebuild the entire dependency graph a second
+      # time, doubling a leg that already downloads up to 748 MB.
+      #
+      # The report is generated BEFORE a failed gate is reported, so a red gate
+      # still publishes the coverage it produced. What must never happen is the
+      # reverse — a failing test swallowed and the coverage reported as if it
+      # passed — which is what `--ignore-run-fail` would do, and why that flag
+      # appears nowhere in this file.
+      - name: Run this kit's gates under coverage
+        env:
+          KIT: ${{ matrix.kit }}
+          GATES: ${{ matrix.gates }}
+        run: |
+          set -euo pipefail
+          mkdir -p coverage
+          cargo llvm-cov clean --workspace
+          failed=""
+          groups=0
+          while IFS='|' read -r features selectors_line filter; do
+            [ -n "${selectors_line:-}" ] || continue
+            groups=$((groups + 1))
+            for selector in $selectors_line; do
+              case "$selector" in
+                @all) target=() ;;
+                @lib) target=(--lib) ;;
+                *)    target=(--test "$selector") ;;
+              esac
+              # An ignored-only run over a target whose gates were deleted,
+              # renamed, un-ignored, or that failed to BUILD runs 0 tests and
+              # exits 0 — and a coverage job would then publish a quietly
+              # smaller number instead of going red. Count through the SAME
+              # filter as the run: counting an unfiltered list would let a
+              # deleted `tiny::` module still report the other three sizes'
+              # gates and then run none.
+              listed=$(cargo llvm-cov --no-report -p coremlit --features "$features" \
+                         ${target[@]+"${target[@]}"} -- --list --ignored ${filter:+"$filter"} \
+                         2>/dev/null </dev/null | grep -c ': test$' || true)
+              if [ "$listed" -eq 0 ]; then
+                echo "::error::$KIT gate '$selector' (features \"$features\"${filter:+, filter $filter}) lists 0 ignored tests — it failed to build, or its model gates were deleted, renamed, or un-ignored, so this leg would report coverage for a run that executed nothing" >&2
+                exit 1
+              fi
+              echo "== $KIT :: $selector (features \"$features\"): $listed model gate(s) =="
+              cargo llvm-cov --no-report --no-fail-fast -p coremlit --features "$features" \
+                ${target[@]+"${target[@]}"} -- --ignored ${filter:+"$filter"} </dev/null \
+                || failed="$failed $selector"
+            done
+          done <<< "$GATES"
+          if [ "$groups" -eq 0 ]; then
+            echo "::error::the '$KIT' matrix row carries an empty gate plan, so this leg would upload an empty report" >&2
+            exit 1
+          fi
+          cargo llvm-cov report --cobertura --output-path coverage/cobertura.xml
+          if [ -n "$failed" ]; then
+            echo "::error::$KIT gates failed:$failed (the coverage report above was still written, and is uploaded, but this leg is red)" >&2
+            exit 1
+          fi
+      - name: Coverage summary
+        if: ${{ !cancelled() }}
+        run: |
+          python3 .github/scripts/coverage_summary.py \
+            --title "Coverage (${{ matrix.kit }})" \
+            --note "Ignored-only model gates for the \`${{ matrix.kit }}\` kit. This leg builds the crate with one kit's feature and runs only that kit's gates, so its TOTAL is structurally low and is not comparable to the hermetic leg's — read the per-module rows for \`${{ matrix.kit }}\`, and the merged summary for the crate." \
+            coverage/cobertura.xml
+      - name: Upload coverage artifact
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ matrix.kit }}
+          path: coverage/cobertura.xml
+          # `warn`, not `error`: this step also runs after a red gate step, which
+          # can fail before `report` writes anything. The merge job's own
+          # "no leg produced a report" check is where that becomes an error.
+          if-no-files-found: warn
+          overwrite: true
+
+  # The drift tripwire for the ONE piece of machinery this workflow shares with
+  # ci.yml: the MODELS_LOCK parser.
+  #
+  # coverage needs the same per-kit staging ci.yml's `model-tests` performs.
+  # Copy-pasting that job's inline parser into this file would have recreated
+  # exactly the coupling the kit-tag rework removed — two hand-written parsers
+  # over one lock, free to drift, with nothing failing when they do. So the
+  # parser moved into `.github/actions/stage-models` and this workflow calls it.
+  # ci.yml could not be migrated in the same change (that job was under review),
+  # so for one release the two coexist, and this job is what makes the
+  # coexistence checkable rather than hopeful: it EXECUTES ci.yml's own download
+  # script with `hf` stubbed out and diffs the argv it would issue against the
+  # shared action's, per kit. There is no third re-implementation to keep in
+  # step — the thing under test is ci.yml's real code.
+  #
+  # Its own success message tells you when to delete it: once ci.yml issues no
+  # `hf download` of its own, there is no second parser left and the script says
+  # so. `ubuntu-latest` because nothing here is macOS-specific and nothing is
+  # downloaded.
+  lock-parser-parity:
+    name: MODELS_LOCK parser parity
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Ensure PyYAML
+        run: python3 -c 'import yaml' || pip install --quiet pyyaml
+      - name: Diff ci.yml's download plan against the shared action's
+        run: .github/actions/stage-models/plan_parity.sh
+
+  # Merge every leg's report into one readable answer to "which code do the tests
+  # actually reach".
+  #
+  # `always() && !cancelled()` with `download-artifact` is the reference
+  # workflow's shape and it is the right one: a leg that failed, was skipped, or
+  # timed out drops ITS data from the merge rather than killing the whole signal.
+  # A kit whose 748 MB download 502s should cost you that kit's rows, not the
+  # crate's number.
+  #
+  # THE NUMBER IS READABLE WITH NO SECRETS. This repository is public and has
+  # none configured, so there is no `CODECOV_TOKEN`; a workflow whose coverage
+  # signal depended on one would report nothing at all here. The primary output
+  # is therefore the job summary below — a per-module and per-file table written
+  # straight into the run page — plus the per-leg Cobertura artifacts. codecov is
+  # wired as a strictly additive extra that degrades to a no-op when the token is
+  # absent.
+  merge:
+    name: Merged coverage
+    needs: [coverage-hermetic, coverage-models]
+    if: ${{ always() && !cancelled() }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Download every leg's report
+        uses: actions/download-artifact@v4
+        with:
+          pattern: coverage-*
+          path: reports/
+      - name: List downloaded reports
+        run: ls -aR reports || true
+      # The merge is a per-file UNION of covered LINES, not a sum of hit counts:
+      # a line in `src/audio/ced` is unreachable in the hermetic leg and covered
+      # in the `ced` leg, and must count once as covered. Summing counts would
+      # double-count every line both legs execute.
+      - name: Merged coverage summary
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          reports=(reports/*/cobertura.xml)
+          if [ "${#reports[@]}" -eq 0 ]; then
+            echo "::error::no leg produced a Cobertura report. That is a real signal, not a missing artifact — every leg failed before it could generate one." >&2
+            exit 1
+          fi
+          echo "merging ${#reports[@]} report(s): ${reports[*]}"
+          python3 .github/scripts/coverage_summary.py \
+            --title "Merged coverage (hermetic + every staged kit)" \
+            --note "Union of the covered lines of every leg that produced a report. A leg that failed or was skipped is absent from this table and its kit's rows will read low — check the leg list above before reading a drop as a regression." \
+            --files "${reports[@]}" | tee merged-coverage.md > /dev/null
+          echo "wrote merged-coverage.md ($(wc -l < merged-coverage.md) lines)"
+      - name: Upload the merged summary
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: merged-coverage-summary
+          path: merged-coverage.md
+          if-no-files-found: warn
+          overwrite: true
+      # ADDITIVE ONLY. `secrets.CODECOV_TOKEN` is an empty string in a repository
+      # that has no such secret — which this one is — so this step must not be
+      # able to fail the job, and the number must not be reachable only through
+      # it. `continue-on-error` plus `fail_ci_if_error: false` gives the first;
+      # the summary above gives the second. If a token is ever configured, this
+      # step starts working with no other edit.
+      - name: Upload to codecov.io (optional, no token required to read the number)
+        continue-on-error: true
+        uses: codecov/codecov-action@v5
+        with:
+          directory: reports
+          fail_ci_if_error: false
+          slug: ${{ github.repository }}
+        env:
+          CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}

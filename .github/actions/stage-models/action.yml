@@ -1,0 +1,48 @@
+name: Stage MODELS_LOCK models
+description: >-
+  Download (or verify, or merely resolve) the MODELS_LOCK tables belonging to one
+  model kit. The single MODELS_LOCK parser — see stage.sh's header for why it is
+  an action rather than a second copy of ci.yml's inline block.
+
+inputs:
+  kit:
+    description: >-
+      The model kit to stage. Selects the MODELS_LOCK tables whose `kit` field
+      matches, in lock order (which is load-bearing for a kit that stages layers
+      into one directory — see MODELS_LOCK's ORDER box).
+    required: true
+  mode:
+    description: >-
+      download | verify | resolve | plan. `download` fetches and then verifies;
+      `verify` only checks the staged tree (the cache-hit path); `resolve` emits
+      `local-dirs` and nothing else (call it BEFORE actions/cache so the cache
+      path list comes from the lock); `plan` prints the hf argv it would run.
+    required: false
+    default: download
+  lock:
+    description: Path to the lock file, relative to the workspace.
+    required: false
+    default: MODELS_LOCK
+
+outputs:
+  local-dirs:
+    description: >-
+      Newline-separated `local-dir` values this kit stages into, deduplicated, in
+      lock order. Feed straight to actions/cache's `path:` so no workflow matrix
+      has to carry a second hand-maintained copy of them.
+    value: ${{ steps.stage.outputs.local-dirs }}
+
+runs:
+  using: composite
+  steps:
+    - id: stage
+      shell: bash
+      env:
+        KIT: ${{ inputs.kit }}
+        MODE: ${{ inputs.mode }}
+        LOCK: ${{ inputs.lock }}
+      # Inputs go through `env` rather than `${{ }}` interpolation into the
+      # script body: an interpolated input is spliced into the shell source
+      # before bash ever sees it, so a value containing a quote would change the
+      # command rather than be one.
+      run: '"$GITHUB_ACTION_PATH/stage.sh" --kit "$KIT" --mode "$MODE" --lock "$LOCK"'
