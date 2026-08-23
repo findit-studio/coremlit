@@ -135,6 +135,7 @@ jobs:
             Models/embedkit-granite/granite-97m-multilingual-r2
             Models/siglip2-naflex/siglip2-base-patch16-naflex-512
             Models/ced/ced-tiny
+            Models/speakerkit
           key: models-${{ hashFiles('MODELS_LOCK') }}
       - name: Download models (cache miss)
         id: download
@@ -143,16 +144,27 @@ jobs:
           set -euo pipefail
 
           # MODELS_LOCK is the source of truth for what gets downloaded, not
-          # just a cache-busting key: it has a fixed five-table shape (the
+          # just a cache-busting key: it has a fixed seven-table shape (the
           # whisperkit-coreml model repo, selector field `include`; the
           # tokenizer repo, selector field `files`; the embedkit-coreml granite
           # repo, selector field `include`; the siglip2-naflex-coreml tokenizer
           # sidecar, selector field `include`; the cedkit-coreml `ced-tiny`
-          # bundle, selector field `include`), each with its own `revision`.
-          # Pull repo/selector/revision out by hand instead of hardcoding them
-          # here, so a MODELS_LOCK edit is what changes what this job downloads
-          # — no TOML crate needed for five fixed tables. Tables are selected by
-          # INDEX, so appending is safe but reordering MODELS_LOCK is not.
+          # bundle, selector field `include`; the speakerkit BASE layer,
+          # selector field `include`; the speakerkit OVERLAY, selector field
+          # `include`, a SPACE-SEPARATED pattern list), each with its own
+          # `revision`. Pull repo/selector/revision out by hand instead of
+          # hardcoding them here, so a MODELS_LOCK edit is what changes what
+          # this job downloads — no TOML crate needed for seven fixed tables.
+          # Tables are selected by INDEX, so appending is safe but reordering
+          # MODELS_LOCK is not.
+          #
+          # For tables 6 and 7 the index is more than a parser detail: both
+          # land in Models/speakerkit/ and both publish
+          # `pyannote_segmentation.mlmodelc` and `wespeaker.mlmodelc`, so the
+          # LAST one downloaded decides which bytes the shipping pipeline gets.
+          # 6 is the base layer, 7 is the fp16-guard-repaired overlay that must
+          # win. See the ORDER box in MODELS_LOCK's header, and the
+          # "Verify speakerkit overlay" step below, which proves the winner.
           lock=MODELS_LOCK
 
           table_header() { # Nth `["..."]` header line, unquoted.
@@ -187,6 +199,33 @@ jobs:
           ced_repo=$(table_header 5)
           ced_include=$(table_field 5 include)
           ced_revision=$(table_field 5 revision)
+          # 6 = the speakerkit BASE layer, 7 = the OVERLAY. Downloaded in THAT
+          # order below; see MODELS_LOCK's header.
+          speakerkit_base_repo=$(table_header 6)
+          speakerkit_base_include=$(table_field 6 include)
+          speakerkit_base_revision=$(table_field 6 revision)
+          speakerkit_overlay_repo=$(table_header 7)
+          speakerkit_overlay_include=$(table_field 7 include)
+          speakerkit_overlay_revision=$(table_field 7 revision)
+          # The overlay selector is a SPACE-SEPARATED pattern list, expanded to
+          # one `--include` flag per pattern (`hf` 1.19 accepts the flag
+          # repeatedly; verified against 1.19.0). A single glob cannot express
+          # it: `*.mlmodelc/*` would also drag in that repo's NOT-adopted
+          # `wespeaker_int8` re-conversion over the base-layer bytes the
+          # byte-identity gate and the fp16_guards pin are cut against. See
+          # MODELS_LOCK's table 7.
+          #
+          # `pipx install` above pins no version, so a future `hf` COULD stop
+          # accepting the repeated flag. That direction is fail-closed either
+          # way: an unknown-option error fails here, and a last-flag-wins
+          # regression would stage only `CHECKSUMS.sha256`, leaving the base
+          # layer's pre-repair graphs in place — which the overlay check below
+          # refuses by hash.
+          read -ra speakerkit_overlay_patterns <<< "$speakerkit_overlay_include"
+          speakerkit_overlay_flags=()
+          for pattern in "${speakerkit_overlay_patterns[@]}"; do
+            speakerkit_overlay_flags+=(--include "$pattern")
+          done
 
           # Index-selected tables mean an APPENDED table this parser does not
           # know about is silently ignored — MODELS_LOCK would say CI downloads
@@ -195,8 +234,8 @@ jobs:
           # it. Pin the count so teaching the lock a new table forces teaching
           # the parser too.
           table_count=$(sed -n 's/^\["\(.*\)"\]$/\1/p' "$lock" | grep -c . || true)
-          if [ "$table_count" -ne 5 ]; then
-            echo "::error::MODELS_LOCK has $table_count tables but this parser handles exactly 5 — a table was added or removed without updating the download step, so it would be silently ignored" >&2
+          if [ "$table_count" -ne 7 ]; then
+            echo "::error::MODELS_LOCK has $table_count tables but this parser handles exactly 7 — a table was added or removed without updating the download step, so it would be silently ignored" >&2
             exit 1
           fi
 
@@ -205,6 +244,8 @@ jobs:
           echo "MODELS_LOCK: granite=$granite_repo@$granite_revision include=$granite_include"
           echo "MODELS_LOCK: siglip=$siglip_repo@$siglip_revision include=$siglip_include"
           echo "MODELS_LOCK: ced=$ced_repo@$ced_revision include=$ced_include"
+          echo "MODELS_LOCK: speakerkit-base=$speakerkit_base_repo@$speakerkit_base_revision include=$speakerkit_base_include"
+          echo "MODELS_LOCK: speakerkit-overlay=$speakerkit_overlay_repo@$speakerkit_overlay_revision include=$speakerkit_overlay_include"
 
           # Fail LOUD on any empty extraction: `hf download repo` with no
           # selector silently fetches the WHOLE repository, so a future
@@ -213,12 +254,22 @@ jobs:
           for v in model_repo model_include model_revision tokenizer_repo tokenizer_files tokenizer_revision \
                    granite_repo granite_include granite_revision \
                    siglip_repo siglip_include siglip_revision \
-                   ced_repo ced_include ced_revision; do
+                   ced_repo ced_include ced_revision \
+                   speakerkit_base_repo speakerkit_base_include speakerkit_base_revision \
+                   speakerkit_overlay_repo speakerkit_overlay_include speakerkit_overlay_revision; do
             if [ -z "${!v}" ]; then
               echo "::error::MODELS_LOCK parse produced empty '$v' — format drift? fix the lock or the parser" >&2
               exit 1
             fi
           done
+          # The overlay's expansion is checked separately: the emptiness loop
+          # above sees the RAW string, not the flag array actually passed to
+          # `hf`, so a value that is non-empty but expands to no pattern would
+          # slip through and fetch the WHOLE repository.
+          if [ "${#speakerkit_overlay_flags[@]}" -eq 0 ]; then
+            echo "::error::MODELS_LOCK's speakerkit overlay include ($speakerkit_overlay_include) expanded to no --include pattern; hf would fetch the whole repository" >&2
+            exit 1
+          fi
 
           pipx install "huggingface_hub[cli]"
           hf download "$model_repo" --include "$model_include" --revision "$model_revision" \
@@ -253,6 +304,28 @@ jobs:
           # — the layout tests/ced/common/mod.rs resolves without CED_TEST_MODELS.
           hf download "$ced_repo" --include "$ced_include" --revision "$ced_revision" \
             --local-dir Models/ced
+          # ---------------------------------------------------------------
+          # speakerkit, in TWO layers into ONE directory. THE ORDER OF THESE
+          # TWO COMMANDS IS A CORRECTNESS INVARIANT, not a style choice.
+          #
+          # Both repos publish `pyannote_segmentation.mlmodelc` and
+          # `wespeaker.mlmodelc`, and the second download overwrites the first.
+          # The BASE layer goes first; the OVERLAY — the two issue-#15
+          # re-conversions whose fp16 guards actually survive the ANE — goes
+          # last and wins. Reverse them and CI stages contract-identical
+          # PRE-REPAIR graphs that pass every load/shape test while saturating
+          # `segments` to -45440 on the default placement. The order comes from
+          # MODELS_LOCK's table order (6 then 7), so it is reviewable in the
+          # lock file rather than buried here, and the very next step re-hashes
+          # both graphs to prove which bytes actually landed.
+          #
+          # `--local-dir Models/speakerkit` is the directory
+          # tests/speaker/common/mod.rs resolves without SPEAKERKIT_TEST_MODELS
+          # (the gate step below sets it anyway, explicitly).
+          hf download "$speakerkit_base_repo" --include "$speakerkit_base_include" \
+            --revision "$speakerkit_base_revision" --local-dir Models/speakerkit
+          hf download "$speakerkit_overlay_repo" "${speakerkit_overlay_flags[@]}" \
+            --revision "$speakerkit_overlay_revision" --local-dir Models/speakerkit
       # EVERY step below carries
       # `if: ${{ !cancelled() && steps.download.outcome != 'failure' }}`, and
       # that is not boilerplate — it is the fix for a failure mode this job
@@ -319,26 +392,121 @@ jobs:
           fi
           cd "$bundle"
           shasum -a 256 -c ../CHECKSUMS.sha256
+      # The speakerkit tree is staged in TWO layers into ONE directory (see the
+      # download step and MODELS_LOCK's ORDER box), so it needs one check the
+      # single-source granite and CED trees do not: proof of WHICH layer won the
+      # two filename collisions. That proof comes first, before the byte-level
+      # checksum verification, because a wrong overlay order is a specific,
+      # nameable mistake and must be reported as itself rather than as anonymous
+      # hash drift 100 MB and one full build later.
+      - name: Verify speakerkit overlay and artifact checksums
+        id: speakerkit_checksums
+        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
+        run: |
+          set -euo pipefail
+          root=Models/speakerkit
+          if [ ! -d "$root" ]; then
+            echo "::error::$root is absent after download/cache-restore — the speaker model gates would have nothing to run against" >&2
+            exit 1
+          fi
+
+          # 1. DID THE OVERLAY LAND? The two graphs the pipeline SHIPS must be
+          # the fp16-guard-repaired re-conversions, not the base layer's
+          # pre-repair originals. Those originals are contract-identical —
+          # same filenames, same feature names, shapes and dtypes — so they
+          # load, they run, and they pass every structural gate while
+          # `segments` saturates to -45440 on the default ComputeUnits::All
+          # placement (issue #15). Only the bytes tell them apart.
+          #
+          # The two sha256s below are the `model.mil` pins from
+          # crates/coremlit/tests/speaker/model_io.rs
+          # (`fp16_safe_segmentation_matches_pinned_sha256` and
+          # `fp16_safe_wespeaker_fp32_matches_pinned_sha256`). They are copied
+          # here deliberately, so this check is INDEPENDENT of the gate that
+          # runs much later; the hermetic test
+          # `ci_stages_the_speakerkit_overlay_last_and_proves_it_won` in
+          # tests/whisper/models_lock.rs keeps the two copies from drifting.
+          overlay_bad=""
+          for pin in \
+            "pyannote_segmentation.mlmodelc:ded0d1ee11d77976b5c706ce667d0c8cb49977d3fe4367cccbd7b582bdb86dec" \
+            "wespeaker.mlmodelc:cff0cfe914078e9336754a9b38a68c2cdd88ca7b6bf97568ad551ab03ae1b666"; do
+            bundle="${pin%%:*}"
+            expected="${pin##*:}"
+            mil="$root/$bundle/model.mil"
+            if [ ! -f "$mil" ]; then
+              echo "::error::$mil is absent — the speakerkit overlay download did not land its shipping graphs" >&2
+              exit 1
+            fi
+            actual=$(shasum -a 256 "$mil" | cut -d' ' -f1)
+            echo "== $bundle/model.mil: $actual =="
+            if [ "$actual" != "$expected" ]; then
+              overlay_bad="$overlay_bad $bundle(got=$actual want=$expected)"
+            fi
+          done
+          if [ -n "$overlay_bad" ]; then
+            echo "::error::speakerkit OVERLAY DID NOT WIN:$overlay_bad — the shipping graphs are not the fp16-guard-repaired re-conversions MODELS_LOCK's last speakerkit table pins. The overwhelmingly likely cause is download ORDER: both speakerkit tables land in Models/speakerkit/ and publish these same filenames, so the LAST one downloaded wins, and the base layer must not be last. Check MODELS_LOCK's table order (base then overlay) and the order of the two hf download commands in the step above. If the bytes changed deliberately, re-baseline tests/speaker/model_io.rs's pins and these two together." >&2
+            exit 1
+          fi
+
+          # 2. Byte-level verification of every staged file from the overlay
+          # repo, against the `CHECKSUMS.sha256` it ships — the granite/CED
+          # contract, on every run rather than only on cache misses, so a
+          # truncated download and a tampered or partially-restored cache entry
+          # both fail here. The BASE layer's repo ships no checksum file
+          # (MODELS_LOCK says so); its bytes are covered by the per-file pins in
+          # tests/speaker/model_io.rs and by the fp16 graph sweep below.
+          #
+          # The checksum file cannot be fed to `shasum -c` whole. It lists its
+          # OWN name with the sha256 of an empty file, and it lists the
+          # `wespeaker_int8` and `.mlpackage` paths MODELS_LOCK's overlay
+          # selector deliberately does not stage. So verify the filtered subset
+          # covering exactly the two staged bundles — and pin the line count,
+          # because a filter that rots into matching nothing would otherwise
+          # "verify" an empty set. (`shasum -c` is itself fail-closed on a
+          # missing file, a hash mismatch, and a file with no valid lines; the
+          # count guard is what makes the FILTER non-vacuous.)
+          cd "$root"
+          filtered=$(mktemp)
+          grep -E '^[0-9a-f]{64}  \./(pyannote_segmentation|wespeaker)\.mlmodelc/' CHECKSUMS.sha256 > "$filtered" || true
+          filtered_lines=$(grep -c . "$filtered" || true)
+          if [ "$filtered_lines" -ne 10 ]; then
+            echo "::error::expected 10 CHECKSUMS.sha256 lines covering the two staged speakerkit bundles, found $filtered_lines — the overlay repo's file list changed at the pinned revision, or the filter no longer matches it" >&2
+            exit 1
+          fi
+          echo "== verifying $filtered_lines checksummed files =="
+          shasum -a 256 -c "$filtered"
       # build.rs UN-ignores the fp16 graph sweep
       # (`every_shipped_model_graph_survives_fp16`) when Models/ is present, so
       # the `-- --ignored` (ignored-ONLY) runs below EXCLUDE it exactly when the
       # models are here — and the modelless `check` job skips it too (ignored
       # there). Run the coremlit sweep binary's ordinary suite here so a newly
       # vanishing fp16 guard cannot merge green. This runner downloads WHISPER,
-      # GRANITE and CED-TINY (per MODELS_LOCK), so COREMLIT_FP16_SWEEP_VENDORS
-      # narrows the vendor manifest to exactly the vendors staged here
-      # (fail-closed: unset would demand EVERY pinned vendor), plus `vadkit`,
-      # which needs no download — it is committed, so requiring it here makes
-      # DELETING the vendored model a hard CI failure rather than a silent drop
-      # of the sweep's second clean control. Naming them ALL is what makes a
-      # vanished vendor tree a failure instead of a quiet drop in coverage; the
-      # absent speakerkit/alignkit/argmax vendors stay the documented escape.
-      # `ced` is a THIRD clean control: the sweep walks Models/ whole, so the
-      # staged CED graph is audited either way — naming it in the manifest is
-      # what turns "the CED download vanished" into a failure instead of a
-      # silent loss of that coverage. `siglip2-naflex` is deliberately NOT here:
-      # MODELS_LOCK stages its tokenizer sidecar alone, so that vendor tree
-      # holds no `.mlmodelc` for the sweep to audit.
+      # GRANITE, CED-TINY and SPEAKERKIT (per MODELS_LOCK), so
+      # COREMLIT_FP16_SWEEP_VENDORS narrows the vendor manifest to exactly the
+      # vendors staged here (fail-closed: unset would demand EVERY pinned
+      # vendor), plus `vadkit`, which needs no download — it is committed, so
+      # requiring it here makes DELETING the vendored model a hard CI failure
+      # rather than a silent drop of the sweep's second clean control. Naming
+      # them ALL is what makes a vanished vendor tree a failure instead of a
+      # quiet drop in coverage; the absent alignkit/argmax vendors stay the
+      # documented escape. `ced` is a THIRD clean control: the sweep walks
+      # Models/ whole, so the staged CED graph is audited either way — naming
+      # it in the manifest is what turns "the CED download vanished" into a
+      # failure instead of a silent loss of that coverage.
+      #
+      # `speakerkit` is different in kind from the other four, and that is why
+      # adding it is worth more than one more clean control: it is the first
+      # vendor named here that carries PINNED DEFECTS. FIVE of the sweep's ten
+      # KNOWN_DEFECTS entries live under it (Segmentation, wespeaker_v2,
+      # wespeaker_int8, PLDA, PldaRho), so half the defect roster moves from
+      # local/dev-only verification to every PR — pinned in BOTH directions, so
+      # an unannounced re-conversion that REPAIRS one of them is as loud as a
+      # new defect would be. The sweep also reaches the two shipping graphs,
+      # which have no pin precisely because issue #15 repaired them, making it a
+      # second, independent witness that the overlay step above staged the right
+      # bytes. `siglip2-naflex` is deliberately NOT here: MODELS_LOCK stages its
+      # tokenizer sidecar alone, so that vendor tree holds no `.mlmodelc` for
+      # the sweep to audit.
       # fp16_guards is a core test — no feature needed. See the
       # coverage-boundary note in crates/coremlit/tests/fp16_guards.rs.
       #
@@ -349,7 +517,7 @@ jobs:
       - name: fp16 graph sweep
         id: fp16_guards
         if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
-        run: COREMLIT_FP16_SWEEP_VENDORS=whisperkit-coreml,embedkit-granite,vadkit,ced cargo test -p coremlit --test fp16_guards
+        run: COREMLIT_FP16_SWEEP_VENDORS=whisperkit-coreml,embedkit-granite,vadkit,ced,speakerkit cargo test -p coremlit --test fp16_guards
       - name: fp16 sweep inventory
         id: fp16_inventory
         if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
@@ -521,6 +689,62 @@ jobs:
             echo "::error::CED tiny gates failed:$failed" >&2
             exit 1
           fi
+      # The speaker (diarization) model gates, now that MODELS_LOCK stages the
+      # speakerkit artifact set. Three targets, and the set is deliberately
+      # smaller than `tests/speaker/` holds:
+      #
+      #   - `speaker_model_io` introspects every staged bundle and byte-pins the
+      #     three that carry a provenance decision;
+      #   - `speaker_parity_seg` / `speaker_parity_embed` run the two shipping
+      #     graphs against committed goldens and fixtures.
+      #
+      # `speaker_parity_diarize_wiring` is NOT here and cannot be: its fixtures
+      # live in the SIBLING `diarization` repository
+      # (`../../../diarization/tests/parity/fixtures/`, overridable via
+      # DIA_PARITY_FIXTURES), which no runner has at any staging size. It stays a
+      # local/dev gate.
+      #
+      # The three argmax targets (`speaker_argmax_model_io`,
+      # `speaker_parity_argmax_accuracy`, `speaker_parity_argmax_swift`) are NOT
+      # here for a different and firmer reason: the argmax artifact repo declares
+      # NO license on Hugging Face, so undeclared-means-all-rights-reserved
+      # applies to those converted graphs and this repository does not fetch them
+      # in CI at all. NOTICE records that; adding an ARGMAX_TEST_MODELS download
+      # here would quietly reverse a licensing decision, not just widen coverage.
+      #
+      # SPEAKERKIT_TEST_MODELS is set explicitly even though the default resolves
+      # to the same path: the gates then name the directory this job staged,
+      # rather than silently depending on the workspace-relative fallback.
+      #
+      # Same two vacuum holes as the granite/siglip/CED steps, closed the same
+      # way, and the same failure-collecting loop: a red target costs its own
+      # verdict, not the two after it.
+      - name: Speaker model gates
+        id: speaker_gates
+        if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
+        env:
+          SPEAKERKIT_TEST_MODELS: ${{ github.workspace }}/Models/speakerkit
+        run: |
+          set -euo pipefail
+          seg=Models/speakerkit/pyannote_segmentation.mlmodelc
+          if [ ! -d "$seg" ]; then
+            echo "::error::speakerkit bundle $seg is absent — the model gates below must FAIL here, never skip" >&2
+            exit 1
+          fi
+          failed=""
+          for target in speaker_model_io speaker_parity_seg speaker_parity_embed; do
+            listed=$(cargo test -p coremlit --features speaker --test "$target" -- --list --ignored 2>/dev/null | grep -c ': test$' || true)
+            if [ "$listed" -eq 0 ]; then
+              echo "::error::$target lists 0 ignored tests — it failed to build, or its model gates were deleted, renamed, or un-ignored, so an ignored-only run would pass vacuously" >&2
+              exit 1
+            fi
+            echo "== $target: $listed model gate(s) =="
+            cargo test -p coremlit --features speaker --test "$target" -- --ignored || failed="$failed $target"
+          done
+          if [ -n "$failed" ]; then
+            echo "::error::speaker gates failed:$failed" >&2
+            exit 1
+          fi
       # The anti-vacuum guard for the JOB, mirroring the per-target
       # `--list --ignored` counts inside the gates above: those refuse a gate
       # that runs zero tests, and this refuses a gate that never runs at all.
@@ -548,6 +772,8 @@ jobs:
             granite-model-gates=${{ steps.granite_gates.outcome }}
             siglip-tokenizer-gates=${{ steps.siglip_gates.outcome }}
             ced-model-gates=${{ steps.ced_gates.outcome }}
+            speakerkit-checksums=${{ steps.speakerkit_checksums.outcome }}
+            speaker-model-gates=${{ steps.speaker_gates.outcome }}
         run: |
           set -euo pipefail
           printf '%s' "$LEDGER"

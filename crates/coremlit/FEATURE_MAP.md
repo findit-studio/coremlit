@@ -133,6 +133,18 @@ that let vadkit be committed instead. Each target declares its gates once per
 size, so the CI step filters on `tiny::`; the `mini`/`small`/`base` gates stay
 local/dev gates against an owner-staged `CED_TEST_MODELS` tree.
 
+`speaker` splits the same way, with one wrinkle no other kit has: its artifact
+set is staged from TWO repositories into one directory, and the second overlays
+the first (MODELS_LOCK's last two tables, and the ORDER box in its header).
+`model-tests` runs `speaker_model_io`, `speaker_parity_seg` and
+`speaker_parity_embed` there. Four speaker targets deliberately stay out:
+`speaker_parity_diarize_wiring`, whose fixtures live in the sibling
+`diarization` repository (`DIA_PARITY_FIXTURES`) that no runner has, and the
+three argmax targets (`speaker_argmax_model_io`,
+`speaker_parity_argmax_accuracy`, `speaker_parity_argmax_swift`), because the
+argmax artifact repo declares no license — so this repository does not fetch
+those graphs in CI at all (NOTICE records the reasoning).
+
 ## Curated CI parity-oracle list
 
 The three third-party oracles get their own CI job (`parity`), which runs
