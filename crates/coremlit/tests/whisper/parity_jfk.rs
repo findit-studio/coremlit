@@ -1,9 +1,12 @@
 //! End-to-end parity against Swift WhisperKit on jfk.wav / openai_whisper-tiny.
 //!
-//! Golden: tests/whisper/fixtures/golden/jfk_tiny_golden.json (see plan Task 13 for
-//! the pinned whisperkit-cli invocation). Contract (spec §2.1): exact token
-//! ids; segment boundaries within epsilon (timestamps are quantized to
-//! 0.02 s tokens, so epsilon 1e-3 catches any real divergence).
+//! Golden: tests/whisper/fixtures/golden/jfk_tiny_golden.json. The pinned
+//! `whisperkit-cli` invocation that produces it is no longer prose in a plan
+//! document — it is `crates/coremlit/tests/whisper/swift/regen_goldens.sh`,
+//! which is the only supported way to rebuild either golden below. Contract
+//! (spec §2.1): exact token ids; segment boundaries within epsilon (timestamps
+//! are quantized to 0.02 s tokens, so epsilon 1e-3 catches any real
+//! divergence).
 //!
 //! Second golden: tests/whisper/fixtures/golden/jfk_tiny_words_golden.json —
 //! the same clip and model with **word timestamps on**, captured from the
@@ -38,12 +41,33 @@
 //! 17 -> token 11, margin 0.1562; step 27 -> token 50889, margin 0.2500)
 //! against a worst observed cross-placement logit delta of ~1.0. No flip
 //! occurs on the development machine, but a different Apple Silicon
-//! generation could flip one, and greedy autoregression would cascade it.
+//! generation or macOS build could flip one, and greedy autoregression would
+//! cascade it. The sibling es golden has already had exactly that happen in
+//! CI (run 97115941847: a `+0.0078` margin, one fp16 ULP, at decode step 11).
 //! `common::assert_golden_tokens` reports the first diverging step's
 //! competing tokens and their margin on failure, so that shows up as a
-//! borderline argmax rather than a mystery. Suspect ANE drift before a
-//! pipeline logic bug — but never "fix" either by regenerating the golden or
-//! loosening the comparison.
+//! borderline argmax rather than a mystery.
+//!
+//! Host provenance closes the attribution. Both goldens below carry a
+//! `generationHost` block and `common::golden_host_note` gates on it BEFORE
+//! any CoreML number: a golden stamped with a different host-class panics with
+//! the regeneration diagnosis instead of a token divergence, and an unstamped
+//! (legacy) one still enforces exact parity but appends the ambiguity note.
+//!
+//! **Regenerating is allowed. Re-baselining is not.**
+//!
+//! - Legitimate: re-run `whisperkit-cli` on a matching host, stamp
+//!   `generationHost`, review the diff, commit. The comparison stays
+//!   Rust-port-vs-Swift-reference; only the hardware both are measured on
+//!   changed. `crates/coremlit/tests/whisper/swift/regen_goldens.sh` is the
+//!   only supported path and can emit nothing but what the CLI produced — it
+//!   never builds or runs coremlit.
+//! - Forbidden: writing this crate's own output into a golden to clear a
+//!   failure. That is what turns an external oracle into a self-portrait. No
+//!   code in this crate can do it any more, and `whisper_golden_provenance`
+//!   keeps it that way.
+//! - Also forbidden, on any host: loosening the comparison. Token ids and
+//!   word timings are exact, or the parity claim is empty.
 
 mod common;
 
@@ -72,13 +96,22 @@ struct GoldenSegment {
   tokens: Vec<u32>,
 }
 
-fn golden_path() -> std::path::PathBuf {
-  common::fixtures_dir().join("golden/jfk_tiny_golden.json")
-}
+/// The token golden's filename, and the label its diagnoses carry.
+const GOLDEN: &str = "jfk_tiny_golden.json";
+
+/// The word-timestamp golden's filename.
+const WORDS_GOLDEN: &str = "jfk_tiny_words_golden.json";
 
 #[test]
 #[ignore = "requires local tiny model (WHISPERKIT_TEST_MODELS)"]
 fn jfk_tiny_matches_golden_tokens_and_segments() {
+  // Golden + host-class gate first, before any CoreML number exists — see the
+  // module doc: a mismatched host must fail as "regenerate on a matching host",
+  // never as a token divergence that reads like a port defect.
+  let golden_json = common::load_golden_json(GOLDEN);
+  let host_note = common::golden_host_note(GOLDEN, &golden_json);
+  let golden: Golden = serde_json::from_value(golden_json).expect("golden matches the schema");
+
   let audio = common::load_wav_mono_f32(&common::fixtures_dir().join("audio/jfk.wav"));
   // `Options::new` takes both folders directly (two-arg constructor, not a
   // zero-arg `new()` plus `with_model_folder`/`with_tokenizer_folder`
@@ -109,28 +142,6 @@ fn jfk_tiny_matches_golden_tokens_and_segments() {
     "clean speech must decode greedily; no window drew from the unseeded sampler"
   );
 
-  if std::env::var_os("UPDATE_GOLDEN").is_some() {
-    // Fallback-path writer (plan Task 13 Step 1-FALLBACK): pin the Rust
-    // output as the golden. Human verification + decision-issue REQUIRED.
-    let doc = serde_json::json!({
-        "model": "openai_whisper-tiny",
-        "source": "rust-coreml (self-golden); swift cross-check pending",
-        "text": result.text(),
-        "language": result.language(),
-        "tokens": result.segments_slice().iter().flat_map(|s| s.tokens_slice().iter().copied()).collect::<Vec<u32>>(),
-        "segments": result.segments_slice().iter().map(|s| serde_json::json!({
-            "id": s.id(), "start": s.start(), "end": s.end(),
-            "text": s.text(), "tokens": s.tokens_slice(),
-        })).collect::<Vec<_>>(),
-    });
-    std::fs::write(golden_path(), serde_json::to_string_pretty(&doc).unwrap()).unwrap();
-    eprintln!("golden written — human-verify the transcript, then re-run without UPDATE_GOLDEN");
-    return;
-  }
-
-  let golden: Golden =
-    serde_json::from_str(&std::fs::read_to_string(golden_path()).unwrap()).unwrap();
-
   assert_eq!(golden.language, result.language());
 
   // Keystone: exact token-id parity across the whole file. Exact — the
@@ -141,29 +152,37 @@ fn jfk_tiny_matches_golden_tokens_and_segments() {
     .iter()
     .flat_map(|s| s.tokens_slice().iter().copied())
     .collect();
-  common::assert_golden_tokens("jfk_tiny_golden.json", &rust_tokens, &golden.tokens, &audio);
+  common::assert_golden_tokens(GOLDEN, &rust_tokens, &golden.tokens, &audio, &host_note);
 
   // Segment-level parity: count, ids, boundaries within epsilon, text.
-  assert_eq!(result.segments_slice().len(), golden.segments.len());
+  assert_eq!(
+    result.segments_slice().len(),
+    golden.segments.len(),
+    "segment count differs from the golden{host_note}"
+  );
   const EPSILON: f32 = 1e-3;
   for (rust, gold) in result.segments_slice().iter().zip(&golden.segments) {
-    assert_eq!(rust.id(), gold.id);
+    assert_eq!(rust.id(), gold.id, "segment id{host_note}");
     assert!(
       (rust.start() - gold.start).abs() < EPSILON,
-      "start {} vs {}",
+      "start {} vs {}{host_note}",
       rust.start(),
       gold.start
     );
     assert!(
       (rust.end() - gold.end).abs() < EPSILON,
-      "end {} vs {}",
+      "end {} vs {}{host_note}",
       rust.end(),
       gold.end
     );
-    assert_eq!(rust.tokens_slice(), gold.tokens.as_slice());
-    assert_eq!(rust.text(), gold.text);
+    assert_eq!(
+      rust.tokens_slice(),
+      gold.tokens.as_slice(),
+      "segment tokens{host_note}"
+    );
+    assert_eq!(rust.text(), gold.text, "segment text{host_note}");
   }
-  assert_eq!(result.text(), golden.text);
+  assert_eq!(result.text(), golden.text, "transcript text{host_note}");
 }
 
 // ---------------------------------------------------------------------
@@ -313,6 +332,15 @@ fn oracle_options() -> DecodingOptions {
 #[test]
 #[ignore = "requires local tiny model (WHISPERKIT_TEST_MODELS)"]
 fn jfk_tiny_word_timestamps_match_swift_and_this_clip_is_gather_invariant() {
+  // Golden + host-class gate first (module doc): word timings are asserted with
+  // NO epsilon, so this gate is the most exposed of the three to fp16 drift on a
+  // foreign host — and the least able to absorb it. A mismatched host-class must
+  // stop here, not at a word boundary.
+  let golden_json = common::load_golden_json(WORDS_GOLDEN);
+  let host_note = common::golden_host_note(WORDS_GOLDEN, &golden_json);
+  let golden: WordsGolden =
+    serde_json::from_value(golden_json).expect("words golden matches the schema");
+
   let audio = common::load_wav_mono_f32(&common::fixtures_dir().join("audio/jfk.wav"));
   let model_options = Options::new(common::tiny_dir(), common::tokenizer_dir());
   assert_eq!(model_options.compute().mel(), DEFAULT_MEL_COMPUTE_UNITS);
@@ -326,12 +354,6 @@ fn jfk_tiny_word_timestamps_match_swift_and_this_clip_is_gather_invariant() {
   );
   let kit = WhisperKit::new(&model_options).unwrap();
 
-  let golden: WordsGolden = serde_json::from_str(
-    &std::fs::read_to_string(common::fixtures_dir().join("golden/jfk_tiny_words_golden.json"))
-      .unwrap(),
-  )
-  .unwrap();
-
   let default_options = oracle_options();
   assert_eq!(
     default_options.alignment_gather(),
@@ -341,31 +363,52 @@ fn jfk_tiny_word_timestamps_match_swift_and_this_clip_is_gather_invariant() {
   let default_result = kit.transcribe(&audio, &default_options).unwrap();
 
   // (1) exact parity with Swift, under the DEFAULT (un-truncated) gather.
-  assert_eq!(default_result.language(), golden.language);
-  assert_eq!(default_result.text(), golden.text);
+  assert_eq!(
+    default_result.language(),
+    golden.language,
+    "language{host_note}"
+  );
+  assert_eq!(default_result.text(), golden.text, "transcript{host_note}");
   assert_eq!(
     default_result.timings().total_decoding_windows(),
     golden.total_decoding_windows,
-    "jfk is a single window; a second one would mean the seek moved"
+    "jfk is a single window; a second one would mean the seek moved{host_note}"
   );
-  assert_eq!(default_result.segments_slice().len(), golden.segments.len());
+  assert_eq!(
+    default_result.segments_slice().len(),
+    golden.segments.len(),
+    "segment count{host_note}"
+  );
   for (rust, gold) in default_result.segments_slice().iter().zip(&golden.segments) {
-    assert_eq!(rust.id(), gold.id);
-    assert_eq!(rust.seek(), gold.seek);
-    assert_eq!(rust.tokens_slice(), gold.tokens.as_slice());
-    assert_eq!(rust.text(), gold.text);
+    assert_eq!(rust.id(), gold.id, "segment id{host_note}");
+    assert_eq!(rust.seek(), gold.seek, "segment seek{host_note}");
+    assert_eq!(
+      rust.tokens_slice(),
+      gold.tokens.as_slice(),
+      "segment tokens{host_note}"
+    );
+    assert_eq!(rust.text(), gold.text, "segment text{host_note}");
     // Exact, not epsilon: the word-timestamp path is integer encoder
     // columns times a constant, so a real divergence lands whole frames
     // away and a tolerance would only hide it.
-    assert_eq!((rust.start(), rust.end()), (gold.start, gold.end));
+    assert_eq!(
+      (rust.start(), rust.end()),
+      (gold.start, gold.end),
+      "segment bounds{host_note}"
+    );
   }
   let default_words = result_word_rows(&default_result);
   assert_eq!(
     default_words,
     golden_word_rows(&golden),
-    "jfk/tiny's word timestamps under the DEFAULT gather must match official Swift exactly"
+    "jfk/tiny's word timestamps under the DEFAULT gather must match official Swift \
+     exactly{host_note}"
   );
-  assert_eq!(default_words.len(), 22, "jfk/tiny yields 22 words");
+  assert_eq!(
+    default_words.len(),
+    22,
+    "jfk/tiny yields 22 words{host_note}"
+  );
 
   // (2) the opt-in gather does not move any of it.
   let parity = kit

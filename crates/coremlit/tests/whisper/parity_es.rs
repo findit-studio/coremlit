@@ -16,6 +16,12 @@
 //!   --report --report-path <dir>
 //! ```
 //!
+//! That invocation is now EXECUTABLE rather than prose:
+//! `crates/coremlit/tests/whisper/swift/regen_goldens.sh` runs exactly it (and
+//! the two jfk equivalents), so the knobs cannot drift from the golden they
+//! describe. Treat the block above as documentation of the script, not a
+//! second source of truth.
+//!
 //! Contract (spec §2.1): exact token ids; segment boundaries within epsilon
 //! (timestamps are quantized to 0.02 s tokens, so epsilon 1e-3 catches any
 //! real divergence).
@@ -33,12 +39,37 @@
 //! `tests/model_io.rs` may still pin `CpuOnly` (they assert shapes and
 //! dtypes, not numerics).
 //!
-//! If this test ever fails on a different Apple Silicon generation with a
-//! one-token divergence, suspect ANE numeric drift on a borderline argmax
-//! before assuming a pipeline logic bug — `common::assert_golden_tokens`
-//! reports the first diverging step's competing tokens and their logit
-//! margin to tell the two apart. Never regenerate the golden or loosen the
-//! comparison to make either go away.
+//! Host provenance — and the one legitimate reason to regenerate. If this
+//! test fails on a different Apple Silicon generation or macOS build with a
+//! one-token divergence, suspect fp16 drift on a borderline argmax before
+//! assuming a pipeline logic bug: `common::assert_golden_tokens` reports the
+//! first diverging step's competing tokens and their logit margin to tell the
+//! two apart. That is not hypothetical here. CI run 97115941847 diverged at
+//! decode step 11 with a margin of `+0.0078` — `2^-7`, a single fp16 ULP —
+//! two candidates tied to the last bit, resolved one way on the owner's
+//! machine and the other way on the runner.
+//!
+//! So the golden carries a `generationHost` block and `common::golden_host_note`
+//! gates on it BEFORE the first CoreML number: a golden stamped with a
+//! different host-class panics with the regeneration diagnosis rather than a
+//! token divergence, and an unstamped (legacy) one still enforces exact token
+//! parity but appends the ambiguity note to any failure.
+//!
+//! **Regenerating is allowed. Re-baselining is not.** The distinction is the
+//! whole gate:
+//!
+//! - Legitimate: re-running `whisperkit-cli` on a matching host and committing
+//!   its output, stamped with `generationHost` and reviewed as a diff. The
+//!   comparison stays Rust-port-vs-Swift-reference; only the hardware both are
+//!   measured on changed. `crates/coremlit/tests/whisper/swift/regen_goldens.sh`
+//!   is the only supported path, and it can only emit what the CLI produced —
+//!   it never builds or runs coremlit.
+//! - Forbidden: writing coremlit's own output here to make a failure go away.
+//!   That converts an external oracle into a self-portrait and the gate then
+//!   asserts nothing. There is deliberately no code left in this crate that can
+//!   do it; `whisper_golden_provenance` keeps it that way.
+//! - Also forbidden, on any host: adding a tolerance. Token ids are exact or
+//!   the parity claim is empty.
 
 mod common;
 
@@ -67,13 +98,20 @@ struct GoldenSegment {
   tokens: Vec<u32>,
 }
 
-fn golden_path() -> std::path::PathBuf {
-  common::fixtures_dir().join("golden/es_tiny_golden.json")
-}
+/// The committed golden's filename, and the label every diagnosis carries.
+const GOLDEN: &str = "es_tiny_golden.json";
 
 #[test]
 #[ignore = "requires local tiny model (WHISPERKIT_TEST_MODELS)"]
 fn es_tiny_matches_golden_tokens_and_segments() {
+  // The golden and its host-class gate come FIRST, before a single CoreML
+  // number exists: a golden generated on a different host-class must fail with
+  // "regenerate on a matching host", never with a token divergence that reads
+  // like a port defect.
+  let golden_json = common::load_golden_json(GOLDEN);
+  let host_note = common::golden_host_note(GOLDEN, &golden_json);
+  let golden: Golden = serde_json::from_value(golden_json).expect("golden matches the schema");
+
   let audio = common::load_wav_mono_f32(&common::fixtures_dir().join("audio/es_test_clip.wav"));
   // `Options::new` takes both folders directly (two-arg constructor, not a
   // zero-arg `new()` plus `with_model_folder`/`with_tokenizer_folder`
@@ -111,29 +149,6 @@ fn es_tiny_matches_golden_tokens_and_segments() {
     "clean speech must decode greedily; no window drew from the unseeded sampler"
   );
 
-  if std::env::var_os("UPDATE_GOLDEN").is_some() {
-    // Fallback-path writer (mirrors parity_jfk.rs's Task 13 Step
-    // 1-FALLBACK writer): pin the Rust output as the golden. Human
-    // verification + decision-issue REQUIRED.
-    let doc = serde_json::json!({
-        "model": "openai_whisper-tiny",
-        "source": "rust-coreml (self-golden); swift cross-check pending",
-        "text": result.text(),
-        "language": result.language(),
-        "tokens": result.segments_slice().iter().flat_map(|s| s.tokens_slice().iter().copied()).collect::<Vec<u32>>(),
-        "segments": result.segments_slice().iter().map(|s| serde_json::json!({
-            "id": s.id(), "start": s.start(), "end": s.end(),
-            "text": s.text(), "tokens": s.tokens_slice(),
-        })).collect::<Vec<_>>(),
-    });
-    std::fs::write(golden_path(), serde_json::to_string_pretty(&doc).unwrap()).unwrap();
-    eprintln!("golden written — human-verify the transcript, then re-run without UPDATE_GOLDEN");
-    return;
-  }
-
-  let golden: Golden =
-    serde_json::from_str(&std::fs::read_to_string(golden_path()).unwrap()).unwrap();
-
   assert_eq!(golden.language, result.language());
 
   // Keystone: exact token-id parity across the whole file. Exact — the
@@ -144,27 +159,35 @@ fn es_tiny_matches_golden_tokens_and_segments() {
     .iter()
     .flat_map(|s| s.tokens_slice().iter().copied())
     .collect();
-  common::assert_golden_tokens("es_tiny_golden.json", &rust_tokens, &golden.tokens, &audio);
+  common::assert_golden_tokens(GOLDEN, &rust_tokens, &golden.tokens, &audio, &host_note);
 
   // Segment-level parity: count, ids, boundaries within epsilon, text.
-  assert_eq!(result.segments_slice().len(), golden.segments.len());
+  assert_eq!(
+    result.segments_slice().len(),
+    golden.segments.len(),
+    "segment count differs from the golden{host_note}"
+  );
   const EPSILON: f32 = 1e-3;
   for (rust, gold) in result.segments_slice().iter().zip(&golden.segments) {
-    assert_eq!(rust.id(), gold.id);
+    assert_eq!(rust.id(), gold.id, "segment id{host_note}");
     assert!(
       (rust.start() - gold.start).abs() < EPSILON,
-      "start {} vs {}",
+      "start {} vs {}{host_note}",
       rust.start(),
       gold.start
     );
     assert!(
       (rust.end() - gold.end).abs() < EPSILON,
-      "end {} vs {}",
+      "end {} vs {}{host_note}",
       rust.end(),
       gold.end
     );
-    assert_eq!(rust.tokens_slice(), gold.tokens.as_slice());
-    assert_eq!(rust.text(), gold.text);
+    assert_eq!(
+      rust.tokens_slice(),
+      gold.tokens.as_slice(),
+      "segment tokens{host_note}"
+    );
+    assert_eq!(rust.text(), gold.text, "segment text{host_note}");
   }
-  assert_eq!(result.text(), golden.text);
+  assert_eq!(result.text(), golden.text, "transcript text{host_note}");
 }

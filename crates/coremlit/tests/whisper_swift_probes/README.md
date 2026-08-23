@@ -232,6 +232,20 @@ DecodingOptions(
 under `ModelComputeOptions(audioEncoderCompute: .cpuAndNeuralEngine,
 textDecoderCompute: .cpuAndNeuralEngine)` — the same pinned invocation the #41
 long-form evidence used, so short-form and long-form are one option set.
+
+**Regeneration route (changed).** That out-of-tree driver captured the golden
+committed today, and this section stays the record of where those bytes came
+from. It is not how the golden is rebuilt any more:
+`crates/coremlit/tests/whisper/swift/regen_goldens.sh` drives the same oracle
+through `whisperkit-cli` instead, because the CI regeneration job
+(`.github/workflows/regen-whisper-goldens.yml`) needs a `brew`-installable
+binary rather than a SwiftPM checkout that does not exist on a runner. The
+option set is reproduced flag for flag, with one trap worth naming: the CLI's
+`--first-token-log-prob-threshold` defaults to `nil` and is passed straight
+through (`TranscribeCLIUtils.swift:64`), while the `DecodingOptions(...)` the
+driver called defaults it to `-1.5` (`Configurations.swift:208`). The script
+passes `-1.5` explicitly. A regenerated golden that differs here — rather than
+in `generationHost` — is that knob, not the port.
 `whisper_parity_jfk`'s
 `jfk_tiny_word_timestamps_match_swift_and_this_clip_is_gather_invariant`
 mirrors those options exactly and asserts every word (text, start, end,

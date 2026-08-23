@@ -366,6 +366,14 @@ asry = { version = "0.1.0", default-features = false, features = ["emissions"] }
 # ---------------------------------------------------------------------------
 
 # --- audio::whisper ---
+# Hermetic (no model, no network): the host-class predicate's falsifiers, and
+# the structural guards that keep a whisper golden producible only by the
+# external Swift oracle. Runs in CI's `features` job on every PR.
+[[test]]
+name = "whisper_golden_provenance"
+path = "tests/whisper/golden_provenance.rs"
+required-features = ["whisper"]
+
 [[test]]
 name = "whisper_longform"
 path = "tests/whisper/longform.rs"

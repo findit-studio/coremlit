@@ -1,0 +1,179 @@
+name: Regenerate whisper goldens
+
+# MANUAL ONLY. There is deliberately no `push:` and no `pull_request:` trigger.
+#
+# This job re-runs the external Swift oracle (`whisperkit-cli`) on the committed
+# audio fixtures and produces the three whisper goldens stamped with the RUNNER's
+# host-class, so `whisper_parity_es`, `whisper_parity_jfk` and `whisper_streaming`
+# can be gates that actually execute in CI instead of on one laptop.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+# WHY IT DOES NOT COMMIT, AND MUST NOT BE MADE TO
+#
+# A job that regenerated the goldens on every push and committed them would make
+# the parity gates self-satisfying: whatever the oracle emitted that day would
+# become the expectation, the gates would be green by construction, and nobody
+# would ever see the oracle's output change. The goldens would be decorative.
+#
+# So the human stays in the loop by four independent mechanisms, any one of
+# which is sufficient:
+#
+#   1. `workflow_dispatch` only — it runs when a person asks, never on a code
+#      change.
+#   2. `permissions: contents: read` — the token cannot write to the repo. Even
+#      a compromised step cannot push a golden.
+#   3. The goldens are written to a scratch directory OUTSIDE the checkout
+#      (`WHISPER_GOLDEN_OUT`), so the committed fixtures are never touched.
+#   4. A final step asserts the working tree is clean, failing the job if some
+#      future edit reintroduces an in-tree write.
+#
+# The output leaves as a build ARTIFACT. A human downloads it, reads the diff,
+# and commits it — which is the point: a change in the oracle's tokens or text
+# is news, and it should arrive as a reviewable diff with a person's name on it.
+#
+# WHEN TO RUN IT: when the three whisper gates fail in CI with a "committed
+# golden was generated on a DIFFERENT host-class" diagnosis. GitHub rotates the
+# macos-15 image roughly monthly and `HostClass` includes `osBuild`, so that is
+# expected to recur. It is a cheap, unmistakable break by design — the
+# alternative was an unattributable token divergence, which is what this
+# replaces.
+# ─────────────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  regenerate:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      # The host-class this run will stamp into the goldens, printed FIRST so it
+      # is at the top of the log and in the job summary: it is the single most
+      # important fact about the artifact this job produces. Read off the runner
+      # with the same sysctl keys the test-side `HostClass::running()` reads —
+      # never hardcoded, because hardcoding it would be a lie the moment the
+      # image rotates.
+      - name: Runner host-class
+        run: |
+          set -euo pipefail
+          os_build="$(/usr/sbin/sysctl -n kern.osversion)"
+          os_version="$(/usr/sbin/sysctl -n kern.osproductversion)"
+          chip="$(/usr/sbin/sysctl -n machdep.cpu.brand_string)"
+          arch="$(uname -m)"
+          line="macOS $os_version (build $os_build), $chip, $arch"
+          echo "$line"
+          echo "### Host-class of these goldens" >> "$GITHUB_STEP_SUMMARY"
+          echo "\`$line\`" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install whisperkit-cli
+        run: |
+          set -euo pipefail
+          brew install whisperkit-cli jq
+          whisperkit-cli --version || true
+
+      # The tiny model, from MODELS_LOCK's FIRST table — the same artifact and
+      # revision `ci.yml` stages for the gates, parsed out of the same lock file
+      # rather than duplicated here, so a lock edit moves both. Only table 1 is
+      # needed: whisperkit-cli fetches its own tokenizer (see the next step).
+      - name: Stage openai_whisper-tiny (MODELS_LOCK table 1)
+        run: |
+          set -euo pipefail
+          lock=MODELS_LOCK
+          repo="$(sed -n 's/^\["\(.*\)"\]$/\1/p' "$lock" | sed -n 1p)"
+          field() {
+            awk -v key="$1" '
+              /^\[/ { seen++; in_table = (seen == 1); next }
+              in_table && $1 == key {
+                line = $0
+                sub(/^[^=]*=[ \t]*"/, "", line)
+                sub(/"[ \t]*$/, "", line)
+                print line
+                exit
+              }
+            ' "$lock"
+          }
+          include="$(field include)"
+          revision="$(field revision)"
+          for v in repo include revision; do
+            if [ -z "${!v}" ]; then
+              echo "::error::MODELS_LOCK table 1 parse produced empty '$v' — format drift?" >&2
+              exit 1
+            fi
+          done
+          echo "MODELS_LOCK: model=$repo@$revision include=$include"
+          pipx install "huggingface_hub[cli]"
+          hf download "$repo" --include "$include" --revision "$revision" \
+            --local-dir Models/whisperkit-coreml
+          test -d Models/whisperkit-coreml/openai_whisper-tiny
+
+      # THE regeneration. `WHISPER_GOLDEN_OUT` points outside the checkout, so
+      # this cannot modify a committed golden even by accident.
+      #
+      # `TMPDIR` is set to the runner scratch area, which is where the script
+      # puts both its raw CLI reports and the tokenizer cache it passes to
+      # `--download-tokenizer-path` — so nothing it downloads lands in the
+      # checkout either. That tokenizer is whisperkit-cli's own Hub fetch, NOT
+      # MODELS_LOCK's table 2, so the `text` fields it produces are detokenized
+      # by whatever revision it pulled. Token IDs are model output and
+      # unaffected; a regenerated `text` that moved while its `tokens` did not
+      # is this, not the port.
+      - name: Regenerate from the Swift oracle
+        env:
+          WHISPER_GOLDEN_OUT: ${{ runner.temp }}/whisper-goldens
+          WHISPERKIT_TEST_MODELS: ${{ github.workspace }}/Models
+        run: |
+          set -euo pipefail
+          mkdir -p "$WHISPER_GOLDEN_OUT"
+          export TMPDIR="${{ runner.temp }}"
+          crates/coremlit/tests/whisper/swift/regen_goldens.sh
+          echo "== tokenizer whisperkit-cli fetched for itself =="
+          find "$TMPDIR/whisperkit-cli-tokenizers" -name 'tokenizer*.json' 2>/dev/null | head || true
+
+      # The reviewable diff, in the log and the job summary. This is the thing a
+      # human is meant to look at before committing the artifact: unchanged
+      # tokens plus a changed `generationHost` is the routine host-rotation case;
+      # changed tokens or text is the oracle saying something new.
+      - name: Diff against the committed goldens
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          out="${{ runner.temp }}/whisper-goldens"
+          committed=crates/coremlit/tests/whisper/fixtures/golden
+          {
+            echo "### Diff vs committed goldens"
+            echo '```diff'
+            for f in es_tiny_golden.json jfk_tiny_golden.json jfk_tiny_words_golden.json; do
+              echo "--- $f"
+              diff -u "$committed/$f" "$out/$f" || true
+            done
+            echo '```'
+          } | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload goldens for human review
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-goldens
+          path: ${{ runner.temp }}/whisper-goldens/*.json
+          if-no-files-found: error
+
+      # Mechanism 4 (see the header): proof that this job did not write into the
+      # checkout. If a future edit ever points the script back at the committed
+      # fixtures, this fails and says why, instead of quietly turning the gates
+      # into a self-portrait.
+      - name: Refuse to have modified the checkout
+        if: ${{ !cancelled() }}
+        run: |
+          set -euo pipefail
+          dirty="$(git status --porcelain)"
+          if [ -n "$dirty" ]; then
+            echo "$dirty"
+            echo "::error::this job modified the checkout. It must only ever write to WHISPER_GOLDEN_OUT and upload an artifact — regenerating goldens IN TREE, in a job that runs without human review, is what makes a parity gate self-satisfying. Fix the regeneration step, do not commit this." >&2
+            exit 1
+          fi
+          echo "checkout clean — goldens left for a human to review and commit"
