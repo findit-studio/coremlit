@@ -186,7 +186,7 @@ jobs:
             coverage/cobertura.xml
       - name: Upload coverage artifact
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-hermetic
           path: coverage/cobertura.xml
@@ -434,7 +434,7 @@ jobs:
             coverage/cobertura.xml
       - name: Upload coverage artifact
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: coverage-${{ matrix.kit }}
           path: coverage/cobertura.xml
@@ -524,7 +524,7 @@ jobs:
           echo "wrote merged-coverage.md ($(wc -l < merged-coverage.md) lines)"
       - name: Upload the merged summary
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: merged-coverage-summary
           path: merged-coverage.md

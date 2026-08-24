@@ -156,7 +156,7 @@ jobs:
 
       - name: Upload goldens for human review
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: whisper-goldens
           path: ${{ runner.temp }}/whisper-goldens/*.json
