@@ -51,6 +51,51 @@
 //!   [`STRIDE_SAMPLES`]-sized thresholds as samples are pushed in — a
 //!   deliberate regularization for that push-based shape, not a
 //!   byte-for-byte port of Swift's off-by-one starting point.
+//! - **A word already confirmed is not re-confirmed at the front of a
+//!   re-decode** (Swift `:372`/`:375`). Swift's hypothesis view is a bare
+//!   timestamp filter, `start >= lastAgreedSeconds`, and the watermark is the
+//!   first held-back word's start — so a word confirmed in the previous round
+//!   that shares that exact start (DTW row steps without a column advance, then
+//!   centisecond rounding; ties are pipeline-reachable) is pulled back in and
+//!   confirmed AGAIN. This port strips the leading run of the offered words that
+//!   reproduces the confirmed tail tied at the watermark. Adjudicated: Swift
+//!   shares the bug, and "confirmed once and stable" wins over parity.
+//!
+//!   **That strip is known-incomplete.** It only catches a reproduction at the
+//!   very front of the offered list; an insertion ahead of it, an omission of
+//!   the confirmed tail's head, a partial front match, or a re-decode that
+//!   nudges the reproduction a hair past the watermark all slide past it. Four
+//!   adversarial-review rounds each defeated a stronger predicate, and
+//!   established that no predicate over (confirmed words, offered words,
+//!   watermark) can be right — occurrence identity is not recoverable from
+//!   those three. It is a design task, tracked with an executable acceptance
+//!   suite at <https://github.com/findit-studio/coremlit/issues/94>: ten
+//!   CHARACTERIZATION tests that pin today's wrong answers and go red the day
+//!   the defect is fixed.
+//! - **The final hypothesis's holdback** (Swift `:418-419`, `let final =
+//!   lastAgreedWords + findLongestDifferentSuffix(prevWords,
+//!   hypothesisWords)`). That decomposition is only valid when the LAST
+//!   hypothesis agreed. `findLongestCommonPrefix` returns elements from its
+//!   second argument, so on an advance `lastAgreedWords` *is* the final
+//!   hypothesis's own `[split..commonPrefix.count]` slice and the sum
+//!   reconstructs `hypothesisWords[split...]` exactly. When the last
+//!   hypothesis DISAGREED, `lastAgreedWords` belongs to the hypothesis it just
+//!   superseded, while `hypothesisWords` — filtered to `start >=
+//!   lastAgreedSeconds` — already re-covers that same span carrying the
+//!   revision, and Swift emits BOTH: the revised word lands beside the reading
+//!   it replaced, and every word the two share is transcribed twice. With an
+//!   empty holdback the same expression fails the other way, dropping the
+//!   `commonPrefix.count` leading words both hypotheses actually produced.
+//!   [`LocalAgreement::finalize`] instead emits the final hypothesis's own
+//!   post-watermark words on that path (`holdback_superseded` is the flag), and
+//!   keeps Swift's shape everywhere else — including when the final hypothesis
+//!   contributes nothing at or past the watermark, where nothing supersedes the
+//!   holdback. Same adjudication as the re-admission divergence recorded on
+//!   `watermark_filtered`: Swift shares the bug, and a word confirmed once and
+//!   stable wins over parity. Nothing in this repo pins the streaming transcript
+//!   against a Swift capture (`tests/whisper/streaming.rs` "owns no golden"; the
+//!   token-for-token goldens are the BATCH decode's), so the divergence costs no
+//!   oracle comparison.
 //! - **`push_samples` needs only `B: InferenceBackend`, not `+ Sync`.**
 //!   Its only backend-touching call is
 //!   [`crate::audio::whisper::transcribe::WhisperKit::transcribe`], whose own `impl`
@@ -138,6 +183,18 @@ pub struct LocalAgreement {
   prev_words: Vec<WordTiming>,
   hypothesis_words: Vec<WordTiming>,
   last_agreed_words: Vec<WordTiming>,
+  /// Whether the most recent WORDED hypothesis failed to corroborate
+  /// [`Self::last_agreed_words`] — i.e. that holdback belongs to a hypothesis
+  /// the latest one has since superseded. [`Self::finalize`] needs this and
+  /// cannot recover it from the word lists alone; see the divergence recorded
+  /// there and in this module's doc.
+  ///
+  /// Maintained ONLY on the worded path of [`Self::ingest`], alongside
+  /// [`Self::prev_words`]/[`Self::hypothesis_words`]/[`Self::last_agreed_words`]
+  /// themselves: the [`AgreementOutcome::NoWordTimings`] early return leaves all
+  /// four untouched, so this keeps describing the last hypothesis that actually
+  /// had words to agree over — exactly the pair `finalize` reasons about.
+  holdback_superseded: bool,
   confirmed_words: Vec<WordTiming>,
   results: Vec<TranscriptionResult>,
   /// A sink for the reproducibility facts of EVERY ingested hypothesis —
@@ -172,6 +229,7 @@ impl LocalAgreement {
       prev_words: Vec::new(),
       hypothesis_words: Vec::new(),
       last_agreed_words: Vec::new(),
+      holdback_superseded: false,
       confirmed_words: Vec::new(),
       results: Vec::new(),
       ingested_facts: TaskFactsAccumulator::new(),
@@ -279,6 +337,20 @@ impl LocalAgreement {
   /// exactly the trailing run with `start >= watermark`, and they sit at
   /// the front of the filtered list — skipping that count restores the
   /// invariant on both sides of the prefix comparison.
+  ///
+  /// **This rule is known-incomplete, and deliberately so.** It only catches a
+  /// reproduction the hypothesis puts at the very FRONT of its post-watermark
+  /// list: an insertion ahead of the reproduction, an omission of the confirmed
+  /// tail's head, or a re-decode that nudges the reproduction a hair past the
+  /// watermark all slide past it and confirm a settled word a second time. Four
+  /// adversarial-review rounds established that closing it needs occurrence
+  /// identity — which is NOT recoverable from the confirmed list, the offered
+  /// list and the watermark (two runs reach byte-identical triples and need
+  /// opposite answers) — so it is a design task, not a stronger predicate. The
+  /// counterexamples are executable rather than prose: the characterization
+  /// tests named in <https://github.com/findit-studio/coremlit/issues/94> carry
+  /// each one with its exact ingest sequence, the wrong answer it produces
+  /// today, and the correct one in the failure message.
   fn watermark_filtered(&self, result: &TranscriptionResult) -> Vec<WordTiming> {
     Self::watermark_filtered_with(result, self.last_agreed_seconds, &self.confirmed_words)
   }
@@ -411,6 +483,14 @@ impl LocalAgreement {
       }
     }
 
+    // The holdback is stale exactly when THIS hypothesis failed to corroborate
+    // it — the same condition as `skip_append`, recorded under its own name
+    // because its consumer is `finalize`, not `results`. Set here rather than in
+    // the branches above so the first-ever call (no `prev_result`, no agreement
+    // run at all) also lands on `false`: nothing has been held back yet, so
+    // nothing can have been superseded.
+    self.holdback_superseded = skip_append;
+
     // :402 (unconditional) + :408-410 (`!skipAppend`).
     if skip_append {
       self.prev_result = Some(result);
@@ -431,7 +511,10 @@ impl LocalAgreement {
   /// agreement's [`Self::last_agreed_words_slice`], then whatever the
   /// final hypothesis added beyond the final previous result
   /// ([`crate::audio::whisper::text::find_longest_different_suffix`] over the last
-  /// ingested pair), both folded onto [`Self::confirmed_words_slice`];
+  /// ingested pair), both folded onto [`Self::confirmed_words_slice`] —
+  /// **except when the final hypothesis DISAGREED**, where this port emits that
+  /// hypothesis's own post-watermark words instead of the superseded holdback
+  /// (see this module's doc, "The final hypothesis's holdback");
   /// [`merge_transcription_results_with_words`] then merges every kept
   /// [`Self::results_slice`] result with that word list as the merged
   /// text, under `options` — the same options the kept results were decoded
@@ -452,9 +535,30 @@ impl LocalAgreement {
   /// the ingest strip carries only the wholly-unknown span, so the fold cannot
   /// supply the exact count, round 12); see [`Self::ingest`].
   pub fn finalize(mut self, options: &DecodingOptions) -> TranscriptionResult {
-    self.confirmed_words.append(&mut self.last_agreed_words);
-    let suffix = find_longest_different_suffix(&self.prev_words, &self.hypothesis_words);
-    self.confirmed_words.extend_from_slice(suffix);
+    if self.holdback_superseded && !self.hypothesis_words.is_empty() {
+      // DIVERGENCE from `:418-419` — see this module's doc for the full
+      // argument. Swift's `lastAgreedWords + differentSuffix(prevWords,
+      // hypothesisWords)` is only a valid decomposition when the final
+      // hypothesis AGREED. Here it did not: `last_agreed_words` belongs to the
+      // hypothesis this one just superseded, while `hypothesis_words` — filtered
+      // to `start >= last_agreed_words[0].start()` — already re-covers that exact
+      // span carrying the revision. Emitting both duplicates the span and strands
+      // the superseded reading beside its own replacement; emitting only the
+      // SUFFIX would instead drop the leading words both hypotheses produced,
+      // which is the same defect's other face when the holdback is empty.
+      //
+      // The non-empty guard is load-bearing: a result whose every word falls
+      // BEFORE the watermark still clears the `has_words` gate (`:371`) and
+      // disagrees, but it re-covers nothing, so there is no revision to prefer
+      // and the provisional holdback remains the only estimate for that span.
+      // That case stays on the Swift shape below, byte-identical.
+      self.confirmed_words.append(&mut self.hypothesis_words);
+    } else {
+      // `:418-419` verbatim.
+      self.confirmed_words.append(&mut self.last_agreed_words);
+      let suffix = find_longest_different_suffix(&self.prev_words, &self.hypothesis_words);
+      self.confirmed_words.extend_from_slice(suffix);
+    }
     let mut merged =
       merge_transcription_results_with_words(&self.results, &self.confirmed_words, options);
     // Fold the merged (surviving-result) facts INTO the ingest-ordered sink, not
