@@ -238,23 +238,27 @@ fn check_confirmed_is_prefix_of_batch(
     )),
     // Every shared position matched, so the confirmation ran PAST the batch
     // transcript — the signature of a word confirmed twice. Two mechanisms
-    // produce it. `LocalAgreement::finalize` folding in BOTH the held-back words
-    // and the last pair's differing suffix is now guarded (`holdback_superseded`)
-    // and has hermetic falsifiers in `stream/agreement/tests.rs`. The
-    // re-admission strip in `LocalAgreement::watermark_filtered` is NOT fixed —
-    // it only catches a reproduction at the front of the offered list, and the
-    // sequences that slide past it are the `_today` characterization tests in
-    // that same file (issue #94). Check the second before the decode, and the
-    // first before both.
+    // produce it, and both are guarded with hermetic falsifiers in
+    // `stream/agreement/tests.rs`: `LocalAgreement::finalize` folding in BOTH
+    // the held-back words and the last pair's differing suffix
+    // (`holdback_superseded`), and `LocalAgreement::watermark_filtered`'s
+    // re-admission frontier (issue #94's ledger, now the named property tests
+    // in that file). The frontier keeps ONE documented residual —
+    // `an_unaccounted_repeat_of_a_settled_word_is_kept_as_the_streams_own`: an
+    // offered list carrying more copies of a settled word than the engine's own
+    // record accounts for is read as the stream repeating it. Check that
+    // residual first, then the decode.
     None => report.push_str(&format!(
       "  every shared position matched, but the confirmation is {} word(s) LONGER \
        than the batch transcript — i.e. it emitted words the batch decode never \
        produced. Suspect a word confirmed TWICE before suspecting the decode: \
-       `LocalAgreement::watermark_filtered`'s re-admission strip has KNOWN OPEN \
-       gaps (issue #94, the `_today` characterization tests in \
-       `stream/agreement/tests.rs`), \
-       and `LocalAgreement::finalize` folds in both the held-back words and the \
-       last pair's differing suffix behind the `holdback_superseded` guard.\n",
+       `LocalAgreement::watermark_filtered`'s re-admission frontier keeps one \
+       documented residual (issue #94 — a repeat its record cannot account for \
+       is kept as the stream's own; see \
+       `an_unaccounted_repeat_of_a_settled_word_is_kept_as_the_streams_own` in \
+       `stream/agreement/tests.rs`), and `LocalAgreement::finalize` folds in \
+       both the held-back words and the last pair's differing suffix behind the \
+       `holdback_superseded` guard.\n",
       confirmed_words.len().saturating_sub(batch_words.len()),
     )),
   }
