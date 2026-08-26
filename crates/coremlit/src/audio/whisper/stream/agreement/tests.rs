@@ -395,6 +395,120 @@ fn omitting_a_confirmed_tied_word_does_not_drop_provisional_words() {
 }
 
 #[test]
+fn the_split_never_cuts_at_a_tied_start() {
+  // RULE W's POSTCONDITION, swept rather than pinned to one fixture: whenever
+  // the holdback is non-empty, the last CONFIRMED word starts strictly before
+  // the watermark.
+  //
+  // That inequality is the whole of #94. `watermark_filtered_with` offers every
+  // hypothesis word whose `start >= watermark`, so a confirmed word that TIES
+  // the watermark passes that filter and can come back at the head of the next
+  // hypothesis -- and there it is byte-identical to the stream's own second
+  // occurrence of the same text, which is the issue's impossibility result.
+  // Every defeated rule in this module's ledger tried to DECIDE that state.
+  // Rule W refuses to create it: the split widens past a tie instead of cutting
+  // at one, so the state is unreachable and needs no decision.
+  //
+  // The sweep draws starts from a coarse grid whose repeats make consecutive
+  // words tie -- the `a=[0,0.5)/b=[0,1.0)` shape both #94 regressions are built
+  // from, generalized -- keeps them non-decreasing the way `find_alignment`
+  // guarantees (`segment::tests`: `w[i].end() <= w[i+1].start() + 1e-4`), and
+  // drives growing prefixes through `ingest_streamed`, the MARKED path the
+  // driver uses, so every advance carries the prefill premise the engine issues
+  // for itself. One stride in four omits the leading word, which is the rewrite
+  // `omitting_a_confirmed_tied_word_does_not_drop_provisional_words` is built
+  // from.
+  //
+  // Mutation proof: drop Rule W's widening loop from `ingest` (leaving the bare
+  // `budgeted_split`) and this reds on the first swept tie, reporting the
+  // confirmed word whose start equals the watermark.
+  const TEXTS: [&str; 4] = [" A", " B", " C", " D"];
+  // Repeated 0.0 entries are the ties; the rest keep the grid coarse enough for
+  // two words to share an instant often.
+  const STEPS: [f32; 6] = [0.0, 0.0, 0.0, 0.5, 0.5, 1.0];
+  // The 0.0 duration is a zero-length word, which is the one shape that could
+  // satisfy `start >= watermark` from inside the confirmed list without a tie
+  // between two distinct starts.
+  const DURATIONS: [f32; 4] = [0.0, 0.2, 0.5, 1.0];
+
+  fn postcondition(agreement: &LocalAgreement, trial: u32, stride: usize) -> bool {
+    if agreement.last_agreed_words_slice().is_empty() {
+      return false;
+    }
+    let Some(last) = agreement.confirmed_words_slice().last() else {
+      return false;
+    };
+    assert!(
+      last.start() < agreement.last_agreed_seconds(),
+      "trial {trial}, stride {stride}: the confirmed list {:?} ends on {:?} at \
+       {}, which is not strictly before the {} s watermark -- that word passes \
+       `watermark_filtered`'s own `start >= watermark` and can be re-admitted",
+      confirmed_texts(agreement),
+      last.word(),
+      last.start(),
+      agreement.last_agreed_seconds(),
+    );
+    true
+  }
+
+  let mut state: u64 = 0x2545_F491_4F6C_DD1D;
+  let mut next = move || {
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    state
+  };
+  let mut checked = 0u32;
+  let mut tied_truths = 0u32;
+
+  for trial in 0..256u32 {
+    let length = 4 + (next() % 5) as usize;
+    let mut truth: Vec<WordTiming> = Vec::with_capacity(length);
+    let mut start = 0.0f32;
+    for _ in 0..length {
+      let text = TEXTS[(next() % TEXTS.len() as u64) as usize];
+      start += STEPS[(next() % STEPS.len() as u64) as usize];
+      let end = start + DURATIONS[(next() % DURATIONS.len() as u64) as usize];
+      truth.push(word(text, start, end));
+    }
+    if truth
+      .windows(2)
+      .any(|pair| pair[0].start() >= pair[1].start())
+    {
+      tied_truths += 1;
+    }
+
+    let mut agreement = LocalAgreement::new();
+    for stride in 2..=truth.len() {
+      let omit_head = stride > 2 && next() % 4 == 0;
+      let offered = if omit_head {
+        truth[1..stride].to_vec()
+      } else {
+        truth[..stride].to_vec()
+      };
+      for _ in 0..2 {
+        agreement.ingest_streamed(result_with_words(offered.clone()));
+        if postcondition(&agreement, trial, stride) {
+          checked += 1;
+        }
+      }
+    }
+  }
+
+  // Non-vacuity, both halves: the sweep really did build tied truths, and the
+  // postcondition really was READ against a non-empty holdback and a non-empty
+  // confirmed list rather than skipped.
+  assert!(
+    tied_truths > 64,
+    "the sweep must actually produce tied starts: {tied_truths} of 256 trials",
+  );
+  assert!(
+    checked > 256,
+    "the postcondition must actually be reachable: {checked} observations",
+  );
+}
+
+#[test]
 fn a_dropped_disagreeing_hypothesiss_draw_survives_into_finalize() {
   // F1 (codex round 8). A three-hypothesis history where the MIDDLE hypothesis
   // disagrees and is dropped from `results` (`:395-400`, skipAppend) but is
@@ -846,14 +960,19 @@ fn a_revision_that_repeats_a_held_back_word_is_not_duplicated() {
   let mut agreement = LocalAgreement::new();
   agreement.ingest_streamed(settled());
   assert!(agreement.ingest_streamed(settled()).is_advanced());
-  assert_eq!(confirmed_texts(&agreement), vec![" A"]);
+  // Rule W (#94): the split may not cut at a tied start, so it widens past the
+  // tie -- one word moves from `last_agreed_words_slice()` into
+  // `confirmed_words_slice()` and the watermark moves to the first word past
+  // the tie. `confirmed ++ holdback` is unchanged, and the finalized text this
+  // test asserts is measured byte-identical either way.
+  assert_eq!(confirmed_texts(&agreement), vec![" A", " B"]);
   assert_eq!(
     agreement
       .last_agreed_words_slice()
       .iter()
       .map(WordTiming::word)
       .collect::<Vec<_>>(),
-    vec![" B", " C"],
+    vec![" C"],
   );
 
   let revision = || {
@@ -1023,14 +1142,19 @@ fn an_insertion_before_a_reproduced_confirmed_word_is_refused_with_it() {
       .ingest_streamed(result_with_words(vec![a(), b(), c()]))
       .is_advanced()
   );
+  // Rule W (#94): the split may not cut at a tied start, so it widens past the
+  // tie -- one word moves from `last_agreed_words_slice()` into
+  // `confirmed_words_slice()` and the watermark moves to the first word past
+  // the tie. `confirmed ++ holdback` is unchanged, and the finalized text this
+  // test asserts is measured byte-identical either way.
   assert_eq!(
     agreement
       .confirmed_words_slice()
       .iter()
       .map(WordTiming::word)
       .collect::<Vec<_>>(),
-    vec![" A"],
-    "confirmed [A], holding [B, C] at a 0.0 s watermark",
+    vec![" A", " B"],
+    "confirmed [A, B], holding [C] at a 1.0 s watermark",
   );
 
   agreement.ingest_streamed(result_with_words(vec![x(), a(), b(), c()]));
@@ -1076,13 +1200,18 @@ fn an_insertion_before_a_reproduced_confirmed_word_is_refused_on_the_advance() {
   agreement.ingest_streamed(result_with_words(vec![x(), a(), b(), c()]));
   agreement.ingest_streamed(result_with_words(vec![x(), a(), b(), c()]));
 
+  // Rule W (#94): the split may not cut at a tied start, so it widens past the
+  // tie -- one word moves from `last_agreed_words_slice()` into
+  // `confirmed_words_slice()` and the watermark moves to the first word past
+  // the tie. `confirmed ++ holdback` is unchanged, and the finalized text this
+  // test asserts is measured byte-identical either way.
   assert_eq!(
     agreement
       .confirmed_words_slice()
       .iter()
       .map(WordTiming::word)
       .collect::<Vec<_>>(),
-    vec![" A"],
+    vec![" A", " B"],
     "the advance path must not re-confirm A either",
   );
 }
@@ -1248,8 +1377,9 @@ fn tied_pair_confirmed() -> LocalAgreement {
       .iter()
       .map(WordTiming::word)
       .collect::<Vec<_>>(),
-    vec![" A", " B"],
-    "confirmed [A, B], holding [C, D] at a 0.0 s watermark",
+    vec![" A", " B", " C"],
+    "Rule W widens past the 0.0 s tie, so this is confirmed [A, B, C] holding \
+     [D] at a 1.0 s watermark -- `confirmed ++ holdback` unchanged",
   );
   agreement
 }
@@ -1318,8 +1448,9 @@ fn a_confirmed_tail_reproduced_without_its_head_is_still_refused_on_the_advance(
       .iter()
       .map(WordTiming::word)
       .collect::<Vec<_>>(),
-    vec![" A", " B"],
-    "the advance path must not re-confirm B either",
+    vec![" A", " B", " C"],
+    "the advance path must not re-confirm B either (\" C\" is Rule W's widening, \
+     not a re-admission)",
   );
 }
 
@@ -1391,8 +1522,9 @@ fn a_reproduction_behind_a_shorter_false_match_is_still_refused_on_the_advance()
       .iter()
       .map(WordTiming::word)
       .collect::<Vec<_>>(),
-    vec![" A", " B"],
-    "the advance path must not re-confirm A or B either",
+    vec![" A", " B", " C"],
+    "the advance path must not re-confirm A or B either (\" C\" is Rule W's \
+     widening, not a re-admission)",
   );
 }
 
@@ -1527,10 +1659,15 @@ fn a_distinct_repetition_of_a_confirmed_word_survives_the_continuing_stream() {
   let mut agreement = LocalAgreement::new();
   agreement.ingest_streamed(stutter());
   assert!(agreement.ingest_streamed(stutter()).is_advanced());
+  // Rule W (#94): the split may not cut at a tied start, so it widens past the
+  // tie -- one word moves from `last_agreed_words_slice()` into
+  // `confirmed_words_slice()` and the watermark moves to the first word past
+  // the tie. `confirmed ++ holdback` is unchanged, and the finalized text this
+  // test asserts is measured byte-identical either way.
   assert_eq!(
     confirmed_texts(&agreement),
-    vec![" A"],
-    "the advance confirms the first A and holds the distinct second one",
+    vec![" A", " A"],
+    "the advance settles both stuttered A's rather than cutting between them",
   );
 
   // The stream CONTINUES past that advance -- which is exactly what
@@ -1591,10 +1728,15 @@ fn a_reproduction_shifted_off_the_watermark_is_still_refused() {
       .ingest_streamed(result_with_words(vec![a(), b(), c()]))
       .is_advanced()
   );
+  // Rule W (#94): the split may not cut at a tied start, so it widens past the
+  // tie -- one word moves from `last_agreed_words_slice()` into
+  // `confirmed_words_slice()` and the watermark moves to the first word past
+  // the tie. `confirmed ++ holdback` is unchanged, and the finalized text this
+  // test asserts is measured byte-identical either way.
   assert_eq!(
     confirmed_texts(&agreement),
-    vec![" A"],
-    "confirmed [A], holding [B, C] at a 0.0 s watermark",
+    vec![" A", " B"],
+    "confirmed [A, B], holding [C] at a 1.0 s watermark",
   );
 
   let shifted = || {
@@ -1609,9 +1751,9 @@ fn a_reproduction_shifted_off_the_watermark_is_still_refused() {
   agreement.ingest_streamed(shifted());
   assert_eq!(
     confirmed_texts(&agreement),
-    vec![" A"],
+    vec![" A", " B"],
     "the shifted reproduction must not reach the confirmed list on the advance \
-     path either",
+     path either (\" B\" is Rule W's widening, not the reproduction)",
   );
 
   let text = agreement

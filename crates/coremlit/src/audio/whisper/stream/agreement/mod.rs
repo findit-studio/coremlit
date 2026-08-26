@@ -1561,7 +1561,58 @@ impl LocalAgreement {
       if common.len() >= self.agreement_count_needed {
         // :383-394 — advance the watermark.
         let requested = common.len() - self.agreement_count_needed;
-        let split = budgeted_split(common, requested, self.special_token_begin);
+        let mut split = budgeted_split(common, requested, self.special_token_begin);
+        // RULE W -- THE SPLIT MAY NOT CUT AT A TIED START (#94, at its source).
+        //
+        // The watermark is the first held-back word's start, and it is also the
+        // CLIP this engine hands its own next decoder. Cutting at a word whose
+        // start TIES the last confirmed one puts that boundary INSIDE a span
+        // already settled: the confirmed word then satisfies the offered filter's
+        // own `start >= watermark`, and the next hypothesis can re-offer it at
+        // the head of its word list. That is the state every re-admission defence
+        // in this issue's history was built to survive -- and the one that cannot
+        // be decided from the offered list, because a re-offered settled word and
+        // the stream's own second occurrence of the same text are byte-identical
+        // there. Refuse to CREATE it: widen past the tie instead.
+        //
+        // Postcondition: whenever `last_agreed_words` is non-empty,
+        // `confirmed_words.last().start() < last_agreed_seconds` strictly, so no
+        // confirmed word can ever pass the offered filter again.
+        //
+        // The anchor is the word the watermark would be measured against: the
+        // last word the split has already moved past (`common[split - 1]`) when
+        // it has moved past anything, and otherwise the engine's own last
+        // confirmed word, which is what the watermark would then sit beside. It
+        // is carried forward through the loop, so a RUN of tied starts is
+        // cleared in one pass rather than one word of it.
+        //
+        // Against `pending_words` this OVER-FIRES, deliberately.
+        // `common[split - 1]` is the last word this advance CONFIRMS only when
+        // every word `budgeted_split` widened past also ends at or before the
+        // new watermark; one that ends past it lands in `pending_words` instead
+        // -- the revisable half of `watermark_filtered_with`, where a tie
+        // creates no re-admission to defend against -- and this widens past it
+        // all the same. The postcondition holds either way, so the cost is
+        // conservatism: on a holdback whose tail ties, the split can run to the
+        // end of `common` and leave nothing held and nothing pending.
+        //
+        // Composes with `budgeted_split` in one direction only, which is why it
+        // runs after it: widening can only SHRINK the holdback `common[split..]`,
+        // so the token budget it just established still holds, and its id-filter
+        // floor is likewise never re-crossed (see `budgeted_split`). Where the
+        // tie runs to the end of `common` the holdback empties and the watermark
+        // falls back to `common.last().end()`, which is at or past every start in
+        // it -- the postcondition is then vacuous, and the next advance re-seeds
+        // the anchor from the confirmed list.
+        let mut anchor = if split > 0 {
+          Some(common[split - 1].start())
+        } else {
+          self.confirmed_words.last().map(WordTiming::start)
+        };
+        while split < common.len() && anchor.is_some_and(|tied| tied >= common[split].start()) {
+          anchor = Some(common[split].start());
+          split += 1;
+        }
         // The still-open record is REPLACED here -- `pending_words` dropped and
         // `last_agreed_words` overwritten -- because `common` is the span two
         // hypotheses have just re-agreed over it. That is a claim about this
