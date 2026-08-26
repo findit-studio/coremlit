@@ -105,39 +105,18 @@
 //!   An advance therefore holds back only what fits [`MAX_HOLDBACK_PREFILL_TOKENS`]
 //!   and CONFIRMS the rest; see `budgeted_split`.
 //!
-//!   The same split now also clears the prefill's OTHER reduction (codex round
-//!   8, finding 1): `prefill_tokens` drops every id at or above the vocabulary's
-//!   `special_token_begin`, and a word with no tokens contributes nothing to the
-//!   prefix at all, so either kind of held word leaves the engine reasoning
-//!   about text the decoder was never given — the premise
-//!   [`LocalAgreement::decoding_options_for_next`]'s retarget makes. It was
-//!   recorded as a residual for as long as the
-//!   argument was "`add_word_timestamps` strips those ids from everything this
-//!   crate emits", which is true and does not reach
-//!   [`LocalAgreement::ingest`]'s public hand-built path. **[BEHAVIOUR CHANGE]**
-//!   an advance takes such a word OUT of the holdback instead of holding it, so
-//!   more words leave the holdback per advance and `finalize`'s text keeps a
-//!   word it previously let a later hypothesis supersede. Unreachable through
-//!   [`LocalAgreementTranscriber`], whose words come from
-//!   `add_word_timestamps`.
-//!
-//!   **The threshold is the engine's, not a constant**
-//!   ([`LocalAgreement::special_token_begin`] **[new public accessor,
-//!   builder, and setter]**). It defaults to [`MIN_SPECIAL_TOKEN_BEGIN`]
-//!   **[public const]**, the minimum `special_token_begin` over the vocabularies
-//!   this crate is expected to load — a bound rather than the threshold, which is
-//!   what a hermetic engine can hold on its own and the only direction that errs
-//!   safely. Nothing makes that bound hold, though (codex round 12, finding 2):
-//!   [`crate::audio::whisper::tokenizer::WhisperTokenizer::from_folder`] accepts
-//!   any parseable `tokenizer.json` and probes `<|endoftext|>` for its own
-//!   threshold, so an artifact below the floor walks straight back into round 8's
-//!   defect. [`LocalAgreementTranscriber::new`] therefore hands the engine the
-//!   loaded vocabulary's own value — exact, and nothing to remember; a caller
-//!   driving `ingest` directly against such an artifact sets it itself.
-//!   Rejecting the artifact at LOAD would close the same hole by refusing a
-//!   vocabulary the rest of this crate decodes correctly, over a premise only
-//!   this module has a stake in, so the loader is left alone. The default is
-//!   today's constant, so no existing caller moves.
+//!   The split bounds the LENGTH trim only. `prefill_tokens` reduces a prefix a
+//!   second way — it drops every id at or above the loaded vocabulary's
+//!   `special_token_begin`, and a word carrying no tokens contributes nothing at
+//!   all — and this engine does not model that (codex round 8, finding 1;
+//!   round 12, finding 2). It does not have to:
+//!   `segment::update_segments_with_word_timings` strips exactly those ids from
+//!   every [`WordTiming`] this crate emits and emits no word at all for an
+//!   all-special alignment entry, so the pipeline cannot produce such a word,
+//!   and [`LocalAgreement::new`]/[`LocalAgreement::ingest`] are `pub(crate)`
+//!   (see the seal), so no caller outside this crate can hand one in either.
+//!   The residual the id filter used to carry is closed by the API surface
+//!   rather than by a vocabulary threshold the hermetic engine cannot know.
 //!
 //!   **A widened-past word is CONFIRMED on the spot.** The argument is round 8's:
 //!   a word the prefill cannot carry is neither corroborable nor revisable by a
@@ -245,7 +224,6 @@ use crate::audio::whisper::{
   result::{TranscriptionResult, WordTiming, merge_transcription_results_with_words},
   task_facts::{SpanKnowledge, TaskFactsAccumulator},
   text::{find_longest_common_prefix, find_longest_different_suffix},
-  tokenizer::MIN_SPECIAL_TOKEN_BEGIN,
   transcribe::WhisperKit,
 };
 
@@ -319,24 +297,15 @@ pub const DEFAULT_AGREEMENT_COUNT_NEEDED: usize = 2;
 /// but one: where nothing can be held it holds nothing, and the advance confirms
 /// the whole agreed prefix.
 ///
-/// The trim is a LENGTH bound only, and it is not the only way `prefill_tokens`
-/// reduces a prefix: it also drops every id at or above the vocabulary's
-/// `special_token_begin`, and contributes nothing at all for a word carrying no
-/// tokens. `budgeted_split` tests each candidate word against
-/// [`LocalAgreement::special_token_begin`] — the loaded vocabulary's own value
-/// where the engine was told it, and [`MIN_SPECIAL_TOKEN_BEGIN`] otherwise — and
-/// widens past every word that fails, exactly as it widens past an over-budget
-/// one. So no prefill this engine issues is ever trimmed OR filtered.
-///
-/// That id filter used to be recorded here as a residual, on the evidence that
-/// `add_word_timestamps` strips exactly those ids from every [`WordTiming`] it
-/// emits (`segment::update_segments_with_word_timings`, Swift
-/// `SegmentSeeker.swift:551-554`; an all-special timing emits no word at all).
-/// The evidence is correct — this crate's pipeline never produces such a word —
-/// but it does not cover [`LocalAgreement::ingest`], which is public and takes a
-/// hand-built [`TranscriptionResult`]. That path could hold back a filtered
-/// word, honestly pass the retarget, and still be recorded `prefilled`
-/// (codex round 8, finding 1); see `budgeted_split`.
+/// The trim is a LENGTH bound only. `prefill_tokens` also drops every id at or
+/// above the loaded vocabulary's `special_token_begin`, and contributes nothing
+/// at all for a word carrying no tokens — which `budgeted_split` does not model,
+/// because it cannot arise: `add_word_timestamps` strips exactly those ids from
+/// every [`WordTiming`] this crate emits and emits no word at all for an
+/// all-special alignment entry (`segment::update_segments_with_word_timings`,
+/// Swift `SegmentSeeker.swift:551-554`), and the engine's constructor and
+/// `ingest` are `pub(crate)`, so no caller outside this crate can hand one in
+/// (codex round 8, finding 1; codex round 12, finding 2).
 pub const MAX_HOLDBACK_PREFILL_TOKENS: usize = MAX_TOKEN_CONTEXT / 2;
 
 /// The LocalAgreement-2 hypothesis-confirmation engine: consumes one
@@ -383,9 +352,6 @@ pub struct LocalAgreement {
   /// [`Self::ingest`]) — the finalized schedule is the adjudicated `None` and the
   /// finalized span is restored from the merged surviving result (round 10).
   ingested_facts: TaskFactsAccumulator,
-  /// The vocabulary threshold `budgeted_split` tests a candidate held-back
-  /// word's ids against — see [`Self::special_token_begin`].
-  special_token_begin: u32,
 }
 
 impl Default for LocalAgreement {
@@ -410,7 +376,6 @@ impl LocalAgreement {
       confirmed_words: Vec::new(),
       results: Vec::new(),
       ingested_facts: TaskFactsAccumulator::new(),
-      special_token_begin: MIN_SPECIAL_TOKEN_BEGIN,
     }
   }
 
@@ -449,53 +414,6 @@ impl LocalAgreement {
     } else {
       agreement_count_needed
     };
-    self
-  }
-
-  // -- special_token_begin ---------------------------------------------------
-  /// The vocabulary's first special-token id, as this engine understands it:
-  /// `budgeted_split` holds back a word only when every one of its token ids is
-  /// BELOW this, because
-  /// [`prefill_tokens`](crate::audio::whisper::decode::prefill_tokens) drops the
-  /// rest before the decoder is given a single one of them.
-  ///
-  /// Defaults to [`MIN_SPECIAL_TOKEN_BEGIN`], the minimum over the vocabularies
-  /// this crate is expected to load — a BOUND, which is all a hermetic engine
-  /// can hold on its own and is the only direction that errs safely (see that
-  /// constant's own doc). The bound is not an invariant, though:
-  /// [`crate::audio::whisper::tokenizer::WhisperTokenizer::from_folder`] loads
-  /// any parseable `tokenizer.json` and probes `<|endoftext|>` for its own
-  /// threshold, so an artifact whose threshold is LOWER makes the default an
-  /// over-estimate — the engine would hold a word whose ids that artifact's
-  /// `prefill_tokens` erases, so the prefill the engine promises the next
-  /// hypothesis is one the decoder is given only part of (codex round 12,
-  /// finding 2).
-  ///
-  /// So it is a value rather than a constant. [`LocalAgreementTranscriber::new`]
-  /// sets it from the pipeline's own loaded vocabulary, which is exact and needs
-  /// nothing remembered; a caller driving [`Self::ingest`] directly against an
-  /// unusual artifact sets it with [`Self::with_special_token_begin`]. Leaving
-  /// it alone is exactly the behaviour every release before this one had.
-  #[inline(always)]
-  pub const fn special_token_begin(&self) -> u32 {
-    self.special_token_begin
-  }
-  /// Builder form of [`Self::set_special_token_begin`].
-  #[must_use]
-  #[inline(always)]
-  pub const fn with_special_token_begin(mut self, special_token_begin: u32) -> Self {
-    self.set_special_token_begin(special_token_begin);
-    self
-  }
-  /// Sets [`Self::special_token_begin`] in place. Unclamped, and deliberately:
-  /// a value ABOVE the deciding vocabulary's own threshold makes the engine hold
-  /// a word the decoder never receives, and a value below it only confirms a
-  /// word a round earlier than it had to. The caller owns the artifact, so the
-  /// caller supplies the fact, and it is checked where it can be:
-  /// [`LocalAgreementTranscriber`] reads it off the vocabulary itself.
-  #[inline(always)]
-  pub const fn set_special_token_begin(&mut self, special_token_begin: u32) -> &mut Self {
-    self.special_token_begin = special_token_begin;
     self
   }
 
@@ -740,7 +658,7 @@ impl LocalAgreement {
       if common.len() >= self.agreement_count_needed {
         // :383-394 — advance the watermark.
         let requested = common.len() - self.agreement_count_needed;
-        let mut split = budgeted_split(common, requested, self.special_token_begin);
+        let mut split = budgeted_split(common, requested);
         // RULE W -- THE SPLIT MAY NOT CUT AT A TIED START (#94, at its source).
         //
         // The watermark is the first held-back word's start, and it is also the
@@ -932,47 +850,23 @@ impl LocalAgreement {
 ///
 /// The holdback is not merely "the last few agreed words": it is the text
 /// [`LocalAgreement::decoding_options_for_next`] forces into the next
-/// hypothesis, and `prefill_tokens` reduces `prefix_tokens` on its way there in
-/// two independent ways — it keeps only the last [`MAX_HOLDBACK_PREFILL_TOKENS`]
-/// ids, and it drops every id at or above the vocabulary's
-/// `special_token_begin`. A holdback the decoder cannot be given whole is not a
-/// holdback at all — the words the filter erases would be neither reproduced
-/// (the decoder never sees their tokens) nor confirmed (an advance replaces the
-/// holdback with the new `common[split..]`), so they would simply vanish from
-/// the transcript.
+/// hypothesis, and
+/// [`prefill_tokens`](crate::audio::whisper::decode::prefill_tokens) keeps only
+/// the last [`MAX_HOLDBACK_PREFILL_TOKENS`] ids of it. A holdback the decoder
+/// cannot be given whole is not a holdback at all — the words the trim erases
+/// would be neither reproduced (the decoder never sees their tokens) nor
+/// confirmed (an advance replaces the holdback with the new `common[split..]`),
+/// so they would simply vanish from the transcript.
 ///
-/// **Both filters are enforced here, and the id one is enforced against
-/// `special_token_begin`** (codex round 8, finding 1) — the deciding
-/// vocabulary's own threshold, which
-/// [`LocalAgreement::special_token_begin`] carries and
-/// [`LocalAgreementTranscriber::new`] reads off the pipeline's loaded tokenizer.
-/// A word with no tokens at all fails the same test for a different reason: it
-/// contributes nothing to `prefix_tokens`, so the decoder is never given it
-/// either, and no threshold is needed to see that.
-///
-/// The engine holds no tokenizer of its own, so with nothing supplied that value
-/// is [`MIN_SPECIAL_TOKEN_BEGIN`] — a BOUND rather than the threshold, which is
-/// what a hermetic engine can hold and which errs in the only safe direction.
-/// The bound is not self-enforcing (codex round 12, finding 2):
-/// [`crate::audio::whisper::tokenizer::WhisperTokenizer::from_folder`] accepts
-/// any parseable `tokenizer.json` and probes `<|endoftext|>` for its threshold,
-/// so an artifact below the floor turns the bound into an over-estimate and
-/// walks straight back into round 8's defect — a word held on the strength of a
-/// filter that will erase it. Rejecting such an artifact at load would fix it by
-/// refusing a vocabulary this crate otherwise decodes correctly, for a premise
-/// only this module has a stake in; supplying the real value fixes it where the
-/// value is known and costs nothing where it is not. See
-/// [`LocalAgreement::special_token_begin`].
-///
-/// That this engine could not evaluate the id filter used to be recorded as a
-/// residual, on the evidence that `add_word_timestamps` strips exactly those ids
-/// from every [`WordTiming`] it emits (and emits no word at all for an
-/// all-special alignment entry). The evidence is correct and the pipeline really
-/// is clean. What it does not cover is [`LocalAgreement::ingest`] itself, which
-/// is public and takes a hand-built [`TranscriptionResult`], so a caller can
-/// hold back a word carrying filtered ids and then use
-/// [`LocalAgreement::decoding_options_for_next`] honestly, leaving the engine
-/// promising the decoder text it will never be given.
+/// `prefill_tokens` reduces a prefix a SECOND way — it drops every id at or
+/// above the loaded vocabulary's `special_token_begin` — and this does not model
+/// that (codex round 8, finding 1). The premise that made it a residual is now
+/// total rather than partial: `segment::update_segments_with_word_timings`
+/// strips exactly those ids from every [`WordTiming`] this crate emits and emits
+/// no word at all for an all-special alignment entry, so the pipeline cannot
+/// produce such a word, and [`LocalAgreement::new`]/[`LocalAgreement::ingest`]
+/// are `pub(crate)`, so no caller outside this crate can hand one in. See this
+/// module's doc.
 ///
 /// Widening the split instead takes that head OUT of the holdback and CONFIRMS
 /// it. That is not a weaker claim than any other agreed word carries: `common`
@@ -1023,19 +917,8 @@ impl LocalAgreement {
 /// bites only for a direct caller that raised
 /// [`LocalAgreement::agreement_count_needed`] far enough, and for that caller
 /// the count becomes a maximum rather than an exact width.
-fn budgeted_split(common: &[WordTiming], requested: usize, special_token_begin: u32) -> usize {
-  // THE ID FILTER FIRST, as a floor. `prefill_tokens` drops ids at or above the
-  // vocabulary's `special_token_begin` and contributes nothing at all for a word
-  // with no tokens, so a holdback containing either is one the decoder is not
-  // given whole -- and the split has to clear the LAST such word, not the first,
-  // since the holdback is `common[split..]` and only a split past a word removes
-  // it. Widening past it can never re-introduce one, so this floor and the
-  // budget loop below compose in one direction: the loop only ever moves `split`
-  // further right.
-  let mut split = common[requested..]
-    .iter()
-    .rposition(|word| !prefill_carries_whole(word, special_token_begin))
-    .map_or(requested, |last| requested + last + 1);
+fn budgeted_split(common: &[WordTiming], requested: usize) -> usize {
+  let mut split = requested;
   let mut tokens: usize = common[split..]
     .iter()
     .map(|word| word.tokens_slice().len())
@@ -1050,25 +933,6 @@ fn budgeted_split(common: &[WordTiming], requested: usize, special_token_begin: 
     split += 1;
   }
   split
-}
-
-/// Whether [`prefill_tokens`](crate::audio::whisper::decode::prefill_tokens)
-/// carries this word's tokens into the initial prompt WHOLE — the property every
-/// held-back word has to have for
-/// [`LocalAgreement::decoding_options_for_next`]'s retarget to promise the
-/// decoder text it will actually be given.
-///
-/// Two ways to fail, and the empty one needs no vocabulary knowledge at all: a
-/// word with NO tokens contributes nothing to `prefix_tokens`, so a prefix equal
-/// to the holdback is equal to a sequence that never mentions it. The other is
-/// the id filter, tested against `special_token_begin` — the deciding
-/// vocabulary's own threshold where the engine was told it
-/// ([`LocalAgreement::special_token_begin`]), and otherwise the floor
-/// [`MIN_SPECIAL_TOKEN_BEGIN`]; see `budgeted_split` for why over-estimating the
-/// special range is the safe direction.
-fn prefill_carries_whole(word: &WordTiming, special_token_begin: u32) -> bool {
-  let tokens = word.tokens_slice();
-  !tokens.is_empty() && tokens.iter().all(|&id| id < special_token_begin)
 }
 
 // ---------------------------------------------------------------------
@@ -1108,20 +972,11 @@ impl<'ctx, B> LocalAgreementTranscriber<'ctx, B> {
   /// has nothing to agree over without word timings); Swift leaves this to
   /// a user-supplied CLI flag instead.
   ///
-  /// Also hands the engine `kit`'s own vocabulary threshold. The engine's
-  /// default, [`MIN_SPECIAL_TOKEN_BEGIN`], is a bound over the vocabularies this
-  /// crate is expected to load, and nothing makes an artifact honour it — but
-  /// this driver holds the very tokenizer whose
-  /// [`prefill_tokens`](crate::audio::whisper::decode::prefill_tokens) call will
-  /// apply the filter the bound is standing in for, so on this path the exact
-  /// value is free and nothing has to be remembered (codex round 12,
-  /// finding 2). See [`LocalAgreement::special_token_begin`].
   pub fn new(kit: &'ctx WhisperKit<B>, options: DecodingOptions) -> Self {
     Self {
       kit,
       options: options.with_word_timestamps(),
-      agreement: LocalAgreement::new()
-        .with_special_token_begin(kit.tokenizer().special_tokens().special_token_begin()),
+      agreement: LocalAgreement::new(),
       buffer: Vec::new(),
       transcribed_samples: 0,
     }

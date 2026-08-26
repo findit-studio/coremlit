@@ -40,45 +40,6 @@ const DEFAULT_NO_SPEECH_TOKEN: u32 = 50_362;
 const DEFAULT_NO_TIMESTAMPS_TOKEN: u32 = 50_363;
 const DEFAULT_TIME_TOKEN_BEGIN: u32 = 50_364;
 
-/// The LOWEST `special_token_begin` any Whisper vocabulary reports — the
-/// conservative test for "a decoder might treat this id as special" available
-/// to code that holds no tokenizer.
-///
-/// [`SpecialTokens::special_token_begin`] is probed per vocabulary
-/// (`<|endoftext|>`'s id), so it is a property of the loaded artifact rather
-/// than a constant: multilingual Whisper puts it at
-/// `DEFAULT_SPECIAL_TOKEN_BEGIN` (`50257`, the value every tokenizer under
-/// `Models/tokenizers/` probes to), and English-only Whisper — the `51864`-vocab
-/// variants [`crate::audio::whisper::model::detect_variant`] recognizes as
-/// `tiny.en`/`base.en`/`small.en`/`medium.en` — reuses GPT-2's table, where
-/// `<|endoftext|>` is `50256` and every special id shifts down by one. This is
-/// the minimum of the two, so `id < MIN_SPECIAL_TOKEN_BEGIN` implies `id <
-/// special_token_begin` for EITHER family.
-///
-/// It is deliberately a floor rather than "the" threshold. Over-estimating a
-/// vocabulary's special range only makes a caller treat one ORDINARY
-/// multilingual id — `50256`, which that vocabulary maps to the empty string —
-/// as though a filter might drop it; under-estimating it lets a genuinely
-/// filtered id through. [`crate::audio::whisper::stream::agreement`]'s holdback
-/// is the caller this exists for: it must decide, with no tokenizer in hand,
-/// whether [`crate::audio::whisper::decode::prefill_tokens`] will carry a word's
-/// tokens into the initial prompt whole.
-///
-/// **It is a DEFAULT, not an invariant, and nothing here enforces it.**
-/// [`WhisperTokenizer::from_folder`] loads any parseable `tokenizer.json` and
-/// takes [`SpecialTokens::special_token_begin`] from whatever `<|endoftext|>`
-/// that artifact happens to map to — including something lower, which would make
-/// this an OVER-estimate of nothing and an UNDER-estimate of that vocabulary's
-/// special range. The loader deliberately does not reject such an artifact: this
-/// bound is one module's premise, the rest of the crate decodes such a
-/// vocabulary correctly, and refusing the load would take the whole pipeline down
-/// over a streaming-only concern. The engine takes the real value instead — see
-/// [`crate::audio::whisper::stream::agreement::LocalAgreement::special_token_begin`],
-/// which defaults to this and which
-/// [`crate::audio::whisper::stream::agreement::LocalAgreementTranscriber::new`]
-/// sets from the loaded vocabulary.
-pub const MIN_SPECIAL_TOKEN_BEGIN: u32 = 50_256;
-
 /// Whisper's fixed special-token ids, resolved from the loaded tokenizer's
 /// vocabulary with Swift's hardcoded defaults as fallback for any probe
 /// that misses (Swift `SpecialTokens`, `Models.swift:1111-1149`; probed in
