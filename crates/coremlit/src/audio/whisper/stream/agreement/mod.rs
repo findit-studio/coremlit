@@ -65,11 +65,23 @@
 //!
 //!   **Postcondition** — whenever [`LocalAgreement::last_agreed_words_slice`] is
 //!   non-empty, `confirmed_words.last().start() < last_agreed_seconds`
-//!   STRICTLY. No confirmed word can satisfy the offered filter's own
-//!   `start >= watermark`, so none can ever head a hypothesis and the
-//!   re-admission question is unrepresentable rather than defended against.
-//!   Adjudicated: Swift shares the bug, and "confirmed once and stable" wins
-//!   over parity here.
+//!   STRICTLY, so the LAST confirmed word cannot satisfy the offered filter's
+//!   own `start >= watermark` and cannot head a hypothesis. The re-admission
+//!   question is then unrepresentable rather than defended against. Adjudicated:
+//!   Swift shares the bug, and "confirmed once and stable" wins over parity here.
+//!
+//!   It is a claim about the LAST confirmed word, and that is as strong as it
+//!   needs to be exactly while word starts inside one hypothesis are
+//!   non-decreasing: `find_alignment` guarantees
+//!   `w[i].end() <= w[i + 1].start() + 1e-4`, so an earlier confirmed word
+//!   starts at or before the last one and so also before the watermark. It is
+//!   NOT a claim about the whole list under a hypothesis whose starts run
+//!   BACKWARDS — offered `[P@5.0, Q@1.0, R@2.0]` confirms `[P, Q]` at a 2.0 s
+//!   watermark, and `P` then passes the offered filter while `Q` does not
+//!   (measured). That input is unreachable now: `ingest` is `pub(crate)` and its
+//!   only in-crate caller is [`LocalAgreementTranscriber::push_samples`], whose
+//!   words come from `add_word_timestamps`. It is one more thing the seal below
+//!   is holding up, and one more reason the grep gate exists.
 //!
 //!   **[BEHAVIOUR CHANGE]** the rule confirms one word EARLIER on a tied input,
 //!   trading one round of revisability for a clip boundary that does not bisect
@@ -246,6 +258,50 @@
 //!
 //! `the_engine_exposes_no_public_mutator` in `tests/whisper/streaming.rs` is the
 //! falsifier: it greps this file and reds if any of those names is re-published.
+//!
+//! # Residuals
+//!
+//! Stated with the sequence that reaches each, rather than claimed closed. The
+//! module makes no totality claim.
+//!
+//! 1. **An empty holdback leaves a zero-duration word AT the watermark.** With
+//!    nothing held back the watermark anchors at `common.last().end()` instead
+//!    of the first held word's start, and Rule W has no `common[split]` to
+//!    anchor against — so a word with `start == end` there satisfies the offered
+//!    filter and a re-decode can confirm it twice. Needs a non-default
+//!    [`LocalAgreement::agreement_count_needed`], a word whose own tokens exceed
+//!    [`MAX_HOLDBACK_PREFILL_TOKENS`], and a zero-duration word, simultaneously.
+//!    `an_empty_holdback_leaves_a_zero_duration_word_at_the_watermark`; the very
+//!    next advance repairs it
+//!    (`the_split_widens_past_a_tie_with_the_confirmed_list_itself`).
+//! 2. **A repeat the engine's record cannot account for** is the stream's own,
+//!    on the untied input — and on a TIED one Rule W deletes it instead. Both
+//!    directions are pinned:
+//!    `a_distinct_repetition_of_a_confirmed_word_survives_the_continuing_stream`
+//!    and `rule_w_deletes_an_unaccounted_repeat_of_a_settled_word`.
+//! 3. **Drift wider than the gap in front of the watermark.** A re-decode free
+//!    to move every timestamp it emits can push a settled word past the
+//!    watermark, where it reads as new speech rather than as a re-admission.
+//!    Pre-existing on `main`; under
+//!    `LocalAgreement::decoding_options_for_next` such a word is outside the
+//!    clip window and behind the forced prefill, so the driver cannot reach it.
+//! 4. **A crate-internal caller could still order the calls wrongly.** The seal
+//!    is privacy plus a grep gate, not a type. There is one call site —
+//!    [`LocalAgreementTranscriber::push_samples`], three lines in this file —
+//!    and nothing stops a future in-crate caller from handing `ingest` a result
+//!    it did not decode from `decoding_options_for_next`. Inverting the seam
+//!    (an engine-side `step(|options| decode(options))`) would make the ordering
+//!    unbreakable in-crate; flagged, not taken.
+//! 5. **A VAD-dropped chunk at [`LocalAgreementTranscriber::finalize`].** A
+//!    caller setting `chunking_strategy = Vad` on a stream longer than one
+//!    window can lose a chunk covering the holdback's span; the final hypothesis
+//!    then disagrees, the `holdback_superseded` path fires, and the record is
+//!    replaced by words that never re-read it. Pre-existing on `main` and
+//!    unchanged here — the coverage model this branch briefly carried did not
+//!    close it either, because the nominal clip schedule is not the effective
+//!    coverage. `task_facts().had_swallowed_error()` is a fact the PIPELINE
+//!    recorded rather than caller testimony and could preserve the record;
+//!    flagged, not taken.
 
 use crate::audio::whisper::{
   backend::InferenceBackend,
