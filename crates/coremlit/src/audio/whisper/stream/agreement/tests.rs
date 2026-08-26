@@ -1746,6 +1746,82 @@ fn a_confirmed_word_from_before_the_watermark_is_out_of_the_alignment() {
   );
 }
 
+#[test]
+fn a_recurring_phrase_does_not_delete_the_words_between_its_occurrences() {
+  // #94, the re-admission FRONTIER's own deletion failure mode -- the direction
+  // this section calls "worse than the duplication the ledger records", reached
+  // by the rule that closed the ledger. It fires whenever a phrase RECURS inside
+  // one decode window, which is the shape Whisper's repetition loop manufactures
+  // and which the crate's own canonical phrase contains twice.
+  //
+  // The frontier aligns `settled ++ holdback` as a WHOLE, and a globally optimal
+  // alignment is free to explain the settled word by an EARLIER occurrence and
+  // the whole holdback by a LATER one. The seam then cuts past both, and every
+  // word BETWEEN the two occurrences is refused -- never confirmed, never held,
+  // and never re-offerable, because the advance that follows moves the watermark
+  // past them.
+  //
+  //   settled  [" the"]                       confirmed, end == watermark
+  //   holdback [" cat", " sat"]               forced into the next decode
+  //   offered  [" cat"," sat"," on"," the"," cat"," sat"," down"]
+  //   scores   [2, 2, 2, 2, 3, 2, 1, 1]       best 3, smallest optimal seam 4
+  //   REFUSED  [" cat"," sat"," on"," the"]   kept [" cat"," sat"," down"]
+  //
+  // `prev_words` is `[" cat", " sat"]` and the kept head is `[" cat", " sat"]`,
+  // so the two still AGREE. The advance fires, installs the LATER occurrence as
+  // the holdback, drops the earlier one, and moves the watermark from 1.0 s to
+  // 5.0 s -- past " on" and past the second " the", which the stream produced
+  // and nothing revised.
+  //
+  //   ingest    [the@0, cat@1, sat@2] twice        -> confirmed [the], held [cat, sat]
+  //   ingest    [the@0, cat@1, sat@2, on@3, the@4, cat@5, sat@6, down@7]
+  let the = |start: f32| word(" the", start, start + 1.0);
+  let cat = |start: f32| word(" cat", start, start + 1.0);
+  let sat = |start: f32| word(" sat", start, start + 1.0);
+  let opening = || result_with_words(vec![the(0.0), cat(1.0), sat(2.0)]);
+
+  let mut agreement = LocalAgreement::new();
+  agreement.ingest_streamed(opening());
+  assert!(agreement.ingest_streamed(opening()).is_advanced());
+  assert_eq!(
+    confirmed_texts(&agreement),
+    vec![" the"],
+    "confirmed [the], holding [cat, sat] at a 1.0 s watermark",
+  );
+
+  // The window has grown far enough ahead of the watermark to contain the
+  // phrase a second time -- the only thing the green golden run lacks.
+  assert!(
+    agreement
+      .ingest_streamed(result_with_words(vec![
+        the(0.0),
+        cat(1.0),
+        sat(2.0),
+        word(" on", 3.0, 4.0),
+        the(4.0),
+        cat(5.0),
+        sat(6.0),
+        word(" down", 7.0, 8.0),
+      ]))
+      .is_advanced(),
+    "the refused prefix leaves both sides agreeing, so the watermark still moves",
+  );
+
+  let text = agreement
+    .finalize(&crate::audio::whisper::options::DecodingOptions::new())
+    .text()
+    .to_string();
+  assert!(
+    text.contains(" on"),
+    "the word between the two occurrences was deleted: {text:?}"
+  );
+  assert_eq!(
+    text.matches(" the").count(),
+    2,
+    "both occurrences of the recurring word must reach the transcript: {text:?}"
+  );
+}
+
 // ---------------------------------------------------------------------
 // What the frontier rule deliberately LEAVES
 // ---------------------------------------------------------------------
