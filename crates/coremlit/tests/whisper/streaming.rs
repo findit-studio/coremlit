@@ -241,22 +241,26 @@ fn check_confirmed_is_prefix_of_batch(
     // produce it, and both are guarded with hermetic falsifiers in
     // `stream/agreement/tests.rs`: `LocalAgreement::finalize` folding in BOTH
     // the held-back words and the last pair's differing suffix
-    // (`holdback_superseded`), and `LocalAgreement::watermark_filtered`'s
-    // re-admission frontier (issue #94's ledger, now the named property tests
-    // in that file). The frontier keeps ONE documented residual —
-    // `an_unaccounted_repeat_of_a_settled_word_is_kept_as_the_streams_own`: an
-    // offered list carrying more copies of a settled word than the engine's own
-    // record accounts for is read as the stream repeating it. Check that
-    // residual first, then the decode.
+    // (`holdback_superseded`), and a word confirmed twice across strides. The
+    // second is closed at its source by RULE W (issue #94) — the advance never
+    // puts the watermark at a word whose start ties the last confirmed one, so
+    // `confirmed.last().start() < last_agreed_seconds` strictly and no
+    // confirmed word can pass `watermark_filtered`'s `start >= watermark`
+    // again. `the_split_never_cuts_at_a_tied_start` sweeps that postcondition.
+    // The rule leaves ONE way back in, recorded there: with an EMPTY holdback
+    // the watermark anchors at the last confirmed word's END, so a
+    // zero-duration word there still ties it. Check that residual first, then
+    // the decode.
     None => report.push_str(&format!(
       "  every shared position matched, but the confirmation is {} word(s) LONGER \
        than the batch transcript — i.e. it emitted words the batch decode never \
        produced. Suspect a word confirmed TWICE before suspecting the decode: \
-       `LocalAgreement::watermark_filtered`'s re-admission frontier keeps one \
-       documented residual (issue #94 — a repeat its record cannot account for \
-       is kept as the stream's own; see \
-       `an_unaccounted_repeat_of_a_settled_word_is_kept_as_the_streams_own` in \
-       `stream/agreement/tests.rs`), and `LocalAgreement::finalize` folds in \
+       Rule W (issue #94) makes a re-admission unrepresentable while the \
+       holdback is non-empty, but leaves one documented residual — an EMPTY \
+       holdback anchors the watermark at the last confirmed word's END, so a \
+       zero-duration word there ties it; see \
+       `the_split_never_cuts_at_a_tied_start` in \
+       `stream/agreement/tests.rs` — and `LocalAgreement::finalize` folds in \
        both the held-back words and the last pair's differing suffix behind the \
        `holdback_superseded` guard.\n",
       confirmed_words.len().saturating_sub(batch_words.len()),
