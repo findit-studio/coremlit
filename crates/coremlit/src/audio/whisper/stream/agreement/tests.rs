@@ -23,8 +23,8 @@ fn word_of_tokens(text: &str, start: f32, end: f32, token_count: usize) -> WordT
 /// [`MIN_SPECIAL_TOKEN_BEGIN`], so the filter drops the lot and the word
 /// contributes NOTHING to the initial prompt. `add_word_timestamps` never emits
 /// one — it strips exactly those ids and skips an alignment entry that has
-/// nothing left — so this is a hand-built shape, which is precisely the call
-/// shape [`LocalAgreement::ingest`]'s `decoded_under` parameter exists for.
+/// nothing left — so this is a hand-built shape, reachable only through
+/// [`LocalAgreement::ingest`]'s public, hand-built [`TranscriptionResult`].
 fn special_only_word(text: &str, start: f32, end: f32) -> WordTiming {
   WordTiming::new(text, vec![MIN_SPECIAL_TOKEN_BEGIN], start, end, 0.9)
 }
@@ -74,23 +74,18 @@ fn initial_prompt_for(
 // defaults for these either") — same brief-vs-shipped-API fix as
 // `tests/pipeline.rs`'s `tiny_options`/`tests/parity_jfk.rs`. Both call sites
 // below pass the real values directly instead.
-/// Ingest the way [`LocalAgreementTranscriber::push_samples`] does: under the
-/// options the engine itself issued for its current state, so the prefill
-/// premise `LocalAgreement::prefill_reproduces_holdback` checks is ESTABLISHED
-/// rather than assumed.
-///
-/// Every test below that is modelling the streaming loop goes through this. The
-/// bare [`LocalAgreement::ingest`] is the UNMARKED path — a result decoded some
-/// other way — and the tests that mean that call it directly, with the options
-/// they mean.
+/// Ingest the way [`LocalAgreementTranscriber::push_samples`] does. The driver
+/// retargets its options through
+/// [`LocalAgreement::decoding_options_for_next`] between strides; the engine
+/// itself takes only the result, so this is a one-line alias kept for the
+/// streaming-shaped tests to read as what they model.
 trait IngestStreamed {
   fn ingest_streamed(&mut self, result: TranscriptionResult) -> AgreementOutcome;
 }
 
 impl IngestStreamed for LocalAgreement {
   fn ingest_streamed(&mut self, result: TranscriptionResult) -> AgreementOutcome {
-    let options = self.decoding_options_for_next(&DecodingOptions::new());
-    self.ingest(result, &options)
+    self.ingest(result)
   }
 }
 
@@ -1212,18 +1207,6 @@ fn confirmed_texts(agreement: &LocalAgreement) -> Vec<&str> {
     .collect()
 }
 
-/// `pending_words_slice()` as text — the agreed-but-not-yet-irrevocable head of
-/// the holdback. Always read in the SAME assertion as `confirmed_texts`, so the
-/// boundary between the two is pinned rather than implied: a mutation that moves
-/// a word across it fails the pair even though the concatenation is unchanged.
-fn pending_texts(agreement: &LocalAgreement) -> Vec<&str> {
-  agreement
-    .pending_words_slice()
-    .iter()
-    .map(WordTiming::word)
-    .collect()
-}
-
 #[test]
 fn a_distinct_repetition_of_a_confirmed_word_survives_the_continuing_stream() {
   // #94 (codex round 3, finding 2) -- the ledger's OTHER face, a DELETION rather
@@ -1619,10 +1602,11 @@ fn a_re_utterance_separated_from_the_watermark_keeps_its_word() {
 #[test]
 fn the_next_strides_prefill_is_the_holdback_verbatim() {
   // THE PREMISE, pinned as the fact it is: the engine WRITES the holdback into
-  // the next hypothesis rather than asking for it. That is what makes a marked
-  // continuation unable to put anything in front of the holdback, which is what
-  // `prefill_reproduces_holdback` and the pending promotion rest on. This
-  // asserts the two halves of that contract that live in this module:
+  // the next hypothesis rather than asking for it. That is what makes the next
+  // hypothesis a RE-AGREEMENT over the span the holdback covers rather than an
+  // independent reading of it, and it is what `budgeted_split`'s whole budget
+  // argument is about. This asserts the two halves of that contract that live in
+  // this module:
   //
   //   * `prefix_tokens` is the holdback's own tokens, in order, concatenated --
   //     not a count, not a summary. `decode::prefill_tokens` appends them to the
@@ -1751,12 +1735,9 @@ fn an_over_budget_holdback_is_capped_rather_than_silently_truncated() {
     "five words were asked for; three is what 112 tokens can carry",
   );
   assert_eq!(
-    (confirmed_texts(&agreement), pending_texts(&agreement)),
-    (vec![" w0", " w1", " w2", " w3"], Vec::<&str>::new()),
-    "the two words that could not be held are CONFIRMED, not dropped -- and \
-     confirmed OUTRIGHT, not left pending: both end at or before the watermark, \
-     so no word the engine will ever be offered again can overlap them (codex \
-     round 12, finding 1)",
+    confirmed_texts(&agreement),
+    vec![" w0", " w1", " w2", " w3"],
+    "the two words that could not be held are CONFIRMED, not dropped",
   );
   // The face that matters to the decoder: what the next stride will prefill.
   assert_eq!(
@@ -1775,11 +1756,8 @@ fn an_over_budget_holdback_is_capped_rather_than_silently_truncated() {
   agreement.ingest_streamed(onward());
   assert!(agreement.ingest_streamed(onward()).is_advanced());
   assert_eq!(
-    (confirmed_texts(&agreement), pending_texts(&agreement)),
-    (
-      vec![" w0", " w1", " w2", " w3", " w4", " w5"],
-      Vec::<&str>::new()
-    ),
+    confirmed_texts(&agreement),
+    vec![" w0", " w1", " w2", " w3", " w4", " w5"],
     "confirmation kept moving, and nothing was retracted",
   );
 
@@ -1832,12 +1810,9 @@ fn a_holdback_word_the_prefill_cannot_carry_is_confirmed_rather_than_held() {
 
   // The streaming face, read between pushes: both agreed words are settled,
   // because the second one is a word the engine can never hand a decoder whole.
-  // Settled OUTRIGHT rather than left pending -- the watermark is " H"'s own
-  // end, so the still-open span starts where " H" stops and can never overlap
-  // it (codex round 12, finding 1).
   assert_eq!(
-    (confirmed_texts(&agreement), pending_texts(&agreement)),
-    (vec![" A", " H"], Vec::<&str>::new()),
+    confirmed_texts(&agreement),
+    vec![" A", " H"],
     "a word the prefill cannot carry is CONFIRMED, never held",
   );
   assert!(
@@ -1890,13 +1865,10 @@ fn a_holdback_word_the_prefill_would_filter_is_confirmed_rather_than_held() {
   // `prefill_tokens` reduces `prefix_tokens` twice on its way to the decoder: it
   // keeps only the last `MAX_HOLDBACK_PREFILL_TOKENS` ids, AND it drops every id
   // at or above the vocabulary's `special_token_begin`. `budgeted_split` bounded
-  // only the first, and `prefill_reproduces_holdback` proves the caller's prefix
-  // EQUALS the holdback -- which is exactly as true for a holdback whose tokens
-  // the second filter erases. So a hand-built stream can settle a word, hold a
-  // word made of ids the decoder never receives, pass the retarget
-  // `decoding_options_for_next` just issued, and have `ProvenancedResult` record
-  // `prefilled = true` for a hypothesis the engine did NOT write the holdback
-  // into.
+  // only the first. So a hand-built stream can settle a word, hold a word made
+  // of ids the decoder never receives, and have `decoding_options_for_next`
+  // issue a retarget that promises the decoder a holdback it will never be
+  // given.
   //
   // REACHABILITY, since round 3 classified this half unreachable. That
   // classification's evidence is correct -- `update_segments_with_word_timings`
@@ -1911,13 +1883,8 @@ fn a_holdback_word_the_prefill_would_filter_is_confirmed_rather_than_held() {
   // NEITHER SEAM IS THE REPAIR, which is why the fix is in the split. Read the
   // arithmetic of this very stream three ways:
   //
-  //   - held and read MARKED (the defect): " S" is never confirmed, the
-  //     re-offer supersedes the holdback that carried it, and the transcript
-  //     loses it -- " A A Y C".
-  //   - held and read UNATTRIBUTED (refuse the marked reading): the offered head
-  //     is cut as well, so the stream loses " S" AND the " A" that replaced it --
-  //     " A Y C". Refusing is not the conservative choice here; the state is the
-  //     defect, not the reading of it.
+  //   - HELD (the defect): " S" is never confirmed, the re-offer supersedes the
+  //     holdback that carried it, and the transcript loses it -- " A A Y C".
   //   - CONFIRMED instead of held (this fix): " A S A Y C", every word two
   //     hypotheses agreed on, and the later revision still applied.
   //
@@ -1957,11 +1924,9 @@ fn a_holdback_word_the_prefill_would_filter_is_confirmed_rather_than_held() {
   // The streaming face, read between pushes: the word the prefill cannot carry
   // is SETTLED, and the holdback is the one word that survives the filter whole.
   assert_eq!(
-    (confirmed_texts(&agreement), pending_texts(&agreement)),
-    (vec![" A", " S"], Vec::<&str>::new()),
-    "a word the decoder can never be given is CONFIRMED, never held -- and \
-     outright, since \" S\" ends exactly where the watermark starts and no \
-     offered word can overlap it (codex round 12, finding 1)",
+    confirmed_texts(&agreement),
+    vec![" A", " S"],
+    "a word the decoder can never be given is CONFIRMED, never held",
   );
   assert_eq!(
     agreement
@@ -1979,9 +1944,8 @@ fn a_holdback_word_the_prefill_would_filter_is_confirmed_rather_than_held() {
   );
 
   // The face the decoder sees: every id the engine issues survives BOTH of
-  // `prefill_tokens`'s reductions, so the equality
-  // `prefill_reproduces_holdback` checks really does establish that the
-  // hypothesis was written to begin with the whole holdback.
+  // `prefill_tokens`'s reductions, so the retarget really does hand the decoder
+  // the whole holdback.
   let next = agreement.decoding_options_for_next(&DecodingOptions::new());
   assert!(
     next
@@ -2313,8 +2277,8 @@ fn the_first_strides_prompt_is_the_bare_start_of_transcript() {
 #[test]
 #[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
 fn the_prefill_reaches_decode_text_as_the_whole_holdback() {
-  // The contract `LocalAgreement::prefill_reproduces_holdback` rests on, pinned
-  // at the layer that decides it. `DecodingOptions::prefix_tokens` is
+  // The contract `budgeted_split`'s budget argument rests on, pinned at the
+  // layer that decides it. `DecodingOptions::prefix_tokens` is
   // only what the engine RECORDED; `prefill_tokens` keeps just the last
   // `MAX_TOKEN_CONTEXT / 2` of them and drops every id at or above
   // `special_token_begin` before `decode_text` sees a single token. What the
@@ -2383,122 +2347,109 @@ fn the_prefill_reaches_decode_text_as_the_whole_holdback() {
 }
 
 #[test]
-fn an_empty_holdback_leaves_nothing_pending_because_nothing_could_ever_clear_it() {
-  // The second half of the advance's reachability split, and the reason the
-  // promotion above can read `prefill_reproduces_holdback` without ever reading
-  // it VACUOUSLY. That predicate answers TRUE for anything when the holdback is
-  // empty -- a state `budgeted_split` reaches by design (round 7, finding 2).
+fn an_empty_holdback_leaves_a_zero_duration_word_at_the_watermark() {
+  // RULE W's ONE RESIDUAL, characterized rather than closed. The postcondition
+  // -- `confirmed.last().start() < last_agreed_seconds` strictly -- is a claim
+  // about a NON-EMPTY holdback, because the watermark is then the first held
+  // word's start and the rule widens past any tie with it. When
+  // `budgeted_split` empties the holdback the watermark falls back to
+  // `common.last().end()` instead, and Rule W has no `common[split]` to anchor
+  // against: if that last word has `start == end` the watermark EQUALS its
+  // start, the word passes `watermark_filtered`'s own `start >= watermark`, and
+  // a re-decode that offers it back -- with no holdback, so no prefill to
+  // displace it -- confirms it a SECOND time.
   //
-  // Rather than bolt a clause on for a state that must not arise, the state is
-  // removed: a pending word waits for a hypothesis this engine ANCHORED, and
-  // with nothing held back no future result can ever be one. Waiting would be an
-  // indefinite hold, and `finalize`'s superseded path would end it by deleting a
-  // word the stream produced -- exactly the loss round 7 finding 2 removed. So
-  // the whole widened-past run is settled at the advance, and
-  // `pending_words` non-empty implies `last_agreed_words` non-empty for good.
+  // Reaching it needs three things at once, and the driver supplies none of
+  // them: a non-default `agreement_count_needed` (here 1), a word whose OWN
+  // tokens exceed `MAX_HOLDBACK_PREFILL_TOKENS` so the split runs to
+  // `common.len()`, and a ZERO-DURATION word in that position.
+  // `LocalAgreementTranscriber` never leaves `DEFAULT_AGREEMENT_COUNT_NEEDED`,
+  // and `add_word_timestamps` never emits a 112-token word.
   //
-  // The shape: " L" runs 1.0..5.0 and " B" 2.0..3.0, so the budget forces the
-  // split to the end (an empty holdback, watermark at 3.0) and " L" OVERLAPS the
-  // still-open span -- the one case the overlap test alone would defer. Word ends
-  // inside a hypothesis are not monotone, which is also why the advance takes a
-  // `position` prefix.
-  //
-  // Mutation proof, one face each, and the second one is codex round 13 finding
-  // 1's recommendation run end to end. Dropping the
-  // `self.last_agreed_words.is_empty()` arm from the advance's second split reds
-  // the STATE face at ([], [" L", " B"]) -- and stops there: the transcript
-  // survives, because `prefill_reproduces_holdback` answers the unanchored
-  // continuation below TRUE vacuously and the promotion puts both words back.
-  // (Round 12 recorded that mutation as reaching the transcript too; it does
-  // not, and the vacuity is why.) Add the other two clauses that finding asks
-  // for -- promote only on a NON-VACUOUS anchor (`&& !self.last_agreed_words
-  // .is_empty()`) -- and the transcript face reds at " Y Z": " L" and " B"
-  // deleted, which is round 7 finding 2's loss returning.
-  let long = || word_of_tokens(" L", 1.0, 5.0, 1);
-  let big = || word_of_tokens(" B", 2.0, 3.0, MAX_HOLDBACK_PREFILL_TOKENS + 1);
-  let y = || word(" Y", 3.0, 5.0);
-  let z = || word(" Z", 5.0, 6.0);
+  // Recorded, not repaired: the alternatives are anchoring the empty-holdback
+  // watermark at `end + epsilon` (a threshold with the same cliff one instant
+  // further on, and one that makes the watermark a value no word's `start` ever
+  // equals) or refusing the advance (the blocking policy this issue's ledger
+  // already refuted for deadlock).
+  let a = || word(" A", 0.0, 1.0);
+  let zero = || word_of_tokens(" Z", 1.0, 1.0, MAX_HOLDBACK_PREFILL_TOKENS + 1);
+  let b = || word(" B", 1.0, 2.0);
 
-  let mut agreement = LocalAgreement::new();
-  let opening = || result_with_words(vec![long(), big()]);
+  let mut agreement = LocalAgreement::new().with_agreement_count_needed(1);
+  let opening = || result_with_words(vec![a(), zero()]);
   agreement.ingest_streamed(opening());
   assert!(agreement.ingest_streamed(opening()).is_advanced());
-  assert!(
-    agreement.last_agreed_words_slice().is_empty(),
-    "non-vacuous: the budget left NOTHING held back, so there is no anchor a \
-     later result could be checked against",
-  );
-  assert_eq!(agreement.last_agreed_seconds(), 3.0);
-  assert!(
-    long().end() > agreement.last_agreed_seconds(),
-    "non-vacuous: \" L\" DOES overlap the still-open span, so the overlap test \
-     alone would have deferred it",
+  assert_eq!(
+    (
+      confirmed_texts(&agreement),
+      agreement.last_agreed_words_slice().len(),
+      agreement.last_agreed_seconds()
+    ),
+    (vec![" A", " Z"], 0, 1.0),
+    "non-vacuous: the budget emptied the holdback, so the watermark is \
+     \" Z\"'s END -- which for a zero-duration word is also its START",
   );
   assert_eq!(
-    (confirmed_texts(&agreement), pending_texts(&agreement)),
-    (vec![" L", " B"], Vec::<&str>::new()),
-    "with no anchor to wait for, the widened-past run is settled at the advance",
+    agreement
+      .confirmed_words_slice()
+      .last()
+      .map(WordTiming::start),
+    Some(agreement.last_agreed_seconds()),
+    "the postcondition is VACUOUS here: with no held-back word the last \
+     confirmed word's start EQUALS the watermark instead of preceding it",
   );
 
-  // And it stays settled through a continuation the engine did not write.
-  let unmarked = DecodingOptions::new();
-  assert!(
-    agreement.prefill_reproduces_holdback(&unmarked),
-    "non-vacuous: these options satisfy the prefill premise VACUOUSLY -- the \
-     answer that would have been read had anything been left pending",
-  );
+  // The re-decode offers " Z" back at the head of its word list. Nothing
+  // displaces it: the holdback is empty, so `decoding_options_for_next` attaches
+  // an empty prefix and the decoder was never fed a reproduction to begin with.
+  //
+  // One ingest is enough: the previous hypothesis already contributed " Z" at
+  // this watermark, so the pair agrees on it immediately.
   assert!(
     agreement
-      .ingest(result_with_words(vec![y(), z()]), &unmarked)
-      .is_awaiting_agreement()
+      .ingest_streamed(result_with_words(vec![zero(), b()]))
+      .is_advanced()
   );
   assert_eq!(
-    agreement.finalize(&DecodingOptions::new()).text(),
-    " L B Y Z",
-    "the finalized face: nothing the stream agreed on was dropped by the wait \
-     it never took",
+    confirmed_texts(&agreement),
+    vec![" A", " Z", " Z"],
+    "CHARACTERIZATION (https://github.com/findit-studio/coremlit/issues/94, \
+     residual 1): the CORRECT answer is [\" A\", \" Z\"] -- \" Z\" is one word \
+     the stream produced once and it reaches the confirmed list twice. Rule W \
+     cannot help: it widens the split past a tie with `common[split]`, and here \
+     the split ran to `common.len()` so there is no `common[split]` to widen \
+     past. If this state is ever closed, assert [\" A\", \" Z\"] and delete this \
+     message.",
   );
 }
 
 #[test]
 fn an_overlapping_agreed_word_is_confirmed_on_the_mainline_path_too() {
-  // #94 (codex round 13, finding 1), REFUTED HERE RATHER THAN FIXED, and this is
-  // the row that says why. The finding reads the empty-holdback arm of the
-  // advance's second split as a NEW hazard: `overlapping` is forced to
-  // `widened.len()`, so a widened-past word whose `end` is past the watermark is
-  // confirmed even though a later unanchored decode could re-read its audio, and
-  // `an_empty_holdback_leaves_nothing_pending_because_nothing_could_ever_clear_
-  // it` is offered as the counterexample (" L" 1.0..5.0 confirmed, then " Y"
-  // 3.0..5.0 landing beside it).
+  // #94 (codex round 13, finding 1), REFUTED RATHER THAN FIXED, and this is the
+  // row that says why. The finding reads "a word is confirmed even though a
+  // later decode could re-read its audio" as a hazard some particular arm of the
+  // advance introduces. It is not: `common[..split]` -- the MAINLINE
+  // confirmation, the one Swift has and this port has never touched -- appends
+  // with no overlap test of any kind.
   //
-  // That reading of the state IS what that test asserts. What makes it not a
-  // defect is this row: `common[..requested]` -- the MAINLINE confirmation, the
-  // one Swift has and this port has never touched -- appends with no overlap
-  // test of any kind, and lands in exactly the same place. Word ends inside a
-  // hypothesis are not monotone, so an agreed word can extend past the first
-  // held-back word's start; here " P" runs 0.0..5.0 while the watermark lands at
-  // " Q"'s 1.0, and the unmarked " Y" that follows re-reads 1.0..5.0. Both are
-  // in the transcript, overlapping.
+  // Word ends inside a hypothesis are not monotone, so an agreed word can extend
+  // past the first held-back word's start. Here " P" runs 0.0..5.0 while the
+  // watermark lands at " Q"'s 1.0, and the " Y" that follows re-reads 1.0..5.0.
+  // Both are in the transcript, overlapping.
   //
-  // So "a confirmed word overlaps a later hypothesis's word" is not a property
-  // the empty-holdback arm introduces; it is the LocalAgreement-2 contract, which
-  // confirms on agreement between two consecutive hypotheses and is append-only.
-  // Whether an offered word is a settled one coming BACK is a question RULE W
-  // makes unaskable rather than answers: the split never puts the watermark at a
+  // So "a confirmed word overlaps a later hypothesis's word" is the
+  // LocalAgreement-2 contract itself, which confirms on agreement between two
+  // consecutive hypotheses and is append-only. Whether an offered word is a
+  // settled one coming BACK is a different question, and RULE W makes it
+  // unaskable rather than answering it: the split never puts the watermark at a
   // tied start, so no confirmed word can pass the offered filter, and " Y" is
-  // simply new text over a span " P" also covers. The alternative the finding
-  // proposes -- hold the word until an anchor
-  // certifies it -- has no terminating condition when the holdback is empty, and
-  // ends in the deletion round 7 finding 2 removed. See that test's own comment.
+  // simply new text over a span " P" also covers. P/Q/R have distinct starts, so
+  // Rule W does not fire here at all.
   //
-  // Mutation proof: this row's whole point is that no mutation of the
-  // empty-holdback arm can red it -- the arm is not on this path. The mutation
-  // that DOES red it is the finding's own recommendation carried to its logical
-  // end: take the same `position(|word| word.end() > self.last_agreed_seconds)`
-  // prefix of `common[..requested]` that the widened run takes, and the state
-  // below reads back ([], []) -- " P" never reaches `confirmed_words_slice()` at
-  // all. Eighteen other rows in this module red with it, which is the measure of
-  // how much of the port that recommendation actually moves.
+  // Mutation proof: apply the finding's recommendation to the mainline --
+  // confirm only the `position(|word| word.end() > self.last_agreed_seconds)`
+  // prefix of `common[..split]` -- and the state below reads back [] : " P"
+  // never reaches `confirmed_words_slice()` at all.
   let p = || word(" P", 0.0, 5.0);
   let q = || word(" Q", 1.0, 2.0);
   let r = || word(" R", 2.0, 3.0);
@@ -2511,10 +2462,9 @@ fn an_overlapping_agreed_word_is_confirmed_on_the_mainline_path_too() {
   assert!(agreement.ingest_streamed(opening()).is_advanced());
   assert_eq!(agreement.last_agreed_seconds(), 1.0);
   assert_eq!(
-    (confirmed_texts(&agreement), pending_texts(&agreement)),
-    (vec![" P"], Vec::<&str>::new()),
-    "non-vacuous: \" P\" came from `common[..requested]`, not from the widened \
-     run -- nothing was ever pending here",
+    confirmed_texts(&agreement),
+    vec![" P"],
+    "non-vacuous: \" P\" is confirmed by the mainline `common[..split]`",
   );
   assert!(
     p().end() > agreement.last_agreed_seconds(),
@@ -2522,562 +2472,16 @@ fn an_overlapping_agreed_word_is_confirmed_on_the_mainline_path_too() {
      still-open span, with no overlap test anywhere on it",
   );
 
-  let unmarked = DecodingOptions::new();
   assert!(
     agreement
-      .ingest(result_with_words(vec![y(), z()]), &unmarked)
+      .ingest_streamed(result_with_words(vec![y(), z()]))
       .is_awaiting_agreement()
   );
   assert_eq!(
     agreement.finalize(&DecodingOptions::new()).text(),
     " P Y Z",
     "the overlapping confirmed word and the later re-reading of its audio are \
-     BOTH in the transcript -- the append-only contract, reached without the \
-     empty-holdback arm being involved at all",
-  );
-}
-
-#[test]
-fn the_still_open_span_begins_where_the_engines_own_record_does() {
-  // Round 13, finding 2's span, from both ends. `open_record_split` scans the
-  // record the engine would DROP, and that record is `pending_words ++
-  // last_agreed_words` -- so it begins at the pending head whenever anything is
-  // pending, and at the holdback otherwise. Reading only one of the two is a
-  // live hole in each direction, and neither is visible in the shapes above,
-  // where the pending word and the holdback tie at the same start.
-  //
-  // The FIRST case is also round 14 finding 2's boundary seen from the pending
-  // side: the window opens at 2.0, which is inside " S1" (1.5..3.0) and at the
-  // head of " B" (2.0..3.0), so the record splits between them -- the pending
-  // head is preserved because no clip re-read it whole, and the holdback is
-  // superseded because one did. A verdict applied to the whole record cannot
-  // express that in either direction.
-  //
-  // Mutation proof, one per case, each mutating `open_record` AND
-  // `open_record_len` together -- moving only one of them leaves the split
-  // arithmetic inconsistent and the mutation self-cancelling, which is how the
-  // first attempt at this pair passed. Make the record the HOLDBACK alone and
-  // the FIRST case reads back " A S0 C": " S1" is no longer in the record, so
-  // nothing protects it and it goes with " B". Make it PENDING alone and the
-  // SECOND case reads back " P D": nothing is pending, so the record is empty,
-  // every word of it is vacuously re-read, and the holdback goes.
-
-  // A pending word that starts STRICTLY before the holdback -- the shape
-  // `the_split_settles_a_widened_word_the_span_can_never_reach` builds, where
-  // the split widens past two words and only the straddling one stays pending.
-  let a = || word(" A", 0.0, 1.0);
-  let s0 = || special_only_word(" S0", 1.0, 2.0);
-  let s1 = || special_only_word(" S1", 1.5, 3.0);
-  let b = || word(" B", 2.0, 3.0);
-  let c = || word(" C", 3.0, 4.0);
-
-  let mut agreement = LocalAgreement::new().with_agreement_count_needed(3);
-  let opening = || result_with_words(vec![a(), s0(), s1(), b()]);
-  agreement.ingest_streamed(opening());
-  assert!(agreement.ingest_streamed(opening()).is_advanced());
-  assert_eq!(
-    (confirmed_texts(&agreement), pending_texts(&agreement)),
-    (vec![" A", " S0"], vec![" S1"]),
-    "non-vacuous: the record's head is PENDING, and it starts at 1.5 while the \
-     holdback starts at 2.0",
-  );
-  assert_eq!(agreement.last_agreed_seconds(), 2.0);
-
-  // Exactly at the watermark, which is exactly where the holdback begins -- so
-  // measuring the holdback alone would call this covering. It is not: " S1"
-  // runs from 1.5.
-  let at_the_holdback = DecodingOptions::new().with_clip_timestamps(vec![2.0]);
-  assert!(
-    agreement
-      .ingest(result_with_words(vec![c()]), &at_the_holdback)
-      .is_awaiting_agreement()
-  );
-  assert_eq!(
-    agreement.finalize(&DecodingOptions::new()).text(),
-    " A S0 S1 C",
-    "the pending head is part of the record and no clip re-read it whole, so it \
-     survives a window that superseded the holdback behind it",
-  );
-
-  // The other end: nothing pending at all, so the holdback IS the record.
-  let p = || word(" P", 0.0, 1.0);
-  let q = || word(" Q", 1.0, 2.0);
-  let r = || word(" R", 2.0, 3.0);
-  let d = || word(" D", 3.5, 4.5);
-
-  let mut agreement = LocalAgreement::new();
-  let opening = || result_with_words(vec![p(), q(), r()]);
-  agreement.ingest_streamed(opening());
-  assert!(agreement.ingest_streamed(opening()).is_advanced());
-  assert_eq!(
-    (confirmed_texts(&agreement), pending_texts(&agreement)),
-    (vec![" P"], Vec::<&str>::new()),
-    "non-vacuous: NOTHING is pending, so the holdback is the whole record",
-  );
-  assert_eq!(agreement.last_agreed_seconds(), 1.0);
-
-  let past_the_holdback = DecodingOptions::new().with_clip_timestamps(vec![3.5]);
-  assert!(
-    agreement
-      .ingest(result_with_words(vec![d()]), &past_the_holdback)
-      .is_awaiting_agreement()
-  );
-  assert_eq!(
-    agreement.finalize(&DecodingOptions::new()).text(),
-    " P Q R D",
-    "with nothing pending the holdback is still a record to protect, not an \
-     absent one",
-  );
-}
-
-#[test]
-fn a_gap_between_clip_ranges_does_not_supersede_the_span_no_range_reached() {
-  // #94 (codex round 14, finding 1). COVERAGE IS A SET OF INTERVALS, NOT A
-  // SINGLE HALF-LINE. Round 13 recorded the window a result arrived under as its
-  // FIRST `clip_timestamps` entry and read it as `[decoded_from, ..)`.
-  // `clip_timestamps` is not a start: its own doc says "Explicit `(start, end)`-pair
-  // timestamps ... to split the audio into segments before transcription", and
-  // `WhisperKit::transcribe` hands it straight to `chunker::prepare_seek_clips`,
-  // which pairs the points and decodes each pair as its own clip.
-  //
-  // `[0.0, 0.5, 3.0]` therefore decodes `[0.0, 0.5)` and `[3.0, end)` and NOTHING
-  // between them. The still-open record here is " S1" (1.5..3.0) then " B"
-  // (2.0..3.0), which sits entirely inside that gap -- yet the half-line reading
-  // starts the window at 0.0 and calls the record covered, so a word from the
-  // SECOND range supersedes a span the decoder demonstrably never saw. Two words
-  // the stream agreed on, deleted for a revision that does not exist.
-  // Mutation proof, one per row. Read the first clip point as a half-line
-  // (`clip_timestamps.first()`, then `[start, ..)`, which is what round 13 did)
-  // and ROW 1 reads back " A S0 C" -- " S1" and " B" gone. Make the trailing
-  // comparison STRICT (`word.end() < end`) and ROW 2 reads back
-  // " A S0 S1 B Y": a clip ending exactly where the record does stops covering
-  // it. Test only the word's START against the clip end
-  // (`start <= word.start() && word.start() <= end`) and ROW 3 reads back
-  // " A S0 Y" -- half a word inside the clip counted as re-read. Full OVERLAP
-  // (`start <= word.end() && word.start() <= end`) reds row 1 first, " A S0 C",
-  // because the `[3.0, ..)` clip then touches both record words at the instant
-  // 3.0, and reds five other tests besides.
-  //
-  // The three rows below also pin the two ENDS of a clip against each other. A
-  // range is half-open and a word is covered by CONTAINMENT in ONE of them, so
-  // the trailing comparison is non-strict at a clip that ends exactly where the
-  // record does (row 2) and refuses a clip that ends one word short of it (row
-  // 3) -- overlap would have accepted both, and a strict end would have refused
-  // both. Rows 2 and 3 differ in NOTHING but that clip end.
-  let a = || word(" A", 0.0, 1.0);
-  let s0 = || special_only_word(" S0", 1.0, 2.0);
-  let s1 = || special_only_word(" S1", 1.5, 3.0);
-  let b = || word(" B", 2.0, 3.0);
-  let c = || word(" C", 3.0, 4.0);
-  let y = || word(" Y", 2.0, 2.5);
-
-  let settled = || {
-    let mut agreement = LocalAgreement::new().with_agreement_count_needed(3);
-    let opening = || result_with_words(vec![a(), s0(), s1(), b()]);
-    agreement.ingest_streamed(opening());
-    assert!(agreement.ingest_streamed(opening()).is_advanced());
-    assert_eq!(
-      (confirmed_texts(&agreement), pending_texts(&agreement)),
-      (vec![" A", " S0"], vec![" S1"]),
-      "non-vacuous: the record spans both buckets -- a pending head and a \
-       holdback",
-    );
-    assert_eq!(agreement.last_agreed_seconds(), 2.0);
-    agreement
-  };
-
-  assert_eq!(
-    crate::audio::whisper::audio::chunker::prepare_seek_clips(&[0.0, 0.5, 3.0], 16_000 * 10)
-      .unwrap(),
-    vec![(0, 8_000), (48_000, 160_000)],
-    "non-vacuous: the crate's own range derivation reads these three points as \
-     two disjoint clips, and 1.5..3.0 is in neither",
-  );
-  assert!(
-    s1().start() >= 0.5 && b().end() <= 3.0,
-    "non-vacuous: the whole record lies strictly inside the gap",
-  );
-
-  for (clip, hypothesis, expected, why) in [
-    // The gap. Every word of the record is between the two clips, and the only
-    // word offered comes out of the SECOND one.
-    (
-      vec![0.0, 0.5, 3.0],
-      vec![c()],
-      " A S0 S1 B C",
-      "a word decoded in the range AFTER the gap supersedes nothing inside it",
-    ),
-    // One clip containing the whole record, ending EXACTLY where it ends. The
-    // branch fires as it always did -- this is a coverage test, not a blanket
-    // refusal of a `(start, end)` pair.
-    (
-      vec![0.0, 3.0],
-      vec![y()],
-      " A S0 Y",
-      "a clip that ends exactly where the record does still decoded it whole",
-    ),
-    // The same clip half a second shorter, so it stops between the record's two
-    // words' starts and their shared end. Neither word was decoded WHOLE, so
-    // neither is superseded.
-    (
-      vec![0.0, 2.5],
-      vec![y()],
-      " A S0 S1 B Y",
-      "a clip that only reaches PART of each held word re-read neither of them",
-    ),
-  ] {
-    let mut agreement = settled();
-    let clipped = DecodingOptions::new().with_clip_timestamps(clip.clone());
-    assert!(
-      !agreement.prefill_reproduces_holdback(&clipped),
-      "non-vacuous: unmarked, so nothing is promoted on arrival ({clip:?})",
-    );
-    assert!(
-      agreement
-        .ingest(result_with_words(hypothesis), &clipped)
-        .is_awaiting_agreement(),
-      "it disagrees, so `holdback_superseded` fires ({clip:?})",
-    );
-    assert_eq!(
-      (confirmed_texts(&agreement), pending_texts(&agreement)),
-      (vec![" A", " S0"], vec![" S1"]),
-      "the streaming face is unmoved -- the decision is `finalize`'s alone \
-       ({clip:?})",
-    );
-    assert_eq!(
-      agreement.finalize(&DecodingOptions::new()).text(),
-      expected,
-      "the finalized face, clipped at {clip:?}: {why}",
-    );
-  }
-  assert!(
-    y().start() >= 2.0 && y().end() <= 2.5,
-    "non-vacuous: the offered word is inside BOTH of the last two rows' clips, \
-     so the rows differ only in what the clip reached of the RECORD",
-  );
-}
-
-#[test]
-fn an_agreement_from_past_a_clip_gap_confirms_the_span_no_range_reached() {
-  // #94 (codex round 14, finding 1), the advance's face. Same gapped schedule,
-  // same record, and the same deletion reached without `finalize` at all: two
-  // consecutive hypotheses whose every word comes from the `[3.0, end)` range
-  // agree, and the advance installs `common` over `pending_words` and
-  // `last_agreed_words`. `common` is not a re-reading of 1.5..3.0 -- no decode
-  // in this schedule ever looked there -- so the record is deleted from the
-  // STREAMING face, where nothing downstream can put it back.
-  //
-  // Mutation proof: read the first clip point as a half-line and the streaming
-  // face reads back ([" A", " S0"], []) with the transcript " A S0 C E F". The
-  // two halves of the confirmed prefix have their own falsifiers -- drop the
-  // holdback half of `confirm_the_unread_prefix_and_drop_the_rest` and it reads
-  // ([" A", " S0", " S1"], []); drop the pending half and it reads
-  // ([" A", " S0", " B"], []), which also pins their ORDER.
-  let a = || word(" A", 0.0, 1.0);
-  let s0 = || special_only_word(" S0", 1.0, 2.0);
-  let s1 = || special_only_word(" S1", 1.5, 3.0);
-  let b = || word(" B", 2.0, 3.0);
-  let c = || word(" C", 3.0, 4.0);
-  let e = || word(" E", 4.0, 5.0);
-  let f = || word(" F", 5.0, 6.0);
-
-  let mut agreement = LocalAgreement::new().with_agreement_count_needed(3);
-  let opening = || result_with_words(vec![a(), s0(), s1(), b()]);
-  agreement.ingest_streamed(opening());
-  assert!(agreement.ingest_streamed(opening()).is_advanced());
-  assert_eq!(
-    (confirmed_texts(&agreement), pending_texts(&agreement)),
-    (vec![" A", " S0"], vec![" S1"]),
-    "non-vacuous: there is a pending word AND a holdback for the advance to \
-     replace",
-  );
-
-  let gapped = DecodingOptions::new().with_clip_timestamps(vec![0.0, 0.5, 3.0]);
-  let resumed = || result_with_words(vec![c(), e(), f()]);
-  assert!(
-    agreement.ingest(resumed(), &gapped).is_awaiting_agreement(),
-    "the first one has nothing to agree with over this span",
-  );
-  assert!(
-    agreement.ingest(resumed(), &gapped).is_advanced(),
-    "the second corroborates it: an advance whose `common` is entirely past the \
-     gap",
-  );
-  assert_eq!(
-    (confirmed_texts(&agreement), pending_texts(&agreement)),
-    (vec![" A", " S0", " S1", " B"], Vec::<&str>::new()),
-    "the streaming face: what no clip in the schedule could re-read, the advance \
-     confirms rather than drops",
-  );
-  assert_eq!(
-    agreement
-      .last_agreed_words_slice()
-      .iter()
-      .map(WordTiming::word)
-      .collect::<Vec<_>>(),
-    vec![" C", " E", " F"],
-    "and the holdback is the agreeing pair's own words, as always",
-  );
-  assert_eq!(
-    agreement.finalize(&DecodingOptions::new()).text(),
-    " A S0 S1 B C E F",
-    "the finalized face: nothing the stream agreed on was lost to a schedule \
-     that skipped it",
-  );
-}
-
-#[test]
-fn a_window_that_opens_inside_the_record_replaces_only_the_part_it_re_read() {
-  // #94 (codex round 14, finding 2). ONE VERDICT FOR A WHOLE RECORD IS WRONG IN
-  // BOTH DIRECTIONS. Round 13 asked whether the window reached the record's
-  // FIRST word and applied that answer to every word in it. Here " Q" (1.0..2.0)
-  // and " R" (2.0..3.0) are held and the continuation clips at exactly 2.0: " Q"
-  // is outside its window and " R" is wholly inside it. The head-only reading
-  // answers "not covered" and CONFIRMS both -- so " R" becomes irrevocable on the
-  // streaming face at the very moment a hypothesis that did re-read it says it is
-  // " X" instead, and the transcript carries the stale " R" beside its own
-  // revision.
-  //
-  // That is the exact mirror of round 13's finding: there a late-clipped result
-  // was allowed to supersede a record it never saw; here the same conservatism
-  // confirms the portion it DID see and revise. The record splits at the
-  // coverage boundary instead: the uncovered prefix is preserved (or, on the
-  // advance, confirmed) and only the covered suffix is replaced.
-  //
-  // Mutation proof, four ways and both faces. Make the leading comparison STRICT
-  // (`start < word.start()`) and the finalized row reads back " P Q R X D" --
-  // the round-13 answer, and the reason that comparison cannot be tightened.
-  // Make `finalize` drop the whole record (pass `0` where it passes
-  // `open_record_split`) and it reads " P X D"; make the ADVANCE do the same and
-  // the streaming face reads ([" P"], []). Read the first clip point as a
-  // half-line, or test only the word's START, or scan FORWARD for the first
-  // covered word (`position`) instead of back over the covered suffix, and the
-  // last row reads back " P Y" -- " Q" and " R" both replaced, the second of
-  // them from behind a word no clip reached.
-  let p = || word(" P", 0.0, 1.0);
-  let q = || word(" Q", 1.0, 2.0);
-  let r = || word(" R", 2.0, 3.0);
-  let x = || word(" X", 2.0, 3.0);
-  let d = || word(" D", 3.0, 4.0);
-
-  let settled = || {
-    let mut agreement = LocalAgreement::new();
-    let opening = || result_with_words(vec![p(), q(), r()]);
-    agreement.ingest_streamed(opening());
-    assert!(agreement.ingest_streamed(opening()).is_advanced());
-    assert_eq!(
-      (confirmed_texts(&agreement), pending_texts(&agreement)),
-      (vec![" P"], Vec::<&str>::new()),
-      "non-vacuous: TWO words are held, and the window below opens between them",
-    );
-    assert_eq!(agreement.last_agreed_seconds(), 1.0);
-    agreement
-  };
-
-  // Exactly the second held word's start, which is strictly past the record's
-  // own head. `" R"` is wholly inside `[2.0, ..)`; `" Q"` is wholly outside it.
-  let inside = || DecodingOptions::new().with_clip_timestamps(vec![2.0]);
-  assert!(
-    q().start() < 2.0 && r().start() >= 2.0,
-    "non-vacuous: the window opens strictly inside the record",
-  );
-
-  // The finalized face: one disagreeing hypothesis.
-  let mut agreement = settled();
-  assert!(
-    agreement
-      .ingest(result_with_words(vec![x(), d()]), &inside())
-      .is_awaiting_agreement(),
-    "it disagrees, so `holdback_superseded` fires",
-  );
-  assert_eq!(
-    agreement.finalize(&DecodingOptions::new()).text(),
-    " P Q X D",
-    "the revised half is replaced by its revision and the unreachable half is \
-     kept -- not both readings of 2.0..3.0 side by side",
-  );
-
-  // The streaming face: two agreeing hypotheses, so the advance decides.
-  let mut agreement = settled();
-  let resumed = || result_with_words(vec![x(), d()]);
-  assert!(
-    agreement
-      .ingest(resumed(), &inside())
-      .is_awaiting_agreement()
-  );
-  assert!(agreement.ingest(resumed(), &inside()).is_advanced());
-  assert_eq!(
-    (confirmed_texts(&agreement), pending_texts(&agreement)),
-    (vec![" P", " Q"], Vec::<&str>::new()),
-    "the streaming face: only the half the pair could not re-read is made \
-     irrevocable -- confirming \" R\" here would strand it against its own \
-     revision",
-  );
-  assert_eq!(
-    agreement
-      .last_agreed_words_slice()
-      .iter()
-      .map(WordTiming::word)
-      .collect::<Vec<_>>(),
-    vec![" X", " D"],
-  );
-  assert_eq!(
-    agreement.finalize(&DecodingOptions::new()).text(),
-    " P Q X D",
-    "and the transcript agrees with the streaming face word for word",
-  );
-
-  // THE OTHER DIRECTION, and why the split is the start of the longest COVERED
-  // SUFFIX rather than the first covered word. A clip that CLOSES inside the
-  // record re-read " Q" and not " R", so the covered word is the one in FRONT.
-  // Replacing from it would take " R" with it -- a deletion, from behind a word
-  // the window never reached -- so the boundary moves past both and the whole
-  // record is preserved. The cost is the erring-wide one this rule is drawn to
-  // pay: " Q" reaches the transcript beside its own revision " Y". A repetition,
-  // not a deletion, and the same direction the advance's `position` split takes
-  // for the same reason.
-  let closing_inside = DecodingOptions::new().with_clip_timestamps(vec![0.0, 2.0]);
-  let y = || word(" Y", 1.0, 2.0);
-  assert!(
-    q().end() <= 2.0 && r().end() > 2.0,
-    "non-vacuous: the clip contains the FIRST held word whole and the second \
-     only in part",
-  );
-  let mut agreement = settled();
-  assert!(
-    agreement
-      .ingest(result_with_words(vec![y()]), &closing_inside)
-      .is_awaiting_agreement(),
-  );
-  assert_eq!(
-    agreement.finalize(&DecodingOptions::new()).text(),
-    " P Q R Y",
-    "a covered word in front of an uncovered one is kept, so the uncovered one \
-     is never replaced out from behind it",
-  );
-}
-
-#[test]
-fn a_final_pair_that_agreed_past_an_unreachable_record_keeps_what_they_agreed_on() {
-  // #94 (codex round 14). The record and the TAIL are two questions, and only
-  // the record's half belongs to coverage. Round 13's `finalize` guard made
-  // "this hypothesis re-read the record" decide both at once; round 14's split
-  // answers the record's half by itself -- a record nothing re-read gets
-  // `open_record_split == len` and is kept whole either way -- leaving the guard
-  // deciding only whether the tail is `hypothesis_words` or Swift's
-  // `findLongestDifferentSuffix(prevWords, hypothesisWords)`.
-  //
-  // Nothing in the suite could tell the two apart, and every shape that CAN
-  // makes the subtraction wrong. Here two consecutive late-clipped hypotheses
-  // both produce " M" at 3.0..4.0 -- a one-word common prefix, short of the
-  // threshold of 2, so it disagrees and " M" is never confirmed. Swift subtracts
-  // it on the premise that `lastAgreedWords` supplies it; `lastAgreedWords` is
-  // " Q R" at 1.0..3.0, which has nothing to do with " M", so subtracting drops
-  // a word BOTH hypotheses produced and nothing puts it back. That is
-  // `a_disagreeing_final_pair_keeps_the_words_both_hypotheses_agreed_on`'s
-  // defect reached with a NON-empty holdback.
-  //
-  // Mutation proof: restore the conjunct (`&& (record_len == 0 ||
-  // open_record_split < record_len)`, with `record_len` re-derived from
-  // `open_record_len()`) and this reads back " P Q R Z" -- " M" gone.
-  let p = || word(" P", 0.0, 1.0);
-  let q = || word(" Q", 1.0, 2.0);
-  let r = || word(" R", 2.0, 3.0);
-  let m = || word(" M", 3.0, 4.0);
-  let n = || word(" N", 4.0, 5.0);
-  let z = || word(" Z", 4.0, 5.0);
-
-  let mut agreement = LocalAgreement::new();
-  let opening = || result_with_words(vec![p(), q(), r()]);
-  agreement.ingest_streamed(opening());
-  assert!(agreement.ingest_streamed(opening()).is_advanced());
-  assert_eq!(
-    (confirmed_texts(&agreement), pending_texts(&agreement)),
-    (vec![" P"], Vec::<&str>::new()),
-    "non-vacuous: the holdback is NON-empty, which is what separates this from \
-     the empty-holdback face of the same defect",
-  );
-
-  // Strictly past every word of the record, so nothing in it is re-read and the
-  // record survives whichever tail is taken.
-  let late = DecodingOptions::new().with_clip_timestamps(vec![3.0]);
-  assert!(
-    agreement
-      .ingest(result_with_words(vec![m(), n()]), &late)
-      .is_awaiting_agreement()
-  );
-  assert!(
-    agreement
-      .ingest(result_with_words(vec![m(), z()]), &late)
-      .is_awaiting_agreement(),
-    "a ONE-word common prefix is short of the threshold, so this disagrees too",
-  );
-  assert_eq!(
-    agreement.finalize(&DecodingOptions::new()).text(),
-    " P Q R M Z",
-    "the unreachable record is kept whole AND the word both hypotheses produced \
-     survives -- the subtraction has no holdback to justify it here",
-  );
-}
-
-#[test]
-fn the_split_settles_a_widened_word_the_span_can_never_reach() {
-  // The line the advance's second split draws, asserted from both sides in one
-  // stream. `budgeted_split` widens past BOTH " S" words here; the still-open
-  // span begins at " B"'s start, and only the word whose extent crosses that
-  // point is still in play. The other one is settled outright -- every word the
-  // engine will ever be offered again starts at or after the watermark, so
-  // nothing can overlap it, and no provenance can change that.
-  //
-  // Deferring it anyway would be strictly worse than the round-8 behaviour it
-  // replaces: `finalize`'s superseded branch would drop a word the stream
-  // produced and nothing revised.
-  //
-  // Mutation proof: relax the advance's `word.end() > self.last_agreed_seconds`
-  // to `>=` and the first assertion reads back ([" A"], [" S0", " S1"]); test
-  // `word.start() >= self.last_agreed_seconds` instead -- the plausible mistake,
-  // since `offered` is filtered on `start` -- and it reads
-  // ([" A", " S0", " S1"], []), which the second half then falsifies too: the
-  // unmarked revision lands beside " S1" rather than replacing it,
-  // " A S0 S1 Y B C".
-  //
-  // `agreement_count_needed` is 3 so that BOTH " S" words fall inside
-  // `common[requested..split]`: at the default 2 the first of them would be
-  // confirmed by `common[..requested]` regardless, and the boundary under test
-  // would decide nothing.
-  let a = || word(" A", 0.0, 1.0);
-  // Ends exactly where the still-open span begins: unreachable from inside it.
-  let s0 = || special_only_word(" S0", 1.0, 2.0);
-  // STRADDLES that point -- starts before it, ends after it -- so an offered
-  // word can overlap it and it is still in play.
-  let s1 = || special_only_word(" S1", 1.5, 3.0);
-  let b = || word(" B", 2.0, 3.0);
-  let y = || word(" Y", 2.0, 3.0);
-  let c = || word(" C", 3.0, 4.0);
-
-  let mut agreement = LocalAgreement::new().with_agreement_count_needed(3);
-  let opening = || result_with_words(vec![a(), s0(), s1(), b()]);
-  agreement.ingest_streamed(opening());
-  assert!(agreement.ingest_streamed(opening()).is_advanced());
-  assert_eq!(agreement.last_agreed_seconds(), 2.0);
-  assert_eq!(
-    (confirmed_texts(&agreement), pending_texts(&agreement)),
-    (vec![" A", " S0"], vec![" S1"]),
-    "the widened-past words split again, on whether the still-open span can \
-     reach them",
-  );
-
-  let unmarked = DecodingOptions::new();
-  assert!(
-    agreement
-      .ingest(result_with_words(vec![y(), b(), c()]), &unmarked)
-      .is_awaiting_agreement()
-  );
-  assert_eq!(
-    agreement.finalize(&DecodingOptions::new()).text(),
-    " A S0 Y B C",
-    "the unreachable word survives the revision; the reachable one is replaced \
-     by it",
+     BOTH in the transcript -- the append-only contract",
   );
 }
 
@@ -3088,9 +2492,9 @@ fn the_holdback_filter_reads_the_configured_special_range_not_the_floor() {
   // families, but `WhisperTokenizer::from_folder` loads any parseable
   // `tokenizer.json` and probes `<|endoftext|>` for that artifact's OWN
   // threshold, rejecting nothing below the floor. For such an artifact the
-  // engine calls an id carriable that `prefill_tokens` erases, the equality
-  // `prefill_reproduces_holdback` checks is satisfied by a prefix the decoder is
-  // given only part of, and round 8's defect is back with no caller lying.
+  // engine calls an id carriable that `prefill_tokens` erases, so the retarget
+  // promises a prefix the decoder is given only part of, and round 8's defect is
+  // back with no caller lying.
   //
   // Threading the real value closes it where the value is known and costs
   // nothing where it is not: the default is exactly the floor, so no existing

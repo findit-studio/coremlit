@@ -53,8 +53,7 @@ impl AudioChunk {
 /// (`Extensions+Internal.swift:112-130`): empty input becomes one
 /// full-range clip; an odd final timestamp runs to `content_frames`; pairs
 /// are consumed in order. Ordering and upper bounds are NOT validated,
-/// like Swift. The pairing itself lives in `seek_clip_ranges`, which the
-/// streaming engine reads the same option through.
+/// like Swift.
 ///
 /// # Errors
 /// [`AudioError::InvalidClipRange`] for a negative or non-finite
@@ -73,40 +72,22 @@ pub fn prepare_seek_clips(
       end: bad,
     });
   }
-  let seek_points: Vec<usize> = clip_timestamps
+  let mut seek_points: Vec<usize> = clip_timestamps
     .iter()
     .map(|seconds| (seconds * SAMPLE_RATE as f32).round() as usize)
     .collect();
-  Ok(seek_clip_ranges(&seek_points, 0, content_frames))
-}
-
-/// The PAIRING rule behind [`prepare_seek_clips`], in whatever unit the caller
-/// measures its own timeline in: an empty list is one segment running from
-/// `audio_start`, an odd final point runs to `audio_end`, and everything else is
-/// consumed as `(start, end)` pairs in order — half-open, since a clip's end is
-/// where the next decode begins.
-///
-/// Ports the body of `DecodingOptions.prepareSeekClips`
-/// (`Extensions+Internal.swift:112-130`) minus the seconds-to-samples
-/// conversion, so the sample-domain chunker and the seconds-domain streaming
-/// engine (`ProvenancedResult::arriving`, which reads the same option to decide
-/// what a hypothesis's decoder could have SEEN) cannot drift into two readings
-/// of one `clip_timestamps` (codex round 14, finding 1). Only the two sentinels
-/// differ between them: the chunker knows the content length, and the streaming
-/// engine, which holds no audio at all, leaves the odd tail unbounded.
-///
-/// Ordering and upper bounds are NOT validated, like Swift and like
-/// [`prepare_seek_clips`]: an out-of-order pair yields an empty range, which
-/// every caller must already be correct for.
-pub(crate) fn seek_clip_ranges<T: Copy>(points: &[T], audio_start: T, audio_end: T) -> Vec<(T, T)> {
-  let mut points = points.to_vec();
-  if points.is_empty() {
-    points.push(audio_start);
+  if seek_points.is_empty() {
+    seek_points.push(0);
   }
-  if points.len() % 2 == 1 {
-    points.push(audio_end);
+  if seek_points.len() % 2 == 1 {
+    seek_points.push(content_frames);
   }
-  points.chunks(2).map(|pair| (pair[0], pair[1])).collect()
+  Ok(
+    seek_points
+      .chunks(2)
+      .map(|pair| (pair[0], pair[1]))
+      .collect(),
+  )
 }
 
 /// Shifts segments (seek, times, and word times) by an absolute chunk

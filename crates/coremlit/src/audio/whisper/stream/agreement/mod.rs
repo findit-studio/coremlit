@@ -109,8 +109,9 @@
 //!   8, finding 1): `prefill_tokens` drops every id at or above the vocabulary's
 //!   `special_token_begin`, and a word with no tokens contributes nothing to the
 //!   prefix at all, so either kind of held word leaves the engine reasoning
-//!   about text the decoder was never given — the exact premise the pending
-//!   head's promotion rests on. It was recorded as a residual for as long as the
+//!   about text the decoder was never given — the premise
+//!   [`LocalAgreement::decoding_options_for_next`]'s retarget makes. It was
+//!   recorded as a residual for as long as the
 //!   argument was "`add_word_timestamps` strips those ids from everything this
 //!   crate emits", which is true and does not reach
 //!   [`LocalAgreement::ingest`]'s public hand-built path. **[BEHAVIOUR CHANGE]**
@@ -138,42 +139,23 @@
 //!   this module has a stake in, so the loader is left alone. The default is
 //!   today's constant, so no existing caller moves.
 //!
-//!   **A widened-past word is not confirmed on the spot** (codex round 12,
-//!   finding 1). The argument for confirming it — neither corroborable nor
-//!   revisable, being behind both the clip and the forced prefill — is an
-//!   argument about the hypothesis that comes NEXT, and the split runs before it
-//!   exists. It holds for a continuation decoded under
-//!   [`LocalAgreement::decoding_options_for_next`] and for no other, and
-//!   confirming into the append-only list cannot be taken back. So the split
-//!   still widens (its retarget is the only coherent one either way) and the
-//!   widened-past words wait in [`LocalAgreement::pending_words_slice`] **[new
-//!   public accessor]** — settled by the first hypothesis this engine anchored
-//!   (one written to begin with the whole holdback, which they sit in front of),
-//!   revisable by any other, and dropped with the holdback they head when one
-//!   supersedes them. Two kinds of word skip the wait entirely: one the
-//!   still-open span can never reach (`end` at or before the watermark), since
-//!   nothing offered could ever overlap it; and every one of them when the
-//!   holdback comes back EMPTY, since with no anchor no later result could ever
-//!   clear the wait and the hold would end in the deletion round 7 finding 2
-//!   removed.
-//!
-//!   That second kind therefore CAN be confirmed while a later unanchored decode
-//!   still re-reads its audio, and the transcript then carries both readings
-//!   (codex round 13, finding 1, refuted rather than fixed). That is not a
-//!   property of this arm: `common[..requested]`, the mainline confirmation
-//!   Swift has and this port has never touched, appends with no overlap test of
-//!   any kind and lands in the same place whenever word ends inside a hypothesis
-//!   are non-monotone
+//!   **A widened-past word is CONFIRMED on the spot.** The argument is round 8's:
+//!   a word the prefill cannot carry is neither corroborable nor revisable by a
+//!   continuation decoded under
+//!   [`LocalAgreement::decoding_options_for_next`], being behind both the clip
+//!   and the forced prefill, and the watermark passes it on the very next line,
+//!   so no future result can ever be offered over its span. Holding it instead
+//!   would be an indefinite wait ending in the deletion codex round 7 finding 2
+//!   removed. A caller driving [`LocalAgreement::ingest`] with a result decoded
+//!   some OTHER way could have re-read that audio, and for that caller the word
+//!   is confirmed while a revision of it is still possible — the transcript then
+//!   carries both readings. That is not a property of this arm:
+//!   `common[..split]`, the mainline confirmation Swift has and this port has
+//!   never touched, appends with no overlap test of any kind and lands in the
+//!   same place whenever word ends inside a hypothesis are non-monotone
 //!   (`an_overlapping_agreed_word_is_confirmed_on_the_mainline_path_too`). It is
 //!   the LocalAgreement-2 contract itself — confirmation follows agreement
-//!   between two consecutive hypotheses and is append-only. Requiring a
-//!   non-vacuous anchor instead reinstates the indefinite hold.
-//!   **[BEHAVIOUR CHANGE]** [`LocalAgreement::confirmed_words_slice`]
-//!   therefore gains a word that waits one `ingest` later than it did, and on a
-//!   MIXED-provenance stream an
-//!   unmarked hypothesis that revises one now replaces it instead of landing
-//!   beside it. Unreachable through [`LocalAgreementTranscriber`], which never
-//!   widens the split at all.
+//!   between two consecutive hypotheses and is append-only.
 //!
 //!   That split runs all the way to `common.len()` when it has to, so **an
 //!   advance can leave the holdback EMPTY** and the watermark anchored at the
@@ -187,7 +169,7 @@
 //!   intact held word with that truncation. Confirming such a word is always
 //!   possible and is no weaker a claim: `common` is the prefix two hypotheses
 //!   agreed on, and a word outside the prefill budget is one no third hypothesis
-//!   decoded from that prefill could revise — see the pending-word entry above
+//!   decoded from that prefill could revise — see the widened-past entry above
 //!   for the qualifier that carries. Unreachable through
 //!   [`LocalAgreementTranscriber`], which never leaves
 //!   [`DEFAULT_AGREEMENT_COUNT_NEEDED`].
@@ -219,80 +201,6 @@
 //!   against a Swift capture (`tests/whisper/streaming.rs` "owns no golden"; the
 //!   token-for-token goldens are the BATCH decode's), so the divergence costs no
 //!   oracle comparison.
-//! - **A result only replaces the PART of the span its own window DECODED**
-//!   (codex round 13, finding 2; intervals and the split, codex round 14). Two
-//!   places install a hypothesis's words over the engine's still-open record of
-//!   the still-open span — [`LocalAgreement::pending_words_slice`] then
-//!   [`LocalAgreement::last_agreed_words_slice`]: the advance in
-//!   [`LocalAgreement::ingest`], and the `holdback_superseded` branch above.
-//!   Both justify it by calling the replacement a REVISION of what it replaces,
-//!   and both inferred that from `prefilled` being false — "decoded some other
-//!   way, so its decoder saw that audio". Nothing made it so. `ingest` is public
-//!   and states no requirement that an unmarked result's window reach the
-//!   watermark, and a caller resuming a stream at a clip point of its own
-//!   legitimately hands over one that does not. Such a decode produced no
-//!   revision of that record, because it produced nothing over its span at all —
-//!   so replacing the record with its words deletes text two hypotheses agreed
-//!   on and nothing contradicted.
-//!
-//!   The deciding fact was already in hand and merely unused:
-//!   [`DecodingOptions::clip_timestamps`](crate::audio::whisper::options::DecodingOptions::clip_timestamps_slice)
-//!   is the window the decode actually covered, and `ProvenancedResult` already
-//!   pairs a result with what was known when it arrived. The window now travels
-//!   with the result exactly as its prefill premise does
-//!   (`ProvenancedResult::decoded`, scanned by
-//!   `LocalAgreement::open_record_split`), and both replacement sites ask it
-//!   first.
-//!
-//!   THE WINDOW IS A SET OF INTERVALS. `clip_timestamps` is a list of
-//!   `(start, end)` PAIRS that splits the audio into segments — its own doc says
-//!   so, and [`crate::audio::whisper::transcribe::WhisperKit::transcribe`] hands
-//!   it to `chunker::prepare_seek_clips`, which decodes each pair as its own
-//!   clip. `[0.0, 0.5, 3.0]` therefore decodes `[0.0, 0.5)` and `[3.0, end)` and
-//!   NOTHING between, so a first-timestamp-plus-half-line reading called a
-//!   two-clip schedule a window over the whole audio and let a word from the
-//!   second range supersede a record inside the gap (round 14, finding 1). Both
-//!   readings come out of one derivation, `chunker::seek_clip_ranges`, which
-//!   `prepare_seek_clips` is also built on; only the sentinels differ, since a
-//!   hermetic engine has no content length and leaves an odd final point's tail
-//!   unbounded. The leading comparison is NON-STRICT and has to be:
-//!   [`LocalAgreement::decoding_options_for_next`] clips exactly AT the
-//!   watermark, which is exactly where the holdback begins, so a strict test
-//!   would fail the engine's own retarget on every stride.
-//!
-//!   THE ANSWER IS A BOUNDARY, NOT A VERDICT. One verdict for a whole record is
-//!   wrong in both directions (round 14, finding 2): a window that opens BETWEEN
-//!   two held words re-read only the second, and deciding at the record's head
-//!   confirms that second word irrevocably at the very moment a hypothesis that
-//!   did re-read it says it is something else — then emits the stale reading
-//!   beside its own revision. `open_record_split` returns the index where the
-//!   longest wholly-re-read SUFFIX begins; the prefix in front of it is
-//!   preserved (finalized) or confirmed (advanced), and only the suffix is
-//!   replaced. Word-level CONTAINMENT in ONE clip, so a word the window only
-//!   partly reaches, or that straddles two adjacent clips, is preserved: erring
-//!   wide costs a repetition, erring narrow deletes a word. Same direction, for
-//!   the same reason, as the advance's own `position` split.
-//!
-//!   **[BEHAVIOUR CHANGE]** on both sites. An advance whose hypothesis could not
-//!   re-read part of the record now CONFIRMS that part instead of dropping it —
-//!   the watermark passes it on the very next line, so nothing can ever be
-//!   offered over its span again and there is no third option that terminates;
-//!   it is the pending bucket's own terminating rule applied where the bucket's
-//!   anchor also runs out. And `finalize` emits that part ahead of the revision
-//!   rather than deleting it for a revision that does not exist. Conversely, the
-//!   part a window DID re-read is no longer confirmed or emitted beside its
-//!   replacement; and the divergence's tail is `hypothesis_words` on every
-//!   disagreeing path rather than only on the ones that re-read something, which
-//!   stops Swift's prefix subtraction from dropping a word both hypotheses
-//!   produced whenever the holdback it subtracts against is being kept. All of
-//!   it is unreachable through [`LocalAgreementTranscriber`], whose every stride
-//!   clips at the watermark and contains its own holdback whole.
-//!
-//!   Swift cannot have the defect and cannot have the fix: it has no
-//!   `decoded_under` to check, and on this path its `:418-419` emits
-//!   `lastAgreedWords` beside the final hypothesis anyway — the duplication the
-//!   `holdback_superseded` branch exists to remove, and, when the final
-//!   hypothesis re-covered nothing, the answer that happens to be right.
 //! - **`use_prefill_prompt` is forced on the retargeted options, but only once
 //!   there is a holdback to reproduce** (Swift `:364-367` sets only
 //!   `clipTimestamps` and `prefixTokens`).
@@ -306,14 +214,15 @@
 //!   and the stream re-decodes each span with no anchor at all. Both this port
 //!   and Swift default the flag on, so this only diverges for a caller that
 //!   turned it off; it is forced for the same reason
-//!   [`LocalAgreementTranscriber::new`] forces `word_timestamps`, and because
-//!   the promotion of a pending word is DECIDED by the prefill (see
-//!   `LocalAgreement::prefill_reproduces_holdback`).
+//!   [`LocalAgreementTranscriber::new`] forces `word_timestamps`: a prefix the
+//!   decoder is never given makes `budgeted_split`'s whole budget argument
+//!   vacuous, and leaves the next hypothesis with no anchor over the span the
+//!   holdback covers.
 //!
 //!   It is forced only while [`LocalAgreement::last_agreed_words_slice`] is
 //!   NON-EMPTY (codex round 6, finding 3). Before the first advance there is no
-//!   holdback, the prefix is empty, and nothing is pending — so no premise needs
-//!   enforcing. Forcing the flag on those strides would
+//!   holdback and the prefix is empty, so there is nothing for the flag to
+//!   carry. Forcing the flag on those strides would
 //!   change the caller's prompt from a bare `<|startoftranscript|>` to the full
 //!   multilingual language/task/timestamp prefill for nothing, and a streaming
 //!   caller would get different decoding behaviour before LocalAgreement had
@@ -329,7 +238,6 @@
 //!   InferenceBackend + Sync` here.
 
 use crate::audio::whisper::{
-  audio::chunker,
   backend::InferenceBackend,
   constants::{MAX_TOKEN_CONTEXT, SAMPLE_RATE},
   error::TranscribeError,
@@ -418,10 +326,7 @@ pub const DEFAULT_AGREEMENT_COUNT_NEEDED: usize = 2;
 /// [`LocalAgreement::special_token_begin`] — the loaded vocabulary's own value
 /// where the engine was told it, and [`MIN_SPECIAL_TOKEN_BEGIN`] otherwise — and
 /// widens past every word that fails, exactly as it widens past an over-budget
-/// one. So no prefill this engine issues is ever trimmed OR filtered, and
-/// `LocalAgreement::prefill_reproduces_holdback` needs a clause for neither: a
-/// prefix EQUAL to the holdback is within budget and carried whole because the
-/// holdback is.
+/// one. So no prefill this engine issues is ever trimmed OR filtered.
 ///
 /// That id filter used to be recorded here as a residual, on the evidence that
 /// `add_word_timestamps` strips exactly those ids from every [`WordTiming`] it
@@ -433,144 +338,6 @@ pub const DEFAULT_AGREEMENT_COUNT_NEEDED: usize = 2;
 /// word, honestly pass the retarget, and still be recorded `prefilled`
 /// (codex round 8, finding 1); see `budgeted_split`.
 pub const MAX_HOLDBACK_PREFILL_TOKENS: usize = MAX_TOKEN_CONTEXT / 2;
-
-/// A result and the provenance it ARRIVED with, inseparable by construction.
-///
-/// Two of the engine's decisions are facts about how a PARTICULAR result was
-/// decoded rather than about the engine's state at the moment they are asked:
-/// whether that result could have re-read the still-open record at all
-/// ([`ProvenancedResult::decoded`]) and whether it can settle the pending head
-/// of it ([`ProvenancedResult::prefilled`]). Those two moments are not the same
-/// moment: [`LocalAgreement::ingest`] keeps `prev_result` RAW and re-reads it on
-/// every later call, so a premise derived from the CURRENT call and reused for
-/// the stored one answers a question about one result with another result's
-/// options — with no caller lying (codex round 7, finding 1).
-///
-/// The pairing is the fix, and it is structural rather than a rule to remember.
-/// The fields are private to this module and
-/// [`ProvenancedResult::arriving`] is the only constructor and the only caller
-/// of [`LocalAgreement::prefill_reproduces_holdback`] — so no signature anywhere
-/// in the engine has a channel through which a foreign premise could arrive, and
-/// the answer is immutable for as long as the engine keeps the result. Recorded
-/// once and read back, exactly as `LocalAgreement::holdback_superseded` is and
-/// for the same reason: a value a later call could re-derive differently is a
-/// value a later call WILL re-derive differently.
-mod provenance {
-  use super::{DecodingOptions, LocalAgreement, TranscriptionResult, WordTiming, chunker};
-
-  /// One ingested result, bound to the premise it arrived under. See the module
-  /// comment above for why the two travel together.
-  #[derive(Debug, Clone, PartialEq)]
-  pub(super) struct ProvenancedResult {
-    result: TranscriptionResult,
-    prefilled: bool,
-    window: Vec<(f32, f32)>,
-  }
-
-  impl ProvenancedResult {
-    /// Binds `result` to the premise `decoded_under` establishes against
-    /// `engine`'s state RIGHT NOW — which is the state the caller decoded
-    /// under, since [`LocalAgreement::ingest`] calls this before any of that
-    /// state moves — and to the WINDOW `decoded_under` says it was decoded in,
-    /// which needs no state at all (see [`Self::decoded`]).
-    pub(super) fn arriving(
-      result: TranscriptionResult,
-      engine: &LocalAgreement,
-      decoded_under: &DecodingOptions,
-    ) -> Self {
-      Self {
-        prefilled: engine.prefill_reproduces_holdback(decoded_under),
-        // `clip_timestamps` is a list of `(start, end)` PAIRS that splits the
-        // audio into segments, not a start (codex round 14, finding 1): its own
-        // doc says so, and `WhisperKit::transcribe` hands it straight to
-        // `chunker::prepare_seek_clips`, which pairs the points and decodes each
-        // pair as its own clip. So `[0.0, 0.5, 3.0]` decodes `[0.0, 0.5)` and
-        // `[3.0, end)` and nothing between — a schedule the round-13 reading
-        // (`first()`, then `[decoded_from, ..)`) called a window over the whole
-        // audio.
-        //
-        // Derived by `chunker::seek_clip_ranges`, which
-        // `prepare_seek_clips` is also built on, so the two cannot drift into
-        // two readings of one option. Both sentinels differ here: the seconds
-        // domain rather than samples, and an UNBOUNDED tail for an odd final
-        // point, because a hermetic engine holds no audio and so has no content
-        // length. That is the only place this reading is wider than the
-        // chunker's, and it is unreachable: every instant the two disagree about
-        // is past the end of the audio, and every word this window is ever asked
-        // about came out of a decode OF that audio.
-        window: chunker::seek_clip_ranges(
-          decoded_under.clip_timestamps_slice(),
-          0.0,
-          f32::INFINITY,
-        ),
-        result,
-      }
-    }
-
-    /// Whether this result's decoder saw the WHOLE of `word`'s audio — that is,
-    /// whether one clip of its schedule contains `[word.start(), word.end())`
-    /// entirely (codex round 13, finding 2; intervals per codex round 14,
-    /// finding 1).
-    ///
-    /// The engine reads this before letting a result's words REPLACE its own
-    /// still-open record of a span: `finalize`'s `holdback_superseded` branch
-    /// prefers the final hypothesis's words over that record because they are a
-    /// revision of it, and the advance replaces it with `common` for the same
-    /// reason — neither is true of a hypothesis whose window excluded the span.
-    /// Nothing checked it: `prefilled()` false was read as "decoded some other
-    /// way, so it saw that audio", and
-    /// [`LocalAgreement::ingest`] states no requirement that an unmarked
-    /// result's window reach the watermark at all.
-    ///
-    /// The leading comparison is NON-STRICT, and it has to be: the window
-    /// [`LocalAgreement::decoding_options_for_next`] issues begins exactly at
-    /// the watermark, which is exactly where the holdback begins, so a strict
-    /// test would fail the engine's own retarget on every stride. The two
-    /// values are the same `f32` — `last_agreed_seconds` is assigned from a
-    /// [`WordTiming::start`] — so the boundary compares exactly, the same
-    /// exactness [`LocalAgreement::prefill_reproduces_holdback`]'s own clip
-    /// clause already rests on. The trailing one is non-strict for the ordinary
-    /// half-open reason: a word that ENDS where the clip does was decoded whole
-    /// inside it.
-    ///
-    /// CONTAINMENT, not overlap, and containment in ONE clip rather than in the
-    /// union of several — "authorised only by real continuous coverage". A word
-    /// the window only partly reaches was only partly re-read, and a word that
-    /// straddles two adjacent clips was decoded in two pieces, neither of which
-    /// saw it whole; in both cases the decoder's reading of it is not a revision
-    /// of the whole word. Erring wide here (calling such a word uncovered)
-    /// leaves the record beside the partial re-reading, which costs a
-    /// repetition; erring narrow would delete it. Same direction the advance's
-    /// overlap split is drawn in, and for the same reason. A `NaN` or reversed
-    /// clip errs the same way for free: every comparison against it is false, so
-    /// it contains nothing.
-    pub(super) fn decoded(&self, word: &WordTiming) -> bool {
-      self
-        .window
-        .iter()
-        .any(|&(start, end)| start <= word.start() && word.end() <= end)
-    }
-
-    /// The hypothesis itself.
-    pub(super) const fn result(&self) -> &TranscriptionResult {
-      &self.result
-    }
-
-    /// Whether THIS result's own options established the prefill premise —
-    /// never any other result's.
-    pub(super) const fn prefilled(&self) -> bool {
-      self.prefilled
-    }
-
-    /// Unbinds the result, for the two places that need to OWN it (the
-    /// wordless-result append, and the kept-result clone).
-    pub(super) fn into_result(self) -> TranscriptionResult {
-      self.result
-    }
-  }
-}
-
-use provenance::ProvenancedResult;
 
 /// The LocalAgreement-2 hypothesis-confirmation engine: consumes one
 /// [`TranscriptionResult`] per call and tracks the growing prefix two
@@ -584,10 +351,9 @@ pub struct LocalAgreement {
   agreement_count_needed: usize,
   last_agreed_seconds: f32,
   /// The previous hypothesis, kept RAW so each ingest can re-filter it against
-  /// the watermark that is current then — paired with the provenance it arrived
-  /// with, so the two replacement decisions this engine makes about it read THAT
-  /// result's own premise and never a later call's (see [`ProvenancedResult`]).
-  prev_result: Option<ProvenancedResult>,
+  /// the watermark that is current then rather than the one current when it
+  /// arrived.
+  prev_result: Option<TranscriptionResult>,
   prev_words: Vec<WordTiming>,
   hypothesis_words: Vec<WordTiming>,
   last_agreed_words: Vec<WordTiming>,
@@ -604,37 +370,6 @@ pub struct LocalAgreement {
   /// had words to agree over — exactly the pair `finalize` reasons about.
   holdback_superseded: bool,
   confirmed_words: Vec<WordTiming>,
-  /// The head of the last advance's holdback that `budgeted_split` widened past
-  /// — words two consecutive hypotheses agreed on that
-  /// [`Self::decoding_options_for_next`]'s prefill cannot re-offer, and which
-  /// are therefore NOT YET in the append-only [`Self::confirmed_words`].
-  ///
-  /// The split has to widen: the retarget it produces (clip and prefill both
-  /// past these words) is the only coherent one, and leaving such a word IN the
-  /// holdback makes every marked continuation disagree with a prefill that
-  /// cannot reproduce it. What the split cannot know at the moment it runs is
-  /// whether the NEXT result will be one of those continuations — and confirming
-  /// on the spot is only sound if it is (codex round 12, finding 1). So the
-  /// split's WIDTH is decided at the advance and these words' DESTINATION is
-  /// decided one call later, by the premise that decides it — whether the next
-  /// result was written to BEGIN with the whole holdback, which every pending
-  /// word sits in front of ([`Self::prefill_reproduces_holdback`]).
-  ///
-  /// A result that could not have SEEN their audio settles them too, and for the
-  /// mirror-image reason (`Self::open_record_split`, codex round 13, finding 2):
-  /// a window that never reached these words revised nothing over their span, so
-  /// neither the advance nor [`Self::finalize`]'s superseded path may replace
-  /// them with it.
-  ///
-  /// Non-empty only while [`Self::last_agreed_words`] is: with nothing held back
-  /// there is no anchor a later result could be checked against, so a word left
-  /// here could never be cleared and is confirmed at the advance instead. See
-  /// the advance's own second split.
-  ///
-  /// Until then they are the head of the holdback in every respect except the
-  /// prefill: an advance replaces them along with the rest of the holdback, and
-  /// [`Self::finalize`]'s `holdback_superseded` path drops them with it.
-  pending_words: Vec<WordTiming>,
   results: Vec<TranscriptionResult>,
   /// A sink for the reproducibility facts of EVERY ingested hypothesis —
   /// including the disagreeing ones dropped from [`Self::results`] but retained
@@ -673,7 +408,6 @@ impl LocalAgreement {
       last_agreed_words: Vec::new(),
       holdback_superseded: false,
       confirmed_words: Vec::new(),
-      pending_words: Vec::new(),
       results: Vec::new(),
       ingested_facts: TaskFactsAccumulator::new(),
       special_token_begin: MIN_SPECIAL_TOKEN_BEGIN,
@@ -733,9 +467,9 @@ impl LocalAgreement {
   /// any parseable `tokenizer.json` and probes `<|endoftext|>` for its own
   /// threshold, so an artifact whose threshold is LOWER makes the default an
   /// over-estimate — the engine would hold a word whose ids that artifact's
-  /// `prefill_tokens` erases, and the equality
-  /// `Self::prefill_reproduces_holdback` checks would be satisfied by a prefix
-  /// the decoder is given only part of (codex round 12, finding 2).
+  /// `prefill_tokens` erases, so the prefill the engine promises the next
+  /// hypothesis is one the decoder is given only part of (codex round 12,
+  /// finding 2).
   ///
   /// So it is a value rather than a constant. [`LocalAgreementTranscriber::new`]
   /// sets it from the pipeline's own loaded vocabulary, which is exact and needs
@@ -757,9 +491,8 @@ impl LocalAgreement {
   /// a value ABOVE the deciding vocabulary's own threshold makes the engine hold
   /// a word the decoder never receives, and a value below it only confirms a
   /// word a round earlier than it had to. The caller owns the artifact, so the
-  /// caller supplies the fact — the same trust model as
-  /// [`Self::ingest`]'s `decoded_under`, and checked the same way where it can
-  /// be: [`LocalAgreementTranscriber`] reads it off the vocabulary itself.
+  /// caller supplies the fact, and it is checked where it can be:
+  /// [`LocalAgreementTranscriber`] reads it off the vocabulary itself.
   #[inline(always)]
   pub const fn set_special_token_begin(&mut self, special_token_begin: u32) -> &mut Self {
     self.special_token_begin = special_token_begin;
@@ -783,44 +516,17 @@ impl LocalAgreement {
     self.last_agreed_words.as_slice()
   }
 
-  // -- pending_words (Vec<WordTiming>) ---------------------------------------
-  /// The words the last advance agreed on but could not hold back — the ones
-  /// `budgeted_split` widened the split past because
-  /// [`prefill_tokens`](crate::audio::whisper::decode::prefill_tokens) cannot
-  /// carry them into the next hypothesis whole.
-  ///
-  /// They sit BETWEEN [`Self::confirmed_words_slice`] and
-  /// [`Self::last_agreed_words_slice`], so the transcript a streaming caller can
-  /// read between pushes is the three concatenated in that order. They are not
-  /// confirmed: a hypothesis decoded some way OTHER than
-  /// [`Self::decoding_options_for_next`] MAY have seen their audio and revised
-  /// them, and [`Self::confirmed_words_slice`] is append-only and cannot take a
-  /// word back. The first hypothesis written to begin with this engine's own
-  /// holdback settles them — nothing it produces can precede that reproduction,
-  /// and these words are in front of it (see the field's own comment, and codex
-  /// round 12, finding 1). So does one whose own
-  /// [`DecodingOptions::clip_timestamps`](crate::audio::whisper::options::DecodingOptions::clip_timestamps_slice)
-  /// begin after them, for the opposite reason — it never decoded their audio at
-  /// all, so it revised nothing and the engine's record is all their span will
-  /// ever have (codex round 13, finding 2).
-  ///
-  /// Always empty for [`LocalAgreementTranscriber`], whose words come from
-  /// `add_word_timestamps` and whose holdback is two words wide.
-  #[inline(always)]
-  pub const fn pending_words_slice(&self) -> &[WordTiming] {
-    self.pending_words.as_slice()
-  }
-
   // -- confirmed_words (Vec<WordTiming>) -------------------------------------
-  /// Word timings settled so far: every agreement's leading remainder,
-  /// ahead of that agreement's own [`Self::agreement_count_needed`]-word
-  /// holdback — and ahead of [`Self::pending_words_slice`], the part of that
-  /// holdback the prefill could not carry, which reaches this list one ingest
-  /// later than the rest of the remainder does.
+  /// Word timings settled so far: every agreement's leading remainder, ahead of
+  /// that agreement's own [`Self::agreement_count_needed`]-word holdback.
   ///
   /// Append-only across the life of the engine: nothing here is ever rewritten,
-  /// reordered, or taken back, which is why a word the next hypothesis might
-  /// still revise waits in [`Self::pending_words_slice`] instead.
+  /// reordered, or taken back, which is why the trailing words of an agreement
+  /// wait in [`Self::last_agreed_words_slice`] instead. RULE W (see
+  /// [`Self::ingest`]'s advance) additionally guarantees that while that
+  /// holdback is non-empty, this list's last word starts STRICTLY before
+  /// [`Self::last_agreed_seconds`] — so nothing here can be re-offered to the
+  /// agreement comparison and confirmed a second time.
   #[inline(always)]
   pub const fn confirmed_words_slice(&self) -> &[WordTiming] {
     self.confirmed_words.as_slice()
@@ -861,9 +567,10 @@ impl LocalAgreement {
   /// `prefixTokens` exactly as described. It defaults `true` on both sides, so
   /// this only diverges for a caller that turned it off.
   ///
-  /// What the prefill buys is the reason a hypothesis decoded from these options
-  /// cannot put anything in front of the holdback — the premise
-  /// [`Self::pending_words_slice`]'s promotion rests on. `prefill_tokens`
+  /// What the prefill buys is that the next hypothesis REPRODUCES the holdback
+  /// rather than predicting it — which is what makes an advance's `common` a
+  /// re-agreement over the same span rather than a fresh reading of it, and what
+  /// `budgeted_split`'s budget argument is about. `prefill_tokens`
   /// appends these tokens to the initial prompt, and `decode_text` FORCES every
   /// prompt position
   /// (`next_token = current_tokens[token_index]` for `token_index <
@@ -873,23 +580,16 @@ impl LocalAgreement {
   /// with `clip_timestamps`, which puts the audio before the watermark outside
   /// the decoded window entirely, a hypothesis produced from these options
   /// BEGINS with a reproduction of the holdback, and nothing already confirmed
-  /// can precede it. See `LocalAgreement::prefill_reproduces_holdback`.
-  ///
-  /// Hand the returned value back to [`Self::ingest`] alongside the result it
-  /// decoded: that is how the premise above becomes something the engine has
-  /// CHECKED rather than assumed. `ingest` compares what it is given against
-  /// what this method would issue for the same state, and leaves the pending
-  /// head unsettled when they differ.
+  /// can precede it.
   ///
   /// # Before the first advance
   ///
   /// With an empty [`Self::last_agreed_words_slice`] there is nothing to
   /// reproduce: the prefix is empty, `clip_timestamps` is at the watermark, and
   /// [`DecodingOptions::use_prefill_prompt`] is left exactly as `base` had it.
-  /// The forcing above exists to make the pending promotion sound, and with no
-  /// holdback nothing is ever pending — the advance settles such a word on the
-  /// spot, precisely because no anchor could ever clear it (see
-  /// `Self::prefill_reproduces_holdback`). Overriding the caller's flag here
+  /// The forcing above exists so the prefix the engine attaches actually
+  /// reaches the decoder, and there is no prefix on this path. Overriding the
+  /// caller's flag here
   /// would change the initial prompt from a bare `<|startoftranscript|>` to the
   /// full multilingual language/task/timestamp prefill for no reason the engine's
   /// own state can point at (codex round 6, finding 3), and there would be no
@@ -900,11 +600,8 @@ impl LocalAgreement {
       .with_clip_timestamps(vec![self.last_agreed_seconds])
       .with_prefix_tokens(self.holdback_prefill_tokens());
     if self.last_agreed_words.is_empty() {
-      // NOTHING IS HELD BACK, so there is no premise to enforce and the caller's
-      // own flag stands: `pending_words` is empty for exactly as long as
-      // `last_agreed_words` is (the advance's own second split), so the
-      // promotion the prefill DECIDES is not being asked for. Forcing the flag
-      // here would change the prompt
+      // NOTHING IS HELD BACK, so the prefix is empty and the caller's own flag
+      // stands. Forcing the flag here would change the prompt
       // from whatever the caller asked for to the full multilingual
       // language/task/timestamp prefill, on strides where the engine holds no
       // state that needs the deviation (codex round 6, finding 3). The prefix
@@ -918,161 +615,13 @@ impl LocalAgreement {
 
   /// The holdback as one token sequence — the exact value
   /// [`Self::decoding_options_for_next`] attaches as
-  /// [`DecodingOptions::prefix_tokens`](DecodingOptions::prefix_tokens_slice),
-  /// and the value [`Self::prefill_reproduces_holdback`] compares a caller's
-  /// options against.
+  /// [`DecodingOptions::prefix_tokens`](DecodingOptions::prefix_tokens_slice).
   fn holdback_prefill_tokens(&self) -> Vec<u32> {
     self
       .last_agreed_words
       .iter()
       .flat_map(|word| word.tokens_slice().iter().copied())
       .collect()
-  }
-
-  /// Whether `decoded_under` — the options a caller says the offered result was
-  /// decoded with — actually establishes the premise
-  /// [`Self::pending_words_slice`]'s promotion is decided by: that the offered
-  /// hypothesis was written to BEGIN with this engine's whole holdback, so
-  /// nothing it produces can precede that reproduction and the pending words,
-  /// which sit in front of it, are past revising.
-  ///
-  /// Every clause is a thing that, if false, breaks that premise outright:
-  ///
-  /// - **An empty holdback** makes it vacuous, and harmlessly so: nothing is
-  ///   ever pending beside an empty holdback (the advance's own second split
-  ///   confirms such a word on the spot, because no anchor could ever clear
-  ///   it), so the only consumer of this answer has nothing to read it for.
-  /// - **[`DecodingOptions::use_prefill_prompt`] off** means
-  ///   [`crate::audio::whisper::transcribe::WhisperKit::transcribe`] never calls
-  ///   [`prefill_tokens`](crate::audio::whisper::decode::prefill_tokens), so the
-  ///   prefix is inert and the hypothesis PREDICTED its head rather than being
-  ///   fed it.
-  /// - **A different [`DecodingOptions::clip_timestamps`](DecodingOptions::clip_timestamps_slice)**
-  ///   means the audio the pending words were recognized in was NOT excluded
-  ///   from the decoded window, so this hypothesis DID re-read them and may be
-  ///   revising them — precisely what the promotion rules out.
-  /// - **A prefix that is not the holdback** is not a reproduction of it — and
-  ///   the test is equality, not "ends with". A prefix over
-  ///   [`MAX_HOLDBACK_PREFILL_TOKENS`] whose TAIL reproduces the holdback is
-  ///   refused by that same clause, and must be: `prefill_tokens` trims such a
-  ///   prefix to its last [`MAX_HOLDBACK_PREFILL_TOKENS`] tokens, which still
-  ///   carries the padding ahead of the holdback into the initial prompt, so the
-  ///   hypothesis does not BEGIN with the holdback. Equality also subsumes both
-  ///   of `prefill_tokens`'s reductions outright: `budgeted_split` leaves a
-  ///   holdback that is inside the budget AND carried whole by the id filter
-  ///   after every advance, so anything equal to that holdback is too — which is
-  ///   why neither reduction gets a clause of its own here. A clause for either
-  ///   would be a conjunct no input can falsify, the shape round 7 removed the
-  ///   length clause for.
-  ///
-  /// What it cannot check is that the caller actually DECODED with the options
-  /// it handed over; `TranscriptionResult` carries no provenance, and the
-  /// issue's impossibility argument already established that no predicate over
-  /// the word lists can recover it (two runs reach byte-identical
-  /// `(confirmed, offered, watermark, holdback)` and need opposite answers).
-  /// This is therefore the strongest premise the engine can hold: an explicit,
-  /// typed assertion by the caller, checked against what the engine itself would
-  /// have issued — not an unstated assumption about how `ingest` is called.
-  fn prefill_reproduces_holdback(&self, decoded_under: &DecodingOptions) -> bool {
-    if self.last_agreed_words.is_empty() {
-      return true;
-    }
-    if !decoded_under.use_prefill_prompt() {
-      return false;
-    }
-    if decoded_under.clip_timestamps_slice() != [self.last_agreed_seconds] {
-      return false;
-    }
-    // Equality, not `ends_with`: a prefix whose head is something else is not a
-    // reproduction of the holdback, however faithfully its TAIL reproduces one
-    // (`prefill_tokens` would force the head into the hypothesis too). Equality
-    // also subsumes both of `prefill_tokens`'s reductions: after every advance
-    // `budgeted_split` leaves a holdback inside `MAX_HOLDBACK_PREFILL_TOKENS`
-    // whose every word the id filter carries whole, so anything equal to it is
-    // within budget and unfiltered as well.
-    decoded_under.prefix_tokens_slice() == self.holdback_prefill_tokens()
-  }
-
-  /// The engine's own STILL-OPEN record of the span, in time order:
-  /// `pending_words` — the agreed-but-not-yet-irrevocable head — then
-  /// `last_agreed_words`, the holdback proper. The two places that would
-  /// REPLACE it read it through here so neither can forget half of it.
-  fn open_record(&self) -> impl DoubleEndedIterator<Item = &WordTiming> {
-    self
-      .pending_words
-      .iter()
-      .chain(self.last_agreed_words.iter())
-  }
-
-  /// How many words are in [`Self::open_record`].
-  fn open_record_len(&self) -> usize {
-    self.pending_words.len() + self.last_agreed_words.len()
-  }
-
-  /// WHERE `hypothesis`'s own decode window cuts the still-open record: the
-  /// index at which the record stops being the only estimate its span will ever
-  /// have and becomes something this hypothesis re-read and may replace (codex
-  /// round 13 finding 2, split per codex round 14 finding 2).
-  ///
-  /// Both places that replace the record ask this, and it is the same question
-  /// in both: the advance, which drops the record and installs `common` over
-  /// it, and [`Self::finalize`]'s `holdback_superseded` branch, which drops it
-  /// and installs the final hypothesis's own post-watermark words. Each
-  /// justifies itself by calling the replacement a REVISION of what it
-  /// replaces, and a decode whose window never reached a word produced no
-  /// revision of it — it produced nothing over its span at all, and the record
-  /// is then the only estimate that span will ever have.
-  ///
-  /// ONE VERDICT FOR THE WHOLE RECORD IS WRONG IN BOTH DIRECTIONS, which is why
-  /// this returns a boundary rather than a `bool`. Deciding it at the record's
-  /// first word alone lets a window that opens BETWEEN two held words confirm
-  /// the second one at the very moment a hypothesis that did re-read it says it
-  /// is something else — irrevocably, on the streaming face, with the stale
-  /// reading then emitted beside its own revision. That is the exact mirror of
-  /// round 13's defect, reached from the conservative side.
-  ///
-  /// The replaceable part is the longest SUFFIX every word of which
-  /// `ProvenancedResult::decoded` accepts, so this is `open_record_len()` minus
-  /// that suffix's length. A suffix rather than a per-word verdict because the
-  /// record is emitted as a prefix and word extents within a hypothesis are not
-  /// guaranteed monotone: an uncovered word anywhere pushes the boundary past
-  /// it, so a later word is never replaced out from behind a preserved one. That
-  /// is the erring-wide direction — a repetition at worst — and it is the same
-  /// direction, for the same reason, as the advance's own `position` split over
-  /// `common[requested..split]`.
-  ///
-  /// `0` when the record is empty, which is exactly "all of it is replaceable"
-  /// and harmlessly so: with nothing held and nothing pending there is nothing
-  /// to protect. `finalize` still has to spell that case out, because there
-  /// "replaceable" and "empty" have to reach the same branch — see the guard
-  /// there.
-  fn open_record_split(&self, hypothesis: &ProvenancedResult) -> usize {
-    self.open_record_len()
-      - self
-        .open_record()
-        .rev()
-        .take_while(|word| hypothesis.decoded(word))
-        .count()
-  }
-
-  /// Moves the record's first `keep` words — the part no window re-read — into
-  /// `confirmed`, and DROPS the rest, leaving both record buckets empty for the
-  /// caller to refill. The two replacement sites' shared tail.
-  ///
-  /// By field rather than through `&mut self`: the advance calls it while
-  /// `common` still borrows `hypothesis_words`, and these three buckets are
-  /// disjoint from that one.
-  fn confirm_the_unread_prefix_and_drop_the_rest(
-    confirmed: &mut Vec<WordTiming>,
-    pending: &mut Vec<WordTiming>,
-    holdback: &mut Vec<WordTiming>,
-    keep: usize,
-  ) {
-    let from_pending = keep.min(pending.len());
-    confirmed.extend_from_slice(&pending[..from_pending]);
-    confirmed.extend_from_slice(&holdback[..keep - from_pending]);
-    pending.clear();
-    holdback.clear();
   }
 
   /// The agreement view of a result's words: everything at or past the
@@ -1136,21 +685,7 @@ impl LocalAgreement {
   /// Either way — agreeing, disagreeing, or no previous result — `result`
   /// becomes the new previous result for the next call (`:402`, outside
   /// the agreement `if`/`else` but still inside the has-words branch).
-  pub fn ingest(
-    &mut self,
-    result: TranscriptionResult,
-    decoded_under: &DecodingOptions,
-  ) -> AgreementOutcome {
-    // PROVENANCE IS BOUND HERE, ONCE, BEFORE ANY STATE MOVES -- `decoded_under`
-    // is checked against the watermark and holdback the caller decoded with,
-    // which are still the current ones at this point, and the answer then
-    // travels WITH the result for as long as the engine keeps it. What it buys
-    // is no longer a reading of the offered list (Rule W removed that question)
-    // but the two REPLACEMENT decisions below: whether this hypothesis could
-    // have revised the still-open record at all, and whether it can settle the
-    // pending head of it.
-    let hypothesis = ProvenancedResult::arriving(result, self, decoded_under);
-
+  pub fn ingest(&mut self, result: TranscriptionResult) -> AgreementOutcome {
     // Accumulate THIS hypothesis's reproducibility facts BEFORE any gate or
     // branch, so a hypothesis dropped from `results` on disagreement (:395-400,
     // `skipAppend`) still contributes them to `finalize` (codex round 8, F1). It
@@ -1168,8 +703,7 @@ impl LocalAgreement {
     // ordinals; `finalize` overwrites it with the merged surviving result's own
     // span, the authoritative id-ordinal count.
     self.ingested_facts.merge(
-      &hypothesis
-        .result()
+      &result
         .task_facts()
         .clone()
         .with_worker_schedule(None)
@@ -1178,56 +712,18 @@ impl LocalAgreement {
 
     // :371 gate — see this module's doc for "any segment" vs. Swift's
     // first-segment-only nil check.
-    let has_words = hypothesis
-      .result()
+    let has_words = result
       .segments_slice()
       .iter()
       .any(|segment| !segment.words_slice().is_empty());
     if !has_words {
-      self.results.push(hypothesis.into_result());
+      self.results.push(result);
       return AgreementOutcome::NoWordTimings;
     }
 
-    // THE PENDING WORDS' DESTINATION, decided here because here is the first
-    // moment the provenance that decides it exists (codex round 12, finding 1).
-    // `budgeted_split` widened past them at the last advance so the retarget
-    // could be coherent, and round 8's argument for confirming them on the spot
-    // -- neither corroborable nor revisable, being behind both the clip and the
-    // prefill -- is an argument about the hypothesis that comes NEXT, which the
-    // advance had not seen. THIS hypothesis's own premise is that argument's
-    // missing clause: a result written to begin with the whole holdback cannot
-    // put anything in front of that reproduction, and every pending word is in
-    // front of it, so such a result can neither corroborate nor revise one and
-    // they settle here. A result decoded any other way saw their audio and could,
-    // so they stay where they are.
-    //
-    // The premise is never the VACUOUS one: `prefill_reproduces_holdback`
-    // answers TRUE for anything when the holdback is empty, and the advance below
-    // leaves nothing pending in that state precisely so this consumer can never
-    // read it (see the anchor argument there). `pending_words` non-empty implies
-    // `last_agreed_words` non-empty, because only an advance sets either and an
-    // advance sets both together.
-    //
-    // Before the `has_words` gate this would also fire for a wordless result,
-    // which the gate above documents as leaving every agreement bookkeeping
-    // field untouched. Deferring past one costs nothing -- the next worded
-    // hypothesis makes the same call -- so the gate keeps its meaning.
-    if hypothesis.prefilled() {
-      self.confirmed_words.append(&mut self.pending_words);
-    }
-
-    // THE OTHER FACT `decoded_under` CARRIES, read here because here is where
-    // the state it is read against stops moving for this call (codex round 13,
-    // finding 2). The promotion above is the last thing to touch
-    // `pending_words` before the advance, and nothing below touches
-    // `last_agreed_words` until the advance replaces it -- so this is the record
-    // whose span the advance would drop, and the boundary computed now is the
-    // boundary at the moment it drops it.
-    let open_record_split = self.open_record_split(&hypothesis);
-
     // :372 verbatim — see `watermark_filtered`, and Rule W below for why the
     // bare filter is sound.
-    self.hypothesis_words = Self::watermark_filtered(hypothesis.result(), self.last_agreed_seconds);
+    self.hypothesis_words = Self::watermark_filtered(&result, self.last_agreed_seconds);
 
     let mut advanced = false;
     let mut skip_append = false;
@@ -1239,7 +735,7 @@ impl LocalAgreement {
       // comparison. `prev_result` is kept RAW for exactly this: the watermark it
       // is re-read against is the one current NOW, not the one current when it
       // arrived.
-      self.prev_words = Self::watermark_filtered(previous.result(), self.last_agreed_seconds);
+      self.prev_words = Self::watermark_filtered(previous, self.last_agreed_seconds);
       let common = find_longest_common_prefix(&self.prev_words, &self.hypothesis_words);
       if common.len() >= self.agreement_count_needed {
         // :383-394 — advance the watermark.
@@ -1269,24 +765,14 @@ impl LocalAgreement {
         // is carried forward through the loop, so a RUN of tied starts is
         // cleared in one pass rather than one word of it.
         //
-        // Against `pending_words` this OVER-FIRES, deliberately.
-        // `common[split - 1]` is the last word this advance CONFIRMS only when
-        // every word `budgeted_split` widened past also ends at or before the
-        // new watermark; one that ends past it lands in `pending_words` instead
-        // -- not confirmed, so a tie against it creates no re-admission to
-        // defend against -- and this widens past it all the same. The
-        // postcondition holds either way, so the cost is conservatism: on a
-        // holdback whose tail ties, the split can run to the end of `common` and
-        // leave nothing held and nothing pending.
-        //
         // Composes with `budgeted_split` in one direction only, which is why it
         // runs after it: widening can only SHRINK the holdback `common[split..]`,
         // so the token budget it just established still holds, and its id-filter
         // floor is likewise never re-crossed (see `budgeted_split`). Where the
         // tie runs to the end of `common` the holdback empties and the watermark
-        // falls back to `common.last().end()`, which is at or past every start in
-        // it -- the postcondition is then vacuous, and the next advance re-seeds
-        // the anchor from the confirmed list.
+        // falls back to `common.last().end()`, which is at or past every start
+        // in it -- the postcondition is then vacuous, and the next advance
+        // re-seeds the anchor from the confirmed list.
         let mut anchor = if split > 0 {
           Some(common[split - 1].start())
         } else {
@@ -1296,43 +782,10 @@ impl LocalAgreement {
           anchor = Some(common[split].start());
           split += 1;
         }
-        // The still-open record is REPLACED here -- `pending_words` dropped and
-        // `last_agreed_words` overwritten -- because `common` is the span two
-        // hypotheses have just re-agreed over it. That is a claim about this
-        // hypothesis's WINDOW, and it used to be assumed: whatever was still
-        // pending had not been settled by the promotion above, from which the
-        // code concluded "so this hypothesis saw its audio". An unmarked result
-        // may legitimately clip LATER than the watermark, or skip the span
-        // between two clips of its schedule entirely, and then it saw none of
-        // it (codex round 13, finding 2; codex round 14, finding 1).
-        //
-        // What it could not re-read, it cannot revise, so THAT PART of the
-        // record is CONFIRMED instead of dropped -- the same claim every other
-        // confirmed word carries (two consecutive hypotheses agreed on it, and
-        // nothing that could see its audio has contradicted it), and the only
-        // alternative to deleting it: the watermark moves past these words on
-        // the very next line, so no future result can ever be offered over
-        // their span and holding them would be an indefinite wait ending in the
-        // deletion round 7 finding 2 removed. Time-ordered, too: they start at
-        // or before the old watermark and every word of `common` starts at or
-        // past it.
-        //
-        // The rest -- the suffix this hypothesis re-read -- is dropped, because
-        // `common` IS its revision and confirming it would make the superseded
-        // reading irrevocable beside its replacement (codex round 14, finding
-        // 2).
-        //
-        // On the promoted path the drain already emptied `pending_words`, and
-        // on every marked stride the retarget's own window begins exactly at
-        // the watermark and runs unbounded from there, so the whole record is
-        // inside it, `open_record_split` is 0, and this is the unchanged
-        // replacement.
-        Self::confirm_the_unread_prefix_and_drop_the_rest(
-          &mut self.confirmed_words,
-          &mut self.pending_words,
-          &mut self.last_agreed_words,
-          open_record_split,
-        );
+        // `common` REPLACES the still-open record: it is the span two consecutive
+        // hypotheses have just re-agreed over it, and `last_agreed_words` is the
+        // one this hypothesis has superseded.
+        self.confirmed_words.extend_from_slice(&common[..split]);
         self.last_agreed_words = common[split..].to_vec();
         // The watermark is the first held-back word's start -- except when the
         // budget could hold NOTHING (see `budgeted_split`), where the still-open
@@ -1341,6 +794,15 @@ impl LocalAgreement {
         // one), so the final fallback is unreachable and only keeps this total.
         // Monotone either way: every word of `common` starts at or past the old
         // watermark, and `end >= start`.
+        //
+        // That empty-holdback anchor is Rule W's one gap, and it is recorded as
+        // a residual rather than closed: `common.last().end()` can EQUAL
+        // `common.last().start()` for a zero-duration word, and the
+        // postcondition is then vacuous because there is no held-back word for
+        // it to speak about. Reaching it needs a non-default
+        // `agreement_count_needed`, a word whose own tokens exceed
+        // `MAX_HOLDBACK_PREFILL_TOKENS`, and a zero-duration word, all at once
+        // (`an_empty_holdback_leaves_a_zero_duration_word_at_the_watermark`).
         self.last_agreed_seconds = self.last_agreed_words.first().map_or_else(
           || {
             common
@@ -1349,54 +811,6 @@ impl LocalAgreement {
           },
           WordTiming::start,
         );
-        // `common[requested..split]` is what the split had to widen past, and it
-        // splits ONE more time -- on whether anything could still speak to the
-        // word (codex round 12, finding 1). Two ways the answer is no, and a
-        // word that gets either is settled here and now on round 8's own
-        // argument rather than deferred:
-        //
-        // - **Nothing can overlap it.** Every word the engine will ever be
-        //   offered again is filtered to `start >= watermark`, so a word whose
-        //   extent ENDS at or before the watermark shares no instant with any of
-        //   them. The `>` is STRICT: erring wide here DELETES a word the stream
-        //   produced and nothing revised, while erring narrow only leaves a word
-        //   pending one call longer. Interval overlap is the exact notion this
-        //   one needs, and `[p.start, p.end)` overlaps `[watermark, ..)` exactly
-        //   when `p.end > watermark`.
-        // - **Nothing could ever clear it.** A pending word waits for a
-        //   hypothesis that provably cannot revise it, and the only such
-        //   hypothesis is one this engine ANCHORED -- prefilled with a holdback
-        //   that occupies the span in front of the word, so nothing it produces
-        //   can precede that reproduction. With the holdback EMPTY there is no
-        //   anchor and no future result can ever supply one, so waiting is not
-        //   deferral but an indefinite hold, ending in exactly the deletion round
-        //   7 finding 2 removed. Confirming instead is what that finding
-        //   requires, and this is where it keeps requiring it.
-        //
-        // Together they also keep this module's one cross-call invariant:
-        // `pending_words` non-empty implies `last_agreed_words` non-empty, which
-        // is what stops the promotion above from ever reading the vacuous
-        // premise.
-        //
-        // `position`, so what is confirmed is a PREFIX: word ends within a
-        // hypothesis are not guaranteed monotone, and a later short word must
-        // not be confirmed out from behind an overlapping earlier one.
-        let widened = &common[requested..split];
-        let overlapping = if self.last_agreed_words.is_empty() {
-          widened.len()
-        } else {
-          widened
-            .iter()
-            .position(|word| word.end() > self.last_agreed_seconds)
-            .unwrap_or(widened.len())
-        };
-        self.confirmed_words.extend_from_slice(&common[..requested]);
-        self
-          .confirmed_words
-          .extend_from_slice(&widened[..overlapping]);
-        self
-          .pending_words
-          .extend_from_slice(&widened[overlapping..]);
         advanced = true;
       } else {
         // :395-400 — disagreement; `result` is dropped below.
@@ -1412,13 +826,12 @@ impl LocalAgreement {
     // nothing can have been superseded.
     self.holdback_superseded = skip_append;
 
-    // :402 (unconditional) + :408-410 (`!skipAppend`). The premise goes into
-    // `prev_result` with the result, never re-derived when it is read back.
+    // :402 (unconditional) + :408-410 (`!skipAppend`).
     if skip_append {
-      self.prev_result = Some(hypothesis);
+      self.prev_result = Some(result);
     } else {
-      self.results.push(hypothesis.result().clone());
-      self.prev_result = Some(hypothesis);
+      self.prev_result = Some(result.clone());
+      self.results.push(result);
     }
 
     if advanced {
@@ -1435,11 +848,8 @@ impl LocalAgreement {
   /// ([`crate::audio::whisper::text::find_longest_different_suffix`] over the last
   /// ingested pair), both folded onto [`Self::confirmed_words_slice`] —
   /// **except when the final hypothesis DISAGREED**, where this port emits that
-  /// hypothesis's own post-watermark words instead — behind whatever part of the
-  /// record its own decode window never reached, which it does not supersede and
-  /// which is emitted ahead of them (see this module's doc, "The final
-  /// hypothesis's holdback", and "A result only replaces the PART of the span
-  /// its own window DECODED" for the window clause);
+  /// hypothesis's own post-watermark words instead of the superseded holdback
+  /// (see this module's doc, "The final hypothesis's holdback");
   /// [`merge_transcription_results_with_words`] then merges every kept
   /// [`Self::results_slice`] result with that word list as the merged
   /// text, under `options` — the same options the kept results were decoded
@@ -1460,29 +870,6 @@ impl LocalAgreement {
   /// the ingest strip carries only the wholly-unknown span, so the fold cannot
   /// supply the exact count, round 12); see [`Self::ingest`].
   pub fn finalize(mut self, options: &DecodingOptions) -> TranscriptionResult {
-    // The third conjunct is `ProvenancedResult::decoded` read off the FINAL
-    // hypothesis -- which is what `prev_result` holds here, since `ingest` sets
-    // it on every worded path and the wordless gate returns before it (codex
-    // round 13, finding 2). `holdback_superseded` is only ever set inside `if
-    // let Some(previous) = &self.prev_result`, so the `None` arm is unreachable
-    // while the branch below is live and is `0` only to keep this total.
-    let open_record_split = match self.prev_result.as_ref() {
-      Some(previous) => self.open_record_split(previous),
-      None => 0,
-    };
-    // AND NOTHING MORE. Round 13 made "this hypothesis re-read the record" a
-    // third conjunct here; the SPLIT above subsumes it, because a record nothing
-    // re-read gets `open_record_split == len` and is kept WHOLE by the branch
-    // itself. What a surviving conjunct would still decide is the tail --
-    // `hypothesis_words` here against `find_longest_different_suffix`'s
-    // remainder below -- and that subtraction is only sound when
-    // `last_agreed_words` holds the prefix it subtracts. On this path it does
-    // not: the record is the OLD holdback, unrelated to whatever prefix the last
-    // two hypotheses happen to share, so the conjunct's false arm dropped words
-    // both of them produced and nothing put back --
-    // `a_disagreeing_final_pair_keeps_the_words_both_hypotheses_agreed_on`'s
-    // defect with a non-empty holdback (codex round 14; the conjunct redded no
-    // test, and every shape that made it observable made it wrong).
     if self.holdback_superseded && !self.hypothesis_words.is_empty() {
       // DIVERGENCE from `:418-419` — see this module's doc for the full
       // argument. Swift's `lastAgreedWords + differentSuffix(prevWords,
@@ -1500,46 +887,9 @@ impl LocalAgreement {
       // disagrees, but it re-covers nothing, so there is no revision to prefer
       // and the provisional holdback remains the only estimate for that span.
       // That case stays on the Swift shape below, byte-identical.
-      //
-      // COVERAGE is the same argument reached from the other end (codex round
-      // 13, finding 2), and it is spent HERE rather than on the branch
-      // condition. "Already re-covers that exact span" is a claim about the
-      // final hypothesis's decode WINDOW, and it was assumed of every unmarked
-      // result rather than checked. A result whose clip schedule never reaches
-      // the holdback shares no instant with it: its words are not a revision of
-      // anything held, so dropping the record for them deletes words the stream
-      // agreed on and nothing contradicted. `open_record_split` is `len` for
-      // such a result, so the call below keeps the record WHOLE and only the
-      // hypothesis's own words follow it.
-      //
-      // And it is a BOUNDARY, not a verdict on the whole record (codex round 14,
-      // finding 2). A window that opens between two held words re-read only the
-      // second, so only the second is superseded; the first is kept, ahead of
-      // the revision, exactly where it sits in time. Reading the record's head
-      // alone got both halves wrong at once -- it emitted the re-read word
-      // beside its own revision, and it did so on the strength of a word the
-      // hypothesis never saw.
-      //
-      // `pending_words` is dropped with the part of the holdback it heads, and
-      // for the same reason: `hypothesis_words` re-covers that span carrying the
-      // revision, and emitting both would strand the superseded reading beside
-      // its replacement — the very defect this branch exists to prevent, reached
-      // one word earlier (codex round 12, finding 1). It is empty on every
-      // marked stream: a hypothesis that clips at the watermark settles the
-      // pending words on arrival, so only a hypothesis that could actually see
-      // their audio ever gets to supersede them.
-      Self::confirm_the_unread_prefix_and_drop_the_rest(
-        &mut self.confirmed_words,
-        &mut self.pending_words,
-        &mut self.last_agreed_words,
-        open_record_split,
-      );
       self.confirmed_words.append(&mut self.hypothesis_words);
     } else {
-      // `:418-419` verbatim, with `pending_words` ahead of the holdback because
-      // that is where they sit in time. Nothing superseded them, so they are
-      // still the only estimate for their span.
-      self.confirmed_words.append(&mut self.pending_words);
+      // `:418-419` verbatim.
       self.confirmed_words.append(&mut self.last_agreed_words);
       let suffix = find_longest_different_suffix(&self.prev_words, &self.hypothesis_words);
       self.confirmed_words.extend_from_slice(suffix);
@@ -1619,40 +969,27 @@ impl LocalAgreement {
 /// from every [`WordTiming`] it emits (and emits no word at all for an
 /// all-special alignment entry). The evidence is correct and the pipeline really
 /// is clean. What it does not cover is [`LocalAgreement::ingest`] itself, which
-/// is public and takes a hand-built [`TranscriptionResult`] — the very call
-/// shape `decoded_under` exists to make safe. Such a caller can hold back a word
-/// carrying filtered ids, honestly pass the options
-/// [`LocalAgreement::decoding_options_for_next`] just issued, and have
-/// `ProvenancedResult` record `prefilled = true` for a hypothesis the decoder
-/// was fed only PART of the holdback for — the one premise
-/// [`LocalAgreement::pending_words_slice`]'s promotion rests on.
+/// is public and takes a hand-built [`TranscriptionResult`], so a caller can
+/// hold back a word carrying filtered ids and then use
+/// [`LocalAgreement::decoding_options_for_next`] honestly, leaving the engine
+/// promising the decoder text it will never be given.
 ///
-/// Widening the split instead takes that head OUT of the holdback. It is not a
-/// weaker claim than any other agreed word carries: `common` is the prefix two
-/// consecutive hypotheses agreed on, which is the whole of LocalAgreement-2's
-/// criterion, and [`LocalAgreement::finalize`] already appends the entire
-/// holdback to [`LocalAgreement::confirmed_words_slice`] unconditionally on its
-/// Swift-shaped path. What the holdback buys on top of that is one more round in
-/// which a third hypothesis could revise it — and a word the prefill cannot
-/// carry cannot be revised by one *that was decoded from the prefill*, because
-/// whatever such a hypothesis produces over that extent came from a DIFFERENT
-/// prefix and from audio the clip excludes, and is therefore neither a
-/// corroboration of the held word nor a revision of it.
-///
-/// **That qualifier is the whole of codex round 12, finding 1.** The argument
-/// above is about the hypothesis that comes NEXT, and the split runs before it
-/// exists. A caller who does not use
-/// [`LocalAgreement::decoding_options_for_next`] is subject to neither reduction
-/// — its decoder never sees a truncated prefix and its window is its own — so
-/// for it the held word is revisable after all, and confirming here would strand
-/// the stale reading beside the revision. So the split still widens (the
-/// retarget it produces is the only coherent one either way: a word the prefill
-/// cannot re-offer must not be the thing the next hypothesis is asked to
-/// reproduce), but the widened-past words land in
-/// [`LocalAgreement::pending_words_slice`] rather than in the append-only
-/// confirmed list, and [`LocalAgreement::ingest`] settles them the moment a
-/// hypothesis arrives that the engine itself anchored. Deferring the
-/// DESTINATION is available; deferring the SPLIT is not.
+/// Widening the split instead takes that head OUT of the holdback and CONFIRMS
+/// it. That is not a weaker claim than any other agreed word carries: `common`
+/// is the prefix two consecutive hypotheses agreed on, which is the whole of
+/// LocalAgreement-2's criterion, and [`LocalAgreement::finalize`] already
+/// appends the entire holdback to
+/// [`LocalAgreement::confirmed_words_slice`] unconditionally on its Swift-shaped
+/// path. What the holdback buys on top of that is one more round in which a
+/// third hypothesis could revise it — and a word the prefill cannot carry cannot
+/// be revised by one *that was decoded from the prefill*, because whatever such
+/// a hypothesis produces over that extent came from a DIFFERENT prefix and from
+/// audio the clip excludes, and is therefore neither a corroboration of the held
+/// word nor a revision of it. A caller driving [`LocalAgreement::ingest`] with a
+/// result decoded some OTHER way is subject to neither reduction, so for it the
+/// word is revisable after all and the confirmation lands beside the revision —
+/// the same append-only cost `common[..split]` already carries on every path
+/// (`an_overlapping_agreed_word_is_confirmed_on_the_mainline_path_too`).
 ///
 /// Widening is the repair because the defect is the STATE, not any reading of
 /// it. Leaving the unreproducible word IN the holdback is what round 7's
@@ -1717,8 +1054,9 @@ fn budgeted_split(common: &[WordTiming], requested: usize, special_token_begin: 
 
 /// Whether [`prefill_tokens`](crate::audio::whisper::decode::prefill_tokens)
 /// carries this word's tokens into the initial prompt WHOLE — the property every
-/// held-back word has to have for `LocalAgreement::prefill_reproduces_holdback`'s
-/// equality to mean what it says.
+/// held-back word has to have for
+/// [`LocalAgreement::decoding_options_for_next`]'s retarget to promise the
+/// decoder text it will actually be given.
 ///
 /// Two ways to fail, and the empty one needs no vocabulary knowledge at all: a
 /// word with NO tokens contributes nothing to `prefix_tokens`, so a prefix equal
@@ -1857,9 +1195,7 @@ where
       let end = (self.transcribed_samples + STRIDE_SAMPLES).min(self.buffer.len());
       let options = self.agreement.decoding_options_for_next(&self.options);
       let result = self.kit.transcribe(&self.buffer[..end], &options)?;
-      // The same `options` the result was decoded with, handed back so
-      // `ingest` can VERIFY the prefill premise rather than assume it.
-      outcomes.push(self.agreement.ingest(result, &options));
+      outcomes.push(self.agreement.ingest(result));
       self.transcribed_samples = end;
     }
     Ok(outcomes)
