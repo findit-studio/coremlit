@@ -45,8 +45,10 @@
 //! The two paths are not the same decode with different numbers. Every stride
 //! after the first re-enters the decoder with `prefix_tokens` and
 //! `clip_timestamps` that the batch path never sets
-//! ([`LocalAgreement::decoding_options_for_next`](
-//! coremlit::audio::whisper::stream::agreement::LocalAgreement::decoding_options_for_next)),
+//! (`LocalAgreement::decoding_options_for_next`, crate-internal since the M1
+//! seal — [`LocalAgreementTranscriber`](
+//! coremlit::audio::whisper::stream::agreement::LocalAgreementTranscriber) is
+//! what drives it),
 //! and that changes which code runs, not just what it computes on. Once a
 //! stride decodes `"And so my fellow Americans!"` — an exclamation mark the
 //! batch decode never produces; `jfk_tiny_golden.json`'s own text has none —
@@ -746,5 +748,115 @@ fn only_the_phrase_is_host_scoped() {
   assert!(
     source.contains("const CANONICAL_PHRASE: &str = \"ask not what your country can do for you\";"),
     "the phrase must not be weakened, widened or deleted — it is host-scoped, not relaxed"
+  );
+}
+
+// ── The seal: the engine exposes no public mutator ───────────────────────────
+
+/// Every name on [`LocalAgreement`] that MOVES its state. Each is `pub(crate)`,
+/// so the only way to drive the engine from outside this crate is through
+/// [`LocalAgreementTranscriber`](coremlit::audio::whisper::stream::agreement::LocalAgreementTranscriber),
+/// which orders the calls correctly by construction.
+///
+const SEALED_MUTATORS: &[&str] = &[
+  "fn new(",
+  "fn ingest(",
+  "fn finalize(",
+  "fn decoding_options_for_next(",
+  "fn with_agreement_count_needed(",
+  "fn set_agreement_count_needed(",
+];
+
+/// **THE SEAL'S FALSIFIER** (issue #94, M1). `LocalAgreement` stays `pub` and
+/// fully readable — `confirmed_words_slice`, `last_agreed_words_slice`,
+/// `last_agreed_seconds`, `results_slice`, `agreement_count_needed` are all
+/// public — but nothing that MOVES its state is, because the correctness this
+/// module argues for is a property of hypotheses the driver produced: the
+/// holdback reproduction that makes an advance a re-agreement, the prefill
+/// budget, and Rule W's postcondition all assume it.
+///
+/// A caller that wants its own DECODER still has one: `InferenceBackend` is
+/// public and unsealed, and `WhisperKit::local_agreement_transcriber` sits on
+/// `impl<B> WhisperKit<B>` with no bound, so a custom backend inherits this
+/// whole stack. What the seal removes is "bring your own TRANSCRIPT", the one
+/// shape that inherits none of it.
+///
+/// Grep rather than a compile-fail fixture, in the convention of
+/// `tests/vad/reexport.rs::src_authors_no_detection_logic`: publishing any of
+/// these again is a one-word edit, and a one-word edit should red a test.
+#[test]
+fn the_engine_exposes_no_public_mutator() {
+  let source = std::fs::read_to_string(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/src/audio/whisper/stream/agreement/mod.rs"
+  ))
+  .expect("the engine's source is readable");
+
+  // Scoped to the ENGINE's own inherent impl block. `LocalAgreementTranscriber`
+  // shares three of these names (`new`, `finalize`,
+  // `with_agreement_count_needed`) and is legitimately public — it IS the public
+  // surface the seal leaves.
+  let engine = source
+    .split_once("\nimpl LocalAgreement {\n")
+    .expect("the engine's inherent impl block is still here")
+    .1
+    .split_once("\n}\n")
+    .expect("that impl block still closes at column 0")
+    .0;
+
+  // Non-vacuous: the block really does declare each of these, `pub(crate)`.
+  // Without this a rename would silently empty the scan.
+  for name in SEALED_MUTATORS {
+    assert!(
+      engine.contains(name),
+      "`{name}` is gone from `impl LocalAgreement` — if it was renamed, rename \
+       it in SEALED_MUTATORS too; this gate is worthless if it scans for nothing",
+    );
+  }
+
+  let mut violations = Vec::new();
+  for (lineno, line) in engine.lines().enumerate() {
+    // Code only: a doc comment that NAMES a sealed item (this module's own docs
+    // do, repeatedly) is not a re-publication.
+    let code = line.split("//").next().unwrap_or("");
+    for name in SEALED_MUTATORS {
+      // `pub ` immediately in front, which `pub(crate) fn` does not contain.
+      if code.contains(&format!("pub {name}")) || code.contains(&format!("pub const {name}")) {
+        violations.push(format!(
+          "impl LocalAgreement, line {}: `{name}` — {}",
+          lineno + 1,
+          line.trim(),
+        ));
+      }
+    }
+  }
+
+  // A public trait impl IS a public constructor: `LocalAgreement::default()`
+  // would hand out a fresh engine with no `new` in sight, and `Default` is
+  // reachable through every generic bound that asks for it. Scanned over the
+  // WHOLE file, since a trait impl lives outside the inherent block.
+  for (lineno, line) in source.lines().enumerate() {
+    if line
+      .split("//")
+      .next()
+      .unwrap_or("")
+      .contains("impl Default for LocalAgreement")
+    {
+      violations.push(format!(
+        "mod.rs:{}: `impl Default for LocalAgreement` is a PUBLIC CONSTRUCTOR — {}",
+        lineno + 1,
+        line.trim(),
+      ));
+    }
+  }
+
+  assert!(
+    violations.is_empty(),
+    "the LocalAgreement engine must expose NO public mutator (issue #94, M1): \
+     the correctness of `ingest` is a property of hypotheses \
+     `LocalAgreementTranscriber` produced, and a caller handing in its own \
+     inherits none of it. Found {} re-publication(s):\n{}",
+    violations.len(),
+    violations.join("\n"),
   );
 }

@@ -21,7 +21,7 @@
 //!   [`crate::audio::whisper::result::TranscriptionSegment::words_slice`] is never
 //!   optional (empty-means-absent, that module's own doc), so nil and
 //!   `[]` already collapse to the same representation before
-//!   [`LocalAgreement::ingest`] ever sees it — "any segment has a
+//!   `LocalAgreement::ingest` ever sees it — "any segment has a
 //!   non-empty `words_slice`" is the closest faithful gate reachable
 //!   from that representation, checking every segment rather than only
 //!   the first since there is no cheaper-but-still-correct equivalent of
@@ -61,7 +61,7 @@
 //!   hole at its SOURCE instead: an advance refuses to put the watermark at a
 //!   word whose start ties the confirmed one in front of it, widening past the
 //!   tie rather than cutting the clip boundary INSIDE a span already settled
-//!   (see the Rule W comment at [`LocalAgreement::ingest`]'s advance).
+//!   (see the Rule W comment at `LocalAgreement::ingest`'s advance).
 //!
 //!   **Postcondition** — whenever [`LocalAgreement::last_agreed_words_slice`] is
 //!   non-empty, `confirmed_words.last().start() < last_agreed_seconds`
@@ -113,7 +113,7 @@
 //!   `segment::update_segments_with_word_timings` strips exactly those ids from
 //!   every [`WordTiming`] this crate emits and emits no word at all for an
 //!   all-special alignment entry, so the pipeline cannot produce such a word,
-//!   and [`LocalAgreement::new`]/[`LocalAgreement::ingest`] are `pub(crate)`
+//!   and `LocalAgreement::new`/`LocalAgreement::ingest` are `pub(crate)`
 //!   (see the seal), so no caller outside this crate can hand one in either.
 //!   The residual the id filter used to carry is closed by the API surface
 //!   rather than by a vocabulary threshold the hermetic engine cannot know.
@@ -121,11 +121,11 @@
 //!   **A widened-past word is CONFIRMED on the spot.** The argument is round 8's:
 //!   a word the prefill cannot carry is neither corroborable nor revisable by a
 //!   continuation decoded under
-//!   [`LocalAgreement::decoding_options_for_next`], being behind both the clip
+//!   `LocalAgreement::decoding_options_for_next`, being behind both the clip
 //!   and the forced prefill, and the watermark passes it on the very next line,
 //!   so no future result can ever be offered over its span. Holding it instead
 //!   would be an indefinite wait ending in the deletion codex round 7 finding 2
-//!   removed. A caller driving [`LocalAgreement::ingest`] with a result decoded
+//!   removed. A caller driving `LocalAgreement::ingest` with a result decoded
 //!   some OTHER way could have re-read that audio, and for that caller the word
 //!   is confirmed while a revision of it is still possible — the transcript then
 //!   carries both readings. That is not a property of this arm:
@@ -144,7 +144,7 @@
 //!   finding 2). What followed was data loss rather than a stall — the next
 //!   hypothesis was decoded from a prefix `prefill_tokens` trims, came back with
 //!   a word that is not the held one, disagreed, and
-//!   [`LocalAgreement::finalize`]'s `holdback_superseded` path replaced the
+//!   `LocalAgreement::finalize`'s `holdback_superseded` path replaced the
 //!   intact held word with that truncation. Confirming such a word is always
 //!   possible and is no weaker a claim: `common` is the prefix two hypotheses
 //!   agreed on, and a word outside the prefill budget is one no third hypothesis
@@ -166,7 +166,7 @@
 //!   it replaced, and every word the two share is transcribed twice. With an
 //!   empty holdback the same expression fails the other way, dropping the
 //!   `commonPrefix.count` leading words both hypotheses actually produced.
-//!   [`LocalAgreement::finalize`] instead emits the final hypothesis's own
+//!   `LocalAgreement::finalize` instead emits the final hypothesis's own
 //!   post-watermark words on that path (`holdback_superseded` is the flag), and
 //!   keeps Swift's shape everywhere else — including when the final hypothesis
 //!   contributes nothing at or past the watermark, where nothing supersedes the
@@ -189,7 +189,7 @@
 //!   [`crate::audio::whisper::transcribe::WhisperKit::transcribe`] makes only when
 //!   [`DecodingOptions::use_prefill_prompt`](crate::audio::whisper::options::DecodingOptions::use_prefill_prompt)
 //!   is set — so on a base with the prompt off, the prefix
-//!   [`LocalAgreement::decoding_options_for_next`] attaches is silently dropped
+//!   `LocalAgreement::decoding_options_for_next` attaches is silently dropped
 //!   and the stream re-decodes each span with no anchor at all. Both this port
 //!   and Swift default the flag on, so this only diverges for a caller that
 //!   turned it off; it is forced for the same reason
@@ -215,6 +215,37 @@
 //!   [`InferenceBackend`] itself has no `Sync` supertrait either. This is
 //!   a correction against this task's own brief, which specified `B:
 //!   InferenceBackend + Sync` here.
+//!
+//! # The engine's mutating surface is `pub(crate)`
+//!
+//! [`LocalAgreement`] is `pub` and fully READABLE —
+//! [`LocalAgreement::confirmed_words_slice`],
+//! [`LocalAgreement::last_agreed_words_slice`],
+//! [`LocalAgreement::last_agreed_seconds`], [`LocalAgreement::results_slice`],
+//! [`LocalAgreement::agreement_count_needed`] — and everything that MOVES its
+//! state is crate-internal: its constructor, `ingest`, `finalize`,
+//! `decoding_options_for_next`, and the count knob (rehomed to
+//! [`LocalAgreementTranscriber::with_agreement_count_needed`], the only side
+//! that can order the engine's calls correctly). `impl Default` is deliberately
+//! ABSENT: a public trait impl is a public constructor.
+//!
+//! What that removes is one shape and one shape only: **bring your own
+//! TRANSCRIPT.** A caller can still bring its own DECODER — the extension seam
+//! is [`InferenceBackend`], which is public, unsealed, and has two impls in this
+//! crate, and
+//! [`WhisperKit::local_agreement_transcriber`](crate::audio::whisper::transcribe::WhisperKit::local_agreement_transcriber)
+//! sits on `impl<B> WhisperKit<B>` with no bound at all, so a custom backend
+//! inherits this entire stack, Rule W included. Only the caller that wanted to
+//! hand `ingest` hypotheses this crate did not decode loses anything, and that
+//! is the one shape which inherits NONE of the correctness above: the holdback
+//! reproduction that makes an advance a re-agreement, the budget that keeps the
+//! prefill whole, and Rule W's postcondition are all facts about hypotheses
+//! [`LocalAgreementTranscriber`] produced. Removing it declines a promise that
+//! was never true rather than withdrawing a working mode; the issue's own
+//! impossibility argument is that no substitute oracle exists for it.
+//!
+//! `the_engine_exposes_no_public_mutator` in `tests/whisper/streaming.rs` is the
+//! falsifier: it greps this file and reds if any of those names is re-published.
 
 use crate::audio::whisper::{
   backend::InferenceBackend,
@@ -234,7 +265,7 @@ mod tests;
 // AgreementOutcome
 // ---------------------------------------------------------------------
 
-/// One [`LocalAgreement::ingest`] call's outcome — whether the new result
+/// One `LocalAgreement::ingest` call's outcome — whether the new result
 /// advanced the confirmation watermark, merely awaits a future result to
 /// agree with, or carried no word timings to agree over at all. Swift
 /// expresses these same three outcomes as local bookkeeping (`skipAppend`,
@@ -288,10 +319,10 @@ pub const DEFAULT_AGREEMENT_COUNT_NEEDED: usize = 2;
 /// `decode_text`'s `current_tokens` and never appears in the hypothesis.
 ///
 /// That trim is silent, and the holdback is what
-/// [`LocalAgreement::decoding_options_for_next`] promises the next hypothesis
+/// `LocalAgreement::decoding_options_for_next` promises the next hypothesis
 /// will be WRITTEN with — so a holdback that cannot survive this budget is one
 /// the decoder is never given, and the words the trim erases would be neither
-/// re-offered nor confirmed. [`LocalAgreement::ingest`] therefore holds back
+/// re-offered nor confirmed. `LocalAgreement::ingest` therefore holds back
 /// only what fits, and
 /// `budgeted_split` guarantees that for EVERY input rather than for every input
 /// but one: where nothing can be held it holds nothing, and the advance confirms
@@ -328,11 +359,11 @@ pub struct LocalAgreement {
   last_agreed_words: Vec<WordTiming>,
   /// Whether the most recent WORDED hypothesis failed to corroborate
   /// [`Self::last_agreed_words`] — i.e. that holdback belongs to a hypothesis
-  /// the latest one has since superseded. [`Self::finalize`] needs this and
+  /// the latest one has since superseded. `Self::finalize` needs this and
   /// cannot recover it from the word lists alone; see the divergence recorded
   /// there and in this module's doc.
   ///
-  /// Maintained ONLY on the worded path of [`Self::ingest`], alongside
+  /// Maintained ONLY on the worded path of `Self::ingest`, alongside
   /// [`Self::prev_words`]/[`Self::hypothesis_words`]/[`Self::last_agreed_words`]
   /// themselves: the [`AgreementOutcome::NoWordTimings`] early return leaves all
   /// four untouched, so this keeps describing the last hypothesis that actually
@@ -346,25 +377,19 @@ pub struct LocalAgreement {
   /// round 8, F1). The same error-drop-sink pattern the VAD branch uses: a
   /// dropped hypothesis's unseeded draw (or callback truncation) still decided
   /// which words the surviving hypotheses agreed on, so it must reach
-  /// [`Self::finalize`]'s reproducibility answer even though its segments never
+  /// `Self::finalize`'s reproducibility answer even though its segments never
   /// survive into the merge. Only the draw/early-stop/language facts are folded;
   /// the worker schedule and id span are stripped to `None` (see the strip in
-  /// [`Self::ingest`]) — the finalized schedule is the adjudicated `None` and the
+  /// `Self::ingest`) — the finalized schedule is the adjudicated `None` and the
   /// finalized span is restored from the merged surviving result (round 10).
   ingested_facts: TaskFactsAccumulator,
-}
-
-impl Default for LocalAgreement {
-  fn default() -> Self {
-    Self::new()
-  }
 }
 
 impl LocalAgreement {
   /// A fresh engine: no prior result, a zero watermark, every collection
   /// empty, [`DEFAULT_AGREEMENT_COUNT_NEEDED`] words required to confirm
   /// (Swift's all-default locals, `TranscribeCLI.swift:346-353`).
-  pub const fn new() -> Self {
+  pub(crate) const fn new() -> Self {
     Self {
       agreement_count_needed: DEFAULT_AGREEMENT_COUNT_NEEDED,
       last_agreed_seconds: 0.0,
@@ -386,10 +411,10 @@ impl LocalAgreement {
   pub const fn agreement_count_needed(&self) -> usize {
     self.agreement_count_needed
   }
-  /// Builder form of [`Self::set_agreement_count_needed`].
+  /// Builder form of `Self::set_agreement_count_needed`.
   #[must_use]
   #[inline(always)]
-  pub const fn with_agreement_count_needed(mut self, agreement_count_needed: usize) -> Self {
+  pub(crate) const fn with_agreement_count_needed(mut self, agreement_count_needed: usize) -> Self {
     self.set_agreement_count_needed(agreement_count_needed);
     self
   }
@@ -408,7 +433,10 @@ impl LocalAgreement {
   /// the watermark anchor covers it), so the clamp is about keeping the
   /// ALGORITHM meaningful rather than about keeping it from panicking.
   #[inline(always)]
-  pub const fn set_agreement_count_needed(&mut self, agreement_count_needed: usize) -> &mut Self {
+  pub(crate) const fn set_agreement_count_needed(
+    &mut self,
+    agreement_count_needed: usize,
+  ) -> &mut Self {
     self.agreement_count_needed = if agreement_count_needed == 0 {
       1
     } else {
@@ -441,7 +469,7 @@ impl LocalAgreement {
   /// Append-only across the life of the engine: nothing here is ever rewritten,
   /// reordered, or taken back, which is why the trailing words of an agreement
   /// wait in [`Self::last_agreed_words_slice`] instead. RULE W (see
-  /// [`Self::ingest`]'s advance) additionally guarantees that while that
+  /// `Self::ingest`'s advance) additionally guarantees that while that
   /// holdback is non-empty, this list's last word starts STRICTLY before
   /// [`Self::last_agreed_seconds`] — so nothing here can be re-offered to the
   /// agreement comparison and confirmed a second time.
@@ -451,7 +479,7 @@ impl LocalAgreement {
   }
 
   // -- results (Vec<TranscriptionResult>) ------------------------------------
-  /// Every ingested result kept for the eventual [`Self::finalize`] merge
+  /// Every ingested result kept for the eventual `Self::finalize` merge
   /// — every result except the ones a disagreeing hypothesis caused to be
   /// dropped (`TranscribeCLI.swift:395-400`, `skipAppend`).
   #[inline(always)]
@@ -512,7 +540,7 @@ impl LocalAgreement {
   /// full multilingual language/task/timestamp prefill for no reason the engine's
   /// own state can point at (codex round 6, finding 3), and there would be no
   /// prefix for it to carry in any case.
-  pub fn decoding_options_for_next(&self, base: &DecodingOptions) -> DecodingOptions {
+  pub(crate) fn decoding_options_for_next(&self, base: &DecodingOptions) -> DecodingOptions {
     let retargeted = base
       .clone()
       .with_clip_timestamps(vec![self.last_agreed_seconds])
@@ -532,7 +560,7 @@ impl LocalAgreement {
   }
 
   /// The holdback as one token sequence — the exact value
-  /// [`Self::decoding_options_for_next`] attaches as
+  /// `Self::decoding_options_for_next` attaches as
   /// [`DecodingOptions::prefix_tokens`](DecodingOptions::prefix_tokens_slice).
   fn holdback_prefill_tokens(&self) -> Vec<u32> {
     self
@@ -548,7 +576,7 @@ impl LocalAgreement {
   /// no scope and no alignment behind it.
   ///
   /// It needs none. The watermark is the first held-back word's start, and
-  /// RULE W (see [`Self::ingest`]'s advance) refuses to put it at a word whose
+  /// RULE W (see `Self::ingest`'s advance) refuses to put it at a word whose
   /// start ties the confirmed one in front of it — so whenever there is a
   /// holdback at all, `confirmed_words.last().start() < last_agreed_seconds`
   /// STRICTLY and no confirmed word can pass this filter. The re-admission the
@@ -582,7 +610,7 @@ impl LocalAgreement {
   /// - Otherwise, `result.all_words()` filtered to `start >=
   ///   last_agreed_seconds()` becomes the new hypothesis (`:372`). With no
   ///   previous result yet (the first call ever, or the first call after
-  ///   [`Self::new`]), there is nothing to compare against: `result` is
+  ///   `Self::new`), there is nothing to compare against: `result` is
   ///   kept and this returns [`AgreementOutcome::AwaitingAgreement`] —
   ///   Swift runs no agreement logic on this path either (`:374`'s `if
   ///   let prevResult = prevResult` is simply not entered).
@@ -603,7 +631,7 @@ impl LocalAgreement {
   /// Either way — agreeing, disagreeing, or no previous result — `result`
   /// becomes the new previous result for the next call (`:402`, outside
   /// the agreement `if`/`else` but still inside the has-words branch).
-  pub fn ingest(&mut self, result: TranscriptionResult) -> AgreementOutcome {
+  pub(crate) fn ingest(&mut self, result: TranscriptionResult) -> AgreementOutcome {
     // Accumulate THIS hypothesis's reproducibility facts BEFORE any gate or
     // branch, so a hypothesis dropped from `results` on disagreement (:395-400,
     // `skipAppend`) still contributes them to `finalize` (codex round 8, F1). It
@@ -786,8 +814,8 @@ impl LocalAgreement {
   /// the adjudicated `None` (agreement attribution is unknown, round 10, F2) and
   /// the decoded span is restored from the merged surviving result (round 10, F3;
   /// the ingest strip carries only the wholly-unknown span, so the fold cannot
-  /// supply the exact count, round 12); see [`Self::ingest`].
-  pub fn finalize(mut self, options: &DecodingOptions) -> TranscriptionResult {
+  /// supply the exact count, round 12); see `Self::ingest`.
+  pub(crate) fn finalize(mut self, options: &DecodingOptions) -> TranscriptionResult {
     if self.holdback_superseded && !self.hypothesis_words.is_empty() {
       // DIVERGENCE from `:418-419` — see this module's doc for the full
       // argument. Swift's `lastAgreedWords + differentSuffix(prevWords,
@@ -830,7 +858,7 @@ impl LocalAgreement {
     // deliberately left at the `None` the strip and the absorbing merge produce —
     // ADJUDICATED (round 10, F2): agreement-confirmed text interleaves multiple
     // hypotheses, so no single ordered worker attribution is knowable. See the
-    // strip site in [`Self::ingest`].
+    // strip site in `Self::ingest`.
     let merged_span = merged.task_facts().decoded_span();
     let mut facts = self.ingested_facts.into_facts();
     facts.merge(merged.task_facts());
@@ -849,7 +877,7 @@ impl LocalAgreement {
 /// carries into the initial prompt WHOLE.
 ///
 /// The holdback is not merely "the last few agreed words": it is the text
-/// [`LocalAgreement::decoding_options_for_next`] forces into the next
+/// `LocalAgreement::decoding_options_for_next` forces into the next
 /// hypothesis, and
 /// [`prefill_tokens`](crate::audio::whisper::decode::prefill_tokens) keeps only
 /// the last [`MAX_HOLDBACK_PREFILL_TOKENS`] ids of it. A holdback the decoder
@@ -864,14 +892,14 @@ impl LocalAgreement {
 /// total rather than partial: `segment::update_segments_with_word_timings`
 /// strips exactly those ids from every [`WordTiming`] this crate emits and emits
 /// no word at all for an all-special alignment entry, so the pipeline cannot
-/// produce such a word, and [`LocalAgreement::new`]/[`LocalAgreement::ingest`]
+/// produce such a word, and `LocalAgreement::new`/`LocalAgreement::ingest`
 /// are `pub(crate)`, so no caller outside this crate can hand one in. See this
 /// module's doc.
 ///
 /// Widening the split instead takes that head OUT of the holdback and CONFIRMS
 /// it. That is not a weaker claim than any other agreed word carries: `common`
 /// is the prefix two consecutive hypotheses agreed on, which is the whole of
-/// LocalAgreement-2's criterion, and [`LocalAgreement::finalize`] already
+/// LocalAgreement-2's criterion, and `LocalAgreement::finalize` already
 /// appends the entire holdback to
 /// [`LocalAgreement::confirmed_words_slice`] unconditionally on its Swift-shaped
 /// path. What the holdback buys on top of that is one more round in which a
@@ -879,7 +907,7 @@ impl LocalAgreement {
 /// be revised by one *that was decoded from the prefill*, because whatever such
 /// a hypothesis produces over that extent came from a DIFFERENT prefix and from
 /// audio the clip excludes, and is therefore neither a corroboration of the held
-/// word nor a revision of it. A caller driving [`LocalAgreement::ingest`] with a
+/// word nor a revision of it. A caller driving `LocalAgreement::ingest` with a
 /// result decoded some OTHER way is subject to neither reduction, so for it the
 /// word is revisable after all and the confirmation lands beside the revision —
 /// the same append-only cost `common[..split]` already carries on every path
@@ -888,7 +916,7 @@ impl LocalAgreement {
 /// Widening is the repair because the defect is the STATE, not any reading of
 /// it. Leaving the unreproducible word IN the holdback is what round 7's
 /// finding 2 recorded: the next unanchored hypothesis disagrees with it and
-/// [`LocalAgreement::finalize`]'s `holdback_superseded` path deletes it.
+/// `LocalAgreement::finalize`'s `holdback_superseded` path deletes it.
 ///
 /// The split runs all the way to `common.len()` when it has to, so the holdback
 /// this leaves can be EMPTY. It has to (codex round 7, finding 2): stopping while
@@ -896,13 +924,13 @@ impl LocalAgreement {
 /// and the cap silently did not cap. What followed was data
 /// loss, not a stall: the next hypothesis came back with the truncated word
 /// rather than the held one, disagreed, and
-/// [`LocalAgreement::finalize`]'s `holdback_superseded` path replaced the intact
+/// `LocalAgreement::finalize`'s `holdback_superseded` path replaced the intact
 /// held word with that truncation. Made impossible here rather than refused
 /// downstream, because a refusal on a public, infallible `ingest` has no path to
 /// report on, and this needs none: taking the word out of the holdback is always
 /// available and is exactly the argument above.
 ///
-/// Where the holdback comes back empty, [`LocalAgreement::ingest`] anchors the
+/// Where the holdback comes back empty, `LocalAgreement::ingest` anchors the
 /// watermark at the last confirmed word's END rather than the first held word's
 /// start — see the anchor at its advance branch.
 /// [`LocalAgreement::agreement_count_needed`] is then a maximum that reached
@@ -950,7 +978,7 @@ pub const STRIDE_SAMPLES: usize = SAMPLE_RATE as usize;
 /// Ports the loop shell of `transcribeStreamSimulated`
 /// (`TranscribeCLI.swift:357-369`) — see this module's doc for the
 /// `word_timestamps`-forcing and error-propagation deviations, and
-/// [`LocalAgreement::ingest`] for the per-result confirmation logic this
+/// `LocalAgreement::ingest` for the per-result confirmation logic this
 /// driver doesn't itself implement.
 ///
 /// Bare struct, no bounds — bounds live on the `impl` blocks below,
@@ -982,6 +1010,27 @@ impl<'ctx, B> LocalAgreementTranscriber<'ctx, B> {
     }
   }
 
+  /// How many consecutive agreeing words this driver's engine needs before it
+  /// confirms — [`LocalAgreement::agreement_count_needed`], set from the only
+  /// side that can order the engine's calls correctly.
+  ///
+  /// Clamped up to at least `1`: zero would hold back no words at all on every
+  /// advance, so no hypothesis would ever be given an anchor to re-decode from
+  /// and LocalAgreement-2's second round of corroboration would be switched off
+  /// wholesale. Swift hardcodes `2` and never exposes the knob
+  /// (`TranscribeCLI.swift:349`).
+  ///
+  /// Raising it far enough makes [`MAX_HOLDBACK_PREFILL_TOKENS`] bite, and the
+  /// count becomes a MAXIMUM rather than an exact width — see `budgeted_split`.
+  #[must_use]
+  #[inline(always)]
+  pub fn with_agreement_count_needed(mut self, agreement_count_needed: usize) -> Self {
+    self.agreement = self
+      .agreement
+      .with_agreement_count_needed(agreement_count_needed);
+    self
+  }
+
   /// The live confirmation engine — read
   /// [`LocalAgreement::confirmed_words_slice`] for the settled transcript
   /// so far without waiting for [`Self::finalize`].
@@ -997,7 +1046,7 @@ impl<'ctx, B> LocalAgreementTranscriber<'ctx, B> {
   }
 
   /// Consumes the driver and produces the final merged transcript.
-  /// Delegates to [`LocalAgreement::finalize`], passing this driver's own
+  /// Delegates to `LocalAgreement::finalize`, passing this driver's own
   /// (word-timestamp-forced) [`DecodingOptions`] so the merge honors the
   /// same [`DecodingOptions::drop_blank_audio`] the streamed results decoded
   /// under.
@@ -1017,8 +1066,8 @@ where
   /// fixed cadence). Each pass transcribes the buffer from the start
   /// through that stride's end
   /// ([`crate::audio::whisper::transcribe::WhisperKit::transcribe`], with options
-  /// retargeted per [`LocalAgreement::decoding_options_for_next`]) and
-  /// folds the result through [`LocalAgreement::ingest`]. Ports
+  /// retargeted per `LocalAgreement::decoding_options_for_next`) and
+  /// folds the result through `LocalAgreement::ingest`. Ports
   /// `TranscribeCLI.swift:357-369`.
   ///
   /// # Errors

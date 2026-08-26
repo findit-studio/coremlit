@@ -2872,7 +2872,7 @@ fn merge_results(results: &[TranscriptionResult], skip_empty_texts: bool) -> Tra
 /// dropping now governs the **segment id mapping** too, not just the text
 /// (see [`merge_transcription_results_with_options`]). Delegating to the plain
 /// (drop-OFF) merge collapsed a survivor id gap `[0, 2]` back to a dense
-/// `[0, 1]`, and [`crate::audio::whisper::stream::agreement::LocalAgreement::finalize`] — the
+/// `[0, 1]`, and `LocalAgreement::finalize` — the
 /// default streaming path — inherited that loss at finalization. Threading the
 /// same `options` the results were decoded under keeps the merged **segments**
 /// honoring the drop even when the merged text does not come from them.
