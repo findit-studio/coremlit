@@ -134,7 +134,28 @@ hf download openai/whisper-tiny tokenizer.json tokenizer_config.json config.json
   --local-dir Models/tokenizers/whisper-tiny
 ```
 
-Each pipeline resolves its models root from its own env var (`WHISPERKIT_TEST_MODELS`, `ALIGNKIT_TEST_MODELS`, `SPEAKERKIT_TEST_MODELS`/`ARGMAX_TEST_MODELS`, `VADKIT_TEST_MODELS`), defaulting to `<repo>/Models/...`, which is gitignored — with one exception. The VAD model is small enough (1.1 MiB) to be **committed**, at `Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc/`, so `cargo test -p coremlit --features vad -- --ignored` works on a fresh clone with nothing downloaded, and CI runs those gates the same way. It is redistributed under MIT; see `NOTICE` sections 1-2 and the `LICENSE` inside that directory. It is *not* part of the published crate — a crates.io consumer fetches every model itself. See each module's `tests/<kit>/model_io.rs` for the pinned repo id, revision, and per-file SHA-256, and the module docs for fetch commands. The model-gated suites load multi-hundred-MB CoreML models per test and libtest runs tests in one binary concurrently by default; on memory-constrained hosts (< 16 GB) append `--test-threads=1` after `--ignored` to run them serially.
+Each pipeline resolves its models root from its own env var (`WHISPERKIT_TEST_MODELS`, `ALIGNKIT_TEST_MODELS`, `SPEAKERKIT_TEST_MODELS`/`ARGMAX_TEST_MODELS`, `VADKIT_TEST_MODELS`, `CLAPKIT_TEST_MODELS`, `EMBEDKIT_TEST_MODELS`, `SIGLIP_TEST_MODELS`, `CED_TEST_MODELS`), defaulting to `<repo>/Models/...`, which is gitignored — with one exception. The VAD model is small enough (1.1 MiB) to be **committed**, at `Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc/`, so `cargo test -p coremlit --features vad -- --ignored` works on a fresh clone with nothing downloaded, and CI runs those gates the same way. It is redistributed under MIT; see `NOTICE` sections 1-2 and the `LICENSE` inside that directory. It is *not* part of the published crate — a crates.io consumer fetches every model itself. See each module's `tests/<kit>/model_io.rs` for the pinned repo id, revision, and per-file SHA-256, and the module docs for fetch commands. The model-gated suites load multi-hundred-MB CoreML models per test and libtest runs tests in one binary concurrently by default; on memory-constrained hosts (< 16 GB) append `--test-threads=1` after `--ignored` to run them serially.
+
+### Running the model-gated suites
+
+Every model gate here is `#[ignore]`d, so a plain `cargo test` runs none of them — and now says how many it skipped instead of leaving that to a wall of `ignored`. Each test binary (and the library's own unit-test binary) prints one line naming its gate count and the state of the models roots those gates read:
+
+```text
+model-gates | ced_model_io: 8 of 13 tests are #[ignore]d model gates and did not run here; CED_TEST_MODELS=<repo>/Models/ced MISSING -> stage the models (README, "Getting models") before running them
+```
+
+With the models staged, **one command runs the whole gated suite**:
+
+```sh
+cargo test -p coremlit --features whisper,align,speaker,vad,clap,granite,siglip,ced,serde,tracing,nl-recognizer --no-fail-fast -- --ignored
+```
+
+That feature list is CI's "all non-oracle" combo, pinned by the `feature_map` golden test ([`FEATURE_MAP.md`](crates/coremlit/FEATURE_MAP.md)); the `--test-threads=1` advice above applies to it. `--no-fail-fast` is not optional — without it the first red binary aborts the run and hides every gate after it, the same masking CI's own gate runner avoids. It covers every model gate that needs no third-party oracle — all the `tests/` binaries plus the in-crate gates in `src/`, which are the larger half. Four things it deliberately does not cover, each needing its own command:
+
+- **The hermetic tests.** `-- --ignored` is ignored-*only*: it skips every non-gated test exactly as a plain run skips every gate. The two runs are disjoint, so a full local check is both — the same command again without `-- --ignored`.
+- **The third-party parity oracles**, which need artifacts and an ONNX Runtime that `Models/` does not hold: `align-oracle` here (asry's ONNX wav2vec2 export, `ALIGNKIT_ASRY_MODELS`; enabling it also builds whisper.cpp), and `speaker-oracle` / `clap-oracle` / `vad-bundled` in [`crates/coremlit-parity`](crates/coremlit-parity). Run them **one oracle per invocation** — `cargo test -p coremlit-parity --features speaker-oracle -- --ignored` — never two at once, and never `-p coremlit-parity --all-features`: two `ort` consumers unified into one build can wedge in `dlopen` when the runtime dylib is absent.
+- **The benches.** They are `harness = false`, so no `cargo test` invocation compiles them; `cargo clippy --all-targets --all-features` is the CI row that proves they still build, and the table below is what runs them.
+- **Gates that `Models/` alone does not satisfy.** The command *selects* these, so when their inputs are absent they FAIL rather than skip: `speaker_parity_diarize_wiring` needs the sibling `diarization` checkout (`DIA_PARITY_FIXTURES`), `siglip_preprocess`'s `full_tensor_parity_against_staged_npy` needs a local torch `.npy` dump no artifact repo publishes, and the Swift-golden gates (`whisper_parity_jfk` / `parity_es`, `vad_parity_swift`) refuse a host whose class differs from the one that generated their goldens, rather than reporting host drift as a port defect ([#36](https://github.com/findit-studio/coremlit/issues/36)). A kit whose bundle you have not fetched fails the same way — the `model-gates` line above says which root is MISSING before you get there, but it probes the root, not every file inside it.
 
 ## Examples & benches
 
