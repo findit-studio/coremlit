@@ -5005,3 +5005,111 @@ fn a_backward_start_beyond_common_backs_the_split_off_too() {
     published.text(),
   );
 }
+
+#[test]
+fn characterization_an_agreeing_round_returns_advanced_without_moving_the_watermark() {
+  // CHARACTERIZATION of what `AgreementOutcome::Advanced` reports TODAY, not a
+  // property that holds. The CORRECT answer is in the failure messages below.
+  //
+  // `Advanced`'s doc said "the confirmation watermark advanced and the result
+  // was kept", and `AwaitingAgreement`'s said "two hypotheses that AGREE always
+  // advance the watermark ... what this value reports is whether the watermark
+  // moved". Both were false, and neither is a rounding artifact.
+  //
+  // MEASURED, on the real tiny model: strides 7 and 9 of the shipping
+  // `jfk_simulated_stream_confirms_the_transcript` fixture return `Advanced`
+  // with `last_agreed_seconds` BIT-identical to the stride before (`0x3fb5c28f`
+  // and `0x3fb851ec`) and the confirmed prefix unchanged at `"and so my"`, while
+  // every stride that really moves changes the bits by ~0.02 s. Instrumenting
+  // the same 512-trial shape `the_split_never_cuts_at_a_tied_start` sweeps finds
+  // 1281 such rounds out of 4233 at this commit and 1128 out of 4233 on `main`,
+  // with the rounded-only count at ZERO on both. The behaviour predates this
+  // branch: the JFK trace is element-wise identical across `main`, `7b353b4`
+  // and `eb1e412`.
+  //
+  // WHY, and it is not the budget. An advance confirms `common[..split]` and
+  // holds `common[split..]`. Where the split is ZERO -- here the earliest
+  // boundary the budget floor allows, `budgeted_split(common, 0) == 0`, and a
+  // legal one -- the round confirms nothing, so `sparing_watermark` re-anchors on
+  // the first held-back word, which is the word the watermark already sat on.
+  // The EXHAUSTED-BUDGET arm is the opposite case and does move the watermark:
+  // it runs the split off the end of `common` and confirms all of it
+  // (`a_forced_empty_holdback_retracts_its_suffix_at_the_settled_instant`).
+  //
+  // Split > 0 cannot reach this state, which is why the pin is at split 0: every
+  // word of `common` clears the watermark by `watermark_filtered`, so confirming
+  // one raises `highest_start(confirmed_words)` to at least the watermark, and
+  // Rule W's first postcondition then puts the new watermark strictly past it.
+  //
+  // Mutation proof: make the third ingest disagree (change `" my"`'s text in
+  // `revised`) and the `is_advanced` row reds -- so the round asserted here is
+  // genuinely an AGREEING one and not a disagreement in disguise.
+  let and = || word(" and", 0.0, 0.4);
+  let so = || word(" so", 0.4, 0.7);
+  let my = || word(" my", 0.7, 1.0);
+
+  let mut agreement = LocalAgreement::new();
+  assert_eq!(
+    agreement.agreement_count_needed(),
+    DEFAULT_AGREEMENT_COUNT_NEEDED,
+    "non-vacuous: the DEFAULT count, the only one the driver reaches",
+  );
+
+  agreement.ingest_streamed(result_with_words(vec![and(), so(), my()]));
+  assert!(
+    agreement
+      .ingest_streamed(result_with_words(vec![
+        and(),
+        so(),
+        my(),
+        word(" fellow", 1.0, 1.5),
+      ]))
+      .is_advanced()
+  );
+  assert_eq!(
+    (
+      confirmed_texts(&agreement),
+      held_back_texts(&agreement),
+      agreement.last_agreed_seconds().to_bits(),
+    ),
+    (vec![" and"], vec![" so", " my"], 0.4f32.to_bits()),
+    "the SETUP round really advances: it confirms `\" and\"` and puts the \
+     watermark on the first held-back word",
+  );
+
+  // The steady state: this round re-agrees on exactly `agreement_count_needed`
+  // words and holds both, so its split is zero and it confirms nothing new.
+  let settled = agreement.last_agreed_seconds();
+  let revised = result_with_words(vec![so(), my(), word(" americans", 1.0, 1.6)]);
+  let outcome = agreement.ingest_streamed(revised);
+
+  assert!(
+    outcome.is_advanced(),
+    "non-vacuous: this round AGREED and its result was kept -- it is the \
+     `Advanced` path, not a disagreement",
+  );
+  assert_eq!(
+    agreement.last_agreed_seconds().to_bits(),
+    settled.to_bits(),
+    "CHARACTERIZATION (https://github.com/findit-studio/coremlit/issues/94): \
+     this pins that a round returning `{outcome}` moves the watermark NOWHERE \
+     -- left is the {} it holds now, right the {settled} it already held, \
+     compared as BITS so no rounding can be blamed either way. The CORRECT \
+     answer is that a caller can read `advanced` as \"something progressed\" \
+     and act on it: drive a \
+     progress indicator, decide a stream has stalled, or stop re-offering audio \
+     that will never be confirmed. Today it only says the round AGREED and its \
+     result was KEPT. Making the signal honest is tracked separately, because \
+     it changes what the JFK regression trace records and that trace must stay \
+     byte-identical on this branch.",
+    agreement.last_agreed_seconds(),
+  );
+  assert_eq!(
+    (confirmed_texts(&agreement), held_back_texts(&agreement)),
+    (vec![" and"], vec![" so", " my"]),
+    "and nothing else progressed either: the confirmed prefix is unchanged and \
+     the whole agreed prefix is still the holdback, which is what a zero split \
+     leaves behind. A caller polling `confirmed_words_slice()` on an `advanced` \
+     sees the same words it saw last round.",
+  );
+}

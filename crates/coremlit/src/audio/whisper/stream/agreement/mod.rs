@@ -635,19 +635,57 @@ mod tests;
 #[non_exhaustive]
 pub enum AgreementOutcome {
   /// The new result's hypothesis agreed with the previous one on at least
-  /// [`LocalAgreement::agreement_count_needed`] words: the confirmation
-  /// watermark advanced and the result was kept.
-  Advanced,
-  /// The watermark is unchanged. Two routes reach it: there is no previous
-  /// result to agree with yet (the first ingested result), or the new hypothesis
-  /// disagreed with the previous one, in which case the result was dropped
-  /// rather than kept.
+  /// [`LocalAgreement::agreement_count_needed`] words, so the result was KEPT
+  /// rather than dropped.
   ///
-  /// Two hypotheses that AGREE always advance the watermark. A third route --
-  /// an agreeing round that DEFERRED rather than advancing -- existed on this
-  /// branch between `6987bec` and `b3ec5c6` and was removed on measured evidence
-  /// (#94; see this module's doc, "Why there is no deferral"). What this value
-  /// reports is what it always reported: whether the watermark moved.
+  /// **It does NOT follow that the confirmation watermark moved**, and this doc
+  /// used to say it did. An advance confirms `common[..split]` and holds the
+  /// rest; where that split is ZERO it confirms nothing, the anchor is the first
+  /// held-back word's start, and that is the word the watermark already sat on
+  /// -- so [`LocalAgreement::last_agreed_seconds`] comes back BIT-identical and
+  /// [`LocalAgreement::confirmed_words_slice`] unchanged. That is the ordinary
+  /// steady state of a stream whose rounds re-agree on exactly
+  /// `agreement_count_needed` words and hold all of them, not an edge case:
+  /// strides 7 and 9 of the shipping
+  /// `jfk_simulated_stream_confirms_the_transcript` fixture do it on the real
+  /// tiny model (watermark stuck at `0x3fb5c28f` and `0x3fb851ec`, three
+  /// confirmed words either side), and instrumenting the same 512-trial shape
+  /// `the_split_never_cuts_at_a_tied_start` sweeps finds 1281 such rounds out of
+  /// 4233 -- every one bit-identical, none of them a rounding artifact.
+  /// Characterized in
+  /// `characterization_an_agreeing_round_returns_advanced_without_moving_the_watermark`.
+  ///
+  /// So a caller may read this as "agreed, and kept" and may NOT read it as
+  /// "something progressed". Nothing in this enum carries the second question;
+  /// answering it is tracked separately, since giving this value that meaning
+  /// changes what the JFK regression trace records.
+  ///
+  /// The EXHAUSTED-BUDGET arm is not this condition and is worth telling apart:
+  /// where no split at or above the prefill-budget floor is legal, the split
+  /// runs off the end of `common` and confirms ALL of it, and the watermark
+  /// necessarily does move -- Rule W's first postcondition puts it strictly past
+  /// the settled high
+  /// (`a_forced_empty_holdback_retracts_its_suffix_at_the_settled_instant`).
+  /// A stuck watermark is the ZERO split, not the full one.
+  Advanced,
+  /// The round did not agree. Two routes reach it: there is no previous result
+  /// to agree with yet (the first ingested result), or the new hypothesis
+  /// disagreed with the previous one, in which case the result was dropped
+  /// rather than kept. The watermark is unchanged on both.
+  ///
+  /// **What separates this from [`Self::Advanced`] is agreed-and-kept versus
+  /// NOT agreed -- not whether the watermark moved.** An unchanged watermark
+  /// does not tell the two apart, because `Advanced` leaves it bit-identical
+  /// too whenever its split confirms nothing (see there for the measurement).
+  /// This doc asserted the opposite -- "two hypotheses that AGREE always advance
+  /// the watermark" -- and the shipping JFK fixture falsifies it on 2 of its 9
+  /// agreeing strides.
+  ///
+  /// A third route -- an agreeing round that DEFERRED rather than advancing --
+  /// existed on this branch between `6987bec` and `b3ec5c6` and was removed on
+  /// measured evidence (#94; see this module's doc, "Why there is no
+  /// deferral"). That removal is why every agreeing round now reaches
+  /// `Advanced`; it was never what would have made `Advanced` mean progress.
   AwaitingAgreement,
   /// The result carried no word timings to agree over; it was still kept
   /// (Swift `:403-409` falls through to the unconditional append).
