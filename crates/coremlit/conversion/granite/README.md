@@ -91,14 +91,39 @@ that exact set with no substitutions.
 These are pinned in `_granite_common.REQUIRED_TOOLCHAIN`, and the one shared
 `observed_toolchain()` reads what is **actually** running (the live interpreter
 and the installed distributions), asserts it equal to the pins, and returns only
-what it observed. `convert_granite.py` and `verify_granite.py` both call it, and
-verification refuses to continue if the two disagree — the pins allow any 3.11.x,
-so converting under 3.11.14 and verifying under 3.11.15 is two environments for
-one artifact. The producer's reading is carried in the digest-bound
+what it observed. `convert_granite.py` records its reading into `producer.json`.
+
+The pins alone cannot say an artifact was made by ONE environment: python is
+pinned to MAJOR.MINOR, so 3.11.14 and 3.11.15 both clear them. Both stages that
+consume the conversion therefore call the shared `require_producer_toolchain()`,
+which requires the reading they are running under to equal
+`producer["toolchain"]` **entry for entry**, and names the diverging field and
+what each side held when it does not:
+
+* `verify_granite.py` — so the manifest cannot describe an artifact measured in
+  a second environment.
+* `generate_goldens.py` — so `corpus.json`'s embeddings and the
+  `driver_crosscheck.json` published beside them cannot come from different
+  interpreters. Converting under 3.11.14, generating goldens under 3.11.15 and
+  verifying back under 3.11.14 used to publish cleanly: every id, digest and
+  run-identity check held, and nothing compared the two environments. It now
+  reds, before the model is loaded.
+
+Equality is on the whole record deliberately. Exempting the python patch level
+would readmit exactly that case, since it is the only field the pins already let
+move — every other entry is pinned exactly, so a looser comparison would reject
+nothing `observed_toolchain()` does not already reject. The recipe's definition
+of a toolchain is `REQUIRED_TOOLCHAIN`'s key set; a field that may legitimately
+differ between stages does not belong in it. A producer record naming no
+toolchain is refused rather than waved through, so the guard cannot be satisfied
+by omission — `read_producer_record()` requires the field for every consumer.
+
+The producer's reading is also carried in the digest-bound
 `verify_metrics.json`; `MANIFEST.json` copies it from there rather than sampling
-the writer's shell, which can trivially be a third environment.
-`generate_goldens.py` records its own observed reading into `corpus.json`'s
-`_provenance`. No hardcoded version dict remains anywhere else.
+the writer's shell, which can trivially be a third environment. The reading
+`generate_goldens.py` stamps into `corpus.json`'s `_provenance` is its own, and
+— because of the guard above — the conversion's. No hardcoded version dict
+remains anywhere else.
 
 transformers **5.14.0** is load-bearing and this recipe does NOT share the
 4.53.3 venv the `clap`/`siglip`/`ced` recipes use. In 5.14.0 ModernBERT reads its
@@ -486,12 +511,13 @@ by cosine and by the recorded distinctness, not by equality.
 
 | file | role |
 |---|---|
-| `scripts/_granite_common.py` | the shared discipline every stage calls: pins, env paths, SHA verify, `observed_toolchain`, `observed_compiler`, `assert_corpus_identity`, `assert_artifact_file_set`, `assert_no_stale_publication_temps`, `require_verify_evidence`, `require_compile_record`, `require_published_crosscheck`, `corpus_input_sha256`, the all-or-nothing `replace_file_atomic`, the NaN-poisoning `worst_update`, plus config/prompt/pooling asserts, the official window extraction, the `GraniteGraph` driver and the crosscheck |
+| `scripts/_granite_common.py` | the shared discipline every stage calls: pins, env paths, SHA verify, `observed_toolchain`, `observed_compiler`, `assert_corpus_identity`, `assert_artifact_file_set`, `assert_no_stale_publication_temps`, `require_verify_evidence`, `require_compile_record`, `require_producer_toolchain`, `require_published_crosscheck`, `corpus_input_sha256`, the all-or-nothing `replace_file_atomic`, the NaN-poisoning `worst_update`, plus config/prompt/pooling asserts, the official window extraction, the `GraniteGraph` driver and the crosscheck |
 | `scripts/_fixtures.py` | the committed 16-entry multilingual corpus (ids + raw texts) |
 | `scripts/convert_granite.py` | mint the run id, invalidate prior records AND every staged `.mlmodelc` -> faithfulness assert (staged for the goldens step) -> trace -> `ct.convert` fp16 (shipped) + fp32 (reference) |
 | `scripts/compile_granite.py` | compile every staged mlpackage -> mlmodelc and write the run-bound `compile.json` (input package digest, output bundle digest, compiler environment) |
 | `scripts/stage_artifact.py` | promote the compiled bundles into the artifact root TRANSACTIONALLY: copy to scratch beside the root, validate each copy against its source by digest, then rename into place in three phases, with a rollback that stops at its first failure — attestations move aside before the bundles and go back last, so no point at which the PROCESS can stop leaves one describing bytes that are gone. Process-crash safe; NOT power-loss ordered (after a power cut, re-run the conversion) and not resumable: a killed run's scratch holds the only copy of what left the root, so the next run refuses while it is there. Assumes one run at a time — nothing locks the root |
-| `scripts/verify_granite.py` | producer, compilation-record, golden-pair and corpus-identity preconditions, then the fail-closed I/O-contract + fp32-vs-goldens + per-unit fp16 matrix; writes `verify_metrics.json` bound to this build's digests |
+| `scripts/verify_granite.py` | producer (identity AND toolchain), compilation-record, golden-pair and corpus-identity preconditions, then the fail-closed I/O-contract + fp32-vs-goldens + per-unit fp16 matrix; writes `verify_metrics.json` bound to this build's digests |
 | `scripts/write_manifest.py` | requires passing, build-bound evidence including the compilation record, stages the two members the conversion does not produce (the model card and the pinned `tokenizer.json`), asserts the artifact root holds exactly the published 10 paths, then publishes `MANIFEST.json` + `CHECKSUMS.sha256` (source pins, observed toolchain, measured verify numbers) in that order, atomically |
-| `scripts/generate_goldens.py` | `corpus.json` (computed) + `driver_crosscheck.json` (published from the conversion run, not recomputed, and only when it measured these exact ordered inputs); invalidates the previous pair, then lands the corpus and the crosscheck in that order |
+| `scripts/generate_goldens.py` | `corpus.json` (computed) + `driver_crosscheck.json` (published from the conversion run, not recomputed, and only when it measured these exact ordered inputs, under the same toolchain that produced it); invalidates the previous pair, then lands the corpus and the crosscheck in that order |
+| `tests/test_toolchain_binding.py` | the producer/consumer toolchain guard, negative cases included; stdlib `unittest`, no model or venv needed (`python3 -m unittest discover -s crates/coremlit/conversion/granite/tests`) |
 | `run_granite.sh` | the env-driven end-to-end driver |

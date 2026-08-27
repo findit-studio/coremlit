@@ -654,7 +654,11 @@ def read_producer_record(stage, produced):
         )
     with open(path) as f:
         record = json.load(f)
-    for field in (RUN_ID_KEY, "converted_utc"):
+    # `toolchain` is required at the READ, not only where it is compared, so a
+    # record that cannot answer "which environment produced this?" is rejected
+    # once rather than by whichever consumer happens to look. Every record
+    # write_producer_record() writes carries it.
+    for field in (RUN_ID_KEY, "converted_utc", "toolchain"):
         if not record.get(field):
             raise SystemExit(
                 f"PRODUCER RECORD ({path}) carries no `{field}`; re-run conversion."
@@ -665,6 +669,62 @@ def read_producer_record(stage, produced):
             f"packages now in {stage}. Re-run convert_granite.py."
         )
     return record
+
+
+# Distinguishes "this side did not record the field at all" from a recorded
+# ``None``, which ``observed_toolchain`` produces for a missing distribution.
+_UNRECORDED = "<unrecorded>"
+
+
+def require_producer_toolchain(producer, observed, role, script):
+    """Every stage consuming an artifact must run the environment that PRODUCED
+    it — not merely one that satisfies the pins.
+
+    ``REQUIRED_TOOLCHAIN`` pins python to MAJOR.MINOR and everything else
+    exactly, so 3.11.14 and 3.11.15 both clear ``observed_toolchain()``. That is
+    deliberate, and it is exactly why the pins cannot answer "was this artifact
+    made by ONE environment?". Conversion under 3.11.14, goldens under 3.11.15
+    and verification back under 3.11.14 used to publish cleanly: the
+    conversion-time crosscheck and the embeddings committed beside it were
+    computed under different interpreters, while every id, digest and
+    run-identity check still held.
+
+    Equality is on the WHOLE record. A looser comparison — ignoring the python
+    patch level, say — would readmit that precise divergence, because the patch
+    level is the ONLY field the pins already let move; every other entry is
+    exact, so relaxing them would reject nothing that ``observed_toolchain``
+    does not already reject. The recipe's own definition of a toolchain is
+    ``REQUIRED_TOOLCHAIN``'s key set: a field that may legitimately differ
+    between producer and consumer does not belong in it, and the way to add one
+    is to widen the record, not to soften the comparison.
+
+    A record naming no toolchain is a FAILURE, not a pass. It cannot be shown to
+    describe this environment, and accepting it would restore the hole this
+    closes. ``read_producer_record`` rejects such a record first; this repeats
+    the check because the guard is reachable with a record from elsewhere."""
+    recorded = producer.get("toolchain")
+    if not isinstance(recorded, dict) or not recorded:
+        raise SystemExit(
+            f"PRODUCER RECORD NAMES NO TOOLCHAIN (got {recorded!r}) — {script} cannot show it is "
+            f"running the environment that produced this artifact, and must not assume it is. "
+            f"Re-run convert_granite.py."
+        )
+    if recorded == observed:
+        print(f"[ok] producer and {role.lower()} toolchains are one environment "
+              f"(python {observed.get('python')})")
+        return
+    diverged = "\n".join(
+        f"  {field}: producer {recorded.get(field, _UNRECORDED)!r}, "
+        f"{role.lower()} {observed.get(field, _UNRECORDED)!r}"
+        for field in sorted(set(recorded) | set(observed))
+        if recorded.get(field, _UNRECORDED) != observed.get(field, _UNRECORDED)
+    )
+    raise SystemExit(
+        f"PRODUCER/{role} TOOLCHAIN DIVERGENCE — the artifact was produced under a different "
+        f"environment than the one now running {script}:\n{diverged}\n"
+        f"  Both may satisfy the pins (python is pinned to MAJOR.MINOR only), but one artifact "
+        f"must name ONE environment. Re-run convert_granite.py and {script} in the same venv."
+    )
 
 
 def observed_compiler():
