@@ -326,11 +326,16 @@
 //!    and a re-offer of the settled one are the same value, which is the issue's
 //!    impossibility result, and the alternative is the unbounded
 //!    re-confirmation #94 is about. A truncation is what the portable prefix
-//!    property tolerates; a rewrite is not. Needs a non-default
-//!    [`LocalAgreement::agreement_count_needed`], a word whose own tokens exceed
-//!    [`MAX_HOLDBACK_PREFILL_TOKENS`] (Rule W's own widening no longer empties
-//!    the holdback), and a zero-duration word, simultaneously.
-//!    `a_zero_duration_word_at_an_empty_holdback_is_not_re_confirmed`.
+//!    property tolerates; a rewrite is not. Needs the prefill budget to empty the
+//!    holdback — Rule W's own widening no longer does — over a ZERO-DURATION word,
+//!    which takes a single word at the end of `common` whose own tokens exceed
+//!    [`MAX_HOLDBACK_PREFILL_TOKENS`]. It does NOT additionally take a
+//!    non-default [`LocalAgreement::agreement_count_needed`]: an earlier form of
+//!    this entry listed one, and the default count reaches the same state
+//!    whenever that one word is the last of the agreed prefix (measured).
+//!    `add_word_timestamps` emitting a 112-token word is the whole of the gate.
+//!    `a_zero_duration_word_at_an_empty_holdback_is_not_re_confirmed` drives it
+//!    at count 1, and `the_split_never_cuts_at_a_tied_start` sweeps both counts.
 //! 2. **A repeat the engine's record cannot account for** is the stream's own,
 //!    on the untied input — and on a TIED one Rule W deletes it instead. Both
 //!    directions are pinned:
@@ -1140,14 +1145,21 @@ fn split_at_a_strict_boundary(
 /// round 7's finding 2.
 ///
 /// **Documented deviation**: with `agreement_count_needed` at its
-/// [`DEFAULT_AGREEMENT_COUNT_NEEDED`] — the only value
-/// [`LocalAgreementTranscriber`] can reach, since it exposes
-/// [`LocalAgreementTranscriber::agreement`] by shared reference only — a
-/// two-word holdback is nowhere near 112 tokens and this is the identity. It
-/// bites only for a direct caller that raised
-/// [`LocalAgreement::agreement_count_needed`] far enough, and for that caller
-/// the count becomes a maximum rather than an exact width. (Rule W's back-off
-/// moves it the other way for any caller — see `split_at_a_strict_boundary`.)
+/// [`DEFAULT_AGREEMENT_COUNT_NEEDED`] a two-word holdback of words
+/// `add_word_timestamps` emits is nowhere near 112 tokens, and this is the
+/// identity. What makes it bite is a HOLDBACK too expensive for the prefill, and
+/// the count is only one of the two ways to get one: raise the count far enough,
+/// or leave the count alone and have a SINGLE word at the end of `common` whose
+/// own tokens exceed the budget — the split then runs to `common.len()` at the
+/// default count too (measured). Either way the count becomes a maximum rather
+/// than an exact width. (Rule W's back-off moves it the other way for any
+/// caller — see `split_at_a_strict_boundary`.)
+///
+/// The count is NOT out of a public caller's reach, and an earlier form of this
+/// note said it was: [`LocalAgreementTranscriber::with_agreement_count_needed`]
+/// is `pub`, having been rehomed there when the engine's own knob was sealed. It
+/// is `LocalAgreement::set_agreement_count_needed` that a caller outside this
+/// crate cannot call, and the driver's builder does the same job.
 fn budgeted_split(common: &[WordTiming], requested: usize) -> usize {
   let mut split = requested;
   let mut tokens: usize = common[split..]
