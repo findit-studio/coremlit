@@ -3,12 +3,6 @@ name = "coremlit"
 description = "Safe, synchronous CoreML runtime for macOS (CPU/GPU/Neural Engine) with opt-in on-device multimodal pipelines: speech (Whisper STT, forced alignment, speaker diarization, Silero VAD), AudioSet sound-event tagging, and audio/text/image embeddings (CLAP, granite, SigLIP)"
 version.workspace = true
 edition.workspace = true
-# Publishable: every dependency in this package — including the optional
-# `align` / `speaker` / `clap` / `granite` ones — now resolves from crates.io.
-# The UNPUBLISHED parity oracles (`dia`, `textclap`) that once blocked this
-# live in the never-published `crates/coremlit-parity`, and must stay there:
-# crates.io rejects a git source even behind an optional feature, so adding one
-# back here re-breaks publishing.
 publish = true
 rust-version.workspace = true
 license.workspace = true
@@ -16,20 +10,6 @@ repository.workspace = true
 readme = "../../README.md"
 keywords = ["coreml", "macos", "speech", "embeddings", "multimodal"]
 categories = ["multimedia::audio", "os::macos-apis", "artificial-intelligence", "computer-vision", "api-bindings"]
-
-# Keep the published `.crate` under the 10 MiB crates.io cap. Everything listed
-# here is DEV-ONLY data: parity fixtures (audio, golden images, mel/logit
-# oracles, Swift probe transcripts) and the model-conversion recipes. None of it
-# is reachable from `src/`, and none of it is usable without the `Models/` trees
-# the gated tests need anyway — which a published-crate consumer does not have,
-# the committed VAD artifact included: `Models/` sits OUTSIDE this package
-# directory, so `cargo package` never carries it. A consumer of the published
-# crate therefore loses nothing (and gains no 1.1 MiB of model it would not
-# use).
-#
-# `tests/` is NOT excluded wholesale: `src/embeddings/granite` `include_str!`s
-# `tests/granite/fixtures/goldens/corpus.json`, so that one fixture tree must
-# stay in the package or the LIBRARY fails to compile from crates.io.
 exclude = [
   "conversion/",
   "tests/align/fixtures/",
@@ -49,15 +29,9 @@ targets = ["aarch64-apple-darwin"]
 
 [features]
 default = []
-
-# --- cross-cutting (unified from the former per-kit `serde`/`tracing`) ---
 serde = ["dep:serde"]
 tracing = ["dep:tracing"]
 
-# --- audio::whisper (former crate `whisperkit`) ---
-# whisperkit's `[dependencies]` were unconditional in that crate; collapsed
-# here they become optional and ride `whisper`, so the runtime core stays
-# dependency-lean and `default = []` pulls none of them.
 whisper = [
   "dep:libc",
   "dep:mach2",
@@ -70,104 +44,26 @@ whisper = [
 # Whisper-only code, so it implies `whisper`.
 nl-recognizer = ["whisper", "dep:objc2-natural-language"]
 
-# --- audio::align (former crate `alignkit`) ---
-# asry's clean `emissions` seam (NO ort / whisper.cpp) rides `align`.
 align = ["dep:asry"]
-# Former alignkit `parity-oracle`: asry's ONNX aligner (pulls ort + whisper.cpp)
+# asry's ONNX aligner (pulls ort + whisper.cpp)
 # as the word-timing parity oracle. DEV/TEST only — adds nothing to the library.
 align-oracle = ["align", "asry/alignment"]
 
-# --- audio::speaker (former crate `speakerkit`) ---
-# `diaric` is the backend-free runtime clustering CORE — offline AHC→VBx
-# (`diaric::offline::diarize_offline`), the online centroid matcher
-# (`diaric::cluster::online`), PLDA projection, and reconstruction. Clustering
-# is a PUBLIC RUNTIME capability of the speaker module (`Extraction::diarize` /
-# `diarize_with` / `diarize_online`), not a test-only harness step. `diaric` is
-# backend-free BY CONSTRUCTION (the ONNX/Torch runners live in the separate
-# `diarization` crate, never here), so the `speaker` runtime graph pulls no
-# `ort` in ANY configuration. The former speakerkit `dia` feature is gone: the
-# runtime clustering dep is now `diaric`, and `dia` is demoted to a test-only
-# DER oracle that is not even a dependency of this crate any more (it lives in
-# `coremlit-parity`).
 speaker = ["dep:diaric"]
-# There is NO `speaker-oracle` feature here any more. The dia-ort DER oracle is
-# an UNPUBLISHED rev-pinned git dependency, which `cargo publish` rejects even
-# behind an optional feature, so it and its six parity binaries live in the
-# never-published `coremlit-parity` package:
-#   cargo test -p coremlit-parity --features speaker-oracle
-# Those binaries still `#[path]`-include this package's shared
-# `tests/speaker/{common,der_calc}` modules, so there is exactly one copy.
-
-# --- audio::vad (former crate `vadkit`) ---
-# `zuoer`, the backend-agnostic VAD core (the `VadBackend` seam plus the
-# Silero-derived segmentation logic), rides `vad`. Zero dependencies, no model,
-# no inference runtime — so `ort` cannot enter the `vad` runtime graph.
 vad = ["dep:zuoer"]
-# There is NO `vad-bundled` feature here any more: the `silero` ONNX
-# cross-backend oracle moved, with the other parity stacks, to
-# `coremlit-parity` — `cargo test -p coremlit-parity --features vad-bundled`.
-
-# --- embeddings::clap (former crate `clapkit`) ---
-# CLAP-HTSAT dual-tower audio+text encoders on CoreML: a Rust mel/STFT front-end
-# (`rustfft`) around two fp16 graphs, plus the pinned Xenova tokenizer
-# (`tokenizers`, shared with `whisper`). NO ort in this path; `default = []`
-# pulls none of it.
 clap = ["dep:rustfft", "dep:tokenizers", "dep:windit"]
-# There is NO `clap-oracle` feature here any more: `textclap` is unpublished, so
-# the model-level parity oracle moved to `coremlit-parity` —
-# `cargo test -p coremlit-parity --features clap-oracle`.
 
-# --- embeddings::granite (the embedkit phase) ---
-# General text sentence-embeddings on CoreML; first model
-# `granite-embedding-97m-multilingual-r2` (ModernBERT + CLS pooling, 384-d). The
-# granite tokenizer (`tokenizers`, shared with `whisper`/`clap`) around the fp16
-# CoreML graph, L2-normalized in Rust. The tokenizer.json is NOT embedded — it
-# ships with the model artifact and is read from beside the `.mlmodelc`, its
-# SHA-256 pinned at load (`dep:sha2`). The parity oracle is COMMITTED
-# transformers-fp32 goldens (`tests/granite/fixtures/goldens/`), never a live
-# ONNX crate — so there is NO `granite-oracle` feature and NO `ort` in this path.
-# `default = []` pulls none of it.
 granite = ["dep:tokenizers", "dep:windit", "windit/text", "dep:sha2"]
 
-# --- embeddings::siglip (the SigLIP 2 image+text phase) ---
-# SigLIP 2 (`siglip2-base-patch16-naflex`) dual-tower image+text embeddings on
-# CoreML: a shared 768-dim joint space. A Rust NaFlex vision front-end
-# (aspect-preserving patch-budget solver + antialiased-bilinear resize +
-# position-embedding lift; the u8 image resize is delegated to `pixon`'s
-# byte-exact PIL-parity q8 resampler, while the patch-budget solver / patchify /
-# pos-emb lift stay hand-rolled — no `image`/decoder dep) around two fp16 graphs,
-# plus the Gemma tokenizer (`tokenizers`, shared with `whisper`/`clap`/`granite`),
-# L2-normalized in Rust. The tokenizer.json is NOT embedded — it ships with the
-# model artifact and is read from beside the `.mlmodelc`, its SHA-256 pinned at
-# load (`dep:sha2`). NaFlex resizes natively to
-# a fixed patch budget, so no windowing is used. The parity oracle is COMMITTED
-# transformers-fp32 goldens (`tests/siglip/fixtures/goldens/`), never a live ONNX
-# crate — so there is NO `siglip-oracle` feature and NO `ort` in this path.
-# `default = []` pulls none of it.
-#
 # LICENSE PREREQUISITE (owner-gated, NOT resolved by this change): `pixon` is
 # currently licensed GPL-3.0-or-later; the owner will relicense it permissive
 # (MIT OR Apache-2.0) before this branch merges. It is a flagged merge blocker
 # tracked outside this change, not something wired here.
 siglip = ["dep:tokenizers", "dep:pixon", "dep:sha2"]
 
-# --- audio::ced (CED tiny/mini/small/base AudioSet sound-event tagging) ---
-# Native CoreML CED multi-label classifier (tiny/mini/small/base — one
-# size-invariant mel→logits contract): 16 kHz mono waveform in, ranked AudioSet
-# predictions out (527 rated classes via the ort-free `soundevents-dataset` data
-# crate). A Rust log-mel front-end (`rustfft`, shared with `clap`) around one
-# fp16 mel→logits transformer graph; long clips chunk via `windit` (geometry
-# only) and aggregate Mean/Max in confidence space. The parity oracle is
-# COMMITTED fp32 goldens (mel + logits, Wave B), never a live ONNX crate — so
-# there is NO `ced-oracle` feature and NO `ort` in this path in ANY
-# configuration, runtime or dev (the ort-based `soundevents` crate is never a
-# dependency). `default = []` pulls none of it.
-# Structural proof (re-run on dep changes):
-#   cargo tree -p coremlit --features ced -e normal | grep -iw ort   → no match
 ced = ["dep:rustfft", "dep:soundevents-dataset", "dep:windit"]
 
 [dependencies]
-# --- core CoreML runtime (always compiled) ---
 objc2.workspace = true
 objc2-core-ml.workspace = true
 objc2-foundation.workspace = true
@@ -192,65 +88,15 @@ unicode_categories = { workspace = true, optional = true }
 objc2-natural-language = { workspace = true, optional = true }
 
 # --- audio::align optional dep (the `align` feature) ---
-# The clean, ort-free dependency: asry's `emissions` seam only (no whispercpp,
-# no ort). A published crates.io version, NOT a sibling path: a clean checkout
-# of this repo alone resolves and builds, with no co-located `asry` checkout
-# required. A sibling `asry` is now only TEST DATA — for the ignored oracle
-# gates that read asry's `models/` fixtures (`ALIGNKIT_ASRY_MODELS`, see
-# `tests/align/common/mod.rs`). Co-developing asry and coremlit together? Point
-# both at your local `asry` with an UNCOMMITTED workspace-root patch (add to
-# the root `Cargo.toml`, never commit it):
-#
-#   [patch.crates-io]
-#   asry = { path = "../asry" }
-#
 asry = { version = "0.1.0", default-features = false, features = ["emissions"], optional = true }
 
 # --- audio::speaker optional dep (the `speaker` feature) ---
-# `diaric` is the backend-free speaker-diarization CORE consumed as the RUNTIME
-# clustering dependency (the `speaker` feature): offline clustering
-# (`diaric::offline::diarize_offline`, AHC→VBx), the online centroid matcher
-# (`diaric::cluster::online`), PLDA projection, and reconstruction. Call sites
-# read `diaric::offline::diarize_offline` etc. `optional = true` + pulled by
-# `speaker` because the whole `audio::speaker` module is feature-gated; when the
-# module compiles, `diaric` is always present, so its bridge / clustering is
-# unconditional within the module.
-#
-# No `default-features` to strip: `diaric` is backend-free BY CONSTRUCTION — the
-# ONNX/Torch model runners live in the separate `diarization` crate, never here
-# — so the runtime clustering graph pulls no `ort`/onnxruntime in ANY
-# configuration (diaric's own default feature set is empty).
-#
-# ORT-FREE PROOF — the runtime configuration pulls no `ort` crate:
-#   cargo tree -p coremlit --features speaker -e normal | grep -iw ort   # → no match
-# Contrast — `coremlit-parity`'s test-only `speaker-oracle` feature DOES pull it
-# (via that package's `dia` oracle dep):
-#   cargo tree -p coremlit-parity --features speaker-oracle -e normal | grep -iw ort
-#
-# A published crates.io version, not a sibling path (a path dep breaks a fresh
-# `cargo metadata` on any checkout lacking the sibling). CO-DEV: to build
-# against a LOCAL diaric checkout, add an UNCOMMITTED `[patch]` to the
-# WORKSPACE ROOT Cargo.toml — mirror the asry recipe above:
-#
-#   [patch.crates-io]
-#   diaric = { path = "../diaric" }
-#
 diaric = { version = "0.1.0", optional = true }
 
 # --- audio::vad optional dep (the `vad` feature) ---
-# The detection/streaming logic single-home: coremlit's vad layer implements
-# `zuoer`'s `VadBackend` seam over CoreML and re-exports zuoer's detector
-# surface wired to that backend, authoring ZERO segmentation logic here.
-# `zuoer` is the model-free VAD core with NO dependencies of its own — no
-# model, no inference runtime, no audio I/O — so `ort` cannot enter the `vad`
-# runtime graph, nor a downstream `whisper`'s.
 zuoer = { version = "0.2.0", optional = true }
 
 # --- embeddings::clap optionals (the `clap` feature) ---
-# f64 forward FFT for the Slaney-mel front-end — the same crate + major version
-# textclap's `mel.rs` uses, so the ported numerics match on the scalar path
-# (see `src/embeddings/clap/audio/mel/mod.rs`). clap-only; the pinned Xenova
-# `tokenizers` load is shared with `whisper` (declared above, rides `clap` too).
 rustfft = { workspace = true, optional = true }
 
 # audio::ced's 527-class rated AudioSet label set (ort-free data crate; see the
@@ -258,64 +104,18 @@ rustfft = { workspace = true, optional = true }
 soundevents-dataset = { workspace = true, optional = true }
 
 # --- embeddings shared windowing engine (the `clap` + `granite` features) ---
-# `windit` is the generic windowed-sequence engine (plan / split / aggregate)
-# both embedding families consume: CLAP's long-audio window geometry +
-# aggregation and granite's `embed_long` content-aware chunking + aggregation
-# ride it. A published crates.io version (the asry/diaric convention).
-# windit's default features stay on (`alloc` — the planner/aggregate/split `Vec`
-# APIs live there); `serde` is NOT enabled (clap keeps its own wire-pinned config
-# types; granite serializes nothing of windit's), nor `half`, nor `std` (windit
-# uses `core::error::Error`). `windit/text` rides `granite` only (content-aware
-# chunking → `unicode-segmentation`); a clap-only build stays free of it.
-# CO-DEV: to build against a LOCAL windit checkout, add an UNCOMMITTED patch to
-# the WORKSPACE ROOT Cargo.toml (never commit it):
-#
-#   [patch.crates-io]
-#   windit = { path = "../windit" }
-#
 windit = { version = "0.2.0", optional = true }
 
 # --- embeddings::granite runtime tokenizer-identity digest (the `granite` feature) ---
-# Pure-Rust SHA-256 for granite's supplied-tokenizer byte-identity backstop:
-# `from_memory`/`from_files` hash the RAW input bytes and compare against the
-# pinned `tokenizer.json` SHA-256, fail-closed. Rides `granite` ONLY (a
-# granite-less build never pulls it — proven by the no-default-features check),
-# and is a dev-dependency too (the model/tokenizer provenance SHA pins), which
-# cargo unifies with this optional entry.
 sha2 = { workspace = true, optional = true }
 
 # --- embeddings::siglip image resampler (the `siglip` feature) ---
-# `pixon` supplies the byte-exact PIL-parity q8 image resampler the NaFlex u8
-# resize path delegates to, retiring the former hand-rolled fixed-point kernel.
-# `default-features = false` with EXACTLY `["std", "rgb"]`: `std` gates pixon's
-# `Convert` / `resample` tiers (the `Convert::from(Rgb24Frame).resize_with(
-# Triangle, …).rgb(…).run()` path this crate drives), and `rgb` gates the
-# packed-RGB24 source frame — the `frame` umbrella (every YUV/bayer/xyz format)
-# is NOT needed for the RGB→RGB resize, so it stays off. Transitive deps are
-# pure-Rust and ort-free (`mediaframe`, `derive_more`, `half`, `thiserror`).
-# A published crates.io range, no longer a rev pin: `pixon` is the renamed
-# `colconv`. `pixon` 0.2's breaking changes are entirely colorimetric (closed
-# `KernelMatrix`/`KernelGamut` selectors, a refused-matrix error, the walker /
-# sink seam move) and cross `mediaframe` 0.1 -> 0.4 with them; NONE of it
-# reaches this RGB24 -> RGB24 resize. `src/resample` is byte-identical between
-# 0.1.0 and 0.2.0 apart from `TransferFunction::for_matrix` taking `&ColorMatrix`
-# (a transfer-curve helper this crate never calls), so the resampler bytes are
-# still the ones the PIL-parity goldens were taken against.
-# CO-DEV against a LOCAL pixon checkout: add an UNCOMMITTED patch to the
-# WORKSPACE ROOT Cargo.toml (never commit it):
-#
-#   [patch.crates-io]
-#   pixon = { path = "../pixon" }
-#
 # LICENSE: pixon is GPL-3.0-or-later today; its owner-gated relicense to
 # MIT OR Apache-2.0 is a merge blocker for this branch (see the `siglip` feature
 # comment above).
 pixon = { version = "0.2", default-features = false, features = ["std", "rgb"], optional = true }
 
 [dev-dependencies]
-# Integration tests / benches / examples are external consumers: they link the
-# crate + these dev-deps, never the lib's own `[dependencies]`. `half` (the
-# fp16_guards sweep) and the audio/test-support crates are named here again.
 half.workspace = true
 cpal.workspace = true
 criterion.workspace = true
@@ -325,50 +125,14 @@ serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
-# `audio::speaker::source`'s unit tests parse the TOML wire form documented on
-# `FluidAudioArtifactConfig` (both the accepted top-level document and the
-# rejected `[speaker]`-headed one), so the documented example is executed rather
-# than reasoned about. Dev-only — the library itself reads no config file and
-# has no format dependency.
 toml.workspace = true
 tokenizers.workspace = true
-# The mel-parity unit tests (`src/embeddings/clap/audio/mel/tests.rs`, feature
-# `clap`) read committed librosa `.npy` mel oracles via `npyz` (former clapkit
-# dev-dep). The siglip full-tensor preprocessing gate (model-gated) reads staged
-# `.npy` NaFlex fixtures via the same dep.
 npyz.workspace = true
-# The siglip corpus PNG fixtures are decoded to RGB8 for the (model-gated) e2e /
-# parity gates via the pure-Rust `png` dev-dep; the library itself takes decoded
-# `Rgb8Image` (sans-I/O), so `png` never enters the library's feature graph.
 png.workspace = true
-# The `clap_encode` bench reports process RSS via `task_info(MACH_TASK_BASIC_INFO)`
-# (the same query as `audio::whisper::log::resident_memory_bytes`, which rides the
-# `whisper` feature the bench does not enable). Dev-deps compile only for
-# tests/benches/examples, so this adds nothing to the library's feature graph.
 libc.workspace = true
 mach2.workspace = true
-# `tests/align/parity_words.rs` names `asry::Aligner` (the ONNX oracle) and
-# `asry::ort::api()` directly, so asry must appear as a dev-dep too. Cargo
-# unions its features with the optional runtime entry above; `align-oracle`
-# adds `alignment`. `emissions` here keeps a features-free default `cargo test`
-# from trying to build a zero-feature asry.
 asry = { version = "0.1.0", default-features = false, features = ["emissions"] }
 
-# ---------------------------------------------------------------------------
-# Per-kit tests / benches / examples.
-#
-# Each former kit crate's tests now live in tests/<kit>/ (benches/<kit>/,
-# examples/<kit>/). Cargo auto-discovers only depth-1 files, so the coremlit
-# core's own tests (tests/*.rs) stay auto-discovered while every kit target is
-# registered explicitly here. `required-features` gates each on its module
-# feature (the whole `audio::<kit>` module is feature-gated, so its tests only
-# compile under that feature) — the oracle suites on the oracle feature.
-# ---------------------------------------------------------------------------
-
-# --- audio::whisper ---
-# Hermetic (no model, no network): the host-class predicate's falsifiers, and
-# the structural guards that keep a whisper golden producible only by the
-# external Swift oracle. Runs in CI's `features` job on every PR.
 [[test]]
 name = "whisper_golden_provenance"
 path = "tests/whisper/golden_provenance.rs"
@@ -409,18 +173,11 @@ name = "whisper_streaming"
 path = "tests/whisper/streaming.rs"
 required-features = ["whisper"]
 
-# The Silero-VAD source path is the whisper+vad composition (former whisperkit
-# `vadkit` feature).
 [[test]]
 name = "whisper_vad_source"
 path = "tests/whisper/vad_source.rs"
 required-features = ["whisper", "vad"]
 
-# rtf.rs is compiled BOTH as a harness-less bench (its real end-to-end main)
-# and, under the default libtest harness, as this test target so its inline
-# #[cfg(test)] `models_ready` gate runs under `cargo test`. Cargo prints an
-# informational "present in multiple build targets" note for the shared path,
-# which is expected and harmless.
 [[test]]
 name = "whisper_rtf_gate"
 path = "benches/whisper/rtf.rs"
@@ -438,9 +195,6 @@ path = "benches/whisper/rtf.rs"
 harness = false
 required-features = ["whisper"]
 
-# `test = true` compiles this example under the libtest harness too, so its
-# inline #[cfg(test)] hermetic BoundedAudioQueue tests run under `cargo test`;
-# `main` is compiled (type-checked) but never executed, so no microphone opens.
 [[example]]
 name = "whisper_mic_stream"
 path = "examples/whisper/mic_stream.rs"
@@ -527,26 +281,15 @@ name = "speaker_parity_seg"
 path = "tests/speaker/parity_seg.rs"
 required-features = ["speaker"]
 
-# Hermetic online-clusterer parity vs FluidAudio's Swift `SpeakerManager`: a
-# committed synthetic trace, no dia oracle and no models, so it rides the
-# default `speaker` suite (diaric + committed fixtures only).
 [[test]]
 name = "speaker_parity_online_swift"
 path = "tests/speaker/parity_online_swift.rs"
 required-features = ["speaker"]
 
-# Model-gated proof that `Extraction::diarize` is one code path with the manual
-# `into_offline_input → diarize_offline` plumbing. diaric-only (no dia oracle),
-# so it gates on `speaker`; its assertions are `#[ignore]`d behind the models.
 [[test]]
 name = "speaker_parity_diarize_wiring"
 path = "tests/speaker/parity_diarize_wiring.rs"
 required-features = ["speaker"]
-
-# The six dia-ort DER / cross-crate parity binaries are NOT registered here:
-# they moved to the never-published `coremlit-parity` package along with the
-# `dia` oracle dependency itself. They still `#[path]`-include this package's
-# shared `tests/speaker/{common,der_calc}` modules, so there is one copy.
 
 # --- audio::vad ---
 [[test]]
@@ -569,12 +312,6 @@ name = "vad_reexport"
 path = "tests/vad/reexport.rs"
 required-features = ["vad"]
 
-# `tests/vad/cross_backend.rs`, the silero-ONNX cross-backend oracle, moved to
-# `coremlit-parity` with the `silero` dependency.
-# --- embeddings::clap ---
-# The whole `embeddings::clap` module is feature-gated, so its tests compile
-# only under `clap`; the model-gated ones keep their `#[ignore]` + Models/
-# layout.
 [[test]]
 name = "clap_e2e"
 path = "tests/clap/e2e.rs"
@@ -600,25 +337,11 @@ name = "clap_tokenizer_identity"
 path = "tests/clap/tokenizer_identity.rs"
 required-features = ["clap"]
 
-# The two textclap oracle binaries moved to `coremlit-parity` with the
-# `textclap` dependency.
-# --- embeddings::granite ---
-# The whole `embeddings::granite` module is feature-gated, so its tests compile
-# only under `granite`. The tokenizer-identity and driver-crosscheck gates are
-# hermetic (committed goldens, no model) and run in the default `granite` suite;
-# the model_io / parity / placement gates keep their `#[ignore]` + Models/
-# layout. There is NO oracle feature — parity scores against COMMITTED
-# transformers-fp32 goldens.
 [[test]]
 name = "granite_tokenizer_identity"
 path = "tests/granite/tokenizer_identity.rs"
 required-features = ["granite"]
 
-# The conversion recipe's pre-trace faithfulness record
-# (`goldens/driver_crosscheck.json`) — hermetic, so it runs unignored in CI's
-# `features` job (its `granite` matrix row, `cargo test --features granite`, with
-# no models staged) alongside the tokenizer gate. The `check` job runs no tests
-# at all — it is fmt/clippy/doc plus an examples build.
 [[test]]
 name = "granite_driver_crosscheck"
 path = "tests/granite/driver_crosscheck.rs"
@@ -639,20 +362,11 @@ name = "granite_placement"
 path = "tests/granite/placement.rs"
 required-features = ["granite"]
 
-# The long-input windowing gate: content-aware chunk geometry is proven hermetic
-# in-lib; this suite gates the CoreML per-chunk embedding + windit aggregation on
-# the staged granite artifact (`#[ignore]` + Models/ layout, like the others).
 [[test]]
 name = "granite_embed_long"
 path = "tests/granite/embed_long.rs"
 required-features = ["granite"]
 
-# --- embeddings::siglip ---
-# The whole `embeddings::siglip` module is feature-gated, so its tests compile
-# only under `siglip`. The tokenizer-identity + preprocess small-oracle gates are
-# hermetic (committed goldens, no model); the model_io / parity / placement / e2e
-# gates keep their `#[ignore]` + Models/ layout. There is NO oracle feature —
-# parity scores against COMMITTED transformers-fp32 goldens.
 [[test]]
 name = "siglip_tokenizer_identity"
 path = "tests/siglip/tokenizer_identity.rs"
@@ -688,16 +402,6 @@ name = "siglip_e2e"
 path = "tests/siglip/e2e.rs"
 required-features = ["siglip"]
 
-# Hermetic (no model, no `SIGLIP_TEST_MODELS`): drives the measured-band host
-# gate that `parity_embed.rs` / `placement.rs` route their pinned numbers
-# through. Deliberately NOT model-gated — that gate is what stands between a
-# host-specific measurement and a false red, so it must be proven on every push
-# rather than only where the artifacts are staged.
-#
-# It therefore belongs in the `features` job and NOT in ci.yml's `model-tests`
-# siglip gate list: it lists ZERO ignored tests, which would correctly trip that
-# job's anti-vacuum guard — the same reason `clap_tokenizer_identity` is absent
-# from the clap row.
 [[test]]
 name = "siglip_band_provenance"
 path = "tests/siglip/band_provenance.rs"
@@ -722,10 +426,7 @@ required-features = ["ced"]
 name = "ced_e2e"
 path = "tests/ced/e2e.rs"
 required-features = ["ced"]
-# Dual-tower encode harness: first-observed/cached load, first + warm inference
-# per tower × ComputeUnits (model-gated; `harness = false` custom main — the load
-# phases are one-shot costs criterion's resampling cannot see). Mirrors the
-# whisper/align bench registrations above.
+
 [[bench]]
 name = "clap_encode"
 path = "benches/clap/encode.rs"
