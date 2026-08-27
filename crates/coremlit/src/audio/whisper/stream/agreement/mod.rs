@@ -259,6 +259,12 @@
 //!   [`InferenceBackend`] itself has no `Sync` supertrait either. This is
 //!   a correction against this task's own brief, which specified `B:
 //!   InferenceBackend + Sync` here.
+//! - **[API BREAK] the engine's mutating surface is sealed to this crate**, an
+//!   unconditional and authorized break against `main` rather than a deviation
+//!   from Swift — Swift has no library surface here at all. It removes one
+//!   caller shape with no migration; the record, the reasoning and the design
+//!   for the verified contract that could restore it are in the next section.
+//!
 //! # The engine's mutating surface is `pub(crate)`
 //!
 //! [`LocalAgreement`] is `pub` and fully READABLE —
@@ -286,6 +292,22 @@
 //! [`LocalAgreementTranscriber`] produced. Removing it declines a promise that
 //! was never true rather than withdrawing a working mode; the issue's own
 //! impossibility argument is that no substitute oracle exists for it.
+//!
+//! **This is an AUTHORIZED, unconditional public API break** against `main`,
+//! recorded here rather than left incidental. On `main` `LocalAgreement`
+//! published `Default`, its constructor, count mutation, retargeting, `ingest`
+//! and `finalize`; code outside this crate that fed stored, remote or
+//! precomputed [`TranscriptionResult`]s into the engine no longer compiles, and
+//! [`InferenceBackend`] is NOT an equivalent seam for it — that trait exposes
+//! feature/encoder/decoder-step operations and cannot be handed an existing
+//! transcript. **Migration: there is none today.** A caller that has a
+//! transcript and wants confirmation over it has no supported path; the design
+//! for one is recorded on <https://github.com/findit-studio/coremlit/issues/94>
+//! and is a VERIFIED contract rather than a trusted one — the engine would check
+//! that the returned result BEGINS with the holdback, which is decidable in one
+//! pass, unlike the occurrence identity the impossibility result rules out. The
+//! crate is unpublished, so no semver ceremony applies; the break is deliberate
+//! and visible instead.
 //!
 //! `the_engine_exposes_no_public_mutator` in `tests/whisper/streaming.rs` is the
 //! falsifier: it greps this file and reds if any of those names is re-published.
