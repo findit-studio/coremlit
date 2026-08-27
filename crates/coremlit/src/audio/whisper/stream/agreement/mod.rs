@@ -568,8 +568,9 @@
 //!    113-word tied run at 2 s twice, then the SAME 113 words at 3 s: the first
 //!    pair advances and anchors just past 2 s, the second pair is entirely
 //!    strictly past that anchor, so it agrees with itself and is confirmed as
-//!    well — 226 confirmed words where the stream said 113 (measured; `main`
-//!    confirms 222 on the same input, so this is not new here).
+//!    well, which double-counts those words: the stream is credited with more
+//!    confirmed words than it actually offered. Not new here — `main` shows the
+//!    same double-count on this input.
 //!
 //!    It is AMBIGUOUS BY CONSTRUCTION, and the two readings give opposite
 //!    verdicts. Read as RE-TIMESTAMPING, the second confirmation is a duplicate
@@ -681,7 +682,7 @@ pub enum AgreementOutcome {
   /// `jfk_simulated_stream_confirms_the_transcript` fixture land here on the
   /// real tiny model, and `the_split_never_cuts_at_a_tied_start`'s 512-trial
   /// sweep asserts a live count over its 4233 rounds — 1281 of the 2965
-  /// agreeing ones at this commit.
+  /// agreeing ones, at `1508e76`.
   ///
   /// **Reporting this as progress is what a caller cannot recover from**, which
   /// is why it is a value rather than a footnote. On the worst shape this module

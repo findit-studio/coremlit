@@ -430,8 +430,9 @@ fn the_split_never_cuts_at_a_tied_start() {
   // budget, and that could not build the AGGREGATE trigger (codex round 3 on
   // PR #95): a TIED RUN of ordinary words whose TOTAL exceeds the budget, where
   // the floor lands inside the run, every reachable boundary ties, and the split
-  // runs off the end of `common`. Measured on the shape this test had before:
-  // 25 such rounds of 1662 observations, all of them reached through the
+  // runs off the end of `common`. Measured on the shape this test had before
+  // (at `4b259ef`): 25 such rounds of 1662 observations, all of them reached
+  // through the
   // oversized word rather than through a run, and none of them DISTINGUISHED.
   // `aggregate_fallbacks` is that half's own non-vacuity proof, and it counts
   // the ROUTE rather than the arm: a fallback round in which no word of `common`
@@ -443,7 +444,8 @@ fn the_split_never_cuts_at_a_tied_start() {
   // an advance may not push the watermark past a word of its own hypothesis it
   // did not confirm; the state that tests it is the FORCED arm reached with a
   // live suffix beyond `common`, and offering every stride TWICE could not build
-  // it -- measured at 0 rounds of 1353. `repeats` below offers a stride once in
+  // it -- measured at 0 rounds of 1353 (at `c6fc2e1`). `repeats` below offers a
+  // stride once in
   // three, which leaves the next stride's first ingest comparing consecutive
   // GROWING lists, and `forced_strands` is that half's non-vacuity proof.
   //
@@ -538,11 +540,13 @@ fn the_split_never_cuts_at_a_tied_start() {
   // legality predicate makes the back-off run on backwards starts as well as on
   // ties, so the sweep now visits split positions it never reached before.
   // Delete the back-off arm outright and `avoidable_backward_strands` reds at 3
-  // of 5 -- every one of them a round whose forward search found nothing and
-  // whose only remaining position was off the end. It used to red NOTHING here,
+  // of 5 (at `eb1e412`) -- every one of them a round whose forward search found
+  // nothing and whose only remaining position was off the end. It used to red
+  // NOTHING here,
   // the empty-holdback anchor holding the first postcondition on that path, and
   // `a_trailing_tied_run_never_confirms_itself_twice_at_the_default_count` was
-  // the sole falsifier at 384 of 385 green; that test still reds, now alongside
+  // the sole falsifier at 384 of 385 green (at `4b259ef`); that test still reds,
+  // now alongside
   // 5 others. Read the boundary against the ADJACENT predecessor rather than the
   // running maximum and the FIRST postcondition reds at trial 65, on a confirmed
   // list reaching a 1 s watermark -- where it used to leave
@@ -559,7 +563,8 @@ fn the_split_never_cuts_at_a_tied_start() {
   // again, on the word the round declined to settle. Drop the suffix-minimum
   // conjunct from `split_at_a_strict_boundary`'s predicate -- the half-predicate
   // codex round 8 found -- and the postcondition itself stays GREEN while
-  // `avoidable_backward_strands` reds at 2 of 4, which is why the oracle is
+  // `avoidable_backward_strands` reds at 2 of 4 (at `eb1e412`), which is why the
+  // oracle is
   // here: the exception's own wording admitted those strands. Seed that suffix
   // minimum with `f32::INFINITY` instead of the minimum over the words beyond
   // `common` and this sweep stays green too, the beyond-`common` half being
@@ -570,10 +575,12 @@ fn the_split_never_cuts_at_a_tied_start() {
   // round 8 removed the interior route rather than the gate.
   //
   // The SHAPE rows, each forced off and re-measured. `aggregate` off:
-  // `aggregate_fallbacks` reds at `0 of 134`, the tied-run route to the empty
+  // `aggregate_fallbacks` reds at `0 of 134` (at `4b259ef`), the tied-run route
+  // to the empty
   // holdback being unreachable while the oversized-word route still supplies
   // 134. `retiming` off: `drifted_advances` reds at `0 rounds`. `alternating`
-  // off: `contradictions` reds at `18 rounds` against its floor of 128 -- but
+  // off: `contradictions` reds at `18 rounds` (at `4b259ef`) against its floor
+  // of 128 -- but
   // only with `nothing_the_stream_still_says_is_erased` neutralized first, since
   // that helper fires at trial 92 on a re-timing its `offered` membership test
   // cannot tell from an erasure (the transcript keeps one `(" A", 0.5)` and the
@@ -989,7 +996,8 @@ fn the_split_never_cuts_at_a_tied_start() {
       // so `common` is the whole filtered list with nothing beyond it, and where
       // that list ENDS on the over-budget word the forced arm confirms it there
       // -- one stride BEFORE the growth that would have given it a suffix.
-      // Measured on the two-everywhere shape: 0 such rounds in 256 trials.
+      // Measured on the two-everywhere shape: 0 such rounds in 256 trials (at
+      // `c6fc2e1`).
       //
       // Offering a stride once leaves the next stride's FIRST ingest comparing
       // `truth[..s]` against `truth[..s + 1]`, so `common` ends on `truth[s - 1]`
@@ -4623,7 +4631,8 @@ fn a_backwards_start_two_words_back_still_cannot_be_re_admitted() {
   //
   // Mutation proof: restore the adjacent-predecessor test in
   // `split_at_a_strict_boundary` (`common[at - 1].start()` for
-  // `settled_before[at]`) and this reds — alone, at 503 of 504 green.
+  // `settled_before[at]`) and this reds — alone, at 503 of 504 green
+  // (at `7b353b4`).
   let offered = || {
     result_with_words(vec![
       word(" P", 0.50, 0.60),
@@ -4997,7 +5006,7 @@ fn a_backward_start_beyond_common_backs_the_split_off_too() {
   // minimum over `beyond_common` in `split_at_a_strict_boundary` and this reds
   // (measured: this test and
   // `a_permanently_backwards_tail_confirms_at_the_budget_rather_than_holding_forever`
-  // are that mutation's only two falsifiers, 42 of 44 still green).
+  // are that mutation's only two falsifiers, 42 of 44 still green, at `eb1e412`).
   const CONSTRAINED_MEDIAN: f32 = 0.70;
   const LAST_SEGMENT_START: f32 = 2.88;
   /// `find_alignment`'s own output, `(start, end)` per word -- the seventh being
