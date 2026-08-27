@@ -105,25 +105,48 @@
 //!   `LocalAgreement::finalize` emits the same words either way, and TAIL growth
 //!   relieves it.
 //!
-//!   **The deferral is a WAIT, and the wait is BOUNDED** (codex round 4 on
-//!   PR #95). Tail growth relieves it only where the tail GROWS `common`, and
-//!   two shapes stop it growing: hypotheses that ALTERNATE past the agreed
-//!   prefix pin `common` at the words they still share, and a hypothesis that
-//!   simply REPEATS pins it with no disagreement at all. Either way the same
-//!   round came back forever — nothing confirmed, the watermark frozen, the
-//!   caller reading `AwaitingAgreement`, and in the driver a clip boundary that
-//!   never advanced while the buffer grew past it. So a deferral over a `common`
-//!   no longer than the one the round before already deferred over takes the
-//!   empty holdback instead: that is a MEASUREMENT of a wait that has already
-//!   happened, not a prediction about the next one, and it costs at most one
-//!   round.
+//!   **The deferral is a WAIT, and the wait is BOUNDED TWICE** (codex rounds 4
+//!   and 5 on PR #95). Tail growth relieves it only where the tail GROWS
+//!   `common`, and two shapes stop it growing: hypotheses that ALTERNATE past
+//!   the agreed prefix pin `common` at the words they still share, and a
+//!   hypothesis that simply REPEATS pins it with no disagreement at all. Either
+//!   way the same round came back forever — nothing confirmed, the watermark
+//!   frozen, the caller reading `AwaitingAgreement`, and in the driver a clip
+//!   boundary that never advanced while the buffer grew past it.
+//!
+//!   So a deferral records a `DeferralSignature` — the floor, `common.len()`,
+//!   the terminal agreed start and the watermark an escape would anchor at,
+//!   which between them fix WHICH words an escape would strand — and a deferral
+//!   over a signature IDENTICAL to the round before's takes the empty holdback
+//!   instead: a MEASUREMENT of a wait that has already happened, not a
+//!   prediction about the next one.
 //!   `an_alternating_suffix_escapes_the_deferral_instead_of_stalling` and
 //!   `a_tied_run_above_the_budget_floor_escapes_the_deferral_instead_of_stalling`
-//!   are the falsifiers, one per deferral arm. What the escape can still lose is
-//!   one thing and it is residual 1 below: a word at the last confirmed word's
-//!   own instant, where no watermark serves both it and #94. Everything else
-//!   `empty_holdback_watermark` now SPARES by lowering the anchor to that word's
-//!   own start
+//!   are the falsifiers, one per deferral arm.
+//!
+//!   A signature bound alone is only half of it, and round 5 is both halves.
+//!   Recording `common.len()` alone (round 4's own predicate, compared with
+//!   `<=`) authorized an escape from a DIFFERENT deferral whenever two lengths
+//!   collided — the terminal timestamp may move while the normalized prefix does
+//!   not, and the escape's cost is a question about timings — which RETRACTS a
+//!   word a repeat would have kept
+//!   (`a_shifted_terminal_timestamp_is_a_new_wait_rather_than_a_repeat`). And a
+//!   signature bound of any strength cannot end a wait whose state keeps MOVING:
+//!   an over-budget tied run gaining one tied word per stride defers with a
+//!   fresh signature every round, forever, retaining one result per round over a
+//!   clip window that never advances
+//!   (`a_growing_tied_prefix_escapes_after_a_bounded_number_of_deferrals`). The
+//!   two findings pull opposite ways — a stricter predicate lengthens the stall,
+//!   a looser bound widens the premature escape — so the answer is both:
+//!   [`MAX_CONSECUTIVE_DEFERRALS`] bounds the wait whatever it is waiting on,
+//!   and the signature ends a proven-repeat sooner. A caller therefore waits at
+//!   most that many consecutive deferred rounds between advances, and
+//!   `LocalAgreement::finalize` publishes the whole live transcript throughout.
+//!
+//!   What either escape can still lose is one thing and it is residual 1 below:
+//!   a word at the last confirmed word's own instant, where no watermark serves
+//!   both it and #94. Everything else `empty_holdback_watermark` now SPARES by
+//!   lowering the anchor to that word's own start
 //!   (`a_strand_starting_strictly_later_lowers_the_watermark_instead_of_deferring`),
 //!   which is what keeps the loss to the impossibility rather than to the
 //!   policy.
@@ -282,7 +305,7 @@
 //!   `commonPrefix.count` leading words both hypotheses actually produced.
 //!   `LocalAgreement::finalize` instead emits the final hypothesis's own
 //!   post-watermark words on that path (`holdback_superseded` is the flag), and
-//!   on the DEFERRED one too (`deferred_common_len`), where the hypotheses agreed but
+//!   on the DEFERRED one too (`deferred`), where the hypotheses agreed but
 //!   the only split available was one Rule W refuses — nothing legal at or above
 //!   the prefill budget floor, or a forced empty holdback that would strand the
 //!   hypothesis's own suffix — so the holdback is an earlier agreement's and
@@ -429,17 +452,21 @@
 //!    it is still dropped — and `the_split_never_cuts_at_a_tied_start` sweeps
 //!    both counts.
 //!
-//!    And it is WIDER again since round 4, by exactly one round and only where
-//!    the deferral has already been measured and found to buy nothing: an
-//!    ESCAPE drops a word that WAS already visible past `common`, if it starts
-//!    at the settled instant. That is the same impossibility from the same side
-//!    — the alternative is the stall the bound exists to leave, and the
-//!    alternative to THAT is re-admitting the settled word, which is #94 — so
-//!    the residual's statement is unchanged and only its route is one wider.
-//!    Everything at any OTHER instant is spared rather than dropped, by
-//!    `empty_holdback_watermark`'s fold. The escape's own falsifiers are
-//!    `an_alternating_suffix_escapes_the_deferral_instead_of_stalling` and
-//!    `a_tied_run_above_the_budget_floor_escapes_the_deferral_instead_of_stalling`,
+//!    And it is WIDER again since round 4, by the length of a bounded wait and
+//!    only where that wait is OVER: an ESCAPE drops a word that WAS already
+//!    visible past `common`, if it starts at the settled instant. That is the
+//!    same impossibility from the same side — the alternative is the stall the
+//!    bound exists to leave, and the alternative to THAT is re-admitting the
+//!    settled word, which is #94 — so the residual's statement is unchanged and
+//!    only its route is wider. Everything at any OTHER instant is spared rather
+//!    than dropped, by `empty_holdback_watermark`'s fold. A wait is over on
+//!    either bound (see `DeferralWait::is_over`): its signature REPEATED, which
+//!    costs the escape one round after the state was first seen, or it ran to
+//!    [`MAX_CONSECUTIVE_DEFERRALS`] rounds without repeating, which costs it
+//!    that many. The escape's own falsifiers are
+//!    `an_alternating_suffix_escapes_the_deferral_instead_of_stalling`,
+//!    `a_tied_run_above_the_budget_floor_escapes_the_deferral_instead_of_stalling`
+//!    and `a_growing_tied_prefix_escapes_after_a_bounded_number_of_deferrals`,
 //!    and the sweep counts the strands so the residual cannot be reported as
 //!    unreachable.
 //! 2. **A repeat the engine's record cannot account for** is the stream's own,
@@ -512,15 +539,16 @@ pub enum AgreementOutcome {
   /// `split_at_a_strict_boundary`), in which case the result was kept like any
   /// other agreeing one.
   ///
-  /// The deferral is deliberately not its own variant, and codex round 4 on
-  /// PR #95 is why that survives its strongest objection. The objection was
+  /// The deferral is deliberately not its own variant, and codex rounds 4 and 5
+  /// on PR #95 are why that survives its strongest objection. The objection was
   /// that a caller cannot escape a state it cannot see, which is true and was
   /// the finding: the deferral used to repeat without bound. It is bounded now
-  /// -- one round, measured (`split_at_a_strict_boundary`'s arm 3) -- so there
-  /// is no state left for a caller to be told about that the engine does not
-  /// leave by itself, and a `Blocked` variant would report a wait that has
-  /// already ended. What this value reports stays what it always reported:
-  /// whether the watermark moved.
+  /// -- at most [`MAX_CONSECUTIVE_DEFERRALS`] consecutive deferred rounds
+  /// between advances, and one round where the wait provably repeats
+  /// (`split_at_a_strict_boundary`'s arm 3) -- so there is no state left for a
+  /// caller to be told about that the engine does not leave by itself, and a
+  /// `Blocked` variant would report a wait that ends without it. What this value
+  /// reports stays what it always reported: whether the watermark moved.
   AwaitingAgreement,
   /// The result carried no word timings to agree over; it was still kept
   /// (Swift `:403-409` falls through to the unconditional append).
@@ -577,6 +605,53 @@ pub const DEFAULT_AGREEMENT_COUNT_NEEDED: usize = 2;
 /// (codex round 8, finding 1; codex round 12, finding 2).
 pub const MAX_HOLDBACK_PREFILL_TOKENS: usize = MAX_TOKEN_CONTEXT / 2;
 
+/// The most consecutive rounds Rule W's deferral may WAIT before it escapes,
+/// WHATEVER state it is waiting on — the liveness backstop beside the
+/// signature bound, and the second half of the answer to #94's codex round 5
+/// (finding 1).
+///
+/// `DeferralSignature` ends a wait that REPEATS, which is the only wait a
+/// measurement can prove bought nothing. It cannot end a wait whose state keeps
+/// MOVING, and one shape moves it every round: a tied run already over the
+/// prefill budget that gains one more tied word each stride defers with a longer
+/// `common`, a higher floor and a fresh signature every time, so every round's
+/// wait is a NEW one and nothing ever measures a repeat. `add_word_timestamps`
+/// produces exactly that run from an all-zero alignment matrix, one word per
+/// stride is the driver's own cadence, and the length is not bounded by
+/// anything: the stall is unbounded, and since an agreeing round is a KEPT
+/// round ([`LocalAgreement::results_slice`]) over a clip window that never
+/// advances, an unbounded stall is unbounded RETENTION as well as unbounded
+/// latency.
+///
+/// So a count bounds it, and the count is what the wait is FOR. A word that
+/// opens a legal boundary needs ONE round to appear in a hypothesis and ONE more
+/// to be corroborated into `common` — see the two-round relief in
+/// `a_forced_empty_holdback_defers_rather_than_retracting_its_suffix` — so a
+/// stream that is relieving itself is relieved within two rounds of the
+/// relieving word arriving, and `4` leaves room for that word to arrive two
+/// rounds late. Past that the wait is not waiting for anything a longer wait
+/// delivers. Rounds rather than seconds because the frozen quantity IS the
+/// watermark, so elapsed watermark cannot measure its own stall, and because the
+/// retained results this bounds accrue one per round.
+///
+/// **What a caller observes in the worst case.** At most this many consecutive
+/// DEFERRED rounds between advances; over them
+/// [`LocalAgreement::confirmed_words_slice`] does not grow, `Self::ingest`
+/// returns [`AgreementOutcome::AwaitingAgreement`],
+/// [`LocalAgreement::last_agreed_seconds`] does not move, and
+/// [`LocalAgreement::results_slice`] grows by one kept result per round —
+/// while `LocalAgreement::finalize` keeps publishing the whole live transcript
+/// (`confirmed ++ hypothesis_words`), so it is CONFIRMATION that stalls, not
+/// the transcript. When the count fires it costs this module's residual 1 on a
+/// state that has not repeated: the escape takes the empty holdback at
+/// `empty_holdback_watermark`'s lowest sparing instant, so the only word it can
+/// strand is one of the newest hypothesis's own AT the last confirmed word's
+/// instant — every other instant the sparing fold keeps offerable.
+///
+/// `a_growing_tied_prefix_escapes_after_a_bounded_number_of_deferrals` is the
+/// falsifier and pins the number as a number.
+pub const MAX_CONSECUTIVE_DEFERRALS: usize = 4;
+
 /// The LocalAgreement-2 hypothesis-confirmation engine: consumes one
 /// [`TranscriptionResult`] per call and tracks the growing prefix two
 /// consecutive hypotheses agree on. Pure — no backend, no I/O, fully
@@ -607,7 +682,7 @@ pub struct LocalAgreement {
   /// four untouched, so this keeps describing the last hypothesis that actually
   /// had words to agree over — exactly the pair `finalize` reasons about.
   holdback_superseded: bool,
-  /// `Some(common.len())` when the most recent WORDED hypothesis AGREED with
+  /// `Some(signature)` when the most recent WORDED hypothesis AGREED with
   /// the previous one and the round still did not advance, because
   /// `split_at_a_strict_boundary` had no acceptable boundary to advance to:
   /// none legal at or above the prefill budget floor, or a forced empty
@@ -621,19 +696,42 @@ pub struct LocalAgreement {
   /// whole span and more, so Swift's `lastAgreedWords + differentSuffix`
   /// decomposition would drop everything between them.
   ///
-  /// `Self::ingest` needs the LENGTH, and that is the whole of the deferral's
-  /// liveness bound (#94, codex round 4 on PR #95). A deferral is a WAIT for
-  /// tail growth: `common` grows, and a boundary the split can legally take
-  /// appears above the budget floor. Deferring again over a `common` no LONGER
-  /// than the one that already deferred is therefore a wait that has already
-  /// been measured and found to buy nothing, which is a repeating state rather
-  /// than a wait — see `split_at_a_strict_boundary`'s escape.
+  /// `Self::ingest` needs the SIGNATURE, which is half of the deferral's
+  /// liveness bound (#94, codex rounds 4 and 5 on PR #95). A deferral is a WAIT
+  /// for tail growth: `common` grows, and a boundary the split can legally take
+  /// appears above the budget floor. Deferring again on a state IDENTICAL to
+  /// the one that already deferred is therefore a wait that has already been
+  /// measured and found to buy nothing, which is a repeating state rather than
+  /// a wait — see `split_at_a_strict_boundary`'s escape. An earlier form of
+  /// this field held `common.len()` alone and compared it with `<=`; a LENGTH
+  /// does not establish that the previous wait covered the current state, which
+  /// is round 5's finding 2 and the whole reason `DeferralSignature` exists.
   ///
   /// Maintained on exactly the same schedule as `Self::holdback_superseded` —
   /// only on the worded path, so the [`AgreementOutcome::NoWordTimings`] early
   /// return leaves it describing the last hypothesis that had words, and a
-  /// wordless stride between two deferrals neither relieves nor repeats one.
-  deferred_common_len: Option<usize>,
+  /// wordless stride between two deferrals neither relieves nor repeats one. It
+  /// is a claim about the IMMEDIATELY preceding worded round: an advance or a
+  /// disagreement clears it, because either one moves the state the signature
+  /// describes.
+  deferred: Option<DeferralSignature>,
+  /// How many rounds have DEFERRED since the last advance —
+  /// `split_at_a_strict_boundary`'s other bound, the one that fires whatever
+  /// the signature says (#94, codex round 5 on PR #95, finding 1). See
+  /// [`MAX_CONSECUTIVE_DEFERRALS`] for what the number is and what firing it
+  /// costs.
+  ///
+  /// Reset by an ADVANCE only. A disagreement clears [`Self::deferred`] but not
+  /// this, deliberately: a stream that alternates defer/disagree/defer never
+  /// repeats a signature and never advances either, and a counter a
+  /// disagreement reset would let that shape stall exactly as far as the
+  /// unbounded wait did. A wordless stride touches neither, on the same
+  /// schedule as every other field of the worded path.
+  ///
+  /// Bounded by [`MAX_CONSECUTIVE_DEFERRALS`] and so incapable of overflowing:
+  /// it only ever increments on a round that DEFERRED, and a round only defers
+  /// while this is strictly below that cap.
+  deferrals_since_advance: usize,
   confirmed_words: Vec<WordTiming>,
   results: Vec<TranscriptionResult>,
   /// A sink for the reproducibility facts of EVERY ingested hypothesis —
@@ -663,7 +761,8 @@ impl LocalAgreement {
       hypothesis_words: Vec::new(),
       last_agreed_words: Vec::new(),
       holdback_superseded: false,
-      deferred_common_len: None,
+      deferred: None,
+      deferrals_since_advance: 0,
       confirmed_words: Vec::new(),
       results: Vec::new(),
       ingested_facts: TaskFactsAccumulator::new(),
@@ -938,7 +1037,7 @@ impl LocalAgreement {
 
     let mut advanced = false;
     let mut skip_append = false;
-    let mut deferred: Option<usize> = None;
+    let mut deferred: Option<DeferralSignature> = None;
     // :374 — absent on the first-ever call, so nothing below runs and
     // this falls through to the `AwaitingAgreement` append below.
     if let Some(previous) = &self.prev_result {
@@ -979,74 +1078,89 @@ impl LocalAgreement {
         // starting strictly later opens a boundary above the floor and one word
         // joining `common` gives an interior split something to hold.
         //
-        // THE WAIT IS BOUNDED (#94, codex round 4 on PR #95). A wait that is
-        // not waiting for anything is a stall, and `common` growing is the
-        // whole of what it waits for -- so a deferral over a `common` no longer
-        // than the one that ALREADY deferred is the same round again, and
-        // repeating it is unbounded. Two shapes reach it and neither needs an
-        // exotic count: hypotheses that ALTERNATE past the agreed prefix keep
-        // `common` pinned at the words they still share, and a hypothesis that
-        // simply REPEATS with a tied run above the budget floor pins it with no
-        // disagreement at all. `deferral_gained_nothing` is that measurement,
-        // read off the round before rather than predicted, and
-        // `split_at_a_strict_boundary` takes the empty holdback instead of
-        // deferring again.
-        let deferral_gained_nothing = self
-          .deferred_common_len
-          .is_some_and(|already_deferred| common.len() <= already_deferred);
+        // THE WAIT IS BOUNDED, TWICE (#94, codex rounds 4 and 5 on PR #95). A
+        // wait that is not waiting for anything is a stall, and `common`
+        // growing is the whole of what it waits for. Two bounds carry that, and
+        // they pull opposite ways on purpose -- see `DeferralWait::is_over`.
+        //
+        // The SIGNATURE bound is the correctness half: a deferral whose
+        // boundary-relevant state is IDENTICAL to the one the round before
+        // deferred over is the same round again, measured rather than
+        // predicted. Two shapes reach it and neither needs an exotic count:
+        // hypotheses that ALTERNATE past the agreed prefix keep `common` pinned
+        // at the words they still share, and a hypothesis that simply REPEATS
+        // with a tied run above the budget floor pins it with no disagreement at
+        // all.
+        //
+        // The COUNT bound is the liveness half, and it fires whatever the
+        // signature says: a state that keeps MOVING never repeats, so an
+        // over-budget tied run gaining one tied word per stride would defer
+        // forever under the signature alone (round 5, finding 1). Round 4's
+        // predicate -- `common.len()` no longer than the length already
+        // deferred over -- was neither: it missed the growing run (finding 1)
+        // and it authorized an escape from a DIFFERENT deferral whenever two
+        // lengths happened to match (finding 2).
+        let wait = DeferralWait {
+          previous: self.deferred.as_ref(),
+          taken: self.deferrals_since_advance,
+        };
         let boundary = split_at_a_strict_boundary(
           common,
           &self.hypothesis_words[common.len()..],
           requested,
           self.confirmed_words.last().map(WordTiming::start),
-          deferral_gained_nothing,
+          wait,
         );
-        if let Some(split) = boundary {
-          // `common` REPLACES the still-open record: it is the span two consecutive
-          // hypotheses have just re-agreed over it, and `last_agreed_words` is the
-          // one this hypothesis has superseded.
-          self.confirmed_words.extend_from_slice(&common[..split]);
-          self.last_agreed_words = common[split..].to_vec();
-          // RULE W'S WATERMARK (#94). The watermark is the first held-back word's
-          // start, which `split_at_a_strict_boundary` has already placed STRICTLY
-          // past the last confirmed word's start.
-          //
-          // With NOTHING held back -- which takes a single word whose OWN
-          // tokens exceed the prefill budget, the one thing that pushes the
-          // budget floor to `common.len()`, or a round that escaped a repeating
-          // deferral -- there is no held word to measure against, and
-          // `empty_holdback_watermark` is the answer. That is the SAME function,
-          // called with the SAME arguments, that the deferral decision above
-          // consults, deliberately: the guard and the value it guards may not
-          // drift apart, and the value is now the LOWEST instant that clears the
-          // last confirmed word's start rather than a fixed one.
-          //
-          // Monotone: every word of `common` starts at or past the old watermark,
-          // `end >= start` for any word the pipeline emits, `next_up` only
-          // increases, and the sparing minimum is taken only over words that
-          // themselves cleared the old watermark. A NaN start cannot break the
-          // postcondition either -- `max` returns the non-NaN side, and
-          // `start >= watermark` is false for a NaN start, so such a word is
-          // never offered back in the first place.
-          //
-          // `common` is non-empty here (its length is at least
-          // `agreement_count_needed`, clamped to at least one), so the final
-          // fallback is unreachable and only keeps this total.
-          self.last_agreed_seconds = self.last_agreed_words.first().map_or_else(
-            || {
-              common.last().map_or(self.last_agreed_seconds, |last| {
-                empty_holdback_watermark(last, &self.hypothesis_words[common.len()..])
-              })
-            },
-            WordTiming::start,
-          );
-          advanced = true;
-        } else {
-          // The hypotheses AGREED, so `result` is KEPT below (`:402`/`:408-410`,
-          // no `skipAppend`) and the next round compares against it -- that is
-          // what lets tail growth reach `common` and relieve this. `common.len()`
-          // rides along as the measurement the NEXT deferral is judged against.
-          deferred = Some(common.len());
+        match boundary {
+          SplitDecision::At(split) => {
+            // `common` REPLACES the still-open record: it is the span two consecutive
+            // hypotheses have just re-agreed over it, and `last_agreed_words` is the
+            // one this hypothesis has superseded.
+            self.confirmed_words.extend_from_slice(&common[..split]);
+            self.last_agreed_words = common[split..].to_vec();
+            // RULE W'S WATERMARK (#94). The watermark is the first held-back word's
+            // start, which `split_at_a_strict_boundary` has already placed STRICTLY
+            // past the last confirmed word's start.
+            //
+            // With NOTHING held back -- which takes a single word whose OWN
+            // tokens exceed the prefill budget, the one thing that pushes the
+            // budget floor to `common.len()`, or a round that escaped a repeating
+            // deferral -- there is no held word to measure against, and
+            // `empty_holdback_watermark` is the answer. That is the SAME function,
+            // called with the SAME arguments, that the deferral decision above
+            // consults, deliberately: the guard and the value it guards may not
+            // drift apart, and the value is now the LOWEST instant that clears the
+            // last confirmed word's start rather than a fixed one.
+            //
+            // Monotone: every word of `common` starts at or past the old watermark,
+            // `end >= start` for any word the pipeline emits, `next_up` only
+            // increases, and the sparing minimum is taken only over words that
+            // themselves cleared the old watermark. A NaN start cannot break the
+            // postcondition either -- `max` returns the non-NaN side, and
+            // `start >= watermark` is false for a NaN start, so such a word is
+            // never offered back in the first place.
+            //
+            // `common` is non-empty here (its length is at least
+            // `agreement_count_needed`, clamped to at least one), so the final
+            // fallback is unreachable and only keeps this total.
+            self.last_agreed_seconds = self.last_agreed_words.first().map_or_else(
+              || {
+                common.last().map_or(self.last_agreed_seconds, |last| {
+                  empty_holdback_watermark(last, &self.hypothesis_words[common.len()..])
+                })
+              },
+              WordTiming::start,
+            );
+            advanced = true;
+          }
+          SplitDecision::Defer(signature) => {
+            // The hypotheses AGREED, so `result` is KEPT below (`:402`/`:408-410`,
+            // no `skipAppend`) and the next round compares against it -- that is
+            // what lets tail growth reach `common` and relieve this. The signature
+            // rides along as the state the NEXT deferral is judged against, and
+            // the counter below as the wait's own length.
+            deferred = Some(signature);
+          }
         }
       } else {
         // :395-400 — disagreement; `result` is dropped below.
@@ -1063,9 +1177,19 @@ impl LocalAgreement {
     self.holdback_superseded = skip_append;
     // Assigned on EVERY worded ingest for the same reason, so an advance or a
     // disagreement clears a deferral the round before it -- which is also what
-    // keeps `deferral_gained_nothing` above a claim about the IMMEDIATELY
+    // keeps the signature comparison above a claim about the IMMEDIATELY
     // preceding worded round rather than about some older one.
-    self.deferred_common_len = deferred;
+    self.deferred = deferred;
+    // The COUNTER spans what the signature does not. An advance resets it: the
+    // watermark moved, the confirmed list grew, and whatever the wait was for is
+    // over. A DISAGREEMENT deliberately leaves it, so a stream that alternates
+    // deferral and disagreement -- never repeating a signature, never advancing
+    // -- is still bounded by it.
+    if advanced {
+      self.deferrals_since_advance = 0;
+    } else if self.deferred.is_some() {
+      self.deferrals_since_advance += 1;
+    }
 
     // :402 (unconditional) + :408-410 (`!skipAppend`).
     if skip_append {
@@ -1112,10 +1236,22 @@ impl LocalAgreement {
   /// the decoded span is restored from the merged surviving result (round 10, F3;
   /// the ingest strip carries only the wholly-unknown span, so the fold cannot
   /// supply the exact count, round 12); see `Self::ingest`.
-  pub(crate) fn finalize(mut self, options: &DecodingOptions) -> TranscriptionResult {
-    if (self.holdback_superseded || self.deferred_common_len.is_some())
-      && !self.hypothesis_words.is_empty()
-    {
+  /// The exact word list `Self::finalize` publishes, taken out of the engine —
+  /// `Self::confirmed_words_slice` with the round's own provisional tail folded
+  /// on, under the two shapes described on `Self::finalize`.
+  ///
+  /// Split out of `Self::finalize` so the TRANSCRIPT can be observed with its
+  /// timings intact (#94, codex round 5 on PR #95, closing note).
+  /// `merge_transcription_results_with_words` keeps this list only as merged
+  /// TEXT, and the merged segments carry the decoders' own words instead — so
+  /// from `Self::finalize`'s return value alone there is no way to ask when a
+  /// published word started, which is the question a retraction is answered by.
+  /// `the_split_never_cuts_at_a_tied_start` reads this every round and asserts
+  /// that a word which LEAVES the transcript is either still offerable or at the
+  /// settled instant; the last two findings on this branch both hid in exactly
+  /// that gap, where `confirmed_words`' append-only guarantee cannot see.
+  fn take_finalized_words(&mut self) -> Vec<WordTiming> {
+    if (self.holdback_superseded || self.deferred.is_some()) && !self.hypothesis_words.is_empty() {
       // DIVERGENCE from `:418-419` — see this module's doc for the full
       // argument. Swift's `lastAgreedWords + differentSuffix(prevWords,
       // hypothesisWords)` is only a valid decomposition when the final round
@@ -1130,7 +1266,7 @@ impl LocalAgreement {
       // SUFFIX would instead drop the leading words both hypotheses produced,
       // which is the same defect's other face when the holdback is empty.
       //
-      // DEFERRED (`deferred_common_len`, codex round 3 on PR #95): the two hypotheses
+      // DEFERRED (`deferred`, codex round 3 on PR #95): the two hypotheses
       // AGREED but no legal split existed at or above the prefill budget floor,
       // so `last_agreed_words` is an EARLIER agreement's holdback and Swift's sum
       // would drop everything between it and `common`'s end. `hypothesis_words`
@@ -1154,8 +1290,12 @@ impl LocalAgreement {
       let suffix = find_longest_different_suffix(&self.prev_words, &self.hypothesis_words);
       self.confirmed_words.extend_from_slice(suffix);
     }
-    let mut merged =
-      merge_transcription_results_with_words(&self.results, &self.confirmed_words, options);
+    core::mem::take(&mut self.confirmed_words)
+  }
+
+  pub(crate) fn finalize(mut self, options: &DecodingOptions) -> TranscriptionResult {
+    let words = self.take_finalized_words();
+    let mut merged = merge_transcription_results_with_words(&self.results, &words, options);
     // Fold the merged (surviving-result) facts INTO the ingest-ordered sink, not
     // the other way round (codex round 9): the sink observed EVERY hypothesis in
     // ingest order — the disagreeing dropped ones included — so its FIRST-observed
@@ -1184,6 +1324,127 @@ impl LocalAgreement {
 // ---------------------------------------------------------------------
 // The confirmed/holdback split
 // ---------------------------------------------------------------------
+
+/// The boundary-relevant state of a round that DEFERRED: everything that decides
+/// WHICH words an escape from that round would strand, and nothing else (#94,
+/// codex round 5 on PR #95, finding 2).
+///
+/// What this replaces was `common.len()` alone, compared with `<=`, and a LENGTH
+/// does not establish that the wait already taken covered the state now in front
+/// of the engine. Agreement compares NORMALIZED TEXT while the escape's cost is
+/// a question about TIMINGS, so the two come apart: defer over `[A, H@1]` with a
+/// tied strand `X@1`, then offer `[A, H@2, Y@2]`, and the common length is still
+/// two while the hazardous boundary has moved from 1 s to 2 s. Escaping there
+/// confirms `H@2`, anchors past 2 s, and strands `Y` — a word this round's own
+/// `LocalAgreement::finalize` had already published, retracted on the next
+/// ingest, and invisible to [`LocalAgreement::confirmed_words_slice`]'s
+/// append-only guarantee, which never held it. Repeating that hypothesis instead
+/// grows `common` to include `Y` and keeps it, which is what makes the escape a
+/// LOSS rather than an ordering.
+/// `a_shifted_terminal_timestamp_is_a_new_wait_rather_than_a_repeat` is the
+/// falsifier.
+///
+/// **Why exactly these fields.** The escape splits at `common.len()` and anchors
+/// at `empty_holdback_watermark`, so what it strands is
+/// `{ w in beyond_common : w.start() < escape_watermark }` — which after that
+/// function's sparing fold is exactly the words TIED to `terminal_start`. Those
+/// two therefore fix the cost. `floor` and `common_len` fix which boundaries the
+/// forward search and the back-off could reach at all, and between them they
+/// also record the ARM: the budget forces the empty holdback exactly when
+/// `floor == common_len`. The last confirmed word's start is deliberately absent
+/// — nothing is confirmed between two deferrals, so it cannot move while this is
+/// being compared, and an advance clears the record anyway.
+///
+/// **What it deliberately does NOT record is TEXT**, so two deferrals whose
+/// strands differ only in what they say at the same instant count as the same
+/// wait. That is round 4's own adjudication rather than an oversight: a word
+/// that alternates at the settled instant is uncorroborable BY CONSTRUCTION —
+/// `find_longest_common_prefix` stops in front of it on every round it is
+/// offered — so no length of wait delivers it, and
+/// `an_alternating_suffix_escapes_the_deferral_instead_of_stalling` is the shape
+/// that would stall if this compared text.
+///
+/// The comparison is EQUALITY on every field, including the length. Round 4's
+/// `<=` is not merely widened here, it is dropped: escaping where `common`
+/// SHRANK is escaping from a state the previous wait did not cover either, and
+/// the safe direction for a doubt about whether a wait repeated is to wait
+/// again, which `MAX_CONSECUTIVE_DEFERRALS` bounds at four rounds. That choice
+/// is a recorded SUITE GAP rather than a proven one: relaxing the length back to
+/// `<=` reds nothing in this crate, since no shape here or in
+/// `the_split_never_cuts_at_a_tied_start` produces two consecutive deferrals
+/// whose `common` shrank at an otherwise identical state (measured: 0 in 512
+/// sweep trials), though a hypothesis that agrees with its predecessor on less
+/// makes one reachable.
+///
+/// Comparing `f32` by `==` is exact and total here: `terminal_start` reached this
+/// through `LocalAgreement::watermark_filtered`, whose `start >= watermark` is
+/// false for a NaN, and `empty_holdback_watermark` is documented never-NaN. Were
+/// one ever NaN the signature would simply never match, which defers one round
+/// longer and stays bounded by [`MAX_CONSECUTIVE_DEFERRALS`] — the safe
+/// direction.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct DeferralSignature {
+  /// `budgeted_split(common, 0)`: the earliest split whose holdback the prefill
+  /// can carry whole, and the floor neither search may cross.
+  floor: usize,
+  /// `common.len()`.
+  common_len: usize,
+  /// The last agreed word's start — the instant an escape must anchor strictly
+  /// past, and so the one instant no watermark can spare.
+  terminal_start: f32,
+  /// `empty_holdback_watermark(common.last(), beyond_common)`: the watermark an
+  /// escape would anchor at.
+  escape_watermark: f32,
+}
+
+/// What `split_at_a_strict_boundary` knows about the wait the current round
+/// would JOIN, and the one place the two bounds compose.
+///
+/// They pull opposite ways, which is the whole difficulty (#94, codex round 5 on
+/// PR #95). Tightening the predicate for finding 2 makes finding 1's stall
+/// LONGER; loosening it for finding 1 makes finding 2's premature escape MORE
+/// available. Neither is a predicate problem alone, so neither is fixed by one
+/// predicate: `previous` establishes that a wait is the SAME wait, which is a
+/// correctness claim about what an escape may cost, and `taken` bounds the wait
+/// whatever it is waiting on, which is a liveness claim about how long a caller
+/// may be made to wait. The first can only ever make the engine wait longer; the
+/// second is what stops that being forever.
+#[derive(Debug, Clone, Copy)]
+struct DeferralWait<'a> {
+  /// The signature of the IMMEDIATELY preceding worded round, if it deferred.
+  previous: Option<&'a DeferralSignature>,
+  /// How many rounds have already deferred since the last advance — never above
+  /// [`MAX_CONSECUTIVE_DEFERRALS`], since a round only defers while it is below.
+  taken: usize,
+}
+
+impl DeferralWait<'_> {
+  /// Whether a round in this state may ESCAPE — advance at `common.len()` with
+  /// an empty holdback — rather than wait again.
+  ///
+  /// The two bounds are a disjunction and each is complete on its own side. The
+  /// SIGNATURE fires on a wait that has provably already happened, so it can end
+  /// a repeat on the very next round without ever cutting a moving state short.
+  /// The COUNT fires on a wait that has gone on too long to be waiting for
+  /// anything, whatever it looks like, so it ends a state that keeps changing
+  /// shape. Neither subsumes the other, and dropping either re-opens one of
+  /// round 5's two findings.
+  fn is_over(self, signature: &DeferralSignature) -> bool {
+    self.previous == Some(signature) || self.taken >= MAX_CONSECUTIVE_DEFERRALS
+  }
+}
+
+/// What `split_at_a_strict_boundary` answered: where to split, or the state the
+/// round is waiting on instead.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum SplitDecision {
+  /// Confirm `common[..at]` and hold `common[at..]` back — `at == common.len()`
+  /// being the empty holdback, which both the FORCED arm and the ESCAPE take.
+  At(usize),
+  /// Do not advance; this is the wait's own signature, which
+  /// `LocalAgreement::ingest` records for the round after it.
+  Defer(DeferralSignature),
+}
 
 /// RULE W (#94, at its source): where an advance splits `common`, moved off any
 /// boundary that would put the watermark AT a start already settled.
@@ -1243,17 +1504,17 @@ impl LocalAgreement {
 ///    over the HEAD of the offered list, which only an advance can move, whereas
 ///    this defers a split position that TAIL growth relieves, and it advances
 ///    the holdback rather than refusing the round.
-/// 3. **`Some(common.len())` -- the ESCAPE**, where neither search found a legal
-///    boundary and `deferral_gained_nothing`. See arm 4 for the wait this
-///    bounds; the holdback goes empty and the watermark is
+/// 3. **`SplitDecision::At(common.len())` -- the ESCAPE**, where neither search
+///    found a legal boundary and `DeferralWait::is_over`. See arm 4 for the wait
+///    this bounds; the holdback goes empty and the watermark is
 ///    `empty_holdback_watermark`'s lowest sparing instant, exactly as in arm 5.
-/// 4. **`None` -- DEFER**, on either of two states, and each is a WAIT rather
-///    than a refusal: it costs nothing on the deferring round itself --
-///    `finalize` emits `confirmed ++ hypothesis_words` either way (see
+/// 4. **`SplitDecision::Defer` -- DEFER**, on either of two states, and each is
+///    a WAIT rather than a refusal: it costs nothing on the deferring round
+///    itself -- `finalize` emits `confirmed ++ hypothesis_words` either way (see
 ///    `LocalAgreement::finalize`) -- and the divergence is entirely in what
 ///    LATER ingests can still see. **The wait is BOUNDED** by
-///    `deferral_gained_nothing`, and that bound is the whole of arm 3; the two
-///    states below are what the FIRST wait is worth taking for.
+///    `DeferralWait::is_over`, and that bound is the whole of arm 3; the two
+///    states below are what a wait is worth taking for at all.
 ///
 ///    The first is where the budget floor is `1` or more and no legal
 ///    boundary sits at or above it. A tied run whose OWN tokens exceed
@@ -1296,19 +1557,30 @@ impl LocalAgreement {
 ///    makes it grow. Two hypotheses that ALTERNATE past the agreed prefix pin
 ///    `common` at the words they still share, round after round, and a
 ///    hypothesis that simply REPEATS pins it with no disagreement at all -- so
-///    `None` came back every round, the watermark never moved, the caller read
-///    `AwaitingAgreement` forever, and in the driver the clip kept re-decoding
-///    from a boundary that never advanced while the buffer grew past it. The
-///    earlier liveness argument -- "one word starting strictly later opens a
-///    boundary" -- is about a suffix that STABILIZES and reaches neither state.
-///    `deferral_gained_nothing` is the bound: a deferral over a `common` no
-///    longer than the one the round before already deferred over is that round
-///    again, measured rather than predicted, so arm 3 takes the empty holdback
-///    instead. It costs at most one round, and BOTH states are bounded by it --
-///    exempting either from its own bound is not a bound
+///    the deferral came back every round, the watermark never moved, the caller
+///    read `AwaitingAgreement` forever, and in the driver the clip kept
+///    re-decoding from a boundary that never advanced while the buffer grew past
+///    it. The earlier liveness argument -- "one word starting strictly later
+///    opens a boundary" -- is about a suffix that STABILIZES and reaches neither
+///    state. Both states are bounded by arm 3, and exempting either from its own
+///    bound is not a bound
 ///    (`an_alternating_suffix_escapes_the_deferral_instead_of_stalling`,
 ///    `a_tied_run_above_the_budget_floor_escapes_the_deferral_instead_of_stalling`).
-/// 5. **`Some(common.len())`** -- tested FIRST in the code, since its condition
+///
+///    **And `common` GROWING is not itself relief** (#94, codex round 5 on
+///    PR #95, finding 1) -- which is what a bound written as "`common` no longer
+///    than the length already deferred over", round 4's own, assumed. A tied run
+///    already over the budget that gains one more TIED word every stride grows
+///    `common` on every round while opening no boundary at all: the floor rises
+///    with it, every reachable position still ties, and the length predicate is
+///    false forever. That stall is unbounded in rounds AND in retention, since
+///    an agreeing round is a kept round. So the wait is bounded by
+///    `MAX_CONSECUTIVE_DEFERRALS` rounds as well, whatever its shape, and by a
+///    `DeferralSignature` rather than a length where it does repeat -- a length
+///    also cannot tell one deferral from a DIFFERENT one of the same length,
+///    which is round 5's finding 2 and the retraction on
+///    `a_shifted_terminal_timestamp_is_a_new_wait_rather_than_a_repeat`.
+/// 5. **`SplitDecision::At(common.len())`** -- tested FIRST in the code, since its condition
 ///    is a property of the budget alone and neither search runs on it. Only
 ///    where the BUDGET FLOOR itself reaches `common.len()` is that length
 ///    returned on the FIRST round and the holdback left empty. That takes a LAST
@@ -1331,14 +1603,9 @@ impl LocalAgreement {
 ///    2, which is the wait that never ends.
 ///
 ///    An EMPTY `common` reaches this arm too (`floor == 0 == common.len()`) and
-///    advances: there is no word to anchor a watermark on, so there is nothing
-///    to strand, and `LocalAgreement::ingest`'s own fallback leaves the
-///    watermark where it was. Like the `at == 0` check above it carries NO
-///    falsifier -- `LocalAgreement::ingest` only calls this with
-///    `common.len() >= agreement_count_needed`, which is clamped to at least one
-///    -- and, like it, it is written out so this function is total on its own
-///    terms rather than on its caller's clamp. Flipping it to defer reds nothing
-///    in this crate.
+///    advances -- written out as its own early return above, so that everything
+///    after it has a terminal word to build a signature from. See that return
+///    for why it carries no falsifier.
 ///
 /// So `agreement_count_needed` is a target rather than an exact width in EITHER
 /// direction: the budget can shorten the holdback (see `budgeted_split`) and
@@ -1353,18 +1620,21 @@ impl LocalAgreement {
 /// the offered filter, and the re-admission question is unrepresentable rather
 /// than defended against.
 ///
-/// It stays TOTAL under both `None` states rather than becoming conditional
+/// It stays TOTAL under both DEFER states rather than becoming conditional
 /// again: a deferred round is not an advance, so it moves neither side of the
-/// inequality and there is no state for the claim to be excluded from. `None`
-/// REMOVES reachable advances rather than adding unguarded ones, and the second
-/// state removes a strict subset of arm 5's, which the `next_up` anchor already
-/// carried.
+/// inequality and there is no state for the claim to be excluded from.
+/// `SplitDecision::Defer` REMOVES reachable advances rather than adding
+/// unguarded ones, and the second state removes a strict subset of arm 5's,
+/// which the `next_up` anchor already carried.
 ///
 /// It stays total under the ESCAPE too, which ADDS advances rather than removing
-/// them: every escape splits at `common.len()`, and there
-/// `LocalAgreement::ingest` anchors at `empty_holdback_watermark`, whose result
-/// is strictly greater than `common.last().start()` for every input -- the
-/// sparing fold skips exactly the starts that are not (see that function).
+/// them, and under BOTH of the bounds that authorize one: every escape splits at
+/// `common.len()` whichever bound fired, and there `LocalAgreement::ingest`
+/// anchors at `empty_holdback_watermark`, whose result is strictly greater than
+/// `common.last().start()` for every input -- the sparing fold skips exactly the
+/// starts that are not (see that function). What `DeferralWait::is_over` decides
+/// is WHEN an escape may be taken, never where it splits or what it anchors at,
+/// so no bound can reach this inequality.
 ///
 /// # A second postcondition
 ///
@@ -1385,12 +1655,16 @@ impl LocalAgreement {
 /// `beyond_common` that starts at the last confirmed word's own instant. There
 /// no value serves both claims -- the first postcondition demands a watermark
 /// strictly past that start, and every such watermark filters the strand -- so
-/// this is the module's residual 1 reached one round earlier than the residual's
-/// own route, not a policy. It is exactly that narrow: at any other start the
-/// sparing fold spares the word, and only an escape may use it.
+/// this is the module's residual 1 reached earlier than the residual's own
+/// route, not a policy. It is exactly that narrow: at any other start the
+/// sparing fold spares the word, and only an escape may use it. Round 5's second
+/// bound does not widen the exception's SHAPE, only the set of rounds that may
+/// take it: an escape authorized by the round count strands the same tie an
+/// escape authorized by a repeating signature does, and nothing else.
 /// `the_split_never_cuts_at_a_tied_start` sweeps both postconditions and the
 /// exception, and counts the escapes and the strands so neither can pass by
-/// being unreachable.
+/// being unreachable -- and reads the published TRANSCRIPT across every round
+/// besides, which is where a retraction the confirmed list cannot see shows up.
 ///
 /// It is a claim about the LAST confirmed word, and that is as strong as it needs
 /// to be exactly while word starts inside one hypothesis are non-decreasing --
@@ -1401,8 +1675,8 @@ fn split_at_a_strict_boundary(
   beyond_common: &[WordTiming],
   requested: usize,
   confirmed_last_start: Option<f32>,
-  deferral_gained_nothing: bool,
-) -> Option<usize> {
+  wait: DeferralWait<'_>,
+) -> SplitDecision {
   let strictly_after_the_preceding_start = |at: usize| {
     let preceding = if at == 0 {
       confirmed_last_start
@@ -1410,6 +1684,33 @@ fn split_at_a_strict_boundary(
       Some(common[at - 1].start())
     };
     preceding.is_none_or(|preceding| preceding < common[at].start())
+  };
+  // `budgeted_split` with nothing requested IS the budget's own floor: the
+  // earliest split whose holdback fits `MAX_HOLDBACK_PREFILL_TOKENS`.
+  let floor = budgeted_split(common, 0);
+  // An EMPTY `common` reaches the FORCED arm below (`floor == 0 ==
+  // common.len()`) and advances: there is no word to anchor a watermark on, so
+  // there is nothing to strand, and `LocalAgreement::ingest`'s own fallback
+  // leaves the watermark where it was. Taken here rather than inside that arm so
+  // everything below has a terminal word to speak about. Like the `at == 0`
+  // check above it carries NO falsifier -- `LocalAgreement::ingest` only calls
+  // this with `common.len() >= agreement_count_needed`, which is clamped to at
+  // least one -- and, like it, it is written out so this function is total on
+  // its own terms rather than on its caller's clamp. Flipping it to defer reds
+  // nothing in this crate.
+  let Some(last) = common.last() else {
+    return SplitDecision::At(common.len());
+  };
+  // The watermark an EMPTY holdback would anchor at, computed ONCE and shared by
+  // the strand test, the deferral's signature and (through `common.len()`)
+  // `LocalAgreement::ingest`'s own anchor -- the guard, the record and the value
+  // may not drift apart.
+  let escape_watermark = empty_holdback_watermark(last, beyond_common);
+  let signature = DeferralSignature {
+    floor,
+    common_len: common.len(),
+    terminal_start: last.start(),
+    escape_watermark,
   };
   // The EMPTY holdback strands a word exactly when `empty_holdback_watermark`
   // cannot be lowered far enough to spare it, which takes a word of
@@ -1422,14 +1723,10 @@ fn split_at_a_strict_boundary(
   // negated, and totally so: every word of `beyond_common` reached this call
   // through that filter, so none of their starts is NaN.
   let empty_holdback_strands = || {
-    common.last().is_some_and(|last| {
-      let watermark = empty_holdback_watermark(last, beyond_common);
-      beyond_common.iter().any(|word| word.start() < watermark)
-    })
+    beyond_common
+      .iter()
+      .any(|word| word.start() < escape_watermark)
   };
-  // `budgeted_split` with nothing requested IS the budget's own floor: the
-  // earliest split whose holdback fits `MAX_HOLDBACK_PREFILL_TOKENS`.
-  let floor = budgeted_split(common, 0);
   if floor == common.len() {
     // The budget FORCES the empty holdback: no split leaves a non-empty one the
     // prefill could carry, which takes a LAST word whose own tokens exceed
@@ -1448,47 +1745,52 @@ fn split_at_a_strict_boundary(
     // would strand -- and the strand is what `beyond_common` is here to see,
     // since on `common` alone this arm cannot know what lies past it.
     //
-    // Unless deferring has already been measured and bought nothing, in which
-    // case the wait is a stall and the round takes the advance anyway (codex
-    // round 4 on PR #95). What that costs is exactly this module's residual 1,
-    // one round earlier than the residual's own route: at an exact tie a word
-    // beyond `common` and a re-offer of the settled word in front of it are the
-    // same value to a timestamp filter, so no watermark serves both.
-    if empty_holdback_strands() && !deferral_gained_nothing {
-      return None;
+    // Unless the WAIT IS OVER -- the same state has already been waited on, or
+    // the wait has run past `MAX_CONSECUTIVE_DEFERRALS` rounds -- in which case
+    // the round takes the advance anyway (codex rounds 4 and 5 on PR #95). What
+    // that costs is exactly this module's residual 1, one round earlier than the
+    // residual's own route: at an exact tie a word beyond `common` and a
+    // re-offer of the settled word in front of it are the same value to a
+    // timestamp filter, so no watermark serves both.
+    if empty_holdback_strands() && !wait.is_over(&signature) {
+      return SplitDecision::Defer(signature);
     }
-    return Some(common.len());
+    return SplitDecision::At(common.len());
   }
   let widened = requested.max(floor);
-  (widened..common.len())
+  match (widened..common.len())
     .find(|&at| strictly_after_the_preceding_start(at))
     .or_else(|| {
       (floor..widened)
         .rev()
         .find(|&at| strictly_after_the_preceding_start(at))
-    })
+    }) {
+    Some(at) => SplitDecision::At(at),
     // No INTERIOR boundary is legal, so this arm's deferral protects the
     // holdback rather than a strand: the tied run stays revisable and the next
     // stride keeps its prefill anchor (see
     // `a_trailing_tied_run_never_confirms_itself_twice_at_the_default_count`).
-    // That is worth exactly one wait. A `common` that did not grow since the
-    // deferral before it is not going to be relieved by waiting again -- a
+    // That is worth waiting for -- but only while the wait is still a wait. A
+    // state already waited on is not going to be relieved by waiting again -- a
     // hypothesis REPEATING a tied run above the floor pins it with no
     // disagreement anywhere, which is the shape an all-zero alignment matrix
-    // produces -- so the empty holdback is taken instead, still at the lowest
-    // watermark that clears the last confirmed start.
+    // produces -- and a state that keeps CHANGING while never opening a boundary
+    // is a stall the signature can never catch, which is the same run gaining
+    // one tied word per stride. So the empty holdback is taken instead, still at
+    // the lowest watermark that clears the last confirmed start.
     //
     // `empty_holdback_strands()` is deliberately NOT consulted here, exactly as
-    // the forced arm stops consulting it once the wait has repeated: a bound
-    // that exempts the state it is there to escape is not a bound, and a tied
-    // run whose SUFFIX alternates at the run's own instant reaches this arm in
+    // the forced arm stops consulting it once the wait is over: a bound that
+    // exempts the state it is there to escape is not a bound, and a tied run
+    // whose SUFFIX alternates at the run's own instant reaches this arm in
     // precisely that state
     // (`a_tied_run_above_the_budget_floor_escapes_the_deferral_instead_of_stalling`'s
-    // second half). Both arms therefore strand the same thing on a repeating
-    // wait -- a word at the settled instant, residual 1 -- and nothing else.
-    .or_else(|| deferral_gained_nothing.then_some(common.len()))
+    // second half). Both arms therefore strand the same thing on a wait that is
+    // over -- a word at the settled instant, residual 1 -- and nothing else.
+    None if wait.is_over(&signature) => SplitDecision::At(common.len()),
+    None => SplitDecision::Defer(signature),
+  }
 }
-
 /// Where an advance splits `common` into the part that is CONFIRMED and the
 /// part that is HELD BACK, given the requested split — moved later until every
 /// word still held is one [`prefill_tokens`](crate::audio::whisper::decode::prefill_tokens)
@@ -1563,8 +1865,9 @@ fn split_at_a_strict_boundary(
 /// erased words are neither re-offered nor confirmed, which is the whole of
 /// round 7's finding 2. Where nothing legal sits at or above the floor, that
 /// rule DEFERS the round rather than crossing the floor — the one thing it never
-/// does, the floor being hard — and widens off the end only once that wait has
-/// been measured and found to buy nothing (its arm 3).
+/// does, the floor being hard — and widens off the end only once that wait is
+/// OVER, either because its state repeated or because it ran to
+/// [`MAX_CONSECUTIVE_DEFERRALS`] rounds (its arm 3).
 ///
 /// **Documented deviation**: with `agreement_count_needed` at its
 /// [`DEFAULT_AGREEMENT_COUNT_NEEDED`] a two-word holdback of words
