@@ -403,66 +403,62 @@ fn the_split_never_cuts_at_a_tied_start() {
   // coverage). The postcondition is now asserted on EVERY observation with a
   // non-empty confirmed list, and the sweep DRIVES the empty holdback rather
   // than avoiding it: some trials raise the prefill cost of one word past
-  // `MAX_HOLDBACK_PREFILL_TOKENS`, which is the only thing that still empties
-  // the holdback -- on a round that strands nothing past `common`, since one
-  // that would defers -- and `empty_holdbacks` below is the non-vacuity proof
-  // that it really happened.
+  // `MAX_HOLDBACK_PREFILL_TOKENS`, and some build a TIED RUN whose tokens
+  // exceed it in aggregate -- the two shapes that empty the holdback -- and
+  // `empty_holdbacks` below is the non-vacuity proof that it really happened.
   //
   // The shape then still had ONE oversized word as its only route past the
   // budget, and that could not build the AGGREGATE trigger (codex round 3 on
   // PR #95): a TIED RUN of ordinary words whose TOTAL exceeds the budget, where
-  // the floor lands inside the run, every reachable boundary ties, and the round
-  // DEFERS instead of advancing. Measured on the shape this test had before:
-  // 25 deferred rounds of 1662 observations, all of them reached through the
-  // oversized word rather than through a run, and none of them DISTINGUISHED --
-  // the postcondition below holds under the old widen-off-the-end fallback too,
-  // which is why the deletion that fallback caused needed its own falsifier
-  // (`an_over_budget_tied_run_defers_rather_than_stranding_its_suffix`). The
-  // aggregate trials below took it to 133, and `deferrals` is that half's own
-  // non-vacuity proof.
+  // the floor lands inside the run, every reachable boundary ties, and the split
+  // runs off the end of `common`. Measured on the shape this test had before:
+  // 25 such rounds of 1662 observations, all of them reached through the
+  // oversized word rather than through a run, and none of them DISTINGUISHED.
+  // `aggregate_fallbacks` is that half's own non-vacuity proof, and it counts
+  // the ROUTE rather than the arm: a fallback round in which no word of `common`
+  // is over budget on its own can only have got there through the run.
   //
   // A SECOND POSTCONDITION now rides the same sweep, and reaching the state it
   // speaks about needed one more shape change (codex round 3 on PR #95, second
   // finding). `nothing_unconfirmed_falls_below_the_watermark` is the claim that
   // an advance may not push the watermark past a word of its own hypothesis it
-  // did not confirm; the state that breaks it is the FORCED arm reached with a
+  // did not confirm; the state that tests it is the FORCED arm reached with a
   // live suffix beyond `common`, and offering every stride TWICE could not build
   // it -- measured at 0 rounds of 1353. `repeats` below offers a stride once in
   // three, which leaves the next stride's first ingest comparing consecutive
   // GROWING lists, and `forced_strands` is that half's non-vacuity proof.
   //
-  // A FOURTH shape change reaches the DEFERRAL's own liveness (codex round 4 on
-  // PR #95). Everything above offers PREFIXES, so every hypothesis is a prefix
-  // of the next, `common` grows on every round, and a deferral is always
-  // relieved by waiting -- the assumption the deferral's own liveness argument
-  // made, and the reason this sweep could not see the stall. `alternating`
-  // rewrites the LAST offered word on every other offering, which pins `common`
-  // in front of it; `contradictions` is that half's non-vacuity proof, `escapes`
-  // proves the bound fires, and `tie_strands` proves the second postcondition's
-  // one exception is reached rather than merely written down.
+  // A FOURTH shape change makes two consecutive hypotheses CONTRADICT each
+  // other past the agreed prefix (codex round 4 on PR #95). Everything above
+  // offers PREFIXES, so every hypothesis is a prefix of the next and `common`
+  // grows on every round; `alternating` rewrites the LAST offered word on every
+  // other offering, which pins `common` in front of it and holds the engine on
+  // the fallback arm round after round. `contradictions` is that half's
+  // non-vacuity proof, and `tie_strands` proves the second postcondition's one
+  // exception is reached rather than merely written down.
   //
-  // A FIFTH reaches the two shapes the LENGTH bound got wrong (codex round 5 on
-  // PR #95). Both are pairs of CONSECUTIVE deferrals, which is what a bound is
-  // read from, and the sweep had neither. `growth_deferrals` counts finding 1's:
-  // a `common` that is LONGER every round, which the length predicate never
-  // escapes -- reached by the aggregate tied runs above, whose trailing tie
-  // survives the prefix growth. `shift_deferrals` counts finding 2's: EQUAL
-  // lengths whose terminal instant MOVED, which the length predicate escapes
-  // although the wait it measured was a different one -- reached by `retiming`,
-  // which drifts a whole offering's timings and leaves its texts alone.
-  // `signature_escapes` and `counted_escapes` prove that BOTH bounds fire, since
-  // neither subsumes the other, and `erasures` is the non-vacuity proof for the
-  // TRANSCRIPT-level property below.
+  // A FIFTH drifts a whole offering's TIMINGS while leaving its texts alone
+  // (`retiming`), so the normalized prefix two hypotheses agree on is unchanged
+  // while the instant an empty-holdback advance anchors past MOVES.
+  // `drifted_advances` is its non-vacuity proof. This half was added for a
+  // deferral bound that no longer exists (codex round 5 on PR #95, finding 2)
+  // and is KEPT because the shape is otherwise unswept: it is also the shape
+  // this module's residual 6 records as unconstrained -- at 0.03 s per offering
+  // the drift stays inside the gap in front of the watermark, so the sweep
+  // reaches the re-timing without ever reaching the whole-run jump past it.
   //
-  // Measured on the shape below, at 512 trials: 495 tied truths, 2383
-  // observations, 277 empty holdbacks, 113 deferrals, 49 forced-arm rounds with
-  // a live suffix, 1207 contradicting rounds, 43 escapes (41 from a repeating
-  // signature, 2 from the count), 29 of which stranded at the settled instant,
-  // 17 growth deferrals, 10 shift deferrals, and 26 rounds that erased a word
-  // from the published transcript. (On the round-4 shape: 489, 2292, 268, 176,
-  // 37, 1221, 79 escapes, 12 tie strands, and neither round-5 shape reachable at
-  // all. On the shape before THAT: 491, 2736, 265, 231, 12, and no escape
-  // reachable at all.)
+  // Measured on the shape below, at 512 trials: 495 tied truths, 2482
+  // observations, 413 empty holdbacks, 141 fallback rounds (46 of them through
+  // the aggregate route), 34 forced-arm rounds with a live suffix, 1162
+  // contradicting rounds, 38 strands at the settled instant, 759 drifted
+  // advances, and 10 rounds that erased a word from the published transcript.
+  //
+  // On the DEFERRAL shape this branch carried between `6987bec` and `b3ec5c6`,
+  // same draw: 2383 observations, 277 empty holdbacks, 113 rounds that WAITED
+  // where no legal boundary existed and 43 that escaped the wait, 49 forced-arm
+  // rounds, 29 tie strands and 26 erasures -- 2.6x the published retractions
+  // for a word apiece at the settled instant. That measurement is what removed
+  // it; see the engine module's doc, "Why there is no deferral".
   //
   // The sweep draws starts from a coarse grid whose repeats make consecutive
   // words tie -- the `a=[0,0.5)/b=[0,1.0)` shape both #94 regressions are built
@@ -474,57 +470,51 @@ fn the_split_never_cuts_at_a_tied_start() {
   // `omitting_a_confirmed_tied_word_does_not_drop_provisional_words` is built
   // from.
   //
-  // Mutation proof: drop the `.max(last.start().next_up())` from
-  // `empty_holdback_watermark` and this reds on a swept over-budget
-  // zero-duration word; make the boundary non-strict (`<=` for `<` in
-  // `split_at_a_strict_boundary`) and it reds on a swept tie; let the back-off
-  // cross the prefill budget floor (`0..widened` for `floor..widened`) and it
-  // reds too. It does NOT red when the back-off arm is deleted outright: the
-  // `next_up` anchor still holds the postcondition on that path, which is why
-  // the back-off has its own falsifier in
+  // Mutation proof, every row RUN on this shape. Make the boundary non-strict
+  // (`<=` for `<` in `split_at_a_strict_boundary`) and the FIRST postcondition
+  // reds on a swept tie at trial 0. Drop the `.max(last.start().next_up())` from
+  // `empty_holdback_watermark` and it reds on a swept over-budget zero-duration
+  // word. Keep the fold but drop its `*start > last.start()` filter and it reds
+  // again, the watermark having landed on the confirmed word's own start.
+  // Return `common.len() - 1` from the final `unwrap_or` and it reds a third
+  // time. It does NOT red when the back-off arm is deleted outright: the
+  // empty-holdback anchor still holds the postcondition on that path, which is
+  // why the back-off is pinned in
   // `a_trailing_tied_run_never_confirms_itself_twice_at_the_default_count`
-  // rather than being asserted here. Restoring the widen-off-the-end fallback
-  // (`.or(Some(common.len()))` after the back-off) reds the SECOND postcondition
-  // now that the alternation half below builds a stranding round for it --
-  // `[(" Z", 1.5)]` stranded on a round that did not escape -- and with that
-  // clause's `escaped` gate removed it falls through to the `deferrals` clause
-  // at `21 deferred rounds`. It used to red only the latter, the sweep having no
-  // shape that could strand.
+  // (measured: that test alone reds, 384 of 385 still green).
   //
-  // The SECOND postcondition has its own rows. Hand
-  // `split_at_a_strict_boundary` an empty `beyond_common` at the call site --
-  // the information state it had before this repair -- and
-  // `nothing_unconfirmed_falls_below_the_watermark` reds on a swept forced-arm
-  // round; return `repeats` to a constant 2 and `forced_strands` reds at
-  // `0 rounds` instead, the state being unreachable rather than unguarded.
+  // The SECOND postcondition has two clauses and they fail differently. Drop the
+  // sparing FOLD from `empty_holdback_watermark` (return
+  // `past_the_confirmed_start`) and the TIE clause reds on a strand BEYOND the
+  // settled instant -- `[(" B", 2.5)]` below a 3 s watermark at a 2.0 s settled
+  // start. Confirm one word FEWER on the advance (`common[..split - 1]`) and the
+  // `ran_off_the_end` GATE reds instead, on an INTERIOR round that stranded at
+  // the settled instant, where the tie clause is silent by construction.
   //
-  // The LIVENESS rows: force `alternating` to `false` and `contradictions` reds
-  // at `14 rounds` against its floor of 128 -- the state the prefix-only shape
-  // could not build. Drop the sparing FOLD from `empty_holdback_watermark`
-  // (return `past_the_confirmed_start`) and the second postcondition reds on a
-  // swept round whose strand is BEYOND the settled instant; drop only its filter
-  // (fold over every start) and the FIRST postcondition reds, the watermark
-  // having landed on the confirmed word's own start.
+  // The gate reds NOTHING when mutated alone -- replace it with `true` and all
+  // 385 tests stay green -- and it is DOMINATED in the observed mutation set:
+  // every engine mutation that reaches a strand at all (no-`next_up`, no-fold,
+  // interior anchor at `end`, confirm-one-fewer) also trips the tie clause
+  // somewhere later in the sweep, so the gate is never the unique reason this
+  // test fails. It is kept because it is the clause that says WHICH arm may
+  // strand, which is the whole of residual 1's claim, and because under the
+  // confirm-one-fewer mutation it is the FIRST and most precise failure.
   //
-  // The ROUND 5 rows: restore round 4's own predicate (`DeferralWait::is_over`
-  // reading `previous.is_some_and(|before| signature.common_len <=
-  // before.common_len)`) and `shift_deferrals` reds at `0 rounds` -- that state
-  // ESCAPES under it rather than deferring, which is the finding. Drop the count
-  // from `is_over` and the counter's own cap row reds at `5 deferrals stand
-  // against a cap of 4` -- read INSIDE the loop, since a stall is only visible
-  // while it is happening. Drop the signature instead and `signature_escapes`
-  // reds at `0`. Force `retiming` to `false` and `shift_deferrals` reds at
-  // `0 rounds` again, the state being unreachable rather than unguarded.
-  //
-  // The exception's two clauses red nothing when mutated ALONE, because on a
-  // correct engine neither state they reject is reachable -- an ordinary advance
-  // never strands, and an escape never strands beyond the settled instant. Each
-  // is the sole discriminator for one engine mutation, and that is where they
-  // are pinned: drop the `escaped` gate and the widen-off-the-end fallback above
-  // stops reding the second postcondition, falling through to `deferrals`
-  // instead; drop the tie clause and the no-sparing-fold mutation above stops
-  // reding it. Neither is dead -- they are conditional on mutants, not on
-  // inputs.
+  // The SHAPE rows, each forced off and re-measured. `aggregate` off:
+  // `aggregate_fallbacks` reds at `0 of 134`, the tied-run route to the empty
+  // holdback being unreachable while the oversized-word route still supplies
+  // 134. `retiming` off: `drifted_advances` reds at `0 rounds`. `alternating`
+  // off: `contradictions` reds at `18 rounds` against its floor of 128 -- but
+  // only with `nothing_the_stream_still_says_is_erased` neutralized first, since
+  // that helper fires at trial 92 on a re-timing its `offered` membership test
+  // cannot tell from an erasure (the transcript keeps one `(" A", 0.5)` and the
+  // result offers one; the multiset difference blames the retained copy). The
+  // `alternating` shape hides that on the shipped draw. `repeats` pinned at 2 --
+  // the row that used to red `forced_strands` at `0` -- now reds NOTHING:
+  // `forced_strands` measures 32 against its floor of 4, the forced arm with a
+  // live suffix being reachable without the one-offering cadence once an
+  // agreeing round always advances. The cadence is kept anyway, being the
+  // driver's own; the row is recorded as DOMINATED rather than deleted.
   const TEXTS: [&str; 4] = [" A", " B", " C", " D"];
   // Repeated 0.0 entries are the ties; the rest keep the grid coarse enough for
   // two words to share an instant often.
@@ -570,22 +560,27 @@ fn the_split_never_cuts_at_a_tied_start() {
   /// `appended` is measured across the call rather than read off a split, so
   /// this cannot be satisfied by the same arithmetic that produced it.
   ///
-  /// IT HAS ONE EXCEPTION since the deferral was bounded (codex round 4 on
-  /// PR #95), and the exception is as narrow as the impossibility that forces
-  /// it: on a round that ESCAPED a repeating deferral, a stranded word may sit
-  /// at the last confirmed word's OWN start. There no instant serves both --
-  /// every watermark strictly past that start (which the first postcondition
-  /// requires) filters the strand, and every watermark that spares the strand
-  /// re-admits the settled word. It is this module's residual 1 reached one
-  /// round earlier than its own route. `escaped` gates it, so an ordinary
-  /// advance may not use it, and `empty_holdback_watermark`'s sparing fold is
-  /// what keeps every other overlap out of it. Returns whether the exception was
-  /// taken, which is the non-vacuity proof that the escape really strands
-  /// something somewhere.
+  /// IT HAS ONE EXCEPTION, and the exception is as narrow as the impossibility
+  /// that forces it: on a round whose split ran off the END of `common`, a
+  /// stranded word may sit at the last confirmed word's OWN start. There no
+  /// instant serves both -- every watermark strictly past that start (which the
+  /// first postcondition requires) filters the strand, and every watermark that
+  /// spares the strand re-admits the settled word. It is this module's
+  /// residual 1. `ran_off_the_end` gates it, so an INTERIOR advance may not use
+  /// it -- there the watermark is the first held word's own start and nothing
+  /// unconfirmed can be below it -- and `empty_holdback_watermark`'s sparing
+  /// fold is what keeps every other overlap out of it.
+  ///
+  /// The gate used to read "this round ESCAPED a repeating deferral" (codex
+  /// round 4 on PR #95). Removing the deferral widened WHICH rounds may take the
+  /// exception and left its SHAPE untouched: measured over these 512 trials, 38
+  /// strands where the deferral had 29, every one of them at the settled
+  /// instant. Returns whether the exception was taken, which is the non-vacuity
+  /// proof that the empty holdback really strands something somewhere.
   fn nothing_unconfirmed_falls_below_the_watermark(
     agreement: &LocalAgreement,
     appended: usize,
-    escaped: bool,
+    ran_off_the_end: bool,
     trial: u32,
     stride: usize,
   ) -> bool {
@@ -604,7 +599,7 @@ fn the_split_never_cuts_at_a_tied_start() {
       .map(WordTiming::start);
     let stranded = &below[appended..];
     assert!(
-      escaped
+      ran_off_the_end
         && stranded
           .iter()
           .all(|(_, start)| settled.is_some_and(|settled| *start <= settled)),
@@ -612,11 +607,11 @@ fn the_split_never_cuts_at_a_tied_start() {
        the {} s watermark ({below:?}) but only {appended} were confirmed this \
        round -- {stranded:?} are STRANDED: the next worded ingest filters them \
        out of both hypotheses at once and `finalize` can no longer reach them, \
-       after this round's own `finalize` already published them. Only an \
-       ESCAPE round (this one escaped: {escaped}) may strand, and only at or \
-       before the settled start {settled:?} -- with starts non-decreasing \
-       inside one hypothesis that is the exact TIE, where no watermark serves \
-       both",
+       after this round's own `finalize` already published them. Only a round \
+       whose split ran off the END of `common` (this one did: \
+       {ran_off_the_end}) may strand, and only at or before the settled start \
+       {settled:?} -- with starts non-decreasing inside one hypothesis that is \
+       the exact TIE, where no watermark serves both",
       below.len(),
       agreement.last_agreed_seconds(),
     );
@@ -658,17 +653,16 @@ fn the_split_never_cuts_at_a_tied_start() {
   /// the strand — this module's residual 1. Anything strictly below that is a
   /// word the engine erased while it could still have held it.
   ///
-  /// **What this does NOT catch, stated rather than implied.** The retraction in
-  /// round 5's finding 2 IS at the settled instant — an escape strands exactly
-  /// the tie — so it is identical in SHAPE to the residual-1 retraction this
-  /// permits, and no property over the transcript alone can separate them. What
-  /// separates them is whether the engine had already waited on that state,
-  /// which is a fact about the DEFERRAL rather than about the transcript, and
-  /// `DeferralSignature` is where it is decided
-  /// (`a_shifted_terminal_timestamp_is_a_new_wait_rather_than_a_repeat`). What
-  /// this DOES buy is the bound: retraction is confined to that one instant on
-  /// every round of every shape the sweep drives, and counted so the confinement
-  /// is not vacuous.
+  /// **What this does NOT catch, stated rather than implied.** Every retraction
+  /// an empty-holdback advance can cause is AT the settled instant, so all of
+  /// them are identical in SHAPE to the residual-1 retraction this permits, and
+  /// no property over the transcript alone can separate a necessary one from an
+  /// avoidable one. What this DOES buy is the bound: retraction is confined to
+  /// that one instant on every round of every shape the sweep drives, and
+  /// COUNTED so the confinement is not vacuous. The count is also the number
+  /// that removed the deferral — 10 erasures here against the deferral's 26 on
+  /// the identical draw (see the engine module's doc, "Why there is no
+  /// deferral").
   ///
   /// **It is DOMINATED, and by which assertion.** Every transcript
   /// `LocalAgreement::finalize` publishes is a subset of
@@ -741,15 +735,12 @@ fn the_split_never_cuts_at_a_tied_start() {
   let mut checked = 0u32;
   let mut empty_holdbacks = 0u32;
   let mut tied_truths = 0u32;
-  let mut deferrals = 0u32;
   let mut forced_strands = 0u32;
   let mut contradictions = 0u32;
-  let mut escapes = 0u32;
+  let mut fallbacks = 0u32;
+  let mut aggregate_fallbacks = 0u32;
   let mut tie_strands = 0u32;
-  let mut growth_deferrals = 0u32;
-  let mut shift_deferrals = 0u32;
-  let mut signature_escapes = 0u32;
-  let mut counted_escapes = 0u32;
+  let mut drifted_advances = 0u32;
   let mut erasures = 0u32;
 
   for trial in 0..512u32 {
@@ -768,8 +759,8 @@ fn the_split_never_cuts_at_a_tied_start() {
     // floor. `AGGREGATE_TOKENS` is sized so any THREE such words exceed
     // `MAX_HOLDBACK_PREFILL_TOKENS` and any two fit, which puts the floor two
     // words from the end of every `common` and makes a three-word tie at the
-    // tail the trigger. That round DEFERS; `deferrals` below is its non-vacuity
-    // proof.
+    // tail the trigger. That round runs the split off the END of `common`;
+    // `fallbacks` below is its non-vacuity proof.
     const AGGREGATE_TOKENS: usize = MAX_HOLDBACK_PREFILL_TOKENS / 3 + 1;
     let aggregate = next() % 4 == 0;
     let over_budget = if !aggregate && next() % 3 == 0 {
@@ -835,13 +826,13 @@ fn the_split_never_cuts_at_a_tied_start() {
         // ALTERNATION, the shape codex round 4 on PR #95 needed and neither
         // half above could build. Growing prefixes and re-offered strides make
         // every hypothesis a PREFIX of the next, so `common` grows on every
-        // round and a deferral is always relieved by waiting -- which is
-        // precisely the assumption the deferral's own liveness argument made.
+        // round and the fallback arm is left almost as soon as it is entered.
         // Rewriting the LAST offered word on every other offering instead makes
         // two consecutive hypotheses CONTRADICT each other there, which pins
         // `common` at everything in front of it for as long as the rewriting
         // continues. `contradictions` below is this half's non-vacuity proof,
-        // and `escapes` is the proof that the bound actually fires.
+        // and `fallbacks` is the proof that the arm it pins the engine on is
+        // actually taken.
         let mut offered = offered.clone();
         if alternating
           && offering % 2 == 1
@@ -855,22 +846,23 @@ fn the_split_never_cuts_at_a_tied_start() {
             last.probability(),
           );
         }
-        // THE SHIFT, the shape codex round 5 on PR #95 (finding 2) needed and
-        // no half above could build. `alternating` rewrites the last word's
-        // TEXT, which pins `common` in FRONT of it; this rewrites TIMINGS and
-        // leaves every text alone, so the words stay inside `common` and the
-        // NORMALIZED PREFIX two consecutive hypotheses agree on is unchanged
-        // while the instant an escape would have to anchor past MOVES. That is
-        // the exact pair of deferrals a `common.len()` record cannot tell apart.
+        // THE SHIFT. `alternating` rewrites the last word's TEXT, which pins
+        // `common` in FRONT of it; this rewrites TIMINGS and leaves every text
+        // alone, so the words stay inside `common` and the NORMALIZED PREFIX
+        // two consecutive hypotheses agree on is unchanged while the instant an
+        // empty-holdback advance anchors past MOVES. Added for codex round 5's
+        // finding 2 on PR #95 and kept past the deferral it measured: it is the
+        // only re-timing this sweep drives, and this module's residual 6 is
+        // about the whole-run re-timing it does NOT reach.
         //
         // The WHOLE offering drifts, by a step that only ever grows. Two weaker
         // shapes were tried and are wrong: shifting the last word alone breaks
-        // it out of the trailing tie and OPENS the boundary the deferral is
-        // waiting for, relieving the state instead of building it; shifting the
-        // trailing tied run alternately moves those words BACK again on the next
-        // offering, which is this module's residual 3 (drift wider than the gap
-        // in front of the watermark) and loses words for a reason that has
-        // nothing to do with the bound. Drifting everything monotonically keeps
+        // it out of the trailing tie and OPENS a legal boundary above the floor,
+        // relieving the state instead of building it; shifting the trailing tied
+        // run alternately moves those words BACK again on the next offering,
+        // which is this module's residual 3 (drift wider than the gap in front
+        // of the watermark) and loses words for a reason that has nothing to do
+        // with the split. Drifting everything monotonically keeps
         // every start non-decreasing across offerings as well as within one, so
         // the only thing that moves is the instant itself.
         // OFF the 0.5 grid the starts are drawn from, deliberately: a drift of
@@ -903,32 +895,16 @@ fn the_split_never_cuts_at_a_tied_start() {
           .map(|word| (word.word().to_string(), word.start()))
           .collect();
         let before = agreement.confirmed_words_slice().len();
-        // Captured BEFORE the call, since `ingest` overwrites all three: they
-        // are the inputs the escape decision is actually made from.
-        let deferred_before = agreement.deferred;
-        let taken_before = agreement.deferrals_since_advance;
+        // Captured BEFORE the call, since `ingest` overwrites it: it is one of
+        // the inputs the split decision is actually made from.
         let confirmed_last_before = agreement
           .confirmed_words_slice()
           .last()
           .map(WordTiming::start);
-        agreement.ingest_streamed(result_with_words(offered));
-        // Read straight off the engine: a deferral returns
-        // `AwaitingAgreement`, which a disagreement returns too, so the outcome
-        // cannot tell them apart.
-        deferrals += u32::from(agreement.deferred.is_some());
-        // THE TWO SHAPES ROUND 5's FINDINGS ARE, counted so a repair cannot be
-        // reported as swept without the sweep having built them. GROWTH is
-        // finding 1: consecutive deferrals whose `common` is LONGER every round,
-        // which round 4's length predicate never escapes. A SHIFT is finding 2:
-        // consecutive deferrals of EQUAL length whose terminal instant moved,
-        // which round 4's length predicate escapes although the wait it measured
-        // was a different one.
-        if let (Some(before), Some(now)) = (deferred_before, agreement.deferred) {
-          growth_deferrals += u32::from(now.common_len > before.common_len);
-          shift_deferrals += u32::from(
-            now.common_len == before.common_len && now.terminal_start != before.terminal_start,
-          );
-        }
+        let outcome = agreement.ingest_streamed(result_with_words(offered));
+        // The RE-TIMED half's own non-vacuity: a drifted offering must actually
+        // reach the advance path, not merely be constructed and disagreed with.
+        drifted_advances += u32::from(drift > 0.0 && outcome.is_advanced());
         forced_strands += u32::from(forced_arm_with_a_live_suffix(&agreement));
         let common_len = common_prefix_len(&agreement);
         contradictions += u32::from(
@@ -936,46 +912,41 @@ fn the_split_never_cuts_at_a_tied_start() {
             && common_len < agreement.prev_words.len()
             && common_len < agreement.hypothesis_words.len(),
         );
-        // EXACT, rather than inferred from the outcome: re-ask
-        // `split_at_a_strict_boundary` what it would have answered with NO wait
-        // behind it at all, from the same inputs the engine handed it. An escape
-        // is a round that would have deferred and did not.
-        let would_defer = common_len >= agreement.agreement_count_needed()
-          && matches!(
-            split_at_a_strict_boundary(
-              &agreement.hypothesis_words[..common_len],
-              &agreement.hypothesis_words[common_len..],
-              common_len - agreement.agreement_count_needed(),
-              confirmed_last_before,
-              DeferralWait {
-                previous: None,
-                taken: 0,
-              },
-            ),
-            SplitDecision::Defer(_)
-          );
-        let escaped = would_defer && agreement.deferred.is_none();
-        escapes += u32::from(escaped);
-        // WHICH bound authorized it. The signature ends a wait that repeated;
-        // the count ends one that never does. Both are counted so neither can be
-        // reported as firing on the strength of the other.
-        if escaped {
-          if taken_before >= MAX_CONSECUTIVE_DEFERRALS {
-            counted_escapes += 1;
-          } else {
-            signature_escapes += 1;
-          }
-        }
-        assert!(
-          taken_before <= MAX_CONSECUTIVE_DEFERRALS,
-          "trial {trial}, stride {stride}: {taken_before} deferrals stand \
-           against a cap of {MAX_CONSECUTIVE_DEFERRALS} -- the counter may not \
-           pass the bound it is, since a round only defers while it is below it",
+        // EXACT, rather than inferred from the outcome or read off the
+        // engine's own holdback: re-ask `split_at_a_strict_boundary` WHERE it
+        // put this round's split, from the same inputs the engine handed it.
+        // `common.len()` is arm 3 -- the FALLBACK, the one position that leaves
+        // the holdback empty, and so the only one that can strand anything.
+        //
+        // Reading `last_agreed_words_slice().is_empty()` instead would be
+        // LOOSER in two directions and both of them weaken the gate below: it is
+        // true on a round that did not advance at all, and true on a round that
+        // inherited an empty holdback from an earlier one. This asks the
+        // function.
+        let ran_off_the_end = common_len >= agreement.agreement_count_needed()
+          && split_at_a_strict_boundary(
+            &agreement.hypothesis_words[..common_len],
+            common_len - agreement.agreement_count_needed(),
+            confirmed_last_before,
+          ) == common_len;
+        fallbacks += u32::from(ran_off_the_end);
+        // WHICH route emptied the holdback. A fallback round in which NO word
+        // of `common` is over budget on its own is the AGGREGATE route: the
+        // floor landed strictly inside a tied run whose words exceed the budget
+        // only between them, every boundary at or above it tied, and split 0 --
+        // the boundary a tied run always leaves legal -- was below the floor.
+        // That is the shape `add_word_timestamps` produces from an all-zero
+        // alignment matrix, and the one the oversized-word half cannot build.
+        aggregate_fallbacks += u32::from(
+          ran_off_the_end
+            && agreement.hypothesis_words[..common_len]
+              .iter()
+              .all(|word| word.tokens_slice().len() <= MAX_HOLDBACK_PREFILL_TOKENS),
         );
         tie_strands += u32::from(nothing_unconfirmed_falls_below_the_watermark(
           &agreement,
           agreement.confirmed_words_slice().len() - before,
-          escaped,
+          ran_off_the_end,
           trial,
           stride,
         ));
@@ -1018,9 +989,18 @@ fn the_split_never_cuts_at_a_tied_start() {
      observations",
   );
   assert!(
-    deferrals > 64,
-    "and the DEFERRED state must be reached, which is the state the \
-     one-oversized-word shape could not build: {deferrals} deferred rounds",
+    fallbacks > 64,
+    "and arm 3 -- the FALLBACK, where no legal boundary sits at or above the \
+     budget floor and the split runs off the end -- must actually be taken, \
+     since it is the only arm that can strand anything: {fallbacks} rounds",
+  );
+  assert!(
+    aggregate_fallbacks > 16,
+    "and it must be reached through the AGGREGATE route -- a tied run whose \
+     tokens exceed the budget between them, with no single word over it, which \
+     is the shape `add_word_timestamps` produces from an all-zero alignment \
+     matrix and the one the oversized-word half cannot build: \
+     {aggregate_fallbacks} of {fallbacks} fallback rounds",
   );
   assert!(
     forced_strands > 4,
@@ -1032,39 +1012,22 @@ fn the_split_never_cuts_at_a_tied_start() {
     contradictions > 128,
     "and two consecutive hypotheses must actually CONTRADICT each other past \
      `common` -- growing prefixes alone make every hypothesis a prefix of the \
-     next, which is the assumption the deferral's liveness argument made: \
+     next, which relieves the fallback arm before it can be read: \
      {contradictions} rounds",
-  );
-  assert!(
-    escapes > 8,
-    "and the deferral's BOUND must actually fire -- a repeating deferral that \
-     takes the empty holdback instead of waiting again: {escapes} rounds",
   );
   assert!(
     tie_strands > 0,
     "and the second postcondition's one exception must be reached rather than \
-     merely written down -- an escape that strands at the settled instant, \
-     which is the only strand any watermark leaves: {tie_strands} rounds",
+     merely written down -- an empty-holdback advance that strands at the \
+     settled instant, which is the only strand any watermark leaves: \
+     {tie_strands} rounds",
   );
   assert!(
-    growth_deferrals > 0,
-    "and a deferral must be reached whose `common` GREW since the deferral \
-     before it -- codex round 5's finding 1, the shape a `common.len()` bound \
-     never escapes because the length rises every round: {growth_deferrals} \
+    drifted_advances > 0,
+    "and the RE-TIMED half must actually reach the advance path rather than \
+     only being constructed -- a whole offering whose instants drifted while \
+     its texts did not, agreed with and advanced over: {drifted_advances} \
      rounds",
-  );
-  assert!(
-    shift_deferrals > 0,
-    "and a deferral must be reached whose `common` is the same LENGTH as the \
-     one before it while its terminal instant MOVED -- codex round 5's finding \
-     2, the pair of different waits a `common.len()` bound cannot tell apart: \
-     {shift_deferrals} rounds",
-  );
-  assert!(
-    signature_escapes > 0 && counted_escapes > 0,
-    "and BOTH bounds must actually fire, since neither subsumes the other: \
-     {signature_escapes} escapes from a repeating signature, {counted_escapes} \
-     from the {MAX_CONSECUTIVE_DEFERRALS}-round count",
   );
   assert!(
     erasures > 0,
@@ -1173,23 +1136,27 @@ fn a_trailing_tied_run_never_confirms_itself_twice_at_the_default_count() {
 }
 
 #[test]
-fn an_over_budget_tied_run_defers_rather_than_stranding_its_suffix() {
+fn an_over_budget_tied_run_strands_its_suffix_at_the_settled_instant() {
+  // CHARACTERIZATION of Rule W's fallback arm, not a property that holds. This
+  // pins what the engine does TODAY; the CORRECT answer is in the failure
+  // messages below, so the day the trade is revisited this test goes red and
+  // hands the next author the expectation.
+  //
   // #94, codex round 3 on PR #95 -- the OTHER way the holdback empties, and the
   // one Rule W's back-off cannot reach. The back-off may not cross the prefill
   // budget FLOOR, and a tied run that is itself over budget puts that floor
   // strictly inside the run: every boundary at or above it ties, split 0 -- the
   // one boundary a tied run always leaves legal -- is below it, and the forward
-  // search and the back-off therefore BOTH fail. The old fallback confirmed the
-  // whole run and emptied the holdback, which is exactly what
-  // `a_trailing_tied_run_never_confirms_itself_twice_at_the_default_count`
-  // refuses one state earlier.
+  // search and the back-off therefore BOTH fail. The split runs off the end,
+  // confirming the whole run and emptying the holdback.
   //
-  // What the empty holdback costs here is a DELETION rather than a
-  // re-confirmation: the watermark anchors at `start.next_up()`, strictly past
+  // WHAT THAT COSTS: the watermark anchors at `start.next_up()`, strictly past
   // the run's instant, so any word the NEWER hypothesis produced at that same
   // instant beyond `common` -- words nothing ever confirmed -- fails the offered
   // filter on the next worded ingest, drops out of both hypotheses at once, and
-  // `finalize` has nothing left to recover them from.
+  // `finalize` has nothing left to recover them from. This round's own
+  // `finalize` has ALREADY published them, so it is a RETRACTION of transcript
+  // and `confirmed_words`' append-only guarantee cannot see it.
   //
   // It takes no over-budget WORD, which is what separates it from
   // `a_zero_duration_word_at_an_empty_holdback_is_not_re_confirmed`: 113
@@ -1201,44 +1168,16 @@ fn an_over_budget_tied_run_defers_rather_than_stranding_its_suffix() {
   // same boundary time. Measured on that stack: 130 words, all at 0.0, all
   // zero-duration, one token each.
   //
-  // The repair is to DEFER: no legal boundary at or above the floor is a
-  // non-advancing round, not a licence to widen off the end. The watermark stays
-  // put, so nothing is filtered away; the holdback stays put, so the next stride
-  // still prefills what it prefilled before; and TAIL growth relieves it, the
-  // same relief the back-off relies on. `finalize` on a deferred round emits the
-  // latest hypothesis's own post-watermark words, which is byte-identical to
-  // what the fallback produced (`confirmed ++ common ++ hypothesis-beyond-common`
-  // either way) -- the divergence is entirely in what LATER ingests can still
-  // see.
-  //
-  // This wait is the FIRST one, and TAIL growth really does relieve it here:
-  // both rounds after the deferral grow `common`, so neither bound in
-  // `split_at_a_strict_boundary`'s arm 3 fires -- the signature never repeats
-  // and two deferrals is under `MAX_CONSECUTIVE_DEFERRALS`. RELIEF COSTS TWO
-  // ROUNDS here, one for the anchor to appear in a hypothesis and one for it to
-  // be corroborated into `common`, which is where that constant's number comes
-  // from. What happens when growth does NOT arrive is
-  // `a_tied_run_above_the_budget_floor_escapes_the_deferral_instead_of_stalling`;
-  // what happens when it arrives and never helps is
-  // `a_growing_tied_prefix_escapes_after_a_bounded_number_of_deferrals`.
-  //
-  // Mutation proof, every row run: restore the widen-off-the-end fallback
-  // (`.or(Some(common.len()))` after the back-off) and the deferral assertion
-  // below reds reading `(113, 0, 2.0000002, 0, 2)`; with that assertion
-  // neutralized the two FACES red next, the streaming one confirming the 113-word
-  // run against an empty holdback and the finalized one reading
-  // `[... "w112", "y"]` with `" x0"`/`" x1"` gone. Defer whenever the budget
-  // floor bites at all (`if floor > 0 { return None }`) and the deadlock clause
-  // below reds -- along with
-  // `an_over_budget_holdback_is_capped_rather_than_silently_truncated`, which is
-  // the ordinary budget path this may not swallow. Make the escape
-  // unconditional (`DeferralWait::is_over` returning `true`) and the deferral
-  // assertion reds, the first wait taken away; never clear the record
-  // (`self.deferred = deferred.or(self.deferred)`) and it reds the same way --
-  // the advance's own Swift shape replaced by the hypothesis. Make `word` emit
-  // two tokens and the non-vacuity row reds at `(113, 226, false)`.
-  //
-  // The `finalize` half has its own two rows at its own assertions below.
+  // WHY IT IS ACCEPTED. To a timestamp filter a genuinely new word at the run's
+  // instant and a re-offer of the run's own last word are the same value, which
+  // is this issue's impossibility result; every watermark that spares the strand
+  // re-admits the settled word, which is #94. Between `6987bec` and `b3ec5c6`
+  // this round DEFERRED instead, waiting for `common` to grow. Measured over the
+  // accumulated counterexample suite and the 512-trial sweep, that wait cost 26
+  // words erased from the published transcript where this fallback costs 10, and
+  // its liveness bound was defeated by `At(0)`; see the engine module's doc,
+  // "Why there is no deferral". So the loss below is this module's residual 1,
+  // reached on the shape the pipeline can actually produce.
   const RUN: usize = MAX_HOLDBACK_PREFILL_TOKENS + 1;
   let tied: Vec<WordTiming> = (0..RUN)
     .map(|index| word(&format!(" w{index:03}"), 2.0, 2.0))
@@ -1271,105 +1210,112 @@ fn an_over_budget_tied_run_defers_rather_than_stranding_its_suffix() {
     "non-vacuous: the DEFAULT count, the only one the driver reaches",
   );
   agreement.ingest_streamed(older());
-  agreement.ingest_streamed(newer());
+  assert!(
+    agreement.ingest_streamed(newer()).is_advanced(),
+    "the agreeing round ADVANCES: an agreeing round always does",
+  );
   assert_eq!(
     (
       confirmed_texts(&agreement).len(),
       held_back_texts(&agreement).len(),
       agreement.last_agreed_seconds(),
       // The consequence, read through the filter that consumes the watermark:
-      // every word the newer hypothesis produced at the run's instant is still
-      // OFFERABLE. Folded into this assertion rather than standing beside it,
-      // since it is a function of the watermark above and could never red first.
+      // nothing the newer hypothesis produced at the run's instant is offerable
+      // any more -- the whole run AND the two words beyond it. Folded into this
+      // assertion rather than standing beside it, since it is a function of the
+      // watermark above and could never red first.
       LocalAgreement::watermark_filtered(&newer(), agreement.last_agreed_seconds()).len(),
       // The hypotheses AGREED, so Swift KEEPS the result (`:408-410`,
       // `!skipAppend`) and it reaches the `finalize` merge as a segment source.
-      // Dropping it here reds nothing else in this suite -- the merged TEXT is
-      // the confirmed word list either way -- so the keep is pinned here.
       agreement.results_slice().len(),
     ),
-    (0, 0, 0.0, RUN + 2, 2),
-    "no legal boundary at or above the budget floor is a DEFERRED round: \
-     nothing is confirmed, the holdback is untouched, the watermark does not \
-     move, so nothing at the run's instant is filtered away -- and the agreeing \
-     result is kept",
+    (RUN, 0, 2.0f32.next_up(), 0, 2),
+    "CHARACTERIZATION (https://github.com/findit-studio/coremlit/issues/94): no \
+     legal boundary sits at or above the budget floor, so the split runs off \
+     the END of `common` -- the whole 113-word run is confirmed, the holdback \
+     is empty, and the watermark anchors strictly past the run's instant. The \
+     CORRECT answer holds the run back and keeps \" x0\"/\" x1\" offerable; no \
+     watermark can do both, since one strictly past the run's start filters \
+     them and one at or below it re-admits the run's own last word. If the \
+     trade was revisited, assert (0, 0, 0.0, RUN + 2, 2) here and re-check the \
+     retraction below.",
   );
 
-  // THE SECOND CLAUSE OF THE REPAIR, on its own. "Do not advance" alone loses
-  // the transcript: `finalize`'s Swift shape is `confirmed ++ last_agreed_words
-  // ++ differentSuffix(prev, hypothesis)`, and on a deferred round the holdback
-  // is an EARLIER agreement's -- here it does not exist at all -- so the sum
-  // drops every word the two hypotheses agreed on. A deferred round therefore
-  // finalizes from the latest hypothesis instead (`deferred`).
-  //
-  // Mutation proof for that clause alone: drop `|| self.deferred.is_some()` from
-  // `finalize`'s guard and this reads `" x0 x1"` -- the whole 113-word run gone,
-  // exactly the `commonPrefix.count` leading words the Swift expression cannot
-  // account for once the holdback is not the round's own.
-  let deferred_transcript = agreement
+  // FINALIZE POINT ONE. The retraction is only visible across two of these, and
+  // this is the one that PUBLISHES the words: the round confirmed `common` and
+  // `find_longest_different_suffix` adds `[" x0", " x1"]` on top.
+  let published = agreement
     .clone()
     .finalize(&crate::audio::whisper::options::DecodingOptions::new())
     .text()
     .to_string();
   assert_eq!(
-    deferred_transcript.split_whitespace().count(),
+    published.split_whitespace().count(),
     RUN + 2,
-    "a stream that ENDS on a deferred round still finalizes every word it \
-     produced: {deferred_transcript:?}",
+    "a stream that ENDS on this round publishes every word it produced, the \
+     two at the settled instant included: {published:?}",
   );
 
-  // And the same with the two hypotheses IDENTICAL, where the differing suffix
-  // is EMPTY as well -- the shape a plain non-advancing policy finalizes as `""`.
-  let mut agreed_twice = agreement.clone();
-  agreed_twice.ingest_streamed(newer());
-  let identical_transcript = agreed_twice
+  // FINALIZE POINT TWO, one hypothesis later. `" x0"` and `" x1"` are below the
+  // watermark by now, so the filter drops them from the hypothesis AND from the
+  // re-read previous result -- both sides at once. The grown tail carries TWO
+  // words starting strictly later, which is what the default count needs to
+  // agree over anything again.
+  let grown = || {
+    result_with_words(
+      [
+        tied.clone(),
+        suffix(),
+        vec![word(" y", 3.0, 4.0), word(" z", 4.0, 5.0)],
+      ]
+      .concat(),
+    )
+  };
+  agreement.ingest_streamed(grown());
+  let retracted = agreement
+    .clone()
     .finalize(&crate::audio::whisper::options::DecodingOptions::new())
     .text()
     .to_string();
   assert_eq!(
-    identical_transcript.split_whitespace().count(),
-    RUN + 2,
-    "with nothing confirmed, nothing held and no differing suffix either, the \
-     Swift shape would finalize the empty string: {identical_transcript:?}",
+    (
+      retracted.split_whitespace().count(),
+      retracted
+        .split_whitespace()
+        .rev()
+        .take(3)
+        .collect::<Vec<_>>(),
+    ),
+    (RUN + 2, vec!["z", "y", "w112"]),
+    "CHARACTERIZATION, and a RETRACTION -- this module's non-preferred \
+     direction (https://github.com/findit-studio/coremlit/issues/94). The \
+     CORRECT answer is {} words with [\"x0\", \"x1\"] still between \"w112\" \
+     and \"y\": both hypotheses produced them, nothing contradicted them, and \
+     the round before this one already published them. They are gone because \
+     the empty holdback's watermark passed their instant. Accepted as \
+     residual 1 -- to a timestamp filter they are indistinguishable from a \
+     re-offer of the run's own last word, which is what #94 is. If that was \
+     revisited, assert {} words here and delete this message. Transcript: \
+     {retracted:?}",
+    RUN + 4,
+    RUN + 4,
   );
 
-  // Tail growth is what relieves the deferral: one word starting strictly later
-  // opens a legal boundary above the floor, and it takes two ingests for that
-  // word to reach `common`.
-  let grown = || result_with_words([tied.clone(), suffix(), vec![word(" y", 3.0, 4.0)]].concat());
-  agreement.ingest_streamed(grown());
+  // AND IT IS NOT A STALL: the grown tail reaches `common` on the next ingest
+  // and the stream keeps moving.
   assert!(
     agreement.ingest_streamed(grown()).is_advanced(),
-    "and the deferral is not a deadlock: the grown tail opens a boundary above \
-     the floor and the round advances",
+    "the grown tail reaches `common` and the round advances",
   );
-
-  let mut expected: Vec<String> = (0..RUN).map(|index| format!(" w{index:03}")).collect();
-  expected.push(" x0".to_string());
-  expected.push(" x1".to_string());
   assert_eq!(
-    (confirmed_texts(&agreement), held_back_texts(&agreement)),
     (
-      expected.iter().map(String::as_str).collect::<Vec<_>>(),
-      vec![" y"],
+      confirmed_texts(&agreement).len(),
+      held_back_texts(&agreement),
+      agreement.last_agreed_seconds(),
     ),
-    "the STREAMING face: the whole tied run and both words at its instant are \
-     confirmed exactly once, and the word that opened the boundary is held",
-  );
-
-  let text = agreement
-    .finalize(&crate::audio::whisper::options::DecodingOptions::new())
-    .text()
-    .to_string();
-  expected.push(" y".to_string());
-  assert_eq!(
-    text.split_whitespace().collect::<Vec<_>>(),
-    expected
-      .iter()
-      .map(|word| word.trim_start())
-      .collect::<Vec<_>>(),
-    "the FINALIZED face: every word the stream produced, each exactly once and \
-     in order",
+    (RUN, vec![" y", " z"], 3.0),
+    "and the tail is held back under an ordinary interior split, with the run \
+     confirmed exactly once",
   );
 }
 
@@ -2720,11 +2666,13 @@ fn a_holdback_word_the_prefill_cannot_carry_is_confirmed_rather_than_held() {
   // `self.last_agreed_words.is_empty()` arm DEFER (`0` in place of
   // `widened.len()`) and both words wait for an anchor that can never arrive.
   //
-  // This is also what bounds the SUFFIX guard the forced arm grew in codex
-  // round 3 (see `a_forced_empty_holdback_defers_rather_than_retracting_its_
-  // suffix`): make that arm defer unconditionally instead of only where it would
-  // strand something, and the `is_advanced` assertion below reds. Nothing lies
-  // beyond `common` here, so deferring waits forever -- round 7's finding again.
+  // This is also the state that says the forced arm may not simply refuse to
+  // advance (see
+  // `a_forced_empty_holdback_retracts_its_suffix_at_the_settled_instant`, the
+  // round where refusing WOULD have saved a word): make that arm return `0`
+  // instead of `common.len()` and the `is_advanced` assertion below reds.
+  // Nothing lies beyond `common` here, so there is no anchor a wait could ever
+  // be waiting for -- round 7's finding again.
   let a = || word_of_tokens(" A", 1.0, 2.0, 1);
   let huge = || word_of_tokens(" H", 2.0, 3.0, MAX_HOLDBACK_PREFILL_TOKENS + 1);
   assert!(
@@ -3060,13 +3008,13 @@ fn a_zero_duration_word_at_an_empty_holdback_is_not_re_confirmed() {
   // needs a non-default `agreement_count_needed` (here 1) and a zero-duration
   // word; `add_word_timestamps` never emits a 112-token word.
   //
-  // The forced arm still ADVANCES here, and this test is half of why it may:
-  // both hypotheses are `[" A", " Z"]`, so nothing lies beyond `common` for the
-  // advance to strand, and there is no anchor a deferral could ever wait for.
-  // The word this costs -- `" B"` below -- arrives one hypothesis LATER, which
-  // is outside what any split can see. Where the strand IS already visible the
-  // arm defers instead
-  // (`a_forced_empty_holdback_defers_rather_than_retracting_its_suffix`).
+  // The forced arm ADVANCES here with nothing to lose: both hypotheses are
+  // `[" A", " Z"]`, so nothing lies beyond `common` for the advance to strand,
+  // and there is no anchor a wait could ever be waiting for. The word this
+  // costs -- `" B"` below -- arrives one hypothesis LATER, which is outside
+  // what any split can see. Where the strand IS already visible the same
+  // advance retracts it, which is the characterization in
+  // `a_forced_empty_holdback_retracts_its_suffix_at_the_settled_instant`.
   //
   // Mutation proof: drop the `.max(last.start().next_up())` from `ingest`'s
   // empty-holdback watermark and this reds with `" Z"` confirmed twice.
@@ -3136,65 +3084,60 @@ fn a_zero_duration_word_at_an_empty_holdback_is_not_re_confirmed() {
   );
 }
 #[test]
-fn a_forced_empty_holdback_defers_rather_than_retracting_its_suffix() {
-  // #94, codex round 3 on PR #95, SECOND FINDING -- the forced arm of
-  // `split_at_a_strict_boundary`, which the tied-run deferral deliberately left
-  // alone. Where the budget FLOOR itself reaches `common.len()` the split runs
-  // off the end unconditionally, and it does so WITHOUT LOOKING at what the
-  // newer hypothesis produced beyond `common`: the helper was handed `common`,
-  // `requested` and the last confirmed start, and nothing else.
+fn a_forced_empty_holdback_retracts_its_suffix_at_the_settled_instant() {
+  // CHARACTERIZATION of Rule W's FORCED arm, not a property that holds. This
+  // pins what the engine does TODAY; the CORRECT answer is in the failure
+  // messages below.
   //
-  // So the advance empties the holdback, anchors the watermark at
-  // `start.next_up()` -- strictly past the run's instant -- and every word the
-  // newer hypothesis produced AT that instant beyond `common` fails the offered
-  // filter from then on. That is not a deletion of something never emitted: the
-  // round's OWN `finalize` already emitted it, through
-  // `differentSuffix(prev, hypothesis)`. What the next hypothesis costs is a
-  // RETRACTION of published transcript, and `confirmed_words`' monotonicity --
-  // the #89 property -- cannot see it, because the retracted word was never
-  // confirmed.
+  // #94, codex round 3 on PR #95, SECOND FINDING. Where the budget FLOOR itself
+  // reaches `common.len()` the split runs off the end unconditionally: it takes
+  // a LAST word whose own tokens exceed `MAX_HOLDBACK_PREFILL_TOKENS`, since
+  // nothing else runs `budgeted_split`'s loop off the end, and there is no
+  // holdback the prefill could carry at any split. Confirming that word is round
+  // 7 finding 2's own repair -- leaving it held is the data loss that finding
+  // recorded.
   //
-  // It needs no unusual count: " H" alone exceeds `MAX_HOLDBACK_PREFILL_TOKENS`,
-  // which is the only thing that drives `budgeted_split`'s loop off the end, and
-  // that is the whole of the forced arm's condition (see
-  // `a_holdback_word_the_prefill_cannot_carry_is_confirmed_rather_than_held`,
-  // the state this rule may NOT swallow: there the budget forces the empty
-  // holdback and nothing lies beyond `common`, so deferring would wait for an
-  // anchor that can never arrive).
+  // WHAT THAT COSTS: the advance empties the holdback, anchors the watermark at
+  // `start.next_up()` -- strictly past `" H"`'s instant -- and `" X"`, which the
+  // newer hypothesis produced AT that instant beyond `common`, fails the offered
+  // filter from then on. That is not a deletion of something never emitted: this
+  // round's OWN `finalize` emits it, through `differentSuffix(prev,
+  // hypothesis)`. What the next hypothesis costs is a RETRACTION of published
+  // transcript, and `confirmed_words`' monotonicity -- the #89 property -- cannot
+  // see it, because the retracted word was never confirmed.
   //
-  // The repair is the same one the tied run got, conditioned on the strand
-  // actually existing: `split_at_a_strict_boundary` now takes the hypothesis's
-  // post-`common` words and defers the forced advance exactly while one of them
-  // starts before the watermark that advance would set.
+  // WHY IT IS ACCEPTED. Deferring here is what this branch tried between
+  // `6987bec` and `b3ec5c6`: the round waited while a word beyond `common` would
+  // be stranded, under two bounds that ended the wait. Measured over the
+  // accumulated counterexample suite and the 512-trial sweep, the wait erased 26
+  // words from the published transcript where this arm erases 10, and its count
+  // bound was defeated by `At(0)` -- see the engine module's doc, "Why there is
+  // no deferral". The narrower repair is kept: `empty_holdback_watermark`'s
+  // sparing fold lowers the anchor to spare every word beyond `common` that
+  // starts strictly later
+  // (`a_word_starting_strictly_later_lowers_the_watermark_instead_of_being_stranded`),
+  // so what is lost is exactly the TIE -- residual 1, the one instant no
+  // watermark serves.
   //
-  // This wait is the FIRST one, and it is the one worth taking: what ENDS it are
-  // the two bounds in `split_at_a_strict_boundary`'s arm 3, whose own falsifiers
-  // are `an_alternating_suffix_escapes_the_deferral_instead_of_stalling`,
-  // `a_tied_run_above_the_budget_floor_escapes_the_deferral_instead_of_stalling`
-  // and `a_growing_tied_prefix_escapes_after_a_bounded_number_of_deferrals`. The
-  // two rounds after the deferral here GROW `common` and the anchor arrives, so
-  // neither bound fires -- which is exactly what they must not do, and the two
-  // rounds relief takes here are what sizes `MAX_CONSECUTIVE_DEFERRALS`.
+  // The state this rule may NOT swallow is
+  // `a_holdback_word_the_prefill_cannot_carry_is_confirmed_rather_than_held`:
+  // there the budget forces the empty holdback and nothing lies beyond `common`,
+  // so there is nothing to lose and nothing to wait for either.
   //
-  // Mutation proof, every row run: pass an empty `beyond_common` at the call
-  // site (the pre-repair information state) and the deferred-state row reds
-  // reading `([" A", " H"], [], 1.0000001)`; with that row neutralized the
-  // RETRACTION row reds at `" A H Y"`, `" X"` gone from a transcript that had
-  // already published it. Defer the forced arm unconditionally (drop the
-  // `beyond_common` test, keeping the bound) and
-  // `a_holdback_word_the_prefill_cannot_carry_is_confirmed_rather_than_held`
-  // reds -- the anchor that can never arrive, and the bound does not rescue it,
-  // since that shape never defers twice. Make the escape unconditional
-  // (`DeferralWait::is_over` returning `true`) and this test's deferred-state row
-  // reds instead, and so does never clearing the record
-  // (`self.deferred = deferred.or(self.deferred)`). Drop
-  // `|| self.deferred.is_some()` from `finalize`'s guard and the
-  // IMMEDIATE row reds at `" X"`, the deferred round's own transcript reduced to
-  // the differing suffix.
+  // Mutation proof, every row run: drop `.max(last.start().next_up())` from
+  // `empty_holdback_watermark` and the state row reds at a 1.0 watermark, `" H"`
+  // re-admissible. Drop the sparing FOLD and this stays green while
+  // `a_word_starting_strictly_later_lowers_the_watermark_instead_of_being_stranded`
+  // reds -- the fold cannot help an exact tie, which is why that test exists
+  // beside this one.
   let a = || word(" A", 0.0, 1.0);
   let over = || word_of_tokens(" H", 1.0, 1.0, MAX_HOLDBACK_PREFILL_TOKENS + 1);
   let tied = || word(" X", 1.0, 1.0);
   let anchor = || word(" Y", 2.0, 3.0);
+  // A SECOND word starting strictly later: the default count needs two agreed
+  // words to advance over anything at all, and the tail below is what proves
+  // this arm is not a stall.
+  let anchor2 = || word(" Z", 3.0, 4.0);
   assert_eq!(
     (
       over().tokens_slice().len() > MAX_HOLDBACK_PREFILL_TOKENS,
@@ -3210,7 +3153,7 @@ fn a_forced_empty_holdback_defers_rather_than_retracting_its_suffix() {
 
   let older = || result_with_words(vec![a(), over()]);
   let newer = || result_with_words(vec![a(), over(), tied()]);
-  let later = || result_with_words(vec![a(), over(), tied(), anchor()]);
+  let later = || result_with_words(vec![a(), over(), tied(), anchor(), anchor2()]);
 
   let mut agreement = LocalAgreement::new();
   assert_eq!(
@@ -3219,24 +3162,29 @@ fn a_forced_empty_holdback_defers_rather_than_retracting_its_suffix() {
     "non-vacuous: the DEFAULT count, the only one the driver reaches",
   );
   agreement.ingest_streamed(older());
-  agreement.ingest_streamed(newer());
+  assert!(
+    agreement.ingest_streamed(newer()).is_advanced(),
+    "the agreeing round ADVANCES: an agreeing round always does",
+  );
   assert_eq!(
     (
       confirmed_texts(&agreement),
       held_back_texts(&agreement),
       agreement.last_agreed_seconds(),
     ),
-    (Vec::new(), Vec::new(), 0.0),
-    "the forced empty holdback would strand \" X\", so the round DEFERS: \
-     nothing is confirmed, the watermark does not move, and \" X\" stays \
-     offerable",
+    (vec![" A", " H"], Vec::new(), 1.0f32.next_up()),
+    "CHARACTERIZATION (https://github.com/findit-studio/coremlit/issues/94): \
+     the budget floor reaches `common.len()`, so the split runs off the end -- \
+     `[\" A\", \" H\"]` is confirmed, the holdback is empty, and the watermark \
+     anchors strictly past `\" H\"`'s instant, which is `\" X\"`'s instant too. \
+     The CORRECT answer keeps `\" X\"` offerable, and no watermark does that \
+     while also clearing `\" H\"`'s own start. If the trade was revisited, \
+     assert ([], [], 0.0) here and re-check the retraction below.",
   );
 
   // FINALIZE POINT ONE. The retraction is only visible across two of these, and
-  // this is the one that publishes the word: byte-identical to what the
-  // unconditional forced advance produced on this same round, since a deferred
-  // round finalizes `confirmed ++ hypothesis_words` and that advance finalized
-  // `confirmed ++ common ++ differentSuffix`, which is the same list.
+  // this is the one that publishes the word: the advance confirmed `common` and
+  // `find_longest_different_suffix` adds `" X"` on top.
   assert_eq!(
     agreement
       .clone()
@@ -3244,15 +3192,14 @@ fn a_forced_empty_holdback_defers_rather_than_retracting_its_suffix() {
       .text()
       .to_string(),
     " A H X",
-    "a stream ENDING here publishes \" X\" either way -- the divergence is \
-     entirely in what a LATER ingest can still see",
+    "a stream ENDING here publishes \" X\" -- which is what makes losing it a \
+     retraction rather than a word never emitted",
   );
 
   // FINALIZE POINT TWO, after a hypothesis that repeats " X" and carries an
-  // anchor starting strictly later. Under the unconditional forced advance " X"
-  // is below the watermark by then, so the filter drops it from the hypothesis
-  // AND from the re-read previous result -- both sides at once -- and this reads
-  // " A H Y".
+  // anchor starting strictly later. `" X"` is below the watermark by now, so
+  // the filter drops it from the hypothesis AND from the re-read previous
+  // result -- both sides at once.
   agreement.ingest_streamed(later());
   assert_eq!(
     agreement
@@ -3260,47 +3207,50 @@ fn a_forced_empty_holdback_defers_rather_than_retracting_its_suffix() {
       .finalize(&DecodingOptions::new())
       .text()
       .to_string(),
-    " A H X Y",
-    "THE RETRACTION: a word this engine already published stays published",
+    " A H Y Z",
+    "CHARACTERIZATION, and a RETRACTION -- this module's non-preferred \
+     direction (https://github.com/findit-studio/coremlit/issues/94). The \
+     CORRECT answer is \" A H X Y Z\": both hypotheses produced \" X\", \
+     nothing contradicted it, and the round before this one already published \
+     it. It is gone because the empty holdback's watermark passed its instant, \
+     and no watermark both passes \" H\"'s start and spares a word AT it. \
+     Accepted as residual 1. If that was revisited, assert \" A H X Y Z\" \
+     here and delete this message.",
   );
 
-  // And the deferral is relieved rather than a deadlock: the anchor reaches
-  // `common` on the second ingest and opens a legal boundary above the floor.
+  // AND IT IS NOT A STALL: the anchor reaches `common` on the next ingest and
+  // an ordinary interior split takes over.
   assert!(
     agreement.ingest_streamed(later()).is_advanced(),
-    "the anchor's strictly later start opens a boundary the forced arm no \
-     longer needs",
-  );
-  let advanced = (
-    confirmed_texts(&agreement)
-      .into_iter()
-      .map(str::to_string)
-      .collect::<Vec<_>>(),
-    held_back_texts(&agreement)
-      .into_iter()
-      .map(str::to_string)
-      .collect::<Vec<_>>(),
-    agreement.last_agreed_seconds(),
+    "the anchor's strictly later start opens an ordinary interior boundary",
   );
   assert_eq!(
     (
-      advanced,
+      confirmed_texts(&agreement)
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>(),
+      held_back_texts(&agreement)
+        .into_iter()
+        .map(str::to_string)
+        .collect::<Vec<_>>(),
+      agreement.last_agreed_seconds(),
       agreement
         .finalize(&DecodingOptions::new())
         .text()
         .to_string(),
     ),
     (
-      (
-        vec![" A".to_string(), " H".to_string(), " X".to_string()],
-        vec![" Y".to_string()],
-        2.0,
-      ),
-      " A H X Y".to_string(),
+      vec![" A".to_string(), " H".to_string()],
+      vec![" Y".to_string(), " Z".to_string()],
+      2.0,
+      " A H Y Z".to_string(),
     ),
-    "and \" X\" is confirmed exactly once, by the ordinary interior split",
+    "and the stream keeps moving: the tail is held under an interior split and \
+     nothing is confirmed twice",
   );
 }
+
 /// One round of the STREAMING face — the outcome a caller reads back plus the
 /// three pieces of engine state it can see between pushes. Built as a value so a
 /// whole run of rounds compares in ONE assertion: a stall is a face that repeats,
@@ -3324,69 +3274,56 @@ fn streaming_face(
 }
 
 #[test]
-fn an_alternating_suffix_escapes_the_deferral_instead_of_stalling() {
-  // #94, codex round 4 on PR #95 -- the DEFERRAL's own liveness, and the first
-  // finding on this branch that is not a correctness hole.
+fn an_alternating_suffix_advances_instead_of_stalling() {
+  // #94, codex round 4 on PR #95 -- LIVENESS on the forced arm, kept past the
+  // deferral it was written against.
   //
-  // Rule W's deferral is a WAIT for tail growth: `common` grows, and a boundary
-  // the split may legally take appears. Nothing bounded that wait. Hypotheses
-  // that ALTERNATE past the agreed prefix -- `[A, H, X]` then `[A, H, Y]` then
-  // `[A, H, X]` -- pin `common` at `[A, H]` forever: the forced arm sees the
-  // same over-budget `" H"` at the end of the same `common` every round, the
-  // same live suffix beyond it, and returns `None` every round. The watermark
-  // never moves, nothing is ever confirmed, the caller reads
-  // `awaiting_agreement` forever, and in the driver the clip keeps re-decoding
-  // from a boundary that never advances while the buffer grows past it.
+  // Hypotheses that ALTERNATE past the agreed prefix -- `[A, H, X]` then
+  // `[A, H, Y]` then `[A, H, X]` -- pin `common` at `[A, H]` forever: the forced
+  // arm sees the same over-budget `" H"` at the end of the same `common` every
+  // round, and the same live suffix beyond it. Whatever the split does with that
+  // state, it must not do it FOREVER: the watermark has to move, or the caller
+  // reads `awaiting_agreement` while the driver's clip keeps re-decoding from a
+  // boundary that never advances and the buffer grows past it.
   //
-  // The earlier liveness argument -- "one word starting strictly later opens a
-  // boundary" -- is about a suffix that STABILIZES, and does not reach this
-  // state: `" T"` and `" U"` below DO start strictly later, and they never help,
-  // because they can only join `common` once the words in front of them agree.
+  // The split runs off the END of `common` on the first such round, so the
+  // stream is a stream: `[" A", " H"]` is confirmed at the only instant that
+  // clears `" H"`'s own start, the alternation stops blocking the tail, and
+  // `[" T", " U"]` is held back under an ordinary interior split from then on.
   //
-  // THE BOUND: a deferral whose boundary-relevant SIGNATURE repeats the previous
-  // round's is that round again. It is a measurement of the wait that has
-  // already happened, not a prediction about the next one, and it costs exactly
-  // one round. Round 1 defers; round 2 finds the identical state -- same floor,
-  // same `common.len()`, same terminal instant, same watermark an escape would
-  // anchor at -- and takes the empty holdback instead. The OTHER bound,
-  // `MAX_CONSECUTIVE_DEFERRALS`, is for the wait that never repeats
-  // (`a_growing_tied_prefix_escapes_after_a_bounded_number_of_deferrals`); here
-  // it would fire three rounds later and the signature gets there first.
+  // Between `6987bec` and `b3ec5c6` this round DEFERRED instead and the escape
+  // came one round later; every face below is that same run shifted by one
+  // ingest, and the two transcripts at the end are byte-identical either way.
+  // The measurement that removed the deferral is in the engine module's doc
+  // ("Why there is no deferral"): the wait cost 26 published erasures against
+  // this fallback's 10 over the same 512 trials.
   //
-  // WHAT THAT TRADES, stated in the direction that costs something. `" X"` and
+  // WHAT THIS TRADES, stated in the direction that costs something. `" X"` and
   // `" Y"` sit at `" H"`'s own instant, so no watermark strictly past `" H"`'s
   // start can spare them (`empty_holdback_watermark` lowers the anchor as far as
-  // it can, and here it cannot lower it at all) -- this module's residual 1,
-  // reached one round earlier than the residual's own route. A stream that ENDS
-  // inside the stall keeps the disputed word, since a deferred round finalizes
-  // `confirmed ++ hypothesis_words`; a stream that CONTINUES gets a transcript
-  // instead of a frozen one. Both are asserted below. The disputed word is also
-  // the one thing the deferral could never have delivered: `find_longest_common_
-  // prefix` stops at it by construction, so it is uncorroborated on every round
-  // it is offered, and `finalize` already published a DIFFERENT one each round.
+  // it can, and here it cannot lower it at all) -- this module's residual 1. A
+  // stream that ENDS on the round before keeps the disputed word; a stream that
+  // CONTINUES gets a transcript instead of a frozen one. Both are asserted
+  // below. The disputed word is also the one thing no wait could ever have
+  // delivered: `find_longest_common_prefix` stops at it by construction, so it
+  // is uncorroborated on every round it is offered, and `finalize` already
+  // published a DIFFERENT one each round.
   //
-  // Mutation proof, every row run: drop `!wait.is_over(&signature)` from the
-  // forced arm's test (`if empty_holdback_strands()`) and this test alone reds,
-  // with eight `awaiting_agreement` rounds at watermark 0 -- the stall itself.
-  // Drop the SIGNATURE from `DeferralWait::is_over` (count only) and it reds the
-  // same way at three deferrals where it asserts one, which is what makes the
-  // signature bound load-bearing beside the count. Make the escape unconditional
-  // (`is_over` returning `true`) and
-  // `a_forced_empty_holdback_defers_rather_than_retracting_its_suffix` and
-  // `an_over_budget_tied_run_defers_rather_than_stranding_its_suffix` red
-  // instead -- the FIRST wait is the one that is worth taking. Restore round 4's
-  // own predicate (`is_over` reading `previous.is_some_and(|before|
-  // signature.common_len <= before.common_len)`) and this stays GREEN, `common`
-  // being EQUAL in length here: that predicate was right about THIS shape and
-  // wrong about two others, which is why round 5 replaced it rather than
-  // widening it.
+  // Mutation proof, every row run: drop the `.or_else(...)` back-off from
+  // `split_at_a_strict_boundary` and this stays green (the forced arm never
+  // reaches either search), which is why the back-off is pinned in
+  // `a_trailing_tied_run_never_confirms_itself_twice_at_the_default_count`
+  // instead. Drop `.max(last.start().next_up())` from `empty_holdback_watermark`
+  // and the face reds at round 1 with a 1.0 watermark, `" H"` re-admissible.
+  // Drop the sparing FOLD and the face reds at round 2 instead, `[" T", " U"]`
+  // filtered away by a 3.0 anchor they never earned.
   let a = || word(" A", 0.0, 1.0);
   let over = || word_of_tokens(" H", 1.0, 1.0, MAX_HOLDBACK_PREFILL_TOKENS + 1);
   let x = || word(" X", 1.0, 1.0);
   let y = || word(" Y", 1.0, 1.0);
-  // Two words the deferral's own liveness argument would call relief. They start
-  // strictly later, they are in every hypothesis, and they cannot reach `common`
-  // while the words in front of them disagree.
+  // Two words a WAIT would have called relief. They start strictly later, they
+  // are in every hypothesis, and they cannot reach `common` while the words in
+  // front of them disagree -- which is why waiting for them never ended.
   let tail = || vec![word(" T", 2.0, 3.0), word(" U", 3.0, 4.0)];
   let odd = || result_with_words([vec![a(), over(), x()], tail()].concat());
   let even = || result_with_words([vec![a(), over(), y()], tail()].concat());
@@ -3415,13 +3352,13 @@ fn an_alternating_suffix_escapes_the_deferral_instead_of_stalling() {
   const ROUNDS: usize = 8;
   let mut face = Vec::with_capacity(ROUNDS);
   let mut forced_arm = Vec::with_capacity(ROUNDS);
-  let mut stalled_transcript = String::new();
+  let mut fallback_transcript = String::new();
   for round in 0..ROUNDS {
     let outcome = agreement.ingest_streamed(if round % 2 == 0 { odd() } else { even() });
     face.push(streaming_face(outcome, &agreement));
     forced_arm.push(forced_arm_with_a_live_suffix(&agreement));
     if round == 1 {
-      stalled_transcript = agreement
+      fallback_transcript = agreement
         .clone()
         .finalize(&DecodingOptions::new())
         .text()
@@ -3430,14 +3367,14 @@ fn an_alternating_suffix_escapes_the_deferral_instead_of_stalling() {
   }
 
   // NON-VACUOUS, per round: the forced arm really is the arm being driven, with
-  // a live suffix beyond `common`, on BOTH the round that defers and the round
-  // that escapes. Without this the face below could be produced by an engine
-  // that never reached the state at all.
+  // a live suffix beyond `common`, on the round that takes the fallback.
+  // Without this the face below could be produced by an engine that never
+  // reached the state at all.
   assert_eq!(
     forced_arm,
-    vec![false, true, true, false, false, false, false, false],
-    "the deferring round and the escaping round must both BE the forced arm \
-     with a live suffix; round 0 has no previous hypothesis and rounds 3+ have \
+    vec![false, true, false, false, false, false, false, false],
+    "the round that runs the split off the end must BE the forced arm with a \
+     live suffix; round 0 has no previous hypothesis and rounds 2+ have \
      advanced past the over-budget word",
   );
 
@@ -3462,14 +3399,13 @@ fn an_alternating_suffix_escapes_the_deferral_instead_of_stalling() {
     vec![
       // No previous hypothesis to agree with.
       awaiting(&[], &[], 0.0),
-      // THE WAIT, worth taking once: `common` may yet grow past `" H"`.
-      awaiting(&[], &[], 0.0),
-      // THE ESCAPE. `common` is `[" A", " H"]` again, so the wait bought
-      // nothing; the empty holdback is taken at the only instant that clears
+      // THE FALLBACK. `common` is `[" A", " H"]` and the budget floor reaches
+      // its end, so the empty holdback is taken at the only instant that clears
       // `" H"`'s own start.
       advanced(&[" A", " H"], &[], 1.0f32.next_up()),
-      // And the stream is a stream again: the tail the alternation was blocking
+      // And the stream is a stream: the tail the alternation was blocking
       // reaches `common` and is held back under an ordinary interior split.
+      advanced(&[" A", " H"], &[" T", " U"], 2.0),
       advanced(&[" A", " H"], &[" T", " U"], 2.0),
       advanced(&[" A", " H"], &[" T", " U"], 2.0),
       advanced(&[" A", " H"], &[" T", " U"], 2.0),
@@ -3480,11 +3416,12 @@ fn an_alternating_suffix_escapes_the_deferral_instead_of_stalling() {
   );
 
   // THE TRADE, both directions, so neither can be reported as free. A stream
-  // that ENDS inside the wait publishes the disputed word; one that CONTINUES
-  // past it does not, and gets everything after it instead.
+  // that ENDS on the round that took the fallback still publishes the disputed
+  // word, through `find_longest_different_suffix`; one that CONTINUES past it
+  // does not, and gets everything after it instead.
   assert_eq!(
     (
-      stalled_transcript.as_str(),
+      fallback_transcript.as_str(),
       agreement
         .finalize(&DecodingOptions::new())
         .text()
@@ -3492,53 +3429,56 @@ fn an_alternating_suffix_escapes_the_deferral_instead_of_stalling() {
         .as_str(),
     ),
     (" A H Y T U", " A H T U"),
-    "the escape drops the word at the settled instant -- residual 1, one round \
-     earlier than its own route -- and keeps the transcript moving",
+    "the empty holdback drops the word at the settled instant -- residual 1 -- \
+     and keeps the transcript moving",
   );
 }
 
 #[test]
-fn a_tied_run_above_the_budget_floor_escapes_the_deferral_instead_of_stalling() {
-  // #94, codex round 4 on PR #95 -- the SAME unbounded wait on the OTHER
-  // deferral arm, and the one this crate's own pipeline can actually reach.
+fn a_tied_run_above_the_budget_floor_advances_instead_of_stalling() {
+  // #94, codex round 4 on PR #95 -- the SAME liveness question on the arm this
+  // crate's own pipeline can actually reach, kept past the deferral it was
+  // written against.
   //
   // The alternating shape above needs a single word carrying more than
   // `MAX_HOLDBACK_PREFILL_TOKENS` tokens. This one needs no over-budget word, no
   // alternation, and nothing beyond `common` at all: 113 ORDINARY one-token
   // words sharing one instant, offered UNCHANGED on every stride. Their SUM puts
   // the budget floor strictly inside the run, every boundary at or above it
-  // ties, and the back-off may not cross the floor -- so `split_at_a_strict_
-  // boundary` returns `None`, and it returns `None` again next round because a
-  // repeated hypothesis grows nothing. `add_word_timestamps` produces exactly
-  // that shape from an ALL-ZERO alignment matrix (`add_word_timestamps_zero_
-  // pads_missing_rows`; measured at 130 such words), which is why this is the
-  // reachability answer for the finding rather than the shape above.
+  // ties, and the back-off may not cross the floor -- so both searches fail and
+  // the split runs off the END of `common`. A repeated hypothesis grows nothing,
+  // so the state is the same again next round and the round after.
+  // `add_word_timestamps` produces exactly that shape from an ALL-ZERO alignment
+  // matrix (`add_word_timestamps_zero_pads_missing_rows`; measured at 130 such
+  // words), which is why this is the reachability answer for the finding rather
+  // than the shape above.
   //
-  // Nothing is stranded here: `beyond_common` is EMPTY, so the escape's
+  // Nothing is stranded on the FIRST half: `beyond_common` is EMPTY, so the
   // watermark filters nothing away that any hypothesis had produced, and BOTH of
-  // Rule W's postconditions hold across it unweakened. What the wait was
-  // protecting is the HOLDBACK -- the tied run stays revisable and the next
-  // stride keeps its prefill anchor -- and that is worth exactly one round.
+  // Rule W's postconditions hold across it unweakened. What a wait would have
+  // been protecting is the HOLDBACK -- the tied run stays revisable and the next
+  // stride keeps its prefill anchor -- and a repeated hypothesis never delivers
+  // it.
   //
   // The SECOND half drives the same arm with a suffix that ALTERNATES at the
-  // run's own instant, which is where a strand-conditional escape would have
-  // gone on deferring forever. Both halves are here because they are one arm
-  // and one bound; splitting them would let a repair pass on the half it
-  // happened to cover.
+  // run's own instant, which is where a strand-conditional wait would have gone
+  // on deferring forever. Both halves are here because they are one arm;
+  // splitting them would let a repair pass on the half it happened to cover.
   //
-  // Mutation proof, every row run: delete the escape arm outright (the
-  // `None if wait.is_over(&signature)` row of `split_at_a_strict_boundary`'s
-  // final match) and the STABLE face reds with six `awaiting_agreement` rounds
-  // at watermark 0. Re-introduce a `!empty_holdback_strands()` guard beside
-  // `wait.is_over(&signature)` there -- the shape that exempts the arm's own
-  // strand from its own bound -- and the ALTERNATING face reds the same way
-  // while the stable one stays green, which is why both halves are here. Drop
-  // the SIGNATURE from `DeferralWait::is_over` (count only) and both faces red
-  // at three deferrals where they assert one. Make the escape unconditional
-  // (`is_over` returning `true`) and
-  // `an_over_budget_tied_run_defers_rather_than_stranding_its_suffix`,
-  // `a_forced_empty_holdback_defers_rather_than_retracting_its_suffix` and the
-  // sweep red, the first wait taken away.
+  // Between `6987bec` and `b3ec5c6` the first agreeing round DEFERRED and the
+  // advance came one round later; both faces below are that same run shifted by
+  // one ingest, and the finalized transcript is byte-identical either way. See
+  // the engine module's doc, "Why there is no deferral", for the measurement.
+  //
+  // Mutation proof, every row run: return `common.len() - 1` from
+  // `split_at_a_strict_boundary`'s `unwrap_or` and the STABLE face reds at
+  // round 1 -- 112 confirmed against 113, and a watermark of 2.0 that re-admits
+  // the run's own last word. Drop `.max(last.start().next_up())` from
+  // `empty_holdback_watermark` and both faces red at a 2.0 watermark with 113
+  // words still offerable, which is the unbounded re-confirmation #94 is about.
+  // Let the back-off cross the floor (`0..widened` for `floor..widened`) and the
+  // stable face reds at round 1 with a two-word holdback the prefill cannot
+  // carry.
   const RUN: usize = MAX_HOLDBACK_PREFILL_TOKENS + 1;
   let tied: Vec<WordTiming> = (0..RUN)
     .map(|index| word(&format!(" w{index:03}"), 2.0, 2.0))
@@ -3578,7 +3518,8 @@ fn a_tied_run_above_the_budget_floor_escapes_the_deferral_instead_of_stalling() 
       agreement.last_agreed_seconds(),
       // Nothing this hypothesis produced falls below the watermark that is not
       // confirmed: the SECOND postcondition, read on every round of this shape
-      // rather than swept, since the escape is where it could have broken.
+      // rather than swept, since the empty holdback is where it could have
+      // broken.
       LocalAgreement::watermark_filtered(&stable(), agreement.last_agreed_seconds()).len()
         + agreement.confirmed_words_slice().len(),
     ));
@@ -3587,9 +3528,7 @@ fn a_tied_run_above_the_budget_floor_escapes_the_deferral_instead_of_stalling() 
     face,
     vec![
       ("awaiting_agreement".to_string(), 0, 0, 0.0, RUN),
-      // THE WAIT: `common` may yet grow past the tie.
-      ("awaiting_agreement".to_string(), 0, 0, 0.0, RUN),
-      // THE ESCAPE, at the only instant that clears the run's own.
+      // THE FALLBACK, at the only instant that clears the run's own.
       ("advanced".to_string(), RUN, 0, 2.0f32.next_up(), RUN),
       // The run is behind the watermark now, so a hypothesis that keeps
       // repeating it offers nothing -- which is the input being degenerate, not
@@ -3615,9 +3554,16 @@ fn a_tied_run_above_the_budget_floor_escapes_the_deferral_instead_of_stalling() 
         2.0f32.next_up(),
         RUN
       ),
+      (
+        "awaiting_agreement".to_string(),
+        RUN,
+        0,
+        2.0f32.next_up(),
+        RUN
+      ),
     ],
     "a hypothesis that simply REPEATS must not freeze the stream, and the \
-     escape must strand nothing: every word is either still offerable or \
+     advance must strand nothing: every word is either still offerable or \
      confirmed",
   );
 
@@ -3633,9 +3579,10 @@ fn a_tied_run_above_the_budget_floor_escapes_the_deferral_instead_of_stalling() 
 
   // ── SECOND HALF: the same arm, with a live strand at the run's own instant.
   //
-  // Two words alternate past the run, both at the run's instant, so the escape
-  // cannot spare either -- and a bound that refused to fire while a strand
-  // existed would defer here forever, which is the state it exists to leave.
+  // Two words alternate past the run, both at the run's instant, so no watermark
+  // that clears the run's own start can spare either -- and a rule that refused
+  // to advance while a strand existed would wait here forever, since the strand
+  // is renewed by the next hypothesis every round.
   let x0 = || word(" x0", 2.0, 2.0);
   let x1 = || word(" x1", 2.0, 2.0);
   let odd = || result_with_words([tied.clone(), vec![x0()]].concat());
@@ -3664,520 +3611,49 @@ fn a_tied_run_above_the_budget_floor_escapes_the_deferral_instead_of_stalling() 
     alternating_face,
     vec![
       ("awaiting_agreement".to_string(), 0, 0, 0.0),
-      ("awaiting_agreement".to_string(), 0, 0, 0.0),
       ("advanced".to_string(), RUN, 0, 2.0f32.next_up()),
       ("awaiting_agreement".to_string(), RUN, 0, 2.0f32.next_up()),
       ("awaiting_agreement".to_string(), RUN, 0, 2.0f32.next_up()),
       ("awaiting_agreement".to_string(), RUN, 0, 2.0f32.next_up()),
+      ("awaiting_agreement".to_string(), RUN, 0, 2.0f32.next_up()),
     ],
-    "an alternating suffix at the run's own instant must not freeze this arm      either -- the run is confirmed and the disputed words at its instant are      the residual, not the reason to wait",
+    "an alternating suffix at the run's own instant must not freeze this arm \
+     either -- the run is confirmed and the disputed words at its instant are \
+     the residual, not a reason to wait",
   );
 }
 
 #[test]
-fn a_growing_tied_prefix_escapes_after_a_bounded_number_of_deferrals() {
-  // #94, codex round 5 on PR #95, FINDING 1 -- the deferral's liveness again,
-  // and the shape round 4's bound could not see.
+fn a_word_starting_strictly_later_lowers_the_watermark_instead_of_being_stranded() {
+  // #94, codex round 4 on PR #95 -- the SPARING fold, which keeps the empty
+  // holdback from stranding anything it does not have to.
   //
-  // That bound was a LENGTH: escape once `common` is no longer than the length
-  // the round before already deferred over. It measures a wait that REPEATED,
-  // and it is blind to a wait whose state MOVES. An over-budget tied run that
-  // gains one more TIED word every stride moves it every round: `common` is
-  // longer each time, the budget floor rises with it, every boundary the forward
-  // search and the back-off can reach still ties, and `common.len() <= already`
-  // is false forever. Every round defers, nothing is confirmed, the watermark
-  // never moves -- and because an AGREEING round is a KEPT round, one whole
-  // result is retained per round over a clip window that never advances. The
-  // stall is unbounded in rounds and in retention both.
+  // The forced empty holdback used to anchor at `common.last().end()` flatly, so
+  // every word the hypothesis had already produced beyond `common` that started
+  // before that edge was filtered away. But word ENDS inside a hypothesis are
+  // not monotone (`an_overlapping_agreed_word_is_confirmed_on_the_mainline_path_
+  // too`), so `end` can reach past a word that is already there -- and nothing
+  // needs it to. All the watermark owes #94 is to clear the last CONFIRMED
+  // word's START. So `empty_holdback_watermark` lowers the anchor to the
+  // earliest such word's start when that still clears it, and the word stays
+  // offerable instead of being lost.
   //
-  // The driver's own cadence is one hypothesis per stride and
-  // `add_word_timestamps` produces exactly this run from an all-zero alignment
-  // matrix, so the shape needs no over-budget WORD and no alternation: 113
-  // ordinary one-token words at one instant, then 114, then 115.
+  // What that leaves is the EXACT TIE alone, which is the case no instant
+  // serves -- this module's residual 1, characterized in
+  // `a_forced_empty_holdback_retracts_its_suffix_at_the_settled_instant`.
   //
-  // THE BOUND IS A COUNT, and the count is asserted here as a NUMBER rather than
-  // implied by an outcome: at most `MAX_CONSECUTIVE_DEFERRALS` rounds may defer
-  // between advances, whatever their signatures say. What it costs when it fires
-  // is this module's residual 1 and nothing else -- the escape anchors at
-  // `empty_holdback_watermark`'s lowest sparing instant, so the only word it can
-  // strand is one at the settled instant, which here is the run's own.
-  //
-  // Mutation proof, every row run: restore round 4's predicate
-  // (`is_over` reading `previous.is_some_and(|before| signature.common_len <=
-  // before.common_len)`) and the face below reds with EIGHT
-  // `awaiting_agreement` rounds at watermark 0 -- the stall itself, retaining a
-  // result on every one of them. Drop the count from `DeferralWait::is_over`
-  // (leaving the signature) and it reds the same way, the signature being fresh
-  // every round. Drop the SIGNATURE instead (leaving the count) and this stays
-  // green while `an_alternating_suffix_escapes_the_deferral_instead_of_stalling`
-  // and `a_tied_run_above_the_budget_floor_escapes_the_deferral_instead_of_
-  // stalling` red at three deferrals where they assert one -- which is why both
-  // halves are here and neither is redundant. Reset `deferrals_since_advance` on
-  // a disagreement as well as on an advance and this stays green, since nothing
-  // here disagrees; `a_deferral_alternating_with_a_disagreement_is_bounded_too`
-  // is that clause's own falsifier.
-  const RUN: usize = MAX_HOLDBACK_PREFILL_TOKENS + 1;
-  let tied = |words: usize| -> Vec<WordTiming> {
-    (0..words)
-      .map(|index| word(&format!(" w{index:03}"), 2.0, 2.0))
-      .collect()
-  };
-  assert_eq!(
-    (
-      tied(RUN).len(),
-      tied(RUN)
-        .iter()
-        .map(|word| word.tokens_slice().len())
-        .sum::<usize>()
-        > MAX_HOLDBACK_PREFILL_TOKENS,
-      tied(RUN).iter().all(|word| word.start() == 2.0),
-    ),
-    (113, true, true),
-    "non-vacuous: ORDINARY one-token words, over the budget by their SUM at ONE \
-     instant -- the shape an all-zero alignment matrix produces, not a \
-     hand-built oversized word",
-  );
-
-  let mut agreement = LocalAgreement::new();
-  assert_eq!(
-    agreement.agreement_count_needed(),
-    DEFAULT_AGREEMENT_COUNT_NEEDED,
-    "non-vacuous: the DEFAULT count, the only one the driver reaches",
-  );
-
-  // One MORE tied word each round, which is the driver's one-hypothesis-per-
-  // stride cadence over a run that keeps growing.
-  const ROUNDS: usize = 8;
-  let mut face = Vec::with_capacity(ROUNDS);
-  let mut deferred_lengths = Vec::new();
-  let mut deferrals = 0usize;
-  let mut stalled_transcript = String::new();
-  for round in 0..ROUNDS {
-    let outcome = agreement.ingest_streamed(result_with_words(tied(RUN + round)));
-    if let Some(signature) = agreement.deferred {
-      deferrals += 1;
-      deferred_lengths.push(signature.common_len);
-    }
-    if round == 2 {
-      stalled_transcript = agreement
-        .clone()
-        .finalize(&DecodingOptions::new())
-        .text()
-        .to_string();
-    }
-    face.push((
-      outcome.to_string(),
-      agreement.confirmed_words_slice().len(),
-      // The RETENTION the bound bounds: an agreeing round is a kept round, so a
-      // round that defers costs one whole retained result over a clip that has
-      // not moved.
-      agreement.results_slice().len(),
-      agreement.last_agreed_seconds(),
-    ));
-  }
-
-  // THE NUMBER, asserted directly rather than read off the outcomes: the wait is
-  // this many rounds and no more.
-  assert_eq!(
-    (deferrals, MAX_CONSECUTIVE_DEFERRALS),
-    (MAX_CONSECUTIVE_DEFERRALS, 4),
-    "the wait must be bounded by the count, and the count is what it says it is",
-  );
-  // NON-VACUOUS, and the whole of finding 1: `common` GREW on every one of those
-  // rounds, so round 4's length predicate was false on every one of them and
-  // could never have ended this wait.
-  assert_eq!(
-    deferred_lengths,
-    vec![RUN, RUN + 1, RUN + 2, RUN + 3],
-    "every deferral must be over a LONGER `common` than the one before it -- \
-     otherwise a length bound would have escaped and this test would be \
-     measuring the wrong stall",
-  );
-
-  let awaiting = |confirmed: usize, results: usize, watermark: f32| {
-    (
-      "awaiting_agreement".to_string(),
-      confirmed,
-      results,
-      watermark,
-    )
-  };
-  assert_eq!(
-    face,
-    vec![
-      // No previous hypothesis to agree with.
-      awaiting(0, 1, 0.0),
-      // THE WAIT, four rounds of it, each retaining its own result.
-      awaiting(0, 2, 0.0),
-      awaiting(0, 3, 0.0),
-      awaiting(0, 4, 0.0),
-      awaiting(0, 5, 0.0),
-      // THE ESCAPE, at the only instant that clears the run's own start. The
-      // 117 words two hypotheses had agreed on are confirmed; the 118th, at that
-      // same instant, is the residual.
-      ("advanced".to_string(), RUN + 4, 6, 2.0f32.next_up()),
-      // Every word this degenerate stream has is at one instant, so a longer run
-      // now offers nothing past the watermark. That is the input being
-      // degenerate, not the engine stalling -- and the result is DROPPED rather
-      // than retained, so even that costs no memory.
-      awaiting(RUN + 4, 6, 2.0f32.next_up()),
-      awaiting(RUN + 4, 6, 2.0f32.next_up()),
-    ],
-    "a growing tied prefix must not freeze the stream, and the wait must cost \
-     exactly `MAX_CONSECUTIVE_DEFERRALS` retained results",
-  );
-
-  // THE TRADE, both directions. A stream that ENDS inside the wait publishes
-  // every word it produced; one that CONTINUES loses the word at the settled
-  // instant and keeps moving.
-  let escaped_transcript = agreement
-    .finalize(&DecodingOptions::new())
-    .text()
-    .to_string();
-  assert_eq!(
-    (
-      stalled_transcript.split_whitespace().count(),
-      escaped_transcript.split_whitespace().count(),
-    ),
-    (RUN + 2, RUN + 4),
-    "a deferred round finalizes `confirmed ++ hypothesis_words`, so the wait \
-     costs nothing on its own rounds; the escape confirms everything two \
-     hypotheses agreed on and strands only the word at the settled instant",
-  );
-}
-
-#[test]
-fn a_deferral_alternating_with_a_disagreement_is_bounded_too() {
-  // #94, codex round 5 on PR #95 -- the clause that decides WHICH rounds reset
-  // the count, pinned on its own because nothing else in this suite reaches it.
-  //
-  // `LocalAgreement::deferred` is cleared by an advance AND by a disagreement,
-  // since either one moves the state a signature describes. If
-  // `deferrals_since_advance` were cleared on the same schedule, a stream that
-  // alternates a deferral with a disagreement would reset the count every other
-  // round, never repeat a signature, and never advance -- the unbounded wait
-  // back again through a door the signature cannot close. So only an ADVANCE
-  // resets it.
-  //
-  // Mutation proof: reset `deferrals_since_advance` on a disagreement as well
-  // (`if advanced || skip_append`) and the face below reds with ten
-  // `awaiting_agreement` rounds at watermark 0.
-  const RUN: usize = MAX_HOLDBACK_PREFILL_TOKENS + 1;
-  let tied: Vec<WordTiming> = (0..RUN)
-    .map(|index| word(&format!(" w{index:03}"), 2.0, 2.0))
-    .collect();
-  // AGREES with the run and defers: every boundary at or above the floor ties.
-  let agreeing = || result_with_words(tied.clone());
-  // DISAGREES with it outright, from its very first word, so no prefix survives
-  // and the round is `skipAppend` rather than a deferral.
-  let disagreeing = || {
-    result_with_words(
-      (0..RUN)
-        .map(|index| word(&format!(" d{index:03}"), 2.0, 2.0))
-        .collect(),
-    )
-  };
-
-  // A DEFERRAL takes two consecutive AGREEING hypotheses, so the cycle is three
-  // rounds long: agree, agree (defer), disagree. The round after a disagreement
-  // agrees with nothing either -- it is compared against the disagreeing
-  // hypothesis -- which is what makes every deferral here a FRESH one with no
-  // signature behind it, and the count the only thing that can end the run.
-  let mut agreement = LocalAgreement::new();
-  const ROUNDS: usize = 3 * MAX_CONSECUTIVE_DEFERRALS + 2;
-  let mut outcomes = Vec::with_capacity(ROUNDS);
-  let mut deferrals = 0usize;
-  let mut repeats = 0usize;
-  for round in 0..ROUNDS {
-    let previous = agreement.deferred;
-    let outcome = if round % 3 == 2 {
-      agreement.ingest_streamed(disagreeing())
-    } else {
-      agreement.ingest_streamed(agreeing())
-    };
-    if let Some(now) = agreement.deferred {
-      deferrals += 1;
-      repeats += usize::from(previous == Some(now));
-    }
-    outcomes.push(outcome.to_string());
-  }
-  assert_eq!(
-    (
-      deferrals,
-      repeats,
-      outcomes.iter().filter(|o| *o == "advanced").count(),
-    ),
-    (MAX_CONSECUTIVE_DEFERRALS, 0, 1),
-    "a deferral every third round must still reach the count, with no \
-     signature ever repeating to end it sooner: {outcomes:?}",
-  );
-  assert!(
-    agreement.last_agreed_seconds() > 2.0,
-    "and the watermark must actually have moved past the run rather than \
-     staying at {}",
-    agreement.last_agreed_seconds(),
-  );
-}
-
-#[test]
-fn a_shifted_terminal_timestamp_is_a_new_wait_rather_than_a_repeat() {
-  // #94, codex round 5 on PR #95, FINDING 2 -- the other half of the same
-  // predicate, and a TRANSCRIPT-level regression rather than a liveness one.
-  //
-  // Round 4's bound was `common.len()`, and equal lengths do not establish that
-  // the wait already taken covered the state now in front of the engine.
-  // Agreement compares NORMALIZED TEXT; the escape's cost is a question about
-  // TIMINGS. Defer over `[" A", " H"@1]` with a tied strand `" X"@1`, then offer
-  // `[" A", " H"@2, " Y"@2]`: the normalized prefix is unchanged and two words
-  // long either way, while the hazardous boundary has moved from 1 s to 2 s.
-  // Escaping there is escaping from a DIFFERENT deferral: it confirms `" H"@2`,
-  // anchors past 2 s and strands `" Y"` -- a word this round's own `finalize`
-  // publishes and the NEXT ingest retracts. `confirmed_words`' append-only
-  // guarantee cannot see it, because `" Y"` was never confirmed.
-  //
-  // And the wait would have WORKED: repeating that hypothesis grows `common` to
-  // include `" Y"`, which is why the loss is a loss rather than an ordering. The
-  // assertions below are `finalize` before and after, which is the only place it
-  // shows.
-  //
-  // `DeferralSignature` is the repair: the floor, the length, the terminal
-  // instant and the watermark an escape would anchor at, compared for EQUALITY.
-  // The two rounds above differ in the last two, so the second is a new wait.
-  //
-  // REACHABILITY, both halves. The first is the finding's own sequence and needs
-  // a single 113-token word to force the empty holdback, which
-  // `add_word_timestamps` does not emit -- the same artificial word
-  // `a_forced_empty_holdback_defers_rather_than_retracting_its_suffix` needs.
-  // The SECOND half runs the same shift on the aggregate arm, where the trigger
-  // is 113 ORDINARY one-token words at one instant, which that function does
-  // produce from an all-zero alignment matrix. The timestamp SHIFT itself is
-  // ordinary either way: a re-decode over a longer window is free to move the
-  // instants it emits, and `find_longest_common_prefix` compares text alone, so
-  // the prefix is unchanged while the instant is not.
-  //
-  // Mutation proof, every row run: restore round 4's predicate
-  // (`is_over` reading `previous.is_some_and(|before| signature.common_len <=
-  // before.common_len)`) and BOTH halves red -- the first at `" A H"`, `" Y"`
-  // retracted from a transcript that had published it, the second at 113 words
-  // where it asserts 114. Drop `terminal_start` and `escape_watermark` from the
-  // signature (comparing floor and length alone) and they red the same way,
-  // which is what makes those two fields the load-bearing ones.
-  //
-  // ONE MUTATION REDS NOTHING and is recorded rather than dropped: comparing the
-  // length with `<=` beside equality on the rest -- escaping where `common`
-  // SHRANK at an otherwise identical state. That is a SUITE GAP, not dead code:
-  // `common` shrinks whenever the newest hypothesis agrees with its predecessor
-  // on less, so the state is reachable, and no shape in this file or in the
-  // sweep produces it (measured: 0 shrinking deferral pairs in 512 sweep
-  // trials). Equality is kept because its direction is the safe one -- it can
-  // only make the engine WAIT longer, and `MAX_CONSECUTIVE_DEFERRALS` caps that
-  // at four rounds -- so the gap costs a mutation score rather than a
-  // correctness claim.
-  let a = || word(" A", 0.0, 1.0);
-  let over = |at: f32| word_of_tokens(" H", at, at, MAX_HOLDBACK_PREFILL_TOKENS + 1);
-  let x = || word(" X", 1.0, 1.0);
-  let y = || word(" Y", 2.0, 2.0);
-  assert_eq!(
-    (
-      over(1.0).tokens_slice().len() > MAX_HOLDBACK_PREFILL_TOKENS,
-      over(1.0).word() == over(2.0).word(),
-      over(1.0).start() == x().start(),
-      over(2.0).start() == y().start(),
-      over(1.0).start() < over(2.0).start(),
-    ),
-    (true, true, true, true, true),
-    "non-vacuous: ONE word over the budget, the SAME word by text at two \
-     different instants, each tied by a strand at its own instant",
-  );
-
-  let older = || result_with_words(vec![a(), over(1.0)]);
-  let tied_at_one = || result_with_words(vec![a(), over(1.0), x()]);
-  let tied_at_two = || result_with_words(vec![a(), over(2.0), y()]);
-
-  let mut agreement = LocalAgreement::new();
-  assert_eq!(
-    agreement.agreement_count_needed(),
-    DEFAULT_AGREEMENT_COUNT_NEEDED,
-    "non-vacuous: the DEFAULT count, the only one the driver reaches",
-  );
-  agreement.ingest_streamed(older());
-  agreement.ingest_streamed(tied_at_one());
-  let deferred_at_one = agreement.deferred;
-  let published_at_one = agreement
-    .clone()
-    .finalize(&DecodingOptions::new())
-    .text()
-    .to_string();
-  agreement.ingest_streamed(tied_at_two());
-  let deferred_at_two = agreement.deferred;
-  let published_at_two = agreement
-    .clone()
-    .finalize(&DecodingOptions::new())
-    .text()
-    .to_string();
-
-  // NON-VACUOUS: both rounds really did DEFER, and their signatures really do
-  // agree on the length round 4 compared while differing on the timings it did
-  // not. Without this the transcript below could be produced by an engine that
-  // never reached the state.
-  assert_eq!(
-    (
-      deferred_at_one.map(|signature| signature.common_len),
-      deferred_at_two.map(|signature| signature.common_len),
-      deferred_at_one.map(|signature| signature.terminal_start),
-      deferred_at_two.map(|signature| signature.terminal_start),
-      deferred_at_one == deferred_at_two,
-    ),
-    (Some(2), Some(2), Some(1.0), Some(2.0), false),
-    "two deferrals of EQUAL `common.len()` whose hazardous instant MOVED -- the \
-     exact pair a length record cannot tell apart",
-  );
-
-  // THE REGRESSION, at `finalize` across the rounds it spans. The escape is one
-  // ingest late in showing itself: the escaping round still publishes the strand
-  // through `find_longest_different_suffix`, and only the NEXT hypothesis loses
-  // it.
-  agreement.ingest_streamed(tied_at_two());
-  let published_after = agreement
-    .clone()
-    .finalize(&DecodingOptions::new())
-    .text()
-    .to_string();
-  assert_eq!(
-    (
-      published_at_one.as_str(),
-      published_at_two.as_str(),
-      published_after.as_str(),
-    ),
-    (" A H X", " A H Y", " A H Y"),
-    "the shifted round is a NEW wait, so `\" Y\"` stays published; escaping it \
-     as a repeat confirms `\" H\"@2`, anchors past 2 s and retracts `\" Y\"` on \
-     the next ingest",
-  );
-
-  // And the wait ENDS: the repeat above really does repeat the signature, so the
-  // round after it escapes -- with `" Y"` inside `common` by then, which is
-  // exactly what waiting bought.
-  assert!(
-    agreement.ingest_streamed(tied_at_two()).is_advanced(),
-    "the repeated signature must end the wait rather than extend it",
-  );
-  let settled = (
-    confirmed_texts(&agreement)
-      .into_iter()
-      .map(str::to_string)
-      .collect::<Vec<_>>(),
-    held_back_texts(&agreement)
-      .into_iter()
-      .map(str::to_string)
-      .collect::<Vec<_>>(),
-  );
-  assert_eq!(
-    (
-      settled,
-      agreement
-        .finalize(&DecodingOptions::new())
-        .text()
-        .to_string(),
-    ),
-    (
-      (
-        vec![" A".to_string(), " H".to_string(), " Y".to_string()],
-        Vec::new(),
-      ),
-      " A H Y".to_string(),
-    ),
-    "and what the wait bought is `\" Y\"` CONFIRMED rather than stranded",
-  );
-
-  // ── SECOND HALF: the same shift on the arm this crate's own pipeline reaches.
-  const RUN: usize = MAX_HOLDBACK_PREFILL_TOKENS + 1;
-  let run_at = |at: f32| -> Vec<WordTiming> {
-    (0..RUN)
-      .map(|index| word(&format!(" w{index:03}"), at, at))
-      .collect()
-  };
-  let run_at_one = || result_with_words([run_at(1.0), vec![word(" x", 1.0, 1.0)]].concat());
-  let run_at_two = || result_with_words([run_at(2.0), vec![word(" y", 2.0, 2.0)]].concat());
-  assert_eq!(
-    (
-      run_at(1.0)
-        .iter()
-        .map(|word| word.tokens_slice().len())
-        .sum::<usize>()
-        > MAX_HOLDBACK_PREFILL_TOKENS,
-      run_at(1.0)
-        .iter()
-        .all(|word| word.tokens_slice().len() == 1),
-    ),
-    (true, true),
-    "non-vacuous: no single word here is over budget -- it is the SUM of \
-     ordinary one-token words at one instant, which is the shape \
-     `add_word_timestamps` produces from an all-zero alignment matrix",
-  );
-
-  let mut aggregate = LocalAgreement::new();
-  aggregate.ingest_streamed(result_with_words(run_at(1.0)));
-  aggregate.ingest_streamed(run_at_one());
-  let aggregate_at_one = aggregate.deferred;
-  aggregate.ingest_streamed(run_at_two());
-  let aggregate_at_two = aggregate.deferred;
-  let after_shift = aggregate
-    .clone()
-    .finalize(&DecodingOptions::new())
-    .text()
-    .to_string();
-  aggregate.ingest_streamed(run_at_two());
-  let after_repeat = aggregate
-    .clone()
-    .finalize(&DecodingOptions::new())
-    .text()
-    .to_string();
-  assert_eq!(
-    (
-      aggregate_at_one.map(|signature| signature.common_len),
-      aggregate_at_two.map(|signature| signature.common_len),
-      aggregate_at_one == aggregate_at_two,
-      after_shift.split_whitespace().count(),
-      after_repeat.split_whitespace().count(),
-    ),
-    (Some(RUN), Some(RUN), false, RUN + 1, RUN + 1),
-    "the same two deferrals of equal length at moved instants, on the arm no \
-     over-budget word is needed to reach -- and `\" y\"` survives the round \
-     that would have escaped: {after_repeat:?}",
-  );
-  assert!(
-    aggregate.ingest_streamed(run_at_two()).is_advanced(),
-    "and this wait ends on its repeat too",
-  );
-}
-
-#[test]
-fn a_strand_starting_strictly_later_lowers_the_watermark_instead_of_deferring() {
-  // #94, codex round 4 on PR #95 -- the NARROWING that keeps the escape above
-  // from having to strand anything it does not have to.
-  //
-  // The forced empty holdback used to anchor at `common.last().end()` flatly,
-  // and defer whenever a word the hypothesis had produced beyond `common`
-  // started before it. But word ENDS inside a hypothesis are not monotone
-  // (`an_overlapping_agreed_word_is_confirmed_on_the_mainline_path_too`), so
-  // `end` can reach past a word that is already there -- and nothing needs it
-  // to. All the watermark owes #94 is to clear the last CONFIRMED word's START.
-  // So `empty_holdback_watermark` lowers the anchor to the earliest such word's
-  // start when that still clears it, the round advances, and the word stays
-  // offerable instead of being waited for.
-  //
-  // What that leaves the deferral is the EXACT TIE alone, which is the case no
-  // instant serves: `an_alternating_suffix_escapes_the_deferral_instead_of_
-  // stalling` is that half.
+  // The fold is SEPARABLE from the deferral this branch briefly carried and was
+  // kept when that was removed: it is the whole of what confines the loss to the
+  // tie, and it is measured here rather than argued.
   //
   // Mutation proof, every row run: drop the `fold` and return
-  // `past_the_confirmed_start` and this reds -- round 1 reads
-  // `("awaiting_agreement", [], [], 0.0)`, the deferral this narrowing removes.
-  // Keep the fold but drop its `*start > last.start()` filter and this stays
-  // green while `the_split_never_cuts_at_a_tied_start` reds on a swept exact tie
-  // (`" C" at 1.5, which is not strictly before the 1.5 s watermark`) -- the
-  // filter is postcondition ONE, asserted where it is swept.
+  // `past_the_confirmed_start` and this reds -- round 1 confirms `[" A", " H"]`
+  // at a 3.0 watermark and `" X"` is gone from round 2's holdback, stranded by
+  // an edge it never earned. Keep the fold but drop its `*start > last.start()`
+  // filter and this stays green while `the_split_never_cuts_at_a_tied_start`
+  // reds on a swept exact tie (`" C" at 1.5, which is not strictly before the
+  // 1.5 s watermark`) -- the filter is postcondition ONE, asserted where it is
+  // swept.
   let a = || word(" A", 0.0, 1.0);
   let over = || word_of_tokens(" H", 1.0, 3.0, MAX_HOLDBACK_PREFILL_TOKENS + 1);
   let strand = || word(" X", 2.0, 2.5);
@@ -4191,7 +3667,7 @@ fn a_strand_starting_strictly_later_lowers_the_watermark_instead_of_deferring() 
     (true, true, true),
     "non-vacuous: the forced arm's own condition, and a word beyond `common` \
      that starts strictly AFTER the last agreed word's start and strictly \
-     BEFORE its end -- the overlap the flat anchor used to defer over",
+     BEFORE its end -- the overlap the flat anchor used to strand",
   );
 
   let older = || result_with_words(vec![a(), over()]);
@@ -4217,8 +3693,9 @@ fn a_strand_starting_strictly_later_lowers_the_watermark_instead_of_deferring() 
         Vec::new(),
         0.0
       ),
-      // The round that used to DEFER: it advances, and the anchor is the
-      // strand's own start rather than `" H"`'s far edge.
+      // The anchor is the strand's OWN start rather than `" H"`'s far edge, so
+      // the advance clears the settled start without reaching past a word the
+      // hypothesis has already produced.
       (
         "advanced".to_string(),
         vec![" A".to_string(), " H".to_string()],
@@ -4234,8 +3711,8 @@ fn a_strand_starting_strictly_later_lowers_the_watermark_instead_of_deferring() 
         2.0,
       ),
     ],
-    "a strand that starts strictly later is SPARED by lowering the anchor, not \
-     waited for",
+    "a word beyond `common` that starts strictly later is SPARED by lowering \
+     the anchor, not stranded by the last agreed word's far edge",
   );
 
   assert_eq!(
