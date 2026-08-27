@@ -5201,7 +5201,8 @@ fn an_agreeing_round_that_moves_nothing_reports_stationary() {
     "so the round must REPORT that, and it reports `{outcome}`. A caller may \
      read `progressed` as \"something moved\" and act on it -- drive a progress \
      indicator, decide a stream has stalled, stop re-offering audio that will \
-     never be confirmed -- and this round moved nothing.",
+     never be confirmed -- and this round moved neither the watermark nor the \
+     confirmed prefix.",
   );
 }
 

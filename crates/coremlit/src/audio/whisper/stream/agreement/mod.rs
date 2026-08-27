@@ -565,8 +565,8 @@
 //!    flagged, not taken.
 //! 6. **A whole hypothesis RE-TIMED past the watermark is confirmed twice, and
 //!    the shape cannot be built without also building a re-admission.** Offer a
-//!    113-word tied run at 2 s twice, then the SAME 113 words at 3 s: the first
-//!    pair advances and anchors just past 2 s, the second pair is entirely
+//!    113-word tied run at 2 s twice, then the SAME 113 words at 3 s twice: the
+//!    first pair advances and anchors just past 2 s, the second pair is entirely
 //!    strictly past that anchor, so it agrees with itself and is confirmed as
 //!    well, which double-counts those words: the stream is credited with more
 //!    confirmed words than it actually offered. Not new here — `main` shows the
@@ -784,9 +784,9 @@ impl AgreementOutcome {
   /// This is the question the single `Advanced` variant used to answer, and it
   /// is kept as a predicate rather than dropped because it is a real and
   /// separate question from progress: `finalize` folds in every kept result, so
-  /// a `Stationary` round contributed to the transcript even though it moved
-  /// nothing. What it must NOT be used for is deciding that something advanced —
-  /// that is `is_progressed()`.
+  /// a `Stationary` round contributed to the transcript even though NEITHER of
+  /// the two SETTLED channels moved. What it must NOT be used for is deciding
+  /// that something advanced — that is `is_progressed()`.
   ///
   /// It is not the KEPT predicate. [`Self::AwaitingAgreement`] covers two
   /// routes, and the first-ever result reaches it and IS kept
