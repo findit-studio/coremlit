@@ -626,9 +626,14 @@ mod tests;
 
 /// One `LocalAgreement::ingest` call's outcome. It answers TWO questions, not
 /// one: whether the new result AGREED with the previous one and was kept, and —
-/// where it did — whether anything a caller can observe actually MOVED. The
-/// second question is why there are two agreeing variants, [`Self::Progressed`]
-/// and [`Self::Stationary`]; the remaining two are the round that did not agree
+/// where it did — whether either of the two SETTLED channels actually MOVED.
+/// Those two are [`LocalAgreement::last_agreed_seconds`] and
+/// [`LocalAgreement::confirmed_words_slice`], and they are the whole of what
+/// progress means here — NOT everything a caller can observe, since the
+/// holdback is observable too and is deliberately excluded (see
+/// [`Self::Stationary`], "What is NOT a progress channel"). The second question
+/// is why there are two agreeing variants, [`Self::Progressed`] and
+/// [`Self::Stationary`]; the remaining two are the round that did not agree
 /// ([`Self::AwaitingAgreement`]) and the result with no word timings to agree
 /// over at all ([`Self::NoWordTimings`]).
 ///
@@ -645,7 +650,7 @@ mod tests;
 pub enum AgreementOutcome {
   /// The round AGREED — the new hypothesis and the previous one shared at least
   /// [`LocalAgreement::agreement_count_needed`] words, so the result was KEPT
-  /// rather than dropped — AND something a caller can observe MOVED:
+  /// rather than dropped — AND one of the two SETTLED channels MOVED:
   /// [`LocalAgreement::last_agreed_seconds`] came back with different bits, or
   /// [`LocalAgreement::confirmed_words_slice`] grew, or both.
   ///
@@ -659,11 +664,16 @@ pub enum AgreementOutcome {
   /// [`Self::Stationary`] for why the split cannot be asked instead.
   Progressed,
   /// The round AGREED and its result was KEPT, exactly as [`Self::Progressed`],
-  /// but NOTHING a caller can observe moved:
+  /// but NEITHER of the two SETTLED channels moved:
   /// [`LocalAgreement::last_agreed_seconds`] came back BIT-identical and
   /// [`LocalAgreement::confirmed_words_slice`] is unchanged. A caller polling
-  /// the engine on this outcome reads back the same watermark and the same
-  /// words it read last round.
+  /// those two on this outcome reads back the same watermark and the same
+  /// confirmed words it read last round.
+  ///
+  /// Deliberately NOT "nothing observable moved". The holdback is observable
+  /// and DOES move here, routinely — see "What is NOT a progress channel"
+  /// below, which is why the two channels above are named rather than
+  /// generalized.
   ///
   /// Not an edge case: it is the ordinary steady state of a stream whose rounds
   /// re-agree on exactly `agreement_count_needed` words and hold all of them.
@@ -1593,8 +1603,12 @@ impl LocalAgreement {
 ///    backwards start reaches the same place the same way once the floor is
 ///    above it, which is the second half of residual 1 and the only route it
 ///    has left since codex round 8. `add_word_timestamps` produces the tied-run
-///    shape from an ALL-ZERO alignment matrix (113 ordinary one-token words at
-///    one instant, measured at 130), so it is the reachable one.
+///    shape from an ALL-ZERO alignment matrix -- DTW's tie-break walks the path
+///    down column 0, so every word lands at one instant, zero-duration and one
+///    token each -- so it is the reachable one. The width is whatever the
+///    gathered tokens supply; the fixtures that drive this residual build 113 of
+///    them (`a_tied_run_above_the_budget_floor_advances_instead_of_stalling`,
+///    `an_over_budget_tied_run_strands_its_suffix_at_the_settled_instant`).
 ///
 ///    **What this costs, and why it is not a DEFERRAL** (#94, measured on this
 ///    branch; see this module's doc, "Why there is no deferral"). The empty

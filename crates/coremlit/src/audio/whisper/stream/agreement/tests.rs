@@ -1083,9 +1083,10 @@ fn the_split_never_cuts_at_a_tied_start() {
         let confirmed_high_before = highest_start(agreement.confirmed_words_slice());
         let outcome = agreement.ingest_streamed(result_with_words(offered));
         // THE HONEST SIGNAL, asserted on every round of every trial: an
-        // agreeing round says `progressed` exactly when one of the two things a
-        // caller can observe moved, and `stationary` exactly when neither did;
-        // a round that did not agree moves neither.
+        // agreeing round says `progressed` exactly when one of the two SETTLED
+        // channels moved -- the watermark and the confirmed prefix, not
+        // everything a caller can observe -- and `stationary` exactly when
+        // neither did; a round that did not agree moves neither.
         //
         // Mutation proof, and the reason this rides the sweep rather than only
         // the two hand-built pairs: decide progress by `split != 0` instead of
@@ -1443,8 +1444,9 @@ fn an_over_budget_tied_run_strands_its_suffix_at_the_settled_instant() {
   // an ALL-ZERO alignment matrix -- the zero-fill
   // `add_word_timestamps_zero_pads_missing_rows` pins -- because DTW's tie-break
   // walks the path down column 0 and every text-index step there records the
-  // same boundary time. Measured on that stack: 130 words, all at 0.0, all
-  // zero-duration, one token each.
+  // same boundary time: every word lands at 0.0, zero-duration, one token each.
+  // The COUNT is whatever the gathered tokens supply, so the 113 this test uses
+  // is its own construction rather than a measurement of that stack.
   //
   // WHY IT IS ACCEPTED. To a timestamp filter a genuinely new word at the run's
   // instant and a re-offer of the run's own last word are the same value, which
@@ -3761,9 +3763,13 @@ fn a_tied_run_above_the_budget_floor_advances_instead_of_stalling() {
   // the split runs off the END of `common`. A repeated hypothesis grows nothing,
   // so the state is the same again next round and the round after.
   // `add_word_timestamps` produces exactly that shape from an ALL-ZERO alignment
-  // matrix (`add_word_timestamps_zero_pads_missing_rows`; measured at 130 such
-  // words), which is why this is the reachability answer for the finding rather
-  // than the shape above.
+  // matrix -- DTW's tie-break walks the path down column 0, so every text-index
+  // step records the same boundary time -- which is why this is the reachability
+  // answer for the finding rather than the shape above. The zero-fill that makes
+  // such a matrix reachable is pinned by
+  // `add_word_timestamps_zero_pads_missing_rows` in `segment/tests.rs`; the
+  // WIDTH of the run is this test's own 113, built here, and no fixture in this
+  // repository measures a different one.
   //
   // Nothing is stranded on the FIRST half: `beyond_common` is EMPTY, so the
   // watermark filters nothing away that any hypothesis had produced, and BOTH of
@@ -5096,13 +5102,20 @@ fn an_agreeing_round_that_moves_nothing_reports_stationary() {
   // Was `characterization_an_agreeing_round_returns_advanced_without_moving_the_
   // watermark`, which PINNED the dishonest signal and named the correct answer
   // in its own failure message. This asserts that answer instead: a round that
-  // agreed, kept its result and moved NOTHING says so.
+  // agreed, kept its result and moved neither the watermark nor the confirmed
+  // prefix says so. Not "moved nothing" -- its holdback is replaced wholesale,
+  // which is observable and is deliberately not a progress channel.
   //
-  // WHY IT MATTERS, measured rather than argued. On the pathological input
-  // `the_split_never_cuts_at_a_tied_start` builds, 399 of 400 rounds are this
-  // one. While both agreeing cases shared a single `Advanced`, a caller with a
-  // stall watchdog keyed on the outcome saw 399 consecutive reports of progress
-  // and could not tell the stall from a working stream.
+  // WHY IT MATTERS, measured rather than argued -- and measured on fixtures
+  // THIS REPOSITORY RUNS, so every figure here is reproducible by running them.
+  // `a_permanently_backwards_tail_confirms_at_the_budget_rather_than_holding_forever`
+  // reaches this state on 110 CONSECUTIVE rounds of its 120, asserted there
+  // against a floor of 100. `the_split_never_cuts_at_a_tied_start`'s 512-trial
+  // sweep reaches it on 1281 of its 2965 agreeing rounds, 4233 rounds in all,
+  // asserted there against a floor of 256. While both agreeing cases shared a
+  // single `Advanced`, a caller with a stall watchdog keyed on the outcome read
+  // every one of those as progress -- 110 in an unbroken run -- and could not
+  // tell the stall from a working stream.
   //
   // The MINIMAL PAIR is
   // `an_agreeing_round_with_a_zero_split_and_drifting_timings_progresses`: the
