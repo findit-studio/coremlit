@@ -76,15 +76,18 @@
 //!   BACKING OFF when the forward search would run off the end of `common`,
 //!   because widening past a tied run that reaches that end would empty the
 //!   holdback and anchor the watermark on the run's own last word, and finally
-//!   DEFERRING the round outright where the prefill budget floor sits at or
+//!   DEFERRING the round outright — where the prefill budget floor sits at or
 //!   above every legal boundary, which is where the back-off has nowhere legal
-//!   to land. And where the holdback is empty anyway — a single word the prefill
-//!   cannot carry WHOLE is the only thing that can still do that —
-//!   `LocalAgreement::ingest` anchors the watermark at
-//!   `end.max(start.next_up())` rather than at `end`, since `end == start` for a
-//!   zero-duration word. `next_up` is the IMMEDIATE f32 successor: it refuses
-//!   exactly the one instant the confirmed word occupies and no span of
-//!   instants, which an `end + epsilon` tolerance would not have managed.
+//!   to land, and where the budget FORCES the empty holdback but the watermark
+//!   that advance would set lies past a word the newer hypothesis produced
+//!   beyond `common`. And where the holdback is empty anyway — a single word the
+//!   prefill cannot carry WHOLE is the only thing that can still do that, and
+//!   only while it strands nothing — `LocalAgreement::ingest` anchors the
+//!   watermark at `empty_holdback_watermark`'s `end.max(start.next_up())` rather
+//!   than at `end`, since `end == start` for a zero-duration word. `next_up` is
+//!   the IMMEDIATE f32 successor: it refuses exactly the one instant the
+//!   confirmed word occupies and no span of instants, which an `end + epsilon`
+//!   tolerance would not have managed.
 //!
 //!   The DEFERRAL closes a DELETION rather than a re-confirmation (codex round 3
 //!   on PR #95). A tied run whose own tokens exceed
@@ -101,6 +104,23 @@
 //!   falsifier. Deferring costs nothing on the round itself, since
 //!   `LocalAgreement::finalize` emits the same words either way, and TAIL growth
 //!   relieves it.
+//!
+//!   The FORCED empty holdback — the arm that first repair deliberately left
+//!   alone — strands the same way and needs the same guard (codex round 3 on
+//!   PR #95, second finding). Where the budget floor itself reaches
+//!   `common.len()` the split ran off the end unconditionally, deciding on
+//!   `common` alone and never looking at what the newer hypothesis produced past
+//!   it. What that costs is a RETRACTION rather than a deletion: the round's own
+//!   `LocalAgreement::finalize` PUBLISHES the stranded word through
+//!   `find_longest_different_suffix`, and only the NEXT hypothesis loses it, so
+//!   `confirmed_words`' append-only guarantee is intact throughout and cannot
+//!   see it. The forced advance is therefore taken exactly while it strands
+//!   nothing, which is also the whole of what keeps its original case alive: a
+//!   `common` with nothing beyond it has no anchor to wait for, and deferring
+//!   there would wait forever.
+//!   `a_forced_empty_holdback_defers_rather_than_retracting_its_suffix` is the
+//!   falsifier, and it needs both of its `finalize` points — the retraction is
+//!   only visible across two.
 //!
 //!   The first shape of this rule widened unconditionally and left the empty
 //!   holdback anchored at `end`, which put the ORIGINAL duplicate-confirmation
@@ -198,11 +218,13 @@
 //!   advance can leave the holdback EMPTY** and the watermark anchored on the
 //!   last confirmed word's own far edge instead of the first held one's start.
 //!   A single word whose OWN tokens exceed the budget is now the only thing that
-//!   can do that — Rule W's own widening backs off, and DEFERS where the
-//!   back-off has nowhere legal to land, rather than emptying (see
-//!   `split_at_a_strict_boundary`) — and the
-//!   anchor is `end.max(start.next_up())`, so a zero-duration word there is
-//!   still strictly behind the watermark. It has to:
+//!   can do that, and only on a round where nothing the newer hypothesis
+//!   produced beyond `common` starts before the watermark it would set — Rule
+//!   W's own widening backs off, and DEFERS both where the back-off has nowhere
+//!   legal to land and where the forced advance would strand such a word, rather
+//!   than emptying (see `split_at_a_strict_boundary`) — and the
+//!   anchor is `empty_holdback_watermark`'s `end.max(start.next_up())`, so a
+//!   zero-duration word there is still strictly behind the watermark. It has to:
 //!   stopping while one word remained left a single word whose OWN tokens exceed
 //!   the budget held anyway, and the cap silently did not cap (codex round 7,
 //!   finding 2). What followed was data loss rather than a stall — the next
@@ -234,9 +256,10 @@
 //!   `LocalAgreement::finalize` instead emits the final hypothesis's own
 //!   post-watermark words on that path (`holdback_superseded` is the flag), and
 //!   on the DEFERRED one too (`split_deferred`), where the hypotheses agreed but
-//!   no legal split existed at or above the prefill budget floor so the holdback
-//!   is an earlier agreement's and Swift's sum would drop everything between it
-//!   and `common`'s end. It keeps Swift's shape everywhere else — including when
+//!   the only split available was one Rule W refuses — nothing legal at or above
+//!   the prefill budget floor, or a forced empty holdback that would strand the
+//!   hypothesis's own suffix — so the holdback is an earlier agreement's and
+//!   Swift's sum would drop everything between it and `common`'s end. It keeps Swift's shape everywhere else — including when
 //!   the final hypothesis contributes nothing at or past the watermark, where
 //!   nothing supersedes the holdback. How much of the holdback that path actually replaces is the
 //!   window's question, below; what is NOT replaced is emitted ahead of the
@@ -365,8 +388,19 @@
 //!    (codex round 3 on PR #95;
 //!    `an_over_budget_tied_run_defers_rather_than_stranding_its_suffix`), which
 //!    is what restores this sentence.
+//!
+//!    It is narrower again since round 3's second finding: the word this drops
+//!    must be one no hypothesis had produced YET at the moment of the advance.
+//!    A word already visible past `common` when the split runs is not dropped —
+//!    the forced arm defers rather than stranding it
+//!    (`a_forced_empty_holdback_defers_rather_than_retracting_its_suffix`). So
+//!    what remains is exactly the word the NEXT decode invents at an instant
+//!    already settled, which is the one case no watermark can tell from a
+//!    re-offer.
 //!    `a_zero_duration_word_at_an_empty_holdback_is_not_re_confirmed` drives it
-//!    at count 1, and `the_split_never_cuts_at_a_tied_start` sweeps both counts.
+//!    at count 1 — its dropped `" B"` arrives one hypothesis later, which is why
+//!    it is still dropped — and `the_split_never_cuts_at_a_tied_start` sweeps
+//!    both counts.
 //! 2. **A repeat the engine's record cannot account for** is the stream's own,
 //!    on the untied input — and on a TIED one Rule W deletes it instead. Both
 //!    directions are pinned:
@@ -431,8 +465,9 @@ pub enum AgreementOutcome {
   /// The watermark is unchanged. Three routes reach it: there is no previous
   /// result to agree with yet (the first ingested result); the new hypothesis
   /// disagreed with the previous one, in which case the result was dropped
-  /// rather than kept; or the two agreed and the round was DEFERRED because no
-  /// legal split exists at or above the prefill budget floor (see
+  /// rather than kept; or the two agreed and the round was DEFERRED because
+  /// every split Rule W would accept is one the prefill budget refuses, or the
+  /// one the budget forces would strand the hypothesis's own suffix (see
   /// `split_at_a_strict_boundary`), in which case the result was kept like any
   /// other agreeing one. The deferral is deliberately not its own variant: what
   /// this value reports is whether the watermark moved, and no in-crate caller
@@ -524,9 +559,11 @@ pub struct LocalAgreement {
   /// had words to agree over — exactly the pair `finalize` reasons about.
   holdback_superseded: bool,
   /// Whether the most recent WORDED hypothesis AGREED with the previous one and
-  /// the round still did not advance, because
-  /// `split_at_a_strict_boundary` found no legal boundary at or above the
-  /// prefill budget floor (#94, codex round 3 on PR #95). `Self::finalize` needs
+  /// the round still did not advance, because `split_at_a_strict_boundary` had
+  /// no acceptable boundary to advance to: none legal at or above the prefill
+  /// budget floor, or a forced empty holdback whose watermark would have
+  /// stranded a word this hypothesis produced beyond `common` (#94, codex
+  /// round 3 on PR #95, both findings). `Self::finalize` needs
   /// it for the same reason it needs [`Self::holdback_superseded`]: on such a
   /// round the holdback belongs to an EARLIER agreement while
   /// [`Self::hypothesis_words`] already re-covers that whole span and more, so
@@ -855,29 +892,36 @@ impl LocalAgreement {
       if common.len() >= self.agreement_count_needed {
         // :383-394 — advance the watermark.
         let requested = common.len() - self.agreement_count_needed;
-        // RULE W'S DEFERRAL (#94, codex round 3 on PR #95). `None` is "the two
-        // hypotheses agreed, but no legal boundary sits at or above the prefill
-        // budget floor" -- a tied run whose OWN tokens exceed the budget puts
-        // the floor strictly inside the run, so every boundary the forward
-        // search and the back-off can reach ties, and split 0, the one boundary
-        // a tied run always leaves legal, is below the floor.
+        // RULE W'S DEFERRAL (#94, codex round 3 on PR #95, both findings).
+        // `None` is "the two hypotheses agreed, but every advance available is
+        // one Rule W refuses", and two states reach it. A tied run whose OWN
+        // tokens exceed the budget puts the floor strictly inside the run, so
+        // every boundary the forward search and the back-off can reach ties, and
+        // split 0, the one boundary a tied run always leaves legal, is below the
+        // floor. Or the budget FORCES the empty holdback and the watermark that
+        // advance would anchor lies past a word this hypothesis produced beyond
+        // `common` -- which is why `hypothesis_words` past `common` is passed
+        // in: on `common` alone that arm cannot see what it would strand.
         //
-        // Widening off the end there -- what the old fallback did -- confirms
-        // the whole run, empties the holdback and anchors the watermark strictly
-        // PAST the run's instant. Every word the newest hypothesis produced at
-        // that same instant beyond `common` is then stranded: nothing confirmed
-        // it, the next worded ingest filters it out of BOTH hypotheses at once,
-        // and `finalize` has nothing left to recover it from. A deletion, which
-        // is this module's non-preferred direction.
+        // Advancing in either state empties the holdback and anchors the
+        // watermark strictly PAST the last confirmed instant. Every word the
+        // newest hypothesis produced at that same instant beyond `common` is
+        // then stranded: nothing confirmed it, the next worded ingest filters it
+        // out of BOTH hypotheses at once, and `finalize` has nothing left to
+        // recover it from -- after THIS round's `finalize` already published it
+        // through `find_longest_different_suffix`. A deletion, and on the forced
+        // arm a retraction, which is this module's non-preferred direction.
         //
         // So the round simply does not advance. It costs nothing that round --
         // `finalize` emits `confirmed ++ hypothesis_words` either way, see
         // `Self::finalize` -- and it is not the blocking policy this issue's
         // ledger refuted for deadlock: TAIL growth relieves it, the same relief
         // `split_at_a_strict_boundary`'s back-off already relies on, since one
-        // word starting strictly later opens a boundary above the floor.
+        // word starting strictly later opens a boundary above the floor and one
+        // word joining `common` gives an interior split something to hold.
         let boundary = split_at_a_strict_boundary(
           common,
+          &self.hypothesis_words[common.len()..],
           requested,
           self.confirmed_words.last().map(WordTiming::start),
         );
@@ -891,21 +935,15 @@ impl LocalAgreement {
           // start, which `split_at_a_strict_boundary` has already placed STRICTLY
           // past the last confirmed word's start.
           //
-          // With NOTHING held back -- which now takes a single word whose OWN
+          // With NOTHING held back -- which takes a single word whose OWN
           // tokens exceed the prefill budget, the one thing that pushes the
-          // budget floor to `common.len()`; an over-budget tied RUN defers
-          // instead (see `split_at_a_strict_boundary`) -- there is no held word
-          // to measure against and the still-open span begins where the
-          // confirmed one ends.
-          // `end` is the answer whenever the last confirmed word has any duration
-          // at all; where it does NOT, `end == start` and the word would satisfy
-          // `watermark_filtered`'s own `start >= watermark` against its own
-          // confirmation, which is the whole of #94. The watermark is therefore the
-          // first instant that is strictly past that start: `next_up` is the
-          // IMMEDIATE f32 successor, so nothing representable lies between it and
-          // the start it excludes, and it is a successor rather than a tolerance --
-          // no span of instants is moved, only the single instant the confirmed
-          // word already occupies is refused.
+          // budget floor to `common.len()`, on a round where nothing beyond
+          // `common` would be stranded by the result; an over-budget tied RUN
+          // and a live strand both defer instead (see
+          // `split_at_a_strict_boundary`) -- there is no held word to measure
+          // against, and `empty_holdback_watermark` is the answer. That is the
+          // SAME function the deferral decision above consults, deliberately:
+          // the guard and the value it guards may not drift apart.
           //
           // Monotone: every word of `common` starts at or past the old watermark,
           // `end >= start` for any word the pipeline emits, and `next_up` only
@@ -918,9 +956,9 @@ impl LocalAgreement {
           // fallback is unreachable and only keeps this total.
           self.last_agreed_seconds = self.last_agreed_words.first().map_or_else(
             || {
-              common.last().map_or(self.last_agreed_seconds, |last| {
-                last.end().max(last.start().next_up())
-              })
+              common
+                .last()
+                .map_or(self.last_agreed_seconds, empty_holdback_watermark)
             },
             WordTiming::start,
           );
@@ -1122,7 +1160,8 @@ impl LocalAgreement {
 ///    over the HEAD of the offered list, which only an advance can move, whereas
 ///    this defers a split position that TAIL growth relieves, and it advances
 ///    the holdback rather than refusing the round.
-/// 3. **`None` -- DEFER** where the budget floor is `1` or more and no legal
+/// 3. **`None` -- DEFER**, on either of two states. The first is where the
+///    budget floor is `1` or more and no legal
 ///    boundary sits at or above it. A tied run whose OWN tokens exceed
 ///    `MAX_HOLDBACK_PREFILL_TOKENS` is the shape: the floor lands strictly
 ///    inside the run, every boundary the search and the back-off can reach ties,
@@ -1147,9 +1186,21 @@ impl LocalAgreement {
 ///    `finalize` emits `confirmed ++ hypothesis_words` either way (see
 ///    `LocalAgreement::finalize`) -- and the divergence is entirely in what
 ///    LATER ingests can still see.
-/// 4. **`Some(common.len())`** -- tested FIRST in the code, since it is a
-///    property of the budget alone and neither search runs on it. Only where the
-///    BUDGET FLOOR itself reaches `common.len()` is that length
+///
+///    The second state is arm 4's, refused: the budget FORCES the empty
+///    holdback, and the watermark that advance would set --
+///    `empty_holdback_watermark(common.last())` -- lies strictly past a word of
+///    `beyond_common`. That word is stranded exactly as above, and what it costs
+///    is one step worse: this round's own `finalize` PUBLISHES it, through
+///    `find_longest_different_suffix`, so losing it on the next ingest RETRACTS
+///    transcript rather than merely never emitting it. `confirmed_words`'
+///    append-only guarantee never sees it -- the word was never confirmed. The
+///    same relief applies: tail growth either moves the strand into `common`,
+///    where an ordinary interior split can hold it, or opens a boundary above
+///    the floor.
+/// 4. **`Some(common.len())`** -- tested FIRST in the code, since its condition
+///    is a property of the budget alone and neither search runs on it. Only
+///    where the BUDGET FLOOR itself reaches `common.len()` is that length
 ///    returned and the holdback left empty. That takes a LAST word whose own
 ///    tokens exceed the budget, since nothing else runs `budgeted_split`'s loop
 ///    off the end, and it is the one state where the empty holdback is FORCED:
@@ -1157,7 +1208,26 @@ impl LocalAgreement {
 ///    to wait for and deferring would wait forever. Confirming is round 7
 ///    finding 2's own repair, and `LocalAgreement::ingest`'s watermark then
 ///    anchors strictly past the last confirmed start rather than at its `end`.
-///    This arm is now the WHOLE of what reaches the empty holdback.
+///    This arm is the WHOLE of what reaches the empty holdback.
+///
+///    "There is no anchor to wait for" is a claim about `common` alone, and it
+///    is why this arm may not simply defer -- but the ADVANCE is not a property
+///    of `common` alone, which is what `beyond_common` is here to supply. Where
+///    a word past `common` would be stranded by this arm's own watermark, arm 3
+///    takes the round instead; where nothing is, this arm advances exactly as
+///    before. The guard is that narrow on purpose: widening it to "defer
+///    whenever the budget forces the empty holdback" re-opens round 7 finding
+///    2, which is the wait that never ends.
+///
+///    An EMPTY `common` reaches this arm too (`floor == 0 == common.len()`) and
+///    advances: there is no word to anchor a watermark on, so there is nothing
+///    to strand, and `LocalAgreement::ingest`'s own fallback leaves the
+///    watermark where it was. Like the `at == 0` check above it carries NO
+///    falsifier -- `LocalAgreement::ingest` only calls this with
+///    `common.len() >= agreement_count_needed`, which is clamped to at least one
+///    -- and, like it, it is written out so this function is total on its own
+///    terms rather than on its caller's clamp. Flipping it to defer reds nothing
+///    in this crate.
 ///
 /// So `agreement_count_needed` is a target rather than an exact width in EITHER
 /// direction: the budget can shorten the holdback (see `budgeted_split`) and
@@ -1172,10 +1242,25 @@ impl LocalAgreement {
 /// the offered filter, and the re-admission question is unrepresentable rather
 /// than defended against.
 ///
-/// It stays TOTAL under the `None` arm rather than becoming conditional again:
-/// a deferred round is not an advance, so it moves neither side of the
+/// It stays TOTAL under both `None` states rather than becoming conditional
+/// again: a deferred round is not an advance, so it moves neither side of the
 /// inequality and there is no state for the claim to be excluded from. `None`
-/// REMOVES reachable advances rather than adding unguarded ones.
+/// REMOVES reachable advances rather than adding unguarded ones, and the second
+/// state removes a strict subset of arm 4's, which the `next_up` anchor already
+/// carried.
+///
+/// # A second postcondition
+///
+/// After every advance, every word of the driving hypothesis that the advance
+/// did NOT confirm still satisfies `LocalAgreement::watermark_filtered`'s own
+/// `start >= last_agreed_seconds`, so the round cannot put a word it left
+/// unsettled out of the next round's reach. Where the split is interior this is
+/// free -- the watermark is `common[split].start()` and word starts inside one
+/// hypothesis are non-decreasing, so everything from `split` on is at or past
+/// it. Where the split is `common.len()` the watermark is strictly PAST the last
+/// confirmed start, so it is not free, and the `beyond_common` test in arm 4 is
+/// what buys it. `the_split_never_cuts_at_a_tied_start` sweeps it beside the
+/// first postcondition.
 ///
 /// It is a claim about the LAST confirmed word, and that is as strong as it needs
 /// to be exactly while word starts inside one hypothesis are non-decreasing --
@@ -1183,6 +1268,7 @@ impl LocalAgreement {
 /// for the backwards-starts input the `pub(crate)` seal excludes.
 fn split_at_a_strict_boundary(
   common: &[WordTiming],
+  beyond_common: &[WordTiming],
   requested: usize,
   confirmed_last_start: Option<f32>,
 ) -> Option<usize> {
@@ -1202,10 +1288,30 @@ fn split_at_a_strict_boundary(
     // prefill could carry, which takes a LAST word whose own tokens exceed
     // `MAX_HOLDBACK_PREFILL_TOKENS` (that is the only way the loop in
     // `budgeted_split` runs off the end). Confirming it is always available and
-    // is round 7 finding 2's own repair; deferring would wait for an anchor that
-    // can never arrive. `LocalAgreement::ingest`'s `next_up` anchor then keeps
-    // the postcondition on this path, and this arm is the whole of what still
-    // reaches it.
+    // is round 7 finding 2's own repair; deferring where nothing would be
+    // stranded would wait for an anchor that can never arrive.
+    //
+    // But the advance would anchor the watermark at
+    // `empty_holdback_watermark(common.last())`, and every word the newer
+    // hypothesis produced BEFORE that instant beyond `common` is stranded by it
+    // (codex round 3 on PR #95, second finding): the next worded ingest filters
+    // it out of both hypotheses at once, and it is a word THIS round's
+    // `LocalAgreement::finalize` already published through
+    // `find_longest_different_suffix`. So the forced advance is available
+    // exactly while it strands nothing, and the strand is what
+    // `beyond_common` is here to see -- without it this arm decides on `common`
+    // alone and cannot know what lies past it.
+    //
+    // `start < watermark` is `watermark_filtered`'s own `start >= watermark`
+    // negated, and totally so: every word of `beyond_common` reached this call
+    // through that filter, so none of their starts is NaN.
+    let strands_a_suffix = common.last().is_some_and(|last| {
+      let watermark = empty_holdback_watermark(last);
+      beyond_common.iter().any(|word| word.start() < watermark)
+    });
+    if strands_a_suffix {
+      return None;
+    }
     return Some(common.len());
   }
   let widened = requested.max(floor);
@@ -1326,6 +1432,28 @@ fn budgeted_split(common: &[WordTiming], requested: usize) -> usize {
     split += 1;
   }
   split
+}
+
+/// The watermark an advance that holds NOTHING back anchors at: the first
+/// instant strictly past `last`'s start, where `last` is the word that advance
+/// confirms last.
+///
+/// `end` is the answer whenever that word has any duration at all; where it does
+/// NOT, `end == start` and the word would satisfy
+/// `LocalAgreement::watermark_filtered`'s own `start >= watermark` against its
+/// own confirmation, which is the whole of #94. `next_up` is the IMMEDIATE `f32`
+/// successor, so nothing representable lies between the result and the start it
+/// excludes: exactly one instant is refused rather than a span, which an
+/// `end + epsilon` tolerance would not have managed.
+///
+/// It is a named function rather than an expression at its one obvious site
+/// because it has TWO callers with opposite jobs and they may not disagree.
+/// `LocalAgreement::ingest` SETS this watermark; `split_at_a_strict_boundary`
+/// decides whether setting it would strand a word the newer hypothesis produced
+/// beyond `common`, which is a question about this exact value. Computing it
+/// twice would let the guard drift off the thing it guards, silently.
+fn empty_holdback_watermark(last: &WordTiming) -> f32 {
+  last.end().max(last.start().next_up())
 }
 
 // ---------------------------------------------------------------------
