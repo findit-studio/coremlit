@@ -8,6 +8,25 @@ fn word(text: &str, start: f32, end: f32) -> WordTiming {
   WordTiming::new(text, vec![start as u32 + 1], start, end, 0.9)
 }
 
+/// The instant an empty-holdback advance anchors at when the word it settles
+/// last is ZERO-DURATION and sits at 1.0 s: the exact time of sample 16001, the
+/// first sample strictly after the one 1.0 s clips to.
+///
+/// Written as the sample's own instant rather than by calling the engine's
+/// `past_the_settled_instant`, so these assertions state which SAMPLE the
+/// anchor has to clear rather than repeating the arithmetic that produced it.
+/// The `f32::next_up` anchor this replaced was `1.0000001` — a real step in
+/// seconds and no step at all in samples, so the next stride re-read the
+/// settled word's own audio while the module doc claimed it had been clipped
+/// away (#94, codex round 7 on PR #95, finding 2). The pin that the two
+/// coordinate systems agree is
+/// `the_watermark_clears_the_settled_sample_not_just_the_settled_instant`.
+const PAST_ONE_SECOND: f32 = 1.0000625;
+
+/// The same anchor for a zero-duration settled word at 2.0 s — sample 32001's
+/// own instant. See [`PAST_ONE_SECOND`].
+const PAST_TWO_SECONDS: f32 = 2.0000625;
+
 /// A word carrying `token_count` distinct plain-vocabulary token ids — for the
 /// prefill-budget cases, where what matters is how many TOKENS the holdback
 /// costs, not how many words it holds. Ids stay far below any Whisper
@@ -447,58 +466,70 @@ fn the_split_never_cuts_at_a_tied_start() {
   // the drift stays inside the gap in front of the watermark, so the sweep
   // reaches the re-timing without ever reaching the whole-run jump past it.
   //
-  // Measured on the shape below, at 512 trials: 495 tied truths, 2482
-  // observations, 413 empty holdbacks, 141 fallback rounds (46 of them through
-  // the aggregate route), 34 forced-arm rounds with a live suffix, 1162
-  // contradicting rounds, 38 strands at the settled instant, 759 drifted
-  // advances, and 10 rounds that erased a word from the published transcript.
+  // A SIXTH shape draws BACKWARDS starts (codex round 7 on PR #95, finding 1).
+  // Every shape above keeps its starts non-decreasing, which is the premise the
+  // second postcondition used to be free under on an interior split -- and
+  // `segment::update_segments_with_word_timings` does not honour it. The
+  // backwards draw reproduces that function's own clamp; `backward_truths` is
+  // this half's non-vacuity proof, and `backward_strands` proves the half of the
+  // exception only a backwards start can reach.
   //
-  // On the DEFERRAL shape this branch carried between `6987bec` and `b3ec5c6`,
-  // same draw: 2383 observations, 277 empty holdbacks, 113 rounds that WAITED
-  // where no legal boundary existed and 43 that escaped the wait, 49 forced-arm
-  // rounds, 29 tie strands and 26 erasures -- 2.6x the published retractions
-  // for a word apiece at the settled instant. That measurement is what removed
-  // it; see the engine module's doc, "Why there is no deferral".
+  // Measured on the shape below, at 512 trials: 477 tied truths, 2488
+  // observations, 410 empty holdbacks, 140 fallback rounds (40 of them through
+  // the aggregate route), 28 forced-arm rounds with a live suffix, 1041
+  // contradicting rounds, 166 backwards truths, 26 tie strands, 4 backwards
+  // strands, 696 drifted advances, and 13 rounds that erased a word from the
+  // published transcript.
+  //
+  // The DEFERRAL comparison that removed the wait was measured on the draw this
+  // test carried at `4b259ef`, BEFORE the backwards half existed: 26 words
+  // erased from the published transcript against this fallback's 10 on that
+  // identical draw, and 29 tie strands against 38. Adding a shape re-rolls every
+  // later draw, so those two columns cannot be re-derived from the numbers
+  // above and are not restated as if they could; the decision they support is
+  // in the engine module's doc, "Why there is no deferral", with the tree it
+  // compared against.
   //
   // The sweep draws starts from a coarse grid whose repeats make consecutive
   // words tie -- the `a=[0,0.5)/b=[0,1.0)` shape both #94 regressions are built
-  // from, generalized -- keeps them non-decreasing the way `find_alignment`
-  // guarantees (`segment::tests`: `w[i].end() <= w[i+1].start() + 1e-4`), and
-  // drives growing prefixes through `ingest_streamed`, the MARKED path the
-  // driver uses, so every advance carries the prefill premise the engine issues
-  // for itself. One stride in four omits the leading word, which is the rewrite
+  // from, generalized -- and drives growing prefixes through `ingest_streamed`,
+  // the MARKED path the driver uses, so every advance carries the prefill
+  // premise the engine issues for itself. The draw is non-decreasing BEFORE the
+  // backwards clamp, the way `find_alignment` guarantees (`segment::tests`:
+  // `w[i].end() <= w[i+1].start() + 1e-4`), and the clamp is the only thing that
+  // breaks it -- which is the pipeline's own arrangement. One stride in four
+  // omits the leading word, which is the rewrite
   // `omitting_a_confirmed_tied_word_does_not_drop_provisional_words` is built
   // from.
   //
   // Mutation proof, every row RUN on this shape. Make the boundary non-strict
   // (`<=` for `<` in `split_at_a_strict_boundary`) and the FIRST postcondition
-  // reds on a swept tie at trial 0. Drop the `.max(last.start().next_up())` from
-  // `empty_holdback_watermark` and it reds on a swept over-budget zero-duration
-  // word. Keep the fold but drop its `*start > last.start()` filter and it reds
-  // again, the watermark having landed on the confirmed word's own start.
-  // Return `common.len() - 1` from the final `unwrap_or` and it reds a third
-  // time. It does NOT red when the back-off arm is deleted outright: the
-  // empty-holdback anchor still holds the postcondition on that path, which is
-  // why the back-off is pinned in
+  // reds on a swept tie at trial 0. Drop the
+  // `.max(past_the_settled_instant(settled_high))` from `empty_holdback_anchor`
+  // and it reds on a swept over-budget zero-duration word. Keep the sparing fold
+  // but drop its `*start > settled_high` filter and it reds again, the watermark
+  // having landed on a confirmed word's own start. Return `common.len() - 1`
+  // from the final `unwrap_or` and it reds a third time. It does NOT red when
+  // the back-off arm is deleted outright: the empty-holdback anchor still holds
+  // the postcondition on that path, which is why the back-off is pinned in
   // `a_trailing_tied_run_never_confirms_itself_twice_at_the_default_count`
-  // (measured: that test alone reds, 384 of 385 still green).
+  // (measured: that test alone reds, 384 of 385 still green). It also does not
+  // red when the boundary is read against the ADJACENT predecessor rather than
+  // the running maximum: nothing this shape draws puts two backwards steps close
+  // enough together to need the difference, and
+  // `a_backwards_start_two_words_back_still_cannot_be_re_admitted` is that
+  // mutation's sole falsifier.
   //
-  // The SECOND postcondition has two clauses and they fail differently. Drop the
-  // sparing FOLD from `empty_holdback_watermark` (return
-  // `past_the_confirmed_start`) and the TIE clause reds on a strand BEYOND the
-  // settled instant -- `[(" B", 2.5)]` below a 3 s watermark at a 2.0 s settled
-  // start. Confirm one word FEWER on the advance (`common[..split - 1]`) and the
-  // `ran_off_the_end` GATE reds instead, on an INTERIOR round that stranded at
-  // the settled instant, where the tie clause is silent by construction.
-  //
-  // The gate reds NOTHING when mutated alone -- replace it with `true` and all
-  // 385 tests stay green -- and it is DOMINATED in the observed mutation set:
-  // every engine mutation that reaches a strand at all (no-`next_up`, no-fold,
-  // interior anchor at `end`, confirm-one-fewer) also trips the tie clause
-  // somewhere later in the sweep, so the gate is never the unique reason this
-  // test fails. It is kept because it is the clause that says WHICH arm may
-  // strand, which is the whole of residual 1's claim, and because under the
-  // confirm-one-fewer mutation it is the FIRST and most precise failure.
+  // The SECOND postcondition is one clause now, and the ARM gate that used to
+  // ride beside it is gone. Return `anchor` from `sparing_watermark` and it reds
+  // on a strand ABOVE the highest confirmed start. Confirm one word FEWER on the
+  // advance (`common[..split.saturating_sub(1)]`) and it reds again, on the word
+  // the round declined to settle. The gate said WHICH ARM may strand -- only a
+  // split that ran off the end of `common` -- and a backwards start makes that
+  // false: an interior split confirms past a word behind it and strands it too
+  // (`a_backward_start_from_the_segment_pipeline_does_not_strand_a_later_word`
+  // is the pipeline-built witness). What actually bounds the exception is the
+  // highest confirmed start, on either arm, so that is what is asserted.
   //
   // The SHAPE rows, each forced off and re-measured. `aggregate` off:
   // `aggregate_fallbacks` reds at `0 of 134`, the tied-run route to the empty
@@ -518,26 +549,33 @@ fn the_split_never_cuts_at_a_tied_start() {
   const TEXTS: [&str; 4] = [" A", " B", " C", " D"];
   // Repeated 0.0 entries are the ties; the rest keep the grid coarse enough for
   // two words to share an instant often.
-  const STEPS: [f32; 6] = [0.0, 0.0, 0.0, 0.5, 0.5, 1.0];
+  const STEPS: [f32; 7] = [0.0, 0.0, 0.0, 0.1, 0.5, 0.5, 1.0];
   // The 0.0 duration is a zero-length word, which is the one shape that could
   // satisfy `start >= watermark` from inside the confirmed list without a tie
-  // between two distinct starts.
-  const DURATIONS: [f32; 4] = [0.0, 0.2, 0.5, 1.0];
+  // between two distinct starts. The 0.55 is the BACKWARDS draw's own entry: the
+  // segment-start clamp fires only for a word spanning more than half a second
+  // and only moves it back by `CLAMP_MEDIAN - duration`, so 0.55 is the one
+  // duration here that both opens the branch and lands behind where it started
+  // -- by 0.15 s, which is wider than the 0.1 STEP so the clamped word can duck
+  // below a word the same round confirms rather than merely tying it.
+  const DURATIONS: [f32; 5] = [0.0, 0.2, 0.5, 0.55, 1.0];
+  /// `calculate_word_duration_constraints`' own ceiling (`median.min(0.7)`), and
+  /// the value `SegmentSeeker.swift:635-640` subtracts from a drifted first
+  /// word's END to get its new start.
+  const CLAMP_MEDIAN: f32 = 0.7;
 
   /// `None` when nothing is confirmed yet and the postcondition has nothing to
   /// speak about; otherwise `Some(the holdback was empty)`, which is the state
   /// this test's earlier shape skipped.
   fn postcondition(agreement: &LocalAgreement, trial: u32, stride: usize) -> Option<bool> {
-    let last = agreement.confirmed_words_slice().last()?;
+    let high = highest_start(agreement.confirmed_words_slice())?;
     assert!(
-      last.start() < agreement.last_agreed_seconds(),
-      "trial {trial}, stride {stride}: the confirmed list {:?} ends on {:?} at \
-       {}, which is not strictly before the {} s watermark -- that word passes \
+      high < agreement.last_agreed_seconds(),
+      "trial {trial}, stride {stride}: the confirmed list {:?} reaches {high}, \
+       which is not strictly before the {} s watermark -- that word passes \
        `watermark_filtered`'s own `start >= watermark` and can be re-admitted. \
        The holdback here is {:?}",
       confirmed_texts(agreement),
-      last.word(),
-      last.start(),
       agreement.last_agreed_seconds(),
       held_back_texts(agreement),
     );
@@ -548,74 +586,75 @@ fn the_split_never_cuts_at_a_tied_start() {
   /// (codex round 3 on PR #95, second finding): an advance may not push the
   /// watermark past a word of its own hypothesis that it did not CONFIRM.
   ///
-  /// Word starts inside one hypothesis are non-decreasing, so the words that
-  /// fall below the new watermark are a PREFIX of `hypothesis_words` -- and each
-  /// one is either a word this round appended to the confirmed list or a word
-  /// the stream can never offer again. Counting the first against the second is
-  /// the whole statement. It is TOTAL for the same reason the first
+  /// Every word of `hypothesis_words` past the split is either a word this
+  /// round appended to the confirmed list or a word the stream can still offer
+  /// again; anything else is a strand. It is TOTAL for the same reason the first
   /// postcondition is: a round that does not advance appends nothing and moves
   /// no watermark, and every word of `hypothesis_words` cleared `start >=
-  /// last_agreed_seconds` to be there at all, so both sides are zero.
+  /// last_agreed_seconds` to be there at all, so there is nothing below it.
   ///
   /// `appended` is measured across the call rather than read off a split, so
-  /// this cannot be satisfied by the same arithmetic that produced it.
+  /// this cannot be satisfied by the same arithmetic that produced it. The
+  /// unconfirmed words are `hypothesis_words[appended..]` exactly: `common` is a
+  /// PREFIX of `hypothesis_words` and the advance appends `common[..split]`, so
+  /// the index is the split. It used to be read as a filtered PREFIX instead,
+  /// which was only equivalent while starts were non-decreasing.
   ///
   /// IT HAS ONE EXCEPTION, and the exception is as narrow as the impossibility
-  /// that forces it: on a round whose split ran off the END of `common`, a
-  /// stranded word may sit at the last confirmed word's OWN start. There no
-  /// instant serves both -- every watermark strictly past that start (which the
-  /// first postcondition requires) filters the strand, and every watermark that
-  /// spares the strand re-admits the settled word. It is this module's
-  /// residual 1. `ran_off_the_end` gates it, so an INTERIOR advance may not use
-  /// it -- there the watermark is the first held word's own start and nothing
-  /// unconfirmed can be below it -- and `empty_holdback_watermark`'s sparing
-  /// fold is what keeps every other overlap out of it.
+  /// that forces it: a stranded word may sit at or below the HIGHEST confirmed
+  /// start. There no instant serves both -- every watermark strictly past that
+  /// start (which the first postcondition requires) filters the strand, and
+  /// every watermark that spares the strand re-admits the settled word. It is
+  /// this module's residual 1, and `sparing_watermark` is what keeps every other
+  /// overlap out of it.
+  ///
+  /// The exception is read at `<=` rather than `==` because BOTH halves are
+  /// reachable and they are reached differently. AT the highest start is the TIE
+  /// -- a zero-duration word an empty-holdback advance settles last, which is
+  /// what residual 1 has always been about. BELOW it is a BACKWARDS start:
+  /// `segment::update_segments_with_word_timings` can put a later word behind an
+  /// earlier one (codex round 7 on PR #95, finding 1), and an interior split can
+  /// then confirm past it. `tie_strands` and `backward_strands` count the two
+  /// separately so neither can pass by being unreachable.
   ///
   /// The gate used to read "this round ESCAPED a repeating deferral" (codex
-  /// round 4 on PR #95). Removing the deferral widened WHICH rounds may take the
-  /// exception and left its SHAPE untouched: measured over these 512 trials, 38
-  /// strands where the deferral had 29, every one of them at the settled
-  /// instant. Returns whether the exception was taken, which is the non-vacuity
-  /// proof that the empty holdback really strands something somewhere.
+  /// round 4 on PR #95), then "this round's split ran off the END of `common`".
+  /// The ARM gate is gone: with backwards starts an INTERIOR split strands too,
+  /// so the arm was never what bounded this -- the highest confirmed start is.
+  /// Returns whether the exception was taken.
   fn nothing_unconfirmed_falls_below_the_watermark(
     agreement: &LocalAgreement,
     appended: usize,
-    ran_off_the_end: bool,
     trial: u32,
     stride: usize,
-  ) -> bool {
-    let below: Vec<(&str, f32)> = agreement
-      .hypothesis_words
+  ) -> Option<bool> {
+    let watermark = agreement.last_agreed_seconds();
+    let stranded: Vec<(&str, f32)> = agreement.hypothesis_words[appended..]
       .iter()
-      .filter(|word| word.start() < agreement.last_agreed_seconds())
+      .filter(|word| word.start() < watermark)
       .map(|word| (word.word(), word.start()))
       .collect();
-    if below.len() <= appended {
-      return false;
+    if stranded.is_empty() {
+      return None;
     }
-    let settled = agreement
-      .confirmed_words_slice()
-      .last()
-      .map(WordTiming::start);
-    let stranded = &below[appended..];
+    let settled = highest_start(agreement.confirmed_words_slice());
     assert!(
-      ran_off_the_end
-        && stranded
-          .iter()
-          .all(|(_, start)| settled.is_some_and(|settled| *start <= settled)),
-      "trial {trial}, stride {stride}: {} words of the hypothesis are below \
-       the {} s watermark ({below:?}) but only {appended} were confirmed this \
-       round -- {stranded:?} are STRANDED: the next worded ingest filters them \
-       out of both hypotheses at once and `finalize` can no longer reach them, \
-       after this round's own `finalize` already published them. Only a round \
-       whose split ran off the END of `common` (this one did: \
-       {ran_off_the_end}) may strand, and only at or before the settled start \
-       {settled:?} -- with starts non-decreasing inside one hypothesis that is \
-       the exact TIE, where no watermark serves both",
-      below.len(),
-      agreement.last_agreed_seconds(),
+      stranded
+        .iter()
+        .all(|(_, start)| settled.is_some_and(|settled| *start <= settled)),
+      "trial {trial}, stride {stride}: {stranded:?} of the hypothesis are \
+       below the {watermark} s watermark and were NOT confirmed this round \
+       (which confirmed {appended}) -- they are STRANDED: the next worded \
+       ingest filters them out of both hypotheses at once and `finalize` can no \
+       longer reach them, after this round's own `finalize` already published \
+       them. Only a word at or below the highest confirmed start {settled:?} \
+       may go that way, which is where no watermark serves both claims",
     );
-    true
+    Some(
+      stranded
+        .iter()
+        .any(|(_, start)| settled.is_some_and(|settled| *start == settled)),
+    )
   }
 
   /// THE PUBLISHED TRANSCRIPT, with its timings — `LocalAgreement::finalize`'s
@@ -648,10 +687,12 @@ fn the_split_never_cuts_at_a_tied_start() {
   /// has since put out of reach. Nothing revised it; the engine simply cannot
   /// see it any more, and no later `finalize` can reach it.
   ///
-  /// Each such word must sit at the last confirmed word's OWN start, the one
-  /// instant where no watermark both clears the confirmed start (#94) and spares
-  /// the strand — this module's residual 1. Anything strictly below that is a
-  /// word the engine erased while it could still have held it.
+  /// Each such word must sit at or below the HIGHEST confirmed start, the range
+  /// where no watermark both clears every confirmed start (#94) and spares the
+  /// strand — this module's residual 1. Anything above that is a word the engine
+  /// erased while it could still have held it. It reads the high-water start
+  /// rather than the last confirmed word's because word starts inside one
+  /// hypothesis are not non-decreasing (codex round 7 on PR #95, finding 1).
   ///
   /// **What this does NOT catch, stated rather than implied.** Every retraction
   /// an empty-holdback advance can cause is AT the settled instant, so all of
@@ -689,10 +730,7 @@ fn the_split_never_cuts_at_a_tied_start() {
     stride: usize,
   ) -> bool {
     let watermark = agreement.last_agreed_seconds();
-    let settled = agreement
-      .confirmed_words_slice()
-      .last()
-      .map(WordTiming::start);
+    let settled = highest_start(agreement.confirmed_words_slice());
     // MULTISET, not set: the sweep's alphabet is four texts over a coarse grid,
     // so one transcript can carry the same (text, start) twice and a set-shaped
     // comparison would call the second copy retained by the first.
@@ -712,14 +750,14 @@ fn the_split_never_cuts_at_a_tied_start() {
     assert!(
       erased
         .iter()
-        .all(|(_, start)| settled.is_some_and(|settled| *start == settled)),
+        .all(|(_, start)| settled.is_some_and(|settled| *start <= settled)),
       "trial {trial}, stride {stride}: {erased:?} left the published transcript \
        while this very result still offers them, and they sit below the \
        {watermark} s watermark -- so nothing revised them, no hypothesis can \
        carry them again and no `finalize` can reach them, after this engine had \
-       already published them. Only the settled instant {settled:?} may lose a \
-       word that way. Transcript before: {before:?}; after: {after:?}; offered: \
-       {offered:?}; confirmed: {:?}",
+       already published them. Only a word at or below the highest confirmed \
+       start {settled:?} may go that way. Transcript before: {before:?}; after: \
+       {after:?}; offered: {offered:?}; confirmed: {:?}",
       confirmed_texts(agreement),
     );
     !erased.is_empty()
@@ -740,6 +778,8 @@ fn the_split_never_cuts_at_a_tied_start() {
   let mut fallbacks = 0u32;
   let mut aggregate_fallbacks = 0u32;
   let mut tie_strands = 0u32;
+  let mut backward_strands = 0u32;
+  let mut backward_truths = 0u32;
   let mut drifted_advances = 0u32;
   let mut erasures = 0u32;
 
@@ -781,6 +821,44 @@ fn the_split_never_cuts_at_a_tied_start() {
       } else {
         word(text, start, end)
       });
+    }
+    // THE BACKWARDS DRAW (codex round 7 on PR #95, finding 1). Everything above
+    // generates non-decreasing starts, which is the premise Rule W's second
+    // postcondition used to be free under on an interior split -- and
+    // `segment::update_segments_with_word_timings` does not honour it. Its
+    // segment-start preference (`SegmentSeeker.swift:635-640`) pulls a segment's
+    // first word back to `end - constrained_median` whenever the segment's own
+    // timestamp start ran more than half a second ahead of it, and that lands
+    // BEHIND the word in front of it.
+    // `a_backward_start_from_the_segment_pipeline_does_not_strand_a_later_word`
+    // is the proof built through that function; this reproduces the SHAPE so the
+    // sweep can drive it at every split position and every count.
+    //
+    // The clamp's own arithmetic, not a free-hand backwards step: the branch
+    // needs the word to span more than half a second, and it lowers the start to
+    // `end - CLAMP_MEDIAN` -- a step back of `CLAMP_MEDIAN - duration`, under
+    // 0.2 s, on ONE word per draw. `DURATIONS`' 0.6 is the only entry that both
+    // opens the branch and moves the word backwards; the others leave this a
+    // no-op, which is why `backward_truths` below is the non-vacuity proof.
+    let spin = (next() as usize) % length;
+    let clamped_at = (1..truth.len())
+      .map(|offset| 1 + (spin + offset) % (truth.len() - 1))
+      .find(|&at| {
+        truth[at].end() - truth[at].start() > 0.5
+          && truth[at].end() - CLAMP_MEDIAN < truth[at].start()
+      });
+    if next() % 2 == 0
+      && let Some(at) = clamped_at
+    {
+      let target = &truth[at];
+      truth[at] = WordTiming::new(
+        target.word(),
+        target.tokens_slice().to_vec(),
+        target.end() - CLAMP_MEDIAN,
+        target.end(),
+        target.probability(),
+      );
+      backward_truths += 1;
     }
     if truth
       .windows(2)
@@ -943,13 +1021,16 @@ fn the_split_never_cuts_at_a_tied_start() {
               .iter()
               .all(|word| word.tokens_slice().len() <= MAX_HOLDBACK_PREFILL_TOKENS),
         );
-        tie_strands += u32::from(nothing_unconfirmed_falls_below_the_watermark(
+        match nothing_unconfirmed_falls_below_the_watermark(
           &agreement,
           agreement.confirmed_words_slice().len() - before,
-          ran_off_the_end,
           trial,
           stride,
-        ));
+        ) {
+          Some(true) => tie_strands += 1,
+          Some(false) => backward_strands += 1,
+          None => {}
+        }
         // Read AFTER the ingest and kept for the next round, so every round is
         // compared against the transcript the round before it published.
         let after = published(&agreement);
@@ -1016,11 +1097,22 @@ fn the_split_never_cuts_at_a_tied_start() {
      {contradictions} rounds",
   );
   assert!(
+    backward_truths > 32,
+    "and the sweep must actually produce BACKWARDS starts -- the shape \
+     `segment::update_segments_with_word_timings` emits and the one every \
+     non-decreasing generator misses: {backward_truths} of 512 trials",
+  );
+  assert!(
     tie_strands > 0,
-    "and the second postcondition's one exception must be reached rather than \
-     merely written down -- an empty-holdback advance that strands at the \
-     settled instant, which is the only strand any watermark leaves: \
-     {tie_strands} rounds",
+    "and the second postcondition's exception must be reached rather than \
+     merely written down, on BOTH halves. AT the highest confirmed start is the \
+     tie an empty-holdback advance leaves: {tie_strands} rounds",
+  );
+  assert!(
+    backward_strands > 0,
+    "and BELOW it is the backwards start, which an interior split can confirm \
+     past -- the half that did not exist while the generator kept its starts \
+     non-decreasing: {backward_strands} rounds",
   );
   assert!(
     drifted_advances > 0,
@@ -1053,7 +1145,7 @@ fn a_trailing_tied_run_never_confirms_itself_twice_at_the_default_count() {
   // last three words tie is enough.
   //
   // The repair has two separable halves and this test pins the SECOND. The
-  // watermark's `next_up` anchor (see
+  // watermark's sample-domain anchor (see
   // `a_zero_duration_word_at_an_empty_holdback_is_not_re_confirmed`) is what
   // closes the DUPLICATION: with it in place the re-offered run is filtered out
   // even when the holdback is empty. The back-off is what keeps Rule W from
@@ -1150,7 +1242,8 @@ fn an_over_budget_tied_run_strands_its_suffix_at_the_settled_instant() {
   // search and the back-off therefore BOTH fail. The split runs off the end,
   // confirming the whole run and emptying the holdback.
   //
-  // WHAT THAT COSTS: the watermark anchors at `start.next_up()`, strictly past
+  // WHAT THAT COSTS: the watermark anchors at `past_the_settled_instant`,
+  // strictly past
   // the run's instant, so any word the NEWER hypothesis produced at that same
   // instant beyond `common` -- words nothing ever confirmed -- fails the offered
   // filter on the next worded ingest, drops out of both hypotheses at once, and
@@ -1178,6 +1271,17 @@ fn an_over_budget_tied_run_strands_its_suffix_at_the_settled_instant() {
   // its liveness bound was defeated by `At(0)`; see the engine module's doc,
   // "Why there is no deferral". So the loss below is this module's residual 1,
   // reached on the shape the pipeline can actually produce.
+  //
+  // WHICH HALF of residual 1 this is. The second postcondition's exception is
+  // "at or below the highest confirmed start", and this test drives the AT half
+  // -- the TIE, where the stranded word shares the settled word's own instant
+  // and the empty holdback is what creates it. The BELOW half needs no empty
+  // holdback and no tie: a backwards word start lets an INTERIOR split confirm
+  // past a word it leaves unconfirmed
+  // (`a_backward_start_from_the_segment_pipeline_does_not_strand_a_later_word`,
+  // codex round 7 on PR #95, finding 1). The name of this test says "at the
+  // settled instant" because that is the half it drives, not because the
+  // exception is only that wide.
   const RUN: usize = MAX_HOLDBACK_PREFILL_TOKENS + 1;
   let tied: Vec<WordTiming> = (0..RUN)
     .map(|index| word(&format!(" w{index:03}"), 2.0, 2.0))
@@ -1229,7 +1333,7 @@ fn an_over_budget_tied_run_strands_its_suffix_at_the_settled_instant() {
       // `!skipAppend`) and it reaches the `finalize` merge as a segment source.
       agreement.results_slice().len(),
     ),
-    (RUN, 0, 2.0f32.next_up(), 0, 2),
+    (RUN, 0, PAST_TWO_SECONDS, 0, 2),
     "CHARACTERIZATION (https://github.com/findit-studio/coremlit/issues/94): no \
      legal boundary sits at or above the budget floor, so the split runs off \
      the END of `common` -- the whole 113-word run is confirmed, the holdback \
@@ -2019,8 +2123,8 @@ fn a_stutter_at_the_watermark_keeps_both_occurrences() {
 /// that the advance's own watermark would put out of reach.
 ///
 /// Written LONGHAND from the engine's recorded comparison state rather than by
-/// calling `budgeted_split` or `empty_holdback_watermark`, so a mutation to
-/// either cannot mutate this counter along with them:
+/// calling `budgeted_split`, so a mutation to it cannot mutate this counter
+/// along with it:
 ///
 /// `find_longest_common_prefix`'s answer for the round the engine has just
 /// finished, recomputed from the two word lists it left behind. The sweep's
@@ -2051,7 +2155,7 @@ fn forced_arm_with_a_live_suffix(agreement: &LocalAgreement) -> bool {
   if last.tokens_slice().len() <= MAX_HOLDBACK_PREFILL_TOKENS {
     return false;
   }
-  let watermark = last.end().max(last.start().next_up());
+  let watermark = empty_holdback_anchor(last, last.start());
   agreement.hypothesis_words[common_len..]
     .iter()
     .any(|word| word.start() < watermark)
@@ -2993,11 +3097,14 @@ fn a_zero_duration_word_at_an_empty_holdback_is_not_re_confirmed() {
   // being confirmed a SECOND time (#94 residual 1, characterized here until
   // codex round 1 on PR #95 found the same state on the default path).
   //
-  // Closed, not characterized: the watermark is `end.max(start.next_up())`, the
-  // first instant strictly past the settled start. `next_up` is the IMMEDIATE
-  // f32 successor, so no representable instant lies between it and the start it
-  // excludes -- it refuses exactly one instant rather than moving a cliff, which
-  // is what an `end + epsilon` tolerance would have done.
+  // Closed, not characterized: the watermark is
+  // `end.max(past_the_settled_instant(settled_high))`, the first instant
+  // strictly past the settled start in BOTH the seconds `watermark_filtered`
+  // compares and the samples `clip_timestamps` is rounded to. It refuses exactly
+  // the settled word's own sample rather than moving a cliff, which is what an
+  // `end + epsilon` tolerance would have done -- and unlike the `f32::next_up`
+  // this used to take, it actually moves the clip (codex round 7 on PR #95,
+  // finding 2).
   //
   // Only the PREFILL BUDGET can reach this state now. Rule W's own widening no
   // longer empties the holdback (it backs off instead --
@@ -3016,8 +3123,8 @@ fn a_zero_duration_word_at_an_empty_holdback_is_not_re_confirmed() {
   // advance retracts it, which is the characterization in
   // `a_forced_empty_holdback_retracts_its_suffix_at_the_settled_instant`.
   //
-  // Mutation proof: drop the `.max(last.start().next_up())` from `ingest`'s
-  // empty-holdback watermark and this reds with `" Z"` confirmed twice.
+  // Mutation proof: drop the `.max(past_the_settled_instant(settled_high))`
+  // from `empty_holdback_anchor` and this reds with `" Z"` confirmed twice.
   let a = || word(" A", 0.0, 1.0);
   let zero = || word_of_tokens(" Z", 1.0, 1.0, MAX_HOLDBACK_PREFILL_TOKENS + 1);
   let b = || word(" B", 1.0, 2.0);
@@ -3037,7 +3144,7 @@ fn a_zero_duration_word_at_an_empty_holdback_is_not_re_confirmed() {
   );
   assert_eq!(
     agreement.last_agreed_seconds(),
-    1.0f32.next_up(),
+    PAST_ONE_SECOND,
     "and \" Z\"'s own END is 1.0, so `end` alone would have put the watermark \
      on \" Z\"'s own start",
   );
@@ -3098,7 +3205,7 @@ fn a_forced_empty_holdback_retracts_its_suffix_at_the_settled_instant() {
   // recorded.
   //
   // WHAT THAT COSTS: the advance empties the holdback, anchors the watermark at
-  // `start.next_up()` -- strictly past `" H"`'s instant -- and `" X"`, which the
+  // `past_the_settled_instant` -- strictly past `" H"`'s instant -- and `" X"`, which the
   // newer hypothesis produced AT that instant beyond `common`, fails the offered
   // filter from then on. That is not a deletion of something never emitted: this
   // round's OWN `finalize` emits it, through `differentSuffix(prev,
@@ -3112,20 +3219,31 @@ fn a_forced_empty_holdback_retracts_its_suffix_at_the_settled_instant() {
   // accumulated counterexample suite and the 512-trial sweep, the wait erased 26
   // words from the published transcript where this arm erases 10, and its count
   // bound was defeated by `At(0)` -- see the engine module's doc, "Why there is
-  // no deferral". The narrower repair is kept: `empty_holdback_watermark`'s
+  // no deferral". The narrower repair is kept: `sparing_watermark`'s
   // sparing fold lowers the anchor to spare every word beyond `common` that
   // starts strictly later
   // (`a_word_starting_strictly_later_lowers_the_watermark_instead_of_being_stranded`),
-  // so what is lost is exactly the TIE -- residual 1, the one instant no
-  // watermark serves.
+  // so what is lost is exactly the TIE -- residual 1's AT half, the one instant
+  // no watermark serves once the settled start is fixed.
+  //
+  // WHICH HALF, and why the name is narrower than the exception. The second
+  // postcondition's exception reads "at or below the highest confirmed start".
+  // This test and `an_over_budget_tied_run_strands_its_suffix_at_the_settled_
+  // instant` drive the AT half, which is what their names say. BELOW is the
+  // other half and needs neither an empty holdback nor a tie -- a backwards word
+  // start (codex round 7 on PR #95, finding 1) lets an INTERIOR split confirm
+  // past a word it leaves unconfirmed, pinned in
+  // `a_backward_start_from_the_segment_pipeline_does_not_strand_a_later_word`
+  // and counted by the sweep as `backward_strands`.
   //
   // The state this rule may NOT swallow is
   // `a_holdback_word_the_prefill_cannot_carry_is_confirmed_rather_than_held`:
   // there the budget forces the empty holdback and nothing lies beyond `common`,
   // so there is nothing to lose and nothing to wait for either.
   //
-  // Mutation proof, every row run: drop `.max(last.start().next_up())` from
-  // `empty_holdback_watermark` and the state row reds at a 1.0 watermark, `" H"`
+  // Mutation proof, every row run: drop
+  // `.max(past_the_settled_instant(settled_high))` from `empty_holdback_anchor`
+  // and the state row reds at a 1.0 watermark, `" H"`
   // re-admissible. Drop the sparing FOLD and this stays green while
   // `a_word_starting_strictly_later_lowers_the_watermark_instead_of_being_stranded`
   // reds -- the fold cannot help an exact tie, which is why that test exists
@@ -3172,7 +3290,7 @@ fn a_forced_empty_holdback_retracts_its_suffix_at_the_settled_instant() {
       held_back_texts(&agreement),
       agreement.last_agreed_seconds(),
     ),
-    (vec![" A", " H"], Vec::new(), 1.0f32.next_up()),
+    (vec![" A", " H"], Vec::new(), PAST_ONE_SECOND),
     "CHARACTERIZATION (https://github.com/findit-studio/coremlit/issues/94): \
      the budget floor reaches `common.len()`, so the split runs off the end -- \
      `[\" A\", \" H\"]` is confirmed, the holdback is empty, and the watermark \
@@ -3300,7 +3418,7 @@ fn an_alternating_suffix_advances_instead_of_stalling() {
   //
   // WHAT THIS TRADES, stated in the direction that costs something. `" X"` and
   // `" Y"` sit at `" H"`'s own instant, so no watermark strictly past `" H"`'s
-  // start can spare them (`empty_holdback_watermark` lowers the anchor as far as
+  // start can spare them (`sparing_watermark` lowers the anchor as far as
   // it can, and here it cannot lower it at all) -- this module's residual 1. A
   // stream that ENDS on the round before keeps the disputed word; a stream that
   // CONTINUES gets a transcript instead of a frozen one. Both are asserted
@@ -3313,7 +3431,8 @@ fn an_alternating_suffix_advances_instead_of_stalling() {
   // `split_at_a_strict_boundary` and this stays green (the forced arm never
   // reaches either search), which is why the back-off is pinned in
   // `a_trailing_tied_run_never_confirms_itself_twice_at_the_default_count`
-  // instead. Drop `.max(last.start().next_up())` from `empty_holdback_watermark`
+  // instead. Drop `.max(past_the_settled_instant(settled_high))` from
+  // `empty_holdback_anchor`
   // and the face reds at round 1 with a 1.0 watermark, `" H"` re-admissible.
   // Drop the sparing FOLD and the face reds at round 2 instead, `[" T", " U"]`
   // filtered away by a 3.0 anchor they never earned.
@@ -3402,7 +3521,7 @@ fn an_alternating_suffix_advances_instead_of_stalling() {
       // THE FALLBACK. `common` is `[" A", " H"]` and the budget floor reaches
       // its end, so the empty holdback is taken at the only instant that clears
       // `" H"`'s own start.
-      advanced(&[" A", " H"], &[], 1.0f32.next_up()),
+      advanced(&[" A", " H"], &[], PAST_ONE_SECOND),
       // And the stream is a stream: the tail the alternation was blocking
       // reaches `common` and is held back under an ordinary interior split.
       advanced(&[" A", " H"], &[" T", " U"], 2.0),
@@ -3473,8 +3592,8 @@ fn a_tied_run_above_the_budget_floor_advances_instead_of_stalling() {
   // Mutation proof, every row run: return `common.len() - 1` from
   // `split_at_a_strict_boundary`'s `unwrap_or` and the STABLE face reds at
   // round 1 -- 112 confirmed against 113, and a watermark of 2.0 that re-admits
-  // the run's own last word. Drop `.max(last.start().next_up())` from
-  // `empty_holdback_watermark` and both faces red at a 2.0 watermark with 113
+  // the run's own last word. Drop `.max(past_the_settled_instant(settled_high))`
+  // from `empty_holdback_anchor` and both faces red at a 2.0 watermark with 113
   // words still offerable, which is the unbounded re-confirmation #94 is about.
   // Let the back-off cross the floor (`0..widened` for `floor..widened`) and the
   // stable face reds at round 1 with a two-word holdback the prefill cannot
@@ -3529,7 +3648,7 @@ fn a_tied_run_above_the_budget_floor_advances_instead_of_stalling() {
     vec![
       ("awaiting_agreement".to_string(), 0, 0, 0.0, RUN),
       // THE FALLBACK, at the only instant that clears the run's own.
-      ("advanced".to_string(), RUN, 0, 2.0f32.next_up(), RUN),
+      ("advanced".to_string(), RUN, 0, PAST_TWO_SECONDS, RUN),
       // The run is behind the watermark now, so a hypothesis that keeps
       // repeating it offers nothing -- which is the input being degenerate, not
       // the engine stalling: every word it has is at one instant.
@@ -3537,28 +3656,28 @@ fn a_tied_run_above_the_budget_floor_advances_instead_of_stalling() {
         "awaiting_agreement".to_string(),
         RUN,
         0,
-        2.0f32.next_up(),
+        PAST_TWO_SECONDS,
         RUN
       ),
       (
         "awaiting_agreement".to_string(),
         RUN,
         0,
-        2.0f32.next_up(),
+        PAST_TWO_SECONDS,
         RUN
       ),
       (
         "awaiting_agreement".to_string(),
         RUN,
         0,
-        2.0f32.next_up(),
+        PAST_TWO_SECONDS,
         RUN
       ),
       (
         "awaiting_agreement".to_string(),
         RUN,
         0,
-        2.0f32.next_up(),
+        PAST_TWO_SECONDS,
         RUN
       ),
     ],
@@ -3611,11 +3730,11 @@ fn a_tied_run_above_the_budget_floor_advances_instead_of_stalling() {
     alternating_face,
     vec![
       ("awaiting_agreement".to_string(), 0, 0, 0.0),
-      ("advanced".to_string(), RUN, 0, 2.0f32.next_up()),
-      ("awaiting_agreement".to_string(), RUN, 0, 2.0f32.next_up()),
-      ("awaiting_agreement".to_string(), RUN, 0, 2.0f32.next_up()),
-      ("awaiting_agreement".to_string(), RUN, 0, 2.0f32.next_up()),
-      ("awaiting_agreement".to_string(), RUN, 0, 2.0f32.next_up()),
+      ("advanced".to_string(), RUN, 0, PAST_TWO_SECONDS),
+      ("awaiting_agreement".to_string(), RUN, 0, PAST_TWO_SECONDS),
+      ("awaiting_agreement".to_string(), RUN, 0, PAST_TWO_SECONDS),
+      ("awaiting_agreement".to_string(), RUN, 0, PAST_TWO_SECONDS),
+      ("awaiting_agreement".to_string(), RUN, 0, PAST_TWO_SECONDS),
     ],
     "an alternating suffix at the run's own instant must not freeze this arm \
      either -- the run is confirmed and the disputed words at its instant are \
@@ -3634,7 +3753,7 @@ fn a_word_starting_strictly_later_lowers_the_watermark_instead_of_being_stranded
   // not monotone (`an_overlapping_agreed_word_is_confirmed_on_the_mainline_path_
   // too`), so `end` can reach past a word that is already there -- and nothing
   // needs it to. All the watermark owes #94 is to clear the last CONFIRMED
-  // word's START. So `empty_holdback_watermark` lowers the anchor to the
+  // word's START. So `sparing_watermark` lowers the anchor to the
   // earliest such word's start when that still clears it, and the word stays
   // offerable instead of being lost.
   //
@@ -3783,5 +3902,555 @@ fn an_overlapping_agreed_word_is_confirmed_on_the_mainline_path_too() {
     " P Y Z",
     "the overlapping confirmed word and the later re-reading of its audio are \
      BOTH in the transcript -- the append-only contract",
+  );
+}
+
+// ── The two coordinate systems the watermark is read in ──────────────────────
+
+#[test]
+fn the_watermark_clears_the_settled_sample_not_just_the_settled_instant() {
+  // #94, codex round 7 on PR #95, finding 2 -- the ARITHMETIC half, pinned
+  // before the driver-level regression below reads its consequence.
+  //
+  // The empty-holdback anchor used to be `end.max(start.next_up())`, and
+  // `f32::next_up` is the IMMEDIATE successor: a real step in SECONDS, which is
+  // the coordinate `watermark_filtered` compares in. The same value is also
+  // handed to `clip_timestamps`, where `chunker::prepare_seek_clips` rounds it
+  // to a SAMPLE -- and one ULP of a small `f32` is worth a few thousandths of a
+  // sample, so the step vanished. The rows below are the measurement: every
+  // whole second's `next_up` clips to the settled word's OWN sample, so the
+  // "strictly past" guarantee was real in float space and vacuous in sample
+  // space, and the next stride re-read the audio the doc claimed it had clipped
+  // away.
+  //
+  // Mutation proof: replace `past_the_settled_instant`'s body with
+  // `settled.next_up()` and the `clip_seek_sample` column below reds on every
+  // row.
+  for settled in [0.0f32, 0.5, 1.0, 2.0, 3.0, 10.0, 0.07, 1.44] {
+    let settled_sample = chunker::clip_seek_sample(settled);
+    assert_eq!(
+      chunker::clip_seek_sample(settled.next_up()),
+      settled_sample,
+      "the ULP step is INERT in sample space, which is the finding: \
+       {settled} and {} both clip to sample {settled_sample}",
+      settled.next_up(),
+    );
+    let boundary = past_the_settled_instant(settled);
+    assert!(
+      boundary > settled,
+      "strictly past in SECONDS, which is what `watermark_filtered` compares: \
+       {boundary} vs {settled}",
+    );
+    assert!(
+      chunker::clip_seek_sample(boundary) > settled_sample,
+      "and strictly past in SAMPLES, which is what `clip_timestamps` reads: \
+       {boundary} clips to {} and {settled} clips to {settled_sample}",
+      chunker::clip_seek_sample(boundary),
+    );
+  }
+  // The two constants the empty-holdback characterizations assert, derived here
+  // from the sample index rather than trusted at their literal value.
+  assert_eq!(past_the_settled_instant(1.0), PAST_ONE_SECOND);
+  assert_eq!(past_the_settled_instant(2.0), PAST_TWO_SECONDS);
+  assert_eq!(chunker::clip_seek_sample(PAST_ONE_SECOND), 16_001);
+  assert_eq!(chunker::clip_seek_sample(PAST_TWO_SECONDS), 32_001);
+  // TOTAL on the degenerate inputs the fold can hand it: `+inf` is what
+  // `f32::next_up` mapped to itself, so this keeps that answer rather than
+  // spinning, and a NEGATIVE instant saturates to sample 0 on the way in.
+  assert_eq!(past_the_settled_instant(f32::INFINITY), f32::INFINITY);
+  assert!(past_the_settled_instant(-1.0) > 0.0);
+}
+
+/// A [`crate::audio::whisper::backend::mock::MockBackend`] that RECORDS the
+/// first sample of every window `TranscribeTask` asks it to extract features
+/// from, then delegates.
+///
+/// `TranscribeTask` calls `extract_features` on
+/// `pad_or_trim(&audio[seek..seek + segment_size], window_samples)`, so over
+/// RAMP audio (`samples[i] == i as f32`) that first sample IS the seek index —
+/// the exact audio each stride re-read. That is the observation #94's codex
+/// round 7 finding 2 is about, and it cannot be read off the engine's own
+/// state: the watermark is in SECONDS and the re-read is in SAMPLES.
+struct WindowRecordingBackend {
+  inner: crate::audio::whisper::backend::mock::MockBackend,
+  window_starts: std::sync::Mutex<Vec<usize>>,
+}
+
+impl WindowRecordingBackend {
+  fn new(inner: crate::audio::whisper::backend::mock::MockBackend) -> Self {
+    Self {
+      inner,
+      window_starts: std::sync::Mutex::new(Vec::new()),
+    }
+  }
+
+  fn window_starts(&self) -> Vec<usize> {
+    self
+      .window_starts
+      .lock()
+      .expect("window-start record lock poisoned")
+      .clone()
+  }
+}
+
+impl InferenceBackend for WindowRecordingBackend {
+  type Features = <crate::audio::whisper::backend::mock::MockBackend as InferenceBackend>::Features;
+  type EncoderOutput =
+    <crate::audio::whisper::backend::mock::MockBackend as InferenceBackend>::EncoderOutput;
+  type DecoderState =
+    <crate::audio::whisper::backend::mock::MockBackend as InferenceBackend>::DecoderState;
+
+  fn extract_features(
+    &self,
+    audio: &[f32],
+  ) -> Result<Self::Features, crate::audio::whisper::backend::BackendError> {
+    if let Some(&first) = audio.first() {
+      self
+        .window_starts
+        .lock()
+        .expect("window-start record lock poisoned")
+        .push(first as usize);
+    }
+    self.inner.extract_features(audio)
+  }
+
+  fn encode(
+    &self,
+    features: &Self::Features,
+  ) -> Result<Self::EncoderOutput, crate::audio::whisper::backend::BackendError> {
+    self.inner.encode(features)
+  }
+
+  fn new_decoder_state(
+    &self,
+  ) -> Result<Self::DecoderState, crate::audio::whisper::backend::BackendError> {
+    self.inner.new_decoder_state()
+  }
+
+  fn reset_decoder_state(&self, state: &mut Self::DecoderState) {
+    self.inner.reset_decoder_state(state);
+  }
+
+  fn decode_step(
+    &self,
+    token: u32,
+    position: usize,
+    encoder_output: &Self::EncoderOutput,
+    state: &mut Self::DecoderState,
+    logits: &mut Vec<f32>,
+  ) -> Result<(), crate::audio::whisper::backend::BackendError> {
+    self
+      .inner
+      .decode_step(token, position, encoder_output, state, logits)
+  }
+
+  fn commit_alignment_row(&self, state: &mut Self::DecoderState) {
+    self.inner.commit_alignment_row(state);
+  }
+
+  fn alignment_weights<'state>(
+    &self,
+    state: &'state Self::DecoderState,
+  ) -> Option<crate::audio::whisper::backend::AlignmentView<'state>> {
+    self.inner.alignment_weights(state)
+  }
+
+  fn dims(&self) -> crate::audio::whisper::backend::ModelDims {
+    self.inner.dims()
+  }
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn the_driver_does_not_re_read_the_settled_words_own_sample() {
+  // #94, codex round 7 on PR #95, finding 2 -- the DRIVER-level regression, and
+  // the reason the arithmetic pin above is not enough on its own. The finding is
+  // not that a float compared wrong; it is that the value the engine calls "the
+  // first instant strictly past the settled start" is ALSO the next stride's
+  // clip start, and `chunker::prepare_seek_clips` rounds it to a sample -- where
+  // the `f32::next_up` step it used to take moved nothing. So the driver handed
+  // the decoder the settled word's OWN audio again while this module's residuals
+  // 3 and 6 claimed that audio was outside the clip window. Those notes were
+  // wrong for a concrete arithmetic reason and are corrected with this test.
+  //
+  // The state is reached THROUGH the driver, not asserted about it: the scripted
+  // window decodes `" Hi" " World" " Helloaaa..."`, whose last word carries 114
+  // tokens against a 112-token prefill budget and lands ZERO-DURATION at 1.0 s
+  // (its own alignment column and the closing timestamps' are the same). So
+  // `budgeted_split`'s floor reaches `common.len()`, the advance confirms all
+  // three words, the holdback empties, and `empty_holdback_anchor` -- not a held
+  // word's start -- is what the next clip is drawn from. That is the ONE arm
+  // where the anchor's own sample matters: give the last word any real duration
+  // and `end` already clears the settled sample by itself.
+  //
+  // Mutation proof: replace `past_the_settled_instant`'s body with
+  // `settled.next_up()` and the final window start below reds at 16_000 -- the
+  // settled word's own sample -- against 16_001.
+  use crate::audio::whisper::{
+    backend::{ModelDims, mock::MockBackend},
+    tokenizer::SpecialTokens,
+    transcribe::WhisperKit,
+  };
+
+  let tokenizer = tiny_tokenizer();
+  let specials = SpecialTokens::whisper_defaults();
+  let hi = tokenizer.encode(" Hi").unwrap()[0];
+  let world = tokenizer.encode(" World").unwrap()[0];
+  let hello = tokenizer.encode(" Hello").unwrap()[0];
+  // No leading space, so `split_to_word_tokens` appends every one of these to
+  // `" Hello"` rather than starting a new word -- which is how one WORD comes to
+  // carry more tokens than the prefill can hold.
+  let filler = tokenizer.encode("a").unwrap()[0];
+  let one_hot = |token: u32| {
+    let mut logits = vec![0.0f32; 51_865];
+    logits[token as usize] = 10.0;
+    logits
+  };
+
+  let mut mock = MockBackend::new().with_dims(
+    ModelDims::new()
+      .with_window_samples(16_000)
+      .with_n_audio_ctx(100),
+  );
+  // `(token, alignment peak column)`. 100 columns over the window put one column
+  // at 0.02 s, so column 50 is 1.0 s. `" Hello"` and all 113 fillers peak on THAT
+  // column and the closing timestamps peak past it, which is what leaves the
+  // last word zero-duration at exactly 1.0 s.
+  let mut script: Vec<(u32, usize)> = vec![
+    (specials.english_token(), 1),
+    (specials.transcribe_token(), 2),
+    (specials.time_token_begin(), 3),
+    (hi, 10),
+    (world, 50),
+    (hello, 50),
+  ];
+  script.extend(std::iter::repeat_n((filler, 50), 113));
+  script.push((specials.time_token_begin() + 100, 60));
+  script.push((specials.time_token_begin() + 100, 60));
+  script.push((specials.end_token(), 60));
+  for (token, peak) in &script {
+    let mut row = vec![0.0f32; 100];
+    row[*peak] = 1.0;
+    mock.push_step_with_alignment(one_hot(*token), row);
+  }
+
+  // The temperature LADDER is switched off and the sampler SEEDED, so this
+  // scripted window decodes the same way every run. The 113-token filler run
+  // trips `needs_fallback`'s compression-ratio check, and a fallback attempt
+  // samples at a non-zero temperature -- from an unseeded draw by default, which
+  // made the assertions below depend on the draw rather than on the split.
+  let kit = WhisperKit::with_backend(WindowRecordingBackend::new(mock), tokenizer);
+  let mut streamer = kit
+    .local_agreement_transcriber(
+      DecodingOptions::new()
+        .with_temperature_fallback_count(0)
+        .with_seed(94),
+    )
+    .with_agreement_count_needed(1);
+  // A RAMP, so the backend's record of each window's first sample is that
+  // window's seek index.
+  let ramp: Vec<f32> = (0..64_000).map(|index| index as f32).collect();
+  let mut chunks = ramp.chunks(STRIDE_SAMPLES);
+  for chunk in chunks.by_ref().take(3) {
+    streamer.push_samples(chunk).unwrap();
+  }
+
+  let settled = streamer
+    .agreement()
+    .confirmed_words_slice()
+    .last()
+    .expect("the advance confirmed the whole agreed prefix")
+    .clone();
+  assert_eq!(
+    (
+      streamer.agreement().confirmed_words_slice().len(),
+      streamer.agreement().last_agreed_words_slice().len(),
+      settled.tokens_slice().len() > MAX_HOLDBACK_PREFILL_TOKENS,
+      settled.start(),
+      settled.end(),
+    ),
+    (3, 0, true, 1.0, 1.0),
+    "non-vacuous: the DRIVER reached the empty-holdback arm, and the word it \
+     settled last is the ZERO-DURATION one -- the only shape where the anchor's \
+     own sample decides the next clip",
+  );
+  assert_eq!(
+    chunker::clip_seek_sample(settled.start()),
+    16_000,
+    "the settled word's own audio is sample 16_000",
+  );
+
+  let before = kit.backend().window_starts();
+  streamer.push_samples(chunks.next().unwrap()).unwrap();
+  let after = kit.backend().window_starts();
+  let fresh: Vec<usize> = after[before.len()..].to_vec();
+  assert!(
+    !fresh.is_empty(),
+    "non-vacuous: the last stride actually decoded a window",
+  );
+  assert_eq!(
+    fresh[0], 16_001,
+    "the stride after the empty-holdback advance must start at the sample AFTER \
+     the settled word's own -- {fresh:?}. At 16_000 the driver re-reads the very \
+     audio the watermark claims to have settled, which is what an `f32::next_up` \
+     anchor left it doing: a real step in seconds and none at all in samples.",
+  );
+  assert!(
+    fresh
+      .iter()
+      .all(|&start| start > chunker::clip_seek_sample(settled.start())),
+    "and no window of that stride reaches back into it: {fresh:?}",
+  );
+}
+
+// ── Backwards word starts, from the pipeline that emits them ─────────────────
+
+/// The three segments and the monotone alignment that make
+/// `segment::update_segments_with_word_timings` emit a BACKWARDS word start,
+/// plus the words it emits. Shared by the engine regression below and by the
+/// sweep's own shape note.
+///
+/// Nothing here is hand-timed: every value goes in as an alignment
+/// `find_alignment` could produce (`w[i].end() <= w[i + 1].start()`, the
+/// guarantee `segment::tests` pins) and comes out through Swift's own
+/// segment-start preference, `SegmentSeeker.swift:635-640`. That branch prefers
+/// the SEGMENT's start over a first word the DTW drifted more than half a second
+/// earlier, and clamps to `w0.end - constrained_median` — which for the last
+/// segment here is `1.51 - 0.70 = 0.81`, BELOW the `0.99` of the word in front
+/// of it.
+///
+/// The 0.70 median is `calculate_word_duration_constraints`' own ceiling
+/// (`median.min(0.7)`), which any speech whose median word runs 0.7 s or longer
+/// reaches.
+fn a_pipeline_result_with_a_backwards_start(
+  tokenizer: &crate::audio::whisper::tokenizer::WhisperTokenizer,
+) -> Vec<WordTiming> {
+  use crate::audio::whisper::{
+    result::TranscriptionSegment, segment::update_segments_with_word_timings,
+  };
+
+  let ids: Vec<u32> = [" A", " B", " C", " D"]
+    .iter()
+    .map(|text| tokenizer.encode(text).unwrap()[0])
+    .collect();
+  let plain = |tokens: Vec<u32>, start: f32, end: f32| {
+    let mut segment = TranscriptionSegment::new();
+    segment.set_tokens(tokens).set_start(start).set_end(end);
+    segment
+  };
+  let segments = [
+    plain(vec![ids[0]], 0.50, 0.70),
+    plain(vec![ids[1], ids[2]], 0.80, 0.99),
+    // The drifted one: the timestamp tokens put this segment at 1.50 while DTW
+    // put its first word at 0.99 — a 0.51 s disagreement, which is what opens
+    // `:635-640`.
+    plain(vec![ids[3]], 1.50, 1.60),
+  ];
+  let alignment = [
+    WordTiming::new(" A", vec![ids[0]], 0.50, 0.70, 0.9),
+    WordTiming::new(" B", vec![ids[1]], 0.80, 0.99, 0.9),
+    WordTiming::new(" C", vec![ids[2]], 0.99, 0.99, 0.9),
+    WordTiming::new(" D", vec![ids[3]], 0.99, 1.51, 0.9),
+  ];
+  assert!(
+    alignment
+      .windows(2)
+      .all(|pair| pair[0].end() <= pair[1].start() + 1e-4),
+    "the INPUT is what `find_alignment` guarantees: non-decreasing and \
+     non-overlapping. Everything backwards below is the post-processing's doing.",
+  );
+  update_segments_with_word_timings(&segments, &alignment, 0, 0.0, 0.70, 1.40, tokenizer)
+    .unwrap()
+    .iter()
+    .flat_map(TranscriptionSegment::words_slice)
+    .cloned()
+    .collect()
+}
+
+#[test]
+#[ignore = "requires local tokenizer (WHISPERKIT_TEST_MODELS)"]
+fn a_backward_start_from_the_segment_pipeline_does_not_strand_a_later_word() {
+  // #94, codex round 7 on PR #95, finding 1. Rule W's SECOND postcondition —
+  // an advance may not push the watermark past a word of its own hypothesis it
+  // did not confirm — used to be free on an INTERIOR split, and the reason given
+  // was that "word starts inside one hypothesis are non-decreasing, so
+  // everything from `split` on is at or past the watermark". That premise is
+  // FALSE, and this test is the disproof: `update_segments_with_word_timings`
+  // emits `[0.50, 0.80, 0.99, 0.81]` from a strictly non-decreasing alignment.
+  //
+  // What the premise cost: the split lands at index 2 (`0.80 < 0.99` is a legal
+  // strict boundary), so the watermark used to be `" C"`'s own `0.99` — and
+  // `" D"` at `0.81`, a word this round CONFIRMED NOTHING about and is still
+  // holding back, falls below it. The next worded ingest filters it out of both
+  // hypotheses at once and `finalize` can never reach it again, after this
+  // round's own `finalize` has already published it. That is a RETRACTION on an
+  // interior split, outside the split-at-the-end exception the doc claimed was
+  // the only one.
+  //
+  // The repair is `sparing_watermark`, which the empty-holdback arm already had:
+  // the anchor drops to the earliest unconfirmed start it can still clear. Here
+  // that is `" D"`'s own `0.81`, which is above the `0.80` this round settled
+  // last, so nothing is stranded at all.
+  //
+  // Mutation proof: return `anchor` from `sparing_watermark` (drop the fold) and
+  // this reds with a `0.99` watermark and `" D"` unreachable.
+  let tokenizer = tiny_tokenizer();
+  let words = a_pipeline_result_with_a_backwards_start(&tokenizer);
+  let starts: Vec<f32> = words.iter().map(WordTiming::start).collect();
+  assert_eq!(
+    (
+      words.iter().map(WordTiming::word).collect::<Vec<_>>(),
+      starts[0],
+      starts[1],
+      starts[2],
+    ),
+    (vec![" A", " B", " C", " D"], 0.50, 0.80, 0.99),
+    "non-vacuous: the first three words are where the alignment put them",
+  );
+  assert!(
+    starts[3] < starts[2] && starts[3] > starts[1],
+    "THE FINDING: the pipeline's own post-processing put `\" D\"` at {} — behind \
+     `\" C\"`'s {} and ahead of `\" B\"`'s {}. Word starts inside one hypothesis \
+     are NOT non-decreasing.",
+    starts[3],
+    starts[2],
+    starts[1],
+  );
+
+  let offered = || result_with_words(words.clone());
+  let mut agreement = LocalAgreement::new();
+  assert_eq!(
+    agreement.agreement_count_needed(),
+    DEFAULT_AGREEMENT_COUNT_NEEDED,
+    "non-vacuous: the DEFAULT count, which is the driver's own",
+  );
+  agreement.ingest_streamed(offered());
+  assert!(agreement.ingest_streamed(offered()).is_advanced());
+  assert_eq!(
+    (
+      confirmed_texts(&agreement),
+      held_back_texts(&agreement),
+      agreement.last_agreed_seconds(),
+    ),
+    (vec![" A", " B"], vec![" C", " D"], starts[3]),
+    "the watermark is the BACKWARDS word's own start, not the first held word's: \
+     an interior split may not pass a word it is still holding back. Before this \
+     repair it was {} — `\" C\"`'s start — and `\" D\"` was stranded below it.",
+    starts[2],
+  );
+
+  // The two postconditions, read on this round rather than argued about.
+  let settled_high = highest_start(agreement.confirmed_words_slice()).unwrap();
+  assert!(
+    settled_high < agreement.last_agreed_seconds(),
+    "FIRST postcondition: every confirmed word starts strictly before the \
+     watermark. Highest confirmed start {settled_high}, watermark {}",
+    agreement.last_agreed_seconds(),
+  );
+  let below: Vec<(&str, f32)> = agreement
+    .hypothesis_words
+    .iter()
+    .skip(agreement.confirmed_words_slice().len())
+    .filter(|word| word.start() < agreement.last_agreed_seconds())
+    .map(|word| (word.word(), word.start()))
+    .collect();
+  assert!(
+    below.is_empty(),
+    "SECOND postcondition: nothing this round left unconfirmed is below the \
+     watermark, so nothing was stranded: {below:?}",
+  );
+
+  // And the round trip: the very next hypothesis still carries `" D"`, which is
+  // the whole point — a stranded word disappears from BOTH hypotheses at once.
+  assert!(
+    LocalAgreement::watermark_filtered(&offered(), agreement.last_agreed_seconds())
+      .iter()
+      .any(|held| held.word() == " D"),
+    "`\" D\"` is still offerable, so a later hypothesis can still revise or \
+     corroborate it",
+  );
+  assert!(agreement.ingest_streamed(offered()).is_advanced());
+  assert!(
+    agreement
+      .finalize(&crate::audio::whisper::options::DecodingOptions::new())
+      .text()
+      .contains('D'),
+    "and it reaches the published transcript rather than being retracted out of \
+     it",
+  );
+}
+
+#[test]
+fn a_backwards_start_two_words_back_still_cannot_be_re_admitted() {
+  // THE SCOPE of the first postcondition, and the reason it is stated over the
+  // WHOLE confirmed list rather than over its last word (#94, codex round 7 on
+  // PR #95, finding 1).
+  //
+  // `split_at_a_strict_boundary` used to compare each candidate boundary
+  // against its ADJACENT predecessor, and the doc justified that with "word
+  // starts inside one hypothesis are non-decreasing, so an earlier confirmed
+  // word starts at or before the last one". `a_backward_start_from_the_segment_
+  // pipeline_does_not_strand_a_later_word` disproves the premise. This pins what
+  // the premise was carrying: with starts `[0.50, 1.15, 0.95, 1.10]` the
+  // adjacent test passes at index 3 (`0.95 < 1.10`), the advance confirms
+  // `" Q"` at `1.15`, and the watermark lands at `1.10` — so `" Q"` satisfies
+  // `watermark_filtered`'s own `start >= watermark` against its own confirmation
+  // and can head the next hypothesis. That is #94 itself, reached from the
+  // backwards side.
+  //
+  // REACHABILITY, stated rather than implied. This exact shape is NOT one
+  // `update_segments_with_word_timings` can emit: its only backwards mover is
+  // the `SegmentSeeker.swift:635-640` clamp, which needs `w0` to span more than
+  // 0.5 s and lowers it only to `w0.end - median`, and every word after it
+  // starts at or after `w0`'s own alignment END — which is at or after
+  // everything in front of it. So the word AFTER a backwards one cannot also
+  // duck below the word two back, which is what this shape needs. The check is
+  // therefore a STRENGTHENING that removes a premise rather than a repair for a
+  // demonstrated route: `ingest` is `pub(crate)` and residual 4 already records
+  // that an in-crate caller can order its calls freely, and re-deriving a new
+  // bound from the clamp's arithmetic is the kind of reasoning this issue has
+  // punished twice. The falsifier is hermetic because the input is.
+  //
+  // Mutation proof: restore the adjacent-predecessor test in
+  // `split_at_a_strict_boundary` (`common[at - 1].start()` for
+  // `settled_before[at]`) and this reds — alone, at 503 of 504 green.
+  let offered = || {
+    result_with_words(vec![
+      word(" P", 0.50, 0.60),
+      word(" Q", 1.15, 1.20),
+      word(" R", 0.95, 1.05),
+      word(" S", 1.10, 1.30),
+    ])
+  };
+  let mut agreement = LocalAgreement::new();
+  agreement.ingest_streamed(offered());
+  assert!(agreement.ingest_streamed(offered()).is_advanced());
+  assert_eq!(
+    (
+      confirmed_texts(&agreement),
+      held_back_texts(&agreement),
+      agreement.last_agreed_seconds(),
+    ),
+    (vec![" P"], vec![" Q", " R", " S"], 0.95),
+    "the forward search finds no boundary at or above the requested split -- \
+     both `0.95` and `1.10` are below the `1.15` already inside `common` -- so \
+     the back-off lands at index 1, and the watermark is the lowest unconfirmed \
+     start it can still clear",
+  );
+  for confirmed in agreement.confirmed_words_slice() {
+    assert!(
+      confirmed.start() < agreement.last_agreed_seconds(),
+      "EVERY confirmed word starts strictly before the {} s watermark, not just \
+       the last: {:?} at {}",
+      agreement.last_agreed_seconds(),
+      confirmed.word(),
+      confirmed.start(),
+    );
+  }
+  assert!(
+    LocalAgreement::watermark_filtered(&offered(), agreement.last_agreed_seconds())
+      .iter()
+      .all(|offered| offered.word() != " P"),
+    "and nothing confirmed can head the next hypothesis",
   );
 }
