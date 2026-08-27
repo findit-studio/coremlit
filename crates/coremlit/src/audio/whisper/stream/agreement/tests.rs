@@ -407,6 +407,19 @@ fn the_split_never_cuts_at_a_tied_start() {
   // the holdback, and `empty_holdbacks` below is the non-vacuity proof that it
   // really happened.
   //
+  // The shape then still had ONE oversized word as its only route past the
+  // budget, and that could not build the AGGREGATE trigger (codex round 3 on
+  // PR #95): a TIED RUN of ordinary words whose TOTAL exceeds the budget, where
+  // the floor lands inside the run, every reachable boundary ties, and the round
+  // DEFERS instead of advancing. Measured on the shape this test had before:
+  // 25 deferred rounds of 1662 observations, all of them reached through the
+  // oversized word rather than through a run, and none of them DISTINGUISHED --
+  // the postcondition below holds under the old widen-off-the-end fallback too,
+  // which is why the deletion that fallback caused needed its own falsifier
+  // (`an_over_budget_tied_run_defers_rather_than_stranding_its_suffix`). The
+  // aggregate trials below take it to 133, and `deferrals` is that half's own
+  // non-vacuity proof.
+  //
   // The sweep draws starts from a coarse grid whose repeats make consecutive
   // words tie -- the `a=[0,0.5)/b=[0,1.0)` shape both #94 regressions are built
   // from, generalized -- keeps them non-decreasing the way `find_alignment`
@@ -426,7 +439,11 @@ fn the_split_never_cuts_at_a_tied_start() {
   // `next_up` anchor still holds the postcondition on that path, which is why
   // the back-off has its own falsifier in
   // `a_trailing_tied_run_never_confirms_itself_twice_at_the_default_count`
-  // rather than being asserted here.
+  // rather than being asserted here. Restoring the widen-off-the-end fallback
+  // (`.or(Some(common.len()))` after the back-off) reds only the `deferrals`
+  // clause below, at `0 deferred rounds`, for the same reason: the postcondition
+  // survives that fallback, and what it costs is the DELETION its own falsifier
+  // pins.
   const TEXTS: [&str; 4] = [" A", " B", " C", " D"];
   // Repeated 0.0 entries are the ties; the rest keep the grid coarse enough for
   // two words to share an instant often.
@@ -466,13 +483,29 @@ fn the_split_never_cuts_at_a_tied_start() {
   let mut checked = 0u32;
   let mut empty_holdbacks = 0u32;
   let mut tied_truths = 0u32;
+  let mut deferrals = 0u32;
 
   for trial in 0..256u32 {
     let length = 4 + (next() % 5) as usize;
-    // The prefill budget is the only thing that can still empty the holdback, so
-    // one word in some trials is made too expensive for it to carry -- and it is
-    // placed anywhere, including last, where the split runs to `common.len()`.
-    let over_budget = if next() % 3 == 0 {
+    // TWO ways to blow the prefill budget, and the sweep drives BOTH.
+    //
+    // ONE OVERSIZED WORD is the route residual 1 needs: it is the only thing
+    // that can still leave the holdback EMPTY, and it is placed anywhere,
+    // including last, where the budget floor reaches `common.len()`.
+    //
+    // The AGGREGATE route needs no oversized word at all, and this test could
+    // not reach it before (codex round 3 on PR #95): ORDINARY words whose TIED
+    // RUN totals more than the budget put the floor strictly INSIDE the run, so
+    // every boundary the forward search and the back-off can reach ties while
+    // split 0 -- the boundary a tied run always leaves legal -- is below the
+    // floor. `AGGREGATE_TOKENS` is sized so any THREE such words exceed
+    // `MAX_HOLDBACK_PREFILL_TOKENS` and any two fit, which puts the floor two
+    // words from the end of every `common` and makes a three-word tie at the
+    // tail the trigger. That round DEFERS; `deferrals` below is its non-vacuity
+    // proof.
+    const AGGREGATE_TOKENS: usize = MAX_HOLDBACK_PREFILL_TOKENS / 3 + 1;
+    let aggregate = next() % 4 == 0;
+    let over_budget = if !aggregate && next() % 3 == 0 {
       Some((next() as usize) % length)
     } else {
       None
@@ -485,6 +518,8 @@ fn the_split_never_cuts_at_a_tied_start() {
       let end = start + DURATIONS[(next() % DURATIONS.len() as u64) as usize];
       truth.push(if over_budget == Some(index) {
         word_of_tokens(text, start, end, MAX_HOLDBACK_PREFILL_TOKENS + 1)
+      } else if aggregate {
+        word_of_tokens(text, start, end, AGGREGATE_TOKENS)
       } else {
         word(text, start, end)
       });
@@ -509,6 +544,10 @@ fn the_split_never_cuts_at_a_tied_start() {
       };
       for _ in 0..2 {
         agreement.ingest_streamed(result_with_words(offered.clone()));
+        // Read straight off the engine: a deferral returns
+        // `AwaitingAgreement`, which a disagreement returns too, so the outcome
+        // cannot tell them apart.
+        deferrals += u32::from(agreement.split_deferred);
         if let Some(empty) = postcondition(&agreement, trial, stride) {
           checked += 1;
           empty_holdbacks += u32::from(empty);
@@ -534,6 +573,11 @@ fn the_split_never_cuts_at_a_tied_start() {
     "the postcondition must be read against an EMPTY holdback too, which is \
      the state this test used to skip: {empty_holdbacks} of {checked} \
      observations",
+  );
+  assert!(
+    deferrals > 64,
+    "and the DEFERRED state must be reached, which is the state the \
+     one-oversized-word shape could not build: {deferrals} deferred rounds",
   );
 }
 #[test]
@@ -632,6 +676,194 @@ fn a_trailing_tied_run_never_confirms_itself_twice_at_the_default_count() {
       "{token} must appear exactly once in {text:?}"
     );
   }
+}
+
+#[test]
+fn an_over_budget_tied_run_defers_rather_than_stranding_its_suffix() {
+  // #94, codex round 3 on PR #95 -- the OTHER way the holdback empties, and the
+  // one Rule W's back-off cannot reach. The back-off may not cross the prefill
+  // budget FLOOR, and a tied run that is itself over budget puts that floor
+  // strictly inside the run: every boundary at or above it ties, split 0 -- the
+  // one boundary a tied run always leaves legal -- is below it, and the forward
+  // search and the back-off therefore BOTH fail. The old fallback confirmed the
+  // whole run and emptied the holdback, which is exactly what
+  // `a_trailing_tied_run_never_confirms_itself_twice_at_the_default_count`
+  // refuses one state earlier.
+  //
+  // What the empty holdback costs here is a DELETION rather than a
+  // re-confirmation: the watermark anchors at `start.next_up()`, strictly past
+  // the run's instant, so any word the NEWER hypothesis produced at that same
+  // instant beyond `common` -- words nothing ever confirmed -- fails the offered
+  // filter on the next worded ingest, drops out of both hypotheses at once, and
+  // `finalize` has nothing left to recover them from.
+  //
+  // It takes no over-budget WORD, which is what separates it from
+  // `a_zero_duration_word_at_an_empty_holdback_is_not_re_confirmed`: 113
+  // ORDINARY one-token words sharing one start are 113 tokens against a
+  // 112-token budget, and `add_word_timestamps` produces exactly that shape from
+  // an ALL-ZERO alignment matrix -- the zero-fill
+  // `add_word_timestamps_zero_pads_missing_rows` pins -- because DTW's tie-break
+  // walks the path down column 0 and every text-index step there records the
+  // same boundary time. Measured on that stack: 130 words, all at 0.0, all
+  // zero-duration, one token each.
+  //
+  // The repair is to DEFER: no legal boundary at or above the floor is a
+  // non-advancing round, not a licence to widen off the end. The watermark stays
+  // put, so nothing is filtered away; the holdback stays put, so the next stride
+  // still prefills what it prefilled before; and TAIL growth relieves it, the
+  // same relief the back-off relies on. `finalize` on a deferred round emits the
+  // latest hypothesis's own post-watermark words, which is byte-identical to
+  // what the fallback produced (`confirmed ++ common ++ hypothesis-beyond-common`
+  // either way) -- the divergence is entirely in what LATER ingests can still
+  // see.
+  //
+  // Mutation proof, every row run: restore the widen-off-the-end fallback
+  // (`.or(Some(common.len()))` after the back-off) and the deferral assertion
+  // below reds reading `(113, 0, 2.0000002, 0, 2)`; with that assertion
+  // neutralized the two FACES red next, the streaming one confirming the 113-word
+  // run against an empty holdback and the finalized one reading
+  // `[... "w112", "y"]` with `" x0"`/`" x1"` gone. Defer whenever the budget
+  // floor bites at all (`if floor > 0 { return None }`) and the deadlock clause
+  // below reds -- along with
+  // `an_over_budget_holdback_is_capped_rather_than_silently_truncated`, which is
+  // the ordinary budget path this may not swallow. Never CLEAR the flag
+  // (`|=` for `=` in `ingest`) and the finalized face reds, the advance's own
+  // Swift shape replaced by the hypothesis. Make `word` emit two tokens and the
+  // non-vacuity row reds at `(113, 226, false)`.
+  //
+  // The `finalize` half has its own two rows at its own assertions below.
+  const RUN: usize = MAX_HOLDBACK_PREFILL_TOKENS + 1;
+  let tied: Vec<WordTiming> = (0..RUN)
+    .map(|index| word(&format!(" w{index:03}"), 2.0, 2.0))
+    .collect();
+  assert_eq!(
+    (
+      tied.len(),
+      tied
+        .iter()
+        .map(|word| word.tokens_slice().len())
+        .sum::<usize>(),
+      tied.iter().all(|word| word.tokens_slice().len() == 1),
+    ),
+    (113, MAX_HOLDBACK_PREFILL_TOKENS + 1, true),
+    "non-vacuous: ORDINARY one-token words, and it is their SUM that exceeds \
+     the budget -- no single word here is over budget",
+  );
+
+  // Two more words at the run's own instant, beyond the prefix the two
+  // hypotheses agree on. Nothing confirms these; the watermark is the only thing
+  // deciding whether they can still be offered.
+  let suffix = || vec![word(" x0", 2.0, 2.0), word(" x1", 2.0, 2.0)];
+  let older = || result_with_words(tied.clone());
+  let newer = || result_with_words([tied.clone(), suffix()].concat());
+
+  let mut agreement = LocalAgreement::new();
+  assert_eq!(
+    agreement.agreement_count_needed(),
+    DEFAULT_AGREEMENT_COUNT_NEEDED,
+    "non-vacuous: the DEFAULT count, the only one the driver reaches",
+  );
+  agreement.ingest_streamed(older());
+  agreement.ingest_streamed(newer());
+  assert_eq!(
+    (
+      confirmed_texts(&agreement).len(),
+      held_back_texts(&agreement).len(),
+      agreement.last_agreed_seconds(),
+      // The consequence, read through the filter that consumes the watermark:
+      // every word the newer hypothesis produced at the run's instant is still
+      // OFFERABLE. Folded into this assertion rather than standing beside it,
+      // since it is a function of the watermark above and could never red first.
+      LocalAgreement::watermark_filtered(&newer(), agreement.last_agreed_seconds()).len(),
+      // The hypotheses AGREED, so Swift KEEPS the result (`:408-410`,
+      // `!skipAppend`) and it reaches the `finalize` merge as a segment source.
+      // Dropping it here reds nothing else in this suite -- the merged TEXT is
+      // the confirmed word list either way -- so the keep is pinned here.
+      agreement.results_slice().len(),
+    ),
+    (0, 0, 0.0, RUN + 2, 2),
+    "no legal boundary at or above the budget floor is a DEFERRED round: \
+     nothing is confirmed, the holdback is untouched, the watermark does not \
+     move, so nothing at the run's instant is filtered away -- and the agreeing \
+     result is kept",
+  );
+
+  // THE SECOND CLAUSE OF THE REPAIR, on its own. "Do not advance" alone loses
+  // the transcript: `finalize`'s Swift shape is `confirmed ++ last_agreed_words
+  // ++ differentSuffix(prev, hypothesis)`, and on a deferred round the holdback
+  // is an EARLIER agreement's -- here it does not exist at all -- so the sum
+  // drops every word the two hypotheses agreed on. A deferred round therefore
+  // finalizes from the latest hypothesis instead (`split_deferred`).
+  //
+  // Mutation proof for that clause alone: drop `|| self.split_deferred` from
+  // `finalize`'s guard and this reads `" x0 x1"` -- the whole 113-word run gone,
+  // exactly the `commonPrefix.count` leading words the Swift expression cannot
+  // account for once the holdback is not the round's own.
+  let deferred_transcript = agreement
+    .clone()
+    .finalize(&crate::audio::whisper::options::DecodingOptions::new())
+    .text()
+    .to_string();
+  assert_eq!(
+    deferred_transcript.split_whitespace().count(),
+    RUN + 2,
+    "a stream that ENDS on a deferred round still finalizes every word it \
+     produced: {deferred_transcript:?}",
+  );
+
+  // And the same with the two hypotheses IDENTICAL, where the differing suffix
+  // is EMPTY as well -- the shape a plain non-advancing policy finalizes as `""`.
+  let mut agreed_twice = agreement.clone();
+  agreed_twice.ingest_streamed(newer());
+  let identical_transcript = agreed_twice
+    .finalize(&crate::audio::whisper::options::DecodingOptions::new())
+    .text()
+    .to_string();
+  assert_eq!(
+    identical_transcript.split_whitespace().count(),
+    RUN + 2,
+    "with nothing confirmed, nothing held and no differing suffix either, the \
+     Swift shape would finalize the empty string: {identical_transcript:?}",
+  );
+
+  // Tail growth is what relieves the deferral: one word starting strictly later
+  // opens a legal boundary above the floor, and it takes two ingests for that
+  // word to reach `common`.
+  let grown = || result_with_words([tied.clone(), suffix(), vec![word(" y", 3.0, 4.0)]].concat());
+  agreement.ingest_streamed(grown());
+  assert!(
+    agreement.ingest_streamed(grown()).is_advanced(),
+    "and the deferral is not a deadlock: the grown tail opens a boundary above \
+     the floor and the round advances",
+  );
+
+  let mut expected: Vec<String> = (0..RUN).map(|index| format!(" w{index:03}")).collect();
+  expected.push(" x0".to_string());
+  expected.push(" x1".to_string());
+  assert_eq!(
+    (confirmed_texts(&agreement), held_back_texts(&agreement)),
+    (
+      expected.iter().map(String::as_str).collect::<Vec<_>>(),
+      vec![" y"],
+    ),
+    "the STREAMING face: the whole tied run and both words at its instant are \
+     confirmed exactly once, and the word that opened the boundary is held",
+  );
+
+  let text = agreement
+    .finalize(&crate::audio::whisper::options::DecodingOptions::new())
+    .text()
+    .to_string();
+  expected.push(" y".to_string());
+  assert_eq!(
+    text.split_whitespace().collect::<Vec<_>>(),
+    expected
+      .iter()
+      .map(|word| word.trim_start())
+      .collect::<Vec<_>>(),
+    "the FINALIZED face: every word the stream produced, each exactly once and \
+     in order",
+  );
 }
 
 #[test]
