@@ -1,11 +1,11 @@
 //! Simulated-stream LocalAgreement-2 on jfk.wav / tiny (ports the
 //! whisperkit-cli `transcribeStreamSimulated` loop, TranscribeCLI.swift:322-424).
 //!
-//! # Two portable properties, and one host-scoped measurement
+//! # Three portable properties, and two host-scoped measurements
 //!
 //! The PORTABLE properties are asserted on every host, because each compares
 //! this run against ITSELF on the same machine — host fp16 drift moves both
-//! sides of the comparison together, so neither can red for hardware reasons:
+//! sides of the comparison together, so none can red for hardware reasons:
 //!
 //! - **Truncation, never rewriting.** [`finalize`](
 //!   coremlit::audio::whisper::stream::agreement::LocalAgreementTranscriber::finalize)'s
@@ -17,20 +17,35 @@
 //! - **Monotone confirmation.** Across the pushes, `confirmed_words_slice()`
 //!   only grows, `last_agreed_seconds()` never decreases, and no already-
 //!   confirmed word is revised.
+//! - **Honest outcome labels.** Every [`AgreementOutcome`] a push reported is
+//!   the one an INDEPENDENT reconstruction of that push says it had to be. The
+//!   reconstruction ([`Route`]) reads engine state — which hypotheses
+//!   `results_slice()` retained, whether the retained one carried word timings,
+//!   and the common-prefix length recomputed from the results themselves — and
+//!   never the label under test. WHICH strides agree is host-scoped; that a
+//!   label matches its own push's route is not.
 //!
-//! Both are non-vacuous by construction: the prefix check refuses a confirmed
-//! text too short to have completed one agreement round (every string starts
-//! with the empty string, so an unconstrained prefix check on an empty
-//! confirmation asserts nothing), and the monotonicity check refuses a run in
-//! which nothing was ever confirmed. The falsifiers for each are the hermetic
-//! tests at the bottom of this file; they are NOT `#[ignore]`d, so the
-//! predicates are gated on every host, model or no model.
+//! All three are non-vacuous by construction: the prefix check refuses a
+//! confirmed text too short to have completed one agreement round (every string
+//! starts with the empty string, so an unconstrained prefix check on an empty
+//! confirmation asserts nothing), the monotonicity check refuses a run in which
+//! nothing was ever confirmed, and the label check refuses a run in which no
+//! stride ever progressed. The falsifiers for each are the hermetic tests at the
+//! bottom of this file; they are NOT `#[ignore]`d, so the predicates are gated
+//! on every host, model or no model.
 //!
-//! The MEASURED observation is whether the confirmed stream ever reaches the
-//! clip's canonical phrase, [`CANONICAL_PHRASE`]. That is a description of one
-//! machine, not a property of the port, so it rides `tests/support/measured_band.rs`'s
-//! three-way host gate: asserted on [`CHARACTERIZED_ON`], computed and PRINTED
-//! everywhere else.
+//! The MEASURED observations are TWO, both descriptions of one machine rather
+//! than properties of the port, so both ride `tests/support/measured_band.rs`'s
+//! three-way host gate — asserted on [`CHARACTERIZED_ON`], computed and PRINTED
+//! everywhere else:
+//!
+//! - whether the confirmed stream ever reaches the clip's canonical phrase,
+//!   [`CANONICAL_PHRASE`];
+//! - the per-stride outcome sequence, [`RECORDED_OUTCOMES`] — the belt to the
+//!   label check's braces. The label check proves each label matches its own
+//!   push's route on every host; this pins WHICH routes this clip takes here,
+//!   and so catches a stride whose behaviour changed while its label stayed
+//!   self-consistent.
 //!
 //! # Why the phrase describes a host rather than the port
 //!
@@ -95,8 +110,10 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use coremlit::audio::whisper::{
   options::{DecodingOptions, Options},
   result::WordTiming,
-  stream::agreement::{AgreementOutcome, LocalAgreement, STRIDE_SAMPLES},
-  text::normalized,
+  stream::agreement::{
+    AgreementOutcome, DEFAULT_AGREEMENT_COUNT_NEEDED, LocalAgreement, STRIDE_SAMPLES,
+  },
+  text::{find_longest_common_prefix, normalized},
   transcribe::WhisperKit,
 };
 
@@ -137,14 +154,73 @@ const CHARACTERIZED_ON: Option<common::CharacterizedHost> = Some(common::Charact
   arch: "arm64",
 });
 
-/// The exact command that re-measures the phrase on THIS machine, quoted into
-/// every band-gate banner so a log names its own fix.
+/// The per-stride [`AgreementOutcome`] sequence the shipping JFK stream reports
+/// on [`CHARACTERIZED_ON`].
+///
+/// MEASURED, exactly like [`CANONICAL_PHRASE`] and for the same reason: which
+/// strides agree, and which of the agreeing ones move anything, is decided by
+/// the host-scoped timestamp-mass gate this module's docs describe. It
+/// therefore rides the same three-way band gate — asserted on the recorded host
+/// class, computed and PRINTED everywhere else — and not a portable `assert!`.
+///
+/// # Why record a sequence at all, next to a portable relation
+///
+/// [`check_outcomes_match_independent_evidence`] is the portable braces and
+/// this is the belt. The relation proves each label matches the route its push
+/// took; this pins WHICH routes this clip takes on this machine. They fail on
+/// different things: the relation catches a label that contradicts the engine
+/// on any host, and this catches a stride whose behaviour changed while its
+/// label stayed self-consistent — the stationary strides 7 and 9 becoming
+/// agreeing-and-moving ones, say, or stride 1 finding word timings it did not
+/// have.
+///
+/// The `[outcome ...]` trace this is compared against is also digested outside
+/// the test, and the two must agree by construction:
+///
+/// ```text
+/// cargo test -p coremlit --features whisper --test whisper_streaming -- --ignored --nocapture \
+///   | grep -E '^\[outcome' | shasum -a 256
+/// 9ce93ed6b510bba3c685061c03110cae2108cf0a6e813528fc47ee41c3e51911
+/// ```
+///
+/// To re-record: run that command, read the `[outcome ...]` lines, and replace
+/// this list — but only from a host that matches [`CHARACTERIZED_ON`]. A
+/// sequence measured anywhere else must not be armed here, for the reason the
+/// [`common::BandVerdict::Foreign`] path exists.
+const RECORDED_OUTCOMES: &[AgreementOutcome] = &[
+  AgreementOutcome::NoWordTimings,
+  AgreementOutcome::AwaitingAgreement,
+  AgreementOutcome::Progressed,
+  AgreementOutcome::Progressed,
+  AgreementOutcome::Progressed,
+  AgreementOutcome::Progressed,
+  AgreementOutcome::Stationary,
+  AgreementOutcome::Progressed,
+  AgreementOutcome::Stationary,
+  AgreementOutcome::Progressed,
+  AgreementOutcome::Progressed,
+];
+
+/// [`RECORDED_OUTCOMES`] as the `[outcome ...]` trace spells it, for a band
+/// line and a failure message.
+fn joined_labels(outcomes: &[AgreementOutcome]) -> String {
+  outcomes
+    .iter()
+    .map(ToString::to_string)
+    .collect::<Vec<_>>()
+    .join(",")
+}
+
+/// The exact command that re-measures BOTH host-scoped measurements — the
+/// phrase and [`RECORDED_OUTCOMES`] — on THIS machine, quoted into every
+/// band-gate banner so a log names its own fix.
 fn recharacterize_command() -> String {
   "cargo test -p coremlit --features whisper --test whisper_streaming -- --ignored --nocapture\n                \
-   then read the printed `[band]` line: if the phrase was present, set\n                \
+   then read the printed `[band]` lines: if the phrase was present, set\n                \
    CHARACTERIZED_ON in crates/coremlit/tests/whisper/streaming.rs to the `this host`\n                \
-   line above; if it was ABSENT, leave the recorded host alone — a host that does not\n                \
-   produce the phrase must not arm it."
+   line above and replace RECORDED_OUTCOMES with the `[outcome ...]` labels the same\n                \
+   run printed; if the phrase was ABSENT, leave BOTH alone — a host that does not\n                \
+   produce the phrase must not arm either of them."
     .to_string()
 }
 
@@ -159,8 +235,8 @@ fn recharacterize_command() -> String {
 /// `[stride ...]` trace exists to prove that the watermark work changes no
 /// transcript, and mixing the outcome label into it made an honest-signal change
 /// disturb a guard that is not about signals. See
-/// [`check_outcomes_match_observed_progress`] for what the labels are asserted
-/// against instead.
+/// [`check_outcomes_match_independent_evidence`] for what the labels are
+/// asserted against instead.
 #[derive(Debug, Clone)]
 struct Confirmation {
   /// 1-based stride index; also the buffered seconds, at a 1 s stride.
@@ -177,16 +253,25 @@ struct Confirmation {
   /// 1 s pushes this is one element — but it is a list because `push_samples`
   /// returns one.
   outcomes: Vec<AgreementOutcome>,
+  /// What this push looked like from OUTSIDE [`Self::outcomes`] — the oracle's
+  /// input. See [`OutcomeEvidence`].
+  evidence: OutcomeEvidence,
 }
 
 impl Confirmation {
-  fn observe(stride: usize, agreement: &LocalAgreement, outcomes: Vec<AgreementOutcome>) -> Self {
+  fn observe(
+    stride: usize,
+    agreement: &LocalAgreement,
+    outcomes: Vec<AgreementOutcome>,
+    evidence: OutcomeEvidence,
+  ) -> Self {
     Self {
       stride,
       last_agreed_seconds: agreement.last_agreed_seconds(),
       confirmed: normalized_words(agreement.confirmed_words_slice()),
       held_back: normalized_words(agreement.last_agreed_words_slice()),
       outcomes,
+      evidence,
     }
   }
 
@@ -205,6 +290,208 @@ impl Confirmation {
 /// Word timings as the normalized word strings the agreement compares.
 fn normalized_words(words: &[WordTiming]) -> Vec<String> {
   words.iter().map(|word| normalized(word.word())).collect()
+}
+
+/// `words` filtered the way [`LocalAgreement::ingest`] filters BOTH sides of
+/// its agreement comparison — `start >= watermark`. The engine's own
+/// `watermark_filtered` is crate-internal; this is that filter rebuilt from the
+/// public parts, so [`OutcomeEvidence::common_prefix`] compares the same two
+/// lists the engine compared.
+fn at_or_past(words: &[WordTiming], watermark: f32) -> Vec<WordTiming> {
+  words
+    .iter()
+    .filter(|word| word.start() >= watermark)
+    .cloned()
+    .collect()
+}
+
+// ---------------------------------------------------------------------
+// The agreement oracle: what a push DID, decided without reading what it SAID
+// ---------------------------------------------------------------------
+
+/// One push's route through [`LocalAgreement::ingest`], reconstructed from
+/// engine state rather than from the [`AgreementOutcome`] under test.
+///
+/// # Why the label cannot be its own witness
+///
+/// The relation this replaced asked the outcome whether the round had agreed
+/// (`outcome.agreed()`) and then checked progress against that answer. On a
+/// round where nothing moved, THREE labels satisfy such a relation —
+/// `stationary` through `is_progressed() == moved`, and `awaiting_agreement`
+/// and `no_word_timings` through the not-agreed branch — so a regression that
+/// swapped a stalled stride's `stationary` for `awaiting_agreement`, or the
+/// reverse, passed. The transcript trace cannot catch it either: it is blind to
+/// labels by construction (that is the point of the two-trace split above).
+///
+/// These four routes are genuinely different events, and each leaves a
+/// signature outside the returned enum:
+///
+/// | route | previous hypothesis | word timings | result | oracle reads |
+/// | --- | --- | --- | --- | --- |
+/// | [`Self::Agreed`] | yes | yes | KEPT | `results_slice` grew, the kept result has words, and the recomputed common prefix reached `agreement_count_needed` |
+/// | [`Self::FirstHypothesis`] | no | yes | KEPT | `results_slice` grew and the kept result has words, but no worded result preceded it |
+/// | [`Self::Disagreed`] | yes | yes | DROPPED | `results_slice` did NOT grow |
+/// | [`Self::NoWordTimings`] | — | no | KEPT | `results_slice` grew and the kept result carries no word timings |
+///
+/// Retention is the load-bearing one, and it is a channel the label cannot
+/// reach: `ingest` drops a hypothesis on exactly one route, and
+/// [`LocalAgreement::results_slice`] is the list [`LocalAgreement::finalize`]
+/// merges. `common_prefix` is a SECOND, independent leg over the same question
+/// — see [`OutcomeEvidence::common_prefix`] for the defect it catches that
+/// retention alone does not.
+///
+/// No production accessor was added for any of this: `results_slice`,
+/// `TranscriptionResult::segments_slice`/`all_words`,
+/// `TranscriptionSegment::words_slice`, `last_agreed_seconds`,
+/// `agreement_count_needed` and
+/// [`find_longest_common_prefix`] were already public.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Route {
+  /// A previous hypothesis existed, this result carried word timings, their
+  /// common prefix reached `agreement_count_needed`, and the result was KEPT.
+  /// The only route that runs an advance, and so the only one that may move
+  /// anything.
+  Agreed,
+  /// The first WORDED result — however many wordless ones preceded it. There is
+  /// no previous hypothesis to compare against, so no agreement logic runs and
+  /// the result is KEPT.
+  ///
+  /// It is the first WORDED one rather than the first one at all because
+  /// `ingest`'s no-timings route returns BEFORE the assignment that installs a
+  /// previous hypothesis, so a wordless result never becomes one. The shipping
+  /// JFK run is exactly this shape: stride 1 is wordless, and stride 2 takes
+  /// this route.
+  FirstHypothesis,
+  /// A previous hypothesis existed and the common prefix fell short, so the
+  /// result was DROPPED. The one route on which `results_slice` does not grow.
+  Disagreed,
+  /// The result carried no word timings to agree over. Kept, and the engine
+  /// returned before it could look at a previous hypothesis at all.
+  NoWordTimings,
+}
+
+impl Route {
+  /// The label a push on this route MUST report. `moved` is consulted only on
+  /// [`Self::Agreed`], the one route that runs an advance.
+  const fn expected_label(self, moved: bool) -> AgreementOutcome {
+    match self {
+      Self::Agreed if moved => AgreementOutcome::Progressed,
+      Self::Agreed => AgreementOutcome::Stationary,
+      Self::FirstHypothesis | Self::Disagreed => AgreementOutcome::AwaitingAgreement,
+      Self::NoWordTimings => AgreementOutcome::NoWordTimings,
+    }
+  }
+
+  /// Whether this route ran the advance — the only one that may move the
+  /// watermark or the confirmed prefix.
+  const fn advanced(self) -> bool {
+    matches!(self, Self::Agreed)
+  }
+
+  /// The evidence that put a push on this route, for a failure message.
+  const fn evidenced_by(self) -> &'static str {
+    match self {
+      Self::Agreed => {
+        "the result was KEPT, it carried word timings, and a worded hypothesis \
+         preceded it"
+      }
+      Self::FirstHypothesis => {
+        "the result was KEPT and carried word timings, and no worded hypothesis \
+         preceded it"
+      }
+      Self::Disagreed => "the result was DROPPED, which `ingest` does on no other route",
+      Self::NoWordTimings => "the result was KEPT and carried no word timings",
+    }
+  }
+}
+
+/// What one push looked like from OUTSIDE the value under test.
+///
+/// [`check_outcomes_match_independent_evidence`] decides which [`Route`] a push
+/// took from these three facts alone, works out the label that route demands,
+/// and only then looks at what the push actually reported. Nothing here reads
+/// that report.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct OutcomeEvidence {
+  /// [`LocalAgreement::results_slice`]'s length AFTER this push. It grows by
+  /// one for a KEPT result and not at all for a dropped one, and `ingest` drops
+  /// on exactly one route — a hypothesis whose common prefix with the previous
+  /// one fell short. So this length alone separates [`Route::Disagreed`] from
+  /// the three kept routes.
+  kept_results: usize,
+  /// Whether the result this push newly KEPT carried word timings, recomputed
+  /// with `ingest`'s own gate: ANY segment with a non-empty `words_slice`.
+  ///
+  /// `None` when the push kept nothing. A dropped result is not in
+  /// `results_slice` to look at — and it does not need to be, since it is
+  /// necessarily worded: the no-timings route returns before any comparison
+  /// that could drop one.
+  kept_has_words: Option<bool>,
+  /// The common-prefix length `ingest`'s agreement gate reads, recomputed here
+  /// from the two RESULTS with [`find_longest_common_prefix`] over
+  /// [`at_or_past`]-filtered words — the engine's own comparison, rebuilt from
+  /// public parts.
+  ///
+  /// This is the second leg, and it catches a defect retention alone cannot: a
+  /// broken agreement gate that KEEPS a hypothesis whose prefix fell short. The
+  /// retention leg would call that round [`Route::Agreed`] and rubber-stamp
+  /// whatever progress label it reported; this leg reds.
+  ///
+  /// `None` where the engine's previous hypothesis is out of the test's reach.
+  /// Two ways in: no worded result has been ingested yet, or the previous
+  /// ingested result was DROPPED and so never reached `results_slice`. Both are
+  /// legitimate runs, so the coverage this leg achieves is REPORTED per stride
+  /// in the `[evidence ...]` trace rather than floored — a run whose every
+  /// agreeing round follows a dropped hypothesis would have no reachable
+  /// predecessor anywhere, and refusing it would red a correct stream.
+  common_prefix: Option<usize>,
+}
+
+impl OutcomeEvidence {
+  /// A push that KEPT a result carrying word timings.
+  const fn kept_worded(kept_results: usize, common_prefix: Option<usize>) -> Self {
+    Self {
+      kept_results,
+      kept_has_words: Some(true),
+      common_prefix,
+    }
+  }
+
+  /// A push that KEPT a result with no word timings.
+  const fn kept_wordless(kept_results: usize) -> Self {
+    Self {
+      kept_results,
+      kept_has_words: Some(false),
+      common_prefix: None,
+    }
+  }
+
+  /// A push whose result was DROPPED — `kept_results` is therefore the length
+  /// it already had.
+  const fn dropped(kept_results: usize) -> Self {
+    Self {
+      kept_results,
+      kept_has_words: None,
+      common_prefix: None,
+    }
+  }
+
+  /// The `[evidence ...]` trace's payload.
+  fn trace(&self) -> String {
+    format!(
+      "kept {:>2}  words {}  common {}",
+      self.kept_results,
+      match self.kept_has_words {
+        Some(true) => "yes    ",
+        Some(false) => "none   ",
+        None => "DROPPED",
+      },
+      match self.common_prefix {
+        Some(length) => length.to_string(),
+        None => "-".to_string(),
+      },
+    )
+  }
 }
 
 /// PORTABLE: `confirmed` is a word-for-word prefix of `batch`, and long enough
@@ -304,38 +591,63 @@ fn check_confirmed_is_prefix_of_batch(
   Err(report)
 }
 
-/// PORTABLE: every reported [`AgreementOutcome`] agrees with what the engine's
-/// own state did across that push.
+/// PORTABLE: every reported [`AgreementOutcome`] is the one an INDEPENDENT
+/// reconstruction of that push says it had to be.
 ///
 /// The outcome sequence is real behaviour and must stay asserted, but the
 /// LABELS are not portable — which strides agree, and which of the agreeing ones
 /// move anything, is decided by the same host-scoped timestamp-mass gate this
-/// file's docs describe. What IS portable is the relation between the label and
-/// the state, because it compares this run against itself: an agreeing round
-/// reports `progressed` exactly when [`LocalAgreement::last_agreed_seconds`] or
-/// the confirmed prefix moved, and `stationary` exactly when neither did. A
-/// round that did not agree runs no advance, so it must move neither.
+/// file's docs describe. What IS portable is that each label matches the route
+/// its push actually took, because that compares this run against itself.
 ///
-/// The watermark is compared by BITS. Rounding it to the two decimals the trace
-/// prints would report a 0.02 s step as a stall, which is precisely the reading
-/// the outcome now exists to replace.
+/// The route comes from [`Route`], which reads engine state and never the
+/// outcome under test: which hypotheses [`LocalAgreement::results_slice`]
+/// retained, whether the retained one carried word timings, and the
+/// common-prefix length recomputed from the results themselves. That
+/// independence is the whole guard — see [`Route`] for the three-label
+/// ambiguity a self-referential relation leaves open on a round that moved
+/// nothing.
+///
+/// Progress within the agreeing route is still measured the same way `ingest`
+/// measures it: [`LocalAgreement::last_agreed_seconds`] by BITS and the
+/// confirmed prefix by length. Rounding the watermark to the two decimals the
+/// trace prints would report a 0.02 s step as a stall, which is precisely the
+/// reading the outcome exists to replace.
+///
+/// `agreement_count_needed` is the run's own
+/// [`LocalAgreement::agreement_count_needed`], the threshold the recomputed
+/// common prefix is read against.
 ///
 /// # Errors
-/// The first stride whose label contradicts its own state transition, naming
-/// both; or a run in which no stride ever reported progress, which would leave
-/// the relation asserted only on its trivial side.
-fn check_outcomes_match_observed_progress(steps: &[Confirmation]) -> Result<(), String> {
+/// Evidence that cannot describe one ingest; a round the oracle says ran no
+/// advance that moved something anyway; the first stride whose label is not the
+/// one its route demands, naming both; or a run in which no stride ever
+/// progressed, which would leave the agreeing route asserted only on its
+/// stationary side.
+fn check_outcomes_match_independent_evidence(
+  steps: &[Confirmation],
+  agreement_count_needed: usize,
+) -> Result<(), String> {
   let mut progressed = 0usize;
+  // `LocalAgreement`'s private `prev_result`, reconstructed as a boolean: the
+  // no-timings route returns BEFORE the assignment that installs one, so a
+  // wordless result never becomes a hypothesis however many of them arrive.
+  // Both other kept routes and the dropped one do install theirs.
+  let mut worded_before = false;
   for (index, after) in steps.iter().enumerate() {
-    // The first push has no predecessor; the engine starts at watermark 0.0 with
-    // nothing confirmed, which is what a synthetic zeroth snapshot would say.
-    let (was_watermark, was_confirmed) =
-      index.checked_sub(1).map_or((0.0f32, 0usize), |previous| {
-        (
-          steps[previous].last_agreed_seconds,
-          steps[previous].confirmed.len(),
-        )
-      });
+    // The first push has no predecessor; the engine starts at watermark 0.0
+    // with nothing confirmed and no results kept, which is what a synthetic
+    // zeroth snapshot would say.
+    let (was_watermark, was_confirmed, was_kept) =
+      index
+        .checked_sub(1)
+        .map_or((0.0f32, 0usize, 0usize), |previous| {
+          (
+            steps[previous].last_agreed_seconds,
+            steps[previous].confirmed.len(),
+            steps[previous].evidence.kept_results,
+          )
+        });
     let moved = after.last_agreed_seconds.to_bits() != was_watermark.to_bits()
       || after.confirmed.len() != was_confirmed;
     // One push, one ingest at this stride and cadence — so the push's labels
@@ -352,36 +664,156 @@ fn check_outcomes_match_observed_progress(steps: &[Confirmation]) -> Result<(), 
         after.outcome_labels(),
       ));
     };
-    progressed += usize::from(outcome.is_progressed());
-    let honest = if outcome.agreed() {
-      outcome.is_progressed() == moved
-    } else {
-      !moved
+
+    // ── The evidence must describe ONE ingest, or it is not evidence for one.
+    let evidence = &after.evidence;
+    let kept = match evidence.kept_results.checked_sub(was_kept) {
+      Some(0) => false,
+      Some(1) => true,
+      _ => {
+        return Err(format!(
+          "stride {}: the kept-result count went {was_kept} -> {}, which one \
+           ingest cannot do — it keeps exactly one result or none, and the list \
+           is append-only.\n\
+           Either the cadence changed (see the one-outcome check above) or the \
+           evidence was not read from the same engine the outcome came from.",
+          after.stride, evidence.kept_results,
+        ));
+      }
     };
-    if !honest {
+    if kept != evidence.kept_has_words.is_some() {
       return Err(format!(
-        "stride {} reported `{outcome}` while the watermark went {was_watermark} s \
-         -> {} s ({:#x} -> {:#x}) and the confirmed prefix {was_confirmed} -> {} \
-         words.\n\
-         An agreeing round must say `progressed` exactly when one of those two \
-         moved and `stationary` exactly when neither did; a round that did not \
-         agree ran no advance and must move neither.\n\
+        "stride {}: the kept-result count says the result was {}, and the \
+         word-timing evidence says it was {}.\n\
+         `kept_has_words` is read FROM the newly kept result, so it is present \
+         exactly when one was kept. Fix the observation, not this check.",
+        after.stride,
+        if kept { "KEPT" } else { "DROPPED" },
+        if evidence.kept_has_words.is_some() {
+          "KEPT"
+        } else {
+          "DROPPED"
+        },
+      ));
+    }
+
+    // ── The route, from that evidence and nothing the push reported.
+    let this_worded = evidence.kept_has_words != Some(false);
+    let route = if !kept {
+      if !worded_before {
+        return Err(format!(
+          "stride {}: the result was DROPPED, but no worded hypothesis had been \
+           ingested yet.\n\
+           `ingest` drops on ONE route — a common prefix too short — and that \
+           comparison only runs against a previous hypothesis. With none there \
+           is nothing to disagree with and the result is kept. This evidence \
+           describes a state the engine cannot be in.",
+          after.stride,
+        ));
+      }
+      Route::Disagreed
+    } else if evidence.kept_has_words == Some(false) {
+      Route::NoWordTimings
+    } else if worded_before {
+      Route::Agreed
+    } else {
+      Route::FirstHypothesis
+    };
+    worded_before |= this_worded;
+
+    // ── Second leg: the common prefix, where the previous hypothesis is still
+    // reachable. It answers the SAME question as retention through a different
+    // channel, so a disagreement between them is an engine defect either way.
+    if let Some(common) = evidence.common_prefix {
+      let agreed_by_prefix = common >= agreement_count_needed;
+      if agreed_by_prefix != route.advanced() {
+        return Err(format!(
+          "stride {}: the two independent readings of whether this round AGREED \
+           contradict each other.\n  \
+           retention  : {} — so the round {}\n  \
+           common prefix: {common} word(s) vs the {agreement_count_needed} this \
+           run requires — so the round {}\n\
+           `ingest` keeps a hypothesis exactly when that prefix reaches the \
+           threshold, so these cannot differ. Suspect the agreement gate itself: \
+           a gate that keeps a result whose prefix fell short reads as an \
+           agreement to the retention leg and would rubber-stamp whatever \
+           progress label followed.",
+          after.stride,
+          route.evidenced_by(),
+          if route.advanced() {
+            "agreed"
+          } else {
+            "did not agree"
+          },
+          if agreed_by_prefix {
+            "agreed"
+          } else {
+            "did not agree"
+          },
+        ));
+      }
+    }
+
+    // ── A round that ran no advance may not have moved anything, whatever it
+    // reported. This is about the ENGINE, not about the label.
+    if !route.advanced() && moved {
+      return Err(format!(
+        "stride {} did not agree — {} — so it ran no advance, yet the watermark \
+         went {was_watermark} s -> {} s ({:#x} -> {:#x}) and the confirmed \
+         prefix {was_confirmed} -> {} words.\n\
+         Only the agreeing route touches either channel.\n\
          This compares the run against ITSELF on this machine, so host fp16 \
          drift moves both sides together and cannot cause it.",
         after.stride,
+        route.evidenced_by(),
         after.last_agreed_seconds,
         was_watermark.to_bits(),
         after.last_agreed_seconds.to_bits(),
         after.confirmed.len(),
       ));
     }
+
+    // ── The label, against the route's demand rather than against itself.
+    let expected = route.expected_label(moved);
+    if *outcome != expected {
+      return Err(format!(
+        "stride {} reported `{outcome}`, but the evidence says it had to report \
+         `{expected}`.\n  \
+         route     : {route:?} — {}\n  \
+         watermark : {was_watermark} s -> {} s ({:#x} -> {:#x})\n  \
+         confirmed : {was_confirmed} -> {} words\n  \
+         kept      : {was_kept} -> {} result(s)\n  \
+         common    : {}\n\
+         The route is read from the engine's own state and NEVER from the \
+         outcome, so this cannot be satisfied by relabelling: on a round that \
+         moved nothing, `stationary`, `awaiting_agreement` and \
+         `no_word_timings` are three different claims and exactly one of them \
+         is true.\n\
+         This compares the run against ITSELF on this machine, so host fp16 \
+         drift moves both sides together and cannot cause it.",
+        after.stride,
+        route.evidenced_by(),
+        after.last_agreed_seconds,
+        was_watermark.to_bits(),
+        after.last_agreed_seconds.to_bits(),
+        after.confirmed.len(),
+        evidence.kept_results,
+        evidence.common_prefix.map_or_else(
+          || "unreachable — the previous hypothesis was dropped, or none had \
+              been ingested yet"
+            .to_string(),
+          |common| format!("{common} word(s) vs the {agreement_count_needed} this run requires"),
+        ),
+      ));
+    }
+    progressed += usize::from(outcome.is_progressed());
   }
 
   if progressed == 0 {
     return Err(format!(
-      "no stride reported `progressed` across all {} stride(s), so the relation \
-       above was only ever read on its did-not-move side and asserts nothing \
-       about the moving one.\n\
+      "no stride reported `progressed` across all {} stride(s), so the agreeing \
+       route above was only ever read on its stationary side and asserts \
+       nothing about the moving one.\n\
        A run that never progressed is a stall to diagnose, not evidence.",
       steps.len(),
     ));
@@ -510,9 +942,59 @@ fn jfk_simulated_stream_confirms_the_transcript() {
   // carries the labels, which this work DOES move, and digests separately.
   // While the two shared one line, an honest-signal fix disturbed a guard that
   // is not about signals.
+  // THE ORACLE'S ONE PIECE OF STATE. `LocalAgreement::ingest` compares the new
+  // hypothesis against a PRIVATE `prev_result`, and this tracks the half of it
+  // the test can still see, by the engine's own three rules: a worded result
+  // becomes the previous hypothesis; a WORDLESS one does not (that route returns
+  // before the assignment); and a DROPPED one does become it but never reaches
+  // `results_slice`, so the test loses sight of it and says so with `None`
+  // rather than guessing. See `OutcomeEvidence::common_prefix`.
+  let mut previous_hypothesis: Option<Vec<WordTiming>> = None;
+  let mut kept_before = 0usize;
+  let mut watermark_before = 0.0f32;
   for (index, chunk) in audio.chunks(STRIDE_SAMPLES).enumerate() {
     let outcomes = streamer.push_samples(chunk).unwrap();
-    let step = Confirmation::observe(index + 1, streamer.agreement(), outcomes);
+    let agreement = streamer.agreement();
+
+    // ── The evidence, read from engine state and never from `outcomes`.
+    let kept_results = agreement.results_slice().len();
+    let newly_kept = (kept_results > kept_before).then(|| {
+      agreement
+        .results_slice()
+        .last()
+        .expect("a kept result is in the list")
+    });
+    // `ingest`'s own gate (`:371`), recomputed: ANY segment with a word timing.
+    let kept_has_words = newly_kept.map(|result| {
+      result
+        .segments_slice()
+        .iter()
+        .any(|segment| !segment.words_slice().is_empty())
+    });
+    let kept_words = newly_kept
+      .filter(|_| kept_has_words == Some(true))
+      .map(coremlit::audio::whisper::result::TranscriptionResult::all_words);
+    // The engine's own comparison, over the watermark that was current when
+    // this ingest ran — the one this push started from, not the one it ended
+    // with.
+    let common_prefix =
+      previous_hypothesis
+        .as_ref()
+        .zip(kept_words.as_ref())
+        .map(|(previous, hypothesis)| {
+          find_longest_common_prefix(
+            &at_or_past(previous, watermark_before),
+            &at_or_past(hypothesis, watermark_before),
+          )
+          .len()
+        });
+    let evidence = OutcomeEvidence {
+      kept_results,
+      kept_has_words,
+      common_prefix,
+    };
+
+    let step = Confirmation::observe(index + 1, agreement, outcomes, evidence);
     println!(
       "[stride {:>2}] watermark {:>6.2} s  confirmed {:>2}  held {:>2}  {:?}",
       step.stride,
@@ -522,6 +1004,18 @@ fn jfk_simulated_stream_confirms_the_transcript() {
       step.confirmed.join(" "),
     );
     println!("[outcome {:>2}] {}", step.stride, step.outcome_labels());
+    // A THIRD trace line, on its own prefix so neither digest above moves: what
+    // the oracle read, so a failure can be diagnosed from a log alone.
+    println!("[evidence {:>2}] {}", step.stride, step.evidence.trace());
+
+    // Maintain the tracker by the three rules above, then the two baselines.
+    match kept_has_words {
+      Some(false) => {}
+      Some(true) => previous_hypothesis = kept_words,
+      None => previous_hypothesis = None,
+    }
+    kept_before = kept_results;
+    watermark_before = step.last_agreed_seconds;
     steps.push(step);
   }
   // Read before `finalize` consumes the driver: the floor the prefix check needs
@@ -538,14 +1032,62 @@ fn jfk_simulated_stream_confirms_the_transcript() {
   if let Err(why) = check_confirmed_is_prefix_of_batch(&confirmed, &batch, agreement_count_needed) {
     panic!("streaming confirmation is not a prefix of the batch transcript: {why}");
   }
-  // The outcome labels, asserted against the state they claim to describe rather
-  // than against a recorded sequence — the labels themselves are host-scoped,
-  // the relation is not.
-  if let Err(why) = check_outcomes_match_observed_progress(&steps) {
+  // The outcome labels, asserted against an INDEPENDENT reconstruction of what
+  // each push did — the labels themselves are host-scoped, the relation between
+  // a label and its push's route is not.
+  if let Err(why) = check_outcomes_match_independent_evidence(&steps, agreement_count_needed) {
     panic!("a reported agreement outcome did not match what the engine did: {why}");
   }
 
   // ── Measured, asserted only on the host class that produced it.
+  //
+  // The recorded label sequence is the belt to the relation's braces: the
+  // relation proves every label matches its own push's route on every host, and
+  // this pins WHICH routes this clip takes on the host that was characterized.
+  // On that host it catches the one thing a self-consistent relabelling could
+  // still hide — a stationary stride becoming a moving one, or stride 1 finding
+  // word timings it did not have.
+  let observed: Vec<AgreementOutcome> = steps
+    .iter()
+    .flat_map(|step| step.outcomes.iter().copied())
+    .collect();
+  gate.check_holds(
+    "per-stride agreement outcome sequence",
+    observed == RECORDED_OUTCOMES,
+    &format!(
+      "the {} recorded label(s) {}",
+      RECORDED_OUTCOMES.len(),
+      joined_labels(RECORDED_OUTCOMES),
+    ),
+    &format!(
+      "the per-stride outcome sequence is not the one recorded on this host \
+       class.\n  recorded : {} label(s) {}\n  observed : {} label(s) {}\n{}\n\
+       The portable relation above already passed, so every label still matches \
+       its own push's route —\nwhat moved is WHICH route a stride takes. That is \
+       either a real behaviour change to\nunderstand or a host drift to \
+       re-record; it is not a sequence to widen.",
+      RECORDED_OUTCOMES.len(),
+      joined_labels(RECORDED_OUTCOMES),
+      observed.len(),
+      joined_labels(&observed),
+      RECORDED_OUTCOMES
+        .iter()
+        .zip(&observed)
+        .position(|(recorded, seen)| recorded != seen)
+        .map_or_else(
+          || "  the shared prefix matched, so the two differ only in LENGTH — \
+              the clip produced a different number of strides"
+            .to_string(),
+          |index| format!(
+            "  first divergence at stride {}: recorded `{}`, observed `{}`",
+            index + 1,
+            RECORDED_OUTCOMES[index],
+            observed[index],
+          ),
+        ),
+    ),
+  );
+
   gate.check_holds(
     "confirmed stream reaches the clip's canonical phrase",
     confirmed.contains(CANONICAL_PHRASE),
@@ -568,8 +1110,8 @@ fn jfk_simulated_stream_confirms_the_transcript() {
 
 /// Snapshots from normalized word lists, for the hermetic cases below.
 ///
-/// No outcome: the monotonicity cases are about the state sequence alone.
-/// [`step_reporting`] is the one the outcome cases use.
+/// No outcome and no evidence: the monotonicity cases are about the state
+/// sequence alone. [`step_reporting`] is the one the outcome cases use.
 fn step(stride: usize, watermark: f32, confirmed: &[&str], held_back: &[&str]) -> Confirmation {
   Confirmation {
     stride,
@@ -577,55 +1119,107 @@ fn step(stride: usize, watermark: f32, confirmed: &[&str], held_back: &[&str]) -
     confirmed: confirmed.iter().map(|w| (*w).to_string()).collect(),
     held_back: held_back.iter().map(|w| (*w).to_string()).collect(),
     outcomes: Vec::new(),
+    evidence: OutcomeEvidence::dropped(0),
   }
 }
 
-/// The same snapshot carrying the label this push reported.
+/// The same snapshot carrying the label this push reported AND the independent
+/// evidence the oracle reads. The two are supplied separately on purpose: every
+/// falsifier below moves exactly one of them and leaves the other alone, which
+/// is what makes each case a real minimal pair.
 fn step_reporting(
   stride: usize,
   outcome: AgreementOutcome,
   watermark: f32,
   confirmed: &[&str],
+  evidence: OutcomeEvidence,
 ) -> Confirmation {
   Confirmation {
     outcomes: vec![outcome],
+    evidence,
     ..step(stride, watermark, confirmed, &[])
   }
 }
 
-/// The JFK run's own shape, as the labels a correct engine reports for it: two
-/// silent strides, then rounds that move the watermark and one that does not.
+/// The JFK run's own shape, as the labels a correct engine reports for it AND
+/// the evidence that same engine leaves behind: a wordless stride, the first
+/// worded hypothesis, then rounds that move the watermark and one that does
+/// not.
+///
+/// The evidence is the shipping run's, not an invention — stride 1 keeps a
+/// wordless result, stride 2 keeps the first worded one (it cannot agree: the
+/// no-timings route never installed a hypothesis for it to agree with), and
+/// every stride after that keeps a worded result whose recomputed common prefix
+/// clears the default width of 2.
 fn honest_run() -> Vec<Confirmation> {
   vec![
-    step_reporting(1, AgreementOutcome::NoWordTimings, 0.0, &[]),
-    step_reporting(2, AgreementOutcome::AwaitingAgreement, 0.0, &[]),
-    step_reporting(3, AgreementOutcome::Progressed, 1.36, &["and", "so", "my"]),
-    step_reporting(4, AgreementOutcome::Progressed, 1.38, &["and", "so", "my"]),
-    step_reporting(5, AgreementOutcome::Stationary, 1.38, &["and", "so", "my"]),
+    step_reporting(
+      1,
+      AgreementOutcome::NoWordTimings,
+      0.0,
+      &[],
+      OutcomeEvidence::kept_wordless(1),
+    ),
+    step_reporting(
+      2,
+      AgreementOutcome::AwaitingAgreement,
+      0.0,
+      &[],
+      OutcomeEvidence::kept_worded(2, None),
+    ),
+    step_reporting(
+      3,
+      AgreementOutcome::Progressed,
+      1.36,
+      &["and", "so", "my"],
+      OutcomeEvidence::kept_worded(3, Some(5)),
+    ),
+    step_reporting(
+      4,
+      AgreementOutcome::Progressed,
+      1.38,
+      &["and", "so", "my"],
+      OutcomeEvidence::kept_worded(4, Some(5)),
+    ),
+    step_reporting(
+      5,
+      AgreementOutcome::Stationary,
+      1.38,
+      &["and", "so", "my"],
+      OutcomeEvidence::kept_worded(5, Some(2)),
+    ),
   ]
 }
+
+/// The width [`honest_run`]'s evidence is read at. Bound to the shipping
+/// [`DEFAULT_AGREEMENT_COUNT_NEEDED`] rather than written as `2`, so a change to
+/// the default moves these cases with it instead of leaving them asserting
+/// against a literal the engine no longer uses.
+const HERMETIC_AGREEMENT_WIDTH: usize = DEFAULT_AGREEMENT_COUNT_NEEDED;
 
 /// The honest shape passes, and it is the JFK stall's own: a `stationary` round
 /// with the watermark bit-identical to the round before it.
 #[test]
 fn an_outcome_sequence_that_matches_the_state_is_accepted() {
   assert_eq!(
-    check_outcomes_match_observed_progress(&honest_run()),
+    check_outcomes_match_independent_evidence(&honest_run(), HERMETIC_AGREEMENT_WIDTH),
     Ok(())
   );
 }
 
-/// THE FALSIFIER the honest-signal fix exists for: a round that moved NOTHING
-/// and claimed progress. This is what every stalled stride reported before the
-/// two agreeing cases were told apart.
+/// THE FALSIFIER the honest-signal fix exists for: a round that moved neither
+/// SETTLED channel — not the watermark, not the confirmed prefix — and claimed
+/// progress. This is what every stalled stride reported before the two agreeing
+/// cases were told apart.
 #[test]
 fn a_progressed_label_on_a_stalled_stride_reds() {
   let mut steps = honest_run();
   steps[4].outcomes = vec![AgreementOutcome::Progressed];
-  let why = check_outcomes_match_observed_progress(&steps)
+  let why = check_outcomes_match_independent_evidence(&steps, HERMETIC_AGREEMENT_WIDTH)
     .expect_err("a stalled stride claiming progress must red");
   assert!(why.contains("stride 5"), "{why}");
-  assert!(why.contains("`progressed`"), "{why}");
+  assert!(why.contains("reported `progressed`"), "{why}");
+  assert!(why.contains("had to report `stationary`"), "{why}");
   assert!(why.contains("1.38"), "{why}");
 }
 
@@ -636,21 +1230,187 @@ fn a_progressed_label_on_a_stalled_stride_reds() {
 fn a_stationary_label_on_a_moving_stride_reds() {
   let mut steps = honest_run();
   steps[3].outcomes = vec![AgreementOutcome::Stationary];
-  let why = check_outcomes_match_observed_progress(&steps)
+  let why = check_outcomes_match_independent_evidence(&steps, HERMETIC_AGREEMENT_WIDTH)
     .expect_err("a moving stride claiming to be stationary must red");
   assert!(why.contains("stride 4"), "{why}");
-  assert!(why.contains("`stationary`"), "{why}");
+  assert!(why.contains("reported `stationary`"), "{why}");
+  assert!(why.contains("had to report `progressed`"), "{why}");
+}
+
+// ── The three swaps a self-referential relation could not see ────────────────
+//
+// All three land on rounds where NOTHING moved, which is exactly where the
+// relation this replaced went blind: it asked the outcome whether the round had
+// agreed and then checked progress against that answer, so `stationary`
+// (`is_progressed() == moved`, false == false), `awaiting_agreement` (`!moved`)
+// and `no_word_timings` (`!moved`) all satisfied it. The oracle reads the route
+// from `results_slice` and the kept result's own timings instead, so exactly one
+// of the three is true on any given round.
+
+/// SWAP 1: a stationary stride relabelled `awaiting_agreement`. The stride kept
+/// a worded result behind a worded predecessor, so it AGREED; a round that
+/// agreed cannot report the label of one that did not.
+#[test]
+fn a_stationary_stride_relabelled_awaiting_agreement_reds() {
+  let mut steps = honest_run();
+  // Non-vacuous: the round this replaces is the stall, and nothing moved across
+  // it — the exact shape the old relation accepted under either label.
+  assert_eq!(
+    steps[4].last_agreed_seconds.to_bits(),
+    steps[3].last_agreed_seconds.to_bits(),
+  );
+  assert_eq!(steps[4].confirmed.len(), steps[3].confirmed.len());
+
+  steps[4].outcomes = vec![AgreementOutcome::AwaitingAgreement];
+  let why = check_outcomes_match_independent_evidence(&steps, HERMETIC_AGREEMENT_WIDTH)
+    .expect_err("an agreeing stall relabelled `awaiting_agreement` must red");
+  assert!(why.contains("stride 5"), "{why}");
+  assert!(why.contains("reported `awaiting_agreement`"), "{why}");
+  assert!(why.contains("had to report `stationary`"), "{why}");
+  assert!(why.contains("the result was KEPT"), "{why}");
+}
+
+/// SWAP 2: the same stationary stride relabelled `no_word_timings`. Its kept
+/// result carried word timings, so the no-timings route is not one it could
+/// have taken.
+#[test]
+fn a_stationary_stride_relabelled_no_word_timings_reds() {
+  let mut steps = honest_run();
+  steps[4].outcomes = vec![AgreementOutcome::NoWordTimings];
+  let why = check_outcomes_match_independent_evidence(&steps, HERMETIC_AGREEMENT_WIDTH)
+    .expect_err("an agreeing stall relabelled `no_word_timings` must red");
+  assert!(why.contains("stride 5"), "{why}");
+  assert!(why.contains("reported `no_word_timings`"), "{why}");
+  assert!(why.contains("had to report `stationary`"), "{why}");
+  assert!(why.contains("carried word timings"), "{why}");
+}
+
+/// SWAP 3, the reverse: a genuinely non-agreeing round relabelled `stationary`.
+/// Stride 2 is the first WORDED hypothesis — the no-timings stride before it
+/// never installed one to agree with — so no agreement logic ran at all, and it
+/// moved nothing, which is what let the old relation take `stationary` for it.
+#[test]
+fn a_non_agreeing_stride_relabelled_stationary_reds() {
+  let mut steps = honest_run();
+  assert_eq!(steps[1].last_agreed_seconds.to_bits(), 0.0f32.to_bits());
+  assert!(steps[1].confirmed.is_empty());
+
+  steps[1].outcomes = vec![AgreementOutcome::Stationary];
+  let why = check_outcomes_match_independent_evidence(&steps, HERMETIC_AGREEMENT_WIDTH)
+    .expect_err("a first-hypothesis round relabelled `stationary` must red");
+  assert!(why.contains("stride 2"), "{why}");
+  assert!(why.contains("reported `stationary`"), "{why}");
+  assert!(why.contains("had to report `awaiting_agreement`"), "{why}");
+  assert!(why.contains("FirstHypothesis"), "{why}");
+
+  // And the OTHER non-agreeing route reads the same way: a DROPPED result is a
+  // disagreement whatever label it carries.
+  let mut steps = honest_run();
+  steps[2].evidence = OutcomeEvidence::dropped(2);
+  steps[2].last_agreed_seconds = steps[1].last_agreed_seconds;
+  steps[2].confirmed = Vec::new();
+  steps[2].outcomes = vec![AgreementOutcome::Stationary];
+  let why = check_outcomes_match_independent_evidence(&steps, HERMETIC_AGREEMENT_WIDTH)
+    .expect_err("a dropped round relabelled `stationary` must red");
+  assert!(why.contains("stride 3"), "{why}");
+  assert!(why.contains("had to report `awaiting_agreement`"), "{why}");
+  assert!(why.contains("the result was DROPPED"), "{why}");
+}
+
+/// A wordless stride relabelled as one of the agreeing ones reds too — the
+/// fourth corner of the same square.
+#[test]
+fn a_wordless_stride_relabelled_stationary_reds() {
+  let mut steps = honest_run();
+  steps[0].outcomes = vec![AgreementOutcome::Stationary];
+  let why = check_outcomes_match_independent_evidence(&steps, HERMETIC_AGREEMENT_WIDTH)
+    .expect_err("a wordless stride relabelled `stationary` must red");
+  assert!(why.contains("stride 1"), "{why}");
+  assert!(why.contains("had to report `no_word_timings`"), "{why}");
+  assert!(why.contains("carried no word timings"), "{why}");
 }
 
 /// A round that did not agree ran no advance, so it may not have moved either.
+/// This is a statement about the ENGINE rather than about the label, so the
+/// evidence is what moves here: the round is made a DISAGREEMENT while its
+/// watermark still steps.
 #[test]
-fn a_non_agreeing_label_on_a_moving_stride_reds() {
+fn a_non_agreeing_round_that_moved_reds() {
   let mut steps = honest_run();
+  // Stride 4 keeps its 1.36 -> 1.38 step and its `awaiting_agreement` label,
+  // but its result was dropped — so no advance ran and nothing may have moved.
+  steps[3].evidence = OutcomeEvidence::dropped(3);
   steps[3].outcomes = vec![AgreementOutcome::AwaitingAgreement];
-  let why = check_outcomes_match_observed_progress(&steps)
+  let why = check_outcomes_match_independent_evidence(&steps, HERMETIC_AGREEMENT_WIDTH)
     .expect_err("a non-agreeing stride that moved the watermark must red");
   assert!(why.contains("stride 4"), "{why}");
   assert!(why.contains("did not agree"), "{why}");
+  assert!(why.contains("ran no advance"), "{why}");
+}
+
+/// The SECOND leg. A gate that KEEPS a hypothesis whose common prefix fell
+/// short reads as an agreement to the retention leg, which would then
+/// rubber-stamp whatever progress label followed. The recomputed prefix refuses
+/// it.
+#[test]
+fn a_kept_round_whose_prefix_fell_short_reds() {
+  let mut steps = honest_run();
+  steps[4].evidence = OutcomeEvidence::kept_worded(5, Some(HERMETIC_AGREEMENT_WIDTH - 1));
+  let why = check_outcomes_match_independent_evidence(&steps, HERMETIC_AGREEMENT_WIDTH)
+    .expect_err("a kept round whose prefix fell short must red");
+  assert!(why.contains("stride 5"), "{why}");
+  assert!(why.contains("contradict each other"), "{why}");
+  assert!(why.contains("common prefix"), "{why}");
+
+  // Non-vacuous: the SAME step at the full width is accepted, so the case turns
+  // on the prefix length and on nothing else.
+  steps[4].evidence = OutcomeEvidence::kept_worded(5, Some(HERMETIC_AGREEMENT_WIDTH));
+  assert_eq!(
+    check_outcomes_match_independent_evidence(&steps, HERMETIC_AGREEMENT_WIDTH),
+    Ok(())
+  );
+}
+
+/// Evidence that cannot have come from one ingest is refused rather than
+/// interpreted. Both directions: a kept-count that jumped, and a kept-count
+/// that disagrees with whether a result was there to look at.
+#[test]
+fn evidence_that_cannot_describe_one_ingest_reds() {
+  let mut steps = honest_run();
+  steps[2].evidence = OutcomeEvidence::kept_worded(4, Some(5));
+  let why = check_outcomes_match_independent_evidence(&steps, HERMETIC_AGREEMENT_WIDTH)
+    .expect_err("a kept-count that jumped by two must red");
+  assert!(why.contains("stride 3"), "{why}");
+  assert!(why.contains("one ingest cannot do"), "{why}");
+
+  let mut steps = honest_run();
+  steps[2].evidence = OutcomeEvidence {
+    kept_results: 2,
+    kept_has_words: Some(true),
+    common_prefix: Some(5),
+  };
+  let why = check_outcomes_match_independent_evidence(&steps, HERMETIC_AGREEMENT_WIDTH)
+    .expect_err("a dropped result that was somehow inspected must red");
+  assert!(why.contains("stride 3"), "{why}");
+  assert!(why.contains("DROPPED"), "{why}");
+  assert!(why.contains("Fix the observation"), "{why}");
+}
+
+/// Nothing can be dropped before there is a hypothesis to disagree with, so
+/// evidence claiming it describes a state the engine cannot reach.
+#[test]
+fn a_drop_before_the_first_hypothesis_reds() {
+  let steps = [step_reporting(
+    1,
+    AgreementOutcome::AwaitingAgreement,
+    0.0,
+    &[],
+    OutcomeEvidence::dropped(0),
+  )];
+  let why = check_outcomes_match_independent_evidence(&steps, HERMETIC_AGREEMENT_WIDTH)
+    .expect_err("a drop with no previous hypothesis must red");
+  assert!(why.contains("stride 1"), "{why}");
+  assert!(why.contains("cannot be in"), "{why}");
 }
 
 /// Rounding is what the bit comparison is there to refuse: 1.38 and a watermark
@@ -665,20 +1425,33 @@ fn a_sub_printed_precision_step_is_still_a_move() {
     format!("{:.2}", steps[3].last_agreed_seconds),
     "non-vacuous: the two print the same at the trace's own precision",
   );
-  let why = check_outcomes_match_observed_progress(&steps)
+  let why = check_outcomes_match_independent_evidence(&steps, HERMETIC_AGREEMENT_WIDTH)
     .expect_err("a one-ULP step is a move, and calling it stationary must red");
   assert!(why.contains("stride 5"), "{why}");
 }
 
-/// A run in which nothing ever progressed satisfies the relation on its trivial
-/// side only, so the predicate must refuse it rather than report a green.
+/// A run in which nothing ever progressed reads the agreeing route on its
+/// stationary side only, so the predicate must refuse it rather than report a
+/// green.
 #[test]
 fn a_run_that_never_progresses_is_not_outcome_evidence() {
   let steps = [
-    step_reporting(1, AgreementOutcome::AwaitingAgreement, 0.0, &[]),
-    step_reporting(2, AgreementOutcome::Stationary, 0.0, &[]),
+    step_reporting(
+      1,
+      AgreementOutcome::AwaitingAgreement,
+      0.0,
+      &[],
+      OutcomeEvidence::kept_worded(1, None),
+    ),
+    step_reporting(
+      2,
+      AgreementOutcome::Stationary,
+      0.0,
+      &[],
+      OutcomeEvidence::kept_worded(2, Some(HERMETIC_AGREEMENT_WIDTH)),
+    ),
   ];
-  let why = check_outcomes_match_observed_progress(&steps)
+  let why = check_outcomes_match_independent_evidence(&steps, HERMETIC_AGREEMENT_WIDTH)
     .expect_err("a run with no progress at all must red");
   assert!(why.contains("no stride reported `progressed`"), "{why}");
 }
@@ -690,10 +1463,41 @@ fn a_run_that_never_progresses_is_not_outcome_evidence() {
 fn a_push_with_more_than_one_ingest_reds_rather_than_guessing() {
   let mut steps = honest_run();
   steps[2].outcomes = vec![AgreementOutcome::Progressed, AgreementOutcome::Stationary];
-  let why =
-    check_outcomes_match_observed_progress(&steps).expect_err("a multi-ingest push must red");
+  let why = check_outcomes_match_independent_evidence(&steps, HERMETIC_AGREEMENT_WIDTH)
+    .expect_err("a multi-ingest push must red");
   assert!(why.contains("reported 2 outcome(s)"), "{why}");
   assert!(why.contains("progressed,stationary"), "{why}");
+}
+
+/// The RECORDED sequence is the belt, so it must be able to red: a stride whose
+/// route changed while its label stayed self-consistent passes the portable
+/// relation and is caught only here.
+#[test]
+fn the_recorded_outcome_sequence_notices_a_changed_route() {
+  // The shipping shape, and a copy in which stride 7's stall became a moving
+  // round. Both are internally honest — the relation would pass either.
+  let mut moved_stride_7 = RECORDED_OUTCOMES.to_vec();
+  assert_eq!(moved_stride_7[6], AgreementOutcome::Stationary);
+  moved_stride_7[6] = AgreementOutcome::Progressed;
+
+  assert_eq!(RECORDED_OUTCOMES.to_vec(), RECORDED_OUTCOMES);
+  assert_ne!(moved_stride_7, RECORDED_OUTCOMES);
+  assert_eq!(
+    moved_stride_7
+      .iter()
+      .zip(RECORDED_OUTCOMES)
+      .position(|(seen, recorded)| seen != recorded),
+    Some(6),
+    "and the divergence the failure message names is stride 7",
+  );
+
+  // The recorded list is the trace's own payload, so a log and this constant
+  // cannot drift apart silently.
+  assert_eq!(
+    joined_labels(RECORDED_OUTCOMES),
+    "no_word_timings,awaiting_agreement,progressed,progressed,progressed,\
+     progressed,stationary,progressed,stationary,progressed,progressed",
+  );
 }
 
 const BATCH: &str = "and so my fellow americans ask not what your country can do for you";
@@ -939,11 +1743,11 @@ fn an_unrecorded_phrase_gate_reports_and_cannot_red() {
   assert!(line.contains("no characterization host recorded"), "{line}");
 }
 
-/// The phrase is the ONLY thing behind the host gate: the portable properties
-/// are asserted bare, so no verdict can silence them. Checked against this
-/// file's real source, the way siglip's `band_provenance` checks its own.
+/// Only MEASUREMENTS ride the host gate: the portable properties are asserted
+/// bare, so no verdict can silence them. Checked against this file's real
+/// source, the way siglip's `band_provenance` checks its own.
 #[test]
-fn only_the_phrase_is_host_scoped() {
+fn only_measurements_are_host_scoped() {
   let source = std::fs::read_to_string(concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/whisper/streaming.rs"
@@ -960,25 +1764,42 @@ fn only_the_phrase_is_host_scoped() {
     .expect("the falsifier section still follows it")
     .0;
 
-  // Exactly one measurement rides the gate, and it is the phrase. A second
-  // `gate.check_` would mean a portable property had been moved behind a
-  // verdict that can switch it off.
+  // Exactly TWO measurements ride the gate, and both are named here: the
+  // canonical phrase and the recorded outcome sequence. A third `gate.check_`
+  // would mean a portable property had been moved behind a verdict that can
+  // switch it off — which is the failure this scan exists to catch, and the
+  // reason it counts rather than merely looking for the two it knows about.
   let gated: Vec<&str> = body
     .lines()
     .filter(|line| line.contains("gate.check_"))
     .collect();
   assert_eq!(
     gated.len(),
-    1,
-    "exactly one measurement may ride the host gate, and it must be the phrase: {gated:?}"
+    2,
+    "exactly two measurements may ride the host gate — the canonical phrase and \
+     the recorded outcome sequence: {gated:?}"
   );
-  assert!(gated[0].contains("check_holds"), "{:?}", gated[0]);
+  for line in &gated {
+    assert!(line.contains("check_holds"), "{line:?}");
+  }
+  // Named, so that swapping one of them for a portable property under the same
+  // call shape does not slip past the count above.
+  for measurement in [
+    "\"per-stride agreement outcome sequence\",",
+    "\"confirmed stream reaches the clip's canonical phrase\",",
+  ] {
+    assert!(
+      body.contains(measurement),
+      "the host-gated measurement `{measurement}` is gone; the count above \
+       cannot tell a replacement from the original"
+    );
+  }
 
   // Both portable properties are called bare, so no verdict can silence them.
   for portable in [
     "check_monotone_confirmation(&steps)",
     "check_confirmed_is_prefix_of_batch(&confirmed, &batch, agreement_count_needed)",
-    "check_outcomes_match_observed_progress(&steps)",
+    "check_outcomes_match_independent_evidence(&steps, agreement_count_needed)",
   ] {
     assert!(
       body.contains(portable),
