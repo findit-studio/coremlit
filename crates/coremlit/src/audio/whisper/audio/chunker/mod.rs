@@ -47,6 +47,27 @@ impl AudioChunk {
   }
 }
 
+/// The sample a clip timestamp actually lands on — the ONE rounding
+/// [`prepare_seek_clips`] applies to a `clip_timestamps` entry, named so that a
+/// caller which COMPUTES a clip time can ask where it will land instead of
+/// assuming its own seconds-domain arithmetic survives the trip.
+///
+/// It exists for `crate::audio::whisper::stream::agreement`'s watermark, which
+/// is read in BOTH coordinate systems: `LocalAgreement::watermark_filtered`
+/// compares it against word starts in seconds, and
+/// `LocalAgreement::decoding_options_for_next` hands the same value to
+/// `clip_timestamps`, where this rounding decides which audio the next stride
+/// re-reads. A seconds-domain step too small to change this value moves the
+/// filter and not the clip (#94, codex round 7 on PR #95, finding 2), so the
+/// engine asks this function rather than inventing a second rounding of its own.
+///
+/// `as usize` saturates: a negative or non-finite input lands on `0`, which
+/// [`prepare_seek_clips`] rejects before ever calling this.
+#[inline]
+pub(crate) fn clip_seek_sample(seconds: f32) -> usize {
+  (seconds * SAMPLE_RATE as f32).round() as usize
+}
+
 /// Turns `clip_timestamps` seconds into `(start, end)` sample ranges.
 ///
 /// Ports `DecodingOptions.prepareSeekClips`
@@ -74,7 +95,7 @@ pub fn prepare_seek_clips(
   }
   let mut seek_points: Vec<usize> = clip_timestamps
     .iter()
-    .map(|seconds| (seconds * SAMPLE_RATE as f32).round() as usize)
+    .map(|&seconds| clip_seek_sample(seconds))
     .collect();
   if seek_points.is_empty() {
     seek_points.push(0);
