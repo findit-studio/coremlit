@@ -78,16 +78,24 @@
 //!   high-water settled start, rather than against the last word.
 //!
 //!   Two things carry it, and they are separable. `split_at_a_strict_boundary`
-//!   puts an INTERIOR split only on a boundary whose start is strictly past
-//!   every settled start behind it — searching forward from the requested split
-//!   first, then BACKING OFF when the forward search would run off the end of
-//!   `common`, because widening past a tied run that reaches that end would
-//!   empty the holdback and anchor the watermark on the run's own last word —
-//!   and widening off the END only where the prefill budget floor sits at or
-//!   above every legal boundary, which is where the back-off has nowhere legal
-//!   to land. And where the holdback is empty, `LocalAgreement::ingest` anchors
-//!   at `empty_holdback_anchor`: the last confirmed word's own far edge, raised
-//!   to `past_the_settled_instant` where that word has no duration — since
+//!   puts an INTERIOR split only where a SPARING WATERMARK EXISTS for it: the
+//!   maximum start it would settle strictly below the minimum start it would
+//!   leave unconfirmed. Both sides are folds and each was completed by its own
+//!   round — the settled side a running maximum (round 7's finding 1), the
+//!   unsettled side a suffix minimum over `hypothesis_words[split..]` (round 8's
+//!   HIGH finding, which found the second half still being read as
+//!   `common[split]` alone, the one comparand the first half had just made
+//!   unsound). It searches forward from the requested split first, then BACKS
+//!   OFF when the forward search finds nothing legal — because widening past a
+//!   tied run that reaches the end of `common` would empty the holdback and
+//!   anchor the watermark on the run's own last word, and widening past a
+//!   backwards word would settle a start no watermark can then clear without
+//!   filtering that word out — and widens off the END only where the prefill
+//!   budget floor sits at or above every legal boundary, which is where the
+//!   back-off has nowhere legal to land. And where the holdback is empty,
+//!   `LocalAgreement::ingest` anchors at `empty_holdback_anchor`: the last
+//!   confirmed word's own far edge, raised to `past_the_settled_instant` where
+//!   that word has no duration — since
 //!   `end == start` for a zero-duration word.
 //!
 //!   `past_the_settled_instant` is a SAMPLE-domain step, and it used to be
@@ -115,7 +123,10 @@
 //!   (`a_word_starting_strictly_later_lowers_the_watermark_instead_of_being_stranded`).
 //!   On an interior split with non-decreasing starts it is the identity; it
 //!   bites where the starts run backwards. What no watermark can spare is a word
-//!   at or below the settled high-water start itself, and that is residual 1.
+//!   at or below the settled high-water start of the split that was TAKEN — and
+//!   since round 8 an interior split is taken only where nothing has to be
+//!   skipped, so the fold meets an unsparable word only on the forced arm. That
+//!   is residual 1, and it is now exactly that narrow.
 //!
 //!   **Word starts run backwards, and the pipeline is where they come from.**
 //!   `segment::update_segments_with_word_timings` prefers a SEGMENT's own start
@@ -126,10 +137,15 @@
 //!   `a_backward_start_from_the_segment_pipeline_does_not_strand_a_later_word`
 //!   (`[0.50, 0.80, 0.99, 0.81]`). `find_alignment`'s
 //!   `w[i].end() <= w[i + 1].start() + 1e-4` is a guarantee about its OWN
-//!   output, and the post-processing that follows it is not bound by it. Two
-//!   claims used to rest on the premise and neither does now: the postcondition
-//!   above reads the high-water start, and the second postcondition's exception
-//!   is stated at `<=` that start rather than at the tie.
+//!   output, and the post-processing that follows it is not bound by it. THREE
+//!   claims used to rest on the premise and none does now: the postcondition
+//!   above reads the high-water start; the second postcondition's exception is
+//!   stated at `<=` that start rather than at the tie; and the split's legality
+//!   predicate reads the MINIMUM start it leaves unconfirmed rather than the
+//!   first one. The third took a round longer than the other two (codex round 8
+//!   on PR #95), and the shape is worth naming: removing a premise from one side
+//!   of a comparison and leaving it on the other reads as complete from either
+//!   side alone.
 //!
 //!   The first shape of this rule widened unconditionally and left the empty
 //!   holdback anchored at `end`, which put the ORIGINAL duplicate-confirmation
@@ -442,35 +458,55 @@
 //! W's postcondition IS total (see its entry above); the module claims no
 //! totality beyond it.
 //!
-//! 1. **A word at or below the settled high-water start is DROPPED.** The
+//! 1. **A word the budget floor leaves no way to spare is DROPPED.** The
 //!    watermark is strictly past every confirmed start (postcondition 1), so a
 //!    word this round did not confirm that starts at or below the highest
 //!    confirmed one fails the offered filter and can never reach a hypothesis
-//!    again. It cannot be helped: to a timestamp filter that word and a re-offer
-//!    of the settled one are the same value, which is the issue's impossibility
-//!    result, and the alternative is the unbounded re-confirmation #94 is about.
-//!    A truncation is what the portable prefix property tolerates; a rewrite is
-//!    not.
+//!    again. It cannot be helped THERE: to a timestamp filter that word and a
+//!    re-offer of the settled one are the same value, which is the issue's
+//!    impossibility result, and the alternative is the unbounded re-confirmation
+//!    #94 is about. A truncation is what the portable prefix property tolerates;
+//!    a rewrite is not.
+//!
+//!    It is stated against the FLOOR rather than against the settled start
+//!    alone, because the settled start is ENDOGENOUS to the split (codex round 8
+//!    on PR #95). An earlier form of this entry read "a word at or below the
+//!    settled high-water start is dropped", full stop, and that claim was too
+//!    broad: a split one word earlier settles less, so a word unsparable under
+//!    the requested split can be spared under an earlier one, and
+//!    `split_at_a_strict_boundary` now takes the earlier one. What remains
+//!    unsparable is only what NO split at or above the budget floor avoids —
+//!    the floor being the line the back-off may not cross, because below it
+//!    `prefill_tokens` silently truncates.
+//!    `the_split_never_cuts_at_a_tied_start` asks an independent brute-force
+//!    oracle for exactly that and asserts the AVOIDABLE count at zero.
 //!
 //!    TWO shapes reach it, and they are the two halves of the second
-//!    postcondition's exception. AT the settled start is the TIE, which needs an
-//!    empty holdback: the prefill budget must run the split off the end of
-//!    `common` — Rule W's own widening backs off wherever a legal boundary
-//!    remains above the floor — and two things do that, a single word at the end
-//!    of `common` whose own tokens exceed [`MAX_HOLDBACK_PREFILL_TOKENS`], and a
-//!    TIED RUN whose tokens exceed it in aggregate, which `add_word_timestamps`
-//!    produces from an all-zero alignment matrix. It does NOT additionally take
-//!    a non-default [`LocalAgreement::agreement_count_needed`]: an earlier form
-//!    of this entry listed one, and the default count reaches the same state
+//!    postcondition's exception. BOTH need an empty holdback: the prefill budget
+//!    must run the split off the end of `common` — Rule W's own widening backs
+//!    off wherever a legal boundary remains above the floor — and two things do
+//!    that, a single word at the end of `common` whose own tokens exceed
+//!    [`MAX_HOLDBACK_PREFILL_TOKENS`], and a TIED RUN whose tokens exceed it in
+//!    aggregate, which `add_word_timestamps` produces from an all-zero alignment
+//!    matrix. AT the settled start is the TIE. It does NOT additionally take a
+//!    non-default [`LocalAgreement::agreement_count_needed`]: an earlier form of
+//!    this entry listed one, and the default count reaches the same state
 //!    whenever that one word is the last of the agreed prefix (measured).
 //!
-//!    BELOW the settled start is a BACKWARDS start, and it needs no empty
-//!    holdback at all: `segment::update_segments_with_word_timings` can put a
-//!    later word behind an earlier one (see "Word starts run backwards" above),
-//!    and an INTERIOR split that confirms past it strands it. This half was
+//!    BELOW the settled start is a BACKWARDS start:
+//!    `segment::update_segments_with_word_timings` can put a later word behind
+//!    an earlier one (see "Word starts run backwards" above). This half was
 //!    invisible while the postcondition assumed non-decreasing starts (codex
-//!    round 7 on PR #95, finding 1); `the_split_never_cuts_at_a_tied_start`
-//!    counts it as `backward_strands` and reached it 4 times in 512 trials.
+//!    round 7 on PR #95, finding 1), and between that round and round 8 it
+//!    reached an INTERIOR split as well — which was a DEFECT rather than a
+//!    residual, a split one word earlier having lost nothing. Round 8 closed
+//!    that route in the legality predicate, so this half now takes the forced
+//!    arm too. `the_split_never_cuts_at_a_tied_start` counts it as
+//!    `backward_strands` and reaches it 2 times in 512 trials, down from 4 on
+//!    the identical draw before the predicate was completed — the 2 that went
+//!    are the 2 its avoidability oracle flagged, the published transcript's
+//!    erasures went from 13 to 11 with them, and the forced arm did not move at
+//!    all (140 fallback rounds and 410 empty holdbacks either way).
 //!
 //!    It covers a word the hypothesis had ALREADY produced past `common` as well
 //!    as one a later decode invents. Between `6987bec` and `b3ec5c6` the first
@@ -1026,8 +1062,12 @@ impl LocalAgreement {
       if common.len() >= self.agreement_count_needed {
         // :383-394 — advance the watermark.
         let requested = common.len() - self.agreement_count_needed;
-        let split =
-          split_at_a_strict_boundary(common, requested, highest_start(&self.confirmed_words));
+        let split = split_at_a_strict_boundary(
+          common,
+          &self.hypothesis_words[common.len()..],
+          requested,
+          highest_start(&self.confirmed_words),
+        );
         // `common` REPLACES the still-open record: it is the span two consecutive
         // hypotheses have just re-agreed over it, and `last_agreed_words` is the
         // one this hypothesis has superseded.
@@ -1039,7 +1079,10 @@ impl LocalAgreement {
         // The ANCHOR is where the advance would like to put the clip boundary.
         // With a holdback it is the first held-back word's start, which
         // `split_at_a_strict_boundary` has already placed strictly past every
-        // settled start. With NOTHING held back -- the fallback, reached where
+        // settled start -- and, since codex round 8 on PR #95, so is every OTHER
+        // start this round leaves unconfirmed, that function's legality
+        // predicate now ranging over the same set the fold below does. With
+        // NOTHING held back -- the fallback, reached where
         // neither the forward search nor the back-off found a legal boundary at
         // or above the prefill budget floor, and where the floor itself reaches
         // `common.len()` -- there is no held word to measure against and
@@ -1056,6 +1099,12 @@ impl LocalAgreement {
         // which `update_segments_with_word_timings` can produce (codex round 7
         // on PR #95, finding 1): there the adjacent boundary is not the latest
         // settled start, and an unconfirmed word can sit below the anchor.
+        //
+        // On the INTERIOR arm the fold never SKIPS a word now: the split was
+        // taken only where every unconfirmed start clears the settled high, so
+        // the filter passes all of them and the minimum is over the whole set.
+        // A skip means a word was lost, and reaching one is the forced arm's
+        // business (codex round 8 on PR #95).
         //
         // `settled_high` is read AFTER the append, so it covers what this very
         // round confirmed. Postcondition 1 follows: the anchor is strictly past
@@ -1241,26 +1290,69 @@ impl LocalAgreement {
 /// offered list, because a re-offered settled word and the stream's own second
 /// occurrence of the same text are byte-identical there. Refuse to CREATE it.
 ///
-/// A split at `at` is legal exactly when `common[at]` starts STRICTLY after
-/// every start a split there would settle -- everything already confirmed, plus
-/// `common[..at]`. That is a running MAXIMUM, not the adjacent predecessor:
-/// word starts inside one hypothesis are not non-decreasing (see the
-/// postconditions below), so the word immediately in front of the boundary is
-/// not necessarily the latest one behind it.
+/// A split at `at` is legal exactly when the MAXIMUM start among everything it
+/// SETTLES is strictly below the MINIMUM start among everything it leaves
+/// UNCONFIRMED. Settled is everything already confirmed plus `common[..at]`;
+/// unconfirmed is `hypothesis_words[at..]` -- `common[at..]` plus whatever the
+/// driving hypothesis produced beyond the agreed prefix.
+///
+/// Equivalently, and this is the reading that makes it CHECKABLE: **a split is
+/// legal iff a sparing watermark exists for it**, some instant strictly greater
+/// than every settled start and at or below every unconfirmed one.
+/// `sparing_watermark` folds over that same `hypothesis_words[at..]`, so where
+/// this predicate holds the fold spares the WHOLE of it and the second
+/// postcondition below is free; where it fails, the fold must skip a word and
+/// something is stranded.
+///
+/// BOTH SIDES ARE FOLDS, and each was completed by a different round.
+///
+/// - The SETTLED side is a running MAXIMUM, not the adjacent predecessor: word
+///   starts inside one hypothesis are not non-decreasing (see the
+///   postconditions below), so the word immediately in front of the boundary is
+///   not necessarily the latest one behind it (codex round 7 on PR #95,
+///   finding 1).
+/// - The UNSETTLED side is a suffix MINIMUM, not `common[at]` alone. Reading the
+///   FIRST unconfirmed word is right only where unconfirmed starts are
+///   non-decreasing -- the very premise the settled side had just been fixed to
+///   stop assuming, so the predicate was one statement read in halves (codex
+///   round 8 on PR #95, the HIGH finding;
+///   `a_backward_start_past_the_requested_split_backs_off_instead_of_stranding_it`).
+///   What the half-predicate did: on a pipeline-emittable `[0.00, 0.70, 1.50,
+///   2.20, 2.30, 2.19]` it accepted the requested split 4, confirmed up to
+///   2.20, and no watermark could then clear 2.20 while sparing 2.19 -- while
+///   split 3 loses nothing at all. The highest confirmed start is ENDOGENOUS to
+///   the split, so it cannot be treated as a fixed bound the way the old
+///   exception below treated it.
+///
+/// The unconfirmed set includes the words BEYOND `common` because
+/// `sparing_watermark`'s does, and that fold is the authority: a predicate over
+/// a smaller set would call a split legal that the fold cannot then spare. A
+/// beyond-`common` word is unconfirmed in the sense that matters -- this round's
+/// own `LocalAgreement::finalize` publishes it through
+/// `find_longest_different_suffix`, so a watermark above it RETRACTS transcript
+/// (`a_backward_start_beyond_common_backs_the_split_off_too`).
 ///
 /// At `at == 0` nothing of `common` is confirmed, so the maximum is the engine's
 /// own `confirmed_start_high` -- the latest start the watermark would sit
-/// beside. That arm is provably never the blocking one: the postcondition below
-/// gives `high < last_agreed_seconds`, and every word of `common` cleared
-/// `start >= last_agreed_seconds` to be offered at all, so
-/// `high < common[0].start()` already. It is written as a CHECK rather than
-/// assumed so this function is correct on its own terms rather than on its
-/// caller's induction — but the proof is why it carries NO falsifier: replacing
-/// `confirmed_start_high` with `None` reds nothing in this crate, and no
-/// sequence through `LocalAgreement::ingest` can construct the state it guards,
-/// because that state IS the postcondition's negation. It was testable while the
-/// postcondition was conditional (through the empty-holdback residual, which the
-/// anchor has since closed) and its test went with that state.
+/// beside. That arm is provably never the blocking one, and the proof now
+/// carries the completed predicate as well: the postcondition below gives
+/// `high < last_agreed_seconds`, and every word of `hypothesis_words` cleared
+/// `start >= last_agreed_seconds` to be offered at all, so `high` is strictly
+/// below the minimum over the WHOLE offered list, not merely below
+/// `common[0].start()`. **Split 0 is therefore always legal**, which is what
+/// bounds the back-off: it can only run out of legal boundaries when the budget
+/// floor is above 0, and the floor rises only as `common` outgrows
+/// `MAX_HOLDBACK_PREFILL_TOKENS`. That is the whole of this rule's liveness
+/// (`a_permanently_backwards_tail_confirms_at_the_budget_rather_than_holding_forever`).
+///
+/// It is written as a CHECK rather than assumed so this function is correct on
+/// its own terms rather than on its caller's induction — but the proof is why it
+/// carries NO falsifier: replacing `confirmed_start_high` with `None` reds
+/// nothing in this crate, and no sequence through `LocalAgreement::ingest` can
+/// construct the state it guards, because that state IS the postcondition's
+/// negation. It was testable while the postcondition was conditional (through
+/// the empty-holdback residual, which the anchor has since closed) and its test
+/// went with that state.
 ///
 /// # Which legal boundary
 ///
@@ -1281,15 +1373,38 @@ impl LocalAgreement {
 ///    where two ingests of ONE default-count hypothesis re-confirmed its whole
 ///    tied tail on every later stride, without bound).
 ///
+///    It runs for a BACKWARDS start as well as for a tie, and that is what codex
+///    round 8 on PR #95 added: a boundary above a word the hypothesis has
+///    already put BEHIND it settles a start the watermark can then not clear
+///    without filtering that word out, so the completed predicate refuses it and
+///    the search comes back here.
+///
 ///    Backing off never fails for want of a boundary while the budget floor is
-///    `0`: `at == 0` is legal by the argument above, so a `common` that is one
-///    tied run from end to end is held WHOLE rather than confirmed, and the next
-///    stride -- which grows the hypothesis at its TAIL -- opens a boundary as
-///    soon as one word starts strictly later. This is NOT the blocking policy
-///    this issue's ledger refuted for deadlock: that one blocked on a predicate
-///    over the HEAD of the offered list, which only an advance can move, whereas
-///    this defers a split position that TAIL growth relieves, and it advances
-///    the holdback rather than refusing the round.
+///    `0`: `at == 0` is legal by the argument above -- which the completed
+///    predicate keeps, every offered word being at or past the watermark that is
+///    itself strictly past the settled high -- so a `common` that is one tied
+///    run from end to end, or one whose tail runs backwards, is held WHOLE
+///    rather than confirmed, and the next stride -- which grows the hypothesis
+///    at its TAIL -- opens a boundary as soon as one word starts strictly later.
+///    This is NOT the blocking policy this issue's ledger refuted for deadlock:
+///    that one blocked on a predicate over the HEAD of the offered list, which
+///    only an advance can move, whereas this defers a split position that TAIL
+///    growth relieves, and it advances the holdback rather than refusing the
+///    round.
+///
+///    **LIVENESS**, which the back-off owes and the budget pays. Confirming
+///    fewer words per round is not a stall while it cannot go on forever, and it
+///    cannot: `split == 0` requires `floor == 0`, `floor == 0` requires the
+///    whole of `common` to fit `MAX_HOLDBACK_PREFILL_TOKENS`, and `common` grows
+///    with the stream. The first round it no longer fits, the floor is above
+///    every legal boundary and arm 3 confirms `common` whole. So the number of
+///    consecutive zero-confirming rounds is bounded by the prefill budget, on
+///    ANY input including a word permanently behind everything else -- and
+///    nothing is lost meanwhile, the held words being exactly what
+///    `LocalAgreement::finalize` publishes. Both halves are driven in
+///    `a_permanently_backwards_tail_confirms_at_the_budget_rather_than_holding_forever`,
+///    which pins the bound at the budget rather than merely asserting that some
+///    round eventually confirms.
 /// 3. **`common.len()` -- the FALLBACK**, where neither search found a legal
 ///    boundary at or above the budget floor. The floor is never crossed, because
 ///    below it `prefill_tokens` silently truncates the prefill and the erased
@@ -1303,21 +1418,26 @@ impl LocalAgreement {
 ///    forced outright, no split leaving one the prefill could carry. Or the
 ///    floor lands strictly INSIDE a tied run whose own tokens exceed the budget,
 ///    where every boundary the forward search and the back-off can reach ties
-///    and split `0` -- the boundary a tied run always leaves legal -- is below
-///    the floor. `add_word_timestamps` produces the second shape from an
-///    ALL-ZERO alignment matrix (113 ordinary one-token words at one instant,
-///    measured at 130), so it is the reachable one.
+///    and split `0` -- the boundary always left legal -- is below the floor. A
+///    backwards start reaches the same place the same way once the floor is
+///    above it, which is the second half of residual 1 and the only route it
+///    has left since codex round 8. `add_word_timestamps` produces the tied-run
+///    shape from an ALL-ZERO alignment matrix (113 ordinary one-token words at
+///    one instant, measured at 130), so it is the reachable one.
 ///
 ///    **What this costs, and why it is not a DEFERRAL** (#94, measured on this
 ///    branch; see this module's doc, "Why there is no deferral"). The empty
 ///    holdback anchors strictly past the settled high-water start, so a word the
-///    newest hypothesis produced beyond `common` AT that same start is stranded:
-///    the next worded ingest filters it out of both hypotheses at once, and
-///    `LocalAgreement::finalize` cannot reach it afterwards -- after THIS
-///    round's `finalize` already published it through
-///    `find_longest_different_suffix`. That is the TIE half of this module's
-///    residual 1, and it is exactly that narrow: `sparing_watermark` lowers the
-///    anchor to spare every word at any HIGHER instant
+///    newest hypothesis produced beyond `common` at or below that start is
+///    stranded: the next worded ingest filters it out of both hypotheses at
+///    once, and `LocalAgreement::finalize` cannot reach it afterwards -- after
+///    THIS round's `finalize` already published it through
+///    `find_longest_different_suffix`. That is the WHOLE of this module's
+///    residual 1, both halves of it, and this arm is now the ONLY place it can
+///    happen: the two interior arms take a boundary only where a sparing
+///    watermark exists for it, and where one exists nothing is stranded at all
+///    (codex round 8 on PR #95). It is exactly that narrow: `sparing_watermark`
+///    lowers the anchor to spare every word at any HIGHER instant
 ///    (`a_word_starting_strictly_later_lowers_the_watermark_instead_of_being_stranded`).
 ///
 ///    Between `6987bec` and `b3ec5c6` this arm did not advance at all: it
@@ -1371,34 +1491,48 @@ impl LocalAgreement {
 /// round did not confirm that any legal watermark could still spare.
 ///
 /// **It has ONE exception, and the exception is the impossibility rather than a
-/// policy** (#94). A stranded word starts AT OR BELOW the highest confirmed
-/// start. There no value serves both claims -- the first postcondition demands a
-/// watermark strictly past that start, and every such watermark filters the
-/// strand -- so this is this module's residual 1.
+/// policy** (#94). A stranded word starts at or below the highest confirmed
+/// start AND no split at or above the budget floor avoids it. The first clause
+/// is why no value serves both claims for THAT split -- the first postcondition
+/// demands a watermark strictly past the settled high, and every such watermark
+/// filters the strand. The second clause is what makes it an impossibility
+/// rather than a choice, and it was MISSING until codex round 8 on PR #95: the
+/// settled high is ENDOGENOUS to the split, so "at or below it" is a fact about
+/// one boundary rather than about the word. A split one word earlier settles
+/// less and can spare what a later one cannot.
 ///
-/// Both halves of `<=` are reachable and they are reached differently. AT is the
-/// TIE, and it takes an empty holdback: a zero-duration word the fallback arm
-/// settles last, with something the same hypothesis produced beyond `common` at
-/// that same instant. BELOW is a BACKWARDS start, and it takes no empty holdback
-/// at all -- an INTERIOR split can confirm a word that starts later than one it
-/// leaves unconfirmed, and then no watermark can clear the first while sparing
-/// the second. The exception was written at `==` and gated on the arm until
-/// codex round 7 on PR #95, finding 1; the gate was never what bounded this.
+/// So the ARM GATE is back, in the only form that was ever true of it: a strand
+/// takes the `common.len()` FALLBACK, on both halves of the `<=`. AT the settled
+/// high is the TIE, and it takes an empty holdback: a zero-duration word the
+/// fallback arm settles last, with something the same hypothesis produced beyond
+/// `common` at that same instant. BELOW it is a BACKWARDS start. Between codex
+/// rounds 7 and 8 the BELOW half also reached an INTERIOR split, and that was
+/// the defect rather than the exception -- the interior arms now take a boundary
+/// only where a sparing watermark exists for it, and where one exists nothing is
+/// stranded. The exception was written at `==` and gated on the arm until codex
+/// round 7 on PR #95, finding 1; that gate was not what bounded this, and this
+/// one is.
 ///
-/// The exception's GATE moved twice. While the deferral existed it read "this
-/// round escaped a repeating wait"; removing the deferral made it "this round's
-/// split ran off the END of `common`" (measured over the 512-trial sweep at
-/// `4b259ef`: 38 strands where the deferral had 29, and 10 words erased from the
-/// published transcript where the deferral erased 26 -- the direction that
-/// decided it, this module's doc, "Why there is no deferral"). The ARM gate is
-/// now gone, because a backwards start strands from an interior split too.
+/// The exception's GATE has moved three times, and each move was a finding, so
+/// the history is kept rather than overwritten. While the deferral existed it
+/// read "this round escaped a repeating wait"; removing the deferral made it
+/// "this round's split ran off the END of `common`" (measured over the
+/// 512-trial sweep at `4b259ef`: 38 strands where the deferral had 29, and 10
+/// words erased from the published transcript where the deferral erased 26 --
+/// the direction that decided it, this module's doc, "Why there is no
+/// deferral"). Codex round 7's finding 1 removed the arm gate, a backwards start
+/// having reached an interior split; round 8 closed that route in the PREDICATE
+/// instead, and the gate returns with the budget floor written into it.
 /// `the_split_never_cuts_at_a_tied_start` sweeps both postconditions and both
 /// halves of the exception, counts the empty-holdback rounds, the tie strands
-/// and the backwards strands so none can pass by being unreachable -- and reads
-/// the published TRANSCRIPT across every round besides, which is where a
-/// retraction the confirmed list cannot see shows up.
+/// and the backwards strands so none can pass by being unreachable, asks an
+/// INDEPENDENT brute-force oracle whether any split at or above the floor would
+/// have lost nothing and asserts that count at ZERO -- and reads the published
+/// TRANSCRIPT across every round besides, which is where a retraction the
+/// confirmed list cannot see shows up.
 fn split_at_a_strict_boundary(
   common: &[WordTiming],
+  beyond_common: &[WordTiming],
   requested: usize,
   confirmed_start_high: Option<f32>,
 ) -> usize {
@@ -1415,24 +1549,59 @@ fn split_at_a_strict_boundary(
   // legal; `f32::max` returns the non-NaN side, so a NaN start neither poisons
   // the running maximum nor makes a boundary look legal (`high < start` is false
   // for a NaN `start`).
-  let mut running = confirmed_start_high.unwrap_or(f32::NEG_INFINITY);
+  let mut settled = confirmed_start_high.unwrap_or(f32::NEG_INFINITY);
   let mut settled_before: Vec<f32> = Vec::with_capacity(common.len() + 1);
-  settled_before.push(running);
+  settled_before.push(settled);
   for word in common {
-    running = running.max(word.start());
-    settled_before.push(running);
+    settled = settled.max(word.start());
+    settled_before.push(settled);
   }
-  let strictly_after_every_settled_start = |at: usize| settled_before[at] < common[at].start();
+  // The LOW-WATER UNSETTLED start at each candidate boundary: the minimum over
+  // every word a split at `at` leaves unconfirmed. That is `common[at..]` plus
+  // `beyond_common`, which is `hypothesis_words[at..]` -- exactly the set
+  // `sparing_watermark` folds over, so the two agree by construction rather than
+  // by coincidence.
+  //
+  // The suffix minimum is the OTHER HALF of the same statement the running
+  // maximum above is one half of, and it was missing until codex round 8 on PR
+  // #95. Reading `common[at]` alone -- the FIRST unconfirmed word -- is the
+  // right comparand only where unconfirmed starts are non-decreasing, which is
+  // the premise round 7 destroyed.
+  //
+  // One backward pass, so this stays linear. `INFINITY` is the nothing-left
+  // base, where the settled side is unconstrained; `f32::min` returns the
+  // non-NaN side, so a NaN start is skipped rather than absorbing the fold --
+  // the same treatment `sparing_watermark`'s own `*start > settled_high` gives
+  // it, NaN failing that test too. A NaN start is unsparable at EVERY split, so
+  // letting it constrain this would refuse every boundary and force the empty
+  // holdback for a word no split could have saved.
+  let mut unsettled = beyond_common
+    .iter()
+    .map(WordTiming::start)
+    .fold(f32::INFINITY, f32::min);
+  let mut unsettled_from: Vec<f32> = vec![unsettled; common.len() + 1];
+  for at in (0..common.len()).rev() {
+    unsettled = unsettled.min(common[at].start());
+    unsettled_from[at] = unsettled;
+  }
+  // A SPARING WATERMARK EXISTS FOR THIS SPLIT: some instant is strictly past
+  // every start it settles and at or below every start it does not. The second
+  // conjunct is the whole of it wherever `common[at].start()` is a number, since
+  // that word is itself in the minimum; the first is what keeps a NaN there --
+  // which `sparing_watermark` would carry through to the anchor, and from there
+  // to a watermark no word can clear -- from reading as legal.
+  let a_sparing_watermark_exists =
+    |at: usize| settled_before[at] < common[at].start() && settled_before[at] < unsettled_from[at];
   // `budgeted_split` with nothing requested IS the budget's own floor: the
   // earliest split whose holdback fits `MAX_HOLDBACK_PREFILL_TOKENS`.
   let floor = budgeted_split(common, 0);
   let widened = requested.max(floor);
   (widened..common.len())
-    .find(|&at| strictly_after_every_settled_start(at))
+    .find(|&at| a_sparing_watermark_exists(at))
     .or_else(|| {
       (floor..widened)
         .rev()
-        .find(|&at| strictly_after_every_settled_start(at))
+        .find(|&at| a_sparing_watermark_exists(at))
     })
     .unwrap_or(common.len())
 }
@@ -1678,10 +1847,19 @@ fn past_the_settled_instant(settled: f32) -> f32 {
 ///
 /// SKIPPING rather than abandoning on an unsparable word is deliberate and
 /// predates this generalization: a word at or below `settled_high` cannot be
-/// spared by ANY watermark the first postcondition permits, but the words
-/// BEHIND it can, and an anchor that gave up on all of them because one was
-/// unsparable stranded them as collateral (measured on the sweep: a strand at
-/// 2.5 s lost to a tie at 2.0 s).
+/// spared by ANY watermark the first postcondition permits FOR THIS SPLIT, but
+/// the words BEHIND it can, and an anchor that gave up on all of them because
+/// one was unsparable stranded them as collateral (measured on the sweep: a
+/// strand at 2.5 s lost to a tie at 2.0 s).
+///
+/// The skip is not a licence to CREATE the state it survives, and reading it as
+/// one is what codex round 8 on PR #95 found. `settled_high` is whatever the
+/// split settled, so a skip here means the split lost a word --
+/// `split_at_a_strict_boundary` therefore refuses any interior boundary this
+/// fold would have to skip on, over exactly this `unconfirmed` set, and reaches
+/// a skip only on the fallback arm where the budget floor left it no choice.
+/// The two range over the SAME set for that reason: a predicate over a smaller
+/// one would call a split legal that this cannot then spare.
 fn sparing_watermark(anchor: f32, settled_high: f32, unconfirmed: &[WordTiming]) -> f32 {
   unconfirmed
     .iter()
