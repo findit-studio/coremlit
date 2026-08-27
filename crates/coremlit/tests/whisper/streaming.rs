@@ -60,7 +60,9 @@
 //! exactly `agreement_count_needed` words, confirms nothing, and re-establishes
 //! the prefix that caused the stall. The `[stride ...]` lines this test prints
 //! show it directly: a run of strides pinned at a 1.4 s watermark with three
-//! confirmed words, then one stride that escapes.
+//! confirmed words, then one stride that escapes. The `[outcome ...]` lines
+//! beside them name the same thing in one word — the pinned strides that move
+//! nothing report `stationary`.
 //!
 //! That is a BOOLEAN control-flow gate riding a sub-nat logit margin, not a
 //! cascade of argmax flips, and it is sensitive to PLACEMENT on a single
@@ -93,7 +95,7 @@ use std::panic::{AssertUnwindSafe, catch_unwind};
 use coremlit::audio::whisper::{
   options::{DecodingOptions, Options},
   result::WordTiming,
-  stream::agreement::{LocalAgreement, STRIDE_SAMPLES},
+  stream::agreement::{AgreementOutcome, LocalAgreement, STRIDE_SAMPLES},
   text::normalized,
   transcribe::WhisperKit,
 };
@@ -151,6 +153,14 @@ fn recharacterize_command() -> String {
 // ---------------------------------------------------------------------
 
 /// One completed push's view of the confirmation state.
+///
+/// The TRANSCRIPT fields and the OUTCOME field are deliberately separate
+/// concerns, and the test prints them on separate lines for the same reason: the
+/// `[stride ...]` trace exists to prove that the watermark work changes no
+/// transcript, and mixing the outcome label into it made an honest-signal change
+/// disturb a guard that is not about signals. See
+/// [`check_outcomes_match_observed_progress`] for what the labels are asserted
+/// against instead.
 #[derive(Debug, Clone)]
 struct Confirmation {
   /// 1-based stride index; also the buffered seconds, at a 1 s stride.
@@ -162,16 +172,33 @@ struct Confirmation {
   /// [`LocalAgreement::last_agreed_words_slice`], normalized — agreed but held
   /// back, still revisable by a later hypothesis.
   held_back: Vec<String>,
+  /// Every [`AgreementOutcome`] this push reported, in order. A push runs one
+  /// ingest per complete stride that newly accumulated, so at a 1 s stride and
+  /// 1 s pushes this is one element — but it is a list because `push_samples`
+  /// returns one.
+  outcomes: Vec<AgreementOutcome>,
 }
 
 impl Confirmation {
-  fn observe(stride: usize, agreement: &LocalAgreement) -> Self {
+  fn observe(stride: usize, agreement: &LocalAgreement, outcomes: Vec<AgreementOutcome>) -> Self {
     Self {
       stride,
       last_agreed_seconds: agreement.last_agreed_seconds(),
       confirmed: normalized_words(agreement.confirmed_words_slice()),
       held_back: normalized_words(agreement.last_agreed_words_slice()),
+      outcomes,
     }
+  }
+
+  /// The outcome labels this push reported, comma-joined — the `[outcome ...]`
+  /// trace's payload.
+  fn outcome_labels(&self) -> String {
+    self
+      .outcomes
+      .iter()
+      .map(ToString::to_string)
+      .collect::<Vec<_>>()
+      .join(",")
   }
 }
 
@@ -275,6 +302,91 @@ fn check_confirmed_is_prefix_of_batch(
      cannot cause it. Do not add a\ntolerance: there is no number here to relax.",
   );
   Err(report)
+}
+
+/// PORTABLE: every reported [`AgreementOutcome`] agrees with what the engine's
+/// own state did across that push.
+///
+/// The outcome sequence is real behaviour and must stay asserted, but the
+/// LABELS are not portable — which strides agree, and which of the agreeing ones
+/// move anything, is decided by the same host-scoped timestamp-mass gate this
+/// file's docs describe. What IS portable is the relation between the label and
+/// the state, because it compares this run against itself: an agreeing round
+/// reports `progressed` exactly when [`LocalAgreement::last_agreed_seconds`] or
+/// the confirmed prefix moved, and `stationary` exactly when neither did. A
+/// round that did not agree runs no advance, so it must move neither.
+///
+/// The watermark is compared by BITS. Rounding it to the two decimals the trace
+/// prints would report a 0.02 s step as a stall, which is precisely the reading
+/// the outcome now exists to replace.
+///
+/// # Errors
+/// The first stride whose label contradicts its own state transition, naming
+/// both; or a run in which no stride ever reported progress, which would leave
+/// the relation asserted only on its trivial side.
+fn check_outcomes_match_observed_progress(steps: &[Confirmation]) -> Result<(), String> {
+  let mut progressed = 0usize;
+  for (index, after) in steps.iter().enumerate() {
+    // The first push has no predecessor; the engine starts at watermark 0.0 with
+    // nothing confirmed, which is what a synthetic zeroth snapshot would say.
+    let (was_watermark, was_confirmed) =
+      index.checked_sub(1).map_or((0.0f32, 0usize), |previous| {
+        (
+          steps[previous].last_agreed_seconds,
+          steps[previous].confirmed.len(),
+        )
+      });
+    let moved = after.last_agreed_seconds.to_bits() != was_watermark.to_bits()
+      || after.confirmed.len() != was_confirmed;
+    // One push, one ingest at this stride and cadence — so the push's labels
+    // describe exactly the transition measured above. A push that ran several
+    // ingests would need per-ingest snapshots to say anything this sharp.
+    let [outcome] = after.outcomes.as_slice() else {
+      return Err(format!(
+        "stride {} reported {} outcome(s), and this check reads the state ONCE \
+         per push: {:?}.\nAt a 1 s stride and 1 s pushes exactly one ingest \
+         runs per push. If the cadence changed, snapshot the engine per ingest \
+         rather than weakening this.",
+        after.stride,
+        after.outcomes.len(),
+        after.outcome_labels(),
+      ));
+    };
+    progressed += usize::from(outcome.is_progressed());
+    let honest = if outcome.agreed() {
+      outcome.is_progressed() == moved
+    } else {
+      !moved
+    };
+    if !honest {
+      return Err(format!(
+        "stride {} reported `{outcome}` while the watermark went {was_watermark} s \
+         -> {} s ({:#x} -> {:#x}) and the confirmed prefix {was_confirmed} -> {} \
+         words.\n\
+         An agreeing round must say `progressed` exactly when one of those two \
+         moved and `stationary` exactly when neither did; a round that did not \
+         agree ran no advance and must move neither.\n\
+         This compares the run against ITSELF on this machine, so host fp16 \
+         drift moves both sides together and cannot cause it.",
+        after.stride,
+        after.last_agreed_seconds,
+        was_watermark.to_bits(),
+        after.last_agreed_seconds.to_bits(),
+        after.confirmed.len(),
+      ));
+    }
+  }
+
+  if progressed == 0 {
+    return Err(format!(
+      "no stride reported `progressed` across all {} stride(s), so the relation \
+       above was only ever read on its did-not-move side and asserts nothing \
+       about the moving one.\n\
+       A run that never progressed is a stall to diagnose, not evidence.",
+      steps.len(),
+    ));
+  }
+  Ok(())
 }
 
 /// PORTABLE: confirmation only ever moves forward across the pushes.
@@ -391,22 +503,25 @@ fn jfk_simulated_stream_confirms_the_transcript() {
   let mut streamer = kit.local_agreement_transcriber(DecodingOptions::new());
   // 1 s pushes — 11 strides, each re-transcribing the grown prefix.
   let mut steps = Vec::new();
+  // TWO TRACES, on separate lines and deliberately so. `[batch]`/`[stride
+  // ...]`/`[confirmed]` carry the TRANSCRIPT and the confirmation state, and
+  // their extract (`grep -E '^\[(batch|stride|confirmed)'`) is the digest this
+  // watermark work is measured against: it must not move. `[outcome ...]`
+  // carries the labels, which this work DOES move, and digests separately.
+  // While the two shared one line, an honest-signal fix disturbed a guard that
+  // is not about signals.
   for (index, chunk) in audio.chunks(STRIDE_SAMPLES).enumerate() {
     let outcomes = streamer.push_samples(chunk).unwrap();
-    let step = Confirmation::observe(index + 1, streamer.agreement());
+    let step = Confirmation::observe(index + 1, streamer.agreement(), outcomes);
     println!(
-      "[stride {:>2}] {:<18} watermark {:>6.2} s  confirmed {:>2}  held {:>2}  {:?}",
+      "[stride {:>2}] watermark {:>6.2} s  confirmed {:>2}  held {:>2}  {:?}",
       step.stride,
-      outcomes
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(","),
       step.last_agreed_seconds,
       step.confirmed.len(),
       step.held_back.len(),
       step.confirmed.join(" "),
     );
+    println!("[outcome {:>2}] {}", step.stride, step.outcome_labels());
     steps.push(step);
   }
   // Read before `finalize` consumes the driver: the floor the prefix check needs
@@ -422,6 +537,12 @@ fn jfk_simulated_stream_confirms_the_transcript() {
   }
   if let Err(why) = check_confirmed_is_prefix_of_batch(&confirmed, &batch, agreement_count_needed) {
     panic!("streaming confirmation is not a prefix of the batch transcript: {why}");
+  }
+  // The outcome labels, asserted against the state they claim to describe rather
+  // than against a recorded sequence — the labels themselves are host-scoped,
+  // the relation is not.
+  if let Err(why) = check_outcomes_match_observed_progress(&steps) {
+    panic!("a reported agreement outcome did not match what the engine did: {why}");
   }
 
   // ── Measured, asserted only on the host class that produced it.
@@ -446,13 +567,133 @@ fn jfk_simulated_stream_confirms_the_transcript() {
 // ---------------------------------------------------------------------
 
 /// Snapshots from normalized word lists, for the hermetic cases below.
+///
+/// No outcome: the monotonicity cases are about the state sequence alone.
+/// [`step_reporting`] is the one the outcome cases use.
 fn step(stride: usize, watermark: f32, confirmed: &[&str], held_back: &[&str]) -> Confirmation {
   Confirmation {
     stride,
     last_agreed_seconds: watermark,
     confirmed: confirmed.iter().map(|w| (*w).to_string()).collect(),
     held_back: held_back.iter().map(|w| (*w).to_string()).collect(),
+    outcomes: Vec::new(),
   }
+}
+
+/// The same snapshot carrying the label this push reported.
+fn step_reporting(
+  stride: usize,
+  outcome: AgreementOutcome,
+  watermark: f32,
+  confirmed: &[&str],
+) -> Confirmation {
+  Confirmation {
+    outcomes: vec![outcome],
+    ..step(stride, watermark, confirmed, &[])
+  }
+}
+
+/// The JFK run's own shape, as the labels a correct engine reports for it: two
+/// silent strides, then rounds that move the watermark and one that does not.
+fn honest_run() -> Vec<Confirmation> {
+  vec![
+    step_reporting(1, AgreementOutcome::NoWordTimings, 0.0, &[]),
+    step_reporting(2, AgreementOutcome::AwaitingAgreement, 0.0, &[]),
+    step_reporting(3, AgreementOutcome::Progressed, 1.36, &["and", "so", "my"]),
+    step_reporting(4, AgreementOutcome::Progressed, 1.38, &["and", "so", "my"]),
+    step_reporting(5, AgreementOutcome::Stationary, 1.38, &["and", "so", "my"]),
+  ]
+}
+
+/// The honest shape passes, and it is the JFK stall's own: a `stationary` round
+/// with the watermark bit-identical to the round before it.
+#[test]
+fn an_outcome_sequence_that_matches_the_state_is_accepted() {
+  assert_eq!(
+    check_outcomes_match_observed_progress(&honest_run()),
+    Ok(())
+  );
+}
+
+/// THE FALSIFIER the honest-signal fix exists for: a round that moved NOTHING
+/// and claimed progress. This is what every stalled stride reported before the
+/// two agreeing cases were told apart.
+#[test]
+fn a_progressed_label_on_a_stalled_stride_reds() {
+  let mut steps = honest_run();
+  steps[4].outcomes = vec![AgreementOutcome::Progressed];
+  let why = check_outcomes_match_observed_progress(&steps)
+    .expect_err("a stalled stride claiming progress must red");
+  assert!(why.contains("stride 5"), "{why}");
+  assert!(why.contains("`progressed`"), "{why}");
+  assert!(why.contains("1.38"), "{why}");
+}
+
+/// And the other direction: a round that DID move and claimed to be stationary.
+/// A `split != 0` progress test produces exactly this on a zero-split round
+/// whose timings drifted.
+#[test]
+fn a_stationary_label_on_a_moving_stride_reds() {
+  let mut steps = honest_run();
+  steps[3].outcomes = vec![AgreementOutcome::Stationary];
+  let why = check_outcomes_match_observed_progress(&steps)
+    .expect_err("a moving stride claiming to be stationary must red");
+  assert!(why.contains("stride 4"), "{why}");
+  assert!(why.contains("`stationary`"), "{why}");
+}
+
+/// A round that did not agree ran no advance, so it may not have moved either.
+#[test]
+fn a_non_agreeing_label_on_a_moving_stride_reds() {
+  let mut steps = honest_run();
+  steps[3].outcomes = vec![AgreementOutcome::AwaitingAgreement];
+  let why = check_outcomes_match_observed_progress(&steps)
+    .expect_err("a non-agreeing stride that moved the watermark must red");
+  assert!(why.contains("stride 4"), "{why}");
+  assert!(why.contains("did not agree"), "{why}");
+}
+
+/// Rounding is what the bit comparison is there to refuse: 1.38 and a watermark
+/// one ULP away print identically at two decimals, and a `stationary` claim over
+/// that step is still false.
+#[test]
+fn a_sub_printed_precision_step_is_still_a_move() {
+  let mut steps = honest_run();
+  steps[4].last_agreed_seconds = f32::from_bits(steps[3].last_agreed_seconds.to_bits() + 1);
+  assert_eq!(
+    format!("{:.2}", steps[4].last_agreed_seconds),
+    format!("{:.2}", steps[3].last_agreed_seconds),
+    "non-vacuous: the two print the same at the trace's own precision",
+  );
+  let why = check_outcomes_match_observed_progress(&steps)
+    .expect_err("a one-ULP step is a move, and calling it stationary must red");
+  assert!(why.contains("stride 5"), "{why}");
+}
+
+/// A run in which nothing ever progressed satisfies the relation on its trivial
+/// side only, so the predicate must refuse it rather than report a green.
+#[test]
+fn a_run_that_never_progresses_is_not_outcome_evidence() {
+  let steps = [
+    step_reporting(1, AgreementOutcome::AwaitingAgreement, 0.0, &[]),
+    step_reporting(2, AgreementOutcome::Stationary, 0.0, &[]),
+  ];
+  let why = check_outcomes_match_observed_progress(&steps)
+    .expect_err("a run with no progress at all must red");
+  assert!(why.contains("no stride reported `progressed`"), "{why}");
+}
+
+/// The check reads the engine's state once per PUSH, so it is only sound while a
+/// push runs exactly one ingest. A push that ran several must red rather than
+/// silently compare one transition against several labels.
+#[test]
+fn a_push_with_more_than_one_ingest_reds_rather_than_guessing() {
+  let mut steps = honest_run();
+  steps[2].outcomes = vec![AgreementOutcome::Progressed, AgreementOutcome::Stationary];
+  let why =
+    check_outcomes_match_observed_progress(&steps).expect_err("a multi-ingest push must red");
+  assert!(why.contains("reported 2 outcome(s)"), "{why}");
+  assert!(why.contains("progressed,stationary"), "{why}");
 }
 
 const BATCH: &str = "and so my fellow americans ask not what your country can do for you";
@@ -737,6 +978,7 @@ fn only_the_phrase_is_host_scoped() {
   for portable in [
     "check_monotone_confirmation(&steps)",
     "check_confirmed_is_prefix_of_batch(&confirmed, &batch, agreement_count_needed)",
+    "check_outcomes_match_observed_progress(&steps)",
   ] {
     assert!(
       body.contains(portable),

@@ -138,7 +138,7 @@ fn agreement_confirms_the_common_prefix_minus_the_agreed_tail() {
     word(" my", 0.7, 1.0),
     word(" fellow", 1.0, 1.5),
   ]);
-  assert!(agreement.ingest_streamed(second).is_advanced());
+  assert!(agreement.ingest_streamed(second).agreed());
   assert_eq!(agreement.results_slice().len(), 2);
   // common = [And, so, my]; last agreed = suffix(2) = [so, my];
   // confirmed += prefix(1) = [And]; watermark = " so".start.
@@ -267,7 +267,7 @@ fn agreement_count_needed_is_configurable() {
   let second = result_with_words(vec![word(" And", 0.0, 0.4), word(" so", 0.4, 0.7)]);
   // A single-word common prefix ([And]) already meets a threshold of 1 —
   // it would NOT at the default threshold of 2.
-  assert!(agreement.ingest_streamed(second).is_advanced());
+  assert!(agreement.ingest_streamed(second).agreed());
   assert!(agreement.confirmed_words_slice().is_empty());
   assert_eq!(agreement.last_agreed_words_slice().len(), 1);
   assert_eq!(agreement.last_agreed_words_slice()[0].word(), " And");
@@ -871,6 +871,8 @@ fn the_split_never_cuts_at_a_tied_start() {
   let mut backward_strands = 0u32;
   let mut backward_truths = 0u32;
   let mut drifted_advances = 0u32;
+  let mut agreeing_rounds = 0u32;
+  let mut stationary_rounds = 0u32;
   let mut erasures = 0u32;
   let mut loss_free_rounds = 0u32;
   let mut avoidable_backward_strands = 0u32;
@@ -1067,6 +1069,11 @@ fn the_split_never_cuts_at_a_tied_start() {
           .map(|word| (word.word().to_string(), word.start()))
           .collect();
         let before = agreement.confirmed_words_slice().len();
+        // The same two quantities `ingest` decides `Progressed` against, read
+        // from the PUBLIC face a caller reads them from. Asserting the outcome
+        // against these over every round is what makes the honest signal a swept
+        // property rather than two hand-built examples.
+        let watermark_bits_before = agreement.last_agreed_seconds().to_bits();
         // Captured BEFORE the call, since `ingest` overwrites it: it is one of
         // the inputs the split decision is actually made from. The HIGH-WATER
         // start rather than the last confirmed word's, which is what the engine
@@ -1075,9 +1082,38 @@ fn the_split_never_cuts_at_a_tied_start() {
         // exists to drive.
         let confirmed_high_before = highest_start(agreement.confirmed_words_slice());
         let outcome = agreement.ingest_streamed(result_with_words(offered));
+        // THE HONEST SIGNAL, asserted on every round of every trial: an
+        // agreeing round says `progressed` exactly when one of the two things a
+        // caller can observe moved, and `stationary` exactly when neither did;
+        // a round that did not agree moves neither.
+        //
+        // Mutation proof, and the reason this rides the sweep rather than only
+        // the two hand-built pairs: decide progress by `split != 0` instead of
+        // by comparing state and the RE-TIMED half reds -- those rounds drift
+        // every start by 0.03 s per offering, so their zero-split advances DO
+        // move the watermark and would be misreported as stationary.
+        let moved = agreement.last_agreed_seconds().to_bits() != watermark_bits_before
+          || agreement.confirmed_words_slice().len() != before;
+        assert_eq!(
+          outcome.is_progressed(),
+          outcome.agreed() && moved,
+          "trial {trial} stride {stride}: the round reported `{outcome}` while \
+           the watermark went {watermark_bits_before:#x} -> {:#x} and the \
+           confirmed prefix {before} -> {} words. An agreeing round must report \
+           `progressed` exactly when one of those two moved.",
+          agreement.last_agreed_seconds().to_bits(),
+          agreement.confirmed_words_slice().len(),
+        );
+        assert!(
+          outcome.agreed() || !moved,
+          "trial {trial} stride {stride}: `{outcome}` did not agree, so no \
+           advance ran, yet the watermark or the confirmed prefix moved",
+        );
+        agreeing_rounds += u32::from(outcome.agreed());
+        stationary_rounds += u32::from(outcome.is_stationary());
         // The RE-TIMED half's own non-vacuity: a drifted offering must actually
         // reach the advance path, not merely be constructed and disagreed with.
-        drifted_advances += u32::from(drift > 0.0 && outcome.is_advanced());
+        drifted_advances += u32::from(drift > 0.0 && outcome.agreed());
         forced_strands += u32::from(forced_arm_with_a_live_suffix(&agreement));
         let common_len = common_prefix_len(&agreement);
         contradictions += u32::from(
@@ -1235,6 +1271,14 @@ fn the_split_never_cuts_at_a_tied_start() {
      rounds",
   );
   assert!(
+    stationary_rounds > 256,
+    "and the STATIONARY outcome -- an agreeing round that kept its result and \
+     moved neither the watermark nor the confirmed prefix -- must actually be \
+     reached in bulk, or the honest-signal assertion above only ever read the \
+     `progressed` side. Measured here: 1281 of 2965 agreeing rounds, over 4233 \
+     rounds in all. Got {stationary_rounds} of {agreeing_rounds}",
+  );
+  assert!(
     loss_free_rounds > 128,
     "and the AVOIDABILITY oracle must actually find loss-free splits, or the \
      zero it reports below is vacuous: {loss_free_rounds} rounds had one at or \
@@ -1319,7 +1363,7 @@ fn a_trailing_tied_run_never_confirms_itself_twice_at_the_default_count() {
     "non-vacuous: the DEFAULT count, the only one the driver reaches",
   );
   agreement.ingest_streamed(hypothesis());
-  assert!(agreement.ingest_streamed(hypothesis()).is_advanced());
+  assert!(agreement.ingest_streamed(hypothesis()).agreed());
   assert_eq!(
     (
       confirmed_texts(&agreement),
@@ -1456,7 +1500,7 @@ fn an_over_budget_tied_run_strands_its_suffix_at_the_settled_instant() {
   );
   agreement.ingest_streamed(older());
   assert!(
-    agreement.ingest_streamed(newer()).is_advanced(),
+    agreement.ingest_streamed(newer()).agreed(),
     "the agreeing round ADVANCES: an agreeing round always does",
   );
   assert_eq!(
@@ -1549,7 +1593,7 @@ fn an_over_budget_tied_run_strands_its_suffix_at_the_settled_instant() {
   // AND IT IS NOT A STALL: the grown tail reaches `common` on the next ingest
   // and the stream keeps moving.
   assert!(
-    agreement.ingest_streamed(grown()).is_advanced(),
+    agreement.ingest_streamed(grown()).agreed(),
     "the grown tail reaches `common` and the round advances",
   );
   assert_eq!(
@@ -1581,8 +1625,11 @@ fn a_dropped_disagreeing_hypothesiss_draw_survives_into_finalize() {
   // R2 disagrees with R1 (no common prefix) AND drew from an unseeded sampler.
   let r2 = result_with_words(vec![word(" But", 0.0, 0.4), word(" then", 0.4, 0.7)])
     .with_task_facts(TaskFacts::observed_clean().with_drew_from_rng(true));
-  // R3 agrees with the retained R2 control hypothesis, so the round returns
-  // `Advanced` -- on a ZERO split, so it confirms nothing and the watermark holds.
+  // R3 agrees with the retained R2 control hypothesis, so the round ADVANCES --
+  // on a ZERO split, so it confirms nothing, and on timings R3 repeats verbatim
+  // from R2, so the redrawn watermark lands where it already was. The split
+  // alone would not decide that; see
+  // `an_agreeing_round_with_a_zero_split_and_drifting_timings_progresses`.
   let r3 = result_with_words(vec![
     word(" But", 0.0, 0.4),
     word(" then", 0.4, 0.7),
@@ -1597,7 +1644,7 @@ fn a_dropped_disagreeing_hypothesiss_draw_survives_into_finalize() {
     "R2 disagrees with R1 and is dropped from results",
   );
   assert!(
-    agreement.ingest_streamed(r3).is_advanced(),
+    agreement.ingest_streamed(r3).agreed(),
     "R3 agrees with the retained R2 control hypothesis",
   );
 
@@ -1682,7 +1729,7 @@ fn finalize_keeps_the_earliest_ingested_language_over_a_later_survivor() {
     "R2 disagrees with R1 and is dropped from results",
   );
   assert!(
-    agreement.ingest_streamed(r3).is_advanced(),
+    agreement.ingest_streamed(r3).agreed(),
     "R3 agrees with the retained R2 control hypothesis",
   );
   assert_eq!(
@@ -1738,7 +1785,7 @@ fn finalize_reports_an_unknown_worker_schedule() {
     "R2 disagrees with R1 and is dropped from results",
   );
   assert!(
-    agreement.ingest_streamed(r3).is_advanced(),
+    agreement.ingest_streamed(r3).agreed(),
     "R3 agrees with the retained R2 control hypothesis",
   );
   // The surviving results R1 (worker 0) and R3 (worker 2) carry a knowable [0, 2],
@@ -1786,7 +1833,7 @@ fn a_disagreeing_final_hypothesis_replaces_the_holdback_instead_of_duplicating_i
         word(" bravo", 0.4, 0.7),
         word(" charlie", 0.7, 1.0),
       ]))
-      .is_advanced(),
+      .agreed(),
     "identical rerun agrees on all three: confirms alpha, holds bravo+charlie",
   );
   assert_eq!(
@@ -1906,7 +1953,7 @@ fn a_final_hypothesis_with_nothing_past_the_watermark_keeps_the_holdback() {
         word(" bravo", 0.4, 0.7),
         word(" charlie", 0.7, 1.0),
       ]))
-      .is_advanced()
+      .agreed()
   );
   assert!((agreement.last_agreed_seconds() - 0.4).abs() < 1e-6);
 
@@ -1955,7 +2002,7 @@ fn an_agreement_after_a_disagreement_restores_the_swift_shape() {
         word(" bravo", 0.4, 0.7),
         word(" charlie", 0.7, 1.0),
       ]))
-      .is_advanced()
+      .agreed()
   );
   // Revises the held-back " bravo": disagrees, dropped, holdback superseded.
   assert!(
@@ -1977,7 +2024,7 @@ fn an_agreement_after_a_disagreement_restores_the_swift_shape() {
         word(" delta", 1.0, 1.3),
         word(" echo", 1.3, 1.6),
       ]))
-      .is_advanced()
+      .agreed()
   );
   assert_eq!(
     agreement
@@ -2016,7 +2063,7 @@ fn a_revision_that_repeats_a_held_back_word_is_not_duplicated() {
   };
   let mut agreement = LocalAgreement::new();
   agreement.ingest_streamed(settled());
-  assert!(agreement.ingest_streamed(settled()).is_advanced());
+  assert!(agreement.ingest_streamed(settled()).agreed());
   // Rule W (#94): the split may not cut at a tied start, so it widens past the
   // tie -- one word moves from `last_agreed_words_slice()` into
   // `confirmed_words_slice()` and the watermark moves to the first word past
@@ -2090,10 +2137,10 @@ fn a_corroborated_revision_that_repeats_a_held_back_word_reaches_the_transcript(
   };
   let mut agreement = LocalAgreement::new();
   agreement.ingest_streamed(settled());
-  assert!(agreement.ingest_streamed(settled()).is_advanced());
+  assert!(agreement.ingest_streamed(settled()).agreed());
   agreement.ingest_streamed(revision());
   assert!(
-    agreement.ingest_streamed(revision()).is_advanced(),
+    agreement.ingest_streamed(revision()).agreed(),
     "the revision corroborates itself",
   );
 
@@ -2235,7 +2282,7 @@ fn a_stutter_at_the_watermark_keeps_both_occurrences() {
   // Mutation proof: make the offered filter STRICT (`start > watermark` in
   // `watermark_filtered`) and the advance never happens -- both stuttered A's
   // sit exactly at the 0.0 s watermark, the hypothesis comes back as the single
-  // word " B", and `is_advanced()` is false. The non-strict endpoint is what
+  // word " B", and `agreed()` is false. The non-strict endpoint is what
   // lets a hypothesis re-offer the instant the watermark sits on, which is the
   // whole of what Rule W then has to keep safe.
   let hypothesis = || {
@@ -2247,7 +2294,7 @@ fn a_stutter_at_the_watermark_keeps_both_occurrences() {
   };
   let mut agreement = LocalAgreement::new();
   agreement.ingest_streamed(hypothesis());
-  assert!(agreement.ingest_streamed(hypothesis()).is_advanced());
+  assert!(agreement.ingest_streamed(hypothesis()).agreed());
   assert_eq!(
     agreement
       .finalize(&crate::audio::whisper::options::DecodingOptions::new())
@@ -2365,7 +2412,7 @@ fn a_distinct_repetition_of_a_confirmed_word_survives_the_continuing_stream() {
   let stutter = || result_with_words(vec![a(), a(), b()]);
   let mut agreement = LocalAgreement::new();
   agreement.ingest_streamed(stutter());
-  assert!(agreement.ingest_streamed(stutter()).is_advanced());
+  assert!(agreement.ingest_streamed(stutter()).agreed());
   // Rule W (#94): the split may not cut at a tied start, so it widens past the
   // tie -- one word moves from `last_agreed_words_slice()` into
   // `confirmed_words_slice()` and the watermark moves to the first word past
@@ -2382,7 +2429,7 @@ fn a_distinct_repetition_of_a_confirmed_word_survives_the_continuing_stream() {
   // that pin cannot see this.
   let onward = || result_with_words(vec![a(), b(), c(), d()]);
   agreement.ingest_streamed(onward());
-  assert!(agreement.ingest_streamed(onward()).is_advanced());
+  assert!(agreement.ingest_streamed(onward()).agreed());
   assert_eq!(
     confirmed_texts(&agreement),
     vec![" A", " A", " B"],
@@ -2433,7 +2480,7 @@ fn rule_w_deletes_a_tied_insertion_that_reproduces_nothing_confirmed() {
   assert!(
     agreement
       .ingest_streamed(result_with_words(vec![a(), b(), c()]))
-      .is_advanced()
+      .agreed()
   );
   assert_eq!(
     confirmed_texts(&agreement),
@@ -2454,7 +2501,7 @@ fn rule_w_deletes_a_tied_insertion_that_reproduces_nothing_confirmed() {
 
   let inserted = || result_with_words(vec![word(" X", 0.0, 0.3), b(), c(), word(" D", 2.0, 2.5)]);
   agreement.ingest_streamed(inserted());
-  assert!(agreement.ingest_streamed(inserted()).is_advanced());
+  assert!(agreement.ingest_streamed(inserted()).agreed());
   assert_eq!(
     confirmed_texts(&agreement),
     vec![" A", " B"],
@@ -2519,7 +2566,7 @@ fn a_recurring_phrase_does_not_delete_the_words_between_its_occurrences() {
 
   let mut agreement = LocalAgreement::new();
   agreement.ingest_streamed(opening());
-  assert!(agreement.ingest_streamed(opening()).is_advanced());
+  assert!(agreement.ingest_streamed(opening()).agreed());
   assert_eq!(
     confirmed_texts(&agreement),
     vec![" the"],
@@ -2540,7 +2587,7 @@ fn a_recurring_phrase_does_not_delete_the_words_between_its_occurrences() {
         sat(6.0),
         word(" down", 7.0, 8.0),
       ]))
-      .is_advanced(),
+      .agreed(),
     "the refused prefix leaves both sides agreeing, so the watermark still moves",
   );
 
@@ -2602,7 +2649,7 @@ fn rule_w_deletes_an_unaccounted_repeat_of_a_settled_word() {
   assert!(
     agreement
       .ingest_streamed(result_with_words(vec![a(), b(), c()]))
-      .is_advanced()
+      .agreed()
   );
   assert_eq!(
     (confirmed_texts(&agreement), agreement.last_agreed_seconds()),
@@ -2683,7 +2730,7 @@ fn a_re_utterance_separated_from_the_watermark_keeps_its_word() {
   assert!(
     agreement
       .ingest_streamed(result_with_words(vec![a0(), b0(), c0(), d0()]))
-      .is_advanced()
+      .agreed()
   );
   assert_eq!(
     confirmed_texts(&agreement),
@@ -2700,7 +2747,7 @@ fn a_re_utterance_separated_from_the_watermark_keeps_its_word() {
     ])
   };
   agreement.ingest_streamed(re_uttered());
-  assert!(agreement.ingest_streamed(re_uttered()).is_advanced());
+  assert!(agreement.ingest_streamed(re_uttered()).agreed());
   assert_eq!(
     confirmed_texts(&agreement),
     vec![" A", " B", " B", " C"],
@@ -2757,11 +2804,7 @@ fn the_next_strides_prefill_is_the_holdback_verbatim() {
     word(" my", 0.8, 1.2),
   ];
   agreement.ingest_streamed(result_with_words(words.clone()));
-  assert!(
-    agreement
-      .ingest_streamed(result_with_words(words))
-      .is_advanced()
-  );
+  assert!(agreement.ingest_streamed(result_with_words(words)).agreed());
 
   // The base has the prompt turned OFF, which is what makes the flag assertion
   // below non-vacuous: on the default base it would hold with no code at all.
@@ -2833,7 +2876,7 @@ fn an_over_budget_holdback_is_capped_rather_than_silently_truncated() {
 
   let first = || result_with_words(words[..7].to_vec());
   agreement.ingest_streamed(first());
-  assert!(agreement.ingest_streamed(first()).is_advanced());
+  assert!(agreement.ingest_streamed(first()).agreed());
 
   let requested: usize = agreement
     .last_agreed_words_slice()
@@ -2869,7 +2912,7 @@ fn an_over_budget_holdback_is_capped_rather_than_silently_truncated() {
   // truncated one does not.
   let onward = || result_with_words(words[4..].to_vec());
   agreement.ingest_streamed(onward());
-  assert!(agreement.ingest_streamed(onward()).is_advanced());
+  assert!(agreement.ingest_streamed(onward()).agreed());
   assert_eq!(
     confirmed_texts(&agreement),
     vec![" w0", " w1", " w2", " w3", " w4", " w5"],
@@ -2916,7 +2959,7 @@ fn a_holdback_word_the_prefill_cannot_carry_is_confirmed_rather_than_held() {
   // advance (see
   // `a_forced_empty_holdback_retracts_its_suffix_at_the_settled_instant`, the
   // round where refusing WOULD have saved a word): make that arm return `0`
-  // instead of `common.len()` and the `is_advanced` assertion below reds.
+  // instead of `common.len()` and the `agreed` assertion below reds.
   // Nothing lies beyond `common` here, so there is no anchor a wait could ever
   // be waiting for -- round 7's finding again.
   let a = || word_of_tokens(" A", 1.0, 2.0, 1);
@@ -2929,7 +2972,7 @@ fn a_holdback_word_the_prefill_cannot_carry_is_confirmed_rather_than_held() {
   let mut agreement = LocalAgreement::new();
   let pair = || result_with_words(vec![a(), huge()]);
   agreement.ingest_streamed(pair());
-  assert!(agreement.ingest_streamed(pair()).is_advanced());
+  assert!(agreement.ingest_streamed(pair()).agreed());
 
   // The streaming face, read between pushes: both agreed words are settled,
   // because the second one is a word the engine can never hand a decoder whole.
@@ -3109,11 +3152,7 @@ fn the_first_strides_options_keep_the_callers_prefill_flag() {
     word(" my", 0.8, 1.2),
   ];
   agreement.ingest_streamed(result_with_words(words.clone()));
-  assert!(
-    agreement
-      .ingest_streamed(result_with_words(words))
-      .is_advanced()
-  );
+  assert!(agreement.ingest_streamed(result_with_words(words)).agreed());
   assert!(
     agreement
       .decoding_options_for_next(&base)
@@ -3180,11 +3219,7 @@ fn the_prefill_reaches_decode_text_as_the_whole_holdback() {
     word(" my", 0.8, 1.2),
   ];
   agreement.ingest_streamed(result_with_words(words.clone()));
-  assert!(
-    agreement
-      .ingest_streamed(result_with_words(words))
-      .is_advanced()
-  );
+  assert!(agreement.ingest_streamed(result_with_words(words)).agreed());
 
   let holdback_tokens: Vec<u32> = agreement
     .last_agreed_words_slice()
@@ -3208,7 +3243,7 @@ fn the_prefill_reaches_decode_text_as_the_whole_holdback() {
   let mut wide = LocalAgreement::new().with_agreement_count_needed(5);
   let first = || result_with_words(budget[..7].to_vec());
   wide.ingest_streamed(first());
-  assert!(wide.ingest_streamed(first()).is_advanced());
+  assert!(wide.ingest_streamed(first()).agreed());
   let wide_holdback: Vec<u32> = wide
     .last_agreed_words_slice()
     .iter()
@@ -3274,7 +3309,7 @@ fn a_zero_duration_word_at_an_empty_holdback_is_not_re_confirmed() {
   let mut agreement = LocalAgreement::new().with_agreement_count_needed(1);
   let opening = || result_with_words(vec![a(), zero()]);
   agreement.ingest_streamed(opening());
-  assert!(agreement.ingest_streamed(opening()).is_advanced());
+  assert!(agreement.ingest_streamed(opening()).agreed());
   assert_eq!(
     (
       confirmed_texts(&agreement),
@@ -3423,7 +3458,7 @@ fn a_forced_empty_holdback_retracts_its_suffix_at_the_settled_instant() {
   );
   agreement.ingest_streamed(older());
   assert!(
-    agreement.ingest_streamed(newer()).is_advanced(),
+    agreement.ingest_streamed(newer()).agreed(),
     "the agreeing round ADVANCES: an agreeing round always does",
   );
   assert_eq!(
@@ -3481,7 +3516,7 @@ fn a_forced_empty_holdback_retracts_its_suffix_at_the_settled_instant() {
   // AND IT IS NOT A STALL: the anchor reaches `common` on the next ingest and
   // an ordinary interior split takes over.
   assert!(
-    agreement.ingest_streamed(later()).is_advanced(),
+    agreement.ingest_streamed(later()).agreed(),
     "the anchor's strictly later start opens an ordinary interior boundary",
   );
   assert_eq!(
@@ -3647,13 +3682,27 @@ fn an_alternating_suffix_advances_instead_of_stalling() {
       watermark,
     )
   };
-  let advanced = |confirmed: &[&str], held: &[&str], watermark: f32| {
+  let labelled = |label: &str, confirmed: &[&str], held: &[&str], watermark: f32| {
     (
-      "advanced".to_string(),
+      label.to_string(),
       confirmed.iter().map(|w| (*w).to_string()).collect(),
       held.iter().map(|w| (*w).to_string()).collect(),
       watermark,
     )
+  };
+  let progressed = |confirmed: &[&str], held: &[&str], watermark: f32| {
+    labelled("progressed", confirmed, held, watermark)
+  };
+  // The FIXED POINT this shape settles into, and the label is now the point of
+  // the row. The input is periodic, so once the interior split is taken nothing
+  // settles again and the watermark stops moving. Under the single `Advanced`
+  // these rows read as five more advances; they are five rounds in which the
+  // caller's confirmed prefix and watermark did not change, and the outcome
+  // says so now. Not a defect -- an alternation that never corroborates its own
+  // suffix has nothing left to give -- but a caller with a stall watchdog is
+  // entitled to see it, which is the whole of why `Stationary` is a value.
+  let stationary = |confirmed: &[&str], held: &[&str], watermark: f32| {
+    labelled("stationary", confirmed, held, watermark)
   };
   assert_eq!(
     face,
@@ -3663,17 +3712,19 @@ fn an_alternating_suffix_advances_instead_of_stalling() {
       // THE FALLBACK. `common` is `[" A", " H"]` and the budget floor reaches
       // its end, so the empty holdback is taken at the only instant that clears
       // `" H"`'s own start.
-      advanced(&[" A", " H"], &[], PAST_ONE_SECOND),
+      progressed(&[" A", " H"], &[], PAST_ONE_SECOND),
       // And the stream is a stream: the tail the alternation was blocking
       // reaches `common` and is held back under an ordinary interior split.
-      advanced(&[" A", " H"], &[" T", " U"], 2.0),
-      advanced(&[" A", " H"], &[" T", " U"], 2.0),
-      advanced(&[" A", " H"], &[" T", " U"], 2.0),
-      advanced(&[" A", " H"], &[" T", " U"], 2.0),
-      advanced(&[" A", " H"], &[" T", " U"], 2.0),
-      advanced(&[" A", " H"], &[" T", " U"], 2.0),
+      progressed(&[" A", " H"], &[" T", " U"], 2.0),
+      stationary(&[" A", " H"], &[" T", " U"], 2.0),
+      stationary(&[" A", " H"], &[" T", " U"], 2.0),
+      stationary(&[" A", " H"], &[" T", " U"], 2.0),
+      stationary(&[" A", " H"], &[" T", " U"], 2.0),
+      stationary(&[" A", " H"], &[" T", " U"], 2.0),
     ],
-    "the alternation must not freeze the stream",
+    "the alternation must not freeze the stream BEFORE it escapes the forced \
+     arm, and must report honestly once it has: two rounds of real progress, \
+     then a fixed point the outcome names",
   );
 
   // THE TRADE, both directions, so neither can be reported as free. A stream
@@ -3789,8 +3840,10 @@ fn a_tied_run_above_the_budget_floor_advances_instead_of_stalling() {
     face,
     vec![
       ("awaiting_agreement".to_string(), 0, 0, 0.0, RUN),
-      // THE FALLBACK, at the only instant that clears the run's own.
-      ("advanced".to_string(), RUN, 0, PAST_TWO_SECONDS, RUN),
+      // THE FALLBACK, at the only instant that clears the run's own -- and the
+      // only round of this shape that moves anything, which is why it is the
+      // only `progressed` one.
+      ("progressed".to_string(), RUN, 0, PAST_TWO_SECONDS, RUN),
       // The run is behind the watermark now, so a hypothesis that keeps
       // repeating it offers nothing -- which is the input being degenerate, not
       // the engine stalling: every word it has is at one instant.
@@ -3872,7 +3925,7 @@ fn a_tied_run_above_the_budget_floor_advances_instead_of_stalling() {
     alternating_face,
     vec![
       ("awaiting_agreement".to_string(), 0, 0, 0.0),
-      ("advanced".to_string(), RUN, 0, PAST_TWO_SECONDS),
+      ("progressed".to_string(), RUN, 0, PAST_TWO_SECONDS),
       ("awaiting_agreement".to_string(), RUN, 0, PAST_TWO_SECONDS),
       ("awaiting_agreement".to_string(), RUN, 0, PAST_TWO_SECONDS),
       ("awaiting_agreement".to_string(), RUN, 0, PAST_TWO_SECONDS),
@@ -3958,15 +4011,24 @@ fn a_word_starting_strictly_later_lowers_the_watermark_instead_of_being_stranded
       // the advance clears the settled start without reaching past a word the
       // hypothesis has already produced.
       (
-        "advanced".to_string(),
+        "progressed".to_string(),
         vec![" A".to_string(), " H".to_string()],
         Vec::new(),
         2.0,
       ),
       // And `" X"` was never filtered away, so it is held back like any other
       // agreed word one round later.
+      //
+      // `stationary`, not `progressed`, and deliberately: this round grew the
+      // HOLDBACK from nothing to two words, and the holdback is not a progress
+      // channel. It is provisional by construction -- every advance replaces it
+      // wholesale, with this hypothesis's timings -- so a stream re-agreeing on
+      // the same two words forever churns it every round. Counting that as
+      // progress is exactly how a stall stays invisible. What moved here is what
+      // MIGHT still be revised; nothing settled, and the clip boundary the next
+      // stride decodes from is where it was.
       (
-        "advanced".to_string(),
+        "stationary".to_string(),
         vec![" A".to_string(), " H".to_string()],
         vec![" X".to_string(), " T".to_string()],
         2.0,
@@ -4021,7 +4083,7 @@ fn an_overlapping_agreed_word_is_confirmed_on_the_mainline_path_too() {
   let mut agreement = LocalAgreement::new();
   let opening = || result_with_words(vec![p(), q(), r()]);
   agreement.ingest_streamed(opening());
-  assert!(agreement.ingest_streamed(opening()).is_advanced());
+  assert!(agreement.ingest_streamed(opening()).agreed());
   assert_eq!(agreement.last_agreed_seconds(), 1.0);
   assert_eq!(
     confirmed_texts(&agreement),
@@ -4467,7 +4529,7 @@ fn a_backward_start_from_the_segment_pipeline_does_not_strand_a_later_word() {
     "non-vacuous: the DEFAULT count, which is the driver's own",
   );
   agreement.ingest_streamed(offered());
-  assert!(agreement.ingest_streamed(offered()).is_advanced());
+  assert!(agreement.ingest_streamed(offered()).agreed());
   assert_eq!(
     (
       confirmed_texts(&agreement),
@@ -4511,7 +4573,7 @@ fn a_backward_start_from_the_segment_pipeline_does_not_strand_a_later_word() {
     "`\" D\"` is still offerable, so a later hypothesis can still revise or \
      corroborate it",
   );
-  assert!(agreement.ingest_streamed(offered()).is_advanced());
+  assert!(agreement.ingest_streamed(offered()).agreed());
   assert!(
     agreement
       .finalize(&crate::audio::whisper::options::DecodingOptions::new())
@@ -4566,7 +4628,7 @@ fn a_backwards_start_two_words_back_still_cannot_be_re_admitted() {
   };
   let mut agreement = LocalAgreement::new();
   agreement.ingest_streamed(offered());
-  assert!(agreement.ingest_streamed(offered()).is_advanced());
+  assert!(agreement.ingest_streamed(offered()).agreed());
   assert_eq!(
     (
       confirmed_texts(&agreement),
@@ -4707,7 +4769,7 @@ fn a_backward_start_past_the_requested_split_backs_off_instead_of_stranding_it()
     "non-vacuous: the DEFAULT count, which is the driver's own",
   );
   agreement.ingest_streamed(offered());
-  assert!(agreement.ingest_streamed(offered()).is_advanced());
+  assert!(agreement.ingest_streamed(offered()).agreed());
 
   // THE FINDING, read on the PUBLISHED TRANSCRIPT across rounds rather than on
   // the confirmed list -- which is append-only and cannot see a retraction.
@@ -4832,10 +4894,12 @@ fn a_permanently_backwards_tail_confirms_at_the_budget_rather_than_holding_forev
   let mut agreement = LocalAgreement::new();
   let mut first_confirmation = None;
   let mut confirmed_after: Vec<usize> = Vec::new();
+  let mut stationary_rounds = 0usize;
   for round in 1..=expected_confirmation_round + 6 {
     let offered = offering(round);
     let published_words = offered.len();
-    agreement.ingest_streamed(result_with_words(offered));
+    let outcome = agreement.ingest_streamed(result_with_words(offered));
+    stationary_rounds += usize::from(outcome.is_stationary());
     let confirmed = agreement.confirmed_words_slice().len();
     if confirmed > 0 && first_confirmation.is_none() {
       first_confirmation = Some(round);
@@ -4872,6 +4936,26 @@ fn a_permanently_backwards_tail_confirms_at_the_budget_rather_than_holding_forev
     confirmed_after.last() > confirmed_after.get(expected_confirmation_round - 1),
     "and it KEEPS confirming afterwards rather than returning to zero for good: \
      {confirmed_after:?}",
+  );
+
+  // AND THE CALLER CAN SEE THE WAIT. This is the shape the honest signal exists
+  // for: the bound above is a BOUND, not a promise of movement, and for most of
+  // it the engine agrees round after round while confirming nothing and holding
+  // the watermark still. 110 of these 120 rounds are that state. While both
+  // agreeing cases shared one `Advanced`, a caller reading the outcome saw 110
+  // consecutive reports of progress across a stream that made none, and a stall
+  // watchdog keyed on it could never fire -- which is the whole reason the
+  // outcome now distinguishes them.
+  //
+  // Asserted as a floor rather than an equality because it is evidence about a
+  // shape, not a contract on a count: what must not happen is this shape
+  // reporting progress on rounds that made none.
+  assert!(
+    stationary_rounds >= 100,
+    "the wait must be VISIBLE to a caller: {stationary_rounds} of {} rounds \
+     agreed, kept their result and moved neither the watermark nor the \
+     confirmed prefix (measured: 110 of 120)",
+    confirmed_after.len(),
   );
 }
 
@@ -4970,7 +5054,7 @@ fn a_backward_start_beyond_common_backs_the_split_off_too() {
   assert!(
     agreement
       .ingest_streamed(result_with_words(with_beyond.clone()))
-      .is_advanced()
+      .agreed()
   );
   assert_eq!(
     (
@@ -5008,42 +5092,26 @@ fn a_backward_start_beyond_common_backs_the_split_off_too() {
 }
 
 #[test]
-fn characterization_an_agreeing_round_returns_advanced_without_moving_the_watermark() {
-  // CHARACTERIZATION of what `AgreementOutcome::Advanced` reports TODAY, not a
-  // property that holds. The CORRECT answer is in the failure messages below.
+fn an_agreeing_round_that_moves_nothing_reports_stationary() {
+  // Was `characterization_an_agreeing_round_returns_advanced_without_moving_the_
+  // watermark`, which PINNED the dishonest signal and named the correct answer
+  // in its own failure message. This asserts that answer instead: a round that
+  // agreed, kept its result and moved NOTHING says so.
   //
-  // `Advanced`'s doc said "the confirmation watermark advanced and the result
-  // was kept", and `AwaitingAgreement`'s said "two hypotheses that AGREE always
-  // advance the watermark ... what this value reports is whether the watermark
-  // moved". Both were false, and neither is a rounding artifact.
+  // WHY IT MATTERS, measured rather than argued. On the pathological input
+  // `the_split_never_cuts_at_a_tied_start` builds, 399 of 400 rounds are this
+  // one. While both agreeing cases shared a single `Advanced`, a caller with a
+  // stall watchdog keyed on the outcome saw 399 consecutive reports of progress
+  // and could not tell the stall from a working stream.
   //
-  // MEASURED, on the real tiny model: strides 7 and 9 of the shipping
-  // `jfk_simulated_stream_confirms_the_transcript` fixture return `Advanced`
-  // with `last_agreed_seconds` BIT-identical to the stride before (`0x3fb5c28f`
-  // and `0x3fb851ec`) and the confirmed prefix unchanged at `"and so my"`, while
-  // every stride that really moves changes the bits by ~0.02 s. Instrumenting
-  // the same 512-trial shape `the_split_never_cuts_at_a_tied_start` sweeps finds
-  // 1281 such rounds out of 4233 at this commit and 1128 out of 4233 on `main`,
-  // with the rounded-only count at ZERO on both. The behaviour predates this
-  // branch: the JFK trace is element-wise identical across `main`, `7b353b4`
-  // and `eb1e412`.
-  //
-  // WHY, and it is not the budget. An advance confirms `common[..split]` and
-  // holds `common[split..]`. Where the split is ZERO -- here the earliest
-  // boundary the budget floor allows, `budgeted_split(common, 0) == 0`, and a
-  // legal one -- the round confirms nothing, so `sparing_watermark` re-anchors on
-  // the first held-back word, which is the word the watermark already sat on.
-  // The EXHAUSTED-BUDGET arm is the opposite case and does move the watermark:
-  // it runs the split off the end of `common` and confirms all of it
-  // (`a_forced_empty_holdback_retracts_its_suffix_at_the_settled_instant`).
-  //
-  // Split > 0 cannot reach this state, which is why the pin is at split 0: every
-  // word of `common` clears the watermark by `watermark_filtered`, so confirming
-  // one raises `highest_start(confirmed_words)` to at least the watermark, and
-  // Rule W's first postcondition then puts the new watermark strictly past it.
+  // The MINIMAL PAIR is
+  // `an_agreeing_round_with_a_zero_split_and_drifting_timings_progresses`: the
+  // same three rounds with `" so"`'s start moved from 0.4 to 0.42 and nothing
+  // else changed. Its split is zero too, and it reports `progressed` -- so the
+  // two zero-split cases are told apart by tests, not only by prose.
   //
   // Mutation proof: make the third ingest disagree (change `" my"`'s text in
-  // `revised`) and the `is_advanced` row reds -- so the round asserted here is
+  // `revised`) and the `agreed()` row reds -- so the round asserted here is
   // genuinely an AGREEING one and not a disagreement in disguise.
   let and = || word(" and", 0.0, 0.4);
   let so = || word(" so", 0.4, 0.7);
@@ -5065,7 +5133,7 @@ fn characterization_an_agreeing_round_returns_advanced_without_moving_the_waterm
         my(),
         word(" fellow", 1.0, 1.5),
       ]))
-      .is_advanced()
+      .is_progressed()
   );
   assert_eq!(
     (
@@ -5079,30 +5147,24 @@ fn characterization_an_agreeing_round_returns_advanced_without_moving_the_waterm
   );
 
   // The steady state: this round re-agrees on exactly `agreement_count_needed`
-  // words and holds both, so its split is zero and it confirms nothing new.
+  // words and holds both, so its split is zero and it confirms nothing new --
+  // and this hypothesis repeats the previous one's timings for both held words,
+  // so the redrawn watermark lands on the instant it already held.
   let settled = agreement.last_agreed_seconds();
   let revised = result_with_words(vec![so(), my(), word(" americans", 1.0, 1.6)]);
   let outcome = agreement.ingest_streamed(revised);
 
   assert!(
-    outcome.is_advanced(),
-    "non-vacuous: this round AGREED and its result was kept -- it is the \
-     `Advanced` path, not a disagreement",
+    outcome.agreed(),
+    "non-vacuous: this round AGREED and its result was kept -- it is an \
+     advancing round, not a disagreement",
   );
   assert_eq!(
     agreement.last_agreed_seconds().to_bits(),
     settled.to_bits(),
-    "CHARACTERIZATION (https://github.com/findit-studio/coremlit/issues/94): \
-     this pins that a round returning `{outcome}` moves the watermark NOWHERE \
-     -- left is the {} it holds now, right the {settled} it already held, \
-     compared as BITS so no rounding can be blamed either way. The CORRECT \
-     answer is that a caller can read `advanced` as \"something progressed\" \
-     and act on it: drive a \
-     progress indicator, decide a stream has stalled, or stop re-offering audio \
-     that will never be confirmed. Today it only says the round AGREED and its \
-     result was KEPT. Making the signal honest is tracked separately, because \
-     it changes what the JFK regression trace records and that trace must stay \
-     byte-identical on this branch.",
+    "the watermark really did not move -- left is the {} it holds now, right \
+     the {settled} it already held, compared as BITS so no rounding can be \
+     blamed either way",
     agreement.last_agreed_seconds(),
   );
   assert_eq!(
@@ -5110,7 +5172,106 @@ fn characterization_an_agreeing_round_returns_advanced_without_moving_the_waterm
     (vec![" and"], vec![" so", " my"]),
     "and nothing else progressed either: the confirmed prefix is unchanged and \
      the whole agreed prefix is still the holdback, which is what a zero split \
-     leaves behind. A caller polling `confirmed_words_slice()` on an `advanced` \
-     sees the same words it saw last round.",
+     leaves behind",
+  );
+  assert!(
+    outcome.is_stationary(),
+    "so the round must REPORT that, and it reports `{outcome}`. A caller may \
+     read `progressed` as \"something moved\" and act on it -- drive a progress \
+     indicator, decide a stream has stalled, stop re-offering audio that will \
+     never be confirmed -- and this round moved nothing.",
+  );
+}
+
+#[test]
+fn an_agreeing_round_with_a_zero_split_and_drifting_timings_progresses() {
+  // THE OTHER ZERO-SPLIT CASE, and the one two commits of this branch said could
+  // not exist. `79fe099` and `47023a7` stated that a zero split leaves the
+  // watermark BIT-identical; a zero split guarantees only that no word is
+  // appended to `confirmed_words`. The watermark is REDRAWN from this
+  // hypothesis's own timings on every advance -- `find_longest_common_prefix`
+  // agrees on normalized TEXT and hands back a slice of the NEW hypothesis -- so
+  // it moves whenever those timings drift, split or no split.
+  //
+  // This is the MINIMAL PAIR to
+  // `an_agreeing_round_that_moves_nothing_reports_stationary`: identical rounds
+  // except that the third hypothesis re-times `" so"` from 0.4 to 0.42, the way
+  // a re-decode over a longer buffer does. Same texts, same agreement, same zero
+  // split -- and the watermark moves, so the outcome must say `progressed`.
+  //
+  // An ORDINARY test rather than a characterization: it does not record
+  // behaviour we tolerate but do not endorse, it pins the honest-signal contract
+  // itself. A round that moves the watermark and reports no progress would be a
+  // defect to fix, not a note to keep.
+  //
+  // MUTATION PROOF, and it is the whole reason the test exists: implement
+  // `ingest`'s progress decision as `split != 0` -- the reading the false claim
+  // invites -- and this reds with `stationary`, while
+  // `an_agreeing_round_that_moves_nothing_reports_stationary` stays green. The
+  // shipping `jfk_simulated_stream_confirms_the_transcript` fixture runs the
+  // same shape on the real tiny model: `confirmed` sits at 3 from stride 3
+  // through stride 9 -- so every advance from stride 4 on splits at zero --
+  // while the watermark walks 1.36 -> 1.38 -> 1.40 -> 1.42, and 1.42 -> 1.44 at
+  // stride 8.
+  let and = || word(" and", 0.0, 0.4);
+  let so = || word(" so", 0.4, 0.7);
+  let my = || word(" my", 0.7, 1.0);
+
+  let mut agreement = LocalAgreement::new();
+  agreement.ingest_streamed(result_with_words(vec![and(), so(), my()]));
+  assert!(
+    agreement
+      .ingest_streamed(result_with_words(vec![
+        and(),
+        so(),
+        my(),
+        word(" fellow", 1.0, 1.5),
+      ]))
+      .is_progressed(),
+    "the SETUP round confirms `\" and\"` and moves the watermark to 0.4",
+  );
+  assert_eq!(
+    (
+      confirmed_texts(&agreement),
+      held_back_texts(&agreement),
+      agreement.last_agreed_seconds().to_bits(),
+    ),
+    (vec![" and"], vec![" so", " my"], 0.4f32.to_bits()),
+  );
+
+  // THE DRIFT, and the only difference from the stationary pair: `" so"` comes
+  // back 0.02 s later. It still clears the 0.4 watermark, so it is still
+  // offered; its text is unchanged, so `common` is still `[" so", " my"]` and
+  // the split is still zero.
+  let settled = agreement.last_agreed_seconds();
+  let outcome = agreement.ingest_streamed(result_with_words(vec![
+    word(" so", 0.42, 0.7),
+    my(),
+    word(" americans", 1.0, 1.6),
+  ]));
+
+  assert_eq!(
+    (confirmed_texts(&agreement), held_back_texts(&agreement)),
+    (vec![" and"], vec![" so", " my"]),
+    "the split really is ZERO: nothing new was confirmed and the whole agreed \
+     prefix is still the holdback",
+  );
+  assert_ne!(
+    agreement.last_agreed_seconds().to_bits(),
+    settled.to_bits(),
+    "and the watermark really did MOVE across that zero split -- {} against \
+     the {settled} it held before, compared as BITS",
+    agreement.last_agreed_seconds(),
+  );
+  assert_eq!(
+    agreement.last_agreed_seconds().to_bits(),
+    0.42f32.to_bits(),
+    "onto the re-timed held word's own start, which is where the anchor is \
+     drawn from",
+  );
+  assert!(
+    outcome.is_progressed(),
+    "so a zero split is NOT the stationary condition, and the outcome must \
+     report the move: `{outcome}`",
   );
 }

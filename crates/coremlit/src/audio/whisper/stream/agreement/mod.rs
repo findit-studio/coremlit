@@ -624,71 +624,133 @@ mod tests;
 // AgreementOutcome
 // ---------------------------------------------------------------------
 
-/// One `LocalAgreement::ingest` call's outcome — whether the new result
-/// AGREED with the previous one and was kept, merely awaits a future result to
-/// agree with, or carried no word timings to agree over at all. Swift
-/// expresses these same three outcomes as local bookkeeping (`skipAppend`,
-/// the no-words `else` branch) rather than a value
-/// (`TranscribeCLI.swift:370-410`).
+/// One `LocalAgreement::ingest` call's outcome. It answers TWO questions, not
+/// one: whether the new result AGREED with the previous one and was kept, and —
+/// where it did — whether anything a caller can observe actually MOVED. The
+/// second question is why there are two agreeing variants, [`Self::Progressed`]
+/// and [`Self::Stationary`]; the remaining two are the round that did not agree
+/// ([`Self::AwaitingAgreement`]) and the result with no word timings to agree
+/// over at all ([`Self::NoWordTimings`]).
+///
+/// Swift expresses only the first question, and as local bookkeeping
+/// (`skipAppend`, the no-words `else` branch) rather than as a value
+/// (`TranscribeCLI.swift:370-410`). It has no answer to the second, and neither
+/// did this enum until the two agreeing cases were split apart: a single
+/// `Advanced` reported agreed-and-kept and was routinely read as progress, so a
+/// stalled stream was indistinguishable from a moving one. See
+/// [`Self::Stationary`] for what that cost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display, derive_more::IsVariant)]
 #[display("{}", self.as_str())]
 #[non_exhaustive]
 pub enum AgreementOutcome {
-  /// The new result's hypothesis agreed with the previous one on at least
+  /// The round AGREED — the new hypothesis and the previous one shared at least
   /// [`LocalAgreement::agreement_count_needed`] words, so the result was KEPT
-  /// rather than dropped.
+  /// rather than dropped — AND something a caller can observe MOVED:
+  /// [`LocalAgreement::last_agreed_seconds`] came back with different bits, or
+  /// [`LocalAgreement::confirmed_words_slice`] grew, or both.
   ///
-  /// **It does NOT follow that the confirmation watermark moved**, and this doc
-  /// used to say it did. An advance confirms `common[..split]` and holds the
-  /// rest; where that split is ZERO it confirms nothing, the anchor is the first
-  /// held-back word's start, and that is the word the watermark already sat on
-  /// -- so [`LocalAgreement::last_agreed_seconds`] comes back BIT-identical and
-  /// [`LocalAgreement::confirmed_words_slice`] unchanged. That is the ordinary
-  /// steady state of a stream whose rounds re-agree on exactly
-  /// `agreement_count_needed` words and hold all of them, not an edge case:
-  /// strides 7 and 9 of the shipping
-  /// `jfk_simulated_stream_confirms_the_transcript` fixture do it on the real
-  /// tiny model (watermark stuck at `0x3fb5c28f` and `0x3fb851ec`, three
-  /// confirmed words either side), and instrumenting the same 512-trial shape
-  /// `the_split_never_cuts_at_a_tied_start` sweeps finds 1281 such rounds out of
-  /// 4233 -- every one bit-identical, none of them a rounding artifact.
-  /// Characterized in
-  /// `characterization_an_agreeing_round_returns_advanced_without_moving_the_watermark`.
+  /// This is the value a progress indicator may drive, a stall watchdog may
+  /// reset, and a decision to stop re-offering audio may rest on.
+  /// [`Self::Stationary`] is the SAME agreement with neither of those two things
+  /// moving; nothing else separates them.
   ///
-  /// So a caller may read this as "agreed, and kept" and may NOT read it as
-  /// "something progressed". Nothing in this enum carries the second question;
-  /// answering it is tracked separately, since giving this value that meaning
-  /// changes what the JFK regression trace records.
+  /// Which of the two a round lands on is decided by COMPARING the watermark's
+  /// bits and the confirmed length across the update — see
+  /// [`Self::Stationary`] for why the split cannot be asked instead.
+  Progressed,
+  /// The round AGREED and its result was KEPT, exactly as [`Self::Progressed`],
+  /// but NOTHING a caller can observe moved:
+  /// [`LocalAgreement::last_agreed_seconds`] came back BIT-identical and
+  /// [`LocalAgreement::confirmed_words_slice`] is unchanged. A caller polling
+  /// the engine on this outcome reads back the same watermark and the same
+  /// words it read last round.
   ///
-  /// The EXHAUSTED-BUDGET arm is not this condition and is worth telling apart:
-  /// where no split at or above the prefill-budget floor is legal, the split
-  /// runs off the end of `common` and confirms ALL of it, and the watermark
-  /// necessarily does move -- Rule W's first postcondition puts it strictly past
-  /// the settled high
+  /// Not an edge case: it is the ordinary steady state of a stream whose rounds
+  /// re-agree on exactly `agreement_count_needed` words and hold all of them.
+  /// Strides 7 and 9 of the shipping
+  /// `jfk_simulated_stream_confirms_the_transcript` fixture land here on the
+  /// real tiny model, and `the_split_never_cuts_at_a_tied_start`'s 512-trial
+  /// sweep asserts a live count over its 4233 rounds — 1281 of the 2965
+  /// agreeing ones at this commit.
+  ///
+  /// **Reporting this as progress is what a caller cannot recover from**, which
+  /// is why it is a value rather than a footnote. On the worst shape this module
+  /// documents — the permanently-backwards tail whose confirmation the prefill
+  /// budget alone bounds — 110 of 120 rounds are this one
+  /// (`a_permanently_backwards_tail_confirms_at_the_budget_rather_than_holding_forever`),
+  /// and a stall watchdog keyed on a single agreed-and-kept outcome sees 110
+  /// consecutive reports of progress across a stream that made none.
+  ///
+  /// # What is NOT a progress channel
+  ///
+  /// [`LocalAgreement::last_agreed_words_slice`] — the holdback — may change on
+  /// a `Stationary` round, and does so routinely: every advance replaces it
+  /// wholesale with `common[split..]` carrying THIS hypothesis's timings, so a
+  /// stream re-agreeing on the same two words forever churns it every round.
+  /// Counting that as progress is exactly how the stall stays invisible, so it
+  /// is deliberately excluded. The two channels this variant is decided by are
+  /// the SETTLED ones — the watermark a caller's next clip is cut at, and the
+  /// append-only confirmed prefix it has already been handed. The holdback is
+  /// provisional by construction.
+  ///
+  /// # A zero split is necessary for this, and NOT sufficient
+  ///
+  /// An advance confirms `common[..split]` and holds the rest, so a split of
+  /// ZERO confirms nothing and leaves
+  /// [`LocalAgreement::confirmed_words_slice`] unchanged. That half is a
+  /// property of the split alone. **The watermark half is not, and a doc on this
+  /// enum claimed it was.** The watermark is RECOMPUTED on every advance from
+  /// THIS round's own timings:
+  /// [`find_longest_common_prefix`] matches on normalized TEXT and returns a
+  /// slice of the NEW hypothesis, so with a zero split the anchor is the new
+  /// hypothesis's start for the first held-back word — not the previous round's
+  /// — and `sparing_watermark` folds it against that same hypothesis's other
+  /// unconfirmed starts. A re-decode that shifts those timings moves the
+  /// watermark with the split still at zero.
+  ///
+  /// The shipping JFK fixture is the disproof: `confirmed` sits at 3 from stride
+  /// 3 through stride 9, so every advance from stride 4 on splits at zero — yet
+  /// the watermark walks 1.36 → 1.38 → 1.40 → 1.42 and later 1.42 → 1.44. Only
+  /// strides 7 and 9 hold still.
+  /// `an_agreeing_round_with_a_zero_split_and_drifting_timings_progresses` pins
+  /// the moving case hermetically, against
+  /// `an_agreeing_round_that_moves_nothing_reports_stationary` for the still one
+  /// — the two differ by one word's start and by nothing else.
+  ///
+  /// So this variant is reached where the recomputed watermark is bit-identical
+  /// to its prior value, which is a fact about the RESULT of the advance and not
+  /// about its split. The other direction does hold, and is what bounds the
+  /// state: a split ABOVE zero always moves the watermark, because every word of
+  /// `common` cleared the old watermark (`watermark_filtered`), so confirming
+  /// one raises `highest_start(confirmed_words)` to at least it, and Rule W's
+  /// first postcondition then puts the new watermark strictly past that. The
+  /// EXHAUSTED-BUDGET arm is the far end of the same statement: the split runs
+  /// off the end of `common` and confirms ALL of it, and the watermark
+  /// necessarily moves
   /// (`a_forced_empty_holdback_retracts_its_suffix_at_the_settled_instant`).
-  /// A stuck watermark is the ZERO split, not the full one.
-  Advanced,
+  Stationary,
   /// The round did not agree. Two routes reach it: there is no previous result
   /// to agree with yet (the first ingested result), or the new hypothesis
   /// disagreed with the previous one, in which case the result was dropped
-  /// rather than kept. The watermark is unchanged on both.
+  /// rather than kept. The watermark is unchanged on both, and so is the
+  /// confirmed prefix — no advance ran.
   ///
-  /// **What separates this from [`Self::Advanced`] is agreed-and-kept versus
-  /// NOT agreed -- not whether the watermark moved.** An unchanged watermark
-  /// does not tell the two apart, because `Advanced` leaves it bit-identical
-  /// too whenever its split confirms nothing (see there for the measurement).
-  /// This doc asserted the opposite -- "two hypotheses that AGREE always advance
-  /// the watermark" -- and the shipping JFK fixture falsifies it on 2 of its 9
-  /// agreeing strides.
+  /// **What separates this from [`Self::Progressed`] and [`Self::Stationary`] is
+  /// agreed-and-kept versus NOT agreed.** An unchanged watermark does not tell
+  /// it from `Stationary`, which leaves the watermark bit-identical too; what
+  /// tells them apart is that a `Stationary` round's result was KEPT and fed
+  /// `LocalAgreement::finalize`, and a disagreeing round's was dropped.
   ///
-  /// A third route -- an agreeing round that DEFERRED rather than advancing --
+  /// A third route — an agreeing round that DEFERRED rather than advancing —
   /// existed on this branch between `6987bec` and `b3ec5c6` and was removed on
   /// measured evidence (#94; see this module's doc, "Why there is no
   /// deferral"). That removal is why every agreeing round now reaches
-  /// `Advanced`; it was never what would have made `Advanced` mean progress.
+  /// `Progressed` or `Stationary`; it was never what would have made an
+  /// agreeing outcome mean progress.
   AwaitingAgreement,
   /// The result carried no word timings to agree over; it was still kept
-  /// (Swift `:403-409` falls through to the unconditional append).
+  /// (Swift `:403-409` falls through to the unconditional append). No advance
+  /// ran, so the watermark and the confirmed prefix are both unchanged.
   NoWordTimings,
 }
 
@@ -697,10 +759,32 @@ impl AgreementOutcome {
   #[inline(always)]
   pub const fn as_str(&self) -> &'static str {
     match self {
-      Self::Advanced => "advanced",
+      Self::Progressed => "progressed",
+      Self::Stationary => "stationary",
       Self::AwaitingAgreement => "awaiting_agreement",
       Self::NoWordTimings => "no_word_timings",
     }
+  }
+
+  /// Whether the round AGREED and its result was therefore KEPT — true for
+  /// [`Self::Progressed`] and [`Self::Stationary`] alike, false for the other
+  /// two.
+  ///
+  /// This is the question the single `Advanced` variant used to answer, and it
+  /// is kept as a predicate rather than dropped because it is a real and
+  /// separate question from progress: `finalize` folds in every kept result, so
+  /// a `Stationary` round contributed to the transcript even though it moved
+  /// nothing. What it must NOT be used for is deciding that something advanced —
+  /// that is `is_progressed()`.
+  ///
+  /// It is not the KEPT predicate. [`Self::AwaitingAgreement`] covers two
+  /// routes, and the first-ever result reaches it and IS kept
+  /// (`TranscribeCLI.swift:408-410`, `!skipAppend`); only the disagreeing route
+  /// drops one. Whether a result was kept is therefore not a function of this
+  /// value, and reading `!agreed()` as "dropped" is wrong on the first round.
+  #[inline(always)]
+  pub const fn agreed(&self) -> bool {
+    matches!(self, Self::Progressed | Self::Stationary)
   }
 }
 
@@ -1038,7 +1122,8 @@ impl LocalAgreement {
   ///   [`Self::confirmed_words_slice`], `common[split..]` becomes the new
   ///   [`Self::last_agreed_words_slice`], a new [`Self::last_agreed_seconds`]
   ///   is drawn, `result` is kept, and this returns
-  ///   [`AgreementOutcome::Advanced`] (`:383-394`). Otherwise the hypotheses
+  ///   [`AgreementOutcome::Progressed`] or [`AgreementOutcome::Stationary`]
+  ///   (`:383-394`) — see below for which. Otherwise the hypotheses
   ///   disagree: the watermark is unchanged, `result` is **dropped** rather
   ///   than kept (`:395-400`, `skipAppend`), and this returns
   ///   [`AgreementOutcome::AwaitingAgreement`].
@@ -1050,9 +1135,14 @@ impl LocalAgreement {
   ///   that count, and `sparing_watermark` lowers that first held start to
   ///   spare every word this round left unconfirmed — over an anchor
   ///   `empty_holdback_anchor` supplies where the split empties the holdback.
-  ///   That is why [`AgreementOutcome::Advanced`] reports agreed-and-kept and
-  ///   NOT a moved watermark: a `split` of `0` confirms nothing and leaves
-  ///   [`Self::last_agreed_seconds`] bit-identical — measured there.
+  ///
+  ///   Which of the two agreeing outcomes an advance reports is decided by
+  ///   COMPARING observed state across it — [`Self::last_agreed_seconds`] by
+  ///   bits and [`Self::confirmed_words_slice`] by length, read before and after
+  ///   — and never by testing the split. A zero split confirms nothing, but the
+  ///   watermark is redrawn from THIS hypothesis's timings and moves whenever
+  ///   they drift, so `split == 0` does not decide it either way; see
+  ///   [`AgreementOutcome::Stationary`].
   ///
   /// Either way — agreeing, disagreeing, or no previous result — `result`
   /// becomes the new previous result for the next call (`:402`, outside
@@ -1093,11 +1183,33 @@ impl LocalAgreement {
       return AgreementOutcome::NoWordTimings;
     }
 
+    // THE PROGRESS BASELINE, read before anything below can move it. What
+    // separates `Progressed` from `Stationary` is measured against these two
+    // and nothing else.
+    //
+    // NOT `split != 0`, which is the reading this replaced and the one that made
+    // the signal dishonest in the other direction as well. A zero split confirms
+    // nothing, but the watermark is REDRAWN from this hypothesis's own timings
+    // every advance -- `find_longest_common_prefix` agrees on normalized text
+    // and hands back a slice of the NEW hypothesis -- so a re-decode that shifts
+    // them moves the watermark at split 0. Strides 4, 5, 6 and 8 of the shipping
+    // `jfk_simulated_stream_confirms_the_transcript` fixture do exactly that:
+    // three confirmed words either side, and a watermark that moves anyway.
+    // Comparing the state the caller reads is the only formulation that is right
+    // on both zero-split cases.
+    //
+    // `to_bits` rather than `==`: the seconds a caller sees are the whole of the
+    // watermark, and two starts 0.02 s apart round to the same two decimals in a
+    // log while being different f32s. A comparison that rounds would report a
+    // stall that is not one.
+    let watermark_before = self.last_agreed_seconds.to_bits();
+    let confirmed_before = self.confirmed_words.len();
+
     // :372 verbatim — see `watermark_filtered`, and Rule W below for why the
     // bare filter is sound.
     self.hypothesis_words = Self::watermark_filtered(&result, self.last_agreed_seconds);
 
-    let mut advanced = false;
+    let mut agreed = false;
     let mut skip_append = false;
     // :374 — absent on the first-ever call, so nothing below runs and
     // this falls through to the `AwaitingAgreement` append below.
@@ -1182,7 +1294,7 @@ impl LocalAgreement {
           settled_high.unwrap_or(f32::NEG_INFINITY),
           &self.hypothesis_words[split..],
         );
-        advanced = true;
+        agreed = true;
       } else {
         // :395-400 — disagreement; `result` is dropped below.
         skip_append = true;
@@ -1205,10 +1317,19 @@ impl LocalAgreement {
       self.results.push(result);
     }
 
-    if advanced {
-      AgreementOutcome::Advanced
+    if !agreed {
+      return AgreementOutcome::AwaitingAgreement;
+    }
+    // `!=` rather than `>` on the length: `confirmed_words` is only ever
+    // extended, so the two are the same test here, and "changed" is the question
+    // being asked. Bits rather than value on the watermark, for the reason
+    // recorded at the baseline above.
+    if self.last_agreed_seconds.to_bits() == watermark_before
+      && self.confirmed_words.len() == confirmed_before
+    {
+      AgreementOutcome::Stationary
     } else {
-      AgreementOutcome::AwaitingAgreement
+      AgreementOutcome::Progressed
     }
   }
 
