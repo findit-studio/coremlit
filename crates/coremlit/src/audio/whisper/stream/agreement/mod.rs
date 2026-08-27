@@ -59,16 +59,40 @@
 //!   centisecond rounding; ties are pipeline-reachable) is pulled back in and
 //!   confirmed AGAIN. This port keeps Swift's filter verbatim and closes the
 //!   hole at its SOURCE instead: an advance refuses to put the watermark at a
-//!   word whose start ties the confirmed one in front of it, widening past the
-//!   tie rather than cutting the clip boundary INSIDE a span already settled
-//!   (see the Rule W comment at `LocalAgreement::ingest`'s advance).
+//!   word whose start ties the confirmed one in front of it, cutting the clip
+//!   boundary INSIDE a span already settled (see `split_at_a_strict_boundary`).
 //!
-//!   **Postcondition** — whenever [`LocalAgreement::last_agreed_words_slice`] is
-//!   non-empty, `confirmed_words.last().start() < last_agreed_seconds`
-//!   STRICTLY, so the LAST confirmed word cannot satisfy the offered filter's
-//!   own `start >= watermark` and cannot head a hypothesis. The re-admission
-//!   question is then unrepresentable rather than defended against. Adjudicated:
-//!   Swift shares the bug, and "confirmed once and stable" wins over parity here.
+//!   **Postcondition (TOTAL)** — after every advance,
+//!   `confirmed_words.last().start() < last_agreed_seconds` STRICTLY, with no
+//!   condition on the holdback, so the LAST confirmed word cannot satisfy the
+//!   offered filter's own `start >= watermark` and cannot head a hypothesis. The
+//!   re-admission question is unrepresentable rather than defended against.
+//!   Adjudicated: Swift shares the bug, and "confirmed once and stable" wins
+//!   over parity here.
+//!
+//!   Two things carry it, and they are separable. `split_at_a_strict_boundary`
+//!   puts an INTERIOR split only on a boundary whose preceding word starts
+//!   strictly earlier — searching forward from the requested split first, then
+//!   BACKING OFF when the forward search would run off the end of `common`,
+//!   because widening past a tied run that reaches that end would empty the
+//!   holdback and anchor the watermark on the run's own last word. And where the
+//!   holdback is empty anyway — the prefill budget is the only thing that can
+//!   still do that — `LocalAgreement::ingest` anchors the watermark at
+//!   `end.max(start.next_up())` rather than at `end`, since `end == start` for a
+//!   zero-duration word. `next_up` is the IMMEDIATE f32 successor: it refuses
+//!   exactly the one instant the confirmed word occupies and no span of
+//!   instants, which an `end + epsilon` tolerance would not have managed.
+//!
+//!   The first shape of this rule widened unconditionally and left the empty
+//!   holdback anchored at `end`, which put the ORIGINAL duplicate-confirmation
+//!   defect back on the DEFAULT driver path: two ingests of one hypothesis whose
+//!   agreed prefix ends in a zero-duration tied run confirmed that whole run,
+//!   emptied the holdback, and re-confirmed the run on every later stride
+//!   without bound (codex round 1 on PR #95;
+//!   `a_trailing_tied_run_never_confirms_itself_twice_at_the_default_count`).
+//!   The lesson is recorded with it: the patch had covered the ROUTE to that
+//!   state (an over-budget word) and not the STATE, and the property test's own
+//!   shape skipped the state, which read as coverage.
 //!
 //!   It is a claim about the LAST confirmed word, and that is as strong as it
 //!   needs to be exactly while word starts inside one hypothesis are
@@ -83,11 +107,14 @@
 //!   words come from `add_word_timestamps`. It is one more thing the seal below
 //!   is holding up, and one more reason the grep gate exists.
 //!
-//!   **[BEHAVIOUR CHANGE]** the rule confirms one word EARLIER on a tied input,
-//!   trading one round of revisability for a clip boundary that does not bisect
-//!   a settled span — the same trade `budgeted_split` already makes, and
-//!   [`LocalAgreement::agreement_count_needed`] becomes a maximum slightly more
-//!   often. **Trigger:** two adjacent agreed words with equal `start`. On words
+//!   **[BEHAVIOUR CHANGE]** the rule confirms one word EARLIER on a tied input
+//!   the forward search clears, trading one round of revisability for a clip
+//!   boundary that does not bisect a settled span — the same trade
+//!   `budgeted_split` already makes — and holds one word LONGER where it has to
+//!   back off instead. So [`LocalAgreement::agreement_count_needed`] is a target
+//!   rather than an exact width in either direction: the budget can shorten the
+//!   holdback and the back-off can lengthen it. **Trigger:** two adjacent agreed
+//!   words with equal `start`. On words
 //!   this crate's own pipeline produces that requires a ZERO-DURATION word:
 //!   `find_alignment` guarantees `w[i].end() <= w[i + 1].start() + 1e-4`
 //!   (pinned in `crate::audio::whisper::segment`'s tests), so
@@ -149,8 +176,12 @@
 //!   between two consecutive hypotheses and is append-only.
 //!
 //!   That split runs all the way to `common.len()` when it has to, so **an
-//!   advance can leave the holdback EMPTY** and the watermark anchored at the
-//!   last confirmed word's end instead of the first held one's start. It has to:
+//!   advance can leave the holdback EMPTY** and the watermark anchored on the
+//!   last confirmed word's own far edge instead of the first held one's start.
+//!   The BUDGET is now the only thing that can do that — Rule W's own widening
+//!   backs off rather than empties (see `split_at_a_strict_boundary`) — and the
+//!   anchor is `end.max(start.next_up())`, so a zero-duration word there is
+//!   still strictly behind the watermark. It has to:
 //!   stopping while one word remained left a single word whose OWN tokens exceed
 //!   the budget held anyway, and the cap silently did not cap (codex round 7,
 //!   finding 2). What followed was data loss rather than a stall — the next
@@ -161,9 +192,10 @@
 //!   possible and is no weaker a claim: `common` is the prefix two hypotheses
 //!   agreed on, and a word outside the prefill budget is one no third hypothesis
 //!   decoded from that prefill could revise — see the widened-past entry above
-//!   for the qualifier that carries. Unreachable through
-//!   [`LocalAgreementTranscriber`], which never leaves
-//!   [`DEFAULT_AGREEMENT_COUNT_NEEDED`].
+//!   for the qualifier that carries. It costs one thing, recorded as this
+//!   module's residual 1: a genuinely NEW word beginning at the same instant a
+//!   zero-duration confirmed word occupies is filtered out with the
+//!   re-offer it cannot be told apart from.
 //! - **The final hypothesis's holdback** (Swift `:418-419`, `let final =
 //!   lastAgreedWords + findLongestDifferentSuffix(prevWords,
 //!   hypothesisWords)`). That decomposition is only valid when the LAST
@@ -227,7 +259,6 @@
 //!   [`InferenceBackend`] itself has no `Sync` supertrait either. This is
 //!   a correction against this task's own brief, which specified `B:
 //!   InferenceBackend + Sync` here.
-//!
 //! # The engine's mutating surface is `pub(crate)`
 //!
 //! [`LocalAgreement`] is `pub` and fully READABLE —
@@ -261,19 +292,23 @@
 //!
 //! # Residuals
 //!
-//! Stated with the sequence that reaches each, rather than claimed closed. The
-//! module makes no totality claim.
+//! Stated with the sequence that reaches each, rather than claimed closed. Rule
+//! W's postcondition IS total (see its entry above); the module claims no
+//! totality beyond it.
 //!
-//! 1. **An empty holdback leaves a zero-duration word AT the watermark.** With
-//!    nothing held back the watermark anchors at `common.last().end()` instead
-//!    of the first held word's start, and Rule W has no `common[split]` to
-//!    anchor against — so a word with `start == end` there satisfies the offered
-//!    filter and a re-decode can confirm it twice. Needs a non-default
+//! 1. **A new word at an empty holdback's own instant is DROPPED.** With nothing
+//!    held back the watermark is the last confirmed word's `end`, raised to
+//!    `start.next_up()` where that word has no duration — so a word the stream
+//!    genuinely produces at that same instant fails the offered filter and never
+//!    reaches a hypothesis. It cannot be helped: to a timestamp filter that word
+//!    and a re-offer of the settled one are the same value, which is the issue's
+//!    impossibility result, and the alternative is the unbounded
+//!    re-confirmation #94 is about. A truncation is what the portable prefix
+//!    property tolerates; a rewrite is not. Needs a non-default
 //!    [`LocalAgreement::agreement_count_needed`], a word whose own tokens exceed
-//!    [`MAX_HOLDBACK_PREFILL_TOKENS`], and a zero-duration word, simultaneously.
-//!    `an_empty_holdback_leaves_a_zero_duration_word_at_the_watermark`; the very
-//!    next advance repairs it
-//!    (`the_split_widens_past_a_tie_with_the_confirmed_list_itself`).
+//!    [`MAX_HOLDBACK_PREFILL_TOKENS`] (Rule W's own widening no longer empties
+//!    the holdback), and a zero-duration word, simultaneously.
+//!    `a_zero_duration_word_at_an_empty_holdback_is_not_re_confirmed`.
 //! 2. **A repeat the engine's record cannot account for** is the stream's own,
 //!    on the untied input — and on a TIED one Rule W deletes it instead. Both
 //!    directions are pinned:
@@ -525,8 +560,8 @@ impl LocalAgreement {
   /// Append-only across the life of the engine: nothing here is ever rewritten,
   /// reordered, or taken back, which is why the trailing words of an agreement
   /// wait in [`Self::last_agreed_words_slice`] instead. RULE W (see
-  /// `Self::ingest`'s advance) additionally guarantees that while that
-  /// holdback is non-empty, this list's last word starts STRICTLY before
+  /// `split_at_a_strict_boundary`) additionally guarantees, with no condition on
+  /// that holdback, that this list's last word starts STRICTLY before
   /// [`Self::last_agreed_seconds`] — so nothing here can be re-offered to the
   /// agreement comparison and confirmed a second time.
   #[inline(always)]
@@ -631,21 +666,20 @@ impl LocalAgreement {
   /// `result.allWords.filter { $0.start >= lastAgreedSeconds }`, with no strip,
   /// no scope and no alignment behind it.
   ///
-  /// It needs none. The watermark is the first held-back word's start, and
-  /// RULE W (see `Self::ingest`'s advance) refuses to put it at a word whose
-  /// start ties the confirmed one in front of it — so whenever there is a
-  /// holdback at all, `confirmed_words.last().start() < last_agreed_seconds`
-  /// STRICTLY and no confirmed word can pass this filter. The re-admission the
+  /// It needs none. RULE W (see `split_at_a_strict_boundary`) refuses to put the
+  /// watermark at a start already settled — so `confirmed_words.last().start() <
+  /// last_agreed_seconds` STRICTLY after every advance, with no condition on the
+  /// holdback, and no confirmed word can pass this filter. The re-admission the
   /// issue is about is unrepresentable rather than detected, which is why this
   /// is the Swift line and not a rule.
   ///
   /// What it deliberately leaves is the same short list the postcondition
-  /// bounds, recorded in this module's doc and each with a named test:
-  /// a repeat the engine's record cannot account for is read as the stream's
-  /// own; an empty holdback anchors the watermark at the last confirmed word's
-  /// END, so a zero-duration word there can still tie it; and a re-decode free
-  /// to move every timestamp it emits can push a settled word past the
-  /// watermark, where it reads as new speech.
+  /// bounds, recorded in this module's doc and each with a named test: a repeat
+  /// the engine's record cannot account for is read as the stream's own; a word
+  /// the stream genuinely produces at an empty holdback's own instant is
+  /// filtered out with the re-offer it cannot be told apart from; and a
+  /// re-decode free to move every timestamp it emits can push a settled word
+  /// past the watermark, where it reads as new speech.
   fn watermark_filtered(result: &TranscriptionResult, watermark: f32) -> Vec<WordTiming> {
     result
       .all_words()
@@ -742,74 +776,47 @@ impl LocalAgreement {
       if common.len() >= self.agreement_count_needed {
         // :383-394 — advance the watermark.
         let requested = common.len() - self.agreement_count_needed;
-        let mut split = budgeted_split(common, requested);
-        // RULE W -- THE SPLIT MAY NOT CUT AT A TIED START (#94, at its source).
-        //
-        // The watermark is the first held-back word's start, and it is also the
-        // CLIP this engine hands its own next decoder. Cutting at a word whose
-        // start TIES the last confirmed one puts that boundary INSIDE a span
-        // already settled: the confirmed word then satisfies the offered filter's
-        // own `start >= watermark`, and the next hypothesis can re-offer it at
-        // the head of its word list. That is the state every re-admission defence
-        // in this issue's history was built to survive -- and the one that cannot
-        // be decided from the offered list, because a re-offered settled word and
-        // the stream's own second occurrence of the same text are byte-identical
-        // there. Refuse to CREATE it: widen past the tie instead.
-        //
-        // Postcondition: whenever `last_agreed_words` is non-empty,
-        // `confirmed_words.last().start() < last_agreed_seconds` strictly, so no
-        // confirmed word can ever pass the offered filter again.
-        //
-        // The anchor is the word the watermark would be measured against: the
-        // last word the split has already moved past (`common[split - 1]`) when
-        // it has moved past anything, and otherwise the engine's own last
-        // confirmed word, which is what the watermark would then sit beside. It
-        // is carried forward through the loop, so a RUN of tied starts is
-        // cleared in one pass rather than one word of it.
-        //
-        // Composes with `budgeted_split` in one direction only, which is why it
-        // runs after it: widening can only SHRINK the holdback `common[split..]`,
-        // so the token budget it just established still holds, and its id-filter
-        // floor is likewise never re-crossed (see `budgeted_split`). Where the
-        // tie runs to the end of `common` the holdback empties and the watermark
-        // falls back to `common.last().end()`, which is at or past every start
-        // in it -- the postcondition is then vacuous, and the next advance
-        // re-seeds the anchor from the confirmed list.
-        let mut anchor = if split > 0 {
-          Some(common[split - 1].start())
-        } else {
-          self.confirmed_words.last().map(WordTiming::start)
-        };
-        while split < common.len() && anchor.is_some_and(|tied| tied >= common[split].start()) {
-          anchor = Some(common[split].start());
-          split += 1;
-        }
+        let split = split_at_a_strict_boundary(
+          common,
+          requested,
+          self.confirmed_words.last().map(WordTiming::start),
+        );
         // `common` REPLACES the still-open record: it is the span two consecutive
         // hypotheses have just re-agreed over it, and `last_agreed_words` is the
         // one this hypothesis has superseded.
         self.confirmed_words.extend_from_slice(&common[..split]);
         self.last_agreed_words = common[split..].to_vec();
-        // The watermark is the first held-back word's start -- except when the
-        // budget could hold NOTHING (see `budgeted_split`), where the still-open
-        // span begins where the confirmed one ends. `common` is non-empty here
-        // (its length is at least `agreement_count_needed`, clamped to at least
-        // one), so the final fallback is unreachable and only keeps this total.
-        // Monotone either way: every word of `common` starts at or past the old
-        // watermark, and `end >= start`.
+        // RULE W'S WATERMARK (#94). The watermark is the first held-back word's
+        // start, which `split_at_a_strict_boundary` has already placed STRICTLY
+        // past the last confirmed word's start.
         //
-        // That empty-holdback anchor is Rule W's one gap, and it is recorded as
-        // a residual rather than closed: `common.last().end()` can EQUAL
-        // `common.last().start()` for a zero-duration word, and the
-        // postcondition is then vacuous because there is no held-back word for
-        // it to speak about. Reaching it needs a non-default
-        // `agreement_count_needed`, a word whose own tokens exceed
-        // `MAX_HOLDBACK_PREFILL_TOKENS`, and a zero-duration word, all at once
-        // (`an_empty_holdback_leaves_a_zero_duration_word_at_the_watermark`).
+        // With NOTHING held back -- which only the prefill budget can now cause
+        // (see `split_at_a_strict_boundary`) -- there is no held word to measure
+        // against and the still-open span begins where the confirmed one ends.
+        // `end` is the answer whenever the last confirmed word has any duration
+        // at all; where it does NOT, `end == start` and the word would satisfy
+        // `watermark_filtered`'s own `start >= watermark` against its own
+        // confirmation, which is the whole of #94. The watermark is therefore the
+        // first instant that is strictly past that start: `next_up` is the
+        // IMMEDIATE f32 successor, so nothing representable lies between it and
+        // the start it excludes, and it is a successor rather than a tolerance --
+        // no span of instants is moved, only the single instant the confirmed
+        // word already occupies is refused.
+        //
+        // Monotone: every word of `common` starts at or past the old watermark,
+        // `end >= start` for any word the pipeline emits, and `next_up` only
+        // increases. A NaN start cannot break the postcondition either -- `max`
+        // returns the non-NaN side, and `start >= watermark` is false for a NaN
+        // start, so such a word is never offered back in the first place.
+        //
+        // `common` is non-empty here (its length is at least
+        // `agreement_count_needed`, clamped to at least one), so the final
+        // fallback is unreachable and only keeps this total.
         self.last_agreed_seconds = self.last_agreed_words.first().map_or_else(
           || {
-            common
-              .last()
-              .map_or(self.last_agreed_seconds, WordTiming::end)
+            common.last().map_or(self.last_agreed_seconds, |last| {
+              last.end().max(last.start().next_up())
+            })
           },
           WordTiming::start,
         );
@@ -927,6 +934,115 @@ impl LocalAgreement {
 // The confirmed/holdback split
 // ---------------------------------------------------------------------
 
+/// RULE W (#94, at its source): where an advance splits `common`, moved off any
+/// boundary that would put the watermark AT a start already settled.
+///
+/// The watermark is the first held-back word's start, and it is also the CLIP
+/// this engine hands its own next decoder. Cutting at a word whose start TIES
+/// the last confirmed one puts that boundary INSIDE a span already settled: the
+/// confirmed word then satisfies `LocalAgreement::watermark_filtered`'s own
+/// `start >= watermark`, and the next hypothesis can re-offer it at the head of
+/// its word list. That is the state every re-admission defence in this issue's
+/// history was built to survive -- and the one that cannot be DECIDED from the
+/// offered list, because a re-offered settled word and the stream's own second
+/// occurrence of the same text are byte-identical there. Refuse to CREATE it.
+///
+/// A split at `at` is legal exactly when the word that would then END the
+/// confirmed list starts STRICTLY before the word that would HEAD the holdback.
+/// At `at == 0` nothing of `common` is confirmed, so the preceding word is the
+/// engine's own last confirmed one -- the word the watermark would sit beside.
+/// That arm is provably never the blocking one: the postcondition below gives
+/// `confirmed.last().start() < last_agreed_seconds`, and every word of `common`
+/// cleared `start >= last_agreed_seconds` to be offered at all, so
+/// `confirmed.last().start() < common[0].start()` already. It is written as a
+/// CHECK rather than assumed so this function is correct on its own terms rather
+/// than on its caller's induction — but the proof is why it carries NO
+/// falsifier: replacing `confirmed_last_start` with `None` reds nothing in this
+/// crate, and no sequence through `LocalAgreement::ingest` can construct the
+/// state it guards, because that state IS the postcondition's negation. It was
+/// testable while the postcondition was conditional (through the empty-holdback
+/// residual, which the `next_up` anchor has since closed) and its test went with
+/// that state.
+///
+/// # Which legal boundary
+///
+/// `requested` (`common.len() - agreement_count_needed`) is where the split
+/// WANTS to be, and `budgeted_split`'s floor is where the prefill budget lets it
+/// be at the earliest. From `max(requested, floor)`:
+///
+/// 1. **Forward** to the first legal boundary. This confirms one word earlier
+///    than Swift on a tied input -- the [BEHAVIOUR CHANGE] recorded in this
+///    module's doc.
+/// 2. **Backward**, if there is no legal boundary at or after that point, to the
+///    LAST legal one still at or above the budget floor. Rule W may not empty
+///    the holdback: widening past a run that reaches the END of `common` would
+///    leave the watermark anchored at that run's own last word, which for a
+///    zero-duration word is that word's own start -- the very state this rule
+///    exists to refuse, re-entered from the other side (codex round 1 on PR #95;
+///    `a_trailing_tied_run_never_confirms_itself_twice_at_the_default_count`,
+///    where two ingests of ONE default-count hypothesis re-confirmed its whole
+///    tied tail on every later stride, without bound).
+///
+///    Backing off never fails for want of a boundary while the budget floor is
+///    `0`: `at == 0` is legal by the argument above, so a `common` that is one
+///    tied run from end to end is held WHOLE rather than confirmed, and the next
+///    stride -- which grows the hypothesis at its TAIL -- opens a boundary as
+///    soon as one word starts strictly later. This is NOT the blocking policy
+///    this issue's ledger refuted for deadlock: that one blocked on a predicate
+///    over the HEAD of the offered list, which only an advance can move, whereas
+///    this defers a split position that TAIL growth relieves, and it advances
+///    the holdback rather than refusing the round.
+/// 3. Only where the BUDGET FLOOR itself sits at or above every legal boundary
+///    is `common.len()` returned and the holdback left empty -- the floor is
+///    never crossed, because below it `prefill_tokens` silently truncates the
+///    prefill and the erased words are neither re-offered nor confirmed (codex
+///    round 7, finding 2). `LocalAgreement::ingest`'s watermark then anchors
+///    strictly past the last confirmed start rather than at its `end`.
+///
+/// So `agreement_count_needed` is a target rather than an exact width in EITHER
+/// direction: the budget can shorten the holdback (see `budgeted_split`) and
+/// this can lengthen it.
+///
+/// # Postcondition (TOTAL)
+///
+/// After every advance, `confirmed_words.last().start() < last_agreed_seconds`
+/// STRICTLY -- with no condition on the holdback. Where the split is interior
+/// the boundary above is exactly that inequality; where it is `common.len()`
+/// `LocalAgreement::ingest`'s `next_up` anchor is. So no confirmed word can pass
+/// the offered filter, and the re-admission question is unrepresentable rather
+/// than defended against.
+///
+/// It is a claim about the LAST confirmed word, and that is as strong as it needs
+/// to be exactly while word starts inside one hypothesis are non-decreasing --
+/// see this module's doc for the `find_alignment` guarantee that supplies it and
+/// for the backwards-starts input the `pub(crate)` seal excludes.
+fn split_at_a_strict_boundary(
+  common: &[WordTiming],
+  requested: usize,
+  confirmed_last_start: Option<f32>,
+) -> usize {
+  let strictly_after_the_preceding_start = |at: usize| {
+    let preceding = if at == 0 {
+      confirmed_last_start
+    } else {
+      Some(common[at - 1].start())
+    };
+    preceding.is_none_or(|preceding| preceding < common[at].start())
+  };
+  // `budgeted_split` with nothing requested IS the budget's own floor: the
+  // earliest split whose holdback fits `MAX_HOLDBACK_PREFILL_TOKENS`.
+  let floor = budgeted_split(common, 0);
+  let widened = requested.max(floor);
+  (widened..common.len())
+    .find(|&at| strictly_after_the_preceding_start(at))
+    .or_else(|| {
+      (floor..widened)
+        .rev()
+        .find(|&at| strictly_after_the_preceding_start(at))
+    })
+    .unwrap_or(common.len())
+}
+
 /// Where an advance splits `common` into the part that is CONFIRMED and the
 /// part that is HELD BACK, given the requested split — moved later until every
 /// word still held is one [`prefill_tokens`](crate::audio::whisper::decode::prefill_tokens)
@@ -987,11 +1103,19 @@ impl LocalAgreement {
 /// available and is exactly the argument above.
 ///
 /// Where the holdback comes back empty, `LocalAgreement::ingest` anchors the
-/// watermark at the last confirmed word's END rather than the first held word's
-/// start — see the anchor at its advance branch.
+/// watermark on the last confirmed word's own far edge — `end`, raised to
+/// `start.next_up()` where that word has no duration — rather than at the first
+/// held word's start; see the anchor at its advance branch.
 /// [`LocalAgreement::agreement_count_needed`] is then a maximum that reached
 /// zero for that round, the same way it becomes a maximum for any holdback the
 /// budget shortens.
+///
+/// Called with `requested == 0` this IS the budget's own FLOOR — the earliest
+/// split whose holdback fits at all. `split_at_a_strict_boundary` needs that
+/// value because its back-off moves the split EARLIER, and the floor is the one
+/// line it may not cross: below it `prefill_tokens` silently truncates and the
+/// erased words are neither re-offered nor confirmed, which is the whole of
+/// round 7's finding 2.
 ///
 /// **Documented deviation**: with `agreement_count_needed` at its
 /// [`DEFAULT_AGREEMENT_COUNT_NEEDED`] — the only value
@@ -1000,7 +1124,8 @@ impl LocalAgreement {
 /// two-word holdback is nowhere near 112 tokens and this is the identity. It
 /// bites only for a direct caller that raised
 /// [`LocalAgreement::agreement_count_needed`] far enough, and for that caller
-/// the count becomes a maximum rather than an exact width.
+/// the count becomes a maximum rather than an exact width. (Rule W's back-off
+/// moves it the other way for any caller — see `split_at_a_strict_boundary`.)
 fn budgeted_split(common: &[WordTiming], requested: usize) -> usize {
   let mut split = requested;
   let mut tokens: usize = common[split..]
@@ -1076,8 +1201,11 @@ impl<'ctx, B> LocalAgreementTranscriber<'ctx, B> {
   /// wholesale. Swift hardcodes `2` and never exposes the knob
   /// (`TranscribeCLI.swift:349`).
   ///
-  /// Raising it far enough makes [`MAX_HOLDBACK_PREFILL_TOKENS`] bite, and the
-  /// count becomes a MAXIMUM rather than an exact width — see `budgeted_split`.
+  /// It is a TARGET rather than an exact width in either direction: raising it
+  /// far enough makes [`MAX_HOLDBACK_PREFILL_TOKENS`] bite and the holdback
+  /// comes back SHORTER (see `budgeted_split`), while a tied run at the end of
+  /// an agreed prefix makes Rule W back its split off and the holdback comes
+  /// back LONGER (see `split_at_a_strict_boundary`).
   #[must_use]
   #[inline(always)]
   pub fn with_agreement_count_needed(mut self, agreement_count_needed: usize) -> Self {

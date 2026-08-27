@@ -382,9 +382,9 @@ fn omitting_a_confirmed_tied_word_does_not_drop_provisional_words() {
 
 #[test]
 fn the_split_never_cuts_at_a_tied_start() {
-  // RULE W's POSTCONDITION, swept rather than pinned to one fixture: whenever
-  // the holdback is non-empty, the last CONFIRMED word starts strictly before
-  // the watermark.
+  // RULE W's POSTCONDITION, swept rather than pinned to one fixture, and TOTAL:
+  // the last CONFIRMED word starts strictly before the watermark, with NO
+  // condition on the holdback.
   //
   // That inequality is the whole of #94. `watermark_filtered` offers every
   // hypothesis word whose `start >= watermark`, so a confirmed word that TIES
@@ -392,8 +392,20 @@ fn the_split_never_cuts_at_a_tied_start() {
   // hypothesis -- and there it is byte-identical to the stream's own second
   // occurrence of the same text, which is the issue's impossibility result.
   // Every defeated rule in this module's ledger tried to DECIDE that state.
-  // Rule W refuses to create it: the split widens past a tie instead of cutting
-  // at one, so the state is unreachable and needs no decision.
+  // Rule W refuses to create it: the split lands only on a boundary whose
+  // preceding word starts strictly earlier, and where no such boundary exists at
+  // or after the requested split it backs OFF rather than widening off the end.
+  //
+  // THE SHAPE THIS TEST USED TO HAVE SKIPPED THE EMPTY HOLDBACK, and the state
+  // it skipped is the one the property did not hold in: with nothing held back
+  // the watermark came from `common.last().end()`, which for a zero-duration
+  // word is that word's own start (codex round 1 on PR #95 -- the skip read as
+  // coverage). The postcondition is now asserted on EVERY observation with a
+  // non-empty confirmed list, and the sweep DRIVES the empty holdback rather
+  // than avoiding it: some trials raise the prefill cost of one word past
+  // `MAX_HOLDBACK_PREFILL_TOKENS`, which is the only thing that still empties
+  // the holdback, and `empty_holdbacks` below is the non-vacuity proof that it
+  // really happened.
   //
   // The sweep draws starts from a coarse grid whose repeats make consecutive
   // words tie -- the `a=[0,0.5)/b=[0,1.0)` shape both #94 regressions are built
@@ -405,9 +417,16 @@ fn the_split_never_cuts_at_a_tied_start() {
   // `omitting_a_confirmed_tied_word_does_not_drop_provisional_words` is built
   // from.
   //
-  // Mutation proof: drop Rule W's widening loop from `ingest` (leaving the bare
-  // `budgeted_split`) and this reds on the first swept tie, reporting the
-  // confirmed word whose start equals the watermark.
+  // Mutation proof: drop the `.max(last.start().next_up())` from `ingest`'s
+  // empty-holdback watermark and this reds on a swept over-budget zero-duration
+  // word; make the boundary non-strict (`<=` for `<` in
+  // `split_at_a_strict_boundary`) and it reds on a swept tie; let the back-off
+  // cross the prefill budget floor (`0..widened` for `floor..widened`) and it
+  // reds too. It does NOT red when the back-off arm is deleted outright: the
+  // `next_up` anchor still holds the postcondition on that path, which is why
+  // the back-off has its own falsifier in
+  // `a_trailing_tied_run_never_confirms_itself_twice_at_the_default_count`
+  // rather than being asserted here.
   const TEXTS: [&str; 4] = [" A", " B", " C", " D"];
   // Repeated 0.0 entries are the ties; the rest keep the grid coarse enough for
   // two words to share an instant often.
@@ -417,24 +436,24 @@ fn the_split_never_cuts_at_a_tied_start() {
   // between two distinct starts.
   const DURATIONS: [f32; 4] = [0.0, 0.2, 0.5, 1.0];
 
-  fn postcondition(agreement: &LocalAgreement, trial: u32, stride: usize) -> bool {
-    if agreement.last_agreed_words_slice().is_empty() {
-      return false;
-    }
-    let Some(last) = agreement.confirmed_words_slice().last() else {
-      return false;
-    };
+  /// `None` when nothing is confirmed yet and the postcondition has nothing to
+  /// speak about; otherwise `Some(the holdback was empty)`, which is the state
+  /// this test's earlier shape skipped.
+  fn postcondition(agreement: &LocalAgreement, trial: u32, stride: usize) -> Option<bool> {
+    let last = agreement.confirmed_words_slice().last()?;
     assert!(
       last.start() < agreement.last_agreed_seconds(),
       "trial {trial}, stride {stride}: the confirmed list {:?} ends on {:?} at \
        {}, which is not strictly before the {} s watermark -- that word passes \
-       `watermark_filtered`'s own `start >= watermark` and can be re-admitted",
+       `watermark_filtered`'s own `start >= watermark` and can be re-admitted. \
+       The holdback here is {:?}",
       confirmed_texts(agreement),
       last.word(),
       last.start(),
       agreement.last_agreed_seconds(),
+      held_back_texts(agreement),
     );
-    true
+    Some(agreement.last_agreed_words_slice().is_empty())
   }
 
   let mut state: u64 = 0x2545_F491_4F6C_DD1D;
@@ -445,17 +464,30 @@ fn the_split_never_cuts_at_a_tied_start() {
     state
   };
   let mut checked = 0u32;
+  let mut empty_holdbacks = 0u32;
   let mut tied_truths = 0u32;
 
   for trial in 0..256u32 {
     let length = 4 + (next() % 5) as usize;
+    // The prefill budget is the only thing that can still empty the holdback, so
+    // one word in some trials is made too expensive for it to carry -- and it is
+    // placed anywhere, including last, where the split runs to `common.len()`.
+    let over_budget = if next() % 3 == 0 {
+      Some((next() as usize) % length)
+    } else {
+      None
+    };
     let mut truth: Vec<WordTiming> = Vec::with_capacity(length);
     let mut start = 0.0f32;
-    for _ in 0..length {
+    for index in 0..length {
       let text = TEXTS[(next() % TEXTS.len() as u64) as usize];
       start += STEPS[(next() % STEPS.len() as u64) as usize];
       let end = start + DURATIONS[(next() % DURATIONS.len() as u64) as usize];
-      truth.push(word(text, start, end));
+      truth.push(if over_budget == Some(index) {
+        word_of_tokens(text, start, end, MAX_HOLDBACK_PREFILL_TOKENS + 1)
+      } else {
+        word(text, start, end)
+      });
     }
     if truth
       .windows(2)
@@ -464,7 +496,10 @@ fn the_split_never_cuts_at_a_tied_start() {
       tied_truths += 1;
     }
 
-    let mut agreement = LocalAgreement::new();
+    // Both counts the engine can be driven at: 1 makes every agreement an
+    // advance, 2 is the driver's own `DEFAULT_AGREEMENT_COUNT_NEEDED`.
+    let mut agreement =
+      LocalAgreement::new().with_agreement_count_needed(1 + (next() % 2) as usize);
     for stride in 2..=truth.len() {
       let omit_head = stride > 2 && next() % 4 == 0;
       let offered = if omit_head {
@@ -474,16 +509,18 @@ fn the_split_never_cuts_at_a_tied_start() {
       };
       for _ in 0..2 {
         agreement.ingest_streamed(result_with_words(offered.clone()));
-        if postcondition(&agreement, trial, stride) {
+        if let Some(empty) = postcondition(&agreement, trial, stride) {
           checked += 1;
+          empty_holdbacks += u32::from(empty);
         }
       }
     }
   }
 
-  // Non-vacuity, both halves: the sweep really did build tied truths, and the
-  // postcondition really was READ against a non-empty holdback and a non-empty
-  // confirmed list rather than skipped.
+  // Non-vacuity, all three halves: the sweep really did build tied truths, the
+  // postcondition really was READ against a non-empty confirmed list rather than
+  // skipped, and the EMPTY-HOLDBACK state -- the one the earlier shape of this
+  // test skipped, and the one #94 was re-opened from -- really was reached.
   assert!(
     tied_truths > 64,
     "the sweep must actually produce tied starts: {tied_truths} of 256 trials",
@@ -492,84 +529,109 @@ fn the_split_never_cuts_at_a_tied_start() {
     checked > 256,
     "the postcondition must actually be reachable: {checked} observations",
   );
+  assert!(
+    empty_holdbacks > 64,
+    "the postcondition must be read against an EMPTY holdback too, which is \
+     the state this test used to skip: {empty_holdbacks} of {checked} \
+     observations",
+  );
 }
-
 #[test]
-fn the_split_widens_past_a_tie_with_the_confirmed_list_itself() {
-  // RULE W's BASE CASE, which `the_split_never_cuts_at_a_tied_start`'s sweep
-  // cannot reach. When the split has moved past nothing (`split == 0`, i.e.
-  // `common.len() == agreement_count_needed` and the budget widened nothing),
-  // there is no `common[split - 1]` to anchor against and the rule falls back to
-  // the engine's own last CONFIRMED word -- the word the watermark would
-  // otherwise sit beside.
+fn a_trailing_tied_run_never_confirms_itself_twice_at_the_default_count() {
+  // #94, codex round 1 on PR #95 -- the ORIGINAL duplicate-confirmation defect,
+  // back on the DEFAULT driver path. Rule W's widening runs to `common.len()`
+  // whenever the agreed prefix ENDS in a tied run: the holdback empties, the
+  // watermark falls back to `common.last().end()`, and for a zero-duration word
+  // that EQUALS its own start -- so `watermark_filtered`'s `start >= watermark`
+  // re-admits it and every later stride confirms the whole run AGAIN.
   //
-  // The sweep never gets here because the fallback is inert while the
-  // postcondition already holds: `confirmed.last().start() < watermark` and
-  // every offered word starts at or past the watermark, so `anchor >=
-  // common[0].start()` is false by induction. The one state that breaks the
-  // induction is the documented residual
-  // (`an_empty_holdback_leaves_a_zero_duration_word_at_the_watermark`): with an
-  // EMPTY holdback the watermark anchors at `common.last().end()`, so a
-  // zero-duration word there leaves `confirmed.last().start() == watermark`, and
-  // the NEXT advance is the only place that can repair it.
+  // It needs neither an over-budget word nor a non-default
+  // `agreement_count_needed`, which is what separates it from the empty-holdback
+  // state `a_zero_duration_word_at_an_empty_holdback_is_not_re_confirmed` reaches
+  // through the prefill budget: two ingests of one four-word hypothesis whose
+  // last three words tie is enough.
   //
-  //   agreement_count_needed 1
-  //   ingest [A@0.0-1.0, Z@1.0-1.0 (over budget)] twice
-  //     -> confirmed [A, Z], holdback EMPTY, watermark 1.0 == Z's own start
-  //   ingest [W@1.0-2.0] twice
-  //     -> common [W], requested 0, budget widens nothing, so split == 0
-  //     -> the fallback sees Z@1.0 >= W@1.0 and widens to 1
+  // The repair has two separable halves and this test pins the SECOND. The
+  // watermark's `next_up` anchor (see
+  // `a_zero_duration_word_at_an_empty_holdback_is_not_re_confirmed`) is what
+  // closes the DUPLICATION: with it in place the re-offered run is filtered out
+  // even when the holdback is empty. The back-off is what keeps Rule W from
+  // emptying the holdback in the first place, so the tied run stays revisable,
+  // the next stride still gets a prefill anchor, and a genuinely new word at the
+  // run's own instant is not filtered away with it.
   //
-  // Mutation proof: seed the anchor with `None` instead of
-  // `self.confirmed_words.last().map(WordTiming::start)` and this reds -- the
-  // split stays at 0, `" W"` is held back at a 1.0 s watermark, and `" Z"` is
-  // left confirmed at exactly that instant, where it passes
-  // `watermark_filtered`'s own `start >= watermark` and can be re-admitted.
-  // Nothing else in this module reds with that mutation, which is why this test
-  // exists.
-  let a = || word(" A", 0.0, 1.0);
-  let zero = || word_of_tokens(" Z", 1.0, 1.0, MAX_HOLDBACK_PREFILL_TOKENS + 1);
-  let w = || word(" W", 1.0, 2.0);
-
-  let mut agreement = LocalAgreement::new().with_agreement_count_needed(1);
-  let opening = || result_with_words(vec![a(), zero()]);
-  agreement.ingest_streamed(opening());
-  assert!(agreement.ingest_streamed(opening()).is_advanced());
+  // Mutation proof: delete the back-off arm (the `.or_else(...)` in
+  // `split_at_a_strict_boundary`) and this reds -- `([" X", " A", " B", " C"],
+  // [], 2.0000002)` against `([" X"], [" A", " B", " C"], 2.0)`. Take the
+  // EARLIEST legal boundary instead of the latest (drop the `.rev()`) and it
+  // reds the other way, confirming nothing at all: `([], [" X", " A", " B",
+  // " C"], 0.0)`.
+  //
+  // Before either half existed, this read `[" X", " A", " B", " C", " A", " B",
+  // " C", " A", " B", " C"]` after the four ingests below, growing by the whole
+  // run on every further stride.
+  let hypothesis = || {
+    result_with_words(vec![
+      word(" X", 0.0, 1.0),
+      word(" A", 2.0, 2.0),
+      word(" B", 2.0, 2.0),
+      word(" C", 2.0, 2.0),
+    ])
+  };
+  let mut agreement = LocalAgreement::new();
+  assert_eq!(
+    agreement.agreement_count_needed(),
+    DEFAULT_AGREEMENT_COUNT_NEEDED,
+    "non-vacuous: the DEFAULT count, the only one the driver reaches",
+  );
+  agreement.ingest_streamed(hypothesis());
+  assert!(agreement.ingest_streamed(hypothesis()).is_advanced());
   assert_eq!(
     (
       confirmed_texts(&agreement),
-      agreement.last_agreed_words_slice().len(),
-      agreement.last_agreed_seconds()
+      held_back_texts(&agreement),
+      agreement.last_agreed_seconds(),
     ),
-    (vec![" A", " Z"], 0, 1.0),
-    "non-vacuous setup: the budget emptied the holdback and left the last \
-     confirmed word starting exactly at the watermark -- the only state from \
-     which the base case below has anything to repair",
+    (vec![" X"], vec![" A", " B", " C"], 2.0),
+    "Rule W may not empty the holdback: with no legal boundary at or after the \
+     requested split it backs off to the last one BEFORE the tied run, so the \
+     run stays provisional instead of being confirmed against a watermark that \
+     sits on its own start",
   );
 
-  // Two ingests: the first disagrees (so `prev_result` becomes this hypothesis
-  // without advancing), the second agrees with it on the single word " W".
-  let onward = || result_with_words(vec![w()]);
-  assert!(agreement.ingest_streamed(onward()).is_awaiting_agreement());
-  assert!(agreement.ingest_streamed(onward()).is_advanced());
+  // The re-decode reproduces the holdback and nothing else -- the exact shape
+  // `decoding_options_for_next` forces, clipped at the 2.0 s watermark.
+  let reproduction = || {
+    result_with_words(vec![
+      word(" A", 2.0, 2.0),
+      word(" B", 2.0, 2.0),
+      word(" C", 2.0, 2.0),
+    ])
+  };
+  agreement.ingest_streamed(reproduction());
+  agreement.ingest_streamed(reproduction());
   assert_eq!(
-    (confirmed_texts(&agreement), agreement.last_agreed_seconds()),
-    (vec![" A", " Z", " W"], 2.0),
-    "the split had moved past nothing, so Rule W anchored on the confirmed \
-     list itself and widened past the tie -- restoring the postcondition the \
-     empty-holdback watermark had broken",
+    (confirmed_texts(&agreement), held_back_texts(&agreement)),
+    (vec![" X"], vec![" A", " B", " C"]),
+    "and NO stride re-confirms the run: the reproduction offers nothing that \
+     starts strictly later, so the same back-off holds it exactly once",
   );
-  let last = agreement
-    .confirmed_words_slice()
-    .last()
-    .expect("the confirmed list is non-empty");
-  assert!(
-    last.start() < agreement.last_agreed_seconds(),
-    "the postcondition is repaired: {:?} starts at {} against a {} s watermark",
-    last.word(),
-    last.start(),
-    agreement.last_agreed_seconds(),
+  let text = agreement
+    .finalize(&crate::audio::whisper::options::DecodingOptions::new())
+    .text()
+    .to_string();
+  assert_eq!(
+    text, " X A B C",
+    "and the finalized face agrees with the streaming one -- the holdback the \
+     back-off kept is still emitted, so nothing is lost by holding it",
   );
+  for token in ["X", "A", "B", "C"] {
+    assert_eq!(
+      text.matches(token).count(),
+      1,
+      "{token} must appear exactly once in {text:?}"
+    );
+  }
 }
 
 #[test]
@@ -1262,6 +1324,17 @@ fn a_stutter_at_the_watermark_keeps_both_occurrences() {
     " A A B",
     "both stuttered A's are the hypothesis's own words, not a re-admission",
   );
+}
+
+/// `last_agreed_words_slice()` as text -- the still-provisional half of the
+/// streaming face, asserted beside `confirmed_texts` wherever a word could be in
+/// one list rather than the other.
+fn held_back_texts(agreement: &LocalAgreement) -> Vec<&str> {
+  agreement
+    .last_agreed_words_slice()
+    .iter()
+    .map(WordTiming::word)
+    .collect()
 }
 
 /// `confirmed_words_slice()` as text — the face a streaming caller reads
@@ -2175,30 +2248,32 @@ fn the_prefill_reaches_decode_text_as_the_whole_holdback() {
 }
 
 #[test]
-fn an_empty_holdback_leaves_a_zero_duration_word_at_the_watermark() {
-  // RULE W's ONE RESIDUAL, characterized rather than closed. The postcondition
-  // -- `confirmed.last().start() < last_agreed_seconds` strictly -- is a claim
-  // about a NON-EMPTY holdback, because the watermark is then the first held
-  // word's start and the rule widens past any tie with it. When
-  // `budgeted_split` empties the holdback the watermark falls back to
-  // `common.last().end()` instead, and Rule W has no `common[split]` to anchor
-  // against: if that last word has `start == end` the watermark EQUALS its
-  // start, the word passes `watermark_filtered`'s own `start >= watermark`, and
-  // a re-decode that offers it back -- with no holdback, so no prefill to
-  // displace it -- confirms it a SECOND time.
+fn a_zero_duration_word_at_an_empty_holdback_is_not_re_confirmed() {
+  // RULE W'S POSTCONDITION ON THE ONE PATH THAT STILL EMPTIES THE HOLDBACK.
+  // With nothing held back there is no held word to measure the watermark
+  // against, so `ingest` anchors it at the last confirmed word's END -- and for
+  // a ZERO-DURATION word that is its own START, which used to leave it passing
+  // `watermark_filtered`'s `start >= watermark` against its own confirmation and
+  // being confirmed a SECOND time (#94 residual 1, characterized here until
+  // codex round 1 on PR #95 found the same state on the default path).
   //
-  // Reaching it needs three things at once, and the driver supplies none of
-  // them: a non-default `agreement_count_needed` (here 1), a word whose OWN
-  // tokens exceed `MAX_HOLDBACK_PREFILL_TOKENS` so the split runs to
-  // `common.len()`, and a ZERO-DURATION word in that position.
-  // `LocalAgreementTranscriber` never leaves `DEFAULT_AGREEMENT_COUNT_NEEDED`,
-  // and `add_word_timestamps` never emits a 112-token word.
+  // Closed, not characterized: the watermark is `end.max(start.next_up())`, the
+  // first instant strictly past the settled start. `next_up` is the IMMEDIATE
+  // f32 successor, so no representable instant lies between it and the start it
+  // excludes -- it refuses exactly one instant rather than moving a cliff, which
+  // is what an `end + epsilon` tolerance would have done.
   //
-  // Recorded, not repaired: the alternatives are anchoring the empty-holdback
-  // watermark at `end + epsilon` (a threshold with the same cliff one instant
-  // further on, and one that makes the watermark a value no word's `start` ever
-  // equals) or refusing the advance (the blocking policy this issue's ledger
-  // already refuted for deadlock).
+  // Only the PREFILL BUDGET can reach this state now. Rule W's own widening no
+  // longer empties the holdback (it backs off instead --
+  // `a_trailing_tied_run_never_confirms_itself_twice_at_the_default_count`), and
+  // the back-off may not cross the budget floor, which here sits at
+  // `common.len()`: `" Z"` alone exceeds `MAX_HOLDBACK_PREFILL_TOKENS`, so there
+  // is nothing the prefill could carry whole (codex round 7, finding 2). It also
+  // needs a non-default `agreement_count_needed` (here 1) and a zero-duration
+  // word; `add_word_timestamps` never emits a 112-token word.
+  //
+  // Mutation proof: drop the `.max(last.start().next_up())` from `ingest`'s
+  // empty-holdback watermark and this reds with `" Z"` confirmed twice.
   let a = || word(" A", 0.0, 1.0);
   let zero = || word_of_tokens(" Z", 1.0, 1.0, MAX_HOLDBACK_PREFILL_TOKENS + 1);
   let b = || word(" B", 1.0, 2.0);
@@ -2211,46 +2286,59 @@ fn an_empty_holdback_leaves_a_zero_duration_word_at_the_watermark() {
     (
       confirmed_texts(&agreement),
       agreement.last_agreed_words_slice().len(),
-      agreement.last_agreed_seconds()
     ),
-    (vec![" A", " Z"], 0, 1.0),
-    "non-vacuous: the budget emptied the holdback, so the watermark is \
-     \" Z\"'s END -- which for a zero-duration word is also its START",
+    (vec![" A", " Z"], 0),
+    "non-vacuous: the budget could hold nothing back, so this is the \
+     empty-holdback watermark rather than a held word's start",
   );
   assert_eq!(
-    agreement
-      .confirmed_words_slice()
-      .last()
-      .map(WordTiming::start),
-    Some(agreement.last_agreed_seconds()),
-    "the postcondition is VACUOUS here: with no held-back word the last \
-     confirmed word's start EQUALS the watermark instead of preceding it",
+    agreement.last_agreed_seconds(),
+    1.0f32.next_up(),
+    "and \" Z\"'s own END is 1.0, so `end` alone would have put the watermark \
+     on \" Z\"'s own start",
+  );
+  let last_confirmed_start = agreement
+    .confirmed_words_slice()
+    .last()
+    .map(WordTiming::start)
+    .expect("the confirmed list is non-empty");
+  assert!(
+    last_confirmed_start < agreement.last_agreed_seconds(),
+    "the postcondition is TOTAL: {last_confirmed_start} is strictly before the \
+     {} s watermark even with an empty holdback",
+    agreement.last_agreed_seconds(),
   );
 
   // The re-decode offers " Z" back at the head of its word list. Nothing
   // displaces it: the holdback is empty, so `decoding_options_for_next` attaches
   // an empty prefix and the decoder was never fed a reproduction to begin with.
-  //
-  // One ingest is enough: the previous hypothesis already contributed " Z" at
-  // this watermark, so the pair agrees on it immediately.
+  // The watermark is the only thing standing between " Z" and a second
+  // confirmation, and it now does stand there.
   assert!(
     agreement
       .ingest_streamed(result_with_words(vec![zero(), b()]))
-      .is_advanced()
+      .is_awaiting_agreement()
   );
   assert_eq!(
     confirmed_texts(&agreement),
-    vec![" A", " Z", " Z"],
-    "CHARACTERIZATION (https://github.com/findit-studio/coremlit/issues/94, \
-     residual 1): the CORRECT answer is [\" A\", \" Z\"] -- \" Z\" is one word \
-     the stream produced once and it reaches the confirmed list twice. Rule W \
-     cannot help: it widens the split past a tie with `common[split]`, and here \
-     the split ran to `common.len()` so there is no `common[split]` to widen \
-     past. If this state is ever closed, assert [\" A\", \" Z\"] and delete this \
-     message.",
+    vec![" A", " Z"],
+    "\" Z\" is one word the stream produced once and it reaches the confirmed \
+     list once",
+  );
+  assert_eq!(
+    agreement
+      .finalize(&crate::audio::whisper::options::DecodingOptions::new())
+      .text(),
+    " A Z",
+    "COST, recorded as this rule's residual: \" B\" is a genuinely NEW word \
+     that begins at the same instant the zero-duration \" Z\" occupies, and no \
+     watermark can admit it while refusing \" Z\" -- the two are byte-identical \
+     to a timestamp filter. It is dropped. The trade is the module's own \
+     adjudicated bias applied to the evidence: an unbounded re-confirmation \
+     REWRITES the confirmed text and breaks the portable prefix property, while \
+     this leaves a truncation, which that property tolerates.",
   );
 }
-
 #[test]
 fn an_overlapping_agreed_word_is_confirmed_on_the_mainline_path_too() {
   // #94 (codex round 13, finding 1), REFUTED RATHER THAN FIXED, and this is the
