@@ -625,7 +625,7 @@ mod tests;
 // ---------------------------------------------------------------------
 
 /// One `LocalAgreement::ingest` call's outcome — whether the new result
-/// advanced the confirmation watermark, merely awaits a future result to
+/// AGREED with the previous one and was kept, merely awaits a future result to
 /// agree with, or carried no word timings to agree over at all. Swift
 /// expresses these same three outcomes as local bookkeeping (`skipAppend`,
 /// the no-words `else` branch) rather than a value
@@ -857,9 +857,11 @@ impl LocalAgreement {
   }
 
   // -- last_agreed_words (Vec<WordTiming>) -----------------------------------
-  /// The most recent agreement's trailing [`Self::agreement_count_needed`]
-  /// words — held back from [`Self::confirmed_words_slice`] since a
-  /// still-later hypothesis could yet revise them.
+  /// The most recent agreement's holdback, `common[split..]` — held back from
+  /// [`Self::confirmed_words_slice`] since a still-later hypothesis could yet
+  /// revise them. [`Self::agreement_count_needed`] words is what it TARGETS,
+  /// not what it has: Rule W can leave it longer and the prefill budget
+  /// shorter, down to empty (`split_at_a_strict_boundary`).
   #[inline(always)]
   pub const fn last_agreed_words_slice(&self) -> &[WordTiming] {
     self.last_agreed_words.as_slice()
@@ -867,7 +869,7 @@ impl LocalAgreement {
 
   // -- confirmed_words (Vec<WordTiming>) -------------------------------------
   /// Word timings settled so far: every agreement's leading remainder, ahead of
-  /// that agreement's own [`Self::agreement_count_needed`]-word holdback.
+  /// that agreement's own [`Self::last_agreed_words_slice`] holdback.
   ///
   /// Append-only across the life of the engine: nothing here is ever rewritten,
   /// reordered, or taken back, which is why the trailing words of an agreement
@@ -1031,16 +1033,26 @@ impl LocalAgreement {
   /// - With a previous result, its own `all_words()` (filtered the same
   ///   way, `:375`) and the new hypothesis feed
   ///   [`crate::audio::whisper::text::find_longest_common_prefix`] (`:376`). A common
-  ///   prefix at least [`Self::agreement_count_needed`] words long
-  ///   advances the watermark: its trailing `agreement_count_needed`
-  ///   words become the new [`Self::last_agreed_words_slice`] (whose
-  ///   first word's start is the new [`Self::last_agreed_seconds`]), its
-  ///   leading remainder is folded into [`Self::confirmed_words_slice`],
-  ///   `result` is kept, and this returns [`AgreementOutcome::Advanced`]
-  ///   (`:383-394`). Otherwise the hypotheses disagree: the watermark is
-  ///   unchanged, `result` is **dropped** rather than kept (`:395-400`,
-  ///   `skipAppend`), and this returns
+  ///   prefix at least [`Self::agreement_count_needed`] words long is an
+  ///   AGREEMENT: `common[..split]` is folded into
+  ///   [`Self::confirmed_words_slice`], `common[split..]` becomes the new
+  ///   [`Self::last_agreed_words_slice`], a new [`Self::last_agreed_seconds`]
+  ///   is drawn, `result` is kept, and this returns
+  ///   [`AgreementOutcome::Advanced`] (`:383-394`). Otherwise the hypotheses
+  ///   disagree: the watermark is unchanged, `result` is **dropped** rather
+  ///   than kept (`:395-400`, `skipAppend`), and this returns
   ///   [`AgreementOutcome::AwaitingAgreement`].
+  ///
+  ///   **Both quantities are RULE W's rather than Swift's** (#94). Swift fixes
+  ///   them: the holdback is `commonPrefix.suffix(agreementCountNeeded)` and
+  ///   the watermark is `lastAgreedWords.first!.start` (`:385`). Here
+  ///   `split_at_a_strict_boundary` moves the boundary later OR earlier than
+  ///   that count, and `sparing_watermark` lowers that first held start to
+  ///   spare every word this round left unconfirmed — over an anchor
+  ///   `empty_holdback_anchor` supplies where the split empties the holdback.
+  ///   That is why [`AgreementOutcome::Advanced`] reports agreed-and-kept and
+  ///   NOT a moved watermark: a `split` of `0` confirms nothing and leaves
+  ///   [`Self::last_agreed_seconds`] bit-identical — measured there.
   ///
   /// Either way — agreeing, disagreeing, or no previous result — `result`
   /// becomes the new previous result for the next call (`:402`, outside
@@ -1098,7 +1110,7 @@ impl LocalAgreement {
       self.prev_words = Self::watermark_filtered(previous, self.last_agreed_seconds);
       let common = find_longest_common_prefix(&self.prev_words, &self.hypothesis_words);
       if common.len() >= self.agreement_count_needed {
-        // :383-394 — advance the watermark.
+        // :383-394 — the advance.
         let requested = common.len() - self.agreement_count_needed;
         let split = split_at_a_strict_boundary(
           common,

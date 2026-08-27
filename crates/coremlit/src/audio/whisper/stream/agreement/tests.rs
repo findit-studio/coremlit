@@ -1581,7 +1581,8 @@ fn a_dropped_disagreeing_hypothesiss_draw_survives_into_finalize() {
   // R2 disagrees with R1 (no common prefix) AND drew from an unseeded sampler.
   let r2 = result_with_words(vec![word(" But", 0.0, 0.4), word(" then", 0.4, 0.7)])
     .with_task_facts(TaskFacts::observed_clean().with_drew_from_rng(true));
-  // R3 agrees with the retained R2 control hypothesis, advancing the watermark.
+  // R3 agrees with the retained R2 control hypothesis, so the round returns
+  // `Advanced` -- on a ZERO split, so it confirms nothing and the watermark holds.
   let r3 = result_with_words(vec![
     word(" But", 0.0, 0.4),
     word(" then", 0.4, 0.7),
