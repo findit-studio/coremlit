@@ -13,6 +13,13 @@ jobs:
       # feature-gated audio module AND the oracle features under one
       # `-D warnings` pass across all targets (lib/tests/benches/examples). ort
       # is `load-dynamic`, so this builds without onnxruntime present.
+      #
+      # This is also THE row that compiles the `harness = false` benches, which
+      # neither `cargo test` nor `clippy --tests` reaches (#61) — and it has to
+      # be the all-features one: every bench declares `required-features`
+      # (whisper, whisper, align, clap), so a default-feature `--all-targets`
+      # build compiles zero of them and would satisfy that acceptance criterion
+      # only on paper.
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo doc --no-deps --all-features
         env:
