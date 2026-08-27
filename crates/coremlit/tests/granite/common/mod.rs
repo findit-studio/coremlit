@@ -247,3 +247,22 @@ pub fn collect_files_rel(root: &Path, dir: &Path, out: &mut std::collections::BT
     }
   }
 }
+
+// ── Model-gate visibility (#61) ─────────────────────────────────────────────
+//
+// NOT `#[ignore]`d, deliberately. This is the ordinary-run half of the gate
+// accounting: an ignored-ONLY run (`-- --ignored`, what every CI gate uses)
+// never selects it, and it never appears in an ignored-only `--list`, so the
+// anti-vacuum counts those gates take are unchanged. What it adds is the case
+// no gate covers — a plain, modelless run — where the skipped gates otherwise
+// say nothing but `ignored`. Mechanism, and what it does and does not refuse,
+// in the shared module.
+#[path = "../../support/model_gate_report.rs"]
+mod model_gate_report;
+
+/// Reports how many of this binary's tests are `#[ignore]`d granite model gates
+/// that did not run, and whether the models root they read is on disk.
+#[test]
+fn model_gate_report() {
+  model_gate_report::report(&[("EMBEDKIT_TEST_MODELS", models_dir())]);
+}
