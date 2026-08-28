@@ -50,12 +50,28 @@ pub const T_FRAMES: usize = 1001;
 /// Re-exported from [`crate::embeddings::clap::audio`].
 pub const N_MELS: usize = 64;
 
-/// Fixed audio window: 10 s at 48 kHz. Re-exported from [`crate::embeddings::clap::audio`].
+/// CLAP's fixed audio sample rate, in Hz. Re-exported from
+/// [`crate::embeddings::clap::audio`]. [`TARGET_SAMPLES`] `== 10 ×
+/// SAMPLE_RATE_HZ`; pin this constant directly rather than re-deriving the
+/// rate from `TARGET_SAMPLES / 10`.
+///
+/// This doctest is the guard: it compiles against the crate's public API
+/// (not the internal `mel` module), so it fails to compile — not just to
+/// pass — if `SAMPLE_RATE_HZ` ever stops being reachable at this path.
+///
+/// ```
+/// use coremlit::embeddings::clap::audio::{SAMPLE_RATE_HZ, TARGET_SAMPLES};
+///
+/// assert_eq!(TARGET_SAMPLES, 10 * SAMPLE_RATE_HZ as usize);
+/// ```
+pub const SAMPLE_RATE_HZ: u32 = 48_000;
+
+/// Fixed audio window: 10 s at [`SAMPLE_RATE_HZ`]. Re-exported from
+/// [`crate::embeddings::clap::audio`].
 pub const TARGET_SAMPLES: usize = 480_000;
 
 const N_FFT: usize = 1024;
 const HOP: usize = 480;
-const SR: u32 = 48_000;
 const FMIN: f64 = 50.0;
 const FMAX: f64 = 14_000.0;
 const POWER_TO_DB_AMIN: f64 = 1e-10;
@@ -160,7 +176,7 @@ impl MelExtractor {
 
   pub(crate) fn new() -> Self {
     let window = Self::periodic_hann(N_FFT);
-    let filterbank = Self::build_mel_filterbank(SR, N_FFT, N_MELS, FMIN, FMAX);
+    let filterbank = Self::build_mel_filterbank(SAMPLE_RATE_HZ, N_FFT, N_MELS, FMIN, FMAX);
     let mut planner = FftPlanner::<f64>::new();
     let fft = planner.plan_fft_forward(N_FFT);
     Self {

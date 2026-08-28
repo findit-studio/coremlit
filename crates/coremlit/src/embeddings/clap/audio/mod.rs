@@ -14,7 +14,7 @@ use crate::embeddings::clap::{
   window::{WindowEmbedding, WindowPlan},
 };
 
-pub use self::mel::{N_MELS, T_FRAMES, TARGET_SAMPLES};
+pub use self::mel::{N_MELS, SAMPLE_RATE_HZ, T_FRAMES, TARGET_SAMPLES};
 
 /// Declared feature names on `clap_audio.mlmodelc` (pinned by
 /// `tests/clap/model_io.rs`).
@@ -186,14 +186,15 @@ impl AudioEncoder {
 
   /// Embeds one audio window into a unit-norm [`Embedding`].
   ///
-  /// `samples` is 48 kHz mono and must be `1..=`[`TARGET_SAMPLES`] long. A
-  /// shorter clip is `repeatpad`ed up to the fixed 480 000-sample window (exactly
-  /// as HF's `ClapFeatureExtractor` does); a **longer** clip is rejected with
-  /// [`Error::AudioTooLong`] rather than silently head-truncated. This is the
-  /// per-window primitive — feed a longer clip to [`Self::embed_windows`] (the
-  /// long-audio pipeline), which hops it into 480 000-sample windows first. (HF is
-  /// configured for `rand_trunc`, so head-truncating here would be neither
-  /// deterministic nor HF-faithful; clapkit will not truncate behind your back.)
+  /// `samples` is 48 kHz ([`SAMPLE_RATE_HZ`]) mono and must be
+  /// `1..=`[`TARGET_SAMPLES`] long. A shorter clip is `repeatpad`ed up to the
+  /// fixed 480 000-sample window (exactly as HF's `ClapFeatureExtractor` does);
+  /// a **longer** clip is rejected with [`Error::AudioTooLong`] rather than
+  /// silently head-truncated. This is the per-window primitive — feed a longer
+  /// clip to [`Self::embed_windows`] (the long-audio pipeline), which hops it
+  /// into 480 000-sample windows first. (HF is configured for `rand_trunc`, so
+  /// head-truncating here would be neither deterministic nor HF-faithful;
+  /// clapkit will not truncate behind your back.)
   ///
   /// # Errors
   /// [`Error::EmptyAudio`] if `samples` is empty.
@@ -319,11 +320,10 @@ impl AudioEncoder {
   /// As [`Self::embed_window`]; a failure here surfaces a broken model at prewarm
   /// time rather than on the first request.
   pub fn prewarm(&self) -> Result<()> {
-    const SR: f32 = 48_000.0;
     // 1 s of a fixed 440 Hz tone: a valid, non-silent window (avoids the
     // zero-magnitude path) that `embed_window` `repeatpad`s to the full window.
-    let signal: Vec<f32> = (0..48_000)
-      .map(|i| 0.5 * (std::f32::consts::TAU * 440.0 * (i as f32 / SR)).sin())
+    let signal: Vec<f32> = (0..SAMPLE_RATE_HZ)
+      .map(|i| 0.5 * (std::f32::consts::TAU * 440.0 * (i as f32 / SAMPLE_RATE_HZ as f32)).sin())
       .collect();
     self.embed_window(&signal)?;
     Ok(())
