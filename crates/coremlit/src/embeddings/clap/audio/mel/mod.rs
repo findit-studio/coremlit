@@ -54,6 +54,16 @@ pub const N_MELS: usize = 64;
 /// [`crate::embeddings::clap::audio`]. [`TARGET_SAMPLES`] `== 10 ×
 /// SAMPLE_RATE_HZ`; pin this constant directly rather than re-deriving the
 /// rate from `TARGET_SAMPLES / 10`.
+///
+/// This doctest is the guard: it compiles against the crate's public API
+/// (not the internal `mel` module), so it fails to compile — not just to
+/// pass — if `SAMPLE_RATE_HZ` ever stops being reachable at this path.
+///
+/// ```
+/// use coremlit::embeddings::clap::audio::{SAMPLE_RATE_HZ, TARGET_SAMPLES};
+///
+/// assert_eq!(TARGET_SAMPLES, 10 * SAMPLE_RATE_HZ as usize);
+/// ```
 pub const SAMPLE_RATE_HZ: u32 = 48_000;
 
 /// Fixed audio window: 10 s at [`SAMPLE_RATE_HZ`]. Re-exported from
