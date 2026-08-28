@@ -2,8 +2,12 @@
 //!
 //! Most of this crate's model gates are NOT integration tests: they are
 //! `#[ignore]`d unit tests inside the pipeline modules — more of them than
-//! every `tests/` binary holds put together — and CI reaches a subset of them
-//! through the granite shard's `@lib` selector. They are skipped by the same
+//! every `tests/` binary holds put together — and CI reaches them through
+//! three `model-tests` shards: whisper's two `@all` groups, which build and run
+//! the lib target alongside every integration one, and the granite and speaker
+//! shards' `@lib` ones. The `align` gates reach no shard at all, because
+//! alignkit has no MODELS_LOCK table; ci.yml's matrix carries the per-kit
+//! ledger, counts included. They are skipped by the same
 //! silence, so they get the same report; see
 //! `crates/coremlit/tests/support/model_gate_report.rs` for the mechanism.
 //!
