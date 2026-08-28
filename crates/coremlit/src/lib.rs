@@ -51,3 +51,8 @@ pub use units::{ComputeUnits, ParseComputeUnitsError};
 
 pub mod audio;
 pub mod embeddings;
+
+// The in-lib model gates outnumber every `tests/` binary's put together, and a
+// modelless run reports them as `ignored` and nothing else. See the module.
+#[cfg(test)]
+mod tests;

@@ -273,9 +273,19 @@ jobs:
           # step, which hashes both graphs; this leg deliberately does not
           # re-verify that (see the note on checksums below) — it consumes the
           # same cache entry ci.yml's speaker shard verified on the same commit.
+          #
+          # `@lib` is load-bearing here for the same reason it is on the granite
+          # leg: 38 of this kit's model gates are `#[ignore]`d unit tests inside
+          # `src/audio/speaker/**`, not `tests/` targets, and their lines are
+          # unreachable without this group. `--skip=argmax` drops the eleven
+          # that read `Models/argmax-speakerkit`, which no runner fetches for a
+          # LICENSING reason — ci.yml's speaker row carries the full argument,
+          # and `ci_speaker_lib_gates_skip_exactly_the_unstaged_argmax_tree`
+          # pins the skip set against the source in both directions.
           - kit: speaker
             gates: |
               speaker|speaker_model_io speaker_parity_seg speaker_parity_embed
+              speaker|@lib|--skip=argmax
           # `@lib` is load-bearing here: the granite tokenizer is a 24 MB sidecar
           # the artifact ships rather than something `include_bytes!`d, so the
           # in-lib tokenizer/chunking gates are model gates like the rest and
@@ -459,12 +469,28 @@ jobs:
   # shared action's, per kit. There is no third re-implementation to keep in
   # step — the thing under test is ci.yml's real code.
   #
-  # Its own success message tells you when to delete it: once ci.yml issues no
-  # `hf download` of its own, there is no second parser left and the script says
-  # so. `ubuntu-latest` because nothing here is macOS-specific and nothing is
-  # downloaded.
+  # Its own success message tells you when to delete THAT SCRIPT AND ITS STEP:
+  # once ci.yml issues no `hf download` of its own, there is no second parser
+  # left and the script says so. The job outlives it — the gate-plan check below
+  # is not tied to the staging migration.
+  #
+  # THE SECOND CHECK is the same idea applied to what runs AFTER the download.
+  # This file's `coverage-models` comment states the coupling plainly ("the gate
+  # plans are the same plans"), and until #61 nothing enforced it: the `speaker`
+  # leg spent a release without the `@lib` group its ci.yml twin carries, and no
+  # job could have noticed, because `plan_parity.sh` diffs only the DOWNLOAD
+  # plan. `gate_plan_parity.sh` executes BOTH workflows' real gate runners with
+  # `cargo` stubbed out and diffs the canonicalised invocations per kit, so a
+  # refactor that changes their syntax while preserving the plan stays green and
+  # a one-token change to either plan cannot.
+  #
+  # Both checks live in one job on purpose: "do the two workflows still agree"
+  # is one question, and this is the one place to look for its answer.
+  # `ubuntu-latest` because nothing here is macOS-specific and nothing is
+  # downloaded — the gate check never builds or runs a test, it only resolves
+  # what the two runners would invoke.
   lock-parser-parity:
-    name: MODELS_LOCK parser parity
+    name: ci.yml / coverage.yml plan parity
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -472,6 +498,8 @@ jobs:
         run: python3 -c 'import yaml' || pip install --quiet pyyaml
       - name: Diff ci.yml's download plan against the shared action's
         run: .github/actions/stage-models/plan_parity.sh
+      - name: Diff ci.yml's gate plans against this workflow's
+        run: .github/scripts/gate_plan_parity.sh
 
   # Merge every leg's report into one readable answer to "which code do the tests
   # actually reach".

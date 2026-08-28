@@ -13,6 +13,13 @@ jobs:
       # feature-gated audio module AND the oracle features under one
       # `-D warnings` pass across all targets (lib/tests/benches/examples). ort
       # is `load-dynamic`, so this builds without onnxruntime present.
+      #
+      # This is also THE row that compiles the `harness = false` benches, which
+      # neither `cargo test` nor `clippy --tests` reaches (#61) — and it has to
+      # be the all-features one: every bench declares `required-features`
+      # (whisper, whisper, align, clap), so a default-feature `--all-targets`
+      # build compiles zero of them and would satisfy that acceptance criterion
+      # only on paper.
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: cargo doc --no-deps --all-features
         env:
@@ -56,6 +63,12 @@ jobs:
       # defect — and once the goldens ARE stamped, `check_host_class` would
       # refuse a mismatched host outright. It stays a local/dev gate against a
       # same-host oracle.
+      #
+      # There is no in-lib half to add here either, and that is measured rather
+      # than assumed: `--features vad --lib -- --list --ignored` lists ZERO —
+      # every VAD model gate is a `tests/vad/*` target — so a `--lib` run would
+      # be exactly the vacuum the counts below refuse. (See the in-lib coverage
+      # ledger over `model-tests`'s matrix for the kits that do have one.)
       #
       # Anti-vacuum, the same idiom `model-tests`'s gate runner applies to every
       # shard: an ignored-only run over a target whose gates were deleted,
@@ -189,6 +202,34 @@ jobs:
   #                  sweep step.
   #   gates          the gate plan, one `features|selectors|filter` group per
   #                  line — see the gate step.
+  #
+  # WHERE THE LIBRARY'S OWN MODEL GATES RUN. 230 of this repository's model
+  # gates are not in `tests/` at all: they are `#[ignore]`d unit tests inside
+  # the pipeline modules, more than every `tests/` binary holds put together
+  # (#61). They reach CI through a row's gate plan like any other target — as
+  # `@lib`, or inside an `@all` — and through nothing else, so the plans below
+  # ARE the in-lib coverage. Counted per kit with
+  # `cargo test -p coremlit --features <kit> --lib -- --list --ignored`:
+  #
+  #   whisper  118  covered by this row's two `@all` groups. `@all` is the
+  #                 whole package, which BUILDS AND RUNS the lib target too, so
+  #                 the row needs no `@lib` of its own; adding one would run
+  #                 the same 118 gates a second time. (Measured: that row's
+  #                 `whisper|@all` lists 150, of which 118 are the lib's.)
+  #   granite   51  covered by `@lib`.
+  #   speaker   38  covered by `@lib`, less the eleven that read a tree no
+  #                 runner fetches — see that row.
+  #   ced        0  these kits' model gates all live in `tests/`, so a `@lib`
+  #   clap       0  group would list ZERO ignored tests and (correctly) trip
+  #   siglip     0  the gate runner's anti-vacuum guard, exactly as
+  #                 `clap_tokenizer_identity` would. The same is true of the
+  #                 `vad` gates in the modelless `check` job.
+  #   align     19  (20 with `tracing`) NO ROW REACHES THEM, and none can from
+  #                 here: `align` has no MODELS_LOCK table — alignkit is one of
+  #                 `UNSTAGED_DEFECT_VENDORS` (tests/whisper/models_lock.rs),
+  #                 360 MB and unstaged — so there is no shard to hang a `@lib`
+  #                 on. They stay local/dev gates alongside the five
+  #                 `tests/align/*` targets, which are equally ungated.
   model-tests:
     name: model-tests (${{ matrix.kit }})
     runs-on: macos-15
@@ -281,6 +322,38 @@ jobs:
           # Face, so undeclared-means-all-rights-reserved applies and this
           # repository does not fetch those graphs in CI at all. NOTICE records
           # that; adding them here would quietly reverse a licensing decision.
+          #
+          # The SECOND gate group is the library's own suite, and it is free:
+          # `--features speaker --lib` lists 38 `#[ignore]`d model gates that
+          # read exactly the two graphs this shard already stages, so the group
+          # costs one more `cargo test` over an already-built binary (26 s
+          # measured) and not one byte of download. Without it the shard pulls
+          # 108 MB for three `tests/` targets and leaves the larger half of the
+          # kit's gates unrun (#61).
+          #
+          # `--skip=argmax` IS THE LICENSING DECISION ABOVE, one level down.
+          # ELEVEN of those 38 load ARGMAX_TEST_MODELS — the ten in
+          # `audio::speaker::source::argmax::tests`, plus
+          # `source::tests::any_source_load_dispatches_fluid_audio_and_argmax`,
+          # which loads BOTH sources — and no runner has that tree. Measured
+          # with it removed: an unfiltered `@lib` fails eleven, a skip that did
+          # not reach the dispatcher gate fails one, and this filter leaves 27
+          # passing. The gate that needs the tree says `argmax` in its NAME,
+          # which is what lets one substring cover all eleven.
+          #
+          # `ci_speaker_lib_gates_skip_exactly_the_unstaged_argmax_tree` pins
+          # both directions. A new argmax gate the filter misses only goes red
+          # after a 108 MB download; a filter that WIDENED onto a
+          # speakerkit-only gate would drop it with no signal at all, because
+          # the anti-vacuum `--list` count is taken through this same filter and
+          # would simply fall with the run instead of reaching zero.
+          #
+          # The three `extract_serde_bypassed_*` gates are not reachable from
+          # here and are not counted above: they are `#[cfg(feature = "serde")]`,
+          # so covering them means a `speaker,serde` group, and they FAIL today
+          # — `Options`' deserializer validates `step_samples`/`onset` itself,
+          # so the serde bypass their premise describes no longer exists.
+          # Gating a red test is not coverage; that is a test-side repair.
           - kit: speaker
             cache: Models/speakerkit
             probe: Models/speakerkit/pyannote_segmentation.mlmodelc Models/speakerkit/wespeaker_v2.mlmodelc
@@ -292,6 +365,7 @@ jobs:
             fp16-vendors: vadkit,speakerkit
             gates: |
               speaker|speaker_model_io speaker_parity_seg speaker_parity_embed
+              speaker|@lib|--skip=argmax
           # 400 MB. The whole granite bundle directory, `CHECKSUMS.sha256` and
           # the 24 MB `tokenizer.json` sidecar included — the crate stopped
           # embedding that tokenizer (`include_bytes!` of that size overruns the
@@ -695,8 +769,13 @@ jobs:
       # ONE gate runner for all six shards, driven by the matrix row's `gates`
       # plan: one `features|selectors|filter` group per line, where a selector
       # is a test-target name, `@lib` for the in-lib gates, or `@all` for the
-      # whole suite under those features. An empty `features` field is the
-      # crate's bare default.
+      # whole suite under those features. `@all` SUBSUMES `@lib`, because a
+      # bare `cargo test` builds and runs the lib target alongside every
+      # integration one — which is why the `whisper` row carries no `@lib`. An
+      # empty `features` field is the crate's bare default, and `filter` is
+      # handed to libtest as ONE word, so an EXCLUSION has to be spelled
+      # `--skip=<substring>` rather than `--skip <substring>` (the `speaker`
+      # row is the one that needs it).
       #
       # Every model gate in this repository is `#[ignore]`d — the convention —
       # so CI has to ask for them by name, and that opens two ways to pass while

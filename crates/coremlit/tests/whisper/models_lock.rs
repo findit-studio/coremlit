@@ -21,7 +21,7 @@
 use std::{
   collections::{BTreeMap, BTreeSet},
   fs,
-  path::PathBuf,
+  path::{Path, PathBuf},
 };
 
 struct LockTable {
@@ -648,6 +648,200 @@ fn ci_runs_the_ced_gates_for_exactly_the_size_the_lock_stages() {
      count and the run, so a deleted or renamed `{size}` module could still count the other \
      sizes' gates and then run none"
   );
+}
+
+/// Every `#[ignore]`d test under `dir`, as `(full libtest path, ignore reason)`.
+///
+/// Text-based like every other reader in this file, and for the same reason:
+/// the alternative is asking libtest for the list, which means building the
+/// `speaker` feature and — for the gates this is used to check — having the
+/// models the check exists to run without.
+///
+/// The shape it needs is the one `src/` uses throughout: `#[ignore = "..."]` on
+/// ONE line (asserted, so a reason that grows a line continuation fails here
+/// rather than silently dropping a gate), the `fn <name>` somewhere below it in
+/// the same attribute block, and the module path taken from the file's own path
+/// under `src/` — the sibling-`tests.rs` layout.
+fn ignored_gates(src_root: &Path, dir: &Path) -> Vec<(String, String)> {
+  let mut gates: Vec<(String, String)> = Vec::new();
+  let mut stack = vec![dir.to_path_buf()];
+  while let Some(current) = stack.pop() {
+    let entries = fs::read_dir(&current)
+      .unwrap_or_else(|e| panic!("{} reads: {e}", current.display()))
+      .map(|e| e.expect("a directory entry reads").path());
+    for path in entries {
+      if path.is_dir() {
+        stack.push(path);
+        continue;
+      }
+      if path.extension().is_none_or(|ext| ext != "rs") {
+        continue;
+      }
+      let module = path
+        .strip_prefix(src_root)
+        .expect("scanned under src/")
+        .with_extension("")
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .filter(|c| c != "mod")
+        .collect::<Vec<_>>()
+        .join("::");
+      let contents = fs::read_to_string(&path).expect("a source file reads");
+      let lines: Vec<&str> = contents.lines().collect();
+      for (i, line) in lines.iter().enumerate() {
+        let Some(rest) = line.trim_start().strip_prefix("#[ignore") else {
+          continue;
+        };
+        assert!(
+          rest.trim_end().ends_with(']'),
+          "{}:{}: this reader needs the whole `#[ignore ...]` attribute on one line",
+          path.display(),
+          i + 1
+        );
+        let reason = match rest.split_once('"').and_then(|(_, r)| r.rsplit_once('"')) {
+          Some((reason, _)) => reason.to_string(),
+          None => String::new(),
+        };
+        let name = lines[i + 1..]
+          .iter()
+          .find_map(|l| l.trim_start().strip_prefix("fn "))
+          .and_then(|l| l.split(['(', '<']).next())
+          .unwrap_or_else(|| {
+            panic!(
+              "{}:{}: an `#[ignore]` attribute with no `fn` after it",
+              path.display(),
+              i + 1
+            )
+          });
+        gates.push((format!("{module}::{name}"), reason));
+      }
+    }
+  }
+  gates.sort();
+  gates
+}
+
+/// The `speaker` shard runs the library's own model gates, and the one thing it
+/// must NOT run is a gate that reads a tree no runner is allowed to fetch.
+///
+/// 230 of this repository's model gates are `#[ignore]`d unit tests inside the
+/// pipeline modules rather than `tests/` binaries (#61), and
+/// `--features speaker --lib` lists 38 of them. ELEVEN read
+/// `ARGMAX_TEST_MODELS` — the `argmax-speakerkit` tree
+/// [`UNSTAGED_DEFECT_VENDORS`] records as deliberately unfetched, for a
+/// LICENSING reason rather than a cost one — so the shard's gate plan skips
+/// exactly those and runs the other 27.
+///
+/// Both drift directions are pinned, and they fail in opposite ways. A new
+/// argmax-tree gate the filter does not name turns the shard red on a missing
+/// bundle: loud, but only after a 108 MB download. A filter that grows to match
+/// a SPEAKERKIT-only gate drops it from CI with no signal at all — the gate
+/// runner's anti-vacuum `--list` count is taken through the same filter as the
+/// run, so both numbers fall together and neither reaches zero.
+#[test]
+fn ci_speaker_lib_gates_skip_exactly_the_unstaged_argmax_tree() {
+  let Some((_, workflow_path)) = repo_files() else {
+    return;
+  };
+  let ci_contents = fs::read_to_string(workflow_path).expect(".github/workflows/ci.yml reads");
+  let row = matrix_rows(&ci_contents)
+    .into_iter()
+    .find(|r| row_field(r, "kit") == "speaker")
+    .expect("ci.yml has no `speaker` shard");
+
+  // The `@lib` group must exist at all. Without it the shard downloads 108 MB,
+  // runs three `tests/` targets, and leaves the larger half of the kit's gates
+  // unrun — the gap this pin was added with.
+  let lib_group = require_field(&row, "gates")
+    .lines()
+    .find(|group| {
+      group
+        .split('|')
+        .nth(1)
+        .is_some_and(|selectors| selectors.split_whitespace().any(|s| s == "@lib"))
+    })
+    .map(str::to_string)
+    .expect(
+      "ci.yml's speaker shard has no `@lib` gate group. The library's own speaker model gates \
+       read exactly the two graphs this shard already stages, so dropping the group means the \
+       shard downloads for them and then runs none of them.",
+    );
+  let filter = lib_group.splitn(3, '|').nth(2).unwrap_or_default();
+
+  // The gate runner hands `filter` to libtest as ONE word, so an exclusion is
+  // spelled `--skip=<substring>`. Any other token here (a positional include
+  // filter, a bare `--skip`) would change which gates run WITHOUT changing the
+  // skip set this check models, so it is refused rather than ignored.
+  let skips: Vec<&str> = filter
+    .split_whitespace()
+    .map(|token| {
+      token.strip_prefix("--skip=").unwrap_or_else(|| {
+        panic!(
+          "ci.yml's speaker `@lib` group has the filter {filter:?}; this pin models libtest's \
+           `--skip=<substring>` exclusions only, and a token of another shape would change which \
+           gates run without changing what is checked here"
+        )
+      })
+    })
+    .collect();
+  assert!(
+    !skips.is_empty(),
+    "ci.yml's speaker `@lib` group has no filter, so it would run the eleven gates that load \
+     Models/argmax-speakerkit — a tree no runner fetches (see UNSTAGED_DEFECT_VENDORS)"
+  );
+
+  let src_root = workspace_root().join("crates/coremlit/src");
+  let gates = ignored_gates(&src_root, &src_root.join("audio/speaker"));
+  assert!(
+    gates.len() > 30,
+    "only {} `#[ignore]`d gates found under src/audio/speaker; this reader has stopped matching \
+     the source layout, and every assertion below would pass vacuously",
+    gates.len()
+  );
+
+  // `argmax` in the ignore REASON is what marks a gate as needing the unstaged
+  // tree; both wordings say it ("requires local argmax speakerkit models
+  // (ARGMAX_TEST_MODELS)" and the two-root "requires local argmax + speakerkit
+  // models (both env vars)"). The reason is the right marker rather than the
+  // module path, because `source::tests` holds one gate of each kind.
+  let mut needs_argmax = 0usize;
+  for (name, reason) in &gates {
+    let skipped = skips.iter().any(|s| name.contains(s));
+    if reason.contains("argmax") {
+      needs_argmax += 1;
+      assert!(
+        skipped,
+        "the in-lib gate {name:?} says it needs the argmax tree ({reason:?}), but the speaker \
+         shard's `@lib` filter {filter:?} does not skip it. CI deliberately does not fetch that \
+         tree (UNSTAGED_DEFECT_VENDORS), so the shard would fail on a missing bundle. Name the \
+         gate so an existing `--skip=` substring matches it, or add one."
+      );
+    } else {
+      assert!(
+        !skipped,
+        "the speaker shard's `@lib` filter {filter:?} skips {name:?}, which needs only the \
+         speakerkit tree this shard stages ({reason:?}). A skip that widens onto a runnable gate \
+         drops it from CI silently: the anti-vacuum `--list` count is taken through this same \
+         filter, so it falls with the run instead of reaching zero."
+      );
+    }
+  }
+  // Non-vacuity for the branch above: gates were found, but if none of them
+  // declared an argmax dependency the completeness half checked nothing at all.
+  assert!(
+    needs_argmax > 0,
+    "no in-lib speaker gate names argmax in its `#[ignore]` reason, so the filter this shard \
+     carries is excluding gates for a dependency nothing declares any more"
+  );
+  for skip in &skips {
+    assert!(
+      gates
+        .iter()
+        .any(|(name, reason)| name.contains(skip) && reason.contains("argmax")),
+      "the speaker shard's `@lib` filter skips {skip:?}, which matches no in-lib gate that needs \
+       the argmax tree — a stale exclusion can only be hiding a gate CI could run"
+    );
+  }
 }
 
 /// The two `speaker` tables are the one place in MODELS_LOCK where table order

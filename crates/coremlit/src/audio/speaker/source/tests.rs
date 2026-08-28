@@ -64,7 +64,7 @@ fn source_serde_round_trips() {
 // `AnySource` counterpart — the only way one source could silently route to
 // another — fails to COMPILE. The two properties a test CAN add are the
 // no-fallback error path (below) and real dispatch
-// (`any_source_load_dispatches_by_source`, model-gated).
+// (`any_source_load_dispatches_fluid_audio_and_argmax`, model-gated).
 
 /// Loading `Source::Argmax` from a directory that holds only the FluidAudio
 /// artifacts must FAIL, not silently fall back to `FluidAudioSource` — the
@@ -592,9 +592,16 @@ fn config_round_trips_paths_and_compute_names() {
 
 /// [`AnySource::load`] builds the source [`Options::source`] names — and
 /// dispatches `extract` to it.
+///
+/// The name carries `argmax` because CI reads it. This is the only in-lib
+/// speaker gate outside `source::argmax::tests` that needs
+/// `ARGMAX_TEST_MODELS`, a tree no runner is allowed to fetch, and the
+/// `speaker` shard excludes the whole set of eleven with one `--skip=argmax`
+/// (.github/workflows/ci.yml, pinned in both directions by
+/// `ci_speaker_lib_gates_skip_exactly_the_unstaged_argmax_tree`).
 #[test]
 #[ignore = "requires local argmax + speakerkit models (both env vars)"]
-fn any_source_load_dispatches_by_source() {
+fn any_source_load_dispatches_fluid_audio_and_argmax() {
   let samples = load_ted_head();
 
   let fluid = AnySource::load(models_dir(), Options::new().with_source(Source::FluidAudio))
