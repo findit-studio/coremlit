@@ -13,9 +13,10 @@
 //!
 //! # Sample rate: 48 kHz (a documented deviation)
 //!
-//! CLAP is a **48 kHz** model. clapkit's audio API therefore takes 48 kHz mono
-//! `&[f32]` — a deliberate, documented deviation from the workspace's 16 kHz
-//! convention. Resampling to 48 kHz is the caller's responsibility (sans-I/O).
+//! CLAP is a **48 kHz** model ([`audio::SAMPLE_RATE_HZ`]). clapkit's audio API
+//! therefore takes 48 kHz mono `&[f32]` — a deliberate, documented deviation
+//! from the workspace's 16 kHz convention. Resampling to 48 kHz is the
+//! caller's responsibility (sans-I/O).
 //!
 //! # Model artifacts
 //!

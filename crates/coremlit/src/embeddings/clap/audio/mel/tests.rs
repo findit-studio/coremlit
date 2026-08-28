@@ -87,6 +87,16 @@ fn nan_prop_min(xs: impl IntoIterator<Item = f32>) -> f32 {
     .expect("nan_prop_min over an empty iterator")
 }
 
+/// Pins the cross-crate derivation downstream code relies on
+/// (`TARGET_SAMPLES == 10 × SAMPLE_RATE_HZ` — e.g. mediagraph currently
+/// derives its own `SAMPLE_RATE_HZ` as `TARGET_SAMPLES / 10` rather than
+/// reading a public rate constant). Guards against the two constants ever
+/// drifting apart independently.
+#[test]
+fn target_samples_is_ten_seconds_at_sample_rate() {
+  assert_eq!(TARGET_SAMPLES, 10 * SAMPLE_RATE_HZ as usize);
+}
+
 /// Periodic Hann at n=1024: peak (1.0) exactly at index n/2, last sample small
 /// but POSITIVE (distinguishing periodic from symmetric, which would be 0).
 #[test]

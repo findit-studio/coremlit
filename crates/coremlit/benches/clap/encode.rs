@@ -72,7 +72,7 @@ use coremlit::{
   ComputeUnits,
   embeddings::clap::{
     AudioEncoder, AudioEncoderOptions, Embedding, TextEncoder, TextEncoderOptions,
-    audio::TARGET_SAMPLES,
+    audio::{SAMPLE_RATE_HZ, TARGET_SAMPLES},
   },
 };
 
@@ -387,10 +387,9 @@ fn models_dir() -> PathBuf {
 /// giving both towers a stable, non-trivial input. Mirrors
 /// `tests/clap/common::deterministic_window` (unreachable from a bench crate).
 fn deterministic_window(len: usize) -> Vec<f32> {
-  const SR: f32 = 48_000.0;
   (0..len)
     .map(|i| {
-      let t = i as f32 / SR;
+      let t = i as f32 / SAMPLE_RATE_HZ as f32;
       let two_pi = std::f32::consts::TAU;
       0.5 * (two_pi * 220.0 * t).sin()
         + 0.3 * (two_pi * 440.0 * t).sin()
