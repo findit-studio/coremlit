@@ -21,7 +21,9 @@
 #
 # SELF-DELETING. Once ci.yml calls the composite action instead of staging models
 # inline, there is no `hf download` in it to extract, and this script reports the
-# migration complete and asks to be removed along with itself.
+# migration complete and asks to be removed along with itself. THE JOB THAT RUNS
+# IT STAYS: it also runs gate_plan_parity.sh, which compares what the two
+# workflows RUN rather than what they download and is not tied to this migration.
 
 set -euo pipefail
 
@@ -100,7 +102,8 @@ PY
 if [ "$extracted" -eq 3 ]; then
   echo "ci.yml issues no \`hf download\` of its own: it has been migrated onto"
   echo ".github/actions/stage-models, so there is no second parser left to drift."
-  echo "DELETE this script and the coverage.yml job that runs it."
+  echo "DELETE this script and the coverage.yml STEP that runs it — not the job,"
+  echo "which also runs gate_plan_parity.sh over the two files' gate plans."
   exit 0
 fi
 if [ "$extracted" -ne 0 ]; then
