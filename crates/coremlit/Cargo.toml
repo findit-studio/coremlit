@@ -113,7 +113,7 @@ sha2 = { workspace = true, optional = true }
 # LICENSE: pixon is GPL-3.0-or-later today; its owner-gated relicense to
 # MIT OR Apache-2.0 is a merge blocker for this branch (see the `siglip` feature
 # comment above).
-pixon = { version = "0.2", default-features = false, features = ["std", "rgb"], optional = true }
+pixon = { version = "0.3", default-features = false, features = ["std", "rgb"], optional = true }
 
 [dev-dependencies]
 half.workspace = true
