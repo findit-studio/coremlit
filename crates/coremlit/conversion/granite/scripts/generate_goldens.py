@@ -66,6 +66,7 @@ from _granite_common import (
     observed_toolchain,
     padded_inputs,
     replace_file_atomic,
+    require_producer_toolchain,
     stage_dir,
 )
 from _fixtures import CORPUS, goldens_dir
@@ -91,7 +92,9 @@ PROVENANCE = {
     "hf_revision": REV,
     # Placeholder only, so the emitted key order stays stable; main() overwrites
     # it with observed_toolchain(). A golden must never record a version that was
-    # not the one that computed it.
+    # not the one that computed it — and, since main() also requires that reading
+    # to EQUAL the producer record's, the version written here is the conversion's
+    # too. One environment per artifact, named once.
     "toolchain": None,
 }
 
@@ -106,12 +109,20 @@ def serialize(obj):
 def main():
     out = goldens_dir()
     os.makedirs(out, exist_ok=True)
-    # Bind to the conversion run whose crosscheck this step publishes.
+    # Bind to the conversion run whose crosscheck this step publishes. The WHOLE
+    # record is kept, not just its run id: the run id says these files came from
+    # one pipeline, and cannot say they came from one ENVIRONMENT.
     stage = stage_dir()
-    run_id = read_producer_record(stage, {
+    toolchain = observed_toolchain()
+    producer = read_producer_record(stage, {
         name: digest_tree(os.path.join(stage, name))
         for name in (SHIPPED_PACKAGE, FP32_REFERENCE)
-    })[RUN_ID_KEY]
+    })
+    run_id = producer[RUN_ID_KEY]
+    # Before the model is loaded and 16 embeddings are computed: a divergence is
+    # not a property of the numbers, so discovering it must cost nothing. This is
+    # the same guard, in the same order, verify_granite.py applies.
+    require_producer_toolchain(producer, toolchain, "GOLDENS", "generate_goldens.py")
     st = load_sentence_transformer()
     assert_prompt_free(st)
     tokenizer = st.tokenizer
@@ -140,7 +151,7 @@ def main():
     assert_corpus_identity(entries, "the entries about to be written")
 
     provenance = dict(PROVENANCE)
-    provenance["toolchain"] = observed_toolchain()
+    provenance["toolchain"] = toolchain
     provenance["generated_utc"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
     provenance["n_entries"] = len(entries)
     # Serialized but NOT yet on disk: the crosscheck below can still fail, and a

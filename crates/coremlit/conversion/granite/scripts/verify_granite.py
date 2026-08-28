@@ -68,6 +68,7 @@ from _granite_common import (
     read_producer_record,
     replace_file_atomic,
     require_compile_record,
+    require_producer_toolchain,
     require_published_crosscheck,
     stage_dir,
     worst_update,
@@ -131,13 +132,7 @@ def main():
     }
     producer = read_producer_record(stage, produced)
     run_id = producer[RUN_ID_KEY]
-    if producer["toolchain"] != toolchain:
-        raise SystemExit(
-            f"PRODUCER/VERIFIER TOOLCHAIN DIVERGENCE — the artifact was produced by\n"
-            f"  {producer['toolchain']}\nbut is being verified by\n  {toolchain}\n"
-            f"  Both satisfy the pins, but the manifest must name ONE environment. "
-            f"Re-run convert_granite.py and verify_granite.py in the same venv."
-        )
+    require_producer_toolchain(producer, toolchain, "VERIFIER", "verify_granite.py")
     # The fp16 matrix below runs the COMPILED bundle, which producer.json does
     # not bind. Require the compilation record for this run before measuring
     # anything, so the numbers cannot describe a bundle another run built.
