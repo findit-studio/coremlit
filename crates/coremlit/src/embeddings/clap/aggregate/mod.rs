@@ -60,10 +60,12 @@ mod tests;
 /// widened to the `f64` compute domain and unit-normalized, and [`aggregate`]
 /// reconstructs the [`Embedding`] from what the policy returns — so a custom
 /// policy implements [`AggregatePolicy`] over `&[&[f64]]`, and reads the window
-/// coverages as `&[f64]` — the domain [`Span::coverage`](crate::embeddings::clap::window::Span::coverage)
-/// itself resolves in, so nothing the fold multiplies an embedding by is rounded
-/// through a narrower grid first. Here one that trusts only the highest-coverage
-/// window, exercised through the public seam, no model required:
+/// coverages as `&[f64]` — the domain [`Span::coverage`] itself resolves in, so
+/// nothing the fold multiplies an embedding by is rounded through a narrower
+/// grid first. Here one that trusts only the highest-coverage window, exercised
+/// through the public seam, no model required:
+///
+/// [`Span::coverage`]: crate::embeddings::clap::window::Span::coverage
 ///
 /// ```
 /// use coremlit::embeddings::clap::aggregate::{AggregatePolicy, aggregate};

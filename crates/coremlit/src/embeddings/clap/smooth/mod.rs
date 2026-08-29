@@ -3,10 +3,9 @@
 //! and adds a thin clap-typed [`smooth`] wrapper.
 //!
 //! This is the streaming half of the long-audio stack, and the sibling of
-//! [`aggregate`](mod@crate::embeddings::clap::aggregate). Where aggregation folds a
-//! finished [`WindowEmbedding`] slice to ONE clip-level
-//! [`Embedding`], smoothing rewrites one
-//! window in / one window out with the input
+//! [`aggregate`](mod@crate::embeddings::clap::aggregate). Where aggregation
+//! folds a finished [`WindowEmbedding`] slice to ONE clip-level [`Embedding`],
+//! smoothing rewrites one window in / one window out with the input
 //! [`Span`](crate::embeddings::clap::window::Span) intact — so a per-window
 //! embedding stream is denoised without being collapsed to a point. A consumer
 //! that wants every window to keep emitting, only quieter, wants this tier and
@@ -26,11 +25,11 @@
 //! windit's other two non-identity smoothers, `Ema` and `CadenceEma`, are
 //! `Smoother<f32>` scalar low-passes — the right shape for a per-window
 //! *probability* (which is what `audio::ced` points its callers at) and the
-//! wrong one for a 512-wide unit-norm embedding. They are deliberately absent here for the same
-//! reason `SaliencyWeighted` is absent from
-//! [`aggregate`](mod@crate::embeddings::clap::aggregate): re-exporting a knob this
-//! module's value type cannot use would ship a misleading surface. Reach them
-//! through `windit::smooth` directly.
+//! wrong one for a 512-wide unit-norm embedding. They are deliberately absent
+//! here for the same reason `SaliencyWeighted` is absent from
+//! [`aggregate`](mod@crate::embeddings::clap::aggregate): re-exporting a knob
+//! this module's value type cannot use would ship a misleading surface. Reach
+//! them through `windit::smooth` directly.
 //!
 //! [`Identity`] and [`VectorEmaState`] are reachable at this module path but are
 //! deliberately NOT flattened onto [`embeddings::clap`](crate::embeddings::clap)
