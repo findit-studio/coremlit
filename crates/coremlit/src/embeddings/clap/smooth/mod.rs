@@ -3,9 +3,9 @@
 //! and adds a thin clap-typed [`smooth`] wrapper.
 //!
 //! This is the streaming half of the long-audio stack, and the sibling of
-//! [`aggregate`](crate::embeddings::clap::aggregate). Where aggregation folds a
+//! [`aggregate`](mod@crate::embeddings::clap::aggregate). Where aggregation folds a
 //! finished [`WindowEmbedding`] slice to ONE clip-level
-//! [`Embedding`](crate::embeddings::clap::Embedding), smoothing rewrites one
+//! [`Embedding`], smoothing rewrites one
 //! window in / one window out with the input
 //! [`Span`](crate::embeddings::clap::window::Span) intact — so a per-window
 //! embedding stream is denoised without being collapsed to a point. A consumer
@@ -28,7 +28,7 @@
 //! *probability* (which is what `audio::ced` points its callers at) and the
 //! wrong one for a 512-wide unit-norm embedding. They are deliberately absent here for the same
 //! reason `SaliencyWeighted` is absent from
-//! [`aggregate`](crate::embeddings::clap::aggregate): re-exporting a knob this
+//! [`aggregate`](mod@crate::embeddings::clap::aggregate): re-exporting a knob this
 //! module's value type cannot use would ship a misleading surface. Reach them
 //! through `windit::smooth` directly.
 //!
@@ -44,6 +44,7 @@
 //! a downstream use site that globs two modules.
 
 use crate::embeddings::clap::{
+  embedding::Embedding,
   error::{Error, Result},
   window::WindowEmbedding,
 };
@@ -59,15 +60,14 @@ mod tests;
 /// [`Span`]: crate::embeddings::clap::window::Span
 ///
 /// This is the clap-typed wrapper over
-/// [`SmoothPolicy::smooth`](windit::smooth::SmoothPolicy::smooth), the batch
+/// [`SmoothPolicy::smooth`], the batch
 /// convenience: it drives a FRESH [`Smoother`] over `windows` on every call, so
 /// smoothing a stream chunk by chunk through separate calls is **not**
 /// equivalent to one whole-stream call — a running average does not carry across
 /// calls. To smooth incrementally, hold one
 /// [`smoother`](SmoothPolicy::smoother) and
 /// [`push`](Smoother::push) each window into it; that path also sheds the
-/// per-window [`Embedding`](crate::embeddings::clap::Embedding) clone this
-/// convenience makes.
+/// per-window [`Embedding`] clone this convenience makes.
 ///
 /// An empty `windows` smooths to an empty stream. That is deliberately unlike
 /// [`aggregate`](crate::embeddings::clap::aggregate::aggregate), which refuses
@@ -77,18 +77,22 @@ mod tests;
 /// # Errors
 /// [`Error::Windowing`] carrying windit's typed error for any smoothing failure.
 /// For [`VectorEma`] over clap's fixed-width, always-unit, always-finite
-/// [`Embedding`](crate::embeddings::clap::Embedding) the reachable member of
-/// that set is the determinacy gate's `WinditError::NonFinite` — a window whose
-/// accumulator has cancelled to within its own error bound of zero, so no
-/// direction can be reported — plus `WinditError::AllocFailed` for a refused
-/// buffer and `WinditError::EpochTooLong` past
+/// [`Embedding`] the reachable member of that set is the determinacy gate's
+/// [`WinditError::NonFinite`](crate::embeddings::clap::error::WinditError::NonFinite)
+/// — a window whose accumulator has cancelled to within its own error bound of
+/// zero, so no direction can be reported — plus `WinditError::AllocFailed` for a
+/// refused buffer and `WinditError::EpochTooLong` past
 /// [`VectorEma::MAX_EPOCH_STEPS`](windit::smooth::VectorEma::MAX_EPOCH_STEPS).
 /// The dimension, finiteness and magnitude refusals windit documents cannot
-/// arise here, because [`Embedding`](crate::embeddings::clap::Embedding)'s own
-/// constructors have already excluded them.
+/// arise for the built-ins here, because [`Embedding`]'s own constructors have
+/// already excluded them.
+///
+/// [`Error::EmptyWindows`] only through a CUSTOM policy that returns
+/// `WinditError::Empty`; no built-in does, and an empty input is an empty
+/// output rather than a refusal.
 pub fn smooth<P>(policy: &P, windows: &[WindowEmbedding]) -> Result<Vec<WindowEmbedding>>
 where
-  P: SmoothPolicy<crate::embeddings::clap::Embedding>,
+  P: SmoothPolicy<Embedding>,
 {
   policy.smooth(windows).map_err(Error::from)
 }
