@@ -126,9 +126,10 @@ fn into_policy_dispatches_to_the_matching_built_in() {
     (AggregatePolicyKind::MeanRenormalized, {
       aggregate(&MeanRenormalized, &windows).unwrap()
     }),
-    (AggregatePolicyKind::EmaRenormalized { alpha: 0.5 }, {
-      aggregate(&EmaRenormalized::new(0.5), &windows).unwrap()
-    }),
+    (
+      AggregatePolicyKind::EmaRenormalized(EmaRenormalizedOptions::new(0.5)),
+      { aggregate(&EmaRenormalized::new(0.5), &windows).unwrap() },
+    ),
     (AggregatePolicyKind::CoverageWeightedMean, {
       aggregate(&CoverageWeightedMean, &windows).unwrap()
     }),
@@ -150,9 +151,11 @@ fn a_configured_alpha_reaches_the_fold_at_f64_precision() {
   // above uses — so the decision is pinned here instead, bit-exactly, at the
   // `f64` compute domain the policy actually folds in.
   //
-  // Reverting the field to `f32` fails this test by failing to COMPILE:
-  // `EmaRenormalized::new` takes `C: Real`, and `Real` is sealed to `f64`.
-  let boxed = AggregatePolicyKind::EmaRenormalized { alpha: 0.3 }.into_policy();
+  // Reverting `EmaRenormalizedOptions::alpha` to `f32` fails this test by
+  // failing to COMPILE: `into_policy` hands the accessor's value to
+  // `EmaRenormalized::new`, which takes `C: Real`, and `Real` is sealed to
+  // `f64`.
+  let boxed = AggregatePolicyKind::EmaRenormalized(EmaRenormalizedOptions::new(0.3)).into_policy();
   let (a, b) = ([1.0f64, 0.0], [0.0f64, 1.0]);
   let embeddings: [&[f64]; 2] = [&a, &b];
   let coverages = [1.0f64, 0.25];
@@ -188,7 +191,8 @@ mod serde_tests {
     for &kind in AggregatePolicyKind::REPRESENTATIVES {
       let expected = match kind {
         AggregatePolicyKind::MeanRenormalized => r#""mean_renormalized""#.to_string(),
-        AggregatePolicyKind::EmaRenormalized { alpha } => {
+        AggregatePolicyKind::EmaRenormalized(ema) => {
+          let alpha = ema.alpha();
           format!(r#"{{"ema_renormalized":{{"alpha":{alpha}}}}}"#)
         }
         AggregatePolicyKind::CoverageWeightedMean => r#""coverage_weighted_mean""#.to_string(),

@@ -171,8 +171,8 @@ pub mod text;
 pub mod window;
 
 pub use aggregate::{
-  AggregatePolicy, AggregatePolicyKind, CoverageWeightedMean, EmaRenormalized, MeanRenormalized,
-  aggregate,
+  AggregatePolicy, AggregatePolicyKind, CoverageWeightedMean, EmaRenormalized,
+  EmaRenormalizedOptions, MeanRenormalized, aggregate,
 };
 pub use audio::{AudioEncoder, AudioEncoderOptions};
 pub use embedding::Embedding;

@@ -121,6 +121,74 @@ where
   windit::aggregate::aggregate(policy, windows).map_err(Error::from)
 }
 
+/// The configuration [`AggregatePolicyKind::EmaRenormalized`] carries: the
+/// smoothing factor an [`EmaRenormalized`] policy is built with, once a value
+/// has been read off a config surface.
+///
+/// Construction is infallible and the range is checked where the value is used,
+/// the same contract [`EmaRenormalized::new`] itself keeps — see [`Self::new`].
+///
+/// # Why it is not named `EmaRenormalized`
+///
+/// A variant and its payload struct may otherwise share a name, living in
+/// different namespaces; here they cannot, because [`EmaRenormalized`] is
+/// already bound in this module as windit's re-exported policy type. A bare
+/// `EmaOptions` would clear that collision and still be wrong: the flat
+/// [`embeddings::clap`] namespace this type is re-exported into holds a SECOND
+/// ema whose knob is also an `alpha` — the streaming [`VectorEma`] — so the name
+/// has to say which ema it configures. `…Options` is this crate's suffix for a
+/// configuration carrier ([`AudioEncoderOptions`], [`TextEncoderOptions`], …),
+/// and is what windit calls the same infallible-construction,
+/// validated-where-used shape ([`WindowOptions`]).
+///
+/// [`embeddings::clap`]: crate::embeddings::clap
+/// [`VectorEma`]: crate::embeddings::clap::smooth::VectorEma
+/// [`AudioEncoderOptions`]: crate::embeddings::clap::audio::AudioEncoderOptions
+/// [`TextEncoderOptions`]: crate::embeddings::clap::text::TextEncoderOptions
+/// [`WindowOptions`]: windit::plan::WindowOptions
+#[derive(Debug, Clone, Copy, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct EmaRenormalizedOptions {
+  /// The EMA smoothing factor, forwarded to [`EmaRenormalized::new`].
+  ///
+  /// `f64`, matching the compute domain the factor multiplies: this is the
+  /// *wire* type, deserialized from a config surface before any embedding
+  /// exists, and a decimal in a file has no compute domain of its own.
+  /// [`aggregate`] widens clap's `f32` storage to `f64` before folding a
+  /// single component, so an `f32` field here would have resolved the weight
+  /// at `2^-24` inside a sum that rounds at `2^-53` — the defect windit fixed
+  /// in its own selector. The JSON form is unchanged (a number carries no
+  /// width), so configuration files round-trip exactly as before; a configured
+  /// `0.3` now reaches the fold at full `f64` precision rather than through
+  /// the `f32` grid, which moves an EMA aggregate in its eighth significant
+  /// digit. Pass `f64::from(0.3f32)` to reproduce the pre-0.3 weights bit for
+  /// bit.
+  ///
+  /// Required on the wire — deliberately no `serde(default)`, because a config
+  /// that forgets `alpha` is a misconfiguration and not a request for `0.0`,
+  /// the value that pins the fold to the first window.
+  alpha: f64,
+}
+
+impl EmaRenormalizedOptions {
+  /// An EMA configuration with the given smoothing factor.
+  ///
+  /// Infallible, like the [`EmaRenormalized::new`] it feeds: an `alpha` outside
+  /// `[0, 1]` (or a NaN) is reported by [`aggregate`] as [`Error::Windowing`]
+  /// carrying `WinditError::AlphaOutOfRange`, never here — which is what lets
+  /// [`AggregatePolicyKind::into_policy`] have no error channel of its own.
+  /// `const`, so a configuration can be named in a `const` or `static`.
+  pub const fn new(alpha: f64) -> Self {
+    Self { alpha }
+  }
+
+  /// The configured smoothing factor: larger values track recent windows more.
+  #[inline]
+  pub const fn alpha(&self) -> f64 {
+    self.alpha
+  }
+}
+
 /// A serde-able closed enum over the built-in policies, for config surfaces
 /// (a file, CLI flag, or env var that names the aggregation strategy).
 ///
@@ -130,6 +198,12 @@ where
 /// pipeline runs. The wire spellings are clap-owned and pinned (windit's `serde`
 /// feature is off, so its own kind enum never compiles); the mapping to windit
 /// policies happens in [`Self::into_policy`].
+///
+/// Every variant is unit or newtype — the EMA knob lives in
+/// [`EmaRenormalizedOptions`] rather than loose in the variant — and no
+/// `is_`/`unwrap_`/`try_unwrap_` face is generated over them: every consumer
+/// here matches exhaustively on purpose, which is what the two no-`_` matches
+/// below buy, so a helper triple would be unspent public surface.
 ///
 /// # Golden-enum contract (what the tests actually force)
 ///
@@ -147,7 +221,7 @@ where
 /// iterates the hand-maintained test-only `REPRESENTATIVES` slice, so *executing* a
 /// new variant's round-trip still requires adding it there (keep it complete).
 /// This is weaker than alignkit's `define_alignment_fallback!`, which
-/// co-generates the enum and its roster in one macro; the struct-carrying
+/// co-generates the enum and its roster in one macro; the payload-carrying
 /// [`Self::EmaRenormalized`] is why the roster is hand-written here, so its
 /// completeness is a maintained invariant rather than a compile-time guarantee.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -156,24 +230,13 @@ where
 pub enum AggregatePolicyKind {
   /// Selects [`MeanRenormalized`].
   MeanRenormalized,
-  /// Selects [`EmaRenormalized`] with the given smoothing factor.
-  EmaRenormalized {
-    /// The EMA smoothing factor, forwarded to [`EmaRenormalized::new`].
-    ///
-    /// `f64`, matching the compute domain the factor multiplies: this enum is
-    /// the *wire* type, deserialized from a config surface before any embedding
-    /// exists, and a decimal in a file has no compute domain of its own.
-    /// [`aggregate`] widens clap's `f32` storage to `f64` before folding a
-    /// single component, so an `f32` field here would have resolved the weight
-    /// at `2^-24` inside a sum that rounds at `2^-53` — the defect windit fixed
-    /// in its own selector. The JSON form is unchanged (a number carries no
-    /// width), so configuration files round-trip exactly as before; a configured
-    /// `0.3` now reaches the fold at full `f64` precision rather than through
-    /// the `f32` grid, which moves an EMA aggregate in its eighth significant
-    /// digit. Pass `f64::from(0.3f32)` to reproduce the pre-0.3 weights bit for
-    /// bit.
-    alpha: f64,
-  },
+  /// Selects [`EmaRenormalized`], configured by [`EmaRenormalizedOptions`].
+  ///
+  /// Externally tagged, so the wire form is unchanged by the payload living in
+  /// its own struct: a newtype variant serializes as its payload does, and
+  /// `{"ema_renormalized":{"alpha":0.5}}` is still exactly what a config file
+  /// holds (pinned by the golden round-trip).
+  EmaRenormalized(EmaRenormalizedOptions),
   /// Selects [`CoverageWeightedMean`].
   CoverageWeightedMean,
 }
@@ -181,15 +244,16 @@ pub enum AggregatePolicyKind {
 impl AggregatePolicyKind {
   /// Convert to the boxed trait object [`aggregate`] runs.
   ///
-  /// Infallible: [`Self::EmaRenormalized`]'s `alpha` is validated when the policy
-  /// runs (through [`aggregate`]), so a config that names a built-in always
-  /// yields a policy, and a bad `alpha` fails loudly at aggregation as
+  /// Infallible: [`Self::EmaRenormalized`]'s
+  /// [`alpha`](EmaRenormalizedOptions::alpha) is validated when the policy runs
+  /// (through [`aggregate`]), so a config that names a built-in always yields a
+  /// policy, and a bad `alpha` fails loudly at aggregation as
   /// [`Error::Windowing`] carrying `WinditError::AlphaOutOfRange` rather than
   /// here.
   pub fn into_policy(self) -> Box<dyn AggregatePolicy + Send + Sync> {
     match self {
       Self::MeanRenormalized => Box::new(MeanRenormalized),
-      Self::EmaRenormalized { alpha } => Box::new(EmaRenormalized::new(alpha)),
+      Self::EmaRenormalized(ema) => Box::new(EmaRenormalized::new(ema.alpha())),
       Self::CoverageWeightedMean => Box::new(CoverageWeightedMean),
     }
   }
@@ -201,7 +265,7 @@ impl AggregatePolicyKind {
   #[cfg(all(test, feature = "serde"))]
   pub(crate) const REPRESENTATIVES: &'static [Self] = &[
     Self::MeanRenormalized,
-    Self::EmaRenormalized { alpha: 0.5 },
+    Self::EmaRenormalized(EmaRenormalizedOptions::new(0.5)),
     Self::CoverageWeightedMean,
   ];
 }
