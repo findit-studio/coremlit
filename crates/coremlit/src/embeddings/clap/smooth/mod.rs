@@ -25,8 +25,8 @@
 //!
 //! windit's other two non-identity smoothers, `Ema` and `CadenceEma`, are
 //! `Smoother<f32>` scalar low-passes — the right shape for a per-window
-//! *probability* (which is how `audio::ced` uses them) and the wrong one for a
-//! 512-wide unit-norm embedding. They are deliberately absent here for the same
+//! *probability* (which is what `audio::ced` points its callers at) and the
+//! wrong one for a 512-wide unit-norm embedding. They are deliberately absent here for the same
 //! reason `SaliencyWeighted` is absent from
 //! [`aggregate`](crate::embeddings::clap::aggregate): re-exporting a knob this
 //! module's value type cannot use would ship a misleading surface. Reach them
