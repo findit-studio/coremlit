@@ -142,6 +142,40 @@ fn into_policy_dispatches_to_the_matching_built_in() {
   }
 }
 
+#[test]
+fn a_configured_alpha_reaches_the_fold_at_f64_precision() {
+  // The wire field is `f64`, so a configured `0.3` is the `f64` nearest 3/10 and
+  // not the `f32` one widened into the fold. The two differ in the eighth
+  // significant digit, which is under the 1e-6 `is_close` the dispatch test
+  // above uses — so the decision is pinned here instead, bit-exactly, at the
+  // `f64` compute domain the policy actually folds in.
+  //
+  // Reverting the field to `f32` fails this test by failing to COMPILE:
+  // `EmaRenormalized::new` takes `C: Real`, and `Real` is sealed to `f64`.
+  let boxed = AggregatePolicyKind::EmaRenormalized { alpha: 0.3 }.into_policy();
+  let (a, b) = ([1.0f64, 0.0], [0.0f64, 1.0]);
+  let embeddings: [&[f64]; 2] = [&a, &b];
+  let coverages = [1.0f64, 0.25];
+
+  let configured = boxed.aggregate_values(&embeddings, &coverages, 2).unwrap();
+  let exact = EmaRenormalized::new(0.3f64)
+    .aggregate_values(&embeddings, &coverages, 2)
+    .unwrap();
+  let widened_from_f32 = EmaRenormalized::new(f64::from(0.3f32))
+    .aggregate_values(&embeddings, &coverages, 2)
+    .unwrap();
+
+  assert_eq!(
+    configured, exact,
+    "a configured alpha must reach the fold unrounded"
+  );
+  assert_ne!(
+    configured, widened_from_f32,
+    "an f32 wire field would have folded these weights instead — if this ever \
+     passes, the eighth-digit move this release took on has been reverted"
+  );
+}
+
 #[cfg(feature = "serde")]
 mod serde_tests {
   use super::*;
