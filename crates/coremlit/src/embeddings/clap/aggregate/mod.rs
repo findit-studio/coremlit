@@ -59,9 +59,11 @@ mod tests;
 /// The set is open. windit's trait is slice-level — values arrive already
 /// widened to the `f64` compute domain and unit-normalized, and [`aggregate`]
 /// reconstructs the [`Embedding`] from what the policy returns — so a custom
-/// policy implements [`AggregatePolicy`] over `&[&[f64]]`. Here one that trusts
-/// only the highest-coverage window, exercised through the public seam, no model
-/// required:
+/// policy implements [`AggregatePolicy`] over `&[&[f64]]`, and reads the window
+/// coverages as `&[f64]` — the domain [`Span::coverage`](crate::embeddings::clap::window::Span::coverage)
+/// itself resolves in, so nothing the fold multiplies an embedding by is rounded
+/// through a narrower grid first. Here one that trusts only the highest-coverage
+/// window, exercised through the public seam, no model required:
 ///
 /// ```
 /// use coremlit::embeddings::clap::aggregate::{AggregatePolicy, aggregate};
@@ -75,7 +77,7 @@ mod tests;
 ///     fn aggregate_values(
 ///         &self,
 ///         embeddings: &[&[f64]],
-///         coverages: &[f32],
+///         coverages: &[f64],
 ///         dim: usize,
 ///     ) -> Result<Vec<f64>, WinditError> {
 ///         let (best, _) = coverages
@@ -155,7 +157,20 @@ pub enum AggregatePolicyKind {
   /// Selects [`EmaRenormalized`] with the given smoothing factor.
   EmaRenormalized {
     /// The EMA smoothing factor, forwarded to [`EmaRenormalized::new`].
-    alpha: f32,
+    ///
+    /// `f64`, matching the compute domain the factor multiplies: this enum is
+    /// the *wire* type, deserialized from a config surface before any embedding
+    /// exists, and a decimal in a file has no compute domain of its own.
+    /// [`aggregate`] widens clap's `f32` storage to `f64` before folding a
+    /// single component, so an `f32` field here would have resolved the weight
+    /// at `2^-24` inside a sum that rounds at `2^-53` — the defect windit fixed
+    /// in its own selector. The JSON form is unchanged (a number carries no
+    /// width), so configuration files round-trip exactly as before; a configured
+    /// `0.3` now reaches the fold at full `f64` precision rather than through
+    /// the `f32` grid, which moves an EMA aggregate in its eighth significant
+    /// digit. Pass `f64::from(0.3f32)` to reproduce the pre-0.3 weights bit for
+    /// bit.
+    alpha: f64,
   },
   /// Selects [`CoverageWeightedMean`].
   CoverageWeightedMean,

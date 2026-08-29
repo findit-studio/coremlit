@@ -154,7 +154,11 @@ fn span_geometry_accessors() {
   assert_eq!(s.len(), 280_000);
   assert_eq!(s.end(), 1_000_000);
   assert_eq!(s.window(), WINDOW_SAMPLES);
-  assert!((s.coverage() - 280_000.0 / 480_000.0).abs() < 1e-7);
+  // Exact, not epsilon: `coverage()` resolves in `f64`, and for a window at or
+  // under `2^53` it is the IEEE division of the two exact counts — bit for bit
+  // the same expression as the right-hand side. The `1e-7` slack this replaces
+  // was sized for the old `f32` return and is now unfalsifiable.
+  assert_eq!(s.coverage(), 280_000.0 / 480_000.0);
 }
 
 #[test]

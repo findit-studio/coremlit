@@ -103,7 +103,7 @@
 //! is not re-exported anywhere, so depend on `windit` directly:
 //!
 //! ```toml
-//! windit = "0.2"   # smoothing; already in your graph via `ced`
+//! windit = "0.3"   # smoothing; already in your graph via `ced`
 //! ```
 //!
 //! `zuoer` is the other case. With the `vad` feature on, `audio::vad`

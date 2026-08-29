@@ -147,10 +147,17 @@
 //!    implement the trait for their own strategies. A serde-able
 //!    [`AggregatePolicyKind`] names the built-ins for config surfaces.
 //!
+//! Step 3 is the *folding* half. Its streaming sibling is [`smooth()`]: a
+//! [`SmoothPolicy`] rewrites one window in / one window out with the span
+//! intact, so a per-window embedding stream can be denoised without being
+//! collapsed to a point. [`VectorEma`] is the vector low-pass — the streaming
+//! counterpart of [`EmaRenormalized`] — and is what a per-window consumer
+//! reaches for where a clip-level one reaches for [`aggregate()`].
+//!
 //! [`score()`] ranks text labels against any embedding (a window's or the
 //! aggregate's) by audio↔text cosine, raw or CLAP-logit-scaled; per-window
 //! scoring ([`score_windows`]) is exposed so score-level smoothing stays
-//! caller-side.
+//! caller-side — [`smooth()`] is the EMBEDDING-level tier, not a score-level one.
 
 pub mod aggregate;
 pub mod audio;
@@ -159,6 +166,7 @@ mod compute_units_serde;
 pub mod embedding;
 pub mod error;
 pub mod score;
+pub mod smooth;
 pub mod text;
 pub mod window;
 
@@ -170,6 +178,7 @@ pub use audio::{AudioEncoder, AudioEncoderOptions};
 pub use embedding::Embedding;
 pub use error::Error;
 pub use score::{LabeledScore, ScoreMode, TextAnchor, score, score_windows};
+pub use smooth::{SmoothPolicy, Smoother, VectorEma, smooth};
 pub use text::{TextEncoder, TextEncoderOptions};
 pub use window::{Span, TailPolicy, WindowEmbedding, WindowPlan};
 

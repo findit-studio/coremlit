@@ -110,7 +110,7 @@ fn every_policy_rejects_empty_windows() {
 #[test]
 fn ema_rejects_out_of_range_alpha_at_aggregation() {
   let windows = [axis(0, 480_000)];
-  for bad in [1.5f32, -0.1, f32::NAN, f32::INFINITY] {
+  for bad in [1.5f64, -0.1, f64::NAN, f64::INFINITY] {
     let err = aggregate(&EmaRenormalized::new(bad), &windows).unwrap_err();
     assert!(
       matches!(err, Error::Windowing(WinditError::AlphaOutOfRange)),
