@@ -224,6 +224,38 @@ fn a_configured_alpha_reaches_the_fold_at_f64_precision() {
   );
 }
 
+#[test]
+fn alpha_that_rounds_into_range_as_f32_is_rejected_at_f64() {
+  // The behavioural fact `EmaRenormalizedOptions::alpha`'s rustdoc now
+  // documents: `1.00000001` parses as `f32` to exactly `1.0` (in range) but
+  // stays `1.00000001` as `f64` (out of range). A legacy JSON config with this
+  // literal used to aggregate and no longer does — pin both sides so the doc
+  // and the behaviour cannot quietly drift apart again.
+  let widened_from_legacy_f32 = f64::from(1.00000001f32);
+  assert_eq!(
+    widened_from_legacy_f32, 1.0,
+    "premise: f32 must round this literal to exactly 1.0"
+  );
+
+  let windows = [axis(0, 480_000), axis(1, 480_000)];
+
+  let via_f32 =
+    AggregatePolicyKind::EmaRenormalized(EmaRenormalizedOptions::new(widened_from_legacy_f32))
+      .into_policy();
+  assert!(
+    aggregate(via_f32.as_ref(), &windows).is_ok(),
+    "an alpha an f32 field would have rounded to 1.0 must still aggregate"
+  );
+
+  let via_f64 =
+    AggregatePolicyKind::EmaRenormalized(EmaRenormalizedOptions::new(1.00000001)).into_policy();
+  let err = aggregate(via_f64.as_ref(), &windows).unwrap_err();
+  assert!(
+    matches!(err, Error::Windowing(WinditError::AlphaOutOfRange)),
+    "the same literal at f64 precision must be rejected as AlphaOutOfRange, got {err:?}"
+  );
+}
+
 #[cfg(feature = "serde")]
 mod serde_tests {
   use super::*;

@@ -181,17 +181,35 @@ pub struct EmaRenormalizedOptions {
   /// [`aggregate`] widens clap's `f32` storage to `f64` before folding a
   /// single component, so an `f32` field here would have resolved the weight
   /// at `2^-24` inside a sum that rounds at `2^-53` — the defect windit fixed
-  /// in its own selector. In JSON a number carries no width, so this field's
-  /// JSON form is unchanged and a JSON configuration file round-trips exactly
-  /// as before (measured). That is JSON-specific, not a general format claim:
-  /// a fixed-width binary format such as bincode encodes an `f32` and an
-  /// `f64` at different byte widths on the wire, and separately,
-  /// [`AggregatePolicyKind::EmaRenormalized`]'s own shape change affects a
-  /// format like RON regardless of this field's type (see that variant's
-  /// docs). A configured `0.3` now reaches the fold at full `f64` precision
-  /// rather than through the `f32` grid, which moves an EMA aggregate in its
-  /// eighth significant digit. Pass `f64::from(0.3f32)` to reproduce the
-  /// pre-0.3 weights bit for bit.
+  /// in its own selector.
+  ///
+  /// What that width change does to a legacy JSON document whose `alpha` was
+  /// written for the old `f32` field, measured by parsing the same literal as
+  /// `f32` then as `f64`:
+  /// - **Structure** is preserved: an old document still deserializes here
+  ///   (pinned by the golden round-trip), because the object shape does not
+  ///   depend on the field's width. A fixed-width binary format is a separate
+  ///   question from JSON: bincode encodes an `f32` and an `f64` at different
+  ///   byte widths on the wire, and
+  ///   [`AggregatePolicyKind::EmaRenormalized`]'s own shape change affects a
+  ///   format like RON regardless of this field's type (see that variant's
+  ///   docs).
+  /// - **Value** is not preserved: `0.30000000000000004` parses as `f32` to
+  ///   `0.3`, which reserializes to `0.3`; the same literal parses as `f64`
+  ///   to `0.30000000000000004` and reserializes unchanged — different
+  ///   bytes.
+  /// - **Behaviour** is not preserved either, and this is the one a caller
+  ///   can be hurt by: `1.00000001` parses as `f32` to exactly `1.0`, inside
+  ///   the `[0, 1]` range [`aggregate`] accepts; the same literal parses as
+  ///   `f64` to `1.00000001`, outside it. A configuration that used to
+  ///   aggregate now fails there instead, as [`Error::Windowing`] carrying
+  ///   `WinditError::AlphaOutOfRange`.
+  ///
+  /// None of this touches a configuration authored for this `f64` field: a
+  /// configured `0.3` reaches the fold at full `f64` precision rather than
+  /// through the `f32` grid, which moves an EMA aggregate in its eighth
+  /// significant digit. Pass `f64::from(0.3f32)` to reproduce the pre-0.3
+  /// weights bit for bit.
   ///
   /// Required on the wire — deliberately no `serde(default)`, because a config
   /// that forgets `alpha` is a misconfiguration and not a request for `0.0`,
