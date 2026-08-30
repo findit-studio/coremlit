@@ -6,7 +6,8 @@ choice). See LICENSE-MIT and LICENSE-APACHE for those terms.
 
 NOTE: the PUBLISHED coremlit crate ships no model weight files, but
 embeddings::clap, embeddings::granite, and embeddings::siglip each BUNDLE a
-third-party tokenizer artifact (via include_bytes! — sections 6b, 7b, and 8b).
+third-party tokenizer artifact (via include_bytes! — sections 6b, 7b, and 8b),
+and audio::lid BUNDLES a third-party label roster the same way (section 10b).
 
 This REPOSITORY redistributes exactly one model: the audio::vad CoreML
 artifact, vendored at
@@ -17,7 +18,7 @@ package directory, so `cargo publish` does not carry it to crates.io — a
 `cargo add coremlit` consumer still fetches every model itself.
 
 Every feature-gated pipeline (audio::whisper / audio::align / audio::speaker /
-audio::vad / audio::ced / embeddings::clap / embeddings::granite /
+audio::vad / audio::ced / audio::lid / embeddings::clap / embeddings::granite /
 embeddings::siglip) LOADS its CoreML model artifacts at runtime; for all of
 them except audio::vad in this repository, a downstream user fetches those
 artifacts separately from Hugging Face (see the crate README and each module's
@@ -48,7 +49,9 @@ Section 7 records the granite text-embedding encoder and its
 artifact-distributed tokenizer, added by the embedkit phase. Section 8 records
 the SigLIP 2 image+text encoder weights and their artifact-distributed Gemma
 tokenizer, added by the siglip phase. Section 9 records the CED source-model
-attribution, added by the CED port. Both audio::vad components below are MIT.
+attribution, added by the CED port. Section 10 records the spoken-language
+identification encoder, its committed label roster and its committed reference
+clip, added by the LID door. Both audio::vad components below are MIT.
 
 ────────────────────────────────────────────────────────────────────────
 1. Silero VAD (upstream model)
@@ -429,3 +432,79 @@ gitignored under `Models/ced/ced-<size>/`.
       conversion/ced/scripts/_fixtures.py) — no third-party audio is
       redistributed. The 527 AudioSet class labels are provided by the
       `soundevents-dataset` crate (AudioSet ontology, Google).
+
+────────────────────────────────────────────────────────────────────────
+10. Spoken-language identification (audio::lid)
+
+audio::lid runs a CoreML export of SpeechBrain's
+`lang-id-voxlingua107-ecapa` — an ECAPA-TDNN language identifier trained on
+VoxLingua107 — as one fp16 `mel -> log probabilities` graph over 107 languages.
+The crate ships NO model files. It DOES bundle that model's label roster
+(section 10b) and this repository commits a reference audio clip taken from the
+upstream model card (section 10c).
+
+  10a) Encoder weights — speechbrain/lang-id-voxlingua107-ecapa. The crate
+       ships no model files; it loads a third-party CoreML export, a format
+       conversion (no weights retrained or altered in value) of the upstream
+       SpeechBrain checkpoint.
+
+         Original model: speechbrain/lang-id-voxlingua107-ecapa
+         https://huggingface.co/speechbrain/lang-id-voxlingua107-ecapa
+         License: Apache-2.0 — preserve the Apache-2.0 attribution when
+         redistributing the weights (or a binary bundling them).
+         Attribution: SpeechBrain (Ravanelli et al.); VoxLingua107
+         (Valk & Alumae, 2021).
+         Source revision recorded in the graph's own creator metadata:
+         0253049ae131d6a4be1c4f0d8b0ff483a0f8c8e9
+
+         CoreML export actually loaded:
+         aufklarer/SpeechBrain-ECAPA-VoxLingua107-21M-CoreML
+         https://huggingface.co/aufklarer/SpeechBrain-ECAPA-VoxLingua107-21M-CoreML
+         revision 2aa4d715a79e410d5f9aa32bd7a4fc9225bf9eb0, Apache-2.0.
+         Per-file SHA-256 pinned in tests/lid/common/mod.rs. MODELS_LOCK does
+         NOT pin it and no CI job fetches it: the model gates that load it are
+         local/dev today (see the `lid` entry in ci.yml's `model-tests` in-lib
+         coverage ledger for why), so this component adds no CI download.
+
+       As an Apache-2.0 work, a redistributor must retain the license and
+       copyright notices AND STATE ANY CHANGES. Two changes apply here and both
+       are upstream of this repository's own code: the export lowers the model
+       to CoreML at fp16 compute with a `[1, frames, 60]` dynamic frame range,
+       and it starts at the log-mel rather than the waveform — the SpeechBrain
+       front end is reimplemented host-side (here, in Rust, `audio::lid`'s
+       private `mel` submodule). coremlit alters no weight value.
+
+  10b) Label roster — voxlingua107_labels.json. COMPILED INTO THE CRATE via
+       include_bytes! (crates/coremlit/src/audio/lid/assets/), so linking
+       coremlit DOES redistribute it. 10 756 bytes of language codes and English
+       names; it carries no model weights.
+
+         Source: the CoreML export repo above (`labels.json` at revision
+         2aa4d715a79e410d5f9aa32bd7a4fc9225bf9eb0), byte-identical to that
+         author's MLX export, and reproducing upstream
+         speechbrain/lang-id-voxlingua107-ecapa's own `label_encoder.txt` in
+         index order.
+         SHA-256: f13f0331965a4a402f4308ed80de662f2d55167d77e163406712ba170b92eb35
+         License: Apache-2.0, the same terms as the model it indexes — retain
+         the license notice when redistributing a binary that links coremlit
+         with the `lid` feature enabled.
+
+       The roster is committed rather than read from the staged artifact
+       (granite's and SigLIP's tokenizers went the other way) because it is a
+       small text file whose 107 rows never change, and because the in-crate
+       `const` table is derived from it: the byte-for-byte agreement is proven
+       by src/audio/lid/labels/tests.rs rather than asserted in prose.
+
+  10c) Reference audio — tests/lid/fixtures/audio/udhr_th_16k.wav. COMMITTED to
+       this repository (not to the published package: it lives under tests/).
+       It is upstream's own `udhr_th.wav` — a Thai reading of the Universal
+       Declaration of Human Rights, shipped with
+       speechbrain/lang-id-voxlingua107-ecapa as that model card's worked
+       example — resampled 44.1 kHz -> 16 kHz mono, which is the stated change.
+
+         Source: speechbrain/lang-id-voxlingua107-ecapa (Apache-2.0).
+         SHA-256 of the committed 16 kHz copy is pinned in tests/lid/e2e.rs.
+
+       It is the anchor the end-to-end gate measures against: the top-1 label
+       and its log probability are what the whole Rust front end is checked by,
+       so the clip's provenance and encoding are pinned rather than incidental.

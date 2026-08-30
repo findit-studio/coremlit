@@ -1,7 +1,7 @@
 <div align="center">
 <h1>coremlit</h1>
 
-**On-device multimodal inference for macOS in Rust**: a safe CoreML runtime layer, plus opt-in feature-gated pipelines — speech (a faithful port of [WhisperKit](https://github.com/argmaxinc/WhisperKit), forced alignment, speaker diarization, Silero VAD), AudioSet sound-event tagging, and audio/text/image embeddings (CLAP, granite, SigLIP 2) — in one crate.
+**On-device multimodal inference for macOS in Rust**: a safe CoreML runtime layer, plus opt-in feature-gated pipelines — speech (a faithful port of [WhisperKit](https://github.com/argmaxinc/WhisperKit), forced alignment, speaker diarization, Silero VAD), AudioSet sound-event tagging, spoken-language identification, and audio/text/image embeddings (CLAP, granite, SigLIP 2) — in one crate.
 
 [<img alt="CI" src="https://img.shields.io/github/actions/workflow/status/findit-studio/coremlit/ci.yml?branch=main&style=for-the-badge&logo=github-actions" height="22">](https://github.com/findit-studio/coremlit/actions/workflows/ci.yml)
 <img alt="MSRV" src="https://img.shields.io/badge/MSRV-1.95-orange?style=for-the-badge&logo=rust" height="22">
@@ -21,6 +21,7 @@
 | [`audio::speaker`](crates/coremlit/src/audio/speaker) | `speaker` (oracle: `coremlit-parity`'s `speaker-oracle`) | CoreML segmentation + embedding backends for `dia`'s diarization: runs pyannote's `segmentation-3.0` and WeSpeaker on Apple silicon under a caller-selected `ComputeUnits` (placement is characterized, never asserted — nothing here measures runtime residency) and produces the `dia`-shaped tensors (`Extraction`) that feed [`dia`](https://github.com/findit-studio/diarization)'s VBx/PLDA clustering. Multi-source (FluidAudio default + Argmax). Never assigns a speaker label — clustering stays in `dia`. |
 | [`audio::vad`](crates/coremlit/src/audio/vad) | `vad` (oracle: `coremlit-parity`'s `vad-bundled`) | Silero VAD on CoreML: runs the FluidInference unified 256 ms model and implements the published [`zuoer`](https://crates.io/crates/zuoer) crate's `VadBackend` seam, re-exporting its detector so a consumer gets the full offline + streaming API with **zero** detection logic duplicated; `ort`/ONNX never enters the runtime graph. |
 | [`audio::ced`](crates/coremlit/src/audio/ced) | `ced` | CED (tiny/mini/small/base) AudioSet sound-event tagging on CoreML: 16 kHz mono waveform → Rust log-mel front-end → fp16 mel→logits transformer natively on Apple silicon → sigmoid + ranked predictions over the 527 rated AudioSet classes (`soundevents-dataset`, ort-free); long clips via `windit` window geometry + Mean/Max confidence aggregation. The four sizes share one size-invariant mel→logits contract (`CedModel`). Closes the ORT-CoreML-EP zeroed-logits gap (`soundevents` stays the ort lineage); parity against committed fp32 goldens lands per size as staged, no `ort`. |
+| [`audio::lid`](crates/coremlit/src/audio/lid) | `lid` | Spoken-language identification on CoreML: 16 kHz mono waveform → Rust log-mel front-end → fp16 mel→log-probabilities graph natively on Apple silicon → the top `k` of a 107-language roster (code + English name + model column + natural-log probability). A **backend-neutral door** — no public name spells the model behind it — today backed by an Apache-2.0 export of `speechbrain/lang-id-voxlingua107-ecapa`. The label roster is committed in-crate (`include_bytes!`, byte-pinned against the artifact author's own JSON); the graph's frame range caps a clip at 30.01 s, so a longer clip is a typed error rather than an invented windowing policy. No `ort`. |
 | [`embeddings`](crates/coremlit/src/embeddings) | `clap` / `granite` / `siglip` | Embedding producers, each a feature-gated CoreML pipeline projecting into a shared joint space, L2-normalized in Rust: CLAP-HTSAT audio+text (`clap`), granite sentence embeddings (`granite`), and SigLIP 2 (`siglip2-base-patch16-naflex`) image+text (`siglip`, NaFlex — no windowing). Parity against committed transformers-fp32 goldens, no `ort`. `video` is likewise reserved and **not** created until a video kit exists. |
 
 ## Layering map
@@ -52,6 +53,12 @@ core: its mel front-end is in-crate Rust (no external logic-seam crate), its
 window geometry rides the crates.io `windit` engine, and its 527-class rated
 label set is the crates.io `soundevents-dataset` data crate (ort-free by
 construction — the ort-based `soundevents` crate is never a dependency).
+
+`audio::lid` (feature `lid`) sits there too, and owns strictly more of itself:
+its mel front-end is in-crate Rust, its 107-language roster is a committed
+in-crate asset rather than a data crate, and it consumes no windowing engine at
+all (the graph's own 30.01 s frame ceiling is the contract, and a longer clip is
+a typed error). Its only feature dependency is `rustfft`.
 
 **Authority.** The runtime **core** owns every CoreML FFI call. Each `audio::*` module owns its pipeline's CoreML execution and host-side glue, but **not** the backend-agnostic algorithm it drives:
 
@@ -134,7 +141,7 @@ hf download openai/whisper-tiny tokenizer.json tokenizer_config.json config.json
   --local-dir Models/tokenizers/whisper-tiny
 ```
 
-Each pipeline resolves its models root from its own env var (`WHISPERKIT_TEST_MODELS`, `ALIGNKIT_TEST_MODELS`, `SPEAKERKIT_TEST_MODELS`/`ARGMAX_TEST_MODELS`, `VADKIT_TEST_MODELS`, `CLAPKIT_TEST_MODELS`, `EMBEDKIT_TEST_MODELS`, `SIGLIP_TEST_MODELS`, `CED_TEST_MODELS`), defaulting to `<repo>/Models/...`, which is gitignored — with one exception. The VAD model is small enough (1.1 MiB) to be **committed**, at `Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc/`, so `cargo test -p coremlit --features vad -- --ignored` works on a fresh clone with nothing downloaded, and CI runs those gates the same way. It is redistributed under MIT; see `NOTICE` sections 1-2 and the `LICENSE` inside that directory. It is *not* part of the published crate — a crates.io consumer fetches every model itself. See each module's `tests/<kit>/model_io.rs` for the pinned repo id, revision, and per-file SHA-256, and the module docs for fetch commands. The model-gated suites load multi-hundred-MB CoreML models per test and libtest runs tests in one binary concurrently by default; on memory-constrained hosts (< 16 GB) append `--test-threads=1` after `--ignored` to run them serially.
+Each pipeline resolves its models root from its own env var (`WHISPERKIT_TEST_MODELS`, `ALIGNKIT_TEST_MODELS`, `SPEAKERKIT_TEST_MODELS`/`ARGMAX_TEST_MODELS`, `VADKIT_TEST_MODELS`, `CLAPKIT_TEST_MODELS`, `EMBEDKIT_TEST_MODELS`, `SIGLIP_TEST_MODELS`, `CED_TEST_MODELS`, `LID_TEST_MODELS`), defaulting to `<repo>/Models/...`, which is gitignored — with one exception. The VAD model is small enough (1.1 MiB) to be **committed**, at `Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc/`, so `cargo test -p coremlit --features vad -- --ignored` works on a fresh clone with nothing downloaded, and CI runs those gates the same way. It is redistributed under MIT; see `NOTICE` sections 1-2 and the `LICENSE` inside that directory. It is *not* part of the published crate — a crates.io consumer fetches every model itself. See each module's `tests/<kit>/model_io.rs` for the pinned repo id, revision, and per-file SHA-256, and the module docs for fetch commands. The model-gated suites load multi-hundred-MB CoreML models per test and libtest runs tests in one binary concurrently by default; on memory-constrained hosts (< 16 GB) append `--test-threads=1` after `--ignored` to run them serially.
 
 ### Running the model-gated suites
 
@@ -147,7 +154,7 @@ model-gates | ced_model_io: 8 of 13 tests are #[ignore]d model gates and did not
 With the models staged, **one command runs the whole gated suite**:
 
 ```sh
-cargo test -p coremlit --features whisper,align,speaker,vad,clap,granite,siglip,ced,serde,tracing,nl-recognizer --no-fail-fast -- --ignored
+cargo test -p coremlit --features whisper,align,speaker,vad,clap,granite,siglip,ced,lid,serde,tracing,nl-recognizer --no-fail-fast -- --ignored
 ```
 
 That feature list is CI's "all non-oracle" combo, pinned by the `feature_map` golden test ([`FEATURE_MAP.md`](crates/coremlit/FEATURE_MAP.md)); the `--test-threads=1` advice above applies to it. `--no-fail-fast` is not optional — without it the first red binary aborts the run and hides every gate after it, the same masking CI's own gate runner avoids. It covers every model gate that needs no third-party oracle — all the `tests/` binaries plus the in-crate gates in `src/`, which are the larger half. Four things it deliberately does not cover, each needing its own command:
@@ -180,6 +187,7 @@ Flat and additive; `default = []`.
 | `vad` | Silero VAD model layer (`zuoer` detector core) |
 | `clap` / `granite` / `siglip` | embedding producers: CLAP audio+text / granite sentence / SigLIP 2 image+text — each committed-golden parity, no `ort` |
 | `ced` | CED (tiny/mini/small/base) AudioSet sound-event tagging — Rust mel + `soundevents-dataset` + `windit`, committed-golden parity per size as staged, no `ort` |
+| `lid` | spoken-language identification over a 107-language roster — Rust mel + a committed in-crate label asset, backend-neutral surface, no `ort` |
 | `serde` | `Serialize`/`Deserialize` on options/results/provenance (+ the whisper JSON writer) |
 | `tracing` | internal log events additionally emitted as `tracing` events |
 
