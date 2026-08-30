@@ -2507,28 +2507,41 @@ fn try_from_parts_rejects_an_output_frame_grid_above_the_allocation_cap() {
 }
 
 #[test]
-fn try_from_parts_accepts_a_soft_active_slot_but_requires_the_count_to_include_it() {
-  // Soft (non-binary) segmentation values are still accepted; what changed in
-  // round 2 is that `count` must AGREE with them.
+fn try_from_parts_refuses_the_soft_active_slot_rounds_1_and_2_argued_over() {
+  // This test has now flipped verdict TWICE, and the second flip retires the
+  // premise both earlier versions shared.
   //
-  // Round 1 read this the other way: it accepted a `count` derived at
-  // `onset = 0.5` while the check used `seg > 0.0`, on the reasoning that
-  // `try_from_parts` cannot know which threshold a producer binarized with. But
-  // NEITHER backend reads an onset — `diarize_online`'s activity scan and dia's
-  // `filter_embeddings` both use `seg > 0.0` — so an onset-derived `count` under
-  // a sub-onset column is the finding-A divergence again with a soft value in
-  // place of a fabricated one: offline, silence at that frame; online, a
-  // speaker. `seg > 0.0` is the ONE predicate the two share, so it is the one
-  // the equality is taken over. `extract()`'s own `count` still satisfies it:
-  // it aggregates `seg >= onset` over a hard `0.0`/`1.0` multilabel, on which
-  // the two predicates coincide for every `onset` in `(0.0, 1.0]`.
+  // Round 1 accepted a `count` derived at `onset = 0.5` under a `0.3` column,
+  // reasoning that `try_from_parts` takes no `onset` and so cannot know which
+  // threshold a producer binarized with. Round 2 kept the parts and tightened
+  // the count: NEITHER backend reads an onset — `diarize_online`'s activity scan
+  // and dia's `filter_embeddings` both use `seg > 0.0` — so the equality is
+  // taken over that shared predicate. Round 2 recorded the choice explicitly,
+  // noting that codex's "hard-binary only" alternative would have forbidden a
+  // soft column, and preserved it.
   //
-  // Slot 1's column carries `0.3`: nonzero, below the default `onset` of 0.5,
-  // and ACTIVE to both engines. `count` must therefore be `[1, 1, 0, 0]`.
+  // The premise underneath both was that a soft cell is legitimate input whose
+  // only open question is which threshold `count` was derived at. It is not.
+  // The BACKENDS — not just the count derivation — read a soft cell
+  // incompatibly: offline sums the magnitudes (`filter_embeddings`'
+  // `clean_frames`, stage 7's `sum_activity == 0.0`) where everything else
+  // booleanizes, and that difference is a speaker count
+  // (`a_fractional_segmentation_splits_the_two_backends`). And the capability
+  // being preserved had no producer: `Extractor::extract` decodes through
+  // `segment::multilabel`'s powerset table and `ArgmaxSource` through the
+  // graph's `speaker_ids`, both exactly `{0.0, 1.0}`
+  // (`no_producer_can_emit_a_segmentation_cell_the_domain_check_refuses`).
+  // Round 2's preservation protected nothing real and admitted a split.
+  //
+  // So what this test pins now: the exact parts rounds 1 and 2 argued over are
+  // REFUSED at the cell, before either round's count question can be asked; the
+  // count equality they settled is unchanged on the domain that survives; and
+  // the onset question itself is moot there.
   let mut raw = one_usable_slot_row(0);
   raw[EMBEDDING_DIM..EMBEDDING_DIM + 64].fill(1.0); // slot 1: usable too
-  let parts = ExtractionParts {
+  let soft = ExtractionParts {
     raw_embeddings: raw,
+    // Slot 1's column carries `0.3`: nonzero, below the default `onset` of 0.5.
     segmentations: vec![1.0, 0.0, 0.0, 0.0, 0.3, 0.0],
     count: vec![1, 1, 0, 0],
     num_chunks: 1,
@@ -2537,28 +2550,78 @@ fn try_from_parts_accepts_a_soft_active_slot_but_requires_the_count_to_include_i
       .with_duration(3.0 * crate::audio::speaker::window::FRAME_STEP_S),
     frames_sw: crate::audio::speaker::window::frame_sliding_window(),
   };
-  let e = Extraction::try_from_parts(parts.clone()).expect("a soft column is not a defect");
-  assert_eq!(e.num_output_frames(), 4);
 
-  // The onset-derived count round 1 accepted is now named, at the frame the
-  // sub-onset column occupies.
-  let under = ExtractionParts {
-    count: vec![1, 0, 0, 0],
-    ..parts.clone()
+  // Round 1 accepted these parts with `count = [1, 0, 0, 0]`; round 2 accepted
+  // them with `[1, 1, 0, 0]`. Round 7 accepts neither: the refusal is the CELL.
+  for count in [vec![1u8, 1, 0, 0], vec![1, 0, 0, 0]] {
+    let err = refused(ExtractionParts {
+      count,
+      ..soft.clone()
+    });
+    let ExtractError::NonBinarySegmentation(n) = err else {
+      panic!("expected NonBinarySegmentation, got {err:?}")
+    };
+    // `[c][f][s]`: frame 1, slot 1 = 1 * SEG_NUM_SLOTS + 1.
+    assert_eq!(
+      (n.index(), n.value(), n.slot()),
+      (SEG_NUM_SLOTS + 1, 0.3, 1)
+    );
+  }
+
+  // Round 2's count equality is untouched on the domain that survives. The same
+  // geometry with the column hardened to `1.0` keeps round 2's `[1, 1, 0, 0]`
+  // and still names round 1's `[1, 0, 0, 0]` at the frame the column occupies.
+  let hard = ExtractionParts {
+    segmentations: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+    ..soft.clone()
   };
-  let err = refused(under);
+  let e = Extraction::try_from_parts(hard.clone()).expect("the hard-binary twin is accepted");
+  assert_eq!(e.num_output_frames(), 4);
+  let err = refused(ExtractionParts {
+    count: vec![1, 0, 0, 0],
+    ..hard.clone()
+  });
   assert!(
     matches!(err, ExtractError::CountNotSegmentationDerived(c)
       if (c.frame(), c.got(), c.expected()) == (1, 0, 1)),
     "expected CountNotSegmentationDerived(1, 0, 1), got {err:?}"
   );
 
-  // And the sub-onset column IS an active column, so a zero row under it is
-  // still the finding-1 defect — the online engine would read that slot as
-  // "no speaker" while its segmentation says otherwise.
+  // And the onset question rounds 1 and 2 argued over cannot arise on that
+  // domain: `seg >= onset` and `seg > 0.0` select the same cells for EVERY
+  // onset the type admits, so there is no longer an onset-derived count that
+  // differs from the derived one. This is what makes the round-2 wording
+  // ("the checks are written against the WEAKEST predicate") a distinction
+  // without a difference rather than a load-bearing choice.
+  let derived_at = |onset: f32| {
+    crate::audio::speaker::window::try_count_from_segmentations(
+      &hard.segmentations,
+      hard.num_chunks,
+      hard.num_frames_per_chunk,
+      SEG_NUM_SLOTS,
+      onset,
+      hard.chunks_sw,
+      hard.frames_sw,
+    )
+    .expect("count")
+  };
+  for onset in [f32::MIN_POSITIVE, 0.01, 0.3, 0.5, 0.9, 1.0] {
+    assert!(
+      crate::audio::speaker::window::check_onset(onset),
+      "onset={onset} must be VALID for this to prove the question is moot"
+    );
+    assert_eq!(
+      derived_at(onset),
+      vec![1u8, 1, 0, 0],
+      "onset={onset} must derive the same count as `seg > 0.0` on a hard buffer"
+    );
+  }
+
+  // The round-1 defect this test also carried survives the hardening: an ACTIVE
+  // column over an all-zero row is still the row refusal, not the domain one.
   let broken = ExtractionParts {
     raw_embeddings: one_usable_slot_row(0), // slot 1 back to all-zero
-    ..parts
+    ..hard
   };
   let err = refused(broken);
   assert!(
@@ -3975,5 +4038,222 @@ fn an_inactive_slots_row_cannot_change_the_offline_result() {
         );
       }
     }
+  }
+}
+
+// =====================================================================
+// ROUND 7. The SEGMENTATION DOMAIN. Every earlier round was "the validator
+// reads a value one way, a backend reads it another"; this one is that at the
+// level of the tensor's value set rather than a row, a count or a grid. The
+// constructor booleanizes `segmentations` at `seg > 0.0` everywhere it touches
+// them, and so does the whole online route — but `diaric`'s offline route SUMS
+// the magnitudes (`filter_embeddings`' `clean_frames`, stage 7's
+// `sum_activity == 0.0`). The two are the same function on `{0.0, 1.0}` and
+// different functions off it, so the cure is to confine the input.
+// =====================================================================
+
+/// The round-7 trigger, as parts: ONE chunk of FOUR frames, slot 0 carrying
+/// `v` on frames 0-1 and slot 1 carrying `v` on frames 2-3, with two usable
+/// ORTHOGONAL embedding rows. `chunks_sw = (0, 3, 1)` over `frames_sw =
+/// (0, 1, 1)` derives exactly four output frames, and every frame has exactly
+/// one active slot, so `count` is `[1, 1, 1, 1]` for any `v > 0.0`.
+///
+/// At `v = 1.0` the two backends agree (two speakers). The whole geometry is
+/// held fixed and only `v` moves, so a divergence is attributable to the VALUE
+/// and to nothing else.
+fn split_by_magnitude_parts(v: f64) -> ExtractionParts {
+  let mut raw_embeddings = one_usable_slot_row(0);
+  // Slot 1: orthogonal to slot 0's `[1.0; 64]` prefix, so the two rows sit at
+  // cosine distance 1 — as far apart as the online engine can see.
+  raw_embeddings[embedding_range(0, 1)][64..128].fill(1.0);
+  let mut segmentations = vec![0.0f64; 4 * SEG_NUM_SLOTS];
+  for f in 0..2 {
+    segmentations[f * SEG_NUM_SLOTS] = v; // frames 0-1, slot 0
+  }
+  for f in 2..4 {
+    segmentations[f * SEG_NUM_SLOTS + 1] = v; // frames 2-3, slot 1
+  }
+  ExtractionParts {
+    raw_embeddings,
+    segmentations,
+    count: vec![1, 1, 1, 1],
+    num_chunks: 1,
+    num_frames_per_chunk: 4,
+    chunks_sw: SlidingWindow::new(0.0, 3.0, 1.0),
+    frames_sw: SlidingWindow::new(0.0, 1.0, 1.0),
+  }
+}
+
+/// One backend's observable answer: the cluster count and the spans it emits.
+type BackendAnswer = (usize, Vec<(f64, f64, usize)>);
+
+/// Both backends' [`BackendAnswer`] for `e`, offline first.
+fn both_backends(e: &Extraction) -> (BackendAnswer, BackendAnswer) {
+  let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+  let read = |o: &diaric::offline::OfflineOutput| {
+    (
+      o.num_clusters(),
+      o.spans_slice()
+        .iter()
+        .map(|s| (s.start(), s.end(), s.cluster()))
+        .collect::<Vec<_>>(),
+    )
+  };
+  (
+    read(
+      &e.diarize_with(&plda, ClusterBackend::default())
+        .expect("this geometry clusters offline"),
+    ),
+    read(
+      &e.diarize_online(OnlineOptions::new())
+        .expect("this geometry clusters online"),
+    ),
+  )
+}
+
+#[test]
+fn a_fractional_segmentation_splits_the_two_backends() {
+  // Finding (round 7). `try_from_parts` BOOLEANIZES every positive
+  // segmentation cell — check 10's activity scan and check 11's count
+  // derivation both test `seg > 0.0` — but the offline backend sums the
+  // ORIGINAL magnitudes: `filter_embeddings` accumulates
+  // `clean_frames += segmentations[..]` over singly-active frames and compares
+  // it with `MIN_ACTIVE_RATIO * num_frames_per_chunk`
+  // (`diarization/src/offline/algo.rs:644-679`). At `v = 0.1` over four frames
+  // each slot's clean sum is `0.2`, below `0.2 * 4 = 0.8`, so NEITHER slot
+  // enters the PLDA train subset and offline collapses both into ONE speaker;
+  // the online engine sees two one-second slots at cosine distance 1 and emits
+  // TWO. One continuous speaker offline, two regions online, from parts that
+  // every check before this one accepts.
+  //
+  // The cure is the DOMAIN, not a second model of offline's sum: no in-crate
+  // producer emits a fractional cell (see
+  // `no_producer_can_emit_a_segmentation_cell_the_domain_check_refuses`), so
+  // soft segmentation support was a capability with no producer and two
+  // incompatible readers.
+  let parts = split_by_magnitude_parts(0.1);
+
+  // Assembled UNCHECKED — the split itself, independent of what the
+  // constructor decides to do about it.
+  let unchecked = Extraction::from_parts(
+    parts.raw_embeddings.clone(),
+    parts.segmentations.clone(),
+    parts.count.clone(),
+    parts.num_chunks,
+    parts.num_frames_per_chunk,
+    parts.chunks_sw,
+    parts.frames_sw,
+  );
+  let (offline, online) = both_backends(&unchecked);
+  assert_eq!(
+    offline,
+    (1, vec![(0.5, 3.5, 0)]),
+    "offline must read the 0.1 cells as magnitudes and merge the two slots"
+  );
+  assert_eq!(
+    online,
+    (2, vec![(0.5, 2.5, 0), (2.5, 3.5, 1)]),
+    "online must read the same cells as booleans and split the two slots"
+  );
+  assert_ne!(offline, online, "the two backends must actually disagree");
+
+  // The IDENTICAL geometry with the cells at `1.0` agrees, which is what makes
+  // this a domain defect rather than a geometry one.
+  let hard = Extraction::try_from_parts(split_by_magnitude_parts(1.0))
+    .expect("the hard-binary twin of the same geometry is accepted");
+  let (offline_hard, online_hard) = both_backends(&hard);
+  assert_eq!(
+    offline_hard, online_hard,
+    "on the hard-binary domain the two backends must agree"
+  );
+  assert_eq!(offline_hard.0, 2, "and both must find the two speakers");
+
+  // So the constructor must refuse the fractional twin, naming the first cell.
+  let err = refused(parts);
+  let ExtractError::NonBinarySegmentation(n) = err else {
+    panic!("expected NonBinarySegmentation, got {err:?}")
+  };
+  assert_eq!((n.index(), n.value(), n.slot()), (0, 0.1, 0));
+}
+
+#[test]
+fn the_segmentation_domain_check_is_an_equality_over_the_whole_buffer() {
+  // The scan is `!= 0.0 && != 1.0` over every cell, so it is neither a range
+  // test nor a floor: values INSIDE `(0.0, 1.0)`, ABOVE `1.0`, BELOW `0.0` and
+  // non-finite are all refused, wherever they sit and whether or not the slot
+  // they belong to is otherwise active.
+  //
+  // `-0.0` is the one value that must be ACCEPTED despite not being written
+  // `0.0`: IEEE-754 equality makes `-0.0 == 0.0`, both backends' `> 0.0` and
+  // `sum == 0.0` readings agree on it, and it is what a caller gets from
+  // negating a zeroed column.
+  let base = split_by_magnitude_parts(1.0);
+  Extraction::try_from_parts(base.clone()).expect("the all-hard buffer is accepted");
+
+  for (cell, bad) in [
+    (0usize, 0.5f64),
+    (1, 0.5),  // an INACTIVE slot's cell: the scan is not activity-gated
+    (2, -1.0), // below zero
+    (5, 1.5),  // above one
+    (7, f64::NAN),
+    (10, f64::INFINITY),
+    (11, f64::NEG_INFINITY),
+    (11, f64::MIN_POSITIVE),
+  ] {
+    let mut parts = base.clone();
+    parts.segmentations[cell] = bad;
+    // A cell change can also break `count`; the domain check runs FIRST, so the
+    // diagnosis names the cell rather than the frame.
+    let err = refused(parts);
+    let ExtractError::NonBinarySegmentation(n) = err else {
+      panic!("expected NonBinarySegmentation for {bad} at cell {cell}, got {err:?}")
+    };
+    assert_eq!(n.index(), cell, "the FIRST offending cell, for {bad}");
+    assert_eq!(n.slot(), cell % SEG_NUM_SLOTS);
+    assert_eq!(n.value().to_bits(), bad.to_bits(), "the value, verbatim");
+  }
+
+  // `-0.0` is accepted: it compares EQUAL to `0.0`, so the domain equality
+  // admits it and both backends' `> 0.0` and `sum == 0.0` readings agree on it.
+  let mut negative_zero = base;
+  negative_zero.segmentations[1] = -0.0;
+  Extraction::try_from_parts(negative_zero).expect("-0.0 == 0.0 and both backends read it so");
+}
+
+#[test]
+fn no_producer_can_emit_a_segmentation_cell_the_domain_check_refuses() {
+  // The premise the fix rests on, asserted rather than assumed: check 9
+  // requires no more of a caller than this crate requires of itself.
+  //
+  // `Extractor::extract` writes exactly two things into `segmentations` —
+  // `segment::multilabel`'s output at `chunk_segmentation_range(c, F)`, and
+  // `zero_slot_column`'s zeros — so the reachable value set is
+  // `POWERSET_TABLE ∪ {0.0}`. The table is walked here through the PUBLIC
+  // `multilabel` over every powerset class, which is what makes this a check on
+  // the producer rather than a restatement of the table.
+  for class in 0..crate::audio::speaker::segment::POWERSET_CLASSES {
+    let mut logits = vec![0.0f32; crate::audio::speaker::segment::POWERSET_CLASSES];
+    logits[class] = 1.0;
+    for v in crate::audio::speaker::segment::multilabel(&logits, 1) {
+      assert!(
+        v == 0.0 || v == 1.0,
+        "multilabel class {class} emitted {v}, which check 9 would refuse"
+      );
+    }
+  }
+
+  // `ArgmaxSource` writes `f64::from(speaker_ids[..])` and `zero_slot_column`'s
+  // zeros. `speaker_ids` is the segmenter graph's own hard powerset decode,
+  // value set exactly `{0.0, 1.0}` — probed against the real model and pinned
+  // by the model-gated `argmax_decoded_output_value_semantics` in
+  // `source::argmax::tests`, which is where a graph change would surface. The
+  // widening itself is exact for those two values, in both f16→f32 (the read)
+  // and f32→f64 (the write), which is the step this test can prove hermetically.
+  for v in [0.0f32, 1.0] {
+    let widened = f64::from(crate::f16::from_f32(v).to_f32());
+    assert!(
+      widened == 0.0 || widened == 1.0,
+      "the f16 speaker_ids value {v} must widen to exactly {v}"
+    );
   }
 }

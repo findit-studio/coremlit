@@ -262,6 +262,43 @@ fn frame_step_not_representable_in_f32_displays_both_the_step_and_its_image() {
 }
 
 #[test]
+fn non_binary_segmentation_displays_the_index_the_value_and_the_slot() {
+  use crate::audio::speaker::segment::SEG_NUM_SLOTS;
+
+  // `[c][f][s]` with the slot axis innermost, so the slot falls out of the flat
+  // index alone: (chunk 2, frame 5, slot 1) on a 7-frame chunk is
+  // ((2 * 7 + 5) * 3) + 1 = 58.
+  let flat = ((2 * 7 + 5) * SEG_NUM_SLOTS) + 1;
+  assert_eq!(flat, 58);
+  let n = NonBinarySegmentation::new(flat, 0.3);
+  assert_eq!((n.index(), n.value(), n.slot()), (58, 0.3, 1));
+  let rendered = ExtractError::NonBinarySegmentation(n).to_string();
+  assert!(rendered.contains("segmentations[58]"), "{rendered}");
+  assert!(rendered.contains("is 0.3"), "{rendered}");
+  assert!(rendered.contains("slot 1"), "{rendered}");
+  assert!(rendered.contains("exactly 0.0 or 1.0"), "{rendered}");
+
+  // Index 0 is slot 0 — the boundary the decode must not shift — and a value
+  // ABOVE the unit interval renders as readily as one inside it, because the
+  // refusal is an equality and not a range.
+  let rendered =
+    ExtractError::NonBinarySegmentation(NonBinarySegmentation::new(0, 4.5)).to_string();
+  assert!(rendered.contains("segmentations[0]"), "{rendered}");
+  assert!(rendered.contains("is 4.5"), "{rendered}");
+  assert!(rendered.contains("slot 0"), "{rendered}");
+
+  // A non-finite cell reaches the same variant.
+  let rendered =
+    ExtractError::NonBinarySegmentation(NonBinarySegmentation::new(2, f64::NAN)).to_string();
+  assert!(rendered.contains("segmentations[2]"), "{rendered}");
+  assert!(rendered.contains("NaN"), "{rendered}");
+  assert!(
+    rendered.contains(&format!("slot {}", 2 % SEG_NUM_SLOTS)),
+    "{rendered}"
+  );
+}
+
+#[test]
 fn active_slot_without_embedding_displays_chunk_and_slot() {
   let a = ActiveSlotWithoutEmbedding::new(7, 2);
   assert_eq!((a.chunk(), a.slot()), (7, 2));

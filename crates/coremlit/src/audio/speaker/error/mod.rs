@@ -282,6 +282,48 @@ impl InvalidSlidingWindow {
   }
 }
 
+/// A `segmentations` cell outside the hard-binary `{0.0, 1.0}` domain.
+///
+/// Payload of [`ExtractError::NonBinarySegmentation`]. Carries the FLAT
+/// `[c][f][s]` index and the value found there. The index alone fixes the slot
+/// (`index % SEG_NUM_SLOTS`, since the slot axis is innermost and its extent is
+/// the constant [`crate::audio::speaker::segment::SEG_NUM_SLOTS`]); recovering
+/// the chunk and frame needs the caller's own `num_frames_per_chunk`, which sits
+/// in the same [`crate::audio::speaker::extract::ExtractionParts`] —
+/// `chunk = index / (num_frames_per_chunk * SEG_NUM_SLOTS)`,
+/// `frame = (index / SEG_NUM_SLOTS) % num_frames_per_chunk`.
+///
+/// No `Eq`/`Hash`: the value is an `f64`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NonBinarySegmentation {
+  index: usize,
+  value: f64,
+}
+
+impl NonBinarySegmentation {
+  /// Flat index into the `[c][f][s]` `segmentations` buffer. The FIRST
+  /// offending cell: the scan stops at the earliest one.
+  #[inline(always)]
+  pub const fn index(&self) -> usize {
+    self.index
+  }
+  /// The value found there — neither `0.0` nor `1.0`.
+  #[inline(always)]
+  pub const fn value(&self) -> f64 {
+    self.value
+  }
+  /// The speaker slot the offending cell belongs to, in `0..SEG_NUM_SLOTS`.
+  #[inline(always)]
+  pub const fn slot(&self) -> usize {
+    self.index % crate::audio::speaker::segment::SEG_NUM_SLOTS
+  }
+
+  /// Crate-private: only the validating constructor raises this.
+  pub(crate) const fn new(index: usize, value: f64) -> Self {
+    Self { index, value }
+  }
+}
+
 /// A `(chunk, slot)` whose `segmentations` column claims speech but whose
 /// `raw_embeddings` row is not a usable embedding.
 ///
@@ -640,6 +682,67 @@ pub enum ExtractError {
     .0.window().step() as f32
   )]
   FrameStepNotRepresentableInF32(InvalidSlidingWindow),
+  /// A `segmentations` cell is neither exactly `0.0` nor exactly `1.0`.
+  ///
+  /// The two backends do not read this tensor the same way once a cell leaves
+  /// that domain, and the split is not in a corner — it changes the number of
+  /// speakers:
+  ///
+  /// - Everything this crate's validator does with `segmentations` BOOLEANIZES
+  ///   it at `seg > 0.0`: the active-slot scan behind
+  ///   [`Self::ActiveSlotWithoutEmbedding`], and the count derivation behind
+  ///   [`Self::CountNotSegmentationDerived`]. So does
+  ///   [`crate::audio::speaker::extract::Extraction::diarize_online`], twice —
+  ///   its per-slot `activity` frame count (which becomes the `f32` speech
+  ///   duration the `min_speech_duration` gate reads) and its distinct-cluster
+  ///   count.
+  /// - `diaric`'s OFFLINE route instead SUMS the magnitudes. Its
+  ///   `filter_embeddings` accumulates `clean_frames += segmentations[…]` over
+  ///   singly-active frames and compares that sum against
+  ///   `0.2 * num_frames_per_chunk` to pick the PLDA train subset
+  ///   (`diarization/src/offline/algo.rs:644-679`); its stage-7 mask sums the
+  ///   whole column and tests `sum_activity == 0.0`
+  ///   (`diarization/src/pipeline/algo.rs:698-711`).
+  ///
+  /// On the hard-binary domain a magnitude sum IS the active-frame count and
+  /// `sum == 0.0` IS "no active frame", so every one of those readings collapses
+  /// onto the same boolean. Off it they diverge: four frames with a slot at
+  /// `0.1` on two of them and a second slot at `0.1` on the other two sum to
+  /// `0.2` each, below `0.2 * 4`, so offline trains on NEITHER and merges both
+  /// into ONE speaker, while online sees two one-second slots at cosine
+  /// distance 1 and emits TWO. Same [`crate::audio::speaker::extract::Extraction`],
+  /// one span or two.
+  ///
+  /// Confining the input to `{0.0, 1.0}` is what removes the divergence, and it
+  /// costs no capability: BOTH in-crate producers already emit exactly that
+  /// domain. [`crate::audio::speaker::extract::Extractor::extract`] writes only
+  /// `crate::audio::speaker::segment::multilabel`'s powerset table (whose rows
+  /// are literal `0.0`/`1.0`) and zeroed columns;
+  /// [`crate::audio::speaker::source::ArgmaxSource`] writes only the graph's
+  /// `speaker_ids`, whose in-graph powerset decode is hard binary (pinned by its
+  /// model-gated `argmax_decoded_output_value_semantics`) and zeroed columns.
+  ///
+  /// Non-finite cells are refused here too, as a by-product of the same
+  /// equality — but they are NOT a split, and this variant does not claim to
+  /// close one. Both routes end in `diaric::reconstruct`, which scans the whole
+  /// tensor and raises `NonFiniteField::Segmentations`
+  /// (`diarization/src/reconstruct/algo.rs:497-508`); the offline route meets
+  /// `diaric::pipeline::assign_embeddings`' own copy of that scan first
+  /// (`diarization/src/pipeline/algo.rs:456-460`), so the two refuse with
+  /// different typed variants and neither returns `Ok`. What this variant adds
+  /// there is only the position: the cell is named at assembly rather than after
+  /// a backend was chosen.
+  ///
+  /// See [`NonBinarySegmentation`] for the payload.
+  #[error(
+    "extraction parts: segmentations[{}] is {} (slot {}) — every cell must be exactly 0.0 or \
+     1.0, because the offline backend sums these magnitudes where the online backend counts \
+     nonzero frames",
+    .0.index(),
+    .0.value(),
+    .0.slot()
+  )]
+  NonBinarySegmentation(NonBinarySegmentation),
   /// A `(chunk, slot)` whose `segmentations` column claims speech pairs with a
   /// `raw_embeddings` row that at least one of the two backends cannot use.
   ///
