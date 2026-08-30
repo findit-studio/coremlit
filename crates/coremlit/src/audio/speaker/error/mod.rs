@@ -1063,6 +1063,35 @@ pub enum ExtractError {
     crate::audio::speaker::extract::MAX_EXTRACTION_TENSOR_BYTES
   )]
   ExtractionTensorBytesTooLarge(usize),
+  /// The chunk grid the geometry derives is above
+  /// [`crate::audio::speaker::extract::MAX_EXTRACTION_CHUNKS`].
+  ///
+  /// The COMPUTE sibling of [`Self::ExtractionTensorBytesTooLarge`], and the
+  /// reason both exist: that one bounds the BYTES the two extraction tensors
+  /// occupy, which the loaded segmenter's per-chunk frame count scales, and this
+  /// one bounds the number of CHUNKS, which is what every producer's model-call
+  /// count is proportional to. A segmenter emitting one frame per ten-second
+  /// chunk costs 3 096 bytes per chunk, so the byte ceiling alone would admit
+  /// 393 349 chunks — 786 698 CoreML calls for 59.17 s of audio, from 946 695
+  /// samples at `step_samples = 2`. Cheap chunks are still chunks.
+  ///
+  /// A RESOURCE bound, not a consistency invariant: the geometry is internally
+  /// consistent and would produce a correct `Extraction` given enough time. See
+  /// [`crate::audio::speaker::extract::MAX_EXTRACTION_CHUNKS`] for how the
+  /// ceiling is derived and why
+  /// [`crate::audio::speaker::extract::Extraction::try_from_parts`] does not
+  /// raise this.
+  ///
+  /// Raised from GEOMETRY ALONE, before any tensor is allocated or any model is
+  /// called. Carries the derived chunk count that was refused; the ceiling is
+  /// the public constant.
+  #[error(
+    "extraction geometry: the declared chunk grid is {} chunks, above the \
+     MAX_EXTRACTION_CHUNKS cap ({})",
+    .0,
+    crate::audio::speaker::extract::MAX_EXTRACTION_CHUNKS
+  )]
+  ExtractionChunkCountTooLarge(usize),
   /// The derived `num_output_frames` would not fit in `usize`. Converted
   /// from [`crate::audio::speaker::window`]'s crate-private `WindowError` by an exhaustive
   /// manual match in [`crate::audio::speaker::extract::Extractor::extract`] (deliberately

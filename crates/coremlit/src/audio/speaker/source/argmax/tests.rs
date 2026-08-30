@@ -1881,21 +1881,26 @@ fn the_frame_cap_refuses_argmax_geometry_before_its_input_scans() {
   );
 }
 
-/// Round 10, this source's half: the chunk-axis bound runs at argmax's earliest
-/// point too, and is UNREACHABLE from here.
+/// Rounds 10 and 11, this source's half: BOTH chunk-axis bounds run at argmax's
+/// earliest point too, and both are UNREACHABLE from here.
 ///
-/// `MAX_EXTRACTION_TENSOR_BYTES` is derived from the first chunk count
-/// `MAX_OUTPUT_FRAMES` refuses at `DEFAULT_STEP_SAMPLES`, and this source's
-/// stride IS that value — pinned by its compiled graph and re-asserted at the
-/// top of `extract`. So at every clip length the frame cap refuses first, and
-/// this bound never names an error. That is a property of the derivation, not a
-/// coincidence, and it is what the round-8 posture asks be pinned rather than
-/// used as a licence to skip the check: the stride is a property of the shipped
-/// graph, not an invariant of `checked_geometry`.
+/// `MAX_EXTRACTION_CHUNKS` is the first chunk count `MAX_OUTPUT_FRAMES` refuses
+/// at `DEFAULT_STEP_SAMPLES`, and this source's stride IS that value — pinned by
+/// its compiled graph and re-asserted at the top of `extract`. So at every clip
+/// length the frame cap refuses first. `MAX_EXTRACTION_TENSOR_BYTES` is derived
+/// at the 594-frame addressable grid and this source's per-window frame count is
+/// the compiled `ARGMAX_FRAMES_PER_WINDOW` = 589, so its footprint stays under
+/// the ceiling at every admitted grid. Neither bound can name an error here.
+///
+/// That is a property of the two derivations, not a coincidence, and it is what
+/// the round-8 posture asks be pinned rather than used as a licence to skip the
+/// checks: the stride and the frame count are properties of the shipped graph,
+/// not invariants of `checked_geometry`.
 #[test]
-fn the_chunk_axis_cap_is_inert_for_argmaxs_pinned_stride() {
+fn the_chunk_axis_caps_are_inert_for_argmaxs_pinned_stride() {
   use crate::audio::speaker::extract::{
-    MAX_EXTRACTION_TENSOR_BYTES, checked_extraction_tensor_bytes,
+    MAX_EXTRACTION_CHUNKS, MAX_EXTRACTION_TENSOR_BYTES, checked_extraction_chunk_count,
+    checked_extraction_tensor_bytes,
   };
 
   /// The smallest clip whose derived output grid exceeds `MAX_OUTPUT_FRAMES` —
@@ -1907,13 +1912,15 @@ fn the_chunk_axis_cap_is_inert_for_argmaxs_pinned_stride() {
   assert_eq!(
     ARGMAX_WINDOW_STRIDE_SAMPLES as u32,
     crate::audio::speaker::window::DEFAULT_STEP_SAMPLES,
-    "the derivation of MAX_EXTRACTION_TENSOR_BYTES rests on these being equal"
+    "the derivation of MAX_EXTRACTION_CHUNKS rests on these being equal"
   );
 
-  // The largest clip the frame cap admits: 70 769 chunks, under the ceiling.
+  // The largest clip the frame cap admits: 70 769 chunks, under both ceilings.
   let (num_chunks, _, _) = checked_geometry(SMALLEST_OVER_CAP_SAMPLES - 1, &w)
     .expect("one sample under the frame cap is still accepted");
   assert_eq!(num_chunks, 70_769);
+  assert_eq!(checked_extraction_chunk_count(num_chunks), Ok(70_769));
+  const { assert!(70_769 < MAX_EXTRACTION_CHUNKS) };
   assert_eq!(
     checked_extraction_tensor_bytes(num_chunks, ARGMAX_FRAMES_PER_WINDOW),
     Ok(1_217_792_952)
@@ -1928,7 +1935,7 @@ fn the_chunk_axis_cap_is_inert_for_argmaxs_pinned_stride() {
   );
 
   // The property, not the two samples: across the whole admissible range this
-  // stride's chunk grid never passes the ceiling.
+  // stride's chunk grid never passes either ceiling.
   for samples in [
     1usize,
     160_000,
@@ -1938,8 +1945,16 @@ fn the_chunk_axis_cap_is_inert_for_argmaxs_pinned_stride() {
   ] {
     let n = crate::audio::speaker::window::num_chunks(samples, &w);
     assert!(
-      checked_extraction_tensor_bytes(n, ARGMAX_FRAMES_PER_WINDOW).is_ok(),
-      "samples={samples} -> {n} chunks must stay inside the ceiling"
+      checked_extraction_chunk_count(n).is_ok()
+        && checked_extraction_tensor_bytes(n, ARGMAX_FRAMES_PER_WINDOW).is_ok(),
+      "samples={samples} -> {n} chunks must stay inside both ceilings"
     );
   }
+
+  // And the compute this source's own call structure buys at that ceiling:
+  // three model calls per 21-window argmax chunk, not per Extraction chunk.
+  assert_eq!(
+    3 * MAX_EXTRACTION_CHUNKS.div_ceil(ARGMAX_WINDOWS_PER_CHUNK),
+    10_110
+  );
 }

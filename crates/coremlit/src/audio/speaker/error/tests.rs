@@ -406,3 +406,56 @@ fn extraction_tensor_bytes_too_large_displays_the_total_and_the_cap() {
   // is the chunk grid, not the same bound restated.
   assert!(rendered.contains("chunk grid"), "{rendered}");
 }
+
+#[test]
+fn extraction_chunk_count_too_large_displays_the_count_and_the_cap() {
+  use crate::audio::speaker::extract::MAX_EXTRACTION_CHUNKS;
+
+  let rendered = ExtractError::ExtractionChunkCountTooLarge(MAX_EXTRACTION_CHUNKS + 1).to_string();
+  assert!(
+    rendered.contains(&(MAX_EXTRACTION_CHUNKS + 1).to_string()),
+    "{rendered}"
+  );
+  assert!(rendered.contains("MAX_EXTRACTION_CHUNKS"), "{rendered}");
+  assert!(
+    rendered.contains(&MAX_EXTRACTION_CHUNKS.to_string()),
+    "{rendered}"
+  );
+  // Same discrimination the byte cap's message needs, in the other direction:
+  // a caller reading "chunk grid" must see this one counts CHUNKS, where
+  // `ExtractionTensorBytesTooLarge` counts bytes of that same grid.
+  assert!(rendered.contains("chunks"), "{rendered}");
+  let bytes = ExtractError::ExtractionTensorBytesTooLarge(1).to_string();
+  assert_ne!(
+    rendered.split_whitespace().collect::<Vec<_>>(),
+    bytes.split_whitespace().collect::<Vec<_>>()
+  );
+}
+
+/// The repo's `rust-type-conventions` rule — "variants are UNIT or NEWTYPE only,
+/// never struct-shaped" — counted rather than asserted per variant, so a new
+/// struct-shaped variant is a failure here rather than a review miss.
+///
+/// The ten are the pre-existing ones: `ModelError::ContractMismatch`,
+/// `InferError`'s five (`NonFiniteOutput`, `InputLength`, `OutputShape`,
+/// `NonFiniteInput`, `F16OverflowInput`), and `ExtractError`'s four
+/// (`StepSamplesExceedsWindow`, `OnsetOutOfRange`, `UnsupportedStepSamples`,
+/// `FrameCountMismatch`). Every variant added since carries a named payload
+/// struct or a plain scalar instead.
+#[test]
+fn error_enums_have_exactly_ten_struct_shaped_variants() {
+  let src = include_str!("mod.rs");
+  let count = src
+    .lines()
+    .filter(|l| {
+      let t = l.strip_prefix("  ").unwrap_or("");
+      t.ends_with(" {")
+        && t.chars().next().is_some_and(char::is_uppercase)
+        && t[..t.len() - 2].chars().all(char::is_alphanumeric)
+    })
+    .count();
+  assert_eq!(
+    count, 10,
+    "struct-shaped variants in audio/speaker/error/mod.rs"
+  );
+}

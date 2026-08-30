@@ -1517,9 +1517,10 @@ fn place_embeddings(
 
 /// The chunk count and both timing grids for `samples_len`, refused if the
 /// output-frame grid they derive is one this crate will not allocate for
-/// (checks 4 and 6 of the shared assembly sequence, round 9) or if the
-/// extraction tensors that chunk grid implies are (round 10) — over geometry
-/// alone.
+/// (checks 4 and 6 of the shared assembly sequence, round 9), if that chunk grid
+/// is more model calls than this crate will make (round 11), or if the
+/// extraction tensors it implies are more memory than this crate will allocate
+/// (round 10, re-derived in round 11) — over geometry alone.
 ///
 /// This source's EARLIEST enforcement point, and it is earlier than
 /// `Extractor::checked_geometry`'s: argmax's window stride is compiled into its
@@ -1552,21 +1553,26 @@ fn place_embeddings(
 /// [`ExtractError::OutputFrameCountOverflow`] or
 /// [`ExtractError::OutputFrameCountTooLarge`], through
 /// `extract::checked_output_frame_count`; then
+/// [`ExtractError::ExtractionChunkCountTooLarge`], through
+/// `extract::checked_extraction_chunk_count`; then
 /// [`ExtractError::ExtractionGeometryOverflow`] or
 /// [`ExtractError::ExtractionTensorBytesTooLarge`], through
-/// `extract::checked_extraction_tensor_bytes`. Both bounds run here rather than
-/// only at assembly for the same reason, and in the same order, as in
+/// `extract::checked_extraction_tensor_bytes`. All three bounds run here rather
+/// than only at assembly for the same reason, and in the same order, as in
 /// `Extractor::checked_geometry`.
 ///
-/// The chunk-axis bound is UNREACHABLE from this source and is run anyway. Its
-/// stride is pinned to `ARGMAX_WINDOW_STRIDE_SAMPLES`, which IS
-/// `DEFAULT_STEP_SAMPLES`, and
-/// [`crate::audio::speaker::extract::MAX_EXTRACTION_TENSOR_BYTES`] is derived so
-/// that at that stride the frame cap always refuses first
-/// (`the_chunk_axis_cap_is_inert_for_argmaxs_pinned_stride`). Running it here is
-/// the round-8 posture: a bound every producer applies, rather than each
+/// Both chunk-axis bounds are UNREACHABLE from this source and are run anyway.
+/// Its stride is pinned to `ARGMAX_WINDOW_STRIDE_SAMPLES`, which IS
+/// `DEFAULT_STEP_SAMPLES`, so the frame cap refuses at 70 770 chunks — exactly
+/// [`crate::audio::speaker::extract::MAX_EXTRACTION_CHUNKS`], which that cap and
+/// that stride are what derive — and its per-window frame count is the fixed
+/// `ARGMAX_FRAMES_PER_WINDOW`, well inside the addressable grid
+/// [`crate::audio::speaker::extract::MAX_EXTRACTION_TENSOR_BYTES`] is derived at
+/// (`the_chunk_axis_caps_are_inert_for_argmaxs_pinned_stride`). Running them
+/// here is the round-8 posture: a bound every producer applies, rather than each
 /// producer applying the bounds it happens to be able to reach — the compiled
-/// stride is a property of the shipped graph, not an invariant of this function.
+/// stride and the compiled frame count are properties of the shipped graph, not
+/// invariants of this function.
 ///
 /// # Panics
 /// Panics if `w_opts.step_samples()` is `0`, as
@@ -1581,6 +1587,7 @@ fn checked_geometry(
   let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(w_opts);
   let frames_sw = crate::audio::speaker::window::frame_sliding_window();
   crate::audio::speaker::extract::checked_output_frame_count(num_chunks, chunks_sw, frames_sw)?;
+  crate::audio::speaker::extract::checked_extraction_chunk_count(num_chunks)?;
   crate::audio::speaker::extract::checked_extraction_tensor_bytes(
     num_chunks,
     ARGMAX_FRAMES_PER_WINDOW,
