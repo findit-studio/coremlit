@@ -1767,6 +1767,69 @@ fn try_from_parts_rejects_non_finite_frames_sw_duration() {
   assert!(w.window().duration().is_nan());
 }
 
+// The window predicate is a five-clause conjunction, and NaN satisfies neither
+// half of a `is_finite() && > 0.0` pair — so the NaN and zero cases above leave
+// three clauses that no test can falsify on its own. These three do: each picks
+// the one value that passes every OTHER clause, so deleting its clause makes the
+// constructor return `Ok` and only this test goes red.
+
+#[test]
+fn try_from_parts_rejects_infinite_frames_sw_duration() {
+  // Sole falsifier of `w.duration().is_finite()`. `+inf > 0.0` is TRUE, so the
+  // positivity clause lets this through; `frames_sw.duration` is also not read
+  // by `try_num_output_frames`, so check 4 lets it through too.
+  let base = valid_parts();
+  let parts = ExtractionParts {
+    frames_sw: base.frames_sw.with_duration(f64::INFINITY),
+    ..base
+  };
+  let err = Extraction::try_from_parts(parts).unwrap_err();
+  let ExtractError::InvalidSlidingWindow(w) = err else {
+    panic!("expected InvalidSlidingWindow, got {err:?}")
+  };
+  assert_eq!(w.part(), ExtractionPart::FramesSw);
+  assert_eq!(w.window().duration(), f64::INFINITY);
+}
+
+#[test]
+fn try_from_parts_rejects_zero_frames_sw_duration() {
+  // Sole falsifier of `w.duration() > 0.0` — the "field never assigned" value.
+  // `0.0.is_finite()` is TRUE, so the finiteness clause lets this through, and
+  // a zero-duration frame window still trips
+  // `try_aggregate_output_frame_count`'s
+  // `assert!(frame_duration.is_finite() && frame_duration > 0.0)`.
+  let base = valid_parts();
+  let parts = ExtractionParts {
+    frames_sw: base.frames_sw.with_duration(0.0),
+    ..base
+  };
+  let err = Extraction::try_from_parts(parts).unwrap_err();
+  let ExtractError::InvalidSlidingWindow(w) = err else {
+    panic!("expected InvalidSlidingWindow, got {err:?}")
+  };
+  assert_eq!(w.part(), ExtractionPart::FramesSw);
+  assert_eq!(w.window().duration(), 0.0);
+}
+
+#[test]
+fn try_from_parts_rejects_infinite_frames_sw_step() {
+  // Sole falsifier of `w.step().is_finite()`. The step case above uses `0.0`,
+  // which IS finite, so it exercises only the positivity clause. `+inf > 0.0` is
+  // TRUE, and `last_chunk_end / +inf` rounds to `0`, so check 4 returns `Ok(1)`
+  // — without the finiteness clause this window would be ACCEPTED.
+  let base = valid_parts();
+  let parts = ExtractionParts {
+    frames_sw: base.frames_sw.with_step(f64::INFINITY),
+    ..base
+  };
+  let err = Extraction::try_from_parts(parts).unwrap_err();
+  let ExtractError::InvalidSlidingWindow(w) = err else {
+    panic!("expected InvalidSlidingWindow, got {err:?}")
+  };
+  assert_eq!(w.part(), ExtractionPart::FramesSw);
+  assert_eq!(w.window().step(), f64::INFINITY);
+}
+
 #[test]
 fn try_from_parts_rejects_non_finite_sliding_window_start() {
   // `start` is the third component of the timing grid. It is not read by
@@ -1936,4 +1999,177 @@ fn diarize_online_refuses_an_oversized_derived_grid_before_allocating_it() {
     ),
     "expected Reconstruct(Shape(CountLenMismatch)), got {err:?}"
   );
+}
+
+#[test]
+fn try_from_parts_cannot_detect_mutually_inconsistent_parts() {
+  // CHARACTERIZATION of the constructor's boundary, not an endorsement of it.
+  //
+  // Every check in `try_from_parts` is a SHAPE check. Parts that are each
+  // individually well-formed, and whose declared geometry describes them all
+  // correctly, are accepted even when they came from DIFFERENT tracks — which is
+  // precisely the mediagraph failure mode the constructor cannot see: two
+  // upstream stages, each internally consistent, joined on the wrong key.
+  //
+  // Here `segmentations`/`count`/geometry come from `online_extraction()` and
+  // `raw_embeddings` from a second track with the identical geometry. Nothing
+  // rejects it, and the clustering silently differs from the real track's — three
+  // online clusters become one. Shapes carry no provenance, so no check inside
+  // this constructor could distinguish the two; detecting it needs a track or
+  // message identity carried alongside the parts, upstream of here.
+  let a = online_extraction();
+
+  // Second track, same geometry: every (chunk, slot) embedding in block 0, so
+  // every surviving slot is the SAME speaker.
+  let mut other_track_embeddings = vec![0.0f32; 2 * SEG_NUM_SLOTS * EMBEDDING_DIM];
+  for c in 0..2 {
+    for s in 0..SEG_NUM_SLOTS {
+      let base = (c * SEG_NUM_SLOTS + s) * EMBEDDING_DIM;
+      other_track_embeddings[base..base + 64].fill(1.0);
+    }
+  }
+  assert_eq!(
+    other_track_embeddings.len(),
+    a.raw_embeddings().len(),
+    "the two tracks must be shape-identical for this to be about provenance"
+  );
+
+  let crossed = Extraction::try_from_parts(ExtractionParts {
+    raw_embeddings: other_track_embeddings,
+    segmentations: a.segmentations().to_vec(),
+    count: a.count().to_vec(),
+    num_chunks: a.num_chunks(),
+    num_frames_per_chunk: a.num_frames_per_chunk(),
+    chunks_sw: a.chunks_sw(),
+    frames_sw: a.frames_sw(),
+  })
+  .expect("shape-valid parts from two tracks are ACCEPTED — the gap this test pins");
+
+  let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+  let online = ClusterBackend::Online(OnlineOptions::new().with_min_speech_duration(0.0));
+  let real = output_fingerprint(&a.diarize_with(&plda, online).expect("real track diarizes"));
+  let mixed = output_fingerprint(&crossed.diarize_with(&plda, online).expect("mixed diarizes"));
+
+  // The mix-up is CONSEQUENTIAL, not cosmetic: it changes the answer.
+  assert_eq!(real.2, 3, "the real track has three online clusters");
+  assert_eq!(mixed.2, 1, "the mixed one collapses to a single speaker");
+  assert_ne!(
+    real, mixed,
+    "a silently-accepted cross-track mix-up must at least be observable here"
+  );
+}
+
+/// An [`Extraction`] whose `count` and windows are built the way
+/// [`Extractor::extract`] builds them: real [`chunk_sliding_window`] /
+/// [`frame_sliding_window`] grids and a `count` from the very
+/// `window::try_count_from_segmentations` call `extract()` makes at its step
+/// 9-11. The closest thing to a model-produced `Extraction` that is reachable
+/// without staged models — `extract()` itself is behind a model gate.
+///
+/// [`chunk_sliding_window`]: crate::audio::speaker::window::chunk_sliding_window
+/// [`frame_sliding_window`]: crate::audio::speaker::window::frame_sliding_window
+fn extract_shaped_extraction(num_chunks: usize, num_frames_per_chunk: usize) -> Extraction {
+  let w = WindowOptions::new();
+  let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&w);
+  let frames_sw = crate::audio::speaker::window::frame_sliding_window();
+
+  let mut segmentations = vec![0.0f64; num_chunks * num_frames_per_chunk * SEG_NUM_SLOTS];
+  for c in 0..num_chunks {
+    for f in 0..num_frames_per_chunk {
+      // One active slot per chunk, rotating, so the aggregation is non-trivial.
+      segmentations[(c * num_frames_per_chunk + f) * SEG_NUM_SLOTS + (c % SEG_NUM_SLOTS)] = 1.0;
+    }
+  }
+  // EXACTLY the call `extract()` makes at step 9-11.
+  let count = crate::audio::speaker::window::try_count_from_segmentations(
+    &segmentations,
+    num_chunks,
+    num_frames_per_chunk,
+    SEG_NUM_SLOTS,
+    w.onset(),
+    chunks_sw,
+    frames_sw,
+  )
+  .expect("this geometry's output-frame count fits usize");
+
+  let raw_embeddings: Vec<f32> = (0..(num_chunks * SEG_NUM_SLOTS * EMBEDDING_DIM))
+    .map(|i| ((i % 64) as f32).mul_add(0.01, 0.5))
+    .collect();
+
+  Extraction::try_from_parts(ExtractionParts {
+    raw_embeddings,
+    segmentations,
+    count,
+    num_chunks,
+    num_frames_per_chunk,
+    chunks_sw,
+    frames_sw,
+  })
+  .unwrap_or_else(|err| panic!("extract()-shaped parts must be accepted: {err}"))
+}
+
+#[test]
+fn try_from_parts_round_trips_an_extract_shaped_extraction() {
+  // The round trip on the most production-like `Extraction` reachable WITHOUT
+  // models: real sliding-window grids and a `count` from `extract()`'s own
+  // derivation, rather than the hand-chosen geometry of `tiny_extraction` /
+  // `online_extraction`. `Extractor::extract` itself needs staged CoreML models,
+  // so this is the strongest form available here.
+  let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+  for (num_chunks, num_frames_per_chunk) in [(1usize, 4usize), (2, 8), (5, 3)] {
+    let original = extract_shaped_extraction(num_chunks, num_frames_per_chunk);
+    let rebuilt =
+      rebuild_through_public_api(&original).expect("an extract()-shaped Extraction's own parts");
+    assert_eq!(rebuilt, original, "({num_chunks}, {num_frames_per_chunk})");
+
+    for backend in [
+      ClusterBackend::default(),
+      ClusterBackend::Online(OnlineOptions::new().with_min_speech_duration(0.0)),
+    ] {
+      match (
+        original.diarize_with(&plda, backend),
+        rebuilt.diarize_with(&plda, backend),
+      ) {
+        (Ok(a), Ok(b)) => assert_eq!(
+          output_fingerprint(&a),
+          output_fingerprint(&b),
+          "({num_chunks}, {num_frames_per_chunk}) diverged on {backend:?}"
+        ),
+        (Err(a), Err(b)) => assert_eq!(format!("{a:?}"), format!("{b:?}")),
+        (a, b) => panic!(
+          "({num_chunks}, {num_frames_per_chunk}) diverged on {backend:?}: original {} vs \
+           rebuilt {}",
+          if a.is_ok() { "Ok" } else { "Err" },
+          if b.is_ok() { "Ok" } else { "Err" },
+        ),
+      }
+    }
+  }
+}
+
+#[test]
+fn diarize_online_never_refuses_a_count_derived_the_way_extract_derives_it() {
+  // The derived-grid guard `diarize_online` gained alongside `try_from_parts`
+  // must be a NO-OP for every in-crate construction path. `Extractor::extract`
+  // and the argmax source both build `count` with
+  // `window::try_count_from_segmentations`, whose returned length IS
+  // `try_num_output_frames(last_chunk_end, frames_sw.step())` — the identical
+  // quantity the guard re-derives. Only a comment asserted that agreement; this
+  // pins it, hermetically, so a future change to either derivation cannot start
+  // refusing extractions that `extract()` produces.
+  for (num_chunks, num_frames_per_chunk) in [(1usize, 4usize), (2, 8), (5, 3)] {
+    let e = extract_shaped_extraction(num_chunks, num_frames_per_chunk);
+
+    let outcome = e.diarize_online(OnlineOptions::new());
+    assert!(
+      !matches!(
+        outcome,
+        Err(diaric::offline::Error::Reconstruct(
+          diaric::reconstruct::Error::Shape(diaric::reconstruct::ShapeError::CountLenMismatch)
+        ))
+      ),
+      "the derived-grid guard refused an extract()-derived count at \
+       ({num_chunks} chunks, {num_frames_per_chunk} frames/chunk)"
+    );
+  }
 }

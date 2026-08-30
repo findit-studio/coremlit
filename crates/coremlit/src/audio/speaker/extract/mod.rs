@@ -700,7 +700,7 @@ impl Extraction {
   /// The PUBLIC construction site: validate an [`ExtractionParts`] and assemble
   /// the [`Extraction`] it describes.
   ///
-  /// [`Self::from_parts`] trusts its in-crate callers — every
+  /// The crate-private `from_parts` trusts its in-crate callers — every
   /// [`crate::audio::speaker::source::ModelSource`] builds a self-consistent
   /// tensor set by construction. This one cannot: mediagraph's cluster node
   /// accumulates the same seven values from TWO upstream stages across many
@@ -711,8 +711,8 @@ impl Extraction {
   ///
   /// `num_output_frames` and `num_speakers` are not parameters — see
   /// [`ExtractionParts`]'s "Not parameters". Assembly itself is delegated to
-  /// [`Self::from_parts`], so the `num_output_frames == count.len()` derivation
-  /// still lives at exactly one place.
+  /// that same crate-private `from_parts`, so the `num_output_frames ==
+  /// count.len()` derivation still lives at exactly one place.
   ///
   /// # What is checked
   ///
@@ -756,6 +756,15 @@ impl Extraction {
   ///   own hermetic fixtures — and would freeze a float derivation into a
   ///   constructor whose job is shape safety. Check 4 above still runs, because
   ///   that one is a panic rather than a rejection.
+  /// - **That the parts came from the SAME track.** Every check here is a shape
+  ///   check, and shapes carry no provenance: parts that are each well-formed
+  ///   and whose declared geometry describes them all correctly are accepted
+  ///   even when `raw_embeddings` came from one track and `segmentations` from
+  ///   another of identical geometry — silently changing the clustering
+  ///   (`try_from_parts_cannot_detect_mutually_inconsistent_parts` pins it). No
+  ///   check inside this constructor can see that; a caller joining parts from
+  ///   several messages must carry its own track identity and match on it before
+  ///   assembling an [`ExtractionParts`].
   ///
   /// # Errors
   /// - [`ExtractError::ZeroExtractionDimension`] — check 1.
@@ -1342,14 +1351,12 @@ impl Extraction {
     // construction path can make it fail here.
     let last_chunk_end =
       self.chunks_sw.duration() + (self.num_chunks - 1) as f64 * self.chunks_sw.step();
-    let derived_output_frames = crate::audio::speaker::window::try_num_output_frames(
-      last_chunk_end,
-      self.frames_sw.step(),
-    )
-    .expect(
-      "every construction path proves this derivation succeeds: extract() bounds the geometry \
+    let derived_output_frames =
+      crate::audio::speaker::window::try_num_output_frames(last_chunk_end, self.frames_sw.step())
+        .expect(
+          "every construction path proves this derivation succeeds: extract() bounds the geometry \
        by samples.len(), and try_from_parts runs this identical call as its check 4",
-    );
+        );
 
     // Refuse a grid that does not match `self.num_output_frames` BEFORE building
     // it. `reconstruct` below requires `count.len() == num_output_frames` and
