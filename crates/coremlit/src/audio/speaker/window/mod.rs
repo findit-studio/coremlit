@@ -704,14 +704,21 @@ pub(crate) enum WindowError {
 /// Guarded computation of [`count_from_segmentations`]'s
 /// `num_output_frames`. Ports dia's `try_num_output_frames_pyannote`'s
 /// overflow check (`diarization/src/aggregate/count.rs:510-547`)
-/// bit-for-bit, scoped to the two inputs this function's one call site
-/// has already validated (`last_chunk_end`, `frame_step`) — dia's own
-/// `num_chunks == 0` / `frame_step` finiteness-and-positivity re-checks
-/// (`count.rs:516-521`) are not repeated here because
-/// [`count_from_segmentations`] already asserts both before computing
-/// `last_chunk_end` (unreachable at this call site). This helper's whole
-/// job is the ONE check dia has that this crate's port was missing: the
-/// division/rounding/cast sequence itself.
+/// bit-for-bit, scoped to the two inputs its callers have already
+/// validated (`last_chunk_end`, `frame_step`) — dia's own `num_chunks ==
+/// 0` / `frame_step` finiteness-and-positivity re-checks
+/// (`count.rs:516-521`) are not repeated here because every caller
+/// asserts or rejects both before computing `last_chunk_end`. This
+/// helper's whole job is the ONE check dia has that this crate's port was
+/// missing: the division/rounding/cast sequence itself.
+///
+/// `pub(crate)`, not module-private: besides the two aggregation paths in
+/// this module, [`crate::audio::speaker::extract::Extraction::try_from_parts`]
+/// runs it as a PRE-check over caller-supplied sliding windows, so that
+/// [`crate::audio::speaker::extract::Extraction::diarize_online`]'s later
+/// `.expect(..)` on the identical `(last_chunk_end, frame_step)` pair stays
+/// unreachable. Both sites must call the SAME function for that argument to
+/// hold — a re-implementation could drift.
 ///
 /// dia's exact bound (`count.rs:522-533`):
 /// ```text
@@ -741,7 +748,10 @@ pub(crate) enum WindowError {
 /// [`WindowError::OutputFrameCountOverflow`] if `(last_chunk_end /
 /// frame_step).round_ties_even()` is non-finite, negative, `>=
 /// usize::MAX as f64`, or whose `+ 1` would overflow `usize`.
-fn try_num_output_frames(last_chunk_end: f64, frame_step: f64) -> Result<usize, WindowError> {
+pub(crate) fn try_num_output_frames(
+  last_chunk_end: f64,
+  frame_step: f64,
+) -> Result<usize, WindowError> {
   let frames_f = (last_chunk_end / frame_step).round_ties_even();
   if !frames_f.is_finite() || frames_f < 0.0 || frames_f >= usize::MAX as f64 {
     return Err(WindowError::OutputFrameCountOverflow);

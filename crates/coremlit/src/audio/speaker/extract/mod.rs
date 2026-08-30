@@ -568,6 +568,79 @@ impl Extractor {
   }
 }
 
+/// The seven values an [`Extraction`] is assembled from — the exact input set
+/// [`Extraction::into_offline_input`] forwards to
+/// `diaric::offline::OfflineInput::new`, minus the two it derives.
+///
+/// This is the "put it back together" half of `Extraction`'s API. mediagraph
+/// decomposes diarization into three autonomous nodes (`segmentation → embed →
+/// cluster`, issue #110); the cluster node accumulates these parts from TWO
+/// upstream stages across many messages and rebuilds an `Extraction` at track
+/// end via [`Extraction::try_from_parts`], then calls the same
+/// [`Extraction::diarize_with`] / [`Extraction::diarize_online`] every in-process
+/// caller does. `Extraction` stays the single carrier: no parallel free
+/// `cluster()` function to keep in step with it.
+///
+/// # Not parameters
+/// - `num_speakers` is the fixed [`SEG_NUM_SLOTS`] (3) — the powerset
+///   segmenter's slot count, not a caller choice
+///   ([`Extraction::num_speakers`]).
+/// - `num_output_frames` IS `count.len()`
+///   (`diarization/src/offline/owned.rs:674`), derived by the constructor so the
+///   two cannot disagree — the same property the crate-private `from_parts` has
+///   always had.
+///
+/// # Why public fields
+/// Every field is REQUIRED, has no default, no presence semantics, and no
+/// per-field invariant: this is a transparent data carrier whose representation
+/// IS the API (`rust-type-conventions`, "Structs and accessors" → Representation
+/// and presence). The invariants are all CROSS-field and belong to
+/// [`Extraction`], which keeps its own fields private and validates on the way
+/// in. Private fields here would add fourteen accessors and setters that each
+/// protect nothing, and either a positional `new` or a `Default`-seeded builder
+/// — both of which reopen the hole this struct exists to close.
+///
+/// The hole: `num_chunks`/`num_frames_per_chunk` are both `usize` and
+/// `chunks_sw`/`frames_sw` are both [`SlidingWindow`], so a seven-argument
+/// positional constructor lets either pair be TRANSPOSED and still compile. A
+/// struct literal names every field, so the compiler checks each one.
+///
+/// This is deliberately NOT the shape of this module's `*Options` types
+/// ([`Options`], [`ComputeOptions`], [`WindowOptions`]): those are
+/// configuration — every field defaultable, `new()` the canonical default,
+/// `with_*`/`set_*` expressing partial override, per-field `serde(default)`
+/// meaningful. None of that applies to a required tensor set, and copying the
+/// shape would hand out a `Default` that is an invalid extraction
+/// (`num_chunks = 0`). The in-crate precedent for THIS shape is
+/// `embeddings::siglip::image::preprocess`'s `VisionInputs`, the analogous
+/// tensor bundle, likewise public-field.
+///
+/// No `#[non_exhaustive]`, for the same reason: it would forbid the struct
+/// literal outside this crate, which is the entire point.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExtractionParts {
+  /// Pre-PLDA WeSpeaker raw embeddings, flattened `[c][s][d]`. Must have length
+  /// `num_chunks * num_speakers * EMBEDDING_DIM`; dropped `(chunk, slot)` rows
+  /// are all-zero. See [`Extraction::raw_embeddings`].
+  pub raw_embeddings: Vec<f32>,
+  /// Per-`(chunk, frame, speaker)` activity, flattened `[c][f][s]`. Must have
+  /// length `num_chunks * num_frames_per_chunk * num_speakers`. See
+  /// [`Extraction::segmentations`].
+  pub segmentations: Vec<f64>,
+  /// Per-output-frame instantaneous speaker count, `[t]`. Its length becomes
+  /// [`Extraction::num_output_frames`]. See [`Extraction::count`].
+  pub count: Vec<u8>,
+  /// Number of sliding-window chunks. See [`Extraction::num_chunks`].
+  pub num_chunks: usize,
+  /// Frames per chunk (the segmentation model's declared frame count). See
+  /// [`Extraction::num_frames_per_chunk`].
+  pub num_frames_per_chunk: usize,
+  /// Outer (chunk-level) sliding window. See [`Extraction::chunks_sw`].
+  pub chunks_sw: SlidingWindow,
+  /// Inner (frame-level) sliding window. See [`Extraction::frames_sw`].
+  pub frames_sw: SlidingWindow,
+}
+
 /// The assembled diaric offline-input tensor set produced by
 /// [`Extractor::extract`]. Its accessors expose exactly
 /// `diaric::offline::OfflineInput::new`'s parameter list (minus `plda`, which
@@ -588,15 +661,20 @@ pub struct Extraction {
 }
 
 impl Extraction {
-  /// The single construction site for an [`Extraction`], shared by every
-  /// [`crate::audio::speaker::source::ModelSource`] (crate-private: the field set is an
-  /// implementation detail, and each source assembles it its own way — see
-  /// [`crate::audio::speaker::source::argmax`], which builds the identical layout from
-  /// argmax's in-graph-decoded tensors instead of a host-side decode).
+  /// The single ASSEMBLY site for an [`Extraction`], shared by every
+  /// [`crate::audio::speaker::source::ModelSource`] and by the public
+  /// [`Self::try_from_parts`] — each source builds the identical layout its own
+  /// way (see [`crate::audio::speaker::source::argmax`], which decodes in-graph
+  /// instead of host-side), and every one of them lands here.
+  ///
+  /// Crate-private and UNCHECKED, deliberately: its in-crate callers produce a
+  /// self-consistent tensor set by construction, so re-validating them would be
+  /// dead weight on the hot path. Anything assembled outside this crate goes
+  /// through [`Self::try_from_parts`], which validates and then delegates here.
   ///
   /// `num_output_frames` is not a parameter: it IS `count.len()`
-  /// (`owned.rs:674`), so deriving it here makes the two impossible to
-  /// disagree.
+  /// (`owned.rs:674`), so deriving it here — at the one site both paths reach —
+  /// makes the two impossible to disagree.
   pub(crate) fn from_parts(
     raw_embeddings: Vec<f32>,
     segmentations: Vec<f64>,
@@ -617,6 +695,227 @@ impl Extraction {
       chunks_sw,
       frames_sw,
     }
+  }
+
+  /// The PUBLIC construction site: validate an [`ExtractionParts`] and assemble
+  /// the [`Extraction`] it describes.
+  ///
+  /// [`Self::from_parts`] trusts its in-crate callers — every
+  /// [`crate::audio::speaker::source::ModelSource`] builds a self-consistent
+  /// tensor set by construction. This one cannot: mediagraph's cluster node
+  /// accumulates the same seven values from TWO upstream stages across many
+  /// messages (issue #110), so a dropped or misordered message reaches here as a
+  /// geometry that does not describe its own tensors. Every check below exists
+  /// so that failure surfaces HERE, naming the disagreeing part, instead of
+  /// producing silently wrong clusters or panicking deep inside `diaric`.
+  ///
+  /// `num_output_frames` and `num_speakers` are not parameters — see
+  /// [`ExtractionParts`]'s "Not parameters". Assembly itself is delegated to
+  /// [`Self::from_parts`], so the `num_output_frames == count.len()` derivation
+  /// still lives at exactly one place.
+  ///
+  /// # What is checked
+  ///
+  /// 1. `num_chunks`, `num_frames_per_chunk` and `count.len()` are all non-zero.
+  /// 2. Both sliding windows are usable timing grids: `start` finite,
+  ///    `duration`/`step` finite and `> 0`.
+  /// 3. `raw_embeddings.len() == num_chunks * num_speakers * EMBEDDING_DIM` and
+  ///    `segmentations.len() == num_chunks * num_frames_per_chunk *
+  ///    num_speakers`, each product computed with `checked_mul` FIRST: an
+  ///    unchecked product can wrap on hostile dimensions (`num_chunks = 2^32,
+  ///    num_frames_per_chunk = 2^32, num_speakers = 3` wraps to `0`) and a short
+  ///    or empty slice would then satisfy a naive equality.
+  /// 4. The output-frame count [`Self::diarize_online`] re-derives from
+  ///    `(chunks_sw, frames_sw, num_chunks)` does not overflow `usize`.
+  ///
+  /// Checks 1, 2 and 4 are the PANIC-preventing ones: `window`'s
+  /// `try_aggregate_output_frame_count` asserts the first two with bare
+  /// `assert!`s and [`Self::diarize_online`] `.expect(..)`s the third, so
+  /// without them a publicly-assembled `Extraction` could panic far from its
+  /// cause. Check 3 is what keeps every `[c][s][d]` / `[c][f][s]` index inside
+  /// its buffer.
+  ///
+  /// # What is deliberately NOT checked
+  ///
+  /// - **`count[t] <= diaric::reconstruct::MAX_COUNT_PER_FRAME`.** `diaric`
+  ///   rejects it as a typed `ShapeError::CountAboveMax`
+  ///   (`diarization/src/offline/algo.rs:612-618`) on the offline route and
+  ///   never reads `count` at all on the online one. Re-checking would mean
+  ///   pinning `diaric`'s constant here (drift) and an O(`num_output_frames`)
+  ///   scan on a path that already fails loudly.
+  /// - **Finiteness of `segmentations` / `raw_embeddings`.** Both are O(n)
+  ///   scans, and both already fail typed: `diaric`'s `reconstruct` rejects
+  ///   every non-finite segmentation, and a non-finite embedding row is refused
+  ///   by `diaric::embed::Embedding::normalize_from` (online) or by PLDA
+  ///   (offline).
+  /// - **`count.len()` equal to the count the geometry would derive.** `diaric`
+  ///   requires only that `num_output_frames` COVER the last chunk's last frame
+  ///   (`ShapeError::OutputFrameCountTooSmall`,
+  ///   `diarization/src/reconstruct/algo.rs:486-494`), not equality. Demanding
+  ///   equality would reject inputs `diaric` accepts — including this crate's
+  ///   own hermetic fixtures — and would freeze a float derivation into a
+  ///   constructor whose job is shape safety. Check 4 above still runs, because
+  ///   that one is a panic rather than a rejection.
+  ///
+  /// # Errors
+  /// - [`ExtractError::ZeroExtractionDimension`] — check 1.
+  /// - [`ExtractError::InvalidSlidingWindow`] — check 2.
+  /// - [`ExtractError::ExtractionGeometryOverflow`] /
+  ///   [`ExtractError::ExtractionLenMismatch`] — check 3.
+  /// - [`ExtractError::OutputFrameCountOverflow`] — check 4.
+  ///
+  /// # Examples
+  /// ```
+  /// use coremlit::audio::speaker::{
+  ///   embed::EMBEDDING_DIM,
+  ///   error::{ExtractError, ExtractionPart},
+  ///   extract::{Extraction, ExtractionParts},
+  ///   segment::SEG_NUM_SLOTS,
+  ///   window::{WindowOptions, chunk_sliding_window, frame_sliding_window},
+  /// };
+  ///
+  /// let parts = ExtractionParts {
+  ///   raw_embeddings: vec![0.5; SEG_NUM_SLOTS * EMBEDDING_DIM],
+  ///   segmentations: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+  ///   count: vec![1, 2, 1, 0],
+  ///   num_chunks: 1,
+  ///   num_frames_per_chunk: 2,
+  ///   chunks_sw: chunk_sliding_window(&WindowOptions::new()),
+  ///   frames_sw: frame_sliding_window(),
+  /// };
+  /// let extraction = Extraction::try_from_parts(parts.clone()).expect("self-consistent parts");
+  /// assert_eq!(extraction.num_output_frames(), 4); // == count.len()
+  /// assert_eq!(extraction.num_speakers(), SEG_NUM_SLOTS);
+  ///
+  /// // A message-assembly bug names the part that disagreed.
+  /// let mut broken = parts;
+  /// broken.segmentations.pop();
+  /// let err = Extraction::try_from_parts(broken).unwrap_err();
+  /// let ExtractError::ExtractionLenMismatch(m) = err else {
+  ///   panic!("expected a length mismatch, got {err}")
+  /// };
+  /// assert_eq!(m.part(), ExtractionPart::Segmentations);
+  /// assert_eq!((m.got(), m.expected()), (5, 6));
+  /// ```
+  pub fn try_from_parts(parts: ExtractionParts) -> Result<Self, ExtractError> {
+    use crate::audio::speaker::error::{
+      ExtractionGeometryOverflow, ExtractionLenMismatch, ExtractionPart, InvalidSlidingWindow,
+    };
+
+    let ExtractionParts {
+      raw_embeddings,
+      segmentations,
+      count,
+      num_chunks,
+      num_frames_per_chunk,
+      chunks_sw,
+      frames_sw,
+    } = parts;
+
+    // ── 1. Non-zero dimensions ────────────────────────────────────────
+    // `count.len()` IS num_output_frames, so an empty `count` is the
+    // ZeroExtractionDimension(Count) case, not a length mismatch.
+    if num_chunks == 0 {
+      return Err(ExtractError::ZeroExtractionDimension(
+        ExtractionPart::NumChunks,
+      ));
+    }
+    if num_frames_per_chunk == 0 {
+      return Err(ExtractError::ZeroExtractionDimension(
+        ExtractionPart::NumFramesPerChunk,
+      ));
+    }
+    if count.is_empty() {
+      return Err(ExtractError::ZeroExtractionDimension(ExtractionPart::Count));
+    }
+
+    // ── 2. Both sliding windows are usable timing grids ───────────────
+    for (part, w) in [
+      (ExtractionPart::ChunksSw, chunks_sw),
+      (ExtractionPart::FramesSw, frames_sw),
+    ] {
+      let usable = w.start().is_finite()
+        && w.duration().is_finite()
+        && w.duration() > 0.0
+        && w.step().is_finite()
+        && w.step() > 0.0;
+      if !usable {
+        return Err(ExtractError::InvalidSlidingWindow(
+          InvalidSlidingWindow::new(part, w),
+        ));
+      }
+    }
+
+    // ── 3. Geometry products, CHECKED, before the length equalities ───
+    // Order matters twice over. Overflow before equality, because a wrapped
+    // product can land on a length a short slice happens to have. And
+    // raw_embeddings' product before segmentations', because the two share
+    // `num_chunks`: a `num_chunks` large enough to overflow one makes the
+    // other's required length unallocatable too, so whichever is checked
+    // first is the one that can be exercised in isolation.
+    let expected_embeddings = num_chunks
+      .checked_mul(SEG_NUM_SLOTS)
+      .and_then(|n| n.checked_mul(EMBEDDING_DIM))
+      .ok_or_else(|| {
+        ExtractError::ExtractionGeometryOverflow(ExtractionGeometryOverflow::new(
+          ExtractionPart::RawEmbeddings,
+          num_chunks,
+          num_frames_per_chunk,
+        ))
+      })?;
+    let expected_segmentations = num_chunks
+      .checked_mul(num_frames_per_chunk)
+      .and_then(|n| n.checked_mul(SEG_NUM_SLOTS))
+      .ok_or_else(|| {
+        ExtractError::ExtractionGeometryOverflow(ExtractionGeometryOverflow::new(
+          ExtractionPart::Segmentations,
+          num_chunks,
+          num_frames_per_chunk,
+        ))
+      })?;
+    if raw_embeddings.len() != expected_embeddings {
+      return Err(ExtractError::ExtractionLenMismatch(
+        ExtractionLenMismatch::new(
+          ExtractionPart::RawEmbeddings,
+          raw_embeddings.len(),
+          expected_embeddings,
+        ),
+      ));
+    }
+    if segmentations.len() != expected_segmentations {
+      return Err(ExtractError::ExtractionLenMismatch(
+        ExtractionLenMismatch::new(
+          ExtractionPart::Segmentations,
+          segmentations.len(),
+          expected_segmentations,
+        ),
+      ));
+    }
+
+    // ── 4. The output-frame count `diarize_online` will re-derive ─────
+    // Same helper, same two arguments, same deterministic f64 arithmetic as
+    // `window::try_aggregate_output_frame_count` runs there, so proving it
+    // returns `Ok` here proves that method's `.expect(..)` is unreachable.
+    // `num_chunks >= 1` (check 1) makes the `- 1` safe; the windows are
+    // finite and positive (check 2), so `last_chunk_end` is the only
+    // quantity left that can drive the division out of range.
+    let last_chunk_end = chunks_sw.duration() + (num_chunks - 1) as f64 * chunks_sw.step();
+    crate::audio::speaker::window::try_num_output_frames(last_chunk_end, frames_sw.step())
+      .map_err(|e| match e {
+        crate::audio::speaker::window::WindowError::OutputFrameCountOverflow => {
+          ExtractError::OutputFrameCountOverflow
+        }
+      })?;
+
+    Ok(Self::from_parts(
+      raw_embeddings,
+      segmentations,
+      count,
+      num_chunks,
+      num_frames_per_chunk,
+      chunks_sw,
+      frames_sw,
+    ))
   }
 
   /// Pre-PLDA WeSpeaker raw embeddings, flattened `[c][s][d]`. Length
@@ -879,11 +1178,15 @@ impl Extraction {
   ///
   /// # Errors
   /// Every failure routes through [`diaric::offline::Error::Reconstruct`]: a
-  /// non-finite segmentation, invalid sliding-window timing, or — only for a
-  /// degenerate input that spawns more than
-  /// [`diaric::reconstruct::MAX_CLUSTER_ID`] + 1 speakers — an out-of-range cluster
-  /// id. The PLDA / pipeline / segment / embed error arms of
-  /// [`diaric::offline::Error`] cannot fire here: the online path runs none of them.
+  /// non-finite segmentation, invalid sliding-window timing, a
+  /// `ShapeError::CountLenMismatch` when the output-frame grid this method
+  /// re-derives from `(chunks_sw, frames_sw, num_chunks)` is not
+  /// [`Self::num_output_frames`] long — raised BEFORE that grid is allocated,
+  /// see the check's own comment — or, only for a degenerate input that spawns
+  /// more than [`diaric::reconstruct::MAX_CLUSTER_ID`] + 1 speakers, an
+  /// out-of-range cluster id. The PLDA / pipeline / segment / embed error arms
+  /// of [`diaric::offline::Error`] cannot fire here: the online path runs none
+  /// of them.
   pub fn diarize_online(
     &self,
     opts: OnlineOptions,
@@ -1032,6 +1335,40 @@ impl Extraction {
       }
     }
 
+    // The output-frame grid length the aggregator below will build, derived in
+    // O(1) from the SAME `(last_chunk_end, frames_sw.step())` pair it uses.
+    // `try_from_parts` runs this very call as its check 4, and `extract()`'s own
+    // geometry keeps `num_output_frames` far below `usize::MAX`, so no
+    // construction path can make it fail here.
+    let last_chunk_end =
+      self.chunks_sw.duration() + (self.num_chunks - 1) as f64 * self.chunks_sw.step();
+    let derived_output_frames = crate::audio::speaker::window::try_num_output_frames(
+      last_chunk_end,
+      self.frames_sw.step(),
+    )
+    .expect(
+      "every construction path proves this derivation succeeds: extract() bounds the geometry \
+       by samples.len(), and try_from_parts runs this identical call as its check 4",
+    );
+
+    // Refuse a grid that does not match `self.num_output_frames` BEFORE building
+    // it. `reconstruct` below requires `count.len() == num_output_frames` and
+    // would raise this same `CountLenMismatch` anyway — but only after
+    // `try_aggregate_output_frame_count` had allocated TWO `f64` buffers of the
+    // derived length. `extract()` derives `count` from this very geometry, so
+    // the two always agree there; a publicly assembled `Extraction`
+    // ([`Self::try_from_parts`]) may instead declare finite, strictly positive
+    // windows whose derived length is astronomically larger than its `count`
+    // (`chunks_sw.duration = 1e13` over `frames_sw.step = 0.01` derives 1e15
+    // frames = 8 PB per buffer), turning a guaranteed typed refusal into an
+    // allocation-failure abort. Same shape as the MAX_CLUSTER_ID early cap
+    // above: the identical typed error `reconstruct` would raise, only sooner.
+    if derived_output_frames != self.num_output_frames {
+      return Err(diaric::offline::Error::Reconstruct(
+        diaric::reconstruct::Error::Shape(diaric::reconstruct::ShapeError::CountLenMismatch),
+      ));
+    }
+
     // The SAME overlap-add + rounding `count_from_segmentations` runs, over the
     // distinct-cluster chunk count. The geometry (`num_chunks`/`num_frames_per_chunk`/
     // `chunks_sw`/`frames_sw`) is IDENTICAL to the one `extract()` already ran to
@@ -1048,8 +1385,8 @@ impl Extraction {
       self.frames_sw,
     )
     .expect(
-      "online count reuses extract()'s already-validated chunk/frame geometry, so the \
-       output-frame count cannot overflow here (num_output_frames is fixed)",
+      "the identical derivation over the identical (last_chunk_end, frames_sw.step()) pair \
+       returned Ok a few lines above, so this one cannot overflow",
     );
 
     // Invariant preserved from the deleted buffer approach: distinct labels at any

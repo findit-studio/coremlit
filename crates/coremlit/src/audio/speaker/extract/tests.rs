@@ -1520,3 +1520,420 @@ fn extract_serde_bypassed_onset_out_of_range_errors() {
     Err(ExtractError::OnsetOutOfRange { onset: 0.0 })
   );
 }
+
+// =====================================================================
+// try_from_parts — the PUBLIC construction site (issue #110). Hermetic:
+// no models, ort-free. Two things are proven here.
+//
+// 1. THE ROUND TRIP, which is the property the issue exists for: an
+//    `Extraction` taken apart through the public accessors and rebuilt
+//    through the public constructor produces a byte-identical
+//    `OfflineOutput` from `diarize_with` — on BOTH backends.
+// 2. EVERY enforced invariant, each with a falsifier that violates that
+//    one and satisfies the rest, asserting the specific typed error.
+//
+// The fixtures reuse `tiny_extraction()` / `online_extraction()` above, so
+// the round trip is pinned on extractions the existing wiring tests
+// already exercise.
+// =====================================================================
+
+use crate::audio::speaker::error::ExtractionPart;
+
+/// The [`ExtractionParts`] of [`tiny_extraction`], self-consistent:
+/// `num_chunks = 1`, `num_frames_per_chunk = 2`, so `raw_embeddings` is
+/// `1 * 3 * 256 = 768` long and `segmentations` is `1 * 2 * 3 = 6`.
+/// Every negative test below starts from this and breaks exactly one thing.
+fn valid_parts() -> ExtractionParts {
+  ExtractionParts {
+    raw_embeddings: (0..(SEG_NUM_SLOTS * EMBEDDING_DIM))
+      .map(|i| i as f32 * 0.25 - 3.0)
+      .collect(),
+    segmentations: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+    count: vec![1, 2, 1, 0],
+    num_chunks: 1,
+    num_frames_per_chunk: 2,
+    chunks_sw: crate::audio::speaker::window::chunk_sliding_window(&WindowOptions::new()),
+    frames_sw: crate::audio::speaker::window::frame_sliding_window(),
+  }
+}
+
+/// Decomposes `e` through its PUBLIC accessors ONLY (no field access, even
+/// though this child module can see the fields) and rebuilds it through the
+/// PUBLIC constructor — exactly what mediagraph's cluster node does with parts
+/// it accumulated from upstream messages.
+fn rebuild_through_public_api(e: &Extraction) -> Result<Extraction, ExtractError> {
+  Extraction::try_from_parts(ExtractionParts {
+    raw_embeddings: e.raw_embeddings().to_vec(),
+    segmentations: e.segmentations().to_vec(),
+    count: e.count().to_vec(),
+    num_chunks: e.num_chunks(),
+    num_frames_per_chunk: e.num_frames_per_chunk(),
+    chunks_sw: e.chunks_sw(),
+    frames_sw: e.frames_sw(),
+  })
+}
+
+/// The tuple [`output_fingerprint`] returns: spans, per-chunk hard assignment,
+/// cluster count, frame-level discrete grid.
+type OutputFingerprint = (
+  Vec<(f64, f64, usize)>,
+  Vec<diaric::pipeline::ChunkAssignment>,
+  usize,
+  Vec<f32>,
+);
+
+/// Every observable field of a [`diaric::offline::OfflineOutput`], flattened for
+/// exact comparison (`OfflineOutput` is not `PartialEq`). Covers the span
+/// geometry, the per-chunk hard assignment, the cluster count, AND the
+/// frame-level discrete grid — so a divergence anywhere in the reconstruction,
+/// not just in the spans, breaks the round-trip assertion.
+fn output_fingerprint(o: &diaric::offline::OfflineOutput) -> OutputFingerprint {
+  (
+    o.spans_slice()
+      .iter()
+      .map(|s| (s.start(), s.end(), s.cluster()))
+      .collect(),
+    o.hard_clusters_slice().to_vec(),
+    o.num_clusters(),
+    o.discrete_diarization_slice().to_vec(),
+  )
+}
+
+#[test]
+fn try_from_parts_round_trips_an_extraction_through_the_public_api() {
+  // THE issue-#110 property, offline backend: accessors out, constructor in,
+  // identical clustering. A dropped or transposed part would break either the
+  // `PartialEq` or the fingerprint.
+  let original = tiny_extraction();
+  let rebuilt = rebuild_through_public_api(&original).expect("a real Extraction's own parts");
+
+  // Same value, including the two DERIVED members (num_output_frames from
+  // count.len(), num_speakers from SEG_NUM_SLOTS) that are not parts.
+  assert_eq!(
+    rebuilt, original,
+    "rebuilt Extraction diverged from the original"
+  );
+  assert_eq!(rebuilt.num_output_frames(), original.count().len());
+  assert_eq!(rebuilt.num_speakers(), SEG_NUM_SLOTS);
+
+  let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+  let backend = ClusterBackend::default();
+  let from_original = original.diarize_with(&plda, backend);
+  let from_rebuilt = rebuilt.diarize_with(&plda, backend);
+
+  match (from_original, from_rebuilt) {
+    (Ok(a), Ok(b)) => assert_eq!(
+      output_fingerprint(&a),
+      output_fingerprint(&b),
+      "rebuilt Extraction produced a different OfflineOutput"
+    ),
+    (Err(a), Err(b)) => assert_eq!(
+      format!("{a:?}"),
+      format!("{b:?}"),
+      "rebuilt Extraction refused differently"
+    ),
+    (a, b) => panic!(
+      "rebuilt Extraction diverged: original {} vs rebuilt {}",
+      if a.is_ok() { "Ok" } else { "Err" },
+      if b.is_ok() { "Ok" } else { "Err" },
+    ),
+  }
+}
+
+#[test]
+fn try_from_parts_round_trips_the_online_backend_too() {
+  // The same round trip on the ONLINE route, whose output depends on the raw
+  // embeddings, the segmentation activity counts AND the frame timing — a part
+  // that survived the offline comparison by accident cannot survive both.
+  let original = online_extraction();
+  let rebuilt = rebuild_through_public_api(&original).expect("a real Extraction's own parts");
+  assert_eq!(rebuilt, original);
+
+  let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+  let backend = ClusterBackend::Online(OnlineOptions::new().with_min_speech_duration(0.0));
+  let a = original
+    .diarize_with(&plda, backend)
+    .expect("online reconstruction succeeds on a valid extraction");
+  let b = rebuilt
+    .diarize_with(&plda, backend)
+    .expect("online reconstruction succeeds on the rebuilt extraction");
+  assert_eq!(
+    output_fingerprint(&a),
+    output_fingerprint(&b),
+    "rebuilt Extraction produced a different online OfflineOutput"
+  );
+}
+
+#[test]
+fn try_from_parts_accepts_self_consistent_parts_and_derives_num_output_frames() {
+  // `num_output_frames` is NOT a part: it IS count.len(). Pinned with a count
+  // length that matches nothing else in the geometry (7 != 1, 2, 6, 768), so a
+  // constructor that derived it from any other dimension would fail here.
+  let mut parts = valid_parts();
+  parts.count = vec![1, 0, 2, 1, 0, 1, 1];
+  let e = Extraction::try_from_parts(parts).expect("self-consistent parts");
+  assert_eq!(e.num_output_frames(), 7);
+  assert_eq!(e.count().len(), 7);
+  assert_eq!(e.num_speakers(), SEG_NUM_SLOTS);
+  assert_eq!(e.num_chunks(), 1);
+  assert_eq!(e.num_frames_per_chunk(), 2);
+}
+
+// ── Falsifiers: one per enforced invariant ──────────────────────────────
+
+#[test]
+fn try_from_parts_rejects_zero_num_chunks() {
+  // num_chunks = 0 makes both expected lengths 0, so the empty tensors keep
+  // every OTHER invariant satisfied; only the zero dimension is violated.
+  // Unchecked, `window::try_aggregate_output_frame_count`'s `assert!(num_chunks
+  // > 0)` would PANIC inside `diarize_online`.
+  let parts = ExtractionParts {
+    raw_embeddings: Vec::new(),
+    segmentations: Vec::new(),
+    num_chunks: 0,
+    ..valid_parts()
+  };
+  assert_eq!(
+    Extraction::try_from_parts(parts).unwrap_err(),
+    ExtractError::ZeroExtractionDimension(ExtractionPart::NumChunks)
+  );
+}
+
+#[test]
+fn try_from_parts_rejects_zero_num_frames_per_chunk() {
+  // num_frames_per_chunk = 0 makes the expected segmentations length 0, so the
+  // empty segmentations satisfy that invariant; raw_embeddings stays exactly
+  // 1 * 3 * 256. Only the zero dimension is violated.
+  let parts = ExtractionParts {
+    segmentations: Vec::new(),
+    num_frames_per_chunk: 0,
+    ..valid_parts()
+  };
+  assert_eq!(
+    Extraction::try_from_parts(parts).unwrap_err(),
+    ExtractError::ZeroExtractionDimension(ExtractionPart::NumFramesPerChunk)
+  );
+}
+
+#[test]
+fn try_from_parts_rejects_empty_count() {
+  // count.len() IS num_output_frames; zero of them makes `diarize_online`'s
+  // `discrete.len() / num_output_frames` a divide-by-zero and is `diaric`'s own
+  // ZeroNumOutputFrames. No length invariant involves `count`, so every other
+  // one still holds.
+  let parts = ExtractionParts {
+    count: Vec::new(),
+    ..valid_parts()
+  };
+  assert_eq!(
+    Extraction::try_from_parts(parts).unwrap_err(),
+    ExtractError::ZeroExtractionDimension(ExtractionPart::Count)
+  );
+}
+
+#[test]
+fn try_from_parts_rejects_non_positive_chunks_sw_step() {
+  // step = 0 trips `try_aggregate_output_frame_count`'s bare
+  // `assert!(chunk_step > 0.0)` — a panic, not a typed error — on the online
+  // route. Everything else in `valid_parts` is untouched.
+  let base = valid_parts();
+  let parts = ExtractionParts {
+    chunks_sw: base.chunks_sw.with_step(0.0),
+    ..base
+  };
+  let err = Extraction::try_from_parts(parts).unwrap_err();
+  let ExtractError::InvalidSlidingWindow(w) = err else {
+    panic!("expected InvalidSlidingWindow, got {err:?}")
+  };
+  assert_eq!(w.part(), ExtractionPart::ChunksSw);
+  assert_eq!(w.window().step(), 0.0);
+}
+
+#[test]
+fn try_from_parts_rejects_non_finite_frames_sw_duration() {
+  // The frames window is the other half of the same invariant, and `duration`
+  // the other half of the same predicate: NaN trips
+  // `assert!(frame_duration.is_finite() && frame_duration > 0.0)`.
+  let base = valid_parts();
+  let parts = ExtractionParts {
+    frames_sw: base.frames_sw.with_duration(f64::NAN),
+    ..base
+  };
+  let err = Extraction::try_from_parts(parts).unwrap_err();
+  let ExtractError::InvalidSlidingWindow(w) = err else {
+    panic!("expected InvalidSlidingWindow, got {err:?}")
+  };
+  assert_eq!(w.part(), ExtractionPart::FramesSw);
+  assert!(w.window().duration().is_nan());
+}
+
+#[test]
+fn try_from_parts_rejects_non_finite_sliding_window_start() {
+  // `start` is the third component of the timing grid. It is not read by
+  // `try_aggregate_output_frame_count`, but `diaric`'s reconstruct requires it
+  // finite (TimingError::NonFiniteParameter), so an infinite start is rejected
+  // here rather than several stages later.
+  let base = valid_parts();
+  let parts = ExtractionParts {
+    chunks_sw: base.chunks_sw.with_start(f64::INFINITY),
+    ..base
+  };
+  let err = Extraction::try_from_parts(parts).unwrap_err();
+  let ExtractError::InvalidSlidingWindow(w) = err else {
+    panic!("expected InvalidSlidingWindow, got {err:?}")
+  };
+  assert_eq!(w.part(), ExtractionPart::ChunksSw);
+  assert!(w.window().start().is_infinite());
+}
+
+#[test]
+fn try_from_parts_rejects_raw_embeddings_geometry_overflow() {
+  // num_chunks * SEG_NUM_SLOTS * EMBEDDING_DIM = 2^60 * 768 overflows usize.
+  // Every invariant checked BEFORE this one is satisfied (non-zero dims, valid
+  // windows). The segmentations length (2^60 * 1 * 3) is unsatisfiable by any
+  // allocatable Vec — inherent, because both products share `num_chunks`, which
+  // is exactly why the embeddings product is checked first.
+  let parts = ExtractionParts {
+    raw_embeddings: Vec::new(),
+    segmentations: Vec::new(),
+    num_chunks: 1usize << 60,
+    num_frames_per_chunk: 1,
+    ..valid_parts()
+  };
+  let err = Extraction::try_from_parts(parts).unwrap_err();
+  let ExtractError::ExtractionGeometryOverflow(g) = err else {
+    panic!("expected ExtractionGeometryOverflow, got {err:?}")
+  };
+  assert_eq!(g.part(), ExtractionPart::RawEmbeddings);
+  assert_eq!(g.num_chunks(), 1usize << 60);
+}
+
+#[test]
+fn try_from_parts_rejects_segmentations_geometry_overflow() {
+  // 2^32 * 2^32 * 3 wraps to 0 in unchecked usize arithmetic, so an EMPTY
+  // segmentations vector would satisfy a naive equality check — the precise
+  // reason the products are computed with `checked_mul` before any comparison.
+  // The embeddings product (2^32 * 768) does NOT overflow, so the earlier check
+  // passes and this one is reached.
+  let parts = ExtractionParts {
+    raw_embeddings: Vec::new(),
+    segmentations: Vec::new(),
+    num_chunks: 1usize << 32,
+    num_frames_per_chunk: 1usize << 32,
+    ..valid_parts()
+  };
+  let err = Extraction::try_from_parts(parts).unwrap_err();
+  let ExtractError::ExtractionGeometryOverflow(g) = err else {
+    panic!("expected ExtractionGeometryOverflow, got {err:?}")
+  };
+  assert_eq!(g.part(), ExtractionPart::Segmentations);
+  assert_eq!(g.num_chunks(), 1usize << 32);
+  assert_eq!(g.num_frames_per_chunk(), 1usize << 32);
+}
+
+#[test]
+fn try_from_parts_rejects_raw_embeddings_len_mismatch() {
+  // One element short of 1 * 3 * 256. Everything else — including the
+  // segmentations length — is exactly right.
+  let mut parts = valid_parts();
+  parts.raw_embeddings.pop();
+  let err = Extraction::try_from_parts(parts).unwrap_err();
+  let ExtractError::ExtractionLenMismatch(m) = err else {
+    panic!("expected ExtractionLenMismatch, got {err:?}")
+  };
+  assert_eq!(m.part(), ExtractionPart::RawEmbeddings);
+  assert_eq!(
+    (m.got(), m.expected()),
+    (767, SEG_NUM_SLOTS * EMBEDDING_DIM)
+  );
+  // The message must name the part and both numbers: a caller debugging a
+  // message-assembly bug needs to know WHICH tensor and BY HOW MUCH.
+  let rendered = err.to_string();
+  assert!(rendered.contains("raw_embeddings"), "{rendered}");
+  assert!(rendered.contains("767"), "{rendered}");
+  assert!(rendered.contains("768"), "{rendered}");
+}
+
+#[test]
+fn try_from_parts_rejects_segmentations_len_mismatch() {
+  // One element short of 1 * 2 * 3, with the embeddings length exactly right —
+  // the two tensors are reported separately so a caller knows which upstream
+  // stage to look at.
+  let mut parts = valid_parts();
+  parts.segmentations.pop();
+  let err = Extraction::try_from_parts(parts).unwrap_err();
+  let ExtractError::ExtractionLenMismatch(m) = err else {
+    panic!("expected ExtractionLenMismatch, got {err:?}")
+  };
+  assert_eq!(m.part(), ExtractionPart::Segmentations);
+  assert_eq!((m.got(), m.expected()), (5, 6));
+  let rendered = err.to_string();
+  assert!(rendered.contains("segmentations"), "{rendered}");
+  assert!(rendered.contains('5'), "{rendered}");
+  assert!(rendered.contains('6'), "{rendered}");
+}
+
+#[test]
+fn try_from_parts_rejects_geometry_whose_output_frame_count_overflows() {
+  // Both windows are finite and strictly positive — they pass check 2 — yet
+  // last_chunk_end / frames_sw.step() = 1e300 / 1e-300 divides to +inf. This is
+  // the geometry `diarize_online` would feed to `try_num_output_frames` and
+  // then `.expect(..)`: without this check the panic happens there, far from
+  // the assembly bug that caused it.
+  let parts = ExtractionParts {
+    chunks_sw: SlidingWindow::new(0.0, 1e300, 1.0),
+    frames_sw: SlidingWindow::new(0.0, 0.1, 1e-300),
+    ..valid_parts()
+  };
+  assert_eq!(
+    Extraction::try_from_parts(parts).unwrap_err(),
+    ExtractError::OutputFrameCountOverflow
+  );
+}
+
+#[test]
+fn try_from_parts_guarantee_makes_diarize_online_panic_free() {
+  // The end-to-end statement of what checks 1, 2 and 4 buy: an Extraction that
+  // came through `try_from_parts` reaches `diarize_online` — the method with
+  // the bare asserts and the `.expect(..)` — without panicking. Any Err here is
+  // a typed `diaric` refusal, which is the contract; a panic is not.
+  let e = Extraction::try_from_parts(valid_parts()).expect("self-consistent parts");
+  let _ = e.diarize_online(OnlineOptions::new());
+  let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+  let _ = e.diarize(&plda);
+}
+
+#[test]
+fn diarize_online_refuses_an_oversized_derived_grid_before_allocating_it() {
+  // The one OOM vector a PUBLIC constructor opens. These windows pass every
+  // `try_from_parts` check — both are finite and strictly positive, and the
+  // derived output-frame count (1e15 + 1) fits `usize` — yet they describe a
+  // grid `diarize_online` would otherwise materialise as TWO `f64` buffers of
+  // 8 PB each before `reconstruct` raised the very same `CountLenMismatch`
+  // against this extraction's 4-frame `count`. An allocation that large is a
+  // process abort, not a catchable failure, so the mismatch is refused first.
+  //
+  // Same convention as `diarize_online_over_cap_grid_is_a_typed_reconstruct_
+  // error_not_an_oom` above: THIS TEST COMPLETING IS THE ALLOCATION PROOF.
+  let parts = ExtractionParts {
+    chunks_sw: SlidingWindow::new(0.0, 1e13, 1.0),
+    frames_sw: SlidingWindow::new(0.0, 0.06, 0.01),
+    ..valid_parts()
+  };
+  let e = Extraction::try_from_parts(parts)
+    .expect("finite positive windows with a representable derived frame count are accepted");
+  assert_eq!(e.num_output_frames(), 4);
+
+  let err = e
+    .diarize_online(OnlineOptions::new())
+    .expect_err("a derived grid that does not match num_output_frames must be refused");
+  assert!(
+    matches!(
+      err,
+      diaric::offline::Error::Reconstruct(diaric::reconstruct::Error::Shape(
+        diaric::reconstruct::ShapeError::CountLenMismatch
+      ))
+    ),
+    "expected Reconstruct(Shape(CountLenMismatch)), got {err:?}"
+  );
+}

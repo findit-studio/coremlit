@@ -105,6 +105,179 @@ pub enum InferError {
   EmptyMask,
 }
 
+/// Which member of [`crate::audio::speaker::extract::ExtractionParts`] a
+/// [`crate::audio::speaker::extract::Extraction::try_from_parts`] validation
+/// failure names — one variant per field of that struct.
+///
+/// The point of naming the part is diagnostic reach: the mediagraph cluster node
+/// assembles those seven fields from TWO upstream stages across many messages
+/// (issue #110), so "which part disagreed" is the same question as "which
+/// upstream stage dropped or reordered a message".
+///
+/// Closed (no `#[non_exhaustive]`) on purpose: the vocabulary IS
+/// `ExtractionParts`'s field set, so a new variant can only appear alongside a
+/// new part — already a breaking change to that struct — and a caller routing a
+/// failure back to the stage that produced it wants an exhaustive `match`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display)]
+pub enum ExtractionPart {
+  /// `raw_embeddings`: the flattened `[c][s][d]` pre-PLDA embedding tensor.
+  #[display("raw_embeddings")]
+  RawEmbeddings,
+  /// `segmentations`: the flattened `[c][f][s]` activity tensor.
+  #[display("segmentations")]
+  Segmentations,
+  /// `count`: the per-output-frame speaker count. Its LENGTH is
+  /// `num_output_frames`, which is why an empty `count` is reported as a
+  /// zero dimension.
+  #[display("count")]
+  Count,
+  /// `num_chunks`: the number of sliding-window chunks.
+  #[display("num_chunks")]
+  NumChunks,
+  /// `num_frames_per_chunk`: the segmentation model's per-chunk frame count.
+  #[display("num_frames_per_chunk")]
+  NumFramesPerChunk,
+  /// `chunks_sw`: the outer (chunk-level) sliding window.
+  #[display("chunks_sw")]
+  ChunksSw,
+  /// `frames_sw`: the inner (frame-level) sliding window.
+  #[display("frames_sw")]
+  FramesSw,
+}
+
+/// A flattened tensor whose length disagrees with the geometry declared beside
+/// it in the same [`crate::audio::speaker::extract::ExtractionParts`].
+///
+/// Payload of [`ExtractError::ExtractionLenMismatch`]. Extracted into a named
+/// struct rather than written as a struct-shaped variant, per this repository's
+/// `rust-type-conventions` ("Variants are UNIT or NEWTYPE only").
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExtractionLenMismatch {
+  part: ExtractionPart,
+  got: usize,
+  expected: usize,
+}
+
+impl ExtractionLenMismatch {
+  /// The rejected tensor — [`ExtractionPart::RawEmbeddings`] or
+  /// [`ExtractionPart::Segmentations`].
+  #[inline(always)]
+  pub const fn part(&self) -> ExtractionPart {
+    self.part
+  }
+  /// The length the caller actually supplied.
+  #[inline(always)]
+  pub const fn got(&self) -> usize {
+    self.got
+  }
+  /// The length the caller's own declared geometry requires:
+  /// `num_chunks * num_speakers * EMBEDDING_DIM` for
+  /// [`ExtractionPart::RawEmbeddings`], `num_chunks * num_frames_per_chunk *
+  /// num_speakers` for [`ExtractionPart::Segmentations`].
+  #[inline(always)]
+  pub const fn expected(&self) -> usize {
+    self.expected
+  }
+
+  /// Crate-private: only the validating constructor raises this.
+  pub(crate) const fn new(part: ExtractionPart, got: usize, expected: usize) -> Self {
+    Self {
+      part,
+      got,
+      expected,
+    }
+  }
+}
+
+/// The element count a declared geometry requires overflows `usize`, so NO
+/// slice length can satisfy it and no expected length can even be named.
+///
+/// Payload of [`ExtractError::ExtractionGeometryOverflow`]. Reported separately
+/// from [`ExtractionLenMismatch`] because the two are different diagnoses: a
+/// mismatch means "this tensor is the wrong size", an overflow means "these
+/// dimensions are not a describable tensor at all". Mirrors `diaric`'s own split
+/// between `ShapeError::RawEmbeddingsOverflow` /
+/// `ShapeError::SegmentationsOverflow` and their `*LenMismatch` counterparts
+/// (`diarization/src/offline/algo.rs:575-588`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ExtractionGeometryOverflow {
+  part: ExtractionPart,
+  num_chunks: usize,
+  num_frames_per_chunk: usize,
+}
+
+impl ExtractionGeometryOverflow {
+  /// Whose length product overflowed — [`ExtractionPart::RawEmbeddings`] or
+  /// [`ExtractionPart::Segmentations`].
+  #[inline(always)]
+  pub const fn part(&self) -> ExtractionPart {
+    self.part
+  }
+  /// The declared `num_chunks`. A factor of BOTH products.
+  #[inline(always)]
+  pub const fn num_chunks(&self) -> usize {
+    self.num_chunks
+  }
+  /// The declared `num_frames_per_chunk`. A factor of the `segmentations`
+  /// product only; reported for [`ExtractionPart::RawEmbeddings`] too because
+  /// both dimensions come from the same message-assembly step and a caller
+  /// debugging one wants to see the other.
+  #[inline(always)]
+  pub const fn num_frames_per_chunk(&self) -> usize {
+    self.num_frames_per_chunk
+  }
+
+  /// Crate-private: only the validating constructor raises this.
+  pub(crate) const fn new(
+    part: ExtractionPart,
+    num_chunks: usize,
+    num_frames_per_chunk: usize,
+  ) -> Self {
+    Self {
+      part,
+      num_chunks,
+      num_frames_per_chunk,
+    }
+  }
+}
+
+/// A supplied [`crate::audio::speaker::window::SlidingWindow`] is not a usable
+/// timing grid.
+///
+/// Payload of [`ExtractError::InvalidSlidingWindow`]. Carries the whole window
+/// rather than a "which field" tag: all three components are needed to see what
+/// the assembling caller actually sent, and
+/// [`crate::audio::speaker::window::SlidingWindow`] is `Copy`.
+///
+/// No `Eq`/`Hash`: `SlidingWindow` is three `f64`s.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct InvalidSlidingWindow {
+  part: ExtractionPart,
+  window: crate::audio::speaker::window::SlidingWindow,
+}
+
+impl InvalidSlidingWindow {
+  /// Which window — [`ExtractionPart::ChunksSw`] or
+  /// [`ExtractionPart::FramesSw`].
+  #[inline(always)]
+  pub const fn part(&self) -> ExtractionPart {
+    self.part
+  }
+  /// The rejected window, verbatim.
+  #[inline(always)]
+  pub const fn window(&self) -> crate::audio::speaker::window::SlidingWindow {
+    self.window
+  }
+
+  /// Crate-private: only the validating constructor raises this.
+  pub(crate) const fn new(
+    part: ExtractionPart,
+    window: crate::audio::speaker::window::SlidingWindow,
+  ) -> Self {
+    Self { part, window }
+  }
+}
+
 /// Top-level extraction failure, composing model-lifecycle and inference
 /// errors (spec §5) plus [`crate::audio::speaker::extract::Extractor::extract`]'s own
 /// input-validation and geometry guards.
@@ -204,6 +377,66 @@ pub enum ExtractError {
     /// The embedding model's mask frame count.
     embedder: usize,
   },
+  /// A required dimension of the
+  /// [`crate::audio::speaker::extract::ExtractionParts`] handed to
+  /// [`crate::audio::speaker::extract::Extraction::try_from_parts`] is zero:
+  /// [`ExtractionPart::NumChunks`], [`ExtractionPart::NumFramesPerChunk`], or
+  /// [`ExtractionPart::Count`] (whose LENGTH is `num_output_frames`).
+  ///
+  /// Each of the three is separately rejected by `diaric`
+  /// (`ShapeError::ZeroNumChunks` / `ZeroNumFramesPerChunk` /
+  /// `ZeroNumOutputFrames`, `diarization/src/offline/algo.rs:542-550,602-606`),
+  /// but a zero `num_chunks` or `num_frames_per_chunk` ALSO trips a bare
+  /// `assert!` inside this crate's own
+  /// `window::try_aggregate_output_frame_count` on the
+  /// [`crate::audio::speaker::extract::Extraction::diarize_online`] route — a
+  /// panic, not a typed error. Rejecting here is what keeps every public method
+  /// on a publicly-constructed `Extraction` panic-free.
+  #[error("extraction parts: {0} must be non-zero")]
+  ZeroExtractionDimension(ExtractionPart),
+  /// A flattened tensor's length disagrees with the geometry declared beside it
+  /// in the same [`crate::audio::speaker::extract::ExtractionParts`]. See
+  /// [`ExtractionLenMismatch`] for which tensor and by how much.
+  #[error(
+    "extraction parts: {} has length {} but the declared geometry requires {}",
+    .0.part(),
+    .0.got(),
+    .0.expected()
+  )]
+  ExtractionLenMismatch(ExtractionLenMismatch),
+  /// The element count a declared geometry requires overflows `usize`, so no
+  /// slice can ever match it. Raised BEFORE the corresponding length equality,
+  /// because an unchecked product could wrap to a small value that a short (or
+  /// empty) slice would spuriously satisfy. See [`ExtractionGeometryOverflow`].
+  #[error(
+    "extraction parts: the length {} requires overflows usize (num_chunks {}, \
+     num_frames_per_chunk {}, num_speakers {})",
+    .0.part(),
+    .0.num_chunks(),
+    .0.num_frames_per_chunk(),
+    crate::audio::speaker::segment::SEG_NUM_SLOTS
+  )]
+  ExtractionGeometryOverflow(ExtractionGeometryOverflow),
+  /// A supplied [`crate::audio::speaker::window::SlidingWindow`] is not a usable
+  /// timing grid: `start` must be finite and `duration`/`step` must both be
+  /// finite and strictly positive.
+  ///
+  /// Not merely `diaric`'s contract (`TimingError::NonFiniteParameter` /
+  /// `NonPositiveDurationOrStep`,
+  /// `diarization/src/reconstruct/algo.rs:397-405`): this crate's own
+  /// `window::try_aggregate_output_frame_count` asserts the duration/step half
+  /// with bare `assert!`s, so a non-positive or non-finite window would PANIC
+  /// inside [`crate::audio::speaker::extract::Extraction::diarize_online`]
+  /// rather than surface a typed error. See [`InvalidSlidingWindow`].
+  #[error(
+    "extraction parts: {} is not a usable timing grid (start {}, duration {}, step {}) — \
+     start must be finite and duration/step must be finite and > 0",
+    .0.part(),
+    .0.window().start(),
+    .0.window().duration(),
+    .0.window().step()
+  )]
+  InvalidSlidingWindow(InvalidSlidingWindow),
   /// The derived `num_output_frames` would not fit in `usize`. Converted
   /// from [`crate::audio::speaker::window`]'s crate-private `WindowError` by an exhaustive
   /// manual match in [`crate::audio::speaker::extract::Extractor::extract`] (deliberately
@@ -217,6 +450,14 @@ pub enum ExtractError {
   /// Message text mirrors `WindowError::OutputFrameCountOverflow`'s
   /// display and dia's `ShapeError::OutputFrameCountOverflow`
   /// (`diarization/src/aggregate/count.rs:114-117`).
+  ///
+  /// REACHABLE, by contrast, through
+  /// [`crate::audio::speaker::extract::Extraction::try_from_parts`], whose
+  /// caller picks both sliding windows outright: a finite `chunks_sw.duration()
+  /// = 1e300` over a finite `frames_sw.step() = 1e-300` divides to `+inf`. That
+  /// constructor raises this variant for exactly the geometry
+  /// [`crate::audio::speaker::extract::Extraction::diarize_online`] would later
+  /// re-derive, which is what lets that method keep its `.expect(..)`.
   #[error(
     "num_output_frames overflows usize (chunk_duration / frame_step too large \
      to represent or saturated past usize::MAX)"

@@ -182,3 +182,59 @@ fn extract_error_output_frame_count_overflow_displays_message() {
   let rendered = ExtractError::OutputFrameCountOverflow.to_string();
   assert!(rendered.contains("num_output_frames overflows usize"));
 }
+
+// ── try_from_parts payloads (issue #110) ────────────────────────────────
+// The variants are NEWTYPES over named payload structs, per this repo's
+// `rust-type-conventions` ("Variants are UNIT or NEWTYPE only — never
+// struct-shaped … EXTRACT them into a named struct and wrap it"). These pin
+// that each payload's accessors survive into the rendered message, which is
+// what a caller debugging a message-assembly bug actually reads.
+
+#[test]
+fn zero_extraction_dimension_displays_the_part_name() {
+  for (part, name) in [
+    (ExtractionPart::NumChunks, "num_chunks"),
+    (ExtractionPart::NumFramesPerChunk, "num_frames_per_chunk"),
+    (ExtractionPart::Count, "count"),
+  ] {
+    let rendered = ExtractError::ZeroExtractionDimension(part).to_string();
+    assert!(rendered.contains(name), "{rendered} must name {name}");
+    assert!(rendered.contains("non-zero"), "{rendered}");
+  }
+}
+
+#[test]
+fn extraction_len_mismatch_displays_part_got_and_expected() {
+  let m = ExtractionLenMismatch::new(ExtractionPart::RawEmbeddings, 767, 768);
+  assert_eq!(m.part(), ExtractionPart::RawEmbeddings);
+  assert_eq!(m.got(), 767);
+  assert_eq!(m.expected(), 768);
+  let rendered = ExtractError::ExtractionLenMismatch(m).to_string();
+  assert!(rendered.contains("raw_embeddings"), "{rendered}");
+  assert!(rendered.contains("767"), "{rendered}");
+  assert!(rendered.contains("768"), "{rendered}");
+}
+
+#[test]
+fn extraction_geometry_overflow_displays_part_and_both_dimensions() {
+  let g = ExtractionGeometryOverflow::new(ExtractionPart::Segmentations, 4_294_967_296, 8);
+  assert_eq!(g.part(), ExtractionPart::Segmentations);
+  assert_eq!(g.num_chunks(), 4_294_967_296);
+  assert_eq!(g.num_frames_per_chunk(), 8);
+  let rendered = ExtractError::ExtractionGeometryOverflow(g).to_string();
+  assert!(rendered.contains("segmentations"), "{rendered}");
+  assert!(rendered.contains("4294967296"), "{rendered}");
+  assert!(rendered.contains("overflows usize"), "{rendered}");
+}
+
+#[test]
+fn invalid_sliding_window_displays_all_three_components() {
+  let w = crate::audio::speaker::window::SlidingWindow::new(0.0, 10.0, 0.0);
+  let e = InvalidSlidingWindow::new(ExtractionPart::ChunksSw, w);
+  assert_eq!(e.part(), ExtractionPart::ChunksSw);
+  assert_eq!(e.window(), w);
+  let rendered = ExtractError::InvalidSlidingWindow(e).to_string();
+  assert!(rendered.contains("chunks_sw"), "{rendered}");
+  assert!(rendered.contains("10"), "{rendered}");
+  assert!(rendered.contains("step 0"), "{rendered}");
+}
