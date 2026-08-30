@@ -99,11 +99,14 @@
 //! ## Dependencies
 //!
 //! `windit` and `zuoer` are coremlit's own dependencies. Only [`Span`] and
-//! [`WindowConfidences`] cross into *this* module's API, and the smoothing tier
-//! is not re-exported anywhere, so depend on `windit` directly:
+//! [`WindowConfidences`] cross into *this* module's API, and this module
+//! re-exports no smoothing tier, so depend on `windit` directly. (Under the
+//! `clap` feature, `embeddings::clap::smooth` does re-export windit's smoothing
+//! seam — but only the parts a 512-wide *embedding* can use: the scalar `Ema`
+//! and `CadenceEma` this table names are not among them.)
 //!
 //! ```toml
-//! windit = "0.2"   # smoothing; already in your graph via `ced`
+//! windit = "0.3"   # smoothing; already in your graph via `ced`
 //! ```
 //!
 //! `zuoer` is the other case. With the `vad` feature on, `audio::vad`

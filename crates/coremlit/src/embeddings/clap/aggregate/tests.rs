@@ -107,10 +107,55 @@ fn every_policy_rejects_empty_windows() {
   }
 }
 
+/// A pathological custom [`AggregatePolicy`]: always reports
+/// `WinditError::Empty`, including for a NONEMPTY `embeddings` slice. No real
+/// policy should do this; it exists only to drive the test below, which pins
+/// that the wrapper's error mapping does not assume otherwise.
+#[derive(Debug, Clone, Copy)]
+struct ClaimsEmptyRegardless;
+
+impl AggregatePolicy for ClaimsEmptyRegardless {
+  fn aggregate_values(
+    &self,
+    _embeddings: &[&[f64]],
+    _coverages: &[f64],
+    _dim: usize,
+  ) -> core::result::Result<Vec<f64>, WinditError> {
+    Err(WinditError::Empty)
+  }
+}
+
+#[test]
+fn a_custom_policys_empty_claim_on_nonempty_input_reaches_windowing_not_emptywindows() {
+  // The error variant alone cannot distinguish "the engine saw no windows" from
+  // "the policy refused": this fixture is two windows, not zero, so a policy
+  // reporting `Empty` here is reporting an aggregation failure, not "there were
+  // no windows". A caller matching `EmptyWindows` to mean the latter must not be
+  // misled by this call.
+  let windows = [axis(0, 480_000), axis(1, 480_000)];
+  assert!(
+    !windows.is_empty(),
+    "the fixture must be nonempty for this to prove anything"
+  );
+
+  let err = aggregate(&ClaimsEmptyRegardless, &windows).unwrap_err();
+
+  assert!(
+    matches!(err, Error::Windowing(WinditError::Empty)),
+    "expected Windowing(Empty), got {err:?}"
+  );
+  assert!(
+    !matches!(err, Error::EmptyWindows),
+    "a nonempty input's aggregation failure must never surface as EmptyWindows \
+     (that variant means zero windows were supplied, which is false here); got \
+     {err:?}"
+  );
+}
+
 #[test]
 fn ema_rejects_out_of_range_alpha_at_aggregation() {
   let windows = [axis(0, 480_000)];
-  for bad in [1.5f32, -0.1, f32::NAN, f32::INFINITY] {
+  for bad in [1.5f64, -0.1, f64::NAN, f64::INFINITY] {
     let err = aggregate(&EmaRenormalized::new(bad), &windows).unwrap_err();
     assert!(
       matches!(err, Error::Windowing(WinditError::AlphaOutOfRange)),
@@ -126,9 +171,10 @@ fn into_policy_dispatches_to_the_matching_built_in() {
     (AggregatePolicyKind::MeanRenormalized, {
       aggregate(&MeanRenormalized, &windows).unwrap()
     }),
-    (AggregatePolicyKind::EmaRenormalized { alpha: 0.5 }, {
-      aggregate(&EmaRenormalized::new(0.5), &windows).unwrap()
-    }),
+    (
+      AggregatePolicyKind::EmaRenormalized(EmaRenormalizedOptions::new(0.5)),
+      { aggregate(&EmaRenormalized::new(0.5), &windows).unwrap() },
+    ),
     (AggregatePolicyKind::CoverageWeightedMean, {
       aggregate(&CoverageWeightedMean, &windows).unwrap()
     }),
@@ -140,6 +186,74 @@ fn into_policy_dispatches_to_the_matching_built_in() {
       "{kind:?} box disagreed with the concrete policy"
     );
   }
+}
+
+#[test]
+fn a_configured_alpha_reaches_the_fold_at_f64_precision() {
+  // The wire field is `f64`, so a configured `0.3` is the `f64` nearest 3/10 and
+  // not the `f32` one widened into the fold. The two differ in the eighth
+  // significant digit, which is under the 1e-6 `is_close` the dispatch test
+  // above uses — so the decision is pinned here instead, bit-exactly, at the
+  // `f64` compute domain the policy actually folds in.
+  //
+  // Reverting `EmaRenormalizedOptions::alpha` to `f32` fails this test by
+  // failing to COMPILE: `into_policy` hands the accessor's value to
+  // `EmaRenormalized::new`, which takes `C: Real`, and `Real` is sealed to
+  // `f64`.
+  let boxed = AggregatePolicyKind::EmaRenormalized(EmaRenormalizedOptions::new(0.3)).into_policy();
+  let (a, b) = ([1.0f64, 0.0], [0.0f64, 1.0]);
+  let embeddings: [&[f64]; 2] = [&a, &b];
+  let coverages = [1.0f64, 0.25];
+
+  let configured = boxed.aggregate_values(&embeddings, &coverages, 2).unwrap();
+  let exact = EmaRenormalized::new(0.3f64)
+    .aggregate_values(&embeddings, &coverages, 2)
+    .unwrap();
+  let widened_from_f32 = EmaRenormalized::new(f64::from(0.3f32))
+    .aggregate_values(&embeddings, &coverages, 2)
+    .unwrap();
+
+  assert_eq!(
+    configured, exact,
+    "a configured alpha must reach the fold unrounded"
+  );
+  assert_ne!(
+    configured, widened_from_f32,
+    "an f32 wire field would have folded these weights instead — if this ever \
+     passes, the eighth-digit move this release took on has been reverted"
+  );
+}
+
+#[test]
+fn alpha_that_rounds_into_range_as_f32_is_rejected_at_f64() {
+  // The behavioural fact `EmaRenormalizedOptions::alpha`'s rustdoc now
+  // documents: `1.00000001` parses as `f32` to exactly `1.0` (in range) but
+  // stays `1.00000001` as `f64` (out of range). A legacy JSON config with this
+  // literal used to aggregate and no longer does — pin both sides so the doc
+  // and the behaviour cannot quietly drift apart again.
+  let widened_from_legacy_f32 = f64::from(1.00000001f32);
+  assert_eq!(
+    widened_from_legacy_f32, 1.0,
+    "premise: f32 must round this literal to exactly 1.0"
+  );
+
+  let windows = [axis(0, 480_000), axis(1, 480_000)];
+
+  let via_f32 =
+    AggregatePolicyKind::EmaRenormalized(EmaRenormalizedOptions::new(widened_from_legacy_f32))
+      .into_policy();
+  assert!(
+    aggregate(via_f32.as_ref(), &windows).is_ok(),
+    "an alpha an f32 field would have rounded to 1.0 must still aggregate"
+  );
+
+  let via_f64 =
+    AggregatePolicyKind::EmaRenormalized(EmaRenormalizedOptions::new(1.00000001)).into_policy();
+  let err = aggregate(via_f64.as_ref(), &windows).unwrap_err();
+  assert!(
+    matches!(err, Error::Windowing(WinditError::AlphaOutOfRange)),
+    "the same literal at f64 precision must be rejected as AlphaOutOfRange, got {err:?}"
+  );
 }
 
 #[cfg(feature = "serde")]
@@ -154,7 +268,8 @@ mod serde_tests {
     for &kind in AggregatePolicyKind::REPRESENTATIVES {
       let expected = match kind {
         AggregatePolicyKind::MeanRenormalized => r#""mean_renormalized""#.to_string(),
-        AggregatePolicyKind::EmaRenormalized { alpha } => {
+        AggregatePolicyKind::EmaRenormalized(ema) => {
+          let alpha = ema.alpha();
           format!(r#"{{"ema_renormalized":{{"alpha":{alpha}}}}}"#)
         }
         AggregatePolicyKind::CoverageWeightedMean => r#""coverage_weighted_mean""#.to_string(),

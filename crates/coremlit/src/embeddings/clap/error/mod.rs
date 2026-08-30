@@ -139,12 +139,23 @@ pub enum Error {
   #[error("failed to tokenize text: {0}")]
   Tokenize(#[source] tokenizers::Error),
 
-  /// An [`crate::embeddings::clap::aggregate::AggregatePolicy`] was asked to combine zero window
-  /// embeddings. Every policy needs at least one window to produce a direction;
-  /// the caller should skip aggregation (or handle the empty clip) instead. This
-  /// is the one windit error given its own clap variant:
-  /// [`From<WinditError>`](Error::from) maps [`WinditError::Empty`] here so the
-  /// pinned empty-aggregation taxonomy is stable across the windit port.
+  /// [`aggregate`](crate::embeddings::clap::aggregate::aggregate) was asked to
+  /// combine zero window embeddings. Every policy needs at least one window to
+  /// produce a direction; the caller should skip aggregation (or handle the
+  /// empty clip) instead.
+  ///
+  /// This variant is produced if and only if the `windows` slice passed to
+  /// [`aggregate`](crate::embeddings::clap::aggregate::aggregate) was itself
+  /// empty — checked before windit's engine (and therefore before any policy)
+  /// ever runs. It is NOT produced by matching windit's returned error: a
+  /// custom [`AggregatePolicy`](crate::embeddings::clap::aggregate::AggregatePolicy)
+  /// may itself return [`WinditError::Empty`] from `aggregate_values` for a
+  /// NONEMPTY `windows` slice (reporting an aggregation failure, not "there
+  /// were no windows"), and that reaches the caller as [`Error::Windowing`],
+  /// never as this variant. The blanket [`From<WinditError>`](Error::from) impl
+  /// does NOT produce this variant either — it is total and never
+  /// special-cases a variant — so nothing that returns a bare [`WinditError`]
+  /// (a downstream `?` included) can produce it.
   #[error("cannot aggregate zero window embeddings")]
   EmptyWindows,
 
@@ -174,16 +185,37 @@ pub enum Error {
 }
 
 impl From<WinditError> for Error {
-  /// The ONE outward translation from windit into clap's taxonomy.
-  /// [`WinditError::Empty`] maps onto the pinned [`Error::EmptyWindows`] variant
-  /// (same meaning, kept so the empty-aggregation taxonomy is stable across the
-  /// port); every other windit error is wrapped losslessly in
-  /// [`Error::Windowing`].
+  /// A total, lossless wrap of any [`WinditError`] into [`Error::Windowing`] —
+  /// this impl makes NO special case for any variant, `Empty` included.
+  ///
+  /// It has to be total *because* it is reached by more than the call this
+  /// crate writes: [`SmoothPolicy`](crate::embeddings::clap::smooth::SmoothPolicy)
+  /// and [`Smoother`](crate::embeddings::clap::smooth::Smoother) are
+  /// re-exported with their windit method signatures intact (returning
+  /// [`WinditError`] directly), so a downstream caller's own
+  /// `policy.smooth(&windows)?` or `smoother.push(w)?` — in a function
+  /// returning this crate's [`Result`] — lifts through this same impl on a
+  /// plain `?`, no different from any in-crate call. A special case here (e.g.
+  /// collapsing [`WinditError::Empty`] onto [`Error::EmptyWindows`]) would
+  /// silently reinterpret every such caller's error under `aggregate`'s
+  /// taxonomy, including callers with nothing to do with aggregation — the
+  /// [`smooth`](crate::embeddings::clap::smooth::smooth) wrapper had exactly
+  /// this bug until its own call site stopped routing through this impl; going
+  /// through the public re-exports instead of that wrapper reached the same
+  /// special case regardless.
+  ///
+  /// [`aggregate`](crate::embeddings::clap::aggregate::aggregate) is the one
+  /// place that reports [`Error::EmptyWindows`], but it does not reach that
+  /// variant through this impl, and not by matching a RETURNED
+  /// [`WinditError::Empty`] either: that variant alone cannot distinguish "the
+  /// engine saw no windows" from "the policy refused" (a custom policy may
+  /// return `Empty` for a NONEMPTY `windows` slice). It checks its own
+  /// `windows` argument before ever calling into windit, and reports
+  /// [`Error::EmptyWindows`] directly when that argument is empty — leaving
+  /// every [`WinditError`] windit itself returns, `Empty` included, to this
+  /// impl.
   fn from(e: WinditError) -> Self {
-    match e {
-      WinditError::Empty => Error::EmptyWindows,
-      other => Error::Windowing(other),
-    }
+    Error::Windowing(e)
   }
 }
 
