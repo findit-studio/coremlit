@@ -3331,3 +3331,253 @@ fn plda_min_norm_is_diarics_own_floor_measured_not_copied() {
   // The two f32 neighbours really do straddle it, so the bracket is tight.
   assert_eq!(hi.to_bits() - lo.to_bits(), 1, "search did not converge");
 }
+
+// =====================================================================
+// An INACTIVE slot must not be able to move the online clusterer's
+// state — adversarial review round 6, finding 1.
+// =====================================================================
+
+/// The round-6 witness geometry: three unit chunks of ONE frame each, slot 0
+/// active in chunks 0 and 2 and INACTIVE in chunk 1, and `slot0_rows` supplying
+/// chunk `c`'s slot-0 raw row. Every other row is the all-zero row a dropped
+/// slot carries.
+fn three_chunk_slot0_parts(slot0_rows: [[f32; EMBEDDING_DIM]; 3]) -> ExtractionParts {
+  let mut raw_embeddings = vec![0.0f32; 3 * SEG_NUM_SLOTS * EMBEDDING_DIM];
+  for (c, row) in slot0_rows.iter().enumerate() {
+    raw_embeddings[embedding_range(c, 0)].copy_from_slice(row);
+  }
+  ExtractionParts {
+    raw_embeddings,
+    // [f][s] per chunk, one frame per chunk: chunk 1's whole column is zero.
+    segmentations: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+    // Chunk `c` lands at output frame `c`; frame 3 is covered by no chunk.
+    count: vec![1, 0, 1, 0],
+    num_chunks: 3,
+    num_frames_per_chunk: 1,
+    chunks_sw: unit_sw(),
+    frames_sw: unit_sw(),
+  }
+}
+
+/// A unit row at `deg` degrees in the `(0, 1)` plane.
+fn planar_row(deg: f64) -> [f32; EMBEDDING_DIM] {
+  let mut row = [0.0f32; EMBEDDING_DIM];
+  row[0] = deg.to_radians().cos() as f32;
+  row[1] = deg.to_radians().sin() as f32;
+  row
+}
+
+#[test]
+fn an_inactive_slots_row_cannot_change_the_online_result() {
+  // Finding 1 (round 6). `try_from_parts` deliberately admits an INACTIVE slot
+  // carrying a usable row — but `diarize_online` used to NORMALIZE and ASSIGN
+  // that row before it computed the zero activity that would have gated it.
+  // `OnlineClusterer::assign` matches the nearest centroid and UPDATES it
+  // BEFORE the `min_speech_duration` gate is consulted at all (its step 3 runs
+  // `update_existing`; the duration gate is step 4, reached only when nothing
+  // matched), so a zero-duration row still moves a centroid.
+  //
+  // A: 0 deg seeds speaker 1. B: 55 deg, under the inactive column, is 0.426
+  //    from A — inside the default 0.65 threshold, so it matches and drags the
+  //    centroid toward itself.
+  // C: -50 deg, 0.357 from the UNPOLLUTED A, is ~0.829 from the polluted
+  //    centroid — outside 0.65, so it spawns a SECOND speaker.
+  //
+  // The property, stated without reference to the mechanism: zeroing an
+  // inactive slot's row — the all-zero row both in-crate producers write into
+  // every dropped slot — must not change what `diarize_online` returns.
+  let a = planar_row(0.0);
+  let b = planar_row(55.0);
+  let c = planar_row(-50.0);
+  let zero = [0.0f32; EMBEDDING_DIM];
+
+  let with_row = Extraction::try_from_parts(three_chunk_slot0_parts([a, b, c]))
+    .expect("an inactive slot carrying a usable row is admitted by construction");
+  let without_row = Extraction::try_from_parts(three_chunk_slot0_parts([a, zero, c]))
+    .expect("the same parts with the dropped slot's row zeroed");
+
+  let clusters = |e: &Extraction| -> Vec<(u64, u64, usize)> {
+    e.diarize_online(OnlineOptions::new())
+      .expect("this geometry clusters")
+      .spans_slice()
+      .iter()
+      .map(|s| (s.start().to_bits(), s.end().to_bits(), s.cluster()))
+      .collect()
+  };
+  assert_eq!(
+    clusters(&with_row),
+    clusters(&without_row),
+    "an INACTIVE slot's raw-embedding row changed the online clustering"
+  );
+
+  // The offline route already ignores that row: `filter_embeddings` needs
+  // `clean_frames >= 0.2 * num_frames_per_chunk` and an all-zero column sums to
+  // zero, so chunk 1 slot 0 never reaches PLDA. Asserted, not assumed — it is
+  // what makes the online skip SUFFICIENT and a constructor refusal
+  // unnecessary.
+  let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+  let spans = |e: &Extraction| -> Vec<(u64, u64, usize)> {
+    e.diarize_with(&plda, ClusterBackend::default())
+      .expect("this geometry clusters offline")
+      .spans_slice()
+      .iter()
+      .map(|s| (s.start().to_bits(), s.end().to_bits(), s.cluster()))
+      .collect()
+  };
+  assert_eq!(
+    spans(&with_row),
+    spans(&without_row),
+    "the OFFLINE route was supposed to be blind to an inactive slot's row"
+  );
+}
+
+// =====================================================================
+// An active row must clear the WHOLE offline chain, projection
+// included — adversarial review round 6, finding 2.
+// =====================================================================
+
+/// `diaric`'s shipped `models/plda/mean1.bin`, decoded little-endian `f64` and
+/// cast elementwise to `f32` — the centering mean `PldaTransform::xvec_transform`
+/// subtracts, quantized to the precision a WeSpeaker row is carried in.
+///
+/// Read from the dependency's own source tree rather than committed here: the
+/// weights are pyannote's CC-BY-4.0 community-1 PLDA (see this repository's
+/// `NOTICE`, section 4), and `NOTICE` records that the repository redistributes
+/// exactly ONE model. Reading the bytes `diaric` already `include_bytes!`es
+/// into this very test binary is use, not redistribution.
+///
+/// `mean1` is private in `diaric` with no accessor and is NOT recoverable from
+/// its public API: every public read of it goes through `xvec_transform`, which
+/// exposes only `normalize(lda.T @ n - mean2)` for the *unit direction*
+/// `n = (x - mean1)/‖x - mean1‖` — a map through a 128x256 matrix that discards
+/// 128 dimensions and normalizes away the scale. So the shipped bytes are the
+/// only source, and `cargo metadata` is how a test finds them wherever Cargo
+/// put the crate (registry, vendor directory, or path override).
+///
+/// # Panics
+/// Loudly, if the dependency's blob cannot be located or decoded. A witness
+/// that quietly stopped being a witness is the defect this test exists for.
+fn diaric_mean1_as_f32() -> [f32; EMBEDDING_DIM] {
+  let cargo = option_env!("CARGO").unwrap_or("cargo");
+  let out = std::process::Command::new(cargo)
+    .args([
+      "metadata",
+      "--format-version",
+      "1",
+      "--all-features",
+      "--manifest-path",
+      concat!(env!("CARGO_MANIFEST_DIR"), "/Cargo.toml"),
+    ])
+    .output()
+    .expect("`cargo metadata` must run: this test reads diaric's shipped PLDA weights");
+  assert!(
+    out.status.success(),
+    "cargo metadata failed: {}",
+    String::from_utf8_lossy(&out.stderr)
+  );
+  let meta: serde_json::Value =
+    serde_json::from_slice(&out.stdout).expect("cargo metadata emits JSON");
+  let manifest = meta["packages"]
+    .as_array()
+    .expect("metadata.packages is an array")
+    .iter()
+    .find(|p| p["name"] == "diaric")
+    .and_then(|p| p["manifest_path"].as_str())
+    .expect("diaric is an --all-features dependency of this crate");
+  let blob = std::path::Path::new(manifest)
+    .parent()
+    .expect("a manifest path has a parent")
+    .join("models/plda/mean1.bin");
+  let bytes = std::fs::read(&blob)
+    .unwrap_or_else(|e| panic!("diaric ships {}: {e}", blob.display()));
+  assert_eq!(
+    bytes.len(),
+    EMBEDDING_DIM * 8,
+    "mean1.bin is {EMBEDDING_DIM} little-endian f64 values"
+  );
+  let mut row = [0.0f32; EMBEDDING_DIM];
+  for (i, slot) in row.iter_mut().enumerate() {
+    let mut le = [0u8; 8];
+    le.copy_from_slice(&bytes[i * 8..i * 8 + 8]);
+    *slot = f64::from_le_bytes(le) as f32;
+  }
+  row
+}
+
+#[test]
+fn try_from_parts_rejects_an_active_row_plda_projection_refuses() {
+  // Finding 2 (round 6). `RawEmbedding::from_wespeaker` is only the offline
+  // route's RAW-INPUT boundary; `PldaTransform::project` runs after it and
+  // rejects again, on `‖row - mean1‖ < XVEC_CENTERED_MIN_NORM` (0.1). The
+  // f32 cast of `mean1` itself sits 3.5e-8 from the centre of that ball while
+  // its RAW norm is 1.42 — forty times PLDA's 0.01 raw floor and far above the
+  // online engine's 1e-12 — so both admission functions accept it and the
+  // projection that follows does not.
+  let row = diaric_mean1_as_f32();
+  let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+
+  // The witness's three properties, proved against the engines themselves so
+  // that a `diaric` weight change turns it into a loud failure rather than a
+  // quietly vacuous test.
+  assert!(
+    diaric::embed::Embedding::normalize_from(row).is_some(),
+    "the ONLINE engine accepts this row"
+  );
+  let raw = diaric::plda::RawEmbedding::from_wespeaker(row)
+    .expect("PLDA's RAW boundary accepts this row (norm ~1.42)");
+  assert!(
+    matches!(
+      plda.project(&raw),
+      Err(diaric::plda::Error::DegenerateInput)
+    ),
+    "the PROJECTION that follows must refuse it — otherwise this is not a witness"
+  );
+
+  let mut raw_embeddings = vec![0.0f32; SEG_NUM_SLOTS * EMBEDDING_DIM];
+  raw_embeddings[..EMBEDDING_DIM].copy_from_slice(&row);
+  let parts = ExtractionParts {
+    raw_embeddings,
+    segmentations: vec![1.0, 0.0, 0.0],
+    count: vec![1, 0],
+    num_chunks: 1,
+    num_frames_per_chunk: 1,
+    chunks_sw: unit_sw(),
+    frames_sw: unit_sw(),
+  };
+
+  // Assembled unchecked, the two backends split: offline fails the WHOLE
+  // extraction, online manufactures a speaker.
+  let unchecked = Extraction::from_parts(
+    parts.raw_embeddings.clone(),
+    parts.segmentations.clone(),
+    parts.count.clone(),
+    parts.num_chunks,
+    parts.num_frames_per_chunk,
+    parts.chunks_sw,
+    parts.frames_sw,
+  );
+  assert!(
+    matches!(
+      unchecked.diarize_with(&plda, ClusterBackend::default()),
+      Err(diaric::offline::Error::Plda(
+        diaric::plda::Error::DegenerateInput
+      ))
+    ),
+    "offline must fail on this row"
+  );
+  assert_eq!(
+    unchecked
+      .diarize_online(OnlineOptions::new())
+      .expect("online accepts it")
+      .spans_slice()
+      .len(),
+    1,
+    "online manufactures a speaker from the same row"
+  );
+
+  let err = refused(parts);
+  assert!(
+    matches!(err, ExtractError::ActiveSlotWithoutEmbedding(a) if (a.chunk(), a.slot()) == (0, 0)),
+    "expected ActiveSlotWithoutEmbedding(0, 0), got {err:?}"
+  );
+}

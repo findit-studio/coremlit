@@ -643,12 +643,14 @@ pub enum ExtractError {
   /// A `(chunk, slot)` whose `segmentations` column claims speech pairs with a
   /// `raw_embeddings` row that at least one of the two backends cannot use.
   ///
-  /// The test is not a threshold this crate names; it is a CALL to both backend
-  /// entry points, and BOTH must accept — `extract::raw_embedding_reaches_plda`
-  /// requires [`diaric::embed::Embedding::normalize_from`] to return `Some` and
-  /// `diaric::plda::RawEmbedding::from_wespeaker` to return `Ok`. Either one
-  /// alone leaves the two backends disagreeing about the identical
-  /// `Extraction`, in opposite directions:
+  /// The test is not a threshold this crate names; it is a CALL to each stage
+  /// the backends put a row through, and ALL must accept —
+  /// `extract::raw_embedding_reaches_plda` requires
+  /// [`diaric::embed::Embedding::normalize_from`] to return `Some`,
+  /// `diaric::plda::RawEmbedding::from_wespeaker` to return `Ok`, and
+  /// [`diaric::plda::PldaTransform::project`] to return `Ok`. Any one alone
+  /// leaves the two backends disagreeing about the identical `Extraction`, in
+  /// opposite directions:
   ///
   /// - ONLINE, `normalize_from` returning `None` is
   ///   [`crate::audio::speaker::extract::Extraction::diarize_online`]'s
@@ -661,13 +663,18 @@ pub enum ExtractError {
   ///   of [`crate::audio::speaker::extract::PLDA_MIN_NORM`] (`0.01`,
   ///   `diarization/src/plda/transform.rs:72,152-165`), ten orders of
   ///   magnitude above `normalize_from`'s `NORM_EPSILON` (`1e-12`).
+  /// - OFFLINE AGAIN, one stage later: `project` re-rejects a row whose
+  ///   CENTERED norm `‖row - mean1‖` is below `XVEC_CENTERED_MIN_NORM` (`0.1`,
+  ///   `diarization/src/plda/transform.rs:315,436`), which the raw floor above
+  ///   cannot see — the `f32` cast of `mean1` has raw norm `1.42`.
   ///
   /// So a row at `[0.005, 0.0, …]` is clustered into a speaker by ONLINE and
-  /// fatal to OFFLINE, while a row at `[f32::MAX, f32::MAX, 0.0, …]` clears
-  /// PLDA's `f64` floor and normalizes to `None` for ONLINE — because
-  /// `normalize_from` narrows the norm to `f32` and `4.8e38` does not fit. The
-  /// conjunction is the standard exactly because each backend has corners the
-  /// other does not.
+  /// fatal to OFFLINE; a row at `[f32::MAX, f32::MAX, 0.0, …]` clears PLDA's
+  /// `f64` floor and normalizes to `None` for ONLINE — because `normalize_from`
+  /// narrows the norm to `f32` and `4.8e38` does not fit; and `mean1` cast to
+  /// `f32` clears BOTH admission functions and dies in the projection between
+  /// them and the clustering. The conjunction is the standard exactly because
+  /// each stage has corners the others do not.
   ///
   /// Every in-crate path already satisfies it:
   /// [`crate::audio::speaker::extract::Extractor::extract`] and the argmax
@@ -681,11 +688,36 @@ pub enum ExtractError {
   #[error(
     "chunk {} slot {} has an active segmentations column but its raw_embeddings \
      row cannot reach the clustering both backends run (non-finite, L2 norm below \
-     PLDA's 0.01 floor, or a norm the online engine's f32 narrowing turns into inf)",
+     PLDA's 0.01 floor, a norm the online engine's f32 narrowing turns into inf, \
+     or a centered norm PLDA's projection refuses)",
     .0.chunk(),
     .0.slot()
   )]
   ActiveSlotWithoutEmbedding(ActiveSlotWithoutEmbedding),
+  /// The one shared [`diaric::plda::PldaTransform`] that
+  /// `extract::raw_embedding_reaches_plda` validates a row's PROJECTION against
+  /// could not be built.
+  ///
+  /// `PldaTransform::new()` is declared fallible; it takes no arguments and
+  /// decodes weight blobs `include_bytes!`d into the binary
+  /// (`diarization/src/plda/loader.rs:17-36`), so today it has no failing path
+  /// and `plda_transform_is_available` pins that. It is surfaced anyway, and as
+  /// a TYPED refusal rather than a weaker check: without the transform the row
+  /// standard cannot be applied, and the two alternatives are both silent —
+  /// dropping the projection clause would admit rows that fail the whole
+  /// offline extraction, and treating every row as unusable would make
+  /// [`crate::audio::speaker::extract::Extractor::extract`] zero every
+  /// segmentation column and return an empty diarization. A validator that
+  /// quietly degrades when its own inputs are missing is the defect class this
+  /// predicate exists to close.
+  ///
+  /// Unit-shaped deliberately: `diaric::plda::Error` is not `Clone`, and the
+  /// cached [`std::sync::OnceLock`] cannot hand the same error out twice.
+  #[error(
+    "diaric's PLDA transform could not be built, so an active slot's raw \
+     embedding cannot be validated against the projection the offline backend runs"
+  )]
+  PldaTransformUnavailable,
   /// A `count[t]` is not the value the `segmentations` supplied beside it
   /// derive at output frame `t`. BOTH directions are rejected, because both
   /// make the two backends disagree about the same `Extraction`.

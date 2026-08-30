@@ -1455,6 +1455,7 @@ fn place_embeddings(
   plan: &WindowPlan,
   masks: &[f16],
   embeddings: &[f32],
+  plda: &diaric::plda::PldaTransform,
   raw_embeddings: &mut [f32],
   segmentations: &mut [f64],
 ) -> Result<(), InferError> {
@@ -1486,12 +1487,12 @@ fn place_embeddings(
 
     // dia's per-slot norm pre-check (`owned.rs:619-630`), through the ONE
     // predicate `Extractor::extract` and `Extraction::try_from_parts` also read
-    // — and that predicate CALLS `normalize_from` and `from_wespeaker` rather
-    // than restating their thresholds, so a row this source keeps is by
-    // construction a row that constructor accepts and both backends consume.
-    // Its finiteness clause cannot fire: the scan above already returned
-    // `NonFiniteOutput` with the offending index.
-    if raw_embedding_reaches_plda(embedding) {
+    // — and that predicate CALLS `normalize_from`, `from_wespeaker` and
+    // `PldaTransform::project` rather than restating their thresholds, so a row
+    // this source keeps is by construction a row that constructor accepts and
+    // both backends consume. Its finiteness clause cannot fire: the scan above
+    // already returned `NonFiniteOutput` with the offending index.
+    if raw_embedding_reaches_plda(plda, embedding) {
       raw_embeddings[embedding_range(c, s)].copy_from_slice(embedding);
     } else {
       zero_slot_column(&mut segmentations[chunk_segmentation_range(c)], s);
@@ -1562,6 +1563,11 @@ impl ModelSource for ArgmaxSource {
     let mut raw_embeddings = vec![0.0f32; num_chunks * SEG_NUM_SLOTS * EMBEDDING_DIM];
     let mut padded = vec![f16::ZERO; ARGMAX_CHUNK_SAMPLES];
 
+    // The transform `place_embeddings`' row guard validates the PROJECTION
+    // against, resolved once before any inference: it is process-wide (see
+    // `extract::shared_plda_transform`) and building it costs ~0.2 ms.
+    let plda = crate::audio::speaker::extract::shared_plda_transform()?;
+
     for (k, &start) in argmax_chunk_starts(samples.len()).iter().enumerate() {
       // The UNPADDED length drives `bounded()` (argmax's `waveformLength`).
       let chunk_len = fill_padded_chunk(&mut padded, samples, start);
@@ -1602,6 +1608,7 @@ impl ModelSource for ArgmaxSource {
           plan,
           &masks,
           &embeddings,
+          plda,
           &mut raw_embeddings,
           &mut segmentations,
         )?;

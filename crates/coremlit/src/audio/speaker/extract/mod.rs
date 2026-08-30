@@ -131,6 +131,8 @@
 //!   multilabel where sub-onset noise (`0.0001` from softmax) could be
 //!   nonzero.
 
+use std::sync::OnceLock;
+
 use crate::audio::speaker::{
   cluster::{ClusterBackend, OnlineOptions},
   embed::{EMBED_SLOTS, EMBEDDING_DIM, EmbedModel},
@@ -219,6 +221,40 @@ pub const MAX_OUTPUT_FRAMES: usize = 1 << 22;
 /// number into a test failure instead of a silent lie.
 pub const PLDA_MIN_NORM: f64 = 0.01;
 
+/// The ONE [`diaric::plda::PldaTransform`] this crate validates rows against,
+/// built at most once per process.
+///
+/// [`raw_embedding_reaches_plda`] has to run the offline route's PROJECTION,
+/// not just its raw-input boundary, and `project` needs a transform. That
+/// transform is a process-wide constant, not a caller's choice:
+/// `PldaTransform::new()` is `diaric`'s ONLY public constructor, it takes no
+/// arguments, and it decodes weight blobs `include_bytes!`d into the binary
+/// (`diarization/src/plda/loader.rs:17-36`). Every `PldaTransform` a caller can
+/// hand [`Extraction::diarize_with`] is therefore this same transform, so
+/// validating against a cached one is validating against theirs.
+///
+/// Cached in a [`OnceLock`] because building it is ~0.2 ms (blob decode plus
+/// nalgebra allocation) against ~9 µs for one `project` — three orders of
+/// magnitude, and it must not be paid per row or per call.
+///
+/// # Errors
+/// [`ExtractError::PldaTransformUnavailable`] if `PldaTransform::new()` fails.
+/// It cannot today — its body has no fallible step, the generalized
+/// eigendecomposition its doc mentions is pre-computed and shipped, and
+/// `plda_transform_is_available` pins that — but it is declared fallible, so
+/// this is a TYPED refusal rather than a silent one. The alternative, treating
+/// a failed load as "no row is usable", would make [`Extractor::extract`] drop
+/// every slot and return an empty diarization: exactly the silent degradation
+/// this predicate's whole history is about.
+pub(crate) fn shared_plda_transform()
+-> Result<&'static diaric::plda::PldaTransform, ExtractError> {
+  static PLDA: OnceLock<Option<diaric::plda::PldaTransform>> = OnceLock::new();
+  PLDA
+    .get_or_init(|| diaric::plda::PldaTransform::new().ok())
+    .as_ref()
+    .ok_or(ExtractError::PldaTransformUnavailable)
+}
+
 /// Whether a raw WeSpeaker row can reach the clustering BOTH backends run.
 ///
 /// The ONE predicate for "this row is usable", shared by every site that needs
@@ -227,6 +263,9 @@ pub const PLDA_MIN_NORM: f64 = 0.01;
 /// whose row fails it (zeroing that slot's segmentation column, so nothing
 /// downstream reads the row at all), and [`Extraction::try_from_parts`]
 /// REFUSES parts whose ACTIVE slot carries one.
+///
+/// `plda` is [`shared_plda_transform`]'s value, hoisted out of the caller's
+/// per-row loop.
 ///
 /// # It CALLS both backends rather than describing them
 ///
@@ -249,32 +288,69 @@ pub const PLDA_MIN_NORM: f64 = 0.01;
 ///   online's DROPPED-slot sentinel, which silently yields no speaker at all.
 ///
 /// Every one of those was a better approximation, and the approximation itself
-/// was the defect. So this calls the two real functions:
+/// was the defect. So this calls the real functions:
 ///
-/// - [`diaric::embed::Embedding::normalize_from`] returning `Some` — what
-///   [`Extraction::diarize_online`] itself runs, with its own `f32` narrowing
-///   and its own epsilon, whatever they become;
-/// - `diaric::plda::RawEmbedding::from_wespeaker` returning `Ok` — the PLDA raw
+/// - [`diaric::embed::Embedding::normalize_from`] returning `Some` — the WHOLE
+///   of what [`Extraction::diarize_online`] does to a row, with its own `f32`
+///   narrowing and its own epsilon, whatever they become;
+/// - `diaric::plda::RawEmbedding::from_wespeaker` returning `Ok` — the PLDA RAW
 ///   boundary [`Extraction::diarize_with`] reaches, `from_raw_array` under a
 ///   public name (`diarization/src/plda/transform.rs:152-190`), with its own
-///   finiteness scan, its own `f64` accumulation and its own floor.
+///   finiteness scan, its own `f64` accumulation and its own floor;
+/// - [`diaric::plda::PldaTransform::project`] returning `Ok` — the stage the
+///   offline route runs IMMEDIATELY AFTER that boundary
+///   (`diarization/src/offline/algo.rs:735-737`, `from_raw_array(arr)?` then
+///   `plda.project(&raw)?`). Composing only the first of the two was the
+///   round-5 gap: `project` rejects again, on `‖row - mean1‖ <
+///   XVEC_CENTERED_MIN_NORM` (`0.1`) and on a degenerate post-LDA intermediate
+///   (`diarization/src/plda/transform.rs:315,436,450`). The `f32` cast of
+///   `mean1` itself is the witness — raw norm `1.42`, forty times PLDA's raw
+///   floor, so both admission functions take it — and it fails the WHOLE
+///   offline extraction with `Plda(DegenerateInput)` while online happily
+///   emits a speaker
+///   (`try_from_parts_rejects_an_active_row_plda_projection_refuses`).
 ///
-/// A future change to either function's epsilon, precision or ordering is
-/// picked up here automatically, because this predicate no longer has an
-/// opinion of its own to drift from theirs.
+/// A future change to any of those functions' epsilons, precision or ordering
+/// is picked up here automatically, because this predicate has no opinion of
+/// its own to drift from theirs.
 ///
-/// Both take an owned `[f32; EMBEDDING_DIM]`; every call site slices exactly
-/// `embedding_range`'s `EMBEDDING_DIM` elements, so the length conversion
-/// cannot fail in-crate, and a wrong-length row is refused rather than panicked
-/// on. The array types also tie `coremlit`'s [`EMBEDDING_DIM`] to `diaric`'s
-/// `embed::EMBEDDING_DIM` and `plda::EMBEDDING_DIMENSION` at COMPILE time: if
-/// any of the three moves, this stops building.
-pub(crate) fn raw_embedding_reaches_plda(row: &[f32]) -> bool {
+/// # Where this stops, per backend
+///
+/// - ONLINE: `normalize_from` is the only thing between a row and
+///   `OnlineClusterer::assign`; nothing downstream can reject it. The predicate
+///   composes online's chain WHOLE.
+/// - OFFLINE: the chain is `filter_embeddings` (which slot is in the PLDA train
+///   subset) → `from_raw_array` → `project` → `assign_embeddings`. This
+///   composes the two ROW gates. It deliberately does NOT model
+///   `filter_embeddings`, whose `clean_frames >= 0.2 * num_frames_per_chunk`
+///   selection is a function of the segmentations rather than the row, so a
+///   row is held to what offline WOULD do with it, not to whether this
+///   particular geometry routes it there. And `assign_embeddings`'s own scan is
+///   implied for any row this admits: it rejects a non-finite value (already
+///   refused by `from_raw_array`'s finiteness scan) and a squared row norm that
+///   overflows `f64` (`ShapeError::RowNormOverflow`, unreachable from `f32`
+///   input — `256 · f32::MAX² ≈ 3e79`).
+///
+/// The three calls take an owned `[f32; EMBEDDING_DIM]`; every call site slices
+/// exactly `embedding_range`'s `EMBEDDING_DIM` elements, so the length
+/// conversion cannot fail in-crate, and a wrong-length row is refused rather
+/// than panicked on. The array types also tie `coremlit`'s [`EMBEDDING_DIM`] to
+/// `diaric`'s `embed::EMBEDDING_DIM` and `plda::EMBEDDING_DIMENSION` at COMPILE
+/// time: if any of the three moves, this stops building.
+pub(crate) fn raw_embedding_reaches_plda(
+  plda: &diaric::plda::PldaTransform,
+  row: &[f32],
+) -> bool {
   let Ok(row) = <[f32; EMBEDDING_DIM]>::try_from(row) else {
     return false;
   };
-  diaric::embed::Embedding::normalize_from(row).is_some()
-    && diaric::plda::RawEmbedding::from_wespeaker(row).is_ok()
+  if diaric::embed::Embedding::normalize_from(row).is_none() {
+    return false;
+  }
+  let Ok(raw) = diaric::plda::RawEmbedding::from_wespeaker(row) else {
+    return false;
+  };
+  plda.project(&raw).is_ok()
 }
 
 #[cfg(feature = "serde")]
@@ -616,6 +692,12 @@ impl Extractor {
       return Err(ExtractError::MisalignedChunkPlacement(m));
     }
 
+    // The transform the per-slot row guard below validates against, resolved
+    // ONCE before any inference: it is process-wide (see
+    // `shared_plda_transform`), so a per-row build would repay ~0.2 ms for a
+    // constant.
+    let plda = shared_plda_transform()?;
+
     let onset = f64::from(w.onset());
     // `segmentations` [c][f][s] f64 (owned.rs:461-464), `raw_embeddings`
     // [c][s][d] f32 pre-zeroed so dropped slots stay zero (owned.rs:502-505).
@@ -673,12 +755,17 @@ impl Extractor {
           }
           // dia's per-slot norm pre-check (owned.rs:619-630), through the ONE
           // predicate every site shares (`raw_embedding_reaches_plda`, which
-          // calls both backends rather than restating their thresholds). Its
+          // calls the backends rather than restating their thresholds). Its
           // finiteness clause cannot fire here — `embed_chunk` hard-scans its
-          // own output — so what this call site exercises is the norm band:
-          // too small for PLDA below, past `f32`'s range for the online
-          // engine's narrowing above.
-          if !raw_embedding_reaches_plda(&rows[s]) {
+          // own output — so what this call site exercises is the norm band
+          // (too small for PLDA below, past `f32`'s range for the online
+          // engine's narrowing above) and PLDA's centered-norm ball, which no
+          // real WeSpeaker row lands in: `diaric` calibrated its `0.1` at ~13x
+          // below the smallest centered norm across its captured distribution
+          // (`diarization/src/plda/transform.rs:273-315`). A collapsed embedder
+          // that DID land there is better dropped one slot at a time here than
+          // left to fail the caller's WHOLE offline extraction later.
+          if !raw_embedding_reaches_plda(plda, &rows[s]) {
             zero_slot_column(
               &mut segmentations[chunk_segmentation_range(c, num_frames)],
               num_frames,
@@ -923,15 +1010,20 @@ impl Extraction {
   /// 9. Every `(chunk, slot)` whose segmentation column is active (`seg > 0.0`,
   ///    the activity rule both backends use) carries a raw-embedding row that
   ///    `raw_embedding_reaches_plda` accepts — which is to say a row BOTH
-  ///    backend entry points accept, because that predicate calls them:
+  ///    backends' row chains accept, because that predicate calls them:
   ///    [`diaric::embed::Embedding::normalize_from`] (what
   ///    [`Self::diarize_online`] runs, `f32`-narrowed norm, `1e-12` floor) must
-  ///    return `Some` AND `diaric::plda::RawEmbedding::from_wespeaker` (the
+  ///    return `Some`, AND `diaric::plda::RawEmbedding::from_wespeaker` (the
   ///    PLDA raw boundary [`Self::diarize_with`] reaches, `f64` norm,
-  ///    [`PLDA_MIN_NORM`] floor) must return `Ok`. Neither alone: a row only
-  ///    online accepts makes it create a speaker where offline fails the
-  ///    extraction, and a row only offline accepts is silently dropped online.
-  ///    See [`ExtractError::ActiveSlotWithoutEmbedding`].
+  ///    [`PLDA_MIN_NORM`] floor) must return `Ok`, AND
+  ///    [`diaric::plda::PldaTransform::project`] — the stage offline runs
+  ///    immediately after that boundary, with its own `0.1` centered-norm
+  ///    rejection — must return `Ok` too. None alone: a row only online accepts
+  ///    makes it create a speaker where offline fails the extraction, a row
+  ///    only offline accepts is silently dropped online, and a row both
+  ///    ADMISSION functions take but projection refuses is the same split one
+  ///    stage further in. See [`ExtractError::ActiveSlotWithoutEmbedding`] and
+  ///    [`ExtractError::PldaTransformUnavailable`].
   /// 10. `count` EQUALS the count the supplied `segmentations` derive, through
   ///     the same overlap-add aggregation
   ///     [`crate::audio::speaker::window::count_from_segmentations`] runs over
@@ -982,22 +1074,37 @@ impl Extraction {
   ///   a non-finite value as `NonFiniteField::Embeddings` and an overflowing row
   ///   norm as `ShapeError::RowNormOverflow`
   ///   (`diarization/src/pipeline/algo.rs:443-455`), so the offline route always
-  ///   fails typed. ONLINE, the row IS normalized and fed to the clusterer, but
-  ///   a non-finite one is exactly the case `normalize_from` returns `None` for,
-  ///   so it is skipped — the same outcome as the all-zero row the crate's own
-  ///   dropped slots carry.
+  ///   fails typed. ONLINE, [`Self::diarize_online`] never reads the row at all
+  ///   — an inactive column is skipped ahead of it — so the slot is simply
+  ///   unmatched, the same outcome as the all-zero row the crate's own dropped
+  ///   slots carry.
   /// - **An INACTIVE slot carrying a usable embedding row** — the converse of
   ///   check 9, and deliberately allowed. *Verified against both:* OFFLINE, such
   ///   a slot cannot reach PLDA (`filter_embeddings` requires
   ///   `clean_frames >= 0.2 * num_frames_per_chunk`, and an all-zero column sums
-  ///   to `0`, `diarization/src/offline/algo.rs:645-679`). ONLINE, it IS
-  ///   assigned, with a speech duration of `0` — dropped by any
-  ///   `min_speech_duration > 0` including the default, and at `0.0` it can seed
-  ///   a speaker whose segmentation column is empty, which contributes nothing
-  ///   to any output frame and produces no span. Both are consequences of the
-  ///   caller's own data ("this slot has an embedding but no speech"), not of a
-  ///   part disagreeing with another; `tiny_extraction`'s third slot is exactly
-  ///   this shape.
+  ///   to `0`, `diarization/src/offline/algo.rs:645-679`). ONLINE,
+  ///   [`Self::diarize_online`] skips it on the SAME activity test before the
+  ///   row reaches the clusterer.
+  ///
+  ///   That online skip is load-bearing, and its absence was a live defect
+  ///   (round 6). An earlier revision argued this shape safe because the row
+  ///   would be assigned "with a speech duration of `0`, dropped by any
+  ///   `min_speech_duration > 0`". That reasoning covers whether the row
+  ///   produces a SPAN; it does not cover whether it perturbs STATE first.
+  ///   `OnlineClusterer::assign` reads `min_speech_duration` only in its
+  ///   NEW-speaker arm — it matches the nearest centroid and, inside
+  ///   `speaker_threshold`, MOVES that centroid and returns before any duration
+  ///   gate — so a zero-duration row could shift a speaker far enough that the
+  ///   next slot spawned a second one. The fix is the skip, in the one place
+  ///   that reads the row; a constructor refusal would not have helped
+  ///   [`Extractor::extract`]'s own output (which assembles through the
+  ///   crate-private `from_parts`) and would refuse parts that are now
+  ///   output-irrelevant to BOTH engines. Both halves are pinned by
+  ///   `an_inactive_slots_row_cannot_change_the_online_result`.
+  ///
+  ///   So the shape stays a consequence of the caller's own data ("this slot
+  ///   has an embedding but no speech"), not of a part disagreeing with
+  ///   another; `tiny_extraction`'s third slot is exactly it.
   /// - **`num_output_frames` covering the last chunk's last frame.** With checks
   ///   5 and 8 the grid is the derived one and every chunk is placed
   ///   identically by both mappings, but a chunk whose declared `duration`
@@ -1018,23 +1125,29 @@ impl Extraction {
   ///   consumes the tensors it is given and produces a well-formed answer for
   ///   them. A caller joining parts from several messages must carry its own
   ///   track identity and match on it before assembling an [`ExtractionParts`].
-  /// - **The two epsilons INSIDE `PldaTransform::xvec_transform`.** Check 9
-  ///   composes the backends' two ADMISSION functions, but offline's admission
-  ///   does not end at `RawEmbedding::from_wespeaker`: `plda.project` then
-  ///   rejects `‖row - mean1‖ < XVEC_CENTERED_MIN_NORM` (`0.1`) and a degenerate
-  ///   post-LDA intermediate, both as `Plda(DegenerateInput)`
-  ///   (`diarization/src/plda/transform.rs:315,413-452`). A row inside that ball
-  ///   clears the raw boundary, normalizes fine for ONLINE, and fails the whole
-  ///   OFFLINE extraction — the check-9 shape, one stage further in.
-  ///   *Not composable here:* those checks need a [`diaric::plda::PldaTransform`],
-  ///   which this constructor is not given (only [`Self::diarize_with`] takes
-  ///   one, from the caller), whose `new()` runs a generalized eigendecomposition,
-  ///   and whose `project` is a 256x128 matmul per `(chunk, slot)` — two orders
-  ///   of magnitude past the 256-element scan the other checks cost, for a ball
-  ///   `coremlit` cannot even construct a point in: `mean1` is private in
-  ///   `diaric` with no accessor, and `diaric` calibrates the `0.1` at ~13x below
-  ///   the smallest centered norm in its captured distribution. Left to
-  ///   `diarize_with`, which fails typed.
+  /// - **Which slots offline routes into the PLDA TRAIN subset.** Check 9 now
+  ///   composes offline's whole ROW chain — `from_raw_array`'s admission AND
+  ///   the `project` that follows it — but not `filter_embeddings`, which
+  ///   decides WHICH `(chunk, slot)` that chain is ever run on:
+  ///   `clean_frames >= 0.2 * num_frames_per_chunk` over singly-active frames
+  ///   (`diarization/src/offline/algo.rs:645-679`). Check 9 therefore holds a
+  ///   row to what offline WOULD do with it, not to whether this particular
+  ///   geometry routes it there, and is in that direction stricter than
+  ///   offline. *Deliberate:* the alternative is a constructor whose row
+  ///   standard changes with the segmentations, so the same row is accepted in
+  ///   one extraction and refused in another — and the corner it would buy is
+  ///   a row `diaric` calibrated out of existence anyway (the `0.1` sits ~13x
+  ///   below the smallest centered norm in its captured distribution,
+  ///   `diarization/src/plda/transform.rs:273-315`).
+  ///
+  ///   An earlier revision left the projection out ENTIRELY, on the grounds
+  ///   that it needs a [`diaric::plda::PldaTransform`] this constructor is not
+  ///   given and that no witness was constructible. Both were wrong (round 6):
+  ///   `PldaTransform::new()` is public, takes no arguments, and loads
+  ///   compile-time-embedded weights, so the transform IS available here
+  ///   (cached once — `shared_plda_transform`), and the `f32` cast of `mean1`
+  ///   is a witness built from those same shipped bytes
+  ///   (`try_from_parts_rejects_an_active_row_plda_projection_refuses`).
   /// - **That both backends agree an active slot deserves a SPEAKER.** Check 9
   ///   is about the row; both engines COUNT activity with the same `seg > 0.0`
   ///   rule, then gate on that count with two unrelated ones. ONLINE drops a
@@ -1067,6 +1180,8 @@ impl Extraction {
   /// - [`ExtractError::FrameStepNotRepresentableInF32`] — check 7.
   /// - [`ExtractError::MisalignedChunkPlacement`] — check 8.
   /// - [`ExtractError::ActiveSlotWithoutEmbedding`] — check 9.
+  /// - [`ExtractError::PldaTransformUnavailable`] — check 9's transform could
+  ///   not be built, so the row standard cannot be applied at all.
   /// - [`ExtractError::CountNotSegmentationDerived`] — check 10.
   ///
   /// # Examples
@@ -1300,21 +1415,28 @@ impl Extraction {
     // `filter_embeddings` uses (`diarization/src/offline/algo.rs:656-660`).
     //
     // The ROW predicate is `raw_embedding_reaches_plda`, which does not describe
-    // what the two backends accept — it CALLS them, `normalize_from` and
-    // `from_wespeaker`, and requires both. Every hand-written stand-in for that
-    // conjunction has had a corner escape it (see the predicate's own doc), the
-    // last one being the floor: offline compares the norm in `f64`, online
-    // narrows it to `f32` first, so `[f32::MAX, f32::MAX, 0.0, …]` clears `0.01`
-    // in `f64` and normalizes to `None` — online's DROPPED-slot sentinel, read
-    // as "no speaker here" under an ACTIVE column.
+    // what the two backends accept — it CALLS them: `normalize_from`, then
+    // `from_wespeaker`, then `PldaTransform::project`, and requires all three.
+    // Every hand-written stand-in for that conjunction has had a corner escape
+    // it (see the predicate's own doc); the last two were the floor — offline
+    // compares the norm in `f64`, online narrows it to `f32` first, so
+    // `[f32::MAX, f32::MAX, 0.0, …]` clears `0.01` in `f64` and normalizes to
+    // `None`, online's DROPPED-slot sentinel read as "no speaker here" under an
+    // ACTIVE column — and the composition, which stopped at offline's RAW
+    // boundary and missed the projection that boundary feeds.
     //
-    // Both directions matter. A row only ONLINE accepts (norm in `[1e-12, 0.01)`)
-    // makes online manufacture a speaker where offline fails the whole
-    // extraction with `Plda(DegenerateInput)`; a row only OFFLINE accepts
-    // (`f64` norm past `f32`'s range) reaches PLDA while online silently drops
-    // the slot. Both in-crate producers drop such a row through this very same
-    // predicate, so this constructor requires no more of a caller than the
-    // crate requires of itself.
+    // Both directions matter. A row only ONLINE accepts (norm in `[1e-12, 0.01)`,
+    // or inside PLDA's `0.1` centered ball) makes online manufacture a speaker
+    // where offline fails the whole extraction with `Plda(DegenerateInput)`; a
+    // row only OFFLINE accepts (`f64` norm past `f32`'s range) reaches PLDA
+    // while online silently drops the slot. Both in-crate producers drop such a
+    // row through this very same predicate, so this constructor requires no
+    // more of a caller than the crate requires of itself.
+    //
+    // The transform is resolved once, ahead of the loop: it is process-wide
+    // (see `shared_plda_transform`) and building it costs ~0.2 ms against
+    // ~9 µs per `project`.
+    let plda = shared_plda_transform()?;
     for c in 0..num_chunks {
       for s in 0..SEG_NUM_SLOTS {
         let active = (0..num_frames_per_chunk)
@@ -1322,7 +1444,7 @@ impl Extraction {
         if !active {
           continue;
         }
-        if !raw_embedding_reaches_plda(&raw_embeddings[embedding_range(c, s)]) {
+        if !raw_embedding_reaches_plda(plda, &raw_embeddings[embedding_range(c, s)]) {
           return Err(ExtractError::ActiveSlotWithoutEmbedding(
             crate::audio::speaker::error::ActiveSlotWithoutEmbedding::new(c, s),
           ));
@@ -1631,9 +1753,17 @@ impl Extraction {
   /// `DiarizerManager` feeds `SpeakerManager` (`Core/DiarizerManager.swift:351`)
   /// and the ONE order this order-DEPENDENT engine is defined at here
   /// (deterministic given a fixed extraction). Per slot:
+  /// - a slot whose segmentation column is INACTIVE (no frame with `seg > 0.0`)
+  ///   is skipped and left unmatched, whatever its row holds. Its speech
+  ///   duration would be `0`, but the engine's duration gate is not what would
+  ///   stop it: `assign` matches the nearest centroid and updates it BEFORE
+  ///   that gate is read, so an inactive row would move a speaker's centroid.
+  ///   The offline route excludes the same slot at `filter_embeddings`
+  ///   (`diarization/src/offline/algo.rs:645-679`), so both engines now agree
+  ///   an empty column contributes nothing;
   /// - a dropped slot (all-zero raw-embedding row —
   ///   [`diaric::embed::Embedding::normalize_from`] rejects its zero norm) is
-  ///   skipped and left unmatched;
+  ///   likewise skipped and left unmatched;
   /// - otherwise the row is L2-normalized into a [`diaric::embed::Embedding`] and
   ///   assigned, with a speech duration of `active_frame_count ×
   ///   frames_sw.step` seconds — FluidAudio's `Float(activity) *
@@ -1696,15 +1826,6 @@ impl Extraction {
     // index alongside.
     for (c, chunk_row) in hard_clusters.iter_mut().enumerate() {
       for (s, slot) in chunk_row.iter_mut().enumerate() {
-        // Raw embedding row for (c, s). A dropped slot's row is all-zero, so
-        // `normalize_from` rejects it (zero norm) and the slot stays UNMATCHED.
-        let range = embedding_range(c, s);
-        let mut row = [0.0f32; EMBEDDING_DIM];
-        row.copy_from_slice(&self.raw_embeddings[range]);
-        let Some(embedding) = diaric::embed::Embedding::normalize_from(row) else {
-          continue;
-        };
-
         // Speech duration = active-frame count × frame step (FluidAudio's
         // `Float(activity) * slidingWindow.step`, DiarizerManager.swift:357).
         // Binarized segmentations are 0/1; count nonzero frames — dia's own
@@ -1715,6 +1836,42 @@ impl Extraction {
             activity += 1;
           }
         }
+
+        // An INACTIVE column (no frame with `seg > 0.0`) contributes nothing,
+        // and that has to be decided BEFORE the row reaches `assign` rather
+        // than by the duration it would carry. `OnlineClusterer::assign`
+        // consults `min_speech_duration` only in its NEW-speaker arm: it first
+        // matches the nearest centroid and, when that match is inside
+        // `speaker_threshold`, runs `update_existing` — MOVING that centroid —
+        // and returns before any duration gate is read. So a zero-duration row
+        // still perturbs the engine's state, and a later slot that would have
+        // joined the unpolluted speaker can then fall outside the threshold and
+        // spawn a second one: one speaker silently becomes two
+        // (`an_inactive_slots_row_cannot_change_the_online_result`).
+        //
+        // Skipping here makes the online route read exactly what the offline
+        // route reads: dia's `filter_embeddings` requires
+        // `clean_frames >= 0.2 * num_frames_per_chunk` before a `(chunk, slot)`
+        // reaches PLDA at all (`diarization/src/offline/algo.rs:645-679`), and
+        // an all-zero column sums to `0`. The slot stays UNMATCHED — where it
+        // already ended up whenever the row was the all-zero one both in-crate
+        // producers write into every dropped slot — so this changes nothing for
+        // any `Extraction` [`Extractor::extract`] or the argmax source
+        // produced, only for one a caller ASSEMBLED with a live row under a
+        // dead column.
+        if activity == 0 {
+          continue;
+        }
+
+        // Raw embedding row for (c, s). A dropped slot's row is all-zero, so
+        // `normalize_from` rejects it (zero norm) and the slot stays UNMATCHED.
+        let range = embedding_range(c, s);
+        let mut row = [0.0f32; EMBEDDING_DIM];
+        row.copy_from_slice(&self.raw_embeddings[range]);
+        let Some(embedding) = diaric::embed::Embedding::normalize_from(row) else {
+          continue;
+        };
+
         let speech_duration = activity as f32 * frame_step;
 
         match clusterer.assign(&embedding, speech_duration) {
