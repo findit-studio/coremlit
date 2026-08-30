@@ -83,3 +83,159 @@ fn model_gate_report() {
   }
   model_gate_report::report(&roots);
 }
+
+/// A counting global allocator, and the probe the allocation-ORDERING
+/// falsifiers read it through.
+///
+/// `#[cfg(test)]` by construction — this whole module is — so only the lib test
+/// binary carries it. Every other target (each `tests/` binary, each bench,
+/// every doctest, and the published library) links this crate without
+/// `cfg(test)` and keeps the platform allocator untouched.
+///
+/// # Why an allocator and not a resident-set reading
+///
+/// The property under test is "this path did not ASK for the buffer", which is
+/// what `GlobalAlloc` sees. `ru_maxrss` is a process-wide high-water mark that
+/// never falls, so under libtest's parallel threads it reports whatever the
+/// rest of the suite peaked at; and a `calloc`'d gigabyte that is never read
+/// commits no resident pages at all, so RSS cannot even see the allocation this
+/// measures.
+///
+/// # Thread-local, deliberately
+///
+/// libtest runs each `#[test]` on its own thread, so per-thread counters
+/// measure the test that installed the probe and nothing the rest of the suite
+/// is doing beside it. They are `Cell<usize>` with const initialisation and no
+/// destructor, so reading them from inside `GlobalAlloc` allocates nothing and
+/// cannot re-enter the allocator.
+///
+/// Memory freed on a thread that did not allocate it drives `LIVE` toward zero
+/// (it saturates there), which can only UNDER-report a peak — never invent one.
+pub(crate) mod alloc_probe {
+  use std::{
+    alloc::{GlobalAlloc, Layout, System},
+    cell::Cell,
+  };
+
+  thread_local! {
+    /// Bytes this thread has asked for and not yet released.
+    static LIVE: Cell<usize> = const { Cell::new(0) };
+    /// High-water mark of `LIVE` since the last [`measure`] began.
+    static PEAK: Cell<usize> = const { Cell::new(0) };
+    /// Bytes this thread has asked for in total, releases included.
+    static TOTAL: Cell<usize> = const { Cell::new(0) };
+  }
+
+  #[inline]
+  fn record_alloc(bytes: usize) {
+    let _ = TOTAL.try_with(|t| t.set(t.get().saturating_add(bytes)));
+    let _ = LIVE.try_with(|l| {
+      let now = l.get().saturating_add(bytes);
+      l.set(now);
+      let _ = PEAK.try_with(|p| {
+        if now > p.get() {
+          p.set(now);
+        }
+      });
+    });
+  }
+
+  #[inline]
+  fn record_free(bytes: usize) {
+    let _ = LIVE.try_with(|l| l.set(l.get().saturating_sub(bytes)));
+  }
+
+  /// Forwards every request to [`System`] unchanged and counts the sizes.
+  struct Counting;
+
+  // SAFETY: every method forwards to `System` — the same platform allocator the
+  // test binary would otherwise install — with the caller's pointer and layout
+  // passed through unchanged, so the pointers returned, their validity, and the
+  // alloc/dealloc pairing are exactly `System`'s and satisfy `GlobalAlloc`'s
+  // contract. The bookkeeping added around each call touches only const-init,
+  // `Drop`-free thread-local `Cell<usize>`s, which cannot allocate and so cannot
+  // re-enter this allocator.
+  unsafe impl GlobalAlloc for Counting {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+      // SAFETY: `layout` is the caller's own, forwarded unchanged.
+      let ptr = unsafe { System.alloc(layout) };
+      if !ptr.is_null() {
+        record_alloc(layout.size());
+      }
+      ptr
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+      // SAFETY: `layout` is the caller's own, forwarded unchanged.
+      let ptr = unsafe { System.alloc_zeroed(layout) };
+      if !ptr.is_null() {
+        record_alloc(layout.size());
+      }
+      ptr
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+      record_free(layout.size());
+      // SAFETY: `ptr` and `layout` are the caller's own, forwarded unchanged —
+      // this allocator returned `ptr` from `System` for that very layout.
+      unsafe { System.dealloc(ptr, layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+      // SAFETY: `ptr`, `layout` and `new_size` are the caller's own, forwarded
+      // unchanged — this allocator returned `ptr` from `System` for `layout`.
+      let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
+      if !new_ptr.is_null() {
+        record_free(layout.size());
+        record_alloc(new_size);
+      }
+      new_ptr
+    }
+  }
+
+  #[global_allocator]
+  static ALLOCATOR: Counting = Counting;
+
+  /// What a [`measure`]d closure asked the allocator for, in bytes.
+  #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+  pub(crate) struct Allocated {
+    /// High-water mark of the bytes held at once.
+    pub(crate) peak: usize,
+    /// Bytes requested in total, whether or not they were released again.
+    pub(crate) total: usize,
+  }
+
+  /// Runs `f` and reports the allocation it performed ON THIS THREAD.
+  ///
+  /// Anything `f` returns is still live when the measurement is taken, so a
+  /// buffer it hands back counts in both figures.
+  pub(crate) fn measure<T>(f: impl FnOnce() -> T) -> (T, Allocated) {
+    let live = LIVE.with(Cell::get);
+    let total = TOTAL.with(Cell::get);
+    PEAK.with(|p| p.set(live));
+    let out = f();
+    (
+      out,
+      Allocated {
+        peak: PEAK.with(Cell::get).saturating_sub(live),
+        total: TOTAL.with(Cell::get).saturating_sub(total),
+      },
+    )
+  }
+
+  #[test]
+  fn the_probe_sees_a_buffer_it_is_pointed_at() {
+    // A self-check, so a probe that silently measured nothing could not make an
+    // ordering falsifier pass by reporting zero for every path.
+    let (v, a) = measure(|| vec![0u8; 4_000_000]);
+    assert_eq!(v.len(), 4_000_000);
+    assert!(
+      a.total >= 4_000_000 && a.peak >= 4_000_000,
+      "the probe must see a 4 MB allocation it wraps: {a:?}"
+    );
+    // ...and a released buffer still counts in `total` while leaving `peak`
+    // where it was, which is what separates "asked for it" from "held it".
+    let (_, released) = measure(|| drop(vec![0u8; 8_000_000]));
+    assert!(released.total >= 8_000_000, "{released:?}");
+  }
+}

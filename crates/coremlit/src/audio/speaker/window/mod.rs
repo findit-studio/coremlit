@@ -635,15 +635,45 @@ impl WindowOptions {
 /// `ShapeError::ZeroStepSamples`) for the identical reason.
 pub fn chunk_starts(total_samples: usize, options: &WindowOptions) -> Vec<usize> {
   let step = options.step_samples() as usize;
+  (0..num_chunks(total_samples, options))
+    .map(|c| c * step)
+    .collect()
+}
+
+/// How many chunks [`chunk_starts`] schedules over `total_samples` — that
+/// function's own count, without its `Vec`.
+///
+/// The ONE definition of the count: `chunk_starts` calls it rather than
+/// repeating the arithmetic. Split out because both producers need the chunk
+/// grid BEFORE they can afford the starts. The output-frame grid — and with it
+/// [`crate::audio::speaker::extract::MAX_OUTPUT_FRAMES`], the resource bound
+/// that refuses a clip no backend could finish — is derived from `num_chunks`
+/// and the two sliding windows alone, and at a cap-tripping clip the starts
+/// vector is itself `8 * num_chunks` bytes (566 KB at the smallest such clip,
+/// and `8 * total_samples` bytes at `step_samples = 1`) of exactly the
+/// allocation that cap exists to refuse.
+///
+/// This count is also the input to
+/// [`crate::audio::speaker::extract::MAX_EXTRACTION_TENSOR_BYTES`], the bound on
+/// the axis the frame cap cannot see: `num_chunks` is `total_samples /
+/// step_samples` while the output grid is very nearly `total_samples / 270`, so
+/// a small `step_samples` drives this value — and with it both extraction
+/// tensors, this starts vector, and the model-call count — without moving the
+/// frame cap at all.
+///
+/// # Panics
+/// Panics if `options.step_samples() == 0`, for the reason and with the message
+/// [`chunk_starts`] documents — this is where that assert now lives, so both
+/// functions still raise it identically.
+pub(crate) fn num_chunks(total_samples: usize, options: &WindowOptions) -> usize {
+  let step = options.step_samples() as usize;
   assert!(step > 0, "step_samples must be > 0");
 
-  let num_chunks = if total_samples <= SEG_CHUNK_SAMPLES {
+  if total_samples <= SEG_CHUNK_SAMPLES {
     1
   } else {
     (total_samples - SEG_CHUNK_SAMPLES).div_ceil(step) + 1
-  };
-
-  (0..num_chunks).map(|c| c * step).collect()
+  }
 }
 
 /// The chunk-grid [`SlidingWindow`] matching `options`: `start = 0.0`,
@@ -704,14 +734,23 @@ pub(crate) enum WindowError {
 /// Guarded computation of [`count_from_segmentations`]'s
 /// `num_output_frames`. Ports dia's `try_num_output_frames_pyannote`'s
 /// overflow check (`diarization/src/aggregate/count.rs:510-547`)
-/// bit-for-bit, scoped to the two inputs this function's one call site
-/// has already validated (`last_chunk_end`, `frame_step`) — dia's own
-/// `num_chunks == 0` / `frame_step` finiteness-and-positivity re-checks
-/// (`count.rs:516-521`) are not repeated here because
-/// [`count_from_segmentations`] already asserts both before computing
-/// `last_chunk_end` (unreachable at this call site). This helper's whole
-/// job is the ONE check dia has that this crate's port was missing: the
-/// division/rounding/cast sequence itself.
+/// bit-for-bit, scoped to the two inputs its callers have already
+/// validated (`last_chunk_end`, `frame_step`) — dia's own `num_chunks ==
+/// 0` / `frame_step` finiteness-and-positivity re-checks
+/// (`count.rs:516-521`) are not repeated here because every caller
+/// asserts or rejects both before computing `last_chunk_end`. This
+/// helper's whole job is the ONE check dia has that this crate's port was
+/// missing: the division/rounding/cast sequence itself.
+///
+/// `pub(crate)`, not module-private: besides the two aggregation paths in
+/// this module, [`crate::audio::speaker::extract::Extraction::try_from_parts`]
+/// runs it over caller-supplied sliding windows for TWO results at once — its
+/// `Err` is the PRE-check that keeps
+/// [`crate::audio::speaker::extract::Extraction::diarize_online`]'s later
+/// `.expect(..)` on the identical `(last_chunk_end, frame_step)` pair
+/// unreachable, and its `Ok` value IS the output-frame grid that constructor
+/// requires `count.len()` to equal. Both sites must call the SAME function for
+/// either argument to hold — a re-implementation could drift.
 ///
 /// dia's exact bound (`count.rs:522-533`):
 /// ```text
@@ -741,7 +780,10 @@ pub(crate) enum WindowError {
 /// [`WindowError::OutputFrameCountOverflow`] if `(last_chunk_end /
 /// frame_step).round_ties_even()` is non-finite, negative, `>=
 /// usize::MAX as f64`, or whose `+ 1` would overflow `usize`.
-fn try_num_output_frames(last_chunk_end: f64, frame_step: f64) -> Result<usize, WindowError> {
+pub(crate) fn try_num_output_frames(
+  last_chunk_end: f64,
+  frame_step: f64,
+) -> Result<usize, WindowError> {
   let frames_f = (last_chunk_end / frame_step).round_ties_even();
   if !frames_f.is_finite() || frames_f < 0.0 || frames_f >= usize::MAX as f64 {
     return Err(WindowError::OutputFrameCountOverflow);
@@ -888,6 +930,266 @@ pub(crate) fn try_count_from_segmentations(
   )
 }
 
+/// Where the count aggregation places chunk `c`'s first frame on the
+/// output-frame grid: dia's `count.rs:766-767` expression, verbatim and in the
+/// SAME operation order — `(c as f64 * chunk_step)` first, then the division,
+/// then `round_ties_even`.
+///
+/// The ONE definition of that mapping. [`try_aggregate_output_frame_count`]
+/// (and therefore [`count_from_segmentations`], `Extractor::extract`'s `count`,
+/// and [`crate::audio::speaker::extract::Extraction::diarize_online`]'s
+/// clustered count) calls it, and so does
+/// [`crate::audio::speaker::extract::Extraction::try_from_parts`]'s
+/// chunk-placement check. Written out a second time it would be a second
+/// expression that is algebraically equal and numerically different — the exact
+/// failure mode the placement check exists to catch.
+///
+/// Reads NO origin, because dia's aggregation does not: pyannote's
+/// `count` only ever runs on grids whose windows start at `0.0`. That is what
+/// makes the placement check necessary rather than optional —
+/// `reconstruct_chunk_start_frame` DOES read both origins.
+#[inline]
+pub(crate) fn aggregate_chunk_start_frame(c: usize, chunk_step: f64, frame_step: f64) -> i64 {
+  let chunk_start_t = c as f64 * chunk_step;
+  (chunk_start_t / frame_step).round_ties_even() as i64
+}
+
+/// Where `diaric::reconstruct` places chunk `c`'s first frame on the same grid:
+/// `frames_sw.closest_frame(chunks_sw.start + c * chunks_sw.step + 0.5 *
+/// frames_sw.duration)` (`diarization/src/reconstruct/algo.rs:110,688-690`),
+/// mirrored here in that source's own operation order.
+///
+/// A MIRROR, not a call: `SlidingWindow::closest_frame` is private to `diaric`,
+/// so there is no way to invoke the real one. `window::tests` pins this mirror
+/// against `diaric::reconstruct`'s observable placement so the two cannot drift
+/// apart silently.
+///
+/// Unlike [`aggregate_chunk_start_frame`] this honours both origins AND routes
+/// the chunk start through `+ frames_sw.duration / 2.0` and back out again —
+/// a round trip that is NOT the identity in binary floating point. Two grids
+/// that are algebraically identical can therefore disagree by a whole frame,
+/// which is why
+/// [`crate::audio::speaker::extract::Extraction::try_from_parts`] compares the
+/// two mappings chunk by chunk instead of testing the origins for zero.
+#[inline]
+pub(crate) fn reconstruct_chunk_start_frame(
+  c: usize,
+  chunks_sw: SlidingWindow,
+  frames_sw: SlidingWindow,
+) -> i64 {
+  let chunk_start_time = chunks_sw.start() + (c as f64) * chunks_sw.step();
+  let center_offset = 0.5 * frames_sw.duration();
+  let t = chunk_start_time + center_offset;
+  ((t - frames_sw.start() - frames_sw.duration() / 2.0) / frames_sw.step()).round_ties_even() as i64
+}
+
+/// The first chunk in `0..num_chunks` that [`aggregate_chunk_start_frame`] and
+/// [`reconstruct_chunk_start_frame`] place at DIFFERENT output frames, or
+/// `None` when every chunk lands identically under both.
+///
+/// The ONE definition of that comparison, and the ONE gate on a grid this
+/// crate is willing to build an [`crate::audio::speaker::extract::Extraction`]
+/// on. EVERY construction path calls it, as check 8 of the shared
+/// `extract::check_assembled_parts` —
+/// [`crate::audio::speaker::extract::Extraction::try_from_parts`] and every
+/// in-crate [`crate::audio::speaker::source::ModelSource`];
+/// [`crate::audio::speaker::extract::Extractor::extract`] calls it once more
+/// before it touches a model — because a grid the two mappings disagree about produces a
+/// `count` written against activations that are not there, on BOTH backends and
+/// regardless of which `count` the caller supplies:
+/// [`crate::audio::speaker::extract::Extraction::diarize_online`] ignores the
+/// stored `count` and re-derives its own through the very aggregation this
+/// compares.
+///
+/// # The class this catches
+///
+/// The two expressions are algebraically equal whenever the origins cancel, and
+/// numerically equal for almost every grid — but not all. The aggregation's
+/// quotient is `c * step_samples / 270` exactly (`chunk_step = step_samples /
+/// 16_000`, `frame_step = 270 / 16_000`), so a rounding TIE needs `c *
+/// step_samples` to be an odd multiple of `135`; that is unreachable for an
+/// even `step_samples`, and for an odd one it first occurs at `c = 135 /
+/// gcd(step_samples, 135)`. Only at such a tie can the two disagree, and there
+/// they routinely do: the reconstruction route adds `frames_sw.duration / 2` to
+/// the chunk start and subtracts it again, and `(x + h) - h != x` in binary
+/// floating point, so one side computes exactly `k + 0.5` (banker's rounding to
+/// even) while the other computes `k + 0.5 ± 1 ulp` (rounding away).
+///
+/// So it is narrow but not hypothetical. Sweeping every real tie reachable
+/// inside [`crate::audio::speaker::extract::MAX_OUTPUT_FRAMES`] finds at least
+/// 102 of the 160 000 supported `step_samples` with a misaligned chunk, 47 of
+/// them inside a 60-second clip, the shortest at 10.0001 s (`step_samples =
+/// 135` or `31_995`, chunk 1). [`DEFAULT_STEP_SAMPLES`] (16 000) is even and so
+/// is argmax's fixed stride, so neither can ever be one of them.
+///
+/// Reads only geometry, so both callers can run it before allocating anything.
+/// `O(num_chunks)`: callers must bound `num_chunks` against a buffer the caller
+/// actually allocated first.
+pub(crate) fn first_misaligned_chunk(
+  num_chunks: usize,
+  chunks_sw: SlidingWindow,
+  frames_sw: SlidingWindow,
+) -> Option<crate::audio::speaker::error::ChunkPlacementMismatch> {
+  (0..num_chunks).find_map(|c| {
+    let aggregated = aggregate_chunk_start_frame(c, chunks_sw.step(), frames_sw.step());
+    let reconstructed = reconstruct_chunk_start_frame(c, chunks_sw, frames_sw);
+    (aggregated != reconstructed).then(|| {
+      crate::audio::speaker::error::ChunkPlacementMismatch::new(c, aggregated, reconstructed)
+    })
+  })
+}
+
+/// The last chunk's coverage failure — `Some` when `num_output_frames` does not
+/// reach the last chunk's LAST frame, `None` when it does.
+///
+/// The ONE definition of that comparison, and — with [`first_misaligned_chunk`]
+/// — the second half of "the grid `diaric::reconstruct` will actually write
+/// this chunk grid onto". EVERY construction path calls it, as check 14 of the
+/// shared `extract::check_assembled_parts`; both producers call it once more in
+/// their `checked_geometry`, before a tensor is allocated or a model is run.
+///
+/// # The class this catches
+///
+/// `diaric::reconstruct` places chunk `c`'s frame `f` at
+/// `closest_frame(..) + f` and SKIPS any `out_f >= num_output_frames`, so a
+/// grid that stops short of the last chunk drops the tail of the diarization.
+/// It refuses that itself — `ShapeError::OutputFrameCountTooSmall { got,
+/// required }` (`diarization/src/reconstruct/algo.rs:478-495`) — which is why
+/// this is an EARLY refusal of a geometry both backends already reject, not a
+/// new restriction. What it buys is the position: at
+/// [`crate::audio::speaker::extract::Extraction::try_from_parts`] the caller is
+/// told at assembly instead of after picking a backend, and at both producers
+/// the model is never called.
+///
+/// The grid is `round(last_chunk_end / frames_sw.step()) + 1` while the
+/// requirement is `closest_frame(last chunk) + num_frames_per_chunk`, and those
+/// are different functions of the same windows: at the shipped
+/// `(0.0, 10.0, 1.0)` chunk grid over `(0.0, 0.0619375, 0.016875)` frames, one
+/// chunk derives 594 output frames and admits at most 594 frames per chunk,
+/// while THREE chunks derive 712 and admit only 593 — the last chunk lands at
+/// frame 119 and `119 + 594 = 713`. So the largest admissible
+/// `num_frames_per_chunk` is not monotone in `num_chunks`, which is why this is
+/// a comparison rather than a constant.
+///
+/// # Not a second derivation
+///
+/// The placement comes from [`reconstruct_chunk_start_frame`], the mirror check
+/// 8 already runs for every chunk and that `window::tests` already anchors
+/// against `diaric`'s own observable placement — read back out of exactly the
+/// `OutputFrameCountTooSmall { required }` this function predicts. Writing the
+/// float arithmetic out again here is precisely what the check-8 class is made
+/// of, so it is not written out again.
+///
+/// The LAST chunk only, matching `diaric`, which validates the two endpoints
+/// and derives its requirement from the last. Past [`first_misaligned_chunk`]
+/// the placement equals `aggregate_chunk_start_frame`, which is non-decreasing
+/// in `c`, so the last chunk is also the furthest-placed; checking more chunks
+/// would refuse geometries `diaric` accepts.
+///
+/// `num_chunks.saturating_sub(1)` where `diaric` guards `num_chunks > 0`:
+/// `check_assembled_parts`' check 1 has already refused `num_chunks == 0` and
+/// [`num_chunks`] returns at least `1`, so the two forms agree everywhere this
+/// is reachable — the same argument `extract::derived_output_frame_count` makes
+/// for its own `saturating_sub`.
+///
+/// Returns `None` for a negative placement, mirroring `diaric`'s own
+/// `last_start_frame >= 0` guard: below zero that crate does not check
+/// coverage, and refusing there would refuse a geometry it accepts. `O(1)`, and
+/// it reads only geometry, so both callers can run it before allocating
+/// anything.
+pub(crate) fn uncovered_last_chunk(
+  num_chunks: usize,
+  num_frames_per_chunk: usize,
+  num_output_frames: usize,
+  chunks_sw: SlidingWindow,
+  frames_sw: SlidingWindow,
+) -> Option<crate::audio::speaker::error::UncoveredLastChunk> {
+  let start_frame =
+    reconstruct_chunk_start_frame(num_chunks.saturating_sub(1), chunks_sw, frames_sw);
+  if start_frame < 0 {
+    return None;
+  }
+  // `usize::try_from` cannot fail on this crate's 64-bit targets, so the
+  // fallback is unreachable rather than a policy; saturating to `usize::MAX`
+  // keeps the refusal (and the absence of a panic) correct on any target where
+  // it could, which is the direction `diaric`'s own `try_from` arm takes.
+  let required = usize::try_from(start_frame)
+    .unwrap_or(usize::MAX)
+    .saturating_add(num_frames_per_chunk);
+  (num_output_frames < required).then(|| {
+    crate::audio::speaker::error::UncoveredLastChunk::new(start_frame, required, num_output_frames)
+  })
+}
+
+/// The TIME output frame `t` sits at, in seconds — the value every span
+/// endpoint either backend emits is built from.
+///
+/// A MIRROR of `diaric`'s span conversion, in that source's own operation
+/// order: `try_discrete_to_spans` computes `center_offset = frame_duration /
+/// 2.0` once and then each endpoint as `frame_start + s as f64 * frame_step +
+/// center_offset` (`diarization/src/reconstruct/rttm.rs:172,216-217,231-232`),
+/// which associates as `(frame_start + t * frame_step) + center_offset`. That
+/// function is `pub` but takes a whole discrete grid, so there is no way to ask
+/// `diaric` for one frame's center; this is written out instead, deliberately
+/// as the SAME three roundings and not as an algebraically-equal rearrangement
+/// — `frame_start + (t * frame_step + center_offset)` is a different `f64`.
+///
+/// Distinct from [`reconstruct_chunk_start_frame`]'s inverse, which maps a TIME
+/// back to a frame index. This is the forward direction, and it is the one that
+/// decides whether two frames are distinguishable at all.
+#[inline]
+pub(crate) fn frame_center(t: usize, frames_sw: SlidingWindow) -> f64 {
+  let center_offset = frames_sw.duration() / 2.0; // rttm.rs:172
+  frames_sw.start() + t as f64 * frames_sw.step() + center_offset // rttm.rs:216-217
+}
+
+/// The first output frame in `0..num_output_frames` whose [`frame_center`] is
+/// not finite, or not strictly later than its predecessor's — or `None` when
+/// the whole sequence is a usable timeline.
+///
+/// The ONE definition of that scan, shared by
+/// [`crate::audio::speaker::extract::Extraction::try_from_parts`] and by every
+/// in-crate [`crate::audio::speaker::source::ModelSource`], for the same reason
+/// [`first_misaligned_chunk`] is shared: written out a second time it would be
+/// a second expression that is algebraically equal and numerically different.
+///
+/// # The class this catches
+///
+/// `frames_sw`'s fields being individually finite and positive says nothing
+/// about the grid they generate. `start + t * step + duration / 2` ROUNDS, and
+/// where `step` is small against the ULP of `start` the addition is a no-op:
+/// at `start = 1e9` the `f64` ULP is `1.1920928955078125e-7`, so `step = 1e-8`
+/// leaves `1e9 + 1e-8 == 1e9` and frames 0 and 1 share one center. `diaric`'s
+/// span conversion then closes a one-frame active run at `start == end` and
+/// returns `Ok` with a span of duration zero.
+///
+/// Adjacent pairs, not the endpoints, because a first pair that separates does
+/// not imply the rest do: `t as f64 * step` is exactly rounded and therefore
+/// monotone, but `round(x + s)` can still repeat a value under ties-to-even,
+/// and a binade crossing changes the ULP the step is competing with. `diaric`'s
+/// own finiteness argument (endpoints finite ⇒ all interior centers finite, by
+/// linearity, `rttm.rs:166-193`) does hold, and this scan subsumes it: a
+/// non-finite center fails `is_finite` where it occurs.
+///
+/// Reads only geometry. `O(num_output_frames)`, so callers must bound that
+/// count — [`crate::audio::speaker::extract::MAX_OUTPUT_FRAMES`] — first.
+pub(crate) fn first_collapsed_frame_center(
+  num_output_frames: usize,
+  frames_sw: SlidingWindow,
+) -> Option<crate::audio::speaker::error::CollapsedFrameCenter> {
+  let mut previous = f64::NEG_INFINITY;
+  for t in 0..num_output_frames {
+    let center = frame_center(t, frames_sw);
+    if !center.is_finite() || center <= previous {
+      return Some(crate::audio::speaker::error::CollapsedFrameCenter::new(
+        t, center, previous,
+      ));
+    }
+    previous = center;
+  }
+  None
+}
+
 /// Steps 2-4 of the pyannote frame-count aggregation
 /// (`diarization/src/aggregate/count.rs:486-801`), factored out of
 /// [`try_count_from_segmentations`] so the online reconstruction path can
@@ -898,8 +1200,13 @@ pub(crate) fn try_count_from_segmentations(
 /// `chunk_count[c * num_frames_per_chunk + f]` is the per-(chunk, frame)
 /// scalar to overlap-add: [`try_count_from_segmentations`] fills it with the
 /// active-slot count, [`crate::audio::speaker::extract::Extraction::diarize_online`] with the
-/// distinct-cluster count. Both are `<= num_speakers`, so the averaged,
-/// `round_ties_even`'d result stays within the same `u8` range either way.
+/// distinct-cluster count, and
+/// [`crate::audio::speaker::extract::Extraction::try_from_parts`] with the
+/// active-slot count under the predicate BOTH cluster backends apply to a
+/// segmentation column (`seg > 0.0`), to require a caller-supplied `count` to
+/// BE what its own segmentations derive. All three are `<= num_speakers`, so
+/// the averaged, `round_ties_even`'d result stays within the same `u8` range in
+/// every case.
 /// Splitting the count derivation from this shared tail is what lets the
 /// online path avoid ever materializing a `chunks × frames × clusters`
 /// tensor: it needs only this `chunks × frames` vector.
@@ -962,8 +1269,7 @@ pub(crate) fn try_aggregate_output_frame_count(
   let mut aggregated = vec![0.0f64; num_output_frames];
   let mut overlapping_count = vec![0.0f64; num_output_frames];
   for c in 0..num_chunks {
-    let chunk_start_t = c as f64 * chunk_step;
-    let start_frame = (chunk_start_t / frame_step).round_ties_even() as i64;
+    let start_frame = aggregate_chunk_start_frame(c, chunk_step, frame_step);
     for f in 0..num_frames_per_chunk {
       let ofr = start_frame + f as i64;
       if ofr < 0 || (ofr as usize) >= num_output_frames {

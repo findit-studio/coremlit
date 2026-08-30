@@ -187,8 +187,9 @@
 //! **finite, non-zero, CONSTANT** embedding (L2 norm ≈ 0.5356, bit-identical
 //! across every all-zero row) — *not* the NaN that FluidAudio's WeSpeaker
 //! produces from an empty mask ([`crate::audio::speaker::error::InferError::EmptyMask`]). Its
-//! norm is ~54× ABOVE `PLDA_MIN_NORM` (0.01), so the norm guard cannot catch
-//! it, and it carries no speaker information at all.
+//! norm is ~54× ABOVE [`crate::audio::speaker::extract::PLDA_MIN_NORM`]
+//! (0.01), so the norm guard cannot catch it, and it carries no speaker
+//! information at all.
 //!
 //! ## argmax is not vulnerable to this — but nothing at its MASK is what saves it
 //!
@@ -357,10 +358,10 @@ use crate::{ComputeUnits, DataType, Features, Model, MultiArray, f16};
 use crate::audio::speaker::{
   embed::{EMBED_SLOTS, EMBEDDING_DIM},
   error::{ExtractError, InferError, ModelError},
-  extract::{EXCLUDE_OVERLAP_MIN_FRAMES, Extraction},
+  extract::{EXCLUDE_OVERLAP_MIN_FRAMES, Extraction, raw_embedding_reaches_plda},
   segment::{SEG_CHUNK_SAMPLES, SEG_NUM_SLOTS},
   source::ModelSource,
-  window::WindowOptions,
+  window::{SlidingWindow, WindowOptions},
 };
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -456,17 +457,6 @@ pub const ARGMAX_CHUNK_HOP_SAMPLES: usize = ARGMAX_CHUNK_SAMPLES - ARGMAX_CHUNK_
 /// `activity * secondsPerFrame > 2.0 * secondsPerFrame` reduces to
 /// `activity > 2.0` — `speaker_activity` IS a frame count, module doc).
 pub const ARGMAX_MIN_ACTIVE_FRAMES: f32 = 2.0;
-
-/// PLDA minimum raw-embedding L2 norm — the same guard
-/// [`crate::audio::speaker::extract::Extractor::extract`] applies (dia's inline `0.01`,
-/// `diarization/src/offline/owned.rs:619-630`), re-applied here because
-/// `Extraction` feeds the same `diaric` clustering either way.
-///
-/// It could never have substituted for an all-zero-mask guard — that
-/// embedding's norm is ≈ 0.5356, ~54× above this (module doc) — but with
-/// `dia`'s exclude-overlap fallback in place, an all-zero mask row is
-/// unreachable for a consumed slot, so no such guard is needed.
-const PLDA_MIN_NORM: f64 = 0.01;
 
 mod names {
   /// Segmenter input: the 30 s waveform, `[480000]`, F16.
@@ -1442,9 +1432,24 @@ fn write_segmentations(
   }
 }
 
-/// Places one bounded window's consumed embedding rows into `raw_embeddings`,
-/// dropping (row left zero + segmentation column zeroed) any slot that fails
-/// the PLDA-norm guard.
+/// The two [`Extraction`] tensors [`place_embeddings`] assembles, borrowed as
+/// one unit.
+///
+/// Keeping a row and zeroing its segmentation column are the two halves of ONE
+/// per-slot decision — a dropped `(chunk, slot)` must lose both, or the
+/// extraction carries a live column over a zero row (or the reverse), which is
+/// exactly the shape `Extraction::try_from_parts` refuses. Passing them
+/// together says that; passing two loose `&mut` slices did not.
+struct ChunkTensors<'a> {
+  /// `[c][s][d]` f32, pre-zeroed: a dropped slot's row is left untouched.
+  raw_embeddings: &'a mut [f32],
+  /// `[c][f][s]` f64 for the whole extraction.
+  segmentations: &'a mut [f64],
+}
+
+/// Places one bounded window's consumed embedding rows into `out`, dropping
+/// (row left zero + segmentation column zeroed) any slot whose row the shared
+/// row predicate refuses.
 ///
 /// `embeddings` is the embedder's flat `[64, 256]` output; the row for
 /// `(w, s)` is `w * 3 + s` (`Emb.swift:288,291`).
@@ -1465,8 +1470,8 @@ fn place_embeddings(
   plan: &WindowPlan,
   masks: &[f16],
   embeddings: &[f32],
-  raw_embeddings: &mut [f32],
-  segmentations: &mut [f64],
+  plda: &diaric::plda::PldaTransform,
+  out: &mut ChunkTensors<'_>,
 ) -> Result<(), InferError> {
   for (s, &is_active) in plan.active.iter().enumerate() {
     if !is_active {
@@ -1494,18 +1499,122 @@ fn place_embeddings(
       });
     }
 
-    // Same f64 norm pre-check dia applies (`owned.rs:619-630`).
-    let norm_sq: f64 = embedding
-      .iter()
-      .map(|v| f64::from(*v) * f64::from(*v))
-      .sum();
-    if norm_sq.sqrt() < PLDA_MIN_NORM {
-      zero_slot_column(&mut segmentations[chunk_segmentation_range(c)], s);
+    // dia's per-slot norm pre-check (`owned.rs:619-630`), through the ONE
+    // predicate `Extractor::extract` and `Extraction::try_from_parts` also read
+    // — and that predicate CALLS `normalize_from`, `from_wespeaker` and
+    // `PldaTransform::project` rather than restating their thresholds, so a row
+    // this source keeps is by construction a row that constructor accepts and
+    // both backends consume. Its finiteness clause cannot fire: the scan above
+    // already returned `NonFiniteOutput` with the offending index.
+    if raw_embedding_reaches_plda(plda, embedding) {
+      out.raw_embeddings[embedding_range(c, s)].copy_from_slice(embedding);
     } else {
-      raw_embeddings[embedding_range(c, s)].copy_from_slice(embedding);
+      zero_slot_column(&mut out.segmentations[chunk_segmentation_range(c)], s);
     }
   }
   Ok(())
+}
+
+/// The chunk count and both timing grids for `samples_len`, refused if the
+/// output-frame grid they derive is one this crate will not allocate for
+/// (checks 4 and 6 of the shared assembly sequence, round 9), if that chunk grid
+/// is more model calls than this crate will make (round 11), or if the
+/// extraction tensors it implies are more memory than this crate will allocate
+/// (round 10, re-derived in round 11) — over geometry alone.
+///
+/// This source's EARLIEST enforcement point, and it is earlier than
+/// `Extractor::checked_geometry`'s: argmax's window stride is compiled into its
+/// graph and re-asserted at the top of `extract`, so `samples_len` is the last
+/// input the grid needs — before the two whole-buffer input scans, before the
+/// extraction tensors, and before any of the three models. An `O(1)` refusal of
+/// a clip nothing downstream could finish belongs ahead of two
+/// `O(samples_len)` passes over it.
+///
+/// A separate function for the reason `Extractor::checked_geometry` is: the
+/// smallest clip the cap refuses is 1 132 448 001 samples — 4.5 GB of `f32` and
+/// 3 371 argmax chunks at up to three model calls each — so a falsifier for the
+/// cap's PLACEMENT cannot go through `extract` and has nowhere else to attach.
+///
+/// No placement guard, unlike `Extractor::checked_geometry`: check 8 can only
+/// fire where `c * step_samples` hits a rounding tie, which needs an ODD
+/// `step_samples` (`window::first_misaligned_chunk`), and this source's stride
+/// is pinned to the even `ARGMAX_WINDOW_STRIDE_SAMPLES`
+/// (`the_fixed_argmax_grid_places_every_chunk_identically_under_both_mappings`).
+/// The assembly door runs it regardless.
+///
+/// The Extraction chunk grid IS dia's (module doc's theorem), so it is computed
+/// from the very same function `FluidAudioSource` uses — the two sources'
+/// geometry agrees by construction, not by coincidence. Counted rather than
+/// enumerated: nothing downstream reads dia's chunk STARTS (this source walks
+/// argmax's own `argmax_chunk_starts`), so the count is all there ever was to
+/// take.
+///
+/// # Errors
+/// [`ExtractError::OutputFrameCountOverflow`] or
+/// [`ExtractError::OutputFrameCountTooLarge`], through
+/// `extract::checked_output_frame_count`; then
+/// [`ExtractError::ExtractionChunkCountTooLarge`], through
+/// `extract::checked_extraction_chunk_count`; then
+/// [`ExtractError::ExtractionGeometryOverflow`] or
+/// [`ExtractError::ExtractionTensorBytesTooLarge`], through
+/// `extract::checked_extraction_tensor_bytes`; then
+/// [`ExtractError::UncoveredLastChunk`], through
+/// `window::uncovered_last_chunk`. All four bounds run here rather
+/// than only at assembly for the same reason, and in the same order, as in
+/// `Extractor::checked_geometry`.
+///
+/// Both chunk-axis bounds are UNREACHABLE from this source and are run anyway.
+/// Its stride is pinned to `ARGMAX_WINDOW_STRIDE_SAMPLES`, which IS
+/// `DEFAULT_STEP_SAMPLES`, so the frame cap refuses at 70 770 chunks — exactly
+/// [`crate::audio::speaker::extract::MAX_EXTRACTION_CHUNKS`], which that cap and
+/// that stride are what derive — and its per-window frame count is the fixed
+/// `ARGMAX_FRAMES_PER_WINDOW`, well inside the addressable grid
+/// [`crate::audio::speaker::extract::MAX_EXTRACTION_TENSOR_BYTES`] is derived at
+/// (`the_chunk_axis_caps_are_inert_for_argmaxs_pinned_stride`). Running them
+/// here is the round-8 posture: a bound every producer applies, rather than each
+/// producer applying the bounds it happens to be able to reach — the compiled
+/// stride and the compiled frame count are properties of the shipped graph, not
+/// invariants of this function.
+///
+/// The COVERAGE bound is likewise inert here and likewise run: at
+/// `ARGMAX_FRAMES_PER_WINDOW` (589) over the pinned stride, the largest grid
+/// this source can build leaves the last chunk at least four frames of headroom
+/// (`the_pinned_argmax_grid_covers_its_last_chunk_at_every_chunk_count`).
+///
+/// # Panics
+/// Panics if `w_opts.step_samples()` is `0`, as
+/// [`crate::audio::speaker::window::chunk_starts`] does. `ArgmaxSource::extract`
+/// has already required it to equal [`ARGMAX_WINDOW_STRIDE_SAMPLES`] before it
+/// reaches here.
+fn checked_geometry(
+  samples_len: usize,
+  w_opts: &WindowOptions,
+) -> Result<(usize, SlidingWindow, SlidingWindow), ExtractError> {
+  let num_chunks = crate::audio::speaker::window::num_chunks(samples_len, w_opts);
+  let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(w_opts);
+  let frames_sw = crate::audio::speaker::window::frame_sliding_window();
+  let derived_output_frames =
+    crate::audio::speaker::extract::checked_output_frame_count(num_chunks, chunks_sw, frames_sw)?;
+  crate::audio::speaker::extract::checked_extraction_chunk_count(num_chunks)?;
+  crate::audio::speaker::extract::checked_extraction_tensor_bytes(
+    num_chunks,
+    ARGMAX_FRAMES_PER_WINDOW,
+  )?;
+  // Check 14, over the frame count this source COMPILES IN rather than reads
+  // off a model — so, unlike at `Extractor::checked_geometry`, unreachable
+  // here. Run anyway, for the round-8 reason the two chunk-axis caps above are
+  // run: `ARGMAX_FRAMES_PER_WINDOW` is a property of the shipped graph, not an
+  // invariant of this function. Ordered last, matching the shared sequence.
+  if let Some(u) = crate::audio::speaker::window::uncovered_last_chunk(
+    num_chunks,
+    ARGMAX_FRAMES_PER_WINDOW,
+    derived_output_frames,
+    chunks_sw,
+    frames_sw,
+  ) {
+    return Err(ExtractError::UncoveredLastChunk(u));
+  }
+  Ok((num_chunks, chunks_sw, frames_sw))
 }
 
 impl ModelSource for ArgmaxSource {
@@ -1535,6 +1644,28 @@ impl ModelSource for ArgmaxSource {
   /// - [`ExtractError::OutputFrameCountOverflow`] if the derived
   ///   `num_output_frames` would not fit in `usize` (unreachable through this
   ///   geometry; kept typed, as in [`crate::audio::speaker::extract`]).
+  /// - Anything [`Extraction::try_from_parts`] raises. This method assembles
+  ///   through `Extraction::assemble_checked`, which runs that constructor's
+  ///   ENTIRE check sequence over the tensors this method just built — round
+  ///   8's class fix. The one that a real model can reach is
+  ///   [`ExtractError::NonBinarySegmentation`]: `write_segmentations` copies
+  ///   `f64::from(speaker_ids[..])` verbatim, [`ArgmaxSource::from_dir_with`]
+  ///   accepts any model carrying the pinned F16 I/O shapes, and the shipped
+  ///   graph's hard `{0.0, 1.0}` decode is a property of THAT graph — pinned by
+  ///   the model-gated `argmax_decoded_output_value_semantics`, which is a test
+  ///   and not a runtime guard. A segmenter that returned `0.1` per frame used
+  ///   to assemble an `Extraction` whose stored `count` was all zero (offline:
+  ///   silence) while the online route read every cell as active (a 9.94 s
+  ///   speaker); it is now refused here, naming the cell. Also reachable:
+  ///   [`ExtractError::OutputFrameCountTooLarge`] for a clip past
+  ///   [`crate::audio::speaker::extract::MAX_OUTPUT_FRAMES`] (19.6 hours) —
+  ///   raised since round 9 from the chunk grid alone, before this method's two
+  ///   whole-buffer input scans and before any tensor or model call, since its
+  ///   window stride is fixed at load and `samples.len()` is therefore the last
+  ///   input the grid needs. Its round-10 sibling
+  ///   [`ExtractError::ExtractionTensorBytesTooLarge`] is applied at the same
+  ///   point and is NOT reachable from this source — see `checked_geometry` for
+  ///   why it runs regardless.
   fn extract(&self, samples: &[f32]) -> Result<Extraction, ExtractError> {
     if samples.is_empty() {
       return Err(ExtractError::EmptySamples);
@@ -1551,6 +1682,9 @@ impl ModelSource for ArgmaxSource {
         onset: w_opts.onset(),
       });
     }
+    // ── Every guard that reads only geometry, before any O(n) work ────
+    let (num_chunks, chunks_sw, frames_sw) = checked_geometry(samples.len(), &w_opts)?;
+
     // Reject a NaN/inf sample before it is converted to f16 and fed to the
     // segmenter (M2) — the same input-side contract the embed module already
     // enforces; converts to `ExtractError::Infer` via `?`.
@@ -1562,13 +1696,18 @@ impl ModelSource for ArgmaxSource {
     // host f32 samples to f16.
     check_f16_representable(samples)?;
 
-    // The Extraction chunk grid IS dia's (module doc's theorem), so it is
-    // computed from the very same function FluidAudioSource uses — the two
-    // sources' geometry agrees by construction, not by coincidence.
-    let num_chunks = crate::audio::speaker::window::chunk_starts(samples.len(), &w_opts).len();
     let mut segmentations = vec![0.0f64; num_chunks * ARGMAX_FRAMES_PER_WINDOW * SEG_NUM_SLOTS];
     let mut raw_embeddings = vec![0.0f32; num_chunks * SEG_NUM_SLOTS * EMBEDDING_DIM];
     let mut padded = vec![f16::ZERO; ARGMAX_CHUNK_SAMPLES];
+
+    // The transform `place_embeddings`' row guard validates the PROJECTION
+    // against, resolved once before any inference: it is process-wide (see
+    // `extract::shared_plda_transform`) and building it costs ~0.15 ms.
+    // `place_embeddings` returns `InferError`, which has no variant for a
+    // missing transform, so resolving it HERE — where the return type is
+    // `ExtractError` — is what keeps the failure typed instead of collapsing
+    // it into the row guard's `bool`.
+    let plda = crate::audio::speaker::extract::shared_plda_transform()?;
 
     for (k, &start) in argmax_chunk_starts(samples.len()).iter().enumerate() {
       // The UNPADDED length drives `bounded()` (argmax's `waveformLength`).
@@ -1610,40 +1749,40 @@ impl ModelSource for ArgmaxSource {
           plan,
           &masks,
           &embeddings,
-          &mut raw_embeddings,
-          &mut segmentations,
+          plda,
+          &mut ChunkTensors {
+            raw_embeddings: &mut raw_embeddings,
+            segmentations: &mut segmentations,
+          },
         )?;
       }
     }
 
     // `count` over the POST-zeroing buffer, on dia's own grid — identical to
     // FluidAudioSource's (`crate::audio::speaker::extract`'s "Count runs after all zeroing").
-    let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&w_opts);
-    let frames_sw = crate::audio::speaker::window::frame_sliding_window();
-    let count = crate::audio::speaker::window::try_count_from_segmentations(
-      &segmentations,
+    //
+    // Through `assemble_checked`, which derives that `count` and then runs the
+    // SAME fourteen checks `Extraction::try_from_parts` runs. Round 8: this
+    // source used to assemble through the crate-private unchecked `from_parts`,
+    // which meant nothing at runtime held `speaker_ids` to the hard-binary
+    // domain — `write_segmentations` copies the decoded IDs verbatim, and
+    // `from_dir_with` accepts any model carrying the pinned F16 I/O shapes. A
+    // segmenter returning `0.1` per frame therefore produced an extraction
+    // whose stored `count` was all zero (offline: silence) while the online
+    // route read every cell as active. That check now runs HERE too.
+    //
+    // `chunks_sw` / `frames_sw` were derived before the input scans so the
+    // output-frame cap could run ahead of them; they are the same two values
+    // this call used to build.
+    Extraction::assemble_checked(
+      raw_embeddings,
+      segmentations,
       num_chunks,
       ARGMAX_FRAMES_PER_WINDOW,
-      SEG_NUM_SLOTS,
       w_opts.onset(),
       chunks_sw,
       frames_sw,
     )
-    .map_err(|e| match e {
-      crate::audio::speaker::window::WindowError::OutputFrameCountOverflow => {
-        ExtractError::OutputFrameCountOverflow
-      }
-    })?;
-
-    Ok(Extraction::from_parts(
-      raw_embeddings,
-      segmentations,
-      count,
-      num_chunks,
-      ARGMAX_FRAMES_PER_WINDOW,
-      chunks_sw,
-      frames_sw,
-    ))
   }
 }
 

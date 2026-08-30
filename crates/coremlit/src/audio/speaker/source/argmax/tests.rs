@@ -1,5 +1,8 @@
 use super::*;
-use crate::audio::speaker::window::{DEFAULT_STEP_SAMPLES, chunk_starts};
+use crate::audio::speaker::{
+  extract::PLDA_MIN_NORM,
+  window::{DEFAULT_STEP_SAMPLES, chunk_starts},
+};
 
 // =====================================================================
 // Hermetic: the geometry — argmax's chunk/window grid
@@ -18,6 +21,37 @@ fn derived_geometry_matches_the_model_contract() {
   assert_eq!(ARGMAX_WINDOW_STRIDE_SAMPLES, DEFAULT_STEP_SAMPLES as usize);
   assert_eq!(seconds_per_window(), 10.0);
   assert_eq!(seconds_per_stride(), 1.0);
+}
+
+/// `ArgmaxSource::extract` assembles through the crate-private, UNCHECKED
+/// `Extraction::from_parts` — the same door `Extractor::extract` goes through —
+/// so it too must never emit a grid whose `count` aggregation and
+/// `diaric::reconstruct` place a chunk at different output frames.
+///
+/// It needs no runtime guard for that, and this test is why rather than a
+/// comment claiming so. The stride is compiled into argmax's graph and
+/// `extract` refuses any other `step_samples` (`UnsupportedStepSamples`), so
+/// the chunk grid is a constant; the two mappings can only disagree at a
+/// rounding tie, which needs `c * step_samples` to be an odd multiple of 135,
+/// which an EVEN stride can never produce. If a future argmax revision moved
+/// the stride to an odd value, this assertion — not a comment — is what fails.
+#[test]
+fn the_fixed_argmax_grid_places_every_chunk_identically_under_both_mappings() {
+  assert_eq!(
+    ARGMAX_WINDOW_STRIDE_SAMPLES % 2,
+    0,
+    "an odd stride could tie, and would need the runtime guard extract() carries"
+  );
+  let opts = WindowOptions::new().with_step_samples(
+    u32::try_from(ARGMAX_WINDOW_STRIDE_SAMPLES).expect("argmax's stride fits u32"),
+  );
+  let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&opts);
+  let frames_sw = crate::audio::speaker::window::frame_sliding_window();
+  assert_eq!(
+    crate::audio::speaker::window::first_misaligned_chunk(100_000, chunks_sw, frames_sw),
+    None,
+    "argmax's fixed grid must stay aligned past any clip it can be handed"
+  );
 }
 
 /// The grid theorem's unstated PREMISE, made explicit: this port implements
@@ -577,6 +611,14 @@ fn inactive_slot_segmentation_column_is_zero() {
   }
 }
 
+/// The one PLDA transform `place_embeddings`' row guard validates a row's
+/// PROJECTION against, resolved through the crate's own cached resolver so a
+/// test exercises the same transform `ArgmaxSource::extract` hands it.
+fn plda() -> &'static diaric::plda::PldaTransform {
+  crate::audio::speaker::extract::shared_plda_transform()
+    .expect("diaric's PLDA weights are compile-time embedded")
+}
+
 /// A synthetic `[64, 256]` embedder output whose row `r` is the constant
 /// `(r + 1) as f32` — so a mis-indexed row is unmistakable.
 fn synthetic_embeddings() -> Vec<f32> {
@@ -610,8 +652,11 @@ fn embeddings_unflatten_64_slots_to_21_chunks_by_3_slots() {
       plan,
       &masks,
       &embeddings,
-      &mut raw,
-      &mut segs,
+      plda(),
+      &mut ChunkTensors {
+        raw_embeddings: &mut raw,
+        segmentations: &mut segs,
+      },
     )
     .expect("finite synthetic embeddings");
   }
@@ -663,8 +708,11 @@ fn inactive_slot_embedding_row_stays_zero() {
       plan,
       &masks,
       &embeddings,
-      &mut raw,
-      &mut segs,
+      plda(),
+      &mut ChunkTensors {
+        raw_embeddings: &mut raw,
+        segmentations: &mut segs,
+      },
     )
     .unwrap();
   }
@@ -725,8 +773,11 @@ fn an_all_overlap_slot_falls_back_and_is_kept() {
       plan,
       &masks,
       &embeddings,
-      &mut raw,
-      &mut segs,
+      plda(),
+      &mut ChunkTensors {
+        raw_embeddings: &mut raw,
+        segmentations: &mut segs,
+      },
     )
     .unwrap();
   }
@@ -775,8 +826,11 @@ fn low_norm_embedding_drops_the_slot() {
       plan,
       &masks,
       &embeddings,
-      &mut raw,
-      &mut segs,
+      plda(),
+      &mut ChunkTensors {
+        raw_embeddings: &mut raw,
+        segmentations: &mut segs,
+      },
     )
     .unwrap();
   }
@@ -809,8 +863,11 @@ fn non_finite_consumed_embedding_row_errors() {
     &plans[0],
     &masks,
     &embeddings,
-    &mut raw,
-    &mut segs,
+    plda(),
+    &mut ChunkTensors {
+      raw_embeddings: &mut raw,
+      segmentations: &mut segs,
+    },
   );
   assert_eq!(
     got,
@@ -841,8 +898,11 @@ fn non_finite_discarded_embedding_row_is_ignored() {
     &plans[0],
     &masks,
     &embeddings,
-    &mut raw,
-    &mut segs,
+    plda(),
+    &mut ChunkTensors {
+      raw_embeddings: &mut raw,
+      segmentations: &mut segs,
+    },
   )
   .expect("a NaN in a discarded row must not fail the extraction");
   assert!(raw.iter().all(|v| v.is_finite()));
@@ -1559,4 +1619,406 @@ fn argmax_source_rejects_f16_overflow_samples() {
       index: 100
     }))
   );
+}
+
+// =====================================================================
+// Hermetic: the assembly door (round 8, finding 1)
+// =====================================================================
+
+/// A segmenter whose `speaker_ids` are not hard-binary splits the two backends,
+/// and this source's assembly door refuses it.
+///
+/// # What is substituted for the model, and why
+///
+/// The trigger is a SEGMENTER, and every segmenter this source can load is a
+/// `.mlmodelc` under `ARGMAX_TEST_MODELS` — none of which returns `0.1`, and
+/// none of which can be made to. So the three CoreML calls are replaced by the
+/// tensors a conforming model is free to return, and NOTHING else is: this test
+/// runs `window_plans`, `write_segmentations`, `build_speaker_masks`,
+/// `place_embeddings`, `try_count_from_segmentations` and the assembly door, in
+/// `ArgmaxSource::extract`'s own order, with its own arguments. The substituted
+/// decode satisfies every contract `extract` enforces around those calls:
+/// `read_f16_output` would have accepted it (the shapes are the pinned ones and
+/// every value is finite), and the value is written as an f16 round trip
+/// because that is the width the graph declares.
+///
+/// The claim the substitution rests on is narrow and stated in
+/// `ArgmaxSource::from_dir_with`'s own contract: a model is accepted on its I/O
+/// SHAPES and dtype. `{0.0, 1.0}` is a property of the shipped graph — pinned
+/// by the model-gated `argmax_decoded_output_value_semantics`, which is a test
+/// and not a runtime guard — so "the decode is hard-binary" is exactly the
+/// premise a loaded model gets to falsify.
+#[test]
+fn a_fractional_speaker_id_splits_the_backends_and_is_refused_at_assembly() {
+  use crate::audio::speaker::window::{
+    chunk_sliding_window, frame_sliding_window, try_count_from_segmentations,
+  };
+
+  // The f16 round trip the real read performs, so the cell this test plants is
+  // a value the graph could actually carry.
+  let soft = f32::from(f16::from_f32(0.1));
+
+  // `extract`'s own preamble, for a 10 s clip: one dia chunk, one bounded
+  // argmax window (w=0; w=1 needs 16_000 + 144_000 < 160_000, which is false).
+  let opts = WindowOptions::new();
+  let samples_len = ARGMAX_WINDOW_SAMPLES;
+  let num_chunks = chunk_starts(samples_len, &opts).len();
+  assert_eq!(num_chunks, 1, "10 s of audio is one dia chunk");
+
+  // The decode: slot 0 of window 0 reads `soft` on every one of its 589 frames,
+  // `speaker_activity` reports those 589 frames (so the `> 2 frames` gate
+  // passes), no overlap. Shapes and finiteness are exactly what `read_f16_output`
+  // requires.
+  let mut ids =
+    vec![0.0f32; ARGMAX_WINDOWS_PER_CHUNK * ARGMAX_FRAMES_PER_WINDOW * ARGMAX_NUM_SPEAKERS];
+  let mut activity = vec![0.0f32; ARGMAX_WINDOWS_PER_CHUNK * ARGMAX_NUM_SPEAKERS];
+  for f in 0..ARGMAX_FRAMES_PER_WINDOW {
+    ids[ids_index(0, f, 0)] = soft;
+  }
+  activity[0] = ARGMAX_FRAMES_PER_WINDOW as f32;
+  let overlapped = vec![0.0f32; ARGMAX_WINDOWS_PER_CHUNK * ARGMAX_FRAMES_PER_WINDOW];
+
+  let plans = window_plans(samples_len, &activity);
+  assert_eq!(
+    (plans[0].bounded, plans[0].active),
+    (true, [true, false, false]),
+    "the activity gate reads a frame COUNT, not a magnitude, so `soft` cells \
+     still make slot 0 active"
+  );
+  assert!(!plans[1].bounded, "only window 0 is inside a 10 s clip");
+
+  // `extract`'s per-chunk body, verbatim, with a usable embedding row where the
+  // embedder's output would be.
+  let (mut segmentations, mut raw_embeddings) = buffers(num_chunks);
+  write_segmentations(0, 0, &ids, &plans[0], &mut segmentations);
+  let masks = build_speaker_masks(&ids, &overlapped, &plans);
+  let mut embeddings = vec![0.0f32; ARGMAX_MASK_SLOTS * EMBEDDING_DIM];
+  embeddings[..64].fill(1.0);
+  let plda =
+    crate::audio::speaker::extract::shared_plda_transform().expect("hermetic PLDA weights");
+  place_embeddings(
+    0,
+    0,
+    &plans[0],
+    &masks,
+    &embeddings,
+    plda,
+    &mut ChunkTensors {
+      raw_embeddings: &mut raw_embeddings,
+      segmentations: &mut segmentations,
+    },
+  )
+  .expect("the row clears `raw_embedding_reaches_plda`, so the slot is kept");
+  assert_eq!(
+    segmentations[0],
+    f64::from(soft),
+    "`write_segmentations` copies the decoded id VERBATIM — the widening is \
+     exact, so the model's value is the Extraction's value"
+  );
+
+  let chunks_sw = chunk_sliding_window(&opts);
+  let frames_sw = frame_sliding_window();
+  let count = try_count_from_segmentations(
+    &segmentations,
+    num_chunks,
+    ARGMAX_FRAMES_PER_WINDOW,
+    SEG_NUM_SLOTS,
+    opts.onset(),
+    chunks_sw,
+    frames_sw,
+  )
+  .expect("this geometry's output-frame count fits usize");
+
+  // The SPLIT itself, proved against the two engines rather than described —
+  // independent of what the assembly door decides to do about it.
+  //
+  // `count` is aggregated at `seg >= onset`; with the default onset of 0.5 no
+  // `soft` cell clears it, so offline is handed a grid that says nobody speaks.
+  // The online route never reads that field: it derives its own count at
+  // `seg > 0.0`, which every one of the 589 cells clears.
+  assert_eq!(
+    count.iter().map(|&c| u32::from(c)).sum::<u32>(),
+    0,
+    "offline's count says silence"
+  );
+  assert_eq!(
+    segmentations
+      .iter()
+      .step_by(SEG_NUM_SLOTS)
+      .filter(|v| **v > 0.0)
+      .count(),
+    ARGMAX_FRAMES_PER_WINDOW,
+    "and the online activity predicate reads all 589 frames of the same buffer \
+     as speech"
+  );
+  let unchecked = Extraction::from_parts_unchecked(
+    raw_embeddings.clone(),
+    segmentations.clone(),
+    count,
+    num_chunks,
+    ARGMAX_FRAMES_PER_WINDOW,
+    chunks_sw,
+    frames_sw,
+  );
+  let p = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+  assert_eq!(
+    unchecked
+      .diarize_with(
+        &p,
+        crate::audio::speaker::cluster::ClusterBackend::default()
+      )
+      .expect("offline returns Ok")
+      .spans_slice()
+      .len(),
+    0,
+    "offline emits NOTHING for this extraction"
+  );
+  let online = unchecked
+    .diarize_online(crate::audio::speaker::OnlineOptions::new())
+    .expect("online returns Ok");
+  assert_eq!(
+    online
+      .spans_slice()
+      .iter()
+      .map(|s| (s.start(), s.end(), s.cluster()))
+      .collect::<Vec<_>>(),
+    vec![(0.03096875, 9.97034375, 0)],
+    "...while online emits a 9.94 s speaker from the identical Extraction"
+  );
+
+  // And the door this source now assembles through refuses it, naming the cell.
+  // This is what goes red if check 9 is reverted, or if this source is ever
+  // given a second, unchecked way back to `from_parts`.
+  let err = Extraction::assemble_checked(
+    raw_embeddings.clone(),
+    segmentations,
+    num_chunks,
+    ARGMAX_FRAMES_PER_WINDOW,
+    opts.onset(),
+    chunks_sw,
+    frames_sw,
+  )
+  .expect_err("a fractional decode must not assemble");
+  let ExtractError::NonBinarySegmentation(n) = err else {
+    panic!("expected NonBinarySegmentation, got {err:?}")
+  };
+  assert_eq!(
+    (n.index(), n.value(), n.slot()),
+    (0, f64::from(soft), 0),
+    "the FIRST offending cell: chunk 0, frame 0, slot 0"
+  );
+
+  // A domain confinement, not a blanket refusal: the hard-binary twin of the
+  // very same decode assembles, and emits the speaker BOTH engines agree on.
+  let mut hard_ids = ids;
+  for f in 0..ARGMAX_FRAMES_PER_WINDOW {
+    hard_ids[ids_index(0, f, 0)] = 1.0;
+  }
+  let (mut hard_segs, mut hard_rows) = buffers(num_chunks);
+  write_segmentations(0, 0, &hard_ids, &plans[0], &mut hard_segs);
+  hard_rows[..64].fill(1.0);
+  let e = Extraction::assemble_checked(
+    hard_rows,
+    hard_segs,
+    num_chunks,
+    ARGMAX_FRAMES_PER_WINDOW,
+    opts.onset(),
+    chunks_sw,
+    frames_sw,
+  )
+  .expect("the hard-binary twin assembles");
+  assert_eq!(
+    e.count().iter().map(|&c| u32::from(c)).sum::<u32>(),
+    ARGMAX_FRAMES_PER_WINDOW as u32,
+    "and now offline's count agrees with online's reading of the same buffer"
+  );
+}
+
+/// Round 9, this source's half: the output-frame cap must be applied at
+/// argmax's OWN earliest point, which is earlier than `Extractor`'s.
+///
+/// `Extractor::checked_geometry` runs after a model-dependent guard (the
+/// segmenter/embedder frame-count agreement); this source has no such guard,
+/// and its window stride is compiled into the graph and re-asserted at the top
+/// of `extract`, so `samples.len()` is the last input the grid needs. That puts
+/// the cap ahead of `check_finite_input` and `check_f16_representable` — two
+/// whole-buffer passes over 4.5 GB of samples at the clip below — as well as
+/// ahead of the extraction tensors and all three models.
+///
+/// Asserted through `checked_geometry` because `extract` cannot be: it needs
+/// three loaded `.mlmodelc`s, and even with them this clip is 3 371 argmax
+/// chunks at up to three model calls each. `checked_geometry` IS what `extract` calls, not a restatement
+/// of it — the sibling half of
+/// `extract::tests::the_frame_cap_refuses_before_the_allocation_it_bounds`,
+/// where the allocation this saves is measured.
+#[test]
+fn the_frame_cap_refuses_argmax_geometry_before_its_input_scans() {
+  /// The smallest clip whose derived output grid exceeds `MAX_OUTPUT_FRAMES`.
+  /// The same number as the other source's, because the two share one chunk
+  /// grid: argmax's pinned stride IS `DEFAULT_STEP_SAMPLES`.
+  const SMALLEST_OVER_CAP_SAMPLES: usize = 1_132_448_001;
+
+  let w = ArgmaxOptions::new().window();
+  assert_eq!(w.step_samples() as usize, ARGMAX_WINDOW_STRIDE_SAMPLES);
+
+  assert_eq!(
+    checked_geometry(SMALLEST_OVER_CAP_SAMPLES, &w),
+    Err(ExtractError::OutputFrameCountTooLarge(4_194_312)),
+    "19.66 h derives 4 194 312 output frames, eight past the cap"
+  );
+
+  // A boundary, not a blanket refusal: one sample fewer is one chunk fewer and
+  // is accepted, with the same two grids the assembly door will be handed.
+  let (num_chunks, chunks_sw, frames_sw) = checked_geometry(SMALLEST_OVER_CAP_SAMPLES - 1, &w)
+    .expect("one sample fewer derives a grid inside the cap");
+  assert_eq!(
+    (num_chunks, chunks_sw, frames_sw),
+    (
+      70_769,
+      crate::audio::speaker::window::chunk_sliding_window(&w),
+      crate::audio::speaker::window::frame_sliding_window()
+    )
+  );
+}
+
+/// Rounds 10 and 11, this source's half: BOTH chunk-axis bounds run at argmax's
+/// earliest point too, and both are UNREACHABLE from here.
+///
+/// `MAX_EXTRACTION_CHUNKS` is the first chunk count `MAX_OUTPUT_FRAMES` refuses
+/// at `DEFAULT_STEP_SAMPLES`, and this source's stride IS that value — pinned by
+/// its compiled graph and re-asserted at the top of `extract`. So at every clip
+/// length the frame cap refuses first. `MAX_EXTRACTION_TENSOR_BYTES` is derived
+/// at the 594-frame addressable grid and this source's per-window frame count is
+/// the compiled `ARGMAX_FRAMES_PER_WINDOW` = 589, so its footprint stays under
+/// the ceiling at every admitted grid. Neither bound can name an error here.
+///
+/// That is a property of the two derivations, not a coincidence, and it is what
+/// the round-8 posture asks be pinned rather than used as a licence to skip the
+/// checks: the stride and the frame count are properties of the shipped graph,
+/// not invariants of `checked_geometry`.
+#[test]
+fn the_chunk_axis_caps_are_inert_for_argmaxs_pinned_stride() {
+  use crate::audio::speaker::extract::{
+    MAX_EXTRACTION_CHUNKS, MAX_EXTRACTION_TENSOR_BYTES, checked_extraction_chunk_count,
+    checked_extraction_tensor_bytes,
+  };
+
+  /// The smallest clip whose derived output grid exceeds `MAX_OUTPUT_FRAMES` —
+  /// the same constant round 9's falsifier uses.
+  const SMALLEST_OVER_CAP_SAMPLES: usize = 1_132_448_001;
+
+  let w = ArgmaxOptions::new().window();
+  assert_eq!(w.step_samples() as usize, ARGMAX_WINDOW_STRIDE_SAMPLES);
+  assert_eq!(
+    ARGMAX_WINDOW_STRIDE_SAMPLES as u32,
+    crate::audio::speaker::window::DEFAULT_STEP_SAMPLES,
+    "the derivation of MAX_EXTRACTION_CHUNKS rests on these being equal"
+  );
+
+  // The largest clip the frame cap admits: 70 769 chunks, under both ceilings.
+  let (num_chunks, _, _) = checked_geometry(SMALLEST_OVER_CAP_SAMPLES - 1, &w)
+    .expect("one sample under the frame cap is still accepted");
+  assert_eq!(num_chunks, 70_769);
+  assert_eq!(checked_extraction_chunk_count(num_chunks), Ok(70_769));
+  const { assert!(70_769 < MAX_EXTRACTION_CHUNKS) };
+  assert_eq!(
+    checked_extraction_tensor_bytes(num_chunks, ARGMAX_FRAMES_PER_WINDOW),
+    Ok(1_217_792_952)
+  );
+  const { assert!(1_217_792_952 < MAX_EXTRACTION_TENSOR_BYTES) };
+
+  // And one sample past it still names the FRAME cap, not this one — the two
+  // are ordered, and the chunk-axis bound has nothing to say at this stride.
+  assert_eq!(
+    checked_geometry(SMALLEST_OVER_CAP_SAMPLES, &w),
+    Err(ExtractError::OutputFrameCountTooLarge(4_194_312))
+  );
+
+  // The property, not the two samples: across the whole admissible range this
+  // stride's chunk grid never passes either ceiling.
+  for samples in [
+    1usize,
+    160_000,
+    160_001,
+    16_000_000,
+    SMALLEST_OVER_CAP_SAMPLES - 1,
+  ] {
+    let n = crate::audio::speaker::window::num_chunks(samples, &w);
+    assert!(
+      checked_extraction_chunk_count(n).is_ok()
+        && checked_extraction_tensor_bytes(n, ARGMAX_FRAMES_PER_WINDOW).is_ok(),
+      "samples={samples} -> {n} chunks must stay inside both ceilings"
+    );
+  }
+
+  // And the compute this source's own call structure buys at that ceiling:
+  // three model calls per 21-window argmax chunk, not per Extraction chunk.
+  assert_eq!(
+    3 * MAX_EXTRACTION_CHUNKS.div_ceil(ARGMAX_WINDOWS_PER_CHUNK),
+    10_110
+  );
+}
+
+/// Check 14 is inert for this source too, and pinned rather than assumed.
+///
+/// The coverage bound is the only guard in `checked_geometry` that reads a
+/// per-chunk FRAME count, so at `Extractor` it is the one a loaded segmenter can
+/// trip. Here that count is `ARGMAX_FRAMES_PER_WINDOW`, compiled into the
+/// shipped graph, and the stride is likewise compiled in — so the check can
+/// never name an error. That is a property of the two numbers, not a licence to
+/// skip the check: the round-8 posture is that every producer applies every
+/// bound, and this is what says applying it costs this source nothing.
+///
+/// Swept over every chunk count the frame cap admits, and the SMALLEST headroom
+/// is reported so a change to either the stride or the compiled frame count
+/// shows up as a moved number rather than a silent loss of margin.
+#[test]
+fn the_pinned_argmax_grid_covers_its_last_chunk_at_every_chunk_count() {
+  use crate::audio::speaker::extract::checked_output_frame_count;
+
+  let w = ArgmaxOptions::new().window();
+  let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&w);
+  let frames_sw = crate::audio::speaker::window::frame_sliding_window();
+
+  // The largest chunk grid this stride can reach before the frame cap refuses.
+  let largest = crate::audio::speaker::window::num_chunks(1_132_448_001 - 1, &w);
+  assert_eq!(largest, 70_769);
+
+  let mut min_headroom = usize::MAX;
+  for num_chunks in 1..=largest {
+    let derived = checked_output_frame_count(num_chunks, chunks_sw, frames_sw)
+      .expect("every admitted chunk count derives a capped grid");
+    assert_eq!(
+      crate::audio::speaker::window::uncovered_last_chunk(
+        num_chunks,
+        ARGMAX_FRAMES_PER_WINDOW,
+        derived,
+        chunks_sw,
+        frames_sw,
+      ),
+      None,
+      "num_chunks={num_chunks}: the compiled 589-frame grid must stay covered"
+    );
+    let start = crate::audio::speaker::window::reconstruct_chunk_start_frame(
+      num_chunks - 1,
+      chunks_sw,
+      frames_sw,
+    );
+    let headroom = derived
+      - usize::try_from(start).expect("this stride places every chunk at or after 0")
+      - ARGMAX_FRAMES_PER_WINDOW;
+    min_headroom = min_headroom.min(headroom);
+  }
+  assert_eq!(
+    min_headroom, 4,
+    "the compiled grid's smallest headroom over the whole admitted range"
+  );
+
+  // The door itself, at both ends of that range.
+  for samples in [1usize, 160_000, 160_001, 16_000_000, 1_132_448_000] {
+    assert!(
+      checked_geometry(samples, &w).is_ok(),
+      "samples={samples}: check 14 must not refuse this source's own geometry"
+    );
+  }
 }

@@ -85,8 +85,26 @@ pub trait ModelSource {
   /// documentation for exactly which [`ExtractError`] variants it can
   /// return.
   ///
+  /// # The assembly contract every implementation is held to
+  ///
+  /// An implementation does NOT construct an [`Extraction`] itself: the
+  /// struct's assembly site is private to [`crate::audio::speaker::extract`],
+  /// and the only way in from here is `Extraction::assemble_checked`, which
+  /// derives `count` and then runs the ENTIRE check sequence
+  /// [`Extraction::try_from_parts`] runs. So whatever an implementation's
+  /// decode semantics are, the tensor set it returns has already been held to
+  /// the standard both cluster backends need.
+  ///
+  /// Round 8 made that structural. Before it, each implementation reached an
+  /// unchecked assembly directly, having satisfied the invariants by its own
+  /// local reasoning — and [`ArgmaxSource`]'s reasoning ("the graph decodes
+  /// hard-binary") is a property of a MODEL, which `from_dir_with` accepts on
+  /// its I/O shapes alone.
+  ///
   /// # Errors
-  /// Implementation-defined; see the implementing type.
+  /// Implementation-defined; see the implementing type. Every implementation
+  /// can additionally return anything [`Extraction::try_from_parts`] returns,
+  /// for the reason above.
   fn extract(&self, samples: &[f32]) -> Result<Extraction, ExtractError>;
 }
 

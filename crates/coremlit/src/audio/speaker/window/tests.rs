@@ -815,3 +815,397 @@ fn count_from_segmentations_panics_on_output_frame_count_overflow() {
   let frames_sw = SlidingWindow::new(0.0, 0.0619375, 1e-300);
   let _ = count_from_segmentations(&segs, 1, 1, 1, 0.5, chunks_sw, frames_sw);
 }
+
+// ---------------------------------------------------------------------
+// The two chunk→output-frame mappings (round 2, finding B)
+// ---------------------------------------------------------------------
+
+/// Reads back the grid length `diaric::reconstruct` ACTUALLY requires for this
+/// geometry, by under-sizing the output grid and letting its
+/// `OutputFrameCountTooSmall` guard report the minimum
+/// (`diarization/src/reconstruct/algo.rs:478-492`). That minimum IS
+/// `last_start_frame + num_frames_per_chunk`.
+///
+/// The oracle behind BOTH [`reconstruct_chunk_start_frame`] — a hand-written
+/// mirror, because `diaric::reconstruct::SlidingWindow::closest_frame` is
+/// private to that crate — and [`uncovered_last_chunk`], whose whole job is to
+/// predict this number before `diaric` is called. One oracle for the two, so a
+/// mirror that drifted could not satisfy one test by breaking the other.
+fn diaric_required_output_frames(
+  num_chunks: usize,
+  num_frames_per_chunk: usize,
+  chunks_sw: SlidingWindow,
+  frames_sw: SlidingWindow,
+) -> usize {
+  const SPEAKERS: usize = 3;
+  let segmentations = vec![0.0f64; num_chunks * num_frames_per_chunk * SPEAKERS];
+  let hard: Vec<diaric::pipeline::ChunkAssignment> = vec![[0, -2, -2]; num_chunks];
+  // One output frame: below any non-negative placement's requirement, so the
+  // guard fires and names the minimum. `count.len()` must match — reconstruct
+  // checks that first.
+  let count = vec![0u8; 1];
+  let input = diaric::reconstruct::ReconstructInput::new(
+    &segmentations,
+    num_chunks,
+    num_frames_per_chunk,
+    SPEAKERS,
+    &hard,
+    &count,
+    1,
+    chunks_sw.into(),
+    frames_sw.into(),
+  );
+  match diaric::reconstruct::reconstruct(&input) {
+    Err(diaric::reconstruct::Error::Shape(
+      diaric::reconstruct::ShapeError::OutputFrameCountTooSmall { required, .. },
+    )) => required,
+    other => panic!("expected OutputFrameCountTooSmall to report the placement, got {other:?}"),
+  }
+}
+
+/// The output frame `diaric::reconstruct` places the last chunk's first frame
+/// at, peeled off [`diaric_required_output_frames`].
+fn diaric_last_chunk_start_frame(
+  num_chunks: usize,
+  num_frames_per_chunk: usize,
+  chunks_sw: SlidingWindow,
+  frames_sw: SlidingWindow,
+) -> i64 {
+  (diaric_required_output_frames(num_chunks, num_frames_per_chunk, chunks_sw, frames_sw)
+    - num_frames_per_chunk) as i64
+}
+
+#[test]
+fn reconstruct_chunk_start_frame_mirrors_diarics_own_placement() {
+  // The mirror is only worth having if it cannot drift from the thing it
+  // mirrors. Each geometry below is checked against `diaric` itself, including
+  // the one whose two mappings DISAGREE — which is the case a mirror derived
+  // from the aggregation expression would get wrong.
+  let community1_frames = frame_sliding_window();
+  let cases: [(usize, usize, SlidingWindow, SlidingWindow); 5] = [
+    // Community-1 production timing: 1 s chunk step on the 0.016875 s frame grid.
+    (
+      4,
+      589,
+      chunk_sliding_window(&WindowOptions::new()),
+      community1_frames,
+    ),
+    // Unit grid, zero origins.
+    (
+      3,
+      2,
+      SlidingWindow::new(0.0, 1.0, 1.0),
+      SlidingWindow::new(0.0, 1.0, 1.0),
+    ),
+    // Equal, CANCELLING non-zero origins — placement is unshifted.
+    (
+      3,
+      2,
+      SlidingWindow::new(1.0, 1.0, 1.0),
+      SlidingWindow::new(1.0, 1.0, 1.0),
+    ),
+    // An uncancelled origin — placement IS shifted, and negatively.
+    (
+      2,
+      2,
+      SlidingWindow::new(-1.0, 1.0, 1.0),
+      SlidingWindow::new(0.0, 1.0, 1.0),
+    ),
+    // The round-2 finding-B geometry: both origins 0.0, and the two mappings
+    // still disagree about chunk 1.
+    (
+      2,
+      1,
+      SlidingWindow::new(0.0, 0.04218750000000001, 0.04218750000000001),
+      SlidingWindow::new(0.0, 0.0619375, 0.016875),
+    ),
+  ];
+  for (num_chunks, num_frames_per_chunk, chunks_sw, frames_sw) in cases {
+    let mirrored = reconstruct_chunk_start_frame(num_chunks - 1, chunks_sw, frames_sw);
+    let actual =
+      diaric_last_chunk_start_frame(num_chunks, num_frames_per_chunk, chunks_sw, frames_sw);
+    assert_eq!(
+      mirrored, actual,
+      "mirror drifted from diaric for chunks_sw={chunks_sw:?} frames_sw={frames_sw:?}"
+    );
+  }
+}
+
+#[test]
+fn the_two_chunk_mappings_agree_on_the_production_grid_and_split_on_the_finding_b_grid() {
+  // `aggregate_chunk_start_frame` is what the count aggregation uses;
+  // `reconstruct_chunk_start_frame` is what `diaric::reconstruct` uses. On the
+  // community-1 grid the two agree for every chunk in a 12-hour clip, which is
+  // why nothing downstream had ever noticed they are different expressions.
+  let chunks_sw = chunk_sliding_window(&WindowOptions::new());
+  let frames_sw = frame_sliding_window();
+  for c in 0..43_200 {
+    assert_eq!(
+      aggregate_chunk_start_frame(c, chunks_sw.step(), frames_sw.step()),
+      reconstruct_chunk_start_frame(c, chunks_sw, frames_sw),
+      "production grid, chunk {c}"
+    );
+  }
+
+  // And the finding-B geometry splits them by a whole frame with BOTH origins
+  // at 0.0 — the reconstruction route adds `frames_sw.duration / 2` and takes
+  // it back off, and `(x + h) - h != x` in binary floating point.
+  let d = 0.04218750000000001_f64;
+  let chunks_sw = SlidingWindow::new(0.0, d, d);
+  let frames_sw = SlidingWindow::new(0.0, 0.0619375, 0.016875);
+  assert_eq!(
+    aggregate_chunk_start_frame(1, chunks_sw.step(), frames_sw.step()),
+    3
+  );
+  assert_eq!(reconstruct_chunk_start_frame(1, chunks_sw, frames_sw), 2);
+
+  // Equal, non-zero origins cancel exactly: a zero-origin test would have
+  // rejected this grid, and there is nothing wrong with it.
+  let sw = SlidingWindow::new(1.0, 1.0, 1.0);
+  for c in 0..8 {
+    assert_eq!(
+      aggregate_chunk_start_frame(c, sw.step(), sw.step()),
+      reconstruct_chunk_start_frame(c, sw, sw),
+      "cancelling origins, chunk {c}"
+    );
+  }
+}
+
+// ---------------------------------------------------------------------
+// The last chunk's coverage (round 12)
+// ---------------------------------------------------------------------
+
+/// The whole justification for check 14: the number `uncovered_last_chunk`
+/// predicts is `diaric`'s OWN `required`, MEASURED out of that crate rather
+/// than restated here.
+///
+/// Round 12's finding turns on one claim — that
+/// [`reconstruct_chunk_start_frame`] is already the quantity the coverage bound
+/// needs, so the check is a CALL and not a fourth frame-index derivation. This
+/// is that claim, falsifiable: for each geometry the predicted `required` must
+/// equal what `diaric::reconstruct` reports when handed a grid too short. The
+/// finding-B grid is in the list on purpose — its two mappings disagree by a
+/// whole frame, so a coverage bound built on the AGGREGATION expression instead
+/// would predict the wrong number there and only there.
+#[test]
+fn uncovered_last_chunks_requirement_is_diarics_own_required_measured_not_copied() {
+  let community1_frames = frame_sliding_window();
+  let cases: [(usize, usize, SlidingWindow, SlidingWindow); 6] = [
+    // Community-1 production timing, the shipped 589-frame grid.
+    (
+      4,
+      589,
+      chunk_sliding_window(&WindowOptions::new()),
+      community1_frames,
+    ),
+    // The round-12 repro: 594 frames over three default chunks.
+    (
+      3,
+      594,
+      chunk_sliding_window(&WindowOptions::new()),
+      community1_frames,
+    ),
+    // The producer repro: a 595-frame segmenter on a one-chunk clip.
+    (
+      1,
+      595,
+      chunk_sliding_window(&WindowOptions::new()),
+      community1_frames,
+    ),
+    // Unit grid, zero origins.
+    (
+      3,
+      2,
+      SlidingWindow::new(0.0, 1.0, 1.0),
+      SlidingWindow::new(0.0, 1.0, 1.0),
+    ),
+    // Equal, CANCELLING non-zero origins.
+    (
+      3,
+      2,
+      SlidingWindow::new(1.0, 1.0, 1.0),
+      SlidingWindow::new(1.0, 1.0, 1.0),
+    ),
+    // The round-2 finding-B geometry: the two mappings disagree about chunk 1,
+    // so only the RECONSTRUCTION mapping predicts `diaric`'s requirement.
+    (
+      2,
+      1,
+      SlidingWindow::new(0.0, 0.04218750000000001, 0.04218750000000001),
+      SlidingWindow::new(0.0, 0.0619375, 0.016875),
+    ),
+  ];
+  for (num_chunks, num_frames_per_chunk, chunks_sw, frames_sw) in cases {
+    let actual =
+      diaric_required_output_frames(num_chunks, num_frames_per_chunk, chunks_sw, frames_sw);
+    // A grid one frame short of `actual` MUST be refused, and the payload must
+    // name that very number.
+    let u = uncovered_last_chunk(
+      num_chunks,
+      num_frames_per_chunk,
+      actual - 1,
+      chunks_sw,
+      frames_sw,
+    )
+    .expect("a grid one frame short of diaric's requirement must be refused");
+    assert_eq!(
+      u.required(),
+      actual,
+      "predicted requirement drifted from diaric for {chunks_sw:?} / {frames_sw:?}"
+    );
+    assert_eq!(u.got(), actual - 1);
+    assert_eq!(
+      u.start_frame(),
+      reconstruct_chunk_start_frame(num_chunks - 1, chunks_sw, frames_sw)
+    );
+    // And a grid of exactly `actual` must be accepted — the bound is `<`, not
+    // `<=`, so the boundary itself is the case a sign error moves.
+    assert_eq!(
+      uncovered_last_chunk(
+        num_chunks,
+        num_frames_per_chunk,
+        actual,
+        chunks_sw,
+        frames_sw
+      ),
+      None,
+      "diaric's own requirement must be admitted"
+    );
+  }
+}
+
+/// The check is `<`, and a NEGATIVE placement is not checked at all — `diaric`
+/// guards `last_start_frame >= 0` before deriving its requirement
+/// (`diarization/src/reconstruct/algo.rs:478`), so refusing there would refuse
+/// a geometry that crate accepts.
+#[test]
+fn uncovered_last_chunk_is_silent_below_frame_zero() {
+  // An uncancelled negative chunk origin places chunk 0 at frame -1.
+  let chunks_sw = SlidingWindow::new(-1.0, 1.0, 1.0);
+  let frames_sw = SlidingWindow::new(0.0, 1.0, 1.0);
+  assert_eq!(reconstruct_chunk_start_frame(0, chunks_sw, frames_sw), -1);
+  assert_eq!(
+    uncovered_last_chunk(1, 9_999, 1, chunks_sw, frames_sw),
+    None,
+    "a negative placement must not be refused here"
+  );
+}
+
+// ---------------------------------------------------------------------
+// The forward frame→time mapping (round 8, finding 2)
+// ---------------------------------------------------------------------
+
+/// Reads back the `(start, duration)` `diaric` ACTUALLY emits for a span, by
+/// handing its public `discrete_to_spans` a one-cluster grid whose active run
+/// is `t_start..t_end`.
+///
+/// This is the oracle for [`frame_center`], which has to be a hand-written
+/// mirror: `try_discrete_to_spans` computes those times inline and takes a
+/// whole grid, so there is no way to ask `diaric` for one frame's center.
+///
+/// `start` and `duration` are the two values that conversion actually computes
+/// — `RttmSpan::new(k, s, e - s)` (`rttm.rs:255`) — so they pin both centers
+/// exactly: `start` IS `frame_center(t_start)` and `duration` IS
+/// `frame_center(t_end) - frame_center(t_start)`. `RttmSpan::end()` is NOT used
+/// here, deliberately: it re-derives `start + duration`, and that round trip is
+/// not the identity in binary floating point (on the `(-1.25, 0.1, 0.3)` grid
+/// below it lands 5 ULP below the center it came from) — the same
+/// re-association hazard `reconstruct_chunk_start_frame` exists for.
+fn diaric_span_start_and_duration(
+  t_start: usize,
+  t_end: usize,
+  num_frames: usize,
+  frames_sw: SlidingWindow,
+) -> (f64, f64) {
+  assert!(t_end < num_frames, "the run must CLOSE inside the grid");
+  let mut grid = vec![0.0f32; num_frames];
+  grid[t_start..t_end].fill(1.0);
+  let spans = diaric::reconstruct::discrete_to_spans(&grid, num_frames, 1, frames_sw.into(), 0.0);
+  assert_eq!(spans.len(), 1, "one contiguous run is one span");
+  (spans[0].start(), spans[0].duration())
+}
+
+#[test]
+fn frame_center_mirrors_diarics_own_span_conversion() {
+  // The mirror is only worth having if it cannot drift. `diaric` computes
+  // `center_offset = duration / 2.0` ONCE and then `start + t * step +
+  // center_offset`; the algebraically equal `start + (t * step + duration / 2)`
+  // is a different `f64`, and these grids are chosen so that difference shows.
+  let cases: [(usize, usize, usize, SlidingWindow); 5] = [
+    // Community-1 production timing.
+    (0, 1, 8, frame_sliding_window()),
+    (13, 37, 64, frame_sliding_window()),
+    // Unit grid, zero origin.
+    (0, 1, 4, SlidingWindow::new(0.0, 1.0, 1.0)),
+    // A non-zero origin, and a duration whose half is not exact in binary.
+    (2, 5, 8, SlidingWindow::new(-1.25, 0.1, 0.3)),
+    // A large origin against a small step: the regime finding 2 lives in, but
+    // one ULP clear of the collapse (step 1e-6 > ULP(1e9)/2 = 5.96e-8).
+    (1, 3, 6, SlidingWindow::new(1e9, 1e-6, 1e-6)),
+  ];
+  for (t_start, t_end, num_frames, frames_sw) in cases {
+    let (start, duration) = diaric_span_start_and_duration(t_start, t_end, num_frames, frames_sw);
+    let (lo, hi) = (
+      frame_center(t_start, frames_sw),
+      frame_center(t_end, frames_sw),
+    );
+    assert_eq!(
+      (lo, hi - lo),
+      (start, duration),
+      "mirror drifted from diaric's span conversion for frames_sw={frames_sw:?}"
+    );
+  }
+}
+
+#[test]
+fn first_collapsed_frame_center_finds_the_first_repeated_center() {
+  // The community-1 grid is a usable timeline over the whole admitted range.
+  assert_eq!(
+    first_collapsed_frame_center(
+      crate::audio::speaker::extract::MAX_OUTPUT_FRAMES,
+      frame_sliding_window()
+    ),
+    None,
+    "the only frame grid this crate's models produce must never collapse"
+  );
+
+  // Round 8, finding 2's window: at `start = 1e9` the f64 ULP is 1.19e-7, so a
+  // step of 1e-8 adds nothing and frame 1 lands on frame 0's center.
+  let collapsing = SlidingWindow::new(1e9, 1e-8, 1e-8);
+  assert_eq!(
+    f64::from_bits(1e9f64.to_bits() + 1) - 1e9,
+    1.1920928955078125e-7
+  );
+  assert_eq!(1e9f64 + 1e-8, 1e9);
+  let c = first_collapsed_frame_center(4, collapsing).expect("this grid collapses");
+  assert_eq!((c.frame(), c.center(), c.previous()), (1, 1e9, 1e9));
+
+  // A single frame cannot collapse — there is nothing to be equal to.
+  assert_eq!(first_collapsed_frame_center(1, collapsing), None);
+  assert_eq!(first_collapsed_frame_center(0, collapsing), None);
+
+  // Not just the first pair: `step` exactly half an ULP with an EVEN mantissa
+  // ties-to-even back onto the same value at t=1, separates at t=2, and ties
+  // again at t=3 — so a check that only compared frames 0 and 1 would miss the
+  // second collapse, and one that only tested the endpoints would miss both.
+  let half_ulp = SlidingWindow::new(0.0, 0.0, f64::EPSILON / 2.0).with_start(1.0);
+  let centers: Vec<f64> = (0..4).map(|t| frame_center(t, half_ulp)).collect();
+  assert_eq!(centers[0], centers[1], "ties-to-even keeps frame 1 at 1.0");
+  assert!(centers[2] > centers[1], "frame 2 does separate");
+  assert_eq!(
+    first_collapsed_frame_center(4, half_ulp).map(|c| c.frame()),
+    Some(1)
+  );
+  assert_eq!(
+    first_collapsed_frame_center(4, half_ulp.with_start(1.0 + f64::EPSILON)).map(|c| c.frame()),
+    Some(2),
+    "shifting the origin by one ULP moves WHICH pair collapses — the reason \
+     this is an adjacent-pair scan and not an endpoint test"
+  );
+
+  // A non-finite center is caught where it occurs, frame 0 included.
+  let overflowing = SlidingWindow::new(f64::MAX, f64::MAX, 1.0);
+  let c = first_collapsed_frame_center(2, overflowing).expect("start + duration/2 overflows");
+  assert_eq!((c.frame(), c.previous()), (0, f64::NEG_INFINITY));
+  assert!(!c.center().is_finite());
+}
