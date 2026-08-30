@@ -900,6 +900,59 @@ pub(crate) fn try_count_from_segmentations(
   )
 }
 
+/// Where the count aggregation places chunk `c`'s first frame on the
+/// output-frame grid: dia's `count.rs:766-767` expression, verbatim and in the
+/// SAME operation order — `(c as f64 * chunk_step)` first, then the division,
+/// then `round_ties_even`.
+///
+/// The ONE definition of that mapping. [`try_aggregate_output_frame_count`]
+/// (and therefore [`count_from_segmentations`], `Extractor::extract`'s `count`,
+/// and [`crate::audio::speaker::extract::Extraction::diarize_online`]'s
+/// clustered count) calls it, and so does
+/// [`crate::audio::speaker::extract::Extraction::try_from_parts`]'s
+/// chunk-placement check. Written out a second time it would be a second
+/// expression that is algebraically equal and numerically different — the exact
+/// failure mode the placement check exists to catch.
+///
+/// Reads NO origin, because dia's aggregation does not: pyannote's
+/// `count` only ever runs on grids whose windows start at `0.0`. That is what
+/// makes the placement check necessary rather than optional —
+/// `reconstruct_chunk_start_frame` DOES read both origins.
+#[inline]
+pub(crate) fn aggregate_chunk_start_frame(c: usize, chunk_step: f64, frame_step: f64) -> i64 {
+  let chunk_start_t = c as f64 * chunk_step;
+  (chunk_start_t / frame_step).round_ties_even() as i64
+}
+
+/// Where `diaric::reconstruct` places chunk `c`'s first frame on the same grid:
+/// `frames_sw.closest_frame(chunks_sw.start + c * chunks_sw.step + 0.5 *
+/// frames_sw.duration)` (`diarization/src/reconstruct/algo.rs:110,688-690`),
+/// mirrored here in that source's own operation order.
+///
+/// A MIRROR, not a call: `SlidingWindow::closest_frame` is private to `diaric`,
+/// so there is no way to invoke the real one. `window::tests` pins this mirror
+/// against `diaric::reconstruct`'s observable placement so the two cannot drift
+/// apart silently.
+///
+/// Unlike [`aggregate_chunk_start_frame`] this honours both origins AND routes
+/// the chunk start through `+ frames_sw.duration / 2.0` and back out again —
+/// a round trip that is NOT the identity in binary floating point. Two grids
+/// that are algebraically identical can therefore disagree by a whole frame,
+/// which is why
+/// [`crate::audio::speaker::extract::Extraction::try_from_parts`] compares the
+/// two mappings chunk by chunk instead of testing the origins for zero.
+#[inline]
+pub(crate) fn reconstruct_chunk_start_frame(
+  c: usize,
+  chunks_sw: SlidingWindow,
+  frames_sw: SlidingWindow,
+) -> i64 {
+  let chunk_start_time = chunks_sw.start() + (c as f64) * chunks_sw.step();
+  let center_offset = 0.5 * frames_sw.duration();
+  let t = chunk_start_time + center_offset;
+  ((t - frames_sw.start() - frames_sw.duration() / 2.0) / frames_sw.step()).round_ties_even() as i64
+}
+
 /// Steps 2-4 of the pyannote frame-count aggregation
 /// (`diarization/src/aggregate/count.rs:486-801`), factored out of
 /// [`try_count_from_segmentations`] so the online reconstruction path can
@@ -912,10 +965,11 @@ pub(crate) fn try_count_from_segmentations(
 /// active-slot count, [`crate::audio::speaker::extract::Extraction::diarize_online`] with the
 /// distinct-cluster count, and
 /// [`crate::audio::speaker::extract::Extraction::try_from_parts`] with the
-/// active-slot count under the WEAKEST activity predicate (`seg > 0.0`), to
-/// bound a caller-supplied `count` by what its own segmentations support. All
-/// three are `<= num_speakers`, so the averaged, `round_ties_even`'d result
-/// stays within the same `u8` range in every case.
+/// active-slot count under the predicate BOTH cluster backends apply to a
+/// segmentation column (`seg > 0.0`), to require a caller-supplied `count` to
+/// BE what its own segmentations derive. All three are `<= num_speakers`, so
+/// the averaged, `round_ties_even`'d result stays within the same `u8` range in
+/// every case.
 /// Splitting the count derivation from this shared tail is what lets the
 /// online path avoid ever materializing a `chunks × frames × clusters`
 /// tensor: it needs only this `chunks × frames` vector.
@@ -978,8 +1032,7 @@ pub(crate) fn try_aggregate_output_frame_count(
   let mut aggregated = vec![0.0f64; num_output_frames];
   let mut overlapping_count = vec![0.0f64; num_output_frames];
   for c in 0..num_chunks {
-    let chunk_start_t = c as f64 * chunk_step;
-    let start_frame = (chunk_start_t / frame_step).round_ties_even() as i64;
+    let start_frame = aggregate_chunk_start_frame(c, chunk_step, frame_step);
     for f in 0..num_frames_per_chunk {
       let ofr = start_frame + f as i64;
       if ofr < 0 || (ofr as usize) >= num_output_frames {

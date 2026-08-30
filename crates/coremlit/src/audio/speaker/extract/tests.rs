@@ -2301,10 +2301,10 @@ fn try_from_parts_rejects_a_count_the_segmentations_cannot_support() {
       frames_sw: unit_sw(),
     };
     let err = refused(parts);
-    let ExtractError::CountAboveSegmentationSupport(c) = err else {
-      panic!("expected CountAboveSegmentationSupport for count {claimed}, got {err:?}")
+    let ExtractError::CountNotSegmentationDerived(c) = err else {
+      panic!("expected CountNotSegmentationDerived for count {claimed}, got {err:?}")
     };
-    assert_eq!((c.frame(), c.got(), c.supported()), (0, claimed, supported));
+    assert_eq!((c.frame(), c.got(), c.expected()), (0, claimed, supported));
   }
 }
 
@@ -2356,7 +2356,7 @@ fn try_from_parts_rejects_a_count_length_the_geometry_does_not_derive() {
 }
 
 #[test]
-fn try_from_parts_rejects_a_non_zero_sliding_window_origin() {
+fn try_from_parts_rejects_an_uncancelled_sliding_window_origin() {
   // Finding 4. `window`'s count aggregation places chunk `c` at
   // `round(c * chunk_step / frame_step)`, ignoring BOTH origins;
   // `diaric::reconstruct` places it at `closest_frame(chunks_sw.start +
@@ -2365,6 +2365,10 @@ fn try_from_parts_rejects_a_non_zero_sliding_window_origin() {
   // written at frames 0 and 1 while reconstruct clips the chunk's first frame
   // and aggregates nothing into frame 1 — whose surviving `count` then marks a
   // zero-activation cell active. Phantom speech, `Ok`, no diagnostic.
+  //
+  // Round 2 replaced the `start != 0.0` proxy with the condition it was
+  // standing in for, so this geometry is now named by the frames the two
+  // mappings actually chose.
   let parts = ExtractionParts {
     raw_embeddings: one_usable_slot_row(0),
     segmentations: vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
@@ -2375,13 +2379,16 @@ fn try_from_parts_rejects_a_non_zero_sliding_window_origin() {
     frames_sw: unit_sw(),
   };
   let err = refused(parts);
-  let ExtractError::NonZeroSlidingWindowOrigin(w) = err else {
-    panic!("expected NonZeroSlidingWindowOrigin, got {err:?}")
+  let ExtractError::MisalignedChunkPlacement(m) = err else {
+    panic!("expected MisalignedChunkPlacement, got {err:?}")
   };
-  assert_eq!(w.part(), ExtractionPart::ChunksSw);
-  assert_eq!(w.window().start(), -1.0);
+  assert_eq!((m.chunk(), m.aggregated(), m.reconstructed()), (0, 0, -1));
 
-  // The frames window's origin is the other half of the same difference.
+  // The frames window's origin is the other half of the same difference. It has
+  // to be a full step to move the mapping: `frames_sw.start = 0.5` on a unit
+  // grid normalizes to exactly `-0.5`, and `round_ties_even` leaves that at
+  // frame 0 — which is why the old `start != 0.0` proxy was refusing an aligned
+  // geometry there rather than a shifted one.
   let parts = ExtractionParts {
     raw_embeddings: one_usable_slot_row(0),
     segmentations: vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
@@ -2389,12 +2396,13 @@ fn try_from_parts_rejects_a_non_zero_sliding_window_origin() {
     num_chunks: 1,
     num_frames_per_chunk: 2,
     chunks_sw: unit_sw(),
-    frames_sw: SlidingWindow::new(0.5, 1.0, 1.0),
+    frames_sw: SlidingWindow::new(1.0, 1.0, 1.0),
   };
   let err = refused(parts);
   assert!(
-    matches!(err, ExtractError::NonZeroSlidingWindowOrigin(w) if w.part() == ExtractionPart::FramesSw),
-    "expected NonZeroSlidingWindowOrigin(FramesSw), got {err:?}"
+    matches!(err, ExtractError::MisalignedChunkPlacement(m)
+      if (m.chunk(), m.aggregated(), m.reconstructed()) == (0, 0, -1)),
+    "expected MisalignedChunkPlacement(0, 0, -1), got {err:?}"
   );
 }
 
@@ -2480,13 +2488,16 @@ fn try_from_parts_rejects_an_output_frame_grid_above_the_allocation_cap() {
   assert_eq!(err, ExtractError::OutputFrameCountTooLarge(n));
 
   // One frame BELOW the cap is accepted, so the cap is a boundary and not a
-  // blanket refusal of large grids. Kept cheap: only the `count` is sized to
-  // the cap, and nothing here reaches the online aggregation.
+  // blanket refusal of large grids. `count` is the derived one — the single
+  // chunk covers output frame 0 with one active slot and nothing else — since
+  // check 10 is an equality.
   let n = MAX_OUTPUT_FRAMES;
+  let mut count = vec![0u8; n];
+  count[0] = 1;
   let parts = ExtractionParts {
     raw_embeddings: one_usable_slot_row(0),
     segmentations: vec![1.0, 0.0, 0.0],
-    count: vec![0; n],
+    count,
     num_chunks: 1,
     num_frames_per_chunk: 1,
     chunks_sw: SlidingWindow::new(0.0, (n - 1) as f64, 1.0),
@@ -2496,34 +2507,53 @@ fn try_from_parts_rejects_an_output_frame_grid_above_the_allocation_cap() {
 }
 
 #[test]
-fn try_from_parts_accepts_a_count_below_the_support_and_a_sub_onset_active_slot() {
-  // The other side of checks 8 and 9: neither is an equality, and both use
-  // `seg > 0.0` rather than `seg >= onset`. `try_from_parts` takes no `onset`
-  // — it cannot know which threshold a producer binarized with — so the checks
-  // are written against the WEAKEST predicate and must accept everything a
-  // stricter one produces.
+fn try_from_parts_accepts_a_soft_active_slot_but_requires_the_count_to_include_it() {
+  // Soft (non-binary) segmentation values are still accepted; what changed in
+  // round 2 is that `count` must AGREE with them.
   //
-  // Slot 1's column carries `0.3`: nonzero, but below the default `onset` of
-  // 0.5. So `count`, derived with that onset, says NO speaker at output frame
-  // 1 while the support bound says one — and that gap must be accepted, or the
-  // constructor would reject every soft segmentation. The same `0.3` makes slot
-  // 1 ACTIVE for check 8, which is why its embedding row has to be usable.
+  // Round 1 read this the other way: it accepted a `count` derived at
+  // `onset = 0.5` while the check used `seg > 0.0`, on the reasoning that
+  // `try_from_parts` cannot know which threshold a producer binarized with. But
+  // NEITHER backend reads an onset — `diarize_online`'s activity scan and dia's
+  // `filter_embeddings` both use `seg > 0.0` — so an onset-derived `count` under
+  // a sub-onset column is the finding-A divergence again with a soft value in
+  // place of a fabricated one: offline, silence at that frame; online, a
+  // speaker. `seg > 0.0` is the ONE predicate the two share, so it is the one
+  // the equality is taken over. `extract()`'s own `count` still satisfies it:
+  // it aggregates `seg >= onset` over a hard `0.0`/`1.0` multilabel, on which
+  // the two predicates coincide for every `onset` in `(0.0, 1.0]`.
+  //
+  // Slot 1's column carries `0.3`: nonzero, below the default `onset` of 0.5,
+  // and ACTIVE to both engines. `count` must therefore be `[1, 1, 0, 0]`.
   let mut raw = one_usable_slot_row(0);
   raw[EMBEDDING_DIM..EMBEDDING_DIM + 64].fill(1.0); // slot 1: usable too
   let parts = ExtractionParts {
     raw_embeddings: raw,
     segmentations: vec![1.0, 0.0, 0.0, 0.0, 0.3, 0.0],
-    count: vec![1, 0, 0, 0],
+    count: vec![1, 1, 0, 0],
     num_chunks: 1,
     num_frames_per_chunk: 2,
     chunks_sw: crate::audio::speaker::window::chunk_sliding_window(&WindowOptions::new())
       .with_duration(3.0 * crate::audio::speaker::window::FRAME_STEP_S),
     frames_sw: crate::audio::speaker::window::frame_sliding_window(),
   };
-  let e = Extraction::try_from_parts(parts.clone()).expect("a sub-onset column is not a defect");
+  let e = Extraction::try_from_parts(parts.clone()).expect("a soft column is not a defect");
   assert_eq!(e.num_output_frames(), 4);
 
-  // But the sub-onset column IS an active column, so a zero row under it is
+  // The onset-derived count round 1 accepted is now named, at the frame the
+  // sub-onset column occupies.
+  let under = ExtractionParts {
+    count: vec![1, 0, 0, 0],
+    ..parts.clone()
+  };
+  let err = refused(under);
+  assert!(
+    matches!(err, ExtractError::CountNotSegmentationDerived(c)
+      if (c.frame(), c.got(), c.expected()) == (1, 0, 1)),
+    "expected CountNotSegmentationDerived(1, 0, 1), got {err:?}"
+  );
+
+  // And the sub-onset column IS an active column, so a zero row under it is
   // still the finding-1 defect — the online engine would read that slot as
   // "no speaker" while its segmentation says otherwise.
   let broken = ExtractionParts {
@@ -2535,4 +2565,136 @@ fn try_from_parts_accepts_a_count_below_the_support_and_a_sub_onset_active_slot(
     matches!(err, ExtractError::ActiveSlotWithoutEmbedding(a) if (a.chunk(), a.slot()) == (0, 1)),
     "expected ActiveSlotWithoutEmbedding(0, 1), got {err:?}"
   );
+}
+
+// =====================================================================
+// ROUND 2. Both findings are ONE structural defect: two code paths compute the
+// same quantity separately and validation BOUNDED their disagreement instead of
+// eliminating it. A bound leaves the unbounded direction open, which is how the
+// same defect surfaced twice. Both are now equalities over ONE shared
+// calculation.
+// =====================================================================
+
+#[test]
+fn try_from_parts_requires_the_count_the_segmentations_derive_not_merely_one_they_support() {
+  // Finding A. The one-sided `count[t] > supported[t]` check let UNDER-counts
+  // through. One standard 589-frame chunk, slot 0 active throughout, a valid
+  // slot-0 embedding, the standard sliding windows, and an ALL-ZERO 594-entry
+  // `count` was ACCEPTED — and then offline trusted the supplied zeros and
+  // emitted no speech (`spans == []`) while online ignored `count`, derived 1
+  // from the active clustered slot, and emitted the speaker
+  // (`spans == [(0.03096875, 9.97034375, 0)]`). Same `Extraction`,
+  // contradictory results. The ONLINE route derives its own count and can never
+  // be made to read this field, so the only reachable cure is to remove the
+  // caller's freedom in it: `count` must BE the derived count.
+  const F: usize = 589;
+  let mut segmentations = vec![0.0f64; F * SEG_NUM_SLOTS];
+  for f in 0..F {
+    segmentations[f * SEG_NUM_SLOTS] = 1.0; // slot 0 active in every frame
+  }
+  let parts = ExtractionParts {
+    raw_embeddings: one_usable_slot_row(0),
+    segmentations,
+    count: vec![0u8; 594],
+    num_chunks: 1,
+    num_frames_per_chunk: F,
+    chunks_sw: crate::audio::speaker::window::chunk_sliding_window(&WindowOptions::new()),
+    frames_sw: crate::audio::speaker::window::frame_sliding_window(),
+  };
+  let err = refused(parts.clone());
+  let ExtractError::CountNotSegmentationDerived(c) = err else {
+    panic!("expected CountNotSegmentationDerived for the all-zero count, got {err:?}")
+  };
+  assert_eq!((c.frame(), c.got(), c.expected()), (0, 0, 1));
+
+  // And the derived count IS accepted, so this is an equality and not a blanket
+  // refusal: the single chunk covers output frames 0..589 with one active slot
+  // each, and frames 589..594 are covered by no chunk.
+  let mut derived = vec![0u8; 594];
+  derived[..F].fill(1);
+  let e = Extraction::try_from_parts(ExtractionParts {
+    count: derived,
+    ..parts
+  })
+  .expect("the derived count is the one accepted");
+  assert_eq!(e.num_output_frames(), 594);
+
+  // With it, the two backends now AGREE that there is speech here — the
+  // divergence the under-count created is gone.
+  let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+  let offline = e
+    .diarize_with(
+      &plda,
+      ClusterBackend::Offline(crate::audio::speaker::cluster::OfflineOptions::new()),
+    )
+    .expect("offline accepts it");
+  let online = e
+    .diarize_online(OnlineOptions::new().with_min_speech_duration(0.0))
+    .expect("online accepts it");
+  assert!(
+    !offline.spans_slice().is_empty(),
+    "offline must now emit the speaker its segmentations declare"
+  );
+  assert!(
+    !online.spans_slice().is_empty(),
+    "online emits the speaker too"
+  );
+}
+
+#[test]
+fn try_from_parts_rejects_misaligned_chunk_placement_even_at_a_zero_origin() {
+  // Finding B. The old guard required both window origins to be `0.0`, which
+  // does NOT imply aligned frame placement: the reconstruction route adds
+  // `frames_sw.duration / 2` to the chunk start and subtracts it again, and
+  // that round trip is not the identity in binary floating point.
+  //
+  // With chunk duration/step `0.04218750000000001` on the community-1 frame
+  // grid, chunk 1 maps to frame 3 aggregating (`2.5000000000000004`) and frame
+  // 2 reconstructing (`2.5`). These parts passed every check and reconstructed
+  // to `[1, 0, 0, 1, 0, 0]`: the real frame-2 activation suppressed, an
+  // uncovered frame 3 selected — silently shifted speech.
+  let d = 0.04218750000000001_f64;
+  let mut raw = vec![0.0f32; 2 * SEG_NUM_SLOTS * EMBEDDING_DIM];
+  raw[0..64].fill(1.0); // chunk 0, slot 0
+  raw[(SEG_NUM_SLOTS * EMBEDDING_DIM)..(SEG_NUM_SLOTS * EMBEDDING_DIM + 64)].fill(1.0); // chunk 1
+  let parts = ExtractionParts {
+    raw_embeddings: raw,
+    segmentations: vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+    count: vec![1, 0, 0, 1, 0, 0],
+    num_chunks: 2,
+    num_frames_per_chunk: 1,
+    chunks_sw: SlidingWindow::new(0.0, d, d),
+    frames_sw: SlidingWindow::new(0.0, 0.0619375, 0.016875),
+  };
+  let err = refused(parts);
+  let ExtractError::MisalignedChunkPlacement(m) = err else {
+    panic!("expected MisalignedChunkPlacement at a zero origin, got {err:?}")
+  };
+  assert_eq!(
+    (m.chunk(), m.aggregated(), m.reconstructed()),
+    (1, 3, 2),
+    "the two mappings disagree about chunk 1"
+  );
+}
+
+#[test]
+fn try_from_parts_accepts_equal_non_zero_origins_that_place_every_chunk_identically() {
+  // The other half of finding B: the old zero-origin guard was also
+  // OVER-restrictive. Both windows at `(start = 1, duration = 1, step = 1)`
+  // cancel exactly — the aggregation places chunk 0 at frame 0 and so does the
+  // reconstruction — so there is nothing to refuse. A guard that tested the
+  // origins for `0.0` rejected this geometry anyway.
+  let sw = SlidingWindow::new(1.0, 1.0, 1.0);
+  let e = Extraction::try_from_parts(ExtractionParts {
+    raw_embeddings: one_usable_slot_row(0),
+    segmentations: vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+    count: vec![1, 1],
+    num_chunks: 1,
+    num_frames_per_chunk: 2,
+    chunks_sw: sw,
+    frames_sw: sw,
+  })
+  .expect("equal, cancelling origins place every chunk identically");
+  assert_eq!(e.num_output_frames(), 2);
+  assert_eq!(e.chunks_sw().start(), 1.0);
 }

@@ -662,7 +662,11 @@ pub struct ExtractionParts {
   /// [`Extraction::segmentations`].
   pub segmentations: Vec<f64>,
   /// Per-output-frame instantaneous speaker count, `[t]`. Its length becomes
-  /// [`Extraction::num_output_frames`]. See [`Extraction::count`].
+  /// [`Extraction::num_output_frames`], and its VALUES must be exactly what
+  /// `segmentations` derive through
+  /// [`crate::audio::speaker::window::count_from_segmentations`] over
+  /// `seg > 0.0` — [`Extraction::try_from_parts`]'s check 10, an equality in
+  /// both directions. See [`Extraction::count`].
   pub count: Vec<u8>,
   /// Number of sliding-window chunks. See [`Extraction::num_chunks`].
   pub num_chunks: usize,
@@ -764,10 +768,7 @@ impl Extraction {
   ///
   /// 1. `num_chunks`, `num_frames_per_chunk` and `count.len()` are all non-zero.
   /// 2. Both sliding windows are usable timing grids: `start` finite,
-  ///    `duration`/`step` finite and `> 0`; and both `start`s are `0.0`, the one
-  ///    origin the online count aggregation (which reads no origin) and
-  ///    `diaric::reconstruct` (which honours both) resolve identically. See
-  ///    [`ExtractError::NonZeroSlidingWindowOrigin`].
+  ///    `duration`/`step` finite and `> 0`.
   /// 3. `raw_embeddings.len() == num_chunks * num_speakers * EMBEDDING_DIM` and
   ///    `segmentations.len() == num_chunks * num_frames_per_chunk *
   ///    num_speakers`, each product computed with `checked_mul` FIRST: an
@@ -787,33 +788,41 @@ impl Extraction {
   /// 7. `frames_sw.step()` stays finite and `> 0` through the `f32` narrowing
   ///    [`Self::diarize_online`] applies to it when it builds the online speech
   ///    duration. See [`ExtractError::FrameStepNotRepresentableInF32`].
-  /// 8. Every `(chunk, slot)` whose segmentation column is active (`seg > 0.0`,
+  /// 8. The COUNT aggregation and `diaric::reconstruct` place every chunk at the
+  ///    SAME output frame. The aggregation reads neither window origin; the
+  ///    reconstruction reads both, and routes the chunk start through
+  ///    `+ frames_sw.duration / 2` and back out. Equal origins are neither
+  ///    necessary nor sufficient for the two to agree, so the mappings
+  ///    themselves are compared, chunk by chunk. See
+  ///    [`ExtractError::MisalignedChunkPlacement`].
+  /// 9. Every `(chunk, slot)` whose segmentation column is active (`seg > 0.0`,
   ///    the activity rule both backends use) carries a raw-embedding row that
   ///    `diaric::embed::Embedding::normalize_from` accepts — because `None` from
   ///    that function is [`Self::diarize_online`]'s DROPPED-slot sentinel, so a
   ///    corrupt row under an active column is read as "no speaker here". See
   ///    [`ExtractError::ActiveSlotWithoutEmbedding`].
-  /// 9. `count[t]` never exceeds the number of simultaneous speakers the
-  ///    supplied `segmentations` put at output frame `t`, computed with the same
-  ///    overlap-add aggregation [`crate::audio::speaker::window::count_from_segmentations`]
-  ///    runs. `diaric`'s top-K binarize marks `count[t]` clusters active with no
-  ///    activation floor, so an inflated `count` fabricates that many speakers.
-  ///    See [`ExtractError::CountAboveSegmentationSupport`].
+  /// 10. `count` EQUALS the count the supplied `segmentations` derive, through
+  ///     the same overlap-add aggregation
+  ///     [`crate::audio::speaker::window::count_from_segmentations`] runs over
+  ///     `seg > 0.0`. Not a bound: offline consumes this field and online
+  ///     derives its own, so a `count` above the derived one fabricates
+  ///     speakers offline and a `count` below it makes offline silent where
+  ///     online speaks. See [`ExtractError::CountNotSegmentationDerived`].
   ///
   /// Checks 1, 2 and 4 are the PANIC-preventing ones: `window`'s
   /// `try_aggregate_output_frame_count` asserts the first two with bare
   /// `assert!`s and [`Self::diarize_online`] `.expect(..)`s the third, so
   /// without them a publicly-assembled `Extraction` could panic far from its
   /// cause. Check 3 is what keeps every `[c][s][d]` / `[c][f][s]` index inside
-  /// its buffer. Checks 5 and 7-9 are the CROSS-PART ones: each is a pair of
+  /// its buffer. Checks 5 and 7-10 are the CROSS-PART ones: each is a pair of
   /// parts that are individually well-formed and jointly describe something the
   /// producing pipeline cannot have produced.
   ///
   /// # What is deliberately NOT checked
   ///
   /// - **`count[t] <= diaric::reconstruct::MAX_COUNT_PER_FRAME`.** Now IMPLIED
-  ///   by check 9 and kept unchecked for that reason rather than by deferral:
-  ///   the support bound is an overlap-add average of per-`(chunk, frame)`
+  ///   by check 10 and kept unchecked for that reason rather than by deferral:
+  ///   the derived count is an overlap-add average of per-`(chunk, frame)`
   ///   active-slot counts, each at most `SEG_NUM_SLOTS` (3), and the average of
   ///   values `<= 3` rounds to `<= 3` — comfortably under `diaric`'s 64.
   ///   *Verified against both:* the OFFLINE route re-checks it anyway as a typed
@@ -832,9 +841,11 @@ impl Extraction {
   ///   (`diarization/src/pipeline/algo.rs:456-460`). Neither can silently
   ///   consume one. Note this is about a NaN reaching the clusterer: a NaN in an
   ///   ACTIVE slot's column also weakens its own activity count here (`NaN >
-  ///   0.0` is false), which only ever LOWERS the check-9 bound, never raises it.
+  ///   0.0` is false), which shifts the check-10 equality DOWN at that frame —
+  ///   the derived count and the caller's `count` are simply required to agree
+  ///   on whatever that scan sees.
   /// - **Finiteness of a raw-embedding row belonging to an INACTIVE slot.**
-  ///   Check 8 covers every active slot; a row under an all-zero segmentation
+  ///   Check 9 covers every active slot; a row under an all-zero segmentation
   ///   column is left to the backends. *Verified against both:* OFFLINE,
   ///   `assign_embeddings` scans EVERY row — train subset or not — and rejects
   ///   a non-finite value as `NonFiniteField::Embeddings` and an overflowing row
@@ -845,7 +856,7 @@ impl Extraction {
   ///   so it is skipped — the same outcome as the all-zero row the crate's own
   ///   dropped slots carry.
   /// - **An INACTIVE slot carrying a usable embedding row** — the converse of
-  ///   check 8, and deliberately allowed. *Verified against both:* OFFLINE, such
+  ///   check 9, and deliberately allowed. *Verified against both:* OFFLINE, such
   ///   a slot cannot reach PLDA (`filter_embeddings` requires
   ///   `clean_frames >= 0.2 * num_frames_per_chunk`, and an all-zero column sums
   ///   to `0`, `diarization/src/offline/algo.rs:645-679`). ONLINE, it IS
@@ -856,8 +867,9 @@ impl Extraction {
   ///   caller's own data ("this slot has an embedding but no speech"), not of a
   ///   part disagreeing with another; `tiny_extraction`'s third slot is exactly
   ///   this shape.
-  /// - **`num_output_frames` covering the last chunk's last frame.** With check
-  ///   5 the grid is the derived one, but a chunk whose declared `duration`
+  /// - **`num_output_frames` covering the last chunk's last frame.** With checks
+  ///   5 and 8 the grid is the derived one and every chunk is placed
+  ///   identically by both mappings, but a chunk whose declared `duration`
   ///   spans fewer frame-steps than `num_frames_per_chunk` still derives a grid
   ///   shorter than the chunk it must hold. *Verified against both:* both routes
   ///   run the same `diaric::reconstruct`, which raises the typed
@@ -878,8 +890,7 @@ impl Extraction {
   ///
   /// # Errors
   /// - [`ExtractError::ZeroExtractionDimension`] — check 1.
-  /// - [`ExtractError::InvalidSlidingWindow`] /
-  ///   [`ExtractError::NonZeroSlidingWindowOrigin`] — check 2.
+  /// - [`ExtractError::InvalidSlidingWindow`] — check 2.
   /// - [`ExtractError::ExtractionGeometryOverflow`] /
   ///   [`ExtractError::ExtractionLenMismatch`] — check 3.
   /// - [`ExtractError::OutputFrameCountOverflow`] — check 4.
@@ -888,8 +899,9 @@ impl Extraction {
   ///   — check 5.
   /// - [`ExtractError::OutputFrameCountTooLarge`] — check 6.
   /// - [`ExtractError::FrameStepNotRepresentableInF32`] — check 7.
-  /// - [`ExtractError::ActiveSlotWithoutEmbedding`] — check 8.
-  /// - [`ExtractError::CountAboveSegmentationSupport`] — check 9.
+  /// - [`ExtractError::MisalignedChunkPlacement`] — check 8.
+  /// - [`ExtractError::ActiveSlotWithoutEmbedding`] — check 9.
+  /// - [`ExtractError::CountNotSegmentationDerived`] — check 10.
   ///
   /// # Examples
   /// ```
@@ -973,19 +985,6 @@ impl Extraction {
         && w.step() > 0.0;
       if !usable {
         return Err(ExtractError::InvalidSlidingWindow(
-          InvalidSlidingWindow::new(part, w),
-        ));
-      }
-      // Both grids must share the ONE origin the two consumers agree on. The
-      // count aggregation places chunk `c` at `round(c * chunk_step /
-      // frame_step)` and reads no origin at all; `diaric::reconstruct` places
-      // it at `closest_frame(chunks_sw.start + c * chunk_step +
-      // frames_sw.duration / 2)`, which subtracts `frames_sw.start`. The two
-      // agree only when both origins are `0.0` — which is exactly what
-      // `chunk_sliding_window` / `frame_sliding_window` produce. See
-      // `ExtractError::NonZeroSlidingWindowOrigin`.
-      if w.start() != 0.0 {
-        return Err(ExtractError::NonZeroSlidingWindowOrigin(
           InvalidSlidingWindow::new(part, w),
         ));
       }
@@ -1096,7 +1095,44 @@ impl Extraction {
       ));
     }
 
-    // ── 8. An active slot must carry an embedding the engines can use ──
+    // ── 8. Both grids must place every chunk at the SAME output frame ──
+    // The `count` this constructor validates (check 10) is written on the
+    // aggregation's grid: `window::aggregate_chunk_start_frame` places chunk `c`
+    // at `round(c * chunk_step / frame_step)` and reads NEITHER window origin.
+    // `diaric::reconstruct` — which BOTH backends feed — places the same chunk
+    // at `closest_frame(chunks_sw.start + c * chunk_step + frames_sw.duration /
+    // 2)`, mirrored here as `window::reconstruct_chunk_start_frame`. Where the
+    // two differ, the count marks frames the activations never reach and
+    // suppresses the ones they do: speech silently shifted.
+    //
+    // Comparing the two mappings is the check; testing the origins for `0.0` is
+    // not. Zero origins do NOT imply agreement — the reconstruction route adds
+    // `frames_sw.duration / 2` and subtracts it again, and `(x + h) - h != x` in
+    // binary floating point (`chunk_step = 0.04218750000000001` over the
+    // community-1 frame grid puts chunk 1 at frame 3 aggregating and frame 2
+    // reconstructing) — and non-zero origins do NOT imply disagreement (equal
+    // origins cancel exactly). See `ExtractError::MisalignedChunkPlacement`.
+    //
+    // Ordered after every O(1) check, and it MUST stay after check 3: this is
+    // the first O(num_chunks) work, and check 3 is what bounds `num_chunks` by
+    // a buffer the caller actually allocated. Ahead of it, a declared
+    // `num_chunks` of `2^60` would spin here before anything refused it.
+    for c in 0..num_chunks {
+      let aggregated = crate::audio::speaker::window::aggregate_chunk_start_frame(
+        c,
+        chunks_sw.step(),
+        frames_sw.step(),
+      );
+      let reconstructed =
+        crate::audio::speaker::window::reconstruct_chunk_start_frame(c, chunks_sw, frames_sw);
+      if aggregated != reconstructed {
+        return Err(ExtractError::MisalignedChunkPlacement(
+          crate::audio::speaker::error::ChunkPlacementMismatch::new(c, aggregated, reconstructed),
+        ));
+      }
+    }
+
+    // ── 9. An active slot must carry an embedding the engines can use ──
     // `diarize_online` reads `Embedding::normalize_from(row) == None` as the
     // DROPPED-slot sentinel, so a corrupt or degenerate row under an ACTIVE
     // segmentation column is silently read as "no speaker here". The predicate
@@ -1121,18 +1157,25 @@ impl Extraction {
       }
     }
 
-    // ── 9. `count[t]` must be a count these segmentations can support ──
-    // `diaric`'s offline reconstruct marks exactly `count[t]` clusters active
-    // by descending activation with no floor, so a `count[t]` above the real
-    // support selects zero-activation padded columns and emits that many
-    // phantom speakers as `Ok`. The bound is the caller's own data run through
-    // the SAME overlap-add aggregation `count_from_segmentations` uses, over
-    // the WEAKEST activity predicate (`seg > 0.0`): every `onset` in
-    // `(0.0, 1.0]` selects a subset of those slots, the aggregation is monotone
-    // in the per-(chunk, frame) count, and `round_ties_even` is monotone — so
-    // this is an upper bound for whatever `onset` the producer binarized with,
-    // and `extract()`'s own `count` (aggregated over `seg >= onset`) always
-    // satisfies it.
+    // ── 10. `count` must BE the count these segmentations derive ──────
+    // EQUALITY, not a bound. The two backends read this field differently:
+    // offline consumes it verbatim, and `diarize_online` ignores it and derives
+    // its own from the same segmentations (its own comment says why it must).
+    // Any supplied `count` that differs from the derived one therefore makes
+    // the two disagree about the same `Extraction` — an inflated `count[t]`
+    // makes offline select zero-activation padded columns and emit phantom
+    // speakers, a deflated one makes offline silent where online emits the
+    // speaker. Bounding one direction leaves the other open, which is why this
+    // is `!=` and not `>`.
+    //
+    // The derived value is the caller's own data run through the SAME
+    // overlap-add aggregation `count_from_segmentations` uses, over `seg > 0.0`
+    // — the activity predicate BOTH backends apply to a segmentation column
+    // (`diarize_online`'s activity scan, dia's `filter_embeddings`,
+    // `diarization/src/offline/algo.rs:656-660`). It is also exactly what
+    // `extract()` produces: `extract()` aggregates `seg >= onset` over a hard
+    // `0.0`/`1.0` multilabel, and on those values `>= onset` and `> 0.0` select
+    // the same slots for every `onset` in `(0.0, 1.0]` (`check_onset`'s range).
     //
     // Ordered last: it is the only check that allocates, and every input that
     // reaches it has already been bounded by check 6.
@@ -1144,7 +1187,7 @@ impl Extraction {
         .filter(|v| **v > 0.0)
         .count() as f64;
     }
-    let supported = crate::audio::speaker::window::try_aggregate_output_frame_count(
+    let derived = crate::audio::speaker::window::try_aggregate_output_frame_count(
       &chunk_count,
       num_chunks,
       num_frames_per_chunk,
@@ -1156,19 +1199,19 @@ impl Extraction {
         ExtractError::OutputFrameCountOverflow
       }
     })?;
-    // Check 5 made `supported.len() == count.len()`: both are the same
+    // Check 5 made `derived.len() == count.len()`: both are the same
     // `try_num_output_frames(last_chunk_end, frames_sw.step())`. The `zip`
     // below TRUNCATES to the shorter of the two, so that equality is what stops
     // a short `count` from skipping frames it never declared.
     debug_assert_eq!(
-      supported.len(),
+      derived.len(),
       count.len(),
       "check 5 must have equated count.len() with the derived grid"
     );
-    for (t, (&got, &max)) in count.iter().zip(supported.iter()).enumerate() {
-      if got > max {
-        return Err(ExtractError::CountAboveSegmentationSupport(
-          crate::audio::speaker::error::CountAboveSegmentationSupport::new(t, got, max),
+    for (t, (&got, &expected)) in count.iter().zip(derived.iter()).enumerate() {
+      if got != expected {
+        return Err(ExtractError::CountNotSegmentationDerived(
+          crate::audio::speaker::error::CountNotSegmentationDerived::new(t, got, expected),
         ));
       }
     }

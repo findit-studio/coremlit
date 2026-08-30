@@ -240,13 +240,14 @@ fn invalid_sliding_window_displays_all_three_components() {
 }
 
 #[test]
-fn non_zero_sliding_window_origin_displays_the_offending_origin() {
-  let w = crate::audio::speaker::window::SlidingWindow::new(-1.0, 1.0, 1.0);
-  let e = InvalidSlidingWindow::new(ExtractionPart::ChunksSw, w);
-  let rendered = ExtractError::NonZeroSlidingWindowOrigin(e).to_string();
-  assert!(rendered.contains("chunks_sw"), "{rendered}");
-  assert!(rendered.contains("start -1"), "{rendered}");
-  assert!(rendered.contains("non-zero origin"), "{rendered}");
+fn misaligned_chunk_placement_displays_the_chunk_and_both_frames() {
+  let m = ChunkPlacementMismatch::new(1, 3, 2);
+  assert_eq!((m.chunk(), m.aggregated(), m.reconstructed()), (1, 3, 2));
+  let rendered = ExtractError::MisalignedChunkPlacement(m).to_string();
+  assert!(rendered.contains("chunk 1"), "{rendered}");
+  assert!(rendered.contains("output frame 3"), "{rendered}");
+  assert!(rendered.contains("frame 2"), "{rendered}");
+  assert!(rendered.contains("reconstruction"), "{rendered}");
 }
 
 #[test]
@@ -271,13 +272,21 @@ fn active_slot_without_embedding_displays_chunk_and_slot() {
 }
 
 #[test]
-fn count_above_segmentation_support_displays_frame_got_and_supported() {
-  let c = CountAboveSegmentationSupport::new(41, 4, 1);
-  assert_eq!((c.frame(), c.got(), c.supported()), (41, 4, 1));
-  let rendered = ExtractError::CountAboveSegmentationSupport(c).to_string();
+fn count_not_segmentation_derived_displays_frame_got_and_expected() {
+  let c = CountNotSegmentationDerived::new(41, 4, 1);
+  assert_eq!((c.frame(), c.got(), c.expected()), (41, 4, 1));
+  let rendered = ExtractError::CountNotSegmentationDerived(c).to_string();
   assert!(rendered.contains("count[41]"), "{rendered}");
   assert!(rendered.contains(" is 4 "), "{rendered}");
-  assert!(rendered.contains("at most 1"), "{rendered}");
+  assert!(rendered.contains("derive 1"), "{rendered}");
+
+  // The UNDER-count direction renders through the same variant: the check is an
+  // equality, so a count BELOW the derived one is the same defect class.
+  let under = CountNotSegmentationDerived::new(0, 0, 1);
+  let rendered = ExtractError::CountNotSegmentationDerived(under).to_string();
+  assert!(rendered.contains("count[0]"), "{rendered}");
+  assert!(rendered.contains(" is 0 "), "{rendered}");
+  assert!(rendered.contains("derive 1"), "{rendered}");
 }
 
 #[test]

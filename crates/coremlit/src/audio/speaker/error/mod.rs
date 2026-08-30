@@ -312,25 +312,26 @@ impl ActiveSlotWithoutEmbedding {
   }
 }
 
-/// A `count[t]` claiming more simultaneous speakers than the `segmentations`
-/// supplied beside it can put at output frame `t`.
+/// A `count[t]` that is not the value the `segmentations` supplied beside it
+/// derive at output frame `t`.
 ///
-/// Payload of [`ExtractError::CountAboveSegmentationSupport`]. `supported` is
-/// the same overlap-add aggregation
+/// Payload of [`ExtractError::CountNotSegmentationDerived`]. `expected` is the
+/// overlap-add aggregation
 /// [`crate::audio::speaker::window::count_from_segmentations`] runs, taken over
-/// the WEAKEST activity predicate (`seg > 0.0`, `diaric`'s "any nonzero entry is
-/// binary-active" convention) so it is an upper bound for every `onset` a
-/// producer could have binarized with.
+/// the activity predicate BOTH cluster backends apply to a segmentation column
+/// (`seg > 0.0`, `diaric`'s "any nonzero entry is binary-active" convention) —
+/// so it is the one count the two of them can agree on, and the one
+/// [`crate::audio::speaker::extract::Extractor::extract`] itself produces.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CountAboveSegmentationSupport {
+pub struct CountNotSegmentationDerived {
   frame: usize,
   got: u8,
-  supported: u8,
+  expected: u8,
 }
 
-impl CountAboveSegmentationSupport {
-  /// The output frame `t` whose count is unsupported. The FIRST such frame:
-  /// the scan stops at the earliest disagreement.
+impl CountNotSegmentationDerived {
+  /// The output frame `t` whose count disagrees. The FIRST such frame: the
+  /// scan stops at the earliest disagreement.
   #[inline(always)]
   pub const fn frame(&self) -> usize {
     self.frame
@@ -340,19 +341,65 @@ impl CountAboveSegmentationSupport {
   pub const fn got(&self) -> u8 {
     self.got
   }
-  /// The largest `count[t]` the caller's own `segmentations` and geometry
-  /// support at that frame.
+  /// The `count[t]` the caller's own `segmentations` and geometry derive at
+  /// that frame — the only value accepted there.
   #[inline(always)]
-  pub const fn supported(&self) -> u8 {
-    self.supported
+  pub const fn expected(&self) -> u8 {
+    self.expected
   }
 
   /// Crate-private: only the validating constructor raises this.
-  pub(crate) const fn new(frame: usize, got: u8, supported: u8) -> Self {
+  pub(crate) const fn new(frame: usize, got: u8, expected: u8) -> Self {
     Self {
       frame,
       got,
-      supported,
+      expected,
+    }
+  }
+}
+
+/// A chunk that the count aggregation and `diaric`'s reconstruction place at
+/// DIFFERENT output frames.
+///
+/// Payload of [`ExtractError::MisalignedChunkPlacement`]. The two mappings are
+/// [`crate::audio::speaker::window`]'s `aggregate_chunk_start_frame` (dia's
+/// `count.rs` expression, which reads no window origin) and its
+/// `reconstruct_chunk_start_frame` (the mirror of
+/// `diaric::reconstruct`'s private `closest_frame`, which reads both). They are
+/// algebraically equal whenever the two origins cancel, but not NUMERICALLY
+/// equal: the reconstruction route adds `frames_sw.duration / 2` to the chunk
+/// start and subtracts it again, and that round trip is not the identity in
+/// binary floating point.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ChunkPlacementMismatch {
+  chunk: usize,
+  aggregated: i64,
+  reconstructed: i64,
+}
+
+impl ChunkPlacementMismatch {
+  /// Index of the first chunk the two mappings disagree about.
+  #[inline(always)]
+  pub const fn chunk(&self) -> usize {
+    self.chunk
+  }
+  /// The output frame the COUNT aggregation places that chunk's first frame at.
+  #[inline(always)]
+  pub const fn aggregated(&self) -> i64 {
+    self.aggregated
+  }
+  /// The output frame `diaric::reconstruct` places the same frame at.
+  #[inline(always)]
+  pub const fn reconstructed(&self) -> i64 {
+    self.reconstructed
+  }
+
+  /// Crate-private: only the validating constructor raises this.
+  pub(crate) const fn new(chunk: usize, aggregated: i64, reconstructed: i64) -> Self {
+    Self {
+      chunk,
+      aggregated,
+      reconstructed,
     }
   }
 }
@@ -516,36 +563,43 @@ pub enum ExtractError {
     .0.window().step()
   )]
   InvalidSlidingWindow(InvalidSlidingWindow),
-  /// A supplied [`crate::audio::speaker::window::SlidingWindow`] declares a
-  /// non-zero origin, which the two consumers of an [`crate::audio::speaker::extract::Extraction`]
-  /// resolve DIFFERENTLY.
+  /// The two mappings from a chunk index to an output frame — the one the
+  /// `count` aggregation uses and the one `diaric::reconstruct` uses — place a
+  /// chunk at DIFFERENT frames, so the count is written against activations
+  /// that are not there.
   ///
-  /// [`crate::audio::speaker::window::count_from_segmentations`] — the aggregation
-  /// [`crate::audio::speaker::extract::Extraction::diarize_online`] runs to build its
-  /// own count — places chunk `c` at `round(c * chunks_sw.step /
-  /// frames_sw.step)`, ignoring both origins (dia's own
+  /// [`crate::audio::speaker::window::count_from_segmentations`] — the
+  /// aggregation [`crate::audio::speaker::extract::Extraction::diarize_online`]
+  /// runs to build its own count, and the one
+  /// [`crate::audio::speaker::extract::Extraction::try_from_parts`] validates
+  /// `count` against — places chunk `c` at `round(c * chunks_sw.step /
+  /// frames_sw.step)`, reading NEITHER origin (dia's own
   /// `diarization/src/aggregate/count.rs` does the same, and dia's pipeline only
   /// ever passes `0.0`). `diaric::reconstruct`, which BOTH backends then feed,
   /// places the same chunk at `frames_sw.closest_frame(chunks_sw.start + c *
-  /// chunks_sw.step + frames_sw.duration / 2)`, which honours both origins
-  /// (`diarization/src/reconstruct/algo.rs:110,690`). A non-zero origin
-  /// therefore shifts the count relative to the activations it is supposed to
-  /// select from, marking zero-activation cells active — phantom speech
-  /// returned as `Ok`.
+  /// chunks_sw.step + frames_sw.duration / 2)`, which reads both
+  /// (`diarization/src/reconstruct/algo.rs:110,690`). Where the two differ, the
+  /// surviving `count` marks zero-activation cells active and suppresses the
+  /// real ones — speech silently shifted onto the wrong frames, returned as
+  /// `Ok`.
   ///
-  /// `0.0` is what [`crate::audio::speaker::window::chunk_sliding_window`] and
-  /// [`crate::audio::speaker::window::frame_sliding_window`] produce, so every
-  /// in-crate construction path already satisfies this; only a
-  /// publicly-assembled [`crate::audio::speaker::extract::ExtractionParts`] can
-  /// declare otherwise. See [`InvalidSlidingWindow`] for the payload.
+  /// Testing the two origins for `0.0` is NOT this condition, in either
+  /// direction. Too weak: the reconstruction route adds `frames_sw.duration / 2`
+  /// to the chunk start and subtracts it again, and that round trip is not the
+  /// identity in binary floating point, so a grid with both origins at `0.0` can
+  /// still disagree by a whole frame. Too strong: equal, non-zero origins (both
+  /// windows `start = 1.0`) cancel exactly and place every chunk identically.
+  /// The condition checked is the one that matters — the mappings AGREE, chunk
+  /// by chunk. See [`ChunkPlacementMismatch`] for the payload.
   #[error(
-    "extraction parts: {} declares a non-zero origin (start {}) — the online count aggregation \
-     ignores window origins while diaric's reconstruct honours them, so only 0.0 keeps the two \
-     grids aligned",
-    .0.part(),
-    .0.window().start()
+    "extraction parts: chunk {} is placed at output frame {} by the count aggregation but at \
+     frame {} by diaric's reconstruction — the two grids must agree, or the count selects \
+     frames the activations never reach",
+    .0.chunk(),
+    .0.aggregated(),
+    .0.reconstructed()
   )]
-  NonZeroSlidingWindowOrigin(InvalidSlidingWindow),
+  MisalignedChunkPlacement(ChunkPlacementMismatch),
   /// `frames_sw.step()` is finite and strictly positive in `f64` but does not
   /// survive the narrowing to `f32` that
   /// [`crate::audio::speaker::extract::Extraction::diarize_online`] applies to
@@ -597,34 +651,44 @@ pub enum ExtractError {
     .0.slot()
   )]
   ActiveSlotWithoutEmbedding(ActiveSlotWithoutEmbedding),
-  /// A `count[t]` claims more simultaneous speakers than the `segmentations`
-  /// supplied beside it can put at output frame `t`.
+  /// A `count[t]` is not the value the `segmentations` supplied beside it
+  /// derive at output frame `t`. BOTH directions are rejected, because both
+  /// make the two backends disagree about the same `Extraction`.
   ///
-  /// `diaric`'s offline reconstruction treats `count[t]` as an INJECTIVE
-  /// per-cluster count: it pads the cluster axis out to `max(count)` and marks
-  /// exactly `count[t]` columns active by descending activation
-  /// (`diarization/src/reconstruct/algo.rs:736-810`), with no lower bound on the
-  /// activation it will select. A `count[t]` above the real support therefore
-  /// selects zero-activation padded columns and emits that many phantom
-  /// speakers, as `Ok`. A range check does not catch it: `count = [3, 3]` is
-  /// inside both `SEG_NUM_SLOTS` and `diaric::reconstruct::MAX_COUNT_PER_FRAME`
-  /// and still fabricates two speakers on a grid with one active slot.
+  /// Above the derived value: `diaric`'s offline reconstruction treats `count[t]`
+  /// as an INJECTIVE per-cluster count — it pads the cluster axis out to
+  /// `max(count)` and marks exactly `count[t]` columns active by descending
+  /// activation (`diarization/src/reconstruct/algo.rs:736-810`), with no lower
+  /// bound on the activation it will select — so an inflated `count[t]` selects
+  /// zero-activation padded columns and emits that many phantom speakers, as
+  /// `Ok`. A range check does not catch it: `count = [3, 3]` is inside both
+  /// `SEG_NUM_SLOTS` and `diaric::reconstruct::MAX_COUNT_PER_FRAME` and still
+  /// fabricates two speakers on a grid with one active slot.
   ///
-  /// The bound is the caller's own data: the overlap-add aggregation
-  /// [`crate::audio::speaker::window::count_from_segmentations`] runs, taken
-  /// over `seg > 0.0` — the weakest activity predicate, so the bound holds for
-  /// every `onset` in `(0.0, 1.0]` a producer could have binarized with, and
-  /// [`crate::audio::speaker::extract::Extractor::extract`]'s own `count` (an
-  /// aggregation over `seg >= onset`) always satisfies it. See
-  /// [`CountAboveSegmentationSupport`].
+  /// Below it: the OFFLINE route consumes the supplied `count` while the ONLINE
+  /// route ignores it and derives its own from the same segmentations
+  /// ([`crate::audio::speaker::extract::Extraction::diarize_online`]'s own
+  /// comment says why it must). An all-zero `count` over an active grid is
+  /// therefore silence offline and a speaker online — the same `Extraction`,
+  /// contradictory answers. Bounding one direction cannot prevent that; only
+  /// equality can.
+  ///
+  /// The derived value is the caller's own data run through the overlap-add
+  /// aggregation [`crate::audio::speaker::window::count_from_segmentations`]
+  /// runs, over `seg > 0.0` — the activity predicate BOTH backends apply to a
+  /// segmentation column, and the one
+  /// [`crate::audio::speaker::extract::Extractor::extract`]'s own `count`
+  /// satisfies (it aggregates `seg >= onset` over a hard `0.0`/`1.0`
+  /// multilabel, on which the two predicates coincide for every `onset` in
+  /// `(0.0, 1.0]`). See [`CountNotSegmentationDerived`].
   #[error(
-    "extraction parts: count[{}] is {} but the supplied segmentations support at most {} \
-     simultaneous speakers at that output frame",
+    "extraction parts: count[{}] is {} but the supplied segmentations derive {} at that output \
+     frame",
     .0.frame(),
     .0.got(),
-    .0.supported()
+    .0.expected()
   )]
-  CountAboveSegmentationSupport(CountAboveSegmentationSupport),
+  CountNotSegmentationDerived(CountNotSegmentationDerived),
   /// The output-frame grid the geometry derives is above
   /// [`crate::audio::speaker::extract::MAX_OUTPUT_FRAMES`].
   ///
