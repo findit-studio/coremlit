@@ -164,6 +164,14 @@ pub const EXCLUDE_OVERLAP_MIN_FRAMES: usize = 2;
 /// [`crate::audio::speaker::source::ModelSource`] through
 /// `Extraction::assemble_checked`.
 ///
+/// Since round 9 it is enforced BEFORE the work it bounds, not only at
+/// assembly. The grid is a function of `num_chunks` and the two sliding windows
+/// alone, so `checked_output_frame_count` derives it and applies this cap at
+/// each producer's first opportunity — ahead of the extraction tensors, ahead
+/// of every model call, and ahead of the count buffers `assemble_checked`
+/// builds. The late check remains, because [`Extraction::try_from_parts`] has
+/// no earlier point to run it at.
+///
 /// A RESOURCE bound, and the only check in that sequence not derived from the
 /// caller's own parts. `num_output_frames` sizes every grid-shaped buffer
 /// downstream, and the two largest are plain heap `Vec<f64>`s this crate
@@ -596,6 +604,78 @@ impl Extractor {
     &self.options
   }
 
+  /// The chunk count, both timing grids, and every guard that reads nothing
+  /// else — checks 4 and 6 (the output-frame grid and the resource bound it is
+  /// held to) then check 8 (chunk placement), in the shared sequence's own
+  /// order.
+  ///
+  /// This is the WHOLE of what [`Self::extract`] decides before it allocates a
+  /// tensor or touches a model, and it is a separate function so that a test
+  /// can run it. `extract` itself cannot be handed the inputs these guards
+  /// exist for: the smallest clip the cap refuses is 1 132 448 001 samples —
+  /// 4.5 GB of `f32` and 70 770 pairs of CoreML calls — so a falsifier for the
+  /// cap's PLACEMENT has nowhere else to attach.
+  ///
+  /// The starts vector is deliberately not built here (`chunk_starts`,
+  /// `owned.rs:447-451`): nothing in this function reads a chunk's start, and
+  /// at a cap-tripping clip those `8 * num_chunks` bytes would be the first of
+  /// the allocations the cap exists to prevent. `window::num_chunks` is the
+  /// function `chunk_starts` itself counts with, so the two cannot disagree.
+  ///
+  /// Both grids are derived here rather than at `owned.rs:653-657`, after the
+  /// chunk loop, so the guards can run ahead of inference. Nothing between here
+  /// and step 9-11 reads them, so the move is a hoist only.
+  ///
+  /// # Errors
+  /// - [`ExtractError::OutputFrameCountOverflow`] / [`ExtractError::OutputFrameCountTooLarge`]
+  ///   — checks 4 and 6, through `checked_output_frame_count` (round 9).
+  ///   Duplicated for the same reason the placement guard is: `assemble_checked`
+  ///   runs both again at the end and THAT run is the guarantee, but the derived
+  ///   grid reads nothing but `num_chunks` and the two windows — so a clip past
+  ///   [`MAX_OUTPUT_FRAMES`] (19.6 h) is refused here instead of after
+  ///   1 217 810 160 bytes of tensors, 70 770 pairs of CoreML calls and
+  ///   404 771 544 bytes of count scratch have been spent reaching the same
+  ///   verdict.
+  /// - [`ExtractError::MisalignedChunkPlacement`] — check 8, round 3's cure.
+  ///   Ordered AFTER the cap, matching the shared sequence's own order (check 6
+  ///   before check 8) so this method and [`Extraction::try_from_parts`] name
+  ///   the same error for a geometry that trips both — and, independently,
+  ///   because the cap is `O(1)` where this scan is `O(num_chunks)`.
+  ///
+  /// # Panics
+  /// Panics if `self.options.window().step_samples()` is `0`, as
+  /// [`crate::audio::speaker::window::chunk_starts`] does and for the same
+  /// reason. [`Self::extract`] refuses that as [`ExtractError::ZeroStepSamples`]
+  /// before it reaches here.
+  fn checked_geometry(
+    &self,
+    samples_len: usize,
+  ) -> Result<(usize, SlidingWindow, SlidingWindow), ExtractError> {
+    let w = self.options.window();
+    let num_chunks = crate::audio::speaker::window::num_chunks(samples_len, &w);
+    let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&w); // owned.rs:653-655
+    let frames_sw = crate::audio::speaker::window::frame_sliding_window(); // owned.rs:656-657
+
+    checked_output_frame_count(num_chunks, chunks_sw, frames_sw)?;
+
+    // No dia analog, and the guard `Extraction::try_from_parts` applies as its
+    // check 8: the `count` built at step 9-11 is written on the AGGREGATION's
+    // frame grid, while `diaric::reconstruct` — which both cluster backends
+    // feed — places the same chunk's activations by `closest_frame`. Where the
+    // two disagree the count marks frames the activations never reach and
+    // suppresses the ones they do, and `diarize_online` re-derives its own
+    // count through the same aggregation, so no choice of `count` repairs it.
+    // See `window::first_misaligned_chunk` for which geometries are affected —
+    // none of them reachable with the default `step_samples`.
+    if let Some(m) =
+      crate::audio::speaker::window::first_misaligned_chunk(num_chunks, chunks_sw, frames_sw)
+    {
+      return Err(ExtractError::MisalignedChunkPlacement(m));
+    }
+
+    Ok((num_chunks, chunks_sw, frames_sw))
+  }
+
   /// Runs the full extraction over `samples` (16 kHz mono f32) using the
   /// pre-loaded `seg` and `embed` models, producing the [`Extraction`]
   /// diaric's offline diarizer consumes.
@@ -640,11 +720,14 @@ impl Extractor {
   ///   longer emit an `Extraction` its own public constructor would refuse. All
   ///   of those refusals are unreachable through this method's own geometry
   ///   (see the matrix on `check_assembled_parts`) with ONE exception:
-  ///   [`ExtractError::OutputFrameCountTooLarge`] is now reachable, for a clip
-  ///   whose derived grid exceeds [`MAX_OUTPUT_FRAMES`] — 19.6 hours at the
+  ///   [`ExtractError::OutputFrameCountTooLarge`] is reachable, for a clip whose
+  ///   derived grid exceeds [`MAX_OUTPUT_FRAMES`] — 19.6 hours at the
   ///   community-1 frame step, far past what either clustering backend can
-  ///   finish. Refusing it here costs the caller the inference it was going to
-  ///   waste.
+  ///   finish. Since round 9 it is raised at step 7a instead: the grid depends
+  ///   only on `samples.len()` and `step_samples`, so a late refusal cost 1.2 GB
+  ///   of tensors, every model call, and 405 MB of count scratch to reach a
+  ///   verdict the geometry had already fixed. Same error, same clips, only
+  ///   sooner.
   pub fn extract(
     &self,
     seg: &SegmentModel,
@@ -678,39 +761,8 @@ impl Extractor {
       });
     }
 
-    // ── 6-7. Chunk grid + zero-cleared output buffers ─────────────────
-    let starts = crate::audio::speaker::window::chunk_starts(samples.len(), &w); // owned.rs:447-451
-    let num_chunks = starts.len();
-
-    // Both timing grids, derived HERE (dia derives them at owned.rs:653-657,
-    // after the chunk loop) so the placement guard below can run before any
-    // inference. Nothing between here and step 9-11 reads them, so the move is
-    // a hoist only.
-    let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&w); // owned.rs:653-655
-    let frames_sw = crate::audio::speaker::window::frame_sliding_window(); // owned.rs:656-657
-
-    // ── 7b. The two grids must place every chunk at the SAME frame ────
-    // No dia analog, and the guard `Extraction::try_from_parts` applies as its
-    // check 8: the `count` built at step 9-11 is written on the AGGREGATION's
-    // frame grid, while `diaric::reconstruct` — which both cluster backends
-    // feed — places the same chunk's activations by `closest_frame`. Where the
-    // two disagree the count marks frames the activations never reach and
-    // suppresses the ones they do, and `diarize_online` re-derives its own
-    // count through the same aggregation, so no choice of `count` repairs it.
-    //
-    // Duplicated on purpose: `Extraction::assemble_checked` runs this very
-    // check again at the end, over the same geometry, as check 8 of the shared
-    // sequence. That later run is the GUARANTEE; this one is the cost
-    // optimisation — the comparison reads nothing but `num_chunks` and the two
-    // windows, so a geometry this crate cannot diarize honestly is refused
-    // before ~591 pairs of CoreML calls rather than after them. See
-    // `window::first_misaligned_chunk` for which geometries are affected —
-    // none of them reachable with the default `step_samples`.
-    if let Some(m) =
-      crate::audio::speaker::window::first_misaligned_chunk(num_chunks, chunks_sw, frames_sw)
-    {
-      return Err(ExtractError::MisalignedChunkPlacement(m));
-    }
+    // ── 6-7b. Every guard that reads only geometry ────────────────────
+    let (num_chunks, chunks_sw, frames_sw) = self.checked_geometry(samples.len())?;
 
     // The transform the per-slot row guard below validates against, resolved
     // ONCE before any inference — and BEFORE it, so an unavailable transform
@@ -728,6 +780,14 @@ impl Extractor {
     let mut padded = vec![0.0f32; SEG_CHUNK_SAMPLES];
 
     // ── 8. Fused per-chunk segment → mask → embed (module doc) ────────
+    // `start = c * step` (owned.rs:447-451), materialised here rather than at
+    // step 6-7 so the geometry guards above allocate nothing.
+    let starts = crate::audio::speaker::window::chunk_starts(samples.len(), &w);
+    debug_assert_eq!(
+      starts.len(),
+      num_chunks,
+      "`chunk_starts` counts with `window::num_chunks`, so the two must agree"
+    );
     for (c, &start) in starts.iter().enumerate() {
       // a. Build the (possibly zero-padded) chunk window (owned.rs:469-475).
       fill_padded_chunk(&mut padded, samples, start);
@@ -921,6 +981,93 @@ pub struct Extraction {
   frames_sw: SlidingWindow,
 }
 
+/// Check 4's derivation: the output-frame grid that `num_chunks` and the two
+/// timing windows imply. The value `count.len()` must equal (check 5), the one
+/// [`MAX_OUTPUT_FRAMES`] bounds (check 6), and the one
+/// [`Extraction::diarize_online`] re-derives on every call.
+///
+/// The ONE place that expression is written — `check_assembled_parts` runs it
+/// as its check 4, and every producer runs it AHEAD of its own work through
+/// [`checked_output_frame_count`]. Written out a second time it would be a
+/// second expression that is algebraically equal and numerically different,
+/// which is the class check 8 exists for.
+///
+/// `saturating_sub(1)` where this was written `- 1` inline: at
+/// `check_assembled_parts`' call site check 1 has already refused `num_chunks
+/// == 0`, and at every producer `window::num_chunks` returns at least `1`, so
+/// the two forms agree everywhere this is reachable. At `num_chunks == 0` it
+/// derives the one-chunk grid, which leaves `window::try_count_from_segmentations`'
+/// own `assert!(num_chunks > 0)` to fire exactly as it did before this preflight
+/// existed.
+fn derived_output_frame_count(
+  num_chunks: usize,
+  chunks_sw: SlidingWindow,
+  frames_sw: SlidingWindow,
+) -> Result<usize, ExtractError> {
+  let last_chunk_end =
+    chunks_sw.duration() + num_chunks.saturating_sub(1) as f64 * chunks_sw.step();
+  crate::audio::speaker::window::try_num_output_frames(last_chunk_end, frames_sw.step()).map_err(
+    |e| match e {
+      crate::audio::speaker::window::WindowError::OutputFrameCountOverflow => {
+        ExtractError::OutputFrameCountOverflow
+      }
+    },
+  )
+}
+
+/// Check 6: the RESOURCE bound. The ONE comparison against
+/// [`MAX_OUTPUT_FRAMES`], so the bound cannot drift between the assembly
+/// sequence and the producers' preflight.
+fn check_output_frame_cap(derived_output_frames: usize) -> Result<(), ExtractError> {
+  if derived_output_frames > MAX_OUTPUT_FRAMES {
+    return Err(ExtractError::OutputFrameCountTooLarge(
+      derived_output_frames,
+    ));
+  }
+  Ok(())
+}
+
+/// Checks 4 and 6 over GEOMETRY ALONE — the preflight every producer runs
+/// before it allocates a tensor or calls a model, and that
+/// `Extraction::assemble_checked` runs before it derives a `count`.
+///
+/// # Why a producer runs this at all (round 9)
+///
+/// Round 8 gave every producer the whole check sequence, but at the END: both
+/// build their extraction tensors and complete inference, and
+/// `assemble_checked` then derives `count` — so check 6, whose entire job is to
+/// refuse a grid this crate is not willing to allocate for, ran after the
+/// allocations. At the smallest clip it refuses (1 132 448 001 samples, 19.66 h
+/// at 16 kHz, deriving 4 194 312 frames against a cap of 4 194 304) that meant
+/// 1 217 810 160 bytes of `segmentations` + `raw_embeddings`, 70 770 pairs of
+/// CoreML calls, and then 404 771 544 bytes of count scratch, all spent on an
+/// input the geometry alone had already condemned.
+///
+/// Nothing about the grid depends on any of that work. Round 3 established the
+/// same fact for check 8 — the output grid is a function of `samples.len()` and
+/// `step_samples`, which is why the placement guard already runs pre-inference
+/// — and checks 4 and 6 read strictly less: `num_chunks` and the two windows.
+/// So the cap moves to where its inputs are known, and the late check stays
+/// where it is, because that is the one [`Extraction::try_from_parts`] runs for
+/// parts this crate did not compute.
+///
+/// Refuses NOTHING it did not refuse before. It is the same two functions over
+/// the same three values a producer hands `assemble_checked` verbatim, so the
+/// verdict is identical and only its position changed.
+///
+/// # Errors
+/// [`crate::audio::speaker::error::ExtractError::OutputFrameCountOverflow`]
+/// (check 4) or [`ExtractError::OutputFrameCountTooLarge`] (check 6).
+pub(crate) fn checked_output_frame_count(
+  num_chunks: usize,
+  chunks_sw: SlidingWindow,
+  frames_sw: SlidingWindow,
+) -> Result<usize, ExtractError> {
+  let derived_output_frames = derived_output_frame_count(num_chunks, chunks_sw, frames_sw)?;
+  check_output_frame_cap(derived_output_frames)?;
+  Ok(derived_output_frames)
+}
+
 /// The ONE implementation of [`Extraction::try_from_parts`]'s thirteen checks,
 /// over BORROWED parts — run by that constructor and, through
 /// `Extraction::assemble_checked`, by every in-crate
@@ -955,7 +1102,7 @@ pub struct Extraction {
 /// | 3 | length products | both buffers are `vec![_; num_chunks * .. ]` at those very dimensions | same |
 /// | 4 | derived count fits `usize` | `try_num_output_frames` via the count derivation | same |
 /// | 5 | `count.len()` == derived | `count` IS that derivation's output | same |
-/// | 6 | derived <= `MAX_OUTPUT_FRAMES` | ENFORCED, and newly reachable: a clip past 19.6 h now fails here instead of building a grid the public constructor refuses | same |
+/// | 6 | derived <= `MAX_OUTPUT_FRAMES` | ENFORCED, and reachable: a clip past 19.6 h fails. Since round 9 it fails at `checked_output_frame_count`, before the tensors and the models — this run is the backstop | same |
 /// | 7 | `frames_sw.step()` survives `f32` | `FRAME_STEP_S` is `0.016875` | same |
 /// | 8 | both grids place every chunk alike | round 3's cure, still run pre-inference as well so a bad grid costs no model time | the stride is compiled into the graph and even, so no rounding tie exists (`the_fixed_argmax_grid_places_every_chunk_identically_under_both_mappings`) |
 /// | 9 | segmentations hard-binary | `multilabel` writes `POWERSET_TABLE` literals and `zero_slot_column` writes `0.0` | **the round-8 hole**: `write_segmentations` copies `f64::from(speaker_ids[..])` verbatim, and `from_dir_with` accepts any model with the pinned F16 shapes |
@@ -1069,17 +1216,15 @@ fn check_assembled_parts(
   // Same helper, same two arguments, same deterministic f64 arithmetic as
   // `window::try_aggregate_output_frame_count` runs there, so proving it
   // returns `Ok` here proves that method's `.expect(..)` is unreachable.
-  // `num_chunks >= 1` (check 1) makes the `- 1` safe; the windows are
-  // finite and positive (check 2), so `last_chunk_end` is the only
-  // quantity left that can drive the division out of range.
-  let last_chunk_end = chunks_sw.duration() + (num_chunks - 1) as f64 * chunks_sw.step();
-  let derived_output_frames =
-    crate::audio::speaker::window::try_num_output_frames(last_chunk_end, frames_sw.step())
-      .map_err(|e| match e {
-        crate::audio::speaker::window::WindowError::OutputFrameCountOverflow => {
-          ExtractError::OutputFrameCountOverflow
-        }
-      })?;
+  // `num_chunks >= 1` (check 1) makes `derived_output_frame_count`'s
+  // `saturating_sub(1)` an exact `- 1`; the windows are finite and positive
+  // (check 2), so `last_chunk_end` is the only quantity left that can drive
+  // the division out of range.
+  //
+  // Through the shared `derived_output_frame_count` — the same function every
+  // producer's pre-inference preflight calls, so the value refused there and
+  // the value validated here cannot drift.
+  let derived_output_frames = derived_output_frame_count(num_chunks, chunks_sw, frames_sw)?;
 
   // ── 5. `count.len()` IS the grid the geometry derives ─────────────
   // The value check 4 computes is the answer, not a by-product: keeping it
@@ -1100,11 +1245,14 @@ fn check_assembled_parts(
   // ── 6. The grid is one this crate is willing to allocate for ──────
   // The RESOURCE bound (see `MAX_OUTPUT_FRAMES`), and the last O(1) check:
   // everything below is O(n) over buffers this bound now limits.
-  if derived_output_frames > MAX_OUTPUT_FRAMES {
-    return Err(ExtractError::OutputFrameCountTooLarge(
-      derived_output_frames,
-    ));
-  }
+  //
+  // Through the shared `check_output_frame_cap`, so this and every producer's
+  // preflight compare against the one constant. Reached here only for parts a
+  // caller assembled: both in-crate producers have already run this exact
+  // comparison, over this exact derivation, before they allocated a tensor —
+  // see `checked_output_frame_count`. Kept regardless, because
+  // `try_from_parts` has no earlier point to run it at.
+  check_output_frame_cap(derived_output_frames)?;
 
   // ── 7. `frames_sw.step()` survives the narrowing `diarize_online` does ──
   // That method builds the online speech duration in `f32`
@@ -1532,6 +1680,17 @@ impl Extraction {
   /// produced the tensors — and what it buys is that neither identity has to be
   /// re-argued the next time a producer changes.
   ///
+  /// # The cap runs first (round 9)
+  ///
+  /// Checks 4 and 6 are applied to the GEOMETRY before `count` is derived at
+  /// all, through the same `checked_output_frame_count` both producers run
+  /// earlier still. Deriving the count is what allocates — three buffers sized
+  /// by the very grid check 6 bounds, 404 771 544 bytes at the smallest grid it
+  /// refuses — so a bound applied afterwards is a bound applied to work already
+  /// done. The full sequence still runs below and still reaches checks 4 and 6
+  /// in their numbered place; the preflight can only return what that sequence
+  /// would have returned, because it is those two checks.
+  ///
   /// # Errors
   /// Every error `check_assembled_parts` raises, plus
   /// [`crate::audio::speaker::error::ExtractError::OutputFrameCountOverflow`]
@@ -1545,6 +1704,21 @@ impl Extraction {
     chunks_sw: SlidingWindow,
     frames_sw: SlidingWindow,
   ) -> Result<Self, ExtractError> {
+    // ── Checks 4 and 6, BEFORE the count buffers ──────────────────────
+    // `try_count_from_segmentations` derives the very grid check 6 bounds, and
+    // allocates three buffers sized by it on the way (a `num_chunks *
+    // num_frames_per_chunk` chunk-count vector, the `num_output_frames`
+    // aggregate/coverage pair, and the `count` itself: 404 771 544 bytes at the
+    // smallest grid the cap refuses). Running the cap over the geometry first
+    // means an over-cap grid costs none of them. Round 9.
+    //
+    // Not a second derivation: this is `check_assembled_parts`' own checks 4
+    // and 6, the same functions over the same three values, so it can only
+    // return what that sequence would have returned below. Check 5 is the one
+    // it cannot preempt, and does not need to — a producer's `count` IS the
+    // derivation's own output, so its length is equal by construction.
+    checked_output_frame_count(num_chunks, chunks_sw, frames_sw)?;
+
     // Manual exhaustive match, deliberately not a `From` impl — see
     // `ExtractError::OutputFrameCountOverflow`'s doc. Unreachable through
     // either source's own geometry (num_chunks * step ≈ samples.len()), kept
@@ -1637,7 +1811,10 @@ impl Extraction {
   ///    disagree about the same `Extraction`.
   /// 6. That derived count is at most [`MAX_OUTPUT_FRAMES`] — a resource bound,
   ///    see that constant. The last `O(1)` check: everything below is `O(n)`
-  ///    over buffers this one bounds.
+  ///    over buffers this one bounds. Both in-crate producers apply this same
+  ///    bound to the same derivation before they allocate anything
+  ///    (`checked_output_frame_count`); this is where it runs for parts a
+  ///    caller assembled, which have no earlier point.
   /// 7. `frames_sw.step()` stays finite and `> 0` through the `f32` narrowing
   ///    [`Self::diarize_online`] applies to it when it builds the online speech
   ///    duration. See [`ExtractError::FrameStepNotRepresentableInF32`].

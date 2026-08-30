@@ -635,15 +635,37 @@ impl WindowOptions {
 /// `ShapeError::ZeroStepSamples`) for the identical reason.
 pub fn chunk_starts(total_samples: usize, options: &WindowOptions) -> Vec<usize> {
   let step = options.step_samples() as usize;
+  (0..num_chunks(total_samples, options))
+    .map(|c| c * step)
+    .collect()
+}
+
+/// How many chunks [`chunk_starts`] schedules over `total_samples` — that
+/// function's own count, without its `Vec`.
+///
+/// The ONE definition of the count: `chunk_starts` calls it rather than
+/// repeating the arithmetic. Split out because both producers need the chunk
+/// grid BEFORE they can afford the starts. The output-frame grid — and with it
+/// [`crate::audio::speaker::extract::MAX_OUTPUT_FRAMES`], the resource bound
+/// that refuses a clip no backend could finish — is derived from `num_chunks`
+/// and the two sliding windows alone, and at a cap-tripping clip the starts
+/// vector is itself `8 * num_chunks` bytes (566 KB at the smallest such clip,
+/// and `2 * total_samples` bytes at `step_samples = 1`) of exactly the
+/// allocation that cap exists to refuse.
+///
+/// # Panics
+/// Panics if `options.step_samples() == 0`, for the reason and with the message
+/// [`chunk_starts`] documents — this is where that assert now lives, so both
+/// functions still raise it identically.
+pub(crate) fn num_chunks(total_samples: usize, options: &WindowOptions) -> usize {
+  let step = options.step_samples() as usize;
   assert!(step > 0, "step_samples must be > 0");
 
-  let num_chunks = if total_samples <= SEG_CHUNK_SAMPLES {
+  if total_samples <= SEG_CHUNK_SAMPLES {
     1
   } else {
     (total_samples - SEG_CHUNK_SAMPLES).div_ceil(step) + 1
-  };
-
-  (0..num_chunks).map(|c| c * step).collect()
+  }
 }
 
 /// The chunk-grid [`SlidingWindow`] matching `options`: `start = 0.0`,

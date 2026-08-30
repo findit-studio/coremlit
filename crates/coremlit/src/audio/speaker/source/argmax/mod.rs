@@ -361,7 +361,7 @@ use crate::audio::speaker::{
   extract::{EXCLUDE_OVERLAP_MIN_FRAMES, Extraction, raw_embedding_reaches_plda},
   segment::{SEG_CHUNK_SAMPLES, SEG_NUM_SLOTS},
   source::ModelSource,
-  window::WindowOptions,
+  window::{SlidingWindow, WindowOptions},
 };
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -1515,6 +1515,59 @@ fn place_embeddings(
   Ok(())
 }
 
+/// The chunk count and both timing grids for `samples_len`, refused if the
+/// output-frame grid they derive is one this crate will not allocate for —
+/// checks 4 and 6 of the shared assembly sequence, over geometry alone
+/// (round 9).
+///
+/// This source's EARLIEST enforcement point, and it is earlier than
+/// `Extractor::checked_geometry`'s: argmax's window stride is compiled into its
+/// graph and re-asserted at the top of `extract`, so `samples_len` is the last
+/// input the grid needs — before the two whole-buffer input scans, before the
+/// extraction tensors, and before any of the three models. An `O(1)` refusal of
+/// a clip nothing downstream could finish belongs ahead of two
+/// `O(samples_len)` passes over it.
+///
+/// A separate function for the reason `Extractor::checked_geometry` is: the
+/// smallest clip the cap refuses is 1 132 448 001 samples — 4.5 GB of `f32` and
+/// 3 371 argmax chunks at up to three model calls each — so a falsifier for the
+/// cap's PLACEMENT cannot go through `extract` and has nowhere else to attach.
+///
+/// No placement guard, unlike `Extractor::checked_geometry`: check 8 can only
+/// fire where `c * step_samples` hits a rounding tie, which needs an ODD
+/// `step_samples` (`window::first_misaligned_chunk`), and this source's stride
+/// is pinned to the even `ARGMAX_WINDOW_STRIDE_SAMPLES`
+/// (`the_fixed_argmax_grid_places_every_chunk_identically_under_both_mappings`).
+/// The assembly door runs it regardless.
+///
+/// The Extraction chunk grid IS dia's (module doc's theorem), so it is computed
+/// from the very same function `FluidAudioSource` uses — the two sources'
+/// geometry agrees by construction, not by coincidence. Counted rather than
+/// enumerated: nothing downstream reads dia's chunk STARTS (this source walks
+/// argmax's own `argmax_chunk_starts`), so the count is all there ever was to
+/// take.
+///
+/// # Errors
+/// [`ExtractError::OutputFrameCountOverflow`] or
+/// [`ExtractError::OutputFrameCountTooLarge`], through
+/// `extract::checked_output_frame_count`.
+///
+/// # Panics
+/// Panics if `w_opts.step_samples()` is `0`, as
+/// [`crate::audio::speaker::window::chunk_starts`] does. `ArgmaxSource::extract`
+/// has already required it to equal [`ARGMAX_WINDOW_STRIDE_SAMPLES`] before it
+/// reaches here.
+fn checked_geometry(
+  samples_len: usize,
+  w_opts: &WindowOptions,
+) -> Result<(usize, SlidingWindow, SlidingWindow), ExtractError> {
+  let num_chunks = crate::audio::speaker::window::num_chunks(samples_len, w_opts);
+  let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(w_opts);
+  let frames_sw = crate::audio::speaker::window::frame_sliding_window();
+  crate::audio::speaker::extract::checked_output_frame_count(num_chunks, chunks_sw, frames_sw)?;
+  Ok((num_chunks, chunks_sw, frames_sw))
+}
+
 impl ModelSource for ArgmaxSource {
   /// Maps argmax's in-graph-decoded output onto [`Extraction`]. See the
   /// module doc for the decode semantics, the `(k, w) → c = k*21 + w` index
@@ -1554,9 +1607,13 @@ impl ModelSource for ArgmaxSource {
   ///   and not a runtime guard. A segmenter that returned `0.1` per frame used
   ///   to assemble an `Extraction` whose stored `count` was all zero (offline:
   ///   silence) while the online route read every cell as active (a 9.94 s
-  ///   speaker); it is now refused here, naming the cell. Also newly reachable:
+  ///   speaker); it is now refused here, naming the cell. Also reachable:
   ///   [`ExtractError::OutputFrameCountTooLarge`] for a clip past
-  ///   [`crate::audio::speaker::extract::MAX_OUTPUT_FRAMES`] (19.6 hours).
+  ///   [`crate::audio::speaker::extract::MAX_OUTPUT_FRAMES`] (19.6 hours) —
+  ///   raised since round 9 from the chunk grid alone, before this method's two
+  ///   whole-buffer input scans and before any tensor or model call, since its
+  ///   window stride is fixed at load and `samples.len()` is therefore the last
+  ///   input the grid needs.
   fn extract(&self, samples: &[f32]) -> Result<Extraction, ExtractError> {
     if samples.is_empty() {
       return Err(ExtractError::EmptySamples);
@@ -1573,6 +1630,9 @@ impl ModelSource for ArgmaxSource {
         onset: w_opts.onset(),
       });
     }
+    // ── Every guard that reads only geometry, before any O(n) work ────
+    let (num_chunks, chunks_sw, frames_sw) = checked_geometry(samples.len(), &w_opts)?;
+
     // Reject a NaN/inf sample before it is converted to f16 and fed to the
     // segmenter (M2) — the same input-side contract the embed module already
     // enforces; converts to `ExtractError::Infer` via `?`.
@@ -1584,10 +1644,6 @@ impl ModelSource for ArgmaxSource {
     // host f32 samples to f16.
     check_f16_representable(samples)?;
 
-    // The Extraction chunk grid IS dia's (module doc's theorem), so it is
-    // computed from the very same function FluidAudioSource uses — the two
-    // sources' geometry agrees by construction, not by coincidence.
-    let num_chunks = crate::audio::speaker::window::chunk_starts(samples.len(), &w_opts).len();
     let mut segmentations = vec![0.0f64; num_chunks * ARGMAX_FRAMES_PER_WINDOW * SEG_NUM_SLOTS];
     let mut raw_embeddings = vec![0.0f32; num_chunks * SEG_NUM_SLOTS * EMBEDDING_DIM];
     let mut padded = vec![f16::ZERO; ARGMAX_CHUNK_SAMPLES];
@@ -1662,8 +1718,10 @@ impl ModelSource for ArgmaxSource {
     // segmenter returning `0.1` per frame therefore produced an extraction
     // whose stored `count` was all zero (offline: silence) while the online
     // route read every cell as active. That check now runs HERE too.
-    let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&w_opts);
-    let frames_sw = crate::audio::speaker::window::frame_sliding_window();
+    //
+    // `chunks_sw` / `frames_sw` were derived before the input scans so the
+    // output-frame cap could run ahead of them; they are the same two values
+    // this call used to build.
     Extraction::assemble_checked(
       raw_embeddings,
       segmentations,

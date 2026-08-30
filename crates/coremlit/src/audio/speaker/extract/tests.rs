@@ -4589,3 +4589,229 @@ fn assemble_checked_reaches_the_same_verdict_as_try_from_parts() {
     }
   }
 }
+
+/// Round 9's falsifier: the output-frame cap must refuse a geometry BEFORE the
+/// work it exists to bound, not after.
+///
+/// # The defect, measured
+///
+/// Round 8 gave every producer the whole thirteen-check sequence, but at the
+/// END of its work. Both producers build their extraction tensors and run every
+/// CoreML call, `assemble_checked` then derives `count`, and only then does
+/// check 6 — whose entire job is to refuse a grid this crate will not allocate
+/// for — get to speak. So the cap refused the right inputs after paying for
+/// them.
+///
+/// The two allocations below are the price, and this test MEASURES them rather
+/// than asserting them (`crate::tests::alloc_probe`, a counting global
+/// allocator with per-thread counters):
+///
+/// - `1 217 810 160` bytes of `raw_embeddings` + `segmentations`, the tensors
+///   a producer must build before it can call this door at all;
+/// - `404 771 544` bytes inside `assemble_checked` itself — the chunk-count
+///   vector, the aggregate/coverage pair and the `count` — every one of them
+///   sized by the very grid the cap was about to refuse. That figure is what
+///   this test printed before the preflight existed; it is `0` now.
+///
+/// # The input
+///
+/// `1 132 448 001` samples: the SMALLEST clip either producer refuses, and one
+/// sample fewer is asserted below to be accepted, so this is a boundary and not
+/// a large round number. At the default `step_samples` that is 70 770 chunks,
+/// a last chunk ending at 70 779.0 s, and `round(70 779 / 0.016875) + 1 =
+/// 4 194 312` output frames against a cap of `4 194 304` — 19.66 hours of
+/// audio, far past what either clustering backend could finish.
+///
+/// # What is substituted for the producer, and why
+///
+/// `Extractor::extract` needs a loaded `SegmentModel`, and could not be RUN on
+/// this input even with one: the clip is 4.5 GB of `f32` samples and 70 770
+/// pairs of CoreML calls, which is not a unit test on any host. So the producer
+/// is exercised in the two halves that bracket its models, and nothing between
+/// them is skipped:
+///
+/// - `Extractor::checked_geometry`, which IS `extract`'s pre-inference
+///   sequence — not a re-composition of it. `extract` calls this and nothing
+///   else before it allocates a tensor or touches a model, so a cap moved back
+///   behind either would leave this assertion unsatisfied.
+/// - `Extraction::assemble_checked`, the assembly door, called with the exact
+///   tensors and geometry `extract` would hand it at this input. That is the
+///   call that used to allocate 404 771 544 bytes before refusing, and it is
+///   the half the allocation measurement lives in.
+///
+/// `ArgmaxSource`'s own earliest point is asserted the same way, one module over
+/// (that module's `the_frame_cap_refuses_argmax_geometry_before_its_input_scans`);
+/// it is earlier than this one, because that source's stride is fixed at load.
+///
+/// What neither covers is the POSITION of the `checked_geometry` call inside
+/// each producer's body: that is the diff, plus the model-gated end-to-end
+/// gates, which report as `ignored` wherever the speaker models are not staged.
+#[test]
+fn the_frame_cap_refuses_before_the_allocation_it_bounds() {
+  use crate::{audio::speaker::window, tests::alloc_probe};
+
+  /// The smallest clip whose derived output grid exceeds `MAX_OUTPUT_FRAMES`.
+  const SMALLEST_OVER_CAP_SAMPLES: usize = 1_132_448_001;
+  /// The derived grid at that clip. Eight frames past the cap.
+  const OVER_CAP_FRAMES: usize = 4_194_312;
+  /// community-1's per-chunk frame count — `SegmentModel::num_frames()` for
+  /// every segmenter this crate loads, and `ARGMAX_FRAMES_PER_WINDOW` for the
+  /// other producer, asserted below rather than assumed.
+  const FRAMES_PER_CHUNK: usize = 589;
+
+  assert_eq!(
+    FRAMES_PER_CHUNK,
+    crate::audio::speaker::source::argmax::ARGMAX_FRAMES_PER_WINDOW
+  );
+  const { assert!(OVER_CAP_FRAMES > MAX_OUTPUT_FRAMES) };
+
+  // ── `Extractor`'s own pre-inference sequence, called directly ──────
+  // Not a re-composition of the functions `extract` calls — `extract` calls
+  // THIS, and calls nothing else before it allocates or infers. So a cap moved
+  // back behind the tensors would show up here.
+  let extractor = Extractor::new();
+  assert_eq!(
+    extractor.checked_geometry(SMALLEST_OVER_CAP_SAMPLES),
+    Err(ExtractError::OutputFrameCountTooLarge(OVER_CAP_FRAMES)),
+    "the cap is reachable from `samples.len()` and the options alone — no \
+     tensor, no model"
+  );
+
+  // A BOUNDARY, not a blanket refusal of long clips: one sample fewer is one
+  // chunk fewer, derives 4 194 253 frames, and is accepted. So this is the
+  // smallest input that now fails early, and the fix refuses nothing that was
+  // not already refused.
+  let w = WindowOptions::new();
+  let (num_chunks, chunks_sw, frames_sw) = extractor
+    .checked_geometry(SMALLEST_OVER_CAP_SAMPLES - 1)
+    .expect("one sample fewer derives a grid inside the cap");
+  assert_eq!(
+    (
+      num_chunks,
+      checked_output_frame_count(num_chunks, chunks_sw, frames_sw)
+    ),
+    (70_769, Ok(4_194_253))
+  );
+
+  // The refused geometry itself, for the allocation half below. `num_chunks`
+  // and both windows are what `checked_geometry` would have returned had the
+  // cap not refused them, from the same three functions.
+  let num_chunks = window::num_chunks(SMALLEST_OVER_CAP_SAMPLES, &w);
+  assert_eq!(num_chunks, 70_770);
+  let chunks_sw = window::chunk_sliding_window(&w);
+  let frames_sw = window::frame_sliding_window();
+
+  // ── What a producer had already built to reach the old refusal ─────
+  // `Extractor::extract`'s two output buffers at this geometry, sized by its
+  // own expressions. Zeroed and never read, so they cost address space and not
+  // resident pages — the counting allocator is what sees them at all.
+  let (tensors, built) = alloc_probe::measure(|| {
+    (
+      vec![0.0f32; num_chunks * SEG_NUM_SLOTS * EMBEDDING_DIM],
+      vec![0.0f64; num_chunks * FRAMES_PER_CHUNK * SEG_NUM_SLOTS],
+    )
+  });
+  assert_eq!(
+    (built.total, built.peak),
+    (1_217_810_160, 1_217_810_160),
+    "the two extraction tensors a producer builds before assembly"
+  );
+
+  // ── ...and what the assembly door itself spent before refusing ─────
+  let (err, scratch) = alloc_probe::measure(|| {
+    Extraction::assemble_checked(
+      tensors.0,
+      tensors.1,
+      num_chunks,
+      FRAMES_PER_CHUNK,
+      w.onset(),
+      chunks_sw,
+      frames_sw,
+    )
+    .expect_err("a 19.66 h clip derives a grid past MAX_OUTPUT_FRAMES")
+  });
+  assert_eq!(err, ExtractError::OutputFrameCountTooLarge(OVER_CAP_FRAMES));
+  assert_eq!(
+    (scratch.total, scratch.peak),
+    (0, 0),
+    "the door allocated before refusing a geometry it could refuse from \
+     `num_chunks` and the two windows alone (404 771 544 bytes before round 9)"
+  );
+}
+
+/// The other half of "only sooner": the preflight must reach the SAME verdict
+/// the late check reaches, on grids at and either side of the boundary.
+///
+/// A cap enforced in two places is a cap that can drift. This is the pinning
+/// for the claim that it has not: for a swept range of geometries the
+/// geometry-only preflight and the full thirteen-check sequence agree, both on
+/// which are refused and on the exact `usize` the refusal names.
+#[test]
+fn the_geometry_preflight_and_the_assembled_check_never_disagree() {
+  let onset = WindowOptions::new().onset();
+  let unit = unit_sw();
+
+  // `(num_chunks, chunks_sw, frames_sw)` triples spanning the cap: the unit
+  // grid at one and two chunks, then the boundary trio — one frame below the
+  // cap, exactly at it, and one past it — and finally a geometry that overflows
+  // `usize`, so check 4's arm is swept as well as check 6's.
+  let second = SlidingWindow::new(0.0, 1.0, 1.0);
+  let cases: [(usize, SlidingWindow, SlidingWindow); 6] = [
+    (1, unit, unit),
+    (2, unit, unit),
+    (
+      1,
+      SlidingWindow::new(0.0, (MAX_OUTPUT_FRAMES - 2) as f64, 1.0),
+      second,
+    ),
+    (
+      1,
+      SlidingWindow::new(0.0, (MAX_OUTPUT_FRAMES - 1) as f64, 1.0),
+      second,
+    ),
+    (
+      1,
+      SlidingWindow::new(0.0, MAX_OUTPUT_FRAMES as f64, 1.0),
+      second,
+    ),
+    (
+      1,
+      SlidingWindow::new(0.0, 1e300, 1e300),
+      SlidingWindow::new(0.0, 1e-300, 1e-300),
+    ),
+  ];
+
+  for (num_chunks, chunks_sw, frames_sw) in cases {
+    let preflight = checked_output_frame_count(num_chunks, chunks_sw, frames_sw);
+    // The same geometry carried through the full sequence, over tensors that
+    // satisfy every OTHER check — all-zero, so no slot is active and no cell is
+    // outside `{0.0, 1.0}` — so whatever the two disagree about can only be
+    // checks 4 and 6.
+    let assembled = Extraction::assemble_checked(
+      vec![0.0f32; num_chunks * SEG_NUM_SLOTS * EMBEDDING_DIM],
+      vec![0.0f64; num_chunks * SEG_NUM_SLOTS],
+      num_chunks,
+      1,
+      onset,
+      chunks_sw,
+      frames_sw,
+    );
+    match (preflight, assembled) {
+      (Err(pre), Err(post)) => assert_eq!(
+        pre, post,
+        "num_chunks={num_chunks} chunks_sw={chunks_sw:?}: the preflight and the \
+         sequence named different errors"
+      ),
+      (Ok(n), Ok(e)) => assert_eq!(
+        n,
+        e.num_output_frames(),
+        "num_chunks={num_chunks} chunks_sw={chunks_sw:?}: the preflight derived \
+         a different grid than the one assembled"
+      ),
+      (pre, post) => panic!(
+        "num_chunks={num_chunks} chunks_sw={chunks_sw:?}: preflight {pre:?} \
+         disagrees with the sequence {post:?}"
+      ),
+    }
+  }
+}

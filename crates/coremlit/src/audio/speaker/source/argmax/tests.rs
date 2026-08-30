@@ -1833,3 +1833,50 @@ fn a_fractional_speaker_id_splits_the_backends_and_is_refused_at_assembly() {
     "and now offline's count agrees with online's reading of the same buffer"
   );
 }
+
+/// Round 9, this source's half: the output-frame cap must be applied at
+/// argmax's OWN earliest point, which is earlier than `Extractor`'s.
+///
+/// `Extractor::checked_geometry` runs after a model-dependent guard (the
+/// segmenter/embedder frame-count agreement); this source has no such guard,
+/// and its window stride is compiled into the graph and re-asserted at the top
+/// of `extract`, so `samples.len()` is the last input the grid needs. That puts
+/// the cap ahead of `check_finite_input` and `check_f16_representable` — two
+/// whole-buffer passes over 4.5 GB of samples at the clip below — as well as
+/// ahead of the extraction tensors and all three models.
+///
+/// Asserted through `checked_geometry` because `extract` cannot be: it needs
+/// three loaded `.mlmodelc`s, and even with them this clip is 3 371 argmax
+/// chunks at up to three model calls each. `checked_geometry` IS what `extract` calls, not a restatement
+/// of it — the sibling half of
+/// `extract::tests::the_frame_cap_refuses_before_the_allocation_it_bounds`,
+/// where the allocation this saves is measured.
+#[test]
+fn the_frame_cap_refuses_argmax_geometry_before_its_input_scans() {
+  /// The smallest clip whose derived output grid exceeds `MAX_OUTPUT_FRAMES`.
+  /// The same number as the other source's, because the two share one chunk
+  /// grid: argmax's pinned stride IS `DEFAULT_STEP_SAMPLES`.
+  const SMALLEST_OVER_CAP_SAMPLES: usize = 1_132_448_001;
+
+  let w = ArgmaxOptions::new().window();
+  assert_eq!(w.step_samples() as usize, ARGMAX_WINDOW_STRIDE_SAMPLES);
+
+  assert_eq!(
+    checked_geometry(SMALLEST_OVER_CAP_SAMPLES, &w),
+    Err(ExtractError::OutputFrameCountTooLarge(4_194_312)),
+    "19.66 h derives 4 194 312 output frames, eight past the cap"
+  );
+
+  // A boundary, not a blanket refusal: one sample fewer is one chunk fewer and
+  // is accepted, with the same two grids the assembly door will be handed.
+  let (num_chunks, chunks_sw, frames_sw) = checked_geometry(SMALLEST_OVER_CAP_SAMPLES - 1, &w)
+    .expect("one sample fewer derives a grid inside the cap");
+  assert_eq!(
+    (num_chunks, chunks_sw, frames_sw),
+    (
+      70_769,
+      crate::audio::speaker::window::chunk_sliding_window(&w),
+      crate::audio::speaker::window::frame_sliding_window()
+    )
+  );
+}
