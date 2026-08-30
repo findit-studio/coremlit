@@ -29,7 +29,7 @@
 
 use crate::embeddings::clap::{
   embedding::Embedding,
-  error::{Error, Result},
+  error::{Error, Result, WinditError},
   window::WindowEmbedding,
 };
 
@@ -118,7 +118,17 @@ pub fn aggregate<P>(policy: &P, windows: &[WindowEmbedding]) -> Result<Embedding
 where
   P: windit::aggregate::AggregatePolicy + ?Sized,
 {
-  windit::aggregate::aggregate(policy, windows).map_err(Error::from)
+  // This crate's ONE place that maps `WinditError::Empty` to
+  // `Error::EmptyWindows`: here, "the input was empty" and "the policy
+  // refuses" are genuinely the same event (windit's own `aggregate` returns
+  // `Empty` before ever invoking the policy for an empty `windows` slice), so
+  // the collapse is a fidelity-preserving rename, not a special case
+  // smuggled into the blanket `From<WinditError>` impl — see that impl's doc
+  // for why it must stay total.
+  windit::aggregate::aggregate(policy, windows).map_err(|e| match e {
+    WinditError::Empty => Error::EmptyWindows,
+    other => Error::Windowing(other),
+  })
 }
 
 /// The configuration [`AggregatePolicyKind::EmaRenormalized`] carries: the

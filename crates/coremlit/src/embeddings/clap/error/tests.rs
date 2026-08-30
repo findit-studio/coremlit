@@ -43,3 +43,21 @@ fn non_finite_variants_carry_index() {
       .contains('3')
   );
 }
+
+#[test]
+fn from_winditerror_is_total_and_does_not_special_case_empty() {
+  // The blanket `From<WinditError> for Error` must be a lossless, total wrap
+  // into `Error::Windowing` — no variant gets special-cased here. This is the
+  // conversion a downstream `SmoothPolicy`/`Smoother` caller takes on a plain
+  // `?` (both re-exported at `clap::{SmoothPolicy, Smoother}`), so a custom
+  // policy's `WinditError::Empty` on a NONEMPTY stream must surface as
+  // `Windowing(Empty)`, not the misleading `EmptyWindows` ("cannot aggregate
+  // zero window embeddings"). Only `aggregate()` may map `Empty ->
+  // EmptyWindows`, and only at its own call site, where an empty error and an
+  // empty input slice are actually the same event.
+  let e = Error::from(WinditError::Empty);
+  assert!(
+    matches!(e, Error::Windowing(WinditError::Empty)),
+    "the blanket From<WinditError> impl must not special-case Empty; got {e:?}"
+  );
+}

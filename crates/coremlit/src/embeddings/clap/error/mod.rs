@@ -143,8 +143,12 @@ pub enum Error {
   /// embeddings. Every policy needs at least one window to produce a direction;
   /// the caller should skip aggregation (or handle the empty clip) instead. This
   /// is the one windit error given its own clap variant:
-  /// [`From<WinditError>`](Error::from) maps [`WinditError::Empty`] here so the
-  /// pinned empty-aggregation taxonomy is stable across the windit port.
+  /// [`aggregate`](crate::embeddings::clap::aggregate::aggregate) maps
+  /// [`WinditError::Empty`] here itself, at its own call site, so the pinned
+  /// empty-aggregation taxonomy is stable across the windit port. The blanket
+  /// [`From<WinditError>`](Error::from) impl does NOT do this mapping — it is
+  /// total and never special-cases a variant — so nothing else that returns a
+  /// bare [`WinditError`] (a downstream `?` included) can produce this variant.
   #[error("cannot aggregate zero window embeddings")]
   EmptyWindows,
 
@@ -174,24 +178,31 @@ pub enum Error {
 }
 
 impl From<WinditError> for Error {
-  /// [`aggregate`](crate::embeddings::clap::aggregate::aggregate)'s outward
-  /// translation from windit into clap's taxonomy — not this crate's only one.
-  /// [`smooth`](crate::embeddings::clap::smooth::smooth) maps [`WinditError`] to
-  /// [`Error::Windowing`] directly instead of going through this impl:
-  /// collapsing [`WinditError::Empty`] onto [`Error::EmptyWindows`] is right
-  /// only where "the input was empty" and "the policy refuses" are the same
-  /// event, which holds for aggregation and not for smoothing, where an empty
-  /// input smooths to an empty *output* rather than a refusal.
+  /// A total, lossless wrap of any [`WinditError`] into [`Error::Windowing`] —
+  /// this impl makes NO special case for any variant, `Empty` included.
   ///
-  /// [`WinditError::Empty`] maps onto the pinned [`Error::EmptyWindows`] variant
-  /// (same meaning, kept so the empty-aggregation taxonomy is stable across the
-  /// port); every other windit error is wrapped losslessly in
-  /// [`Error::Windowing`].
+  /// It has to be total *because* it is reached by more than the call this
+  /// crate writes: [`SmoothPolicy`](crate::embeddings::clap::smooth::SmoothPolicy)
+  /// and [`Smoother`](crate::embeddings::clap::smooth::Smoother) are
+  /// re-exported with their windit method signatures intact (returning
+  /// [`WinditError`] directly), so a downstream caller's own
+  /// `policy.smooth(&windows)?` or `smoother.push(w)?` — in a function
+  /// returning this crate's [`Result`] — lifts through this same impl on a
+  /// plain `?`, no different from any in-crate call. A special case here (e.g.
+  /// collapsing [`WinditError::Empty`] onto [`Error::EmptyWindows`]) would
+  /// silently reinterpret every such caller's error under `aggregate`'s
+  /// taxonomy, including callers with nothing to do with aggregation — the
+  /// [`smooth`](crate::embeddings::clap::smooth::smooth) wrapper had exactly
+  /// this bug until its own call site stopped routing through this impl; going
+  /// through the public re-exports instead of that wrapper reached the same
+  /// special case regardless.
+  ///
+  /// [`aggregate`](crate::embeddings::clap::aggregate::aggregate) is the one
+  /// place [`WinditError::Empty`] and "nothing to combine" genuinely coincide,
+  /// so it maps `Empty` to [`Error::EmptyWindows`] itself, at its own call
+  /// site, instead of relying on this impl to do it.
   fn from(e: WinditError) -> Self {
-    match e {
-      WinditError::Empty => Error::EmptyWindows,
-      other => Error::Windowing(other),
-    }
+    Error::Windowing(e)
   }
 }
 
