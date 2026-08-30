@@ -1542,6 +1542,21 @@ impl ModelSource for ArgmaxSource {
   /// - [`ExtractError::OutputFrameCountOverflow`] if the derived
   ///   `num_output_frames` would not fit in `usize` (unreachable through this
   ///   geometry; kept typed, as in [`crate::audio::speaker::extract`]).
+  /// - Anything [`Extraction::try_from_parts`] raises. This method assembles
+  ///   through `Extraction::assemble_checked`, which runs that constructor's
+  ///   ENTIRE check sequence over the tensors this method just built — round
+  ///   8's class fix. The one that a real model can reach is
+  ///   [`ExtractError::NonBinarySegmentation`]: `write_segmentations` copies
+  ///   `f64::from(speaker_ids[..])` verbatim, [`ArgmaxSource::from_dir_with`]
+  ///   accepts any model carrying the pinned F16 I/O shapes, and the shipped
+  ///   graph's hard `{0.0, 1.0}` decode is a property of THAT graph — pinned by
+  ///   the model-gated `argmax_decoded_output_value_semantics`, which is a test
+  ///   and not a runtime guard. A segmenter that returned `0.1` per frame used
+  ///   to assemble an `Extraction` whose stored `count` was all zero (offline:
+  ///   silence) while the online route read every cell as active (a 9.94 s
+  ///   speaker); it is now refused here, naming the cell. Also newly reachable:
+  ///   [`ExtractError::OutputFrameCountTooLarge`] for a clip past
+  ///   [`crate::audio::speaker::extract::MAX_OUTPUT_FRAMES`] (19.6 hours).
   fn extract(&self, samples: &[f32]) -> Result<Extraction, ExtractError> {
     if samples.is_empty() {
       return Err(ExtractError::EmptySamples);
@@ -1637,32 +1652,27 @@ impl ModelSource for ArgmaxSource {
 
     // `count` over the POST-zeroing buffer, on dia's own grid — identical to
     // FluidAudioSource's (`crate::audio::speaker::extract`'s "Count runs after all zeroing").
+    //
+    // Through `assemble_checked`, which derives that `count` and then runs the
+    // SAME thirteen checks `Extraction::try_from_parts` runs. Round 8: this
+    // source used to assemble through the crate-private unchecked `from_parts`,
+    // which meant nothing at runtime held `speaker_ids` to the hard-binary
+    // domain — `write_segmentations` copies the decoded IDs verbatim, and
+    // `from_dir_with` accepts any model carrying the pinned F16 I/O shapes. A
+    // segmenter returning `0.1` per frame therefore produced an extraction
+    // whose stored `count` was all zero (offline: silence) while the online
+    // route read every cell as active. That check now runs HERE too.
     let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&w_opts);
     let frames_sw = crate::audio::speaker::window::frame_sliding_window();
-    let count = crate::audio::speaker::window::try_count_from_segmentations(
-      &segmentations,
+    Extraction::assemble_checked(
+      raw_embeddings,
+      segmentations,
       num_chunks,
       ARGMAX_FRAMES_PER_WINDOW,
-      SEG_NUM_SLOTS,
       w_opts.onset(),
       chunks_sw,
       frames_sw,
     )
-    .map_err(|e| match e {
-      crate::audio::speaker::window::WindowError::OutputFrameCountOverflow => {
-        ExtractError::OutputFrameCountOverflow
-      }
-    })?;
-
-    Ok(Extraction::from_parts(
-      raw_embeddings,
-      segmentations,
-      count,
-      num_chunks,
-      ARGMAX_FRAMES_PER_WINDOW,
-      chunks_sw,
-      frames_sw,
-    ))
   }
 }
 

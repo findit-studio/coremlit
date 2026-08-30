@@ -446,6 +446,59 @@ impl ChunkPlacementMismatch {
   }
 }
 
+/// The first output frame whose CENTER is not a strictly larger, finite time
+/// than its predecessor's.
+///
+/// Payload of [`ExtractError::CollapsedFrameCenter`]. Frame `t`'s center is
+/// `frames_sw.start + t * frames_sw.step + frames_sw.duration / 2` — the
+/// expression `diaric`'s span conversion evaluates for every span endpoint
+/// (`diarization/src/reconstruct/rttm.rs:216-217,231-232`), mirrored by
+/// [`crate::audio::speaker::window`]'s `frame_center`. A window whose three
+/// fields are each finite and positive can still collapse it: at
+/// `start = 1e9` the `f64` ULP is `1.19e-7`, so a `step` of `1e-8` adds
+/// nothing at all and consecutive frames share one center. The active run then
+/// closes at endpoints that are equal, and the backend returns `Ok` with a span
+/// of duration zero.
+///
+/// Carries the offending frame, its center, and the previous frame's center.
+/// For frame `0` — which has no predecessor and can only fail by being
+/// non-finite — `previous` is `f64::NEG_INFINITY`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CollapsedFrameCenter {
+  frame: usize,
+  center: f64,
+  previous: f64,
+}
+
+impl CollapsedFrameCenter {
+  /// Index of the first output frame whose center is not finite, or not
+  /// strictly greater than the previous frame's.
+  #[inline(always)]
+  pub const fn frame(&self) -> usize {
+    self.frame
+  }
+  /// That frame's center, in seconds.
+  #[inline(always)]
+  pub const fn center(&self) -> f64 {
+    self.center
+  }
+  /// The previous frame's center, in seconds — `f64::NEG_INFINITY` when
+  /// [`Self::frame`] is `0`.
+  #[inline(always)]
+  pub const fn previous(&self) -> f64 {
+    self.previous
+  }
+
+  /// Crate-private: only the validating constructor raises this.
+  pub(crate) const fn new(frame: usize, center: f64, previous: f64) -> Self {
+    Self {
+      frame,
+      center,
+      previous,
+    }
+  }
+}
+
 /// Top-level extraction failure, composing model-lifecycle and inference
 /// errors (spec §5) plus [`crate::audio::speaker::extract::Extractor::extract`]'s own
 /// input-validation and geometry guards.
@@ -634,14 +687,16 @@ pub enum ExtractError {
   /// The condition checked is the one that matters — the mappings AGREE, chunk
   /// by chunk. See [`ChunkPlacementMismatch`] for the payload.
   ///
-  /// Raised by BOTH construction paths, over the one shared
+  /// Raised by EVERY construction path, over the one shared
   /// `window::first_misaligned_chunk`:
   /// [`crate::audio::speaker::extract::Extraction::try_from_parts`] for parts a
-  /// caller assembled, and
-  /// [`crate::audio::speaker::extract::Extractor::extract`] for the grid its own
-  /// `step_samples` and clip length derive — the latter before it runs a model,
-  /// since a geometry this crate cannot diarize honestly is not worth inferring
-  /// over. Through `extract` it is reachable only for an ODD `step_samples`: the
+  /// caller assembled, and every in-crate
+  /// [`crate::audio::speaker::source::ModelSource`] for the grid its own
+  /// `step_samples` and clip length derive.
+  /// [`crate::audio::speaker::extract::Extractor::extract`] additionally runs it
+  /// BEFORE it touches a model, since a geometry this crate cannot diarize
+  /// honestly is not worth inferring over — a cost optimisation on top of the
+  /// shared sequence, not the guarantee. Through `extract` it is reachable only for an ODD `step_samples`: the
   /// aggregation's quotient is `c * step_samples / 270` exactly, so a rounding
   /// tie needs `c * step_samples` to be an odd multiple of `135`.
   /// [`crate::audio::speaker::window::DEFAULT_STEP_SAMPLES`] and argmax's fixed
@@ -655,6 +710,39 @@ pub enum ExtractError {
     .0.reconstructed()
   )]
   MisalignedChunkPlacement(ChunkPlacementMismatch),
+  /// The output-frame grid the geometry derives has two frames at the same
+  /// center time, or a center that is not finite.
+  ///
+  /// `frames_sw`'s three fields being finite and positive is NOT enough to make
+  /// the grid a usable timeline. Every span either backend emits is a pair of
+  /// frame CENTERS — `frames_sw.start + t * frames_sw.step +
+  /// frames_sw.duration / 2`, evaluated by `diaric`'s span conversion at
+  /// `diarization/src/reconstruct/rttm.rs:216-217,231-232` — and that sum
+  /// rounds. Where `frames_sw.step` is small against the ULP of
+  /// `frames_sw.start`, consecutive frames land on the identical `f64`:
+  /// `start = 1e9, step = 1e-8` puts frames 0 and 1 both at exactly `1e9`
+  /// (`1e9 + 1e-8 == 1e9`, the ULP there being `1.19e-7`). A one-frame active
+  /// run then closes at `start == end` and the backend returns `Ok` with a span
+  /// of DURATION ZERO — speech reported as an instant, which no consumer can
+  /// act on and no other check sees.
+  ///
+  /// Raised by
+  /// [`crate::audio::speaker::extract::Extraction::try_from_parts`] (whose
+  /// caller picks `frames_sw` outright) and by every in-crate
+  /// [`crate::audio::speaker::source::ModelSource`], which reach it through the
+  /// same shared check. Unreachable from either source in practice: both use
+  /// [`crate::audio::speaker::window::frame_sliding_window`]'s fixed
+  /// `(0.0, 0.0619375, 0.016875)` grid, whose centers stay strictly increasing
+  /// past [`crate::audio::speaker::extract::MAX_OUTPUT_FRAMES`].
+  #[error(
+    "extraction parts: output frame {}'s center ({:e}) must be finite and strictly later than \
+     the previous frame's ({:e}) — this frames_sw collapses adjacent frame centers, so a span \
+     closes at duration zero",
+    .0.frame(),
+    .0.center(),
+    .0.previous()
+  )]
+  CollapsedFrameCenter(CollapsedFrameCenter),
   /// `frames_sw.step()` is finite and strictly positive in `f64` but does not
   /// survive the narrowing to `f32` that
   /// [`crate::audio::speaker::extract::Extraction::diarize_online`] applies to
@@ -714,13 +802,20 @@ pub enum ExtractError {
   /// one span or two.
   ///
   /// Confining the input to `{0.0, 1.0}` is what removes the divergence, and it
-  /// costs no capability: BOTH in-crate producers already emit exactly that
-  /// domain. [`crate::audio::speaker::extract::Extractor::extract`] writes only
+  /// costs no capability that the SHIPPING models exercise.
+  /// [`crate::audio::speaker::extract::Extractor::extract`] writes only
   /// `crate::audio::speaker::segment::multilabel`'s powerset table (whose rows
-  /// are literal `0.0`/`1.0`) and zeroed columns;
-  /// [`crate::audio::speaker::source::ArgmaxSource`] writes only the graph's
-  /// `speaker_ids`, whose in-graph powerset decode is hard binary (pinned by its
-  /// model-gated `argmax_decoded_output_value_semantics`) and zeroed columns.
+  /// are literal `0.0`/`1.0`) and zeroed columns — a compile-time constant, so
+  /// for that source the domain is structural.
+  /// [`crate::audio::speaker::source::ArgmaxSource`] writes the graph's
+  /// `speaker_ids` VERBATIM, and there the hard-binary decode is a property of
+  /// the shipped graph (pinned by the model-gated
+  /// `argmax_decoded_output_value_semantics`) rather than of the code:
+  /// `ArgmaxSource::from_dir_with` accepts a model on its I/O SHAPES. Round 8:
+  /// that source therefore raises this variant itself, at its assembly door — a
+  /// segmenter returning `0.1` per frame used to produce an extraction whose
+  /// stored `count` was all zero (offline: silence) against 589 active frames
+  /// read by the online route.
   ///
   /// Non-finite cells are refused here too, as a by-product of the same
   /// equality — but they are NOT a split, and this variant does not claim to

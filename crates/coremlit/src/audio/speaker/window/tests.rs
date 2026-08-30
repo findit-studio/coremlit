@@ -956,3 +956,122 @@ fn the_two_chunk_mappings_agree_on_the_production_grid_and_split_on_the_finding_
     );
   }
 }
+
+// ---------------------------------------------------------------------
+// The forward frame→time mapping (round 8, finding 2)
+// ---------------------------------------------------------------------
+
+/// Reads back the `(start, duration)` `diaric` ACTUALLY emits for a span, by
+/// handing its public `discrete_to_spans` a one-cluster grid whose active run
+/// is `t_start..t_end`.
+///
+/// This is the oracle for [`frame_center`], which has to be a hand-written
+/// mirror: `try_discrete_to_spans` computes those times inline and takes a
+/// whole grid, so there is no way to ask `diaric` for one frame's center.
+///
+/// `start` and `duration` are the two values that conversion actually computes
+/// — `RttmSpan::new(k, s, e - s)` (`rttm.rs:255`) — so they pin both centers
+/// exactly: `start` IS `frame_center(t_start)` and `duration` IS
+/// `frame_center(t_end) - frame_center(t_start)`. `RttmSpan::end()` is NOT used
+/// here, deliberately: it re-derives `start + duration`, and that round trip is
+/// not the identity in binary floating point (on the `(-1.25, 0.1, 0.3)` grid
+/// below it lands 5 ULP below the center it came from) — the same
+/// re-association hazard `reconstruct_chunk_start_frame` exists for.
+fn diaric_span_start_and_duration(
+  t_start: usize,
+  t_end: usize,
+  num_frames: usize,
+  frames_sw: SlidingWindow,
+) -> (f64, f64) {
+  assert!(t_end < num_frames, "the run must CLOSE inside the grid");
+  let mut grid = vec![0.0f32; num_frames];
+  grid[t_start..t_end].fill(1.0);
+  let spans = diaric::reconstruct::discrete_to_spans(&grid, num_frames, 1, frames_sw.into(), 0.0);
+  assert_eq!(spans.len(), 1, "one contiguous run is one span");
+  (spans[0].start(), spans[0].duration())
+}
+
+#[test]
+fn frame_center_mirrors_diarics_own_span_conversion() {
+  // The mirror is only worth having if it cannot drift. `diaric` computes
+  // `center_offset = duration / 2.0` ONCE and then `start + t * step +
+  // center_offset`; the algebraically equal `start + (t * step + duration / 2)`
+  // is a different `f64`, and these grids are chosen so that difference shows.
+  let cases: [(usize, usize, usize, SlidingWindow); 5] = [
+    // Community-1 production timing.
+    (0, 1, 8, frame_sliding_window()),
+    (13, 37, 64, frame_sliding_window()),
+    // Unit grid, zero origin.
+    (0, 1, 4, SlidingWindow::new(0.0, 1.0, 1.0)),
+    // A non-zero origin, and a duration whose half is not exact in binary.
+    (2, 5, 8, SlidingWindow::new(-1.25, 0.1, 0.3)),
+    // A large origin against a small step: the regime finding 2 lives in, but
+    // one ULP clear of the collapse (step 1e-6 > ULP(1e9)/2 = 5.96e-8).
+    (1, 3, 6, SlidingWindow::new(1e9, 1e-6, 1e-6)),
+  ];
+  for (t_start, t_end, num_frames, frames_sw) in cases {
+    let (start, duration) = diaric_span_start_and_duration(t_start, t_end, num_frames, frames_sw);
+    let (lo, hi) = (
+      frame_center(t_start, frames_sw),
+      frame_center(t_end, frames_sw),
+    );
+    assert_eq!(
+      (lo, hi - lo),
+      (start, duration),
+      "mirror drifted from diaric's span conversion for frames_sw={frames_sw:?}"
+    );
+  }
+}
+
+#[test]
+fn first_collapsed_frame_center_finds_the_first_repeated_center() {
+  // The community-1 grid is a usable timeline over the whole admitted range.
+  assert_eq!(
+    first_collapsed_frame_center(
+      crate::audio::speaker::extract::MAX_OUTPUT_FRAMES,
+      frame_sliding_window()
+    ),
+    None,
+    "the only frame grid this crate's models produce must never collapse"
+  );
+
+  // Round 8, finding 2's window: at `start = 1e9` the f64 ULP is 1.19e-7, so a
+  // step of 1e-8 adds nothing and frame 1 lands on frame 0's center.
+  let collapsing = SlidingWindow::new(1e9, 1e-8, 1e-8);
+  assert_eq!(
+    f64::from_bits(1e9f64.to_bits() + 1) - 1e9,
+    1.1920928955078125e-7
+  );
+  assert_eq!(1e9f64 + 1e-8, 1e9);
+  let c = first_collapsed_frame_center(4, collapsing).expect("this grid collapses");
+  assert_eq!((c.frame(), c.center(), c.previous()), (1, 1e9, 1e9));
+
+  // A single frame cannot collapse — there is nothing to be equal to.
+  assert_eq!(first_collapsed_frame_center(1, collapsing), None);
+  assert_eq!(first_collapsed_frame_center(0, collapsing), None);
+
+  // Not just the first pair: `step` exactly half an ULP with an EVEN mantissa
+  // ties-to-even back onto the same value at t=1, separates at t=2, and ties
+  // again at t=3 — so a check that only compared frames 0 and 1 would miss the
+  // second collapse, and one that only tested the endpoints would miss both.
+  let half_ulp = SlidingWindow::new(0.0, 0.0, f64::EPSILON / 2.0).with_start(1.0);
+  let centers: Vec<f64> = (0..4).map(|t| frame_center(t, half_ulp)).collect();
+  assert_eq!(centers[0], centers[1], "ties-to-even keeps frame 1 at 1.0");
+  assert!(centers[2] > centers[1], "frame 2 does separate");
+  assert_eq!(
+    first_collapsed_frame_center(4, half_ulp).map(|c| c.frame()),
+    Some(1)
+  );
+  assert_eq!(
+    first_collapsed_frame_center(4, half_ulp.with_start(1.0 + f64::EPSILON)).map(|c| c.frame()),
+    Some(2),
+    "shifting the origin by one ULP moves WHICH pair collapses — the reason \
+     this is an adjacent-pair scan and not an endpoint test"
+  );
+
+  // A non-finite center is caught where it occurs, frame 0 included.
+  let overflowing = SlidingWindow::new(f64::MAX, f64::MAX, 1.0);
+  let c = first_collapsed_frame_center(2, overflowing).expect("start + duration/2 overflows");
+  assert_eq!((c.frame(), c.previous()), (0, f64::NEG_INFINITY));
+  assert!(!c.center().is_finite());
+}

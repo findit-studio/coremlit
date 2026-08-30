@@ -1620,3 +1620,216 @@ fn argmax_source_rejects_f16_overflow_samples() {
     }))
   );
 }
+
+// =====================================================================
+// Hermetic: the assembly door (round 8, finding 1)
+// =====================================================================
+
+/// A segmenter whose `speaker_ids` are not hard-binary splits the two backends,
+/// and this source's assembly door refuses it.
+///
+/// # What is substituted for the model, and why
+///
+/// The trigger is a SEGMENTER, and every segmenter this source can load is a
+/// `.mlmodelc` under `ARGMAX_TEST_MODELS` — none of which returns `0.1`, and
+/// none of which can be made to. So the three CoreML calls are replaced by the
+/// tensors a conforming model is free to return, and NOTHING else is: this test
+/// runs `window_plans`, `write_segmentations`, `build_speaker_masks`,
+/// `place_embeddings`, `try_count_from_segmentations` and the assembly door, in
+/// `ArgmaxSource::extract`'s own order, with its own arguments. The substituted
+/// decode satisfies every contract `extract` enforces around those calls:
+/// `read_f16_output` would have accepted it (the shapes are the pinned ones and
+/// every value is finite), and the value is written as an f16 round trip
+/// because that is the width the graph declares.
+///
+/// The claim the substitution rests on is narrow and stated in
+/// `ArgmaxSource::from_dir_with`'s own contract: a model is accepted on its I/O
+/// SHAPES and dtype. `{0.0, 1.0}` is a property of the shipped graph — pinned
+/// by the model-gated `argmax_decoded_output_value_semantics`, which is a test
+/// and not a runtime guard — so "the decode is hard-binary" is exactly the
+/// premise a loaded model gets to falsify.
+#[test]
+fn a_fractional_speaker_id_splits_the_backends_and_is_refused_at_assembly() {
+  use crate::audio::speaker::window::{
+    chunk_sliding_window, frame_sliding_window, try_count_from_segmentations,
+  };
+
+  // The f16 round trip the real read performs, so the cell this test plants is
+  // a value the graph could actually carry.
+  let soft = f32::from(f16::from_f32(0.1));
+
+  // `extract`'s own preamble, for a 10 s clip: one dia chunk, one bounded
+  // argmax window (w=0; w=1 needs 16_000 + 144_000 < 160_000, which is false).
+  let opts = WindowOptions::new();
+  let samples_len = ARGMAX_WINDOW_SAMPLES;
+  let num_chunks = chunk_starts(samples_len, &opts).len();
+  assert_eq!(num_chunks, 1, "10 s of audio is one dia chunk");
+
+  // The decode: slot 0 of window 0 reads `soft` on every one of its 589 frames,
+  // `speaker_activity` reports those 589 frames (so the `> 2 frames` gate
+  // passes), no overlap. Shapes and finiteness are exactly what `read_f16_output`
+  // requires.
+  let mut ids =
+    vec![0.0f32; ARGMAX_WINDOWS_PER_CHUNK * ARGMAX_FRAMES_PER_WINDOW * ARGMAX_NUM_SPEAKERS];
+  let mut activity = vec![0.0f32; ARGMAX_WINDOWS_PER_CHUNK * ARGMAX_NUM_SPEAKERS];
+  for f in 0..ARGMAX_FRAMES_PER_WINDOW {
+    ids[ids_index(0, f, 0)] = soft;
+  }
+  activity[0] = ARGMAX_FRAMES_PER_WINDOW as f32;
+  let overlapped = vec![0.0f32; ARGMAX_WINDOWS_PER_CHUNK * ARGMAX_FRAMES_PER_WINDOW];
+
+  let plans = window_plans(samples_len, &activity);
+  assert_eq!(
+    (plans[0].bounded, plans[0].active),
+    (true, [true, false, false]),
+    "the activity gate reads a frame COUNT, not a magnitude, so `soft` cells \
+     still make slot 0 active"
+  );
+  assert!(!plans[1].bounded, "only window 0 is inside a 10 s clip");
+
+  // `extract`'s per-chunk body, verbatim, with a usable embedding row where the
+  // embedder's output would be.
+  let (mut segmentations, mut raw_embeddings) = buffers(num_chunks);
+  write_segmentations(0, 0, &ids, &plans[0], &mut segmentations);
+  let masks = build_speaker_masks(&ids, &overlapped, &plans);
+  let mut embeddings = vec![0.0f32; ARGMAX_MASK_SLOTS * EMBEDDING_DIM];
+  embeddings[..64].fill(1.0);
+  let plda =
+    crate::audio::speaker::extract::shared_plda_transform().expect("hermetic PLDA weights");
+  place_embeddings(
+    0,
+    0,
+    &plans[0],
+    &masks,
+    &embeddings,
+    plda,
+    &mut ChunkTensors {
+      raw_embeddings: &mut raw_embeddings,
+      segmentations: &mut segmentations,
+    },
+  )
+  .expect("the row clears `raw_embedding_reaches_plda`, so the slot is kept");
+  assert_eq!(
+    segmentations[0],
+    f64::from(soft),
+    "`write_segmentations` copies the decoded id VERBATIM — the widening is \
+     exact, so the model's value is the Extraction's value"
+  );
+
+  let chunks_sw = chunk_sliding_window(&opts);
+  let frames_sw = frame_sliding_window();
+  let count = try_count_from_segmentations(
+    &segmentations,
+    num_chunks,
+    ARGMAX_FRAMES_PER_WINDOW,
+    SEG_NUM_SLOTS,
+    opts.onset(),
+    chunks_sw,
+    frames_sw,
+  )
+  .expect("this geometry's output-frame count fits usize");
+
+  // The SPLIT itself, proved against the two engines rather than described —
+  // independent of what the assembly door decides to do about it.
+  //
+  // `count` is aggregated at `seg >= onset`; with the default onset of 0.5 no
+  // `soft` cell clears it, so offline is handed a grid that says nobody speaks.
+  // The online route never reads that field: it derives its own count at
+  // `seg > 0.0`, which every one of the 589 cells clears.
+  assert_eq!(
+    count.iter().map(|&c| u32::from(c)).sum::<u32>(),
+    0,
+    "offline's count says silence"
+  );
+  assert_eq!(
+    segmentations
+      .iter()
+      .step_by(SEG_NUM_SLOTS)
+      .filter(|v| **v > 0.0)
+      .count(),
+    ARGMAX_FRAMES_PER_WINDOW,
+    "and the online activity predicate reads all 589 frames of the same buffer \
+     as speech"
+  );
+  let unchecked = Extraction::from_parts_unchecked(
+    raw_embeddings.clone(),
+    segmentations.clone(),
+    count,
+    num_chunks,
+    ARGMAX_FRAMES_PER_WINDOW,
+    chunks_sw,
+    frames_sw,
+  );
+  let p = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+  assert_eq!(
+    unchecked
+      .diarize_with(
+        &p,
+        crate::audio::speaker::cluster::ClusterBackend::default()
+      )
+      .expect("offline returns Ok")
+      .spans_slice()
+      .len(),
+    0,
+    "offline emits NOTHING for this extraction"
+  );
+  let online = unchecked
+    .diarize_online(crate::audio::speaker::OnlineOptions::new())
+    .expect("online returns Ok");
+  assert_eq!(
+    online
+      .spans_slice()
+      .iter()
+      .map(|s| (s.start(), s.end(), s.cluster()))
+      .collect::<Vec<_>>(),
+    vec![(0.03096875, 9.97034375, 0)],
+    "...while online emits a 9.94 s speaker from the identical Extraction"
+  );
+
+  // And the door this source now assembles through refuses it, naming the cell.
+  // This is what goes red if check 9 is reverted, or if this source is ever
+  // given a second, unchecked way back to `from_parts`.
+  let err = Extraction::assemble_checked(
+    raw_embeddings.clone(),
+    segmentations,
+    num_chunks,
+    ARGMAX_FRAMES_PER_WINDOW,
+    opts.onset(),
+    chunks_sw,
+    frames_sw,
+  )
+  .expect_err("a fractional decode must not assemble");
+  let ExtractError::NonBinarySegmentation(n) = err else {
+    panic!("expected NonBinarySegmentation, got {err:?}")
+  };
+  assert_eq!(
+    (n.index(), n.value(), n.slot()),
+    (0, f64::from(soft), 0),
+    "the FIRST offending cell: chunk 0, frame 0, slot 0"
+  );
+
+  // A domain confinement, not a blanket refusal: the hard-binary twin of the
+  // very same decode assembles, and emits the speaker BOTH engines agree on.
+  let mut hard_ids = ids;
+  for f in 0..ARGMAX_FRAMES_PER_WINDOW {
+    hard_ids[ids_index(0, f, 0)] = 1.0;
+  }
+  let (mut hard_segs, mut hard_rows) = buffers(num_chunks);
+  write_segmentations(0, 0, &hard_ids, &plans[0], &mut hard_segs);
+  hard_rows[..64].fill(1.0);
+  let e = Extraction::assemble_checked(
+    hard_rows,
+    hard_segs,
+    num_chunks,
+    ARGMAX_FRAMES_PER_WINDOW,
+    opts.onset(),
+    chunks_sw,
+    frames_sw,
+  )
+  .expect("the hard-binary twin assembles");
+  assert_eq!(
+    e.count().iter().map(|&c| u32::from(c)).sum::<u32>(),
+    ARGMAX_FRAMES_PER_WINDOW as u32,
+    "and now offline's count agrees with online's reading of the same buffer"
+  );
+}

@@ -959,10 +959,12 @@ pub(crate) fn reconstruct_chunk_start_frame(
 ///
 /// The ONE definition of that comparison, and the ONE gate on a grid this
 /// crate is willing to build an [`crate::audio::speaker::extract::Extraction`]
-/// on. Both construction paths call it —
-/// [`crate::audio::speaker::extract::Extractor::extract`] before it touches a
-/// model, and [`crate::audio::speaker::extract::Extraction::try_from_parts`] as
-/// its check 8 — because a grid the two mappings disagree about produces a
+/// on. EVERY construction path calls it, as check 8 of the shared
+/// `extract::check_assembled_parts` —
+/// [`crate::audio::speaker::extract::Extraction::try_from_parts`] and every
+/// in-crate [`crate::audio::speaker::source::ModelSource`];
+/// [`crate::audio::speaker::extract::Extractor::extract`] calls it once more
+/// before it touches a model — because a grid the two mappings disagree about produces a
 /// `count` written against activations that are not there, on BOTH backends and
 /// regardless of which `count` the caller supplies:
 /// [`crate::audio::speaker::extract::Extraction::diarize_online`] ignores the
@@ -1005,6 +1007,75 @@ pub(crate) fn first_misaligned_chunk(
       crate::audio::speaker::error::ChunkPlacementMismatch::new(c, aggregated, reconstructed)
     })
   })
+}
+
+/// The TIME output frame `t` sits at, in seconds — the value every span
+/// endpoint either backend emits is built from.
+///
+/// A MIRROR of `diaric`'s span conversion, in that source's own operation
+/// order: `try_discrete_to_spans` computes `center_offset = frame_duration /
+/// 2.0` once and then each endpoint as `frame_start + s as f64 * frame_step +
+/// center_offset` (`diarization/src/reconstruct/rttm.rs:172,216-217,231-232`),
+/// which associates as `(frame_start + t * frame_step) + center_offset`. That
+/// function is `pub` but takes a whole discrete grid, so there is no way to ask
+/// `diaric` for one frame's center; this is written out instead, deliberately
+/// as the SAME three roundings and not as an algebraically-equal rearrangement
+/// — `frame_start + (t * frame_step + center_offset)` is a different `f64`.
+///
+/// Distinct from [`reconstruct_chunk_start_frame`]'s inverse, which maps a TIME
+/// back to a frame index. This is the forward direction, and it is the one that
+/// decides whether two frames are distinguishable at all.
+#[inline]
+pub(crate) fn frame_center(t: usize, frames_sw: SlidingWindow) -> f64 {
+  let center_offset = frames_sw.duration() / 2.0; // rttm.rs:172
+  frames_sw.start() + t as f64 * frames_sw.step() + center_offset // rttm.rs:216-217
+}
+
+/// The first output frame in `0..num_output_frames` whose [`frame_center`] is
+/// not finite, or not strictly later than its predecessor's — or `None` when
+/// the whole sequence is a usable timeline.
+///
+/// The ONE definition of that scan, shared by
+/// [`crate::audio::speaker::extract::Extraction::try_from_parts`] and by every
+/// in-crate [`crate::audio::speaker::source::ModelSource`], for the same reason
+/// [`first_misaligned_chunk`] is shared: written out a second time it would be
+/// a second expression that is algebraically equal and numerically different.
+///
+/// # The class this catches
+///
+/// `frames_sw`'s fields being individually finite and positive says nothing
+/// about the grid they generate. `start + t * step + duration / 2` ROUNDS, and
+/// where `step` is small against the ULP of `start` the addition is a no-op:
+/// at `start = 1e9` the `f64` ULP is `1.1920928955078125e-7`, so `step = 1e-8`
+/// leaves `1e9 + 1e-8 == 1e9` and frames 0 and 1 share one center. `diaric`'s
+/// span conversion then closes a one-frame active run at `start == end` and
+/// returns `Ok` with a span of duration zero.
+///
+/// Adjacent pairs, not the endpoints, because a first pair that separates does
+/// not imply the rest do: `t as f64 * step` is exactly rounded and therefore
+/// monotone, but `round(x + s)` can still repeat a value under ties-to-even,
+/// and a binade crossing changes the ULP the step is competing with. `diaric`'s
+/// own finiteness argument (endpoints finite ⇒ all interior centers finite, by
+/// linearity, `rttm.rs:166-193`) does hold, and this scan subsumes it: a
+/// non-finite center fails `is_finite` where it occurs.
+///
+/// Reads only geometry. `O(num_output_frames)`, so callers must bound that
+/// count — [`crate::audio::speaker::extract::MAX_OUTPUT_FRAMES`] — first.
+pub(crate) fn first_collapsed_frame_center(
+  num_output_frames: usize,
+  frames_sw: SlidingWindow,
+) -> Option<crate::audio::speaker::error::CollapsedFrameCenter> {
+  let mut previous = f64::NEG_INFINITY;
+  for t in 0..num_output_frames {
+    let center = frame_center(t, frames_sw);
+    if !center.is_finite() || center <= previous {
+      return Some(crate::audio::speaker::error::CollapsedFrameCenter::new(
+        t, center, previous,
+      ));
+    }
+    previous = center;
+  }
+  None
 }
 
 /// Steps 2-4 of the pyannote frame-count aggregation

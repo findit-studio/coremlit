@@ -4249,11 +4249,343 @@ fn no_producer_can_emit_a_segmentation_cell_the_domain_check_refuses() {
   // `source::argmax::tests`, which is where a graph change would surface. The
   // widening itself is exact for those two values, in both f16→f32 (the read)
   // and f32→f64 (the write), which is the step this test can prove hermetically.
+  //
+  // Round 8: for THAT source this paragraph is no longer the guarantee, only
+  // the reason the guarantee never fires. `from_dir_with` accepts a model on
+  // its I/O SHAPES, so "the decode is hard-binary" is a property of the shipped
+  // graph and a model-gated test is not a runtime guard; the source now runs
+  // check 9 itself, at its assembly door
+  // (`a_fractional_speaker_id_splits_the_backends_and_is_refused_at_assembly`).
+  // `Extractor::extract`'s half above stays structural — `POWERSET_TABLE` is a
+  // compile-time constant, not a model output — and it runs the check too.
   for v in [0.0f32, 1.0] {
     let widened = f64::from(crate::f16::from_f32(v).to_f32());
     assert!(
       widened == 0.0 || widened == 1.0,
       "the f16 speaker_ids value {v} must widen to exactly {v}"
     );
+  }
+}
+
+/// The `frames_sw` sub-domain round 7's table missed: three finite, positive
+/// fields that still do not generate a timeline.
+///
+/// Round 8, finding 2. Check 2 asks whether `frames_sw`'s fields are usable
+/// NUMBERS; both backends additionally read them FORWARD, as the frame centers
+/// every span endpoint is built from. Those two readings have different
+/// sub-domains, and this geometry is inside the first and outside the second.
+fn collapsing_frame_grid_parts() -> ExtractionParts {
+  ExtractionParts {
+    raw_embeddings: one_usable_slot_row(0),
+    // One chunk, two frames; only frame 0 of slot 0 is active, so the run
+    // closes at frame 1 and the span is (center(0), center(1)).
+    segmentations: vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+    count: vec![1, 0, 0, 0],
+    num_chunks: 1,
+    num_frames_per_chunk: 2,
+    // duration + (num_chunks - 1) * step = 3e-8, over a frame step of 1e-8:
+    // four output frames, which is what `count` above declares.
+    chunks_sw: SlidingWindow::new(1e9, 3e-8, 1e-8),
+    frames_sw: SlidingWindow::new(1e9, 1e-8, 1e-8),
+  }
+}
+
+#[test]
+fn try_from_parts_rejects_a_frames_sw_that_collapses_adjacent_frame_centers() {
+  // The arithmetic, stated rather than described: at 1e9 the f64 ULP is
+  // 1.19e-7, an order of magnitude above the 1e-8 step, so the step adds
+  // literally nothing.
+  assert_eq!(
+    f64::from_bits(1e9f64.to_bits() + 1) - 1e9,
+    1.1920928955078125e-7
+  );
+  assert_eq!(1e9f64 + 1e-8, 1e9);
+
+  let parts = collapsing_frame_grid_parts();
+
+  // Every earlier check ACCEPTS these parts — the geometry is self-consistent,
+  // the windows are finite and positive, the grids agree about chunk 0, the
+  // segmentations are hard-binary, the row reaches PLDA, and `count` IS what
+  // those segmentations derive. Proved by the twin below, which differs only in
+  // the two ORIGINS and is accepted.
+  let separated = ExtractionParts {
+    chunks_sw: SlidingWindow::new(0.0, 3e-8, 1e-8),
+    frames_sw: SlidingWindow::new(0.0, 1e-8, 1e-8),
+    ..parts.clone()
+  };
+  let ok = Extraction::try_from_parts(separated).expect("the same grid at origin 0.0 is accepted");
+  assert_eq!(ok.num_output_frames(), 4);
+
+  // Assembled UNCHECKED, the span conversion closes the one-frame run at
+  // endpoints that are the identical f64, and offline returns `Ok` with a span
+  // of DURATION ZERO — speech reported as an instant. (Online returns `Ok` with
+  // no span at all: its `min_speech_duration` gate drops a slot whose single
+  // 1e-8 s frame cannot meet the default 1.0 s. Both answers are useless, and
+  // the constructor accepted the parts that produced them.)
+  let unchecked = Extraction::from_parts(
+    parts.raw_embeddings.clone(),
+    parts.segmentations.clone(),
+    parts.count.clone(),
+    parts.num_chunks,
+    parts.num_frames_per_chunk,
+    parts.chunks_sw,
+    parts.frames_sw,
+  );
+  let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+  let offline = unchecked
+    .diarize_with(&plda, ClusterBackend::default())
+    .expect("offline returns Ok");
+  assert_eq!(
+    offline
+      .spans_slice()
+      .iter()
+      .map(|s| (s.start(), s.duration()))
+      .collect::<Vec<_>>(),
+    vec![(1e9, 0.0)],
+    "the active run closes at identical endpoints: a zero-duration span"
+  );
+  assert_eq!(
+    unchecked
+      .diarize_online(OnlineOptions::new())
+      .expect("online returns Ok")
+      .spans_slice()
+      .len(),
+    0
+  );
+  // The SAME extraction on the separated grid emits a span with a real
+  // duration, so the zero is the grid's doing and not the fixture's.
+  assert_eq!(
+    ok.diarize_with(&plda, ClusterBackend::default())
+      .expect("offline returns Ok")
+      .spans_slice()
+      .iter()
+      .map(|s| (s.start(), s.duration()))
+      .collect::<Vec<_>>(),
+    vec![(5e-9, 1.0000000000000002e-8)],
+    "a real duration — the 2-ULP tail is the same rounding, now visible instead \
+     of annihilating"
+  );
+
+  // And the constructor refuses it, naming the first frame that repeats a
+  // center. This is what goes red if check 13 is reverted.
+  let err = refused(parts);
+  let ExtractError::CollapsedFrameCenter(c) = err else {
+    panic!("expected CollapsedFrameCenter, got {err:?}")
+  };
+  assert_eq!(
+    (c.frame(), c.center(), c.previous()),
+    (1, 1e9, 1e9),
+    "frame 1 lands on frame 0's center"
+  );
+}
+
+#[test]
+fn no_producer_can_emit_a_frame_grid_the_center_check_refuses() {
+  // The premise the fix rests on for the two in-crate sources, asserted rather
+  // than assumed: both take their `frames_sw` from
+  // `window::frame_sliding_window()`, whose three constants generate a strictly
+  // increasing center sequence over the WHOLE admitted range — so check 13
+  // requires no more of a caller than this crate requires of itself.
+  assert_eq!(
+    crate::audio::speaker::window::first_collapsed_frame_center(
+      MAX_OUTPUT_FRAMES,
+      crate::audio::speaker::window::frame_sliding_window()
+    ),
+    None
+  );
+  // The MARGIN, so a future frame grid that narrows it fails loudly here rather
+  // than at whatever grid size first collapses. At the last admitted center
+  // (70 778.89 s, i.e. 19.6 h) the f64 ULP is 1.46e-11, so the 0.016875 s step
+  // clears it by a factor of ~1.16e9.
+  let last = crate::audio::speaker::window::frame_center(
+    MAX_OUTPUT_FRAMES - 1,
+    crate::audio::speaker::window::frame_sliding_window(),
+  );
+  let ulp = f64::from_bits(last.to_bits() + 1) - last;
+  assert!(
+    crate::audio::speaker::window::FRAME_STEP_S / ulp > 1e9,
+    "step {} against ULP {ulp:e} at the last center {last}",
+    crate::audio::speaker::window::FRAME_STEP_S
+  );
+}
+
+/// The class fix, pinned: the door every in-crate producer assembles through
+/// reaches the SAME verdict as the public constructor, on every input.
+///
+/// Round 8's finding is that a check confined to one construction path is worse
+/// than none. `Extraction::from_parts` is now private to the `extract` module,
+/// so the only ways in are `try_from_parts` and `assemble_checked` — and this
+/// test is what says the second is not the weaker of the two. It is a
+/// PROPERTY test over the shape of the two doors, not a restatement of any one
+/// check: it would go red for a producer door that skipped a check, ran them in
+/// a different order, or mapped an error differently.
+#[test]
+fn assemble_checked_reaches_the_same_verdict_as_try_from_parts() {
+  let onset = WindowOptions::new().onset();
+  let good_row = one_usable_slot_row(0);
+  let unit = unit_sw();
+
+  // Each case is what a PRODUCER hands the door: a label, two tensors and a
+  // geometry. `count` is derived from them exactly as `assemble_checked`
+  // derives it, so the `ExtractionParts` built below is the same input in the
+  // other door's shape.
+  type DoorCase = (
+    &'static str,
+    Vec<f32>,
+    Vec<f64>,
+    usize,
+    usize,
+    SlidingWindow,
+    SlidingWindow,
+  );
+  let cases: [DoorCase; 7] = [
+    (
+      "accepted",
+      good_row.clone(),
+      vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+      1,
+      2,
+      unit,
+      unit,
+    ),
+    (
+      "check 9: a fractional cell",
+      good_row.clone(),
+      vec![0.5, 0.0, 0.0, 1.0, 0.0, 0.0],
+      1,
+      2,
+      unit,
+      unit,
+    ),
+    (
+      "check 10: an active slot with an all-zero row",
+      vec![0.0f32; SEG_NUM_SLOTS * EMBEDDING_DIM],
+      vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+      1,
+      2,
+      unit,
+      unit,
+    ),
+    (
+      "check 12: a non-finite row under an INACTIVE column",
+      {
+        let mut r = good_row.clone();
+        r[2 * EMBEDDING_DIM] = f32::NAN;
+        r
+      },
+      vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+      1,
+      2,
+      unit,
+      unit,
+    ),
+    (
+      "check 13: a frames_sw that collapses adjacent centers",
+      good_row.clone(),
+      vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      1,
+      2,
+      SlidingWindow::new(1e9, 3e-8, 1e-8),
+      SlidingWindow::new(1e9, 1e-8, 1e-8),
+    ),
+    (
+      "check 8: the two grids place chunk 1 differently",
+      {
+        let mut r = vec![0.0f32; 2 * SEG_NUM_SLOTS * EMBEDDING_DIM];
+        r[..64].fill(1.0);
+        r
+      },
+      vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      2,
+      1,
+      SlidingWindow::new(0.0, 0.04218750000000001, 0.04218750000000001),
+      crate::audio::speaker::window::frame_sliding_window(),
+    ),
+    (
+      "check 7: a frames_sw step that vanishes in f32",
+      good_row,
+      vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+      1,
+      2,
+      SlidingWindow::new(0.0, 1e-300, 1e-300),
+      SlidingWindow::new(0.0, 1.0, 1e-300),
+    ),
+  ];
+
+  // Each case must exercise a DIFFERENT check, or this is seven copies of one
+  // agreement. The expected variant is read off the case's own label.
+  let expected_variant = |name: &str| -> Option<&'static str> {
+    match name
+      .split(':')
+      .next()
+      .expect("split yields at least one part")
+    {
+      "accepted" => None,
+      "check 7" => Some("FrameStepNotRepresentableInF32"),
+      "check 8" => Some("MisalignedChunkPlacement"),
+      "check 9" => Some("NonBinarySegmentation"),
+      "check 10" => Some("ActiveSlotWithoutEmbedding"),
+      "check 12" => Some("NonFiniteRawEmbedding"),
+      "check 13" => Some("CollapsedFrameCenter"),
+      other => panic!("unmapped case label `{other}`"),
+    }
+  };
+
+  for (
+    name,
+    raw_embeddings,
+    segmentations,
+    num_chunks,
+    num_frames_per_chunk,
+    chunks_sw,
+    frames_sw,
+  ) in cases
+  {
+    let count = crate::audio::speaker::window::try_count_from_segmentations(
+      &segmentations,
+      num_chunks,
+      num_frames_per_chunk,
+      SEG_NUM_SLOTS,
+      onset,
+      chunks_sw,
+      frames_sw,
+    )
+    .expect("every case's geometry derives a count that fits usize");
+    let public = Extraction::try_from_parts(ExtractionParts {
+      raw_embeddings: raw_embeddings.clone(),
+      segmentations: segmentations.clone(),
+      count,
+      num_chunks,
+      num_frames_per_chunk,
+      chunks_sw,
+      frames_sw,
+    });
+    let producer = Extraction::assemble_checked(
+      raw_embeddings,
+      segmentations,
+      num_chunks,
+      num_frames_per_chunk,
+      onset,
+      chunks_sw,
+      frames_sw,
+    );
+    assert_eq!(
+      public.as_ref().err(),
+      producer.as_ref().err(),
+      "the two doors disagreed about `{name}`"
+    );
+    assert_eq!(
+      public.ok(),
+      producer.clone().ok(),
+      "the two doors assembled different Extractions for `{name}`"
+    );
+    match (expected_variant(name), producer) {
+      (None, Ok(_)) => {}
+      (Some(variant), Err(e)) => assert!(
+        format!("{e:?}").starts_with(variant),
+        "`{name}` must be refused by {variant}, got {e:?}"
+      ),
+      (expected, got) => panic!("`{name}`: expected {expected:?}, got {got:?}"),
+    }
   }
 }

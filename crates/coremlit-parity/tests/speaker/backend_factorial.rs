@@ -59,9 +59,10 @@
 //!
 //! The cells are assembled by this file, not by `Extractor::extract` — no
 //! public entry point runs a MIXED backend end to end (`Extraction::from_parts`
-//! is crate-private, and the public `Extraction::try_from_parts` takes an
-//! already-assembled tensor set, which is exactly what this file builds by
-//! hand). A hand-assembled pipeline is only worth as much as its agreement with
+//! is private to the `extract` module, reachable only through
+//! `Extraction::assemble_checked` or the public `Extraction::try_from_parts`,
+//! and the latter takes an already-assembled tensor set, which is exactly what
+//! this file builds by hand). A hand-assembled pipeline is only worth as much as its agreement with
 //! the real one:
 //!
 //! - the all-ONNX corner must reproduce dia-ort's pinned clip-09 speaker
