@@ -160,7 +160,7 @@ use coremlit::{
   ComputeUnits,
   audio::speaker::{
     embed::{EMBED_SLOTS, EMBEDDING_DIM, EmbedModel, EmbedModelOptions},
-    extract::{Options, PLDA_MIN_NORM},
+    extract::Options,
     segment::{
       POWERSET_CLASSES, SEG_CHUNK_SAMPLES, SEG_NUM_SLOTS, SegmentModel, SegmentModelOptions,
       multilabel,
@@ -556,8 +556,8 @@ struct Cell {
 /// calls made pluggable, and it must stay a faithful copy of it — the
 /// all-CoreML corner assertion in [`shipping_config_backend_factorial`] is what
 /// enforces that. Reproduced in order: the shipping [`multilabel`] decode, the
-/// overlap-exclusion mask rule, the Skip-slot column zeroing, and the
-/// [`PLDA_MIN_NORM`] drop (which also zeroes the slot's column).
+/// overlap-exclusion mask rule, the Skip-slot column zeroing, and the ROW
+/// PREDICATE drop (which also zeroes the slot's column).
 ///
 /// **The decode is speakerkit's on BOTH segmentation backends.** dia's own
 /// pipeline decodes `softmax`-then-argmax instead; the two agree over the reals
@@ -568,7 +568,13 @@ struct Cell {
 /// dia's logits, not a byte-for-byte rerun of dia's pipeline, which is why that
 /// corner is checked against dia-ort's pinned speaker count rather than
 /// asserted identical to it.
-fn assemble(seg: &SegRun, embed: &mut EmbedSide, samples: &[f32], starts: &[usize]) -> Cell {
+fn assemble(
+  seg: &SegRun,
+  embed: &mut EmbedSide,
+  samples: &[f32],
+  starts: &[usize],
+  plda: &diaric::plda::PldaTransform,
+) -> Cell {
   let num_frames = seg.num_frames;
   let num_chunks = starts.len();
   let mut segmentations = vec![0.0f64; num_chunks * num_frames * SEG_NUM_SLOTS];
@@ -595,13 +601,26 @@ fn assemble(seg: &SegRun, embed: &mut EmbedSide, samples: &[f32], starts: &[usiz
     let rows = embed.embed_chunk(&padded, &plans);
     for (s, row) in rows.iter().enumerate() {
       let Some(row) = row else { continue };
-      // dia's f64 norm pre-check (`owned.rs:619-630`): a degenerate embedding
-      // is dropped and its column zeroed rather than fed to PLDA. The floor is
-      // IMPORTED from `coremlit` — this cell must drop exactly the rows the
-      // crate's own producers drop, and a local `0.01` here would be a fourth
-      // copy that can drift out from under the comparison.
-      let norm_sq: f64 = row.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
-      if norm_sq.sqrt() < PLDA_MIN_NORM {
+      // dia's per-slot pre-check (`owned.rs:619-630`): a row neither backend
+      // can consume is dropped and its column zeroed rather than fed to PLDA.
+      //
+      // This cell's contract is that it drops EXACTLY the rows the crate's own
+      // producers drop, so the test is theirs, not a restatement of it.
+      // `coremlit`'s `raw_embedding_reaches_plda` is `pub(crate)` and out of
+      // reach from this integration test, so the three functions it composes
+      // are called directly, in its order — `Embedding::normalize_from` (the
+      // online engine's `f32`-narrowed norm and `1e-12` floor),
+      // `RawEmbedding::from_wespeaker` (PLDA's raw boundary: a finiteness scan
+      // and the `f64` `0.01` floor `PLDA_MIN_NORM` names), and
+      // `PldaTransform::project` (the centered-norm rejection the offline route
+      // runs immediately after that boundary). A local `norm_sq.sqrt() < 0.01`
+      // here was a fourth copy of the FIRST clause only: it carried neither the
+      // finiteness scan nor the `f32` narrowing nor the projection, so it could
+      // keep a row the producers drop and the contract was not provable.
+      let keeps = diaric::embed::Embedding::normalize_from(*row).is_some()
+        && diaric::plda::RawEmbedding::from_wespeaker(*row)
+          .is_ok_and(|raw| plda.project(&raw).is_ok());
+      if !keeps {
         zero_slot_column(&mut segmentations[lo..hi], num_frames, s);
       } else {
         let e = (c * SEG_NUM_SLOTS + s) * EMBEDDING_DIM;
@@ -914,7 +933,7 @@ fn shipping_config_backend_factorial() {
     for embed_arm in [EmbedArm::Onnx, EmbedArm::SHIPPING] {
       let embed_backend = embed_arm.backend();
       let mut embed = EmbedSide::load(embed_arm);
-      let cell = assemble(seg_run, &mut embed, &samples, &starts);
+      let cell = assemble(seg_run, &mut embed, &samples, &starts, &plda);
       assert_eq!(
         common::fnv1a_f32(&samples),
         audio_fnv,
@@ -1424,8 +1443,8 @@ struct EmbedAgreement {
   rows: usize,
   mean_cos: f64,
   min_cos: f64,
-  /// Rows non-zero on exactly one side: dia's [`PLDA_MIN_NORM`] pre-check
-  /// dropped the `(chunk, slot)` on one arm and kept it on the other. A cosine
+  /// Rows non-zero on exactly one side: the row predicate dropped the
+  /// `(chunk, slot)` on one arm and kept it on the other. A cosine
   /// is undefined against a zeroed row, so these are counted rather than
   /// folded in — and they are themselves a divergence, since a dropped slot
   /// also zeroes that slot's segmentation column.
@@ -1436,7 +1455,7 @@ struct EmbedAgreement {
 ///
 /// An all-zero row means the slot was never embedded: either the
 /// overlap-exclusion rule skipped it (identical across arms — the plans derive
-/// from the ONE fixed reference segmentation) or [`PLDA_MIN_NORM`] dropped it
+/// from the ONE fixed reference segmentation) or the row predicate dropped it
 /// (which CAN differ per arm). Rows zero on both sides carry no information.
 fn embed_agreement(arm: &[f32], reference: &[f32]) -> EmbedAgreement {
   assert_eq!(
@@ -1496,7 +1515,7 @@ fn embed_agreement(arm: &[f32], reference: &[f32]) -> EmbedAgreement {
 /// is worth reading against the verdict because the two disagree about which
 /// factor is "bigger". Measured on the same run as the pinned table, mean and
 /// minimum cosine against cell A over all 2 114 `(chunk, slot)` rows, with zero
-/// [`PLDA_MIN_NORM`] drop disagreements on any arm:
+/// row-predicate drop disagreements on any arm:
 ///
 /// ```text
 /// B  CoreML int8 / All        mean 0.985777 | min 0.042112
@@ -1605,7 +1624,7 @@ fn embedding_precision_x_placement() {
   for (i, arm) in PRECISION_PLACEMENT_ARMS.into_iter().enumerate() {
     let cell = char::from(b'A' + u8::try_from(i).expect("five arms"));
     let mut embed = EmbedSide::load(arm);
-    let assembled = assemble(&seg, &mut embed, &samples, &starts);
+    let assembled = assemble(&seg, &mut embed, &samples, &starts, &plda);
     assert_eq!(
       common::fnv1a_f32(&samples),
       audio_fnv,
@@ -1697,7 +1716,7 @@ fn embedding_precision_x_placement() {
   for a in arms.iter().filter(|a| a.arm != EmbedArm::Onnx) {
     let g = embed_agreement(&a.embeddings, reference_embeddings);
     println!(
-      "║   {} {:<24} mean cos {:.6} | min cos {:.6} | {} rows | {} PLDA_MIN_NORM drop \
+      "║   {} {:<24} mean cos {:.6} | min cos {:.6} | {} rows | {} row-predicate drop \
        disagreements",
       a.cell,
       a.arm.label(),
@@ -2497,7 +2516,7 @@ fn assert_mechanism_verdict(o: &MechanismObserved) {
   /// named in the panic messages.
   const NULL_COHERENCE: f64 = 0.022;
   /// Every arm pairs this many live `(chunk, slot)` rows against cell E —
-  /// the probe's full population, with zero `PLDA_MIN_NORM` drop
+  /// the probe's full population, with zero row-predicate drop
   /// disagreements.
   const MECHANISM_ROWS: usize = 2_114;
   /// Ceiling on bit-identical rows per arm (measured 4-9). A mostly-zero
@@ -2866,7 +2885,7 @@ fn quantization_error_structure() {
   for (i, arm) in PRECISION_PLACEMENT_ARMS.into_iter().enumerate() {
     let cell_tag = char::from(b'A' + u8::try_from(i).expect("five arms"));
     let mut embed = EmbedSide::load(arm);
-    let assembled = assemble(&seg, &mut embed, &samples, &starts);
+    let assembled = assemble(&seg, &mut embed, &samples, &starts, &plda);
     let out = cluster_full(&assembled, &window, &plda);
     println!(
       "║ ran {cell_tag}: {:<24} -> {}",

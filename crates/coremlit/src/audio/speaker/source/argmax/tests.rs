@@ -611,6 +611,14 @@ fn inactive_slot_segmentation_column_is_zero() {
   }
 }
 
+/// The one PLDA transform `place_embeddings`' row guard validates a row's
+/// PROJECTION against, resolved through the crate's own cached resolver so a
+/// test exercises the same transform `ArgmaxSource::extract` hands it.
+fn plda() -> &'static diaric::plda::PldaTransform {
+  crate::audio::speaker::extract::shared_plda_transform()
+    .expect("diaric's PLDA weights are compile-time embedded")
+}
+
 /// A synthetic `[64, 256]` embedder output whose row `r` is the constant
 /// `(r + 1) as f32` — so a mis-indexed row is unmistakable.
 fn synthetic_embeddings() -> Vec<f32> {
@@ -644,8 +652,11 @@ fn embeddings_unflatten_64_slots_to_21_chunks_by_3_slots() {
       plan,
       &masks,
       &embeddings,
-      &mut raw,
-      &mut segs,
+      plda(),
+      &mut ChunkTensors {
+        raw_embeddings: &mut raw,
+        segmentations: &mut segs,
+      },
     )
     .expect("finite synthetic embeddings");
   }
@@ -697,8 +708,11 @@ fn inactive_slot_embedding_row_stays_zero() {
       plan,
       &masks,
       &embeddings,
-      &mut raw,
-      &mut segs,
+      plda(),
+      &mut ChunkTensors {
+        raw_embeddings: &mut raw,
+        segmentations: &mut segs,
+      },
     )
     .unwrap();
   }
@@ -759,8 +773,11 @@ fn an_all_overlap_slot_falls_back_and_is_kept() {
       plan,
       &masks,
       &embeddings,
-      &mut raw,
-      &mut segs,
+      plda(),
+      &mut ChunkTensors {
+        raw_embeddings: &mut raw,
+        segmentations: &mut segs,
+      },
     )
     .unwrap();
   }
@@ -809,8 +826,11 @@ fn low_norm_embedding_drops_the_slot() {
       plan,
       &masks,
       &embeddings,
-      &mut raw,
-      &mut segs,
+      plda(),
+      &mut ChunkTensors {
+        raw_embeddings: &mut raw,
+        segmentations: &mut segs,
+      },
     )
     .unwrap();
   }
@@ -843,8 +863,11 @@ fn non_finite_consumed_embedding_row_errors() {
     &plans[0],
     &masks,
     &embeddings,
-    &mut raw,
-    &mut segs,
+    plda(),
+    &mut ChunkTensors {
+      raw_embeddings: &mut raw,
+      segmentations: &mut segs,
+    },
   );
   assert_eq!(
     got,
@@ -875,8 +898,11 @@ fn non_finite_discarded_embedding_row_is_ignored() {
     &plans[0],
     &masks,
     &embeddings,
-    &mut raw,
-    &mut segs,
+    plda(),
+    &mut ChunkTensors {
+      raw_embeddings: &mut raw,
+      segmentations: &mut segs,
+    },
   )
   .expect("a NaN in a discarded row must not fail the extraction");
   assert!(raw.iter().all(|v| v.is_finite()));

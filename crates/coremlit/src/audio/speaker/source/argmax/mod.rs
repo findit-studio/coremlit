@@ -1432,9 +1432,24 @@ fn write_segmentations(
   }
 }
 
-/// Places one bounded window's consumed embedding rows into `raw_embeddings`,
-/// dropping (row left zero + segmentation column zeroed) any slot that fails
-/// the PLDA-norm guard.
+/// The two [`Extraction`] tensors [`place_embeddings`] assembles, borrowed as
+/// one unit.
+///
+/// Keeping a row and zeroing its segmentation column are the two halves of ONE
+/// per-slot decision — a dropped `(chunk, slot)` must lose both, or the
+/// extraction carries a live column over a zero row (or the reverse), which is
+/// exactly the shape `Extraction::try_from_parts` refuses. Passing them
+/// together says that; passing two loose `&mut` slices did not.
+struct ChunkTensors<'a> {
+  /// `[c][s][d]` f32, pre-zeroed: a dropped slot's row is left untouched.
+  raw_embeddings: &'a mut [f32],
+  /// `[c][f][s]` f64 for the whole extraction.
+  segmentations: &'a mut [f64],
+}
+
+/// Places one bounded window's consumed embedding rows into `out`, dropping
+/// (row left zero + segmentation column zeroed) any slot whose row the shared
+/// row predicate refuses.
 ///
 /// `embeddings` is the embedder's flat `[64, 256]` output; the row for
 /// `(w, s)` is `w * 3 + s` (`Emb.swift:288,291`).
@@ -1456,8 +1471,7 @@ fn place_embeddings(
   masks: &[f16],
   embeddings: &[f32],
   plda: &diaric::plda::PldaTransform,
-  raw_embeddings: &mut [f32],
-  segmentations: &mut [f64],
+  out: &mut ChunkTensors<'_>,
 ) -> Result<(), InferError> {
   for (s, &is_active) in plan.active.iter().enumerate() {
     if !is_active {
@@ -1493,9 +1507,9 @@ fn place_embeddings(
     // both backends consume. Its finiteness clause cannot fire: the scan above
     // already returned `NonFiniteOutput` with the offending index.
     if raw_embedding_reaches_plda(plda, embedding) {
-      raw_embeddings[embedding_range(c, s)].copy_from_slice(embedding);
+      out.raw_embeddings[embedding_range(c, s)].copy_from_slice(embedding);
     } else {
-      zero_slot_column(&mut segmentations[chunk_segmentation_range(c)], s);
+      zero_slot_column(&mut out.segmentations[chunk_segmentation_range(c)], s);
     }
   }
   Ok(())
@@ -1565,7 +1579,11 @@ impl ModelSource for ArgmaxSource {
 
     // The transform `place_embeddings`' row guard validates the PROJECTION
     // against, resolved once before any inference: it is process-wide (see
-    // `extract::shared_plda_transform`) and building it costs ~0.2 ms.
+    // `extract::shared_plda_transform`) and building it costs ~0.15 ms.
+    // `place_embeddings` returns `InferError`, which has no variant for a
+    // missing transform, so resolving it HERE — where the return type is
+    // `ExtractError` — is what keeps the failure typed instead of collapsing
+    // it into the row guard's `bool`.
     let plda = crate::audio::speaker::extract::shared_plda_transform()?;
 
     for (k, &start) in argmax_chunk_starts(samples.len()).iter().enumerate() {
@@ -1609,8 +1627,10 @@ impl ModelSource for ArgmaxSource {
           &masks,
           &embeddings,
           plda,
-          &mut raw_embeddings,
-          &mut segmentations,
+          &mut ChunkTensors {
+            raw_embeddings: &mut raw_embeddings,
+            segmentations: &mut segmentations,
+          },
         )?;
       }
     }

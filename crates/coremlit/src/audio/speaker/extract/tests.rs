@@ -3070,17 +3070,27 @@ fn the_active_row_floor_is_the_one_both_in_crate_producers_drop_at() {
   // adding a fourth copy of it.
   assert_eq!(PLDA_MIN_NORM, 0.01);
 
+  let plda = shared_plda_transform().expect("diaric's PLDA weights are embedded");
+
   // Agreement with PLDA's own admission test, straddling the floor. Equality
   // over the whole sweep is the property: a floor that drifts in either
   // direction shows up as a row one side keeps and the other refuses.
+  //
+  // The predicate's third clause (`PldaTransform::project`) is inert across
+  // this band, and the equality itself is what proves it rather than a comment
+  // claiming so: a row `project` refused would make `mine` false where
+  // `from_wespeaker` says true, i.e. a disagreement. (The reason it is inert:
+  // a single-component row of magnitude ~0.01 sits ~1.42 from `mean1`,
+  // fourteen times PLDA's `0.1` centered floor.) So this sweep still isolates
+  // the RAW floor exactly as it did before the projection clause existed.
   let mut disagreements = 0;
   for micro in 9_000..11_000u32 {
     let v = f64::from(micro) / 1_000_000.0;
     let mut row = [0.0f32; EMBEDDING_DIM];
     row[0] = v as f32;
-    let mine = raw_embedding_reaches_plda(&row);
-    let plda = diaric::plda::RawEmbedding::from_wespeaker(row).is_ok();
-    if mine != plda {
+    let mine = raw_embedding_reaches_plda(plda, &row);
+    let admitted = diaric::plda::RawEmbedding::from_wespeaker(row).is_ok();
+    if mine != admitted {
       disagreements += 1;
     }
   }
@@ -3093,23 +3103,23 @@ fn the_active_row_floor_is_the_one_both_in_crate_producers_drop_at() {
   // the two is refused here while `normalize_from` still accepts it.
   let mut between = [0.0f32; EMBEDDING_DIM];
   between[0] = 0.005;
-  assert!(!raw_embedding_reaches_plda(&between));
+  assert!(!raw_embedding_reaches_plda(plda, &between));
   assert!(diaric::embed::Embedding::normalize_from(between).is_some());
 
   let mut above = [0.0f32; EMBEDDING_DIM];
   above[0] = 0.02;
-  assert!(raw_embedding_reaches_plda(&above));
+  assert!(raw_embedding_reaches_plda(plda, &above));
 
   // Non-finite is refused by the same predicate, matching `from_raw_array`'s
   // own leading finiteness scan — a `+inf` row has an INFINITE norm, which a
   // bare `norm >= floor` comparison would have admitted.
   let mut infinite = above;
   infinite[1] = f32::INFINITY;
-  assert!(!raw_embedding_reaches_plda(&infinite));
+  assert!(!raw_embedding_reaches_plda(plda, &infinite));
   assert!(diaric::plda::RawEmbedding::from_wespeaker(infinite).is_err());
   let mut nan = above;
   nan[1] = f32::NAN;
-  assert!(!raw_embedding_reaches_plda(&nan));
+  assert!(!raw_embedding_reaches_plda(plda, &nan));
   assert!(diaric::plda::RawEmbedding::from_wespeaker(nan).is_err());
 }
 
@@ -3260,14 +3270,28 @@ fn the_row_predicate_is_the_two_backend_functions_not_a_description_of_them() {
   push(f32::NAN, 0.0);
   push(2.07, f32::NAN);
   push(-2.07, 0.0);
+  // The round-6 corner: `mean1` cast to f32. Both ADMISSION functions take it
+  // (raw norm 1.42) and the PROJECTION that follows does not, so it is what
+  // makes the third clause below non-vacuous.
+  probes.push(diaric_mean1_as_f32());
+
+  let plda = shared_plda_transform().expect("diaric's PLDA weights are embedded");
+  // The three stages, called separately, to compare against the predicate that
+  // composes them. `projects` runs on the row's OWN `RawEmbedding`, so it is
+  // `false` for a row the raw boundary already refused.
+  let projects = |row: &[f32; EMBEDDING_DIM]| {
+    diaric::plda::RawEmbedding::from_wespeaker(*row).is_ok_and(|raw| plda.project(&raw).is_ok())
+  };
 
   for row in &probes {
     let online = diaric::embed::Embedding::normalize_from(*row).is_some();
     let offline = diaric::plda::RawEmbedding::from_wespeaker(*row).is_ok();
+    let projected = projects(row);
     assert_eq!(
-      raw_embedding_reaches_plda(row),
-      online && offline,
-      "row [{}, {}, 0, …] — online accepts {online}, offline accepts {offline}",
+      raw_embedding_reaches_plda(plda, row),
+      online && offline && projected,
+      "row [{}, {}, 0, …] — online accepts {online}, offline accepts {offline}, \
+       projection accepts {projected}",
       row[0],
       row[1]
     );
@@ -3290,12 +3314,27 @@ fn the_row_predicate_is_the_two_backend_functions_not_a_description_of_them() {
     }),
     "the probe set must contain a row ONLY the offline boundary accepts"
   );
+  assert!(
+    probes.iter().any(|r| {
+      diaric::embed::Embedding::normalize_from(*r).is_some()
+        && diaric::plda::RawEmbedding::from_wespeaker(*r).is_ok()
+        && !projects(r)
+    }),
+    "the probe set must contain a row BOTH admission functions accept and the \
+     PROJECTION refuses — otherwise the third clause is vacuous"
+  );
 
   // A wrong-length row is refused rather than panicked on. Unreachable in
   // crate — every call site slices exactly `EMBEDDING_DIM` — but the array
   // conversion is what makes it so, and this pins which way it fails.
-  assert!(!raw_embedding_reaches_plda(&[1.0f32; EMBEDDING_DIM - 1]));
-  assert!(!raw_embedding_reaches_plda(&[1.0f32; EMBEDDING_DIM + 1]));
+  assert!(!raw_embedding_reaches_plda(
+    plda,
+    &[1.0f32; EMBEDDING_DIM - 1]
+  ));
+  assert!(!raw_embedding_reaches_plda(
+    plda,
+    &[1.0f32; EMBEDDING_DIM + 1]
+  ));
 }
 
 #[test]
@@ -3330,6 +3369,58 @@ fn plda_min_norm_is_diarics_own_floor_measured_not_copied() {
   );
   // The two f32 neighbours really do straddle it, so the bracket is tight.
   assert_eq!(hi.to_bits() - lo.to_bits(), 1, "search did not converge");
+}
+
+// =====================================================================
+// The ONE transform the row predicate projects against — adversarial
+// review round 6.
+// =====================================================================
+
+#[test]
+fn plda_transform_is_available() {
+  // `shared_plda_transform`'s and `ExtractError::PldaTransformUnavailable`'s
+  // docs both claim `PldaTransform::new()` cannot fail today. Pin it: the
+  // constructor takes no arguments and decodes `include_bytes!`d blobs, so
+  // "cannot fail" is a property of the shipped dependency, and if a future
+  // `diaric` adds a fallible step this is where it surfaces rather than as
+  // every active slot suddenly being refused.
+  let mine = shared_plda_transform().expect("diaric's PLDA weights are compile-time embedded");
+
+  // Cached, not rebuilt: the same `&'static` every call. This is what makes
+  // resolving it once per `extract` / `try_from_parts` — rather than once per
+  // row — a choice about WHERE the ~0.15 ms is paid and not WHETHER.
+  assert!(
+    std::ptr::eq(
+      mine,
+      shared_plda_transform().expect("the cached transform is still there")
+    ),
+    "shared_plda_transform must hand out one process-wide transform"
+  );
+
+  // And it is the SAME transform a caller can hand `diarize_with`, which is
+  // the claim that makes validating against a cached one meaningful:
+  // `PldaTransform::new()` is diaric's only public constructor and takes no
+  // arguments, so a caller's transform cannot differ from this one. Proved
+  // through behaviour rather than asserted — `PldaTransform` is opaque.
+  let theirs = diaric::plda::PldaTransform::new().expect("a caller's own transform");
+  assert_eq!(
+    mine.phi(),
+    theirs.phi(),
+    "the eigenvalue diagonal must match"
+  );
+  let mut row = [0.0f32; EMBEDDING_DIM];
+  row[0] = 2.07; // in-distribution raw norm
+  row[1] = -0.5;
+  let raw = diaric::plda::RawEmbedding::from_wespeaker(row).expect("an in-distribution row");
+  assert_eq!(
+    mine
+      .project(&raw)
+      .expect("the cached transform projects it"),
+    theirs
+      .project(&raw)
+      .expect("the caller's transform projects it"),
+    "the cached transform must project exactly as a caller's own does"
+  );
 }
 
 // =====================================================================
@@ -3488,8 +3579,8 @@ fn diaric_mean1_as_f32() -> [f32; EMBEDDING_DIM] {
     .parent()
     .expect("a manifest path has a parent")
     .join("models/plda/mean1.bin");
-  let bytes = std::fs::read(&blob)
-    .unwrap_or_else(|e| panic!("diaric ships {}: {e}", blob.display()));
+  let bytes =
+    std::fs::read(&blob).unwrap_or_else(|e| panic!("diaric ships {}: {e}", blob.display()));
   assert_eq!(
     bytes.len(),
     EMBEDDING_DIM * 8,

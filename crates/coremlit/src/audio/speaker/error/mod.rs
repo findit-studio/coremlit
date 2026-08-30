@@ -711,8 +711,15 @@ pub enum ExtractError {
   /// quietly degrades when its own inputs are missing is the defect class this
   /// predicate exists to close.
   ///
-  /// Unit-shaped deliberately: `diaric::plda::Error` is not `Clone`, and the
-  /// cached [`std::sync::OnceLock`] cannot hand the same error out twice.
+  /// Unit-shaped because nothing else compiles: `diaric::plda::Error` derives
+  /// only `Debug` + `Error` (`diarization/src/plda/error.rs:21`), while this
+  /// enum derives `Clone` and `PartialEq`, so a newtype carrying it would break
+  /// both. The cache makes the same point from the other side — the transform
+  /// is built once behind a [`std::sync::OnceLock`], so a `diaric` error
+  /// produced there could be moved out at most once, while this refusal has to
+  /// be returnable on every later call. The REFUSAL therefore repeats; the
+  /// CAUSE does not survive the first build, and a caller that needs it can
+  /// call `diaric::plda::PldaTransform::new()` itself.
   #[error(
     "diaric's PLDA transform could not be built, so an active slot's raw \
      embedding cannot be validated against the projection the offline backend runs"

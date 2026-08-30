@@ -233,9 +233,10 @@ pub const PLDA_MIN_NORM: f64 = 0.01;
 /// hand [`Extraction::diarize_with`] is therefore this same transform, so
 /// validating against a cached one is validating against theirs.
 ///
-/// Cached in a [`OnceLock`] because building it is ~0.2 ms (blob decode plus
-/// nalgebra allocation) against ~9 µs for one `project` — three orders of
-/// magnitude, and it must not be paid per row or per call.
+/// Cached in a [`OnceLock`] because building it is ~0.15 ms (blob decode plus
+/// nalgebra allocation) against ~8.6 µs for one `project` — ~17 rows' worth of
+/// projection per build, measured `--release` on this host — so a per-row build
+/// would turn a 1 773-row extraction's 15 ms of validation into 270 ms.
 ///
 /// # Errors
 /// [`ExtractError::PldaTransformUnavailable`] if `PldaTransform::new()` fails.
@@ -246,8 +247,13 @@ pub const PLDA_MIN_NORM: f64 = 0.01;
 /// a failed load as "no row is usable", would make [`Extractor::extract`] drop
 /// every slot and return an empty diarization: exactly the silent degradation
 /// this predicate's whole history is about.
-pub(crate) fn shared_plda_transform()
--> Result<&'static diaric::plda::PldaTransform, ExtractError> {
+///
+/// A cached failure is still reported EVERY time: the `OnceLock` holds an
+/// `Option<PldaTransform>`, so a `None` yields a fresh
+/// [`ExtractError::PldaTransformUnavailable`] on this and every later call. What
+/// the cache cannot repeat is the CAUSE — see that variant's doc.
+pub(crate) fn shared_plda_transform() -> Result<&'static diaric::plda::PldaTransform, ExtractError>
+{
   static PLDA: OnceLock<Option<diaric::plda::PldaTransform>> = OnceLock::new();
   PLDA
     .get_or_init(|| diaric::plda::PldaTransform::new().ok())
@@ -337,10 +343,7 @@ pub(crate) fn shared_plda_transform()
 /// than panicked on. The array types also tie `coremlit`'s [`EMBEDDING_DIM`] to
 /// `diaric`'s `embed::EMBEDDING_DIM` and `plda::EMBEDDING_DIMENSION` at COMPILE
 /// time: if any of the three moves, this stops building.
-pub(crate) fn raw_embedding_reaches_plda(
-  plda: &diaric::plda::PldaTransform,
-  row: &[f32],
-) -> bool {
+pub(crate) fn raw_embedding_reaches_plda(plda: &diaric::plda::PldaTransform, row: &[f32]) -> bool {
   let Ok(row) = <[f32; EMBEDDING_DIM]>::try_from(row) else {
     return false;
   };
@@ -693,9 +696,10 @@ impl Extractor {
     }
 
     // The transform the per-slot row guard below validates against, resolved
-    // ONCE before any inference: it is process-wide (see
-    // `shared_plda_transform`), so a per-row build would repay ~0.2 ms for a
-    // constant.
+    // ONCE before any inference — and BEFORE it, so an unavailable transform
+    // refuses the call rather than surfacing after the first chunk's models
+    // have already run. It is process-wide (see `shared_plda_transform`), so a
+    // per-row build would repay ~0.15 ms for a constant.
     let plda = shared_plda_transform()?;
 
     let onset = f64::from(w.onset());
@@ -1434,8 +1438,8 @@ impl Extraction {
     // more of a caller than the crate requires of itself.
     //
     // The transform is resolved once, ahead of the loop: it is process-wide
-    // (see `shared_plda_transform`) and building it costs ~0.2 ms against
-    // ~9 µs per `project`.
+    // (see `shared_plda_transform`) and building it costs ~0.15 ms against
+    // ~8.6 µs per `project`.
     let plda = shared_plda_transform()?;
     for c in 0..num_chunks {
       for s in 0..SEG_NUM_SLOTS {
