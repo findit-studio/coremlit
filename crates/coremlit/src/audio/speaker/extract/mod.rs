@@ -868,8 +868,11 @@ impl Extractor {
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExtractionParts {
   /// Pre-PLDA WeSpeaker raw embeddings, flattened `[c][s][d]`. Must have length
-  /// `num_chunks * num_speakers * EMBEDDING_DIM`; dropped `(chunk, slot)` rows
-  /// are all-zero. See [`Extraction::raw_embeddings`].
+  /// `num_chunks * num_speakers * EMBEDDING_DIM`, and EVERY value must be finite
+  /// — including the rows of inactive slots, which the offline backend scans and
+  /// the online one never reads ([`Extraction::try_from_parts`]'s check 11).
+  /// Dropped `(chunk, slot)` rows are all-zero, which satisfies that. See
+  /// [`Extraction::raw_embeddings`].
   pub raw_embeddings: Vec<f32>,
   /// Per-`(chunk, frame, speaker)` activity, flattened `[c][f][s]`. Must have
   /// length `num_chunks * num_frames_per_chunk * num_speakers`. See
@@ -1035,6 +1038,20 @@ impl Extraction {
   ///     derives its own, so a `count` above the derived one fabricates
   ///     speakers offline and a `count` below it makes offline silent where
   ///     online speaks. See [`ExtractError::CountNotSegmentationDerived`].
+  /// 11. EVERY `raw_embeddings` value is finite — the whole buffer, not only
+  ///     the rows check 9 reaches. An INACTIVE slot's row has no active column
+  ///     to bring it to check 9, and the two backends read it in opposite ways:
+  ///     offline's `diaric::pipeline::assign_embeddings` scans the WHOLE matrix
+  ///     (train subset or not, active or not — stage 6 scores every row) and
+  ///     fails the extraction with `NonFiniteField::Embeddings`
+  ///     (`diarization/src/pipeline/algo.rs:443-455`), while
+  ///     [`Self::diarize_online`] skips the inactive column before it copies the
+  ///     row and returns `Ok`. Ordered after check 9 so an ACTIVE slot's
+  ///     non-finite row keeps that check's more specific `(chunk, slot)`
+  ///     diagnosis. Finiteness is the WHOLE of what that offline scan can find
+  ///     in an `f32` buffer: its companion refusal `ShapeError::RowNormOverflow`
+  ///     needs `Σ v²` to overflow `f64`, and `256 · f32::MAX² ≈ 3e79` cannot.
+  ///     See [`ExtractError::NonFiniteRawEmbedding`].
   ///
   /// Checks 1, 2 and 4 are the PANIC-preventing ones: `window`'s
   /// `try_aggregate_output_frame_count` asserts the first two with bare
@@ -1043,55 +1060,81 @@ impl Extraction {
   /// cause. Check 3 is what keeps every `[c][s][d]` / `[c][f][s]` index inside
   /// its buffer. Checks 5 and 7-10 are the CROSS-PART ones: each is a pair of
   /// parts that are individually well-formed and jointly describe something the
-  /// producing pipeline cannot have produced.
+  /// producing pipeline cannot have produced. Check 11 is neither: it holds ONE
+  /// part to a standard only ONE consumer enforces, which is the same failure —
+  /// the backends disagreeing about an identical `Extraction` — arrived at
+  /// without a second part being involved at all.
   ///
   /// # What is deliberately NOT checked
   ///
   /// - **`count[t] <= diaric::reconstruct::MAX_COUNT_PER_FRAME`.** Now IMPLIED
   ///   by check 10 and kept unchecked for that reason rather than by deferral:
-  ///   the derived count is an overlap-add average of per-`(chunk, frame)`
-  ///   active-slot counts, each at most `SEG_NUM_SLOTS` (3), and the average of
-  ///   values `<= 3` rounds to `<= 3` — comfortably under `diaric`'s 64.
-  ///   *Verified against both:* the OFFLINE route re-checks it anyway as a typed
-  ///   `ShapeError::CountAboveMax` (`diarization/src/offline/algo.rs:612-618`),
-  ///   and the ONLINE route never reads this `count` at all — it derives its own
-  ///   distinct-cluster count, likewise bounded by `SEG_NUM_SLOTS`, which
-  ///   `diaric::reconstruct` then re-checks against the same constant
-  ///   (`diarization/src/reconstruct/algo.rs:391-398`).
+  ///   check 10 makes `count` EQUAL the derived value, and that derivation is
+  ///   `round_ties_even(Σ_c active(c, f) / covering_chunks(t))` over
+  ///   per-`(chunk, frame)` active-slot counts each at most `SEG_NUM_SLOTS` (3)
+  ///   — an average of values `<= 3`, which rounds to `<= 3`, comfortably under
+  ///   `diaric`'s 64. *Verified against both:* the OFFLINE route re-checks it
+  ///   anyway as a typed `ShapeError::CountAboveMax`, ahead of every stage
+  ///   (`diarization/src/offline/algo.rs:612-617`); the ONLINE route never reads
+  ///   this `count` at all — it derives its own distinct-cluster count, likewise
+  ///   bounded by `SEG_NUM_SLOTS`, which `diaric::reconstruct` then re-checks
+  ///   against the same constant
+  ///   (`diarization/src/reconstruct/algo.rs:395-399`). Neither can consume an
+  ///   over-count silently, and neither is relied on: the bound holds by
+  ///   construction for both.
   /// - **Finiteness of `segmentations`.** An `O(n)` scan that would duplicate a
-  ///   typed refusal on BOTH routes. *Verified against both:* the ONLINE route
-  ///   reaches `diaric::reconstruct`, which rejects every non-finite
-  ///   segmentation before it can reach the aggregation
-  ///   (`diarization/src/reconstruct/algo.rs:497-500`); the OFFLINE route
-  ///   reaches that same `reconstruct` AND `diaric::pipeline::assign_embeddings`,
-  ///   which rejects them as `NonFiniteField::Segmentations`
-  ///   (`diarization/src/pipeline/algo.rs:456-460`). Neither can silently
-  ///   consume one. Note this is about a NaN reaching the clusterer: a NaN in an
-  ///   ACTIVE slot's column also weakens its own activity count here (`NaN >
-  ///   0.0` is false), which shifts the check-10 equality DOWN at that frame —
-  ///   the derived count and the caller's `count` are simply required to agree
-  ///   on whatever that scan sees.
-  /// - **Finiteness of a raw-embedding row belonging to an INACTIVE slot.**
-  ///   Check 9 covers every active slot; a row under an all-zero segmentation
-  ///   column is left to the backends. *Verified against both:* OFFLINE,
-  ///   `assign_embeddings` scans EVERY row — train subset or not — and rejects
-  ///   a non-finite value as `NonFiniteField::Embeddings` and an overflowing row
-  ///   norm as `ShapeError::RowNormOverflow`
-  ///   (`diarization/src/pipeline/algo.rs:443-455`), so the offline route always
-  ///   fails typed. ONLINE, [`Self::diarize_online`] never reads the row at all
-  ///   — an inactive column is skipped ahead of it — so the slot is simply
-  ///   unmatched, the same outcome as the all-zero row the crate's own dropped
-  ///   slots carry.
-  /// - **An INACTIVE slot carrying a usable embedding row** — the converse of
-  ///   check 9, and deliberately allowed. *Verified against both:* OFFLINE, such
-  ///   a slot cannot reach PLDA (`filter_embeddings` requires
-  ///   `clean_frames >= 0.2 * num_frames_per_chunk`, and an all-zero column sums
-  ///   to `0`, `diarization/src/offline/algo.rs:645-679`). ONLINE,
-  ///   [`Self::diarize_online`] skips it on the SAME activity test before the
-  ///   row reaches the clusterer.
+  ///   typed refusal BOTH routes reach through the SAME function. *Verified
+  ///   against both:* every path ends in `diaric::reconstruct`, which scans the
+  ///   whole tensor and raises `NonFiniteField::Segmentations`
+  ///   (`diarization/src/reconstruct/algo.rs:504-508`) — ONLINE hands it
+  ///   `self.segmentations` directly, OFFLINE hands it the same slice at its
+  ///   stage 5 (`diarization/src/offline/algo.rs:808`). OFFLINE additionally
+  ///   meets `diaric::pipeline::assign_embeddings`' own copy of that scan first
+  ///   (`diarization/src/pipeline/algo.rs:456-460`), so the two refuse with
+  ///   different typed variants — `Pipeline(NonFinite(Segmentations))` offline,
+  ///   `Reconstruct(NonFinite(Segmentations))` online — and neither returns
+  ///   `Ok`. This is precisely what check 11's `raw_embeddings` case was NOT:
+  ///   there the offline scan had no online counterpart, here it is
+  ///   belt-and-braces over a refusal both share.
   ///
-  ///   That online skip is load-bearing, and its absence was a live defect
-  ///   (round 6). An earlier revision argued this shape safe because the row
+  ///   The two also agree on the way to that refusal. `NaN > 0.0` is false, so a
+  ///   NaN entry is INACTIVE to every activity predicate in play — this
+  ///   constructor's check-9 scan and check-10 derivation, `diarize_online`'s
+  ///   own activity count, and dia's `filter_embeddings` — so it cannot make one
+  ///   engine see speech the other does not. It only shifts the check-10
+  ///   equality DOWN at that frame: the derived count and the caller's `count`
+  ///   are required to agree on whatever that scan sees.
+  /// - **An INACTIVE slot carrying a usable embedding row** — the converse of
+  ///   check 9, and deliberately allowed. *Verified against both:* ONLINE,
+  ///   [`Self::diarize_online`] skips the slot on the SAME `seg > 0.0` activity
+  ///   test before the row is copied, so the row is not read at all. OFFLINE is
+  ///   the half an earlier revision under-stated: it DOES read the row, in three
+  ///   places, and is output-blind at every one.
+  ///
+  ///   1. `filter_embeddings` never routes the slot into the PLDA TRAIN subset —
+  ///      that needs `clean_frames >= 0.2 * num_frames_per_chunk` over
+  ///      singly-active frames, and an all-zero column sums to `0`
+  ///      (`diarization/src/offline/algo.rs:645-679`). This is where the earlier
+  ///      reasoning stopped, and on its own it is not enough.
+  ///   2. Stage 6 cosine-scores EVERY row against every centroid, this one
+  ///      included (`diarization/src/pipeline/algo.rs:636-684`) — but stage 7
+  ///      then OVERWRITES the whole soft row of any `(chunk, slot)` whose
+  ///      segmentations sum to `0` with `soft.min() - 1.0`
+  ///      (`diarization/src/pipeline/algo.rs:685-712`), so the row's own scores
+  ///      never survive into the assignment.
+  ///   3. What survives is that those pre-mask scores took part in the
+  ///      `soft.min()` that constant is built from, so the row CAN move it. It
+  ///      cannot move the ANSWER: the constant lands on every inactive row at
+  ///      once and on every column of each, and a linear assignment problem is
+  ///      invariant under a per-row constant shift. Whatever label an inactive
+  ///      slot then draws, its activation is `0` at every frame, so
+  ///      `diaric::reconstruct` writes nothing for it.
+  ///
+  ///   `an_inactive_slots_row_cannot_change_the_offline_result` pins 2 and 3 on
+  ///   a three-cluster geometry whose inactive slots DO draw labels.
+  ///
+  ///   Back to ONLINE: that skip is load-bearing, and its absence was a live
+  ///   defect (round 6). An earlier revision argued this shape safe because the row
   ///   would be assigned "with a speech duration of `0`, dropped by any
   ///   `min_speech_duration > 0`". That reasoning covers whether the row
   ///   produces a SPAN; it does not cover whether it perturbs STATE first.
@@ -1114,10 +1157,13 @@ impl Extraction {
   ///   identically by both mappings, but a chunk whose declared `duration`
   ///   spans fewer frame-steps than `num_frames_per_chunk` still derives a grid
   ///   shorter than the chunk it must hold. *Verified against both:* both routes
-  ///   run the same `diaric::reconstruct`, which raises the typed
-  ///   `ShapeError::OutputFrameCountTooSmall`
-  ///   (`diarization/src/reconstruct/algo.rs:467-494`) before allocating
-  ///   anything. Re-deriving it here would duplicate `closest_frame`'s float
+  ///   end in the same `diaric::reconstruct`, which raises the typed
+  ///   `ShapeError::OutputFrameCountTooSmall` before allocating the grid
+  ///   (`diarization/src/reconstruct/algo.rs:465-495`). They differ in the WORK
+  ///   that precedes it, not in the outcome: ONLINE reaches that call directly,
+  ///   OFFLINE only at its stage 5, after AHC and VBx have already run
+  ///   (`diarization/src/offline/algo.rs:808`). Neither can return `Ok`.
+  ///   Re-deriving the bound here would duplicate `closest_frame`'s float
   ///   arithmetic in a second place, which is how the two grids drift apart.
   /// - **That the parts came from the SAME track.** Every check here compares
   ///   parts to each OTHER, and no comparison carries provenance: parts that are
@@ -1137,12 +1183,17 @@ impl Extraction {
   ///   (`diarization/src/offline/algo.rs:645-679`). Check 9 therefore holds a
   ///   row to what offline WOULD do with it, not to whether this particular
   ///   geometry routes it there, and is in that direction stricter than
-  ///   offline. *Deliberate:* the alternative is a constructor whose row
-  ///   standard changes with the segmentations, so the same row is accepted in
-  ///   one extraction and refused in another — and the corner it would buy is
-  ///   a row `diaric` calibrated out of existence anyway (the `0.1` sits ~13x
-  ///   below the smallest centered norm in its captured distribution,
-  ///   `diarization/src/plda/transform.rs:273-315`).
+  ///   offline. *Verified against both:* ONLINE has no selection to model —
+  ///   [`Self::diarize_online`] runs its row chain on EVERY active slot — so
+  ///   check 9 examines exactly the rows online examines, and a superset of the
+  ///   rows offline trains on. The asymmetry runs the safe way: a check that
+  ///   examined FEWER rows than a backend reads is the failure mode, and it is
+  ///   the one check 11 just closed. *Deliberate:* the alternative is a
+  ///   constructor whose row standard changes with the segmentations, so the
+  ///   same row is accepted in one extraction and refused in another — and the
+  ///   corner it would buy is a row `diaric` calibrated out of existence anyway
+  ///   (the `0.1` sits ~13x below the smallest centered norm in its captured
+  ///   distribution, `diarization/src/plda/transform.rs:273-315`).
   ///
   ///   An earlier revision left the projection out ENTIRELY, on the grounds
   ///   that it needs a [`diaric::plda::PldaTransform`] this constructor is not
@@ -1153,16 +1204,26 @@ impl Extraction {
   ///   is a witness built from those same shipped bytes
   ///   (`try_from_parts_rejects_an_active_row_plda_projection_refuses`).
   /// - **That both backends agree an active slot deserves a SPEAKER.** Check 9
-  ///   is about the row; both engines COUNT activity with the same `seg > 0.0`
-  ///   rule, then gate on that count with two unrelated ones. ONLINE drops a
-  ///   slot whose
-  ///   `active_frames x frames_sw.step` is under `OnlineOptions`'
-  ///   `min_speech_duration` (default `1.0` s); OFFLINE excludes it from the
-  ///   PLDA train subset unless `Σ seg` over singly-active frames reaches
-  ///   `0.2 * num_frames_per_chunk` (`diarization/src/offline/algo.rs:645-679`).
-  ///   On the shipping grid those are `60` frames and `117.8` frames, so a slot
-  ///   active in `50` of `589` (`0.84` s) yields ONE offline span and NONE
-  ///   online for the identical `Extraction`. *Not checkable here:* the online
+  ///   is about the ROW; whether a slot with an acceptable row becomes a speaker
+  ///   is settled later, and NOT by two symmetric duration gates — an earlier
+  ///   revision described it that way and was wrong on both halves.
+  ///   *Verified against both:* OFFLINE has no speech-duration gate on the span
+  ///   path at all. Its `0.2 * num_frames_per_chunk` ratio selects the PLDA
+  ///   TRAIN subset only (`diarization/src/offline/algo.rs:645-679`); a slot
+  ///   that FAILS it is still cosine-scored at stage 6, still assigned a cluster
+  ///   by `constrained_argmax` at stage 7 (whose mask is `Σ seg == 0`, which it
+  ///   is not), and still contributes its frames to `diaric::reconstruct`'s grid
+  ///   — so it emits a span. ONLINE does gate on duration, but in ONE arm only:
+  ///   `OnlineClusterer::assign` matches the nearest centroid FIRST and returns
+  ///   `Existing` whenever that match is inside `speaker_threshold`, reading
+  ///   `min_speech_duration` only when nothing matched
+  ///   (`diarization/src/cluster/online/algo.rs:274-304`) — the same structure
+  ///   round 6's finding 1 turned on. So a short slot is dropped online exactly
+  ///   when it would also be a NEW speaker. That is still a real split: on the
+  ///   shipping grid the default `min_speech_duration` of `1.0` s is `60` frames
+  ///   of `589`, so the first slot of a speaker who talks for `50` of them
+  ///   (`0.84` s) yields ONE offline span and NONE online for the identical
+  ///   `Extraction`. *Not checkable here:* the online
   ///   gate is a function of `OnlineOptions`, supplied at
   ///   [`Self::diarize_online`] and not at construction, so any threshold this
   ///   constructor assumed would be wrong for some caller — and the input is
@@ -1187,6 +1248,7 @@ impl Extraction {
   /// - [`ExtractError::PldaTransformUnavailable`] — check 9's transform could
   ///   not be built, so the row standard cannot be applied at all.
   /// - [`ExtractError::CountNotSegmentationDerived`] — check 10.
+  /// - [`ExtractError::NonFiniteRawEmbedding`] — check 11.
   ///
   /// # Examples
   /// ```
@@ -1476,8 +1538,11 @@ impl Extraction {
     // `0.0`/`1.0` multilabel, and on those values `>= onset` and `> 0.0` select
     // the same slots for every `onset` in `(0.0, 1.0]` (`check_onset`'s range).
     //
-    // Ordered last: it is the only check that allocates, and every input that
-    // reaches it has already been bounded by check 6.
+    // The only check that ALLOCATES, so it is ordered behind every check that
+    // bounds what it would allocate — `chunk_frames` past check 3 and the
+    // derived grid past check 6. Check 11 follows it only because that one is
+    // allocation-free and deliberately yields to check 9's diagnosis; nothing
+    // below this point can make this aggregation cheaper.
     let mut chunk_count = vec![0.0f64; chunk_frames];
     for (cf, slot) in chunk_count.iter_mut().enumerate() {
       let base = cf * SEG_NUM_SLOTS;
@@ -1513,6 +1578,41 @@ impl Extraction {
           crate::audio::speaker::error::CountNotSegmentationDerived::new(t, got, expected),
         ));
       }
+    }
+
+    // ── 11. EVERY raw_embeddings value is finite, active or not ───────
+    // Check 9 stops at the rows of ACTIVE slots, and that is exactly one
+    // buffer position short of the split it exists to prevent. Under an
+    // all-zero segmentation column the two backends read the same row
+    // differently: dia's `assign_embeddings` scans the WHOLE matrix — train
+    // subset or not, active or not, because its stage-6 cosine scoring reads
+    // every row — and fails the offline extraction with
+    // `NonFiniteField::Embeddings` (`diarization/src/pipeline/algo.rs:443-455`),
+    // while `diarize_online` skips an inactive column before it ever copies the
+    // row and returns `Ok`. Fatal to one engine, invisible to the other, for
+    // the identical `Extraction`.
+    //
+    // The WHOLE buffer, not a per-inactive-row loop: the property is "no value
+    // in this tensor is non-finite", which is what offline's scan asserts, and
+    // stating it over the buffer cannot drift from the `[c][s][d]` indexing the
+    // way a hand-rolled row walk can.
+    //
+    // Ordered AFTER check 9 on purpose, and it costs nothing to do so. Ahead of
+    // it, this blanket scan would swallow every ACTIVE slot's non-finite row —
+    // the round-1 falsifier's NaN included — and report a bare buffer offset
+    // where `ActiveSlotWithoutEmbedding` names the `(chunk, slot)` whose column
+    // claims speech, the more specific diagnosis and the more actionable one.
+    // The scan is ~1% of check 9 on a realistic extraction (10 minutes of audio
+    // is 1 773 rows: ~0.17 ms to scan the 1.73 MiB buffer against ~16.4 ms for
+    // the row chain, release, this host), so the ordering buys that diagnosis
+    // for no measurable cost.
+    //
+    // Refuses nothing either in-crate producer emits. Both pre-zero this buffer
+    // and `0.0` is finite, so an unwritten row passes; a written row passed
+    // `raw_embedding_reaches_plda`, whose `from_wespeaker` clause has its own
+    // finiteness scan (`no_producer_can_emit_a_buffer_the_finiteness_check_refuses`).
+    if let Some(i) = raw_embeddings.iter().position(|v| !v.is_finite()) {
+      return Err(ExtractError::NonFiniteRawEmbedding(i));
     }
 
     Ok(Self::from_parts(

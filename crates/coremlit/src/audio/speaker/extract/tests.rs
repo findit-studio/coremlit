@@ -3672,3 +3672,308 @@ fn try_from_parts_rejects_an_active_row_plda_projection_refuses() {
     "expected ActiveSlotWithoutEmbedding(0, 0), got {err:?}"
   );
 }
+
+// =====================================================================
+// Every raw_embeddings value must be finite, including under an
+// INACTIVE column — the residual round 6 named and left open.
+// =====================================================================
+
+/// One unit chunk of one frame: slot 0 ACTIVE with a usable row, slots 1 and 2
+/// INACTIVE with all-zero columns — the shape both in-crate producers write into
+/// a dropped slot. `poison` places one value at `(slot, dimension)`.
+fn one_chunk_with_poisoned_slot(slot: usize, dimension: usize, value: f32) -> ExtractionParts {
+  let mut raw_embeddings = one_usable_slot_row(0);
+  raw_embeddings[embedding_range(0, slot)][dimension] = value;
+  ExtractionParts {
+    raw_embeddings,
+    // [f][s], one frame: only slot 0 is active.
+    segmentations: vec![1.0, 0.0, 0.0],
+    count: vec![1, 0],
+    num_chunks: 1,
+    num_frames_per_chunk: 1,
+    chunks_sw: unit_sw(),
+    frames_sw: unit_sw(),
+  }
+}
+
+#[test]
+fn try_from_parts_rejects_a_non_finite_row_under_an_inactive_column() {
+  // The gap round 6 enumerated and left open. Check 9 tests the row of every
+  // ACTIVE slot; an INACTIVE slot has no active column to bring its row there,
+  // so a NaN one buffer position away was accepted — and the two backends then
+  // read it in opposite directions:
+  //
+  //   OFFLINE: `assign_embeddings` scans the WHOLE embedding matrix — train
+  //   subset or not, active or not, because stage 6 cosine-scores every row —
+  //   and fails the extraction with `NonFiniteField::Embeddings`.
+  //   ONLINE: `diarize_online` skips an inactive column before it copies the
+  //   row, so the value is never read and the call returns `Ok`.
+  //
+  // Fatal to one engine, invisible to the other, for the identical
+  // `Extraction` — exactly the class this constructor exists to refuse.
+  let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+
+  for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+    let parts = one_chunk_with_poisoned_slot(2, 0, bad);
+
+    // The split, proved against the engines themselves rather than described.
+    // Assembled through the crate-private `from_parts`, which is what the
+    // constructor guards against.
+    let unchecked = Extraction::from_parts(
+      parts.raw_embeddings.clone(),
+      parts.segmentations.clone(),
+      parts.count.clone(),
+      parts.num_chunks,
+      parts.num_frames_per_chunk,
+      parts.chunks_sw,
+      parts.frames_sw,
+    );
+    assert!(
+      matches!(
+        unchecked.diarize_with(&plda, ClusterBackend::default()),
+        Err(diaric::offline::Error::Pipeline(
+          diaric::pipeline::Error::NonFinite(diaric::pipeline::error::NonFiniteField::Embeddings)
+        ))
+      ),
+      "offline must fail the whole extraction on {bad:?} in an inactive slot's row, got {:?}",
+      unchecked.diarize_with(&plda, ClusterBackend::default())
+    );
+    assert_eq!(
+      unchecked
+        .diarize_online(OnlineOptions::new())
+        .expect("online never reads an inactive slot's row, so it returns Ok")
+        .spans_slice()
+        .len(),
+      1,
+      "online must be blind to the same value the offline route dies on"
+    );
+
+    // The constructor must refuse it, naming the offending buffer position.
+    let err = refused(parts);
+    let expected = embedding_range(0, 2).start;
+    assert!(
+      matches!(err, ExtractError::NonFiniteRawEmbedding(i) if i == expected),
+      "expected NonFiniteRawEmbedding({expected}) for {bad:?}, got {err:?}"
+    );
+  }
+
+  // Non-vacuity in the other direction: the SAME geometry with a finite value
+  // in that position is accepted. The check refuses the non-finiteness, not the
+  // inactive slot carrying a row — which stays deliberately allowed (see
+  // `an_inactive_slots_row_cannot_change_the_online_result`).
+  for ok in [0.0f32, -0.0, 7.5, f32::MAX, f32::MIN_POSITIVE] {
+    Extraction::try_from_parts(one_chunk_with_poisoned_slot(2, 0, ok)).unwrap_or_else(|e| {
+      panic!("a finite {ok:?} in an inactive slot's row must be accepted: {e:?}")
+    });
+  }
+}
+
+#[test]
+fn the_finiteness_check_covers_the_whole_buffer_not_only_active_rows() {
+  // The property is over the BUFFER: no `(chunk, slot, dimension)` position may
+  // hold a non-finite value. Swept exhaustively over the slot axis and over the
+  // first/last dimension of each row, so a check that walked only some rows —
+  // or that stopped at a row boundary — fails here.
+  //
+  // Slot 0 is ACTIVE, so its refusal is check 9's `ActiveSlotWithoutEmbedding`
+  // (`normalize_from` rejects a non-finite row): the more specific diagnosis,
+  // which is why check 11 is ordered behind it. Slots 1 and 2 are inactive and
+  // land on check 11. Both are refusals; neither position is accepted.
+  for slot in 0..SEG_NUM_SLOTS {
+    for dimension in [0, 1, EMBEDDING_DIM - 1] {
+      for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+        let err = refused(one_chunk_with_poisoned_slot(slot, dimension, bad));
+        let flat = embedding_range(0, slot).start + dimension;
+        if slot == 0 {
+          assert!(
+            matches!(err, ExtractError::ActiveSlotWithoutEmbedding(a)
+              if (a.chunk(), a.slot()) == (0, 0)),
+            "an ACTIVE slot's non-finite row must keep check 9's diagnosis \
+             (slot {slot}, dimension {dimension}, {bad:?}), got {err:?}"
+          );
+        } else {
+          assert!(
+            matches!(err, ExtractError::NonFiniteRawEmbedding(i) if i == flat),
+            "expected NonFiniteRawEmbedding({flat}) for slot {slot}, dimension \
+             {dimension}, {bad:?}, got {err:?}"
+          );
+        }
+      }
+    }
+  }
+}
+
+#[test]
+fn no_producer_can_emit_a_buffer_the_finiteness_check_refuses() {
+  // Check 11 must refuse nothing either in-crate producer emits.
+  // `Extractor::extract` and `ArgmaxSource::extract` both allocate an all-zero
+  // `raw_embeddings` and write a row ONLY when `raw_embedding_reaches_plda`
+  // accepts it, zeroing the slot's segmentation column otherwise. Two facts
+  // make check 11 unreachable from either, and both are asserted here rather
+  // than assumed:
+  //
+  //   a. an UNWRITTEN row stays all-zero, and `0.0` is finite;
+  //   b. a WRITTEN row passed `raw_embedding_reaches_plda`, whose
+  //      `RawEmbedding::from_wespeaker` clause carries its own finiteness scan.
+  assert!(0.0f32.is_finite(), "an unwritten row is all-zero");
+
+  let plda = shared_plda_transform().expect("hermetic PLDA weights load");
+  let usable = planar_row(30.0);
+  assert!(
+    raw_embedding_reaches_plda(plda, &usable),
+    "non-vacuity: the unpoisoned row must be one a producer WOULD write"
+  );
+  for dimension in [0, 1, EMBEDDING_DIM - 1] {
+    for bad in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+      let mut row = usable;
+      row[dimension] = bad;
+      assert!(
+        !raw_embedding_reaches_plda(plda, &row),
+        "a producer must never write a row holding {bad:?} at dimension {dimension}"
+      );
+    }
+  }
+
+  // And the producers' own emitted shape — an all-zero row under an all-zero
+  // column — is accepted, which is what `one_usable_slot_row`'s untouched slots
+  // and `valid_parts` already are.
+  Extraction::try_from_parts(valid_parts()).expect("the reference parts stay accepted");
+  Extraction::try_from_parts(ExtractionParts {
+    raw_embeddings: one_usable_slot_row(0),
+    segmentations: vec![1.0, 0.0, 0.0],
+    count: vec![1, 0],
+    num_chunks: 1,
+    num_frames_per_chunk: 1,
+    chunks_sw: unit_sw(),
+    frames_sw: unit_sw(),
+  })
+  .expect("two all-zero rows under two all-zero columns is the producers' own output shape");
+}
+
+// =====================================================================
+// The OFFLINE half of "an INACTIVE slot may carry a usable row": dia
+// scores every row at stage 6, so blindness needs stage 7's mask and
+// the assignment's row-shift invariance, not just the PLDA train gate.
+// =====================================================================
+
+/// A row with `1.0` at dimension `i` and zeros elsewhere.
+fn axis_row(i: usize, v: f32) -> [f32; EMBEDDING_DIM] {
+  let mut r = [0.0f32; EMBEDDING_DIM];
+  r[i] = v;
+  r
+}
+
+/// Six unit chunks of one frame, slot 0 active in every one and carrying
+/// `SLOT0_ROWS[c]` — three well-separated pairs, so `diaric` reaches three
+/// alive clusters and its Hungarian step has spare columns to hand the INACTIVE
+/// slots real labels. `probe` is written into `(chunk, slot)`, and into both
+/// inactive slots of a second chunk with opposite signs, so two constant rows
+/// also compete for the leftover columns.
+fn six_chunk_parts(probe: [f32; EMBEDDING_DIM], chunk: usize, slot: usize) -> ExtractionParts {
+  let slot0: [[f32; EMBEDDING_DIM]; 6] = [
+    planar_row(0.0),
+    planar_row(4.0),
+    planar_row(88.0),
+    planar_row(92.0),
+    axis_row(2, 1.0),
+    {
+      let mut r = axis_row(2, 1.0);
+      r[3] = 0.07;
+      r
+    },
+  ];
+  let n = slot0.len();
+  let mut raw_embeddings = vec![0.0f32; n * SEG_NUM_SLOTS * EMBEDDING_DIM];
+  for (c, row) in slot0.iter().enumerate() {
+    raw_embeddings[embedding_range(c, 0)].copy_from_slice(row);
+  }
+  raw_embeddings[embedding_range(chunk, slot)].copy_from_slice(&probe);
+  let other = (chunk + 2) % n;
+  raw_embeddings[embedding_range(other, 1)].copy_from_slice(&probe);
+  let mut anti = probe;
+  for v in anti.iter_mut() {
+    *v = -*v;
+  }
+  raw_embeddings[embedding_range(other, 2)].copy_from_slice(&anti);
+
+  // [f][s], one frame per chunk: only slot 0 is ever active.
+  let mut segmentations = vec![0.0f64; n * SEG_NUM_SLOTS];
+  for c in 0..n {
+    segmentations[c * SEG_NUM_SLOTS] = 1.0;
+  }
+  let mut count = vec![1u8; n];
+  count.push(0); // the trailing output frame no chunk covers
+
+  ExtractionParts {
+    raw_embeddings,
+    segmentations,
+    count,
+    num_chunks: n,
+    num_frames_per_chunk: 1,
+    chunks_sw: unit_sw(),
+    frames_sw: unit_sw(),
+  }
+}
+
+#[test]
+fn an_inactive_slots_row_cannot_change_the_offline_result() {
+  // The claim the "deliberately NOT checked" list makes about OFFLINE. The
+  // earlier justification stopped at `filter_embeddings`: an inactive slot never
+  // enters the PLDA TRAIN subset. That is true and insufficient — dia's stage 6
+  // cosine-scores EVERY row against every centroid, train subset or not. What
+  // makes offline blind is stage 7 (it OVERWRITES an inactive slot's whole soft
+  // row with `soft.min() - 1.0`) plus the fact that the residue — the row's
+  // contribution to that `soft.min()` — is a per-row constant shift, which a
+  // linear assignment problem is invariant under.
+  //
+  // Property, stated without the mechanism: an INACTIVE slot's raw-embedding row
+  // must not change ANY observable of `diarize_with` — spans, per-chunk hard
+  // assignment, cluster count, or the frame-level grid.
+  let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+  let fingerprint = |parts: ExtractionParts| -> OutputFingerprint {
+    output_fingerprint(
+      &Extraction::try_from_parts(parts)
+        .expect("the probe geometry is self-consistent")
+        .diarize_with(&plda, ClusterBackend::default())
+        .expect("this geometry clusters offline"),
+    )
+  };
+
+  let zero = [0.0f32; EMBEDDING_DIM];
+  let base = fingerprint(six_chunk_parts(zero, 0, 1));
+
+  // Non-vacuity: the geometry must actually exercise the path. Three alive
+  // clusters, and the INACTIVE slots must really draw labels — if dia left them
+  // UNMATCHED there would be nothing for a probe to perturb.
+  assert_eq!(base.2, 3, "the probe geometry must reach three clusters");
+  assert!(
+    base.1.iter().all(|row| row[1] >= 0 && row[2] >= 0),
+    "the inactive slots must draw real cluster labels, got {:?}",
+    base.1
+  );
+
+  let probes = [
+    planar_row(180.0),
+    planar_row(270.0),
+    planar_row(45.0),
+    axis_row(2, -1.0),
+    axis_row(7, 1.0),
+    axis_row(7, -3.5),
+  ];
+  for slot in [1usize, 2] {
+    for chunk in [0usize, 3, 5] {
+      let at = fingerprint(six_chunk_parts(zero, chunk, slot));
+      assert_eq!(
+        at, base,
+        "moving the all-zero probe to (chunk {chunk}, slot {slot}) changed the offline output"
+      );
+      for (i, probe) in probes.iter().enumerate() {
+        assert_eq!(
+          fingerprint(six_chunk_parts(*probe, chunk, slot)),
+          base,
+          "probe {i} in INACTIVE (chunk {chunk}, slot {slot}) changed the offline output"
+        );
+      }
+    }
+  }
+}

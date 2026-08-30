@@ -307,3 +307,41 @@ fn output_frame_count_too_large_displays_both_the_derived_count_and_the_cap() {
   assert!(rendered.contains("4194304"), "{rendered}");
   assert!(rendered.contains("MAX_OUTPUT_FRAMES"), "{rendered}");
 }
+
+#[test]
+fn non_finite_raw_embedding_displays_the_index_it_decodes_to_chunk_slot_dimension() {
+  use crate::audio::speaker::{embed::EMBEDDING_DIM, segment::SEG_NUM_SLOTS};
+
+  // The newtype carries a flat `[c][s][d]` index; the message decodes it. The
+  // arithmetic is the inverse of `extract::embedding_range`, so it is pinned
+  // against hand-computed positions rather than restated.
+  // (chunk 2, slot 1, dimension 5) = ((2 * 3 + 1) * 256) + 5 = 1797.
+  let flat = ((2 * SEG_NUM_SLOTS + 1) * EMBEDDING_DIM) + 5;
+  assert_eq!(flat, 1797);
+  let rendered = ExtractError::NonFiniteRawEmbedding(flat).to_string();
+  assert!(rendered.contains("raw_embeddings[1797]"), "{rendered}");
+  assert!(rendered.contains("chunk 2"), "{rendered}");
+  assert!(rendered.contains("slot 1"), "{rendered}");
+  assert!(rendered.contains("dimension 5"), "{rendered}");
+
+  // Index 0 is chunk 0, slot 0, dimension 0 — the boundary the decode must not
+  // shift.
+  let rendered = ExtractError::NonFiniteRawEmbedding(0).to_string();
+  assert!(rendered.contains("raw_embeddings[0]"), "{rendered}");
+  assert!(rendered.contains("chunk 0"), "{rendered}");
+  assert!(rendered.contains("slot 0"), "{rendered}");
+  assert!(rendered.contains("dimension 0"), "{rendered}");
+
+  // The last lane of the last slot of chunk 0: one before the chunk boundary.
+  let last = SEG_NUM_SLOTS * EMBEDDING_DIM - 1;
+  let rendered = ExtractError::NonFiniteRawEmbedding(last).to_string();
+  assert!(rendered.contains("chunk 0"), "{rendered}");
+  assert!(
+    rendered.contains(&format!("slot {}", SEG_NUM_SLOTS - 1)),
+    "{rendered}"
+  );
+  assert!(
+    rendered.contains(&format!("dimension {}", EMBEDDING_DIM - 1)),
+    "{rendered}"
+  );
+}

@@ -763,6 +763,52 @@ pub enum ExtractError {
     .0.expected()
   )]
   CountNotSegmentationDerived(CountNotSegmentationDerived),
+  /// A `raw_embeddings` value is NaN or `±inf`. Carries its flat index into
+  /// that buffer.
+  ///
+  /// Raised by a scan of the WHOLE buffer, which is what separates it from
+  /// [`Self::ActiveSlotWithoutEmbedding`]: that one holds the row of an ACTIVE
+  /// `(chunk, slot)` to what both engines' row chains accept, and an INACTIVE
+  /// slot's row never reaches it. Under an all-zero segmentation column the two
+  /// backends then split, in the direction the row check cannot see:
+  ///
+  /// - OFFLINE, `diaric::pipeline::assign_embeddings` scans EVERY row of the
+  ///   matrix — train subset or not, active or not, because its stage 6 cosine
+  ///   scoring reads all of them — and returns `NonFiniteField::Embeddings`
+  ///   (`diarization/src/pipeline/algo.rs:443-455`). The whole extraction fails.
+  /// - ONLINE, [`crate::audio::speaker::extract::Extraction::diarize_online`]
+  ///   skips an inactive column before it ever copies the row, so the value is
+  ///   never read and the call returns `Ok`.
+  ///
+  /// So the identical [`crate::audio::speaker::extract::Extraction`] is fatal to
+  /// one backend and silently fine for the other — the split this constructor
+  /// exists to refuse, one buffer position away from the row check that already
+  /// refuses its active-slot twin.
+  ///
+  /// Neither in-crate producer can emit one:
+  /// [`crate::audio::speaker::extract::Extractor::extract`] and
+  /// [`crate::audio::speaker::source::argmax::ArgmaxSource`] both start from an
+  /// all-zero buffer (and `0.0` is finite) and write a row only when
+  /// `extract::raw_embedding_reaches_plda` accepts it, which requires
+  /// `diaric::plda::RawEmbedding::from_wespeaker` to return `Ok` and so cannot
+  /// admit a non-finite value.
+  ///
+  /// Newtype, not struct-shaped: the flat index IS the whole diagnosis. It
+  /// determines the `(chunk, slot)` pair — `chunk = i / (SEG_NUM_SLOTS *
+  /// EMBEDDING_DIM)`, `slot = (i / EMBEDDING_DIM) % SEG_NUM_SLOTS`, both spelled
+  /// out in the message — plus the lane within the row, which a `(chunk, slot)`
+  /// payload would drop. Mirrors [`InferError::NonFiniteOutput`], which reports
+  /// the same defect at the same granularity one stage upstream.
+  #[error(
+    "extraction parts: raw_embeddings[{}] is not finite (chunk {}, slot {}, dimension {}); the \
+     offline backend rejects the whole matrix while the online backend never reads an inactive \
+     slot's row",
+    .0,
+    .0 / (crate::audio::speaker::segment::SEG_NUM_SLOTS * crate::audio::speaker::embed::EMBEDDING_DIM),
+    (.0 / crate::audio::speaker::embed::EMBEDDING_DIM) % crate::audio::speaker::segment::SEG_NUM_SLOTS,
+    .0 % crate::audio::speaker::embed::EMBEDDING_DIM
+  )]
+  NonFiniteRawEmbedding(usize),
   /// The output-frame grid the geometry derives is above
   /// [`crate::audio::speaker::extract::MAX_OUTPUT_FRAMES`].
   ///
