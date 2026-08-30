@@ -87,14 +87,17 @@ mod tests;
 /// already excluded them.
 ///
 /// [`Error::EmptyWindows`] is never returned here, unlike
-/// [`aggregate`](crate::embeddings::clap::aggregate::aggregate). A CUSTOM policy
-/// may still return `WinditError::Empty` — including for a NONEMPTY input — and
-/// that reaches the caller as `Windowing(WinditError::Empty)`, not
-/// `EmptyWindows`: this wrapper does not collapse the two the way `aggregate`'s
-/// does, because here `WinditError::Empty` would not mean "the input was empty"
-/// (see above — an empty input is an empty output, not a refusal), so
-/// `EmptyWindows`'s own meaning ("cannot aggregate zero window embeddings")
-/// would misdescribe it. No built-in policy here returns `WinditError::Empty`.
+/// [`aggregate`](crate::embeddings::clap::aggregate::aggregate), which reports
+/// it directly whenever its OWN `windows` argument is empty — checked before
+/// windit's engine, and therefore before any policy, ever runs. This wrapper
+/// makes no such check: an empty input is an empty output, not a refusal (see
+/// above), so nothing here ever produces `EmptyWindows`. A CUSTOM policy may
+/// still return `WinditError::Empty` — including for a NONEMPTY input — and
+/// that always reaches the caller as `Windowing(WinditError::Empty)`, the same
+/// as it would from `aggregate`: neither wrapper matches on windit's RETURNED
+/// error to decide `EmptyWindows`, because `WinditError::Empty` alone cannot
+/// distinguish "the input was empty" from "the policy refused". No built-in
+/// policy here returns `WinditError::Empty`.
 pub fn smooth<P>(policy: &P, windows: &[WindowEmbedding]) -> Result<Vec<WindowEmbedding>>
 where
   P: SmoothPolicy<Embedding>,

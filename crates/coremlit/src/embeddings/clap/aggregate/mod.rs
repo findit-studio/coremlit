@@ -29,7 +29,7 @@
 
 use crate::embeddings::clap::{
   embedding::Embedding,
-  error::{Error, Result, WinditError},
+  error::{Error, Result},
   window::WindowEmbedding,
 };
 
@@ -118,17 +118,31 @@ pub fn aggregate<P>(policy: &P, windows: &[WindowEmbedding]) -> Result<Embedding
 where
   P: windit::aggregate::AggregatePolicy + ?Sized,
 {
-  // This crate's ONE place that maps `WinditError::Empty` to
-  // `Error::EmptyWindows`: here, "the input was empty" and "the policy
-  // refuses" are genuinely the same event (windit's own `aggregate` returns
-  // `Empty` before ever invoking the policy for an empty `windows` slice), so
-  // the collapse is a fidelity-preserving rename, not a special case
-  // smuggled into the blanket `From<WinditError>` impl — see that impl's doc
-  // for why it must stay total.
-  windit::aggregate::aggregate(policy, windows).map_err(|e| match e {
-    WinditError::Empty => Error::EmptyWindows,
-    other => Error::Windowing(other),
-  })
+  // This crate's ONE place that produces `Error::EmptyWindows`, keyed on the
+  // OBSERVED INPUT, not on the error windit returns: `WinditError::Empty` alone
+  // cannot distinguish "the engine saw no windows" from "the policy refused". A
+  // custom `AggregatePolicy` may return `WinditError::Empty` from
+  // `aggregate_values` for a NONEMPTY `windows` slice — windit's own rustdoc
+  // example for implementing a custom policy does exactly this
+  // (`embeddings.first().ok_or(WinditError::Empty)?`), and a filtering policy
+  // that delegates a filtered subset to a windit built-in gets a
+  // contract-correct `Empty` from windit's `check_inputs` when nothing in the
+  // subset qualifies — so matching on the RETURNED error would misreport that
+  // as "zero windows were supplied".
+  //
+  // Guarding on the input sidesteps the ambiguity instead of relocating it:
+  // windit's own `aggregate` runs the identical `windows.is_empty()` check
+  // before invoking ANY policy, built-in or custom, so this guard fires on
+  // exactly the inputs that used to reach `Empty` through the engine's own
+  // short-circuit — behaviour is unchanged for an empty slice and for every
+  // built-in policy. A nonempty slice always reaches the policy now, and
+  // whatever it returns — `Empty` included — is reported faithfully as
+  // `Error::Windowing`, never smuggled into the blanket `From<WinditError>`
+  // impl — see that impl's doc for why it must stay total.
+  if windows.is_empty() {
+    return Err(Error::EmptyWindows);
+  }
+  windit::aggregate::aggregate(policy, windows).map_err(Error::Windowing)
 }
 
 /// The configuration [`AggregatePolicyKind::EmaRenormalized`] carries: the

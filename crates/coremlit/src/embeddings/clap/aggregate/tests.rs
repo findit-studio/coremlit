@@ -107,6 +107,51 @@ fn every_policy_rejects_empty_windows() {
   }
 }
 
+/// A pathological custom [`AggregatePolicy`]: always reports
+/// `WinditError::Empty`, including for a NONEMPTY `embeddings` slice. No real
+/// policy should do this; it exists only to drive the test below, which pins
+/// that the wrapper's error mapping does not assume otherwise.
+#[derive(Debug, Clone, Copy)]
+struct ClaimsEmptyRegardless;
+
+impl AggregatePolicy for ClaimsEmptyRegardless {
+  fn aggregate_values(
+    &self,
+    _embeddings: &[&[f64]],
+    _coverages: &[f64],
+    _dim: usize,
+  ) -> core::result::Result<Vec<f64>, WinditError> {
+    Err(WinditError::Empty)
+  }
+}
+
+#[test]
+fn a_custom_policys_empty_claim_on_nonempty_input_reaches_windowing_not_emptywindows() {
+  // The error variant alone cannot distinguish "the engine saw no windows" from
+  // "the policy refused": this fixture is two windows, not zero, so a policy
+  // reporting `Empty` here is reporting an aggregation failure, not "there were
+  // no windows". A caller matching `EmptyWindows` to mean the latter must not be
+  // misled by this call.
+  let windows = [axis(0, 480_000), axis(1, 480_000)];
+  assert!(
+    !windows.is_empty(),
+    "the fixture must be nonempty for this to prove anything"
+  );
+
+  let err = aggregate(&ClaimsEmptyRegardless, &windows).unwrap_err();
+
+  assert!(
+    matches!(err, Error::Windowing(WinditError::Empty)),
+    "expected Windowing(Empty), got {err:?}"
+  );
+  assert!(
+    !matches!(err, Error::EmptyWindows),
+    "a nonempty input's aggregation failure must never surface as EmptyWindows \
+     (that variant means zero windows were supplied, which is false here); got \
+     {err:?}"
+  );
+}
+
 #[test]
 fn ema_rejects_out_of_range_alpha_at_aggregation() {
   let windows = [axis(0, 480_000)];
