@@ -3112,3 +3112,222 @@ fn the_active_row_floor_is_the_one_both_in_crate_producers_drop_at() {
   assert!(!raw_embedding_reaches_plda(&nan));
   assert!(diaric::plda::RawEmbedding::from_wespeaker(nan).is_err());
 }
+
+// =====================================================================
+// An active row must clear BOTH backends' own admission tests, not a
+// hand-written approximation of their intersection — adversarial review
+// round 4.
+// =====================================================================
+
+#[test]
+fn try_from_parts_rejects_an_active_row_whose_norm_overflows_f32_for_the_online_engine() {
+  // The trigger: one default-geometry chunk, slot 0 active in 60 frames, and a
+  // slot-0 row of `[f32::MAX, f32::MAX, 0.0, …]`. Every element is finite and
+  // the f64 L2 norm is ~4.81e38 — forty orders of magnitude ABOVE
+  // `PLDA_MIN_NORM`, so a `f64` norm floor accepts it and so does PLDA's own
+  // raw boundary. `Embedding::normalize_from` narrows that norm to f32 FIRST,
+  // where 4.81e38 is `+inf`, and returns `None` — `diarize_online`'s
+  // dropped-slot sentinel. The active slot yields no speaker at all.
+  let w = WindowOptions::new();
+  let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&w);
+  let frames_sw = crate::audio::speaker::window::frame_sliding_window();
+  let nf = 60;
+  let mut segmentations = vec![0.0f64; nf * SEG_NUM_SLOTS];
+  for f in 0..nf {
+    segmentations[f * SEG_NUM_SLOTS] = 1.0;
+  }
+  let count = crate::audio::speaker::window::try_count_from_segmentations(
+    &segmentations,
+    1,
+    nf,
+    SEG_NUM_SLOTS,
+    w.onset(),
+    chunks_sw,
+    frames_sw,
+  )
+  .expect("this geometry's output-frame count fits usize");
+
+  let mut raw_embeddings = vec![0.0f32; SEG_NUM_SLOTS * EMBEDDING_DIM];
+  raw_embeddings[0] = f32::MAX;
+  raw_embeddings[1] = f32::MAX;
+
+  // The split, proved against the two engines themselves and against the
+  // arithmetic that produced four rounds of approximations.
+  let mut row = [0.0f32; EMBEDDING_DIM];
+  row.copy_from_slice(&raw_embeddings[..EMBEDDING_DIM]);
+  let f64_norm: f64 = row
+    .iter()
+    .map(|v| f64::from(*v) * f64::from(*v))
+    .sum::<f64>()
+    .sqrt();
+  assert!(
+    f64_norm > PLDA_MIN_NORM && f64_norm.is_finite(),
+    "the f64 norm ({f64_norm:e}) is finite and far above the floor — a f64 \
+     comparison accepts this row"
+  );
+  assert!(
+    !(f64_norm as f32).is_finite(),
+    "and the SAME norm is +inf once narrowed to f32, which is what \
+     `normalize_from` compares"
+  );
+  assert!(
+    diaric::plda::RawEmbedding::from_wespeaker(row).is_ok(),
+    "PLDA's raw boundary ACCEPTS this row — matching it alone is the defect"
+  );
+  assert!(
+    diaric::embed::Embedding::normalize_from(row).is_none(),
+    "the online engine's own test REFUSES it, and `None` is its dropped-slot \
+     sentinel"
+  );
+
+  let parts = ExtractionParts {
+    raw_embeddings,
+    segmentations,
+    count,
+    num_chunks: 1,
+    num_frames_per_chunk: nf,
+    chunks_sw,
+    frames_sw,
+  };
+
+  // Assembled unchecked, `diarize_online` returns Ok with the speech GONE:
+  // 60 active frames, no span.
+  let unchecked = Extraction::from_parts(
+    parts.raw_embeddings.clone(),
+    parts.segmentations.clone(),
+    parts.count.clone(),
+    parts.num_chunks,
+    parts.num_frames_per_chunk,
+    parts.chunks_sw,
+    parts.frames_sw,
+  );
+  let online = unchecked
+    .diarize_online(OnlineOptions::new())
+    .expect("online returns Ok");
+  assert_eq!(
+    online.spans_slice().len(),
+    0,
+    "online silently drops the active slot — the failure this constructor exists \
+     to make impossible"
+  );
+
+  let err = refused(parts);
+  assert!(
+    matches!(err, ExtractError::ActiveSlotWithoutEmbedding(a) if (a.chunk(), a.slot()) == (0, 0)),
+    "expected ActiveSlotWithoutEmbedding(0, 0), got {err:?}"
+  );
+}
+
+#[test]
+fn the_row_predicate_is_the_two_backend_functions_not_a_description_of_them() {
+  // Equality with the CONJUNCTION over rows that straddle every corner four
+  // rounds of approximations were caught on. This is the property the fix
+  // makes structural: the predicate cannot disagree with a backend, because it
+  // is the two backends' own calls.
+  let mut probes: Vec<[f32; EMBEDDING_DIM]> = Vec::new();
+  let mut push = |first: f32, second: f32| {
+    let mut row = [0.0f32; EMBEDDING_DIM];
+    row[0] = first;
+    row[1] = second;
+    probes.push(row);
+  };
+  // Zero, the dropped-slot row every producer writes.
+  push(0.0, 0.0);
+  // Subnormal, and the smallest normal.
+  push(f32::from_bits(1), 0.0);
+  push(f32::MIN_POSITIVE, 0.0);
+  // Below / at / above the online engine's `NORM_EPSILON` (1e-12).
+  push(1e-13, 0.0);
+  push(1e-12, 0.0);
+  push(1e-11, 0.0);
+  // Between the two floors — the round-3 corner.
+  push(0.005, 0.0);
+  // Straddling PLDA's floor.
+  push(0.009_999, 0.0);
+  push(0.01, 0.0);
+  push(0.010_001, 0.0);
+  // In distribution.
+  push(2.07, 0.0);
+  // Large but f32-representable norm, and norms that overflow f32 — the
+  // round-4 corner, approached from both sides of the narrowing.
+  push(1e19, 1e19);
+  push(f32::MAX, 0.0);
+  push(f32::MAX, f32::MAX);
+  push(f32::MAX, f32::MAX / 2.0);
+  // Non-finite, in either position, and signed.
+  push(f32::INFINITY, 0.0);
+  push(f32::NEG_INFINITY, 0.0);
+  push(f32::NAN, 0.0);
+  push(2.07, f32::NAN);
+  push(-2.07, 0.0);
+
+  for row in &probes {
+    let online = diaric::embed::Embedding::normalize_from(*row).is_some();
+    let offline = diaric::plda::RawEmbedding::from_wespeaker(*row).is_ok();
+    assert_eq!(
+      raw_embedding_reaches_plda(row),
+      online && offline,
+      "row [{}, {}, 0, …] — online accepts {online}, offline accepts {offline}",
+      row[0],
+      row[1]
+    );
+  }
+
+  // Both single-sided corners are actually present in the probe set, so the
+  // equality above is not vacuous: neither backend's test alone is this
+  // predicate.
+  assert!(
+    probes.iter().any(|r| {
+      diaric::embed::Embedding::normalize_from(*r).is_some()
+        && diaric::plda::RawEmbedding::from_wespeaker(*r).is_err()
+    }),
+    "the probe set must contain a row ONLY the online engine accepts"
+  );
+  assert!(
+    probes.iter().any(|r| {
+      diaric::embed::Embedding::normalize_from(*r).is_none()
+        && diaric::plda::RawEmbedding::from_wespeaker(*r).is_ok()
+    }),
+    "the probe set must contain a row ONLY the offline boundary accepts"
+  );
+
+  // A wrong-length row is refused rather than panicked on. Unreachable in
+  // crate — every call site slices exactly `EMBEDDING_DIM` — but the array
+  // conversion is what makes it so, and this pins which way it fails.
+  assert!(!raw_embedding_reaches_plda(&[1.0f32; EMBEDDING_DIM - 1]));
+  assert!(!raw_embedding_reaches_plda(&[1.0f32; EMBEDDING_DIM + 1]));
+}
+
+#[test]
+fn plda_min_norm_is_diarics_own_floor_measured_not_copied() {
+  // `PLDA_MIN_NORM` is published but no longer READ by anything in-crate, so
+  // nothing would notice it drifting away from the number `diaric` enforces.
+  // Measure that number instead of restating it: binary-search
+  // `RawEmbedding::from_wespeaker` for the smallest single-component row it
+  // accepts, and require the constant to name that boundary.
+  //
+  // A single-component row's f64 norm is exactly `|v|`, so the search is over
+  // the norm itself.
+  let admits = |v: f32| {
+    let mut row = [0.0f32; EMBEDDING_DIM];
+    row[0] = v;
+    diaric::plda::RawEmbedding::from_wespeaker(row).is_ok()
+  };
+  let (mut lo, mut hi) = (0.0f32, 1.0f32);
+  assert!(!admits(lo) && admits(hi), "the floor lies inside (0, 1]");
+  for _ in 0..200 {
+    let mid = f32::from_bits(lo.to_bits().midpoint(hi.to_bits()));
+    if mid == lo || mid == hi {
+      break;
+    }
+    if admits(mid) { hi = mid } else { lo = mid }
+  }
+  assert!(
+    f64::from(lo) < PLDA_MIN_NORM && f64::from(hi) >= PLDA_MIN_NORM,
+    "diaric's measured raw-embedding floor is in ({lo:e}, {hi:e}] but \
+     PLDA_MIN_NORM says {PLDA_MIN_NORM:e} — the published constant no longer \
+     names the number diaric enforces"
+  );
+  // The two f32 neighbours really do straddle it, so the bracket is tight.
+  assert_eq!(hi.to_bits() - lo.to_bits(), 1, "search did not converge");
+}

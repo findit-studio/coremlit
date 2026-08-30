@@ -641,41 +641,47 @@ pub enum ExtractError {
   )]
   FrameStepNotRepresentableInF32(InvalidSlidingWindow),
   /// A `(chunk, slot)` whose `segmentations` column claims speech pairs with a
-  /// `raw_embeddings` row that cannot reach the clustering: non-finite, or with
-  /// an L2 norm below
-  /// [`crate::audio::speaker::extract::PLDA_MIN_NORM`] (`0.01`).
+  /// `raw_embeddings` row that at least one of the two backends cannot use.
   ///
-  /// That floor is BOTH backends' requirement, which is why it and not the
-  /// online engine's own test is the standard here:
+  /// The test is not a threshold this crate names; it is a CALL to both backend
+  /// entry points, and BOTH must accept — `extract::raw_embedding_reaches_plda`
+  /// requires [`diaric::embed::Embedding::normalize_from`] to return `Some` and
+  /// `diaric::plda::RawEmbedding::from_wespeaker` to return `Ok`. Either one
+  /// alone leaves the two backends disagreeing about the identical
+  /// `Extraction`, in opposite directions:
   ///
-  /// - ONLINE, `diaric::embed::Embedding::normalize_from` returning `None` is
+  /// - ONLINE, `normalize_from` returning `None` is
   ///   [`crate::audio::speaker::extract::Extraction::diarize_online`]'s
   ///   DROPPED-SLOT sentinel — a dropped slot's row is all-zero precisely so
   ///   that it is rejected there and the slot stays UNMATCHED. A corrupt row
   ///   under an ACTIVE column takes that same path, so the engine reads "no
   ///   speaker here" and returns `Ok` with the speech missing.
-  /// - OFFLINE, `diaric::plda::RawEmbedding::from_raw_array` refuses the row
-  ///   outright (`Plda(DegenerateInput)`) at a norm floor of `0.01`
-  ///   (`diarization/src/plda/transform.rs:72,152-165`), nine orders of
+  /// - OFFLINE, `RawEmbedding::from_wespeaker` refuses the row outright
+  ///   (`Plda(NonFiniteInput)` / `Plda(DegenerateInput)`) at a `f64` norm floor
+  ///   of [`crate::audio::speaker::extract::PLDA_MIN_NORM`] (`0.01`,
+  ///   `diarization/src/plda/transform.rs:72,152-165`), ten orders of
   ///   magnitude above `normalize_from`'s `NORM_EPSILON` (`1e-12`).
   ///
-  /// A row BETWEEN the two floors — `[0.005, 0.0, …]` — is therefore accepted
-  /// and clustered into a speaker by one backend and fatal to the other, for
-  /// the identical `Extraction`. Holding to `normalize_from` alone would let
-  /// exactly that through.
+  /// So a row at `[0.005, 0.0, …]` is clustered into a speaker by ONLINE and
+  /// fatal to OFFLINE, while a row at `[f32::MAX, f32::MAX, 0.0, …]` clears
+  /// PLDA's `f64` floor and normalizes to `None` for ONLINE — because
+  /// `normalize_from` narrows the norm to `f32` and `4.8e38` does not fit. The
+  /// conjunction is the standard exactly because each backend has corners the
+  /// other does not.
   ///
-  /// Every in-crate path already satisfies this at the STRICTER floor:
+  /// Every in-crate path already satisfies it:
   /// [`crate::audio::speaker::extract::Extractor::extract`] and the argmax
-  /// source both drop a below-`PLDA_MIN_NORM` slot, zeroing its segmentation
-  /// column at the same moment they leave its row zero — through the same
-  /// `extract::raw_embedding_reaches_plda` this check applies, so the
-  /// producers and the constructor cannot drift apart. Rejecting at assembly is
-  /// what separates "this slot was deliberately dropped upstream" (column
-  /// zeroed too) from "this slot's embedding is broken". See
+  /// source both DROP such a slot, zeroing its segmentation column at the same
+  /// moment they leave its row zero — through the same
+  /// `extract::raw_embedding_reaches_plda` this check applies, so the producers
+  /// and the constructor cannot drift apart. Rejecting at assembly is what
+  /// separates "this slot was deliberately dropped upstream" (column zeroed
+  /// too) from "this slot's embedding is broken". See
   /// [`ActiveSlotWithoutEmbedding`].
   #[error(
     "chunk {} slot {} has an active segmentations column but its raw_embeddings \
-     row cannot reach the clustering (non-finite, or L2 norm below PLDA's 0.01 floor)",
+     row cannot reach the clustering both backends run (non-finite, L2 norm below \
+     PLDA's 0.01 floor, or a norm the online engine's f32 narrowing turns into inf)",
     .0.chunk(),
     .0.slot()
   )]

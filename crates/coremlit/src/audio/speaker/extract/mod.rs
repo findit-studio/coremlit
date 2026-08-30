@@ -190,52 +190,91 @@ pub const EXCLUDE_OVERLAP_MIN_FRAMES: usize = 2;
 /// `diarization/src/reconstruct/algo.rs:42`).
 pub const MAX_OUTPUT_FRAMES: usize = 1 << 22;
 
-/// PLDA minimum raw-embedding L2 norm: a slot whose raw embedding has a
-/// smaller norm is dropped (its column zeroed, its row left zero) before
-/// it can reach PLDA. Matches dia's inline `0.01` guard
-/// (`diarization/src/offline/owned.rs:619-630`), which pre-validates the
-/// norm `RawEmbedding::from_raw_array` would otherwise reject downstream.
+/// PLDA's minimum raw-embedding L2 norm: `diaric` refuses a raw row below it at
+/// the PLDA boundary itself — `plda::transform::RAW_EMBEDDING_MIN_NORM = 0.01`,
+/// checked in `RawEmbedding::from_raw_array`
+/// (`diarization/src/plda/transform.rs:72,152-165`) and reached from
+/// `diarization/src/offline/algo.rs:738`. That constant is `pub(crate)` in
+/// `diaric`, so this is the only name a `coremlit` caller has for the number.
 ///
-/// `diaric` enforces the identical number at the PLDA boundary itself —
-/// `plda::transform::RAW_EMBEDDING_MIN_NORM = 0.01`, checked in
-/// `RawEmbedding::from_raw_array` (`diarization/src/plda/transform.rs:72,152-165`)
-/// and reached from `diarization/src/offline/algo.rs:738` — so this is the
-/// threshold a raw row must clear to be usable at all, not merely a
-/// producer-side convention.
+/// # NECESSARY, NOT SUFFICIENT
 ///
-/// `pub` for the same reason [`MAX_OUTPUT_FRAMES`] is: [`Extraction::try_from_parts`]
-/// REFUSES an active slot whose row falls below it, so a caller assembling an
-/// [`ExtractionParts`] needs the number to satisfy that contract. In-crate it
-/// has exactly one reader, `raw_embedding_reaches_plda`.
+/// This is the LOWER edge of the band [`Extraction::try_from_parts`] admits for
+/// an active slot, not the admission test. `raw_embedding_reaches_plda` no
+/// longer reads it: that predicate CALLS the two backend functions instead of
+/// re-deriving them, and one of them —
+/// [`diaric::embed::Embedding::normalize_from`] — narrows the norm to `f32`, so
+/// a finite row whose norm overflows `f32` (`[f32::MAX, f32::MAX, 0.0, …]`,
+/// norm `4.8e38`) clears `0.01` in `f64` and is still refused. A caller who
+/// wants the exact contract calls those two `diaric` functions, both public;
+/// this constant only says how small a row may be, never that a row is usable.
+///
+/// `pub` for the same reason [`MAX_OUTPUT_FRAMES`] is: it is a number a caller
+/// assembling an [`ExtractionParts`] has to know and cannot otherwise reach.
+/// Because nothing in-crate reads it any more, it is anchored to `diaric`'s
+/// real boundary by test rather than by use —
+/// `plda_min_norm_is_diarics_own_floor_measured_not_copied` binary-searches
+/// `RawEmbedding::from_wespeaker` for the floor it actually enforces and
+/// requires this constant to equal it, so a `diaric` change turns the published
+/// number into a test failure instead of a silent lie.
 pub const PLDA_MIN_NORM: f64 = 0.01;
 
-/// Whether a raw WeSpeaker row can reach the clustering both backends run:
-/// every element finite, and an L2 norm of at least [`PLDA_MIN_NORM`], with it
-/// accumulated in `f64` — `diaric::plda::RawEmbedding::from_raw_array`'s own
-/// two checks, in its own order and its own arithmetic
-/// (`diarization/src/plda/transform.rs:152-165`).
+/// Whether a raw WeSpeaker row can reach the clustering BOTH backends run.
 ///
 /// The ONE predicate for "this row is usable", shared by every site that needs
-/// it so the threshold cannot drift between them: [`Extractor::extract`] and
+/// it: [`Extractor::extract`] and
 /// [`crate::audio::speaker::source::argmax::ArgmaxSource`] both DROP a slot
 /// whose row fails it (zeroing that slot's segmentation column, so nothing
 /// downstream reads the row at all), and [`Extraction::try_from_parts`]
 /// REFUSES parts whose ACTIVE slot carries one.
 ///
-/// Why not `diaric::embed::Embedding::normalize_from`, the test the online
-/// engine itself applies: that function floors the norm at `NORM_EPSILON`
-/// (`1e-12`, `diarization/src/embed/options.rs:30`), nine orders of magnitude
-/// below the PLDA boundary. A row in between — `[0.005, 0.0, …]`, norm `0.005`
-/// — is normalized and clustered into a speaker by the ONLINE backend while the
-/// OFFLINE one fails the whole extraction with `Plda(DegenerateInput)`.
-/// Matching either backend alone is what makes the two disagree about the same
-/// `Extraction`; this predicate is the intersection.
+/// # It CALLS both backends rather than describing them
+///
+/// An `Extraction` is handed to whichever backend the caller picks, so the row
+/// standard is the INTERSECTION of the two. Four earlier revisions of this
+/// function wrote that intersection out as a norm comparison, and each was a
+/// different approximation of it with a different corner escaping:
+///
+/// - a bare norm floor, with no finiteness clause — `+inf` has an infinite
+///   norm, which passes `norm >= floor`;
+/// - the ONLINE floor (`NORM_EPSILON`, `1e-12`,
+///   `diarization/src/embed/options.rs:30`) — a row at `[0.005, 0.0, …]` is
+///   normalized into a speaker by online while offline fails the whole
+///   extraction with `Plda(DegenerateInput)`;
+/// - the OFFLINE floor (`0.01`) computed in `f64` — which is what
+///   `RawEmbedding::from_raw_array` does, but NOT what the online engine does:
+///   `Embedding::normalize_from` narrows the norm to `f32` before comparing, so
+///   a finite row whose norm overflows `f32` (`[f32::MAX, f32::MAX, 0.0, …]`,
+///   `f64` norm `4.8e38`) clears the `f64` floor and normalizes to `None` —
+///   online's DROPPED-slot sentinel, which silently yields no speaker at all.
+///
+/// Every one of those was a better approximation, and the approximation itself
+/// was the defect. So this calls the two real functions:
+///
+/// - [`diaric::embed::Embedding::normalize_from`] returning `Some` — what
+///   [`Extraction::diarize_online`] itself runs, with its own `f32` narrowing
+///   and its own epsilon, whatever they become;
+/// - `diaric::plda::RawEmbedding::from_wespeaker` returning `Ok` — the PLDA raw
+///   boundary [`Extraction::diarize_with`] reaches, `from_raw_array` under a
+///   public name (`diarization/src/plda/transform.rs:152-190`), with its own
+///   finiteness scan, its own `f64` accumulation and its own floor.
+///
+/// A future change to either function's epsilon, precision or ordering is
+/// picked up here automatically, because this predicate no longer has an
+/// opinion of its own to drift from theirs.
+///
+/// Both take an owned `[f32; EMBEDDING_DIM]`; every call site slices exactly
+/// `embedding_range`'s `EMBEDDING_DIM` elements, so the length conversion
+/// cannot fail in-crate, and a wrong-length row is refused rather than panicked
+/// on. The array types also tie `coremlit`'s [`EMBEDDING_DIM`] to `diaric`'s
+/// `embed::EMBEDDING_DIM` and `plda::EMBEDDING_DIMENSION` at COMPILE time: if
+/// any of the three moves, this stops building.
 pub(crate) fn raw_embedding_reaches_plda(row: &[f32]) -> bool {
-  if !row.iter().all(|v| v.is_finite()) {
+  let Ok(row) = <[f32; EMBEDDING_DIM]>::try_from(row) else {
     return false;
-  }
-  let norm_sq: f64 = row.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
-  norm_sq.sqrt() >= PLDA_MIN_NORM
+  };
+  diaric::embed::Embedding::normalize_from(row).is_some()
+    && diaric::plda::RawEmbedding::from_wespeaker(row).is_ok()
 }
 
 #[cfg(feature = "serde")]
@@ -632,11 +671,13 @@ impl Extractor {
           if matches!(plans[s], SlotPlan::Skip) {
             continue;
           }
-          // Exact f64 arithmetic shape of dia's norm pre-check
-          // (owned.rs:619-630), through the ONE predicate every site shares
-          // (`raw_embedding_reaches_plda`). Its finiteness clause cannot fire
-          // here — `embed_chunk` hard-scans its own output — so the norm floor
-          // is the only branch this call site exercises.
+          // dia's per-slot norm pre-check (owned.rs:619-630), through the ONE
+          // predicate every site shares (`raw_embedding_reaches_plda`, which
+          // calls both backends rather than restating their thresholds). Its
+          // finiteness clause cannot fire here — `embed_chunk` hard-scans its
+          // own output — so what this call site exercises is the norm band:
+          // too small for PLDA below, past `f32`'s range for the online
+          // engine's narrowing above.
           if !raw_embedding_reaches_plda(&rows[s]) {
             zero_slot_column(
               &mut segmentations[chunk_segmentation_range(c, num_frames)],
@@ -881,13 +922,16 @@ impl Extraction {
   ///    [`ExtractError::MisalignedChunkPlacement`].
   /// 9. Every `(chunk, slot)` whose segmentation column is active (`seg > 0.0`,
   ///    the activity rule both backends use) carries a raw-embedding row that
-  ///    `raw_embedding_reaches_plda` accepts — finite, and norm at least
-  ///    [`PLDA_MIN_NORM`], the floor both in-crate producers drop a slot below
-  ///    and `diaric` re-applies at the PLDA boundary. Not
-  ///    `Embedding::normalize_from`'s `1e-12`: that is the ONLINE backend's
-  ///    rule alone, and a row between the two floors makes online create a
-  ///    speaker where offline fails the extraction. See
-  ///    [`ExtractError::ActiveSlotWithoutEmbedding`].
+  ///    `raw_embedding_reaches_plda` accepts — which is to say a row BOTH
+  ///    backend entry points accept, because that predicate calls them:
+  ///    [`diaric::embed::Embedding::normalize_from`] (what
+  ///    [`Self::diarize_online`] runs, `f32`-narrowed norm, `1e-12` floor) must
+  ///    return `Some` AND `diaric::plda::RawEmbedding::from_wespeaker` (the
+  ///    PLDA raw boundary [`Self::diarize_with`] reaches, `f64` norm,
+  ///    [`PLDA_MIN_NORM`] floor) must return `Ok`. Neither alone: a row only
+  ///    online accepts makes it create a speaker where offline fails the
+  ///    extraction, and a row only offline accepts is silently dropped online.
+  ///    See [`ExtractError::ActiveSlotWithoutEmbedding`].
   /// 10. `count` EQUALS the count the supplied `segmentations` derive, through
   ///     the same overlap-add aggregation
   ///     [`crate::audio::speaker::window::count_from_segmentations`] runs over
@@ -974,6 +1018,41 @@ impl Extraction {
   ///   consumes the tensors it is given and produces a well-formed answer for
   ///   them. A caller joining parts from several messages must carry its own
   ///   track identity and match on it before assembling an [`ExtractionParts`].
+  /// - **The two epsilons INSIDE `PldaTransform::xvec_transform`.** Check 9
+  ///   composes the backends' two ADMISSION functions, but offline's admission
+  ///   does not end at `RawEmbedding::from_wespeaker`: `plda.project` then
+  ///   rejects `‖row - mean1‖ < XVEC_CENTERED_MIN_NORM` (`0.1`) and a degenerate
+  ///   post-LDA intermediate, both as `Plda(DegenerateInput)`
+  ///   (`diarization/src/plda/transform.rs:315,413-452`). A row inside that ball
+  ///   clears the raw boundary, normalizes fine for ONLINE, and fails the whole
+  ///   OFFLINE extraction — the check-9 shape, one stage further in.
+  ///   *Not composable here:* those checks need a [`diaric::plda::PldaTransform`],
+  ///   which this constructor is not given (only [`Self::diarize_with`] takes
+  ///   one, from the caller), whose `new()` runs a generalized eigendecomposition,
+  ///   and whose `project` is a 256x128 matmul per `(chunk, slot)` — two orders
+  ///   of magnitude past the 256-element scan the other checks cost, for a ball
+  ///   `coremlit` cannot even construct a point in: `mean1` is private in
+  ///   `diaric` with no accessor, and `diaric` calibrates the `0.1` at ~13x below
+  ///   the smallest centered norm in its captured distribution. Left to
+  ///   `diarize_with`, which fails typed.
+  /// - **That both backends agree an active slot deserves a SPEAKER.** Check 9
+  ///   is about the row; both engines COUNT activity with the same `seg > 0.0`
+  ///   rule, then gate on that count with two unrelated ones. ONLINE drops a
+  ///   slot whose
+  ///   `active_frames x frames_sw.step` is under `OnlineOptions`'
+  ///   `min_speech_duration` (default `1.0` s); OFFLINE excludes it from the
+  ///   PLDA train subset unless `Σ seg` over singly-active frames reaches
+  ///   `0.2 * num_frames_per_chunk` (`diarization/src/offline/algo.rs:645-679`).
+  ///   On the shipping grid those are `60` frames and `117.8` frames, so a slot
+  ///   active in `50` of `589` (`0.84` s) yields ONE offline span and NONE
+  ///   online for the identical `Extraction`. *Not checkable here:* the online
+  ///   gate is a function of `OnlineOptions`, supplied at
+  ///   [`Self::diarize_online`] and not at construction, so any threshold this
+  ///   constructor assumed would be wrong for some caller — and the input is
+  ///   ordinary audio [`Extractor::extract`] itself produces (a speaker who
+  ///   talks briefly in a 10 s window), which it must not refuse. Choosing
+  ///   between the two clustering engines is the caller's, and their disagreement
+  ///   on sparse speech is a property of that choice, not of malformed parts.
   ///
   /// # Errors
   /// - [`ExtractError::ZeroExtractionDimension`] — check 1.
@@ -1220,18 +1299,22 @@ impl Extraction {
     // binary-active" rule `diarize_online` applies and dia's
     // `filter_embeddings` uses (`diarization/src/offline/algo.rs:656-660`).
     //
-    // The ROW predicate is `raw_embedding_reaches_plda`: finite, and norm at
-    // least `PLDA_MIN_NORM`. Matching only what `diarize_online` consumes
-    // (`Embedding::normalize_from`, whose floor is `1e-12`) was the error this
-    // check was written with: `normalize_from`'s `None` IS that method's
-    // dropped-slot sentinel, so a row it refuses under an active column is read
-    // as "no speaker here" — but a row it ACCEPTS can still be one the OFFLINE
-    // route refuses outright at `RawEmbedding::from_raw_array`. A norm in
-    // `[1e-12, 0.01)` splits the two backends: online normalizes it and creates
-    // a speaker, offline fails the whole extraction with `Plda(DegenerateInput)`.
-    // The intersection is the standard, and both in-crate producers already drop
-    // such a row through the very same predicate, so this constructor requires
-    // no more of a caller than the crate requires of itself.
+    // The ROW predicate is `raw_embedding_reaches_plda`, which does not describe
+    // what the two backends accept — it CALLS them, `normalize_from` and
+    // `from_wespeaker`, and requires both. Every hand-written stand-in for that
+    // conjunction has had a corner escape it (see the predicate's own doc), the
+    // last one being the floor: offline compares the norm in `f64`, online
+    // narrows it to `f32` first, so `[f32::MAX, f32::MAX, 0.0, …]` clears `0.01`
+    // in `f64` and normalizes to `None` — online's DROPPED-slot sentinel, read
+    // as "no speaker here" under an ACTIVE column.
+    //
+    // Both directions matter. A row only ONLINE accepts (norm in `[1e-12, 0.01)`)
+    // makes online manufacture a speaker where offline fails the whole
+    // extraction with `Plda(DegenerateInput)`; a row only OFFLINE accepts
+    // (`f64` norm past `f32`'s range) reaches PLDA while online silently drops
+    // the slot. Both in-crate producers drop such a row through this very same
+    // predicate, so this constructor requires no more of a caller than the
+    // crate requires of itself.
     for c in 0..num_chunks {
       for s in 0..SEG_NUM_SLOTS {
         let active = (0..num_frames_per_chunk)

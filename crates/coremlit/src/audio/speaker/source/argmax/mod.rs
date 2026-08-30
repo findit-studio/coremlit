@@ -1484,12 +1484,13 @@ fn place_embeddings(
       });
     }
 
-    // Same f64 norm pre-check dia applies (`owned.rs:619-630`), through the
-    // ONE predicate `Extractor::extract` and `Extraction::try_from_parts` also
-    // read — a second `0.01` written here is a second number that can drift,
-    // and the three must agree for a row this source keeps to be a row that
-    // constructor accepts. Its finiteness clause cannot fire: the scan above
-    // already returned `NonFiniteOutput` with the offending index.
+    // dia's per-slot norm pre-check (`owned.rs:619-630`), through the ONE
+    // predicate `Extractor::extract` and `Extraction::try_from_parts` also read
+    // — and that predicate CALLS `normalize_from` and `from_wespeaker` rather
+    // than restating their thresholds, so a row this source keeps is by
+    // construction a row that constructor accepts and both backends consume.
+    // Its finiteness clause cannot fire: the scan above already returned
+    // `NonFiniteOutput` with the offending index.
     if raw_embedding_reaches_plda(embedding) {
       raw_embeddings[embedding_range(c, s)].copy_from_slice(embedding);
     } else {
