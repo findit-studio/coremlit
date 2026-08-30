@@ -195,7 +195,48 @@ pub const MAX_OUTPUT_FRAMES: usize = 1 << 22;
 /// it can reach PLDA. Matches dia's inline `0.01` guard
 /// (`diarization/src/offline/owned.rs:619-630`), which pre-validates the
 /// norm `RawEmbedding::from_raw_array` would otherwise reject downstream.
-const PLDA_MIN_NORM: f64 = 0.01;
+///
+/// `diaric` enforces the identical number at the PLDA boundary itself —
+/// `plda::transform::RAW_EMBEDDING_MIN_NORM = 0.01`, checked in
+/// `RawEmbedding::from_raw_array` (`diarization/src/plda/transform.rs:72,152-165`)
+/// and reached from `diarization/src/offline/algo.rs:738` — so this is the
+/// threshold a raw row must clear to be usable at all, not merely a
+/// producer-side convention.
+///
+/// `pub` for the same reason [`MAX_OUTPUT_FRAMES`] is: [`Extraction::try_from_parts`]
+/// REFUSES an active slot whose row falls below it, so a caller assembling an
+/// [`ExtractionParts`] needs the number to satisfy that contract. In-crate it
+/// has exactly one reader, `raw_embedding_reaches_plda`.
+pub const PLDA_MIN_NORM: f64 = 0.01;
+
+/// Whether a raw WeSpeaker row can reach the clustering both backends run:
+/// every element finite, and an L2 norm of at least [`PLDA_MIN_NORM`], with it
+/// accumulated in `f64` — `diaric::plda::RawEmbedding::from_raw_array`'s own
+/// two checks, in its own order and its own arithmetic
+/// (`diarization/src/plda/transform.rs:152-165`).
+///
+/// The ONE predicate for "this row is usable", shared by every site that needs
+/// it so the threshold cannot drift between them: [`Extractor::extract`] and
+/// [`crate::audio::speaker::source::argmax::ArgmaxSource`] both DROP a slot
+/// whose row fails it (zeroing that slot's segmentation column, so nothing
+/// downstream reads the row at all), and [`Extraction::try_from_parts`]
+/// REFUSES parts whose ACTIVE slot carries one.
+///
+/// Why not `diaric::embed::Embedding::normalize_from`, the test the online
+/// engine itself applies: that function floors the norm at `NORM_EPSILON`
+/// (`1e-12`, `diarization/src/embed/options.rs:30`), nine orders of magnitude
+/// below the PLDA boundary. A row in between — `[0.005, 0.0, …]`, norm `0.005`
+/// — is normalized and clustered into a speaker by the ONLINE backend while the
+/// OFFLINE one fails the whole extraction with `Plda(DegenerateInput)`.
+/// Matching either backend alone is what makes the two disagree about the same
+/// `Extraction`; this predicate is the intersection.
+pub(crate) fn raw_embedding_reaches_plda(row: &[f32]) -> bool {
+  if !row.iter().all(|v| v.is_finite()) {
+    return false;
+  }
+  let norm_sq: f64 = row.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
+  norm_sq.sqrt() >= PLDA_MIN_NORM
+}
 
 #[cfg(feature = "serde")]
 fn default_segmenter_compute() -> crate::ComputeUnits {
@@ -454,6 +495,17 @@ impl Extractor {
   /// - [`ExtractError::FrameCountMismatch`] if the two models disagree on
   ///   the per-chunk frame count (this crate's own guard — see the
   ///   variant's doc).
+  /// - [`ExtractError::MisalignedChunkPlacement`] if the chunk grid
+  ///   `step_samples` and `samples.len()` derive is one the `count`
+  ///   aggregation and `diaric::reconstruct` place differently (this crate's
+  ///   own guard — see `window::first_misaligned_chunk`
+  ///   for the exact class and [`Extraction::try_from_parts`]'s check 8 for
+  ///   why the two must agree). Raised BEFORE any inference: it depends only
+  ///   on `samples.len()` and the configured `step_samples`, so a geometry
+  ///   this crate cannot diarize honestly costs no model time. It is the same
+  ///   refusal `try_from_parts` makes, at the same standard — without it
+  ///   `extract` would emit, through the crate-private unchecked assembly,
+  ///   precisely the `Extraction` its own public constructor rejects.
   /// - [`ExtractError::Infer`] (via `#[from]`) if either model's inference
   ///   fails (`owned.rs:477,600`).
   /// - [`ExtractError::OutputFrameCountOverflow`] if the derived
@@ -497,6 +549,34 @@ impl Extractor {
     // ── 6-7. Chunk grid + zero-cleared output buffers ─────────────────
     let starts = crate::audio::speaker::window::chunk_starts(samples.len(), &w); // owned.rs:447-451
     let num_chunks = starts.len();
+
+    // Both timing grids, derived HERE (dia derives them at owned.rs:653-657,
+    // after the chunk loop) so the placement guard below can run before any
+    // inference. Nothing between here and step 9-11 reads them, so the move is
+    // a hoist only.
+    let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&w); // owned.rs:653-655
+    let frames_sw = crate::audio::speaker::window::frame_sliding_window(); // owned.rs:656-657
+
+    // ── 7b. The two grids must place every chunk at the SAME frame ────
+    // No dia analog, and the guard `Extraction::try_from_parts` applies as its
+    // check 8: the `count` built at step 9-11 is written on the AGGREGATION's
+    // frame grid, while `diaric::reconstruct` — which both cluster backends
+    // feed — places the same chunk's activations by `closest_frame`. Where the
+    // two disagree the count marks frames the activations never reach and
+    // suppresses the ones they do, and `diarize_online` re-derives its own
+    // count through the same aggregation, so no choice of `count` repairs it.
+    //
+    // Assembling through the crate-private, UNCHECKED `from_parts` is what
+    // makes this guard `extract`'s own job: without it this method emits the
+    // exact `Extraction` its public constructor refuses. See
+    // `window::first_misaligned_chunk` for which geometries are affected —
+    // none of them reachable with the default `step_samples`.
+    if let Some(m) =
+      crate::audio::speaker::window::first_misaligned_chunk(num_chunks, chunks_sw, frames_sw)
+    {
+      return Err(ExtractError::MisalignedChunkPlacement(m));
+    }
+
     let onset = f64::from(w.onset());
     // `segmentations` [c][f][s] f64 (owned.rs:461-464), `raw_embeddings`
     // [c][s][d] f32 pre-zeroed so dropped slots stay zero (owned.rs:502-505).
@@ -553,10 +633,11 @@ impl Extractor {
             continue;
           }
           // Exact f64 arithmetic shape of dia's norm pre-check
-          // (owned.rs:619-630). Finite by `embed_chunk`'s own hard scan,
-          // so `< PLDA_MIN_NORM` is the only branch that can fire here.
-          let norm_sq: f64 = rows[s].iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
-          if norm_sq.sqrt() < PLDA_MIN_NORM {
+          // (owned.rs:619-630), through the ONE predicate every site shares
+          // (`raw_embedding_reaches_plda`). Its finiteness clause cannot fire
+          // here — `embed_chunk` hard-scans its own output — so the norm floor
+          // is the only branch this call site exercises.
+          if !raw_embedding_reaches_plda(&rows[s]) {
             zero_slot_column(
               &mut segmentations[chunk_segmentation_range(c, num_frames)],
               num_frames,
@@ -570,8 +651,9 @@ impl Extractor {
     }
 
     // ── 9-11. Count tensor + timing over the post-zeroing buffer ──────
-    let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&w); // owned.rs:653-655
-    let frames_sw = crate::audio::speaker::window::frame_sliding_window(); // owned.rs:656-657
+    // `chunks_sw` / `frames_sw` were derived at step 6-7 so the placement
+    // guard could run ahead of inference; they are the same two values
+    // `owned.rs:653-657` builds here.
     // Manual exhaustive match, deliberately not a `From` impl — see
     // `ExtractError::OutputFrameCountOverflow`'s doc. Unreachable through
     // extract's own geometry (num_chunks * step ≈ samples.len()), kept
@@ -793,13 +875,18 @@ impl Extraction {
   ///    reconstruction reads both, and routes the chunk start through
   ///    `+ frames_sw.duration / 2` and back out. Equal origins are neither
   ///    necessary nor sufficient for the two to agree, so the mappings
-  ///    themselves are compared, chunk by chunk. See
+  ///    themselves are compared, chunk by chunk, through the one shared
+  ///    `window::first_misaligned_chunk` that
+  ///    [`Extractor::extract`] also runs before it touches a model. See
   ///    [`ExtractError::MisalignedChunkPlacement`].
   /// 9. Every `(chunk, slot)` whose segmentation column is active (`seg > 0.0`,
   ///    the activity rule both backends use) carries a raw-embedding row that
-  ///    `diaric::embed::Embedding::normalize_from` accepts — because `None` from
-  ///    that function is [`Self::diarize_online`]'s DROPPED-slot sentinel, so a
-  ///    corrupt row under an active column is read as "no speaker here". See
+  ///    `raw_embedding_reaches_plda` accepts — finite, and norm at least
+  ///    [`PLDA_MIN_NORM`], the floor both in-crate producers drop a slot below
+  ///    and `diaric` re-applies at the PLDA boundary. Not
+  ///    `Embedding::normalize_from`'s `1e-12`: that is the ONLINE backend's
+  ///    rule alone, and a row between the two floors makes online create a
+  ///    speaker where offline fails the extraction. See
   ///    [`ExtractError::ActiveSlotWithoutEmbedding`].
   /// 10. `count` EQUALS the count the supplied `segmentations` derive, through
   ///     the same overlap-add aggregation
@@ -1117,29 +1204,34 @@ impl Extraction {
     // the first O(num_chunks) work, and check 3 is what bounds `num_chunks` by
     // a buffer the caller actually allocated. Ahead of it, a declared
     // `num_chunks` of `2^60` would spin here before anything refused it.
-    for c in 0..num_chunks {
-      let aggregated = crate::audio::speaker::window::aggregate_chunk_start_frame(
-        c,
-        chunks_sw.step(),
-        frames_sw.step(),
-      );
-      let reconstructed =
-        crate::audio::speaker::window::reconstruct_chunk_start_frame(c, chunks_sw, frames_sw);
-      if aggregated != reconstructed {
-        return Err(ExtractError::MisalignedChunkPlacement(
-          crate::audio::speaker::error::ChunkPlacementMismatch::new(c, aggregated, reconstructed),
-        ));
-      }
+    //
+    // `window::first_misaligned_chunk` is the ONE definition of the comparison,
+    // shared with `Extractor::extract`'s own pre-inference guard: written out a
+    // second time it would be a second expression that is algebraically equal
+    // and numerically different — the exact failure mode this check exists for.
+    if let Some(m) =
+      crate::audio::speaker::window::first_misaligned_chunk(num_chunks, chunks_sw, frames_sw)
+    {
+      return Err(ExtractError::MisalignedChunkPlacement(m));
     }
 
-    // ── 9. An active slot must carry an embedding the engines can use ──
-    // `diarize_online` reads `Embedding::normalize_from(row) == None` as the
-    // DROPPED-slot sentinel, so a corrupt or degenerate row under an ACTIVE
-    // segmentation column is silently read as "no speaker here". The predicate
-    // is `seg > 0.0` — the same "any nonzero entry is binary-active" rule
-    // `diarize_online` itself applies, and dia's `filter_embeddings`
-    // (`diarization/src/offline/algo.rs:656-660`) — and the row test is
-    // literally the function that method calls, so neither can drift.
+    // ── 9. An active slot must carry an embedding BOTH engines can use ──
+    // The activity predicate is `seg > 0.0` — the same "any nonzero entry is
+    // binary-active" rule `diarize_online` applies and dia's
+    // `filter_embeddings` uses (`diarization/src/offline/algo.rs:656-660`).
+    //
+    // The ROW predicate is `raw_embedding_reaches_plda`: finite, and norm at
+    // least `PLDA_MIN_NORM`. Matching only what `diarize_online` consumes
+    // (`Embedding::normalize_from`, whose floor is `1e-12`) was the error this
+    // check was written with: `normalize_from`'s `None` IS that method's
+    // dropped-slot sentinel, so a row it refuses under an active column is read
+    // as "no speaker here" — but a row it ACCEPTS can still be one the OFFLINE
+    // route refuses outright at `RawEmbedding::from_raw_array`. A norm in
+    // `[1e-12, 0.01)` splits the two backends: online normalizes it and creates
+    // a speaker, offline fails the whole extraction with `Plda(DegenerateInput)`.
+    // The intersection is the standard, and both in-crate producers already drop
+    // such a row through the very same predicate, so this constructor requires
+    // no more of a caller than the crate requires of itself.
     for c in 0..num_chunks {
       for s in 0..SEG_NUM_SLOTS {
         let active = (0..num_frames_per_chunk)
@@ -1147,9 +1239,7 @@ impl Extraction {
         if !active {
           continue;
         }
-        let mut row = [0.0f32; EMBEDDING_DIM];
-        row.copy_from_slice(&raw_embeddings[embedding_range(c, s)]);
-        if diaric::embed::Embedding::normalize_from(row).is_none() {
+        if !raw_embedding_reaches_plda(&raw_embeddings[embedding_range(c, s)]) {
           return Err(ExtractError::ActiveSlotWithoutEmbedding(
             crate::audio::speaker::error::ActiveSlotWithoutEmbedding::new(c, s),
           ));

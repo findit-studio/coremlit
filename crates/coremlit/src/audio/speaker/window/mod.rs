@@ -953,6 +953,60 @@ pub(crate) fn reconstruct_chunk_start_frame(
   ((t - frames_sw.start() - frames_sw.duration() / 2.0) / frames_sw.step()).round_ties_even() as i64
 }
 
+/// The first chunk in `0..num_chunks` that [`aggregate_chunk_start_frame`] and
+/// [`reconstruct_chunk_start_frame`] place at DIFFERENT output frames, or
+/// `None` when every chunk lands identically under both.
+///
+/// The ONE definition of that comparison, and the ONE gate on a grid this
+/// crate is willing to build an [`crate::audio::speaker::extract::Extraction`]
+/// on. Both construction paths call it —
+/// [`crate::audio::speaker::extract::Extractor::extract`] before it touches a
+/// model, and [`crate::audio::speaker::extract::Extraction::try_from_parts`] as
+/// its check 8 — because a grid the two mappings disagree about produces a
+/// `count` written against activations that are not there, on BOTH backends and
+/// regardless of which `count` the caller supplies:
+/// [`crate::audio::speaker::extract::Extraction::diarize_online`] ignores the
+/// stored `count` and re-derives its own through the very aggregation this
+/// compares.
+///
+/// # The class this catches
+///
+/// The two expressions are algebraically equal whenever the origins cancel, and
+/// numerically equal for almost every grid — but not all. The aggregation's
+/// quotient is `c * step_samples / 270` exactly (`chunk_step = step_samples /
+/// 16_000`, `frame_step = 270 / 16_000`), so a rounding TIE needs `c *
+/// step_samples` to be an odd multiple of `135`; that is unreachable for an
+/// even `step_samples`, and for an odd one it first occurs at `c = 135 /
+/// gcd(step_samples, 135)`. Only at such a tie can the two disagree, and there
+/// they routinely do: the reconstruction route adds `frames_sw.duration / 2` to
+/// the chunk start and subtracts it again, and `(x + h) - h != x` in binary
+/// floating point, so one side computes exactly `k + 0.5` (banker's rounding to
+/// even) while the other computes `k + 0.5 ± 1 ulp` (rounding away).
+///
+/// So it is narrow but not hypothetical. Sweeping every real tie reachable
+/// inside [`crate::audio::speaker::extract::MAX_OUTPUT_FRAMES`] finds at least
+/// 102 of the 160 000 supported `step_samples` with a misaligned chunk, 47 of
+/// them inside a 60-second clip, the shortest at 10.0001 s (`step_samples =
+/// 135` or `31_995`, chunk 1). [`DEFAULT_STEP_SAMPLES`] (16 000) is even and so
+/// is argmax's fixed stride, so neither can ever be one of them.
+///
+/// Reads only geometry, so both callers can run it before allocating anything.
+/// `O(num_chunks)`: callers must bound `num_chunks` against a buffer the caller
+/// actually allocated first.
+pub(crate) fn first_misaligned_chunk(
+  num_chunks: usize,
+  chunks_sw: SlidingWindow,
+  frames_sw: SlidingWindow,
+) -> Option<crate::audio::speaker::error::ChunkPlacementMismatch> {
+  (0..num_chunks).find_map(|c| {
+    let aggregated = aggregate_chunk_start_frame(c, chunks_sw.step(), frames_sw.step());
+    let reconstructed = reconstruct_chunk_start_frame(c, chunks_sw, frames_sw);
+    (aggregated != reconstructed).then(|| {
+      crate::audio::speaker::error::ChunkPlacementMismatch::new(c, aggregated, reconstructed)
+    })
+  })
+}
+
 /// Steps 2-4 of the pyannote frame-count aggregation
 /// (`diarization/src/aggregate/count.rs:486-801`), factored out of
 /// [`try_count_from_segmentations`] so the online reconstruction path can

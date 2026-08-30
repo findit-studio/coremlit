@@ -1,5 +1,8 @@
 use super::*;
-use crate::audio::speaker::window::{DEFAULT_STEP_SAMPLES, chunk_starts};
+use crate::audio::speaker::{
+  extract::PLDA_MIN_NORM,
+  window::{DEFAULT_STEP_SAMPLES, chunk_starts},
+};
 
 // =====================================================================
 // Hermetic: the geometry — argmax's chunk/window grid
@@ -18,6 +21,37 @@ fn derived_geometry_matches_the_model_contract() {
   assert_eq!(ARGMAX_WINDOW_STRIDE_SAMPLES, DEFAULT_STEP_SAMPLES as usize);
   assert_eq!(seconds_per_window(), 10.0);
   assert_eq!(seconds_per_stride(), 1.0);
+}
+
+/// `ArgmaxSource::extract` assembles through the crate-private, UNCHECKED
+/// `Extraction::from_parts` — the same door `Extractor::extract` goes through —
+/// so it too must never emit a grid whose `count` aggregation and
+/// `diaric::reconstruct` place a chunk at different output frames.
+///
+/// It needs no runtime guard for that, and this test is why rather than a
+/// comment claiming so. The stride is compiled into argmax's graph and
+/// `extract` refuses any other `step_samples` (`UnsupportedStepSamples`), so
+/// the chunk grid is a constant; the two mappings can only disagree at a
+/// rounding tie, which needs `c * step_samples` to be an odd multiple of 135,
+/// which an EVEN stride can never produce. If a future argmax revision moved
+/// the stride to an odd value, this assertion — not a comment — is what fails.
+#[test]
+fn the_fixed_argmax_grid_places_every_chunk_identically_under_both_mappings() {
+  assert_eq!(
+    ARGMAX_WINDOW_STRIDE_SAMPLES % 2,
+    0,
+    "an odd stride could tie, and would need the runtime guard extract() carries"
+  );
+  let opts = WindowOptions::new().with_step_samples(
+    u32::try_from(ARGMAX_WINDOW_STRIDE_SAMPLES).expect("argmax's stride fits u32"),
+  );
+  let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&opts);
+  let frames_sw = crate::audio::speaker::window::frame_sliding_window();
+  assert_eq!(
+    crate::audio::speaker::window::first_misaligned_chunk(100_000, chunks_sw, frames_sw),
+    None,
+    "argmax's fixed grid must stay aligned past any clip it can be handed"
+  );
 }
 
 /// The grid theorem's unstated PREMISE, made explicit: this port implements

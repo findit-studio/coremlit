@@ -591,8 +591,21 @@ pub enum ExtractError {
   /// windows `start = 1.0`) cancel exactly and place every chunk identically.
   /// The condition checked is the one that matters — the mappings AGREE, chunk
   /// by chunk. See [`ChunkPlacementMismatch`] for the payload.
+  ///
+  /// Raised by BOTH construction paths, over the one shared
+  /// `window::first_misaligned_chunk`:
+  /// [`crate::audio::speaker::extract::Extraction::try_from_parts`] for parts a
+  /// caller assembled, and
+  /// [`crate::audio::speaker::extract::Extractor::extract`] for the grid its own
+  /// `step_samples` and clip length derive — the latter before it runs a model,
+  /// since a geometry this crate cannot diarize honestly is not worth inferring
+  /// over. Through `extract` it is reachable only for an ODD `step_samples`: the
+  /// aggregation's quotient is `c * step_samples / 270` exactly, so a rounding
+  /// tie needs `c * step_samples` to be an odd multiple of `135`.
+  /// [`crate::audio::speaker::window::DEFAULT_STEP_SAMPLES`] and argmax's fixed
+  /// stride are both even, so neither can raise it.
   #[error(
-    "extraction parts: chunk {} is placed at output frame {} by the count aggregation but at \
+    "chunk {} is placed at output frame {} by the count aggregation but at \
      frame {} by diaric's reconstruction — the two grids must agree, or the count selects \
      frames the activations never reach",
     .0.chunk(),
@@ -628,25 +641,41 @@ pub enum ExtractError {
   )]
   FrameStepNotRepresentableInF32(InvalidSlidingWindow),
   /// A `(chunk, slot)` whose `segmentations` column claims speech pairs with a
-  /// `raw_embeddings` row that `diaric::embed::Embedding::normalize_from`
-  /// refuses (non-finite, or norm below `diaric::embed::NORM_EPSILON`).
+  /// `raw_embeddings` row that cannot reach the clustering: non-finite, or with
+  /// an L2 norm below
+  /// [`crate::audio::speaker::extract::PLDA_MIN_NORM`] (`0.01`).
   ///
-  /// `None` from `normalize_from` is
-  /// [`crate::audio::speaker::extract::Extraction::diarize_online`]'s
-  /// DROPPED-SLOT sentinel — a dropped slot's row is all-zero precisely so that
-  /// it is rejected there and the slot stays UNMATCHED. A corrupt or degenerate
-  /// row under an ACTIVE column takes that same path, so the online engine reads
-  /// "no speaker here" and returns `Ok` with the speech missing. Rejecting at
-  /// assembly is what separates "this slot was deliberately dropped upstream"
-  /// (column zeroed too) from "this slot's embedding is broken".
+  /// That floor is BOTH backends' requirement, which is why it and not the
+  /// online engine's own test is the standard here:
   ///
-  /// Every in-crate path already satisfies this:
-  /// [`crate::audio::speaker::extract::Extractor::extract`] zeroes a dropped
-  /// slot's segmentation column at the same moment it leaves the row zero. See
+  /// - ONLINE, `diaric::embed::Embedding::normalize_from` returning `None` is
+  ///   [`crate::audio::speaker::extract::Extraction::diarize_online`]'s
+  ///   DROPPED-SLOT sentinel — a dropped slot's row is all-zero precisely so
+  ///   that it is rejected there and the slot stays UNMATCHED. A corrupt row
+  ///   under an ACTIVE column takes that same path, so the engine reads "no
+  ///   speaker here" and returns `Ok` with the speech missing.
+  /// - OFFLINE, `diaric::plda::RawEmbedding::from_raw_array` refuses the row
+  ///   outright (`Plda(DegenerateInput)`) at a norm floor of `0.01`
+  ///   (`diarization/src/plda/transform.rs:72,152-165`), nine orders of
+  ///   magnitude above `normalize_from`'s `NORM_EPSILON` (`1e-12`).
+  ///
+  /// A row BETWEEN the two floors — `[0.005, 0.0, …]` — is therefore accepted
+  /// and clustered into a speaker by one backend and fatal to the other, for
+  /// the identical `Extraction`. Holding to `normalize_from` alone would let
+  /// exactly that through.
+  ///
+  /// Every in-crate path already satisfies this at the STRICTER floor:
+  /// [`crate::audio::speaker::extract::Extractor::extract`] and the argmax
+  /// source both drop a below-`PLDA_MIN_NORM` slot, zeroing its segmentation
+  /// column at the same moment they leave its row zero — through the same
+  /// `extract::raw_embedding_reaches_plda` this check applies, so the
+  /// producers and the constructor cannot drift apart. Rejecting at assembly is
+  /// what separates "this slot was deliberately dropped upstream" (column
+  /// zeroed too) from "this slot's embedding is broken". See
   /// [`ActiveSlotWithoutEmbedding`].
   #[error(
-    "extraction parts: chunk {} slot {} has an active segmentations column but its raw_embeddings \
-     row is not a usable embedding (non-finite, or norm below diaric's NORM_EPSILON)",
+    "chunk {} slot {} has an active segmentations column but its raw_embeddings \
+     row cannot reach the clustering (non-finite, or L2 norm below PLDA's 0.01 floor)",
     .0.chunk(),
     .0.slot()
   )]

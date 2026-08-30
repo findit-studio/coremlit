@@ -268,7 +268,16 @@ fn active_slot_without_embedding_displays_chunk_and_slot() {
   let rendered = ExtractError::ActiveSlotWithoutEmbedding(a).to_string();
   assert!(rendered.contains("chunk 7"), "{rendered}");
   assert!(rendered.contains("slot 2"), "{rendered}");
-  assert!(rendered.contains("usable embedding"), "{rendered}");
+  // The message must name the floor the row failed. It is PLDA's `0.01`, the
+  // one BOTH backends require and both in-crate producers drop below — not
+  // `normalize_from`'s `1e-12`, which is the online engine's alone and which
+  // this variant used to advertise.
+  assert!(
+    rendered.contains("cannot reach the clustering"),
+    "{rendered}"
+  );
+  assert!(rendered.contains("0.01"), "{rendered}");
+  assert!(!rendered.contains("NORM_EPSILON"), "{rendered}");
 }
 
 #[test]

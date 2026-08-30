@@ -160,7 +160,7 @@ use coremlit::{
   ComputeUnits,
   audio::speaker::{
     embed::{EMBED_SLOTS, EMBEDDING_DIM, EmbedModel, EmbedModelOptions},
-    extract::Options,
+    extract::{Options, PLDA_MIN_NORM},
     segment::{
       POWERSET_CLASSES, SEG_CHUNK_SAMPLES, SEG_NUM_SLOTS, SegmentModel, SegmentModelOptions,
       multilabel,
@@ -460,12 +460,6 @@ fn run_seg(backend: Backend, samples: &[f32], starts: &[usize]) -> SegRun {
 // Stage 2 — assembly: seg slabs + an embedding backend -> clustered spans
 // ══════════════════════════════════════════════════════════════════════
 
-/// dia's minimum pre-PLDA embedding norm (`owned.rs:619-630`; speakerkit's
-/// private `extract::PLDA_MIN_NORM`): a slot whose raw embedding is shorter
-/// than this is dropped, its segmentation column zeroed, exactly as if it had
-/// never been active.
-const PLDA_MIN_NORM: f64 = 0.01;
-
 /// The embedding backend for one cell, holding its loaded model. dia's is
 /// `&mut self` per call; speakerkit's is `&self` and batches all three slots.
 enum EmbedSide {
@@ -602,7 +596,10 @@ fn assemble(seg: &SegRun, embed: &mut EmbedSide, samples: &[f32], starts: &[usiz
     for (s, row) in rows.iter().enumerate() {
       let Some(row) = row else { continue };
       // dia's f64 norm pre-check (`owned.rs:619-630`): a degenerate embedding
-      // is dropped and its column zeroed rather than fed to PLDA.
+      // is dropped and its column zeroed rather than fed to PLDA. The floor is
+      // IMPORTED from `coremlit` — this cell must drop exactly the rows the
+      // crate's own producers drop, and a local `0.01` here would be a fourth
+      // copy that can drift out from under the comparison.
       let norm_sq: f64 = row.iter().map(|v| f64::from(*v) * f64::from(*v)).sum();
       if norm_sq.sqrt() < PLDA_MIN_NORM {
         zero_slot_column(&mut segmentations[lo..hi], num_frames, s);

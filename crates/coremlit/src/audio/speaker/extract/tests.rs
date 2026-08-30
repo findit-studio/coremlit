@@ -2698,3 +2698,417 @@ fn try_from_parts_accepts_equal_non_zero_origins_that_place_every_chunk_identica
   assert_eq!(e.num_output_frames(), 2);
   assert_eq!(e.chunks_sw().start(), 1.0);
 }
+
+// =====================================================================
+// The two grids must agree BEFORE an Extraction exists — adversarial
+// review round 3, finding 1. `try_from_parts`'s check 8 was correct and
+// `extract()` was the defect it exposed: `extract()` assembles through the
+// crate-private, UNCHECKED `from_parts`, so it could emit exactly the
+// `Extraction` its own public constructor refuses.
+// =====================================================================
+
+/// The chunk grid `Extractor::extract` derives from a 160 001-sample clip at
+/// `step_samples = 31_995` — through the same three `window` calls `extract`
+/// itself makes, so this IS that method's geometry and not a re-derivation.
+fn misaligned_extract_geometry() -> (usize, SlidingWindow, SlidingWindow) {
+  let w = WindowOptions::new().with_step_samples(31_995);
+  let num_chunks = crate::audio::speaker::window::chunk_starts(160_001, &w).len();
+  (
+    num_chunks,
+    crate::audio::speaker::window::chunk_sliding_window(&w),
+    crate::audio::speaker::window::frame_sliding_window(),
+  )
+}
+
+#[test]
+fn extract_derives_a_geometry_whose_two_frame_mappings_disagree() {
+  // The trigger, reproduced end to end at the geometry layer. `step_samples =
+  // 31_995` is odd and `31_995 = 135 * 237` with `237` odd, so chunk 1's
+  // aggregation quotient `1 * 31_995 / 270` is exactly `118.5` — a rounding
+  // tie. The aggregation computes that `118.5` and banker's-rounds DOWN to
+  // 118; the reconstruction's `(chunk_start + duration/2) - duration/2` round
+  // trip computes `118.50000000000001` and rounds UP to 119.
+  let (num_chunks, chunks_sw, frames_sw) = misaligned_extract_geometry();
+  assert_eq!(num_chunks, 2, "160_001 samples over a 31_995 step");
+  assert_eq!(chunks_sw.step(), 1.9996875);
+
+  assert_eq!(
+    crate::audio::speaker::window::aggregate_chunk_start_frame(
+      1,
+      chunks_sw.step(),
+      frames_sw.step()
+    ),
+    118,
+    "the count aggregation places chunk 1 at frame 118"
+  );
+  assert_eq!(
+    crate::audio::speaker::window::reconstruct_chunk_start_frame(1, chunks_sw, frames_sw),
+    119,
+    "diaric's reconstruction places the same chunk at frame 119"
+  );
+
+  let m = crate::audio::speaker::window::first_misaligned_chunk(num_chunks, chunks_sw, frames_sw)
+    .expect("the shared guard must see the same disagreement");
+  assert_eq!(
+    (m.chunk(), m.aggregated(), m.reconstructed()),
+    (1, 118, 119)
+  );
+}
+
+#[test]
+fn a_misaligned_geometry_shifts_the_emitted_span_by_a_whole_frame() {
+  // The OBSERVABLE consequence, and the reason refusing is the fix rather than
+  // documenting: with the crate-private unchecked assembly — which is what
+  // `extract()` used to reach unguarded — the emitted span lands on the frame
+  // the COUNT names, not the frame the reconstruction put the activation on.
+  //
+  // Speaker A holds chunk 0's first 100 frames; two more slots are active in
+  // chunk 1's FIRST frame only. `extract()`'s own aggregation puts that frame's
+  // count at output frame 118, while `diaric::reconstruct` puts its activations
+  // at 119.
+  let (num_chunks, chunks_sw, frames_sw) = misaligned_extract_geometry();
+  let nf = 589; // the real segmenter's per-chunk frame count
+  let mut segmentations = vec![0.0f64; num_chunks * nf * SEG_NUM_SLOTS];
+  for f in 0..100 {
+    segmentations[f * SEG_NUM_SLOTS] = 1.0;
+  }
+  segmentations[nf * SEG_NUM_SLOTS + 1] = 1.0;
+  segmentations[nf * SEG_NUM_SLOTS + 2] = 1.0;
+
+  // EXACTLY the call `extract()` makes at its step 9-11.
+  let count = crate::audio::speaker::window::try_count_from_segmentations(
+    &segmentations,
+    num_chunks,
+    nf,
+    SEG_NUM_SLOTS,
+    WindowOptions::new().onset(),
+    chunks_sw,
+    frames_sw,
+  )
+  .expect("this geometry's output-frame count fits usize");
+  assert_eq!(
+    (count[118], count[119]),
+    (1, 0),
+    "the count marks frame 118 and leaves 119 empty"
+  );
+
+  // The same overlap-add, placing each chunk where `diaric::reconstruct` does.
+  let aligned = {
+    let mut agg = vec![0.0f64; count.len()];
+    let mut cov = vec![0.0f64; count.len()];
+    for c in 0..num_chunks {
+      let start =
+        crate::audio::speaker::window::reconstruct_chunk_start_frame(c, chunks_sw, frames_sw);
+      for f in 0..nf {
+        let Ok(t) = usize::try_from(start + f as i64) else {
+          continue;
+        };
+        if t >= count.len() {
+          continue;
+        }
+        agg[t] += segmentations[((c * nf + f) * SEG_NUM_SLOTS)..][..SEG_NUM_SLOTS]
+          .iter()
+          .filter(|v| **v > 0.0)
+          .count() as f64;
+        cov[t] += 1.0;
+      }
+    }
+    (0..count.len())
+      .map(|t| {
+        if cov[t] > 0.0 {
+          (agg[t] / cov[t]).round_ties_even() as u8
+        } else {
+          0
+        }
+      })
+      .collect::<Vec<u8>>()
+  };
+  assert_eq!(
+    (aligned[118], aligned[119]),
+    (0, 1),
+    "placed the way the activations are, the same frame's count belongs at 119"
+  );
+
+  let mut raw_embeddings = vec![0.0f32; num_chunks * SEG_NUM_SLOTS * EMBEDDING_DIM];
+  raw_embeddings[..64].fill(1.0);
+  let c1 = SEG_NUM_SLOTS * EMBEDDING_DIM;
+  raw_embeddings[c1 + EMBEDDING_DIM..c1 + EMBEDDING_DIM + 64].fill(-1.0);
+  for k in 0..64 {
+    raw_embeddings[c1 + 2 * EMBEDDING_DIM + 2 * k] = 1.0;
+  }
+
+  let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+  let span_start = |count: Vec<u8>| -> f64 {
+    Extraction::from_parts(
+      raw_embeddings.clone(),
+      segmentations.clone(),
+      count,
+      num_chunks,
+      nf,
+      chunks_sw,
+      frames_sw,
+    )
+    .diarize_with(&plda, ClusterBackend::default())
+    .expect("both counts diarize")
+    .spans_slice()
+    .last()
+    .expect("a trailing span for chunk 1's lone active frame")
+    .start()
+  };
+  let shifted = span_start(count.clone());
+  let honest = span_start(aligned);
+  assert!(
+    (honest - shifted - frames_sw.step()).abs() < 1e-12,
+    "the count's placement moves the emitted span a whole frame step earlier: \
+     {shifted} vs {honest}"
+  );
+
+  // Which is why BOTH public paths must refuse this geometry outright.
+  let err = refused(ExtractionParts {
+    raw_embeddings,
+    segmentations,
+    count,
+    num_chunks,
+    num_frames_per_chunk: nf,
+    chunks_sw,
+    frames_sw,
+  });
+  assert!(
+    matches!(err, ExtractError::MisalignedChunkPlacement(m)
+      if (m.chunk(), m.aggregated(), m.reconstructed()) == (1, 118, 119)),
+    "expected MisalignedChunkPlacement(1, 118, 119), got {err:?}"
+  );
+}
+
+#[test]
+fn every_shipping_extract_geometry_places_its_chunks_identically() {
+  // The other half: the guard must not refuse a geometry the crate actually
+  // ships. A tie needs `c * step_samples` to be an odd multiple of 135, which
+  // an EVEN `step_samples` can never be — and the default (16 000) and argmax's
+  // stride are both even. Swept over chunk counts far past any real clip.
+  let w = WindowOptions::new();
+  assert_eq!(w.step_samples() % 2, 0, "the default step is even");
+  let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&w);
+  let frames_sw = crate::audio::speaker::window::frame_sliding_window();
+  assert_eq!(
+    crate::audio::speaker::window::first_misaligned_chunk(100_000, chunks_sw, frames_sw),
+    None,
+    "the default geometry must survive 100 000 chunks (~27.7 h of audio)"
+  );
+
+  // And every EVEN step across the supported range, over a chunk count far
+  // past the first tie any ODD step reaches (the smallest tying chunk index is
+  // `135 / gcd(step_samples, 135)`, at most 135).
+  for step in (2..=SEG_CHUNK_SAMPLES as u32).step_by(1_998) {
+    assert_eq!(step % 2, 0, "the sweep must stay on even steps");
+    let w = WindowOptions::new().with_step_samples(step);
+    let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&w);
+    assert_eq!(
+      crate::audio::speaker::window::first_misaligned_chunk(4_096, chunks_sw, frames_sw),
+      None,
+      "even step_samples={step} must never tie"
+    );
+  }
+
+  // The complement, so the sweep above is a real discrimination and not a
+  // vacuous pass: the reviewer's own odd step DOES tie, at chunk 1.
+  let odd = crate::audio::speaker::window::chunk_sliding_window(
+    &WindowOptions::new().with_step_samples(31_995),
+  );
+  assert!(
+    crate::audio::speaker::window::first_misaligned_chunk(2, odd, frames_sw).is_some(),
+    "step_samples=31_995 must still be caught"
+  );
+}
+
+#[test]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
+fn extract_refuses_a_geometry_whose_two_frame_mappings_disagree() {
+  // The wiring, on the real method. `extract` assembles through the
+  // crate-private `from_parts`, which validates nothing, so WITHOUT its own
+  // guard this call returns `Ok` with the `Extraction`
+  // `Extraction::try_from_parts` rejects — the shifted span the hermetic test
+  // above measures. The guard runs before any inference, so this refusal costs
+  // no model time.
+  let seg = load_seg_model();
+  let embed = load_embed_model();
+  let options = Options::new().with_window(WindowOptions::new().with_step_samples(31_995));
+  // Not `expect_err`: on the failing (accepted) side that renders the whole
+  // 712-frame `Extraction` and buries the one fact this falsifier reports.
+  match Extractor::with_options(options).extract(&seg, &embed, &vec![0.0f32; 160_001]) {
+    Err(ExtractError::MisalignedChunkPlacement(m)) => {
+      assert_eq!(
+        (m.chunk(), m.aggregated(), m.reconstructed()),
+        (1, 118, 119)
+      );
+    }
+    Err(other) => panic!("expected MisalignedChunkPlacement(1, 118, 119), got {other:?}"),
+    Ok(e) => panic!(
+      "extract ACCEPTED a misaligned geometry: {} chunks on chunks_sw={:?}, which the count \
+       aggregation places at frame {} and diaric's reconstruction at frame {}",
+      e.num_chunks(),
+      e.chunks_sw(),
+      crate::audio::speaker::window::aggregate_chunk_start_frame(
+        1,
+        e.chunks_sw().step(),
+        e.frames_sw().step()
+      ),
+      crate::audio::speaker::window::reconstruct_chunk_start_frame(1, e.chunks_sw(), e.frames_sw()),
+    ),
+  }
+
+  // The shipping default over the identical clip stays accepted.
+  Extractor::new()
+    .extract(&seg, &embed, &vec![0.0f32; 160_001])
+    .expect("the default geometry places every chunk identically");
+}
+
+// =====================================================================
+// An active slot's row must clear PLDA's floor, not just the online
+// engine's — adversarial review round 3, finding 2.
+// =====================================================================
+
+#[test]
+fn try_from_parts_rejects_an_active_row_below_plda_norm_that_only_online_tolerates() {
+  // The trigger: one default-geometry chunk, slot 0 active in all 589 frames,
+  // and a slot-0 row of `[0.005, 0.0, …]` — norm 0.005. That is nine orders of
+  // magnitude ABOVE `Embedding::normalize_from`'s `1e-12` floor (so check 9's
+  // old predicate accepted it) and BELOW PLDA's 0.01 (so the offline backend
+  // refuses the whole extraction). The two backends therefore disagree about
+  // the identical `Extraction`, which is exactly what this constructor exists
+  // to prevent.
+  let w = WindowOptions::new();
+  let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&w);
+  let frames_sw = crate::audio::speaker::window::frame_sliding_window();
+  let nf = 589;
+  let mut segmentations = vec![0.0f64; nf * SEG_NUM_SLOTS];
+  for f in 0..nf {
+    segmentations[f * SEG_NUM_SLOTS] = 1.0;
+  }
+  let count = crate::audio::speaker::window::try_count_from_segmentations(
+    &segmentations,
+    1,
+    nf,
+    SEG_NUM_SLOTS,
+    w.onset(),
+    chunks_sw,
+    frames_sw,
+  )
+  .expect("this geometry's output-frame count fits usize");
+
+  let mut raw_embeddings = vec![0.0f32; SEG_NUM_SLOTS * EMBEDDING_DIM];
+  raw_embeddings[0] = 0.005;
+
+  // Both halves of the divergence, proved against the engines themselves.
+  let mut row = [0.0f32; EMBEDDING_DIM];
+  row.copy_from_slice(&raw_embeddings[..EMBEDDING_DIM]);
+  assert!(
+    diaric::embed::Embedding::normalize_from(row).is_some(),
+    "the online engine's own test ACCEPTS this row — matching it is the defect"
+  );
+  assert!(
+    matches!(
+      diaric::plda::RawEmbedding::from_wespeaker(row),
+      Err(diaric::plda::Error::DegenerateInput)
+    ),
+    "PLDA's raw boundary refuses it at the 0.01 floor"
+  );
+
+  let parts = ExtractionParts {
+    raw_embeddings,
+    segmentations,
+    count,
+    num_chunks: 1,
+    num_frames_per_chunk: nf,
+    chunks_sw,
+    frames_sw,
+  };
+
+  // Assembled unchecked, the two backends split: offline fails outright, online
+  // normalizes the row and manufactures a ~9.94 s speaker.
+  let unchecked = Extraction::from_parts(
+    parts.raw_embeddings.clone(),
+    parts.segmentations.clone(),
+    parts.count.clone(),
+    parts.num_chunks,
+    parts.num_frames_per_chunk,
+    parts.chunks_sw,
+    parts.frames_sw,
+  );
+  let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+  assert!(
+    matches!(
+      unchecked.diarize_with(&plda, ClusterBackend::default()),
+      Err(diaric::offline::Error::Plda(
+        diaric::plda::Error::DegenerateInput
+      ))
+    ),
+    "offline must fail on this row"
+  );
+  let online = unchecked
+    .diarize_online(OnlineOptions::new())
+    .expect("online accepts it");
+  assert_eq!(
+    online.spans_slice().len(),
+    1,
+    "online manufactures a speaker from the same row"
+  );
+
+  let err = refused(parts);
+  assert!(
+    matches!(err, ExtractError::ActiveSlotWithoutEmbedding(a) if (a.chunk(), a.slot()) == (0, 0)),
+    "expected ActiveSlotWithoutEmbedding(0, 0), got {err:?}"
+  );
+}
+
+#[test]
+fn the_active_row_floor_is_the_one_both_in_crate_producers_drop_at() {
+  // The threshold is not this constructor's own: `Extractor::extract` and the
+  // argmax source both DROP a slot whose row falls below it, and `diaric`
+  // re-applies the identical number at the PLDA boundary. All three read
+  // `raw_embedding_reaches_plda`, so this pins the value they share rather than
+  // adding a fourth copy of it.
+  assert_eq!(PLDA_MIN_NORM, 0.01);
+
+  // Agreement with PLDA's own admission test, straddling the floor. Equality
+  // over the whole sweep is the property: a floor that drifts in either
+  // direction shows up as a row one side keeps and the other refuses.
+  let mut disagreements = 0;
+  for micro in 9_000..11_000u32 {
+    let v = f64::from(micro) / 1_000_000.0;
+    let mut row = [0.0f32; EMBEDDING_DIM];
+    row[0] = v as f32;
+    let mine = raw_embedding_reaches_plda(&row);
+    let plda = diaric::plda::RawEmbedding::from_wespeaker(row).is_ok();
+    if mine != plda {
+      disagreements += 1;
+    }
+  }
+  assert_eq!(
+    disagreements, 0,
+    "the crate's row predicate and PLDA's own boundary must admit the same rows"
+  );
+
+  // And the floor really is 0.01, not the online engine's 1e-12: a row between
+  // the two is refused here while `normalize_from` still accepts it.
+  let mut between = [0.0f32; EMBEDDING_DIM];
+  between[0] = 0.005;
+  assert!(!raw_embedding_reaches_plda(&between));
+  assert!(diaric::embed::Embedding::normalize_from(between).is_some());
+
+  let mut above = [0.0f32; EMBEDDING_DIM];
+  above[0] = 0.02;
+  assert!(raw_embedding_reaches_plda(&above));
+
+  // Non-finite is refused by the same predicate, matching `from_raw_array`'s
+  // own leading finiteness scan — a `+inf` row has an INFINITE norm, which a
+  // bare `norm >= floor` comparison would have admitted.
+  let mut infinite = above;
+  infinite[1] = f32::INFINITY;
+  assert!(!raw_embedding_reaches_plda(&infinite));
+  assert!(diaric::plda::RawEmbedding::from_wespeaker(infinite).is_err());
+  let mut nan = above;
+  nan[1] = f32::NAN;
+  assert!(!raw_embedding_reaches_plda(&nan));
+  assert!(diaric::plda::RawEmbedding::from_wespeaker(nan).is_err());
+}

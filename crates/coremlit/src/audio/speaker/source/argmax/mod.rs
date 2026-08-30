@@ -187,8 +187,9 @@
 //! **finite, non-zero, CONSTANT** embedding (L2 norm ≈ 0.5356, bit-identical
 //! across every all-zero row) — *not* the NaN that FluidAudio's WeSpeaker
 //! produces from an empty mask ([`crate::audio::speaker::error::InferError::EmptyMask`]). Its
-//! norm is ~54× ABOVE `PLDA_MIN_NORM` (0.01), so the norm guard cannot catch
-//! it, and it carries no speaker information at all.
+//! norm is ~54× ABOVE [`crate::audio::speaker::extract::PLDA_MIN_NORM`]
+//! (0.01), so the norm guard cannot catch it, and it carries no speaker
+//! information at all.
 //!
 //! ## argmax is not vulnerable to this — but nothing at its MASK is what saves it
 //!
@@ -357,7 +358,7 @@ use crate::{ComputeUnits, DataType, Features, Model, MultiArray, f16};
 use crate::audio::speaker::{
   embed::{EMBED_SLOTS, EMBEDDING_DIM},
   error::{ExtractError, InferError, ModelError},
-  extract::{EXCLUDE_OVERLAP_MIN_FRAMES, Extraction},
+  extract::{EXCLUDE_OVERLAP_MIN_FRAMES, Extraction, raw_embedding_reaches_plda},
   segment::{SEG_CHUNK_SAMPLES, SEG_NUM_SLOTS},
   source::ModelSource,
   window::WindowOptions,
@@ -456,17 +457,6 @@ pub const ARGMAX_CHUNK_HOP_SAMPLES: usize = ARGMAX_CHUNK_SAMPLES - ARGMAX_CHUNK_
 /// `activity * secondsPerFrame > 2.0 * secondsPerFrame` reduces to
 /// `activity > 2.0` — `speaker_activity` IS a frame count, module doc).
 pub const ARGMAX_MIN_ACTIVE_FRAMES: f32 = 2.0;
-
-/// PLDA minimum raw-embedding L2 norm — the same guard
-/// [`crate::audio::speaker::extract::Extractor::extract`] applies (dia's inline `0.01`,
-/// `diarization/src/offline/owned.rs:619-630`), re-applied here because
-/// `Extraction` feeds the same `diaric` clustering either way.
-///
-/// It could never have substituted for an all-zero-mask guard — that
-/// embedding's norm is ≈ 0.5356, ~54× above this (module doc) — but with
-/// `dia`'s exclude-overlap fallback in place, an all-zero mask row is
-/// unreachable for a consumed slot, so no such guard is needed.
-const PLDA_MIN_NORM: f64 = 0.01;
 
 mod names {
   /// Segmenter input: the 30 s waveform, `[480000]`, F16.
@@ -1494,15 +1484,16 @@ fn place_embeddings(
       });
     }
 
-    // Same f64 norm pre-check dia applies (`owned.rs:619-630`).
-    let norm_sq: f64 = embedding
-      .iter()
-      .map(|v| f64::from(*v) * f64::from(*v))
-      .sum();
-    if norm_sq.sqrt() < PLDA_MIN_NORM {
-      zero_slot_column(&mut segmentations[chunk_segmentation_range(c)], s);
-    } else {
+    // Same f64 norm pre-check dia applies (`owned.rs:619-630`), through the
+    // ONE predicate `Extractor::extract` and `Extraction::try_from_parts` also
+    // read — a second `0.01` written here is a second number that can drift,
+    // and the three must agree for a row this source keeps to be a row that
+    // constructor accepts. Its finiteness clause cannot fire: the scan above
+    // already returned `NonFiniteOutput` with the offending index.
+    if raw_embedding_reaches_plda(embedding) {
       raw_embeddings[embedding_range(c, s)].copy_from_slice(embedding);
+    } else {
+      zero_slot_column(&mut segmentations[chunk_segmentation_range(c)], s);
     }
   }
   Ok(())
