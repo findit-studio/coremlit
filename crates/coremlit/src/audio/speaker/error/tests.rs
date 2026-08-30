@@ -382,3 +382,27 @@ fn non_finite_raw_embedding_displays_the_index_it_decodes_to_chunk_slot_dimensio
     "{rendered}"
   );
 }
+
+#[test]
+fn extraction_tensor_bytes_too_large_displays_the_total_and_the_cap() {
+  use crate::audio::speaker::extract::MAX_EXTRACTION_TENSOR_BYTES;
+
+  let rendered =
+    ExtractError::ExtractionTensorBytesTooLarge(MAX_EXTRACTION_TENSOR_BYTES + 1).to_string();
+  assert!(
+    rendered.contains(&(MAX_EXTRACTION_TENSOR_BYTES + 1).to_string()),
+    "{rendered}"
+  );
+  assert!(
+    rendered.contains("MAX_EXTRACTION_TENSOR_BYTES"),
+    "{rendered}"
+  );
+  assert!(
+    rendered.contains(&MAX_EXTRACTION_TENSOR_BYTES.to_string()),
+    "{rendered}"
+  );
+  // The message must say which grid it is talking about: a caller who has just
+  // read `OutputFrameCountTooLarge`'s "output frames" needs to see that this one
+  // is the chunk grid, not the same bound restated.
+  assert!(rendered.contains("chunk grid"), "{rendered}");
+}

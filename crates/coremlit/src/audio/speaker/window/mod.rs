@@ -650,8 +650,16 @@ pub fn chunk_starts(total_samples: usize, options: &WindowOptions) -> Vec<usize>
 /// that refuses a clip no backend could finish — is derived from `num_chunks`
 /// and the two sliding windows alone, and at a cap-tripping clip the starts
 /// vector is itself `8 * num_chunks` bytes (566 KB at the smallest such clip,
-/// and `2 * total_samples` bytes at `step_samples = 1`) of exactly the
+/// and `8 * total_samples` bytes at `step_samples = 1`) of exactly the
 /// allocation that cap exists to refuse.
+///
+/// This count is also the input to
+/// [`crate::audio::speaker::extract::MAX_EXTRACTION_TENSOR_BYTES`], the bound on
+/// the axis the frame cap cannot see: `num_chunks` is `total_samples /
+/// step_samples` while the output grid is very nearly `total_samples / 270`, so
+/// a small `step_samples` drives this value — and with it both extraction
+/// tensors, this starts vector, and the model-call count — without moving the
+/// frame cap at all.
 ///
 /// # Panics
 /// Panics if `options.step_samples() == 0`, for the reason and with the message

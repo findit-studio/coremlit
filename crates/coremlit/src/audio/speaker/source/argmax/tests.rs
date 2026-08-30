@@ -1880,3 +1880,66 @@ fn the_frame_cap_refuses_argmax_geometry_before_its_input_scans() {
     )
   );
 }
+
+/// Round 10, this source's half: the chunk-axis bound runs at argmax's earliest
+/// point too, and is UNREACHABLE from here.
+///
+/// `MAX_EXTRACTION_TENSOR_BYTES` is derived from the first chunk count
+/// `MAX_OUTPUT_FRAMES` refuses at `DEFAULT_STEP_SAMPLES`, and this source's
+/// stride IS that value — pinned by its compiled graph and re-asserted at the
+/// top of `extract`. So at every clip length the frame cap refuses first, and
+/// this bound never names an error. That is a property of the derivation, not a
+/// coincidence, and it is what the round-8 posture asks be pinned rather than
+/// used as a licence to skip the check: the stride is a property of the shipped
+/// graph, not an invariant of `checked_geometry`.
+#[test]
+fn the_chunk_axis_cap_is_inert_for_argmaxs_pinned_stride() {
+  use crate::audio::speaker::extract::{
+    MAX_EXTRACTION_TENSOR_BYTES, checked_extraction_tensor_bytes,
+  };
+
+  /// The smallest clip whose derived output grid exceeds `MAX_OUTPUT_FRAMES` —
+  /// the same constant round 9's falsifier uses.
+  const SMALLEST_OVER_CAP_SAMPLES: usize = 1_132_448_001;
+
+  let w = ArgmaxOptions::new().window();
+  assert_eq!(w.step_samples() as usize, ARGMAX_WINDOW_STRIDE_SAMPLES);
+  assert_eq!(
+    ARGMAX_WINDOW_STRIDE_SAMPLES as u32,
+    crate::audio::speaker::window::DEFAULT_STEP_SAMPLES,
+    "the derivation of MAX_EXTRACTION_TENSOR_BYTES rests on these being equal"
+  );
+
+  // The largest clip the frame cap admits: 70 769 chunks, under the ceiling.
+  let (num_chunks, _, _) = checked_geometry(SMALLEST_OVER_CAP_SAMPLES - 1, &w)
+    .expect("one sample under the frame cap is still accepted");
+  assert_eq!(num_chunks, 70_769);
+  assert_eq!(
+    checked_extraction_tensor_bytes(num_chunks, ARGMAX_FRAMES_PER_WINDOW),
+    Ok(1_217_792_952)
+  );
+  const { assert!(1_217_792_952 < MAX_EXTRACTION_TENSOR_BYTES) };
+
+  // And one sample past it still names the FRAME cap, not this one — the two
+  // are ordered, and the chunk-axis bound has nothing to say at this stride.
+  assert_eq!(
+    checked_geometry(SMALLEST_OVER_CAP_SAMPLES, &w),
+    Err(ExtractError::OutputFrameCountTooLarge(4_194_312))
+  );
+
+  // The property, not the two samples: across the whole admissible range this
+  // stride's chunk grid never passes the ceiling.
+  for samples in [
+    1usize,
+    160_000,
+    160_001,
+    16_000_000,
+    SMALLEST_OVER_CAP_SAMPLES - 1,
+  ] {
+    let n = crate::audio::speaker::window::num_chunks(samples, &w);
+    assert!(
+      checked_extraction_tensor_bytes(n, ARGMAX_FRAMES_PER_WINDOW).is_ok(),
+      "samples={samples} -> {n} chunks must stay inside the ceiling"
+    );
+  }
+}

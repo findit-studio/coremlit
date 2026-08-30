@@ -193,8 +193,8 @@ impl ExtractionLenMismatch {
   }
 }
 
-/// The element count a declared geometry requires overflows `usize`, so NO
-/// slice length can satisfy it and no expected length can even be named.
+/// The size a declared geometry requires overflows `usize`, so NO slice can
+/// satisfy it and no expected length can even be named.
 ///
 /// Payload of [`ExtractError::ExtractionGeometryOverflow`]. Reported separately
 /// from [`ExtractionLenMismatch`] because the two are different diagnoses: a
@@ -203,6 +203,13 @@ impl ExtractionLenMismatch {
 /// between `ShapeError::RawEmbeddingsOverflow` /
 /// `ShapeError::SegmentationsOverflow` and their `*LenMismatch` counterparts
 /// (`diarization/src/offline/algo.rs:575-588`).
+///
+/// Raised from two places, over the same dimensions in two units.
+/// [`ExtractError::ExtractionTensorBytesTooLarge`]'s preflight computes the same
+/// products in BYTES, so it also covers an element count that fits `usize` while
+/// its byte size does not — a `Vec` of which is unallocatable regardless. Both
+/// check `raw_embeddings` before `segmentations`, so a geometry that overflows
+/// both names the same [`ExtractionPart`] either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ExtractionGeometryOverflow {
   part: ExtractionPart,
@@ -211,7 +218,7 @@ pub struct ExtractionGeometryOverflow {
 }
 
 impl ExtractionGeometryOverflow {
-  /// Whose length product overflowed — [`ExtractionPart::RawEmbeddings`] or
+  /// Whose product overflowed — [`ExtractionPart::RawEmbeddings`] or
   /// [`ExtractionPart::Segmentations`].
   #[inline(always)]
   pub const fn part(&self) -> ExtractionPart {
@@ -231,7 +238,8 @@ impl ExtractionGeometryOverflow {
     self.num_frames_per_chunk
   }
 
-  /// Crate-private: only the validating constructor raises this.
+  /// Crate-private: only the validating constructor and the producers'
+  /// geometry preflight raise this.
   pub(crate) const fn new(
     part: ExtractionPart,
     num_chunks: usize,
@@ -1025,6 +1033,36 @@ pub enum ExtractError {
     crate::audio::speaker::extract::MAX_OUTPUT_FRAMES
   )]
   OutputFrameCountTooLarge(usize),
+  /// The `segmentations` + `raw_embeddings` footprint the chunk grid derives is
+  /// above [`crate::audio::speaker::extract::MAX_EXTRACTION_TENSOR_BYTES`].
+  ///
+  /// The sibling of [`Self::OutputFrameCountTooLarge`] on the OTHER axis, and
+  /// the reason both exist: that one bounds the output grid, which is a function
+  /// of the clip's duration, while the producers allocate on the chunk grid,
+  /// which is `samples.len() / step_samples`. A ten-minute clip at
+  /// `step_samples = 2` derives 4 720 001 chunks and 81 221 777 208 bytes of
+  /// tensors while its output grid is 0.85 % of `MAX_OUTPUT_FRAMES` — so the
+  /// frame cap passes it and this one refuses it.
+  ///
+  /// A RESOURCE bound, not a consistency invariant: the geometry is internally
+  /// consistent and would produce a correct `Extraction` on a machine large
+  /// enough. See
+  /// [`crate::audio::speaker::extract::MAX_EXTRACTION_TENSOR_BYTES`] for how the
+  /// ceiling is derived, why the byte count is bounded rather than the chunk
+  /// count or the model-call count, and why
+  /// [`crate::audio::speaker::extract::Extraction::try_from_parts`] does not
+  /// raise this.
+  ///
+  /// Raised from GEOMETRY ALONE, before any tensor is allocated or any model is
+  /// called. Carries the derived byte total that was refused; the ceiling is the
+  /// public constant.
+  #[error(
+    "extraction geometry: the declared chunk grid derives {} bytes of extraction \
+     tensors, above the MAX_EXTRACTION_TENSOR_BYTES cap ({})",
+    .0,
+    crate::audio::speaker::extract::MAX_EXTRACTION_TENSOR_BYTES
+  )]
+  ExtractionTensorBytesTooLarge(usize),
   /// The derived `num_output_frames` would not fit in `usize`. Converted
   /// from [`crate::audio::speaker::window`]'s crate-private `WindowError` by an exhaustive
   /// manual match in [`crate::audio::speaker::extract::Extractor::extract`] (deliberately

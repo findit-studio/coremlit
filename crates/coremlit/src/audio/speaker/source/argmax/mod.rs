@@ -1516,9 +1516,10 @@ fn place_embeddings(
 }
 
 /// The chunk count and both timing grids for `samples_len`, refused if the
-/// output-frame grid they derive is one this crate will not allocate for —
-/// checks 4 and 6 of the shared assembly sequence, over geometry alone
-/// (round 9).
+/// output-frame grid they derive is one this crate will not allocate for
+/// (checks 4 and 6 of the shared assembly sequence, round 9) or if the
+/// extraction tensors that chunk grid implies are (round 10) — over geometry
+/// alone.
 ///
 /// This source's EARLIEST enforcement point, and it is earlier than
 /// `Extractor::checked_geometry`'s: argmax's window stride is compiled into its
@@ -1550,7 +1551,22 @@ fn place_embeddings(
 /// # Errors
 /// [`ExtractError::OutputFrameCountOverflow`] or
 /// [`ExtractError::OutputFrameCountTooLarge`], through
-/// `extract::checked_output_frame_count`.
+/// `extract::checked_output_frame_count`; then
+/// [`ExtractError::ExtractionGeometryOverflow`] or
+/// [`ExtractError::ExtractionTensorBytesTooLarge`], through
+/// `extract::checked_extraction_tensor_bytes`. Both bounds run here rather than
+/// only at assembly for the same reason, and in the same order, as in
+/// `Extractor::checked_geometry`.
+///
+/// The chunk-axis bound is UNREACHABLE from this source and is run anyway. Its
+/// stride is pinned to `ARGMAX_WINDOW_STRIDE_SAMPLES`, which IS
+/// `DEFAULT_STEP_SAMPLES`, and
+/// [`crate::audio::speaker::extract::MAX_EXTRACTION_TENSOR_BYTES`] is derived so
+/// that at that stride the frame cap always refuses first
+/// (`the_chunk_axis_cap_is_inert_for_argmaxs_pinned_stride`). Running it here is
+/// the round-8 posture: a bound every producer applies, rather than each
+/// producer applying the bounds it happens to be able to reach — the compiled
+/// stride is a property of the shipped graph, not an invariant of this function.
 ///
 /// # Panics
 /// Panics if `w_opts.step_samples()` is `0`, as
@@ -1565,6 +1581,10 @@ fn checked_geometry(
   let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(w_opts);
   let frames_sw = crate::audio::speaker::window::frame_sliding_window();
   crate::audio::speaker::extract::checked_output_frame_count(num_chunks, chunks_sw, frames_sw)?;
+  crate::audio::speaker::extract::checked_extraction_tensor_bytes(
+    num_chunks,
+    ARGMAX_FRAMES_PER_WINDOW,
+  )?;
   Ok((num_chunks, chunks_sw, frames_sw))
 }
 
@@ -1613,7 +1633,10 @@ impl ModelSource for ArgmaxSource {
   ///   raised since round 9 from the chunk grid alone, before this method's two
   ///   whole-buffer input scans and before any tensor or model call, since its
   ///   window stride is fixed at load and `samples.len()` is therefore the last
-  ///   input the grid needs.
+  ///   input the grid needs. Its round-10 sibling
+  ///   [`ExtractError::ExtractionTensorBytesTooLarge`] is applied at the same
+  ///   point and is NOT reachable from this source — see `checked_geometry` for
+  ///   why it runs regardless.
   fn extract(&self, samples: &[f32]) -> Result<Extraction, ExtractError> {
     if samples.is_empty() {
       return Err(ExtractError::EmptySamples);

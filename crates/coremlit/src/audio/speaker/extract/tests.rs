@@ -4671,7 +4671,7 @@ fn the_frame_cap_refuses_before_the_allocation_it_bounds() {
   // back behind the tensors would show up here.
   let extractor = Extractor::new();
   assert_eq!(
-    extractor.checked_geometry(SMALLEST_OVER_CAP_SAMPLES),
+    extractor.checked_geometry(SMALLEST_OVER_CAP_SAMPLES, FRAMES_PER_CHUNK),
     Err(ExtractError::OutputFrameCountTooLarge(OVER_CAP_FRAMES)),
     "the cap is reachable from `samples.len()` and the options alone — no \
      tensor, no model"
@@ -4683,7 +4683,7 @@ fn the_frame_cap_refuses_before_the_allocation_it_bounds() {
   // not already refused.
   let w = WindowOptions::new();
   let (num_chunks, chunks_sw, frames_sw) = extractor
-    .checked_geometry(SMALLEST_OVER_CAP_SAMPLES - 1)
+    .checked_geometry(SMALLEST_OVER_CAP_SAMPLES - 1, FRAMES_PER_CHUNK)
     .expect("one sample fewer derives a grid inside the cap");
   assert_eq!(
     (
@@ -4814,4 +4814,442 @@ fn the_geometry_preflight_and_the_assembled_check_never_disagree() {
       ),
     }
   }
+}
+
+/// Round 10: the cap round 9 hoisted bounds the OUTPUT axis, and the producers
+/// allocate on the CHUNK axis. Nothing bounded that one.
+///
+/// # The defect, measured
+///
+/// `num_output_frames` is a function of the clip's DURATION —
+/// `round(last_chunk_end / FRAME_STEP_S) + 1`, where `last_chunk_end =
+/// CHUNK_DURATION_S + (num_chunks - 1) * step_samples / SAMPLE_RATE_HZ`. The two
+/// `step_samples` cancel. The tensors are a function of `num_chunks =
+/// samples.len() / step_samples`, which they do not.
+///
+/// So at a small `step_samples` the two diverge without limit. Ten minutes of
+/// audio at `step_samples = 2` — a value `WindowOptions` accepts, since it
+/// guards only against `0` — derives 4 720 001 chunks and 81 221 777 208 bytes
+/// of `segmentations` + `raw_embeddings`, from 38 400 000 bytes of input. Its
+/// output grid is 35 557 frames: 0.85 % of `MAX_OUTPUT_FRAMES`. Every guard that
+/// existed passed it, the stride being even, so the placement scan found no tie
+/// either — and `extract` then asked the allocator for 75.64 GiB and faced
+/// 9 440 002 model calls.
+///
+/// The 81 221 777 208 below is MEASURED through `crate::tests::alloc_probe`, the
+/// counting global allocator round 9 added, by building the two `vec![..]`s from
+/// `Extractor::extract`'s own expressions at this geometry — not asserted from
+/// the arithmetic that would be about to be fixed. It is `0` after the refusal,
+/// because `checked_geometry` returns before the first `vec!`.
+///
+/// # What is substituted for the producer, and why
+///
+/// `Extractor::checked_geometry`, which IS `extract`'s pre-inference sequence —
+/// `extract` calls it and nothing else before it allocates a tensor or touches a
+/// model. `extract` itself cannot be run on this input: 9 440 002 CoreML calls
+/// is not a unit test on any host, which is the same reason round 9's falsifier
+/// attaches here.
+#[test]
+fn the_chunk_axis_cap_refuses_before_the_allocation_it_bounds() {
+  use crate::{audio::speaker::window, tests::alloc_probe};
+
+  /// A `step_samples` `WindowOptions` accepts today: it guards `0` and
+  /// `> SEG_CHUNK_SAMPLES`, nothing between.
+  const STEP: u32 = 2;
+  /// Ten minutes at 16 kHz — 38 400 000 bytes of `f32`.
+  const SAMPLES: usize = 9_600_000;
+  /// community-1's per-chunk frame count, which `extract` reads from the loaded
+  /// segmenter and hands `checked_geometry`.
+  const FRAMES_PER_CHUNK: usize = 589;
+  /// `1 + (9_600_000 - 160_000).div_ceil(2)`.
+  const NUM_CHUNKS: usize = 4_720_001;
+  /// `NUM_CHUNKS * (589 * 3 * 8 + 3 * 256 * 4)` — 75.64 GiB.
+  const TENSOR_BYTES: usize = 81_221_777_208;
+
+  let w = WindowOptions::new().with_step_samples(STEP);
+  let extractor = Extractor::with_options(Options::new().with_window(w));
+  let chunks_sw = window::chunk_sliding_window(&w);
+  let frames_sw = window::frame_sliding_window();
+  let num_chunks = window::num_chunks(SAMPLES, &w);
+  assert_eq!(num_chunks, NUM_CHUNKS);
+
+  // ── Every guard that existed before this one accepts the geometry ──
+  assert_eq!(
+    checked_output_frame_count(num_chunks, chunks_sw, frames_sw),
+    Ok(35_557),
+    "the output-frame cap sees a ten-minute clip and passes it"
+  );
+  // ...at well under 1 % of MAX_OUTPUT_FRAMES.
+  const { assert!(35_557 * 100 / MAX_OUTPUT_FRAMES == 0) };
+  assert_eq!(
+    window::first_misaligned_chunk(num_chunks, chunks_sw, frames_sw),
+    None,
+    "and the even stride clears the placement scan"
+  );
+
+  // ── The cap, at the producer's own earliest point ──────────────────
+  assert_eq!(
+    extractor.checked_geometry(SAMPLES, FRAMES_PER_CHUNK),
+    Err(ExtractError::ExtractionTensorBytesTooLarge(TENSOR_BYTES)),
+    "the chunk-axis bound is reachable from `samples.len()`, `step_samples` and \
+     the segmenter's frame count alone — no tensor, no model"
+  );
+
+  // ── What that refusal costs, and what it saves ─────────────────────
+  // `Extractor::extract`'s two output buffers at this geometry, sized by its own
+  // expressions. Zeroed and never read, so they cost address space rather than
+  // resident pages — which is exactly why a counting allocator is what sees
+  // them, and why the process survives long enough to report the number.
+  let (tensors, built) = alloc_probe::measure(|| {
+    (
+      vec![0.0f32; num_chunks * SEG_NUM_SLOTS * EMBEDDING_DIM],
+      vec![0.0f64; num_chunks * FRAMES_PER_CHUNK * SEG_NUM_SLOTS],
+    )
+  });
+  assert_eq!(
+    (built.total, built.peak),
+    (TENSOR_BYTES, TENSOR_BYTES),
+    "the two extraction tensors this geometry used to reach the chunk loop with"
+  );
+  assert_eq!(
+    (
+      tensors.0.len() * size_of::<f32>(),
+      tensors.1.len() * size_of::<f64>()
+    ),
+    (14_499_843_072, 66_721_934_136),
+    "raw_embeddings and segmentations, the two terms the bound adds"
+  );
+  drop(tensors);
+
+  // ...and the same door, on the same geometry, now allocating nothing.
+  let (err, spent) = alloc_probe::measure(|| {
+    extractor
+      .checked_geometry(SAMPLES, FRAMES_PER_CHUNK)
+      .expect_err("a 4 720 001-chunk grid is past MAX_EXTRACTION_TENSOR_BYTES")
+  });
+  assert_eq!(
+    err,
+    ExtractError::ExtractionTensorBytesTooLarge(TENSOR_BYTES)
+  );
+  assert_eq!(
+    (spent.total, spent.peak),
+    (0, 0),
+    "the preflight reaches the verdict from three `usize`s"
+  );
+}
+
+/// The boundary, and the ordering: the SMALLEST configuration the chunk-axis cap
+/// newly refuses, and the proof it is applied ahead of the `O(num_chunks)`
+/// placement scan.
+///
+/// `step_samples = 1` over 230 770 samples — 14.42 seconds, 923 080 bytes of
+/// `f32` — is the smallest input any legal configuration can turn into 70 771
+/// chunks, one past what `MAX_EXTRACTION_TENSOR_BYTES` admits. It is also
+/// misaligned (`first_misaligned_chunk` fires at chunk 135), which is what makes
+/// it an ordering falsifier: if the placement scan ran first, this call would
+/// name `MisalignedChunkPlacement`.
+///
+/// One sample fewer is 70 770 chunks — exactly `MAX_EXTRACTION_TENSOR_BYTES`,
+/// accepted — and the placement scan then gets to speak, unchanged from round 3.
+/// So the new bound is a boundary rather than a blanket refusal of small strides,
+/// and it did not swallow the guard behind it.
+#[test]
+fn the_chunk_axis_cap_is_a_boundary_and_precedes_the_placement_scan() {
+  use crate::audio::speaker::window;
+
+  const FRAMES_PER_CHUNK: usize = 589;
+  /// The smallest clip any legal `step_samples` can turn into 70 771 chunks:
+  /// `SEG_CHUNK_SAMPLES + 70_770 * 1`.
+  const SMALLEST_REFUSED_SAMPLES: usize = 230_770;
+
+  let w = WindowOptions::new().with_step_samples(1);
+  let extractor = Extractor::with_options(Options::new().with_window(w));
+  let chunks_sw = window::chunk_sliding_window(&w);
+  let frames_sw = window::frame_sliding_window();
+
+  let num_chunks = window::num_chunks(SMALLEST_REFUSED_SAMPLES, &w);
+  assert_eq!(num_chunks, 70_771);
+  assert!(
+    checked_output_frame_count(num_chunks, chunks_sw, frames_sw).is_ok(),
+    "a 14.42 s clip is nowhere near MAX_OUTPUT_FRAMES"
+  );
+  assert_eq!(
+    window::first_misaligned_chunk(num_chunks, chunks_sw, frames_sw)
+      .map(|m| m.chunk())
+      .expect("an odd stride ties, so the placement scan has something to say"),
+    135
+  );
+  assert_eq!(
+    extractor.checked_geometry(SMALLEST_REFUSED_SAMPLES, FRAMES_PER_CHUNK),
+    Err(ExtractError::ExtractionTensorBytesTooLarge(1_217_827_368)),
+    "the byte bound runs BEFORE the placement scan, which is O(num_chunks) over \
+     the very axis it limits"
+  );
+
+  // One sample fewer: 70 770 chunks, exactly the ceiling, released to the guard
+  // behind it.
+  assert_eq!(window::num_chunks(SMALLEST_REFUSED_SAMPLES - 1, &w), 70_770);
+  assert_eq!(
+    checked_extraction_tensor_bytes(70_770, FRAMES_PER_CHUNK),
+    Ok(MAX_EXTRACTION_TENSOR_BYTES),
+    "the largest grid admitted sits exactly ON the ceiling"
+  );
+  assert!(
+    matches!(
+      extractor.checked_geometry(SMALLEST_REFUSED_SAMPLES - 1, FRAMES_PER_CHUNK),
+      Err(ExtractError::MisalignedChunkPlacement(m)) if m.chunk() == 135
+    ),
+    "one sample fewer passes the byte bound and reaches round 3's guard"
+  );
+}
+
+/// `MAX_EXTRACTION_TENSOR_BYTES` is the frame cap's own footprint, derived here
+/// rather than copied into the constant and hoped about.
+///
+/// The number is `70_770 * 17_208`, where `70_770` is the first chunk count
+/// `MAX_OUTPUT_FRAMES` refuses at `DEFAULT_STEP_SAMPLES` and `17_208` is one
+/// chunk's tensor cost on community-1's 589-frame grid. This searches for that
+/// chunk count through `checked_output_frame_count` — the same function the
+/// preflight runs — so a change to either cap turns the derivation into a
+/// failure instead of a silent drift, the shape
+/// `plda_min_norm_is_diarics_own_floor_measured_not_copied` uses for `diaric`'s
+/// floor.
+///
+/// It then pins the property that makes the new bound safe: at the default
+/// stride the frame cap ALWAYS refuses first, so nothing the shipped
+/// configuration can reach is newly refused.
+#[test]
+fn max_extraction_tensor_bytes_is_the_frame_caps_own_footprint_derived_not_copied() {
+  use crate::audio::speaker::window;
+
+  const FRAMES_PER_CHUNK: usize = 589;
+
+  let w = WindowOptions::new();
+  assert_eq!(w.step_samples(), window::DEFAULT_STEP_SAMPLES);
+  let chunks_sw = window::chunk_sliding_window(&w);
+  let frames_sw = window::frame_sliding_window();
+
+  // The first `num_chunks` the OUTPUT cap refuses at the shipped stride. The
+  // derived grid rises with `num_chunks`, so a binary search is exact.
+  let (mut lo, mut hi) = (1usize, 1usize << 24);
+  assert!(
+    checked_output_frame_count(hi, chunks_sw, frames_sw).is_err(),
+    "the search needs a refused upper bound"
+  );
+  while lo < hi {
+    let mid = lo + (hi - lo) / 2;
+    if checked_output_frame_count(mid, chunks_sw, frames_sw).is_err() {
+      hi = mid;
+    } else {
+      lo = mid + 1;
+    }
+  }
+  let first_refused = lo;
+  assert_eq!(first_refused, 70_770);
+
+  assert_eq!(
+    derived_extraction_tensor_bytes(first_refused, FRAMES_PER_CHUNK),
+    Ok(MAX_EXTRACTION_TENSOR_BYTES),
+    "the ceiling IS the tensor footprint of the geometry MAX_OUTPUT_FRAMES \
+     already declines"
+  );
+  assert_eq!(MAX_EXTRACTION_TENSOR_BYTES, 70_770 * 17_208);
+
+  // The safety property: the largest chunk grid the frame cap ADMITS at the
+  // default stride is strictly under the ceiling, so the byte bound cannot
+  // speak there at all.
+  assert_eq!(
+    checked_extraction_tensor_bytes(first_refused - 1, FRAMES_PER_CHUNK),
+    Ok(1_217_792_952)
+  );
+  const { assert!(1_217_792_952 < MAX_EXTRACTION_TENSOR_BYTES) };
+
+  // And the compute bound this one implies, so no second constant is needed:
+  // `raw_embeddings` alone costs 3 072 bytes per chunk whatever the segmenter,
+  // and check 1 forces `num_frames_per_chunk >= 1`.
+  let min_chunk_bytes = SEG_NUM_SLOTS * (size_of::<f64>() + EMBEDDING_DIM * size_of::<f32>());
+  assert_eq!(min_chunk_bytes, 3_096);
+  assert_eq!(MAX_EXTRACTION_TENSOR_BYTES / min_chunk_bytes, 393_349);
+  assert_eq!(
+    derived_extraction_tensor_bytes(393_350, 1),
+    Ok(1_217_811_600)
+  );
+  assert!(
+    checked_extraction_tensor_bytes(393_350, 1).is_err(),
+    "even a segmenter emitting one frame per ten seconds is held to 393 349 \
+     chunks, i.e. at most 786 698 model calls"
+  );
+}
+
+/// The discrimination: across the whole legal `step_samples` range the new bound
+/// refuses a geometry exactly when its chunk grid passes 70 770, and never for
+/// any other reason.
+///
+/// A cap that refused a band of strides outright, or that varied with something
+/// other than the chunk count, would pass the boundary tests above and fail this
+/// one. Swept on the reviewer's own ten-minute clip, where the threshold falls
+/// at `step_samples = 134`.
+#[test]
+fn the_chunk_axis_cap_tracks_the_chunk_grid_across_every_legal_stride() {
+  use crate::audio::speaker::window;
+
+  const FRAMES_PER_CHUNK: usize = 589;
+  const SAMPLES: usize = 9_600_000;
+
+  let mut boundary = None;
+  for step in (1u32..=SEG_CHUNK_SAMPLES as u32).step_by(7) {
+    let w = WindowOptions::new().with_step_samples(step);
+    let num_chunks = window::num_chunks(SAMPLES, &w);
+    let refused = checked_extraction_tensor_bytes(num_chunks, FRAMES_PER_CHUNK).is_err();
+    assert_eq!(
+      refused,
+      num_chunks > 70_770,
+      "step_samples={step}: {num_chunks} chunks, refused={refused}"
+    );
+    if !refused && boundary.is_none() {
+      boundary = Some(step);
+    }
+  }
+  // The sweep must actually cross the threshold, or it proves nothing.
+  assert_eq!(boundary, Some(134), "the ten-minute clip turns at step 134");
+
+  // Both endpoints exactly, off the sweep's stride-of-7 grid.
+  for (step, expected) in [(133u32, true), (134, false)] {
+    let w = WindowOptions::new().with_step_samples(step);
+    let num_chunks = window::num_chunks(SAMPLES, &w);
+    assert_eq!(
+      checked_extraction_tensor_bytes(num_chunks, FRAMES_PER_CHUNK).is_err(),
+      expected,
+      "step_samples={step} -> {num_chunks} chunks"
+    );
+  }
+}
+
+/// The overflow arms, which no clip can reach but `try_from_parts`' own check 3
+/// can: a geometry whose tensor footprint does not fit in `usize` reports the
+/// same `(part, num_chunks, num_frames_per_chunk)` diagnosis check 3 reports,
+/// and reports `raw_embeddings` first, so the two never name different parts for
+/// a geometry that overflows both.
+#[test]
+fn derived_extraction_tensor_bytes_overflow_arms_match_check_threes_diagnosis() {
+  use crate::audio::speaker::error::{ExtractionGeometryOverflow, ExtractionPart};
+
+  // `num_chunks * SEG_NUM_SLOTS * EMBEDDING_DIM * 4` overflows first, and it
+  // does not read `num_frames_per_chunk` at all, so a `1` there still names
+  // RawEmbeddings.
+  assert_eq!(
+    derived_extraction_tensor_bytes(usize::MAX, 1),
+    Err(ExtractError::ExtractionGeometryOverflow(
+      ExtractionGeometryOverflow::new(ExtractionPart::RawEmbeddings, usize::MAX, 1)
+    ))
+  );
+
+  // A `num_chunks` small enough for the embeddings product but not for the
+  // segmentations one: `n * 3 * 256 * 4` fits while `n * f * 3 * 8` does not.
+  let n = usize::MAX / 8_192;
+  assert!(
+    derived_extraction_tensor_bytes(n, 1).is_ok(),
+    "the embeddings product must still fit, or this case tests the wrong arm"
+  );
+  let m = ExtractionGeometryOverflow::new(ExtractionPart::Segmentations, n, usize::MAX);
+  assert_eq!(
+    derived_extraction_tensor_bytes(n, usize::MAX),
+    Err(ExtractError::ExtractionGeometryOverflow(m))
+  );
+  assert_eq!(
+    (m.part(), m.num_chunks(), m.num_frames_per_chunk()),
+    (ExtractionPart::Segmentations, n, usize::MAX)
+  );
+
+  // Both products fit and their SUM does not. Reported against
+  // `Segmentations`, the dominant term.
+  let n = usize::MAX / 4_096;
+  let frames = 86usize;
+  let raw = n * SEG_NUM_SLOTS * EMBEDDING_DIM * size_of::<f32>();
+  let seg = n * frames * SEG_NUM_SLOTS * size_of::<f64>();
+  assert!(
+    raw.checked_add(seg).is_none(),
+    "this case needs two products that fit and a sum that does not"
+  );
+  assert_eq!(
+    derived_extraction_tensor_bytes(n, frames),
+    Err(ExtractError::ExtractionGeometryOverflow(
+      ExtractionGeometryOverflow::new(ExtractionPart::Segmentations, n, frames)
+    ))
+  );
+
+  // The BYTE products are what is checked, so an element count that fits while
+  // its byte size does not is refused here even though check 3 would accept the
+  // length. Such a `Vec` is unallocatable regardless (`isize::MAX` bytes).
+  let elems = usize::MAX / (SEG_NUM_SLOTS * EMBEDDING_DIM);
+  assert!(
+    elems
+      .checked_mul(SEG_NUM_SLOTS)
+      .and_then(|v| v.checked_mul(EMBEDDING_DIM))
+      .is_some(),
+    "check 3's element product fits"
+  );
+  assert!(
+    derived_extraction_tensor_bytes(elems, 1).is_err(),
+    "...while its byte size does not"
+  );
+}
+
+/// The alternative cure, measured and rejected: a `step_samples` floor at one
+/// output-frame step would have left the tensors unbounded.
+///
+/// There is a real threshold to put such a floor at — `FRAME_STEP_S *
+/// SAMPLE_RATE_HZ` is exactly 270 samples, the point below which
+/// `aggregate_chunk_start_frame` maps consecutive chunks onto the same output
+/// frame. This pins why that was not the fix: AT that floor, with every existing
+/// guard in force, `MAX_OUTPUT_FRAMES` still admits a chunk grid worth 67.21 GiB
+/// of extraction tensors. A floor caps the amplification and not the total, so
+/// it is a bound on a proxy — which is the shape of defect this branch keeps
+/// finding.
+///
+/// Kept so a later round cannot replace the byte ceiling with the floor and
+/// believe the axis is closed.
+#[test]
+fn a_step_samples_floor_at_one_frame_step_would_not_have_bounded_the_tensors() {
+  use crate::audio::speaker::window;
+
+  const FRAMES_PER_CHUNK: usize = 589;
+
+  // The threshold itself, exactly representable and exactly 270.
+  let one_frame_step_in_samples = window::FRAME_STEP_S * f64::from(window::SAMPLE_RATE_HZ);
+  assert_eq!(one_frame_step_in_samples, 270.0);
+  let floor = 270u32;
+  assert!(
+    window::DEFAULT_STEP_SAMPLES > floor,
+    "the shipped stride is 59.26 frame steps, far above any such floor"
+  );
+
+  // The largest chunk grid MAX_OUTPUT_FRAMES admits AT that floor.
+  let w = WindowOptions::new().with_step_samples(floor);
+  let chunks_sw = window::chunk_sliding_window(&w);
+  let frames_sw = window::frame_sliding_window();
+  let (mut lo, mut hi) = (1usize, 1usize << 25);
+  assert!(checked_output_frame_count(hi, chunks_sw, frames_sw).is_err());
+  while lo < hi {
+    let mid = lo + (hi - lo) / 2;
+    if checked_output_frame_count(mid, chunks_sw, frames_sw).is_err() {
+      hi = mid;
+    } else {
+      lo = mid + 1;
+    }
+  }
+  let largest_admitted = lo - 1;
+  assert_eq!(largest_admitted, 4_193_711);
+
+  // ...and what a producer would then allocate for it.
+  assert_eq!(
+    derived_extraction_tensor_bytes(largest_admitted, FRAMES_PER_CHUNK),
+    Ok(72_165_378_888),
+    "67.21 GiB, still reachable with a 270-sample floor in force"
+  );
+  assert_eq!(
+    checked_extraction_tensor_bytes(largest_admitted, FRAMES_PER_CHUNK),
+    Err(ExtractError::ExtractionTensorBytesTooLarge(72_165_378_888)),
+    "only the byte ceiling refuses it"
+  );
 }

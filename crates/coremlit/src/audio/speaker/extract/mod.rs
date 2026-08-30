@@ -203,6 +203,147 @@ pub const EXCLUDE_OVERLAP_MIN_FRAMES: usize = 2;
 /// `diarization/src/reconstruct/algo.rs:42`).
 pub const MAX_OUTPUT_FRAMES: usize = 1 << 22;
 
+/// The largest `segmentations` + `raw_embeddings` footprint this crate will
+/// allocate for, in bytes: `1_217_810_160` (1.134 GiB). Enforced from GEOMETRY
+/// ALONE in every producer's `checked_geometry` seam — ahead of the
+/// `O(num_chunks)` placement scan, ahead of the two tensors, and ahead of every
+/// model call.
+///
+/// # The axis [`MAX_OUTPUT_FRAMES`] cannot see
+///
+/// That cap bounds the OUTPUT grid, and the output grid is a function of the
+/// clip's DURATION: `num_output_frames = round(last_chunk_end / FRAME_STEP_S) +
+/// 1`, with `last_chunk_end = CHUNK_DURATION_S + (num_chunks - 1) *
+/// step_samples / SAMPLE_RATE_HZ`. The two `step_samples` factors cancel, so the
+/// derived grid is very nearly `samples.len() / 270` whatever stride the caller
+/// picked.
+///
+/// The producers do not allocate on that axis. They allocate on the CHUNK axis,
+/// `num_chunks = 1 + (samples.len() - SEG_CHUNK_SAMPLES).div_ceil(step_samples)`,
+/// which grows without bound as `step_samples` shrinks — and
+/// [`WindowOptions::set_step_samples`] constrains that only to
+/// `1..=SEG_CHUNK_SAMPLES`. A ten-minute clip (9 600 000 samples, 38 400 000
+/// bytes of `f32`) at `step_samples = 2` derives:
+///
+/// | quantity | value |
+/// |---|---|
+/// | `num_chunks` | 4 720 001 |
+/// | `segmentations` | 66 721 934 136 B |
+/// | `raw_embeddings` | 14 499 843 072 B |
+/// | tensors, total | 81 221 777 208 B — **75.64 GiB**, a 2 115x amplification |
+/// | model calls | 9 440 002 |
+/// | derived output frames | 35 557, against a cap of 4 194 304 — **0.85 % of it** |
+///
+/// and every guard that existed before this constant passed it: the output-frame
+/// cap saw a ten-minute clip, and the placement scan found no rounding tie
+/// because `2` is even. Those figures are not arithmetic in a doc comment —
+/// `the_chunk_axis_cap_refuses_before_the_allocation_it_bounds` MEASURES the
+/// 81 221 777 208 through the counting global allocator.
+///
+/// # The number, derived
+///
+/// `70_770 * (589 * SEG_NUM_SLOTS * size_of::<f64>() + SEG_NUM_SLOTS *
+/// EMBEDDING_DIM * size_of::<f32>())`, i.e. `70_770 * 17_208`.
+///
+/// `70_770` is the FIRST chunk count [`MAX_OUTPUT_FRAMES`] refuses at the
+/// shipped [`crate::audio::speaker::window::DEFAULT_STEP_SAMPLES`], and `589` is
+/// community-1's per-chunk frame count — the only one this crate's models
+/// produce, and [`crate::audio::speaker::source::argmax::ARGMAX_FRAMES_PER_WINDOW`]
+/// for the other producer. So this is not a new budget. It is the tensor
+/// footprint of the very geometry the existing cap already declines, and it is
+/// the number round 9's own falsifier measured and printed
+/// (`the_frame_cap_refuses_before_the_allocation_it_bounds` asserts
+/// `built.total == 1_217_810_160` for exactly this geometry). The crate had
+/// already committed to allocating this much; what it never did is hold the
+/// chunk axis to the same figure.
+///
+/// Two consequences follow, both pinned by test rather than asserted here
+/// (`max_extraction_tensor_bytes_is_the_frame_caps_own_footprint_derived_not_copied`):
+///
+/// - At the default `step_samples` this bound can never speak. The largest chunk
+///   grid [`MAX_OUTPUT_FRAMES`] admits there is 70 769 chunks — 1 217 792 952
+///   bytes, 17 208 BELOW this ceiling — so the frame cap always refuses first
+///   and names its own error. Nothing the shipped configuration can reach is
+///   newly refused, and the same holds for
+///   [`crate::audio::speaker::source::ArgmaxSource`], whose stride is pinned by
+///   its compiled graph to that identical value.
+/// - Every other `step_samples` now costs the same worst case. A stride of `s`
+///   used to buy `19.66 h * SAMPLE_RATE_HZ / s` chunks; it now buys at most
+///   70 770, whatever `s` is.
+///
+/// # Why the byte count, and not `num_chunks` or the model-call count
+///
+/// `num_chunks` is a PROXY: the memory it stands for is `num_chunks *
+/// num_frames_per_chunk * ...`, and `num_frames_per_chunk` comes from the loaded
+/// segmenter, so a chunk cap would bound bytes only for the frame count it was
+/// calibrated against. Bounding a proxy and leaving the real quantity free is
+/// the failure this branch has now hit repeatedly, so what is bounded here is
+/// the byte count itself — the quantity that actually exhausts memory — with
+/// every product `checked_mul`ed (`derived_extraction_tensor_bytes`).
+///
+/// The model-call count is a COMPUTE cost, and 9 440 002 calls would be fatal
+/// even on a host that could hold the buffers — but it does not need a second
+/// constant, because this one implies it. Every chunk contributes at least
+/// `SEG_NUM_SLOTS * (size_of::<f64>() + EMBEDDING_DIM * size_of::<f32>())` =
+/// 3 096 bytes (`raw_embeddings` alone is model-independent, and
+/// `num_frames_per_chunk >= 1` is check 1), so `num_chunks <= 1_217_810_160 /
+/// 3_096 = 393_349` for ANY segmenter and `<= 70_770` for one on community-1's
+/// grid. [`Extractor::extract`] makes at most two model calls per chunk, so this
+/// ceiling admits at most 141 540 of them for a real segmenter — precisely what
+/// [`MAX_OUTPUT_FRAMES`] already admitted at the default stride — and 786 698 in
+/// the degenerate limit of a segmenter emitting one frame per ten seconds.
+/// Memory and compute do not diverge, so one bound is enough; a second would be
+/// a constant bounding an already-bounded quantity.
+///
+/// # Why not a `step_samples` floor instead
+///
+/// The obvious upstream cure is to refuse `step_samples = 2` as a configuration
+/// rather than to bound what it costs, and there IS a principled threshold to
+/// refuse it at. [`crate::audio::speaker::window::FRAME_STEP_S`] times
+/// [`crate::audio::speaker::window::SAMPLE_RATE_HZ`] is exactly 270 samples, and
+/// `window::aggregate_chunk_start_frame` places chunk `c` at
+/// `round_ties_even(c * step_samples / 270)` — so below a 270-sample stride
+/// consecutive chunks land on the SAME output-frame index, and the chunk grid is
+/// finer than the grid its own output can address. The shipped
+/// [`crate::audio::speaker::window::DEFAULT_STEP_SAMPLES`] is 16 000, 59.26 frame
+/// steps, and [`crate::audio::speaker::source::argmax::ARGMAX_WINDOW_STRIDE_SAMPLES`]
+/// — compiled into that graph, not a choice — is the same 16 000.
+///
+/// A floor was still not adopted, for three reasons, and
+/// `a_step_samples_floor_at_one_frame_step_would_not_have_bounded_the_tensors`
+/// pins the decisive one:
+///
+/// - It would not close the hole. At a stride of exactly 270,
+///   [`MAX_OUTPUT_FRAMES`] still admits 4 193 711 chunks — 72 165 378 888 bytes,
+///   67.21 GiB — from a 19.66 h clip. A floor caps the AMPLIFICATION (2 115x at
+///   `step_samples = 2`, down to 15.9x) without capping the total, so it is a
+///   third proxy on a branch already bitten twice by bounding proxies.
+/// - It is not implied by anything upstream. dia guards `step_samples` at `0`
+///   and at `> SEG_CHUNK_SAMPLES` and nowhere else (`owned.rs:374-387`), which
+///   [`crate::audio::speaker::window::WindowOptions`] mirrors exactly; a floor
+///   would be a refusal this crate invents, and a sub-frame stride still
+///   produces a well-defined `Extraction` — its extra chunks are averaged into
+///   the same output frame rather than discarded.
+/// - It would refuse geometries the existing suite exercises:
+///   `every_shipping_extract_geometry_places_its_chunks_identically` sweeps even
+///   strides from `2` upward through
+///   [`crate::audio::speaker::window::WindowOptions::with_step_samples`].
+///
+/// # NOT part of the thirteen-check assembly sequence
+///
+/// Deliberately, and this is a real asymmetry between the producers and
+/// [`Extraction::try_from_parts`]. That constructor is HANDED the tensors, so
+/// its check 3 requires `raw_embeddings.len()` to equal `num_chunks *
+/// SEG_NUM_SLOTS * EMBEDDING_DIM` and `segmentations.len()` to equal
+/// `num_chunks * num_frames_per_chunk * SEG_NUM_SLOTS`, exactly: a caller
+/// declaring 4 720 001 chunks must already hold the 75.64 GiB of `Vec` to get
+/// past it, and both products are themselves `checked_mul`ed, so an overflowing
+/// `num_chunks` raises [`ExtractError::ExtractionGeometryOverflow`] before any
+/// comparison and without allocating. The chunk axis is bounded there by the
+/// caller's own inputs; adding this cap would only refuse memory already
+/// spent.
+pub const MAX_EXTRACTION_TENSOR_BYTES: usize = 1_217_810_160;
+
 /// PLDA's minimum raw-embedding L2 norm: `diaric` refuses a raw row below it at
 /// the PLDA boundary itself — `plda::transform::RAW_EMBEDDING_MIN_NORM = 0.01`,
 /// checked in `RawEmbedding::from_raw_array`
@@ -606,15 +747,24 @@ impl Extractor {
 
   /// The chunk count, both timing grids, and every guard that reads nothing
   /// else — checks 4 and 6 (the output-frame grid and the resource bound it is
-  /// held to) then check 8 (chunk placement), in the shared sequence's own
-  /// order.
+  /// held to), then the CHUNK-axis resource bound, then check 8 (chunk
+  /// placement).
   ///
   /// This is the WHOLE of what [`Self::extract`] decides before it allocates a
   /// tensor or touches a model, and it is a separate function so that a test
   /// can run it. `extract` itself cannot be handed the inputs these guards
-  /// exist for: the smallest clip the cap refuses is 1 132 448 001 samples —
-  /// 4.5 GB of `f32` and 70 770 pairs of CoreML calls — so a falsifier for the
-  /// cap's PLACEMENT has nowhere else to attach.
+  /// exist for: the smallest clip the frame cap refuses is 1 132 448 001
+  /// samples — 4.5 GB of `f32` and 70 770 pairs of CoreML calls — so a
+  /// falsifier for its PLACEMENT has nowhere else to attach. The chunk-axis
+  /// bound is reachable from a 923 KB clip, but never in fewer than 141 542
+  /// model calls — and from the ten-minute clip its own falsifier uses, 9 440 002
+  /// of them — so that falsifier attaches here too.
+  ///
+  /// `num_frames_per_chunk` is `seg.num_frames()`, which `extract` has already
+  /// agreed with the embedder (check 5) before calling this. It is a parameter
+  /// rather than a re-read because the byte bound needs it and this method must
+  /// stay ahead of every model call: the frame count is the LAST input the
+  /// tensor footprint needs, and `extract` has it before it allocates anything.
   ///
   /// The starts vector is deliberately not built here (`chunk_starts`,
   /// `owned.rs:447-451`): nothing in this function reads a chunk's start, and
@@ -636,11 +786,21 @@ impl Extractor {
   ///   1 217 810 160 bytes of tensors, 70 770 pairs of CoreML calls and
   ///   404 771 544 bytes of count scratch have been spent reaching the same
   ///   verdict.
+  /// - [`ExtractError::ExtractionGeometryOverflow`] /
+  ///   [`ExtractError::ExtractionTensorBytesTooLarge`] — the CHUNK-axis resource
+  ///   bound, through `checked_extraction_tensor_bytes` (round 10). NOT
+  ///   duplicated at assembly, and that asymmetry is deliberate: see
+  ///   [`MAX_EXTRACTION_TENSOR_BYTES`] for why
+  ///   [`Extraction::try_from_parts`]'s check 3 already bounds this axis by the
+  ///   caller's own allocation. Ordered after the frame cap so a geometry
+  ///   tripping both still names [`ExtractError::OutputFrameCountTooLarge`],
+  ///   unchanged from round 9.
   /// - [`ExtractError::MisalignedChunkPlacement`] — check 8, round 3's cure.
-  ///   Ordered AFTER the cap, matching the shared sequence's own order (check 6
-  ///   before check 8) so this method and [`Extraction::try_from_parts`] name
+  ///   Ordered AFTER both caps, matching the shared sequence's own order (check
+  ///   6 before check 8) so this method and [`Extraction::try_from_parts`] name
   ///   the same error for a geometry that trips both — and, independently,
-  ///   because the cap is `O(1)` where this scan is `O(num_chunks)`.
+  ///   because the caps are `O(1)` where this scan is `O(num_chunks)`, on the
+  ///   very axis the byte bound has just limited.
   ///
   /// # Panics
   /// Panics if `self.options.window().step_samples()` is `0`, as
@@ -650,6 +810,7 @@ impl Extractor {
   fn checked_geometry(
     &self,
     samples_len: usize,
+    num_frames_per_chunk: usize,
   ) -> Result<(usize, SlidingWindow, SlidingWindow), ExtractError> {
     let w = self.options.window();
     let num_chunks = crate::audio::speaker::window::num_chunks(samples_len, &w);
@@ -657,6 +818,11 @@ impl Extractor {
     let frames_sw = crate::audio::speaker::window::frame_sliding_window(); // owned.rs:656-657
 
     checked_output_frame_count(num_chunks, chunks_sw, frames_sw)?;
+    // The DURATION axis is now bounded; this is the CHUNK axis, which
+    // `step_samples` scales independently of it and which sizes both tensors,
+    // the starts vector, and the model-call count. Ahead of the placement scan
+    // below, which is itself `O(num_chunks)`.
+    checked_extraction_tensor_bytes(num_chunks, num_frames_per_chunk)?;
 
     // No dia analog, and the guard `Extraction::try_from_parts` applies as its
     // check 8: the `count` built at step 9-11 is written on the AGGREGATION's
@@ -706,6 +872,17 @@ impl Extractor {
   ///   this crate cannot diarize honestly costs no model time. Since round 8
   ///   that early raise is a COST optimisation, not the guarantee — the same
   ///   check runs again at assembly, through the shared sequence below.
+  /// - [`ExtractError::ExtractionTensorBytesTooLarge`] if the chunk grid
+  ///   `step_samples` and `samples.len()` derive would need more than
+  ///   [`MAX_EXTRACTION_TENSOR_BYTES`] of `segmentations` + `raw_embeddings`
+  ///   (round 10), or [`ExtractError::ExtractionGeometryOverflow`] if that
+  ///   footprint does not fit in `usize` at all. The axis
+  ///   [`MAX_OUTPUT_FRAMES`] cannot see: the output grid scales with the clip's
+  ///   DURATION and the tensors scale with `samples.len() / step_samples`, so a
+  ///   ten-minute clip at `step_samples = 2` used to reach the chunk loop
+  ///   holding 75.64 GiB and facing 9 440 002 model calls with every existing
+  ///   guard satisfied. Raised BEFORE any inference and before either tensor,
+  ///   from `num_chunks` and `seg.num_frames()` alone.
   /// - [`ExtractError::Infer`] (via `#[from]`) if either model's inference
   ///   fails (`owned.rs:477,600`).
   /// - [`ExtractError::OutputFrameCountOverflow`] if the derived
@@ -762,7 +939,10 @@ impl Extractor {
     }
 
     // ── 6-7b. Every guard that reads only geometry ────────────────────
-    let (num_chunks, chunks_sw, frames_sw) = self.checked_geometry(samples.len())?;
+    // `num_frames` is check 5's agreed frame count, and the last input the
+    // tensor footprint needs — so the chunk-axis bound runs here, before the
+    // two `vec![..]`s below size themselves from the very same products.
+    let (num_chunks, chunks_sw, frames_sw) = self.checked_geometry(samples.len(), num_frames)?;
 
     // The transform the per-slot row guard below validates against, resolved
     // ONCE before any inference — and BEFORE it, so an unavailable transform
@@ -1068,6 +1248,88 @@ pub(crate) fn checked_output_frame_count(
   Ok(derived_output_frames)
 }
 
+/// The exact byte footprint of the two tensors a producer is about to allocate
+/// for `(num_chunks, num_frames_per_chunk)`: `segmentations`' `num_chunks *
+/// num_frames_per_chunk * SEG_NUM_SLOTS` `f64`s plus `raw_embeddings`'
+/// `num_chunks * SEG_NUM_SLOTS * EMBEDDING_DIM` `f32`s.
+///
+/// The ONE place that expression is written, for the reason
+/// `derived_output_frame_count` is the one place ITS expression is written: both
+/// producers size those two `vec![..]`s from these very products, so a second
+/// spelling could be algebraically equal and numerically different.
+///
+/// Every product `checked_mul`ed, and `raw_embeddings` before `segmentations` —
+/// `check_assembled_parts`' own check-3 order, so a geometry whose products
+/// overflow names the same [`crate::audio::speaker::error::ExtractionPart`] in
+/// this preflight as in the assembly sequence.
+///
+/// # Errors
+/// [`ExtractError::ExtractionGeometryOverflow`] if either product, or their sum,
+/// exceeds `usize`. That is the variant check 3 already raises for an
+/// overflowing geometry, carrying the same `(part, num_chunks,
+/// num_frames_per_chunk)` diagnosis; the only difference is that the products
+/// here are in BYTES, so this arm can also fire for an element count that fits
+/// `usize` while its byte size does not — a `Vec` of which is unallocatable
+/// regardless (`Vec` caps capacity at `isize::MAX` bytes). The sum's own arm
+/// names `Segmentations`, the dominant term.
+fn derived_extraction_tensor_bytes(
+  num_chunks: usize,
+  num_frames_per_chunk: usize,
+) -> Result<usize, ExtractError> {
+  use crate::audio::speaker::error::{ExtractionGeometryOverflow, ExtractionPart};
+
+  let overflow = |part| {
+    ExtractError::ExtractionGeometryOverflow(ExtractionGeometryOverflow::new(
+      part,
+      num_chunks,
+      num_frames_per_chunk,
+    ))
+  };
+  let raw_embeddings = num_chunks
+    .checked_mul(SEG_NUM_SLOTS)
+    .and_then(|n| n.checked_mul(EMBEDDING_DIM))
+    .and_then(|n| n.checked_mul(size_of::<f32>()))
+    .ok_or_else(|| overflow(ExtractionPart::RawEmbeddings))?;
+  let segmentations = num_chunks
+    .checked_mul(num_frames_per_chunk)
+    .and_then(|n| n.checked_mul(SEG_NUM_SLOTS))
+    .and_then(|n| n.checked_mul(size_of::<f64>()))
+    .ok_or_else(|| overflow(ExtractionPart::Segmentations))?;
+  raw_embeddings
+    .checked_add(segmentations)
+    .ok_or_else(|| overflow(ExtractionPart::Segmentations))
+}
+
+/// The CHUNK-axis resource bound: the preflight every producer runs on geometry
+/// alone, before it allocates a tensor, scans a chunk placement, or calls a
+/// model.
+///
+/// The ONE comparison against [`MAX_EXTRACTION_TENSOR_BYTES`], so the bound
+/// cannot drift between the two producers — the same reason
+/// `check_output_frame_cap` is one function.
+///
+/// Ordered AFTER [`checked_output_frame_count`] at both call sites. A geometry
+/// that trips both caps therefore keeps naming
+/// [`ExtractError::OutputFrameCountTooLarge`], exactly as it did before this
+/// bound existed, and this one speaks only about geometries every pre-existing
+/// check accepts.
+///
+/// # Errors
+/// [`ExtractError::ExtractionGeometryOverflow`] from
+/// `derived_extraction_tensor_bytes`, or
+/// [`ExtractError::ExtractionTensorBytesTooLarge`] carrying the derived byte
+/// total.
+pub(crate) fn checked_extraction_tensor_bytes(
+  num_chunks: usize,
+  num_frames_per_chunk: usize,
+) -> Result<usize, ExtractError> {
+  let bytes = derived_extraction_tensor_bytes(num_chunks, num_frames_per_chunk)?;
+  if bytes > MAX_EXTRACTION_TENSOR_BYTES {
+    return Err(ExtractError::ExtractionTensorBytesTooLarge(bytes));
+  }
+  Ok(bytes)
+}
+
 /// The ONE implementation of [`Extraction::try_from_parts`]'s thirteen checks,
 /// over BORROWED parts — run by that constructor and, through
 /// `Extraction::assemble_checked`, by every in-crate
@@ -1115,6 +1377,14 @@ pub(crate) fn checked_output_frame_count(
 /// `ArgmaxSource`. It holds only BECAUSE check 9 holds, which is what makes
 /// "each producer enforces the checks it can reach" the wrong shape of
 /// argument and one shared sequence the right one.
+///
+/// One bound is deliberately absent from this table:
+/// [`MAX_EXTRACTION_TENSOR_BYTES`], the CHUNK-axis resource bound, is enforced
+/// in each producer's `checked_geometry` and NOT here. Check 3 already holds
+/// this axis for caller-supplied parts — the two length equalities are exact, so
+/// a declared `num_chunks` is bounded by the buffers the caller had to allocate
+/// to reach them, and the products are `checked_mul`ed so an unrepresentable one
+/// raises before any comparison. See that constant's own doc.
 #[allow(clippy::too_many_arguments)]
 fn check_assembled_parts(
   raw_embeddings: &[f32],
