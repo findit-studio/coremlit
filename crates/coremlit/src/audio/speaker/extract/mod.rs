@@ -156,6 +156,40 @@ use crate::audio::speaker::{
 /// none of them can drift apart.
 pub const EXCLUDE_OVERLAP_MIN_FRAMES: usize = 2;
 
+/// The largest output-frame grid [`Extraction::try_from_parts`] will assemble:
+/// `2^22` frames.
+///
+/// A RESOURCE bound, and the only check in that constructor not derived from the
+/// caller's own parts. `num_output_frames` sizes every grid-shaped buffer
+/// downstream, and the two largest are plain heap `Vec<f64>`s this crate
+/// allocates itself: [`crate::audio::speaker::window::count_from_segmentations`]'s
+/// `aggregated` / `overlapping_count` pair, which [`Extraction::diarize_online`]
+/// builds on every call and which `try_from_parts` builds once to validate
+/// `count`. At this cap that pair is exactly 64 MiB — `diaric`'s own default
+/// `SpillOptions::threshold_bytes`, the size above which `diaric` stops keeping a
+/// grid in RAM at all (`diarization/src/reconstruct/algo.rs:30-42`). Above the
+/// cap a caller could turn an `n`-byte `count` into `16n` bytes of scratch
+/// (measured: a 50 MB `count` reached 726 MB peak RSS) with no bound but `usize`.
+///
+/// At [`crate::audio::speaker::window::FRAME_STEP_S`] — the community-1 frame
+/// grid, the only one this crate's models produce — the cap is `4_194_304 *
+/// 0.016875 s`, i.e. **19.6 hours** of audio in a single extraction. The offline
+/// backend's clustering is quadratic in `num_chunks`, so an extraction that long
+/// is already far outside what either backend can finish; the cap refuses
+/// geometries that were never going to run, before they can allocate.
+///
+/// # Why a cap, and not fallible allocation or a short circuit
+/// `Vec::try_reserve` would turn the abort into a typed error, but only when the
+/// allocator actually fails — on a machine with memory to spare it grants the
+/// 16x amplification and calls it success, which IS the denial of service rather
+/// than a fix for it. Short-circuiting an all-unmatched input covers only that
+/// one shape and leaves every partially-matched grid unbounded. A cap is the
+/// only one of the three that bounds the work BEFORE it is attempted, in `O(1)`,
+/// for every input — and it is the shape `diaric` itself already uses for this
+/// class of hazard (`MAX_RECONSTRUCT_GRID_CELLS`,
+/// `diarization/src/reconstruct/algo.rs:42`).
+pub const MAX_OUTPUT_FRAMES: usize = 1 << 22;
+
 /// PLDA minimum raw-embedding L2 norm: a slot whose raw embedding has a
 /// smaller norm is dropped (its column zeroed, its row left zero) before
 /// it can reach PLDA. Matches dia's inline `0.01` guard
@@ -714,11 +748,26 @@ impl Extraction {
   /// that same crate-private `from_parts`, so the `num_output_frames ==
   /// count.len()` derivation still lives at exactly one place.
   ///
+  /// # The standard this constructor holds to
+  ///
+  /// This is the ONE place the two backends' requirements meet. An
+  /// [`Extraction`] assembled here can be handed to [`Self::diarize_with`]
+  /// (offline) or [`Self::diarize_online`], and the caller chooses which — so
+  /// the checks below are the INTERSECTION of what both consumers need, never
+  /// the union of what each individually tolerates. An input only one of them
+  /// mishandles is still an input this constructor must refuse.
+  ///
+  /// Every omission in "What is deliberately NOT checked" therefore names the
+  /// consumer it was verified against, both of them.
+  ///
   /// # What is checked
   ///
   /// 1. `num_chunks`, `num_frames_per_chunk` and `count.len()` are all non-zero.
   /// 2. Both sliding windows are usable timing grids: `start` finite,
-  ///    `duration`/`step` finite and `> 0`.
+  ///    `duration`/`step` finite and `> 0`; and both `start`s are `0.0`, the one
+  ///    origin the online count aggregation (which reads no origin) and
+  ///    `diaric::reconstruct` (which honours both) resolve identically. See
+  ///    [`ExtractError::NonZeroSlidingWindowOrigin`].
   /// 3. `raw_embeddings.len() == num_chunks * num_speakers * EMBEDDING_DIM` and
   ///    `segmentations.len() == num_chunks * num_frames_per_chunk *
   ///    num_speakers`, each product computed with `checked_mul` FIRST: an
@@ -727,51 +776,120 @@ impl Extraction {
   ///    or empty slice would then satisfy a naive equality.
   /// 4. The output-frame count [`Self::diarize_online`] re-derives from
   ///    `(chunks_sw, frames_sw, num_chunks)` does not overflow `usize`.
+  /// 5. `count.len()` EQUALS that derived count — the value check 4 already
+  ///    computes. [`Self::diarize_online`] refuses anything else
+  ///    (`CountLenMismatch`) while the offline route accepts it and emits speech
+  ///    past the audio the chunks describe, so without this the two backends
+  ///    disagree about the same `Extraction`.
+  /// 6. That derived count is at most [`MAX_OUTPUT_FRAMES`] — a resource bound,
+  ///    see that constant. The last `O(1)` check: everything below is `O(n)`
+  ///    over buffers this one bounds.
+  /// 7. `frames_sw.step()` stays finite and `> 0` through the `f32` narrowing
+  ///    [`Self::diarize_online`] applies to it when it builds the online speech
+  ///    duration. See [`ExtractError::FrameStepNotRepresentableInF32`].
+  /// 8. Every `(chunk, slot)` whose segmentation column is active (`seg > 0.0`,
+  ///    the activity rule both backends use) carries a raw-embedding row that
+  ///    `diaric::embed::Embedding::normalize_from` accepts — because `None` from
+  ///    that function is [`Self::diarize_online`]'s DROPPED-slot sentinel, so a
+  ///    corrupt row under an active column is read as "no speaker here". See
+  ///    [`ExtractError::ActiveSlotWithoutEmbedding`].
+  /// 9. `count[t]` never exceeds the number of simultaneous speakers the
+  ///    supplied `segmentations` put at output frame `t`, computed with the same
+  ///    overlap-add aggregation [`crate::audio::speaker::window::count_from_segmentations`]
+  ///    runs. `diaric`'s top-K binarize marks `count[t]` clusters active with no
+  ///    activation floor, so an inflated `count` fabricates that many speakers.
+  ///    See [`ExtractError::CountAboveSegmentationSupport`].
   ///
   /// Checks 1, 2 and 4 are the PANIC-preventing ones: `window`'s
   /// `try_aggregate_output_frame_count` asserts the first two with bare
   /// `assert!`s and [`Self::diarize_online`] `.expect(..)`s the third, so
   /// without them a publicly-assembled `Extraction` could panic far from its
   /// cause. Check 3 is what keeps every `[c][s][d]` / `[c][f][s]` index inside
-  /// its buffer.
+  /// its buffer. Checks 5 and 7-9 are the CROSS-PART ones: each is a pair of
+  /// parts that are individually well-formed and jointly describe something the
+  /// producing pipeline cannot have produced.
   ///
   /// # What is deliberately NOT checked
   ///
-  /// - **`count[t] <= diaric::reconstruct::MAX_COUNT_PER_FRAME`.** `diaric`
-  ///   rejects it as a typed `ShapeError::CountAboveMax`
-  ///   (`diarization/src/offline/algo.rs:612-618`) on the offline route and
-  ///   never reads `count` at all on the online one. Re-checking would mean
-  ///   pinning `diaric`'s constant here (drift) and an O(`num_output_frames`)
-  ///   scan on a path that already fails loudly.
-  /// - **Finiteness of `segmentations` / `raw_embeddings`.** Both are O(n)
-  ///   scans, and both already fail typed: `diaric`'s `reconstruct` rejects
-  ///   every non-finite segmentation, and a non-finite embedding row is refused
-  ///   by `diaric::embed::Embedding::normalize_from` (online) or by PLDA
-  ///   (offline).
-  /// - **`count.len()` equal to the count the geometry would derive.** `diaric`
-  ///   requires only that `num_output_frames` COVER the last chunk's last frame
-  ///   (`ShapeError::OutputFrameCountTooSmall`,
-  ///   `diarization/src/reconstruct/algo.rs:486-494`), not equality. Demanding
-  ///   equality would reject inputs `diaric` accepts — including this crate's
-  ///   own hermetic fixtures — and would freeze a float derivation into a
-  ///   constructor whose job is shape safety. Check 4 above still runs, because
-  ///   that one is a panic rather than a rejection.
-  /// - **That the parts came from the SAME track.** Every check here is a shape
-  ///   check, and shapes carry no provenance: parts that are each well-formed
-  ///   and whose declared geometry describes them all correctly are accepted
-  ///   even when `raw_embeddings` came from one track and `segmentations` from
-  ///   another of identical geometry — silently changing the clustering
-  ///   (`try_from_parts_cannot_detect_mutually_inconsistent_parts` pins it). No
-  ///   check inside this constructor can see that; a caller joining parts from
-  ///   several messages must carry its own track identity and match on it before
-  ///   assembling an [`ExtractionParts`].
+  /// - **`count[t] <= diaric::reconstruct::MAX_COUNT_PER_FRAME`.** Now IMPLIED
+  ///   by check 9 and kept unchecked for that reason rather than by deferral:
+  ///   the support bound is an overlap-add average of per-`(chunk, frame)`
+  ///   active-slot counts, each at most `SEG_NUM_SLOTS` (3), and the average of
+  ///   values `<= 3` rounds to `<= 3` — comfortably under `diaric`'s 64.
+  ///   *Verified against both:* the OFFLINE route re-checks it anyway as a typed
+  ///   `ShapeError::CountAboveMax` (`diarization/src/offline/algo.rs:612-618`),
+  ///   and the ONLINE route never reads this `count` at all — it derives its own
+  ///   distinct-cluster count, likewise bounded by `SEG_NUM_SLOTS`, which
+  ///   `diaric::reconstruct` then re-checks against the same constant
+  ///   (`diarization/src/reconstruct/algo.rs:391-398`).
+  /// - **Finiteness of `segmentations`.** An `O(n)` scan that would duplicate a
+  ///   typed refusal on BOTH routes. *Verified against both:* the ONLINE route
+  ///   reaches `diaric::reconstruct`, which rejects every non-finite
+  ///   segmentation before it can reach the aggregation
+  ///   (`diarization/src/reconstruct/algo.rs:497-500`); the OFFLINE route
+  ///   reaches that same `reconstruct` AND `diaric::pipeline::assign_embeddings`,
+  ///   which rejects them as `NonFiniteField::Segmentations`
+  ///   (`diarization/src/pipeline/algo.rs:456-460`). Neither can silently
+  ///   consume one. Note this is about a NaN reaching the clusterer: a NaN in an
+  ///   ACTIVE slot's column also weakens its own activity count here (`NaN >
+  ///   0.0` is false), which only ever LOWERS the check-9 bound, never raises it.
+  /// - **Finiteness of a raw-embedding row belonging to an INACTIVE slot.**
+  ///   Check 8 covers every active slot; a row under an all-zero segmentation
+  ///   column is left to the backends. *Verified against both:* OFFLINE,
+  ///   `assign_embeddings` scans EVERY row — train subset or not — and rejects
+  ///   a non-finite value as `NonFiniteField::Embeddings` and an overflowing row
+  ///   norm as `ShapeError::RowNormOverflow`
+  ///   (`diarization/src/pipeline/algo.rs:443-455`), so the offline route always
+  ///   fails typed. ONLINE, the row IS normalized and fed to the clusterer, but
+  ///   a non-finite one is exactly the case `normalize_from` returns `None` for,
+  ///   so it is skipped — the same outcome as the all-zero row the crate's own
+  ///   dropped slots carry.
+  /// - **An INACTIVE slot carrying a usable embedding row** — the converse of
+  ///   check 8, and deliberately allowed. *Verified against both:* OFFLINE, such
+  ///   a slot cannot reach PLDA (`filter_embeddings` requires
+  ///   `clean_frames >= 0.2 * num_frames_per_chunk`, and an all-zero column sums
+  ///   to `0`, `diarization/src/offline/algo.rs:645-679`). ONLINE, it IS
+  ///   assigned, with a speech duration of `0` — dropped by any
+  ///   `min_speech_duration > 0` including the default, and at `0.0` it can seed
+  ///   a speaker whose segmentation column is empty, which contributes nothing
+  ///   to any output frame and produces no span. Both are consequences of the
+  ///   caller's own data ("this slot has an embedding but no speech"), not of a
+  ///   part disagreeing with another; `tiny_extraction`'s third slot is exactly
+  ///   this shape.
+  /// - **`num_output_frames` covering the last chunk's last frame.** With check
+  ///   5 the grid is the derived one, but a chunk whose declared `duration`
+  ///   spans fewer frame-steps than `num_frames_per_chunk` still derives a grid
+  ///   shorter than the chunk it must hold. *Verified against both:* both routes
+  ///   run the same `diaric::reconstruct`, which raises the typed
+  ///   `ShapeError::OutputFrameCountTooSmall`
+  ///   (`diarization/src/reconstruct/algo.rs:467-494`) before allocating
+  ///   anything. Re-deriving it here would duplicate `closest_frame`'s float
+  ///   arithmetic in a second place, which is how the two grids drift apart.
+  /// - **That the parts came from the SAME track.** Every check here compares
+  ///   parts to each OTHER, and no comparison carries provenance: parts that are
+  ///   each well-formed and mutually consistent are accepted even when
+  ///   `raw_embeddings` came from one track and `segmentations` from another of
+  ///   identical geometry — silently changing the clustering
+  ///   (`try_from_parts_cannot_detect_mutually_inconsistent_parts` pins it).
+  ///   *Verified against both:* neither backend can see it either — each
+  ///   consumes the tensors it is given and produces a well-formed answer for
+  ///   them. A caller joining parts from several messages must carry its own
+  ///   track identity and match on it before assembling an [`ExtractionParts`].
   ///
   /// # Errors
   /// - [`ExtractError::ZeroExtractionDimension`] — check 1.
-  /// - [`ExtractError::InvalidSlidingWindow`] — check 2.
+  /// - [`ExtractError::InvalidSlidingWindow`] /
+  ///   [`ExtractError::NonZeroSlidingWindowOrigin`] — check 2.
   /// - [`ExtractError::ExtractionGeometryOverflow`] /
   ///   [`ExtractError::ExtractionLenMismatch`] — check 3.
   /// - [`ExtractError::OutputFrameCountOverflow`] — check 4.
+  /// - [`ExtractError::ExtractionLenMismatch`] with
+  ///   [`ExtractionPart::Count`](crate::audio::speaker::error::ExtractionPart::Count)
+  ///   — check 5.
+  /// - [`ExtractError::OutputFrameCountTooLarge`] — check 6.
+  /// - [`ExtractError::FrameStepNotRepresentableInF32`] — check 7.
+  /// - [`ExtractError::ActiveSlotWithoutEmbedding`] — check 8.
+  /// - [`ExtractError::CountAboveSegmentationSupport`] — check 9.
   ///
   /// # Examples
   /// ```
@@ -780,16 +898,21 @@ impl Extraction {
   ///   error::{ExtractError, ExtractionPart},
   ///   extract::{Extraction, ExtractionParts},
   ///   segment::SEG_NUM_SLOTS,
-  ///   window::{WindowOptions, chunk_sliding_window, frame_sliding_window},
+  ///   window::{FRAME_STEP_S, WindowOptions, chunk_sliding_window, frame_sliding_window},
   /// };
   ///
   /// let parts = ExtractionParts {
   ///   raw_embeddings: vec![0.5; SEG_NUM_SLOTS * EMBEDDING_DIM],
   ///   segmentations: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-  ///   count: vec![1, 2, 1, 0],
+  ///   // One speaker per frame, and only the two frames the single chunk covers:
+  ///   // `count[t]` may not exceed what `segmentations` puts at output frame `t`.
+  ///   count: vec![1, 1, 0, 0],
   ///   num_chunks: 1,
   ///   num_frames_per_chunk: 2,
-  ///   chunks_sw: chunk_sliding_window(&WindowOptions::new()),
+  ///   // A chunk three frame-steps long, so the geometry derives exactly the
+  ///   // four output frames `count` declares. (The nominal 10 s chunk duration
+  ///   // derives 594 of them, which this `count` would contradict.)
+  ///   chunks_sw: chunk_sliding_window(&WindowOptions::new()).with_duration(3.0 * FRAME_STEP_S),
   ///   frames_sw: frame_sliding_window(),
   /// };
   /// let extraction = Extraction::try_from_parts(parts.clone()).expect("self-consistent parts");
@@ -853,6 +976,19 @@ impl Extraction {
           InvalidSlidingWindow::new(part, w),
         ));
       }
+      // Both grids must share the ONE origin the two consumers agree on. The
+      // count aggregation places chunk `c` at `round(c * chunk_step /
+      // frame_step)` and reads no origin at all; `diaric::reconstruct` places
+      // it at `closest_frame(chunks_sw.start + c * chunk_step +
+      // frames_sw.duration / 2)`, which subtracts `frames_sw.start`. The two
+      // agree only when both origins are `0.0` — which is exactly what
+      // `chunk_sliding_window` / `frame_sliding_window` produce. See
+      // `ExtractError::NonZeroSlidingWindowOrigin`.
+      if w.start() != 0.0 {
+        return Err(ExtractError::NonZeroSlidingWindowOrigin(
+          InvalidSlidingWindow::new(part, w),
+        ));
+      }
     }
 
     // ── 3. Geometry products, CHECKED, before the length equalities ───
@@ -872,8 +1008,8 @@ impl Extraction {
           num_frames_per_chunk,
         ))
       })?;
-    let expected_segmentations = num_chunks
-      .checked_mul(num_frames_per_chunk)
+    let chunk_frames = num_chunks.checked_mul(num_frames_per_chunk);
+    let expected_segmentations = chunk_frames
       .and_then(|n| n.checked_mul(SEG_NUM_SLOTS))
       .ok_or_else(|| {
         ExtractError::ExtractionGeometryOverflow(ExtractionGeometryOverflow::new(
@@ -882,6 +1018,9 @@ impl Extraction {
           num_frames_per_chunk,
         ))
       })?;
+    // `chunk_frames` is `Some` whenever the product above did not overflow:
+    // `x * y * z` overflowing only at the last factor still yields `x * y`.
+    let chunk_frames = chunk_frames.expect("checked_mul chain proved the inner product fits");
     if raw_embeddings.len() != expected_embeddings {
       return Err(ExtractError::ExtractionLenMismatch(
         ExtractionLenMismatch::new(
@@ -909,12 +1048,130 @@ impl Extraction {
     // finite and positive (check 2), so `last_chunk_end` is the only
     // quantity left that can drive the division out of range.
     let last_chunk_end = chunks_sw.duration() + (num_chunks - 1) as f64 * chunks_sw.step();
-    crate::audio::speaker::window::try_num_output_frames(last_chunk_end, frames_sw.step())
-      .map_err(|e| match e {
-        crate::audio::speaker::window::WindowError::OutputFrameCountOverflow => {
-          ExtractError::OutputFrameCountOverflow
+    let derived_output_frames =
+      crate::audio::speaker::window::try_num_output_frames(last_chunk_end, frames_sw.step())
+        .map_err(|e| match e {
+          crate::audio::speaker::window::WindowError::OutputFrameCountOverflow => {
+            ExtractError::OutputFrameCountOverflow
+          }
+        })?;
+
+    // ── 5. `count.len()` IS the grid the geometry derives ─────────────
+    // The value check 4 computes is the answer, not a by-product: keeping it
+    // is the whole fix. `diarize_online` re-derives this identical number and
+    // refuses any `Extraction` whose `num_output_frames` differs
+    // (`CountLenMismatch`), while `diaric`'s offline reconstruct requires only
+    // that the grid COVER the last chunk — so a longer `count` makes the two
+    // backends disagree about the same `Extraction`, offline emitting speech
+    // past the end of the audio the chunks describe. Reported as a `Count`
+    // length mismatch: `count.len()` is `num_output_frames`, so this is the
+    // same diagnosis as any other tensor whose length the geometry contradicts.
+    if count.len() != derived_output_frames {
+      return Err(ExtractError::ExtractionLenMismatch(
+        ExtractionLenMismatch::new(ExtractionPart::Count, count.len(), derived_output_frames),
+      ));
+    }
+
+    // ── 6. The grid is one this crate is willing to allocate for ──────
+    // The RESOURCE bound (see `MAX_OUTPUT_FRAMES`), and the last O(1) check:
+    // everything below is O(n) over buffers this bound now limits.
+    if derived_output_frames > MAX_OUTPUT_FRAMES {
+      return Err(ExtractError::OutputFrameCountTooLarge(
+        derived_output_frames,
+      ));
+    }
+
+    // ── 7. `frames_sw.step()` survives the narrowing `diarize_online` does ──
+    // That method builds the online speech duration in `f32`
+    // (`active_frames as f32 * frames_sw.step() as f32`, FluidAudio's own
+    // arithmetic, pinned by `tests/parity_online_swift.rs`). A step below
+    // `f32`'s smallest subnormal narrows to `0.0` and a step above `f32::MAX`
+    // to `+inf`, either of which hands the engine a duration its geometry did
+    // not declare. Checked AFTER 4 so a step that also overflows the derived
+    // count still reports the overflow.
+    let frame_step_f32 = frames_sw.step() as f32;
+    if !frame_step_f32.is_finite() || frame_step_f32 <= 0.0 {
+      return Err(ExtractError::FrameStepNotRepresentableInF32(
+        InvalidSlidingWindow::new(ExtractionPart::FramesSw, frames_sw),
+      ));
+    }
+
+    // ── 8. An active slot must carry an embedding the engines can use ──
+    // `diarize_online` reads `Embedding::normalize_from(row) == None` as the
+    // DROPPED-slot sentinel, so a corrupt or degenerate row under an ACTIVE
+    // segmentation column is silently read as "no speaker here". The predicate
+    // is `seg > 0.0` — the same "any nonzero entry is binary-active" rule
+    // `diarize_online` itself applies, and dia's `filter_embeddings`
+    // (`diarization/src/offline/algo.rs:656-660`) — and the row test is
+    // literally the function that method calls, so neither can drift.
+    for c in 0..num_chunks {
+      for s in 0..SEG_NUM_SLOTS {
+        let active = (0..num_frames_per_chunk)
+          .any(|f| segmentations[(c * num_frames_per_chunk + f) * SEG_NUM_SLOTS + s] > 0.0);
+        if !active {
+          continue;
         }
-      })?;
+        let mut row = [0.0f32; EMBEDDING_DIM];
+        row.copy_from_slice(&raw_embeddings[embedding_range(c, s)]);
+        if diaric::embed::Embedding::normalize_from(row).is_none() {
+          return Err(ExtractError::ActiveSlotWithoutEmbedding(
+            crate::audio::speaker::error::ActiveSlotWithoutEmbedding::new(c, s),
+          ));
+        }
+      }
+    }
+
+    // ── 9. `count[t]` must be a count these segmentations can support ──
+    // `diaric`'s offline reconstruct marks exactly `count[t]` clusters active
+    // by descending activation with no floor, so a `count[t]` above the real
+    // support selects zero-activation padded columns and emits that many
+    // phantom speakers as `Ok`. The bound is the caller's own data run through
+    // the SAME overlap-add aggregation `count_from_segmentations` uses, over
+    // the WEAKEST activity predicate (`seg > 0.0`): every `onset` in
+    // `(0.0, 1.0]` selects a subset of those slots, the aggregation is monotone
+    // in the per-(chunk, frame) count, and `round_ties_even` is monotone — so
+    // this is an upper bound for whatever `onset` the producer binarized with,
+    // and `extract()`'s own `count` (aggregated over `seg >= onset`) always
+    // satisfies it.
+    //
+    // Ordered last: it is the only check that allocates, and every input that
+    // reaches it has already been bounded by check 6.
+    let mut chunk_count = vec![0.0f64; chunk_frames];
+    for (cf, slot) in chunk_count.iter_mut().enumerate() {
+      let base = cf * SEG_NUM_SLOTS;
+      *slot = segmentations[base..base + SEG_NUM_SLOTS]
+        .iter()
+        .filter(|v| **v > 0.0)
+        .count() as f64;
+    }
+    let supported = crate::audio::speaker::window::try_aggregate_output_frame_count(
+      &chunk_count,
+      num_chunks,
+      num_frames_per_chunk,
+      chunks_sw,
+      frames_sw,
+    )
+    .map_err(|e| match e {
+      crate::audio::speaker::window::WindowError::OutputFrameCountOverflow => {
+        ExtractError::OutputFrameCountOverflow
+      }
+    })?;
+    // Check 5 made `supported.len() == count.len()`: both are the same
+    // `try_num_output_frames(last_chunk_end, frames_sw.step())`. The `zip`
+    // below TRUNCATES to the shorter of the two, so that equality is what stops
+    // a short `count` from skipping frames it never declared.
+    debug_assert_eq!(
+      supported.len(),
+      count.len(),
+      "check 5 must have equated count.len() with the derived grid"
+    );
+    for (t, (&got, &max)) in count.iter().zip(supported.iter()).enumerate() {
+      if got > max {
+        return Err(ExtractError::CountAboveSegmentationSupport(
+          crate::audio::speaker::error::CountAboveSegmentationSupport::new(t, got, max),
+        ));
+      }
+    }
 
     Ok(Self::from_parts(
       raw_embeddings,

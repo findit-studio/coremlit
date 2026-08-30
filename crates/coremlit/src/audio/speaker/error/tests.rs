@@ -238,3 +238,54 @@ fn invalid_sliding_window_displays_all_three_components() {
   assert!(rendered.contains("10"), "{rendered}");
   assert!(rendered.contains("step 0"), "{rendered}");
 }
+
+#[test]
+fn non_zero_sliding_window_origin_displays_the_offending_origin() {
+  let w = crate::audio::speaker::window::SlidingWindow::new(-1.0, 1.0, 1.0);
+  let e = InvalidSlidingWindow::new(ExtractionPart::ChunksSw, w);
+  let rendered = ExtractError::NonZeroSlidingWindowOrigin(e).to_string();
+  assert!(rendered.contains("chunks_sw"), "{rendered}");
+  assert!(rendered.contains("start -1"), "{rendered}");
+  assert!(rendered.contains("non-zero origin"), "{rendered}");
+}
+
+#[test]
+fn frame_step_not_representable_in_f32_displays_both_the_step_and_its_image() {
+  let w = crate::audio::speaker::window::SlidingWindow::new(0.0, 1.0, 7.0e-46);
+  let e = InvalidSlidingWindow::new(ExtractionPart::FramesSw, w);
+  let rendered = ExtractError::FrameStepNotRepresentableInF32(e).to_string();
+  assert!(rendered.contains("frames_sw"), "{rendered}");
+  // The f64 step and the f32 it narrows to, so the message shows the loss.
+  assert!(rendered.contains("7e-46"), "{rendered}");
+  assert!(rendered.contains("narrows to 0e0"), "{rendered}");
+}
+
+#[test]
+fn active_slot_without_embedding_displays_chunk_and_slot() {
+  let a = ActiveSlotWithoutEmbedding::new(7, 2);
+  assert_eq!((a.chunk(), a.slot()), (7, 2));
+  let rendered = ExtractError::ActiveSlotWithoutEmbedding(a).to_string();
+  assert!(rendered.contains("chunk 7"), "{rendered}");
+  assert!(rendered.contains("slot 2"), "{rendered}");
+  assert!(rendered.contains("usable embedding"), "{rendered}");
+}
+
+#[test]
+fn count_above_segmentation_support_displays_frame_got_and_supported() {
+  let c = CountAboveSegmentationSupport::new(41, 4, 1);
+  assert_eq!((c.frame(), c.got(), c.supported()), (41, 4, 1));
+  let rendered = ExtractError::CountAboveSegmentationSupport(c).to_string();
+  assert!(rendered.contains("count[41]"), "{rendered}");
+  assert!(rendered.contains(" is 4 "), "{rendered}");
+  assert!(rendered.contains("at most 1"), "{rendered}");
+}
+
+#[test]
+fn output_frame_count_too_large_displays_both_the_derived_count_and_the_cap() {
+  let rendered =
+    ExtractError::OutputFrameCountTooLarge(crate::audio::speaker::extract::MAX_OUTPUT_FRAMES + 1)
+      .to_string();
+  assert!(rendered.contains("4194305"), "{rendered}");
+  assert!(rendered.contains("4194304"), "{rendered}");
+  assert!(rendered.contains("MAX_OUTPUT_FRAMES"), "{rendered}");
+}

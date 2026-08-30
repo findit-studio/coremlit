@@ -714,11 +714,13 @@ pub(crate) enum WindowError {
 ///
 /// `pub(crate)`, not module-private: besides the two aggregation paths in
 /// this module, [`crate::audio::speaker::extract::Extraction::try_from_parts`]
-/// runs it as a PRE-check over caller-supplied sliding windows, so that
+/// runs it over caller-supplied sliding windows for TWO results at once — its
+/// `Err` is the PRE-check that keeps
 /// [`crate::audio::speaker::extract::Extraction::diarize_online`]'s later
-/// `.expect(..)` on the identical `(last_chunk_end, frame_step)` pair stays
-/// unreachable. Both sites must call the SAME function for that argument to
-/// hold — a re-implementation could drift.
+/// `.expect(..)` on the identical `(last_chunk_end, frame_step)` pair
+/// unreachable, and its `Ok` value IS the output-frame grid that constructor
+/// requires `count.len()` to equal. Both sites must call the SAME function for
+/// either argument to hold — a re-implementation could drift.
 ///
 /// dia's exact bound (`count.rs:522-533`):
 /// ```text
@@ -908,8 +910,12 @@ pub(crate) fn try_count_from_segmentations(
 /// `chunk_count[c * num_frames_per_chunk + f]` is the per-(chunk, frame)
 /// scalar to overlap-add: [`try_count_from_segmentations`] fills it with the
 /// active-slot count, [`crate::audio::speaker::extract::Extraction::diarize_online`] with the
-/// distinct-cluster count. Both are `<= num_speakers`, so the averaged,
-/// `round_ties_even`'d result stays within the same `u8` range either way.
+/// distinct-cluster count, and
+/// [`crate::audio::speaker::extract::Extraction::try_from_parts`] with the
+/// active-slot count under the WEAKEST activity predicate (`seg > 0.0`), to
+/// bound a caller-supplied `count` by what its own segmentations support. All
+/// three are `<= num_speakers`, so the averaged, `round_ties_even`'d result
+/// stays within the same `u8` range in every case.
 /// Splitting the count derivation from this shared tail is what lets the
 /// online path avoid ever materializing a `chunks × frames × clusters`
 /// tensor: it needs only this `chunks × frames` vector.

@@ -159,8 +159,8 @@ pub struct ExtractionLenMismatch {
 }
 
 impl ExtractionLenMismatch {
-  /// The rejected tensor — [`ExtractionPart::RawEmbeddings`] or
-  /// [`ExtractionPart::Segmentations`].
+  /// The rejected tensor — [`ExtractionPart::RawEmbeddings`],
+  /// [`ExtractionPart::Segmentations`], or [`ExtractionPart::Count`].
   #[inline(always)]
   pub const fn part(&self) -> ExtractionPart {
     self.part
@@ -173,7 +173,11 @@ impl ExtractionLenMismatch {
   /// The length the caller's own declared geometry requires:
   /// `num_chunks * num_speakers * EMBEDDING_DIM` for
   /// [`ExtractionPart::RawEmbeddings`], `num_chunks * num_frames_per_chunk *
-  /// num_speakers` for [`ExtractionPart::Segmentations`].
+  /// num_speakers` for [`ExtractionPart::Segmentations`], and — for
+  /// [`ExtractionPart::Count`], whose length IS `num_output_frames` — the
+  /// output-frame count the two sliding windows and `num_chunks` derive, the
+  /// same one [`crate::audio::speaker::extract::Extraction::diarize_online`]
+  /// re-derives and requires.
   #[inline(always)]
   pub const fn expected(&self) -> usize {
     self.expected
@@ -275,6 +279,81 @@ impl InvalidSlidingWindow {
     window: crate::audio::speaker::window::SlidingWindow,
   ) -> Self {
     Self { part, window }
+  }
+}
+
+/// A `(chunk, slot)` whose `segmentations` column claims speech but whose
+/// `raw_embeddings` row is not a usable embedding.
+///
+/// Payload of [`ExtractError::ActiveSlotWithoutEmbedding`]. The two indices are
+/// what a caller needs to route the failure back to the upstream stage that
+/// produced the row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ActiveSlotWithoutEmbedding {
+  chunk: usize,
+  slot: usize,
+}
+
+impl ActiveSlotWithoutEmbedding {
+  /// Index of the chunk carrying the offending slot.
+  #[inline(always)]
+  pub const fn chunk(&self) -> usize {
+    self.chunk
+  }
+  /// Index of the speaker slot within that chunk, in `0..SEG_NUM_SLOTS`.
+  #[inline(always)]
+  pub const fn slot(&self) -> usize {
+    self.slot
+  }
+
+  /// Crate-private: only the validating constructor raises this.
+  pub(crate) const fn new(chunk: usize, slot: usize) -> Self {
+    Self { chunk, slot }
+  }
+}
+
+/// A `count[t]` claiming more simultaneous speakers than the `segmentations`
+/// supplied beside it can put at output frame `t`.
+///
+/// Payload of [`ExtractError::CountAboveSegmentationSupport`]. `supported` is
+/// the same overlap-add aggregation
+/// [`crate::audio::speaker::window::count_from_segmentations`] runs, taken over
+/// the WEAKEST activity predicate (`seg > 0.0`, `diaric`'s "any nonzero entry is
+/// binary-active" convention) so it is an upper bound for every `onset` a
+/// producer could have binarized with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CountAboveSegmentationSupport {
+  frame: usize,
+  got: u8,
+  supported: u8,
+}
+
+impl CountAboveSegmentationSupport {
+  /// The output frame `t` whose count is unsupported. The FIRST such frame:
+  /// the scan stops at the earliest disagreement.
+  #[inline(always)]
+  pub const fn frame(&self) -> usize {
+    self.frame
+  }
+  /// The `count[t]` the caller supplied.
+  #[inline(always)]
+  pub const fn got(&self) -> u8 {
+    self.got
+  }
+  /// The largest `count[t]` the caller's own `segmentations` and geometry
+  /// support at that frame.
+  #[inline(always)]
+  pub const fn supported(&self) -> u8 {
+    self.supported
+  }
+
+  /// Crate-private: only the validating constructor raises this.
+  pub(crate) const fn new(frame: usize, got: u8, supported: u8) -> Self {
+    Self {
+      frame,
+      got,
+      supported,
+    }
   }
 }
 
@@ -437,6 +516,133 @@ pub enum ExtractError {
     .0.window().step()
   )]
   InvalidSlidingWindow(InvalidSlidingWindow),
+  /// A supplied [`crate::audio::speaker::window::SlidingWindow`] declares a
+  /// non-zero origin, which the two consumers of an [`crate::audio::speaker::extract::Extraction`]
+  /// resolve DIFFERENTLY.
+  ///
+  /// [`crate::audio::speaker::window::count_from_segmentations`] — the aggregation
+  /// [`crate::audio::speaker::extract::Extraction::diarize_online`] runs to build its
+  /// own count — places chunk `c` at `round(c * chunks_sw.step /
+  /// frames_sw.step)`, ignoring both origins (dia's own
+  /// `diarization/src/aggregate/count.rs` does the same, and dia's pipeline only
+  /// ever passes `0.0`). `diaric::reconstruct`, which BOTH backends then feed,
+  /// places the same chunk at `frames_sw.closest_frame(chunks_sw.start + c *
+  /// chunks_sw.step + frames_sw.duration / 2)`, which honours both origins
+  /// (`diarization/src/reconstruct/algo.rs:110,690`). A non-zero origin
+  /// therefore shifts the count relative to the activations it is supposed to
+  /// select from, marking zero-activation cells active — phantom speech
+  /// returned as `Ok`.
+  ///
+  /// `0.0` is what [`crate::audio::speaker::window::chunk_sliding_window`] and
+  /// [`crate::audio::speaker::window::frame_sliding_window`] produce, so every
+  /// in-crate construction path already satisfies this; only a
+  /// publicly-assembled [`crate::audio::speaker::extract::ExtractionParts`] can
+  /// declare otherwise. See [`InvalidSlidingWindow`] for the payload.
+  #[error(
+    "extraction parts: {} declares a non-zero origin (start {}) — the online count aggregation \
+     ignores window origins while diaric's reconstruct honours them, so only 0.0 keeps the two \
+     grids aligned",
+    .0.part(),
+    .0.window().start()
+  )]
+  NonZeroSlidingWindowOrigin(InvalidSlidingWindow),
+  /// `frames_sw.step()` is finite and strictly positive in `f64` but does not
+  /// survive the narrowing to `f32` that
+  /// [`crate::audio::speaker::extract::Extraction::diarize_online`] applies to
+  /// it.
+  ///
+  /// That method builds the online engine's speech duration as
+  /// `active_frame_count as f32 * (frames_sw.step() as f32)` — FluidAudio's
+  /// `Float(activity) * slidingWindow.step`, kept in `f32` for
+  /// bit-parity with the Swift oracle (`tests/parity_online_swift.rs`). A step
+  /// below `f32`'s smallest subnormal narrows to `0.0`, so every slot is handed
+  /// a zero speech duration and the `min_speech_duration` gate drops speakers
+  /// whose DECLARED duration meets it; a step above `f32::MAX` narrows to
+  /// `+inf`, which makes an inactive slot's duration `0.0 * inf = NaN`. Both
+  /// are silent: `Ok`, with the wrong speakers.
+  ///
+  /// Rejected rather than repaired by widening the arithmetic, because the
+  /// `f32` product is the parity contract; a step this crate cannot represent
+  /// in it is not a grid the online engine can honour. See
+  /// [`InvalidSlidingWindow`] for the payload.
+  #[error(
+    "extraction parts: {} declares a step ({:e}) that narrows to {:e} in f32 — the online speech \
+     duration is an f32 product, so the step must stay finite and > 0 through that narrowing",
+    .0.part(),
+    .0.window().step(),
+    .0.window().step() as f32
+  )]
+  FrameStepNotRepresentableInF32(InvalidSlidingWindow),
+  /// A `(chunk, slot)` whose `segmentations` column claims speech pairs with a
+  /// `raw_embeddings` row that `diaric::embed::Embedding::normalize_from`
+  /// refuses (non-finite, or norm below `diaric::embed::NORM_EPSILON`).
+  ///
+  /// `None` from `normalize_from` is
+  /// [`crate::audio::speaker::extract::Extraction::diarize_online`]'s
+  /// DROPPED-SLOT sentinel — a dropped slot's row is all-zero precisely so that
+  /// it is rejected there and the slot stays UNMATCHED. A corrupt or degenerate
+  /// row under an ACTIVE column takes that same path, so the online engine reads
+  /// "no speaker here" and returns `Ok` with the speech missing. Rejecting at
+  /// assembly is what separates "this slot was deliberately dropped upstream"
+  /// (column zeroed too) from "this slot's embedding is broken".
+  ///
+  /// Every in-crate path already satisfies this:
+  /// [`crate::audio::speaker::extract::Extractor::extract`] zeroes a dropped
+  /// slot's segmentation column at the same moment it leaves the row zero. See
+  /// [`ActiveSlotWithoutEmbedding`].
+  #[error(
+    "extraction parts: chunk {} slot {} has an active segmentations column but its raw_embeddings \
+     row is not a usable embedding (non-finite, or norm below diaric's NORM_EPSILON)",
+    .0.chunk(),
+    .0.slot()
+  )]
+  ActiveSlotWithoutEmbedding(ActiveSlotWithoutEmbedding),
+  /// A `count[t]` claims more simultaneous speakers than the `segmentations`
+  /// supplied beside it can put at output frame `t`.
+  ///
+  /// `diaric`'s offline reconstruction treats `count[t]` as an INJECTIVE
+  /// per-cluster count: it pads the cluster axis out to `max(count)` and marks
+  /// exactly `count[t]` columns active by descending activation
+  /// (`diarization/src/reconstruct/algo.rs:736-810`), with no lower bound on the
+  /// activation it will select. A `count[t]` above the real support therefore
+  /// selects zero-activation padded columns and emits that many phantom
+  /// speakers, as `Ok`. A range check does not catch it: `count = [3, 3]` is
+  /// inside both `SEG_NUM_SLOTS` and `diaric::reconstruct::MAX_COUNT_PER_FRAME`
+  /// and still fabricates two speakers on a grid with one active slot.
+  ///
+  /// The bound is the caller's own data: the overlap-add aggregation
+  /// [`crate::audio::speaker::window::count_from_segmentations`] runs, taken
+  /// over `seg > 0.0` — the weakest activity predicate, so the bound holds for
+  /// every `onset` in `(0.0, 1.0]` a producer could have binarized with, and
+  /// [`crate::audio::speaker::extract::Extractor::extract`]'s own `count` (an
+  /// aggregation over `seg >= onset`) always satisfies it. See
+  /// [`CountAboveSegmentationSupport`].
+  #[error(
+    "extraction parts: count[{}] is {} but the supplied segmentations support at most {} \
+     simultaneous speakers at that output frame",
+    .0.frame(),
+    .0.got(),
+    .0.supported()
+  )]
+  CountAboveSegmentationSupport(CountAboveSegmentationSupport),
+  /// The output-frame grid the geometry derives is above
+  /// [`crate::audio::speaker::extract::MAX_OUTPUT_FRAMES`].
+  ///
+  /// A RESOURCE bound, not a consistency invariant: the grid is internally
+  /// consistent, it is simply larger than this crate is willing to build
+  /// scratch buffers for. See
+  /// [`crate::audio::speaker::extract::MAX_OUTPUT_FRAMES`] for the budget the
+  /// number encodes and why a cap was chosen over fallible allocation.
+  ///
+  /// Carries the derived frame count that was refused; the ceiling is the public
+  /// constant.
+  #[error(
+    "extraction parts: the declared geometry derives {} output frames, above the \
+     MAX_OUTPUT_FRAMES cap ({})",
+    .0,
+    crate::audio::speaker::extract::MAX_OUTPUT_FRAMES
+  )]
+  OutputFrameCountTooLarge(usize),
   /// The derived `num_output_frames` would not fit in `usize`. Converted
   /// from [`crate::audio::speaker::window`]'s crate-private `WindowError` by an exhaustive
   /// manual match in [`crate::audio::speaker::extract::Extractor::extract`] (deliberately

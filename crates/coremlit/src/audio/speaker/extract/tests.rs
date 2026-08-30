@@ -497,21 +497,10 @@ fn options_serde_round_trips() {
 
 #[test]
 fn into_offline_input_round_trips_against_real_dia() {
-  // A small, self-consistent Extraction (num_chunks=1, F=2, count len ==
-  // num_output_frames=4). Fields are private, but this child test module
-  // sees them.
-  let e = Extraction {
-    raw_embeddings: (0..(SEG_NUM_SLOTS * EMBEDDING_DIM))
-      .map(|i| i as f32 * 0.25 - 3.0)
-      .collect(),
-    segmentations: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-    count: vec![1, 2, 1, 0],
-    num_chunks: 1,
-    num_frames_per_chunk: 2,
-    num_output_frames: 4,
-    chunks_sw: crate::audio::speaker::window::chunk_sliding_window(&WindowOptions::new()),
-    frames_sw: crate::audio::speaker::window::frame_sliding_window(),
-  };
+  // The shared small, self-consistent Extraction (num_chunks=1, F=2, count len
+  // == num_output_frames=4). One definition, so the geometry these assertions
+  // read cannot drift from the one `try_from_parts` validates below.
+  let e = tiny_extraction();
 
   let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
   let input = e.into_offline_input(&plda);
@@ -554,18 +543,8 @@ fn into_offline_input_round_trips_against_real_dia() {
 #[test]
 fn diarize_matches_manual_into_offline_input_pipeline() {
   // The same small, self-consistent Extraction as the round-trip test above.
-  let e = Extraction {
-    raw_embeddings: (0..(SEG_NUM_SLOTS * EMBEDDING_DIM))
-      .map(|i| i as f32 * 0.25 - 3.0)
-      .collect(),
-    segmentations: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-    count: vec![1, 2, 1, 0],
-    num_chunks: 1,
-    num_frames_per_chunk: 2,
-    num_output_frames: 4,
-    chunks_sw: crate::audio::speaker::window::chunk_sliding_window(&WindowOptions::new()),
-    frames_sw: crate::audio::speaker::window::frame_sliding_window(),
-  };
+  // Shared, not re-inlined: see that test's note.
+  let e = tiny_extraction();
   let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
 
   // Subject: the public runtime method.
@@ -619,19 +598,30 @@ fn diarize_matches_manual_into_offline_input_pipeline() {
 // =====================================================================
 
 /// A small, self-consistent [`Extraction`] (num_chunks=1, F=2, count len ==
-/// num_output_frames=4) — the same shape the round-trip / diarize tests above
-/// build inline. Private fields are visible to this child module.
+/// num_output_frames=4) — the fixture the round-trip / diarize tests above and
+/// the `try_from_parts` suite below all build from. Private fields are visible
+/// to this child module.
+///
+/// "Self-consistent" is load-bearing, not decoration: [`Extraction::try_from_parts`]
+/// enforces every cross-part invariant these fields carry, so this fixture must
+/// satisfy them all or the round-trip through the public constructor fails.
+/// - The chunk window is shortened to three frame-steps so the geometry derives
+///   exactly `count.len()` output frames. At the nominal 10 s chunk duration it
+///   would derive 594.
+/// - `count` is `[1, 1, 0, 0]`: the single chunk covers output frames 0 and 1
+///   with one active slot each, and frames 2-3 are covered by no chunk at all.
 fn tiny_extraction() -> Extraction {
   Extraction {
     raw_embeddings: (0..(SEG_NUM_SLOTS * EMBEDDING_DIM))
       .map(|i| i as f32 * 0.25 - 3.0)
       .collect(),
     segmentations: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-    count: vec![1, 2, 1, 0],
+    count: vec![1, 1, 0, 0],
     num_chunks: 1,
     num_frames_per_chunk: 2,
     num_output_frames: 4,
-    chunks_sw: crate::audio::speaker::window::chunk_sliding_window(&WindowOptions::new()),
+    chunks_sw: crate::audio::speaker::window::chunk_sliding_window(&WindowOptions::new())
+      .with_duration(3.0 * crate::audio::speaker::window::FRAME_STEP_S),
     frames_sw: crate::audio::speaker::window::frame_sliding_window(),
   }
 }
@@ -749,12 +739,15 @@ fn online_extraction() -> Extraction {
   set_block(1, 1, 0); // A (reuse)
   set_block(1, 2, 2); // C
 
-  // count[t]: 2 active clusters over each chunk's frames, 0 elsewhere. Valid
-  // (<= MAX_COUNT_PER_FRAME) and length == num_output_frames. NOTE: `diarize_online`
-  // no longer consumes this field (it derives its own clustered-segmentation count);
-  // it is retained as a valid `Extraction::count` (the offline path's contract).
+  // count[t]: the number of active slots this fixture's own segmentations put at
+  // each output frame — ONE per frame over chunk 0 (output frames 0-3, one active
+  // slot each) and TWO over chunk 1 (output frames 59-62, two active slots each),
+  // 0 on the uncovered frames between. Length == num_output_frames. NOTE:
+  // `diarize_online` no longer consumes this field (it derives its own
+  // clustered-segmentation count); it is retained as a valid `Extraction::count`
+  // (the offline path's contract, and what `try_from_parts` validates).
   let mut count = vec![0u8; 63];
-  count[0..4].fill(2);
+  count[0..4].fill(1);
   count[59..63].fill(2);
 
   // Chunk window sized to this fixture's 63-frame output grid: duration =
@@ -1541,19 +1534,24 @@ use crate::audio::speaker::error::ExtractionPart;
 
 /// The [`ExtractionParts`] of [`tiny_extraction`], self-consistent:
 /// `num_chunks = 1`, `num_frames_per_chunk = 2`, so `raw_embeddings` is
-/// `1 * 3 * 256 = 768` long and `segmentations` is `1 * 2 * 3 = 6`.
-/// Every negative test below starts from this and breaks exactly one thing.
+/// `1 * 3 * 256 = 768` long and `segmentations` is `1 * 2 * 3 = 6`; the chunk
+/// window derives exactly `count.len() == 4` output frames and `count` stays
+/// within what those segmentations support. Every negative test below starts
+/// from this and breaks exactly one thing.
+///
+/// Decomposed from [`tiny_extraction`] rather than re-listed, so the fixture and
+/// its parts cannot drift apart — a `valid_parts` that stopped describing a real
+/// `Extraction` would make every negative test below vacuous.
 fn valid_parts() -> ExtractionParts {
+  let e = tiny_extraction();
   ExtractionParts {
-    raw_embeddings: (0..(SEG_NUM_SLOTS * EMBEDDING_DIM))
-      .map(|i| i as f32 * 0.25 - 3.0)
-      .collect(),
-    segmentations: vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-    count: vec![1, 2, 1, 0],
-    num_chunks: 1,
-    num_frames_per_chunk: 2,
-    chunks_sw: crate::audio::speaker::window::chunk_sliding_window(&WindowOptions::new()),
-    frames_sw: crate::audio::speaker::window::frame_sliding_window(),
+    raw_embeddings: e.raw_embeddings().to_vec(),
+    segmentations: e.segmentations().to_vec(),
+    count: e.count().to_vec(),
+    num_chunks: e.num_chunks(),
+    num_frames_per_chunk: e.num_frames_per_chunk(),
+    chunks_sw: e.chunks_sw(),
+    frames_sw: e.frames_sw(),
   }
 }
 
@@ -1668,9 +1666,14 @@ fn try_from_parts_round_trips_the_online_backend_too() {
 fn try_from_parts_accepts_self_consistent_parts_and_derives_num_output_frames() {
   // `num_output_frames` is NOT a part: it IS count.len(). Pinned with a count
   // length that matches nothing else in the geometry (7 != 1, 2, 6, 768), so a
-  // constructor that derived it from any other dimension would fail here.
+  // constructor that derived it from any other dimension would fail here. The
+  // chunk window is stretched to six frame-steps so the geometry DERIVES those
+  // seven frames; only the two the single chunk covers carry a speaker.
   let mut parts = valid_parts();
-  parts.count = vec![1, 0, 2, 1, 0, 1, 1];
+  parts.chunks_sw = parts
+    .chunks_sw
+    .with_duration(6.0 * crate::audio::speaker::window::FRAME_STEP_S);
+  parts.count = vec![1, 1, 0, 0, 0, 0, 0];
   let e = Extraction::try_from_parts(parts).expect("self-consistent parts");
   assert_eq!(e.num_output_frames(), 7);
   assert_eq!(e.count().len(), 7);
@@ -1968,25 +1971,41 @@ fn try_from_parts_guarantee_makes_diarize_online_panic_free() {
 
 #[test]
 fn diarize_online_refuses_an_oversized_derived_grid_before_allocating_it() {
-  // The one OOM vector a PUBLIC constructor opens. These windows pass every
-  // `try_from_parts` check — both are finite and strictly positive, and the
-  // derived output-frame count (1e15 + 1) fits `usize` — yet they describe a
-  // grid `diarize_online` would otherwise materialise as TWO `f64` buffers of
-  // 8 PB each before `reconstruct` raised the very same `CountLenMismatch`
-  // against this extraction's 4-frame `count`. An allocation that large is a
-  // process abort, not a catchable failure, so the mismatch is refused first.
+  // TWO doors, both shut, on the one OOM vector a PUBLIC constructor opens.
+  // These windows are finite and strictly positive and the derived output-frame
+  // count (1e15 + 1) fits `usize`, yet they describe a grid `diarize_online`
+  // would otherwise materialise as TWO `f64` buffers of 8 PB each. An
+  // allocation that large is a process abort, not a catchable failure.
   //
   // Same convention as `diarize_online_over_cap_grid_is_a_typed_reconstruct_
   // error_not_an_oom` above: THIS TEST COMPLETING IS THE ALLOCATION PROOF.
-  let parts = ExtractionParts {
-    chunks_sw: SlidingWindow::new(0.0, 1e13, 1.0),
-    frames_sw: SlidingWindow::new(0.0, 0.06, 0.01),
-    ..valid_parts()
-  };
-  let e = Extraction::try_from_parts(parts)
-    .expect("finite positive windows with a representable derived frame count are accepted");
-  assert_eq!(e.num_output_frames(), 4);
+  let chunks_sw = SlidingWindow::new(0.0, 1e13, 1.0);
+  let frames_sw = SlidingWindow::new(0.0, 0.06, 0.01);
 
+  // Door 1: the public constructor. `count.len()` is not the grid this geometry
+  // derives, which is now a refusal rather than an accepted `Extraction`.
+  let err = refused(ExtractionParts {
+    chunks_sw,
+    frames_sw,
+    ..valid_parts()
+  });
+  let ExtractError::ExtractionLenMismatch(m) = err else {
+    panic!("expected an ExtractionLenMismatch on count, got {err:?}")
+  };
+  assert_eq!(m.part(), ExtractionPart::Count);
+  assert_eq!(m.got(), 4);
+
+  // Door 2: `diarize_online`'s own guard, which stays load-bearing because
+  // `Extraction`'s fields are crate-private but its in-crate constructors are
+  // UNCHECKED (`from_parts`). Built here the way a source builds one, so the
+  // guard is exercised on exactly the geometry door 1 now rejects.
+  let base = tiny_extraction();
+  let e = Extraction {
+    chunks_sw,
+    frames_sw,
+    ..base
+  };
+  assert_eq!(e.num_output_frames(), 4);
   let err = e
     .diarize_online(OnlineOptions::new())
     .expect_err("a derived grid that does not match num_output_frames must be refused");
@@ -2172,4 +2191,348 @@ fn diarize_online_never_refuses_a_count_derived_the_way_extract_derives_it() {
        ({num_chunks} chunks, {num_frames_per_chunk} frames/chunk)"
     );
   }
+}
+
+// =====================================================================
+// try_from_parts — the CROSS-PART invariants both backends consume
+// (adversarial review of #110). Every test below is the reviewer's own
+// trigger: each one is accepted by a constructor that checks only shapes,
+// and each one then makes ONE of the two backends silently wrong.
+// =====================================================================
+
+/// A `raw_embeddings` buffer for one chunk whose slot `slot` carries a
+/// usable (large, finite) embedding and whose other slots are all-zero.
+fn one_usable_slot_row(slot: usize) -> Vec<f32> {
+  let mut raw = vec![0.0f32; SEG_NUM_SLOTS * EMBEDDING_DIM];
+  let base = slot * EMBEDDING_DIM;
+  raw[base..base + 64].fill(1.0);
+  raw
+}
+
+/// Unit-scale timing: one 1-second chunk on a 1-second frame grid, so the
+/// derived output-frame count is exactly `2` and every geometry below can be
+/// read off by hand.
+fn unit_sw() -> SlidingWindow {
+  SlidingWindow::new(0.0, 1.0, 1.0)
+}
+
+/// `try_from_parts` must REFUSE `parts`; returns the error it raised.
+///
+/// Not `unwrap_err()`: on the failing (accepted) side that prints the whole
+/// `Extraction`, whose 768-value embedding buffer buries the one fact the
+/// falsifier is reporting. This names the accepted geometry instead.
+#[track_caller]
+fn refused(parts: ExtractionParts) -> ExtractError {
+  match Extraction::try_from_parts(parts) {
+    Err(e) => e,
+    Ok(e) => panic!(
+      "try_from_parts ACCEPTED these parts: num_chunks={}, num_frames_per_chunk={}, \
+       num_output_frames={}, chunks_sw={:?}, frames_sw={:?}",
+      e.num_chunks(),
+      e.num_frames_per_chunk(),
+      e.num_output_frames(),
+      e.chunks_sw(),
+      e.frames_sw()
+    ),
+  }
+}
+
+#[test]
+fn try_from_parts_rejects_an_active_slot_whose_embedding_row_is_unusable() {
+  // Finding 1. An ACTIVE segmentation column paired with a row that
+  // `diaric::embed::Embedding::normalize_from` refuses. `None` from that
+  // function is `diarize_online`'s DROPPED-SLOT sentinel (see its own comment
+  // at the `normalize_from` call), so a NaN row is read as "no speaker here":
+  // the slot stays UNMATCHED, the online engine returns `Ok` with NO speech,
+  // and nothing anywhere says the embedding was corrupt.
+  let mut raw = vec![0.0f32; SEG_NUM_SLOTS * EMBEDDING_DIM];
+  raw[0] = f32::NAN;
+  let parts = ExtractionParts {
+    raw_embeddings: raw,
+    segmentations: vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+    count: vec![1, 1],
+    num_chunks: 1,
+    num_frames_per_chunk: 2,
+    chunks_sw: unit_sw(),
+    frames_sw: unit_sw(),
+  };
+  let err = refused(parts);
+  let ExtractError::ActiveSlotWithoutEmbedding(a) = err else {
+    panic!("expected ActiveSlotWithoutEmbedding, got {err:?}")
+  };
+  assert_eq!((a.chunk(), a.slot()), (0, 0));
+
+  // The same rejection for the OTHER shape of the same defect: an all-zero
+  // row under an active column. `normalize_from` refuses it for zero norm,
+  // which is the very sentinel the online route reads as "dropped".
+  let parts = ExtractionParts {
+    raw_embeddings: vec![0.0f32; SEG_NUM_SLOTS * EMBEDDING_DIM],
+    segmentations: vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+    count: vec![1, 1],
+    num_chunks: 1,
+    num_frames_per_chunk: 2,
+    chunks_sw: unit_sw(),
+    frames_sw: unit_sw(),
+  };
+  let err = refused(parts);
+  assert!(
+    matches!(err, ExtractError::ActiveSlotWithoutEmbedding(a) if (a.chunk(), a.slot()) == (0, 0)),
+    "expected ActiveSlotWithoutEmbedding(0, 0), got {err:?}"
+  );
+}
+
+#[test]
+fn try_from_parts_rejects_a_count_the_segmentations_cannot_support() {
+  // Finding 2. One chunk, two frames, ONE active slot — so at most one
+  // speaker can be simultaneously active anywhere on this grid — with
+  // `count = [4, 4]`. Offline reconstruction pads its single hard cluster out
+  // to four columns and top-K marks all four active: three phantom speakers,
+  // `Ok`, no diagnostic. `count[t] <= MAX_COUNT_PER_FRAME` does not see it
+  // (4 <= 64), and neither does a `SEG_NUM_SLOTS` range check (`[3, 3]`
+  // fabricates two and is inside the slot bound).
+  for (claimed, supported) in [(4u8, 1u8), (3, 1)] {
+    let parts = ExtractionParts {
+      raw_embeddings: one_usable_slot_row(0),
+      segmentations: vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+      count: vec![claimed, claimed],
+      num_chunks: 1,
+      num_frames_per_chunk: 2,
+      chunks_sw: unit_sw(),
+      frames_sw: unit_sw(),
+    };
+    let err = refused(parts);
+    let ExtractError::CountAboveSegmentationSupport(c) = err else {
+      panic!("expected CountAboveSegmentationSupport for count {claimed}, got {err:?}")
+    };
+    assert_eq!((c.frame(), c.got(), c.supported()), (0, claimed, supported));
+  }
+}
+
+#[test]
+fn try_from_parts_rejects_a_count_length_the_geometry_does_not_derive() {
+  // Finding 3. The geometry derives TWO output frames; the parts declare
+  // something else. The two backends then DISAGREE about the same `Extraction`:
+  // online refuses it with `CountLenMismatch` while offline accepts it. The
+  // derived value is already computed here — it is what the overflow guard
+  // returns — and the defect was throwing it away with `?`.
+  //
+  // A SHORT count first, because it is the half NO other check can reach: the
+  // support scan walks `count` against the derived grid pairwise, so a `count`
+  // that stops early simply ends the scan, and every other invariant holds.
+  let parts = ExtractionParts {
+    raw_embeddings: one_usable_slot_row(0),
+    segmentations: vec![1.0, 0.0, 0.0],
+    count: vec![1],
+    num_chunks: 1,
+    num_frames_per_chunk: 1,
+    chunks_sw: unit_sw(),
+    frames_sw: unit_sw(),
+  };
+  let err = refused(parts);
+  let ExtractError::ExtractionLenMismatch(m) = err else {
+    panic!("expected ExtractionLenMismatch, got {err:?}")
+  };
+  assert_eq!(m.part(), ExtractionPart::Count);
+  assert_eq!((m.got(), m.expected()), (1, 2));
+
+  // And the reviewer's own trigger: TEN declared where two are derived. Offline
+  // accepts it and emits speech out to 9.5 s — eight frames past the end of the
+  // only chunk.
+  let parts = ExtractionParts {
+    raw_embeddings: one_usable_slot_row(0),
+    segmentations: vec![1.0, 0.0, 0.0],
+    count: vec![1; 10],
+    num_chunks: 1,
+    num_frames_per_chunk: 1,
+    chunks_sw: unit_sw(),
+    frames_sw: unit_sw(),
+  };
+  let err = refused(parts);
+  assert!(
+    matches!(err, ExtractError::ExtractionLenMismatch(m)
+      if m.part() == ExtractionPart::Count && (m.got(), m.expected()) == (10, 2)),
+    "expected an ExtractionLenMismatch(Count, 10, 2), got {err:?}"
+  );
+}
+
+#[test]
+fn try_from_parts_rejects_a_non_zero_sliding_window_origin() {
+  // Finding 4. `window`'s count aggregation places chunk `c` at
+  // `round(c * chunk_step / frame_step)`, ignoring BOTH origins;
+  // `diaric::reconstruct` places it at `closest_frame(chunks_sw.start +
+  // c * chunk_step + frames_duration / 2)`, which honours both. With
+  // `chunks_sw.start = -1` the two disagree by a frame: the online count is
+  // written at frames 0 and 1 while reconstruct clips the chunk's first frame
+  // and aggregates nothing into frame 1 — whose surviving `count` then marks a
+  // zero-activation cell active. Phantom speech, `Ok`, no diagnostic.
+  let parts = ExtractionParts {
+    raw_embeddings: one_usable_slot_row(0),
+    segmentations: vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+    count: vec![1, 1],
+    num_chunks: 1,
+    num_frames_per_chunk: 2,
+    chunks_sw: SlidingWindow::new(-1.0, 1.0, 1.0),
+    frames_sw: unit_sw(),
+  };
+  let err = refused(parts);
+  let ExtractError::NonZeroSlidingWindowOrigin(w) = err else {
+    panic!("expected NonZeroSlidingWindowOrigin, got {err:?}")
+  };
+  assert_eq!(w.part(), ExtractionPart::ChunksSw);
+  assert_eq!(w.window().start(), -1.0);
+
+  // The frames window's origin is the other half of the same difference.
+  let parts = ExtractionParts {
+    raw_embeddings: one_usable_slot_row(0),
+    segmentations: vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+    count: vec![1, 1],
+    num_chunks: 1,
+    num_frames_per_chunk: 2,
+    chunks_sw: unit_sw(),
+    frames_sw: SlidingWindow::new(0.5, 1.0, 1.0),
+  };
+  let err = refused(parts);
+  assert!(
+    matches!(err, ExtractError::NonZeroSlidingWindowOrigin(w) if w.part() == ExtractionPart::FramesSw),
+    "expected NonZeroSlidingWindowOrigin(FramesSw), got {err:?}"
+  );
+}
+
+#[test]
+fn try_from_parts_rejects_a_frame_step_that_does_not_survive_f32_narrowing() {
+  // Finding 5. `diarize_online` narrows `frames_sw.step()` to `f32` to build
+  // the speech duration the online gate reads. A step of `7e-46` is finite and
+  // strictly positive in `f64` — it passes every timing check — but narrows to
+  // exactly `0.0f32`, so a slot active for three frames is handed a speech
+  // duration of `0.0` where its own geometry declares `2.1e-45`. With
+  // `min_speech_duration = 1.4e-45` (the smallest positive `f32`) the declared
+  // duration MEETS the gate and the narrowed one does not: the speaker is
+  // dropped and the method returns `Ok` with an empty diarization.
+  //
+  // `1e-300` (the reviewer's own value) narrows the same way; it is included
+  // because it is the value the report names, not because its outcome differs.
+  let step = 7.0e-46_f64;
+  assert_eq!(step as f32, 0.0, "the premise: this step narrows to zero");
+  assert_eq!(1e-300_f64 as f32, 0.0);
+  for step in [step, 1e-300_f64] {
+    let parts = ExtractionParts {
+      raw_embeddings: one_usable_slot_row(0),
+      segmentations: vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+      count: vec![1, 1, 1],
+      num_chunks: 1,
+      num_frames_per_chunk: 3,
+      chunks_sw: SlidingWindow::new(0.0, 2.0 * step, step),
+      frames_sw: SlidingWindow::new(0.0, 2.0 * step, step),
+    };
+    let err = refused(parts);
+    let ExtractError::FrameStepNotRepresentableInF32(w) = err else {
+      panic!("expected FrameStepNotRepresentableInF32 for step {step:e}, got {err:?}")
+    };
+    assert_eq!(w.part(), ExtractionPart::FramesSw);
+    assert_eq!(w.window().step(), step);
+  }
+
+  // The other end of the same narrowing: a step above `f32::MAX` becomes
+  // `+inf`, which turns the online speech duration into `+inf` for an active
+  // slot and `0.0 * inf = NaN` for an inactive one.
+  let parts = ExtractionParts {
+    raw_embeddings: one_usable_slot_row(0),
+    segmentations: vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+    count: vec![1, 1],
+    num_chunks: 1,
+    num_frames_per_chunk: 2,
+    chunks_sw: SlidingWindow::new(0.0, 1e300, 1e300),
+    frames_sw: SlidingWindow::new(0.0, 1e300, 1e300),
+  };
+  let err = refused(parts);
+  assert!(
+    matches!(err, ExtractError::FrameStepNotRepresentableInF32(w) if w.window().step() == 1e300),
+    "expected FrameStepNotRepresentableInF32 for a step above f32::MAX, got {err:?}"
+  );
+}
+
+#[test]
+fn try_from_parts_rejects_an_output_frame_grid_above_the_allocation_cap() {
+  // Finding 6, the resource bound. A one-chunk, one-frame extraction whose
+  // chunk duration spans fifty million frame steps, with a `count` that
+  // MATCHES the derived grid — so the consistency checks are all satisfied and
+  // only a bound can refuse it. `diarize_online` would then build two
+  // `f64` buffers of that length: measured at 726 MB peak RSS from a 50 MB
+  // input before this check existed.
+  //
+  // THIS TEST COMPLETING WITHOUT THAT ALLOCATION IS THE PROOF: the refusal is
+  // O(1) and happens before any grid-sized buffer is touched.
+  //
+  // `count` is all-zero on purpose: a zero count is supported at every frame, so
+  // no consistency check can refuse these parts. The cap is the only thing that
+  // does, which is what makes this a falsifier for the cap itself.
+  let n = MAX_OUTPUT_FRAMES + 1;
+  let parts = ExtractionParts {
+    raw_embeddings: one_usable_slot_row(0),
+    segmentations: vec![1.0, 0.0, 0.0],
+    count: vec![0; n],
+    num_chunks: 1,
+    num_frames_per_chunk: 1,
+    chunks_sw: SlidingWindow::new(0.0, (n - 1) as f64, 1.0),
+    frames_sw: SlidingWindow::new(0.0, 1.0, 1.0),
+  };
+  let err = refused(parts);
+  assert_eq!(err, ExtractError::OutputFrameCountTooLarge(n));
+
+  // One frame BELOW the cap is accepted, so the cap is a boundary and not a
+  // blanket refusal of large grids. Kept cheap: only the `count` is sized to
+  // the cap, and nothing here reaches the online aggregation.
+  let n = MAX_OUTPUT_FRAMES;
+  let parts = ExtractionParts {
+    raw_embeddings: one_usable_slot_row(0),
+    segmentations: vec![1.0, 0.0, 0.0],
+    count: vec![0; n],
+    num_chunks: 1,
+    num_frames_per_chunk: 1,
+    chunks_sw: SlidingWindow::new(0.0, (n - 1) as f64, 1.0),
+    frames_sw: SlidingWindow::new(0.0, 1.0, 1.0),
+  };
+  Extraction::try_from_parts(parts).expect("exactly at the cap is accepted");
+}
+
+#[test]
+fn try_from_parts_accepts_a_count_below_the_support_and_a_sub_onset_active_slot() {
+  // The other side of checks 8 and 9: neither is an equality, and both use
+  // `seg > 0.0` rather than `seg >= onset`. `try_from_parts` takes no `onset`
+  // — it cannot know which threshold a producer binarized with — so the checks
+  // are written against the WEAKEST predicate and must accept everything a
+  // stricter one produces.
+  //
+  // Slot 1's column carries `0.3`: nonzero, but below the default `onset` of
+  // 0.5. So `count`, derived with that onset, says NO speaker at output frame
+  // 1 while the support bound says one — and that gap must be accepted, or the
+  // constructor would reject every soft segmentation. The same `0.3` makes slot
+  // 1 ACTIVE for check 8, which is why its embedding row has to be usable.
+  let mut raw = one_usable_slot_row(0);
+  raw[EMBEDDING_DIM..EMBEDDING_DIM + 64].fill(1.0); // slot 1: usable too
+  let parts = ExtractionParts {
+    raw_embeddings: raw,
+    segmentations: vec![1.0, 0.0, 0.0, 0.0, 0.3, 0.0],
+    count: vec![1, 0, 0, 0],
+    num_chunks: 1,
+    num_frames_per_chunk: 2,
+    chunks_sw: crate::audio::speaker::window::chunk_sliding_window(&WindowOptions::new())
+      .with_duration(3.0 * crate::audio::speaker::window::FRAME_STEP_S),
+    frames_sw: crate::audio::speaker::window::frame_sliding_window(),
+  };
+  let e = Extraction::try_from_parts(parts.clone()).expect("a sub-onset column is not a defect");
+  assert_eq!(e.num_output_frames(), 4);
+
+  // But the sub-onset column IS an active column, so a zero row under it is
+  // still the finding-1 defect — the online engine would read that slot as
+  // "no speaker" while its segmentation says otherwise.
+  let broken = ExtractionParts {
+    raw_embeddings: one_usable_slot_row(0), // slot 1 back to all-zero
+    ..parts
+  };
+  let err = refused(broken);
+  assert!(
+    matches!(err, ExtractError::ActiveSlotWithoutEmbedding(a) if (a.chunk(), a.slot()) == (0, 1)),
+    "expected ActiveSlotWithoutEmbedding(0, 1), got {err:?}"
+  );
 }
