@@ -179,3 +179,68 @@ fn the_smoother_is_reachable_from_the_flat_clap_surface() {
     "reset must return the smoother to its unseeded state"
   );
 }
+
+/// A pathological custom [`SmoothPolicy`]: overrides the provided `smooth`
+/// method to report `WinditError::Empty` regardless of input length, including
+/// for a NONEMPTY stream. No real policy should do this; it exists only to
+/// drive the test below, which pins that the wrapper's error mapping does not
+/// assume otherwise.
+#[derive(Debug, Clone, Copy)]
+struct ClaimsEmptyRegardless;
+
+/// The streaming state `ClaimsEmptyRegardless` must still name to satisfy
+/// [`SmoothPolicy`]; never driven, since the override below never calls
+/// `smoother`/`push`.
+#[derive(Debug, Clone, Copy)]
+struct ClaimsEmptyRegardlessState;
+
+impl Smoother<Embedding> for ClaimsEmptyRegardlessState {
+  fn push(&mut self, w: WindowEmbedding) -> core::result::Result<WindowEmbedding, WinditError> {
+    Ok(w)
+  }
+
+  fn reset(&mut self) {}
+}
+
+impl SmoothPolicy<Embedding> for ClaimsEmptyRegardless {
+  type Smoother = ClaimsEmptyRegardlessState;
+
+  fn smoother(&self) -> Self::Smoother {
+    ClaimsEmptyRegardlessState
+  }
+
+  fn smooth(
+    &self,
+    _seq: &[WindowEmbedding],
+  ) -> core::result::Result<Vec<WindowEmbedding>, WinditError> {
+    Err(WinditError::Empty)
+  }
+}
+
+#[test]
+fn a_custom_policys_empty_claim_on_nonempty_input_reaches_windowing_not_emptywindows() {
+  // `aggregate`'s blanket `From<WinditError>` collapses `WinditError::Empty`
+  // onto `Error::EmptyWindows` because there "the input was empty" and "the
+  // policy refuses" are the same event. They are NOT the same event here: this
+  // input is four windows, not zero, so a policy reporting `Empty` is reporting
+  // a smoothing failure, not "there were no windows". A caller matching
+  // `EmptyWindows` to mean the latter must not be misled by this call.
+  let windows = stream();
+  assert!(
+    !windows.is_empty(),
+    "the fixture must be nonempty for this to prove anything"
+  );
+
+  let err = smooth(&ClaimsEmptyRegardless, &windows).unwrap_err();
+
+  assert!(
+    matches!(err, Error::Windowing(WinditError::Empty)),
+    "expected Windowing(Empty), got {err:?}"
+  );
+  assert!(
+    !matches!(err, Error::EmptyWindows),
+    "a nonempty input's smoothing failure must never surface as EmptyWindows \
+     (that variant means zero windows were supplied, which is false here); \
+     got {err:?}"
+  );
+}

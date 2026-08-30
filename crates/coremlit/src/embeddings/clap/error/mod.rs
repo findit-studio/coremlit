@@ -174,7 +174,15 @@ pub enum Error {
 }
 
 impl From<WinditError> for Error {
-  /// The ONE outward translation from windit into clap's taxonomy.
+  /// [`aggregate`](crate::embeddings::clap::aggregate::aggregate)'s outward
+  /// translation from windit into clap's taxonomy — not this crate's only one.
+  /// [`smooth`](crate::embeddings::clap::smooth::smooth) maps [`WinditError`] to
+  /// [`Error::Windowing`] directly instead of going through this impl:
+  /// collapsing [`WinditError::Empty`] onto [`Error::EmptyWindows`] is right
+  /// only where "the input was empty" and "the policy refuses" are the same
+  /// event, which holds for aggregation and not for smoothing, where an empty
+  /// input smooths to an empty *output* rather than a refusal.
+  ///
   /// [`WinditError::Empty`] maps onto the pinned [`Error::EmptyWindows`] variant
   /// (same meaning, kept so the empty-aggregation taxonomy is stable across the
   /// port); every other windit error is wrapped losslessly in

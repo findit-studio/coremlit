@@ -86,12 +86,18 @@ mod tests;
 /// arise for the built-ins here, because [`Embedding`]'s own constructors have
 /// already excluded them.
 ///
-/// [`Error::EmptyWindows`] only through a CUSTOM policy that returns
-/// `WinditError::Empty`; no built-in does, and an empty input is an empty
-/// output rather than a refusal.
+/// [`Error::EmptyWindows`] is never returned here, unlike
+/// [`aggregate`](crate::embeddings::clap::aggregate::aggregate). A CUSTOM policy
+/// may still return `WinditError::Empty` — including for a NONEMPTY input — and
+/// that reaches the caller as `Windowing(WinditError::Empty)`, not
+/// `EmptyWindows`: this wrapper does not collapse the two the way `aggregate`'s
+/// does, because here `WinditError::Empty` would not mean "the input was empty"
+/// (see above — an empty input is an empty output, not a refusal), so
+/// `EmptyWindows`'s own meaning ("cannot aggregate zero window embeddings")
+/// would misdescribe it. No built-in policy here returns `WinditError::Empty`.
 pub fn smooth<P>(policy: &P, windows: &[WindowEmbedding]) -> Result<Vec<WindowEmbedding>>
 where
   P: SmoothPolicy<Embedding>,
 {
-  policy.smooth(windows).map_err(Error::from)
+  policy.smooth(windows).map_err(Error::Windowing)
 }
