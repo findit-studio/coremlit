@@ -148,8 +148,9 @@ const INTENDED_CI_COMBOS: &[&str] = &[
   "granite",
   "siglip",
   "ced",
-  "whisper,align,speaker,vad,clap,granite,siglip,ced,serde,tracing,nl-recognizer",
-  "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,serde,tracing,nl-recognizer",
+  "lid",
+  "whisper,align,speaker,vad,clap,granite,siglip,ced,lid,serde,tracing,nl-recognizer",
+  "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,serde,tracing,nl-recognizer",
 ];
 
 /// The curated combos of ci.yml's `parity` job — one row per third-party oracle
@@ -558,8 +559,9 @@ jobs:
           - "granite"
           - "siglip"
           - "ced"
-          - "whisper,align,speaker,vad,clap,granite,siglip,ced,serde,tracing,nl-recognizer"
-          - "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,serde,tracing,nl-recognizer"
+          - "lid"
+          - "whisper,align,speaker,vad,clap,granite,siglip,ced,lid,serde,tracing,nl-recognizer"
+          - "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,serde,tracing,nl-recognizer"
     steps:
       - uses: actions/checkout@v7
   parity:

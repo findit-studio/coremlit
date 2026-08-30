@@ -44,7 +44,7 @@ manifests and BOTH CI matrices.
 `default = []` (the bare CoreML runtime core). Additive features:
 
 `whisper`, `nl-recognizer`, `align`, `align-oracle`, `speaker`, `vad`, `clap`,
-`granite`, `siglip`, `ced`, `serde`, `tracing`.
+`granite`, `siglip`, `ced`, `lid`, `serde`, `tracing`.
 
 `coremlit-parity`'s own `default = []` plus three additive oracle features:
 `speaker-oracle` (⇒ `coremlit/speaker`), `clap-oracle` (⇒ `coremlit/clap`),
@@ -77,11 +77,25 @@ crates.io `windit` engine (geometry only). Same posture as `granite` —
 COMMITTED fp32 goldens, so NO `ced-oracle` sibling and no `ort` — and it
 composes with nothing (a single leaf feature).
 
+`lid` is likewise a NEW module (`audio::lid`): spoken-language identification
+on CoreML — 16 kHz mono waveform in, ranked languages out over a 107-language
+roster. A Rust log-mel front-end (`rustfft`, the module's only dependency)
+feeds one fp16 mel→log-probabilities graph, so the feature adds exactly
+`dep:rustfft` and nothing else. It is a **backend-neutral door**: no public name
+spells the model behind it, and today's backend is
+`aufklarer/SpeechBrain-ECAPA-VoxLingua107-21M-CoreML` (Apache-2.0), an export of
+`speechbrain/lang-id-voxlingua107-ecapa`. Unlike `granite` and `siglip` the
+label roster is COMMITTED in-crate (`include_bytes!`, 10.7 kB) rather than read
+from the artifact, so nothing about the vocabulary is a model gate. Clips are
+capped at 30.01 s by the graph's own frame range, so `lid` is a `windit`
+non-consumer (no windowing), and it composes with nothing — a single leaf
+feature.
+
 Compositions (pinned by the golden test): `nl-recognizer` → `whisper`;
 `align-oracle` → `align`. Across the package boundary, `coremlit-parity`'s
 `speaker-oracle` → `coremlit/speaker`, `clap-oracle` → `coremlit/clap`,
-`vad-bundled` → `coremlit/vad`. (`granite`, `siglip`, and `ced` each compose
-with nothing — a single leaf feature.)
+`vad-bundled` → `coremlit/vad`. (`granite`, `siglip`, `ced`, and `lid` each
+compose with nothing — a single leaf feature.)
 
 ## Curated CI feature-combination list
 
@@ -103,8 +117,9 @@ and driven by the `features` job of CI (`.github/workflows/ci.yml`), which runs
 | `granite` | granite text embeddings alone (artifact-sidecar tokenizer + committed transformers-fp32 goldens, no ort; `embed_long` rides the crates.io `windit` engine + `windit/text`) |
 | `siglip` | SigLIP 2 image+text embeddings alone (artifact-sidecar tokenizer + committed transformers-fp32 goldens, no ort) |
 | `ced` | CED (tiny/mini/small/base) sound-event tagging alone (Rust mel + `soundevents-dataset` + `windit`, no ort) |
-| `whisper,align,speaker,vad,clap,granite,siglip,ced,serde,tracing,nl-recognizer` | all non-oracle features on |
-| `whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,serde,tracing,nl-recognizer` | all-on (every coremlit feature, `align-oracle` included) |
+| `lid` | spoken-language identification alone (Rust mel + committed 107-label roster, no ort) |
+| `whisper,align,speaker,vad,clap,granite,siglip,ced,lid,serde,tracing,nl-recognizer` | all non-oracle features on |
+| `whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,serde,tracing,nl-recognizer` | all-on (every coremlit feature, `align-oracle` included) |
 
 `serde` and `tracing` are cross-cutting and covered by the all-on runs. The
 list embodies the combinatorial-honesty rule: it is explicit and reviewable,
@@ -132,6 +147,25 @@ I/O-identical and `ced-base` at 163.62 MB is past GitHub's 100 MB file limit
 that let vadkit be committed instead. Each target declares its gates once per
 size, so the CI step filters on `tiny::`; the `mini`/`small`/`base` gates stay
 local/dev gates against an owner-staged `CED_TEST_MODELS` tree.
+
+`lid` splits the same way, but only half of it is wired today. The `features`
+job runs the hermetic lid suite (the mel front end, the roster/asset agreement
+checks, every typed-error path) under the `lid` row and both all-on rows. The
+model-gated `lid_model_io` (5 gates) and `lid_e2e` (4 gates) targets have **no
+`model-tests` shard yet** and stay local/dev gates against an owner-staged
+`LID_TEST_MODELS` tree — the same posture `align` is in, and for a related
+reason. It is not the download: it is that `Models/lid/` cannot enter any shard
+until `tests/fp16_guards.rs`'s graph sweep can read the artifact. That sweep
+walks `Models/` WHOLE, and this graph is a coremltools 9 export whose scalar
+consts use MIL's terse `fp16 v = const()[val = fp16(…)]` spelling instead of the
+`tensor<fp16, []>` form the reader knows, so all 36 of its guard sites come back
+unresolved; and once they are readable its final `softmax -> log` carries
+`epsilon = 0x1p-149`, the same vanishing-guard defect `alignkit` and
+`speakerkit/Segmentation` are pinned for. Teaching the reader that dialect and
+cutting a `KNOWN_DEFECTS` pin are prerequisites for the shard, and both are
+model-numerics work rather than CI registration. There would be no `@lib` half
+in any case — every lid model gate is a `tests/lid/*` target, so
+`--features lid --lib -- --list --ignored` lists zero.
 
 `speaker` splits the same way, with one wrinkle no other kit has: its artifact
 set is staged from TWO repositories into one directory, and the second overlays

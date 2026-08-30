@@ -170,7 +170,7 @@ jobs:
           mkdir -p coverage
           failed=0
           cargo llvm-cov --no-report --no-fail-fast -p coremlit \
-            --features whisper,align,speaker,vad,clap,granite,siglip,ced,serde,tracing,nl-recognizer \
+            --features whisper,align,speaker,vad,clap,granite,siglip,ced,lid,serde,tracing,nl-recognizer \
             || failed=1
           cargo llvm-cov report --cobertura --output-path coverage/cobertura.xml
           if [ "$failed" -ne 0 ]; then
@@ -210,6 +210,14 @@ jobs:
       #
       # Raise it when a measured run shows real headroom. Never raise it to a
       # number no run has produced.
+      #
+      # THE READING ABOVE PREDATES `lid`. That feature joined the list when
+      # `audio::lid` was registered in ci.yml's matrix (the list is that row,
+      # verbatim), which adds ~1.5 kloc of module — most of it doc comment and a
+      # 107-row `const` roster — plus its hermetic suite, and no run has been
+      # measured since. The floor was left at 60 rather than re-cut from a
+      # number nobody produced; the next measured run on this leg is the one to
+      # re-baseline from.
       #
       # This is llvm-cov's own line metric, which is what `--fail-under-lines`
       # compares against. The summary table above is rendered from the Cobertura
