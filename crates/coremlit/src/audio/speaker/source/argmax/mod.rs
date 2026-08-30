@@ -1557,7 +1557,9 @@ fn place_embeddings(
 /// `extract::checked_extraction_chunk_count`; then
 /// [`ExtractError::ExtractionGeometryOverflow`] or
 /// [`ExtractError::ExtractionTensorBytesTooLarge`], through
-/// `extract::checked_extraction_tensor_bytes`. All three bounds run here rather
+/// `extract::checked_extraction_tensor_bytes`; then
+/// [`ExtractError::UncoveredLastChunk`], through
+/// `window::uncovered_last_chunk`. All four bounds run here rather
 /// than only at assembly for the same reason, and in the same order, as in
 /// `Extractor::checked_geometry`.
 ///
@@ -1574,6 +1576,11 @@ fn place_embeddings(
 /// stride and the compiled frame count are properties of the shipped graph, not
 /// invariants of this function.
 ///
+/// The COVERAGE bound is likewise inert here and likewise run: at
+/// `ARGMAX_FRAMES_PER_WINDOW` (589) over the pinned stride, the largest grid
+/// this source can build leaves the last chunk at least four frames of headroom
+/// (`the_pinned_argmax_grid_covers_its_last_chunk_at_every_chunk_count`).
+///
 /// # Panics
 /// Panics if `w_opts.step_samples()` is `0`, as
 /// [`crate::audio::speaker::window::chunk_starts`] does. `ArgmaxSource::extract`
@@ -1586,12 +1593,27 @@ fn checked_geometry(
   let num_chunks = crate::audio::speaker::window::num_chunks(samples_len, w_opts);
   let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(w_opts);
   let frames_sw = crate::audio::speaker::window::frame_sliding_window();
-  crate::audio::speaker::extract::checked_output_frame_count(num_chunks, chunks_sw, frames_sw)?;
+  let derived_output_frames =
+    crate::audio::speaker::extract::checked_output_frame_count(num_chunks, chunks_sw, frames_sw)?;
   crate::audio::speaker::extract::checked_extraction_chunk_count(num_chunks)?;
   crate::audio::speaker::extract::checked_extraction_tensor_bytes(
     num_chunks,
     ARGMAX_FRAMES_PER_WINDOW,
   )?;
+  // Check 14, over the frame count this source COMPILES IN rather than reads
+  // off a model — so, unlike at `Extractor::checked_geometry`, unreachable
+  // here. Run anyway, for the round-8 reason the two chunk-axis caps above are
+  // run: `ARGMAX_FRAMES_PER_WINDOW` is a property of the shipped graph, not an
+  // invariant of this function. Ordered last, matching the shared sequence.
+  if let Some(u) = crate::audio::speaker::window::uncovered_last_chunk(
+    num_chunks,
+    ARGMAX_FRAMES_PER_WINDOW,
+    derived_output_frames,
+    chunks_sw,
+    frames_sw,
+  ) {
+    return Err(ExtractError::UncoveredLastChunk(u));
+  }
   Ok((num_chunks, chunks_sw, frames_sw))
 }
 
@@ -1740,7 +1762,7 @@ impl ModelSource for ArgmaxSource {
     // FluidAudioSource's (`crate::audio::speaker::extract`'s "Count runs after all zeroing").
     //
     // Through `assemble_checked`, which derives that `count` and then runs the
-    // SAME thirteen checks `Extraction::try_from_parts` runs. Round 8: this
+    // SAME fourteen checks `Extraction::try_from_parts` runs. Round 8: this
     // source used to assemble through the crate-private unchecked `from_parts`,
     // which meant nothing at runtime held `speaker_ids` to the hard-binary
     // domain — `write_segmentations` copies the decoded IDs verbatim, and

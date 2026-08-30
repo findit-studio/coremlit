@@ -820,21 +820,23 @@ fn count_from_segmentations_panics_on_output_frame_count_overflow() {
 // The two chunk→output-frame mappings (round 2, finding B)
 // ---------------------------------------------------------------------
 
-/// Reads back the output frame `diaric::reconstruct` ACTUALLY places the last
-/// chunk's first frame at, by under-sizing the output grid and letting its
-/// `OutputFrameCountTooSmall` guard report the minimum it required: that
-/// minimum IS `last_start_frame + num_frames_per_chunk`
-/// (`diarization/src/reconstruct/algo.rs:478-492`).
+/// Reads back the grid length `diaric::reconstruct` ACTUALLY requires for this
+/// geometry, by under-sizing the output grid and letting its
+/// `OutputFrameCountTooSmall` guard report the minimum
+/// (`diarization/src/reconstruct/algo.rs:478-492`). That minimum IS
+/// `last_start_frame + num_frames_per_chunk`.
 ///
-/// This is the oracle for [`reconstruct_chunk_start_frame`], which has to be a
-/// hand-written mirror because `diaric::reconstruct::SlidingWindow::closest_frame`
-/// is private to that crate.
-fn diaric_last_chunk_start_frame(
+/// The oracle behind BOTH [`reconstruct_chunk_start_frame`] — a hand-written
+/// mirror, because `diaric::reconstruct::SlidingWindow::closest_frame` is
+/// private to that crate — and [`uncovered_last_chunk`], whose whole job is to
+/// predict this number before `diaric` is called. One oracle for the two, so a
+/// mirror that drifted could not satisfy one test by breaking the other.
+fn diaric_required_output_frames(
   num_chunks: usize,
   num_frames_per_chunk: usize,
   chunks_sw: SlidingWindow,
   frames_sw: SlidingWindow,
-) -> i64 {
+) -> usize {
   const SPEAKERS: usize = 3;
   let segmentations = vec![0.0f64; num_chunks * num_frames_per_chunk * SPEAKERS];
   let hard: Vec<diaric::pipeline::ChunkAssignment> = vec![[0, -2, -2]; num_chunks];
@@ -856,9 +858,21 @@ fn diaric_last_chunk_start_frame(
   match diaric::reconstruct::reconstruct(&input) {
     Err(diaric::reconstruct::Error::Shape(
       diaric::reconstruct::ShapeError::OutputFrameCountTooSmall { required, .. },
-    )) => (required - num_frames_per_chunk) as i64,
+    )) => required,
     other => panic!("expected OutputFrameCountTooSmall to report the placement, got {other:?}"),
   }
+}
+
+/// The output frame `diaric::reconstruct` places the last chunk's first frame
+/// at, peeled off [`diaric_required_output_frames`].
+fn diaric_last_chunk_start_frame(
+  num_chunks: usize,
+  num_frames_per_chunk: usize,
+  chunks_sw: SlidingWindow,
+  frames_sw: SlidingWindow,
+) -> i64 {
+  (diaric_required_output_frames(num_chunks, num_frames_per_chunk, chunks_sw, frames_sw)
+    - num_frames_per_chunk) as i64
 }
 
 #[test]
@@ -955,6 +969,126 @@ fn the_two_chunk_mappings_agree_on_the_production_grid_and_split_on_the_finding_
       "cancelling origins, chunk {c}"
     );
   }
+}
+
+// ---------------------------------------------------------------------
+// The last chunk's coverage (round 12)
+// ---------------------------------------------------------------------
+
+/// The whole justification for check 14: the number `uncovered_last_chunk`
+/// predicts is `diaric`'s OWN `required`, MEASURED out of that crate rather
+/// than restated here.
+///
+/// Round 12's finding turns on one claim — that
+/// [`reconstruct_chunk_start_frame`] is already the quantity the coverage bound
+/// needs, so the check is a CALL and not a fourth frame-index derivation. This
+/// is that claim, falsifiable: for each geometry the predicted `required` must
+/// equal what `diaric::reconstruct` reports when handed a grid too short. The
+/// finding-B grid is in the list on purpose — its two mappings disagree by a
+/// whole frame, so a coverage bound built on the AGGREGATION expression instead
+/// would predict the wrong number there and only there.
+#[test]
+fn uncovered_last_chunks_requirement_is_diarics_own_required_measured_not_copied() {
+  let community1_frames = frame_sliding_window();
+  let cases: [(usize, usize, SlidingWindow, SlidingWindow); 6] = [
+    // Community-1 production timing, the shipped 589-frame grid.
+    (
+      4,
+      589,
+      chunk_sliding_window(&WindowOptions::new()),
+      community1_frames,
+    ),
+    // The round-12 repro: 594 frames over three default chunks.
+    (
+      3,
+      594,
+      chunk_sliding_window(&WindowOptions::new()),
+      community1_frames,
+    ),
+    // The producer repro: a 595-frame segmenter on a one-chunk clip.
+    (
+      1,
+      595,
+      chunk_sliding_window(&WindowOptions::new()),
+      community1_frames,
+    ),
+    // Unit grid, zero origins.
+    (
+      3,
+      2,
+      SlidingWindow::new(0.0, 1.0, 1.0),
+      SlidingWindow::new(0.0, 1.0, 1.0),
+    ),
+    // Equal, CANCELLING non-zero origins.
+    (
+      3,
+      2,
+      SlidingWindow::new(1.0, 1.0, 1.0),
+      SlidingWindow::new(1.0, 1.0, 1.0),
+    ),
+    // The round-2 finding-B geometry: the two mappings disagree about chunk 1,
+    // so only the RECONSTRUCTION mapping predicts `diaric`'s requirement.
+    (
+      2,
+      1,
+      SlidingWindow::new(0.0, 0.04218750000000001, 0.04218750000000001),
+      SlidingWindow::new(0.0, 0.0619375, 0.016875),
+    ),
+  ];
+  for (num_chunks, num_frames_per_chunk, chunks_sw, frames_sw) in cases {
+    let actual =
+      diaric_required_output_frames(num_chunks, num_frames_per_chunk, chunks_sw, frames_sw);
+    // A grid one frame short of `actual` MUST be refused, and the payload must
+    // name that very number.
+    let u = uncovered_last_chunk(
+      num_chunks,
+      num_frames_per_chunk,
+      actual - 1,
+      chunks_sw,
+      frames_sw,
+    )
+    .expect("a grid one frame short of diaric's requirement must be refused");
+    assert_eq!(
+      u.required(),
+      actual,
+      "predicted requirement drifted from diaric for {chunks_sw:?} / {frames_sw:?}"
+    );
+    assert_eq!(u.got(), actual - 1);
+    assert_eq!(
+      u.start_frame(),
+      reconstruct_chunk_start_frame(num_chunks - 1, chunks_sw, frames_sw)
+    );
+    // And a grid of exactly `actual` must be accepted — the bound is `<`, not
+    // `<=`, so the boundary itself is the case a sign error moves.
+    assert_eq!(
+      uncovered_last_chunk(
+        num_chunks,
+        num_frames_per_chunk,
+        actual,
+        chunks_sw,
+        frames_sw
+      ),
+      None,
+      "diaric's own requirement must be admitted"
+    );
+  }
+}
+
+/// The check is `<`, and a NEGATIVE placement is not checked at all — `diaric`
+/// guards `last_start_frame >= 0` before deriving its requirement
+/// (`diarization/src/reconstruct/algo.rs:478`), so refusing there would refuse
+/// a geometry that crate accepts.
+#[test]
+fn uncovered_last_chunk_is_silent_below_frame_zero() {
+  // An uncancelled negative chunk origin places chunk 0 at frame -1.
+  let chunks_sw = SlidingWindow::new(-1.0, 1.0, 1.0);
+  let frames_sw = SlidingWindow::new(0.0, 1.0, 1.0);
+  assert_eq!(reconstruct_chunk_start_frame(0, chunks_sw, frames_sw), -1);
+  assert_eq!(
+    uncovered_last_chunk(1, 9_999, 1, chunks_sw, frames_sw),
+    None,
+    "a negative placement must not be refused here"
+  );
 }
 
 // ---------------------------------------------------------------------

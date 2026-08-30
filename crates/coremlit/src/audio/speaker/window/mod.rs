@@ -1039,6 +1039,88 @@ pub(crate) fn first_misaligned_chunk(
   })
 }
 
+/// The last chunk's coverage failure — `Some` when `num_output_frames` does not
+/// reach the last chunk's LAST frame, `None` when it does.
+///
+/// The ONE definition of that comparison, and — with [`first_misaligned_chunk`]
+/// — the second half of "the grid `diaric::reconstruct` will actually write
+/// this chunk grid onto". EVERY construction path calls it, as check 14 of the
+/// shared `extract::check_assembled_parts`; both producers call it once more in
+/// their `checked_geometry`, before a tensor is allocated or a model is run.
+///
+/// # The class this catches
+///
+/// `diaric::reconstruct` places chunk `c`'s frame `f` at
+/// `closest_frame(..) + f` and SKIPS any `out_f >= num_output_frames`, so a
+/// grid that stops short of the last chunk drops the tail of the diarization.
+/// It refuses that itself — `ShapeError::OutputFrameCountTooSmall { got,
+/// required }` (`diarization/src/reconstruct/algo.rs:478-495`) — which is why
+/// this is an EARLY refusal of a geometry both backends already reject, not a
+/// new restriction. What it buys is the position: at
+/// [`crate::audio::speaker::extract::Extraction::try_from_parts`] the caller is
+/// told at assembly instead of after picking a backend, and at both producers
+/// the model is never called.
+///
+/// The grid is `round(last_chunk_end / frames_sw.step()) + 1` while the
+/// requirement is `closest_frame(last chunk) + num_frames_per_chunk`, and those
+/// are different functions of the same windows: at the shipped
+/// `(0.0, 10.0, 1.0)` chunk grid over `(0.0, 0.0619375, 0.016875)` frames, one
+/// chunk derives 594 output frames and admits at most 594 frames per chunk,
+/// while THREE chunks derive 712 and admit only 593 — the last chunk lands at
+/// frame 119 and `119 + 594 = 713`. So the largest admissible
+/// `num_frames_per_chunk` is not monotone in `num_chunks`, which is why this is
+/// a comparison rather than a constant.
+///
+/// # Not a second derivation
+///
+/// The placement comes from [`reconstruct_chunk_start_frame`], the mirror check
+/// 8 already runs for every chunk and that `window::tests` already anchors
+/// against `diaric`'s own observable placement — read back out of exactly the
+/// `OutputFrameCountTooSmall { required }` this function predicts. Writing the
+/// float arithmetic out again here is precisely what the check-8 class is made
+/// of, so it is not written out again.
+///
+/// The LAST chunk only, matching `diaric`, which validates the two endpoints
+/// and derives its requirement from the last. Past [`first_misaligned_chunk`]
+/// the placement equals `aggregate_chunk_start_frame`, which is non-decreasing
+/// in `c`, so the last chunk is also the furthest-placed; checking more chunks
+/// would refuse geometries `diaric` accepts.
+///
+/// `num_chunks.saturating_sub(1)` where `diaric` guards `num_chunks > 0`:
+/// `check_assembled_parts`' check 1 has already refused `num_chunks == 0` and
+/// [`num_chunks`] returns at least `1`, so the two forms agree everywhere this
+/// is reachable — the same argument `extract::derived_output_frame_count` makes
+/// for its own `saturating_sub`.
+///
+/// Returns `None` for a negative placement, mirroring `diaric`'s own
+/// `last_start_frame >= 0` guard: below zero that crate does not check
+/// coverage, and refusing there would refuse a geometry it accepts. `O(1)`, and
+/// it reads only geometry, so both callers can run it before allocating
+/// anything.
+pub(crate) fn uncovered_last_chunk(
+  num_chunks: usize,
+  num_frames_per_chunk: usize,
+  num_output_frames: usize,
+  chunks_sw: SlidingWindow,
+  frames_sw: SlidingWindow,
+) -> Option<crate::audio::speaker::error::UncoveredLastChunk> {
+  let start_frame =
+    reconstruct_chunk_start_frame(num_chunks.saturating_sub(1), chunks_sw, frames_sw);
+  if start_frame < 0 {
+    return None;
+  }
+  // `usize::try_from` cannot fail on this crate's 64-bit targets, so the
+  // fallback is unreachable rather than a policy; saturating to `usize::MAX`
+  // keeps the refusal (and the absence of a panic) correct on any target where
+  // it could, which is the direction `diaric`'s own `try_from` arm takes.
+  let required = usize::try_from(start_frame)
+    .unwrap_or(usize::MAX)
+    .saturating_add(num_frames_per_chunk);
+  (num_output_frames < required).then(|| {
+    crate::audio::speaker::error::UncoveredLastChunk::new(start_frame, required, num_output_frames)
+  })
+}
+
 /// The TIME output frame `t` sits at, in seconds — the value every span
 /// endpoint either backend emits is built from.
 ///

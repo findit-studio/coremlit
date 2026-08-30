@@ -319,7 +319,7 @@ pub const MAX_OUTPUT_FRAMES: usize = 1 << 22;
 /// bounding the chunk count IS bounding the call count; a separate constant per
 /// producer would be the same number written twice.
 ///
-/// # NOT part of the thirteen-check assembly sequence
+/// # NOT part of the fourteen-check assembly sequence
 ///
 /// For the reason [`MAX_EXTRACTION_TENSOR_BYTES`] is not: see that constant's
 /// own doc. [`Extraction::try_from_parts`] calls no model at all, so there is no
@@ -467,7 +467,7 @@ pub const MAX_EXTRACTION_CHUNKS: usize = 70_770;
 ///   strides from `2` upward through
 ///   [`crate::audio::speaker::window::WindowOptions::with_step_samples`].
 ///
-/// # NOT part of the thirteen-check assembly sequence
+/// # NOT part of the fourteen-check assembly sequence
 ///
 /// Deliberately, and this is a real asymmetry between the producers and
 /// [`Extraction::try_from_parts`]. That constructor is HANDED the tensors, so
@@ -945,6 +945,16 @@ impl Extractor {
   ///   the same error for a geometry that trips both — and, independently,
   ///   because the caps are `O(1)` where this scan is `O(num_chunks)`, on the
   ///   very axis the byte bound has just limited.
+  /// - [`ExtractError::UncoveredLastChunk`] — check 14. The COVERAGE bound, and
+  ///   the only guard here that the LOADED SEGMENTER's declared frame count can
+  ///   trip: `SegmentModel` constrains it to `shape[1] >= 1` and nothing else,
+  ///   while the output grid is fixed by the two windows, so a 595-frame model
+  ///   on a one-chunk clip needs 595 frames of a 594-frame grid.
+  ///   `diaric::reconstruct` refuses that on BOTH routes — but only after the
+  ///   tensors, both models and (offline) AHC and VBx. Ordered AFTER the
+  ///   placement scan, matching the shared sequence's own order (check 8 before
+  ///   check 14) so a geometry tripping both names the same error here and at
+  ///   [`Extraction::try_from_parts`].
   ///
   /// # Panics
   /// Panics if `self.options.window().step_samples()` is `0`, as
@@ -961,7 +971,7 @@ impl Extractor {
     let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&w); // owned.rs:653-655
     let frames_sw = crate::audio::speaker::window::frame_sliding_window(); // owned.rs:656-657
 
-    checked_output_frame_count(num_chunks, chunks_sw, frames_sw)?;
+    let derived_output_frames = checked_output_frame_count(num_chunks, chunks_sw, frames_sw)?;
     // The DURATION axis is now bounded; these two are the CHUNK axis, which
     // `step_samples` scales independently of it and which sizes both tensors,
     // the starts vector, and the model-call count. COMPUTE first — it reads
@@ -984,6 +994,27 @@ impl Extractor {
       crate::audio::speaker::window::first_misaligned_chunk(num_chunks, chunks_sw, frames_sw)
     {
       return Err(ExtractError::MisalignedChunkPlacement(m));
+    }
+
+    // Check 14, and the one bound on this method's `num_frames_per_chunk`
+    // argument that the loaded segmenter can actually trip: `SegmentModel`
+    // constrains its declared frame count only to `shape[1] >= 1`, and a
+    // 595-frame model on a one-chunk clip needs 595 output frames where the
+    // geometry derives 594. Both backends refuse that extraction with
+    // `OutputFrameCountTooSmall`, so running it here — after the placement
+    // scan, matching the shared sequence's own order (check 8 before check
+    // 14) so a geometry tripping both names the same error at both doors —
+    // spends no inference on a clip nothing downstream could finish. The grid
+    // it is compared against is the value `checked_output_frame_count` above
+    // already returned, not a re-derivation of it.
+    if let Some(u) = crate::audio::speaker::window::uncovered_last_chunk(
+      num_chunks,
+      num_frames_per_chunk,
+      derived_output_frames,
+      chunks_sw,
+      frames_sw,
+    ) {
+      return Err(ExtractError::UncoveredLastChunk(u));
     }
 
     Ok((num_chunks, chunks_sw, frames_sw))
@@ -1195,7 +1226,7 @@ impl Extractor {
     // `chunks_sw` / `frames_sw` were derived at step 6-7 so the placement
     // guard could run ahead of inference; they are the same two values
     // `owned.rs:653-657` builds here. `assemble_checked` derives `count` from
-    // the post-zeroing buffer, runs the SAME thirteen checks
+    // the post-zeroing buffer, runs the SAME fourteen checks
     // `Extraction::try_from_parts` runs, and assembles — this method no longer
     // has an unchecked door to reach for (round 8).
     Extraction::assemble_checked(
@@ -1514,7 +1545,7 @@ pub(crate) fn checked_extraction_tensor_bytes(
   Ok(bytes)
 }
 
-/// The ONE implementation of [`Extraction::try_from_parts`]'s thirteen checks,
+/// The ONE implementation of [`Extraction::try_from_parts`]'s fourteen checks,
 /// over BORROWED parts — run by that constructor and, through
 /// `Extraction::assemble_checked`, by every in-crate
 /// [`crate::audio::speaker::source::ModelSource`].
@@ -1535,7 +1566,7 @@ pub(crate) fn checked_extraction_tensor_bytes(
 /// (offline: silence) while the online route read every cell as active (a
 /// 9.94 s speaker).
 ///
-/// All three now run all thirteen, so the matrix has no holes and no
+/// All three now run all fourteen, so the matrix has no holes and no
 /// exemptions. What it still records is WHY each check cannot fire from the two
 /// sources — a check that no producer can trip is a check whose cost is a
 /// premium against a future producer, and that is a different statement from
@@ -1556,6 +1587,7 @@ pub(crate) fn checked_extraction_tensor_bytes(
 /// | 11 | `count` IS the derived count | `count` is the same aggregation under `seg >= onset`, which check 9 + `check_onset` make identical to `seg > 0.0` | same, and it was NOT identical while check 9 was open: at `0.1` with onset `0.5` the stored count was zero where `seg > 0.0` derives one |
 /// | 12 | whole `raw_embeddings` finite | buffer pre-zeroed; a written row passed `from_wespeaker`'s own finiteness scan | same, plus `place_embeddings`' explicit per-row scan (`InferError::NonFiniteOutput`) |
 /// | 13 | frame centers strictly increasing | `frame_sliding_window`'s fixed grid stays strictly increasing past `MAX_OUTPUT_FRAMES` | same |
+/// | 14 | the grid reaches the last chunk's last frame | ENFORCED, and reachable: `SegmentModel` constrains its declared frame count only to `shape[1] >= 1`, so a 595-frame segmenter on a one-chunk clip needs 595 of 594 frames. Since this round it fails at `checked_geometry`, before the tensors and the models — this run is the backstop | the frame count is the compiled `ARGMAX_FRAMES_PER_WINDOW` (589), which leaves the last chunk >= 4 frames of headroom at every chunk count the caps admit (`the_pinned_argmax_grid_covers_its_last_chunk_at_every_chunk_count`) |
 ///
 /// Row 11 is the one worth reading twice: it is not independently sound at
 /// `ArgmaxSource`. It holds only BECAUSE check 9 holds, which is what makes
@@ -2013,6 +2045,51 @@ fn check_assembled_parts(
     return Err(ExtractError::CollapsedFrameCenter(c));
   }
 
+  // ── 14. The grid must REACH the last chunk's last frame ───────────
+  // Checks 5 and 8 settle which grid this is and that both mappings agree
+  // about where each chunk starts on it. Neither says the grid is LONG
+  // ENOUGH. The derived length is `round(last_chunk_end / frames_sw.step()) +
+  // 1`, and the requirement is `reconstruct_chunk_start_frame(last) +
+  // num_frames_per_chunk` — different functions of the same windows, so a
+  // `chunks_sw.duration()` spanning fewer frame-steps than
+  // `num_frames_per_chunk` derives a grid the last chunk overruns. On the
+  // shipped `(0.0, 10.0, 1.0)` / `(0.0, 0.0619375, 0.016875)` pair a
+  // 594-frame segmenter over THREE chunks derives 712 frames while the last
+  // chunk sits at 119 and needs 713.
+  //
+  // `diaric::reconstruct` skips every `out_f >= num_output_frames`, so those
+  // cells are simply not written; it refuses the geometry rather than
+  // truncating (`ShapeError::OutputFrameCountTooSmall`,
+  // `diarization/src/reconstruct/algo.rs:478-495`) and BOTH routes reach it —
+  // ONLINE directly, OFFLINE at stage 5 after AHC and VBx
+  // (`diarization/src/offline/algo.rs:808`). So this refuses nothing new; it
+  // moves a typed, late, post-clustering failure to assembly, which is this
+  // constructor's whole contract.
+  //
+  // `window::uncovered_last_chunk` is the ONE definition, and it calls the
+  // SAME `reconstruct_chunk_start_frame` check 8 runs for every chunk. An
+  // earlier revision of the "deliberately NOT checked" list declined this
+  // check because re-deriving the placement would be a second copy of
+  // `closest_frame`'s float arithmetic; round 8 introduced that mirror and
+  // anchored it, so the derivation is now a call rather than a copy.
+  //
+  // Ordered LAST, for check 13's reason and one more. It is `O(1)` geometry
+  // over values check 4 has already derived, so its position costs nothing
+  // measurable; putting it earlier would move the precedence of every check
+  // after it, and each of those is pinned by a falsifier that says why it is
+  // where it is. Both producers run it in their `checked_geometry` instead,
+  // where it lands before any inference — this run is the backstop, and the
+  // only run for parts a caller assembled.
+  if let Some(u) = crate::audio::speaker::window::uncovered_last_chunk(
+    num_chunks,
+    num_frames_per_chunk,
+    derived_output_frames,
+    chunks_sw,
+    frames_sw,
+  ) {
+    return Err(ExtractError::UncoveredLastChunk(u));
+  }
+
   Ok(())
 }
 
@@ -2116,13 +2193,13 @@ impl Extraction {
   ///
   /// # What it enforces
   ///
-  /// ALL THIRTEEN of [`Self::try_from_parts`]'s checks, in that constructor's
+  /// ALL FOURTEEN of [`Self::try_from_parts`]'s checks, in that constructor's
   /// own order, through the one `check_assembled_parts` both call. No
   /// exemptions: a producer is held to exactly the standard an out-of-crate
   /// caller is, which is the only version of this fix whose closure argument
   /// does not have to enumerate which cells it skips.
   ///
-  /// Two of the thirteen are provably redundant here and are run anyway.
+  /// Two of the fourteen are provably redundant here and are run anyway.
   /// Check 5 (`count.len()` equals the derived grid) compares
   /// `try_count_from_segmentations`'s output length with the
   /// `try_num_output_frames` call that produced it. Check 11 (`count` EQUALS
@@ -2356,21 +2433,43 @@ impl Extraction {
   ///     while moving it earlier would shift the precedence of every check
   ///     after it. See [`ExtractError::CollapsedFrameCenter`].
   ///
+  /// 14. The derived grid REACHES the last chunk's last frame. Checks 5 and 8
+  ///     say which grid this is and that both mappings place every chunk on it
+  ///     identically; neither says it is long enough. The length is
+  ///     `round(last_chunk_end / frames_sw.step()) + 1` while the requirement is
+  ///     `reconstruct_chunk_start_frame(last) + num_frames_per_chunk`, and those
+  ///     are different functions of the same windows — on the shipped grid one
+  ///     chunk admits 594 frames per chunk and THREE admit only 593, because the
+  ///     last of the three lands at output frame 119 of 712. Below that,
+  ///     `diaric::reconstruct` refuses the extraction on BOTH routes
+  ///     (`ShapeError::OutputFrameCountTooSmall`,
+  ///     `diarization/src/reconstruct/algo.rs:478-495`) rather than truncating,
+  ///     so this check refuses nothing new — it moves a late, post-clustering
+  ///     failure to assembly. Computed through the shared
+  ///     `window::uncovered_last_chunk`, which calls the very
+  ///     `reconstruct_chunk_start_frame` check 8 runs for every chunk; both
+  ///     producers run it once more before they touch a model. Ordered LAST,
+  ///     for check 13's reason. See [`ExtractError::UncoveredLastChunk`].
+  ///
   /// Checks 1, 2 and 4 are the PANIC-preventing ones: `window`'s
   /// `try_aggregate_output_frame_count` asserts the first two with bare
   /// `assert!`s and [`Self::diarize_online`] `.expect(..)`s the third, so
   /// without them a publicly-assembled `Extraction` could panic far from its
   /// cause. Check 3 is what keeps every `[c][s][d]` / `[c][f][s]` index inside
-  /// its buffer. Checks 5, 7-8 and 10-11 are the CROSS-PART ones: each is a pair
-  /// of parts that are individually well-formed and jointly describe something
-  /// the producing pipeline cannot have produced. Checks 9, 12 and 13 are
-  /// neither: check 12 holds ONE part to a standard only ONE consumer enforces,
-  /// check 9 holds ONE part to the domain outside which the two consumers stop
-  /// reading it the same way, and check 13 holds ONE part to the sub-domain on
-  /// which it is a timeline at all. The first two end in the same failure — the
-  /// backends disagreeing about an identical `Extraction` — arrived at without
-  /// a second part being involved; check 13's failure is not a disagreement but
-  /// an answer BOTH backends give and neither can mean.
+  /// its buffer. Checks 5, 7-8, 10-11 and 14 are the CROSS-PART ones: each is a
+  /// pair of parts that are individually well-formed and jointly describe
+  /// something the producing pipeline cannot have produced — check 14's pair
+  /// being the declared per-chunk frame count and the grid the two windows
+  /// derive. Checks 9, 12 and 13 are neither: check 12 holds ONE part to a
+  /// standard only ONE consumer enforces, check 9 holds ONE part to the domain
+  /// outside which the two consumers stop reading it the same way, and check 13
+  /// holds ONE part to the sub-domain on which it is a timeline at all. The
+  /// first two end in the same failure — the backends disagreeing about an
+  /// identical `Extraction` — arrived at without a second part being involved;
+  /// check 13's failure is not a disagreement but an answer BOTH backends give
+  /// and neither can mean. Check 14's is a third shape again: both backends
+  /// REFUSE, identically and typed, and what the check buys is only when and
+  /// where.
   ///
   /// # Where these checks run
   ///
@@ -2580,19 +2679,28 @@ impl Extraction {
   ///   So the shape stays a consequence of the caller's own data ("this slot
   ///   has an embedding but no speech"), not of a part disagreeing with
   ///   another; `tiny_extraction`'s third slot is exactly it.
-  /// - **`num_output_frames` covering the last chunk's last frame.** With checks
-  ///   5 and 8 the grid is the derived one and every chunk is placed
-  ///   identically by both mappings, but a chunk whose declared `duration`
-  ///   spans fewer frame-steps than `num_frames_per_chunk` still derives a grid
-  ///   shorter than the chunk it must hold. *Verified against both:* both routes
-  ///   end in the same `diaric::reconstruct`, which raises the typed
-  ///   `ShapeError::OutputFrameCountTooSmall` before allocating the grid
-  ///   (`diarization/src/reconstruct/algo.rs:465-495`). They differ in the WORK
-  ///   that precedes it, not in the outcome: ONLINE reaches that call directly,
-  ///   OFFLINE only at its stage 5, after AHC and VBx have already run
-  ///   (`diarization/src/offline/algo.rs:808`). Neither can return `Ok`.
-  ///   Re-deriving the bound here would duplicate `closest_frame`'s float
-  ///   arithmetic in a second place, which is how the two grids drift apart.
+  /// - **`num_output_frames` covering the last chunk's last frame — WAS on this
+  ///   list, and is now check 14.** Kept here as history, because the reason it
+  ///   was omitted is the useful part: it was not "both backends refuse, so we
+  ///   need not", which is true and would have applied to check 8 as well. It
+  ///   was that re-deriving the requirement meant writing `closest_frame`'s
+  ///   float arithmetic out a SECOND time, and a second spelling of a rounding
+  ///   expression is exactly the drift check 8 exists to catch — so the check
+  ///   would have introduced the class it was meant to guard.
+  ///
+  ///   That reasoning lapsed at round 8, and quietly. Round 8 added
+  ///   `window::reconstruct_chunk_start_frame` — one mirror of that private
+  ///   `closest_frame`, anchored by `window::tests` against `diaric`'s own
+  ///   OBSERVABLE placement, read back out of the very
+  ///   `OutputFrameCountTooSmall { required }` this check predicts — and check 8
+  ///   already called it for every chunk. From that commit the derivation this
+  ///   entry declined to make was already being made, on every path, and already
+  ///   pinned; the requirement is that mirror plus `num_frames_per_chunk`, so
+  ///   check 14 is a CALL and not a copy. The omission outlived its own premise
+  ///   by three rounds, which is the general lesson: an entry on this list is
+  ///   only as good as the code it was written against, and a "we would have to
+  ///   duplicate X" justification expires the moment X gains a shared, anchored
+  ///   definition.
   /// - **That the parts came from the SAME track.** Every check here compares
   ///   parts to each OTHER, and no comparison carries provenance: parts that are
   ///   each well-formed and mutually consistent are accepted even when
@@ -2679,6 +2787,7 @@ impl Extraction {
   /// - [`ExtractError::CountNotSegmentationDerived`] — check 11.
   /// - [`ExtractError::NonFiniteRawEmbedding`] — check 12.
   /// - [`ExtractError::CollapsedFrameCenter`] — check 13.
+  /// - [`ExtractError::UncoveredLastChunk`] — check 14.
   ///
   /// # Examples
   /// ```

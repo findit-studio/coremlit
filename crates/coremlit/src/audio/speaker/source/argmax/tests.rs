@@ -1958,3 +1958,67 @@ fn the_chunk_axis_caps_are_inert_for_argmaxs_pinned_stride() {
     10_110
   );
 }
+
+/// Check 14 is inert for this source too, and pinned rather than assumed.
+///
+/// The coverage bound is the only guard in `checked_geometry` that reads a
+/// per-chunk FRAME count, so at `Extractor` it is the one a loaded segmenter can
+/// trip. Here that count is `ARGMAX_FRAMES_PER_WINDOW`, compiled into the
+/// shipped graph, and the stride is likewise compiled in — so the check can
+/// never name an error. That is a property of the two numbers, not a licence to
+/// skip the check: the round-8 posture is that every producer applies every
+/// bound, and this is what says applying it costs this source nothing.
+///
+/// Swept over every chunk count the frame cap admits, and the SMALLEST headroom
+/// is reported so a change to either the stride or the compiled frame count
+/// shows up as a moved number rather than a silent loss of margin.
+#[test]
+fn the_pinned_argmax_grid_covers_its_last_chunk_at_every_chunk_count() {
+  use crate::audio::speaker::extract::checked_output_frame_count;
+
+  let w = ArgmaxOptions::new().window();
+  let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&w);
+  let frames_sw = crate::audio::speaker::window::frame_sliding_window();
+
+  // The largest chunk grid this stride can reach before the frame cap refuses.
+  let largest = crate::audio::speaker::window::num_chunks(1_132_448_001 - 1, &w);
+  assert_eq!(largest, 70_769);
+
+  let mut min_headroom = usize::MAX;
+  for num_chunks in 1..=largest {
+    let derived = checked_output_frame_count(num_chunks, chunks_sw, frames_sw)
+      .expect("every admitted chunk count derives a capped grid");
+    assert_eq!(
+      crate::audio::speaker::window::uncovered_last_chunk(
+        num_chunks,
+        ARGMAX_FRAMES_PER_WINDOW,
+        derived,
+        chunks_sw,
+        frames_sw,
+      ),
+      None,
+      "num_chunks={num_chunks}: the compiled 589-frame grid must stay covered"
+    );
+    let start = crate::audio::speaker::window::reconstruct_chunk_start_frame(
+      num_chunks - 1,
+      chunks_sw,
+      frames_sw,
+    );
+    let headroom = derived
+      - usize::try_from(start).expect("this stride places every chunk at or after 0")
+      - ARGMAX_FRAMES_PER_WINDOW;
+    min_headroom = min_headroom.min(headroom);
+  }
+  assert_eq!(
+    min_headroom, 4,
+    "the compiled grid's smallest headroom over the whole admitted range"
+  );
+
+  // The door itself, at both ends of that range.
+  for samples in [1usize, 160_000, 160_001, 16_000_000, 1_132_448_000] {
+    assert!(
+      checked_geometry(samples, &w).is_ok(),
+      "samples={samples}: check 14 must not refuse this source's own geometry"
+    );
+  }
+}

@@ -4438,7 +4438,7 @@ fn assemble_checked_reaches_the_same_verdict_as_try_from_parts() {
     SlidingWindow,
     SlidingWindow,
   );
-  let cases: [DoorCase; 7] = [
+  let cases: [DoorCase; 8] = [
     (
       "accepted",
       good_row.clone(),
@@ -4503,12 +4503,23 @@ fn assemble_checked_reaches_the_same_verdict_as_try_from_parts() {
     ),
     (
       "check 7: a frames_sw step that vanishes in f32",
-      good_row,
+      good_row.clone(),
       vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
       1,
       2,
       SlidingWindow::new(0.0, 1e-300, 1e-300),
       SlidingWindow::new(0.0, 1.0, 1e-300),
+    ),
+    (
+      // The unit grid derives TWO output frames and places the one chunk at
+      // frame 0, so a third declared frame has nowhere to land.
+      "check 14: a chunk longer than the grid it derives",
+      good_row,
+      vec![1.0, 0.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 0.0],
+      1,
+      3,
+      unit,
+      unit,
     ),
   ];
 
@@ -4527,6 +4538,7 @@ fn assemble_checked_reaches_the_same_verdict_as_try_from_parts() {
       "check 10" => Some("ActiveSlotWithoutEmbedding"),
       "check 12" => Some("NonFiniteRawEmbedding"),
       "check 13" => Some("CollapsedFrameCenter"),
+      "check 14" => Some("UncoveredLastChunk"),
       other => panic!("unmapped case label `{other}`"),
     }
   };
@@ -4595,7 +4607,7 @@ fn assemble_checked_reaches_the_same_verdict_as_try_from_parts() {
 ///
 /// # The defect, measured
 ///
-/// Round 8 gave every producer the whole thirteen-check sequence, but at the
+/// Round 8 gave every producer the whole check sequence, but at the
 /// END of its work. Both producers build their extraction tensors and run every
 /// CoreML call, `assemble_checked` then derives `count`, and only then does
 /// check 6 — whose entire job is to refuse a grid this crate will not allocate
@@ -4744,7 +4756,7 @@ fn the_frame_cap_refuses_before_the_allocation_it_bounds() {
 ///
 /// A cap enforced in two places is a cap that can drift. This is the pinning
 /// for the claim that it has not: for a swept range of geometries the
-/// geometry-only preflight and the full thirteen-check sequence agree, both on
+/// geometry-only preflight and the full check sequence agree, both on
 /// which are refused and on the exact `usize` the refusal names.
 #[test]
 fn the_geometry_preflight_and_the_assembled_check_never_disagree() {
@@ -5577,5 +5589,308 @@ fn the_byte_ceiling_admits_every_frame_grid_the_frame_cap_admits() {
       checked_extraction_tensor_bytes(largest_admitted, frames).is_ok(),
       "frames_per_chunk={frames}: the frame cap's own largest grid must fit"
     );
+  }
+}
+
+// =====================================================================
+// ROUND 12. The COVERAGE of the last chunk. Checks 5 and 8 settle WHICH output
+// grid an `Extraction` is written on and that both mappings agree about where
+// each chunk starts on it; neither says the grid is LONG ENOUGH to hold the
+// last chunk's frames. `diaric::reconstruct` refuses that geometry on both
+// routes with a typed `OutputFrameCountTooSmall`, so this round is not about a
+// backend SPLIT — it is about a refusal arriving late (after AHC and VBx
+// offline) and, at the producers, after inference that could never be used.
+//
+// The class this round belongs to is the "deliberately NOT checked" entry whose
+// justification EXPIRED: it declined the check because re-deriving the
+// requirement meant a second copy of `closest_frame`'s float arithmetic, and
+// round 8 then introduced (and anchored) exactly one shared mirror of it.
+// =====================================================================
+
+/// The last output frame index the SHIPPED grid leaves free for a chunk of
+/// `frames` frames, at `num_chunks` chunks of the default stride: `derived -
+/// (reconstruct placement of the last chunk)`. Derived through the crate's own
+/// two functions, never restated.
+fn largest_admissible_frames_per_chunk(num_chunks: usize) -> usize {
+  let w = WindowOptions::new();
+  let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&w);
+  let frames_sw = crate::audio::speaker::window::frame_sliding_window();
+  let derived = derived_output_frame_count(num_chunks, chunks_sw, frames_sw)
+    .expect("the default grid derives a count that fits usize");
+  let start = crate::audio::speaker::window::reconstruct_chunk_start_frame(
+    num_chunks - 1,
+    chunks_sw,
+    frames_sw,
+  );
+  derived - usize::try_from(start).expect("the default grid places every chunk at or after 0")
+}
+
+/// Round 12's falsifier, half A: the CALLER-assembled geometry the constructor
+/// accepted and both backends then refused.
+///
+/// Before check 14 this exact `ExtractionParts` — correctly sized zero tensors,
+/// a `count` of exactly the derived length, every window inside every
+/// sub-domain, both mappings in agreement — returned `Ok`, and BOTH routes then
+/// returned `Reconstruct(Shape(OutputFrameCountTooSmall { got: 712, required:
+/// 713 }))`. The three chunks derive 712 output frames while the last of them
+/// is placed at frame 119 and declares 594, so the grid is one frame short.
+///
+/// The second half of the test is the non-vacuity: the SAME parts, forced past
+/// the constructor through `from_parts_unchecked`, must still be refused by
+/// both backends with those very numbers. Without it this is a test that the
+/// constructor refuses something, not a test that what it refuses is unusable.
+#[test]
+fn try_from_parts_refuses_a_grid_that_stops_short_of_the_last_chunk() {
+  let w = WindowOptions::new();
+  let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&w);
+  let frames_sw = crate::audio::speaker::window::frame_sliding_window();
+  const NUM_CHUNKS: usize = 3;
+  const FRAMES: usize = 594;
+  let derived = derived_output_frame_count(NUM_CHUNKS, chunks_sw, frames_sw).expect("well defined");
+  assert_eq!(
+    derived, 712,
+    "three default chunks derive 712 output frames"
+  );
+
+  let parts = || ExtractionParts {
+    raw_embeddings: vec![0.0f32; NUM_CHUNKS * SEG_NUM_SLOTS * EMBEDDING_DIM],
+    segmentations: vec![0.0f64; NUM_CHUNKS * FRAMES * SEG_NUM_SLOTS],
+    count: vec![0u8; derived],
+    num_chunks: NUM_CHUNKS,
+    num_frames_per_chunk: FRAMES,
+    chunks_sw,
+    frames_sw,
+  };
+
+  let ExtractError::UncoveredLastChunk(u) = refused(parts()) else {
+    panic!("expected UncoveredLastChunk, got {:?}", refused(parts()))
+  };
+  assert_eq!((u.start_frame(), u.required(), u.got()), (119, 713, 712));
+
+  // Non-vacuity: this geometry really is the one both backends refuse, with the
+  // very numbers check 14 predicted.
+  let p = parts();
+  let e = Extraction::from_parts_unchecked(
+    p.raw_embeddings,
+    p.segmentations,
+    p.count,
+    p.num_chunks,
+    p.num_frames_per_chunk,
+    p.chunks_sw,
+    p.frames_sw,
+  );
+  let plda = diaric::plda::PldaTransform::new().expect("hermetic PLDA weights load");
+  for (route, got) in [
+    ("offline", e.diarize_with(&plda, ClusterBackend::default())),
+    ("online", e.diarize_online(OnlineOptions::default())),
+  ] {
+    let Err(diaric::offline::Error::Reconstruct(diaric::reconstruct::Error::Shape(
+      diaric::reconstruct::ShapeError::OutputFrameCountTooSmall { got, required },
+    ))) = got
+    else {
+      panic!("{route} must refuse the uncovered grid, got {got:?}")
+    };
+    assert_eq!(
+      (got, required),
+      (u.got(), u.required()),
+      "{route} reported different numbers than check 14 predicted"
+    );
+  }
+}
+
+/// Round 12's falsifier, half B: the PRODUCER preflight now refuses a segmenter
+/// whose declared frame count overruns the grid, BEFORE inference.
+///
+/// `SegmentModel` constrains its declared frame count only to `shape[1] >= 1`,
+/// so a 595-frame model is loadable; on a one-chunk clip it needs 595 output
+/// frames of a 594-frame grid. Before check 14 all three of `checked_geometry`'s
+/// bounds admitted it — the output cap (`Ok(594)`), the chunk-count cap
+/// (`Ok(1)`) and the byte ceiling (`Ok(17_352)`) — the placement scan found no
+/// misalignment, both models ran, and BOTH routes then returned
+/// `OutputFrameCountTooSmall { got: 594, required: 595 }`.
+///
+/// Asserted through `Extractor::checked_geometry` for the reason round 9's cap
+/// falsifier is: that method IS `extract`'s entire pre-inference sequence, not a
+/// re-composition of it — `extract` calls it and nothing else before it
+/// allocates a tensor or touches a model — so a check moved behind either would
+/// leave this assertion unsatisfied.
+#[test]
+fn the_producer_preflight_refuses_a_segmenter_whose_frames_overrun_the_grid() {
+  let w = WindowOptions::new();
+  let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&w);
+  let frames_sw = crate::audio::speaker::window::frame_sliding_window();
+  let extractor = Extractor::new();
+  // A one-chunk clip: `samples.len() <= SEG_CHUNK_SAMPLES`.
+  let num_chunks = crate::audio::speaker::window::num_chunks(SEG_CHUNK_SAMPLES, &w);
+  assert_eq!(num_chunks, 1);
+  assert_eq!(largest_admissible_frames_per_chunk(1), 594);
+
+  // The three caps and the placement scan all still admit it — this is what
+  // makes check 14 the guard that closes the hole rather than a duplicate.
+  assert_eq!(
+    checked_output_frame_count(num_chunks, chunks_sw, frames_sw),
+    Ok(594)
+  );
+  assert_eq!(checked_extraction_chunk_count(num_chunks), Ok(1));
+  assert_eq!(checked_extraction_tensor_bytes(num_chunks, 595), Ok(17_352));
+  assert_eq!(
+    crate::audio::speaker::window::first_misaligned_chunk(num_chunks, chunks_sw, frames_sw),
+    None
+  );
+
+  match extractor.checked_geometry(SEG_CHUNK_SAMPLES, 595) {
+    Err(ExtractError::UncoveredLastChunk(u)) => {
+      assert_eq!((u.start_frame(), u.required(), u.got()), (0, 595, 594));
+    }
+    other => panic!("a 595-frame segmenter must be refused pre-inference, got {other:?}"),
+  }
+  // The boundary, one frame down: 594 is the largest grid a one-chunk clip can
+  // address, and it must still be accepted.
+  assert_eq!(
+    extractor.checked_geometry(SEG_CHUNK_SAMPLES, 594),
+    Ok((num_chunks, chunks_sw, frames_sw)),
+    "the largest admissible frame count must not be refused"
+  );
+
+  // And the assembly door reaches the same verdict for the extraction such a
+  // model would have produced, so the pre-inference refusal is a HOIST and not
+  // a new standard.
+  match Extraction::assemble_checked(
+    vec![0.0f32; SEG_NUM_SLOTS * EMBEDDING_DIM],
+    vec![0.0f64; 595 * SEG_NUM_SLOTS],
+    num_chunks,
+    595,
+    w.onset(),
+    chunks_sw,
+    frames_sw,
+  ) {
+    Err(ExtractError::UncoveredLastChunk(u)) => {
+      assert_eq!((u.start_frame(), u.required(), u.got()), (0, 595, 594));
+    }
+    other => panic!("the assembly door must reach the same verdict, got {other:?}"),
+  }
+}
+
+/// The SHIPPED configurations are unaffected, with the margin stated.
+///
+/// community-1's segmenter declares 589 frames per 10 s chunk and
+/// [`crate::audio::speaker::source::ArgmaxSource`] compiles in the same 589. At
+/// the default stride the grid admits 594 frames per chunk at some chunk counts
+/// and 593 at others, so the SMALLEST headroom 589 ever has is FOUR frames —
+/// and it never varies by more than one. Swept over the whole chunk range
+/// either producer can reach, not sampled.
+#[test]
+fn the_shipped_589_frame_grid_keeps_four_frames_of_headroom_everywhere() {
+  const SHIPPED_FRAMES: usize = 589;
+  assert_eq!(
+    crate::audio::speaker::source::argmax::ARGMAX_FRAMES_PER_WINDOW,
+    SHIPPED_FRAMES
+  );
+  let mut min_margin = usize::MAX;
+  let mut max_margin = 0usize;
+  for num_chunks in 1..=MAX_EXTRACTION_CHUNKS {
+    let admissible = largest_admissible_frames_per_chunk(num_chunks);
+    assert!(
+      admissible >= SHIPPED_FRAMES,
+      "num_chunks={num_chunks}: the shipped grid must fit, admissible={admissible}"
+    );
+    let margin = admissible - SHIPPED_FRAMES;
+    min_margin = min_margin.min(margin);
+    max_margin = max_margin.max(margin);
+  }
+  assert_eq!(
+    (min_margin, max_margin),
+    (4, 5),
+    "the shipped 589-frame grid's headroom over the whole admitted chunk range"
+  );
+}
+
+/// What check 14 newly refuses, exactly — the boundary in both directions, at
+/// every chunk count either producer can reach.
+///
+/// The largest admissible `num_frames_per_chunk` is NOT constant: the derived
+/// grid grows by `round(step / frame_step)` per chunk while the last chunk's
+/// placement grows by `round(c * step / frame_step)`, and the two roundings
+/// beat differently — at the default stride the allowance is 594 for 41 938 of
+/// the 70 770 admitted chunk counts and 593 for the other 28 832. So the
+/// smallest per-chunk frame count check 14 can refuse at all is 594, first at
+/// THREE chunks, and at one or two chunks it takes 595.
+///
+/// Both doors are asserted at each boundary, because a bound that moved at only
+/// one of them would be the round-8 hole again.
+#[test]
+fn check_14s_boundary_is_the_grids_own_allowance_at_every_chunk_count() {
+  let w = WindowOptions::new();
+  let chunks_sw = crate::audio::speaker::window::chunk_sliding_window(&w);
+  let frames_sw = crate::audio::speaker::window::frame_sliding_window();
+  let extractor = Extractor::new();
+
+  let mut seen = std::collections::BTreeSet::new();
+  for num_chunks in 1..=MAX_EXTRACTION_CHUNKS {
+    seen.insert(largest_admissible_frames_per_chunk(num_chunks));
+  }
+  assert_eq!(
+    seen.into_iter().collect::<Vec<_>>(),
+    vec![593, 594],
+    "the allowance at the default stride takes exactly these two values"
+  );
+  assert_eq!(
+    (1..=MAX_EXTRACTION_CHUNKS).find(|n| largest_admissible_frames_per_chunk(*n) == 593),
+    Some(3),
+    "594 frames per chunk first becomes unusable at three chunks"
+  );
+
+  // The producer door, at the small chunk counts a test can actually run
+  // `checked_geometry` for. `samples_len` is chosen so `num_chunks` is exact.
+  for num_chunks in 1..=8usize {
+    let samples_len = SEG_CHUNK_SAMPLES + (num_chunks - 1) * w.step_samples() as usize;
+    assert_eq!(
+      crate::audio::speaker::window::num_chunks(samples_len, &w),
+      num_chunks
+    );
+    let admissible = largest_admissible_frames_per_chunk(num_chunks);
+    assert_eq!(
+      extractor.checked_geometry(samples_len, admissible),
+      Ok((num_chunks, chunks_sw, frames_sw)),
+      "num_chunks={num_chunks}: the allowance itself must be accepted"
+    );
+    match extractor.checked_geometry(samples_len, admissible + 1) {
+      Err(ExtractError::UncoveredLastChunk(u)) => assert_eq!(
+        (u.required(), u.got()),
+        (
+          u.start_frame() as usize + admissible + 1,
+          derived_output_frame_count(num_chunks, chunks_sw, frames_sw).expect("well defined")
+        ),
+        "num_chunks={num_chunks}"
+      ),
+      other => {
+        panic!("num_chunks={num_chunks}: one past the allowance must be refused, got {other:?}")
+      }
+    }
+  }
+
+  // The caller door, on the same boundaries.
+  for num_chunks in 1..=8usize {
+    let derived =
+      derived_output_frame_count(num_chunks, chunks_sw, frames_sw).expect("well defined");
+    let admissible = largest_admissible_frames_per_chunk(num_chunks);
+    for (frames, want_ok) in [(admissible, true), (admissible + 1, false)] {
+      let parts = ExtractionParts {
+        raw_embeddings: vec![0.0f32; num_chunks * SEG_NUM_SLOTS * EMBEDDING_DIM],
+        segmentations: vec![0.0f64; num_chunks * frames * SEG_NUM_SLOTS],
+        count: vec![0u8; derived],
+        num_chunks,
+        num_frames_per_chunk: frames,
+        chunks_sw,
+        frames_sw,
+      };
+      let got = Extraction::try_from_parts(parts);
+      assert_eq!(
+        got.is_ok(),
+        want_ok,
+        "num_chunks={num_chunks} frames={frames}: got {:?}",
+        got.err()
+      );
+    }
   }
 }

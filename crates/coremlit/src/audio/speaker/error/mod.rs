@@ -507,6 +507,60 @@ impl CollapsedFrameCenter {
   }
 }
 
+/// The derived output-frame grid is too short to hold the LAST chunk's frames,
+/// so `diaric::reconstruct` would drop every cell past its end.
+///
+/// Payload of [`ExtractError::UncoveredLastChunk`]. `diaric::reconstruct` writes
+/// chunk `c`'s frame `f` at output frame `closest_frame(chunks_sw.start + c *
+/// chunks_sw.step + frames_sw.duration / 2) + f` and requires the grid to reach
+/// the last chunk's last frame, raising its own
+/// `ShapeError::OutputFrameCountTooSmall { got, required }`
+/// (`diarization/src/reconstruct/algo.rs:478-495`) when it does not. This
+/// carries the same two numbers, plus the placement they are derived from.
+///
+/// [`Self::required`] is [`Self::start_frame`] `+ num_frames_per_chunk`, where
+/// the placement comes from [`crate::audio::speaker::window`]'s
+/// `reconstruct_chunk_start_frame` — the mirror of that `closest_frame`, and
+/// the SAME quantity `diaric`'s `required` is built from. [`Self::got`] is the
+/// grid the geometry derives, which past
+/// [`ExtractError::ExtractionLenMismatch`]'s check-5 equality IS `count.len()`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct UncoveredLastChunk {
+  start_frame: i64,
+  required: usize,
+  got: usize,
+}
+
+impl UncoveredLastChunk {
+  /// The output frame `diaric::reconstruct` places the LAST chunk's first frame
+  /// at. Non-negative: the check does not fire below zero, matching `diaric`'s
+  /// own `last_start_frame >= 0` guard.
+  #[inline(always)]
+  pub const fn start_frame(&self) -> i64 {
+    self.start_frame
+  }
+  /// The grid length that placement demands: [`Self::start_frame`] `+
+  /// num_frames_per_chunk`, saturating.
+  #[inline(always)]
+  pub const fn required(&self) -> usize {
+    self.required
+  }
+  /// The grid length the geometry actually derives.
+  #[inline(always)]
+  pub const fn got(&self) -> usize {
+    self.got
+  }
+
+  /// Crate-private: only the validating constructor raises this.
+  pub(crate) const fn new(start_frame: i64, required: usize, got: usize) -> Self {
+    Self {
+      start_frame,
+      required,
+      got,
+    }
+  }
+}
+
 /// Top-level extraction failure, composing model-lifecycle and inference
 /// errors (spec §5) plus [`crate::audio::speaker::extract::Extractor::extract`]'s own
 /// input-validation and geometry guards.
@@ -751,6 +805,43 @@ pub enum ExtractError {
     .0.previous()
   )]
   CollapsedFrameCenter(CollapsedFrameCenter),
+  /// The derived output-frame grid does not reach the LAST chunk's last frame,
+  /// so `diaric::reconstruct` silently drops every cell past its end — check 14.
+  ///
+  /// Checks 5 and 8 make the grid the derived one and place every chunk
+  /// identically under both mappings, and neither says the grid is LONG ENOUGH:
+  /// a chunk whose declared `chunks_sw.duration()` spans fewer
+  /// `frames_sw.step()` slots than `num_frames_per_chunk` derives a grid
+  /// shorter than the chunk it must hold. At the shipped grid that first bites
+  /// at `num_frames_per_chunk = 595` for a one-chunk clip (594 output frames)
+  /// and at `594` for a three-chunk clip (712 frames against a last chunk
+  /// placed at 119).
+  ///
+  /// *Verified against both:* both routes end in the same
+  /// `diaric::reconstruct`, which raises the typed
+  /// `ShapeError::OutputFrameCountTooSmall` before allocating the grid
+  /// (`diarization/src/reconstruct/algo.rs:478-495`). They differ in the WORK
+  /// that precedes it, not in the outcome: ONLINE reaches that call directly,
+  /// OFFLINE only at its stage 5, after AHC and VBx have already run
+  /// (`diarization/src/offline/algo.rs:808`). Neither can return `Ok`, so this
+  /// variant makes the refusal EARLY rather than newly-refusing anything —
+  /// and, at both producers, before inference rather than after.
+  ///
+  /// Reachable from every construction path, and from both producers'
+  /// pre-inference `checked_geometry`: `num_frames_per_chunk` is
+  /// `SegmentModel`'s declared frame count, which that loader constrains only
+  /// to `shape[1] >= 1`. Unreachable with the shipped 589-frame community-1
+  /// segmenter, whose last chunk always leaves at least four frames of headroom
+  /// on the default stride, and with
+  /// [`crate::audio::speaker::source::ArgmaxSource`]'s compiled-in 589.
+  #[error(
+    "extraction geometry: the derived output grid is {} frames, but the last chunk starts at \
+     frame {} and needs {} — diaric::reconstruct would drop every cell past the end",
+    .0.got(),
+    .0.start_frame(),
+    .0.required()
+  )]
+  UncoveredLastChunk(UncoveredLastChunk),
   /// `frames_sw.step()` is finite and strictly positive in `f64` but does not
   /// survive the narrowing to `f32` that
   /// [`crate::audio::speaker::extract::Extraction::diarize_online`] applies to
