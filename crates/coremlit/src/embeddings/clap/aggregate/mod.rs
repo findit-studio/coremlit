@@ -181,12 +181,17 @@ pub struct EmaRenormalizedOptions {
   /// [`aggregate`] widens clap's `f32` storage to `f64` before folding a
   /// single component, so an `f32` field here would have resolved the weight
   /// at `2^-24` inside a sum that rounds at `2^-53` — the defect windit fixed
-  /// in its own selector. The JSON form is unchanged (a number carries no
-  /// width), so configuration files round-trip exactly as before; a configured
-  /// `0.3` now reaches the fold at full `f64` precision rather than through
-  /// the `f32` grid, which moves an EMA aggregate in its eighth significant
-  /// digit. Pass `f64::from(0.3f32)` to reproduce the pre-0.3 weights bit for
-  /// bit.
+  /// in its own selector. In JSON a number carries no width, so this field's
+  /// JSON form is unchanged and a JSON configuration file round-trips exactly
+  /// as before (measured). That is JSON-specific, not a general format claim:
+  /// a fixed-width binary format such as bincode encodes an `f32` and an
+  /// `f64` at different byte widths on the wire, and separately,
+  /// [`AggregatePolicyKind::EmaRenormalized`]'s own shape change affects a
+  /// format like RON regardless of this field's type (see that variant's
+  /// docs). A configured `0.3` now reaches the fold at full `f64` precision
+  /// rather than through the `f32` grid, which moves an EMA aggregate in its
+  /// eighth significant digit. Pass `f64::from(0.3f32)` to reproduce the
+  /// pre-0.3 weights bit for bit.
   ///
   /// Required on the wire — deliberately no `serde(default)`, because a config
   /// that forgets `alpha` is a misconfiguration and not a request for `0.0`,
@@ -256,10 +261,21 @@ pub enum AggregatePolicyKind {
   MeanRenormalized,
   /// Selects [`EmaRenormalized`], configured by [`EmaRenormalizedOptions`].
   ///
-  /// Externally tagged, so the wire form is unchanged by the payload living in
-  /// its own struct: a newtype variant serializes as its payload does, and
+  /// Before this type existed, the payload lived directly in a struct variant
+  /// (`EmaRenormalized { alpha: f32 }`). For a self-describing map format the
+  /// wire form is unchanged: JSON renders a struct variant and a newtype
+  /// variant wrapping the same fields identically, so
   /// `{"ema_renormalized":{"alpha":0.5}}` is still exactly what a config file
-  /// holds (pinned by the golden round-trip).
+  /// holds, and that old-shape document still deserializes here (both
+  /// measured, and pinned by the golden round-trip). That does **not**
+  /// generalize: serde's data model distinguishes a struct variant from a
+  /// newtype variant wrapping one, and a shape-sensitive format shows it — RON
+  /// measures as `ema_renormalized(alpha:0.5)` for the old shape and
+  /// `ema_renormalized((alpha:0.5))` for this one, and the old string fails to
+  /// deserialize here. A fixed-width binary format such as bincode is
+  /// shape-sensitive the same way. Accepted deliberately: every variant here
+  /// is unit or newtype only (see above), never struct; this crate has never
+  /// published a release, so no old-shape document exists to break.
   EmaRenormalized(EmaRenormalizedOptions),
   /// Selects [`CoverageWeightedMean`].
   CoverageWeightedMean,
