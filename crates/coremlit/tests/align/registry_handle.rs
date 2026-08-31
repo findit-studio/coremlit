@@ -45,9 +45,7 @@ fn resolve_exposes_binding_as_data_never_an_aligner() {
   assert_eq!(handle.language(), &Lang::Zh);
   assert_eq!(
     handle.binding(),
-    AlignmentBinding::Miss {
-      fallback: AlignmentFallback::Error,
-    }
+    AlignmentBinding::Miss(AlignmentFallback::Error)
   );
 }
 
@@ -99,12 +97,7 @@ fn any_fallback_handle_keys_policy_on_the_requested_language() {
   // fallback whose OWN construction language is En — metadata as DATA, not the
   // aligner itself.
   assert_eq!(handle.language(), &Lang::Zh);
-  assert_eq!(
-    handle.binding(),
-    AlignmentBinding::AnyFallback {
-      aligner_language: Lang::En,
-    }
-  );
+  assert_eq!(handle.binding(), AlignmentBinding::AnyFallback(Lang::En));
 
   let samples = common::load_wav_mono_f32(&common::jfk_wav_path());
   let text = common::JFK_TRANSCRIPT;

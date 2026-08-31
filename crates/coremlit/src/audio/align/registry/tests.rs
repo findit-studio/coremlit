@@ -164,7 +164,7 @@ fn empty_set_misses_with_default_fallback() {
   assert!(set.is_empty());
   assert_eq!(set.len(), 0);
   match set.lookup(&Lang::En) {
-    AlignmentLookup::Miss { fallback } => assert_eq!(fallback, AlignmentFallback::SkipChunk),
+    AlignmentLookup::Miss(fallback) => assert_eq!(fallback, AlignmentFallback::SkipChunk),
     _ => panic!("expected Miss"),
   }
 }
@@ -176,7 +176,7 @@ fn empty_set_misses_with_error_fallback() {
     .build();
   assert_eq!(set.fallback(), AlignmentFallback::Error);
   match set.lookup(&Lang::Zh) {
-    AlignmentLookup::Miss { fallback } => assert_eq!(fallback, AlignmentFallback::Error),
+    AlignmentLookup::Miss(fallback) => assert_eq!(fallback, AlignmentFallback::Error),
     _ => panic!("expected Miss"),
   }
 }
@@ -250,8 +250,8 @@ fn cross_decisions_rejects_a_decision_not_carrying_the_requested_language() {
   let err = cross_decisions_into(&decisions, &Lang::Zh, &Lang::En).unwrap_err();
   assert!(matches!(
     err,
-    AlignError::DecisionLanguage { index, ref requested, ref found }
-      if index == 1 && *requested == Lang::Zh && *found == Lang::En
+    AlignError::DecisionLanguage(ref e)
+      if e.index() == 1 && *e.requested() == Lang::Zh && *e.found() == Lang::En
   ));
 }
 
@@ -290,7 +290,7 @@ fn align_chunk_miss_error_returns_language_unsupported() {
     .unwrap_err();
   assert!(matches!(
     err,
-    AlignError::LanguageUnsupported { ref language } if *language == Lang::Zh
+    AlignError::LanguageUnsupported(ref language) if *language == Lang::Zh
   ));
 }
 
@@ -303,9 +303,7 @@ fn resolve_binds_the_requested_language_and_reports_the_miss() {
   assert_eq!(handle.language(), &Lang::Zh);
   assert_eq!(
     handle.binding(),
-    AlignmentBinding::Miss {
-      fallback: AlignmentFallback::SkipChunk
-    }
+    AlignmentBinding::Miss(AlignmentFallback::SkipChunk)
   );
 }
 
@@ -364,7 +362,7 @@ fn lookup_hits_registered_language() {
     .build();
   assert_eq!(set.len(), 1);
   // Internal lookup hits the language's own aligner (never the Any fallback).
-  assert!(matches!(set.lookup(&Lang::En), AlignmentLookup::Hit { .. }));
+  assert!(matches!(set.lookup(&Lang::En), AlignmentLookup::Hit(_)));
   // The public handle reports the same resolution as DATA: an exact bind.
   assert_eq!(set.resolve(&Lang::En).binding(), AlignmentBinding::Exact);
 }
@@ -377,9 +375,7 @@ fn lookup_misses_unregistered_language_without_any() {
     .build();
   assert!(matches!(
     set.lookup(&Lang::Zh),
-    AlignmentLookup::Miss {
-      fallback: AlignmentFallback::SkipChunk
-    }
+    AlignmentLookup::Miss(AlignmentFallback::SkipChunk)
   ));
 }
 
@@ -391,11 +387,11 @@ fn strict_lookup_prefers_lang_over_any() {
     .register(AlignerKey::Any, en_aligner())
     .build();
   // A registered language hits its own aligner, never the Any fallback.
-  assert!(matches!(set.lookup(&Lang::En), AlignmentLookup::Hit { .. }));
+  assert!(matches!(set.lookup(&Lang::En), AlignmentLookup::Hit(_)));
   // An unregistered language falls through to Any.
   assert!(matches!(
     set.lookup(&Lang::Zh),
-    AlignmentLookup::AnyFallback { .. }
+    AlignmentLookup::AnyFallback(_)
   ));
 }
 
@@ -413,15 +409,13 @@ fn any_fallback_can_match_the_requested_language() {
     .build();
   assert!(matches!(
     set.lookup(&Lang::En),
-    AlignmentLookup::AnyFallback { .. }
+    AlignmentLookup::AnyFallback(_)
   ));
   // The public binding carries the Any aligner's own language — here EQUAL to the
   // requested language, exactly the case the doc now cites.
   assert_eq!(
     set.resolve(&Lang::En).binding(),
-    AlignmentBinding::AnyFallback {
-      aligner_language: Lang::En
-    }
+    AlignmentBinding::AnyFallback(Lang::En)
   );
 }
 
@@ -554,8 +548,8 @@ fn exact_hit_validates_decision_language_before_dispatch() {
     assert!(
       matches!(
         err,
-        AlignError::DecisionLanguage { index, ref requested, ref found }
-          if index == 0 && *requested == Lang::En && *found == Lang::Zh
+        AlignError::DecisionLanguage(ref e)
+          if e.index() == 0 && *e.requested() == Lang::En && *e.found() == Lang::Zh
       ),
       "{case}: exact En hit + Zh decision must be the typed DecisionLanguage, got {err:?}"
     );

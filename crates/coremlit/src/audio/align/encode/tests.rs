@@ -325,8 +325,8 @@ fn encoder_input_rejects_a_buffer_longer_than_the_window_before_any_prediction()
   let err = EncoderInput::from_samples(&too_long).unwrap_err();
   assert!(matches!(
     err,
-    AlignError::InputTooLong { got, max }
-      if got == ENCODER_WINDOW_SAMPLES + 1 && max == ENCODER_WINDOW_SAMPLES
+    AlignError::InputTooLong(ref e)
+      if e.got() == ENCODER_WINDOW_SAMPLES + 1 && e.max() == ENCODER_WINDOW_SAMPLES
   ));
 }
 
@@ -361,10 +361,7 @@ fn check_waveform_contract_rejects_wrong_shape() {
   let err = check_waveform_contract(&[1, 480_000], Some(DataType::F32)).unwrap_err();
   assert!(matches!(
     err,
-    AlignerError::ContractMismatch {
-      feature: "waveform",
-      ..
-    }
+    AlignerError::ContractMismatch(ref e) if e.feature() == "waveform"
   ));
 }
 
@@ -373,17 +370,14 @@ fn check_waveform_contract_rejects_wrong_dtype() {
   let err = check_waveform_contract(&[1, ENCODER_WINDOW_SAMPLES], Some(DataType::F16)).unwrap_err();
   assert!(matches!(
     err,
-    AlignerError::ContractMismatch {
-      feature: "waveform",
-      ..
-    }
+    AlignerError::ContractMismatch(ref e) if e.feature() == "waveform"
   ));
 }
 
 #[test]
 fn check_waveform_contract_rejects_missing_dtype() {
   let err = check_waveform_contract(&[1, ENCODER_WINDOW_SAMPLES], None).unwrap_err();
-  assert!(matches!(err, AlignerError::ContractMismatch { .. }));
+  assert!(matches!(err, AlignerError::ContractMismatch(_)));
 }
 
 #[test]
@@ -400,14 +394,10 @@ fn missing_waveform_input_diagnostic_names_the_exact_contract() {
   // Hand-diverging `expected_waveform_contract` from the check's literal fails
   // the `expected` assertion below.
   match waveform_input_or_mismatch(None) {
-    Err(AlignerError::ContractMismatch {
-      feature,
-      expected,
-      actual,
-    }) => {
-      assert_eq!(feature, "waveform");
-      assert_eq!(expected, "[1, 960000] float32");
-      assert_eq!(actual, "missing");
+    Err(AlignerError::ContractMismatch(e)) => {
+      assert_eq!(e.feature(), "waveform");
+      assert_eq!(e.expected(), "[1, 960000] float32");
+      assert_eq!(e.actual(), "missing");
     }
     other => panic!("expected a ContractMismatch, got {other:?}"),
   }
@@ -433,10 +423,7 @@ fn check_emissions_contract_rejects_wrong_rank() {
   .unwrap_err();
   assert!(matches!(
     err,
-    AlignerError::ContractMismatch {
-      feature: "emissions",
-      ..
-    }
+    AlignerError::ContractMismatch(ref e) if e.feature() == "emissions"
   ));
 }
 
@@ -447,7 +434,7 @@ fn check_emissions_contract_rejects_wrong_batch_dim() {
     Some(DataType::F32),
   )
   .unwrap_err();
-  assert!(matches!(err, AlignerError::ContractMismatch { .. }));
+  assert!(matches!(err, AlignerError::ContractMismatch(_)));
 }
 
 #[test]
@@ -459,13 +446,13 @@ fn check_emissions_contract_rejects_zero_frames() {
     Some(DataType::F32),
   )
   .unwrap_err();
-  assert!(matches!(err, AlignerError::ContractMismatch { .. }));
+  assert!(matches!(err, AlignerError::ContractMismatch(_)));
 }
 
 #[test]
 fn check_emissions_contract_rejects_wrong_vocab_dim() {
   let err = check_emissions_contract(&[1, 2_999, 32], Some(DataType::F32)).unwrap_err();
-  assert!(matches!(err, AlignerError::ContractMismatch { .. }));
+  assert!(matches!(err, AlignerError::ContractMismatch(_)));
 }
 
 #[test]
@@ -475,7 +462,7 @@ fn check_emissions_contract_rejects_wrong_dtype() {
     Some(DataType::F64),
   )
   .unwrap_err();
-  assert!(matches!(err, AlignerError::ContractMismatch { .. }));
+  assert!(matches!(err, AlignerError::ContractMismatch(_)));
 }
 
 #[test]
@@ -494,10 +481,7 @@ fn check_emissions_contract_rejects_a_cropped_frame_count() {
   .unwrap_err();
   assert!(matches!(
     err,
-    AlignerError::ContractMismatch {
-      feature: "emissions",
-      ..
-    }
+    AlignerError::ContractMismatch(ref e) if e.feature() == "emissions"
   ));
 }
 
@@ -514,10 +498,7 @@ fn check_emissions_contract_rejects_an_overlong_frame_count() {
   .unwrap_err();
   assert!(matches!(
     err,
-    AlignerError::ContractMismatch {
-      feature: "emissions",
-      ..
-    }
+    AlignerError::ContractMismatch(ref e) if e.feature() == "emissions"
   ));
 }
 
@@ -534,14 +515,10 @@ fn missing_emissions_output_diagnostic_names_the_exact_contract() {
   // `expected_emissions_contract` to a `>=1` literal fails the `expected`
   // assertion below.
   match emissions_output_or_mismatch(None) {
-    Err(AlignerError::ContractMismatch {
-      feature,
-      expected,
-      actual,
-    }) => {
-      assert_eq!(feature, "emissions");
-      assert_eq!(expected, "[1, 2999, 29] float32");
-      assert_eq!(actual, "missing");
+    Err(AlignerError::ContractMismatch(e)) => {
+      assert_eq!(e.feature(), "emissions");
+      assert_eq!(e.expected(), "[1, 2999, 29] float32");
+      assert_eq!(e.actual(), "missing");
     }
     other => panic!("expected a ContractMismatch, got {other:?}"),
   }
@@ -578,19 +555,13 @@ fn check_log_prob_floor_rejects_the_fp16_log_zero_sentinel() {
   let Err(err) = check_log_prob_floor(&data, ComputeUnits::All) else {
     panic!("the -45440 fp16 log(0) sentinel must be rejected");
   };
-  let AlignError::CorruptEmissions {
-    compute,
-    min,
-    cells,
-    total,
-  } = err
-  else {
+  let AlignError::CorruptEmissions(ref e) = err else {
     panic!("expected AlignError::CorruptEmissions, got {err:?}");
   };
-  assert_eq!(compute, ComputeUnits::All);
-  assert_eq!(min, -45_440.0);
-  assert_eq!(cells, 1);
-  assert_eq!(total, 4);
+  assert_eq!(e.compute(), ComputeUnits::All);
+  assert_eq!(e.min(), -45_440.0);
+  assert_eq!(e.cells(), 1);
+  assert_eq!(e.total(), 4);
 }
 
 #[test]
@@ -712,19 +683,15 @@ fn check_log_prob_normalization_rejects_shifted_raw_logits() {
   let Err(err) = check_log_prob_normalization(&data, ComputeUnits::CpuOnly) else {
     panic!("raw logits shifted into [-20, -10] must be rejected as un-normalized");
   };
-  let AlignError::UnnormalizedEmissions {
-    logsumexp,
-    tolerance,
-    ..
-  } = err
-  else {
+  let AlignError::UnnormalizedEmissions(ref e) = err else {
     panic!("expected AlignError::UnnormalizedEmissions, got {err:?}");
   };
+  let logsumexp = e.logsumexp();
   assert!(
     logsumexp.abs() > 6.6,
     "a [-20, -10] shifted frame's |logsumexp| is >= 6.63, got {logsumexp}"
   );
-  assert_eq!(tolerance, LOG_PROB_SUM_TOLERANCE);
+  assert_eq!(e.tolerance(), LOG_PROB_SUM_TOLERANCE);
 }
 
 #[test]
@@ -738,17 +705,14 @@ fn check_log_prob_normalization_rejects_an_all_zero_frame() {
     "an all-zeros frame is above the floor"
   );
   assert!(data.iter().all(|v| v.is_finite() && *v <= 0.0));
-  let Err(AlignError::UnnormalizedEmissions {
-    row,
-    logsumexp,
-    compute,
-    ..
-  }) = check_log_prob_normalization(&data, ComputeUnits::All)
+  let Err(AlignError::UnnormalizedEmissions(e)) =
+    check_log_prob_normalization(&data, ComputeUnits::All)
   else {
     panic!("an all-zeros frame (logsumexp = ln 29) must be rejected");
   };
-  assert_eq!(row, 0);
-  assert_eq!(compute, ComputeUnits::All); // the placement is carried through
+  let logsumexp = e.logsumexp();
+  assert_eq!(e.row(), 0);
+  assert_eq!(e.compute(), ComputeUnits::All); // the placement is carried through
   let ln29 = f64::from(crate::audio::align::vocab::VOCAB_SIZE as u32).ln();
   assert!(
     (logsumexp - ln29).abs() < 1e-5,
@@ -771,12 +735,12 @@ fn check_log_prob_normalization_names_the_worst_frame() {
       data.extend_from_slice(&normalized); // logsumexp ≈ 0
     }
   }
-  let Err(AlignError::UnnormalizedEmissions { row, .. }) =
+  let Err(AlignError::UnnormalizedEmissions(e)) =
     check_log_prob_normalization(&data, ComputeUnits::CpuOnly)
   else {
     panic!("the un-normalized frame must be rejected");
   };
-  assert_eq!(row, bad_index, "the error must name the worst frame");
+  assert_eq!(e.row(), bad_index, "the error must name the worst frame");
 }
 
 #[test]
@@ -833,7 +797,7 @@ fn raw_emissions_check_value_domain_binds_the_guard_and_the_minted_buffer() {
   assert!(
     matches!(
       raw.check_value_domain(ComputeUnits::CpuOnly),
-      Err(AlignError::UnnormalizedEmissions { .. })
+      Err(AlignError::UnnormalizedEmissions(_))
     ),
     "the minter must reject a shifted-raw-logit tensor as un-normalized"
   );
@@ -847,7 +811,7 @@ fn raw_emissions_check_value_domain_binds_the_guard_and_the_minted_buffer() {
   assert!(
     matches!(
       raw.check_value_domain(ComputeUnits::CpuOnly),
-      Err(AlignError::UnnormalizedEmissions { .. })
+      Err(AlignError::UnnormalizedEmissions(_))
     ),
     "the minter must reject an all-zeros frame as un-normalized"
   );
@@ -1190,15 +1154,10 @@ fn emissions_reject_an_ane_corrupted_matrix() {
        timings. LOG_PROB_FLOOR is the only thing standing here."
     );
   };
-  let AlignError::CorruptEmissions {
-    compute,
-    min,
-    cells,
-    total,
-  } = err
-  else {
+  let AlignError::CorruptEmissions(ref e) = err else {
     panic!("expected AlignError::CorruptEmissions, got {err:?}");
   };
+  let (compute, min, cells, total) = (e.compute(), e.min(), e.cells(), e.total());
   // The measured ANE signature, pinned: 2,667 of 15,921 cells (16.7%),
   // min = -45440. Asserted as bounds rather than as equalities — the exact
   // count is a property of one OS/ANE firmware pair, but the ORDER of the
@@ -1215,13 +1174,7 @@ fn emissions_reject_an_ane_corrupted_matrix() {
   );
   // Self-diagnosing: the message must NAME the placement, or the caller is
   // left to rediscover a 450×-slower, 16.7%-corrupt configuration by hand.
-  let rendered = AlignError::CorruptEmissions {
-    compute,
-    min,
-    cells,
-    total,
-  }
-  .to_string();
+  let rendered = AlignError::CorruptEmissions(e.clone()).to_string();
   assert!(
     rendered.contains("All"),
     "error must name the placement: {rendered}"

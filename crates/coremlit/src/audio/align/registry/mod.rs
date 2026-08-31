@@ -47,7 +47,10 @@ use asry::{
   emissions::{OovEvent, OutputClock, ResolvedOov},
 };
 
-use crate::audio::align::{aligner::Aligner, error::AlignError};
+use crate::audio::align::{
+  aligner::Aligner,
+  error::{AlignError, DecisionLanguage},
+};
 
 /// Identifies an aligner in the [`AlignmentSet`] registry.
 ///
@@ -198,22 +201,19 @@ enum AlignmentLookup<'a> {
   /// fall through to [`AlignerKey::Any`]. The matched key is always
   /// `Lang(requested)`, so it carries no information beyond the handle's own
   /// [`language`](AlignmentHandle::language) and is not stored.
-  Hit {
-    /// The language-specific aligner.
-    aligner: &'a Aligner,
-  },
+  ///
+  /// Carries the language-specific aligner.
+  Hit(&'a Aligner),
   /// Miss on `Lang(L)`, hit on [`AlignerKey::Any`] — the multilingual
   /// fallback is used.
-  AnyFallback {
-    /// The multilingual fallback aligner.
-    aligner: &'a Aligner,
-  },
+  ///
+  /// Carries the multilingual fallback aligner.
+  AnyFallback(&'a Aligner),
   /// Miss on both `Lang(L)` and `Any`. The configured [`AlignmentFallback`]
   /// decides what the caller does.
-  Miss {
-    /// The configured miss policy.
-    fallback: AlignmentFallback,
-  },
+  ///
+  /// Carries the configured miss policy.
+  Miss(AlignmentFallback),
 }
 
 /// How [`AlignmentSet::resolve`] matched a request — the hit-vs-fallback-vs-miss
@@ -240,26 +240,24 @@ pub enum AlignmentBinding {
   /// ([`AlignmentHandle::language`]).
   Exact,
   /// Miss on `Lang(L)`, served by the [`AlignerKey::Any`] fallback, whose OWN
-  /// construction language is `aligner_language`. What makes this a fallback is
+  /// construction language this variant carries. What makes this a fallback is
   /// that the lookup found no exact [`AlignerKey::Lang`]`(L)` and fell through to
   /// [`AlignerKey::Any`] — **not** that the languages differ. They usually do (an
   /// `Any` aligner serving another language), but they need not: with an English
   /// aligner registered under [`AlignerKey::Any`] alone, an English request finds
-  /// no `Lang(En)` key and resolves to `AnyFallback { aligner_language: En }`,
+  /// no `Lang(En)` key and resolves to `AnyFallback(En)`,
   /// matching the request (`registry::tests::any_fallback_can_match_the_requested_language`).
   /// Either way policy keys on the REQUESTED language, not on this one.
-  AnyFallback {
-    /// The `Any` aligner's own construction language — MAY equal the request (see
-    /// the variant doc); it is the aligner the fallback bound, not a guarantee of
-    /// difference.
-    aligner_language: Lang,
-  },
+  ///
+  /// Carries the `Any` aligner's own construction language — MAY equal the request
+  /// (see above); it is the aligner the fallback bound, not a guarantee of
+  /// difference.
+  AnyFallback(Lang),
   /// Miss on both `Lang(L)` and `Any`: the configured [`AlignmentFallback`]
   /// decides what [`AlignmentHandle::align_chunk`] does.
-  Miss {
-    /// The configured miss policy.
-    fallback: AlignmentFallback,
-  },
+  ///
+  /// Carries the configured miss policy.
+  Miss(AlignmentFallback),
 }
 
 /// A registry bound to one requested language — the guarded, request-scoped view
@@ -361,14 +359,12 @@ impl AlignmentSet {
   fn lookup<'a>(&'a self, language: &Lang) -> AlignmentLookup<'a> {
     let lang_key = AlignerKey::Lang(language.clone());
     if let Some(aligner) = self.aligners.get(&lang_key) {
-      return AlignmentLookup::Hit { aligner };
+      return AlignmentLookup::Hit(aligner);
     }
     if let Some(aligner) = self.aligners.get(&AlignerKey::Any) {
-      return AlignmentLookup::AnyFallback { aligner };
+      return AlignmentLookup::AnyFallback(aligner);
     }
-    AlignmentLookup::Miss {
-      fallback: self.fallback,
-    }
+    AlignmentLookup::Miss(self.fallback)
   }
 
   /// Detect out-of-vocabulary characters in `text` against the aligner
@@ -391,8 +387,8 @@ impl AlignmentSet {
   /// from the matched aligner.
   pub fn detect_oov(&self, text: &str, language: &Lang) -> Result<Vec<OovEvent>, AlignError> {
     let aligner = match self.lookup(language) {
-      AlignmentLookup::Hit { aligner } | AlignmentLookup::AnyFallback { aligner } => aligner,
-      AlignmentLookup::Miss { .. } => return Ok(Vec::new()),
+      AlignmentLookup::Hit(aligner) | AlignmentLookup::AnyFallback(aligner) => aligner,
+      AlignmentLookup::Miss(_) => return Ok(Vec::new()),
     };
     let mut events = aligner.detect_oov(text)?;
     for event in &mut events {
@@ -471,7 +467,7 @@ impl AlignmentSet {
     oov_decisions: &[ResolvedOov],
   ) -> Result<AlignmentResult, AlignError> {
     match self.lookup(language) {
-      AlignmentLookup::Hit { aligner } => {
+      AlignmentLookup::Hit(aligner) => {
         // Requested language == the aligner's own language (the builder asserts
         // it for AlignerKey::Lang), so a correctly-resolved decision already
         // carries the tag the aligner's `prepare` expects. Validate that HERE,
@@ -492,7 +488,7 @@ impl AlignmentSet {
           oov_decisions,
         )
       }
-      AlignmentLookup::AnyFallback { aligner } => {
+      AlignmentLookup::AnyFallback(aligner) => {
         // The Any aligner's language MAY differ from the request (and usually
         // does). Validate the decisions were resolved for the REQUESTED language
         // (so we are not masking a wrong-policy payload), then cross them into the
@@ -502,11 +498,9 @@ impl AlignmentSet {
         let crossed = cross_decisions_into(oov_decisions, language, aligner.language_ref())?;
         aligner.align_chunk(samples, sub_segments, text, clock, abort_flag, &crossed)
       }
-      AlignmentLookup::Miss { fallback } => match fallback {
+      AlignmentLookup::Miss(fallback) => match fallback {
         AlignmentFallback::SkipChunk => Ok(AlignmentResult::new(Vec::new())),
-        AlignmentFallback::Error => Err(AlignError::LanguageUnsupported {
-          language: language.clone(),
-        }),
+        AlignmentFallback::Error => Err(AlignError::LanguageUnsupported(language.clone())),
       },
     }
   }
@@ -529,11 +523,11 @@ impl AlignmentHandle<'_> {
   #[must_use]
   pub fn binding(&self) -> AlignmentBinding {
     match self.set.lookup(&self.language) {
-      AlignmentLookup::Hit { .. } => AlignmentBinding::Exact,
-      AlignmentLookup::AnyFallback { aligner } => AlignmentBinding::AnyFallback {
-        aligner_language: aligner.language_ref().clone(),
-      },
-      AlignmentLookup::Miss { fallback } => AlignmentBinding::Miss { fallback },
+      AlignmentLookup::Hit(_) => AlignmentBinding::Exact,
+      AlignmentLookup::AnyFallback(aligner) => {
+        AlignmentBinding::AnyFallback(aligner.language_ref().clone())
+      }
+      AlignmentLookup::Miss(fallback) => AlignmentBinding::Miss(fallback),
     }
   }
 
@@ -632,11 +626,11 @@ fn validate_decisions_language(
 ) -> Result<(), AlignError> {
   for (index, resolved) in decisions.iter().enumerate() {
     if resolved.event().language() != requested {
-      return Err(AlignError::DecisionLanguage {
+      return Err(AlignError::DecisionLanguage(DecisionLanguage::new(
         index,
-        requested: requested.clone(),
-        found: resolved.event().language().clone(),
-      });
+        requested.clone(),
+        resolved.event().language().clone(),
+      )));
     }
   }
   Ok(())

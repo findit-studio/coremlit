@@ -28,7 +28,7 @@ use asry::{
 
 use crate::audio::align::{
   encode::{DEFAULT_ENCODER_COMPUTE, Encoder, EncoderInput, EncoderOptions},
-  error::{AlignError, AlignerError},
+  error::{AlignError, AlignerError, InputTooLong},
 };
 
 /// The frame stride handed to asry's seam, in 16 kHz samples — the SAME
@@ -477,10 +477,10 @@ impl Aligner {
     oov_decisions: &[ResolvedOov],
   ) -> Result<AlignmentResult, AlignError> {
     if samples.len() > crate::audio::align::encode::ENCODER_WINDOW_SAMPLES {
-      return Err(AlignError::InputTooLong {
-        got: samples.len(),
-        max: crate::audio::align::encode::ENCODER_WINDOW_SAMPLES,
-      });
+      return Err(AlignError::InputTooLong(InputTooLong::new(
+        samples.len(),
+        crate::audio::align::encode::ENCODER_WINDOW_SAMPLES,
+      )));
     }
 
     let speech = if sub_segments.is_empty() {
