@@ -1,0 +1,233 @@
+// Not every integration-test binary that includes `mod common;` uses every
+// helper below (`model_io.rs` uses the model-path + sha helpers; the parity
+// and state suites use the audio/fnv helpers). Each test file is its own
+// crate, so an unused helper is dead code *in that crate* — allow it here so
+// the shared module compiles clean under the workspace's `-D warnings` gate.
+#![allow(dead_code)]
+
+// The workspace-root anchor every `models_dir()` below resolves against, and
+// the sibling-checkout anchor the oracle gates read. FOUND by searching upward
+// for the `[workspace]` manifest, never counted in `../` hops — see its module
+// doc for why a count is the wrong shape here. Re-exported so the binaries
+// that pull this `common` in share the one resolver.
+#[path = "../../support/workspace_root.rs"]
+#[allow(dead_code)]
+mod workspace_root;
+#[allow(unused_imports)]
+pub use workspace_root::{checkout_parent, models_root, workspace_root};
+
+use std::path::{Path, PathBuf};
+
+use sha2::{Digest, Sha256};
+
+// The `coremlit_dir` hop that keeps every crate-relative fixture path below
+// correct from BOTH packages that compile this shared module (`coremlit`'s own
+// test binaries and `coremlit-parity`'s oracle binaries, which `#[path]`-include
+// this very file). Kept in one place — see its module doc.
+#[path = "../../support/coremlit_dir.rs"]
+#[allow(dead_code)]
+mod coremlit_dir;
+use coremlit_dir::coremlit_path;
+
+/// The compiled VAD artifact's directory name within [`models_dir`] — the
+/// FluidInference `silero-vad-unified-256ms-v6.2.1` `.mlmodelc` (design spec
+/// §5; the v6.2.1 artifact ships pre-compiled, so this loads directly with no
+/// `coremlcompiler` step). Its HF revision + per-file SHA-256 are pinned in
+/// `tests/model_io.rs` — the alignkit/speakerkit convention for adopted models,
+/// NOT `MODELS_LOCK` (which a whisperkit hermetic gate holds to exactly the
+/// tables CI actually downloads; vad is not among them).
+pub const ARTIFACT: &str = "silero-vad-unified-256ms-v6.2.1.mlmodelc";
+
+/// Directory containing the vadkit model artifact.
+///
+/// Overridable via `VADKIT_TEST_MODELS`; otherwise falls back to
+/// `<workspace>/Models/vadkit` (mirroring `speakerkit`'s
+/// `SPEAKERKIT_TEST_MODELS`/`Models/speakerkit` and `alignkit`'s
+/// `ALIGNKIT_TEST_MODELS`/`Models/alignkit`, one directory level down for this
+/// crate's own model set).
+///
+/// Unlike every sibling kit's, that fallback needs NO download: the artifact
+/// is COMMITTED at
+/// `Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc/` — 1.1 MiB, MIT,
+/// un-ignored by name in `.gitignore` — so a fresh clone resolves it and CI
+/// runs the vad model gates with no fetch step (`.github/workflows/ci.yml`,
+/// the `check` job). To re-fetch it from the Hub instead (a re-vendor, or to
+/// verify the committed bytes against the source):
+///
+/// ```text
+/// hf download FluidInference/silero-vad-coreml \
+///   --include "silero-vad-unified-256ms-v6.2.1*" \
+///   --revision b419383c55c110e2c9271fa6ee0ea83d03c70d96 \
+///   --local-dir Models/vadkit
+/// ```
+///
+/// That download also writes a `Models/vadkit/.cache/huggingface/` bookkeeping
+/// tree, which stays gitignored — only the `.mlmodelc` is committed.
+pub fn models_dir() -> PathBuf {
+  std::env::var_os("VADKIT_TEST_MODELS").map_or_else(
+    || workspace_root::models_root().join("vadkit"),
+    PathBuf::from,
+  )
+}
+
+/// Path to the compiled VAD `.mlmodelc` artifact.
+pub fn model_path() -> PathBuf {
+  models_dir().join(ARTIFACT)
+}
+
+/// A committed parity fixture: a short 16 kHz mono clip borrowed by relative
+/// path from the `speakerkit` crate's fixtures (dia's parity corpus), plus its
+/// provenance. Borrowed rather than re-committed — both crates live in this
+/// workspace and move together, exactly as `alignkit` borrows whisperkit's
+/// `ted_60.wav`.
+pub struct Fixture {
+  /// Basename (no extension) of the WAV and its committed Swift golden.
+  pub name: &'static str,
+  /// Path within the `speakerkit` crate this clip is borrowed from.
+  pub source: &'static str,
+  /// SHA-256 of the borrowed WAV — pins the exact audio a swap/re-encode
+  /// would silently change out from under the cross-crate relative path.
+  pub sha256: &'static str,
+  /// Why this clip is in the set (coverage rationale).
+  pub note: &'static str,
+}
+
+/// The Swift-trace parity fixture set (spec §6 model-layer gate). Two real-
+/// speech clips from dia's parity corpus: `02_pyannote_sample` is pyannote's
+/// canonical multi-speaker demo (30.0 s → 118 chunks); `07_yuhewei_dongbei_
+/// english` is a second real conversational clip (25.26 s → 99 chunks) that
+/// exercises the short-final-chunk padding path. Together: 217 chunks across
+/// 2 clips (the gate requires ≥ 40 chunks over ≥ 2 clips). Speaker counts are
+/// deliberately NOT claimed here beyond "multi-speaker demo" — the fixture
+/// names in dia's corpus do not reliably encode speaker counts, and VAD only
+/// needs real speech with speech/non-speech transitions.
+pub const FIXTURES: &[Fixture] = &[
+  Fixture {
+    name: "02_pyannote_sample",
+    source: "coremlit/tests/speaker/fixtures/audio/02_pyannote_sample.wav",
+    sha256: "c319b4abca767b124e41432d364fd7df006cb26bb79d09326c487d606a134e6e",
+    note: "pyannote's canonical 30.0 s multi-speaker demo → 118 full 256 ms chunks",
+  },
+  Fixture {
+    name: "07_yuhewei_dongbei_english",
+    source: "coremlit/tests/speaker/fixtures/audio/07_yuhewei_dongbei_english.wav",
+    sha256: "096890ba8ffbaf10ca770c5373bf6c6664777f9421595c2cb7780af8cb2e46ff",
+    note: "25.26 s clip → 98 full chunks + 1 short final chunk (exercises repeat-last padding)",
+  },
+];
+
+/// Absolute path to a borrowed fixture WAV by basename.
+pub fn fixture_wav_path(name: &str) -> PathBuf {
+  coremlit_path("tests/speaker/fixtures/audio").join(format!("{name}.wav"))
+}
+
+/// Directory holding this crate's committed Swift-trace goldens.
+pub fn golden_swift_dir() -> PathBuf {
+  coremlit_path("tests/vad/fixtures/golden_swift")
+}
+
+/// Loads a 16 kHz mono WAV as `f32` samples — the single source of truth both
+/// the Swift dumper (`tests/vad/swift/.../DumpVadTraces.swift`'s `readPcm16Mono16k`)
+/// and the Rust gate feed their models, so the two sides are input-identical by
+/// construction; the [`fnv1a_f32`] recorded in each golden re-proves it at
+/// replay time (the alignkit/speakerkit Gate-1 lesson: prove the inputs match).
+///
+/// 16-bit PCM is scaled by `1 / 32768`; float WAVs pass through.
+///
+/// # Panics
+/// If the file is missing, not 16 kHz mono, or an unsupported bit depth.
+pub fn load_wav_16k_mono(path: &Path) -> Vec<f32> {
+  let mut reader =
+    hound::WavReader::open(path).unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+  let spec = reader.spec();
+  assert_eq!(spec.sample_rate, 16_000, "{}: not 16 kHz", path.display());
+  assert_eq!(spec.channels, 1, "{}: not mono", path.display());
+  match spec.sample_format {
+    hound::SampleFormat::Int => {
+      assert_eq!(
+        spec.bits_per_sample,
+        16,
+        "{}: only 16-bit int PCM supported",
+        path.display()
+      );
+      reader
+        .samples::<i16>()
+        .map(|s| f32::from(s.expect("read i16 sample")) / 32_768.0)
+        .collect()
+    }
+    hound::SampleFormat::Float => reader
+      .samples::<f32>()
+      .map(|s| s.expect("read f32 sample"))
+      .collect(),
+  }
+}
+
+/// FNV-1a-64 over the little-endian bytes of `samples` — byte-for-byte the
+/// same construction as `coremlit::audio::speaker::tests::common::fnv1a_f32` and the Swift
+/// dumper's `fnv1aHex`, so the golden's recorded input hash proves both sides
+/// fed the model element-identical audio.
+pub fn fnv1a_f32(samples: &[f32]) -> u64 {
+  let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+  for &s in samples {
+    for b in s.to_le_bytes() {
+      h ^= u64::from(b);
+      h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+  }
+  h
+}
+
+/// Lowercase 16-hex-digit rendering of a [`fnv1a_f32`] hash for JSON storage.
+pub fn fnv_hex(h: u64) -> String {
+  format!("{h:016x}")
+}
+
+/// Lowercase-hex SHA-256 digest of a file's contents — the provenance/
+/// integrity pin over the downloaded model artifacts (`tests/model_io.rs`).
+pub fn sha256_hex(path: &Path) -> String {
+  let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {path:?}: {e}"));
+  Sha256::digest(&bytes)
+    .iter()
+    .map(|b| format!("{b:02x}"))
+    .collect()
+}
+
+// ── Host-class provenance for the committed-Swift-golden parity gate ────────
+//
+// The gate stamps each golden with the host-class it was generated on and
+// enforces its tight bound only against a matching host, because CoreML floats
+// are not contracted portable across macOS builds or chips (#36). The
+// predicate, the verdict enum and the two diagnosis strings live in ONE file
+// under `tests/support/` — the `coremlit_dir` convention — because the speaker
+// and vad `common/mod.rs` used to carry byte-identical copies of them and
+// whisper needed a third. Re-exported here so `common::HostClass` and friends
+// keep their existing spelling; this suite's hermetic tests drive the shared
+// copy.
+#[path = "../../support/host_class.rs"]
+#[allow(dead_code)]
+mod host_class;
+// Named rather than glob-re-exported so the shared surface is legible here, and
+// `allow`ed for the same reason this file's top-level `allow(dead_code)` exists:
+// every test binary that says `mod common;` compiles this whole module, and the
+// ones with no golden to host-gate reference none of these four.
+#[allow(unused_imports)]
+pub use host_class::{HostClass, HostVerdict, check_host_class, legacy_failure_note};
+
+// ── Model-gate visibility (#61) ─────────────────────────────────────────────
+//
+// NOT `#[ignore]`d, deliberately. This is the ordinary-run half of the gate
+// accounting: an ignored-ONLY run (`-- --ignored`, what every CI gate uses)
+// never selects it, and it never appears in an ignored-only `--list`, so the
+// anti-vacuum counts those gates take are unchanged. What it adds is the case
+// no gate covers — a plain, modelless run — where the skipped gates otherwise
+// say nothing but `ignored`. Mechanism, and what it does and does not refuse,
+// in the shared module.
+#[path = "../../support/model_gate_report.rs"]
+mod model_gate_report;
+
+/// Reports how many of this binary's tests are `#[ignore]`d vadkit model gates
+/// that did not run, and whether the models root they read is on disk.
+#[test]
+fn model_gate_report() {
+  model_gate_report::report(&[("VADKIT_TEST_MODELS", models_dir())]);
+}

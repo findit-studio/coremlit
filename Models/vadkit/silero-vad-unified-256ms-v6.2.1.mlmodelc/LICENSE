@@ -15,7 +15,7 @@ What this artifact is
 The bytes here are FluidInference's CoreML conversion of Silero VAD, copied
 verbatim from that repository at that revision. Nothing was modified. The
 per-file SHA-256 of every file that came from the Hub is pinned in
-crates/coremlit/tests/vad/model_io.rs and re-verified by a model-gated test;
+coremlit/tests/vad/model_io.rs and re-verified by a model-gated test;
 this LICENSE file is coremlit's own addition and is not part of the download.
 
 ────────────────────────────────────────────────────────────────────────

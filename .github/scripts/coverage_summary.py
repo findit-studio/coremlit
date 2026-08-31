@@ -56,8 +56,8 @@ def parse(path: str) -> dict[str, dict[int, bool]]:
 def module_of(filename: str) -> str:
     """Group a source path into the module a human would ask about.
 
-    ``crates/coremlit/src/audio/ced/prediction/mod.rs`` -> ``audio/ced``;
-    ``crates/coremlit/src/lib.rs`` -> ``(crate root)``. Two path components under
+    ``coremlit/src/audio/ced/prediction/mod.rs`` -> ``audio/ced``;
+    ``coremlit/src/lib.rs`` -> ``(crate root)``. Two path components under
     ``src/`` is the level this crate is organised at (``audio::whisper``,
     ``embeddings::granite``), and it is also the level the coverage legs are
     sharded at, so the table lines up with the legs that produced it.

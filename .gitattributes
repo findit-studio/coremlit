@@ -1,5 +1,5 @@
 # The vendored VAD CoreML artifact is byte-pinned by SHA-256
-# (crates/coremlit/tests/vad/model_io.rs). Two of its five files — `model.mil`
+# (coremlit/tests/vad/model_io.rs). Two of its five files — `model.mil`
 # and `metadata.json` — are TEXT, so a clone with `core.autocrlf=true` (the
 # Windows default) would rewrite their line endings in the working tree and
 # every pinned hash would mismatch. Mark the whole artifact binary so no
