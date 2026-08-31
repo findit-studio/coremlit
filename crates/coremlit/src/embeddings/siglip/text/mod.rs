@@ -382,12 +382,9 @@ impl TextEmbedder {
     let mut outputs = self
       .model
       .predict_with(&[(names::INPUT_IDS, &ids_tensor)])?;
-    let feats =
-      outputs
-        .take(names::TEXT_FEATURES)
-        .ok_or_else(|| crate::PredictionError::MissingOutput {
-          name: names::TEXT_FEATURES.to_string(),
-        })?;
+    let feats = outputs
+      .take(names::TEXT_FEATURES)
+      .ok_or_else(|| crate::PredictionError::MissingOutput(names::TEXT_FEATURES.to_string()))?;
     if feats.shape() != [1, EMBEDDING_DIM] {
       return Err(Error::OutputShape {
         got: feats.shape().to_vec(),

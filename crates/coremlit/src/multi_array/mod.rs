@@ -5,7 +5,10 @@ use objc2::{AnyThread, ClassType, rc::Retained};
 use objc2_core_ml::{MLMultiArray, MLMultiArrayDataType};
 use objc2_foundation::{NSArray, NSNumber};
 
-use crate::{DataType, NsErrorInfo, ShapeRequirement, TensorError};
+use crate::{
+  DataType, DataTypeMismatch, IndexOutOfBounds, NonContiguous, NsErrorInfo, RankMismatch,
+  ShapeMismatch, ShapeRequirement, TensorError, UnsupportedShape,
+};
 
 mod sealed {
   pub trait Sealed {}
@@ -86,9 +89,7 @@ fn checked_element_count(shape: &[usize]) -> Result<usize, TensorError> {
   shape
     .iter()
     .try_fold(1usize, |acc, &dim| acc.checked_mul(dim))
-    .ok_or_else(|| TensorError::ShapeOverflow {
-      shape: shape.to_vec(),
-    })
+    .ok_or_else(|| TensorError::ShapeOverflow(shape.to_vec()))
 }
 
 impl MultiArray {
@@ -104,7 +105,7 @@ impl MultiArray {
   /// [`TensorError::Native`] if CoreML rejects the allocation.
   pub fn zeros(shape: &[usize], dtype: DataType) -> Result<Self, TensorError> {
     if dtype.size_of().is_none() {
-      return Err(TensorError::UnsupportedDataType { dtype });
+      return Err(TensorError::UnsupportedDataType(dtype));
     }
     checked_element_count(shape)?;
     // SAFETY: valid shape array; `dtype` was checked above to have a known
@@ -138,10 +139,10 @@ impl MultiArray {
   {
     let expected = checked_element_count(shape)?;
     if expected != data.len() {
-      return Err(TensorError::ShapeMismatch {
+      return Err(TensorError::ShapeMismatch(ShapeMismatch::new(
         expected,
-        actual: data.len(),
-      });
+        data.len(),
+      )));
     }
     let mut this = Self::zeros(shape, T::DATA_TYPE)?;
     this.as_slice_mut::<T>()?.copy_from_slice(data);
@@ -212,10 +213,10 @@ impl MultiArray {
   {
     self.check_dtype::<T>()?;
     if !self.is_contiguous() {
-      return Err(TensorError::NonContiguous {
-        shape: self.shape().to_vec(),
-        strides: self.strides().to_vec(),
-      });
+      return Err(TensorError::NonContiguous(NonContiguous::new(
+        self.shape().to_vec(),
+        self.strides().to_vec(),
+      )));
     }
     // SAFETY: dtype checked; contiguity checked above, so the flat range
     // `[dataPointer, dataPointer + count * size_of::<T>())` holds exactly
@@ -241,10 +242,10 @@ impl MultiArray {
   {
     self.check_dtype::<T>()?;
     if !self.is_contiguous() {
-      return Err(TensorError::NonContiguous {
-        shape: self.shape().to_vec(),
-        strides: self.strides().to_vec(),
-      });
+      return Err(TensorError::NonContiguous(NonContiguous::new(
+        self.shape().to_vec(),
+        self.strides().to_vec(),
+      )));
     }
     // SAFETY: as in `as_slice` (dtype and contiguity both checked above),
     // plus exclusivity via &mut self.
@@ -265,27 +266,25 @@ impl MultiArray {
   pub fn linear_offset(&self, indices: &[usize]) -> Result<usize, TensorError> {
     let shape = self.shape();
     if indices.len() != shape.len() {
-      return Err(TensorError::RankMismatch {
-        expected: shape.len(),
-        actual: indices.len(),
-      });
+      return Err(TensorError::RankMismatch(RankMismatch::new(
+        shape.len(),
+        indices.len(),
+      )));
     }
     let strides = self.strides();
     let mut offset = 0usize;
     for ((&index, &dim), &stride) in indices.iter().zip(shape).zip(strides) {
       if index >= dim {
-        return Err(TensorError::IndexOutOfBounds { index, len: dim });
+        return Err(TensorError::IndexOutOfBounds(IndexOutOfBounds::new(
+          index, dim,
+        )));
       }
       let term = index
         .checked_mul(stride)
-        .ok_or_else(|| TensorError::ShapeOverflow {
-          shape: shape.to_vec(),
-        })?;
+        .ok_or_else(|| TensorError::ShapeOverflow(shape.to_vec()))?;
       offset = offset
         .checked_add(term)
-        .ok_or_else(|| TensorError::ShapeOverflow {
-          shape: shape.to_vec(),
-        })?;
+        .ok_or_else(|| TensorError::ShapeOverflow(shape.to_vec()))?;
     }
     Ok(offset)
   }
@@ -328,10 +327,10 @@ impl MultiArray {
     let (last, stride) = {
       let shape = self.shape();
       if shape.len() >= 2 && shape[..shape.len() - 1].iter().any(|&dim| dim != 1) {
-        return Err(TensorError::UnsupportedShape {
-          shape: shape.to_vec(),
-          reason: ShapeRequirement::LeadingDimsUnit,
-        });
+        return Err(TensorError::UnsupportedShape(UnsupportedShape::new(
+          shape.to_vec(),
+          ShapeRequirement::LeadingDimsUnit,
+        )));
       }
       (
         shape.last().copied().unwrap_or(0),
@@ -340,18 +339,15 @@ impl MultiArray {
     };
     for &position in positions {
       if position >= last {
-        return Err(TensorError::IndexOutOfBounds {
-          index: position,
-          len: last,
-        });
+        return Err(TensorError::IndexOutOfBounds(IndexOutOfBounds::new(
+          position, last,
+        )));
       }
     }
     for &position in positions {
       let offset = position
         .checked_mul(stride)
-        .ok_or_else(|| TensorError::ShapeOverflow {
-          shape: self.shape().to_vec(),
-        })?;
+        .ok_or_else(|| TensorError::ShapeOverflow(self.shape().to_vec()))?;
       self.write_element(offset, value)?;
     }
     Ok(())
@@ -404,10 +400,10 @@ impl MultiArray {
     self.check_dtype::<T>()?;
     let count = self.count();
     if out.len() != count {
-      return Err(TensorError::ShapeMismatch {
-        expected: count,
-        actual: out.len(),
-      });
+      return Err(TensorError::ShapeMismatch(ShapeMismatch::new(
+        count,
+        out.len(),
+      )));
     }
     if self.is_contiguous() {
       // `as_slice` re-checks dtype (already confirmed above) and
@@ -441,23 +437,16 @@ impl MultiArray {
       for i in (0..leading_dims.len()).rev() {
         let index = remainder % leading_dims[i];
         remainder /= leading_dims[i];
-        let term =
-          index
-            .checked_mul(leading_strides[i])
-            .ok_or_else(|| TensorError::ShapeOverflow {
-              shape: shape.to_vec(),
-            })?;
+        let term = index
+          .checked_mul(leading_strides[i])
+          .ok_or_else(|| TensorError::ShapeOverflow(shape.to_vec()))?;
         row_start = row_start
           .checked_add(term)
-          .ok_or_else(|| TensorError::ShapeOverflow {
-            shape: shape.to_vec(),
-          })?;
+          .ok_or_else(|| TensorError::ShapeOverflow(shape.to_vec()))?;
       }
       let out_start = row
         .checked_mul(last_dim)
-        .ok_or_else(|| TensorError::ShapeOverflow {
-          shape: shape.to_vec(),
-        })?;
+        .ok_or_else(|| TensorError::ShapeOverflow(shape.to_vec()))?;
 
       if last_stride == 1 {
         // SAFETY: dtype checked above; `row_start` is a valid in-bounds
@@ -481,14 +470,10 @@ impl MultiArray {
         for last in 0..last_dim {
           let extra = last
             .checked_mul(last_stride)
-            .ok_or_else(|| TensorError::ShapeOverflow {
-              shape: shape.to_vec(),
-            })?;
+            .ok_or_else(|| TensorError::ShapeOverflow(shape.to_vec()))?;
           let offset = row_start
             .checked_add(extra)
-            .ok_or_else(|| TensorError::ShapeOverflow {
-              shape: shape.to_vec(),
-            })?;
+            .ok_or_else(|| TensorError::ShapeOverflow(shape.to_vec()))?;
           // SAFETY: dtype checked above; `offset` is a valid in-bounds
           // element offset for the same reason as the contiguous-row
           // branch, one element at a time.
@@ -528,7 +513,7 @@ impl MultiArray {
       DataType::F32 => copy_typed::<f32>(self, shape),
       DataType::F64 => copy_typed::<f64>(self, shape),
       DataType::I32 => copy_typed::<i32>(self, shape),
-      dtype @ DataType::Unknown(_) => Err(TensorError::UnsupportedDataType { dtype }),
+      dtype @ DataType::Unknown(_) => Err(TensorError::UnsupportedDataType(dtype)),
     }
   }
 
@@ -596,10 +581,10 @@ impl MultiArray {
   {
     let actual = self.data_type();
     if actual != T::DATA_TYPE {
-      return Err(TensorError::DataTypeMismatch {
-        expected: T::DATA_TYPE,
+      return Err(TensorError::DataTypeMismatch(DataTypeMismatch::new(
+        T::DATA_TYPE,
         actual,
-      });
+      )));
     }
     Ok(())
   }
@@ -637,9 +622,7 @@ impl MultiArray {
           .size_of()
           .expect("constructors validate the data type"),
       )
-      .ok_or_else(|| TensorError::ShapeOverflow {
-        shape: self.shape().to_vec(),
-      })?;
+      .ok_or_else(|| TensorError::ShapeOverflow(self.shape().to_vec()))?;
     // SAFETY: `dataPointer` is non-null and suitably aligned for
     // `data_type()`, and the allocation backing it is at least
     // `count() * size_of(data_type())` bytes — guaranteed because every
@@ -722,20 +705,20 @@ impl MultiArray {
     }
 
     if shape.is_empty() {
-      return Err(TensorError::UnsupportedShape {
-        shape: Vec::new(),
-        reason: ShapeRequirement::NonEmpty,
-      });
+      return Err(TensorError::UnsupportedShape(UnsupportedShape::new(
+        Vec::new(),
+        ShapeRequirement::NonEmpty,
+      )));
     }
     // `initWithPixelBuffer:shape:` requires the pixel width to EQUAL the
     // final shape dimension — a zero dimension would force a clamped width
     // that violates that contract (an Objective-C exception from safe
     // code), and a zero-element surface is meaningless anyway.
     if shape.contains(&0) {
-      return Err(TensorError::UnsupportedShape {
-        shape: shape.to_vec(),
-        reason: ShapeRequirement::NonZeroDims,
-      });
+      return Err(TensorError::UnsupportedShape(UnsupportedShape::new(
+        shape.to_vec(),
+        ShapeRequirement::NonZeroDims,
+      )));
     }
 
     // `initWithPixelBuffer:shape:` requires the product of every dimension
@@ -756,9 +739,7 @@ impl MultiArray {
       .and_then(|count| count.checked_mul(size_of::<f16>()))
       .is_none()
     {
-      return Err(TensorError::ShapeOverflow {
-        shape: shape.to_vec(),
-      });
+      return Err(TensorError::ShapeOverflow(shape.to_vec()));
     }
 
     // An empty IOSurface-properties dictionary as the value of
@@ -790,7 +771,7 @@ impl MultiArray {
       )
     };
     if ret != kCVReturnSuccess || pixel_buffer.is_null() {
-      return Err(TensorError::PixelBuffer { code: ret });
+      return Err(TensorError::PixelBuffer(ret));
     }
     let pixel_buffer =
       core::ptr::NonNull::new(pixel_buffer).expect("checked non-null CVPixelBuffer above");
@@ -832,12 +813,12 @@ impl MultiArray {
       };
       let lock = CVPixelBufferLockBaseAddress(&buffer, CVPixelBufferLockFlags::empty());
       if lock != kCVReturnSuccess {
-        return Err(TensorError::PixelBuffer { code: lock });
+        return Err(TensorError::PixelBuffer(lock));
       }
       let base = CVPixelBufferGetBaseAddress(&buffer);
       if base.is_null() {
         CVPixelBufferUnlockBaseAddress(&buffer, CVPixelBufferLockFlags::empty());
-        return Err(TensorError::PixelBuffer { code: lock });
+        return Err(TensorError::PixelBuffer(lock));
       }
       let data_size = CVPixelBufferGetDataSize(&buffer);
       core::ptr::write_bytes(base.cast::<u8>(), 0, data_size);

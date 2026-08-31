@@ -480,9 +480,7 @@ fn check_finite_input(window: &[f32]) -> Result<(), InferError> {
 fn take_scalar(outputs: &mut crate::Features, name: &'static str) -> Result<f32, InferError> {
   let tensor = outputs
     .take(name)
-    .ok_or_else(|| crate::PredictionError::MissingOutput {
-      name: name.to_string(),
-    })?;
+    .ok_or_else(|| crate::PredictionError::MissingOutput(name.to_string()))?;
   check_output_shape(tensor.shape(), name, &[1, 1, 1])?;
   let mut buf = [0.0f32; 1];
   tensor.copy_into::<f32>(&mut buf)?;
@@ -503,9 +501,7 @@ fn take_state(
 ) -> Result<[f32; STATE_SIZE], InferError> {
   let tensor = outputs
     .take(name)
-    .ok_or_else(|| crate::PredictionError::MissingOutput {
-      name: name.to_string(),
-    })?;
+    .ok_or_else(|| crate::PredictionError::MissingOutput(name.to_string()))?;
   check_output_shape(tensor.shape(), name, &[1, STATE_SIZE])?;
   let mut buf = [0.0f32; STATE_SIZE];
   tensor.copy_into::<f32>(&mut buf)?;

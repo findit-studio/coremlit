@@ -446,12 +446,9 @@ impl SegmentModel {
 
     let audio = MultiArray::from_slice(&[1, 1, SEG_CHUNK_SAMPLES], samples)?;
     let mut outputs = self.model.predict_with(&[(names::AUDIO, &audio)])?;
-    let segments =
-      outputs
-        .take(names::SEGMENTS)
-        .ok_or_else(|| crate::PredictionError::MissingOutput {
-          name: names::SEGMENTS.to_string(),
-        })?;
+    let segments = outputs
+      .take(names::SEGMENTS)
+      .ok_or_else(|| crate::PredictionError::MissingOutput(names::SEGMENTS.to_string()))?;
     // The construction-time contract pins the model's DECLARED shape; the
     // CoreML runtime producing a specific prediction's tensor is a
     // separate trust boundary, re-checked here on every call exactly as

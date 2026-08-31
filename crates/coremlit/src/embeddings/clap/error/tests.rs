@@ -28,9 +28,9 @@ fn output_shape_display_shows_both() {
 #[test]
 fn coremlit_errors_convert_via_from() {
   // `#[from]` lets `?` lift coremlit errors into clapkit's Error.
-  let e = Error::from(crate::PredictionError::MissingOutput {
-    name: "audio_embeds".to_string(),
-  });
+  let e = Error::from(crate::PredictionError::MissingOutput(
+    "audio_embeds".to_string(),
+  ));
   assert!(matches!(e, Error::Prediction(_)), "got {e:?}");
 }
 

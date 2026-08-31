@@ -2,19 +2,14 @@ use super::*;
 
 #[test]
 fn aligner_error_wraps_load_via_from() {
-  let inner = crate::LoadError::NotFound {
-    path: "base960h_aligner.mlmodelc".into(),
-  };
+  let inner = crate::LoadError::NotFound("base960h_aligner.mlmodelc".into());
   let e: AlignerError = inner.into();
   assert!(matches!(e, AlignerError::Load(_)));
 }
 
 #[test]
 fn aligner_error_load_displays_inner_message() {
-  let e: AlignerError = crate::LoadError::NotFound {
-    path: "/tmp/missing.mlmodelc".into(),
-  }
-  .into();
+  let e: AlignerError = crate::LoadError::NotFound("/tmp/missing.mlmodelc".into()).into();
   assert!(e.to_string().contains("/tmp/missing.mlmodelc"));
 }
 
@@ -44,9 +39,7 @@ fn aligner_error_is_equatable_and_cloneable() {
 
 #[test]
 fn align_error_wraps_prediction_via_from() {
-  let inner = crate::PredictionError::MissingOutput {
-    name: "emissions".to_string(),
-  };
+  let inner = crate::PredictionError::MissingOutput("emissions".to_string());
   let e: AlignError = inner.into();
   assert!(matches!(e, AlignError::Prediction(_)));
   assert!(e.to_string().contains("emissions"));
@@ -54,10 +47,7 @@ fn align_error_wraps_prediction_via_from() {
 
 #[test]
 fn align_error_wraps_tensor_via_from() {
-  let inner = crate::TensorError::ShapeMismatch {
-    expected: 960_000,
-    actual: 100,
-  };
+  let inner = crate::TensorError::ShapeMismatch(crate::ShapeMismatch::new(960_000, 100));
   let e: AlignError = inner.into();
   assert!(matches!(e, AlignError::Tensor(_)));
   assert!(e.to_string().contains("960000") || e.to_string().contains("960_000"));

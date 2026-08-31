@@ -531,12 +531,9 @@ impl ImageEmbedder {
       (names::POSITION_EMBEDDINGS, &position_embeddings),
       (names::ATTENTION_MASK, &attention_mask),
     ])?;
-    let feats =
-      outputs
-        .take(names::IMAGE_FEATURES)
-        .ok_or_else(|| crate::PredictionError::MissingOutput {
-          name: names::IMAGE_FEATURES.to_string(),
-        })?;
+    let feats = outputs
+      .take(names::IMAGE_FEATURES)
+      .ok_or_else(|| crate::PredictionError::MissingOutput(names::IMAGE_FEATURES.to_string()))?;
     if feats.shape() != [1, EMBEDDING_DIM] {
       return Err(Error::OutputShape {
         got: feats.shape().to_vec(),

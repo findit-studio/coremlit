@@ -2,9 +2,7 @@ use super::*;
 
 #[test]
 fn model_error_wraps_load_via_from() {
-  let inner = crate::LoadError::NotFound {
-    path: "seg.mlmodelc".into(),
-  };
+  let inner = crate::LoadError::NotFound("seg.mlmodelc".into());
   let e: ModelError = inner.into();
   assert!(matches!(e, ModelError::Load(_)));
 }
@@ -27,11 +25,7 @@ fn infer_error_wraps_prediction_and_tensor_via_from() {
   let e: InferError = crate::PredictionError::StateUnsupported.into();
   assert!(matches!(e, InferError::Prediction(_)));
 
-  let e: InferError = crate::TensorError::ShapeMismatch {
-    expected: 4,
-    actual: 2,
-  }
-  .into();
+  let e: InferError = crate::TensorError::ShapeMismatch(crate::ShapeMismatch::new(4, 2)).into();
   assert!(matches!(e, InferError::Tensor(_)));
 }
 
@@ -99,21 +93,15 @@ fn infer_error_empty_mask_displays_message() {
 
 #[test]
 fn extract_error_composes_model_arm() {
-  let model_err: ModelError = crate::LoadError::NotFound {
-    path: "seg.mlmodelc".into(),
-  }
-  .into();
+  let model_err: ModelError = crate::LoadError::NotFound("seg.mlmodelc".into()).into();
   let e: ExtractError = model_err.into();
   assert!(matches!(e, ExtractError::Model(ModelError::Load(_))));
 }
 
 #[test]
 fn extract_error_composes_infer_arm() {
-  let infer_err: InferError = crate::TensorError::ShapeMismatch {
-    expected: 4,
-    actual: 2,
-  }
-  .into();
+  let infer_err: InferError =
+    crate::TensorError::ShapeMismatch(crate::ShapeMismatch::new(4, 2)).into();
   let e: ExtractError = infer_err.into();
   assert!(matches!(e, ExtractError::Infer(InferError::Tensor(_))));
 }

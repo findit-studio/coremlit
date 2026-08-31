@@ -589,12 +589,9 @@ impl EmbedModel {
     let mut outputs = self
       .model
       .predict_with(&[(names::WAVEFORM, &waveform), (names::MASK, &mask)])?;
-    let embedding =
-      outputs
-        .take(names::EMBEDDING)
-        .ok_or_else(|| crate::PredictionError::MissingOutput {
-          name: names::EMBEDDING.to_string(),
-        })?;
+    let embedding = outputs
+      .take(names::EMBEDDING)
+      .ok_or_else(|| crate::PredictionError::MissingOutput(names::EMBEDDING.to_string()))?;
     // Construction validated the DECLARED contract; the CoreML runtime
     // producing this specific prediction's tensor is a separate trust
     // boundary, re-checked on every call — same rationale as

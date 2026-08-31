@@ -1115,12 +1115,9 @@ impl Encoder {
 
     let array = MultiArray::from_slice(&[1, ENCODER_WINDOW_SAMPLES], waveform.as_ref())?;
     let mut outputs = self.model.predict_with(&[(names::WAVEFORM, &array)])?;
-    let emissions =
-      outputs
-        .take(names::EMISSIONS)
-        .ok_or_else(|| crate::PredictionError::MissingOutput {
-          name: names::EMISSIONS.to_string(),
-        })?;
+    let emissions = outputs
+      .take(names::EMISSIONS)
+      .ok_or_else(|| crate::PredictionError::MissingOutput(names::EMISSIONS.to_string()))?;
 
     let mut data = vec![0.0f32; self.frames * crate::audio::align::vocab::VOCAB_SIZE];
     emissions.copy_into::<f32>(&mut data)?;

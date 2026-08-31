@@ -26,7 +26,7 @@
 //! (mel features, encoder output) are never read on the CPU at all and
 //! stay owned `MultiArray`s end to end.
 
-use crate::{DataType, Model, MultiArray, TensorError, f16};
+use crate::{DataType, IndexOutOfBounds, Model, MultiArray, TensorError, f16};
 
 use crate::audio::whisper::{
   backend::{AlignmentView, BackendError, InferenceBackend, ModelDims},
@@ -476,10 +476,9 @@ impl InferenceBackend for CoreMlBackend {
     // error a strided write would report, because `append_kv` below
     // indexes a raw slice.
     if position >= max_ctx {
-      return Err(BackendError::Tensor(TensorError::IndexOutOfBounds {
-        index: position,
-        len: max_ctx,
-      }));
+      return Err(BackendError::Tensor(TensorError::IndexOutOfBounds(
+        IndexOutOfBounds::new(position, max_ctx),
+      )));
     }
 
     // TextDecoder.swift:600-602.

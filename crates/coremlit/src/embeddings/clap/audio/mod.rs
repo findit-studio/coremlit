@@ -226,12 +226,9 @@ impl AudioEncoder {
     let mut outputs = self
       .model
       .predict_with(&[(names::INPUT_FEATURES, &input)])?;
-    let embeds =
-      outputs
-        .take(names::AUDIO_EMBEDS)
-        .ok_or_else(|| crate::PredictionError::MissingOutput {
-          name: names::AUDIO_EMBEDS.to_string(),
-        })?;
+    let embeds = outputs
+      .take(names::AUDIO_EMBEDS)
+      .ok_or_else(|| crate::PredictionError::MissingOutput(names::AUDIO_EMBEDS.to_string()))?;
     if embeds.shape() != [1, EMBEDDING_DIM] {
       return Err(Error::OutputShape {
         got: embeds.shape().to_vec(),

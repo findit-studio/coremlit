@@ -15,10 +15,7 @@ fn ns_error_info_captures_domain_code_message() {
 
 #[test]
 fn tensor_error_displays_structured_fields() {
-  let e = TensorError::DataTypeMismatch {
-    expected: DataType::F16,
-    actual: DataType::F32,
-  };
+  let e = TensorError::DataTypeMismatch(DataTypeMismatch::new(DataType::F16, DataType::F32));
   assert_eq!(
     e.to_string(),
     "data type mismatch: expected `float16`, got `float32`"
@@ -27,8 +24,6 @@ fn tensor_error_displays_structured_fields() {
 
 #[test]
 fn load_error_not_found_displays_path() {
-  let e = LoadError::NotFound {
-    path: "/tmp/missing.mlmodelc".into(),
-  };
+  let e = LoadError::NotFound("/tmp/missing.mlmodelc".into());
   assert!(e.to_string().contains("/tmp/missing.mlmodelc"));
 }

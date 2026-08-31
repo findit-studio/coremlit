@@ -573,12 +573,9 @@ impl Classifier {
     // `mel [1, 64, 1001]` contract.
     let input = MultiArray::from_slice(&[1, N_MELS, N_FRAMES], &features)?;
     let mut outputs = self.model.predict_with(&[(names::MEL, &input)])?;
-    let logits =
-      outputs
-        .take(names::LOGITS)
-        .ok_or_else(|| crate::PredictionError::MissingOutput {
-          name: names::LOGITS.to_string(),
-        })?;
+    let logits = outputs
+      .take(names::LOGITS)
+      .ok_or_else(|| crate::PredictionError::MissingOutput(names::LOGITS.to_string()))?;
     if logits.shape() != [1, NUM_CLASSES] {
       return Err(Error::OutputShape {
         got: logits.shape().to_vec(),

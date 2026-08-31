@@ -28,9 +28,9 @@ fn output_shape_display_shows_both() {
 #[test]
 fn coremlit_errors_convert_via_from() {
   // `#[from]` lets `?` lift coremlit errors into granite's Error.
-  let e = Error::from(crate::PredictionError::MissingOutput {
-    name: "embedding".to_string(),
-  });
+  let e = Error::from(crate::PredictionError::MissingOutput(
+    "embedding".to_string(),
+  ));
   assert!(matches!(e, Error::Prediction(_)), "got {e:?}");
 }
 

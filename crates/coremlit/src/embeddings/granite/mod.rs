@@ -558,12 +558,9 @@ impl TextEmbedder {
       (names::INPUT_IDS, &ids_tensor),
       (names::ATTENTION_MASK, &mask_tensor),
     ])?;
-    let embeds =
-      outputs
-        .take(names::EMBEDDING)
-        .ok_or_else(|| crate::PredictionError::MissingOutput {
-          name: names::EMBEDDING.to_string(),
-        })?;
+    let embeds = outputs
+      .take(names::EMBEDDING)
+      .ok_or_else(|| crate::PredictionError::MissingOutput(names::EMBEDDING.to_string()))?;
     if embeds.shape() != [1, EMBEDDING_DIM] {
       return Err(Error::OutputShape {
         got: embeds.shape().to_vec(),

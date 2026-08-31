@@ -164,9 +164,7 @@ impl Model {
   pub fn load(path: impl AsRef<Path>, units: ComputeUnits) -> Result<Self, LoadError> {
     let path = path.as_ref();
     if !path.exists() {
-      return Err(LoadError::NotFound {
-        path: path.to_path_buf(),
-      });
+      return Err(LoadError::NotFound(path.to_path_buf()));
     }
     let url = file_url(path, path.is_dir());
     // SAFETY: fresh configuration object; setComputeUnits is a setter.
@@ -328,9 +326,7 @@ impl Model {
   pub fn compile(source: impl AsRef<Path>) -> Result<PathBuf, CompileError> {
     let source = source.as_ref();
     if !source.exists() {
-      return Err(CompileError::NotFound {
-        path: source.to_path_buf(),
-      });
+      return Err(CompileError::NotFound(source.to_path_buf()));
     }
     let url = file_url(source, source.is_dir());
     // SAFETY: blocking compile; Result-checked. The sync API is deprecated

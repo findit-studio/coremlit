@@ -152,17 +152,12 @@ impl Features {
       let name_str = name.to_string();
       // SAFETY: `name` was just yielded by `provider.featureNames()`, so it
       // names a member of this same provider.
-      let value = unsafe { provider.featureValueForName(&name) }.ok_or_else(|| {
-        PredictionError::MissingOutput {
-          name: name_str.clone(),
-        }
-      })?;
+      let value = unsafe { provider.featureValueForName(&name) }
+        .ok_or_else(|| PredictionError::MissingOutput(name_str.clone()))?;
       // SAFETY: plain accessor message send on a live MLFeatureValue; `None`
       // means the feature holds a non-multi-array value, not invalid state.
-      let array =
-        unsafe { value.multiArrayValue() }.ok_or_else(|| PredictionError::NotMultiArray {
-          name: name_str.clone(),
-        })?;
+      let array = unsafe { value.multiArrayValue() }
+        .ok_or_else(|| PredictionError::NotMultiArray(name_str.clone()))?;
       let mut array = MultiArray::from_raw(array);
       let region = array.byte_range();
       if known_regions.iter().any(|&known| overlaps(known, region)) {

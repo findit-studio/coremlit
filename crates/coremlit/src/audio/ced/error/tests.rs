@@ -25,9 +25,7 @@ fn output_shape_display_shows_both() {
 #[test]
 fn coremlit_errors_convert_via_from() {
   // `#[from]` lets `?` lift coremlit errors into ced's Error.
-  let e = Error::from(crate::PredictionError::MissingOutput {
-    name: "logits".to_string(),
-  });
+  let e = Error::from(crate::PredictionError::MissingOutput("logits".to_string()));
   assert!(matches!(e, Error::Prediction(_)), "got {e:?}");
 }
 

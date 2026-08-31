@@ -610,11 +610,9 @@ impl Identifier {
     // `mel_features [1, frames, 60]` contract.
     let input = MultiArray::from_slice(&[1, frames, N_MELS], &features)?;
     let mut outputs = self.model.predict_with(&[(names::MEL_FEATURES, &input)])?;
-    let scores = outputs.take(names::LOG_PROBABILITIES).ok_or_else(|| {
-      crate::PredictionError::MissingOutput {
-        name: names::LOG_PROBABILITIES.to_owned(),
-      }
-    })?;
+    let scores = outputs
+      .take(names::LOG_PROBABILITIES)
+      .ok_or_else(|| crate::PredictionError::MissingOutput(names::LOG_PROBABILITIES.to_owned()))?;
     if scores.shape() != [1, NUM_LANGUAGES] {
       return Err(OutputShape::new(scores.shape().to_vec(), vec![1, NUM_LANGUAGES]).into());
     }

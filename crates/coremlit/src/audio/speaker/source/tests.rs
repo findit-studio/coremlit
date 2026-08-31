@@ -319,7 +319,7 @@ fn load_with_opens_the_configured_segmenter_path() {
 
   let got = FluidAudioSource::load_with("/nonexistent-speakerkit-models", Options::new(), &config);
   match got {
-    Err(crate::audio::speaker::error::ModelError::Load(crate::LoadError::NotFound { path })) => {
+    Err(crate::audio::speaker::error::ModelError::Load(crate::LoadError::NotFound(path))) => {
       assert_eq!(
         path,
         std::path::PathBuf::from("/nonexistent-byo/my_seg.mlmodelc"),
@@ -335,7 +335,7 @@ fn load_with_opens_the_configured_segmenter_path() {
   // `load_with` always echoing its first argument.
   let got = FluidAudioSource::load("/nonexistent-speakerkit-models", Options::new());
   match got {
-    Err(crate::audio::speaker::error::ModelError::Load(crate::LoadError::NotFound { path })) => {
+    Err(crate::audio::speaker::error::ModelError::Load(crate::LoadError::NotFound(path))) => {
       assert_eq!(
         path,
         std::path::PathBuf::from("/nonexistent-speakerkit-models/pyannote_segmentation.mlmodelc")
@@ -389,7 +389,7 @@ fn load_with_does_not_consult_the_source_selector_when_choosing_what_to_load() {
   // and not a refusal.
   let got = FluidAudioSource::load_with(ROOT, base.with_source(Source::Argmax), &config);
   match &got {
-    Err(crate::audio::speaker::error::ModelError::Load(crate::LoadError::NotFound { path })) => {
+    Err(crate::audio::speaker::error::ModelError::Load(crate::LoadError::NotFound(path))) => {
       assert_eq!(
         *path,
         std::path::PathBuf::from("/nonexistent-speakerkit-models/pyannote_segmentation.mlmodelc"),
@@ -831,7 +831,7 @@ fn load_with_opens_the_configured_embedder_path() {
 
   let got = FluidAudioSource::load_with(models_dir(), Options::new(), &config);
   match got {
-    Err(crate::audio::speaker::error::ModelError::Load(crate::LoadError::NotFound { path })) => {
+    Err(crate::audio::speaker::error::ModelError::Load(crate::LoadError::NotFound(path))) => {
       assert_eq!(
         path,
         std::path::PathBuf::from("/nonexistent-byo/my_embed.mlmodelc")
