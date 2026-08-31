@@ -8,7 +8,7 @@
 
 use core::{fmt, ops::Deref};
 
-use crate::embeddings::granite::error::{Error, Result};
+use crate::embeddings::granite::error::{EmbeddingDimMismatch, Error, Result};
 
 /// Dimensionality of a granite text embedding (the ModernBERT encoder projects
 /// its CLS token to 384). Pinned from the converted graph's output contract
@@ -83,22 +83,20 @@ impl Embedding {
   /// [`Error::EmbeddingNotUnitNorm`] if the norm is outside the budget.
   pub fn try_from_unit_slice(s: &[f32]) -> Result<Self> {
     if s.len() != EMBEDDING_DIM {
-      return Err(Error::EmbeddingDimMismatch {
-        expected: EMBEDDING_DIM,
-        got: s.len(),
-      });
+      return Err(Error::EmbeddingDimMismatch(EmbeddingDimMismatch::new(
+        EMBEDDING_DIM,
+        s.len(),
+      )));
     }
     for (i, &v) in s.iter().enumerate() {
       if !v.is_finite() {
-        return Err(Error::NonFiniteEmbedding { component_index: i });
+        return Err(Error::NonFiniteEmbedding(i));
       }
     }
     let norm_sq: f32 = s.iter().map(|x| x * x).sum();
     let dev = (norm_sq - 1.0).abs();
     if dev > NORM_BUDGET {
-      return Err(Error::EmbeddingNotUnitNorm {
-        norm_sq_deviation: dev,
-      });
+      return Err(Error::EmbeddingNotUnitNorm(dev));
     }
     // Within budget: rebuild through the f64 normalization path so the STORED
     // vector is unit-norm to fp32 ULP regardless of where in the budget the
@@ -120,14 +118,14 @@ impl Embedding {
   /// [`Error::EmbeddingZero`] if the input has zero magnitude.
   pub fn from_slice_normalizing(s: &[f32]) -> Result<Self> {
     if s.len() != EMBEDDING_DIM {
-      return Err(Error::EmbeddingDimMismatch {
-        expected: EMBEDDING_DIM,
-        got: s.len(),
-      });
+      return Err(Error::EmbeddingDimMismatch(EmbeddingDimMismatch::new(
+        EMBEDDING_DIM,
+        s.len(),
+      )));
     }
     for (i, &v) in s.iter().enumerate() {
       if !v.is_finite() {
-        return Err(Error::NonFiniteEmbedding { component_index: i });
+        return Err(Error::NonFiniteEmbedding(i));
       }
     }
     // f64 accumulation: for any finite f32 (|x| ≤ ~3.4e38), x² ≤ ~1.16e77 and
@@ -228,7 +226,7 @@ impl fmt::Debug for Embedding {
 ///
 /// The inward error map is lossy by design and documented only here: a dimension
 /// mismatch keeps its `got`/`expected` payload, while both
-/// [`Error::NonFiniteEmbedding`] (dropping its `component_index`) and
+/// [`Error::NonFiniteEmbedding`] (dropping its component index) and
 /// [`Error::EmbeddingZero`] collapse into [`WinditError::NonFinite`](windit::WinditError::NonFinite)
 /// — exactly windit's documented meaning, "no finite unit direction".
 impl windit::windowed::Vector for Embedding {
@@ -252,9 +250,10 @@ impl windit::windowed::Vector for Embedding {
     // non-finite lands in `from_slice_normalizing`'s finite/zero guards.
     let narrowed: [f32; EMBEDDING_DIM] = core::array::from_fn(|i| v[i] as f32);
     Embedding::from_slice_normalizing(&narrowed).map_err(|e| match e {
-      Error::EmbeddingDimMismatch { got, expected } => {
-        windit::WinditError::DimMismatch { got, expected }
-      }
+      Error::EmbeddingDimMismatch(dim) => windit::WinditError::DimMismatch {
+        got: dim.got(),
+        expected: dim.expected(),
+      },
       _ => windit::WinditError::NonFinite,
     })
   }
@@ -277,7 +276,7 @@ impl windit::windowed::Vector for Embedding {
 /// component.
 pub(crate) fn check_finite_output(values: &[f32]) -> Result<()> {
   if let Some(index) = values.iter().position(|v| !v.is_finite()) {
-    return Err(Error::NonFiniteOutput { index });
+    return Err(Error::NonFiniteOutput(index));
   }
   Ok(())
 }

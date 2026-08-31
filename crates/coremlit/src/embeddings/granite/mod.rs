@@ -71,7 +71,10 @@ mod token_index;
 mod compute_units_serde;
 
 pub use embedding::Embedding;
-pub use error::Error;
+pub use error::{
+  ArtifactTokenizerRead, ContentlessInputOverBudget, ContractMismatch, EmbeddingDimMismatch, Error,
+  InputTooLarge, OutputShape, TokenCount, TokenizerContractMismatch, WindowOverBudget,
+};
 
 /// windit's window geometry, re-exported as the one windit type in granite's
 /// public surface: the per-chunk token budget, overlap, and window cap. Carried
@@ -349,9 +352,8 @@ impl TextEmbedder {
   pub fn load(model_path: impl AsRef<Path>, options: TextEmbedderOptions) -> Result<Self> {
     let model_path = model_path.as_ref();
     let tokenizer_path = artifact_tokenizer_path(model_path);
-    let bytes = std::fs::read(&tokenizer_path).map_err(|source| Error::ArtifactTokenizerRead {
-      path: tokenizer_path.clone(),
-      source,
+    let bytes = std::fs::read(&tokenizer_path).map_err(|source| {
+      Error::ArtifactTokenizerRead(ArtifactTokenizerRead::new(tokenizer_path.clone(), source))
     })?;
     // Hash the RAW file bytes for the identity backstop in `from_parts`, from
     // the SAME read the parse sees (no second read, no TOCTOU).
@@ -361,10 +363,7 @@ impl TextEmbedder {
       model_path,
       tokenizer,
       options,
-      TokenizerProvenance::Artifact {
-        path: tokenizer_path,
-        sha256_hex,
-      },
+      TokenizerProvenance::Artifact(Artifact::new(tokenizer_path, sha256_hex)),
     )
   }
 
@@ -420,7 +419,7 @@ impl TextEmbedder {
       model_path,
       tokenizer,
       options,
-      TokenizerProvenance::Supplied { sha256_hex },
+      TokenizerProvenance::Supplied(sha256_hex),
     )
   }
 
@@ -457,36 +456,36 @@ impl TextEmbedder {
 
     let ids_expected = format!("[1, {MAX_TOKENS}] int32");
     for name in [names::INPUT_IDS, names::ATTENTION_MASK] {
-      let input = description
-        .input(name)
-        .ok_or_else(|| Error::ContractMismatch {
-          feature: name,
-          expected: ids_expected.clone(),
-          actual: "missing".to_string(),
-        })?;
+      let input = description.input(name).ok_or_else(|| {
+        Error::ContractMismatch(ContractMismatch::new(
+          name,
+          ids_expected.clone(),
+          "missing".to_string(),
+        ))
+      })?;
       if input.shape() != [1, MAX_TOKENS] || input.data_type() != Some(DataType::I32) {
-        return Err(Error::ContractMismatch {
-          feature: name,
-          expected: ids_expected.clone(),
-          actual: describe(input.shape(), input.data_type()),
-        });
+        return Err(Error::ContractMismatch(ContractMismatch::new(
+          name,
+          ids_expected.clone(),
+          describe(input.shape(), input.data_type()),
+        )));
       }
     }
 
     let output_expected = format!("[1, {EMBEDDING_DIM}] float32");
-    let output = description
-      .output(names::EMBEDDING)
-      .ok_or_else(|| Error::ContractMismatch {
-        feature: names::EMBEDDING,
-        expected: output_expected.clone(),
-        actual: "missing".to_string(),
-      })?;
+    let output = description.output(names::EMBEDDING).ok_or_else(|| {
+      Error::ContractMismatch(ContractMismatch::new(
+        names::EMBEDDING,
+        output_expected.clone(),
+        "missing".to_string(),
+      ))
+    })?;
     if output.shape() != [1, EMBEDDING_DIM] || output.data_type() != Some(DataType::F32) {
-      return Err(Error::ContractMismatch {
-        feature: names::EMBEDDING,
-        expected: output_expected,
-        actual: describe(output.shape(), output.data_type()),
-      });
+      return Err(Error::ContractMismatch(ContractMismatch::new(
+        names::EMBEDDING,
+        output_expected,
+        describe(output.shape(), output.data_type()),
+      )));
     }
 
     Ok(Self {
@@ -562,10 +561,10 @@ impl TextEmbedder {
       .take(names::EMBEDDING)
       .ok_or_else(|| crate::PredictionError::MissingOutput(names::EMBEDDING.to_string()))?;
     if embeds.shape() != [1, EMBEDDING_DIM] {
-      return Err(Error::OutputShape {
-        got: embeds.shape().to_vec(),
-        expected: vec![1, EMBEDDING_DIM],
-      });
+      return Err(Error::OutputShape(OutputShape::new(
+        embeds.shape().to_vec(),
+        vec![1, EMBEDDING_DIM],
+      )));
     }
 
     let mut row = [0.0f32; EMBEDDING_DIM];
@@ -791,21 +790,25 @@ fn validate_tokenizer_contract(tokenizer: &Tokenizer) -> Result<()> {
   ] {
     let actual = tokenizer.token_to_id(token);
     if actual != Some(expected_id) {
-      return Err(Error::TokenizerContractMismatch {
-        check,
-        expected: expected_id.to_string(),
-        actual: actual.map_or_else(|| "missing".to_string(), |id| id.to_string()),
-      });
+      return Err(Error::TokenizerContractMismatch(
+        TokenizerContractMismatch::new(
+          check,
+          expected_id.to_string(),
+          actual.map_or_else(|| "missing".to_string(), |id| id.to_string()),
+        ),
+      ));
     }
   }
 
   let vocab_size = tokenizer.get_vocab_size(true);
   if vocab_size != contract::VOCAB_SIZE {
-    return Err(Error::TokenizerContractMismatch {
-      check: "vocab size",
-      expected: contract::VOCAB_SIZE.to_string(),
-      actual: vocab_size.to_string(),
-    });
+    return Err(Error::TokenizerContractMismatch(
+      TokenizerContractMismatch::new(
+        "vocab size",
+        contract::VOCAB_SIZE.to_string(),
+        vocab_size.to_string(),
+      ),
+    ));
   }
 
   // The out-of-vocabulary gate: an id past the model's embedding table gathers
@@ -814,22 +817,26 @@ fn validate_tokenizer_contract(tokenizer: &Tokenizer) -> Result<()> {
   // entry map, one-time at construction and trivial next to the model load.
   let max_id = tokenizer.get_vocab(true).values().copied().max();
   if !matches!(max_id, Some(id) if id <= contract::MAX_TOKEN_ID) {
-    return Err(Error::TokenizerContractMismatch {
-      check: "max token id",
-      expected: format!("<= {}", contract::MAX_TOKEN_ID),
-      actual: max_id.map_or_else(|| "empty vocab".to_string(), |id| id.to_string()),
-    });
+    return Err(Error::TokenizerContractMismatch(
+      TokenizerContractMismatch::new(
+        "max token id",
+        format!("<= {}", contract::MAX_TOKEN_ID),
+        max_id.map_or_else(|| "empty vocab".to_string(), |id| id.to_string()),
+      ),
+    ));
   }
 
   let sentinel = tokenizer
     .encode(contract::SENTINEL_TEXT, true)
     .map_err(Error::Tokenize)?;
   if sentinel.get_ids() != contract::SENTINEL_IDS.as_slice() {
-    return Err(Error::TokenizerContractMismatch {
-      check: "sentinel encoding",
-      expected: format!("{:?}", contract::SENTINEL_IDS),
-      actual: format!("{:?}", sentinel.get_ids()),
-    });
+    return Err(Error::TokenizerContractMismatch(
+      TokenizerContractMismatch::new(
+        "sentinel encoding",
+        format!("{:?}", contract::SENTINEL_IDS),
+        format!("{:?}", sentinel.get_ids()),
+      ),
+    ));
   }
 
   Ok(())
@@ -845,6 +852,40 @@ fn sha256_hex(bytes: &[u8]) -> String {
     .collect()
 }
 
+/// Read from the model artifact's own [`TOKENIZER_FILE_NAME`] sidecar
+/// ([`TextEmbedder::load`] / [`TextEmbedder::from_file`]): the lowercase-hex
+/// SHA-256 of the file's RAW bytes, plus the path they came from — a wrong or
+/// truncated staged artifact must say WHICH file failed.
+///
+/// Payload of [`TokenizerProvenance::Artifact`].
+struct Artifact {
+  /// The sidecar path the bytes were read from.
+  path: std::path::PathBuf,
+  /// Lowercase-hex SHA-256 of the file's RAW bytes.
+  sha256_hex: String,
+}
+
+impl Artifact {
+  /// Construct from the sidecar path the bytes were read from and their
+  /// lowercase-hex SHA-256.
+  #[inline(always)]
+  const fn new(path: std::path::PathBuf, sha256_hex: String) -> Self {
+    Self { path, sha256_hex }
+  }
+
+  /// The sidecar path the bytes were read from.
+  #[inline(always)]
+  fn path(&self) -> &Path {
+    &self.path
+  }
+
+  /// Lowercase-hex SHA-256 of the file's RAW bytes.
+  #[inline(always)]
+  fn sha256_hex(&self) -> &str {
+    &self.sha256_hex
+  }
+}
+
 /// Where a constructor's tokenizer bytes came from — carried so the
 /// byte-identity backstop ([`validate_tokenizer_identity`]) can name the source
 /// in its diagnostic. Both variants are checked against the same pin: nothing is
@@ -854,14 +895,11 @@ enum TokenizerProvenance {
   /// ([`TextEmbedder::load`] / [`TextEmbedder::from_file`]): the lowercase-hex
   /// SHA-256 of the file's RAW bytes, plus the path they came from — a wrong or
   /// truncated staged artifact must say WHICH file failed.
-  Artifact {
-    path: std::path::PathBuf,
-    sha256_hex: String,
-  },
+  Artifact(Artifact),
   /// Caller-supplied bytes (`from_files` / `from_memory`): the lowercase-hex
   /// SHA-256 of the RAW input bytes, exactly as supplied (never a re-serialization
   /// of the parsed tokenizer).
-  Supplied { sha256_hex: String },
+  Supplied(String),
 }
 
 /// The artifact-root path [`TextEmbedder::load`] reads its tokenizer from: the
@@ -901,26 +939,28 @@ fn artifact_tokenizer_path(model_path: &Path) -> std::path::PathBuf {
 /// (the sidecar) if the digest differs from the pin.
 fn validate_tokenizer_identity(provenance: &TokenizerProvenance) -> Result<()> {
   let (check, sha256_hex, from) = match provenance {
-    TokenizerProvenance::Artifact { path, sha256_hex } => (
+    TokenizerProvenance::Artifact(artifact) => (
       "artifact tokenizer identity (sha-256)",
-      sha256_hex,
-      Some(path),
+      artifact.sha256_hex(),
+      Some(artifact.path()),
     ),
-    TokenizerProvenance::Supplied { sha256_hex } => {
-      ("tokenizer identity (sha-256)", sha256_hex, None)
+    TokenizerProvenance::Supplied(sha256_hex) => {
+      ("tokenizer identity (sha-256)", sha256_hex.as_str(), None)
     }
   };
   if sha256_hex == contract::TOKENIZER_SHA256_HEX {
     return Ok(());
   }
-  Err(Error::TokenizerContractMismatch {
-    check,
-    expected: contract::TOKENIZER_SHA256_HEX.to_string(),
-    actual: from.map_or_else(
-      || sha256_hex.clone(),
-      |path| format!("{sha256_hex} (read from {})", path.display()),
+  Err(Error::TokenizerContractMismatch(
+    TokenizerContractMismatch::new(
+      check,
+      contract::TOKENIZER_SHA256_HEX.to_string(),
+      from.map_or_else(
+        || sha256_hex.to_string(),
+        |path| format!("{sha256_hex} (read from {})", path.display()),
+      ),
     ),
-  })
+  ))
 }
 
 /// Builds the fixed `[1, `[`MAX_TOKENS`]`]` `input_ids` / `attention_mask` window
@@ -939,15 +979,12 @@ fn validate_tokenizer_identity(provenance: &TokenizerProvenance) -> Result<()> {
 /// if a token id does not fit the model's `int32` `input_ids` tensor.
 fn build_window(ids: &[u32], pad_id: i32) -> Result<([i32; MAX_TOKENS], [i32; MAX_TOKENS])> {
   if ids.len() > MAX_TOKENS {
-    return Err(Error::TokenCount {
-      got: ids.len(),
-      max: MAX_TOKENS,
-    });
+    return Err(Error::TokenCount(TokenCount::new(ids.len(), MAX_TOKENS)));
   }
   let mut input_ids = [pad_id; MAX_TOKENS];
   let mut attention_mask = [0i32; MAX_TOKENS];
   for (i, &id) in ids.iter().enumerate() {
-    input_ids[i] = i32::try_from(id).map_err(|_| Error::TokenIdRange { id })?;
+    input_ids[i] = i32::try_from(id).map_err(|_| Error::TokenIdRange(id))?;
     attention_mask[i] = 1;
   }
   Ok((input_ids, attention_mask))
@@ -971,17 +1008,13 @@ fn validate_long_input(text: &str, opts: &LongTextOptions) -> Result<()> {
   if let Some(max) = opts.max_input_bytes()
     && text.len() > max
   {
-    return Err(Error::InputTooLarge {
-      got: text.len(),
-      max,
-    });
+    return Err(Error::InputTooLarge(InputTooLarge::new(text.len(), max)));
   }
   let window = opts.window_options().window();
   if window > MAX_TOKENS {
-    return Err(Error::WindowOverBudget {
-      window,
-      max: MAX_TOKENS,
-    });
+    return Err(Error::WindowOverBudget(WindowOverBudget::new(
+      window, MAX_TOKENS,
+    )));
   }
   Ok(())
 }
@@ -1077,12 +1110,9 @@ fn chunk_long(
   if repaired.is_empty() && !text.is_empty() {
     let tokens = measure_checked(0, text.len())?;
     if tokens > MAX_TOKENS {
-      return Err(Error::ContentlessInputOverBudget {
-        start: 0,
-        end: text.len(),
-        tokens,
-        max: MAX_TOKENS,
-      });
+      return Err(Error::ContentlessInputOverBudget(
+        ContentlessInputOverBudget::new(0, text.len(), tokens, MAX_TOKENS),
+      ));
     }
     repaired.push(windit::split::Chunk::new(0, text.len()));
   }
@@ -1219,12 +1249,9 @@ fn own_chunk(
 ) -> Result<windit::split::Chunk> {
   let tokens = measure(start, end)?;
   if tokens > MAX_TOKENS {
-    return Err(Error::ContentlessInputOverBudget {
-      start,
-      end,
-      tokens,
-      max: MAX_TOKENS,
-    });
+    return Err(Error::ContentlessInputOverBudget(
+      ContentlessInputOverBudget::new(start, end, tokens, MAX_TOKENS),
+    ));
   }
   Ok(windit::split::Chunk::new(start, end))
 }
