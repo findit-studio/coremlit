@@ -35,7 +35,8 @@ struct LockTable {
   fields: Vec<(String, String)>,
 }
 
-/// [`KNOWN_DEFECTS`](../fp16_guards.rs) vendors that NO shard stages, and why.
+/// [`KNOWN_DEFECTS`](../fp16_guards.rs) / `LOAD_BEARING_NORMS` vendors that NO
+/// shard stages, and why.
 ///
 /// This is a real, named coverage gap, not a formality: three of the sweep's
 /// nine pinned defects live under these two vendors, and no `model-tests`
@@ -343,15 +344,40 @@ fn vendor_of(local_dir: &str) -> &str {
 /// The sweep lives in a different test binary, so its roster cannot be imported
 /// — but it CAN be read, which is the same thing this file already does to hold
 /// ci.yml's overlay pins against `tests/speaker/model_io.rs`.
-fn known_defect_vendors() -> BTreeSet<String> {
+fn fp16_pinned_vendors() -> BTreeSet<String> {
   let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fp16_guards.rs");
   let source = fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+  // BOTH of the sweep's registers. `KNOWN_DEFECTS` pins guards whose constant
+  // vanishes in fp16; `LOAD_BEARING_NORMS` pins artifacts where a SURVIVING
+  // epsilon is the only thing guarding a channel whose stored variance is zero.
+  // Either kind of pin is verified nowhere if no shard sweeps its vendor, so
+  // the coverage claim below has to reason about the union.
+  let vendors: BTreeSet<String> = [
+    "const KNOWN_DEFECTS: &[KnownDefect] = &[",
+    "const LOAD_BEARING_NORMS: &[LoadBearingNorm] = &[",
+  ]
+  .into_iter()
+  .flat_map(|decl| pin_vendors_in(&source, decl))
+  .collect();
+  assert!(
+    !vendors.is_empty(),
+    "no `path:` entries parsed out of tests/fp16_guards.rs's pin registers — the sweep's roster \
+     moved or this reader stopped matching it, and every coverage claim below would be vacuous"
+  );
+  vendors
+}
+
+/// The vendor prefixes of every `path: "…",` entry inside the `decl` register of
+/// `source`. Text-based like the rest of this file's readers, and it PANICS on a
+/// register it cannot find: a rename that made this silently return nothing
+/// would turn every coverage assertion below vacuous.
+fn pin_vendors_in(source: &str, decl: &str) -> BTreeSet<String> {
   let block = source
-    .split_once("const KNOWN_DEFECTS: &[KnownDefect] = &[")
-    .expect("tests/fp16_guards.rs no longer declares `const KNOWN_DEFECTS`")
+    .split_once(decl)
+    .unwrap_or_else(|| panic!("tests/fp16_guards.rs no longer declares `{decl}`"))
     .1
     .split_once("\n];")
-    .expect("tests/fp16_guards.rs's KNOWN_DEFECTS list is unterminated")
+    .unwrap_or_else(|| panic!("tests/fp16_guards.rs's `{decl}` list is unterminated"))
     .0;
   let vendors: BTreeSet<String> = block
     .lines()
@@ -359,7 +385,7 @@ fn known_defect_vendors() -> BTreeSet<String> {
     .map(|rest| {
       let path = rest
         .strip_suffix("\",")
-        .unwrap_or_else(|| panic!("KNOWN_DEFECTS path entry is not `path: \"...\",`: {rest:?}"));
+        .unwrap_or_else(|| panic!("`{decl}` path entry is not `path: \"...\",`: {rest:?}"));
       path
         .split('/')
         .next()
@@ -369,8 +395,7 @@ fn known_defect_vendors() -> BTreeSet<String> {
     .collect();
   assert!(
     !vendors.is_empty(),
-    "no KNOWN_DEFECTS `path:` entries parsed out of tests/fp16_guards.rs — the sweep's roster \
-     moved or this reader stopped matching it, and every coverage claim below would be vacuous"
+    "no `path:` entries parsed out of `{decl}` in tests/fp16_guards.rs"
   );
   vendors
 }
@@ -1124,7 +1149,7 @@ fn ci_fp16_sweep_shards_cover_every_pinned_vendor() {
   }
 
   let unstaged: BTreeMap<&str, &str> = UNSTAGED_DEFECT_VENDORS.iter().copied().collect();
-  let pinned = known_defect_vendors();
+  let pinned = fp16_pinned_vendors();
   for vendor in &pinned {
     let vendor = vendor.as_str();
     if swept.contains(vendor) {
@@ -1132,9 +1157,10 @@ fn ci_fp16_sweep_shards_cover_every_pinned_vendor() {
     }
     assert!(
       unstaged.contains_key(vendor),
-      "tests/fp16_guards.rs pins known fp16 defects under Models/{vendor}/, but NO model-tests \
-       shard sweeps that vendor — those pins are verified nowhere in CI. Stage it in a shard, or \
-       record it in UNSTAGED_DEFECT_VENDORS here with the reason it cannot be."
+      "tests/fp16_guards.rs pins fp16 guard findings under Models/{vendor}/ (KNOWN_DEFECTS or \
+       LOAD_BEARING_NORMS), but NO model-tests shard sweeps that vendor — those pins are verified \
+       nowhere in CI. Stage it in a shard, or record it in UNSTAGED_DEFECT_VENDORS here with the \
+       reason it cannot be."
     );
   }
   // ...and the escape list must not outlive its reason: a vendor recorded as
@@ -1148,7 +1174,7 @@ fn ci_fp16_sweep_shards_cover_every_pinned_vendor() {
     );
     assert!(
       pinned.contains(*vendor),
-      "UNSTAGED_DEFECT_VENDORS records Models/{vendor}/, which carries no KNOWN_DEFECTS pin in \
+      "UNSTAGED_DEFECT_VENDORS records Models/{vendor}/, which carries no fp16_guards pin in \
        tests/fp16_guards.rs any more — drop the entry"
     );
   }
