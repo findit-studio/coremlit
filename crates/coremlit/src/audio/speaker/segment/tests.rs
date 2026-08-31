@@ -114,10 +114,10 @@ fn check_input_length_accepts_exact_length() {
 fn check_input_length_rejects_short_input() {
   assert_eq!(
     check_input_length(100),
-    Err(InferError::InputLength {
-      got: 100,
-      expected: SEG_CHUNK_SAMPLES,
-    })
+    Err(InferError::InputLength(InputLength::new(
+      100,
+      SEG_CHUNK_SAMPLES
+    )))
   );
 }
 
@@ -126,10 +126,10 @@ fn check_input_length_rejects_long_input() {
   let got = SEG_CHUNK_SAMPLES + 1;
   assert_eq!(
     check_input_length(got),
-    Err(InferError::InputLength {
+    Err(InferError::InputLength(InputLength::new(
       got,
-      expected: SEG_CHUNK_SAMPLES,
-    })
+      SEG_CHUNK_SAMPLES
+    )))
   );
 }
 
@@ -147,10 +147,10 @@ fn check_output_shape_accepts_correct_shape() {
 fn check_output_shape_rejects_swapped_axes() {
   assert_eq!(
     check_output_shape(&[1, POWERSET_CLASSES, 589], 589),
-    Err(InferError::OutputShape {
-      got: vec![1, POWERSET_CLASSES, 589],
-      expected: vec![1, 589, POWERSET_CLASSES],
-    })
+    Err(InferError::OutputShape(OutputShape::new(
+      vec![1, POWERSET_CLASSES, 589],
+      vec![1, 589, POWERSET_CLASSES]
+    )))
   );
 }
 
@@ -158,10 +158,10 @@ fn check_output_shape_rejects_swapped_axes() {
 fn check_output_shape_rejects_wrong_rank() {
   assert_eq!(
     check_output_shape(&[589, POWERSET_CLASSES], 589),
-    Err(InferError::OutputShape {
-      got: vec![589, POWERSET_CLASSES],
-      expected: vec![1, 589, POWERSET_CLASSES],
-    })
+    Err(InferError::OutputShape(OutputShape::new(
+      vec![589, POWERSET_CLASSES],
+      vec![1, 589, POWERSET_CLASSES]
+    )))
   );
 }
 
@@ -169,10 +169,10 @@ fn check_output_shape_rejects_wrong_rank() {
 fn check_output_shape_rejects_wrong_frame_count() {
   assert_eq!(
     check_output_shape(&[1, 590, POWERSET_CLASSES], 589),
-    Err(InferError::OutputShape {
-      got: vec![1, 590, POWERSET_CLASSES],
-      expected: vec![1, 589, POWERSET_CLASSES],
-    })
+    Err(InferError::OutputShape(OutputShape::new(
+      vec![1, 590, POWERSET_CLASSES],
+      vec![1, 589, POWERSET_CLASSES]
+    )))
   );
 }
 
@@ -180,10 +180,10 @@ fn check_output_shape_rejects_wrong_frame_count() {
 fn check_output_shape_rejects_wrong_batch_dim() {
   assert_eq!(
     check_output_shape(&[2, 589, POWERSET_CLASSES], 589),
-    Err(InferError::OutputShape {
-      got: vec![2, 589, POWERSET_CLASSES],
-      expected: vec![1, 589, POWERSET_CLASSES],
-    })
+    Err(InferError::OutputShape(OutputShape::new(
+      vec![2, 589, POWERSET_CLASSES],
+      vec![1, 589, POWERSET_CLASSES]
+    )))
   );
 }
 
@@ -196,7 +196,7 @@ fn check_finite_accepts_all_finite() {
 fn check_finite_rejects_nan_at_reported_index() {
   assert_eq!(
     check_finite(&[0.0, f32::NAN, 2.0]),
-    Err(InferError::NonFiniteOutput { index: 1 })
+    Err(InferError::NonFiniteOutput(1))
   );
 }
 
@@ -204,7 +204,7 @@ fn check_finite_rejects_nan_at_reported_index() {
 fn check_finite_rejects_positive_infinity() {
   assert_eq!(
     check_finite(&[f32::INFINITY]),
-    Err(InferError::NonFiniteOutput { index: 0 })
+    Err(InferError::NonFiniteOutput(0))
   );
 }
 
@@ -212,7 +212,7 @@ fn check_finite_rejects_positive_infinity() {
 fn check_finite_rejects_negative_infinity() {
   assert_eq!(
     check_finite(&[0.0, 0.0, f32::NEG_INFINITY]),
-    Err(InferError::NonFiniteOutput { index: 2 })
+    Err(InferError::NonFiniteOutput(2))
   );
 }
 
@@ -220,7 +220,7 @@ fn check_finite_rejects_negative_infinity() {
 fn check_finite_reports_first_offending_index() {
   assert_eq!(
     check_finite(&[f32::NAN, f32::INFINITY]),
-    Err(InferError::NonFiniteOutput { index: 0 })
+    Err(InferError::NonFiniteOutput(0))
   );
 }
 
@@ -237,7 +237,7 @@ fn check_finite_input_accepts_all_finite() {
 fn check_finite_input_rejects_nan_at_reported_index() {
   assert_eq!(
     check_finite_input(&[0.0, f32::NAN, 2.0]),
-    Err(InferError::NonFiniteInput { index: 1 })
+    Err(InferError::NonFiniteInput(1))
   );
 }
 
@@ -245,7 +245,7 @@ fn check_finite_input_rejects_nan_at_reported_index() {
 fn check_finite_input_rejects_positive_infinity() {
   assert_eq!(
     check_finite_input(&[f32::INFINITY]),
-    Err(InferError::NonFiniteInput { index: 0 })
+    Err(InferError::NonFiniteInput(0))
   );
 }
 
@@ -253,7 +253,7 @@ fn check_finite_input_rejects_positive_infinity() {
 fn check_finite_input_rejects_negative_infinity() {
   assert_eq!(
     check_finite_input(&[0.0, 0.0, f32::NEG_INFINITY]),
-    Err(InferError::NonFiniteInput { index: 2 })
+    Err(InferError::NonFiniteInput(2))
   );
 }
 
@@ -357,10 +357,7 @@ fn from_file_rejects_wrong_contract_model() {
   let err = SegmentModel::from_file(path).expect_err("wrong contract must be rejected");
   assert!(matches!(
     err,
-    ModelError::ContractMismatch {
-      feature: "audio",
-      ..
-    }
+    ModelError::ContractMismatch(m) if m.feature() == "audio"
   ));
 }
 
@@ -373,10 +370,7 @@ fn infer_rejects_wrong_input_length() {
     .expect_err("wrong length must be rejected");
   assert_eq!(
     err,
-    InferError::InputLength {
-      got: 100,
-      expected: SEG_CHUNK_SAMPLES,
-    }
+    InferError::InputLength(InputLength::new(100, SEG_CHUNK_SAMPLES))
   );
 }
 

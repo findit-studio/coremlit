@@ -2,6 +2,50 @@
 //! spec §5). Foreign errors from `coremlit` are wrapped as typed `#[from]`
 //! variants; [`ExtractError`] composes both domain errors at the top level.
 
+/// A loaded model's input or output feature does not match the
+/// shape/dtype contract this crate was built against (see
+/// `tests/model_io.rs` for the pinned ground truth).
+///
+/// Payload of [`ModelError::ContractMismatch`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContractMismatch {
+  /// Name of the input/output feature that mismatched.
+  feature: &'static str,
+  /// The contract this crate expects, rendered for display.
+  expected: String,
+  /// What the loaded model actually declares, rendered for display.
+  actual: String,
+}
+
+impl ContractMismatch {
+  /// Construct from the mismatched feature, the expected contract, and what
+  /// the loaded model actually declares.
+  #[inline(always)]
+  pub const fn new(feature: &'static str, expected: String, actual: String) -> Self {
+    Self {
+      feature,
+      expected,
+      actual,
+    }
+  }
+
+  /// Name of the input/output feature that mismatched.
+  #[inline(always)]
+  pub const fn feature(&self) -> &'static str {
+    self.feature
+  }
+  /// The contract this crate expects, rendered for display.
+  #[inline(always)]
+  pub fn expected(&self) -> &str {
+    &self.expected
+  }
+  /// What the loaded model actually declares, rendered for display.
+  #[inline(always)]
+  pub fn actual(&self) -> &str {
+    &self.actual
+  }
+}
+
 /// Failure locating, loading, or validating a CoreML segmentation or
 /// embedding model.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -13,15 +57,82 @@ pub enum ModelError {
   /// A loaded model's input or output feature does not match the
   /// shape/dtype contract this crate was built against (see
   /// `tests/model_io.rs` for the pinned ground truth).
-  #[error("model contract mismatch on `{feature}`: expected {expected}, got {actual}")]
-  ContractMismatch {
-    /// Name of the input/output feature that mismatched.
-    feature: &'static str,
-    /// The contract this crate expects, rendered for display.
-    expected: String,
-    /// What the loaded model actually declares, rendered for display.
-    actual: String,
-  },
+  #[error(
+    "model contract mismatch on `{}`: expected {}, got {}",
+    .0.feature(),
+    .0.expected(),
+    .0.actual()
+  )]
+  ContractMismatch(ContractMismatch),
+}
+
+/// The caller's input slice did not have the model's required length.
+///
+/// Payload of [`InferError::InputLength`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InputLength {
+  /// Elements the caller provided.
+  got: usize,
+  /// Elements the model requires.
+  expected: usize,
+}
+
+impl InputLength {
+  /// Construct from the element count the caller provided and the count the
+  /// model requires.
+  #[inline(always)]
+  pub const fn new(got: usize, expected: usize) -> Self {
+    Self { got, expected }
+  }
+
+  /// Elements the caller provided.
+  #[inline(always)]
+  pub const fn got(&self) -> usize {
+    self.got
+  }
+
+  /// Elements the model requires.
+  #[inline(always)]
+  pub const fn expected(&self) -> usize {
+    self.expected
+  }
+}
+
+/// A predict-time output tensor's shape diverged from the contract
+/// validated at construction. `crate::MultiArray::copy_into` alone
+/// only validates total element count, so an axes-swapped output (e.g.
+/// `[1, classes, frames]` instead of `[1, frames, classes]`) can carry
+/// the same element count as the expected shape and would otherwise pass
+/// silently, transposing two axes instead of erroring.
+///
+/// Payload of [`InferError::OutputShape`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OutputShape {
+  /// Shape the runtime tensor actually had.
+  got: Vec<usize>,
+  /// Shape the construction-time contract declares.
+  expected: Vec<usize>,
+}
+
+impl OutputShape {
+  /// Construct from the shape the runtime tensor had and the shape the
+  /// construction-time contract declares.
+  #[inline(always)]
+  pub const fn new(got: Vec<usize>, expected: Vec<usize>) -> Self {
+    Self { got, expected }
+  }
+
+  /// Shape the runtime tensor actually had.
+  #[inline(always)]
+  pub fn got(&self) -> &[usize] {
+    &self.got
+  }
+
+  /// Shape the construction-time contract declares.
+  #[inline(always)]
+  pub fn expected(&self) -> &[usize] {
+    &self.expected
+  }
 }
 
 /// Failure running or interpreting a segmentation or embedding inference
@@ -37,32 +148,22 @@ pub enum InferError {
   Tensor(#[from] crate::TensorError),
   /// An output tensor contained a NaN or infinite value — the exact `ort`
   /// CoreML-EP failure mode this crate exists to replace (spec §6, gate 2).
-  #[error("output contains a non-finite value at index {index}")]
-  NonFiniteOutput {
-    /// Flat index of the offending element.
-    index: usize,
-  },
+  /// Carries the flat index of the offending element.
+  #[error("output contains a non-finite value at index {0}")]
+  NonFiniteOutput(usize),
   /// The caller's input slice did not have the model's required length.
-  #[error("input length mismatch: expected {expected}, got {got}")]
-  InputLength {
-    /// Elements the caller provided.
-    got: usize,
-    /// Elements the model requires.
-    expected: usize,
-  },
+  /// See [`InputLength`] for the two element counts.
+  #[error("input length mismatch: expected {}, got {}", .0.expected(), .0.got())]
+  InputLength(InputLength),
   /// A predict-time output tensor's shape diverged from the contract
   /// validated at construction. `crate::MultiArray::copy_into` alone
   /// only validates total element count, so an axes-swapped output (e.g.
   /// `[1, classes, frames]` instead of `[1, frames, classes]`) can carry
   /// the same element count as the expected shape and would otherwise pass
   /// silently, transposing two axes instead of erroring.
-  #[error("output shape mismatch: expected {expected:?}, got {got:?}")]
-  OutputShape {
-    /// Shape the runtime tensor actually had.
-    got: Vec<usize>,
-    /// Shape the construction-time contract declares.
-    expected: Vec<usize>,
-  },
+  /// See [`OutputShape`] for the two shapes.
+  #[error("output shape mismatch: expected {:?}, got {:?}", .0.expected(), .0.got())]
+  OutputShape(OutputShape),
   /// The caller's input contained a NaN or infinite value before inference
   /// ran. Complements [`Self::NonFiniteOutput`]: an unchecked NaN sample
   /// can otherwise propagate silently into a finite-looking but garbage
@@ -72,11 +173,9 @@ pub enum InferError {
   /// This variant adds the offending flat index, matching this crate's own
   /// [`Self::NonFiniteOutput`] shape: a deliberate enhancement over dia's,
   /// not a parity requirement (dia's own variant carries no index).
-  #[error("input contains a non-finite value at index {index}")]
-  NonFiniteInput {
-    /// Flat index of the offending element.
-    index: usize,
-  },
+  /// Carries the flat index of the offending element.
+  #[error("input contains a non-finite value at index {0}")]
+  NonFiniteInput(usize),
   /// The caller's input was finite in `f32` but its magnitude exceeds `f16`'s
   /// finite range (`|x| > f16::MAX`, i.e. `65504`), so narrowing it to the
   /// argmax segmenter's `.float16` `waveform` input would round it to an f16
@@ -86,14 +185,12 @@ pub enum InferError {
   /// inference; the FluidAudio and dia-coreml paths feed `f32` unchanged, so
   /// this guard is scoped to that source's `extract` (the public contract
   /// places no amplitude bound on `samples`, `source/mod.rs`).
+  /// Carries the flat index of the offending element.
   #[error(
-    "input value at index {index} is finite in f32 but overflows the model's f16 input \
+    "input value at index {0} is finite in f32 but overflows the model's f16 input \
      domain (|x| > f16::MAX)"
   )]
-  F16OverflowInput {
-    /// Flat index of the offending element.
-    index: usize,
-  },
+  F16OverflowInput(usize),
   /// A per-frame speaker-activity mask had no active (`true`) frame at
   /// all. Every WeSpeaker call backed by an all-zero mask would receive
   /// all-zero pooling weights, which divides by zero inside statistics
@@ -561,6 +658,109 @@ impl UncoveredLastChunk {
   }
 }
 
+/// The configured `step_samples` exceeds
+/// [`crate::audio::speaker::segment::SEG_CHUNK_SAMPLES`], so samples in
+/// `[window .. step)` per chunk would never be segmented or embedded.
+///
+/// Payload of [`ExtractError::StepSamplesExceedsWindow`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct StepSamplesExceedsWindow {
+  /// The rejected `step_samples`.
+  step: u32,
+  /// The chunk window length ([`crate::audio::speaker::segment::SEG_CHUNK_SAMPLES`]).
+  window: usize,
+}
+
+impl StepSamplesExceedsWindow {
+  /// Construct from the rejected `step_samples` and the chunk window length
+  /// it exceeded.
+  #[inline(always)]
+  pub const fn new(step: u32, window: usize) -> Self {
+    Self { step, window }
+  }
+
+  /// The rejected `step_samples`.
+  #[inline(always)]
+  pub const fn step(&self) -> u32 {
+    self.step
+  }
+
+  /// The chunk window length ([`crate::audio::speaker::segment::SEG_CHUNK_SAMPLES`]).
+  #[inline(always)]
+  pub const fn window(&self) -> usize {
+    self.window
+  }
+}
+
+/// The configured `step_samples` is one the selected source cannot honor
+/// because its sliding-window stride is compiled INTO the model graph.
+///
+/// Payload of [`ExtractError::UnsupportedStepSamples`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct UnsupportedStepSamples {
+  /// The rejected `step_samples`.
+  step: u32,
+  /// The stride the source's graph requires.
+  required: u32,
+}
+
+impl UnsupportedStepSamples {
+  /// Construct from the rejected `step_samples` and the stride the selected
+  /// source's graph requires.
+  #[inline(always)]
+  pub const fn new(step: u32, required: u32) -> Self {
+    Self { step, required }
+  }
+
+  /// The rejected `step_samples`.
+  #[inline(always)]
+  pub const fn step(&self) -> u32 {
+    self.step
+  }
+
+  /// The stride the source's graph requires.
+  #[inline(always)]
+  pub const fn required(&self) -> u32 {
+    self.required
+  }
+}
+
+/// The segmentation model's per-chunk frame count disagrees with the
+/// embedding model's mask frame count.
+///
+/// Payload of [`ExtractError::FrameCountMismatch`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameCountMismatch {
+  /// The segmentation model's per-chunk frame count.
+  segmenter: usize,
+  /// The embedding model's mask frame count.
+  embedder: usize,
+}
+
+impl FrameCountMismatch {
+  /// Construct from the segmentation model's per-chunk frame count and the
+  /// embedding model's mask frame count.
+  #[inline(always)]
+  pub const fn new(segmenter: usize, embedder: usize) -> Self {
+    Self {
+      segmenter,
+      embedder,
+    }
+  }
+
+  /// The segmentation model's per-chunk frame count.
+  #[inline(always)]
+  pub const fn segmenter(&self) -> usize {
+    self.segmenter
+  }
+
+  /// The embedding model's mask frame count.
+  #[inline(always)]
+  pub const fn embedder(&self) -> usize {
+    self.embedder
+  }
+}
+
 /// Top-level extraction failure, composing model-lifecycle and inference
 /// errors (spec §5) plus [`crate::audio::speaker::extract::Extractor::extract`]'s own
 /// input-validation and geometry guards.
@@ -597,13 +797,13 @@ pub enum ExtractError {
   /// the serde-bypass defense-in-depth rationale): with `step > window`,
   /// samples in `[window .. step)` per chunk are never segmented or
   /// embedded — silent data loss returning `Ok(_)` with missing speech.
-  #[error("step_samples ({step}) must not exceed SEG_CHUNK_SAMPLES ({window})")]
-  StepSamplesExceedsWindow {
-    /// The rejected `step_samples`.
-    step: u32,
-    /// The chunk window length ([`crate::audio::speaker::segment::SEG_CHUNK_SAMPLES`]).
-    window: usize,
-  },
+  /// See [`StepSamplesExceedsWindow`] for the step and the window it exceeded.
+  #[error(
+    "step_samples ({}) must not exceed SEG_CHUNK_SAMPLES ({})",
+    .0.step(),
+    .0.window()
+  )]
+  StepSamplesExceedsWindow(StepSamplesExceedsWindow),
   /// The configured `onset` is not finite in `(0.0, 1.0]`. Mirrors dia's
   /// `ShapeError::OnsetOutOfRange`
   /// (`diarization/src/offline/owned.rs:388-393`) and
@@ -611,11 +811,9 @@ pub enum ExtractError {
   /// segmentation mask `seg >= onset` degenerates — `> 1.0`/NaN makes
   /// every frame inactive (empty diarization), `<= 0.0` makes every zero
   /// cell active (corrupted masks/counts).
-  #[error("onset ({onset}) must be finite in (0.0, 1.0]")]
-  OnsetOutOfRange {
-    /// The rejected `onset`.
-    onset: f32,
-  },
+  /// Carries the rejected `onset`.
+  #[error("onset ({0}) must be finite in (0.0, 1.0]")]
+  OnsetOutOfRange(f32),
   /// The configured `step_samples` is one the selected source cannot honor
   /// because its sliding-window stride is compiled INTO the model graph.
   ///
@@ -631,16 +829,15 @@ pub enum ExtractError {
   /// `step_samples` would return an `Extraction` whose `chunks_sw.step()`
   /// did not describe its own chunk grid, corrupting every downstream time
   /// offset `diaric` reconstructs from it.
+  ///
+  /// See [`UnsupportedStepSamples`] for the step and the stride required.
   #[error(
-    "step_samples ({step}) is not supported by this source: its window stride is fixed at \
-     {required} by the model graph"
+    "step_samples ({}) is not supported by this source: its window stride is fixed at \
+     {} by the model graph",
+    .0.step(),
+    .0.required()
   )]
-  UnsupportedStepSamples {
-    /// The rejected `step_samples`.
-    step: u32,
-    /// The stride the source's graph requires.
-    required: u32,
-  },
+  UnsupportedStepSamples(UnsupportedStepSamples),
   /// The segmentation model's per-chunk frame count disagrees with the
   /// embedding model's mask frame count. This guard has NO dia analog and
   /// cannot: dia shares one `FRAMES_PER_WINDOW` const across both stages
@@ -651,15 +848,13 @@ pub enum ExtractError {
   /// [`crate::audio::speaker::embed::EmbedModel::num_mask_frames`]); a mismatch would
   /// silently repeat-pad time-misaligned masks (`embed_chunk` pads each
   /// mask to its OWN frame count), so it is rejected up front instead.
+  /// See [`FrameCountMismatch`] for the two frame counts.
   #[error(
-    "segmenter frame count ({segmenter}) does not match embedder mask frame count ({embedder})"
+    "segmenter frame count ({}) does not match embedder mask frame count ({})",
+    .0.segmenter(),
+    .0.embedder()
   )]
-  FrameCountMismatch {
-    /// The segmentation model's per-chunk frame count.
-    segmenter: usize,
-    /// The embedding model's mask frame count.
-    embedder: usize,
-  },
+  FrameCountMismatch(FrameCountMismatch),
   /// A required dimension of the
   /// [`crate::audio::speaker::extract::ExtractionParts`] handed to
   /// [`crate::audio::speaker::extract::Extraction::try_from_parts`] is zero:

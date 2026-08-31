@@ -357,7 +357,9 @@ use crate::{ComputeUnits, DataType, Features, Model, MultiArray, f16};
 
 use crate::audio::speaker::{
   embed::{EMBED_SLOTS, EMBEDDING_DIM},
-  error::{ExtractError, InferError, ModelError},
+  error::{
+    ContractMismatch, ExtractError, InferError, ModelError, OutputShape, UnsupportedStepSamples,
+  },
   extract::{EXCLUDE_OVERLAP_MIN_FRAMES, Extraction, raw_embedding_reaches_plda},
   segment::{SEG_CHUNK_SAMPLES, SEG_NUM_SLOTS},
   source::ModelSource,
@@ -1092,7 +1094,7 @@ fn fill_padded_chunk(padded: &mut [f16], samples: &[f32], start: usize) -> usize
 /// finite-looking but corrupt decode no consumed-output scan reliably catches.
 fn check_finite_input(samples: &[f32]) -> Result<(), InferError> {
   if let Some(index) = samples.iter().position(|v| !v.is_finite()) {
-    return Err(InferError::NonFiniteInput { index });
+    return Err(InferError::NonFiniteInput(index));
   }
   Ok(())
 }
@@ -1108,7 +1110,7 @@ fn check_finite_input(samples: &[f32]) -> Result<(), InferError> {
 fn check_f16_representable(samples: &[f32]) -> Result<(), InferError> {
   let max = f32::from(f16::MAX);
   if let Some(index) = samples.iter().position(|v| v.abs() > max) {
-    return Err(InferError::F16OverflowInput { index });
+    return Err(InferError::F16OverflowInput(index));
   }
   Ok(())
 }
@@ -1139,20 +1141,20 @@ fn check_feature(
     description.output(feature)
   };
   let Some(info) = info else {
-    return Err(ModelError::ContractMismatch {
+    return Err(ModelError::ContractMismatch(ContractMismatch::new(
       feature,
-      expected: describe(expected, Some(DataType::F16)),
-      actual: "absent".to_string(),
-    });
+      describe(expected, Some(DataType::F16)),
+      "absent".to_string(),
+    )));
   };
   // Every argmax I/O is F16 on EVERY variant, W32A32 included — the one
   // fact that silently corrupts everything if got wrong (module doc).
   if info.shape() != expected || info.data_type() != Some(DataType::F16) {
-    return Err(ModelError::ContractMismatch {
+    return Err(ModelError::ContractMismatch(ContractMismatch::new(
       feature,
-      expected: describe(expected, Some(DataType::F16)),
-      actual: describe(info.shape(), info.data_type()),
-    });
+      describe(expected, Some(DataType::F16)),
+      describe(info.shape(), info.data_type()),
+    )));
   }
   Ok(())
 }
@@ -1170,21 +1172,23 @@ fn read_f16_output(
   name: &'static str,
   expected: &[usize],
 ) -> Result<Vec<f32>, InferError> {
-  let array = features.get(name).ok_or(InferError::OutputShape {
-    got: Vec::new(),
-    expected: expected.to_vec(),
-  })?;
+  let array = features
+    .get(name)
+    .ok_or(InferError::OutputShape(OutputShape::new(
+      Vec::new(),
+      expected.to_vec(),
+    )))?;
   if array.shape() != expected {
-    return Err(InferError::OutputShape {
-      got: array.shape().to_vec(),
-      expected: expected.to_vec(),
-    });
+    return Err(InferError::OutputShape(OutputShape::new(
+      array.shape().to_vec(),
+      expected.to_vec(),
+    )));
   }
   let mut raw = vec![f16::ZERO; array.count()];
   array.copy_into(&mut raw)?;
   let values: Vec<f32> = raw.into_iter().map(f32::from).collect();
   if let Some(index) = values.iter().position(|v| !v.is_finite()) {
-    return Err(InferError::NonFiniteOutput { index });
+    return Err(InferError::NonFiniteOutput(index));
   }
   Ok(values)
 }
@@ -1358,16 +1362,16 @@ impl ArgmaxSource {
     // distinction). `place_embeddings` scans exactly the CONSUMED rows.
     let array = out
       .get(names::SPEAKER_EMBEDDINGS)
-      .ok_or(InferError::OutputShape {
-        got: Vec::new(),
-        expected: vec![1, ARGMAX_MASK_SLOTS, EMBEDDING_DIM],
-      })?;
+      .ok_or(InferError::OutputShape(OutputShape::new(
+        Vec::new(),
+        vec![1, ARGMAX_MASK_SLOTS, EMBEDDING_DIM],
+      )))?;
     let expected = [1, ARGMAX_MASK_SLOTS, EMBEDDING_DIM];
     if array.shape() != expected {
-      return Err(InferError::OutputShape {
-        got: array.shape().to_vec(),
-        expected: expected.to_vec(),
-      });
+      return Err(InferError::OutputShape(OutputShape::new(
+        array.shape().to_vec(),
+        expected.to_vec(),
+      )));
     }
     let mut raw = vec![f16::ZERO; array.count()];
     array.copy_into(&mut raw)?;
@@ -1494,9 +1498,7 @@ fn place_embeddings(
 
     let embedding = &embeddings[row * EMBEDDING_DIM..(row + 1) * EMBEDDING_DIM];
     if let Some(offset) = embedding.iter().position(|v| !v.is_finite()) {
-      return Err(InferError::NonFiniteOutput {
-        index: row * EMBEDDING_DIM + offset,
-      });
+      return Err(InferError::NonFiniteOutput(row * EMBEDDING_DIM + offset));
     }
 
     // dia's per-slot norm pre-check (`owned.rs:619-630`), through the ONE
@@ -1672,15 +1674,12 @@ impl ModelSource for ArgmaxSource {
     }
     let w_opts = self.options.window();
     if w_opts.step_samples() as usize != ARGMAX_WINDOW_STRIDE_SAMPLES {
-      return Err(ExtractError::UnsupportedStepSamples {
-        step: w_opts.step_samples(),
-        required: ARGMAX_WINDOW_STRIDE_SAMPLES as u32,
-      });
+      return Err(ExtractError::UnsupportedStepSamples(
+        UnsupportedStepSamples::new(w_opts.step_samples(), ARGMAX_WINDOW_STRIDE_SAMPLES as u32),
+      ));
     }
     if !crate::audio::speaker::window::check_onset(w_opts.onset()) {
-      return Err(ExtractError::OnsetOutOfRange {
-        onset: w_opts.onset(),
-      });
+      return Err(ExtractError::OnsetOutOfRange(w_opts.onset()));
     }
     // ── Every guard that reads only geometry, before any O(n) work ────
     let (num_chunks, chunks_sw, frames_sw) = checked_geometry(samples.len(), &w_opts)?;

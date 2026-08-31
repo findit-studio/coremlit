@@ -9,11 +9,11 @@ fn model_error_wraps_load_via_from() {
 
 #[test]
 fn model_error_contract_mismatch_displays_feature_and_shapes() {
-  let e = ModelError::ContractMismatch {
-    feature: "segments",
-    expected: "[1, 589, 7] f32".to_string(),
-    actual: "[1, 592, 7] f32".to_string(),
-  };
+  let e = ModelError::ContractMismatch(ContractMismatch::new(
+    "segments",
+    "[1, 589, 7] f32".to_string(),
+    "[1, 592, 7] f32".to_string(),
+  ));
   let rendered = e.to_string();
   assert!(rendered.contains("segments"));
   assert!(rendered.contains("589"));
@@ -31,7 +31,7 @@ fn infer_error_wraps_prediction_and_tensor_via_from() {
 
 #[test]
 fn infer_error_non_finite_output_displays_index() {
-  let e = InferError::NonFiniteOutput { index: 42 };
+  let e = InferError::NonFiniteOutput(42);
   assert_eq!(
     e.to_string(),
     "output contains a non-finite value at index 42"
@@ -40,10 +40,7 @@ fn infer_error_non_finite_output_displays_index() {
 
 #[test]
 fn infer_error_input_length_displays_got_and_expected() {
-  let e = InferError::InputLength {
-    got: 100,
-    expected: 160_000,
-  };
+  let e = InferError::InputLength(InputLength::new(100, 160_000));
   let rendered = e.to_string();
   assert!(rendered.contains("100"));
   assert!(rendered.contains("160000"));
@@ -54,10 +51,7 @@ fn infer_error_output_shape_displays_got_and_expected() {
   // Missing pin (T2 review-queue item): every other variant has a Display
   // test, but `OutputShape` (added in fix round 1, commit fcbce74) never
   // got one.
-  let e = InferError::OutputShape {
-    got: vec![1, 7, 589],
-    expected: vec![1, 589, 7],
-  };
+  let e = InferError::OutputShape(OutputShape::new(vec![1, 7, 589], vec![1, 589, 7]));
   let rendered = e.to_string();
   assert!(rendered.contains("[1, 7, 589]"));
   assert!(rendered.contains("[1, 589, 7]"));
@@ -65,7 +59,7 @@ fn infer_error_output_shape_displays_got_and_expected() {
 
 #[test]
 fn infer_error_non_finite_input_displays_index() {
-  let e = InferError::NonFiniteInput { index: 7 };
+  let e = InferError::NonFiniteInput(7);
   assert_eq!(
     e.to_string(),
     "input contains a non-finite value at index 7"
@@ -74,7 +68,7 @@ fn infer_error_non_finite_input_displays_index() {
 
 #[test]
 fn infer_error_f16_overflow_input_displays_index_and_honest_reason() {
-  let e = InferError::F16OverflowInput { index: 42 };
+  let e = InferError::F16OverflowInput(42);
   let rendered = e.to_string();
   assert!(rendered.contains("index 42"), "{rendered}");
   // The message must be HONEST that the value is finite in f32 (unlike
@@ -121,10 +115,7 @@ fn extract_error_zero_step_samples_displays_message() {
 
 #[test]
 fn extract_error_step_samples_exceeds_window_displays_both() {
-  let e = ExtractError::StepSamplesExceedsWindow {
-    step: 200_000,
-    window: 160_000,
-  };
+  let e = ExtractError::StepSamplesExceedsWindow(StepSamplesExceedsWindow::new(200_000, 160_000));
   let rendered = e.to_string();
   assert!(rendered.contains("200000"));
   assert!(rendered.contains("160000"));
@@ -137,10 +128,7 @@ fn extract_error_step_samples_exceeds_window_displays_both() {
 /// caller can see what it asked for AND what the source requires.
 #[test]
 fn extract_error_unsupported_step_samples_displays_both() {
-  let e = ExtractError::UnsupportedStepSamples {
-    step: 8_000,
-    required: 16_000,
-  };
+  let e = ExtractError::UnsupportedStepSamples(UnsupportedStepSamples::new(8_000, 16_000));
   let rendered = e.to_string();
   assert!(rendered.contains("8000"));
   assert!(rendered.contains("16000"));
@@ -148,7 +136,7 @@ fn extract_error_unsupported_step_samples_displays_both() {
 
 #[test]
 fn extract_error_onset_out_of_range_displays_value() {
-  let e = ExtractError::OnsetOutOfRange { onset: 1.5 };
+  let e = ExtractError::OnsetOutOfRange(1.5);
   let rendered = e.to_string();
   assert!(rendered.contains("1.5"));
   assert!(rendered.contains("(0.0, 1.0]"));
@@ -156,10 +144,7 @@ fn extract_error_onset_out_of_range_displays_value() {
 
 #[test]
 fn extract_error_frame_count_mismatch_displays_both() {
-  let e = ExtractError::FrameCountMismatch {
-    segmenter: 589,
-    embedder: 588,
-  };
+  let e = ExtractError::FrameCountMismatch(FrameCountMismatch::new(589, 588));
   let rendered = e.to_string();
   assert!(rendered.contains("589"));
   assert!(rendered.contains("588"));
@@ -424,14 +409,15 @@ fn extraction_chunk_count_too_large_displays_the_count_and_the_cap() {
 /// never struct-shaped" — counted rather than asserted per variant, so a new
 /// struct-shaped variant is a failure here rather than a review miss.
 ///
-/// The ten are the pre-existing ones: `ModelError::ContractMismatch`,
-/// `InferError`'s five (`NonFiniteOutput`, `InputLength`, `OutputShape`,
-/// `NonFiniteInput`, `F16OverflowInput`), and `ExtractError`'s four
-/// (`StepSamplesExceedsWindow`, `OnsetOutOfRange`, `UnsupportedStepSamples`,
-/// `FrameCountMismatch`). Every variant added since carries a named payload
-/// struct or a plain scalar instead.
+/// Ten variants were grandfathered in when this test was written:
+/// `ModelError::ContractMismatch`, `InferError`'s five (`NonFiniteOutput`,
+/// `InputLength`, `OutputShape`, `NonFiniteInput`, `F16OverflowInput`), and
+/// `ExtractError`'s four (`StepSamplesExceedsWindow`, `OnsetOutOfRange`,
+/// `UnsupportedStepSamples`, `FrameCountMismatch`). All ten now carry a named
+/// payload struct or a plain scalar, so the exemption is gone and the rule
+/// holds here with no exceptions.
 #[test]
-fn error_enums_have_exactly_ten_struct_shaped_variants() {
+fn error_enums_have_no_struct_shaped_variants() {
   let src = include_str!("mod.rs");
   let count = src
     .lines()
@@ -443,7 +429,7 @@ fn error_enums_have_exactly_ten_struct_shaped_variants() {
     })
     .count();
   assert_eq!(
-    count, 10,
+    count, 0,
     "struct-shaped variants in audio/speaker/error/mod.rs"
   );
 }

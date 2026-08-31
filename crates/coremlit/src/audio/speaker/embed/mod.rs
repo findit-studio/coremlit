@@ -249,7 +249,7 @@ use std::path::Path;
 
 use crate::{ComputeUnits, DataType, Model, MultiArray};
 
-use crate::audio::speaker::error::{InferError, ModelError};
+use crate::audio::speaker::error::{ContractMismatch, InferError, ModelError, OutputShape};
 
 /// Output dimensionality of the WeSpeaker embedding. Matches dia's
 /// `EMBEDDING_DIM` (`diarization/src/embed/options.rs:25`) and the
@@ -402,14 +402,13 @@ impl EmbedModel {
       "[{EMBED_SLOTS}, {}] float32",
       crate::audio::speaker::segment::SEG_CHUNK_SAMPLES
     );
-    let waveform =
-      description
-        .input(names::WAVEFORM)
-        .ok_or_else(|| ModelError::ContractMismatch {
-          feature: names::WAVEFORM,
-          expected: waveform_expected.clone(),
-          actual: "missing".to_string(),
-        })?;
+    let waveform = description.input(names::WAVEFORM).ok_or_else(|| {
+      ModelError::ContractMismatch(ContractMismatch::new(
+        names::WAVEFORM,
+        waveform_expected.clone(),
+        "missing".to_string(),
+      ))
+    })?;
     if waveform.shape()
       != [
         EMBED_SLOTS,
@@ -417,21 +416,21 @@ impl EmbedModel {
       ]
       || waveform.data_type() != Some(DataType::F32)
     {
-      return Err(ModelError::ContractMismatch {
-        feature: names::WAVEFORM,
-        expected: waveform_expected,
-        actual: describe(waveform.shape(), waveform.data_type()),
-      });
+      return Err(ModelError::ContractMismatch(ContractMismatch::new(
+        names::WAVEFORM,
+        waveform_expected,
+        describe(waveform.shape(), waveform.data_type()),
+      )));
     }
 
     let mask_expected = format!("[{EMBED_SLOTS}, >=1] float32");
-    let mask = description
-      .input(names::MASK)
-      .ok_or_else(|| ModelError::ContractMismatch {
-        feature: names::MASK,
-        expected: mask_expected.clone(),
-        actual: "missing".to_string(),
-      })?;
+    let mask = description.input(names::MASK).ok_or_else(|| {
+      ModelError::ContractMismatch(ContractMismatch::new(
+        names::MASK,
+        mask_expected.clone(),
+        "missing".to_string(),
+      ))
+    })?;
     let mask_shape = mask.shape();
     // `mask_shape[1] >= 1`: a zero-frame contract would "load fine" and
     // then make every embed call build a zero-length mask row — reject
@@ -440,31 +439,30 @@ impl EmbedModel {
     // `shape[1] >= 1` guard on `segments`.
     let mask_shape_ok = mask_shape.len() == 2 && mask_shape[0] == EMBED_SLOTS && mask_shape[1] >= 1;
     if !mask_shape_ok || mask.data_type() != Some(DataType::F32) {
-      return Err(ModelError::ContractMismatch {
-        feature: names::MASK,
-        expected: mask_expected,
-        actual: describe(mask_shape, mask.data_type()),
-      });
+      return Err(ModelError::ContractMismatch(ContractMismatch::new(
+        names::MASK,
+        mask_expected,
+        describe(mask_shape, mask.data_type()),
+      )));
     }
     let num_mask_frames = mask_shape[1];
 
     let embedding_expected = format!("[{EMBED_SLOTS}, {EMBEDDING_DIM}] float32");
-    let embedding =
-      description
-        .output(names::EMBEDDING)
-        .ok_or_else(|| ModelError::ContractMismatch {
-          feature: names::EMBEDDING,
-          expected: embedding_expected.clone(),
-          actual: "missing".to_string(),
-        })?;
+    let embedding = description.output(names::EMBEDDING).ok_or_else(|| {
+      ModelError::ContractMismatch(ContractMismatch::new(
+        names::EMBEDDING,
+        embedding_expected.clone(),
+        "missing".to_string(),
+      ))
+    })?;
     if embedding.shape() != [EMBED_SLOTS, EMBEDDING_DIM]
       || embedding.data_type() != Some(DataType::F32)
     {
-      return Err(ModelError::ContractMismatch {
-        feature: names::EMBEDDING,
-        expected: embedding_expected,
-        actual: describe(embedding.shape(), embedding.data_type()),
-      });
+      return Err(ModelError::ContractMismatch(ContractMismatch::new(
+        names::EMBEDDING,
+        embedding_expected,
+        describe(embedding.shape(), embedding.data_type()),
+      )));
     }
 
     Ok(Self {
@@ -703,7 +701,7 @@ fn check_mask_active(mask: &[bool]) -> Result<(), InferError> {
 /// item).
 fn check_finite_input(samples: &[f32]) -> Result<(), InferError> {
   if let Some(index) = samples.iter().position(|v| !v.is_finite()) {
-    return Err(InferError::NonFiniteInput { index });
+    return Err(InferError::NonFiniteInput(index));
   }
   Ok(())
 }
@@ -718,7 +716,7 @@ fn check_finite_input(samples: &[f32]) -> Result<(), InferError> {
 /// loaded model.
 fn check_finite_output(values: &[f32]) -> Result<(), InferError> {
   if let Some(index) = values.iter().position(|v| !v.is_finite()) {
-    return Err(InferError::NonFiniteOutput { index });
+    return Err(InferError::NonFiniteOutput(index));
   }
   Ok(())
 }
@@ -734,10 +732,10 @@ fn check_finite_output(values: &[f32]) -> Result<(), InferError> {
 /// silently and transpose slots and dimensions.
 fn check_output_shape(shape: &[usize]) -> Result<(), InferError> {
   if shape != [EMBED_SLOTS, EMBEDDING_DIM] {
-    return Err(InferError::OutputShape {
-      got: shape.to_vec(),
-      expected: vec![EMBED_SLOTS, EMBEDDING_DIM],
-    });
+    return Err(InferError::OutputShape(OutputShape::new(
+      shape.to_vec(),
+      vec![EMBED_SLOTS, EMBEDDING_DIM],
+    )));
   }
   Ok(())
 }

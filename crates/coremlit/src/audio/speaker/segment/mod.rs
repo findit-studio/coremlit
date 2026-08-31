@@ -215,7 +215,9 @@ use std::path::Path;
 
 use crate::{ComputeUnits, DataType, Model, MultiArray};
 
-use crate::audio::speaker::error::{InferError, ModelError};
+use crate::audio::speaker::error::{
+  ContractMismatch, InferError, InputLength, ModelError, OutputShape,
+};
 
 /// Sample count of one segmentation-model chunk (10 s at 16 kHz). Matches
 /// dia's `WINDOW_SAMPLES` (`diarization/src/segment/options.rs:18`) and the
@@ -352,29 +354,28 @@ impl SegmentModel {
     let model = Model::load(path, options.compute())?;
     let description = model.description();
 
-    let audio = description
-      .input(names::AUDIO)
-      .ok_or_else(|| ModelError::ContractMismatch {
-        feature: names::AUDIO,
-        expected: format!("[1, 1, {SEG_CHUNK_SAMPLES}] float32"),
-        actual: "missing".to_string(),
-      })?;
+    let audio = description.input(names::AUDIO).ok_or_else(|| {
+      ModelError::ContractMismatch(ContractMismatch::new(
+        names::AUDIO,
+        format!("[1, 1, {SEG_CHUNK_SAMPLES}] float32"),
+        "missing".to_string(),
+      ))
+    })?;
     if audio.shape() != [1, 1, SEG_CHUNK_SAMPLES] || audio.data_type() != Some(DataType::F32) {
-      return Err(ModelError::ContractMismatch {
-        feature: names::AUDIO,
-        expected: format!("[1, 1, {SEG_CHUNK_SAMPLES}] float32"),
-        actual: describe(audio.shape(), audio.data_type()),
-      });
+      return Err(ModelError::ContractMismatch(ContractMismatch::new(
+        names::AUDIO,
+        format!("[1, 1, {SEG_CHUNK_SAMPLES}] float32"),
+        describe(audio.shape(), audio.data_type()),
+      )));
     }
 
-    let segments =
-      description
-        .output(names::SEGMENTS)
-        .ok_or_else(|| ModelError::ContractMismatch {
-          feature: names::SEGMENTS,
-          expected: format!("[1, >=1, {POWERSET_CLASSES}] float32"),
-          actual: "missing".to_string(),
-        })?;
+    let segments = description.output(names::SEGMENTS).ok_or_else(|| {
+      ModelError::ContractMismatch(ContractMismatch::new(
+        names::SEGMENTS,
+        format!("[1, >=1, {POWERSET_CLASSES}] float32"),
+        "missing".to_string(),
+      ))
+    })?;
     let shape = segments.shape();
     // `shape[1] >= 1`: a zero-frame model would "load fine" and then make
     // every infer() return an empty Vec with no error — reject the
@@ -382,11 +383,11 @@ impl SegmentModel {
     let shape_ok =
       shape.len() == 3 && shape[0] == 1 && shape[1] >= 1 && shape[2] == POWERSET_CLASSES;
     if !shape_ok || segments.data_type() != Some(DataType::F32) {
-      return Err(ModelError::ContractMismatch {
-        feature: names::SEGMENTS,
-        expected: format!("[1, >=1, {POWERSET_CLASSES}] float32"),
-        actual: describe(shape, segments.data_type()),
-      });
+      return Err(ModelError::ContractMismatch(ContractMismatch::new(
+        names::SEGMENTS,
+        format!("[1, >=1, {POWERSET_CLASSES}] float32"),
+        describe(shape, segments.data_type()),
+      )));
     }
     let num_frames = shape[1];
 
@@ -470,10 +471,10 @@ impl SegmentModel {
 /// real loaded [`SegmentModel`], to reach the CoreML call this guards).
 fn check_input_length(got: usize) -> Result<(), InferError> {
   if got != SEG_CHUNK_SAMPLES {
-    return Err(InferError::InputLength {
+    return Err(InferError::InputLength(InputLength::new(
       got,
-      expected: SEG_CHUNK_SAMPLES,
-    });
+      SEG_CHUNK_SAMPLES,
+    )));
   }
   Ok(())
 }
@@ -492,10 +493,10 @@ fn check_output_shape(shape: &[usize], num_frames: usize) -> Result<(), InferErr
   let shape_ok =
     shape.len() == 3 && shape[0] == 1 && shape[1] == num_frames && shape[2] == POWERSET_CLASSES;
   if !shape_ok {
-    return Err(InferError::OutputShape {
-      got: shape.to_vec(),
-      expected: vec![1, num_frames, POWERSET_CLASSES],
-    });
+    return Err(InferError::OutputShape(OutputShape::new(
+      shape.to_vec(),
+      vec![1, num_frames, POWERSET_CLASSES],
+    )));
   }
   Ok(())
 }
@@ -506,7 +507,7 @@ fn check_output_shape(shape: &[usize], num_frames: usize) -> Result<(), InferErr
 /// testable without a loaded model.
 fn check_finite(logits: &[f32]) -> Result<(), InferError> {
   if let Some(index) = logits.iter().position(|v| !v.is_finite()) {
-    return Err(InferError::NonFiniteOutput { index });
+    return Err(InferError::NonFiniteOutput(index));
   }
   Ok(())
 }
@@ -520,7 +521,7 @@ fn check_finite(logits: &[f32]) -> Result<(), InferError> {
 /// the module doc's "Non-finite inputs and outputs" section.
 fn check_finite_input(samples: &[f32]) -> Result<(), InferError> {
   if let Some(index) = samples.iter().position(|v| !v.is_finite()) {
-    return Err(InferError::NonFiniteInput { index });
+    return Err(InferError::NonFiniteInput(index));
   }
   Ok(())
 }

@@ -190,7 +190,7 @@ use std::sync::OnceLock;
 use crate::audio::speaker::{
   cluster::{ClusterBackend, OnlineOptions},
   embed::{EMBED_SLOTS, EMBEDDING_DIM, EmbedModel},
-  error::ExtractError,
+  error::{ExtractError, FrameCountMismatch, StepSamplesExceedsWindow},
   segment::{SEG_CHUNK_SAMPLES, SEG_NUM_SLOTS, SegmentModel},
   source::Source,
   window::{SlidingWindow, WindowOptions},
@@ -1103,22 +1103,21 @@ impl Extractor {
       return Err(ExtractError::ZeroStepSamples);
     }
     if w.step_samples() as usize > SEG_CHUNK_SAMPLES {
-      return Err(ExtractError::StepSamplesExceedsWindow {
-        step: w.step_samples(),
-        window: SEG_CHUNK_SAMPLES,
-      });
+      return Err(ExtractError::StepSamplesExceedsWindow(
+        StepSamplesExceedsWindow::new(w.step_samples(), SEG_CHUNK_SAMPLES),
+      ));
     }
     if !crate::audio::speaker::window::check_onset(w.onset()) {
-      return Err(ExtractError::OnsetOutOfRange { onset: w.onset() });
+      return Err(ExtractError::OnsetOutOfRange(w.onset()));
     }
 
     // ── 5. Cross-model frame-count agreement (no dia analog) ──────────
     let num_frames = seg.num_frames();
     if num_frames != embed.num_mask_frames() {
-      return Err(ExtractError::FrameCountMismatch {
-        segmenter: num_frames,
-        embedder: embed.num_mask_frames(),
-      });
+      return Err(ExtractError::FrameCountMismatch(FrameCountMismatch::new(
+        num_frames,
+        embed.num_mask_frames(),
+      )));
     }
 
     // ── 6-7b. Every guard that reads only geometry ────────────────────
