@@ -194,16 +194,37 @@ fn windowed_scores_reproduce_the_single_shot_ranking() {
       THAI_INDEX,
       "{label} must reproduce the single-shot top-1"
     );
+    // The measured basis for `aggregate`'s `MAX_MASS_DEVIATION`, taken on the
+    // shipping graph rather than on hand-built rows: a folded row is a
+    // distribution to well within the tolerance the fold enforces, on whatever
+    // compute unit this runs. The model's OWN rows are not — theirs is off by
+    // as much as 7.7e-3 on `CpuOnly` — so this is a property the poolings
+    // establish, not one they inherit, and that is exactly why the tolerance
+    // can be tight.
+    let mass: f64 = row.iter().map(|v| f64::from(*v).exp()).sum();
     let delta = f64::from(row[THAI_INDEX] - truth[THAI_INDEX]).abs();
     println!(
-      "  {label:>10}  top-1 {} {:>9.5}  |Δ vs single-shot| {:.5}  top-3 {:?}",
+      "  {label:>10}  top-1 {} {:>9.5}  |Δ vs single-shot| {:.5}  mass 1{:+.2e}  top-3 {:?}",
       code(argmax(row)),
       row[argmax(row)],
       delta,
+      mass - 1.0,
       top_three(row).map(code)
+    );
+    assert!(
+      (mass - 1.0).abs() < 1e-6,
+      "{label} folded a row of mass {mass}, an order of magnitude inside the \
+       1e-5 the fold refuses beyond"
     );
     deltas.push((label, delta));
   }
+
+  // The single-shot row itself is NOT held to that: it is the graph's own
+  // fp16 output, and `identify_long` returns it verbatim on a clip that fits
+  // one window. Printed so the gap between what the model produces and what
+  // the fold guarantees stays visible.
+  let single_mass: f64 = truth.iter().map(|v| f64::from(*v).exp()).sum();
+  println!("  single-shot row mass 1{:+.2e}", single_mass - 1.0);
 
   let mean_log = deltas[0].1;
   for (label, delta) in &deltas[1..] {

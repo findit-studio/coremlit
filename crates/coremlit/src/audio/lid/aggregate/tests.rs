@@ -12,11 +12,15 @@ fn row_from_logits(logits: &[(usize, f64)]) -> LogProbabilities {
     values[index] = logit;
   }
   let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-  let log_sum_exp = max + values.iter().map(|v| (v - max).exp()).sum::<f64>().ln();
+  // The shift comes off before the log does, for the reason `renormalize`
+  // spells out: a helper that quietly stopped normalizing on a large logit
+  // would surface as the fold's postcondition failing, which reads as a
+  // production defect rather than a broken fixture.
+  let log_sum = values.iter().map(|v| (v - max).exp()).sum::<f64>().ln();
   LogProbabilities::new(
     values
       .into_iter()
-      .map(|v| (v - log_sum_exp) as f32)
+      .map(|v| ((v - max) - log_sum) as f32)
       .collect(),
   )
 }
@@ -326,7 +330,7 @@ fn the_batch_and_streaming_folds_agree_bit_for_bit() {
     let batch = aggregate_windows(pooling, &windows).expect("batch");
     let mut acc = Accumulator::new(pooling);
     for w in &windows {
-      acc.push(w.value(), w.span().len());
+      acc.push(w.value(), w.span().len()).expect("push");
     }
     let streamed = acc.finish().expect("streamed");
     assert_eq!(batch.as_slice(), streamed.as_slice(), "{pooling:?}");
@@ -431,15 +435,17 @@ fn the_linear_pool_keeps_a_finite_tail_through_exp_underflow() {
   assert_eq!(pooled.as_slice(), row.as_slice());
 }
 
-/// The survey the two findings above prompted, pinned rather than described:
-/// over the domain [`LogProbabilities`] accepts, every pooling either returns a
+/// The survey the findings prompted, pinned rather than described: over the
+/// domain [`LogProbabilities`] accepts, every pooling either returns a
 /// distribution or refuses.
 ///
 /// Windows that are `-∞` in every column are the hardest case that domain
-/// admits. Three poolings have nothing to report and say so. [`Vote`] still
-/// does: a vote is cast for the row's argmax whatever its magnitudes are — here
-/// the tie-break's column 0 — and a vote share is a distribution by
-/// construction, so it is the one pooling that cannot produce a zero-mass row.
+/// admits, and they are refused at the door for every pooling alike — a row
+/// that rules every language out is not evidence about any of them. That is one
+/// rule rather than four: it used to be that three poolings folded such a row
+/// into a zero-mass pool and said so, while [`Vote`] cast its ballot for
+/// whatever column the ranking tie-break surfaced and returned a perfectly
+/// well-formed distribution over a language nothing had chosen.
 ///
 /// [`Vote`]: ScorePooling::Vote
 #[test]
@@ -455,32 +461,46 @@ fn every_pooling_either_returns_a_distribution_or_refuses() {
         window(nothing.clone(), WINDOW, WINDOW),
       ],
     );
-    if pooling == ScorePooling::Vote {
-      let row = pooled.expect("a vote always has a winner");
-      assert_eq!(row.as_slice()[0], 0.0, "the tie-break's column, at share 1");
-      assert_eq!(row.as_slice()[1], f32::NEG_INFINITY);
-      assert!((mass(&row) - 1.0).abs() < 1e-6, "mass {}", mass(&row));
-      continue;
-    }
     assert!(
-      matches!(&pooled, Err(Error::ZeroMassAggregate(got)) if *got == pooling),
+      matches!(&pooled, Err(Error::ZeroMassWindow(0))),
       "{pooling:?}: {}",
       describe(&pooled)
     );
   }
 
-  // The single-window identity path is not an exception to the postcondition:
-  // a lone zero-mass row is refused, not handed back verbatim. Unreachable
-  // from the model, whose rows are all finite; reachable by hand, because
-  // `try_from_slice` accepts `-∞` on purpose.
+  // The single-window identity path is not an exception: a lone zero-mass row
+  // is refused, not handed back verbatim. Unreachable from the model, whose
+  // rows are log-softmax rows; reachable by hand, because `try_from_slice`
+  // accepts `-∞` on purpose.
   for pooling in all_poolings() {
     let pooled = aggregate_windows(pooling, &[window(nothing.clone(), 0, WINDOW)]);
     assert!(
-      matches!(&pooled, Err(Error::ZeroMassAggregate(got)) if *got == pooling),
+      matches!(&pooled, Err(Error::ZeroMassWindow(0))),
       "{pooling:?} identity: {}",
       describe(&pooled)
     );
   }
+
+  // What the refusal must NOT swallow: a row that is `-∞` in all but one
+  // column still has mass, so it is evidence, and a vote over rows like it is
+  // still the distribution it always was.
+  let certain_of = |index: usize| {
+    let mut values = vec![f32::NEG_INFINITY; NUM_LANGUAGES];
+    values[index] = 0.0;
+    LogProbabilities::try_from_slice(&values).expect("one zero among -inf")
+  };
+  let voted = aggregate_windows(
+    ScorePooling::Vote,
+    &[
+      window(certain_of(50), 0, WINDOW),
+      window(certain_of(3), WINDOW, WINDOW),
+    ],
+  )
+  .expect("a vote over rows that chose something");
+  assert_eq!(voted.as_slice()[50], 0.5f32.ln());
+  assert_eq!(voted.as_slice()[3], 0.5f32.ln());
+  assert_eq!(voted.as_slice()[0], f32::NEG_INFINITY);
+  assert!((mass(&voted) - 1.0).abs() < 1e-6, "mass {}", mass(&voted));
 }
 
 /// One language ruled out by one window is where the refusal must NOT reach:
@@ -550,4 +570,245 @@ fn distribution(entries: &[(usize, f64)]) -> Vec<f32> {
     values[index] = p.ln() as f32;
   }
   values
+}
+
+// ── The normalizer's own arithmetic ─────────────────────────────────────────
+
+/// A pool that lands far below zero is still normalized.
+///
+/// Two equal-weight rows, each certain of a different language among columns
+/// pinned at a huge finite negative. Both rows have mass 1, so nothing screens
+/// them out; the logarithmic pool's per-column mean lands at −5e19, where f64's
+/// ULP is 8192. Forming `max + ln(sum)` there returns `max` unchanged — the
+/// normalization constant is absorbed whole — and both leading columns come
+/// back as exactly `0.0`: two languages, each reported at probability 1, in a
+/// row whose mass is 2.
+#[test]
+fn a_pool_far_below_zero_is_still_normalized() {
+  let certain_among_giants = |index: usize| {
+    let mut values = vec![-1e20f32; NUM_LANGUAGES];
+    values[index] = 0.0;
+    LogProbabilities::try_from_slice(&values).expect("finite and non-positive")
+  };
+  let windows = vec![
+    window(certain_among_giants(0), 0, WINDOW),
+    window(certain_among_giants(1), WINDOW, WINDOW),
+  ];
+  // All four, not only the pooling that provoked it: `Max` reaches the same
+  // normalizer, and `MeanProbability` carries a shift of its own that this row
+  // drives to −1e20 in every column but two.
+  for pooling in all_poolings() {
+    let pooled = aggregate_windows(pooling, &windows);
+    let row = match &pooled {
+      Ok(row) => row,
+      Err(error) => panic!("{pooling:?} expected a distribution, got Err({error})"),
+    };
+    assert!(
+      (mass(row) - 1.0).abs() < 1e-6,
+      "{pooling:?} mass {}, columns 0 and 1 = {} / {}",
+      mass(row),
+      row.as_slice()[0],
+      row.as_slice()[1]
+    );
+    // Each of the two survivors takes half; the giants keep their own scale.
+    assert!(
+      (f64::from(row.as_slice()[0]).exp() - 0.5).abs() < 1e-6,
+      "{pooling:?} column 0 = {}",
+      row.as_slice()[0]
+    );
+    assert!(
+      (f64::from(row.as_slice()[1]).exp() - 0.5).abs() < 1e-6,
+      "{pooling:?} column 1 = {}",
+      row.as_slice()[1]
+    );
+  }
+}
+
+/// `renormalize` is written so the shift comes off before the small constant
+/// does, which is the whole of the fix above. Stated directly on the function
+/// so it cannot be lost by a change to which poolings call it.
+#[test]
+fn renormalize_does_not_lose_its_constant_against_a_huge_shift() {
+  let mut values = vec![-1e20f64; NUM_LANGUAGES];
+  values[0] = -5e19;
+  values[1] = -5e19;
+  renormalize(&mut values);
+  let total: f64 = values.iter().map(|v| v.exp()).sum();
+  assert!((total - 1.0).abs() < 1e-12, "total {total}");
+  assert!(
+    (values[0] - 0.5f64.ln()).abs() < 1e-12,
+    "column 0 = {}",
+    values[0]
+  );
+}
+
+// ── The fold's precondition: a window must be evidence ──────────────────────
+
+/// A window that rules EVERY language out is refused rather than folded.
+///
+/// It contributes to no numerator — the linear pool skips its terms, which is
+/// what keeps `(-∞) − (-∞)` unreachable — while its weight still lands in the
+/// denominator, so folding it diluted the pool: a one-hot window beside it came
+/// back at probability 0.5, in a row whose total mass was 0.5.
+#[test]
+fn a_window_with_no_probability_mass_is_refused_not_folded() {
+  let mut one_hot = vec![f32::NEG_INFINITY; NUM_LANGUAGES];
+  one_hot[0] = 0.0;
+  let says_something = LogProbabilities::try_from_slice(&one_hot).expect("row");
+  let says_nothing = LogProbabilities::try_from_slice(&vec![f32::NEG_INFINITY; NUM_LANGUAGES])
+    .expect("an all-zero-probability row is accepted");
+  let windows = vec![
+    window(says_something, 0, WINDOW),
+    window(says_nothing, WINDOW, WINDOW),
+  ];
+  let pooled = aggregate_windows(ScorePooling::MeanProbability, &windows);
+  assert!(
+    matches!(&pooled, Err(Error::ZeroMassWindow(1))),
+    "expected the SECOND window to be named, got {}",
+    describe(&pooled)
+  );
+}
+
+/// The refusal names the offending window's position, so a caller pooling forty
+/// windows learns which one it was.
+#[test]
+fn the_refusal_names_the_window_that_ruled_everything_out() {
+  let mut one_hot = vec![f32::NEG_INFINITY; NUM_LANGUAGES];
+  one_hot[7] = 0.0;
+  let says_something = LogProbabilities::try_from_slice(&one_hot).expect("row");
+  let says_nothing =
+    LogProbabilities::try_from_slice(&vec![f32::NEG_INFINITY; NUM_LANGUAGES]).expect("row");
+  for position in 0..3usize {
+    let windows: Vec<_> = (0..3usize)
+      .map(|i| {
+        let row = if i == position {
+          says_nothing.clone()
+        } else {
+          says_something.clone()
+        };
+        window(row, i * WINDOW, WINDOW)
+      })
+      .collect();
+    let pooled = aggregate_windows(ScorePooling::Max, &windows);
+    assert!(
+      matches!(&pooled, Err(Error::ZeroMassWindow(got)) if *got == position),
+      "position {position}: {}",
+      describe(&pooled)
+    );
+  }
+}
+
+/// A vote from a window that ruled every language out used to be cast for the
+/// TIE-BREAK's column: a language nothing chose taking half the clip's vote
+/// share, in a row whose mass was a perfectly respectable 1. The mass check
+/// cannot see that one — only refusing the row at the door can.
+#[test]
+fn a_vote_is_not_cast_by_a_window_that_ruled_everything_out() {
+  let mut one_hot = vec![f32::NEG_INFINITY; NUM_LANGUAGES];
+  one_hot[50] = 0.0;
+  let says_fifty = LogProbabilities::try_from_slice(&one_hot).expect("row");
+  let says_nothing =
+    LogProbabilities::try_from_slice(&vec![f32::NEG_INFINITY; NUM_LANGUAGES]).expect("row");
+  let pooled = aggregate_windows(
+    ScorePooling::Vote,
+    &[
+      window(says_fifty, 0, WINDOW),
+      window(says_nothing, WINDOW, WINDOW),
+    ],
+  );
+  assert!(
+    matches!(&pooled, Err(Error::ZeroMassWindow(1))),
+    "expected a typed refusal, got {}",
+    describe(&pooled)
+  );
+}
+
+/// `Max` reaches `renormalize` too, and a row of huge finite negatives
+/// renormalized to all-zeros gave 107 languages at probability 1 apiece. Both
+/// guards close it: the rows have no mass, so they never reach the fold.
+#[test]
+fn max_over_rows_with_no_mass_is_refused() {
+  let row = LogProbabilities::try_from_slice(&vec![-1e20f32; NUM_LANGUAGES]).expect("row");
+  let pooled = aggregate_windows(
+    ScorePooling::Max,
+    &[window(row.clone(), 0, WINDOW), window(row, WINDOW, WINDOW)],
+  );
+  assert!(
+    matches!(&pooled, Err(Error::ZeroMassWindow(0))),
+    "a row with no probability mass must not pool to one, got {}",
+    describe(&pooled)
+  );
+}
+
+// ── The fold's postcondition: a distribution comes back ─────────────────────
+
+/// The linear pool returns a distribution even from rows that only nearly are.
+///
+/// It is the one pooling whose output mass would otherwise be its inputs'.
+/// Model rows are log-softmax rows narrowed through fp16 and do not sum to 1
+/// exactly — measured 7.7e-3 short on `CpuOnly` — so without the closing
+/// renormalization this pooling alone hands that deficit to the caller.
+#[test]
+fn the_linear_pool_returns_a_distribution_from_rows_that_only_nearly_are() {
+  let short = (0.99f64 / NUM_LANGUAGES as f64).ln() as f32;
+  let deficient = LogProbabilities::try_from_slice(&vec![short; NUM_LANGUAGES]).expect("row");
+  let windows = vec![
+    window(deficient.clone(), 0, WINDOW),
+    window(deficient, WINDOW, WINDOW),
+  ];
+  let pooled = aggregate_windows(ScorePooling::MeanProbability, &windows);
+  let row = match &pooled {
+    Ok(row) => row,
+    Err(error) => panic!("expected a distribution, got Err({error})"),
+  };
+  assert!((mass(row) - 1.0).abs() < 1e-6, "mass {}", mass(row));
+}
+
+/// The postcondition is a mass CHECK, not a mass repair: it reports the row it
+/// refused, so a defect that reaches it is diagnosable rather than merely
+/// blocked.
+#[test]
+fn a_row_that_is_not_a_distribution_carries_the_mass_it_left() {
+  let error = Error::from(NotADistribution::new(ScorePooling::MeanProbability, 0.5));
+  let rendered = error.to_string();
+  assert!(rendered.contains("MeanProbability"), "{rendered}");
+  assert!(rendered.contains("0.5"), "{rendered}");
+  assert!(rendered.contains("not a distribution"), "{rendered}");
+  let Error::NotADistribution(payload) = error else {
+    panic!("wrong variant")
+  };
+  assert_eq!(payload.pooling(), ScorePooling::MeanProbability);
+  assert!((payload.mass() - 0.5).abs() < f64::EPSILON);
+}
+
+/// Every pooling's folded row sits far inside the tolerance the postcondition
+/// enforces — the measured basis for `MAX_MASS_DEVIATION`, pinned so a future
+/// change that eats into the margin shows up here rather than in a caller's
+/// refused clip.
+#[test]
+fn every_folded_row_is_normalized_to_far_inside_the_tolerance() {
+  let windows = vec![
+    window(row_from_logits(&[(94, 7.0), (3, 2.0)]), 0, WINDOW),
+    window(
+      row_from_logits(&[(3, 4.0), (94, 3.5), (61, 3.0)]),
+      WINDOW,
+      WINDOW,
+    ),
+    window(row_from_logits(&[(61, 9.0)]), 2 * WINDOW, WINDOW / 3),
+    // A near-uniform row, which is where the f32 narrowing costs the most.
+    window(
+      row_from_logits(&(0..NUM_LANGUAGES).map(|i| (i, 0.0)).collect::<Vec<_>>()),
+      3 * WINDOW,
+      WINDOW,
+    ),
+  ];
+  for pooling in all_poolings() {
+    let out = aggregate_windows(pooling, &windows).expect("aggregate");
+    let deviation = (mass(&out) - 1.0).abs();
+    assert!(
+      deviation < MAX_MASS_DEVIATION / 10.0,
+      "{pooling:?} deviation {deviation:e} is within an order of magnitude of \
+       the tolerance {MAX_MASS_DEVIATION:e}"
+    );
+  }
 }

@@ -33,15 +33,26 @@ pub type WindowLogProbabilities = windit::windowed::Windowed<LogProbabilities>;
 ///
 /// # What the invariant does and does not promise
 ///
-/// Straight off the graph the row is a log-SOFTMAX: `exp` over it sums to 1.
-/// Aggregation preserves that for every [`ScorePooling`] — the mean policies
-/// and `Vote` produce distributions by construction, and `Max` is renormalized
-/// — or it FAILS, with [`Error::ZeroMassAggregate`], on the rows whose honest
-/// pool assigns every language probability zero. What it never does is hand
-/// back a row that is not a distribution. The invariant this TYPE enforces is
-/// only the pointwise one (`<= 0`, not NaN), because that is the part a
-/// hand-built row can be held to without choosing a floating-point tolerance
-/// for "sums to 1".
+/// Straight off the graph the row is a log-SOFTMAX: `exp` over it sums to 1 —
+/// to the graph's own fp16 accuracy, which is 7.7e-3 short of it on
+/// [`ComputeUnits::CpuOnly`]. Aggregation makes that exact: `Vote` divides
+/// shares, the other three close with a renormalization, and the result is
+/// checked against 1 before it is returned. Where a fold cannot produce a
+/// distribution it FAILS — [`Error::ZeroMassAggregate`] on rows whose honest
+/// pool assigns every language probability zero — rather than hand back a row
+/// that is not one.
+///
+/// The invariant this TYPE enforces is only the pointwise one (`<= 0`, not
+/// NaN), because that is the part a hand-built row can be held to without
+/// choosing a floating-point tolerance for "sums to 1". The one thing
+/// [`aggregate_windows`] additionally requires of a row it is given is that it
+/// have SOME mass ([`Error::ZeroMassWindow`]): a row that is `-∞` in every
+/// column rules every language out, which is not evidence about any of them.
+///
+/// [`ComputeUnits::CpuOnly`]: crate::ComputeUnits::CpuOnly
+/// [`aggregate_windows`]: crate::audio::lid::aggregate_windows
+/// [`Error::ZeroMassAggregate`]: crate::audio::lid::Error::ZeroMassAggregate
+/// [`Error::ZeroMassWindow`]: crate::audio::lid::Error::ZeroMassWindow
 ///
 /// `-∞` is a legal value: it is the exact log of a zero probability, which
 /// [`ScorePooling::Vote`] produces for any language no window chose.

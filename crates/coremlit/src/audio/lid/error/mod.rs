@@ -9,9 +9,10 @@
 //! [`Error`] deliberately carries **unit and newtype variants only**. A
 //! multi-field payload lives in its own named, documented, accessor-bearing
 //! struct ([`ContractMismatch`], [`OutputShape`], [`FrameCountOutOfRange`],
-//! [`InvalidLogProbability`]) that the variant then wraps. Struct-shaped enum variants are the shape this
-//! crate is moving away from (the older doors still use them; that sweep is
-//! tracked separately), and this door adds none. The practical gain is that a
+//! [`InvalidLogProbability`], [`NotADistribution`]) that the variant then
+//! wraps. Struct-shaped enum variants are the shape this crate is moving away
+//! from (the older doors still use them; that sweep is tracked separately), and
+//! this door adds none. The practical gain is that a
 //! payload is constructible, matchable, and `Display`-able on its own —
 //! [`FrameCountOutOfRange`] in particular is the guard callers reach for most,
 //! and it answers "how much audio may I pass?" without a live error in hand.
@@ -237,6 +238,49 @@ impl FrameCountOutOfRange {
   }
 }
 
+/// Aggregation produced a row whose probabilities do not sum to 1, carrying the
+/// [`ScorePooling`] that produced it and the mass it actually left.
+///
+/// Every pooling normalizes the row it folds, so this is a defect report rather
+/// than a description of any input: it is the fold's postcondition catching an
+/// arithmetic slip in the crate. The two it was written for are recorded in
+/// `aggregate`'s tests — a normalizer that loses its constant to rounding
+/// against a huge shift (mass 2), and a mixture that counts a window in its
+/// denominator but not in its numerator (mass 0.5).
+///
+/// [`Error::ZeroMassAggregate`] is the one deviation that is NOT a defect — a
+/// logarithmic pool over windows with disjoint supports honestly leaves nothing
+/// — so it keeps its own variant and its own explanation.
+///
+/// [`ScorePooling`]: super::ScorePooling
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[error(
+  "{pooling:?} pooling produced a row whose probabilities sum to {mass}, not 1, \
+   so it is not a distribution"
+)]
+pub struct NotADistribution {
+  pooling: ScorePooling,
+  mass: f64,
+}
+
+impl NotADistribution {
+  pub(crate) const fn new(pooling: ScorePooling, mass: f64) -> Self {
+    Self { pooling, mass }
+  }
+
+  /// The pooling whose fold produced the row.
+  #[inline]
+  pub const fn pooling(&self) -> ScorePooling {
+    self.pooling
+  }
+
+  /// Total probability mass the row actually carries — `exp` summed over it.
+  #[inline]
+  pub const fn mass(&self) -> f64 {
+    self.mass
+  }
+}
+
 /// Any failure loading the language identifier, running inference, or
 /// constructing scores.
 #[derive(Debug, thiserror::Error)]
@@ -313,9 +357,9 @@ pub enum Error {
   /// Unreachable through [`Identifier::identify_long`] — a model row is
   /// all-finite, so no `-∞` enters the fold — and reachable through
   /// [`aggregate_windows`] only from hand-built rows, `-∞` being a value
-  /// [`LogProbabilities::try_from_slice`] deliberately accepts. The
-  /// single-window identity path is covered too: a lone zero-mass row is
-  /// refused rather than passed through.
+  /// [`LogProbabilities::try_from_slice`] deliberately accepts. Each of those
+  /// rows must still have carried mass of its own: a window that ruled every
+  /// language out is [`Error::ZeroMassWindow`], refused before the fold.
   ///
   /// [`Identifier::identify_long`]: super::Identifier::identify_long
   /// [`aggregate_windows`]: super::aggregate_windows
@@ -325,6 +369,41 @@ pub enum Error {
      zero, so the result is not a distribution and its ranking would be arbitrary"
   )]
   ZeroMassAggregate(ScorePooling),
+
+  /// A window offered to the fold assigns probability zero to EVERY language,
+  /// carrying its position in the pushed sequence (its index in the slice
+  /// [`aggregate_windows`] was given).
+  ///
+  /// Such a row is not evidence about which language was spoken — it is the
+  /// statement that none was — and no pooling has a meaningful answer for it.
+  /// The logarithmic pool zeroes the whole clip out; the linear pool would
+  /// count the window's duration in its denominator while its terms contribute
+  /// to no numerator, diluting every other window; and [`ScorePooling::Vote`]
+  /// would cast the window's vote for whatever column the ranking tie-break
+  /// surfaces, handing a share of the clip to a language nothing chose. It is
+  /// refused at the door instead, once, for every pooling.
+  ///
+  /// Unreachable through [`Identifier::identify_long`]: a model row is a
+  /// log-softmax, so its largest entry is at least `ln(1/107)` and its mass is
+  /// positive. Reachable through [`aggregate_windows`] from hand-built rows,
+  /// `-∞` being a value [`LogProbabilities::try_from_slice`] deliberately
+  /// accepts.
+  ///
+  /// [`Identifier::identify_long`]: super::Identifier::identify_long
+  /// [`aggregate_windows`]: super::aggregate_windows
+  /// [`ScorePooling::Vote`]: super::ScorePooling::Vote
+  /// [`LogProbabilities::try_from_slice`]: super::LogProbabilities::try_from_slice
+  #[error(
+    "window {0} assigns probability zero to every language, so it is not evidence \
+     about any of them and cannot be pooled"
+  )]
+  ZeroMassWindow(usize),
+
+  /// The fold produced a row that is not a distribution — its probabilities do
+  /// not sum to 1 — which is a defect in this crate rather than a property of
+  /// the caller's rows. See [`NotADistribution`].
+  #[error(transparent)]
+  NotADistribution(#[from] NotADistribution),
 
   /// A hand-built log-probability row was not exactly
   /// [`NUM_LANGUAGES`](super::NUM_LANGUAGES) values long, carrying the length

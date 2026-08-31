@@ -79,6 +79,8 @@ fn every_payload_variant_is_a_newtype() {
     WinditError::TooManyWindows { got: 9, max: 4 }.into(),
     Error::EmptyWindows,
     Error::ZeroMassAggregate(ScorePooling::MeanLogProbability),
+    Error::ZeroMassWindow(7),
+    NotADistribution::new(ScorePooling::MeanProbability, 0.5).into(),
     Error::LanguageCountMismatch(106),
     InvalidLogProbability::new(12, 0.5).into(),
   ];
@@ -100,6 +102,11 @@ fn every_payload_variant_is_a_newtype() {
       Error::ZeroMassAggregate(pooling) => {
         assert_eq!(pooling, ScorePooling::MeanLogProbability);
       }
+      Error::ZeroMassWindow(position) => assert_eq!(position, 7),
+      Error::NotADistribution(detail) => {
+        assert_eq!(detail.pooling(), ScorePooling::MeanProbability);
+        assert!((detail.mass() - 0.5).abs() < f64::EPSILON);
+      }
       Error::LanguageCountMismatch(got) => assert_eq!(got, 106),
       Error::InvalidLogProbability(detail) => {
         assert_eq!(detail.index(), 12);
@@ -117,6 +124,7 @@ fn index_variants_render_their_index() {
   assert!(Error::NonFiniteInput(1_234).to_string().contains("1234"));
   assert!(Error::NonFiniteOutput(56).to_string().contains("56"));
   assert!(Error::UnknownLanguageIndex(107).to_string().contains("107"));
+  assert!(Error::ZeroMassWindow(41).to_string().contains("window 41"));
 }
 
 /// The foreign errors arrive through `#[from]` and keep their own message, so

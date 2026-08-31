@@ -315,8 +315,8 @@ mod compute_units_serde;
 
 pub use aggregate::{ScorePooling, aggregate_windows};
 pub use error::{
-  ContractMismatch, Error, FrameCountOutOfRange, InvalidLogProbability, OutputShape, Result,
-  WinditError,
+  ContractMismatch, Error, FrameCountOutOfRange, InvalidLogProbability, NotADistribution,
+  OutputShape, Result, WinditError,
 };
 pub use labels::{LABELS_JSON_LEN, Language, labels_json_bytes, languages};
 pub use prediction::{LanguageScore, LogProbabilities, WindowLogProbabilities};
@@ -720,10 +720,11 @@ impl Identifier {
   /// # Errors
   /// As [`Self::log_probabilities_windows`]; [`Error::UnknownLanguageIndex`] is
   /// defensive-only. ([`Error::EmptyWindows`] is unreachable — a clip that
-  /// passes validation always plans at least one span — and so is
-  /// [`Error::ZeroMassAggregate`]: [`Self::log_probabilities`] rejects a
-  /// non-finite score, so every row this folds is all-finite and no pooling can
-  /// zero the whole clip out.)
+  /// passes validation always plans at least one span — and so are the three
+  /// aggregation refusals: [`Self::log_probabilities`] rejects a non-finite
+  /// score and a log-softmax row's largest entry is at least `ln(1/107)`, so
+  /// every row this folds has mass, no pooling can zero the whole clip out, and
+  /// every pooling normalizes what it returns.)
   ///
   /// [`NUM_LANGUAGES`]: NUM_LANGUAGES
   pub fn identify_long(
@@ -744,7 +745,7 @@ impl Identifier {
     let mut acc = aggregate::Accumulator::new(pooling);
     for span in spans {
       let row = self.log_probabilities(&samples_16k[span.start()..span.end()])?;
-      acc.push(&LogProbabilities::new(row), span.len());
+      acc.push(&LogProbabilities::new(row), span.len())?;
     }
     acc.finish()?.top_k(k)
   }
