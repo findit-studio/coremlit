@@ -13,6 +13,163 @@ pub type Result<T> = core::result::Result<T, Error>;
 /// long-audio window geometry and aggregation).
 pub use windit::WinditError;
 
+/// A loaded model's input or output feature does not match the shape/dtype
+/// contract this crate was built against (the pinned ground truth lives in
+/// `tests/clap/model_io.rs` / `tests/clap/text_model_io.rs`).
+///
+/// Payload of [`Error::ContractMismatch`].
+#[derive(Debug)]
+pub struct ContractMismatch {
+  /// Name of the input/output feature that mismatched.
+  feature: &'static str,
+  /// The contract this crate expects, rendered for display.
+  expected: String,
+  /// What the loaded model actually declares, rendered for display.
+  actual: String,
+}
+
+impl ContractMismatch {
+  /// Construct from the mismatched feature, the expected contract, and what
+  /// the loaded model actually declares.
+  #[inline(always)]
+  pub const fn new(feature: &'static str, expected: String, actual: String) -> Self {
+    Self {
+      feature,
+      expected,
+      actual,
+    }
+  }
+
+  /// Name of the input/output feature that mismatched.
+  #[inline(always)]
+  pub const fn feature(&self) -> &'static str {
+    self.feature
+  }
+
+  /// The contract this crate expects, rendered for display.
+  #[inline(always)]
+  pub fn expected(&self) -> &str {
+    &self.expected
+  }
+
+  /// What the loaded model actually declares, rendered for display.
+  #[inline(always)]
+  pub fn actual(&self) -> &str {
+    &self.actual
+  }
+}
+
+/// A predict-time output tensor's shape diverged from the contract validated
+/// at construction. [`crate::MultiArray::copy_into`] alone validates only
+/// total element count, so an axes-swapped output would otherwise pass
+/// silently — the CoreML runtime is re-checked on every call.
+///
+/// Payload of [`Error::OutputShape`].
+#[derive(Debug)]
+pub struct OutputShape {
+  /// Shape the runtime tensor actually had.
+  got: Vec<usize>,
+  /// Shape the construction-time contract declares.
+  expected: Vec<usize>,
+}
+
+impl OutputShape {
+  /// Construct from the runtime tensor's shape and the shape the
+  /// construction-time contract declares.
+  #[inline(always)]
+  pub const fn new(got: Vec<usize>, expected: Vec<usize>) -> Self {
+    Self { got, expected }
+  }
+
+  /// Shape the runtime tensor actually had.
+  #[inline(always)]
+  pub fn got(&self) -> &[usize] {
+    &self.got
+  }
+
+  /// Shape the construction-time contract declares.
+  #[inline(always)]
+  pub fn expected(&self) -> &[usize] {
+    &self.expected
+  }
+}
+
+/// [`AudioEncoder::embed_window`](crate::embeddings::clap::AudioEncoder::embed_window) received
+/// more than [`TARGET_SAMPLES`](crate::embeddings::clap::audio::TARGET_SAMPLES) samples. That
+/// method embeds exactly one fixed 480 000-sample window, so a longer clip must
+/// be hopped into windows by
+/// [`AudioEncoder::embed_windows`](crate::embeddings::clap::AudioEncoder::embed_windows) (the
+/// long-audio pipeline) rather than silently head-truncated: HF's
+/// `ClapFeatureExtractor` is configured for `rand_trunc`, so truncating a longer
+/// clip here would be both non-deterministic and unfaithful to HF, which clapkit
+/// refuses to do behind the caller's back.
+///
+/// Payload of [`Error::AudioTooLong`].
+#[derive(Debug)]
+pub struct AudioTooLong {
+  /// Number of samples the caller supplied.
+  len: usize,
+  /// The per-window limit ([`TARGET_SAMPLES`](crate::embeddings::clap::audio::TARGET_SAMPLES)).
+  max: usize,
+}
+
+// `len` names the sample count the caller SUPPLIED, against the per-window
+// bound it overran — not a collection length this payload owns, so there is
+// nothing for an `is_empty` to mean here.
+#[allow(clippy::len_without_is_empty)]
+impl AudioTooLong {
+  /// Construct from the samples the caller supplied and the per-window limit
+  /// they exceeded.
+  #[inline(always)]
+  pub const fn new(len: usize, max: usize) -> Self {
+    Self { len, max }
+  }
+
+  /// Number of samples the caller supplied.
+  #[inline(always)]
+  pub const fn len(&self) -> usize {
+    self.len
+  }
+
+  /// The per-window limit ([`TARGET_SAMPLES`](crate::embeddings::clap::audio::TARGET_SAMPLES)).
+  #[inline(always)]
+  pub const fn max(&self) -> usize {
+    self.max
+  }
+}
+
+/// An embedding slice did not have the expected dimension.
+///
+/// Payload of [`Error::EmbeddingDimMismatch`].
+#[derive(Debug)]
+pub struct EmbeddingDimMismatch {
+  /// The required dimension ([`crate::embeddings::clap::embedding::EMBEDDING_DIM`]).
+  expected: usize,
+  /// The dimension the caller supplied.
+  got: usize,
+}
+
+impl EmbeddingDimMismatch {
+  /// Construct from the required dimension and the dimension the caller
+  /// supplied.
+  #[inline(always)]
+  pub const fn new(expected: usize, got: usize) -> Self {
+    Self { expected, got }
+  }
+
+  /// The required dimension ([`crate::embeddings::clap::embedding::EMBEDDING_DIM`]).
+  #[inline(always)]
+  pub const fn expected(&self) -> usize {
+    self.expected
+  }
+
+  /// The dimension the caller supplied.
+  #[inline(always)]
+  pub const fn got(&self) -> usize {
+    self.got
+  }
+}
+
 /// Any failure loading a CLAP encoder, running inference, tokenizing text, or
 /// constructing an [`crate::embeddings::clap::Embedding`].
 #[derive(Debug, thiserror::Error)]
@@ -33,43 +190,34 @@ pub enum Error {
   /// A loaded model's input or output feature does not match the shape/dtype
   /// contract this crate was built against (the pinned ground truth lives in
   /// `tests/clap/model_io.rs` / `tests/clap/text_model_io.rs`).
-  #[error("model contract mismatch on `{feature}`: expected {expected}, got {actual}")]
-  ContractMismatch {
-    /// Name of the input/output feature that mismatched.
-    feature: &'static str,
-    /// The contract this crate expects, rendered for display.
-    expected: String,
-    /// What the loaded model actually declares, rendered for display.
-    actual: String,
-  },
+  #[error(
+    "model contract mismatch on `{}`: expected {}, got {}",
+    .0.feature(),
+    .0.expected(),
+    .0.actual()
+  )]
+  ContractMismatch(ContractMismatch),
 
   /// A predict-time output tensor's shape diverged from the contract validated
   /// at construction. [`crate::MultiArray::copy_into`] alone validates only
   /// total element count, so an axes-swapped output would otherwise pass
   /// silently — the CoreML runtime is re-checked on every call.
-  #[error("output shape mismatch: expected {expected:?}, got {got:?}")]
-  OutputShape {
-    /// Shape the runtime tensor actually had.
-    got: Vec<usize>,
-    /// Shape the construction-time contract declares.
-    expected: Vec<usize>,
-  },
+  #[error("output shape mismatch: expected {:?}, got {:?}", .0.expected(), .0.got())]
+  OutputShape(OutputShape),
 
   /// The caller's audio input contained a NaN or infinite value before
   /// inference ran. An unchecked non-finite sample would otherwise propagate
   /// through the mel front-end into a finite-looking but garbage embedding.
-  #[error("audio input contains a non-finite value at index {index}")]
-  NonFiniteInput {
-    /// Flat index of the offending sample.
-    index: usize,
-  },
+  ///
+  /// Carries the flat index of the offending sample.
+  #[error("audio input contains a non-finite value at index {0}")]
+  NonFiniteInput(usize),
 
   /// A model output component was NaN or infinite.
-  #[error("model output contains a non-finite value at index {index}")]
-  NonFiniteOutput {
-    /// Flat index of the offending element.
-    index: usize,
-  },
+  ///
+  /// Carries the flat index of the offending element.
+  #[error("model output contains a non-finite value at index {0}")]
+  NonFiniteOutput(usize),
 
   /// The caller passed an empty audio slice; there is nothing to embed.
   #[error("audio input is empty")]
@@ -85,35 +233,26 @@ pub enum Error {
   /// clip here would be both non-deterministic and unfaithful to HF, which clapkit
   /// refuses to do behind the caller's back.
   #[error(
-    "audio window has {len} samples, over the {max}-sample per-window limit; use \
-     `AudioEncoder::embed_windows` for long audio"
+    "audio window has {} samples, over the {}-sample per-window limit; use \
+     `AudioEncoder::embed_windows` for long audio",
+    .0.len(),
+    .0.max()
   )]
-  AudioTooLong {
-    /// Number of samples the caller supplied.
-    len: usize,
-    /// The per-window limit ([`TARGET_SAMPLES`](crate::embeddings::clap::audio::TARGET_SAMPLES)).
-    max: usize,
-  },
+  AudioTooLong(AudioTooLong),
 
   /// The caller passed an empty text string; there is nothing to embed.
   #[error("text input is empty")]
   EmptyText,
 
   /// An embedding slice did not have the expected dimension.
-  #[error("embedding dimension mismatch: expected {expected}, got {got}")]
-  EmbeddingDimMismatch {
-    /// The required dimension ([`crate::embeddings::clap::embedding::EMBEDDING_DIM`]).
-    expected: usize,
-    /// The dimension the caller supplied.
-    got: usize,
-  },
+  #[error("embedding dimension mismatch: expected {}, got {}", .0.expected(), .0.got())]
+  EmbeddingDimMismatch(EmbeddingDimMismatch),
 
   /// An embedding component was NaN or infinite.
-  #[error("embedding contains a non-finite value at component {component_index}")]
-  NonFiniteEmbedding {
-    /// Index of the offending component.
-    component_index: usize,
-  },
+  ///
+  /// Carries the index of the offending component.
+  #[error("embedding contains a non-finite value at component {0}")]
+  NonFiniteEmbedding(usize),
 
   /// An embedding to be normalized had zero magnitude (undefined direction).
   #[error("embedding has zero magnitude and cannot be normalized")]
@@ -121,11 +260,11 @@ pub enum Error {
 
   /// A trusted-path embedding was not unit-norm within the crate's norm budget
   /// (`crate::embeddings::clap::embedding::NORM_BUDGET`).
-  #[error("embedding is not unit-norm: |norm² − 1| = {norm_sq_deviation}")]
-  EmbeddingNotUnitNorm {
-    /// `(norm² − 1).abs()`, the amount by which the invariant was violated.
-    norm_sq_deviation: f32,
-  },
+  ///
+  /// Carries `(norm² − 1).abs()`, the amount by which the invariant was
+  /// violated.
+  #[error("embedding is not unit-norm: |norm² − 1| = {0}")]
+  EmbeddingNotUnitNorm(f32),
 
   /// The tokenizer failed to load from its JSON definition.
   #[error("failed to load tokenizer: {0}")]

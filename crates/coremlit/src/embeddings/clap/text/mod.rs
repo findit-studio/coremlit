@@ -8,7 +8,7 @@ use tokenizers::{Tokenizer, TruncationDirection, TruncationParams, TruncationStr
 
 use crate::embeddings::clap::{
   embedding::{EMBEDDING_DIM, Embedding, check_finite_output},
-  error::{Error, Result},
+  error::{ContractMismatch, Error, OutputShape, Result},
 };
 
 /// Declared feature names on `clap_text.mlmodelc` (pinned by
@@ -192,36 +192,36 @@ impl TextEncoder {
 
     let ids_expected = format!("[1, {TEXT_MAX_TOKENS}] int32");
     for name in [names::INPUT_IDS, names::ATTENTION_MASK] {
-      let input = description
-        .input(name)
-        .ok_or_else(|| Error::ContractMismatch {
-          feature: name,
-          expected: ids_expected.clone(),
-          actual: "missing".to_string(),
-        })?;
+      let input = description.input(name).ok_or_else(|| {
+        Error::ContractMismatch(ContractMismatch::new(
+          name,
+          ids_expected.clone(),
+          "missing".to_string(),
+        ))
+      })?;
       if input.shape() != [1, TEXT_MAX_TOKENS] || input.data_type() != Some(DataType::I32) {
-        return Err(Error::ContractMismatch {
-          feature: name,
-          expected: ids_expected.clone(),
-          actual: describe(input.shape(), input.data_type()),
-        });
+        return Err(Error::ContractMismatch(ContractMismatch::new(
+          name,
+          ids_expected.clone(),
+          describe(input.shape(), input.data_type()),
+        )));
       }
     }
 
     let output_expected = format!("[1, {EMBEDDING_DIM}] float32");
-    let output = description
-      .output(names::TEXT_EMBEDS)
-      .ok_or_else(|| Error::ContractMismatch {
-        feature: names::TEXT_EMBEDS,
-        expected: output_expected.clone(),
-        actual: "missing".to_string(),
-      })?;
+    let output = description.output(names::TEXT_EMBEDS).ok_or_else(|| {
+      Error::ContractMismatch(ContractMismatch::new(
+        names::TEXT_EMBEDS,
+        output_expected.clone(),
+        "missing".to_string(),
+      ))
+    })?;
     if output.shape() != [1, EMBEDDING_DIM] || output.data_type() != Some(DataType::F32) {
-      return Err(Error::ContractMismatch {
-        feature: names::TEXT_EMBEDS,
-        expected: output_expected,
-        actual: describe(output.shape(), output.data_type()),
-      });
+      return Err(Error::ContractMismatch(ContractMismatch::new(
+        names::TEXT_EMBEDS,
+        output_expected,
+        describe(output.shape(), output.data_type()),
+      )));
     }
 
     Ok(Self {
@@ -282,10 +282,10 @@ impl TextEncoder {
       .take(names::TEXT_EMBEDS)
       .ok_or_else(|| crate::PredictionError::MissingOutput(names::TEXT_EMBEDS.to_string()))?;
     if embeds.shape() != [1, EMBEDDING_DIM] {
-      return Err(Error::OutputShape {
-        got: embeds.shape().to_vec(),
-        expected: vec![1, EMBEDDING_DIM],
-      });
+      return Err(Error::OutputShape(OutputShape::new(
+        embeds.shape().to_vec(),
+        vec![1, EMBEDDING_DIM],
+      )));
     }
 
     let mut row = [0.0f32; EMBEDDING_DIM];

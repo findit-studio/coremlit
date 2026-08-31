@@ -2,11 +2,11 @@ use super::*;
 
 #[test]
 fn contract_mismatch_display_names_feature() {
-  let e = Error::ContractMismatch {
-    feature: "input_features",
-    expected: "[1, 1, 1001, 64] float32".to_string(),
-    actual: "[1, 1, 1001, 64] float16".to_string(),
-  };
+  let e = Error::ContractMismatch(ContractMismatch::new(
+    "input_features",
+    "[1, 1, 1001, 64] float32".to_string(),
+    "[1, 1, 1001, 64] float16".to_string(),
+  ));
   let msg = e.to_string();
   assert!(msg.contains("input_features"), "{msg}");
   assert!(msg.contains("float16"), "{msg}");
@@ -14,10 +14,7 @@ fn contract_mismatch_display_names_feature() {
 
 #[test]
 fn output_shape_display_shows_both() {
-  let e = Error::OutputShape {
-    got: vec![512, 1],
-    expected: vec![1, 512],
-  };
+  let e = Error::OutputShape(OutputShape::new(vec![512, 1], vec![1, 512]));
   let msg = e.to_string();
   assert!(
     msg.contains("[512, 1]") && msg.contains("[1, 512]"),
@@ -36,12 +33,8 @@ fn coremlit_errors_convert_via_from() {
 
 #[test]
 fn non_finite_variants_carry_index() {
-  assert!(Error::NonFiniteInput { index: 7 }.to_string().contains('7'));
-  assert!(
-    Error::NonFiniteEmbedding { component_index: 3 }
-      .to_string()
-      .contains('3')
-  );
+  assert!(Error::NonFiniteInput(7).to_string().contains('7'));
+  assert!(Error::NonFiniteEmbedding(3).to_string().contains('3'));
 }
 
 #[test]

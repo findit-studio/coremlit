@@ -176,11 +176,11 @@ pub use aggregate::{
 };
 pub use audio::{AudioEncoder, AudioEncoderOptions};
 pub use embedding::Embedding;
-pub use error::Error;
+pub use error::{AudioTooLong, ContractMismatch, EmbeddingDimMismatch, Error, OutputShape};
 pub use score::{LabeledScore, ScoreMode, TextAnchor, score, score_windows};
 pub use smooth::{SmoothPolicy, Smoother, VectorEma, smooth};
 pub use text::{TextEncoder, TextEncoderOptions};
-pub use window::{Span, TailPolicy, WindowEmbedding, WindowPlan};
+pub use window::{DropBelowMin, Span, TailPolicy, WindowEmbedding, WindowPlan};
 
 /// Bytes of the pinned Xenova `tokenizer.json` bundled with the crate (~2 MB).
 ///

@@ -115,6 +115,43 @@ pub const DEFAULT_TAIL_MIN_SAMPLES: u32 = (WINDOW_SAMPLES / 4) as u32;
 /// and inference work. Mirrors the CED classifier's identical rail.
 pub const DEFAULT_MAX_WINDOWS: u32 = 100_000;
 
+/// Drop a final chunk whose real length is below `min_samples`, so a trailing
+/// sliver dominated by padding never contributes. A chunk at or above the
+/// threshold is kept. The single window a clip shorter than one full window
+/// produces is never dropped (there is nothing else to represent it).
+///
+/// A payload STRUCT, not a bare `u32` newtype: [`TailPolicy`] is serde-derived,
+/// and only a struct keeping the `min_samples` field name preserves the
+/// `{"drop_below_min":{"min_samples":N}}` wire form every existing config file
+/// is written against.
+///
+/// Payload of [`TailPolicy::DropBelowMin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DropBelowMin {
+  /// The keep threshold in real samples; validated into `1..=WINDOW_SAMPLES`
+  /// by [`WindowPlan`]'s checked setters and serde path.
+  min_samples: u32,
+}
+
+impl DropBelowMin {
+  /// Construct from the keep threshold in real samples. Unvalidated on its
+  /// own: [`WindowPlan`]'s checked setters and its serde path hold the
+  /// `1..=WINDOW_SAMPLES` range, exactly as they did for the struct variant's
+  /// public field.
+  #[inline(always)]
+  pub const fn new(min_samples: u32) -> Self {
+    Self { min_samples }
+  }
+
+  /// The keep threshold in real samples; validated into `1..=WINDOW_SAMPLES`
+  /// by [`WindowPlan`]'s checked setters and serde path.
+  #[inline(always)]
+  pub const fn min_samples(&self) -> u32 {
+    self.min_samples
+  }
+}
+
 /// What [`WindowPlan`] does with a final chunk whose real samples fall short of a
 /// full [`WINDOW_SAMPLES`] window.
 ///
@@ -135,11 +172,7 @@ pub enum TailPolicy {
   /// sliver dominated by padding never contributes. A chunk at or above the
   /// threshold is kept. The single window a clip shorter than one full window
   /// produces is never dropped (there is nothing else to represent it).
-  DropBelowMin {
-    /// The keep threshold in real samples; validated into `1..=WINDOW_SAMPLES`
-    /// by [`WindowPlan`]'s checked setters and serde path.
-    min_samples: u32,
-  },
+  DropBelowMin(DropBelowMin),
 }
 
 /// Whether `hop_samples` is in the valid `1..=WINDOW_SAMPLES` range: positive
@@ -157,8 +190,8 @@ const fn check_hop_samples(v: u32) -> bool {
 const fn check_tail(tail: TailPolicy) -> bool {
   match tail {
     TailPolicy::Pad => true,
-    TailPolicy::DropBelowMin { min_samples } => {
-      min_samples > 0 && min_samples as usize <= WINDOW_SAMPLES
+    TailPolicy::DropBelowMin(d) => {
+      d.min_samples() > 0 && d.min_samples() as usize <= WINDOW_SAMPLES
     }
   }
 }
@@ -389,8 +422,8 @@ impl WindowPlan {
       .with_hop(self.hop_samples as usize)
       .with_tail(match self.tail {
         TailPolicy::Pad => windit::plan::TailPolicy::PadFull,
-        TailPolicy::DropBelowMin { min_samples } => {
-          windit::plan::TailPolicy::DropBelowMin(min_samples as usize)
+        TailPolicy::DropBelowMin(d) => {
+          windit::plan::TailPolicy::DropBelowMin(d.min_samples() as usize)
         }
       })
       .with_max_windows(self.max_windows as usize)
@@ -419,7 +452,7 @@ impl WindowPlan {
     let hop = self.hop_samples as usize;
     match self.tail {
       TailPolicy::Pad => total_samples.div_ceil(hop),
-      TailPolicy::DropBelowMin { min_samples } => (total_samples - min_samples as usize) / hop + 1,
+      TailPolicy::DropBelowMin(d) => (total_samples - d.min_samples() as usize) / hop + 1,
     }
   }
 
@@ -484,7 +517,7 @@ impl WindowPlan {
     let hop = self.hop_samples as usize;
     let min_keep = match self.tail {
       TailPolicy::Pad => 1,
-      TailPolicy::DropBelowMin { min_samples } => min_samples as usize,
+      TailPolicy::DropBelowMin(d) => d.min_samples() as usize,
     };
     // Contract 2 appends exactly `planned - spans.len()` more spans (windit's
     // kept spans are a subset of the full plan), so reserve that exact count up
