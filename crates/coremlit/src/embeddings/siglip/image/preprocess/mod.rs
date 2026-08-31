@@ -38,7 +38,10 @@
 //! with the measured-then-pinned tolerance (Wave B3) absorbing any residual
 //! delta against the torch reference's working precision.
 
-use crate::embeddings::siglip::{embedding::EMBEDDING_DIM, error::Error};
+use crate::embeddings::siglip::{
+  embedding::EMBEDDING_DIM,
+  error::{Error, ImageDimensions, PatchCount, PosEmbedLength},
+};
 
 /// Vision patch side in pixels (a `16×16` patch). Architecture constant of the
 /// `patch16` model — not a resolved parameter (unlike the patch budget `P`).
@@ -198,14 +201,12 @@ fn precompute_coeffs(in_size: usize, out_size: usize) -> Result<Vec<(usize, Vec<
     .checked_mul(2)
     .and_then(|two_support| two_support.checked_add(1))
     .and_then(|ksize_bound| out_size.checked_mul(ksize_bound))
-    .ok_or(Error::PreprocessAllocation { bytes: usize::MAX })?;
+    .ok_or(Error::PreprocessAllocation(usize::MAX))?;
 
   let mut coeffs = Vec::new();
-  coeffs
-    .try_reserve_exact(out_size)
-    .map_err(|_| Error::PreprocessAllocation {
-      bytes: out_size.saturating_mul(core::mem::size_of::<(usize, Vec<f64>)>()),
-    })?;
+  coeffs.try_reserve_exact(out_size).map_err(|_| {
+    Error::PreprocessAllocation(out_size.saturating_mul(core::mem::size_of::<(usize, Vec<f64>)>()))
+  })?;
   for o in 0..out_size {
     let center = (o as f64 + 0.5) * scale;
 
@@ -228,9 +229,7 @@ fn precompute_coeffs(in_size: usize, out_size: usize) -> Result<Vec<(usize, Vec<
     let mut weights = Vec::new();
     weights
       .try_reserve_exact(taps)
-      .map_err(|_| Error::PreprocessAllocation {
-        bytes: taps.saturating_mul(core::mem::size_of::<f64>()),
-      })?;
+      .map_err(|_| Error::PreprocessAllocation(taps.saturating_mul(core::mem::size_of::<f64>())))?;
     let mut sum = 0.0f64;
     for k in 0..taps {
       let x = (start + k) as f64;
@@ -335,7 +334,7 @@ pub(crate) fn resize_bilinear_antialias(
 /// dimension does not fit pixon's `u32` frame geometry, or pixon rejects the
 /// resize plan — returned instead of aborting the process (`pixon` reserves
 /// fallibly and [`Rgb24Frame::try_new`](pixon::frame::Rgb24Frame::try_new)
-/// validates the geometry rather than panicking). `bytes` is the `dst_h · dst_w
+/// validates the geometry rather than panicking). It carries the `dst_h · dst_w
 /// · 3` output-buffer size — representable even when its reservation or
 /// pixon's own resize plan is what actually failed — or [`usize::MAX`] for a
 /// geometry that could never be represented.
@@ -352,13 +351,11 @@ pub(crate) fn resize_bilinear_antialias_u8(
   // never be represented, let alone allocated. Only reachable through a direct
   // pathological-geometry call — `preprocess_image` caps both axes by
   // `MAX_IMAGE_AXIS`, far inside `u32`.
-  let width =
-    u32::try_from(src_w).map_err(|_| Error::PreprocessAllocation { bytes: usize::MAX })?;
-  let height =
-    u32::try_from(src_h).map_err(|_| Error::PreprocessAllocation { bytes: usize::MAX })?;
+  let width = u32::try_from(src_w).map_err(|_| Error::PreprocessAllocation(usize::MAX))?;
+  let height = u32::try_from(src_h).map_err(|_| Error::PreprocessAllocation(usize::MAX))?;
   let stride = width
     .checked_mul(CHANNELS as u32)
-    .ok_or(Error::PreprocessAllocation { bytes: usize::MAX })?;
+    .ok_or(Error::PreprocessAllocation(usize::MAX))?;
 
   // Output buffer (`dst_h · dst_w · 3` bytes), reserved fallibly so a
   // pathological target geometry returns a typed error instead of aborting on
@@ -366,18 +363,18 @@ pub(crate) fn resize_bilinear_antialias_u8(
   let dst_len = dst_w
     .checked_mul(dst_h)
     .and_then(|hw| hw.checked_mul(CHANNELS))
-    .ok_or(Error::PreprocessAllocation { bytes: usize::MAX })?;
+    .ok_or(Error::PreprocessAllocation(usize::MAX))?;
   let mut out = Vec::new();
   out
     .try_reserve_exact(dst_len)
-    .map_err(|_| Error::PreprocessAllocation { bytes: dst_len })?;
+    .map_err(|_| Error::PreprocessAllocation(dst_len))?;
   out.resize(dst_len, 0);
 
   // The tightly-packed RGB24 source frame; `try_new` (not the panicking `new`)
   // validates dimensions and plane length, returning a typed error on a
   // pathological direct-call extent.
   let frame = Rgb24Frame::try_new(src, width, height, stride)
-    .map_err(|_| Error::PreprocessAllocation { bytes: usize::MAX })?;
+    .map_err(|_| Error::PreprocessAllocation(usize::MAX))?;
 
   // Filtered (windowed-triangle = PIL BILINEAR) resample, any ratio; the sole
   // fallible call assembles the sink and walks the frame into `out`. `out` is
@@ -389,7 +386,7 @@ pub(crate) fn resize_bilinear_antialias_u8(
     .resize_with(Triangle, dst_w, dst_h)
     .rgb(&mut out)
     .run()
-    .map_err(|_| Error::PreprocessAllocation { bytes: dst_len })?;
+    .map_err(|_| Error::PreprocessAllocation(dst_len))?;
 
   Ok(out)
 }
@@ -423,10 +420,7 @@ pub(crate) fn patchify(
 ) -> Result<(Vec<f32>, Vec<f32>), Error> {
   let n_real = grid_h * grid_w;
   if n_real > budget {
-    return Err(Error::PatchCount {
-      got: n_real,
-      max: budget,
-    });
+    return Err(Error::PatchCount(PatchCount::new(n_real, budget)));
   }
   let img_w = grid_w * PATCH_SIZE;
   let mut pixel_values = vec![0.0f32; budget * PATCH_DIM];
@@ -462,10 +456,10 @@ pub(crate) fn patchify(
 /// [`Error::PosEmbedLength`] if `bytes.len() != POS_EMBED_BYTES`.
 pub(crate) fn parse_base_pos_grid(bytes: &[u8]) -> Result<Vec<f32>, Error> {
   if bytes.len() != POS_EMBED_BYTES {
-    return Err(Error::PosEmbedLength {
-      got: bytes.len(),
-      expected: POS_EMBED_BYTES,
-    });
+    return Err(Error::PosEmbedLength(PosEmbedLength::new(
+      bytes.len(),
+      POS_EMBED_BYTES,
+    )));
   }
   let (chunks, _rest) = bytes.as_chunks::<4>(); // len is an exact multiple of 4
   let grid = chunks.iter().map(|&c| f32::from_le_bytes(c)).collect();
@@ -558,7 +552,7 @@ pub(crate) fn preprocess_image(
   budget: usize,
 ) -> Result<VisionInputs, Error> {
   if width > MAX_IMAGE_AXIS || height > MAX_IMAGE_AXIS {
-    return Err(Error::ImageDimensions { width, height });
+    return Err(Error::ImageDimensions(ImageDimensions::new(width, height)));
   }
 
   let (grid_h, grid_w) = fit_to_patch_budget(height, width, PATCH_SIZE, budget);

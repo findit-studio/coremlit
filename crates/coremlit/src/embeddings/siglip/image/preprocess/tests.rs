@@ -410,39 +410,39 @@ fn resize_u8_distinct_channels_match_independent_pil_grids() {
 }
 
 /// An over-tall source height that overflows pixon's `u32` frame geometry
-/// returns a typed [`Error::PreprocessAllocation`] `{ bytes: usize::MAX }` — no
+/// returns a typed [`Error::PreprocessAllocation`] `(usize::MAX)` — no
 /// panic, no abort — before any resize work. (`preprocess_image` caps both axes
 /// far inside `u32`; this exercises the wrapper's own backstop via a direct
 /// call.)
 #[test]
 fn resize_u8_rejects_overflowing_geometry() {
   match resize_bilinear_antialias_u8(&[0u8; 12], usize::MAX / 2, 2, 2, 2) {
-    Err(Error::PreprocessAllocation { bytes }) => assert_eq!(bytes, usize::MAX),
+    Err(Error::PreprocessAllocation(bytes)) => assert_eq!(bytes, usize::MAX),
     other => panic!("expected PreprocessAllocation, got {other:?}"),
   }
 }
 
 /// The over-wide twin: a source width that overflows pixon's `u32` frame
 /// geometry is rejected with the same typed [`Error::PreprocessAllocation`]
-/// `{ bytes: usize::MAX }`, before any tap is indexed — no panic, no abort. The
+/// `(usize::MAX)`, before any tap is indexed — no panic, no abort. The
 /// tiny `src` is never read.
 #[test]
 fn resize_u8_rejects_over_wide_source_extent() {
   match resize_bilinear_antialias_u8(&[0u8; 12], 2, usize::MAX / 2, 2, 16) {
-    Err(Error::PreprocessAllocation { bytes }) => assert_eq!(bytes, usize::MAX),
+    Err(Error::PreprocessAllocation(bytes)) => assert_eq!(bytes, usize::MAX),
     other => panic!("expected PreprocessAllocation, got {other:?}"),
   }
 }
 
 /// The `dst_len` checked-mul twin: a destination geometry whose `dst_w · dst_h
 /// · 3` byte count overflows `usize` is rejected with the same typed
-/// [`Error::PreprocessAllocation`] `{ bytes: usize::MAX }`, from the output
+/// [`Error::PreprocessAllocation`] `(usize::MAX)`, from the output
 /// sizing arm rather than the source-geometry guards above — the tiny `src` is
 /// never resized.
 #[test]
 fn resize_u8_rejects_overflowing_destination_length() {
   match resize_bilinear_antialias_u8(&[0u8; 12], 2, 2, 2, usize::MAX / 2) {
-    Err(Error::PreprocessAllocation { bytes }) => assert_eq!(bytes, usize::MAX),
+    Err(Error::PreprocessAllocation(bytes)) => assert_eq!(bytes, usize::MAX),
     other => panic!("expected PreprocessAllocation, got {other:?}"),
   }
 }
@@ -593,7 +593,7 @@ fn patchify_rejects_grid_over_budget() {
   let grid_w = 3; // 9 patches
   let img = vec![0.0f32; (grid_h * PATCH_SIZE) * (grid_w * PATCH_SIZE) * CHANNELS];
   match patchify(&img, grid_h, grid_w, 8) {
-    Err(Error::PatchCount { got: 9, max: 8 }) => {}
+    Err(Error::PatchCount(ref e)) if e.got() == 9 && e.max() == 8 => {}
     other => panic!("expected PatchCount, got {other:?}"),
   }
 }
@@ -613,13 +613,13 @@ fn parse_base_pos_grid_validates_exact_byte_length() {
   assert_eq!(grid.len(), POS_EMBED_ELEMS);
 
   match parse_base_pos_grid(&[0u8; 16]) {
-    Err(Error::PosEmbedLength { got: 16, expected }) => assert_eq!(expected, POS_EMBED_BYTES),
+    Err(Error::PosEmbedLength(e)) if e.got() == 16 => assert_eq!(e.expected(), POS_EMBED_BYTES),
     other => panic!("expected PosEmbedLength, got {other:?}"),
   }
   let long = vec![0u8; POS_EMBED_BYTES + 4];
   assert!(matches!(
     parse_base_pos_grid(&long),
-    Err(Error::PosEmbedLength { .. })
+    Err(Error::PosEmbedLength(_))
   ));
 }
 
@@ -768,7 +768,7 @@ fn preprocess_rejects_width_over_axis_bound() {
   let rgb = vec![0u8; w * 3];
   let base = vec![0.0f32; POS_EMBED_ELEMS];
   let err = preprocess_image(&rgb, w, 1, &base, P).unwrap_err();
-  assert!(matches!(err, Error::ImageDimensions { width, height } if width == w && height == 1));
+  assert!(matches!(err, Error::ImageDimensions(ref e) if e.width() == w && e.height() == 1));
 }
 
 /// Tall twin — the same rejection on the other orientation. Without the cap an
@@ -780,7 +780,7 @@ fn preprocess_rejects_height_over_axis_bound() {
   let rgb = vec![0u8; h * 3];
   let base = vec![0.0f32; POS_EMBED_ELEMS];
   let err = preprocess_image(&rgb, 1, h, &base, P).unwrap_err();
-  assert!(matches!(err, Error::ImageDimensions { width, height } if width == 1 && height == h));
+  assert!(matches!(err, Error::ImageDimensions(ref e) if e.width() == 1 && e.height() == h));
 }
 
 /// The Pillow `f32`-box divergence zone is unreachable: Pillow rounds the
@@ -796,7 +796,7 @@ fn preprocess_rejects_pillow_f32_inexact_extent() {
   let rgb = vec![0u8; w * 3];
   let base = vec![0.0f32; POS_EMBED_ELEMS];
   let err = preprocess_image(&rgb, w, 1, &base, P).unwrap_err();
-  assert!(matches!(err, Error::ImageDimensions { width, height } if width == w && height == 1));
+  assert!(matches!(err, Error::ImageDimensions(ref e) if e.width() == w && e.height() == 1));
 }
 
 /// The boundary panorama IS accepted: `MAX_IMAGE_AXIS × 1` (the largest

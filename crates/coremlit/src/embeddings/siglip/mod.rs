@@ -102,7 +102,12 @@ pub mod text;
 mod compute_units_serde;
 
 pub use embedding::Embedding;
-pub use error::Error;
+pub use error::{
+  ArtifactTokenizerIdentity, ArtifactTokenizerRead, ContractMismatch, EmbeddingDimMismatch, Error,
+  ImageDataLength, ImageDimensions, OutputShape, PatchBudgetMismatch, PatchCount, PosEmbedLength,
+  PreprocessedLength, PreprocessedMaskValue, PreprocessedNonFinite, PreprocessedPadNonZero,
+  TokenCount,
+};
 pub use image::{
   DEFAULT_IMAGE_COMPUTE, ImageEmbedder, ImageEmbedderOptions, PreprocessedImage, Rgb8Image,
 };

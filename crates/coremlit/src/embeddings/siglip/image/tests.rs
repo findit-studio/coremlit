@@ -17,10 +17,7 @@ fn rgb8_image_accepts_valid_geometry_and_exposes_dims() {
 fn rgb8_image_rejects_zero_width() {
   let data: Vec<u8> = Vec::new();
   match Rgb8Image::new(&data, 0, 3) {
-    Err(Error::ImageDimensions {
-      width: 0,
-      height: 3,
-    }) => {}
+    Err(Error::ImageDimensions(ref e)) if e.width() == 0 && e.height() == 3 => {}
     other => panic!("expected ImageDimensions, got {other:?}"),
   }
 }
@@ -29,10 +26,7 @@ fn rgb8_image_rejects_zero_width() {
 fn rgb8_image_rejects_zero_height() {
   let data: Vec<u8> = Vec::new();
   match Rgb8Image::new(&data, 4, 0) {
-    Err(Error::ImageDimensions {
-      width: 4,
-      height: 0,
-    }) => {}
+    Err(Error::ImageDimensions(ref e)) if e.width() == 4 && e.height() == 0 => {}
     other => panic!("expected ImageDimensions, got {other:?}"),
   }
 }
@@ -41,9 +35,9 @@ fn rgb8_image_rejects_zero_height() {
 fn rgb8_image_rejects_length_mismatch() {
   let data = vec![0u8; 4 * 3 * 3 - 1]; // one byte short
   match Rgb8Image::new(&data, 4, 3) {
-    Err(Error::ImageDataLength { got, expected }) => {
-      assert_eq!(got, 4 * 3 * 3 - 1);
-      assert_eq!(expected, 4 * 3 * 3);
+    Err(Error::ImageDataLength(e)) => {
+      assert_eq!(e.got(), 4 * 3 * 3 - 1);
+      assert_eq!(e.expected(), 4 * 3 * 3);
     }
     other => panic!("expected ImageDataLength, got {other:?}"),
   }
@@ -54,7 +48,7 @@ fn rgb8_image_rejects_size_overflow() {
   // width·height·3 overflows usize; data length is irrelevant to the overflow.
   let data = [0u8; 1];
   match Rgb8Image::new(&data, usize::MAX, 2) {
-    Err(Error::ImageDimensions { .. }) => {}
+    Err(Error::ImageDimensions(_)) => {}
     other => panic!("expected ImageDimensions on overflow, got {other:?}"),
   }
 }
@@ -146,7 +140,7 @@ fn preprocessed_image_accepts_negative_zero_mask_pad() {
 #[test]
 fn preprocessed_image_rejects_zero_budget() {
   match PreprocessedImage::try_new(vec![], vec![], vec![], 0) {
-    Err(Error::PreprocessedPatchBudget { max_num_patches: 0 }) => {}
+    Err(Error::PreprocessedPatchBudget(0)) => {}
     other => panic!("expected PreprocessedPatchBudget, got {other:?}"),
   }
 }
@@ -156,7 +150,7 @@ fn preprocessed_image_rejects_overflowing_budget() {
   // The budget guard runs before any multiplication, so this must not
   // panic/overflow in debug.
   match PreprocessedImage::try_new(vec![], vec![], vec![], usize::MAX) {
-    Err(Error::PreprocessedPatchBudget { .. }) => {}
+    Err(Error::PreprocessedPatchBudget(_)) => {}
     other => panic!("expected PreprocessedPatchBudget, got {other:?}"),
   }
 }
@@ -166,13 +160,9 @@ fn preprocessed_image_rejects_wrong_pixel_values_length() {
   let (mut px, pos, mask) = bundle(4, 3);
   px.pop();
   match PreprocessedImage::try_new(px, pos, mask, 4) {
-    Err(Error::PreprocessedLength {
-      feature: "pixel_values",
-      got,
-      expected,
-    }) => {
-      assert_eq!(got, 4 * PATCH_DIM - 1);
-      assert_eq!(expected, 4 * PATCH_DIM);
+    Err(Error::PreprocessedLength(e)) if e.feature() == "pixel_values" => {
+      assert_eq!(e.got(), 4 * PATCH_DIM - 1);
+      assert_eq!(e.expected(), 4 * PATCH_DIM);
     }
     other => panic!("expected PreprocessedLength, got {other:?}"),
   }
@@ -183,13 +173,9 @@ fn preprocessed_image_rejects_wrong_position_embeddings_length() {
   let (px, mut pos, mask) = bundle(4, 3);
   pos.push(0.0);
   match PreprocessedImage::try_new(px, pos, mask, 4) {
-    Err(Error::PreprocessedLength {
-      feature: "position_embeddings",
-      got,
-      expected,
-    }) => {
-      assert_eq!(got, 4 * EMBEDDING_DIM + 1);
-      assert_eq!(expected, 4 * EMBEDDING_DIM);
+    Err(Error::PreprocessedLength(e)) if e.feature() == "position_embeddings" => {
+      assert_eq!(e.got(), 4 * EMBEDDING_DIM + 1);
+      assert_eq!(e.expected(), 4 * EMBEDDING_DIM);
     }
     other => panic!("expected PreprocessedLength, got {other:?}"),
   }
@@ -200,11 +186,8 @@ fn preprocessed_image_rejects_wrong_mask_length() {
   let (px, pos, _mask) = bundle(4, 3);
   let mask = vec![0.0f32; 5]; // length 5 at budget 4
   match PreprocessedImage::try_new(px, pos, mask, 4) {
-    Err(Error::PreprocessedLength {
-      feature: "attention_mask",
-      got: 5,
-      expected: 4,
-    }) => {}
+    Err(Error::PreprocessedLength(ref e))
+      if e.feature() == "attention_mask" && e.got() == 5 && e.expected() == 4 => {}
     other => panic!("expected PreprocessedLength, got {other:?}"),
   }
 }
@@ -214,10 +197,8 @@ fn preprocessed_image_rejects_non_finite_pixel_values() {
   let (mut px, pos, mask) = bundle(4, 3);
   px[10] = f32::NAN;
   match PreprocessedImage::try_new(px, pos, mask, 4) {
-    Err(Error::PreprocessedNonFinite {
-      feature: "pixel_values",
-      index: 10,
-    }) => {}
+    Err(Error::PreprocessedNonFinite(ref e))
+      if e.feature() == "pixel_values" && e.index() == 10 => {}
     other => panic!("expected PreprocessedNonFinite, got {other:?}"),
   }
 }
@@ -227,10 +208,8 @@ fn preprocessed_image_rejects_non_finite_position_embeddings() {
   let (px, mut pos, mask) = bundle(4, 3);
   pos[0] = f32::NEG_INFINITY;
   match PreprocessedImage::try_new(px, pos, mask, 4) {
-    Err(Error::PreprocessedNonFinite {
-      feature: "position_embeddings",
-      index: 0,
-    }) => {}
+    Err(Error::PreprocessedNonFinite(ref e))
+      if e.feature() == "position_embeddings" && e.index() == 0 => {}
     other => panic!("expected PreprocessedNonFinite, got {other:?}"),
   }
 }
@@ -242,7 +221,7 @@ fn preprocessed_image_classifies_nan_mask_as_mask_value() {
   let (px, pos, mut mask) = bundle(4, 3);
   mask[1] = f32::NAN;
   match PreprocessedImage::try_new(px, pos, mask, 4) {
-    Err(Error::PreprocessedMaskValue { index: 1, value }) => assert!(value.is_nan()),
+    Err(Error::PreprocessedMaskValue(e)) if e.index() == 1 => assert!(e.value().is_nan()),
     other => panic!("expected PreprocessedMaskValue, got {other:?}"),
   }
 }
@@ -252,7 +231,7 @@ fn preprocessed_image_rejects_mask_value_outside_domain() {
   let (px, pos, mut mask) = bundle(4, 3);
   mask[1] = 0.5;
   match PreprocessedImage::try_new(px, pos, mask, 4) {
-    Err(Error::PreprocessedMaskValue { index: 1, value }) => assert_eq!(value, 0.5),
+    Err(Error::PreprocessedMaskValue(e)) if e.index() == 1 => assert_eq!(e.value(), 0.5),
     other => panic!("expected PreprocessedMaskValue, got {other:?}"),
   }
 }
@@ -264,7 +243,7 @@ fn preprocessed_image_rejects_mask_one_after_zero() {
   let (px, pos, _mask) = bundle(4, 3);
   let mask = vec![1.0, 0.0, 1.0, 0.0];
   match PreprocessedImage::try_new(px, pos, mask, 4) {
-    Err(Error::PreprocessedMaskOrder { index: 2 }) => {}
+    Err(Error::PreprocessedMaskOrder(2)) => {}
     other => panic!("expected PreprocessedMaskOrder, got {other:?}"),
   }
 }
@@ -284,10 +263,9 @@ fn preprocessed_image_rejects_nonzero_pixel_pad_row() {
   let (mut px, pos, mask) = bundle(4, 3);
   px[3 * PATCH_DIM + 5] = 0.25; // a nonzero value inside the masked pad row
   match PreprocessedImage::try_new(px, pos, mask, 4) {
-    Err(Error::PreprocessedPadNonZero {
-      feature: "pixel_values",
-      index,
-    }) => assert_eq!(index, 3 * PATCH_DIM + 5),
+    Err(Error::PreprocessedPadNonZero(e)) if e.feature() == "pixel_values" => {
+      assert_eq!(e.index(), 3 * PATCH_DIM + 5)
+    }
     other => panic!("expected PreprocessedPadNonZero, got {other:?}"),
   }
 }
@@ -297,10 +275,9 @@ fn preprocessed_image_rejects_nonzero_position_embedding_pad_row() {
   let (px, mut pos, mask) = bundle(4, 3);
   pos[3 * EMBEDDING_DIM] = 1e-3; // first element of the masked pad row
   match PreprocessedImage::try_new(px, pos, mask, 4) {
-    Err(Error::PreprocessedPadNonZero {
-      feature: "position_embeddings",
-      index,
-    }) => assert_eq!(index, 3 * EMBEDDING_DIM),
+    Err(Error::PreprocessedPadNonZero(e)) if e.feature() == "position_embeddings" => {
+      assert_eq!(e.index(), 3 * EMBEDDING_DIM)
+    }
     other => panic!("expected PreprocessedPadNonZero, got {other:?}"),
   }
 }
@@ -309,10 +286,7 @@ fn preprocessed_image_rejects_nonzero_position_embedding_pad_row() {
 fn check_patch_budget_accepts_equal_and_rejects_mismatch() {
   check_patch_budget(512, 512).expect("equal budgets accepted");
   match check_patch_budget(256, 512) {
-    Err(Error::PatchBudgetMismatch {
-      input: 256,
-      model: 512,
-    }) => {}
+    Err(Error::PatchBudgetMismatch(ref e)) if e.input() == 256 && e.model() == 512 => {}
     other => panic!("expected PatchBudgetMismatch, got {other:?}"),
   }
 }

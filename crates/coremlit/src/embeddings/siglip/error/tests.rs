@@ -2,11 +2,11 @@ use super::*;
 
 #[test]
 fn contract_mismatch_display_names_feature() {
-  let e = Error::ContractMismatch {
-    feature: "pixel_values",
-    expected: "[1, 512, 768] float32".to_string(),
-    actual: "[1, 512, 768] float16".to_string(),
-  };
+  let e = Error::ContractMismatch(ContractMismatch::new(
+    "pixel_values",
+    "[1, 512, 768] float32".to_string(),
+    "[1, 512, 768] float16".to_string(),
+  ));
   let msg = e.to_string();
   assert!(msg.contains("pixel_values"), "{msg}");
   assert!(msg.contains("float16"), "{msg}");
@@ -14,10 +14,7 @@ fn contract_mismatch_display_names_feature() {
 
 #[test]
 fn output_shape_display_shows_both() {
-  let e = Error::OutputShape {
-    got: vec![768, 1],
-    expected: vec![1, 768],
-  };
+  let e = Error::OutputShape(OutputShape::new(vec![768, 1], vec![1, 768]));
   let msg = e.to_string();
   assert!(
     msg.contains("[768, 1]") && msg.contains("[1, 768]"),
@@ -36,34 +33,20 @@ fn coremlit_errors_convert_via_from() {
 
 #[test]
 fn non_finite_variants_carry_index() {
-  assert!(
-    Error::NonFiniteOutput { index: 7 }
-      .to_string()
-      .contains('7')
-  );
-  assert!(
-    Error::NonFiniteEmbedding { component_index: 3 }
-      .to_string()
-      .contains('3')
-  );
+  assert!(Error::NonFiniteOutput(7).to_string().contains('7'));
+  assert!(Error::NonFiniteEmbedding(3).to_string().contains('3'));
 }
 
 #[test]
 fn image_dimensions_display_shows_both_dims() {
-  let e = Error::ImageDimensions {
-    width: 640,
-    height: 0,
-  };
+  let e = Error::ImageDimensions(ImageDimensions::new(640, 0));
   let msg = e.to_string();
   assert!(msg.contains("640") && msg.contains('0'), "{msg}");
 }
 
 #[test]
 fn image_data_length_display_shows_expected_and_got() {
-  let e = Error::ImageDataLength {
-    got: 100,
-    expected: 640 * 480 * 3,
-  };
+  let e = Error::ImageDataLength(ImageDataLength::new(100, 640 * 480 * 3));
   let msg = e.to_string();
   assert!(
     msg.contains("100") && msg.contains(&(640 * 480 * 3).to_string()),
@@ -73,10 +56,7 @@ fn image_data_length_display_shows_expected_and_got() {
 
 #[test]
 fn pos_embed_length_display_shows_expected_and_got() {
-  let e = Error::PosEmbedLength {
-    got: 123,
-    expected: 16 * 16 * 768 * 4,
-  };
+  let e = Error::PosEmbedLength(PosEmbedLength::new(123, 16 * 16 * 768 * 4));
   let msg = e.to_string();
   assert!(
     msg.contains("123") && msg.contains(&(16 * 16 * 768 * 4).to_string()),
@@ -94,7 +74,7 @@ fn pos_embed_load_wraps_io_error_as_source() {
 
 #[test]
 fn patch_count_display_shows_both() {
-  let e = Error::PatchCount { got: 600, max: 512 };
+  let e = Error::PatchCount(PatchCount::new(600, 512));
   let msg = e.to_string();
   assert!(msg.contains("600") && msg.contains("512"), "{msg}");
 }
@@ -108,12 +88,12 @@ fn tokenizer_placeholder_display_names_the_placeholder() {
 #[test]
 fn token_variants_carry_values() {
   assert!(
-    Error::TokenCount { got: 70, max: 64 }
+    Error::TokenCount(TokenCount::new(70, 64))
       .to_string()
       .contains("70")
   );
   assert!(
-    Error::TokenIdRange { id: u32::MAX }
+    Error::TokenIdRange(u32::MAX)
       .to_string()
       .contains(&u32::MAX.to_string())
   );
@@ -121,65 +101,39 @@ fn token_variants_carry_values() {
 
 #[test]
 fn preprocessed_length_display_names_feature() {
-  let msg = Error::PreprocessedLength {
-    feature: "pixel_values",
-    got: 100,
-    expected: 393_216,
-  }
-  .to_string();
+  let msg =
+    Error::PreprocessedLength(PreprocessedLength::new("pixel_values", 100, 393_216)).to_string();
   assert!(msg.contains("pixel_values"), "{msg}");
   assert!(msg.contains("100"), "{msg}");
   assert!(msg.contains("393216"), "{msg}");
-  assert!(
-    Error::PreprocessedPatchBudget { max_num_patches: 0 }
-      .to_string()
-      .contains('0')
-  );
+  assert!(Error::PreprocessedPatchBudget(0).to_string().contains('0'));
 }
 
 #[test]
 fn preprocessed_mask_and_pad_variants_display_carry_diagnostics() {
-  let non_finite = Error::PreprocessedNonFinite {
-    feature: "position_embeddings",
-    index: 7,
-  }
-  .to_string();
+  let non_finite =
+    Error::PreprocessedNonFinite(PreprocessedNonFinite::new("position_embeddings", 7)).to_string();
   assert!(
     non_finite.contains("position_embeddings") && non_finite.contains('7'),
     "{non_finite}"
   );
 
-  let mask_value = Error::PreprocessedMaskValue {
-    index: 1,
-    value: 0.5,
-  }
-  .to_string();
+  let mask_value = Error::PreprocessedMaskValue(PreprocessedMaskValue::new(1, 0.5)).to_string();
   assert!(
     mask_value.contains('1') && mask_value.contains("0.5"),
     "{mask_value}"
   );
 
-  assert!(
-    Error::PreprocessedMaskOrder { index: 2 }
-      .to_string()
-      .contains('2')
-  );
+  assert!(Error::PreprocessedMaskOrder(2).to_string().contains('2'));
   assert!(Error::PreprocessedMaskEmpty.to_string().contains("no real"));
 
-  let pad = Error::PreprocessedPadNonZero {
-    feature: "pixel_values",
-    index: 9,
-  }
-  .to_string();
+  let pad =
+    Error::PreprocessedPadNonZero(PreprocessedPadNonZero::new("pixel_values", 9)).to_string();
   assert!(pad.contains("pixel_values") && pad.contains('9'), "{pad}");
 }
 
 #[test]
 fn patch_budget_mismatch_display_shows_both() {
-  let msg = Error::PatchBudgetMismatch {
-    input: 256,
-    model: 512,
-  }
-  .to_string();
+  let msg = Error::PatchBudgetMismatch(PatchBudgetMismatch::new(256, 512)).to_string();
   assert!(msg.contains("256") && msg.contains("512"), "{msg}");
 }

@@ -22,7 +22,10 @@ use tokenizers::{
 
 use crate::embeddings::siglip::{
   embedding::{EMBEDDING_DIM, Embedding, check_finite_output},
-  error::{Error, Result},
+  error::{
+    ArtifactTokenizerIdentity, ArtifactTokenizerRead, ContractMismatch, Error, OutputShape, Result,
+    TokenCount,
+  },
 };
 
 /// Declared feature names on the siglip text `.mlmodelc` (pinned by
@@ -113,11 +116,9 @@ fn ensure_pinned_identity(bytes: &[u8], path: &Path) -> Result<()> {
   if actual == contract::TOKENIZER_SHA256_HEX {
     return Ok(());
   }
-  Err(Error::ArtifactTokenizerIdentity {
-    path: path.to_path_buf(),
-    expected: contract::TOKENIZER_SHA256_HEX,
-    actual,
-  })
+  Err(Error::ArtifactTokenizerIdentity(
+    ArtifactTokenizerIdentity::new(path.to_path_buf(), contract::TOKENIZER_SHA256_HEX, actual),
+  ))
 }
 
 /// Default [`TextEmbedderOptions::compute`]: [`ComputeUnits::CpuAndGpu`] — the
@@ -249,9 +250,8 @@ impl TextEmbedder {
   pub fn load(model_path: impl AsRef<Path>, options: TextEmbedderOptions) -> Result<Self> {
     let model_path = model_path.as_ref();
     let tokenizer_path = artifact_tokenizer_path(model_path);
-    let bytes = std::fs::read(&tokenizer_path).map_err(|source| Error::ArtifactTokenizerRead {
-      path: tokenizer_path.clone(),
-      source,
+    let bytes = std::fs::read(&tokenizer_path).map_err(|source| {
+      Error::ArtifactTokenizerRead(ArtifactTokenizerRead::new(tokenizer_path.clone(), source))
     })?;
     // The guard the embedded bytes used to carry, applied to the file that is
     // ACTUALLY loaded — a placeholder staged into an artifact tree must fail
@@ -386,10 +386,10 @@ impl TextEmbedder {
       .take(names::TEXT_FEATURES)
       .ok_or_else(|| crate::PredictionError::MissingOutput(names::TEXT_FEATURES.to_string()))?;
     if feats.shape() != [1, EMBEDDING_DIM] {
-      return Err(Error::OutputShape {
-        got: feats.shape().to_vec(),
-        expected: vec![1, EMBEDDING_DIM],
-      });
+      return Err(Error::OutputShape(OutputShape::new(
+        feats.shape().to_vec(),
+        vec![1, EMBEDDING_DIM],
+      )));
     }
 
     let mut row = [0.0f32; EMBEDDING_DIM];
@@ -421,44 +421,44 @@ impl TextEmbedder {
 /// `attention_mask`) is the Wave C `tests/siglip/text_model_io.rs` gate.
 fn resolve_text_window(description: &ModelDescription) -> Result<usize> {
   let ids_expected = "[1, T] int32";
-  let input = description
-    .input(names::INPUT_IDS)
-    .ok_or_else(|| Error::ContractMismatch {
-      feature: names::INPUT_IDS,
-      expected: ids_expected.to_string(),
-      actual: "missing".to_string(),
-    })?;
+  let input = description.input(names::INPUT_IDS).ok_or_else(|| {
+    Error::ContractMismatch(ContractMismatch::new(
+      names::INPUT_IDS,
+      ids_expected.to_string(),
+      "missing".to_string(),
+    ))
+  })?;
   let shape = input.shape();
   if shape.len() != 2 || shape[0] != 1 || input.data_type() != Some(DataType::I32) {
-    return Err(Error::ContractMismatch {
-      feature: names::INPUT_IDS,
-      expected: ids_expected.to_string(),
-      actual: describe(shape, input.data_type()),
-    });
+    return Err(Error::ContractMismatch(ContractMismatch::new(
+      names::INPUT_IDS,
+      ids_expected.to_string(),
+      describe(shape, input.data_type()),
+    )));
   }
   let t = shape[1];
   if t == 0 {
-    return Err(Error::ContractMismatch {
-      feature: names::INPUT_IDS,
-      expected: ids_expected.to_string(),
-      actual: describe(shape, input.data_type()),
-    });
+    return Err(Error::ContractMismatch(ContractMismatch::new(
+      names::INPUT_IDS,
+      ids_expected.to_string(),
+      describe(shape, input.data_type()),
+    )));
   }
 
   let out_expected = format!("[1, {EMBEDDING_DIM}] float32");
-  let output = description
-    .output(names::TEXT_FEATURES)
-    .ok_or_else(|| Error::ContractMismatch {
-      feature: names::TEXT_FEATURES,
-      expected: out_expected.clone(),
-      actual: "missing".to_string(),
-    })?;
+  let output = description.output(names::TEXT_FEATURES).ok_or_else(|| {
+    Error::ContractMismatch(ContractMismatch::new(
+      names::TEXT_FEATURES,
+      out_expected.clone(),
+      "missing".to_string(),
+    ))
+  })?;
   if output.shape() != [1, EMBEDDING_DIM] || output.data_type() != Some(DataType::F32) {
-    return Err(Error::ContractMismatch {
-      feature: names::TEXT_FEATURES,
-      expected: out_expected,
-      actual: describe(output.shape(), output.data_type()),
-    });
+    return Err(Error::ContractMismatch(ContractMismatch::new(
+      names::TEXT_FEATURES,
+      out_expected,
+      describe(output.shape(), output.data_type()),
+    )));
   }
 
   Ok(t)
@@ -518,10 +518,7 @@ fn build_window(
   max_tokens: usize,
 ) -> Result<Vec<i32>> {
   if ids.len() > max_tokens {
-    return Err(Error::TokenCount {
-      got: ids.len(),
-      max: max_tokens,
-    });
+    return Err(Error::TokenCount(TokenCount::new(ids.len(), max_tokens)));
   }
   let mut window = vec![pad_id; max_tokens];
   let offset = match pad_side {
@@ -529,7 +526,7 @@ fn build_window(
     PadSide::Left => max_tokens - ids.len(),
   };
   for (i, &id) in ids.iter().enumerate() {
-    window[offset + i] = i32::try_from(id).map_err(|_| Error::TokenIdRange { id })?;
+    window[offset + i] = i32::try_from(id).map_err(|_| Error::TokenIdRange(id))?;
   }
   Ok(window)
 }

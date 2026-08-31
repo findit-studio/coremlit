@@ -11,7 +11,11 @@ use crate::{ComputeUnits, DataType, Model, ModelDescription, MultiArray};
 
 use crate::embeddings::siglip::{
   embedding::{EMBEDDING_DIM, Embedding, check_finite_output},
-  error::{Error, Result},
+  error::{
+    ContractMismatch, Error, ImageDataLength, ImageDimensions, OutputShape, PatchBudgetMismatch,
+    PreprocessedLength, PreprocessedMaskValue, PreprocessedNonFinite, PreprocessedPadNonZero,
+    Result,
+  },
   image::preprocess::{parse_base_pos_grid, preprocess_image},
 };
 
@@ -129,17 +133,17 @@ impl<'a> Rgb8Image<'a> {
   /// `data.len()` is not exactly `width · height · 3`.
   pub fn new(data: &'a [u8], width: usize, height: usize) -> Result<Self> {
     if width == 0 || height == 0 {
-      return Err(Error::ImageDimensions { width, height });
+      return Err(Error::ImageDimensions(ImageDimensions::new(width, height)));
     }
     let expected = width
       .checked_mul(height)
       .and_then(|hw| hw.checked_mul(3))
-      .ok_or(Error::ImageDimensions { width, height })?;
+      .ok_or(Error::ImageDimensions(ImageDimensions::new(width, height)))?;
     if data.len() != expected {
-      return Err(Error::ImageDataLength {
-        got: data.len(),
+      return Err(Error::ImageDataLength(ImageDataLength::new(
+        data.len(),
         expected,
-      });
+      )));
     }
     Ok(Self {
       data,
@@ -535,10 +539,10 @@ impl ImageEmbedder {
       .take(names::IMAGE_FEATURES)
       .ok_or_else(|| crate::PredictionError::MissingOutput(names::IMAGE_FEATURES.to_string()))?;
     if feats.shape() != [1, EMBEDDING_DIM] {
-      return Err(Error::OutputShape {
-        got: feats.shape().to_vec(),
-        expected: vec![1, EMBEDDING_DIM],
-      });
+      return Err(Error::OutputShape(OutputShape::new(
+        feats.shape().to_vec(),
+        vec![1, EMBEDDING_DIM],
+      )));
     }
 
     let mut row = [0.0f32; EMBEDDING_DIM];
@@ -576,33 +580,32 @@ impl ImageEmbedder {
 fn resolve_patch_budget(description: &ModelDescription) -> Result<usize> {
   // pixel_values [1, P, PATCH_DIM] f32 — the source of the resolved P.
   let pv_expected = format!("[1, P, {PATCH_DIM}] float32");
-  let pixel_values =
-    description
-      .input(names::PIXEL_VALUES)
-      .ok_or_else(|| Error::ContractMismatch {
-        feature: names::PIXEL_VALUES,
-        expected: pv_expected.clone(),
-        actual: "missing".to_string(),
-      })?;
+  let pixel_values = description.input(names::PIXEL_VALUES).ok_or_else(|| {
+    Error::ContractMismatch(ContractMismatch::new(
+      names::PIXEL_VALUES,
+      pv_expected.clone(),
+      "missing".to_string(),
+    ))
+  })?;
   let shape = pixel_values.shape();
   if shape.len() != 3
     || shape[0] != 1
     || shape[2] != PATCH_DIM
     || pixel_values.data_type() != Some(DataType::F32)
   {
-    return Err(Error::ContractMismatch {
-      feature: names::PIXEL_VALUES,
-      expected: pv_expected,
-      actual: describe(shape, pixel_values.data_type()),
-    });
+    return Err(Error::ContractMismatch(ContractMismatch::new(
+      names::PIXEL_VALUES,
+      pv_expected,
+      describe(shape, pixel_values.data_type()),
+    )));
   }
   let p = shape[1];
   if p == 0 {
-    return Err(Error::ContractMismatch {
-      feature: names::PIXEL_VALUES,
-      expected: pv_expected,
-      actual: describe(shape, pixel_values.data_type()),
-    });
+    return Err(Error::ContractMismatch(ContractMismatch::new(
+      names::PIXEL_VALUES,
+      pv_expected,
+      describe(shape, pixel_values.data_type()),
+    )));
   }
 
   // position_embeddings [1, P, EMBEDDING_DIM] f32 — same resolved P.
@@ -616,20 +619,19 @@ fn resolve_patch_budget(description: &ModelDescription) -> Result<usize> {
 
   // image_features [1, EMBEDDING_DIM] f32.
   let out_expected = format!("[1, {EMBEDDING_DIM}] float32");
-  let output =
-    description
-      .output(names::IMAGE_FEATURES)
-      .ok_or_else(|| Error::ContractMismatch {
-        feature: names::IMAGE_FEATURES,
-        expected: out_expected.clone(),
-        actual: "missing".to_string(),
-      })?;
+  let output = description.output(names::IMAGE_FEATURES).ok_or_else(|| {
+    Error::ContractMismatch(ContractMismatch::new(
+      names::IMAGE_FEATURES,
+      out_expected.clone(),
+      "missing".to_string(),
+    ))
+  })?;
   if output.shape() != [1, EMBEDDING_DIM] || output.data_type() != Some(DataType::F32) {
-    return Err(Error::ContractMismatch {
-      feature: names::IMAGE_FEATURES,
-      expected: out_expected,
-      actual: describe(output.shape(), output.data_type()),
-    });
+    return Err(Error::ContractMismatch(ContractMismatch::new(
+      names::IMAGE_FEATURES,
+      out_expected,
+      describe(output.shape(), output.data_type()),
+    )));
   }
 
   Ok(p)
@@ -642,19 +644,19 @@ fn check_input(
   expected_shape: &[usize],
 ) -> Result<()> {
   let expected = format!("{expected_shape:?} float32");
-  let input = description
-    .input(name)
-    .ok_or_else(|| Error::ContractMismatch {
-      feature: name,
-      expected: expected.clone(),
-      actual: "missing".to_string(),
-    })?;
+  let input = description.input(name).ok_or_else(|| {
+    Error::ContractMismatch(ContractMismatch::new(
+      name,
+      expected.clone(),
+      "missing".to_string(),
+    ))
+  })?;
   if input.shape() != expected_shape || input.data_type() != Some(DataType::F32) {
-    return Err(Error::ContractMismatch {
-      feature: name,
+    return Err(Error::ContractMismatch(ContractMismatch::new(
+      name,
       expected,
-      actual: describe(input.shape(), input.data_type()),
-    });
+      describe(input.shape(), input.data_type()),
+    )));
   }
   Ok(())
 }
@@ -676,7 +678,7 @@ fn validate_budget_and_lengths(
     EMBEDDING_DIM
   };
   if max_num_patches == 0 || max_num_patches > usize::MAX / MAX_ROW_DIM {
-    return Err(Error::PreprocessedPatchBudget { max_num_patches });
+    return Err(Error::PreprocessedPatchBudget(max_num_patches));
   }
   check_len(
     names::PIXEL_VALUES,
@@ -695,11 +697,9 @@ fn validate_budget_and_lengths(
 /// One exact-length check, reported as [`Error::PreprocessedLength`].
 fn check_len(feature: &'static str, got: usize, expected: usize) -> Result<()> {
   if got != expected {
-    return Err(Error::PreprocessedLength {
-      feature,
-      got,
-      expected,
-    });
+    return Err(Error::PreprocessedLength(PreprocessedLength::new(
+      feature, got, expected,
+    )));
   }
   Ok(())
 }
@@ -709,7 +709,9 @@ fn check_len(feature: &'static str, got: usize, expected: usize) -> Result<()> {
 /// defect on the MODEL-output side).
 fn check_tensor_finite(feature: &'static str, values: &[f32]) -> Result<()> {
   if let Some(index) = values.iter().position(|v| !v.is_finite()) {
-    return Err(Error::PreprocessedNonFinite { feature, index });
+    return Err(Error::PreprocessedNonFinite(PreprocessedNonFinite::new(
+      feature, index,
+    )));
   }
   Ok(())
 }
@@ -727,13 +729,15 @@ fn validate_mask(mask: &[f32]) -> Result<usize> {
   for (index, &value) in mask.iter().enumerate() {
     if value == 1.0 {
       if in_pad {
-        return Err(Error::PreprocessedMaskOrder { index });
+        return Err(Error::PreprocessedMaskOrder(index));
       }
       num_real += 1;
     } else if value == 0.0 {
       in_pad = true;
     } else {
-      return Err(Error::PreprocessedMaskValue { index, value });
+      return Err(Error::PreprocessedMaskValue(PreprocessedMaskValue::new(
+        index, value,
+      )));
     }
   }
   if num_real == 0 {
@@ -756,10 +760,10 @@ fn validate_pad_rows(
 ) -> Result<()> {
   let pad_start = num_real * row_dim;
   if let Some(offset) = values[pad_start..].iter().position(|&v| v != 0.0) {
-    return Err(Error::PreprocessedPadNonZero {
+    return Err(Error::PreprocessedPadNonZero(PreprocessedPadNonZero::new(
       feature,
-      index: pad_start + offset,
-    });
+      pad_start + offset,
+    )));
   }
   Ok(())
 }
@@ -799,7 +803,9 @@ fn validate_structural(
 /// [`Error::PatchBudgetMismatch`] carrying both budgets.
 fn check_patch_budget(input: usize, model: usize) -> Result<()> {
   if input != model {
-    return Err(Error::PatchBudgetMismatch { input, model });
+    return Err(Error::PatchBudgetMismatch(PatchBudgetMismatch::new(
+      input, model,
+    )));
   }
   Ok(())
 }
