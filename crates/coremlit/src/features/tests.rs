@@ -186,12 +186,7 @@ fn from_provider_rejects_non_multi_array_values() {
   };
   let err =
     Features::from_provider(ProtocolObject::from_ref(&*provider), &mut Vec::new()).unwrap_err();
-  assert_eq!(
-    err,
-    crate::PredictionError::NotMultiArray {
-      name: "meta".into()
-    }
-  );
+  assert_eq!(err, crate::PredictionError::NotMultiArray("meta".into()));
 }
 
 // `unsafe impl <protocol> for GhostProvider` below needs the protocol trait
@@ -234,10 +229,5 @@ fn from_provider_surfaces_missing_outputs() {
   let provider: Retained<GhostProvider> = unsafe { objc2::msg_send![GhostProvider::alloc(), init] };
   let err =
     Features::from_provider(ProtocolObject::from_ref(&*provider), &mut Vec::new()).unwrap_err();
-  assert_eq!(
-    err,
-    crate::PredictionError::MissingOutput {
-      name: "ghost".into()
-    }
-  );
+  assert_eq!(err, crate::PredictionError::MissingOutput("ghost".into()));
 }

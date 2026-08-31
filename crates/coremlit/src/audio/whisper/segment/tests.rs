@@ -817,7 +817,7 @@ fn add_word_timestamps_errors_on_empty_segments() {
   .unwrap_err();
   assert!(matches!(
     err,
-    SegmentError::InvalidAlignmentShape { rows: 0, .. }
+    SegmentError::InvalidAlignmentShape(ref shape) if shape.rows() == 0
   ));
 }
 
@@ -847,7 +847,7 @@ fn add_word_timestamps_errors_on_zero_columns() {
   .unwrap_err();
   assert!(matches!(
     err,
-    SegmentError::InvalidAlignmentShape { cols: 0, .. }
+    SegmentError::InvalidAlignmentShape(ref shape) if shape.cols() == 0
   ));
 }
 
@@ -889,16 +889,19 @@ fn coreml_f16_row_pitch_answers_with_a_usable_pitch_or_a_typed_refusal() {
           "rows={rows} cols={cols}: a row pitch below the logical width ({pitch}) would make \
            the gather reproduction nonsense, and must have been refused instead"
         ),
-        Err(
-          SegmentError::AlignmentPitchUnavailable {
-            rows: r, cols: c, ..
-          }
-          | SegmentError::AlignmentPitchUnexpectedLayout {
-            rows: r, cols: c, ..
-          },
-        ) => {
+        // Two arms, not one or-pattern: the two refusals carry DIFFERENT
+        // payload types, and an or-pattern's binding must have the same type
+        // in every alternative, so no one binding can cover both (E0308).
+        Err(SegmentError::AlignmentPitchUnavailable(ref pitch)) => {
           assert_eq!(
-            (r, c),
+            (pitch.rows(), pitch.cols()),
+            (rows, cols),
+            "the refusal must name the shape it refused"
+          );
+        }
+        Err(SegmentError::AlignmentPitchUnexpectedLayout(ref layout)) => {
+          assert_eq!(
+            (layout.rows(), layout.cols()),
             (rows, cols),
             "the refusal must name the shape it refused"
           );

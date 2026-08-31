@@ -227,7 +227,7 @@ fn check_finite_input_accepts_all_finite() {
 fn check_finite_input_rejects_nan_at_reported_index() {
   assert_eq!(
     check_finite_input(&[0.0, f32::NAN, 2.0]),
-    Err(InferError::NonFiniteInput { index: 1 })
+    Err(InferError::NonFiniteInput(1))
   );
 }
 
@@ -235,7 +235,7 @@ fn check_finite_input_rejects_nan_at_reported_index() {
 fn check_finite_input_rejects_positive_infinity() {
   assert_eq!(
     check_finite_input(&[f32::INFINITY]),
-    Err(InferError::NonFiniteInput { index: 0 })
+    Err(InferError::NonFiniteInput(0))
   );
 }
 
@@ -243,7 +243,7 @@ fn check_finite_input_rejects_positive_infinity() {
 fn check_finite_input_rejects_negative_infinity() {
   assert_eq!(
     check_finite_input(&[0.0, 0.0, f32::NEG_INFINITY]),
-    Err(InferError::NonFiniteInput { index: 2 })
+    Err(InferError::NonFiniteInput(2))
   );
 }
 
@@ -256,7 +256,7 @@ fn check_finite_output_accepts_all_finite() {
 fn check_finite_output_rejects_nan_at_reported_index() {
   assert_eq!(
     check_finite_output(&[0.0, f32::NAN, 2.0]),
-    Err(InferError::NonFiniteOutput { index: 1 })
+    Err(InferError::NonFiniteOutput(1))
   );
 }
 
@@ -264,7 +264,7 @@ fn check_finite_output_rejects_nan_at_reported_index() {
 fn check_finite_output_reports_first_offending_index() {
   assert_eq!(
     check_finite_output(&[f32::NAN, f32::INFINITY]),
-    Err(InferError::NonFiniteOutput { index: 0 })
+    Err(InferError::NonFiniteOutput(0))
   );
 }
 
@@ -287,10 +287,10 @@ fn check_output_shape_accepts_correct_shape() {
 fn check_output_shape_rejects_swapped_axes() {
   assert_eq!(
     check_output_shape(&[EMBEDDING_DIM, EMBED_SLOTS]),
-    Err(InferError::OutputShape {
-      got: vec![EMBEDDING_DIM, EMBED_SLOTS],
-      expected: vec![EMBED_SLOTS, EMBEDDING_DIM],
-    })
+    Err(InferError::OutputShape(OutputShape::new(
+      vec![EMBEDDING_DIM, EMBED_SLOTS],
+      vec![EMBED_SLOTS, EMBEDDING_DIM]
+    )))
   );
 }
 
@@ -298,10 +298,10 @@ fn check_output_shape_rejects_swapped_axes() {
 fn check_output_shape_rejects_wrong_rank() {
   assert_eq!(
     check_output_shape(&[EMBED_SLOTS * EMBEDDING_DIM]),
-    Err(InferError::OutputShape {
-      got: vec![EMBED_SLOTS * EMBEDDING_DIM],
-      expected: vec![EMBED_SLOTS, EMBEDDING_DIM],
-    })
+    Err(InferError::OutputShape(OutputShape::new(
+      vec![EMBED_SLOTS * EMBEDDING_DIM],
+      vec![EMBED_SLOTS, EMBEDDING_DIM]
+    )))
   );
 }
 
@@ -309,10 +309,10 @@ fn check_output_shape_rejects_wrong_rank() {
 fn check_output_shape_rejects_wrong_slot_count() {
   assert_eq!(
     check_output_shape(&[2, EMBEDDING_DIM]),
-    Err(InferError::OutputShape {
-      got: vec![2, EMBEDDING_DIM],
-      expected: vec![EMBED_SLOTS, EMBEDDING_DIM],
-    })
+    Err(InferError::OutputShape(OutputShape::new(
+      vec![2, EMBEDDING_DIM],
+      vec![EMBED_SLOTS, EMBEDDING_DIM]
+    )))
   );
 }
 
@@ -320,10 +320,10 @@ fn check_output_shape_rejects_wrong_slot_count() {
 fn check_output_shape_rejects_wrong_embedding_dim() {
   assert_eq!(
     check_output_shape(&[EMBED_SLOTS, EMBEDDING_DIM - 1]),
-    Err(InferError::OutputShape {
-      got: vec![EMBED_SLOTS, EMBEDDING_DIM - 1],
-      expected: vec![EMBED_SLOTS, EMBEDDING_DIM],
-    })
+    Err(InferError::OutputShape(OutputShape::new(
+      vec![EMBED_SLOTS, EMBEDDING_DIM - 1],
+      vec![EMBED_SLOTS, EMBEDDING_DIM]
+    )))
   );
 }
 
@@ -464,10 +464,7 @@ fn from_file_rejects_wrong_contract_model() {
   let err = EmbedModel::from_file(path).expect_err("wrong contract must be rejected");
   assert!(matches!(
     err,
-    ModelError::ContractMismatch {
-      feature: "waveform",
-      ..
-    }
+    ModelError::ContractMismatch(m) if m.feature() == "waveform"
   ));
 }
 
@@ -616,7 +613,7 @@ fn embed_chunk_rejects_non_finite_samples() {
   let err = model
     .embed_chunk(&samples, &masks)
     .expect_err("NaN samples must be rejected");
-  assert_eq!(err, InferError::NonFiniteInput { index: 1234 });
+  assert_eq!(err, InferError::NonFiniteInput(1234));
 }
 
 #[test]

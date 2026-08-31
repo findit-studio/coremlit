@@ -1494,10 +1494,9 @@ fn extract_serde_bypassed_step_samples_exceeds_window_errors() {
   let options: Options = serde_json::from_str(r#"{"window":{"step_samples":200000}}"#).unwrap();
   assert_eq!(
     Extractor::with_options(options).extract(&seg, &embed, &[0.0f32; 10]),
-    Err(ExtractError::StepSamplesExceedsWindow {
-      step: 200_000,
-      window: SEG_CHUNK_SAMPLES,
-    })
+    Err(ExtractError::StepSamplesExceedsWindow(
+      StepSamplesExceedsWindow::new(200_000, SEG_CHUNK_SAMPLES)
+    ))
   );
 }
 
@@ -1510,7 +1509,7 @@ fn extract_serde_bypassed_onset_out_of_range_errors() {
   let options: Options = serde_json::from_str(r#"{"window":{"onset":0.0}}"#).unwrap();
   assert_eq!(
     Extractor::with_options(options).extract(&seg, &embed, &[0.0f32; 10]),
-    Err(ExtractError::OnsetOutOfRange { onset: 0.0 })
+    Err(ExtractError::OnsetOutOfRange(0.0))
   );
 }
 

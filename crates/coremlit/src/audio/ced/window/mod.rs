@@ -68,6 +68,48 @@ pub const DEFAULT_HOP_SAMPLES: u32 = WINDOW_SAMPLES as u32;
 /// opt-in to more memory and inference work.
 pub const DEFAULT_MAX_WINDOWS: u32 = 100_000;
 
+/// Drop a final chunk whose real length is below `min_samples`, so a
+/// trailing sliver dominated by padding never contributes. A chunk at or
+/// above the threshold is kept. The single window a clip shorter than one
+/// full window produces is never dropped (there is nothing else to
+/// represent it).
+///
+/// A payload STRUCT, not a bare `u32` newtype: [`TailPolicy`] is serde-derived,
+/// and only a struct keeping the `min_samples` field name preserves the
+/// `{"drop_below_min":{"min_samples":N}}` wire form every existing config file
+/// is written against.
+///
+/// Payload of [`TailPolicy::DropBelowMin`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct DropBelowMin {
+  /// The keep threshold in real samples; validated into
+  /// `1..=WINDOW_SAMPLES` by [`WindowPlan`]'s checked setters and serde
+  /// path. No default — soundevents has no drop policy, so there is no
+  /// upstream value to mirror.
+  min_samples: u32,
+}
+
+impl DropBelowMin {
+  /// Construct from the keep threshold in real samples. Unvalidated on its
+  /// own: [`WindowPlan`]'s checked setters and its serde path hold the
+  /// `1..=WINDOW_SAMPLES` range, exactly as they did for the struct variant's
+  /// public field.
+  #[inline(always)]
+  pub const fn new(min_samples: u32) -> Self {
+    Self { min_samples }
+  }
+
+  /// The keep threshold in real samples; validated into
+  /// `1..=WINDOW_SAMPLES` by [`WindowPlan`]'s checked setters and serde
+  /// path. No default — soundevents has no drop policy, so there is no
+  /// upstream value to mirror.
+  #[inline(always)]
+  pub const fn min_samples(&self) -> u32 {
+    self.min_samples
+  }
+}
+
 /// What [`WindowPlan`] does with a final chunk whose real samples fall short of
 /// a full [`WINDOW_SAMPLES`] window.
 ///
@@ -87,13 +129,7 @@ pub enum TailPolicy {
   /// above the threshold is kept. The single window a clip shorter than one
   /// full window produces is never dropped (there is nothing else to
   /// represent it).
-  DropBelowMin {
-    /// The keep threshold in real samples; validated into
-    /// `1..=WINDOW_SAMPLES` by [`WindowPlan`]'s checked setters and serde
-    /// path. No default — soundevents has no drop policy, so there is no
-    /// upstream value to mirror.
-    min_samples: u32,
-  },
+  DropBelowMin(DropBelowMin),
 }
 
 /// Whether `hop_samples` is in the valid `1..=WINDOW_SAMPLES` range: positive
@@ -119,8 +155,8 @@ const fn check_max_windows(v: u32) -> bool {
 const fn check_tail(tail: TailPolicy) -> bool {
   match tail {
     TailPolicy::Pad => true,
-    TailPolicy::DropBelowMin { min_samples } => {
-      min_samples > 0 && min_samples as usize <= WINDOW_SAMPLES
+    TailPolicy::DropBelowMin(d) => {
+      d.min_samples() > 0 && d.min_samples() as usize <= WINDOW_SAMPLES
     }
   }
 }
@@ -196,9 +232,18 @@ impl TryFrom<WindowPlanRepr> for WindowPlan {
       ));
     }
     if !check_tail(r.tail) {
+      // Interpolate the PAYLOAD, not the whole policy. `DropBelowMin`'s payload
+      // struct shares its variant's name and field name, so its `Debug` is
+      // exactly what the struct-shaped variant used to render — this keeps the
+      // message byte-identical to the pre-newtype one instead of doubling the
+      // name to `DropBelowMin(DropBelowMin { .. })`. `Pad` never fails
+      // `check_tail`, so its arm exists only to keep the match total.
+      let tail: &dyn core::fmt::Debug = match &r.tail {
+        TailPolicy::DropBelowMin(min) => min,
+        TailPolicy::Pad => &r.tail,
+      };
       return Err(format!(
-        "tail DropBelowMin.min_samples must be > 0 and <= WINDOW_SAMPLES ({WINDOW_SAMPLES}), got {:?}",
-        r.tail
+        "tail DropBelowMin.min_samples must be > 0 and <= WINDOW_SAMPLES ({WINDOW_SAMPLES}), got {tail:?}"
       ));
     }
     if !check_max_windows(r.max_windows) {
@@ -339,8 +384,8 @@ impl WindowPlan {
       .with_hop(self.hop_samples as usize)
       .with_tail(match self.tail {
         TailPolicy::Pad => windit::plan::TailPolicy::PadFull,
-        TailPolicy::DropBelowMin { min_samples } => {
-          windit::plan::TailPolicy::DropBelowMin(min_samples as usize)
+        TailPolicy::DropBelowMin(d) => {
+          windit::plan::TailPolicy::DropBelowMin(d.min_samples() as usize)
         }
       })
       .with_max_windows(self.max_windows as usize)
@@ -369,7 +414,7 @@ impl WindowPlan {
     let hop = self.hop_samples as usize;
     match self.tail {
       TailPolicy::Pad => total_samples.div_ceil(hop),
-      TailPolicy::DropBelowMin { min_samples } => (total_samples - min_samples as usize) / hop + 1,
+      TailPolicy::DropBelowMin(d) => (total_samples - d.min_samples() as usize) / hop + 1,
     }
   }
 
@@ -431,7 +476,7 @@ impl WindowPlan {
     let hop = self.hop_samples as usize;
     let min_keep = match self.tail {
       TailPolicy::Pad => 1,
-      TailPolicy::DropBelowMin { min_samples } => min_samples as usize,
+      TailPolicy::DropBelowMin(d) => d.min_samples() as usize,
     };
     // Guard 2 appends exactly `planned - spans.len()` more spans (windit's kept
     // spans are a subset of the full plan), so reserve that exact count up

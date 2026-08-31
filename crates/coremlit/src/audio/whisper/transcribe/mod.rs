@@ -89,7 +89,7 @@ use crate::audio::whisper::{
     self, TranscriptionProgressCallback,
     sampler::{self, GreedyTokenSampler},
   },
-  error::{DecodeError, ModelError, TranscribeError, VadError},
+  error::{DecodeError, InvalidState, ModelError, TranscribeError, VadError},
   model::{
     ModelVariant, detect_variant,
     manager::{ModelLoadTimings, ModelManager},
@@ -1331,10 +1331,10 @@ impl WhisperKit<CoreMlBackend> {
     // expensive ANE prewarm pass before reporting it would be pure waste.
     if !options.load() {
       return Err(
-        ModelError::InvalidState {
-          expected: "load = true (WhisperKit::new always loads at construction)",
-          actual: "load = false",
-        }
+        ModelError::InvalidState(InvalidState::new(
+          "load = true (WhisperKit::new always loads at construction)",
+          "load = false",
+        ))
         .into(),
       );
     }
@@ -1954,10 +1954,10 @@ where
     let dims = self.backend.dims();
     if !dims.is_multilingual() {
       return Err(
-        ModelError::InvalidState {
-          expected: "a multilingual model",
-          actual: "a monolingual (English-only) model",
-        }
+        ModelError::InvalidState(InvalidState::new(
+          "a multilingual model",
+          "a monolingual (English-only) model",
+        ))
         .into(),
       );
     }

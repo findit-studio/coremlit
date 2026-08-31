@@ -167,7 +167,7 @@ fn empty_and_overlong_inputs_are_typed_errors() {
   let long = vec![0.0f32; WINDOW_SAMPLES + 1];
   assert!(matches!(
     mel.extract_into(&long, &mut out),
-    Err(Error::AudioTooLong { len, max }) if len == WINDOW_SAMPLES + 1 && max == WINDOW_SAMPLES
+    Err(Error::AudioTooLong(e)) if e.len() == WINDOW_SAMPLES + 1 && e.max() == WINDOW_SAMPLES
   ));
 }
 

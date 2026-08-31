@@ -869,12 +869,7 @@ fn non_finite_consumed_embedding_row_errors() {
       segmentations: &mut segs,
     },
   );
-  assert_eq!(
-    got,
-    Err(InferError::NonFiniteOutput {
-      index: EMBEDDING_DIM + 7
-    })
-  );
+  assert_eq!(got, Err(InferError::NonFiniteOutput(EMBEDDING_DIM + 7)));
 }
 
 /// A non-finite value in a DISCARDED row (an inactive slot, or the unused
@@ -1092,7 +1087,7 @@ fn check_finite_input_accepts_all_finite() {
 fn check_finite_input_rejects_nan_at_reported_index() {
   assert_eq!(
     check_finite_input(&[0.0, f32::NAN, 2.0]),
-    Err(InferError::NonFiniteInput { index: 1 })
+    Err(InferError::NonFiniteInput(1))
   );
 }
 
@@ -1100,7 +1095,7 @@ fn check_finite_input_rejects_nan_at_reported_index() {
 fn check_finite_input_rejects_positive_infinity() {
   assert_eq!(
     check_finite_input(&[f32::INFINITY]),
-    Err(InferError::NonFiniteInput { index: 0 })
+    Err(InferError::NonFiniteInput(0))
   );
 }
 
@@ -1108,7 +1103,7 @@ fn check_finite_input_rejects_positive_infinity() {
 fn check_finite_input_rejects_negative_infinity() {
   assert_eq!(
     check_finite_input(&[0.0, 0.0, f32::NEG_INFINITY]),
-    Err(InferError::NonFiniteInput { index: 2 })
+    Err(InferError::NonFiniteInput(2))
   );
 }
 
@@ -1132,7 +1127,7 @@ fn check_f16_representable_accepts_values_within_f16_range() {
 fn check_f16_representable_rejects_f32_max_at_reported_index() {
   assert_eq!(
     check_f16_representable(&[0.0, 1.0, f32::MAX]),
-    Err(InferError::F16OverflowInput { index: 2 })
+    Err(InferError::F16OverflowInput(2))
   );
 }
 
@@ -1140,7 +1135,7 @@ fn check_f16_representable_rejects_f32_max_at_reported_index() {
 fn check_f16_representable_rejects_negative_overflow() {
   assert_eq!(
     check_f16_representable(&[f32::MIN]),
-    Err(InferError::F16OverflowInput { index: 0 })
+    Err(InferError::F16OverflowInput(0))
   );
 }
 
@@ -1152,7 +1147,7 @@ fn check_f16_representable_rejects_just_above_f16_max() {
   let just_above = f32::from(f16::MAX) + 6.0;
   assert_eq!(
     check_f16_representable(&[just_above]),
-    Err(InferError::F16OverflowInput { index: 0 })
+    Err(InferError::F16OverflowInput(0))
   );
 }
 
@@ -1571,10 +1566,9 @@ fn argmax_source_rejects_a_foreign_step_samples() {
   .expect("load");
   assert_eq!(
     source.extract(&[0.0; 16_000]),
-    Err(ExtractError::UnsupportedStepSamples {
-      step: 8_000,
-      required: 16_000,
-    })
+    Err(ExtractError::UnsupportedStepSamples(
+      UnsupportedStepSamples::new(8_000, 16_000)
+    ))
   );
 }
 
@@ -1596,9 +1590,7 @@ fn argmax_source_rejects_non_finite_samples() {
   clip[100] = f32::NAN;
   assert_eq!(
     load_source().extract(&clip),
-    Err(ExtractError::Infer(InferError::NonFiniteInput {
-      index: 100
-    }))
+    Err(ExtractError::Infer(InferError::NonFiniteInput(100)))
   );
 }
 
@@ -1615,9 +1607,7 @@ fn argmax_source_rejects_f16_overflow_samples() {
   clip[100] = f32::MAX;
   assert_eq!(
     load_source().extract(&clip),
-    Err(ExtractError::Infer(InferError::F16OverflowInput {
-      index: 100
-    }))
+    Err(ExtractError::Infer(InferError::F16OverflowInput(100)))
   );
 }
 

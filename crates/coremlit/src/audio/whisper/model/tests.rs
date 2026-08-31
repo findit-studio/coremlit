@@ -202,7 +202,7 @@ fn detect_model_url_falls_back_to_package_when_compiled_missing() {
 fn detect_model_url_errors_when_nothing_found() {
   let dir = tempfile::tempdir().unwrap();
   let err = detect_model_url(dir.path(), "Missing", false).unwrap_err();
-  assert!(matches!(err, ModelError::NotFound { .. }));
+  assert!(matches!(err, ModelError::NotFound(_)));
 }
 
 #[test]
@@ -236,7 +236,7 @@ fn detect_model_url_recursive_ignores_package_fallback() {
   .unwrap();
 
   let err = detect_model_url(dir.path(), "AudioEncoder", true).unwrap_err();
-  assert!(matches!(err, ModelError::NotFound { .. }));
+  assert!(matches!(err, ModelError::NotFound(_)));
 }
 
 // ---------------------------------------------------------------------
@@ -494,7 +494,7 @@ fn local_loader_errors_when_a_component_is_missing() {
   let dir = tempfile::tempdir().unwrap();
   std::fs::create_dir_all(dir.path().join("MelSpectrogram.mlmodelc")).unwrap();
   let err = LocalModelLoader::new().resolve(dir.path()).unwrap_err();
-  assert!(matches!(err, ModelError::NotFound { .. }));
+  assert!(matches!(err, ModelError::NotFound(_)));
 }
 
 #[test]
@@ -510,7 +510,7 @@ fn recursive_detection_survives_symlink_cycles() {
   let dir = tempfile::tempdir().unwrap();
   std::os::unix::fs::symlink(dir.path(), dir.path().join("loop")).unwrap();
   let err = detect_model_url(dir.path(), "Missing", true).unwrap_err();
-  assert!(matches!(err, ModelError::NotFound { .. }));
+  assert!(matches!(err, ModelError::NotFound(_)));
   // A genuinely present bundle nested one level down is still found.
   let nested = dir.path().join("sub/Found.mlmodelc");
   std::fs::create_dir_all(&nested).unwrap();

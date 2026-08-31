@@ -201,7 +201,10 @@ pub mod registry;
 pub mod vocab;
 
 pub use aligner::{Aligner, AlignerOptions};
-pub use error::{AlignError, AlignerError};
+pub use error::{
+  AlignError, AlignerError, ContractMismatch, CorruptEmissions, DecisionLanguage, InputTooLong,
+  UnnormalizedEmissions,
+};
 pub use registry::{
   AlignerKey, AlignmentBinding, AlignmentFallback, AlignmentHandle, AlignmentSet,
   AlignmentSetBuilder, ParseAlignmentFallbackError,

@@ -302,9 +302,7 @@ pub fn detect_model_url(folder: &Path, name: &str, recursive: bool) -> Result<Pa
     if let Some(found) = find_named_recursive(folder, &target) {
       return Ok(found);
     }
-    return Err(ModelError::NotFound {
-      searched: vec![compiled],
-    });
+    return Err(ModelError::NotFound(vec![compiled]));
   }
 
   if compiled.exists() {
@@ -316,9 +314,7 @@ pub fn detect_model_url(folder: &Path, name: &str, recursive: bool) -> Result<Pa
   if package.exists() {
     return Ok(package);
   }
-  Err(ModelError::NotFound {
-    searched: vec![compiled, package],
-  })
+  Err(ModelError::NotFound(vec![compiled, package]))
 }
 
 /// Depth-first, pre-order search under `folder` for an entry (file or

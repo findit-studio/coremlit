@@ -199,6 +199,39 @@ pub(crate) struct TokenIndex {
   direct_only: bool,
 }
 
+/// A shared boundary `z` — a pre-token boundary of BOTH `text[a..]`'s parse and
+/// the full parse — was found; `count` is the content-token count of `[a, z)`.
+/// The caller resumes the interior/right decomposition from `z`.
+///
+/// Payload of [`Resync::Boundary`].
+struct Boundary {
+  /// The shared pre-token boundary position.
+  z: usize,
+  /// Content-token count of `[a, z)`.
+  count: usize,
+}
+
+impl Boundary {
+  /// Construct from the shared pre-token boundary position and the
+  /// content-token count of `[a, z)`.
+  #[inline(always)]
+  const fn new(z: usize, count: usize) -> Self {
+    Self { z, count }
+  }
+
+  /// The shared pre-token boundary position.
+  #[inline(always)]
+  const fn z(&self) -> usize {
+    self.z
+  }
+
+  /// Content-token count of `[a, z)`.
+  #[inline(always)]
+  const fn count(&self) -> usize {
+    self.count
+  }
+}
+
 /// The outcome of [`TokenIndex::left_resync`]. Three cases the caller handles
 /// distinctly, so the shared-boundary count and the whole-query reuse count are
 /// never conflated with the "must re-encode" signal.
@@ -206,12 +239,15 @@ enum Resync {
   /// A shared boundary `z` — a pre-token boundary of BOTH `text[a..]`'s parse and
   /// the full parse — was found; `count` is the content-token count of `[a, z)`.
   /// The caller resumes the interior/right decomposition from `z`.
-  Boundary { z: usize, count: usize },
+  Boundary(Boundary),
   /// The re-sync window WAS the whole query `[a, b)` (`hi == b`) and held no
   /// interior shared boundary, so its own encode already produced the exact
-  /// whole-query content-token count. The caller returns `count + 2` (the two
-  /// template specials) directly, WITHOUT re-encoding the identical `[a, b)`.
-  WholeQuery { count: usize },
+  /// whole-query content-token count. The caller returns that count plus 2 (the
+  /// two template specials) directly, WITHOUT re-encoding the identical
+  /// `[a, b)`.
+  ///
+  /// Carries the whole-query content-token count.
+  WholeQuery(usize),
   /// No reusable result — the window was a proper prefix (`hi < b`) with no usable
   /// boundary, or the defensive empty-window guard — so the caller encodes `[a, b)`
   /// whole. Unreachable for the pinned tokenizer.
@@ -463,12 +499,13 @@ impl TokenIndex {
           pp += 1;
         }
         match self.left_resync(tok, text, a, b, pp)? {
-          Resync::Boundary { z: zz, count: cnt } => {
+          Resync::Boundary(boundary) => {
+            let zz = boundary.z();
             z = zz;
             i = ends.partition_point(|&e| e <= zz as u32);
-            left_count = cnt;
+            left_count = boundary.count();
           }
-          Resync::WholeQuery { count } => {
+          Resync::WholeQuery(count) => {
             // The window was the whole query and held no interior boundary, so
             // `left_resync`'s own encode already counted `[a, b)` exactly — reuse
             // it plus the two template specials instead of re-encoding the
@@ -544,7 +581,7 @@ impl TokenIndex {
   }
 
   /// The inside-pre-token re-sync: re-encode a bounded window from `a` and report a
-  /// [`Resync`]. On [`Resync::Boundary`] `{ z, count }`, `z` is the first position
+  /// [`Resync`]. On [`Resync::Boundary`], `z` is the first position
   /// that is a pre-token boundary of BOTH `text[a..]`'s parse (a word-id change)
   /// and the full parse, and `count` is the content-token count of `[a, z)` read
   /// off that same encode. EVERY cut strictly inside a pre-token takes this path —
@@ -602,10 +639,7 @@ impl TokenIndex {
         if abs == hi && hi < b {
           return Ok(Resync::Direct);
         }
-        return Ok(Resync::Boundary {
-          z: abs,
-          count: k + 1,
-        });
+        return Ok(Resync::Boundary(Boundary::new(abs, k + 1)));
       }
     }
     // No usable interior boundary. When the window WAS the whole query (`hi == b`),
@@ -614,7 +648,7 @@ impl TokenIndex {
     // encode of an oversized single pre-token (codex #57). Otherwise the window was
     // a proper prefix carrying no whole-query count → direct.
     if hi == b {
-      Ok(Resync::WholeQuery { count: m })
+      Ok(Resync::WholeQuery(m))
     } else {
       Ok(Resync::Direct)
     }

@@ -209,7 +209,9 @@ pub mod error;
 pub mod model;
 
 pub use backend::{CoreMlBackend, detect_speech};
-pub use error::{InferError, ModelError};
+pub use error::{
+  ChunkTooLong, ContractMismatch, InferError, ModelError, NonFiniteOutput, OutputShape,
+};
 pub use model::{
   CHUNK_SAMPLES, CONTEXT_SAMPLES, MODEL_INPUT_SAMPLES, STATE_SIZE, VadModel, VadModelOptions,
   VadState,

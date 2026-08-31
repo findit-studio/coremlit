@@ -1,7 +1,10 @@
 use half::f16;
 
 use super::*;
-use crate::{DataType, ShapeRequirement, TensorError};
+use crate::{
+  DataType, DataTypeMismatch, IndexOutOfBounds, RankMismatch, ShapeMismatch, ShapeRequirement,
+  TensorError, UnsupportedShape,
+};
 
 #[test]
 fn zeros_has_shape_count_dtype_and_zero_content() {
@@ -37,23 +40,14 @@ fn wrong_view_type_is_dtype_mismatch() {
   let err = arr.as_slice::<i32>().unwrap_err();
   assert_eq!(
     err,
-    TensorError::DataTypeMismatch {
-      expected: DataType::I32,
-      actual: DataType::F32
-    }
+    TensorError::DataTypeMismatch(DataTypeMismatch::new(DataType::I32, DataType::F32))
   );
 }
 
 #[test]
 fn from_slice_rejects_shape_element_mismatch() {
   let err = MultiArray::from_slice(&[2, 2], &[1.0f32]).unwrap_err();
-  assert_eq!(
-    err,
-    TensorError::ShapeMismatch {
-      expected: 4,
-      actual: 1
-    }
-  );
+  assert_eq!(err, TensorError::ShapeMismatch(ShapeMismatch::new(4, 1)));
 }
 
 #[test]
@@ -66,12 +60,7 @@ fn as_slice_mut_writes_are_visible() {
 #[test]
 fn zeros_rejects_unknown_dtype() {
   let err = MultiArray::zeros(&[4], DataType::Unknown(0)).unwrap_err();
-  assert_eq!(
-    err,
-    TensorError::UnsupportedDataType {
-      dtype: DataType::Unknown(0)
-    }
-  );
+  assert_eq!(err, TensorError::UnsupportedDataType(DataType::Unknown(0)));
 }
 
 #[test]
@@ -81,14 +70,11 @@ fn linear_offset_uses_strides() {
   assert_eq!(arr.linear_offset(&[1, 2, 3]).unwrap(), 23);
   assert_eq!(
     arr.linear_offset(&[1, 2]).unwrap_err(),
-    TensorError::RankMismatch {
-      expected: 3,
-      actual: 2
-    }
+    TensorError::RankMismatch(RankMismatch::new(3, 2))
   );
   assert_eq!(
     arr.linear_offset(&[0, 3, 0]).unwrap_err(),
-    TensorError::IndexOutOfBounds { index: 3, len: 3 }
+    TensorError::IndexOutOfBounds(IndexOutOfBounds::new(3, 3))
   );
 }
 
@@ -112,10 +98,10 @@ fn fill_last_dim_rejects_non_unit_leading_dims() {
   let err = arr.fill_last_dim(&[0], 1.0f32).unwrap_err();
   assert_eq!(
     err,
-    TensorError::UnsupportedShape {
-      shape: vec![2, 3, 4],
-      reason: ShapeRequirement::LeadingDimsUnit,
-    }
+    TensorError::UnsupportedShape(UnsupportedShape::new(
+      vec![2, 3, 4],
+      ShapeRequirement::LeadingDimsUnit
+    ))
   );
 }
 
@@ -123,7 +109,10 @@ fn fill_last_dim_rejects_non_unit_leading_dims() {
 fn fill_last_dim_oob_position_leaves_array_untouched() {
   let mut arr = MultiArray::zeros(&[1, 1, 4], DataType::F32).unwrap();
   let err = arr.fill_last_dim(&[0, 2, 10], 1.5f32).unwrap_err();
-  assert_eq!(err, TensorError::IndexOutOfBounds { index: 10, len: 4 });
+  assert_eq!(
+    err,
+    TensorError::IndexOutOfBounds(IndexOutOfBounds::new(10, 4))
+  );
   assert!(arr.as_slice::<f32>().unwrap().iter().all(|v| *v == 0.0));
 }
 
@@ -176,10 +165,10 @@ fn f16_surface_rejects_empty_shape() {
   let err = MultiArray::f16_surface(&[]).unwrap_err();
   assert_eq!(
     err,
-    TensorError::UnsupportedShape {
-      shape: Vec::new(),
-      reason: ShapeRequirement::NonEmpty,
-    }
+    TensorError::UnsupportedShape(UnsupportedShape::new(
+      Vec::new(),
+      ShapeRequirement::NonEmpty
+    ))
   );
 }
 
@@ -241,11 +230,11 @@ fn padded_surface_rejects_flat_views_but_fills_elementwise() {
   }
   assert!(matches!(
     arr.as_slice::<f16>(),
-    Err(TensorError::NonContiguous { .. })
+    Err(TensorError::NonContiguous(_))
   ));
   assert!(matches!(
     arr.as_slice_mut::<f16>(),
-    Err(TensorError::NonContiguous { .. })
+    Err(TensorError::NonContiguous(_))
   ));
   arr.fill_at(&[0, 1, 0, 3], f16::from_f32(2.5)).unwrap();
   let offset = arr.linear_offset(&[0, 1, 0, 3]).unwrap();
@@ -347,36 +336,21 @@ fn f16_surface_zero_fills_every_logical_element_at_every_shape() {
 #[test]
 fn zeros_rejects_shape_overflow() {
   let err = MultiArray::zeros(&[usize::MAX, 2], DataType::F32).unwrap_err();
-  assert_eq!(
-    err,
-    TensorError::ShapeOverflow {
-      shape: vec![usize::MAX, 2]
-    }
-  );
+  assert_eq!(err, TensorError::ShapeOverflow(vec![usize::MAX, 2]));
 }
 
 #[test]
 fn from_slice_rejects_shape_overflow() {
   let data = [1.0f32];
   let err = MultiArray::from_slice(&[usize::MAX, 2], &data).unwrap_err();
-  assert_eq!(
-    err,
-    TensorError::ShapeOverflow {
-      shape: vec![usize::MAX, 2]
-    }
-  );
+  assert_eq!(err, TensorError::ShapeOverflow(vec![usize::MAX, 2]));
 }
 
 #[test]
 fn f16_surface_rejects_shape_overflow() {
   let huge = usize::MAX / 4 + 2;
   let err = MultiArray::f16_surface(&[huge, 4]).unwrap_err();
-  assert_eq!(
-    err,
-    TensorError::ShapeOverflow {
-      shape: vec![huge, 4]
-    }
-  );
+  assert_eq!(err, TensorError::ShapeOverflow(vec![huge, 4]));
 }
 
 #[test]
@@ -390,10 +364,10 @@ fn f16_surface_rejects_zero_dimensions() {
     let err = MultiArray::f16_surface(shape).unwrap_err();
     assert_eq!(
       err,
-      TensorError::UnsupportedShape {
-        shape: shape.to_vec(),
-        reason: ShapeRequirement::NonZeroDims,
-      },
+      TensorError::UnsupportedShape(UnsupportedShape::new(
+        shape.to_vec(),
+        ShapeRequirement::NonZeroDims
+      )),
       "shape {shape:?}"
     );
   }

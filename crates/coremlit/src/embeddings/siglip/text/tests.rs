@@ -78,9 +78,9 @@ fn build_window_full_window_has_no_pad() {
 fn build_window_rejects_overlong_ids_with_typed_error() {
   let overlong = vec![1u32; T + 1];
   match build_window(&overlong, 0, PadSide::Right, T) {
-    Err(Error::TokenCount { got, max }) => {
-      assert_eq!(got, T + 1);
-      assert_eq!(max, T);
+    Err(Error::TokenCount(e)) => {
+      assert_eq!(e.got(), T + 1);
+      assert_eq!(e.max(), T);
     }
     other => panic!("expected TokenCount, got {other:?}"),
   }
@@ -89,7 +89,7 @@ fn build_window_rejects_overlong_ids_with_typed_error() {
 #[test]
 fn build_window_rejects_out_of_range_token_id() {
   match build_window(&[u32::MAX], 0, PadSide::Right, T) {
-    Err(Error::TokenIdRange { id }) => assert_eq!(id, u32::MAX),
+    Err(Error::TokenIdRange(id)) => assert_eq!(id, u32::MAX),
     other => panic!("expected TokenIdRange, got {other:?}"),
   }
 }
@@ -195,8 +195,8 @@ fn artifact_tokenizer_path_is_the_bundle_sibling() {
 #[test]
 fn load_reports_a_missing_artifact_tokenizer() {
   match TextEmbedder::load("/nonexistent/model.mlmodelc", TextEmbedderOptions::new()) {
-    Err(Error::ArtifactTokenizerRead { path, .. }) => {
-      assert_eq!(path, Path::new("/nonexistent/tokenizer.json"));
+    Err(Error::ArtifactTokenizerRead(e)) => {
+      assert_eq!(e.path(), Path::new("/nonexistent/tokenizer.json"));
     }
     other => panic!("expected ArtifactTokenizerRead, got {other:?}"),
   }
@@ -226,14 +226,10 @@ fn load_guards_the_sidecar_it_reads() {
 
   std::fs::write(&tokenizer_path, TINY_TOKENIZER.as_bytes()).expect("write foreign sidecar");
   match TextEmbedder::load(&model_path, TextEmbedderOptions::new()) {
-    Err(Error::ArtifactTokenizerIdentity {
-      path,
-      expected,
-      actual,
-    }) => {
-      assert_eq!(path, tokenizer_path);
-      assert_eq!(expected, contract::TOKENIZER_SHA256_HEX);
-      assert_ne!(actual, contract::TOKENIZER_SHA256_HEX);
+    Err(Error::ArtifactTokenizerIdentity(e)) => {
+      assert_eq!(e.path(), tokenizer_path.as_path());
+      assert_eq!(e.expected(), contract::TOKENIZER_SHA256_HEX);
+      assert_ne!(e.actual(), contract::TOKENIZER_SHA256_HEX);
     }
     other => panic!("expected ArtifactTokenizerIdentity for a foreign sidecar, got {other:?}"),
   }

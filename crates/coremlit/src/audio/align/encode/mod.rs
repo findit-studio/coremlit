@@ -157,7 +157,9 @@ use std::{borrow::Cow, path::Path};
 use crate::{ComputeUnits, DataType, FeatureInfo, Model, MultiArray};
 use asry::emissions::{Emissions, PreparedChunk};
 
-use crate::audio::align::error::{AlignError, AlignerError};
+use crate::audio::align::error::{
+  AlignError, AlignerError, ContractMismatch, CorruptEmissions, InputTooLong, UnnormalizedEmissions,
+};
 
 /// Fixed sample count of the encoder's input window (60 s @ 16 kHz).
 /// Pinned by `tests/model_io.rs::base960h_aligner_io_matches_spec`
@@ -542,11 +544,11 @@ fn expected_waveform_contract() -> String {
 /// artifact).
 fn check_waveform_contract(shape: &[usize], dtype: Option<DataType>) -> Result<(), AlignerError> {
   if shape != [1, ENCODER_WINDOW_SAMPLES] || dtype != Some(DataType::F32) {
-    return Err(AlignerError::ContractMismatch {
-      feature: names::WAVEFORM,
-      expected: expected_waveform_contract(),
-      actual: describe(shape, dtype),
-    });
+    return Err(AlignerError::ContractMismatch(ContractMismatch::new(
+      names::WAVEFORM,
+      expected_waveform_contract(),
+      describe(shape, dtype),
+    )));
   }
   Ok(())
 }
@@ -561,10 +563,12 @@ fn check_waveform_contract(shape: &[usize], dtype: Option<DataType>) -> Result<(
 /// holding exactly one, always-present-input artifact — stays covered
 /// hermetically by passing `None`.
 fn waveform_input_or_mismatch(input: Option<&FeatureInfo>) -> Result<&FeatureInfo, AlignerError> {
-  input.ok_or_else(|| AlignerError::ContractMismatch {
-    feature: names::WAVEFORM,
-    expected: expected_waveform_contract(),
-    actual: "missing".to_string(),
+  input.ok_or_else(|| {
+    AlignerError::ContractMismatch(ContractMismatch::new(
+      names::WAVEFORM,
+      expected_waveform_contract(),
+      "missing".to_string(),
+    ))
   })
 }
 
@@ -608,11 +612,11 @@ fn check_emissions_contract(
     && shape[1] == EXPECTED_OUTPUT_FRAMES
     && shape[2] == crate::audio::align::vocab::VOCAB_SIZE;
   if !shape_ok || dtype != Some(DataType::F32) {
-    return Err(AlignerError::ContractMismatch {
-      feature: names::EMISSIONS,
-      expected: expected_emissions_contract(),
-      actual: describe(shape, dtype),
-    });
+    return Err(AlignerError::ContractMismatch(ContractMismatch::new(
+      names::EMISSIONS,
+      expected_emissions_contract(),
+      describe(shape, dtype),
+    )));
   }
   Ok(shape[1])
 }
@@ -629,10 +633,12 @@ fn check_emissions_contract(
 fn emissions_output_or_mismatch(
   output: Option<&FeatureInfo>,
 ) -> Result<&FeatureInfo, AlignerError> {
-  output.ok_or_else(|| AlignerError::ContractMismatch {
-    feature: names::EMISSIONS,
-    expected: expected_emissions_contract(),
-    actual: "missing".to_string(),
+  output.ok_or_else(|| {
+    AlignerError::ContractMismatch(ContractMismatch::new(
+      names::EMISSIONS,
+      expected_emissions_contract(),
+      "missing".to_string(),
+    ))
   })
 }
 
@@ -662,12 +668,12 @@ fn check_log_prob_floor(data: &[f32], compute: ComputeUnits) -> Result<(), Align
     }
   }
   if cells > 0 {
-    return Err(AlignError::CorruptEmissions {
+    return Err(AlignError::CorruptEmissions(CorruptEmissions::new(
       compute,
       min,
       cells,
-      total: data.len(),
-    });
+      data.len(),
+    )));
   }
   Ok(())
 }
@@ -728,12 +734,9 @@ fn check_log_prob_normalization(data: &[f32], compute: ComputeUnits) -> Result<(
     }
   }
   if worst_abs > LOG_PROB_SUM_TOLERANCE {
-    return Err(AlignError::UnnormalizedEmissions {
-      compute,
-      row: worst_row,
-      logsumexp: worst_lse,
-      tolerance: LOG_PROB_SUM_TOLERANCE,
-    });
+    return Err(AlignError::UnnormalizedEmissions(
+      UnnormalizedEmissions::new(compute, worst_row, worst_lse, LOG_PROB_SUM_TOLERANCE),
+    ));
   }
   Ok(())
 }
@@ -965,10 +968,10 @@ impl<'a> EncoderInput<'a> {
   /// asry only ever pads the real audio UP).
   fn new(encoder_input: &'a [f32], real_samples: usize) -> Result<Self, AlignError> {
     if encoder_input.len() > ENCODER_WINDOW_SAMPLES {
-      return Err(AlignError::InputTooLong {
-        got: encoder_input.len(),
-        max: ENCODER_WINDOW_SAMPLES,
-      });
+      return Err(AlignError::InputTooLong(InputTooLong::new(
+        encoder_input.len(),
+        ENCODER_WINDOW_SAMPLES,
+      )));
     }
     debug_assert!(
       real_samples <= encoder_input.len(),
@@ -1115,12 +1118,9 @@ impl Encoder {
 
     let array = MultiArray::from_slice(&[1, ENCODER_WINDOW_SAMPLES], waveform.as_ref())?;
     let mut outputs = self.model.predict_with(&[(names::WAVEFORM, &array)])?;
-    let emissions =
-      outputs
-        .take(names::EMISSIONS)
-        .ok_or_else(|| crate::PredictionError::MissingOutput {
-          name: names::EMISSIONS.to_string(),
-        })?;
+    let emissions = outputs
+      .take(names::EMISSIONS)
+      .ok_or_else(|| crate::PredictionError::MissingOutput(names::EMISSIONS.to_string()))?;
 
     let mut data = vec![0.0f32; self.frames * crate::audio::align::vocab::VOCAB_SIZE];
     emissions.copy_into::<f32>(&mut data)?;

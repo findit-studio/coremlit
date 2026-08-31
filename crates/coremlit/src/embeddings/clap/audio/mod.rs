@@ -10,7 +10,7 @@ use crate::{ComputeUnits, DataType, Model, MultiArray};
 
 use crate::embeddings::clap::{
   embedding::{EMBEDDING_DIM, Embedding, check_finite_output},
-  error::{Error, Result, WinditError},
+  error::{AudioTooLong, ContractMismatch, Error, OutputShape, Result, WinditError},
   window::{WindowEmbedding, WindowPlan},
 };
 
@@ -145,37 +145,35 @@ impl AudioEncoder {
     let description = model.description();
 
     let input_expected = format!("[1, 1, {T_FRAMES}, {N_MELS}] float32");
-    let input =
-      description
-        .input(names::INPUT_FEATURES)
-        .ok_or_else(|| Error::ContractMismatch {
-          feature: names::INPUT_FEATURES,
-          expected: input_expected.clone(),
-          actual: "missing".to_string(),
-        })?;
+    let input = description.input(names::INPUT_FEATURES).ok_or_else(|| {
+      Error::ContractMismatch(ContractMismatch::new(
+        names::INPUT_FEATURES,
+        input_expected.clone(),
+        "missing".to_string(),
+      ))
+    })?;
     if input.shape() != [1, 1, T_FRAMES, N_MELS] || input.data_type() != Some(DataType::F32) {
-      return Err(Error::ContractMismatch {
-        feature: names::INPUT_FEATURES,
-        expected: input_expected,
-        actual: describe(input.shape(), input.data_type()),
-      });
+      return Err(Error::ContractMismatch(ContractMismatch::new(
+        names::INPUT_FEATURES,
+        input_expected,
+        describe(input.shape(), input.data_type()),
+      )));
     }
 
     let output_expected = format!("[1, {EMBEDDING_DIM}] float32");
-    let output =
-      description
-        .output(names::AUDIO_EMBEDS)
-        .ok_or_else(|| Error::ContractMismatch {
-          feature: names::AUDIO_EMBEDS,
-          expected: output_expected.clone(),
-          actual: "missing".to_string(),
-        })?;
+    let output = description.output(names::AUDIO_EMBEDS).ok_or_else(|| {
+      Error::ContractMismatch(ContractMismatch::new(
+        names::AUDIO_EMBEDS,
+        output_expected.clone(),
+        "missing".to_string(),
+      ))
+    })?;
     if output.shape() != [1, EMBEDDING_DIM] || output.data_type() != Some(DataType::F32) {
-      return Err(Error::ContractMismatch {
-        feature: names::AUDIO_EMBEDS,
-        expected: output_expected,
-        actual: describe(output.shape(), output.data_type()),
-      });
+      return Err(Error::ContractMismatch(ContractMismatch::new(
+        names::AUDIO_EMBEDS,
+        output_expected,
+        describe(output.shape(), output.data_type()),
+      )));
     }
 
     Ok(Self {
@@ -214,7 +212,7 @@ impl AudioEncoder {
     }
     check_window_len(samples.len())?;
     if let Some(index) = first_non_finite(samples) {
-      return Err(Error::NonFiniteInput { index });
+      return Err(Error::NonFiniteInput(index));
     }
 
     let mut features = vec![0.0f32; N_MELS * T_FRAMES];
@@ -226,17 +224,14 @@ impl AudioEncoder {
     let mut outputs = self
       .model
       .predict_with(&[(names::INPUT_FEATURES, &input)])?;
-    let embeds =
-      outputs
-        .take(names::AUDIO_EMBEDS)
-        .ok_or_else(|| crate::PredictionError::MissingOutput {
-          name: names::AUDIO_EMBEDS.to_string(),
-        })?;
+    let embeds = outputs
+      .take(names::AUDIO_EMBEDS)
+      .ok_or_else(|| crate::PredictionError::MissingOutput(names::AUDIO_EMBEDS.to_string()))?;
     if embeds.shape() != [1, EMBEDDING_DIM] {
-      return Err(Error::OutputShape {
-        got: embeds.shape().to_vec(),
-        expected: vec![1, EMBEDDING_DIM],
-      });
+      return Err(Error::OutputShape(OutputShape::new(
+        embeds.shape().to_vec(),
+        vec![1, EMBEDDING_DIM],
+      )));
     }
 
     let mut row = [0.0f32; EMBEDDING_DIM];
@@ -348,10 +343,7 @@ fn first_non_finite(samples: &[f32]) -> Option<usize> {
 /// is rejected separately by the caller ([`Error::EmptyAudio`]).
 fn check_window_len(len: usize) -> Result<()> {
   if len > TARGET_SAMPLES {
-    return Err(Error::AudioTooLong {
-      len,
-      max: TARGET_SAMPLES,
-    });
+    return Err(Error::AudioTooLong(AudioTooLong::new(len, TARGET_SAMPLES)));
   }
   Ok(())
 }

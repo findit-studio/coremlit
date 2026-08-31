@@ -161,6 +161,51 @@ pub fn json_content(result: &TranscriptionResult) -> Result<String, WriteError> 
 // WriteError
 // ---------------------------------------------------------------------
 
+/// Writing the rendered content to `path` failed.
+///
+/// Payload of [`WriteError::Write`].
+///
+/// Derives [`std::error::Error`] and owns both the variant's message and
+/// its `source`: the variant is `#[error(transparent)]`, which forwards
+/// `Display` *and* `source()` straight through to this struct rather than
+/// inserting it as a link. The rendered message and the error chain are
+/// therefore exactly what the struct-shaped variant produced — one link, to
+/// the [`std::io::Error`] below — not one link deeper.
+///
+/// Note that the inherent [`source`](Self::source) getter returns the
+/// concrete `&`[`std::io::Error`] the struct pattern used to expose, and so
+/// shadows [`std::error::Error::source`] for method-call syntax; call the
+/// trait method by path (`std::error::Error::source(&e)`) to walk the chain.
+#[derive(Debug, thiserror::Error)]
+#[error("failed to write result file `{path}`: {source}", path = path.display())]
+pub struct Write {
+  /// The path that failed to write.
+  path: PathBuf,
+  /// The underlying I/O error.
+  source: std::io::Error,
+}
+
+impl Write {
+  /// Construct from the path that failed to write and the underlying I/O
+  /// error.
+  #[inline(always)]
+  pub const fn new(path: PathBuf, source: std::io::Error) -> Self {
+    Self { path, source }
+  }
+
+  /// The path that failed to write.
+  #[inline(always)]
+  pub fn path(&self) -> &Path {
+    &self.path
+  }
+
+  /// The underlying I/O error.
+  #[inline(always)]
+  pub const fn source(&self) -> &std::io::Error {
+    &self.source
+  }
+}
+
 /// Failure writing a rendered transcript to disk. Swift's `ResultWriting`
 /// protocol has no equivalent typed error -- every conformer folds every
 /// failure into `Result<String, Error>`'s boxed existential `Error`
@@ -170,13 +215,11 @@ pub fn json_content(result: &TranscriptionResult) -> Result<String, WriteError> 
 #[non_exhaustive]
 pub enum WriteError {
   /// Writing the rendered content to `path` failed.
-  #[error("failed to write result file `{path}`: {source}", path = path.display())]
-  Write {
-    /// The path that failed to write.
-    path: PathBuf,
-    /// The underlying I/O error.
-    source: std::io::Error,
-  },
+  ///
+  /// The message and the `source` live on [`Write`], which this variant
+  /// forwards both of through `#[error(transparent)]`.
+  #[error(transparent)]
+  Write(#[from] Write),
   /// Serializing the result to JSON failed.
   #[cfg(feature = "serde")]
   #[error("failed to serialize result: {0}")]
@@ -234,10 +277,7 @@ impl SrtWriter {
 /// (phase-gate finding: `std::fs::write` truncates first).
 fn write_atomic(path: &Path, contents: &str) -> Result<(), WriteError> {
   use std::io::Write as _;
-  let map = |source| WriteError::Write {
-    path: path.to_path_buf(),
-    source,
-  };
+  let map = |source| WriteError::Write(Write::new(path.to_path_buf(), source));
   // A UNIQUE staging sibling, arbitrated by `create_new` (O_EXCL): a
   // deterministic `<dest>.tmp` let two concurrent writers share one
   // staging inode — one could keep writing it after the other renamed it

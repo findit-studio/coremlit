@@ -30,7 +30,7 @@ fn scripted_steps_replay_in_order_and_record_positions() {
   let err = mock
     .decode_step(9, 2, &encoded, &mut state, &mut logits)
     .unwrap_err();
-  assert!(matches!(err, BackendError::ScriptExhausted { step: 2 }));
+  assert!(matches!(err, BackendError::ScriptExhausted(2)));
 }
 
 #[test]

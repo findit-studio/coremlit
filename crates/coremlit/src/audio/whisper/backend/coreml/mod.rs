@@ -26,10 +26,12 @@
 //! (mel features, encoder output) are never read on the CPU at all and
 //! stay owned `MultiArray`s end to end.
 
-use crate::{DataType, Model, MultiArray, TensorError, f16};
+use crate::{DataType, IndexOutOfBounds, Model, MultiArray, TensorError, f16};
 
 use crate::audio::whisper::{
-  backend::{AlignmentView, BackendError, InferenceBackend, ModelDims},
+  backend::{
+    AlignmentView, AudioLength, BackendError, InferenceBackend, MissingFeature, ModelDims,
+  },
   model::manager::LoadedModels,
 };
 
@@ -77,10 +79,9 @@ fn input_dim(
     .description()
     .input(feature)
     .and_then(|f| f.shape().get(position).copied())
-    .ok_or(BackendError::MissingFeature {
-      model: model_name,
-      name: feature,
-    })
+    .ok_or(BackendError::MissingFeature(MissingFeature::new(
+      model_name, feature,
+    )))
 }
 
 /// Output-side twin of [`input_dim`] (`ModelUtilities.swift:22-28`).
@@ -94,10 +95,9 @@ fn output_dim(
     .description()
     .output(feature)
     .and_then(|f| f.shape().get(position).copied())
-    .ok_or(BackendError::MissingFeature {
-      model: model_name,
-      name: feature,
-    })
+    .ok_or(BackendError::MissingFeature(MissingFeature::new(
+      model_name, feature,
+    )))
 }
 
 // ---------------------------------------------------------------------
@@ -245,10 +245,10 @@ impl CoreMlBackend {
     let vocab = match decoder.description().output(names::LOGITS) {
       Some(logits) if !logits.shape().is_empty() => logits.shape().iter().product(),
       _ => {
-        return Err(BackendError::MissingFeature {
-          model: "decoder",
-          name: names::LOGITS,
-        });
+        return Err(BackendError::MissingFeature(MissingFeature::new(
+          "decoder",
+          names::LOGITS,
+        )));
       }
     };
     // Swift's supportsWordTimestamps is getModelOutputDimension(...) !=
@@ -330,29 +330,29 @@ impl InferenceBackend for CoreMlBackend {
   fn extract_features(&self, audio: &[f32]) -> Result<Self::Features, BackendError> {
     let expected = self.dims.window_samples();
     if audio.len() != expected {
-      return Err(BackendError::AudioLength {
-        got: audio.len(),
+      return Err(BackendError::AudioLength(AudioLength::new(
+        audio.len(),
         expected,
-      });
+      )));
     }
     let array = MultiArray::from_slice(&[expected], audio)?;
     let mut outputs = self.mel.predict_with(&[(names::AUDIO, &array)])?;
     outputs
       .take(names::MEL)
-      .ok_or(BackendError::MissingFeature {
-        model: "mel",
-        name: names::MEL,
-      })
+      .ok_or(BackendError::MissingFeature(MissingFeature::new(
+        "mel",
+        names::MEL,
+      )))
   }
 
   fn encode(&self, features: &Self::Features) -> Result<Self::EncoderOutput, BackendError> {
     let mut outputs = self.encoder.predict_with(&[(names::MEL, features)])?;
     outputs
       .take(names::ENCODER)
-      .ok_or(BackendError::MissingFeature {
-        model: "encoder",
-        name: names::ENCODER,
-      })
+      .ok_or(BackendError::MissingFeature(MissingFeature::new(
+        "encoder",
+        names::ENCODER,
+      )))
   }
 
   fn new_decoder_state(&self) -> Result<Self::DecoderState, BackendError> {
@@ -476,10 +476,9 @@ impl InferenceBackend for CoreMlBackend {
     // error a strided write would report, because `append_kv` below
     // indexes a raw slice.
     if position >= max_ctx {
-      return Err(BackendError::Tensor(TensorError::IndexOutOfBounds {
-        index: position,
-        len: max_ctx,
-      }));
+      return Err(BackendError::Tensor(TensorError::IndexOutOfBounds(
+        IndexOutOfBounds::new(position, max_ctx),
+      )));
     }
 
     // TextDecoder.swift:600-602.
@@ -504,10 +503,10 @@ impl InferenceBackend for CoreMlBackend {
     // pass, leaving it exactly vocab() long per the trait contract.
     let logits_array = outputs
       .take(names::LOGITS)
-      .ok_or(BackendError::MissingFeature {
-        model: "decoder",
-        name: names::LOGITS,
-      })?;
+      .ok_or(BackendError::MissingFeature(MissingFeature::new(
+        "decoder",
+        names::LOGITS,
+      )))?;
     state.logits_scratch.resize(self.dims.vocab(), f16::ZERO);
     logits_array.copy_into::<f16>(&mut state.logits_scratch)?;
     logits.clear();
@@ -516,16 +515,16 @@ impl InferenceBackend for CoreMlBackend {
     // KV append (updateKVCache, TextDecoder.swift:218-270 via :688-702).
     let key_updates = outputs
       .take(names::KEY_UPDATES)
-      .ok_or(BackendError::MissingFeature {
-        model: "decoder",
-        name: names::KEY_UPDATES,
-      })?;
+      .ok_or(BackendError::MissingFeature(MissingFeature::new(
+        "decoder",
+        names::KEY_UPDATES,
+      )))?;
     let value_updates = outputs
       .take(names::VALUE_UPDATES)
-      .ok_or(BackendError::MissingFeature {
-        model: "decoder",
-        name: names::VALUE_UPDATES,
-      })?;
+      .ok_or(BackendError::MissingFeature(MissingFeature::new(
+        "decoder",
+        names::VALUE_UPDATES,
+      )))?;
     let kv_dim = self.dims.kv_dim();
     append_kv(
       &mut state.key_cache,

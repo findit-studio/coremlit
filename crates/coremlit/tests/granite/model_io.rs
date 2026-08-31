@@ -159,7 +159,7 @@ fn from_memory_rejects_foreign_tokenizer() {
   )
   .expect_err("a foreign tokenizer must be refused at construction");
   assert!(
-    matches!(err, Error::TokenizerContractMismatch { .. }),
+    matches!(err, Error::TokenizerContractMismatch(_)),
     "expected TokenizerContractMismatch, got {err:?}"
   );
 }
@@ -208,9 +208,10 @@ fn from_memory_rejects_corrupted_tokenizer_with_identity_check() {
   let err = TextEmbedder::from_memory(common::model_path(), &bytes, TextEmbedderOptions::new())
     .expect_err("a non-identical tokenizer must be refused at construction");
   match err {
-    Error::TokenizerContractMismatch { check, .. } => {
+    Error::TokenizerContractMismatch(mismatch) => {
       assert_eq!(
-        check, "tokenizer identity (sha-256)",
+        mismatch.check(),
+        "tokenizer identity (sha-256)",
         "the behavioral stage must pass first, then the identity backstop fires"
       );
     }

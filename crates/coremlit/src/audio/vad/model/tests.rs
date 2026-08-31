@@ -47,10 +47,7 @@ fn prepare_chunk_rejects_over_long() {
   let err = prepare_chunk(&chunk).expect_err("over-long must reject, not truncate");
   assert_eq!(
     err,
-    InferError::ChunkTooLong {
-      got: CHUNK_SAMPLES + 1,
-      max: CHUNK_SAMPLES,
-    }
+    InferError::ChunkTooLong(ChunkTooLong::new(CHUNK_SAMPLES + 1, CHUNK_SAMPLES))
   );
 }
 
@@ -135,7 +132,7 @@ fn check_finite_input_rejects_nan_at_its_index() {
   window[5] = f32::NAN;
   assert_eq!(
     check_finite_input(&window),
-    Err(InferError::NonFiniteInput { index: 5 })
+    Err(InferError::NonFiniteInput(5))
   );
 }
 
@@ -145,7 +142,7 @@ fn check_finite_input_rejects_infinity() {
   window[2] = f32::INFINITY;
   assert_eq!(
     check_finite_input(&window),
-    Err(InferError::NonFiniteInput { index: 2 })
+    Err(InferError::NonFiniteInput(2))
   );
 }
 
@@ -163,11 +160,11 @@ fn check_output_shape_rejects_a_divergent_shape() {
     check_output_shape(&[1, 1], names::VAD_OUTPUT, &[1, 1, 1]).expect_err("wrong rank must fail");
   assert_eq!(
     err,
-    InferError::OutputShape {
-      feature: names::VAD_OUTPUT,
-      got: vec![1, 1],
-      expected: vec![1, 1, 1],
-    }
+    InferError::OutputShape(OutputShape::new(
+      names::VAD_OUTPUT,
+      vec![1, 1],
+      vec![1, 1, 1]
+    ))
   );
 }
 

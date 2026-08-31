@@ -93,7 +93,7 @@ fn over_budget_window_rejected_before_any_prediction() {
     )
     .unwrap_err();
   assert!(
-    matches!(err, Error::WindowOverBudget { window, max } if window == MAX_TOKENS + 1 && max == MAX_TOKENS),
+    matches!(err, Error::WindowOverBudget(ref b) if b.window() == MAX_TOKENS + 1 && b.max() == MAX_TOKENS),
     "expected WindowOverBudget, got {err:?}"
   );
 }
@@ -153,7 +153,7 @@ fn contentless_over_budget_input_is_refused() {
   let emb = embedder();
   let err = emb.embed_long(&" ".repeat(100_000)).unwrap_err();
   assert!(
-    matches!(err, Error::ContentlessInputOverBudget { .. }),
+    matches!(err, Error::ContentlessInputOverBudget(_)),
     "expected ContentlessInputOverBudget, got {err:?}"
   );
 }
@@ -171,7 +171,7 @@ fn oversized_input_rejected_with_input_too_large() {
     .embed_long_with(&big, &LongTextOptions::new().with_max_input_bytes(1 << 20))
     .unwrap_err();
   assert!(
-    matches!(err, Error::InputTooLarge { got, max } if got == big.len() && max == (1 << 20)),
+    matches!(err, Error::InputTooLarge(ref l) if l.got() == big.len() && l.max() == (1 << 20)),
     "expected InputTooLarge, got {err:?}"
   );
 }

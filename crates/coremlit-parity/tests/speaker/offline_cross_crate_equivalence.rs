@@ -160,6 +160,17 @@ fn build_fixture(identity_of: impl Fn(usize) -> usize) -> OfflineFixture {
   }
 }
 
+/// The `Ok` half of an [`Outcome`]: the per-chunk hard clusters, the cluster
+/// count, the bit-exact discrete grid, and the bit-exact spans. Payload of
+/// [`Outcome::Ok`].
+#[derive(Debug, PartialEq)]
+struct Ok {
+  hard_clusters: Vec<[i32; NUM_SPEAKERS]>,
+  num_clusters: usize,
+  grid_bits: Vec<u32>,
+  spans: Vec<(usize, u64, u64)>, // (cluster, start.to_bits, duration.to_bits)
+}
+
 /// The full observable output of one `diarize_offline`, lifted out of each
 /// crate's own `OfflineOutput` type into a crate-neutral, exactly-comparable
 /// form: the typed outcome, the per-chunk hard clusters, the bit-exact discrete
@@ -167,12 +178,7 @@ fn build_fixture(identity_of: impl Fn(usize) -> usize) -> OfflineFixture {
 /// `Debug` rendering (the shared error variants render identically across crates).
 #[derive(Debug, PartialEq)]
 enum Outcome {
-  Ok {
-    hard_clusters: Vec<[i32; NUM_SPEAKERS]>,
-    num_clusters: usize,
-    grid_bits: Vec<u32>,
-    spans: Vec<(usize, u64, u64)>, // (cluster, start.to_bits, duration.to_bits)
-  },
+  Ok(Ok),
   Err(String),
 }
 
@@ -200,7 +206,7 @@ fn diaric_outcome_cs(fx: &OfflineFixture, cs: SlidingWindow) -> Outcome {
     &plda,
   );
   match diaric::offline::diarize_offline(&input) {
-    Ok(o) => Outcome::Ok {
+    Ok(o) => Outcome::Ok(Ok {
       hard_clusters: o.hard_clusters_slice().to_vec(),
       num_clusters: o.num_clusters(),
       grid_bits: o
@@ -213,7 +219,7 @@ fn diaric_outcome_cs(fx: &OfflineFixture, cs: SlidingWindow) -> Outcome {
         .iter()
         .map(|s| (s.cluster(), s.start().to_bits(), s.duration().to_bits()))
         .collect(),
-    },
+    }),
     Err(e) => Outcome::Err(format!("{e:?}")),
   }
 }
@@ -240,7 +246,7 @@ fn dia_outcome_cs(fx: &OfflineFixture, cs: SlidingWindow) -> Outcome {
     &plda,
   );
   match dia::offline::diarize_offline(&input) {
-    Ok(o) => Outcome::Ok {
+    Ok(o) => Outcome::Ok(Ok {
       hard_clusters: o.hard_clusters_slice().to_vec(),
       num_clusters: o.num_clusters(),
       grid_bits: o
@@ -253,7 +259,7 @@ fn dia_outcome_cs(fx: &OfflineFixture, cs: SlidingWindow) -> Outcome {
         .iter()
         .map(|s| (s.cluster(), s.start().to_bits(), s.duration().to_bits()))
         .collect(),
-    },
+    }),
     Err(e) => Outcome::Err(format!("{e:?}")),
   }
 }
@@ -275,12 +281,12 @@ fn offline_cross_crate_equivalence() {
   // produced a non-trivial multi-cluster partition with real spans, so a
   // post-PLDA divergence would MANIFEST in the compared output above.
   match &diaric {
-    Outcome::Ok {
+    Outcome::Ok(Ok {
       hard_clusters,
       num_clusters,
       spans,
       ..
-    } => {
+    }) => {
       assert!(
         *num_clusters >= 2,
         "fixture must exercise multi-cluster AHC/VBx (got {num_clusters} clusters)"
@@ -302,7 +308,7 @@ fn offline_cross_crate_equivalence() {
         distinct.len(),
         spans.len(),
         match &diaric {
-          Outcome::Ok { grid_bits, .. } => grid_bits.len(),
+          Outcome::Ok(Ok { grid_bits, .. }) => grid_bits.len(),
           Outcome::Err(_) => 0,
         }
       );
@@ -549,12 +555,12 @@ fn offline_cross_crate_equivalence_activity_boundary() {
   // cluster, not left UNMATCHED, so the CLUSTER IDENTITY — not an UNMATCHED
   // sentinel — is the observable that flips.)
   match &diaric {
-    Outcome::Ok {
+    Outcome::Ok(Ok {
       hard_clusters,
       num_clusters,
       spans,
       ..
-    } => {
+    }) => {
       let base_cluster = hard_clusters[base_pairs[0].0][base_pairs[0].1];
       let edge_cluster = hard_clusters[edge_pairs[0].0][edge_pairs[0].1];
       assert!(
@@ -763,12 +769,12 @@ fn offline_cross_crate_equivalence_overlap_add() {
 
   // ── (3) Non-vacuity + the overlap-add outcome itself ──
   match &diaric {
-    Outcome::Ok {
+    Outcome::Ok(Ok {
       hard_clusters,
       num_clusters,
       grid_bits,
       spans,
-    } => {
+    }) => {
       let distinct: std::collections::BTreeSet<i32> = hard_clusters
         .iter()
         .flatten()

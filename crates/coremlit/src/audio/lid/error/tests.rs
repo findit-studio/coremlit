@@ -140,18 +140,13 @@ fn index_variants_render_their_index() {
 /// `?` works and no cause is flattened into a string here.
 #[test]
 fn foreign_errors_convert_and_keep_their_message() {
-  let load = crate::LoadError::NotFound {
-    path: std::path::PathBuf::from("/nonexistent/lid.mlmodelc"),
-  };
+  let load = crate::LoadError::NotFound(std::path::PathBuf::from("/nonexistent/lid.mlmodelc"));
   let inner = load.to_string();
   let error = Error::from(load);
   assert!(matches!(error, Error::Load(_)));
   assert!(error.to_string().contains(&inner), "{error}");
 
-  let tensor = crate::TensorError::ShapeMismatch {
-    expected: 60,
-    actual: 61,
-  };
+  let tensor = crate::TensorError::ShapeMismatch(crate::ShapeMismatch::new(60, 61));
   assert!(matches!(Error::from(tensor), Error::Tensor(_)));
 }
 

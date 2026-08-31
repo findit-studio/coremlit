@@ -329,9 +329,9 @@ fn overlong_input_truncates_and_fills_the_window_without_panic() {
 fn build_window_rejects_overlong_ids_with_typed_error() {
   let overlong = vec![7u32; MAX_TOKENS + 1];
   match build_window(&overlong, 0) {
-    Err(Error::TokenCount { got, max }) => {
-      assert_eq!(got, MAX_TOKENS + 1);
-      assert_eq!(max, MAX_TOKENS);
+    Err(Error::TokenCount(count)) => {
+      assert_eq!(count.got(), MAX_TOKENS + 1);
+      assert_eq!(count.max(), MAX_TOKENS);
     }
     other => panic!("expected Err(TokenCount), got {other:?}"),
   }
@@ -342,7 +342,7 @@ fn build_window_rejects_overlong_ids_with_typed_error() {
 #[test]
 fn build_window_rejects_out_of_range_token_id() {
   match build_window(&[u32::MAX], 0) {
-    Err(Error::TokenIdRange { id }) => assert_eq!(id, u32::MAX),
+    Err(Error::TokenIdRange(id)) => assert_eq!(id, u32::MAX),
     other => panic!("expected Err(TokenIdRange), got {other:?}"),
   }
 }
@@ -798,19 +798,15 @@ fn contentless_over_budget_input_is_refused_not_truncated() {
       "fixture must actually exceed the window (got {expected_tokens})"
     );
     match chunk_long(&mt, s, &WindowOptions::new(MAX_TOKENS)) {
-      Err(Error::ContentlessInputOverBudget {
-        start,
-        end,
-        tokens,
-        max,
-      }) => {
-        assert_eq!(start, 0, "the whole input is the offending run");
-        assert_eq!(end, s.len());
+      Err(Error::ContentlessInputOverBudget(over)) => {
+        assert_eq!(over.start(), 0, "the whole input is the offending run");
+        assert_eq!(over.end(), s.len());
         assert_eq!(
-          tokens, expected_tokens,
+          over.tokens(),
+          expected_tokens,
           "reported count is the untruncated measure"
         );
-        assert_eq!(max, MAX_TOKENS);
+        assert_eq!(over.max(), MAX_TOKENS);
       }
       other => panic!("expected ContentlessInputOverBudget, got {other:?}"),
     }
@@ -856,7 +852,7 @@ fn contentless_input_at_or_under_budget_still_embeds_whole() {
   );
   let over = " ".repeat(hi);
   match chunk_long(&mt, &over, &WindowOptions::new(MAX_TOKENS)) {
-    Err(Error::ContentlessInputOverBudget { .. }) => {}
+    Err(Error::ContentlessInputOverBudget(_)) => {}
     other => panic!("expected ContentlessInputOverBudget just past the budget, got {other:?}"),
   }
 }
@@ -871,16 +867,14 @@ fn separator_gap_over_budget_is_refused() {
   let mt = measuring_tokenizer_from_bytes(artifact_tokenizer_bytes()).expect("measuring");
   let text = format!("a{}b", " ".repeat(100_000));
   match chunk_long(&mt, &text, &WindowOptions::new(3)) {
-    Err(Error::ContentlessInputOverBudget {
-      start,
-      end,
-      tokens,
-      max,
-    }) => {
-      assert_eq!(start, 1, "the gap starts right after `a`");
-      assert_eq!(end, 100_001, "the gap ends right before `b`");
-      assert!(tokens > MAX_TOKENS, "the gap run measures over the window");
-      assert_eq!(max, MAX_TOKENS);
+    Err(Error::ContentlessInputOverBudget(over)) => {
+      assert_eq!(over.start(), 1, "the gap starts right after `a`");
+      assert_eq!(over.end(), 100_001, "the gap ends right before `b`");
+      assert!(
+        over.tokens() > MAX_TOKENS,
+        "the gap run measures over the window"
+      );
+      assert_eq!(over.max(), MAX_TOKENS);
     }
     other => panic!("expected ContentlessInputOverBudget, got {other:?}"),
   }
@@ -902,18 +896,18 @@ fn leading_and_trailing_over_budget_gaps_are_refused() {
 
   let leading = format!("{}a", " ".repeat(100_000));
   match chunk_long(&mt, &leading, &WindowOptions::new(MAX_TOKENS)) {
-    Err(Error::ContentlessInputOverBudget { start, end, .. }) => {
-      assert_eq!(start, 0, "leading gap starts at byte 0");
-      assert_eq!(end, 100_000, "leading gap ends right before `a`");
+    Err(Error::ContentlessInputOverBudget(over)) => {
+      assert_eq!(over.start(), 0, "leading gap starts at byte 0");
+      assert_eq!(over.end(), 100_000, "leading gap ends right before `a`");
     }
     other => panic!("expected leading ContentlessInputOverBudget, got {other:?}"),
   }
 
   let trailing = format!("a{}", " ".repeat(100_000));
   match chunk_long(&mt, &trailing, &WindowOptions::new(MAX_TOKENS)) {
-    Err(Error::ContentlessInputOverBudget { start, end, .. }) => {
-      assert_eq!(start, 1, "trailing gap starts right after `a`");
-      assert_eq!(end, 100_001, "trailing gap ends at text length");
+    Err(Error::ContentlessInputOverBudget(over)) => {
+      assert_eq!(over.start(), 1, "trailing gap starts right after `a`");
+      assert_eq!(over.end(), 100_001, "trailing gap ends at text length");
     }
     other => panic!("expected trailing ContentlessInputOverBudget, got {other:?}"),
   }
@@ -1028,9 +1022,9 @@ fn window_over_budget_is_rejected() {
     "any text",
     &LongTextOptions::from(WindowOptions::new(MAX_TOKENS + 1)),
   ) {
-    Err(Error::WindowOverBudget { window, max }) => {
-      assert_eq!(window, MAX_TOKENS + 1);
-      assert_eq!(max, MAX_TOKENS);
+    Err(Error::WindowOverBudget(budget)) => {
+      assert_eq!(budget.window(), MAX_TOKENS + 1);
+      assert_eq!(budget.max(), MAX_TOKENS);
     }
     other => panic!("expected Err(WindowOverBudget), got {other:?}"),
   }
@@ -1082,9 +1076,9 @@ fn input_too_large_is_rejected_before_any_tokenizer_work() {
   let big = "x".repeat(8 * 1024 * 1024);
   let opts = LongTextOptions::new().with_max_input_bytes(1024 * 1024);
   match validate_long_input(&big, &opts) {
-    Err(Error::InputTooLarge { got, max }) => {
-      assert_eq!(got, big.len());
-      assert_eq!(max, 1024 * 1024);
+    Err(Error::InputTooLarge(large)) => {
+      assert_eq!(large.got(), big.len());
+      assert_eq!(large.max(), 1024 * 1024);
     }
     other => panic!("expected InputTooLarge, got {other:?}"),
   }
@@ -1103,7 +1097,7 @@ fn input_too_large_takes_precedence_over_window_budget() {
   let opts =
     LongTextOptions::from(WindowOptions::new(MAX_TOKENS + 1)).with_max_input_bytes(1024 * 1024);
   match validate_long_input(&big, &opts) {
-    Err(Error::InputTooLarge { .. }) => {}
+    Err(Error::InputTooLarge(_)) => {}
     other => panic!("expected InputTooLarge to win over WindowOverBudget, got {other:?}"),
   }
 }
@@ -1146,12 +1140,13 @@ fn tokenizer_contract_rejects_missing_specials() {
   const TINY: &[u8] = br#"{"version":"1.0","truncation":null,"padding":null,"added_tokens":[],"normalizer":null,"pre_tokenizer":null,"post_processor":null,"decoder":null,"model":{"type":"WordLevel","vocab":{"hello":0,"world":1},"unk_token":"<unk>"}}"#;
   let tok = configured_tokenizer_from_bytes(TINY).expect("configure tiny");
   match validate_tokenizer_contract(&tok) {
-    Err(Error::TokenizerContractMismatch { check, actual, .. }) => {
+    Err(Error::TokenizerContractMismatch(mismatch)) => {
+      let check = mismatch.check();
       assert!(
         check.contains("<|startoftext|>"),
         "check names the missing special: {check}"
       );
-      assert_eq!(actual, "missing");
+      assert_eq!(mismatch.actual(), "missing");
     }
     other => panic!("expected TokenizerContractMismatch, got {other:?}"),
   }
@@ -1173,12 +1168,9 @@ fn tokenizer_contract_rejects_wrong_vocab_size() {
     added.pop().expect("added_tokens is non-empty");
   });
   match validate_tokenizer_contract(&tok) {
-    Err(Error::TokenizerContractMismatch {
-      check,
-      expected,
-      actual,
-    }) => {
-      assert_eq!(check, "vocab size");
+    Err(Error::TokenizerContractMismatch(mismatch)) => {
+      let (expected, actual) = (mismatch.expected(), mismatch.actual());
+      assert_eq!(mismatch.check(), "vocab size");
       assert!(
         expected.contains("180000"),
         "expected names the contract size: {expected}"
@@ -1214,8 +1206,9 @@ fn tokenizer_contract_rejects_out_of_model_vocab_id() {
     vocab.insert(key, serde_json::json!(180_000));
   });
   match validate_tokenizer_contract(&tok) {
-    Err(Error::TokenizerContractMismatch { check, actual, .. }) => {
-      assert_eq!(check, "max token id");
+    Err(Error::TokenizerContractMismatch(mismatch)) => {
+      let actual = mismatch.actual();
+      assert_eq!(mismatch.check(), "max token id");
       assert!(
         actual.contains("180000"),
         "actual carries the offending id: {actual}"
@@ -1250,8 +1243,8 @@ fn tokenizer_contract_rejects_divergent_encoding() {
     vocab.insert(key_b, serde_json::json!(24_313));
   });
   match validate_tokenizer_contract(&tok) {
-    Err(Error::TokenizerContractMismatch { check, .. }) => {
-      assert_eq!(check, "sentinel encoding");
+    Err(Error::TokenizerContractMismatch(mismatch)) => {
+      assert_eq!(mismatch.check(), "sentinel encoding");
     }
     other => panic!("expected TokenizerContractMismatch on sentinel encoding, got {other:?}"),
   }
@@ -1320,17 +1313,11 @@ fn tokenizer_identity_rejects_non_sentinel_vocab_corruption() {
   // (c) the identity backstop REJECTS it, naming the identity check with the
   // pinned expected / computed actual digests.
   let actual = sha256_hex(&bytes);
-  match validate_tokenizer_identity(&TokenizerProvenance::Supplied {
-    sha256_hex: actual.clone(),
-  }) {
-    Err(Error::TokenizerContractMismatch {
-      check,
-      expected,
-      actual: reported,
-    }) => {
-      assert_eq!(check, "tokenizer identity (sha-256)");
-      assert_eq!(expected, contract::TOKENIZER_SHA256_HEX);
-      assert_eq!(reported, actual);
+  match validate_tokenizer_identity(&TokenizerProvenance::Supplied(actual.clone())) {
+    Err(Error::TokenizerContractMismatch(mismatch)) => {
+      assert_eq!(mismatch.check(), "tokenizer identity (sha-256)");
+      assert_eq!(mismatch.expected(), contract::TOKENIZER_SHA256_HEX);
+      assert_eq!(mismatch.actual(), actual);
     }
     other => panic!("expected identity TokenizerContractMismatch, got {other:?}"),
   }
@@ -1356,16 +1343,10 @@ fn tokenizer_identity_rejects_reserialized_artifact_json() {
   );
 
   let actual = sha256_hex(&bytes);
-  match validate_tokenizer_identity(&TokenizerProvenance::Supplied {
-    sha256_hex: actual.clone(),
-  }) {
-    Err(Error::TokenizerContractMismatch {
-      check,
-      actual: reported,
-      ..
-    }) => {
-      assert_eq!(check, "tokenizer identity (sha-256)");
-      assert_eq!(reported, actual);
+  match validate_tokenizer_identity(&TokenizerProvenance::Supplied(actual.clone())) {
+    Err(Error::TokenizerContractMismatch(mismatch)) => {
+      assert_eq!(mismatch.check(), "tokenizer identity (sha-256)");
+      assert_eq!(mismatch.actual(), actual);
     }
     other => panic!("expected identity TokenizerContractMismatch, got {other:?}"),
   }
@@ -1379,14 +1360,12 @@ fn tokenizer_identity_rejects_reserialized_artifact_json() {
 #[ignore = "requires the granite tokenizer.json staged beside the model bundle (EMBEDKIT_TEST_MODELS)"]
 fn tokenizer_identity_accepts_the_pinned_bytes_through_both_provenances() {
   let sha256_hex = sha256_hex(artifact_tokenizer_bytes());
-  validate_tokenizer_identity(&TokenizerProvenance::Supplied {
-    sha256_hex: sha256_hex.clone(),
-  })
-  .expect("the pinned bytes are the identity, supplied");
-  validate_tokenizer_identity(&TokenizerProvenance::Artifact {
-    path: artifact_tokenizer_path_for_tests(),
+  validate_tokenizer_identity(&TokenizerProvenance::Supplied(sha256_hex.clone()))
+    .expect("the pinned bytes are the identity, supplied");
+  validate_tokenizer_identity(&TokenizerProvenance::Artifact(Artifact::new(
+    artifact_tokenizer_path_for_tests(),
     sha256_hex,
-  })
+  )))
   .expect("the pinned bytes are the identity, read from the artifact");
 }
 
@@ -1395,19 +1374,16 @@ fn tokenizer_identity_accepts_the_pinned_bytes_through_both_provenances() {
 /// an on-disk tokenizer strictly weaker than the embedded bytes it replaced.
 #[test]
 fn artifact_provenance_is_not_exempt_from_the_identity_pin() {
-  let err = validate_tokenizer_identity(&TokenizerProvenance::Artifact {
-    path: std::path::PathBuf::from("/models/granite/tokenizer.json"),
-    sha256_hex: "0".repeat(64),
-  })
+  let err = validate_tokenizer_identity(&TokenizerProvenance::Artifact(Artifact::new(
+    std::path::PathBuf::from("/models/granite/tokenizer.json"),
+    "0".repeat(64),
+  )))
   .expect_err("a sidecar that is not the pinned artifact must be refused");
   match err {
-    Error::TokenizerContractMismatch {
-      check,
-      expected,
-      actual,
-    } => {
-      assert_eq!(check, "artifact tokenizer identity (sha-256)");
-      assert_eq!(expected, contract::TOKENIZER_SHA256_HEX);
+    Error::TokenizerContractMismatch(mismatch) => {
+      let actual = mismatch.actual();
+      assert_eq!(mismatch.check(), "artifact tokenizer identity (sha-256)");
+      assert_eq!(mismatch.expected(), contract::TOKENIZER_SHA256_HEX);
       assert!(
         actual.contains("/models/granite/tokenizer.json"),
         "the diagnostic must name the offending file, got {actual}"
@@ -1464,12 +1440,9 @@ where
   if repaired.is_empty() && !text.is_empty() {
     let tokens = range_measure(0, text.len())?;
     if tokens > MAX_TOKENS {
-      return Err(Error::ContentlessInputOverBudget {
-        start: 0,
-        end: text.len(),
-        tokens,
-        max: MAX_TOKENS,
-      });
+      return Err(Error::ContentlessInputOverBudget(
+        ContentlessInputOverBudget::new(0, text.len(), tokens, MAX_TOKENS),
+      ));
     }
     repaired.push(windit::split::Chunk::new(0, text.len()));
   }

@@ -518,9 +518,7 @@ impl WhisperTokenizer {
     let folder = folder.as_ref();
     let path = folder.join("tokenizer.json");
     if !path.is_file() {
-      return Err(TokenizerError::FileNotFound {
-        searched: vec![path],
-      });
+      return Err(TokenizerError::FileNotFound(vec![path]));
     }
     let tokenizer = tokenizers::Tokenizer::from_file(&path)?;
     let special_tokens = SpecialTokens::probe(&tokenizer);

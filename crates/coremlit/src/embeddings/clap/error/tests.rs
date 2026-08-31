@@ -2,11 +2,11 @@ use super::*;
 
 #[test]
 fn contract_mismatch_display_names_feature() {
-  let e = Error::ContractMismatch {
-    feature: "input_features",
-    expected: "[1, 1, 1001, 64] float32".to_string(),
-    actual: "[1, 1, 1001, 64] float16".to_string(),
-  };
+  let e = Error::ContractMismatch(ContractMismatch::new(
+    "input_features",
+    "[1, 1, 1001, 64] float32".to_string(),
+    "[1, 1, 1001, 64] float16".to_string(),
+  ));
   let msg = e.to_string();
   assert!(msg.contains("input_features"), "{msg}");
   assert!(msg.contains("float16"), "{msg}");
@@ -14,10 +14,7 @@ fn contract_mismatch_display_names_feature() {
 
 #[test]
 fn output_shape_display_shows_both() {
-  let e = Error::OutputShape {
-    got: vec![512, 1],
-    expected: vec![1, 512],
-  };
+  let e = Error::OutputShape(OutputShape::new(vec![512, 1], vec![1, 512]));
   let msg = e.to_string();
   assert!(
     msg.contains("[512, 1]") && msg.contains("[1, 512]"),
@@ -28,20 +25,16 @@ fn output_shape_display_shows_both() {
 #[test]
 fn coremlit_errors_convert_via_from() {
   // `#[from]` lets `?` lift coremlit errors into clapkit's Error.
-  let e = Error::from(crate::PredictionError::MissingOutput {
-    name: "audio_embeds".to_string(),
-  });
+  let e = Error::from(crate::PredictionError::MissingOutput(
+    "audio_embeds".to_string(),
+  ));
   assert!(matches!(e, Error::Prediction(_)), "got {e:?}");
 }
 
 #[test]
 fn non_finite_variants_carry_index() {
-  assert!(Error::NonFiniteInput { index: 7 }.to_string().contains('7'));
-  assert!(
-    Error::NonFiniteEmbedding { component_index: 3 }
-      .to_string()
-      .contains('3')
-  );
+  assert!(Error::NonFiniteInput(7).to_string().contains('7'));
+  assert!(Error::NonFiniteEmbedding(3).to_string().contains('3'));
 }
 
 #[test]
@@ -60,4 +53,24 @@ fn from_winditerror_is_total_and_does_not_special_case_empty() {
     matches!(e, Error::Windowing(WinditError::Empty)),
     "the blanket From<WinditError> impl must not special-case Empty; got {e:?}"
   );
+}
+
+#[test]
+fn non_finite_output_display_carries_index() {
+  let msg = Error::NonFiniteOutput(7).to_string();
+  assert!(msg.contains('7'), "{msg}");
+  assert!(msg.contains("non-finite"), "{msg}");
+}
+
+#[test]
+fn embedding_dim_mismatch_display_shows_expected_then_got() {
+  let msg = Error::EmbeddingDimMismatch(EmbeddingDimMismatch::new(512, 256)).to_string();
+  assert_eq!(msg, "embedding dimension mismatch: expected 512, got 256");
+}
+
+#[test]
+fn embedding_not_unit_norm_display_carries_the_deviation() {
+  let msg = Error::EmbeddingNotUnitNorm(0.25).to_string();
+  assert!(msg.contains("unit-norm"), "{msg}");
+  assert!(msg.contains("0.25"), "{msg}");
 }

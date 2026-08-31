@@ -392,6 +392,71 @@ impl AlignmentView<'_> {
 // BackendError
 // ---------------------------------------------------------------------
 
+/// A model's output feature dictionary lacks an expected named output.
+///
+/// Payload of [`BackendError::MissingFeature`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MissingFeature {
+  /// Which model produced the incomplete output (e.g. `"encoder"`).
+  model: &'static str,
+  /// The missing feature's name.
+  name: &'static str,
+}
+
+impl MissingFeature {
+  /// Construct from the model that produced the incomplete output and the
+  /// missing feature's name.
+  #[inline(always)]
+  pub const fn new(model: &'static str, name: &'static str) -> Self {
+    Self { model, name }
+  }
+
+  /// Which model produced the incomplete output (e.g. `"encoder"`).
+  #[inline(always)]
+  pub const fn model(&self) -> &'static str {
+    self.model
+  }
+
+  /// The missing feature's name.
+  #[inline(always)]
+  pub const fn name(&self) -> &'static str {
+    self.name
+  }
+}
+
+/// The audio window's sample count doesn't match what the backend
+/// expects.
+///
+/// Payload of [`BackendError::AudioLength`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioLength {
+  /// Samples actually provided.
+  got: usize,
+  /// Samples the backend expects.
+  expected: usize,
+}
+
+impl AudioLength {
+  /// Construct from the samples actually provided and the samples the
+  /// backend expects.
+  #[inline(always)]
+  pub const fn new(got: usize, expected: usize) -> Self {
+    Self { got, expected }
+  }
+
+  /// Samples actually provided.
+  #[inline(always)]
+  pub const fn got(&self) -> usize {
+    self.got
+  }
+
+  /// Samples the backend expects.
+  #[inline(always)]
+  pub const fn expected(&self) -> usize {
+    self.expected
+  }
+}
+
 /// Failure calling into an [`InferenceBackend`] — mel extraction, encoding,
 /// or a decode step.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -404,37 +469,23 @@ pub enum BackendError {
   #[error("backend tensor failed: {0}")]
   Tensor(#[from] crate::TensorError),
   /// A model's output feature dictionary lacks an expected named output.
-  #[error("{model} model output is missing feature `{name}`")]
-  MissingFeature {
-    /// Which model produced the incomplete output (e.g. `"encoder"`).
-    model: &'static str,
-    /// The missing feature's name.
-    name: &'static str,
-  },
+  #[error("{} model output is missing feature `{}`", .0.model(), .0.name())]
+  MissingFeature(MissingFeature),
   /// The audio window's sample count doesn't match what the backend
   /// expects.
-  #[error("audio window has {got} samples, backend expects {expected}")]
-  AudioLength {
-    /// Samples actually provided.
-    got: usize,
-    /// Samples the backend expects.
-    expected: usize,
-  },
+  #[error("audio window has {} samples, backend expects {}", .0.got(), .0.expected())]
+  AudioLength(AudioLength),
   /// [`mock::MockBackend`]'s scripted logits ran out before the decode loop
   /// finished — the test forgot to script an explicit end-of-text step.
-  #[error("mock script exhausted at step {step}")]
-  ScriptExhausted {
-    /// The step index the script had no entry for.
-    step: usize,
-  },
+  /// Carries the step index the script had no entry for.
+  #[error("mock script exhausted at step {0}")]
+  ScriptExhausted(usize),
   /// A failure scripted by [`mock::MockBackend::fail_on_call`] — lets
   /// hermetic tests drive error paths (e.g. a transiently failing
   /// language probe) that no scripted-logits vocabulary can express.
-  #[error("scripted decode-step failure on call {call}")]
-  ScriptedFailure {
-    /// 1-based ordinal of the failing `decode_step` call.
-    call: usize,
-  },
+  /// Carries the 1-based ordinal of the failing `decode_step` call.
+  #[error("scripted decode-step failure on call {0}")]
+  ScriptedFailure(usize),
 }
 
 // ---------------------------------------------------------------------

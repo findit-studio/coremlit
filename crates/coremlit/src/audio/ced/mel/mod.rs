@@ -57,7 +57,7 @@ use rustfft::{Fft, FftPlanner, num_complex::Complex};
 
 use crate::audio::ced::{
   WINDOW_SAMPLES,
-  error::{Error, Result},
+  error::{AudioTooLong, Error, Result},
 };
 
 /// Mel-frequency bin count — the graph's believed input height. BELIEVED —
@@ -216,10 +216,10 @@ impl MelExtractor {
       return Err(Error::EmptyAudio);
     }
     if samples.len() > WINDOW_SAMPLES {
-      return Err(Error::AudioTooLong {
-        len: samples.len(),
-        max: WINDOW_SAMPLES,
-      });
+      return Err(Error::AudioTooLong(AudioTooLong::new(
+        samples.len(),
+        WINDOW_SAMPLES,
+      )));
     }
 
     // 1. Zero-pad to the fixed window (believed policy; probe-ratified or

@@ -39,10 +39,7 @@ fn from_slice_normalizing_rejects_nan() {
   let mut s = e0();
   s[7] = f32::NAN;
   let err = Embedding::from_slice_normalizing(&s).unwrap_err();
-  assert!(
-    matches!(err, Error::NonFiniteEmbedding { component_index: 7 }),
-    "got {err:?}"
-  );
+  assert!(matches!(err, Error::NonFiniteEmbedding(7)), "got {err:?}");
 }
 
 #[test]
@@ -50,10 +47,7 @@ fn from_slice_normalizing_rejects_inf() {
   let mut s = e0();
   s[3] = f32::INFINITY;
   let err = Embedding::from_slice_normalizing(&s).unwrap_err();
-  assert!(
-    matches!(err, Error::NonFiniteEmbedding { component_index: 3 }),
-    "got {err:?}"
-  );
+  assert!(matches!(err, Error::NonFiniteEmbedding(3)), "got {err:?}");
 }
 
 #[test]
@@ -74,10 +68,7 @@ fn check_finite_output_rejects_model_nan_as_output_not_embedding() {
   let mut s = e0();
   s[5] = f32::NAN;
   let err = check_finite_output(&s).unwrap_err();
-  assert!(
-    matches!(err, Error::NonFiniteOutput { index: 5 }),
-    "got {err:?}"
-  );
+  assert!(matches!(err, Error::NonFiniteOutput(5)), "got {err:?}");
 }
 
 #[test]
@@ -85,10 +76,7 @@ fn check_finite_output_rejects_inf() {
   let mut s = e0();
   s[9] = f32::NEG_INFINITY;
   let err = check_finite_output(&s).unwrap_err();
-  assert!(
-    matches!(err, Error::NonFiniteOutput { index: 9 }),
-    "got {err:?}"
-  );
+  assert!(matches!(err, Error::NonFiniteOutput(9)), "got {err:?}");
 }
 
 #[test]
@@ -118,10 +106,8 @@ fn from_slice_normalizing_wrong_len() {
   assert!(
     matches!(
       err,
-      Error::EmbeddingDimMismatch {
-        expected: EMBEDDING_DIM,
-        got
-      } if got == EMBEDDING_DIM - 1
+      Error::EmbeddingDimMismatch(ref e)
+        if e.expected() == EMBEDDING_DIM && e.got() == EMBEDDING_DIM - 1
     ),
     "got {err:?}"
   );
@@ -233,7 +219,7 @@ fn near_budget_vectors_restore_unit_norm_property() {
             "cos(x, −x) escaped [−1, 1]: {o}"
           );
         }
-        Err(Error::EmbeddingNotUnitNorm { .. }) => {
+        Err(Error::EmbeddingNotUnitNorm(_)) => {
           assert!(
             !expect_accept,
             "rejected a vector the gate should accept (norm² = {norm_sq})"
@@ -266,10 +252,7 @@ fn try_from_unit_slice_rejects_beyond_budget() {
   let mut s = [0.0f32; EMBEDDING_DIM];
   s[0] = (1.0 + 2.0 * NORM_BUDGET).sqrt();
   let err = Embedding::try_from_unit_slice(&s).unwrap_err();
-  assert!(
-    matches!(err, Error::EmbeddingNotUnitNorm { .. }),
-    "got {err:?}"
-  );
+  assert!(matches!(err, Error::EmbeddingNotUnitNorm(_)), "got {err:?}");
 }
 
 #[test]
@@ -279,10 +262,8 @@ fn try_from_unit_slice_wrong_len() {
   assert!(
     matches!(
       err,
-      Error::EmbeddingDimMismatch {
-        expected: EMBEDDING_DIM,
-        got
-      } if got == EMBEDDING_DIM + 1
+      Error::EmbeddingDimMismatch(ref e)
+        if e.expected() == EMBEDDING_DIM && e.got() == EMBEDDING_DIM + 1
     ),
     "got {err:?}"
   );

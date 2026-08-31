@@ -50,9 +50,8 @@ fn short_clip_is_one_window_regardless_of_hop() {
 fn short_clip_survives_drop_below_min() {
   // Mismatch #1: windit's DropBelowMin drops a short clip's sole span; clap's
   // contract keeps it — a clip's only representation is never dropped.
-  let plan = WindowPlan::new().with_tail_policy(TailPolicy::DropBelowMin {
-    min_samples: 200_000,
-  });
+  let plan =
+    WindowPlan::new().with_tail_policy(TailPolicy::DropBelowMin(DropBelowMin::new(200_000)));
   assert_eq!(
     plan
       .spans(100_000)
@@ -89,18 +88,16 @@ fn no_overlap_tiling_with_padded_tail() {
 
 #[test]
 fn drop_below_min_drops_the_short_tail() {
-  let plan = WindowPlan::new().with_tail_policy(TailPolicy::DropBelowMin {
-    min_samples: 120_000,
-  });
+  let plan =
+    WindowPlan::new().with_tail_policy(TailPolicy::DropBelowMin(DropBelowMin::new(120_000)));
   // The 40 000-sample tail (< 120 000) is dropped; the two full windows remain.
   assert_eq!(
     offsets(&plan, 1_000_000),
     vec![(0, 480_000), (480_000, 480_000)]
   );
   // A tail at exactly the threshold is kept (inclusive `>=`).
-  let plan2 = WindowPlan::new().with_tail_policy(TailPolicy::DropBelowMin {
-    min_samples: 40_000,
-  });
+  let plan2 =
+    WindowPlan::new().with_tail_policy(TailPolicy::DropBelowMin(DropBelowMin::new(40_000)));
   assert_eq!(
     offsets(&plan2, 1_000_000),
     vec![(0, 480_000), (480_000, 480_000), (960_000, 40_000)]
@@ -122,9 +119,7 @@ fn overlapping_hop_produces_full_windows_then_tails() {
     ]
   );
   // DropBelowMin keeps the 280 000 tail (>= 120 000), drops the 40 000 one.
-  let dropped = plan.with_tail_policy(TailPolicy::DropBelowMin {
-    min_samples: 120_000,
-  });
+  let dropped = plan.with_tail_policy(TailPolicy::DropBelowMin(DropBelowMin::new(120_000)));
   assert_eq!(
     offsets(&dropped, 1_000_000),
     vec![
@@ -143,7 +138,7 @@ fn window_just_over_boundary_keeps_a_one_sample_tail_under_pad() {
     vec![(0, 480_000), (480_000, 1)]
   );
   // …and drops it under DropBelowMin (it is not the first span).
-  let dropped = WindowPlan::new().with_tail_policy(TailPolicy::DropBelowMin { min_samples: 2 });
+  let dropped = WindowPlan::new().with_tail_policy(TailPolicy::DropBelowMin(DropBelowMin::new(2)));
   assert_eq!(offsets(&dropped, 480_001), vec![(0, 480_000)]);
 }
 
@@ -188,7 +183,7 @@ fn hop_past_window_setter_panics() {
 #[test]
 #[should_panic(expected = "min_samples")]
 fn zero_drop_min_setter_panics() {
-  let _ = WindowPlan::new().with_tail_policy(TailPolicy::DropBelowMin { min_samples: 0 });
+  let _ = WindowPlan::new().with_tail_policy(TailPolicy::DropBelowMin(DropBelowMin::new(0)));
 }
 
 #[test]
@@ -275,7 +270,7 @@ fn planned_windows_matches_materialized_len() {
   let drop_min = |hop: u32, min: u32| {
     WindowPlan::new()
       .with_hop_samples(hop)
-      .with_tail_policy(TailPolicy::DropBelowMin { min_samples: min })
+      .with_tail_policy(TailPolicy::DropBelowMin(DropBelowMin::new(min)))
       .with_max_windows(u32::MAX)
   };
   let cases: [(WindowPlan, usize); 18] = [
@@ -336,14 +331,10 @@ mod serde_tests {
     for plan in [
       WindowPlan::new(),
       WindowPlan::new().with_hop_samples(240_000),
-      WindowPlan::new().with_tail_policy(TailPolicy::DropBelowMin {
-        min_samples: 120_000,
-      }),
+      WindowPlan::new().with_tail_policy(TailPolicy::DropBelowMin(DropBelowMin::new(120_000))),
       WindowPlan::new()
         .with_hop_samples(240_000)
-        .with_tail_policy(TailPolicy::DropBelowMin {
-          min_samples: 120_000,
-        })
+        .with_tail_policy(TailPolicy::DropBelowMin(DropBelowMin::new(120_000)))
         .with_max_windows(50_000),
     ] {
       let json = serde_json::to_string(&plan).unwrap();
@@ -368,10 +359,7 @@ mod serde_tests {
   fn tail_policy_wire_spellings_are_pinned() {
     assert_eq!(serde_json::to_string(&TailPolicy::Pad).unwrap(), r#""pad""#);
     assert_eq!(
-      serde_json::to_string(&TailPolicy::DropBelowMin {
-        min_samples: 120_000
-      })
-      .unwrap(),
+      serde_json::to_string(&TailPolicy::DropBelowMin(DropBelowMin::new(120_000))).unwrap(),
       r#"{"drop_below_min":{"min_samples":120000}}"#
     );
     // The full-plan wire form pins the new `max_windows` field's spelling.
@@ -408,5 +396,25 @@ mod serde_tests {
     // A zero cap can never embed any clip; the validated repr rejects it, just
     // as the setter panics on it.
     assert!(serde_json::from_str::<WindowPlan>(r#"{"max_windows": 0}"#).is_err());
+  }
+
+  /// The rejection MESSAGE, pinned byte-exactly. `TailPolicy::DropBelowMin`
+  /// carries a payload struct that shares its variant's name, so interpolating
+  /// the PAYLOAD renders `DropBelowMin { min_samples: 0 }` — what the
+  /// struct-shaped variant rendered before it was newtyped. Interpolating the
+  /// whole policy instead would double the name, and nothing else asserts this.
+  #[test]
+  fn invalid_tail_min_rejection_message_names_the_payload_once() {
+    let err = WindowPlan::try_from(WindowPlanRepr {
+      hop_samples: DEFAULT_HOP_SAMPLES,
+      tail: TailPolicy::DropBelowMin(DropBelowMin::new(0)),
+      max_windows: DEFAULT_MAX_WINDOWS,
+    })
+    .unwrap_err();
+    assert_eq!(
+      err,
+      "tail DropBelowMin.min_samples must be > 0 and <= WINDOW_SAMPLES \
+       (480000), got DropBelowMin { min_samples: 0 }"
+    );
   }
 }

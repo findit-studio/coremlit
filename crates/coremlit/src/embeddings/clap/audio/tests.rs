@@ -57,8 +57,8 @@ fn check_window_len_rejects_over_length_only() {
   let err = check_window_len(TARGET_SAMPLES + 1).unwrap_err();
   let msg = err.to_string();
   assert!(
-    matches!(err, Error::AudioTooLong { len, max } if len == TARGET_SAMPLES + 1 && max == TARGET_SAMPLES),
-    "expected AudioTooLong{{ len: {}, max: {TARGET_SAMPLES} }}, got {err:?}",
+    matches!(err, Error::AudioTooLong(ref e) if e.len() == TARGET_SAMPLES + 1 && e.max() == TARGET_SAMPLES),
+    "expected AudioTooLong with len {} and max {TARGET_SAMPLES}, got {err:?}",
     TARGET_SAMPLES + 1
   );
   assert!(

@@ -215,10 +215,8 @@ fn wrong_audio_length_is_structured_error() {
   let err = backend.extract_features(&[0.0; 100]).unwrap_err();
   assert!(matches!(
     err,
-    coremlit::audio::whisper::backend::BackendError::AudioLength {
-      got: 100,
-      expected: 480_000
-    }
+    coremlit::audio::whisper::backend::BackendError::AudioLength(ref length)
+      if length.got() == 100 && length.expected() == 480_000
   ));
 }
 
@@ -355,7 +353,7 @@ fn prewarm_over_loaded_models_is_rejected() {
   manager.ensure_loaded().unwrap();
   assert_eq!(manager.state(), ModelState::Loaded);
   let err = manager.prewarm().unwrap_err();
-  assert!(matches!(err, ModelError::InvalidState { .. }));
+  assert!(matches!(err, ModelError::InvalidState(_)));
   assert_eq!(manager.state(), ModelState::Loaded, "state untouched");
   manager.unload();
   assert_eq!(

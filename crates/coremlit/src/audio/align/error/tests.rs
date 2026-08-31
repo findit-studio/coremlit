@@ -2,29 +2,24 @@ use super::*;
 
 #[test]
 fn aligner_error_wraps_load_via_from() {
-  let inner = crate::LoadError::NotFound {
-    path: "base960h_aligner.mlmodelc".into(),
-  };
+  let inner = crate::LoadError::NotFound("base960h_aligner.mlmodelc".into());
   let e: AlignerError = inner.into();
   assert!(matches!(e, AlignerError::Load(_)));
 }
 
 #[test]
 fn aligner_error_load_displays_inner_message() {
-  let e: AlignerError = crate::LoadError::NotFound {
-    path: "/tmp/missing.mlmodelc".into(),
-  }
-  .into();
+  let e: AlignerError = crate::LoadError::NotFound("/tmp/missing.mlmodelc".into()).into();
   assert!(e.to_string().contains("/tmp/missing.mlmodelc"));
 }
 
 #[test]
 fn aligner_error_contract_mismatch_displays_feature_and_shapes() {
-  let e = AlignerError::ContractMismatch {
-    feature: "emissions",
-    expected: "[1, 2999, 29] f32".to_string(),
-    actual: "[1, 2999, 32] f32".to_string(),
-  };
+  let e = AlignerError::ContractMismatch(ContractMismatch::new(
+    "emissions",
+    "[1, 2999, 29] f32".to_string(),
+    "[1, 2999, 32] f32".to_string(),
+  ));
   let rendered = e.to_string();
   assert!(rendered.contains("emissions"));
   assert!(rendered.contains("2999, 29"));
@@ -33,20 +28,18 @@ fn aligner_error_contract_mismatch_displays_feature_and_shapes() {
 
 #[test]
 fn aligner_error_is_equatable_and_cloneable() {
-  let a = AlignerError::ContractMismatch {
-    feature: "waveform",
-    expected: "[1, 960000] f32".to_string(),
-    actual: "[1, 480000] f32".to_string(),
-  };
+  let a = AlignerError::ContractMismatch(ContractMismatch::new(
+    "waveform",
+    "[1, 960000] f32".to_string(),
+    "[1, 480000] f32".to_string(),
+  ));
   let b = a.clone();
   assert_eq!(a, b);
 }
 
 #[test]
 fn align_error_wraps_prediction_via_from() {
-  let inner = crate::PredictionError::MissingOutput {
-    name: "emissions".to_string(),
-  };
+  let inner = crate::PredictionError::MissingOutput("emissions".to_string());
   let e: AlignError = inner.into();
   assert!(matches!(e, AlignError::Prediction(_)));
   assert!(e.to_string().contains("emissions"));
@@ -54,10 +47,7 @@ fn align_error_wraps_prediction_via_from() {
 
 #[test]
 fn align_error_wraps_tensor_via_from() {
-  let inner = crate::TensorError::ShapeMismatch {
-    expected: 960_000,
-    actual: 100,
-  };
+  let inner = crate::TensorError::ShapeMismatch(crate::ShapeMismatch::new(960_000, 100));
   let e: AlignError = inner.into();
   assert!(matches!(e, AlignError::Tensor(_)));
   assert!(e.to_string().contains("960000") || e.to_string().contains("960_000"));
@@ -100,10 +90,10 @@ fn aligner_error_wraps_seam_via_from() {
 
 #[test]
 fn align_error_input_too_long_displays_both_counts() {
-  let e = AlignError::InputTooLong {
-    got: 1_000_000,
-    max: crate::audio::align::encode::ENCODER_WINDOW_SAMPLES,
-  };
+  let e = AlignError::InputTooLong(InputTooLong::new(
+    1_000_000,
+    crate::audio::align::encode::ENCODER_WINDOW_SAMPLES,
+  ));
   let rendered = e.to_string();
   assert!(rendered.contains("1000000"));
   assert!(rendered.contains("960000"));
@@ -116,12 +106,12 @@ fn align_error_corrupt_emissions_names_the_placement_and_the_floor() {
   // without knowing anything about fp16 subnormals. So the placement, the
   // floor that was tripped, the observed minimum and the blast radius all
   // have to survive into Display. The real ANE numbers, measured on jfk.wav.
-  let e = AlignError::CorruptEmissions {
-    compute: crate::ComputeUnits::All,
-    min: -45_440.0,
-    cells: 2_667,
-    total: 15_921,
-  };
+  let e = AlignError::CorruptEmissions(CorruptEmissions::new(
+    crate::ComputeUnits::All,
+    -45_440.0,
+    2_667,
+    15_921,
+  ));
   let rendered = e.to_string();
   assert!(
     rendered.contains("All"),
@@ -155,12 +145,12 @@ fn align_error_unnormalized_emissions_names_the_frame_and_logsumexp() {
   // model artifact swapped for a raw-logit head — straight off the message, so
   // the offending frame, its logsumexp, the tolerance and the placement all
   // survive into Display.
-  let e = AlignError::UnnormalizedEmissions {
-    compute: crate::ComputeUnits::All,
-    row: 2_832,
-    logsumexp: 6.63,
-    tolerance: crate::audio::align::encode::LOG_PROB_SUM_TOLERANCE,
-  };
+  let e = AlignError::UnnormalizedEmissions(UnnormalizedEmissions::new(
+    crate::ComputeUnits::All,
+    2_832,
+    6.63,
+    crate::audio::align::encode::LOG_PROB_SUM_TOLERANCE,
+  ));
   let rendered = e.to_string();
   assert!(rendered.contains("2832"), "must name the frame: {rendered}");
   assert!(
@@ -179,4 +169,33 @@ fn align_error_unnormalized_emissions_names_the_frame_and_logsumexp() {
     rendered.contains("raw-logit"),
     "must name the likely cause: {rendered}"
   );
+}
+
+#[test]
+fn decision_language_display_separates_found_from_requested() {
+  // `new` takes (index, requested, found); the message prints the FOUND
+  // language first and the REQUESTED one second, which is the pair a
+  // positional-argument slip would swap without changing the prose.
+  let e = AlignError::DecisionLanguage(DecisionLanguage::new(3, asry::Lang::En, asry::Lang::Zh));
+  let rendered = e.to_string();
+  assert!(
+    rendered.starts_with("oov_decisions[3] carries language "),
+    "{rendered}"
+  );
+  assert!(
+    rendered.contains("carries language Zh but the chunk is being aligned for En"),
+    "{rendered}"
+  );
+  assert!(rendered.contains("AlignmentSet::detect_oov"), "{rendered}");
+}
+
+#[test]
+fn language_unsupported_display_names_the_language_and_the_policy() {
+  let rendered = AlignError::LanguageUnsupported(asry::Lang::Zh).to_string();
+  assert!(
+    rendered.contains("no aligner registered for language Zh"),
+    "{rendered}"
+  );
+  assert!(rendered.contains("no `Any` fallback"), "{rendered}");
+  assert!(rendered.contains("`Error`"), "{rendered}");
 }
