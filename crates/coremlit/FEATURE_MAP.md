@@ -148,24 +148,31 @@ that let vadkit be committed instead. Each target declares its gates once per
 size, so the CI step filters on `tiny::`; the `mini`/`small`/`base` gates stay
 local/dev gates against an owner-staged `CED_TEST_MODELS` tree.
 
-`lid` splits the same way, but only half of it is wired today. The `features`
-job runs the hermetic lid suite (the mel front end, the roster/asset agreement
-checks, every typed-error path) under the `lid` row and both all-on rows. The
-model-gated `lid_model_io` (5 gates) and `lid_e2e` (4 gates) targets have **no
-`model-tests` shard yet** and stay local/dev gates against an owner-staged
-`LID_TEST_MODELS` tree — the same posture `align` is in, and for a related
-reason. It is not the download: it is that `Models/lid/` cannot enter any shard
-until `tests/fp16_guards.rs`'s graph sweep can read the artifact. That sweep
-walks `Models/` WHOLE, and this graph is a coremltools 9 export whose scalar
-consts use MIL's terse `fp16 v = const()[val = fp16(…)]` spelling instead of the
-`tensor<fp16, []>` form the reader knows, so all 36 of its guard sites come back
-unresolved; and once they are readable its final `softmax -> log` carries
+`lid` splits the same way. The `features` job runs the hermetic lid suite (the
+mel front end, the roster/asset agreement checks, every typed-error path) under
+the `lid` row and both all-on rows, and the `lid` `model-tests` shard stages the
+41 MB bundle and runs `lid_model_io` (5 gates) and `lid_e2e` (4 gates). There is
+no `@lib` half — every lid model gate is a `tests/lid/*` target, so
+`--features lid --lib -- --list --ignored` lists zero, and a group that selected
+it would trip the runner's anti-vacuum guard.
+
+That shard was blocked for a release, and on the graph sweep rather than the
+download. `tests/fp16_guards.rs` walks `Models/` WHOLE, and this artifact is a
+coremltools 9 export whose scalar consts use MIL's terse
+`fp16 v = const()[val = fp16(…)]` spelling instead of the `tensor<fp16, []>`
+form the reader knew, so all 36 of its guard sites came back unresolved; and
+once they were readable its final `softmax -> log` turned out to carry
 `epsilon = 0x1p-149`, the same vanishing-guard defect `alignkit` and
-`speakerkit/Segmentation` are pinned for. Teaching the reader that dialect and
-cutting a `KNOWN_DEFECTS` pin are prerequisites for the shard, and both are
-model-numerics work rather than CI registration. There would be no `@lib` half
-in any case — every lid model gate is a `tests/lid/*` target, so
-`--features lid --lib -- --list --ignored` lists zero.
+`speakerkit/Segmentation` are pinned for. Both halves are settled — the reader
+takes either spelling, and `KNOWN_DEFECTS` carries a
+`lid/SpeechBrainECAPAVoxLingua107.mlmodelc` entry whose note records what the
+inert guard costs today, the exact change that would arm it, and the two
+repairs already measured NOT to work. The shard is also the second kit
+to declare `checksum-dir: none`: this repo publishes its digests in an
+`artifact_manifest.json` that `shasum -c` cannot read, so the exemption is
+recorded with that reason in `CHECKSUMLESS_KITS`
+(`tests/whisper/models_lock.rs`), which refuses `none` from any kit not listed
+there and fails if a listed kit stops declaring it.
 
 `speaker` splits the same way, with one wrinkle no other kit has: its artifact
 set is staged from TWO repositories into one directory, and the second overlays

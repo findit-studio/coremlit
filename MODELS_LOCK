@@ -72,7 +72,11 @@
 # instead by the per-file SHA-256 pins in
 # crates/coremlit/tests/speaker/model_io.rs (`wespeaker_v2.mlmodelc`) and by
 # the `tests/fp16_guards.rs` graph sweep, which reads every staged
-# `model.mil` and pins its guard sites in both directions.
+# `model.mil` and pins its guard sites in both directions. The lid repo is in
+# the same position for a different reason — it publishes digests, but in an
+# `artifact_manifest.json` that `shasum -c` cannot read — and is covered the
+# same way: an exact per-file manifest the gates check, plus that sweep. See
+# its table.
 cache-epoch = 1
 
 ["argmaxinc/whisperkit-coreml"]
@@ -299,3 +303,38 @@ kit       = "clap"
 include   = "*.mlmodelc/* CHECKSUMS.sha256"
 revision  = "02a99c6a8be21da1e9a947499ea503a10c80c4f1"
 local-dir = "Models/clapkit"
+
+# The SpeechBrain ECAPA VoxLingua107 spoken-language identifier
+# (`audio::lid`), staged under Models/lid/ — the directory
+# tests/lid/common/mod.rs resolves by default (the `lid` shard sets
+# `LID_TEST_MODELS` to the same path explicitly).
+#
+# ONE 41 MB `.mlmodelc`, the whole kit. `include` names the bundle DIRECTLY:
+# this repo publishes no size or tier directory the way `ced` and `siglip` do,
+# so `local-dir` IS the models root and the tree lands at
+# `Models/lid/SpeechBrainECAPAVoxLingua107.mlmodelc`. Adding a path component
+# here would stage the bundle one level below where every lid gate looks.
+#
+# THIS REPO SHIPS NO `CHECKSUMS.sha256` — the second such kit after whisper,
+# and for a different reason: it DOES publish per-file digests, in
+# `artifact_manifest.json`, which `shasum -c` cannot read. Pointing
+# `checksum-file` at it would fail on a correct tree, so the shard declares
+# `checksum-dir: none`, recorded with that reason in `CHECKSUMLESS_KITS`
+# (crates/coremlit/tests/whisper/models_lock.rs), which also fails if the row
+# ever stops declaring it. The bytes are covered instead by `ARTIFACT_SHA256`
+# in tests/lid/common/mod.rs — an EXACT file set, so a missing or an added file
+# reds as loudly as a changed one — verified by
+# `artifact_matches_the_pinned_sha_manifest`, and by tests/fp16_guards.rs,
+# which parses the staged `model.mil` and pins its 36 guard sites in BOTH
+# directions.
+#
+# The revision is the ARTIFACT repo's commit SHA, and it is the one both that
+# manifest and the fp16 pin were cut against. Do not confuse it with the
+# upstream `speechbrain/lang-id-voxlingua107-ecapa` SOURCE revision recorded in
+# tests/lid/common/mod.rs, which names the PyTorch checkpoint the conversion
+# consumed — a different chain entirely.
+["aufklarer/SpeechBrain-ECAPA-VoxLingua107-21M-CoreML"]
+kit       = "lid"
+include   = "SpeechBrainECAPAVoxLingua107.mlmodelc/*"
+revision  = "2aa4d715a79e410d5f9aa32bd7a4fc9225bf9eb0"
+local-dir = "Models/lid"

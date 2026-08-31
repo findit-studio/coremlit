@@ -32,7 +32,7 @@ struct LockTable {
 /// [`KNOWN_DEFECTS`](../fp16_guards.rs) vendors that NO shard stages, and why.
 ///
 /// This is a real, named coverage gap, not a formality: three of the sweep's
-/// eight pinned defects live under these two vendors, and no `model-tests`
+/// nine pinned defects live under these two vendors, and no `model-tests`
 /// shard verifies them because MODELS_LOCK has no table that fetches them. They
 /// stay local/dev-only. Listing them here is what makes the gap reviewable —
 /// `ci_fp16_sweep_shards_cover_every_pinned_vendor` fails on any OTHER pinned
@@ -61,12 +61,41 @@ const UNSTAGED_DEFECT_VENDORS: &[(&str, &str)] = &[
 /// specifically. Every OTHER staged vendor must appear in its shard's manifest.
 const GRAPHLESS_VENDORS: &[&str] = &["tokenizers"];
 
-/// The one kit permitted to declare `checksum-dir: none`.
+/// The kits permitted to declare `checksum-dir: none`, each with the reason
+/// none of its artifact repos ships a `shasum -c`-readable `CHECKSUMS.sha256`
+/// and what covers those bytes instead.
 ///
-/// Neither `argmaxinc/whisperkit-coreml` nor `openai/whisper-tiny` ships a
-/// `CHECKSUMS.sha256`. Every other artifact repo in the lock does, so `none`
-/// anywhere else means a verification was dropped rather than declared absent.
-const CHECKSUMLESS_KIT: &str = "whisper";
+/// `none` is a DECLARED absence, and the entry here IS the declaration: for
+/// every other kit it would mean a verification was silently dropped. A
+/// reasoned registry rather than one name, because the property is per-REPO
+/// and the reasons genuinely differ — whisper's upstreams publish no digests at
+/// all, while lid's publishes them in a format `shasum -c` cannot read. Naming
+/// the substitute coverage is the load-bearing half: an exemption whose reason
+/// nobody can restate is one nobody can retire.
+///
+/// Bidirectional, and that is the staleness check
+/// ([`ci_shards_every_kit_in_the_lock`]): a kit listed here that does NOT
+/// declare `checksum-dir: none` fails, so an exemption cannot outlive the
+/// upstream gap it describes. The day one of these repos grows a checksum file
+/// and its shard starts verifying against it, this entry has to go with it.
+const CHECKSUMLESS_KITS: &[(&str, &str)] = &[
+  (
+    "whisper",
+    "neither argmaxinc/whisperkit-coreml nor openai/whisper-tiny publishes digests in any form, \
+     and both tables are still on `revision = \"main\"` (MODELS_LOCK's LOUD FOLLOW-UP), so there \
+     is nothing to verify against that would mean anything. Their bytes are covered by the \
+     whisper gates' own model_io pins and by the fp16_guards graph sweep.",
+  ),
+  (
+    "lid",
+    "aufklarer/SpeechBrain-ECAPA-VoxLingua107-21M-CoreML ships NO CHECKSUMS.sha256: its per-file \
+     digests live in `artifact_manifest.json`, which `shasum -c` cannot read. Pointing \
+     `checksum-file` at it would fail on a correct tree. The bytes are covered instead by \
+     `ARTIFACT_SHA256` in tests/lid/common/mod.rs — an EXACT file set, so a missing or an added \
+     file reds too — verified by `artifact_matches_the_pinned_sha_manifest`, which this shard \
+     runs, and by the fp16_guards graph sweep.",
+  ),
+];
 
 fn workspace_root() -> PathBuf {
   PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..")
@@ -486,6 +515,14 @@ fn ci_shards_every_kit_in_the_lock() {
      then gates a bare checkout. Add the missing table or the missing matrix row."
   );
 
+  let checksumless: BTreeMap<&str, &str> = CHECKSUMLESS_KITS.iter().copied().collect();
+  assert_eq!(
+    checksumless.len(),
+    CHECKSUMLESS_KITS.len(),
+    "CHECKSUMLESS_KITS lists a kit twice; the second reason would be unreachable"
+  );
+  let mut declared_checksumless: BTreeSet<&str> = BTreeSet::new();
+
   for row in &rows {
     let kit = row_field(row, "kit");
     let local_dirs: Vec<&str> = tables
@@ -503,12 +540,20 @@ fn ci_shards_every_kit_in_the_lock() {
     }
     let checksum_dir = require_field(row, "checksum-dir");
     if checksum_dir == "none" {
-      assert_eq!(
-        kit, CHECKSUMLESS_KIT,
-        "ci.yml's {kit:?} shard declares `checksum-dir: none`, but only the {CHECKSUMLESS_KIT:?} \
-         kit's repos ship no CHECKSUMS.sha256. Either that repo grew one and this shard should \
-         verify against it, or a verification was dropped."
+      let reason = checksumless.get(kit).unwrap_or_else(|| {
+        panic!(
+          "ci.yml's {kit:?} shard declares `checksum-dir: none`, but CHECKSUMLESS_KITS does not \
+           record that kit's repos as shipping no shasum-readable CHECKSUMS.sha256 (it records \
+           {:?}). Either a verification was dropped, or the absence is real — in which case add \
+           {kit:?} here WITH the reason and the coverage that stands in for it.",
+          checksumless.keys().collect::<Vec<_>>()
+        )
+      });
+      assert!(
+        !reason.trim().is_empty(),
+        "CHECKSUMLESS_KITS records {kit:?} with an empty reason; the reason is the declaration"
       );
+      declared_checksumless.insert(kit);
     } else {
       paths.push(checksum_dir);
       assert!(
@@ -562,6 +607,28 @@ fn ci_shards_every_kit_in_the_lock() {
          {features:?})"
       );
     }
+  }
+
+  // The staleness half of the checksum exemption. An entry in CHECKSUMLESS_KITS
+  // is a claim about an upstream repo, and upstream repos change: the day one
+  // starts publishing a `shasum -c`-readable CHECKSUMS.sha256 and its shard
+  // begins verifying against it, the exemption is a lie that would let the NEXT
+  // dropped verification hide behind it. So the registry must name only kits
+  // that actually declare `none`, today — and only kits that still have a
+  // shard, since a deleted shard's exemption is the same stale claim.
+  for (kit, _) in CHECKSUMLESS_KITS {
+    assert!(
+      shard_kits.contains(kit),
+      "CHECKSUMLESS_KITS names {kit:?}, which has no model-tests shard in ci.yml. The exemption \
+       describes a shard that no longer exists — drop the entry."
+    );
+    assert!(
+      declared_checksumless.contains(kit),
+      "CHECKSUMLESS_KITS records {kit:?} as staging no repo with a shasum-readable \
+       CHECKSUMS.sha256, but its shard now names a checksum-dir. If the repo grew one, that is \
+       good news — delete this entry so the exemption cannot outlive its reason and shelter the \
+       next verification somebody drops."
+    );
   }
 }
 
@@ -990,7 +1057,7 @@ fn ci_stages_the_speakerkit_overlay_last_and_proves_it_won() {
 /// `COREMLIT_FP16_SWEEP_VENDORS` is fail-closed per shard (a named vendor
 /// directory that is missing fails the sweep) but says nothing about vendors no
 /// shard names at all. Unset, the sweep demands every `KNOWN_DEFECTS` vendor;
-/// narrowed six ways, it demands whatever the six rows happen to list. This
+/// narrowed seven ways, it demands whatever the seven rows happen to list. This
 /// pins both directions of that:
 ///
 /// - every pinned-defect vendor is swept by SOME shard, or is declared in
@@ -1123,7 +1190,7 @@ fn ci_model_tests_gates_cannot_be_silently_skipped() {
 
   // Vacuum guard: a parse that produced no steps would pass every loop below.
   // Every shard runs this exact list — that uniformity is what lets one ledger
-  // and one set of pins cover all six.
+  // and one set of pins cover all seven.
   for gate in [
     "name: Verify staged overlay ordering",
     "name: Verify staged artifact checksums",

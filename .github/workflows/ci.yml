@@ -53,7 +53,7 @@ jobs:
       # and the composition once, there — neither twice, neither dropped. The
       # committed graph is still swept for fp16 guards on every shard: each
       # `model-tests` row names `vadkit` in its sweep manifest, so deleting the
-      # vendored artifact fails all six.
+      # vendored artifact fails all seven.
       #
       # `vad_parity_swift` is deliberately NOT here, and cannot be until its
       # goldens are regenerated on a runner. Its committed Swift traces carry no
@@ -172,7 +172,7 @@ jobs:
   # EVERY SHARD RUNS THE IDENTICAL STEP LIST. Nothing here is `if: matrix.kit ==
   # ...`; the per-kit differences are DATA in the matrix rows below, which is
   # what lets one `Gate ledger` step, one anti-vacuum guard and one set of
-  # hermetic pins cover all six shards instead of six near-copies drifting apart.
+  # hermetic pins cover all seven shards instead of seven near-copies drifting apart.
   # A new kit is a new matrix row plus a new MODELS_LOCK table, and
   # `ci_shards_every_kit_in_the_lock` (tests/whisper/models_lock.rs) fails if you
   # add one without the other in either direction.
@@ -223,34 +223,30 @@ jobs:
   #   ced        0  these kits' model gates all live in `tests/`, so a `@lib`
   #   clap       0  group would list ZERO ignored tests and (correctly) trip
   #   siglip     0  the gate runner's anti-vacuum guard, exactly as
-  #                 `clap_tokenizer_identity` would. The same is true of the
-  #                 `vad` gates in the modelless `check` job, and of `lid`
-  #                 below.
-  #   lid        0  NO ROW REACHES ITS NINE `tests/lid/*` GATES EITHER, and the
-  #                 reason is the fp16 sweep rather than the download. Staging
-  #                 `Models/lid/` in any shard puts
+  #   lid        0  `clap_tokenizer_identity` would. The same is true of the
+  #                 `vad` gates in the modelless `check` job.
+  #
+  #                 lid's NINE `tests/lid/*` gates (5 + 4) are reached by its
+  #                 own row below. Registering that row was blocked on the fp16
+  #                 sweep, not on the download: staging `Models/lid/` puts
   #                 SpeechBrainECAPAVoxLingua107.mlmodelc under
   #                 `every_shipped_model_graph_survives_fp16`, which walks
-  #                 Models/ WHOLE and fails on it twice over: the graph is a
-  #                 coremltools 9 / MIL program(1.3) export whose scalar consts
-  #                 are spelled `fp16 v = const()[val = fp16(...)]` rather than
-  #                 `tensor<fp16, []> v = const()[val = tensor<fp16, []>(...)]`,
-  #                 so tests/fp16_guards.rs's reader resolves NONE of its 36
-  #                 guard sites ("36 guard-looking statement(s) the reader could
-  #                 not resolve", then "parsed zero guard sites ... the parser
-  #                 has rotted"); and the graph's final `softmax -> log` carries
+  #                 Models/ WHOLE and used to fail on it twice over. The graph
+  #                 is a coremltools 9 / MIL program(1.3) export whose scalar
+  #                 consts are spelled `fp16 v = const()[val = fp16(...)]`
+  #                 rather than `tensor<fp16, []> v = const()[val =
+  #                 tensor<fp16, []>(...)]`, so the reader resolved NONE of its
+  #                 36 guard sites; and its final `softmax -> log` carries
   #                 `epsilon = 0x1p-149`, fp32's smallest subnormal — the
   #                 alignkit/Segmentation defect exactly — so once the reader
-  #                 CAN read it the sweep reports a new unpinned vanishing
-  #                 guard. A `lid` shard therefore needs the sweep's reader
-  #                 taught this dialect AND a KNOWN_DEFECTS pin cut with a note
-  #                 saying what the inert guard costs the shipped door; neither
-  #                 is CI registration. Until then lid's model gates are
-  #                 local/dev, like align's — `LID_TEST_MODELS=<tree> cargo test
-  #                 -p coremlit --features lid --test lid_model_io --test
-  #                 lid_e2e -- --ignored` (5 + 4 gates, green against the pinned
-  #                 artifact). Its HERMETIC suite does run on every PR: the
-  #                 `features` job's `lid` row and both all-on rows.
+  #                 COULD read it the sweep reported a new unpinned vanishing
+  #                 guard. Both halves are settled: tests/fp16_guards.rs reads
+  #                 the bare-scalar dialect (in BOTH spellings, pinned
+  #                 hermetically) and carries the
+  #                 `lid/SpeechBrainECAPAVoxLingua107.mlmodelc` KNOWN_DEFECTS
+  #                 entry whose note records what the inert guard costs, what
+  #                 would arm it, and which two repairs are already known not to
+  #                 work.
   #   align     19  (20 with `tracing`) NO ROW REACHES THEM, and none can from
   #                 here: `align` has no MODELS_LOCK table — alignkit is one of
   #                 `UNSTAGED_DEFECT_VENDORS` (tests/whisper/models_lock.rs),
@@ -289,7 +285,8 @@ jobs:
           # 78 MB: the 73 MB whisper-tiny bundle plus a 5 MB tokenizer sidecar,
           # from two repos into two separate directories.
           #
-          # The only kit with `checksum-dir: none`: neither of its two upstream
+          # One of the two kits with `checksum-dir: none` (`lid` is the other,
+          # for a different reason — see its row): neither of its two upstream
           # repos ships a CHECKSUMS.sha256, and both tables are still on
           # `revision = "main"` (MODELS_LOCK's LOUD FOLLOW-UP), so there is
           # nothing to verify against that would mean anything. Their names stay
@@ -460,6 +457,44 @@ jobs:
             fp16-vendors: vadkit,siglip2-naflex
             gates: |
               siglip|siglip_tokenizer_identity siglip_model_io siglip_text_model_io siglip_parity_embed siglip_placement siglip_e2e
+          # 41 MB — ONE `.mlmodelc`, the whole kit. MODELS_LOCK's `include`
+          # names the bundle directly (this repo publishes no size or tier
+          # directory the way ced's and siglip's do), so its `local-dir` IS the
+          # models root: `Models/lid` is the cache path, the probe's parent, and
+          # the directory `LID_TEST_MODELS` names below.
+          #
+          # `checksum-dir: none` is the SECOND declared absence in this file,
+          # after whisper's, and it is a different absence. aufklarer's repo DOES
+          # publish per-file digests — in `artifact_manifest.json`, which
+          # `shasum -c` cannot read — so a `checksum-file` pointed at it would
+          # fail on a correct tree. The bytes are covered by
+          # `artifact_matches_the_pinned_sha_manifest`, one of the five
+          # `lid_model_io` gates below, which checks an EXACT per-file SHA-256
+          # set (`ARTIFACT_SHA256`, tests/lid/common/mod.rs) so a missing or an
+          # added file reds too. `CHECKSUMLESS_KITS` in
+          # crates/coremlit/tests/whisper/models_lock.rs records the exemption
+          # WITH that reason, refuses `none` from any kit not listed there, and
+          # fails if a listed kit ever stops declaring it — so the exemption
+          # cannot outlive the upstream gap it describes.
+          #
+          # NO `@lib` GROUP, unlike granite and speaker: `audio::lid`'s in-lib
+          # tests are all hermetic and list ZERO ignored gates, which would
+          # (correctly) trip the anti-vacuum guard in the runner below. Their
+          # lines are covered by the `features` job.
+          #
+          # The fp16 sweep is half of why this shard exists. The graph is a
+          # coremltools 9 `program(1.3)` export whose scalar consts are written
+          # bare (`fp16 eps = const()[.., val = fp16(..)]`), and it carries the
+          # `lid/SpeechBrainECAPAVoxLingua107.mlmodelc` KNOWN_DEFECTS pin — a
+          # third instance of the vanishing-guard class. Until this row landed no
+          # shard staged Models/lid/, so nothing verified that pin.
+          - kit: lid
+            cache: Models/lid
+            probe: Models/lid/SpeechBrainECAPAVoxLingua107.mlmodelc
+            checksum-dir: none
+            fp16-vendors: vadkit,lid
+            gates: |
+              lid|lid_model_io lid_e2e
     # Every kit's test-model override, set for every shard. Each of these
     # resolves to the same path the suite's `common/mod.rs` falls back to, so
     # nothing changes behaviorally — the point is that the gates NAME the
@@ -474,6 +509,7 @@ jobs:
       SPEAKERKIT_TEST_MODELS: ${{ github.workspace }}/Models/speakerkit
       CLAPKIT_TEST_MODELS: ${{ github.workspace }}/Models/clapkit
       SIGLIP_TEST_MODELS: ${{ github.workspace }}/Models/siglip2-naflex
+      LID_TEST_MODELS: ${{ github.workspace }}/Models/lid
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -760,14 +796,14 @@ jobs:
       # including two no runner fetches). Naming them all is what makes a
       # vanished vendor tree a FAILURE rather than a quiet drop in coverage.
       # Every row names `vadkit`, which needs no download — it is committed — so
-      # deleting the vendored VAD model is a hard failure in all six shards
+      # deleting the vendored VAD model is a hard failure in all seven shards
       # rather than a silent loss of the sweep's clean control.
       #
       # THE UNION ACROSS SHARDS IS THE COVERAGE, and it is pinned:
       # `ci_fp16_sweep_shards_cover_every_pinned_vendor`
       # (tests/whisper/models_lock.rs) fails if a KNOWN_DEFECTS vendor is swept
       # by no shard, and fails if a shard stages a vendor tree it does not
-      # sweep. The `speaker` shard carries FIVE of the eight KNOWN_DEFECTS pins
+      # sweep. The `speaker` shard carries FIVE of the nine KNOWN_DEFECTS pins
       # (Segmentation, wespeaker_v2, wespeaker_int8, PLDA, PldaRho) — pinned in
       # BOTH directions, so an unannounced re-conversion that REPAIRS one is as
       # loud as a new defect. The remaining three (alignkit, and the two argmax
@@ -793,7 +829,7 @@ jobs:
         id: fp16_inventory
         if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
         run: crates/coremlit/tests/fp16_sweep_inventory.sh
-      # ONE gate runner for all six shards, driven by the matrix row's `gates`
+      # ONE gate runner for all seven shards, driven by the matrix row's `gates`
       # plan: one `features|selectors|filter` group per line, where a selector
       # is a test-target name, `@lib` for the in-lib gates, or `@all` for the
       # whole suite under those features. `@all` SUBSUMES `@lib`, because a
@@ -886,7 +922,7 @@ jobs:
       # on the PR page rather than buried as a `skipped` step. What GitHub does
       # NOT notice is a shard that exists but whose checks quietly stopped
       # running, which is what this still catches — and because every shard runs
-      # the identical step list, one ledger covers all six.
+      # the identical step list, one ledger covers all seven.
       #
       # Adding a step above means adding its id here. Forgetting to is the
       # benign direction (the new check is simply unwatched); forgetting the
