@@ -83,6 +83,7 @@ fn every_payload_variant_is_a_newtype() {
     NotADistribution::new(ScorePooling::MeanProbability, 0.5).into(),
     Error::LanguageCountMismatch(106),
     InvalidLogProbability::new(12, 0.5).into(),
+    Error::PositiveOutput(InvalidLogProbability::new(94, 0.25)),
   ];
 
   for error in cases {
@@ -111,6 +112,10 @@ fn every_payload_variant_is_a_newtype() {
       Error::InvalidLogProbability(detail) => {
         assert_eq!(detail.index(), 12);
         assert_eq!(detail.value(), 0.5);
+      }
+      Error::PositiveOutput(detail) => {
+        assert_eq!(detail.index(), 94);
+        assert_eq!(detail.value(), 0.25);
       }
       other => panic!("unexpected variant {other:?}"),
     }

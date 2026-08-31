@@ -26,13 +26,20 @@ pub type Result<T> = core::result::Result<T, Error>;
 /// [`Error::Windowing`] carries it (`audio::ced`'s convention).
 pub use windit::WinditError;
 
-/// A value offered to [`LogProbabilities::try_from_slice`] is not a natural-log
-/// probability: it is NaN, or it is greater than zero.
+/// A value is not a natural-log probability: it is NaN, or it is greater than
+/// zero.
 ///
-/// `-∞` is deliberately ACCEPTED — it is the exact log of a zero probability,
-/// which [`ScorePooling::Vote`] genuinely produces for a language no window
-/// chose. Only NaN (which would sort silently under `total_cmp`) and positive
-/// values (which no log-softmax output can take) are rejected.
+/// Carried by both variants that report that fact — [`Error::InvalidLogProbability`]
+/// for a value a CALLER offered [`LogProbabilities::try_from_slice`], and
+/// [`Error::PositiveOutput`] for one the GRAPH emitted — because the two doors
+/// apply one shared predicate and differ only in whose row is at fault.
+///
+/// `-∞` is deliberately ACCEPTED by that predicate — it is the exact log of a
+/// zero probability, which [`ScorePooling::Vote`] genuinely produces for a
+/// language no window chose. Only NaN (which would sort silently under
+/// `total_cmp`) and positive values (which no log-softmax output can take) are
+/// rejected. The model door additionally refuses `-∞`, and reports that as
+/// [`Error::NonFiniteOutput`] rather than through this payload.
 ///
 /// [`LogProbabilities::try_from_slice`]: super::LogProbabilities::try_from_slice
 /// [`ScorePooling::Vote`]: super::ScorePooling::Vote
@@ -328,8 +335,37 @@ pub enum Error {
   /// A model output log-probability was NaN or infinite, carrying its language
   /// index — model corruption, caught before it can reach the ranking heap
   /// (where `total_cmp` would silently sort a NaN) or `exp`.
+  ///
+  /// Its sibling [`Self::PositiveOutput`] carries the other half of the same
+  /// door. The two split ONE refusal by cause, not by rule: admission is
+  /// decided by a single predicate, and only the diagnosis branches.
   #[error("model output contains a non-finite log-probability at index {0}")]
   NonFiniteOutput(usize),
+
+  /// A model output score was finite and ABOVE zero, so it is not a
+  /// natural-log probability at all — carrying its model column and the value.
+  ///
+  /// This is the half a finiteness-only guard let through, and it is not
+  /// hypothetical. `tests/fp16_guards.rs` records it measured on this very
+  /// graph: a `x - logsumexp(x)` re-conversion overflows fp16 inside the reduce
+  /// and the tail comes back as RAW LOGITS, maximum +22.86. Every value in it
+  /// is finite, so nothing upstack noticed; ranking still ordered them
+  /// correctly, and [`LanguageScore::probability`] then reported `exp(22.86)`
+  /// as a confidence. An impossible number is worse than a refusal, so the door
+  /// refuses.
+  ///
+  /// The boundary is `> 0`, not `>= 0`, and that is measured rather than
+  /// assumed: this graph does emit exactly `0.0` on
+  /// [`ComputeUnits::CpuOnly`] — see
+  /// [`LogProbabilities::try_from_slice`]'s predicate for the count and the
+  /// sweep that produced it — so a door written to "a log-softmax output is
+  /// strictly negative" would refuse real audio.
+  ///
+  /// [`LanguageScore::probability`]: super::LanguageScore::probability
+  /// [`LogProbabilities::try_from_slice`]: super::LogProbabilities::try_from_slice
+  /// [`ComputeUnits::CpuOnly`]: crate::ComputeUnits::CpuOnly
+  #[error("model emitted a positive score: {0}")]
+  PositiveOutput(InvalidLogProbability),
 
   /// The windowing plan for a long clip could not be built — it exceeded
   /// [`WindowPlan::max_windows`] ([`WinditError::TooManyWindows`], `got`

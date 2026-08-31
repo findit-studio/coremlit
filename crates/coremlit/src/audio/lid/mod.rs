@@ -597,8 +597,9 @@ impl Identifier {
   /// infinite (it would silently poison the mel); [`Error::Tensor`] /
   /// [`Error::Prediction`] on a tensor or CoreML failure; [`Error::OutputShape`]
   /// if the predicted row's shape diverges from `[1, `[`NUM_LANGUAGES`]`]`;
-  /// [`Error::NonFiniteOutput`] if the model emits a NaN or infinite score
-  /// (model corruption — never reaches ranking).
+  /// [`Error::NonFiniteOutput`] if the model emits a NaN or infinite score, and
+  /// [`Error::PositiveOutput`] if it emits a finite score above zero (both are
+  /// model corruption — neither reaches ranking).
   pub fn log_probabilities(&self, samples_16k: &[f32]) -> Result<Vec<f32>> {
     let frames = validate_frame_range(samples_16k.len())?;
 
@@ -620,9 +621,7 @@ impl Identifier {
 
     let mut row = vec![0.0f32; NUM_LANGUAGES];
     scores.copy_into::<f32>(&mut row)?;
-    if let Some(index) = row.iter().position(|value| !value.is_finite()) {
-      return Err(Error::NonFiniteOutput(index));
-    }
+    validate_model_row(&row)?;
     Ok(row)
   }
 
@@ -792,6 +791,45 @@ fn validate_frame_range(n_samples: usize) -> Result<usize> {
     return Err(FrameCountOutOfRange::for_samples(n_samples).into());
   }
   Ok(frames)
+}
+
+/// Reject a model output row that is not a row of natural-log probabilities,
+/// naming the first column that is not one.
+///
+/// A free fn for the same two reasons [`validate_frame_range`] is one: the
+/// guard is hermetically testable without a model, and the rule it applies is
+/// readable on its own rather than buried in the predict path.
+///
+/// **One predicate decides admission**, and it is
+/// [`prediction::is_finite_log_probability`] — the shared
+/// [`prediction::is_log_probability`] that [`LogProbabilities::try_from_slice`]
+/// holds a CALLER's row to, plus finiteness, which this door needs and that one
+/// must not have (`-∞` is a legal log-probability a caller may hand in and
+/// [`ScorePooling::Vote`] produces; a log-softmax GRAPH emitting one is
+/// corruption). The `is_finite` test below decides nothing — it only names the
+/// diagnosis of a value already refused, because the two causes are different
+/// and worth telling apart: a NaN or an `±∞` is arithmetic corruption, while a
+/// finite score ABOVE zero says the classifier tail is no longer a log-softmax
+/// at all. `tests/fp16_guards.rs` records exactly that failure measured on this
+/// graph — a `x - logsumexp(x)` re-conversion overflows fp16 inside the reduce
+/// and returns RAW LOGITS, maximum +22.86 — which a finiteness-only guard
+/// admits and `LanguageScore::probability` then reports as `exp(22.86)`.
+///
+/// [`prediction::is_finite_log_probability`]: prediction::is_finite_log_probability
+/// [`prediction::is_log_probability`]: prediction::is_log_probability
+/// [`LogProbabilities::try_from_slice`]: LogProbabilities::try_from_slice
+fn validate_model_row(row: &[f32]) -> Result<()> {
+  for (index, &value) in row.iter().enumerate() {
+    if prediction::is_finite_log_probability(value) {
+      continue;
+    }
+    return Err(if value.is_finite() {
+      Error::PositiveOutput(InvalidLogProbability::new(index, value))
+    } else {
+      Error::NonFiniteOutput(index)
+    });
+  }
+  Ok(())
 }
 
 /// Reject a clip the LONG path must not see: shorter than [`MIN_SAMPLES`] (no

@@ -66,8 +66,9 @@
 //! A row's RATIOS are what it says about the languages; its overall scale says
 //! nothing. Straight off the graph a row is a log-softmax and `exp` over it
 //! should sum to 1 — and it does not, quite: fp16 arithmetic leaves it up to
-//! 7.7e-3 short on [`ComputeUnits::CpuOnly`] and 1.5e-4 short on the ANE. That
-//! deficit is a fact about how the row was computed, not about what was spoken.
+//! as much as 7.7e-3 away from 1 on [`ComputeUnits::CpuOnly`] and 1.5e-4 with
+//! the ANE — on either side of it, the deviation being signed. That gap is a
+//! fact about how the row was computed, not about what was spoken.
 //!
 //! Folded raw it becomes a per-window WEIGHT, because three of the four
 //! poolings fold VALUES. Two equal 160 000-sample windows, each one-hot and so
@@ -84,7 +85,7 @@
 //! sweep, normalizing at the door
 //! changed the pooled row by at most 3.8e-6 nats under `ComputeUnits::All` and
 //! `CpuAndGpu`, and 2.6e-4 on the ANE — but by 1.0e-2 on
-//! [`ComputeUnits::CpuOnly`], whose rows carry the 7.7e-3 deficit. No fold in
+//! [`ComputeUnits::CpuOnly`], whose rows carry the 7.7e-3 gap. No fold in
 //! that sweep changed its top-1 language, and [`ScorePooling::MeanLogProbability`]
 //! and [`ScorePooling::Vote`] came back bit-identical on every one of the 192.
 //!
@@ -560,7 +561,7 @@ impl Accumulator {
       // IS a distribution, and `push` folds nothing else, so the shift is
       // near zero and the row barely moves; what it buys is that the row is a
       // distribution whether or not this pooling's own f64 arithmetic left it
-      // one. The model's mass deficit — 7.7e-3 on `CpuOnly` — is no longer
+      // one. The model's mass gap — 7.7e-3 on `CpuOnly` — is no longer
       // among the things it has to absorb: it comes off each row at the door,
       // which is also where it stops acting as a per-window weight. A
       // constant shift cannot reorder the row, so no ranking this pooling
@@ -714,10 +715,10 @@ fn renormalize(values: &mut [f64]) {
 /// `row` as a distribution, in f64 — the fold's ENTRANCE normalizer, and the
 /// values [`Accumulator::push`] actually folds.
 ///
-/// A row's own total mass is fp noise: a model row comes back up to 7.7e-3
-/// short of 1 on [`ComputeUnits::CpuOnly`] and 1.5e-4 short on the ANE, and
-/// that deficit says nothing about any language, only about the graph's fp16
-/// arithmetic. Folded raw it acts as a per-window WEIGHT — see the module docs'
+/// A row's own total mass is fp noise: a model row comes back as much as 7.7e-3
+/// away from 1 on [`ComputeUnits::CpuOnly`] and 1.5e-4 with the ANE, on either
+/// side of it, and that gap says nothing about any language, only about the
+/// graph's fp16 arithmetic. Folded raw it acts as a per-window WEIGHT — see the module docs'
 /// "A row's own scale is not evidence" section for the two windows it flipped.
 ///
 /// [`ComputeUnits::CpuOnly`]: crate::ComputeUnits::CpuOnly

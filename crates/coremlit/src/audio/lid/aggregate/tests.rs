@@ -767,8 +767,8 @@ fn max_over_rows_of_huge_negatives_pools_to_a_distribution() {
 ///
 /// It is the one pooling whose output mass would otherwise be its inputs'.
 /// Model rows are log-softmax rows narrowed through fp16 and do not sum to 1
-/// exactly — measured 7.7e-3 short on `CpuOnly` — and this pooling alone would
-/// hand that deficit straight to the caller.
+/// exactly — measured as much as 7.7e-3 away from it on `CpuOnly`, either side —
+/// and this pooling alone would hand that gap straight to the caller.
 ///
 /// TWO independent guards now stop it, and this test holds the PROPERTY rather
 /// than either mechanism: `push` makes every row a distribution before folding
@@ -842,10 +842,17 @@ fn every_folded_row_is_normalized_to_far_inside_the_tolerance() {
 
 // ── A row's own scale ───────────────────────────────────────────────────────
 
-/// The mass a real log-softmax row comes back with on `CpuOnly`: 7.7e-3 short
-/// of 1. Its log is what that deficit subtracts from every column of the row,
-/// and subtracting a constant from a whole row changes no ratio inside it — so
-/// it is the exact shape of "carries no evidence about any language".
+/// A mass a real log-softmax row comes back with on `CpuOnly`: 7.7e-3 from 1,
+/// written here on the low side. Its log is what that gap subtracts from every
+/// column of the row, and subtracting a constant from a whole row changes no
+/// ratio inside it — so it is the exact shape of "carries no evidence about any
+/// language".
+///
+/// The side is arbitrary and the test does not rest on it: the deviation is
+/// signed (`the_graphs_largest_output_reaches_zero_and_never_passes_it` measures
+/// both directions on every compute unit, and on `CpuOnly` the LARGER extreme is
+/// the high one), and a shift either way exercises scale-invariance
+/// identically.
 const CPU_ONLY_ROW_MASS: f64 = 0.99235;
 
 /// `row` with `by` added to every column — the row at a different overall
@@ -924,7 +931,7 @@ fn a_windows_own_mass_deficit_does_not_outvote_an_equally_certain_window() {
   }
   assert!(
     wrong.is_empty(),
-    "a 7.7e-3 mass deficit, which is fp noise and not evidence, decided the clip:\n  {}",
+    "a 7.7e-3 mass gap, which is fp noise and not evidence, decided the clip:\n  {}",
     wrong.join("\n  ")
   );
 

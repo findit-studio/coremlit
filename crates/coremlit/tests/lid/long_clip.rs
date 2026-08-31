@@ -712,3 +712,142 @@ fn every_fold_in_the_published_sweep_lands_far_inside_the_mass_tolerance() {
     worst_fold.1
   );
 }
+
+// ── The model door's own measurement ────────────────────────────────────────
+
+/// The measurement the model door's admission predicate is anchored to: **how
+/// close to zero does this graph actually get, and does it ever pass zero?**
+///
+/// A log-softmax output is `<= 0` mathematically, so refusing a positive one at
+/// [`Identifier::log_probabilities`] looks free. It is not free by inspection.
+/// These rows are narrowed through fp16, and a top language at probability ~1
+/// has a true log of about `-1e-9` — near enough to zero that the narrowing can
+/// land ON it, or past it. A door written to the mathematics alone would then
+/// start refusing real clips that work today, which is exactly the failure the
+/// single-window identity path already declined to walk into when it stopped
+/// short of holding a model row to "mass sums to 1".
+///
+/// So the predicate was chosen from this number rather than from the theorem.
+/// Over the same sweep `MAX_MASS_DEVIATION`'s doc publishes — 4 clips x 3
+/// geometries x 4 compute units, 468 rows and 50 076 values — this graph
+///
+/// 1. never emits a value ABOVE zero, on any compute unit; and
+/// 2. does emit EXACTLY zero, on [`ComputeUnits::CpuOnly`], whose fp16 rounding
+///    is the loosest of the four (the other three peak near `-1.4e-3`).
+///
+/// Both halves are gated, because the predicate needs both. (1) is what makes
+/// `value <= 0.0` — the one definition of "is a natural-log probability" that
+/// [`LogProbabilities::try_from_slice`] and [`Identifier::log_probabilities`]
+/// now share — safe to apply to model output at all. (2) is what makes it `<=`
+/// rather than `<`: tightening it by one boundary point would refuse real rows
+/// this run produced.
+///
+/// The per-compute-unit table is printed on every run, signed row mass
+/// alongside, so the number the predicate rests on is re-measured rather than
+/// remembered. A row whose maximum reaches exactly zero is also a row whose
+/// mass EXCEEDS one — `exp(0)` is 1 before the other 106 columns are added —
+/// which is the mechanism behind both halves at once.
+#[test]
+#[ignore = "requires the staged LID model (LID_TEST_MODELS)"]
+fn the_graphs_largest_output_reaches_zero_and_never_passes_it() {
+  let english = english_clip();
+  let clips: [(&str, Vec<f32>); 4] = [
+    ("thai-39s", repeated(3)),
+    ("thai-52s", repeated(4)),
+    (
+      "thai+english",
+      repeated(2).into_iter().chain(english.clone()).collect(),
+    ),
+    ("english", english),
+  ];
+
+  let mut rows = 0usize;
+  let mut values = 0usize;
+  let mut zeros_by_unit = [0usize; SWEEP_COMPUTE_UNITS.len()];
+  let mut largest_by_unit = [f32::NEG_INFINITY; SWEEP_COMPUTE_UNITS.len()];
+  let mut mass_span_by_unit = [(f64::INFINITY, f64::NEG_INFINITY); SWEEP_COMPUTE_UNITS.len()];
+  let mut positives: Vec<String> = Vec::new();
+  let mut largest = (f32::NEG_INFINITY, String::new());
+
+  for (unit_index, compute) in SWEEP_COMPUTE_UNITS.into_iter().enumerate() {
+    let identifier = Identifier::load(
+      common::model_path(),
+      IdentifierOptions::new().with_compute(compute),
+    )
+    .expect("load identifier");
+
+    for (clip_label, samples) in &clips {
+      for (geometry_label, window, hop) in SWEEP_GEOMETRIES {
+        let plan = WindowPlan::new().with_geometry(window, hop);
+        let windows = identifier
+          .log_probabilities_windows(samples, &plan)
+          .expect("windows");
+        for scored in &windows {
+          let row = scored.value().as_slice();
+          rows += 1;
+          let signed = mass(row) - 1.0;
+          let span = &mut mass_span_by_unit[unit_index];
+          span.0 = span.0.min(signed);
+          span.1 = span.1.max(signed);
+          for (column, &value) in row.iter().enumerate() {
+            values += 1;
+            let site = format!("{compute:?}/{clip_label}/{geometry_label} column {column}");
+            if value == 0.0 {
+              zeros_by_unit[unit_index] += 1;
+            }
+            if value > 0.0 {
+              positives.push(format!("{value:e} at {site}"));
+            }
+            if value > largest_by_unit[unit_index] {
+              largest_by_unit[unit_index] = value;
+            }
+            if value > largest.0 {
+              largest = (value, site);
+            }
+          }
+        }
+      }
+    }
+  }
+
+  println!(
+    "  {:<22} {:>16} {:>8} {:>14} {:>14}",
+    "largest raw value", "largest", "== 0.0", "min mass-1", "max mass-1"
+  );
+  for (unit_index, compute) in SWEEP_COMPUTE_UNITS.into_iter().enumerate() {
+    let (low, high) = mass_span_by_unit[unit_index];
+    println!(
+      "  {:<22} {:>16.9} {:>8} {:>14.3e} {:>14.3e}",
+      format!("{compute:?}"),
+      largest_by_unit[unit_index],
+      zeros_by_unit[unit_index],
+      low,
+      high
+    );
+  }
+  println!(
+    "  {rows} rows, {values} values; largest {:.9} at {}",
+    largest.0, largest.1
+  );
+
+  assert_eq!(
+    rows, 468,
+    "the sweep's shape moved; the numbers above move with it"
+  );
+  assert!(
+    positives.is_empty(),
+    "this graph emitted {} value(s) ABOVE zero: {positives:?}. `value <= 0.0` is the \
+     predicate `LogProbabilities::try_from_slice` holds a caller's row to and the one \
+     `Identifier::log_probabilities` now holds the graph's output to, so a real row past \
+     zero means the DOOR is wrong, not the model — decide which door moves before \
+     loosening either",
+    positives.len()
+  );
+  let zeros: usize = zeros_by_unit.iter().sum();
+  assert!(
+    zeros > 0,
+    "no row in this sweep reached exactly zero, so the reason the shared predicate is \
+     `<= 0.0` rather than `< 0.0` is no longer visible here. It was 22 values, all on \
+     CpuOnly, when the predicate was chosen; re-measure before tightening the door"
+  );
+}

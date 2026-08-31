@@ -247,3 +247,148 @@ fn prewarm_covers_the_default_plans_window() {
     "prewarm's clip length is the default plan's window"
   );
 }
+
+// ── The model-output door ───────────────────────────────────────────────────
+
+/// A row of `-14.0` with one column overwritten, the shape both halves below
+/// read.
+fn row_with(index: usize, value: f32) -> Vec<f32> {
+  let mut row = vec![-14.0f32; NUM_LANGUAGES];
+  row[index] = value;
+  row
+}
+
+/// A model that satisfies the feature-name, shape and dtype contract and then
+/// emits a POSITIVE score is refused at the door, instead of being ranked into
+/// a [`LanguageScore`] whose `probability()` exceeds 1.
+///
+/// The two halves below are the whole of the path, and they meet at one row.
+/// `identify_long` on a clip that fits one window IS `log_probabilities` (mel,
+/// predict, then this door) followed by `LogProbabilities::new` ->
+/// `Accumulator::push` -> `finish` -> `top_k`; the second half is driven here
+/// directly from the same values, so whatever the door admits is exactly what
+/// the caller receives. `identify` differs only in ranking the row without the
+/// one-window fold, which is the identity.
+///
+/// The first assertion is a CHARACTERIZATION and stays green after the fix: a
+/// one-window fold returning its row verbatim is the `identify_long` ==
+/// `identify` promise, and holding that row to anything here would break it
+/// (`aggregate`'s "Totality"). That is precisely why the door is the only place
+/// this can be stopped — and the door is the half that was red.
+#[test]
+fn a_positive_model_score_is_refused_at_the_door_not_ranked_above_probability_one() {
+  let row = row_with(94, 0.25);
+
+  let mut accumulator = aggregate::Accumulator::new(ScorePooling::default());
+  accumulator
+    .push(
+      &LogProbabilities::new(row.clone()),
+      DEFAULT_WINDOW_SAMPLES as usize,
+    )
+    .expect("a row with a finite maximum is normalizable");
+  let ranked = accumulator
+    .finish()
+    .expect("one window folds to itself")
+    .top_k(1)
+    .expect("top_k");
+  assert_eq!(ranked[0].index(), 94);
+  assert_eq!(ranked[0].log_probability(), 0.25);
+  assert!(
+    ranked[0].probability() > 1.0,
+    "the identity path returns its row verbatim, so a positive score reaches the caller as \
+     probability {} — an impossible confidence, which is why the door has to refuse it",
+    ranked[0].probability()
+  );
+
+  let error = validate_model_row(&row).expect_err("a positive score is not a log-probability");
+  assert!(
+    matches!(&error, Error::PositiveOutput(detail)
+      if detail.index() == 94 && detail.value() == 0.25),
+    "{error:?}"
+  );
+  assert!(error.to_string().contains("0.25"), "{error}");
+}
+
+/// The door's boundary sits where the MEASUREMENT put it, not where the
+/// mathematics alone would: exactly zero is admitted, and the first value past
+/// it is not.
+///
+/// `lid_long_clip`'s published sweep emits `0.0` 22 times out of 50 076 values,
+/// all on `ComputeUnits::CpuOnly`, and nothing above it on any compute unit. A
+/// door written to "a log-softmax output is strictly negative" would refuse
+/// those 22 real rows.
+#[test]
+fn the_model_door_admits_exactly_zero_and_refuses_the_first_value_past_it() {
+  assert!(validate_model_row(&row_with(0, 0.0)).is_ok());
+  assert!(validate_model_row(&row_with(0, -0.0)).is_ok());
+  assert!(validate_model_row(&vec![0.0f32; NUM_LANGUAGES]).is_ok());
+
+  let smallest_positive = row_with(7, f32::MIN_POSITIVE);
+  assert!(matches!(
+    validate_model_row(&smallest_positive),
+    Err(Error::PositiveOutput(detail)) if detail.index() == 7
+  ));
+  // A subnormal is still above zero, and the predicate is an ordered
+  // comparison rather than a normal-number test, so it is refused too.
+  assert!(matches!(
+    validate_model_row(&row_with(7, 1e-45)),
+    Err(Error::PositiveOutput(_))
+  ));
+}
+
+/// A non-finite score keeps reporting as [`Error::NonFiniteOutput`], by its
+/// FIRST column, exactly as it did before the door gained the `> 0` half. `-∞`
+/// is the case that separates the two doors: legal for a caller, corruption
+/// from a graph.
+#[test]
+fn the_model_door_still_reports_a_non_finite_score_as_it_did() {
+  for value in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+    assert!(
+      matches!(
+        validate_model_row(&row_with(11, value)),
+        Err(Error::NonFiniteOutput(11))
+      ),
+      "{value}"
+    );
+  }
+  // First column wins, whichever half would have caught the later one.
+  let mut row = row_with(3, f32::NAN);
+  row[50] = 0.25;
+  assert!(matches!(
+    validate_model_row(&row),
+    Err(Error::NonFiniteOutput(3))
+  ));
+}
+
+/// The two doors read ONE predicate, so they cannot disagree about what a
+/// natural-log probability is. The model door is the caller's door plus
+/// finiteness, and that relationship is asserted rather than described — a
+/// second copy of the rule at either end reds here the moment the copies part.
+#[test]
+fn the_model_door_is_the_callers_door_plus_finiteness() {
+  let values = [
+    0.0f32,
+    -0.0,
+    -1e-45,
+    -0.010_064,
+    -37.27,
+    f32::MIN,
+    f32::NEG_INFINITY,
+    f32::INFINITY,
+    f32::NAN,
+    f32::MIN_POSITIVE,
+    0.25,
+    22.86,
+    f32::MAX,
+  ];
+  for value in values {
+    let row = row_with(5, value);
+    let caller_admits = LogProbabilities::try_from_slice(&row).is_ok();
+    let model_admits = validate_model_row(&row).is_ok();
+    assert_eq!(
+      model_admits,
+      caller_admits && value.is_finite(),
+      "{value:e}: caller door {caller_admits}, model door {model_admits}"
+    );
+  }
+}
