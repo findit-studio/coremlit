@@ -252,6 +252,14 @@ impl FrameCountOutOfRange {
 /// logarithmic pool over windows with disjoint supports honestly leaves nothing
 /// — so it keeps its own variant and its own explanation.
 ///
+/// [`Self::mass`] is whatever the fold left, NaN included: a pooling that
+/// produced something other than arithmetic is reported here rather than given
+/// a variant of its own, because the mass IS the diagnosis and `Display`
+/// renders it as `sum to NaN, not 1`. The fold's postcondition is written as
+/// the predicate that accepts so that a NaN reaches this variant at all — every
+/// ordered comparison against one is false, so a `> tolerance` guard would wave
+/// it through.
+///
 /// [`ScorePooling`]: super::ScorePooling
 #[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
 #[error(
@@ -388,6 +396,12 @@ pub enum Error {
   ///   the clip to a language nothing chose.
   /// - `+∞` ANYWHERE. `exp` over such a row sums to `∞`, so it is not a
   ///   log-probability row at all and there is no constant that makes it one.
+  /// - A NaN ANYWHERE. It sits under no bound, `+∞` included, so the row has no
+  ///   maximum to shift by and nothing to rank. Each pooling loses it in its own
+  ///   direction — spread over all 107 columns, silently DROPPED, or handed the
+  ///   window's whole ballot because `total_cmp` ranks a NaN above every real
+  ///   value — and only one of the four leaves a mass the fold's postcondition
+  ///   can see.
   ///
   /// What this is NOT is a judgement on a row's absolute SCALE. A row whose
   /// largest value is `-800` says exactly what one whose largest value is `0`
@@ -400,8 +414,8 @@ pub enum Error {
   /// log-softmax, and [`Identifier::log_probabilities`] refuses a non-finite
   /// score outright. Reachable through [`aggregate_windows`] from hand-built
   /// rows, `-∞` being a value [`LogProbabilities::try_from_slice`] deliberately
-  /// accepts; `+∞` is not, so that half guards this crate's own unvalidated
-  /// internal constructor rather than a caller.
+  /// accepts; neither `+∞` nor a NaN is, so those two halves guard this crate's
+  /// own unvalidated internal constructor rather than a caller.
   ///
   /// [`Identifier::identify_long`]: super::Identifier::identify_long
   /// [`Identifier::log_probabilities`]: super::Identifier::log_probabilities
@@ -409,9 +423,10 @@ pub enum Error {
   /// [`ScorePooling::Vote`]: super::ScorePooling::Vote
   /// [`LogProbabilities::try_from_slice`]: super::LogProbabilities::try_from_slice
   #[error(
-    "window {0}'s largest log-probability is not finite, so no shift makes the row a \
-     distribution: it is either -inf throughout, which rules every language out, or \
-     +inf somewhere, which is not a log-probability row at all"
+    "window {0} has no finite largest log-probability, so no shift makes the row a \
+     distribution: it is -inf throughout, which rules every language out, or it holds \
+     a +inf, which is not a log-probability row at all, or it holds a NaN, which sits \
+     under no bound"
   )]
   UnnormalizableWindow(usize),
 

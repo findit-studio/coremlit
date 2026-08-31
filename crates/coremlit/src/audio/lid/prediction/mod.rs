@@ -45,12 +45,16 @@ pub type WindowLogProbabilities = windit::windowed::Windowed<LogProbabilities>;
 /// The invariant this TYPE enforces is only the pointwise one (`<= 0`, not
 /// NaN), because that is the part a hand-built row can be held to without
 /// choosing a floating-point tolerance for "sums to 1". The one thing
-/// [`aggregate_windows`] additionally requires of a row it is given is that its
-/// maximum be FINITE ([`Error::UnnormalizableWindow`]), which is exactly the
-/// condition under which the row normalizes: a row that is `-∞` in every column
-/// rules every language out, which is not evidence about any of them. It does
-/// NOT require the row to sit at any particular scale — a row whose largest
-/// value is `-800` folds exactly as one shifted up to `0` does.
+/// [`aggregate_windows`] additionally requires of a row it is given is that it
+/// have a FINITE maximum ([`Error::UnnormalizableWindow`]) — a bound that is
+/// finite and that the whole row sits under — which is exactly the condition
+/// under which the row normalizes: a row that is `-∞` in every column rules
+/// every language out, which is not evidence about any of them. That door
+/// re-establishes the pointwise invariant rather than assuming it, because the
+/// crate-internal constructor does not check it: a row reaching the fold from
+/// inside this crate holding a `+∞` or a NaN is refused there too. It does NOT
+/// require the row to sit at any particular scale — a row whose largest value
+/// is `-800` folds exactly as one shifted up to `0` does.
 ///
 /// [`ComputeUnits::CpuOnly`]: crate::ComputeUnits::CpuOnly
 /// [`aggregate_windows`]: crate::audio::lid::aggregate_windows

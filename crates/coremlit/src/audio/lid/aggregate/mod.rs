@@ -125,8 +125,9 @@
 //!
 //! **Precondition: a window must be normalizable.** The fold asks one thing of
 //! every row it is handed — that `DistributionShift` can turn it into a
-//! distribution — and that is exactly that its **maximum is finite**. Two rows
-//! fail it, and neither is one any pooling could have folded:
+//! distribution — and that is exactly that it has a **finite maximum**, a bound
+//! that is finite AND that the whole row actually sits under. Three rows fail
+//! it, and none is one any pooling could have folded:
 //!
 //! - `-∞` in every column says no language is possible. It is not evidence
 //!   about which language was spoken, and each pooling would mishandle it in
@@ -146,8 +147,27 @@
 //!   every comparison against NaN is false; and a LONE `+∞` window took the
 //!   identity path back to the caller verbatim, as a [`LogProbabilities`]
 //!   holding a positive value.
+//! - A NaN anywhere is under no bound at all, `+∞` included, so there is no
+//!   shift and no ranking. It survived the `+∞` round because that round's
+//!   guard folded the row with `f32::max`, whose documented `maxNum` semantics
+//!   are to IGNORE a NaN operand: `[-1, NaN, -1, …]` reported a maximum of `-1`
+//!   and was let through. Past it the four poolings lost it in three different
+//!   directions, and the postcondition could see only one of them.
+//!   [`ScorePooling::MeanLogProbability`] spread the NaN over all 107 columns —
+//!   one NaN anywhere in `DistributionShift`'s sum poisons the whole shift —
+//!   for a mass of NaN. [`ScorePooling::Max`] and [`ScorePooling::MeanProbability`]
+//!   DROPPED the window instead, `f64::max` ignoring the NaN and the
+//!   log-sum-exp skipping it exactly as it skips a `-∞`: a NaN window beside a
+//!   real one answered from the real one alone at mass 1, and a clip of nothing
+//!   but NaN came back as [`Error::ZeroMassAggregate`], a refusal naming the
+//!   wrong reason. [`ScorePooling::Vote`] handed the window's whole ballot to
+//!   the NaN's column, also at mass 1, because `total_cmp` ranks a NaN above
+//!   every real value. And a LONE NaN window took the identity path back to the
+//!   caller verbatim under all four — a [`LogProbabilities`] holding a NaN,
+//!   which this type's invariant forbids, whose `top_k` reports the NaN's
+//!   language first, and which the postcondition does not apply to at all.
 //!
-//! [`aggregate_windows`] refuses both with [`Error::UnnormalizableWindow`],
+//! [`aggregate_windows`] refuses all three with [`Error::UnnormalizableWindow`],
 //! naming the window, before any of that. It costs one pass and no `exp`.
 //!
 //! **What the precondition must NOT decide is a row's SCALE.**
@@ -173,6 +193,15 @@
 //! honest answer rather than a defect. Any OTHER deviation is a defect, and is
 //! [`Error::NotADistribution`] carrying the mass the fold actually left — the
 //! tolerance and the measurements behind it are on `MAX_MASS_DEVIATION`.
+//!
+//! It is written as the predicate that ACCEPTS — `|mass − 1| <=
+//! MAX_MASS_DEVIATION`, returned from — rather than as the `>` that refuses,
+//! because those two are the same test only over an ORDERED domain and f64 is
+//! not one. Every ordered comparison against a NaN is false, so the refusing
+//! form reads a NaN mass as "not outside the tolerance" and hands the caller
+//! 107 NaNs; the accepting form reads it as "not inside", and it lands in the
+//! refusal. A postcondition stated once so that whatever is added later
+//! inherits it has to be TOTAL, or what it is inherited by is a hole.
 //!
 //! The postcondition applies to a FOLDED row only. A lone window is returned
 //! verbatim, and holding a row this module did not compute to "sums to 1" would
@@ -344,10 +373,11 @@ impl Accumulator {
   ///
   /// # Errors
   /// [`Error::UnnormalizableWindow`], carrying the window's position, if the
-  /// row's maximum is not finite — `-∞` throughout, which rules every language
-  /// out, or `+∞` anywhere, which is not a log-probability row at all. The
-  /// module docs' "Totality" section for why those are refused rather than
-  /// folded, and why a row's absolute SCALE is not among the things refused.
+  /// row has no finite maximum — `-∞` throughout, which rules every language
+  /// out; `+∞` anywhere, which is not a log-probability row at all; or a NaN
+  /// anywhere, which has no order against any bound. The module docs'
+  /// "Totality" section for why those are refused rather than folded, and why a
+  /// row's absolute SCALE is not among the things refused.
   pub(crate) fn push(&mut self, window: &LogProbabilities, weight_samples: usize) -> Result<()> {
     let row = window.as_slice();
     // The fold's precondition, stated once for every pooling rather than in
@@ -358,17 +388,27 @@ impl Accumulator {
     // the same thing, and a guard that refused low ones would be the module's
     // own "a row's own scale is not evidence" defect wearing a different hat.
     //
-    // What the two refused rows would have done: an all-`-inf` row is not
+    // What the three refused rows would have done: an all-`-inf` row is not
     // evidence about any language, and each pooling mishandles it differently
     // (the linear pool's terms are all skipped — that is what keeps
     // `(-inf) - (-inf)` unreachable — while its weight still lands in the
     // denominator, so the pool comes out diluted; a vote would be cast for
     // whatever column the ranking tie-break surfaces). A row holding `+inf`
-    // is not a log-probability row at all, and the exit could not be trusted
-    // to catch it: `MeanProbability` turned one into 107 NaNs, which the mass
-    // postcondition waves through because every comparison against NaN is
-    // false, and a LONE `+inf` window took the identity path straight back to
-    // the caller.
+    // is not a log-probability row at all. A row holding a NaN has no order
+    // against anything, so each pooling loses it in its own direction: the
+    // logarithmic pool spreads it over all 107 columns, `Max` and the linear
+    // pool DROP the window (`f64::max` ignores a NaN and the log-sum-exp skips
+    // it like a `-inf`), and `Vote` hands the window's whole ballot to the NaN's
+    // column, because `total_cmp` ranks a NaN above every real value.
+    //
+    // The exit cannot be trusted with any of the three, and the reason is the
+    // same each time: it reads a MASS, and two of these three leave a mass of
+    // exactly 1. `Vote` does so on all three; `Max` and the linear pool do on a
+    // NaN beside a real window, having quietly answered from the real one. Only
+    // `MeanProbability` on a `+inf` and the logarithmic pool on a NaN leave a
+    // mass the postcondition can see. And a LONE bad window takes the identity
+    // path straight back to the caller, where the postcondition does not apply
+    // at all.
     if !has_a_finite_maximum(row) {
       return Err(Error::UnnormalizableWindow(self.count));
     }
@@ -456,8 +496,9 @@ impl Accumulator {
   /// # Errors
   /// [`Error::EmptyWindows`] if no window was pushed;
   /// [`Error::ZeroMassAggregate`] if the fold left no probability mass at all,
-  /// and [`Error::NotADistribution`] if it left an amount other than 1
-  /// (module docs, "Totality").
+  /// and [`Error::NotADistribution`] if it left anything other than 1 — a NaN
+  /// mass among them, which is the shape a fold that is not arithmetic at all
+  /// comes back as (module docs, "Totality").
   pub(crate) fn finish(self) -> Result<LogProbabilities> {
     if self.count == 0 {
       return Err(Error::EmptyWindows);
@@ -557,10 +598,23 @@ impl Accumulator {
       // explanation.
       return Err(Error::ZeroMassAggregate(pooling));
     }
-    if (mass - 1.0).abs() > MAX_MASS_DEVIATION {
-      return Err(NotADistribution::new(pooling, mass).into());
+    // Written as the predicate that ACCEPTS, and returned from, rather than as
+    // a `> MAX_MASS_DEVIATION` that refuses — which is the same test only over
+    // an ordered domain. Every ordered comparison against a NaN is false, so a
+    // NaN mass reads as "not outside the tolerance" under the refusing form and
+    // is handed to the caller as a row of NaN; under this one it is simply not
+    // inside the tolerance, and falls into the refusal below. A guard a future
+    // pooling can walk straight through is not the "stated once, inherited by
+    // whatever is added later" this postcondition is for, so it is one TOTAL
+    // predicate rather than a pair of partial ones with an `is_nan` beside them.
+    if (mass - 1.0).abs() <= MAX_MASS_DEVIATION {
+      return Ok(LogProbabilities::new(values));
     }
-    Ok(LogProbabilities::new(values))
+    // `NotADistribution` already carries the mass, and a NaN in that payload is
+    // the honest report: the fold left something that is not a number, and the
+    // variant's own `Display` renders it as `sum to NaN, not 1`. No case here
+    // needs a variant of its own.
+    Err(NotADistribution::new(pooling, mass).into())
   }
 }
 
@@ -693,12 +747,22 @@ fn as_distribution(row: &[f32]) -> Vec<f64> {
 /// negatives, and that stopped being true when [`DistributionShift`] gained one
 /// anchored definition: it forms `(v − max)` before anything else, which is
 /// well-conditioned for ANY finite maximum however far from zero it sits.
+///
+/// **Why the maximum is checked to be an upper bound as well as finite.**
+/// [`f32::max`] IGNORES a NaN operand — that is its documented `maxNum`
+/// semantics — so folding a row with it returns the maximum of the row's
+/// non-NaN values, which for `[-1, NaN, -1, …]` is a perfectly finite `-1`.
+/// The row is not normalizable: `DistributionShift::of` sums `exp(v − max)`
+/// over EVERY value, so the NaN poisons the sum, its log, and every column the
+/// shift is then applied to. Naming the fold's result `max` and then asking
+/// whether the row actually sits `<=` it is what makes the predicate total: a
+/// NaN compares false against every bound, which is the same reason the row has
+/// no maximum. The alternative spelling — a separate `is_nan` scan beside the
+/// finiteness test — is the pair of partial predicates this door already had
+/// one of.
 fn has_a_finite_maximum(row: &[f32]) -> bool {
-  row
-    .iter()
-    .copied()
-    .fold(f32::NEG_INFINITY, f32::max)
-    .is_finite()
+  let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+  max.is_finite() && row.iter().all(|&value| value <= max)
 }
 
 /// How far a FOLDED row's probability mass may sit from 1 before
@@ -740,9 +804,15 @@ const MAX_MASS_DEVIATION: f64 = 1e-5;
 /// The row's total probability mass: `exp` summed over it, in f64.
 ///
 /// Wider than the row it reads, on purpose — the narrowing to f32 is the thing
-/// being measured, so the measurement must not be narrowed too. Bounded by
-/// [`NUM_LANGUAGES`] and never NaN: every value the fold emits is `<= 0` and
-/// non-NaN, so every term lands in `(0, 1]`.
+/// being measured, so the measurement must not be narrowed too.
+///
+/// It is `NUM_LANGUAGES`-bounded and NaN-free for every row the four poolings
+/// currently produce, because each of them emits values that are `<= 0` and
+/// non-NaN, so every term lands in `(0, 1]`. That is a fact about those four
+/// and NOT a guarantee this function makes: `exp` of a NaN is a NaN and the sum
+/// carries it, so a fifth pooling that left one would be reported here as a NaN
+/// mass. [`Accumulator::finish`] is written to refuse that rather than to
+/// assume it cannot happen.
 ///
 /// [`NUM_LANGUAGES`]: crate::audio::lid::NUM_LANGUAGES
 fn probability_mass(row: &[f32]) -> f64 {
@@ -776,12 +846,12 @@ fn argmax(row: &[f32]) -> usize {
 /// `identify_long` — a clip long enough to reach the model always plans at
 /// least one span.)
 ///
-/// [`Error::UnnormalizableWindow`], naming the window, if one of them has a
-/// maximum that is not finite — `-∞` throughout (which is not evidence about
-/// any language) or `+∞` anywhere (which is not a log-probability row). Every
-/// pooling refuses those alike. A row's absolute SCALE is not among the things
-/// refused: a row whose largest value is `-800` folds exactly as one shifted up
-/// to `0` does.
+/// [`Error::UnnormalizableWindow`], naming the window, if one of them has no
+/// finite maximum — `-∞` throughout (which is not evidence about any language),
+/// `+∞` anywhere (which is not a log-probability row), or a NaN anywhere (which
+/// sits under no bound at all). Every pooling refuses those alike. A row's
+/// absolute SCALE is not among the things refused: a row whose largest value is
+/// `-800` folds exactly as one shifted up to `0` does.
 ///
 /// [`Error::ZeroMassAggregate`] if the pooled row assigns probability zero to
 /// every language, which is not a distribution and cannot be ranked — see the

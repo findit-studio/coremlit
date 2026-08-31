@@ -1267,3 +1267,197 @@ fn a_window_whose_maximum_is_not_finite_upward_is_refused_at_the_door() {
     );
   }
 }
+
+/// A fold that leaves a NaN is REFUSED, and the mass postcondition is what has
+/// to refuse it.
+///
+/// The guard used to be `(mass - 1.0).abs() > MAX_MASS_DEVIATION`, and every
+/// ordered comparison against a NaN is false: `NaN <= 0.0` is false, so the
+/// zero-mass arm does not fire, and `NaN > 1e-5` is false, so the deviation arm
+/// does not either. A row of 107 NaNs went back to the caller as `Ok`, with
+/// `top_k` reporting whichever languages `total_cmp` surfaced. Written as the
+/// predicate that ACCEPTS, the same test refuses it, because a NaN is no more
+/// inside the tolerance than outside it.
+///
+/// The state is poisoned rather than provoked, deliberately. No pooling this
+/// module ships can leave a NaN (`a_fold_over_admissible_rows_cannot_produce_a_nan`
+/// is the argument, run over all four), and this postcondition exists for the
+/// FIFTH — stated once so that whatever is added later inherits it. A guard a
+/// future pooling can walk straight through does not do that job, so the thing
+/// under test is the guard, on state a future pooling could leave.
+#[test]
+fn a_fold_that_leaves_a_nan_is_refused_rather_than_returned() {
+  let row = row_from_logits(&[(94, 6.0), (3, 1.5)]);
+  for pooling in all_poolings() {
+    let mut fold = Accumulator::new(pooling);
+    fold.push(&row, WINDOW).expect("push");
+    fold.push(&row, WINDOW).expect("push");
+    // Two real windows folded, then the accumulator left holding what a
+    // pooling that stopped being arithmetic would leave.
+    fold.acc = vec![f64::NAN; NUM_LANGUAGES];
+    let finished = fold.finish();
+    assert!(
+      matches!(&finished, Err(Error::NotADistribution(detail)) if detail.mass().is_nan()),
+      "{pooling:?}: {}",
+      describe(&finished)
+    );
+    // The existing payload tells the truth about a NaN mass, so this needs no
+    // variant of its own — but only if it renders as something a reader can
+    // act on.
+    let rendered = finished.expect_err("refused").to_string();
+    assert!(
+      rendered.contains("sum to NaN, not 1"),
+      "{pooling:?}: {rendered}"
+    );
+  }
+}
+
+/// A NaN anywhere in a row is refused AT THE DOOR, under every pooling and on
+/// the single-window identity path too.
+///
+/// It cannot arrive from outside this crate — [`LogProbabilities::try_from_slice`]
+/// rejects a NaN by name — nor from the model, whose row
+/// [`Identifier::log_probabilities`] refuses if any entry is non-finite. What
+/// reaches here is the same in-crate producer the `+∞` case guards against: the
+/// unvalidated `pub(crate)` `LogProbabilities::new`.
+///
+/// The `+∞` round put this class at the door and stated the precondition as
+/// "the row's maximum is finite", which is the right predicate. What made it
+/// partial is that it FOLDED the row with [`f32::max`], whose documented
+/// semantics are to ignore a NaN operand: `[-1, NaN, -1, …]` reported a maximum
+/// of `-1.0` and was let through. Downstream all four poolings then lost it,
+/// each in its own direction, and the exit's mass postcondition saw only one of
+/// them — which is why each shape below is asserted separately:
+///
+/// - the logarithmic pool spread the NaN over all 107 columns, mass NaN;
+/// - `Max` and the linear pool silently DROPPED the window, so a NaN beside a
+///   real window answered from the real one alone at mass 1, while a pair of
+///   NaN windows came back as `ZeroMassAggregate` — a refusal naming the wrong
+///   reason;
+/// - `Vote` gave the window's whole ballot to the NaN's column, at mass 1, in
+///   both.
+///
+/// A LONE NaN window was worse still, under all four: the identity path handed
+/// it back verbatim, a [`LogProbabilities`] holding a NaN whose `top_k` named
+/// the NaN's language first, and the postcondition does not apply to that path
+/// at all.
+///
+/// [`Identifier::log_probabilities`]: crate::audio::lid::Identifier::log_probabilities
+#[test]
+fn a_window_holding_a_nan_is_refused_at_the_door() {
+  let mut values = vec![-1.0f32; NUM_LANGUAGES];
+  values[7] = f32::NAN;
+  assert!(
+    matches!(
+      LogProbabilities::try_from_slice(&values),
+      Err(Error::InvalidLogProbability(detail)) if detail.index() == 7
+    ),
+    "the public constructor must still be the first line of defence"
+  );
+  // The row the door has to catch on its own: every other column is a perfectly
+  // ordinary finite value, so `f32::max` reports a finite maximum for it.
+  assert!(!has_a_finite_maximum(&values));
+  let row = LogProbabilities::new(values);
+
+  for pooling in all_poolings() {
+    let lone = aggregate_windows(pooling, &[window(row.clone(), 0, WINDOW)]);
+    assert!(
+      matches!(&lone, Err(Error::UnnormalizableWindow(0))),
+      "{pooling:?}, lone window: {}",
+      describe(&lone)
+    );
+    let pair = fold_pair(pooling, &row);
+    assert!(
+      matches!(&pair, Err(Error::UnnormalizableWindow(0))),
+      "{pooling:?}, two windows: {}",
+      describe(&pair)
+    );
+    // A NaN beside a window that IS evidence: the fold must not quietly answer
+    // from the good window alone, which is what three of the four did.
+    let good = row_from_logits(&[(94, 6.0), (3, 1.5)]);
+    let mixed = aggregate_windows(
+      pooling,
+      &[window(row.clone(), 0, WINDOW), window(good, WINDOW, WINDOW)],
+    );
+    assert!(
+      matches!(&mixed, Err(Error::UnnormalizableWindow(0))),
+      "{pooling:?}, NaN beside a good window: {}",
+      describe(&mixed)
+    );
+  }
+}
+
+/// No pooling this module ships can produce a NaN from a row the door admits —
+/// re-derived over all four, and pinned rather than only argued.
+///
+/// An admitted row has a finite maximum that the whole row sits under, so every
+/// value is finite or `-∞` and at least one is finite. Entrance normalization
+/// forms `(v − max)` against a FINITE `max`, so it cannot reopen
+/// `(-∞) − (-∞)`: a `-∞` value passes through as `-∞ − finite = -∞`, and the
+/// shifted sum has at least the `exp(0) = 1` term, so it lands in `[1, 107]` and
+/// its log is finite. The four folds then meet a `-∞` in four different places,
+/// and each has to be the harmless one:
+///
+/// - `MeanLogProbability` forms `w · v` with `w >= 1` (windit's [`Span`]
+///   invariant is `0 < len <= window`, so a zero weight — whose `0 · -∞` WOULD
+///   be a NaN — cannot be built), giving `-∞`, and `-∞ + finite` stays `-∞`.
+/// - `MeanProbability` SKIPS an exact `-∞` rather than exponentiating it, which
+///   is what keeps `(-∞) − (-∞)` unreachable; a language `-∞` in every window
+///   closes as `-∞ + ln(0)`, both terms the same sign.
+/// - `Max` takes `f64::max`, which never invents a value.
+/// - `Vote` divides counts by a positive `weight_sum`, and `ln(0)` is `-∞`.
+///
+/// The exit normalizer meets an all-`-∞` row and answers it with the identity
+/// shift, so it is `ZeroMassAggregate` rather than NaN. Every rendered
+/// alternative below is a refusal or a NaN-free row.
+///
+/// [`Span`]: crate::audio::lid::Span
+#[test]
+fn a_fold_over_admissible_rows_cannot_produce_a_nan() {
+  let certain_of = |index: usize| {
+    let mut values = vec![f32::NEG_INFINITY; NUM_LANGUAGES];
+    values[index] = 0.0;
+    LogProbabilities::try_from_slice(&values).expect("one zero among -inf")
+  };
+  let mut mostly_ruled_out = distribution(&[(0, 0.6), (1, 0.4)]);
+  mostly_ruled_out[5] = f32::NEG_INFINITY;
+  let rows = [
+    // Disjoint supports, the case that pools to no mass at all.
+    vec![certain_of(0), certain_of(1)],
+    // Overlapping supports with a `-inf` on each side.
+    vec![
+      LogProbabilities::try_from_slice(&mostly_ruled_out).expect("row"),
+      certain_of(0),
+    ],
+    // A row written far below zero, folded against one written at zero: the
+    // widest finite span of scales the door admits.
+    vec![ramp(-800.0), ramp(0.0)],
+    // The shortest weight windit's `Span` allows, beside a full window, so the
+    // duration weighting is as lopsided as it can be.
+    vec![certain_of(3), certain_of(3)],
+  ];
+
+  for pooling in all_poolings() {
+    for (case, pair) in rows.iter().enumerate() {
+      let windows = vec![
+        window(pair[0].clone(), 0, if case == 3 { 1 } else { WINDOW }),
+        window(pair[1].clone(), WINDOW, WINDOW),
+      ];
+      let pooled = aggregate_windows(pooling, &windows);
+      match &pooled {
+        Ok(out) => assert!(
+          out.as_slice().iter().all(|v| !v.is_nan()),
+          "{pooling:?} case {case}: {}",
+          describe(&pooled)
+        ),
+        // A refusal is an acceptable answer; a NaN one is not, and a NaN mass
+        // now IS a refusal, so the refusal has to be named.
+        Err(error) => assert!(
+          matches!(error, Error::ZeroMassAggregate(_)),
+          "{pooling:?} case {case}: {}",
+          describe(&pooled)
+        ),
+      }
+    }
+  }
+}
