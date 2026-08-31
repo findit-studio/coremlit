@@ -39,17 +39,73 @@
 //! - Findings must match [`KNOWN_DEFECTS`] **exactly**. An unpinned model
 //!   that grows a vanishing guard fails; a pinned one that is quietly
 //!   *repaired* also fails, so a fix cannot land un-noticed either.
+//! - Every site is CLASSIFIED into one of three [`GuardBand`]s and the census is
+//!   reported with any failure. Only [`GuardBand::Inert`] fails; the two
+//!   surviving bands are told apart rather than collapsed (see below).
+//! - Every `batch_norm` whose `variance` is a CONSTANT has that constant read
+//!   out of the bundle's weight blob, and the channels that are exactly `0.0` in
+//!   fp16 are pinned in [`LOAD_BEARING_NORMS`] — in both directions. Those
+//!   channels are guarded by the epsilon and by nothing else.
 //! - A `.mlmodelc` with no readable `model.mil` is a hard failure; a pinned
 //!   defect that has disappeared from an otherwise-present vendor tree is a hard
+//!   failure; a constant `variance` the blob reader cannot read is a hard
 //!   failure; and — the vendor manifest — an EXPECTED vendor directory that is
 //!   missing entirely is a hard failure too, so deleting a whole vendor cannot
 //!   silently disable all of its pins (the per-pin check alone only fired when
 //!   the vendor dir still existed). Nothing silently skips.
 //!
+//! # The two SURVIVING bands, and why the threshold stays at `2^-24`
+//!
+//! `2^-24` is fp16's smallest SUBNORMAL; `2^-14` ≈ 6.10e-5 its smallest NORMAL.
+//! A constant between them is representable only as a subnormal, and hardware
+//! that flushed subnormals to zero would make it inert exactly as if it were
+//! below `2^-24`. [`FP16_MIN_NORMAL`] used to sit here as a DEAD constant whose
+//! doc comment said as much, with no test behind it — the file asserting a
+//! hazard it never checked.
+//!
+//! It is not a small band. Over the 37 staged graphs the sweep audits 1 240
+//! guard sites: **4 normal, 1 217 subnormal-only, 19 inert** — and the 19 are
+//! exactly [`KNOWN_DEFECTS`]. Raising the threshold to the normal floor would
+//! fail 98 % of the tree, including whisper-mel's `add(x, 0x1p-24)` — the file's
+//! own clean control — and every issue-#15 REPAIR, which were cut to `0x1p-24`
+//! precisely. If the band were inert those repairs would be worthless.
+//!
+//! So it was MEASURED, on the one artifact where the band is load-bearing:
+//! `lid/SpeechBrainECAPAVoxLingua107.mlmodelc`, whose 33 `batch_norm` epsilons
+//! are all `0x1.5p-17` = 1.0014e-5 (subnormal-only) and whose stored
+//! `running_var` is exactly `0.0` in fp16 for 159 of its 19 968 channels — so
+//! `sqrt(variance + epsilon)` there is `sqrt(epsilon)` and nothing else. The
+//! graph was re-emitted with only those epsilon constants changed and run on
+//! `CpuOnly`, `CpuAndGpu`, `CpuAndNeuralEngine` and `All`, over three inputs:
+//!
+//! - `0x0p+0` — **107 of 107 NaN on every arm.** The falsifier, red: the guard
+//!   really is the only thing holding those channels up.
+//! - `0x1.5p-17` (shipping) and `0x1p-24` (fp16's SMALLEST subnormal, this
+//!   gate's own floor) — 107 of 107 finite on every arm, same top-1.
+//! - `0x1p-24`, `0x1p-23`, `0x1p-20`, `0x1p-15`, `0x1p-14` — five DISTINCT
+//!   outputs, so the value is consulted at full fp16 resolution, not flushed.
+//! - `0x1p-25` is refused at load (`not within range of type: fp16`), so the
+//!   `2^-24` floor is the type's own boundary, enforced by the runtime.
+//!
+//! `MLComputePlan` places 29 of those 33 `batch_norm` ops on the ANE under the
+//! default `All`. The threshold therefore stays at `2^-24`; the band is
+//! classified and REPORTED, not failed.
+//!
+//! This does **not** contradict the `lid/` [`KNOWN_DEFECTS`] note's failed
+//! repair (1), where an explicit `+6e-8` on a `log` was measured to flush on a
+//! static-shape ANE recompilation. The difference is structural and is the
+//! rule worth carrying forward: a `batch_norm`'s `variance` and `epsilon` are
+//! BOTH constants, so their sum is folded before any fp16 kernel runs, whereas
+//! a `log`'s guarded operand is a runtime tensor and its `+ eps` is a real fp16
+//! kernel add. Only the second is exposed to flush-to-zero. What has NOT been
+//! measured is a static-shape recompilation of these `batch_norm`s; the tools
+//! to produce one (coremltools) are not part of this repository's test
+//! environment.
+//!
 //! # Coverage boundary (`COREMLIT_FP16_SWEEP_VENDORS`)
 //!
-//! By default the sweep requires EVERY vendor named by a [`KNOWN_DEFECTS`] pin to
-//! be present. CI runs it once per `model-tests` SHARD, and each shard stages
+//! By default the sweep requires EVERY vendor named by a [`KNOWN_DEFECTS`] or
+//! [`LOAD_BEARING_NORMS`] pin to be present. CI runs it once per `model-tests` SHARD, and each shard stages
 //! only its own kit's part of the tree (per MODELS_LOCK), so each names exactly
 //! what it stages — `vadkit,speakerkit` for the speaker shard,
 //! `whisperkit-coreml,vadkit` for whisper, `vadkit,lid` for lid, and so on —
@@ -61,12 +117,12 @@
 //!
 //! The real coverage is therefore the UNION across shards, and the union is
 //! pinned rather than assumed: `ci_fp16_sweep_shards_cover_every_pinned_vendor`
-//! in `tests/whisper/models_lock.rs` fails if a [`KNOWN_DEFECTS`] vendor is
-//! swept by no shard, and fails if a shard stages a vendor tree it does not
+//! in `tests/whisper/models_lock.rs` fails if a vendor pinned by EITHER register
+//! is swept by no shard, and fails if a shard stages a vendor tree it does not
 //! sweep. Today that union proves the whisper mel, granite norm, vadkit STFT,
 //! CED, CLAP and SigLIP graphs are clean controls, and that the FIVE
-//! `speakerkit/` defect pins and the ONE `lid/` pin still hold in BOTH
-//! directions. It still CANNOT verify the `alignkit` and `argmax-speakerkit`
+//! `speakerkit/` defect pins, the ONE `lid/` defect pin and the ONE `lid/`
+//! [`LOAD_BEARING_NORMS`] pin still hold in BOTH directions. It still CANNOT verify the `alignkit` and `argmax-speakerkit`
 //! pins — no shard downloads those models — so full pin verification (every
 //! [`KNOWN_DEFECTS`] entry) remains a local/dev gate needing the complete
 //! `Models/` tree; that gap is recorded by name as `UNSTAGED_DEFECT_VENDORS`
@@ -98,7 +154,8 @@ mod workspace_root;
 
 use std::{
   collections::{BTreeMap, BTreeSet},
-  env, fs, io,
+  env, fs,
+  io::{self, Read, Seek, SeekFrom},
   path::{Path, PathBuf},
 };
 
@@ -106,11 +163,54 @@ use std::{
 /// representable in fp16 and rounds to zero — the guard becomes inert.
 const FP16_MIN_SUBNORMAL: f64 = 5.960_464_477_539_063e-8;
 
-/// fp16's smallest *normal*, `2^-14`. Not the gate's threshold; recorded
-/// because guards between it and [`FP16_MIN_SUBNORMAL`] survive only as
-/// subnormals, which some kernels flush to zero.
-#[allow(dead_code)]
+/// fp16's smallest *normal*, `2^-14` ≈ 6.10e-5. The boundary between the two
+/// SURVIVING bands (see [`GuardBand`]), **not** a second failure threshold —
+/// the module docs carry the measurement that keeps it from being one.
 const FP16_MIN_NORMAL: f64 = 6.103_515_625e-5;
+
+/// Which fp16 band a guard's effective floor lands in.
+///
+/// Three bands rather than a bare pass/fail, because two of them survive and
+/// they do not survive the same way, and because the difference is exactly the
+/// thing this file used to assert without checking: [`FP16_MIN_NORMAL`] sat
+/// here as a dead constant whose doc comment claimed subnormal guards were at
+/// risk while no test looked at the band at all. It is a classification now, so
+/// the claim is either measured or visible.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GuardBand {
+  /// `>= 2^-14` — an ordinary fp16 number, immune to any flush-to-zero.
+  Normal,
+  /// `[2^-24, 2^-14)` — representable, but ONLY as an fp16 subnormal. Almost
+  /// the whole tree lives here (see the module docs' census); MEASURED to be
+  /// honoured, and classified apart so that stays a measurement.
+  SubnormalOnly,
+  /// `< 2^-24` — not representable in fp16 at all. The constant rounds to zero,
+  /// the guard goes inert, and the sweep FAILS.
+  Inert,
+}
+
+impl GuardBand {
+  /// The band an effective floor lands in.
+  fn of(effective: f64) -> Self {
+    if effective >= FP16_MIN_NORMAL {
+      GuardBand::Normal
+    } else if effective >= FP16_MIN_SUBNORMAL {
+      GuardBand::SubnormalOnly
+    } else {
+      GuardBand::Inert
+    }
+  }
+
+  /// Stable label — it appears in the census, in every failure message, and
+  /// inside the [`LOAD_BEARING_NORMS`] pins, so it is API, not decoration.
+  fn label(self) -> &'static str {
+    match self {
+      GuardBand::Normal => "normal",
+      GuardBand::SubnormalOnly => "subnormal-only",
+      GuardBand::Inert => "inert",
+    }
+  }
+}
 
 // ---------------------------------------------------------------------------
 // MIL parsing
@@ -167,6 +267,15 @@ struct Stmt {
   dtype: String,
   op: String,
   args: String,
+  /// The trailing `[name = .., val = ..]` attribute list, kept verbatim.
+  ///
+  /// Scalar `const`s are resolved to a number at parse time, but a WEIGHT
+  /// const's value is not in the text at all — it is a `BLOBFILE(path, offset)`
+  /// into the bundle's `weights/weight.bin`. Keeping the attributes is what
+  /// lets [`Graph::audit`] hand a `batch_norm`'s `variance` operand to the
+  /// sweep as a [`BlobRef`], so the quantity a guard protects can be READ
+  /// rather than assumed.
+  attrs: String,
 }
 
 /// A parsed graph: scalar constants resolved to values, plus every
@@ -415,9 +524,15 @@ fn parse_stmt_line(line: &str) -> ParseOutcome {
   let attrs = rest[close + 1..].trim().to_string();
 
   let const_val = (op == "const").then(|| const_scalar(&attrs)).flatten();
+
   ParseOutcome::Parsed(Parsed {
     var: var.to_string(),
-    stmt: Stmt { dtype, op, args },
+    stmt: Stmt {
+      dtype,
+      op,
+      args,
+      attrs,
+    },
     const_val,
   })
 }
@@ -480,6 +595,167 @@ fn const_scalar(attrs: &str) -> Option<f64> {
   }
   let close = attrs[open..].find(')')? + open;
   parse_scalar(&attrs[open + 1..close])
+}
+
+// ---------------------------------------------------------------------------
+// Weight blobs
+//
+// A guard is only worth what it guards. `epsilon >= 2^-24` says the CONSTANT is
+// representable; it says nothing about whether the quantity beside it can be
+// zero. For most guard shapes that quantity is a runtime tensor and the gate
+// rightly makes no claim — but `batch_norm` is different: MIL passes its
+// `variance` as an OPERAND, and in every graph here that operand is a constant
+// stored in the bundle's own `weights/weight.bin`. So it can be read, and the
+// question "is this epsilon the ONLY thing between the graph and 1/sqrt(0)"
+// has an answer that is a fact about the artifact rather than a guess.
+//
+// The blob format is coremltools' `blob_file_format`: a 24-byte metadata record
+// at the offset the MIL names, then the payload wherever that record points.
+//
+//   0x00  uint32  sentinel = 0xdeadbeef
+//   0x04  uint32  dtype (1 = fp16, 2 = fp32)
+//   0x08  uint64  payload size in BYTES
+//   0x10  uint64  payload offset
+//
+// The sentinel is checked, and every failure to read is a HOLE — the same rule
+// the MIL reader follows. A variance this reader cannot read means the guard's
+// worth is unknown, which is not the same as the guard being fine.
+// ---------------------------------------------------------------------------
+
+/// The 4-byte sentinel every blob metadata record begins with.
+const BLOB_SENTINEL: u32 = 0xdead_beef;
+/// `blob_metadata`'s dtype code for fp16.
+const BLOB_DTYPE_FP16: u32 = 1;
+/// `blob_metadata`'s dtype code for fp32.
+const BLOB_DTYPE_FP32: u32 = 2;
+/// Refuse to allocate for a payload larger than this. A corrupt or
+/// misinterpreted metadata record can name an arbitrary `size`; the largest
+/// constant in the tree is a few tens of MiB, so a cap well above it turns a
+/// misread into a named failure instead of an out-of-memory abort.
+const BLOB_MAX_BYTES: u64 = 512 * 1024 * 1024;
+
+/// Where a non-scalar constant's bytes live: a bundle-relative path and the
+/// byte offset of its blob METADATA record (not of the payload).
+struct BlobRef {
+  path: String,
+  offset: u64,
+}
+
+/// The [`BlobRef`] in a `const`'s attribute list, if its value is a weight blob.
+///
+/// Both spellings, exactly as the two `const_scalar` arms handle both:
+/// coremltools 8 writes `BLOBFILE(path = tensor<string, []>("…"), offset =
+/// tensor<uint64, []>(64))`, coremltools 9 writes `BLOBFILE(path = string("…"),
+/// offset = uint64(618752))`. The path is the first quoted string after
+/// `BLOBFILE(` and the offset the first parenthesised integer after `offset`,
+/// which both spellings satisfy without the reader having to model either.
+fn blob_ref(attrs: &str) -> Option<BlobRef> {
+  let rest = &attrs[attrs.find("BLOBFILE(")? + "BLOBFILE(".len()..];
+  let open_quote = rest.find('"')?;
+  let close_quote = open_quote + 1 + rest[open_quote + 1..].find('"')?;
+  let path = rest[open_quote + 1..close_quote].to_string();
+
+  let after = &rest[close_quote..];
+  let offset_key = after.find("offset")?;
+  let open = offset_key + after[offset_key..].find('(')?;
+  let close = open + after[open..].find(')')?;
+  let offset = after[open + 1..close].trim().parse().ok()?;
+  Some(BlobRef { path, offset })
+}
+
+/// Reads a weight blob and narrows it to fp16 — the precision the guard is
+/// judged at, whatever the blob declares.
+///
+/// `Err` is a completeness HOLE, never a skip: an unreadable variance means the
+/// gate cannot say what the epsilon beside it is worth.
+fn read_blob_as_fp16(bundle: &Path, blob: &BlobRef) -> Result<Vec<half::f16>, String> {
+  let rel = blob.path.strip_prefix("@model_path/").unwrap_or(&blob.path);
+  let path = bundle.join(rel);
+  let mut file = fs::File::open(&path).map_err(|e| format!("open {}: {e}", path.display()))?;
+
+  let mut meta = [0_u8; 24];
+  file
+    .seek(SeekFrom::Start(blob.offset))
+    .and_then(|_| file.read_exact(&mut meta))
+    .map_err(|e| {
+      format!(
+        "read blob metadata at offset {} of {}: {e}",
+        blob.offset,
+        path.display()
+      )
+    })?;
+  let word = |at: usize| u32::from_le_bytes(meta[at..at + 4].try_into().expect("4 bytes"));
+  let long = |at: usize| u64::from_le_bytes(meta[at..at + 8].try_into().expect("8 bytes"));
+
+  let sentinel = word(0);
+  if sentinel != BLOB_SENTINEL {
+    return Err(format!(
+      "blob metadata at offset {} of {} begins {sentinel:#010x}, not the {BLOB_SENTINEL:#010x} \
+       sentinel — the offset or the blob layout is not what this reader assumes",
+      blob.offset,
+      path.display()
+    ));
+  }
+  let dtype = word(4);
+  let width = match dtype {
+    BLOB_DTYPE_FP16 => 2_u64,
+    BLOB_DTYPE_FP32 => 4,
+    other => {
+      return Err(format!(
+        "blob at offset {} of {} declares dtype {other}, which this reader does not narrow to \
+         fp16 (it knows {BLOB_DTYPE_FP16} = fp16 and {BLOB_DTYPE_FP32} = fp32)",
+        blob.offset,
+        path.display()
+      ));
+    }
+  };
+  let size = long(8);
+  if size > BLOB_MAX_BYTES || size % width != 0 {
+    return Err(format!(
+      "blob at offset {} of {} declares a {size}-byte payload, which is not a sane multiple of \
+       its {width}-byte element",
+      blob.offset,
+      path.display()
+    ));
+  }
+  let mut raw = vec![0_u8; usize::try_from(size).map_err(|e| format!("{size} bytes: {e}"))?];
+  file
+    .seek(SeekFrom::Start(long(16)))
+    .and_then(|_| file.read_exact(&mut raw))
+    .map_err(|e| {
+      format!(
+        "read {size} bytes of payload at offset {} of {}: {e}",
+        long(16),
+        path.display()
+      )
+    })?;
+
+  Ok(match dtype {
+    BLOB_DTYPE_FP16 => raw
+      .as_chunks::<2>()
+      .0
+      .iter()
+      .map(|c| half::f16::from_le_bytes(*c))
+      .collect(),
+    // Narrowed, not read as-is: an fp32 constant executed in fp16 IS its fp16
+    // rounding, which is the whole premise of this gate.
+    _ => raw
+      .as_chunks::<4>()
+      .0
+      .iter()
+      .map(|c| half::f16::from_f32(f32::from_le_bytes(*c)))
+      .collect(),
+  })
+}
+
+/// A `batch_norm` whose `variance` operand resolved to a CONSTANT — the one
+/// guard shape in this tree where the guarded quantity is pinned in the
+/// artifact and can therefore be counted.
+struct ConstVarianceNorm {
+  var: String,
+  dtype: String,
+  eps: f64,
+  blob: BlobRef,
 }
 
 impl Graph {
@@ -598,8 +874,41 @@ impl Graph {
     // level holes (a recognized site whose epsilon will not resolve) join
     // them below.
     let mut unresolved = self.unresolved.clone();
+    let mut const_variance_norms = Vec::new();
     for (var, stmt) in &self.producers {
       let eps_kwarg = self.value(arg(&stmt.args, "epsilon"));
+      // A `batch_norm` is the only op here that takes its `variance` as an
+      // OPERAND rather than computing it — `layer_norm`/`instance_norm` derive
+      // theirs from `x` at runtime and carry no such argument. When that
+      // operand is a constant, what the epsilon is worth is a readable fact
+      // about the artifact, so hand it to the sweep, which has the bundle
+      // path. A constant this reader cannot turn into a [`BlobRef`] is a HOLE,
+      // exactly like an unreadable epsilon: the guard's worth is unknown.
+      let variance_const = self
+        .producer_through_cast(arg(&stmt.args, "variance"), 0)
+        .filter(|producer| producer.op == "const");
+      if let ("batch_norm", Some(eps), Some(producer)) =
+        (stmt.op.as_str(), eps_kwarg, variance_const)
+      {
+        match blob_ref(&producer.attrs) {
+          Some(blob) => const_variance_norms.push(ConstVarianceNorm {
+            var: var.clone(),
+            dtype: stmt.dtype.clone(),
+            eps,
+            blob,
+          }),
+          // A rank-0 `variance` is not a thing MIL emits, but a constant whose
+          // value this reader can neither locate in the blob nor read as a
+          // scalar is unreadable, not absent.
+          None if const_scalar(&producer.attrs).is_none() => {
+            unresolved.push(format!(
+              "unreadable constant `variance` on batch_norm/{} {var}: {}",
+              stmt.dtype, producer.attrs
+            ));
+          }
+          None => {}
+        }
+      }
       let site = match stmt.op.as_str() {
         // `log` and `rsqrt` always carry an `epsilon` in CoreML MIL, so they
         // are always guard sites — including when that epsilon has already
@@ -695,6 +1004,7 @@ impl Graph {
     Audit {
       findings: found,
       unresolved,
+      const_variance_norms,
     }
   }
 }
@@ -706,6 +1016,10 @@ impl Graph {
 struct Audit {
   findings: Vec<Finding>,
   unresolved: Vec<String>,
+  /// Every `batch_norm` whose `variance` is a constant in the bundle's weight
+  /// blob. Carried out of the text-only audit so [`sweep_tree`] — which knows
+  /// the bundle path — can read it; the hermetic parser tests stay file-free.
+  const_variance_norms: Vec<ConstVarianceNorm>,
 }
 
 /// A one-line completeness failure for a recognized guard site whose epsilon
@@ -748,12 +1062,21 @@ impl Finding {
     self.eps.max(self.floor)
   }
 
+  /// Which fp16 band this guard's effective floor lands in.
+  fn band(&self) -> GuardBand {
+    GuardBand::of(self.effective())
+  }
+
   /// The gate. A guard survives iff its effective floor — the MAX of the op's
   /// own epsilon and the preceding floor, each an independent fp16 constant — is
   /// at or above fp16's smallest subnormal; anything below rounds to zero and
   /// the guard goes inert.
+  ///
+  /// Survival is the [`GuardBand::Inert`] question and nothing more. The
+  /// remaining two bands both survive, and the module docs carry the
+  /// measurement that says so — the distinction is REPORTED, never failed.
   fn survives_fp16(&self) -> bool {
-    self.effective() >= FP16_MIN_SUBNORMAL
+    self.band() != GuardBand::Inert
   }
 
   /// A `softmax` feeding a `log` is a decomposed `log_softmax`. Even with
@@ -938,6 +1261,125 @@ const KNOWN_DEFECTS: &[KnownDefect] = &[
            entry changing.",
   },
 ];
+
+// ---------------------------------------------------------------------------
+// The second register: where a surviving guard is the ONLY guard
+// ---------------------------------------------------------------------------
+
+/// One `batch_norm` whose stored `variance` holds channels that are exactly
+/// `0.0` once narrowed to fp16.
+///
+/// Those channels have nothing else. `batch_norm` computes
+/// `gamma * (x - mean) / sqrt(variance + epsilon) + beta`, so with
+/// `variance == 0` the epsilon is the entire denominator: drop it and the site
+/// computes `1/sqrt(0)`. That is not a hypothesis either — see
+/// [`LOAD_BEARING_NORMS`], where the measurement is recorded.
+struct ZeroVarianceSite {
+  dtype: String,
+  eps: f64,
+  channels: usize,
+  zeros: usize,
+}
+
+impl ZeroVarianceSite {
+  /// Stable one-line rendering — this is what [`LOAD_BEARING_NORMS`] pins, so
+  /// a changed epsilon, a changed BAND, a changed width or a changed number of
+  /// zero channels all fail the gate.
+  fn render(&self) -> String {
+    format!(
+      "batch_norm/{} eps={:e} band={} zero={}/{}",
+      self.dtype,
+      self.eps,
+      GuardBand::of(self.eps).label(),
+      self.zeros,
+      self.channels
+    )
+  }
+}
+
+/// An artifact where a surviving epsilon is the ONLY protection some channel
+/// has — the second thing this file pins, beside [`KNOWN_DEFECTS`].
+///
+/// [`KNOWN_DEFECTS`] answers "is the constant representable in fp16".
+/// This answers the question that one cannot: "and is there anything else
+/// holding the site up". A guard can clear `2^-24` by three orders of magnitude
+/// and still be the single point of failure for a channel whose variance is
+/// zero, and the gate had no way to see that.
+///
+/// Pinned in BOTH directions, like [`KnownDefect::sites`] and like
+/// `CHECKSUMLESS_KITS` in `tests/whisper/models_lock.rs`: a NEW artifact with
+/// zero-variance channels fails as an unpinned finding, a pinned artifact whose
+/// rows change fails, and a pinned artifact that is REPAIRED — its zero
+/// channels gone — fails too, so the entry cannot outlive its cause.
+struct LoadBearingNorm {
+  /// Path relative to `Models/`.
+  path: &'static str,
+  /// Every zero-variance `batch_norm`, rendered by
+  /// [`ZeroVarianceSite::render`], sorted. A multiset, like
+  /// [`KnownDefect::sites`]: two same-signature layers are two sites.
+  sites: &'static [&'static str],
+  /// Constant-variance channels in the whole graph, and how many of them are
+  /// exactly zero in fp16. The denominator is pinned too, so a re-conversion
+  /// that changes the model's widths cannot leave the numerator looking
+  /// unchanged.
+  channels: usize,
+  zero_channels: usize,
+  /// What is measured, and what it would take to arm it.
+  note: &'static str,
+}
+
+/// Every artifact in the tree whose epsilon is load-bearing. ONE, today.
+///
+/// The census that produced it swept all 37 staged graphs: 1 240 guard sites,
+/// of which 4 are [`GuardBand::Normal`], 1 217 [`GuardBand::SubnormalOnly`] and
+/// 19 [`GuardBand::Inert`] (those 19 are exactly [`KNOWN_DEFECTS`]). Of the
+/// 285 `batch_norm` sites, every one has a constant `variance`, and every one
+/// of those variances is bounded away from zero — whisper's 246 are all exactly
+/// `1.0`, CED's 4 sit at 244–448 and CLAP's 2 at 564–1043 — except the LID
+/// classifier's, below.
+const LOAD_BEARING_NORMS: &[LoadBearingNorm] = &[LoadBearingNorm {
+  path: "lid/SpeechBrainECAPAVoxLingua107.mlmodelc",
+  sites: &[
+    "batch_norm/fp16 eps=1.0013580322265625e-5 band=subnormal-only zero=1/1024",
+    "batch_norm/fp16 eps=1.0013580322265625e-5 band=subnormal-only zero=144/6144",
+    "batch_norm/fp16 eps=1.0013580322265625e-5 band=subnormal-only zero=4/1024",
+    "batch_norm/fp16 eps=1.0013580322265625e-5 band=subnormal-only zero=4/3072",
+    "batch_norm/fp16 eps=1.0013580322265625e-5 band=subnormal-only zero=6/1024",
+  ],
+  channels: 19_968,
+  zero_channels: 159,
+  note: "SpeechBrain's ECAPA carries PyTorch's BatchNorm1d default epsilon, 1e-5, rounded to \
+           fp16 as 0x1.5p-17 = 1.0014e-5 — 168x fp16's smallest subnormal, but 0.164x its \
+           smallest NORMAL, so it exists only as a subnormal. Across the 33 `batch_norm` sites \
+           the artifact's own `running_var` blobs hold 19 968 channels, of which 159 are exactly \
+           0.0 in fp16 (0.80 %), spread over five layers — 144 of them in `asp_bn`, the 6 144-wide \
+           statistics-pooling norm feeding the embedding. Those 159 channels are guarded by the \
+           epsilon and by nothing else. MEASURED, on this exact artifact (SHA-pinned by \
+           tests/lid/common/mod.rs), by re-emitting the graph with the two epsilon constants \
+           changed and running all four ComputeUnits arms on three inputs: at 0x0p+0 every arm \
+           returns 107 of 107 NaN — the falsifier, red, so the guard is genuinely load-bearing; \
+           at the SHIPPING 0x1.5p-17, and at 0x1p-24 (fp16's SMALLEST subnormal, the gate's own \
+           floor), every arm returns 107 of 107 finite log-probabilities with the same top-1, and \
+           0x1p-24 / 0x1p-23 / 0x1p-20 / 0x1p-15 / 0x1p-14 each give a DISTINCT output, so the \
+           value is being consulted at full fp16 resolution rather than flushed. MLComputePlan \
+           places 29 of the 33 `batch_norm` ops on the ANE under the default `All`. So the \
+           subnormal is honoured here, and the reason is structural: `variance` and `epsilon` are \
+           BOTH constants, so `variance + epsilon` is folded before any fp16 kernel runs — unlike \
+           the `log` epsilon pinned for this same artifact in KNOWN_DEFECTS, whose guarded operand \
+           is a runtime tensor and which the ANE was measured to flush. Pinned unrepaired because \
+           the guard holds; the pin is what makes a re-conversion that drops, folds or re-rounds \
+           this epsilon — or one that clamps `running_var` and removes the exposure — impossible \
+           to land unseen.",
+}];
+
+/// Every path either register pins, so the sweep can require it to be present.
+fn pinned_paths() -> BTreeSet<&'static str> {
+  KNOWN_DEFECTS
+    .iter()
+    .map(|d| d.path)
+    .chain(LOAD_BEARING_NORMS.iter().map(|d| d.path))
+    .collect()
+}
 
 // ---------------------------------------------------------------------------
 // Hermetic parser tests — no models, always run.
@@ -1298,6 +1740,21 @@ const LID_NON_STATEMENT_LINES: &[&str] = &[
   "} -> (log_probabilities);",
   "}",
 ];
+
+/// `Models/lid/SpeechBrainECAPAVoxLingua107.mlmodelc/model.mil`, lines 28-29 and
+/// 32-33 — the first of its 33 `batch_norm` sites, with the two constants the
+/// census reads: the `variance` operand's `BLOBFILE` reference and the shared
+/// epsilon. Verbatim, offsets included, so the hermetic tests exercise the same
+/// blob lookup the real sweep performs.
+const LID_BATCH_NORM: &str = r#"
+            tensor<fp16, [1024]> embedding_model_blocks_0_norm_norm_running_mean_to_fp16 = const()[name = string("embedding_model_blocks_0_norm_norm_running_mean_to_fp16"), val = tensor<fp16, [1024]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(616640)))];
+            tensor<fp16, [1024]> embedding_model_blocks_0_norm_norm_running_var_to_fp16 = const()[name = string("embedding_model_blocks_0_norm_norm_running_var_to_fp16"), val = tensor<fp16, [1024]>(BLOBFILE(path = string("@model_path/weights/weight.bin"), offset = uint64(618752)))];
+            fp16 var_23_to_fp16 = const()[name = string("op_23_to_fp16"), val = fp16(0x1.5p-17)];
+            tensor<fp16, [1, 1024, ?]> input_7_cast_fp16 = batch_norm(beta = embedding_model_blocks_0_norm_norm_bias_to_fp16, epsilon = var_23_to_fp16, gamma = embedding_model_blocks_0_norm_norm_weight_to_fp16, mean = embedding_model_blocks_0_norm_norm_running_mean_to_fp16, variance = embedding_model_blocks_0_norm_norm_running_var_to_fp16, x = x_3_cast_fp16)[name = string("input_7_cast_fp16")];
+"#;
+
+/// The blob-metadata offset [`LID_BATCH_NORM`]'s `variance` const names.
+const LID_VARIANCE_BLOB_OFFSET: u64 = 618_752;
 
 /// The vanishing guard sites of an already-audited graph, rendered and sorted
 /// as a **multiset** — duplicates PRESERVED. Two sites with the same signature
@@ -2031,9 +2488,10 @@ fn vendor_of(path: &str) -> &str {
 }
 
 /// The vendors the sweep REQUIRES to be present (the vendor manifest). Default:
-/// every vendor named by a [`KNOWN_DEFECTS`] pin, so deleting a whole vendor FAILS
-/// the sweep instead of silently dropping that vendor's pins. Fail-closed —
-/// absence of the override is the strictest setting.
+/// every vendor named by a [`KNOWN_DEFECTS`] **or** a [`LOAD_BEARING_NORMS`]
+/// pin, so deleting a whole vendor FAILS the sweep instead of silently dropping
+/// that vendor's pins. Fail-closed — absence of the override is the strictest
+/// setting.
 ///
 /// `COREMLIT_FP16_SWEEP_VENDORS` (comma-separated) OVERRIDES the manifest for a
 /// deliberately-partial tree: CI's model job stages part of the tree (per
@@ -2069,9 +2527,9 @@ fn expected_vendors() -> BTreeSet<String> {
 /// than disabling the fail-closed default.
 fn vendor_manifest(raw: Option<&str>) -> BTreeSet<String> {
   let Some(raw) = raw else {
-    return KNOWN_DEFECTS
-      .iter()
-      .map(|d| vendor_of(d.path).to_string())
+    return pinned_paths()
+      .into_iter()
+      .map(|path| vendor_of(path).to_string())
       .collect();
   };
   let vendors: BTreeSet<String> = raw
@@ -2095,6 +2553,14 @@ fn vendor_manifest(raw: Option<&str>) -> BTreeSet<String> {
 struct SweepOutcome {
   models_len: usize,
   audited_sites: usize,
+  /// How many audited sites landed in each [`GuardBand`], keyed by
+  /// [`GuardBand::label`]. Reported with every failure so a red carries the
+  /// census that explains it, and asserted non-vacuous by the sweep.
+  bands: BTreeMap<&'static str, usize>,
+  /// Constant `batch_norm` variance channels read out of the weight blobs, and
+  /// how many are exactly zero in fp16.
+  variance_channels: usize,
+  zero_variance_channels: usize,
   failures: Vec<String>,
 }
 
@@ -2116,7 +2582,12 @@ fn sweep_tree(root: &Path, expected_vendors: &BTreeSet<String>) -> io::Result<Sw
   models.sort();
 
   let pins: BTreeMap<&str, &KnownDefect> = KNOWN_DEFECTS.iter().map(|d| (d.path, d)).collect();
+  let load_bearing: BTreeMap<&str, &LoadBearingNorm> =
+    LOAD_BEARING_NORMS.iter().map(|d| (d.path, d)).collect();
   let mut audited_sites = 0_usize;
+  let mut bands: BTreeMap<&'static str, usize> = BTreeMap::new();
+  let mut variance_channels = 0_usize;
+  let mut zero_variance_channels = 0_usize;
   let mut failures = Vec::new();
   let mut seen = Vec::new();
 
@@ -2142,6 +2613,7 @@ fn sweep_tree(root: &Path, expected_vendors: &BTreeSet<String>) -> io::Result<Sw
     let Audit {
       findings,
       unresolved,
+      const_variance_norms,
     } = parse_mil(&text).audit();
 
     // Completeness: a guard-looking statement the reader could not resolve is
@@ -2169,6 +2641,46 @@ fn sweep_tree(root: &Path, expected_vendors: &BTreeSet<String>) -> io::Result<Sw
       continue;
     }
     audited_sites += findings.len();
+    for finding in &findings {
+      *bands.entry(finding.band().label()).or_default() += 1;
+    }
+
+    // What the artifact's own constants say the guards are WORTH. A
+    // `batch_norm` whose stored variance holds fp16-zero channels is a site
+    // whose epsilon is the whole denominator; an unreadable variance is a hole,
+    // recorded like any other, never a silent pass.
+    let mut zero_variance: Vec<String> = Vec::new();
+    let mut model_channels = 0_usize;
+    let mut model_zero_channels = 0_usize;
+    for norm in &const_variance_norms {
+      match read_blob_as_fp16(model, &norm.blob) {
+        Ok(values) => {
+          let zeros = values.iter().filter(|v| v.to_f32() == 0.0).count();
+          model_channels += values.len();
+          model_zero_channels += zeros;
+          if zeros > 0 {
+            zero_variance.push(
+              ZeroVarianceSite {
+                dtype: norm.dtype.clone(),
+                eps: norm.eps,
+                channels: values.len(),
+                zeros,
+              }
+              .render(),
+            );
+          }
+        }
+        Err(e) => failures.push(format!(
+          "{rel}: batch_norm {} declares a constant `variance` this reader could not read \
+           ({e}). What its epsilon is worth depends on that tensor, so an unreadable one is a \
+           hole, not a pass.",
+          norm.var
+        )),
+      }
+    }
+    zero_variance.sort();
+    variance_channels += model_channels;
+    zero_variance_channels += model_zero_channels;
 
     // A MULTISET, not a set: duplicates are preserved so a second
     // same-signature vanishing site fails the pin instead of collapsing into the
@@ -2223,6 +2735,40 @@ fn sweep_tree(root: &Path, expected_vendors: &BTreeSet<String>) -> io::Result<Sw
       }
       None => {}
     }
+
+    // The second register, pinned in BOTH directions exactly as the first is.
+    match load_bearing.get(rel.as_str()) {
+      Some(pin) => {
+        let expected: Vec<String> = pin.sites.iter().map(|s| (*s).to_string()).collect();
+        // Rows AND totals in one comparison: the rows carry the sites whose
+        // epsilon is the whole denominator, the totals carry the graph the
+        // fraction is out of — including the zero-FREE norms no row mentions.
+        if (&zero_variance, model_channels, model_zero_channels)
+          != (&expected, pin.channels, pin.zero_channels)
+        {
+          failures.push(format!(
+            "{rel}: pinned LOAD-BEARING epsilon sites CHANGED.\n    expected: {expected:?} over \
+             {}/{} channels\n    found:    {zero_variance:?} over {model_zero_channels}/\
+             {model_channels} channels\n    A zero-variance channel is guarded by its epsilon \
+             and by nothing else, so this changing in EITHER direction is a change in what the \
+             artifact depends on — a REPAIR included, which must be seen and the pin retired \
+             deliberately. Pin note: {}",
+            pin.zero_channels, pin.channels, pin.note
+          ));
+        }
+      }
+      None if !zero_variance.is_empty() => {
+        failures.push(format!(
+          "{rel}: NEW load-bearing epsilon in an unpinned model: {zero_variance:?}\n    These \
+           `batch_norm` sites hold channels whose stored variance is exactly 0.0 in fp16, so \
+           `sqrt(variance + epsilon)` reduces to `sqrt(epsilon)` and the epsilon is the entire \
+           denominator. That can clear the {FP16_MIN_SUBNORMAL:e} floor and still be a single \
+           point of failure. Measure what the site does with the epsilon set to zero, then pin \
+           it in LOAD_BEARING_NORMS with that measurement."
+        ));
+      }
+      None => {}
+    }
   }
 
   // The vendor manifest (F3): every EXPECTED vendor directory must be present, or
@@ -2241,16 +2787,17 @@ fn sweep_tree(root: &Path, expected_vendors: &BTreeSet<String>) -> io::Result<Sw
     }
   }
 
-  // A pinned defect that has disappeared from a vendor tree that IS present means
+  // A pinned model that has disappeared from a vendor tree that IS present means
   // the pin can no longer be verified. Hard failure — the single-model face of
-  // the same mode (the manifest above is the whole-vendor face).
-  for defect in KNOWN_DEFECTS {
-    let vendor = vendor_of(defect.path);
-    if root.join(vendor).is_dir() && !seen.iter().any(|s| s == defect.path) {
+  // the same mode (the manifest above is the whole-vendor face). Over BOTH
+  // registers, so deleting the one artifact LOAD_BEARING_NORMS pins cannot
+  // quietly retire that pin either.
+  for path in pinned_paths() {
+    let vendor = vendor_of(path);
+    if root.join(vendor).is_dir() && !seen.iter().any(|s| s == path) {
       failures.push(format!(
-        "{}: pinned known-defect model is MISSING, but Models/{vendor}/ is present. The pin \
-         cannot be verified. Restore the model or remove the pin.",
-        defect.path
+        "{path}: pinned model is MISSING, but Models/{vendor}/ is present. The pin cannot be \
+         verified. Restore the model or remove the pin."
       ));
     }
   }
@@ -2258,6 +2805,9 @@ fn sweep_tree(root: &Path, expected_vendors: &BTreeSet<String>) -> io::Result<Sw
   Ok(SweepOutcome {
     models_len: models.len(),
     audited_sites,
+    bands,
+    variance_channels,
+    zero_variance_channels,
     failures,
   })
 }
@@ -2289,12 +2839,26 @@ fn every_shipped_model_graph_survives_fp16() {
     "swept {} models and audited zero guard sites — vacuous",
     outcome.models_len
   );
+  // The band census must ACCOUNT for every audited site. A classification that
+  // silently dropped one would make the report a subset of the tree while still
+  // looking like a census.
+  assert_eq!(
+    outcome.bands.values().sum::<usize>(),
+    outcome.audited_sites,
+    "the band census {:?} does not account for all {} audited sites",
+    outcome.bands,
+    outcome.audited_sites
+  );
 
   assert!(
     outcome.failures.is_empty(),
-    "fp16 guard sweep failed over {} models / {} guard sites:\n\n{}\n",
+    "fp16 guard sweep failed over {} models / {} guard sites (bands: {:?}; constant batch_norm \
+     variance: {} of {} channels zero in fp16):\n\n{}\n",
     outcome.models_len,
     outcome.audited_sites,
+    outcome.bands,
+    outcome.zero_variance_channels,
+    outcome.variance_channels,
     outcome.failures.join("\n\n")
   );
 }
@@ -2340,6 +2904,302 @@ fn write_model(root: &Path, rel: &str, mil: &str) {
   let dir = root.join(rel);
   fs::create_dir_all(&dir).expect("create model dir");
   fs::write(dir.join("model.mil"), mil).expect("write model.mil");
+}
+
+/// Writes a synthetic `.mlmodelc` whose `variance` const resolves to a real
+/// weight blob: `model.mil`, plus a `weights/weight.bin` carrying one
+/// `blob_metadata` record at `offset` and `values` (as fp16) right after it.
+///
+/// The layout is the one [`read_blob_as_fp16`] reads, written independently
+/// here from the same field order — so a test that passes proves the reader and
+/// this writer agree about a format neither of them invented, and the verbatim
+/// [`LID_BATCH_NORM`] offsets stay untouched.
+fn write_model_with_variance(root: &Path, rel: &str, mil: &str, offset: u64, values: &[f32]) {
+  write_model(root, rel, mil);
+  let payload: Vec<u8> = values
+    .iter()
+    .flat_map(|v| half::f16::from_f32(*v).to_le_bytes())
+    .collect();
+  let data_at = offset + 24;
+  let mut blob = vec![0_u8; usize::try_from(data_at).expect("test offset fits") + payload.len()];
+  let at = usize::try_from(offset).expect("test offset fits");
+  blob[at..at + 4].copy_from_slice(&BLOB_SENTINEL.to_le_bytes());
+  blob[at + 4..at + 8].copy_from_slice(&BLOB_DTYPE_FP16.to_le_bytes());
+  blob[at + 8..at + 16].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+  blob[at + 16..at + 24].copy_from_slice(&data_at.to_le_bytes());
+  blob[usize::try_from(data_at).expect("test offset fits")..].copy_from_slice(&payload);
+
+  let weights = root.join(rel).join("weights");
+  fs::create_dir_all(&weights).expect("create weights dir");
+  fs::write(weights.join("weight.bin"), blob).expect("write weight.bin");
+}
+
+/// 1 024 variances with `zeros` of them exactly zero — the shape
+/// [`LID_BATCH_NORM`] declares.
+fn variances_with_zeros(zeros: usize) -> Vec<f32> {
+  (0..1024)
+    .map(|i| if i < zeros { 0.0 } else { 1.0 })
+    .collect()
+}
+
+/// The three bands must be three, and their boundaries must be the format's,
+/// not a rounded restatement of it. Also pins the band of the three epsilons the
+/// live tree actually contains, so "which band is this tree in" is answered by a
+/// test rather than by a comment.
+///
+/// MUTATION PROOF: collapsing [`GuardBand::of`]'s two surviving arms into one
+/// reds the `SubnormalOnly` assertions below.
+#[test]
+fn the_two_surviving_bands_are_classified_apart() {
+  assert_eq!(GuardBand::of(FP16_MIN_NORMAL), GuardBand::Normal);
+  assert_eq!(GuardBand::of(FP16_MIN_SUBNORMAL), GuardBand::SubnormalOnly);
+  // The boundaries are half-open at the BOTTOM of each band: the smallest
+  // representable step below either one drops a band.
+  assert_eq!(
+    GuardBand::of(FP16_MIN_NORMAL - FP16_MIN_SUBNORMAL),
+    GuardBand::SubnormalOnly
+  );
+  assert_eq!(
+    GuardBand::of(FP16_MIN_SUBNORMAL / 2.0),
+    GuardBand::Inert,
+    "half of the smallest subnormal is not representable in fp16"
+  );
+  assert_eq!(GuardBand::of(0.0), GuardBand::Inert);
+
+  // And the labels, which the pins and the failure messages both spell out.
+  assert_eq!(GuardBand::Normal.label(), "normal");
+  assert_eq!(GuardBand::SubnormalOnly.label(), "subnormal-only");
+  assert_eq!(GuardBand::Inert.label(), "inert");
+
+  // The three epsilons the live tree carries, one per band. Every one of these
+  // is a real value from a real staged graph, so the classification is anchored
+  // to the tree rather than to invented numbers.
+  //  - 1e-4, speakerkit/Embedding's pooling divisor guard  -> normal
+  //  - 1e-5, the BatchNorm1d default, everywhere           -> subnormal-only
+  //  - 1e-8, wespeaker's pooling guard (KNOWN_DEFECTS)     -> inert
+  assert_eq!(
+    GuardBand::of(1.000_165_939_331_054_7e-4),
+    GuardBand::Normal,
+    "speakerkit/Embedding's divisor guard is an ordinary fp16 number"
+  );
+  assert_eq!(
+    GuardBand::of(1.001_358_032_226_562_5e-5),
+    GuardBand::SubnormalOnly,
+    "0x1.5p-17, PyTorch's BatchNorm1d default rounded to fp16, is 168x the smallest subnormal \
+     and 0.164x the smallest NORMAL — it exists only as a subnormal"
+  );
+  assert_eq!(GuardBand::of(9.999_999_939_225_29e-9), GuardBand::Inert);
+}
+
+/// The blob reader, against a record this test writes itself. Proves the census
+/// reads what the MIL POINTS AT rather than whatever happens to be at the head
+/// of the file, and that an fp32 blob is narrowed rather than read as-is.
+#[test]
+fn a_variance_blob_is_read_from_the_offset_the_mil_names() {
+  let tree = TempTree::new("blob_read");
+  write_model_with_variance(
+    tree.path(),
+    "lid/probe.mlmodelc",
+    LID_BATCH_NORM,
+    LID_VARIANCE_BLOB_OFFSET,
+    &[1.0, 0.0, 2.0],
+  );
+  let bundle = tree.path().join("lid/probe.mlmodelc");
+  let blob = BlobRef {
+    path: "@model_path/weights/weight.bin".to_string(),
+    offset: LID_VARIANCE_BLOB_OFFSET,
+  };
+  let values = read_blob_as_fp16(&bundle, &blob).expect("the written blob reads back");
+  assert_eq!(
+    values.iter().map(|v| v.to_f32()).collect::<Vec<_>>(),
+    [1.0, 0.0, 2.0]
+  );
+
+  // The offset is load-bearing: a record that is not there is a hole, named.
+  let wrong = BlobRef {
+    path: "@model_path/weights/weight.bin".to_string(),
+    offset: 0,
+  };
+  let err = read_blob_as_fp16(&bundle, &wrong).expect_err("offset 0 holds no blob record");
+  assert!(
+    err.contains("sentinel"),
+    "a bad offset must be reported as a missing sentinel, got {err:?}"
+  );
+}
+
+/// The finding this whole register exists for: a `batch_norm` whose stored
+/// variance holds fp16-zero channels is a site whose epsilon is the ENTIRE
+/// denominator, and the sweep must say so — for a model no pin covers, loudly.
+///
+/// MUTATION PROOF: making the census skip zero counting (or dropping the
+/// `None if !zero_variance.is_empty()` arm) empties `failures` and reds this.
+#[test]
+fn an_unpinned_load_bearing_epsilon_fails_the_sweep() {
+  let tree = TempTree::new("load_bearing_new");
+  write_model_with_variance(
+    tree.path(),
+    "vadkit/synthetic.mlmodelc",
+    LID_BATCH_NORM,
+    LID_VARIANCE_BLOB_OFFSET,
+    &variances_with_zeros(7),
+  );
+  let expected = BTreeSet::from(["vadkit".to_string()]);
+
+  let outcome = sweep_tree(tree.path(), &expected).expect("walk the temp tree");
+  assert_eq!(
+    outcome.zero_variance_channels, 7,
+    "seven of the 1 024 stored variances are exactly zero in fp16"
+  );
+  assert_eq!(outcome.variance_channels, 1024);
+  assert!(
+    outcome.failures.iter().any(|f| {
+      f.contains("NEW load-bearing epsilon")
+        && f.contains("band=subnormal-only")
+        && f.contains("zero=7/1024")
+    }),
+    "an unpinned zero-variance batch_norm must fail the sweep, naming the band and the count — \
+     got {:?}",
+    outcome.failures
+  );
+}
+
+/// The other direction, and the one that keeps the register honest: a pinned
+/// artifact whose zero-variance channels have GONE fails too. An exemption must
+/// not outlive its cause — the same rule `CHECKSUMLESS_KITS` holds in
+/// `tests/whisper/models_lock.rs`.
+///
+/// Uses the real pinned path with a graph whose variances are all NON-zero, so
+/// the pin's five rows meet an empty finding: exactly what a re-conversion that
+/// clamped `running_var` would produce. The synthetic graph also carries no
+/// `log`, so the artifact's [`KNOWN_DEFECTS`] pin reports a second, unrelated
+/// failure; the assertion below names the load-bearing one specifically.
+#[test]
+fn a_repaired_load_bearing_pin_fails_the_sweep() {
+  let pin = LOAD_BEARING_NORMS
+    .iter()
+    .find(|p| p.path == "lid/SpeechBrainECAPAVoxLingua107.mlmodelc")
+    .expect("the lid artifact is pinned");
+  assert!(!pin.sites.is_empty(), "and it pins at least one site");
+
+  let tree = TempTree::new("load_bearing_repaired");
+  write_model_with_variance(
+    tree.path(),
+    pin.path,
+    LID_BATCH_NORM,
+    LID_VARIANCE_BLOB_OFFSET,
+    &variances_with_zeros(0),
+  );
+  let expected = BTreeSet::from(["lid".to_string()]);
+
+  let outcome = sweep_tree(tree.path(), &expected).expect("walk the temp tree");
+  assert_eq!(
+    outcome.zero_variance_channels, 0,
+    "nothing is zero any more"
+  );
+  assert!(
+    outcome
+      .failures
+      .iter()
+      .any(|f| f.contains("pinned LOAD-BEARING epsilon sites CHANGED") && f.contains("REPAIR")),
+    "a pinned load-bearing artifact whose zero-variance channels vanished must FAIL, so the \
+     repair is seen and the pin retired deliberately — got {:?}",
+    outcome.failures
+  );
+}
+
+/// A constant `variance` the reader cannot read is a HOLE, never a pass: what
+/// the epsilon beside it is worth depends on that tensor, and "could not look"
+/// is not "looked and it was fine". The same rule the MIL reader follows for an
+/// unreadable guard statement.
+#[test]
+fn an_unreadable_variance_blob_is_a_hole_not_a_skip() {
+  let tree = TempTree::new("variance_hole");
+  // The MIL is verbatim, so it points at offset 618 752 — and the bundle is
+  // written with NO weights directory at all.
+  write_model(tree.path(), "vadkit/synthetic.mlmodelc", LID_BATCH_NORM);
+  let expected = BTreeSet::from(["vadkit".to_string()]);
+
+  let outcome = sweep_tree(tree.path(), &expected).expect("walk the temp tree");
+  assert!(
+    outcome.failures.iter().any(|f| {
+      f.contains("constant `variance` this reader could not read") && f.contains("weight.bin")
+    }),
+    "a missing weight blob must be reported as a hole naming the file — got {:?}",
+    outcome.failures
+  );
+}
+
+/// A norm that computes its own statistics makes NO claim here, and must not
+/// produce a hole either. `layer_norm` and `instance_norm` carry no `variance`
+/// operand at all — their variance is a runtime tensor — so the census is
+/// silent about them, while the ordinary epsilon audit still covers them.
+///
+/// Without this, the census could be "complete" by flagging every norm in the
+/// tree, which would be noise rather than a finding.
+#[test]
+fn a_norm_that_computes_its_own_variance_makes_no_claim() {
+  for (label, mil) in [
+    ("granite layer_norm", GRANITE_NORMS_CLEAN),
+    ("clap layer_norm", CLAPKIT_NORMS_CLEAN),
+    ("siglip layer_norm", SIGLIP_NORMS_CLEAN),
+  ] {
+    let audit = parse_mil(mil).audit();
+    assert!(
+      audit.const_variance_norms.is_empty(),
+      "{label} has no constant `variance` operand, so the census must say nothing about it"
+    );
+    assert!(
+      audit.unresolved.is_empty(),
+      "{label} must not become a hole either: {:?}",
+      audit.unresolved
+    );
+    assert!(!audit.findings.is_empty(), "{label} still has guard sites");
+  }
+}
+
+/// Register hygiene, both registers: a path pinned twice would make the second
+/// entry unreachable, and the sweep looks each path up in a map. Mirrors the
+/// duplicate check `CHECKSUMLESS_KITS` carries in
+/// `tests/whisper/models_lock.rs`.
+#[test]
+fn neither_register_pins_a_path_twice() {
+  let defects: BTreeSet<&str> = KNOWN_DEFECTS.iter().map(|d| d.path).collect();
+  assert_eq!(
+    defects.len(),
+    KNOWN_DEFECTS.len(),
+    "KNOWN_DEFECTS pins a path twice; the second entry would be unreachable"
+  );
+  let bearing: BTreeSet<&str> = LOAD_BEARING_NORMS.iter().map(|d| d.path).collect();
+  assert_eq!(
+    bearing.len(),
+    LOAD_BEARING_NORMS.len(),
+    "LOAD_BEARING_NORMS pins a path twice; the second entry would be unreachable"
+  );
+  assert_eq!(
+    pinned_paths(),
+    defects.union(&bearing).copied().collect::<BTreeSet<&str>>(),
+    "pinned_paths must be the union of both registers — it is what the vendor manifest and the \
+     missing-model check are built from"
+  );
+  for pin in LOAD_BEARING_NORMS {
+    assert!(
+      !pin.sites.is_empty(),
+      "{}: a LOAD_BEARING_NORMS entry with no sites pins nothing",
+      pin.path
+    );
+    assert!(
+      pin.zero_channels > 0 && pin.zero_channels <= pin.channels,
+      "{}: {} of {} channels zero is not a coherent census",
+      pin.path,
+      pin.zero_channels,
+      pin.channels
+    );
+    assert!(
+      !pin.note.trim().is_empty(),
+      "{}: the note is the declaration — an entry without one records nothing",
+      pin.path
+    );
+  }
 }
 
 /// F3: deleting an entire vendor must FAIL the sweep, not silently skip its pins.
