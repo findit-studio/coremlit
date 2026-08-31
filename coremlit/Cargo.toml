@@ -1,0 +1,455 @@
+[package]
+name = "coremlit"
+description = "Safe, synchronous CoreML runtime for macOS (CPU/GPU/Neural Engine) with opt-in on-device multimodal pipelines: speech (Whisper STT, forced alignment, speaker diarization, Silero VAD), AudioSet sound-event tagging, and audio/text/image embeddings (CLAP, granite, SigLIP)"
+version.workspace = true
+edition.workspace = true
+publish = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "../README.md"
+keywords = ["coreml", "macos", "speech", "embeddings", "multimodal"]
+categories = ["multimedia::audio", "os::macos-apis", "artificial-intelligence", "computer-vision", "api-bindings"]
+exclude = [
+  "conversion/",
+  "tests/align/fixtures/",
+  "tests/ced/fixtures/",
+  "tests/clap/fixtures/",
+  "tests/lid/fixtures/",
+  "tests/siglip/fixtures/",
+  "tests/speaker/fixtures/",
+  "tests/vad/fixtures/",
+  "tests/whisper/fixtures/",
+  "tests/whisper_swift_probes/",
+]
+
+[package.metadata.docs.rs]
+all-features = true
+default-target = "aarch64-apple-darwin"
+targets = ["aarch64-apple-darwin"]
+
+[features]
+default = []
+serde = ["dep:serde"]
+tracing = ["dep:tracing"]
+
+whisper = [
+  "dep:libc",
+  "dep:mach2",
+  "dep:rand",
+  "dep:serde_json",
+  "dep:tokenizers",
+  "dep:unicode_categories",
+]
+# Former whisperkit `nl-recognizer` (Apple `NLLanguageRecognizer` redetection).
+# Whisper-only code, so it implies `whisper`.
+nl-recognizer = ["whisper", "dep:objc2-natural-language"]
+
+align = ["dep:asry"]
+# asry's ONNX aligner (pulls ort + whisper.cpp)
+# as the word-timing parity oracle. DEV/TEST only — adds nothing to the library.
+align-oracle = ["align", "asry/alignment"]
+
+speaker = ["dep:diaric"]
+vad = ["dep:zuoer"]
+clap = ["dep:rustfft", "dep:tokenizers", "dep:windit"]
+
+granite = ["dep:tokenizers", "dep:windit", "windit/text", "dep:sha2"]
+
+# LICENSE PREREQUISITE (owner-gated, NOT resolved by this change): `pixon` is
+# currently licensed GPL-3.0-or-later; the owner will relicense it permissive
+# (MIT OR Apache-2.0) before this branch merges. It is a flagged merge blocker
+# tracked outside this change, not something wired here.
+siglip = ["dep:tokenizers", "dep:pixon", "dep:sha2"]
+
+ced = ["dep:rustfft", "dep:soundevents-dataset", "dep:windit"]
+
+lid = ["dep:rustfft", "dep:windit"]
+
+[dependencies]
+objc2.workspace = true
+objc2-core-ml.workspace = true
+objc2-foundation.workspace = true
+objc2-core-video.workspace = true
+objc2-core-foundation.workspace = true
+block2.workspace = true
+half.workspace = true
+thiserror.workspace = true
+derive_more.workspace = true
+
+# --- cross-cutting optionals ---
+serde = { workspace = true, optional = true }
+tracing = { workspace = true, optional = true }
+
+# --- audio::whisper optionals ---
+libc = { workspace = true, optional = true }
+mach2 = { workspace = true, optional = true }
+rand = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+unicode_categories = { workspace = true, optional = true }
+objc2-natural-language = { workspace = true, optional = true }
+
+# --- audio::align optional dep (the `align` feature) ---
+asry = { version = "0.1.0", default-features = false, features = ["emissions"], optional = true }
+
+# --- audio::speaker optional dep (the `speaker` feature) ---
+diaric = { version = "0.1.0", optional = true }
+
+# --- audio::vad optional dep (the `vad` feature) ---
+zuoer = { version = "0.2.0", optional = true }
+
+# --- embeddings::clap optionals (the `clap` feature) ---
+rustfft = { workspace = true, optional = true }
+
+# audio::ced's 527-class rated AudioSet label set (ort-free data crate; see the
+# workspace table for the feature pins).
+soundevents-dataset = { workspace = true, optional = true }
+
+# --- shared windowing engine (the `clap`, `granite` + `lid` features) ---
+windit = { version = "0.3", optional = true }
+
+# --- embeddings::granite runtime tokenizer-identity digest (the `granite` feature) ---
+sha2 = { workspace = true, optional = true }
+
+# --- embeddings::siglip image resampler (the `siglip` feature) ---
+# LICENSE: pixon is GPL-3.0-or-later today; its owner-gated relicense to
+# MIT OR Apache-2.0 is a merge blocker for this branch (see the `siglip` feature
+# comment above).
+pixon = { version = "0.3", default-features = false, features = ["std", "rgb"], optional = true }
+
+[dev-dependencies]
+half.workspace = true
+cpal.workspace = true
+criterion.workspace = true
+hound.workspace = true
+rubato.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+toml.workspace = true
+tokenizers.workspace = true
+npyz.workspace = true
+png.workspace = true
+libc.workspace = true
+mach2.workspace = true
+asry = { version = "0.1.0", default-features = false, features = ["emissions"] }
+
+[[test]]
+name = "whisper_golden_provenance"
+path = "tests/whisper/golden_provenance.rs"
+required-features = ["whisper"]
+
+[[test]]
+name = "whisper_longform"
+path = "tests/whisper/longform.rs"
+required-features = ["whisper"]
+
+[[test]]
+name = "whisper_model_io"
+path = "tests/whisper/model_io.rs"
+required-features = ["whisper"]
+
+[[test]]
+name = "whisper_models_lock"
+path = "tests/whisper/models_lock.rs"
+required-features = ["whisper"]
+
+[[test]]
+name = "whisper_parity_es"
+path = "tests/whisper/parity_es.rs"
+required-features = ["whisper"]
+
+[[test]]
+name = "whisper_parity_jfk"
+path = "tests/whisper/parity_jfk.rs"
+required-features = ["whisper"]
+
+[[test]]
+name = "whisper_pipeline"
+path = "tests/whisper/pipeline.rs"
+required-features = ["whisper"]
+
+[[test]]
+name = "whisper_streaming"
+path = "tests/whisper/streaming.rs"
+required-features = ["whisper"]
+
+[[test]]
+name = "whisper_vad_source"
+path = "tests/whisper/vad_source.rs"
+required-features = ["whisper", "vad"]
+
+[[test]]
+name = "whisper_rtf_gate"
+path = "benches/whisper/rtf.rs"
+required-features = ["whisper"]
+
+[[bench]]
+name = "whisper_stages"
+path = "benches/whisper/stages.rs"
+harness = false
+required-features = ["whisper"]
+
+[[bench]]
+name = "whisper_rtf"
+path = "benches/whisper/rtf.rs"
+harness = false
+required-features = ["whisper"]
+
+[[example]]
+name = "whisper_mic_stream"
+path = "examples/whisper/mic_stream.rs"
+test = true
+required-features = ["whisper"]
+
+[[example]]
+name = "whisper_transcribe_wav"
+path = "examples/whisper/transcribe_wav.rs"
+required-features = ["whisper"]
+
+# --- audio::align ---
+[[test]]
+name = "align_align_chunk"
+path = "tests/align/align_chunk.rs"
+required-features = ["align"]
+
+[[test]]
+name = "align_align_chunk_equivalence"
+path = "tests/align/align_chunk_equivalence.rs"
+required-features = ["align"]
+
+[[test]]
+name = "align_model_io"
+path = "tests/align/model_io.rs"
+required-features = ["align"]
+
+[[test]]
+name = "align_prepared_composition"
+path = "tests/align/prepared_composition.rs"
+required-features = ["align"]
+
+[[test]]
+name = "align_registry_handle"
+path = "tests/align/registry_handle.rs"
+required-features = ["align"]
+
+# The word-timing parity gate needs asry's ONNX aligner oracle (ort +
+# whisper.cpp) — the former alignkit `parity-oracle`, now `align-oracle`.
+[[test]]
+name = "align_parity_words"
+path = "tests/align/parity_words.rs"
+required-features = ["align-oracle"]
+
+[[bench]]
+name = "align_align"
+path = "benches/align/align.rs"
+harness = false
+required-features = ["align"]
+
+# --- audio::speaker ---
+[[test]]
+name = "speaker_argmax_model_io"
+path = "tests/speaker/argmax_model_io.rs"
+required-features = ["speaker"]
+
+[[test]]
+name = "speaker_golden_metadata"
+path = "tests/speaker/golden_metadata.rs"
+required-features = ["speaker"]
+
+[[test]]
+name = "speaker_model_io"
+path = "tests/speaker/model_io.rs"
+required-features = ["speaker"]
+
+[[test]]
+name = "speaker_parity_argmax_accuracy"
+path = "tests/speaker/parity_argmax_accuracy.rs"
+required-features = ["speaker"]
+
+[[test]]
+name = "speaker_parity_argmax_swift"
+path = "tests/speaker/parity_argmax_swift.rs"
+required-features = ["speaker"]
+
+[[test]]
+name = "speaker_parity_embed"
+path = "tests/speaker/parity_embed.rs"
+required-features = ["speaker"]
+
+[[test]]
+name = "speaker_parity_seg"
+path = "tests/speaker/parity_seg.rs"
+required-features = ["speaker"]
+
+[[test]]
+name = "speaker_parity_online_swift"
+path = "tests/speaker/parity_online_swift.rs"
+required-features = ["speaker"]
+
+[[test]]
+name = "speaker_parity_diarize_wiring"
+path = "tests/speaker/parity_diarize_wiring.rs"
+required-features = ["speaker"]
+
+# --- audio::vad ---
+[[test]]
+name = "vad_model_io"
+path = "tests/vad/model_io.rs"
+required-features = ["vad"]
+
+[[test]]
+name = "vad_model_state"
+path = "tests/vad/model_state.rs"
+required-features = ["vad"]
+
+[[test]]
+name = "vad_parity_swift"
+path = "tests/vad/parity_swift.rs"
+required-features = ["vad"]
+
+[[test]]
+name = "vad_reexport"
+path = "tests/vad/reexport.rs"
+required-features = ["vad"]
+
+[[test]]
+name = "clap_e2e"
+path = "tests/clap/e2e.rs"
+required-features = ["clap"]
+
+[[test]]
+name = "clap_model_io"
+path = "tests/clap/model_io.rs"
+required-features = ["clap"]
+
+[[test]]
+name = "clap_text_model_io"
+path = "tests/clap/text_model_io.rs"
+required-features = ["clap"]
+
+[[test]]
+name = "clap_placement"
+path = "tests/clap/placement.rs"
+required-features = ["clap"]
+
+[[test]]
+name = "clap_tokenizer_identity"
+path = "tests/clap/tokenizer_identity.rs"
+required-features = ["clap"]
+
+[[test]]
+name = "granite_tokenizer_identity"
+path = "tests/granite/tokenizer_identity.rs"
+required-features = ["granite"]
+
+[[test]]
+name = "granite_driver_crosscheck"
+path = "tests/granite/driver_crosscheck.rs"
+required-features = ["granite"]
+
+[[test]]
+name = "granite_model_io"
+path = "tests/granite/model_io.rs"
+required-features = ["granite"]
+
+[[test]]
+name = "granite_parity_embed"
+path = "tests/granite/parity_embed.rs"
+required-features = ["granite"]
+
+[[test]]
+name = "granite_placement"
+path = "tests/granite/placement.rs"
+required-features = ["granite"]
+
+[[test]]
+name = "granite_embed_long"
+path = "tests/granite/embed_long.rs"
+required-features = ["granite"]
+
+[[test]]
+name = "siglip_tokenizer_identity"
+path = "tests/siglip/tokenizer_identity.rs"
+required-features = ["siglip"]
+
+[[test]]
+name = "siglip_preprocess"
+path = "tests/siglip/preprocess.rs"
+required-features = ["siglip"]
+
+[[test]]
+name = "siglip_model_io"
+path = "tests/siglip/model_io.rs"
+required-features = ["siglip"]
+
+[[test]]
+name = "siglip_text_model_io"
+path = "tests/siglip/text_model_io.rs"
+required-features = ["siglip"]
+
+[[test]]
+name = "siglip_parity_embed"
+path = "tests/siglip/parity_embed.rs"
+required-features = ["siglip"]
+
+[[test]]
+name = "siglip_placement"
+path = "tests/siglip/placement.rs"
+required-features = ["siglip"]
+
+[[test]]
+name = "siglip_e2e"
+path = "tests/siglip/e2e.rs"
+required-features = ["siglip"]
+
+[[test]]
+name = "siglip_band_provenance"
+path = "tests/siglip/band_provenance.rs"
+required-features = ["siglip"]
+
+[[test]]
+name = "ced_model_io"
+path = "tests/ced/model_io.rs"
+required-features = ["ced"]
+
+[[test]]
+name = "ced_parity_logits"
+path = "tests/ced/parity_logits.rs"
+required-features = ["ced"]
+
+[[test]]
+name = "ced_placement"
+path = "tests/ced/placement.rs"
+required-features = ["ced"]
+
+[[test]]
+name = "ced_e2e"
+path = "tests/ced/e2e.rs"
+required-features = ["ced"]
+
+[[test]]
+name = "lid_model_io"
+path = "tests/lid/model_io.rs"
+required-features = ["lid"]
+
+[[test]]
+name = "lid_e2e"
+path = "tests/lid/e2e.rs"
+required-features = ["lid"]
+
+[[test]]
+name = "lid_long_clip"
+path = "tests/lid/long_clip.rs"
+required-features = ["lid"]
+
+[[bench]]
+name = "clap_encode"
+path = "benches/clap/encode.rs"
+harness = false
+required-features = ["clap"]
+
+[lints]
+workspace = true

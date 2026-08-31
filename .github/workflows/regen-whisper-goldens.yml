@@ -130,7 +130,7 @@ jobs:
           set -euo pipefail
           mkdir -p "$WHISPER_GOLDEN_OUT"
           export TMPDIR="${{ runner.temp }}"
-          crates/coremlit/tests/whisper/swift/regen_goldens.sh
+          coremlit/tests/whisper/swift/regen_goldens.sh
           echo "== tokenizer whisperkit-cli fetched for itself =="
           find "$TMPDIR/whisperkit-cli-tokenizers" -name 'tokenizer*.json' 2>/dev/null | head || true
 
@@ -143,7 +143,7 @@ jobs:
         run: |
           set -euo pipefail
           out="${{ runner.temp }}/whisper-goldens"
-          committed=crates/coremlit/tests/whisper/fixtures/golden
+          committed=coremlit/tests/whisper/fixtures/golden
           {
             echo "### Diff vs committed goldens"
             echo '```diff'

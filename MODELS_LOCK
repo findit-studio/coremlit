@@ -26,7 +26,7 @@
 #     the shard's own kit matches NO table (which would otherwise leave a
 #     shard downloading nothing and gating a bare checkout).
 #   - the hermetic `ci_shards_every_kit_in_the_lock` gate in
-#     crates/coremlit/tests/whisper/models_lock.rs fails if a kit named here
+#     coremlit/tests/whisper/models_lock.rs fails if a kit named here
 #     has no shard in ci.yml's matrix, or a shard names a kit no table
 #     defines. That is the cross-shard half no single shard can see, and it
 #     runs in the modelless `features` job on every PR.
@@ -53,7 +53,7 @@
 # # contract-identical and pass every load/shape test. Only bytes tell them  #
 # # apart, which is why ci.yml's "Verify speakerkit overlay" step hashes     #
 # # both graphs against the pins in                                          #
-# # crates/coremlit/tests/speaker/model_io.rs BEFORE any gate runs, and      #
+# # coremlit/tests/speaker/model_io.rs BEFORE any gate runs, and      #
 # # fails the job naming this ordering as the cause.                        #
 # ###########################################################################
 #
@@ -70,7 +70,7 @@
 # `CHECKSUMS.sha256` that ci.yml verifies the downloaded bytes against;
 # FluidInference's repo ships NO checksum file, so its bundles are covered
 # instead by the per-file SHA-256 pins in
-# crates/coremlit/tests/speaker/model_io.rs (`wespeaker_v2.mlmodelc`) and by
+# coremlit/tests/speaker/model_io.rs (`wespeaker_v2.mlmodelc`) and by
 # the `tests/fp16_guards.rs` graph sweep, which reads every staged
 # `model.mil` and pins its guard sites in both directions. The lid repo is in
 # the same position for a different reason — it publishes digests, but in an
@@ -320,7 +320,7 @@ local-dir = "Models/clapkit"
 # `artifact_manifest.json`, which `shasum -c` cannot read. Pointing
 # `checksum-file` at it would fail on a correct tree, so the shard declares
 # `checksum-dir: none`, recorded with that reason in `CHECKSUMLESS_KITS`
-# (crates/coremlit/tests/whisper/models_lock.rs), which also fails if the row
+# (coremlit/tests/whisper/models_lock.rs), which also fails if the row
 # ever stops declaring it. The bytes are covered instead by `ARTIFACT_SHA256`
 # in tests/lid/common/mod.rs — an EXACT file set, so a missing or an added file
 # reds as loudly as a changed one — verified by

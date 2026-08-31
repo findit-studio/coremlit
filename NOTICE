@@ -62,7 +62,7 @@ it. FluidInference's CoreML conversion (section 2) is vendored into this
 repository at `Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc/`,
 committed so CI and every clone have it with no download step. Those bytes are
 copied verbatim from the Hub at the pinned revision, and every one of them is
-re-verified per file by SHA-256 in `crates/coremlit/tests/vad/model_io.rs`.
+re-verified per file by SHA-256 in `coremlit/tests/vad/model_io.rs`.
 
   Upstream project: https://github.com/snakers4/silero-vad
   Upstream license at the time this crate was written: MIT
@@ -401,7 +401,7 @@ does not redistribute it.
 audio::ced runs CoreML conversions of the four OFFICIAL public CED checkpoints
 (Consistent Ensemble Distillation; arXiv 2308.11957; upstream RicherMans/CED),
 one fp16 `mel → logits` graph per size. The crate ships NO model files; each
-graph is converted locally by `crates/coremlit/conversion/ced/` and staged
+graph is converted locally by `coremlit/conversion/ced/` and staged
 gitignored under `Models/ced/ced-<size>/`.
 
         Original models — mispeech/ced-{tiny,mini,small,base}
@@ -477,7 +477,7 @@ upstream model card (section 10c).
        private `mel` submodule). coremlit alters no weight value.
 
   10b) Label roster — voxlingua107_labels.json. COMPILED INTO THE CRATE via
-       include_bytes! (crates/coremlit/src/audio/lid/assets/), so linking
+       include_bytes! (coremlit/src/audio/lid/assets/), so linking
        coremlit DOES redistribute it. 10 756 bytes of language codes and English
        names; it carries no model weights.
 

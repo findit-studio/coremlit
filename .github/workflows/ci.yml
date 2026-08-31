@@ -30,7 +30,7 @@ jobs:
       # hermetic falsifiability suites (no models). Those binaries live in the
       # never-published `coremlit-parity` package, which owns the unpublished
       # `dia` git oracle.
-      - run: crates/coremlit-parity/tests/speaker/der_gate_inventory.sh
+      - run: coremlit-parity/tests/speaker/der_gate_inventory.sh
       # The VAD model gates run HERE, in the job that downloads nothing: the
       # FluidInference silero-vad `.mlmodelc` is COMMITTED (1.1 MiB; .gitignore
       # un-ignores exactly that path), so `<workspace>/Models/vadkit` resolves
@@ -95,7 +95,7 @@ jobs:
   # Curated feature-combination matrix for the PUBLISHABLE crate — replaces the
   # former per-crate `cargo hack --each-feature` powerset with the explicit,
   # reviewable list (each kit feature alone, all-on, none) pinned in
-  # crates/coremlit/FEATURE_MAP.md and by the `feature_map` golden test. Runs
+  # coremlit/FEATURE_MAP.md and by the `feature_map` golden test. Runs
   # each combo's hermetic tests; model-gated tests stay `#[ignore]`d here. The
   # third-party parity oracles are NOT here — they are the `parity` job below.
   features:
@@ -325,7 +325,7 @@ jobs:
           # ComputeUnits::All placement (issue #15). Only the bytes tell them
           # apart, which is what these two sha256s are for. They are a
           # deliberate SECOND copy of the `model.mil` pins in
-          # crates/coremlit/tests/speaker/model_io.rs
+          # coremlit/tests/speaker/model_io.rs
           # (`fp16_safe_segmentation_matches_pinned_sha256`,
           # `fp16_safe_wespeaker_fp32_matches_pinned_sha256`), so this check is
           # independent of the gate that runs much later;
@@ -472,7 +472,7 @@ jobs:
           # `lid_model_io` gates below, which checks an EXACT per-file SHA-256
           # set (`ARTIFACT_SHA256`, tests/lid/common/mod.rs) so a missing or an
           # added file reds too. `CHECKSUMLESS_KITS` in
-          # crates/coremlit/tests/whisper/models_lock.rs records the exemption
+          # coremlit/tests/whisper/models_lock.rs records the exemption
           # WITH that reason, refuses `none` from any kit not listed there, and
           # fails if a listed kit ever stops declaring it — so the exemption
           # cannot outlive the upstream gap it describes.
@@ -551,7 +551,7 @@ jobs:
           #
           # Still no TOML crate: a small awk pass over the lock's fixed
           # `["repo/name"]` + `key = "value"` shape, mirrored hermetically by
-          # `parse_lock` in crates/coremlit/tests/whisper/models_lock.rs.
+          # `parse_lock` in coremlit/tests/whisper/models_lock.rs.
           lock=MODELS_LOCK
 
           # TRIPWIRE 1 (replaces the old `table_count -ne 7` pin): every table
@@ -708,7 +708,7 @@ jobs:
             exit 0
           fi
           # The expected hashes are a deliberate SECOND copy of the pins in
-          # crates/coremlit/tests/speaker/model_io.rs, so this check is
+          # coremlit/tests/speaker/model_io.rs, so this check is
           # independent of the gate that runs much later;
           # `ci_stages_the_speakerkit_overlay_last_and_proves_it_won` keeps the
           # two copies from drifting.
@@ -812,7 +812,7 @@ jobs:
       # `UNSTAGED_DEFECT_VENDORS` in that test rather than left implicit.
       #
       # fp16_guards is a core test — no feature needed. See the
-      # coverage-boundary note in crates/coremlit/tests/fp16_guards.rs.
+      # coverage-boundary note in coremlit/tests/fp16_guards.rs.
       - name: fp16 graph sweep
         id: fp16_guards
         if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
@@ -828,7 +828,7 @@ jobs:
       - name: fp16 sweep inventory
         id: fp16_inventory
         if: ${{ !cancelled() && steps.download.outcome != 'failure' }}
-        run: crates/coremlit/tests/fp16_sweep_inventory.sh
+        run: coremlit/tests/fp16_sweep_inventory.sh
       # ONE gate runner for all seven shards, driven by the matrix row's `gates`
       # plan: one `features|selectors|filter` group per line, where a selector
       # is a test-target name, `@lib` for the in-lib gates, or `@all` for the

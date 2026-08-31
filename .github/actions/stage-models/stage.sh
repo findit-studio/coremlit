@@ -102,7 +102,7 @@ fi
 #
 # Still no TOML crate for a file of this fixed shape, matching ci.yml's inline
 # parser and the hermetic `parse_lock` mirror in
-# crates/coremlit/tests/whisper/models_lock.rs.
+# coremlit/tests/whisper/models_lock.rs.
 tables=$(awk -v want="$kit" '
   function flush() {
     if (repo != "" && tkit == want) {
@@ -136,7 +136,7 @@ tables=$(awk -v want="$kit" '
 # on EVERY mode, so the cache-hit path (which performs no download) is covered
 # too. The cross-leg half — a table whose kit NO leg consumes — cannot be seen
 # from inside one leg and is pinned hermetically by
-# `ci_shards_every_kit_in_the_lock` (crates/coremlit/tests/whisper/models_lock.rs).
+# `ci_shards_every_kit_in_the_lock` (coremlit/tests/whisper/models_lock.rs).
 if [ -z "$tables" ]; then
   echo "::error::$lock defines no table with kit = \"$kit\", but a \"$kit\" leg asked to stage one — add the table, or drop the leg" >&2
   exit 1
@@ -264,7 +264,7 @@ for d in "${dirs[@]}"; do
   # pass for having been created. Globbed rather than `find -quit`ed because
   # `-quit` is not in every BSD find, and rather than `ls | head` because that
   # closes a pipe under a writer (the SIGPIPE lesson from
-  # crates/coremlit/tests/fp16_sweep_inventory.sh).
+  # coremlit/tests/fp16_sweep_inventory.sh).
   shopt -s nullglob dotglob
   entries=("$d"/*)
   shopt -u nullglob dotglob
