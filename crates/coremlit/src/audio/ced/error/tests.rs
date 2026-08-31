@@ -45,3 +45,22 @@ fn input_variants_render_their_payloads() {
   assert!(Error::EmptyWindows.to_string().contains("window"));
   assert!(Error::UnknownClassIndex(527).to_string().contains("527"));
 }
+
+#[test]
+fn class_count_mismatch_display_shows_got_then_expected() {
+  // `new` takes (expected, got); the message prints GOT first.
+  let msg = Error::ClassCountMismatch(ClassCountMismatch::new(527, 3)).to_string();
+  assert_eq!(
+    msg,
+    "confidence vector has 3 values, expected exactly 527 (one per class)"
+  );
+}
+
+#[test]
+fn invalid_confidence_display_shows_index_and_value() {
+  let msg = Error::InvalidConfidence(InvalidConfidence::new(9, 1.5)).to_string();
+  assert_eq!(
+    msg,
+    "confidence at class index 9 is 1.5, not a finite value in [0, 1]"
+  );
+}

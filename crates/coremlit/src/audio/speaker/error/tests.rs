@@ -404,32 +404,3 @@ fn extraction_chunk_count_too_large_displays_the_count_and_the_cap() {
     bytes.split_whitespace().collect::<Vec<_>>()
   );
 }
-
-/// The repo's `rust-type-conventions` rule — "variants are UNIT or NEWTYPE only,
-/// never struct-shaped" — counted rather than asserted per variant, so a new
-/// struct-shaped variant is a failure here rather than a review miss.
-///
-/// Ten variants were grandfathered in when this test was written:
-/// `ModelError::ContractMismatch`, `InferError`'s five (`NonFiniteOutput`,
-/// `InputLength`, `OutputShape`, `NonFiniteInput`, `F16OverflowInput`), and
-/// `ExtractError`'s four (`StepSamplesExceedsWindow`, `OnsetOutOfRange`,
-/// `UnsupportedStepSamples`, `FrameCountMismatch`). All ten now carry a named
-/// payload struct or a plain scalar, so the exemption is gone and the rule
-/// holds here with no exceptions.
-#[test]
-fn error_enums_have_no_struct_shaped_variants() {
-  let src = include_str!("mod.rs");
-  let count = src
-    .lines()
-    .filter(|l| {
-      let t = l.strip_prefix("  ").unwrap_or("");
-      t.ends_with(" {")
-        && t.chars().next().is_some_and(char::is_uppercase)
-        && t[..t.len() - 2].chars().all(char::is_alphanumeric)
-    })
-    .count();
-  assert_eq!(
-    count, 0,
-    "struct-shaped variants in audio/speaker/error/mod.rs"
-  );
-}

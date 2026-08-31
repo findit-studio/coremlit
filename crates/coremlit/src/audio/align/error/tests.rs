@@ -170,3 +170,32 @@ fn align_error_unnormalized_emissions_names_the_frame_and_logsumexp() {
     "must name the likely cause: {rendered}"
   );
 }
+
+#[test]
+fn decision_language_display_separates_found_from_requested() {
+  // `new` takes (index, requested, found); the message prints the FOUND
+  // language first and the REQUESTED one second, which is the pair a
+  // positional-argument slip would swap without changing the prose.
+  let e = AlignError::DecisionLanguage(DecisionLanguage::new(3, asry::Lang::En, asry::Lang::Zh));
+  let rendered = e.to_string();
+  assert!(
+    rendered.starts_with("oov_decisions[3] carries language "),
+    "{rendered}"
+  );
+  assert!(
+    rendered.contains("carries language Zh but the chunk is being aligned for En"),
+    "{rendered}"
+  );
+  assert!(rendered.contains("AlignmentSet::detect_oov"), "{rendered}");
+}
+
+#[test]
+fn language_unsupported_display_names_the_language_and_the_policy() {
+  let rendered = AlignError::LanguageUnsupported(asry::Lang::Zh).to_string();
+  assert!(
+    rendered.contains("no aligner registered for language Zh"),
+    "{rendered}"
+  );
+  assert!(rendered.contains("no `Any` fallback"), "{rendered}");
+  assert!(rendered.contains("`Error`"), "{rendered}");
+}

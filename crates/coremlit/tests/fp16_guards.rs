@@ -318,20 +318,25 @@ fn guard_op_in(line: &str) -> Option<&'static str> {
   })
 }
 
+/// A fully-parsed statement: its variable, producing op, and (when the op
+/// is a scalar `const`) the resolved value. Payload of
+/// [`ParseOutcome::Parsed`].
+struct Parsed {
+  var: String,
+  stmt: Stmt,
+  const_val: Option<f64>,
+}
+
 /// The outcome of reading one physical line as a MIL statement.
 enum ParseOutcome {
   /// Not a `tensor<...>` statement line at all — skipped, as before.
   NotStatement,
   /// A fully-parsed statement: its variable, producing op, and (when the op
   /// is a scalar `const`) the resolved value.
-  Parsed {
-    var: String,
-    stmt: Stmt,
-    const_val: Option<f64>,
-  },
-  /// A `tensor<...>` statement line that did not parse. `guard` names the
-  /// guard op it appears to call, if any — `Some` is a completeness hole.
-  Unparsed { guard: Option<&'static str> },
+  Parsed(Parsed),
+  /// A `tensor<...>` statement line that did not parse. Carries the guard op
+  /// it appears to call, if any — `Some` is a completeness hole.
+  Unparsed(Option<&'static str>),
 }
 
 /// Reads one trimmed line. Any statement — in EITHER type spelling, `tensor<..>`
@@ -343,9 +348,7 @@ fn parse_stmt_line(line: &str) -> ParseOutcome {
   // parse is Unparsed, and a completeness hole iff the raw line names a guard
   // op. Declared before the head split so an unclosed `tensor<` stays a
   // statement we could not read rather than degrading to "not a statement".
-  let unparsed = || ParseOutcome::Unparsed {
-    guard: guard_op_in(line),
-  };
+  let unparsed = || ParseOutcome::Unparsed(guard_op_in(line));
 
   let (dtype, rest) = if let Some(rest) = line.strip_prefix("tensor<") {
     // `fp16, [1, 2999, 29]> var = op(args)[attrs];` — shapes never nest angle
@@ -400,17 +403,17 @@ fn parse_stmt_line(line: &str) -> ParseOutcome {
       .iter()
       .copied()
       .find(|&g| g == op.as_str());
-    return ParseOutcome::Unparsed { guard };
+    return ParseOutcome::Unparsed(guard);
   };
   let args = rest[open + 1..close].to_string();
   let attrs = rest[close + 1..].trim().to_string();
 
   let const_val = (op == "const").then(|| const_scalar(&attrs)).flatten();
-  ParseOutcome::Parsed {
+  ParseOutcome::Parsed(Parsed {
     var: var.to_string(),
     stmt: Stmt { dtype, op, args },
     const_val,
-  }
+  })
 }
 
 /// Reads a MIL program into constants, producers, and — critically — the
@@ -424,20 +427,20 @@ fn parse_mil(text: &str) -> Graph {
     let line = line.trim();
     match parse_stmt_line(line) {
       ParseOutcome::NotStatement => {}
-      ParseOutcome::Parsed {
+      ParseOutcome::Parsed(Parsed {
         var,
         stmt,
         const_val,
-      } => {
+      }) => {
         if let Some(value) = const_val {
           consts.insert(var.clone(), value);
         }
         producers.insert(var, stmt);
       }
-      ParseOutcome::Unparsed { guard: Some(op) } => {
+      ParseOutcome::Unparsed(Some(op)) => {
         unresolved.push(format!("unreadable `{op}` statement: {line}"));
       }
-      ParseOutcome::Unparsed { guard: None } => {}
+      ParseOutcome::Unparsed(None) => {}
     }
   }
 

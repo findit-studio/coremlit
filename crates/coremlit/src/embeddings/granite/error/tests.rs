@@ -65,3 +65,55 @@ fn contentless_input_over_budget_display_shows_span_and_counts() {
     "{msg}"
   );
 }
+
+#[test]
+fn embedding_dim_mismatch_display_shows_expected_then_got() {
+  let msg = Error::EmbeddingDimMismatch(EmbeddingDimMismatch::new(384, 128)).to_string();
+  assert_eq!(msg, "embedding dimension mismatch: expected 384, got 128");
+}
+
+#[test]
+fn embedding_not_unit_norm_display_carries_the_deviation() {
+  let msg = Error::EmbeddingNotUnitNorm(0.5).to_string();
+  assert!(msg.contains("unit-norm"), "{msg}");
+  assert!(msg.contains("0.5"), "{msg}");
+}
+
+#[test]
+fn token_budget_errors_display_their_counts_and_caps() {
+  // `TokenCount::new` takes (got, max); `WindowOverBudget::new` (window, max).
+  let count = Error::TokenCount(TokenCount::new(600, 512)).to_string();
+  assert_eq!(
+    count,
+    "tokenized input has 600 tokens, exceeding the fixed 512-token window"
+  );
+  let budget = Error::WindowOverBudget(WindowOverBudget::new(600, 512)).to_string();
+  assert!(budget.contains("600") && budget.contains("512"), "{budget}");
+  assert!(budget.contains("embed_long"), "{budget}");
+  assert!(
+    Error::TokenIdRange(u32::MAX)
+      .to_string()
+      .contains(&u32::MAX.to_string())
+  );
+}
+
+#[test]
+fn artifact_tokenizer_read_is_transparent_and_keeps_the_chain_at_depth_one() {
+  // The path carries a SPACE, so a `Debug` rendering could not pass for the
+  // `Display` one thiserror's `{path}` shorthand produces.
+  let e = Error::ArtifactTokenizerRead(ArtifactTokenizerRead::new(
+    std::path::PathBuf::from("/tmp/a b/tokenizer.json"),
+    std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
+  ));
+  assert_eq!(
+    e.to_string(),
+    "failed to read the artifact tokenizer `/tmp/a b/tokenizer.json`: missing"
+  );
+  let mut depth = 0;
+  let mut cur: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&e);
+  while let Some(c) = cur {
+    depth += 1;
+    cur = std::error::Error::source(c);
+  }
+  assert_eq!(depth, 1, "the source chain must stay at depth 1");
+}

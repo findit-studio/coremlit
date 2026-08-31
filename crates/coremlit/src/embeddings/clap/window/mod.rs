@@ -279,9 +279,18 @@ impl TryFrom<WindowPlanRepr> for WindowPlan {
       ));
     }
     if !check_tail(r.tail) {
+      // Interpolate the PAYLOAD, not the whole policy. `DropBelowMin`'s payload
+      // struct shares its variant's name and field name, so its `Debug` is
+      // exactly what the struct-shaped variant used to render — this keeps the
+      // message byte-identical to the pre-newtype one instead of doubling the
+      // name to `DropBelowMin(DropBelowMin { .. })`. `Pad` never fails
+      // `check_tail`, so its arm exists only to keep the match total.
+      let tail: &dyn core::fmt::Debug = match &r.tail {
+        TailPolicy::DropBelowMin(min) => min,
+        TailPolicy::Pad => &r.tail,
+      };
       return Err(format!(
-        "tail DropBelowMin.min_samples must be > 0 and <= WINDOW_SAMPLES ({WINDOW_SAMPLES}), got {:?}",
-        r.tail
+        "tail DropBelowMin.min_samples must be > 0 and <= WINDOW_SAMPLES ({WINDOW_SAMPLES}), got {tail:?}"
       ));
     }
     if !check_max_windows(r.max_windows) {

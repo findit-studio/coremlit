@@ -185,3 +185,26 @@ fn staging_never_clobbers_existing_files_and_concurrent_writes_stay_whole() {
     .collect();
   assert!(leftovers.is_empty(), "staging leaked: {leftovers:?}");
 }
+
+#[test]
+fn write_error_is_transparent_over_its_payload_and_keeps_the_chain_at_depth_one() {
+  // The path carries a SPACE: `path.display()` renders it bare, where `Debug`
+  // would quote it, so this cannot pass on the wrong formatting.
+  let e = WriteError::Write(Write::new(
+    PathBuf::from("/tmp/a b/out.srt"),
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, "denied"),
+  ));
+  assert_eq!(
+    e.to_string(),
+    "failed to write result file `/tmp/a b/out.srt`: denied"
+  );
+  // `#[error(transparent)]` forwards `source()` THROUGH the payload rather
+  // than inserting it as a frame, so the io error stays one link away.
+  let mut depth = 0;
+  let mut cur: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&e);
+  while let Some(c) = cur {
+    depth += 1;
+    cur = std::error::Error::source(c);
+  }
+  assert_eq!(depth, 1, "the source chain must stay at depth 1");
+}

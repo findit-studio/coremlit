@@ -86,3 +86,30 @@ fn transcribe_error_composes_segment_arm() {
   assert!(matches!(e, TranscribeError::Segment(_)));
   assert!(e.to_string().contains("16"));
 }
+
+#[test]
+fn search_path_errors_display_the_paths_they_searched() {
+  // A path with a SPACE, so a `Display` rendering could not masquerade as the
+  // `Debug` one these two deliberately use for a whole `Vec<PathBuf>`.
+  let paths = vec![PathBuf::from("/tmp/a b/tiny.mlmodelc")];
+  assert_eq!(
+    ModelError::NotFound(paths.clone()).to_string(),
+    "model not found (searched [\"/tmp/a b/tiny.mlmodelc\"])"
+  );
+  assert_eq!(
+    TokenizerError::FileNotFound(paths).to_string(),
+    "tokenizer file not found (searched [\"/tmp/a b/tiny.mlmodelc\"])"
+  );
+}
+
+#[test]
+fn clip_range_and_alignment_shape_display_their_payloads() {
+  assert_eq!(
+    AudioError::InvalidClipRange(InvalidClipRange::new(1.5, 0.5)).to_string(),
+    "invalid clip range: start 1.5, end 0.5"
+  );
+  assert_eq!(
+    SegmentError::InvalidAlignmentShape(InvalidAlignmentShape::new(2, 3, 7)).to_string(),
+    "invalid alignment matrix shape: 2 rows x 3 cols, but data has 7 elements"
+  );
+}

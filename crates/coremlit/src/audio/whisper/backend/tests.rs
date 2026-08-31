@@ -43,3 +43,15 @@ fn backend_error_displays_structured() {
   let e = BackendError::AudioLength(AudioLength::new(100, 480_000));
   assert!(e.to_string().contains("480000"));
 }
+
+#[test]
+fn mock_backend_errors_display_the_step_they_failed_on() {
+  assert_eq!(
+    BackendError::ScriptExhausted(3).to_string(),
+    "mock script exhausted at step 3"
+  );
+  assert_eq!(
+    BackendError::ScriptedFailure(2).to_string(),
+    "scripted decode-step failure on call 2"
+  );
+}

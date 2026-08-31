@@ -328,6 +328,14 @@ impl Precision {
   }
 }
 
+/// speakerkit's CoreML conversion at a chosen precision and placement.
+/// Payload of [`EmbedArm::CoreMl`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct CoreMl {
+  precision: Precision,
+  placement: ComputeUnits,
+}
+
 /// **One embedding arm**: which conversion computes the embeddings and, for the
 /// CoreML conversion, at which precision and on which compute placement.
 ///
@@ -341,27 +349,24 @@ enum EmbedArm {
   /// implementation, and the only arm that is not a CoreML conversion.
   Onnx,
   /// speakerkit's CoreML conversion at a chosen precision and placement.
-  CoreMl {
-    precision: Precision,
-    placement: ComputeUnits,
-  },
+  CoreMl(CoreMl),
 }
 
 impl EmbedArm {
   /// The int8-palettized artifact on [`ComputeUnits::All`] — the embedding
   /// path that SHIPPED until issue #15 retired it. This is the bundle
   /// [`shipping_config_backend_factorial`] varies as a single unit.
-  const SHIPPING: Self = Self::CoreMl {
+  const SHIPPING: Self = Self::CoreMl(CoreMl {
     precision: Precision::Int8,
     placement: PLACEMENT,
-  };
+  });
 
   /// The [`Backend`] this arm belongs to — the coarse factor the 2x2
   /// cross-product varies.
   const fn backend(self) -> Backend {
     match self {
       Self::Onnx => Backend::Onnx,
-      Self::CoreMl { .. } => Backend::CoreMl,
+      Self::CoreMl(_) => Backend::CoreMl,
     }
   }
 
@@ -369,10 +374,10 @@ impl EmbedArm {
   fn label(self) -> String {
     match self {
       Self::Onnx => "ONNX fp32 / ort CPU EP".to_string(),
-      Self::CoreMl {
+      Self::CoreMl(CoreMl {
         precision,
         placement,
-      } => format!("CoreML {} / {placement:?}", precision.tag()),
+      }) => format!("CoreML {} / {placement:?}", precision.tag()),
     }
   }
 }
@@ -471,10 +476,10 @@ enum EmbedSide {
 impl EmbedSide {
   fn load(arm: EmbedArm) -> Self {
     match arm {
-      EmbedArm::CoreMl {
+      EmbedArm::CoreMl(CoreMl {
         precision,
         placement,
-      } => Self::CoreMl(
+      }) => Self::CoreMl(
         EmbedModel::from_file_with(
           precision.path(),
           EmbedModelOptions::new().with_compute(placement),
@@ -1393,18 +1398,18 @@ fn factorial_verdict_pins_every_cell() {
 const PRECISION_PLACEMENT_ARMS: [EmbedArm; 5] = [
   EmbedArm::Onnx,
   EmbedArm::SHIPPING,
-  EmbedArm::CoreMl {
+  EmbedArm::CoreMl(CoreMl {
     precision: Precision::Fp32,
     placement: ComputeUnits::All,
-  },
-  EmbedArm::CoreMl {
+  }),
+  EmbedArm::CoreMl(CoreMl {
     precision: Precision::Int8,
     placement: ComputeUnits::CpuOnly,
-  },
-  EmbedArm::CoreMl {
+  }),
+  EmbedArm::CoreMl(CoreMl {
     precision: Precision::Fp32,
     placement: ComputeUnits::CpuOnly,
-  },
+  }),
 ];
 
 /// One embedding arm's measured result over the fixed reference segmentation.
@@ -1745,18 +1750,18 @@ fn embedding_precision_x_placement() {
   assert_precision_placement_verdict(&PrecisionPlacementObserved {
     onnx_cpu: at(EmbedArm::Onnx),
     int8_all: at(EmbedArm::SHIPPING),
-    fp32_all: at(EmbedArm::CoreMl {
+    fp32_all: at(EmbedArm::CoreMl(CoreMl {
       precision: Precision::Fp32,
       placement: ComputeUnits::All,
-    }),
-    int8_cpu: at(EmbedArm::CoreMl {
+    })),
+    int8_cpu: at(EmbedArm::CoreMl(CoreMl {
       precision: Precision::Int8,
       placement: ComputeUnits::CpuOnly,
-    }),
-    fp32_cpu: at(EmbedArm::CoreMl {
+    })),
+    fp32_cpu: at(EmbedArm::CoreMl(CoreMl {
       precision: Precision::Fp32,
       placement: ComputeUnits::CpuOnly,
-    }),
+    })),
   });
 }
 

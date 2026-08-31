@@ -137,3 +137,55 @@ fn patch_budget_mismatch_display_shows_both() {
   let msg = Error::PatchBudgetMismatch(PatchBudgetMismatch::new(256, 512)).to_string();
   assert!(msg.contains("256") && msg.contains("512"), "{msg}");
 }
+
+#[test]
+fn embedding_dim_mismatch_display_shows_expected_then_got() {
+  let msg = Error::EmbeddingDimMismatch(EmbeddingDimMismatch::new(768, 256)).to_string();
+  assert_eq!(msg, "embedding dimension mismatch: expected 768, got 256");
+}
+
+#[test]
+fn embedding_not_unit_norm_display_carries_the_deviation() {
+  let msg = Error::EmbeddingNotUnitNorm(0.125).to_string();
+  assert!(msg.contains("unit-norm"), "{msg}");
+  assert!(msg.contains("0.125"), "{msg}");
+}
+
+#[test]
+fn preprocess_allocation_display_carries_the_byte_count() {
+  let msg = Error::PreprocessAllocation(1_048_576).to_string();
+  assert!(msg.contains("1048576"), "{msg}");
+  assert!(msg.contains("resize buffer"), "{msg}");
+}
+
+#[test]
+fn artifact_tokenizer_errors_display_the_path_and_keep_the_chain_at_depth_one() {
+  // Both paths carry a SPACE: `Display` renders it bare where `Debug` would
+  // quote it, so neither assertion can pass on the wrong formatting.
+  let identity = Error::ArtifactTokenizerIdentity(ArtifactTokenizerIdentity::new(
+    std::path::PathBuf::from("/tmp/a b/tokenizer.json"),
+    "0000",
+    "ffff".to_string(),
+  ));
+  assert_eq!(
+    identity.to_string(),
+    "artifact tokenizer `/tmp/a b/tokenizer.json` is not the pinned Gemma tokenizer: \
+     expected sha-256 0000, got ffff"
+  );
+
+  let read = Error::ArtifactTokenizerRead(ArtifactTokenizerRead::new(
+    std::path::PathBuf::from("/tmp/a b/tokenizer.json"),
+    std::io::Error::new(std::io::ErrorKind::NotFound, "missing"),
+  ));
+  assert_eq!(
+    read.to_string(),
+    "failed to read the artifact tokenizer `/tmp/a b/tokenizer.json`: missing"
+  );
+  let mut depth = 0;
+  let mut cur: Option<&(dyn std::error::Error + 'static)> = std::error::Error::source(&read);
+  while let Some(c) = cur {
+    depth += 1;
+    cur = std::error::Error::source(c);
+  }
+  assert_eq!(depth, 1, "the source chain must stay at depth 1");
+}

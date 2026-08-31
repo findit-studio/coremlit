@@ -54,3 +54,23 @@ fn from_winditerror_is_total_and_does_not_special_case_empty() {
     "the blanket From<WinditError> impl must not special-case Empty; got {e:?}"
   );
 }
+
+#[test]
+fn non_finite_output_display_carries_index() {
+  let msg = Error::NonFiniteOutput(7).to_string();
+  assert!(msg.contains('7'), "{msg}");
+  assert!(msg.contains("non-finite"), "{msg}");
+}
+
+#[test]
+fn embedding_dim_mismatch_display_shows_expected_then_got() {
+  let msg = Error::EmbeddingDimMismatch(EmbeddingDimMismatch::new(512, 256)).to_string();
+  assert_eq!(msg, "embedding dimension mismatch: expected 512, got 256");
+}
+
+#[test]
+fn embedding_not_unit_norm_display_carries_the_deviation() {
+  let msg = Error::EmbeddingNotUnitNorm(0.25).to_string();
+  assert!(msg.contains("unit-norm"), "{msg}");
+  assert!(msg.contains("0.25"), "{msg}");
+}

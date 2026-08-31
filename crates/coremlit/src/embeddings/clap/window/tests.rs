@@ -397,4 +397,24 @@ mod serde_tests {
     // as the setter panics on it.
     assert!(serde_json::from_str::<WindowPlan>(r#"{"max_windows": 0}"#).is_err());
   }
+
+  /// The rejection MESSAGE, pinned byte-exactly. `TailPolicy::DropBelowMin`
+  /// carries a payload struct that shares its variant's name, so interpolating
+  /// the PAYLOAD renders `DropBelowMin { min_samples: 0 }` — what the
+  /// struct-shaped variant rendered before it was newtyped. Interpolating the
+  /// whole policy instead would double the name, and nothing else asserts this.
+  #[test]
+  fn invalid_tail_min_rejection_message_names_the_payload_once() {
+    let err = WindowPlan::try_from(WindowPlanRepr {
+      hop_samples: DEFAULT_HOP_SAMPLES,
+      tail: TailPolicy::DropBelowMin(DropBelowMin::new(0)),
+      max_windows: DEFAULT_MAX_WINDOWS,
+    })
+    .unwrap_err();
+    assert_eq!(
+      err,
+      "tail DropBelowMin.min_samples must be > 0 and <= WINDOW_SAMPLES \
+       (480000), got DropBelowMin { min_samples: 0 }"
+    );
+  }
 }
