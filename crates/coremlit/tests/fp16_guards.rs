@@ -52,11 +52,12 @@
 //! be present. CI runs it once per `model-tests` SHARD, and each shard stages
 //! only its own kit's part of the tree (per MODELS_LOCK), so each names exactly
 //! what it stages — `vadkit,speakerkit` for the speaker shard,
-//! `whisperkit-coreml,vadkit` for whisper, and so on — narrowing the manifest
-//! EXPLICITLY. That works because the per-pin check fires on
-//! `root.join(vendor).is_dir()`: in a whisper-only shard `Models/speakerkit/`
-//! does not exist, so its five pins are skipped rather than reported missing,
-//! while the manifest still refuses a vendor the shard DID stage and then lost.
+//! `whisperkit-coreml,vadkit` for whisper, `vadkit,lid` for lid, and so on —
+//! narrowing the manifest EXPLICITLY. That works because the per-pin check
+//! fires on `root.join(vendor).is_dir()`: in a whisper-only shard
+//! `Models/speakerkit/` does not exist, so its five pins are skipped rather
+//! than reported missing, while the manifest still refuses a vendor the shard
+//! DID stage and then lost.
 //!
 //! The real coverage is therefore the UNION across shards, and the union is
 //! pinned rather than assumed: `ci_fp16_sweep_shards_cover_every_pinned_vendor`
@@ -64,14 +65,15 @@
 //! swept by no shard, and fails if a shard stages a vendor tree it does not
 //! sweep. Today that union proves the whisper mel, granite norm, vadkit STFT,
 //! CED, CLAP and SigLIP graphs are clean controls, and that the FIVE
-//! `speakerkit/` defect pins still hold in BOTH directions. It still CANNOT
-//! verify the `alignkit` and `argmax-speakerkit` pins — no shard downloads
-//! those models — so full pin verification (every [`KNOWN_DEFECTS`] entry)
-//! remains a local/dev gate needing the complete `Models/` tree; that gap is
-//! recorded by name as `UNSTAGED_DEFECT_VENDORS` in the same test. The override
-//! is fail-closed — absence of it requires ALL pinned vendors — so narrowing
-//! coverage is always an explicit, reviewable act in ci.yml, never the silent
-//! side effect of a deleted directory, which is the whole point of the manifest.
+//! `speakerkit/` defect pins and the ONE `lid/` pin still hold in BOTH
+//! directions. It still CANNOT verify the `alignkit` and `argmax-speakerkit`
+//! pins — no shard downloads those models — so full pin verification (every
+//! [`KNOWN_DEFECTS`] entry) remains a local/dev gate needing the complete
+//! `Models/` tree; that gap is recorded by name as `UNSTAGED_DEFECT_VENDORS`
+//! in the same test. The override is fail-closed — absence of it requires ALL
+//! pinned vendors — so narrowing coverage is always an explicit, reviewable
+//! act in ci.yml, never the silent side effect of a deleted directory, which is
+//! the whole point of the manifest.
 //!
 //! When no DOWNLOADED model tree is on disk the sweep is `ignored`, never a
 //! green `ok` over zero models (see `build.rs`). "Downloaded" excludes the one
@@ -80,7 +82,7 @@
 //! every fresh clone under the fail-closed manifest above and fail it for
 //! vendors nobody fetched. The committed VAD graph is still swept wherever the
 //! cfg is on — EVERY `model-tests` shard names `vadkit` in its manifest, so
-//! deleting the vendored artifact fails all six on every PR — and its single
+//! deleting the vendored artifact fails all seven on every PR — and its single
 //! guard site is pinned hermetically by `accepts_vadkits_stft_sqrt_guard`
 //! regardless.
 //!
@@ -114,7 +116,45 @@ const FP16_MIN_NORMAL: f64 = 6.103_515_625e-5;
 //   tensor<fp16, [1, 2999, 29]> var_849_cast_fp16 =
 //       log(epsilon = var_849_epsilon_0, x = var_849_softmax_cast_fp16)
 //       [name = tensor<string, []>("op_849_cast_fp16")];
+//
+// TWO SPELLINGS OF THAT SHAPE, not one. Through coremltools 8 every
+// declaration was written as a tensor type, rank-0 scalars included
+// (`tensor<fp16, []> eps = const()[.., val = tensor<fp16, []>(0x1p-24)]`).
+// coremltools 9 / MIL `program(1.3)` writes a scalar's type BARE, on both the
+// declaration and the `val` attribute:
+//
+//   fp16 var_23_to_fp16 = const()[name = string("op_23_to_fp16"),
+//                                 val = fp16(0x1.5p-17)];
+//
+// A `tensor<`-only reader sees no statement there at all, so EVERY scalar
+// const of such a graph — every epsilon among them — stays out of
+// [`Graph::consts`] and every guard site resolves to nothing. That was not a
+// quiet under-report, which is why it was found: the sites land in
+// [`Graph::unresolved`] and the sweep fails loudly (36 unresolvable guard
+// statements and zero sites over the 162 KB VoxLingua107 graph). Both
+// spellings are read below, and one graph mixes them freely — the same file
+// writes `tensor<fp16, [1, 107]>` for a tensor and `fp32` for a scalar.
 // ---------------------------------------------------------------------------
+
+/// MIL's scalar (rank-0) type names, as coremltools 9 writes them BARE at the
+/// head of a statement and inside a `const`'s `val = TY(..)` attribute. Only
+/// these introduce a statement: any other leading token (`func`, `program(..)`,
+/// `[buildInfo`, `{`, `}`) is not one, exactly as before. A closed vocabulary
+/// rather than "any identifier followed by a space", so a wrapped line or a
+/// future header cannot be mistaken for a declaration.
+const MIL_SCALAR_TYPES: &[&str] = &[
+  "bool", "string", "fp16", "fp32", "fp64", "int8", "int16", "int32", "int64", "uint8", "uint16",
+  "uint32", "uint64",
+];
+
+/// The bare scalar type heading a coremltools-9 statement (`fp16 v = ..`), with
+/// the rest of the line. `None` when the line does not start with one —
+/// including every line of a coremltools-8 graph, where a scalar is spelled
+/// `tensor<TY, []>` and this arm never fires.
+fn bare_scalar_head(line: &str) -> Option<(&str, &str)> {
+  let (ty, rest) = line.split_once(' ')?;
+  MIL_SCALAR_TYPES.contains(&ty).then_some((ty, rest))
+}
 
 /// One parsed MIL statement: `tensor<DTYPE, [..]> VAR = OP(ARGS)[ATTRS];`
 struct Stmt {
@@ -294,25 +334,34 @@ enum ParseOutcome {
   Unparsed { guard: Option<&'static str> },
 }
 
-/// Reads one trimmed line. Any `tensor<...>`-shaped statement that does not
-/// parse is reported as [`ParseOutcome::Unparsed`] — never silently skipped —
-/// so a guard emitted in unhandled syntax is surfaced, not lost.
+/// Reads one trimmed line. Any statement — in EITHER type spelling, `tensor<..>`
+/// or a bare [`MIL_SCALAR_TYPES`] head — that does not parse is reported as
+/// [`ParseOutcome::Unparsed`], never silently skipped, so a guard emitted in
+/// unhandled syntax is surfaced, not lost.
 fn parse_stmt_line(line: &str) -> ParseOutcome {
-  let Some(rest) = line.strip_prefix("tensor<") else {
-    return ParseOutcome::NotStatement;
-  };
-  // From here the line IS a statement; any failure to parse is Unparsed, and
-  // a completeness hole iff the raw line names a guard op.
+  // From a recognized type head onward the line IS a statement; any failure to
+  // parse is Unparsed, and a completeness hole iff the raw line names a guard
+  // op. Declared before the head split so an unclosed `tensor<` stays a
+  // statement we could not read rather than degrading to "not a statement".
   let unparsed = || ParseOutcome::Unparsed {
     guard: guard_op_in(line),
   };
 
-  // `fp16, [1, 2999, 29]> var = op(args)[attrs];` — shapes never nest angle
-  // brackets, so the first `>` closes the tensor type.
-  let Some((ty, rest)) = rest.split_once('>') else {
-    return unparsed();
+  let (dtype, rest) = if let Some(rest) = line.strip_prefix("tensor<") {
+    // `fp16, [1, 2999, 29]> var = op(args)[attrs];` — shapes never nest angle
+    // brackets, so the first `>` closes the tensor type.
+    let Some((ty, rest)) = rest.split_once('>') else {
+      return unparsed();
+    };
+    (ty.split(',').next().unwrap_or("").trim().to_string(), rest)
+  } else if let Some((ty, rest)) = bare_scalar_head(line) {
+    // coremltools 9: `fp16 var = op(args)[attrs];`. The dtype is the head
+    // itself, so a scalar's `Finding::render` reads `log/fp16` exactly as the
+    // tensor spelling's does.
+    (ty.to_string(), rest)
+  } else {
+    return ParseOutcome::NotStatement;
   };
-  let dtype = ty.split(',').next().unwrap_or("").trim().to_string();
 
   let Some((var, rest)) = rest.split_once('=') else {
     return unparsed();
@@ -400,13 +449,24 @@ fn parse_mil(text: &str) -> Graph {
 }
 
 /// Extracts a scalar `const`'s value from its attribute list:
-/// `[name = .., val = tensor<fp32, []>(0x1p-149)]`. Non-scalar constants
-/// (weights, shapes) have a non-empty shape and are deliberately ignored.
+/// `[name = .., val = tensor<fp32, []>(0x1p-149)]`, or its coremltools-9
+/// spelling `[name = .., val = fp32(0x1p-149)]`. Non-scalar constants (weights,
+/// shapes) have a non-empty shape and are deliberately ignored, in both
+/// spellings — `val = tensor<fp16, [1024]>(BLOBFILE(..))` has no bare form.
 fn const_scalar(attrs: &str) -> Option<f64> {
   let val = attrs.find("val")?;
   let open = attrs[val..].find("(")? + val;
-  // Only `tensor<TY, []>` — a scalar — qualifies.
-  if !attrs[val..open].replace(' ', "").contains(",[]>") {
+  let head = attrs[val..open].replace(' ', "");
+  // `tensor<TY, []>` — a rank-0 tensor — or the bare `TY`. The bare arm reads
+  // only what follows the LAST `val=`: `attrs.find("val")` can land inside a
+  // name (`"..._validate_indices_0"`, `"interval"`), and the tensor arm's
+  // substring test tolerates that, so the added arm must too or it would
+  // narrow what already parses.
+  let scalar_tensor = head.contains(",[]>");
+  let bare_scalar = head
+    .rsplit_once("val=")
+    .is_some_and(|(_, ty)| MIL_SCALAR_TYPES.contains(&ty));
+  if !(scalar_tensor || bare_scalar) {
     return None;
   }
   let close = attrs[open..].find(')')? + open;
@@ -829,6 +889,45 @@ const KNOWN_DEFECTS: &[KnownDefect] = &[
     note: "Same graph as the W32A32 variant with the epsilon left at 0x1p-149 instead of folded \
            to zero — identically inert in fp16, identically contained by the downstream `exp`.",
   },
+  KnownDefect {
+    path: "lid/SpeechBrainECAPAVoxLingua107.mlmodelc",
+    sites: &["log/fp16 guard=softmax->log eff=1.401298464324817e-45"],
+    note: "The THIRD instance of this class, after alignkit/base960h_aligner and \
+           speakerkit/Segmentation: a decomposed log-softmax at the classifier tail, guarded by \
+           fp32's smallest subnormal (0x1p-149) against an fp16 log whose floor is 2^-24 ~ 6e-8. \
+           TODAY IT COSTS NOTHING, AND THE REASON IS THAT THE EPSILON IS NEVER CONSULTED. The \
+           shipped graph is FLEXIBLE-SHAPE, and on every current backend — All, ANE, GPU, CpuOnly \
+           — the softmax->log pair executes as one fused, higher-precision log-softmax. Measured \
+           on both census clips, all four arms: 107 of 107 rows finite, no saturation, the tail \
+           reaching -37.27 (a probability of 6.5e-17, NINE orders below fp16's smallest subnormal \
+           — a number the fp16 grid cannot hold, which is the proof the log is not being taken in \
+           fp16), and sum(exp) = 0.994-1.000. `Error::NonFiniteOutput` cannot fire. The epsilon is \
+           dead code. THE TRIGGER THAT ARMS IT IS STATIC SHAPES — exactly what a re-conversion \
+           would do to put this tail on the ANE. Recompiled with fixed input dims the fusion is \
+           gone, and every entry whose true log-prob is below ln(2^-24) = -16.635 becomes ANE \
+           log(0) = -45440.0. On the 13 s anchor clip that is 105 of 107 entries, starting at RANK \
+           2, and the fp64 reference agrees exactly on WHICH 105. Top-1 survives essentially \
+           intact (-0.009842 against an fp64 truth of -0.010195, delta 3.5e-4) and so does top-2, \
+           so the blast radius is confidence-gated: on a flat 3 s clip it is 0 of 107. -45440.0 is \
+           FINITE, so nothing upstack notices — the door's non-finite guard stays silent, \
+           `LanguageScore::probability` reads 0.0, and `identify(k >= 3)` fills ranks 2+ by \
+           ascending model column, the order `RankedScore` breaks ties in. TWO OBVIOUS REPAIRS ARE \
+           ALREADY KNOWN NOT TO WORK — measured on that static ANE arm, and recorded here because \
+           without it the first of them looks correct AND appears to succeed. (1) A `HEALTHY` fp16 \
+           EPSILON — an explicit +6e-8, the whisper-mel discipline the issue-#15 \
+           speakerkit re-conversions used — does NOT survive: the ANE flushes subnormals and the output is -45440.0, \
+           unchanged. A floor that does survive must be at least 6.1e-5, fp16's smallest NORMAL, \
+           which clamps the whole tail at -9.7 and is uselessly coarse. (2) The PYANNOTE-STYLE `x \
+           - logsumexp(x)` rewrite also fails on the ANE at this graph's logit range: exp(~23) \
+           overflows fp16 inside the reduce and the output comes back as raw logits (max +22.86, \
+           sum(exp) 8.6e9) — worse than the defect. The ONLY verified ANE-safe tail is an fp32 \
+           ISLAND: the final softmax+log excluded from the fp16 pass (8 CPU ops, 2 unit \
+           transitions, latency unchanged at ~23.6 ms), which reproduces the flexible graph's full \
+           finite tail (-37.28) on the ANE. Pinned unrepaired because the shipping artifact is \
+           flexible-shape and the guard is therefore inert; the pin is what makes the arming event \
+           impossible to miss, since a re-conversion to static shapes cannot land without this \
+           entry changing.",
+  },
 ];
 
 // ---------------------------------------------------------------------------
@@ -1138,6 +1237,59 @@ const EPSILON_BEARING_UNKNOWN_OP: &str = r#"
             tensor<fp16, [1, 256]> mystery_out = some_future_norm(epsilon = mystery_eps, x = in_cast_fp16)[name = tensor<string, []>("mystery_out")];
 "#;
 
+/// The coremltools-9 BARE-SCALAR dialect, and the vendor that brought it.
+/// Verbatim excerpts of the real shipped
+/// `Models/lid/SpeechBrainECAPAVoxLingua107.mlmodelc/model.mil`
+/// (`program(1.3)`, coremltools 9.0): lines 32-33 (a `batch_norm` whose epsilon
+/// const is declared `fp16 …` rather than `tensor<fp16, []> …`), 668-671 (the
+/// attentive-stat `clip(0x1p-24) -> sqrt`, whose clip floor is TWO bare scalars),
+/// and 771-773 (the classifier tail's decomposed `softmax -> log`).
+///
+/// Every epsilon in this graph is a bare scalar, so a `tensor<`-only reader
+/// resolves NONE of them: the whole file audited to zero guard sites and 36
+/// unresolved statements. All three guard shapes are kept together here because
+/// the dialect is orthogonal to the shape — the same file writes tensors the old
+/// way and scalars the new way — so the fixture proves the reader reads BOTH
+/// spellings in one graph rather than having merely swapped one for the other.
+const LID_ECAPA_SCALAR_DIALECT: &str = r#"
+            fp16 var_23_to_fp16 = const()[name = string("op_23_to_fp16"), val = fp16(0x1.5p-17)];
+            tensor<fp16, [1, 1024, ?]> input_7_cast_fp16 = batch_norm(beta = embedding_model_blocks_0_norm_norm_bias_to_fp16, epsilon = var_23_to_fp16, gamma = embedding_model_blocks_0_norm_norm_weight_to_fp16, mean = embedding_model_blocks_0_norm_norm_running_mean_to_fp16, variance = embedding_model_blocks_0_norm_norm_running_var_to_fp16, x = x_3_cast_fp16)[name = string("input_7_cast_fp16")];
+            fp16 var_13_to_fp16 = const()[name = string("op_13_to_fp16"), val = fp16(0x1p-24)];
+            fp16 const_37_to_fp16 = const()[name = string("const_37_to_fp16"), val = fp16(inf)];
+            tensor<fp16, [?, 3072]> clip_0_cast_fp16 = clip(alpha = var_13_to_fp16, beta = const_37_to_fp16, x = var_835_cast_fp16)[name = string("clip_0_cast_fp16")];
+            tensor<fp16, [?, 3072]> std_1_cast_fp16 = sqrt(x = clip_0_cast_fp16)[name = string("std_1_cast_fp16")];
+            tensor<fp16, [1, 107]> x_act_softmax_cast_fp16 = softmax(axis = var_914, x = input_cast_fp16)[name = string("x_act_softmax_cast_fp16")];
+            fp32 x_act_epsilon_0 = const()[name = string("x_act_epsilon_0"), val = fp32(0x1p-149)];
+            tensor<fp16, [1, 107]> x_act_cast_fp16 = log(epsilon = x_act_epsilon_0, x = x_act_softmax_cast_fp16)[name = string("x_act_cast_fp16")];
+"#;
+
+/// The bare-scalar dialect with its `batch_norm` epsilon dropped from
+/// `0x1.5p-17` to `0x1p-25` — exactly half the fp16 floor. It MUST be caught as
+/// a vanishing `norm` finding, which is what proves the clean sites of
+/// [`LID_ECAPA_SCALAR_DIALECT`] are clean because the reader RESOLVED a bare
+/// scalar const, not because it silently failed to read one. (A merely-unread
+/// epsilon would surface as an unresolved hole, which [`vanishing`] panics on;
+/// this pins the value path too.)
+const LID_SCALAR_NORM_VANISHING_MUTANT: &str = r#"
+            fp16 var_23_to_fp16 = const()[name = string("op_23_to_fp16"), val = fp16(0x1p-25)];
+            tensor<fp16, [1, 1024, ?]> input_7_cast_fp16 = batch_norm(beta = embedding_model_blocks_0_norm_norm_bias_to_fp16, epsilon = var_23_to_fp16, gamma = embedding_model_blocks_0_norm_norm_weight_to_fp16, mean = embedding_model_blocks_0_norm_norm_running_mean_to_fp16, variance = embedding_model_blocks_0_norm_norm_running_var_to_fp16, x = x_3_cast_fp16)[name = string("input_7_cast_fp16")];
+"#;
+
+/// Every non-statement line of the same graph, verbatim: the `program`/`buildInfo`
+/// header, the brace, the `func` signature, and the block's return. None is a
+/// declaration, and the bare-scalar arm must not decide otherwise — it is the arm
+/// that most easily over-fires, since "a token, a space, the rest" describes most
+/// lines in the file. (`[buildInfo …]` is elided in the middle only for width; the
+/// leading token, which is all the reader looks at, is verbatim.)
+const LID_NON_STATEMENT_LINES: &[&str] = &[
+  "program(1.3)",
+  r#"[buildInfo = dict<string, string>({{"coremltools-version", "9.0"}})]"#,
+  "{",
+  r#"    func main<ios18>(tensor<fp32, [1, ?, 60]> mel_features) [FlexibleShapeInformation = tuple<tuple<string, dict<string, tensor<int32, [?]>>>, tuple<string, dict<string, list<tensor<int32, [2]>, ?>>>>((("DefaultShapes", {{"mel_features", [1, 301, 60]}}), ("RangeDims", {{"mel_features", [[1, 1], [10, 3001], [60, 60]]}})))] {"#,
+  "} -> (log_probabilities);",
+  "}",
+];
+
 /// The vanishing guard sites of an already-audited graph, rendered and sorted
 /// as a **multiset** — duplicates PRESERVED. Two sites with the same signature
 /// are two defects, not one: a `dedup`/set here would let a reconversion that
@@ -1302,6 +1454,107 @@ fn accepts_whisperkits_mel_guard() {
   assert!(
     !log.is_decomposed_log_softmax(),
     "it logs a mel spectrogram, not a softmax"
+  );
+}
+
+/// The coremltools-9 dialect, read end to end: three guard sites in one graph,
+/// every epsilon of them a BARE scalar const. Two survive and the third is the
+/// pinned defect, so this excerpt exercises the reader's clean and dirty verdicts
+/// at once — and, because [`vanishing`] refuses any unresolved statement, it
+/// doubles as the proof that the `tensor<`-only reader's 36-hole failure is
+/// closed rather than merely quieted.
+#[test]
+fn reads_the_coremltools_9_bare_scalar_dialect() {
+  let graph = parse_mil(LID_ECAPA_SCALAR_DIALECT);
+
+  // The values only a bare-scalar-aware reader can see. `inf` is here because
+  // the clip's UPPER bound is one: a scalar literal that is not a hex float.
+  assert_eq!(
+    graph.consts.get("var_23_to_fp16").copied(),
+    Some(1.0013580322265625e-5),
+    "the batch_norm epsilon is declared `fp16 …`, not `tensor<fp16, []> …`"
+  );
+  assert_eq!(
+    graph.consts.get("var_13_to_fp16").copied(),
+    Some(FP16_MIN_SUBNORMAL)
+  );
+  assert_eq!(
+    graph.consts.get("const_37_to_fp16").copied(),
+    Some(f64::INFINITY)
+  );
+  assert_eq!(
+    graph.consts.get("x_act_epsilon_0").copied(),
+    Some(2.0_f64.powi(-149)),
+    "and an fp32 scalar is spelled bare too, in the same graph as `tensor<fp16, [1, 107]>`"
+  );
+
+  assert_eq!(
+    vanishing(LID_ECAPA_SCALAR_DIALECT),
+    ["log/fp16 guard=softmax->log eff=1.401298464324817e-45"],
+    "exactly one of the three sites vanishes: the classifier tail's decomposed \
+     log-softmax. The batch_norm's 1.001e-5 and the clip's 0x1p-24 both clear the floor."
+  );
+
+  let audit = graph.audit();
+  assert_eq!(
+    audit.findings.len(),
+    3,
+    "batch_norm, sqrt and log — a reader that saw only `tensor<` statements found NONE of \
+     them and reported three unresolved holes instead: {:?}",
+    audit
+      .findings
+      .iter()
+      .map(Finding::render)
+      .collect::<Vec<_>>()
+  );
+  let sqrt = audit
+    .findings
+    .iter()
+    .find(|f| f.op == "sqrt")
+    .expect("a sqrt site");
+  assert_eq!(
+    sqrt.floor, FP16_MIN_SUBNORMAL,
+    "the attentive-stat sqrt is floored by clip(alpha = 0x1p-24), read through a bare scalar"
+  );
+  assert!(sqrt.survives_fp16());
+}
+
+/// The falsifier for the test above: the same bare-scalar `batch_norm` with its
+/// epsilon halved to `0x1p-25` must be CAUGHT. Without it, "clean" could mean
+/// the reader resolved a healthy epsilon or that it resolved nothing at all in a
+/// way the hole accounting happened to miss.
+#[test]
+fn a_vanishing_bare_scalar_epsilon_is_caught() {
+  assert_eq!(
+    vanishing(LID_SCALAR_NORM_VANISHING_MUTANT),
+    ["batch_norm/fp16 guard=norm eff=2.9802322387695313e-8"],
+    "a bare-scalar epsilon below the fp16 floor must fail exactly like a `tensor<fp16, []>` one"
+  );
+}
+
+/// The over-fire side. The bare-scalar arm keys on "leading token, then a
+/// space", which describes the graph's header and its function signature too —
+/// so those must stay [`ParseOutcome::NotStatement`]. A header misread as a
+/// declaration would add a junk producer and, worse, could be reported as an
+/// unreadable guard (the `func` line names `tuple(`/`dict(`, and a future one
+/// might name `log(`), failing every graph in the dialect for nothing.
+#[test]
+fn the_bare_scalar_arm_does_not_swallow_the_program_header() {
+  for line in LID_NON_STATEMENT_LINES {
+    assert!(
+      matches!(parse_stmt_line(line.trim()), ParseOutcome::NotStatement),
+      "not a declaration, and must not be read as one: {line}"
+    );
+  }
+  assert_eq!(
+    bare_scalar_head("fp16 var_23_to_fp16 = const()[]"),
+    Some(("fp16", "var_23_to_fp16 = const()[]")),
+    "…while a real scalar declaration still is one"
+  );
+  assert_eq!(
+    bare_scalar_head("float16 v = const()[]"),
+    None,
+    "the vocabulary is closed: a near-miss type name is not a declaration"
   );
 }
 

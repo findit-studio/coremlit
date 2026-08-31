@@ -461,10 +461,12 @@ upstream model card (section 10c).
          aufklarer/SpeechBrain-ECAPA-VoxLingua107-21M-CoreML
          https://huggingface.co/aufklarer/SpeechBrain-ECAPA-VoxLingua107-21M-CoreML
          revision 2aa4d715a79e410d5f9aa32bd7a4fc9225bf9eb0, Apache-2.0.
-         Per-file SHA-256 pinned in tests/lid/common/mod.rs. MODELS_LOCK does
-         NOT pin it and no CI job fetches it: the model gates that load it are
-         local/dev today (see the `lid` entry in ci.yml's `model-tests` in-lib
-         coverage ledger for why), so this component adds no CI download.
+         Per-file SHA-256 pinned in tests/lid/common/mod.rs, and that manifest
+         is what verifies the staged bytes: the repo ships no CHECKSUMS.sha256,
+         publishing its digests in an artifact_manifest.json that `shasum -c`
+         cannot read. MODELS_LOCK pins the revision above and ci.yml's `lid`
+         model-tests shard fetches it (41 MB), so this component DOES add a CI
+         download.
 
        As an Apache-2.0 work, a redistributor must retain the license and
        copyright notices AND STATE ANY CHANGES. Two changes apply here and both
