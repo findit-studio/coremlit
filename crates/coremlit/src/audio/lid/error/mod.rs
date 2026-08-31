@@ -16,6 +16,8 @@
 //! [`FrameCountOutOfRange`] in particular is the guard callers reach for most,
 //! and it answers "how much audio may I pass?" without a live error in hand.
 
+use super::ScorePooling;
+
 /// Convenience alias for `Result<T, `[`Error`]`>`.
 pub type Result<T> = core::result::Result<T, Error>;
 
@@ -297,6 +299,32 @@ pub enum Error {
   /// [`aggregate_windows`]: super::aggregate_windows
   #[error("cannot aggregate an empty window list")]
   EmptyWindows,
+
+  /// Pooling produced a row that assigns probability zero to EVERY language,
+  /// carrying the [`ScorePooling`] that produced it.
+  ///
+  /// Not an arithmetic slip. The logarithmic pool is a geometric mean, so a
+  /// language ANY window scored at `-∞` is zero in the pool; windows certain of
+  /// different languages therefore zero out every language between them, and
+  /// the pool's honest answer is that nothing is possible. It is refused rather
+  /// than returned because a row whose exponentials sum to zero is not a
+  /// distribution: ranking it reports arbitrary languages at probability zero.
+  ///
+  /// Unreachable through [`Identifier::identify_long`] — a model row is
+  /// all-finite, so no `-∞` enters the fold — and reachable through
+  /// [`aggregate_windows`] only from hand-built rows, `-∞` being a value
+  /// [`LogProbabilities::try_from_slice`] deliberately accepts. The
+  /// single-window identity path is covered too: a lone zero-mass row is
+  /// refused rather than passed through.
+  ///
+  /// [`Identifier::identify_long`]: super::Identifier::identify_long
+  /// [`aggregate_windows`]: super::aggregate_windows
+  /// [`LogProbabilities::try_from_slice`]: super::LogProbabilities::try_from_slice
+  #[error(
+    "{0:?} pooling left no probability mass: every language pooled to probability \
+     zero, so the result is not a distribution and its ranking would be arbitrary"
+  )]
+  ZeroMassAggregate(ScorePooling),
 
   /// A hand-built log-probability row was not exactly
   /// [`NUM_LANGUAGES`](super::NUM_LANGUAGES) values long, carrying the length

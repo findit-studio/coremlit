@@ -720,7 +720,10 @@ impl Identifier {
   /// # Errors
   /// As [`Self::log_probabilities_windows`]; [`Error::UnknownLanguageIndex`] is
   /// defensive-only. ([`Error::EmptyWindows`] is unreachable — a clip that
-  /// passes validation always plans at least one span.)
+  /// passes validation always plans at least one span — and so is
+  /// [`Error::ZeroMassAggregate`]: [`Self::log_probabilities`] rejects a
+  /// non-finite score, so every row this folds is all-finite and no pooling can
+  /// zero the whole clip out.)
   ///
   /// [`NUM_LANGUAGES`]: NUM_LANGUAGES
   pub fn identify_long(

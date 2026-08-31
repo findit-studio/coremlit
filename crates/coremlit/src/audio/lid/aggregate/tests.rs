@@ -354,6 +354,191 @@ fn renormalize_does_not_turn_an_impossible_row_into_nan() {
   assert!(values.iter().all(|v| *v == f64::NEG_INFINITY));
 }
 
+// ── Totality over the accepted domain ───────────────────────────────────────
+
+/// Disjoint zero-probability supports pool, in log space, to a row whose
+/// exponentials sum to ZERO.
+///
+/// The arithmetic is right: a logarithmic pool is a geometric mean, so a
+/// language ANY window scores at `-∞` is zero in the pool, and two windows
+/// certain of different languages zero out every language between them. What
+/// is wrong is returning that as a distribution — its "top" languages are
+/// whichever ones the tie-break happens to surface, each at probability zero.
+#[test]
+fn a_zero_mass_logarithmic_pool_is_refused_rather_than_returned() {
+  let certain_of = |index: usize| {
+    let mut values = vec![f32::NEG_INFINITY; NUM_LANGUAGES];
+    values[index] = 0.0;
+    LogProbabilities::try_from_slice(&values).expect("one zero among -inf normalizes exactly")
+  };
+  let windows = vec![
+    window(certain_of(100), 0, WINDOW),
+    window(certain_of(101), WINDOW, WINDOW),
+  ];
+
+  let pooled = aggregate_windows(ScorePooling::MeanLogProbability, &windows);
+  assert!(
+    matches!(
+      pooled,
+      Err(Error::ZeroMassAggregate(ScorePooling::MeanLogProbability))
+    ),
+    "a zero-mass pool must be a typed refusal, got {}",
+    describe(&pooled)
+  );
+}
+
+/// A finite log-probability far below the row maximum keeps its RANK through
+/// the linear pool, even where `exp` of it underflows to zero.
+///
+/// `f64`'s smallest subnormal is 4.94e-324, so anything under ln of it
+/// (≈ −744.4) exponentiates to exactly `0.0`; a pool that sums those and takes
+/// the log re-emits `-∞` for every tail and hands the caller a ranking that is
+/// whatever the tie-break says. Two identical windows must pool back to their
+/// common row exactly, tail included.
+#[test]
+fn the_linear_pool_keeps_a_finite_tail_through_exp_underflow() {
+  let mut values = vec![-1_000.0f32; NUM_LANGUAGES];
+  values[0] = 0.0;
+  values[100] = -800.0;
+  values[101] = -900.0;
+  let row = LogProbabilities::try_from_slice(&values).expect("a finite row, normalized to 1");
+
+  let pooled = aggregate_windows(
+    ScorePooling::MeanProbability,
+    &[
+      window(row.clone(), 0, WINDOW),
+      window(row.clone(), WINDOW, WINDOW),
+    ],
+  )
+  .expect("aggregate");
+
+  let ranked: Vec<usize> = pooled
+    .top_k(3)
+    .expect("rank")
+    .iter()
+    .map(|score| score.index())
+    .collect();
+  assert_eq!(
+    ranked,
+    vec![0, 100, 101],
+    "the finite tail must keep its rank; row[100]={} row[101]={} row[1]={}",
+    pooled.as_slice()[100],
+    pooled.as_slice()[101],
+    pooled.as_slice()[1],
+  );
+  // Two identical windows pool back to their common row, and in log space the
+  // shifted sum makes that exact rather than approximate.
+  assert_eq!(pooled.as_slice(), row.as_slice());
+}
+
+/// The survey the two findings above prompted, pinned rather than described:
+/// over the domain [`LogProbabilities`] accepts, every pooling either returns a
+/// distribution or refuses.
+///
+/// Windows that are `-∞` in every column are the hardest case that domain
+/// admits. Three poolings have nothing to report and say so. [`Vote`] still
+/// does: a vote is cast for the row's argmax whatever its magnitudes are — here
+/// the tie-break's column 0 — and a vote share is a distribution by
+/// construction, so it is the one pooling that cannot produce a zero-mass row.
+///
+/// [`Vote`]: ScorePooling::Vote
+#[test]
+fn every_pooling_either_returns_a_distribution_or_refuses() {
+  let nothing = LogProbabilities::try_from_slice(&vec![f32::NEG_INFINITY; NUM_LANGUAGES])
+    .expect("an all-zero-probability row is accepted");
+
+  for pooling in all_poolings() {
+    let pooled = aggregate_windows(
+      pooling,
+      &[
+        window(nothing.clone(), 0, WINDOW),
+        window(nothing.clone(), WINDOW, WINDOW),
+      ],
+    );
+    if pooling == ScorePooling::Vote {
+      let row = pooled.expect("a vote always has a winner");
+      assert_eq!(row.as_slice()[0], 0.0, "the tie-break's column, at share 1");
+      assert_eq!(row.as_slice()[1], f32::NEG_INFINITY);
+      assert!((mass(&row) - 1.0).abs() < 1e-6, "mass {}", mass(&row));
+      continue;
+    }
+    assert!(
+      matches!(&pooled, Err(Error::ZeroMassAggregate(got)) if *got == pooling),
+      "{pooling:?}: {}",
+      describe(&pooled)
+    );
+  }
+
+  // The single-window identity path is not an exception to the postcondition:
+  // a lone zero-mass row is refused, not handed back verbatim. Unreachable
+  // from the model, whose rows are all finite; reachable by hand, because
+  // `try_from_slice` accepts `-∞` on purpose.
+  for pooling in all_poolings() {
+    let pooled = aggregate_windows(pooling, &[window(nothing.clone(), 0, WINDOW)]);
+    assert!(
+      matches!(&pooled, Err(Error::ZeroMassAggregate(got)) if *got == pooling),
+      "{pooling:?} identity: {}",
+      describe(&pooled)
+    );
+  }
+}
+
+/// One language ruled out by one window is where the refusal must NOT reach:
+/// the row still has mass, so it is an answer and it is returned.
+///
+/// It also separates the three poolings that meet a `-∞` differently. The
+/// logarithmic pool multiplies, so a single window's zero is final. The linear
+/// pool adds, so the other window's 0.7 survives. `Max` takes the peak, so it
+/// survives there too — and neither of those two can be dragged to zero mass by
+/// a `-∞` at all.
+#[test]
+fn one_language_ruled_out_does_not_rule_out_the_row() {
+  let mut values = distribution(&[(0, 0.6), (1, 0.4)]);
+  values[5] = f32::NEG_INFINITY;
+  let rules_out = LogProbabilities::try_from_slice(&values).expect("row");
+  let votes_for =
+    LogProbabilities::try_from_slice(&distribution(&[(5, 0.7), (0, 0.3)])).expect("row");
+  let windows = vec![
+    window(rules_out, 0, WINDOW),
+    window(votes_for, WINDOW, WINDOW),
+  ];
+
+  for pooling in all_poolings() {
+    let out = aggregate_windows(pooling, &windows).expect("aggregate");
+    assert!(
+      (mass(&out) - 1.0).abs() < 1e-5,
+      "{pooling:?} mass {}",
+      mass(&out)
+    );
+    let zeroed = out.as_slice()[5] == f32::NEG_INFINITY;
+    assert_eq!(
+      zeroed,
+      pooling == ScorePooling::MeanLogProbability,
+      "{pooling:?} column 5 = {}",
+      out.as_slice()[5]
+    );
+  }
+}
+
+/// Render an aggregate result for an assertion message: what a caller would
+/// actually receive, including the mass that makes it not a distribution.
+fn describe(pooled: &Result<LogProbabilities>) -> String {
+  match pooled {
+    Ok(row) => format!(
+      "Ok(mass {}, top-3 {:?}, values[0..3] {:?})",
+      mass(row),
+      row
+        .top_k(3)
+        .expect("rank")
+        .iter()
+        .map(|score| score.index())
+        .collect::<Vec<_>>(),
+      &row.as_slice()[..3],
+    ),
+    Err(error) => format!("Err({error})"),
+  }
+}
+
 /// A row of exact probabilities, as log-probabilities. Unlisted columns get the
 /// remaining mass spread thin enough to be negligible but never zero, so a
 /// pooling that multiplies cannot be handed a `-∞` it did not earn.

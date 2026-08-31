@@ -36,9 +36,12 @@ pub type WindowLogProbabilities = windit::windowed::Windowed<LogProbabilities>;
 /// Straight off the graph the row is a log-SOFTMAX: `exp` over it sums to 1.
 /// Aggregation preserves that for every [`ScorePooling`] — the mean policies
 /// and `Vote` produce distributions by construction, and `Max` is renormalized
-/// — but the invariant this TYPE enforces is only the pointwise one (`<= 0`,
-/// not NaN), because that is the part a hand-built row can be held to without
-/// choosing a floating-point tolerance for "sums to 1".
+/// — or it FAILS, with [`Error::ZeroMassAggregate`], on the rows whose honest
+/// pool assigns every language probability zero. What it never does is hand
+/// back a row that is not a distribution. The invariant this TYPE enforces is
+/// only the pointwise one (`<= 0`, not NaN), because that is the part a
+/// hand-built row can be held to without choosing a floating-point tolerance
+/// for "sums to 1".
 ///
 /// `-∞` is a legal value: it is the exact log of a zero probability, which
 /// [`ScorePooling::Vote`] produces for any language no window chose.

@@ -78,6 +78,7 @@ fn every_payload_variant_is_a_newtype() {
     Error::UnknownLanguageIndex(999),
     WinditError::TooManyWindows { got: 9, max: 4 }.into(),
     Error::EmptyWindows,
+    Error::ZeroMassAggregate(ScorePooling::MeanLogProbability),
     Error::LanguageCountMismatch(106),
     InvalidLogProbability::new(12, 0.5).into(),
   ];
@@ -96,6 +97,9 @@ fn every_payload_variant_is_a_newtype() {
         assert!(matches!(detail, WinditError::TooManyWindows { got: 9, .. }));
       }
       Error::EmptyWindows => {}
+      Error::ZeroMassAggregate(pooling) => {
+        assert_eq!(pooling, ScorePooling::MeanLogProbability);
+      }
       Error::LanguageCountMismatch(got) => assert_eq!(got, 106),
       Error::InvalidLogProbability(detail) => {
         assert_eq!(detail.index(), 12);
