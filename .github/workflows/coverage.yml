@@ -315,13 +315,13 @@ jobs:
           - kit: siglip
             gates: |
               siglip|siglip_tokenizer_identity siglip_model_io siglip_text_model_io siglip_parity_embed siglip_placement siglip_e2e
-          # 41 MB, one `.mlmodelc`, nine gates. No `@lib` group, for the same
+          # 41 MB, one `.mlmodelc`, sixteen gates. No `@lib` group, for the same
           # reason ced/clap/siglip have none: `audio::lid`'s in-lib tests are all
           # hermetic and list ZERO ignored, which would (correctly) trip the
           # anti-vacuum guard below; their lines come from the hermetic leg.
           - kit: lid
             gates: |
-              lid|lid_model_io lid_e2e
+              lid|lid_model_io lid_e2e lid_long_clip
     # Every kit's test-model override, set for every leg — the same block
     # ci.yml's `model-tests` sets, and for the same reason: each resolves to the
     # path the suite's `common/mod.rs` already falls back to, so nothing changes
