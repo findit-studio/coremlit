@@ -72,7 +72,7 @@ fn validate_rejects_overlong_audio_never_truncates() {
   let long = vec![0.0f32; WINDOW_SAMPLES + 1];
   assert!(matches!(
     validate_window_input(&long),
-    Err(Error::AudioTooLong { len, max }) if len == WINDOW_SAMPLES + 1 && max == WINDOW_SAMPLES
+    Err(Error::AudioTooLong(e)) if e.len() == WINDOW_SAMPLES + 1 && e.max() == WINDOW_SAMPLES
   ));
 }
 
@@ -83,7 +83,7 @@ fn validate_reports_the_first_non_finite_sample() {
   samples[43] = f32::INFINITY;
   assert!(matches!(
     validate_window_input(&samples),
-    Err(Error::NonFiniteInput { index: 41 })
+    Err(Error::NonFiniteInput(41))
   ));
 }
 
@@ -98,7 +98,7 @@ fn classify_long_zero_k_guard_catches_non_finite_samples_beyond_one_window() {
   samples[WINDOW_SAMPLES + 300] = f32::NAN;
   assert!(matches!(
     check_finite_samples(&samples),
-    Err(Error::NonFiniteInput { index }) if index == WINDOW_SAMPLES + 300
+    Err(Error::NonFiniteInput(index)) if index == WINDOW_SAMPLES + 300
   ));
   assert!(check_finite_samples(&vec![0.0f32; WINDOW_SAMPLES + 500]).is_ok());
 }
@@ -116,7 +116,7 @@ fn finite_logit_check_reports_the_index() {
   logits[7] = f32::NEG_INFINITY;
   assert!(matches!(
     check_finite_logits(&logits),
-    Err(Error::NonFiniteOutput { index: 7 })
+    Err(Error::NonFiniteOutput(7))
   ));
 }
 

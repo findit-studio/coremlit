@@ -17,7 +17,7 @@ use std::collections::BinaryHeap;
 
 use crate::audio::ced::{
   NUM_CLASSES,
-  error::{Error, Result},
+  error::{ClassCountMismatch, Error, InvalidConfidence, Result},
 };
 
 /// The 527-class rated AudioSet vocabulary, re-exported from the ort-free
@@ -55,8 +55,8 @@ impl EventPrediction {
   /// the compile-time `NUM_CLASSES == events().len()` assert makes this
   /// unreachable for in-range indices.
   pub(crate) fn from_confidence(class_index: usize, confidence: f32) -> Result<Self> {
-    let event = RatedSoundEvent::from_index(class_index)
-      .ok_or(Error::UnknownClassIndex { index: class_index })?;
+    let event =
+      RatedSoundEvent::from_index(class_index).ok_or(Error::UnknownClassIndex(class_index))?;
     Ok(Self { event, confidence })
   }
 
@@ -164,27 +164,29 @@ impl Confidences {
   /// // Both rejections are typed, never the panic `new` would raise.
   /// assert!(matches!(
   ///   Confidences::try_from_slice(&values[..NUM_CLASSES - 1]),
-  ///   Err(Error::ClassCountMismatch { got, .. }) if got == NUM_CLASSES - 1
+  ///   Err(Error::ClassCountMismatch(e)) if e.got() == NUM_CLASSES - 1
   /// ));
   /// values[74] = f32::NAN;
   /// assert!(matches!(
   ///   Confidences::try_from_slice(&values),
-  ///   Err(Error::InvalidConfidence { index: 74, .. })
+  ///   Err(Error::InvalidConfidence(e)) if e.index() == 74
   /// ));
   /// # Ok::<(), Error>(())
   /// ```
   pub fn try_from_slice(values: &[f32]) -> Result<Self> {
     if values.len() != NUM_CLASSES {
-      return Err(Error::ClassCountMismatch {
-        expected: NUM_CLASSES,
-        got: values.len(),
-      });
+      return Err(Error::ClassCountMismatch(ClassCountMismatch::new(
+        NUM_CLASSES,
+        values.len(),
+      )));
     }
     for (index, &value) in values.iter().enumerate() {
       // NaN and both infinities fail this containment test too, so it is the
       // whole "finite and in [0, 1]" check, not just the bounds half.
       if !(0.0..=1.0).contains(&value) {
-        return Err(Error::InvalidConfidence { index, value });
+        return Err(Error::InvalidConfidence(InvalidConfidence::new(
+          index, value,
+        )));
       }
     }
     Ok(Self::new(values.to_vec()))

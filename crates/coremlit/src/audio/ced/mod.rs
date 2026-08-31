@@ -338,10 +338,12 @@ mod mel;
 mod compute_units_serde;
 
 pub use aggregate::{ChunkAggregation, aggregate_windows};
-pub use error::Error;
+pub use error::{
+  AudioTooLong, ClassCountMismatch, ContractMismatch, Error, InvalidConfidence, OutputShape,
+};
 pub use model::{CedModel, ParseCedModelError};
 pub use prediction::{Confidences, EventPrediction, RatedSoundEvent, WindowConfidences};
-pub use window::{Span, TailPolicy, WindowPlan};
+pub use window::{DropBelowMin, Span, TailPolicy, WindowPlan};
 
 use crate::audio::ced::{
   error::{Result, WinditError},
@@ -501,35 +503,35 @@ impl Classifier {
     let description = model.description();
 
     let input_expected = format!("[1, {N_MELS}, {N_FRAMES}] float32");
-    let input = description
-      .input(names::MEL)
-      .ok_or_else(|| Error::ContractMismatch {
-        feature: names::MEL,
-        expected: input_expected.clone(),
-        actual: "missing".to_string(),
-      })?;
+    let input = description.input(names::MEL).ok_or_else(|| {
+      Error::ContractMismatch(ContractMismatch::new(
+        names::MEL,
+        input_expected.clone(),
+        "missing".to_string(),
+      ))
+    })?;
     if input.shape() != [1, N_MELS, N_FRAMES] || input.data_type() != Some(DataType::F32) {
-      return Err(Error::ContractMismatch {
-        feature: names::MEL,
-        expected: input_expected,
-        actual: describe(input.shape(), input.data_type()),
-      });
+      return Err(Error::ContractMismatch(ContractMismatch::new(
+        names::MEL,
+        input_expected,
+        describe(input.shape(), input.data_type()),
+      )));
     }
 
     let output_expected = format!("[1, {NUM_CLASSES}] float32");
-    let output = description
-      .output(names::LOGITS)
-      .ok_or_else(|| Error::ContractMismatch {
-        feature: names::LOGITS,
-        expected: output_expected.clone(),
-        actual: "missing".to_string(),
-      })?;
+    let output = description.output(names::LOGITS).ok_or_else(|| {
+      Error::ContractMismatch(ContractMismatch::new(
+        names::LOGITS,
+        output_expected.clone(),
+        "missing".to_string(),
+      ))
+    })?;
     if output.shape() != [1, NUM_CLASSES] || output.data_type() != Some(DataType::F32) {
-      return Err(Error::ContractMismatch {
-        feature: names::LOGITS,
-        expected: output_expected,
-        actual: describe(output.shape(), output.data_type()),
-      });
+      return Err(Error::ContractMismatch(ContractMismatch::new(
+        names::LOGITS,
+        output_expected,
+        describe(output.shape(), output.data_type()),
+      )));
     }
 
     Ok(Self {
@@ -577,10 +579,10 @@ impl Classifier {
       .take(names::LOGITS)
       .ok_or_else(|| crate::PredictionError::MissingOutput(names::LOGITS.to_string()))?;
     if logits.shape() != [1, NUM_CLASSES] {
-      return Err(Error::OutputShape {
-        got: logits.shape().to_vec(),
-        expected: vec![1, NUM_CLASSES],
-      });
+      return Err(Error::OutputShape(OutputShape::new(
+        logits.shape().to_vec(),
+        vec![1, NUM_CLASSES],
+      )));
     }
 
     let mut row = vec![0.0f32; NUM_CLASSES];
@@ -743,10 +745,10 @@ fn validate_window_input(samples: &[f32]) -> Result<()> {
     return Err(Error::EmptyAudio);
   }
   if samples.len() > WINDOW_SAMPLES {
-    return Err(Error::AudioTooLong {
-      len: samples.len(),
-      max: WINDOW_SAMPLES,
-    });
+    return Err(Error::AudioTooLong(AudioTooLong::new(
+      samples.len(),
+      WINDOW_SAMPLES,
+    )));
   }
   check_finite_samples(samples)
 }
@@ -759,7 +761,7 @@ fn validate_window_input(samples: &[f32]) -> Result<()> {
 /// wave a NaN/∞ clip through as an empty result.
 fn check_finite_samples(samples: &[f32]) -> Result<()> {
   if let Some(index) = samples.iter().position(|v| !v.is_finite()) {
-    return Err(Error::NonFiniteInput { index });
+    return Err(Error::NonFiniteInput(index));
   }
   Ok(())
 }
@@ -769,7 +771,7 @@ fn check_finite_samples(samples: &[f32]) -> Result<()> {
 /// would silently rank via `total_cmp` and poison downstream aggregation.
 fn check_finite_logits(logits: &[f32]) -> Result<()> {
   if let Some(index) = logits.iter().position(|v| !v.is_finite()) {
-    return Err(Error::NonFiniteOutput { index });
+    return Err(Error::NonFiniteOutput(index));
   }
   Ok(())
 }

@@ -60,9 +60,8 @@ fn short_clip_is_one_window_regardless_of_hop() {
 fn short_clip_survives_drop_below_min() {
   // A short clip's sole span is never dropped — there is nothing else to
   // represent it.
-  let plan = WindowPlan::new().with_tail_policy(TailPolicy::DropBelowMin {
-    min_samples: 100_000,
-  });
+  let plan =
+    WindowPlan::new().with_tail_policy(TailPolicy::DropBelowMin(DropBelowMin::new(100_000)));
   assert_eq!(offsets(&plan, 50_000), vec![(0, 50_000)]);
 }
 
@@ -89,9 +88,8 @@ fn no_overlap_tiling_with_padded_tail() {
 
 #[test]
 fn drop_below_min_drops_the_short_tail() {
-  let plan = WindowPlan::new().with_tail_policy(TailPolicy::DropBelowMin {
-    min_samples: 100_000,
-  });
+  let plan =
+    WindowPlan::new().with_tail_policy(TailPolicy::DropBelowMin(DropBelowMin::new(100_000)));
   // The 80_000-sample tail is below the 100_000 threshold.
   assert_eq!(
     offsets(&plan, 400_000),
@@ -178,7 +176,7 @@ fn hop_past_window_setter_panics() {
 #[test]
 #[should_panic(expected = "min_samples")]
 fn zero_drop_min_setter_panics() {
-  let _ = WindowPlan::new().with_tail_policy(TailPolicy::DropBelowMin { min_samples: 0 });
+  let _ = WindowPlan::new().with_tail_policy(TailPolicy::DropBelowMin(DropBelowMin::new(0)));
 }
 
 #[test]
@@ -245,7 +243,7 @@ fn planned_windows_matches_materialized_len() {
   let drop_min = |hop: u32, min: u32| {
     WindowPlan::new()
       .with_hop_samples(hop)
-      .with_tail_policy(TailPolicy::DropBelowMin { min_samples: min })
+      .with_tail_policy(TailPolicy::DropBelowMin(DropBelowMin::new(min)))
       .with_max_windows(u32::MAX)
   };
   let cases: [(WindowPlan, usize); 20] = [
@@ -307,9 +305,7 @@ mod serde_tests {
   fn round_trips_through_json() {
     let plan = WindowPlan::new()
       .with_hop_samples(80_000)
-      .with_tail_policy(TailPolicy::DropBelowMin {
-        min_samples: 40_000,
-      })
+      .with_tail_policy(TailPolicy::DropBelowMin(DropBelowMin::new(40_000)))
       .with_max_windows(50_000);
     let json = serde_json::to_string(&plan).unwrap();
     let back: WindowPlan = serde_json::from_str(&json).unwrap();
@@ -330,13 +326,12 @@ mod serde_tests {
     // pinned here (the ChunkAggregation golden pattern, `aggregate/tests.rs`).
     for kind in [
       TailPolicy::Pad,
-      TailPolicy::DropBelowMin {
-        min_samples: 40_000,
-      },
+      TailPolicy::DropBelowMin(DropBelowMin::new(40_000)),
     ] {
       let expected = match kind {
         TailPolicy::Pad => "\"pad\"".to_string(),
-        TailPolicy::DropBelowMin { min_samples } => {
+        TailPolicy::DropBelowMin(d) => {
+          let min_samples = d.min_samples();
           format!("{{\"drop_below_min\":{{\"min_samples\":{min_samples}}}}}")
         }
       };

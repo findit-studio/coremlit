@@ -117,7 +117,7 @@ fn event_prediction_round_trips_known_rows() {
   assert!(EventPrediction::from_confidence(NUM_CLASSES - 1, 0.5).is_ok());
   let err = EventPrediction::from_confidence(NUM_CLASSES, 0.5).unwrap_err();
   assert!(
-    matches!(err, crate::audio::ced::Error::UnknownClassIndex { index } if index == NUM_CLASSES),
+    matches!(err, crate::audio::ced::Error::UnknownClassIndex(index) if index == NUM_CLASSES),
     "got {err:?}"
   );
 }
@@ -155,9 +155,9 @@ fn try_from_slice_rejects_a_wrong_length_vector_without_panicking() {
     let err = Confidences::try_from_slice(&vec![0.5f32; got]).unwrap_err();
     assert!(
       matches!(
-        err,
-        crate::audio::ced::Error::ClassCountMismatch { expected, got: g }
-          if expected == NUM_CLASSES && g == got
+        &err,
+        crate::audio::ced::Error::ClassCountMismatch(e)
+          if e.expected() == NUM_CLASSES && e.got() == got
       ),
       "len {got} gave {err:?}"
     );
@@ -180,9 +180,9 @@ fn try_from_slice_rejects_values_outside_the_stated_invariant() {
     let err = Confidences::try_from_slice(&values).unwrap_err();
     assert!(
       matches!(
-        err,
-        crate::audio::ced::Error::InvalidConfidence { index: i, value }
-          if i == index && (value == bad || (value.is_nan() && bad.is_nan()))
+        &err,
+        crate::audio::ced::Error::InvalidConfidence(e)
+          if e.index() == index && (e.value() == bad || (e.value().is_nan() && bad.is_nan()))
       ),
       "{bad} at {index} gave {err:?}"
     );

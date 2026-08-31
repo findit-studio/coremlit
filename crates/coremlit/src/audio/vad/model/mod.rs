@@ -72,7 +72,9 @@ use std::path::Path;
 
 use crate::{ComputeUnits, DataType, FeatureInfo, Model, MultiArray};
 
-use crate::audio::vad::error::{InferError, ModelError};
+use crate::audio::vad::error::{
+  ChunkTooLong, ContractMismatch, InferError, ModelError, NonFiniteOutput, OutputShape,
+};
 
 /// New audio samples consumed per VAD chunk — 256 ms at 16 kHz. Matches
 /// FluidAudio's `VadManager.chunkSize` (`VadManager.swift:22`) and the
@@ -400,18 +402,18 @@ fn check_feature(
 ) -> Result<(), ModelError> {
   let expected = describe(expected_shape, Some(DataType::F32));
   let Some(feature) = feature else {
-    return Err(ModelError::ContractMismatch {
-      feature: name,
+    return Err(ModelError::ContractMismatch(ContractMismatch::new(
+      name,
       expected,
-      actual: "missing".to_string(),
-    });
+      "missing".to_string(),
+    )));
   };
   if feature.shape() != expected_shape || feature.data_type() != Some(DataType::F32) {
-    return Err(ModelError::ContractMismatch {
-      feature: name,
+    return Err(ModelError::ContractMismatch(ContractMismatch::new(
+      name,
       expected,
-      actual: describe(feature.shape(), feature.data_type()),
-    });
+      describe(feature.shape(), feature.data_type()),
+    )));
   }
   Ok(())
 }
@@ -424,10 +426,10 @@ fn check_feature(
 /// truncates). Hermetically testable without a loaded model.
 fn prepare_chunk(chunk: &[f32]) -> Result<[f32; CHUNK_SAMPLES], InferError> {
   if chunk.len() > CHUNK_SAMPLES {
-    return Err(InferError::ChunkTooLong {
-      got: chunk.len(),
-      max: CHUNK_SAMPLES,
-    });
+    return Err(InferError::ChunkTooLong(ChunkTooLong::new(
+      chunk.len(),
+      CHUNK_SAMPLES,
+    )));
   }
   let mut padded = [0.0f32; CHUNK_SAMPLES];
   padded[..chunk.len()].copy_from_slice(chunk);
@@ -469,7 +471,7 @@ fn next_context(chunk: &[f32; CHUNK_SAMPLES]) -> [f32; CONTEXT_SAMPLES] {
 /// [`InferError::NonFiniteInput`]). Hermetically testable.
 fn check_finite_input(window: &[f32]) -> Result<(), InferError> {
   if let Some(index) = window.iter().position(|v| !v.is_finite()) {
-    return Err(InferError::NonFiniteInput { index });
+    return Err(InferError::NonFiniteInput(index));
   }
   Ok(())
 }
@@ -485,10 +487,7 @@ fn take_scalar(outputs: &mut crate::Features, name: &'static str) -> Result<f32,
   let mut buf = [0.0f32; 1];
   tensor.copy_into::<f32>(&mut buf)?;
   if !buf[0].is_finite() {
-    return Err(InferError::NonFiniteOutput {
-      feature: name,
-      index: 0,
-    });
+    return Err(InferError::NonFiniteOutput(NonFiniteOutput::new(name, 0)));
   }
   Ok(buf[0])
 }
@@ -506,10 +505,9 @@ fn take_state(
   let mut buf = [0.0f32; STATE_SIZE];
   tensor.copy_into::<f32>(&mut buf)?;
   if let Some(index) = buf.iter().position(|v| !v.is_finite()) {
-    return Err(InferError::NonFiniteOutput {
-      feature: name,
-      index,
-    });
+    return Err(InferError::NonFiniteOutput(NonFiniteOutput::new(
+      name, index,
+    )));
   }
   Ok(buf)
 }
@@ -522,11 +520,11 @@ fn check_output_shape(
   expected: &[usize],
 ) -> Result<(), InferError> {
   if shape != expected {
-    return Err(InferError::OutputShape {
+    return Err(InferError::OutputShape(OutputShape::new(
       feature,
-      got: shape.to_vec(),
-      expected: expected.to_vec(),
-    });
+      shape.to_vec(),
+      expected.to_vec(),
+    )));
   }
   Ok(())
 }
