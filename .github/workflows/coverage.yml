@@ -315,7 +315,7 @@ jobs:
           - kit: siglip
             gates: |
               siglip|siglip_tokenizer_identity siglip_model_io siglip_text_model_io siglip_parity_embed siglip_placement siglip_e2e
-          # 41 MB, one `.mlmodelc`, sixteen gates. No `@lib` group, for the same
+          # 41 MB, one `.mlmodelc`, seventeen gates. No `@lib` group, for the same
           # reason ced/clap/siglip have none: `audio::lid`'s in-lib tests are all
           # hermetic and list ZERO ignored, which would (correctly) trip the
           # anti-vacuum guard below; their lines come from the hermetic leg.

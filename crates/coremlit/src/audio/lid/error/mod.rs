@@ -358,8 +358,9 @@ pub enum Error {
   /// all-finite, so no `-∞` enters the fold — and reachable through
   /// [`aggregate_windows`] only from hand-built rows, `-∞` being a value
   /// [`LogProbabilities::try_from_slice`] deliberately accepts. Each of those
-  /// rows must still have carried mass of its own: a window that ruled every
-  /// language out is [`Error::ZeroMassWindow`], refused before the fold.
+  /// rows must still have been normalizable on its own: a window that ruled
+  /// every language out is [`Error::UnnormalizableWindow`], refused before the
+  /// fold.
   ///
   /// [`Identifier::identify_long`]: super::Identifier::identify_long
   /// [`aggregate_windows`]: super::aggregate_windows
@@ -370,34 +371,49 @@ pub enum Error {
   )]
   ZeroMassAggregate(ScorePooling),
 
-  /// A window offered to the fold assigns probability zero to EVERY language,
-  /// carrying its position in the pushed sequence (its index in the slice
+  /// A window offered to the fold has a maximum that is not FINITE, so no
+  /// shift makes it a distribution and no pooling can fold it. Carries the
+  /// window's position in the pushed sequence (its index in the slice
   /// [`aggregate_windows`] was given).
   ///
-  /// Such a row is not evidence about which language was spoken — it is the
-  /// statement that none was — and no pooling has a meaningful answer for it.
-  /// The logarithmic pool zeroes the whole clip out; the linear pool would
-  /// count the window's duration in its denominator while its terms contribute
-  /// to no numerator, diluting every other window; and [`ScorePooling::Vote`]
-  /// would cast the window's vote for whatever column the ranking tie-break
-  /// surfaces, handing a share of the clip to a language nothing chose. It is
-  /// refused at the door instead, once, for every pooling.
+  /// Exactly two rows reach it:
+  ///
+  /// - `-∞` in EVERY column. Such a row is not evidence about which language
+  ///   was spoken — it is the statement that none was — and no pooling has a
+  ///   meaningful answer for it. The logarithmic pool zeroes the whole clip
+  ///   out; the linear pool would count the window's duration in its
+  ///   denominator while its terms contribute to no numerator, diluting every
+  ///   other window; and [`ScorePooling::Vote`] would cast the window's vote
+  ///   for whatever column the ranking tie-break surfaces, handing a share of
+  ///   the clip to a language nothing chose.
+  /// - `+∞` ANYWHERE. `exp` over such a row sums to `∞`, so it is not a
+  ///   log-probability row at all and there is no constant that makes it one.
+  ///
+  /// What this is NOT is a judgement on a row's absolute SCALE. A row whose
+  /// largest value is `-800` says exactly what one whose largest value is `0`
+  /// says, column for column, and both are folded — the shift comes off before
+  /// anything else, so how far from zero a row happens to sit is arithmetic
+  /// noise rather than evidence and decides nothing here. See `aggregate`'s
+  /// module docs, "A row's own scale is not evidence".
   ///
   /// Unreachable through [`Identifier::identify_long`]: a model row is a
-  /// log-softmax, so its largest entry is at least `ln(1/107)` and its mass is
-  /// positive. Reachable through [`aggregate_windows`] from hand-built rows,
-  /// `-∞` being a value [`LogProbabilities::try_from_slice`] deliberately
-  /// accepts.
+  /// log-softmax, and [`Identifier::log_probabilities`] refuses a non-finite
+  /// score outright. Reachable through [`aggregate_windows`] from hand-built
+  /// rows, `-∞` being a value [`LogProbabilities::try_from_slice`] deliberately
+  /// accepts; `+∞` is not, so that half guards this crate's own unvalidated
+  /// internal constructor rather than a caller.
   ///
   /// [`Identifier::identify_long`]: super::Identifier::identify_long
+  /// [`Identifier::log_probabilities`]: super::Identifier::log_probabilities
   /// [`aggregate_windows`]: super::aggregate_windows
   /// [`ScorePooling::Vote`]: super::ScorePooling::Vote
   /// [`LogProbabilities::try_from_slice`]: super::LogProbabilities::try_from_slice
   #[error(
-    "window {0} assigns probability zero to every language, so it is not evidence \
-     about any of them and cannot be pooled"
+    "window {0}'s largest log-probability is not finite, so no shift makes the row a \
+     distribution: it is either -inf throughout, which rules every language out, or \
+     +inf somewhere, which is not a log-probability row at all"
   )]
-  ZeroMassWindow(usize),
+  UnnormalizableWindow(usize),
 
   /// The fold produced a row that is not a distribution — its probabilities do
   /// not sum to 1 — which is a defect in this crate rather than a property of

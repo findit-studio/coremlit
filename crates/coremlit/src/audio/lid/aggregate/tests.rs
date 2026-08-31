@@ -462,7 +462,7 @@ fn every_pooling_either_returns_a_distribution_or_refuses() {
       ],
     );
     assert!(
-      matches!(&pooled, Err(Error::ZeroMassWindow(0))),
+      matches!(&pooled, Err(Error::UnnormalizableWindow(0))),
       "{pooling:?}: {}",
       describe(&pooled)
     );
@@ -475,7 +475,7 @@ fn every_pooling_either_returns_a_distribution_or_refuses() {
   for pooling in all_poolings() {
     let pooled = aggregate_windows(pooling, &[window(nothing.clone(), 0, WINDOW)]);
     assert!(
-      matches!(&pooled, Err(Error::ZeroMassWindow(0))),
+      matches!(&pooled, Err(Error::UnnormalizableWindow(0))),
       "{pooling:?} identity: {}",
       describe(&pooled)
     );
@@ -665,7 +665,7 @@ fn a_window_with_no_probability_mass_is_refused_not_folded() {
   ];
   let pooled = aggregate_windows(ScorePooling::MeanProbability, &windows);
   assert!(
-    matches!(&pooled, Err(Error::ZeroMassWindow(1))),
+    matches!(&pooled, Err(Error::UnnormalizableWindow(1))),
     "expected the SECOND window to be named, got {}",
     describe(&pooled)
   );
@@ -693,7 +693,7 @@ fn the_refusal_names_the_window_that_ruled_everything_out() {
       .collect();
     let pooled = aggregate_windows(ScorePooling::Max, &windows);
     assert!(
-      matches!(&pooled, Err(Error::ZeroMassWindow(got)) if *got == position),
+      matches!(&pooled, Err(Error::UnnormalizableWindow(got)) if *got == position),
       "position {position}: {}",
       describe(&pooled)
     );
@@ -719,27 +719,46 @@ fn a_vote_is_not_cast_by_a_window_that_ruled_everything_out() {
     ],
   );
   assert!(
-    matches!(&pooled, Err(Error::ZeroMassWindow(1))),
+    matches!(&pooled, Err(Error::UnnormalizableWindow(1))),
     "expected a typed refusal, got {}",
     describe(&pooled)
   );
 }
 
 /// `Max` reaches `renormalize` too, and a row of huge finite negatives
-/// renormalized to all-zeros gave 107 languages at probability 1 apiece. Both
-/// guards close it: the rows have no mass, so they never reach the fold.
+/// renormalized to all-zeros once gave 107 languages at probability 1 apiece.
+///
+/// The row is NOT refused. Its maximum is finite, so it normalizes, and a
+/// uniform row written at −1e20 is a uniform DISTRIBUTION — the honest answer,
+/// and the one this returns. What closed the defect is `DistributionShift`'s
+/// two subtractions held apart, so the log of the shifted sum survives a
+/// maximum that far from zero; the door was never the right place for it, and
+/// using the door for it is exactly what made the door decide on a row's
+/// absolute scale.
 #[test]
-fn max_over_rows_with_no_mass_is_refused() {
+fn max_over_rows_of_huge_negatives_pools_to_a_distribution() {
   let row = LogProbabilities::try_from_slice(&vec![-1e20f32; NUM_LANGUAGES]).expect("row");
   let pooled = aggregate_windows(
     ScorePooling::Max,
     &[window(row.clone(), 0, WINDOW), window(row, WINDOW, WINDOW)],
   );
-  assert!(
-    matches!(&pooled, Err(Error::ZeroMassWindow(0))),
-    "a row with no probability mass must not pool to one, got {}",
-    describe(&pooled)
-  );
+  let out = match &pooled {
+    Ok(out) => out,
+    Err(_) => panic!(
+      "a row with a finite maximum must fold, got {}",
+      describe(&pooled)
+    ),
+  };
+  // Not 107 columns at exactly 0.0, which is what the fused shift produced.
+  let total = mass(out);
+  assert!((total - 1.0).abs() < 1e-6, "mass {total}");
+  let uniform = (1.0 / NUM_LANGUAGES as f64).ln();
+  for (index, value) in out.as_slice().iter().enumerate() {
+    assert!(
+      (f64::from(*value) - uniform).abs() < 1e-6,
+      "column {index}: {value} against the uniform {uniform}"
+    );
+  }
 }
 
 // ── The fold's postcondition: a distribution comes back ─────────────────────
@@ -1025,5 +1044,226 @@ fn a_lone_window_keeps_its_own_mass_deficit() {
   for pooling in all_poolings() {
     let out = aggregate_windows(pooling, &[window(row.clone(), 0, WINDOW)]).expect("aggregate");
     assert_eq!(out.as_slice(), row.as_slice(), "{pooling:?}");
+  }
+}
+
+// ── The door in front of the fold: what it may and may not decide on ────────
+
+/// A row of [`NUM_LANGUAGES`] values descending by one nat from `top` — the
+/// SAME evidence at whatever absolute scale `top` names.
+///
+/// Every value is an integer, so for any integer `top` whose row stays under
+/// 2^24 the whole row is exact in f32 and two rows built at different `top`s
+/// differ by EXACTLY their shift. That is what lets the assertions below be
+/// bit-equalities rather than tolerances.
+fn ramp(top: f32) -> LogProbabilities {
+  let values: Vec<f32> = (0..NUM_LANGUAGES).map(|i| top - i as f32).collect();
+  LogProbabilities::try_from_slice(&values).expect("a descending non-positive ramp")
+}
+
+/// Fold two equal-length windows of `row`.
+fn fold_pair(pooling: ScorePooling, row: &LogProbabilities) -> Result<LogProbabilities> {
+  aggregate_windows(
+    pooling,
+    &[
+      window(row.clone(), 0, WINDOW),
+      window(row.clone(), WINDOW, WINDOW),
+    ],
+  )
+}
+
+/// A row's own scale decided whether the door would take it at all.
+///
+/// `[-800, -801, …, -906]` and `[0, -1, …, -106]` differ by exactly 800 in
+/// every column, so no probability RATIO differs between them and they
+/// normalize to the identical distribution — and the door refused the first
+/// and folded the second. The guard was `exp(max) > 0.0`, and `exp` underflows
+/// f64 to exactly zero below `ln(f64::MIN_POSITIVE)` ≈ −744.44, so a perfectly
+/// well-formed row was refused for being WRITTEN low.
+///
+/// This is the same leak the fold itself was carrying one round earlier, one
+/// step further upstream: normalizing at the door stopped a row's scale acting
+/// as a weight, but the guard standing in front of the door was still deciding
+/// on it.
+#[test]
+fn a_rows_own_scale_does_not_decide_whether_the_door_accepts_it() {
+  let low = ramp(-800.0);
+  let high = ramp(0.0);
+
+  // Non-vacuity, both ways: these are different rows, and they say the same
+  // thing. Every column sits the same distance below its own row's maximum,
+  // exactly, and the two normalize to the identical distribution.
+  assert_ne!(low.as_slice(), high.as_slice());
+  for (&a, &b) in low.as_slice().iter().zip(high.as_slice()) {
+    assert_eq!(a - low.as_slice()[0], b - high.as_slice()[0]);
+  }
+  assert_eq!(
+    as_distribution(low.as_slice()),
+    as_distribution(high.as_slice())
+  );
+
+  // The arithmetic that used to separate them, pinned so the fixture cannot
+  // quietly stop reproducing the regime it was built for.
+  assert_eq!(f64::from(low.as_slice()[0]).exp(), 0.0);
+  assert!(f64::from(high.as_slice()[0]).exp() > 0.0);
+
+  for pooling in all_poolings() {
+    let from_low = fold_pair(pooling, &low);
+    let from_high = fold_pair(pooling, &high);
+    match (&from_low, &from_high) {
+      (Ok(a), Ok(b)) => assert_eq!(
+        a.as_slice(),
+        b.as_slice(),
+        "{pooling:?}: two rows carrying identical evidence must fold alike"
+      ),
+      _ => panic!(
+        "{pooling:?}: the SAME evidence at two scales got two verdicts — \
+         low {} / high {}",
+        describe(&from_low),
+        describe(&from_high)
+      ),
+    }
+  }
+}
+
+/// Scale invariance as a PROPERTY of the door, not of one pair: shifting a
+/// whole row by a constant changes neither the verdict nor the fold.
+///
+/// `the_fold_is_invariant_to_a_rows_own_scale` holds the same property one
+/// stage later, over rows the door had already accepted. It could not see this
+/// one, because a row the door refuses never reaches the fold to be compared.
+#[test]
+fn the_door_is_invariant_to_a_rows_own_scale() {
+  let reference: Vec<Vec<f32>> = all_poolings()
+    .into_iter()
+    .map(|pooling| {
+      fold_pair(pooling, &ramp(0.0))
+        .expect("the unshifted ramp folds")
+        .as_slice()
+        .to_vec()
+    })
+    .collect();
+
+  // Every shift below keeps the ramp integral and under 2^24, where f32 is
+  // exact — so "the same row at another scale" is not itself an approximation
+  // and the fold must come back BIT-identical. −744/−745/−746 straddle
+  // `ln(f64::MIN_POSITIVE)`, the cliff the old guard fell off.
+  for top in [
+    -1.0f32,
+    -100.0,
+    -744.0,
+    -745.0,
+    -746.0,
+    -800.0,
+    -10_000.0,
+    -16_000_000.0,
+  ] {
+    let row = ramp(top);
+    for (pooling, want) in all_poolings().into_iter().zip(&reference) {
+      let got = fold_pair(pooling, &row);
+      match &got {
+        Ok(folded) => assert_eq!(folded.as_slice(), want.as_slice(), "top {top}, {pooling:?}"),
+        Err(_) => panic!("top {top}, {pooling:?}: {}", describe(&got)),
+      }
+    }
+  }
+
+  // Past the point where f32 can hold the ramp the row genuinely changes: at
+  // −3e38 the ULP is 2e31, so every column rounds onto `top` and the row
+  // really IS uniform. The VERDICT must still not change — a uniform row is a
+  // perfectly good distribution, whatever scale it is written at — and what
+  // comes back is one.
+  let flattened = ramp(-3.0e38);
+  assert!(flattened.as_slice().iter().all(|v| *v == -3.0e38));
+  for pooling in all_poolings() {
+    let got = fold_pair(pooling, &flattened);
+    let folded = match &got {
+      Ok(folded) => folded,
+      Err(_) => panic!("{pooling:?}: {}", describe(&got)),
+    };
+    let total = mass(folded);
+    assert!((total - 1.0).abs() < 1e-6, "{pooling:?}: mass {total}");
+  }
+}
+
+/// A LONE low-scale window is answered rather than refused, and the answer is
+/// the caller's row VERBATIM — which is exactly what a single-shot
+/// `identify` over the same row returns.
+///
+/// The consequence of relaxing the door, stated as a contract rather than
+/// discovered: the identity path now hands back a row whose f64 mass is
+/// exactly zero. That is not a regression, it is the `identify_long` ==
+/// `identify` promise. `finish`'s postcondition does not apply to it (the row
+/// is the caller's, not one this module computed) and the ranking is the same
+/// ranking `top_k` gives the row on its own.
+#[test]
+fn a_lone_low_scale_window_comes_back_verbatim_and_ranks_as_identify_would() {
+  let low = ramp(-800.0);
+  assert_eq!(
+    mass(&low),
+    0.0,
+    "the fixture must be in the underflow regime"
+  );
+
+  for pooling in all_poolings() {
+    let out = aggregate_windows(pooling, &[window(low.clone(), 0, WINDOW)]);
+    let row = match &out {
+      Ok(row) => row,
+      Err(_) => panic!("{pooling:?}: {}", describe(&out)),
+    };
+    assert_eq!(row.as_slice(), low.as_slice(), "{pooling:?}");
+    // The rank a caller actually receives, against the rank the same row
+    // ranked on its own — what `identify` would have reported for it.
+    assert_eq!(
+      row.top_k(3).expect("rank"),
+      low.top_k(3).expect("rank"),
+      "{pooling:?}"
+    );
+  }
+}
+
+/// `+∞` is refused at the door, deliberately.
+///
+/// It cannot arrive from outside this crate — [`LogProbabilities::try_from_slice`]
+/// rejects every value above zero, `+∞` among them — and it cannot arrive from
+/// the model, whose row [`Identifier::log_probabilities`] refuses outright if
+/// any entry is non-finite. What could reach here is a future in-crate producer
+/// going through the unvalidated `pub(crate)` `LogProbabilities::new`, and the
+/// door's answer to that is a typed refusal naming the window.
+///
+/// The alternative was to accept it and let the fold deal with it, which is
+/// what it did before: three of the four poolings carried the `∞` through to
+/// `finish` and failed the mass postcondition with `NotADistribution(inf)`,
+/// while a LONE `+∞` window took the identity path and came back to the caller
+/// verbatim — a `LogProbabilities` holding a POSITIVE value, which the type's
+/// own documented invariant forbids. One predicate at the door closes both.
+///
+/// [`Identifier::log_probabilities`]: crate::audio::lid::Identifier::log_probabilities
+#[test]
+fn a_window_whose_maximum_is_not_finite_upward_is_refused_at_the_door() {
+  let mut values = vec![-1.0f32; NUM_LANGUAGES];
+  values[7] = f32::INFINITY;
+  assert!(
+    matches!(
+      LogProbabilities::try_from_slice(&values),
+      Err(Error::InvalidLogProbability(detail)) if detail.index() == 7
+    ),
+    "the public constructor must still be the first line of defence"
+  );
+  let row = LogProbabilities::new(values);
+
+  for pooling in all_poolings() {
+    let lone = aggregate_windows(pooling, &[window(row.clone(), 0, WINDOW)]);
+    assert!(
+      matches!(&lone, Err(Error::UnnormalizableWindow(0))),
+      "{pooling:?}, lone window: {}",
+      describe(&lone)
+    );
+    let pair = fold_pair(pooling, &row);
+    assert!(
+      matches!(&pair, Err(Error::UnnormalizableWindow(0))),
+      "{pooling:?}, two windows: {}",
+      describe(&pair)
+    );
   }
 }

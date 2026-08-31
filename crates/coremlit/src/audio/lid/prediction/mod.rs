@@ -45,14 +45,17 @@ pub type WindowLogProbabilities = windit::windowed::Windowed<LogProbabilities>;
 /// The invariant this TYPE enforces is only the pointwise one (`<= 0`, not
 /// NaN), because that is the part a hand-built row can be held to without
 /// choosing a floating-point tolerance for "sums to 1". The one thing
-/// [`aggregate_windows`] additionally requires of a row it is given is that it
-/// have SOME mass ([`Error::ZeroMassWindow`]): a row that is `-∞` in every
-/// column rules every language out, which is not evidence about any of them.
+/// [`aggregate_windows`] additionally requires of a row it is given is that its
+/// maximum be FINITE ([`Error::UnnormalizableWindow`]), which is exactly the
+/// condition under which the row normalizes: a row that is `-∞` in every column
+/// rules every language out, which is not evidence about any of them. It does
+/// NOT require the row to sit at any particular scale — a row whose largest
+/// value is `-800` folds exactly as one shifted up to `0` does.
 ///
 /// [`ComputeUnits::CpuOnly`]: crate::ComputeUnits::CpuOnly
 /// [`aggregate_windows`]: crate::audio::lid::aggregate_windows
 /// [`Error::ZeroMassAggregate`]: crate::audio::lid::Error::ZeroMassAggregate
-/// [`Error::ZeroMassWindow`]: crate::audio::lid::Error::ZeroMassWindow
+/// [`Error::UnnormalizableWindow`]: crate::audio::lid::Error::UnnormalizableWindow
 ///
 /// `-∞` is a legal value: it is the exact log of a zero probability, which
 /// [`ScorePooling::Vote`] produces for any language no window chose.

@@ -28,9 +28,12 @@
 
 mod common;
 
-use coremlit::audio::lid::{
-  DEFAULT_WINDOW_SAMPLES, Error, Identifier, LogProbabilities, NUM_LANGUAGES, ScorePooling, Span,
-  TailPolicy, WindowPlan, aggregate_windows, languages,
+use coremlit::{
+  ComputeUnits,
+  audio::lid::{
+    DEFAULT_WINDOW_SAMPLES, Error, Identifier, IdentifierOptions, LogProbabilities, NUM_LANGUAGES,
+    ScorePooling, Span, TailPolicy, WindowPlan, aggregate_windows, languages,
+  },
 };
 
 /// Model column of Thai, the committed clip's language (pinned independently by
@@ -58,6 +61,21 @@ fn identifier() -> Identifier {
 fn repeated(times: usize) -> Vec<f32> {
   let one = clip();
   std::iter::repeat_n(one, times).flatten().collect()
+}
+
+/// The 11 s English reference, borrowed from the whisper fixtures — the second
+/// language in the spliced clip, and a clip of its own in the mass sweep.
+fn english_clip() -> Vec<f32> {
+  common::read_wav_16k_mono(
+    &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+      .join("tests/whisper/fixtures/audio/jfk.wav"),
+  )
+}
+
+/// A row's total probability mass under `exp`, in f64 — wider than the row it
+/// reads, because the narrowing to f32 is the thing being measured.
+fn mass(row: &[f32]) -> f64 {
+  row.iter().map(|v| f64::from(*v).exp()).sum()
 }
 
 fn argmax(row: &[f32]) -> usize {
@@ -201,7 +219,7 @@ fn windowed_scores_reproduce_the_single_shot_ranking() {
     // as much as 7.7e-3 on `CpuOnly` — so this is a property the poolings
     // establish, not one they inherit, and that is exactly why the tolerance
     // can be tight.
-    let mass: f64 = row.iter().map(|v| f64::from(*v).exp()).sum();
+    let mass = mass(row);
     let delta = f64::from(row[THAI_INDEX] - truth[THAI_INDEX]).abs();
     println!(
       "  {label:>10}  top-1 {} {:>9.5}  |Δ vs single-shot| {:.5}  mass 1{:+.2e}  top-3 {:?}",
@@ -223,8 +241,7 @@ fn windowed_scores_reproduce_the_single_shot_ranking() {
   // fp16 output, and `identify_long` returns it verbatim on a clip that fits
   // one window. Printed so the gap between what the model produces and what
   // the fold guarantees stays visible.
-  let single_mass: f64 = truth.iter().map(|v| f64::from(*v).exp()).sum();
-  println!("  single-shot row mass 1{:+.2e}", single_mass - 1.0);
+  println!("  single-shot row mass 1{:+.2e}", mass(&truth) - 1.0);
 
   let mean_log = deltas[0].1;
   for (label, delta) in &deltas[1..] {
@@ -316,11 +333,7 @@ fn a_concatenated_clip_past_the_ceiling_keeps_its_language() {
 #[ignore = "requires the staged LID model (LID_TEST_MODELS)"]
 fn a_spliced_minority_language_is_kept_by_one_pooling_and_erased_by_another() {
   let identifier = identifier();
-  let english = common::read_wav_16k_mono(
-    &std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-      .join("tests/whisper/fixtures/audio/jfk.wav"),
-  );
-  let mixed: Vec<f32> = repeated(2).into_iter().chain(english).collect();
+  let mixed: Vec<f32> = repeated(2).into_iter().chain(english_clip()).collect();
   assert!(mixed.len() > coremlit::audio::lid::MAX_SAMPLES);
 
   let english_index = languages()
@@ -510,4 +523,192 @@ fn every_tail_policy_answers_the_concatenated_clip() {
     );
     assert_eq!(ranked[0].index(), THAI_INDEX, "{tail:?}");
   }
+}
+
+// ── The tolerance's own measurement ─────────────────────────────────────────
+
+/// The geometries the mass sweep runs, `(window, hop)` in samples: the shipped
+/// default, a half-overlapping plan, and the shortest context that still gives
+/// the sweep more than a handful of windows.
+const SWEEP_GEOMETRIES: [(&str, u32, u32); 3] = [
+  ("10s/10s", 160_000, 160_000),
+  ("5s/2.5s", 80_000, 40_000),
+  ("3s/3s", 48_000, 48_000),
+];
+
+/// Every compute unit, because the deviation the sweep measures is the graph's
+/// fp16 arithmetic and the four back ends do not agree on it.
+const SWEEP_COMPUTE_UNITS: [ComputeUnits; 4] = [
+  ComputeUnits::All,
+  ComputeUnits::CpuOnly,
+  ComputeUnits::CpuAndGpu,
+  ComputeUnits::CpuAndNeuralEngine,
+];
+
+/// The largest folded-mass deviation this sweep may produce.
+///
+/// The number `MAX_MASS_DEVIATION`'s doc publishes is **3.9e-8** (`Max`, on the
+/// ANE). This ceiling is 2.5x it — room for a host whose `exp`/`ln` round a
+/// unit differently — and still two orders of magnitude under the `1e-5` the
+/// fold refuses beyond, so a regression that started letting a real deficit
+/// through into the fold reds here long before `finish` would see it.
+const SWEEP_OBSERVED_CEILING: f64 = 1e-7;
+
+/// How far apart the two numbers `MAX_MASS_DEVIATION`'s doc contrasts must
+/// stay: the model's OWN row mass against the mass a fold leaves.
+///
+/// The doc's pair is 7.7e-3 against 3.9e-8, five orders. Held at three, which
+/// is loose enough that a quieter graph revision does not red it and tight
+/// enough that "a fold's mass is something the poolings establish rather than
+/// inherit" stops being true before it passes.
+const SWEEP_MODEL_TO_FOLD_RATIO: f64 = 1e3;
+
+/// The sweep `MAX_MASS_DEVIATION`'s doc publishes, RUN rather than described.
+///
+/// Four clips (Thai to 39 s and to 52 s, Thai spliced with English, English
+/// alone) x three geometries x four compute units x four poolings = **192
+/// folds** over 2 to 20 windows each. The doc quotes one number out of it —
+/// the largest deviation from mass 1 any of those folds produced — and until
+/// this gate landed no committed test computed it, so a reader could not
+/// re-derive the constant's justification from the tree.
+///
+/// It gates three things, all of them claims the constant's doc makes:
+///
+/// 1. the sweep really has that shape (192 folds, none of them a one-window
+///    identity that would measure nothing);
+/// 2. every fold's mass lands far inside the tolerance, not merely inside it;
+/// 3. the model's own per-window rows do NOT — that gap is the whole reason
+///    the tolerance is not derived from the graph.
+///
+/// The per-compute-unit table is printed on every run, so the doc's number is
+/// re-measured rather than remembered.
+#[test]
+#[ignore = "requires the staged LID model (LID_TEST_MODELS)"]
+fn every_fold_in_the_published_sweep_lands_far_inside_the_mass_tolerance() {
+  let english = english_clip();
+  let clips: [(&str, Vec<f32>); 4] = [
+    ("thai-39s", repeated(3)),
+    ("thai-52s", repeated(4)),
+    (
+      "thai+english",
+      repeated(2).into_iter().chain(english.clone()).collect(),
+    ),
+    ("english", english),
+  ];
+
+  let mut folds = 0usize;
+  let mut windows_per_fold: Vec<usize> = Vec::new();
+  // [compute unit][pooling], so the printed table is the doc's table.
+  let mut worst_by_cell = [[0.0f64; POOLINGS.len()]; SWEEP_COMPUTE_UNITS.len()];
+  let mut worst_fold = (0.0f64, String::new());
+  let mut worst_row = (0.0f64, String::new());
+
+  for (unit_index, compute) in SWEEP_COMPUTE_UNITS.into_iter().enumerate() {
+    let identifier = Identifier::load(
+      common::model_path(),
+      IdentifierOptions::new().with_compute(compute),
+    )
+    .expect("load identifier");
+
+    for (clip_label, samples) in &clips {
+      for (geometry_label, window, hop) in SWEEP_GEOMETRIES {
+        let plan = WindowPlan::new().with_geometry(window, hop);
+        let windows = identifier
+          .log_probabilities_windows(samples, &plan)
+          .expect("windows");
+        windows_per_fold.push(windows.len());
+
+        // The graph's OWN rows, taken from the same inferences the folds
+        // below consume. This is the 7.7e-3 the constant's doc contrasts
+        // itself against, and it is measured here rather than asserted from
+        // memory.
+        for scored in &windows {
+          let deviation = (mass(scored.value().as_slice()) - 1.0).abs();
+          if deviation > worst_row.0 {
+            worst_row = (
+              deviation,
+              format!("{compute:?}/{clip_label}/{geometry_label}"),
+            );
+          }
+        }
+
+        for (pooling_index, (pooling_label, pooling)) in POOLINGS.into_iter().enumerate() {
+          // An `Err` here would already be the postcondition firing; the
+          // point of the gate is the DISTANCE from the tolerance, which only
+          // a successful fold carries.
+          let folded = aggregate_windows(pooling, &windows).expect("aggregate");
+          let deviation = (mass(folded.as_slice()) - 1.0).abs();
+          folds += 1;
+          worst_by_cell[unit_index][pooling_index] =
+            worst_by_cell[unit_index][pooling_index].max(deviation);
+          if deviation > worst_fold.0 {
+            worst_fold = (
+              deviation,
+              format!("{compute:?}/{clip_label}/{geometry_label}/{pooling_label}"),
+            );
+          }
+        }
+      }
+    }
+  }
+
+  println!(
+    "  {:<22} {:>10} {:>10} {:>10} {:>10}",
+    "worst |mass - 1|", POOLINGS[0].0, POOLINGS[1].0, POOLINGS[2].0, POOLINGS[3].0
+  );
+  for (unit_index, compute) in SWEEP_COMPUTE_UNITS.into_iter().enumerate() {
+    let row = worst_by_cell[unit_index];
+    println!(
+      "  {:<22} {:>10.2e} {:>10.2e} {:>10.2e} {:>10.2e}",
+      format!("{compute:?}"),
+      row[0],
+      row[1],
+      row[2],
+      row[3]
+    );
+  }
+  println!(
+    "  {folds} folds over {}..={} windows each\n  \
+     worst fold {:.2e} at {}\n  worst model row {:.2e} at {}",
+    windows_per_fold.iter().min().expect("at least one fold"),
+    windows_per_fold.iter().max().expect("at least one fold"),
+    worst_fold.0,
+    worst_fold.1,
+    worst_row.0,
+    worst_row.1
+  );
+
+  assert_eq!(
+    folds,
+    SWEEP_COMPUTE_UNITS.len() * clips.len() * SWEEP_GEOMETRIES.len() * POOLINGS.len(),
+    "the sweep MAX_MASS_DEVIATION's doc publishes is 4 clips x 3 geometries x 4 compute \
+     units x 4 poolings; if this shape changes, the number the doc quotes changes with it"
+  );
+  assert_eq!(folds, 192);
+  let fewest = *windows_per_fold.iter().min().expect("at least one fold");
+  let most = *windows_per_fold.iter().max().expect("at least one fold");
+  assert!(
+    (2..=20).contains(&fewest) && (2..=20).contains(&most),
+    "the doc says 2 to 20 windows per fold, got {fewest}..={most} — a one-window 'fold' \
+     is the identity path and measures nothing about the poolings"
+  );
+
+  assert!(
+    worst_fold.0 <= SWEEP_OBSERVED_CEILING,
+    "the worst fold in the sweep left mass 1{:+.3e} ({}), past the {SWEEP_OBSERVED_CEILING:e} \
+     this sweep is documented to stay under. MAX_MASS_DEVIATION's doc publishes 3.9e-8; if \
+     the real number has moved, the doc must move with it rather than this ceiling",
+    worst_fold.0,
+    worst_fold.1
+  );
+  assert!(
+    worst_row.0 > worst_fold.0 * SWEEP_MODEL_TO_FOLD_RATIO,
+    "the model's own rows ({:.3e}, {}) are no longer orders looser than what the fold \
+     leaves ({:.3e}, {}) — that gap is why MAX_MASS_DEVIATION is not derived from the graph, \
+     and the doc's argument goes with it",
+    worst_row.0,
+    worst_row.1,
+    worst_fold.0,
+    worst_fold.1
+  );
 }

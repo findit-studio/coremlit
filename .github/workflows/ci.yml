@@ -226,7 +226,7 @@ jobs:
   #   lid        0  `clap_tokenizer_identity` would. The same is true of the
   #                 `vad` gates in the modelless `check` job.
   #
-  #                 lid's SIXTEEN `tests/lid/*` gates (5 + 4 + 7) are reached by
+  #                 lid's SEVENTEEN `tests/lid/*` gates (5 + 4 + 8) are reached by
   #                 its own row below. Registering that row was blocked on the
   #                 fp16 sweep, not on the download: staging `Models/lid/` puts
   #                 SpeechBrainECAPAVoxLingua107.mlmodelc under

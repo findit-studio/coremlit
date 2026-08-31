@@ -123,17 +123,44 @@
 //! inherits both without having to remember to, and so does a future edit to
 //! one of these four.
 //!
-//! **Precondition: a window must be evidence.** A row that is `-∞` in every
-//! column says no language is possible. It is not evidence about which language
-//! was spoken, and each pooling would mishandle it in its own way: the
-//! logarithmic pool zeroes the whole clip out; the linear pool skips all of its
-//! terms (that is what keeps `(-∞) − (-∞)` unreachable) while still counting
-//! its duration in the denominator, so every other window comes out diluted;
-//! and [`ScorePooling::Vote`] casts its ballot for whatever column the ranking
-//! tie-break surfaces, handing a share of the clip to a language nothing chose.
-//! [`aggregate_windows`] refuses it with [`Error::ZeroMassWindow`], naming the
-//! window, before any of that. It costs one `exp` per window (`exp` is
-//! monotonic, so a row's total is positive exactly when its maximum's is).
+//! **Precondition: a window must be normalizable.** The fold asks one thing of
+//! every row it is handed — that `DistributionShift` can turn it into a
+//! distribution — and that is exactly that its **maximum is finite**. Two rows
+//! fail it, and neither is one any pooling could have folded:
+//!
+//! - `-∞` in every column says no language is possible. It is not evidence
+//!   about which language was spoken, and each pooling would mishandle it in
+//!   its own way: the logarithmic pool zeroes the whole clip out; the linear
+//!   pool skips all of its terms (that is what keeps `(-∞) − (-∞)` unreachable)
+//!   while still counting its duration in the denominator, so every other
+//!   window comes out diluted; and [`ScorePooling::Vote`] casts its ballot for
+//!   whatever column the ranking tie-break surfaces, handing a share of the
+//!   clip to a language nothing chose.
+//! - `+∞` anywhere is not a log-probability row at all: `exp` over it sums to
+//!   `∞`, and no constant makes that a distribution. It used to be let through
+//!   here and left to the postcondition, which caught it under only two of the
+//!   four poolings ([`Error::NotADistribution`], carrying a mass of `∞`).
+//!   [`ScorePooling::Vote`] returned a clean-looking distribution putting the
+//!   whole clip on whichever column held the `∞`; [`ScorePooling::MeanProbability`]
+//!   returned a row of 107 NaNs, which the postcondition cannot see because
+//!   every comparison against NaN is false; and a LONE `+∞` window took the
+//!   identity path back to the caller verbatim, as a [`LogProbabilities`]
+//!   holding a positive value.
+//!
+//! [`aggregate_windows`] refuses both with [`Error::UnnormalizableWindow`],
+//! naming the window, before any of that. It costs one pass and no `exp`.
+//!
+//! **What the precondition must NOT decide is a row's SCALE.**
+//! `[-800, -801, …, -906]` and `[0, -1, …, -106]` differ by exactly 800 in
+//! every column, so no probability ratio differs between them and they
+//! normalize to the identical distribution. An earlier form of this guard —
+//! `exp(max) > 0.0`, i.e. "the row's total is positive" — refused the first and
+//! folded the second, because `exp` underflows f64 to exactly zero below
+//! −744.44. That was this module's own "a row's own scale is not evidence"
+//! leak, taken out of the fold and left standing in the door in front of it.
+//! `the_door_is_invariant_to_a_rows_own_scale` holds the property now; what
+//! makes it true is that `DistributionShift` forms `(v − max)` before anything
+//! else, which is well-conditioned for any finite maximum.
 //!
 //! **Postcondition: what comes back sums to 1.** Two windows each certain of a
 //! DIFFERENT language, `-∞` everywhere else, both pass the precondition and
@@ -153,11 +180,15 @@
 //! on real audio rather than only in principle: a model row's own mass is off
 //! by up to 7.7e-3 on [`ComputeUnits::CpuOnly`] and 1.5e-4 on the ANE. The
 //! precondition covers that path instead, which is the property a row this
-//! module did not compute can be held to — it has mass, so it ranks.
+//! module did not compute can be held to — it normalizes, so it ranks. A lone
+//! window written at a very low scale is therefore returned verbatim with an
+//! f64 mass of exactly zero, and that is the right answer: it is what
+//! [`Identifier::identify`] returns for the same row.
 //!
 //! Both are unreachable from the model. [`Identifier::log_probabilities`]
-//! rejects a non-finite score, and a log-softmax row's largest entry is at
-//! least `ln(1/107)`, so no window `identify_long` folds can be massless.
+//! rejects a non-finite score, so no window `identify_long` folds can have a
+//! non-finite maximum, and a log-softmax row's largest entry is at least
+//! `ln(1/107)`.
 //!
 //! [`NUM_LANGUAGES`]: crate::audio::lid::NUM_LANGUAGES
 //! [`Span::len`]: crate::audio::lid::Span::len
@@ -312,20 +343,34 @@ impl Accumulator {
   /// sites below.
   ///
   /// # Errors
-  /// [`Error::ZeroMassWindow`], carrying the window's position, if the row
-  /// assigns probability zero to every language — the module docs' "Totality"
-  /// section for why that is refused rather than folded.
+  /// [`Error::UnnormalizableWindow`], carrying the window's position, if the
+  /// row's maximum is not finite — `-∞` throughout, which rules every language
+  /// out, or `+∞` anywhere, which is not a log-probability row at all. The
+  /// module docs' "Totality" section for why those are refused rather than
+  /// folded, and why a row's absolute SCALE is not among the things refused.
   pub(crate) fn push(&mut self, window: &LogProbabilities, weight_samples: usize) -> Result<()> {
     let row = window.as_slice();
     // The fold's precondition, stated once for every pooling rather than in
-    // the one that provokes it. A row with no mass is not evidence about any
-    // language, and each pooling would mishandle it differently: the linear
-    // pool's terms are all skipped (that is what keeps `(-inf) - (-inf)`
-    // unreachable) while its weight still lands in the denominator, so the
-    // pool comes out diluted; a vote would be cast for whatever column the
-    // ranking tie-break surfaces.
-    if !has_probability_mass(row) {
-      return Err(Error::ZeroMassWindow(self.count));
+    // the one that provokes it, and stating exactly what the fold needs: that
+    // the row can be made a distribution, which is that its maximum is finite.
+    // Not that its maximum is LARGE — the normalization below subtracts the
+    // row's own maximum first, so a row written at any finite scale folds to
+    // the same thing, and a guard that refused low ones would be the module's
+    // own "a row's own scale is not evidence" defect wearing a different hat.
+    //
+    // What the two refused rows would have done: an all-`-inf` row is not
+    // evidence about any language, and each pooling mishandles it differently
+    // (the linear pool's terms are all skipped — that is what keeps
+    // `(-inf) - (-inf)` unreachable — while its weight still lands in the
+    // denominator, so the pool comes out diluted; a vote would be cast for
+    // whatever column the ranking tie-break surfaces). A row holding `+inf`
+    // is not a log-probability row at all, and the exit could not be trusted
+    // to catch it: `MeanProbability` turned one into 107 NaNs, which the mass
+    // postcondition waves through because every comparison against NaN is
+    // false, and a LONE `+inf` window took the identity path straight back to
+    // the caller.
+    if !has_a_finite_maximum(row) {
+      return Err(Error::UnnormalizableWindow(self.count));
     }
     let weight = weight_samples as f64;
     if self.count == 0 {
@@ -435,7 +480,10 @@ impl Accumulator {
       // the ANE (measured; see the module docs' "Totality" section), so the
       // long path would start refusing clips the short path answers. What the
       // row IS held to is `push`'s precondition, which is the only property a
-      // row this code did not compute can be held to: it has mass, so it ranks.
+      // row this code did not compute can be held to: it normalizes, so it
+      // ranks. A row written low enough that its f64 mass underflows to zero
+      // comes back through here unchanged, and that is the answer `identify`
+      // gives for the same row.
       return Ok(LogProbabilities::new(first));
     }
     match pooling {
@@ -459,11 +507,13 @@ impl Accumulator {
       // the value it is added to, so there is no rewrite that expresses the
       // sum near zero: the answer genuinely IS of magnitude `s`. What makes
       // it benign is that absorption needs `|s|` above about 1e16, where the
-      // constant falls under the f64 ULP — and `push` has already refused any
-      // window whose whole row sits that low, so a column reaching it is
-      // 1e16 nats below a row maximum that is at worst `ln(1/107)`. Its
-      // probability is exactly zero either way, and no f64 could hold the
-      // difference the constant would have made.
+      // constant falls under the f64 ULP — and `s` is a NORMALIZED value, one
+      // `push` already took each row's own maximum off, so it is at most 0 and
+      // its magnitude measures how far below its row's maximum the column sat,
+      // not how far from zero the row was written. A column reaching 1e16 is
+      // therefore 1e16 nats below its own row's maximum. Its probability is
+      // exactly zero either way, and no f64 could hold the difference the
+      // constant would have made.
       //
       // Then renormalize, exactly as `Max` does. A mixture of distributions
       // IS a distribution, and `push` folds nothing else, so the shift is
@@ -554,6 +604,17 @@ impl DistributionShift {
   /// [`Accumulator::finish`]'s postcondition at the exit, which cover every
   /// pooling between them; doing it here as well would only give the shift a
   /// second place to disagree with them.
+  ///
+  /// **Which end still reaches this branch, since the precondition became
+  /// "the maximum is finite".** [`as_distribution`], the ENTRANCE, no longer
+  /// can: `push` has already refused every row it would fire on. [`renormalize`],
+  /// the EXIT, still does and is why the branch stays —
+  /// [`ScorePooling::MeanLogProbability`] over windows with disjoint supports
+  /// folds to `-∞` in every column, and this branch is what makes that a clean
+  /// [`Error::ZeroMassAggregate`] instead of a row of NaN
+  /// (`a_zero_mass_logarithmic_pool_is_refused_rather_than_returned` walks the
+  /// whole path; `renormalize_does_not_turn_an_impossible_row_into_nan` pins
+  /// the branch on its own).
   fn of(values: impl Iterator<Item = f64> + Clone) -> Self {
     let max = values.clone().fold(f64::NEG_INFINITY, f64::max);
     if !max.is_finite() {
@@ -611,17 +672,33 @@ fn as_distribution(row: &[f32]) -> Vec<f64> {
   row.iter().map(|&v| shift.apply(f64::from(v))).collect()
 }
 
-/// Whether `row` carries any probability mass — whether `exp` over it sums to
-/// something greater than zero.
+/// Whether `row` has a finite maximum — the fold's precondition, and the exact
+/// condition under which [`DistributionShift`] can make the row a distribution.
 ///
-/// One `exp` wide, and exact: `exp` is monotonic, so the row's total is
-/// positive exactly when its LARGEST entry exponentiates to a positive number.
-/// `-∞` in every column is the case this exists for; a row of finite but
-/// enormous negatives (an f32 column may hold −3.4e38) is the same degenerate
-/// answer and the same test rejects it.
-fn has_probability_mass(row: &[f32]) -> bool {
-  let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-  f64::from(max).exp() > 0.0
+/// The two rows it refuses are the two [`DistributionShift::of`] has no shift
+/// for: `-∞` in every column, and `+∞` anywhere. `aggregate`'s module docs
+/// ("Totality") carry what each of them would have done to each pooling.
+///
+/// **It deliberately says nothing about a row's absolute SCALE**, and an
+/// earlier form of it did. The guard used to be `exp(max) > 0.0`, which is
+/// "the row's total is positive" — and `exp` underflows f64 to exactly zero
+/// below `ln(f64::MIN_POSITIVE)` ≈ −744.44, so `[-800, -801, …, -906]` was
+/// refused while `[0, -1, …, -106]` was folded. Those two rows carry the
+/// identical evidence: every column sits the same distance below its own row's
+/// maximum, and both normalize to the identical distribution. Refusing one of
+/// them was the module's "a row's own scale is not evidence" leak still
+/// standing in the door after it had been taken out of the fold.
+///
+/// The old test was defensible while nothing could normalize a row of enormous
+/// negatives, and that stopped being true when [`DistributionShift`] gained one
+/// anchored definition: it forms `(v − max)` before anything else, which is
+/// well-conditioned for ANY finite maximum however far from zero it sits.
+fn has_a_finite_maximum(row: &[f32]) -> bool {
+  row
+    .iter()
+    .copied()
+    .fold(f32::NEG_INFINITY, f32::max)
+    .is_finite()
 }
 
 /// How far a FOLDED row's probability mass may sit from 1 before
@@ -643,6 +720,11 @@ fn has_probability_mass(row: &[f32]) -> bool {
 ///   any fold produced was **3.9e-8** (`Max`, on the ANE). It was 5.7e-8 while
 ///   the fold still took raw rows; normalizing each row before folding it
 ///   removed the input deficit the exit shift had been absorbing.
+///
+/// That sweep is a committed model gate rather than a remembered run:
+/// `every_fold_in_the_published_sweep_lands_far_inside_the_mass_tolerance`, in
+/// `tests/lid/long_clip.rs`, runs all 192 folds and prints the per-compute-unit
+/// table, so both numbers above are re-derivable from this tree.
 ///
 /// `1e-5` is 36× the derived bound and 258× the largest observed, and still
 /// four orders of magnitude below either defect this postcondition was written
@@ -694,9 +776,12 @@ fn argmax(row: &[f32]) -> usize {
 /// `identify_long` — a clip long enough to reach the model always plans at
 /// least one span.)
 ///
-/// [`Error::ZeroMassWindow`], naming the window, if one of them assigns
-/// probability zero to every language: such a row is not evidence about any of
-/// them, and every pooling refuses it alike.
+/// [`Error::UnnormalizableWindow`], naming the window, if one of them has a
+/// maximum that is not finite — `-∞` throughout (which is not evidence about
+/// any language) or `+∞` anywhere (which is not a log-probability row). Every
+/// pooling refuses those alike. A row's absolute SCALE is not among the things
+/// refused: a row whose largest value is `-800` folds exactly as one shifted up
+/// to `0` does.
 ///
 /// [`Error::ZeroMassAggregate`] if the pooled row assigns probability zero to
 /// every language, which is not a distribution and cannot be ranked — see the

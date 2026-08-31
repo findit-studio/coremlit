@@ -155,7 +155,7 @@ local/dev gates against an owner-staged `CED_TEST_MODELS` tree.
 mel front end, the roster/asset agreement checks, every typed-error path)
 under the `lid` row and both all-on rows, and the `lid` `model-tests` shard
 stages the 41 MB bundle and runs `lid_model_io` (5 gates), `lid_e2e` (4 gates)
-and `lid_long_clip` (7 gates). There is no `@lib` half — every lid model gate
+and `lid_long_clip` (8 gates). There is no `@lib` half — every lid model gate
 is a `tests/lid/*` target, so `--features lid --lib -- --list --ignored` lists
 zero, and a group that selected it would trip the runner's anti-vacuum guard.
 
