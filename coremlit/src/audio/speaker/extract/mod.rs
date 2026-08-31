@@ -45,6 +45,28 @@
 //! (`owned.rs:631`, `algo.rs:207-208`); `count` is `[t]` u8 whose length
 //! IS `num_output_frames` (`owned.rs:663-674`).
 //!
+//! # The split pipeline's three doors
+//!
+//! [`Extractor::extract`] is the FUSED path: one call, both models, a whole
+//! clip. A caller that instead runs `segmentation → embed → cluster` as three
+//! autonomous nodes ([`ExtractionParts`]' doc, issue #110) drives the same
+//! stages through three public doors, and each one is a face of this module's
+//! own implementation rather than a second copy of it:
+//!
+//! | node | door |
+//! |---|---|
+//! | segmentation | [`crate::audio::speaker::segment::SegmentModel::infer`] + [`crate::audio::speaker::segment::multilabel`], on the chunk grid [`crate::audio::speaker::window::chunk_starts`] schedules |
+//! | embed | [`Extractor::extract_chunk_embeddings`] — stage 4 and stage 5 for ONE chunk |
+//! | cluster | [`crate::audio::speaker::window::count_from_segmentations`] then [`Extraction::try_from_parts`], at the track's end |
+//!
+//! The embed door is per-CHUNK because that is the granularity at which the
+//! stage decides anything, and because it lets `extract`'s loop and the split
+//! node call ONE function (`embed_chunk_slots`) instead of two implementations
+//! of the masking policy this crate parity-gates against dia (issue #127).
+//! Publishing `derive_slot_plans` instead would have handed the caller the
+//! decision and kept the loop — the drop paths, the placeholder-mask batching,
+//! the zeroing order — as something they had to rebuild correctly.
+//!
 //! **Count runs after all zeroing.** dia computes `count` from the
 //! `segmentations` buffer only after Stage 2 has finished zeroing every
 //! dropped `(chunk, slot)` column (`owned.rs:663-673` reads the
@@ -1160,65 +1182,19 @@ impl Extractor {
       let slab = crate::audio::speaker::segment::multilabel(&logits, num_frames);
       segmentations[chunk_segmentation_range(c, num_frames)].copy_from_slice(&slab);
 
-      // e. Per-slot embedding plans from the overlap-exclusion rule
-      // (owned.rs:507-591).
-      let plans = derive_slot_plans(
-        &segmentations[chunk_segmentation_range(c, num_frames)],
+      // e-g. Mask derivation, the batched embed call, and both drop paths —
+      // through `embed_chunk_slots`, THE one implementation of the embed
+      // stage, which `Self::extract_chunk_embeddings` also runs so the split
+      // pipeline cannot drift from this loop (issue #127).
+      embed_chunk_slots(
+        embed,
+        plda,
+        &padded,
+        &mut segmentations[chunk_segmentation_range(c, num_frames)],
+        &mut raw_embeddings[chunk_embedding_range(c)],
         num_frames,
         onset,
-      );
-
-      // f. Zero every Skip slot's segmentation column (owned.rs:561-571).
-      for (s, plan) in plans.iter().enumerate() {
-        if matches!(plan, SlotPlan::Skip) {
-          zero_slot_column(
-            &mut segmentations[chunk_segmentation_range(c, num_frames)],
-            num_frames,
-            s,
-          );
-        }
-      }
-
-      // g. One batched embed call if any slot is planned; Skip slots
-      // borrow the first planned slot's mask as a non-degenerate
-      // placeholder and their output rows are discarded (module doc).
-      let placeholder = plans.iter().find_map(|p| match p {
-        SlotPlan::Embed(mask) => Some(mask.as_slice()),
-        SlotPlan::Skip => None,
-      });
-      if let Some(placeholder) = placeholder {
-        let masks: [&[bool]; EMBED_SLOTS] = core::array::from_fn(|s| match &plans[s] {
-          SlotPlan::Embed(mask) => mask.as_slice(),
-          SlotPlan::Skip => placeholder,
-        });
-        let rows = embed.embed_chunk(&padded, &masks)?;
-        for s in 0..SEG_NUM_SLOTS {
-          if matches!(plans[s], SlotPlan::Skip) {
-            continue;
-          }
-          // dia's per-slot norm pre-check (owned.rs:619-630), through the ONE
-          // predicate every site shares (`raw_embedding_reaches_plda`, which
-          // calls the backends rather than restating their thresholds). Its
-          // finiteness clause cannot fire here — `embed_chunk` hard-scans its
-          // own output — so what this call site exercises is the norm band
-          // (too small for PLDA below, past `f32`'s range for the online
-          // engine's narrowing above) and PLDA's centered-norm ball, which no
-          // real WeSpeaker row lands in: `diaric` calibrated its `0.1` at ~13x
-          // below the smallest centered norm across its captured distribution
-          // (`diarization/src/plda/transform.rs:273-315`). A collapsed embedder
-          // that DID land there is better dropped one slot at a time here than
-          // left to fail the caller's WHOLE offline extraction later.
-          if !raw_embedding_reaches_plda(plda, &rows[s]) {
-            zero_slot_column(
-              &mut segmentations[chunk_segmentation_range(c, num_frames)],
-              num_frames,
-              s,
-            );
-          } else {
-            raw_embeddings[embedding_range(c, s)].copy_from_slice(&rows[s]); // owned.rs:631-632
-          }
-        }
-      }
+      )?;
     }
 
     // ── 9-11. Count tensor + timing over the post-zeroing buffer ──────
@@ -1238,6 +1214,164 @@ impl Extractor {
       frames_sw,
     )
   }
+
+  /// Runs the EMBED stage over ONE chunk — for a caller that owns the chunk
+  /// loop itself.
+  ///
+  /// This is the open end of the `segmentation → embed → cluster` split
+  /// [`ExtractionParts`] describes (issue #127). The CLUSTER end is
+  /// [`Extraction::try_from_parts`]; the SEGMENTATION end is
+  /// [`crate::audio::speaker::segment::SegmentModel::infer`] +
+  /// [`crate::audio::speaker::segment::multilabel`] + the [`crate::audio::speaker::window`]
+  /// module; this is the middle one, and it exists so a standalone embed node
+  /// does not have to re-derive pyannote's `embedding_exclude_overlap` masking
+  /// by hand. It runs steps (e)-(g) of [`Self::extract`]'s fused loop through
+  /// the SAME private function that loop calls, so the two paths cannot
+  /// disagree about a policy this crate parity-gates against dia.
+  ///
+  /// # What goes in
+  ///
+  /// - `embed` — the embedding model. NO [`crate::audio::speaker::segment::SegmentModel`]:
+  ///   the point of the split is that the embed node never loads or re-runs a
+  ///   segmenter, so this method takes the segmentation the caller already has.
+  /// - `samples` — that chunk's audio window, EXACTLY [`SEG_CHUNK_SAMPLES`]
+  ///   long: the identical buffer the caller handed
+  ///   [`crate::audio::speaker::segment::SegmentModel::infer`], whose own
+  ///   input-length contract is the same one and whose
+  ///   [`crate::audio::speaker::error::InferError::InputLength`] this reuses.
+  ///   A SHORTER slice is refused rather than padded here, because the padding
+  ///   would be the wrong one: [`Self::extract`] zero-pads a final partial chunk
+  ///   (dia's `owned.rs:469-475`) while
+  ///   [`crate::audio::speaker::embed::EmbedModel::embed_chunk`] REPEAT-pads
+  ///   whatever it is given, so accepting a short slice here would silently
+  ///   embed different audio than the fused path does. The caller zero-pads its
+  ///   own tail chunk — which it has already done, to call the segmenter.
+  /// - `chunk_segmentations` — that chunk's `[f][s]` multilabel slab,
+  ///   `embed.num_mask_frames() * SEG_NUM_SLOTS` values (a ONE-chunk
+  ///   [`ExtractionParts::segmentations`]), MUTATED IN PLACE. Deriving the frame
+  ///   count from the embedder rather than taking it as an argument is this
+  ///   door's form of [`Self::extract`]'s check 5: with no segmenter present
+  ///   there is no second declared frame count to compare, so the slab that
+  ///   disagrees with the embedder's mask width is the one refused.
+  ///
+  /// Only [`Options::window`]'s `onset` is read — the compute and source
+  /// options select models and a segmentation backend, neither of which this
+  /// method touches. Configure the extractor exactly as for [`Self::extract`]
+  /// and the two agree by construction.
+  ///
+  /// # What comes out
+  ///
+  /// The chunk's `[s][d]` raw-embedding block, `SEG_NUM_SLOTS * EMBEDDING_DIM`
+  /// f32 — append it to the accumulating [`ExtractionParts::raw_embeddings`] —
+  /// and, through `chunk_segmentations`, the POST-ZEROING slab to append to
+  /// [`ExtractionParts::segmentations`]. Both drop paths are already applied:
+  /// a slot with no active frame and a slot whose row cannot reach the
+  /// clustering both leave an all-zero embedding row over an all-zero
+  /// segmentation column, which is the pairing
+  /// [`Extraction::try_from_parts`]' check 10 requires. Derive `count` from the
+  /// accumulated (post-zeroing) `segmentations` with
+  /// [`crate::audio::speaker::window::count_from_segmentations`], exactly as
+  /// [`Self::extract`] does after ITS loop — never per chunk.
+  ///
+  /// # Errors
+  /// - [`ExtractError::OnsetOutOfRange`] if the configured `onset` is not
+  ///   finite in `(0.0, 1.0]` — [`Self::extract`]'s guard 4, for the same
+  ///   serde-bypass reason, and raised before any inference.
+  /// - [`ExtractError::Infer`] carrying
+  ///   [`crate::audio::speaker::error::InferError::InputLength`] if
+  ///   `samples.len() != SEG_CHUNK_SAMPLES`; or carrying whatever
+  ///   [`crate::audio::speaker::embed::EmbedModel::embed_chunk`] raises
+  ///   (`owned.rs:600`).
+  /// - [`ExtractError::ExtractionLenMismatch`] naming
+  ///   [`crate::audio::speaker::error::ExtractionPart::Segmentations`] if
+  ///   `chunk_segmentations.len()` is not `embed.num_mask_frames() *
+  ///   SEG_NUM_SLOTS`.
+  /// - [`ExtractError::PldaTransformUnavailable`] if the shared transform the
+  ///   per-row drop path validates against cannot be built — resolved BEFORE
+  ///   the embedding call, as in [`Self::extract`].
+  ///
+  /// # Examples
+  /// ```no_run
+  /// # use coremlit::audio::speaker::{
+  /// #   embed::{EMBEDDING_DIM, EmbedModel},
+  /// #   extract::Extractor,
+  /// #   segment::{SEG_CHUNK_SAMPLES, SEG_NUM_SLOTS, SegmentModel, multilabel},
+  /// # };
+  /// # fn one_chunk(
+  /// #   seg: &SegmentModel,
+  /// #   embed: &EmbedModel,
+  /// #   padded: &[f32],
+  /// # ) -> Result<(), Box<dyn std::error::Error>> {
+  /// let extractor = Extractor::new();
+  /// assert_eq!(padded.len(), SEG_CHUNK_SAMPLES);
+  ///
+  /// // The segmentation node's work; the embed node receives its output.
+  /// let logits = seg.infer(padded)?;
+  /// let mut slab = multilabel(&logits, seg.num_frames());
+  ///
+  /// // The embed node's work: no segmenter in sight, no masking policy here.
+  /// let rows = extractor.extract_chunk_embeddings(embed, padded, &mut slab)?;
+  /// assert_eq!(rows.len(), SEG_NUM_SLOTS * EMBEDDING_DIM);
+  ///
+  /// // `rows` and the now-zeroed `slab` are this chunk's contribution to the
+  /// // cluster node's `ExtractionParts`.
+  /// # Ok(())
+  /// # }
+  /// ```
+  pub fn extract_chunk_embeddings(
+    &self,
+    embed: &EmbedModel,
+    samples: &[f32],
+    chunk_segmentations: &mut [f64],
+  ) -> Result<Vec<f32>, ExtractError> {
+    use crate::audio::speaker::error::{
+      ExtractionLenMismatch, ExtractionPart, InferError, InputLength,
+    };
+
+    let w = self.options.window();
+    if !crate::audio::speaker::window::check_onset(w.onset()) {
+      return Err(ExtractError::OnsetOutOfRange(w.onset()));
+    }
+    if samples.len() != SEG_CHUNK_SAMPLES {
+      return Err(ExtractError::Infer(InferError::InputLength(
+        InputLength::new(samples.len(), SEG_CHUNK_SAMPLES),
+      )));
+    }
+
+    let num_frames = embed.num_mask_frames();
+    // `saturating_mul` rather than `*`: `num_frames` is a shape the loaded
+    // model declares, so this cannot overflow from any real embedder — and a
+    // saturated `usize::MAX` matches no slab a caller can allocate, which
+    // refuses rather than panicking on a value that only a broken model could
+    // produce.
+    let expected = num_frames.saturating_mul(SEG_NUM_SLOTS);
+    if chunk_segmentations.len() != expected {
+      return Err(ExtractError::ExtractionLenMismatch(
+        ExtractionLenMismatch::new(
+          ExtractionPart::Segmentations,
+          chunk_segmentations.len(),
+          expected,
+        ),
+      ));
+    }
+
+    // Resolved before the embedding call for the reason `extract` resolves it
+    // before its loop: an unavailable transform must refuse the call rather
+    // than surface after the model has already run.
+    let plda = shared_plda_transform()?;
+
+    let mut chunk_embeddings = vec![0.0f32; SEG_NUM_SLOTS * EMBEDDING_DIM];
+    embed_chunk_slots(
+      embed,
+      plda,
+      samples,
+      chunk_segmentations,
+      &mut chunk_embeddings,
+      num_frames,
+      f64::from(w.onset()),
+    )?;
+    Ok(chunk_embeddings)
+  }
 }
 
 /// The seven values an [`Extraction`] is assembled from — the exact input set
@@ -1252,6 +1386,15 @@ impl Extractor {
 /// [`Extraction::diarize_with`] / [`Extraction::diarize_online`] every in-process
 /// caller does. `Extraction` stays the single carrier: no parallel free
 /// `cluster()` function to keep in step with it.
+///
+/// The upstream half of that road is public too, and none of it re-implements
+/// anything: the segmentation node runs
+/// [`crate::audio::speaker::segment::SegmentModel::infer`] +
+/// [`crate::audio::speaker::segment::multilabel`] on
+/// [`crate::audio::speaker::window::chunk_starts`]' grid, and the embed node runs
+/// [`Extractor::extract_chunk_embeddings`] per chunk, appending its answer to
+/// `raw_embeddings` and its (post-zeroing) slab to `segmentations` — see the
+/// module doc's "The split pipeline's three doors".
 ///
 /// # Not parameters
 /// - `num_speakers` is the fixed [`SEG_NUM_SLOTS`] (3) — the powerset
@@ -3441,6 +3584,27 @@ fn embedding_range(c: usize, s: usize) -> core::ops::Range<usize> {
   base..base + EMBEDDING_DIM
 }
 
+/// The flat `raw_embeddings` sub-block for chunk `c` — ALL [`SEG_NUM_SLOTS`]
+/// rows at once: `c * S * D .. (c + 1) * S * D`. The chunk-granular face of
+/// [`embedding_range`], and the unit [`embed_chunk_slots`] writes, because the
+/// chunk is the granularity at which the embed stage decides anything.
+///
+/// `chunk_embedding_range(c).start + slot_embedding_range(s).start ==
+/// embedding_range(c, s).start`, pinned by
+/// `chunk_and_slot_embedding_ranges_compose_to_embedding_range`.
+fn chunk_embedding_range(c: usize) -> core::ops::Range<usize> {
+  let stride = SEG_NUM_SLOTS * EMBEDDING_DIM;
+  c * stride..(c + 1) * stride
+}
+
+/// Slot `s`'s row WITHIN one chunk's [`chunk_embedding_range`] block: `s * D ..
+/// (s + 1) * D`. The chunk-relative half of [`embedding_range`]'s absolute
+/// offset.
+fn slot_embedding_range(s: usize) -> core::ops::Range<usize> {
+  let base = s * EMBEDDING_DIM;
+  base..base + EMBEDDING_DIM
+}
+
 /// Copies the chunk window starting at sample `start` into `padded`,
 /// zero-clearing first and leaving any out-of-range tail zero. Exact shape
 /// of dia's per-chunk build (`owned.rs:469-475`), including the `.min`
@@ -3550,6 +3714,100 @@ fn derive_slot_plans(
     plans[s] = SlotPlan::Embed(used_mask);
   }
   plans
+}
+
+/// Steps (e)-(g) of [`Extractor::extract`]'s fused per-chunk loop — the EMBED
+/// stage for ONE chunk — and THE single implementation of it.
+///
+/// Two callers, one body: [`Extractor::extract`] runs this once per chunk over
+/// sub-slices of its own two tensors, and [`Extractor::extract_chunk_embeddings`]
+/// runs it once over a caller's chunk. Neither restates the overlap-exclusion
+/// policy, the drop paths, or the placeholder-mask batching, so the fused path
+/// and the split (`segmentation → embed → cluster`) path cannot drift. That
+/// property is the whole reason the split's embed end is a per-chunk DOOR rather
+/// than a published [`derive_slot_plans`] a caller would have to loop correctly
+/// itself.
+///
+/// - `padded` is the chunk's audio window, exactly [`SEG_CHUNK_SAMPLES`] long.
+/// - `chunk_segs` is the chunk's `[f][s]` slab, `num_frames * SEG_NUM_SLOTS`
+///   long, MUTATED in place: every dropped slot's column is zeroed, by both the
+///   Skip drop (step f, `owned.rs:561-571`) and the PLDA-norm drop (step g,
+///   `owned.rs:619-630`).
+/// - `chunk_embeddings` is the chunk's `[s][d]` block, `SEG_NUM_SLOTS *
+///   EMBEDDING_DIM` long. Only a SURVIVING slot's row is written, so the caller
+///   hands a ZEROED block — dia's pre-zeroed, never-written rows
+///   (`owned.rs:502-505`) are what a dropped slot must leave behind, and
+///   [`Extraction::try_from_parts`]' check 10 reads exactly that.
+/// - `plda` is [`shared_plda_transform`]'s value, hoisted out of the caller's
+///   loop; `onset` is the already-validated threshold.
+///
+/// # Errors
+/// [`ExtractError::Infer`] if the embedding call fails (`owned.rs:600`).
+///
+/// # Panics
+/// Panics if `chunk_segs.len() != num_frames * SEG_NUM_SLOTS`
+/// ([`derive_slot_plans`]' own contract) or if `chunk_embeddings` is shorter
+/// than `SEG_NUM_SLOTS * EMBEDDING_DIM`. Both callers derive the two lengths
+/// from the same `num_frames` before calling — `extract` from the frame count
+/// its check 5 already agreed between the two models, the public door from a
+/// length check against the embedder's own.
+fn embed_chunk_slots(
+  embed: &EmbedModel,
+  plda: &diaric::plda::PldaTransform,
+  padded: &[f32],
+  chunk_segs: &mut [f64],
+  chunk_embeddings: &mut [f32],
+  num_frames: usize,
+  onset: f64,
+) -> Result<(), ExtractError> {
+  // e. Per-slot embedding plans from the overlap-exclusion rule
+  // (owned.rs:507-591).
+  let plans = derive_slot_plans(chunk_segs, num_frames, onset);
+
+  // f. Zero every Skip slot's segmentation column (owned.rs:561-571).
+  for (s, plan) in plans.iter().enumerate() {
+    if matches!(plan, SlotPlan::Skip) {
+      zero_slot_column(chunk_segs, num_frames, s);
+    }
+  }
+
+  // g. One batched embed call if any slot is planned; Skip slots borrow the
+  // first planned slot's mask as a non-degenerate placeholder and their output
+  // rows are discarded (module doc).
+  let placeholder = plans.iter().find_map(|p| match p {
+    SlotPlan::Embed(mask) => Some(mask.as_slice()),
+    SlotPlan::Skip => None,
+  });
+  if let Some(placeholder) = placeholder {
+    let masks: [&[bool]; EMBED_SLOTS] = core::array::from_fn(|s| match &plans[s] {
+      SlotPlan::Embed(mask) => mask.as_slice(),
+      SlotPlan::Skip => placeholder,
+    });
+    let rows = embed.embed_chunk(padded, &masks)?;
+    for s in 0..SEG_NUM_SLOTS {
+      if matches!(plans[s], SlotPlan::Skip) {
+        continue;
+      }
+      // dia's per-slot norm pre-check (owned.rs:619-630), through the ONE
+      // predicate every site shares (`raw_embedding_reaches_plda`, which
+      // calls the backends rather than restating their thresholds). Its
+      // finiteness clause cannot fire here — `embed_chunk` hard-scans its
+      // own output — so what this call site exercises is the norm band
+      // (too small for PLDA below, past `f32`'s range for the online
+      // engine's narrowing above) and PLDA's centered-norm ball, which no
+      // real WeSpeaker row lands in: `diaric` calibrated its `0.1` at ~13x
+      // below the smallest centered norm across its captured distribution
+      // (`diarization/src/plda/transform.rs:273-315`). A collapsed embedder
+      // that DID land there is better dropped one slot at a time here than
+      // left to fail the caller's WHOLE offline extraction later.
+      if !raw_embedding_reaches_plda(plda, &rows[s]) {
+        zero_slot_column(chunk_segs, num_frames, s);
+      } else {
+        chunk_embeddings[slot_embedding_range(s)].copy_from_slice(&rows[s]); // owned.rs:631-632
+      }
+    }
+  }
+  Ok(())
 }
 
 #[cfg(test)]

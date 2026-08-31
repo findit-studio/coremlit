@@ -21,6 +21,30 @@ fn embedding_range_hand_values() {
   assert_eq!(embedding_range(1, 2), 1280..1536);
 }
 
+#[test]
+fn chunk_and_slot_embedding_ranges_compose_to_embedding_range() {
+  // `extract` addresses a row absolutely (`embedding_range`) while
+  // `embed_chunk_slots` writes a chunk-relative row inside the block
+  // `chunk_embedding_range` hands it. The two must name the same bytes, or the
+  // fused path and the per-chunk door would disagree about WHERE a slot's
+  // embedding lives while agreeing about its value.
+  for c in 0..4 {
+    let block = chunk_embedding_range(c);
+    assert_eq!(block.len(), SEG_NUM_SLOTS * EMBEDDING_DIM);
+    for s in 0..SEG_NUM_SLOTS {
+      let slot = slot_embedding_range(s);
+      assert_eq!(slot.len(), EMBEDDING_DIM);
+      assert_eq!(
+        block.start + slot.start..block.start + slot.end,
+        embedding_range(c, s),
+        "chunk {c} slot {s}"
+      );
+    }
+    // The blocks tile `raw_embeddings` with no gap and no overlap.
+    assert_eq!(block.end, chunk_embedding_range(c + 1).start);
+  }
+}
+
 // =====================================================================
 // Hermetic: fill_padded_chunk (owned.rs:469-475 exact shape)
 // =====================================================================
@@ -1448,6 +1472,223 @@ fn extract_ted30_invariants() {
     }
   }
 }
+
+/// The one private helper the split pipeline's caller writes for itself
+/// (`fill_padded_chunk`, `owned.rs:469-475` — issue #127 calls it minor and it
+/// is). Written out here rather than called, so this test exercises the road an
+/// OUT-OF-CRATE embed node actually walks: nothing below this line reaches a
+/// `pub(crate)` item that the door was supposed to make unnecessary.
+fn caller_padded_chunk(samples: &[f32], start: usize) -> Vec<f32> {
+  let mut padded = vec![0.0f32; SEG_CHUNK_SAMPLES];
+  let end = (start + SEG_CHUNK_SAMPLES).min(samples.len());
+  let lo = start.min(samples.len());
+  padded[..end - lo].copy_from_slice(&samples[lo..end]);
+  padded
+}
+
+/// Reports the first index at which two f32 slices differ in their BITS, so a
+/// failure names one number instead of dumping 16 128 of them.
+fn first_bit_divergence_f32(a: &[f32], b: &[f32]) -> Option<usize> {
+  a.iter()
+    .zip(b.iter())
+    .position(|(x, y)| x.to_bits() != y.to_bits())
+}
+
+/// Same, for the `f64` segmentation tensor.
+fn first_bit_divergence_f64(a: &[f64], b: &[f64]) -> Option<usize> {
+  a.iter()
+    .zip(b.iter())
+    .position(|(x, y)| x.to_bits() != y.to_bits())
+}
+
+/// THE equivalence gate for the per-chunk embed door (issue #127): driving the
+/// `segmentation → embed → cluster` split over 30 s of `ted_60` through the
+/// PUBLIC doors reassembles the byte-identical `Extraction` that the fused
+/// [`Extractor::extract`] produces from the same audio.
+///
+/// This is what makes the door a door rather than a second implementation. The
+/// split road below never touches `derive_slot_plans`, `SlotPlan`,
+/// `zero_slot_column` or `raw_embedding_reaches_plda` — the four items the
+/// issue names as walled — and it still lands on the same tensors, because
+/// `extract_chunk_embeddings` and `extract`'s own loop run the same
+/// `embed_chunk_slots`.
+///
+/// Equality is checked in BITS, not with `==`: `-0.0 == 0.0` and a shared
+/// rounding of two different computations would both pass a numeric compare,
+/// and neither would be the claim being made.
+#[test]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
+fn extract_chunk_embeddings_reassembles_extract_byte_for_byte() {
+  use crate::audio::speaker::window::{
+    chunk_sliding_window, chunk_starts, count_from_segmentations, frame_sliding_window,
+  };
+
+  let seg = load_seg_model();
+  let embed = load_embed_model();
+  let all = load_ted_60();
+  let samples = &all[..480_000]; // first 30 s — the clip `extract_ted30_invariants` uses
+
+  let extractor = Extractor::new();
+  let fused = extractor
+    .extract(&seg, &embed, samples)
+    .expect("the fused path extracts 30 s of ted_60");
+
+  // ── The split road ────────────────────────────────────────────────
+  // Node 1 (segmentation) and node 2 (embed) interleaved in one loop only
+  // because one test process holds both; each iteration uses exactly the
+  // public surface each node would.
+  let w = extractor.options_ref().window();
+  let num_frames = embed.num_mask_frames();
+  let starts = chunk_starts(samples.len(), &w);
+  let mut raw_embeddings: Vec<f32> = Vec::new();
+  let mut segmentations: Vec<f64> = Vec::new();
+  for &start in &starts {
+    let padded = caller_padded_chunk(samples, start);
+
+    // Node 1: segmentation. No embedder is loaded on this side of the edge.
+    let logits = seg.infer(&padded).expect("segment a chunk");
+    let mut slab = crate::audio::speaker::segment::multilabel(&logits, num_frames);
+
+    // Node 2: embed. No SEGMENTER is loaded on this side of the edge — the
+    // whole point of the split — and no masking policy is written here.
+    let rows = extractor
+      .extract_chunk_embeddings(&embed, &padded, &mut slab)
+      .expect("the embed door runs a chunk");
+    assert_eq!(rows.len(), SEG_NUM_SLOTS * EMBEDDING_DIM);
+    assert_eq!(slab.len(), num_frames * SEG_NUM_SLOTS);
+
+    raw_embeddings.extend_from_slice(&rows);
+    segmentations.extend_from_slice(&slab);
+  }
+
+  // Node 3 (cluster), at the track's End: derive `count` over the ACCUMULATED
+  // post-zeroing segmentations — never per chunk — and rebuild.
+  let chunks_sw = chunk_sliding_window(&w);
+  let frames_sw = frame_sliding_window();
+  let count = count_from_segmentations(
+    &segmentations,
+    starts.len(),
+    num_frames,
+    SEG_NUM_SLOTS,
+    w.onset(),
+    chunks_sw,
+    frames_sw,
+  );
+  let split = Extraction::try_from_parts(ExtractionParts {
+    raw_embeddings,
+    segmentations,
+    count,
+    num_chunks: starts.len(),
+    num_frames_per_chunk: num_frames,
+    chunks_sw,
+    frames_sw,
+  })
+  .expect("the split road's parts pass every try_from_parts check");
+
+  // ── The claim ─────────────────────────────────────────────────────
+  assert_eq!(split.num_chunks(), fused.num_chunks());
+  assert_eq!(split.num_frames_per_chunk(), fused.num_frames_per_chunk());
+  assert_eq!(split.num_speakers(), fused.num_speakers());
+  assert_eq!(split.num_output_frames(), fused.num_output_frames());
+  assert_eq!(split.chunks_sw(), fused.chunks_sw());
+  assert_eq!(split.frames_sw(), fused.frames_sw());
+  assert_eq!(split.count(), fused.count(), "count tensors differ");
+
+  assert_eq!(
+    split.raw_embeddings().len(),
+    fused.raw_embeddings().len(),
+    "raw_embeddings lengths differ"
+  );
+  assert_eq!(
+    first_bit_divergence_f32(split.raw_embeddings(), fused.raw_embeddings()),
+    None,
+    "raw_embeddings diverge at the reported index (split vs fused)"
+  );
+  assert_eq!(
+    split.segmentations().len(),
+    fused.segmentations().len(),
+    "segmentations lengths differ"
+  );
+  assert_eq!(
+    first_bit_divergence_f64(split.segmentations(), fused.segmentations()),
+    None,
+    "segmentations diverge at the reported index (split vs fused)"
+  );
+
+  // The door is being compared against a NON-trivial extraction: an all-zero
+  // pair would satisfy every assertion above.
+  assert!(
+    fused.raw_embeddings().iter().any(|v| *v != 0.0),
+    "the fused reference must carry real embeddings for this to prove anything"
+  );
+  assert!(
+    fused.segmentations().iter().any(|v| *v != 0.0),
+    "the fused reference must carry real activity for this to prove anything"
+  );
+
+  // And the whole carriers, once the two tensors above are known equal.
+  assert_eq!(split, fused);
+}
+
+/// The door refuses a chunk that is not exactly [`SEG_CHUNK_SAMPLES`] — with
+/// the SAME error the segmenter raises for the same slice, because it is the
+/// same contract. Accepting a short slice would be silent divergence, not
+/// leniency: `EmbedModel::embed_chunk` repeat-pads while `extract` zero-pads.
+#[test]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
+fn extract_chunk_embeddings_refuses_a_chunk_that_is_not_the_window_length() {
+  use crate::audio::speaker::error::{InferError, InputLength};
+
+  let embed = load_embed_model();
+  let num_frames = embed.num_mask_frames();
+  let mut slab = vec![0.0f64; num_frames * SEG_NUM_SLOTS];
+
+  for got in [0usize, SEG_CHUNK_SAMPLES - 1, SEG_CHUNK_SAMPLES + 1] {
+    assert_eq!(
+      Extractor::new().extract_chunk_embeddings(&embed, &vec![0.0f32; got], &mut slab),
+      Err(ExtractError::Infer(InferError::InputLength(
+        InputLength::new(got, SEG_CHUNK_SAMPLES)
+      ))),
+      "a {got}-sample chunk must be refused"
+    );
+  }
+}
+
+/// The door's form of `extract`'s check 5: with no segmenter present, the slab
+/// that disagrees with the embedder's own mask width is the one refused —
+/// naming the tensor and both lengths, as `try_from_parts` does for the whole
+/// one.
+#[test]
+#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
+fn extract_chunk_embeddings_refuses_a_slab_the_embedder_disagrees_with() {
+  use crate::audio::speaker::error::{ExtractionLenMismatch, ExtractionPart};
+
+  let embed = load_embed_model();
+  let expected = embed.num_mask_frames() * SEG_NUM_SLOTS;
+  let padded = vec![0.0f32; SEG_CHUNK_SAMPLES];
+
+  for got in [0usize, expected - 1, expected + 1] {
+    let mut slab = vec![0.0f64; got];
+    assert_eq!(
+      Extractor::new().extract_chunk_embeddings(&embed, &padded, &mut slab),
+      Err(ExtractError::ExtractionLenMismatch(
+        ExtractionLenMismatch::new(ExtractionPart::Segmentations, got, expected)
+      )),
+      "a {got}-value slab must be refused against the embedder's {expected}"
+    );
+  }
+}
+
+// The door's `OnsetOutOfRange` guard has no test, and deliberately not: it is
+// the same defense-in-depth `extract`'s guard 4 is, and there is no longer a
+// route that constructs the witness. `WindowOptions`' builders assert the
+// `(0.0, 1.0]` range and its `Deserialize` routes through `WindowOptionsRepr`,
+// which REFUSES an out-of-range `onset` before an `Options` exists — so the
+// serde-bypass premise the three `extract_serde_bypassed_*` tests below rest on
+// no longer holds either. Those three fail today, on `main`, unrelated to this
+// change; CI's speaker shard runs `--features speaker` (no `serde`) and so has
+// never executed them. Reported rather than repaired here — deciding what those
+// tests should become is not this door's call.
 
 #[test]
 #[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
