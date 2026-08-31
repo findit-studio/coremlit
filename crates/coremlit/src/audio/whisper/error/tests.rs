@@ -4,19 +4,13 @@ use super::*;
 fn transcribe_error_composes_via_from() {
   let e: TranscribeError = AudioError::EmptyInput.into();
   assert!(matches!(e, TranscribeError::Audio(AudioError::EmptyInput)));
-  let e: TranscribeError = ModelError::InvalidState {
-    expected: "loaded",
-    actual: "unloaded",
-  }
-  .into();
+  let e: TranscribeError = ModelError::InvalidState(InvalidState::new("loaded", "unloaded")).into();
   assert!(e.to_string().contains("loaded"));
 }
 
 #[test]
 fn tokenizer_missing_token_displays_name() {
-  let e = TokenizerError::MissingToken {
-    token: "<|endoftext|>",
-  };
+  let e = TokenizerError::MissingToken("<|endoftext|>");
   assert_eq!(
     e.to_string(),
     "tokenizer vocabulary is missing required token `<|endoftext|>`"
@@ -32,10 +26,7 @@ fn coreml_errors_wrap_typed() {
 
 #[test]
 fn transcribe_error_composes_tokenizer_and_decode_arms() {
-  let e: TranscribeError = TokenizerError::MissingToken {
-    token: "<|endoftext|>",
-  }
-  .into();
+  let e: TranscribeError = TokenizerError::MissingToken("<|endoftext|>").into();
   assert!(matches!(e, TranscribeError::Tokenizer(_)));
   let e: TranscribeError = DecodeError::MissingAlignment.into();
   assert!(matches!(e, TranscribeError::Decode(_)));
@@ -43,19 +34,13 @@ fn transcribe_error_composes_tokenizer_and_decode_arms() {
 
 #[test]
 fn decode_error_composes_tokenizer_arm() {
-  let e: DecodeError = TokenizerError::MissingToken {
-    token: "<|endoftext|>",
-  }
-  .into();
+  let e: DecodeError = TokenizerError::MissingToken("<|endoftext|>").into();
   assert!(matches!(e, DecodeError::Tokenizer(_)));
 }
 
 #[test]
 fn segment_error_composes_tokenizer_arm() {
-  let e: SegmentError = TokenizerError::MissingToken {
-    token: "<|endoftext|>",
-  }
-  .into();
+  let e: SegmentError = TokenizerError::MissingToken("<|endoftext|>").into();
   assert!(matches!(e, SegmentError::Tokenizer(_)));
 }
 
@@ -81,11 +66,9 @@ fn alignment_pitch_errors_name_the_shape_and_the_explicit_way_out() {
     "the tensor failure must survive as the source"
   );
 
-  let unexpected = SegmentError::AlignmentPitchUnexpectedLayout {
-    rows: 30,
-    cols: 1500,
-    strides: vec![1504, 2],
-  };
+  let unexpected = SegmentError::AlignmentPitchUnexpectedLayout(
+    AlignmentPitchUnexpectedLayout::new(30, 1500, vec![1504, 2]),
+  );
   let text = unexpected.to_string();
   assert!(text.contains("[1504, 2]"), "{text}");
   assert!(text.contains("AlignmentGather::Complete"), "{text}");
@@ -98,12 +81,8 @@ fn alignment_pitch_errors_name_the_shape_and_the_explicit_way_out() {
 
 #[test]
 fn transcribe_error_composes_segment_arm() {
-  let e: TranscribeError = SegmentError::InvalidAlignmentShape {
-    rows: 4,
-    cols: 8,
-    len: 16,
-  }
-  .into();
+  let e: TranscribeError =
+    SegmentError::InvalidAlignmentShape(InvalidAlignmentShape::new(4, 8, 16)).into();
   assert!(matches!(e, TranscribeError::Segment(_)));
   assert!(e.to_string().contains("16"));
 }

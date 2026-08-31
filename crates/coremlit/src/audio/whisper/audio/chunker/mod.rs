@@ -7,7 +7,7 @@
 use crate::audio::whisper::{
   audio::vad::VoiceActivityDetector,
   constants::SAMPLE_RATE,
-  error::AudioError,
+  error::{AudioError, InvalidClipRange},
   result::{TranscriptionResult, TranscriptionSegment},
 };
 
@@ -88,10 +88,9 @@ pub fn prepare_seek_clips(
   content_frames: usize,
 ) -> Result<Vec<(usize, usize)>, AudioError> {
   if let Some(&bad) = clip_timestamps.iter().find(|t| !t.is_finite() || **t < 0.0) {
-    return Err(AudioError::InvalidClipRange {
-      start: bad,
-      end: bad,
-    });
+    return Err(AudioError::InvalidClipRange(InvalidClipRange::new(
+      bad, bad,
+    )));
   }
   let mut seek_points: Vec<usize> = clip_timestamps
     .iter()

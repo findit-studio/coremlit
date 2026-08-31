@@ -18,7 +18,7 @@ use std::{
 };
 
 use crate::audio::whisper::{
-  error::ModelError,
+  error::{InvalidState, ModelError},
   model::{LocalModelLoader, ModelLoader, ModelState, StateCallback},
   options::ComputeOptions,
 };
@@ -232,10 +232,10 @@ impl ModelManager {
       // ModelManager.swift:132-134 — already prewarmed: skip silently.
       ModelState::Prewarmed => return Ok(()),
       ModelState::Loaded => {
-        return Err(ModelError::InvalidState {
-          expected: "unloaded (local models prewarm before loading)",
-          actual: self.state.as_str(),
-        });
+        return Err(ModelError::InvalidState(InvalidState::new(
+          "unloaded (local models prewarm before loading)",
+          self.state.as_str(),
+        )));
       }
       _ => {}
     }

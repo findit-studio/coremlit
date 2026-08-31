@@ -5,25 +5,51 @@
 
 use std::path::PathBuf;
 
+/// The model was used from a lifecycle state that does not support the
+/// requested operation.
+///
+/// Payload of [`ModelError::InvalidState`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InvalidState {
+  /// State the operation required.
+  expected: &'static str,
+  /// State the model was actually in.
+  actual: &'static str,
+}
+
+impl InvalidState {
+  /// Construct from the state the operation required and the state the
+  /// model was actually in.
+  #[inline(always)]
+  pub const fn new(expected: &'static str, actual: &'static str) -> Self {
+    Self { expected, actual }
+  }
+
+  /// State the operation required.
+  #[inline(always)]
+  pub const fn expected(&self) -> &'static str {
+    self.expected
+  }
+
+  /// State the model was actually in.
+  #[inline(always)]
+  pub const fn actual(&self) -> &'static str {
+    self.actual
+  }
+}
+
 /// Failure locating, loading, or using a CoreML-backed Whisper model.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum ModelError {
-  /// None of the searched paths contained the model.
-  #[error("model not found (searched {searched:?})")]
-  NotFound {
-    /// Paths that were checked.
-    searched: Vec<PathBuf>,
-  },
+  /// None of the searched paths contained the model. Carries the paths
+  /// that were checked.
+  #[error("model not found (searched {0:?})")]
+  NotFound(Vec<PathBuf>),
   /// The model was used from a lifecycle state that does not support the
   /// requested operation.
-  #[error("model is in state `{actual}`, expected `{expected}`")]
-  InvalidState {
-    /// State the operation required.
-    expected: &'static str,
-    /// State the model was actually in.
-    actual: &'static str,
-  },
+  #[error("model is in state `{}`, expected `{}`", .0.actual(), .0.expected())]
+  InvalidState(InvalidState),
   /// The CoreML runtime failed to load the compiled model.
   #[error("failed to load model: {0}")]
   Load(#[from] crate::LoadError),
@@ -43,22 +69,79 @@ pub enum ModelError {
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum TokenizerError {
-  /// None of the searched paths contained a tokenizer file.
-  #[error("tokenizer file not found (searched {searched:?})")]
-  FileNotFound {
-    /// Paths that were checked.
-    searched: Vec<PathBuf>,
-  },
+  /// None of the searched paths contained a tokenizer file. Carries the
+  /// paths that were checked.
+  #[error("tokenizer file not found (searched {0:?})")]
+  FileNotFound(Vec<PathBuf>),
   /// The `tokenizers` crate failed to load or run the tokenizer.
   #[error("tokenizer backend failed: {0}")]
   Backend(#[from] tokenizers::Error),
   /// A token required by the pipeline is absent from the tokenizer's
-  /// vocabulary.
-  #[error("tokenizer vocabulary is missing required token `{token}`")]
-  MissingToken {
-    /// The missing token's text.
-    token: &'static str,
-  },
+  /// vocabulary. Carries the missing token's text.
+  #[error("tokenizer vocabulary is missing required token `{0}`")]
+  MissingToken(&'static str),
+}
+
+/// The audio window exceeds the model's maximum supported length.
+///
+/// Payload of [`AudioError::WindowTooLarge`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct WindowTooLarge {
+  /// Samples provided.
+  got: usize,
+  /// Maximum samples supported.
+  max: usize,
+}
+
+impl WindowTooLarge {
+  /// Construct from the samples provided and the maximum supported.
+  #[inline(always)]
+  pub const fn new(got: usize, max: usize) -> Self {
+    Self { got, max }
+  }
+
+  /// Samples provided.
+  #[inline(always)]
+  pub const fn got(&self) -> usize {
+    self.got
+  }
+
+  /// Maximum samples supported.
+  #[inline(always)]
+  pub const fn max(&self) -> usize {
+    self.max
+  }
+}
+
+/// A clip's timestamp range is invalid (inverted or out of bounds).
+///
+/// Payload of [`AudioError::InvalidClipRange`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct InvalidClipRange {
+  /// Clip start time, in seconds.
+  start: f32,
+  /// Clip end time, in seconds.
+  end: f32,
+}
+
+impl InvalidClipRange {
+  /// Construct from the clip's start and end times, in seconds.
+  #[inline(always)]
+  pub const fn new(start: f32, end: f32) -> Self {
+    Self { start, end }
+  }
+
+  /// Clip start time, in seconds.
+  #[inline(always)]
+  pub const fn start(&self) -> f32 {
+    self.start
+  }
+
+  /// Clip end time, in seconds.
+  #[inline(always)]
+  pub const fn end(&self) -> f32 {
+    self.end
+  }
 }
 
 /// Failure preparing or validating audio input.
@@ -66,24 +149,46 @@ pub enum TokenizerError {
 #[non_exhaustive]
 pub enum AudioError {
   /// The audio window exceeds the model's maximum supported length.
-  #[error("audio window of {got} samples exceeds the maximum of {max}")]
-  WindowTooLarge {
-    /// Samples provided.
-    got: usize,
-    /// Maximum samples supported.
-    max: usize,
-  },
+  #[error("audio window of {} samples exceeds the maximum of {}", .0.got(), .0.max())]
+  WindowTooLarge(WindowTooLarge),
   /// No audio samples were provided.
   #[error("audio input is empty")]
   EmptyInput,
   /// A clip's timestamp range is invalid (inverted or out of bounds).
-  #[error("invalid clip range: start {start}, end {end}")]
-  InvalidClipRange {
-    /// Clip start time, in seconds.
-    start: f32,
-    /// Clip end time, in seconds.
-    end: f32,
-  },
+  #[error("invalid clip range: start {}, end {}", .0.start(), .0.end())]
+  InvalidClipRange(InvalidClipRange),
+}
+
+/// The decoder's logits tensor has an unexpected shape.
+///
+/// Payload of [`DecodeError::LogitsShape`].
+#[derive(Debug)]
+pub struct LogitsShape {
+  /// Elements the decode step expected.
+  expected: usize,
+  /// Elements the logits tensor actually had.
+  actual: usize,
+}
+
+impl LogitsShape {
+  /// Construct from the element count the decode step expected and the
+  /// count the logits tensor actually had.
+  #[inline(always)]
+  pub const fn new(expected: usize, actual: usize) -> Self {
+    Self { expected, actual }
+  }
+
+  /// Elements the decode step expected.
+  #[inline(always)]
+  pub const fn expected(&self) -> usize {
+    self.expected
+  }
+
+  /// Elements the logits tensor actually had.
+  #[inline(always)]
+  pub const fn actual(&self) -> usize {
+    self.actual
+  }
 }
 
 /// Failure running or interpreting a decoder step.
@@ -102,13 +207,8 @@ pub enum DecodeError {
   #[error("decoder tensor failed: {0}")]
   Tensor(#[from] crate::TensorError),
   /// The decoder's logits tensor has an unexpected shape.
-  #[error("logits shape mismatch: expected {expected}, got {actual}")]
-  LogitsShape {
-    /// Elements the decode step expected.
-    expected: usize,
-    /// Elements the logits tensor actually had.
-    actual: usize,
-  },
+  #[error("logits shape mismatch: expected {}, got {}", .0.expected(), .0.actual())]
+  LogitsShape(LogitsShape),
   /// Cross-attention alignment data required for word timestamps is
   /// missing.
   #[error("decoder output is missing cross-attention alignment data")]
@@ -123,6 +223,102 @@ pub enum DecodeError {
   Tokenizer(#[from] TokenizerError),
 }
 
+/// A word-alignment matrix did not have the expected 2D shape, or its
+/// flattened element count did not match `rows * cols`.
+///
+/// Payload of [`SegmentError::InvalidAlignmentShape`].
+#[derive(Debug)]
+pub struct InvalidAlignmentShape {
+  /// Expected row count (text tokens).
+  rows: usize,
+  /// Expected column count (audio tokens).
+  cols: usize,
+  /// Actual flattened element count.
+  len: usize,
+}
+
+// `len` is the flattened element count that FAILED to match `rows * cols`,
+// not a container length, so an `is_empty` companion would be meaningless.
+#[allow(clippy::len_without_is_empty)]
+impl InvalidAlignmentShape {
+  /// Construct from the expected row and column counts and the actual
+  /// flattened element count.
+  #[inline(always)]
+  pub const fn new(rows: usize, cols: usize, len: usize) -> Self {
+    Self { rows, cols, len }
+  }
+
+  /// Expected row count (text tokens).
+  #[inline(always)]
+  pub const fn rows(&self) -> usize {
+    self.rows
+  }
+
+  /// Expected column count (audio tokens).
+  #[inline(always)]
+  pub const fn cols(&self) -> usize {
+    self.cols
+  }
+
+  /// Actual flattened element count.
+  #[inline(always)]
+  pub const fn len(&self) -> usize {
+    self.len
+  }
+}
+
+/// The probe allocation behind
+/// [`AlignmentGather::SwiftParity`](crate::audio::whisper::options::AlignmentGather::SwiftParity)
+/// succeeded but reported a layout the gather's model cannot describe —
+/// anything other than `[pitch, 1]` element strides with `pitch >= cols`,
+/// i.e. rows padded only *between* each other.
+///
+/// Fail-closed for the same reason as
+/// [`SegmentError::AlignmentPitchUnavailable`]: an unmodellable layout means
+/// the truncation Swift's gather performs is unknown, not absent.
+///
+/// Payload of [`SegmentError::AlignmentPitchUnexpectedLayout`].
+#[derive(Debug)]
+pub struct AlignmentPitchUnexpectedLayout {
+  /// Rows the gather allocated (gathered tokens).
+  rows: usize,
+  /// Columns the gather allocated (audio tokens).
+  cols: usize,
+  /// The element strides the probe allocation actually reported.
+  strides: Vec<usize>,
+}
+
+impl AlignmentPitchUnexpectedLayout {
+  /// Construct from the rows and columns the gather allocated and the
+  /// element strides the probe allocation actually reported.
+  #[inline(always)]
+  pub const fn new(rows: usize, cols: usize, strides: Vec<usize>) -> Self {
+    Self {
+      rows,
+      cols,
+      strides,
+    }
+  }
+
+  /// Rows the gather allocated (gathered tokens).
+  #[inline(always)]
+  pub const fn rows(&self) -> usize {
+    self.rows
+  }
+
+  /// Columns the gather allocated (audio tokens).
+  #[inline(always)]
+  pub const fn cols(&self) -> usize {
+    self.cols
+  }
+
+  /// The element strides the probe allocation actually reported.
+  #[inline(always)]
+  pub fn strides(&self) -> &[usize] {
+    &self.strides
+  }
+}
+
 /// Failure seeking to the next decode window or slicing a window's decode
 /// result into segments.
 ///
@@ -135,15 +331,13 @@ pub enum DecodeError {
 pub enum SegmentError {
   /// A word-alignment matrix did not have the expected 2D shape, or its
   /// flattened element count did not match `rows * cols`.
-  #[error("invalid alignment matrix shape: {rows} rows x {cols} cols, but data has {len} elements")]
-  InvalidAlignmentShape {
-    /// Expected row count (text tokens).
-    rows: usize,
-    /// Expected column count (audio tokens).
-    cols: usize,
-    /// Actual flattened element count.
-    len: usize,
-  },
+  #[error(
+    "invalid alignment matrix shape: {} rows x {} cols, but data has {} elements",
+    .0.rows(),
+    .0.cols(),
+    .0.len()
+  )]
+  InvalidAlignmentShape(InvalidAlignmentShape),
   /// This host's CoreVideo row pitch for the Float16 surface Swift's
   /// alignment gather allocates could not be measured, so
   /// [`AlignmentGather::SwiftParity`](crate::audio::whisper::options::AlignmentGather::SwiftParity)
@@ -183,18 +377,14 @@ pub enum SegmentError {
   /// an unmodellable layout means the truncation Swift's gather performs is
   /// unknown, not absent.
   #[error(
-    "this host's CoreVideo Float16 surface for the {rows} x {cols} alignment gather reports \
-     element strides {strides:?}, which is not the row-padded row-major layout the Swift-parity \
-     gather models (select `AlignmentGather::Complete` to gather every row in full instead)"
+    "this host's CoreVideo Float16 surface for the {} x {} alignment gather reports \
+     element strides {:?}, which is not the row-padded row-major layout the Swift-parity \
+     gather models (select `AlignmentGather::Complete` to gather every row in full instead)",
+    .0.rows(),
+    .0.cols(),
+    .0.strides()
   )]
-  AlignmentPitchUnexpectedLayout {
-    /// Rows the gather allocated (gathered tokens).
-    rows: usize,
-    /// Columns the gather allocated (audio tokens).
-    cols: usize,
-    /// The element strides the probe allocation actually reported.
-    strides: Vec<usize>,
-  },
+  AlignmentPitchUnexpectedLayout(AlignmentPitchUnexpectedLayout),
   /// Decoding a slice's tokens back to text failed.
   #[error("tokenizer decode failed: {0}")]
   Tokenizer(#[from] TokenizerError),

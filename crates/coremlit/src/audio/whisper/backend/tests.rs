@@ -35,17 +35,11 @@ fn alignment_matrix_round_trips_a_view() {
 
 #[test]
 fn backend_error_displays_structured() {
-  let e = BackendError::MissingFeature {
-    model: "decoder",
-    name: "logits",
-  };
+  let e = BackendError::MissingFeature(MissingFeature::new("decoder", "logits"));
   assert_eq!(
     e.to_string(),
     "decoder model output is missing feature `logits`"
   );
-  let e = BackendError::AudioLength {
-    got: 100,
-    expected: 480_000,
-  };
+  let e = BackendError::AudioLength(AudioLength::new(100, 480_000));
   assert!(e.to_string().contains("480000"));
 }

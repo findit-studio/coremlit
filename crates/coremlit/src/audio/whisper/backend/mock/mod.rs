@@ -329,10 +329,10 @@ impl InferenceBackend for MockBackend {
       *attempted
     };
     if self.fail_calls.contains(&call) {
-      return Err(BackendError::ScriptedFailure { call });
+      return Err(BackendError::ScriptedFailure(call));
     }
     let Some(scripted) = self.script.get(state.step) else {
-      return Err(BackendError::ScriptExhausted { step: state.step });
+      return Err(BackendError::ScriptExhausted(state.step));
     };
 
     state.consumed.push((token, position));

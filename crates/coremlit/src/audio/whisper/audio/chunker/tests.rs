@@ -30,11 +30,11 @@ fn seek_clips_reject_negative_and_non_finite_timestamps() {
   // clips instead. Loud rejection is the documented divergence.
   assert!(matches!(
     prepare_seek_clips(&[-0.5, 1.0], 100_000),
-    Err(AudioError::InvalidClipRange { .. })
+    Err(AudioError::InvalidClipRange(_))
   ));
   assert!(matches!(
     prepare_seek_clips(&[f32::NAN], 100_000),
-    Err(AudioError::InvalidClipRange { .. })
+    Err(AudioError::InvalidClipRange(_))
   ));
 }
 

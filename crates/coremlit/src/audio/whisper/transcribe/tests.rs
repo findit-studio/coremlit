@@ -1807,7 +1807,8 @@ fn silence_skipped_window_with_word_timestamps_surfaces_a_segment_error() {
   assert!(
     matches!(
       err,
-      TranscribeError::Segment(SegmentError::InvalidAlignmentShape { rows: 0, .. })
+      TranscribeError::Segment(SegmentError::InvalidAlignmentShape(ref shape))
+        if shape.rows() == 0
     ),
     "got: {err:?}"
   );

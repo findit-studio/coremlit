@@ -92,7 +92,7 @@ fn from_folder_missing_file_reports_searched_path() {
   let folder = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src");
   let err = WhisperTokenizer::from_folder(&folder).unwrap_err();
   match err {
-    TokenizerError::FileNotFound { searched } => {
+    TokenizerError::FileNotFound(searched) => {
       assert_eq!(searched, vec![folder.join("tokenizer.json")]);
     }
     other => panic!("expected FileNotFound, got {other:?}"),

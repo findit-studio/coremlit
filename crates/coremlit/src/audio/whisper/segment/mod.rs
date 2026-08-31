@@ -37,7 +37,7 @@ use crate::{
   audio::whisper::{
     backend::{AlignmentMatrix, AlignmentView},
     constants::{SAMPLE_RATE, SECONDS_PER_TIME_TOKEN},
-    error::SegmentError,
+    error::{AlignmentPitchUnexpectedLayout, InvalidAlignmentShape, SegmentError},
     options::{AlignmentGather, DecodingOptions, WordGrouping},
     result::{DecodingResult, TranscriptionSegment, WordTiming},
     tokenizer::WhisperTokenizer,
@@ -340,11 +340,9 @@ fn min_cost_and_trace(diagonal: f64, up: f64, left: f64, value: f64) -> (f64, i8
 pub fn dynamic_time_warping(matrix: &AlignmentView<'_>) -> Result<DtwPath, SegmentError> {
   let (rows, cols) = (matrix.rows(), matrix.cols());
   if rows == 0 || cols == 0 {
-    return Err(SegmentError::InvalidAlignmentShape {
-      rows,
-      cols,
-      len: matrix.data().len(),
-    });
+    return Err(SegmentError::InvalidAlignmentShape(
+      InvalidAlignmentShape::new(rows, cols, matrix.data().len()),
+    ));
   }
 
   let width = cols + 1;
@@ -1024,11 +1022,9 @@ fn row_pitch_of(probe: &MultiArray, rows: usize, cols: usize) -> Result<usize, S
   let strides = probe.strides();
   match *strides {
     [pitch, 1] if pitch >= cols => Ok(pitch),
-    _ => Err(SegmentError::AlignmentPitchUnexpectedLayout {
-      rows,
-      cols,
-      strides: strides.to_vec(),
-    }),
+    _ => Err(SegmentError::AlignmentPitchUnexpectedLayout(
+      AlignmentPitchUnexpectedLayout::new(rows, cols, strides.to_vec()),
+    )),
   }
 }
 
@@ -1349,11 +1345,9 @@ pub fn add_word_timestamps(
   // panics even over an empty buffer, and `dynamic_time_warping`'s own
   // zero-shape rejection sits after this construction — too late.
   if cols == 0 {
-    return Err(SegmentError::InvalidAlignmentShape {
-      rows: alignment.rows(),
-      cols,
-      len: alignment.data().len(),
-    });
+    return Err(SegmentError::InvalidAlignmentShape(
+      InvalidAlignmentShape::new(alignment.rows(), cols, alignment.data().len()),
+    ));
   }
   let mut data = vec![0.0f32; needed * cols];
 
