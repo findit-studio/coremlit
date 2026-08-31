@@ -64,7 +64,7 @@ siglip = ["dep:tokenizers", "dep:pixon", "dep:sha2"]
 
 ced = ["dep:rustfft", "dep:soundevents-dataset", "dep:windit"]
 
-lid = ["dep:rustfft"]
+lid = ["dep:rustfft", "dep:windit"]
 
 [dependencies]
 objc2.workspace = true
@@ -106,7 +106,7 @@ rustfft = { workspace = true, optional = true }
 # workspace table for the feature pins).
 soundevents-dataset = { workspace = true, optional = true }
 
-# --- embeddings shared windowing engine (the `clap` + `granite` features) ---
+# --- shared windowing engine (the `clap`, `granite` + `lid` features) ---
 windit = { version = "0.3", optional = true }
 
 # --- embeddings::granite runtime tokenizer-identity digest (the `granite` feature) ---
@@ -438,6 +438,11 @@ required-features = ["lid"]
 [[test]]
 name = "lid_e2e"
 path = "tests/lid/e2e.rs"
+required-features = ["lid"]
+
+[[test]]
+name = "lid_long_clip"
+path = "tests/lid/long_clip.rs"
 required-features = ["lid"]
 
 [[bench]]

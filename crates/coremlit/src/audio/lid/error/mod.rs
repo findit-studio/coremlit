@@ -8,16 +8,65 @@
 //!
 //! [`Error`] deliberately carries **unit and newtype variants only**. A
 //! multi-field payload lives in its own named, documented, accessor-bearing
-//! struct ([`ContractMismatch`], [`OutputShape`], [`FrameCountOutOfRange`])
-//! that the variant then wraps. Struct-shaped enum variants are the shape this
-//! crate is moving away from (the older doors still use them; that sweep is
-//! tracked separately), and this door adds none. The practical gain is that a
+//! struct ([`ContractMismatch`], [`OutputShape`], [`FrameCountOutOfRange`],
+//! [`InvalidLogProbability`], [`NotADistribution`]) that the variant then
+//! wraps. Struct-shaped enum variants are the shape this crate is moving away
+//! from (the older doors still use them; that sweep is tracked separately), and
+//! this door adds none. The practical gain is that a
 //! payload is constructible, matchable, and `Display`-able on its own —
 //! [`FrameCountOutOfRange`] in particular is the guard callers reach for most,
 //! and it answers "how much audio may I pass?" without a live error in hand.
 
+use super::ScorePooling;
+
 /// Convenience alias for `Result<T, `[`Error`]`>`.
 pub type Result<T> = core::result::Result<T, Error>;
+
+/// The windowed-sequence engine's own error, re-exported because
+/// [`Error::Windowing`] carries it (`audio::ced`'s convention).
+pub use windit::WinditError;
+
+/// A value is not a natural-log probability: it is NaN, or it is greater than
+/// zero.
+///
+/// Carried by both variants that report that fact — [`Error::InvalidLogProbability`]
+/// for a value a CALLER offered [`LogProbabilities::try_from_slice`], and
+/// [`Error::PositiveOutput`] for one the GRAPH emitted — because the two doors
+/// apply one shared predicate and differ only in whose row is at fault.
+///
+/// `-∞` is deliberately ACCEPTED by that predicate — it is the exact log of a
+/// zero probability, which [`ScorePooling::Vote`] genuinely produces for a
+/// language no window chose. Only NaN (which would sort silently under
+/// `total_cmp`) and positive values (which no log-softmax output can take) are
+/// rejected. The model door additionally refuses `-∞`, and reports that as
+/// [`Error::NonFiniteOutput`] rather than through this payload.
+///
+/// [`LogProbabilities::try_from_slice`]: super::LogProbabilities::try_from_slice
+/// [`ScorePooling::Vote`]: super::ScorePooling::Vote
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[error("log-probability at index {index} is {value}, which is not a value <= 0")]
+pub struct InvalidLogProbability {
+  index: usize,
+  value: f32,
+}
+
+impl InvalidLogProbability {
+  pub(crate) const fn new(index: usize, value: f32) -> Self {
+    Self { index, value }
+  }
+
+  /// Position of the offending value in the supplied row.
+  #[inline]
+  pub const fn index(&self) -> usize {
+    self.index
+  }
+
+  /// The offending value itself.
+  #[inline]
+  pub const fn value(&self) -> f32 {
+    self.value
+  }
+}
 
 /// A loaded model's input or output feature does not match the shape/dtype
 /// contract this module was built against (the pinned ground truth lives in
@@ -196,6 +245,57 @@ impl FrameCountOutOfRange {
   }
 }
 
+/// Aggregation produced a row whose probabilities do not sum to 1, carrying the
+/// [`ScorePooling`] that produced it and the mass it actually left.
+///
+/// Every pooling normalizes the row it folds, so this is a defect report rather
+/// than a description of any input: it is the fold's postcondition catching an
+/// arithmetic slip in the crate. The two it was written for are recorded in
+/// `aggregate`'s tests — a normalizer that loses its constant to rounding
+/// against a huge shift (mass 2), and a mixture that counts a window in its
+/// denominator but not in its numerator (mass 0.5).
+///
+/// [`Error::ZeroMassAggregate`] is the one deviation that is NOT a defect — a
+/// logarithmic pool over windows with disjoint supports honestly leaves nothing
+/// — so it keeps its own variant and its own explanation.
+///
+/// [`Self::mass`] is whatever the fold left, NaN included: a pooling that
+/// produced something other than arithmetic is reported here rather than given
+/// a variant of its own, because the mass IS the diagnosis and `Display`
+/// renders it as `sum to NaN, not 1`. The fold's postcondition is written as
+/// the predicate that accepts so that a NaN reaches this variant at all — every
+/// ordered comparison against one is false, so a `> tolerance` guard would wave
+/// it through.
+///
+/// [`ScorePooling`]: super::ScorePooling
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[error(
+  "{pooling:?} pooling produced a row whose probabilities sum to {mass}, not 1, \
+   so it is not a distribution"
+)]
+pub struct NotADistribution {
+  pooling: ScorePooling,
+  mass: f64,
+}
+
+impl NotADistribution {
+  pub(crate) const fn new(pooling: ScorePooling, mass: f64) -> Self {
+    Self { pooling, mass }
+  }
+
+  /// The pooling whose fold produced the row.
+  #[inline]
+  pub const fn pooling(&self) -> ScorePooling {
+    self.pooling
+  }
+
+  /// Total probability mass the row actually carries — `exp` summed over it.
+  #[inline]
+  pub const fn mass(&self) -> f64 {
+    self.mass
+  }
+}
+
 /// Any failure loading the language identifier, running inference, or
 /// constructing scores.
 #[derive(Debug, thiserror::Error)]
@@ -235,8 +335,153 @@ pub enum Error {
   /// A model output log-probability was NaN or infinite, carrying its language
   /// index — model corruption, caught before it can reach the ranking heap
   /// (where `total_cmp` would silently sort a NaN) or `exp`.
+  ///
+  /// Its sibling [`Self::PositiveOutput`] carries the other half of the same
+  /// door. The two split ONE refusal by cause, not by rule: admission is
+  /// decided by a single predicate, and only the diagnosis branches.
   #[error("model output contains a non-finite log-probability at index {0}")]
   NonFiniteOutput(usize),
+
+  /// A model output score was finite and ABOVE zero, so it is not a
+  /// natural-log probability at all — carrying its model column and the value.
+  ///
+  /// This is the half a finiteness-only guard let through, and it is not
+  /// hypothetical. `tests/fp16_guards.rs` records it measured on this very
+  /// graph: a `x - logsumexp(x)` re-conversion overflows fp16 inside the reduce
+  /// and the tail comes back as RAW LOGITS, maximum +22.86. Every value in it
+  /// is finite, so nothing upstack noticed; ranking still ordered them
+  /// correctly, and [`LanguageScore::probability`] then reported `exp(22.86)`
+  /// as a confidence. An impossible number is worse than a refusal, so the door
+  /// refuses.
+  ///
+  /// The boundary is `> 0`, not `>= 0`, and that is measured rather than
+  /// assumed: this graph does emit exactly `0.0` on
+  /// [`ComputeUnits::CpuOnly`] — see
+  /// [`LogProbabilities::try_from_slice`]'s predicate for the count and the
+  /// sweep that produced it — so a door written to "a log-softmax output is
+  /// strictly negative" would refuse real audio.
+  ///
+  /// [`LanguageScore::probability`]: super::LanguageScore::probability
+  /// [`LogProbabilities::try_from_slice`]: super::LogProbabilities::try_from_slice
+  /// [`ComputeUnits::CpuOnly`]: crate::ComputeUnits::CpuOnly
+  #[error("model emitted a positive score: {0}")]
+  PositiveOutput(InvalidLogProbability),
+
+  /// The windowing plan for a long clip could not be built — it exceeded
+  /// [`WindowPlan::max_windows`] ([`WinditError::TooManyWindows`], `got`
+  /// carrying the FULL planned count) or a span buffer could not be allocated
+  /// ([`WinditError::AllocFailed`]).
+  ///
+  /// [`WinditError`] is `#[non_exhaustive]`, so match it with a wildcard arm.
+  ///
+  /// [`WindowPlan::max_windows`]: super::WindowPlan::max_windows
+  #[error("windowing failed: {0}")]
+  Windowing(#[from] WinditError),
+
+  /// Aggregation was asked to fold an empty window list. Unreachable through
+  /// [`Identifier::identify_long`] — a clip long enough to reach the model
+  /// always plans at least one span — so this only reaches a caller who called
+  /// [`aggregate_windows`] with an empty slice.
+  ///
+  /// [`Identifier::identify_long`]: super::Identifier::identify_long
+  /// [`aggregate_windows`]: super::aggregate_windows
+  #[error("cannot aggregate an empty window list")]
+  EmptyWindows,
+
+  /// Pooling produced a row that assigns probability zero to EVERY language,
+  /// carrying the [`ScorePooling`] that produced it.
+  ///
+  /// Not an arithmetic slip. The logarithmic pool is a geometric mean, so a
+  /// language ANY window scored at `-∞` is zero in the pool; windows certain of
+  /// different languages therefore zero out every language between them, and
+  /// the pool's honest answer is that nothing is possible. It is refused rather
+  /// than returned because a row whose exponentials sum to zero is not a
+  /// distribution: ranking it reports arbitrary languages at probability zero.
+  ///
+  /// Unreachable through [`Identifier::identify_long`] — a model row is
+  /// all-finite, so no `-∞` enters the fold — and reachable through
+  /// [`aggregate_windows`] only from hand-built rows, `-∞` being a value
+  /// [`LogProbabilities::try_from_slice`] deliberately accepts. Each of those
+  /// rows must still have been normalizable on its own: a window that ruled
+  /// every language out is [`Error::UnnormalizableWindow`], refused before the
+  /// fold.
+  ///
+  /// [`Identifier::identify_long`]: super::Identifier::identify_long
+  /// [`aggregate_windows`]: super::aggregate_windows
+  /// [`LogProbabilities::try_from_slice`]: super::LogProbabilities::try_from_slice
+  #[error(
+    "{0:?} pooling left no probability mass: every language pooled to probability \
+     zero, so the result is not a distribution and its ranking would be arbitrary"
+  )]
+  ZeroMassAggregate(ScorePooling),
+
+  /// A window offered to the fold has a maximum that is not FINITE, so no
+  /// shift makes it a distribution and no pooling can fold it. Carries the
+  /// window's position in the pushed sequence (its index in the slice
+  /// [`aggregate_windows`] was given).
+  ///
+  /// Exactly two rows reach it:
+  ///
+  /// - `-∞` in EVERY column. Such a row is not evidence about which language
+  ///   was spoken — it is the statement that none was — and no pooling has a
+  ///   meaningful answer for it. The logarithmic pool zeroes the whole clip
+  ///   out; the linear pool would count the window's duration in its
+  ///   denominator while its terms contribute to no numerator, diluting every
+  ///   other window; and [`ScorePooling::Vote`] would cast the window's vote
+  ///   for whatever column the ranking tie-break surfaces, handing a share of
+  ///   the clip to a language nothing chose.
+  /// - `+∞` ANYWHERE. `exp` over such a row sums to `∞`, so it is not a
+  ///   log-probability row at all and there is no constant that makes it one.
+  /// - A NaN ANYWHERE. It sits under no bound, `+∞` included, so the row has no
+  ///   maximum to shift by and nothing to rank. Each pooling loses it in its own
+  ///   direction — spread over all 107 columns, silently DROPPED, or handed the
+  ///   window's whole ballot because `total_cmp` ranks a NaN above every real
+  ///   value — and only one of the four leaves a mass the fold's postcondition
+  ///   can see.
+  ///
+  /// What this is NOT is a judgement on a row's absolute SCALE. A row whose
+  /// largest value is `-800` says exactly what one whose largest value is `0`
+  /// says, column for column, and both are folded — the shift comes off before
+  /// anything else, so how far from zero a row happens to sit is arithmetic
+  /// noise rather than evidence and decides nothing here. See `aggregate`'s
+  /// module docs, "A row's own scale is not evidence".
+  ///
+  /// Unreachable through [`Identifier::identify_long`]: a model row is a
+  /// log-softmax, and [`Identifier::log_probabilities`] refuses a non-finite
+  /// score outright. Reachable through [`aggregate_windows`] from hand-built
+  /// rows, `-∞` being a value [`LogProbabilities::try_from_slice`] deliberately
+  /// accepts; neither `+∞` nor a NaN is, so those two halves guard this crate's
+  /// own unvalidated internal constructor rather than a caller.
+  ///
+  /// [`Identifier::identify_long`]: super::Identifier::identify_long
+  /// [`Identifier::log_probabilities`]: super::Identifier::log_probabilities
+  /// [`aggregate_windows`]: super::aggregate_windows
+  /// [`ScorePooling::Vote`]: super::ScorePooling::Vote
+  /// [`LogProbabilities::try_from_slice`]: super::LogProbabilities::try_from_slice
+  #[error(
+    "window {0} has no finite largest log-probability, so no shift makes the row a \
+     distribution: it is -inf throughout, which rules every language out, or it holds \
+     a +inf, which is not a log-probability row at all, or it holds a NaN, which sits \
+     under no bound"
+  )]
+  UnnormalizableWindow(usize),
+
+  /// The fold produced a row that is not a distribution — its probabilities do
+  /// not sum to 1 — which is a defect in this crate rather than a property of
+  /// the caller's rows. See [`NotADistribution`].
+  #[error(transparent)]
+  NotADistribution(#[from] NotADistribution),
+
+  /// A hand-built log-probability row was not exactly
+  /// [`NUM_LANGUAGES`](super::NUM_LANGUAGES) values long, carrying the length
+  /// supplied.
+  #[error("expected a row of exactly {n} log-probabilities, got {0}", n = super::NUM_LANGUAGES)]
+  LanguageCountMismatch(usize),
+
+  /// A hand-built log-probability row carried a value that is not a natural-log
+  /// probability (NaN, or greater than zero).
+  #[error(transparent)]
+  InvalidLogProbability(#[from] InvalidLogProbability),
 
   /// A language index had no roster row, carrying that index. Defensive: the
   /// compile-time `NUM_LANGUAGES == languages().len()` assert makes this

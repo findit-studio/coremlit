@@ -21,7 +21,7 @@
 | [`audio::speaker`](crates/coremlit/src/audio/speaker) | `speaker` (oracle: `coremlit-parity`'s `speaker-oracle`) | CoreML segmentation + embedding backends for `dia`'s diarization: runs pyannote's `segmentation-3.0` and WeSpeaker on Apple silicon under a caller-selected `ComputeUnits` (placement is characterized, never asserted — nothing here measures runtime residency) and produces the `dia`-shaped tensors (`Extraction`) that feed [`dia`](https://github.com/findit-studio/diarization)'s VBx/PLDA clustering. Multi-source (FluidAudio default + Argmax). Never assigns a speaker label — clustering stays in `dia`. |
 | [`audio::vad`](crates/coremlit/src/audio/vad) | `vad` (oracle: `coremlit-parity`'s `vad-bundled`) | Silero VAD on CoreML: runs the FluidInference unified 256 ms model and implements the published [`zuoer`](https://crates.io/crates/zuoer) crate's `VadBackend` seam, re-exporting its detector so a consumer gets the full offline + streaming API with **zero** detection logic duplicated; `ort`/ONNX never enters the runtime graph. |
 | [`audio::ced`](crates/coremlit/src/audio/ced) | `ced` | CED (tiny/mini/small/base) AudioSet sound-event tagging on CoreML: 16 kHz mono waveform → Rust log-mel front-end → fp16 mel→logits transformer natively on Apple silicon → sigmoid + ranked predictions over the 527 rated AudioSet classes (`soundevents-dataset`, ort-free); long clips via `windit` window geometry + Mean/Max confidence aggregation. The four sizes share one size-invariant mel→logits contract (`CedModel`). Closes the ORT-CoreML-EP zeroed-logits gap (`soundevents` stays the ort lineage); parity against committed fp32 goldens lands per size as staged, no `ort`. |
-| [`audio::lid`](crates/coremlit/src/audio/lid) | `lid` | Spoken-language identification on CoreML: 16 kHz mono waveform → Rust log-mel front-end → fp16 mel→log-probabilities graph natively on Apple silicon → the top `k` of a 107-language roster (code + English name + model column + natural-log probability). A **backend-neutral door** — no public name spells the model behind it — today backed by an Apache-2.0 export of `speechbrain/lang-id-voxlingua107-ecapa`. The label roster is committed in-crate (`include_bytes!`, byte-pinned against the artifact author's own JSON); the graph's frame range caps a clip at 30.01 s, so a longer clip is a typed error rather than an invented windowing policy. No `ort`. |
+| [`audio::lid`](crates/coremlit/src/audio/lid) | `lid` | Spoken-language identification on CoreML: 16 kHz mono waveform → Rust log-mel front-end → fp16 mel→log-probabilities graph natively on Apple silicon → the top `k` of a 107-language roster (code + English name + model column + natural-log probability). A **backend-neutral door** — no public name spells the model behind it — today backed by an Apache-2.0 export of `speechbrain/lang-id-voxlingua107-ecapa`. The label roster is committed in-crate (`include_bytes!`, byte-pinned against the artifact author's own JSON). The graph's frame range caps ONE prediction at 30.01 s; longer clips go through `identify_long`, which windows on `windit` geometry and pools the per-window log-probability rows under a policy chosen on two model-derived oracles (self-consistency and concatenation) — logarithmic by default, with linear/max/vote available. No `ort`. |
 | [`embeddings`](crates/coremlit/src/embeddings) | `clap` / `granite` / `siglip` | Embedding producers, each a feature-gated CoreML pipeline projecting into a shared joint space, L2-normalized in Rust: CLAP-HTSAT audio+text (`clap`), granite sentence embeddings (`granite`), and SigLIP 2 (`siglip2-base-patch16-naflex`) image+text (`siglip`, NaFlex — no windowing). Parity against committed transformers-fp32 goldens, no `ort`. `video` is likewise reserved and **not** created until a video kit exists. |
 
 ## Layering map
@@ -55,10 +55,14 @@ label set is the crates.io `soundevents-dataset` data crate (ort-free by
 construction — the ort-based `soundevents` crate is never a dependency).
 
 `audio::lid` (feature `lid`) sits there too, and owns strictly more of itself:
-its mel front-end is in-crate Rust, its 107-language roster is a committed
-in-crate asset rather than a data crate, and it consumes no windowing engine at
-all (the graph's own 30.01 s frame ceiling is the contract, and a longer clip is
-a typed error). Its only feature dependency is `rustfft`.
+its mel front-end is in-crate Rust and its 107-language roster is a committed
+in-crate asset rather than a data crate. It reaches for `windit` only for window
+GEOMETRY, as `ced` does; the graph's 30.01 s frame ceiling bounds one
+prediction, and `Identifier::identify_long` windows past it under a pooling
+policy this module owns — a log-softmax over mutually exclusive classes is a
+third domain again, neither `ced`'s independent sigmoids nor windit's unit
+vectors, and which pooling to default to was measured rather than assumed. Its
+feature dependencies are `rustfft` and `windit`.
 
 **Authority.** The runtime **core** owns every CoreML FFI call. Each `audio::*` module owns its pipeline's CoreML execution and host-side glue, but **not** the backend-agnostic algorithm it drives:
 
@@ -187,7 +191,7 @@ Flat and additive; `default = []`.
 | `vad` | Silero VAD model layer (`zuoer` detector core) |
 | `clap` / `granite` / `siglip` | embedding producers: CLAP audio+text / granite sentence / SigLIP 2 image+text — each committed-golden parity, no `ort` |
 | `ced` | CED (tiny/mini/small/base) AudioSet sound-event tagging — Rust mel + `soundevents-dataset` + `windit`, committed-golden parity per size as staged, no `ort` |
-| `lid` | spoken-language identification over a 107-language roster — Rust mel + a committed in-crate label asset, backend-neutral surface, no `ort` |
+| `lid` | spoken-language identification over a 107-language roster — Rust mel + a committed in-crate label asset + `windit` geometry for long clips, backend-neutral surface, no `ort` |
 | `serde` | `Serialize`/`Deserialize` on options/results/provenance (+ the whisper JSON writer) |
 | `tracing` | internal log events additionally emitted as `tracing` events |
 

@@ -76,6 +76,14 @@ fn every_payload_variant_is_a_newtype() {
     Error::NonFiniteInput(3),
     Error::NonFiniteOutput(4),
     Error::UnknownLanguageIndex(999),
+    WinditError::TooManyWindows { got: 9, max: 4 }.into(),
+    Error::EmptyWindows,
+    Error::ZeroMassAggregate(ScorePooling::MeanLogProbability),
+    Error::UnnormalizableWindow(7),
+    NotADistribution::new(ScorePooling::MeanProbability, 0.5).into(),
+    Error::LanguageCountMismatch(106),
+    InvalidLogProbability::new(12, 0.5).into(),
+    Error::PositiveOutput(InvalidLogProbability::new(94, 0.25)),
   ];
 
   for error in cases {
@@ -88,6 +96,27 @@ fn every_payload_variant_is_a_newtype() {
       Error::NonFiniteInput(index) => assert_eq!(index, 3),
       Error::NonFiniteOutput(index) => assert_eq!(index, 4),
       Error::UnknownLanguageIndex(index) => assert_eq!(index, 999),
+      Error::Windowing(detail) => {
+        assert!(matches!(detail, WinditError::TooManyWindows { got: 9, .. }));
+      }
+      Error::EmptyWindows => {}
+      Error::ZeroMassAggregate(pooling) => {
+        assert_eq!(pooling, ScorePooling::MeanLogProbability);
+      }
+      Error::UnnormalizableWindow(position) => assert_eq!(position, 7),
+      Error::NotADistribution(detail) => {
+        assert_eq!(detail.pooling(), ScorePooling::MeanProbability);
+        assert!((detail.mass() - 0.5).abs() < f64::EPSILON);
+      }
+      Error::LanguageCountMismatch(got) => assert_eq!(got, 106),
+      Error::InvalidLogProbability(detail) => {
+        assert_eq!(detail.index(), 12);
+        assert_eq!(detail.value(), 0.5);
+      }
+      Error::PositiveOutput(detail) => {
+        assert_eq!(detail.index(), 94);
+        assert_eq!(detail.value(), 0.25);
+      }
       other => panic!("unexpected variant {other:?}"),
     }
   }
@@ -100,6 +129,11 @@ fn index_variants_render_their_index() {
   assert!(Error::NonFiniteInput(1_234).to_string().contains("1234"));
   assert!(Error::NonFiniteOutput(56).to_string().contains("56"));
   assert!(Error::UnknownLanguageIndex(107).to_string().contains("107"));
+  assert!(
+    Error::UnnormalizableWindow(41)
+      .to_string()
+      .contains("window 41")
+  );
 }
 
 /// The foreign errors arrive through `#[from]` and keep their own message, so
@@ -119,4 +153,31 @@ fn foreign_errors_convert_and_keep_their_message() {
     actual: 61,
   };
   assert!(matches!(Error::from(tensor), Error::Tensor(_)));
+}
+
+/// The two long-clip payloads say enough to act on without a second lookup: the
+/// row length that was wrong, and the offending value with its column.
+#[test]
+fn the_long_clip_payloads_name_what_was_wrong() {
+  let rendered = Error::LanguageCountMismatch(106).to_string();
+  assert!(rendered.contains("106"), "{rendered}");
+  assert!(
+    rendered.contains("107"),
+    "the expected width too: {rendered}"
+  );
+
+  let detail = InvalidLogProbability::new(94, f32::NAN);
+  assert_eq!(detail.index(), 94);
+  assert!(detail.value().is_nan());
+  let rendered = Error::from(detail).to_string();
+  assert!(rendered.contains("94"), "{rendered}");
+  assert!(rendered.contains("NaN"), "{rendered}");
+
+  // The windowing refusal keeps windit's own wording rather than flattening it.
+  let inner = WinditError::TooManyWindows {
+    got: 40_001,
+    max: 10,
+  };
+  let text = inner.to_string();
+  assert!(Error::from(inner).to_string().contains(&text));
 }

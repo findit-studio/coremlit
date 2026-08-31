@@ -79,17 +79,20 @@ composes with nothing (a single leaf feature).
 
 `lid` is likewise a NEW module (`audio::lid`): spoken-language identification
 on CoreML — 16 kHz mono waveform in, ranked languages out over a 107-language
-roster. A Rust log-mel front-end (`rustfft`, the module's only dependency)
-feeds one fp16 mel→log-probabilities graph, so the feature adds exactly
-`dep:rustfft` and nothing else. It is a **backend-neutral door**: no public name
-spells the model behind it, and today's backend is
-`aufklarer/SpeechBrain-ECAPA-VoxLingua107-21M-CoreML` (Apache-2.0), an export of
-`speechbrain/lang-id-voxlingua107-ecapa`. Unlike `granite` and `siglip` the
-label roster is COMMITTED in-crate (`include_bytes!`, 10.7 kB) rather than read
-from the artifact, so nothing about the vocabulary is a model gate. Clips are
-capped at 30.01 s by the graph's own frame range, so `lid` is a `windit`
-non-consumer (no windowing), and it composes with nothing — a single leaf
-feature.
+roster. A Rust log-mel front-end (`rustfft`) feeds one fp16
+mel→log-probabilities graph, so the feature adds `dep:rustfft` plus the
+crates.io `windit` engine (geometry only, no `windit/text`). It is a
+**backend-neutral door**: no public name spells the model behind it, and
+today's backend is `aufklarer/SpeechBrain-ECAPA-VoxLingua107-21M-CoreML`
+(Apache-2.0), an export of `speechbrain/lang-id-voxlingua107-ecapa`. Unlike
+`granite` and `siglip` the label roster is COMMITTED in-crate
+(`include_bytes!`, 10.7 kB) rather than read from the artifact, so nothing
+about the vocabulary is a model gate. ONE prediction is capped at 30.01 s by
+the graph's own frame range; a longer clip goes through
+`Identifier::identify_long`, whose window geometry rides `windit` and whose
+log-probability pooling — a third domain again, neither `ced`'s independent
+sigmoids nor windit's unit vectors — is this module's own. It composes with
+nothing: a single leaf feature.
 
 Compositions (pinned by the golden test): `nl-recognizer` → `whisper`;
 `align-oracle` → `align`. Across the package boundary, `coremlit-parity`'s
@@ -149,12 +152,12 @@ size, so the CI step filters on `tiny::`; the `mini`/`small`/`base` gates stay
 local/dev gates against an owner-staged `CED_TEST_MODELS` tree.
 
 `lid` splits the same way. The `features` job runs the hermetic lid suite (the
-mel front end, the roster/asset agreement checks, every typed-error path) under
-the `lid` row and both all-on rows, and the `lid` `model-tests` shard stages the
-41 MB bundle and runs `lid_model_io` (5 gates) and `lid_e2e` (4 gates). There is
-no `@lib` half — every lid model gate is a `tests/lid/*` target, so
-`--features lid --lib -- --list --ignored` lists zero, and a group that selected
-it would trip the runner's anti-vacuum guard.
+mel front end, the roster/asset agreement checks, every typed-error path)
+under the `lid` row and both all-on rows, and the `lid` `model-tests` shard
+stages the 41 MB bundle and runs `lid_model_io` (5 gates), `lid_e2e` (4 gates)
+and `lid_long_clip` (8 gates). There is no `@lib` half — every lid model gate
+is a `tests/lid/*` target, so `--features lid --lib -- --list --ignored` lists
+zero, and a group that selected it would trip the runner's anti-vacuum guard.
 
 That shard was blocked for a release, and on the graph sweep rather than the
 download. `tests/fp16_guards.rs` walks `Models/` WHOLE, and this artifact is a
