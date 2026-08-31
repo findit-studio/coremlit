@@ -267,6 +267,79 @@ impl InvalidAlignmentShape {
   }
 }
 
+/// This host's CoreVideo row pitch for the Float16 surface Swift's
+/// alignment gather allocates could not be measured, so
+/// [`AlignmentGather::SwiftParity`](crate::audio::whisper::options::AlignmentGather::SwiftParity)
+/// — whose whole content is replicating what that pitch truncates —
+/// cannot be honored.
+///
+/// Fail-closed by design: the alternative, quietly gathering every row in
+/// full, is the behavior
+/// [`AlignmentGather::Complete`](crate::audio::whisper::options::AlignmentGather::Complete)
+/// names, and substituting it under a `SwiftParity` request would be the
+/// same silent, host-dependent swap of transcript-changing behavior that
+/// whisper #41 exists to remove. `SwiftParity` is opt-in, so refusing an
+/// environment where it cannot be honored costs a caller nothing they did
+/// not explicitly ask for — a caller who prefers timings over parity simply
+/// does not opt in, and gets `Complete` by default.
+///
+/// Payload of [`SegmentError::AlignmentPitchUnavailable`].
+///
+/// Unlike its sibling payloads this one derives [`std::error::Error`] and
+/// owns both the variant's message and its `#[source]`: the variant is
+/// `#[error(transparent)]`, which forwards `Display` *and* `source()`
+/// straight through to this struct rather than inserting it as a link. The
+/// rendered message and the error chain are therefore exactly what the
+/// struct-shaped variant produced — one link, to the [`crate::TensorError`]
+/// below — not one link deeper.
+///
+/// Note that the inherent [`source`](Self::source) getter returns the
+/// concrete `&`[`crate::TensorError`] the struct pattern used to expose, and
+/// so shadows [`std::error::Error::source`] for method-call syntax; call the
+/// trait method by path (`std::error::Error::source(&e)`) to walk the chain.
+#[derive(Debug, thiserror::Error)]
+#[error(
+  "cannot measure this host's CoreVideo Float16 row pitch for the {rows} x {cols} alignment \
+   gather, so the Swift-parity gather cannot be reproduced (select \
+   `AlignmentGather::Complete` to gather every row in full instead): {source}"
+)]
+pub struct AlignmentPitchUnavailable {
+  /// Rows the gather would have allocated (gathered tokens).
+  rows: usize,
+  /// Columns the gather would have allocated (audio tokens).
+  cols: usize,
+  /// Why the probe allocation could not supply a pitch.
+  #[source]
+  source: crate::TensorError,
+}
+
+impl AlignmentPitchUnavailable {
+  /// Construct from the rows and columns the gather would have allocated
+  /// and the reason the probe allocation could not supply a pitch.
+  #[inline(always)]
+  pub const fn new(rows: usize, cols: usize, source: crate::TensorError) -> Self {
+    Self { rows, cols, source }
+  }
+
+  /// Rows the gather would have allocated (gathered tokens).
+  #[inline(always)]
+  pub const fn rows(&self) -> usize {
+    self.rows
+  }
+
+  /// Columns the gather would have allocated (audio tokens).
+  #[inline(always)]
+  pub const fn cols(&self) -> usize {
+    self.cols
+  }
+
+  /// Why the probe allocation could not supply a pitch.
+  #[inline(always)]
+  pub const fn source(&self) -> &crate::TensorError {
+    &self.source
+  }
+}
+
 /// The probe allocation behind
 /// [`AlignmentGather::SwiftParity`](crate::audio::whisper::options::AlignmentGather::SwiftParity)
 /// succeeded but reported a layout the gather's model cannot describe —
@@ -353,20 +426,12 @@ pub enum SegmentError {
   /// environment where it cannot be honored costs a caller nothing they did
   /// not explicitly ask for — a caller who prefers timings over parity simply
   /// does not opt in, and gets `Complete` by default.
-  #[error(
-    "cannot measure this host's CoreVideo Float16 row pitch for the {rows} x {cols} alignment \
-     gather, so the Swift-parity gather cannot be reproduced (select \
-     `AlignmentGather::Complete` to gather every row in full instead): {source}"
-  )]
-  AlignmentPitchUnavailable {
-    /// Rows the gather would have allocated (gathered tokens).
-    rows: usize,
-    /// Columns the gather would have allocated (audio tokens).
-    cols: usize,
-    /// Why the probe allocation could not supply a pitch.
-    #[source]
-    source: crate::TensorError,
-  },
+  ///
+  /// The message and the `#[source]` live on
+  /// [`AlignmentPitchUnavailable`], which this variant forwards both of
+  /// through `#[error(transparent)]`.
+  #[error(transparent)]
+  AlignmentPitchUnavailable(#[from] AlignmentPitchUnavailable),
   /// The probe allocation behind
   /// [`AlignmentGather::SwiftParity`](crate::audio::whisper::options::AlignmentGather::SwiftParity)
   /// succeeded but reported a layout the gather's model cannot describe —

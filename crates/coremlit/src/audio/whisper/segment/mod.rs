@@ -37,7 +37,10 @@ use crate::{
   audio::whisper::{
     backend::{AlignmentMatrix, AlignmentView},
     constants::{SAMPLE_RATE, SECONDS_PER_TIME_TOKEN},
-    error::{AlignmentPitchUnexpectedLayout, InvalidAlignmentShape, SegmentError},
+    error::{
+      AlignmentPitchUnavailable, AlignmentPitchUnexpectedLayout, InvalidAlignmentShape,
+      SegmentError,
+    },
     options::{AlignmentGather, DecodingOptions, WordGrouping},
     result::{DecodingResult, TranscriptionSegment, WordTiming},
     tokenizer::WhisperTokenizer,
@@ -1005,8 +1008,9 @@ pub(crate) fn rounded_to_places(value: f32, decimal_places: i32) -> f32 {
 // this host's pitch cuts the gather, and has to ask the same helper the
 // pipeline asks rather than restate a number.
 pub(crate) fn coreml_f16_row_pitch(rows: usize, cols: usize) -> Result<usize, SegmentError> {
-  let probe = MultiArray::f16_surface(&[rows, cols])
-    .map_err(|source| SegmentError::AlignmentPitchUnavailable { rows, cols, source })?;
+  let probe = MultiArray::f16_surface(&[rows, cols]).map_err(|source| {
+    SegmentError::AlignmentPitchUnavailable(AlignmentPitchUnavailable::new(rows, cols, source))
+  })?;
   row_pitch_of(&probe, rows, cols)
 }
 

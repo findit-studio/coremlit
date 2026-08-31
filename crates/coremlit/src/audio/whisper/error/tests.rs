@@ -53,11 +53,11 @@ fn alignment_pitch_errors_name_the_shape_and_the_explicit_way_out() {
   // one the decoder's f16 tensors use), which is exactly why the messages are
   // pinned here rather than by a path that can produce them. The default
   // gather returns neither: it allocates no surface and measures nothing.
-  let unavailable = SegmentError::AlignmentPitchUnavailable {
-    rows: 30,
-    cols: 1500,
-    source: crate::TensorError::SurfaceUnsupported,
-  };
+  let unavailable = SegmentError::AlignmentPitchUnavailable(AlignmentPitchUnavailable::new(
+    30,
+    1500,
+    crate::TensorError::SurfaceUnsupported,
+  ));
   let text = unavailable.to_string();
   assert!(text.contains("30 x 1500"), "{text}");
   assert!(text.contains("AlignmentGather::Complete"), "{text}");

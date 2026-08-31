@@ -81,7 +81,7 @@ fn writers_emit_files_with_the_right_extension() {
   let err = SrtWriter::new("/nonexistent/dir")
     .write(&result, "out")
     .unwrap_err();
-  assert!(matches!(err, WriteError::Write { .. }));
+  assert!(matches!(err, WriteError::Write(_)));
 }
 
 #[cfg(feature = "serde")]
