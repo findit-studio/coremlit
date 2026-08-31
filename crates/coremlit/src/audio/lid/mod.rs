@@ -1,6 +1,7 @@
 //! Native CoreML **spoken-language identification** — 16 kHz mono waveform in,
 //! ranked languages out ([`NUM_LANGUAGES`] of them: code + English name +
-//! model column + natural-log probability).
+//! model column + natural-log probability), with clips past the graph's 30 s
+//! ceiling handled by a measured windowing + pooling policy.
 //!
 //! The mel front end runs in Rust (the private `mel` submodule) and the
 //! mel→log-probabilities network runs natively on Apple silicon as one
@@ -39,7 +40,9 @@
 //! is [`MIN_SAMPLES`]..=[`MAX_SAMPLES`] — **0.09 s to 30.01 s** at 16 kHz. The
 //! runtime rejects anything outside that; this module rejects it FIRST, as
 //! [`Error::FrameCountOutOfRange`], so a caller never has to string-match
-//! CoreML's own axis-indexed complaint.
+//! CoreML's own axis-indexed complaint. That envelope bounds ONE prediction;
+//! [`Identifier::identify_long`] windows a clip of any length over it (see
+//! "Clips longer than 30 s").
 //!
 //! Both tensors are fp32 at the boundary, but the graph casts to **fp16**
 //! immediately and computes in it throughout. That is why the placements do not
@@ -49,14 +52,204 @@
 //!
 //! ## Clips longer than 30 s
 //!
-//! Not handled here, deliberately. There is no upstream-authored windowing
-//! policy for this model, and the choices that would have to be invented —
-//! window length, hop, and how to combine per-window log-probability vectors
-//! (mean in log space? in probability space? a vote?) — change the answer.
-//! Long-clip support is a follow-up with its own measurements; until then a
-//! long clip is a typed error, and the caller slices the audio with a policy
-//! it can defend. Note that padding a short clip up to some bucket length is
-//! NOT free either — see the performance note below.
+//! [`Identifier::identify_long`] windows them, under a [`WindowPlan`] and a
+//! [`ScorePooling`]. [`Identifier::identify`] is untouched: same ceiling, same
+//! contract, same numbers. The long path is additive, and on a clip that fits
+//! one window it returns **bit-identically** what `identify` returns, so there
+//! is no boundary to straddle.
+//!
+//! There is still no upstream-authored windowing policy for this model. The two
+//! things that had to be invented — the geometry, and how per-window
+//! log-probability vectors combine — were therefore MEASURED rather than
+//! assumed. What follows is what was measured, on what, and what it leaves
+//! unverified.
+//!
+//! ### Two oracles, because there is no labelled long-form corpus
+//!
+//! 1. **Self-consistency.** On a clip that FITS one prediction, the model's own
+//!    single-shot answer is ground truth by definition. Window that same clip,
+//!    aggregate, and compare. The policy that best reproduces the single-shot
+//!    ranking is the defensible default. Run over sixteen clips — the committed
+//!    Thai reference, English, Spanish, Japanese and Chinese speech, two 30 s
+//!    TED segments, noise, a tone, and reversed / attenuated / noise-mixed
+//!    variants of the Thai clip, which is where the model is uncertain and the
+//!    policies actually diverge.
+//! 2. **Concatenation.** Repeat the committed 13 s Thai clip to 39 s and 52 s:
+//!    the answer is `th` by construction. Then splice English, Spanish or noise
+//!    into it and watch each policy degrade.
+//!
+//! ### Aggregation: all four candidates, including the rejected ones
+//!
+//! Oracle 1 at the default geometry (10 s window, 10 s hop,
+//! [`TailPolicy::SlideBack`]; 11 clips long enough to window, 26 windows).
+//! "top-3 set" is the overlap between the aggregate's top three and the
+//! single-shot top three; the last two columns are mean absolute error against
+//! the single-shot row, in nats. Read [`Vote`]'s row-error column with care —
+//! it is averaged over only the languages that received a vote, because the
+//! rest are exactly `-∞`, so it is not comparable with the other three:
+//!
+//! | pooling                                  | top-1 | top-3 set | Δ at top-1 | MAE, whole row |
+//! |------------------------------------------|-------|-----------|------------|----------------|
+//! | [`MeanLogProbability`] (**the default**) | 10/11 | **78.8 %**| **0.138**  | **0.743**      |
+//! | [`MeanProbability`]                      | 10/11 | 78.8 %    | 0.194      | 1.382          |
+//! | [`Max`]                                  | 10/11 | 78.8 %    | 0.270      | 1.753          |
+//! | [`Vote`]                                 | 10/11 | 36.4 %    | ∞          | 0.501          |
+//!
+//! At a finer geometry (5 s window, 2.5 s hop; 15 clips, 87 windows) they
+//! separate further — this is the row that decides it:
+//!
+//! | pooling                | top-1 | top-3 set | Δ at top-1 | MAE, whole row |
+//! |------------------------|-------|-----------|------------|----------------|
+//! | [`MeanLogProbability`] | 14/15 | **84.4 %**| **0.117**  | **1.285**      |
+//! | [`MeanProbability`]    | 14/15 | 75.6 %    | 0.259      | 3.045          |
+//! | [`Max`]                | 12/15 | 73.3 %    | 0.499      | 3.757          |
+//! | [`Vote`]               | 14/15 | 40.0 %    | ∞          | 0.979          |
+//!
+//! Reading it:
+//!
+//! - **Mean in log space wins both ranking metrics at every geometry tried**
+//!   (3 s, 5 s and 10 s windows, overlapped and not) and the row error among
+//!   the three policies whose rows are comparable. Its clip-level number is
+//!   also close enough to the single-shot one to be used interchangeably — on
+//!   the Thai reference it reads −0.010 against a single-shot −0.0101, on a
+//!   30 s TED segment −0.001 against −0.0004.
+//! - **Mean in probability space** costs roughly double the row error and, at
+//!   the finer geometry, nine points of top-3 agreement. It is kept because it
+//!   answers a different and sometimes better question — see the mixed-clip
+//!   table below.
+//! - **Per-class max** is the only candidate that loses top-1 agreement outright
+//!   (12/15). One over-confident window sets a language's clip-level score, and
+//!   nothing damps it.
+//! - **The vote is rejected for the default on its own numbers**, not on taste.
+//!   Its top-1 agreement is competitive — but its top-3 agreement is 36–40 %,
+//!   because everything below the winners is `-∞` and the ranking below the top
+//!   is arbitrary. The ∞ in the Δ column is literal: on at least one clip the
+//!   single-shot top-1 language won ZERO windows, so its aggregate probability
+//!   is exactly zero. A caller who wants a majority-of-windows answer can still
+//!   ask for it.
+//!
+//! The single top-1 miss shared by all four at the default geometry is a
+//! non-speech AudioSet clip whose single-shot "truth" is itself only
+//! −1.75 nats (17 %) — the oracle has nothing to say there.
+//!
+//! ### The same four on a MIXED clip, which is where they really diverge
+//!
+//! Oracle 2, `th + th + English` (37.0 s, 70 % Thai), per-window argmaxes
+//! `[th th th en]`:
+//!
+//! | pooling                | 1st          | 2nd            | 3rd        |
+//! |------------------------|--------------|----------------|------------|
+//! | [`MeanLogProbability`] | `th` −0.0099 | `lo` −4.63     | `la` −11.0 |
+//! | [`MeanProbability`]    | `th` −0.3032 | **`en` −1.54** | `lo` −4.46 |
+//! | [`Max`]                | `th` −0.7134 | `en` −0.8693   | `lo` −3.95 |
+//! | [`Vote`]               | `th` −0.2877 | `en` −1.3863   | (−∞)       |
+//!
+//! The default **erases the minority language**: English is not in its top
+//! three at all. That is correct behaviour for the question it answers — "what
+//! language is this span" — and wrong for "what languages are in this clip".
+//! `MeanProbability` reports 73.8 % / 21.4 %, tracking the actual 70/30 split;
+//! `Max` reads it as almost a coin flip. **For a genuinely multilingual clip,
+//! read [`Identifier::log_probabilities_windows`] per window rather than any
+//! aggregate** — and note that a stretch shorter than one window may never win
+//! a window at all (spliced English between two Thai halves loses every 10 s
+//! window, and loses every 30 s window even when it is a third of the clip).
+//!
+//! ### Duration weighting
+//!
+//! Every window contributes in proportion to the audio it actually saw, always.
+//! Under [`TailPolicy::SlideBack`] and [`TailPolicy::Drop`] every span is one
+//! full window, so this is exactly the equal-weight mean — measured identical,
+//! bit for bit. It only bites under [`TailPolicy::Partial`], and there it is
+//! measurably better: 78.8 % vs 72.7 % top-3 agreement, 0.128 vs 0.216 at
+//! top-1, 1.08 vs 1.97 row MAE. There is no equal-weight knob because there is
+//! no case where equal weights were better.
+//!
+//! ### The tail: four treatments, one clip set
+//!
+//! Eight clips that all leave a real tail at the default geometry, mean-in-log
+//! throughout. "shapes" is the number of DISTINCT mel frame counts the graph is
+//! asked to specialize:
+//!
+//! | tail treatment              | top-1 | top-3 set | Δ at top-1 | MAE, row  | shapes |
+//! |-----------------------------|-------|-----------|------------|-----------|--------|
+//! | [`TailPolicy::SlideBack`]   | 7/8   | **79.2 %**| 0.187      | **0.568** | **1**  |
+//! | [`TailPolicy::Partial`]     | 7/8   | 79.2 %    | **0.173**  | 1.034     | 6      |
+//! | [`TailPolicy::Drop`]        | 7/8   | 75.0 %    | 0.226      | 0.792     | 1      |
+//! | zero-pad the tail (**not shipped**) | 7/8 | 75.0 % | 0.218 | 1.854     | 1      |
+//!
+//! **Padding is not among the shipped policies, and this is why.** Scoring the
+//! first `n` seconds of the reference clip honestly, then again zero-padded up
+//! to the 10 s window:
+//!
+//! | real audio | honest      | zero-padded to 10 s | worst shift | slid back to 10 s |
+//! |------------|-------------|---------------------|-------------|-------------------|
+//! | 0.5 s      | `tl` −0.372 | `sq` −2.140         | 9.1 nats    | `th` −0.0054      |
+//! | 1.0 s      | `th` −0.051 | `as` −1.567         | 19.1 nats   | `th` −0.0054      |
+//! | 3.0 s      | `th` −0.010 | `lo` −0.210         | 16.0 nats   | `th` −0.0054      |
+//! | 6.0 s      | `th` −0.015 | `th` −0.177         | 6.8 nats    | `th` −0.0054      |
+//! | 9.0 s      | `th` −0.013 | `th` −0.013         | 2.5 nats    | `th` −0.0054      |
+//!
+//! Padding a tail of 3 s or less **changes the language**. The fused in-graph
+//! mean subtraction reduces over the time axis, so it sees the zeros; this is
+//! the same effect the performance note below records for bucketing, at the
+//! magnitude a short tail provokes.
+//!
+//! So the default is [`TailPolicy::SlideBack`]: a full-length, unpadded final
+//! window that ends flush with the clip, at the cost of re-reading the audio it
+//! overlaps. It keeps the whole plan to ONE graph shape, covers every sample,
+//! and has the lowest row error of the four. [`TailPolicy::Partial`] is a
+//! fraction better at the top-1 value and worse everywhere else, and it asks
+//! the graph to specialize a new shape per distinct tail length — it also
+//! produces genuinely noisier windows: on four repeats of the Thai clip its 2 s
+//! tail scores as Lao, which drags [`ScorePooling::Max`] from a −0.039 call on
+//! Thai to −0.629, against Lao at −0.762 — one bad window short of flipping the
+//! whole clip.
+//! [`TailPolicy::Drop`] is there for callers who would rather see nothing than
+//! a re-read window; it discards up to one hop from the end.
+//!
+//! ### What none of this verifies
+//!
+//! Stated plainly, because the policy is chosen on these two oracles and
+//! nothing else:
+//!
+//! - **There is no labelled long-form benchmark here.** Oracle 1 measures
+//!   agreement with the model's own single-shot answer, which is self-consistency,
+//!   not accuracy: if the model is wrong about a clip, the aggregation that
+//!   reproduces that wrong answer scores best. Oracle 2's ground truth is real
+//!   but constructed by repetition, so it tests robustness to windowing, not
+//!   generalization to unseen speech.
+//! - **The clip set is small and narrow** — sixteen clips over about five
+//!   languages, from this repository's existing fixtures. Nothing here says how
+//!   the policy behaves over the model's other hundred-odd languages, over
+//!   telephone-band audio, or over speakers unlike these.
+//! - **No long-form conversational or code-switched corpus was used.** The
+//!   mixed-clip numbers come from splices, which have hard boundaries real
+//!   code-switching does not.
+//! - **Nothing here validates the window length against accuracy on long
+//!   speech.** [`DEFAULT_WINDOW_SAMPLES`] is 10 s because self-consistency
+//!   improves monotonically with window length up to it (81 % at 3 s, 87 % at
+//!   5 s, 91 % at 10 s) while code-switch resolution gets worse above it, and
+//!   because it is the one frame count [`Identifier::prewarm`] already warms.
+//!   A different corpus could move it.
+//!
+//! [`MeanLogProbability`]: ScorePooling::MeanLogProbability
+//! [`MeanProbability`]: ScorePooling::MeanProbability
+//! [`Max`]: ScorePooling::Max
+//! [`Vote`]: ScorePooling::Vote
+//!
+//! ```no_run
+//! use coremlit::audio::lid::{Error, Identifier, ScorePooling, WindowPlan};
+//!
+//! # let speech_span_16k: Vec<f32> = Vec::new();
+//! let identifier = Identifier::from_file("Models/lid/lid.mlmodelc")?;
+//! identifier.prewarm()?; // warms exactly the default plan's window length
+//!
+//! let plan = WindowPlan::new();
+//! for score in identifier.identify_long(&speech_span_16k, 3, &plan, ScorePooling::default())? {
+//!   println!("{:>3} {:<12} {:.4}", score.code(), score.name(), score.probability());
+//! }
+//! # Ok::<(), Error>(())
+//! ```
 //!
 //! # Reading the scores
 //!
@@ -93,7 +286,10 @@
 //!   in-graph mean subtraction reduces over the time axis, so it sees the
 //!   padding: bucketing shifts tail log-probabilities by up to 3 nats. Bucket
 //!   only if you have measured that the shift does not matter for your
-//!   decision.
+//!   decision — and note that 3 nats is what BUCKETING costs, not a bound on
+//!   the effect: padding a 1 s clip out to 10 s moves the row by 19 nats and
+//!   changes the reported language ("Clips longer than 30 s", the tail table).
+//!   It is why [`TailPolicy`] has no padding variant.
 //! - [`Identifier::prewarm`] pays the first prediction's graph specialization
 //!   once, off the first real request — for ONE frame count.
 //!
@@ -106,18 +302,27 @@ use std::path::Path;
 
 use crate::{ComputeUnits, DataType, Model, MultiArray};
 
+pub mod aggregate;
 pub mod error;
 pub mod labels;
 pub mod prediction;
+pub mod window;
 
 mod mel;
 
 #[cfg(feature = "serde")]
 mod compute_units_serde;
 
-pub use error::{ContractMismatch, Error, FrameCountOutOfRange, OutputShape, Result};
+pub use aggregate::{ScorePooling, aggregate_windows};
+pub use error::{
+  ContractMismatch, Error, FrameCountOutOfRange, InvalidLogProbability, OutputShape, Result,
+  WinditError,
+};
 pub use labels::{LABELS_JSON_LEN, Language, labels_json_bytes, languages};
-pub use prediction::LanguageScore;
+pub use prediction::{LanguageScore, LogProbabilities, WindowLogProbabilities};
+pub use window::{
+  DEFAULT_HOP_SAMPLES, DEFAULT_MAX_WINDOWS, DEFAULT_WINDOW_SAMPLES, Span, TailPolicy, WindowPlan,
+};
 
 use crate::audio::lid::mel::{HOP, MelExtractor, N_MELS};
 
@@ -441,23 +646,128 @@ impl Identifier {
     prediction::top_k_from_scores(scores.into_iter().enumerate(), k)
   }
 
+  /// The long-clip primitive: one log-probability row per planned window,
+  /// paired with the [`Span`] it was scored over — ALWAYS exposed, so
+  /// code-switch detection ("where did it change language") is a caller-side
+  /// read of `windows[i].value().as_slice()` against `windows[i].span()`, with
+  /// no second API.
+  ///
+  /// Slices `samples_16k` at the plan's offsets and runs one
+  /// [`Self::log_probabilities`] per span. Runs sequentially: [`crate::Model`]
+  /// is `!Sync`, so windows share one identifier on one thread.
+  ///
+  /// Every span a [`WindowPlan`] produces is a length the graph accepts, so no
+  /// window is ever rejected mid-clip for its size. Under the default
+  /// [`TailPolicy::SlideBack`] every span is exactly one window long, so the
+  /// whole clip costs ONE graph specialization; see
+  /// [`DEFAULT_WINDOW_SAMPLES`] for why the default is the length
+  /// [`Self::prewarm`] warms.
+  ///
+  /// # Errors
+  /// [`Error::FrameCountOutOfRange`] if the whole clip is shorter than
+  /// [`MIN_SAMPLES`] (there is no upper bound here — that is the point);
+  /// [`Error::NonFiniteInput`] if any sample is NaN or infinite, carrying its
+  /// index **in the clip** (the whole clip is scanned once up front, so the
+  /// index is never window-relative); [`Error::Windowing`] if the plan exceeds
+  /// [`WindowPlan::max_windows`] or a buffer cannot be allocated; otherwise any
+  /// per-window [`Self::log_probabilities`] error.
+  pub fn log_probabilities_windows(
+    &self,
+    samples_16k: &[f32],
+    plan: &WindowPlan,
+  ) -> Result<Vec<WindowLogProbabilities>> {
+    validate_long_input(samples_16k)?;
+    let spans = plan.spans(samples_16k.len())?;
+    // Fallible reservation: the cap already bounds `spans.len()`, but the
+    // result vector is still caller-geometry-sized, so reserve it checked
+    // rather than risk an infallible `with_capacity` abort under memory
+    // pressure.
+    let mut out = Vec::new();
+    out.try_reserve_exact(spans.len()).map_err(|_| {
+      Error::Windowing(WinditError::AllocFailed {
+        elements: spans.len(),
+      })
+    })?;
+    for span in spans {
+      let row = self.log_probabilities(&samples_16k[span.start()..span.end()])?;
+      out.push(WindowLogProbabilities::new(
+        LogProbabilities::new(row),
+        span,
+      ));
+    }
+    Ok(out)
+  }
+
+  /// The composed long-clip answer: scores each planned window and folds the
+  /// per-window rows into one clip-level row under `pooling`, then returns its
+  /// top `k` languages — the long-clip counterpart of [`Self::identify`], with
+  /// no 30 s ceiling.
+  ///
+  /// The fold streams through an O([`NUM_LANGUAGES`]) accumulator, so a clip of
+  /// any length retains one row rather than one per window; use
+  /// [`Self::log_probabilities_windows`] when per-window access is wanted.
+  ///
+  /// A clip that already fits one window returns **exactly** what
+  /// [`Self::identify`] returns for it, bit for bit: the plan is a single span
+  /// and a one-window fold is the identity, whatever the pooling. So this is a
+  /// drop-in for `identify` rather than a separate regime with a boundary to
+  /// straddle.
+  ///
+  /// `k == 0` returns an empty vec without running the model OR any windowing,
+  /// so the [`WindowPlan::max_windows`] cap does not apply to it; it still
+  /// applies the same clip-level validation the scoring path would.
+  ///
+  /// # Errors
+  /// As [`Self::log_probabilities_windows`]; [`Error::UnknownLanguageIndex`] is
+  /// defensive-only. ([`Error::EmptyWindows`] is unreachable — a clip that
+  /// passes validation always plans at least one span.)
+  ///
+  /// [`NUM_LANGUAGES`]: NUM_LANGUAGES
+  pub fn identify_long(
+    &self,
+    samples_16k: &[f32],
+    k: usize,
+    plan: &WindowPlan,
+    pooling: ScorePooling,
+  ) -> Result<Vec<LanguageScore>> {
+    validate_long_input(samples_16k)?;
+    if k == 0 {
+      // Matches `identify`: no model, no windowing, and therefore no cap — but
+      // a clip that is too short or non-finite is still refused rather than
+      // waved through as an empty result.
+      return Ok(Vec::new());
+    }
+    let spans = plan.spans(samples_16k.len())?;
+    let mut acc = aggregate::Accumulator::new(pooling);
+    for span in spans {
+      let row = self.log_probabilities(&samples_16k[span.start()..span.end()])?;
+      acc.push(&LogProbabilities::new(row), span.len());
+    }
+    acc.finish()?.top_k(k)
+  }
+
   /// Runs one throwaway inference on a fixed synthetic clip to fully specialize
   /// the prediction path, so the first user-facing request is warm.
   /// Construction pays the model load; what it does NOT pay is the first
   /// prediction's own graph specialization.
   ///
-  /// **This warms ONE frame count** — 1 001 frames, a 10 s clip. The
-  /// specialization is per frame count (module docs, "Performance notes"), so a
-  /// service that will see one clip length should prewarm at that length
-  /// instead, by calling [`Self::log_probabilities`] on a throwaway buffer of
-  /// the right size.
+  /// **This warms ONE frame count**, and it is deliberately
+  /// [`DEFAULT_WINDOW_SAMPLES`] long — 1 001 frames, 10 s — so one `prewarm`
+  /// covers every window of a default [`WindowPlan`], however long the clip.
+  /// The length is read from that constant rather than restated, so the two
+  /// cannot drift apart. The specialization is per frame count (module docs,
+  /// "Performance notes"), so a service that will see one OTHER clip length
+  /// should prewarm at that length instead, by calling
+  /// [`Self::log_probabilities`] on a throwaway buffer of the right size — and
+  /// a plan using [`TailPolicy::Partial`] pays one more specialization per
+  /// distinct tail length, which no prewarm can anticipate.
   ///
   /// # Errors
   /// As [`Self::log_probabilities`]; a failure here surfaces a broken model at
   /// prewarm time rather than on the first request.
   pub fn prewarm(&self) -> Result<()> {
     let rate = SAMPLE_RATE_HZ as f32;
-    let signal: Vec<f32> = (0..10 * SAMPLE_RATE_HZ as usize)
+    let signal: Vec<f32> = (0..DEFAULT_WINDOW_SAMPLES as usize)
       .map(|i| 0.5 * (core::f32::consts::TAU * 440.0 * (i as f32 / rate)).sin())
       .collect();
     self.log_probabilities(&signal)?;
@@ -478,6 +788,21 @@ fn validate_frame_range(n_samples: usize) -> Result<usize> {
     return Err(FrameCountOutOfRange::for_samples(n_samples).into());
   }
   Ok(frames)
+}
+
+/// Reject a clip the LONG path must not see: shorter than [`MIN_SAMPLES`] (no
+/// window could be scored, and windowing cannot rescue a clip that is simply
+/// too short), or carrying a NaN/±∞ sample.
+///
+/// There is deliberately no upper bound: lifting it is what the long path is
+/// for. The finite scan runs over the WHOLE clip once, before any window is
+/// sliced, so [`Error::NonFiniteInput`] carries a clip-absolute index rather
+/// than one relative to whichever window happened to contain it.
+fn validate_long_input(samples: &[f32]) -> Result<()> {
+  if samples.len() < MIN_SAMPLES {
+    return Err(FrameCountOutOfRange::for_samples(samples.len()).into());
+  }
+  check_finite_samples(samples)
 }
 
 /// Reject a NaN/±∞ sample ([`Error::NonFiniteInput`]) — it would poison the mel

@@ -190,3 +190,60 @@ fn tensor_names_are_pinned() {
   assert_eq!(names::MEL_FEATURES, "mel_features");
   assert_eq!(names::LOG_PROBABILITIES, "log_probabilities");
 }
+
+// ── The long path's own guard ───────────────────────────────────────────────
+
+/// The long path keeps the SHORT-clip floor and drops the ceiling — the whole
+/// point of it. Stated at both ends so a copy-paste of `validate_frame_range`'s
+/// upper bound would red here.
+#[test]
+fn the_long_guard_keeps_the_floor_and_drops_the_ceiling() {
+  assert!(validate_long_input(&vec![0.0; MIN_SAMPLES]).is_ok());
+  for accepted in [MAX_SAMPLES, MAX_SAMPLES + 1, 10 * MAX_SAMPLES] {
+    assert!(
+      validate_long_input(&vec![0.0; accepted]).is_ok(),
+      "{accepted} samples must be accepted by the long path"
+    );
+  }
+
+  for rejected in [0, 1, MIN_SAMPLES - 1] {
+    let error = validate_long_input(&vec![0.0; rejected]).expect_err("must reject");
+    let Error::FrameCountOutOfRange(detail) = error else {
+      panic!("expected FrameCountOutOfRange for {rejected} samples, got {error:?}");
+    };
+    assert_eq!(detail.samples(), rejected);
+    assert!(detail.is_too_short());
+  }
+}
+
+/// The long guard scans the WHOLE clip before any window is sliced, so the
+/// reported index is clip-absolute — a NaN deep inside a later window is not
+/// renumbered relative to that window's start.
+#[test]
+fn the_long_guard_reports_a_clip_absolute_index() {
+  let mut samples = vec![0.5f32; 3 * MAX_SAMPLES];
+  let deep = 2 * MAX_SAMPLES + 12_345;
+  samples[deep] = f32::NAN;
+  assert!(matches!(
+    validate_long_input(&samples),
+    Err(Error::NonFiniteInput(index)) if index == deep
+  ));
+}
+
+/// `prewarm` warms exactly the default plan's window, because it reads its
+/// length from that constant. The tone it builds is unchanged from before the
+/// long path existed (10 s at 16 kHz was already 160 000 samples), so this is a
+/// single-source-of-truth statement, not a behaviour change.
+#[test]
+fn prewarm_covers_the_default_plans_window() {
+  assert_eq!(
+    DEFAULT_WINDOW_SAMPLES as usize,
+    10 * SAMPLE_RATE_HZ as usize
+  );
+  assert_eq!(frame_count(DEFAULT_WINDOW_SAMPLES as usize), 1_001);
+  assert_eq!(
+    WindowPlan::new().window_samples(),
+    DEFAULT_WINDOW_SAMPLES,
+    "prewarm's clip length is the default plan's window"
+  );
+}

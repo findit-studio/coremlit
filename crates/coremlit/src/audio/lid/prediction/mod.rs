@@ -12,12 +12,135 @@ use core::cmp::{Ordering, Reverse};
 use std::collections::BinaryHeap;
 
 use crate::audio::lid::{
-  error::{Error, Result},
+  NUM_LANGUAGES,
+  error::{Error, InvalidLogProbability, Result},
   labels::Language,
 };
 
 #[cfg(test)]
 mod tests;
+
+/// One window's log-probability row paired with the [`Span`] it was scored
+/// over — `windit`'s own value type, so the per-window output composes with the
+/// windit post-processing stack (smoothing, segmentation) with no adapter.
+///
+/// [`Span`]: crate::audio::lid::Span
+pub type WindowLogProbabilities = windit::windowed::Windowed<LogProbabilities>;
+
+/// A full row of natural-log probabilities — one window's, or a whole clip's
+/// after aggregation: always exactly [`NUM_LANGUAGES`] values, indexed by model
+/// column, each `<= 0` and never NaN.
+///
+/// # What the invariant does and does not promise
+///
+/// Straight off the graph the row is a log-SOFTMAX: `exp` over it sums to 1.
+/// Aggregation preserves that for every [`ScorePooling`] — the mean policies
+/// and `Vote` produce distributions by construction, and `Max` is renormalized
+/// — but the invariant this TYPE enforces is only the pointwise one (`<= 0`,
+/// not NaN), because that is the part a hand-built row can be held to without
+/// choosing a floating-point tolerance for "sums to 1".
+///
+/// `-∞` is a legal value: it is the exact log of a zero probability, which
+/// [`ScorePooling::Vote`] produces for any language no window chose.
+/// [`LanguageScore::probability`] maps it to exactly `0.0`.
+///
+/// [`NUM_LANGUAGES`]: crate::audio::lid::NUM_LANGUAGES
+/// [`ScorePooling`]: crate::audio::lid::ScorePooling
+/// [`ScorePooling::Vote`]: crate::audio::lid::ScorePooling::Vote
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogProbabilities {
+  values: Vec<f32>,
+}
+
+impl LogProbabilities {
+  /// Wrap an already-validated row.
+  ///
+  /// # Panics
+  /// If `values.len() != NUM_LANGUAGES` — an internal invariant (every producer
+  /// is post-shape-check), not a caller-reachable path.
+  pub(crate) fn new(values: Vec<f32>) -> Self {
+    assert!(
+      values.len() == NUM_LANGUAGES,
+      "LogProbabilities requires exactly NUM_LANGUAGES values, got {}",
+      values.len()
+    );
+    Self { values }
+  }
+
+  /// Build a row by hand, for a consumer's own tests and for driving
+  /// [`aggregate_windows`] with no staged `.mlmodelc` and no inference.
+  ///
+  /// `values` is read positionally as natural-log probabilities that are
+  /// ALREADY in log space, one per model column, indexed exactly as
+  /// [`Self::as_slice`] returns them. Nothing is transformed: no softmax, no
+  /// `ln`, no renormalization. The slice is copied rather than adopted.
+  ///
+  /// # Errors
+  /// [`Error::LanguageCountMismatch`] if `values.len() != `[`NUM_LANGUAGES`];
+  /// [`Error::InvalidLogProbability`] on a NaN or a value above zero.
+  ///
+  /// # Examples
+  /// ```
+  /// use coremlit::audio::lid::{Error, LogProbabilities, NUM_LANGUAGES};
+  ///
+  /// // A near-certain call on Thai (model column 94).
+  /// let mut row = vec![-14.0f32; NUM_LANGUAGES];
+  /// row[94] = -0.01;
+  /// let scores = LogProbabilities::try_from_slice(&row)?;
+  /// assert_eq!(scores.as_slice()[94], -0.01);
+  /// assert_eq!(scores.top_k(1)?[0].code(), "th");
+  ///
+  /// // A zero probability is representable; a positive one is not.
+  /// assert!(LogProbabilities::try_from_slice(&vec![f32::NEG_INFINITY; NUM_LANGUAGES]).is_ok());
+  /// row[94] = 0.5;
+  /// assert!(matches!(
+  ///   LogProbabilities::try_from_slice(&row),
+  ///   Err(Error::InvalidLogProbability(d)) if d.index() == 94
+  /// ));
+  /// assert!(matches!(
+  ///   LogProbabilities::try_from_slice(&row[..NUM_LANGUAGES - 1]),
+  ///   Err(Error::LanguageCountMismatch(got)) if got == NUM_LANGUAGES - 1
+  /// ));
+  /// # Ok::<(), Error>(())
+  /// ```
+  ///
+  /// [`NUM_LANGUAGES`]: crate::audio::lid::NUM_LANGUAGES
+  /// [`aggregate_windows`]: crate::audio::lid::aggregate_windows
+  pub fn try_from_slice(values: &[f32]) -> Result<Self> {
+    if values.len() != NUM_LANGUAGES {
+      return Err(Error::LanguageCountMismatch(values.len()));
+    }
+    for (index, &value) in values.iter().enumerate() {
+      // Both halves are load-bearing: a NaN would sort silently under
+      // `total_cmp`, and no log-softmax output can be positive. `-inf` is NOT
+      // rejected — it is the exact log of a zero probability, which
+      // `ScorePooling::Vote` genuinely produces.
+      if value.is_nan() || value > 0.0 {
+        return Err(InvalidLogProbability::new(index, value).into());
+      }
+    }
+    Ok(Self::new(values.to_vec()))
+  }
+
+  /// The per-language natural-log probabilities, indexed by model column
+  /// ([`LanguageScore::index`]).
+  #[inline]
+  pub fn as_slice(&self) -> &[f32] {
+    &self.values
+  }
+
+  /// The top `k` languages, descending, ties broken by ascending model column —
+  /// the same ranking [`Identifier::identify`] applies to a single-window row.
+  /// `k == 0` yields an empty vec; `k` above the roster size saturates.
+  ///
+  /// # Errors
+  /// [`Error::UnknownLanguageIndex`] — defensive only.
+  ///
+  /// [`Identifier::identify`]: crate::audio::lid::Identifier::identify
+  pub fn top_k(&self, k: usize) -> Result<Vec<LanguageScore>> {
+    top_k_from_scores(self.values.iter().copied().enumerate(), k)
+  }
+}
 
 /// One ranked language: the roster row plus the model's natural-log
 /// probability for it.
@@ -93,7 +216,7 @@ impl LanguageScore {
   /// The model's score for this language, as it comes out of the graph: a
   /// **natural-log probability**, always `<= 0`, and already normalized (the
   /// graph's last op is a log-softmax, so `exp` over all
-  /// [`NUM_LANGUAGES`](crate::audio::lid::NUM_LANGUAGES) columns sums to 1).
+  /// [`NUM_LANGUAGES`] columns sums to 1).
   ///
   /// This is the value ranking compares, and the one to threshold on when a
   /// confident answer matters: log space keeps the resolution that `exp`

@@ -88,7 +88,7 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
       "ced",
       vec!["dep:rustfft", "dep:soundevents-dataset", "dep:windit"],
     ),
-    ("lid", vec!["dep:rustfft"]),
+    ("lid", vec!["dep:rustfft", "dep:windit"]),
     ("siglip", vec!["dep:tokenizers", "dep:pixon", "dep:sha2"]),
   ]
 }

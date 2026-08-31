@@ -226,9 +226,9 @@ jobs:
   #   lid        0  `clap_tokenizer_identity` would. The same is true of the
   #                 `vad` gates in the modelless `check` job.
   #
-  #                 lid's NINE `tests/lid/*` gates (5 + 4) are reached by its
-  #                 own row below. Registering that row was blocked on the fp16
-  #                 sweep, not on the download: staging `Models/lid/` puts
+  #                 lid's SIXTEEN `tests/lid/*` gates (5 + 4 + 7) are reached by
+  #                 its own row below. Registering that row was blocked on the
+  #                 fp16 sweep, not on the download: staging `Models/lid/` puts
   #                 SpeechBrainECAPAVoxLingua107.mlmodelc under
   #                 `every_shipped_model_graph_survives_fp16`, which walks
   #                 Models/ WHOLE and used to fail on it twice over. The graph
@@ -494,7 +494,7 @@ jobs:
             checksum-dir: none
             fp16-vendors: vadkit,lid
             gates: |
-              lid|lid_model_io lid_e2e
+              lid|lid_model_io lid_e2e lid_long_clip
     # Every kit's test-model override, set for every shard. Each of these
     # resolves to the same path the suite's `common/mod.rs` falls back to, so
     # nothing changes behaviorally — the point is that the gates NAME the

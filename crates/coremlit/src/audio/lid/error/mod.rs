@@ -8,8 +8,8 @@
 //!
 //! [`Error`] deliberately carries **unit and newtype variants only**. A
 //! multi-field payload lives in its own named, documented, accessor-bearing
-//! struct ([`ContractMismatch`], [`OutputShape`], [`FrameCountOutOfRange`])
-//! that the variant then wraps. Struct-shaped enum variants are the shape this
+//! struct ([`ContractMismatch`], [`OutputShape`], [`FrameCountOutOfRange`],
+//! [`InvalidLogProbability`]) that the variant then wraps. Struct-shaped enum variants are the shape this
 //! crate is moving away from (the older doors still use them; that sweep is
 //! tracked separately), and this door adds none. The practical gain is that a
 //! payload is constructible, matchable, and `Display`-able on its own —
@@ -18,6 +18,45 @@
 
 /// Convenience alias for `Result<T, `[`Error`]`>`.
 pub type Result<T> = core::result::Result<T, Error>;
+
+/// The windowed-sequence engine's own error, re-exported because
+/// [`Error::Windowing`] carries it (`audio::ced`'s convention).
+pub use windit::WinditError;
+
+/// A value offered to [`LogProbabilities::try_from_slice`] is not a natural-log
+/// probability: it is NaN, or it is greater than zero.
+///
+/// `-∞` is deliberately ACCEPTED — it is the exact log of a zero probability,
+/// which [`ScorePooling::Vote`] genuinely produces for a language no window
+/// chose. Only NaN (which would sort silently under `total_cmp`) and positive
+/// values (which no log-softmax output can take) are rejected.
+///
+/// [`LogProbabilities::try_from_slice`]: super::LogProbabilities::try_from_slice
+/// [`ScorePooling::Vote`]: super::ScorePooling::Vote
+#[derive(Debug, Clone, Copy, PartialEq, thiserror::Error)]
+#[error("log-probability at index {index} is {value}, which is not a value <= 0")]
+pub struct InvalidLogProbability {
+  index: usize,
+  value: f32,
+}
+
+impl InvalidLogProbability {
+  pub(crate) const fn new(index: usize, value: f32) -> Self {
+    Self { index, value }
+  }
+
+  /// Position of the offending value in the supplied row.
+  #[inline]
+  pub const fn index(&self) -> usize {
+    self.index
+  }
+
+  /// The offending value itself.
+  #[inline]
+  pub const fn value(&self) -> f32 {
+    self.value
+  }
+}
 
 /// A loaded model's input or output feature does not match the shape/dtype
 /// contract this module was built against (the pinned ground truth lives in
@@ -237,6 +276,38 @@ pub enum Error {
   /// (where `total_cmp` would silently sort a NaN) or `exp`.
   #[error("model output contains a non-finite log-probability at index {0}")]
   NonFiniteOutput(usize),
+
+  /// The windowing plan for a long clip could not be built — it exceeded
+  /// [`WindowPlan::max_windows`] ([`WinditError::TooManyWindows`], `got`
+  /// carrying the FULL planned count) or a span buffer could not be allocated
+  /// ([`WinditError::AllocFailed`]).
+  ///
+  /// [`WinditError`] is `#[non_exhaustive]`, so match it with a wildcard arm.
+  ///
+  /// [`WindowPlan::max_windows`]: super::WindowPlan::max_windows
+  #[error("windowing failed: {0}")]
+  Windowing(#[from] WinditError),
+
+  /// Aggregation was asked to fold an empty window list. Unreachable through
+  /// [`Identifier::identify_long`] — a clip long enough to reach the model
+  /// always plans at least one span — so this only reaches a caller who called
+  /// [`aggregate_windows`] with an empty slice.
+  ///
+  /// [`Identifier::identify_long`]: super::Identifier::identify_long
+  /// [`aggregate_windows`]: super::aggregate_windows
+  #[error("cannot aggregate an empty window list")]
+  EmptyWindows,
+
+  /// A hand-built log-probability row was not exactly
+  /// [`NUM_LANGUAGES`](super::NUM_LANGUAGES) values long, carrying the length
+  /// supplied.
+  #[error("expected a row of exactly {n} log-probabilities, got {0}", n = super::NUM_LANGUAGES)]
+  LanguageCountMismatch(usize),
+
+  /// A hand-built log-probability row carried a value that is not a natural-log
+  /// probability (NaN, or greater than zero).
+  #[error(transparent)]
+  InvalidLogProbability(#[from] InvalidLogProbability),
 
   /// A language index had no roster row, carrying that index. Defensive: the
   /// compile-time `NUM_LANGUAGES == languages().len()` assert makes this
