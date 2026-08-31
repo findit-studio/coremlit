@@ -61,6 +61,57 @@
 //! that already fits one window agree exactly — not approximately — with
 //! [`Identifier::identify`].
 //!
+//! # A row's own scale is not evidence
+//!
+//! A row's RATIOS are what it says about the languages; its overall scale says
+//! nothing. Straight off the graph a row is a log-softmax and `exp` over it
+//! should sum to 1 — and it does not, quite: fp16 arithmetic leaves it up to
+//! 7.7e-3 short on [`ComputeUnits::CpuOnly`] and 1.5e-4 short on the ANE. That
+//! deficit is a fact about how the row was computed, not about what was spoken.
+//!
+//! Folded raw it becomes a per-window WEIGHT, because three of the four
+//! poolings fold VALUES. Two equal 160 000-sample windows, each one-hot and so
+//! each perfectly certain — one on column 0 at `ln(0.99235)`, one on column 1
+//! at exactly `0.0` — used to pool to p(0) = 0.498080 against p(1) = 0.501920
+//! under [`ScorePooling::MeanProbability`], and to the same split under
+//! [`ScorePooling::Max`]: the clip went to whichever window's row had rounded
+//! better. The pooled row's mass was 1.0000000086, four orders of magnitude
+//! inside `MAX_MASS_DEVIATION`, so the postcondition could not see it.
+//!
+//! How much it was worth on real audio depends entirely on the compute unit,
+//! which is why the door's measurement tables (`audio::lid`'s own module docs)
+//! did not move when this was fixed. Over `MAX_MASS_DEVIATION`'s 192-fold
+//! sweep, normalizing at the door
+//! changed the pooled row by at most 3.8e-6 nats under `ComputeUnits::All` and
+//! `CpuAndGpu`, and 2.6e-4 on the ANE — but by 1.0e-2 on
+//! [`ComputeUnits::CpuOnly`], whose rows carry the 7.7e-3 deficit. No fold in
+//! that sweep changed its top-1 language, and [`ScorePooling::MeanLogProbability`]
+//! and [`ScorePooling::Vote`] came back bit-identical on every one of the 192.
+//!
+//! Every row is therefore made a distribution AT THE DOOR, in `push`, under the
+//! same shift the fold's exit uses — one `DistributionShift`, called from both
+//! ends, rather than the arithmetic restated per caller. Rescaling one window's
+//! row by a constant now moves the pooled row by no more than the f32 narrowing
+//! at the exit. Measured over two overlapping-support rows with one rescaled by
+//! `ln(0.99235)`, the largest per-column gap that rescale opens:
+//!
+//! | pooling                              | folding raw rows | folding normalized rows |
+//! |--------------------------------------|------------------|-------------------------|
+//! | [`ScorePooling::MeanLogProbability`] | 0.0              | 0.0                     |
+//! | [`ScorePooling::MeanProbability`]    | 1.28e-3          | 0.0                     |
+//! | [`ScorePooling::Max`]                | 4.04e-3          | 5.96e-8                 |
+//! | [`ScorePooling::Vote`]               | 0.0              | 0.0                     |
+//!
+//! The logarithmic pool was already immune, and for a reason rather than by
+//! luck: a constant added to one row adds a constant to the mean of the logs,
+//! and the closing renormalization takes exactly that constant back off.
+//!
+//! [`ScorePooling::Vote`] is the one pooling still folding the RAW row, and is
+//! exactly invariant either way. Its ballot is an `argmax` — a comparison, not
+//! arithmetic — so a shift cannot reorder it, and shifting first could only
+//! round two distinct values onto one and hand the outcome to the ranking
+//! tie-break. `the_fold_is_invariant_to_a_rows_own_scale` holds the table.
+//!
 //! # Totality: a distribution comes back, or an error does
 //!
 //! [`LogProbabilities`] accepts `-∞`. It has to: that is the exact log of a
@@ -174,10 +225,10 @@ pub enum ScorePooling {
   /// Computed as a log-sum-exp, not as a literal sum of `exp`, so a language
   /// far below the row maximum keeps a finite pooled score and its rank rather
   /// than underflowing to `-∞` (module docs, "Precision"), and renormalized at
-  /// the close. A mixture of distributions is a distribution already, so on
-  /// rows that are ones the renormalization is a no-op; it is what makes this
-  /// pooling's answer a distribution when the per-window rows are only nearly
-  /// ones, which is what the model's fp16 rows are.
+  /// the close. A mixture of distributions is a distribution already, and the
+  /// rows folded here are made distributions before they are folded, so the
+  /// closing renormalization is very nearly a no-op; what it buys is that the
+  /// answer is one whether or not the mixture arithmetic left it one.
   MeanProbability,
   /// The highest log-probability each language reached in ANY window,
   /// renormalized back into a distribution.
@@ -220,13 +271,15 @@ pub(crate) struct Accumulator {
   /// `NUM_LANGUAGES` long.
   acc: Vec<f64>,
   /// [`ScorePooling::MeanProbability`]'s log-sum-exp shift: `shift[j]` is the
-  /// largest log-probability any window has given language `j`, and `acc[j]`
-  /// the weighted probability sum taken RELATIVE to it. Empty under every
-  /// other pooling — none of them exponentiates during the fold, so none of
-  /// them needs a shift.
+  /// largest NORMALIZED log-probability any window has given language `j`
+  /// (normalized because that is what [`Self::push`] folds), and `acc[j]` the
+  /// weighted probability sum taken RELATIVE to it. Empty under every other
+  /// pooling — none of them exponentiates during the fold, so none of them
+  /// needs a shift.
   shift: Vec<f64>,
-  /// The first window's row, verbatim. Returned unchanged when it is the only
-  /// one, which is what makes a one-window fold the bit-exact identity.
+  /// The first window's row, verbatim — RAW, not the normalized row
+  /// [`Self::push`] folds. Returned unchanged when it is the only one, which is
+  /// what makes a one-window fold the bit-exact identity.
   first: Vec<f32>,
   weight_sum: f64,
   count: usize,
@@ -251,6 +304,13 @@ impl Accumulator {
   /// [`ScorePooling::Max`] ignores the weight; every other policy is
   /// proportional to it.
   ///
+  /// The row is made a distribution BEFORE it is folded, so a row's own overall
+  /// scale — which is fp noise, not evidence — cannot act as a second weight
+  /// beside `weight_samples` (module docs, "A row's own scale is not
+  /// evidence"). [`ScorePooling::Vote`] is the exception, and the first row is
+  /// kept raw for [`Self::finish`]'s identity path; both are argued at their
+  /// sites below.
+  ///
   /// # Errors
   /// [`Error::ZeroMassWindow`], carrying the window's position, if the row
   /// assigns probability zero to every language — the module docs' "Totality"
@@ -269,6 +329,12 @@ impl Accumulator {
     }
     let weight = weight_samples as f64;
     if self.count == 0 {
+      // The RAW row, before the normalization below: `finish` hands it straight
+      // back when it turns out to be the only one, and that verbatim return is
+      // the whole of the `identify_long` == `identify` promise. It is the one
+      // place in this fold where a row's own scale is the right answer, because
+      // the answer is the caller's or the model's rather than one this module
+      // computed.
       self.first = row.to_vec();
       let seed = match self.pooling {
         ScorePooling::Max => f64::NEG_INFINITY,
@@ -279,10 +345,27 @@ impl Accumulator {
         self.shift = vec![f64::NEG_INFINITY; NUM_LANGUAGES];
       }
     }
+    // The row is made a distribution HERE, at the door, before any pooling
+    // folds it — under the same shift, from the same helper, that normalizes
+    // the row the fold produces. Three of the four poolings fold VALUES, so
+    // folding a raw row folds its own overall scale along with the ratios that
+    // are the evidence, and that scale is fp noise (module docs, "A row's own
+    // scale is not evidence").
+    //
+    // `Vote` is exempt, and not by oversight. Its ballot is an `argmax`, and an
+    // argmax is a comparison: subtracting one constant from every column cannot
+    // reorder them, so normalizing first is measurably a no-op (0.0 deviation)
+    // and can only do harm — two distinct values can round onto one shifted
+    // value, creating a tie the tie-break then decides. So `Vote` reads `row`
+    // and the other three read `normalized`.
+    let normalized = match self.pooling {
+      ScorePooling::Vote => Vec::new(),
+      _ => as_distribution(row),
+    };
     match self.pooling {
       ScorePooling::MeanLogProbability => {
-        for (a, &v) in self.acc.iter_mut().zip(row) {
-          *a += weight * f64::from(v);
+        for (a, &v) in self.acc.iter_mut().zip(&normalized) {
+          *a += weight * v;
         }
       }
       // Online weighted log-sum-exp, one running shift per language, so no
@@ -291,8 +374,7 @@ impl Accumulator {
       // literal `Σ w·exp(x)` then re-logs the whole tail as `-∞` — losing an
       // ordering the input row still carried, from finite values throughout.
       ScorePooling::MeanProbability => {
-        for ((sum, shift), &v) in self.acc.iter_mut().zip(&mut self.shift).zip(row) {
-          let value = f64::from(v);
+        for ((sum, shift), &value) in self.acc.iter_mut().zip(&mut self.shift).zip(&normalized) {
           if value > *shift {
             // Re-express what is already summed against the new, larger shift.
             // While the shift is still `-∞` the sum is 0, so this is `0 · 0`.
@@ -308,10 +390,11 @@ impl Accumulator {
         }
       }
       ScorePooling::Max => {
-        for (a, &v) in self.acc.iter_mut().zip(row) {
-          *a = a.max(f64::from(v));
+        for (a, &v) in self.acc.iter_mut().zip(&normalized) {
+          *a = a.max(v);
         }
       }
+      // The RAW row, per the exemption above.
       ScorePooling::Vote => self.acc[argmax(row)] += weight,
     }
     self.weight_sum += weight;
@@ -383,15 +466,14 @@ impl Accumulator {
       // difference the constant would have made.
       //
       // Then renormalize, exactly as `Max` does. A mixture of distributions
-      // IS a distribution, so on rows that satisfy this pooling's own
-      // precondition the shift is zero and nothing moves; what it buys is
-      // that the row is a distribution whether or not they did. The model's
-      // rows do not, quite: they are log-softmax rows narrowed through fp16,
-      // and their mass is off by up to 7.7e-3 on `CpuOnly` — a deficit this
-      // pooling, alone among the four, would otherwise hand straight to the
-      // caller as `probability()` values that do not total 1. A constant
-      // shift cannot reorder the row, so no ranking this pooling reported
-      // before changes.
+      // IS a distribution, and `push` folds nothing else, so the shift is
+      // near zero and the row barely moves; what it buys is that the row is a
+      // distribution whether or not this pooling's own f64 arithmetic left it
+      // one. The model's mass deficit — 7.7e-3 on `CpuOnly` — is no longer
+      // among the things it has to absorb: it comes off each row at the door,
+      // which is also where it stops acting as a per-window weight. A
+      // constant shift cannot reorder the row, so no ranking this pooling
+      // reported before changes.
       ScorePooling::MeanProbability => {
         for (a, &s) in acc.iter_mut().zip(&shift) {
           *a = s + (*a / weight_sum).ln();
@@ -432,35 +514,101 @@ impl Accumulator {
   }
 }
 
-/// Shift `values` down by their log-sum-exp so `exp` over the row sums to 1.
+/// The one constant that turns a row of natural-log values into a distribution:
+/// subtract it from every value and `exp` over the row sums to 1.
 ///
-/// Runs the standard max-subtraction form, which is what keeps
-/// [`ScorePooling::Max`] finite when the row's maximum is far from zero. The
-/// row maximum is never `-∞` in practice (a model row is a log-softmax and its
-/// argmax is finite), and an all-`-∞` row is left alone rather than turned into
-/// NaN by `-∞ − (−∞)`. It stays infallible and total for that reason: the row
-/// it declines to touch is not a distribution, and refusing it is
-/// [`Accumulator::finish`]'s postcondition, which catches it for every pooling
-/// rather than only for the ones that renormalize.
+/// **One definition, called from both ends of the fold.** The row a pooling
+/// FOLDS is normalized by [`Accumulator::push`] and the row a pooling PRODUCES
+/// is normalized by [`renormalize`], and both take the shift from here rather
+/// than spelling it out for themselves. Two ends that each spell it out are two
+/// places to get it wrong and two places to fix it, and this module has been
+/// both: the exit's arithmetic had to be corrected once for the fusion the next
+/// paragraph describes, while the entrance — which had no normalization at all
+/// — went on folding raw rows for another two review rounds. Whatever the next
+/// change to "the shift that makes a row a distribution" is, there is now one
+/// place to make it.
 ///
-/// The two subtractions are deliberately NOT folded into one. Forming
-/// `max + ln(sum)` first and subtracting that loses `ln(sum)` entirely whenever
-/// `max` is large enough that the sum's log falls below its ULP — at −5e19 the
-/// f64 ULP is 8192, so `max + ln(2)` IS `max`, every leading column comes back
-/// as exactly `0.0`, and the row's mass is its number of leading columns
-/// instead of 1. Subtracting the shift first lands each value near zero, where
-/// the small constant is representable. The two forms agree everywhere the
-/// first one has not already lost the constant.
+/// Held in TWO parts — the row's maximum and the log of the shifted sum — which
+/// [`Self::apply`] subtracts one after the other and which nothing may fold
+/// into one. Forming `max + log_sum` and subtracting that loses `log_sum`
+/// entirely whenever `max` is large enough that the sum's log falls below its
+/// ULP: at −5e19 the f64 ULP is 8192, so `max + ln(2)` IS `max`, every leading
+/// column comes back as exactly `0.0`, and the row's mass is its number of
+/// leading columns instead of 1. Subtracting the maximum first lands each value
+/// near zero, where the small constant is representable. The two forms agree
+/// everywhere the fused one has not already lost the constant.
+#[derive(Debug, Clone, Copy)]
+struct DistributionShift {
+  max: f64,
+  log_sum: f64,
+}
+
+impl DistributionShift {
+  /// The shift for the row `values` yields.
+  ///
+  /// Total, and deliberately so: a row whose maximum is not finite has no shift
+  /// that makes it a distribution — an all-`-∞` row is the case that reaches
+  /// here, and `-∞ − (−∞)` is NaN — so the shift is the IDENTITY and the row
+  /// comes back untouched rather than poisoned. Refusing such a row belongs to
+  /// [`Accumulator::push`]'s precondition at the entrance and
+  /// [`Accumulator::finish`]'s postcondition at the exit, which cover every
+  /// pooling between them; doing it here as well would only give the shift a
+  /// second place to disagree with them.
+  fn of(values: impl Iterator<Item = f64> + Clone) -> Self {
+    let max = values.clone().fold(f64::NEG_INFINITY, f64::max);
+    if !max.is_finite() {
+      return Self {
+        max: 0.0,
+        log_sum: 0.0,
+      };
+    }
+    let sum: f64 = values.map(|v| (v - max).exp()).sum();
+    Self {
+      max,
+      log_sum: sum.ln(),
+    }
+  }
+
+  /// `value`, shifted — the two subtractions, in the order that keeps the
+  /// second one representable.
+  fn apply(self, value: f64) -> f64 {
+    (value - self.max) - self.log_sum
+  }
+}
+
+/// Shift `values` down by their log-sum-exp so `exp` over the row sums to 1 —
+/// the fold's EXIT normalizer, closing [`ScorePooling::MeanLogProbability`],
+/// [`ScorePooling::MeanProbability`] and [`ScorePooling::Max`].
+///
+/// The max-subtraction form is what keeps [`ScorePooling::Max`] finite when the
+/// row's maximum is far from zero; [`DistributionShift`] carries the arithmetic
+/// and the reason its two subtractions must stay apart. The row maximum is
+/// never `-∞` in practice (a model row is a log-softmax and its argmax is
+/// finite), and an all-`-∞` row is left alone rather than turned into NaN. It
+/// stays infallible and total for that reason: the row it declines to touch is
+/// not a distribution, and refusing it is [`Accumulator::finish`]'s
+/// postcondition, which catches it for every pooling rather than only for the
+/// ones that renormalize.
 fn renormalize(values: &mut [f64]) {
-  let max = values.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-  if !max.is_finite() {
-    return;
-  }
-  let sum: f64 = values.iter().map(|v| (v - max).exp()).sum();
-  let log_sum = sum.ln();
+  let shift = DistributionShift::of(values.iter().copied());
   for v in values {
-    *v = (*v - max) - log_sum;
+    *v = shift.apply(*v);
   }
+}
+
+/// `row` as a distribution, in f64 — the fold's ENTRANCE normalizer, and the
+/// values [`Accumulator::push`] actually folds.
+///
+/// A row's own total mass is fp noise: a model row comes back up to 7.7e-3
+/// short of 1 on [`ComputeUnits::CpuOnly`] and 1.5e-4 short on the ANE, and
+/// that deficit says nothing about any language, only about the graph's fp16
+/// arithmetic. Folded raw it acts as a per-window WEIGHT — see the module docs'
+/// "A row's own scale is not evidence" section for the two windows it flipped.
+///
+/// [`ComputeUnits::CpuOnly`]: crate::ComputeUnits::CpuOnly
+fn as_distribution(row: &[f32]) -> Vec<f64> {
+  let shift = DistributionShift::of(row.iter().copied().map(f64::from));
+  row.iter().map(|&v| shift.apply(f64::from(v))).collect()
 }
 
 /// Whether `row` carries any probability mass — whether `exp` over it sums to
@@ -479,9 +627,11 @@ fn has_probability_mass(row: &[f32]) -> bool {
 /// How far a FOLDED row's probability mass may sit from 1 before
 /// [`Accumulator::finish`] refuses it.
 ///
-/// Measured, not chosen. Every pooling normalizes the row it folds, so the only
-/// deviation that should survive is the narrowing to f32 at the exit. Two
-/// numbers bound that:
+/// Measured, not chosen. Every row that ENTERS the fold is normalized at the
+/// door and every row that LEAVES it is a distribution by construction
+/// ([`ScorePooling::Vote`], from the shares it divides) or by a closing
+/// renormalization (the other three), so the only deviation that should survive
+/// is the narrowing to f32 at the exit. Two numbers bound that:
 ///
 /// - **Derived.** A row that sums to 1 in f64 has mass error at most
 ///   `Σ p·2⁻²⁴·|ln p|`, maximized by the uniform row at
@@ -490,9 +640,11 @@ fn has_probability_mass(row: &[f32]) -> bool {
 ///   clip spliced with English, and English alone, at three geometries
 ///   (10 s/10 s, 5 s/2.5 s, 3 s/3 s), on all four compute units and all four
 ///   poolings — 192 folds over 2 to 20 windows each — the largest deviation
-///   any fold produced was **5.7e-8**.
+///   any fold produced was **3.9e-8** (`Max`, on the ANE). It was 5.7e-8 while
+///   the fold still took raw rows; normalizing each row before folding it
+///   removed the input deficit the exit shift had been absorbing.
 ///
-/// `1e-5` is 36× the derived bound and 177× the largest observed, and still
+/// `1e-5` is 36× the derived bound and 258× the largest observed, and still
 /// four orders of magnitude below either defect this postcondition was written
 /// for (mass 2 and mass 0.5). What it is NOT derived from is the model: the
 /// same sweep's raw per-window rows are off by up to **7.7e-3**, five orders

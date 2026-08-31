@@ -626,7 +626,9 @@ fn a_pool_far_below_zero_is_still_normalized() {
 
 /// `renormalize` is written so the shift comes off before the small constant
 /// does, which is the whole of the fix above. Stated directly on the function
-/// so it cannot be lost by a change to which poolings call it.
+/// so it cannot be lost by a change to which poolings call it — and, since
+/// `renormalize` and `push` now share one `DistributionShift`, it pins the
+/// arithmetic at BOTH ends of the fold rather than only at the exit.
 #[test]
 fn renormalize_does_not_lose_its_constant_against_a_huge_shift() {
   let mut values = vec![-1e20f64; NUM_LANGUAGES];
@@ -746,8 +748,14 @@ fn max_over_rows_with_no_mass_is_refused() {
 ///
 /// It is the one pooling whose output mass would otherwise be its inputs'.
 /// Model rows are log-softmax rows narrowed through fp16 and do not sum to 1
-/// exactly — measured 7.7e-3 short on `CpuOnly` — so without the closing
-/// renormalization this pooling alone hands that deficit to the caller.
+/// exactly — measured 7.7e-3 short on `CpuOnly` — and this pooling alone would
+/// hand that deficit straight to the caller.
+///
+/// TWO independent guards now stop it, and this test holds the PROPERTY rather
+/// than either mechanism: `push` makes every row a distribution before folding
+/// it (which is also what stops the deficit acting as a per-window weight —
+/// module docs, "A row's own scale is not evidence"), and the fold still closes
+/// with a renormalization whatever the rows were.
 #[test]
 fn the_linear_pool_returns_a_distribution_from_rows_that_only_nearly_are() {
   let short = (0.99f64 / NUM_LANGUAGES as f64).ln() as f32;
@@ -810,5 +818,212 @@ fn every_folded_row_is_normalized_to_far_inside_the_tolerance() {
       "{pooling:?} deviation {deviation:e} is within an order of magnitude of \
        the tolerance {MAX_MASS_DEVIATION:e}"
     );
+  }
+}
+
+// ── A row's own scale ───────────────────────────────────────────────────────
+
+/// The mass a real log-softmax row comes back with on `CpuOnly`: 7.7e-3 short
+/// of 1. Its log is what that deficit subtracts from every column of the row,
+/// and subtracting a constant from a whole row changes no ratio inside it — so
+/// it is the exact shape of "carries no evidence about any language".
+const CPU_ONLY_ROW_MASS: f64 = 0.99235;
+
+/// `row` with `by` added to every column — the row at a different overall
+/// scale, saying exactly the same thing about every language.
+fn rescaled(row: &LogProbabilities, by: f32) -> LogProbabilities {
+  let values: Vec<f32> = row.as_slice().iter().map(|v| v + by).collect();
+  LogProbabilities::try_from_slice(&values).expect("a non-positive row stays one under a shift")
+}
+
+/// The largest per-column gap between two pooled rows, in log space. Equal
+/// columns count as zero so a shared `-∞` is a match rather than a NaN.
+fn max_abs_difference(a: &LogProbabilities, b: &LogProbabilities) -> f64 {
+  a.as_slice()
+    .iter()
+    .zip(b.as_slice())
+    .map(|(&x, &y)| {
+      if x == y {
+        0.0
+      } else {
+        (f64::from(x) - f64::from(y)).abs()
+      }
+    })
+    .fold(0.0f64, f64::max)
+}
+
+/// A window's own probability-mass deficit is fp noise, and it used to decide
+/// the clip.
+///
+/// Two equal-length windows, each one-hot and so each perfectly certain of its
+/// own language: window 0 on column 0 at `ln(0.99235)`, the mass a real
+/// `CpuOnly` row comes back with, and window 1 on column 1 at exactly `0.0`.
+/// Nothing separates them but the first row's narrowing error. Folding the RAW
+/// rows let that error act as a per-window WEIGHT: both `MeanProbability` and
+/// `Max` returned col0 = −0.69699425 against col1 = −0.68931484, which is
+/// p0 = 0.498080163 against p1 = 0.501919846, so column 1 won both. (`Max`
+/// carries the deficit in as `-0.00767941` against `0.0` and the exit shift
+/// then lands it in the same place.) The folded mass was 1.0000000086 — four
+/// orders inside `MAX_MASS_DEVIATION`, so the postcondition could not see it.
+///
+/// Normalized at the door the two columns tie exactly, and the crate's
+/// ascending-index tie-break takes column 0.
+#[test]
+fn a_windows_own_mass_deficit_does_not_outvote_an_equally_certain_window() {
+  let one_hot = |index: usize, value: f32| {
+    let mut values = vec![f32::NEG_INFINITY; NUM_LANGUAGES];
+    values[index] = value;
+    LogProbabilities::try_from_slice(&values).expect("one finite value among -inf")
+  };
+  let deficit = CPU_ONLY_ROW_MASS.ln() as f32;
+  let windows = vec![
+    window(one_hot(0, deficit), 0, WINDOW),
+    window(one_hot(1, 0.0), WINDOW, WINDOW),
+  ];
+
+  // Every pooling is measured before anything is asserted, so a failure names
+  // all of them rather than the first one to go.
+  let mut wrong = Vec::new();
+  for pooling in [ScorePooling::MeanProbability, ScorePooling::Max] {
+    let out = aggregate_windows(pooling, &windows).expect("aggregate");
+    let (col0, col1) = (out.as_slice()[0], out.as_slice()[1]);
+    let winner = argmax(out.as_slice());
+    println!(
+      "codex trigger  {pooling:>18?}  winner {winner}  col0 {col0:.8} col1 {col1:.8}  \
+       p0 {:.9} p1 {:.9}  mass {:.10}",
+      f64::from(col0).exp(),
+      f64::from(col1).exp(),
+      mass(&out)
+    );
+    if winner != 0 || col0 != col1 {
+      wrong.push(format!(
+        "{pooling:?}: winner {winner}, col0 {col0} vs col1 {col1} (p0 {}, p1 {})",
+        f64::from(col0).exp(),
+        f64::from(col1).exp()
+      ));
+    }
+  }
+  assert!(
+    wrong.is_empty(),
+    "a 7.7e-3 mass deficit, which is fp noise and not evidence, decided the clip:\n  {}",
+    wrong.join("\n  ")
+  );
+
+  // The other two are unmoved either way, and both are pinned here so the fix
+  // is held to changing only what it had to.
+  //
+  // The logarithmic pool over these two windows has disjoint supports, so its
+  // honest answer is that every language has probability zero — before the fix
+  // and after it.
+  assert!(
+    matches!(
+      aggregate_windows(ScorePooling::MeanLogProbability, &windows),
+      Err(Error::ZeroMassAggregate(ScorePooling::MeanLogProbability))
+    ),
+    "the logarithmic pool over disjoint supports is refused, not repaired"
+  );
+  // A vote is an argmax, and an argmax is a comparison: the deficit never
+  // reached it, so nothing here moves.
+  let voted = aggregate_windows(ScorePooling::Vote, &windows).expect("aggregate");
+  assert_eq!(voted.as_slice()[0], 0.5f32.ln());
+  assert_eq!(voted.as_slice()[1], 0.5f32.ln());
+  assert_eq!(argmax(voted.as_slice()), 0);
+}
+
+/// Scale invariance, as a property rather than a comment: rescaling ONE
+/// window's row by a constant — which changes no probability ratio inside it,
+/// and so tells the fold nothing new about any language — must not move the
+/// pooled row by more than the f32 narrowing at the exit.
+///
+/// This is the invariant the module was missing. The largest per-column gap the
+/// rescale opens, over the two overlapping-support rows below:
+///
+/// | pooling  | folding raw rows | folding normalized rows |
+/// |----------|------------------|-------------------------|
+/// | meanlog  | 0.0              | 0.0                     |
+/// | meanprob | 1.2791e-3        | 0.0                     |
+/// | max      | 4.0376e-3        | 5.9605e-8               |
+/// | vote     | 0.0              | 0.0                     |
+///
+/// The test prints the right-hand column on every run, so the table is
+/// re-measured rather than remembered.
+#[test]
+fn the_fold_is_invariant_to_a_rows_own_scale() {
+  let baseline =
+    LogProbabilities::try_from_slice(&distribution(&[(94, 0.62), (3, 0.23), (61, 0.15)]))
+      .expect("row");
+  let other = LogProbabilities::try_from_slice(&distribution(&[(3, 0.44), (94, 0.31), (61, 0.25)]))
+    .expect("row");
+  let deficit = CPU_ONLY_ROW_MASS.ln() as f32;
+  let scaled_other = rescaled(&other, deficit);
+  // Non-vacuity: the rescale must actually change the row it is given.
+  assert!(deficit < 0.0, "the deficit must be a real shift");
+  assert_ne!(scaled_other.as_slice(), other.as_slice());
+
+  let plain = vec![
+    window(baseline.clone(), 0, WINDOW),
+    window(other, WINDOW, WINDOW),
+  ];
+  let scaled = vec![
+    window(baseline, 0, WINDOW),
+    window(scaled_other, WINDOW, WINDOW),
+  ];
+
+  // All four are measured before anything is asserted, so the failure carries
+  // the whole table rather than the first row of it.
+  let mut moved = Vec::new();
+  for pooling in all_poolings() {
+    let from_plain = aggregate_windows(pooling, &plain).expect("aggregate");
+    let from_scaled = aggregate_windows(pooling, &scaled).expect("aggregate");
+    let deviation = max_abs_difference(&from_plain, &from_scaled);
+    println!("scale-invariance  {pooling:>18?}  {deviation:.4e}");
+    if deviation >= SCALE_INVARIANCE_FLOOR {
+      moved.push(format!("{pooling:?}: {deviation:e}"));
+    }
+  }
+  assert!(
+    moved.is_empty(),
+    "rescaling one window's row by a constant moved the pooled row further than the \
+     f32 narrowing floor {SCALE_INVARIANCE_FLOOR:e}:\n  {}",
+    moved.join("\n  ")
+  );
+}
+
+/// How far a pooled row may move when one window's row is rescaled by a
+/// constant.
+///
+/// Measured, not chosen: the fold runs in f64 and narrows once at the exit, so
+/// the only gap that survives is that narrowing. Three of the four poolings
+/// come back bit-identical and `Max` moves by 5.96e-8 — one f32 ULP at
+/// `ln(0.5)`. This is 17× that, leaving room for a platform whose `exp`/`ln`
+/// round a unit differently, and still four orders of magnitude below what
+/// folding raw rows produced (1.28e-3 and 4.04e-3), which is the thing it has
+/// to catch.
+const SCALE_INVARIANCE_FLOOR: f64 = 1e-6;
+
+/// The identity path keeps the row it was GIVEN — deficit and all.
+///
+/// Normalizing at the door must not reach it: a lone window is the caller's or
+/// the model's row, returned verbatim, and that is precisely what makes
+/// `identify_long` a bit-for-bit drop-in for `identify`. The row used here is
+/// deliberately NOT a distribution, so a normalization that leaked into
+/// `self.first` would move every column of it.
+#[test]
+fn a_lone_window_keeps_its_own_mass_deficit() {
+  let deficit = CPU_ONLY_ROW_MASS.ln() as f32;
+  let row = rescaled(
+    &LogProbabilities::try_from_slice(&distribution(&[(94, 0.62), (3, 0.23), (61, 0.15)]))
+      .expect("row"),
+    deficit,
+  );
+  let remaining = mass(&row);
+  assert!(
+    (remaining - CPU_ONLY_ROW_MASS).abs() < 1e-4,
+    "the fixture must not already be a distribution, or this proves nothing: mass {remaining}"
+  );
+
+  for pooling in all_poolings() {
+    let out = aggregate_windows(pooling, &[window(row.clone(), 0, WINDOW)]).expect("aggregate");
+    assert_eq!(out.as_slice(), row.as_slice(), "{pooling:?}");
   }
 }
