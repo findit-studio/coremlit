@@ -122,6 +122,6 @@ pub use align::{
   SimilarityTransform, TEMPLATE_BYTES, TEMPLATE_SIZE,
 };
 pub use embed::{
-  ChannelOrder, DEFAULT_FACE_COMPUTE, FaceEmbedder, FaceEmbedderOptions, FaceEmbedding, FaceModel,
-  Preprocessing, TensorLayout,
+  ChannelOrder, DEFAULT_FACE_COMPUTE, EmbeddingSpace, FaceEmbedder, FaceEmbedderOptions,
+  FaceEmbedding, FaceModel, Preprocessing, TensorLayout,
 };

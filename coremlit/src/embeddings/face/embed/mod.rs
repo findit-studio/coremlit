@@ -47,7 +47,7 @@ use crate::{
 };
 
 /// The channel order a model's input tensor expects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 pub enum ChannelOrder {
@@ -58,7 +58,7 @@ pub enum ChannelOrder {
 }
 
 /// The axis order a model's input tensor expects.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[cfg_attr(feature = "serde", serde(rename_all = "kebab-case"))]
 pub enum TensorLayout {
@@ -69,19 +69,75 @@ pub enum TensorLayout {
   Nhwc,
 }
 
+/// One `f32` preprocessing field as its SEMANTIC identity: the bit pattern,
+/// with the representations that mean the same thing folded onto one.
+///
+/// Two foldings, and each closes a case where a raw `to_bits` comparison says
+/// "different" about preprocessing that is not:
+///
+/// - **`−0.0` and `+0.0` are one value.** They are the same real number, so
+///   `byte · scale + bias` is the same function either way. (The produced
+///   tensor can still differ in the SIGN of a zero — with a negative scale,
+///   byte `0` gives `−0.0 + +0.0 = +0.0` against `−0.0 + −0.0 = −0.0` — and
+///   nothing downstream reads the sign of a zero. Nothing else can differ.)
+/// - **Every NaN is one value.** A NaN scale is a broken manifest, but it is
+///   ONE broken manifest: without this it would not equal itself, and an
+///   embedding would be refused against its own twin for a reason having
+///   nothing to do with either embedding.
+///
+/// Both foldings are reflexive, symmetric and transitive, which is what lets
+/// [`Preprocessing`] and [`EmbeddingSpace`] be [`Eq`] at all — `f32`'s own
+/// `PartialEq` is not an equivalence relation.
+fn canonical_bits(value: f32) -> u32 {
+  if value.is_nan() {
+    f32::NAN.to_bits()
+  } else if value == 0.0 {
+    0
+  } else {
+    value.to_bits()
+  }
+}
+
 /// One model's host-side preprocessing: `value = byte · scale + bias[channel]`.
 ///
 /// `scale` and `bias` are in the MODEL's channel order, so a BGR model's
 /// per-channel bias is written blue-first. Both forms in the module table
 /// reduce to this: a divisor `d` and a mean `m` are `scale = 1/d`,
 /// `bias = −m/d`.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// Equality is `canonical_bits` on the two float fields rather than `f32`'s
+/// own `==` or a raw bit comparison, which is why this is [`Eq`] and [`Hash`].
+/// It is the SAME relation [`EmbeddingSpace`] decides a cosine by — one type
+/// must not carry two equalities that disagree.
+#[derive(Debug, Clone, Copy)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Preprocessing {
   order: ChannelOrder,
   layout: TensorLayout,
   scale: f32,
   bias: [f32; 3],
+}
+
+impl PartialEq for Preprocessing {
+  #[inline]
+  fn eq(&self, other: &Self) -> bool {
+    self.order == other.order
+      && self.layout == other.layout
+      && canonical_bits(self.scale) == canonical_bits(other.scale)
+      && self.bias.map(canonical_bits) == other.bias.map(canonical_bits)
+  }
+}
+
+impl Eq for Preprocessing {}
+
+impl core::hash::Hash for Preprocessing {
+  #[inline]
+  fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+    core::hash::Hash::hash(&self.order, state);
+    core::hash::Hash::hash(&self.layout, state);
+    core::hash::Hash::hash(&canonical_bits(self.scale), state);
+    core::hash::Hash::hash(&self.bias.map(canonical_bits), state);
+  }
 }
 
 impl Preprocessing {
@@ -152,6 +208,66 @@ impl Preprocessing {
   }
 }
 
+/// The space one embedder's vectors live in: the part of a [`FaceModel`] that
+/// decides what the NUMBERS are.
+///
+/// # Why this is a type and not just "the manifest"
+///
+/// A [`FaceModel`] carries two unrelated kinds of field. `dim` and
+/// [`Preprocessing`] are part of the function that produced the vector: change
+/// a divisor or a channel order and every component moves. The feature NAMES
+/// are not — they are the strings CoreML routes a tensor by, and re-exporting
+/// one set of weights under different names produces the same numbers.
+///
+/// Deciding a cosine on the whole manifest therefore meant one type carrying
+/// two disagreeing notions of "same": `FaceModel`'s own equality, and the walk
+/// [`FaceEmbedding::dot`] refused on. Projecting the space out makes each type
+/// carry exactly one, and makes the projection something a reader can see.
+///
+/// A [`FaceEmbedding`] carries one of these, not a manifest — it has no
+/// business remembering which feature name its tensor arrived under.
+#[derive(Debug, Clone, Copy)]
+pub struct EmbeddingSpace {
+  dim: usize,
+  preprocessing: Preprocessing,
+}
+
+impl EmbeddingSpace {
+  /// The embedding width — [`FaceModel::dim`], reconciled against the
+  /// artifact's declared output at load.
+  #[inline]
+  pub const fn dim(&self) -> usize {
+    self.dim
+  }
+
+  /// The host-side preprocessing the pixels went through.
+  #[inline]
+  pub const fn preprocessing(&self) -> Preprocessing {
+    self.preprocessing
+  }
+}
+
+impl PartialEq for EmbeddingSpace {
+  /// **Defined as `space_difference` finding nothing** — the very walk
+  /// [`FaceEmbedding::dot`] refuses on, so `a == b` and `a.dot(b)` cannot
+  /// disagree about whether two vectors are comparable. One relation, written
+  /// once.
+  #[inline]
+  fn eq(&self, other: &Self) -> bool {
+    space_difference(*self, *other).is_none()
+  }
+}
+
+impl Eq for EmbeddingSpace {}
+
+impl core::hash::Hash for EmbeddingSpace {
+  #[inline]
+  fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+    core::hash::Hash::hash(&self.dim, state);
+    core::hash::Hash::hash(&self.preprocessing, state);
+  }
+}
+
 /// One face-embedding artifact's contract: what its input and output features
 /// are called, how it wants its pixels, and how wide its embedding is.
 ///
@@ -162,7 +278,15 @@ impl Preprocessing {
 /// with the artifact rather than a runtime setting, and `Deserialize` cannot
 /// produce a `&'static str` at all. The part that genuinely varies between
 /// artifacts — [`Preprocessing`] — is serialisable on its own.
-#[derive(Debug, Clone, Copy, PartialEq)]
+///
+/// Equality here is equality of all four fields, with the floats compared by
+/// `canonical_bits` as [`Preprocessing`] compares them. That is a strictly
+/// finer relation than [`EmbeddingSpace`]'s, and deliberately a DIFFERENT type's
+/// relation: two manifests naming different features are different manifests —
+/// they load different tensors — while being the same space. Which question is
+/// being asked is settled by which type is compared, not by which of two
+/// equalities on one type happened to be reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FaceModel {
   input: &'static str,
   output: &'static str,
@@ -207,6 +331,19 @@ impl FaceModel {
   #[inline]
   pub const fn preprocessing(&self) -> Preprocessing {
     self.preprocessing
+  }
+
+  /// The [`EmbeddingSpace`] this manifest's vectors live in: everything here
+  /// that decides the numbers, and nothing that only routes them.
+  ///
+  /// The one place the projection happens, so "which fields are the space" has
+  /// a single answer with a single definition.
+  #[inline]
+  pub const fn space(&self) -> EmbeddingSpace {
+    EmbeddingSpace {
+      dim: self.dim,
+      preprocessing: self.preprocessing,
+    }
   }
 
   /// Builder form of [`Self::set_preprocessing`].
@@ -309,14 +446,39 @@ impl FaceEmbedderOptions {
 /// widths agreeing does not establish that: two 512-wide ArcFace-family
 /// artifacts, or one artifact fed BGR where it was trained on RGB, produce
 /// vectors whose dot product lands in `[−1, 1]` looking exactly like a
-/// measurement. So each embedding carries the [`FaceModel`] that produced it
-/// and [`Self::dot`] REFUSES a pair that disagrees.
+/// measurement. So each embedding carries the [`EmbeddingSpace`] it was
+/// produced in and [`Self::dot`] REFUSES a pair that disagrees.
 ///
 /// **A value here is produced, never assembled.** There is no public
-/// constructor: the only way to obtain a `FaceEmbedding` is
-/// [`FaceEmbedder::embed`], which stamps its own bound manifest onto every row
-/// it returns. So the space is not something a caller states about a vector —
-/// it is what the embedder that computed the vector was loaded against.
+/// constructor for a `FaceEmbedding`: the only way to obtain one is
+/// [`FaceEmbedder::embed`], which stamps the space of its own bound manifest
+/// onto every row it returns.
+///
+/// # What that guarantee IS, and what a previous round claimed it was
+///
+/// It was written down here that "there is no public `FaceModel` constructor,
+/// so a caller-built `FaceModel` can never be stamped on a vector". **That is
+/// false.** [`FaceModel::new`] and [`Preprocessing::new`] are both public
+/// `const fn`, and [`FaceEmbedder::load`] takes the manifest from its caller —
+/// so every field of the space on every vector is a value the caller chose. A
+/// guarantee resting on that sentence was resting on nothing, and the sentence
+/// is kept here inverted rather than deleted, because the shape of the mistake
+/// is the useful part: the unforgeable thing was never the manifest, it was
+/// the VECTOR.
+///
+/// What is actually true, stated as narrowly as it holds:
+///
+/// - a `FaceEmbedding`'s components came out of a real prediction by an
+///   embedder this crate loaded — no caller can assemble one;
+/// - the space stamped on it is the space that embedder actually preprocessed
+///   with, not a claim made later at the comparison site;
+/// - `dim` was reconciled against the artifact's own declared output width at
+///   load — **except** for a legacy `neuralNetwork` export that declares no
+///   shape, where it remains the caller's claim until the first prediction
+///   checks it;
+/// - the preprocessing half is caller-stated and cannot be otherwise: the
+///   artifact does not declare its own normalisation, and the preprocessing
+///   really is what the host did to the pixels, so comparing it is sound.
 ///
 /// # What this takes from `audio::speaker::calibrate`, and what it does not
 ///
@@ -327,8 +489,8 @@ impl FaceEmbedderOptions {
 /// caller-owned state at all.
 ///
 /// Taken: the identity rides on the value rather than being an argument at the
-/// call site, no caller-owned value takes part in deciding it, and the part
-/// this crate cannot refute is stated below instead of claimed away.
+/// call site, nothing is *resolved* at the comparison site, and the part this
+/// crate cannot refute is stated below instead of claimed away.
 ///
 /// **Not taken: a minted, process-unique token, and the reason is a
 /// difference in the two problems rather than a lighter standard.** A cohort is
@@ -340,25 +502,42 @@ impl FaceEmbedderOptions {
 /// wrong answer is not the precedent's cure. There is also no lookup here to
 /// remove: `calibrate`'s defect was a question that could be answered twice
 /// differently, and [`Self::dot`] asks nothing of caller-owned state — it
-/// compares two values' own recorded manifests, by bit pattern, so a NaN
-/// scale still names one consistent space rather than a space unequal to
-/// itself.
+/// compares two values' own recorded spaces.
 ///
-/// **The residual, stated.** Equality of manifests is the strongest evidence a
-/// sans-I/O crate holds: `coremlit` does not hold the weights, so two DISTINCT
-/// artifacts declaring the same feature names, width and preprocessing are one
-/// space as far as this type can see, and their cosine is returned rather than
-/// refused. That is the same shape as `calibrate`'s own stated residual —
-/// `Enrolled::new` *claims* a probe belongs to a speaker and no type in this
-/// crate can refute it. [`AlignedFace::from_template_pixels`] carries the
-/// matching hole on the pixel side, and says so.
+/// # The residual, stated
+///
+/// **Equality of spaces is the strongest evidence a sans-I/O crate holds, and
+/// it is strictly weaker than identity of artifacts.** `coremlit` does not hold
+/// the weights — it is handed a path, and the thing that decides an embedding
+/// space is the trained parameters behind it — so two DISTINCT artifacts loaded
+/// with the same width and the same preprocessing are one space as far as this
+/// type can see, and their cosine is returned rather than refused. No
+/// arrangement of manifest fields closes that; closing it would take a witness
+/// derived from the weights, which is a different crate's job.
+///
+/// Two consequences worth being explicit about, because both were previously
+/// obscured by comparing the feature names:
+///
+/// - comparing the names caught *some* different-artifact pairs by accident,
+///   and that accident is gone. It was never evidence — two unrelated exports
+///   are free to call their features `data` and `embedding` — and it cost a
+///   false refusal every time one set of weights was re-exported under other
+///   names;
+/// - a caller who needs artifact identity has to carry it themselves, exactly
+///   as `calibrate`'s caller carries the map from their library key to a
+///   [`crate::audio::speaker::calibrate::SpeakerToken`]. That is the same shape
+///   as `calibrate`'s own stated residual: `Enrolled::new` *claims* a probe
+///   belongs to a speaker and no type in this crate can refute it.
+///
+/// [`AlignedFace::from_template_pixels`] carries the matching hole on the pixel
+/// side, and says so.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FaceEmbedding {
   /// The unit-norm components. Always `space.dim()` of them: the only
-  /// constructor fills this from a row the manifest's own width cut.
+  /// constructor fills this from a row the space's own width cut.
   values: Box<[f32]>,
-  /// The manifest of the embedder that produced this vector.
-  space: FaceModel,
+  /// The space of the embedder that produced this vector.
+  space: EmbeddingSpace,
 }
 
 impl FaceEmbedding {
@@ -380,24 +559,29 @@ impl FaceEmbedding {
     self.values.to_vec()
   }
 
-  /// The manifest of the embedder that produced this embedding — the space it
-  /// lives in.
+  /// The [`EmbeddingSpace`] this vector lives in — the space of the embedder
+  /// that produced it.
   ///
-  /// Readable so a caller storing embeddings can tell which artifact a stored
-  /// vector came from. Reading it cannot forge one: [`FaceEmbedding`] has no
-  /// public constructor, so a [`FaceModel`] a caller builds can never end up
-  /// stamped on a vector this crate did not compute.
+  /// Readable so a caller storing embeddings can group them, and so a stored
+  /// vector can be checked against a freshly loaded embedder before a batch of
+  /// comparisons rather than one at a time.
+  ///
+  /// **Reading it forges nothing, and stating a space forges nothing either.**
+  /// Every field here is one the caller handed to [`FaceEmbedder::load`]; what
+  /// cannot be assembled is a [`FaceEmbedding`], which has no public
+  /// constructor. See this type's doc for what that does and does not
+  /// establish.
   #[inline]
-  pub const fn manifest(&self) -> &FaceModel {
-    &self.space
+  pub const fn space(&self) -> EmbeddingSpace {
+    self.space
   }
 
   /// The dot product with `other`, which for two unit vectors in one space is
   /// their cosine.
   ///
   /// # Errors
-  /// [`Error::IncomparableEmbeddings`] if the two came from different model or
-  /// preprocessing spaces, naming the first manifest field that differs.
+  /// [`Error::IncomparableEmbeddings`] if the two came from different spaces,
+  /// naming the first field that differs.
   ///
   /// **Fallible rather than a sentinel.** This used to return `0.0` for a
   /// width mismatch, which is also what a measured orthogonal pair returns —
@@ -407,7 +591,7 @@ impl FaceEmbedding {
   /// report before — equal widths, different spaces — is the rest of it.
   #[inline]
   pub fn dot(&self, other: &Self) -> Result<f32> {
-    if let Some(field) = space_difference(&self.space, &other.space) {
+    if let Some(field) = space_difference(self.space, other.space) {
       return Err(Error::IncomparableEmbeddings(IncomparableEmbeddings::new(
         field,
       )));
@@ -433,34 +617,28 @@ impl FaceEmbedding {
   }
 }
 
-/// The first field of two manifests that puts their embeddings in different
-/// spaces, or `None` when they name one space.
+/// The first field of two spaces that puts their embeddings in different
+/// spaces, or `None` when they are one space.
 ///
-/// The `f32`s are compared by BIT PATTERN rather than by `==`. A manifest with
-/// a NaN scale is a broken manifest, but it is ONE broken manifest: under `==`
-/// it would fail to equal itself and every comparison involving it — including
-/// an embedding against its own twin — would be refused for a reason that has
-/// nothing to do with the two embeddings. `to_bits` makes a manifest name the
-/// same space as itself whatever it holds, which is the only property this
-/// check needs from it.
+/// **The single definition of that relation.** [`EmbeddingSpace`]'s
+/// [`PartialEq`] is this function, so the equality a caller can test and the
+/// refusal [`FaceEmbedding::dot`] raises cannot disagree; there is no second
+/// walk to drift from this one.
+///
+/// The `f32`s are compared by [`canonical_bits`] — neither `f32`'s `==`, which
+/// makes a NaN scale unequal to itself, nor a raw `to_bits`, which makes `−0.0`
+/// a different space from `+0.0`. Both of those are relations that answer a
+/// question about the SPELLING where the question asked is about the function.
 ///
 /// Every field is compared, not short-circuited — the array is built before
 /// `find_map` walks it — so the order decides only WHICH field is named when
 /// several differ at once. `Dim` leads because it is the one a caller is most
 /// likely to have caused and the only one the old width check could see.
-fn space_difference(left: &FaceModel, right: &FaceModel) -> Option<EmbeddingSpaceField> {
+fn space_difference(left: EmbeddingSpace, right: EmbeddingSpace) -> Option<EmbeddingSpaceField> {
   let (lp, rp) = (left.preprocessing(), right.preprocessing());
-  let bits = |b: [f32; 3]| b.map(f32::to_bits);
+  let bias = |b: [f32; 3]| b.map(canonical_bits);
   [
     (EmbeddingSpaceField::Dim, left.dim() != right.dim()),
-    (
-      EmbeddingSpaceField::InputFeature,
-      left.input() != right.input(),
-    ),
-    (
-      EmbeddingSpaceField::OutputFeature,
-      left.output() != right.output(),
-    ),
     (EmbeddingSpaceField::ChannelOrder, lp.order() != rp.order()),
     (
       EmbeddingSpaceField::TensorLayout,
@@ -468,11 +646,11 @@ fn space_difference(left: &FaceModel, right: &FaceModel) -> Option<EmbeddingSpac
     ),
     (
       EmbeddingSpaceField::PreprocessingScale,
-      lp.scale().to_bits() != rp.scale().to_bits(),
+      canonical_bits(lp.scale()) != canonical_bits(rp.scale()),
     ),
     (
       EmbeddingSpaceField::PreprocessingBias,
-      bits(lp.bias()) != bits(rp.bias()),
+      bias(lp.bias()) != bias(rp.bias()),
     ),
   ]
   .into_iter()
@@ -656,8 +834,9 @@ impl FaceEmbedder {
     let mut flat = vec![0.0f32; batch * dim];
     features.copy_into::<f32>(&mut flat)?;
     let mut rows = Vec::with_capacity(chunk.len());
+    let space = self.manifest.space();
     for (offset, row) in flat.chunks_exact(dim).take(chunk.len()).enumerate() {
-      rows.push(normalise_row(row, first_row + offset, &self.manifest)?);
+      rows.push(normalise_row(row, first_row + offset, space)?);
     }
     Ok(rows)
   }
@@ -925,7 +1104,7 @@ fn write_row(row: &mut [f32], face: &AlignedFace, preprocessing: Preprocessing) 
 /// smallest nonzero `f32` squares to ≈2e-90 — comfortably normal. The norm is
 /// therefore zero if and only if every component is exactly zero, which is the
 /// only row that genuinely has no direction.
-fn normalise_row(row: &[f32], index: usize, space: &FaceModel) -> Result<FaceEmbedding> {
+fn normalise_row(row: &[f32], index: usize, space: EmbeddingSpace) -> Result<FaceEmbedding> {
   if let Some(component) = row.iter().position(|v| !v.is_finite()) {
     return Err(Error::NonFiniteOutput(NonFiniteOutput::new(
       index, component,
@@ -943,10 +1122,10 @@ fn normalise_row(row: &[f32], index: usize, space: &FaceModel) -> Result<FaceEmb
     // Divided in `f64` and narrowed once, at the end: scaling in `f32` would
     // put back the overflow this widening exists to remove.
     values: row.iter().map(|v| (f64::from(*v) / norm) as f32).collect(),
-    // The one place a space is attached, and it is the embedder's OWN
-    // manifest — the artifact these numbers came out of — never a value a
-    // caller states about them.
-    space: *space,
+    // The one place a space is attached, and it is the space of the embedder
+    // that just ran — the function these numbers actually came out of — rather
+    // than one stated about them afterwards at a comparison site.
+    space,
   })
 }
 

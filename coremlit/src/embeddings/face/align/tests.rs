@@ -154,7 +154,7 @@ fn bilinear_sampling_is_exact_on_an_affine_ramp() {
   let data = linear_crop(width, height);
   let crop = FaceCrop::new(&data, width, height).expect("geometry is valid");
   let inverse = SimilarityTransform::new(1.0, 0.0, 3.25, 1.5);
-  let warped = warp_bilinear(crop, &inverse);
+  let warped = warp_bilinear(crop, &inverse).expect("an identity-scaled inverse stays inside int");
 
   let mut checked = 0usize;
   for v in 0..TEMPLATE_SIZE {
@@ -293,25 +293,34 @@ fn a_transform_that_does_not_invert_reports_its_own_scale_not_a_landmark_spread(
   // coincident landmarks that do not exist — the failure is the solved SCALE,
   // and that is what the payload has to carry.
   //
-  // The first witness has a scale that is NONZERO and still has no inverse:
-  // `1/(a² + b²)` overflows at 1e-160. A payload reporting zero here would be
-  // a sentinel rather than the measurement, so this is the assertion that
-  // discriminates one from the other.
-  let collapsed = SimilarityTransform::new(1e-160, 0.0, 1.0, 2.0);
+  // The first witness has a scale that is NONZERO and still has no inverse. It
+  // is deliberately NOT `1e-160`, which this test used to use on the strength
+  // of `1/(a² + b²)` overflowing there: `1/1e-160` is `1e160`, that transform
+  // inverts, and building a truthful payload around an untrue predicate is
+  // what the round before last actually did. The smallest subnormal is a real
+  // witness — `1/5e-324` is genuinely not representable — and it is a scale
+  // `f32` would flush to the zero this payload exists to stop reporting.
+  const SUBNORMAL: f64 = f64::from_bits(1);
+  let collapsed = SimilarityTransform::new(SUBNORMAL, 0.0, 1.0, 2.0);
   assert!(collapsed.inverse().is_none(), "the witness has no inverse");
-  assert_eq!(collapsed.scale(), 1e-160, "and its scale is not zero");
+  assert_eq!(collapsed.scale(), SUBNORMAL, "and its scale is not zero");
+  assert_eq!(
+    collapsed.scale() as f32,
+    0.0,
+    "and `f32` would render it as the zero this payload must not report"
+  );
 
   let error = collapsed
     .checked_inverse()
     .expect_err("a transform with no inverse cannot align anything");
   assert!(
-    matches!(&error, Error::NonInvertibleTransform(payload) if payload.scale() == 1e-160),
+    matches!(&error, Error::NonInvertibleTransform(payload) if payload.scale() == SUBNORMAL),
     "the payload must carry the scale that collapsed, got {error:?}"
   );
   // And what a reader actually sees, since that is where the falsehood was.
   let message = error.to_string();
   assert!(
-    message.contains("1e-160"),
+    message.contains("5e-324"),
     "the message must name the collapsed scale, got {message:?}"
   );
   assert!(
@@ -455,16 +464,46 @@ fn an_inverse_is_refused_when_any_parameter_is_non_finite() {
       .is_none(),
     "the rotation side must still be refused"
   );
-  // And the check on the way OUT is load-bearing on its own, not a duplicate
-  // of the one on the way in: a scale small enough that `1/(a² + b²)`
-  // overflows turns four finite parameters into an infinite one. OpenCV's
-  // `warpAffine` computes the same `D = 1./D` and would produce the same
-  // infinity, so refusing is both the safe answer and the faithful one.
+  // The entry guard's OWN witness, and it did not exist before the scaled
+  // reciprocal did. Under the old `D = a·a + b·b; 1./D` an infinite rotation
+  // propagated a NaN into the result and the exit check caught it, so a guard
+  // on the way in was unreachable. Scaling reaches a FINITE answer from it —
+  // `∞` scales to `(0, −0)`, and a zero transform with a finite translation
+  // passes the exit check — so without the guard this is a false `Some`
+  // mapping every template pixel onto one source point.
+  for infinite in [f64::INFINITY, f64::NEG_INFINITY] {
+    assert!(
+      SimilarityTransform::new(infinite, 0.0, 1.0, 2.0)
+        .inverse()
+        .is_none(),
+      "an infinite rotation coefficient has no inverse, and must not scale to a zero transform"
+    );
+    assert!(
+      SimilarityTransform::new(0.0, infinite, 1.0, 2.0)
+        .inverse()
+        .is_none(),
+      "the same on the other rotation coefficient, which takes the other scaling branch"
+    );
+  }
+  // The check on the way OUT is load-bearing on its own, not a duplicate of
+  // the one on the way in: a scale too small for `f64` to hold `1/s` turns
+  // four finite parameters into an infinite one. `1e-160` is NOT that witness
+  // — `1/1e-160 = 1e160` is finite, and treating it as one was the defect
+  // `the_inverse_refuses_only_transforms_that_have_no_finite_inverse` covers.
+  // The real boundary is around `5.6e-309`, below which no reciprocal exists.
   assert!(
-    SimilarityTransform::new(1e-160, 0.0, 1.0, 2.0)
+    SimilarityTransform::new(f64::from_bits(1), 0.0, 1.0, 2.0)
       .inverse()
       .is_none(),
-    "a scale whose reciprocal overflows has no finite inverse"
+    "the smallest subnormal scale has no representable reciprocal"
+  );
+  // And the same check catching a TRANSLATION built from a good inverse
+  // scale: `1e-300` inverts to `1e300`, which the shift then overflows.
+  assert!(
+    SimilarityTransform::new(1e-300, 0.0, 1e300, 0.0)
+      .inverse()
+      .is_none(),
+    "an inverse translation that overflows is still no inverse"
   );
   assert!(
     SimilarityTransform::new(1.7875, -0.1252, 5.1247, 24.1454)
@@ -475,7 +514,7 @@ fn an_inverse_is_refused_when_any_parameter_is_non_finite() {
 }
 
 #[test]
-fn cv_round_breaks_ties_to_even_and_saturates() {
+fn cv_round_breaks_ties_to_even_and_refuses_what_leaves_int() {
   // `cvRound` is `lrint` under the default rounding mode, so an exact .5 goes
   // to the EVEN neighbour — not away from zero, which is what the pixel cast
   // below does. The two tie rules sit three lines apart in this module and
@@ -483,7 +522,7 @@ fn cv_round_breaks_ties_to_even_and_saturates() {
   // never lands exactly on a half, which is most of them: the golden alone
   // could not tell the two apart.
   for (value, want) in [
-    (0.5f64, 0i64),
+    (0.5f64, 0i32),
     (1.5, 2),
     (2.5, 2),
     (3.5, 4),
@@ -496,14 +535,28 @@ fn cv_round_breaks_ties_to_even_and_saturates() {
   ] {
     assert_eq!(
       cv_round(value),
-      want,
+      Some(want),
       "cvRound({value}) must be {want} (nearest, ties to even)"
     );
   }
-  // `saturate_cast<int>` is undefined outside `int` in C++; here it saturates,
-  // and either way the coordinate lands far outside every crop.
-  assert_eq!(cv_round(1e300), i64::from(i32::MAX));
-  assert_eq!(cv_round(-1e300), i64::from(i32::MIN));
+
+  // Past `int` there is no reference answer at all: `saturate_cast<int>` is
+  // UNDEFINED outside the range in C++. This used to saturate, and saturating
+  // is precisely what let two out-of-domain terms cancel into a small,
+  // valid-looking coordinate — see
+  // `opposite_coordinate_saturations_must_not_cancel_into_a_valid_tap`. The
+  // domain is reported instead.
+  for out in [1e300, -1e300, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+    assert_eq!(cv_round(out), None, "{out} is outside `int`");
+  }
+
+  // The boundary itself is inside. `i32::MIN` and `i32::MAX` are exactly
+  // representable in `f64`, so this is the exact bound and not an
+  // approximation of one.
+  assert_eq!(cv_round(f64::from(i32::MAX)), Some(i32::MAX));
+  assert_eq!(cv_round(f64::from(i32::MIN)), Some(i32::MIN));
+  assert_eq!(cv_round(f64::from(i32::MAX) + 1.0), None);
+  assert_eq!(cv_round(f64::from(i32::MIN) - 1.0), None);
 }
 
 #[test]
@@ -581,18 +634,21 @@ fn crop_geometry_is_validated() {
 }
 
 #[test]
-fn the_i16_tap_limit_is_why_a_wide_crop_is_refused() {
-  // FIRST the read that made this a defect rather than a style point. The
-  // sampler saturates its integer tap into `i16`, as OpenCV's own
-  // `saturate_cast<short>` does, and then decides the constant-0 border by
-  // comparing the SATURATED tap against the crop's extent. Hand it a crop
-  // wider than that saturation and the two disagree: source column 33 000 is
-  // a perfectly good column of a 40 000-wide crop, but the tap arrives as
-  // `i16::MAX`, which is ALSO inside the crop — so the sampler reads column
-  // 32 767 and reports nothing.
+fn the_tap_is_exact_rather_than_saturated_into_the_crop() {
+  // The read this used to measure, on the geometry that separates the two
+  // forms. The sampler once saturated its integer tap into `i16`, as OpenCV's
+  // `saturate_cast<short>` does, and then decided the constant-0 border by
+  // comparing the SATURATED tap against the crop's extent. Past `i16` the two
+  // disagree: source column 33 000 is a perfectly good column of a 40 000-wide
+  // crop, but the tap arrived as `i16::MAX`, which is ALSO inside that crop —
+  // so the sampler read column 32 767 and reported nothing.
+  //
+  // The tap is written exactly now, so the caller's own column is read. The
+  // crop bound below is still there, and is still OpenCV's, but it is no
+  // longer what stands between an aliased tap and a wrong pixel.
   const WIDE: usize = 40_000;
   let mut row = vec![0u8; WIDE * 3];
-  row[32_767 * 3] = 200; // what a saturated tap would read
+  row[32_767 * 3] = 200; // what a saturated tap would have read
   row[33_000 * 3] = 25; // what the caller actually asked for
   let mut out = [0u8; 3];
   sample_fixed_point(
@@ -604,11 +660,40 @@ fn the_i16_tap_limit_is_why_a_wide_crop_is_refused() {
     &mut out,
   );
   assert_eq!(
-    out[0], 200,
-    "the tap saturation is the mechanism: it silently substituted column 32 767"
+    out[0], 25,
+    "the exact tap must read the column asked for, not the one `i16` saturation aliases it onto"
   );
 
-  // So the geometry is refused, at the door, rather than sampled wrongly.
+  // And the two forms agree on every crop the reference admits, which is what
+  // makes this a total replacement rather than a divergence: at and past the
+  // saturation value, both read the constant-0 border.
+  let mut widest = vec![9u8; MAX_CROP_AXIS * 3];
+  widest[(MAX_CROP_AXIS - 1) * 3] = 111;
+  for column in [
+    i64::from(i16::MAX) - 1,
+    i64::from(i16::MAX),
+    i64::from(i16::MAX) + 5_000,
+    i64::from(i16::MIN),
+    i64::from(i16::MIN) - 5_000,
+  ] {
+    let mut border = [7u8; 3];
+    sample_fixed_point(
+      &widest,
+      MAX_CROP_AXIS,
+      1,
+      column << INTER_BITS,
+      0,
+      &mut border,
+    );
+    assert_eq!(
+      border, [0u8; 3],
+      "a tap at {column} is outside the widest admitted crop and must read the border"
+    );
+  }
+
+  // The geometry past OpenCV's own assert is still refused at the door,
+  // because the reference refuses it and this module's contract is to be
+  // bit-exact with the reference.
   let data = vec![0u8; WIDE * 2 * 3];
   let error = FaceCrop::new(&data, WIDE, 2).expect_err("wider than the fixed-point tap domain");
   assert!(
@@ -638,26 +723,22 @@ fn the_i16_tap_limit_is_why_a_wide_crop_is_refused() {
     "one pixel past the bound must be refused"
   );
 
-  // And for every crop still admitted the saturation is unreachable as an
-  // index, which is what makes the clamp a no-op rather than a silent
-  // substitution: a tap at or past `i16::MAX` reads the border.
-  let mut widest = vec![9u8; MAX_CROP_AXIS * 3];
-  widest[(MAX_CROP_AXIS - 1) * 3] = 111;
-  for column in [i64::from(i16::MAX), i64::from(i16::MAX) + 5_000] {
-    let mut border = [7u8; 3];
-    sample_fixed_point(
-      &widest,
-      MAX_CROP_AXIS,
-      1,
-      column << INTER_BITS,
-      0,
-      &mut border,
-    );
-    assert_eq!(
-      border, [0u8; 3],
-      "a tap at {column} must read the constant-0 border, not a saturated column"
-    );
-  }
+  // The widest admitted crop's own last column still reads as itself, so the
+  // border assertions above are about the taps outside it and not about a
+  // sampler that reads nothing.
+  let mut last = [7u8; 3];
+  sample_fixed_point(
+    &widest,
+    MAX_CROP_AXIS,
+    1,
+    (MAX_CROP_AXIS as i64 - 1) << INTER_BITS,
+    0,
+    &mut last,
+  );
+  assert_eq!(
+    last[0], 111,
+    "the last column of the widest admitted crop must still be readable"
+  );
 }
 
 #[test]
@@ -760,8 +841,8 @@ fn invert_2x3(m: [f64; 6]) -> [f64; 6] {
 /// under-reports a moved map.
 fn coordinate_divergence(left: [f64; 6], right: [f64; 6]) -> usize {
   let (a, b) = (
-    SourceGrid::new(invert_2x3(left)),
-    SourceGrid::new(invert_2x3(right)),
+    SourceGrid::new(invert_2x3(left)).expect("a face-shaped matrix stays inside int"),
+    SourceGrid::new(invert_2x3(right)).expect("a face-shaped matrix stays inside int"),
   );
   (0..TEMPLATE_SIZE)
     .map(|v| {
@@ -906,7 +987,8 @@ fn a_fraction_below_the_five_bit_half_step_takes_the_pure_left_pixel() {
     }
   }
   let crop = FaceCrop::new(&data, width, height).expect("geometry is valid");
-  let warped = warp_bilinear(crop, &SimilarityTransform::new(1.0, 0.0, FRACTION, 0.0));
+  let warped = warp_bilinear(crop, &SimilarityTransform::new(1.0, 0.0, FRACTION, 0.0))
+    .expect("a unit-scale translation stays inside int");
 
   assert_eq!(
     warped[0], 0,
@@ -925,5 +1007,205 @@ fn a_fraction_below_the_five_bit_half_step_takes_the_pure_left_pixel() {
     "template pixel (3, 0) got {}, where OpenCV's quantised fraction 0 takes source column 3 \
      whole and never reaches the border",
     warped[u3]
+  );
+}
+
+/// The reviewer's round-3 witness: five FINITE, in-bounds landmarks in a
+/// 256×256 crop whose solved inverse is large enough that both split halves of
+/// the fixed-point coordinate leave `int` — in OPPOSITE directions.
+const CANCELLING_LANDMARKS: [Point; LANDMARK_COUNT] = [
+  Point::new(108.922_34, 130.0),
+  Point::new(128.855_71, 130.0),
+  Point::new(174.0, 130.0),
+  Point::new(131.146_21, 130.0),
+  Point::new(107.075_73, 130.0),
+];
+
+#[test]
+fn opposite_coordinate_saturations_must_not_cancel_into_a_valid_tap() {
+  const SIDE: usize = 256;
+  let mut data = vec![0u8; SIDE * SIDE * 3];
+  data[..3].copy_from_slice(&[200, 201, 202]); // crop pixel (0, 0)
+  let crop = FaceCrop::new(&data, SIDE, SIDE).expect("geometry is valid");
+
+  // Where destination (1, 0) TRULY comes from: nowhere near the crop.
+  let transform = SimilarityTransform::estimate(&CANCELLING_LANDMARKS, &ARCFACE_TEMPLATE)
+    .expect("finite, spread landmarks solve");
+  let inverse = transform
+    .inverse()
+    .expect("a finite nonzero scale has a finite inverse");
+  let m = inverse.matrix();
+  let (source_x, source_y) = (m[0] + m[2], m[3] + m[5]);
+  assert!(
+    source_x < -1.8e9 && source_y > 7.6e7,
+    "the witness must map destination (1,0) far outside the crop, got ({source_x:e}, {source_y:e})"
+  );
+
+  // Both halves of that coordinate leave `int`, in OPPOSITE directions, which
+  // is what made the failure invisible: saturated, they summed to 15, which is
+  // source pixel 0 after the shift onto the five-bit grid.
+  let outcome = FaceAlign::to_template(crop, &CANCELLING_LANDMARKS);
+  let sampled = outcome
+    .as_ref()
+    .ok()
+    .map(|face| [face.pixels()[3], face.pixels()[4], face.pixels()[5]]);
+  let error = match outcome {
+    Err(error) => error,
+    Ok(_) => panic!(
+      "destination (1,0) inverse-maps to ({source_x:e}, {source_y:e}) — border — but the split \
+       terms saturated to `i32::MIN` and `i32::MAX` and cancelled; it sampled {sampled:?}, which \
+       is the crop's own pixel (0,0)"
+    ),
+  };
+  assert!(
+    matches!(&error, Error::CoordinateOverflow(_)),
+    "expected CoordinateOverflow, got {error:?}"
+  );
+  // The refusal has to say WHERE, or it is a panic with a nicer type.
+  let message = error.to_string();
+  assert!(
+    message.contains("outside the `int` domain"),
+    "the message must name the domain that was left, got {message:?}"
+  );
+
+  // The terms themselves, so the gate does not rest on `to_template` alone:
+  // the per-column half of `x` is past `i32::MAX`, and the per-row half of `y`
+  // is past it too once `round_delta` is folded in — the addition that made
+  // the round-2 `i16` bound insufficient one level up.
+  let error = SourceGrid::new(m)
+    .err()
+    .expect("this map does not fit in `int`");
+  assert!(
+    matches!(&error, Error::CoordinateOverflow(p) if p.term() != CoordinateTerm::Sum),
+    "a term leaves `int` before any sum does, got {error:?}"
+  );
+
+  // The `round_delta` FOLD is its own overflow site, and the witness above
+  // reaches it only because its rounding already failed. So: a row origin that
+  // rounds to exactly `i32::MAX` — inside `int` — and then leaves it by adding
+  // 16. That is the `2147483663` the reviewer's witness reports, isolated.
+  // `i32::MAX / 1024` is exact in `f64`, so this rounds to the boundary and not
+  // near it.
+  let at_the_boundary = f64::from(i32::MAX) / AB_SCALE;
+  let error = SourceGrid::new([0.0, 0.0, at_the_boundary, 0.0, 0.0, 0.0])
+    .err()
+    .expect("`i32::MAX + round_delta` is not an `int`");
+  assert!(
+    matches!(
+      &error,
+      Error::CoordinateOverflow(p)
+        if p.term() == CoordinateTerm::RowOrigin
+          && p.axis() == CoordinateAxis::X
+          && p.value() == f64::from(i32::MAX) + f64::from(ROUND_DELTA)
+    ),
+    "expected the fold past `i32::MAX` to be reported at 2147483663, got {error:?}"
+  );
+  // One less, and it fits — so this is the boundary and not a blanket refusal.
+  assert!(
+    SourceGrid::new([
+      0.0,
+      0.0,
+      (f64::from(i32::MAX) - f64::from(ROUND_DELTA)) / AB_SCALE,
+      0.0,
+      0.0,
+      0.0
+    ])
+    .is_ok(),
+    "a row origin that folds to exactly `i32::MAX` is inside the domain"
+  );
+
+  // And the arm no per-term check can reach: two terms that each fit while
+  // their SUM does not. The per-column term at u = 111 is about `+2.02e9` and
+  // every row origin about `+1.07e9`, so both are inside `int` and
+  // `origin + delta` is about `+3.09e9`, which is not.
+  let column = f64::from(i32::MAX) * 0.94 / (111.0 * AB_SCALE);
+  let row = f64::from(i32::MAX) * 0.5 / AB_SCALE;
+  let error = SourceGrid::new([column, 0.0, row, 0.0, 0.0, 0.0])
+    .err()
+    .expect("two representable terms whose sum is not");
+  assert!(
+    matches!(
+      &error,
+      Error::CoordinateOverflow(p)
+        if p.term() == CoordinateTerm::Sum
+          && p.axis() == CoordinateAxis::X
+          && p.value() > f64::from(i32::MAX)
+    ),
+    "expected a Sum overflow on the horizontal coordinate, got {error:?}"
+  );
+}
+
+#[test]
+fn the_inverse_refuses_only_transforms_that_have_no_finite_inverse() {
+  // Forming `a² + b²` at the input's own magnitude used to decide
+  // invertibility, and that product leaves `f64` on BOTH sides while the
+  // inverse itself stays comfortably inside it.
+  //
+  // Underflow: `1e-160² = 1e-320` is subnormal, its reciprocal overflows, and
+  // the whole inverse was refused — though `1/1e-160 = 1e160` is finite and
+  // exactly representable.
+  let tiny = SimilarityTransform::new(1e-160, 0.0, 1.0, 2.0);
+  let tiny_inverse = tiny
+    .inverse()
+    .expect("1/1e-160 = 1e160 is finite, so this transform HAS an inverse");
+  assert_eq!(
+    tiny_inverse.a(),
+    1e160,
+    "the inverse coefficient is exactly 1e160"
+  );
+
+  // Overflow: `1e200² = inf`, so the determinant was infinite, its reciprocal
+  // zero, and the result `Some` holding the ZERO transform — a false `Some`
+  // that maps every template pixel onto one source point. The worse of the two
+  // errors: a false `None` refuses, a false `Some` warps.
+  let huge = SimilarityTransform::new(1e200, 0.0, 1.0, 2.0);
+  let huge_inverse = huge
+    .inverse()
+    .expect("1/1e200 = 1e-200 is finite, so this transform HAS an inverse");
+  assert_eq!(
+    huge_inverse.a(),
+    1e-200,
+    "the inverse coefficient is exactly 1e-200, not the zero an infinite determinant produces"
+  );
+
+  // Both survive a round trip, which is the property a "zero transform"
+  // inverse silently fails.
+  for original in [tiny, huge] {
+    let back = original
+      .inverse()
+      .and_then(|inverted| inverted.inverse())
+      .expect("an invertible transform's inverse is invertible");
+    assert_eq!(
+      (back.a(), back.b()),
+      (original.a(), original.b()),
+      "inverting twice must return the rotation block it started from"
+    );
+  }
+
+  // Across the band where `a² + b²` and its reciprocal are both normal —
+  // about `1.5e-154` to `6.7e153`, the range the docs name — the inverse is
+  // correct on BOTH sides of the boundary, which is the property that matters
+  // rather than which association ran.
+  for scale in [1e-160, 1e-154, 2e-154, 1.0, 6e153, 1e154, 1e200] {
+    let inverted = SimilarityTransform::new(scale, 0.0, 0.0, 0.0)
+      .inverse()
+      .unwrap_or_else(|| panic!("a scale of {scale:e} has a finite inverse"));
+    assert_eq!(
+      inverted.a(),
+      1.0 / scale,
+      "the inverse coefficient at scale {scale:e} must be 1/{scale:e}"
+    );
+  }
+
+  // The fast path is still OpenCV's own association wherever OpenCV's own
+  // arithmetic is defined, so nothing about an ordinary alignment moved.
+  let ordinary = SimilarityTransform::new(1.7875, -0.1252, 5.1247, 24.1454);
+  let determinant = ordinary.a() * ordinary.a() + ordinary.b() * ordinary.b();
+  let reciprocal = 1.0 / determinant;
+  let inverted = ordinary.inverse().expect("an ordinary transform inverts");
+  assert_eq!(
+    (inverted.a(), inverted.b()),
+    (ordinary.a() * reciprocal, ordinary.b() * -reciprocal),
+    "an in-range transform must invert through `D = 1./D` exactly as cv2.warpAffine does"
   );
 }

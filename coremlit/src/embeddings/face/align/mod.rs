@@ -173,13 +173,48 @@
 //! and is not independent evidence about the pipeline. What carries that is
 //! `a_fraction_below_the_five_bit_half_step_takes_the_pure_left_pixel`, which
 //! pins the one behaviour separating the fixed-point pipeline from a float
-//! one, plus `cv_round_breaks_ties_to_even_and_saturates` and
+//! one, plus `cv_round_breaks_ties_to_even_and_refuses_what_leaves_int` and
 //! `the_fixed_point_pixel_cast_rounds_half_up_and_saturates` for the two tie
 //! rules that no whole-image comparison can see.
+//!
+//! # The coordinate pipeline is TOTAL, and where it is not it says so
+//!
+//! Everything between the solved transform and a sampled byte rounds, casts,
+//! clamps or accumulates, and each of those is a place an answer can be
+//! invented. Two rounds of review found one invented answer each — an `i16`
+//! tap that aliased a real column onto a saturated one, then two `i32` terms
+//! that saturated in opposite directions and CANCELLED into a small,
+//! plausible coordinate — and both were first met by bounding the input.
+//! Bounding the input is an argument about every future caller; it does not
+//! make the operation total, it makes it safe for the inputs someone thought
+//! of. So the operation is fallible instead:
+//!
+//! - `cv_round` returns `Option<i32>` rather than saturating. OpenCV's
+//!   `saturate_cast<int>(double)` is UNDEFINED past `int`, so there is no
+//!   reference answer to reproduce there — only a domain to stay inside;
+//! - the `round_delta` fold and the per-row/per-column SUM are checked
+//!   additions, the sum for all 112² pairs at once by an extremes argument
+//!   (`check_sum_domain`);
+//! - the whole map is built and validated in `SourceGrid::new` BEFORE the
+//!   first pixel is sampled, so a transform outside the domain produces
+//!   [`Error::CoordinateOverflow`] rather than a partially warped face;
+//! - the source tap is written EXACTLY rather than saturated into `i16`,
+//!   which agrees with the reference on every crop the reference admits and
+//!   is total on the ones it does not;
+//! - [`SimilarityTransform::inverse`] refuses only when the INVERSE is
+//!   unrepresentable, not when one expression for it overflowed.
+//!
+//! What remains a clamp is `fixed_point_to_u8`'s saturation into `u8`, which
+//! is OpenCV's `FixedPtCast` and is unreachable for a `u8` source (the four
+//! 15-bit weights sum to exactly `1 << 15`, so the accumulator cannot leave
+//! `0..=255` after the shift); and [`MAX_CROP_AXIS`], which is now purely the
+//! reference's own `CV_Assert` and no longer stands between an aliased tap
+//! and a wrong pixel.
 
 use crate::embeddings::face::error::{
-  CropDataLength, CropDimensions, DegenerateLandmarks, Error, LandmarkSet, NonFiniteLandmark,
-  NonFiniteTransform, NonInvertibleTransform, Result, TransformParameter,
+  CoordinateAxis, CoordinateOverflow, CoordinateTerm, CropDataLength, CropDimensions,
+  DegenerateLandmarks, Error, LandmarkSet, NonFiniteLandmark, NonFiniteTransform,
+  NonInvertibleTransform, Result, TransformParameter,
 };
 
 /// The number of landmarks the ArcFace family aligns on.
@@ -193,32 +228,32 @@ pub const TEMPLATE_BYTES: usize = TEMPLATE_SIZE * TEMPLATE_SIZE * 3;
 
 /// The largest crop axis [`FaceCrop::new`] admits: one short of `i16::MAX`.
 ///
-/// **This is the sampler's fixed-point domain, not a buffer limit.**
-/// [`FaceAlign::to_template`] saturates each integer source tap into `i16` —
-/// OpenCV's own `saturate_cast<short>` on the `short XY[]` its
-/// `WarpAffineInvoker` fills — and the constant-0 border is then decided by
-/// comparing the SATURATED tap against the crop's extent. That test is right
-/// only while the saturation value is not a coordinate the crop actually has.
-/// Past this bound it is: a 40 000-column crop whose inverse asks for column
-/// 33 000 gets `i16::MAX` back, and 32 767 IS a column of that crop, so the
-/// sampler reads a wholly different region and reports nothing.
-/// `the_i16_tap_limit_is_why_a_wide_crop_is_refused` measures that read.
+/// **This is the REFERENCE's admitted geometry, and nothing here depends on it
+/// for safety.** OpenCV 4.x's `remap` — the fixed-point pipeline `warpAffine`
+/// funnels into — opens with `CV_Assert( dst.cols < SHRT_MAX && dst.rows <
+/// SHRT_MAX && src.cols < SHRT_MAX && src.rows < SHRT_MAX )`, so a wider crop
+/// is a shape the reference declines to define. This module's contract is to be
+/// bit-exact with `cv2.warpAffine` (see the module doc); admitting geometry the
+/// reference refuses would mean claiming exactness against an answer that does
+/// not exist.
 ///
-/// **Refused rather than widened**, because the sampler's contract is to be
-/// bit-exact with `cv2.warpAffine` (see the module doc) and OpenCV draws this
-/// line itself: 4.x's `remap` — the fixed-point pipeline `warpAffine` funnels
-/// into — opens with `CV_Assert( dst.cols < SHRT_MAX && dst.rows < SHRT_MAX &&
-/// src.cols < SHRT_MAX && src.rows < SHRT_MAX )`. A wider tap would sample
-/// geometry the reference refuses outright, which trades a silent wrong answer
-/// for a silent divergence rather than removing one.
+/// **It used to be load-bearing, and that is worth recording rather than
+/// quietly dropping.** The sampler once saturated each integer source tap into
+/// `i16` — OpenCV's own `saturate_cast<short>` on the `short XY[]` its
+/// `WarpAffineInvoker` fills — and decided the constant-0 border by comparing
+/// the SATURATED tap against the crop's extent. That comparison is right only
+/// while the saturation value is not a coordinate the crop actually has, which
+/// this bound was introduced to guarantee. Guaranteeing it is not the same as
+/// removing it: the tap is now written exactly (`sample_fixed_point`), so a
+/// coordinate outside the crop reads the border at any crop width, and the
+/// bound no longer stands between an aliased tap and a wrong pixel.
+/// `the_tap_is_exact_rather_than_saturated_into_the_crop` measures both forms
+/// on the geometry that separates them.
 ///
-/// **Why `i16::MAX − 1` and not `i16::MAX`.** Correctness alone would admit an
-/// axis of exactly `i16::MAX`: a crop that wide has its last column at
-/// `i16::MAX − 1`, so the saturation value is still outside it and the border
-/// test still holds. This takes OpenCV's strictly-less bound instead, so the
-/// admitted set is exactly the one the reference admits and the two cannot
-/// disagree about a crop at the boundary. One pixel of conservatism, chosen to
-/// keep a second number from existing.
+/// **Why `i16::MAX − 1` and not `i16::MAX`.** OpenCV's bound is strictly less
+/// than `SHRT_MAX`, so this takes the same one: the admitted set is exactly the
+/// reference's and the two cannot disagree about a crop at the boundary. One
+/// pixel of conservatism, chosen to keep a second number from existing.
 pub const MAX_CROP_AXIS: usize = i16::MAX as usize - 1;
 
 /// One 2-D point in a crop's pixel coordinates, pixel centres on integers.
@@ -393,26 +428,46 @@ impl SimilarityTransform {
   /// Closed form rather than a general 3×3 inversion: a similarity's inverse is
   /// a similarity, and `[[a, −b], [b, a]]⁻¹ = [[a, b], [−b, a]] / (a² + b²)`.
   ///
-  /// `None` on a zero scale, and equally on a non-finite parameter — including
-  /// a non-finite TRANSLATION with a perfectly good rotation, which the
-  /// determinant alone does not see. [`Self::new`] is `const` and public, so
-  /// that is a value a caller can hand in, and returning `Some` for it would
-  /// mean handing back an inverse whose [`Self::apply`] is NaN everywhere.
+  /// # `None` is a fact about the RESULT, not about one expression for it
   ///
-  /// ONE check, on the way out, and that is deliberate: every parameter of the
-  /// result is a sum of products of all four inputs, so a non-finite input
-  /// reaches at least one output parameter and a guard on the way in would be
-  /// unreachable — a line no test could distinguish from its absence. The exit
-  /// check is not redundant with it, though: a scale small enough that
-  /// `1.0 / (a² + b²)` overflows turns four finite parameters into an infinite
-  /// one, which is what
-  /// `an_inverse_is_refused_when_any_parameter_is_non_finite` pins.
+  /// [`Self::new`] is `const` and public, so all four parameters are a
+  /// caller's to choose, and the predicate has to be a property of the inverse
+  /// rather than of an intermediate. `None` is returned in exactly three
+  /// cases, and each is a case where no inverse exists in `f64`:
   ///
-  /// The arithmetic follows `cv2.warpAffine`'s own inversion in ITS operation
-  /// order — one reciprocal, then multiplies — because the resampler this
-  /// feeds is bit-exact with OpenCV (see the module doc) and a
-  /// differently-associated inverse moves the sampled coordinate by an ulp,
-  /// and with it the occasional quantised pixel:
+  /// - a non-finite INPUT parameter — including a non-finite translation with
+  ///   a perfectly good rotation, which no determinant sees;
+  /// - `a = b = 0`, the rotation block that collapses the plane onto a point;
+  /// - a final inverse parameter that is not finite, which is how a scale
+  ///   below about `5.6e-309`, or a translation too large to carry through the
+  ///   inverse scale, is refused.
+  ///
+  /// **Deciding it on `a² + b²` at the input's own magnitude got the answer
+  /// wrong in BOTH directions**, and the fix is the predicate, not the payload
+  /// the refusal carried:
+  ///
+  /// - at `(a, b) = (1e-160, 0)` the square is the subnormal `1e-320`, its
+  ///   reciprocal overflows, and the inverse was refused — though `1/1e-160 =
+  ///   1e160` is finite and exactly representable;
+  /// - at `(1e200, 0)` the square is infinite, its reciprocal is zero, and the
+  ///   result was `Some` holding the ZERO transform — an "inverse" mapping
+  ///   every template pixel to one source point — where `1e-200` was the
+  ///   answer. A false `Some` is worse than the false `None`: it warps.
+  ///
+  /// The entry guard on non-finite inputs is genuinely load-bearing now.
+  /// Under the old arithmetic every output parameter was a product reaching
+  /// every input, so a non-finite input always surfaced in the exit check and
+  /// a guard on the way in would have been unreachable; the scaled reciprocal
+  /// below breaks that — `(a, b) = (∞, 0)` scales to a finite `(0, −0)` — so
+  /// the guard is now the only thing that catches it.
+  ///
+  /// # `cv2.warpAffine`'s own operation order, wherever it is defined
+  ///
+  /// The resampler this feeds is bit-exact with OpenCV (see the module doc)
+  /// and a differently-associated inverse moves the sampled coordinate by an
+  /// ulp, and with it the occasional quantised pixel. So the reference's order
+  /// is used verbatim whenever the reference's own arithmetic stays inside
+  /// `f64`:
   ///
   /// ```text
   /// D = M[0]*M[4] - M[1]*M[3];  D = 1./D;
@@ -425,19 +480,21 @@ impl SimilarityTransform {
   /// With `M = [a, −b, tx, b, a, ty]` the determinant `M[0]·M[4] − M[1]·M[3]`
   /// is `a·a − (−b)·b`, which rounds identically to `a² + b²`, and `A11` and
   /// `A22` coincide — so the inverse is again a similarity and fits this type.
+  /// `inverse_rotation` takes that path for every scale between about
+  /// `1.5e-154` and `6.7e153` — the band where `a² + b²` and its reciprocal
+  /// are BOTH normal, and so every alignment a detector can produce — and
+  /// falls back to a scaled reciprocal only where OpenCV's own expression has
+  /// left `f64` and there is no bit-exactness left to preserve.
   #[inline]
   pub fn inverse(&self) -> Option<Self> {
-    let determinant = self.a * self.a + self.b * self.b;
-    if determinant == 0.0 {
+    if self.first_non_finite().is_some() {
       return None;
     }
-    let reciprocal = 1.0 / determinant;
+    let (a, b) = inverse_rotation(self.a, self.b)?;
     // `a` is OpenCV's `A11`/`A22`; `b` is its `M[3]` after `M[3] *= -D`, and
     // its `M[1]` is then exactly `-b`. Subtracting `(-b)·ty` and adding `b·ty`
     // are the same IEEE result, so the translation is written in the shorter
     // of the two forms.
-    let a = self.a * reciprocal;
-    let b = self.b * -reciprocal;
     let inverted = Self {
       a,
       b,
@@ -450,12 +507,18 @@ impl SimilarityTransform {
   /// [`Self::inverse`] with the failure REPORTED rather than swallowed — the
   /// form [`FaceAlign::to_template`] needs, which owes its caller a reason.
   ///
-  /// The reason is [`Self::scale`], the quantity that actually decides it, and
-  /// it is read off THIS transform rather than defaulted. A payload here can
-  /// only say what a `SimilarityTransform` knows: the landmark spread that
-  /// produced it is not one of those things, and the old
-  /// [`Error::DegenerateLandmarks`] said it anyway — as zero, on a path
-  /// `estimate`'s spread guard has already proven it is not.
+  /// The reason is [`Self::scale`], the quantity that decides two of
+  /// [`Self::inverse`]'s three refusals, and it is read off THIS transform
+  /// rather than defaulted. A payload here can only say what a
+  /// `SimilarityTransform` knows: the landmark spread that produced it is not
+  /// one of those things, and the old [`Error::DegenerateLandmarks`] said it
+  /// anyway — as zero, on a path `estimate`'s spread guard has already proven
+  /// it is not.
+  ///
+  /// The third refusal — a non-finite input parameter — renders as a NaN or
+  /// infinite scale, which is the truth about such a transform. It is not
+  /// reachable from [`FaceAlign::to_template`], whose transform comes from
+  /// [`Self::estimate`] and is finite in all four parameters by construction.
   fn checked_inverse(&self) -> Result<Self> {
     self
       .inverse()
@@ -541,6 +604,56 @@ impl SimilarityTransform {
       ty_mean - (b * sx + a * sy),
     )
   }
+}
+
+/// The rotation block of `[[a, −b], [b, a]]⁻¹` — the complex reciprocal
+/// `1/(a + bi)`, returned as `(re, im)`.
+///
+/// `None` only when no such reciprocal exists in `f64`: `a = b = 0`, or a
+/// scale so small that even the scaled form overflows. Both arguments are
+/// finite by [`SimilarityTransform::inverse`]'s entry guard.
+///
+/// Two paths, and which one runs is decided by whether the REFERENCE's
+/// arithmetic is defined rather than by the size of the input:
+///
+/// 1. `cv2.warpAffine`'s own `D = a·a + b·b; D = 1./D;` whenever both `D` and
+///    `1/D` are normal — a scale from about `1.5e-154` to `6.7e153`, so
+///    every alignment a detector can produce takes it and the module's
+///    bit-exactness with OpenCV is untouched.
+/// 2. Otherwise Smith's scaling, which never forms the sum of squares at the
+///    original magnitude. Dividing through by the larger component gives
+///    `(a² + b²)/max = max + min·(min/max)`, an expression that stays inside
+///    `f64` exactly when the reciprocal itself does — so `(1e-160, 0)` yields
+///    `1e160` and `(1e200, 0)` yields `1e-200`, both of which the direct form
+///    got wrong.
+///
+/// Path 2 is a different association and can differ from path 1 in the last
+/// bits. That is not a divergence from OpenCV: it runs only where OpenCV's own
+/// expression has already produced an infinity or a subnormal, i.e. where the
+/// reference has no answer to be exact against.
+fn inverse_rotation(a: f64, b: f64) -> Option<(f64, f64)> {
+  let determinant = a * a + b * b;
+  let reciprocal = 1.0 / determinant;
+  if determinant.is_normal() && reciprocal.is_normal() {
+    return Some((a * reciprocal, b * -reciprocal));
+  }
+  let a_dominates = a.abs() >= b.abs();
+  let (larger, smaller) = if a_dominates { (a, b) } else { (b, a) };
+  if larger == 0.0 {
+    // `a = b = 0`. The only rotation block with no inverse at any precision:
+    // it collapses the plane onto a point, and no scaling recovers a direction
+    // from that.
+    return None;
+  }
+  let ratio = smaller / larger;
+  // `(a² + b²) / larger`, formed without ever holding `a² + b²`.
+  let scaled = larger + smaller * ratio;
+  let (re, im) = if a_dominates {
+    (1.0 / scaled, -ratio / scaled)
+  } else {
+    (ratio / scaled, -1.0 / scaled)
+  };
+  (re.is_finite() && im.is_finite()).then_some((re, im))
 }
 
 /// Rejects a NaN or infinite coordinate in one NAMED point set, so the error
@@ -729,7 +842,15 @@ impl FaceAlign {
   /// [`Error::NonInvertibleTransform`] if the solve nonetheless produced a
   /// transform with no inverse — a DIFFERENT geometry, and a different error,
   /// because the landmarks are spread in that case and only the scale
-  /// collapsed.
+  /// collapsed; [`Error::CoordinateOverflow`] if the inverse is finite but so
+  /// large that a destination → source coordinate leaves the `int` fixed-point
+  /// domain the sampler computes it in.
+  ///
+  /// **The last of those is the arm a near-degenerate detection reaches.** Five
+  /// finite, in-bounds landmarks that are nearly collinear solve to a nonzero
+  /// scale, pass the spread guard, invert cleanly, and then map a destination
+  /// pixel a billion columns outside the crop — which is not a face, and is now
+  /// said so rather than sampled.
   pub fn to_template(
     crop: FaceCrop<'_>,
     landmarks5: &[Point; LANDMARK_COUNT],
@@ -758,7 +879,7 @@ impl FaceAlign {
     // the spread is positive and finite.
     let inverse = transform.checked_inverse()?;
     Ok(AlignedFace {
-      pixels: Box::new(warp_bilinear(crop, &inverse)),
+      pixels: Box::new(warp_bilinear(crop, &inverse)?),
       transform: Some(transform),
     })
   }
@@ -783,7 +904,7 @@ const AB_SCALE: f64 = (1i64 << AB_BITS) as f64;
 /// OpenCV's `round_delta` for a non-nearest interpolation,
 /// `AB_SCALE / INTER_TAB_SIZE / 2` — the half-step folded in so that the
 /// truncating shift down to the five-bit grid becomes a round-to-nearest.
-const ROUND_DELTA: i64 = (1i64 << AB_BITS) / INTER_TAB_SIZE / 2;
+const ROUND_DELTA: i32 = (1i32 << AB_BITS) / (1i32 << INTER_BITS) / 2;
 
 /// OpenCV's `INTER_REMAP_COEF_BITS`: the four interpolation weights are
 /// 15-bit fixed point and sum to exactly `1 << 15`.
@@ -792,22 +913,35 @@ const REMAP_COEF_BITS: u32 = 15;
 /// OpenCV's `cvRound`, which is `lrint` under the default rounding mode:
 /// nearest, **ties to even** — not the half-up rounding used for pixels.
 ///
-/// OpenCV reaches this through `saturate_cast<int>(double)`, which is
-/// undefined outside `int`'s range; Rust has to define it, so it saturates
-/// there. No solved alignment reaches that: [`SimilarityTransform::estimate`]
-/// and [`SimilarityTransform::inverse`] both refuse a non-finite parameter,
-/// and a saturated coordinate lands outside any crop and reads the border
-/// either way.
+/// `None` outside `int`, rather than a saturated value, and that is the whole
+/// point of the signature. OpenCV reaches this through
+/// `saturate_cast<int>(double)`, which is *undefined* past `int`'s range: there
+/// is no reference answer to reproduce, only a domain to stay inside. Rust has
+/// to define something, and the two definitions on offer are not equally safe.
+///
+/// **Saturating was tried and is wrong.** The coordinate is SPLIT — a per-column
+/// term and a per-row term, each rounded on its own, then added — so two
+/// saturated terms can cancel: `i32::MIN + 16` plus `i32::MAX` is `15`, which
+/// after the shift onto the five-bit grid is source pixel `0`. A destination
+/// pixel whose true source is 1.9 billion columns outside the crop then reads
+/// the crop's own first pixel and reports nothing. Refusing the term instead
+/// makes the map total, because a term that has no answer cannot cancel against
+/// another that has none either.
 #[inline]
-fn cv_round(value: f64) -> i64 {
+fn cv_round(value: f64) -> Option<i32> {
   let rounded = value.round_ties_even();
-  if rounded >= f64::from(i32::MAX) {
-    i64::from(i32::MAX)
-  } else if rounded <= f64::from(i32::MIN) {
-    i64::from(i32::MIN)
-  } else {
-    rounded as i64
-  }
+  // NaN fails both comparisons, so it is refused here rather than reaching the
+  // cast. `i32::MIN` and `i32::MAX` are exactly representable in `f64`, so the
+  // bounds are the exact ones and the cast below cannot saturate.
+  (rounded >= f64::from(i32::MIN) && rounded <= f64::from(i32::MAX)).then_some(rounded as i32)
+}
+
+/// [`cv_round`] with the domain failure NAMED, so a refusal can say which term
+/// of which coordinate left `int`.
+#[inline]
+fn rounded_term(value: f64, axis: CoordinateAxis, term: CoordinateTerm) -> Result<i32> {
+  cv_round(value)
+    .ok_or_else(|| Error::CoordinateOverflow(CoordinateOverflow::new(axis, term, value)))
 }
 
 /// `cv2.warpAffine(crop, M, (112, 112), flags=INTER_LINEAR,
@@ -822,12 +956,21 @@ fn cv_round(value: f64) -> i64 {
 /// part of the answer, so it is reproduced rather than folded into a single
 /// expression: `cvRound(a·u·1024) + cvRound(m·v·1024)` is not
 /// `cvRound((a·u + m·v)·1024)`.
-fn warp_bilinear(crop: FaceCrop<'_>, inverse: &SimilarityTransform) -> [u8; TEMPLATE_BYTES] {
+///
+/// # Errors
+/// [`Error::CoordinateOverflow`] if any term of the destination → source map,
+/// or the sum of two of them, leaves the `int` domain OpenCV computes it in.
+/// The whole map is built and checked BEFORE the first sample, so this is a
+/// refusal rather than a template warped from some pixels and not others.
+fn warp_bilinear(
+  crop: FaceCrop<'_>,
+  inverse: &SimilarityTransform,
+) -> Result<[u8; TEMPLATE_BYTES]> {
   let mut out = [0u8; TEMPLATE_BYTES];
   let (width, height) = (crop.width(), crop.height());
   let data = crop.data();
   // The same six numbers `cv2.warpAffine` holds in `M` after inverting it.
-  let grid = SourceGrid::new(inverse.matrix());
+  let grid = SourceGrid::new(inverse.matrix())?;
 
   for v in 0..TEMPLATE_SIZE {
     let origin = grid.row_origin(v);
@@ -837,7 +980,7 @@ fn warp_bilinear(crop: FaceCrop<'_>, inverse: &SimilarityTransform) -> [u8; TEMP
       sample_fixed_point(data, width, height, x, y, &mut out[base..base + 3]);
     }
   }
-  out
+  Ok(out)
 }
 
 /// The destination → five-bit source coordinate map `cv2.warpAffine` walks,
@@ -857,56 +1000,154 @@ fn warp_bilinear(crop: FaceCrop<'_>, inverse: &SimilarityTransform) -> [u8; TEMP
 /// Takes a raw `[f64; 6]` rather than a [`SimilarityTransform`] because the
 /// reference's own solved matrix usually is NOT a similarity — see the module
 /// doc — and comparing against one means being able to walk one.
+///
+/// **Every term is `i32` and every one of them was checked before this value
+/// existed**, which is what makes the map total. A `SourceGrid` cannot be
+/// constructed for a transform whose coordinates leave `int`, so [`Self::at`]
+/// is infallible for the same reason a `FaceCrop`'s indices are: the
+/// constructor is the only door.
 struct SourceGrid {
-  /// The inverted 2×3, row-major, as `cv2.warpAffine` holds `M`.
-  m: [f64; 6],
   /// OpenCV's `adelta`: the per-destination-COLUMN half of the mapped `x`,
   /// rounded to `1/AB_SCALE` of a pixel on its own.
-  adelta: [i64; TEMPLATE_SIZE],
+  adelta: [i32; TEMPLATE_SIZE],
   /// OpenCV's `bdelta`, the same for `y`.
-  bdelta: [i64; TEMPLATE_SIZE],
+  bdelta: [i32; TEMPLATE_SIZE],
+  /// OpenCV's `X0` per destination ROW, [`ROUND_DELTA`] already folded in.
+  x_origin: [i32; TEMPLATE_SIZE],
+  /// OpenCV's `Y0`, the same for `y`.
+  y_origin: [i32; TEMPLATE_SIZE],
 }
 
 impl SourceGrid {
-  /// Precomputes the per-column halves for a template → source 2×3.
-  fn new(inverse: [f64; 6]) -> Self {
-    let mut adelta = [0i64; TEMPLATE_SIZE];
-    let mut bdelta = [0i64; TEMPLATE_SIZE];
+  /// Builds and VALIDATES the whole destination → source map for a template →
+  /// source 2×3.
+  ///
+  /// Both halves are computed here, not just the per-column one, because the
+  /// per-row half is where `round_delta` is added and that addition is one of
+  /// the places the coordinate can leave `int` — the reviewer's witness leaves
+  /// it exactly there, at `i32::MAX + 16`.
+  ///
+  /// # Errors
+  /// [`Error::CoordinateOverflow`] naming the axis and the term, for any of
+  /// the three: a per-column term, a per-row term (rounding or the
+  /// `round_delta` fold), or the sum the two form.
+  fn new(inverse: [f64; 6]) -> Result<Self> {
+    let mut adelta = [0i32; TEMPLATE_SIZE];
+    let mut bdelta = [0i32; TEMPLATE_SIZE];
     for (u, (a, b)) in adelta.iter_mut().zip(bdelta.iter_mut()).enumerate() {
       // `u` is below 112, so `u as f64` is exact.
       let uf = u as f64;
-      *a = cv_round(inverse[0] * uf * AB_SCALE);
-      *b = cv_round(inverse[3] * uf * AB_SCALE);
+      *a = rounded_term(
+        inverse[0] * uf * AB_SCALE,
+        CoordinateAxis::X,
+        CoordinateTerm::ColumnDelta,
+      )?;
+      *b = rounded_term(
+        inverse[3] * uf * AB_SCALE,
+        CoordinateAxis::Y,
+        CoordinateTerm::ColumnDelta,
+      )?;
     }
-    Self {
-      m: inverse,
+
+    let mut x_origin = [0i32; TEMPLATE_SIZE];
+    let mut y_origin = [0i32; TEMPLATE_SIZE];
+    for (v, (x, y)) in x_origin.iter_mut().zip(y_origin.iter_mut()).enumerate() {
+      // `v` is below 112, so `v as f64` is exact.
+      let vf = v as f64;
+      *x = row_origin_term((inverse[1] * vf + inverse[2]) * AB_SCALE, CoordinateAxis::X)?;
+      *y = row_origin_term((inverse[4] * vf + inverse[5]) * AB_SCALE, CoordinateAxis::Y)?;
+    }
+
+    check_sum_domain(&x_origin, &adelta, CoordinateAxis::X)?;
+    check_sum_domain(&y_origin, &bdelta, CoordinateAxis::Y)?;
+
+    Ok(Self {
       adelta,
       bdelta,
-    }
+      x_origin,
+      y_origin,
+    })
   }
 
   /// Destination row `v`'s accumulator origin, with [`ROUND_DELTA`] folded in
   /// so the shift down onto the five-bit grid rounds rather than truncates.
-  fn row_origin(&self, v: usize) -> (i64, i64) {
-    let vf = v as f64;
-    (
-      cv_round((self.m[1] * vf + self.m[2]) * AB_SCALE) + ROUND_DELTA,
-      cv_round((self.m[4] * vf + self.m[5]) * AB_SCALE) + ROUND_DELTA,
-    )
+  ///
+  /// Read from the table [`Self::new`] built: the rounding and the fold both
+  /// happened there, where a term outside `int` could still be reported.
+  #[inline]
+  fn row_origin(&self, v: usize) -> (i32, i32) {
+    (self.x_origin[v], self.y_origin[v])
   }
 
   /// The five-bit source coordinate destination `(u, v)` samples at, given
   /// that row's origin from [`Self::row_origin`].
   ///
-  /// Arithmetic shift, so it floors for a negative coordinate exactly as
-  /// C++'s does.
+  /// The sum is formed in `i64` and cannot overflow there; it is also
+  /// guaranteed by [`check_sum_domain`] to fit in `i32`, so it holds exactly
+  /// the value C++'s `int X = X0 + adelta[x1]` holds. Arithmetic shift, so it
+  /// floors for a negative coordinate exactly as C++'s does.
   #[inline]
-  fn at(&self, origin: (i64, i64), u: usize) -> (i64, i64) {
+  fn at(&self, origin: (i32, i32), u: usize) -> (i64, i64) {
     (
-      (origin.0 + self.adelta[u]) >> (AB_BITS - INTER_BITS),
-      (origin.1 + self.bdelta[u]) >> (AB_BITS - INTER_BITS),
+      (i64::from(origin.0) + i64::from(self.adelta[u])) >> (AB_BITS - INTER_BITS),
+      (i64::from(origin.1) + i64::from(self.bdelta[u])) >> (AB_BITS - INTER_BITS),
     )
   }
+}
+
+/// One row origin: [`cv_round`] plus OpenCV's `round_delta`, with BOTH steps
+/// required to stay inside `int`.
+///
+/// The fold is checked separately because it is a real overflow site and not a
+/// formality: the witness that motivated this whole path rounds to `i32::MAX`
+/// and then adds 16.
+fn row_origin_term(value: f64, axis: CoordinateAxis) -> Result<i32> {
+  let rounded = rounded_term(value, axis, CoordinateTerm::RowOrigin)?;
+  rounded.checked_add(ROUND_DELTA).ok_or_else(|| {
+    Error::CoordinateOverflow(CoordinateOverflow::new(
+      axis,
+      CoordinateTerm::RowOrigin,
+      // Exact: both operands are `i32`, so the sum is far inside `f64`'s
+      // integer range.
+      f64::from(rounded) + f64::from(ROUND_DELTA),
+    ))
+  })
+}
+
+/// Proves every one of the 112² sums `origin[v] + delta[u]` fits in the single
+/// `int` OpenCV forms it in — with two checked additions rather than 12 544.
+///
+/// Addition is monotone in both arguments, so for every pair
+/// `min(origin) + min(delta) ≤ origin[v] + delta[u] ≤ max(origin) + max(delta)`,
+/// and `i32` is a contiguous interval: if both bounds are representable, so is
+/// everything between them. Checking the two extreme pairs therefore covers
+/// the whole grid, and it is why [`SourceGrid::at`] can be infallible.
+///
+/// # Errors
+/// [`Error::CoordinateOverflow`] with [`CoordinateTerm::Sum`], carrying the
+/// offending sum computed in `f64` where it does not overflow.
+fn check_sum_domain(
+  origins: &[i32; TEMPLATE_SIZE],
+  deltas: &[i32; TEMPLATE_SIZE],
+  axis: CoordinateAxis,
+) -> Result<()> {
+  let extremes = |values: &[i32; TEMPLATE_SIZE]| {
+    values
+      .iter()
+      .fold((i32::MAX, i32::MIN), |(lo, hi), &v| (lo.min(v), hi.max(v)))
+  };
+  let (origin_lo, origin_hi) = extremes(origins);
+  let (delta_lo, delta_hi) = extremes(deltas);
+  for (origin, delta) in [(origin_lo, delta_lo), (origin_hi, delta_hi)] {
+    if origin.checked_add(delta).is_none() {
+      return Err(Error::CoordinateOverflow(CoordinateOverflow::new(
+        axis,
+        CoordinateTerm::Sum,
+        f64::from(origin) + f64::from(delta),
+      )));
+    }
+  }
+  Ok(())
 }
 
 /// One destination pixel from a five-bit fixed-point source coordinate:
@@ -921,11 +1162,26 @@ impl SourceGrid {
 /// alpha  = (Y & (INTER_TAB_SIZE-1))*INTER_TAB_SIZE + (X & (INTER_TAB_SIZE-1));
 /// ```
 fn sample_fixed_point(data: &[u8], width: usize, height: usize, x: i64, y: i64, out: &mut [u8]) {
-  // `saturate_cast<short>` on the integer tap. It cannot pull an out-of-range
-  // coordinate back INTO a crop — no crop is 32 768 pixels wide — so it only
-  // ever keeps the arithmetic below in range.
-  let sx = (x >> INTER_BITS).clamp(i64::from(i16::MIN), i64::from(i16::MAX));
-  let sy = (y >> INTER_BITS).clamp(i64::from(i16::MIN), i64::from(i16::MAX));
+  // The integer tap, EXACT, where OpenCV writes `saturate_cast<short>(X >>
+  // INTER_BITS)` into its `short XY[]` and then tests THAT against the source
+  // extent.
+  //
+  // The two agree everywhere the reference is defined, and the exact form is
+  // total where the saturating one is not. OpenCV's `remap` asserts
+  // `src.cols < SHRT_MAX`, so a saturated tap — `i16::MIN`, or `i16::MAX`,
+  // whose successor tap is `32 768` — is outside every admitted crop and reads
+  // the constant-0 border, exactly as the unsaturated coordinate does; the
+  // taps the clamp leaves alone are unchanged by definition. Past that assert
+  // the two part company, and it is the saturating form that is wrong: column
+  // 33 000 of a 40 000-wide crop arrives as `i16::MAX`, which IS a column of
+  // that crop, so the sampler reads a different region and reports nothing.
+  // Writing the tap exactly removes that aliasing from the operation instead
+  // of keeping it unreachable by a bound on the caller's geometry.
+  //
+  // No overflow to guard here: `x` and `y` come from `SourceGrid::at`, whose
+  // sums are inside `i32`, so both are within `±2³¹ ⁄ 32` before this shift.
+  let sx = x >> INTER_BITS;
+  let sy = y >> INTER_BITS;
   let fx = x & (INTER_TAB_SIZE - 1);
   let fy = y & (INTER_TAB_SIZE - 1);
 

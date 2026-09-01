@@ -257,10 +257,15 @@ pub struct NonInvertibleTransform {
   /// The solved transform's uniform scale, `√(a² + b²)`.
   ///
   /// Zero when the solve collapsed the plane onto a point; nonzero but tiny
-  /// when it is only the INVERSE that leaves `f64` — `1/(a² + b²)`, or a
-  /// translation built from it, overflowing. `f64` for exactly that second
-  /// case: narrowed to `f32`, a scale of `1e-160` would render as the zero
-  /// this payload exists to stop reporting.
+  /// when it is only the INVERSE that leaves `f64` — an inverse coefficient
+  /// `1/s`, or a translation built from it, overflowing.
+  ///
+  /// `f64` for exactly that second case. The smallest scale that still has a
+  /// representable inverse is around `5.6e-309`, so a witness lives in a range
+  /// `f32` flushes to zero — and reporting zero is what this payload exists to
+  /// stop doing. (`1e-160` was the witness before
+  /// [`crate::embeddings::face::SimilarityTransform::inverse`] stopped forming
+  /// `a² + b²` at the original magnitude; it inverts cleanly now, to `1e160`.)
   scale: f64,
 }
 
@@ -275,6 +280,125 @@ impl NonInvertibleTransform {
   #[inline(always)]
   pub const fn scale(&self) -> f64 {
     self.scale
+  }
+}
+
+/// Which of the two source coordinates left OpenCV's `int` fixed-point domain.
+///
+/// Named after the variables `imgwarp.cpp`'s `WarpAffineInvoker` uses, so a
+/// reader can put the failure on a line of the reference.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display)]
+#[display("{}", self.as_str())]
+pub enum CoordinateAxis {
+  /// The horizontal source coordinate — OpenCV's `X`, built from `M[0..3]`.
+  X,
+  /// The vertical source coordinate — OpenCV's `Y`, built from `M[3..6]`.
+  Y,
+}
+
+impl CoordinateAxis {
+  /// Stable name, as it appears in the error message.
+  #[inline(always)]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::X => "horizontal",
+      Self::Y => "vertical",
+    }
+  }
+}
+
+/// Which TERM of the split fixed-point coordinate left `int`.
+///
+/// `cv2.warpAffine` never forms the source coordinate in one expression: the
+/// per-column half and the per-row half are each rounded to `1/1024` of a
+/// pixel on their own and only then added. Each of the three is a separate
+/// `int`, so each is a separate place the coordinate can leave the domain —
+/// and naming which one is what distinguishes a transform whose columns run
+/// away from one whose rows do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display)]
+#[display("{}", self.as_str())]
+pub enum CoordinateTerm {
+  /// OpenCV's `adelta[x]` / `bdelta[x]`: the per-destination-COLUMN half.
+  ColumnDelta,
+  /// OpenCV's `X0` / `Y0`: the per-destination-ROW half, `round_delta`
+  /// included.
+  RowOrigin,
+  /// OpenCV's `X` / `Y`: the two halves added into one `int`.
+  ///
+  /// **The arm that made this error necessary.** Both halves can be inside
+  /// `int` — or be forced into it by a clamp — while their SUM is not, and a
+  /// clamped pair can CANCEL: `i32::MIN + 16` plus `i32::MAX` is 15, a small,
+  /// perfectly ordinary-looking coordinate that samples the crop's first pixel
+  /// where the true source is 1.9 billion pixels away.
+  Sum,
+}
+
+impl CoordinateTerm {
+  /// Stable name, as it appears in the error message.
+  #[inline(always)]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::ColumnDelta => "per-column term",
+      Self::RowOrigin => "per-row term",
+      Self::Sum => "summed term",
+    }
+  }
+}
+
+/// A destination → source coordinate leaves the `int` fixed-point domain
+/// `cv2.warpAffine` computes it in, so no template pixel can be sampled
+/// through the transform.
+///
+/// **Raised BEFORE any sampling.** The whole coordinate map is built and
+/// checked up front, so this is a refusal rather than a partially warped
+/// template: a transform that puts one destination pixel outside the domain
+/// puts the operation outside its own definition.
+///
+/// Reaching it needs a transform whose inverse is enormous, which needs
+/// landmarks whose solved scale is nearly zero — a detector emitting a
+/// near-degenerate five-point set, finite and in-bounds and past every other
+/// guard. That is exactly the input that used to produce a plausible corrupted
+/// face.
+///
+/// Payload of [`Error::CoordinateOverflow`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CoordinateOverflow {
+  /// Which source coordinate the offending term belongs to.
+  axis: CoordinateAxis,
+  /// Which of the three split terms left `int`.
+  term: CoordinateTerm,
+  /// The offending value, in units of `1/1024` of a source pixel.
+  ///
+  /// `f64` because two of the three terms are read before they are rounded.
+  /// The third — [`CoordinateTerm::Sum`] — is an integer of magnitude at most
+  /// 2³², so widening it to `f64` is exact and the field carries one kind of
+  /// number rather than two.
+  value: f64,
+}
+
+impl CoordinateOverflow {
+  /// Construct from the offending axis, term and value.
+  #[inline(always)]
+  pub const fn new(axis: CoordinateAxis, term: CoordinateTerm, value: f64) -> Self {
+    Self { axis, term, value }
+  }
+
+  /// Which source coordinate the offending term belongs to.
+  #[inline(always)]
+  pub const fn axis(&self) -> CoordinateAxis {
+    self.axis
+  }
+
+  /// Which of the three split terms left `int`.
+  #[inline(always)]
+  pub const fn term(&self) -> CoordinateTerm {
+    self.term
+  }
+
+  /// The offending value, in units of `1/1024` of a source pixel.
+  #[inline(always)]
+  pub const fn value(&self) -> f64 {
+    self.value
   }
 }
 
@@ -459,21 +583,26 @@ impl NonFiniteOutput {
 /// reports them, so a pair that differs in several places at once names the
 /// first of these rather than an arbitrary one.
 ///
-/// Every one of these decides what an embedding MEANS, which is why a
-/// difference in any of them makes a cosine undefined rather than merely
-/// inaccurate: a channel swap, a rescaled input or a second artifact each put
-/// the vector in a different space, and a dot product across two spaces is an
-/// arbitrary number with a plausible range.
+/// **Every variant here is part of the FUNCTION that produced the vector**, and
+/// that is the whole membership rule. `dim` is the artifact's output width; the
+/// other four are the pixels-to-tensor map the host applied before inference.
+/// Change any of them and the numbers change, so a cosine across the difference
+/// is undefined rather than merely inaccurate.
+///
+/// **The feature NAMES used to be in this list and are not any more.** A
+/// feature name is the string CoreML routes a tensor by: re-exporting one set
+/// of weights under different names produces the same space, and two unrelated
+/// artifacts are free to pick the same two names. It is therefore neither
+/// necessary nor sufficient evidence about the space, and the only thing
+/// comparing it ever produced was a false refusal — see
+/// [`crate::embeddings::face::FaceEmbedding`]'s doc for what identity is bound
+/// to now and what remains unbindable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display)]
 #[display("{}", self.as_str())]
 pub enum EmbeddingSpaceField {
   /// The embeddings are different widths — the one case that was previously
   /// reported as a cosine of `0.0`, a value a measured non-match also has.
   Dim,
-  /// The manifests name different input features, so different artifacts.
-  InputFeature,
-  /// The manifests name different output features.
-  OutputFeature,
   /// One model wants RGB and the other BGR.
   ChannelOrder,
   /// One model wants NCHW and the other NHWC.
@@ -490,8 +619,6 @@ impl EmbeddingSpaceField {
   pub const fn as_str(&self) -> &'static str {
     match self {
       Self::Dim => "dim",
-      Self::InputFeature => "input feature",
-      Self::OutputFeature => "output feature",
       Self::ChannelOrder => "preprocessing channel order",
       Self::TensorLayout => "preprocessing tensor layout",
       Self::PreprocessingScale => "preprocessing scale",
@@ -580,6 +707,16 @@ pub enum Error {
     .0.spread()
   )]
   DegenerateLandmarks(DegenerateLandmarks),
+  /// A destination → source coordinate leaves OpenCV's `int` fixed-point
+  /// domain, so the warp is refused before anything is sampled.
+  #[error(
+    "the {} source coordinate's {} is {:e} (units of 1/1024 px), outside the `int` domain \
+     `cv2.warpAffine` computes it in; no template pixel can be sampled through this transform",
+    .0.axis(),
+    .0.term(),
+    .0.value()
+  )]
+  CoordinateOverflow(CoordinateOverflow),
   /// The loaded model does not match the manifest's declared contract.
   #[error("model contract mismatch on `{}`: expected {}, got {}", .0.feature(), .0.expected(), .0.actual())]
   ContractMismatch(ContractMismatch),
