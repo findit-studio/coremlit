@@ -98,7 +98,37 @@ impl DegenerateLandmarks {
   }
 }
 
-/// A landmark coordinate is NaN or infinite.
+/// Which of [`crate::embeddings::face::SimilarityTransform::estimate`]'s TWO
+/// point sets a rejected coordinate came from.
+///
+/// `estimate` takes a source and a target and is only as total as the weaker
+/// of the two checks, so the error has to say which side failed: "landmark 3
+/// is NaN" is not actionable when the caller supplied one of the point sets
+/// and the crate supplied the other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display)]
+#[display("{}", self.as_str())]
+pub enum LandmarkSet {
+  /// The detector's landmarks — `estimate`'s `source`, and the argument
+  /// [`crate::embeddings::face::FaceAlign::to_template`] takes from its caller.
+  Source,
+  /// The destination template — `estimate`'s `target`, which
+  /// [`crate::embeddings::face::FaceAlign::to_template`] fills in with
+  /// [`crate::embeddings::face::ARCFACE_TEMPLATE`].
+  Target,
+}
+
+impl LandmarkSet {
+  /// Stable name, as it appears in the error message.
+  #[inline(always)]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Source => "source",
+      Self::Target => "target",
+    }
+  }
+}
+
+/// A landmark coordinate is NaN or infinite, in one named point set.
 ///
 /// Separated from [`DegenerateLandmarks`] because the causes differ: a
 /// non-finite coordinate is a broken detector, a zero spread is a detection
@@ -107,21 +137,90 @@ impl DegenerateLandmarks {
 /// Payload of [`Error::NonFiniteLandmark`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NonFiniteLandmark {
+  /// Which point set the offending coordinate came from.
+  set: LandmarkSet,
   /// Index of the offending landmark, `0..5` in template order.
   index: usize,
 }
 
 impl NonFiniteLandmark {
-  /// Construct from the offending landmark's index.
+  /// Construct from the offending landmark's point set and index.
   #[inline(always)]
-  pub const fn new(index: usize) -> Self {
-    Self { index }
+  pub const fn new(set: LandmarkSet, index: usize) -> Self {
+    Self { set, index }
+  }
+
+  /// Which point set the offending coordinate came from.
+  #[inline(always)]
+  pub const fn set(&self) -> LandmarkSet {
+    self.set
   }
 
   /// Index of the offending landmark, `0..5` in template order.
   #[inline(always)]
   pub const fn index(&self) -> usize {
     self.index
+  }
+}
+
+/// One of a [`crate::embeddings::face::SimilarityTransform`]'s four free
+/// parameters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display)]
+#[display("{}", self.as_str())]
+pub enum TransformParameter {
+  /// `s·cos θ`.
+  A,
+  /// `s·sin θ`.
+  B,
+  /// Horizontal translation.
+  Tx,
+  /// Vertical translation.
+  Ty,
+}
+
+impl TransformParameter {
+  /// Stable name, as it appears in the error message.
+  #[inline(always)]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::A => "a",
+      Self::B => "b",
+      Self::Tx => "tx",
+      Self::Ty => "ty",
+    }
+  }
+}
+
+/// A solved or inverted similarity transform has a non-finite parameter.
+///
+/// The backstop that keeps a `SimilarityTransform` VALUE total: every way of
+/// producing one checks its four parameters before handing it out, so no
+/// caller can receive an `Ok` holding a transform whose `apply` returns NaN.
+/// Both point sets are finite by the time the solve runs, which makes this
+/// unreachable through
+/// [`crate::embeddings::face::SimilarityTransform::estimate`] — see that
+/// function's doc for the range argument. It is reachable through
+/// [`crate::embeddings::face::SimilarityTransform::inverse`], whose input a
+/// caller can build directly.
+///
+/// Payload of [`Error::NonFiniteTransform`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NonFiniteTransform {
+  /// The first parameter found to be NaN or infinite.
+  parameter: TransformParameter,
+}
+
+impl NonFiniteTransform {
+  /// Construct from the offending parameter.
+  #[inline(always)]
+  pub const fn new(parameter: TransformParameter) -> Self {
+    Self { parameter }
+  }
+
+  /// The first parameter found to be NaN or infinite.
+  #[inline(always)]
+  pub const fn parameter(&self) -> TransformParameter {
+    self.parameter
   }
 }
 
@@ -280,8 +379,11 @@ pub enum Error {
   #[error("crop data length mismatch: expected {} bytes (w·h·3), got {}", .0.expected(), .0.got())]
   CropDataLength(CropDataLength),
   /// A landmark coordinate is NaN or infinite.
-  #[error("landmark {} has a non-finite coordinate", .0.index())]
+  #[error("{} landmark {} has a non-finite coordinate", .0.set(), .0.index())]
   NonFiniteLandmark(NonFiniteLandmark),
+  /// A solved or inverted transform has a non-finite parameter.
+  #[error("the solved similarity transform has a non-finite `{}`", .0.parameter())]
+  NonFiniteTransform(NonFiniteTransform),
   /// The five landmarks carry no usable spread.
   #[error(
     "the five landmarks have no usable spread (Σ‖pᵢ−p̄‖² = {}); no similarity transform is \

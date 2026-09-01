@@ -14,14 +14,36 @@
 //!
 //! 1. solves the same least-squares similarity through a **different
 //!    derivation** — the complex/linear formulation, whose minimiser is two dot
-//!    products, where the Rust follows Umeyama's statement of the same problem;
-//! 2. resamples with an inverse-mapped bilinear kernel and a constant-0 border,
-//!    reproducing `cv2.warpAffine(img, M, (112, 112), borderValue=0.0)`;
+//!    products, where `skimage`'s `estimate` (the function InsightFace calls)
+//!    reaches it through an SVD with a determinant sign correction;
+//! 2. resamples with OpenCV's fixed-point `INTER_LINEAR` pipeline and a
+//!    constant-0 border, reproducing
+//!    `cv2.warpAffine(img, M, (112, 112), borderValue=0.0)`;
 //! 3. writes both the source crop and the 112×112×3 result as raw RGB8.
 //!
 //! Both files are committed, and both digests are pinned below, so
 //! regenerating a fixture is a visible diff in two places rather than a silent
 //! re-baseline.
+//!
+//! # What this golden is, and is not, evidence for
+//!
+//! The solve is two independent derivations of one minimiser agreeing. The
+//! RESAMPLER is not: `cv2.warpAffine` has exactly one right answer and both
+//! sides reproduce the same specification, so byte agreement here catches a
+//! transcription slip in either transcription and nothing more. That the
+//! pipeline is OpenCV's rests elsewhere — on the constants being named after
+//! the OpenCV symbols they come from, and on the unit gate
+//! `a_fraction_below_the_five_bit_half_step_takes_the_pure_left_pixel`, which
+//! pins the one behaviour separating the fixed-point pipeline from a float
+//! one.
+//!
+//! Observed once, out of tree and recorded rather than gated (nothing in this
+//! repository imports OpenCV): under `opencv-python-headless` **4.12.0** these
+//! committed 37 632 bytes are what `cv2.warpAffine` itself returns for this
+//! crop and matrix — **0 bytes differ**. Under **5.0.0**, which replaced the
+//! fixed-point path with a float one, 8 488 of them differ by up to 5 levels.
+//! The 4.x line is the target: it is what InsightFace's pinned `face_align.py`
+//! runs against and what every published ArcFace number was measured on.
 //!
 //! # Why these landmarks
 //!
@@ -60,7 +82,7 @@ const CROP_HEIGHT: usize = 48;
 const CROP_SHA256: &str = "a7d34a19107058c28c73633cc25b82a018fc279034d6670b45488022d5071ce0";
 
 /// SHA-256 of `align_expected_112x112_rgb8.bin` as the oracle wrote it.
-const EXPECTED_SHA256: &str = "0b04d1c71bd97ee3ea42f01fde36cd36282ed6ba4a85843613597fa6f4dc45c4";
+const EXPECTED_SHA256: &str = "274b92b0002ab01af0c8967372b2aea7bf5a71096308f257ea50168cf671f13c";
 
 /// The oracle's own solved matrix, printed by `align_oracle.py` in row-major
 /// `[a, −b, tx, b, a, ty]` order — the same six numbers

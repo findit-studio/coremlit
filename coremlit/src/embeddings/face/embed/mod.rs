@@ -36,7 +36,7 @@
 use std::path::Path;
 
 use crate::{
-  ComputeUnits, Model, MultiArray,
+  ComputeUnits, DataType, Model, MultiArray,
   embeddings::face::{
     align::{AlignedFace, TEMPLATE_SIZE},
     error::{BatchRow, ContractMismatch, Error, NonFiniteOutput, OutputShape, Result},
@@ -362,8 +362,13 @@ impl FaceEmbedding {
 pub struct FaceEmbedder {
   model: Model,
   manifest: FaceModel,
-  /// The graph's own batch dimension, read from the input contract at load.
-  batch: usize,
+  /// The graph's own batch dimension AND declared rank, read from the input
+  /// contract at load. The rank is carried, not just the capacity: a model
+  /// that declares the unbatched rank-3 form has to be fed a rank-3 tensor.
+  input: InputContract,
+  /// The output form the graph declared, so a predicted tensor is checked
+  /// against the axes it promised and not merely against an element count.
+  output: OutputContract,
 }
 
 impl FaceEmbedder {
@@ -374,18 +379,25 @@ impl FaceEmbedder {
   /// features, or claims the wrong width, fails at load rather than producing
   /// a plausible-looking wrong vector.
   ///
+  /// Both features must be `float32` MULTI-ARRAYS. Inference supplies and
+  /// extracts nothing else, so an f16 export — or an `ImageType` feature,
+  /// which carries no shape and no element type at all and is what both
+  /// third-party CoreML ArcFace builds this module's doc surveys declare — is
+  /// refused here rather than loading clean and failing every prediction.
+  ///
   /// # Errors
   /// [`Error::Load`] if CoreML rejects the model;
   /// [`Error::ContractMismatch`] if the model declares no feature by the
-  /// manifest's name, or if its input/output shapes are not a batch of
-  /// `3 × 112 × 112` and a batch of [`FaceModel::dim`].
+  /// manifest's name, if either feature is not a `float32` multi-array, or if
+  /// its input/output shapes are not a batch of `3 × 112 × 112` and a batch of
+  /// [`FaceModel::dim`].
   pub fn load(
     model_path: impl AsRef<Path>,
     manifest: FaceModel,
     options: FaceEmbedderOptions,
   ) -> Result<Self> {
     let model = Model::load(model_path, options.compute())?;
-    let batch = {
+    let (input_contract, output_contract) = {
       let description = model.description();
       let input = description.input(manifest.input()).ok_or_else(|| {
         Error::ContractMismatch(ContractMismatch::new(
@@ -394,17 +406,23 @@ impl FaceEmbedder {
           format!("inputs {:?}", feature_names(description.inputs())),
         ))
       })?;
-      let batch =
-        resolve_batch(input.shape(), manifest.preprocessing().layout()).ok_or_else(|| {
-          Error::ContractMismatch(ContractMismatch::new(
-            manifest.input().to_string(),
-            format!(
-              "{:?} shaped [n, 3, {TEMPLATE_SIZE}, {TEMPLATE_SIZE}] (or without the batch axis)",
-              manifest.preprocessing().layout()
-            ),
-            format!("{:?}", input.shape()),
-          ))
-        })?;
+      let contract = resolve_input_contract(
+        input.shape(),
+        input.data_type(),
+        manifest.preprocessing().layout(),
+      )
+      .ok_or_else(|| {
+        Error::ContractMismatch(ContractMismatch::new(
+          manifest.input().to_string(),
+          format!(
+            "{:?} shaped [n, 3, {TEMPLATE_SIZE}, {TEMPLATE_SIZE}] (or without the batch axis) \
+             float32",
+            manifest.preprocessing().layout()
+          ),
+          describe(input.shape(), input.data_type()),
+        ))
+      })?;
+      let batch = contract.batch();
       let output = description.output(manifest.output()).ok_or_else(|| {
         Error::ContractMismatch(ContractMismatch::new(
           manifest.output().to_string(),
@@ -412,19 +430,27 @@ impl FaceEmbedder {
           format!("outputs {:?}", feature_names(description.outputs())),
         ))
       })?;
-      check_output_shape(output.shape(), batch, manifest.dim()).map_err(|actual| {
-        Error::ContractMismatch(ContractMismatch::new(
-          manifest.output().to_string(),
-          format!("[{batch}, {}] (or [{}])", manifest.dim(), manifest.dim()),
-          actual,
-        ))
-      })?;
-      batch
+      let declared =
+        check_output_contract(output.shape(), output.data_type(), batch, manifest.dim()).map_err(
+          |actual| {
+            Error::ContractMismatch(ContractMismatch::new(
+              manifest.output().to_string(),
+              format!(
+                "[{batch}, {}] (or [{}] for a batch-one graph) float32",
+                manifest.dim(),
+                manifest.dim()
+              ),
+              actual,
+            ))
+          },
+        )?;
+      (contract, declared)
     };
     Ok(Self {
       model,
       manifest,
-      batch,
+      input: input_contract,
+      output: output_contract,
     })
   }
 
@@ -448,7 +474,7 @@ impl FaceEmbedder {
   /// rather than a call-site constraint.
   #[inline]
   pub const fn batch_capacity(&self) -> usize {
-    self.batch
+    self.input.batch
   }
 
   /// The embedding width — [`FaceModel::dim`], reconciled against the model at
@@ -474,8 +500,9 @@ impl FaceEmbedder {
   /// output row has zero magnitude and cannot be normalised.
   pub fn embed(&self, faces: &[AlignedFace]) -> Result<Vec<FaceEmbedding>> {
     let mut out = Vec::with_capacity(faces.len());
-    for (chunk_index, chunk) in faces.chunks(self.batch).enumerate() {
-      let rows = self.predict_chunk(chunk, chunk_index * self.batch)?;
+    let batch = self.input.batch;
+    for (chunk_index, chunk) in faces.chunks(batch).enumerate() {
+      let rows = self.predict_chunk(chunk, chunk_index * batch)?;
       out.extend(rows);
     }
     Ok(out)
@@ -495,15 +522,10 @@ impl FaceEmbedder {
     let features = outputs
       .take(self.manifest.output())
       .ok_or_else(|| crate::PredictionError::MissingOutput(self.manifest.output().to_string()))?;
-    let expected = vec![self.batch, dim];
-    if features.count() != self.batch * dim {
-      return Err(Error::OutputShape(OutputShape::new(
-        features.shape().to_vec(),
-        expected,
-      )));
-    }
+    let batch = self.input.batch;
+    check_predicted_shape(features.shape(), features.count(), self.output, batch, dim)?;
 
-    let mut flat = vec![0.0f32; self.batch * dim];
+    let mut flat = vec![0.0f32; batch * dim];
     features.copy_into::<f32>(&mut flat)?;
     let mut rows = Vec::with_capacity(chunk.len());
     for (offset, row) in flat.chunks_exact(dim).take(chunk.len()).enumerate() {
@@ -517,7 +539,7 @@ impl FaceEmbedder {
   fn build_input(&self, chunk: &[AlignedFace]) -> Result<MultiArray> {
     let preprocessing = self.manifest.preprocessing();
     let pixels = TEMPLATE_SIZE * TEMPLATE_SIZE;
-    let mut data = vec![0.0f32; self.batch * 3 * pixels];
+    let mut data = vec![0.0f32; self.input.batch * 3 * pixels];
     for (row, face) in chunk.iter().enumerate() {
       write_row(
         &mut data[row * 3 * pixels..(row + 1) * 3 * pixels],
@@ -525,11 +547,30 @@ impl FaceEmbedder {
         preprocessing,
       );
     }
-    let shape = match preprocessing.layout() {
-      TensorLayout::Nchw => [self.batch, 3, TEMPLATE_SIZE, TEMPLATE_SIZE],
-      TensorLayout::Nhwc => [self.batch, TEMPLATE_SIZE, TEMPLATE_SIZE, 3],
-    };
+    let shape = input_shape(self.input, preprocessing.layout());
     Ok(MultiArray::from_slice(&shape, &data)?)
+  }
+}
+
+/// The shape of the tensor [`FaceEmbedder::build_input`] hands the graph, for
+/// a contract resolved at load.
+///
+/// The rank is the CONTRACT's, not a constant. A graph that declares
+/// `[3, 112, 112]` is handed `[3, 112, 112]`; only a graph that declared the
+/// batch axis is handed one.
+fn input_shape(contract: InputContract, layout: TensorLayout) -> Vec<usize> {
+  let face = match layout {
+    TensorLayout::Nchw => [3, TEMPLATE_SIZE, TEMPLATE_SIZE],
+    TensorLayout::Nhwc => [TEMPLATE_SIZE, TEMPLATE_SIZE, 3],
+  };
+  match contract.rank {
+    InputRank::Unbatched => face.to_vec(),
+    InputRank::Batched => {
+      let mut shape = Vec::with_capacity(1 + face.len());
+      shape.push(contract.batch);
+      shape.extend_from_slice(&face);
+      shape
+    }
   }
 }
 
@@ -538,16 +579,63 @@ fn feature_names(features: &[crate::FeatureInfo]) -> Vec<&str> {
   features.iter().map(crate::FeatureInfo::name).collect()
 }
 
-/// The batch dimension an input `shape` declares, or `None` when the shape is
-/// not a template face.
+/// Whether a model's input feature declares the batch axis.
+///
+/// Kept, rather than collapsed into the numeric capacity, because it decides
+/// the RANK of the tensor [`input_shape`] then builds. Resolving
+/// `[3, 112, 112]` to "batch 1" and building `[1, 3, 112, 112]` from it means
+/// a model that loads as supported fails every prediction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputRank {
+  /// `[n, 3, 112, 112]` / `[n, 112, 112, 3]` — the batch axis is declared.
+  Batched,
+  /// `[3, 112, 112]` / `[112, 112, 3]` — no batch axis, so capacity 1.
+  Unbatched,
+}
+
+/// The input contract resolved from a model's declared feature at load.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InputContract {
+  /// How many faces one prediction consumes.
+  batch: usize,
+  /// The rank the graph declared, and therefore the rank it must be fed.
+  rank: InputRank,
+}
+
+impl InputContract {
+  /// How many faces one prediction consumes.
+  #[inline]
+  const fn batch(&self) -> usize {
+    self.batch
+  }
+}
+
+/// The input contract an input feature declares, or `None` when it is not a
+/// `float32` multi-array holding a template face.
 ///
 /// Accepts three shapes, all of which real ArcFace exports use: the batched
 /// rank-4 form, the unbatched rank-3 form (batch 1), and an EMPTY shape — the
 /// legacy `neuralNetwork` specification leaves input shapes undeclared, and
 /// refusing those would refuse a whole artifact format on the strength of
-/// metadata the format does not carry. An empty shape resolves to batch 1 and
-/// is caught instead at predict time by the output-shape check.
-fn resolve_batch(shape: &[usize], layout: TensorLayout) -> Option<usize> {
+/// metadata the format does not carry. An undeclared shape resolves to a
+/// batch-one BATCHED contract — the rank an export that declares nothing
+/// overwhelmingly means — and is caught instead at predict time by the
+/// output-shape check.
+///
+/// The dtype is not decoration. `None` means the feature is not a multi-array
+/// AT ALL — an `ImageType` input reports no shape and no element type, which
+/// is what both third-party CoreML ArcFace builds the module doc surveys
+/// declare — and anything but `float32` is a tensor
+/// [`FaceEmbedder::build_input`] cannot supply. Both used to load clean and
+/// then fail every prediction.
+fn resolve_input_contract(
+  shape: &[usize],
+  dtype: Option<DataType>,
+  layout: TensorLayout,
+) -> Option<InputContract> {
+  if dtype != Some(DataType::F32) {
+    return None;
+  }
   let (channels, height, width) = match layout {
     TensorLayout::Nchw => (0usize, 1usize, 2usize),
     TensorLayout::Nhwc => (2usize, 0usize, 1usize),
@@ -556,38 +644,108 @@ fn resolve_batch(shape: &[usize], layout: TensorLayout) -> Option<usize> {
     dims[channels] == 3 && dims[height] == TEMPLATE_SIZE && dims[width] == TEMPLATE_SIZE
   };
   match shape.len() {
-    0 => Some(1),
-    3 if matches(shape) => Some(1),
+    0 => Some(InputContract {
+      batch: 1,
+      rank: InputRank::Batched,
+    }),
+    3 if matches(shape) => Some(InputContract {
+      batch: 1,
+      rank: InputRank::Unbatched,
+    }),
     // A declared batch of zero is not a batch: `embed` would divide the work
     // into chunks of zero and never terminate, so it is a contract mismatch
     // rather than a capacity.
-    4 if shape[0] > 0 && matches(&shape[1..]) => Some(shape[0]),
+    4 if shape[0] > 0 && matches(&shape[1..]) => Some(InputContract {
+      batch: shape[0],
+      rank: InputRank::Batched,
+    }),
     _ => None,
   }
 }
 
-/// Checks an output `shape` against the resolved contract, returning the
-/// rendered actual shape on mismatch.
+/// The output form a model declared — and therefore the EXACT shape its
+/// predicted tensor must have.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputContract {
+  /// The model declared `[batch, dim]`.
+  Batched,
+  /// The model declared `[dim]`, which only a batch-one graph can mean.
+  Flat,
+  /// The model declared no shape at all (a legacy `neuralNetwork`). Either
+  /// form is then legitimate at predict time — and only those two.
+  Undeclared,
+}
+
+/// Checks an output feature against the resolved contract, returning the form
+/// it declared, or the rendered actual feature on mismatch.
 ///
-/// Like [`resolve_batch`], an empty shape is accepted: a legacy `neuralNetwork`
-/// artifact declares none, and the predicted tensor is checked on every call
-/// regardless.
-fn check_output_shape(
+/// Like [`resolve_input_contract`], an empty shape is accepted: a legacy
+/// `neuralNetwork` artifact declares none, and the predicted tensor is checked
+/// on every call regardless. A `[dim]` shape is accepted only for a batch-one
+/// graph — against a batch of 4 it is not a shorthand, it is a contradiction.
+fn check_output_contract(
   shape: &[usize],
+  dtype: Option<DataType>,
   batch: usize,
   dim: usize,
-) -> core::result::Result<(), String> {
-  let ok = match shape.len() {
-    0 => true,
-    1 => shape[0] == dim,
-    2 => shape[0] == batch && shape[1] == dim,
-    _ => false,
-  };
-  if ok {
-    Ok(())
-  } else {
-    Err(format!("{shape:?}"))
+) -> core::result::Result<OutputContract, String> {
+  if dtype != Some(DataType::F32) {
+    return Err(describe(shape, dtype));
   }
+  let resolved = match shape.len() {
+    0 => Some(OutputContract::Undeclared),
+    1 if shape[0] == dim && batch == 1 => Some(OutputContract::Flat),
+    2 if shape[0] == batch && shape[1] == dim => Some(OutputContract::Batched),
+    _ => None,
+  };
+  resolved.ok_or_else(|| describe(shape, dtype))
+}
+
+/// Human-readable `shape dtype` rendering for [`ContractMismatch`].
+fn describe(shape: &[usize], dtype: Option<DataType>) -> String {
+  let dtype = dtype.map_or("not a multi-array", |d| d.as_str());
+  format!("{shape:?} {dtype}")
+}
+
+/// Checks a PREDICTED tensor against the contract resolved at load — its AXES,
+/// not merely its element count.
+///
+/// A count-only check is close to no check here. `[dim, batch]` holds exactly
+/// as many elements as `[batch, dim]`, so it passes, and the
+/// `chunks_exact(dim)` that follows then slices across the wrong axis: every
+/// returned embedding is a mixture of components from different faces,
+/// unit-norm and plausible, and nothing downstream — no shape check, no
+/// finiteness scan, no cosine — can tell. So the shape must equal the resolved
+/// contract exactly, with the bare `[dim]` form allowed only where the
+/// contract really is batch-one.
+///
+/// The count is still checked alongside it: [`MultiArray::count`] is CoreML's
+/// own answer rather than a product of the cached shape, and the copy that
+/// follows sizes its destination from the contract.
+fn check_predicted_shape(
+  shape: &[usize],
+  count: usize,
+  contract: OutputContract,
+  batch: usize,
+  dim: usize,
+) -> Result<()> {
+  let batched = [batch, dim];
+  let flat = [dim];
+  let expected: &[usize] = match contract {
+    OutputContract::Batched => &batched,
+    OutputContract::Flat => &flat,
+    // The graph promised nothing, so either form is honest — but it still has
+    // to be one of the two.
+    OutputContract::Undeclared if batch == 1 && shape == flat => &flat,
+    OutputContract::Undeclared => &batched,
+  };
+  if shape != expected || count != batch * dim {
+    return Err(Error::OutputShape(OutputShape::new(
+      shape.to_vec(),
+      expected.to_vec(),
+    )));
+  }
+  Ok(())
 }
 
 /// Writes one aligned face into `row` as `3 · 112 · 112` preprocessed floats.
@@ -615,18 +773,39 @@ fn write_row(row: &mut [f32], face: &AlignedFace, preprocessing: Preprocessing) 
 
 /// L2-normalises one model output row, classifying a non-finite component and
 /// a zero magnitude separately.
+///
+/// The squared norm accumulates in `f64`, and the division happens there too.
+/// In `f32` it could not: `v * v` overflows to infinity for a large component
+/// and underflows to zero for a small one, and BOTH used to be reported as
+/// [`Error::EmbeddingZero`] — "this row has no direction" — for a row with a
+/// perfectly good direction. Nothing in the contract says an artifact's
+/// pre-normalisation output is near unit scale, so its magnitude is the
+/// model's business and not a reason to refuse it.
+///
+/// In `f64` the accumulator cannot leave the type: every component is a finite
+/// `f32` by the scan above, so each square is at most `f32::MAX²` (≈1.2e77)
+/// and even a very wide embedding sums far below `f64::MAX`, while the
+/// smallest nonzero `f32` squares to ≈2e-90 — comfortably normal. The norm is
+/// therefore zero if and only if every component is exactly zero, which is the
+/// only row that genuinely has no direction.
 fn normalise_row(row: &[f32], index: usize) -> Result<FaceEmbedding> {
   if let Some(component) = row.iter().position(|v| !v.is_finite()) {
     return Err(Error::NonFiniteOutput(NonFiniteOutput::new(
       index, component,
     )));
   }
-  let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt();
-  if norm == 0.0 || !norm.is_finite() {
+  let norm = row
+    .iter()
+    .map(|v| f64::from(*v) * f64::from(*v))
+    .sum::<f64>()
+    .sqrt();
+  if norm == 0.0 {
     return Err(Error::EmbeddingZero(BatchRow::new(index)));
   }
   Ok(FaceEmbedding {
-    values: row.iter().map(|v| v / norm).collect(),
+    // Divided in `f64` and narrowed once, at the end: scaling in `f32` would
+    // put back the overflow this widening exists to remove.
+    values: row.iter().map(|v| (f64::from(*v) / norm) as f32).collect(),
   })
 }
 

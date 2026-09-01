@@ -4,20 +4,34 @@
 Generates `coremlit/tests/face/fixtures/` — the committed expected pixels the
 Rust `FaceAlign::to_template` golden is checked against.
 
-WHY THIS IS AN ORACLE AND NOT A SECOND COPY OF THE IMPLEMENTATION
-=================================================================
-The Rust implementation solves the 5-point similarity transform with the
-**Umeyama (1991) SVD** construction, which is what `skimage`'s
-`SimilarityTransform.estimate` — the function InsightFace's `estimate_norm`
-calls — uses.
+WHAT IS INDEPENDENT HERE, AND WHAT IS A SPECIFICATION REPRODUCED TWICE
+======================================================================
+Stated precisely, because "oracle" is worth nothing if the reader has to guess
+which half of it is evidence.
 
-This script deliberately does NOT. It solves the same least-squares problem
-through the **complex/linear formulation**: writing the scaled rotation as
-`[[a, -b], [b, a]]` makes the residual linear in `(a, b, tx, ty)`, so the
-minimiser is a pair of dot products over the centred point sets and needs no
-SVD, no determinant sign correction, and no eigen decomposition. Two different
-derivations of one minimiser agreeing to float precision is evidence; one
-derivation run twice is not.
+**The solve is independently derived.** InsightFace's `estimate_norm` calls
+`skimage`'s `SimilarityTransform.estimate`, which is Umeyama (1991) by way of
+an SVD with a determinant sign correction. Neither this file nor the Rust runs
+an SVD: both reach the same minimiser through the complex/linear formulation,
+where writing the scaled rotation as `[[a, -b], [b, a]]` makes the residual
+linear in `(a, b, tx, ty)` and the answer a pair of dot products over the
+centred point sets. The two agree to 1e-12 on the solved matrix. That agreement
+is evidence about the DERIVATION, and it is also why the Rust's own tests do
+not lean on it: `recovered_transform_is_the_least_squares_minimiser` proves
+optimality by perturbation, naming no formula at all.
+
+**The resampler is a specification reproduced twice, and is not independent
+evidence about the algorithm.** `cv2.warpAffine`'s `INTER_LINEAR` is a
+fixed-point pipeline, not a float bilinear kernel (see `warp_inter_linear`
+below), and there is exactly one right answer to reproduce. What the golden
+buys here is that two transcriptions of that pipeline — a scalar Rust loop and
+the vectorised numpy below — land on the same 37 632 bytes, which catches a
+transcription slip in either. It does not, and is not claimed to, establish
+that the pipeline itself is OpenCV's. That claim rests on the constants being
+named after the OpenCV symbols they come from, and on
+`a_fraction_below_the_five_bit_half_step_takes_the_pure_left_pixel`, which
+pins the one behaviour that separates the fixed-point pipeline from a float
+one.
 
 Reference semantics being reproduced (deepinsight/insightface, path
 `python-package/insightface/utils/face_align.py`, pinned at commit
@@ -30,10 +44,10 @@ ffa12d315041c0505b077c7ff057ca914bb8dc7e, 2022-12-17):
 
 `cv2.warpAffine` without `WARP_INVERSE_MAP` inverts `M` itself and samples the
 SOURCE at the inverse-mapped destination centre, `INTER_LINEAR`, constant-0
-border. That is what `warp_bilinear` below does — in float64, where OpenCV uses
-5-bit fixed-point interpolation weights for 8-bit images. The two differ by at
-most one LSB per channel; see the Rust golden's module doc for why that is far
-below the ANE's own fp16 floor and is recorded rather than chased.
+border. OpenCV **4.x** is the target: it is what the pinned `face_align.py`
+runs against and what every published ArcFace accuracy number was measured on.
+OpenCV 5.0 replaced this fixed-point path with a float one and is a different
+function; see the Rust module doc.
 
 Run: `python3 align_oracle.py` (numpy only — no skimage, no OpenCV, on purpose:
 neither reference implementation is importable here, so nothing in this file
@@ -63,6 +77,27 @@ ARCFACE_DST = np.array(
 ).astype(np.float64)
 
 TEMPLATE_SIZE = 112
+
+# --- OpenCV's INTER_LINEAR fixed-point constants, by their own names ---------
+INTER_BITS = 5                                    # imgproc/src/imgwarp.cpp
+INTER_TAB_SIZE = 1 << INTER_BITS                  # 32
+AB_BITS = max(10, INTER_BITS)                     # 10
+AB_SCALE = 1 << AB_BITS                           # 1024
+ROUND_DELTA = AB_SCALE // INTER_TAB_SIZE // 2     # 16
+INTER_REMAP_COEF_BITS = 15
+INTER_REMAP_COEF_SCALE = 1 << INTER_REMAP_COEF_BITS   # 32768
+
+INT32_MIN = -(1 << 31)
+INT32_MAX = (1 << 31) - 1
+
+
+def cv_round(values):
+    """OpenCV's `cvRound` / `saturate_cast<int>(double)`.
+
+    `lrint` under the default rounding mode: nearest, TIES TO EVEN. The
+    saturation stands in for C++'s undefined behaviour outside `int`.
+    """
+    return np.clip(np.rint(values), INT32_MIN, INT32_MAX).astype(np.int64)
 
 
 def similarity_transform(src, dst):
@@ -97,39 +132,101 @@ def similarity_transform(src, dst):
     return np.hstack([s, t.reshape(2, 1)])
 
 
-def warp_bilinear(img, m, size):
-    """`cv2.warpAffine(img, m, (size, size), borderValue=0)` semantics.
+def invert_affine(m):
+    """`warpAffine`'s own inversion of `M`, in ITS operation order.
 
-    `m` maps source -> destination, so the sampler uses its inverse. Bilinear,
-    pixel centres at integer coordinates, out-of-range taps contribute 0, and
-    the result is rounded half-away-from-zero into uint8.
+    Not `np.linalg.inv`: the resampler below is bit-exact, and a
+    differently-associated inverse moves the sampled coordinate by an ulp and
+    with it the occasional quantised pixel. OpenCV does, literally:
+
+        D = M[0]*M[4] - M[1]*M[3];  D = D != 0 ? 1./D : 0;
+        A11 = M[4]*D; A22 = M[0]*D;
+        M[0] = A11; M[1] *= -D; M[3] *= -D; M[4] = A22;
+        M[2] = -M[0]*M[2] - M[1]*M[5];
+        M[5] = -M[3]*M[2] - M[4]*M[5];
     """
-    inv = np.linalg.inv(np.vstack([m, [0.0, 0.0, 1.0]]))[0:2, :]
+    m = [float(v) for v in np.asarray(m, dtype=np.float64).reshape(6)]
+    d = m[0] * m[4] - m[1] * m[3]
+    d = 1.0 / d if d != 0.0 else 0.0
+    a11, a22 = m[4] * d, m[0] * d
+    n0, n1, n3, n4 = a11, m[1] * -d, m[3] * -d, a22
+    n2 = -n0 * m[2] - n1 * m[5]
+    n5 = -n3 * m[2] - n4 * m[5]
+    return [n0, n1, n2, n3, n4, n5]
+
+
+def warp_inter_linear(img, m, size):
+    """`cv2.warpAffine(img, m, (size, size), INTER_LINEAR, BORDER_CONSTANT, 0)`.
+
+    `m` maps source -> destination, so the sampler uses its inverse.
+
+    This is NOT a float bilinear kernel with the weights rounded at the end.
+    OpenCV quantises the inverse-mapped coordinate onto a five-bit grid before
+    it picks a weight at all, so a true fraction below the half-step 1/64
+    collapses to zero and the tap is the pure left pixel. Reproduced here in
+    the order `imgwarp.cpp`'s `WarpAffineInvoker` does it, because the
+    intermediate roundings are part of the answer:
+
+      * the per-destination-COLUMN contribution is rounded to 1/AB_SCALE of a
+        pixel on its own (`adelta`/`bdelta`), and so is the per-ROW half;
+      * only then are the two added and shifted onto the 1/INTER_TAB_SIZE grid,
+        with `ROUND_DELTA` folded in to make that truncation a rounding;
+      * the four interpolation weights are 15-bit integers summing to exactly
+        `1 << 15` (`BilinearTab_i`), the taps accumulate as integers, and the
+        result is `(acc + (1 << 14)) >> 15` saturated into uint8.
+
+    `cvRound(a*u*1024) + cvRound(m*v*1024)` is not `cvRound((a*u + m*v)*1024)`,
+    which is exactly why the two halves are rounded separately here.
+    """
+    inv = invert_affine(m)
     height, width, channels = img.shape
-    src = img.astype(np.float64)
-    out = np.zeros((size, size, channels), dtype=np.float64)
+    src = img.astype(np.int64)
 
-    for v in range(size):
-        for u in range(size):
-            fx = inv[0, 0] * u + inv[0, 1] * v + inv[0, 2]
-            fy = inv[1, 0] * u + inv[1, 1] * v + inv[1, 2]
-            x0 = int(np.floor(fx))
-            y0 = int(np.floor(fy))
-            ax = fx - x0
-            ay = fy - y0
-            acc = np.zeros(channels, dtype=np.float64)
-            for dy, wy in ((0, 1.0 - ay), (1, ay)):
-                for dx, wx in ((0, 1.0 - ax), (1, ax)):
-                    w = wy * wx
-                    if w == 0.0:
-                        continue
-                    xx = x0 + dx
-                    yy = y0 + dy
-                    if 0 <= xx < width and 0 <= yy < height:
-                        acc += w * src[yy, xx, :]
-            out[v, u, :] = acc
+    axis = np.arange(size, dtype=np.float64)
+    adelta = cv_round(inv[0] * axis * AB_SCALE)          # per destination column
+    bdelta = cv_round(inv[3] * axis * AB_SCALE)
+    x0 = cv_round((inv[1] * axis + inv[2]) * AB_SCALE) + ROUND_DELTA   # per row
+    y0 = cv_round((inv[4] * axis + inv[5]) * AB_SCALE) + ROUND_DELTA
 
-    return np.clip(np.floor(out + 0.5), 0.0, 255.0).astype(np.uint8)
+    # `>>` is arithmetic on numpy's signed integers, so it floors for negative
+    # coordinates exactly as C++'s does.
+    x = (x0[:, None] + adelta[None, :]) >> (AB_BITS - INTER_BITS)
+    y = (y0[:, None] + bdelta[None, :]) >> (AB_BITS - INTER_BITS)
+
+    # `saturate_cast<short>` on the integer tap; the low INTER_BITS are the
+    # fraction's index into the weight table.
+    sx = np.clip(x >> INTER_BITS, -32768, 32767)
+    sy = np.clip(y >> INTER_BITS, -32768, 32767)
+    fx = x & (INTER_TAB_SIZE - 1)
+    fy = y & (INTER_TAB_SIZE - 1)
+
+    # BilinearTab_i[fy*INTER_TAB_SIZE + fx], as exact integers. OpenCV's own
+    # table differs in one of its 1024 cells: `initInterTab2D` builds it with
+    # `saturate_cast<short>`, so the unit weight at fraction (0, 0) saturates
+    # to 32767 and its sum-fixing step moves the missing 1 to the opposite
+    # corner. For a uint8 source the two tables are the same function (the Rust
+    # gate `the_saturating_weight_table_cell_is_invisible_for_u8_sources`
+    # proves it exhaustively), so the exact form is used here.
+    weights = [
+        (INTER_TAB_SIZE - fy) * (INTER_TAB_SIZE - fx) * INTER_TAB_SIZE,
+        (INTER_TAB_SIZE - fy) * fx * INTER_TAB_SIZE,
+        fy * (INTER_TAB_SIZE - fx) * INTER_TAB_SIZE,
+        fy * fx * INTER_TAB_SIZE,
+    ]
+
+    acc = np.zeros((size, size, channels), dtype=np.int64)
+    for (dy, dx), weight in zip(((0, 0), (0, 1), (1, 0), (1, 1)), weights):
+        xx, yy = sx + dx, sy + dy
+        # BORDER_CONSTANT with borderValue 0: an out-of-range tap contributes
+        # `0 * weight`. The bounds are tested on the QUANTISED tap, as OpenCV
+        # tests them.
+        inside = (xx >= 0) & (xx < width) & (yy >= 0) & (yy < height)
+        taps = src[np.clip(yy, 0, height - 1), np.clip(xx, 0, width - 1), :]
+        acc += (weight * inside)[:, :, None] * taps
+
+    # FixedPtCast<int, uchar, INTER_REMAP_COEF_BITS>.
+    half = 1 << (INTER_REMAP_COEF_BITS - 1)
+    return np.clip((acc + half) >> INTER_REMAP_COEF_BITS, 0, 255).astype(np.uint8)
 
 
 def synthetic_crop(width, height):
@@ -175,7 +272,7 @@ def main():
 
     crop = synthetic_crop(CROP_WIDTH, CROP_HEIGHT)
     m = similarity_transform(LANDMARKS, ARCFACE_DST)
-    aligned = warp_bilinear(crop, m, TEMPLATE_SIZE)
+    aligned = warp_inter_linear(crop, m, TEMPLATE_SIZE)
 
     crop_path = out_dir / "align_crop_64x48_rgb8.bin"
     aligned_path = out_dir / "align_expected_112x112_rgb8.bin"
@@ -184,7 +281,7 @@ def main():
 
     print("transform (source -> template), row-major 2x3:")
     for row in m:
-        print("   ", ", ".join(f"{v!r}" for v in row))
+        print("   ", ", ".join(repr(float(v)) for v in row))
     print()
     for path in (crop_path, aligned_path):
         digest = hashlib.sha256(path.read_bytes()).hexdigest()

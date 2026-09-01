@@ -261,6 +261,31 @@ fn estimate_itself_rejects_landmarks_with_no_spread() {
 }
 
 #[test]
+fn estimate_can_return_a_transform_with_no_inverse() {
+  // `to_template`'s `inverse()` arm used to be commented as unreachable, on
+  // the strength of `estimate` rejecting a zero SOURCE spread. That does not
+  // follow: the solved scale is `|Σ conj(uᵢ)·vᵢ| / Σ‖uᵢ‖²` over the two
+  // CENTRED sets, so it is the TARGET side (and the relative geometry) that
+  // decides invertibility, and `estimate` is public and takes its target from
+  // the caller. A zero-spread target is the shortest witness: every solved
+  // parameter is finite, `estimate` is happy, and the result still inverts to
+  // nothing.
+  let flat_target = [Point::new(11.0, -4.0); LANDMARK_COUNT];
+  let solved = SimilarityTransform::estimate(&FIXTURE_LANDMARKS, &flat_target)
+    .expect("a spread source against any finite target is solvable");
+  assert_eq!((solved.a(), solved.b()), (0.0, 0.0));
+  assert_eq!(
+    (solved.tx(), solved.ty()),
+    (11.0, -4.0),
+    "the whole plane collapses onto the target point"
+  );
+  assert!(
+    solved.inverse().is_none(),
+    "a zero-scale transform has no inverse, so `estimate` can hand back one that does not invert"
+  );
+}
+
+#[test]
 fn coincident_landmarks_are_rejected() {
   let data = vec![0u8; 16 * 16 * 3];
   let crop = FaceCrop::new(&data, 16, 16).expect("geometry is valid");
@@ -280,9 +305,210 @@ fn a_non_finite_landmark_is_rejected_by_index() {
   landmarks[3] = Point::new(f32::NAN, 4.0);
   let error = FaceAlign::to_template(crop, &landmarks).expect_err("NaN is not a landmark");
   assert!(
-    matches!(error, Error::NonFiniteLandmark(payload) if payload.index() == 3),
-    "expected NonFiniteLandmark(3), got {error:?}"
+    matches!(error, Error::NonFiniteLandmark(payload)
+      if payload.index() == 3 && payload.set() == LandmarkSet::Source),
+    "expected NonFiniteLandmark(source, 3), got {error:?}"
   );
+}
+
+#[test]
+fn estimate_rejects_a_non_finite_target_and_names_the_set_it_came_from() {
+  // `estimate` takes TWO point sets and used to validate only `source`. A NaN
+  // in the public `target` reached the centroid and both dot products, and the
+  // function returned `Ok` holding NaN parameters — after which `apply` gives
+  // NaN and the sampler, refusing every mapped coordinate, emits an all-border
+  // template. A silent black face is exactly what returning a `Result` here
+  // was supposed to prevent.
+  let mut target = ARCFACE_TEMPLATE;
+  target[2] = Point::new(56.0252, f32::INFINITY);
+  let error = SimilarityTransform::estimate(&FIXTURE_LANDMARKS, &target)
+    .expect_err("an infinite target coordinate determines no transform");
+  assert!(
+    matches!(error, Error::NonFiniteLandmark(payload)
+      if payload.index() == 2 && payload.set() == LandmarkSet::Target),
+    "expected NonFiniteLandmark(target, 2), got {error:?}"
+  );
+
+  // And the payload has to DISTINGUISH the two sides, or the caller cannot
+  // tell "my detector emitted NaN" from "the template I passed is broken".
+  let mut source = FIXTURE_LANDMARKS;
+  source[2] = Point::new(30.5, f32::NAN);
+  let from_source = SimilarityTransform::estimate(&source, &ARCFACE_TEMPLATE)
+    .expect_err("a NaN source coordinate determines no transform");
+  assert!(
+    matches!(from_source, Error::NonFiniteLandmark(payload)
+      if payload.index() == 2 && payload.set() == LandmarkSet::Source),
+    "expected NonFiniteLandmark(source, 2), got {from_source:?}"
+  );
+  assert_ne!(
+    LandmarkSet::Source,
+    LandmarkSet::Target,
+    "the two sides must not compare equal, or naming them proves nothing"
+  );
+}
+
+#[test]
+fn a_solved_transform_with_a_non_finite_parameter_is_never_handed_out() {
+  // The backstop `estimate` returns through. It is not reachable from
+  // `estimate` itself — with both `f32` point sets finite the solved
+  // parameters are bounded well inside `f64` (see `estimate`'s doc) — so it is
+  // gated at the constructor, which is the only place that can see it. Without
+  // this, `Ok` could carry a transform whose `apply` is NaN.
+  for (index, parameter) in [
+    TransformParameter::A,
+    TransformParameter::B,
+    TransformParameter::Tx,
+    TransformParameter::Ty,
+  ]
+  .into_iter()
+  .enumerate()
+  {
+    let mut params = [1.0f64, 0.5, 2.0, 3.0];
+    params[index] = f64::NAN;
+    let [a, b, tx, ty] = params;
+    let error =
+      SimilarityTransform::checked(a, b, tx, ty).expect_err("a NaN parameter is not a transform");
+    assert!(
+      matches!(error, Error::NonFiniteTransform(payload) if payload.parameter() == parameter),
+      "expected NonFiniteTransform({parameter}), got {error:?}"
+    );
+  }
+  assert!(SimilarityTransform::checked(1.0, 0.5, 2.0, 3.0).is_ok());
+}
+
+#[test]
+fn an_inverse_is_refused_when_any_parameter_is_non_finite() {
+  // The same one-sided-validation class as `estimate`'s, on the other public
+  // constructor: `inverse` checked the ROTATION (through the determinant) and
+  // never the TRANSLATION, so a perfectly good rotation with a NaN shift
+  // returned `Some` holding a transform whose `apply` is NaN everywhere.
+  // `new` is public AND `const`, so that is a value a caller can build.
+  assert!(
+    SimilarityTransform::new(1.0, 0.0, f64::NAN, 0.0)
+      .inverse()
+      .is_none(),
+    "a NaN translation must not invert to Some"
+  );
+  assert!(
+    SimilarityTransform::new(1.0, 0.0, 0.0, f64::NEG_INFINITY)
+      .inverse()
+      .is_none(),
+    "an infinite translation must not invert to Some"
+  );
+  assert!(
+    SimilarityTransform::new(f64::NAN, 0.0, 1.0, 2.0)
+      .inverse()
+      .is_none(),
+    "the rotation side must still be refused"
+  );
+  // And the check on the way OUT is load-bearing on its own, not a duplicate
+  // of the one on the way in: a scale small enough that `1/(a² + b²)`
+  // overflows turns four finite parameters into an infinite one. OpenCV's
+  // `warpAffine` computes the same `D = 1./D` and would produce the same
+  // infinity, so refusing is both the safe answer and the faithful one.
+  assert!(
+    SimilarityTransform::new(1e-160, 0.0, 1.0, 2.0)
+      .inverse()
+      .is_none(),
+    "a scale whose reciprocal overflows has no finite inverse"
+  );
+  assert!(
+    SimilarityTransform::new(1.7875, -0.1252, 5.1247, 24.1454)
+      .inverse()
+      .is_some(),
+    "a finite invertible transform must still invert"
+  );
+}
+
+#[test]
+fn cv_round_breaks_ties_to_even_and_saturates() {
+  // `cvRound` is `lrint` under the default rounding mode, so an exact .5 goes
+  // to the EVEN neighbour — not away from zero, which is what the pixel cast
+  // below does. The two tie rules sit three lines apart in this module and
+  // reproducing the wrong one at either site is invisible on any input that
+  // never lands exactly on a half, which is most of them: the golden alone
+  // could not tell the two apart.
+  for (value, want) in [
+    (0.5f64, 0i64),
+    (1.5, 2),
+    (2.5, 2),
+    (3.5, 4),
+    (-0.5, 0),
+    (-1.5, -2),
+    (-2.5, -2),
+    (0.49, 0),
+    (0.51, 1),
+    (-0.51, -1),
+  ] {
+    assert_eq!(
+      cv_round(value),
+      want,
+      "cvRound({value}) must be {want} (nearest, ties to even)"
+    );
+  }
+  // `saturate_cast<int>` is undefined outside `int` in C++; here it saturates,
+  // and either way the coordinate lands far outside every crop.
+  assert_eq!(cv_round(1e300), i64::from(i32::MAX));
+  assert_eq!(cv_round(-1e300), i64::from(i32::MIN));
+}
+
+#[test]
+fn the_fixed_point_pixel_cast_rounds_half_up_and_saturates() {
+  // OpenCV's `FixedPtCast<int, uchar, INTER_REMAP_COEF_BITS>`:
+  // `saturate_cast<uchar>((value + (1 << 14)) >> 15)`. Half goes UP here,
+  // where `cv_round` above sends it to even — pinned separately because the
+  // difference only shows on an exact half.
+  let one = 1i64 << REMAP_COEF_BITS;
+  let half = 1i64 << (REMAP_COEF_BITS - 1);
+  assert_eq!(fixed_point_to_u8(0), 0);
+  assert_eq!(fixed_point_to_u8(half - 1), 0);
+  assert_eq!(fixed_point_to_u8(half), 1, "an exact half must round UP");
+  assert_eq!(fixed_point_to_u8(one + half), 2, "and so must the next one");
+  assert_eq!(fixed_point_to_u8(255 * one), 255);
+  assert_eq!(fixed_point_to_u8(256 * one), 255, "must saturate, not wrap");
+  assert_eq!(fixed_point_to_u8(-one), 0, "must clamp, not wrap");
+}
+
+#[test]
+fn the_saturating_weight_table_cell_is_invisible_for_u8_sources() {
+  // `bilinear_weights` returns the EXACT 15-bit table, whose four entries sum
+  // to `1 << 15`. OpenCV's `initInterTab2D` cannot: it fills its table through
+  // `saturate_cast<short>`, so the single cell whose weight is the whole unit
+  // — fraction (0, 0) — saturates to 32 767, and the sum-fixing step then puts
+  // the missing 1 on the opposite corner. That one cell of 1 024 is the only
+  // place the two tables differ, and this module would be claiming
+  // bit-exactness while knowingly using the other one if the difference were
+  // not proven invisible.
+  //
+  // Exhaustive over both taps the differing weights touch: with weights
+  // [32768, 0, 0, 0] the accumulator is `v00 << 15`, and with OpenCV's
+  // [32767, 0, 0, 1] it is `v00 · 32767 + v11`.
+  for v00 in 0..=255i64 {
+    for v11 in 0..=255i64 {
+      assert_eq!(
+        fixed_point_to_u8(v00 * 32768),
+        fixed_point_to_u8(v00 * 32767 + v11),
+        "taps ({v00}, {v11}) separate the exact weight table from OpenCV's saturated one"
+      );
+    }
+  }
+
+  // The property that makes the exact table the right one to carry: every cell
+  // sums to one unit, so the fixed-point cast is unbiased.
+  for fy in 0..INTER_TAB_SIZE {
+    for fx in 0..INTER_TAB_SIZE {
+      let weights = bilinear_weights(fx, fy);
+      assert!(
+        weights.iter().all(|w| *w >= 0),
+        "weight table cell ({fx}, {fy}) has a negative entry: {weights:?}"
+      );
+      assert_eq!(
+        weights.iter().sum::<i64>(),
+        1 << REMAP_COEF_BITS,
+        "weight table cell ({fx}, {fy}) does not sum to one unit: {weights:?}"
+      );
+    }
+  }
 }
 
 #[test]
@@ -333,4 +559,50 @@ fn aligning_records_the_transform_it_used() {
   assert_eq!(*transform, solved);
   assert_eq!(aligned.width(), TEMPLATE_SIZE);
   assert_eq!(aligned.height(), TEMPLATE_SIZE);
+}
+
+#[test]
+fn a_fraction_below_the_five_bit_half_step_takes_the_pure_left_pixel() {
+  // The resampler falsifier, stated as OpenCV's own arithmetic rather than as
+  // prose. `cv2.warpAffine`'s `INTER_LINEAR` carries the fractional source
+  // coordinate in five bits (`INTER_BITS = 5`), so a true fraction below the
+  // half-step 1/64 quantises to index 0 and the tap is the PURE LEFT PIXEL.
+  //
+  // On a 0-to-255 edge that is the difference between 0 and `255 · f`:
+  //   f = 0.015  (just under 1/64 = 0.015625)
+  //   unquantised: 255 · 0.015 = 3.825  ->  4
+  //   OpenCV:      round(0.015 · 1024) = 15; (15 + 16) >> 5 = 0  ->  fraction
+  //                index 0  ->  255 · 0 = 0
+  //
+  // A float sampler cannot produce 0 here, and every published ArcFace number
+  // is measured against crops `cv2.warpAffine` produced.
+  const FRACTION: f64 = 0.015;
+  let (width, height) = (4usize, 2usize);
+  let mut data = vec![255u8; width * height * 3];
+  for y in 0..height {
+    for channel in 0..3 {
+      data[(y * width) * 3 + channel] = 0;
+    }
+  }
+  let crop = FaceCrop::new(&data, width, height).expect("geometry is valid");
+  let warped = warp_bilinear(crop, &SimilarityTransform::new(1.0, 0.0, FRACTION, 0.0));
+
+  assert_eq!(
+    warped[0], 0,
+    "template pixel (0, 0) sampled a 0-to-255 edge at fraction {FRACTION} (under the 1/64 \
+     half-step) and got {}, where cv2.warpAffine's 5-bit INTER_LINEAR quantises the fraction to 0 \
+     and takes the pure left pixel",
+    warped[0]
+  );
+
+  // The same quantisation at the right edge: u = 3 maps to source x = 3.015,
+  // whose fraction also quantises to 0, so the pixel is the pure 255 and NOT
+  // 0.985 · 255 = 251 blended against the zero border past the last column.
+  let u3 = 3 * 3;
+  assert_eq!(
+    warped[u3], 255,
+    "template pixel (3, 0) got {}, where OpenCV's quantised fraction 0 takes source column 3 \
+     whole and never reaches the border",
+    warped[u3]
+  );
 }

@@ -29,20 +29,35 @@
 //! `INTER_LINEAR`, constant-0 border. [`FaceAlign::to_template`] does exactly
 //! that.
 //!
-//! # Two deliberate numerical divergences, both recorded rather than chased
+//! # The resampler is BIT-EXACT with `cv2.warpAffine`, and that is the contract
 //!
-//! 1. **Float weights, not OpenCV's 5-bit fixed point.** For 8-bit input
-//!    OpenCV quantises the bilinear weights to `INTER_BITS = 5`; this module
-//!    accumulates in `f64`. The two differ by at most one LSB per channel.
-//! 2. **Half-up rounding.** OpenCV's `saturate_cast<uchar>` rounds half to
-//!    even; this module rounds half away from zero (`⌊v + 0.5⌋`, then clamps).
-//!    It bites only on an exact `.5`.
+//! `INTER_LINEAR` is **not** a float bilinear kernel. For an 8-bit image
+//! OpenCV quantises the inverse-mapped coordinate to a five-bit fraction
+//! (`INTER_BITS = 5`) and interpolates with 15-bit fixed-point weights, so a
+//! true fraction below the half-step `1/64` collapses to **zero** and the tap
+//! is the pure left pixel. On a 0-to-255 edge that is the difference between
+//! `0` and `255/64 ≈ 4` — two thirds of a level short of `4` is not a rounding
+//! difference, it is a different pixel.
 //!
-//! Both sit around **1/255 ≈ 0.004 of a channel**, against a measured ANE fp16
-//! embedding floor of `1 − cos ≈ 0.0015` typical / `0.0025` worst and a
-//! cheapest-real-preprocessing-bug distance of `0.083` (issue #115's parity
-//! census). Chasing bit-exact OpenCV would buy nothing measurable and would
-//! make the sampler untestable against anything but OpenCV itself.
+//! An earlier revision of this module resampled in `f64` and recorded the
+//! divergence as "at most one LSB per channel". **That was a measurement on
+//! one fixture stated as a bound over the domain, and it is false.** Measured
+//! against `cv2.warpAffine` over ArcFace-shaped warps of random crops
+//! (`opencv-python-headless` 4.12.0, 451 584 bytes): **11.6 % of bytes differ
+//! and the worst differs by 6 levels.** Every published ArcFace accuracy
+//! number is measured against crops `cv2.warpAffine` produced, so this module
+//! reproduces OpenCV's fixed-point pipeline exactly rather than approximating
+//! it. The sampler's constants are each named after the OpenCV symbol they
+//! come from (`INTER_BITS`, `AB_SCALE`, `INTER_REMAP_COEF_BITS`, …), so the
+//! pipeline can be read against `imgproc/src/imgwarp.cpp` line by line.
+//!
+//! **Which OpenCV — the version is part of the contract.** The 4.x line, which
+//! is what InsightFace's pinned `face_align.py` runs against and what every
+//! published number was measured on. OpenCV **5.0 replaced the fixed-point
+//! path with a float one**: on the same warps it tracks an unquantised `f64`
+//! sampler (one differing byte in 73 728, an exact-tie rounding) and so
+//! differs from 4.x on the same 11.6 % of bytes. "Bit-exact with OpenCV" is
+//! therefore version-bearing, and it is pinned here to **4.x** deliberately.
 //!
 //! # The transform is solved without an SVD
 //!
@@ -65,10 +80,21 @@
 //!   recovered scale and rotation are the constructed ones inverted;
 //! - the committed golden compares 112×112×3 bytes against
 //!   `conversion/face/align_oracle.py`, which solves the same minimiser
-//!   through a different derivation and resamples in numpy.
+//!   through a different derivation.
+//!
+//! The golden's THIRD leg covers the solve only. Since the resampler became
+//! bit-exact, the oracle reproduces the same OpenCV specification this module
+//! does, so their byte agreement catches a transcription slip on either side
+//! and is not independent evidence about the pipeline. What carries that is
+//! `a_fraction_below_the_five_bit_half_step_takes_the_pure_left_pixel`, which
+//! pins the one behaviour separating the fixed-point pipeline from a float
+//! one, plus `cv_round_breaks_ties_to_even_and_saturates` and
+//! `the_fixed_point_pixel_cast_rounds_half_up_and_saturates` for the two tie
+//! rules that no whole-image comparison can see.
 
 use crate::embeddings::face::error::{
-  CropDataLength, CropDimensions, DegenerateLandmarks, Error, NonFiniteLandmark, Result,
+  CropDataLength, CropDimensions, DegenerateLandmarks, Error, LandmarkSet, NonFiniteLandmark,
+  NonFiniteTransform, Result, TransformParameter,
 };
 
 /// The number of landmarks the ArcFace family aligns on.
@@ -154,9 +180,41 @@ impl SimilarityTransform {
   /// A transform from its four free parameters.
   ///
   /// `a = s·cos θ`, `b = s·sin θ`, and `(tx, ty)` the translation.
+  ///
+  /// **Unvalidated**, because it is `const`: a non-finite argument produces a
+  /// transform whose [`Self::apply`] is NaN everywhere. The two FALLIBLE
+  /// constructors — [`Self::estimate`] and [`Self::inverse`] — both refuse
+  /// one, so a transform that reaches [`FaceAlign::to_template`]'s sampler is
+  /// finite in all four parameters.
   #[inline(always)]
   pub const fn new(a: f64, b: f64, tx: f64, ty: f64) -> Self {
     Self { a, b, tx, ty }
+  }
+
+  /// The first of `(a, b, tx, ty)` that is NaN or infinite, in that order.
+  #[inline]
+  fn first_non_finite(&self) -> Option<TransformParameter> {
+    [
+      (TransformParameter::A, self.a),
+      (TransformParameter::B, self.b),
+      (TransformParameter::Tx, self.tx),
+      (TransformParameter::Ty, self.ty),
+    ]
+    .into_iter()
+    .find_map(|(parameter, value)| (!value.is_finite()).then_some(parameter))
+  }
+
+  /// [`Self::new`] with the finiteness check — the one path every fallible
+  /// constructor returns through, so no `Ok` can hold a transform whose
+  /// [`Self::apply`] is NaN.
+  fn checked(a: f64, b: f64, tx: f64, ty: f64) -> Result<Self> {
+    let candidate = Self { a, b, tx, ty };
+    match candidate.first_non_finite() {
+      Some(parameter) => Err(Error::NonFiniteTransform(NonFiniteTransform::new(
+        parameter,
+      ))),
+      None => Ok(candidate),
+    }
   }
 
   /// `s·cos θ`.
@@ -213,24 +271,64 @@ impl SimilarityTransform {
     )
   }
 
-  /// The inverse transform (template → source), or `None` when the scale is
-  /// zero and no inverse exists.
+  /// The inverse transform (template → source), or `None` when no finite
+  /// inverse exists.
   ///
   /// Closed form rather than a general 3×3 inversion: a similarity's inverse is
   /// a similarity, and `[[a, −b], [b, a]]⁻¹ = [[a, b], [−b, a]] / (a² + b²)`.
+  ///
+  /// `None` on a zero scale, and equally on a non-finite parameter — including
+  /// a non-finite TRANSLATION with a perfectly good rotation, which the
+  /// determinant alone does not see. [`Self::new`] is `const` and public, so
+  /// that is a value a caller can hand in, and returning `Some` for it would
+  /// mean handing back an inverse whose [`Self::apply`] is NaN everywhere.
+  ///
+  /// ONE check, on the way out, and that is deliberate: every parameter of the
+  /// result is a sum of products of all four inputs, so a non-finite input
+  /// reaches at least one output parameter and a guard on the way in would be
+  /// unreachable — a line no test could distinguish from its absence. The exit
+  /// check is not redundant with it, though: a scale small enough that
+  /// `1.0 / (a² + b²)` overflows turns four finite parameters into an infinite
+  /// one, which is what
+  /// `an_inverse_is_refused_when_any_parameter_is_non_finite` pins.
+  ///
+  /// The arithmetic follows `cv2.warpAffine`'s own inversion in ITS operation
+  /// order — one reciprocal, then multiplies — because the resampler this
+  /// feeds is bit-exact with OpenCV (see the module doc) and a
+  /// differently-associated inverse moves the sampled coordinate by an ulp,
+  /// and with it the occasional quantised pixel:
+  ///
+  /// ```text
+  /// D = M[0]*M[4] - M[1]*M[3];  D = 1./D;
+  /// A11 = M[4]*D;  A22 = M[0]*D;
+  /// M[0] = A11;  M[1] *= -D;  M[3] *= -D;  M[4] = A22;
+  /// M[2] = -M[0]*M[2] - M[1]*M[5];
+  /// M[5] = -M[3]*M[2] - M[4]*M[5];
+  /// ```
+  ///
+  /// With `M = [a, −b, tx, b, a, ty]` the determinant `M[0]·M[4] − M[1]·M[3]`
+  /// is `a·a − (−b)·b`, which rounds identically to `a² + b²`, and `A11` and
+  /// `A22` coincide — so the inverse is again a similarity and fits this type.
   #[inline]
   pub fn inverse(&self) -> Option<Self> {
-    let det = self.a * self.a + self.b * self.b;
-    if det == 0.0 || !det.is_finite() {
+    let determinant = self.a * self.a + self.b * self.b;
+    if determinant == 0.0 {
       return None;
     }
-    let (ia, ib) = (self.a / det, -self.b / det);
-    Some(Self {
-      a: ia,
-      b: ib,
-      tx: -(ia * self.tx - ib * self.ty),
-      ty: -(ib * self.tx + ia * self.ty),
-    })
+    let reciprocal = 1.0 / determinant;
+    // `a` is OpenCV's `A11`/`A22`; `b` is its `M[3]` after `M[3] *= -D`, and
+    // its `M[1]` is then exactly `-b`. Subtracting `(-b)·ty` and adding `b·ty`
+    // are the same IEEE result, so the translation is written in the shorter
+    // of the two forms.
+    let a = self.a * reciprocal;
+    let b = self.b * -reciprocal;
+    let inverted = Self {
+      a,
+      b,
+      tx: -a * self.tx + b * self.ty,
+      ty: -b * self.tx - a * self.ty,
+    };
+    inverted.first_non_finite().is_none().then_some(inverted)
   }
 
   /// The least-squares similarity mapping `source` onto `target`.
@@ -250,18 +348,33 @@ impl SimilarityTransform {
   /// result is checked without appealing to either derivation.
   ///
   /// # Errors
-  /// [`Error::NonFiniteLandmark`] if any `source` coordinate is NaN or
-  /// infinite; [`Error::DegenerateLandmarks`] if `Σ ‖Xᵢ‖²` is zero or
-  /// non-finite, which is the case where no transform is determined.
+  /// [`Error::NonFiniteLandmark`] if any coordinate of EITHER point set is NaN
+  /// or infinite, naming which set it came from;
+  /// [`Error::DegenerateLandmarks`] if `Σ ‖Xᵢ‖²` is zero or non-finite, which
+  /// is the case where no transform is determined;
+  /// [`Error::NonFiniteTransform`] if a solved parameter is not finite.
+  ///
+  /// **Both sets, not just `source`.** `target` reaches the centroid and the
+  /// dot products exactly as `source` does, so a NaN there used to return `Ok`
+  /// holding NaN parameters and [`FaceAlign::to_template`] then emitted an
+  /// all-black template instead of an error. `target` is
+  /// [`ARCFACE_TEMPLATE`] on that path, but this function is PUBLIC and takes
+  /// the target from its caller.
+  ///
+  /// The [`Error::NonFiniteTransform`] arm is a backstop rather than a
+  /// reachable branch: with both `f32` point sets finite, `|a|` is bounded by
+  /// `√(Σ‖Yᵢ‖² / Σ‖Xᵢ‖²)` (Cauchy–Schwarz), whose numerator is at most
+  /// `10·f32::MAX² ≈ 1.2e78` and whose denominator, once nonzero, is at least
+  /// the square of the smallest `f32` gap — so the quotient stays far inside
+  /// `f64`. It is kept because the bound is an argument about the input type
+  /// and not something the compiler enforces, and because `Ok` must never
+  /// carry a NaN transform.
   pub fn estimate(
     source: &[Point; LANDMARK_COUNT],
     target: &[Point; LANDMARK_COUNT],
   ) -> Result<Self> {
-    for (index, p) in source.iter().enumerate() {
-      if !p.x().is_finite() || !p.y().is_finite() {
-        return Err(Error::NonFiniteLandmark(NonFiniteLandmark::new(index)));
-      }
-    }
+    check_all_finite(source, LandmarkSet::Source)?;
+    check_all_finite(target, LandmarkSet::Target)?;
 
     let (sx, sy) = centroid(source);
     let (tx_mean, ty_mean) = centroid(target);
@@ -285,12 +398,24 @@ impl SimilarityTransform {
     }
 
     let (a, b) = (dot / denom, cross / denom);
-    Ok(Self {
+    Self::checked(
       a,
       b,
-      tx: tx_mean - (a * sx - b * sy),
-      ty: ty_mean - (b * sx + a * sy),
-    })
+      tx_mean - (a * sx - b * sy),
+      ty_mean - (b * sx + a * sy),
+    )
+  }
+}
+
+/// Rejects a NaN or infinite coordinate in one NAMED point set, so the error
+/// says which of [`SimilarityTransform::estimate`]'s two sides failed.
+fn check_all_finite(points: &[Point; LANDMARK_COUNT], set: LandmarkSet) -> Result<()> {
+  match points
+    .iter()
+    .position(|p| !p.x().is_finite() || !p.y().is_finite())
+  {
+    Some(index) => Err(Error::NonFiniteLandmark(NonFiniteLandmark::new(set, index))),
+    None => Ok(()),
   }
 }
 
@@ -466,9 +591,22 @@ impl FaceAlign {
     landmarks5: &[Point; LANDMARK_COUNT],
   ) -> Result<AlignedFace> {
     let transform = SimilarityTransform::estimate(landmarks5, &ARCFACE_TEMPLATE)?;
-    // `estimate` rejects a zero spread, so the scale is nonzero and the
-    // inverse exists; the `ok_or_else` is a total-function backstop, not a path
-    // any input reaches.
+    // A real backstop, against a real geometry — NOT an impossibility, which
+    // is what the two obvious arguments for it both get wrong. The solved
+    // scale is `|Σ conj(uᵢ)·vᵢ| / Σ‖uᵢ‖²` over the two CENTRED point sets, and
+    // that vanishes when the sets are orthogonal in that inner product, which
+    // neither `estimate`'s rejection of a zero SOURCE spread nor the fact that
+    // [`ARCFACE_TEMPLATE`] has spread of its own rules out: a well-spread
+    // source exists (`Σ‖uᵢ‖² ≈ 9.3e4`) whose exact solved scale against this
+    // very template is 5e-18. Rounding such a source through `Point`'s `f32`
+    // has always left the scale nonzero — 9e-10 for the constructed case — so
+    // no input is KNOWN to reach the arm, and it is kept because that is a
+    // failure to find one rather than a proof that none exists.
+    //
+    // Reachable directly, though, and pinned by
+    // `estimate_can_return_a_transform_with_no_inverse`: `estimate` is public
+    // and takes its target from the caller, so a zero-spread target hands back
+    // a finite `a = b = 0` that inverts to `None`.
     let inverse = transform
       .inverse()
       .ok_or_else(|| Error::DegenerateLandmarks(DegenerateLandmarks::new(0.0)))?;
@@ -479,87 +617,189 @@ impl FaceAlign {
   }
 }
 
-/// `cv2.warpAffine(crop, M, (112, 112), borderValue=0.0)`, given `M⁻¹`.
+/// OpenCV's `INTER_BITS`: the inverse-mapped source coordinate keeps five
+/// fractional bits, so its interpolation weight is drawn from a 32-step table
+/// and a true fraction under `1/64` quantises to zero.
+const INTER_BITS: u32 = 5;
+
+/// OpenCV's `INTER_TAB_SIZE`, `1 << INTER_BITS`.
+const INTER_TAB_SIZE: i64 = 1 << INTER_BITS;
+
+/// OpenCV's `AB_BITS`, `MAX(10, INTER_BITS)`: the precision the per-row and
+/// per-column halves of the mapped coordinate are rounded to BEFORE they are
+/// added together.
+const AB_BITS: u32 = 10;
+
+/// OpenCV's `AB_SCALE`, `1 << AB_BITS`.
+const AB_SCALE: f64 = (1i64 << AB_BITS) as f64;
+
+/// OpenCV's `round_delta` for a non-nearest interpolation,
+/// `AB_SCALE / INTER_TAB_SIZE / 2` — the half-step folded in so that the
+/// truncating shift down to the five-bit grid becomes a round-to-nearest.
+const ROUND_DELTA: i64 = (1i64 << AB_BITS) / INTER_TAB_SIZE / 2;
+
+/// OpenCV's `INTER_REMAP_COEF_BITS`: the four interpolation weights are
+/// 15-bit fixed point and sum to exactly `1 << 15`.
+const REMAP_COEF_BITS: u32 = 15;
+
+/// OpenCV's `cvRound`, which is `lrint` under the default rounding mode:
+/// nearest, **ties to even** — not the half-up rounding used for pixels.
 ///
-/// Destination-driven: each template pixel centre is mapped back into the crop
-/// and bilinearly sampled, with out-of-range taps contributing zero. `f64`
-/// accumulation, then half-up rounding into `u8`.
+/// OpenCV reaches this through `saturate_cast<int>(double)`, which is
+/// undefined outside `int`'s range; Rust has to define it, so it saturates
+/// there. No solved alignment reaches that: [`SimilarityTransform::estimate`]
+/// and [`SimilarityTransform::inverse`] both refuse a non-finite parameter,
+/// and a saturated coordinate lands outside any crop and reads the border
+/// either way.
+#[inline]
+fn cv_round(value: f64) -> i64 {
+  let rounded = value.round_ties_even();
+  if rounded >= f64::from(i32::MAX) {
+    i64::from(i32::MAX)
+  } else if rounded <= f64::from(i32::MIN) {
+    i64::from(i32::MIN)
+  } else {
+    rounded as i64
+  }
+}
+
+/// `cv2.warpAffine(crop, M, (112, 112), flags=INTER_LINEAR,
+/// borderMode=BORDER_CONSTANT, borderValue=0)`, given `M⁻¹`.
+///
+/// Destination-driven, and **fixed point throughout** — see the module doc for
+/// why a float bilinear kernel is a different function and not a rounding of
+/// this one. The structure mirrors `imgwarp.cpp`'s `WarpAffineInvoker`: the
+/// per-destination-column contribution is rounded to `1/AB_SCALE` of a pixel
+/// once (`adelta`/`bdelta`), the per-row half likewise, and only then are the
+/// two added and dropped to the five-bit grid. That intermediate rounding is
+/// part of the answer, so it is reproduced rather than folded into a single
+/// expression: `cvRound(a·u·1024) + cvRound(m·v·1024)` is not
+/// `cvRound((a·u + m·v)·1024)`.
 fn warp_bilinear(crop: FaceCrop<'_>, inverse: &SimilarityTransform) -> [u8; TEMPLATE_BYTES] {
   let mut out = [0u8; TEMPLATE_BYTES];
   let (width, height) = (crop.width(), crop.height());
   let data = crop.data();
+  // The same six numbers `cv2.warpAffine` holds in `M` after inverting it.
+  let m = inverse.matrix();
+
+  let mut adelta = [0i64; TEMPLATE_SIZE];
+  let mut bdelta = [0i64; TEMPLATE_SIZE];
+  for (u, (a, b)) in adelta.iter_mut().zip(bdelta.iter_mut()).enumerate() {
+    // `u` is below 112, so `u as f64` is exact.
+    let uf = u as f64;
+    *a = cv_round(m[0] * uf * AB_SCALE);
+    *b = cv_round(m[3] * uf * AB_SCALE);
+  }
 
   for v in 0..TEMPLATE_SIZE {
+    let vf = v as f64;
+    let x0 = cv_round((m[1] * vf + m[2]) * AB_SCALE) + ROUND_DELTA;
+    let y0 = cv_round((m[4] * vf + m[5]) * AB_SCALE) + ROUND_DELTA;
     for u in 0..TEMPLATE_SIZE {
-      // `u` and `v` are below 112, so both are exact in `f64`.
-      let (uf, vf) = (u as f64, v as f64);
-      let fx = inverse.a() * uf - inverse.b() * vf + inverse.tx();
-      let fy = inverse.b() * uf + inverse.a() * vf + inverse.ty();
-      let mut acc = [0.0f64; 3];
-      accumulate_bilinear(data, width, height, fx, fy, &mut acc);
+      // `>> (AB_BITS − INTER_BITS)` drops the accumulator onto the five-bit
+      // grid; the `ROUND_DELTA` folded into `x0`/`y0` makes that truncation a
+      // rounding. Arithmetic shift, so it floors for a negative coordinate
+      // exactly as C++'s does.
+      let x = (x0 + adelta[u]) >> (AB_BITS - INTER_BITS);
+      let y = (y0 + bdelta[u]) >> (AB_BITS - INTER_BITS);
       let base = (v * TEMPLATE_SIZE + u) * 3;
-      for (channel, value) in acc.iter().enumerate() {
-        out[base + channel] = round_to_u8(*value);
-      }
+      sample_fixed_point(data, width, height, x, y, &mut out[base..base + 3]);
     }
   }
   out
 }
 
-/// Adds the four bilinear taps around `(fx, fy)` into `acc`, skipping taps
-/// outside the crop (the constant-0 border).
-fn accumulate_bilinear(
-  data: &[u8],
-  width: usize,
-  height: usize,
-  fx: f64,
-  fy: f64,
-  acc: &mut [f64; 3],
-) {
-  // A non-finite mapped coordinate cannot happen for a transform `estimate`
-  // accepted, but `floor` on a NaN would produce a nonsense index, so the
-  // sampler refuses it and leaves the pixel at the border value.
-  if !fx.is_finite() || !fy.is_finite() {
-    return;
-  }
-  let (x0, y0) = (fx.floor(), fy.floor());
-  let (ax, ay) = (fx - x0, fy - y0);
-  for (dy, wy) in [(0i64, 1.0 - ay), (1, ay)] {
-    for (dx, wx) in [(0i64, 1.0 - ax), (1, ax)] {
-      let weight = wy * wx;
-      if weight == 0.0 {
-        continue;
-      }
-      let Some(index) = tap_index(x0, y0, dx, dy, width, height) else {
-        continue;
-      };
-      for (channel, slot) in acc.iter_mut().enumerate() {
-        *slot += weight * f64::from(data[index + channel]);
-      }
+/// One destination pixel from a five-bit fixed-point source coordinate:
+/// `remapBilinear`'s tap gather, weight table and output cast.
+///
+/// `x` and `y` are in units of `1/INTER_TAB_SIZE` of a source pixel. The high
+/// bits are the integer tap and the low [`INTER_BITS`] are the fraction's table
+/// index, which is how OpenCV splits them:
+///
+/// ```text
+/// xy[k]  = saturate_cast<short>(X >> INTER_BITS);
+/// alpha  = (Y & (INTER_TAB_SIZE-1))*INTER_TAB_SIZE + (X & (INTER_TAB_SIZE-1));
+/// ```
+fn sample_fixed_point(data: &[u8], width: usize, height: usize, x: i64, y: i64, out: &mut [u8]) {
+  // `saturate_cast<short>` on the integer tap. It cannot pull an out-of-range
+  // coordinate back INTO a crop — no crop is 32 768 pixels wide — so it only
+  // ever keeps the arithmetic below in range.
+  let sx = (x >> INTER_BITS).clamp(i64::from(i16::MIN), i64::from(i16::MAX));
+  let sy = (y >> INTER_BITS).clamp(i64::from(i16::MIN), i64::from(i16::MAX));
+  let fx = x & (INTER_TAB_SIZE - 1);
+  let fy = y & (INTER_TAB_SIZE - 1);
+
+  let weights = bilinear_weights(fx, fy);
+
+  let mut acc = [0i64; 3];
+  for ((dy, dx), weight) in [(0i64, 0i64), (0, 1), (1, 0), (1, 1)]
+    .into_iter()
+    .zip(weights)
+  {
+    // `BORDER_CONSTANT` with `borderValue = 0`: an out-of-range tap
+    // contributes `0 · weight`, which is what skipping it adds. The bounds are
+    // tested on the QUANTISED tap, as OpenCV tests them — deciding the border
+    // from the unrounded coordinate instead would disagree wherever the
+    // rounding crosses a pixel boundary.
+    let Some(index) = tap_index(sx + dx, sy + dy, width, height) else {
+      continue;
+    };
+    for (channel, slot) in acc.iter_mut().enumerate() {
+      *slot += weight * i64::from(data[index + channel]);
     }
+  }
+  for (slot, value) in out.iter_mut().zip(acc) {
+    *slot = fixed_point_to_u8(value);
   }
 }
 
-/// The byte offset of the tap at `(x0 + dx, y0 + dy)`, or `None` when it falls
-/// outside the crop.
-fn tap_index(x0: f64, y0: f64, dx: i64, dy: i64, width: usize, height: usize) -> Option<usize> {
-  // `x0`/`y0` are `floor`ed and finite here; anything beyond `i64` is far
-  // outside any crop, so the saturating conversion lands out of range and the
-  // bounds test below rejects it.
-  let (xi, yi) = (x0 as i64 + dx, y0 as i64 + dy);
-  let x = usize::try_from(xi).ok()?;
-  let y = usize::try_from(yi).ok()?;
+/// `BilinearTab_i[fy·INTER_TAB_SIZE + fx]`, in tap order
+/// `(0,0), (0,1), (1,0), (1,1)`.
+///
+/// The products of the two 1-D weights `(1 − i/32, i/32)` scaled by
+/// `1 << INTER_REMAP_COEF_BITS`. Every entry is an exact integer and the four
+/// sum to exactly `1 << 15`, which is what makes the fixed-point cast below
+/// unbiased.
+///
+/// OpenCV's own table differs in ONE of its 1 024 cells: `initInterTab2D`
+/// fills it with `saturate_cast<short>`, so the unit weight at fraction
+/// `(0, 0)` saturates to 32 767 and the sum-fixing step that follows puts the
+/// missing 1 on the opposite corner — `[32767, 0, 0, 1]` where this returns
+/// `[32768, 0, 0, 0]`. For a `u8` source the two are the same function;
+/// `the_saturating_weight_table_cell_is_invisible_for_u8_sources` proves that
+/// exhaustively over the 65 536 tap pairs the difference can see, so the exact
+/// form is used here rather than a transcription of an overflow.
+#[inline]
+fn bilinear_weights(fx: i64, fy: i64) -> [i64; 4] {
+  [
+    (INTER_TAB_SIZE - fy) * (INTER_TAB_SIZE - fx) * INTER_TAB_SIZE,
+    (INTER_TAB_SIZE - fy) * fx * INTER_TAB_SIZE,
+    fy * (INTER_TAB_SIZE - fx) * INTER_TAB_SIZE,
+    fy * fx * INTER_TAB_SIZE,
+  ]
+}
+
+/// The byte offset of the source tap at `(x, y)`, or `None` when it lies
+/// outside the crop and reads the constant-0 border.
+fn tap_index(x: i64, y: i64, width: usize, height: usize) -> Option<usize> {
+  let x = usize::try_from(x).ok()?;
+  let y = usize::try_from(y).ok()?;
   if x >= width || y >= height {
     return None;
   }
   Some((y * width + x) * 3)
 }
 
-/// Half-up rounding into `u8`, clamped to `0..=255`.
+/// OpenCV's `FixedPtCast<int, uchar, INTER_REMAP_COEF_BITS>`: add half a unit,
+/// shift down, saturate into `u8`.
+///
+/// Half-up on the fixed-point accumulator, which is NOT the same tie rule as
+/// [`cv_round`]'s half-to-even on the coordinate; both are reproduced as
+/// OpenCV has them.
 #[inline]
-fn round_to_u8(value: f64) -> u8 {
-  // Clamped into `0.0..=255.0` immediately before the narrowing cast.
-  (value + 0.5).floor().clamp(0.0, 255.0) as u8
+fn fixed_point_to_u8(value: i64) -> u8 {
+  let rounded = (value + (1i64 << (REMAP_COEF_BITS - 1))) >> REMAP_COEF_BITS;
+  rounded.clamp(0, 255) as u8
 }
 
 #[cfg(test)]

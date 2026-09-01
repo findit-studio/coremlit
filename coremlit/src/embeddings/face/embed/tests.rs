@@ -7,6 +7,15 @@
 use super::*;
 use crate::embeddings::face::align::TEMPLATE_BYTES;
 
+/// Every real face artifact declares an f32 multi-array for both features.
+const F32: Option<DataType> = Some(DataType::F32);
+
+/// The resolved input contract as a comparable pair, so a gate can assert the
+/// declared RANK and not only the numeric capacity.
+fn contract_of(shape: &[usize], layout: TensorLayout) -> Option<(usize, InputRank)> {
+  resolve_input_contract(shape, F32, layout).map(|c| (c.batch(), c.rank))
+}
+
 /// An [`AlignedFace`] whose byte at `(pixel, channel)` is `pixel + channel`,
 /// so a channel swap and a layout swap both change the tensor.
 fn ramp_face() -> AlignedFace {
@@ -174,44 +183,72 @@ fn preprocessing_is_scale_then_bias_with_the_bias_in_the_models_channel_space() 
 }
 
 #[test]
-fn resolve_batch_accepts_the_three_shapes_real_exports_declare() {
-  assert_eq!(resolve_batch(&[], TensorLayout::Nchw), Some(1));
-  assert_eq!(resolve_batch(&[3, 112, 112], TensorLayout::Nchw), Some(1));
+fn the_input_contract_accepts_the_three_shapes_real_exports_declare() {
+  // The rank is asserted alongside the capacity: the two rank-3 rows below
+  // used to resolve to a bare `1`, indistinguishable from the batched
+  // `[1, 3, 112, 112]` form, and that discarded bit is what fed them a tensor
+  // their graph cannot accept.
   assert_eq!(
-    resolve_batch(&[8, 3, 112, 112], TensorLayout::Nchw),
-    Some(8)
+    contract_of(&[], TensorLayout::Nchw),
+    Some((1, InputRank::Batched))
   );
-  assert_eq!(resolve_batch(&[112, 112, 3], TensorLayout::Nhwc), Some(1));
   assert_eq!(
-    resolve_batch(&[4, 112, 112, 3], TensorLayout::Nhwc),
-    Some(4)
+    contract_of(&[3, 112, 112], TensorLayout::Nchw),
+    Some((1, InputRank::Unbatched))
+  );
+  assert_eq!(
+    contract_of(&[8, 3, 112, 112], TensorLayout::Nchw),
+    Some((8, InputRank::Batched))
+  );
+  assert_eq!(
+    contract_of(&[112, 112, 3], TensorLayout::Nhwc),
+    Some((1, InputRank::Unbatched))
+  );
+  assert_eq!(
+    contract_of(&[4, 112, 112, 3], TensorLayout::Nhwc),
+    Some((4, InputRank::Batched))
   );
 }
 
 #[test]
-fn resolve_batch_refuses_a_shape_that_is_not_a_template_face() {
+fn the_input_contract_refuses_a_shape_that_is_not_a_template_face() {
   // The layouts must not accept each other's shapes: that swap is exactly the
   // silent-degradation failure the manifest exists to prevent.
-  assert_eq!(resolve_batch(&[1, 112, 112, 3], TensorLayout::Nchw), None);
-  assert_eq!(resolve_batch(&[1, 3, 112, 112], TensorLayout::Nhwc), None);
-  assert_eq!(resolve_batch(&[1, 3, 96, 112], TensorLayout::Nchw), None);
-  assert_eq!(
-    resolve_batch(&[1, 1, 3, 112, 112], TensorLayout::Nchw),
-    None
-  );
-  assert_eq!(resolve_batch(&[112, 112], TensorLayout::Nchw), None);
+  assert_eq!(contract_of(&[1, 112, 112, 3], TensorLayout::Nchw), None);
+  assert_eq!(contract_of(&[1, 3, 112, 112], TensorLayout::Nhwc), None);
+  assert_eq!(contract_of(&[1, 3, 96, 112], TensorLayout::Nchw), None);
+  assert_eq!(contract_of(&[1, 1, 3, 112, 112], TensorLayout::Nchw), None);
+  assert_eq!(contract_of(&[112, 112], TensorLayout::Nchw), None);
   // A declared batch of zero would make `embed` chunk by zero.
-  assert_eq!(resolve_batch(&[0, 3, 112, 112], TensorLayout::Nchw), None);
+  assert_eq!(contract_of(&[0, 3, 112, 112], TensorLayout::Nchw), None);
 }
 
 #[test]
 fn output_shape_check_binds_batch_and_dim() {
-  assert!(check_output_shape(&[], 4, 512).is_ok());
-  assert!(check_output_shape(&[512], 1, 512).is_ok());
-  assert!(check_output_shape(&[4, 512], 4, 512).is_ok());
-  assert!(check_output_shape(&[4, 128], 4, 512).is_err());
-  assert!(check_output_shape(&[2, 512], 4, 512).is_err());
-  assert!(check_output_shape(&[1, 4, 512], 4, 512).is_err());
+  // The resolved FORM is returned, not just an ok/err: it is what the
+  // predicted tensor is then measured against on every call.
+  assert_eq!(
+    check_output_contract(&[], F32, 4, 512),
+    Ok(OutputContract::Undeclared)
+  );
+  assert_eq!(
+    check_output_contract(&[512], F32, 1, 512),
+    Ok(OutputContract::Flat)
+  );
+  assert_eq!(
+    check_output_contract(&[4, 512], F32, 4, 512),
+    Ok(OutputContract::Batched)
+  );
+  assert!(check_output_contract(&[4, 128], F32, 4, 512).is_err());
+  assert!(check_output_contract(&[2, 512], F32, 4, 512).is_err());
+  assert!(check_output_contract(&[1, 4, 512], F32, 4, 512).is_err());
+  // A bare `[dim]` is a batch-one form. Declared against a batch of 4 it is
+  // not a shorthand, it is a contradiction, and accepting it would leave the
+  // predicted-tensor check with two incompatible shapes to allow.
+  assert!(
+    check_output_contract(&[512], F32, 4, 512).is_err(),
+    "[512] must not resolve against a batch-4 graph"
+  );
 }
 
 #[test]
@@ -324,4 +361,166 @@ fn preprocessing_round_trips_through_serde() {
   );
   let back: Preprocessing = serde_json::from_str(&json).expect("deserialisable");
   assert_eq!(back, preprocessing);
+}
+
+#[test]
+fn the_tensor_built_has_the_rank_the_model_declared() {
+  // `resolve_batch` accepts the UNBATCHED rank-3 form that real ArcFace
+  // exports declare, and used to keep only the numeric capacity from it — so a
+  // model that loads as supported was then always handed a leading-batch
+  // rank-4 tensor, and every single prediction failed. A contract the loader
+  // accepted has to be one `build_input` can actually satisfy.
+  for (declared, layout) in [
+    (
+      vec![3usize, TEMPLATE_SIZE, TEMPLATE_SIZE],
+      TensorLayout::Nchw,
+    ),
+    (
+      vec![TEMPLATE_SIZE, TEMPLATE_SIZE, 3usize],
+      TensorLayout::Nhwc,
+    ),
+    (
+      vec![8usize, 3, TEMPLATE_SIZE, TEMPLATE_SIZE],
+      TensorLayout::Nchw,
+    ),
+    (
+      vec![4usize, TEMPLATE_SIZE, TEMPLATE_SIZE, 3],
+      TensorLayout::Nhwc,
+    ),
+  ] {
+    let contract = resolve_input_contract(&declared, F32, layout)
+      .expect("a shape real exports declare must load");
+    assert_eq!(
+      input_shape(contract, layout),
+      declared,
+      "the loader accepted {declared:?} and would then feed the graph a different shape"
+    );
+  }
+}
+
+#[test]
+fn a_transposed_output_tensor_is_refused() {
+  // The silent one. `[dim, batch]` has exactly the same element COUNT as
+  // `[batch, dim]`, so a count-only check passes it, and the flattening that
+  // follows then cuts `dim`-sized chunks across the WRONG axis — mixing
+  // components between faces and returning embeddings that are plausible,
+  // unit-norm and wrong. No shape check, no finiteness check and no cosine can
+  // see it afterwards.
+  let error = check_predicted_shape(&[512, 4], 4 * 512, OutputContract::Batched, 4, 512)
+    .expect_err("a [dim, batch] tensor is not a [batch, dim] tensor");
+  assert!(
+    matches!(&error, Error::OutputShape(payload) if payload.got() == [512, 4]),
+    "expected OutputShape([512, 4]), got {error:?}"
+  );
+
+  // The contract's own shape still passes, and so does the batch-one `[dim]`
+  // form — but ONLY for a batch-one contract.
+  assert!(check_predicted_shape(&[4, 512], 4 * 512, OutputContract::Batched, 4, 512).is_ok());
+  assert!(check_predicted_shape(&[512], 512, OutputContract::Flat, 1, 512).is_ok());
+
+  // A graph that declared nothing may emit either form — and only those two.
+  assert!(check_predicted_shape(&[1, 512], 512, OutputContract::Undeclared, 1, 512).is_ok());
+  assert!(check_predicted_shape(&[512], 512, OutputContract::Undeclared, 1, 512).is_ok());
+  assert!(
+    check_predicted_shape(&[512], 512, OutputContract::Undeclared, 512, 1).is_err(),
+    "a bare [dim] tensor must not stand in for a 512-row batch"
+  );
+  assert!(
+    check_predicted_shape(&[512, 4], 4 * 512, OutputContract::Undeclared, 4, 512).is_err(),
+    "an undeclared output shape must not become a licence to accept any transposition"
+  );
+
+  // And a declared form is binding: a graph that promised [batch, dim] does
+  // not get to emit [dim] instead.
+  assert!(check_predicted_shape(&[512], 512, OutputContract::Batched, 1, 512).is_err());
+}
+
+#[test]
+fn normalising_survives_components_an_f32_square_cannot_hold() {
+  // The squared norm used to accumulate in `f32`, where `v * v` overflows to
+  // infinity for a large component and underflows to zero for a small one.
+  // Both reported `EmbeddingZero` — "this row has no direction" — for a row
+  // with a perfectly good direction. The magnitudes are the artifact's, not
+  // ours: nothing in the contract says a model's pre-normalisation output is
+  // near unit scale.
+  // Both components are finite `f32`s, and so is their norm (3.0e38); only the
+  // SQUARES leave the type.
+  let big = normalise_row(&[1.8e38, 2.4e38], 0).expect("a large but finite row has a direction");
+  assert!(
+    (big.as_slice()[0] - 0.6).abs() < 1e-6,
+    "got {:?}",
+    big.as_slice()
+  );
+  assert!(
+    (big.as_slice()[1] - 0.8).abs() < 1e-6,
+    "got {:?}",
+    big.as_slice()
+  );
+
+  let small = normalise_row(&[3.0e-25, 4.0e-25], 1).expect("a tiny but finite row has a direction");
+  assert!(
+    (small.as_slice()[0] - 0.6).abs() < 1e-6,
+    "got {:?}",
+    small.as_slice()
+  );
+  assert!(
+    (small.as_slice()[1] - 0.8).abs() < 1e-6,
+    "got {:?}",
+    small.as_slice()
+  );
+
+  // Only an EXACT zero magnitude is a genuine absence of direction.
+  assert!(matches!(
+    normalise_row(&[0.0, -0.0], 2).expect_err("zero has no direction"),
+    Error::EmbeddingZero(_)
+  ));
+}
+
+#[test]
+fn the_load_time_contract_requires_an_f32_multi_array() {
+  // Names and shapes were checked; the tensor KIND and element type never
+  // were, while inference always supplies and extracts `f32` multi-arrays. An
+  // f16 export therefore loaded clean and failed every prediction.
+  for wrong in [DataType::F16, DataType::F64, DataType::I32] {
+    assert_eq!(
+      resolve_input_contract(
+        &[1, 3, TEMPLATE_SIZE, TEMPLATE_SIZE],
+        Some(wrong),
+        TensorLayout::Nchw
+      ),
+      None,
+      "a {wrong} input must not load against an f32 inference path"
+    );
+    assert!(
+      check_output_contract(&[4, 512], Some(wrong), 4, 512).is_err(),
+      "a {wrong} output must not load against an f32 inference path"
+    );
+  }
+
+  // `data_type()` is `None` exactly when the feature is NOT a multi-array —
+  // which is the case the module doc's own census hits: both third-party
+  // CoreML ArcFace builds it surveys declare `ImageType` inputs, and an image
+  // feature reports no shape and no dtype at all.
+  assert_eq!(
+    resolve_input_contract(&[], None, TensorLayout::Nchw),
+    None,
+    "a feature that is not a multi-array must not resolve to batch 1"
+  );
+  assert!(
+    check_output_contract(&[], None, 1, 512).is_err(),
+    "a feature that is not a multi-array must not satisfy the output contract"
+  );
+
+  // An f32 multi-array still loads, including the undeclared-shape form a
+  // legacy `neuralNetwork` artifact leaves behind.
+  assert_eq!(
+    contract_of(&[1, 3, TEMPLATE_SIZE, TEMPLATE_SIZE], TensorLayout::Nchw),
+    Some((1, InputRank::Batched))
+  );
+  assert_eq!(
+    contract_of(&[], TensorLayout::Nchw),
+    Some((1, InputRank::Batched))
+  );
+  assert!(check_output_contract(&[4, 512], F32, 4, 512).is_ok());
+  assert!(check_output_contract(&[], F32, 4, 512).is_ok());
 }
