@@ -113,7 +113,11 @@ plus a CoreML embedder whose preprocessing — channel order, scale, bias,
 layout — is a per-artifact manifest value rather than a constant at a call
 site. It adds **no dependency at all**: the alignment is `f64` arithmetic and
 the embedder builds a `MultiArray` the always-compiled runtime core already
-owns.
+owns. That `f64` is also where the alignment departs from InsightFace, whose
+`skimage` solve stays in `f32` — a divergence the `align` module doc measures
+and shows has no single target to be closed against, because `skimage`'s `f32`
+path delegates to a BLAS and two correct builds of it disagree by more than
+this crate disagrees with either.
 
 It is also the ONLY kit feature that stages no model artifact, and the reason
 belongs in this file rather than only in the module doc. Issue #115's census

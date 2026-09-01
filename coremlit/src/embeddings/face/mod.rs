@@ -118,8 +118,8 @@ pub mod error;
 mod compute_units_serde;
 
 pub use align::{
-  ARCFACE_TEMPLATE, AlignedFace, FaceAlign, FaceCrop, LANDMARK_COUNT, Point, SimilarityTransform,
-  TEMPLATE_BYTES, TEMPLATE_SIZE,
+  ARCFACE_TEMPLATE, AlignedFace, FaceAlign, FaceCrop, LANDMARK_COUNT, MAX_CROP_AXIS, Point,
+  SimilarityTransform, TEMPLATE_BYTES, TEMPLATE_SIZE,
 };
 pub use embed::{
   ChannelOrder, DEFAULT_FACE_COMPUTE, FaceEmbedder, FaceEmbedderOptions, FaceEmbedding, FaceModel,

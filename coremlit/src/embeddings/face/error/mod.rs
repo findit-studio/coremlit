@@ -5,8 +5,9 @@
 //! struct, per the workspace house rule
 //! (`no_enum_in_the_workspace_has_a_struct_shaped_or_multi_field_variant`).
 
-/// A crop's declared geometry is unusable: a zero axis, or `width · height · 3`
-/// not representable.
+/// A crop's declared geometry is unusable: a zero axis, an axis past
+/// [`crate::embeddings::face::MAX_CROP_AXIS`], or `width · height · 3` not
+/// representable.
 ///
 /// Payload of [`Error::CropDimensions`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -451,6 +452,90 @@ impl NonFiniteOutput {
   }
 }
 
+/// Which part of two [`crate::embeddings::face::FaceModel`] manifests first
+/// disagrees.
+///
+/// Declared in the order [`crate::embeddings::face::FaceEmbedding::dot`]
+/// reports them, so a pair that differs in several places at once names the
+/// first of these rather than an arbitrary one.
+///
+/// Every one of these decides what an embedding MEANS, which is why a
+/// difference in any of them makes a cosine undefined rather than merely
+/// inaccurate: a channel swap, a rescaled input or a second artifact each put
+/// the vector in a different space, and a dot product across two spaces is an
+/// arbitrary number with a plausible range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display)]
+#[display("{}", self.as_str())]
+pub enum EmbeddingSpaceField {
+  /// The embeddings are different widths — the one case that was previously
+  /// reported as a cosine of `0.0`, a value a measured non-match also has.
+  Dim,
+  /// The manifests name different input features, so different artifacts.
+  InputFeature,
+  /// The manifests name different output features.
+  OutputFeature,
+  /// One model wants RGB and the other BGR.
+  ChannelOrder,
+  /// One model wants NCHW and the other NHWC.
+  TensorLayout,
+  /// The per-byte multiplier differs.
+  PreprocessingScale,
+  /// The per-channel offset differs.
+  PreprocessingBias,
+}
+
+impl EmbeddingSpaceField {
+  /// Stable name, as it appears in the error message.
+  #[inline(always)]
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Dim => "dim",
+      Self::InputFeature => "input feature",
+      Self::OutputFeature => "output feature",
+      Self::ChannelOrder => "preprocessing channel order",
+      Self::TensorLayout => "preprocessing tensor layout",
+      Self::PreprocessingScale => "preprocessing scale",
+      Self::PreprocessingBias => "preprocessing bias",
+    }
+  }
+}
+
+/// Two [`crate::embeddings::face::FaceEmbedding`]s were compared across
+/// different model or preprocessing spaces.
+///
+/// **This is a refusal, not a score.** The widths agreeing is not enough: two
+/// 512-wide ArcFace-family artifacts, or one artifact fed BGR and RGB, put
+/// their vectors in unrelated spaces, and their dot product lands in `[−1, 1]`
+/// looking exactly like a measurement. The old return of `0.0` for a width
+/// mismatch had the same defect in its narrow case — `0.0` is a legitimate
+/// cosine, so no caller could tell an incompatible migration from a face that
+/// simply did not match.
+///
+/// Payload of [`Error::IncomparableEmbeddings`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IncomparableEmbeddings {
+  /// The first manifest field found to differ.
+  field: EmbeddingSpaceField,
+}
+
+impl IncomparableEmbeddings {
+  /// Construct from the first manifest field found to differ.
+  #[inline(always)]
+  pub const fn new(field: EmbeddingSpaceField) -> Self {
+    Self { field }
+  }
+
+  /// The first manifest field found to differ.
+  ///
+  /// The FIRST, not the only: two manifests can disagree in several places at
+  /// once, and reporting one that is definitely wrong beats a list assembled
+  /// to look thorough.
+  #[inline(always)]
+  pub const fn field(&self) -> EmbeddingSpaceField {
+    self.field
+  }
+}
+
 /// Everything [`crate::embeddings::face`] can fail with.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -465,7 +550,12 @@ pub enum Error {
   #[error("tensor failed: {0}")]
   Tensor(#[from] crate::TensorError),
   /// The crop's declared geometry is unusable.
-  #[error("crop dimensions {}×{} are unusable (zero axis, or w·h·3 overflows)", .0.width(), .0.height())]
+  #[error(
+    "crop dimensions {}×{} are unusable (zero axis, an axis past {}, or w·h·3 overflows)",
+    .0.width(),
+    .0.height(),
+    crate::embeddings::face::MAX_CROP_AXIS
+  )]
   CropDimensions(CropDimensions),
   /// The crop's backing slice is not `width · height · 3` bytes.
   #[error("crop data length mismatch: expected {} bytes (w·h·3), got {}", .0.expected(), .0.got())]
@@ -506,6 +596,13 @@ pub enum Error {
   /// A (finite) embedding row has zero magnitude and cannot be L2-normalized.
   #[error("model output row {} has zero magnitude and cannot be normalized", .0.row())]
   EmbeddingZero(BatchRow),
+  /// Two embeddings come from different model or preprocessing spaces.
+  #[error(
+    "these two embeddings come from different spaces (their manifests' {} differs); no \
+     similarity between them is defined",
+    .0.field()
+  )]
+  IncomparableEmbeddings(IncomparableEmbeddings),
 }
 
 /// `Result` specialized to this module's [`Error`].

@@ -34,7 +34,10 @@ evidence:
   formulation, where writing the scaled rotation as `[[a, -b], [b, a]]` makes
   the residual linear in `(a, b, tx, ty)` and the answer two dot products. The
   Rust's own optimality gate (`recovered_transform_is_the_least_squares_minimiser`)
-  names no formula at all, so the golden is not the only leg;
+  names no formula at all, so the golden is not the only leg. **Both sides
+  evaluate that minimiser in `f64` where `skimage` evaluates it in `f32`, which
+  is a divergence and not a rounding** — see "The solve is not bit-exact with
+  `skimage`" below;
 - the **resampler** is not independent. `cv2.warpAffine`'s `INTER_LINEAR` has
   exactly one right answer and both sides reproduce it, so byte agreement here
   catches a transcription slip and nothing more.
@@ -57,6 +60,72 @@ accuracy number was measured on. OpenCV **5.0 replaced the fixed-point path
 with a float one** and is a different function — against 5.0.0 these same
 committed bytes differ on 8 488 of 37 632, by up to 5 levels.
 
+## The solve is not bit-exact with `skimage`, and there is no single `skimage` to be exact against
+
+`skimage`'s `_umeyama` (`skimage/transform/_geometric.py` v0.19.3, L107-149)
+keeps its **`f32`** input through the centroids, the covariance and the SVD,
+storing only the result as `f64`. This script and the Rust promote to `f64`
+first. Same minimiser, different numbers — enough to move a five-bit source
+coordinate on **10 of 12 544** destination pixels for the witness landmarks
+`align_oracle.py --reference-divergence` reports.
+
+That gap is real. What makes it unclosable is that `_umeyama`'s `f32` path is
+two library calls — a `sgemm` for the covariance, a `sgesdd` for the 2×2 SVD —
+and neither is specified past returning *a* correct answer. Running the
+identical `_umeyama` source, same machine, same landmarks, under numpy's
+OpenBLAS 0.3.33 and Apple's Accelerate:
+
+| measured over | OpenBLAS vs Accelerate |
+|---|---|
+| `f32` covariance, face-like landmark sets | 16 618 of 20 000 differ |
+| `f32` `sgesdd` singular values | 13 657 of 20 000 differ |
+| `f32` `sgesdd` rotation `U @ V` | 20 000 of 20 000 differ |
+| `_umeyama` results that are not a similarity | 19 624 of 20 000 (Accelerate); 0 (OpenBLAS) |
+| five-bit coordinates, the witness | **15** of 12 544 differ |
+| five-bit coordinates, 20 000 face-like sets | mean **14.8**, median 11, worst 212 |
+
+The two builds disagree with **each other** by more than this crate disagrees
+with either (10 against OpenBLAS, 5 against Accelerate). OpenBLAS's aarch64
+`sgemm` contracts its multiply-adds into `fma` — an `fma` chain reproduces it on
+3 000 of 3 000 random inputs, a non-fused chain on 341 — and whether a kernel
+contracts is a build flag, not a specification.
+
+There is a structural obstruction too: a `f32` `U @ V` is only approximately
+orthogonal, so under Accelerate 98 % of `_umeyama` results are not exactly
+similarities — and under OpenBLAS none of them fail to be, which is itself the
+point: the property belongs to the build, not to the reference. Rust's
+`SimilarityTransform` stores `(a, b)` and cannot represent a shear, so the
+reference's own output is routinely not a value that type can hold.
+
+So "bit-exact with `skimage`" is a property of `skimage` *and the BLAS the
+measuring machine linked*, not of `skimage`. This crate therefore claims only
+what it can hold: the least-squares similarity minimiser of the `f32`
+landmarks, evaluated in `f64` rather than in the reference's `f32`, handed to a
+resampler that is bit-exact with `cv2.warpAffine` 4.x.
+`the_solve_diverges_from_skimage_by_less_than_skimage_diverges_from_itself`
+commits all three counts, so closing the gap toward one build turns that test
+red on the gap that has no single target.
+
+Deciding it on accuracy rather than on bit-exactness needs the embedding drift
+the divergence causes, measured against a staged artifact. There is none (see
+`src/embeddings/face/mod.rs`), so the divergence is recorded rather than traded
+away.
+
+```sh
+python3 coremlit/conversion/face/align_oracle.py --reference-divergence --sweep 20000
+```
+
+prints every number on this page: the witness, all three matrices, the three
+witness counts that `src/embeddings/face/align/tests.rs` commits as constants,
+the accumulation identification, and the table above (about ten seconds; drop
+`--sweep` for the matrices and the three counts alone). **This mode, unlike the
+golden,
+depends on the BLAS**: that is what it exists to demonstrate. It needs no
+skimage and no OpenCV, only numpy plus — for the second backend — Apple's
+Accelerate through `ctypes`, whose bridge asserts that it reproduces a matmul
+and reconstructs an SVD before anything is measured through it. Where
+Accelerate is unavailable the mode says so and reports the one backend it has.
+
 ## Regenerating
 
 ```sh
@@ -77,14 +146,19 @@ The committed fixtures were produced by this exact stack:
 | macOS | 26.5, arm64 |
 | python | 3.14.6 (`/opt/homebrew/opt/python@3.14/bin/python3.14`) |
 | numpy | 2.5.1 |
-| `align_oracle.py` sha256 | `d28a94294dc8f82783771b8026a117e3550d227762a3bd640b7ad27454947b53` |
+| `align_oracle.py` sha256 | `e96bf45ab2a5a712e7b5f2f9029958cced273f8172f36a483ba0594dede30ba4` |
 | `align_crop_64x48_rgb8.bin` sha256 | `a7d34a19107058c28c73633cc25b82a018fc279034d6670b45488022d5071ce0` |
 | `align_expected_112x112_rgb8.bin` sha256 | `274b92b0002ab01af0c8967372b2aea7bf5a71096308f257ea50168cf671f13c` |
 
 The solve is IEEE-754 `f64` throughout with no BLAS call on the hot path and
 the resampler is integer arithmetic after it, so a different numpy or Python is
-expected to reproduce these bytes; the row records what was actually run, not
-what is required.
+expected to reproduce these **fixture** bytes; the row records what was actually
+run, not what is required.
+
+`--reference-divergence` is the exception and deliberately so: its numbers are
+BLAS-dependent by construction, and the row above pins the build the committed
+`SKIMAGE_OPENBLAS` constant came from (numpy 2.5.1, OpenBLAS 0.3.33, aarch64).
+A different build will print a different matrix, which is the finding.
 
 The OpenCV comparisons quoted above were run **out of tree**, in a throwaway
 virtualenv, purely to check this reproduction against the thing it reproduces.

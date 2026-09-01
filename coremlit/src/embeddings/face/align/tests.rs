@@ -581,6 +581,86 @@ fn crop_geometry_is_validated() {
 }
 
 #[test]
+fn the_i16_tap_limit_is_why_a_wide_crop_is_refused() {
+  // FIRST the read that made this a defect rather than a style point. The
+  // sampler saturates its integer tap into `i16`, as OpenCV's own
+  // `saturate_cast<short>` does, and then decides the constant-0 border by
+  // comparing the SATURATED tap against the crop's extent. Hand it a crop
+  // wider than that saturation and the two disagree: source column 33 000 is
+  // a perfectly good column of a 40 000-wide crop, but the tap arrives as
+  // `i16::MAX`, which is ALSO inside the crop — so the sampler reads column
+  // 32 767 and reports nothing.
+  const WIDE: usize = 40_000;
+  let mut row = vec![0u8; WIDE * 3];
+  row[32_767 * 3] = 200; // what a saturated tap would read
+  row[33_000 * 3] = 25; // what the caller actually asked for
+  let mut out = [0u8; 3];
+  sample_fixed_point(
+    &row,
+    WIDE,
+    1,
+    33_000 << INTER_BITS, // an exact pixel centre: the whole weight on one tap
+    0,
+    &mut out,
+  );
+  assert_eq!(
+    out[0], 200,
+    "the tap saturation is the mechanism: it silently substituted column 32 767"
+  );
+
+  // So the geometry is refused, at the door, rather than sampled wrongly.
+  let data = vec![0u8; WIDE * 2 * 3];
+  let error = FaceCrop::new(&data, WIDE, 2).expect_err("wider than the fixed-point tap domain");
+  assert!(
+    matches!(error, Error::CropDimensions(p) if p.width() == WIDE && p.height() == 2),
+    "expected CropDimensions({WIDE}, 2), got {error:?}"
+  );
+  let tall = vec![0u8; 2 * WIDE * 3];
+  assert!(
+    matches!(
+      FaceCrop::new(&tall, 2, WIDE).expect_err("the bound is per axis"),
+      Error::CropDimensions(_)
+    ),
+    "the height axis is bounded too"
+  );
+
+  // The bound is exactly OpenCV's `remap` assert, `src.cols < SHRT_MAX`, and
+  // it is a boundary rather than a round number: one pixel narrower is fine.
+  assert_eq!(MAX_CROP_AXIS, i16::MAX as usize - 1);
+  let admitted = vec![0u8; MAX_CROP_AXIS * 3];
+  assert!(
+    FaceCrop::new(&admitted, MAX_CROP_AXIS, 1).is_ok(),
+    "the widest admitted crop must still be admitted"
+  );
+  let refused = vec![0u8; (MAX_CROP_AXIS + 1) * 3];
+  assert!(
+    FaceCrop::new(&refused, MAX_CROP_AXIS + 1, 1).is_err(),
+    "one pixel past the bound must be refused"
+  );
+
+  // And for every crop still admitted the saturation is unreachable as an
+  // index, which is what makes the clamp a no-op rather than a silent
+  // substitution: a tap at or past `i16::MAX` reads the border.
+  let mut widest = vec![9u8; MAX_CROP_AXIS * 3];
+  widest[(MAX_CROP_AXIS - 1) * 3] = 111;
+  for column in [i64::from(i16::MAX), i64::from(i16::MAX) + 5_000] {
+    let mut border = [7u8; 3];
+    sample_fixed_point(
+      &widest,
+      MAX_CROP_AXIS,
+      1,
+      column << INTER_BITS,
+      0,
+      &mut border,
+    );
+    assert_eq!(
+      border, [0u8; 3],
+      "a tap at {column} must read the constant-0 border, not a saturated column"
+    );
+  }
+}
+
+#[test]
 fn from_template_pixels_requires_the_exact_length() {
   let exact = vec![0u8; TEMPLATE_BYTES];
   let short = vec![0u8; TEMPLATE_BYTES - 1];
@@ -613,6 +693,193 @@ fn aligning_records_the_transform_it_used() {
   assert_eq!(*transform, solved);
   assert_eq!(aligned.width(), TEMPLATE_SIZE);
   assert_eq!(aligned.height(), TEMPLATE_SIZE);
+}
+
+/// The reviewer's witness, `f32` as a detector emits them.
+const WITNESS: [Point; LANDMARK_COUNT] = [
+  Point::new(48.073_643, 97.059_7),
+  Point::new(103.453_03, 115.633_26),
+  Point::new(68.999_21, 127.547_72),
+  Point::new(37.211_536, 152.986_66),
+  Point::new(82.014_03, 169.196_21),
+];
+
+/// `skimage`'s `f32` `_umeyama` on [`WITNESS`] under numpy 2.5.1 / **OpenBLAS
+/// 0.3.33**, row-major 2×3 — the same six numbers `tform.params[0:2, :]` holds.
+///
+/// Printed by `conversion/face/align_oracle.py --reference-divergence`.
+const SKIMAGE_OPENBLAS: [f64; 6] = [
+  0.628_153_825_248_663_7,
+  0.202_666_161_104_246_54,
+  -13.507_243_940_956_57,
+  -0.202_666_161_104_246_54,
+  0.628_153_825_248_663_7,
+  2.451_227_246_254_319_4,
+];
+
+/// The IDENTICAL `_umeyama` source on the IDENTICAL landmarks, under **Apple
+/// Accelerate** instead.
+///
+/// Note that `[0] != [4]` and `[1] != -[3]`: a `f32` `U @ V` is only
+/// approximately orthogonal, so this is not a similarity at all and
+/// [`SimilarityTransform`] could not hold it even if it were the target.
+const SKIMAGE_ACCELERATE: [f64; 6] = [
+  0.628_153_890_096_049_4,
+  0.202_666_202_037_496_08,
+  -13.507_253_770_385_248,
+  -0.202_666_205_667_098_56,
+  0.628_153_970_067_602_8,
+  2.451_211_088_017_999,
+];
+
+/// `cv2.warpAffine`'s own inversion of a general 2×3, in ITS operation order.
+///
+/// [`SimilarityTransform::inverse`] is this specialised to a similarity, and
+/// the two are asserted to agree wherever both apply. It is here in full
+/// because the reference matrices above are not similarities and the
+/// production type cannot carry them.
+fn invert_2x3(m: [f64; 6]) -> [f64; 6] {
+  let d = m[0] * m[4] - m[1] * m[3];
+  let d = if d == 0.0 { 0.0 } else { 1.0 / d };
+  let (n0, n1, n3, n4) = (m[4] * d, m[1] * -d, m[3] * -d, m[0] * d);
+  [
+    n0,
+    n1,
+    -n0 * m[2] - n1 * m[5],
+    n3,
+    n4,
+    -n3 * m[2] - n4 * m[5],
+  ]
+}
+
+/// Destination pixels whose five-bit source coordinate differs between two
+/// source → template matrices.
+///
+/// Coordinates, not bytes: a moved coordinate leaves the output unchanged
+/// wherever it lands in a flat neighbourhood, so counting differing pixels
+/// under-reports a moved map.
+fn coordinate_divergence(left: [f64; 6], right: [f64; 6]) -> usize {
+  let (a, b) = (
+    SourceGrid::new(invert_2x3(left)),
+    SourceGrid::new(invert_2x3(right)),
+  );
+  (0..TEMPLATE_SIZE)
+    .map(|v| {
+      let (oa, ob) = (a.row_origin(v), b.row_origin(v));
+      (0..TEMPLATE_SIZE)
+        .filter(|&u| a.at(oa, u) != b.at(ob, u))
+        .count()
+    })
+    .sum()
+}
+
+#[test]
+fn the_solve_diverges_from_skimage_by_less_than_skimage_diverges_from_itself() {
+  // The module doc's central claim, as three numbers rather than as prose.
+  //
+  // The ruling this answers was to reproduce `skimage`'s `f32` `_umeyama`
+  // end to end so the bit-exact resampler would be fed the matrix the
+  // reference computes. It cannot be done, and the third number is why: the
+  // reference is not one matrix. `_umeyama`'s `f32` path is a `sgemm` and a
+  // `sgesdd`, neither specified past returning *a* correct answer, and two
+  // correct builds of it disagree on these very landmarks by MORE than this
+  // module disagrees with either.
+  //
+  // If a later change closes the first gap by tracking one build, this goes
+  // red and the gap that cannot be closed has to be confronted rather than
+  // inherited.
+  let solved = SimilarityTransform::estimate(&WITNESS, &ARCFACE_TEMPLATE)
+    .expect("the witness landmarks are non-degenerate");
+
+  // The watcher first: `invert_2x3` must agree with the production inverse
+  // wherever the production type can carry the matrix at all, or the three
+  // counts below are measuring this helper rather than the solve.
+  let inverse = solved.inverse().expect("a solvable witness inverts");
+  assert_eq!(
+    invert_2x3(solved.matrix()),
+    inverse.matrix(),
+    "the test's general inversion must reproduce the production similarity one"
+  );
+
+  assert_eq!(
+    coordinate_divergence(solved.matrix(), SKIMAGE_OPENBLAS),
+    10,
+    "the solve's distance from `skimage` under OpenBLAS"
+  );
+  assert_eq!(
+    coordinate_divergence(solved.matrix(), SKIMAGE_ACCELERATE),
+    5,
+    "the solve's distance from the SAME `skimage` under Accelerate"
+  );
+  assert_eq!(
+    coordinate_divergence(SKIMAGE_OPENBLAS, SKIMAGE_ACCELERATE),
+    15,
+    "two correct builds of the reference disagree with EACH OTHER by more than \
+     this module disagrees with either; there is no single matrix to be exact against"
+  );
+
+  // The reference's own output is frequently not even a similarity, so the
+  // production type could not carry it however the solve were written.
+  // `SimilarityTransform` stores `(a, b)` and reconstitutes
+  // `[a, −b, tx, b, a, ty]`, so the nearest value it can hold to Accelerate's
+  // matrix is not that matrix: a `f32` `U @ V` is only approximately
+  // orthogonal, and the shear that leaves behind has nowhere to live here.
+  let nearest = SimilarityTransform::new(
+    SKIMAGE_ACCELERATE[0],
+    -SKIMAGE_ACCELERATE[1],
+    SKIMAGE_ACCELERATE[2],
+    SKIMAGE_ACCELERATE[5],
+  );
+  assert_ne!(
+    nearest.matrix(),
+    SKIMAGE_ACCELERATE,
+    "the Accelerate reference was expected to carry a shear this type cannot hold"
+  );
+}
+
+#[test]
+fn the_divergence_counts_are_sensitive_to_the_matrix_they_measure() {
+  // `the_solve_diverges_…` asserts three fixed numbers, so it is worth
+  // something only if those numbers respond to the matrix. Three properties,
+  // because "it changed once" is not one of them.
+  let solved = SimilarityTransform::estimate(&WITNESS, &ARCFACE_TEMPLATE).expect("solvable");
+
+  // Zero on identity — the metric is a distance, not a constant.
+  for m in [solved.matrix(), SKIMAGE_OPENBLAS, SKIMAGE_ACCELERATE] {
+    assert_eq!(
+      coordinate_divergence(m, m),
+      0,
+      "a matrix cannot differ from itself"
+    );
+  }
+
+  // Closing the gap really does close it. This is the shape a later "fix"
+  // toward one build would take, and it is what makes the third assertion in
+  // `the_solve_diverges_…` the one that has to be answered: adopting OpenBLAS's
+  // matrix drives that count to zero and leaves the 15 exactly where it was.
+  assert_eq!(
+    coordinate_divergence(SKIMAGE_OPENBLAS, SKIMAGE_OPENBLAS),
+    0,
+    "tracking one build would zero its count"
+  );
+  assert_eq!(
+    coordinate_divergence(SKIMAGE_OPENBLAS, SKIMAGE_ACCELERATE),
+    15,
+    "and would leave the other one untouched"
+  );
+
+  // And the count moves at the SCALE of the divergence it measures. That
+  // scale is the translation's: the `f32` centroid `skimage` keeps is worth
+  // 2.1e-6 on `tx` and 6.1e-6 on `ty` here, where the rotation block differs
+  // by only 4.4e-8. A perturbation far under the measured divergence leaves a
+  // quantised count alone, which is the metric behaving, not sleeping.
+  let mut moved = solved.matrix();
+  moved[2] += 1e-6;
+  assert_ne!(
+    coordinate_divergence(moved, SKIMAGE_OPENBLAS),
+    coordinate_divergence(solved.matrix(), SKIMAGE_OPENBLAS),
+    "a translation move the size of the measured divergence must be visible in the count"
+  );
 }
 
 #[test]

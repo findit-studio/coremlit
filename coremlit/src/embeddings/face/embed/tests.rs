@@ -10,6 +10,13 @@ use crate::embeddings::face::align::TEMPLATE_BYTES;
 /// Every real face artifact declares an f32 multi-array for both features.
 const F32: Option<DataType> = Some(DataType::F32);
 
+/// A manifest of the given width, standing in for the artifact an embedder
+/// would have been loaded against. Every `FaceEmbedding` carries one, so a
+/// unit gate has to name one too.
+fn space(dim: usize) -> FaceModel {
+  FaceModel::new("data", "embedding", dim)
+}
+
 /// The resolved input contract as a comparable pair, so a gate can assert the
 /// declared RANK and not only the numeric capacity.
 fn contract_of(shape: &[usize], layout: TensorLayout) -> Option<(usize, InputRank)> {
@@ -253,7 +260,7 @@ fn output_shape_check_binds_batch_and_dim() {
 
 #[test]
 fn normalising_produces_a_unit_vector() {
-  let embedding = normalise_row(&[3.0, 4.0], 0).expect("finite and nonzero");
+  let embedding = normalise_row(&[3.0, 4.0], 0, &space(2)).expect("finite and nonzero");
   assert_eq!(embedding.dim(), 2);
   assert!((embedding.as_slice()[0] - 0.6).abs() < 1e-6);
   assert!((embedding.as_slice()[1] - 0.8).abs() < 1e-6);
@@ -264,7 +271,7 @@ fn normalising_produces_a_unit_vector() {
 
 #[test]
 fn a_zero_row_is_refused_and_names_the_callers_index() {
-  let error = normalise_row(&[0.0, 0.0, 0.0], 7).expect_err("zero has no direction");
+  let error = normalise_row(&[0.0, 0.0, 0.0], 7, &space(3)).expect_err("zero has no direction");
   assert!(
     matches!(error, Error::EmbeddingZero(payload) if payload.row() == 7),
     "expected EmbeddingZero(7), got {error:?}"
@@ -273,7 +280,8 @@ fn a_zero_row_is_refused_and_names_the_callers_index() {
 
 #[test]
 fn a_non_finite_row_names_the_row_and_the_component() {
-  let error = normalise_row(&[1.0, f32::NAN, 2.0], 5).expect_err("NaN is not an embedding");
+  let error =
+    normalise_row(&[1.0, f32::NAN, 2.0], 5, &space(3)).expect_err("NaN is not an embedding");
   assert!(
     matches!(error, Error::NonFiniteOutput(payload) if payload.row() == 5 && payload.component() == 1),
     "expected NonFiniteOutput(5, 1), got {error:?}"
@@ -282,23 +290,179 @@ fn a_non_finite_row_names_the_row_and_the_component() {
 
 #[test]
 fn cosine_is_the_dot_product_of_unit_vectors() {
-  let a = normalise_row(&[1.0, 0.0], 0).expect("unit");
-  let b = normalise_row(&[0.0, 1.0], 0).expect("unit");
-  let c = normalise_row(&[1.0, 0.0], 0).expect("unit");
-  assert!(a.cosine(&b).abs() < 1e-6);
-  assert!((a.cosine(&c) - 1.0).abs() < 1e-6);
-  assert_eq!(a.dot(&b), a.cosine(&b));
+  let a = normalise_row(&[1.0, 0.0], 0, &space(2)).expect("unit");
+  let b = normalise_row(&[0.0, 1.0], 0, &space(2)).expect("unit");
+  let c = normalise_row(&[1.0, 0.0], 0, &space(2)).expect("unit");
+  assert!(a.cosine(&b).expect("one space").abs() < 1e-6);
+  assert!((a.cosine(&c).expect("one space") - 1.0).abs() < 1e-6);
+  assert_eq!(
+    a.dot(&b).expect("one space"),
+    a.cosine(&b).expect("one space")
+  );
 }
 
 #[test]
-fn embeddings_of_different_widths_are_not_comparable() {
-  let a = normalise_row(&[1.0, 0.0], 0).expect("unit");
-  let wide = normalise_row(&[1.0, 0.0, 0.0], 0).expect("unit");
+fn one_space_reached_through_two_separately_built_manifests_still_compares() {
+  // `&self` inference means fan-out is one embedder per worker over the same
+  // artifact, so the SAME space is legitimately produced by more than one
+  // producer. A space identity minted per embedder would refuse exactly the
+  // cross-worker comparisons those workers exist to make; this pins that it
+  // does not. See `FaceEmbedding`'s doc for why the precedent's minted token
+  // was not the right shape here.
+  let a = normalise_row(&[1.0, 0.0], 0, &space(2)).expect("unit");
+  let b = normalise_row(&[1.0, 0.0], 0, &FaceModel::new("data", "embedding", 2)).expect("unit");
   assert_eq!(
-    a.cosine(&wide),
-    0.0,
-    "two artifacts' spaces must not compare as if they were one"
+    a.cosine(&b).expect("two equal manifests are one space"),
+    1.0,
+    "two equal manifests must name one space"
   );
+}
+
+#[test]
+fn embeddings_of_different_widths_are_refused_rather_than_scored_zero() {
+  // This used to return `0.0`, which is also what a measured orthogonal pair
+  // returns — so a caller could not tell an incompatible model migration from
+  // a face that did not match.
+  let a = normalise_row(&[1.0, 0.0], 0, &space(2)).expect("unit");
+  let wide = normalise_row(&[1.0, 0.0, 0.0], 0, &space(3)).expect("unit");
+  let error = a.cosine(&wide).expect_err("two widths are two spaces");
+  assert!(
+    matches!(
+      error,
+      Error::IncomparableEmbeddings(p) if p.field() == EmbeddingSpaceField::Dim
+    ),
+    "expected IncomparableEmbeddings(Dim), got {error:?}"
+  );
+}
+
+#[test]
+fn embeddings_from_two_preprocessing_spaces_are_refused_not_scored() {
+  // The half no width check could ever reach: identical widths, identical
+  // components, unrelated spaces. Scored, this pair reads 1.0 — a perfect
+  // match between two vectors that mean nothing to each other.
+  let rgb = space(2);
+  let bgr = rgb.with_preprocessing(Preprocessing::from_mean_and_divisor(
+    ChannelOrder::Bgr,
+    TensorLayout::Nchw,
+    [127.5, 127.5, 127.5],
+    127.5,
+  ));
+  let a = normalise_row(&[1.0, 0.0], 0, &rgb).expect("unit");
+  let b = normalise_row(&[1.0, 0.0], 0, &bgr).expect("unit");
+  assert_eq!(
+    a.dot(&a).expect("one space"),
+    1.0,
+    "the same space must still score"
+  );
+  let error = a
+    .cosine(&b)
+    .expect_err("two preprocessing spaces are not one space");
+  assert!(
+    matches!(
+      error,
+      Error::IncomparableEmbeddings(p) if p.field() == EmbeddingSpaceField::ChannelOrder
+    ),
+    "expected IncomparableEmbeddings(ChannelOrder), got {error:?}"
+  );
+
+  // Every field of the manifest decides the space, not only the ones a shape
+  // check could see.
+  for (want, other) in [
+    (
+      EmbeddingSpaceField::InputFeature,
+      FaceModel::new("pixels", "embedding", 2),
+    ),
+    (
+      EmbeddingSpaceField::OutputFeature,
+      FaceModel::new("data", "features", 2),
+    ),
+    (
+      EmbeddingSpaceField::TensorLayout,
+      rgb.with_preprocessing(Preprocessing::new(
+        ChannelOrder::Rgb,
+        TensorLayout::Nhwc,
+        1.0 / 127.5,
+        [-1.0, -1.0, -1.0],
+      )),
+    ),
+    (
+      EmbeddingSpaceField::PreprocessingScale,
+      rgb.with_preprocessing(Preprocessing::new(
+        ChannelOrder::Rgb,
+        TensorLayout::Nchw,
+        1.0 / 255.0,
+        [-1.0, -1.0, -1.0],
+      )),
+    ),
+    (
+      EmbeddingSpaceField::PreprocessingBias,
+      rgb.with_preprocessing(Preprocessing::new(
+        ChannelOrder::Rgb,
+        TensorLayout::Nchw,
+        1.0 / 127.5,
+        [0.0, -1.0, -1.0],
+      )),
+    ),
+  ] {
+    let far = normalise_row(&[1.0, 0.0], 0, &other).expect("unit");
+    let error = a
+      .cosine(&far)
+      .expect_err("a different manifest is a different space");
+    assert!(
+      matches!(error, Error::IncomparableEmbeddings(p) if p.field() == want),
+      "expected IncomparableEmbeddings({want}), got {error:?}"
+    );
+  }
+}
+
+#[test]
+fn a_non_finite_preprocessing_scale_still_names_one_space() {
+  // The space check compares the manifest's `f32`s by BIT PATTERN. Under `==`
+  // a NaN scale would fail to equal itself, and an embedding would be refused
+  // against its own twin for a reason having nothing to do with either
+  // embedding. A broken manifest is one broken manifest.
+  let nan = space(2).with_preprocessing(Preprocessing::new(
+    ChannelOrder::Rgb,
+    TensorLayout::Nchw,
+    f32::NAN,
+    [f32::NAN, -1.0, -1.0],
+  ));
+  let a = normalise_row(&[1.0, 0.0], 0, &nan).expect("unit");
+  let b = normalise_row(&[1.0, 0.0], 0, &nan).expect("unit");
+  assert_eq!(
+    a.cosine(&b)
+      .expect("one manifest is one space, whatever it holds"),
+    1.0
+  );
+  assert!(
+    a.cosine(&normalise_row(&[1.0, 0.0], 0, &space(2)).expect("unit"))
+      .is_err(),
+    "a NaN scale is still a DIFFERENT space from a finite one"
+  );
+}
+
+#[test]
+fn an_embedding_carries_the_manifest_that_produced_it() {
+  // Deliberately NOT the default preprocessing. A manifest built from
+  // `input`/`output`/`dim` alone reconstructs `Preprocessing::ARCFACE`, so a
+  // gate written against the default one would pass while the preprocessing
+  // half — the half that decides the space and that no shape check can see —
+  // was silently replaced.
+  let manifest = space(2).with_preprocessing(Preprocessing::from_mean_and_divisor(
+    ChannelOrder::Bgr,
+    TensorLayout::Nhwc,
+    [104.0, 117.0, 123.0],
+    58.0,
+  ));
+  assert_ne!(manifest.preprocessing(), Preprocessing::ARCFACE);
+  let embedding = normalise_row(&[1.0, 0.0], 0, &manifest).expect("unit");
+  assert_eq!(*embedding.manifest(), manifest);
+  assert_eq!(
+    embedding.manifest().preprocessing(),
+    manifest.preprocessing(),
+    "the preprocessing half of the space must travel with the vector too"
+  );
+  assert_eq!(embedding.manifest().dim(), embedding.dim());
 }
 
 #[test]
@@ -483,7 +647,8 @@ fn normalising_survives_components_an_f32_square_cannot_hold() {
   // near unit scale.
   // Both components are finite `f32`s, and so is their norm (3.0e38); only the
   // SQUARES leave the type.
-  let big = normalise_row(&[1.8e38, 2.4e38], 0).expect("a large but finite row has a direction");
+  let big =
+    normalise_row(&[1.8e38, 2.4e38], 0, &space(2)).expect("a large but finite row has a direction");
   assert!(
     (big.as_slice()[0] - 0.6).abs() < 1e-6,
     "got {:?}",
@@ -495,7 +660,8 @@ fn normalising_survives_components_an_f32_square_cannot_hold() {
     big.as_slice()
   );
 
-  let small = normalise_row(&[3.0e-25, 4.0e-25], 1).expect("a tiny but finite row has a direction");
+  let small = normalise_row(&[3.0e-25, 4.0e-25], 1, &space(2))
+    .expect("a tiny but finite row has a direction");
   assert!(
     (small.as_slice()[0] - 0.6).abs() < 1e-6,
     "got {:?}",
@@ -509,7 +675,7 @@ fn normalising_survives_components_an_f32_square_cannot_hold() {
 
   // Only an EXACT zero magnitude is a genuine absence of direction.
   assert!(matches!(
-    normalise_row(&[0.0, -0.0], 2).expect_err("zero has no direction"),
+    normalise_row(&[0.0, -0.0], 2, &space(2)).expect_err("zero has no direction"),
     Error::EmbeddingZero(_)
   ));
 }

@@ -26,8 +26,14 @@
 //! `estimate` is `skimage`'s Umeyama least-squares similarity, and
 //! `cv2.warpAffine` without `WARP_INVERSE_MAP` **inverts** `M` itself and
 //! samples the source at the inverse-mapped destination pixel centre,
-//! `INTER_LINEAR`, constant-0 border. [`FaceAlign::to_template`] does exactly
-//! that.
+//! `INTER_LINEAR`, constant-0 border. [`FaceAlign::to_template`] is that
+//! pipeline in the same order.
+//!
+//! **The two halves are reproduced to different standards, and the difference
+//! is measured rather than assumed.** The warp is bit-exact with OpenCV 4.x
+//! given a matrix. The solve is not bit-exact with `skimage`, and the section
+//! below measures both how far apart they are and — the part that decides
+//! what may be claimed — how far the reference is from ITSELF.
 //!
 //! # The resampler is BIT-EXACT with `cv2.warpAffine`, and that is the contract
 //!
@@ -59,6 +65,82 @@
 //! differs from 4.x on the same 11.6 % of bytes. "Bit-exact with OpenCV" is
 //! therefore version-bearing, and it is pinned here to **4.x** deliberately.
 //!
+//! # The SOLVE is not bit-exact with `skimage`, and there is no single
+//! # `skimage` to be exact against
+//!
+//! The resampler above reproduces `cv2.warpAffine` exactly **given a matrix**.
+//! Which matrix is a separate question, and the honest answer is that the
+//! reference has no single one to reproduce.
+//!
+//! `skimage`'s `_umeyama` (`skimage/transform/_geometric.py` v0.19.3, L107-149)
+//! keeps its **`f32`** input through the centroids, the covariance and the SVD,
+//! storing only the result as `f64`. This module promotes to `f64` first. Same
+//! minimiser, different numbers — and the difference is large enough to move a
+//! five-bit source coordinate. On the landmarks
+//!
+//! ```text
+//! [[48.073643, 97.0597], [103.45303, 115.63326], [68.99921, 127.54772],
+//!  [37.211536, 152.98666], [82.01403, 169.19621]]
+//! ```
+//!
+//! **10 of the 12 544 destination pixels** take a different five-bit source
+//! coordinate than `skimage` gives under numpy 2.5.1 / OpenBLAS 0.3.33.
+//!
+//! That much is a real divergence. What makes it unclosable is the next
+//! measurement. `_umeyama`'s `f32` path is two library calls — a `sgemm` for
+//! the covariance and a `sgesdd` for the 2×2 SVD — and neither is specified
+//! beyond returning *a* correct answer. Running the identical `_umeyama`
+//! source, same machine, same landmarks, under two BLAS/LAPACK builds (numpy's
+//! OpenBLAS 0.3.33 and Apple's Accelerate):
+//!
+//! - the `f32` covariance differs on **16 618 of 20 000** face-like landmark
+//!   sets. OpenBLAS's aarch64 `sgemm` contracts its multiply-adds into `fma`:
+//!   an `fma` chain reproduces it on 3 000 of 3 000 random inputs and a
+//!   non-fused chain on 341. Whether a kernel contracts is a build flag, not a
+//!   specification;
+//! - the `f32` `sgesdd` differs on its singular values on 13 657 of 20 000,
+//!   and on the rotation `U @ V` that `_umeyama` actually uses on all 20 000;
+//! - end to end, **on the witness above the two builds differ from each other
+//!   on 15 destination pixels** — more than either differs from this module —
+//!   and over 20 000 face-like sets on a mean of 14.8 (median 11, worst 212).
+//!
+//! So "bit-exact with `skimage`" is not a property of `skimage`. It is a
+//! property of `skimage` *and the BLAS the measuring machine happened to
+//! link*, and picking one build to be exact against would be picking one of
+//! several equally correct references while presenting it as having removed a
+//! choice.
+//!
+//! A structural obstruction sits on top of the numeric one:
+//! [`SimilarityTransform`] cannot hold a shear by construction, and under
+//! Accelerate **19 624 of those same 20 000** `_umeyama` results are not
+//! exactly similarities — `a ≠ d` or `b ≠ −c` in the last bits, because a
+//! `f32` `U @ V` is only approximately orthogonal. (Under OpenBLAS, 0 of
+//! 20 000, which is itself the point: the property is the build's, not the
+//! reference's.) The reference's own output is routinely not a value this type
+//! can represent.
+//!
+//! **What this module claims, therefore, and nothing more:** the transform is
+//! the least-squares similarity minimiser of the `f32` landmarks, evaluated in
+//! `f64` (not exactly — `f64` rounds too; it is `f64`-accurate where the
+//! reference is `f32`-accurate), and the resampler is bit-exact with
+//! `cv2.warpAffine`
+//! 4.x given that transform. It sits 10 five-bit coordinates from one
+//! reference build and 5 from another, inside a 15-wide band the reference
+//! occupies on its own.
+//! `the_solve_diverges_from_skimage_by_less_than_skimage_diverges_from_itself`
+//! pins all three numbers, so an attempt to close the gap toward one build has
+//! to confront the gap that cannot be closed.
+//!
+//! Regenerate every number above with
+//! `python3 conversion/face/align_oracle.py --reference-divergence --sweep 20000`
+//! (about ten seconds; without `--sweep` it prints the matrices and the three
+//! witness counts alone). Deciding
+//! it on accuracy instead of on bit-exactness needs a number this branch
+//! cannot produce — the embedding drift the divergence causes, measured
+//! against a staged artifact, and there is none (see the
+//! [`crate::embeddings::face`] module doc). So it is recorded rather than
+//! traded away.
+//!
 //! # The transform is solved without an SVD
 //!
 //! Umeyama's construction is stated with an SVD, but in 2-D **without
@@ -81,6 +163,9 @@
 //! - the committed golden compares 112×112×3 bytes against
 //!   `conversion/face/align_oracle.py`, which solves the same minimiser
 //!   through a different derivation.
+//!
+//! All three legs are about the minimiser, not about `skimage`'s `f32`
+//! evaluation of it; the section above is what covers that.
 //!
 //! The golden's THIRD leg covers the solve only. Since the resampler became
 //! bit-exact, the oracle reproduces the same OpenCV specification this module
@@ -106,10 +191,41 @@ pub const TEMPLATE_SIZE: usize = 112;
 /// Bytes in one [`AlignedFace`]: `112 · 112 · 3`, RGB8 interleaved.
 pub const TEMPLATE_BYTES: usize = TEMPLATE_SIZE * TEMPLATE_SIZE * 3;
 
+/// The largest crop axis [`FaceCrop::new`] admits: one short of `i16::MAX`.
+///
+/// **This is the sampler's fixed-point domain, not a buffer limit.**
+/// [`FaceAlign::to_template`] saturates each integer source tap into `i16` —
+/// OpenCV's own `saturate_cast<short>` on the `short XY[]` its
+/// `WarpAffineInvoker` fills — and the constant-0 border is then decided by
+/// comparing the SATURATED tap against the crop's extent. That test is right
+/// only while the saturation value is not a coordinate the crop actually has.
+/// Past this bound it is: a 40 000-column crop whose inverse asks for column
+/// 33 000 gets `i16::MAX` back, and 32 767 IS a column of that crop, so the
+/// sampler reads a wholly different region and reports nothing.
+/// `the_i16_tap_limit_is_why_a_wide_crop_is_refused` measures that read.
+///
+/// **Refused rather than widened**, because the sampler's contract is to be
+/// bit-exact with `cv2.warpAffine` (see the module doc) and OpenCV draws this
+/// line itself: 4.x's `remap` — the fixed-point pipeline `warpAffine` funnels
+/// into — opens with `CV_Assert( dst.cols < SHRT_MAX && dst.rows < SHRT_MAX &&
+/// src.cols < SHRT_MAX && src.rows < SHRT_MAX )`. A wider tap would sample
+/// geometry the reference refuses outright, which trades a silent wrong answer
+/// for a silent divergence rather than removing one.
+///
+/// **Why `i16::MAX − 1` and not `i16::MAX`.** Correctness alone would admit an
+/// axis of exactly `i16::MAX`: a crop that wide has its last column at
+/// `i16::MAX − 1`, so the saturation value is still outside it and the border
+/// test still holds. This takes OpenCV's strictly-less bound instead, so the
+/// admitted set is exactly the one the reference admits and the two cannot
+/// disagree about a crop at the boundary. One pixel of conservatism, chosen to
+/// keep a second number from existing.
+pub const MAX_CROP_AXIS: usize = i16::MAX as usize - 1;
+
 /// One 2-D point in a crop's pixel coordinates, pixel centres on integers.
 ///
-/// `f32` because that is what a detector emits, and because every coordinate
-/// the alignment consumes is promoted to `f64` for the solve anyway.
+/// `f32` because that is what a detector emits. The solve then promotes to
+/// `f64`, where `skimage`'s stays in `f32` — a divergence the module doc
+/// measures rather than waves at.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Point {
   /// Horizontal coordinate, increasing rightwards.
@@ -362,6 +478,11 @@ impl SimilarityTransform {
   /// without an SVD — see the module doc for why that is safe here and how the
   /// result is checked without appealing to either derivation.
   ///
+  /// **`f64` throughout, where the reference evaluates the same minimiser in
+  /// `f32`.** That is a divergence, it moves five-bit source coordinates, and
+  /// it is not closable: the module doc measures it, and measures the wider
+  /// spread the reference has between two builds of its own BLAS.
+  ///
   /// # Errors
   /// [`Error::NonFiniteLandmark`] if any coordinate of EITHER point set is NaN
   /// or infinite, naming which set it came from;
@@ -465,12 +586,16 @@ pub struct FaceCrop<'a> {
 impl<'a> FaceCrop<'a> {
   /// Wrap a decoded RGB8 buffer, validating its geometry.
   ///
+  /// Both axes must be nonzero and at most [`MAX_CROP_AXIS`]. The upper bound
+  /// is the sampler's, not the allocator's — see that constant for the tap
+  /// saturation it keeps unreachable and for OpenCV's identical assert.
+  ///
   /// # Errors
-  /// [`Error::CropDimensions`] if an axis is zero or `width · height · 3`
-  /// overflows `usize`; [`Error::CropDataLength`] if `data.len()` is not
-  /// exactly `width · height · 3`.
+  /// [`Error::CropDimensions`] if an axis is zero, exceeds [`MAX_CROP_AXIS`],
+  /// or `width · height · 3` overflows `usize`; [`Error::CropDataLength`] if
+  /// `data.len()` is not exactly `width · height · 3`.
   pub fn new(data: &'a [u8], width: usize, height: usize) -> Result<Self> {
-    if width == 0 || height == 0 {
+    if width == 0 || height == 0 || width > MAX_CROP_AXIS || height > MAX_CROP_AXIS {
       return Err(Error::CropDimensions(CropDimensions::new(width, height)));
     }
     let expected = width
@@ -702,33 +827,86 @@ fn warp_bilinear(crop: FaceCrop<'_>, inverse: &SimilarityTransform) -> [u8; TEMP
   let (width, height) = (crop.width(), crop.height());
   let data = crop.data();
   // The same six numbers `cv2.warpAffine` holds in `M` after inverting it.
-  let m = inverse.matrix();
-
-  let mut adelta = [0i64; TEMPLATE_SIZE];
-  let mut bdelta = [0i64; TEMPLATE_SIZE];
-  for (u, (a, b)) in adelta.iter_mut().zip(bdelta.iter_mut()).enumerate() {
-    // `u` is below 112, so `u as f64` is exact.
-    let uf = u as f64;
-    *a = cv_round(m[0] * uf * AB_SCALE);
-    *b = cv_round(m[3] * uf * AB_SCALE);
-  }
+  let grid = SourceGrid::new(inverse.matrix());
 
   for v in 0..TEMPLATE_SIZE {
-    let vf = v as f64;
-    let x0 = cv_round((m[1] * vf + m[2]) * AB_SCALE) + ROUND_DELTA;
-    let y0 = cv_round((m[4] * vf + m[5]) * AB_SCALE) + ROUND_DELTA;
+    let origin = grid.row_origin(v);
     for u in 0..TEMPLATE_SIZE {
-      // `>> (AB_BITS − INTER_BITS)` drops the accumulator onto the five-bit
-      // grid; the `ROUND_DELTA` folded into `x0`/`y0` makes that truncation a
-      // rounding. Arithmetic shift, so it floors for a negative coordinate
-      // exactly as C++'s does.
-      let x = (x0 + adelta[u]) >> (AB_BITS - INTER_BITS);
-      let y = (y0 + bdelta[u]) >> (AB_BITS - INTER_BITS);
+      let (x, y) = grid.at(origin, u);
       let base = (v * TEMPLATE_SIZE + u) * 3;
       sample_fixed_point(data, width, height, x, y, &mut out[base..base + 3]);
     }
   }
   out
+}
+
+/// The destination → five-bit source coordinate map `cv2.warpAffine` walks,
+/// for one ALREADY-INVERTED 2×3 matrix.
+///
+/// Split out of [`warp_bilinear`] for two reasons. It names the intermediate
+/// rounding that is part of the answer — the per-column and per-row halves are
+/// each rounded to `1/AB_SCALE` before they are added, so
+/// `cvRound(a·u·1024) + cvRound(m·v·1024)` is not `cvRound((a·u + m·v)·1024)`.
+/// And it lets two matrices be compared on the coordinates themselves rather
+/// than on pixels, which is what
+/// `the_solve_diverges_from_skimage_by_less_than_skimage_diverges_from_itself`
+/// needs: a moved coordinate leaves the output unchanged wherever the
+/// neighbourhood it lands in happens to be flat, so counting differing bytes
+/// under-reports a moved map.
+///
+/// Takes a raw `[f64; 6]` rather than a [`SimilarityTransform`] because the
+/// reference's own solved matrix usually is NOT a similarity — see the module
+/// doc — and comparing against one means being able to walk one.
+struct SourceGrid {
+  /// The inverted 2×3, row-major, as `cv2.warpAffine` holds `M`.
+  m: [f64; 6],
+  /// OpenCV's `adelta`: the per-destination-COLUMN half of the mapped `x`,
+  /// rounded to `1/AB_SCALE` of a pixel on its own.
+  adelta: [i64; TEMPLATE_SIZE],
+  /// OpenCV's `bdelta`, the same for `y`.
+  bdelta: [i64; TEMPLATE_SIZE],
+}
+
+impl SourceGrid {
+  /// Precomputes the per-column halves for a template → source 2×3.
+  fn new(inverse: [f64; 6]) -> Self {
+    let mut adelta = [0i64; TEMPLATE_SIZE];
+    let mut bdelta = [0i64; TEMPLATE_SIZE];
+    for (u, (a, b)) in adelta.iter_mut().zip(bdelta.iter_mut()).enumerate() {
+      // `u` is below 112, so `u as f64` is exact.
+      let uf = u as f64;
+      *a = cv_round(inverse[0] * uf * AB_SCALE);
+      *b = cv_round(inverse[3] * uf * AB_SCALE);
+    }
+    Self {
+      m: inverse,
+      adelta,
+      bdelta,
+    }
+  }
+
+  /// Destination row `v`'s accumulator origin, with [`ROUND_DELTA`] folded in
+  /// so the shift down onto the five-bit grid rounds rather than truncates.
+  fn row_origin(&self, v: usize) -> (i64, i64) {
+    let vf = v as f64;
+    (
+      cv_round((self.m[1] * vf + self.m[2]) * AB_SCALE) + ROUND_DELTA,
+      cv_round((self.m[4] * vf + self.m[5]) * AB_SCALE) + ROUND_DELTA,
+    )
+  }
+
+  /// The five-bit source coordinate destination `(u, v)` samples at, given
+  /// that row's origin from [`Self::row_origin`].
+  ///
+  /// Arithmetic shift, so it floors for a negative coordinate exactly as
+  /// C++'s does.
+  #[inline]
+  fn at(&self, origin: (i64, i64), u: usize) -> (i64, i64) {
+    (
+      (origin.0 + self.adelta[u]) >> (AB_BITS - INTER_BITS),
+      (origin.1 + self.bdelta[u]) >> (AB_BITS - INTER_BITS),
+    )
+  }
 }
 
 /// One destination pixel from a five-bit fixed-point source coordinate:

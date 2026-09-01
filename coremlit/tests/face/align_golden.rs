@@ -27,10 +27,17 @@
 //!
 //! # What this golden is, and is not, evidence for
 //!
-//! The solve is two independent derivations of one minimiser agreeing. The
-//! RESAMPLER is not: `cv2.warpAffine` has exactly one right answer and both
-//! sides reproduce the same specification, so byte agreement here catches a
-//! transcription slip in either transcription and nothing more. That the
+//! The solve is two independent derivations of one minimiser agreeing —
+//! **both in `f64`, where `skimage` evaluates the same minimiser in `f32`.**
+//! So this golden says nothing about the distance to `skimage`'s own numbers;
+//! `the_solve_diverges_from_skimage_by_less_than_skimage_diverges_from_itself`
+//! is what measures that, and the `align` module doc is where the measurement
+//! and the reason it cannot be driven to zero are written down.
+//!
+//! The RESAMPLER is not two derivations: `cv2.warpAffine` has exactly one
+//! right answer and both sides reproduce the same specification, so byte
+//! agreement here catches a transcription slip in either transcription and
+//! nothing more. That the
 //! pipeline is OpenCV's rests elsewhere — on the constants being named after
 //! the OpenCV symbols they come from, and on the unit gate
 //! `a_fraction_below_the_five_bit_half_step_takes_the_pure_left_pixel`, which
