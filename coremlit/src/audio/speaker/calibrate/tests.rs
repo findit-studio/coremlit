@@ -6,12 +6,20 @@
 //! recording. Nothing in this file asserts anything about WeSpeaker's real
 //! output distribution — that is `tests/speaker/`'s job, and it needs models.
 
-use diaric::embed::{Embedding, cosine_similarity};
+use diaric::{
+  embed::{Embedding, cosine_similarity},
+  // `CohortStats` is `diaric`'s own untagged statistic, and it is deliberately
+  // NOT re-exported by `super` any more (module docs, "The untagged road is a
+  // different crate, not a re-export"). These tests reach it the way a caller
+  // now has to — through `diaric` itself — which is also what lets them build
+  // the arrangements the doors refuse, in order to pin WHY they refuse them.
+  score_norm::CohortStats,
+};
 
 use crate::audio::speaker::{
   calibrate::{
-    AsNormOptions, Cohort, CohortStats, Enrolled, HeldOutCohort, Scoring, SideStats, TrialScore,
-    VoiceProfile, as_norm, enrolled_stats, held_out_stats,
+    AsNormOptions, CohortId, Enrolled, HeldOutCohort, LibraryCohort, Scoring, SideStats,
+    TrialScore, VoiceProfile, as_norm, enrolled_stats, held_out_stats,
   },
   embed::EMBEDDING_DIM,
   error::CalibrateError,
@@ -95,8 +103,8 @@ enum Speaker {
 /// #123's cohort is "sampled from the library itself", so A and B ARE in their
 /// own cohorts — which is the whole reason [`enrolled_stats`] excludes by
 /// identity.
-fn library(scoring: Scoring) -> Cohort<Speaker, VoiceProfile> {
-  let mut cohort = Cohort::new();
+fn library(scoring: Scoring) -> LibraryCohort<Speaker> {
+  let mut cohort = LibraryCohort::new();
   for (i, v) in crowd().iter().enumerate() {
     cohort.push(
       Speaker::Impostor(i),
@@ -120,8 +128,9 @@ fn held_out(scoring: Scoring) -> HeldOutCohort {
   )
 }
 
-/// One side of a trial over the held-out cohort — the recommended arrangement,
-/// and the only one an unidentified probe has.
+/// One side of a trial over the held-out cohort — the arrangement a trial with
+/// an unidentified probe in it has to use, since both sides must come from one
+/// cohort and a probe's can only be a held-out one.
 fn side(cohort: &HeldOutCohort, profile: &VoiceProfile) -> SideStats {
   ok(
     held_out_stats(cohort, profile, &AsNormOptions::new()),
@@ -294,7 +303,7 @@ fn keeping_a_speakers_own_entry_raises_its_cohort_mean() {
   // included. Only a test would state that; it is the failure the assertion
   // exists to keep out.
   let contaminated_members: Vec<VoiceProfile> =
-    cohort.entries().iter().map(|e| *e.item()).collect();
+    cohort.entries.entries().iter().map(|e| *e.item()).collect();
   let contaminated = ok(
     held_out_stats(
       &HeldOutCohort::assuming_disjoint(contaminated_members),
@@ -365,7 +374,7 @@ fn an_enrolled_side_drops_only_its_own_speaker_never_the_partner() {
     .iter()
     .map(|v| ok(scoring.prepare(v), "prepare a cohort member"))
     .collect();
-  let mut cohort: Cohort<Speaker, VoiceProfile> = Cohort::new();
+  let mut cohort: LibraryCohort<Speaker> = LibraryCohort::new();
   for (i, p) in profiles.iter().enumerate() {
     cohort.push(Speaker::Impostor(i), *p);
   }
@@ -410,7 +419,7 @@ fn an_enrolled_side_drops_only_its_own_speaker_never_the_partner() {
 #[test]
 fn a_cohort_that_is_entirely_the_excluded_speaker_is_refused() {
   let scoring = Scoring::Cosine;
-  let mut cohort: Cohort<Speaker, VoiceProfile> = Cohort::new();
+  let mut cohort: LibraryCohort<Speaker> = LibraryCohort::new();
   cohort.push(Speaker::B, ok(scoring.prepare(&speaker_b()), "prepare B"));
   cohort.push(
     Speaker::B,
@@ -436,7 +445,14 @@ fn a_cohort_that_is_entirely_the_excluded_speaker_is_refused() {
 /// a threshold.
 ///
 /// The truncated statistics have to be built by hand out of `diaric`'s own
-/// constructor, because no entrypoint here can produce them any more.
+/// constructor, because no entrypoint here can produce them any more — and so
+/// does the whole-cohort normalization, for a second reason that arrived with
+/// the cohort identity: the candidate's side comes from the library cohort and
+/// the probe's from the held-out one, and [`as_norm`] now refuses that pairing
+/// outright (`two_sides_taken_over_different_cohorts_are_refused` says why).
+/// Both numbers here therefore run through `diaric`'s own `normalize` with the
+/// SAME enrolment statistics, which is what makes this a comparison of the two
+/// PROBE sides and of nothing else.
 #[test]
 fn an_unidentified_probes_side_covers_its_whole_cohort() {
   let scoring = Scoring::Cosine;
@@ -465,7 +481,7 @@ fn an_unidentified_probes_side_covers_its_whole_cohort() {
   assert_eq!(probe_side.selected(), 3);
 
   // The candidate's side, from the library-sampled cohort that names it.
-  let mut library_cohort: Cohort<Speaker, VoiceProfile> = Cohort::new();
+  let mut library_cohort: LibraryCohort<Speaker> = LibraryCohort::new();
   for (i, p) in profiles.iter().enumerate() {
     library_cohort.push(Speaker::Impostor(i), *p);
   }
@@ -479,9 +495,15 @@ fn an_unidentified_probes_side_covers_its_whole_cohort() {
   );
 
   let trial = ok(candidate.score(&probe), "the trial score");
-  let honest = ok(
-    as_norm(trial, &enrolled_side, &probe_side),
-    "the normalized trial",
+
+  // Two cohorts, so the tagged door refuses the pair before any arithmetic.
+  assert!(
+    matches!(
+      as_norm(trial, &enrolled_side, &probe_side),
+      Err(CalibrateError::CohortMismatch(_))
+    ),
+    "a library-sampled enrolment side and a held-out probe side are two \
+     impostor populations, and averaging their z-scores is the refusal"
   );
 
   // The same trial, with the candidate's entry dropped from the PROBE's side.
@@ -510,6 +532,14 @@ fn an_unidentified_probes_side_covers_its_whole_cohort() {
     enrolled_side.mean().to_bits(),
     "the hand-built enrolment side must be the door's own, or the comparison \
      below is between two different trials"
+  );
+  // One enrolment side, two probe sides: the door's whole-cohort one, and the
+  // candidate-truncated alternative. `probe_side.stats` is the door's own
+  // statistic, read through the private field these tests can see, so the
+  // honest half is not a second hand-built copy of it.
+  let honest = ok(
+    enrolled_untagged.normalize(trial.raw(), &probe_side.stats),
+    "the normalized trial against whole-cohort probe statistics",
   );
   let flipped = ok(
     enrolled_untagged.normalize(trial.raw(), &truncated),
@@ -957,6 +987,338 @@ const _: fn() = || {
   assert_send_sync::<TrialScore>();
   assert_send_sync::<SideStats>();
   assert_send_sync::<HeldOutCohort>();
+  assert_send_sync::<LibraryCohort<u32>>();
+  assert_send_sync::<CohortId>();
   assert_send_sync::<Enrolled<'static, u32>>();
   assert_send_sync::<CalibrateError>();
 };
+
+// ── one cohort per trial ─────────────────────────────────────────────────
+
+/// codex's round-2 case, reproduced to its digits. `P` is the probe; `A` and
+/// `B` are the two candidates the trial has to rank; `X` is the third library
+/// member that keeps each enrolled side above [`MIN_COHORT_SCORES`] once its
+/// own entry is dropped. `X` is placed so that `A·X = 0.8` and `B·X = 0`,
+/// which is what pulls the two enrolment statistics apart.
+fn ranking_case() -> [Vec<f32>; 4] {
+  [
+    row(&[(0, 1.0)]),                                             // P
+    row(&[(0, 0.8), (1, 0.6)]),                                   // A
+    row(&[(0, 0.7), (2, 0.51f32.sqrt())]),                        // B
+    row(&[(0, 0.341_056_75), (1, 0.878_591), (2, -0.334_302_5)]), // X
+  ]
+}
+
+/// The axis-aligned impostor cohort of the case above, over `axes`.
+fn axis_cohort(scoring: Scoring, axes: &[(usize, f32)]) -> HeldOutCohort {
+  HeldOutCohort::assuming_disjoint(
+    axes
+      .iter()
+      .map(|&(axis, sign)| {
+        ok(
+          scoring.prepare(&row(&[(axis, sign)])),
+          "prepare an axis impostor",
+        )
+      })
+      .collect(),
+  )
+}
+
+/// One run of the ranking case: an impostor cohort, and the numbers the two
+/// candidates normalize to with both sides over it and with only the probe's
+/// side over it.
+struct Case<'a> {
+  /// The cohort's members, as `(axis, sign)` unit vectors.
+  axes: &'a [(usize, f32)],
+  /// A and B normalized with BOTH sides over `axes`.
+  shared: [f64; 2],
+  /// A and B normalized with the enrolment side over the library cohort
+  /// instead — the pairing the door refuses.
+  mixed: [f64; 2],
+}
+
+/// ROUND 2, FINDING 2. Two sides taken over DIFFERENT cohorts are refused —
+/// and the refusal is not pedantry: on this fixture the mixed pairing does not
+/// merely shift the number, it REVERSES which candidate ranks first.
+///
+/// Every value in both arrangements is tagged [`Scoring::Cosine`], every
+/// profile is valid, and every deviation clears [`DEFAULT_MIN_DEVIATION`], so
+/// nothing already in this module could see it: the metric was never what
+/// differed. The mixed numbers are computed here through `diaric`'s own
+/// `normalize`, because the tagged door will not produce them any more.
+///
+/// Run over two cohorts. The first is codex's as reported, `{±e0, ±e1, ±e2}`,
+/// which holds a member on the probe's own axis — so `assuming_disjoint` is a
+/// geometric falsehood there, stated only to keep the reported digits
+/// checkable. The second drops that member, which makes the fixture's
+/// assertion true and shows the reversal does not depend on it.
+#[test]
+fn two_sides_taken_over_different_cohorts_are_refused() {
+  let scoring = Scoring::Cosine;
+  let options = AsNormOptions::new();
+  let [probe_row, a_row, b_row, x_row] = ranking_case();
+
+  let probe = ok(scoring.prepare(&probe_row), "prepare the probe");
+  let a = ok(scoring.prepare(&a_row), "prepare A");
+  let b = ok(scoring.prepare(&b_row), "prepare B");
+  let x = ok(scoring.prepare(&x_row), "prepare X");
+
+  let trial_a = ok(a.score(&probe), "A against the probe");
+  let trial_b = ok(b.score(&probe), "B against the probe");
+  assert!(
+    trial_a.raw() > trial_b.raw(),
+    "the fixture must start with A ahead on the raw score: A {} vs B {}",
+    trial_a.raw(),
+    trial_b.raw()
+  );
+
+  // The library-sampled cohort: it holds A and B themselves, so each enrolled
+  // side drops its own entries and keeps the other two.
+  let mut library: LibraryCohort<Speaker> = LibraryCohort::new();
+  library.push(Speaker::A, a);
+  library.push(Speaker::B, b);
+  library.push(Speaker::Impostor(0), x);
+  let a_enrolled = ok(
+    enrolled_stats(&library, Enrolled::new(&Speaker::A, &a), &options),
+    "A's side over the library cohort",
+  );
+  let b_enrolled = ok(
+    enrolled_stats(&library, Enrolled::new(&Speaker::B, &b), &options),
+    "B's side over the library cohort",
+  );
+  assert_eq!(a_enrolled.considered(), 2);
+  assert_eq!(b_enrolled.considered(), 2);
+
+  let codex_axes = [
+    (0, 1.0),
+    (0, -1.0),
+    (1, 1.0),
+    (1, -1.0),
+    (2, 1.0),
+    (2, -1.0),
+  ];
+  let cases = [
+    Case {
+      axes: &codex_axes,
+      shared: [1.385_640_6, 1.212_435_6],
+      mixed: [1.192_820_1, 1.356_217_7],
+    },
+    Case {
+      // The same case with the probe's own axis dropped, so
+      // `assuming_disjoint` is true of the fixture as well as asserted.
+      axes: &codex_axes[1..],
+      shared: [2.216_987_6, 1.915_345_4],
+      mixed: [1.75, 1.875],
+    },
+  ];
+
+  for Case {
+    axes,
+    shared: [shared_a, shared_b],
+    mixed: [mixed_a, mixed_b],
+  } in cases
+  {
+    let held_out = axis_cohort(scoring, axes);
+    let probe_side = ok(
+      held_out_stats(&held_out, &probe, &options),
+      "the probe's side over the held-out cohort",
+    );
+
+    // The arrangement that IS commensurable: both sides over the one cohort.
+    let a_shared = ok(
+      as_norm(
+        trial_a,
+        &ok(held_out_stats(&held_out, &a, &options), "A over the cohort"),
+        &probe_side,
+      ),
+      "A normalized, both sides over one cohort",
+    );
+    let b_shared = ok(
+      as_norm(
+        trial_b,
+        &ok(held_out_stats(&held_out, &b, &options), "B over the cohort"),
+        &probe_side,
+      ),
+      "B normalized, both sides over one cohort",
+    );
+    assert!(
+      (a_shared - shared_a).abs() < 1e-6,
+      "A over one cohort: {a_shared}"
+    );
+    assert!(
+      (b_shared - shared_b).abs() < 1e-6,
+      "B over one cohort: {b_shared}"
+    );
+    assert!(
+      a_shared > b_shared,
+      "one cohort for both sides must keep A ahead, as the raw score has it: \
+       A {a_shared} vs B {b_shared}"
+    );
+
+    // The arrangement that is not, and what it does to the order. `diaric`'s
+    // own arithmetic, because the door refuses to run it.
+    let a_mixed = ok(
+      a_enrolled.stats.normalize(trial_a.raw(), &probe_side.stats),
+      "A normalized across two cohorts",
+    );
+    let b_mixed = ok(
+      b_enrolled.stats.normalize(trial_b.raw(), &probe_side.stats),
+      "B normalized across two cohorts",
+    );
+    assert!(
+      (a_mixed - mixed_a).abs() < 1e-6,
+      "A across two cohorts: {a_mixed}"
+    );
+    assert!(
+      (b_mixed - mixed_b).abs() < 1e-6,
+      "B across two cohorts: {b_mixed}"
+    );
+    assert!(
+      b_mixed > a_mixed,
+      "the whole point: two cohorts put B first, against both the raw order \
+       and the one-cohort order — A {a_mixed} vs B {b_mixed}"
+    );
+
+    // Which is why the door will not do it.
+    for (side, trial) in [(&a_enrolled, trial_a), (&b_enrolled, trial_b)] {
+      match as_norm(trial, side, &probe_side) {
+        Err(CalibrateError::CohortMismatch(m)) => {
+          assert_eq!(m.enrolled(), library.id());
+          assert_eq!(m.probe(), held_out.id());
+          assert_ne!(m.enrolled(), m.probe());
+        }
+        other => panic!("two cohorts in one trial must be refused, got {other:?}"),
+      }
+    }
+  }
+}
+
+/// The identity is the COHORT's, not the variable's: a side taken before a
+/// cohort grows cannot be averaged against one taken after. That is the shape
+/// a per-speaker cache produces when the library gains a member, and it is the
+/// one case where two sides really did come from "the same" cohort by name.
+#[test]
+fn growing_a_cohort_makes_it_a_different_cohort() {
+  let scoring = Scoring::Cosine;
+  let options = AsNormOptions::new();
+  let mut cohort = library(scoring);
+
+  let a = ok(scoring.prepare(&speaker_a()), "prepare A");
+  let b = ok(scoring.prepare(&speaker_b()), "prepare B");
+  let before = ok(
+    enrolled_stats(&cohort, Enrolled::new(&Speaker::A, &a), &options),
+    "A's side before the cohort grew",
+  );
+  assert_eq!(before.cohort(), cohort.id());
+
+  cohort.push(
+    Speaker::Impostor(999),
+    ok(
+      scoring.prepare(&speaker_b_again()),
+      "prepare a new impostor",
+    ),
+  );
+  let after = ok(
+    enrolled_stats(&cohort, Enrolled::new(&Speaker::B, &b), &options),
+    "B's side after the cohort grew",
+  );
+  assert_ne!(
+    before.cohort(),
+    after.cohort(),
+    "pushing a member must mint a new identity"
+  );
+
+  let trial = ok(a.score(&b), "A vs B");
+  assert!(
+    matches!(
+      as_norm(trial, &before, &after),
+      Err(CalibrateError::CohortMismatch(_))
+    ),
+    "a side from before the push and one from after are two populations"
+  );
+
+  // A clone is the same population, so it keeps the identity and still pairs.
+  let clone = cohort.clone();
+  let cloned_side = ok(
+    enrolled_stats(&clone, Enrolled::new(&Speaker::A, &a), &options),
+    "A's side over a clone of the grown cohort",
+  );
+  assert_eq!(cloned_side.cohort(), after.cohort());
+  assert!(
+    ok(
+      as_norm(trial, &cloned_side, &after),
+      "cloned cohort normalizes"
+    )
+    .is_finite()
+  );
+}
+
+/// Two cohorts built from the very same profiles are two identities, because
+/// nothing in this crate can tell they are one population. Stated as a test
+/// because it is the conservative half of the trade — a caller who rebuilds an
+/// identical cohort gets a refusal, not a silent pass — and a future "compare
+/// the members instead" would be a behaviour change, not an optimisation.
+#[test]
+fn two_cohorts_of_identical_profiles_are_two_identities() {
+  let scoring = Scoring::Cosine;
+  let one = held_out(scoring);
+  let two = held_out(scoring);
+  assert_eq!(one, one.clone(), "a clone is the same cohort");
+  assert_ne!(one.id(), two.id());
+  assert_ne!(
+    one, two,
+    "equality is identity, so two separately assembled cohorts differ even \
+     when their members do not"
+  );
+
+  let b = ok(scoring.prepare(&speaker_b()), "prepare B");
+  let b2 = ok(scoring.prepare(&speaker_b_again()), "prepare B again");
+  let trial = ok(b.score(&b2), "B vs B'");
+  assert!(
+    matches!(
+      as_norm(trial, &side(&one, &b), &side(&two, &b2)),
+      Err(CalibrateError::CohortMismatch(_))
+    ),
+    "two identically-built cohorts are still two cohorts"
+  );
+  assert!(
+    ok(
+      as_norm(trial, &side(&one, &b), &side(&one, &b2)),
+      "one cohort for both sides"
+    )
+    .is_finite()
+  );
+}
+
+/// The metric check runs FIRST. A caller who has mixed both needs to hear
+/// about the metric: a `PldaCosine` side and a `Cosine` side necessarily came
+/// from two cohorts as well, so reporting the cohort would name the symptom.
+#[test]
+fn a_metric_mismatch_is_reported_ahead_of_the_cohort_mismatch() {
+  let cosine_cohort = held_out(Scoring::Cosine);
+  let plda_cohort = held_out(Scoring::PldaCosine);
+  assert_ne!(cosine_cohort.id(), plda_cohort.id());
+
+  let plda_b = ok(Scoring::PldaCosine.prepare(&speaker_b()), "prepare B");
+  let plda_b2 = ok(
+    Scoring::PldaCosine.prepare(&speaker_b_again()),
+    "prepare B again",
+  );
+  let trial = ok(plda_b.score(&plda_b2), "a PldaCosine trial");
+
+  let plda_side = side(&plda_cohort, &plda_b);
+  let cosine_side = side(
+    &cosine_cohort,
+    &ok(
+      Scoring::Cosine.prepare(&speaker_b_again()),
+      "prepare B again for cosine",
+    ),
+  );
+  assert!(
+    matches!(
+      as_norm(trial, &plda_side, &cosine_side),
+      Err(CalibrateError::NormalizationMismatch(_))
+    ),
+    "the metric mismatch must win over the cohort one"
+  );
+}

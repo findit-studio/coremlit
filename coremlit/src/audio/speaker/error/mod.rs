@@ -1529,6 +1529,50 @@ impl NormalizationMismatch {
   }
 }
 
+/// The two cohort statistics handed to
+/// [`as_norm`](crate::audio::speaker::calibrate::as_norm) were taken over
+/// different cohorts.
+///
+/// Payload of [`CalibrateError::CohortMismatch`].
+///
+/// Both identities are carried rather than a bare "they differ", because a
+/// caller caching one [`SideStats`](crate::audio::speaker::calibrate::SideStats)
+/// per speaker has several cohorts alive at once, and which of the two sides
+/// is the stale one is what they need to know. The identities are opaque —
+/// see [`CohortId`](crate::audio::speaker::calibrate::CohortId) — so what a
+/// reader gets from them is *which side* and *the same or not*, never a way to
+/// mint one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CohortMismatch {
+  /// The cohort the enrolment side's statistics were taken over.
+  enrolled: crate::audio::speaker::calibrate::CohortId,
+  /// The cohort the probe side's statistics were taken over.
+  probe: crate::audio::speaker::calibrate::CohortId,
+}
+
+impl CohortMismatch {
+  /// Construct from the two sides' cohort identities.
+  #[inline(always)]
+  pub const fn new(
+    enrolled: crate::audio::speaker::calibrate::CohortId,
+    probe: crate::audio::speaker::calibrate::CohortId,
+  ) -> Self {
+    Self { enrolled, probe }
+  }
+
+  /// The cohort the enrolment side's statistics were taken over.
+  #[inline(always)]
+  pub const fn enrolled(&self) -> crate::audio::speaker::calibrate::CohortId {
+    self.enrolled
+  }
+
+  /// The cohort the probe side's statistics were taken over.
+  #[inline(always)]
+  pub const fn probe(&self) -> crate::audio::speaker::calibrate::CohortId {
+    self.probe
+  }
+}
+
 /// Failure preparing a voice profile, scoring a trial, or deriving a side's
 /// cohort statistics — [`crate::audio::speaker::calibrate`]'s error.
 ///
@@ -1631,6 +1675,26 @@ pub enum CalibrateError {
     .0.probe()
   )]
   NormalizationMismatch(NormalizationMismatch),
+
+  /// The two sides handed to
+  /// [`as_norm`](crate::audio::speaker::calibrate::as_norm) were computed over
+  /// DIFFERENT cohorts.
+  ///
+  /// The refusal the [`Scoring`](crate::audio::speaker::calibrate::Scoring)
+  /// tag could not make: it says which metric a number was computed in, and
+  /// both sides of this failure were computed in the same one. AS-Norm
+  /// averages two z-scores, and they measure the trial against a common
+  /// impostor population only when both sides selected their top-N from one
+  /// cohort. When they did not, the result is not merely imprecise — on valid
+  /// profiles with healthy deviations it can invert which candidate ranks
+  /// first, which is the one thing identification exists to get right. The
+  /// `calibrate` module docs carry the worked case.
+  #[error(
+    "AS-Norm: the enrolment side was computed over {:?} and the probe side      over {:?}; two z-scores are commensurable only when both sides selected      their top-N from ONE cohort",
+    .0.enrolled(),
+    .0.probe()
+  )]
+  CohortMismatch(CohortMismatch),
 
   /// `diaric`'s AS-Norm refused this side's cohort statistics.
   #[error("voice profile: {0}")]

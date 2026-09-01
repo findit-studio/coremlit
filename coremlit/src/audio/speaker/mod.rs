@@ -176,13 +176,19 @@
 //! identities and the cohort. It is deliberately NOT wired into the clustering
 //! above — that is a within-recording question with a parity oracle of its own.
 //!
-//! The one thing to know before reading that module: the two sides of a trial
-//! are not symmetric. An **enrolled** speaker has an identity the caller can
+//! Two things to know before reading that module. The first: the two sides of
+//! a trial are not symmetric. An **enrolled** speaker has an identity the caller can
 //! name, so its own entries can be dropped from a library-sampled cohort. An
 //! unidentified **probe** does not — its identity is what identification is
 //! trying to discover — so it scores against a
 //! [`HeldOutCohort`](calibrate::HeldOutCohort) instead, and no entrypoint
 //! there lets a candidate's key reach a probe's statistics.
+//!
+//! The second: both sides of a trial have to come from one cohort, and
+//! [`as_norm`](calibrate::as_norm) refuses them when they do not. Two sides
+//! taken over different impostor populations can invert which candidate ranks
+//! first while every value involved stays finite, in range and tagged with the
+//! same metric, so this is a typed refusal rather than a caveat.
 //!
 //! [coremlit-123]: https://github.com/findit-studio/coremlit/issues/123
 

@@ -509,3 +509,38 @@ fn calibrate_error_normalization_mismatch_names_all_three_sources() {
   assert_ne!(rendered, pairwise);
   assert!(rendered.contains("AS-Norm"), "{rendered}");
 }
+
+#[test]
+fn calibrate_error_cohort_mismatch_names_which_side_came_from_which_cohort() {
+  use crate::audio::speaker::calibrate::{HeldOutCohort, Scoring};
+
+  // The only way to obtain a `CohortId` is from a cohort — there is no
+  // constructor — and two separately assembled cohorts must not share one.
+  let enrolled = HeldOutCohort::assuming_disjoint(Vec::new()).id();
+  let probe = HeldOutCohort::assuming_disjoint(Vec::new()).id();
+  assert_ne!(enrolled, probe);
+
+  let m = CohortMismatch::new(enrolled, probe);
+  assert_eq!(m.enrolled(), enrolled);
+  assert_eq!(m.probe(), probe);
+
+  let rendered = CalibrateError::CohortMismatch(m).to_string();
+  assert!(rendered.contains("AS-Norm"), "{rendered}");
+  assert!(rendered.contains("cohort"), "{rendered}");
+
+  // Which side is the stale one is the diagnosis, so the reversed pairing must
+  // not render identically.
+  let reversed = CalibrateError::CohortMismatch(CohortMismatch::new(probe, enrolled)).to_string();
+  assert_ne!(rendered, reversed);
+
+  // And it must not read like the metric refusal it is not: that one says the
+  // two numbers were computed in different SPACES, this one that they were
+  // computed over different POPULATIONS.
+  let metric = CalibrateError::NormalizationMismatch(NormalizationMismatch::new(
+    Scoring::Cosine,
+    Scoring::Cosine,
+    Scoring::PldaCosine,
+  ))
+  .to_string();
+  assert_ne!(rendered, metric);
+}
