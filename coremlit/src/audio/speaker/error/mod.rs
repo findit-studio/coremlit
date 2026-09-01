@@ -1406,5 +1406,477 @@ pub enum ExtractError {
   OutputFrameCountOverflow,
 }
 
+/// The caller's raw embedding row did not have [`EMBEDDING_DIM`] elements.
+///
+/// Payload of [`CalibrateError::ProfileLength`].
+///
+/// [`EMBEDDING_DIM`]: crate::audio::speaker::embed::EMBEDDING_DIM
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProfileLength {
+  /// Elements the caller provided.
+  got: usize,
+  /// Elements a raw WeSpeaker row has.
+  expected: usize,
+}
+
+impl ProfileLength {
+  /// Construct from the provided and required element counts.
+  #[inline(always)]
+  pub const fn new(got: usize, expected: usize) -> Self {
+    Self { got, expected }
+  }
+
+  /// Elements the caller provided.
+  #[inline(always)]
+  pub const fn got(&self) -> usize {
+    self.got
+  }
+
+  /// Elements a raw WeSpeaker row has.
+  #[inline(always)]
+  pub const fn expected(&self) -> usize {
+    self.expected
+  }
+}
+
+/// Two profiles prepared for different score sources were scored against each
+/// other.
+///
+/// Payload of [`CalibrateError::ScoringMismatch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScoringMismatch {
+  /// The score source the side being normalized was prepared for.
+  side: crate::audio::speaker::calibrate::Scoring,
+  /// The score source the other profile was prepared for.
+  other: crate::audio::speaker::calibrate::Scoring,
+}
+
+impl ScoringMismatch {
+  /// Construct from the two disagreeing score sources.
+  #[inline(always)]
+  pub const fn new(
+    side: crate::audio::speaker::calibrate::Scoring,
+    other: crate::audio::speaker::calibrate::Scoring,
+  ) -> Self {
+    Self { side, other }
+  }
+
+  /// The score source the side being normalized was prepared for.
+  #[inline(always)]
+  pub const fn side(&self) -> crate::audio::speaker::calibrate::Scoring {
+    self.side
+  }
+
+  /// The score source the other profile was prepared for.
+  #[inline(always)]
+  pub const fn other(&self) -> crate::audio::speaker::calibrate::Scoring {
+    self.other
+  }
+}
+
+/// A [`TrialSide`] handed to
+/// [`Calibration::trial`](crate::audio::speaker::calibrate::Calibration::trial)
+/// was taken under a different calibration.
+///
+/// Payload of [`CalibrateError::CalibrationMismatch`].
+///
+/// [`TrialSide`]: crate::audio::speaker::calibrate::TrialSide
+///
+/// All three identities are carried, not merely "they differ". A calibration
+/// is one cohort and one [`AsNormOptions`], so a side of another one may
+/// disagree about either — and a caller caching a side per speaker has several
+/// calibrations alive at once, which makes *which side is the stale one* the
+/// whole diagnosis. The identities are opaque — see
+/// [`CalibrationId`](crate::audio::speaker::calibrate::CalibrationId) — so what
+/// a reader gets from them is which side and the same-or-not, never a way to
+/// mint one.
+///
+/// [`AsNormOptions`]: diaric::score_norm::AsNormOptions
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CalibrationMismatch {
+  /// The calibration the trial was asked of.
+  expected: crate::audio::speaker::calibrate::CalibrationId,
+  /// The calibration the enrolment side was taken under.
+  enrolled: crate::audio::speaker::calibrate::CalibrationId,
+  /// The calibration the probe side was taken under.
+  probe: crate::audio::speaker::calibrate::CalibrationId,
+}
+
+impl CalibrationMismatch {
+  /// Construct from the calibration asked and the two sides' own.
+  #[inline(always)]
+  pub const fn new(
+    expected: crate::audio::speaker::calibrate::CalibrationId,
+    enrolled: crate::audio::speaker::calibrate::CalibrationId,
+    probe: crate::audio::speaker::calibrate::CalibrationId,
+  ) -> Self {
+    Self {
+      expected,
+      enrolled,
+      probe,
+    }
+  }
+
+  /// The calibration the trial was asked of.
+  #[inline(always)]
+  pub const fn expected(&self) -> crate::audio::speaker::calibrate::CalibrationId {
+    self.expected
+  }
+
+  /// The calibration the enrolment side was taken under.
+  #[inline(always)]
+  pub const fn enrolled(&self) -> crate::audio::speaker::calibrate::CalibrationId {
+    self.enrolled
+  }
+
+  /// The calibration the probe side was taken under.
+  #[inline(always)]
+  pub const fn probe(&self) -> crate::audio::speaker::calibrate::CalibrationId {
+    self.probe
+  }
+}
+
+/// How many cohort scores one side reached, and how many of them survived
+/// top-N selection.
+///
+/// Payload of the two [`ScoreNormRefusal`]s that are about a selection. Both
+/// are counts: `considered` is every cohort member the side was scored
+/// against — every member, less whatever the exclusion dropped — and
+/// `selected` is how many of those the top-N kept. They say whether an
+/// exclusion ate the cohort, or whether `top_n` was set below what the cohort
+/// can supply, which is the whole diagnosis on a refused side. Neither is an
+/// operand of the normalization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CohortSelection {
+  /// How many scores the top-N selection kept.
+  selected: usize,
+  /// How many cohort members were scored at all.
+  considered: usize,
+}
+
+impl CohortSelection {
+  /// Construct from the selected and considered counts.
+  #[inline(always)]
+  pub const fn new(selected: usize, considered: usize) -> Self {
+    Self {
+      selected,
+      considered,
+    }
+  }
+
+  /// How many scores the top-N selection kept.
+  #[inline(always)]
+  pub const fn selected(&self) -> usize {
+    self.selected
+  }
+
+  /// How many cohort members were scored at all.
+  #[inline(always)]
+  pub const fn considered(&self) -> usize {
+    self.considered
+  }
+}
+
+/// Why the AS-Norm arithmetic refused — one variant per refusal
+/// [`diaric::score_norm::Error`] makes, in `coremlit`'s own vocabulary.
+///
+/// Payload of [`CalibrateError::ScoreNorm`].
+///
+/// # Why this is a translation and not the `diaric` error itself
+///
+/// `diaric`'s refusals carry their arithmetic:
+/// `DegenerateDeviation::deviation` is the **exact standard deviation** of the
+/// side that was refused, and `ZScoreCancellation` carries both z-scores and
+/// the value they cancelled to. [`crate::audio::speaker::calibrate`]'s whole
+/// claim is that no cohort statistic this crate computes reaches a caller —
+/// [`TrialSide`] has no `mean` and no `deviation`, and its [`Debug`] prints
+/// neither — and a refusal handing one back is that claim broken through a
+/// door nothing was looking at. It needs no [`TrialSide`] to exist: raising
+/// `min_deviation` above what a perfectly valid cohort spreads is enough.
+///
+/// [`TrialSide`]: crate::audio::speaker::calibrate::TrialSide
+///
+/// So the refusal is re-stated: the **category** survives, and the counts with
+/// it, and the deviations, means, z-scores and normalized values do not.
+/// Nothing is lost that a caller can act on — which floor was breached, how
+/// many scores were selected out of how many considered, and whether the
+/// cohort was empty, too small, degenerate or misconfigured are the four
+/// questions a caller tuning [`AsNormOptions`] asks, and each is answered here.
+/// The configured floor itself is not repeated because it is the caller's own:
+/// [`Calibration::options`] hands it straight back.
+///
+/// [`AsNormOptions`]: diaric::score_norm::AsNormOptions
+/// [`Calibration::options`]: crate::audio::speaker::calibrate::Calibration::options
+///
+/// # `Eq` and `Hash` are the seal, not a convenience
+///
+/// An `f64` field — at any depth, in any variant — makes both underivable. So
+/// the derive is a whole-type, compile-time proof that no intermediate can be
+/// carried out through a refusal, rather than one assertion per variant that a
+/// later variant would not be covered by.
+///
+/// # Which side, and which step
+///
+/// The call says it. [`Calibration::enrolled_side`] and [`Calibration::side`]
+/// derive ONE side, so a refusal from either is that side's; a
+/// [`NonFiniteScore`](Self::NonFiniteScore) there is a cohort score and a
+/// [`NonFiniteResult`](Self::NonFiniteResult) is that side's own deviation.
+/// [`Calibration::trial`] has both sides in hand and publishes each side's
+/// counts, so its refusals need carry none: a `NonFiniteScore` there is the
+/// raw trial score and a `NonFiniteResult` is eq. (7)'s own answer.
+///
+/// [`Calibration::enrolled_side`]: crate::audio::speaker::calibrate::Calibration::enrolled_side
+/// [`Calibration::side`]: crate::audio::speaker::calibrate::Calibration::side
+/// [`Calibration::trial`]: crate::audio::speaker::calibrate::Calibration::trial
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+#[non_exhaustive]
+pub enum ScoreNormRefusal {
+  /// No usable cohort score at all: the cohort was empty, or excluding the
+  /// enrolled speaker's own entries removed every member.
+  #[error(
+    "no usable cohort score: the cohort was empty, or excluding this speaker's own entries \
+     removed every member"
+  )]
+  EmptyCohort,
+
+  /// Fewer cohort scores survived top-N selection than the arithmetic needs.
+  ///
+  /// A cohort that is merely too small, which is a different repair from one
+  /// that does not discriminate.
+  #[error(
+    "only {} of {} cohort score(s) survived selection; AS-Norm needs at least {}",
+    .0.selected(),
+    .0.considered(),
+    diaric::score_norm::MIN_COHORT_SCORES
+  )]
+  CohortTooSmall(CohortSelection),
+
+  /// The selected cohort scores do not spread past the configured
+  /// `min_deviation` floor, so this side's cohort does not discriminate.
+  ///
+  /// The floor that was breached is named by the variant; its value is the
+  /// caller's own, from the [`AsNormOptions`] their [`Calibration`] holds. The
+  /// deviation that failed it is NOT carried — it is one of eq. (7)'s two
+  /// operands, and a refusal is not a door for it.
+  ///
+  /// [`AsNormOptions`]: diaric::score_norm::AsNormOptions
+  /// [`Calibration`]: crate::audio::speaker::calibrate::Calibration
+  #[error(
+    "the {} selected of {} cohort score(s) do not spread past the configured `min_deviation` \
+     floor; the cohort does not discriminate",
+    .0.selected(),
+    .0.considered()
+  )]
+  DegenerateCohort(CohortSelection),
+
+  /// The configured `min_deviation` floor is not finite and greater than zero,
+  /// so the guard between a zero-spread cohort and a division by zero is not
+  /// one.
+  ///
+  /// Only reachable through a deserialized [`AsNormOptions`] — the builder
+  /// asserts it.
+  ///
+  /// [`AsNormOptions`]: diaric::score_norm::AsNormOptions
+  #[error("the configured `min_deviation` floor is not finite and greater than zero")]
+  InvalidMinDeviation,
+
+  /// A score handed to the arithmetic was not finite: a cohort score while a
+  /// side was being derived, or the raw trial score while a trial was.
+  #[error("a score handed to the AS-Norm arithmetic was not finite")]
+  NonFiniteScore,
+
+  /// A value the arithmetic produced was not finite: this side's standard
+  /// deviation while a side was being derived, or eq. (7)'s own answer while a
+  /// trial was.
+  #[error("a value the AS-Norm arithmetic produced was not finite")]
+  NonFiniteResult,
+
+  /// The two sides' z-scores cancel, so eq. (7)'s answer would be made of its
+  /// own rounding rather than of the trial.
+  ///
+  /// `diaric`'s accuracy postcondition, and it is the one refusal that is
+  /// about the pair rather than about either side. The z-scores and the value
+  /// they cancelled to are not carried: given
+  /// [`CalibratedTrial::raw`](crate::audio::speaker::calibrate::CalibratedTrial::raw)
+  /// for two trials of one side, a pair of z-scores solves for that side's
+  /// mean and deviation exactly.
+  #[error(
+    "the two sides' z-scores cancel, so the calibrated score would be made of its own rounding \
+     rather than of the trial"
+  )]
+  ZScoreCancellation,
+}
+
+impl ScoreNormRefusal {
+  /// Translate one of `diaric`'s refusals, keeping the category and dropping
+  /// the arithmetic.
+  ///
+  /// `considered` is how many cohort members the statistics in question were
+  /// taken over; `diaric` reports it on a successful `CohortStats` and on none
+  /// of its refusals, so it is counted at the scoring bridge instead.
+  ///
+  /// The match is exhaustive on purpose: `diaric::score_norm::Error` is not
+  /// `#[non_exhaustive]`, so a refusal added upstream is a compile error here
+  /// rather than a category silently collapsing into a neighbour — which is
+  /// how an operand would come back.
+  pub(crate) fn translate(e: diaric::score_norm::Error, considered: usize) -> Self {
+    use diaric::score_norm::Error as Refused;
+
+    match e {
+      Refused::EmptyCohort => Self::EmptyCohort,
+      Refused::CohortTooSmall(too_small) => {
+        Self::CohortTooSmall(CohortSelection::new(too_small.available(), considered))
+      }
+      Refused::DegenerateDeviation(degenerate) => {
+        Self::DegenerateCohort(CohortSelection::new(degenerate.selected(), considered))
+      }
+      Refused::InvalidMinDeviation(_) => Self::InvalidMinDeviation,
+      Refused::NonFiniteScore(_) => Self::NonFiniteScore,
+      Refused::NonFiniteResult(_) => Self::NonFiniteResult,
+      Refused::ZScoreCancellation(_) => Self::ZScoreCancellation,
+    }
+  }
+}
+
+/// Failure preparing a voice profile, scoring a trial, or deriving a side's
+/// cohort statistics — [`crate::audio::speaker::calibrate`]'s error.
+///
+/// # Why this one is neither `Clone` nor `PartialEq`
+///
+/// Every other error in this module is both. This one wraps a `diaric` error —
+/// [`diaric::plda::Error`], which derives nothing past `Debug` + `Error`.
+/// [`ExtractError`] met the same wall and answered it by making
+/// [`ExtractError::PldaTransformUnavailable`] UNIT-shaped, discarding the
+/// cause to keep its own derives. That trade is right there and wrong here:
+/// `PldaTransformUnavailable` has exactly one cause, while
+/// [`diaric::plda::Error`] distinguishes corrupted weights from a non-finite
+/// input from a degenerate one. Keeping the payload and dropping the derives is
+/// the direction that keeps information.
+///
+/// The score-normalization refusals used to be the second such payload. They
+/// are [`ScoreNormRefusal`] now, which is `Clone`, `Copy`, `Eq` and `Hash` —
+/// see that type for why the translation exists, and why those derives are the
+/// proof rather than the convenience.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum CalibrateError {
+  /// The raw embedding row handed to
+  /// [`Scoring::prepare`](crate::audio::speaker::calibrate::Scoring::prepare)
+  /// was not [`EMBEDDING_DIM`] elements long.
+  ///
+  /// [`EMBEDDING_DIM`]: crate::audio::speaker::embed::EMBEDDING_DIM
+  #[error(
+    "voice profile: raw embedding row is {} elements, expected {}",
+    .0.got(),
+    .0.expected()
+  )]
+  ProfileLength(ProfileLength),
+
+  /// The prepared vector has no usable direction, so a cosine against it would
+  /// be noise rather than a similarity.
+  ///
+  /// Carries the score source that refused, because the two refuse for
+  /// different reasons and neither number is this crate's to invent:
+  ///
+  /// - [`Scoring::Cosine`](crate::audio::speaker::calibrate::Scoring::Cosine)
+  ///   refuses whatever [`diaric::embed::Embedding::normalize_from`] refuses —
+  ///   a non-finite row, or an L2 norm under `diaric`'s own `NORM_EPSILON`.
+  ///   This door CALLS that constructor rather than re-deriving its floor, the
+  ///   same discipline [`crate::audio::speaker::extract::PLDA_MIN_NORM`]'s doc
+  ///   describes.
+  /// - [`Scoring::PldaCosine`](crate::audio::speaker::calibrate::Scoring::PldaCosine)
+  ///   refuses a projected vector whose norm is zero or non-finite, or whose
+  ///   normalization leaves the range. There is deliberately NO floor above
+  ///   zero: `diaric` publishes none for the 128-d PLDA space, the WeSpeaker
+  ///   `NORM_EPSILON` is calibrated for a different one, and a fabricated
+  ///   constant would refuse real projections on a number nothing measured.
+  #[error("voice profile: the prepared {0:?} vector has no usable direction")]
+  DegenerateProfile(crate::audio::speaker::calibrate::Scoring),
+
+  /// `diaric`'s PLDA projection refused the row.
+  #[error("voice profile: plda: {0}")]
+  Plda(#[from] diaric::plda::Error),
+
+  /// The same refusal [`ExtractError::PldaTransformUnavailable`] carries, from
+  /// the same process-wide cached transform: without it a
+  /// [`Scoring::PldaCosine`](crate::audio::speaker::calibrate::Scoring::PldaCosine)
+  /// profile cannot be projected at all.
+  #[error(
+    "diaric's PLDA transform could not be built, so a raw embedding cannot be \
+     projected into the space `Scoring::PldaCosine` scores in"
+  )]
+  PldaTransformUnavailable,
+
+  /// Two profiles prepared for different score sources were scored against
+  /// each other.
+  ///
+  /// A tag comparison rather than a type error, and the trade is deliberate —
+  /// see [`crate::audio::speaker::calibrate::VoiceProfile`]'s own docs. What
+  /// matters is that it cannot be silent: an AS-Norm side is built from a
+  /// whole cohort, so a mixed cohort would otherwise contribute scores from
+  /// two different spaces to one mean.
+  #[error(
+    "voice profile: a {:?} profile cannot be scored against a {:?} one",
+    .0.side(),
+    .0.other()
+  )]
+  ScoringMismatch(ScoringMismatch),
+
+  /// A side handed to
+  /// [`Calibration::trial`](crate::audio::speaker::calibrate::Calibration::trial)
+  /// was taken under a DIFFERENT calibration.
+  ///
+  /// The one refusal a scoped trial still has to make, and it stands in for
+  /// three that the shape removed. A calibration is one cohort and one
+  /// `AsNormOptions`, and a trial is computed from its two sides' own
+  /// profiles, so a side of some other calibration is the only way the metric,
+  /// the impostor population, the top-N configuration or the endpoints can
+  /// still fail to line up.
+  ///
+  /// It is not pedantry. AS-Norm averages two z-scores, and they measure the
+  /// trial against a common impostor population only when both sides selected
+  /// their top-N of one cohort under one configuration. When they did not, the
+  /// result is not merely imprecise — on valid profiles with healthy
+  /// deviations it can invert which candidate ranks first, which is the one
+  /// thing identification exists to get right. The `calibrate` module docs
+  /// carry the worked case.
+  #[error(
+    "AS-Norm: the enrolment side was taken under {:?} and the probe side under \
+     {:?}, but this trial is {:?}'s; two z-scores are commensurable only when \
+     both sides came from ONE calibration",
+    .0.enrolled(),
+    .0.probe(),
+    .0.expected()
+  )]
+  CalibrationMismatch(CalibrationMismatch),
+
+  /// The AS-Norm arithmetic refused this side's cohort statistics, or the
+  /// trial over two of them.
+  ///
+  /// [`ScoreNormRefusal`] is `coremlit`'s own re-statement of `diaric`'s
+  /// refusal: the category and the counts, and none of the deviations, means
+  /// or z-scores the original carried.
+  #[error("voice profile: {0}")]
+  ScoreNorm(#[from] ScoreNormRefusal),
+
+  /// The [`SpeakerToken`] handed to
+  /// [`Calibration::enrolled_side`](crate::audio::speaker::calibrate::Calibration::enrolled_side)
+  /// was not minted by that calibration's own cohort.
+  ///
+  /// A token names a speaker in the cohort that minted it and in no other, so
+  /// there is nothing here to exclude. Excluding nothing instead of refusing
+  /// would be exactly the self-contamination the enrolled door exists to
+  /// prevent, and it would look perfectly healthy: a speaker's own material
+  /// scores at the top of any cohort, so top-N selection is guaranteed to keep
+  /// it.
+  ///
+  /// [`SpeakerToken`]: crate::audio::speaker::calibrate::SpeakerToken
+  #[error(
+    "AS-Norm: this speaker token was minted by a different cohort, so it names nothing to \
+     exclude here; a side taken under it would score this speaker against their own entries"
+  )]
+  ForeignSpeaker,
+}
+
 #[cfg(test)]
 mod tests;

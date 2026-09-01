@@ -160,7 +160,44 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Across recordings
+//!
+//! Everything above is *within* one recording. [`calibrate`] is the other
+//! direction — the AS-Norm1 door for scoring voice profiles at
+//! cluster-centroid grain against a library-wide cohort, so the same person
+//! found in two different recordings can be bound to one identity
+//! ([`findit-studio/coremlit#123`][coremlit-123]). Raw cosine scores are not
+//! comparable across speakers, so a single global threshold over-merges some
+//! identities and under-merges others; AS-Norm rescales each trial against the
+//! cohort distribution of the two speakers involved.
+//!
+//! It is a SCORING surface and nothing else: the caller owns the library, the
+//! identities and the cohort. It is deliberately NOT wired into the clustering
+//! above — that is a within-recording question with a parity oracle of its own.
+//!
+//! Two things to know before reading that module. The first: the two sides of
+//! a trial are not symmetric. An **enrolled** speaker has an identity the caller can
+//! name, so its own entries can be dropped from a library-sampled cohort. An
+//! unidentified **probe** does not — its identity is what identification is
+//! trying to discover — so it scores against a
+//! [`HeldOutCohort`](calibrate::HeldOutCohort) instead, and no entrypoint
+//! there lets a candidate's key reach a probe's statistics.
+//!
+//! The second: a calibrated trial is the product of ONE
+//! [`Calibration`](calibrate::Calibration) — a cohort and an
+//! [`AsNormOptions`](calibrate::AsNormOptions) fixed together, which produces
+//! each side bound to its own profile and then computes the trial from those
+//! two profiles. So the metric, the impostor population, the trial's endpoints
+//! and the top-N configuration are one value's rather than four the caller
+//! carries between calls. Sides taken over different impostor populations can
+//! invert which candidate ranks first while every value involved stays finite,
+//! in range and computed in the same metric, so mixing two calibrations is a
+//! typed refusal rather than a caveat.
+//!
+//! [coremlit-123]: https://github.com/findit-studio/coremlit/issues/123
 
+pub mod calibrate;
 pub mod cluster;
 #[cfg(feature = "serde")]
 mod compute_units_serde;
