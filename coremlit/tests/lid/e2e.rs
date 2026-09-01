@@ -38,6 +38,31 @@ const CLIP_FRAMES: usize = 1_300;
 /// Model column of Thai in this door's roster.
 const THAI_INDEX: usize = 94;
 
+/// How far a RAW model row's own probability mass may sit from 1.
+///
+/// MEASURED, and deliberately not this machine's number — the same argument
+/// [`THAI_LOG_PROBABILITY`] already makes, applied to the quantity below. A raw
+/// row's mass is the graph's fp16 arithmetic and nothing else, and the four
+/// compute units do not agree on it: `audio::lid::aggregate`'s module docs
+/// publish **7.7e-3 on `ComputeUnits::CpuOnly`** and 1.5e-4 on the ANE, against
+/// ~5e-8 on the GPU arm. `lid_long_clip`'s
+/// `every_fold_in_the_published_sweep_lands_far_inside_the_mass_tolerance`
+/// re-measures that spread over 468 rows on all four units, so this constant
+/// restates a number the tree derives rather than making a fresh claim.
+///
+/// This ceiling is that worst case with ~30 % headroom for a host whose
+/// `exp`/`ln` round a unit differently. It does NOT loosen a real bound: the
+/// property this gate exists to hold is that the GRAPH already applies a
+/// log-softmax and Rust adds none, and a row that had stopped being a
+/// normalized log distribution — raw logits, a dropped softmax — misses mass 1
+/// by orders of magnitude, not by thousandths.
+///
+/// The `1e-3` this replaced was never true for every placement. It passed only
+/// on a host whose default dispatches to the GPU; where the default resolves to
+/// the CPU the same clip reads 5.07e-3, so the assertion contradicted the
+/// crate's own published measurement rather than measuring the graph.
+const MAX_RAW_ROW_MASS_DEVIATION: f64 = 1e-2;
+
 /// The reference top-1 log probability, from the artifact author's own probe of
 /// this exact clip on `.all` / `.cpuAndGpu` (bit-identical there).
 ///
@@ -119,8 +144,12 @@ fn reference_clip_identifies_as_thai() {
 }
 
 /// The raw row really is a normalized natural-log distribution: every value is
-/// `<= 0` and finite, and the exponentials sum to 1. Nothing in Rust applies a
-/// softmax, so this is a statement about the graph.
+/// `<= 0` and finite, and the exponentials sum to 1 to within the graph's own
+/// measured fp16 error ([`MAX_RAW_ROW_MASS_DEVIATION`], which is a
+/// cross-placement number on purpose). Nothing in Rust applies a softmax, so
+/// this is a statement about the graph — and about the graph alone, which is
+/// why the tolerance may not be pinned to whichever compute unit the host that
+/// happens to run it dispatches to.
 #[test]
 #[ignore = "requires the staged LID model (LID_TEST_MODELS)"]
 fn raw_row_is_an_already_normalized_log_distribution() {
@@ -131,9 +160,17 @@ fn raw_row_is_an_already_normalized_log_distribution() {
   assert!(row.iter().all(|v| v.is_finite() && *v <= 0.0));
 
   let mass: f64 = row.iter().map(|v| f64::from(*v).exp()).sum();
+  let deviation = (mass - 1.0).abs();
+  // Printed on every run: this is the number that tells a reader which compute
+  // unit the host actually resolved to (~5e-8 GPU, ~1.5e-4 ANE, ~7.7e-3 CPU),
+  // which is the first thing worth knowing when a placement question opens.
+  println!("  raw row mass 1{:+.3e}", mass - 1.0);
   assert!(
-    (mass - 1.0).abs() < 1e-3,
-    "exp of the row must sum to 1, got {mass}"
+    deviation < MAX_RAW_ROW_MASS_DEVIATION,
+    "exp of the row must sum to 1 to within {MAX_RAW_ROW_MASS_DEVIATION:e}, \
+     got {mass} ({deviation:e} away) — a row that is still a log-softmax output \
+     misses by fp16 noise, so this size of gap means the graph stopped emitting \
+     a normalized log distribution"
   );
 
   // `identify` ranks that same row: its top-1 is the row's argmax.

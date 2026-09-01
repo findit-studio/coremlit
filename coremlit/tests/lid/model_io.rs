@@ -109,6 +109,18 @@ fn model_declares_the_pinned_io_contract() {
     (MIN_FRAMES..=MAX_FRAMES).contains(&shape[1]),
     "the default time axis must sit inside the accepted range, got {shape:?}"
   );
+  // And pinned to the exact value, not merely to the range, because two things
+  // downstream now READ it rather than tolerate it: the frame count
+  // `runtime_accepts_exactly_the_pinned_frame_range` singles out below, and
+  // `common::default_shape_refusal`, whose whole diagnosis is that one host
+  // refuses the graph's OWN default shape while answering every other length.
+  // A re-exported artifact that moved this would turn both into tests of an
+  // arbitrary number, silently.
+  assert_eq!(
+    shape[1],
+    common::GRAPH_DEFAULT_SHAPE_FRAMES,
+    "the artifact's declared DefaultShapes time axis moved, got {shape:?}"
+  );
 
   let output = description
     .output("log_probabilities")
@@ -139,7 +151,16 @@ fn artifact_matches_the_pinned_sha_manifest() {
 fn runtime_accepts_exactly_the_pinned_frame_range() {
   let model = Model::load(common::model_path(), ComputeUnits::CpuOnly).expect("load model");
 
-  for frames in [MIN_FRAMES, MIN_FRAMES + 1, 301, MAX_FRAMES - 1, MAX_FRAMES] {
+  // `GRAPH_DEFAULT_SHAPE_FRAMES` rather than a bare 301: this row is here
+  // BECAUSE it is the graph's declared default shape, and the assertion above
+  // is what keeps that true.
+  for frames in [
+    MIN_FRAMES,
+    MIN_FRAMES + 1,
+    common::GRAPH_DEFAULT_SHAPE_FRAMES,
+    MAX_FRAMES - 1,
+    MAX_FRAMES,
+  ] {
     let input = mel_tensor(frames);
     let outputs = model
       .predict_with(&[("mel_features", &input)])

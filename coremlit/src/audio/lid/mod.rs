@@ -351,6 +351,34 @@ pub const NUM_LANGUAGES: usize = 107;
 pub const MIN_FRAMES: usize = 10;
 
 /// Most mel frames the graph accepts (its `RangeDims` upper bound).
+///
+/// # A frame count inside this range that one host still refuses
+///
+/// KNOWN HOST RISK, recorded so it is a measurement rather than a mystery. The
+/// artifact declares both halves of its flexible shape:
+/// `DefaultShapes {"mel_features", [1, 301, 60]}` beside
+/// `RangeDims [[1, 1], [10, 3001], [60, 60]]`. 301 frames — 48 000 samples,
+/// exactly 3 s — is therefore the ONE length CoreML specializes the graph for,
+/// and it is reachable from ordinary use: a caller who asks [`WindowPlan`] for
+/// 3 s windows lands on it.
+///
+/// MEASURED: on the GitHub `macos-15` runner, predicting at exactly that shape
+/// under [`DEFAULT_COMPUTE`] is refused ("Unable to compute the prediction
+/// using ML Program"), deterministically, while 101, 900, 1 001 and 1 300
+/// frames all answer on the same loaded model — the refusal is NOT monotone in
+/// length. The same call answers normally on macOS 26.5 / M1 Max, and that
+/// runner's own runtime accepts a `[1, 301, 60]` tensor under
+/// [`ComputeUnits::CpuOnly`]. The shape is supported and the tensor this crate
+/// builds is valid; what varies is the host's CoreML, not this door.
+///
+/// Nothing here works around it. The range is the graph's, and narrowing it
+/// would refuse lengths that work everywhere this crate targets. A caller who
+/// must run on such a host can pick a window length away from that one, or pin
+/// [`ComputeUnits::CpuOnly`]. `tests/lid/long_clip.rs` probes for the refusal
+/// and reports the gates it stands down, rather than failing or passing quietly.
+///
+/// [`WindowPlan`]: crate::audio::lid::WindowPlan
+/// [`ComputeUnits::CpuOnly`]: crate::ComputeUnits::CpuOnly
 pub const MAX_FRAMES: usize = 3_001;
 
 /// Fewest 16 kHz samples that reach [`MIN_FRAMES`]: `(MIN_FRAMES - 1) · 160`
