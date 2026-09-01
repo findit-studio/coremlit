@@ -43,17 +43,62 @@
 //!   1. a file `MODELS_LOCK` stages with no licence row — and the reverse, a
 //!      row naming a file no table stages
 //!      ([`every_staged_file_has_a_licence_row_and_every_row_names_a_staged_file`]);
-//!   2. a research-only row whose loader's `#[cfg]` feature is reachable from
-//!      ANY non-commercial feature closure, or is not `commercial-` prefixed
-//!      ([`no_research_only_artifact_is_reachable_without_a_commercial_gate`]);
-//!   3. a `commercial-`prefixed feature that gates only clear artifacts, or
-//!      that no `#[cfg(feature = ...)]` in the tree names at all
-//!      ([`every_commercial_feature_gates_a_research_only_artifact`]).
+//!   2. an artifact reachable from a configuration its terms cannot carry.
+//!      TWO clauses over two different sets of rows, because "the terms forbid
+//!      it" and "nobody knows what the terms are" are not the same claim:
+//!      - the STRONG clause, research-only rows only — the loader's `#[cfg]`
+//!        feature must be `commercial-` prefixed and must sit in no
+//!        non-commercial feature's closure
+//!        ([`no_research_only_artifact_is_reachable_without_a_commercial_gate`]);
+//!      - the WIDE clause, research-only AND unresolved rows — whatever gates
+//!        it, `default` must not reach it
+//!        ([`no_ungranted_artifact_is_reachable_from_default`]);
+//!   3. a `commercial-`prefixed feature that gates only artifacts granted at
+//!      both layers, or that no `#[cfg(feature = ...)]` in the tree names at
+//!      all ([`every_commercial_feature_gates_an_artifact_with_no_shipping_grant`]).
 //!
 //! The third is the one people forget, and it is what keeps the table honest
 //! as artifacts change: the day an upstream relicenses, the gate that was
 //! protecting it becomes a gate protecting nothing, and it must be retired
 //! rather than left standing as false reassurance.
+//!
+//! # Two axes, and why `Unresolved` needed the second
+//!
+//! [`Terms::forbids_commercial_use`] answers "do the terms forbid it", and
+//! only [`Terms::ResearchOnly`] does. That is the right predicate for the
+//! `commercial-` prefix and the WRONG one for what `default` may ship — which
+//! is how [`Terms::Unresolved`] came to be invisible to directions 2 and 3
+//! while its own doc said it is "a row that no shipping claim may rest on".
+//! The sentence was true and unenforced: a row shaped exactly like
+//! `redimnet/redimnet_b5.mlmodelc` under `default = ["identity"]` left every
+//! check in this file green.
+//!
+//! So there is a second axis. [`Terms::permits_a_shipping_claim`] asks whether
+//! a grant exists for a claim to rest on at all: `Permissive` and
+//! `Attribution` yes, `ResearchOnly` and `Unresolved` no — for opposite
+//! reasons, which [`withheld_because`] keeps in different words so no failure
+//! message asserts a prohibition this repository has not found. Both axes are
+//! exhaustive `match`es rather than `matches!(…)`, which is the actual root
+//! cause rather than a style note: a fall-through default classified
+//! `Unresolved` instead of an author doing it, and a fifth variant now cannot
+//! be classified by accident.
+//!
+//! **What this deliberately does NOT do is extend the `commercial-` prefix
+//! rule to unresolved rows**, and that is a decision with evidence rather than
+//! an omission. Two things forbid it. The prefix's own documentation rule
+//! ([`every_commercial_feature_says_it_requires_a_commercial_licence_first`])
+//! demands a first sentence saying a commercial licence is REQUIRED, which
+//! over an unresolved row asserts exactly the thing the row says nobody has
+//! established. And the scope is not one artifact: NINETEEN rows here carry an
+//! unresolved CORPUS layer — every `whisper`, `siglip`, `clap` and `ced` row
+//! and four `speaker` ones — because `NOTICE` documents the weights layer
+//! throughout and the corpus layer nowhere. That count is not an estimate:
+//! [`the_tables_verdict_census_is_what_this_file_says_it_is`] pins it, so an
+//! argument resting on it cannot go quietly out of date. A prefix rule keyed on
+//! "unresolved" would rename most of this crate's public feature surface on
+//! the strength of records this repository has not finished writing.
+//! `default`-reachability is the rule the evidence supports, and it leaves
+//! `identity` a plain feature.
 //!
 //! # What a check that cannot fire proves
 //!
@@ -65,6 +110,13 @@
 //! over doctored input (`falsifiers::*`), which run everywhere, need no models
 //! and no repository files, and fail if the predicate ever stops detecting the
 //! thing it exists to detect.
+//!
+//! Direction 2's WIDE clause is the exception, and it is worth stating
+//! separately: twenty rows are in its scope today. What makes it pass is not
+//! an empty set but two live facts — `default = []`, and a
+//! `#[cfg(feature = ...)]` on every one of those twenty loaders. Remove the
+//! `identity` gate from `src/audio/mod.rs`, or put a kit feature into
+//! `default`, and it reds against the real table with no doctoring at all.
 //!
 //! What "cannot fire" does NOT mean is "reads nothing". Directions 2 and 3
 //! bind live data today even though nothing can trip them: the gate every row
@@ -310,6 +362,14 @@ enum Terms {
   /// "clear" is how a table stops being evidence. Unresolved is not
   /// disqualifying either — it is a row that no shipping claim may rest on
   /// until somebody resolves it.
+  ///
+  /// That last sentence is a CHECK, not a promise:
+  /// [`Terms::permits_a_shipping_claim`] is false here, and
+  /// [`no_ungranted_artifact_is_reachable_from_default`] refuses to let such a
+  /// row be reachable from the one configuration this crate chooses for its
+  /// consumers. It was prose alone once, and a row shaped exactly like
+  /// `redimnet/redimnet_b5.mlmodelc` then sat under `default = ["identity"]`
+  /// with every check in this file green.
   Unresolved(Statement),
 }
 
@@ -377,9 +437,42 @@ impl Terms {
     }
   }
 
-  /// Whether these terms forbid the shipping path outright.
+  /// **Axis one.** Whether these terms forbid the shipping path outright.
+  ///
+  /// The predicate the `commercial-` prefix hangs on, and it stays narrow on
+  /// purpose: [`Terms::Unresolved`] is NOT a prohibition, and a feature whose
+  /// documented first sentence must say a commercial licence is required
+  /// cannot honestly gate an artifact for which nobody has found one. What
+  /// `default` may ship is a different question — see
+  /// [`Self::permits_a_shipping_claim`].
+  ///
+  /// Written as an exhaustive `match` rather than `matches!(…)`, which is not
+  /// style. A fall-through default is what classified `Unresolved` here
+  /// instead of an author, and made it invisible to directions 2 and 3 while
+  /// its own doc said no shipping claim may rest on it. A fifth variant now
+  /// cannot be classified by accident: the compiler asks.
   const fn forbids_commercial_use(self) -> bool {
-    matches!(self, Self::ResearchOnly(_))
+    match self {
+      Self::ResearchOnly(_) => true,
+      Self::Permissive(_) | Self::Attribution(_) | Self::Unresolved(_) => false,
+    }
+  }
+
+  /// **Axis two.** Whether there is a grant for a shipping claim to rest on.
+  ///
+  /// Not the negation of [`Self::forbids_commercial_use`], and the difference
+  /// is the whole point: `ResearchOnly` says the terms are known and they
+  /// forbid it, `Unresolved` says nobody knows what the terms are. Both leave
+  /// a shipping claim with nothing to stand on; only one of them is a finding
+  /// of prohibition, and [`withheld_because`] keeps the two apart in the words
+  /// a failure message uses.
+  ///
+  /// Exhaustive for the same reason as the axis above.
+  const fn permits_a_shipping_claim(self) -> bool {
+    match self {
+      Self::Permissive(_) | Self::Attribution(_) => true,
+      Self::ResearchOnly(_) | Self::Unresolved(_) => false,
+    }
   }
 
   /// The structured payload.
@@ -493,26 +586,38 @@ struct Artifact {
 }
 
 impl Artifact {
-  /// Which layer disqualifies the artifact, when one does.
-  fn disqualifying_layer(&self) -> Option<&'static str> {
-    if self.weights.forbids_commercial_use() {
-      Some("weights")
-    } else if self.corpus.forbids_commercial_use() {
-      Some("training corpus")
+  /// The first layer for which `holds`, and its terms.
+  ///
+  /// Weights before corpus, so a message points at the document a reader can
+  /// go and re-read first. An artifact is only as shippable as its least
+  /// permissive layer, so BOTH are asked and either one answering is enough.
+  fn layer_where(&self, holds: impl Fn(Terms) -> bool) -> Option<(&'static str, Terms)> {
+    if holds(self.weights) {
+      Some(("weights", self.weights))
+    } else if holds(self.corpus) {
+      Some(("training corpus", self.corpus))
     } else {
       None
     }
   }
 
-  /// The terms of the layer named by [`Self::disqualifying_layer`].
-  fn disqualifying_terms(&self) -> Option<Terms> {
-    if self.weights.forbids_commercial_use() {
-      Some(self.weights)
-    } else if self.corpus.forbids_commercial_use() {
-      Some(self.corpus)
-    } else {
-      None
-    }
+  /// Which layer disqualifies the artifact, when one does — the layer whose
+  /// terms are established and FORBID commercial use.
+  fn disqualifying_layer(&self) -> Option<&'static str> {
+    self
+      .layer_where(Terms::forbids_commercial_use)
+      .map(|(layer, _)| layer)
+  }
+
+  /// Which layer leaves a shipping claim with nothing to rest on, when one
+  /// does, and its terms — research-only OR unresolved.
+  ///
+  /// A STRICTLY WIDER question than [`Self::disqualifying_layer`], and the one
+  /// `default`-reachability is checked on. Asking the narrow question there is
+  /// what let an unresolved row sit in the default feature set with every
+  /// check green.
+  fn ungranted_layer(&self) -> Option<(&'static str, Terms)> {
+    self.layer_where(|terms| !terms.permits_a_shipping_claim())
   }
 
   /// The row's SHA-256, or `None` when it has no hash to key on.
@@ -1536,12 +1641,9 @@ fn research_only_reachable(
 ) -> Vec<String> {
   let mut failures = Vec::new();
   for row in rows {
-    let Some(layer) = row.disqualifying_layer() else {
+    let Some((layer, terms)) = row.layer_where(Terms::forbids_commercial_use) else {
       continue;
     };
-    let terms = row
-      .disqualifying_terms()
-      .expect("a disqualified row has terms");
     let empty = BTreeSet::new();
     let gates = derived.get(row.file).unwrap_or(&empty);
     if gates.is_empty() {
@@ -1585,8 +1687,94 @@ fn research_only_reachable(
   failures
 }
 
-/// **Direction 3.** No `commercial-` feature gates only clear artifacts — and
-/// no `commercial-` feature gates nothing at all in the SOURCE.
+/// Why a layer withholds the shipping claim, in the words a failure message
+/// needs — and the two reasons kept APART, because they are not the same
+/// finding.
+///
+/// [`Terms::ResearchOnly`] is an ANSWER: somebody read the terms and they
+/// forbid the shipping path. [`Terms::Unresolved`] is the ABSENCE of one:
+/// nobody has established anything, so the bytes may well be perfectly
+/// shippable — what does not exist is a document saying so. Collapsing the two
+/// would make every message here assert a prohibition this repository has not
+/// found, which is the register's own over-claim defect pointed backwards.
+const fn withheld_because(terms: Terms) -> &'static str {
+  match terms {
+    Terms::ResearchOnly(_) => {
+      "The terms are ESTABLISHED and they forbid commercial use, so shipping these bytes is \
+       infringement."
+    }
+    Terms::Unresolved(_) => {
+      "NOTHING is established over these bytes. That is not a prohibition — they may well be \
+       shippable — but there is no grant for a shipping claim to rest on, and a configuration \
+       the consumer never chose is this crate answering the open question on their behalf."
+    }
+    Terms::Permissive(_) | Terms::Attribution(_) => {
+      "These terms DO permit a shipping claim, so a failure quoting this sentence is a defect in \
+       the predicate rather than a finding about the artifact."
+    }
+  }
+}
+
+/// **Direction 2's wide clause.** Nothing whose terms leave a shipping claim
+/// with nothing to rest on is reachable from `default`.
+///
+/// Wider than [`research_only_reachable`] in the rows it covers — research-only
+/// AND unresolved — and deliberately weaker in what it demands of them. The
+/// strong clause insists on a `commercial-` gate that no ordinary feature
+/// pulls in; this one insists only that the consumer had to ask. That
+/// asymmetry is the vocabulary decision recorded in this file's module doc:
+/// `default` is the single configuration coremlit chooses on a consumer's
+/// behalf, and choosing an artifact nobody has found a grant for is the thing
+/// [`Terms::Unresolved`]'s own doc already said may not happen.
+///
+/// It reads the same two live facts the strong clause does — the tree's
+/// `#[cfg(feature = ...)]` and the manifest's feature graph — and never the
+/// row's claimed `gate`.
+fn ungranted_reachable_from_default(
+  rows: &[Artifact],
+  derived: &BTreeMap<&str, BTreeSet<String>>,
+  default_closure: &BTreeSet<String>,
+) -> Vec<String> {
+  let mut failures = Vec::new();
+  for row in rows {
+    let Some((layer, terms)) = row.ungranted_layer() else {
+      continue;
+    };
+    let empty = BTreeSet::new();
+    let gates = derived.get(row.file).unwrap_or(&empty);
+    if gates.is_empty() {
+      failures.push(format!(
+        "{}: {} at the {layer} layer, and the tree puts NO `#[cfg(feature = ...)]` on the module \
+         that loads it — it compiles in EVERY configuration, `default` included, so there is \
+         nothing a consumer could decline. {} {}",
+        row.file,
+        terms.verdict(),
+        withheld_because(terms),
+        terms.detail()
+      ));
+      continue;
+    }
+    for gate in gates {
+      if !default_closure.contains(gate) {
+        continue;
+      }
+      failures.push(format!(
+        "{}: {} at the {layer} layer behind {gate:?}, and `default` enables {gate:?} — a plain \
+         `cargo add coremlit` ships it, so this crate took the decision instead of the consumer. \
+         {} {}",
+        row.file,
+        terms.verdict(),
+        withheld_because(terms),
+        terms.detail()
+      ));
+    }
+  }
+  failures
+}
+
+/// **Direction 3.** No `commercial-` feature gates only artifacts that are
+/// GRANTED at both layers — and no `commercial-` feature gates nothing at all
+/// in the SOURCE.
 ///
 /// The one people forget. A gate that protects nothing is worse than no gate:
 /// it reads as a live restriction, so nobody re-examines the artifacts behind
@@ -1597,6 +1785,19 @@ fn research_only_reachable(
 /// no `#[cfg(feature = ...)]` in the tree names compiles nothing differently
 /// whether it is on or off. It is a NAME, not a gate, and a restricted row
 /// naming it is behind no gate at all.
+///
+/// **This direction runs backwards, so `unresolved` needs its own wording.**
+/// The other two ask "is this artifact protected"; this one asks "does this
+/// protection still have a cause", and answers RED when it does not. An
+/// unresolved row therefore must not red it — the row is not clear, so a gate
+/// over it is not standing over nothing. But the cause it stands on is not the
+/// research-only one and the message must not say it is: research-only means a
+/// document forbids the shipping path and the gate is retired when that
+/// document changes; unresolved means no document grants it and the gate is
+/// holding an open QUESTION, retired when somebody answers it. Calling an
+/// unresolved row "restricted" would assert the very prohibition the row says
+/// nobody has established, so the failure text names both causes and says
+/// which is which.
 fn commercial_features_gating_nothing_restricted(
   rows: &[Artifact],
   derived: &BTreeMap<&str, BTreeSet<String>>,
@@ -1630,14 +1831,17 @@ fn commercial_features_gating_nothing_restricted(
       ));
       continue;
     }
-    if gated.iter().all(|r| r.disqualifying_layer().is_none()) {
-      let cleared: Vec<&str> = gated.iter().map(|r| r.file).collect();
+    if gated.iter().all(|r| r.ungranted_layer().is_none()) {
+      let granted: Vec<&str> = gated.iter().map(|r| r.file).collect();
       failures.push(format!(
         "feature {feature:?} carries the {COMMERCIAL_PREFIX:?} prefix, but every artifact it \
-         gates is CLEAR: {}. An upstream relicensed, or the terms were re-read — either way the \
-         gate now says a restriction exists that does not, so retire it and move the artifacts to \
-         a plain feature.",
-        cleared.join(", ")
+         gates is GRANTED at both layers: {}. A {COMMERCIAL_PREFIX:?} gate stands on one of two \
+         causes and this one has neither — a RESEARCH-ONLY row, where a document forbids the \
+         shipping path, or an UNRESOLVED row, where no document grants it and the gate holds an \
+         open question rather than a prohibition. An upstream relicensed, the terms were re-read, \
+         or the question was answered; either way the gate now says a restriction exists that \
+         does not, so retire it and move the artifacts to a plain feature.",
+        granted.join(", ")
       ));
     }
   }
@@ -2437,10 +2641,29 @@ fn no_research_only_artifact_is_reachable_without_a_commercial_gate() {
   assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
 
-/// **Direction 3.** No `commercial-`prefixed feature gates only clear
-/// artifacts, and none gates nothing at all in the source.
+/// **Direction 2's wide clause.** No artifact whose terms leave a shipping
+/// claim with nothing to rest on — research-only OR unresolved — is reachable
+/// from `default`.
+///
+/// Unlike the strong clause above this one has rows in scope TODAY: twenty of
+/// them, the nineteen with an unresolved corpus layer plus
+/// `redimnet/redimnet_b5.mlmodelc`, whose WEIGHTS layer is unresolved. Two
+/// live facts are what make it pass — `default = []` in the manifest, and a
+/// `#[cfg(feature = ...)]` on every one of those rows' loaders. Delete either
+/// and this goes red now, on today's table.
 #[test]
-fn every_commercial_feature_gates_a_research_only_artifact() {
+fn no_ungranted_artifact_is_reachable_from_default() {
+  let block = features_block();
+  let closure = feature_closure(&block, "default");
+  let derived = derived_gates(ARTIFACTS);
+  let failures = ungranted_reachable_from_default(ARTIFACTS, &derived, &closure);
+  assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// **Direction 3.** No `commercial-`prefixed feature gates only artifacts that
+/// are granted at both layers, and none gates nothing at all in the source.
+#[test]
+fn every_commercial_feature_gates_an_artifact_with_no_shipping_grant() {
   let block = features_block();
   let features = feature_names(&block);
   let derived = derived_gates(ARTIFACTS);
@@ -3020,7 +3243,7 @@ mod falsifiers {
     StagedTable, Terms, commercial_features_gating_nothing_restricted,
     commercial_features_without_the_phrase, contradictory_terms, feature_closure, feature_closures,
     feature_docs, feature_names, first_sentence, fp16_pinned_bundles_without_a_row, glob_matches,
-    research_only_reachable, unmatched_coverage,
+    research_only_reachable, ungranted_reachable_from_default, unmatched_coverage,
   };
 
   /// A row with everything but the fields a given test is about.
@@ -3050,6 +3273,30 @@ mod falsifiers {
     RETAIN_NOTICE,
     "non-commercial research purposes only, for a falsifier",
   );
+  const ATTRIBUTED: Terms = Terms::attribution(
+    "CC-BY-4.0",
+    CREDIT_AUTHOR,
+    "granted, on condition of attribution, for a falsifier",
+  );
+  const UNGRANTED: Terms = Terms::unresolved("nothing established, for a falsifier");
+
+  /// The manifest shape that exposed the hole: an ordinary kit feature, and
+  /// `default` turning it on.
+  const SHIPS_IT_BY_DEFAULT: &str = "\
+default = [\"identity\"]
+identity = [\"dep:rustfft\"]
+";
+
+  /// The same manifest with the feature left as an opt-in — this crate's
+  /// actual shape.
+  const OPT_IN_ONLY: &str = "\
+default = []
+identity = [\"dep:rustfft\"]
+";
+
+  /// The row `redimnet/redimnet_b5.mlmodelc` is: no grant over the WEIGHTS,
+  /// an attribution grant over the corpus, behind a plain kit feature.
+  const REDIMNET_SHAPED: &str = "redimnet/redimnet_b5.mlmodelc/weights/weight.bin";
 
   /// A roster of `Models/`-relative bundle paths, as a reader would return it.
   fn staged_paths(paths: &[&str]) -> Vec<String> {
@@ -3522,17 +3769,182 @@ commercial-face = [\"dep:facelib\"]
     );
   }
 
+  /// **THE HOLE, as an assertion.** `default = ["identity"]`, so a plain
+  /// `cargo add coremlit` compiles the loader for an artifact whose WEIGHTS
+  /// layer has no grant at all.
+  ///
+  /// Handed to the strong clause this same input returned `[]`, and all 64
+  /// checks the file then held stayed green: only `Terms::ResearchOnly` set
+  /// `forbids_commercial_use`, so `disqualifying_layer()` was `None` and the
+  /// row was skipped before anything looked at the feature graph.
   #[test]
-  fn direction_two_ignores_unresolved_rows_rather_than_treating_them_as_restricted() {
+  fn direction_two_reds_when_an_unresolved_row_is_reachable_from_default() {
     let rows = [row(
-      "a/w.bin",
+      REDIMNET_SHAPED,
       "vendor/one",
-      "speaker",
-      Terms::unresolved("open question, for a falsifier"),
+      "identity",
+      UNGRANTED,
+      ATTRIBUTED,
+    )];
+    let derived = tree_gates(&[(REDIMNET_SHAPED, &["identity"])]);
+    let failures = ungranted_reachable_from_default(
+      &rows,
+      &derived,
+      &feature_closure(SHIPS_IT_BY_DEFAULT, "default"),
+    );
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(failures[0].contains("\"identity\""), "{failures:?}");
+    assert!(
+      failures[0].contains("plain `cargo add coremlit`"),
+      "{failures:?}"
+    );
+    assert!(
+      failures[0].contains("NOTHING is established"),
+      "{failures:?}"
+    );
+    assert!(
+      !failures[0].contains("forbid commercial use"),
+      "an unresolved row must not be reported as a prohibition: {failures:?}"
+    );
+  }
+
+  /// The same row with the feature left an opt-in — this crate's real shape.
+  /// The wide clause asks only that the consumer had to ask for it.
+  #[test]
+  fn direction_two_leaves_an_unresolved_row_behind_an_opt_in_feature_alone() {
+    let rows = [row(
+      REDIMNET_SHAPED,
+      "vendor/one",
+      "identity",
+      UNGRANTED,
+      ATTRIBUTED,
+    )];
+    let derived = tree_gates(&[(REDIMNET_SHAPED, &["identity"])]);
+    assert!(
+      ungranted_reachable_from_default(&rows, &derived, &feature_closure(OPT_IN_ONLY, "default"))
+        .is_empty()
+    );
+  }
+
+  /// The wide clause covers research-only rows too, and says something
+  /// DIFFERENT about them — a found prohibition, not an open question.
+  #[test]
+  fn direction_two_names_a_prohibition_when_the_default_reachable_row_is_research_only() {
+    let rows = [row(
+      REDIMNET_SHAPED,
+      "vendor/one",
+      "identity",
+      RESTRICTED,
       CLEAR,
     )];
+    let derived = tree_gates(&[(REDIMNET_SHAPED, &["identity"])]);
+    let failures = ungranted_reachable_from_default(
+      &rows,
+      &derived,
+      &feature_closure(SHIPS_IT_BY_DEFAULT, "default"),
+    );
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+      failures[0].contains("ESTABLISHED and they forbid commercial use"),
+      "{failures:?}"
+    );
+    assert!(
+      !failures[0].contains("NOTHING is established"),
+      "{failures:?}"
+    );
+  }
+
+  /// A loader with no `#[cfg]` at all is in `default` however empty `default`
+  /// is — the clause that keeps the wide check non-vacuous against today's
+  /// table.
+  #[test]
+  fn direction_two_reds_when_an_ungranted_loader_carries_no_cfg() {
+    let rows = [row(
+      REDIMNET_SHAPED,
+      "vendor/one",
+      "identity",
+      UNGRANTED,
+      CLEAR,
+    )];
+    let derived = tree_gates(&[(REDIMNET_SHAPED, &[])]);
+    let failures =
+      ungranted_reachable_from_default(&rows, &derived, &feature_closure(OPT_IN_ONLY, "default"));
+    assert_eq!(failures.len(), 1, "{failures:?}");
+    assert!(
+      failures[0].contains("compiles in EVERY configuration"),
+      "{failures:?}"
+    );
+  }
+
+  /// And the widening stops where the grants start. A permissive or
+  /// attribution row in `default` is what this crate ships on purpose; a
+  /// clause that flagged those would red the whole table.
+  #[test]
+  fn direction_two_leaves_granted_rows_in_default_alone() {
+    let rows = [
+      row("a/w.bin", "vendor/one", "identity", CLEAR, CLEAR),
+      row("b/w.bin", "vendor/one", "identity", ATTRIBUTED, ATTRIBUTED),
+    ];
+    let derived = tree_gates(&[("a/w.bin", &["identity"]), ("b/w.bin", &["identity"])]);
+    assert!(
+      ungranted_reachable_from_default(
+        &rows,
+        &derived,
+        &feature_closure(SHIPS_IT_BY_DEFAULT, "default")
+      )
+      .is_empty()
+    );
+  }
+
+  /// The STRONG clause still does not sweep unresolved rows in, and that is a
+  /// decision rather than the hole above.
+  ///
+  /// Requiring a `commercial-` gate here would demand a feature whose first
+  /// documented sentence says a commercial licence is REQUIRED over a row that
+  /// says nobody has established anything — and it would demand it of the
+  /// nineteen rows in the real table with an unresolved CORPUS layer, which is
+  /// most of this crate's public feature surface. See the module doc.
+  #[test]
+  fn direction_twos_prefix_clause_does_not_sweep_in_unresolved_rows() {
+    let rows = [row("a/w.bin", "vendor/one", "speaker", UNGRANTED, CLEAR)];
     let derived = tree_gates(&[("a/w.bin", &["speaker"])]);
     assert!(research_only_reachable(&rows, &derived, &feature_closures(CLEAN_FEATURES)).is_empty());
+  }
+
+  /// The two axes, pinned for every variant of the vocabulary — the
+  /// per-variant audit made executable instead of written in a comment.
+  ///
+  /// `unresolved` is the cell the hole lived in: `(false, false)`. Not
+  /// forbidden, because nobody found a prohibition; not permitted either,
+  /// which is the half that had no predicate. A FIFTH variant is caught by the
+  /// compiler rather than here — both axes are exhaustive `match`es — and this
+  /// pins what the four existing answers are.
+  #[test]
+  fn the_two_shipping_axes_are_pinned_for_every_terms_variant() {
+    let axes: Vec<(&str, bool, bool)> = [CLEAR, ATTRIBUTED, RESTRICTED, UNGRANTED]
+      .into_iter()
+      .map(|t| {
+        (
+          t.verdict(),
+          t.forbids_commercial_use(),
+          t.permits_a_shipping_claim(),
+        )
+      })
+      .collect();
+    assert_eq!(
+      axes.as_slice(),
+      [
+        ("permissive", false, true),
+        ("attribution-required", false, true),
+        ("research-only", true, false),
+        ("unresolved", false, false),
+      ]
+      .as_slice(),
+      "the shipping vocabulary moved. `forbids_commercial_use` is what the \
+       `commercial-` prefix hangs on and `permits_a_shipping_claim` is what \
+       `default`-reachability hangs on; they are not each other's negation, and \
+       the day they become one, one of the two directions stops seeing a class of row."
+    );
   }
 
   // --- direction 3 ---------------------------------------------------------
@@ -3556,15 +3968,21 @@ commercial-face = [\"dep:facelib\"]
   }
 
   #[test]
-  fn direction_three_reds_when_a_commercial_feature_gates_only_clear_artifacts() {
-    let rows = [row(
-      "a/w.bin",
-      "vendor/one",
-      "commercial-face",
-      CLEAR,
-      CLEAR,
-    )];
-    let derived = tree_gates(&[("a/w.bin", &["commercial-face"])]);
+  fn direction_three_reds_when_a_commercial_feature_gates_only_granted_artifacts() {
+    let rows = [
+      row("a/w.bin", "vendor/one", "commercial-face", CLEAR, CLEAR),
+      row(
+        "b/w.bin",
+        "vendor/one",
+        "commercial-face",
+        ATTRIBUTED,
+        ATTRIBUTED,
+      ),
+    ];
+    let derived = tree_gates(&[
+      ("a/w.bin", &["commercial-face"]),
+      ("b/w.bin", &["commercial-face"]),
+    ]);
     let failures = commercial_features_gating_nothing_restricted(
       &rows,
       &derived,
@@ -3573,8 +3991,38 @@ commercial-face = [\"dep:facelib\"]
     );
     assert_eq!(failures.len(), 1, "{failures:?}");
     assert!(
-      failures[0].contains("every artifact it gates is CLEAR"),
+      failures[0].contains("every artifact it gates is GRANTED at both layers"),
       "{failures:?}"
+    );
+    assert!(
+      failures[0].contains("RESEARCH-ONLY") && failures[0].contains("UNRESOLVED"),
+      "the retire message must name BOTH causes a commercial gate can stand on, \
+       or the next reader learns only one of them: {failures:?}"
+    );
+  }
+
+  /// **Direction 3 runs backwards, and an unresolved row must not trip it.**
+  /// The gate is not standing over nothing — the row is not clear. What it
+  /// stands on is an open QUESTION rather than a found prohibition, which is
+  /// why the retire message above has to name two causes and not one.
+  #[test]
+  fn direction_three_keeps_a_commercial_gate_that_covers_an_unresolved_row() {
+    let rows = [row(
+      "a/w.bin",
+      "vendor/one",
+      "commercial-face",
+      UNGRANTED,
+      ATTRIBUTED,
+    )];
+    let derived = tree_gates(&[("a/w.bin", &["commercial-face"])]);
+    assert!(
+      commercial_features_gating_nothing_restricted(
+        &rows,
+        &derived,
+        &features(&["default", "commercial-face"]),
+        &features(&["commercial-face"]),
+      )
+      .is_empty()
     );
   }
 

@@ -124,10 +124,17 @@ Two notes on the modelling, both deliberate:
   register that no document attaches to those bytes, and
   `identical_bytes_carry_identical_terms` exists precisely to catch a row that claims more
   than the upstream said.
-- **`unresolved` is recorded, not disqualifying.** Only `Terms::ResearchOnly` sets
-  `forbids_commercial_use` (`model_licences.rs:381-383`), so this row needs no
-  `commercial-`prefixed gate, and adding one would trip direction 3
-  (`every_commercial_feature_gates_a_research_only_artifact`).
+- **`unresolved` is not disqualifying, and it is NOT unchecked.** `Terms::ResearchOnly`
+  is still the only verdict that sets `forbids_commercial_use`, and that is the axis the
+  `commercial-` prefix rule hangs on — so this row needs no `commercial-`prefixed gate and
+  `identity` stays a plain feature. That is a different statement from "invisible", which
+  is what it used to mean: `Terms::permits_a_shipping_claim` is a SECOND axis, false for
+  `Unresolved` as well as for `ResearchOnly`, and
+  `no_ungranted_artifact_is_reachable_from_default` refuses to let this row be reachable
+  from the default feature set. Adding a `commercial-` gate over it would not trip
+  direction 3 either — `every_commercial_feature_gates_an_artifact_with_no_shipping_grant`
+  accepts an unresolved row as a cause a gate may stand on, and says in its own failure
+  text that the cause is an open question rather than a found prohibition.
 
 ## The `MODELS_LOCK` table, as it must read
 
