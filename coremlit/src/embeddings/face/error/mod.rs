@@ -79,8 +79,14 @@ impl CropDataLength {
 /// Payload of [`Error::DegenerateLandmarks`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct DegenerateLandmarks {
-  /// `Σ ‖pᵢ − p̄‖²` over the five supplied landmarks — zero, subnormal, or
-  /// non-finite when this error is raised.
+  /// `Σ ‖pᵢ − p̄‖²` over the five supplied landmarks — exactly zero, or
+  /// non-finite, when this error is raised.
+  ///
+  /// Those are the only two values the guard admits, which is why narrowing
+  /// the `f64` accumulator to `f32` here cannot lose anything: a positive
+  /// SUBNORMAL spread is finite and greater than zero, so it is solved rather
+  /// than rejected, and never reaches this field to be flushed to zero by the
+  /// narrowing.
   spread: f32,
 }
 
@@ -191,17 +197,23 @@ impl TransformParameter {
   }
 }
 
-/// A solved or inverted similarity transform has a non-finite parameter.
+/// A SOLVED similarity transform has a non-finite parameter.
 ///
 /// The backstop that keeps a `SimilarityTransform` VALUE total: every way of
 /// producing one checks its four parameters before handing it out, so no
 /// caller can receive an `Ok` holding a transform whose `apply` returns NaN.
-/// Both point sets are finite by the time the solve runs, which makes this
-/// unreachable through
-/// [`crate::embeddings::face::SimilarityTransform::estimate`] — see that
-/// function's doc for the range argument. It is reachable through
-/// [`crate::embeddings::face::SimilarityTransform::inverse`], whose input a
-/// caller can build directly.
+///
+/// **No public route reaches it, and the doc says so rather than naming one.**
+/// [`crate::embeddings::face::SimilarityTransform::estimate`] is its only
+/// producer, and both point sets are finite by the time the solve runs, which
+/// bounds the four parameters well inside `f64` — see that function's doc for
+/// the range argument. [`crate::embeddings::face::SimilarityTransform::inverse`]
+/// takes a caller-built transform and CAN meet a non-finite parameter, but it
+/// reports that as `None` and raises nothing; where
+/// [`crate::embeddings::face::FaceAlign::to_template`] has to turn that `None`
+/// into an error, the one it raises is [`Error::NonInvertibleTransform`].
+/// This variant is kept because the bound is an argument about the input type
+/// rather than something the compiler enforces.
 ///
 /// Payload of [`Error::NonFiniteTransform`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -221,6 +233,47 @@ impl NonFiniteTransform {
   #[inline(always)]
   pub const fn parameter(&self) -> TransformParameter {
     self.parameter
+  }
+}
+
+/// A solved similarity transform has no inverse, so no template pixel can be
+/// mapped back into the crop and nothing can be sampled through it.
+///
+/// **Deliberately not [`DegenerateLandmarks`].** That one means the SOURCE
+/// points carried no spread, and
+/// [`crate::embeddings::face::SimilarityTransform::estimate`] raises it only
+/// where the spread really is zero. Anything reaching THIS error has already
+/// passed that guard, so its landmarks are spread — what vanished is the
+/// solved SCALE, which the source spread does not determine on its own (the
+/// scale is `|Σ conj(uᵢ)·vᵢ| / Σ‖uᵢ‖²` over the two CENTRED sets, so the
+/// target and the relative geometry decide it too). Reporting a zero landmark
+/// spread here would send a reader hunting for coincident landmarks that do
+/// not exist.
+///
+/// Payload of [`Error::NonInvertibleTransform`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NonInvertibleTransform {
+  /// The solved transform's uniform scale, `√(a² + b²)`.
+  ///
+  /// Zero when the solve collapsed the plane onto a point; nonzero but tiny
+  /// when it is only the INVERSE that leaves `f64` — `1/(a² + b²)`, or a
+  /// translation built from it, overflowing. `f64` for exactly that second
+  /// case: narrowed to `f32`, a scale of `1e-160` would render as the zero
+  /// this payload exists to stop reporting.
+  scale: f64,
+}
+
+impl NonInvertibleTransform {
+  /// Construct from the solved transform's scale.
+  #[inline(always)]
+  pub const fn new(scale: f64) -> Self {
+    Self { scale }
+  }
+
+  /// The solved transform's uniform scale, `√(a² + b²)`.
+  #[inline(always)]
+  pub const fn scale(&self) -> f64 {
+    self.scale
   }
 }
 
@@ -298,6 +351,45 @@ impl OutputShape {
   #[inline(always)]
   pub fn expected(&self) -> &[usize] {
     &self.expected
+  }
+}
+
+/// The predicted tensor holds a different NUMBER of elements than the resolved
+/// contract, with axes that matched.
+///
+/// **Deliberately not [`OutputShape`].** The element count is CoreML's own
+/// answer rather than a product of the cached shape, which is why it is
+/// checked alongside the axes at all — so the two can disagree, and when only
+/// the count does, the axes were right. `OutputShape` would then have to put
+/// the same vector in both of its fields and report a shape mismatch that did
+/// not happen.
+///
+/// Payload of [`Error::OutputElementCount`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputElementCount {
+  /// Elements the model's tensor reports.
+  got: usize,
+  /// Elements the resolved contract requires.
+  expected: usize,
+}
+
+impl OutputElementCount {
+  /// Construct from the reported and required element counts.
+  #[inline(always)]
+  pub const fn new(got: usize, expected: usize) -> Self {
+    Self { got, expected }
+  }
+
+  /// Elements the model's tensor reports.
+  #[inline(always)]
+  pub const fn got(&self) -> usize {
+    self.got
+  }
+
+  /// Elements the resolved contract requires.
+  #[inline(always)]
+  pub const fn expected(&self) -> usize {
+    self.expected
   }
 }
 
@@ -381,9 +473,16 @@ pub enum Error {
   /// A landmark coordinate is NaN or infinite.
   #[error("{} landmark {} has a non-finite coordinate", .0.set(), .0.index())]
   NonFiniteLandmark(NonFiniteLandmark),
-  /// A solved or inverted transform has a non-finite parameter.
+  /// A solved transform has a non-finite parameter.
   #[error("the solved similarity transform has a non-finite `{}`", .0.parameter())]
   NonFiniteTransform(NonFiniteTransform),
+  /// A solved transform has no inverse, so the template cannot be sampled.
+  #[error(
+    "the solved similarity transform has no inverse (scale = {:e}); no template pixel can be \
+     mapped back into the crop",
+    .0.scale()
+  )]
+  NonInvertibleTransform(NonInvertibleTransform),
   /// The five landmarks carry no usable spread.
   #[error(
     "the five landmarks have no usable spread (Σ‖pᵢ−p̄‖² = {}); no similarity transform is \
@@ -397,6 +496,10 @@ pub enum Error {
   /// The predicted embedding tensor's shape diverges from the resolved contract.
   #[error("output shape mismatch: expected {:?}, got {:?}", .0.expected(), .0.got())]
   OutputShape(OutputShape),
+  /// The predicted embedding tensor holds the wrong number of elements, with
+  /// axes that matched.
+  #[error("output element count mismatch: expected {}, got {}", .0.expected(), .0.got())]
+  OutputElementCount(OutputElementCount),
   /// The model produced a NaN or infinite embedding component.
   #[error("model output row {} contains a non-finite value at component {}", .0.row(), .0.component())]
   NonFiniteOutput(NonFiniteOutput),

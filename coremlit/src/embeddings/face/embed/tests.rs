@@ -436,6 +436,44 @@ fn a_transposed_output_tensor_is_refused() {
 }
 
 #[test]
+fn a_diverging_element_count_is_not_reported_as_a_shape_mismatch() {
+  // FALSIFIER (red first, on CONTENTS). `count` is CoreML's OWN answer rather
+  // than a product of the cached shape — which is the entire reason it is
+  // checked alongside the axes. So the two can disagree, and when only the
+  // COUNT does, the shape matched: the old payload put the same vector in
+  // both fields and rendered "expected [4, 512], got [4, 512]", a shape
+  // mismatch that did not happen.
+  let error = check_predicted_shape(&[4, 512], 4 * 512 - 1, OutputContract::Batched, 4, 512)
+    .expect_err("an element count short of the contract is a divergence");
+  let message = error.to_string();
+  assert!(
+    !message.contains("expected [4, 512], got [4, 512]"),
+    "the shapes are equal; reporting them as a mismatch is a falsehood, got {message:?}"
+  );
+  assert!(
+    message.contains("2047") && message.contains("2048"),
+    "the failure must name the counts that diverged, got {message:?}"
+  );
+  assert!(
+    matches!(
+      &error,
+      Error::OutputElementCount(payload) if payload.got() == 2047 && payload.expected() == 2048
+    ),
+    "the payload must carry both counts, got {error:?}"
+  );
+
+  // A genuine axis divergence is still an `OutputShape`, so splitting the two
+  // did not swallow the one that matters.
+  assert!(
+    matches!(
+      check_predicted_shape(&[512, 4], 4 * 512, OutputContract::Batched, 4, 512),
+      Err(Error::OutputShape(_))
+    ),
+    "a transposed tensor is still a shape mismatch"
+  );
+}
+
+#[test]
 fn normalising_survives_components_an_f32_square_cannot_hold() {
   // The squared norm used to accumulate in `f32`, where `v * v` overflows to
   // infinity for a large component and underflows to zero for a small one.

@@ -286,6 +286,60 @@ fn estimate_can_return_a_transform_with_no_inverse() {
 }
 
 #[test]
+fn a_transform_that_does_not_invert_reports_its_own_scale_not_a_landmark_spread() {
+  // Every execution of `to_template`'s no-inverse arm has already passed
+  // `estimate`'s spread guard, so `Σ‖pᵢ−p̄‖²` is strictly positive there. The
+  // old payload reported it as ZERO, which sends the reader hunting for
+  // coincident landmarks that do not exist — the failure is the solved SCALE,
+  // and that is what the payload has to carry.
+  //
+  // The first witness has a scale that is NONZERO and still has no inverse:
+  // `1/(a² + b²)` overflows at 1e-160. A payload reporting zero here would be
+  // a sentinel rather than the measurement, so this is the assertion that
+  // discriminates one from the other.
+  let collapsed = SimilarityTransform::new(1e-160, 0.0, 1.0, 2.0);
+  assert!(collapsed.inverse().is_none(), "the witness has no inverse");
+  assert_eq!(collapsed.scale(), 1e-160, "and its scale is not zero");
+
+  let error = collapsed
+    .checked_inverse()
+    .expect_err("a transform with no inverse cannot align anything");
+  assert!(
+    matches!(&error, Error::NonInvertibleTransform(payload) if payload.scale() == 1e-160),
+    "the payload must carry the scale that collapsed, got {error:?}"
+  );
+  // And what a reader actually sees, since that is where the falsehood was.
+  let message = error.to_string();
+  assert!(
+    message.contains("1e-160"),
+    "the message must name the collapsed scale, got {message:?}"
+  );
+  assert!(
+    !message.contains("landmark"),
+    "the landmarks are spread; blaming them is the falsehood, got {message:?}"
+  );
+
+  // The second witness is the one `estimate` itself reaches (see
+  // `estimate_can_return_a_transform_with_no_inverse`): a zero-spread TARGET
+  // collapses the plane onto a point. The source spread is ~9.3e4 — the
+  // number the old payload reported as 0.0 — and the scale really is zero.
+  let flat_target = [Point::new(11.0, -4.0); LANDMARK_COUNT];
+  let solved = SimilarityTransform::estimate(&FIXTURE_LANDMARKS, &flat_target)
+    .expect("a spread source against any finite target is solvable");
+  let error = solved
+    .checked_inverse()
+    .expect_err("a zero-scale transform has no inverse");
+  assert!(
+    matches!(&error, Error::NonInvertibleTransform(payload) if payload.scale() == 0.0),
+    "expected NonInvertibleTransform(0), got {error:?}"
+  );
+  assert!(
+    !error.to_string().contains("landmark"),
+    "a well-spread source must not be reported as landmarks with no spread"
+  );
+}
+
+#[test]
 fn coincident_landmarks_are_rejected() {
   let data = vec![0u8; 16 * 16 * 3];
   let crop = FaceCrop::new(&data, 16, 16).expect("geometry is valid");

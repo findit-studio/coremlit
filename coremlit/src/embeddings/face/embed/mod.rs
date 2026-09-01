@@ -39,7 +39,9 @@ use crate::{
   ComputeUnits, DataType, Model, MultiArray,
   embeddings::face::{
     align::{AlignedFace, TEMPLATE_SIZE},
-    error::{BatchRow, ContractMismatch, Error, NonFiniteOutput, OutputShape, Result},
+    error::{
+      BatchRow, ContractMismatch, Error, NonFiniteOutput, OutputElementCount, OutputShape, Result,
+    },
   },
 };
 
@@ -494,8 +496,9 @@ impl FaceEmbedder {
   ///
   /// # Errors
   /// [`Error::Tensor`] / [`Error::Prediction`] on a tensor or CoreML failure;
-  /// [`Error::OutputShape`] if a predicted tensor's shape diverges from the
-  /// contract resolved at load; [`Error::NonFiniteOutput`] if the model emits
+  /// [`Error::OutputShape`] if a predicted tensor's axes diverge from the
+  /// contract resolved at load, or [`Error::OutputElementCount`] if only its
+  /// element count does; [`Error::NonFiniteOutput`] if the model emits
   /// a NaN or infinite component; [`Error::EmbeddingZero`] if a (finite)
   /// output row has zero magnitude and cannot be normalised.
   pub fn embed(&self, faces: &[AlignedFace]) -> Result<Vec<FaceEmbedding>> {
@@ -721,7 +724,10 @@ fn describe(shape: &[usize], dtype: Option<DataType>) -> String {
 ///
 /// The count is still checked alongside it: [`MultiArray::count`] is CoreML's
 /// own answer rather than a product of the cached shape, and the copy that
-/// follows sizes its destination from the contract.
+/// follows sizes its destination from the contract. It gets an error of its
+/// OWN, because it is a different failure: with the axes equal there is no
+/// shape mismatch to report, and [`Error::OutputShape`] could only report one
+/// by naming the same vector twice.
 fn check_predicted_shape(
   shape: &[usize],
   count: usize,
@@ -739,10 +745,16 @@ fn check_predicted_shape(
     OutputContract::Undeclared if batch == 1 && shape == flat => &flat,
     OutputContract::Undeclared => &batched,
   };
-  if shape != expected || count != batch * dim {
+  if shape != expected {
     return Err(Error::OutputShape(OutputShape::new(
       shape.to_vec(),
       expected.to_vec(),
+    )));
+  }
+  if count != batch * dim {
+    return Err(Error::OutputElementCount(OutputElementCount::new(
+      count,
+      batch * dim,
     )));
   }
   Ok(())

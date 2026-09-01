@@ -94,7 +94,7 @@
 
 use crate::embeddings::face::error::{
   CropDataLength, CropDimensions, DegenerateLandmarks, Error, LandmarkSet, NonFiniteLandmark,
-  NonFiniteTransform, Result, TransformParameter,
+  NonFiniteTransform, NonInvertibleTransform, Result, TransformParameter,
 };
 
 /// The number of landmarks the ArcFace family aligns on.
@@ -329,6 +329,21 @@ impl SimilarityTransform {
       ty: -b * self.tx - a * self.ty,
     };
     inverted.first_non_finite().is_none().then_some(inverted)
+  }
+
+  /// [`Self::inverse`] with the failure REPORTED rather than swallowed — the
+  /// form [`FaceAlign::to_template`] needs, which owes its caller a reason.
+  ///
+  /// The reason is [`Self::scale`], the quantity that actually decides it, and
+  /// it is read off THIS transform rather than defaulted. A payload here can
+  /// only say what a `SimilarityTransform` knows: the landmark spread that
+  /// produced it is not one of those things, and the old
+  /// [`Error::DegenerateLandmarks`] said it anyway — as zero, on a path
+  /// `estimate`'s spread guard has already proven it is not.
+  fn checked_inverse(&self) -> Result<Self> {
+    self
+      .inverse()
+      .ok_or_else(|| Error::NonInvertibleTransform(NonInvertibleTransform::new(self.scale())))
   }
 
   /// The least-squares similarity mapping `source` onto `target`.
@@ -585,7 +600,11 @@ impl FaceAlign {
   ///
   /// # Errors
   /// [`Error::NonFiniteLandmark`] on a NaN or infinite landmark coordinate;
-  /// [`Error::DegenerateLandmarks`] if the five landmarks carry no spread.
+  /// [`Error::DegenerateLandmarks`] if the five landmarks carry no spread;
+  /// [`Error::NonInvertibleTransform`] if the solve nonetheless produced a
+  /// transform with no inverse — a DIFFERENT geometry, and a different error,
+  /// because the landmarks are spread in that case and only the scale
+  /// collapsed.
   pub fn to_template(
     crop: FaceCrop<'_>,
     landmarks5: &[Point; LANDMARK_COUNT],
@@ -607,9 +626,12 @@ impl FaceAlign {
     // `estimate_can_return_a_transform_with_no_inverse`: `estimate` is public
     // and takes its target from the caller, so a zero-spread target hands back
     // a finite `a = b = 0` that inverts to `None`.
-    let inverse = transform
-      .inverse()
-      .ok_or_else(|| Error::DegenerateLandmarks(DegenerateLandmarks::new(0.0)))?;
+    //
+    // Whichever way it is reached, the error names the SCALE. It used to name
+    // a landmark spread of zero, which no execution of this line can have:
+    // `estimate` returned `Ok`, so its own guard has already established that
+    // the spread is positive and finite.
+    let inverse = transform.checked_inverse()?;
     Ok(AlignedFace {
       pixels: Box::new(warp_bilinear(crop, &inverse)),
       transform: Some(transform),
