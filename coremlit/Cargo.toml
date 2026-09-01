@@ -15,6 +15,7 @@ exclude = [
   "tests/align/fixtures/",
   "tests/ced/fixtures/",
   "tests/clap/fixtures/",
+  "tests/identity/fixtures/",
   "tests/lid/fixtures/",
   "tests/siglip/fixtures/",
   "tests/speaker/fixtures/",
@@ -65,6 +66,11 @@ siglip = ["dep:tokenizers", "dep:pixon", "dep:sha2"]
 ced = ["dep:rustfft", "dep:soundevents-dataset", "dep:windit"]
 
 lid = ["dep:rustfft", "dep:windit"]
+
+# `audio::identity` — one fixed 6 s window in, one raw 192-d speaker embedding
+# out. Only the mel front end needs a dependency; the windowing and scoring of
+# several windows are the caller's, so there is no `windit` here.
+identity = ["dep:rustfft"]
 
 [dependencies]
 objc2.workspace = true
@@ -444,6 +450,16 @@ required-features = ["lid"]
 name = "lid_long_clip"
 path = "tests/lid/long_clip.rs"
 required-features = ["lid"]
+
+[[test]]
+name = "identity_model_io"
+path = "tests/identity/model_io.rs"
+required-features = ["identity"]
+
+[[test]]
+name = "identity_parity_embed"
+path = "tests/identity/parity_embed.rs"
+required-features = ["identity"]
 
 [[bench]]
 name = "clap_encode"

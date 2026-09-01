@@ -117,8 +117,10 @@ jobs:
           - "siglip"                                                        # SigLIP 2 image+text embeddings alone (committed goldens, no ort)
           - "ced"                                                           # CED-tiny sound-event tagging alone (Rust mel + soundevents-dataset, no ort)
           - "lid"                                                           # spoken-language identification alone (Rust mel + committed label roster, no ort)
-          - "whisper,align,speaker,vad,clap,granite,siglip,ced,lid,serde,tracing,nl-recognizer"    # all non-oracle
-          - "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,serde,tracing,nl-recognizer"  # all-on
+          - "identity"                                                      # speaker-identity embedding alone (Rust mel + committed mel goldens, no ort)
+          - "identity,speaker"                                              # named smoke: Scoring::IdentityCosine lives behind `speaker` while the door that feeds it lives behind `identity`, and the const assert tying their dimensions together compiles ONLY when both are on
+          - "whisper,align,speaker,vad,clap,granite,siglip,ced,lid,identity,serde,tracing,nl-recognizer"    # all non-oracle
+          - "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,identity,serde,tracing,nl-recognizer"  # all-on
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -502,6 +504,34 @@ jobs:
             fp16-vendors: vadkit,lid
             gates: |
               lid|lid_model_io lid_e2e lid_long_clip
+
+          # `audio::identity` — the ReDimNet-B5 speaker embedder (issue #123).
+          #
+          # THIS SHARD CANNOT STAGE ITS ARTIFACT YET, and the reason is a licence
+          # decision rather than an oversight. Its MODELS_LOCK table names a
+          # PRIVATE repository: the upstream MIT grant is written over "the
+          # Software" and extends to the released weights nowhere in writing, so
+          # publishing a conversion of them openly would be redistribution under
+          # no grant, while CI fetching from our own private repository is use.
+          # The download step below passes `HF_TOKEN` through from a repository
+          # secret of the same name — huggingface_hub's own variable, so no flag
+          # is needed — and AT THE TIME THIS ROW LANDED NO SUCH SECRET EXISTED.
+          # Creating one (a Hugging Face read token with access to the
+          # FinDIT-Studio org) is an owner action; until then this shard's
+          # download 401s and its gates never run. An unset secret expands to the
+          # empty string, so the six public kits above are unaffected either way.
+          #
+          # The bundle's CHECKSUMS.sha256 lists exactly the five staged files with
+          # paths relative to the `.mlmodelc` root, so it needs no filter — see
+          # the MODELS_LOCK comment.
+          - kit: identity
+            cache: Models/redimnet
+            probe: Models/redimnet/redimnet_b5.mlmodelc
+            checksum-dir: Models/redimnet/redimnet_b5.mlmodelc
+            checksum-file: ../CHECKSUMS.sha256
+            fp16-vendors: vadkit,redimnet
+            gates: |
+              identity|identity_model_io identity_parity_embed
     # Every kit's test-model override, set for every shard. Each of these
     # resolves to the same path the suite's `common/mod.rs` falls back to, so
     # nothing changes behaviorally — the point is that the gates NAME the
@@ -517,6 +547,7 @@ jobs:
       CLAPKIT_TEST_MODELS: ${{ github.workspace }}/Models/clapkit
       SIGLIP_TEST_MODELS: ${{ github.workspace }}/Models/siglip2-naflex
       LID_TEST_MODELS: ${{ github.workspace }}/Models/lid
+      IDENTITY_TEST_MODELS: ${{ github.workspace }}/Models/redimnet
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
@@ -539,6 +570,12 @@ jobs:
         if: steps.models.outputs.cache-hit != 'true'
         env:
           KIT: ${{ matrix.kit }}
+          # `hf` reads this itself; no flag, and no per-kit branch. The ONLY kit
+          # whose table is a private repository is `identity`, whose matrix row
+          # explains why. When the secret is unset GitHub expands it to the empty
+          # string and `hf download` behaves exactly as it did before this line
+          # existed, so the public kits are untouched.
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
         run: |
           set -euo pipefail
 

@@ -94,6 +94,10 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
       vec!["dep:rustfft", "dep:soundevents-dataset", "dep:windit"],
     ),
     ("lid", vec!["dep:rustfft", "dep:windit"]),
+    // No `windit`: this door embeds ONE window and the caller owns any
+    // windowing or averaging across several of them, so the shared window
+    // engine that `ced`/`lid`/`granite` need has nothing to do here.
+    ("identity", vec!["dep:rustfft"]),
     ("siglip", vec!["dep:tokenizers", "dep:pixon", "dep:sha2"]),
   ]
 }
@@ -155,8 +159,10 @@ const INTENDED_CI_COMBOS: &[&str] = &[
   "siglip",
   "ced",
   "lid",
-  "whisper,align,speaker,vad,clap,granite,siglip,ced,lid,serde,tracing,nl-recognizer",
-  "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,serde,tracing,nl-recognizer",
+  "identity",
+  "identity,speaker",
+  "whisper,align,speaker,vad,clap,granite,siglip,ced,lid,identity,serde,tracing,nl-recognizer",
+  "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,identity,serde,tracing,nl-recognizer",
 ];
 
 /// The curated combos of ci.yml's `parity` job — one row per third-party oracle
@@ -567,8 +573,10 @@ jobs:
           - "siglip"
           - "ced"
           - "lid"
-          - "whisper,align,speaker,vad,clap,granite,siglip,ced,lid,serde,tracing,nl-recognizer"
-          - "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,serde,tracing,nl-recognizer"
+          - "identity"
+          - "identity,speaker"
+          - "whisper,align,speaker,vad,clap,granite,siglip,ced,lid,identity,serde,tracing,nl-recognizer"
+          - "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,identity,serde,tracing,nl-recognizer"
     steps:
       - uses: actions/checkout@v7
   parity:

@@ -581,10 +581,15 @@ const NEGATIONS: &[&str] = &[
 /// against it by [`every_rows_sha256_matches_the_pin_it_names`], so the two
 /// cannot drift apart.
 ///
-/// **No row here is research-only.** Every disqualification found so far sits
-/// in `Terms::Unresolved` on the CORPUS layer, because `NOTICE` documents the
-/// weights layer throughout and the corpus layer nowhere. That is a finding
-/// about this repository's records, not a clean bill of health.
+/// **No row here is research-only.** What used to follow that sentence — that
+/// every unresolved layer is a CORPUS layer, because `NOTICE` documents the
+/// weights layer throughout and the corpus layer nowhere — stopped being true
+/// with `redimnet/redimnet_b5.mlmodelc`, the register's FIRST unresolved
+/// WEIGHTS layer. It is not an oversight in this file and not a gap in
+/// `NOTICE`: `IDRnD/redimnet` genuinely grants nothing over the released
+/// checkpoints, its MIT covering "the Software", so there is no document to
+/// record. Every other unresolved layer is still a corpus one. Both remain
+/// findings about this repository's records rather than a clean bill of health.
 const ARTIFACTS: &[Artifact] = &[
   // --- whisper -------------------------------------------------------------
   Artifact {
@@ -1260,6 +1265,49 @@ const ARTIFACTS: &[Artifact] = &[
        not carry, which is why they are restrictions here. Evidence pinned in the module doc.",
     ),
     source: "NOTICE section 10a; VoxLingua107 distribution page (EVIDENCE, module doc)",
+  },
+  // --- identity ------------------------------------------------------------
+  Artifact {
+    file: "redimnet/redimnet_b5.mlmodelc/weights/weight.bin",
+    key: Key::Sha256("1735fc68f4cdf10ad8bb56135da3bd8c0c83f6c3549ee8514f0346046f90a79b"),
+    pin: "tests/identity/common/mod.rs::ARTIFACT_SHA256",
+    staged_by: "FinDIT-Studio/redimnetkit-coreml",
+    loader: "src/audio/mod.rs::identity",
+    gate: "identity",
+    weights: Terms::unresolved(
+      "NO WRITTEN GRANT COVERS THESE BYTES, and that is a step DOWN in artifact-level clarity \
+       from the incumbent rather than a step across. `IDRnD/redimnet` ships MIT, but the grant \
+       is written over \"the Software\" — the model source — and neither that repository nor \
+       `PalabraAI/redimnet2` extends it to the released `.pt` assets in writing. Compare the \
+       row this sits beside: WeSpeaker's own model-licence document places its \
+       VoxCeleb-trained pretrained models under CC-BY-4.0, an explicit weights grant with \
+       attribution as a CONDITION, which is why `speakerkit/wespeaker.mlmodelc` is an \
+       attribution row and this one is not. The corpus layer below is the binding constraint \
+       and it is unchanged, so this does not disqualify the shipping path; what it does is \
+       remove a written permission we previously had, and the register should show that as \
+       `unresolved` rather than borrow the source licence's identifier for weight bytes it \
+       does not name. Re-tagging an upstream CODE licence onto a weights artifact is the \
+       exact conflation this campaign has already paid for once — `aufklarer/\
+       ReDimNet2-B6-CoreML` declares `license: mit` over VoxBlink2-trained weights whose \
+       corpus is CC-BY-NC-SA-4.0. It is also why the artifact repository MODELS_LOCK names is \
+       PRIVATE: fetching our own conversion for our own CI is use, and publishing it openly \
+       would have been redistribution under no grant.",
+    ),
+    corpus: Terms::attribution(
+      "CC-BY-4.0",
+      CREDIT_AUTHOR_VOXCELEB,
+      "VoxCeleb2-dev, and NO NEW EXPOSURE: this is the same corpus lineage the incumbent \
+       WeSpeaker embedder already carries, so the decision it needs has already been taken. \
+       The `-vox2-` lineage is the only one usable here — the same upstream release publishes \
+       `M-vb2+vox2+cnc-ft_mix.pt` and `S-vb2-ptn.pt` trained on VoxBlink2, whose distributor \
+       states the CC-BY-NC-SA-4.0 term propagates to the trained model (\"The license of the \
+       model is also CC BY-NC-SA 4.0, no commercial application is allowed\"). The conversion \
+       recipe refuses any asset whose name is not `-vox2-` \
+       (`conversion/redimnet/scripts/_redimnet_common.py::verify_asset_name`), so the \
+       distinction is enforced at the point the bytes are loaded rather than remembered here.",
+    ),
+    source: "conversion/redimnet/README.md and LICENCE_ROW.md; IDRnD/redimnet LICENSE (MIT, over \
+             \"the Software\"); wenet-e2e/wespeaker model licence; voxblink2.github.io",
   },
 ];
 
@@ -2933,7 +2981,11 @@ fn the_tables_verdict_census_is_what_this_file_says_it_is() {
   };
   assert_eq!(
     census(|r| r.weights),
-    BTreeMap::from([("attribution-required", 12), ("permissive", 15)]),
+    BTreeMap::from([
+      ("attribution-required", 12),
+      ("permissive", 15),
+      ("unresolved", 1)
+    ]),
     "the weights-layer census changed. Say what moved and why in this file's module doc before \
      re-baselining it — a licence verdict that changes silently is the failure this table exists \
      to prevent."
@@ -2941,7 +2993,7 @@ fn the_tables_verdict_census_is_what_this_file_says_it_is() {
   assert_eq!(
     census(|r| r.corpus),
     BTreeMap::from([
-      ("attribution-required", 6),
+      ("attribution-required", 7),
       ("permissive", 2),
       ("unresolved", 19)
     ]),

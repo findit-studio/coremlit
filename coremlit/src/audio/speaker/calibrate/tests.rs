@@ -2044,3 +2044,244 @@ fn the_two_published_numbers_still_determine_every_side_that_produced_them() {
     );
   }
 }
+
+// ── Scoring::IdentityCosine — the third score source ──────────────────────
+//
+// A different lane's embedder in a different dimension, so it gets its own
+// fixtures rather than a parameter on the ones above: `row` builds 256-d rows,
+// and the whole point of this source is that its rows are 192 long.
+
+/// The identity lane's raw row width, restated here rather than imported, so
+/// this file pins the number independently of the constant it validates.
+const IDENTITY_ROW: usize = 192;
+
+/// A raw 192-d row built from `(axis, weight)` pairs. Un-normalized on purpose
+/// — the door's job is the L2, and the real embedder's norms sit near 20.
+fn identity_row(components: &[(usize, f32)]) -> Vec<f32> {
+  let mut v = vec![0.0f32; IDENTITY_ROW];
+  for &(axis, weight) in components {
+    v[axis] = weight;
+  }
+  v
+}
+
+/// The 192-d analogue of [`crowd`]: impostors clustered on axis 0 with enough
+/// radial spread that their scores against a probe actually vary.
+fn identity_crowd() -> Vec<Vec<f32>> {
+  (0..32)
+    .map(|i| {
+      let radius = 4.0 + 0.2 * i as f32;
+      let axis_one = 0.4 + 0.08 * i as f32;
+      identity_row(&[(0, 19.0), (1, axis_one), (10 + i, radius)])
+    })
+    .collect()
+}
+
+/// The identity-lane probe: inside the crowd, and at a realistic raw norm.
+fn identity_speaker() -> Vec<f32> {
+  identity_row(&[(0, 19.0), (100, 5.4)])
+}
+
+/// Each source states the row length it takes, and `prepare` enforces exactly
+/// that — so a caller who hands one lane's embedding to the other lane's source
+/// gets a typed refusal naming both counts rather than a profile built from a
+/// prefix of somebody else's vector.
+#[test]
+fn each_source_takes_its_own_row_length_and_refuses_the_others() {
+  assert_eq!(Scoring::Cosine.row_len(), EMBEDDING_DIM);
+  assert_eq!(Scoring::PldaCosine.row_len(), EMBEDDING_DIM);
+  assert_eq!(Scoring::IdentityCosine.row_len(), IDENTITY_ROW);
+  assert_ne!(Scoring::Cosine.row_len(), Scoring::IdentityCosine.row_len());
+
+  let identity = identity_speaker();
+  let wespeaker = speaker_a();
+
+  assert!(Scoring::IdentityCosine.prepare(&identity).is_ok());
+  assert!(Scoring::Cosine.prepare(&wespeaker).is_ok());
+
+  // The two crossings, each reported with both counts.
+  match Scoring::IdentityCosine.prepare(&wespeaker) {
+    Err(CalibrateError::ProfileLength(e)) => {
+      assert_eq!((e.got(), e.expected()), (EMBEDDING_DIM, IDENTITY_ROW));
+    }
+    other => panic!("a 256-d row must be refused by IdentityCosine, got {other:?}"),
+  }
+  match Scoring::Cosine.prepare(&identity) {
+    Err(CalibrateError::ProfileLength(e)) => {
+      assert_eq!((e.got(), e.expected()), (IDENTITY_ROW, EMBEDDING_DIM));
+    }
+    other => panic!("a 192-d row must be refused by Cosine, got {other:?}"),
+  }
+}
+
+/// A prepared identity profile carries its own tag, and the source is a
+/// property of the profile rather than of the call site that made it.
+#[test]
+fn an_identity_profile_reports_its_own_source() {
+  let p = ok(
+    Scoring::IdentityCosine.prepare(&identity_speaker()),
+    "prepare an identity profile",
+  );
+  assert_eq!(p.scoring(), Scoring::IdentityCosine);
+  assert_ne!(p.scoring(), Scoring::Cosine);
+}
+
+/// The variant is ADDITIVE: the two existing sources still mean what they
+/// meant, and a profile of one is still refused against a profile of the other
+/// — now in three directions rather than one. A cohort is the place that
+/// matters, because an AS-Norm side is a mean over every entry in it.
+#[test]
+fn identity_profiles_are_refused_against_both_wespeaker_sources() {
+  let identity: Vec<VoiceProfile> = identity_crowd()
+    .iter()
+    .map(|v| {
+      ok(
+        Scoring::IdentityCosine.prepare(v),
+        "prepare an identity impostor",
+      )
+    })
+    .collect();
+  let options = AsNormOptions::new();
+
+  for foreign in [Scoring::Cosine, Scoring::PldaCosine] {
+    let probe = ok(foreign.prepare(&speaker_a()), "prepare a foreign probe");
+    let refused =
+      Calibration::new(HeldOutCohort::assuming_disjoint(identity.clone()), options).side(&probe);
+    match refused {
+      Err(CalibrateError::ScoringMismatch(m)) => {
+        assert_eq!(m.side(), foreign);
+        assert_eq!(m.other(), Scoring::IdentityCosine);
+      }
+      other => panic!("{foreign:?} against an identity cohort must refuse, got {other:?}"),
+    }
+  }
+}
+
+/// A row with no direction is refused rather than normalized into noise. There
+/// is deliberately no floor above zero for this space — `diaric` publishes none
+/// for it, and the recipe's measured `‖e‖ ≈ 15.8 – 21.9` describes eight
+/// synthetic clips rather than a distribution — so what is refused is exactly a
+/// zero or non-finite norm, and nothing merely small.
+#[test]
+fn a_directionless_identity_row_is_refused_and_a_tiny_one_is_not() {
+  match Scoring::IdentityCosine.prepare(&vec![0.0f32; IDENTITY_ROW]) {
+    Err(CalibrateError::DegenerateProfile(s)) => assert_eq!(s, Scoring::IdentityCosine),
+    other => panic!("an all-zero row must be refused, got {other:?}"),
+  }
+  for poison in [f32::NAN, f32::INFINITY] {
+    let mut v = identity_speaker();
+    v[7] = poison;
+    assert!(
+      matches!(
+        Scoring::IdentityCosine.prepare(&v),
+        Err(CalibrateError::DegenerateProfile(Scoring::IdentityCosine))
+      ),
+      "a {poison} component must be refused"
+    );
+  }
+  // Small but real: no invented floor turns this into a refusal.
+  assert!(
+    Scoring::IdentityCosine
+      .prepare(&identity_row(&[(0, 1e-6)]))
+      .is_ok()
+  );
+}
+
+/// Preparing normalizes, so the SCALE of a raw row does not reach the score —
+/// which is what lets a caller average raw windows into a centroid without
+/// having to think about how loud each one was.
+#[test]
+fn preparing_an_identity_row_removes_its_scale() {
+  let base = identity_speaker();
+  let scaled: Vec<f32> = base.iter().map(|v| v * 7.5).collect();
+  let a = ok(Scoring::IdentityCosine.prepare(&base), "prepare");
+  let b = ok(Scoring::IdentityCosine.prepare(&scaled), "prepare scaled");
+  assert_eq!(a, b, "an L2-normalized profile cannot carry the raw scale");
+}
+
+/// A profile stays `Copy`, and the new variant did not make it bigger than the
+/// widest one already there — 192 f32s is smaller than 256, so the third source
+/// costs the type nothing.
+#[test]
+fn a_voice_profile_is_still_copy_and_no_wider_than_before() {
+  let p = ok(
+    Scoring::IdentityCosine.prepare(&identity_speaker()),
+    "prepare",
+  );
+  let copied = p;
+  assert_eq!(copied.scoring(), Scoring::IdentityCosine);
+  // Both still usable: `Copy`, not a move.
+  assert_eq!(p.scoring(), copied.scoring());
+  assert!(
+    core::mem::size_of::<VoiceProfile>() <= 8 + EMBEDDING_DIM * 4,
+    "a profile must stay within its widest variant's footprint"
+  );
+}
+
+/// The whole door works under the new source, not just `prepare`: a cohort, a
+/// calibration, two sides and a trial, with the calibrated number differing
+/// from the raw one — i.e. AS-Norm actually normalized something.
+#[test]
+fn a_full_trial_runs_under_the_identity_source() {
+  let cohort: Vec<VoiceProfile> = identity_crowd()
+    .iter()
+    .map(|v| {
+      ok(
+        Scoring::IdentityCosine.prepare(v),
+        "prepare an identity impostor",
+      )
+    })
+    .collect();
+  assert!(cohort.len() >= super::MIN_COHORT_SCORES);
+
+  let calibration = Calibration::new(
+    HeldOutCohort::assuming_disjoint(cohort),
+    AsNormOptions::new(),
+  );
+  let probe = ok(
+    Scoring::IdentityCosine.prepare(&identity_speaker()),
+    "prepare the probe",
+  );
+  let other = ok(
+    Scoring::IdentityCosine.prepare(&identity_row(&[(0, 19.0), (100, 5.4), (101, 1.4)])),
+    "prepare a second recording",
+  );
+
+  let side_a = ok(calibration.side(&probe), "take the probe side");
+  let side_b = ok(calibration.side(&other), "take the other side");
+  let trial = ok(calibration.trial(&side_a, &side_b), "score the trial");
+
+  assert_eq!(trial.scoring(), Scoring::IdentityCosine);
+  assert!(
+    trial.raw().is_finite() && (-1.0..=1.0).contains(&trial.raw()),
+    "a cosine between unit vectors is bounded, got {}",
+    trial.raw()
+  );
+  assert!(trial.calibrated().is_finite());
+  assert!(
+    (trial.calibrated() - trial.raw()).abs() > 1e-6,
+    "AS-Norm must have moved the score; raw {} calibrated {}",
+    trial.raw(),
+    trial.calibrated()
+  );
+}
+
+/// The serde spelling is pinned, because it is a wire format the moment a
+/// caller stores which source a profile was prepared for. `snake_case`, and the
+/// two existing spellings are untouched.
+#[cfg(feature = "serde")]
+#[test]
+fn the_score_source_spellings_are_pinned() {
+  for (source, spelling) in [
+    (Scoring::Cosine, "\"cosine\""),
+    (Scoring::PldaCosine, "\"plda_cosine\""),
+    (Scoring::IdentityCosine, "\"identity_cosine\""),
+  ] {
+    assert_eq!(serde_json::to_string(&source).unwrap(), spelling);
+    assert_eq!(
+      serde_json::from_str::<Scoring>(spelling).unwrap(),
+      source,
+      "{spelling} must round-trip"
+    );
+  }
+}

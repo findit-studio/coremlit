@@ -338,3 +338,53 @@ kit       = "lid"
 include   = "SpeechBrainECAPAVoxLingua107.mlmodelc/*"
 revision  = "2aa4d715a79e410d5f9aa32bd7a4fc9225bf9eb0"
 local-dir = "Models/lid"
+
+# The ReDimNet-B5 speaker-embedding artifact (`audio::identity`, issue #123),
+# staged under Models/redimnet/ — the directory tests/identity/common/mod.rs
+# resolves by default (the `identity` shard sets `IDENTITY_TEST_MODELS` to the
+# same path explicitly).
+#
+# ONE `.mlmodelc` bundle, 15 MB fp16, converted by `coremlit/conversion/redimnet`
+# from the OFFICIAL public `IDRnD/redimnet` release asset `b5-vox2-ft_lm.pt`
+# (sha256 8b0c11bb…, VoxCeleb2-dev). The graph is
+# `mel [1, 72, 401] f32 -> embedding [1, 192] f32`, RAW (un-normalized): the L2
+# is the caller's, and there is none in the graph to strip.
+#
+# The mel front end runs in the CALLER, which is not a style choice. The
+# waveform-in variant is exact in fp32 but wrong in fp16 on EVERY compute unit
+# (worst cosine 0.28 on the default `All` placement), because its power
+# spectrogram overflows fp16 at the top and its `log(x + 1e-6)` guard is
+# subnormal at the bottom. Measured in the recipe's README.
+#
+# THE SIBLING `.mlpackage` DIRECTORIES ARE DELIBERATELY EXCLUDED, and naming the
+# bundle rather than a bare `*` is what excludes them — the same reasoning the
+# clapkit table records: they are the uncompiled sources the bundle was compiled
+# from, nothing in this crate resolves a `.mlpackage` path, and staging them
+# would double the download for zero coverage.
+#
+# `CHECKSUMS.sha256` is staged and verified. Its paths are relative to the
+# `.mlmodelc` root (as cedkit's are, NOT as granite's), it lists exactly the five
+# staged files, and it carries neither the speakerkit overlay's empty-file
+# self-listing trap nor clapkit's skipped-`.mlpackage` entries — so `shasum -c`
+# over the whole file works from the bundle directory with no filter, which is
+# why the shard needs no `checksum-filter`.
+#
+# THIS REPOSITORY IS PRIVATE, deliberately. `IDRnD/redimnet` ships MIT over "the
+# Software" — its model source — and extends nothing in writing to the released
+# `.pt` weights, so publishing a conversion of them openly would be
+# redistribution under no grant. CI fetching from our own private repository is
+# USE, which is the line NOTICE already draws. The consequence is that the
+# `identity` shard cannot stage this table without a Hugging Face read token;
+# see that shard's comment in ci.yml.
+#
+# The revision is the ARTIFACT repo's commit SHA, and it is the one
+# tests/identity/common/mod.rs's per-file SHA-256 manifest was cut against. Do
+# not confuse it with the upstream SOURCE pins — the `.pt` asset's sha256 and the
+# `IDRnD/redimnet` model-source revision — which name what the CONVERSION
+# consumed; both live in tests/identity/common/mod.rs beside it, and
+# `provenance_is_pinned` asserts the two chains are not the same string.
+["FinDIT-Studio/redimnetkit-coreml"]
+kit       = "identity"
+include   = "redimnet_b5.mlmodelc/* CHECKSUMS.sha256"
+revision  = "80c2d0a40b0bacc738db2d8607470515afd9d405"
+local-dir = "Models/redimnet"
