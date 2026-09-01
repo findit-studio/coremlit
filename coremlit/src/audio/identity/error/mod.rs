@@ -191,6 +191,18 @@ pub enum Error {
   #[error("audio input contains a non-finite sample at index {0}")]
   NonFiniteInput(usize),
 
+  /// The loaded graph declares a REQUIRED input this door never supplies, so
+  /// every prediction through it would fail.
+  ///
+  /// Carries the offending feature name. An OPTIONAL extra input is not this:
+  /// CoreML runs a prediction that omits one, so only a required input the
+  /// caller cannot fill makes the contract unsatisfiable.
+  #[error(
+    "model declares a required input `{0}` that this door never supplies; \
+     it sends `mel` and nothing else, so every prediction would fail"
+  )]
+  UnsatisfiableInput(String),
+
   /// A model output component was NaN or infinite — model corruption, caught
   /// before the raw vector reaches a caller's normalization, where it would
   /// turn the whole embedding into NaNs.

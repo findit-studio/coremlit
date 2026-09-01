@@ -96,7 +96,7 @@
 mod common;
 
 use coremlit::{
-  ComputeUnits, DataType, Model,
+  ComputeUnits, DataType, Model, ShapeConstraint,
   audio::vad::{CHUNK_SAMPLES, MODEL_INPUT_SAMPLES, STATE_SIZE, VadModel, VadModelOptions},
 };
 
@@ -145,6 +145,42 @@ fn silero_vad_unified_io_matches_metadata() {
   // not a CoreML MLState buffer (which `supports_state()` would report).
   assert_eq!(description.inputs().len(), 3, "exactly 3 declared inputs");
   assert_eq!(description.outputs().len(), 3, "exactly 3 declared outputs");
+
+  // The optionality and shape-constraint halves of the metadata snapshot,
+  // pinned against a REAL model — this bundle's own `metadata.json` records
+  // `isOptional: "0"` and `hasShapeFlexibility: "0"` for every one of these
+  // six features, and this is where the Objective-C wiring behind
+  // `FeatureInfo::is_optional` / `FeatureInfo::shape_constraint` is checked
+  // against it. Nothing here needs either fact; it is asserted because this is
+  // the only kit whose artifact a shard actually stages, and the door that
+  // DOES depend on them (`audio::identity`, which refuses anything but
+  // `ShapeConstraint::Fixed`) has never had its model staged in CI.
+  //
+  // Note what `Fixed` is NOT read off: a fixed-shape export reports CoreML's
+  // `MLMultiArrayShapeConstraintTypeEnumerated`, not `…Unspecified`, so the
+  // verdict comes from the per-axis spans. See `ShapeConstraint`.
+  //
+  // ONE DIRECTION ONLY, for `is_optional`. Every feature here is required, so
+  // this catches a snapshot that reported `true` and NOT one hardcoded to
+  // `false` — verified by mutation, which this gate survives. No artifact any
+  // shard in this repository stages declares an optional feature, so nothing
+  // here can pin that half; `audio::identity`'s tolerance of an optional extra
+  // input rests on the CoreML contract, not on a measurement. The
+  // shape-constraint half has both directions: `Fixed` is asserted here, and
+  // `classify_shape_constraint`'s unit tests cover the rest of the vocabulary.
+  for feature in description.inputs().iter().chain(description.outputs()) {
+    assert!(
+      !feature.is_optional(),
+      "{}: every feature of this bundle is declared required",
+      feature.name()
+    );
+    assert_eq!(
+      feature.shape_constraint(),
+      Some(ShapeConstraint::Fixed),
+      "{}: `hasShapeFlexibility: \"0\"` must reach the snapshot as `Fixed`",
+      feature.name()
+    );
+  }
 
   // The construction-time contract validator accepts the real model.
   VadModel::load_with(

@@ -65,12 +65,78 @@ pub struct Model {
 // out.
 unsafe impl Send for Model {}
 
+/// How many shapes a model will accept for one multi-array feature.
+///
+/// # This is DERIVED, not the raw `type` code
+///
+/// `MLMultiArrayShapeConstraint` carries a `type`
+/// (`MLMultiArrayShapeConstraintType`), and it does **not** answer the
+/// question. A graph converted at a plain fixed shape — no `RangeDim`, no
+/// enumerated shapes — reports `…TypeEnumerated` (raw `2`), never
+/// `…TypeUnspecified`. Measured on the staged
+/// `silero-vad-unified-256ms-v6.2.1.mlmodelc`, whose `metadata.json` records
+/// `hasShapeFlexibility: "0"` for every one of its six features: each reports
+/// raw type `2`, one enumerated shape equal to [`FeatureInfo::shape`], and one
+/// `sizeRangeForDimension` entry per axis with **length 1**.
+///
+/// So the verdict is read off the constraint's CONTENTS — how many sizes each
+/// axis admits — rather than off its code. A door that matched the raw code
+/// would reject every fixed-shape artifact this crate ships.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display)]
+#[non_exhaustive]
+pub enum ShapeConstraint {
+  /// Exactly one shape is accepted, and [`FeatureInfo::shape`] is it: every
+  /// axis admits exactly one size.
+  #[display("fixed")]
+  Fixed,
+  /// A list of two or more accepted shapes; [`FeatureInfo::shape`] is the
+  /// default, not the only one.
+  #[display("enumerated")]
+  Enumerated,
+  /// At least one axis admits a range of sizes (`RangeDims`);
+  /// [`FeatureInfo::shape`] is the default, not a bound.
+  #[display("range")]
+  Range,
+  /// The constraint records nothing that decides how many shapes are accepted
+  /// — no per-axis sizes at all. Carries the raw
+  /// `MLMultiArrayShapeConstraintType` for diagnosis. Deliberately NOT read as
+  /// "fixed": a caller that needs a fixed shape needs it established, and this
+  /// does not establish it.
+  #[display("unknown({_0})")]
+  Unknown(isize),
+}
+
+/// Classify one multi-array shape constraint from its contents.
+///
+/// `axis_spans` is how many sizes each axis admits (one entry per dimension,
+/// `NSRange::length` from `sizeRangeForDimension`); `enumerated_shapes` is
+/// `enumeratedShapes.count`. A free function over plain numbers so the whole
+/// vocabulary is exercisable with no model present.
+fn classify_shape_constraint(
+  raw_type: isize,
+  enumerated_shapes: usize,
+  axis_spans: &[usize],
+) -> ShapeConstraint {
+  if axis_spans.is_empty() {
+    return ShapeConstraint::Unknown(raw_type);
+  }
+  if axis_spans.iter().all(|span| *span == 1) {
+    return ShapeConstraint::Fixed;
+  }
+  if enumerated_shapes > 1 {
+    return ShapeConstraint::Enumerated;
+  }
+  ShapeConstraint::Range
+}
+
 /// Shape/type info for one model input or output feature.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeatureInfo {
   name: String,
   shape: Vec<usize>,
   data_type: Option<DataType>,
+  optional: bool,
+  shape_constraint: Option<ShapeConstraint>,
 }
 
 impl FeatureInfo {
@@ -81,6 +147,12 @@ impl FeatureInfo {
   }
 
   /// Constrained dimensions; empty when the model leaves them open.
+  ///
+  /// For a feature whose [`Self::shape_constraint`] is not
+  /// [`ShapeConstraint::Fixed`] this is the graph's DEFAULT shape, not a
+  /// bound: a `RangeDims` input reports a shape it will happily accept others
+  /// beside. Pinning a value read from here is only sound once the constraint
+  /// says the value is the only one.
   #[inline(always)]
   pub fn shape(&self) -> &[usize] {
     &self.shape
@@ -90,6 +162,24 @@ impl FeatureInfo {
   #[inline(always)]
   pub const fn data_type(&self) -> Option<DataType> {
     self.data_type
+  }
+
+  /// Whether the model declares this feature optional — a prediction that
+  /// omits it still runs.
+  ///
+  /// The complement is what matters at load: a REQUIRED input a caller never
+  /// supplies makes every prediction fail, so a door that checks only the
+  /// features it does send accepts a contract it cannot honour.
+  #[inline(always)]
+  pub const fn is_optional(&self) -> bool {
+    self.optional
+  }
+
+  /// How many shapes the model accepts for this feature; `None` for a
+  /// non-multi-array feature, which carries no such constraint.
+  #[inline(always)]
+  pub const fn shape_constraint(&self) -> Option<ShapeConstraint> {
+    self.shape_constraint
   }
 }
 
@@ -135,20 +225,35 @@ fn snapshot_features(
     let description = descriptions.objectForKey(&name).expect("key from keys()");
     // SAFETY: accessor sends; multiArrayConstraint is nil for
     // non-multi-array features.
-    let (shape, data_type) = unsafe {
+    let (shape, data_type, shape_constraint) = unsafe {
       description
         .multiArrayConstraint()
-        .map_or((Vec::new(), None), |constraint| {
+        .map_or((Vec::new(), None, None), |constraint| {
+          let shape_constraint = constraint.shapeConstraint();
+          let axis_spans: Vec<usize> = shape_constraint
+            .sizeRangeForDimension()
+            .iter()
+            .map(|range| range.rangeValue().length)
+            .collect();
           (
             constraint.shape().iter().map(|n| n.as_usize()).collect(),
             Some(DataType::from_raw(constraint.dataType().0)),
+            Some(classify_shape_constraint(
+              shape_constraint.r#type().0,
+              shape_constraint.enumeratedShapes().len(),
+              &axis_spans,
+            )),
           )
         })
     };
+    // SAFETY: accessor send on a live feature description.
+    let optional = unsafe { description.isOptional() };
     features.push(FeatureInfo {
       name: name.to_string(),
       shape,
       data_type,
+      optional,
+      shape_constraint,
     });
   }
   features.sort_by(|a, b| a.name.cmp(&b.name));

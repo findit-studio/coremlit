@@ -23,7 +23,7 @@
 mod common;
 
 use coremlit::{
-  ComputeUnits, DataType, Model, MultiArray,
+  ComputeUnits, DataType, Model, MultiArray, ShapeConstraint,
   audio::identity::{
     EMBEDDING_DIM, Embedder, EmbedderOptions, Error, N_FRAMES, N_MELS, SAMPLE_RATE_HZ,
     WINDOW_SAMPLES,
@@ -96,6 +96,23 @@ fn a_wrong_length_clip_is_refused_before_any_model_is_needed() {
 /// The declared I/O contract, read off the real model. Fixed shapes on both
 /// sides: the conversion refuses a `RangeDim` input on purpose, because a
 /// flexible input takes the graph off the ANE.
+///
+/// `shape()` alone cannot say that. A `RangeDims` input reports its DEFAULT
+/// shape through the snapshot, so a flexible graph converted at
+/// `[1, 72, 401]` satisfies every assertion about the numbers — which is why
+/// [`coremlit::FeatureInfo::shape_constraint`] is asserted here as well, and
+/// why `Embedder::load` refuses anything but
+/// [`coremlit::ShapeConstraint::Fixed`].
+///
+/// **This is also where a prediction about the artifact gets settled.** The
+/// classification was measured on a DIFFERENT fixed-shape export (the staged
+/// silero VAD bundle, `hasShapeFlexibility: "0"`, which reports raw
+/// constraint type 2 with one enumerated shape and unit spans). The redimnet
+/// bundle is converted the same way — `ct.TensorType(shape=(1, 72, 401))`,
+/// no `RangeDim` — so it is EXPECTED to classify `Fixed`; nothing in this
+/// repository has confirmed it, because the artifact has never been staged.
+/// If that prediction is wrong, `Embedder::load` refuses the artifact and
+/// this assertion is what says so, on the first run that stages it.
 #[test]
 #[ignore = "requires the staged identity model (IDENTITY_TEST_MODELS)"]
 fn model_declares_the_pinned_io_contract() {
@@ -105,13 +122,39 @@ fn model_declares_the_pinned_io_contract() {
   let input = description.input("mel").expect("`mel` input");
   assert_eq!(input.shape(), [1, N_MELS, N_FRAMES]);
   assert_eq!(input.data_type(), Some(DataType::F32));
+  assert_eq!(
+    input.shape_constraint(),
+    Some(ShapeConstraint::Fixed),
+    "the mel input must accept exactly one shape; a flexible one reports the same NUMBERS \
+     through `shape()` and takes the graph off the accelerator"
+  );
 
   let output = description.output("embedding").expect("`embedding` output");
   assert_eq!(output.shape(), [1, EMBEDDING_DIM]);
   assert_eq!(output.data_type(), Some(DataType::F32));
+  assert_eq!(output.shape_constraint(), Some(ShapeConstraint::Fixed));
 
   assert_eq!(description.inputs().len(), 1, "exactly one input");
   assert_eq!(description.outputs().len(), 1, "exactly one output");
+  assert!(
+    !input.is_optional(),
+    "the one input this door supplies is the one the graph requires"
+  );
+
+  // The COMPLETE input set, not just the feature the door sends. A graph
+  // carrying `mel` plus a second REQUIRED input satisfies every per-feature
+  // assertion above and then fails on every prediction, because `embed`
+  // supplies `mel` and nothing else.
+  let unsatisfiable: Vec<&str> = description
+    .inputs()
+    .iter()
+    .filter(|f| f.name() != "mel" && !f.is_optional())
+    .map(coremlit::FeatureInfo::name)
+    .collect();
+  assert!(
+    unsatisfiable.is_empty(),
+    "the graph requires {unsatisfiable:?}, which this door never sends"
+  );
 }
 
 /// The staged bundle is byte-for-byte the pinned artifact — exact file set,

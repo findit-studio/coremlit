@@ -131,7 +131,9 @@ Two notes on the modelling, both deliberate:
   is what it used to mean: `Terms::permits_a_shipping_claim` is a SECOND axis, false for
   `Unresolved` as well as for `ResearchOnly`, and
   `no_ungranted_artifact_is_reachable_from_default` refuses to let this row be reachable
-  from the default feature set. Adding a `commercial-` gate over it would not trip
+  from the default feature set — reading `default` through the real TOML parser, so the
+  refusal holds for every spelling Cargo obeys and not only the one the check was first
+  mutation-tested in. Adding a `commercial-` gate over it would not trip
   direction 3 either — `every_commercial_feature_gates_an_artifact_with_no_shipping_grant`
   accepts an unresolved row as a cause a gate may stand on, and says in its own failure
   text that the cause is an open question rather than a found prohibition.

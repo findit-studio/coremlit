@@ -36,8 +36,11 @@
 //! ```
 //!
 //! Fixed shape, never `RangeDim` — a flexible input takes the graph off the
-//! ANE. Batch is 1: this lane embeds one window, and the diarization embedder's
-//! batch-3 shape is a slot artifact that does not apply here.
+//! ANE, and [`Embedder::load`] ENFORCES that rather than restating it: the
+//! declared shape is the same either way, so the door reads the model's shape
+//! CONSTRAINT and refuses anything that accepts more than one shape. Batch is
+//! 1: this lane embeds one window, and the diarization embedder's batch-3
+//! shape is a slot artifact that does not apply here.
 //!
 //! ## The output is RAW, and the caller normalizes
 //!
@@ -117,7 +120,7 @@
 
 use std::path::Path;
 
-use crate::{ComputeUnits, DataType, Model, MultiArray};
+use crate::{ComputeUnits, DataType, Model, MultiArray, ShapeConstraint};
 
 pub mod error;
 
@@ -285,16 +288,30 @@ impl Embedder {
   /// Loads the identity `.mlmodelc` from `model_path` with custom `options` —
   /// the primary constructor. Pins the model's I/O contract against the
   /// metadata at load (`mel` `[1, 72, 401]` f32 in, `embedding` `[1, 192]` f32
-  /// out), by NAME, shape and element type: a graph that declares the right
-  /// shape as fp16, or spells a feature differently, is refused here rather
-  /// than at the first prediction.
+  /// out), by NAME, shape, element type **and shape constraint**: a graph that
+  /// declares the right shape as fp16, spells a feature differently, or accepts
+  /// more than the one shape, is refused here rather than at the first
+  /// prediction.
+  ///
+  /// It also checks the COMPLETE input set, not only the feature it sends. Two
+  /// things a per-feature check cannot see are what make that necessary:
+  ///
+  ///   - a graph carrying `mel` plus another REQUIRED input passes every
+  ///     per-feature check and then fails on every prediction, because
+  ///     [`Self::embed`] supplies `mel` and nothing else;
+  ///   - a `RangeDims` input reports its DEFAULT shape through
+  ///     [`crate::FeatureInfo::shape`], so a flexible graph converted at
+  ///     `[1, 72, 401]` declares this contract's exact numbers — and a flexible
+  ///     input is what takes the graph off the accelerator, which is the one
+  ///     reason the conversion recipe pins a fixed shape.
   ///
   /// No model is bundled: the `.mlmodelc` is a directory artifact, staged
   /// gitignored under `Models/redimnet/` from the `MODELS_LOCK` table.
   ///
   /// # Errors
   /// [`Error::Load`] if CoreML rejects the model; [`Error::ContractMismatch`]
-  /// if its I/O contract mismatches.
+  /// if its I/O contract mismatches; [`Error::UnsatisfiableInput`] if it
+  /// requires an input this door never sends.
   pub fn load(model_path: impl AsRef<Path>, options: EmbedderOptions) -> Result<Self> {
     let model = Model::load(model_path, options.compute())?;
     let description = model.description();
@@ -304,14 +321,20 @@ impl Embedder {
       &[1, N_MELS, N_FRAMES],
       description
         .input(names::MEL)
-        .map(|f| (f.shape(), f.data_type())),
+        .map(|f| (f.shape(), f.data_type(), f.shape_constraint())),
     )?;
     check_feature(
       names::EMBEDDING,
       &[1, EMBEDDING_DIM],
       description
         .output(names::EMBEDDING)
-        .map(|f| (f.shape(), f.data_type())),
+        .map(|f| (f.shape(), f.data_type(), f.shape_constraint())),
+    )?;
+    check_input_set(
+      description
+        .inputs()
+        .iter()
+        .map(|f| (f.name(), f.is_optional())),
     )?;
 
     Ok(Self {
@@ -394,39 +417,90 @@ impl Embedder {
 
 /// Check one declared model feature against the contract.
 ///
-/// A free function over `(name, expected shape, declared shape + dtype)` and
-/// nothing else, so the whole load-time contract check is exercisable with no
-/// model present — which matters here more than usual, because until a CI shard
-/// stages the artifact this is the only way any of it runs at all. `declared`
-/// is `None` when the model has no feature of that name.
+/// A free function over `(name, expected shape, declared shape + dtype + shape
+/// constraint)` and nothing else, so the whole load-time contract check is
+/// exercisable with no model present — which matters here more than usual,
+/// because until a CI shard stages the artifact this is the only way any of it
+/// runs at all. `declared` is `None` when the model has no feature of that
+/// name.
+///
+/// # Why the shape constraint is checked and not just the shape
+///
+/// [`crate::FeatureInfo::shape`] reports the DEFAULT shape of a flexible
+/// input, not a bound, so a `RangeDims` graph converted at `[1, 72, 401]`
+/// declares exactly this contract's numbers and the numbers alone cannot tell
+/// the two apart. Fixed shape is the reason this graph stays on the
+/// accelerator at all — the conversion recipe refuses `RangeDim` for that
+/// reason and nothing else — so a flexible graph would load, predict, and cost
+/// the placement the whole conversion was designed around, silently. Only
+/// [`ShapeConstraint::Fixed`] is accepted: an absent constraint and an
+/// [`ShapeConstraint::Unknown`] one are refused too, because "fixed" is a fact
+/// that has to be established rather than a default to fall back on.
 ///
 /// # Errors
 /// [`Error::ContractMismatch`] if the feature is missing, has a different
-/// shape, or is not `float32`.
+/// shape, is not `float32`, or does not accept exactly one shape.
 fn check_feature(
   feature: &'static str,
   expected_shape: &[usize],
-  declared: Option<(&[usize], Option<DataType>)>,
+  declared: Option<(&[usize], Option<DataType>, Option<ShapeConstraint>)>,
 ) -> Result<()> {
-  let expected = describe(expected_shape, Some(DataType::F32));
+  let expected = describe(
+    expected_shape,
+    Some(DataType::F32),
+    Some(ShapeConstraint::Fixed),
+  );
   match declared {
     None => Err(Error::ContractMismatch(ContractMismatch::new(
       feature,
       expected,
       "missing".to_string(),
     ))),
-    Some((shape, dtype)) => {
-      if shape == expected_shape && dtype == Some(DataType::F32) {
+    Some((shape, dtype, constraint)) => {
+      if shape == expected_shape
+        && dtype == Some(DataType::F32)
+        && constraint == Some(ShapeConstraint::Fixed)
+      {
         Ok(())
       } else {
         Err(Error::ContractMismatch(ContractMismatch::new(
           feature,
           expected,
-          describe(shape, dtype),
+          describe(shape, dtype, constraint),
         )))
       }
     }
   }
+}
+
+/// Check the model's COMPLETE input set against what `embed` actually sends.
+///
+/// [`check_feature`] pins the features this door DOES send; this pins the ones
+/// it does not. A graph carrying the expected `mel` plus a second REQUIRED
+/// input satisfies every name/shape/dtype check and then fails on every
+/// prediction, because [`Embedder::embed`] supplies `mel` and nothing else — so
+/// `load` would have accepted a contract it cannot honour.
+///
+/// An OPTIONAL extra input is not that: CoreML runs a prediction that omits
+/// one. Optionality is exactly the distinction this needs, and it is why
+/// [`crate::FeatureInfo`] retains it — a count of inputs cannot tell the two
+/// apart.
+///
+/// A free function over `(name, optional)` pairs, so it is exercisable with no
+/// model present. `snapshot_features` sorts by name, so the offender this
+/// reports is stable across loads rather than an artefact of CoreML's
+/// dictionary order.
+///
+/// # Errors
+/// [`Error::UnsatisfiableInput`] naming the first required input that is not
+/// [`names::MEL`].
+fn check_input_set<'a>(declared: impl IntoIterator<Item = (&'a str, bool)>) -> Result<()> {
+  for (name, optional) in declared {
+    if name != names::MEL && !optional {
+      return Err(Error::UnsatisfiableInput(name.to_string()));
+    }
+  }
+  Ok(())
 }
 
 /// Reject a window the pipeline must not see: one that is not exactly
@@ -458,7 +532,13 @@ fn check_finite_embedding(embedding: &[f32]) -> Result<()> {
 }
 
 /// Human-readable `shape dtype` rendering for [`Error::ContractMismatch`].
-fn describe(shape: &[usize], dtype: Option<DataType>) -> String {
+fn describe(
+  shape: &[usize],
+  dtype: Option<DataType>,
+  constraint: Option<ShapeConstraint>,
+) -> String {
   let dtype = dtype.map_or("none", |d| d.as_str());
-  format!("{shape:?} {dtype}")
+  let constraint =
+    constraint.map_or_else(|| "none".to_string(), |constraint| constraint.to_string());
+  format!("{shape:?} {dtype} {constraint}")
 }

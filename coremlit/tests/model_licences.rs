@@ -118,6 +118,27 @@
 //! `identity` gate from `src/audio/mod.rs`, or put a kit feature into
 //! `default`, and it reds against the real table with no doctoring at all.
 //!
+//! **And that last claim is worth exactly as much as the manifest reader
+//! behind it.** It was first checked by writing one mutation — `default =
+//! ["identity"]`, in the one formatting it happened to be typed in — and the
+//! reader it was checked against was hand-rolled: it skipped indented lines,
+//! split on the first `=`, and pulled DOUBLE-quoted runs out of the value. Six
+//! spellings Cargo obeys defeated all three steps (an indented key, a literal
+//! `'…'` string, a quoted key, a `#` comment carrying `]` inside a multi-line
+//! array, a `features.default` dotted key, a `[ features ]` header), and under
+//! every one of them `default`'s closure came back as `{"default"}` and the
+//! clause stayed GREEN on a manifest that ships the bytes. The reader is now
+//! [`declared_features`], which is the real `toml` parser and fails closed;
+//! `falsifiers::the_reader_sees_default_under_every_valid_spelling` and
+//! `falsifiers::direction_two_reds_from_default_under_every_valid_spelling`
+//! carry all six spellings and report every one that regresses in a single
+//! run, and
+//! `falsifiers::an_undecodable_manifest_panics_rather_than_reading_as_empty`
+//! pins the fail-closed half. So the claim above now reads: it reds against
+//! the real table for every spelling of `default` the manifest can be written
+//! in — which is what it always meant, and not what it had been measured
+//! against.
+//!
 //! What "cannot fire" does NOT mean is "reads nothing". Directions 2 and 3
 //! bind live data today even though nothing can trip them: the gate every row
 //! runs on is read out of the tree's `#[cfg(feature = ...)]` by
@@ -2009,12 +2030,12 @@ fn read_rel(rel: &str) -> String {
     .unwrap_or_else(|e| panic!("read {rel}: {e}"))
 }
 
-/// The `[features]` block of this crate's manifest, comments included.
-fn features_block() -> String {
-  features_block_of(&read_rel("Cargo.toml"))
+/// This crate's manifest, verbatim.
+fn manifest_text() -> String {
+  read_rel("Cargo.toml")
 }
 
-/// The same block, read from the manifest the REPOSITORY holds rather than the
+/// The same manifest, read from the file the REPOSITORY holds rather than the
 /// one the compiling package happens to sit next to.
 ///
 /// `cargo package` re-serialises the manifest into the tarball and DROPS EVERY
@@ -2023,19 +2044,78 @@ fn features_block() -> String {
 /// need only names or entries are happy with either. `None` outside the
 /// repository workspace, where the comment-bearing manifest is not present at
 /// all and the rule is simply unverifiable.
-fn repository_features_block() -> Option<String> {
+fn repository_manifest_text() -> Option<String> {
   let root = workspace_root::try_workspace_root()?;
   let manifest = root.join("coremlit/Cargo.toml");
   if !manifest.is_file() {
     eprintln!("model_licences: no comment-bearing manifest; the doc rule is skipped");
     return None;
   }
-  let text = std::fs::read_to_string(&manifest)
-    .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display()));
-  Some(features_block_of(&text))
+  Some(
+    std::fs::read_to_string(&manifest)
+      .unwrap_or_else(|e| panic!("read {}: {e}", manifest.display())),
+  )
 }
 
-/// The `[features]` block of `manifest`, comments included.
+/// The `[features]` table of `manifest`, decoded by the REAL TOML parser.
+///
+/// # Why this is not hand-rolled any more
+///
+/// It was, and the reader was a hole. It skipped every line beginning with
+/// whitespace, split on the first `=`, and pulled the DOUBLE-quoted runs out of
+/// the value. TOML permits all of the following, and Cargo obeys every one:
+///
+/// ```text
+///   ␣␣default = ["identity"]     an indented key — skipped outright
+///   default = ['identity']       a literal string — no `"` to split on
+///   "default" = ["identity"]     a quoted key — never equal to `default`
+///   default = [ # note ]         a `#` comment carrying `]` — value ends early
+///     "identity",
+///   ]
+///   [ features ]                 a non-canonical header — block came back empty
+///   features.default = [...]     a dotted key — no header to find at all
+/// ```
+///
+/// Each one made `default` look EMPTY, and an empty `default` closure is
+/// exactly what [`no_ungranted_artifact_is_reachable_from_default`] reads as
+/// "nothing ungranted ships without an opt-in". A reader that cannot see a
+/// spelling Cargo obeys is not a check; it is a check-shaped comment.
+///
+/// # Fails closed
+///
+/// A manifest that does not decode, that declares no `[features]` table, or
+/// whose entries are not arrays of strings PANICS here. The alternative —
+/// returning an empty map — would let every reachability check pass vacuously
+/// on a manifest nobody could read, which is the failure mode this function
+/// exists to remove.
+fn declared_features(manifest: &str) -> BTreeMap<String, Vec<String>> {
+  let document: toml::Table = toml::from_str(manifest).unwrap_or_else(|e| {
+    panic!(
+      "the manifest under test does not decode as TOML: {e}. This check reads `default`'s \
+       closure to decide whether an ungranted artifact ships; a manifest it cannot read is a \
+       manifest it cannot clear."
+    )
+  });
+  let features = document.get("features").cloned().unwrap_or_else(|| {
+    panic!(
+      "the manifest under test declares no `features` table. An absent feature graph is not an \
+       empty one: every reachability check here would pass vacuously on it."
+    )
+  });
+  features.try_into().unwrap_or_else(|e| {
+    panic!(
+      "the manifest's `[features]` table is not a map of string arrays: {e}. A feature whose \
+       entries this check cannot decode is a feature whose closure it cannot compute."
+    )
+  })
+}
+
+/// The `[features]` block of `manifest` as TEXT, comments included.
+///
+/// Only [`feature_docs`] and its vacuity guard read this: comments are the one
+/// thing a TOML parser drops, so the doc rule has no alternative to scanning
+/// lines. Nothing that decides REACHABILITY comes through here — that is
+/// [`declared_features`]'s job, and the split is the point.
 fn features_block_of(manifest: &str) -> String {
   let mut out = String::new();
   let mut inside = false;
@@ -2052,78 +2132,35 @@ fn features_block_of(manifest: &str) -> String {
   out
 }
 
-/// The declared feature names.
-fn feature_names(block: &str) -> BTreeSet<String> {
-  let mut names = BTreeSet::new();
-  for line in block.lines() {
-    if line.starts_with(char::is_whitespace) {
-      continue;
-    }
-    let trimmed = line.trim_start();
-    if trimmed.is_empty() || trimmed.starts_with('#') {
-      continue;
-    }
-    if let Some((key, _)) = line.split_once('=') {
-      let key = key.trim();
-      if !key.is_empty() && !key.contains(char::is_whitespace) {
-        names.insert(key.to_string());
-      }
-    }
-  }
-  names
+/// The declared feature names, as the TOML parser sees them.
+fn feature_names(manifest: &str) -> BTreeSet<String> {
+  declared_features(manifest).into_keys().collect()
 }
 
-/// One feature's entries — the quoted contents of its `[..]` value, spread
-/// over as many lines as rustfmt/taplo left it on.
-fn feature_entries(block: &str, feature: &str) -> Vec<String> {
-  let mut collecting = false;
-  let mut buf = String::new();
-  for line in block.lines() {
-    if collecting {
-      buf.push('\n');
-      buf.push_str(line);
-      if line.contains(']') {
-        break;
-      }
-      continue;
-    }
-    if line.starts_with(char::is_whitespace) {
-      continue;
-    }
-    let Some((key, rest)) = line.split_once('=') else {
-      continue;
-    };
-    if key.trim() != feature {
-      continue;
-    }
-    collecting = true;
-    buf.push_str(rest);
-    if rest.contains(']') {
-      break;
-    }
-  }
-  buf
-    .split('"')
-    .skip(1)
-    .step_by(2)
-    .map(str::to_string)
-    .collect()
+/// One feature's entries, as the TOML parser sees them. Empty for a feature the
+/// manifest does not declare — which [`declared_features`] guarantees is a real
+/// absence rather than a spelling this reader could not see.
+fn feature_entries(manifest: &str, feature: &str) -> Vec<String> {
+  declared_features(manifest)
+    .remove(feature)
+    .unwrap_or_default()
 }
 
 /// Every feature transitively enabled by `seed`, `seed` included.
 ///
 /// Entries naming a dependency (`dep:x`) or a dependency's own feature (`x/y`)
 /// are not this crate's features and do not extend the closure.
-fn feature_closure(block: &str, seed: &str) -> BTreeSet<String> {
+fn feature_closure(manifest: &str, seed: &str) -> BTreeSet<String> {
+  let declared = declared_features(manifest);
   let mut seen = BTreeSet::new();
   let mut queue = vec![seed.to_string()];
   while let Some(feature) = queue.pop() {
     if !seen.insert(feature.clone()) {
       continue;
     }
-    for entry in feature_entries(block, &feature) {
+    for entry in declared.get(&feature).into_iter().flatten() {
       if !entry.starts_with("dep:") && !entry.contains('/') {
-        queue.push(entry);
+        queue.push(entry.clone());
       }
     }
   }
@@ -2134,7 +2171,16 @@ fn feature_closure(block: &str, seed: &str) -> BTreeSet<String> {
 ///
 /// A blank line ends a block, so a comment about the section above cannot be
 /// mistaken for documentation of the feature below it.
-fn feature_docs(block: &str) -> BTreeMap<String, String> {
+///
+/// Necessarily textual — a TOML parser drops comments — and therefore
+/// deliberately conservative about which keys it recognises: it reads the
+/// unindented, unquoted spelling and nothing else. That is safe here in a way
+/// it was NOT safe in the reachability readers, because the set of features
+/// this rule must find documentation FOR comes from [`declared_features`]. A
+/// feature spelled in a way this scanner cannot see therefore arrives with no
+/// documentation and is reported as undocumented — red, never green.
+fn feature_docs(manifest: &str) -> BTreeMap<String, String> {
+  let block = features_block_of(manifest);
   let mut docs = BTreeMap::new();
   let mut pending: Vec<&str> = Vec::new();
   for line in block.lines() {
@@ -2634,8 +2680,8 @@ fn every_fp16_pinned_bundle_under_a_staged_vendor_has_a_licence_row() {
 /// the tree and the closures from the manifest, both read live.
 #[test]
 fn no_research_only_artifact_is_reachable_without_a_commercial_gate() {
-  let block = features_block();
-  let closures = feature_closures(&block);
+  let manifest = manifest_text();
+  let closures = feature_closures(&manifest);
   let derived = derived_gates(ARTIFACTS);
   let failures = research_only_reachable(ARTIFACTS, &derived, &closures);
   assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -2653,8 +2699,8 @@ fn no_research_only_artifact_is_reachable_without_a_commercial_gate() {
 /// and this goes red now, on today's table.
 #[test]
 fn no_ungranted_artifact_is_reachable_from_default() {
-  let block = features_block();
-  let closure = feature_closure(&block, "default");
+  let manifest = manifest_text();
+  let closure = feature_closure(&manifest, "default");
   let derived = derived_gates(ARTIFACTS);
   let failures = ungranted_reachable_from_default(ARTIFACTS, &derived, &closure);
   assert!(failures.is_empty(), "{}", failures.join("\n"));
@@ -2664,8 +2710,8 @@ fn no_ungranted_artifact_is_reachable_from_default() {
 /// are granted at both layers, and none gates nothing at all in the source.
 #[test]
 fn every_commercial_feature_gates_an_artifact_with_no_shipping_grant() {
-  let block = features_block();
-  let features = feature_names(&block);
+  let manifest = manifest_text();
+  let features = feature_names(&manifest);
   let derived = derived_gates(ARTIFACTS);
   let failures = commercial_features_gating_nothing_restricted(
     ARTIFACTS,
@@ -2686,7 +2732,7 @@ fn every_commercial_feature_gates_an_artifact_with_no_shipping_grant() {
 /// about a gate that does not exist.
 #[test]
 fn every_rows_gate_matches_the_cfg_that_guards_its_loader() {
-  let declared = feature_names(&features_block());
+  let declared = feature_names(&manifest_text());
   for row in ARTIFACTS {
     let gates = loader_gates(row.loader);
     assert_eq!(
@@ -2761,16 +2807,16 @@ fn every_rows_loader_module_is_the_kit_its_lock_table_names() {
 /// backwards.
 #[test]
 fn every_commercial_feature_says_it_requires_a_commercial_licence_first() {
-  let Some(block) = repository_features_block() else {
+  let Some(manifest) = repository_manifest_text() else {
     return;
   };
   assert!(
-    block.contains('#'),
+    features_block_of(&manifest).contains('#'),
     "the `[features]` block read for the doc rule carries no comments at all, so the rule would \
      pass vacuously. That is the stripped manifest `cargo package` writes, not the checked-in one."
   );
-  let features = feature_names(&block);
-  let docs = feature_docs(&block);
+  let features = feature_names(&manifest);
+  let docs = feature_docs(&manifest);
   let failures = commercial_features_without_the_phrase(&features, &docs);
   assert!(failures.is_empty(), "{}", failures.join("\n"));
 }
@@ -2783,8 +2829,8 @@ fn every_commercial_feature_says_it_requires_a_commercial_licence_first() {
 /// trivially; it stops holding the moment somebody adds one.
 #[test]
 fn no_commercial_feature_is_reachable_from_default() {
-  let block = features_block();
-  let closure = feature_closure(&block, "default");
+  let manifest = manifest_text();
+  let closure = feature_closure(&manifest, "default");
   let leaked: Vec<&String> = closure
     .iter()
     .filter(|f| f.starts_with(COMMERCIAL_PREFIX))
@@ -3242,8 +3288,9 @@ mod falsifiers {
     Artifact, CREDIT_AUTHOR, Covered, Key, NOTHING_ESTABLISHED, RETAIN_NOTICE, Selection,
     StagedTable, Terms, commercial_features_gating_nothing_restricted,
     commercial_features_without_the_phrase, contradictory_terms, feature_closure, feature_closures,
-    feature_docs, feature_names, first_sentence, fp16_pinned_bundles_without_a_row, glob_matches,
-    research_only_reachable, ungranted_reachable_from_default, unmatched_coverage,
+    feature_docs, feature_entries, feature_names, first_sentence,
+    fp16_pinned_bundles_without_a_row, glob_matches, research_only_reachable,
+    ungranted_reachable_from_default, unmatched_coverage,
   };
 
   /// A row with everything but the fields a given test is about.
@@ -3283,6 +3330,7 @@ mod falsifiers {
   /// The manifest shape that exposed the hole: an ordinary kit feature, and
   /// `default` turning it on.
   const SHIPS_IT_BY_DEFAULT: &str = "\
+[features]
 default = [\"identity\"]
 identity = [\"dep:rustfft\"]
 ";
@@ -3290,6 +3338,7 @@ identity = [\"dep:rustfft\"]
   /// The same manifest with the feature left as an opt-in — this crate's
   /// actual shape.
   const OPT_IN_ONLY: &str = "\
+[features]
 default = []
 identity = [\"dep:rustfft\"]
 ";
@@ -3640,6 +3689,7 @@ identity = [\"dep:rustfft\"]
   /// A manifest whose `default` is empty and whose kit features are ordinary —
   /// the shape this crate has today.
   const CLEAN_FEATURES: &str = "\
+[features]
 default = []
 speaker = [\"dep:diaric\"]
 # Requires a commercial licence from the weights' author.
@@ -3651,6 +3701,7 @@ commercial-face = [\"dep:facelib\"]
   /// the row's claimed gate carries the prefix, so a claim-driven check passes
   /// while `cargo add coremlit --features speaker` ships the restricted bytes.
   const REACHABLE_VIA_A_PLAIN_FEATURE: &str = "\
+[features]
 default = []
 speaker = [\"dep:diaric\", \"commercial-face\"]
 # Requires a commercial licence from the weights' author.
@@ -3695,6 +3746,7 @@ commercial-face = [\"dep:facelib\"]
   #[test]
   fn direction_two_reds_when_a_research_only_row_is_reachable_from_default() {
     const LEAKY: &str = "\
+[features]
 default = [\"commercial-face\"]
 # Requires a commercial licence from the weights' author.
 commercial-face = [\"dep:facelib\"]
@@ -4399,6 +4451,7 @@ commercial-face = [\"dep:facelib\"]
   // --- the manifest readers ------------------------------------------------
 
   const DOCTORED_FEATURES: &str = "\
+[features]
 default = [\"speaker\"]
 speaker = [\"dep:diaric\"]
 # Requires a commercial licence from the weights' author.
@@ -4444,6 +4497,7 @@ lid = [\"dep:rustfft\"]
   /// mutation direction 2's `default` clause exists for, read through the real
   /// manifest reader rather than a hand-built set.
   const LEAKY_FEATURES: &str = "\
+[features]
 default = [\"commercial-face\"]
 speaker = [\"dep:diaric\"]
 # Requires a commercial licence from the weights' author.
@@ -4475,6 +4529,221 @@ commercial-face = [\"dep:facelib\", \"speaker\"]
         .iter()
         .any(|f| f.contains("plain `cargo add coremlit`")),
       "{failures:?}"
+    );
+  }
+
+  // --- valid TOML the hand-rolled reader could not see ---------------------
+  //
+  // Every constant below is a manifest Cargo obeys, spelling
+  // `default = ["identity"]` — the exact mutation
+  // `no_ungranted_artifact_is_reachable_from_default` was verified against.
+  // The old reader returned NO entries for any of them, so `default`'s closure
+  // came back as `{"default"}`, every ungranted artifact looked opt-in, and the
+  // check stayed green on a manifest that ships the bytes. That is what makes
+  // this an enumeration and not a style note: the mutation used to prove the
+  // check worked was true only for the ONE formatting it happened to be
+  // written in.
+
+  /// **Spelling 1 — an indented key.** TOML does not care about leading
+  /// whitespace; the old reader skipped every line that had any.
+  const DEFAULT_INDENTED: &str = "\
+[features]
+  default = [\"identity\"]
+identity = [\"dep:rustfft\"]
+";
+
+  /// **Spelling 2 — a literal string.** TOML's single-quoted strings are
+  /// strings; the old reader split the value on `\"` and found none.
+  const DEFAULT_SINGLE_QUOTED: &str = "\
+[features]
+default = ['identity']
+identity = ['dep:rustfft']
+";
+
+  /// **Spelling 3 — a quoted key.** `\"default\"` and `default` are the same
+  /// key in TOML; the old reader compared the raw text before the first `=`
+  /// and never matched.
+  const DEFAULT_QUOTED_KEY: &str = "\
+[features]
+\"default\" = [\"identity\"]
+identity = [\"dep:rustfft\"]
+";
+
+  /// **Spelling 4 — a comment carrying `]` inside a multi-line array.** The old
+  /// reader stopped collecting at the first line containing `]`, so the value
+  /// ended before the entry did.
+  const DEFAULT_COMMENT_WITH_BRACKET: &str = "\
+[features]
+default = [ # the shipping set (see [features] above)
+  \"identity\",
+]
+identity = [\"dep:rustfft\"]
+";
+
+  /// **Spelling 5 — a dotted key, no `[features]` header at all.** There was no
+  /// header to find, so the block came back empty and so did every closure
+  /// built from it.
+  const DEFAULT_DOTTED_KEY: &str = "\
+features.default = [\"identity\"]
+features.identity = [\"dep:rustfft\"]
+";
+
+  /// **Spelling 6 — a non-canonical header.** `[ features ]` is the same table;
+  /// the old reader compared the trimmed line to the literal `\"[features]\"`.
+  const DEFAULT_SPACED_HEADER: &str = "\
+[ features ]
+default = [\"identity\"]
+identity = [\"dep:rustfft\"]
+";
+
+  /// Every spelling above, named, so a failure says which one regressed.
+  fn every_missed_spelling() -> [(&'static str, &'static str); 6] {
+    [
+      ("indented key", DEFAULT_INDENTED),
+      ("literal (single-quoted) string", DEFAULT_SINGLE_QUOTED),
+      ("quoted key", DEFAULT_QUOTED_KEY),
+      (
+        "comment carrying `]` in a multi-line array",
+        DEFAULT_COMMENT_WITH_BRACKET,
+      ),
+      ("dotted key with no `[features]` header", DEFAULT_DOTTED_KEY),
+      ("non-canonical `[ features ]` header", DEFAULT_SPACED_HEADER),
+    ]
+  }
+
+  /// The reader sees `identity` in `default`'s entries under every one of them.
+  ///
+  /// Every spelling is reported in ONE run rather than short-circuiting on the
+  /// first, because the enumeration is the result here: a reader that fixes the
+  /// spelling it was last caught on and misses the next one has not been fixed.
+  #[test]
+  fn the_reader_sees_default_under_every_valid_spelling() {
+    let mut missed = Vec::new();
+    for (label, manifest) in every_missed_spelling() {
+      let entries = feature_entries(manifest, "default");
+      let names = feature_names(manifest);
+      let closure = feature_closure(manifest, "default");
+      if entries != vec!["identity".to_string()]
+        || names != features(&["default", "identity"])
+        || closure != features(&["default", "identity"])
+      {
+        missed.push(format!(
+          "{label}: entries {entries:?}, names {names:?}, closure {closure:?}"
+        ));
+      }
+    }
+    assert!(
+      missed.is_empty(),
+      "the reader must see what Cargo sees, and does not for {} of {} spellings:\n{}",
+      missed.len(),
+      every_missed_spelling().len(),
+      missed.join("\n")
+    );
+  }
+
+  /// **The check itself, driven through every spelling.** Not the reader in
+  /// isolation: an ungranted row behind `identity` must be REPORTED as
+  /// reachable from `default` for each one, because that is the state the
+  /// manifest actually describes to Cargo.
+  #[test]
+  fn direction_two_reds_from_default_under_every_valid_spelling() {
+    let rows = [row(
+      REDIMNET_SHAPED,
+      "vendor/one",
+      "identity",
+      UNGRANTED,
+      ATTRIBUTED,
+    )];
+    let derived = tree_gates(&[(REDIMNET_SHAPED, &["identity"])]);
+    let mut passed_vacuously = Vec::new();
+    for (label, manifest) in every_missed_spelling() {
+      let failures =
+        ungranted_reachable_from_default(&rows, &derived, &feature_closure(manifest, "default"));
+      if failures.len() != 1 || !failures[0].contains("plain `cargo add coremlit`") {
+        passed_vacuously.push(format!("{label}: {failures:?}"));
+      }
+    }
+    assert!(
+      passed_vacuously.is_empty(),
+      "the check stayed green on {} of {} manifests that ship the ungranted bytes:\n{}",
+      passed_vacuously.len(),
+      every_missed_spelling().len(),
+      passed_vacuously.join("\n")
+    );
+  }
+
+  /// And the opt-in shape still passes under the same spellings, so the test
+  /// above is detecting `default`'s contents rather than the parser change.
+  #[test]
+  fn direction_two_stays_green_when_the_same_spellings_leave_default_empty() {
+    let rows = [row(
+      REDIMNET_SHAPED,
+      "vendor/one",
+      "identity",
+      UNGRANTED,
+      ATTRIBUTED,
+    )];
+    let derived = tree_gates(&[(REDIMNET_SHAPED, &["identity"])]);
+    for manifest in [
+      "[features]\n  default = []\nidentity = [\"dep:rustfft\"]\n",
+      "[features]\ndefault = []\nidentity = ['dep:rustfft']\n",
+      "[ features ]\ndefault = []\nidentity = [\"dep:rustfft\"]\n",
+      "features.default = []\nfeatures.identity = [\"dep:rustfft\"]\n",
+    ] {
+      assert!(
+        ungranted_reachable_from_default(&rows, &derived, &feature_closure(manifest, "default"))
+          .is_empty(),
+        "{manifest:?}"
+      );
+    }
+  }
+
+  /// **Fail closed.** A manifest the reader cannot decode must PANIC, not come
+  /// back empty: an empty feature graph is what every reachability check here
+  /// reads as "nothing ships by default", so a silent decode failure is a
+  /// silent pass.
+  #[test]
+  fn an_undecodable_manifest_panics_rather_than_reading_as_empty() {
+    let mut read_as_empty = Vec::new();
+    for (label, manifest) in [
+      ("not TOML at all", "default = [\"identity\"\n"),
+      ("no `[features]` table", "[package]\nname = \"coremlit\"\n"),
+      (
+        "a feature whose value is not an array",
+        "[features]\ndefault = \"identity\"\n",
+      ),
+      (
+        "a feature whose entries are not strings",
+        "[features]\ndefault = [1, 2]\n",
+      ),
+      ("`features` is not a table", "features = \"identity\"\n"),
+    ] {
+      let hook = std::panic::take_hook();
+      std::panic::set_hook(Box::new(|_| {}));
+      let outcome = std::panic::catch_unwind(|| feature_closure(manifest, "default"));
+      std::panic::set_hook(hook);
+      if let Ok(closure) = outcome {
+        read_as_empty.push(format!("{label}: read as {closure:?}"));
+      }
+    }
+    assert!(
+      read_as_empty.is_empty(),
+      "{} of these manifests were read rather than refused; a feature graph nobody can decode \
+       is not an empty one:\n{}",
+      read_as_empty.len(),
+      read_as_empty.join("\n")
+    );
+  }
+
+  /// A feature the manifest genuinely does not declare still reads as absent —
+  /// failing closed on an undecodable document must not turn every lookup into
+  /// a panic.
+  #[test]
+  fn an_undeclared_feature_reads_as_absent_rather_than_panicking() {
+    assert!(feature_entries(CLEAN_FEATURES, "no-such-feature").is_empty());
+    assert_eq!(
+      feature_closure(CLEAN_FEATURES, "no-such-feature"),
+      features(&["no-such-feature"])
     );
   }
 

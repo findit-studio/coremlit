@@ -106,7 +106,11 @@ fn check_feature_accepts_the_converted_contract() {
     check_feature(
       names::MEL,
       &[1, N_MELS, N_FRAMES],
-      Some((&[1, N_MELS, N_FRAMES], Some(DataType::F32)))
+      Some((
+        &[1, N_MELS, N_FRAMES],
+        Some(DataType::F32),
+        Some(ShapeConstraint::Fixed)
+      ))
     )
     .is_ok()
   );
@@ -114,7 +118,11 @@ fn check_feature_accepts_the_converted_contract() {
     check_feature(
       names::EMBEDDING,
       &[1, EMBEDDING_DIM],
-      Some((&[1, EMBEDDING_DIM], Some(DataType::F32)))
+      Some((
+        &[1, EMBEDDING_DIM],
+        Some(DataType::F32),
+        Some(ShapeConstraint::Fixed)
+      ))
     )
     .is_ok()
   );
@@ -129,7 +137,7 @@ fn check_feature_refuses_a_missing_feature() {
     panic!("expected ContractMismatch, got {err:?}")
   };
   assert_eq!(m.feature(), "mel");
-  assert_eq!(m.expected(), "[1, 72, 401] float32");
+  assert_eq!(m.expected(), "[1, 72, 401] float32 fixed");
   assert_eq!(m.actual(), "missing");
 }
 
@@ -141,13 +149,17 @@ fn check_feature_refuses_a_transposed_shape_of_the_same_size() {
   let err = check_feature(
     names::MEL,
     &[1, N_MELS, N_FRAMES],
-    Some((&[1, N_FRAMES, N_MELS], Some(DataType::F32))),
+    Some((
+      &[1, N_FRAMES, N_MELS],
+      Some(DataType::F32),
+      Some(ShapeConstraint::Fixed),
+    )),
   )
   .unwrap_err();
   let Error::ContractMismatch(m) = err else {
     panic!("expected ContractMismatch, got {err:?}")
   };
-  assert_eq!(m.actual(), "[1, 401, 72] float32");
+  assert_eq!(m.actual(), "[1, 401, 72] float32 fixed");
 }
 
 /// The dtype is checked as hard as the shape. A graph whose boundary is fp16
@@ -159,7 +171,7 @@ fn check_feature_refuses_a_right_shaped_wrong_dtype_feature() {
     let err = check_feature(
       names::EMBEDDING,
       &[1, EMBEDDING_DIM],
-      Some((&[1, EMBEDDING_DIM], dtype)),
+      Some((&[1, EMBEDDING_DIM], dtype, Some(ShapeConstraint::Fixed))),
     )
     .unwrap_err();
     assert!(
@@ -169,30 +181,153 @@ fn check_feature_refuses_a_right_shaped_wrong_dtype_feature() {
   }
 }
 
-/// A flexible-shape input declares no constrained dimensions at all, and is
-/// refused: the conversion pins a fixed shape on purpose, because a `RangeDim`
-/// input takes the graph off the ANE.
+/// A feature that declares no constrained dimensions at all is refused.
+///
+/// This is the DYNAMIC-output flavour of flexibility — an empty shape — and it
+/// is caught by the shape comparison alone. It is deliberately NOT the
+/// interesting case: a `RangeDims` INPUT reports its default shape here, not an
+/// empty one, so this test says nothing about the constraint that
+/// `check_feature_refuses_a_flexible_shape_constraint` covers.
 #[test]
 fn check_feature_refuses_an_unconstrained_shape() {
   let err = check_feature(
     names::MEL,
     &[1, N_MELS, N_FRAMES],
-    Some((&[], Some(DataType::F32))),
+    Some((&[], Some(DataType::F32), Some(ShapeConstraint::Fixed))),
   )
   .unwrap_err();
   let Error::ContractMismatch(m) = err else {
     panic!("expected ContractMismatch, got {err:?}")
   };
-  assert_eq!(m.actual(), "[] float32");
+  assert_eq!(m.actual(), "[] float32 fixed");
+}
+
+/// **The `RangeDim` refusal.** A flexible input passes every name/shape/dtype
+/// check, because [`crate::FeatureInfo::shape`] reports its DEFAULT shape — and
+/// a `RangeDims` graph converted at `[1, 72, 401]` reports exactly the
+/// contract's numbers. Fixed shape is why this graph stays on the accelerator
+/// at all; the recipe refuses `RangeDim` for that reason, and the door has to
+/// refuse it too or the conversion's whole placement argument is unenforced.
+#[test]
+fn check_feature_refuses_a_flexible_shape_constraint() {
+  for constraint in [
+    ShapeConstraint::Range,
+    ShapeConstraint::Enumerated,
+    ShapeConstraint::Unknown(1),
+    ShapeConstraint::Unknown(2),
+  ] {
+    let outcome = check_feature(
+      names::MEL,
+      &[1, N_MELS, N_FRAMES],
+      Some((
+        &[1, N_MELS, N_FRAMES],
+        Some(DataType::F32),
+        Some(constraint),
+      )),
+    );
+    assert!(
+      outcome.is_err(),
+      "a {constraint} shape constraint carrying the contract's own numbers must be REFUSED; \
+       `shape()` reports the default of a flexible input, so the numbers prove nothing"
+    );
+    let Error::ContractMismatch(m) = outcome.unwrap_err() else {
+      panic!("{constraint:?}: expected ContractMismatch")
+    };
+    assert_eq!(m.expected(), "[1, 72, 401] float32 fixed");
+    assert_eq!(m.actual(), format!("[1, 72, 401] float32 {constraint}"));
+  }
+}
+
+/// A feature carrying no shape constraint at all is refused for the same
+/// reason: "fixed" is a fact that has to be established, and an absent
+/// constraint establishes nothing.
+#[test]
+fn check_feature_refuses_a_feature_with_no_shape_constraint() {
+  let outcome = check_feature(
+    names::MEL,
+    &[1, N_MELS, N_FRAMES],
+    Some((&[1, N_MELS, N_FRAMES], Some(DataType::F32), None)),
+  );
+  assert!(
+    outcome.is_err(),
+    "a feature with no shape constraint at all must be REFUSED: fixedness is a fact to be \
+     established, and nothing here establishes it"
+  );
+  let Error::ContractMismatch(m) = outcome.unwrap_err() else {
+    panic!("expected ContractMismatch")
+  };
+  assert_eq!(m.actual(), "[1, 72, 401] float32 none");
+}
+
+// ── The complete input set ─────────────────────────────────────────────────
+
+/// The exact input set the conversion emits is accepted.
+#[test]
+fn check_input_set_accepts_the_single_converted_input() {
+  assert!(check_input_set([(names::MEL, false)]).is_ok());
+}
+
+/// **The load-accepts-what-predict-cannot-honour refusal.** A graph carrying
+/// the expected `mel` PLUS another required input passes every per-feature
+/// check and then fails on every single prediction, because `embed` supplies
+/// `mel` and nothing else. The refusal names the offending feature.
+#[test]
+fn check_input_set_refuses_an_extra_required_input() {
+  let outcome = check_input_set([(names::MEL, false), ("speaker_mask", false)]);
+  assert!(
+    outcome.is_err(),
+    "a graph requiring `speaker_mask` alongside `mel` must be refused at LOAD; `embed` sends \
+     `mel` and nothing else, so every prediction through it would fail"
+  );
+  let Error::UnsatisfiableInput(name) = outcome.unwrap_err() else {
+    panic!("expected UnsatisfiableInput")
+  };
+  assert_eq!(name, "speaker_mask");
+  let rendered = Error::UnsatisfiableInput(name).to_string();
+  assert!(
+    rendered.contains("every prediction would fail"),
+    "the refusal must say what would have happened at predict time: {rendered}"
+  );
+}
+
+/// An OPTIONAL extra input is not a broken contract: CoreML runs a prediction
+/// that omits it. This is the whole reason `FeatureInfo` had to retain
+/// `isOptional` rather than counting inputs.
+#[test]
+fn check_input_set_accepts_an_extra_optional_input() {
+  assert!(check_input_set([(names::MEL, false), ("mask", true)]).is_ok());
+}
+
+/// The first offender by NAME is reported, not by dictionary order — CoreML
+/// hands the description back as an unordered dictionary, and
+/// `snapshot_features` sorts it, so the message is stable across loads.
+#[test]
+fn check_input_set_reports_a_stable_offender() {
+  let outcome = check_input_set([("aaa", false), (names::MEL, false), ("zzz", false)]);
+  assert!(
+    matches!(&outcome, Err(Error::UnsatisfiableInput(n)) if n == "aaa"),
+    "the first offender in name order must be the one reported, got {outcome:?}"
+  );
 }
 
 #[test]
-fn describe_renders_shape_and_dtype() {
+fn describe_renders_shape_dtype_and_constraint() {
   assert_eq!(
-    describe(&[1, N_MELS, N_FRAMES], Some(DataType::F32)),
-    "[1, 72, 401] float32"
+    describe(
+      &[1, N_MELS, N_FRAMES],
+      Some(DataType::F32),
+      Some(ShapeConstraint::Fixed)
+    ),
+    "[1, 72, 401] float32 fixed"
   );
-  assert_eq!(describe(&[1, EMBEDDING_DIM], None), "[1, 192] none");
+  assert_eq!(
+    describe(&[1, EMBEDDING_DIM], None, Some(ShapeConstraint::Range)),
+    "[1, 192] none range"
+  );
+  assert_eq!(
+    describe(&[1, EMBEDDING_DIM], None, None),
+    "[1, 192] none none"
+  );
 }
 
 // ── Input and output guards ────────────────────────────────────────────────

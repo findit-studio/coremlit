@@ -46,7 +46,7 @@ pub use error::{
 pub use features::Features;
 /// Half-precision element type, re-exported for [`Element`] consumers.
 pub use half::f16;
-pub use model::{FeatureInfo, Model, ModelDescription};
+pub use model::{FeatureInfo, Model, ModelDescription, ShapeConstraint};
 pub use multi_array::{Element, MultiArray};
 pub use state::State;
 pub use units::{ComputeUnits, ParseComputeUnitsError};
