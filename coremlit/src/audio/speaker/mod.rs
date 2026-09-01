@@ -160,7 +160,25 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Across recordings
+//!
+//! Everything above is *within* one recording. [`calibrate`] is the other
+//! direction — the AS-Norm1 door for scoring voice profiles at
+//! cluster-centroid grain against a library-wide cohort, so the same person
+//! found in two different recordings can be bound to one identity
+//! ([`findit-studio/coremlit#123`][coremlit-123]). Raw cosine scores are not
+//! comparable across speakers, so a single global threshold over-merges some
+//! identities and under-merges others; AS-Norm rescales each trial against the
+//! cohort distribution of the two speakers involved.
+//!
+//! It is a SCORING surface and nothing else: the caller owns the library, the
+//! identities and the cohort. It is deliberately NOT wired into the clustering
+//! above — that is a within-recording question with a parity oracle of its own.
+//!
+//! [coremlit-123]: https://github.com/findit-studio/coremlit/issues/123
 
+pub mod calibrate;
 pub mod cluster;
 #[cfg(feature = "serde")]
 mod compute_units_serde;

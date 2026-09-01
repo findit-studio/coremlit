@@ -1406,5 +1406,162 @@ pub enum ExtractError {
   OutputFrameCountOverflow,
 }
 
+/// The caller's raw embedding row did not have [`EMBEDDING_DIM`] elements.
+///
+/// Payload of [`CalibrateError::ProfileLength`].
+///
+/// [`EMBEDDING_DIM`]: crate::audio::speaker::embed::EMBEDDING_DIM
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ProfileLength {
+  /// Elements the caller provided.
+  got: usize,
+  /// Elements a raw WeSpeaker row has.
+  expected: usize,
+}
+
+impl ProfileLength {
+  /// Construct from the provided and required element counts.
+  #[inline(always)]
+  pub const fn new(got: usize, expected: usize) -> Self {
+    Self { got, expected }
+  }
+
+  /// Elements the caller provided.
+  #[inline(always)]
+  pub const fn got(&self) -> usize {
+    self.got
+  }
+
+  /// Elements a raw WeSpeaker row has.
+  #[inline(always)]
+  pub const fn expected(&self) -> usize {
+    self.expected
+  }
+}
+
+/// Two profiles prepared for different score sources were scored against each
+/// other.
+///
+/// Payload of [`CalibrateError::ScoringMismatch`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ScoringMismatch {
+  /// The score source the side being normalized was prepared for.
+  side: crate::audio::speaker::calibrate::Scoring,
+  /// The score source the other profile was prepared for.
+  other: crate::audio::speaker::calibrate::Scoring,
+}
+
+impl ScoringMismatch {
+  /// Construct from the two disagreeing score sources.
+  #[inline(always)]
+  pub const fn new(
+    side: crate::audio::speaker::calibrate::Scoring,
+    other: crate::audio::speaker::calibrate::Scoring,
+  ) -> Self {
+    Self { side, other }
+  }
+
+  /// The score source the side being normalized was prepared for.
+  #[inline(always)]
+  pub const fn side(&self) -> crate::audio::speaker::calibrate::Scoring {
+    self.side
+  }
+
+  /// The score source the other profile was prepared for.
+  #[inline(always)]
+  pub const fn other(&self) -> crate::audio::speaker::calibrate::Scoring {
+    self.other
+  }
+}
+
+/// Failure preparing a voice profile, scoring a trial, or deriving a side's
+/// cohort statistics — [`crate::audio::speaker::calibrate`]'s error.
+///
+/// # Why this one is neither `Clone` nor `PartialEq`
+///
+/// Every other error in this module is both. This one wraps two `diaric`
+/// errors — [`diaric::plda::Error`] and [`diaric::score_norm::Error`] — and
+/// neither derives anything past `Debug` + `Error`. [`ExtractError`] met the
+/// same wall and answered it by making
+/// [`ExtractError::PldaTransformUnavailable`] UNIT-shaped, discarding the
+/// cause to keep its own derives. That trade is right there and wrong here:
+/// `PldaTransformUnavailable` has exactly one cause, while
+/// `diaric::score_norm::Error` distinguishes a cohort that was too small from
+/// one whose selected scores do not spread from an arithmetic refusal — the
+/// three things a caller tuning [`AsNormOptions`] has to tell apart. Keeping
+/// the payload and dropping the derives is the direction that keeps
+/// information.
+///
+/// [`AsNormOptions`]: diaric::score_norm::AsNormOptions
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum CalibrateError {
+  /// The raw embedding row handed to
+  /// [`Scoring::prepare`](crate::audio::speaker::calibrate::Scoring::prepare)
+  /// was not [`EMBEDDING_DIM`] elements long.
+  ///
+  /// [`EMBEDDING_DIM`]: crate::audio::speaker::embed::EMBEDDING_DIM
+  #[error(
+    "voice profile: raw embedding row is {} elements, expected {}",
+    .0.got(),
+    .0.expected()
+  )]
+  ProfileLength(ProfileLength),
+
+  /// The prepared vector has no usable direction, so a cosine against it would
+  /// be noise rather than a similarity.
+  ///
+  /// Carries the score source that refused, because the two refuse for
+  /// different reasons and neither number is this crate's to invent:
+  ///
+  /// - [`Scoring::Cosine`](crate::audio::speaker::calibrate::Scoring::Cosine)
+  ///   refuses whatever [`diaric::embed::Embedding::normalize_from`] refuses —
+  ///   a non-finite row, or an L2 norm under `diaric`'s own `NORM_EPSILON`.
+  ///   This door CALLS that constructor rather than re-deriving its floor, the
+  ///   same discipline [`crate::audio::speaker::extract::PLDA_MIN_NORM`]'s doc
+  ///   describes.
+  /// - [`Scoring::PldaCosine`](crate::audio::speaker::calibrate::Scoring::PldaCosine)
+  ///   refuses a projected vector whose norm is zero or non-finite, or whose
+  ///   normalization leaves the range. There is deliberately NO floor above
+  ///   zero: `diaric` publishes none for the 128-d PLDA space, the WeSpeaker
+  ///   `NORM_EPSILON` is calibrated for a different one, and a fabricated
+  ///   constant would refuse real projections on a number nothing measured.
+  #[error("voice profile: the prepared {0:?} vector has no usable direction")]
+  DegenerateProfile(crate::audio::speaker::calibrate::Scoring),
+
+  /// `diaric`'s PLDA projection refused the row.
+  #[error("voice profile: plda: {0}")]
+  Plda(#[from] diaric::plda::Error),
+
+  /// The same refusal [`ExtractError::PldaTransformUnavailable`] carries, from
+  /// the same process-wide cached transform: without it a
+  /// [`Scoring::PldaCosine`](crate::audio::speaker::calibrate::Scoring::PldaCosine)
+  /// profile cannot be projected at all.
+  #[error(
+    "diaric's PLDA transform could not be built, so a raw embedding cannot be \
+     projected into the space `Scoring::PldaCosine` scores in"
+  )]
+  PldaTransformUnavailable,
+
+  /// Two profiles prepared for different score sources were scored against
+  /// each other.
+  ///
+  /// A tag comparison rather than a type error, and the trade is deliberate —
+  /// see [`crate::audio::speaker::calibrate::VoiceProfile`]'s own docs. What
+  /// matters is that it cannot be silent: an AS-Norm side is built from a
+  /// whole cohort, so a mixed cohort would otherwise contribute scores from
+  /// two different spaces to one mean.
+  #[error(
+    "voice profile: a {:?} profile cannot be scored against a {:?} one",
+    .0.side(),
+    .0.other()
+  )]
+  ScoringMismatch(ScoringMismatch),
+
+  /// `diaric`'s AS-Norm refused this side's cohort statistics.
+  #[error("voice profile: {0}")]
+  ScoreNorm(#[from] diaric::score_norm::Error),
+}
+
 #[cfg(test)]
 mod tests;

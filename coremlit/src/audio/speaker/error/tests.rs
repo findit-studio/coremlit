@@ -404,3 +404,65 @@ fn extraction_chunk_count_too_large_displays_the_count_and_the_cap() {
     bytes.split_whitespace().collect::<Vec<_>>()
   );
 }
+
+// ── CalibrateError (audio::speaker::calibrate) ─────────────────────────────
+
+#[test]
+fn calibrate_error_profile_length_displays_got_and_expected() {
+  use crate::audio::speaker::embed::EMBEDDING_DIM;
+
+  let e = CalibrateError::ProfileLength(ProfileLength::new(192, EMBEDDING_DIM));
+  let rendered = e.to_string();
+  assert!(rendered.contains("192"), "{rendered}");
+  assert!(rendered.contains(&EMBEDDING_DIM.to_string()), "{rendered}");
+}
+
+#[test]
+fn calibrate_error_degenerate_profile_names_the_score_source_that_refused() {
+  use crate::audio::speaker::calibrate::Scoring;
+
+  let cosine = CalibrateError::DegenerateProfile(Scoring::Cosine).to_string();
+  let plda = CalibrateError::DegenerateProfile(Scoring::PldaCosine).to_string();
+  assert!(cosine.contains("Cosine"), "{cosine}");
+  assert!(plda.contains("PldaCosine"), "{plda}");
+  // The two must be distinguishable: which source refused is the whole
+  // payload, and a shared rendering would discard it.
+  assert_ne!(cosine, plda);
+}
+
+#[test]
+fn calibrate_error_wraps_diarics_plda_and_score_norm_errors_via_from() {
+  let e: CalibrateError = diaric::plda::Error::DegenerateInput.into();
+  assert!(matches!(e, CalibrateError::Plda(_)));
+  assert!(e.to_string().contains("plda"), "{e}");
+
+  let e: CalibrateError = diaric::score_norm::Error::EmptyCohort.into();
+  assert!(matches!(e, CalibrateError::ScoreNorm(_)));
+  assert!(e.to_string().contains("cohort"), "{e}");
+}
+
+#[test]
+fn calibrate_error_plda_transform_unavailable_says_what_cannot_be_projected() {
+  let rendered = CalibrateError::PldaTransformUnavailable.to_string();
+  assert!(rendered.contains("PLDA transform"), "{rendered}");
+  assert!(rendered.contains("PldaCosine"), "{rendered}");
+}
+
+#[test]
+fn calibrate_error_scoring_mismatch_displays_both_sides_in_order() {
+  use crate::audio::speaker::calibrate::Scoring;
+
+  let m = ScoringMismatch::new(Scoring::Cosine, Scoring::PldaCosine);
+  assert_eq!(m.side(), Scoring::Cosine);
+  assert_eq!(m.other(), Scoring::PldaCosine);
+  let rendered = CalibrateError::ScoringMismatch(m).to_string();
+  assert!(rendered.contains("Cosine"), "{rendered}");
+  assert!(rendered.contains("PldaCosine"), "{rendered}");
+  // Order is load-bearing: it says which profile the SIDE was, so a caller
+  // knows which end of the trial to re-prepare. The reversed pairing must
+  // therefore not render identically.
+  let reversed =
+    CalibrateError::ScoringMismatch(ScoringMismatch::new(Scoring::PldaCosine, Scoring::Cosine))
+      .to_string();
+  assert_ne!(rendered, reversed);
+}
