@@ -94,7 +94,7 @@ objc2-natural-language = { workspace = true, optional = true }
 asry = { version = "0.1.0", default-features = false, features = ["emissions"], optional = true }
 
 # --- audio::speaker optional dep (the `speaker` feature) ---
-diaric = { version = "0.1.0", optional = true }
+diaric = { version = "0.2.0", optional = true }
 
 # --- audio::vad optional dep (the `vad` feature) ---
 zuoer = { version = "0.2.0", optional = true }
