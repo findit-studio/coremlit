@@ -110,9 +110,11 @@ no weight bytes (see `NOTICE`, "CI DOWNLOADS; IT DOES NOT REDISTRIBUTE").
 
 Any such artifact rides a feature named with the **`commercial-` prefix**, which
 is never in `default`. The prefix reads backwards — `commercial-face` looks like
-"cleared for commercial use" — so **the first sentence of the feature's comment
-in `Cargo.toml` must say that a commercial licence is required**. That is not
-decoration; it is what stops the name being read as an endorsement.
+"cleared for commercial use" — so **the feature's comment in `Cargo.toml` must
+BEGIN with the warning that a commercial licence is required**. Begins with, not
+contains: "This feature no longer requires a commercial license" and "Cleared
+for commercial use! This feature requires a commercial license" both contain the
+phrase and both say the opposite of it.
 
 None of these features exists yet. The mechanism does:
 `coremlit/tests/model_licences.rs` holds the licence table — keyed by
@@ -120,17 +122,30 @@ None of these features exists yet. The mechanism does:
 tag can contradict the terms of bytes it merely re-hosts — and refuses all
 three of
 
-- a `MODELS_LOCK` artifact with no licence row (and a row naming no staged
-  repository);
-- a research-only row reachable from `default`, or gated by a plain kit
-  feature instead of a `commercial-` one;
-- a `commercial-` feature gating artifacts whose rows are all clear — a gate
-  left standing after the restriction it protected went away.
+- a file `MODELS_LOCK` stages with no licence row, and a row naming a file no
+  table stages. At FILE granularity: a table with an explicit `files` list is
+  an exact bijection against the rows, and a globbed table's rows must be
+  selected by the glob and must cover their whole `.mlmodelc` through a
+  per-file SHA-256 manifest;
+- a research-only row whose loader's `#[cfg(feature = ...)]` is reachable from
+  **any** non-commercial feature closure — not just `default`'s, because
+  `speaker = ["commercial-face"]` ships it just as surely — or that is not
+  `commercial-` prefixed;
+- a `commercial-` feature gating artifacts whose rows are all clear (a gate
+  left standing after the restriction it protected went away), or that **no
+  `#[cfg(feature = ...)]` in `src/` names at all** — a feature that gates no
+  code is a name, not a gate.
 
-Adding a `commercial-` feature therefore means three edits, not one: the
+Every one of those reads a repository fact rather than the row: the gate comes
+from the `#[cfg]` on the module that loads the artifact, the closures from this
+manifest, and the selectors from `MODELS_LOCK`. The row's own `gate` field is a
+claim, cross-checked against the tree by
+`every_rows_gate_matches_the_cfg_that_guards_its_loader`.
+
+Adding a `commercial-` feature therefore means four edits, not one: the
 `Cargo.toml` feature (with its first-sentence warning), its row in
-`expected_features()` and the table above, and its artifact rows in the licence
-table.
+`expected_features()` and the table above, **a `#[cfg(feature = ...)]` in `src/`
+that actually gates the loader**, and its artifact rows in the licence table.
 
 ## Curated CI feature-combination list
 
