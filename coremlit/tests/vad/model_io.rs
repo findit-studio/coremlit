@@ -156,9 +156,12 @@ fn silero_vad_unified_io_matches_metadata() {
   // DOES depend on them (`audio::identity`, which refuses anything but
   // `ShapeConstraint::Fixed`) has never had its model staged in CI.
   //
-  // Note what `Fixed` is NOT read off: a fixed-shape export reports CoreML's
-  // `MLMultiArrayShapeConstraintTypeEnumerated`, not `…Unspecified`, so the
-  // verdict comes from the per-axis spans. See `ShapeConstraint`.
+  // Note how `Fixed` is reached: a fixed-shape export reports CoreML's
+  // `MLMultiArrayShapeConstraintTypeEnumerated`, not a dedicated fixed code and
+  // not `…Unspecified`, so the verdict needs the per-axis spans as well as the
+  // code — one enumerated shape and a span of 1 on every axis under raw type 2.
+  // Neither input decides it alone; see `ShapeConstraint` for the table, and for
+  // the equal-bound `RangeDim` the spans alone would misread as fixed.
   //
   // ONE DIRECTION ONLY, for `is_optional`. Every feature here is required, so
   // this catches a snapshot that reported `true` and NOT one hardcoded to

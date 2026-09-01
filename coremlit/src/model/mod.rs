@@ -67,21 +67,42 @@ unsafe impl Send for Model {}
 
 /// How many shapes a model will accept for one multi-array feature.
 ///
-/// # This is DERIVED, not the raw `type` code
+/// # Derived from the raw `type` code AND the constraint's contents
 ///
-/// `MLMultiArrayShapeConstraint` carries a `type`
-/// (`MLMultiArrayShapeConstraintType`), and it does **not** answer the
-/// question. A graph converted at a plain fixed shape — no `RangeDim`, no
-/// enumerated shapes — reports `…TypeEnumerated` (raw `2`), never
-/// `…TypeUnspecified`. Measured on the staged
+/// Neither half decides this on its own, and the two measurements that say so
+/// point in opposite directions.
+///
+/// **The code alone is not enough.** A graph converted at a plain fixed shape
+/// — no `RangeDim`, no enumerated shapes — reports `…TypeEnumerated` (raw
+/// `2`), never `…TypeUnspecified`. Measured on the staged
 /// `silero-vad-unified-256ms-v6.2.1.mlmodelc`, whose `metadata.json` records
 /// `hasShapeFlexibility: "0"` for every one of its six features: each reports
 /// raw type `2`, one enumerated shape equal to [`FeatureInfo::shape`], and one
-/// `sizeRangeForDimension` entry per axis with **length 1**.
+/// `sizeRangeForDimension` entry per axis with **length 1**. A door that
+/// demanded a dedicated "fixed" code would reject every fixed-shape artifact
+/// this crate ships.
 ///
-/// So the verdict is read off the constraint's CONTENTS — how many sizes each
-/// axis admits — rather than off its code. A door that matched the raw code
-/// would reject every fixed-shape artifact this crate ships.
+/// **The contents alone are not enough either.** coremltools permits a
+/// `RangeDim` whose lower and upper bounds are equal. The dimension stays
+/// symbolic and the converter still serialises a `shapeRange`, so CoreML
+/// reports raw type `3` (`…TypeRange`) with a span of 1 on every axis. Read
+/// off the spans alone that is indistinguishable from the fixed export above —
+/// and it is exactly what the fixed-shape invariant exists to refuse, because a
+/// symbolic dimension is what takes the graph off the accelerator.
+///
+/// **So the rule uses both**, and fails closed on anything it has not measured:
+///
+/// | raw `type` | spans / enumerated shapes | verdict |
+/// |---|---|---|
+/// | `…TypeEnumerated` (`2`) | at least one axis, every span `1`, at most one enumerated shape | [`Self::Fixed`] |
+/// | `…TypeEnumerated` (`2`) | anything else | [`Self::Enumerated`] |
+/// | `…TypeRange` (`3`) | anything, unit spans included | [`Self::Range`] |
+/// | `…TypeUnspecified` (`1`) | anything | [`Self::Unknown`] |
+/// | any other code | anything | [`Self::Unknown`] |
+///
+/// Only [`Self::Fixed`] establishes a fixed shape. This vocabulary answers that
+/// one question; it is deliberately not a count of accepted shapes, and no
+/// caller should read it as one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display)]
 #[non_exhaustive]
 pub enum ShapeConstraint {
@@ -97,36 +118,67 @@ pub enum ShapeConstraint {
   /// [`FeatureInfo::shape`] is the default, not a bound.
   #[display("range")]
   Range,
-  /// The constraint records nothing that decides how many shapes are accepted
-  /// — no per-axis sizes at all. Carries the raw
-  /// `MLMultiArrayShapeConstraintType` for diagnosis. Deliberately NOT read as
-  /// "fixed": a caller that needs a fixed shape needs it established, and this
-  /// does not establish it.
+  /// The constraint carries a `MLMultiArrayShapeConstraintType` this door has
+  /// never measured — `…TypeUnspecified`, or a code newer than this crate.
+  /// Carries the raw code for diagnosis.
+  ///
+  /// Deliberately NOT read as "fixed", however narrow the per-axis sizes look:
+  /// a caller that needs a fixed shape needs it established, and a code whose
+  /// meaning is unmeasured establishes nothing.
   #[display("unknown({_0})")]
   Unknown(isize),
 }
 
-/// Classify one multi-array shape constraint from its contents.
+/// `MLMultiArrayShapeConstraintTypeEnumerated`.
+const RAW_ENUMERATED: isize = 2;
+/// `MLMultiArrayShapeConstraintTypeRange`.
+const RAW_RANGE: isize = 3;
+
+/// Classify one multi-array shape constraint from its raw type code and its
+/// contents.
 ///
 /// `axis_spans` is how many sizes each axis admits (one entry per dimension,
 /// `NSRange::length` from `sizeRangeForDimension`); `enumerated_shapes` is
-/// `enumeratedShapes.count`. A free function over plain numbers so the whole
-/// vocabulary is exercisable with no model present.
-fn classify_shape_constraint(
+/// `enumeratedShapes.count`. See [`ShapeConstraint`] for the table this
+/// implements and the two measurements that force both inputs to be consulted.
+/// A free function over plain numbers so the whole vocabulary is exercisable
+/// with no model present.
+const fn classify_shape_constraint(
   raw_type: isize,
   enumerated_shapes: usize,
   axis_spans: &[usize],
 ) -> ShapeConstraint {
-  if axis_spans.is_empty() {
-    return ShapeConstraint::Unknown(raw_type);
+  match raw_type {
+    // A symbolic dimension, whatever its bounds. An equal-bound `RangeDim`
+    // reports unit spans and is still off the fixed-shape path.
+    RAW_RANGE => ShapeConstraint::Range,
+    RAW_ENUMERATED => {
+      if enumerated_shapes <= 1 && all_spans_are_one(axis_spans) {
+        ShapeConstraint::Fixed
+      } else {
+        ShapeConstraint::Enumerated
+      }
+    }
+    other => ShapeConstraint::Unknown(other),
   }
-  if axis_spans.iter().all(|span| *span == 1) {
-    return ShapeConstraint::Fixed;
+}
+
+/// Whether `spans` is non-empty and every axis admits exactly one size.
+///
+/// Empty is not "every axis is pinned"; it is a constraint that lists no axes
+/// at all, which pins nothing.
+const fn all_spans_are_one(spans: &[usize]) -> bool {
+  if spans.is_empty() {
+    return false;
   }
-  if enumerated_shapes > 1 {
-    return ShapeConstraint::Enumerated;
+  let mut i = 0;
+  while i < spans.len() {
+    if spans[i] != 1 {
+      return false;
+    }
+    i += 1;
   }
-  ShapeConstraint::Range
+  true
 }
 
 /// Shape/type info for one model input or output feature.
@@ -184,10 +236,33 @@ impl FeatureInfo {
 }
 
 /// Eagerly snapshotted model I/O description.
+///
+/// # What this carries, and what it deliberately drops
+///
+/// `MLModelDescription` exposes nine things. This snapshot keeps the three that
+/// decide whether a caller's prediction can run at all, and drops the six that
+/// describe a model rather than constrain how it is called:
+///
+/// | `MLModelDescription` member | here | why |
+/// |---|---|---|
+/// | `inputDescriptionsByName` | [`Self::inputs`] | a REQUIRED input a caller never sends fails every prediction |
+/// | `outputDescriptionsByName` | [`Self::outputs`] | the shapes and dtypes a caller reads back |
+/// | `stateDescriptionsByName` | [`Self::states`] | a stateful graph must be predicted through `MLState`; the stateless API cannot honour it |
+/// | `predictedFeatureName` | dropped | names one existing OUTPUT as a classifier's primary; it is already in [`Self::outputs`] and constrains no call |
+/// | `predictedProbabilitiesName` | dropped | likewise, and likewise already an output |
+/// | `classLabels` | dropped | the label vocabulary behind a classifier output; descriptive, not a calling constraint |
+/// | `metadata` | dropped | author/version/description strings |
+/// | `isUpdatable` | dropped | an updatable model still predicts through the same API |
+/// | `trainingInputDescriptionsByName`, `parameterDescriptionsByKey` | dropped | on-device UPDATE inputs, reached through `MLUpdateTask`, never through a prediction |
+///
+/// The rule the table encodes: a member is snapshotted when its contents can
+/// make an otherwise-conformant prediction fail, and dropped when it cannot.
+/// The three kept members are the complete set that can.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelDescription {
   inputs: Vec<FeatureInfo>,
   outputs: Vec<FeatureInfo>,
+  states: Vec<FeatureInfo>,
 }
 
 impl ModelDescription {
@@ -201,6 +276,24 @@ impl ModelDescription {
   #[inline(always)]
   pub fn outputs(&self) -> &[FeatureInfo] {
     &self.outputs
+  }
+
+  /// State features (`MLState` buffers) the model declares; empty for a
+  /// stateless model.
+  ///
+  /// A model with a non-empty state set must be predicted through
+  /// [`Model::predict_with_state`]: CoreML requires a stateful model to receive
+  /// an `MLState`, and the stateless
+  /// [`predict`](Model::predict) / [`predict_with`](Model::predict_with) path
+  /// either fails or discards the persistence the graph was built around. State
+  /// features are NOT ordinary inputs and never appear in [`Self::inputs`], so
+  /// a door that reasons only over the input set cannot see them.
+  ///
+  /// Always empty before macOS 15, where CoreML has no state concept and no
+  /// model can declare one — see [`Model::supports_state`].
+  #[inline(always)]
+  pub fn states(&self) -> &[FeatureInfo] {
+    &self.states
   }
 
   /// Input feature named `name`.
@@ -260,6 +353,27 @@ fn snapshot_features(
   features
 }
 
+/// The model's declared `MLState` buffers, or an empty set on an OS with no
+/// state concept.
+///
+/// `stateDescriptionsByName` arrived with macOS 15, alongside `MLState` itself.
+/// The selector is probed rather than assumed for the same reason
+/// [`Model::supports_state`] probes `newState`: sending a message the runtime
+/// does not implement traps. The empty set the probe falls back to is not an
+/// approximation — CoreML gained state and this accessor in the same release,
+/// so an OS without the accessor is an OS on which no loaded model can declare
+/// state at all.
+fn snapshot_states(description: &objc2_core_ml::MLModelDescription) -> Vec<FeatureInfo> {
+  use objc2::runtime::NSObjectProtocol;
+  if !description.respondsToSelector(objc2::sel!(stateDescriptionsByName)) {
+    return Vec::new();
+  }
+  // SAFETY: selector availability probed immediately above; the description is
+  // live for the call.
+  let states = unsafe { description.stateDescriptionsByName() };
+  snapshot_features(&states)
+}
+
 impl Model {
   /// Loads a compiled `.mlmodelc` with the given compute units.
   ///
@@ -291,9 +405,14 @@ impl Model {
         snapshot_features(&raw_description.outputDescriptionsByName()),
       )
     };
+    let states = snapshot_states(&raw_description);
     Ok(Self {
       inner,
-      description: ModelDescription { inputs, outputs },
+      description: ModelDescription {
+        inputs,
+        outputs,
+        states,
+      },
     })
   }
 

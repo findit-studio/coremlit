@@ -1965,6 +1965,34 @@ fn normalise_spelling(text: &str) -> String {
 // ---------------------------------------------------------------------------
 // Repository readers
 // ---------------------------------------------------------------------------
+//
+// EVERY READER BELOW INFERS SOMETHING FROM A FILE, AND THE FAILURE MODE THAT
+// MATTERS IS THE ONE WHERE A MIS-READ MAKES A CHECK PASS.
+//
+// Two rounds of review found the same defect twice, one layer apart: a
+// hand-rolled approximation of a grammar read valid input wrongly, and the
+// wrong reading was the reassuring one. First the manifest reader, which could
+// not see six spellings of `default` that Cargo obeys and reported every one of
+// them EMPTY; then the loader-gate reader, which scanned for the substring
+// `feature = "` in attributes and comments alike and derived a REQUIREMENT from
+// a negation, an `any(..)` alternative and a sentence. So the roster, and what
+// each does now:
+//
+// | reader | reads | grammar | if it mis-reads |
+// |---|---|---|---|
+// | `declared_features` and its callers | `Cargo.toml` | the `toml` crate | panics; an undecodable manifest is not an empty one |
+// | `gates_of_module` / `required_features` | a loader's `#[cfg]` | `syn`, one predicate per item | `Err`; only the positive form derives a gate |
+// | `cfg_features_in` | every `#[cfg]`/`cfg!` under `src/` | `proc-macro2` tokens | a missed site reds direction 3; prose and strings can no longer add one |
+// | `fp16_pinned_bundles` | `tests/fp16_guards.rs` rosters | `proc-macro2` tokens, anchored on the `path` field | a missed entry would silently shrink direction 1's second enumeration, so it is read structurally |
+// | `parse_lock` | `MODELS_LOCK` | hand-rolled, mirroring ci.yml's sed/awk | panics on anything that is not a header, a comment or `key = "value"`; `staged_tables` panics again on a table missing `local-dir` or its selector |
+// | `pins_at` | a `const`/`fn` holding SHA-256s | hand-rolled over quoted runs | panics on an ambiguous anchor or an empty result, and `every_rows_sha256_matches_the_pin_it_names` panics on a key the pin does not hold |
+// | `feature_docs` | `[features]` COMMENTS | hand-rolled, line-wise | a key it cannot see arrives with NO documentation and is reported undocumented — red, never green. Comments are the one thing a TOML parser drops, so this has no alternative |
+// | `first_sentence`, `negation_in`, `normalise_spelling` | a doc comment's PROSE | word- and sentence-level | prose is text; these infer no structure |
+//
+// The rule the table encodes: a reader may be hand-rolled only where every
+// mis-read exits through a panic or a red. Where a mis-read could produce a
+// PLAUSIBLE-BUT-WRONG value that a check then believes, it uses a real parser.
+// Adding a reader here means placing it in that table, not just writing it.
 
 /// One `["repo/name"]` table of `MODELS_LOCK`, reduced to what this file needs.
 struct LockTable {
@@ -2324,46 +2352,179 @@ fn loader_gates(locator: &str) -> BTreeSet<String> {
   let (rel, module) = locator
     .split_once("::")
     .unwrap_or_else(|| panic!("loader locator {locator:?} is not `<source>::<module>`"));
-  let text = read_rel(rel);
+  gates_of_module(&read_rel(rel), module)
+    .unwrap_or_else(|why| panic!("loader locator {locator:?}: {rel} {why}"))
+}
 
-  let bare = format!("mod {module};");
-  let public = format!("pub mod {module};");
-  let lines: Vec<&str> = text.lines().collect();
-  let declared: Vec<usize> = lines
-    .iter()
-    .enumerate()
-    .filter(|(_, l)| {
-      let trimmed = l.trim_start();
-      trimmed.starts_with(bare.as_str()) || trimmed.starts_with(public.as_str())
-    })
-    .map(|(i, _)| i)
-    .collect();
-  assert_eq!(
-    declared.len(),
-    1,
-    "loader locator {locator:?}: {rel} holds {} declarations of `{bare}`; exactly one must be \
-     present, or this reader could be reading the wrong module's gate",
-    declared.len()
-  );
-
+/// [`loader_gates`] over source TEXT, so every cfg spelling is exercisable
+/// without a file.
+///
+/// Parses with `syn` and derives a gate ONLY from the exact positive form
+/// `#[cfg(feature = "name")]`, on the declaration or on any module enclosing
+/// it. Everything else in the `cfg` family is an error, never a name — see
+/// [`required_features`].
+fn gates_of_module(source: &str, module: &str) -> Result<BTreeSet<String>, String> {
+  let file = syn::parse_file(source).map_err(|e| {
+    format!(
+      "does not parse as Rust ({e}). This reader derives the gate that directions 2 and 3 \
+       reason about; source it cannot parse is source whose gate it cannot establish."
+    )
+  })?;
+  let mut chains = Vec::new();
+  find_module_chains(&file.items, module, &mut Vec::new(), &mut chains);
+  let [chain] = chains.as_slice() else {
+    return Err(format!(
+      "holds {} declarations of `mod {module}`; exactly one must be present, or this reader \
+       could be reading the wrong module's gate",
+      chains.len()
+    ));
+  };
   let mut gates = BTreeSet::new();
-  for line in lines[..declared[0]].iter().rev() {
-    let trimmed = line.trim();
-    if trimmed.is_empty() {
-      break;
+  for attrs in chain {
+    gates.extend(required_features(attrs)?);
+  }
+  Ok(gates)
+}
+
+/// Every declaration of `mod <module>` reachable from `items`, each as the
+/// chain of attribute lists that must all admit it: the enclosing modules'
+/// attributes outermost, its own last.
+///
+/// Only ancestors are collected. A sibling module's `#[cfg(test)]` is never
+/// looked at, so a spelling [`required_features`] refuses cannot fail a read it
+/// has no bearing on.
+fn find_module_chains<'a>(
+  items: &'a [syn::Item],
+  module: &str,
+  chain: &mut Vec<&'a [syn::Attribute]>,
+  out: &mut Vec<Vec<&'a [syn::Attribute]>>,
+) {
+  for item in items {
+    let syn::Item::Mod(declared) = item else {
+      continue;
+    };
+    if declared.ident == module {
+      let mut hit = chain.clone();
+      hit.push(&declared.attrs);
+      out.push(hit);
     }
-    if !trimmed.starts_with("#[") && !trimmed.starts_with("//") {
-      break;
-    }
-    let mut rest = trimmed;
-    while let Some(open) = rest.find("feature = \"") {
-      let tail = &rest[open + "feature = \"".len()..];
-      let Some(close) = tail.find('"') else { break };
-      gates.insert(tail[..close].to_string());
-      rest = &tail[close + 1..];
+    if let Some((_, inner)) = &declared.content {
+      chain.push(&declared.attrs);
+      find_module_chains(inner, module, chain, out);
+      chain.pop();
     }
   }
-  gates
+}
+
+/// The features one item's attributes make REQUIRED for it to compile.
+///
+/// # Fails closed
+///
+/// Exactly `#[cfg(feature = "name")]` is understood. Every other `cfg`-family
+/// spelling is an error rather than a name, because in each of them the feature
+/// mentioned is not one the item requires:
+///
+/// | spelling | what the name would have meant |
+/// |---|---|
+/// | `#[cfg(not(feature = "x"))]` | compiles when `x` is OFF — the opposite |
+/// | `#[cfg(any(target_os = "macos", feature = "x"))]` | compiles with `x` off, on that target |
+/// | `#[cfg(all(feature = "x", feature = "y"))]` | two requirements, and a row claims one gate |
+/// | `#[cfg(target_os = "macos")]` | a real gate, but not a cargo feature |
+/// | `#[cfg_attr(feature = "x", ...)]` | attaches an attribute; gates nothing by itself |
+///
+/// A gate derived from any of them would be believed by
+/// [`ungranted_reachable_from_default`], which asks whether `default` enables
+/// the gate — and concludes an artifact is withheld whenever it does not. A
+/// loader gated on a NEGATION would then read as withheld from `default` while
+/// compiling in `default`, which is the exact reassurance this file exists to
+/// refuse.
+///
+/// Attributes outside the `cfg` family are ignored outright rather than
+/// scanned: a `#[doc]` string that quotes a `#[cfg]` is prose, not compilation.
+///
+/// # One `cfg` per item
+///
+/// Two `#[cfg]` attributes on one item are a conjunction, and so is
+/// `#[cfg(all(..))]`. Accepting the first while refusing the second would be
+/// the same rule written twice with different answers, so this reader takes
+/// neither: it reads one PREDICATE per item and does not evaluate cfg
+/// EXPRESSIONS at all. Nesting is not an expression — a module inside a gated
+/// module genuinely requires both, and [`gates_of_module`] unions the chain.
+fn required_features(attrs: &[syn::Attribute]) -> Result<BTreeSet<String>, String> {
+  let mut gates = BTreeSet::new();
+  let cfgs = attrs
+    .iter()
+    .filter(|attr| attr.path().is_ident("cfg"))
+    .count();
+  if cfgs > 1 {
+    return Err(format!(
+      "carries {cfgs} `#[cfg(...)]` attributes on one item. Together they are a conjunction,        which is what `#[cfg(all(..))]` spells and what this reader refuses there; it reads one        predicate per item and does not evaluate cfg expressions."
+    ));
+  }
+  for attr in attrs {
+    let path = attr.path();
+    if path.is_ident("cfg_attr") {
+      return Err(format!(
+        "carries `#[cfg_attr(...)]` on the module that loads it. A `cfg_attr` attaches an \
+         attribute conditionally — it can even attach a further `#[cfg]` — and the feature it \
+         names is not one the module requires. This reader does not evaluate it and will not \
+         guess: {}",
+        rendered(attr)
+      ));
+    }
+    if !path.is_ident("cfg") {
+      continue;
+    }
+    let name = attr.parse_args_with(positive_feature).map_err(|e| {
+      format!(
+        "carries a `#[cfg(...)]` this reader will not read as a feature requirement ({e}): \
+           {}. Only the positive form `#[cfg(feature = \"name\")]` derives a gate; a negation, \
+           a target alternative, a combination, or several predicates each make the name mean \
+           something other than \"required to compile\", and a gate that means something else \
+           is one directions 2 and 3 would reason about wrongly.",
+        rendered(attr)
+      )
+    })?;
+    gates.insert(name);
+  }
+  Ok(gates)
+}
+
+/// One attribute rendered back to source, for a failure message.
+fn rendered(attr: &syn::Attribute) -> String {
+  match &attr.meta {
+    syn::Meta::List(list) => format!("`#[{}({})]`", joined(&list.path), list.tokens),
+    syn::Meta::Path(path) => format!("`#[{}]`", joined(path)),
+    syn::Meta::NameValue(pair) => format!("`#[{} = ...]`", joined(&pair.path)),
+  }
+}
+
+/// An attribute path as `a::b`.
+fn joined(path: &syn::Path) -> String {
+  path
+    .segments
+    .iter()
+    .map(|segment| segment.ident.to_string())
+    .collect::<Vec<_>>()
+    .join("::")
+}
+
+/// Parses exactly `feature = "name"` and nothing else.
+///
+/// A `syn` parser rather than a matcher: `parse_args_with` requires the WHOLE
+/// argument list to be consumed, so a second predicate, a wrapping `not`/`any`/
+/// `all`, or a non-`feature` key each fail here rather than contributing a
+/// name.
+fn positive_feature(input: syn::parse::ParseStream<'_>) -> syn::Result<String> {
+  let key: syn::Ident = input.parse()?;
+  if key != "feature" {
+    return Err(syn::Error::new(
+      key.span(),
+      format!("expected the predicate `feature`, found `{key}`"),
+    ));
+  }
+  input.parse::<syn::Token![=]>()?;
+  Ok(input.parse::<syn::LitStr>()?.value())
 }
 
 /// Every feature name a `#[cfg(feature = "...")]` in this crate's `src/` tree
@@ -2387,15 +2548,119 @@ fn cfg_features_in_source() -> BTreeSet<String> {
   );
   for file in files {
     let text = std::fs::read_to_string(&file).unwrap_or_else(|e| panic!("read {file:?}: {e}"));
-    let mut rest = text.as_str();
-    while let Some(at) = rest.find("feature = \"") {
-      let tail = &rest[at + "feature = \"".len()..];
-      let Some(close) = tail.find('"') else { break };
-      found.insert(tail[..close].to_string());
-      rest = &tail[close + 1..];
-    }
+    found.extend(cfg_features_in(&text));
   }
   found
+}
+
+/// Every feature name a conditional-compilation site in one source TEXT names,
+/// wherever it sits inside the predicate.
+///
+/// # A different question from [`required_features`], deliberately
+///
+/// That one asks which feature an item REQUIRES, and refuses every spelling
+/// where the answer is not exactly one name. This one asks whether a feature
+/// changes what compiles AT ALL, so a negation, an alternative and a `cfg_attr`
+/// all count — enabling the feature does compile something differently in each.
+/// The two must not share a rule.
+///
+/// # Why this is not a substring search any more
+///
+/// It was: `text.find("feature = \"")` over the whole file. That matched prose
+/// and string literals as readily as attributes, so a feature named only in a
+/// SENTENCE — this tree has several, e.g. ``//! `#![cfg(feature = "…")]` `` in
+/// `audio/speaker/mod.rs` — read as a live gate. The clause that consumes this,
+/// [`commercial_features_gating_nothing_restricted`], reds when a
+/// `commercial-` feature names no conditional compilation at all; a phantom
+/// from a comment is exactly what makes that clause pass over the gate it was
+/// written to catch.
+///
+/// Reading TOKENS instead removes the whole class: the lexer has already
+/// decided what is a comment (gone), what is a string (one `Literal`), and what
+/// is an attribute — no rule here has to approximate that. Missing a real site
+/// remains possible only if a file does not tokenise, which panics.
+fn cfg_features_in(source: &str) -> BTreeSet<String> {
+  let tokens: proc_macro2::TokenStream = source.parse().unwrap_or_else(|e| {
+    panic!(
+      "source does not tokenise ({e}). This sweep decides whether a `commercial-` feature gates \
+       any code at all; a file it cannot read is a file whose gates it cannot count."
+    )
+  });
+  let mut found = BTreeSet::new();
+  collect_cfg_sites(tokens, &mut found);
+  found
+}
+
+/// Walks a token stream for `#[cfg(..)]` / `#![cfg(..)]` / `#[cfg_attr(..)]`
+/// attributes and `cfg!(..)` invocations, collecting the feature names inside
+/// each. Recurses through every group, so an attribute inside a `macro_rules!`
+/// body or on a deeply nested item counts like any other.
+fn collect_cfg_sites(tokens: proc_macro2::TokenStream, out: &mut BTreeSet<String>) {
+  use proc_macro2::{Delimiter, TokenTree};
+  let trees: Vec<TokenTree> = tokens.into_iter().collect();
+  let mut at = 0;
+  while at < trees.len() {
+    match &trees[at] {
+      // `#[..]` or `#![..]`
+      TokenTree::Punct(hash) if hash.as_char() == '#' => {
+        let mut next = at + 1;
+        if matches!(trees.get(next), Some(TokenTree::Punct(p)) if p.as_char() == '!') {
+          next += 1;
+        }
+        if let Some(TokenTree::Group(body)) = trees.get(next)
+          && body.delimiter() == Delimiter::Bracket
+        {
+          collect_cfg_sites(body.stream(), out);
+          let inner: Vec<TokenTree> = body.stream().into_iter().collect();
+          if let (Some(TokenTree::Ident(name)), Some(TokenTree::Group(args))) =
+            (inner.first(), inner.get(1))
+            && (name == "cfg" || name == "cfg_attr")
+            && args.delimiter() == Delimiter::Parenthesis
+          {
+            collect_feature_names(args.stream(), out);
+          }
+          at = next + 1;
+          continue;
+        }
+      }
+      // `cfg!(..)`
+      TokenTree::Ident(name) if name == "cfg" => {
+        if let (Some(TokenTree::Punct(bang)), Some(TokenTree::Group(args))) =
+          (trees.get(at + 1), trees.get(at + 2))
+          && bang.as_char() == '!'
+          && args.delimiter() == Delimiter::Parenthesis
+        {
+          collect_feature_names(args.stream(), out);
+          at += 3;
+          continue;
+        }
+      }
+      TokenTree::Group(group) => collect_cfg_sites(group.stream(), out),
+      _ => {}
+    }
+    at += 1;
+  }
+}
+
+/// Every `feature = "name"` in one cfg predicate, at any nesting depth.
+fn collect_feature_names(tokens: proc_macro2::TokenStream, out: &mut BTreeSet<String>) {
+  use proc_macro2::TokenTree;
+  let trees: Vec<TokenTree> = tokens.into_iter().collect();
+  for (at, tree) in trees.iter().enumerate() {
+    match tree {
+      TokenTree::Ident(key) if key == "feature" => {
+        if let (Some(TokenTree::Punct(eq)), Some(TokenTree::Literal(value))) =
+          (trees.get(at + 1), trees.get(at + 2))
+          && eq.as_char() == '='
+          && let Ok(name) = syn::parse_str::<syn::LitStr>(&value.to_string())
+        {
+          out.insert(name.value());
+        }
+      }
+      TokenTree::Group(group) => collect_feature_names(group.stream(), out),
+      _ => {}
+    }
+  }
 }
 
 /// Every `.rs` file under `dir`, recursively.
@@ -2619,20 +2884,25 @@ fn fp16_pinned_bundles_without_a_row(
 
 /// Every `.mlmodelc` path pinned by `tests/fp16_guards.rs`'s defect and
 /// load-bearing rosters.
+///
+/// Reads the `path` FIELD of the roster entries, at token level. The line-based
+/// reader this replaces required the literal `path: "` to open a trimmed line,
+/// so a rustfmt wrap put a roster entry out of its sight — and a missed entry
+/// is one staged bundle whose licence row nobody checks, which is the single
+/// thing this second enumeration exists to prevent.
+///
+/// Anchored on the field NAME rather than on "any string ending in
+/// `.mlmodelc`", because that file's prose and its `note` fields both quote
+/// bundle paths; widening to every literal would invent bundles instead of
+/// missing them.
 fn fp16_pinned_bundles() -> Vec<String> {
   let text = read_rel("tests/fp16_guards.rs");
+  let tokens: proc_macro2::TokenStream = text.parse().unwrap_or_else(|e| {
+    panic!("tests/fp16_guards.rs does not tokenise ({e}); its roster cannot be read")
+  });
   let mut paths = Vec::new();
-  for line in text.lines() {
-    let trimmed = line.trim();
-    let Some(rest) = trimmed.strip_prefix("path: \"") else {
-      continue;
-    };
-    let Some(end) = rest.find('"') else { continue };
-    let path = &rest[..end];
-    if path.ends_with(".mlmodelc") {
-      paths.push(path.to_string());
-    }
-  }
+  collect_field_literals(tokens, "path", &mut paths);
+  paths.retain(|path| path.ends_with(".mlmodelc"));
   assert!(
     paths.len() >= 8,
     "only {} `.mlmodelc` paths read out of tests/fp16_guards.rs; the reader has stopped matching \
@@ -2640,6 +2910,28 @@ fn fp16_pinned_bundles() -> Vec<String> {
     paths.len()
   );
   paths
+}
+
+/// Every string literal assigned to a struct-literal field named `field`, at
+/// any nesting depth.
+fn collect_field_literals(tokens: proc_macro2::TokenStream, field: &str, out: &mut Vec<String>) {
+  use proc_macro2::TokenTree;
+  let trees: Vec<TokenTree> = tokens.into_iter().collect();
+  for (at, tree) in trees.iter().enumerate() {
+    match tree {
+      TokenTree::Ident(name) if name == field => {
+        if let (Some(TokenTree::Punct(colon)), Some(TokenTree::Literal(value))) =
+          (trees.get(at + 1), trees.get(at + 2))
+          && colon.as_char() == ':'
+          && let Ok(literal) = syn::parse_str::<syn::LitStr>(&value.to_string())
+        {
+          out.push(literal.value());
+        }
+      }
+      TokenTree::Group(group) => collect_field_literals(group.stream(), field, out),
+      _ => {}
+    }
+  }
 }
 
 /// **Direction 1's second enumeration.** Every bundle the fp16 sweep pins under
@@ -3286,11 +3578,11 @@ mod falsifiers {
 
   use super::{
     Artifact, CREDIT_AUTHOR, Covered, Key, NOTHING_ESTABLISHED, RETAIN_NOTICE, Selection,
-    StagedTable, Terms, commercial_features_gating_nothing_restricted,
-    commercial_features_without_the_phrase, contradictory_terms, feature_closure, feature_closures,
-    feature_docs, feature_entries, feature_names, first_sentence,
-    fp16_pinned_bundles_without_a_row, glob_matches, research_only_reachable,
-    ungranted_reachable_from_default, unmatched_coverage,
+    StagedTable, Terms, cfg_features_in, collect_field_literals,
+    commercial_features_gating_nothing_restricted, commercial_features_without_the_phrase,
+    contradictory_terms, feature_closure, feature_closures, feature_docs, feature_entries,
+    feature_names, first_sentence, fp16_pinned_bundles_without_a_row, gates_of_module,
+    glob_matches, research_only_reachable, ungranted_reachable_from_default, unmatched_coverage,
   };
 
   /// A row with everything but the fields a given test is about.
@@ -4462,6 +4754,324 @@ commercial-face = [\"dep:facelib\", \"speaker\"]
 
 lid = [\"dep:rustfft\"]
 ";
+
+  // ── The gate reader: what a `#[cfg]` on a loader may and may not derive ──
+
+  /// Wrap one `#[cfg]` spelling around the `identity` loader declaration.
+  fn loader_with(attributes: &str) -> String {
+    format!("//! a module.\n\n{attributes}\npub mod identity;\n\n#[cfg(test)]\nmod tests;\n")
+  }
+
+  /// **The whole enumeration, in one run.** Every one of these makes the name
+  /// `identity` appear in the text above the declaration, and NONE of them
+  /// makes `identity` a feature the loader REQUIRES in order to compile. The
+  /// substring reader derived `{identity}` from every single one, row
+  /// reconciliation then agreed with the row's claim, and default-reachability
+  /// concluded the artifact was withheld — while the loader compiled by
+  /// default.
+  ///
+  /// Reported together rather than one assertion per shape: the point is the
+  /// class, and a reader fixed for the negation alone would still pass three of
+  /// these.
+  #[test]
+  fn the_gate_reader_refuses_every_cfg_it_cannot_read_as_a_requirement() {
+    let cases: &[(&str, String)] = &[
+      (
+        "a negation — `identity` OFF is what compiles the loader",
+        loader_with(r#"#[cfg(not(feature = "identity"))]"#),
+      ),
+      (
+        "an alternative — the target arm compiles the loader with `identity` off",
+        loader_with(r#"#[cfg(any(target_os = "macos", feature = "identity"))]"#),
+      ),
+      (
+        "a conjunction — two features, and the row can only claim one",
+        loader_with(r#"#[cfg(all(feature = "identity", feature = "speaker"))]"#),
+      ),
+      (
+        "a `cfg_attr` — it attaches an attribute conditionally, it is not a gate",
+        loader_with(r#"#[cfg_attr(feature = "identity", allow(dead_code))]"#),
+      ),
+      (
+        "a nested negation inside an otherwise positive `all`",
+        loader_with(r#"#[cfg(all(not(feature = "identity"), unix))]"#),
+      ),
+      (
+        "a non-feature predicate — a real gate, but not one `[features]` declares",
+        loader_with(r#"#[cfg(target_os = "macos")]"#),
+      ),
+      (
+        "two `cfg` attributes — the loader needs BOTH, and `all(..)` is refused above",
+        loader_with("#[cfg(feature = \"identity\")]\n#[cfg(feature = \"speaker\")]"),
+      ),
+    ];
+
+    let mut accepted = Vec::new();
+    for (what, source) in cases {
+      if let Ok(gates) = gates_of_module(source, "identity") {
+        accepted.push(format!("  {what}\n    read as {gates:?}"));
+      }
+    }
+    assert!(
+      accepted.is_empty(),
+      "these `#[cfg]` spellings were read as a feature REQUIREMENT, and not one of them is \
+       one. A derived gate is what directions 2 and 3 reason about: an ungranted loader whose \
+       gate is derived from a negation reads as withheld from `default` while it compiles in \
+       `default`. Each must fail closed instead.\n{}",
+      accepted.join("\n")
+    );
+  }
+
+  /// A comment is not a gate. `//`, `///` and `//!` above the declaration all
+  /// carried their `feature = "..."` into the derived set, so a sentence
+  /// mentioning a feature by name invented a gate that no `#[cfg]` imposed.
+  #[test]
+  fn the_gate_reader_never_derives_a_gate_from_a_comment() {
+    let cases: &[(&str, String)] = &[
+      (
+        "a line comment",
+        loader_with(
+          "// unlike feature = \"phantom\", this one ships\n#[cfg(feature = \"identity\")]",
+        ),
+      ),
+      (
+        "a doc comment",
+        loader_with(
+          "/// Behind feature = \"phantom\" until the terms resolve.\n#[cfg(feature = \"identity\")]",
+        ),
+      ),
+      (
+        "an inner doc comment",
+        loader_with("//! See feature = \"phantom\".\n#[cfg(feature = \"identity\")]"),
+      ),
+      (
+        "a comment between two attributes",
+        loader_with(
+          "#[allow(unused)]\n// feature = \"phantom\" is not a gate\n#[cfg(feature = \"identity\")]",
+        ),
+      ),
+    ];
+
+    let mut wrong = Vec::new();
+    for (what, source) in cases {
+      match gates_of_module(source, "identity") {
+        Ok(gates) if gates == BTreeSet::from(["identity".to_string()]) => {}
+        other => wrong.push(format!("  {what}: {other:?}")),
+      }
+    }
+    assert!(
+      wrong.is_empty(),
+      "each of these carries exactly one gate — `identity` — and prose naming another feature \
+       beside it. Only the `#[cfg]` decides:\n{}",
+      wrong.join("\n")
+    );
+  }
+
+  /// The supported form is read, however it is laid out, and an enclosing
+  /// `mod` block's gate counts as much as the declaration's own.
+  #[test]
+  fn the_gate_reader_reads_the_supported_form() {
+    assert_eq!(
+      gates_of_module(&loader_with("#[cfg(feature = \"identity\")]"), "identity"),
+      Ok(BTreeSet::from(["identity".to_string()]))
+    );
+    assert_eq!(
+      gates_of_module(
+        &loader_with("#[cfg(\n  feature = \"identity\"\n)]"),
+        "identity"
+      ),
+      Ok(BTreeSet::from(["identity".to_string()])),
+      "an attribute rustfmt wrapped over three lines is the same attribute"
+    );
+    assert_eq!(
+      gates_of_module(
+        &loader_with(
+          "#[doc = \"gated on feature = \\\"phantom\\\"\"]\n#[cfg(feature = \"identity\")]"
+        ),
+        "identity"
+      ),
+      Ok(BTreeSet::from(["identity".to_string()])),
+      "a non-`cfg` attribute names no gate, whatever string it carries"
+    );
+    assert_eq!(
+      gates_of_module(
+        "#[cfg(feature = \"identity\")]\nmod outer {\n  pub mod identity;\n}\n",
+        "identity"
+      ),
+      Ok(BTreeSet::from(["identity".to_string()])),
+      "an enclosing module's gate is required for the declaration to compile too"
+    );
+    assert!(
+      gates_of_module("pub mod identity;\n", "identity")
+        .is_ok_and(|gates: BTreeSet<String>| gates.is_empty()),
+      "an ungated loader derives NO gate — that is direction 2's finding, not an error"
+    );
+    assert!(
+      gates_of_module("pub mod identity;\nmod identity;\n", "identity").is_err(),
+      "two declarations mean the reader could be reading the wrong one"
+    );
+    assert!(
+      gates_of_module("pub mod identity", "identity").is_err(),
+      "source this reader cannot parse must fail closed, not read as ungated"
+    );
+  }
+
+  /// **The third reader in the same class.** `fp16_pinned_bundles` is
+  /// direction 1's SECOND enumeration of what a glob stages, and its value is
+  /// entirely in being independent — a roster entry it cannot see is a staged
+  /// bundle whose licence row nobody checks. The line reader it replaces
+  /// required `path: "` to open a trimmed line, so a rustfmt wrap hid one; the
+  /// token reader sees the field wherever it is laid out, and still refuses the
+  /// bundle paths that file quotes in prose and in its `note` fields.
+  #[test]
+  fn the_roster_reader_reads_a_path_field_however_it_is_laid_out() {
+    let mut found = Vec::new();
+    collect_field_literals(
+      "const R: &[E] = &[\n  E {\n    path:\n      \"vendorkit/Wrapped.mlmodelc\",\n    \
+       note: \"same floor as Other.mlmodelc\",\n  },\n];\n"
+        .parse()
+        .expect("tokenises"),
+      "path",
+      &mut found,
+    );
+    assert_eq!(
+      found,
+      vec!["vendorkit/Wrapped.mlmodelc".to_string()],
+      "the wrapped `path` field must be read, and the `note` field's quoted bundle must not be"
+    );
+  }
+
+  /// Prose is not a roster. This file documents bundle paths in `//!` and `///`
+  /// blocks; a reader that widened to "any literal ending in `.mlmodelc`" would
+  /// invent entries out of them.
+  #[test]
+  fn the_roster_reader_never_reads_a_path_out_of_prose() {
+    let mut found = Vec::new();
+    collect_field_literals(
+      "//! see `lid/Prose.mlmodelc` for the epsilon table\n/// and `doc/Prose.mlmodelc`\nfn f() {}\n"
+        .parse()
+        .expect("tokenises"),
+      "path",
+      &mut found,
+    );
+    assert!(found.is_empty(), "read {found:?} out of prose");
+  }
+
+  // ── The source sweep: what counts as a feature the tree NAMES ──────────────
+
+  /// **The sibling scanner, enumerated the same way.** `cfg_features_in_source`
+  /// decides whether a `commercial-` feature gates any code at all, and it
+  /// looked for the substring `feature = "` anywhere in a file. Prose and
+  /// string literals both matched, so a feature named only in a SENTENCE read
+  /// as a live gate and direction 3's third clause passed vacuously over it.
+  #[test]
+  fn the_source_sweep_never_counts_prose_or_a_string_literal() {
+    let cases: &[(&str, &str)] = &[
+      (
+        "a line comment",
+        "// gated on feature = \"ghost\"\nfn f() {}\n",
+      ),
+      (
+        "a doc comment",
+        "/// Behind feature = \"ghost\".\npub fn f() {}\n",
+      ),
+      (
+        "an inner doc comment",
+        "//! `#[cfg(feature = \"ghost\")]` guards this module.\n",
+      ),
+      (
+        "a block comment",
+        "/* #[cfg(feature = \"ghost\")] */\nfn f() {}\n",
+      ),
+      (
+        "a string literal",
+        "const S: &str = \"#[cfg(feature = \\\"ghost\\\")]\";\n",
+      ),
+      (
+        "a raw string literal",
+        "const S: &str = r#\"#[cfg(feature = \"ghost\")]\"#;\n",
+      ),
+      (
+        "a `doc` attribute",
+        "#[doc = \"gated on feature = \\\"ghost\\\"\"]\npub fn f() {}\n",
+      ),
+    ];
+
+    let mut counted = Vec::new();
+    for (what, source) in cases {
+      let found = cfg_features_in(source);
+      if found.contains("ghost") {
+        counted.push(format!("  {what}: read as naming {found:?}"));
+      }
+    }
+    assert!(
+      counted.is_empty(),
+      "a feature named in prose or in a string compiles nothing differently. Counting it lets \
+       a `commercial-` gate that guards no code at all read as live, which is precisely the \
+       clause this sweep exists to enforce.\n{}",
+      counted.join("\n")
+    );
+  }
+
+  /// Every shape that IS conditional compilation is counted, wherever the
+  /// feature sits inside the predicate: this sweep asks whether the feature
+  /// changes what compiles, not whether it is REQUIRED — a negation qualifies
+  /// as much as a plain gate. (That is the opposite of what
+  /// [`gates_of_module`] asks, and the split is the point.)
+  #[test]
+  fn the_source_sweep_counts_every_conditional_compilation_site() {
+    let cases: &[(&str, &str)] = &[
+      ("a plain gate", "#[cfg(feature = \"plain\")]\nfn f() {}\n"),
+      ("a negation", "#[cfg(not(feature = \"neg\"))]\nfn f() {}\n"),
+      (
+        "an alternative",
+        "#[cfg(any(unix, feature = \"alt\"))]\nfn f() {}\n",
+      ),
+      (
+        "a `cfg_attr`",
+        "#[cfg_attr(feature = \"ca\", derive(Debug))]\nstruct S;\n",
+      ),
+      (
+        "a `cfg_attr` rustfmt wrapped",
+        "#[cfg_attr(\n  feature = \"wrapped\",\n  serde(default)\n)]\nstruct S;\n",
+      ),
+      (
+        "the `cfg!` macro",
+        "fn f() -> bool { cfg!(feature = \"bang\") }\n",
+      ),
+      (
+        "an inner attribute",
+        "#![cfg(feature = \"inner\")]\nfn f() {}\n",
+      ),
+      (
+        "an attribute inside a `macro_rules!` body",
+        "macro_rules! m {\n  () => {\n    #[cfg(feature = \"macro\")]\n    fn g() {}\n  };\n}\n",
+      ),
+      (
+        "an attribute on a nested item",
+        "mod m {\n  impl S {\n    #[cfg(feature = \"nested\")]\n    fn g() {}\n  }\n}\n",
+      ),
+    ];
+
+    let mut missed = Vec::new();
+    for (what, source) in cases {
+      let expected = source
+        .split("feature = \"")
+        .nth(1)
+        .and_then(|t| t.split('"').next())
+        .expect("each case names one feature");
+      let found = cfg_features_in(source);
+      if !found.contains(expected) {
+        missed.push(format!("  {what}: expected {expected:?}, found {found:?}"));
+      }
+    }
+    assert!(
+      missed.is_empty(),
+      "a conditional-compilation site this sweep cannot see makes the feature it names read as \
+       gating nothing.\n{}",
+      missed.join("\n")
+    );
+  }
 
   #[test]
   fn the_feature_reader_finds_every_declared_name() {

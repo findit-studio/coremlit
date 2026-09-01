@@ -137,6 +137,16 @@ fn model_declares_the_pinned_io_contract() {
   assert_eq!(description.inputs().len(), 1, "exactly one input");
   assert_eq!(description.outputs().len(), 1, "exactly one output");
   assert!(
+    description.states().is_empty(),
+    "the identity graph must declare NO `MLState` buffers: `Embedder::embed` predicts through \
+     the stateless API, which CoreML does not allow for a stateful model. Declared: {:?}",
+    description
+      .states()
+      .iter()
+      .map(coremlit::FeatureInfo::name)
+      .collect::<Vec<_>>()
+  );
+  assert!(
     !input.is_optional(),
     "the one input this door supplies is the one the graph requires"
   );

@@ -382,3 +382,47 @@ fn finite_embedding_check_reports_the_index() {
     Err(Error::NonFiniteOutput(7))
   ));
 }
+
+/// **The stateful-graph refusal.** `check_input_set` reasons over ORDINARY
+/// inputs, and CoreML does not put state buffers there: a stateful ML Program
+/// declaring exactly `mel` and `embedding` plus a `kv_cache` state passes every
+/// name, shape, dtype, constraint and input-set check, loads, and only then
+/// meets `embed`, which predicts through the STATELESS API. CoreML requires a
+/// stateful model to receive an `MLState` on every prediction, so that either
+/// fails or silently throws the persistence away.
+#[test]
+fn check_state_set_refuses_a_graph_that_declares_state() {
+  let outcome = check_state_set(["kv_cache"]);
+  assert!(
+    outcome.is_err(),
+    "a graph declaring a state buffer must be refused at LOAD; `embed` predicts through the \
+     stateless API and never makes an `MLState`"
+  );
+  let Error::UnsatisfiableState(name) = outcome.unwrap_err() else {
+    panic!("expected UnsatisfiableState")
+  };
+  assert_eq!(name, "kv_cache");
+  let rendered = Error::UnsatisfiableState(name).to_string();
+  assert!(
+    rendered.contains("stateless API"),
+    "the refusal must say what this door does instead: {rendered}"
+  );
+}
+
+/// A stateless graph declares no state buffers at all, and that is the only
+/// state set this door can honour.
+#[test]
+fn check_state_set_accepts_a_graph_with_no_state() {
+  assert!(check_state_set([]).is_ok());
+}
+
+/// The first offender by NAME is reported, matching `check_input_set`: CoreML
+/// hands the state descriptions back as an unordered dictionary and
+/// `snapshot_features` sorts it, so the message is stable across loads.
+#[test]
+fn check_state_set_reports_a_stable_offender() {
+  assert!(
+    matches!(check_state_set(["aaa", "zzz"]), Err(Error::UnsatisfiableState(n)) if n == "aaa"),
+    "the first offender in name order must be the one reported"
+  );
+}

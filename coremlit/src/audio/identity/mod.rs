@@ -120,7 +120,7 @@
 
 use std::path::Path;
 
-use crate::{ComputeUnits, DataType, Model, MultiArray, ShapeConstraint};
+use crate::{ComputeUnits, DataType, FeatureInfo, Model, MultiArray, ShapeConstraint};
 
 pub mod error;
 
@@ -293,8 +293,9 @@ impl Embedder {
   /// more than the one shape, is refused here rather than at the first
   /// prediction.
   ///
-  /// It also checks the COMPLETE input set, not only the feature it sends. Two
-  /// things a per-feature check cannot see are what make that necessary:
+  /// It also checks the COMPLETE input set and the COMPLETE state set, not
+  /// only the feature it sends. Three things a per-feature check cannot see are
+  /// what make that necessary:
   ///
   ///   - a graph carrying `mel` plus another REQUIRED input passes every
   ///     per-feature check and then fails on every prediction, because
@@ -303,7 +304,18 @@ impl Embedder {
   ///     [`crate::FeatureInfo::shape`], so a flexible graph converted at
   ///     `[1, 72, 401]` declares this contract's exact numbers — and a flexible
   ///     input is what takes the graph off the accelerator, which is the one
-  ///     reason the conversion recipe pins a fixed shape.
+  ///     reason the conversion recipe pins a fixed shape;
+  ///   - a STATE buffer is not an input at all. It lives in its own
+  ///     dictionary ([`crate::ModelDescription::states`]), so a stateful ML
+  ///     Program declaring exactly `mel` and `embedding` plus a state clears
+  ///     the input set too — and then meets [`Self::embed`], which predicts
+  ///     through the stateless API that CoreML does not let a stateful model
+  ///     be called with.
+  ///
+  /// Which is "complete" over exactly the members of
+  /// [`crate::ModelDescription`] that can make a conformant prediction fail;
+  /// that type's own documentation is the table of what those are and what is
+  /// dropped.
   ///
   /// No model is bundled: the `.mlmodelc` is a directory artifact, staged
   /// gitignored under `Models/redimnet/` from the `MODELS_LOCK` table.
@@ -311,7 +323,8 @@ impl Embedder {
   /// # Errors
   /// [`Error::Load`] if CoreML rejects the model; [`Error::ContractMismatch`]
   /// if its I/O contract mismatches; [`Error::UnsatisfiableInput`] if it
-  /// requires an input this door never sends.
+  /// requires an input this door never sends; [`Error::UnsatisfiableState`] if
+  /// it declares a state buffer.
   pub fn load(model_path: impl AsRef<Path>, options: EmbedderOptions) -> Result<Self> {
     let model = Model::load(model_path, options.compute())?;
     let description = model.description();
@@ -336,6 +349,7 @@ impl Embedder {
         .iter()
         .map(|f| (f.name(), f.is_optional())),
     )?;
+    check_state_set(description.states().iter().map(FeatureInfo::name))?;
 
     Ok(Self {
       model,
@@ -501,6 +515,27 @@ fn check_input_set<'a>(declared: impl IntoIterator<Item = (&'a str, bool)>) -> R
     }
   }
   Ok(())
+}
+
+/// Refuse a graph that declares CoreML STATE buffers.
+///
+/// `check_input_set` cannot see these: state features live in
+/// `stateDescriptionsByName`, a dictionary of their own, and never appear among
+/// the ordinary inputs. So a stateful ML Program declaring exactly `mel` and
+/// `embedding` plus a state satisfies every per-feature check AND the complete
+/// input set, loads, and then meets [`Embedder::embed`] — which predicts
+/// through the stateless API. CoreML requires a stateful model to receive an
+/// `MLState` on every prediction, so the prediction fails or the graph's
+/// persistence is silently discarded.
+///
+/// Returns [`Error::UnsatisfiableState`] naming the first declared state
+/// buffer; `declared` arrives in name order from
+/// [`crate::ModelDescription::states`], so the name is stable across loads.
+fn check_state_set<'a>(declared: impl IntoIterator<Item = &'a str>) -> Result<()> {
+  match declared.into_iter().next() {
+    Some(name) => Err(Error::UnsatisfiableState(name.to_string())),
+    None => Ok(()),
+  }
 }
 
 /// Reject a window the pipeline must not see: one that is not exactly

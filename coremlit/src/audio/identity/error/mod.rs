@@ -203,6 +203,19 @@ pub enum Error {
   )]
   UnsatisfiableInput(String),
 
+  /// The loaded graph declares CoreML STATE buffers, and this door predicts
+  /// through the stateless API.
+  ///
+  /// Carries the offending state feature name. A stateful model must receive an
+  /// `MLState` on every prediction; a door that never makes one either fails
+  /// the prediction outright or silently discards the persistence the graph was
+  /// built around. Neither is something to discover at predict time.
+  #[error(
+    "model declares the state buffer `{0}`, and this door predicts through the \
+     stateless API; a stateful graph needs an `MLState` on every prediction"
+  )]
+  UnsatisfiableState(String),
+
   /// A model output component was NaN or infinite — model corruption, caught
   /// before the raw vector reaches a caller's normalization, where it would
   /// turn the whole embedding into NaNs.
