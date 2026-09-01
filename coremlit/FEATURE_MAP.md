@@ -113,6 +113,7 @@ and driven by the `features` job of CI (`.github/workflows/ci.yml`), which runs
 | `whisper` | the STT pipeline alone |
 | `align` | forced alignment alone (asry emissions, no ort) |
 | `speaker` | diarization backends + diaric clustering core (no ort) |
+| `speaker,serde` | named smoke for `speaker`'s own serde code (`WindowOptions`' validated `Deserialize`) — see below |
 | `vad` | Silero model layer alone (`zuoer` detector core, no ort) |
 | `whisper,vad` | the `silero_vad` composition (former `vadkit` feature) |
 | `align-oracle` | + asry ONNX aligner (ort + whisper.cpp) |
@@ -124,9 +125,18 @@ and driven by the `features` job of CI (`.github/workflows/ci.yml`), which runs
 | `whisper,align,speaker,vad,clap,granite,siglip,ced,lid,serde,tracing,nl-recognizer` | all non-oracle features on |
 | `whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,serde,tracing,nl-recognizer` | all-on (every coremlit feature, `align-oracle` included) |
 
-`serde` and `tracing` are cross-cutting and covered by the all-on runs. The
-list embodies the combinatorial-honesty rule: it is explicit and reviewable,
-not an implicit powerset.
+`serde` and `tracing` are cross-cutting and covered by the all-on runs, with
+one named exception: `speaker,serde` (issue #129). `WindowOptions`' validated
+`Deserialize` (`serde(try_from = WindowOptionsRepr)`, module doc "Validated
+deserialization") is `speaker`'s only `#[cfg(feature = "serde")]` code, and it
+broke — silently — behind the all-on rows' other ten features for long enough
+that three `#[ignore]`d tests built on its PRE-fix behavior
+(`extract_serde_bypassed_*`) went stale on `main` with nothing red. Both
+all-on rows still exercise it too; this row exists so a `speaker`+`serde`
+regression is legible by name instead of buried in a twelve-feature diff. It
+is one curated row for the one kit that has needed it, not a new per-kit ×
+`serde` dimension — the list stays explicit and reviewable, not an implicit
+powerset.
 
 "Artifact-sidecar tokenizer" (`granite`, `siglip`) means the crate embeds no
 `tokenizer.json` for those two — each is a multi-megabyte file the published

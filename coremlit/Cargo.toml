@@ -183,7 +183,7 @@ required-features = ["whisper", "vad"]
 
 [[test]]
 name = "whisper_rtf_gate"
-path = "benches/whisper/rtf.rs"
+path = "benches/whisper/rtf_gate.rs"
 required-features = ["whisper"]
 
 [[bench]]

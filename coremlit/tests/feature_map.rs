@@ -146,6 +146,7 @@ const INTENDED_CI_COMBOS: &[&str] = &[
   "whisper",
   "align",
   "speaker",
+  "speaker,serde",
   "vad",
   "whisper,vad",
   "align-oracle",
@@ -557,6 +558,7 @@ jobs:
           - "whisper"
           - "align"
           - "speaker"
+          - "speaker,serde"
           - "vad"
           - "whisper,vad"
           - "align-oracle"

@@ -138,8 +138,17 @@ fn measure(model: &EmbedModel, label: &str) -> (f64, f64, usize) {
 #[test]
 #[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS) + committed goldens"]
 fn embedding_parity_fp32_vs_dia_ort() {
+  let embed_fp32_path = common::embed_fp32_path();
+  if common::skipped_for_stale_overlay(
+    "embedding_parity_fp32_vs_dia_ort",
+    &embed_fp32_path,
+    "wespeaker.mlmodelc",
+  ) {
+    return;
+  }
+
   let model = EmbedModel::from_file_with(
-    common::embed_fp32_path(),
+    embed_fp32_path,
     EmbedModelOptions::new().with_compute(ComputeUnits::CpuOnly),
   )
   .expect("load wespeaker.mlmodelc (fp32)");

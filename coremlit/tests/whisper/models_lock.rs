@@ -823,11 +823,11 @@ fn ignored_gates(src_root: &Path, dir: &Path) -> Vec<(String, String)> {
 ///
 /// 230 of this repository's model gates are `#[ignore]`d unit tests inside the
 /// pipeline modules rather than `tests/` binaries (#61), and
-/// `--features speaker --lib` lists 38 of them. ELEVEN read
+/// `--features speaker --lib` lists 42 of them. ELEVEN read
 /// `ARGMAX_TEST_MODELS` — the `argmax-speakerkit` tree
 /// [`UNSTAGED_DEFECT_VENDORS`] records as deliberately unfetched, for a
 /// LICENSING reason rather than a cost one — so the shard's gate plan skips
-/// exactly those and runs the other 27.
+/// exactly those and runs the other 31.
 ///
 /// Both drift directions are pinned, and they fail in opposite ways. A new
 /// argmax-tree gate the filter does not name turns the shard red on a missing
@@ -961,6 +961,9 @@ fn ci_speaker_lib_gates_skip_exactly_the_unstaged_argmax_tree() {
 /// turns a wrong order into a named failure instead of anonymous "sha256 drift"
 /// reported a full build later by `speaker_model_io` — and the pins are a
 /// deliberate SECOND copy of that gate's, so this test holds the two together.
+/// A THIRD copy — `tests/speaker/common/mod.rs`'s `skipped_for_stale_overlay`,
+/// the parity gates' own runtime hash-vs-LOCK check — is held to the same two
+/// below alongside them.
 #[test]
 fn ci_stages_the_speakerkit_overlay_last_and_proves_it_won() {
   let Some((lock_path, workflow_path)) = repo_files() else {
@@ -1043,6 +1046,13 @@ fn ci_stages_the_speakerkit_overlay_last_and_proves_it_won() {
   let model_io = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/speaker/model_io.rs");
   let model_io =
     fs::read_to_string(&model_io).unwrap_or_else(|e| panic!("read {}: {e}", model_io.display()));
+  // A THIRD copy of the same two hashes lives in `tests/speaker/common/mod.rs`'s
+  // `skipped_for_stale_overlay` — the parity gates' own hash-vs-LOCK check, independent of both
+  // ci.yml's overlay step and model_io.rs's byte-pin tests. Held to the same pin below so a
+  // re-baseline of one copy cannot silently leave another checking retired bytes.
+  let common_mod = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/speaker/common/mod.rs");
+  let common_mod = fs::read_to_string(&common_mod)
+    .unwrap_or_else(|e| panic!("read {}: {e}", common_mod.display()));
   for (bundle, gate) in [
     (
       "pyannote_segmentation.mlmodelc",
@@ -1078,6 +1088,13 @@ fn ci_stages_the_speakerkit_overlay_last_and_proves_it_won() {
        tests/speaker/model_io.rs — the overlay check and the {gate} gate have drifted apart, so \
        CI would demand bytes that gate rejects (or accept bytes it would reject). Re-baseline \
        both together."
+    );
+    assert!(
+      common_mod.contains(hash),
+      "ci.yml pins {bundle}/model.mil at sha256 {hash}, which appears nowhere in \
+       tests/speaker/common/mod.rs — `skipped_for_stale_overlay`'s OVERLAY_MODEL_MIL_PINS has \
+       drifted from the overlay check and the {gate} gate, so a stale-overlay skip could fire (or \
+       fail to fire) on bytes the other two disagree with. Re-baseline all three together."
     );
   }
 }
