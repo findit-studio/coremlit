@@ -47,7 +47,7 @@
 //! # The arithmetic is `diaric`'s, not a second copy
 //!
 //! Every statistic and every normalization on this page is
-//! [`diaric::score_norm`] called through — [`CohortStats`],
+//! [`diaric::score_norm`] called through — its `CohortStats`,
 //! [`diaric::score_norm::as_norm`], the [`AsNormOptions`] defaults,
 //! [`MAX_NORMALIZED_ERROR`]'s accuracy postcondition. That module is where the
 //! cancellation analysis, the subnormal handling and the two-tier error
@@ -58,14 +58,57 @@
 //! - the [`Scoring`] a profile is prepared for, and the preparation itself;
 //! - a **fallible** boundary. `diaric`'s cohort statistics take an INFALLIBLE
 //!   `FnMut(&S, &T) -> f64`, so a refusal inside scoring has no way out of the
-//!   closure. [`enrolled_stats`] and [`held_out_stats`] carry it out by hand
-//!   rather than letting a caller decide what number a failed score should be
-//!   — an `unwrap_or(0.0)` inside that closure poisons a mean silently, which
-//!   is the one failure AS-Norm exists to prevent;
-//! - the shape that says which cohort each side of a trial may use, and the
-//!   [`Scoring`] tag carried through every value so one metric cannot
-//!   calibrate another. Those two are the rest of this page, and both are
-//!   corrections to what this module said when it was first written.
+//!   closure. The side constructors carry it out by hand rather than letting a
+//!   caller decide what number a failed score should be — an `unwrap_or(0.0)`
+//!   inside that closure poisons a mean silently, which is the one failure
+//!   AS-Norm exists to prevent;
+//! - the [`Calibration`] that holds every attribute a trial has to agree on,
+//!   so no two of them can be got out of step. That is the rest of this page,
+//!   and it is the third correction to what this module said when it was first
+//!   written.
+//!
+//! # One scoped operation, not three loose values
+//!
+//! A calibrated trial is the product of a single [`Calibration`]. Nothing else
+//! produces one, and a caller assembles no operands at all.
+//!
+//! ```text
+//! Calibration::new(cohort, options)     one cohort, one configuration
+//!   .side(&probe)             -> TrialSide        bound to that profile
+//!   .enrolled_side(Enrolled)  -> TrialSide        bound to that profile and key
+//!   .trial(&a, &b)            -> CalibratedTrial  the raw score AND the calibrated one
+//! ```
+//!
+//! AS-Norm1's eq. (7) has four things that must agree, and each of the first
+//! three was once a value the caller carried between calls:
+//!
+//! | must agree | how it is fixed |
+//! |---|---|
+//! | the **metric** both numbers were computed in | a side exists only if its profile's [`Scoring`] matched every cohort entry it was scored against; [`Calibration::trial`] then computes the raw score **from those same two profiles** |
+//! | the **cohort** both sides selected their top-N from | the [`Calibration`] owns it, by value, for its whole life |
+//! | the **endpoints** the trial score is between | [`Calibration::trial`] takes no score. It computes one, from the two sides' own profiles, so the trial is between whoever the sides are |
+//! | the **configuration** both sides were derived under | the [`Calibration`] owns the [`AsNormOptions`] too, and both side constructors read it from there |
+//!
+//! **Why this shape and not one more tag.** The three rounds of review that
+//! produced it each bound one more attribute onto three loose values — a raw
+//! score and two statistics — that a caller assembled by hand: first the
+//! metric, then the cohort, then the endpoints and the configuration. Each
+//! round's fix was correct and each left the next attribute unbound, because
+//! the shape was the defect: a value a caller carries between two calls is a
+//! value they can carry from the wrong place. Removing the assembly removes
+//! the class. There is no public constructor for a [`TrialSide`] or a
+//! [`CalibratedTrial`], and no function anywhere on this page that takes a raw
+//! score and two statistics.
+//!
+//! **What is left, stated rather than left to be found.** Two [`Calibration`]s
+//! are two values, so a caller holding both can still hand one's side to the
+//! other's [`trial`](Calibration::trial). That is a refusal
+//! ([`CalibrateError::CalibrationMismatch`]) rather than a wrong number, and
+//! it is *one* check over *one* opaque identity — not four checks over four
+//! attributes — because a calibration fixes all four at once. Making even that
+//! a compile error would take an invariant lifetime and a closure-scoped API,
+//! which would end the reuse guarantee below: a cached side could not outlive
+//! the scope that built it. The trade is deliberate, and it is the residual.
 //!
 //! # Two sides, and only one of them has an identity
 //!
@@ -74,7 +117,8 @@
 //!
 //! The **enrolled** side is a speaker the caller's library already names. Its
 //! identity is known, so a cohort drawn from that same library can have
-//! exactly that speaker's entries removed — [`enrolled_stats`], which is
+//! exactly that speaker's entries removed —
+//! [`Calibration::enrolled_side`], which is
 //! [`Cohort::stats_excluding`](diaric::score_norm::Cohort::stats_excluding)
 //! with the key and the profile handed over as one [`Enrolled`] value.
 //!
@@ -118,17 +162,19 @@
 //! asked. *"Was this cohort drawn from people who are not in my library?"* is
 //! provenance, and the caller answered it when they assembled the cohort.
 //!
-//! One cohort serves both sides of a trial, and [`as_norm`] refuses two sides
-//! that came from different ones. AS-Norm averages two z-scores, and they are
-//! only commensurable when they measure the same trial score against the same
-//! impostor population — [`diaric::score_norm`]'s own statement of eq. (7) has
-//! each side selecting its top-N of *the shared cohort*. So a trial with an
-//! unidentified probe in it takes both sides over one [`HeldOutCohort`], which
-//! is what the example below does. [`enrolled_stats`] is the other shape: one
-//! [`LibraryCohort`] serving two NAMED sides, each dropping its own speaker's
-//! entries. "One cohort, and the door checks it" says why the MIXTURE of those
-//! two — a library-sampled enrolment side against a held-out probe side — is
-//! now a refusal rather than a caveat.
+//! One cohort serves both sides of a trial. AS-Norm averages two z-scores, and
+//! they are commensurable only when they measure the same trial score against
+//! the same impostor population — [`diaric::score_norm`]'s own statement of
+//! eq. (7) has each side selecting its top-N of *the shared cohort*. So a
+//! trial with an unidentified probe in it is calibrated over one
+//! `Calibration<HeldOutCohort>`, which is what the example below does.
+//! `Calibration<LibraryCohort<K>>` is the other shape: one cohort serving two
+//! NAMED sides, each dropping its own speaker's entries. The MIXTURE of those
+//! two — a library-sampled enrolment side against a held-out probe side —
+//! reverses the candidate ranking on valid, healthy-looking numbers
+//! (`two_sides_from_different_calibrations_are_refused` has the case), and
+//! there is no way to express it: the two sides come from two calibrations,
+//! and neither calibration will normalize the other's.
 //!
 //! ## Why the signatures changed, and not only the prose
 //!
@@ -150,8 +196,9 @@
 //!
 //! ## The key travels with the profile
 //!
-//! [`enrolled_stats`] takes one [`Enrolled`] rather than a key *and* a side,
-//! so there is no second argument left that could name a different speaker.
+//! [`Calibration::enrolled_side`] takes one [`Enrolled`] rather than a key
+//! *and* a side, so there is no second argument left that could name a
+//! different speaker.
 //!
 //! What remains is not a mis-passed argument but a false statement:
 //! `Enrolled::new(&candidate_key, &probe)` *claims* the probe belongs to that
@@ -159,146 +206,110 @@
 //! hold the library — but it is a claim spelled out at the point a caller
 //! reads a library record, not an argument slot two positions along from the
 //! one that matters. A probe has no such value to build, and that is the
-//! point: a bare [`VoiceProfile`] reaches only [`held_out_stats`].
+//! point: a bare [`VoiceProfile`] reaches only [`Calibration::side`], the
+//! held-out door.
 //!
 //! ```compile_fail,E0308
 //! use coremlit::audio::speaker::calibrate::{
-//!   AsNormOptions, LibraryCohort, Scoring, enrolled_stats,
+//!   AsNormOptions, Calibration, LibraryCohort, Scoring,
 //! };
 //! # let raw = vec![0.5f32; coremlit::audio::speaker::embed::EMBEDDING_DIM];
 //! let mut cohort: LibraryCohort<u32> = LibraryCohort::new();
 //! cohort.push(1, Scoring::Cosine.prepare(&raw).unwrap());
+//! let calibration = Calibration::new(cohort, AsNormOptions::new());
 //! // An unidentified probe: a prepared vector and no key at all. There is no
 //! // identity to exclude, so the excluding door must not accept it.
 //! let probe = Scoring::Cosine.prepare(&raw).unwrap();
-//! let _ = enrolled_stats(&cohort, &probe, &AsNormOptions::new());
+//! let _ = calibration.enrolled_side(&probe);
 //! ```
 //!
-//! # Every value carries its score source
+//! # The score source is structural, not re-checked
 //!
-//! [`Scoring`] is checked at every step rather than once.
-//! [`VoiceProfile::score`] returns a [`TrialScore`], both statistics doors
-//! return a [`SideStats`], each carrying the source it was computed in, and
-//! [`as_norm`] refuses unless all three agree
-//! ([`CalibrateError::NormalizationMismatch`]).
+//! [`Scoring`] used to be a tag carried on a raw score and on both statistics
+//! and compared three ways at the last step. It no longer needs to be, because
+//! the last step is no longer handed a number.
 //!
-//! That is the failure a single check at `score()` did not cover, and it is
+//! A [`TrialSide`] exists only if its profile was scored against the cohort
+//! and every entry it reached agreed with it
+//! ([`CalibrateError::ScoringMismatch`] refuses the whole call otherwise, and
+//! `diaric`'s own [`MIN_COHORT_SCORES`] floor refuses a side that reached too
+//! few entries to have one). Two sides of one calibration therefore agree with
+//! the cohort, and so with each other. Then [`Calibration::trial`] computes the
+//! raw score from those two profiles, in the source they were prepared for,
+//! rather than accepting one computed elsewhere.
+//!
+//! That is the failure a single check at score time did not cover, and it is
 //! silent by construction: [`Scoring::Cosine`] cohort scores of `[-1, 1]` have
 //! mean `0` and deviation `1`, so *any* finite [`Scoring::PldaCosine`] trial
 //! score normalized against them comes back finite and plausible — one metric
 //! calibrated by another, with no value out of range to notice. It is most
 //! reachable exactly where this design pushes a caller: caching a
-//! [`SideStats`] per speaker while iterating over both score sources, which is
-//! what #123's ask 3 is.
+//! [`TrialSide`] per speaker while iterating over both score sources, which is
+//! what #123's ask 3 is. A cached side carries its calibration, and a
+//! calibration is over one cohort, whose entries are prepared for one source.
 //!
-//! The tag is trustworthy because there is no way to write one down. A
-//! [`TrialScore`] exists only as the output of [`VoiceProfile::score`], which
-//! produces the number and the source together; a [`SideStats`] exists only as
-//! the output of the two statistics doors, which take theirs from the side
-//! profile — and every cohort entry that reached those statistics had to match
-//! that profile or the whole call is [`CalibrateError::ScoringMismatch`].
-//!
-//! **What it does not promise.** The tag says which *metric* a number was
-//! computed in, and only that. Which *cohort* it came from is a second
-//! question with a second answer, immediately below. An earlier version of
-//! this page left that one to the caller; it should not have.
-//!
-//! # One cohort, and the door checks it
-//!
-//! A [`SideStats`] carries the [`CohortId`] of the cohort it was taken over as
-//! well as its [`Scoring`], and [`as_norm`] refuses two sides that disagree on
-//! it ([`CalibrateError::CohortMismatch`]).
-//!
-//! That is not tidiness. Two sides over different impostor populations do not
-//! merely return a number that is a little off — they REVERSE the candidate
-//! ranking, which is the one thing identification exists to get right. The
-//! case, pinned to its digits by
-//! `two_sides_taken_over_different_cohorts_are_refused`:
-//!
-//! ```text
-//! probe P = e0     A = (0.8, 0.6, 0)     B = (0.7, 0, sqrt(0.51))
-//! held-out H = {±e0, ±e1, ±e2}     library L = {A, B, X}
-//!
-//! raw score                            A 0.800  >  B 0.700     A first
-//! both sides over H                    A 1.386  >  B 1.212     A first
-//! enrolled over L, probe over H        A 1.193  <  B 1.356     B FIRST
-//! ```
-//!
-//! Every profile is valid, every deviation clears [`DEFAULT_MIN_DEVIATION`],
-//! all three values in each trial are tagged
-//! [`Scoring::Cosine`], and the mixed pairing returned `Ok` with nothing in
-//! the number to say the order had been inverted. A `Scoring`-only tag cannot
-//! see it, because both sides really were computed in one metric — the metric
-//! was never what differed.
-//!
-//! **What a [`CohortId`] proves, and what it does not.** It is minted per
-//! cohort VALUE and it is opaque: no constructor, no accessor to the number,
-//! nothing a caller can write down or forge. So it proves exactly one thing —
-//! that two [`SideStats`] were taken over the same cohort — which is all
-//! eq. (7) asks for. It says nothing about whether that cohort was a good one:
-//! provenance, size and speaker coverage are still the caller's, and
-//! [`HeldOutCohort::assuming_disjoint`] is still the one place they state the
-//! first of those. Two cohorts assembled separately from the very same
-//! profiles get two identities, because nothing in this crate can tell they
-//! are one population; a [`Clone`] keeps its cohort's identity, and
-//! [`LibraryCohort::push`] mints a fresh one, since a cohort with a member
-//! added is not the population the sides already taken were computed over.
-//!
-//! **Self-exclusion is inside the arithmetic, not outside the check.** Two
-//! [`enrolled_stats`] sides over one [`LibraryCohort`] each drop their own
-//! speaker's entries, so the two selections are not the same set of scores —
-//! and they still agree on the [`CohortId`]. That is correct rather than a
-//! hole: per-side self-exclusion is eq. (7)'s own arrangement, it is symmetric
-//! between the two sides, and `diaric` names removing anything ELSE — the
-//! partner especially — as the failure. What the check refuses is two
-//! different impostor populations, which is the thing the arithmetic has no
-//! way to absorb.
-//!
-//! # The untagged road is a different crate, not a re-export
+//! # What leaves this module
 //!
 //! `diaric`'s own [`as_norm`](diaric::score_norm::as_norm) is arithmetic over
-//! two untagged [`CohortStats`], and this module re-exports neither it nor
-//! the containers that produce one.
+//! two unbound `CohortStats`, and this module re-exports neither it nor the
+//! containers that produce one. Nor does it hand out the **operands**:
 //!
-//! **That second half is a correction.** The version of this page that shipped
-//! re-exported `diaric`'s generic
-//! [`Cohort<K, T>`](diaric::score_norm::Cohort) whole, including its public
-//! inherent
-//! [`stats_excluding`](diaric::score_norm::Cohort::stats_excluding); `T` is
-//! unconstrained, so it accepts a [`VoiceProfile`] like any other item type.
-//! A caller holding the exact type these doors produce could therefore write
+//! - a [`TrialSide`] has no `mean` and no `deviation`, and no accessor to the
+//!   `CohortStats` inside it. Its [`Debug`] is hand-written for the same
+//!   reason — the derived one printed both numbers, which is the same
+//!   disclosure through a different door;
+//! - a [`VoiceProfile`] has no public way to produce a number at all. Scoring
+//!   two profiles is private to this module;
+//! - the only `f64`s this page emits are [`CalibratedTrial`]'s two, produced
+//!   together by [`Calibration::trial`], which fixed all four of eq. (7)'s
+//!   attributes before it computed either of them.
 //!
-//! ```text
-//! cohort.stats_excluding(&candidate_key, &probe, |a, b| a.score(b).unwrap().raw(), options)
-//! ```
+//! **This is a correction.** The version of this page that shipped published
+//! `TrialScore::raw`, `SideStats::mean` and `SideStats::deviation` — every
+//! operand of `0.5·((s−μₐ)/σₐ + (s−μᵦ)/σᵦ)` — and its derived `Debug` printed
+//! the last two as well. So the cross-cohort normalization this door refuses
+//! was a two-line function over values `coremlit` itself handed out, needing
+//! no `diaric` dependency and no statistic of the caller's own. Calling that
+//! pairing "a typed refusal rather than a caveat" was true of the door, and
+//! the door was not the only way through.
 //!
-//! and get back a candidate-dependent, untagged statistic — the probe's scores
-//! going from `[0, 0.8, 0.2]` to `[0, 0.2]` on the choice of candidate —
-//! through `coremlit`'s own surface, which is precisely the shape
-//! [`HeldOutCohort`] exists to make inexpressible. Calling that "a different
-//! road that never touches `coremlit`'s tagged values" was wrong: it was a
-//! re-export, and it ran straight through them.
+//! **And here is what this page does not claim.** A caller owns the embedding
+//! rows they prepared their profiles from, and `diaric` is a published crate.
+//! They can compute their own cosines, select their own top-N and evaluate
+//! eq. (7) over two cohorts of their own — and, holding a [`Calibration`],
+//! they can take a side per cohort member and read the raw scores back out of
+//! [`CalibratedTrial::raw`] to rebuild a mean and a deviation. Nothing in a
+//! library that does not hold the library can prevent arithmetic over the
+//! caller's own numbers. **Cross-cohort normalization is not, and cannot be
+//! made, structurally unavailable.** What is true is narrower, and is the
+//! whole claim: *no value `coremlit` produces is an operand of it.* That road
+//! now starts with building the statistic, not with reading one off something
+//! this crate returned.
 //!
-//! The cohorts are `coremlit`'s own types now — [`LibraryCohort`] and
-//! [`HeldOutCohort`] — and the `diaric` container inside each is private. So
-//! [`enrolled_stats`] and [`held_out_stats`] are the only constructors of a
-//! statistic over a [`VoiceProfile`] this crate offers, and a [`SideStats`]
-//! still never hands out the `CohortStats` inside it:
+//! The cohorts are `coremlit`'s own types — [`LibraryCohort`] and
+//! [`HeldOutCohort`] — and the `diaric` container inside each is private, so
+//! `diaric`'s generic [`Cohort<K, T>`](diaric::score_norm::Cohort) and its
+//! public
+//! [`stats_excluding`](diaric::score_norm::Cohort::stats_excluding) — whose
+//! `T` is unconstrained, and so accepts a [`VoiceProfile`] like any other item
+//! type — are not reachable through this surface:
 //!
 //! ```compile_fail,E0599
-//! use coremlit::audio::speaker::calibrate::{AsNormOptions, LibraryCohort, Scoring};
+//! use coremlit::audio::speaker::calibrate::{
+//!   AsNormOptions, LibraryCohort, Scoring, VoiceProfile,
+//! };
 //! # let raw = vec![0.5f32; coremlit::audio::speaker::embed::EMBEDDING_DIM];
 //! let mut cohort: LibraryCohort<u32> = LibraryCohort::new();
 //! cohort.push(1, Scoring::Cosine.prepare(&raw).unwrap());
 //! cohort.push(2, Scoring::Cosine.prepare(&raw).unwrap());
 //! let probe = Scoring::Cosine.prepare(&raw).unwrap();
-//! // `diaric`'s untagged statistic takes ANY key — the candidate's included —
-//! // and returns a number with no tag and no cohort identity on it. It is not
-//! // reachable from a cohort this crate hands out.
+//! // `diaric`'s unbound statistic takes ANY key — the candidate's included —
+//! // and returns a number with no calibration on it. It is not reachable from
+//! // a cohort this crate hands out.
 //! let _ = cohort.stats_excluding(
 //!   &1,
 //!   &probe,
-//!   |a, b| a.score(b).unwrap().raw(),
+//!   |_a: &VoiceProfile, _b: &VoiceProfile| 0.0,
 //!   &AsNormOptions::new(),
 //! );
 //! ```
@@ -323,35 +334,81 @@
 //!
 //! ```compile_fail,E0616
 //! use coremlit::audio::speaker::calibrate::{
-//!   AsNormOptions, HeldOutCohort, Scoring, held_out_stats,
+//!   AsNormOptions, Calibration, HeldOutCohort, Scoring,
 //! };
 //! # let raw = vec![0.5f32; coremlit::audio::speaker::embed::EMBEDDING_DIM];
 //! let profile = Scoring::Cosine.prepare(&raw).unwrap();
-//! let cohort = HeldOutCohort::assuming_disjoint(vec![profile; 4]);
-//! let side = held_out_stats(&cohort, &profile, &AsNormOptions::new()).unwrap();
+//! let calibration = Calibration::new(
+//!   HeldOutCohort::assuming_disjoint(vec![profile; 4]),
+//!   AsNormOptions::new(),
+//! );
+//! let side = calibration.side(&profile).unwrap();
 //! let _ = side.stats;
 //! ```
 //!
-//! A caller who genuinely wants untagged generic normalization still has a
-//! road, and it is a different one rather than a hatch in this one: they take
-//! their own `diaric` dependency and use `diaric`'s own types — a
-//! `Cohort<K, T>` of THEIR item type,
-//! [`stats_excluding`](diaric::score_norm::Cohort::stats_excluding) with their
-//! own `FnMut(&S, &T) -> f64`, and
-//! [`CohortStats::normalize`](diaric::score_norm::CohortStats::normalize).
-//! Nothing on that road needs a [`VoiceProfile`], and nothing here is in its
-//! way.
+//! The two operands are pinned one at a time as well, for the same reason one
+//! shared pin is not enough — either accessor coming back reopens the road on
+//! its own:
 //!
-//! **Where that stops, stated rather than left to be found.**
-//! [`VoiceProfile`] is a public type with a public
-//! [`score`](VoiceProfile::score) and [`TrialScore::raw`] is a public `f64`,
-//! so a caller who adds that `diaric` dependency can still put profiles into
-//! `diaric`'s own `Cohort` and call `stats_excluding` over them by hand.
-//! Nothing short of sealing [`VoiceProfile`] could prevent it, and sealing it
-//! would take [`TrialScore::raw`] with it — the number #123's own comparison
-//! is written against. What changed is that this is now a road a caller has to
-//! go and build: `coremlit`'s surface no longer hands them the untagged door
-//! with a tagged value already in it.
+//! ```compile_fail,E0599
+//! use coremlit::audio::speaker::calibrate::{
+//!   AsNormOptions, Calibration, HeldOutCohort, Scoring,
+//! };
+//! # let raw = vec![0.5f32; coremlit::audio::speaker::embed::EMBEDDING_DIM];
+//! let profile = Scoring::Cosine.prepare(&raw).unwrap();
+//! let calibration = Calibration::new(
+//!   HeldOutCohort::assuming_disjoint(vec![profile; 4]),
+//!   AsNormOptions::new(),
+//! );
+//! let side = calibration.side(&profile).unwrap();
+//! let _ = side.mean();
+//! ```
+//!
+//! ```compile_fail,E0599
+//! use coremlit::audio::speaker::calibrate::{
+//!   AsNormOptions, Calibration, HeldOutCohort, Scoring,
+//! };
+//! # let raw = vec![0.5f32; coremlit::audio::speaker::embed::EMBEDDING_DIM];
+//! let profile = Scoring::Cosine.prepare(&raw).unwrap();
+//! let calibration = Calibration::new(
+//!   HeldOutCohort::assuming_disjoint(vec![profile; 4]),
+//!   AsNormOptions::new(),
+//! );
+//! let side = calibration.side(&profile).unwrap();
+//! let _ = side.deviation();
+//! ```
+//!
+//! Scoring two profiles is private, so a raw similarity leaves this module
+//! only inside a [`CalibratedTrial`]:
+//!
+//! ```compile_fail,E0624
+//! use coremlit::audio::speaker::calibrate::Scoring;
+//! # let raw = vec![0.5f32; coremlit::audio::speaker::embed::EMBEDDING_DIM];
+//! let a = Scoring::Cosine.prepare(&raw).unwrap();
+//! let b = Scoring::Cosine.prepare(&raw).unwrap();
+//! let _ = a.score(&b);
+//! ```
+//!
+//! And neither product can be assembled by hand, which is what makes "a
+//! calibration produced it" a fact rather than a convention:
+//!
+//! ```compile_fail,E0451
+//! use coremlit::audio::speaker::calibrate::TrialSide;
+//! let _ = TrialSide {
+//!   profile: todo!(),
+//!   stats: todo!(),
+//!   calibration: todo!(),
+//! };
+//! ```
+//!
+//! ```compile_fail,E0451
+//! use coremlit::audio::speaker::calibrate::CalibratedTrial;
+//! let _ = CalibratedTrial {
+//!   raw: todo!(),
+//!   calibrated: todo!(),
+//!   scoring: todo!(),
+//! };
+//! ```
 //!
 //! # The score sources
 //!
@@ -436,21 +493,21 @@
 //! [`extract`](crate::audio::speaker::extract)'s shared-transform doc). A
 //! [`VoiceProfile`] is prepared once and scored many times.
 //!
-//! A [`SideStats`] depends only on its own profile and its own cohort, never
-//! on the other side of the trial, so it is computed once and reused across
+//! A [`TrialSide`] depends only on its own profile and its own calibration,
+//! never on the other side of the trial, so it is taken once and reused across
 //! every trial that profile appears in. **That holds for both sides here**,
 //! and it is what the shape above buys:
 //!
-//! | side | the trial's one cohort | the statistic depends on | reused across |
+//! | side | the calibration's cohort | the statistic depends on | reused across |
 //! |---|---|---|---|
-//! | enrolled | held-out (nothing to exclude), or library-sampled with its own key excluded | that speaker and the cohort | every trial over that cohort the speaker appears in |
-//! | probe | held-out only | that probe and the cohort | every candidate over that cohort the probe is scored against |
+//! | enrolled | held-out (nothing to exclude), or library-sampled with its own key excluded | that speaker and the calibration | every trial of that calibration the speaker appears in |
+//! | probe | held-out only | that probe and the calibration | every candidate of that calibration the probe is scored against |
 //!
-//! A cached [`SideStats`] is reusable across trials, not across cohorts. It
-//! carries the [`CohortId`] it was taken over, so pairing it with a side from
-//! some later-assembled cohort is a refusal rather than a silent mismatch —
-//! which is exactly the shape a per-speaker cache produces once a caller
-//! rebuilds their cohort.
+//! A cached [`TrialSide`] is reusable across trials, not across calibrations.
+//! It carries the [`CalibrationId`] it was taken under, so pairing it with a
+//! side from a later-built calibration is a refusal rather than a silent
+//! mismatch — which is exactly the shape a per-speaker cache produces once a
+//! caller rebuilds their cohort or changes their [`AsNormOptions`].
 //!
 //! `N` enrolled speakers against `M` probes over a cohort of `C` therefore
 //! costs `(N + M)·C` cohort scores and `N·M` trial scores, not `N·M·C` — for
@@ -467,23 +524,20 @@
 //!
 //! **Where it does not hold**: a probe against a library-sampled cohort. There
 //! is no entrypoint for that pairing, because there is no correct statistic to
-//! return — see above — and there is no half-measure either, now that the two
-//! sides of a trial have to agree on their [`CohortId`]. Taking the enrolment
-//! side over the library and the probe side over a held-out cohort is exactly
-//! the ranking-reversing pairing above, so a caller who has no held-out cohort
-//! has to assemble one and take BOTH sides over it before an unidentified
-//! probe can be normalized at all. That is a real restriction on what this
-//! door can do, and it is stated here rather than papered over with a default
-//! that would be wrong in a way nothing could detect.
+//! return — see above — and there is no half-measure either, now that a trial
+//! is one calibration's product. Taking the enrolment side over the library
+//! and the probe side over a held-out cohort is exactly the ranking-reversing
+//! pairing above, so a caller with no held-out cohort has to assemble one and
+//! calibrate BOTH sides over it before an unidentified probe can be normalized
+//! at all. That is a real restriction on what this door can do, and it is
+//! stated here rather than papered over with a default that would be wrong in
+//! a way nothing could detect.
 //!
 //! # End to end
 //!
 //! ```
 //! use coremlit::audio::speaker::{
-//!   calibrate::{
-//!     AsNormOptions, Enrolled, HeldOutCohort, LibraryCohort, Scoring, as_norm, enrolled_stats,
-//!     held_out_stats,
-//!   },
+//!   calibrate::{AsNormOptions, Calibration, Enrolled, HeldOutCohort, LibraryCohort, Scoring},
 //!   embed::EMBEDDING_DIM,
 //! };
 //!
@@ -516,49 +570,55 @@
 //!     .collect::<Result<Vec<_>, _>>()?,
 //! );
 //!
-//! // 2. The trial: a library profile the caller can name, against a probe
+//! // 2. One calibration. It takes the cohort and the configuration by value,
+//! //    and from here on it is the only thing that produces a side or a
+//! //    trial — so no two of them can disagree about either.
+//! let over_held_out = Calibration::new(held_out, options);
+//!
+//! // 3. The trial: a library profile the caller can name, against a probe
 //! //    from a recording that has just been diarized — whose speaker is the
 //! //    thing being looked up, not something the caller can hand over.
 //! let alice: PersonId = 7;
 //! let stored = scoring.prepare(&stored_centroid(alice as usize))?;
 //! let probe = scoring.prepare(&probe_of(alice as usize))?;
 //!
-//! // 3. One side per profile, both over the same held-out cohort, both
-//! //    reusable. Neither depends on the other side of the trial.
-//! let stored_side = held_out_stats(&held_out, &stored, &options)?;
-//! let probe_side = held_out_stats(&held_out, &probe, &options)?;
+//! // 4. One side per profile, both reusable. Neither depends on the other
+//! //    side of the trial.
+//! let stored_side = over_held_out.side(&stored)?;
+//! let probe_side = over_held_out.side(&probe)?;
 //! assert_eq!(probe_side.considered(), 64); // nothing to exclude
 //!
-//! // 4. The raw trial score, then the calibrated one a fixed threshold reads.
-//! //    All three values carry `Cosine`, so this cannot be a PLDA score
-//! //    calibrated by cosine statistics.
-//! let trial = stored.score(&probe)?;
-//! let normalized = as_norm(trial, &stored_side, &probe_side)?;
-//! assert!(normalized.is_finite());
+//! // 5. The trial itself. It is handed no score: it computes the raw one from
+//! //    the two sides' own profiles and returns it beside the calibrated
+//! //    number a fixed threshold reads.
+//! let trial = over_held_out.trial(&stored_side, &probe_side)?;
+//! assert!(trial.raw() <= 1.0);
+//! assert!(trial.calibrated().is_finite());
 //!
 //! // The other cohort shape: sampled from the library itself, so it CONTAINS
 //! // the speakers being scored. Only NAMED sides may use it — the key travels
 //! // with the profile, so no other speaker's entries can be dropped by
-//! // mistake — and both sides of the trial take their statistics over the one
-//! // cohort, each dropping its own.
+//! // mistake — and each side drops its own.
 //! let mut library: LibraryCohort<PersonId> = LibraryCohort::new();
 //! for id in 0..64u32 {
 //!   library.push(id, scoring.prepare(&stored_centroid(id as usize))?);
 //! }
+//! let over_library = Calibration::new(library, options);
 //! let bob: PersonId = 11;
 //! let bobs_profile = scoring.prepare(&stored_centroid(bob as usize))?;
 //!
-//! let alice_side = enrolled_stats(&library, Enrolled::new(&alice, &stored), &options)?;
-//! let bobs_side = enrolled_stats(&library, Enrolled::new(&bob, &bobs_profile), &options)?;
+//! let alice_side = over_library.enrolled_side(Enrolled::new(&alice, &stored))?;
+//! let bobs_side = over_library.enrolled_side(Enrolled::new(&bob, &bobs_profile))?;
 //! assert_eq!(alice_side.considered(), 63); // 64 members, less Alice's own
-//! let merged = as_norm(stored.score(&bobs_profile)?, &alice_side, &bobs_side)?;
-//! assert!(merged.is_finite());
+//! let merged = over_library.trial(&alice_side, &bobs_side)?;
+//! assert!(merged.calibrated().is_finite());
 //!
-//! // What no longer normalizes: one side from the library cohort and the
-//! // other from the held-out one. Both are valid statistics, both are tagged
-//! // `Cosine`, and averaging their z-scores can invert the candidate order —
-//! // so the door refuses it instead of the caller having to know.
-//! assert!(as_norm(trial, &alice_side, &probe_side).is_err());
+//! // What no longer normalizes: a side from one calibration in another's
+//! // trial. Both are valid statistics and both are `Cosine`, and averaging
+//! // their z-scores can invert the candidate order — so it is refused from
+//! // either end, rather than the caller having to know.
+//! assert!(over_library.trial(&alice_side, &probe_side).is_err());
+//! assert!(over_held_out.trial(&alice_side, &probe_side).is_err());
 //! # Ok(())
 //! # }
 //! ```
@@ -575,16 +635,16 @@
 //!   this repository does not have. Nothing here publishes a default.
 //! - **AS-Norm2**, the crossed variant. See [`diaric::score_norm`]; it is not
 //!   implemented there either, and for a stated reason.
-//! - **A third score source.** [`enrolled_stats`] and [`held_out_stats`] take
-//!   a [`VoiceProfile`], so they cover the sources [`Scoring`] names and no
-//!   others — they exist to carry a `coremlit` refusal out of an infallible
-//!   closure, which a caller's own scoring function does not need. Genericity
-//!   is not lost by that, but it is no longer *re-exported*: a caller scoring
-//!   in some other space takes a `diaric` dependency and fills `diaric`'s own
-//!   `Cohort<K, T>` with THEIR item type. "The untagged road is a different
-//!   crate, not a re-export" says why that is the shape, and why handing the
-//!   same container out from here — already able to hold a [`VoiceProfile`] —
-//!   was a defect rather than a convenience.
+//! - **A third score source.** A [`Calibration`] is built over a cohort of
+//!   [`VoiceProfile`]s, so it covers the sources [`Scoring`] names and no
+//!   others — it exists to carry a `coremlit` refusal out of an infallible
+//!   closure and to hold eq. (7)'s four attributes together, neither of which
+//!   a caller's own scoring function needs. Genericity is not lost by that,
+//!   but it is not *re-exported*: a caller scoring in some other space takes a
+//!   `diaric` dependency and fills `diaric`'s own `Cohort<K, T>` with THEIR
+//!   item type. "What leaves this module" says why handing the same container
+//!   out from here — already able to hold a [`VoiceProfile`] — was a defect
+//!   rather than a convenience.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -596,7 +656,7 @@ use diaric::{
 
 use crate::audio::speaker::{
   embed::EMBEDDING_DIM,
-  error::{CalibrateError, CohortMismatch, NormalizationMismatch, ProfileLength, ScoringMismatch},
+  error::{CalibrateError, CalibrationMismatch, ProfileLength, ScoringMismatch},
   extract::shared_plda_transform,
 };
 
@@ -612,12 +672,12 @@ use crate::audio::speaker::{
 ///
 /// **`diaric`'s CONTAINERS and its arithmetic are deliberately not among
 /// these** — not `as_norm`, and not `Cohort`, `CohortEntry` or `CohortStats`
-/// either. The free `as_norm` takes two untagged statistics and cannot tell
-/// one score source from another; the generic `Cohort<K, T>` accepts a
-/// [`VoiceProfile`] as its `T` and hands out a candidate-dependent, untagged
-/// statistic over one. Both are reachable from `diaric` itself, and neither is
-/// reachable from here — the module docs' "The untagged road is a different
-/// crate, not a re-export" has the worked case and the boundary.
+/// either. The free `as_norm` takes two unbound statistics and cannot tell one
+/// score source, cohort or subject from another; the generic `Cohort<K, T>`
+/// accepts a [`VoiceProfile`] as its `T` and hands out a candidate-dependent,
+/// unbound statistic over one. Both are reachable from `diaric` itself, and
+/// neither is reachable from here — the module docs' "What leaves this module"
+/// has the worked case and the boundary.
 ///
 /// One consequence, stated because it is not visible from the signatures:
 /// [`AsNormOptions`]'s `serde` impls are `diaric`'s own and sit behind
@@ -759,7 +819,7 @@ fn unit_vector(v: [f64; PLDA_DIMENSION]) -> Result<[f64; PLDA_DIMENSION], Calibr
 }
 
 /// One speaker's voice profile, prepared for a chosen [`Scoring`] and ready to
-/// be scored.
+/// be calibrated.
 ///
 /// Build one with [`Scoring::prepare`]. A profile is a *prepared vector*, not a
 /// stored one: it holds no identity, no provenance and no recording. The
@@ -767,13 +827,19 @@ fn unit_vector(v: [f64; PLDA_DIMENSION]) -> Result<[f64; PLDA_DIMENSION], Calibr
 /// [`Enrolled`] when — and only when — the speaker is known.
 ///
 /// A bare `VoiceProfile` is therefore exactly what an unidentified probe is,
-/// and it reaches only [`held_out_stats`].
+/// and it reaches only [`Calibration::side`].
+///
+/// **No number comes out of a profile.** Scoring two of them is private to
+/// this module: a raw similarity leaves only inside a [`CalibratedTrial`],
+/// beside the calibrated number, and only after a [`Calibration`] has fixed
+/// everything eq. (7) needs the two to agree on. The module docs' "What leaves
+/// this module" says what that closes and, precisely, what it does not.
 ///
 /// # Why the score source is a tag and not a type parameter
 ///
-/// Mixing sources is refused at runtime ([`CalibrateError::ScoringMismatch`],
-/// [`CalibrateError::NormalizationMismatch`]) rather than made unrepresentable
-/// by a `VoiceProfile<S>`. Two reasons, the second deciding:
+/// Mixing sources is refused at runtime ([`CalibrateError::ScoringMismatch`])
+/// rather than made unrepresentable by a `VoiceProfile<S>`. Two reasons, the
+/// second deciding:
 ///
 /// - a cohort is generic over the caller's speaker key ([`LibraryCohort<K>`]),
 ///   so a type parameter here would monomorphize the caller's whole cohort on
@@ -784,16 +850,13 @@ fn unit_vector(v: [f64; PLDA_DIMENSION]) -> Result<[f64; PLDA_DIMENSION], Calibr
 ///   type parameter turns that loop into duplicated generic code.
 ///
 /// What the tag buys in exchange is that a cross-source result is a typed
-/// refusal rather than a finite number, and that is a property of the whole
-/// chain rather than of this one call — the tag travels into [`TrialScore`]
-/// and [`SideStats`] and is re-checked by [`as_norm`]. An earlier version of
-/// this paragraph claimed the guarantee on the ground that "every path that
-/// reads two profiles compares the tags first", which was true and not
-/// sufficient: the last step reads no profiles at all. What the tag still does
-/// **not** say is which cohort a statistic came from — that is a second
-/// identity, carried beside it on a [`SideStats`] and checked in the same
-/// place ([`CohortId`], and the module docs' "One cohort, and the door checks
-/// it").
+/// refusal rather than a finite number. An earlier version of this paragraph
+/// claimed that on the ground that "every path that reads two profiles
+/// compares the tags first", which was true and not sufficient, because the
+/// last step then read no profiles at all. It reads them again: a trial is
+/// computed from the two sides' own profiles, so the source they agree on is
+/// the source the number is in — see the module docs' "The score source is
+/// structural, not re-checked".
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct VoiceProfile(Prepared);
 
@@ -817,8 +880,13 @@ impl VoiceProfile {
     }
   }
 
-  /// The raw trial score between this profile and `other` — the number
-  /// [`as_norm`] normalizes, tagged with the source it was computed in.
+  /// The raw trial score between this profile and `other`.
+  ///
+  /// **Private, and that is the point.** A raw similarity with nothing bound
+  /// to it is exactly the loose operand three rounds of review kept finding a
+  /// use for; it reaches a caller only through [`CalibratedTrial::raw`], which
+  /// a [`Calibration`] produced. Inside this module it is called twice: once
+  /// per cohort entry when a side is taken, and once per trial.
   ///
   /// Both sources are cosines between unit vectors, so the result is finite and
   /// lands in `[-1, 1]` to within the rounding of the normalization that
@@ -830,18 +898,16 @@ impl VoiceProfile {
   ///
   /// [`CalibrateError::ScoringMismatch`] if the two profiles were prepared for
   /// different score sources. That is the only way this can fail.
-  pub fn score(&self, other: &Self) -> Result<TrialScore, CalibrateError> {
+  fn score(&self, other: &Self) -> Result<f64, CalibrateError> {
     match (&self.0, &other.0) {
       // Calls `diaric`'s cosine rather than repeating its loop, so this score
       // is bit-identical to the one the online clusterer matches on.
-      (Prepared::Cosine(a), Prepared::Cosine(b)) => Ok(TrialScore {
-        raw: f64::from(diaric::embed::cosine_similarity(a, b)),
-        scoring: Scoring::Cosine,
-      }),
-      (Prepared::PldaCosine(a), Prepared::PldaCosine(b)) => Ok(TrialScore {
-        raw: a.iter().zip(b.iter()).map(|(x, y)| x * y).sum(),
-        scoring: Scoring::PldaCosine,
-      }),
+      (Prepared::Cosine(a), Prepared::Cosine(b)) => {
+        Ok(f64::from(diaric::embed::cosine_similarity(a, b)))
+      }
+      (Prepared::PldaCosine(a), Prepared::PldaCosine(b)) => {
+        Ok(a.iter().zip(b.iter()).map(|(x, y)| x * y).sum())
+      }
       _ => Err(CalibrateError::ScoringMismatch(ScoringMismatch::new(
         self.scoring(),
         other.scoring(),
@@ -850,106 +916,12 @@ impl VoiceProfile {
   }
 }
 
-/// A raw trial score, carrying the [`Scoring`] it was computed in.
-///
-/// Built only by [`VoiceProfile::score`], so the tag cannot be a claim: the
-/// number and the source it came from are produced together and there is no
-/// constructor that takes them apart. [`as_norm`] re-checks the tag against
-/// both sides' statistics — the module docs' "Every value carries its score
-/// source" says what a bare `f64` here would let through.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct TrialScore {
-  /// The similarity itself.
-  raw: f64,
-  /// The score source both profiles were prepared for.
-  scoring: Scoring,
-}
-
-impl TrialScore {
-  /// The raw, uncalibrated similarity.
-  ///
-  /// #123's own comparison needs it: the claim being tested is that no fixed
-  /// threshold over these separates a library, and that one over [`as_norm`]'s
-  /// output does.
-  pub const fn raw(&self) -> f64 {
-    self.raw
-  }
-
-  /// The score source this trial was computed in.
-  pub const fn scoring(&self) -> Scoring {
-    self.scoring
-  }
-}
-
-/// One side of a trial: a cohort statistic, carrying the [`Scoring`] it was
-/// computed in and the [`CohortId`] of the cohort it was computed over.
-///
-/// Built only by [`enrolled_stats`] and [`held_out_stats`]. It depends on its
-/// own profile and its own cohort and on nothing else, so it is computed once
-/// per profile and reused across every trial that profile appears in — the
-/// reuse guarantee in the module docs' cost table. Reused across *cohorts* it
-/// is not, and the [`CohortId`] is what makes that a refusal instead of a
-/// silently incommensurable average.
-///
-/// The [`CohortStats`] inside is deliberately not handed back.
-/// Doing so would re-open the untagged
-/// [`as_norm`](diaric::score_norm::as_norm) this module refuses to re-export,
-/// and it would strip both identities off the numbers on the way; the four
-/// values a caller actually reads are forwarded instead.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct SideStats {
-  /// `diaric`'s own statistic, untouched.
-  stats: CohortStats,
-  /// The score source the side profile — and therefore every cohort score
-  /// behind these numbers — was prepared for.
-  scoring: Scoring,
-  /// The cohort these numbers were computed over.
-  cohort: CohortId,
-}
-
-impl SideStats {
-  /// The score source these statistics were computed in.
-  pub const fn scoring(&self) -> Scoring {
-    self.scoring
-  }
-
-  /// The cohort these statistics were computed over.
-  ///
-  /// [`as_norm`] compares this for the caller; it is exposed so a caller
-  /// caching a side per speaker can tell a stale entry from a live one before
-  /// they get as far as a refusal.
-  pub const fn cohort(&self) -> CohortId {
-    self.cohort
-  }
-
-  /// Mean of the selected cohort scores.
-  pub const fn mean(&self) -> f64 {
-    self.stats.mean()
-  }
-
-  /// Population standard deviation of the selected cohort scores.
-  pub const fn deviation(&self) -> f64 {
-    self.stats.deviation()
-  }
-
-  /// How many cohort scores the top-N selection kept.
-  pub const fn selected(&self) -> usize {
-    self.stats.selected()
-  }
-
-  /// How many cohort members were scored at all — every member, less whatever
-  /// [`enrolled_stats`] dropped by identity.
-  pub const fn considered(&self) -> usize {
-    self.stats.considered()
-  }
-}
-
 /// A [`VoiceProfile`] bound to the identity it belongs to.
 ///
-/// The one value [`enrolled_stats`] takes in place of a key *and* a side, so
-/// no argument is left that could name a different speaker than the profile
-/// belongs to. The module docs' "The key travels with the profile" says what
-/// that removes and what it cannot.
+/// The one value [`Calibration::enrolled_side`] takes in place of a key *and* a
+/// side, so no argument is left that could name a different speaker than the
+/// profile belongs to. The module docs' "The key travels with the profile" says
+/// what that removes and what it cannot.
 ///
 /// A borrowing view rather than an owning pair: a caller's library already
 /// holds the key and the profile, `K` may be a `String`, and a
@@ -990,119 +962,64 @@ impl<'a, K> Enrolled<'a, K> {
     self.speaker
   }
 
-  /// The prepared vector itself — how an enrolled speaker reaches
-  /// [`held_out_stats`], [`VoiceProfile::score`], or a cohort.
+  /// The prepared vector itself — how an enrolled speaker reaches a
+  /// [`Calibration`] or a cohort.
   pub const fn profile(&self) -> &VoiceProfile {
     self.profile
-  }
-}
-
-/// The identity of one cohort value.
-///
-/// Opaque and unforgeable: no constructor, no accessor to the number inside,
-/// nothing a caller can write down. All it can do is compare equal to itself
-/// — which is all [`as_norm`] needs, because the property that has to hold is
-/// *same cohort* and nothing more. The module docs' "One cohort, and the door
-/// checks it" argues why that is enough, and says what it deliberately does
-/// not claim about the cohort's provenance.
-///
-/// Minted per cohort VALUE. A [`Clone`] of a cohort carries its identity —
-/// same members, same population — while
-/// [`HeldOutCohort::assuming_disjoint`] and [`LibraryCohort::new`] each mint a
-/// fresh one, and so does [`LibraryCohort::push`], because a cohort with a
-/// member added is not the population that the sides already taken were
-/// computed over.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub struct CohortId(u64);
-
-impl CohortId {
-  /// The next identity.
-  ///
-  /// `Relaxed` is the entire requirement. A `fetch_add` hands every caller a
-  /// distinct previous value under any ordering, and this counter guards no
-  /// other memory, so there is nothing for an `Acquire`/`Release` pair to
-  /// order it against.
-  ///
-  /// The counter wraps after `2^64` cohorts, which is not a number a program
-  /// reaches — one mint per nanosecond takes 584 years — and a wrap would make
-  /// two cohorts compare equal, i.e. it would MISS a mismatch rather than
-  /// invent one. That is why there is no panic path here: the only failure it
-  /// could report belongs to a program that cannot exist, and a library that
-  /// aborts is a worse answer than a check that has already done its work
-  /// 2^64 times.
-  fn mint() -> Self {
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    Self(NEXT.fetch_add(1, Ordering::Relaxed))
   }
 }
 
 /// A cohort sampled from the caller's own library, whose members therefore
 /// carry the identities that name them.
 ///
-/// #123's cohort shape, and the container [`enrolled_stats`] takes. Because it
-/// may hold an enrolled speaker's own entries, every side over it drops that
-/// speaker's entries by identity — which is correct for a side whose speaker
-/// is NAMED and impossible for one whose speaker is what the trial is trying
-/// to discover. A probe therefore has no door onto this type at all; it goes
-/// to [`HeldOutCohort`].
+/// #123's cohort shape, and the one [`Calibration::enrolled_side`] needs.
+/// Because it may hold an enrolled speaker's own entries, every side over it
+/// drops that speaker's entries by identity — which is correct for a side whose
+/// speaker is NAMED and impossible for one whose speaker is what the trial is
+/// trying to discover. A probe therefore has no door onto this type at all; it
+/// goes to [`HeldOutCohort`].
 ///
-/// **Both sides of a trial come from one cohort, and [`as_norm`] checks it.**
-/// A side taken over a `LibraryCohort` cannot be averaged against a side taken
-/// over a [`HeldOutCohort`] — see the module docs' "One cohort, and the door
-/// checks it", where that pairing inverts the candidate order on valid,
-/// healthy-looking statistics.
+/// **A cohort becomes a [`Calibration`] by value, and cannot then grow.**
+/// [`Calibration::new`] takes it, so nothing can add a member behind the back
+/// of a side already taken. Growing means assembling a new cohort and a new
+/// calibration, whose sides do not pair with the old ones — the refusal a
+/// silently grown cohort would otherwise skip.
 ///
 /// **The `diaric` container inside is private, and that is the point.**
 /// `diaric`'s [`Cohort<K, T>`](diaric::score_norm::Cohort) is generic in `T`
 /// and carries a public
 /// [`stats_excluding`](diaric::score_norm::Cohort::stats_excluding), so
 /// re-exporting it — which this module did — handed a caller a way to compute
-/// an untagged, candidate-dependent statistic over a [`VoiceProfile`] through
-/// `coremlit`'s own surface. Wrapping it means [`enrolled_stats`] and
-/// [`held_out_stats`] are this crate's only statistic constructors over a
-/// profile.
-///
-/// Equality includes the [`CohortId`], so `==` means *the same cohort* rather
-/// than *the same members*: two separately assembled cohorts of identical
-/// profiles are two impostor populations as far as anything here can tell.
+/// an unbound, candidate-dependent statistic over a [`VoiceProfile`] through
+/// `coremlit`'s own surface. Wrapping it means a [`Calibration`] is this
+/// crate's only statistic constructor over a profile.
 #[derive(Debug, Clone, PartialEq)]
 pub struct LibraryCohort<K> {
   /// `diaric`'s own container, private.
   entries: DiaricCohort<K, VoiceProfile>,
-  /// This cohort's identity, minted at construction and re-minted on every
-  /// mutation.
-  id: CohortId,
 }
 
 impl<K> Default for LibraryCohort<K> {
-  /// An empty cohort with a fresh identity.
+  /// An empty cohort.
   ///
-  /// Hand-written rather than derived: a derived `Default` would need
-  /// `CohortId: Default`, and an identity that can be *defaulted* is one two
-  /// unrelated cohorts could share.
+  /// Hand-written rather than derived: the derive would demand `K: Default`,
+  /// which an empty container does not need.
   fn default() -> Self {
     Self::new()
   }
 }
 
 impl<K> LibraryCohort<K> {
-  /// An empty cohort, with a fresh [`CohortId`].
+  /// An empty cohort.
   pub fn new() -> Self {
     Self {
       entries: DiaricCohort::new(),
-      id: CohortId::mint(),
     }
   }
 
   /// Add one library profile under the speaker key that names it.
-  ///
-  /// This mints a NEW [`CohortId`]. A cohort with a member added is a
-  /// different impostor population from the one any [`SideStats`] already
-  /// taken was computed over, so those sides stop pairing with new ones —
-  /// which is the refusal that a silently grown cohort would otherwise skip.
   pub fn push(&mut self, speaker: K, profile: VoiceProfile) {
     self.entries.push(speaker, profile);
-    self.id = CohortId::mint();
   }
 
   /// Number of cohort members, before any exclusion.
@@ -1111,47 +1028,36 @@ impl<K> LibraryCohort<K> {
   }
 
   /// Whether the cohort holds no members. An empty one is not a refusal here;
-  /// it becomes [`CalibrateError::ScoreNorm`] at [`enrolled_stats`], where
-  /// `diaric`'s own floor lives.
+  /// it becomes [`CalibrateError::ScoreNorm`] at
+  /// [`Calibration::enrolled_side`], where `diaric`'s own floor lives.
   pub fn is_empty(&self) -> bool {
     self.entries.is_empty()
-  }
-
-  /// This cohort's identity — what a [`SideStats`] taken over it will carry.
-  pub const fn id(&self) -> CohortId {
-    self.id
   }
 }
 
 /// A cohort the caller asserts holds no material from any speaker that will be
 /// scored against it.
 ///
-/// The literature's own arrangement (Matějka et al. 2017 §2.1) and the only
-/// one an unidentified probe has, because nothing about a probe can be
-/// excluded from a cohort when the probe's identity is the thing being looked
-/// up. See the module docs' "Two sides, and only one of them has an identity".
+/// The literature's own arrangement (Matějka et al. 2017 §2.1) and the only one
+/// an unidentified probe has, because nothing about a probe can be excluded
+/// from a cohort when the probe's identity is the thing being looked up. See
+/// the module docs' "Two sides, and only one of them has an identity".
 ///
 /// **It carries no speaker keys, and that is the design.** A held-out cohort
-/// has nothing to exclude, so there is no key to pass wrongly and no
-/// entrypoint that could take one: candidate-independence is structural here
-/// rather than documented.
+/// has nothing to exclude, so there is no key to pass wrongly and no entrypoint
+/// that could take one: candidate-independence is structural here rather than
+/// documented.
 ///
 /// The disjointness itself cannot be checked — `coremlit` does not hold the
 /// library — so [`assuming_disjoint`](HeldOutCohort::assuming_disjoint) is the
-/// single, named place the caller states it, once, where they know the
-/// cohort's provenance.
-///
-/// Equality includes the [`CohortId`], so `==` means *the same cohort* rather
-/// than *the same members* — as on [`LibraryCohort`], and for the same reason.
+/// single, named place the caller states it, once, where they know the cohort's
+/// provenance.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HeldOutCohort {
   /// `diaric`'s own container with the key type erased and kept private, so
   /// the selection this runs is `diaric`'s and not a second copy of it, and a
-  /// caller cannot reach `diaric`'s untagged statistic through it.
+  /// caller cannot reach `diaric`'s unbound statistic through it.
   entries: DiaricCohort<(), VoiceProfile>,
-  /// This cohort's identity, minted once at assembly. There is no mutator, so
-  /// it never changes.
-  id: CohortId,
 }
 
 impl HeldOutCohort {
@@ -1179,7 +1085,6 @@ impl HeldOutCohort {
           .map(|profile| CohortEntry::new((), profile))
           .collect(),
       ),
-      id: CohortId::mint(),
     }
   }
 
@@ -1189,173 +1094,409 @@ impl HeldOutCohort {
   }
 
   /// Whether the cohort holds no members. An empty one is not a refusal here;
-  /// it becomes [`CalibrateError::ScoreNorm`] at [`held_out_stats`], where
+  /// it becomes [`CalibrateError::ScoreNorm`] at [`Calibration::side`], where
   /// `diaric`'s own floor lives.
   pub fn is_empty(&self) -> bool {
     self.entries.is_empty()
   }
+}
 
-  /// This cohort's identity — what a [`SideStats`] taken over it will carry.
-  pub const fn id(&self) -> CohortId {
+/// The cohort shapes a [`Calibration`] can be built over.
+///
+/// **Sealed**: [`LibraryCohort`] and [`HeldOutCohort`] implement it, nothing
+/// else can, and there is no method on it to call. It exists so
+/// [`Calibration`]'s shared methods are offered for exactly the two containers
+/// that can produce a side, rather than for any type at all.
+pub trait CohortSource: sealed::Sealed {}
+
+impl<K> CohortSource for LibraryCohort<K> {}
+
+impl CohortSource for HeldOutCohort {}
+
+mod sealed {
+  /// Not nameable outside this module, so
+  /// [`CohortSource`](super::CohortSource) cannot be implemented outside it
+  /// either.
+  pub trait Sealed {}
+
+  impl<K> Sealed for super::LibraryCohort<K> {}
+
+  impl Sealed for super::HeldOutCohort {}
+}
+
+/// The identity of one [`Calibration`].
+///
+/// Opaque and unforgeable: no constructor, no accessor to the number inside,
+/// nothing a caller can write down. All it can do is compare equal to itself —
+/// which is all [`Calibration::trial`] needs, because the property that has to
+/// hold is *this calibration and no other*, and a calibration is one cohort and
+/// one configuration.
+///
+/// Minted per calibration VALUE. A [`Clone`] of a calibration carries its
+/// identity — same cohort, same options, so the same statistics — while every
+/// [`Calibration::new`] mints a fresh one, including one over a cohort equal to
+/// another's. That is the conservative direction: nothing in a sans-I/O crate
+/// can tell that two separately assembled cohorts are one population.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct CalibrationId(u64);
+
+impl CalibrationId {
+  /// The next identity.
+  ///
+  /// `Relaxed` is the entire requirement. A `fetch_add` hands every caller a
+  /// distinct previous value under any ordering, and this counter guards no
+  /// other memory, so there is nothing for an `Acquire`/`Release` pair to
+  /// order it against.
+  ///
+  /// The counter wraps after `2^64` calibrations, which is not a number a
+  /// program reaches — one mint per nanosecond takes 584 years — and a wrap
+  /// would make two calibrations compare equal, i.e. it would MISS a mismatch
+  /// rather than invent one. That is why there is no panic path here: the only
+  /// failure it could report belongs to a program that cannot exist, and a
+  /// library that aborts is a worse answer than a check that has already done
+  /// its work 2^64 times.
+  fn mint() -> Self {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    Self(NEXT.fetch_add(1, Ordering::Relaxed))
+  }
+}
+
+/// One cohort and one [`AsNormOptions`] — and the only thing on this page that
+/// produces a side or a calibrated trial.
+///
+/// AS-Norm1 averages two z-scores, and they are commensurable only when four
+/// things agree: the metric both numbers were computed in, the cohort both
+/// sides selected their top-N from, the two endpoints the trial score is
+/// between, and the configuration both sides were derived under. A
+/// `Calibration` holds all four — so a caller assembles none of them, and there
+/// is no loose triple of a score and two statistics left to mismatch. The
+/// module docs' "One scoped operation, not three loose values" has the table
+/// and the history.
+///
+/// It takes its cohort **by value**. A cohort that could still be pushed to
+/// would be a population that changed under sides already taken.
+///
+/// Build one per `(cohort, options)` pair and keep it for as long as the sides
+/// taken under it: a [`TrialSide`] is reusable across every trial of *this*
+/// calibration and across no other (module docs' cost table).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Calibration<C> {
+  /// The impostor population every side selects its top-N from.
+  cohort: C,
+  /// The selection and floor every side is derived under.
+  options: AsNormOptions,
+  /// This calibration's identity, minted at construction.
+  id: CalibrationId,
+}
+
+impl<C: CohortSource> Calibration<C> {
+  /// Fix a cohort and a configuration together, under a fresh
+  /// [`CalibrationId`].
+  ///
+  /// `C` is [`LibraryCohort<K>`] or [`HeldOutCohort`]; which one decides
+  /// whether sides are taken with [`enrolled_side`](Self::enrolled_side) or
+  /// with [`side`](Self::side), and that is the asymmetry between a named
+  /// speaker and an unidentified probe that the module docs argue.
+  pub fn new(cohort: C, options: AsNormOptions) -> Self {
+    Self {
+      cohort,
+      options,
+      id: CalibrationId::mint(),
+    }
+  }
+
+  /// This calibration's identity — what every [`TrialSide`] it produces
+  /// carries.
+  ///
+  /// [`trial`](Self::trial) compares it for the caller; it is exposed so a
+  /// caller caching a side per speaker can tell a stale entry from a live one
+  /// before they get as far as a refusal.
+  pub const fn id(&self) -> CalibrationId {
     self.id
   }
-}
 
-/// Cohort statistics for an **enrolled** speaker, over a cohort that may
-/// contain that speaker's own entries.
-///
-/// The entrypoint for a cohort sampled from the same library being scored —
-/// #123's own arrangement, and the one where a speaker's material is guaranteed
-/// to be selected into its own top-N. Exclusion is by identity: all of
-/// `enrolled`'s speaker's entries go, not merely the exact self-match, and only
-/// that speaker's — never the other side of the trial, which is what keeps a
-/// side reusable across every trial the speaker appears in.
-///
-/// **An unidentified probe has no entrypoint here, deliberately.** It takes an
-/// [`Enrolled`], which binds a key to a profile, and a probe has no key to
-/// bind; passing the candidate's key instead is the failure this shape
-/// removes. A probe goes to [`held_out_stats`]. The module docs argue the
-/// asymmetry.
-///
-/// **What this side can be averaged with.** The other side of the trial has to
-/// come from the SAME [`LibraryCohort`] — [`as_norm`] compares the
-/// [`CohortId`] and refuses otherwise. That makes this the door for a trial
-/// between two speakers the caller can both name (binding two enrolled
-/// recordings to one identity, say), each side dropping its own entries from
-/// the shared cohort, which is eq. (7)'s own arrangement. It is NOT a door
-/// onto "enrolment side from the library, probe side from somewhere else":
-/// that pairing averages two z-scores taken over two different impostor
-/// populations, and the module docs carry the case where doing so reverses
-/// which candidate ranks first.
-///
-/// [`Eq`] rather than [`PartialEq`] on `K` because the filter is
-/// `entry.speaker != *speaker`, and that is a correct exclusion only if a key
-/// equals itself; `f64::NAN` is the standard counterexample, and it would keep
-/// a self-entry that scores `1.0`. See
-/// [`Cohort::stats_excluding`](diaric::score_norm::Cohort::stats_excluding) for
-/// the full argument. The bound is pinned at the call site, not merely
-/// inherited:
-///
-/// ```compile_fail,E0277
-/// use coremlit::audio::speaker::calibrate::{
-///   AsNormOptions, Enrolled, LibraryCohort, Scoring, enrolled_stats,
-/// };
-/// # let raw = vec![0.5f32; coremlit::audio::speaker::embed::EMBEDDING_DIM];
-/// // `f64` is `PartialEq` but not `Eq`, so it cannot name a speaker — and a
-/// // `NaN` key would not match its own entry, keeping the self-match in.
-/// let mut cohort: LibraryCohort<f64> = LibraryCohort::new();
-/// cohort.push(f64::NAN, Scoring::Cosine.prepare(&raw).unwrap());
-/// let side = Scoring::Cosine.prepare(&raw).unwrap();
-/// let _ = enrolled_stats(&cohort, Enrolled::new(&f64::NAN, &side), &AsNormOptions::new());
-/// ```
-///
-/// # Errors
-///
-/// - [`CalibrateError::ScoringMismatch`] if any scored cohort entry was
-///   prepared for a different [`Scoring`] than the enrolled profile.
-/// - [`CalibrateError::ScoreNorm`] for `diaric`'s own refusals: an empty
-///   selection (including a cohort that was entirely this speaker), too few
-///   usable scores, or a selected set that does not spread.
-pub fn enrolled_stats<K: Eq>(
-  cohort: &LibraryCohort<K>,
-  enrolled: Enrolled<'_, K>,
-  options: &AsNormOptions,
-) -> Result<SideStats, CalibrateError> {
-  let mut carried = None;
-  let stats = cohort.entries.stats_excluding(
-    enrolled.speaker,
-    enrolled.profile,
-    scorer(&mut carried),
-    options,
-  );
-  finish(carried, stats, enrolled.profile.scoring(), cohort.id)
-}
-
-/// Cohort statistics for any profile, over a [`HeldOutCohort`].
-///
-/// Nothing is excluded, because a held-out cohort has nothing of this
-/// speaker's in it to exclude — the precondition is the cohort's, asserted
-/// once at [`HeldOutCohort::assuming_disjoint`], rather than a choice made
-/// again at every call.
-///
-/// **This is the only door an unidentified probe has**, and it is therefore
-/// the door for the enrolled side of any trial a probe is in: AS-Norm averages
-/// two z-scores, they are commensurable only when both sides select their
-/// top-N from the same impostor population, and [`as_norm`] enforces that by
-/// [`CohortId`] rather than leaving it to be got right.
-///
-/// # Errors
-///
-/// As [`enrolled_stats`], minus the self-exclusion case.
-pub fn held_out_stats(
-  cohort: &HeldOutCohort,
-  side: &VoiceProfile,
-  options: &AsNormOptions,
-) -> Result<SideStats, CalibrateError> {
-  let mut carried = None;
-  let stats = cohort
-    .entries
-    .stats_assuming_disjoint(side, scorer(&mut carried), options);
-  finish(carried, stats, side.scoring(), cohort.id)
-}
-
-/// AS-Norm1: the calibrated score a fixed threshold reads, from a trial score
-/// and the two sides' cohort statistics.
-///
-/// The arithmetic is [`diaric::score_norm::as_norm`] called through — eq. (7)
-/// of Matějka et al. 2017, its `0.5`, its population standard deviation and
-/// its [`MAX_NORMALIZED_ERROR`] accuracy postcondition, none of them re-derived
-/// here. What this wrapper adds is the two checks `diaric` cannot make,
-/// because its own inputs are bare numbers: that all three values were
-/// computed in the same [`Scoring`], and that the two sides were computed over
-/// the same cohort.
-///
-/// `diaric`'s free function takes two untagged
-/// [`CohortStats`] and an `f64`, so
-/// [`Scoring::Cosine`] statistics with mean `0` and deviation `1` will happily
-/// calibrate a [`Scoring::PldaCosine`] trial score and return a finite,
-/// plausible number — and two `Cosine` sides taken over two different cohorts
-/// will happily return one that ranks the candidates backwards. That is why
-/// this module re-exports the arithmetic's configuration but neither the
-/// function nor the containers.
-///
-/// `enrolled` and `probe` name the two sides of eq. (7) — `s(e,t)`'s
-/// enrolment and test terms. The order does not change the result (the
-/// formula is symmetric in the two z-scores) but it does change which side an
-/// error names, so it matches the trial being described.
-///
-/// # Errors
-///
-/// - [`CalibrateError::NormalizationMismatch`] if the trial score and the two
-///   sides were not all computed in one score source. Reported before the
-///   arithmetic, and naming all three, because which of them is the odd one
-///   out is the whole diagnosis.
-/// - [`CalibrateError::CohortMismatch`] if the two sides were computed over
-///   different cohorts. Checked after the [`Scoring`] one, so a caller who has
-///   mixed both gets told about the metric first: a `PldaCosine` side and a
-///   `Cosine` side necessarily came from two cohorts as well, and naming that
-///   as the cohort failure would point at the symptom.
-/// - [`CalibrateError::ScoreNorm`] for `diaric`'s own refusals — a non-finite
-///   trial score, or a z-score cancellation that leaves the result outside the
-///   accuracy postcondition.
-pub fn as_norm(
-  trial: TrialScore,
-  enrolled: &SideStats,
-  probe: &SideStats,
-) -> Result<f64, CalibrateError> {
-  if trial.scoring != enrolled.scoring || trial.scoring != probe.scoring {
-    return Err(CalibrateError::NormalizationMismatch(
-      NormalizationMismatch::new(trial.scoring, enrolled.scoring, probe.scoring),
-    ));
+  /// The configuration every side of this calibration is derived under.
+  pub const fn options(&self) -> &AsNormOptions {
+    &self.options
   }
-  if enrolled.cohort != probe.cohort {
-    return Err(CalibrateError::CohortMismatch(CohortMismatch::new(
-      enrolled.cohort,
-      probe.cohort,
-    )));
+
+  /// The cohort every side of this calibration selects its top-N from.
+  pub const fn cohort(&self) -> &C {
+    &self.cohort
   }
-  diaric::score_norm::as_norm(trial.raw, &enrolled.stats, &probe.stats)
-    .map_err(CalibrateError::ScoreNorm)
+
+  /// AS-Norm1: the raw trial score between two sides, and the calibrated score
+  /// a fixed threshold reads.
+  ///
+  /// The arithmetic is [`diaric::score_norm::as_norm`] called through — eq. (7)
+  /// of Matějka et al. 2017, its `0.5`, its population standard deviation and
+  /// its [`MAX_NORMALIZED_ERROR`] accuracy postcondition, none of them
+  /// re-derived here.
+  ///
+  /// **It is handed no score.** It computes the raw one from the two sides'
+  /// own profiles, which is what binds the trial to its endpoints: there is no
+  /// argument that could carry a score between two other speakers, and none
+  /// that could carry statistics taken over another cohort or under other
+  /// options, because a side of this calibration has neither. The one thing
+  /// left to check is that both sides really are this calibration's.
+  ///
+  /// `enrolled` and `probe` name the two sides of eq. (7) — `s(e,t)`'s
+  /// enrolment and test terms. The order does not change the result (the
+  /// formula is symmetric in the two z-scores) but it does change which side an
+  /// error names, so it matches the trial being described.
+  ///
+  /// # Errors
+  ///
+  /// - [`CalibrateError::CalibrationMismatch`] if either side was taken under a
+  ///   different calibration. The error names all three identities — this one
+  ///   and both sides' — because which side is the stale one is the diagnosis.
+  /// - [`CalibrateError::ScoringMismatch`] if the two sides' profiles were
+  ///   prepared for different score sources. Not reachable through a single
+  ///   calibration — a side exists only if its profile agreed with every cohort
+  ///   entry it was scored against, so two sides of one cohort agree with each
+  ///   other — and propagated rather than asserted away, on the same grounds as
+  ///   the overflow check in this module's PLDA normalization: "cannot happen"
+  ///   is a claim about today's code.
+  /// - [`CalibrateError::ScoreNorm`] for `diaric`'s own refusals — a non-finite
+  ///   trial score, or a z-score cancellation that leaves the result outside
+  ///   the accuracy postcondition.
+  pub fn trial(
+    &self,
+    enrolled: &TrialSide,
+    probe: &TrialSide,
+  ) -> Result<CalibratedTrial, CalibrateError> {
+    if enrolled.calibration != self.id || probe.calibration != self.id {
+      return Err(CalibrateError::CalibrationMismatch(
+        CalibrationMismatch::new(self.id, enrolled.calibration, probe.calibration),
+      ));
+    }
+    let raw = enrolled.profile.score(&probe.profile)?;
+    let calibrated = diaric::score_norm::as_norm(raw, &enrolled.stats, &probe.stats)
+      .map_err(CalibrateError::ScoreNorm)?;
+    Ok(CalibratedTrial {
+      raw,
+      calibrated,
+      scoring: enrolled.profile.scoring(),
+    })
+  }
+}
+
+impl<K: Eq> Calibration<LibraryCohort<K>> {
+  /// One side for an **enrolled** speaker, over a cohort that may contain that
+  /// speaker's own entries.
+  ///
+  /// The entrypoint for a cohort sampled from the same library being scored —
+  /// #123's own arrangement, and the one where a speaker's material is
+  /// guaranteed to be selected into its own top-N. Exclusion is by identity:
+  /// all of `enrolled`'s speaker's entries go, not merely the exact self-match,
+  /// and only that speaker's — never the other side of the trial, which is what
+  /// keeps a side reusable across every trial the speaker appears in.
+  ///
+  /// **An unidentified probe has no entrypoint here, deliberately.** It takes
+  /// an [`Enrolled`], which binds a key to a profile, and a probe has no key to
+  /// bind; passing the candidate's key instead is the failure this shape
+  /// removes. A probe goes to a `Calibration<HeldOutCohort>` and
+  /// [`side`](Calibration::side). The module docs argue the asymmetry.
+  ///
+  /// **What this side can be averaged with.** Any other side of this same
+  /// calibration, and nothing else. That makes it the door for a trial between
+  /// two speakers the caller can both name (binding two enrolled recordings to
+  /// one identity, say), each side dropping its own entries from the shared
+  /// cohort, which is eq. (7)'s own arrangement. It is NOT a door onto
+  /// "enrolment side from the library, probe side from somewhere else": that
+  /// pairing averages two z-scores taken over two different impostor
+  /// populations, and the module docs carry the case where doing so reverses
+  /// which candidate ranks first.
+  ///
+  /// [`Eq`] rather than [`PartialEq`] on `K` because the filter is
+  /// `entry.speaker != *speaker`, and that is a correct exclusion only if a key
+  /// equals itself; `f64::NAN` is the standard counterexample, and it would
+  /// keep a self-entry that scores `1.0`. See
+  /// [`Cohort::stats_excluding`](diaric::score_norm::Cohort::stats_excluding)
+  /// for the full argument. The bound is pinned at the call site, not merely
+  /// inherited. It is `E0599` rather than `E0277` because the bound sits on
+  /// this inherent impl block, so rustc reports the method as uncallable
+  /// (`the following trait bounds were not satisfied: f64: Eq`) rather than an
+  /// unsatisfied predicate. That code would also cover the method simply not
+  /// existing; what rules that out is the rest of the suite, which calls it on
+  /// an `Eq` key a dozen times and would not compile if it went away:
+  ///
+  /// ```compile_fail,E0599
+  /// use coremlit::audio::speaker::calibrate::{
+  ///   AsNormOptions, Calibration, Enrolled, LibraryCohort, Scoring,
+  /// };
+  /// # let raw = vec![0.5f32; coremlit::audio::speaker::embed::EMBEDDING_DIM];
+  /// // `f64` is `PartialEq` but not `Eq`, so it cannot name a speaker — and a
+  /// // `NaN` key would not match its own entry, keeping the self-match in.
+  /// let mut cohort: LibraryCohort<f64> = LibraryCohort::new();
+  /// cohort.push(f64::NAN, Scoring::Cosine.prepare(&raw).unwrap());
+  /// let calibration = Calibration::new(cohort, AsNormOptions::new());
+  /// let side = Scoring::Cosine.prepare(&raw).unwrap();
+  /// let _ = calibration.enrolled_side(Enrolled::new(&f64::NAN, &side));
+  /// ```
+  ///
+  /// # Errors
+  ///
+  /// - [`CalibrateError::ScoringMismatch`] if any scored cohort entry was
+  ///   prepared for a different [`Scoring`] than the enrolled profile.
+  /// - [`CalibrateError::ScoreNorm`] for `diaric`'s own refusals: an empty
+  ///   selection (including a cohort that was entirely this speaker), too few
+  ///   usable scores, or a selected set that does not spread.
+  pub fn enrolled_side(&self, enrolled: Enrolled<'_, K>) -> Result<TrialSide, CalibrateError> {
+    let mut carried = None;
+    let stats = self.cohort.entries.stats_excluding(
+      enrolled.speaker,
+      enrolled.profile,
+      scorer(&mut carried),
+      &self.options,
+    );
+    finish(carried, stats, *enrolled.profile, self.id)
+  }
+}
+
+impl Calibration<HeldOutCohort> {
+  /// One side for any profile, over a [`HeldOutCohort`].
+  ///
+  /// Nothing is excluded, because a held-out cohort has nothing of this
+  /// speaker's in it to exclude — the precondition is the cohort's, asserted
+  /// once at [`HeldOutCohort::assuming_disjoint`], rather than a choice made
+  /// again at every call.
+  ///
+  /// **This is the only door an unidentified probe has**, and it is therefore
+  /// the door for the enrolled side of any trial a probe is in: AS-Norm
+  /// averages two z-scores, they are commensurable only when both sides select
+  /// their top-N from the same impostor population, and a calibration is what
+  /// makes that one population rather than something to get right.
+  ///
+  /// # Errors
+  ///
+  /// As [`Calibration::enrolled_side`], minus the self-exclusion case.
+  pub fn side(&self, profile: &VoiceProfile) -> Result<TrialSide, CalibrateError> {
+    let mut carried = None;
+    let stats =
+      self
+        .cohort
+        .entries
+        .stats_assuming_disjoint(profile, scorer(&mut carried), &self.options);
+    finish(carried, stats, *profile, self.id)
+  }
+}
+
+/// One side of a trial: a subject's profile and its cohort statistics, bound to
+/// the [`Calibration`] that produced them.
+///
+/// Built only by [`Calibration::enrolled_side`] and [`Calibration::side`], and
+/// not constructible any other way — every field is private and there is no
+/// public constructor, which is what makes "this calibration produced it" a
+/// fact rather than a convention.
+///
+/// It depends on its own profile and its own calibration and on nothing else,
+/// so it is taken once per profile and reused across every trial that profile
+/// appears in — the reuse guarantee in the module docs' cost table. Reused
+/// across *calibrations* it is not, and the [`CalibrationId`] is what makes
+/// that a refusal instead of a silently incommensurable average.
+///
+/// **It carries the profile, not only the statistics.** That is what binds a
+/// trial to its endpoints: [`Calibration::trial`] computes the raw score from
+/// the two sides' profiles rather than accepting one, so there is no argument
+/// left that could carry a score between two other speakers.
+///
+/// **It publishes neither μ nor σ**, and its [`Debug`] does not print them
+/// either — see the module docs' "What leaves this module" for what that closes
+/// and for the residual it does not.
+#[derive(Clone, Copy, PartialEq)]
+pub struct TrialSide {
+  /// Whose side this is — the subject the statistics were taken for, and one
+  /// endpoint of every trial this side appears in.
+  profile: VoiceProfile,
+  /// `diaric`'s own statistic, untouched.
+  stats: CohortStats,
+  /// The calibration that produced it: one cohort, one configuration.
+  calibration: CalibrationId,
+}
+
+// Hand-written rather than derived, and the difference is the whole point of
+// the type: `#[derive(Debug)]` prints every field, and `CohortStats`'s own
+// derived `Debug` prints `mean` and `deviation`. That is every operand of
+// eq. (7) on a `{:?}` of a value this crate handed out — the same disclosure
+// the removed accessors made, through a door a reviewer would not think to
+// look at. The profile is left out for a duller reason: it is a kilobyte of
+// prepared vector, and printing it helps nobody.
+impl core::fmt::Debug for TrialSide {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("TrialSide")
+      .field("scoring", &self.scoring())
+      .field("selected", &self.selected())
+      .field("considered", &self.considered())
+      .field("calibration", &self.calibration)
+      .finish_non_exhaustive()
+  }
+}
+
+impl TrialSide {
+  /// The score source this side's profile was prepared for, and therefore the
+  /// one every cohort score behind its statistics was computed in.
+  pub const fn scoring(&self) -> Scoring {
+    self.profile.scoring()
+  }
+
+  /// The calibration that produced this side.
+  ///
+  /// [`Calibration::trial`] compares it for the caller; it is exposed so a
+  /// caller caching a side per speaker can tell a stale entry from a live one
+  /// before they get as far as a refusal.
+  pub const fn calibration(&self) -> CalibrationId {
+    self.calibration
+  }
+
+  /// How many cohort scores the top-N selection kept.
+  pub const fn selected(&self) -> usize {
+    self.stats.selected()
+  }
+
+  /// How many cohort members were scored at all — every member, less whatever
+  /// [`Calibration::enrolled_side`] dropped by identity.
+  pub const fn considered(&self) -> usize {
+    self.stats.considered()
+  }
+}
+
+/// One trial, calibrated: the raw similarity and the AS-Norm1 score a fixed
+/// threshold reads.
+///
+/// Built only by [`Calibration::trial`], so the two numbers are one trial's —
+/// computed together, from two sides of one calibration, between the endpoints
+/// those sides are. There is no constructor that takes them apart.
+///
+/// Both are published because #123's own comparison needs both: the claim being
+/// tested is that no fixed threshold over the raw scores separates a library
+/// and that one over the calibrated scores does.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CalibratedTrial {
+  /// The raw, uncalibrated similarity between the two sides' profiles.
+  raw: f64,
+  /// eq. (7) over that similarity and the two sides' statistics.
+  calibrated: f64,
+  /// The source both profiles were prepared for, and so the space both numbers
+  /// live in.
+  scoring: Scoring,
+}
+
+impl CalibratedTrial {
+  /// The raw, uncalibrated similarity.
+  pub const fn raw(&self) -> f64 {
+    self.raw
+  }
+
+  /// The AS-Norm1 score — what a fixed threshold is read against.
+  pub const fn calibrated(&self) -> f64 {
+    self.calibrated
+  }
+
+  /// The score source both numbers were computed in.
+  pub const fn scoring(&self) -> Scoring {
+    self.scoring
+  }
 }
 
 /// The fallible-scorer bridge. `diaric`'s cohort statistics take an INFALLIBLE
@@ -1372,7 +1513,7 @@ fn scorer(
   carried: &mut Option<CalibrateError>,
 ) -> impl FnMut(&VoiceProfile, &VoiceProfile) -> f64 + '_ {
   move |side, entry| match side.score(entry) {
-    Ok(v) => v.raw,
+    Ok(v) => v,
     Err(e) => {
       carried.get_or_insert(e);
       f64::NAN
@@ -1382,29 +1523,30 @@ fn scorer(
 
 /// Report a carried scoring refusal ahead of `diaric`'s own, so a mixed cohort
 /// is named as a mismatch rather than as the `NonFiniteScore` the poison value
-/// produces downstream, and tag the surviving statistic with the source its
-/// side was prepared for.
+/// produces downstream, and bind the surviving statistic to the profile it was
+/// taken for and the calibration it was taken under.
 ///
-/// That tag is sound precisely because the mismatch is reported here: a
-/// [`SideStats`] labelled [`Scoring::Cosine`] can only have come from a
-/// `Cosine` side scored against entries that were all `Cosine` too, since one
-/// foreign entry refuses the whole call rather than contributing a number.
+/// Reporting the mismatch here is what makes the side's own source sound: a
+/// [`TrialSide`] whose profile is [`Scoring::Cosine`] can only have been scored
+/// against entries that were all `Cosine` too, since one foreign entry refuses
+/// the whole call rather than contributing a number.
 ///
-/// The [`CohortId`] is sound for a simpler reason: both callers pass their own
-/// cohort's, and a cohort's identity is not something a caller can supply.
+/// The other two bindings are sound for a simpler reason: both callers pass
+/// their own calibration's identity and the profile they were handed, and
+/// neither is something a caller can supply.
 fn finish(
   carried: Option<CalibrateError>,
   stats: Result<CohortStats, diaric::score_norm::Error>,
-  scoring: Scoring,
-  cohort: CohortId,
-) -> Result<SideStats, CalibrateError> {
+  profile: VoiceProfile,
+  calibration: CalibrationId,
+) -> Result<TrialSide, CalibrateError> {
   match carried {
     Some(e) => Err(e),
     None => stats
-      .map(|stats| SideStats {
+      .map(|stats| TrialSide {
+        profile,
         stats,
-        scoring,
-        cohort,
+        calibration,
       })
       .map_err(CalibrateError::ScoreNorm),
   }

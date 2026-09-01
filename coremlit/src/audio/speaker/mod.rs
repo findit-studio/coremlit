@@ -184,11 +184,16 @@
 //! [`HeldOutCohort`](calibrate::HeldOutCohort) instead, and no entrypoint
 //! there lets a candidate's key reach a probe's statistics.
 //!
-//! The second: both sides of a trial have to come from one cohort, and
-//! [`as_norm`](calibrate::as_norm) refuses them when they do not. Two sides
-//! taken over different impostor populations can invert which candidate ranks
-//! first while every value involved stays finite, in range and tagged with the
-//! same metric, so this is a typed refusal rather than a caveat.
+//! The second: a calibrated trial is the product of ONE
+//! [`Calibration`](calibrate::Calibration) — a cohort and an
+//! [`AsNormOptions`](calibrate::AsNormOptions) fixed together, which produces
+//! each side bound to its own profile and then computes the trial from those
+//! two profiles. So the metric, the impostor population, the trial's endpoints
+//! and the top-N configuration are one value's rather than four the caller
+//! carries between calls. Sides taken over different impostor populations can
+//! invert which candidate ranks first while every value involved stays finite,
+//! in range and computed in the same metric, so mixing two calibrations is a
+//! typed refusal rather than a caveat.
 //!
 //! [coremlit-123]: https://github.com/findit-studio/coremlit/issues/123
 

@@ -468,79 +468,52 @@ fn calibrate_error_scoring_mismatch_displays_both_sides_in_order() {
 }
 
 #[test]
-fn calibrate_error_normalization_mismatch_names_all_three_sources() {
-  use crate::audio::speaker::calibrate::Scoring;
+fn calibrate_error_calibration_mismatch_names_which_side_was_taken_where() {
+  use crate::audio::speaker::calibrate::{AsNormOptions, Calibration, HeldOutCohort, Scoring};
 
-  let m = NormalizationMismatch::new(Scoring::PldaCosine, Scoring::Cosine, Scoring::Cosine);
-  assert_eq!(m.trial(), Scoring::PldaCosine);
-  assert_eq!(m.enrolled(), Scoring::Cosine);
-  assert_eq!(m.probe(), Scoring::Cosine);
-
-  let rendered = CalibrateError::NormalizationMismatch(m).to_string();
-  assert!(rendered.contains("PldaCosine"), "{rendered}");
-  assert!(rendered.contains("Cosine"), "{rendered}");
-
-  // Which of the three disagrees is the whole diagnosis, so no two of the
-  // three placements may render alike: a PldaCosine trial against two Cosine
-  // sides is a caller who did not re-derive their statistics, one stale
-  // Cosine side among PldaCosine values is a stale cache entry, and a Cosine
-  // trial against two PldaCosine sides is neither.
-  let stale_side = CalibrateError::NormalizationMismatch(NormalizationMismatch::new(
-    Scoring::PldaCosine,
-    Scoring::PldaCosine,
-    Scoring::Cosine,
-  ))
-  .to_string();
-  let stale_trial = CalibrateError::NormalizationMismatch(NormalizationMismatch::new(
-    Scoring::Cosine,
-    Scoring::PldaCosine,
-    Scoring::PldaCosine,
-  ))
-  .to_string();
-  assert_ne!(rendered, stale_side);
-  assert_ne!(rendered, stale_trial);
-  assert_ne!(stale_side, stale_trial);
-
-  // And it must not read like the pairwise refusal it is not: that one is a
-  // profile-against-profile scoring failure, this one is a normalization.
-  let pairwise =
-    CalibrateError::ScoringMismatch(ScoringMismatch::new(Scoring::PldaCosine, Scoring::Cosine))
-      .to_string();
-  assert_ne!(rendered, pairwise);
-  assert!(rendered.contains("AS-Norm"), "{rendered}");
-}
-
-#[test]
-fn calibrate_error_cohort_mismatch_names_which_side_came_from_which_cohort() {
-  use crate::audio::speaker::calibrate::{HeldOutCohort, Scoring};
-
-  // The only way to obtain a `CohortId` is from a cohort — there is no
-  // constructor — and two separately assembled cohorts must not share one.
-  let enrolled = HeldOutCohort::assuming_disjoint(Vec::new()).id();
-  let probe = HeldOutCohort::assuming_disjoint(Vec::new()).id();
+  // The only way to obtain a `CalibrationId` is from a calibration — there is
+  // no constructor — and two separately built ones must not share an identity.
+  let fresh = || {
+    Calibration::new(
+      HeldOutCohort::assuming_disjoint(Vec::new()),
+      AsNormOptions::new(),
+    )
+    .id()
+  };
+  let expected = fresh();
+  let enrolled = fresh();
+  let probe = fresh();
+  assert_ne!(expected, enrolled);
   assert_ne!(enrolled, probe);
 
-  let m = CohortMismatch::new(enrolled, probe);
+  let m = CalibrationMismatch::new(expected, enrolled, probe);
+  assert_eq!(m.expected(), expected);
   assert_eq!(m.enrolled(), enrolled);
   assert_eq!(m.probe(), probe);
 
-  let rendered = CalibrateError::CohortMismatch(m).to_string();
+  let rendered = CalibrateError::CalibrationMismatch(m).to_string();
   assert!(rendered.contains("AS-Norm"), "{rendered}");
-  assert!(rendered.contains("cohort"), "{rendered}");
+  assert!(rendered.contains("calibration"), "{rendered}");
 
-  // Which side is the stale one is the diagnosis, so the reversed pairing must
-  // not render identically.
-  let reversed = CalibrateError::CohortMismatch(CohortMismatch::new(probe, enrolled)).to_string();
-  assert_ne!(rendered, reversed);
+  // Which side is the stale one is the diagnosis, so no two of the three
+  // placements may render alike: the enrolment side being foreign is a
+  // different repair from the probe side being foreign, and both differ from
+  // a trial asked of a third calibration entirely.
+  let stale_enrolment =
+    CalibrateError::CalibrationMismatch(CalibrationMismatch::new(probe, enrolled, probe))
+      .to_string();
+  let stale_probe =
+    CalibrateError::CalibrationMismatch(CalibrationMismatch::new(enrolled, enrolled, probe))
+      .to_string();
+  assert_ne!(rendered, stale_enrolment);
+  assert_ne!(rendered, stale_probe);
+  assert_ne!(stale_enrolment, stale_probe);
 
-  // And it must not read like the metric refusal it is not: that one says the
-  // two numbers were computed in different SPACES, this one that they were
-  // computed over different POPULATIONS.
-  let metric = CalibrateError::NormalizationMismatch(NormalizationMismatch::new(
-    Scoring::Cosine,
-    Scoring::Cosine,
-    Scoring::PldaCosine,
-  ))
-  .to_string();
+  // And it must not read like the pairwise metric refusal it is not: that one
+  // says two profiles were prepared in different SPACES, this one that two
+  // sides came from different populations or configurations.
+  let metric =
+    CalibrateError::ScoringMismatch(ScoringMismatch::new(Scoring::Cosine, Scoring::PldaCosine))
+      .to_string();
   assert_ne!(rendered, metric);
 }
