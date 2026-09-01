@@ -68,7 +68,7 @@ dia = { package = "diarization", git = "https://github.com/findit-studio/diariza
 # diaric in the graph make those distinct types — a hard E0308/E0277 compile
 # failure, not a silent divergence. So this tracks coremlit's published version,
 # not a git rev; re-pinning either side alone reds this package.
-diaric = { version = "0.1.0", optional = true }
+diaric = { version = "0.2.0", optional = true }
 
 # The textclap oracle — likewise an unpublished rev-pinned git source. CO-DEV:
 #
