@@ -466,3 +466,46 @@ fn calibrate_error_scoring_mismatch_displays_both_sides_in_order() {
       .to_string();
   assert_ne!(rendered, reversed);
 }
+
+#[test]
+fn calibrate_error_normalization_mismatch_names_all_three_sources() {
+  use crate::audio::speaker::calibrate::Scoring;
+
+  let m = NormalizationMismatch::new(Scoring::PldaCosine, Scoring::Cosine, Scoring::Cosine);
+  assert_eq!(m.trial(), Scoring::PldaCosine);
+  assert_eq!(m.enrolled(), Scoring::Cosine);
+  assert_eq!(m.probe(), Scoring::Cosine);
+
+  let rendered = CalibrateError::NormalizationMismatch(m).to_string();
+  assert!(rendered.contains("PldaCosine"), "{rendered}");
+  assert!(rendered.contains("Cosine"), "{rendered}");
+
+  // Which of the three disagrees is the whole diagnosis, so no two of the
+  // three placements may render alike: a PldaCosine trial against two Cosine
+  // sides is a caller who did not re-derive their statistics, one stale
+  // Cosine side among PldaCosine values is a stale cache entry, and a Cosine
+  // trial against two PldaCosine sides is neither.
+  let stale_side = CalibrateError::NormalizationMismatch(NormalizationMismatch::new(
+    Scoring::PldaCosine,
+    Scoring::PldaCosine,
+    Scoring::Cosine,
+  ))
+  .to_string();
+  let stale_trial = CalibrateError::NormalizationMismatch(NormalizationMismatch::new(
+    Scoring::Cosine,
+    Scoring::PldaCosine,
+    Scoring::PldaCosine,
+  ))
+  .to_string();
+  assert_ne!(rendered, stale_side);
+  assert_ne!(rendered, stale_trial);
+  assert_ne!(stale_side, stale_trial);
+
+  // And it must not read like the pairwise refusal it is not: that one is a
+  // profile-against-profile scoring failure, this one is a normalization.
+  let pairwise =
+    CalibrateError::ScoringMismatch(ScoringMismatch::new(Scoring::PldaCosine, Scoring::Cosine))
+      .to_string();
+  assert_ne!(rendered, pairwise);
+  assert!(rendered.contains("AS-Norm"), "{rendered}");
+}

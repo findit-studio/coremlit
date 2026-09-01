@@ -10,8 +10,8 @@ use diaric::embed::{Embedding, cosine_similarity};
 
 use crate::audio::speaker::{
   calibrate::{
-    AsNormOptions, Cohort, CohortStats, Scoring, VoiceProfile, as_norm,
-    cohort_stats_assuming_disjoint, cohort_stats_excluding,
+    AsNormOptions, Cohort, CohortStats, Enrolled, HeldOutCohort, Scoring, SideStats, TrialScore,
+    VoiceProfile, as_norm, enrolled_stats, held_out_stats,
   },
   embed::EMBEDDING_DIM,
   error::CalibrateError,
@@ -54,6 +54,13 @@ fn crowd() -> Vec<Vec<f32>> {
     .collect()
 }
 
+/// Where the held-out partition of [`crowd`] starts. Members below this index
+/// can appear as a trial partner; members at or above it are cohort-only and
+/// never sit on a side of a trial — which is what makes
+/// [`HeldOutCohort::assuming_disjoint`] a true statement about this fixture
+/// rather than a convenient one.
+const HELD_OUT_FROM: usize = 8;
+
 /// Speaker A, sitting INSIDE the crowd — the speaker every impostor scores
 /// highly against.
 fn speaker_a() -> Vec<f32> {
@@ -84,10 +91,10 @@ enum Speaker {
   Impostor(usize),
 }
 
-/// The library every cross-recording test scores against: the crowd, plus
-/// speakers A and B themselves. #123's cohort is "sampled from the library
-/// itself", so A and B ARE in their own cohorts — which is the whole reason
-/// [`cohort_stats_excluding`] has to exist.
+/// The library-sampled cohort: the crowd, plus speakers A and B themselves.
+/// #123's cohort is "sampled from the library itself", so A and B ARE in their
+/// own cohorts — which is the whole reason [`enrolled_stats`] excludes by
+/// identity.
 fn library(scoring: Scoring) -> Cohort<Speaker, VoiceProfile> {
   let mut cohort = Cohort::new();
   for (i, v) in crowd().iter().enumerate() {
@@ -101,17 +108,43 @@ fn library(scoring: Scoring) -> Cohort<Speaker, VoiceProfile> {
   cohort
 }
 
-/// One side of a trial, excluding the probe speaker's own library entries.
-fn side(
-  cohort: &Cohort<Speaker, VoiceProfile>,
-  speaker: Speaker,
-  profile: &VoiceProfile,
-) -> CohortStats {
+/// The held-out cohort: crowd members [`HELD_OUT_FROM`]`..`, which hold no
+/// material from A, from B, or from the one impostor used as a trial partner.
+fn held_out(scoring: Scoring) -> HeldOutCohort {
+  HeldOutCohort::assuming_disjoint(
+    crowd()
+      .iter()
+      .skip(HELD_OUT_FROM)
+      .map(|v| ok(scoring.prepare(v), "prepare a held-out impostor"))
+      .collect(),
+  )
+}
+
+/// One side of a trial over the held-out cohort — the recommended arrangement,
+/// and the only one an unidentified probe has.
+fn side(cohort: &HeldOutCohort, profile: &VoiceProfile) -> SideStats {
   ok(
-    cohort_stats_excluding(cohort, &speaker, profile, &AsNormOptions::new()),
+    held_out_stats(cohort, profile, &AsNormOptions::new()),
     "cohort statistics for a trial side",
   )
 }
+
+/// The worked case behind the finding this shape answers: a three-member
+/// cohort in which a probe scores `[0, 0.8, 0.2]`. Returns the probe row and
+/// the three member rows.
+fn worked_case() -> (Vec<f32>, [Vec<f32>; 3]) {
+  let probe = row(&[(0, 1.0)]);
+  let members = [
+    row(&[(1, 1.0)]),                 // cos(probe, ·) = 0.0
+    row(&[(0, 0.8), (1, 0.6)]),       // cos(probe, ·) = 0.8
+    row(&[(0, 0.2), (2, 0.979_796)]), // cos(probe, ·) = 0.2
+  ];
+  (probe, members)
+}
+
+/// A threshold the worked case straddles: the whole-cohort normalization lands
+/// below it, and the candidate-truncated one above it.
+const WORKED_CASE_THRESHOLD: f64 = 3.0;
 
 // ── the score sources ────────────────────────────────────────────────────
 
@@ -133,7 +166,7 @@ fn a_cosine_trial_score_is_bit_identical_to_diarics_own_cosine() {
     &Embedding::normalize_from(arr_b).expect("B normalizes"),
   ));
 
-  let got = ok(profile_a.score(&profile_b), "score A against B");
+  let got = ok(profile_a.score(&profile_b), "score A against B").raw();
   assert_eq!(
     got.to_bits(),
     expected.to_bits(),
@@ -142,19 +175,20 @@ fn a_cosine_trial_score_is_bit_identical_to_diarics_own_cosine() {
 }
 
 /// A self-match is the top of the cohort — the fact that makes
-/// self-contamination guaranteed rather than merely possible.
+/// self-contamination guaranteed rather than merely possible, and therefore
+/// the fact [`HeldOutCohort::assuming_disjoint`] exists to keep out.
 #[test]
 fn a_cosine_self_match_is_the_largest_score_a_profile_can_obtain() {
   let scoring = Scoring::Cosine;
   let a = ok(scoring.prepare(&speaker_a()), "prepare A");
-  let self_score = ok(a.score(&a), "score A against itself");
+  let self_score = ok(a.score(&a), "score A against itself").raw();
   assert!(
     (self_score - 1.0).abs() < 1e-6,
     "an L2-normalized self-match is 1.0, got {self_score}"
   );
   for (i, v) in crowd().iter().enumerate() {
     let impostor = ok(scoring.prepare(v), "prepare an impostor");
-    let s = ok(a.score(&impostor), "score A against an impostor");
+    let s = ok(a.score(&impostor), "score A against an impostor").raw();
     assert!(
       s < self_score,
       "impostor {i} scored {s}, at or above A's own self-match {self_score}"
@@ -171,12 +205,14 @@ fn both_score_sources_are_reachable_and_are_not_the_same_number() {
     ok(Scoring::Cosine.prepare(&a), "prepare A for cosine")
       .score(&ok(Scoring::Cosine.prepare(&b), "prepare B for cosine")),
     "cosine trial score",
-  );
+  )
+  .raw();
   let plda = ok(
     ok(Scoring::PldaCosine.prepare(&a), "prepare A for plda")
       .score(&ok(Scoring::PldaCosine.prepare(&b), "prepare B for plda")),
     "plda trial score",
-  );
+  )
+  .raw();
 
   assert!(cosine.is_finite(), "cosine score {cosine} must be finite");
   assert!(plda.is_finite(), "plda score {plda} must be finite");
@@ -205,43 +241,85 @@ fn a_profile_reports_the_score_source_it_was_prepared_for() {
   );
 }
 
-// ── the self-contamination choice ────────────────────────────────────────
-
-/// The ruling this door exists to preserve: BOTH entrypoints are present, and
-/// they answer differently on the cohort #123 actually has — one sampled from
-/// the library being scored, so the speaker is in it.
+/// The tag has to SURVIVE each step, not merely be checked at the first one:
+/// a trial score and both kinds of cohort statistic carry the source they were
+/// computed in, which is what makes the final check in [`as_norm`] possible at
+/// all.
 #[test]
-fn the_two_self_contamination_entrypoints_answer_differently_on_a_shared_library() {
+fn a_trial_score_and_a_side_statistic_carry_the_source_they_were_computed_in() {
+  let options = AsNormOptions::new();
+  for scoring in [Scoring::Cosine, Scoring::PldaCosine] {
+    let a = ok(scoring.prepare(&speaker_a()), "prepare A");
+    let b = ok(scoring.prepare(&speaker_b()), "prepare B");
+
+    assert_eq!(
+      ok(a.score(&b), "a trial score").scoring(),
+      scoring,
+      "a trial score must report the source both profiles were prepared for"
+    );
+    assert_eq!(
+      side(&held_out(scoring), &a).scoring(),
+      scoring,
+      "a held-out side must report the source it was computed in"
+    );
+    assert_eq!(
+      ok(
+        enrolled_stats(&library(scoring), Enrolled::new(&Speaker::A, &a), &options),
+        "A's enrolled side",
+      )
+      .scoring(),
+      scoring,
+      "an enrolled side must report the source it was computed in"
+    );
+  }
+}
+
+// ── the two cohorts, and what each side may use ──────────────────────────
+
+/// Why [`HeldOutCohort::assuming_disjoint`] is an assertion worth making: a
+/// cohort that keeps a speaker's own entry scores it at `1.0` and pulls the
+/// mean up, and the contaminated side still looks perfectly healthy.
+#[test]
+fn keeping_a_speakers_own_entry_raises_its_cohort_mean() {
   let scoring = Scoring::Cosine;
   let cohort = library(scoring);
   let b = ok(scoring.prepare(&speaker_b()), "prepare B");
   let options = AsNormOptions::new();
 
   let excluding = ok(
-    cohort_stats_excluding(&cohort, &Speaker::B, &b, &options),
+    enrolled_stats(&cohort, Enrolled::new(&Speaker::B, &b), &options),
     "statistics excluding B's own entries",
   );
-  let disjoint = ok(
-    cohort_stats_assuming_disjoint(&cohort, &b, &options),
-    "statistics over the whole cohort",
+  // The same profiles, wrongly asserted to be held out — B's own entry
+  // included. Only a test would state that; it is the failure the assertion
+  // exists to keep out.
+  let contaminated_members: Vec<VoiceProfile> =
+    cohort.entries().iter().map(|e| *e.item()).collect();
+  let contaminated = ok(
+    held_out_stats(
+      &HeldOutCohort::assuming_disjoint(contaminated_members),
+      &b,
+      &options,
+    ),
+    "statistics over a cohort that still holds B",
   );
 
   assert_eq!(
-    disjoint.considered(),
+    contaminated.considered(),
     cohort.len(),
-    "the disjoint door scores every member"
+    "the held-out door scores every member"
   );
   assert_eq!(
     excluding.considered(),
     cohort.len() - 1,
-    "the excluding door drops B's one library entry"
+    "the enrolled door drops B's one library entry"
   );
   assert!(
-    excluding.mean() < disjoint.mean(),
+    excluding.mean() < contaminated.mean(),
     "B's own entry scores 1.0 against B, so keeping it must raise the mean: \
-     excluding {} vs disjoint {}",
+     excluding {} vs contaminated {}",
     excluding.mean(),
-    disjoint.mean()
+    contaminated.mean()
   );
 }
 
@@ -259,7 +337,11 @@ fn exclusion_drops_every_entry_a_speaker_owns_not_only_the_self_match() {
 
   let b = ok(scoring.prepare(&speaker_b()), "prepare B");
   let excluding = ok(
-    cohort_stats_excluding(&cohort, &Speaker::B, &b, &AsNormOptions::new()),
+    enrolled_stats(
+      &cohort,
+      Enrolled::new(&Speaker::B, &b),
+      &AsNormOptions::new(),
+    ),
     "statistics excluding B",
   );
   assert_eq!(
@@ -267,6 +349,60 @@ fn exclusion_drops_every_entry_a_speaker_owns_not_only_the_self_match() {
     cohort.len() - 2,
     "both of B's entries must go, not just the exact self-match"
   );
+}
+
+/// The SCOPE of the exclusion, pinned as arithmetic: an enrolled side drops
+/// its own speaker and nobody else — least of all the partner it is about to
+/// be scored against, which is what keeps the side a property of one speaker
+/// plus the cohort, and therefore reusable.
+#[test]
+fn an_enrolled_side_drops_only_its_own_speaker_never_the_partner() {
+  let scoring = Scoring::Cosine;
+  let (_, member_rows) = worked_case();
+  let options = AsNormOptions::new();
+
+  let profiles: Vec<VoiceProfile> = member_rows
+    .iter()
+    .map(|v| ok(scoring.prepare(v), "prepare a cohort member"))
+    .collect();
+  let mut cohort: Cohort<Speaker, VoiceProfile> = Cohort::new();
+  for (i, p) in profiles.iter().enumerate() {
+    cohort.push(Speaker::Impostor(i), *p);
+  }
+
+  let enrolled = profiles[1];
+  let got = ok(
+    enrolled_stats(
+      &cohort,
+      Enrolled::new(&Speaker::Impostor(1), &enrolled),
+      &options,
+    ),
+    "the enrolled side",
+  );
+
+  // Exactly the scores against the other two members, member 2 included —
+  // member 2 is the trial partner in the finding-1 test below.
+  let by_hand = ok(
+    CohortStats::from_scores(
+      [
+        ok(enrolled.score(&profiles[0]), "score against member 0").raw(),
+        ok(enrolled.score(&profiles[2]), "score against member 2").raw(),
+      ],
+      &options,
+    ),
+    "the statistics written out by hand",
+  );
+
+  assert_eq!(got.considered(), 2, "only member 1's own entry may go");
+  assert_eq!(
+    got.mean().to_bits(),
+    by_hand.mean().to_bits(),
+    "an enrolled side must be exactly the scores against every OTHER speaker: \
+     got {} against {}",
+    got.mean(),
+    by_hand.mean()
+  );
+  assert_eq!(got.deviation().to_bits(), by_hand.deviation().to_bits());
 }
 
 /// A cohort holding nothing but the excluded speaker is a refusal, not an
@@ -282,10 +418,117 @@ fn a_cohort_that_is_entirely_the_excluded_speaker_is_refused() {
   );
   let b = ok(scoring.prepare(&speaker_b()), "prepare B");
 
-  let refused = cohort_stats_excluding(&cohort, &Speaker::B, &b, &AsNormOptions::new());
+  let refused = enrolled_stats(
+    &cohort,
+    Enrolled::new(&Speaker::B, &b),
+    &AsNormOptions::new(),
+  );
   assert!(
     matches!(refused, Err(CalibrateError::ScoreNorm(_))),
     "self-exclusion emptying the cohort must refuse, got {refused:?}"
+  );
+}
+
+/// FINDING 1, pinned as numbers. An unenrolled probe's identity is what
+/// identification is trying to discover, so its side covers the WHOLE cohort;
+/// the alternative this module's first version recommended — dropping the
+/// candidate's entry from the probe's side — moves the normalized trial across
+/// a threshold.
+///
+/// The truncated statistics have to be built by hand out of `diaric`'s own
+/// constructor, because no entrypoint here can produce them any more.
+#[test]
+fn an_unidentified_probes_side_covers_its_whole_cohort() {
+  let scoring = Scoring::Cosine;
+  let (probe_row, member_rows) = worked_case();
+  let options = AsNormOptions::new();
+
+  let profiles: Vec<VoiceProfile> = member_rows
+    .iter()
+    .map(|v| ok(scoring.prepare(v), "prepare a cohort member"))
+    .collect();
+  let probe = ok(scoring.prepare(&probe_row), "prepare the probe");
+  let candidate = profiles[1];
+
+  // The probe's side: a held-out cohort, nothing excluded, and no candidate
+  // anywhere in the call.
+  let cohort = HeldOutCohort::assuming_disjoint(profiles.clone());
+  let probe_side = ok(
+    held_out_stats(&cohort, &probe, &options),
+    "the probe's cohort statistics",
+  );
+  assert_eq!(
+    probe_side.considered(),
+    cohort.len(),
+    "a probe has no identity to exclude, so every cohort member must be scored"
+  );
+  assert_eq!(probe_side.selected(), 3);
+
+  // The candidate's side, from the library-sampled cohort that names it.
+  let mut library_cohort: Cohort<Speaker, VoiceProfile> = Cohort::new();
+  for (i, p) in profiles.iter().enumerate() {
+    library_cohort.push(Speaker::Impostor(i), *p);
+  }
+  let enrolled_side = ok(
+    enrolled_stats(
+      &library_cohort,
+      Enrolled::new(&Speaker::Impostor(1), &candidate),
+      &options,
+    ),
+    "the candidate's cohort statistics",
+  );
+
+  let trial = ok(candidate.score(&probe), "the trial score");
+  let honest = ok(
+    as_norm(trial, &enrolled_side, &probe_side),
+    "the normalized trial",
+  );
+
+  // The same trial, with the candidate's entry dropped from the PROBE's side.
+  let truncated = ok(
+    CohortStats::from_scores(
+      [
+        ok(probe.score(&profiles[0]), "probe against member 0").raw(),
+        ok(probe.score(&profiles[2]), "probe against member 2").raw(),
+      ],
+      &options,
+    ),
+    "the candidate-truncated probe statistics",
+  );
+  let enrolled_untagged = ok(
+    CohortStats::from_scores(
+      [
+        ok(candidate.score(&profiles[0]), "candidate against member 0").raw(),
+        ok(candidate.score(&profiles[2]), "candidate against member 2").raw(),
+      ],
+      &options,
+    ),
+    "the candidate's statistics written out by hand",
+  );
+  assert_eq!(
+    enrolled_untagged.mean().to_bits(),
+    enrolled_side.mean().to_bits(),
+    "the hand-built enrolment side must be the door's own, or the comparison \
+     below is between two different trials"
+  );
+  let flipped = ok(
+    enrolled_untagged.normalize(trial.raw(), &truncated),
+    "the normalized trial against truncated probe statistics",
+  );
+
+  assert!(
+    (honest - 1.640_951_863_461_705).abs() < 1e-9,
+    "the whole-cohort normalization moved: {honest}"
+  );
+  assert!(
+    (flipped - 4.454_545_979_780_686).abs() < 1e-9,
+    "the candidate-truncated normalization moved: {flipped}"
+  );
+  assert!(
+    honest < WORKED_CASE_THRESHOLD && flipped > WORKED_CASE_THRESHOLD,
+    "dropping the candidate from the probe's cohort must be the difference \
+     between {honest} and {flipped}, which straddle a threshold of \
+     {WORKED_CASE_THRESHOLD}"
   );
 }
 
@@ -294,10 +537,14 @@ fn a_cohort_that_is_entirely_the_excluded_speaker_is_refused() {
 /// The claim from #123, made falsifiable: raw cosine admits NO single
 /// threshold that separates same-speaker trials from different-speaker ones
 /// across two differently-placed speakers, and AS-Norm does.
+///
+/// Every side here comes from the one held-out cohort — the recommended
+/// arrangement, and the only one under which the two z-scores AS-Norm averages
+/// are commensurable.
 #[test]
 fn as_norm_separates_two_differently_placed_speakers_where_no_raw_threshold_can() {
   let scoring = Scoring::Cosine;
-  let cohort = library(scoring);
+  let cohort = held_out(scoring);
 
   let a = ok(scoring.prepare(&speaker_a()), "prepare A");
   let a2 = ok(scoring.prepare(&speaker_a_again()), "prepare A again");
@@ -316,19 +563,22 @@ fn as_norm_separates_two_differently_placed_speakers_where_no_raw_threshold_can(
   // A threshold separates iff the weakest genuine trial outscores the
   // strongest impostor one. Raw scores fail that test.
   assert!(
-    raw_genuine_b < raw_impostor,
+    raw_genuine_b.raw() < raw_impostor.raw(),
     "the fixture must reproduce #123's problem: a genuine trial for the \
-     isolated speaker ({raw_genuine_b}) has to score BELOW an impostor trial \
-     for the crowded one ({raw_impostor})"
+     isolated speaker ({}) has to score BELOW an impostor trial for the \
+     crowded one ({})",
+    raw_genuine_b.raw(),
+    raw_impostor.raw()
   );
 
-  // The same trials, normalized. Every side excludes its own speaker's
-  // library entries — only the caller knows a probe's identity.
-  let side_a = side(&cohort, Speaker::A, &a);
-  let side_a2 = side(&cohort, Speaker::A, &a2);
-  let side_b = side(&cohort, Speaker::B, &b);
-  let side_b2 = side(&cohort, Speaker::B, &b2);
-  let side_impostor = side(&cohort, Speaker::Impostor(0), &impostor);
+  // The same trials, normalized. A', B' and the impostor partner all sit
+  // OUTSIDE the held-out cohort, so nothing needs excluding and no side
+  // depends on the other end of its trial.
+  let side_a = side(&cohort, &a);
+  let side_a2 = side(&cohort, &a2);
+  let side_b = side(&cohort, &b);
+  let side_b2 = side(&cohort, &b2);
+  let side_impostor = side(&cohort, &impostor);
 
   let norm_genuine_a = ok(
     as_norm(raw_genuine_a, &side_a, &side_a2),
@@ -354,13 +604,13 @@ fn as_norm_separates_two_differently_placed_speakers_where_no_raw_threshold_can(
 #[test]
 fn the_plda_score_source_normalizes_end_to_end() {
   let scoring = Scoring::PldaCosine;
-  let cohort = library(scoring);
+  let cohort = held_out(scoring);
   let b = ok(scoring.prepare(&speaker_b()), "prepare B");
   let b2 = ok(scoring.prepare(&speaker_b_again()), "prepare B again");
 
   let raw = ok(b.score(&b2), "B vs B'");
-  let side_b = side(&cohort, Speaker::B, &b);
-  let side_b2 = side(&cohort, Speaker::B, &b2);
+  let side_b = side(&cohort, &b);
+  let side_b2 = side(&cohort, &b2);
   let normalized = ok(as_norm(raw, &side_b, &side_b2), "B vs B' normalized");
   assert!(
     normalized.is_finite(),
@@ -369,12 +619,11 @@ fn the_plda_score_source_normalizes_end_to_end() {
 
   // The statistics have to come out of the PLDA space, not out of a
   // `PldaCosine` that quietly degraded to `Cosine` somewhere in `prepare`.
-  let cosine_cohort = library(Scoring::Cosine);
   let cosine_b = ok(
     Scoring::Cosine.prepare(&speaker_b()),
     "prepare B for cosine",
   );
-  let cosine_side = side(&cosine_cohort, Speaker::B, &cosine_b);
+  let cosine_side = side(&held_out(Scoring::Cosine), &cosine_b);
   assert!(
     (side_b.mean() - cosine_side.mean()).abs() > 1e-6
       || (side_b.deviation() - cosine_side.deviation()).abs() > 1e-6,
@@ -383,6 +632,50 @@ fn the_plda_score_source_normalizes_end_to_end() {
     side_b.deviation(),
     cosine_side.mean(),
     cosine_side.deviation()
+  );
+}
+
+/// The wrapper adds a tag check and NOTHING else: on values that agree, its
+/// answer is `diaric`'s own arithmetic, bit for bit. A second implementation
+/// of eq. (7) hiding in here would be a second set of `diaric`'s cancellation
+/// bugs.
+#[test]
+fn a_matching_normalization_is_diarics_own_arithmetic_bit_for_bit() {
+  let scoring = Scoring::Cosine;
+  let cohort = held_out(scoring);
+  let options = AsNormOptions::new();
+  let a = ok(scoring.prepare(&speaker_a()), "prepare A");
+  let b = ok(scoring.prepare(&speaker_b()), "prepare B");
+
+  let trial = ok(a.score(&b), "A vs B");
+  let got = ok(
+    as_norm(trial, &side(&cohort, &a), &side(&cohort, &b)),
+    "this module's as_norm",
+  );
+
+  let scores = |profile: &VoiceProfile| {
+    crowd()
+      .iter()
+      .skip(HELD_OUT_FROM)
+      .map(|v| {
+        let entry = ok(scoring.prepare(v), "prepare a held-out impostor");
+        ok(profile.score(&entry), "a cohort score").raw()
+      })
+      .collect::<Vec<_>>()
+  };
+  let expected = ok(
+    diaric::score_norm::as_norm(
+      trial.raw(),
+      &ok(CohortStats::from_scores(scores(&a), &options), "A's side"),
+      &ok(CohortStats::from_scores(scores(&b), &options), "B's side"),
+    ),
+    "diaric's own as_norm",
+  );
+
+  assert_eq!(
+    got.to_bits(),
+    expected.to_bits(),
+    "the tagged door must return diaric's number unchanged: {got} vs {expected}"
   );
 }
 
@@ -467,8 +760,58 @@ fn scoring_across_two_score_sources_is_refused() {
   }
 }
 
+/// FINDING 2. The check at `score()` covers the trial and nothing else: the
+/// final combination reads a number and two statistics and no profile at all,
+/// so without a tag on each of the three a `PldaCosine` trial score is
+/// silently calibrated by `Cosine` cohort statistics and comes back finite and
+/// plausible.
+#[test]
+fn a_trial_score_cannot_be_normalized_by_another_metrics_statistics() {
+  let cosine_cohort = held_out(Scoring::Cosine);
+  let cosine_b = ok(Scoring::Cosine.prepare(&speaker_b()), "prepare B");
+  let cosine_b2 = ok(
+    Scoring::Cosine.prepare(&speaker_b_again()),
+    "prepare B again",
+  );
+  let cosine_side = side(&cosine_cohort, &cosine_b);
+  let cosine_side2 = side(&cosine_cohort, &cosine_b2);
+
+  let plda_b = ok(Scoring::PldaCosine.prepare(&speaker_b()), "prepare B");
+  let plda_b2 = ok(
+    Scoring::PldaCosine.prepare(&speaker_b_again()),
+    "prepare B again",
+  );
+  let plda_trial = ok(plda_b.score(&plda_b2), "a PldaCosine trial score");
+
+  match as_norm(plda_trial, &cosine_side, &cosine_side2) {
+    Err(CalibrateError::NormalizationMismatch(m)) => {
+      assert_eq!(m.trial(), Scoring::PldaCosine);
+      assert_eq!(m.enrolled(), Scoring::Cosine);
+      assert_eq!(m.probe(), Scoring::Cosine);
+    }
+    other => panic!(
+      "a PldaCosine trial score calibrated by Cosine cohort statistics must be \
+       refused, got {other:?}"
+    ),
+  }
+
+  // And one stale side among otherwise matching values, which is the shape a
+  // cache of per-speaker statistics actually produces.
+  let plda_side = side(&held_out(Scoring::PldaCosine), &plda_b);
+  match as_norm(plda_trial, &plda_side, &cosine_side2) {
+    Err(CalibrateError::NormalizationMismatch(m)) => {
+      assert_eq!(m.trial(), Scoring::PldaCosine);
+      assert_eq!(m.enrolled(), Scoring::PldaCosine);
+      assert_eq!(m.probe(), Scoring::Cosine);
+    }
+    other => panic!("one foreign side must be refused, got {other:?}"),
+  }
+}
+
 /// A cohort holding a foreign-source entry poisons a mean silently unless the
-/// door refuses it, so it refuses it — through BOTH entrypoints.
+/// door refuses it, so it refuses it — through BOTH entrypoints. This is also
+/// what makes a [`SideStats`]'s own tag sound: a surviving statistic can only
+/// have been computed over entries that all matched its side.
 #[test]
 fn a_cohort_mixing_two_score_sources_is_refused_rather_than_averaged() {
   let mut cohort = library(Scoring::Cosine);
@@ -482,15 +825,24 @@ fn a_cohort_mixing_two_score_sources_is_refused_rather_than_averaged() {
   let a = ok(Scoring::Cosine.prepare(&speaker_a()), "prepare A");
   let options = AsNormOptions::new();
 
-  let excluding = cohort_stats_excluding(&cohort, &Speaker::A, &a, &options);
+  let excluding = enrolled_stats(&cohort, Enrolled::new(&Speaker::A, &a), &options);
   assert!(
     matches!(excluding, Err(CalibrateError::ScoringMismatch(_))),
-    "a mixed cohort must be refused by the excluding door, got {excluding:?}"
+    "a mixed cohort must be refused by the enrolled door, got {excluding:?}"
   );
-  let disjoint = cohort_stats_assuming_disjoint(&cohort, &a, &options);
+
+  let mut mixed: Vec<VoiceProfile> = crowd()
+    .iter()
+    .map(|v| ok(Scoring::Cosine.prepare(v), "prepare an impostor"))
+    .collect();
+  mixed.push(ok(
+    Scoring::PldaCosine.prepare(&speaker_b()),
+    "prepare a foreign-source entry",
+  ));
+  let held = held_out_stats(&HeldOutCohort::assuming_disjoint(mixed), &a, &options);
   assert!(
-    matches!(disjoint, Err(CalibrateError::ScoringMismatch(_))),
-    "a mixed cohort must be refused by the disjoint door, got {disjoint:?}"
+    matches!(held, Err(CalibrateError::ScoringMismatch(_))),
+    "a mixed cohort must be refused by the held-out door, got {held:?}"
   );
 }
 
@@ -500,15 +852,9 @@ fn a_cohort_mixing_two_score_sources_is_refused_rather_than_averaged() {
 /// poison value would otherwise produce.
 #[test]
 fn a_mismatch_inside_the_cohort_reports_the_mismatch_not_the_poison_value() {
-  let mut cohort: Cohort<Speaker, VoiceProfile> = Cohort::new();
-  for (i, v) in crowd().iter().enumerate() {
-    cohort.push(
-      Speaker::Impostor(i),
-      ok(Scoring::PldaCosine.prepare(v), "prepare a foreign entry"),
-    );
-  }
+  let cohort = held_out(Scoring::PldaCosine);
   let a = ok(Scoring::Cosine.prepare(&speaker_a()), "prepare A");
-  let refused = cohort_stats_assuming_disjoint(&cohort, &a, &AsNormOptions::new());
+  let refused = held_out_stats(&cohort, &a, &AsNormOptions::new());
   assert!(
     matches!(refused, Err(CalibrateError::ScoringMismatch(_))),
     "every entry mismatches, so the mismatch must be reported: {refused:?}"
@@ -549,11 +895,15 @@ fn the_callers_options_reach_diarics_selection() {
   let narrow = AsNormOptions::new().with_top_n(NonZeroUsize::new(4).expect("4 is non-zero"));
 
   let wide_side = ok(
-    cohort_stats_excluding(&cohort, &Speaker::B, &b, &AsNormOptions::new()),
+    enrolled_stats(
+      &cohort,
+      Enrolled::new(&Speaker::B, &b),
+      &AsNormOptions::new(),
+    ),
     "statistics at the default top_n",
   );
   let narrow_side = ok(
-    cohort_stats_excluding(&cohort, &Speaker::B, &b, &narrow),
+    enrolled_stats(&cohort, Enrolled::new(&Speaker::B, &b), &narrow),
     "statistics at top_n = 4",
   );
   assert_eq!(
@@ -565,11 +915,11 @@ fn the_callers_options_reach_diarics_selection() {
 
   // Through the other door too, so neither wrapper can be the one that drops
   // the argument.
-  let narrow_disjoint = ok(
-    cohort_stats_assuming_disjoint(&cohort, &b, &narrow),
-    "whole-cohort statistics at top_n = 4",
+  let narrow_held_out = ok(
+    held_out_stats(&held_out(scoring), &b, &narrow),
+    "held-out statistics at top_n = 4",
   );
-  assert_eq!(narrow_disjoint.selected(), 4);
+  assert_eq!(narrow_held_out.selected(), 4);
 }
 
 /// `diaric`'s minimum-usable-cohort floor reaches through the wrapper, and
@@ -578,15 +928,15 @@ fn the_callers_options_reach_diarics_selection() {
 #[test]
 fn a_cohort_below_the_minimum_usable_size_is_refused_as_too_small() {
   let scoring = Scoring::Cosine;
-  let mut cohort: Cohort<Speaker, VoiceProfile> = Cohort::new();
-  cohort.push(
-    Speaker::Impostor(0),
-    ok(scoring.prepare(&crowd()[0]), "prepare an impostor"),
-  );
+  let cohort = HeldOutCohort::assuming_disjoint(vec![ok(
+    scoring.prepare(&crowd()[0]),
+    "prepare an impostor",
+  )]);
   assert!(cohort.len() < super::MIN_COHORT_SCORES);
+  assert!(!cohort.is_empty());
 
   let b = ok(scoring.prepare(&speaker_b()), "prepare B");
-  let refused = cohort_stats_assuming_disjoint(&cohort, &b, &AsNormOptions::new());
+  let refused = held_out_stats(&cohort, &b, &AsNormOptions::new());
   match refused {
     Err(CalibrateError::ScoreNorm(diaric::score_norm::Error::CohortTooSmall(t))) => {
       assert_eq!(t.available(), 1);
@@ -598,11 +948,15 @@ fn a_cohort_below_the_minimum_usable_size_is_refused_as_too_small() {
 
 /// A profile is plain data and must stay movable and shareable across threads:
 /// a library holds thousands of them and a confusion experiment fans them out.
-/// Pinned at compile time so a future field type cannot regress the auto-derive
-/// silently.
+/// The tagged values travel with them. Pinned at compile time so a future field
+/// type cannot regress the auto-derive silently.
 const _: fn() = || {
   fn assert_send_sync<T: Send + Sync>() {}
   assert_send_sync::<VoiceProfile>();
   assert_send_sync::<Scoring>();
+  assert_send_sync::<TrialScore>();
+  assert_send_sync::<SideStats>();
+  assert_send_sync::<HeldOutCohort>();
+  assert_send_sync::<Enrolled<'static, u32>>();
   assert_send_sync::<CalibrateError>();
 };

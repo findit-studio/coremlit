@@ -1474,6 +1474,61 @@ impl ScoringMismatch {
   }
 }
 
+/// A trial score and the two cohort statistics it was normalized against were
+/// not all computed in the same score source.
+///
+/// Payload of [`CalibrateError::NormalizationMismatch`].
+///
+/// All three sources are carried, not merely the disagreeing pair. AS-Norm1
+/// combines one score with two independently computed sides, so *which* of the
+/// three is the odd one out is the whole diagnosis: a `PldaCosine` trial
+/// against two `Cosine` sides is a caller who did not re-derive their
+/// statistics, while one `Cosine` side among two `PldaCosine` values is a
+/// stale cache entry. The pair-shaped [`ScoringMismatch`] cannot say which.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct NormalizationMismatch {
+  /// The score source the trial score was computed in.
+  trial: crate::audio::speaker::calibrate::Scoring,
+  /// The score source the enrolment side's statistics were computed in.
+  enrolled: crate::audio::speaker::calibrate::Scoring,
+  /// The score source the probe side's statistics were computed in.
+  probe: crate::audio::speaker::calibrate::Scoring,
+}
+
+impl NormalizationMismatch {
+  /// Construct from the trial score's source and the two sides'.
+  #[inline(always)]
+  pub const fn new(
+    trial: crate::audio::speaker::calibrate::Scoring,
+    enrolled: crate::audio::speaker::calibrate::Scoring,
+    probe: crate::audio::speaker::calibrate::Scoring,
+  ) -> Self {
+    Self {
+      trial,
+      enrolled,
+      probe,
+    }
+  }
+
+  /// The score source the trial score was computed in.
+  #[inline(always)]
+  pub const fn trial(&self) -> crate::audio::speaker::calibrate::Scoring {
+    self.trial
+  }
+
+  /// The score source the enrolment side's statistics were computed in.
+  #[inline(always)]
+  pub const fn enrolled(&self) -> crate::audio::speaker::calibrate::Scoring {
+    self.enrolled
+  }
+
+  /// The score source the probe side's statistics were computed in.
+  #[inline(always)]
+  pub const fn probe(&self) -> crate::audio::speaker::calibrate::Scoring {
+    self.probe
+  }
+}
+
 /// Failure preparing a voice profile, scoring a trial, or deriving a side's
 /// cohort statistics — [`crate::audio::speaker::calibrate`]'s error.
 ///
@@ -1557,6 +1612,25 @@ pub enum CalibrateError {
     .0.other()
   )]
   ScoringMismatch(ScoringMismatch),
+
+  /// A trial score and the two sides handed to
+  /// [`as_norm`](crate::audio::speaker::calibrate::as_norm) were not all
+  /// computed in one score source.
+  ///
+  /// The refusal [`ScoringMismatch`] could not make, because the final
+  /// combination step reads no profiles at all — it reads a number and two
+  /// statistics. `Cosine` cohort scores of `[-1, 1]` have mean `0` and
+  /// deviation `1`, so any finite `PldaCosine` trial score normalized against
+  /// them comes back finite and plausible: one metric calibrated by another,
+  /// with nothing out of range to notice.
+  #[error(
+    "AS-Norm: a {:?} trial score cannot be normalized by a {:?} enrolment side \
+     and a {:?} probe side",
+    .0.trial(),
+    .0.enrolled(),
+    .0.probe()
+  )]
+  NormalizationMismatch(NormalizationMismatch),
 
   /// `diaric`'s AS-Norm refused this side's cohort statistics.
   #[error("voice profile: {0}")]
