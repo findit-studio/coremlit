@@ -206,6 +206,133 @@ pub fn assert_exact_sha_manifest(dir: &Path, cases: &[(&str, &str)]) {
   }
 }
 
+// ── Host capability: predicting AT the graph's own default shape ────────────
+
+/// Mel frames in the shape the shipped artifact names as its own default.
+///
+/// `model.mil`'s `FlexibleShapeInformation` carries both halves:
+/// `DefaultShapes {"mel_features", [1, 301, 60]}` beside
+/// `RangeDims [[1, 1], [10, 3001], [60, 60]]`. So 301 is not just "a short
+/// window" — it is the ONE length CoreML specializes the graph for at load
+/// time, and it is reachable from ordinary use: a caller who asks
+/// [`coremlit::audio::lid::WindowPlan`] for 3 s windows lands exactly on it.
+#[allow(dead_code)]
+pub const GRAPH_DEFAULT_SHAPE_FRAMES: usize = 301;
+
+/// 16 kHz samples that produce [`GRAPH_DEFAULT_SHAPE_FRAMES`] mel frames.
+#[allow(dead_code)]
+pub const GRAPH_DEFAULT_SHAPE_SAMPLES: usize = 48_000;
+
+/// `Some(reason)` when this host's CoreML cannot predict at the shape above.
+///
+/// # Why this probe exists
+///
+/// On the GitHub `macos-15` runner, a prediction at EXACTLY 301 frames under
+/// the door's default placement comes back as
+/// `Prediction(Native(.. "Unable to compute the prediction using ML Program"))`,
+/// deterministically, while 101, 900, 1 001 and 1 300 frames all answer
+/// normally on the same loaded model. The refusal is not about length — it is
+/// non-monotone in length — and it is not this crate's doing:
+///
+///   - the failing call is a bare
+///     [`Identifier::log_probabilities`](coremlit::audio::lid::Identifier::log_probabilities)
+///     on a sub-slice, with no window plan anywhere in the path;
+///   - `model_io`'s `runtime_accepts_exactly_the_pinned_frame_range` feeds the
+///     runtime a `[1, 301, 60]` tensor on that same runner and it is ACCEPTED,
+///     so the shape is supported and the tensor this crate builds is valid;
+///   - the identical call on the identical artifact bytes answers on
+///     macOS 26.5 / M1 Max with a mass deviation of 6.8e-8.
+///
+/// That leaves the host's CoreML refusing its own default-shape specialization,
+/// which no amount of Rust can fix and which a gate must therefore state rather
+/// than absorb.
+///
+/// # Why it cannot hide a real break
+///
+/// The probe runs the DEFAULT-length window first and requires it to answer. A
+/// model that is actually broken here fails that call, and the probe panics
+/// instead of excusing anything. Only a `Prediction` refusal at the default
+/// shape, on a host that is otherwise predicting fine, is reported as a host
+/// limitation; every other error is re-raised.
+#[allow(dead_code)]
+fn default_shape_refusal() -> Option<&'static String> {
+  use std::sync::OnceLock;
+
+  use coremlit::audio::lid::{DEFAULT_WINDOW_SAMPLES, Error, Identifier};
+
+  static PROBE: OnceLock<Option<String>> = OnceLock::new();
+  PROBE
+    .get_or_init(|| {
+      // The two constants must describe the SAME input, or the refusal message
+      // below names a length the probe did not actually run.
+      assert_eq!(
+        coremlit::audio::lid::frame_count(GRAPH_DEFAULT_SHAPE_SAMPLES),
+        GRAPH_DEFAULT_SHAPE_FRAMES,
+        "the probe's sample count and frame count disagree"
+      );
+      let identifier = Identifier::from_file(model_path())
+        .unwrap_or_else(|e| panic!("host-capability probe: load identifier: {e}"));
+      // The real fixture, so the probe runs the very call the gates run.
+      let samples = read_wav_16k_mono(&fixture_path("audio/udhr_th_16k.wav"));
+
+      // A host that cannot answer the SHIPPED default window is broken, not
+      // limited: fail here rather than excusing anything below.
+      identifier
+        .log_probabilities(&samples[..DEFAULT_WINDOW_SAMPLES as usize])
+        .unwrap_or_else(|e| {
+          panic!(
+            "host-capability probe: this host cannot predict at the door's own \
+             default window ({DEFAULT_WINDOW_SAMPLES} samples): {e} — that is a \
+             broken model or a broken host, not the narrow default-shape \
+             refusal this probe excuses, so it must red"
+          )
+        });
+
+      match identifier.log_probabilities(&samples[..GRAPH_DEFAULT_SHAPE_SAMPLES]) {
+        Ok(_) => None,
+        Err(e @ Error::Prediction(_)) => Some(format!(
+          "this host's CoreML refuses to predict at the graph's own \
+           DefaultShapes [1, {GRAPH_DEFAULT_SHAPE_FRAMES}, 60] \
+           ({GRAPH_DEFAULT_SHAPE_SAMPLES} samples, 3 s) under the door's \
+           default placement, while answering normally at the default \
+           {DEFAULT_WINDOW_SAMPLES}-sample window: {e}"
+        )),
+        // Anything else is a real defect and must not be excused.
+        Err(e) => panic!(
+          "host-capability probe: predicting at the graph's default shape failed \
+           with {e} — only a CoreML `Prediction` refusal is a host limitation, \
+           so this reds"
+        ),
+      }
+    })
+    .as_ref()
+}
+
+/// Reports and returns `true` when this gate cannot run on this host.
+///
+/// The line goes to the INHERITED stderr descriptor rather than through
+/// `println!`, for the reason `model_gate_report` spells out next door: libtest
+/// discards a passing test's output unless the reader remembered `--nocapture`,
+/// and a skip nobody can see is the silent pass this is meant to prevent.
+#[allow(dead_code)]
+pub fn skipped_for_the_default_shape_refusal(gate: &str) -> bool {
+  use std::io::Write;
+
+  let Some(reason) = default_shape_refusal() else {
+    return false;
+  };
+  let line = format!("model-gates | SKIPPED {gate}: {reason}\n");
+  // SAFETY: fd 2 is open for the whole life of the process (libtest redirects
+  // the Rust-level handles, never the descriptor), it is only written to here,
+  // and `ManuallyDrop` keeps the `File` from closing a descriptor it does not
+  // own.
+  let mut fd2 = std::mem::ManuallyDrop::new(unsafe {
+    <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(2)
+  });
+  let _ = fd2.write_all(line.as_bytes());
+  true
+}
+
 // ── Model-gate visibility (#61) ─────────────────────────────────────────────
 //
 // NOT `#[ignore]`d, deliberately: an ignored-only run never selects it, so the

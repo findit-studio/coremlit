@@ -192,6 +192,14 @@ fn the_long_path_is_bit_identical_to_identify_on_a_clip_that_fits() {
 #[test]
 #[ignore = "requires the staged LID model (LID_TEST_MODELS)"]
 fn windowed_scores_reproduce_the_single_shot_ranking() {
+  // Every window here is 48 000 samples — 301 frames, the graph's own
+  // `DefaultShapes`. See `common::default_shape_refusal` for the host that
+  // refuses exactly that length and why this is a skip and not a relaxation.
+  if common::skipped_for_the_default_shape_refusal(
+    "windowed_scores_reproduce_the_single_shot_ranking",
+  ) {
+    return;
+  }
   let identifier = identifier();
   let samples = clip();
   let truth = identifier.log_probabilities(&samples).expect("single shot");
@@ -391,6 +399,15 @@ fn a_spliced_minority_language_is_kept_by_one_pooling_and_erased_by_another() {
 #[test]
 #[ignore = "requires the staged LID model (LID_TEST_MODELS)"]
 fn padding_a_short_tail_moves_the_answer_and_sliding_back_does_not() {
+  // The 48 000-sample tail below is 301 frames, the graph's own
+  // `DefaultShapes`. The whole gate stands down rather than half of it, so the
+  // three tails it contrasts stay one measurement — see
+  // `common::default_shape_refusal`.
+  if common::skipped_for_the_default_shape_refusal(
+    "padding_a_short_tail_moves_the_answer_and_sliding_back_does_not",
+  ) {
+    return;
+  }
   let identifier = identifier();
   let samples = clip();
   let window = DEFAULT_WINDOW_SAMPLES as usize;
@@ -585,6 +602,15 @@ const SWEEP_MODEL_TO_FOLD_RATIO: f64 = 1e3;
 #[test]
 #[ignore = "requires the staged LID model (LID_TEST_MODELS)"]
 fn every_fold_in_the_published_sweep_lands_far_inside_the_mass_tolerance() {
+  // The `3s/3s` geometry is 301 frames, the graph's own `DefaultShapes`. The
+  // sweep's published shape IS its claim — 192 folds over four units — so a
+  // host that cannot run one third of it must skip the gate, not quietly
+  // publish a smaller table under the same name.
+  if common::skipped_for_the_default_shape_refusal(
+    "every_fold_in_the_published_sweep_lands_far_inside_the_mass_tolerance",
+  ) {
+    return;
+  }
   let english = english_clip();
   let clips: [(&str, Vec<f32>); 4] = [
     ("thai-39s", repeated(3)),
@@ -750,6 +776,13 @@ fn every_fold_in_the_published_sweep_lands_far_inside_the_mass_tolerance() {
 #[test]
 #[ignore = "requires the staged LID model (LID_TEST_MODELS)"]
 fn the_graphs_largest_output_reaches_zero_and_never_passes_it() {
+  // Same sweep, same 301-frame geometry, and the same reason it is all or
+  // nothing: the 468-row count this gate rests on is part of what it asserts.
+  if common::skipped_for_the_default_shape_refusal(
+    "the_graphs_largest_output_reaches_zero_and_never_passes_it",
+  ) {
+    return;
+  }
   let english = english_clip();
   let clips: [(&str, Vec<f32>); 4] = [
     ("thai-39s", repeated(3)),
