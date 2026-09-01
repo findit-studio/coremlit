@@ -100,6 +100,38 @@ Compositions (pinned by the golden test): `nl-recognizer` → `whisper`;
 `vad-bundled` → `coremlit/vad`. (`granite`, `siglip`, `ced`, and `lid` each
 compose with nothing — a single leaf feature.)
 
+## Model-licence gating (the `commercial-` prefix)
+
+coremlit is MIT OR Apache-2.0, but products built on it need not be. A model
+artifact whose **weights** or whose **training corpus** forbids commercial use
+is therefore disqualifying for the shipping path — while still being perfectly
+legal for CI to fetch and test against, because this repository redistributes
+no weight bytes (see `NOTICE`, "CI DOWNLOADS; IT DOES NOT REDISTRIBUTE").
+
+Any such artifact rides a feature named with the **`commercial-` prefix**, which
+is never in `default`. The prefix reads backwards — `commercial-face` looks like
+"cleared for commercial use" — so **the first sentence of the feature's comment
+in `Cargo.toml` must say that a commercial licence is required**. That is not
+decoration; it is what stops the name being read as an endorsement.
+
+None of these features exists yet. The mechanism does:
+`coremlit/tests/model_licences.rs` holds the licence table — keyed by
+**artifact file + SHA-256, never by repository**, because a repository's own
+tag can contradict the terms of bytes it merely re-hosts — and refuses all
+three of
+
+- a `MODELS_LOCK` artifact with no licence row (and a row naming no staged
+  repository);
+- a research-only row reachable from `default`, or gated by a plain kit
+  feature instead of a `commercial-` one;
+- a `commercial-` feature gating artifacts whose rows are all clear — a gate
+  left standing after the restriction it protected went away.
+
+Adding a `commercial-` feature therefore means three edits, not one: the
+`Cargo.toml` feature (with its first-sentence warning), its row in
+`expected_features()` and the table above, and its artifact rows in the licence
+table.
+
 ## Curated CI feature-combination list
 
 The former per-crate `cargo hack --each-feature` powerset is replaced by this
