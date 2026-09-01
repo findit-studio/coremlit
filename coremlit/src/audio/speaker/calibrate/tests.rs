@@ -19,10 +19,10 @@ use diaric::{
 use crate::audio::speaker::{
   calibrate::{
     AsNormOptions, CalibratedTrial, Calibration, CalibrationId, Enrolled, HeldOutCohort,
-    LibraryCohort, Scoring, TrialSide, VoiceProfile,
+    LibraryCohort, Scoring, SpeakerToken, TrialSide, VoiceProfile,
   },
   embed::EMBEDDING_DIM,
-  error::CalibrateError,
+  error::{CalibrateError, CohortSelection, ScoreNormRefusal},
 };
 
 // ── fixtures ─────────────────────────────────────────────────────────────
@@ -116,6 +116,28 @@ fn library(scoring: Scoring) -> LibraryCohort<Speaker> {
   cohort
 }
 
+/// Mint one speaker's token out of a cohort that is still open, and hand back
+/// both. Every enrolled side in this file goes through here, because that is
+/// the only order the surface permits: identity is decided while the cohort
+/// can still change, and never after.
+fn with_token(
+  mut cohort: LibraryCohort<Speaker>,
+  speaker: Speaker,
+) -> (LibraryCohort<Speaker>, SpeakerToken) {
+  let token = cohort.token(speaker);
+  (cohort, token)
+}
+
+/// [`library`] under the default options, with one speaker's token minted
+/// first — the shape an enrolled side takes.
+fn library_calibration_for(
+  scoring: Scoring,
+  speaker: Speaker,
+) -> (Calibration<LibraryCohort<Speaker>>, SpeakerToken) {
+  let (cohort, token) = with_token(library(scoring), speaker);
+  (Calibration::new(cohort, AsNormOptions::new()), token)
+}
+
 /// The held-out cohort: crowd members [`HELD_OUT_FROM`]`..`, which hold no
 /// material from A, from B, or from the one impostor used as a trial partner.
 fn held_out(scoring: Scoring) -> HeldOutCohort {
@@ -126,12 +148,6 @@ fn held_out(scoring: Scoring) -> HeldOutCohort {
       .map(|v| ok(scoring.prepare(v), "prepare a held-out impostor"))
       .collect(),
   )
-}
-
-/// [`library`] fixed under the default options — the shape a trial between two
-/// NAMED speakers takes.
-fn library_calibration(scoring: Scoring) -> Calibration<LibraryCohort<Speaker>> {
-  Calibration::new(library(scoring), AsNormOptions::new())
 }
 
 /// [`held_out`] fixed under the default options — the shape a trial with an
@@ -303,9 +319,10 @@ fn a_side_and_a_calibrated_trial_carry_the_source_they_were_computed_in() {
       scoring,
       "a calibrated trial must report the source both its profiles carry"
     );
+    let (library_cal, a_token) = library_calibration_for(scoring, Speaker::A);
     assert_eq!(
       ok(
-        library_calibration(scoring).enrolled_side(Enrolled::new(&Speaker::A, &a)),
+        library_cal.enrolled_side(Enrolled::new(a_token, &a)),
         "A's enrolled side",
       )
       .scoring(),
@@ -329,18 +346,18 @@ fn a_side_and_a_calibrated_trial_carry_the_source_they_were_computed_in() {
 fn keeping_a_speakers_own_entry_lowers_every_score_taken_against_it() {
   let scoring = Scoring::Cosine;
   let options = AsNormOptions::new();
-  let cohort = library(scoring);
+  let (cohort, b_token) = with_token(library(scoring), Speaker::B);
   let members = cohort.len();
   let b = ok(scoring.prepare(&speaker_b()), "prepare B");
   let b2 = ok(scoring.prepare(&speaker_b_again()), "prepare B again");
 
   let clean = Calibration::new(cohort.clone(), options);
   let clean_b = ok(
-    clean.enrolled_side(Enrolled::new(&Speaker::B, &b)),
+    clean.enrolled_side(Enrolled::new(b_token, &b)),
     "B's side, own entries excluded",
   );
   let clean_b2 = ok(
-    clean.enrolled_side(Enrolled::new(&Speaker::B, &b2)),
+    clean.enrolled_side(Enrolled::new(b_token, &b2)),
     "B''s side, own entries excluded",
   );
 
@@ -404,10 +421,11 @@ fn exclusion_drops_every_entry_a_speaker_owns_not_only_the_self_match() {
     ok(scoring.prepare(&speaker_b_again()), "prepare B again"),
   );
   let members = cohort.len();
+  let b_token = cohort.token(Speaker::B);
 
   let b = ok(scoring.prepare(&speaker_b()), "prepare B");
   let excluding = ok(
-    Calibration::new(cohort, AsNormOptions::new()).enrolled_side(Enrolled::new(&Speaker::B, &b)),
+    Calibration::new(cohort, AsNormOptions::new()).enrolled_side(Enrolled::new(b_token, &b)),
     "statistics excluding B",
   );
   assert_eq!(
@@ -437,9 +455,9 @@ fn an_enrolled_side_drops_only_its_own_speaker_never_the_partner() {
   }
 
   let enrolled = profiles[1];
+  let token = cohort.token(Speaker::Impostor(1));
   let got = ok(
-    Calibration::new(cohort, options)
-      .enrolled_side(Enrolled::new(&Speaker::Impostor(1), &enrolled)),
+    Calibration::new(cohort, options).enrolled_side(Enrolled::new(token, &enrolled)),
     "the enrolled side",
   );
 
@@ -485,12 +503,170 @@ fn a_cohort_that_is_entirely_the_excluded_speaker_is_refused() {
     ok(scoring.prepare(&speaker_b_again()), "prepare B again"),
   );
   let b = ok(scoring.prepare(&speaker_b()), "prepare B");
+  let b_token = cohort.token(Speaker::B);
 
   let refused =
-    Calibration::new(cohort, AsNormOptions::new()).enrolled_side(Enrolled::new(&Speaker::B, &b));
+    Calibration::new(cohort, AsNormOptions::new()).enrolled_side(Enrolled::new(b_token, &b));
   assert!(
     matches!(refused, Err(CalibrateError::ScoreNorm(_))),
     "self-exclusion emptying the cohort must refuse, got {refused:?}"
+  );
+}
+
+/// A speaker key the caller can still WRITE TO must not be able to re-decide
+/// what a side excludes once the calibration exists.
+///
+/// `K: Eq` does not forbid interior mutability: `Cell`'s `PartialEq` reads the
+/// cell, so `Rc<Cell<u64>>` is a perfectly good `Eq` key that a caller can
+/// change through their own handle, and taking the cohort by value does not
+/// close it — what moved is the container, and the number the comparison reads
+/// is behind a pointer the caller kept.
+///
+/// Under a cohort that excluded by `K`, writing to that cell between two
+/// derivations gave the second side the WHOLE cohort, this speaker's own entry
+/// included, while the [`CalibrationId`] did not move — so `trial` averaged a
+/// clean side with a self-contaminated one and returned a finite number. The
+/// mint is `&mut self` now, so the key is compared once, before the
+/// calibration exists, and this writes to a value nothing reads again.
+#[test]
+fn a_writable_key_cannot_re_decide_what_a_side_excludes() {
+  use core::cell::Cell;
+  use std::rc::Rc;
+
+  type Writable = Rc<Cell<u64>>;
+  let scoring = Scoring::Cosine;
+
+  let mut cohort: LibraryCohort<Writable> = LibraryCohort::new();
+  for (i, v) in crowd().iter().enumerate() {
+    cohort.push(
+      Rc::new(Cell::new(100 + i as u64)),
+      ok(scoring.prepare(v), "prepare an impostor"),
+    );
+  }
+  // A's own library entry, under the key `1`.
+  cohort.push(
+    Rc::new(Cell::new(1)),
+    ok(scoring.prepare(&speaker_a()), "prepare A"),
+  );
+  let members = cohort.len();
+
+  // The caller's own handle on A's identity — a second `Rc` holding the same
+  // number, which is what a caller reading their library record has. It is
+  // compared HERE, once, while the cohort is still open.
+  let key: Writable = Rc::new(Cell::new(1));
+  let token = cohort.token(Rc::clone(&key));
+
+  let calibration = Calibration::new(cohort, AsNormOptions::new());
+  let a = ok(scoring.prepare(&speaker_a()), "prepare A");
+
+  let first = ok(
+    calibration.enrolled_side(Enrolled::new(token, &a)),
+    "A's side",
+  );
+  assert_eq!(
+    first.considered(),
+    members - 1,
+    "A's own entry must be dropped"
+  );
+
+  // The caller writes to the key the token was minted from. Nothing reads it
+  // again: the cohort files its entries under the token, and the mint that
+  // compared `K` needs `&mut self`, which a calibration cannot lend.
+  key.set(999);
+  let second = ok(
+    calibration.enrolled_side(Enrolled::new(token, &a)),
+    "A's side, taken again",
+  );
+
+  assert_eq!(
+    second.considered(),
+    first.considered(),
+    "one calibration and one enrolled value must consider one cohort"
+  );
+  assert_eq!(second.calibration(), first.calibration());
+  // Same exclusion, so the same statistics, so the same trial: the two sides
+  // really are commensurable rather than merely claiming to be.
+  assert_eq!(
+    second.stats.mean().to_bits(),
+    first.stats.mean().to_bits(),
+    "a side taken twice under one calibration must be one statistic"
+  );
+  assert_eq!(
+    second.stats.deviation().to_bits(),
+    first.stats.deviation().to_bits()
+  );
+}
+
+/// A token names a speaker in the cohort that MINTED it and in no other, so a
+/// token from somewhere else is a refusal rather than an exclusion of nothing.
+///
+/// Excluding nothing is the self-contamination the enrolled door exists to
+/// prevent, and it looks perfectly healthy: a self-match is the largest score
+/// a profile can obtain, so top-N selection is guaranteed to keep it.
+#[test]
+fn a_token_from_another_cohort_is_refused_rather_than_excluding_nothing() {
+  let scoring = Scoring::Cosine;
+  let (_, foreign_token) = with_token(library(scoring), Speaker::A);
+  let (own, own_token) = with_token(library(scoring), Speaker::A);
+  assert_ne!(
+    foreign_token, own_token,
+    "two cohorts mint two tokens for one key: nothing here can tell they are \
+     one population"
+  );
+
+  let calibration = Calibration::new(own, AsNormOptions::new());
+  let a = ok(scoring.prepare(&speaker_a()), "prepare A");
+
+  let refused = calibration.enrolled_side(Enrolled::new(foreign_token, &a));
+  assert!(
+    matches!(refused, Err(CalibrateError::ForeignSpeaker)),
+    "a foreign token must be refused, got {refused:?}"
+  );
+  let accepted = ok(
+    calibration.enrolled_side(Enrolled::new(own_token, &a)),
+    "A's side under her own cohort's token",
+  );
+  assert_eq!(accepted.considered(), calibration.cohort().len() - 1);
+}
+
+/// A speaker the cohort holds nothing of still gets a token, and it names an
+/// empty exclusion set — the ordinary case, since a cohort is a sample of a
+/// library and most enrolled speakers are not in it. The token stays the same
+/// one if that speaker IS pushed later, so an exclusion cannot be lost by the
+/// order the caller assembled things in.
+#[test]
+fn a_speaker_the_cohort_does_not_hold_excludes_nothing_and_keeps_its_token() {
+  let scoring = Scoring::Cosine;
+  let mut cohort = library(scoring);
+  let members = cohort.len();
+
+  let stranger = Speaker::Impostor(999);
+  let token = cohort.token(stranger);
+  let profile = ok(scoring.prepare(&speaker_b_again()), "prepare a stranger");
+
+  let absent = Calibration::new(cohort.clone(), AsNormOptions::new());
+  let side = ok(
+    absent.enrolled_side(Enrolled::new(token, &profile)),
+    "a side for a speaker the cohort does not hold",
+  );
+  assert_eq!(
+    side.considered(),
+    members,
+    "there is nothing of this speaker's here to drop"
+  );
+
+  // Pushed afterwards, under the same key: the token it was already given is
+  // the one the entry is filed under, so the exclusion still happens.
+  cohort.push(stranger, profile);
+  let present = Calibration::new(cohort, AsNormOptions::new());
+  let after = ok(
+    present.enrolled_side(Enrolled::new(token, &profile)),
+    "a side once the cohort holds this speaker",
+  );
+  assert_eq!(
+    after.considered(),
+    members,
+    "the entry pushed under an already-minted token must be dropped by it"
   );
 }
 
@@ -538,9 +714,10 @@ fn an_unidentified_probes_side_covers_its_whole_cohort() {
   for (i, p) in profiles.iter().enumerate() {
     library_cohort.push(Speaker::Impostor(i), *p);
   }
+  let candidate_token = library_cohort.token(Speaker::Impostor(1));
   let library_cal = Calibration::new(library_cohort, options);
   let enrolled_side = ok(
-    library_cal.enrolled_side(Enrolled::new(&Speaker::Impostor(1), &candidate)),
+    library_cal.enrolled_side(Enrolled::new(candidate_token, &candidate)),
     "the candidate's cohort statistics",
   );
 
@@ -906,8 +1083,9 @@ fn a_cohort_mixing_two_score_sources_is_refused_rather_than_averaged() {
   );
   let a = ok(Scoring::Cosine.prepare(&speaker_a()), "prepare A");
   let options = AsNormOptions::new();
+  let a_token = cohort.token(Speaker::A);
 
-  let excluding = Calibration::new(cohort, options).enrolled_side(Enrolled::new(&Speaker::A, &a));
+  let excluding = Calibration::new(cohort, options).enrolled_side(Enrolled::new(a_token, &a));
   assert!(
     matches!(excluding, Err(CalibrateError::ScoringMismatch(_))),
     "a mixed cohort must be refused by the enrolled door, got {excluding:?}"
@@ -973,7 +1151,7 @@ fn the_callers_options_reach_diarics_selection() {
   use core::num::NonZeroUsize;
 
   let scoring = Scoring::Cosine;
-  let cohort = library(scoring);
+  let (cohort, b_token) = with_token(library(scoring), Speaker::B);
   let members = cohort.len();
   let b = ok(scoring.prepare(&speaker_b()), "prepare B");
   let narrow = AsNormOptions::new().with_top_n(NonZeroUsize::new(4).expect("4 is non-zero"));
@@ -982,12 +1160,15 @@ fn the_callers_options_reach_diarics_selection() {
   let narrow_library = Calibration::new(cohort, narrow);
   assert_eq!(narrow_library.options(), &narrow);
 
+  // A clone of the cohort keeps the tokens it was cloned with, so one token
+  // names the same speaker in both — which is what makes this a comparison of
+  // two `top_n` values and of nothing else.
   let wide_side = ok(
-    wide.enrolled_side(Enrolled::new(&Speaker::B, &b)),
+    wide.enrolled_side(Enrolled::new(b_token, &b)),
     "statistics at the default top_n",
   );
   let narrow_side = ok(
-    narrow_library.enrolled_side(Enrolled::new(&Speaker::B, &b)),
+    narrow_library.enrolled_side(Enrolled::new(b_token, &b)),
     "statistics at top_n = 4",
   );
   assert_eq!(
@@ -1007,7 +1188,8 @@ fn the_callers_options_reach_diarics_selection() {
 
 /// `diaric`'s minimum-usable-cohort floor reaches through the wrapper, and
 /// arrives as its OWN refusal — a cohort that is merely absent must not be
-/// reported as a degenerate one.
+/// reported as a degenerate one — and it arrives translated, carrying the two
+/// COUNTS and none of `diaric`'s arithmetic.
 #[test]
 fn a_cohort_below_the_minimum_usable_size_is_refused_as_too_small() {
   let scoring = Scoring::Cosine;
@@ -1021,11 +1203,87 @@ fn a_cohort_below_the_minimum_usable_size_is_refused_as_too_small() {
   let b = ok(scoring.prepare(&speaker_b()), "prepare B");
   let refused = Calibration::new(cohort, AsNormOptions::new()).side(&b);
   match refused {
-    Err(CalibrateError::ScoreNorm(diaric::score_norm::Error::CohortTooSmall(t))) => {
-      assert_eq!(t.available(), 1);
-      assert_eq!(t.required(), super::MIN_COHORT_SCORES);
+    Err(CalibrateError::ScoreNorm(ScoreNormRefusal::CohortTooSmall(selection))) => {
+      assert_eq!(selection.selected(), 1);
+      assert_eq!(selection.considered(), 1);
+      // The floor itself is named by the variant and rendered from the public
+      // constant, so nothing has to carry it.
+      assert!(
+        CalibrateError::ScoreNorm(ScoreNormRefusal::CohortTooSmall(selection))
+          .to_string()
+          .contains(&super::MIN_COHORT_SCORES.to_string())
+      );
     }
     other => panic!("a one-member cohort must be refused as too small, got {other:?}"),
+  }
+}
+
+/// A REFUSAL must not hand back the operand the success path withholds.
+///
+/// A `min_deviation` above what a valid cohort spreads is a refusal path: no
+/// side is produced, so none of `TrialSide`'s doors are involved at all. The
+/// refusal itself carried the exact standard deviation of the side that was
+/// rejected — `diaric`'s `DegenerateDeviation::deviation`, rendered by both
+/// its `Debug` and its `Display` — which is one half of eq. (7)'s operands,
+/// reached without a `TrialSide` ever existing.
+#[test]
+fn a_refused_side_discloses_no_deviation() {
+  let scoring = Scoring::Cosine;
+  let b = ok(scoring.prepare(&speaker_b()), "prepare B");
+
+  // The very statistics the refusal is about, computed here so the test knows
+  // the number it is looking for. Every cosine is in `[-1, 1]`, so a floor of
+  // `2.0` refuses this cohort while leaving it perfectly well formed.
+  let members: Vec<VoiceProfile> = crowd()
+    .iter()
+    .skip(HELD_OUT_FROM)
+    .map(|v| ok(scoring.prepare(v), "prepare a held-out impostor"))
+    .collect();
+  let truth = ok(
+    CohortStats::from_scores(
+      members
+        .iter()
+        .map(|m| ok(b.score(m), "score B against a cohort member")),
+      &AsNormOptions::new(),
+    ),
+    "B's own statistics under a usable floor",
+  );
+  let sigma = truth.deviation();
+  assert!(sigma > 0.0 && sigma < 2.0, "the fixture must be refusable");
+
+  let refused = Calibration::new(
+    held_out(scoring),
+    AsNormOptions::new().with_min_deviation(2.0),
+  )
+  .side(&b);
+  let e = match refused {
+    Err(e) => e,
+    Ok(side) => panic!("a deviation below the floor must refuse, got {side:?}"),
+  };
+
+  // The category and the counts survive; the number does not.
+  match &e {
+    CalibrateError::ScoreNorm(ScoreNormRefusal::DegenerateCohort(selection)) => {
+      assert_eq!(selection.selected(), members.len());
+      assert_eq!(selection.considered(), members.len());
+    }
+    other => panic!("a deviation below the floor is a degenerate cohort, got {other:?}"),
+  }
+
+  let debugged = format!("{e:?}");
+  let displayed = e.to_string();
+  for rendering in [&debugged, &displayed] {
+    for spelling in [
+      format!("{sigma}"),
+      format!("{sigma:?}"),
+      format!("{sigma:.3e}"),
+      format!("{sigma:.6e}"),
+    ] {
+      assert!(
+        !rendering.contains(&spelling),
+        "a refusal must not disclose the deviation it refused: {spelling} in {rendering}"
+      );
+    }
   }
 }
 
@@ -1044,8 +1302,28 @@ const _: fn() = || {
   assert_send_sync::<Calibration<HeldOutCohort>>();
   assert_send_sync::<Calibration<LibraryCohort<u32>>>();
   assert_send_sync::<CalibrationId>();
-  assert_send_sync::<Enrolled<'static, u32>>();
+  assert_send_sync::<SpeakerToken>();
+  assert_send_sync::<Enrolled<'static>>();
   assert_send_sync::<CalibrateError>();
+  assert_send_sync::<ScoreNormRefusal>();
+};
+
+/// A refusal must be unable to carry an arithmetic intermediate AT ALL, rather
+/// than one variant at a time.
+///
+/// An `f64` anywhere in [`ScoreNormRefusal`] — at any depth, in any variant,
+/// added at any time — makes [`Eq`] and [`Hash`](core::hash::Hash)
+/// underivable. So this bound is a whole-type, compile-time proof that no
+/// deviation, mean, z-score or normalized value can leave through a refusal;
+/// the round that put a σ back would not compile rather than needing a test
+/// that anticipated it.
+const _: fn() = || {
+  fn assert_sealed<T: Eq + core::hash::Hash>() {}
+  assert_sealed::<ScoreNormRefusal>();
+  assert_sealed::<CohortSelection>();
+  // The token is the other value this surface mints, and it must stay a plain
+  // comparable handle for the same reason.
+  assert_sealed::<SpeakerToken>();
 };
 
 // ── one calibration per trial ────────────────────────────────────────────
@@ -1139,13 +1417,15 @@ fn two_sides_from_different_calibrations_are_refused() {
   library.push(Speaker::A, a);
   library.push(Speaker::B, b);
   library.push(Speaker::Impostor(0), x);
+  let a_token = library.token(Speaker::A);
+  let b_token = library.token(Speaker::B);
   let library_cal = Calibration::new(library, options);
   let a_enrolled = ok(
-    library_cal.enrolled_side(Enrolled::new(&Speaker::A, &a)),
+    library_cal.enrolled_side(Enrolled::new(a_token, &a)),
     "A's side over the library cohort",
   );
   let b_enrolled = ok(
-    library_cal.enrolled_side(Enrolled::new(&Speaker::B, &b)),
+    library_cal.enrolled_side(Enrolled::new(b_token, &b)),
     "B's side over the library cohort",
   );
   assert_eq!(a_enrolled.considered(), 2);
@@ -1273,12 +1553,14 @@ fn a_grown_cohort_is_a_different_calibration() {
   let scoring = Scoring::Cosine;
   let options = AsNormOptions::new();
   let mut cohort = library(scoring);
+  let a_token = cohort.token(Speaker::A);
+  let b_token = cohort.token(Speaker::B);
 
   let a = ok(scoring.prepare(&speaker_a()), "prepare A");
   let b = ok(scoring.prepare(&speaker_b()), "prepare B");
   let before_cal = Calibration::new(cohort.clone(), options);
   let before = ok(
-    before_cal.enrolled_side(Enrolled::new(&Speaker::A, &a)),
+    before_cal.enrolled_side(Enrolled::new(a_token, &a)),
     "A's side before the cohort grew",
   );
   assert_eq!(before.calibration(), before_cal.id());
@@ -1291,8 +1573,11 @@ fn a_grown_cohort_is_a_different_calibration() {
     ),
   );
   let after_cal = Calibration::new(cohort, options);
+  // A cohort CLONED and then grown keeps the tokens it was cloned with, so
+  // one token still names one speaker in both lineages — the new member got a
+  // token of its own, minted fresh.
   let after = ok(
-    after_cal.enrolled_side(Enrolled::new(&Speaker::B, &b)),
+    after_cal.enrolled_side(Enrolled::new(b_token, &b)),
     "B's side after the cohort grew",
   );
   assert_ne!(
@@ -1314,7 +1599,7 @@ fn a_grown_cohort_is_a_different_calibration() {
   let clone = after_cal.clone();
   assert_eq!(clone.id(), after_cal.id());
   let cloned_side = ok(
-    clone.enrolled_side(Enrolled::new(&Speaker::A, &a)),
+    clone.enrolled_side(Enrolled::new(a_token, &a)),
     "A's side over a clone of the grown calibration",
   );
   assert_eq!(cloned_side.calibration(), after.calibration());
@@ -1588,6 +1873,94 @@ fn one_side_serves_every_trial_of_its_own_calibration() {
       reused.calibrated().to_bits(),
       fresh.calibrated().to_bits(),
       "partner {i}: a reused side must not change the calibrated score"
+    );
+  }
+}
+
+/// **The residual, measured rather than asserted.** μ and σ leave this module
+/// by no door at all — no accessor, no [`Debug`], no refusal — and they are
+/// still RECOVERABLE in closed form from the two numbers a
+/// [`CalibratedTrial`] publishes on purpose.
+///
+/// Write `aᵢ = 1/σᵢ` and `bᵢ = −μᵢ/σᵢ`, so a z-score is the affine `aᵢ·s + bᵢ`
+/// and eq. (7) reads `c(i,j) = ½·[(aᵢ + aⱼ)·s(i,j) + bᵢ + bⱼ]`. Trialling a
+/// side against ITSELF gives `c(i,i) = aᵢ·s(i,i) + bᵢ`, which eliminates every
+/// `bᵢ`; three sides then leave three linear equations in three unknowns, and
+/// the solve returns each side's σ and μ to the last few digits. Nothing here
+/// reads a private field until the final comparison: only `raw`, `calibrated`,
+/// and one calibration.
+///
+/// This is why the claim in the module docs is about what is HANDED OUT and
+/// not about what can be reconstructed. A door that publishes both a raw score
+/// and its normalization publishes the affine map between them, and no library
+/// can withhold the map while publishing both of its ends — which #123's own
+/// raw-versus-calibrated comparison is the reason to do.
+#[test]
+fn the_two_published_numbers_still_determine_every_side_that_produced_them() {
+  let scoring = Scoring::Cosine;
+  let calibration = held_out_calibration(scoring);
+
+  let rows = [speaker_a(), speaker_b(), crowd()[0].clone()];
+  let profiles: Vec<VoiceProfile> = rows
+    .iter()
+    .map(|v| ok(scoring.prepare(v), "prepare a subject"))
+    .collect();
+  let sides: Vec<TrialSide> = profiles.iter().map(|p| side(&calibration, p)).collect();
+
+  // Everything below this line is what a caller can read.
+  let trial = |i: usize, j: usize| {
+    let t = ok(
+      calibration.trial(&sides[i], &sides[j]),
+      "a calibrated trial",
+    );
+    (t.raw(), t.calibrated())
+  };
+  let own: Vec<(f64, f64)> = (0..3).map(|i| trial(i, i)).collect();
+
+  // 2·c(i,j) − c(i,i) − c(j,j) = aᵢ·(s(i,j) − s(i,i)) + aⱼ·(s(i,j) − s(j,j)),
+  // one row per pair. Self-cosines are not assumed equal to each other or to
+  // one: `Scoring::Cosine` is an f32 dot product, and they are not.
+  let equation = |i: usize, j: usize| {
+    let (s_ij, c_ij) = trial(i, j);
+    let (s_ii, c_ii) = own[i];
+    let (s_jj, c_jj) = own[j];
+    (s_ij - s_ii, s_ij - s_jj, 2.0 * c_ij - c_ii - c_jj)
+  };
+  let (ab_a, ab_b, ab_r) = equation(0, 1);
+  let (ac_a, ac_c, ac_r) = equation(0, 2);
+  let (bc_b, bc_c, bc_r) = equation(1, 2);
+
+  let m = [[ab_a, ab_b, 0.0], [ac_a, 0.0, ac_c], [0.0, bc_b, bc_c]];
+  let rhs = [ab_r, ac_r, bc_r];
+  let det = |m: &[[f64; 3]; 3]| {
+    m[0][0] * (m[1][1] * m[2][2] - m[1][2] * m[2][1])
+      - m[0][1] * (m[1][0] * m[2][2] - m[1][2] * m[2][0])
+      + m[0][2] * (m[1][0] * m[2][1] - m[1][1] * m[2][0])
+  };
+  let base = det(&m);
+  assert!(base.abs() > 1e-12, "the three sides must be independent");
+
+  for (i, (s_ii, c_ii)) in own.iter().enumerate() {
+    // Cramer's rule for aᵢ.
+    let mut replaced = m;
+    for (row, r) in replaced.iter_mut().zip(rhs.iter()) {
+      row[i] = *r;
+    }
+    let a_i = det(&replaced) / base;
+    let sigma = 1.0 / a_i;
+    let mu = (a_i * s_ii - c_ii) * sigma;
+
+    // `sides[i].stats` is the private field these tests can see and a caller
+    // cannot. The point of the test is that a caller did not need it.
+    let truth_sigma = sides[i].stats.deviation();
+    let truth_mu = sides[i].stats.mean();
+    assert!(
+      (sigma - truth_sigma).abs() <= 1e-9 * truth_sigma.abs(),
+      "side {i}: recovered sigma {sigma} against {truth_sigma}"
+    );
+    assert!(
+      (mu - truth_mu).abs() <= 1e-9 * truth_mu.abs(),
+      "side {i}: recovered mean {mu} against {truth_mu}"
     );
   }
 }

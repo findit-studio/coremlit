@@ -431,14 +431,162 @@ fn calibrate_error_degenerate_profile_names_the_score_source_that_refused() {
 }
 
 #[test]
-fn calibrate_error_wraps_diarics_plda_and_score_norm_errors_via_from() {
+fn calibrate_error_wraps_diarics_plda_error_and_coremlits_own_refusal_via_from() {
   let e: CalibrateError = diaric::plda::Error::DegenerateInput.into();
   assert!(matches!(e, CalibrateError::Plda(_)));
   assert!(e.to_string().contains("plda"), "{e}");
 
-  let e: CalibrateError = diaric::score_norm::Error::EmptyCohort.into();
+  let e: CalibrateError = ScoreNormRefusal::EmptyCohort.into();
   assert!(matches!(e, CalibrateError::ScoreNorm(_)));
   assert!(e.to_string().contains("cohort"), "{e}");
+}
+
+/// The refusals `diaric` can actually raise must arrive TRANSLATED — the right
+/// category, the counts kept, and not one of the numbers the original carried.
+///
+/// Driven through `diaric`'s own statistics constructor rather than through
+/// hand-built payloads, because its payload constructors are `pub(crate)`:
+/// these are the refusals a cohort can really produce. The other three are
+/// covered structurally instead — `ScoreNormRefusal::translate` matches
+/// `diaric::score_norm::Error` exhaustively, and that enum is not
+/// `#[non_exhaustive]`, so a category going missing is a compile error.
+#[test]
+fn diarics_refusals_arrive_translated_and_carry_none_of_its_numbers() {
+  use diaric::score_norm::{AsNormOptions, CohortStats};
+
+  let default = AsNormOptions::new();
+  let spread = [0.1_f64, 0.2, 0.3];
+
+  // The exact statistics the degenerate case is about, so the test knows the
+  // number it is looking for.
+  let truth = CohortStats::from_scores(spread, &default).expect("a usable cohort");
+  let deviation = truth.deviation();
+  let mean = truth.mean();
+  assert!(deviation > 0.0 && deviation < 2.0);
+
+  let refusal = |scores: &[f64], options: &AsNormOptions| {
+    CohortStats::from_scores(scores.iter().copied(), options)
+      .expect_err("these scores must be refused")
+  };
+
+  let cases = [
+    (
+      refusal(&[], &default),
+      ScoreNormRefusal::EmptyCohort,
+      "an empty cohort",
+    ),
+    (
+      refusal(&[0.5], &default),
+      ScoreNormRefusal::CohortTooSmall(CohortSelection::new(1, 9)),
+      "a one-score cohort",
+    ),
+    (
+      refusal(&spread, &default.with_min_deviation(2.0)),
+      ScoreNormRefusal::DegenerateCohort(CohortSelection::new(3, 9)),
+      "a cohort under a floor it cannot clear",
+    ),
+    (
+      refusal(&[f64::NAN, 0.0, 1.0], &default),
+      ScoreNormRefusal::NonFiniteScore,
+      "a non-finite cohort score",
+    ),
+  ];
+
+  for (from_diaric, expected, what) in cases {
+    let leaked = from_diaric.to_string();
+    let got = ScoreNormRefusal::translate(from_diaric, 9);
+    assert_eq!(got, expected, "{what} translated from: {leaked}");
+
+    let wrapped = CalibrateError::ScoreNorm(got);
+    let display = wrapped.to_string();
+    let debug = format!("{wrapped:?}");
+    for number in [deviation, mean] {
+      for spelling in [
+        format!("{number}"),
+        format!("{number:?}"),
+        format!("{number:.3e}"),
+        format!("{number:.6e}"),
+      ] {
+        assert!(
+          !display.contains(&spelling),
+          "{what}: {spelling} in {display}"
+        );
+        assert!(!debug.contains(&spelling), "{what}: {spelling} in {debug}");
+      }
+    }
+    assert!(!display.contains("NaN"), "{what}: {display}");
+    // Every field this payload can hold is a count, so its `Debug` cannot
+    // contain a decimal point. `diaric`'s did.
+    assert!(!debug.contains('.'), "{what}: {debug}");
+  }
+}
+
+/// The seven categories must stay seven: a translation that collapsed two of
+/// them would lose the diagnosis the payload was dropped to protect.
+#[test]
+fn every_sanitized_refusal_reads_as_its_own_category() {
+  let selection = CohortSelection::new(3, 9);
+  let all = [
+    ScoreNormRefusal::EmptyCohort,
+    ScoreNormRefusal::CohortTooSmall(selection),
+    ScoreNormRefusal::DegenerateCohort(selection),
+    ScoreNormRefusal::InvalidMinDeviation,
+    ScoreNormRefusal::NonFiniteScore,
+    ScoreNormRefusal::NonFiniteResult,
+    ScoreNormRefusal::ZScoreCancellation,
+  ];
+
+  let mut rendered: Vec<String> = all
+    .iter()
+    .map(|r| CalibrateError::ScoreNorm(*r).to_string())
+    .collect();
+  let count = rendered.len();
+  rendered.sort();
+  rendered.dedup();
+  assert_eq!(rendered.len(), count, "{rendered:?}");
+
+  for refusal in all {
+    assert!(
+      !format!("{refusal:?}").contains('.'),
+      "a refusal carries counts only: {refusal:?}"
+    );
+  }
+}
+
+/// The two selection counts are what a refused side reports instead of its
+/// statistics, so they have to reach the rendering.
+#[test]
+fn a_sanitized_refusal_still_reports_the_counts_and_the_floor() {
+  let selection = CohortSelection::new(3, 17);
+  assert_eq!(selection.selected(), 3);
+  assert_eq!(selection.considered(), 17);
+
+  let too_small =
+    CalibrateError::ScoreNorm(ScoreNormRefusal::CohortTooSmall(selection)).to_string();
+  assert!(too_small.contains('3'), "{too_small}");
+  assert!(too_small.contains("17"), "{too_small}");
+  assert!(
+    too_small.contains(&diaric::score_norm::MIN_COHORT_SCORES.to_string()),
+    "the floor that was breached must be named: {too_small}"
+  );
+
+  let degenerate =
+    CalibrateError::ScoreNorm(ScoreNormRefusal::DegenerateCohort(selection)).to_string();
+  assert!(degenerate.contains('3'), "{degenerate}");
+  assert!(degenerate.contains("17"), "{degenerate}");
+  assert!(
+    degenerate.contains("min_deviation"),
+    "the floor that was breached must be named: {degenerate}"
+  );
+}
+
+/// A token from another cohort is a refusal of its own, and it has to say what
+/// it would otherwise have done.
+#[test]
+fn calibrate_error_foreign_speaker_says_it_would_have_excluded_nothing() {
+  let rendered = CalibrateError::ForeignSpeaker.to_string();
+  assert!(rendered.contains("token"), "{rendered}");
+  assert!(rendered.contains("cohort"), "{rendered}");
 }
 
 #[test]
