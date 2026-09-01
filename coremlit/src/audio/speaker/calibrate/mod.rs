@@ -125,17 +125,18 @@
 //!
 //! The **probe** side is a recording whose speaker is not yet known. That
 //! identity is what identification is *trying to discover*, so the caller has
-//! no key of the probe's to exclude — and neither of the two things they could
-//! reach for instead is answerable:
+//! no identity of the probe's to exclude — and neither of the two things they
+//! could reach for instead is answerable:
 //!
 //! - excluding nothing from a library-sampled cohort is self-contamination
 //!   whenever the probe's speaker is enrolled, which is precisely the case a
 //!   positive identification is. A self-match is the largest score obtainable,
 //!   so top-N selection is *guaranteed* to pick it up;
-//! - excluding the **candidate's** key is worse, and it is what this module's
-//!   first version told a caller to do. It drops a valid impostor, and it
-//!   makes the probe's statistics depend on which candidate the probe is being
-//!   scored against. `diaric` names that failure at the entrypoint itself:
+//! - excluding the **candidate's** identity is worse, and it is what this
+//!   module's first version told a caller to do. It drops a valid impostor,
+//!   and it makes the probe's statistics depend on which candidate the probe
+//!   is being scored against. `diaric` names that failure at the entrypoint
+//!   itself:
 //!
 //!   > Only `speaker`'s **own** entries are removed — never the other side of
 //!   > the trial. […] Excluding the partner too would make the statistics
@@ -169,7 +170,7 @@
 //! eq. (7) has each side selecting its top-N of *the shared cohort*. So a
 //! trial with an unidentified probe in it is calibrated over one
 //! `Calibration<HeldOutCohort>`, which is what the example below does.
-//! `Calibration<LibraryCohort<K>>` is the other shape: one cohort serving two
+//! `Calibration<LibraryCohort>` is the other shape: one cohort serving two
 //! NAMED sides, each dropping its own speaker's entries. The MIXTURE of those
 //! two — a library-sampled enrolment side against a held-out probe side —
 //! reverses the candidate ranking on valid, healthy-looking numbers
@@ -190,10 +191,10 @@
 //! that signature "a probe's side does not depend on the candidate" is caller
 //! discipline, not an API property, so no test in this crate could hold it —
 //! the guidance would have been the only guard over exactly the mistake the
-//! guidance had just made. Binding the key to the profile turns it into a type
-//! property with a `compile_fail` proof, and a keyless [`HeldOutCohort`] means
-//! the probe's road has no key to pass at all. What is left of the hazard is
-//! stated below rather than claimed away.
+//! guidance had just made. Binding the identity to the profile turns it into a
+//! type property with a `compile_fail` proof, and an identity-free
+//! [`HeldOutCohort`] means the probe's road has nothing to pass at all. What is
+//! left of the hazard is stated below rather than claimed away.
 //!
 //! ## The token travels with the profile
 //!
@@ -201,52 +202,74 @@
 //! *and* a side, so there is no second argument left that could name a
 //! different speaker.
 //!
-//! The identity half is a [`SpeakerToken`] the cohort minted, not a borrow of
-//! the caller's key, and the difference is not ergonomic. [`Eq`] does not
-//! forbid interior mutability: `Rc<Cell<u64>>` is a perfectly good `Eq` key
-//! whose comparison reads a cell the caller can still write to, and taking the
-//! cohort by value does not help, because what moves is the container while
-//! the number sits behind a pointer the caller kept. Under the shape this
-//! replaces, writing to that cell between two derivations re-decided what the
-//! second side excluded — and the [`CalibrationId`] did not move, because the
-//! cohort value had not changed, so [`trial`](Calibration::trial) averaged a
-//! clean side with a self-contaminated one and returned a finite, plausible
-//! number.
+//! The identity half is a [`SpeakerToken`] the cohort minted, and there is
+//! **no key type on this surface for it to have been resolved from**.
+//! [`LibraryCohortBuilder::speaker`] takes no argument; a
+//! [`LibraryCohort`] holds token membership and token-keyed entries and
+//! nothing else. So no value the caller owns takes part in deciding which
+//! speaker a token names, at any point in a cohort's life, and no duplicate of
+//! a cohort — a [`Clone`], a borrow, a re-derived copy — can answer that
+//! question differently, because none of them can be asked it:
 //!
-//! [`LibraryCohort::token`] is now the one place `K` is ever compared, and it
-//! takes `&mut self`. A [`Calibration`] owns its cohort and lends it out by
-//! shared reference only, so no key can be resolved once the calibration
-//! exists, and every exclusion set is fixed before any side is taken:
-//!
-//! ```compile_fail,E0596
-//! use coremlit::audio::speaker::calibrate::{AsNormOptions, Calibration, LibraryCohort, Scoring};
+//! ```compile_fail,E0599
+//! use coremlit::audio::speaker::calibrate::{
+//!   AsNormOptions, Calibration, LibraryCohortBuilder, Scoring,
+//! };
 //! # let raw = vec![0.5f32; coremlit::audio::speaker::embed::EMBEDDING_DIM];
-//! let mut cohort: LibraryCohort<u32> = LibraryCohort::new();
-//! cohort.push(1, Scoring::Cosine.prepare(&raw).unwrap());
+//! let mut cohort = LibraryCohortBuilder::new();
+//! let alice = cohort.speaker();
+//! cohort.push(alice, Scoring::Cosine.prepare(&raw).unwrap());
 //! let calibration = Calibration::new(cohort, AsNormOptions::new());
-//! // Minting is `&mut self`, and a calibration lends its cohort out shared.
-//! let _ = calibration.cohort().token(1);
+//! // An OWNED duplicate of the calibration's own cohort — no borrow in the
+//! // way. It still has no mutator on it, and no key to look anything up by.
+//! let mut duplicate = calibration.cohort().clone();
+//! let _ = duplicate.speaker();
 //! ```
+//!
+//! ```compile_fail,E0061
+//! use coremlit::audio::speaker::calibrate::LibraryCohortBuilder;
+//! let mut cohort = LibraryCohortBuilder::new();
+//! // A token is minted, not resolved: there is no argument to hand it, and so
+//! // nothing whose later value could re-decide the answer.
+//! let _ = cohort.speaker(7u32);
+//! ```
+//!
+//! **Why the whole key type went, rather than one more seal on it.** [`Eq`]
+//! does not forbid interior mutability: `Rc<Cell<u64>>` is a perfectly good
+//! `Eq` key whose comparison reads a cell the caller can still write to.
+//! Rewriting that cell so one speaker's key equalled another's made a lookup
+//! for the *second* speaker hand back the *first* one's token, and the side
+//! taken under it then dropped the wrong speaker's entries while leaving the
+//! subject's own in place — a finite, plausible, self-contaminated number,
+//! with the [`CalibrationId`] never moving because no cohort had changed.
+//! Three separate roads reached it: between two derivations, through a
+//! [`Clone`] of the calibration's cohort (an owned copy, so the `&mut` on the
+//! mint sealed nothing), and with no calibration in sight at all. Each round
+//! sealed the road it had found and left the next, because the road was never
+//! the defect — resolving a token from caller-owned state was. [`SpeakerToken`]
+//! carries the three in full.
 //!
 //! What remains is not a mis-passed argument but a false statement:
 //! `Enrolled::new(candidate_token, &probe)` *claims* the probe belongs to that
-//! speaker. No type in a sans-I/O crate can refute that — `coremlit` does not
-//! hold the library — but it is a claim spelled out at the point a caller
-//! reads a library record, not an argument slot two positions along from the
-//! one that matters. A probe has no such value to build, and that is the
-//! point: a bare [`VoiceProfile`] reaches only [`Calibration::side`], the
-//! held-out door.
+//! speaker, and `push(some_other_token, profile)` claims the same thing while
+//! the cohort is being assembled. No type in a sans-I/O crate can refute
+//! either — `coremlit` does not hold the library — but both are claims spelled
+//! out at the point a caller reads a library record, not an argument slot two
+//! positions along from the one that matters, and neither is an ANSWER this
+//! crate gave. A probe has no such value to build, and that is the point: a
+//! bare [`VoiceProfile`] reaches only [`Calibration::side`], the held-out door.
 //!
 //! ```compile_fail,E0308
 //! use coremlit::audio::speaker::calibrate::{
-//!   AsNormOptions, Calibration, LibraryCohort, Scoring,
+//!   AsNormOptions, Calibration, LibraryCohortBuilder, Scoring,
 //! };
 //! # let raw = vec![0.5f32; coremlit::audio::speaker::embed::EMBEDDING_DIM];
-//! let mut cohort: LibraryCohort<u32> = LibraryCohort::new();
-//! cohort.push(1, Scoring::Cosine.prepare(&raw).unwrap());
+//! let mut cohort = LibraryCohortBuilder::new();
+//! let alice = cohort.speaker();
+//! cohort.push(alice, Scoring::Cosine.prepare(&raw).unwrap());
 //! let calibration = Calibration::new(cohort, AsNormOptions::new());
-//! // An unidentified probe: a prepared vector and no key at all. There is no
-//! // identity to exclude, so the excluding door must not accept it.
+//! // An unidentified probe: a prepared vector and no identity at all. There is
+//! // nothing to exclude, so the excluding door must not accept it.
 //! let probe = Scoring::Cosine.prepare(&raw).unwrap();
 //! let _ = calibration.enrolled_side(&probe);
 //! ```
@@ -358,8 +381,9 @@
 //! The road to a cross-cohort normalization starts where it always did:
 //! building the statistic out of the caller's own numbers.
 //!
-//! The cohorts are `coremlit`'s own types — [`LibraryCohort`] and
-//! [`HeldOutCohort`] — and the `diaric` container inside each is private, so
+//! The cohorts are `coremlit`'s own types — [`LibraryCohortBuilder`],
+//! [`LibraryCohort`] and [`HeldOutCohort`] — and the `diaric` container inside
+//! each is private, so
 //! `diaric`'s generic [`Cohort<K, T>`](diaric::score_norm::Cohort) and its
 //! public
 //! [`stats_excluding`](diaric::score_norm::Cohort::stats_excluding) — whose
@@ -368,18 +392,20 @@
 //!
 //! ```compile_fail,E0599
 //! use coremlit::audio::speaker::calibrate::{
-//!   AsNormOptions, LibraryCohort, Scoring, VoiceProfile,
+//!   AsNormOptions, LibraryCohortBuilder, Scoring, VoiceProfile,
 //! };
 //! # let raw = vec![0.5f32; coremlit::audio::speaker::embed::EMBEDDING_DIM];
-//! let mut cohort: LibraryCohort<u32> = LibraryCohort::new();
-//! cohort.push(1, Scoring::Cosine.prepare(&raw).unwrap());
-//! cohort.push(2, Scoring::Cosine.prepare(&raw).unwrap());
+//! let mut cohort = LibraryCohortBuilder::new();
+//! let alice = cohort.speaker();
+//! let bob = cohort.speaker();
+//! cohort.push(alice, Scoring::Cosine.prepare(&raw).unwrap());
+//! cohort.push(bob, Scoring::Cosine.prepare(&raw).unwrap());
 //! let probe = Scoring::Cosine.prepare(&raw).unwrap();
 //! // `diaric`'s unbound statistic takes ANY key — the candidate's included —
 //! // and returns a number with no calibration on it. It is not reachable from
 //! // a cohort this crate hands out.
 //! let _ = cohort.stats_excluding(
-//!   &1,
+//!   &alice,
 //!   &probe,
 //!   |_a: &VoiceProfile, _b: &VoiceProfile| 0.0,
 //!   &AsNormOptions::new(),
@@ -393,8 +419,14 @@
 //! public is the regression each of these catches and the one above does not:
 //!
 //! ```compile_fail,E0616
-//! use coremlit::audio::speaker::calibrate::LibraryCohort;
-//! let cohort: LibraryCohort<u32> = LibraryCohort::new();
+//! use coremlit::audio::speaker::calibrate::LibraryCohortBuilder;
+//! let cohort = LibraryCohortBuilder::new();
+//! let _ = cohort.entries;
+//! ```
+//!
+//! ```compile_fail,E0616
+//! use coremlit::audio::speaker::calibrate::{LibraryCohort, LibraryCohortBuilder};
+//! let cohort = LibraryCohort::from(LibraryCohortBuilder::new());
 //! let _ = cohort.entries;
 //! ```
 //!
@@ -572,7 +604,7 @@
 //!
 //! | side | the calibration's cohort | the statistic depends on | reused across |
 //! |---|---|---|---|
-//! | enrolled | held-out (nothing to exclude), or library-sampled with its own key excluded | that speaker and the calibration | every trial of that calibration the speaker appears in |
+//! | enrolled | held-out (nothing to exclude), or library-sampled with its own token excluded | that speaker and the calibration | every trial of that calibration the speaker appears in |
 //! | probe | held-out only | that probe and the calibration | every candidate of that calibration the probe is scored against |
 //!
 //! A cached [`TrialSide`] is reusable across trials, not across calibrations.
@@ -589,10 +621,10 @@
 //!
 //! **This is a correction, not a restatement.** The version of this page that
 //! shipped claimed the same `N·C` reuse while telling a caller to exclude the
-//! candidate's key from the probe's side — which makes the probe's statistic
-//! trial-dependent, so it has to be recomputed per candidate and the claim was
-//! false by `M` for exactly the road the page recommended. The claim is true
-//! again because the probe's side no longer has a candidate in it.
+//! candidate's identity from the probe's side — which makes the probe's
+//! statistic trial-dependent, so it has to be recomputed per candidate and the
+//! claim was false by `M` for exactly the road the page recommended. The claim
+//! is true again because the probe's side no longer has a candidate in it.
 //!
 //! **Where it does not hold**: a probe against a library-sampled cohort. There
 //! is no entrypoint for that pairing, because there is no correct statistic to
@@ -608,8 +640,13 @@
 //! # End to end
 //!
 //! ```
+//! use std::collections::HashMap;
+//!
 //! use coremlit::audio::speaker::{
-//!   calibrate::{AsNormOptions, Calibration, Enrolled, HeldOutCohort, LibraryCohort, Scoring},
+//!   calibrate::{
+//!     AsNormOptions, Calibration, Enrolled, HeldOutCohort, LibraryCohortBuilder, Scoring,
+//!     SpeakerToken,
+//!   },
 //!   embed::EMBEDDING_DIM,
 //! };
 //!
@@ -627,7 +664,9 @@
 //! #   v
 //! # }
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
-//! // Identities are the caller's. Anything `Eq` names a speaker.
+//! // The caller's library key. It stays the caller's: this door names a
+//! // speaker with a `SpeakerToken` it minted, and never with a value of
+//! // theirs.
 //! type PersonId = u32;
 //!
 //! let scoring = Scoring::Cosine;
@@ -668,24 +707,25 @@
 //! assert!(trial.calibrated().is_finite());
 //!
 //! // The other cohort shape: sampled from the library itself, so it CONTAINS
-//! // the speakers being scored. Only NAMED sides may use it — the key travels
-//! // with the profile, so no other speaker's entries can be dropped by
+//! // the speakers being scored. Only NAMED sides may use it — the identity
+//! // travels with the profile, so no other speaker's entries can be dropped by
 //! // mistake — and each side drops its own.
 //! let bob: PersonId = 11;
-//! let mut library: LibraryCohort<PersonId> = LibraryCohort::new();
+//! let mut library = LibraryCohortBuilder::new();
+//! // The map from the caller's own key to this cohort's identity lives with
+//! // the library, because that is whose it is. `speaker` takes no argument, so
+//! // nothing the caller does to their own keys afterwards — and no duplicate
+//! // of this cohort — can change what a token names.
+//! let mut tokens: HashMap<PersonId, SpeakerToken> = HashMap::new();
 //! for id in 0..64u32 {
-//!   library.push(id, scoring.prepare(&stored_centroid(id as usize))?);
+//!   let token = *tokens.entry(id).or_insert_with(|| library.speaker());
+//!   library.push(token, scoring.prepare(&stored_centroid(id as usize))?);
 //! }
-//! // Identity is decided HERE, while the cohort is still open: `token` takes
-//! // `&mut self`, so nothing the caller does to their own key afterwards can
-//! // change what these two sides exclude.
-//! let alices_token = library.token(alice);
-//! let bobs_token = library.token(bob);
 //! let over_library = Calibration::new(library, options);
 //! let bobs_profile = scoring.prepare(&stored_centroid(bob as usize))?;
 //!
-//! let alice_side = over_library.enrolled_side(Enrolled::new(alices_token, &stored))?;
-//! let bobs_side = over_library.enrolled_side(Enrolled::new(bobs_token, &bobs_profile))?;
+//! let alice_side = over_library.enrolled_side(Enrolled::new(tokens[&alice], &stored))?;
+//! let bobs_side = over_library.enrolled_side(Enrolled::new(tokens[&bob], &bobs_profile))?;
 //! assert_eq!(alice_side.considered(), 63); // 64 members, less Alice's own
 //! let merged = over_library.trial(&alice_side, &bobs_side)?;
 //! assert!(merged.calibrated().is_finite());
@@ -918,10 +958,11 @@ fn unit_vector(v: [f64; PLDA_DIMENSION]) -> Result<[f64; PLDA_DIMENSION], Calibr
 /// rather than made unrepresentable by a `VoiceProfile<S>`. Two reasons, the
 /// second deciding:
 ///
-/// - a cohort is generic over the caller's speaker key ([`LibraryCohort<K>`]),
-///   so a type parameter here would monomorphize the caller's whole cohort on
-///   a choice they naturally make at run time — which score source to run
-///   *this* comparison in;
+/// - a type parameter here would spread onto every container that holds a
+///   profile — [`LibraryCohortBuilder`], [`LibraryCohort`], [`HeldOutCohort`],
+///   [`Calibration`] — so the caller's whole library would be monomorphized on
+///   a choice they naturally make at run time: which score source to run *this*
+///   comparison in;
 /// - #123's follow-up is a confusion experiment *between* score sources, whose
 ///   natural shape is a loop over `[Scoring::Cosine, Scoring::PldaCosine]`. A
 ///   type parameter turns that loop into duplicated generic code.
@@ -993,41 +1034,68 @@ impl VoiceProfile {
   }
 }
 
-/// An opaque handle to one speaker inside one [`LibraryCohort`] — what an
-/// enrolled side is excluded by.
+/// An opaque handle to one speaker of one [`LibraryCohortBuilder`] — what an
+/// enrolled side is excluded by, and the only name a speaker has here.
 ///
-/// Minted by [`LibraryCohort::token`], which is the only way to obtain one.
-/// There is no constructor, no accessor to the number inside, and nothing a
-/// caller can write down; all it can do is compare equal to itself, which is
+/// Minted by [`LibraryCohortBuilder::speaker`], which is the only way to obtain
+/// one. There is no constructor, no accessor to the number inside, and nothing
+/// a caller can write down; all it can do is compare equal to itself, which is
 /// all an exclusion needs.
 ///
-/// # Why exclusion is not by the caller's key
+/// # A token is MINTED, never resolved
 ///
-/// [`Eq`] does not forbid interior mutability. `Rc<Cell<u64>>` is `Eq` —
-/// [`Cell`](core::cell::Cell)'s [`PartialEq`] reads the cell — so a caller
-/// could push one into a cohort, keep a second handle on the same number, and
-/// write to it afterwards. Taking the cohort **by value** does not close that:
-/// what moves is the container, and the number the comparison reads sits
-/// behind a pointer the caller still holds.
+/// [`LibraryCohortBuilder::speaker`] **takes no argument**. Nothing on this page
+/// maps a value the caller owns to a `SpeakerToken`, so there is no question
+/// that can be asked twice and answered differently — and a token therefore
+/// names the same speaker for as long as it exists, whoever holds it and
+/// however the value holding it was arrived at.
 ///
-/// The consequence was not a wrong-looking value. Exclusion membership was
-/// re-decided between two derivations while the [`CalibrationId`] did not move
-/// — the cohort value had not changed — so [`Calibration::trial`] accepted a
-/// clean side beside a self-contaminated one and returned a finite,
-/// plausible score. A self-match is the largest score a profile can obtain, so
-/// leaving one in is exactly the failure [`diaric::score_norm`] names.
+/// That is the whole property, and it is what a cohort keyed by the caller's
+/// own `K` could not buy. [`Eq`] does not forbid interior mutability:
+/// `Rc<Cell<u64>>` is a perfectly good `Eq` key whose comparison reads a cell
+/// the caller can still write to. Rewriting that cell so one speaker's key
+/// equals another's made a *lookup for the second speaker hand back the first
+/// one's token*; the side taken under it then dropped the wrong speaker's
+/// entries and left the subject's own in place, which is the
+/// self-contamination [`diaric::score_norm`] names — on finite, plausible
+/// numbers, with the [`CalibrationId`] never moving because no cohort had
+/// changed.
 ///
-/// A token closes it by construction. `K` is compared **once per key**, inside
-/// [`LibraryCohort::token`] — which takes `&mut self`, and a [`Calibration`]
-/// owns its cohort and lends it out by shared reference only. So every token
-/// is minted while the cohort is still open, and no caller-owned state
-/// participates in equality after the calibration exists.
+/// Three roads reached that one answer, and each round of review sealed one:
 ///
-/// Tokens come from a process-wide counter, so one never collides with a
-/// token another cohort minted; [`Calibration::enrolled_side`] refuses a token
-/// its own cohort did not mint
-/// ([`CalibrateError::ForeignSpeaker`]) rather than
+/// - rewriting the cell between two derivations, back when the cohort compared
+///   `K` at every side;
+/// - rewriting it after the cohort had become a [`Calibration`], and resolving
+///   through a [`Clone`] of the calibration's cohort — an owned, and therefore
+///   mutable, copy carrying the original tokens. Lending the cohort out shared
+///   seals `&mut`, and `Clone` does not go through a borrow;
+/// - rewriting it with no calibration in sight, while the cohort was still
+///   open, or through a copy of the cohort kept aside before it was frozen.
+///
+/// Sealing a road leaves the next one, because the road was never the defect:
+/// the defect was that a token could be *resolved* from caller-owned state at
+/// all. There is no `K` on this surface now, at any point in a cohort's life,
+/// so there is nothing to resolve — cloned, borrowed, serialized or otherwise.
+/// What the caller keeps instead is the map from their own library key to the
+/// token this minted, which is the map their library already is.
+///
+/// This token's OWN [`Eq`] is the one comparison an exclusion still makes, and
+/// it is safe for the reason an arbitrary `K` was not: it compares a private
+/// `u64` with no accessor, no constructor and no interior mutability, so it
+/// cannot answer differently on a second call. That is the difference between
+/// closing the class and moving it.
+///
+/// Tokens come from a process-wide counter, so one never collides with a token
+/// another cohort minted; [`Calibration::enrolled_side`] refuses a token its
+/// own cohort does not hold ([`CalibrateError::ForeignSpeaker`]) rather than
 /// silently excluding nothing.
+///
+/// It is deliberately **not** `serde`, and neither cohort is. A `Deserialize`
+/// would be a constructor from data — the one remaining shape that could put a
+/// token this process never minted beside a profile, or rebuild a cohort whose
+/// token-to-entry map nothing here decided. A caller persists their own library
+/// key and re-mints on load, which is the same work assembling a cohort already
+/// is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct SpeakerToken(u64);
 
@@ -1051,10 +1119,10 @@ impl SpeakerToken {
 /// than the profile belongs to. The module docs' "The token travels with the
 /// profile" says what that removes and what it cannot.
 ///
-/// The identity half is a [`SpeakerToken`] the cohort minted rather than a
-/// borrow of the caller's key — see that type for what a mutable key could do
-/// otherwise. The profile half stays a borrow: a caller's library already
-/// holds it and a [`VoiceProfile`] is a kilobyte of prepared vector.
+/// The identity half is a [`SpeakerToken`] the cohort minted — see that type
+/// for why it is not, and can never again be, anything of the caller's. The
+/// profile half stays a borrow: a caller's library already holds it and a
+/// [`VoiceProfile`] is a kilobyte of prepared vector.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Enrolled<'a> {
   /// Whose profile this is, as this cohort's own immutable handle.
@@ -1087,71 +1155,96 @@ impl<'a> Enrolled<'a> {
   }
 }
 
-/// A cohort sampled from the caller's own library, whose members therefore
-/// carry the identities that name them.
+/// Where a library-sampled cohort is assembled: speakers are minted here, and
+/// profiles filed under them.
 ///
-/// #123's cohort shape, and the one [`Calibration::enrolled_side`] needs.
-/// Because it may hold an enrolled speaker's own entries, every side over it
-/// drops that speaker's entries by identity — which is correct for a side whose
-/// speaker is NAMED and impossible for one whose speaker is what the trial is
-/// trying to discover. A probe therefore has no door onto this type at all; it
-/// goes to [`HeldOutCohort`].
+/// [`Calibration::new`] takes one of these **by value** and freezes it into a
+/// [`LibraryCohort`], which is what the calibration holds and the only cohort
+/// it will ever lend out. The split is the design and not a convenience: the
+/// frozen value has no mutator on it at all, so "nothing can change under a
+/// side already taken" is a property of the type rather than a property of who
+/// holds which borrow — and a borrow is what [`Clone`] goes around.
 ///
-/// **Identity here is the cohort's own, not the caller's key.** [`token`] mints
-/// an immutable [`SpeakerToken`] per distinct speaker and is the only place `K`
-/// is ever compared; it takes `&mut self`, so it is unreachable once the cohort
-/// has become a [`Calibration`]. [`SpeakerToken`] carries the case that shape
-/// closes — an `Eq` key with a cell in it, rewritten between two derivations.
+/// **Identity is minted, never resolved.** [`speaker`](Self::speaker) takes no
+/// argument and reads nothing of the caller's; [`push`](Self::push) files a
+/// profile under a token the caller already holds. There is no key type here,
+/// so nothing a caller owns takes part in deciding which speaker a token names
+/// — before the freeze or after it. [`SpeakerToken`] carries the three roads
+/// that closes, and why sealing them one at a time did not.
 ///
-/// [`token`]: LibraryCohort::token
-///
-/// **A cohort becomes a [`Calibration`] by value, and cannot then grow.**
-/// [`Calibration::new`] takes it, so nothing can add a member behind the back
-/// of a side already taken. Growing means assembling a new cohort and a new
-/// calibration, whose sides do not pair with the old ones — the refusal a
-/// silently grown cohort would otherwise skip.
-///
-/// **The `diaric` container inside is private, and that is the point.**
-/// `diaric`'s [`Cohort<K, T>`](diaric::score_norm::Cohort) is generic in `T`
-/// and carries a public
-/// [`stats_excluding`](diaric::score_norm::Cohort::stats_excluding), so
-/// re-exporting it — which this module did — handed a caller a way to compute
-/// an unbound, candidate-dependent statistic over a [`VoiceProfile`] through
-/// `coremlit`'s own surface. Wrapping it means a [`Calibration`] is this
-/// crate's only statistic constructor over a profile.
+/// The caller's own library key stays the caller's: a `HashMap<TheirId,
+/// SpeakerToken>` filled while this cohort is assembled is the whole of what a
+/// key type used to buy, and it lives where the library does.
 #[derive(Debug, Clone, PartialEq)]
-pub struct LibraryCohort<K> {
-  /// One row per DISTINCT speaker: the caller's key, and the immutable
-  /// [`SpeakerToken`] minted for it.
+pub struct LibraryCohortBuilder {
+  /// One entry per speaker this cohort knows: minted by
+  /// [`speaker`](Self::speaker), or adopted by [`push`](Self::push).
   ///
-  /// The keys live here rather than inside `entries` so that `K` is compared
-  /// in exactly one place — [`LibraryCohort::token`], which takes `&mut self`
-  /// — and therefore only while the cohort is still open. It also answers the
-  /// second question `entries` cannot: whether a token handed to
-  /// [`Calibration::enrolled_side`] is one THIS cohort minted.
-  speakers: Vec<(K, SpeakerToken)>,
-  /// `diaric`'s own container, private, keyed by the token rather than by the
-  /// caller's `K`.
+  /// It answers the question `entries` cannot — whether a token handed to
+  /// [`Calibration::enrolled_side`] is one this cohort holds — for a speaker
+  /// the cohort has no profiles of, whose exclusion set is legitimately empty.
+  speakers: Vec<SpeakerToken>,
+  /// `diaric`'s own container, private, keyed by the token.
   entries: DiaricCohort<SpeakerToken, VoiceProfile>,
 }
 
-impl<K> Default for LibraryCohort<K> {
+impl Default for LibraryCohortBuilder {
   /// An empty cohort.
-  ///
-  /// Hand-written rather than derived: the derive would demand `K: Default`,
-  /// which an empty container does not need.
   fn default() -> Self {
     Self::new()
   }
 }
 
-impl<K> LibraryCohort<K> {
+impl LibraryCohortBuilder {
   /// An empty cohort.
   pub fn new() -> Self {
     Self {
       speakers: Vec::new(),
       entries: DiaricCohort::new(),
     }
+  }
+
+  /// Mint a token for one speaker of this cohort.
+  ///
+  /// **It takes no argument**, which is the point: a token is not derived from
+  /// anything, so there is no input whose later value could re-decide the
+  /// answer. Call it once per distinct speaker and keep the token beside that
+  /// speaker's own library key; calling it twice mints two speakers, which is
+  /// what two calls asked for.
+  ///
+  /// A speaker with no profiles pushed under it is not a mistake — it names an
+  /// empty exclusion set, which is the right answer for an enrolled speaker who
+  /// is simply not among the impostors.
+  pub fn speaker(&mut self) -> SpeakerToken {
+    let token = SpeakerToken::mint();
+    self.speakers.push(token);
+    token
+  }
+
+  /// File one library profile under the speaker it belongs to.
+  ///
+  /// Every profile pushed under one token is dropped together by
+  /// [`Calibration::enrolled_side`], so a speaker's second recording goes under
+  /// the same token their first did.
+  ///
+  /// A token this cohort has not seen is **adopted**: it becomes one of this
+  /// cohort's speakers, naming exactly what is filed under it here. That is the
+  /// only sound reading — a token is a bare identity, so one minted from
+  /// another cohort names, in this one, precisely the entries this cohort was
+  /// given for it. Refusing instead would turn a caller reusing one identity
+  /// across two cohorts into a [`CalibrateError::ForeignSpeaker`] on a cohort
+  /// that genuinely holds that speaker, which is an exclusion lost.
+  ///
+  /// Like [`Enrolled::new`], this is an **assertion**: it says the profile is
+  /// material from the speaker the token names. A sans-I/O crate cannot refute
+  /// that, and it is the same irreducible residual stated there. What is no
+  /// longer possible is the other thing — a *query* of this crate's handing
+  /// back a token that names somebody else.
+  pub fn push(&mut self, speaker: SpeakerToken, profile: VoiceProfile) {
+    if !self.speakers.contains(&speaker) {
+      self.speakers.push(speaker);
+    }
+    self.entries.push(speaker, profile);
   }
 
   /// Number of cohort members, before any exclusion.
@@ -1165,70 +1258,78 @@ impl<K> LibraryCohort<K> {
   pub fn is_empty(&self) -> bool {
     self.entries.is_empty()
   }
+}
 
-  /// Whether THIS cohort minted `token`.
+/// A frozen cohort sampled from the caller's own library, whose members carry
+/// the identities that name them.
+///
+/// #123's cohort shape, and the one [`Calibration::enrolled_side`] needs.
+/// Because it may hold an enrolled speaker's own entries, every side over it
+/// drops that speaker's entries by identity — which is correct for a side whose
+/// speaker is NAMED and impossible for one whose speaker is what the trial is
+/// trying to discover. A probe therefore has no door onto this type at all; it
+/// goes to [`HeldOutCohort`].
+///
+/// **It holds token membership and token-keyed entries, and nothing else.**
+/// There is no caller key in it, so no lookup of the caller's can be answered
+/// against it — which is not a statement about what it lends out. A [`Clone`]
+/// of it, a [`Clone`] of the [`Calibration`] around it, or any other duplicate
+/// is the same immutable pair of lists: nothing to mutate and nothing to
+/// resolve. [`SpeakerToken`] has the case that shape closes, and the three
+/// separate roads that reached it while a key was still here.
+///
+/// **Built only by freezing a [`LibraryCohortBuilder`]**, and it has no mutator,
+/// so it cannot grow. [`Calibration::new`] does the freeze; growing means
+/// assembling a new cohort and a new calibration, whose sides do not pair with
+/// the old ones — the refusal a silently grown cohort would otherwise skip.
+///
+/// **The `diaric` container inside is private, and that is the point.**
+/// `diaric`'s [`Cohort<K, T>`](diaric::score_norm::Cohort) is generic in `T`
+/// and carries a public
+/// [`stats_excluding`](diaric::score_norm::Cohort::stats_excluding), so
+/// re-exporting it — which this module did — handed a caller a way to compute
+/// an unbound, candidate-dependent statistic over a [`VoiceProfile`] through
+/// `coremlit`'s own surface. Wrapping it means a [`Calibration`] is this
+/// crate's only statistic constructor over a profile.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LibraryCohort {
+  /// The speakers this cohort knows, as frozen at the moment of the freeze.
+  speakers: Vec<SpeakerToken>,
+  /// `diaric`'s own container, private, keyed by the token.
+  entries: DiaricCohort<SpeakerToken, VoiceProfile>,
+}
+
+impl From<LibraryCohortBuilder> for LibraryCohort {
+  /// Freeze an assembled cohort: the same speakers and the same entries, with
+  /// every mutator left behind.
+  fn from(builder: LibraryCohortBuilder) -> Self {
+    Self {
+      speakers: builder.speakers,
+      entries: builder.entries,
+    }
+  }
+}
+
+impl LibraryCohort {
+  /// Number of cohort members, before any exclusion.
+  pub fn len(&self) -> usize {
+    self.entries.len()
+  }
+
+  /// Whether the cohort holds no members. An empty one is not a refusal here;
+  /// it becomes [`CalibrateError::ScoreNorm`] at
+  /// [`Calibration::enrolled_side`], where `diaric`'s own floor lives.
+  pub fn is_empty(&self) -> bool {
+    self.entries.is_empty()
+  }
+
+  /// Whether this cohort holds `token` as one of its speakers.
   ///
   /// A linear scan over the distinct speakers, which is nothing beside the one
   /// cosine per member the side that follows costs. It is what makes a token
   /// from some other cohort a refusal rather than an exclusion of nothing.
-  fn minted(&self, token: SpeakerToken) -> bool {
-    self.speakers.iter().any(|(_, minted)| *minted == token)
-  }
-}
-
-impl<K: Eq> LibraryCohort<K> {
-  /// Add one library profile under the speaker key that names it.
-  ///
-  /// The key is resolved to this cohort's [`SpeakerToken`] here, once, and the
-  /// entry is stored under that token — so pushing a second recording of a
-  /// speaker already present files it under the same token, and
-  /// [`Calibration::enrolled_side`] drops both.
-  ///
-  /// [`Eq`] rather than [`PartialEq`] because "already present" is only a
-  /// correct question if a key equals itself; `f64::NAN` is the standard
-  /// counterexample, and under it every push would mint a fresh token, so a
-  /// speaker's own entries would not be dropped together. The bound is pinned
-  /// here, at the one place `K` is ever compared:
-  ///
-  /// ```compile_fail,E0599
-  /// use coremlit::audio::speaker::calibrate::{LibraryCohort, Scoring};
-  /// # let raw = vec![0.5f32; coremlit::audio::speaker::embed::EMBEDDING_DIM];
-  /// // `f64` is `PartialEq` but not `Eq`, so it cannot name a speaker — and a
-  /// // `NaN` key would not match its own entry.
-  /// let mut cohort: LibraryCohort<f64> = LibraryCohort::new();
-  /// cohort.push(f64::NAN, Scoring::Cosine.prepare(&raw).unwrap());
-  /// ```
-  pub fn push(&mut self, speaker: K, profile: VoiceProfile) {
-    let token = self.token(speaker);
-    self.entries.push(token, profile);
-  }
-
-  /// The token that names `speaker` for the rest of this cohort's life.
-  ///
-  /// Idempotent: the same key always resolves to the same token, whether it
-  /// was first seen here or at [`push`](Self::push). A speaker this cohort
-  /// holds nothing of gets one too — it names an empty exclusion set, which is
-  /// the right answer for an enrolled speaker who is simply not among the
-  /// impostors, and it stays the right answer if that speaker is pushed later.
-  ///
-  /// **It takes `&mut self`, and that is the seal.** A [`Calibration`] owns
-  /// its cohort and lends it out only by shared reference
-  /// ([`Calibration::cohort`]), so this cannot be called once the calibration
-  /// exists. Every token is therefore minted while the cohort is still open,
-  /// and no caller-owned `K` participates in equality after that point — see
-  /// [`SpeakerToken`] for what that closes.
-  ///
-  /// It takes the key **by value** because the cohort keeps it: answering the
-  /// same question the same way later is the whole point.
-  pub fn token(&mut self, speaker: K) -> SpeakerToken {
-    for (key, token) in &self.speakers {
-      if *key == speaker {
-        return *token;
-      }
-    }
-    let token = SpeakerToken::mint();
-    self.speakers.push((speaker, token));
-    token
+  fn holds(&self, token: SpeakerToken) -> bool {
+    self.speakers.contains(&token)
   }
 }
 
@@ -1240,10 +1341,11 @@ impl<K: Eq> LibraryCohort<K> {
 /// from a cohort when the probe's identity is the thing being looked up. See
 /// the module docs' "Two sides, and only one of them has an identity".
 ///
-/// **It carries no speaker keys, and that is the design.** A held-out cohort
-/// has nothing to exclude, so there is no key to pass wrongly and no entrypoint
-/// that could take one: candidate-independence is structural here rather than
-/// documented.
+/// **It carries no speaker identities at all, and that is the design.** A
+/// held-out cohort has nothing to exclude, so there is no token to pass wrongly
+/// and no entrypoint that could take one: candidate-independence is structural
+/// here rather than documented. It needs no builder for the same reason — there
+/// is nothing to mint — so it is its own frozen form.
 ///
 /// The disjointness itself cannot be checked — `coremlit` does not hold the
 /// library — so [`assuming_disjoint`](HeldOutCohort::assuming_disjoint) is the
@@ -1298,25 +1400,49 @@ impl HeldOutCohort {
   }
 }
 
-/// The cohort shapes a [`Calibration`] can be built over.
+/// The cohort shapes a [`Calibration`] can HOLD: frozen, with no mutator on
+/// them and no key of the caller's in them.
 ///
 /// **Sealed**: [`LibraryCohort`] and [`HeldOutCohort`] implement it, nothing
 /// else can, and there is no method on it to call. It exists so
 /// [`Calibration`]'s shared methods are offered for exactly the two containers
 /// that can produce a side, rather than for any type at all.
-pub trait CohortSource: sealed::Sealed {}
+pub trait CalibrationCohort: sealed::Sealed {}
 
-impl<K> CohortSource for LibraryCohort<K> {}
+impl CalibrationCohort for LibraryCohort {}
 
-impl CohortSource for HeldOutCohort {}
+impl CalibrationCohort for HeldOutCohort {}
+
+/// The cohort shapes [`Calibration::new`] can be handed, and the frozen cohort
+/// each becomes.
+///
+/// **Sealed**, and the one place the freeze is expressed:
+/// [`LibraryCohortBuilder`] becomes a [`LibraryCohort`] — the caller's assembly
+/// step left behind, along with every mutator — and a [`HeldOutCohort`], which
+/// mints nothing and has nothing to freeze, becomes itself.
+pub trait CohortSource: sealed::Sealed + Sized {
+  /// The frozen cohort a [`Calibration`] holds once it owns this one.
+  type Cohort: CalibrationCohort + From<Self>;
+}
+
+impl CohortSource for LibraryCohortBuilder {
+  type Cohort = LibraryCohort;
+}
+
+impl CohortSource for HeldOutCohort {
+  type Cohort = Self;
+}
 
 mod sealed {
   /// Not nameable outside this module, so
-  /// [`CohortSource`](super::CohortSource) cannot be implemented outside it
-  /// either.
+  /// [`CohortSource`](super::CohortSource) and
+  /// [`CalibrationCohort`](super::CalibrationCohort) cannot be implemented
+  /// outside it either.
   pub trait Sealed {}
 
-  impl<K> Sealed for super::LibraryCohort<K> {}
+  impl Sealed for super::LibraryCohortBuilder {}
+
+  impl Sealed for super::LibraryCohort {}
 
   impl Sealed for super::HeldOutCohort {}
 }
@@ -1370,8 +1496,12 @@ impl CalibrationId {
 /// module docs' "One scoped operation, not three loose values" has the table
 /// and the history.
 ///
-/// It takes its cohort **by value**. A cohort that could still be pushed to
-/// would be a population that changed under sides already taken.
+/// It takes its cohort **by value and freezes it**: what it holds is a
+/// [`LibraryCohort`] or a [`HeldOutCohort`], neither of which has a mutator on
+/// it at all. A cohort that could still be pushed to would be a population that
+/// changed under sides already taken, and making that a property of the TYPE
+/// rather than of who holds which borrow is deliberate — a borrow is what a
+/// [`Clone`] goes around.
 ///
 /// Build one per `(cohort, options)` pair and keep it for as long as the sides
 /// taken under it: a [`TrialSide`] is reusable across every trial of *this*
@@ -1386,17 +1516,34 @@ pub struct Calibration<C> {
   id: CalibrationId,
 }
 
-impl<C: CohortSource> Calibration<C> {
-  /// Fix a cohort and a configuration together, under a fresh
+impl<C: CalibrationCohort> Calibration<C> {
+  /// Freeze a cohort and a configuration together, under a fresh
   /// [`CalibrationId`].
   ///
-  /// `C` is [`LibraryCohort<K>`] or [`HeldOutCohort`]; which one decides
-  /// whether sides are taken with [`enrolled_side`](Self::enrolled_side) or
-  /// with [`side`](Self::side), and that is the asymmetry between a named
-  /// speaker and an unidentified probe that the module docs argue.
-  pub fn new(cohort: C, options: AsNormOptions) -> Self {
+  /// It takes a [`LibraryCohortBuilder`] or a [`HeldOutCohort`] and holds what
+  /// that freezes into — a [`LibraryCohort`], or the [`HeldOutCohort`] itself.
+  /// Which one decides whether sides are taken with
+  /// [`enrolled_side`](Self::enrolled_side) or with [`side`](Self::side), and
+  /// that is the asymmetry between a named speaker and an unidentified probe
+  /// that the module docs argue.
+  ///
+  /// **The freeze is about what the cohort loses, not about who may borrow
+  /// it.** A frozen cohort holds token membership and token-keyed entries and
+  /// nothing else, so a duplicate of it — or of this calibration — answers no
+  /// question the original would have answered differently. That is
+  /// deliberately not a claim about `&mut`: [`SpeakerToken`] carries the round
+  /// where it was, and the [`Clone`] that walked around it.
+  // `C: From<S>` is what `CohortSource::Cohort`'s own bound already says, and
+  // it is restated because rustc does not carry an associated type's item
+  // bounds across the `Cohort = C` equality. It constrains no caller: the only
+  // two `S` that exist satisfy it by that same bound.
+  pub fn new<S>(cohort: S, options: AsNormOptions) -> Self
+  where
+    S: CohortSource<Cohort = C>,
+    C: From<S>,
+  {
     Self {
-      cohort,
+      cohort: cohort.into(),
       options,
       id: CalibrationId::mint(),
     }
@@ -1486,7 +1633,7 @@ impl<C: CohortSource> Calibration<C> {
   }
 }
 
-impl<K> Calibration<LibraryCohort<K>> {
+impl Calibration<LibraryCohort> {
   /// One side for an **enrolled** speaker, over a cohort that may contain that
   /// speaker's own entries.
   ///
@@ -1498,9 +1645,9 @@ impl<K> Calibration<LibraryCohort<K>> {
   /// keeps a side reusable across every trial the speaker appears in.
   ///
   /// **An unidentified probe has no entrypoint here, deliberately.** It takes
-  /// an [`Enrolled`], which binds a key to a profile, and a probe has no key to
-  /// bind; passing the candidate's key instead is the failure this shape
-  /// removes. A probe goes to a `Calibration<HeldOutCohort>` and
+  /// an [`Enrolled`], which binds an identity to a profile, and a probe has no
+  /// identity to bind; passing the candidate's instead is the failure this
+  /// shape removes. A probe goes to a `Calibration<HeldOutCohort>` and
   /// [`side`](Calibration::side). The module docs argue the asymmetry.
   ///
   /// **What this side can be averaged with.** Any other side of this same
@@ -1513,17 +1660,18 @@ impl<K> Calibration<LibraryCohort<K>> {
   /// populations, and the module docs carry the case where doing so reverses
   /// which candidate ranks first.
   ///
-  /// **Exclusion is by a token the cohort minted, not by the caller's key.**
-  /// `K` is compared exactly once per key, at [`LibraryCohort::token`], which
-  /// takes `&mut self` and so cannot be reached once the cohort has become
-  /// this calibration. That is what makes the exclusion set a fixed property
-  /// of the token rather than of whatever the caller's key says at the moment
-  /// a side is taken — [`SpeakerToken`] has the case it closes.
+  /// **Exclusion is by a [`SpeakerToken`], and there is no key anywhere to
+  /// resolve one from.** A token is minted by
+  /// [`LibraryCohortBuilder::speaker`], which takes no argument, so the
+  /// exclusion set it names is fixed by what was filed under it and by nothing
+  /// the caller can subsequently change or ask again — that type has the three
+  /// roads a caller's `K` left open, and why sealing them one at a time did
+  /// not close the class.
   ///
   /// # Errors
   ///
-  /// - [`CalibrateError::ForeignSpeaker`] if the token was not minted by this
-  ///   calibration's own cohort. Excluding nothing instead would be the
+  /// - [`CalibrateError::ForeignSpeaker`] if this calibration's own cohort does
+  ///   not hold that speaker. Excluding nothing instead would be the
   ///   self-contamination this door exists to prevent.
   /// - [`CalibrateError::ScoringMismatch`] if any scored cohort entry was
   ///   prepared for a different [`Scoring`] than the enrolled profile.
@@ -1531,7 +1679,7 @@ impl<K> Calibration<LibraryCohort<K>> {
   ///   empty selection (including a cohort that was entirely this speaker), too
   ///   few usable scores, or a selected set that does not spread.
   pub fn enrolled_side(&self, enrolled: Enrolled<'_>) -> Result<TrialSide, CalibrateError> {
-    if !self.cohort.minted(enrolled.speaker) {
+    if !self.cohort.holds(enrolled.speaker) {
       return Err(CalibrateError::ForeignSpeaker);
     }
     let mut bridge = Bridge::default();
