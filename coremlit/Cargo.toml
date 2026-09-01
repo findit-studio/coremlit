@@ -15,6 +15,7 @@ exclude = [
   "tests/align/fixtures/",
   "tests/ced/fixtures/",
   "tests/clap/fixtures/",
+  "tests/face/fixtures/",
   "tests/identity/fixtures/",
   "tests/lid/fixtures/",
   "tests/siglip/fixtures/",
@@ -71,6 +72,20 @@ lid = ["dep:rustfft", "dep:windit"]
 # out. Only the mel front end needs a dependency; the windowing and scoring of
 # several windows are the caller's, so there is no `windit` here.
 identity = ["dep:rustfft"]
+
+# The face-embedding surface (`embeddings::face`): the ArcFace 5-point
+# similarity alignment plus a manifest-driven CoreML embedder. It adds NO
+# dependency — the alignment is `f64` arithmetic and the embedder builds a
+# `MultiArray` the always-compiled runtime core already owns.
+#
+# NOT `commercial-face`, and that is deliberate. This feature gates no model
+# artifact: issue #115's census found none that clears both the licence bar and
+# the off-angle accuracy bar, so `MODELS_LOCK` stages no face kit and the caller
+# supplies the artifact path. A `commercial-` feature that gates no licence row
+# is refused by `every_commercial_feature_gates_a_research_only_artifact`
+# (tests/model_licences.rs) precisely so a gate cannot stand as false
+# reassurance. The rename arrives with the artifact it protects.
+face = []
 
 [dependencies]
 objc2.workspace = true
@@ -143,6 +158,11 @@ png.workspace = true
 libc.workspace = true
 mach2.workspace = true
 asry = { version = "0.1.0", default-features = false, features = ["emissions"] }
+
+[[test]]
+name = "face_align_golden"
+path = "tests/face/align_golden.rs"
+required-features = ["face"]
 
 [[test]]
 name = "whisper_golden_provenance"

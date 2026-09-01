@@ -44,7 +44,7 @@ manifests and BOTH CI matrices.
 `default = []` (the bare CoreML runtime core). Additive features:
 
 `whisper`, `nl-recognizer`, `align`, `align-oracle`, `speaker`, `vad`, `clap`,
-`granite`, `siglip`, `ced`, `lid`, `identity`, `serde`, `tracing`.
+`granite`, `siglip`, `ced`, `lid`, `identity`, `face`, `serde`, `tracing`.
 
 `coremlit-parity`'s own `default = []` plus three additive oracle features:
 `speaker-oracle` (⇒ `coremlit/speaker`), `clap-oracle` (⇒ `coremlit/clap`),
@@ -106,11 +106,36 @@ public name spells the model behind it — today backed by a conversion of
 diarization lane's batch-3, mask-taking, 256-d WeSpeaker graph, pinned by a DER
 gate that reds on any change to it, and this is additive.
 
+`face` is likewise a NEW module (`embeddings::face`): the identity half of the
+video face path, as `speaker` is for voices. It carries the ArcFace 5-point
+similarity alignment as an explicit, golden-tested step OUTSIDE the embedder,
+plus a CoreML embedder whose preprocessing — channel order, scale, bias,
+layout — is a per-artifact manifest value rather than a constant at a call
+site. It adds **no dependency at all**: the alignment is `f64` arithmetic and
+the embedder builds a `MultiArray` the always-compiled runtime core already
+owns.
+
+It is also the ONLY kit feature that stages no model artifact, and the reason
+belongs in this file rather than only in the module doc. Issue #115's census
+found no face-embedding model that clears both the licence bar and the
+off-angle accuracy bar; the owner's answer was that CI may use research-only
+weights behind a `commercial-` feature *provided coremlit never redistributes
+them*. There is no road from that decision to a staged artifact today — the
+convert-and-publish road every other kit uses IS redistribution, no upstream
+publishes a CoreML build of an accuracy-adequate ArcFace, the two third-party
+builds that exist declare `ImageType` inputs this crate's `Model` cannot bind,
+and converting inside the CI job has no legal key in the licence register. So
+the feature is plain `face`, the caller supplies the artifact path, and
+`commercial-face` — this file's own worked example below — arrives with
+the artifact it protects, not before. The alignment golden is real and
+hermetic; there is no embedding parity gate, no known-pairs gate and no
+throughput number, because there is nothing to run them against.
+
 Compositions (pinned by the golden test): `nl-recognizer` → `whisper`;
 `align-oracle` → `align`. Across the package boundary, `coremlit-parity`'s
 `speaker-oracle` → `coremlit/speaker`, `clap-oracle` → `coremlit/clap`,
-`vad-bundled` → `coremlit/vad`. (`granite`, `siglip`, `ced`, `lid` and
-`identity` each compose with nothing — a single leaf feature. `identity` and
+`vad-bundled` → `coremlit/vad`. (`granite`, `siglip`, `ced`, `lid`, `identity`
+and `face` each compose with nothing — a single leaf feature. `identity` and
 `speaker` are a curated CI PAIRING rather than a composition: neither implies
 the other, and `Scoring::IdentityCosine`'s `const` assert that its row length
 IS `audio::identity::EMBEDDING_DIM` compiles only when both are on, so a

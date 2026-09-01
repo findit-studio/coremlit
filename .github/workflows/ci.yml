@@ -119,8 +119,9 @@ jobs:
           - "lid"                                                           # spoken-language identification alone (Rust mel + committed label roster, no ort)
           - "identity"                                                      # speaker-identity embedding alone (Rust mel + committed mel goldens, no ort)
           - "identity,speaker"                                              # named smoke: Scoring::IdentityCosine lives behind `speaker` while the door that feeds it lives behind `identity`, and the const assert tying their dimensions together compiles ONLY when both are on
-          - "whisper,align,speaker,vad,clap,granite,siglip,ced,lid,identity,serde,tracing,nl-recognizer"    # all non-oracle
-          - "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,identity,serde,tracing,nl-recognizer"  # all-on
+          - "face"                                                          # face alignment + embedder surface alone (no dependency at all; the ONLY kit with no staged artifact, so its gates are hermetic by construction)
+          - "whisper,align,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer"    # all non-oracle
+          - "whisper,align-oracle,speaker,vad,clap,granite,siglip,ced,lid,identity,face,serde,tracing,nl-recognizer"  # all-on
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
