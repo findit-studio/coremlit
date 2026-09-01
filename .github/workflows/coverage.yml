@@ -283,7 +283,7 @@ jobs:
           # same cache entry ci.yml's speaker shard verified on the same commit.
           #
           # `@lib` is load-bearing here for the same reason it is on the granite
-          # leg: 38 of this kit's model gates are `#[ignore]`d unit tests inside
+          # leg: 42 of this kit's model gates are `#[ignore]`d unit tests inside
           # `src/audio/speaker/**`, not `tests/` targets, and their lines are
           # unreachable without this group. `--skip=argmax` drops the eleven
           # that read `Models/argmax-speakerkit`, which no runner fetches for a

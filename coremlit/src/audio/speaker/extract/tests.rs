@@ -1679,16 +1679,43 @@ fn extract_chunk_embeddings_refuses_a_slab_the_embedder_disagrees_with() {
   }
 }
 
-// The door's `OnsetOutOfRange` guard has no test, and deliberately not: it is
-// the same defense-in-depth `extract`'s guard 4 is, and there is no longer a
-// route that constructs the witness. `WindowOptions`' builders assert the
-// `(0.0, 1.0]` range and its `Deserialize` routes through `WindowOptionsRepr`,
-// which REFUSES an out-of-range `onset` before an `Options` exists — so the
-// serde-bypass premise the three `extract_serde_bypassed_*` tests below rest on
-// no longer holds either. Those three fail today, on `main`, unrelated to this
-// change; CI's speaker shard runs `--features speaker` (no `serde`) and so has
-// never executed them. Reported rather than repaired here — deciding what those
-// tests should become is not this door's call.
+// The door's `ZeroStepSamples`/`StepSamplesExceedsWindow`/`OnsetOutOfRange`
+// guards (guards 3-4) have no test, and deliberately not: they are
+// defense-in-depth, and there is no longer a route that constructs the
+// witness. `WindowOptions`' fields are private, its builders assert the same
+// `step_samples`/`onset` ranges these guards re-check, and — since the L1 fix
+// that motivated `WindowOptionsRepr` — its `Deserialize` routes through that
+// repr's `TryFrom`, which refuses an invalid `step_samples`/`onset` before a
+// `WindowOptions` (and so an `Options`) exists at all. Every public
+// construction path is validated; only an internal bug that skipped the repr
+// could still reach these three branches.
+//
+// This file used to carry three `extract_serde_bypassed_*` tests built on the
+// PRE-`WindowOptionsRepr` premise: that serde's derived, field-assigning
+// `Deserialize` bypassed the builder panics (dia's own serde-bypass
+// rationale, owned.rs:377-378) and so was the one route left to reach these
+// guards. That premise died with `WindowOptionsRepr` — the three now fail at
+// `serde_json::from_str(..).unwrap()`, before `extract` is ever called,
+// because deserialization itself now rejects the bad value (verified against
+// `main`: `step_samples (0) must be > 0 and <= SEG_CHUNK_SAMPLES (160000)`,
+// `step_samples (200000) must be > 0 and <= SEG_CHUNK_SAMPLES (160000)`,
+// `onset (0) must be finite in (0.0, 1.0]` — the exact
+// `WindowOptionsRepr::try_from` messages, not anything from `extract`). CI
+// never caught this: the speaker shard runs `--features speaker` with no
+// `serde`, so these `#[cfg(feature = "serde")]` tests have never executed
+// there.
+//
+// Deleted rather than repaired to test the new failure: that coverage
+// already exists, hermetically and without the model-gating these three
+// carried for no reason (they never reached model-dependent code), in
+// `window/tests.rs`'s `options_serde_rejects_zero_step_samples`,
+// `options_serde_rejects_step_samples_exceeding_window` and
+// `options_serde_rejects_out_of_range_onset` — the correct layer for "does
+// deserialization reject this", proven at `WindowOptions` itself rather than
+// through `Options`' embedding of it. Re-asserting the same rejection here
+// through `extract`'s door would only be a second, drifting copy of that
+// coverage for a guard body that (per the paragraph above) nothing can any
+// longer reach to execute.
 
 #[test]
 #[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
@@ -1698,54 +1725,6 @@ fn extract_empty_samples_errors() {
   assert_eq!(
     Extractor::new().extract(&seg, &embed, &[]),
     Err(ExtractError::EmptySamples)
-  );
-}
-
-// serde-bypass preflight: serde deserialization assigns fields directly,
-// bypassing WindowOptions' builder panics (dia's own serde-bypass
-// rationale, owned.rs:377-378). These reach `extract`'s own
-// defense-in-depth guards, which run BEFORE any inference. Model-gated
-// only because `extract`'s signature requires loaded models; they run
-// under `cargo test -p coremlit --features speaker,serde -- --ignored`.
-
-#[cfg(feature = "serde")]
-#[test]
-#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
-fn extract_serde_bypassed_zero_step_samples_errors() {
-  let seg = load_seg_model();
-  let embed = load_embed_model();
-  let options: Options = serde_json::from_str(r#"{"window":{"step_samples":0}}"#).unwrap();
-  assert_eq!(
-    Extractor::with_options(options).extract(&seg, &embed, &[0.0f32; 10]),
-    Err(ExtractError::ZeroStepSamples)
-  );
-}
-
-#[cfg(feature = "serde")]
-#[test]
-#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
-fn extract_serde_bypassed_step_samples_exceeds_window_errors() {
-  let seg = load_seg_model();
-  let embed = load_embed_model();
-  let options: Options = serde_json::from_str(r#"{"window":{"step_samples":200000}}"#).unwrap();
-  assert_eq!(
-    Extractor::with_options(options).extract(&seg, &embed, &[0.0f32; 10]),
-    Err(ExtractError::StepSamplesExceedsWindow(
-      StepSamplesExceedsWindow::new(200_000, SEG_CHUNK_SAMPLES)
-    ))
-  );
-}
-
-#[cfg(feature = "serde")]
-#[test]
-#[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS)"]
-fn extract_serde_bypassed_onset_out_of_range_errors() {
-  let seg = load_seg_model();
-  let embed = load_embed_model();
-  let options: Options = serde_json::from_str(r#"{"window":{"onset":0.0}}"#).unwrap();
-  assert_eq!(
-    Extractor::with_options(options).extract(&seg, &embed, &[0.0f32; 10]),
-    Err(ExtractError::OnsetOutOfRange(0.0))
   );
 }
 

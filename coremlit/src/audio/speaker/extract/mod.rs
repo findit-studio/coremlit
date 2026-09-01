@@ -49,15 +49,29 @@
 //!
 //! [`Extractor::extract`] is the FUSED path: one call, both models, a whole
 //! clip. A caller that instead runs `segmentation → embed → cluster` as three
-//! autonomous nodes ([`ExtractionParts`]' doc, issue #110) drives the same
-//! stages through three public doors, and each one is a face of this module's
-//! own implementation rather than a second copy of it:
+//! autonomous nodes ([`ExtractionParts`]' doc, issue #110) drives stages 3-6
+//! through three public doors, and each one is a face of this module's own
+//! implementation rather than a second copy of it:
 //!
 //! | node | door |
 //! |---|---|
 //! | segmentation | [`crate::audio::speaker::segment::SegmentModel::infer`] + [`crate::audio::speaker::segment::multilabel`], on the chunk grid [`crate::audio::speaker::window::chunk_starts`] schedules |
 //! | embed | [`Extractor::extract_chunk_embeddings`] — stage 4 and stage 5 for ONE chunk |
 //! | cluster | [`crate::audio::speaker::window::count_from_segmentations`] then [`Extraction::try_from_parts`], at the track's end |
+//!
+//! **Stage 2 (chunk grid + zero-padding) has no door: it is not shared, it is
+//! rebuilt.** A split-pipeline caller still constructs each
+//! `SEG_CHUNK_SAMPLES` window itself — zero-padding the final, partial chunk
+//! exactly as the fused loop's private `fill_padded_chunk` does — before
+//! calling the segmentation door, and again, identically, before calling
+//! [`Extractor::extract_chunk_embeddings`] (whose own `samples` doc explains
+//! why: a short slice is refused rather than padded there, because
+//! [`crate::audio::speaker::embed::EmbedModel::embed_chunk`] REPEAT-pads
+//! whatever it is given, so accepting one here would silently embed
+//! different audio than the fused path computed). That copy is small
+//! (`fill_padded_chunk` is seven lines) but it is a real one, not a face of
+//! anything published — this module's shared surface is stages 3-6, not the
+//! whole pipeline.
 //!
 //! The embed door is per-CHUNK because that is the granularity at which the
 //! stage decides anything, and because it lets `extract`'s loop and the split

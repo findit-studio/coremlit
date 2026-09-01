@@ -284,6 +284,87 @@ pub fn sha256_hex(data: &[u8]) -> String {
     .collect()
 }
 
+/// `<bundle>.mlmodelc` name -> the sha256 MODELS_LOCK's `speaker`-kit OVERLAY table
+/// (`FinDIT-Studio/speakerkit-coreml`, module doc "ORDER WITHIN THE `speaker` KIT") pins its
+/// `model.mil` at, once staged last as the lock requires.
+///
+/// A THIRD copy of the two hashes `tests/speaker/model_io.rs`'s
+/// `fp16_safe_segmentation_matches_pinned_sha256`/`fp16_safe_wespeaker_fp32_matches_pinned_sha256`
+/// already duplicate from ci.yml's `overlay-pins` (module doc there: "a deliberate SECOND copy").
+/// `ci_stages_the_speakerkit_overlay_last_and_proves_it_won` (tests/whisper/models_lock.rs) is
+/// extended to hold all three copies together, the same way it already held the first two.
+const OVERLAY_MODEL_MIL_PINS: &[(&str, &str)] = &[
+  (
+    "pyannote_segmentation.mlmodelc",
+    "ded0d1ee11d77976b5c706ce667d0c8cb49977d3fe4367cccbd7b582bdb86dec",
+  ),
+  (
+    "wespeaker.mlmodelc",
+    "cff0cfe914078e9336754a9b38a68c2cdd88ca7b6bf97568ad551ab03ae1b666",
+  ),
+];
+
+/// Reports and returns `true` when `gate` must not run because the staged `bundle` (at
+/// `bundle_root`, i.e. [`seg_path`] or [`embed_fp32_path`]) does not hash to MODELS_LOCK's pinned
+/// overlay `model.mil` ([`OVERLAY_MODEL_MIL_PINS`]).
+///
+/// Both the FluidInference base layer and the FinDIT-Studio overlay ship a contract-identical
+/// `model.mil` under this same filename — same I/O shapes, same dtypes — so a numeric parity gate
+/// loads and runs either one to completion (module doc, "ORDER WITHIN THE `speaker` KIT"). Only
+/// the overlay's bytes carry the issue-#15 fp16-guard repair; the base layer's silently produce a
+/// plausible-looking but wrong number (an inert `log(epsilon = 0)` / vanished pooling guards)
+/// instead of the loud failure a missing or malformed file would give. A byte mismatch here means
+/// this host's cache was never re-staged in MODELS_LOCK's lock order — re-download rather than
+/// trust this run.
+///
+/// A missing file is NOT this function's concern: it returns `false` and lets the caller's own
+/// `Model::from_file_with(...).expect(...)` a few lines down give the (already loud) "no such
+/// file" panic — conflating "wrong bytes" with "no bytes" would blur two different repairs behind
+/// one message.
+///
+/// Follows `tests/lid/common/mod.rs`'s `skipped_for_the_default_shape_refusal` convention: the
+/// line goes to the inherited stderr descriptor, because libtest discards a PASSING test's output
+/// unless the reader remembers `--nocapture`, and a skip nobody can see is the silent pass this
+/// exists to prevent.
+///
+/// # Panics
+/// If `bundle` is not one of [`OVERLAY_MODEL_MIL_PINS`]'s two names — a caller error, not a host
+/// or artifact state this function is meant to report on.
+#[allow(dead_code)]
+pub fn skipped_for_stale_overlay(gate: &str, bundle_root: &std::path::Path, bundle: &str) -> bool {
+  use std::io::Write;
+
+  let expected = OVERLAY_MODEL_MIL_PINS
+    .iter()
+    .find_map(|(name, hash)| (*name == bundle).then_some(*hash))
+    .unwrap_or_else(|| {
+      panic!("skipped_for_stale_overlay: {bundle:?} is not a pinned overlay bundle")
+    });
+  let mil = bundle_root.join("model.mil");
+  let Ok(bytes) = std::fs::read(&mil) else {
+    return false;
+  };
+  let actual = sha256_hex(&bytes);
+  if actual == expected {
+    return false;
+  }
+  let line = format!(
+    "model-gates | SKIPPED {gate}: {} sha256 {actual} != MODELS_LOCK overlay pin {expected} — \
+     this host staged the FluidInference pre-repair build, not the fp16-guard-repaired \
+     FinDIT-Studio overlay; re-run the download in MODELS_LOCK's lock order before trusting this \
+     gate\n",
+    mil.display()
+  );
+  // SAFETY: fd 2 is open for the whole life of the process (libtest redirects the Rust-level
+  // handles, never the descriptor), it is only written to here, and `ManuallyDrop` keeps the
+  // `File` from closing a descriptor it does not own.
+  let mut fd2 = std::mem::ManuallyDrop::new(unsafe {
+    <std::fs::File as std::os::fd::FromRawFd>::from_raw_fd(2)
+  });
+  let _ = fd2.write_all(line.as_bytes());
+  true
+}
+
 /// Cosine similarity of two equal-length vectors, accumulated in `f64` for
 /// precision (Gate 2's per-`(chunk, slot)` metric).
 ///

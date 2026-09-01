@@ -108,6 +108,7 @@ jobs:
           - "whisper"
           - "align"
           - "speaker"
+          - "speaker,serde"                                                 # named smoke: WindowOptionsRepr's validated Deserialize is speaker-only serde code, and the all-on rows bury a break in it behind ten other features (#129: extract_serde_bypassed_* orphaned this way, undetected)
           - "vad"
           - "whisper,vad"                                                   # the silero_vad composition
           - "align-oracle"                                                  # asry's ONNX aligner — a FEATURE of a dep coremlit already has, so it stays here
@@ -218,7 +219,7 @@ jobs:
   #                 the same 118 gates a second time. (Measured: that row's
   #                 `whisper|@all` lists 150, of which 118 are the lib's.)
   #   granite   51  covered by `@lib`.
-  #   speaker   38  covered by `@lib`, less the eleven that read a tree no
+  #   speaker   42  covered by `@lib`, less the eleven that read a tree no
   #                 runner fetches — see that row.
   #   ced        0  these kits' model gates all live in `tests/`, so a `@lib`
   #   clap       0  group would list ZERO ignored tests and (correctly) trip
@@ -348,7 +349,7 @@ jobs:
           # that; adding them here would quietly reverse a licensing decision.
           #
           # The SECOND gate group is the library's own suite, and it is free:
-          # `--features speaker --lib` lists 38 `#[ignore]`d model gates that
+          # `--features speaker --lib` lists 42 `#[ignore]`d model gates that
           # read exactly the two graphs this shard already stages, so the group
           # costs one more `cargo test` over an already-built binary (26 s
           # measured) and not one byte of download. Without it the shard pulls
@@ -356,12 +357,12 @@ jobs:
           # kit's gates unrun (#61).
           #
           # `--skip=argmax` IS THE LICENSING DECISION ABOVE, one level down.
-          # ELEVEN of those 38 load ARGMAX_TEST_MODELS — the ten in
+          # ELEVEN of those 42 load ARGMAX_TEST_MODELS — the ten in
           # `audio::speaker::source::argmax::tests`, plus
           # `source::tests::any_source_load_dispatches_fluid_audio_and_argmax`,
           # which loads BOTH sources — and no runner has that tree. Measured
           # with it removed: an unfiltered `@lib` fails eleven, a skip that did
-          # not reach the dispatcher gate fails one, and this filter leaves 27
+          # not reach the dispatcher gate fails one, and this filter leaves 31
           # passing. The gate that needs the tree says `argmax` in its NAME,
           # which is what lets one substring cover all eleven.
           #
@@ -372,12 +373,18 @@ jobs:
           # the anti-vacuum `--list` count is taken through this same filter and
           # would simply fall with the run instead of reaching zero.
           #
-          # The three `extract_serde_bypassed_*` gates are not reachable from
-          # here and are not counted above: they are `#[cfg(feature = "serde")]`,
-          # so covering them means a `speaker,serde` group, and they FAIL today
-          # — `Options`' deserializer validates `step_samples`/`onset` itself,
-          # so the serde bypass their premise describes no longer exists.
-          # Gating a red test is not coverage; that is a test-side repair.
+          # The three `extract_serde_bypassed_*` gates this comment used to name
+          # are gone: they were `#[cfg(feature = "serde")]` and `#[ignore]`d, so
+          # neither this shard (no `serde`) nor the `features` job (no
+          # `--ignored`) ever ran them, and `Options`' `WindowOptionsRepr`
+          # deserializer had since started validating `step_samples`/`onset`
+          # itself — the serde-bypass premise they rested on no longer holds
+          # (see `extract/tests.rs`'s history for the record). Deleted rather
+          # than repaired to test the new failure: that coverage already exists,
+          # hermetically, in `window/tests.rs`'s `options_serde_rejects_*`, which
+          # now also runs named and alone via the `features` job's
+          # `speaker,serde` row (FEATURE_MAP.md), not just buried in the all-on
+          # rows.
           - kit: speaker
             cache: Models/speakerkit
             probe: Models/speakerkit/pyannote_segmentation.mlmodelc Models/speakerkit/wespeaker_v2.mlmodelc

@@ -149,11 +149,20 @@ fn dia_exact_multilabel(logits: &[f32], num_frames: usize) -> Vec<f64> {
 #[test]
 #[ignore = "requires local speakerkit models (SPEAKERKIT_TEST_MODELS) + committed goldens"]
 fn segmentation_parity_vs_dia_ort() {
+  let seg_path = common::seg_path();
+  if common::skipped_for_stale_overlay(
+    "segmentation_parity_vs_dia_ort",
+    &seg_path,
+    "pyannote_segmentation.mlmodelc",
+  ) {
+    return;
+  }
+
   // CpuOnly for run-to-run determinism (no ANE compile-latency variance) and
   // an apples-to-apples match with dia-ort's CPU EP — the same convention
   // `tests/model_io.rs` uses. Production dispatch is `ComputeUnits::All`.
   let model = SegmentModel::from_file_with(
-    common::seg_path(),
+    seg_path,
     SegmentModelOptions::new().with_compute(ComputeUnits::CpuOnly),
   )
   .expect("load pyannote_segmentation.mlmodelc");
