@@ -83,7 +83,7 @@ use crate::{
   ComputeUnits, DataType, Model, ModelDescription, MultiArray,
   embeddings::face::{
     align::{AlignedFace, TEMPLATE_SIZE},
-    artifact::{ArtifactDigest, digest_artifact},
+    artifact::{ArtifactDigest, digest_around},
     error::{
       BatchRow, ContractMismatch, EmbeddingSpaceField, Error, IncomparableEmbeddings,
       NonFiniteOutput, OutputElementCount, OutputShape, Result,
@@ -879,7 +879,7 @@ impl FaceEmbedder {
   /// and the module doc carries it along with the deliberate refusal of every
   /// legacy `neuralNetwork` export.
   ///
-  /// # The digest of the loaded bytes is taken here
+  /// # The digest of the loaded bytes BRACKETS the load
   ///
   /// [`Self::space`] — and therefore every [`FaceEmbedding`] this embedder
   /// produces — carries the [`ArtifactDigest`] of the directory this path
@@ -889,11 +889,22 @@ impl FaceEmbedder {
   /// on every worker and every machine, so the cross-worker comparisons
   /// `&self` inference exists to allow are unaffected.
   ///
-  /// It is taken AFTER the contract is reconciled, so a manifest that does not
-  /// match the artifact costs nothing to reject. The window between the load
-  /// and the hash is not closable by a sans-I/O crate — it does not hold the
-  /// file — and it is not the failure this exists to prevent, which is two
-  /// different bundles being compared as one.
+  /// **The digest is taken twice: before the artifact is opened and again
+  /// after the description has been read.** A load and a hash are two separate
+  /// walks of a path this crate does not own, and this doc used to record the
+  /// gap between them as unclosable and out of scope. It is neither. A bundle
+  /// replaced in that window was loaded as A and stamped as B, so every vector
+  /// carried an identity belonging to weights that never ran — which is
+  /// precisely the confusion the digest exists against, arriving through the
+  /// digest. `digest_around` brackets the whole read and refuses on a
+  /// mismatch with [`Error::ArtifactChangedDuringLoad`]; see that payload for
+  /// the A→B→A residual this does NOT close, and why a private snapshot was
+  /// declined.
+  ///
+  /// The old ordering — hash last, after the cheap rejections — is gone with
+  /// it, and the cost is stated rather than hidden: a manifest that does not
+  /// match the artifact now pays ONE walk of the bundle instead of none.
+  /// A read cannot be bracketed by a hash that starts after it.
   ///
   /// # Errors
   /// [`Error::Load`] if CoreML rejects the model; [`Error::ContractMismatch`]
@@ -904,18 +915,26 @@ impl FaceEmbedder {
   /// [`Error::UnsatisfiableInput`] if it requires an input this door never
   /// sends; [`Error::UnsatisfiableState`] if it declares a state buffer;
   /// [`Error::ArtifactDigest`] if the artifact's bytes cannot be read — which
-  /// fails the load rather than producing vectors with no identity.
+  /// fails the load rather than producing vectors with no identity;
+  /// [`Error::ArtifactChangedDuringLoad`] if the bundle does not hash the same
+  /// before and after the load, so which bytes CoreML read is not known.
   pub fn load(
     model_path: impl AsRef<Path>,
     manifest: FaceModel,
     options: FaceEmbedderOptions,
   ) -> Result<Self> {
     let model_path = model_path.as_ref();
-    let model = Model::load(model_path, options.compute())?;
-    let (contract, rank, output) = load_contract(model.description(), &manifest)?;
-    let model = Checked::new(model, &contract).map_err(contract_violation)?;
-    let input = InputContract::read_back(model.description(), manifest.input(), rank);
-    let space = EmbeddingSpace::of(digest_artifact(model_path)?, &manifest);
+    // Hash, read, hash again. Everything this function does with the path is
+    // inside the bracket, so a bundle replaced while it is in flight is
+    // refused rather than loaded as A and stamped as B.
+    let ((model, input, output), artifact) = digest_around(model_path, || {
+      let model = Model::load(model_path, options.compute())?;
+      let (contract, rank, output) = load_contract(model.description(), &manifest)?;
+      let model = Checked::new(model, &contract).map_err(contract_violation)?;
+      let input = InputContract::read_back(model.description(), manifest.input(), rank);
+      Ok((model, input, output))
+    })?;
+    let space = EmbeddingSpace::of(artifact, &manifest);
     Ok(Self {
       model,
       manifest,

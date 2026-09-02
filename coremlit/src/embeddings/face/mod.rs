@@ -46,7 +46,9 @@
 //!   [`embed`] module for the census table that makes this non-negotiable.
 //! - **The space is produced by `load`, and it knows which bytes it came
 //!   from.** [`FaceEmbedder::load`] hashes the artifact directory it loads
-//!   into an [`ArtifactDigest`], and every [`FaceEmbedding`] carries that
+//!   into an [`ArtifactDigest`] — twice, bracketing the read, so a bundle
+//!   replaced mid-load is refused rather than stamped with the wrong identity
+//!   — and every [`FaceEmbedding`] carries that
 //!   alongside the feature names, width and preprocessing. Two vectors compare
 //!   only if byte-identical weights produced them, read from the same output
 //!   feature — [`FaceEmbedding::dot`] cannot return a score across different

@@ -757,6 +757,75 @@ impl DigestFailure {
   }
 }
 
+/// One digest as lowercase hex, for an error message.
+///
+/// Cold path: two of these are formatted only when a load is being refused.
+fn hex(digest: crate::embeddings::face::ArtifactDigest) -> String {
+  digest
+    .as_bytes()
+    .iter()
+    .map(|byte| format!("{byte:02x}"))
+    .collect()
+}
+
+/// The artifact's bytes changed between the digest taken before the load and
+/// the one taken after, so which bytes CoreML actually read is not known.
+///
+/// **A digest and a load are two separate walks of a path the crate does not
+/// own.** This crate is sans-I/O about the artifact: it takes a path, and
+/// anything may replace what that path names while the load is in flight. A
+/// bundle swapped in that window used to be loaded as A and STAMPED as B, and
+/// every vector it produced then carried an identity belonging to weights that
+/// never ran — the exact confusion
+/// [`crate::embeddings::face::EmbeddingSpace`] exists to prevent, arriving
+/// through the mechanism meant to prevent it.
+/// [`crate::embeddings::face::FaceEmbedder::load`] therefore hashes, loads, and
+/// hashes again, and raises this rather than choosing one of the two answers.
+///
+/// # The residual, stated exactly
+///
+/// This detects any SINGLE replacement inside the window. It does not detect an
+/// **A→B→A** replacement completed inside one `load` — B's bytes are read and
+/// A's digest is stamped twice — and that is not closed. Closing it needs a
+/// private immutable snapshot of the bundle, which costs a full copy per load
+/// and adds a new failure surface (disk space, a second path, its own cleanup)
+/// for a race that requires two swaps inside roughly 150 ms with no adversary
+/// in the threat model: a caller who controls the filesystem can already load
+/// whatever bytes they choose, and the digest exists against *confusion*, not
+/// against them. The snapshot was considered and declined for that reason.
+///
+/// Payload of [`Error::ArtifactChangedDuringLoad`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ArtifactChangedDuringLoad {
+  /// The digest taken before the artifact was opened.
+  before: crate::embeddings::face::ArtifactDigest,
+  /// The digest taken after the load had read it.
+  after: crate::embeddings::face::ArtifactDigest,
+}
+
+impl ArtifactChangedDuringLoad {
+  /// Construct from the digests taken before and after the load.
+  #[inline(always)]
+  pub const fn new(
+    before: crate::embeddings::face::ArtifactDigest,
+    after: crate::embeddings::face::ArtifactDigest,
+  ) -> Self {
+    Self { before, after }
+  }
+
+  /// The digest taken before the artifact was opened.
+  #[inline(always)]
+  pub const fn before(&self) -> crate::embeddings::face::ArtifactDigest {
+    self.before
+  }
+
+  /// The digest taken after the load had read it.
+  #[inline(always)]
+  pub const fn after(&self) -> crate::embeddings::face::ArtifactDigest {
+    self.after
+  }
+}
+
 /// Everything [`crate::embeddings::face`] can fail with.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -818,6 +887,16 @@ pub enum Error {
   /// forwards both of through `#[error(transparent)]`.
   #[error(transparent)]
   ArtifactDigest(#[from] DigestFailure),
+  /// The artifact's bytes changed while it was being loaded, so the identity
+  /// to stamp on its vectors is not known.
+  #[error(
+    "the model artifact changed while it was being loaded: it hashed to {} before and {} after, \
+     so which bytes CoreML read is not known and no identity can be stamped on the vectors it \
+     would produce",
+    hex(.0.before()),
+    hex(.0.after())
+  )]
+  ArtifactChangedDuringLoad(ArtifactChangedDuringLoad),
   /// The loaded model does not match the manifest's declared contract.
   #[error("model contract mismatch on `{}`: expected {}, got {}", .0.feature(), .0.expected(), .0.actual())]
   ContractMismatch(ContractMismatch),

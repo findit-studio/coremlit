@@ -21,12 +21,23 @@
 //! It is also not caller-forgeable in the way that matters: the caller chooses
 //! which artifact to load, not what its digest is, and [`ArtifactDigest`] has
 //! no public constructor.
+//!
+//! # The hash BRACKETS the read
+//!
+//! Hashing a path and loading it are two walks of something this crate does not
+//! own. A bundle replaced between them was loaded as A and stamped as B, so its
+//! vectors carried the identity of weights that never ran — the confusion this
+//! module exists to prevent, reached through this module. The crate-internal
+//! `digest_around` is the sequence as one function: hash, read, hash again,
+//! refuse on a mismatch. Its own doc carries what that detects, and
+//! [`crate::embeddings::face::error::ArtifactChangedDuringLoad`] carries what
+//! it does not.
 
 use std::{fs, io::Read, os::unix::ffi::OsStrExt, path::Path};
 
 use sha2::{Digest, Sha256};
 
-use crate::embeddings::face::error::{DigestFailure, Error, Result};
+use crate::embeddings::face::error::{ArtifactChangedDuringLoad, DigestFailure, Error, Result};
 
 /// How deep [`digest_artifact`] will walk before refusing.
 ///
@@ -80,10 +91,15 @@ impl ArtifactDigest {
   ///
   /// That matters here specifically: `FaceEmbedder::load` needs a real
   /// artifact and this crate stages no face model, so **nothing runnable
-  /// drives that door** — replacing its `digest_artifact` call with a constant
-  /// fails no test. It fails the build instead. The general form of that gap
-  /// is issue #138 §4/§6 and the reason `Checked<Model>` exists; this is the
-  /// one field of it that a private constructor can close on its own.
+  /// drives that door** — replacing the digest it stamps with a constant fails
+  /// no test. It fails the build instead. The general form of that gap is
+  /// issue #138 §4/§6 and the reason `Checked<Model>` exists; this is the one
+  /// field of it that a private constructor can close on its own.
+  ///
+  /// What the door does with the digest — hashing on BOTH sides of the load —
+  /// is a separate question a private constructor cannot answer, and
+  /// [`digest_around`] is factored so that a test can drive it without an
+  /// artifact.
   #[cfg(test)]
   #[inline(always)]
   pub(crate) const fn from_raw(bytes: [u8; 32]) -> Self {
@@ -153,6 +169,48 @@ pub(crate) fn digest_artifact(root: &Path) -> Result<ArtifactDigest> {
     ));
   }
   Ok(fold_entries(entries))
+}
+
+/// Runs `read` bracketed by two digests of `root`, and refuses if they differ.
+///
+/// **The sequence exists as one function so the race is testable.** The defect
+/// this closes is that a load and a digest are two separate walks of a mutable
+/// path: `Model::load` reads bundle A, someone replaces it, `digest_artifact`
+/// hashes bundle B, and every vector the embedder produces is stamped with an
+/// identity belonging to weights that never ran. Hashing on both sides turns
+/// that into a refusal. A test can drive it by handing in a `read` that mutates
+/// `root` — which is the only way to make the window deterministic, since the
+/// real one is a real CoreML load.
+///
+/// The bracket is deliberately WIDER than `Model::load` alone: `read` also
+/// reconciles the manifest against the description, so anything that moves
+/// while `FaceEmbedder::load` is looking at the path is caught. That costs a
+/// wrong manifest one walk of the artifact, where before it cost none — the
+/// digest used to be taken last, after the cheap rejections. The trade is
+/// deliberate: the identity of the bytes has to bracket the read, and a read
+/// cannot happen before it starts.
+///
+/// Returns `read`'s value alongside the digest both walks agreed on. `read`'s
+/// own error passes through unchanged, so a contract mismatch stays a contract
+/// mismatch and the second digest is never even computed.
+///
+/// # Errors
+/// [`Error::ArtifactDigest`] if either walk fails;
+/// [`Error::ArtifactChangedDuringLoad`] if the two disagree — see that payload
+/// for the A→B→A residual this does NOT close; whatever `read` itself raises.
+pub(crate) fn digest_around<T>(
+  root: &Path,
+  read: impl FnOnce() -> Result<T>,
+) -> Result<(T, ArtifactDigest)> {
+  let before = digest_artifact(root)?;
+  let value = read()?;
+  let after = digest_artifact(root)?;
+  if before != after {
+    return Err(Error::ArtifactChangedDuringLoad(
+      ArtifactChangedDuringLoad::new(before, after),
+    ));
+  }
+  Ok((value, before))
 }
 
 /// Sorts the `(relative path, file digest)` entries and folds them into the

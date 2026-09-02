@@ -22,6 +22,87 @@ fn digest_of(root: &Path) -> ArtifactDigest {
 }
 
 #[test]
+fn a_bundle_replaced_while_it_is_being_read_is_refused() {
+  // The race, made deterministic. `FaceEmbedder::load` used to run
+  // `Model::load` and `digest_artifact` as two separate walks of a path this
+  // crate does not own: a bundle swapped between them was loaded as A and
+  // stamped as B, and every vector it produced then carried the identity of
+  // weights that never ran — the exact confusion `EmbeddingSpace` exists to
+  // prevent, arriving through the mechanism meant to prevent it.
+  //
+  // A real load cannot be raced hermetically, so the sequence is a function
+  // that takes the read as a closure, and this gate hands it a `read` that
+  // replaces the weights mid-flight. That is the whole reason `digest_around`
+  // is shaped this way.
+  let temp = tempfile::tempdir().expect("tempdir");
+  let root = temp.path().join("swapped.mlmodelc");
+  stage(&root);
+  let before = digest_of(&root);
+
+  let error = digest_around(&root, || {
+    fs::write(root.join("weights/weight.bin"), b"fedcba9876543210").expect("swap the weights");
+    Ok(())
+  })
+  .expect_err("a bundle that moved under the load has no identity to stamp");
+
+  let after = digest_of(&root);
+  assert_ne!(before, after, "the swap must actually change the digest");
+  assert!(
+    matches!(&error, Error::ArtifactChangedDuringLoad(payload)
+      if payload.before() == before && payload.after() == after),
+    "expected ArtifactChangedDuringLoad({before:?}, {after:?}), got {error:?}"
+  );
+  // Both digests are in the message, because "it changed" without saying to
+  // what leaves a reader with nothing to compare against their own bundle.
+  let message = error.to_string();
+  for digest in [before, after] {
+    let rendered: String = digest
+      .as_bytes()
+      .iter()
+      .map(|byte| format!("{byte:02x}"))
+      .collect();
+    assert!(
+      message.contains(&rendered),
+      "the message must name {rendered}, got {message:?}"
+    );
+  }
+}
+
+#[test]
+fn a_bundle_that_does_not_move_hashes_to_what_digest_artifact_says() {
+  // The other half, and the one that keeps the refusal from being a load that
+  // never succeeds: a read that leaves the path alone returns its own value
+  // and the digest both walks agreed on — the same digest `digest_artifact`
+  // gives on its own, so bracketing the read did not invent a second identity.
+  let temp = tempfile::tempdir().expect("tempdir");
+  let root = temp.path().join("still.mlmodelc");
+  stage(&root);
+  let (value, digest) =
+    digest_around(&root, || Ok(7usize)).expect("a bundle that does not move loads");
+  assert_eq!(value, 7, "the read's own value passes through");
+  assert_eq!(digest, digest_of(&root), "and its digest is the artifact's");
+}
+
+#[test]
+fn a_failing_read_keeps_its_own_error() {
+  // The bracket must not reclassify what it wraps. A manifest that does not
+  // match the artifact is a contract mismatch, not a digest failure, and the
+  // second walk is not even paid for it — which is what makes the added
+  // first walk the only cost of bracketing.
+  let temp = tempfile::tempdir().expect("tempdir");
+  let root = temp.path().join("mismatched.mlmodelc");
+  stage(&root);
+  let error = digest_around(&root, || {
+    Err::<(), _>(Error::UnsatisfiableInput("extra".to_string()))
+  })
+  .expect_err("the read's failure is the load's failure");
+  assert!(
+    matches!(&error, Error::UnsatisfiableInput(name) if name == "extra"),
+    "expected the read's own error, got {error:?}"
+  );
+}
+
+#[test]
 fn a_byte_identical_copy_of_a_bundle_has_the_same_digest() {
   // The property the whole design rests on: identity is of the BYTES, not of
   // the load. `&self` inference means fan-out is one embedder per worker over
