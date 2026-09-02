@@ -1986,7 +1986,7 @@ fn normalise_spelling(text: &str) -> String {
 // | `fp16_pinned_bundles` | `tests/fp16_guards.rs` rosters | `proc-macro2` tokens, anchored on the `path` field | a missed entry would silently shrink direction 1's second enumeration, so it is read structurally |
 // | `parse_lock` | `MODELS_LOCK` | hand-rolled, mirroring ci.yml's sed/awk | panics on anything that is not a header, a comment or `key = "value"`; `staged_tables` panics again on a table missing `local-dir` or its selector |
 // | `pins_at` | a `const`/`fn` holding SHA-256s | hand-rolled over quoted runs | panics on an ambiguous anchor or an empty result, and `every_rows_sha256_matches_the_pin_it_names` panics on a key the pin does not hold |
-// | `feature_docs` | `[features]` COMMENTS | hand-rolled, line-wise | a key it cannot see arrives with NO documentation and is reported undocumented — red, never green. Comments are the one thing a TOML parser drops, so this has no alternative |
+// | `feature_docs` | `[features]` COMMENTS | hand-rolled, line-wise | a key it cannot see arrives with NO documentation and is reported undocumented — red. "Never green" was this table's claim and it was wrong by one cell: the `#` was stripped BEFORE the indentation was checked, and a whitespace-led non-comment line did not clear the pending block, so a comment indented inside a multi-line array documented the NEXT key and the doc rule went green on it. An indented line now ends the block before anything else (`a_comment_inside_a_multi_line_array_documents_nothing`). Comments are the one thing a TOML parser drops, so this has no alternative |
 // | `first_sentence`, `negation_in`, `normalise_spelling` | a doc comment's PROSE | word- and sentence-level | prose is text; these infer no structure |
 //
 // The rule the table encodes: a reader may be hand-rolled only where every
@@ -2206,7 +2206,13 @@ fn feature_closure(manifest: &str, seed: &str) -> BTreeSet<String> {
 /// it was NOT safe in the reachability readers, because the set of features
 /// this rule must find documentation FOR comes from [`declared_features`]. A
 /// feature spelled in a way this scanner cannot see therefore arrives with no
-/// documentation and is reported as undocumented — red, never green.
+/// documentation and is reported as undocumented — red.
+///
+/// Conservative about which keys it recognises is not the same as conservative
+/// about which COMMENTS it attaches, and that is where it was once fail-open:
+/// an indented comment inside a multi-line array used to attach to the next
+/// key, which could document a feature nobody wrote a word about into green.
+/// So an indented line ends the pending block, and that test comes first.
 fn feature_docs(manifest: &str) -> BTreeMap<String, String> {
   let block = features_block_of(manifest);
   let mut docs = BTreeMap::new();
@@ -2217,11 +2223,18 @@ fn feature_docs(manifest: &str) -> BTreeMap<String, String> {
       pending.clear();
       continue;
     }
-    if let Some(comment) = trimmed.strip_prefix('#') {
-      pending.push(comment.trim());
+    // An INDENTED line is inside a multi-line value, not at the top level of
+    // the table, and this reader documents a key from the contiguous block
+    // ABOVE it. So an indented line — comment or not — ends the pending block
+    // rather than extending it. Checking this BEFORE the `#` is what stops a
+    // comment inside `a = [ .. ]` from becoming the documentation of whatever
+    // key follows the array's closing bracket.
+    if line.starts_with(char::is_whitespace) {
+      pending.clear();
       continue;
     }
-    if line.starts_with(char::is_whitespace) {
+    if let Some(comment) = trimmed.strip_prefix('#') {
+      pending.push(comment.trim());
       continue;
     }
     if let Some((key, _)) = line.split_once('=') {
@@ -5090,6 +5103,41 @@ lid = [\"dep:rustfft\"]
     assert_eq!(
       feature_closure(DOCTORED_FEATURES, "commercial-face"),
       features(&["commercial-face", "speaker"])
+    );
+  }
+
+  /// **The one fail-open cell in the reader roster.** `feature_docs` strips
+  /// the `#` BEFORE it checks whether the line was indented, and a
+  /// whitespace-led non-comment line did not clear `pending`. So an indented
+  /// comment inside a multi-line array attached itself to the NEXT key: this
+  /// manifest gave `commercial-b` the sentence "Requires a commercial licence."
+  /// and the doc rule went green on a feature nobody documented.
+  ///
+  /// The roster claims this reader is "red, never green". That claim was wrong
+  /// by exactly one cell, and this is the cell.
+  const INDENTED_COMMENT_FEATURES: &str = "\
+[features]
+commercial-a = [
+  # Requires a commercial licence.
+  \"dep:x\"]
+commercial-b = []
+";
+
+  #[test]
+  fn a_comment_inside_a_multi_line_array_documents_nothing() {
+    let docs = feature_docs(INDENTED_COMMENT_FEATURES);
+    assert_eq!(
+      docs.get("commercial-b").map(String::as_str),
+      Some(""),
+      "an indented comment inside `commercial-a`'s array must not become \
+       `commercial-b`'s documentation: a feature nobody documented would pass \
+       the doc rule on a sentence written about another one"
+    );
+    assert_eq!(
+      docs.get("commercial-a").map(String::as_str),
+      Some(""),
+      "nor its own: the comment sits BELOW the key it is indented under, and \
+       this reader documents a key from the block ABOVE it"
     );
   }
 
