@@ -353,6 +353,115 @@ fn a_manifest_whose_preprocessing_is_not_finite_is_refused_at_load() {
 }
 
 #[test]
+fn a_preprocessing_map_that_leaves_f32_at_a_byte_endpoint_is_refused_at_load() {
+  // The gate above refuses each FIELD that is not finite. That was an
+  // enumeration of what can go wrong, and it missed the thing the fields are
+  // for: `scale = f32::MAX` with `bias = 0` is two perfectly finite numbers
+  // whose MAP writes `+inf` for every byte from 2 upwards. So the tensor was
+  // non-finite from a manifest the load had blessed, and every claim resting
+  // on "no stamped space carries a NaN" rested on the wrong check.
+  //
+  // The map `byte ↦ byte · scale + bias` is AFFINE in `byte`, so its extremes
+  // over `0..=255` are at the two endpoints and rounding is monotone — the two
+  // endpoints being finite is therefore a PROOF that all 256 are, not a sample
+  // of them. `load` evaluates the exact `mul_add` expression `write_row` uses,
+  // at byte 0 and byte 255, for every channel's bias.
+  let arcface = Preprocessing::ARCFACE;
+  let graph = graph(&[1, 3, TEMPLATE_SIZE, TEMPLATE_SIZE], &[1, DIM]);
+
+  // The witness: finite fields, infinite tensor.
+  assert!(
+    f32::MAX.is_finite() && 0.0f32.is_finite(),
+    "both fields are finite, which is why the per-field check admits this"
+  );
+  assert!(
+    !f32::from(255u8).mul_add(f32::MAX, 0.0).is_finite(),
+    "and the map at the far endpoint is not"
+  );
+  let overflowing = model(DIM).with_preprocessing(Preprocessing::new(
+    arcface.order(),
+    arcface.layout(),
+    f32::MAX,
+    [0.0; 3],
+  ));
+  let error =
+    check(&graph, &overflowing).expect_err("a manifest whose map leaves `f32` is not loadable");
+  assert!(
+    matches!(
+      &error,
+      Error::NonFinitePreprocessing(payload)
+        if payload.field() == PreprocessingField::Map(PreprocessingMap::new(0, u8::MAX))
+    ),
+    "expected the endpoint that overflows to be named, got {error:?}"
+  );
+  assert!(
+    error.to_string().contains("byte 255"),
+    "and a reader must be told WHICH end, got {error}"
+  );
+
+  // Per CHANNEL, not per manifest: a bias that only overflows on one channel
+  // is named on that channel. `2^127` is finite; `2^127 · 255` is not, so the
+  // scale alone already overflows — use a scale that is fine on its own and a
+  // bias that pushes one channel over.
+  let scale = f32::MAX / 256.0;
+  assert!(
+    f32::from(255u8).mul_add(scale, 0.0).is_finite(),
+    "this scale is safe over the whole byte range on its own"
+  );
+  let lopsided = model(DIM).with_preprocessing(Preprocessing::new(
+    arcface.order(),
+    arcface.layout(),
+    scale,
+    [0.0, 0.0, f32::MAX],
+  ));
+  let error =
+    check(&graph, &lopsided).expect_err("one channel's bias carries that channel out of `f32`");
+  assert!(
+    matches!(
+      &error,
+      Error::NonFinitePreprocessing(payload)
+        if payload.field() == PreprocessingField::Map(PreprocessingMap::new(2, u8::MAX))
+    ),
+    "expected channel 2 to be named, got {error:?}"
+  );
+
+  // The mutation this pins is "check only byte 0": the witness above overflows
+  // at 255 and nowhere near 0. The OTHER half of the proof cannot be pinned
+  // the same way and the reason is arithmetic rather than a missing gate —
+  // `byte 0 · scale + bias` is exactly `bias` for any finite `scale`, so once
+  // the two field checks have passed, the byte-0 endpoint cannot be the one
+  // that fires. It is evaluated because the PAIR is what proves the 254 bytes
+  // between them, not because either end alone is suspected.
+  for (scale, bias) in [(f32::MAX, 0.0f32), (scale, f32::MAX)] {
+    assert_eq!(
+      f32::from(0u8).mul_add(scale, bias),
+      bias,
+      "the near endpoint is the bias itself, which the field check has already cleared"
+    );
+  }
+
+  // And the boundary is exact: the largest scale whose map stays finite loads.
+  let largest = f32::MAX / f32::from(255u8);
+  assert!(
+    f32::from(255u8).mul_add(largest, 0.0).is_finite(),
+    "the map at the far endpoint is finite here"
+  );
+  assert!(
+    check(
+      &graph,
+      &model(DIM).with_preprocessing(Preprocessing::new(
+        arcface.order(),
+        arcface.layout(),
+        largest,
+        [0.0; 3],
+      ))
+    )
+    .is_ok(),
+    "an extreme but finite map must still load — the check is on the map, not on the magnitude"
+  );
+}
+
+#[test]
 fn nhwc_interleaves_where_nchw_planes() {
   let face = ramp_face();
   let pixels = TEMPLATE_SIZE * TEMPLATE_SIZE;

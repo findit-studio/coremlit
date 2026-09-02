@@ -772,7 +772,13 @@ impl DigestFailure {
   }
 }
 
-/// Which field of a [`crate::embeddings::face::Preprocessing`] is not finite.
+/// What about a [`crate::embeddings::face::Preprocessing`] does not stay in
+/// `f32` — a field, or the MAP the two fields make.
+///
+/// The third variant is the one that is not a field, and it exists because the
+/// first two were an enumeration of what can go wrong that missed the thing
+/// the fields are for: `scale = f32::MAX` with `bias = 0` is two perfectly
+/// finite numbers whose map writes `+inf` for every byte from 2 upwards.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display)]
 pub enum PreprocessingField {
   /// [`crate::embeddings::face::Preprocessing::scale`], the per-byte
@@ -784,9 +790,59 @@ pub enum PreprocessingField {
   /// blue offset.
   #[display("bias[{_0}]")]
   Bias(usize),
+  /// Both fields are finite and the MAP they make is not — see
+  /// [`PreprocessingMap`] for the channel and the endpoint it names.
+  #[display("{_0}")]
+  Map(PreprocessingMap),
 }
 
-/// A manifest's preprocessing carries a NaN or infinite `scale` or `bias`.
+/// Where a [`crate::embeddings::face::Preprocessing`]'s map leaves `f32`: the
+/// end of the byte range, and the channel whose bias carries it there.
+///
+/// `byte ↦ byte · scale + bias[channel]` is affine in `byte`, so its extremes
+/// over `0..=255` are at the two endpoints — which is why naming one of them
+/// names the whole failure rather than one sampled byte. Only the far endpoint
+/// can be named in practice: `byte 0 · scale + bias` is exactly `bias` for any
+/// finite `scale`, so once the two field checks have passed the near endpoint
+/// is finite by construction, and it is evaluated because the PAIR is what
+/// proves the 254 bytes between them.
+///
+/// Payload of [`PreprocessingField::Map`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display)]
+#[display("byte {byte} · scale + bias[{channel}]")]
+pub struct PreprocessingMap {
+  /// The channel whose bias carries the map out of `f32`, in the MODEL's own
+  /// channel order — as [`PreprocessingField::Bias`]'s index is, so a BGR
+  /// manifest's channel `0` is its blue one.
+  channel: usize,
+  /// The endpoint of the byte range at which it does: `0` or `255`.
+  byte: u8,
+}
+
+impl PreprocessingMap {
+  /// Construct from the channel and the byte-range endpoint.
+  #[inline(always)]
+  pub const fn new(channel: usize, byte: u8) -> Self {
+    Self { channel, byte }
+  }
+
+  /// The channel whose bias carries the map out of `f32`, in the MODEL's own
+  /// channel order.
+  #[inline(always)]
+  pub const fn channel(&self) -> usize {
+    self.channel
+  }
+
+  /// The endpoint of the byte range at which the map leaves `f32`.
+  #[inline(always)]
+  pub const fn byte(&self) -> u8 {
+    self.byte
+  }
+}
+
+/// A manifest's preprocessing does not stay in `f32`: a NaN or infinite
+/// `scale` or `bias`, or an affine map that leaves `f32` at an end of the byte
+/// range.
 ///
 /// **Refused at load, which is what keeps a NaN out of a stamped
 /// [`crate::embeddings::face::EmbeddingSpace`].** `value = byte · scale +
@@ -795,6 +851,14 @@ pub enum PreprocessingField {
 /// [`Error::NonFiniteOutput`]; and the manifest is copied verbatim into the
 /// space every vector carries, where a NaN would then have to be given an
 /// equality of its own to stay comparable with itself.
+///
+/// **The two fields being finite is not the same claim, and the load used to
+/// make only that one.** `scale = f32::MAX` and `bias = 0` are both finite and
+/// write `+inf` for every byte from 2 upwards. The map is AFFINE in `byte`, so
+/// its extremes over `0..=255` sit at the endpoints; the load evaluates the
+/// exact expression the writer uses at byte `0` and byte `255` for each
+/// channel, which proves the 254 bytes between them rather than sampling them.
+/// [`PreprocessingField::Map`] is what that refusal names.
 ///
 /// [`crate::embeddings::face::Preprocessing`] is public and its constructors
 /// are `const`, so such a value can be BUILT — that is why
@@ -962,9 +1026,10 @@ pub enum Error {
     hex(.0.after())
   )]
   ArtifactChangedDuringLoad(ArtifactChangedDuringLoad),
-  /// The manifest's preprocessing carries a NaN or infinite scale or bias.
+  /// The manifest's preprocessing does not stay in `f32`: a NaN or infinite
+  /// scale or bias, or a map that leaves `f32` at an end of the byte range.
   #[error(
-    "the manifest's preprocessing `{}` is NaN or infinite; every value it writes into the input \
+    "the manifest's preprocessing `{}` does not stay in `f32`; values it writes into the input \
      tensor would be non-finite, and the space stamped on the embeddings would carry it",
     .0.field()
   )]

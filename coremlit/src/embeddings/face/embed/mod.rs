@@ -87,7 +87,7 @@ use crate::{
     error::{
       BatchRow, ContractMismatch, EmbeddingSpaceField, Error, IncomparableEmbeddings,
       NonFiniteOutput, NonFinitePreprocessing, OutputElementCount, OutputShape, PreprocessingField,
-      Result,
+      PreprocessingMap, Result,
     },
   },
   model::contract::{
@@ -138,9 +138,10 @@ pub enum TensorLayout {
 ///   lawfulness and nothing else. The type is public and both its constructors
 ///   are `const`, so a NaN `Preprocessing` can be built, and without the fold
 ///   it would not equal itself. It does not serve a broken manifest reaching a
-///   comparison: [`FaceEmbedder::load`] refuses a non-finite scale or bias
-///   ([`Error::NonFinitePreprocessing`]), so no stamped [`EmbeddingSpace`]
-///   carries a NaN.
+///   comparison: [`FaceEmbedder::load`] refuses a preprocessing whose map does
+///   not stay in `f32` ([`Error::NonFinitePreprocessing`]) — the two fields
+///   AND the map they make, at both ends of the byte range — so no stamped
+///   [`EmbeddingSpace`] carries a NaN.
 ///
 /// Both foldings are reflexive, symmetric and transitive, which is what lets
 /// [`Preprocessing`] and [`EmbeddingSpace`] be [`Eq`] at all — `f32`'s own
@@ -633,9 +634,11 @@ impl FaceEmbedderOptions {
 ///   vectors are all wrong the same way, so they still compare with each other
 ///   — and it is unclosable here, because the artifact declares no
 ///   normalisation for this crate to check the claim against. The one part of
-///   the claim that does not need the artifact IS checked: a non-finite scale
-///   or bias is refused at load ([`Error::NonFinitePreprocessing`]), so no
-///   stamped space carries a NaN;
+///   the claim that does not need the artifact IS checked: a preprocessing
+///   whose map `byte ↦ byte · scale + bias` leaves `f32` is refused at load
+///   ([`Error::NonFinitePreprocessing`]), evaluated at both ends of the byte
+///   range rather than on the two fields alone, so no stamped space carries a
+///   NaN;
 /// - **[`AlignedFace::from_template_pixels`] keeps its documented hole on the
 ///   pixel side.** Bring-your-own-alignment cannot be checked: pixels aligned
 ///   to some other template, or not aligned at all, pass that constructor and
@@ -919,7 +922,11 @@ impl FaceEmbedder {
   /// A read cannot be bracketed by a hash that starts after it.
   ///
   /// # Errors
-  /// [`Error::Load`] if CoreML rejects the model; [`Error::ContractMismatch`]
+  /// [`Error::NonFinitePreprocessing`] if the manifest's map
+  /// `byte ↦ byte · scale + bias` does not stay in `f32` — either field, or
+  /// the map itself at an end of the byte range, which two finite fields can
+  /// still fail; [`Error::Load`] if CoreML rejects the model;
+  /// [`Error::ContractMismatch`]
   /// if the model declares no feature by the manifest's name, if the declared
   /// rank of either feature is one no contract of this door's can be built
   /// from (an undeclared shape included), or if a named feature's element
@@ -1185,12 +1192,14 @@ fn load_contract(
   description: &ModelDescription,
   manifest: &FaceModel,
 ) -> Result<(LoadContract, InputRank, OutputContract)> {
-  // Before anything about the graph: a manifest whose scale or bias is not
-  // finite makes every element of the input tensor non-finite, and it is
+  // Before anything about the graph: a manifest whose MAP does not stay in
+  // `f32` makes elements of the input tensor non-finite, and the manifest is
   // copied verbatim into the `EmbeddingSpace` stamped on the vectors. Refusing
   // it here is what keeps a NaN out of a produced space, and therefore what
   // makes `canonical_bits`' NaN fold a statement about `Preprocessing`'s own
-  // `Eq` and nothing more.
+  // `Eq` and nothing more. The check is on the map at both ends of the byte
+  // range, not on the two fields alone — `f32::MAX` and `0.0` are both finite
+  // and their map is not.
   if let Some(field) = non_finite_preprocessing(manifest.preprocessing()) {
     return Err(Error::NonFinitePreprocessing(NonFinitePreprocessing::new(
       field,
@@ -1249,20 +1258,66 @@ fn load_contract(
   Ok((contract, rank, form))
 }
 
-/// The first non-finite field of `preprocessing`, `scale` before `bias`.
+/// The first thing about `preprocessing` that does not stay in `f32` — the
+/// MAP, evaluated at both ends of the byte range, attributed to a field where
+/// a field is what is wrong.
 ///
-/// The FIRST, not all of them: one field that is definitely wrong is more
-/// actionable than a list assembled to look thorough, and the same rule
-/// [`space_difference`] follows.
+/// # The map, not the fields — and the endpoints are a PROOF
+///
+/// Checking `scale` and `bias` for finiteness one at a time was an enumeration
+/// of what can go wrong that missed the thing the fields are for:
+/// `scale = f32::MAX` with `bias = 0` is two perfectly finite numbers whose
+/// map writes `+inf` for every byte from 2 upwards, so the input tensor was
+/// non-finite from a manifest the load had blessed.
+///
+/// `byte ↦ byte · scale + bias[channel]` is **affine in `byte`**. The exact
+/// value at any byte therefore lies between the exact values at `0` and `255`,
+/// and rounding to nearest is monotone — so if both endpoints round to finite
+/// `f32`, every byte between them does. That is a proof over the whole domain,
+/// not a sample of it, which is why two evaluations per channel are enough and
+/// why no third byte needs a rule of its own. NaN cannot arise at all once
+/// `scale` and `bias` are finite.
+///
+/// The expression evaluated here is [`write_row`]'s own `mul_add`, so what is
+/// proved is what will be written rather than a differently associated
+/// stand-in for it.
+///
+/// # Which end fires, and which end cannot
+///
+/// Only the far one, and the reason is arithmetic rather than a gap in the
+/// gate: `byte 0 · scale + bias` is exactly `bias` for any finite `scale`, so
+/// once the field checks have passed, the byte-0 endpoint is finite by
+/// construction. It is evaluated because the PAIR is what proves the 254 bytes
+/// between them, and the gate says so where it pins the mutation that drops
+/// the far one.
+///
+/// # The FIRST, not all of them
+///
+/// One thing that is definitely wrong is more actionable than a list assembled
+/// to look thorough, and the same rule [`space_difference`] follows. The
+/// failure is attributed to the most specific thing about it: a non-finite
+/// `scale` is [`PreprocessingField::Scale`], a non-finite `bias` is
+/// [`PreprocessingField::Bias`], and a map that leaves `f32` out of two finite
+/// fields is [`PreprocessingField::Map`] naming the channel and the endpoint.
 fn non_finite_preprocessing(preprocessing: Preprocessing) -> Option<PreprocessingField> {
-  if !preprocessing.scale().is_finite() {
-    return Some(PreprocessingField::Scale);
+  let scale = preprocessing.scale();
+  for (channel, offset) in preprocessing.bias().iter().enumerate() {
+    for byte in [u8::MIN, u8::MAX] {
+      if f32::from(byte).mul_add(scale, *offset).is_finite() {
+        continue;
+      }
+      if !scale.is_finite() {
+        return Some(PreprocessingField::Scale);
+      }
+      if !offset.is_finite() {
+        return Some(PreprocessingField::Bias(channel));
+      }
+      return Some(PreprocessingField::Map(PreprocessingMap::new(
+        channel, byte,
+      )));
+    }
   }
-  preprocessing
-    .bias()
-    .iter()
-    .position(|value| !value.is_finite())
-    .map(PreprocessingField::Bias)
+  None
 }
 
 /// Map a [`ContractViolation`] into this module's error vocabulary.
@@ -1461,6 +1516,13 @@ fn check_predicted_shape(
 /// as `+∞` against `−∞`), so one space could produce two tensors. It is
 /// canonicalised here, at the producer, rather than compared away downstream:
 /// see `a_written_zero_is_positive_zero_whichever_sign_the_bias_carries`.
+///
+/// **Every value written is finite, and that is the LOAD's guarantee rather
+/// than this function's.** `non_finite_preprocessing` evaluates the `mul_add`
+/// below at byte `0` and byte `255` for each channel, and the map is affine in
+/// `byte`, so the two endpoints being finite proves all 256 are. A check here
+/// would add nothing the load has not already established, and one per pixel
+/// would pay 37 632 branches to re-derive it.
 fn write_row(row: &mut [f32], face: &AlignedFace, preprocessing: Preprocessing) {
   let pixels = TEMPLATE_SIZE * TEMPLATE_SIZE;
   let source = face.pixels();
