@@ -114,11 +114,11 @@ fn check(
   description: &ModelDescription,
   manifest: &FaceModel,
 ) -> Result<(InputContract, OutputContract)> {
-  let (contract, rank, output) = load_contract(description, manifest)?;
-  check_load_contract(description, &contract).map_err(contract_violation)?;
+  let resolved = load_contract(description, manifest)?;
+  check_load_contract(description, &resolved.contract).map_err(contract_violation)?;
   Ok((
-    InputContract::read_back(description, manifest.input(), rank),
-    output,
+    InputContract::read_back(description, manifest.input(), resolved.rank),
+    resolved.output,
   ))
 }
 
@@ -580,14 +580,17 @@ fn the_contract_reads_the_batch_and_requires_everything_else() {
   // Rank-4 NCHW, batch 4: the batch axis is READ (`AnyFixed`), the face axes
   // are REQUIRED, and the output's row count is the input's batch stated as a
   // number rather than read a second time.
-  let (contract, rank, form) = load_contract(
+  let resolved = load_contract(
     &graph(&[4, 3, TEMPLATE_SIZE, TEMPLATE_SIZE], &[4, DIM]),
     &manifest(TensorLayout::Nchw),
   )
   .expect("a batch-4 NCHW export is one of the accepted forms");
-  assert_eq!((rank, form), (InputRank::Batched, OutputContract::Batched));
   assert_eq!(
-    contract,
+    (resolved.rank, resolved.output),
+    (InputRank::Batched, OutputContract::Batched)
+  );
+  assert_eq!(
+    resolved.contract,
     LoadContract::new(
       vec![FeatureContract::new(
         "data",
@@ -604,14 +607,17 @@ fn the_contract_reads_the_batch_and_requires_everything_else() {
   );
 
   // Rank-4 NHWC: the same shape of statement, with the channel axis last.
-  let (contract, rank, form) = load_contract(
+  let resolved = load_contract(
     &graph(&[2, TEMPLATE_SIZE, TEMPLATE_SIZE, 3], &[2, DIM]),
     &manifest(TensorLayout::Nhwc),
   )
   .expect("a batch-2 NHWC export is one of the accepted forms");
-  assert_eq!((rank, form), (InputRank::Batched, OutputContract::Batched));
   assert_eq!(
-    contract,
+    (resolved.rank, resolved.output),
+    (InputRank::Batched, OutputContract::Batched)
+  );
+  assert_eq!(
+    resolved.contract,
     LoadContract::new(
       vec![FeatureContract::new(
         "data",
@@ -629,14 +635,17 @@ fn the_contract_reads_the_batch_and_requires_everything_else() {
 
   // Rank-3, with the bare `[dim]` output only a batch-one graph can declare:
   // there is no batch axis to read, so the contract has no `AnyFixed` at all.
-  let (contract, rank, form) = load_contract(
+  let resolved = load_contract(
     &graph(&[3, TEMPLATE_SIZE, TEMPLATE_SIZE], &[DIM]),
     &manifest(TensorLayout::Nchw),
   )
   .expect("the unbatched rank-3 form is one of the accepted forms");
-  assert_eq!((rank, form), (InputRank::Unbatched, OutputContract::Flat));
   assert_eq!(
-    contract,
+    (resolved.rank, resolved.output),
+    (InputRank::Unbatched, OutputContract::Flat)
+  );
+  assert_eq!(
+    resolved.contract,
     LoadContract::new(
       vec![FeatureContract::new(
         "data",
@@ -1337,7 +1346,7 @@ fn a_transposed_output_tensor_is_refused() {
   // components between faces and returning embeddings that are plausible,
   // unit-norm and wrong. No shape check, no finiteness check and no cosine can
   // see it afterwards.
-  let error = check_predicted_shape(&[512, 4], 4 * 512, OutputContract::Batched, 4, 512)
+  let error = check_predicted_shape(&[512, 4], 4 * 512, OutputContract::Batched, 4, 512, 4 * 512)
     .expect_err("a [dim, batch] tensor is not a [batch, dim] tensor");
   assert!(
     matches!(&error, Error::OutputShape(payload) if payload.got() == [512, 4]),
@@ -1346,14 +1355,16 @@ fn a_transposed_output_tensor_is_refused() {
 
   // The contract's own shape still passes, and so does the batch-one `[dim]`
   // form — but ONLY for a batch-one contract.
-  assert!(check_predicted_shape(&[4, 512], 4 * 512, OutputContract::Batched, 4, 512).is_ok());
-  assert!(check_predicted_shape(&[512], 512, OutputContract::Flat, 1, 512).is_ok());
+  assert!(
+    check_predicted_shape(&[4, 512], 4 * 512, OutputContract::Batched, 4, 512, 4 * 512).is_ok()
+  );
+  assert!(check_predicted_shape(&[512], 512, OutputContract::Flat, 1, 512, 512).is_ok());
 
   // And a declared form is binding: a graph that promised [batch, dim] does
   // not get to emit [dim] instead. There is no third arm softening that any
   // more — the `Undeclared` form these lines used to cover is refused at load,
   // so a predicted tensor is always measured against a shape the graph named.
-  assert!(check_predicted_shape(&[512], 512, OutputContract::Batched, 1, 512).is_err());
+  assert!(check_predicted_shape(&[512], 512, OutputContract::Batched, 1, 512, 512).is_err());
 }
 
 #[test]
@@ -1364,8 +1375,15 @@ fn a_diverging_element_count_is_not_reported_as_a_shape_mismatch() {
   // COUNT does, the shape matched: the old payload put the same vector in
   // both fields and rendered "expected [4, 512], got [4, 512]", a shape
   // mismatch that did not happen.
-  let error = check_predicted_shape(&[4, 512], 4 * 512 - 1, OutputContract::Batched, 4, 512)
-    .expect_err("an element count short of the contract is a divergence");
+  let error = check_predicted_shape(
+    &[4, 512],
+    4 * 512 - 1,
+    OutputContract::Batched,
+    4,
+    512,
+    4 * 512,
+  )
+  .expect_err("an element count short of the contract is a divergence");
   let message = error.to_string();
   assert!(
     !message.contains("expected [4, 512], got [4, 512]"),
@@ -1387,7 +1405,7 @@ fn a_diverging_element_count_is_not_reported_as_a_shape_mismatch() {
   // did not swallow the one that matters.
   assert!(
     matches!(
-      check_predicted_shape(&[512, 4], 4 * 512, OutputContract::Batched, 4, 512),
+      check_predicted_shape(&[512, 4], 4 * 512, OutputContract::Batched, 4, 512, 4 * 512),
       Err(Error::OutputShape(_))
     ),
     "a transposed tensor is still a shape mismatch"
@@ -1490,6 +1508,129 @@ fn the_load_time_contract_requires_an_f32_multi_array() {
 
   // The all-f32 description still loads.
   assert!(check(&graph(&shape, &[4, DIM]), &nchw).is_ok());
+}
+
+// ── The element counts the artifact's batch decides ────────────────────
+
+/// **FALSIFIER (red first).** The batch is the ARTIFACT's — `Dim::AnyFixed`
+/// reads back whatever the graph pins — and this description used to load
+/// clean: every clause of the contract passes, because a `usize::MAX / 1000`
+/// axis is a perfectly well-formed pinned dimension.
+///
+/// What followed was not an error. `build_input` computed
+/// `batch · 3 · 112 · 112`, which for this batch is `6.9e20` against a `usize`
+/// ceiling of `1.8e19`; in a release build the product wraps to
+/// `11_658_342_254_584_413_440`, `vec![0.0f32; …]` then aborts on that, and for
+/// a batch chosen to wrap SMALL the allocation succeeds and the first
+/// `row * FACE_ELEMENTS ..` slice panics out of the too-short buffer. Either
+/// way a model this door ACCEPTED terminates the caller.
+///
+/// The assertion is the REFUSAL rather than the arithmetic, which is what makes
+/// it independent of `-C overflow-checks`: replace `checked_mul` with `*` and a
+/// debug build panics inside the multiply while a release build returns `Ok` —
+/// both red here, for the same reason, without the gate knowing which profile
+/// it is in.
+#[test]
+fn a_batch_whose_tensor_element_count_leaves_usize_is_refused_at_load() {
+  // The INPUT's count is the artifact's alone: `batch · 112 · 112 · 3`.
+  let batch = usize::MAX / 1000;
+  assert!(
+    batch.checked_mul(DIM).is_some(),
+    "this batch must overflow the INPUT count only, or the case below is the \
+     one being tested twice"
+  );
+  let description = graph(&[batch, 3, TEMPLATE_SIZE, TEMPLATE_SIZE], &[batch, DIM]);
+  let error = check(&description, &model(DIM))
+    .expect_err("a batch whose input tensor cannot be counted must not load");
+  assert!(
+    matches!(
+      &error,
+      Error::ElementCountOverflow(o)
+        if o.tensor() == PredictionTensor::Input
+          && o.batch() == batch
+          && o.per_row() == TEMPLATE_BYTES
+    ),
+    "{error}"
+  );
+
+  // The OUTPUT's count pairs that batch with the MANIFEST's width, so it can
+  // overflow where the input's does not — a second clause, not the same one.
+  let dim = 1 << 40;
+  let batch = usize::MAX / dim + 1;
+  assert!(
+    batch.checked_mul(TEMPLATE_BYTES).is_some(),
+    "this batch must overflow the OUTPUT count only"
+  );
+  let description = graph(&[batch, 3, TEMPLATE_SIZE, TEMPLATE_SIZE], &[batch, dim]);
+  let error = check(&description, &model(dim))
+    .expect_err("a batch and width whose output tensor cannot be counted must not load");
+  assert!(
+    matches!(
+      &error,
+      Error::ElementCountOverflow(o)
+        if o.tensor() == PredictionTensor::Output && o.batch() == batch && o.per_row() == dim
+    ),
+    "{error}"
+  );
+
+  // And a batch that counts fine still loads, so the refusal is the overflow
+  // and not the size.
+  let (input, _) = check(
+    &graph(&[8, 3, TEMPLATE_SIZE, TEMPLATE_SIZE], &[8, DIM]),
+    &model(DIM),
+  )
+  .expect("a batch-8 export counts to 301056 input and 4096 output elements");
+  assert_eq!(input.batch, 8);
+}
+
+/// **FALSIFIER (red first).** Fitting `usize` is strictly weaker than the
+/// memory existing, so the count proved at load does not finish the job: a
+/// batch of `2⁵⁵` counts fine and asks for petabytes.
+///
+/// The batch that reaches that regime cannot be allocated in a test — that is
+/// the point of it — so the helper is driven directly at two absurd lengths,
+/// one on each side of `Vec`'s own capacity arithmetic. `vec![0.0f32; n]`
+/// answers both by ABORTING the process, which no `expect_err` can observe and
+/// no caller can handle; the assertion here is that an `Err` comes back at all.
+#[test]
+fn the_tensor_allocator_refuses_rather_than_aborting() {
+  // `usize::MAX` f32s is `usize::MAX · 4` bytes: the length cannot even be
+  // turned into a layout, and `Vec` reports `CapacityOverflow`.
+  let error = zeroed_tensor(PredictionTensor::Output, usize::MAX)
+    .expect_err("a length whose byte size leaves `usize` has no buffer");
+  assert!(
+    matches!(
+      &error,
+      Error::AllocationFailed(a)
+        if a.tensor() == PredictionTensor::Output && a.elements() == usize::MAX
+    ),
+    "{error}"
+  );
+
+  // `usize::MAX / 8` f32s is a layout `Vec` will happily describe — under
+  // `isize::MAX` bytes — and that no allocator will satisfy, so this is the
+  // arm that reaches a real `AllocError`.
+  let beyond_memory = usize::MAX / 8;
+  let error = zeroed_tensor(PredictionTensor::Input, beyond_memory)
+    .expect_err("a buffer the allocator refuses is an error, not an abort");
+  assert!(
+    matches!(
+      &error,
+      Error::AllocationFailed(a)
+        if a.tensor() == PredictionTensor::Input && a.elements() == beyond_memory
+    ),
+    "{error}"
+  );
+  assert!(
+    error.to_string().contains(&beyond_memory.to_string()),
+    "the refusal must name the length that was asked for, got {error}"
+  );
+
+  // A length that CAN be met still comes back zeroed and exactly that long,
+  // so the fallible path did not change what the buffer is.
+  let data = zeroed_tensor(PredictionTensor::Input, FACE_ELEMENTS).expect("one face fits");
+  assert_eq!(data.len(), FACE_ELEMENTS);
+  assert!(data.iter().all(|v| v.to_bits() == 0.0f32.to_bits()));
 }
 
 // ── The one gate here that loads a real artifact ───────────────────────────

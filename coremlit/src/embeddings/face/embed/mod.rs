@@ -35,6 +35,13 @@
 //! ([`FaceEmbedder::batch_capacity`]) — and the slice is chunked to it, so a
 //! batch-1 export and a batch-8 export are the same call site.
 //!
+//! That capacity is the ARTIFACT's number and nothing bounds it, so the two
+//! buffers it sizes are the one place this door's arithmetic is over a value it
+//! did not choose. Both element counts are `checked_mul`'d at load and carried
+//! (`TensorElements`), and both buffers are reserved fallibly
+//! (`zeroed_tensor`) — a wrap and an abort are the two ways an accepted model
+//! used to end the caller's process instead of returning an error.
+//!
 //! # The load contract is a value, and a type proves it was checked
 //!
 //! [`FaceEmbedder`] holds a `Checked` model, never a bare [`Model`]: the only
@@ -82,18 +89,26 @@ use std::path::Path;
 use crate::{
   ComputeUnits, DataType, Model, ModelDescription, MultiArray,
   embeddings::face::{
-    align::{AlignedFace, TEMPLATE_SIZE},
+    align::{AlignedFace, TEMPLATE_BYTES, TEMPLATE_SIZE},
     artifact::{ArtifactDigest, digest_around},
     error::{
-      BatchRow, ContractMismatch, EmbeddingSpaceField, Error, IncomparableEmbeddings,
-      NonFiniteOutput, NonFinitePreprocessing, OutputElementCount, OutputShape, PreprocessingField,
-      PreprocessingMap, Result,
+      AllocationFailed, BatchRow, ContractMismatch, ElementCountOverflow, EmbeddingSpaceField,
+      Error, IncomparableEmbeddings, NonFiniteOutput, NonFinitePreprocessing, OutputElementCount,
+      OutputShape, PredictionTensor, PreprocessingField, PreprocessingMap, Result,
     },
   },
   model::contract::{
     Checked, ContractViolation, Dim, FeatureContract, LoadContract, StateContract,
   },
 };
+
+/// Elements one face occupies in the input tensor: `3 · 112 · 112`.
+///
+/// Numerically [`TEMPLATE_BYTES`] — [`write_row`] maps every byte of the RGB8
+/// template to exactly one tensor element — and spelled as that constant rather
+/// than re-multiplied, so the row stride [`FaceEmbedder::build_input`] slices by
+/// cannot drift from the template it is slicing.
+const FACE_ELEMENTS: usize = TEMPLATE_BYTES;
 
 /// The channel order a model's input tensor expects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -830,6 +845,10 @@ pub struct FaceEmbedder {
   /// The output form the graph declared, so a predicted tensor is checked
   /// against the axes it promised and not merely against an element count.
   output: OutputContract,
+  /// The element counts one prediction allocates, established at load with
+  /// `checked_mul` and carried so no inference-time site multiplies the
+  /// artifact's batch again.
+  elements: TensorElements,
 }
 
 impl FaceEmbedder {
@@ -865,6 +884,17 @@ impl FaceEmbedder {
   /// [`Self::batch_capacity`] reports came from a description established to
   /// admit exactly one shape, rather than from the default a flexible graph
   /// also reports.
+  ///
+  /// **A batch the door reads is a batch the door has to size two buffers
+  /// from, and that is checked here rather than trusted.** `n` is the
+  /// artifact's, so nothing bounds it: `n = usize::MAX / 1000` is a well-formed
+  /// pinned shape that used to load clean and then wrap `n · 112 · 112 · 3` on
+  /// the way to an allocation, panicking on the first row slice out of the
+  /// too-short buffer that resulted. `TensorElements` computes both counts
+  /// with `checked_mul` at load, refuses on overflow
+  /// ([`Error::ElementCountOverflow`]) and is CARRIED, so `embed` never
+  /// multiplies the artifact's batch again. There is no cap — see that type for
+  /// why a proof is the right shape and a cap is not.
   ///
   /// The OUTPUT's batch axis is `Exactly` that same number rather than
   /// `AnyFixed`, because this door does more than read it: [`Self::embed`]
@@ -933,6 +963,8 @@ impl FaceEmbedder {
   /// type, rank, shape flexibility or any one axis is not the contract's;
   /// [`Error::UnsatisfiableInput`] if it requires an input this door never
   /// sends; [`Error::UnsatisfiableState`] if it declares a state buffer;
+  /// [`Error::ElementCountOverflow`] if the batch the graph pins makes either
+  /// the input or the output tensor's element count leave `usize`;
   /// [`Error::ArtifactDigest`] if the artifact's bytes cannot be read — which
   /// fails the load rather than producing vectors with no identity;
   /// [`Error::ArtifactChangedDuringLoad`] if the bundle does not hash the same
@@ -946,12 +978,12 @@ impl FaceEmbedder {
     // Hash, read, hash again. Everything this function does with the path is
     // inside the bracket, so a bundle replaced while it is in flight is
     // refused rather than loaded as A and stamped as B.
-    let ((model, input, output), artifact) = digest_around(model_path, || {
+    let ((model, input, resolved), artifact) = digest_around(model_path, || {
       let model = Model::load(model_path, options.compute())?;
-      let (contract, rank, output) = load_contract(model.description(), &manifest)?;
-      let model = Checked::new(model, &contract).map_err(contract_violation)?;
-      let input = InputContract::read_back(model.description(), manifest.input(), rank);
-      Ok((model, input, output))
+      let resolved = load_contract(model.description(), &manifest)?;
+      let model = Checked::new(model, &resolved.contract).map_err(contract_violation)?;
+      let input = InputContract::read_back(model.description(), manifest.input(), resolved.rank);
+      Ok((model, input, resolved))
     })?;
     let space = EmbeddingSpace::of(artifact, &manifest);
     Ok(Self {
@@ -959,7 +991,8 @@ impl FaceEmbedder {
       manifest,
       space,
       input,
-      output,
+      output: resolved.output,
+      elements: resolved.elements,
     })
   }
 
@@ -995,6 +1028,14 @@ impl FaceEmbedder {
   ///
   /// [`Self::embed`] chunks any slice to this, so it is a throughput fact
   /// rather than a call-site constraint.
+  ///
+  /// **Not bounded, and it does not need to be.** No cap is imposed on what a
+  /// graph may pin here; what [`Self::load`] establishes instead is that the
+  /// two element counts this number sizes fit `usize` (`TensorElements`), and
+  /// what `zeroed_tensor` establishes is that a buffer the allocator will not
+  /// give is an error rather than an abort. A batch too large to be useful is
+  /// the artifact's business; a batch that makes this door misbehave is not
+  /// loadable.
   #[inline]
   pub const fn batch_capacity(&self) -> usize {
     self.input.batch
@@ -1016,7 +1057,10 @@ impl FaceEmbedder {
   /// always equals `faces.len()`.
   ///
   /// # Errors
-  /// [`Error::Tensor`] / [`Error::Prediction`] on a tensor or CoreML failure;
+  /// [`Error::AllocationFailed`] if a per-prediction buffer the graph's batch
+  /// sizes cannot be allocated — an error rather than an abort, which is the
+  /// whole reason it is reserved fallibly; [`Error::Tensor`] /
+  /// [`Error::Prediction`] on a tensor or CoreML failure;
   /// [`Error::OutputShape`] if a predicted tensor's axes diverge from the
   /// contract resolved at load, or [`Error::OutputElementCount`] if only its
   /// element count does; [`Error::NonFiniteOutput`] if the model emits
@@ -1047,9 +1091,16 @@ impl FaceEmbedder {
       .take(self.manifest.output())
       .ok_or_else(|| crate::PredictionError::MissingOutput(self.manifest.output().to_string()))?;
     let batch = self.input.batch;
-    check_predicted_shape(features.shape(), features.count(), self.output, batch, dim)?;
+    check_predicted_shape(
+      features.shape(),
+      features.count(),
+      self.output,
+      batch,
+      dim,
+      self.elements.output,
+    )?;
 
-    let mut flat = vec![0.0f32; batch * dim];
+    let mut flat = zeroed_tensor(PredictionTensor::Output, self.elements.output)?;
     features.copy_into::<f32>(&mut flat)?;
     let mut rows = Vec::with_capacity(chunk.len());
     let space = self.space;
@@ -1061,13 +1112,17 @@ impl FaceEmbedder {
 
   /// Builds the `[batch, …]` input tensor for one chunk, zero-padding the tail
   /// rows a short chunk leaves.
+  ///
+  /// The length is the one [`TensorElements`] proved at load, not
+  /// `batch · 3 · pixels` recomputed here, and it is reserved through
+  /// [`zeroed_tensor`] so an allocation the artifact's batch makes impossible
+  /// is an error rather than an abort.
   fn build_input(&self, chunk: &[AlignedFace]) -> Result<MultiArray> {
     let preprocessing = self.manifest.preprocessing();
-    let pixels = TEMPLATE_SIZE * TEMPLATE_SIZE;
-    let mut data = vec![0.0f32; self.input.batch * 3 * pixels];
+    let mut data = zeroed_tensor(PredictionTensor::Input, self.elements.input)?;
     for (row, face) in chunk.iter().enumerate() {
       write_row(
-        &mut data[row * 3 * pixels..(row + 1) * 3 * pixels],
+        &mut data[row * FACE_ELEMENTS..(row + 1) * FACE_ELEMENTS],
         face,
         preprocessing,
       );
@@ -1160,6 +1215,102 @@ impl InputContract {
   }
 }
 
+/// The element counts one prediction allocates, PROVED at load to fit `usize`.
+///
+/// # Why a proof, and why it is kept rather than recomputed
+///
+/// Both counts are products with the ARTIFACT's batch in them, and that batch
+/// is not a number this crate or its caller chose: the input contract states
+/// the batch axis as [`Dim::AnyFixed`] and [`InputContract::read_back`] reads
+/// back whatever the graph pins, and nothing in a `.mlmodelc` bounds it. A
+/// `usize::MAX / 1000` batch declares a perfectly well-formed fixed shape.
+///
+/// Computed with `*` at the point of use, `batch · 112 · 112 · 3` then wraps
+/// silently in a release build; `build_input` allocates the wrapped length and
+/// panics on the first `row * FACE_ELEMENTS ..` slice, so a model the door
+/// ACCEPTED terminates the caller. Computed here with `checked_mul` it is
+/// [`Error::ElementCountOverflow`] — a refusal at load, from a value the door
+/// then carries, so no inference-time site multiplies an artifact-derived
+/// number again and there is no second spelling to drift.
+///
+/// **No cap.** A cap would be an enumeration of how big is too big; the product
+/// either fits `usize` or it does not. Fitting `usize` is also strictly weaker
+/// than the memory existing, which is why the buffers themselves are still
+/// reserved fallibly — see [`zeroed_tensor`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TensorElements {
+  /// `batch · 112 · 112 · 3` — what [`FaceEmbedder::build_input`] allocates.
+  input: usize,
+  /// `batch · dim` — what [`FaceEmbedder::predict_chunk`] allocates, and the
+  /// count [`check_predicted_shape`] measures the predicted tensor against.
+  output: usize,
+}
+
+impl TensorElements {
+  /// Both counts for a graph of this batch under a manifest of this width.
+  ///
+  /// # Errors
+  /// [`Error::ElementCountOverflow`] naming the tensor whose product leaves
+  /// `usize`, the batch, and that tensor's per-row count. The input is checked
+  /// first only so that a description overflowing both reports one thing; each
+  /// is refused on its own, and `dim` is the manifest's, so the output count
+  /// can overflow where the input's does not.
+  fn of(batch: usize, dim: usize) -> Result<Self> {
+    let input = batch
+      .checked_mul(FACE_ELEMENTS)
+      .ok_or(Error::ElementCountOverflow(ElementCountOverflow::new(
+        PredictionTensor::Input,
+        batch,
+        FACE_ELEMENTS,
+      )))?;
+    let output =
+      batch
+        .checked_mul(dim)
+        .ok_or(Error::ElementCountOverflow(ElementCountOverflow::new(
+          PredictionTensor::Output,
+          batch,
+          dim,
+        )))?;
+    Ok(Self { input, output })
+  }
+}
+
+/// A zeroed `f32` buffer of `elements`, reserved FALLIBLY.
+///
+/// `vec![0.0f32; n]` on an artifact-derived `n` answers "the allocator will not
+/// give me that" by aborting the process, which is not a thing a caller can
+/// handle and not a thing a `Result`-returning door should do.
+/// [`TensorElements`] has already proved the count fits `usize`, and that is a
+/// strictly weaker fact than the memory existing — a batch of `2⁵⁵` counts fine
+/// and asks for petabytes — so the reservation is `try_reserve_exact` and the
+/// failure is [`Error::AllocationFailed`], naming the tensor and the length
+/// that was refused.
+///
+/// The `resize` cannot allocate: the reservation above it already secured
+/// capacity for exactly `elements`.
+fn zeroed_tensor(tensor: PredictionTensor, elements: usize) -> Result<Vec<f32>> {
+  let mut data: Vec<f32> = Vec::new();
+  data
+    .try_reserve_exact(elements)
+    .map_err(|_| Error::AllocationFailed(AllocationFailed::new(tensor, elements)))?;
+  data.resize(elements, 0.0);
+  Ok(data)
+}
+
+/// What [`load_contract`] resolves off a description: the contract
+/// [`Checked::new`] then checks, and the three facts the door runs on once it
+/// has passed.
+struct Resolved {
+  /// The contract to check the description against.
+  contract: LoadContract,
+  /// The rank the graph declared, and therefore the rank it must be fed.
+  rank: InputRank,
+  /// The output form a predicted tensor is later measured against.
+  output: OutputContract,
+  /// The two element counts one prediction allocates.
+  elements: TensorElements,
+}
+
 /// The load contract this door states for `manifest`, with the two forms
 /// [`FaceEmbedder`] carries: the RANK it must feed, and the output form a
 /// predicted tensor is later measured against.
@@ -1187,11 +1338,11 @@ impl InputContract {
 /// # Errors
 /// [`Error::ContractMismatch`] naming the feature whose declaration no contract
 /// of this door's can be built from: absent, or of a rank that is neither the
-/// batched nor the unbatched form — an undeclared (empty) shape included.
-fn load_contract(
-  description: &ModelDescription,
-  manifest: &FaceModel,
-) -> Result<(LoadContract, InputRank, OutputContract)> {
+/// batched nor the unbatched form — an undeclared (empty) shape included;
+/// [`Error::NonFinitePreprocessing`] for a manifest whose map leaves `f32`;
+/// [`Error::ElementCountOverflow`] if the batch the input feature declares
+/// makes either tensor's element count leave `usize` — see [`TensorElements`].
+fn load_contract(description: &ModelDescription, manifest: &FaceModel) -> Result<Resolved> {
   // Before anything about the graph: a manifest whose MAP does not stay in
   // `f32` makes elements of the input tensor non-finite, and the manifest is
   // copied verbatim into the `EmbeddingSpace` stamped on the vectors. Refusing
@@ -1222,6 +1373,11 @@ fn load_contract(
       format!("{:?}", declared_input.shape()),
     ))
   })?;
+
+  // The batch is now a number, and both tensors are sized from it. Prove the
+  // two products fit `usize` HERE, where the batch first becomes one, rather
+  // than at the two allocation sites where a wrap would be silent.
+  let elements = TensorElements::of(batch, manifest.dim())?;
 
   let declared_output = description.output(manifest.output()).ok_or_else(|| {
     Error::ContractMismatch(ContractMismatch::new(
@@ -1255,7 +1411,12 @@ fn load_contract(
     )],
     StateContract::None,
   );
-  Ok((contract, rank, form))
+  Ok(Resolved {
+    contract,
+    rank,
+    output: form,
+    elements,
+  })
 }
 
 /// The first thing about `preprocessing` that does not stay in `f32` — the
@@ -1474,6 +1635,11 @@ fn output_dims(form: OutputContract, batch: usize, dim: usize) -> Vec<Dim> {
 /// shape mismatch to report, and [`Error::OutputShape`] could only report one
 /// by naming the same vector twice.
 ///
+/// `elements` is that required count — [`TensorElements::output`], proved to
+/// fit `usize` at load — and is PASSED rather than recomputed as `batch · dim`,
+/// which is the same artifact-derived product that would wrap here as silently
+/// as it would at an allocation.
+///
 /// This is a DIFFERENT moment from the load contract, which is why it survives
 /// the adoption of [`Checked`]: the contract established what the graph
 /// DECLARES, and this measures what one prediction actually produced.
@@ -1483,6 +1649,7 @@ fn check_predicted_shape(
   contract: OutputContract,
   batch: usize,
   dim: usize,
+  elements: usize,
 ) -> Result<()> {
   let batched = [batch, dim];
   let flat = [dim];
@@ -1496,10 +1663,9 @@ fn check_predicted_shape(
       expected.to_vec(),
     )));
   }
-  if count != batch * dim {
+  if count != elements {
     return Err(Error::OutputElementCount(OutputElementCount::new(
-      count,
-      batch * dim,
+      count, elements,
     )));
   }
   Ok(())

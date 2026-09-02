@@ -955,6 +955,122 @@ impl ArtifactChangedDuringLoad {
   }
 }
 
+/// Which of the two tensors one prediction allocates.
+///
+/// They are sized by different things, so a size failure names which one it is
+/// about: the input's element count is `batch · 112 · 112 · 3` and is the
+/// ARTIFACT's alone, while the output's is `batch · dim` and pairs the
+/// artifact's batch with the manifest's declared width.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display)]
+pub enum PredictionTensor {
+  /// The `[batch, 3, 112, 112]` (or NHWC) tensor the preprocessed pixels are
+  /// written into.
+  #[display("input")]
+  Input,
+  /// The `[batch, dim]` tensor the embeddings are read out of.
+  #[display("output")]
+  Output,
+}
+
+/// One prediction tensor whose element count `batch · per_row` does not fit
+/// `usize`, so no buffer for it can even be described.
+///
+/// # Why this is a load-time refusal and not a cap
+///
+/// The batch is the ARTIFACT's: this door's input contract states the batch
+/// axis as "any one fixed size" and reads the number back off the checked
+/// model, so it is a value neither this crate nor its caller chose, and nothing
+/// in a `.mlmodelc` bounds it. Multiplied with `*`, `batch · per_row` wraps
+/// silently in a release build; the too-short buffer that follows then panics
+/// when a row is sliced out of it, which turns a model the door ACCEPTED into a
+/// terminated caller.
+///
+/// A cap would be an enumeration of how big is too big. `checked_mul` is a
+/// proof instead: the product either fits `usize` or it does not, and the
+/// second case is this error.
+///
+/// Payload of [`Error::ElementCountOverflow`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ElementCountOverflow {
+  /// Which tensor's element count overflowed.
+  tensor: PredictionTensor,
+  /// The batch the artifact declares.
+  batch: usize,
+  /// Elements one row of that tensor holds: `112 · 112 · 3` for the input, the
+  /// manifest's embedding width for the output.
+  per_row: usize,
+}
+
+impl ElementCountOverflow {
+  /// Construct from the tensor, the artifact's batch and that tensor's
+  /// per-row element count.
+  #[inline(always)]
+  pub const fn new(tensor: PredictionTensor, batch: usize, per_row: usize) -> Self {
+    Self {
+      tensor,
+      batch,
+      per_row,
+    }
+  }
+
+  /// Which tensor's element count overflowed.
+  #[inline(always)]
+  pub const fn tensor(&self) -> PredictionTensor {
+    self.tensor
+  }
+
+  /// The batch the artifact declares.
+  #[inline(always)]
+  pub const fn batch(&self) -> usize {
+    self.batch
+  }
+
+  /// Elements one row of that tensor holds.
+  #[inline(always)]
+  pub const fn per_row(&self) -> usize {
+    self.per_row
+  }
+}
+
+/// A prediction tensor whose element count fits `usize` and whose buffer the
+/// allocator would not give.
+///
+/// The count fitting `usize` is what [`ElementCountOverflow`] establishes and
+/// is a strictly weaker fact than the memory existing: a batch of `2⁵⁵` counts
+/// fine and asks for petabytes. `vec![0.0; n]` answers that by aborting the
+/// process, which is not something a caller can handle; the buffers this door
+/// sizes from an artifact are reserved with `Vec::try_reserve_exact` instead,
+/// and this payload is what the refusal carries.
+///
+/// Payload of [`Error::AllocationFailed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AllocationFailed {
+  /// Which tensor could not be allocated.
+  tensor: PredictionTensor,
+  /// The `f32` element count that was asked for.
+  elements: usize,
+}
+
+impl AllocationFailed {
+  /// Construct from the tensor and the element count that was refused.
+  #[inline(always)]
+  pub const fn new(tensor: PredictionTensor, elements: usize) -> Self {
+    Self { tensor, elements }
+  }
+
+  /// Which tensor could not be allocated.
+  #[inline(always)]
+  pub const fn tensor(&self) -> PredictionTensor {
+    self.tensor
+  }
+
+  /// The `f32` element count that was asked for.
+  #[inline(always)]
+  pub const fn elements(&self) -> usize {
+    self.elements
+  }
+}
+
 /// Everything [`crate::embeddings::face`] can fail with.
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -1073,6 +1189,21 @@ pub enum Error {
   /// A (finite) embedding row has zero magnitude and cannot be L2-normalized.
   #[error("model output row {} has zero magnitude and cannot be normalized", .0.row())]
   EmbeddingZero(BatchRow),
+  /// The artifact's declared batch makes one of this door's tensors
+  /// uncountable: `batch · per_row` does not fit `usize`.
+  #[error(
+    "the graph's batch of {} makes the {} tensor {} · {} elements long, which does not fit \
+     `usize`; no buffer for it can be described, let alone filled",
+    .0.batch(), .0.tensor(), .0.batch(), .0.per_row()
+  )]
+  ElementCountOverflow(ElementCountOverflow),
+  /// A prediction tensor whose element count fits `usize` could not be
+  /// allocated.
+  #[error(
+    "could not allocate the {} tensor's {} `f32` elements",
+    .0.tensor(), .0.elements()
+  )]
+  AllocationFailed(AllocationFailed),
   /// Two embeddings come from different artifact, routing or preprocessing
   /// spaces.
   #[error(
