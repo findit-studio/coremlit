@@ -259,6 +259,100 @@ fn bgr_reads_the_opposite_channel_of_the_rgb_template() {
 }
 
 #[test]
+fn a_written_zero_is_positive_zero_whichever_sign_the_bias_carries() {
+  // `canonical_bits` folds `±0` in the SPACE — two manifests differing only in
+  // the sign of a zero bias are one space, and their embeddings compare. The
+  // TENSOR did not agree. Pixel `0` with `scale = −1` gives `−0.0` from the
+  // multiply, and adding `+0.0` yields `+0.0` while adding `−0.0` yields
+  // `−0.0`: two bit patterns from one space, and a graph can tell them apart
+  // (`sign`, `copysign`, `1/x` are `+∞` against `−∞`). One relation must not
+  // have two answers, so the PRODUCER canonicalises.
+  let black =
+    AlignedFace::from_template_pixels(&vec![0u8; TEMPLATE_BYTES]).expect("exact template length");
+  let signed_zero =
+    |bias: f32| Preprocessing::new(ChannelOrder::Rgb, TensorLayout::Nchw, -1.0, [bias; 3]);
+  // The premise: the two manifests really are ONE space, so the tensor is the
+  // only place the sign could have survived.
+  assert_eq!(
+    signed_zero(0.0),
+    signed_zero(-0.0),
+    "the space cannot see the sign of a zero, which is why the tensor must not"
+  );
+
+  for bias in [0.0f32, -0.0] {
+    let mut row = vec![f32::NAN; 3 * TEMPLATE_SIZE * TEMPLATE_SIZE];
+    write_row(&mut row, &black, signed_zero(bias));
+    // The BIT PATTERN, not `== 0.0`, which is exactly the comparison that
+    // cannot see this.
+    for (index, value) in row.iter().enumerate() {
+      assert_eq!(
+        value.to_bits(),
+        0x0000_0000,
+        "bias {bias:?} wrote {value:?} (bits {:#010x}) at {index}, not `+0.0`",
+        value.to_bits()
+      );
+    }
+  }
+}
+
+#[test]
+fn a_manifest_whose_preprocessing_is_not_finite_is_refused_at_load() {
+  // The other half of the same defect. `canonical_bits` folds every NaN onto
+  // one representative so a `Preprocessing` equals itself — the type is public
+  // with a public `const` constructor, so a NaN one can be BUILT. What must
+  // not happen is that such a manifest reaches an embedder: every value it
+  // writes into the input tensor is non-finite, and the space stamped on the
+  // vectors carries the NaN forward. The load contract is where the road is
+  // cut, so the NaN fold is about the type's algebra and nothing else.
+  //
+  // Driven through the pure contract path — the same pair `FaceEmbedder::load`
+  // runs inside its digest bracket — because this crate stages no face
+  // artifact.
+  let arcface = Preprocessing::ARCFACE;
+  let cases = [
+    (f32::NAN, [-1.0f32, -1.0, -1.0], PreprocessingField::Scale),
+    (f32::INFINITY, [-1.0, -1.0, -1.0], PreprocessingField::Scale),
+    (
+      arcface.scale(),
+      [-1.0, f32::NAN, -1.0],
+      PreprocessingField::Bias(1),
+    ),
+    (
+      arcface.scale(),
+      [f32::NEG_INFINITY, -1.0, -1.0],
+      PreprocessingField::Bias(0),
+    ),
+  ];
+  for (scale, bias, want) in cases {
+    let broken = model(DIM).with_preprocessing(Preprocessing::new(
+      arcface.order(),
+      arcface.layout(),
+      scale,
+      bias,
+    ));
+    let error = check(
+      &graph(&[1, 3, TEMPLATE_SIZE, TEMPLATE_SIZE], &[1, DIM]),
+      &broken,
+    )
+    .expect_err("a non-finite preprocessing parameter is not loadable");
+    assert!(
+      matches!(&error, Error::NonFinitePreprocessing(payload) if payload.field() == want),
+      "expected NonFinitePreprocessing({want}) for scale={scale:?} bias={bias:?}, got {error:?}"
+    );
+  }
+  // And the finite manifest the same graph is built for still loads, so the
+  // refusal is about the parameter and not about the shape.
+  assert!(
+    check(
+      &graph(&[1, 3, TEMPLATE_SIZE, TEMPLATE_SIZE], &[1, DIM]),
+      &model(DIM)
+    )
+    .is_ok(),
+    "a finite manifest must still load"
+  );
+}
+
+#[test]
 fn nhwc_interleaves_where_nchw_planes() {
   let face = ramp_face();
   let pixels = TEMPLATE_SIZE * TEMPLATE_SIZE;
@@ -965,7 +1059,15 @@ fn a_non_finite_preprocessing_scale_still_names_one_space() {
   // The space check compares the manifest's `f32`s by a CANONICAL bit pattern.
   // Under `==` a NaN scale would fail to equal itself, and an embedding would
   // be refused against its own twin for a reason having nothing to do with
-  // either embedding. A broken manifest is one broken manifest.
+  // either embedding.
+  //
+  // This is about `Preprocessing`'s own `Eq` LAWFULNESS and nothing more: the
+  // type is public with `const` constructors, so a NaN one can be built, and a
+  // `PartialEq` that is not reflexive is not an equivalence relation. It is
+  // not about a broken manifest surviving to a comparison — `load` refuses one
+  // (`a_manifest_whose_preprocessing_is_not_finite_is_refused_at_load`), so no
+  // space this crate stamps can reach here with a NaN in it. The spaces below
+  // are therefore built through `EmbeddingSpace::of` directly.
   let with_nan = |payload: f32| {
     model(2).with_preprocessing(Preprocessing::new(
       ChannelOrder::Rgb,

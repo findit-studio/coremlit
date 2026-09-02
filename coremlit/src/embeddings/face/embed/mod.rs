@@ -86,7 +86,8 @@ use crate::{
     artifact::{ArtifactDigest, digest_around},
     error::{
       BatchRow, ContractMismatch, EmbeddingSpaceField, Error, IncomparableEmbeddings,
-      NonFiniteOutput, OutputElementCount, OutputShape, Result,
+      NonFiniteOutput, NonFinitePreprocessing, OutputElementCount, OutputShape, PreprocessingField,
+      Result,
     },
   },
   model::contract::{
@@ -124,14 +125,22 @@ pub enum TensorLayout {
 /// "different" about preprocessing that is not:
 ///
 /// - **`−0.0` and `+0.0` are one value.** They are the same real number, so
-///   `byte · scale + bias` is the same function either way. (The produced
-///   tensor can still differ in the SIGN of a zero — with a negative scale,
-///   byte `0` gives `−0.0 + +0.0 = +0.0` against `−0.0 + −0.0 = −0.0` — and
-///   nothing downstream reads the sign of a zero. Nothing else can differ.)
-/// - **Every NaN is one value.** A NaN scale is a broken manifest, but it is
-///   ONE broken manifest: without this it would not equal itself, and an
-///   embedding would be refused against its own twin for a reason having
-///   nothing to do with either embedding.
+///   `byte · scale + bias` is the same function either way — and the produced
+///   TENSOR agrees, because [`write_row`] normalises every zero it writes to
+///   `+0.0`. That parenthetical used to read the other way: the tensor *could*
+///   differ in the sign of a zero (with a negative scale, byte `0` gives
+///   `−0.0 + +0.0 = +0.0` against `−0.0 + −0.0 = −0.0`) and "nothing
+///   downstream reads the sign of a zero" was the argument for tolerating it.
+///   A graph can read it — `sign`, `copysign`, and `1/x` as `+∞` against `−∞`
+///   — so one space had two tensors. The producer canonicalises now, and this
+///   fold is the whole truth rather than half of it.
+/// - **Every NaN is one value.** This serves [`Preprocessing`]'s own [`Eq`]
+///   lawfulness and nothing else. The type is public and both its constructors
+///   are `const`, so a NaN `Preprocessing` can be built, and without the fold
+///   it would not equal itself. It does not serve a broken manifest reaching a
+///   comparison: [`FaceEmbedder::load`] refuses a non-finite scale or bias
+///   ([`Error::NonFinitePreprocessing`]), so no stamped [`EmbeddingSpace`]
+///   carries a NaN.
 ///
 /// Both foldings are reflexive, symmetric and transitive, which is what lets
 /// [`Preprocessing`] and [`EmbeddingSpace`] be [`Eq`] at all — `f32`'s own
@@ -623,7 +632,10 @@ impl FaceEmbedderOptions {
 ///   off-distribution space.** That is misuse rather than conflation — the
 ///   vectors are all wrong the same way, so they still compare with each other
 ///   — and it is unclosable here, because the artifact declares no
-///   normalisation for this crate to check the claim against;
+///   normalisation for this crate to check the claim against. The one part of
+///   the claim that does not need the artifact IS checked: a non-finite scale
+///   or bias is refused at load ([`Error::NonFinitePreprocessing`]), so no
+///   stamped space carries a NaN;
 /// - **[`AlignedFace::from_template_pixels`] keeps its documented hole on the
 ///   pixel side.** Bring-your-own-alignment cannot be checked: pixels aligned
 ///   to some other template, or not aligned at all, pass that constructor and
@@ -1173,6 +1185,17 @@ fn load_contract(
   description: &ModelDescription,
   manifest: &FaceModel,
 ) -> Result<(LoadContract, InputRank, OutputContract)> {
+  // Before anything about the graph: a manifest whose scale or bias is not
+  // finite makes every element of the input tensor non-finite, and it is
+  // copied verbatim into the `EmbeddingSpace` stamped on the vectors. Refusing
+  // it here is what keeps a NaN out of a produced space, and therefore what
+  // makes `canonical_bits`' NaN fold a statement about `Preprocessing`'s own
+  // `Eq` and nothing more.
+  if let Some(field) = non_finite_preprocessing(manifest.preprocessing()) {
+    return Err(Error::NonFinitePreprocessing(NonFinitePreprocessing::new(
+      field,
+    )));
+  }
   let layout = manifest.preprocessing().layout();
   let declared_input = description.input(manifest.input()).ok_or_else(|| {
     Error::ContractMismatch(ContractMismatch::new(
@@ -1224,6 +1247,22 @@ fn load_contract(
     StateContract::None,
   );
   Ok((contract, rank, form))
+}
+
+/// The first non-finite field of `preprocessing`, `scale` before `bias`.
+///
+/// The FIRST, not all of them: one field that is definitely wrong is more
+/// actionable than a list assembled to look thorough, and the same rule
+/// [`space_difference`] follows.
+fn non_finite_preprocessing(preprocessing: Preprocessing) -> Option<PreprocessingField> {
+  if !preprocessing.scale().is_finite() {
+    return Some(PreprocessingField::Scale);
+  }
+  preprocessing
+    .bias()
+    .iter()
+    .position(|value| !value.is_finite())
+    .map(PreprocessingField::Bias)
 }
 
 /// Map a [`ContractViolation`] into this module's error vocabulary.
@@ -1412,6 +1451,16 @@ fn check_predicted_shape(
 }
 
 /// Writes one aligned face into `row` as `3 · 112 · 112` preprocessed floats.
+///
+/// **Every zero written is `+0.0`.** [`Preprocessing`]'s equality folds `±0`
+/// onto one value, so two manifests differing only in the sign of a zero bias
+/// are ONE [`EmbeddingSpace`] and their embeddings compare — but `byte · scale
+/// + bias` does not fold it: pixel `0` with `scale = −1` gives `−0.0` from the
+/// multiply, and `+0.0` and `−0.0` as the bias then write two different bit
+/// patterns. A graph can read that difference (`sign`, `copysign`, and `1/x`
+/// as `+∞` against `−∞`), so one space could produce two tensors. It is
+/// canonicalised here, at the producer, rather than compared away downstream:
+/// see `a_written_zero_is_positive_zero_whichever_sign_the_bias_carries`.
 fn write_row(row: &mut [f32], face: &AlignedFace, preprocessing: Preprocessing) {
   let pixels = TEMPLATE_SIZE * TEMPLATE_SIZE;
   let source = face.pixels();
@@ -1424,7 +1473,12 @@ fn write_row(row: &mut [f32], face: &AlignedFace, preprocessing: Preprocessing) 
         ChannelOrder::Rgb => channel,
         ChannelOrder::Bgr => 2 - channel,
       };
-      let value = f32::from(source[pixel * 3 + source_channel]).mul_add(scale, *offset);
+      // `+ 0.0` normalises `−0.0` to `+0.0` and leaves every other value
+      // alone: under round-to-nearest the sum of two zeros of opposite sign
+      // is `+0.0`, and `x + 0.0` is exactly `x` for any nonzero finite `x`
+      // (and for `±∞`). One add, no branch, and the sign of a zero cannot
+      // reach the tensor.
+      let value = f32::from(source[pixel * 3 + source_channel]).mul_add(scale, *offset) + 0.0;
       let index = match preprocessing.layout() {
         TensorLayout::Nchw => channel * pixels + pixel,
         TensorLayout::Nhwc => pixel * 3 + channel,

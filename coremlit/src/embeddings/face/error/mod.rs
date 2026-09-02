@@ -757,6 +757,56 @@ impl DigestFailure {
   }
 }
 
+/// Which field of a [`crate::embeddings::face::Preprocessing`] is not finite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display)]
+pub enum PreprocessingField {
+  /// [`crate::embeddings::face::Preprocessing::scale`], the per-byte
+  /// multiplier.
+  #[display("scale")]
+  Scale,
+  /// [`crate::embeddings::face::Preprocessing::bias`], at this channel index
+  /// in the MODEL's own channel order — so a BGR manifest's `bias[0]` is its
+  /// blue offset.
+  #[display("bias[{_0}]")]
+  Bias(usize),
+}
+
+/// A manifest's preprocessing carries a NaN or infinite `scale` or `bias`.
+///
+/// **Refused at load, which is what keeps a NaN out of a stamped
+/// [`crate::embeddings::face::EmbeddingSpace`].** `value = byte · scale +
+/// bias` with a non-finite parameter makes every element of the input tensor
+/// non-finite, so the model can only produce garbage or
+/// [`Error::NonFiniteOutput`]; and the manifest is copied verbatim into the
+/// space every vector carries, where a NaN would then have to be given an
+/// equality of its own to stay comparable with itself.
+///
+/// [`crate::embeddings::face::Preprocessing`] is public and its constructors
+/// are `const`, so such a value can be BUILT — that is why
+/// `Preprocessing`'s own `Eq` still folds NaN onto one representative. What
+/// this variant removes is the road from there to an embedder.
+///
+/// Payload of [`Error::NonFinitePreprocessing`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NonFinitePreprocessing {
+  /// The first field found to be NaN or infinite, `scale` before `bias`.
+  field: PreprocessingField,
+}
+
+impl NonFinitePreprocessing {
+  /// Construct from the offending field.
+  #[inline(always)]
+  pub const fn new(field: PreprocessingField) -> Self {
+    Self { field }
+  }
+
+  /// The first field found to be NaN or infinite, `scale` before `bias`.
+  #[inline(always)]
+  pub const fn field(&self) -> PreprocessingField {
+    self.field
+  }
+}
+
 /// One digest as lowercase hex, for an error message.
 ///
 /// Cold path: two of these are formatted only when a load is being refused.
@@ -897,6 +947,13 @@ pub enum Error {
     hex(.0.after())
   )]
   ArtifactChangedDuringLoad(ArtifactChangedDuringLoad),
+  /// The manifest's preprocessing carries a NaN or infinite scale or bias.
+  #[error(
+    "the manifest's preprocessing `{}` is NaN or infinite; every value it writes into the input \
+     tensor would be non-finite, and the space stamped on the embeddings would carry it",
+    .0.field()
+  )]
+  NonFinitePreprocessing(NonFinitePreprocessing),
   /// The loaded model does not match the manifest's declared contract.
   #[error("model contract mismatch on `{}`: expected {}, got {}", .0.feature(), .0.expected(), .0.actual())]
   ContractMismatch(ContractMismatch),
