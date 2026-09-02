@@ -101,6 +101,7 @@ use crate::{
       AllocationFailed, BatchRow, ContractMismatch, ElementCountOverflow, EmbeddingSpaceField,
       Error, IncomparableEmbeddings, NonFiniteOutput, NonFinitePreprocessing, OutputElementCount,
       OutputShape, PredictionTensor, PreprocessingField, PreprocessingMap, Result,
+      ZeroEmbeddingWidth,
     },
   },
   model::contract::{
@@ -436,6 +437,13 @@ impl FaceModel {
   /// width, preprocessed as [`Preprocessing::ARCFACE`].
   ///
   /// `dim` is 512 for every ArcFace-family artifact in issue #115's census.
+  ///
+  /// **A `dim` of zero is accepted HERE and refused at
+  /// [`FaceEmbedder::load`]**, with [`Error::ZeroEmbeddingWidth`]. This
+  /// constructor is `const` and total, so it cannot refuse anything; the refusal
+  /// is at the one place that can, and it is a load-time refusal rather than a
+  /// clause of the contract because the contract a zero width builds is
+  /// satisfiable — see that error for the walk.
   #[inline]
   pub const fn new(input: &'static str, output: &'static str, dim: usize) -> Self {
     Self {
@@ -982,7 +990,10 @@ impl FaceEmbedder {
   /// [`Error::NonFinitePreprocessing`] if the manifest's map
   /// `byte ↦ byte · scale + bias` does not stay in `f32` — either field, or
   /// the map itself at an end of the byte range, which two finite fields can
-  /// still fail; [`Error::Load`] if CoreML rejects the model;
+  /// still fail; [`Error::ZeroEmbeddingWidth`] if the manifest's width is zero,
+  /// which is refused at the manifest because no contract clause can refuse it
+  /// and the failure is otherwise a PANIC in [`Self::embed`]'s row split;
+  /// [`Error::Load`] if CoreML rejects the model;
   /// [`Error::ContractMismatch`]
   /// if the model declares no feature by the manifest's name, if the declared
   /// rank of either feature is one no contract of this door's can be built
@@ -1069,7 +1080,7 @@ impl FaceEmbedder {
   }
 
   /// The embedding width — [`FaceModel::dim`], reconciled against the model at
-  /// load.
+  /// load, and never zero: [`Self::load`] refuses a zero-width manifest.
   #[inline]
   pub const fn dim(&self) -> usize {
     self.manifest.dim()
@@ -1122,6 +1133,12 @@ impl FaceEmbedder {
   /// TWICE over on the Rust side, beside both native tensors. Reserving the
   /// flat buffer fallibly and the rows infallibly would move the abort rather
   /// than remove it — the rows are the larger half once the chunk is full.
+  ///
+  /// # Panics
+  /// Never, and the one that could is `chunks_exact(dim)`, which panics on a
+  /// chunk size of zero. `dim` is the MANIFEST's, so nothing about the graph
+  /// bounds it; [`load_contract`] refuses a zero-width manifest before this
+  /// door exists, which is what makes the split total.
   fn predict_chunk(&self, chunk: &[AlignedFace], first_row: usize) -> Result<Vec<FaceEmbedding>> {
     let dim = self.manifest.dim();
     let tensor = self.build_input(chunk)?;
@@ -1380,11 +1397,37 @@ struct Resolved {
 /// the OUTPUT's row count, and if the input's own declaration is not pinned,
 /// the input clause refuses the model whether it is consulted first or last.
 ///
+/// # The manifest's own numbers are refused before the graph is read
+///
+/// A manifest carries exactly two kinds of number, and both are checked here
+/// rather than where they are used:
+///
+///   - **`preprocessing`'s `scale` and `bias`** — refused when the affine MAP
+///     they make leaves `f32`, which also covers the degenerate constructions
+///     that reach them: [`Preprocessing::from_mean_and_divisor`] divides by its
+///     `divisor`, and a zero one makes `scale` `±inf` while a NaN one makes it
+///     NaN. Either way this clause is what stops it, and it stops it on the
+///     resulting `scale` rather than on the divisor, so there is no second
+///     predicate to drift. A `scale` of zero is NOT degenerate: it writes a
+///     constant tensor, which is well defined if useless, and an output row
+///     that then comes back all-zero meets [`Error::EmbeddingZero`] like any
+///     other.
+///   - **`dim`** — refused at zero, see below.
+///
+/// Nothing else the door multiplies, divides or chunks by is the manifest's.
+/// `TEMPLATE_SIZE` and [`FACE_ELEMENTS`] are compile-time constants, and the
+/// only other number in the arithmetic is the ARTIFACT's batch, whose zero
+/// [`input_form`] refuses and whose overflow [`TensorElements`] does.
+///
 /// # Errors
+/// [`Error::NonFinitePreprocessing`] for a manifest whose map leaves `f32`;
+/// [`Error::ZeroEmbeddingWidth`] for a manifest of zero width, which no clause
+/// of the contract it would otherwise build can refuse — see
+/// [`ZeroEmbeddingWidth`];
 /// [`Error::ContractMismatch`] naming the feature whose declaration no contract
 /// of this door's can be built from: absent, or of a rank that is neither the
-/// batched nor the unbatched form — an undeclared (empty) shape included;
-/// [`Error::NonFinitePreprocessing`] for a manifest whose map leaves `f32`;
+/// batched nor the unbatched form — an undeclared (empty) shape included, and a
+/// declared batch of zero with it;
 /// [`Error::ElementCountOverflow`] if the batch the input feature declares
 /// makes either tensor's element count leave `usize` — see [`TensorElements`].
 fn load_contract(description: &ModelDescription, manifest: &FaceModel) -> Result<Resolved> {
@@ -1399,6 +1442,16 @@ fn load_contract(description: &ModelDescription, manifest: &FaceModel) -> Result
   if let Some(field) = non_finite_preprocessing(manifest.preprocessing()) {
     return Err(Error::NonFinitePreprocessing(NonFinitePreprocessing::new(
       field,
+    )));
+  }
+  // Also before the graph, and before any contract is built: a manifest of ZERO
+  // width. This is the door's only refusal of a manifest NUMBER, and it has to
+  // live here because nothing after it can make it — every clause a zero width
+  // reaches is satisfied by it, and the failure lands in `predict_chunk`'s
+  // `chunks_exact(dim)` as a panic. See [`ZeroEmbeddingWidth`] for the walk.
+  if manifest.dim() == 0 {
+    return Err(Error::ZeroEmbeddingWidth(ZeroEmbeddingWidth::new(
+      manifest.output(),
     )));
   }
   let layout = manifest.preprocessing().layout();

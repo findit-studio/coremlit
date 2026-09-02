@@ -886,6 +886,52 @@ impl NonFinitePreprocessing {
   }
 }
 
+/// The manifest declares an embedding width of ZERO, so there is no vector for
+/// the door to produce and no row for it to cut.
+///
+/// # Why the refusal is at the producer and nowhere else
+///
+/// Nothing downstream can make it.
+/// [`crate::embeddings::face::FaceModel::new`] is `const`, so the manifest
+/// constructor cannot refuse a width; and the LOAD CONTRACT cannot express the
+/// refusal either, because every clause a zero width reaches is satisfied by it.
+/// `Dim::Exactly(0)` is a well-formed axis; a `[batch, 0]` feature reporting
+/// `(0, 1)` on that axis classifies as [`crate::ShapeConstraint::Fixed`] like
+/// any other pinned shape; `batch · 0` is a legitimate `usize`, so no element
+/// count overflows; and a prediction carrying no elements then matches both the
+/// axes and the count the contract resolved.
+///
+/// What such a load meets is
+/// `flat.chunks_exact(dim)` on the first non-empty `embed`, and
+/// `slice::chunks_exact` PANICS on a chunk size of zero — so a manifest the
+/// door accepted terminates the caller, from a number the caller supplied.
+/// The sibling refusal for the ARTIFACT's own zero, a declared batch of `0`,
+/// is `input_form`'s, and is a [`Error::ContractMismatch`] rather than this,
+/// because that one is a fact about the graph.
+///
+/// Payload of [`Error::ZeroEmbeddingWidth`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ZeroEmbeddingWidth {
+  /// The output feature the manifest names — the head whose width it is
+  /// declaring, which for a graph with two `[batch, dim]` heads is what says
+  /// WHICH width was meant to be there.
+  output: &'static str,
+}
+
+impl ZeroEmbeddingWidth {
+  /// Construct from the manifest's output feature name.
+  #[inline(always)]
+  pub const fn new(output: &'static str) -> Self {
+    Self { output }
+  }
+
+  /// The output feature the manifest names.
+  #[inline(always)]
+  pub const fn output(&self) -> &'static str {
+    self.output
+  }
+}
+
 /// One digest as lowercase hex, for an error message.
 ///
 /// Cold path: two of these are formatted only when a load is being refused.
@@ -1160,6 +1206,15 @@ pub enum Error {
     .0.field()
   )]
   NonFinitePreprocessing(NonFinitePreprocessing),
+  /// The manifest declares an embedding width of zero, which no contract clause
+  /// can refuse and which panics `embed`'s row split.
+  #[error(
+    "the manifest declares an embedding width of 0 for the output feature `{}`; a zero-width \
+     contract is satisfied by a prediction of no elements, and cutting one into rows of zero \
+     is not defined",
+    .0.output()
+  )]
+  ZeroEmbeddingWidth(ZeroEmbeddingWidth),
   /// The loaded model does not match the manifest's declared contract.
   #[error("model contract mismatch on `{}`: expected {}, got {}", .0.feature(), .0.expected(), .0.actual())]
   ContractMismatch(ContractMismatch),

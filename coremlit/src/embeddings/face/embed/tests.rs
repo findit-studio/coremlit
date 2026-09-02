@@ -461,6 +461,54 @@ fn a_preprocessing_map_that_leaves_f32_at_a_byte_endpoint_is_refused_at_load() {
   );
 }
 
+/// **FALSIFIER (red first).** A manifest of ZERO width used to load, on both
+/// output forms, and then panic on the first non-empty `embed`.
+///
+/// Nothing downstream could refuse it. `FaceModel::new` is `const`, so it
+/// cannot; the CONTRACT cannot either — `Dim::Exactly(0)` is a well-formed
+/// axis, a `[batch, 0]` feature carrying `(0, 1)` on that axis classifies as
+/// `Fixed`, and `TensorElements::of` multiplies to a legitimate `0`. A
+/// prediction of no elements then satisfies BOTH of
+/// `check_predicted_shape`'s clauses, and `predict_chunk` reaches
+/// `flat.chunks_exact(0)`, which panics.
+///
+/// So the refusal has to be at the producer, and this is it. The empty slice
+/// is not the exception it looks like: `embed(&[])` never enters
+/// `predict_chunk`, so the panic needs one real face and nothing more.
+#[test]
+fn a_manifest_of_zero_width_is_refused_at_load() {
+  let input = [1, 3, TEMPLATE_SIZE, TEMPLATE_SIZE];
+
+  // The batched output form: `[batch, 0]`.
+  let error = check(&graph(&input, &[1, 0]), &model(0))
+    .expect_err("a zero-width manifest has no embedding to produce");
+  assert!(
+    matches!(&error, Error::ZeroEmbeddingWidth(payload) if payload.output() == "embedding"),
+    "{error}"
+  );
+  assert!(error.to_string().contains("embedding"), "{error}");
+
+  // And the flat one a batch-one graph may declare instead: `[0]`. The refusal
+  // is the manifest's width, so which form the artifact declares cannot matter
+  // — and the width is read before the description is, so a graph declaring
+  // some OTHER width is refused by the same clause rather than by a mismatch.
+  for output in [vec![0], vec![512]] {
+    assert!(
+      matches!(
+        check(&graph(&input, &output), &model(0)),
+        Err(Error::ZeroEmbeddingWidth(_))
+      ),
+      "output {output:?} must be refused for the manifest's width, not for its own"
+    );
+  }
+
+  // A width of one still loads, so the refusal is zero and not "small".
+  assert!(
+    check(&graph(&input, &[1, 1]), &model(1)).is_ok(),
+    "a one-wide manifest is degenerate but well defined"
+  );
+}
+
 #[test]
 fn nhwc_interleaves_where_nchw_planes() {
   let face = ramp_face();
