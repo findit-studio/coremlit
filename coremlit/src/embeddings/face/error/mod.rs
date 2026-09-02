@@ -204,13 +204,14 @@ impl TransformParameter {
 /// producing one checks its four parameters before handing it out, so no
 /// caller can receive an `Ok` holding a transform whose `apply` returns NaN.
 ///
-/// **No public route reaches it, and the doc says so rather than naming one.**
+/// **No route reaches it, and the doc says so rather than naming one.**
 /// [`crate::embeddings::face::SimilarityTransform::estimate`] is its only
 /// producer, and both point sets are finite by the time the solve runs, which
-/// bounds the four parameters well inside `f64` — see that function's doc for
-/// the range argument. [`crate::embeddings::face::SimilarityTransform::inverse`]
-/// takes a caller-built transform and CAN meet a non-finite parameter, but it
-/// reports that as `None` and raises nothing; where
+/// bounds the four parameters well inside `f64` — see
+/// [`crate::embeddings::face::SimilarityTransform::inverse`] for the bound and
+/// the 860 810-set measurement behind it. That measurement counted this
+/// variant zero times. [`crate::embeddings::face::SimilarityTransform::inverse`]
+/// reports a transform it cannot invert as `None` and raises nothing; where
 /// [`crate::embeddings::face::FaceAlign::to_template`] has to turn that `None`
 /// into an error, the one it raises is [`Error::NonInvertibleTransform`].
 /// This variant is kept because the bound is an argument about the input type
@@ -256,16 +257,17 @@ impl NonFiniteTransform {
 pub struct NonInvertibleTransform {
   /// The solved transform's uniform scale, `√(a² + b²)`.
   ///
-  /// Zero when the solve collapsed the plane onto a point; nonzero but tiny
-  /// when it is only the INVERSE that leaves `f64` — an inverse coefficient
-  /// `1/s`, or a translation built from it, overflowing.
+  /// Zero when the solve collapsed the plane onto a point — the only value
+  /// [`crate::embeddings::face::SimilarityTransform::estimate`] can reach this
+  /// error with, and it reaches it only for a target with no spread.
   ///
-  /// `f64` for exactly that second case. The smallest scale that still has a
-  /// representable inverse is around `5.6e-309`, so a witness lives in a range
-  /// `f32` flushes to zero — and reporting zero is what this payload exists to
-  /// stop doing. (`1e-160` was the witness before
-  /// [`crate::embeddings::face::SimilarityTransform::inverse`] stopped forming
-  /// `a² + b²` at the original magnitude; it inverts cleanly now, to `1e160`.)
+  /// `f64` rather than `f32`, because the OTHER way a transform has no inverse
+  /// is a scale outside the band
+  /// [`crate::embeddings::face::SimilarityTransform::inverse`] declares — below
+  /// about `1.5e-154`, or above about `6.7e153`. The whole lower half of that
+  /// is a range `f32` flushes to zero, and reporting zero is what this payload
+  /// exists to stop doing. No public producer reaches it, so the width is a
+  /// property of the type rather than of a witness anyone can hand in.
   scale: f64,
 }
 

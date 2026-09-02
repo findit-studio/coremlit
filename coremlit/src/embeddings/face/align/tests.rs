@@ -293,13 +293,12 @@ fn a_transform_that_does_not_invert_reports_its_own_scale_not_a_landmark_spread(
   // coincident landmarks that do not exist — the failure is the solved SCALE,
   // and that is what the payload has to carry.
   //
-  // The first witness has a scale that is NONZERO and still has no inverse. It
-  // is deliberately NOT `1e-160`, which this test used to use on the strength
-  // of `1/(a² + b²)` overflowing there: `1/1e-160` is `1e160`, that transform
-  // inverts, and building a truthful payload around an untrue predicate is
-  // what the round before last actually did. The smallest subnormal is a real
-  // witness — `1/5e-324` is genuinely not representable — and it is a scale
-  // `f32` would flush to the zero this payload exists to stop reporting.
+  // The witness has a scale that is NONZERO and still has no inverse, and it
+  // is reached through the private `new` because no public producer reaches
+  // this arm with a nonzero scale — the domain `inverse` declares excludes it
+  // (see that method). What the payload has to get right is unchanged by
+  // that: the scale is not zero, `f32` would render it as zero, and the error
+  // must not say "the landmarks had no spread".
   const SUBNORMAL: f64 = f64::from_bits(1);
   let collapsed = SimilarityTransform::new(SUBNORMAL, 0.0, 1.0, 2.0);
   assert!(collapsed.inverse().is_none(), "the witness has no inverse");
@@ -441,11 +440,17 @@ fn a_solved_transform_with_a_non_finite_parameter_is_never_handed_out() {
 
 #[test]
 fn an_inverse_is_refused_when_any_parameter_is_non_finite() {
-  // The same one-sided-validation class as `estimate`'s, on the other public
+  // The same one-sided-validation class as `estimate`'s, on the other fallible
   // constructor: `inverse` checked the ROTATION (through the determinant) and
   // never the TRANSLATION, so a perfectly good rotation with a NaN shift
   // returned `Some` holding a transform whose `apply` is NaN everywhere.
-  // `new` is public AND `const`, so that is a value a caller can build.
+  //
+  // The three refusals below are each attributed to the check that ACTUALLY
+  // makes them, because two of the three are documented backstops and one is
+  // load-bearing. The band test in `inverse_rotation` answers for every
+  // non-finite ROTATION on its own (`a·a + b·b` is NaN or infinite, so it is
+  // not normal); the entry guard is kept as a stated precondition, not as the
+  // only thing catching those. What nothing else can catch is the last case.
   assert!(
     SimilarityTransform::new(1.0, 0.0, f64::NAN, 0.0)
       .inverse()
@@ -464,47 +469,48 @@ fn an_inverse_is_refused_when_any_parameter_is_non_finite() {
       .is_none(),
     "the rotation side must still be refused"
   );
-  // The entry guard's OWN witness, and it did not exist before the scaled
-  // reciprocal did. Under the old `D = a·a + b·b; 1./D` an infinite rotation
-  // propagated a NaN into the result and the exit check caught it, so a guard
-  // on the way in was unreachable. Scaling reaches a FINITE answer from it —
-  // `∞` scales to `(0, −0)`, and a zero transform with a finite translation
-  // passes the exit check — so without the guard this is a false `Some`
-  // mapping every template pixel onto one source point.
   for infinite in [f64::INFINITY, f64::NEG_INFINITY] {
     assert!(
       SimilarityTransform::new(infinite, 0.0, 1.0, 2.0)
         .inverse()
         .is_none(),
-      "an infinite rotation coefficient has no inverse, and must not scale to a zero transform"
+      "an infinite rotation coefficient has no inverse"
     );
     assert!(
       SimilarityTransform::new(0.0, infinite, 1.0, 2.0)
         .inverse()
         .is_none(),
-      "the same on the other rotation coefficient, which takes the other scaling branch"
+      "the same on the other rotation coefficient"
     );
   }
-  // The check on the way OUT is load-bearing on its own, not a duplicate of
-  // the one on the way in: a scale too small for `f64` to hold `1/s` turns
-  // four finite parameters into an infinite one. `1e-160` is NOT that witness
-  // — `1/1e-160 = 1e160` is finite, and treating it as one was the defect
-  // `the_inverse_refuses_only_transforms_that_have_no_finite_inverse` covers.
-  // The real boundary is around `5.6e-309`, below which no reciprocal exists.
+  // A rotation outside the declared band is refused there rather than here —
+  // the band, not this check, is what answers for it.
   assert!(
-    SimilarityTransform::new(f64::from_bits(1), 0.0, 1.0, 2.0)
+    inverse_rotation(f64::from_bits(1), 0.0).is_none(),
+    "the smallest subnormal scale is outside the band `inverse` declares"
+  );
+
+  // THE EXIT CHECK'S OWN WITNESS, and the one thing neither the entry guard
+  // nor the band can see: a rotation squarely INSIDE the band whose
+  // TRANSLATION leaves `f64` once it is carried through the inverse scale.
+  // `2e-154` squares to `4e-308`, normal, with a normal reciprocal — so
+  // `inverse_rotation` answers `5e153` — and `5e153 · 1e200` is `−∞`.
+  const IN_BAND: f64 = 2e-154;
+  let determinant = IN_BAND * IN_BAND;
+  assert!(
+    determinant.is_normal() && (1.0 / determinant).is_normal(),
+    "the witness's rotation must be INSIDE the band, or it proves nothing about the exit check"
+  );
+  let (rotation, _) = inverse_rotation(IN_BAND, 0.0).expect("an in-band rotation inverts");
+  assert_eq!(rotation, 5e153, "and its inverse coefficient is finite");
+  assert!(
+    SimilarityTransform::new(IN_BAND, 0.0, 1e200, 0.0)
       .inverse()
       .is_none(),
-    "the smallest subnormal scale has no representable reciprocal"
+    "an inverse translation that overflows is still no inverse, and only the check on the way \
+     OUT can say so"
   );
-  // And the same check catching a TRANSLATION built from a good inverse
-  // scale: `1e-300` inverts to `1e300`, which the shift then overflows.
-  assert!(
-    SimilarityTransform::new(1e-300, 0.0, 1e300, 0.0)
-      .inverse()
-      .is_none(),
-    "an inverse translation that overflows is still no inverse"
-  );
+
   assert!(
     SimilarityTransform::new(1.7875, -0.1252, 5.1247, 24.1454)
       .inverse()
@@ -1136,76 +1142,406 @@ fn opposite_coordinate_saturations_must_not_cancel_into_a_valid_tap() {
 }
 
 #[test]
-fn the_inverse_refuses_only_transforms_that_have_no_finite_inverse() {
-  // Forming `a² + b²` at the input's own magnitude used to decide
-  // invertibility, and that product leaves `f64` on BOTH sides while the
-  // inverse itself stays comfortably inside it.
+fn an_out_of_band_rotation_has_no_inverse_by_declaration() {
+  // The value that ended the widening. Smith's scaling was added so that
+  // `(1e200, 0)` would invert to `1e-200` instead of to the zero transform the
+  // direct form produced; `a = b = f64::MAX` then overflowed Smith's OWN
+  // expression — `larger + smaller·ratio` is `∞` — and it handed back
+  // `SimilarityTransform { a: 0.0, b: -0.0, tx: -0.0, ty: 0.0 }`, precisely
+  // the zero transform the rescue existed to avoid. That is an "inverse"
+  // mapping every template pixel onto one source point, and it warps rather
+  // than refusing.
   //
-  // Underflow: `1e-160² = 1e-320` is subnormal, its reciprocal overflows, and
-  // the whole inverse was refused — though `1/1e-160 = 1e160` is finite and
-  // exactly representable.
-  let tiny = SimilarityTransform::new(1e-160, 0.0, 1.0, 2.0);
-  let tiny_inverse = tiny
-    .inverse()
-    .expect("1/1e-160 = 1e160 is finite, so this transform HAS an inverse");
-  assert_eq!(
-    tiny_inverse.a(),
-    1e160,
-    "the inverse coefficient is exactly 1e160"
-  );
-
-  // Overflow: `1e200² = inf`, so the determinant was infinite, its reciprocal
-  // zero, and the result `Some` holding the ZERO transform — a false `Some`
-  // that maps every template pixel onto one source point. The worse of the two
-  // errors: a false `None` refuses, a false `Some` warps.
-  let huge = SimilarityTransform::new(1e200, 0.0, 1.0, 2.0);
-  let huge_inverse = huge
-    .inverse()
-    .expect("1/1e200 = 1e-200 is finite, so this transform HAS an inverse");
-  assert_eq!(
-    huge_inverse.a(),
-    1e-200,
-    "the inverse coefficient is exactly 1e-200, not the zero an infinite determinant produces"
-  );
-
-  // Both survive a round trip, which is the property a "zero transform"
-  // inverse silently fails.
-  for original in [tiny, huge] {
-    let back = original
+  // The cure is not a third expression. `estimate` cannot produce this value —
+  // it is 300 orders past the measured `a²+b²` maximum (see
+  // `SimilarityTransform::inverse`) — and with `new` private nothing else can
+  // either. So the inverse is undefined here BY DECLARATION, and `None` says
+  // exactly that.
+  assert!(
+    SimilarityTransform::new(f64::MAX, f64::MAX, 0.0, 0.0)
       .inverse()
-      .and_then(|inverted| inverted.inverse())
-      .expect("an invertible transform's inverse is invertible");
-    assert_eq!(
-      (back.a(), back.b()),
-      (original.a(), original.b()),
-      "inverting twice must return the rotation block it started from"
-    );
+      .is_none(),
+    "out of band, the inverse is undefined by declaration — a `Some` here is a rescue, and every \
+     rescue this module tried was itself met by the next value outside its enumeration"
+  );
+}
+
+/// A deterministic xorshift64, so the sweep below feeds the same point sets on
+/// every machine and every run. A `rand` dependency for a hermetic gate would
+/// buy nothing and could change its stream between versions.
+struct Xorshift(u64);
+
+impl Xorshift {
+  fn next(&mut self) -> u64 {
+    let mut x = self.0;
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    self.0 = x;
+    x
   }
 
-  // Across the band where `a² + b²` and its reciprocal are both normal —
-  // about `1.5e-154` to `6.7e153`, the range the docs name — the inverse is
-  // correct on BOTH sides of the boundary, which is the property that matters
-  // rather than which association ran.
-  for scale in [1e-160, 1e-154, 2e-154, 1.0, 6e153, 1e154, 1e200] {
-    let inverted = SimilarityTransform::new(scale, 0.0, 0.0, 0.0)
-      .inverse()
-      .unwrap_or_else(|| panic!("a scale of {scale:e} has a finite inverse"));
-    assert_eq!(
-      inverted.a(),
-      1.0 / scale,
-      "the inverse coefficient at scale {scale:e} must be 1/{scale:e}"
-    );
+  /// An `f32` straight from raw bits — every value the type has, subnormals
+  /// and `±f32::MAX` included, plus the non-finite ones the sweep skips.
+  fn bits_f32(&mut self) -> f32 {
+    f32::from_bits(self.next() as u32)
   }
 
-  // The fast path is still OpenCV's own association wherever OpenCV's own
-  // arithmetic is defined, so nothing about an ordinary alignment moved.
-  let ordinary = SimilarityTransform::new(1.7875, -0.1252, 5.1247, 24.1454);
-  let determinant = ordinary.a() * ordinary.a() + ordinary.b() * ordinary.b();
-  let reciprocal = 1.0 / determinant;
-  let inverted = ordinary.inverse().expect("an ordinary transform inverts");
+  /// An `f64` in `[0, 1)`.
+  fn unit(&mut self) -> f64 {
+    (self.next() >> 11) as f64 / (1u64 << 53) as f64
+  }
+
+  fn choose<T: Copy>(&mut self, values: &[T]) -> T {
+    values[(self.next() as usize) % values.len()]
+  }
+}
+
+/// The extremes and the counts [`SweepTally::feed`] accumulates, so the sweep's
+/// verdict is a handful of assertions on one value rather than an assertion
+/// buried in a loop.
+struct SweepTally {
+  /// Finite sets fed to `estimate`.
+  sets: u64,
+  /// Sets that solved.
+  ok: u64,
+  /// Sets `estimate` refused for want of spread — a legitimate outcome.
+  degenerate: u64,
+  /// Sets whose solve left `f64`. The bound says this is zero.
+  non_finite_transform: u64,
+  /// The extremes of `a² + b²` over everything that solved.
+  determinant_min: f64,
+  determinant_max: f64,
+}
+
+impl SweepTally {
+  fn new() -> Self {
+    Self {
+      sets: 0,
+      ok: 0,
+      degenerate: 0,
+      non_finite_transform: 0,
+      determinant_min: f64::INFINITY,
+      determinant_max: 0.0,
+    }
+  }
+
+  /// Solves one set and asserts everything the domain claims about the result.
+  ///
+  /// The arm and index are passed rather than a formatted label so 50 000
+  /// iterations do not allocate 50 000 strings for messages that are almost
+  /// never printed.
+  fn feed(
+    &mut self,
+    source: &[Point; LANDMARK_COUNT],
+    target: &[Point; LANDMARK_COUNT],
+    arm: &str,
+    index: usize,
+  ) {
+    let finite =
+      |set: &[Point; LANDMARK_COUNT]| set.iter().all(|p| p.x().is_finite() && p.y().is_finite());
+    if !finite(source) || !finite(target) {
+      // `estimate` names these by index and set; the bound is a claim about
+      // the FINITE `f32` sets, so a non-finite one is not a counterexample.
+      return;
+    }
+    self.sets += 1;
+    let solved = match SimilarityTransform::estimate(source, target) {
+      Ok(solved) => solved,
+      Err(Error::DegenerateLandmarks(_)) => {
+        self.degenerate += 1;
+        return;
+      }
+      Err(Error::NonFiniteTransform(_)) => {
+        self.non_finite_transform += 1;
+        return;
+      }
+      Err(other) => panic!("{arm}#{index}: unexpected {other:?}"),
+    };
+    self.ok += 1;
+
+    let (a, b) = (solved.a(), solved.b());
+    for (name, value) in [("a", a), ("b", b), ("tx", solved.tx()), ("ty", solved.ty())] {
+      assert!(
+        value.is_finite(),
+        "{arm}#{index}: solved `{name}` is {value:e}"
+      );
+    }
+    assert!(
+      (a, b) != (0.0, 0.0),
+      "{arm}#{index}: the solve collapsed the plane onto a point, which only a target with no \
+       spread should reach"
+    );
+
+    let determinant = a * a + b * b;
+    let reciprocal = 1.0 / determinant;
+    assert!(
+      determinant.is_normal() && reciprocal.is_normal(),
+      "{arm}#{index}: a={a:e} b={b:e} put a²+b²={determinant:e} (1/D={reciprocal:e}) outside the \
+       band `SimilarityTransform::inverse` declares — the Cauchy–Schwarz bound is wrong"
+    );
+    self.determinant_min = self.determinant_min.min(determinant);
+    self.determinant_max = self.determinant_max.max(determinant);
+
+    let inverted = solved.inverse().unwrap_or_else(|| {
+      panic!("{arm}#{index}: a={a:e} b={b:e} is in band and still did not invert")
+    });
+    for (name, value) in [
+      ("a", inverted.a()),
+      ("b", inverted.b()),
+      ("tx", inverted.tx()),
+      ("ty", inverted.ty()),
+    ] {
+      assert!(
+        value.is_finite(),
+        "{arm}#{index}: inverse `{name}` is {value:e}"
+      );
+    }
+  }
+}
+
+/// The template centred on itself, so an arm can rotate it about its own
+/// centroid without recomputing one.
+fn centred_template() -> [(f64, f64); LANDMARK_COUNT] {
+  let (cx, cy) = centroid(&ARCFACE_TEMPLATE);
+  ARCFACE_TEMPLATE.map(|p| (f64::from(p.x()) - cx, f64::from(p.y()) - cy))
+}
+
+#[test]
+fn every_transform_estimate_can_produce_inverts_on_the_reference_path() {
+  // The gate behind `SimilarityTransform::inverse`'s domain, and the reason
+  // `None` there may be a DECLARATION rather than a rescue: over the whole
+  // finite `f32` range, everything `estimate` returns has `a² + b²` and its
+  // reciprocal normal, so the inverse runs `cv2.warpAffine`'s own expression
+  // on every value the type can hold.
+  //
+  // A condensed, hermetic form of the 860 810-set audit sweep — same
+  // constructions, same extremes, ~50 000 sets so it runs inside `cargo test`.
+  // Both analytic ends are REPRODUCED (the two assertions at the bottom), so a
+  // sweep that quietly narrowed to a comfortable middle reds instead of
+  // passing.
+  //
+  // Measured here: a²+b² ∈ [5.308275955331472e-169, 7.358792257355573e165],
+  // against a band of [5.6e-309, 4.5e307] — more than 140 orders of margin at
+  // each end.
+  let mut rng = Xorshift(0x9E37_79B9_7F4A_7C15);
+  let mut tally = SweepTally::new();
+  let point = |x: f32, y: f32| Point::new(x, y);
+  let origin = [point(0.0, 0.0); LANDMARK_COUNT];
+
+  // 1. Random `f32` bit patterns as the SOURCE, against the real template.
+  for index in 0..20_000 {
+    let mut source = origin;
+    for slot in &mut source {
+      *slot = point(rng.bits_f32(), rng.bits_f32());
+    }
+    tally.feed(&source, &ARCFACE_TEMPLATE, "randbits-source", index);
+  }
+
+  // 2. Random bits on BOTH sides. `estimate` is public and takes its target
+  //    from the caller, so the target is part of the domain too.
+  for index in 0..15_000 {
+    let mut source = origin;
+    let mut target = origin;
+    for slot in source.iter_mut().chain(target.iter_mut()) {
+      *slot = point(rng.bits_f32(), rng.bits_f32());
+    }
+    tally.feed(&source, &target, "randbits-both", index);
+  }
+
+  // 3. Structured extremes at twelve magnitudes across the whole `f32` range,
+  //    spread by whole ulps: the regime where `Σ‖uᵢ‖²` is as small as the type
+  //    allows while the coordinates themselves are as large as it allows.
+  const MAGNITUDES: [f32; 12] = [
+    1.4e-45, 1e-44, 1e-40, 1.17e-38, 1e-30, 1e-10, 1.0, 1e3, 3.2767e4, 1e10, 1e30, 3.4e38,
+  ];
+  let mut index = 0usize;
+  for magnitude in MAGNITUDES {
+    for sign in [1.0f32, -1.0] {
+      let base = sign * magnitude;
+      let step = |n: i32| {
+        let mut value = base;
+        for _ in 0..n.abs() {
+          value = if n > 0 {
+            value.next_up()
+          } else {
+            value.next_down()
+          };
+        }
+        value
+      };
+      for k in [1i32, 2, 3, 7, 100] {
+        // (a) all five at one magnitude, spread by k ulps.
+        let spread = [
+          point(base, base),
+          point(step(k), base),
+          point(base, step(k)),
+          point(step(-k), step(k)),
+          point(step(k), step(-k)),
+        ];
+        tally.feed(&spread, &ARCFACE_TEMPLATE, "ulp-spread", index);
+        // (b) collinear: no spread at all on one axis.
+        let collinear = [
+          point(base, base),
+          point(step(k), base),
+          point(step(2 * k), base),
+          point(step(3 * k), base),
+          point(step(4 * k), base),
+        ];
+        tally.feed(&collinear, &ARCFACE_TEMPLATE, "collinear", index);
+        // (c) four coincident and one apart — the smallest spread five points
+        //     can carry without being degenerate.
+        let four_plus_one = [
+          point(base, base),
+          point(base, base),
+          point(base, base),
+          point(base, base),
+          point(step(k), step(k)),
+        ];
+        tally.feed(&four_plus_one, &ARCFACE_TEMPLATE, "four-plus-one", index);
+        index += 1;
+      }
+      // (d) one coordinate at the magnitude, four at the smallest subnormal.
+      let huge_and_tiny = [
+        point(base, base),
+        point(1.4e-45, 0.0),
+        point(0.0, 1.4e-45),
+        point(-1.4e-45, 0.0),
+        point(0.0, -1.4e-45),
+      ];
+      tally.feed(&huge_and_tiny, &ARCFACE_TEMPLATE, "huge-and-tiny", index);
+      let mixed = [
+        point(base, base),
+        point(-base, -base),
+        point(-base, base),
+        point(base, -base),
+        point(-base, -base),
+      ];
+      tally.feed(&mixed, &ARCFACE_TEMPLATE, "mixed-signs", index);
+      index += 1;
+    }
+  }
+
+  // 4. Rotations of the template onto itself, mirrored and not, at four
+  //    scales: a reflection flips the sign of the cross term, and 90° is where
+  //    the dot term vanishes.
+  let centred = centred_template();
+  index = 0;
+  for scale in [1e-3f64, 1.0, 1e3, 1e6] {
+    for degrees in [0.0f64, 45.0, 89.999, 90.0, 90.001, 135.0, 180.0, 270.0] {
+      let (sin, cos) = degrees.to_radians().sin_cos();
+      let mut rotated = origin;
+      for (slot, (x, y)) in rotated.iter_mut().zip(centred) {
+        *slot = point(
+          ((cos * x - sin * y) * scale) as f32,
+          ((sin * x + cos * y) * scale) as f32,
+        );
+      }
+      tally.feed(&rotated, &ARCFACE_TEMPLATE, "rotation", index);
+      let mirrored = rotated.map(|p| point(-p.x(), p.y()));
+      tally.feed(&mirrored, &ARCFACE_TEMPLATE, "mirrored", index);
+      index += 1;
+    }
+  }
+
+  // 5. THE DESIGNED MINIMUM. Take `u = i·k·v` — the template rotated a quarter
+  //    turn — so the two centred sets are exactly complex-orthogonal and the
+  //    solved `|a + ib|` is zero in exact arithmetic; then move ONE coordinate
+  //    by one `f32` ulp. That makes `|a + ib|` about one ulp of the perturbed
+  //    coordinate over `Σ‖uᵢ‖²`, which is the smallest a nonzero solve can be
+  //    by the argument in `SimilarityTransform::inverse`. Sweeping `k` pushes
+  //    `Σ‖uᵢ‖²` as high as `f32` allows, which is what minimises it.
+  index = 0;
+  for k in [1e-3f32, 1.0, 1e3, 1e6, 1e10, 1e20, 1e30, 1e36, 4e36] {
+    let mut quarter_turn = origin;
+    for (slot, (x, y)) in quarter_turn.iter_mut().zip(centred) {
+      *slot = point((-y * f64::from(k)) as f32, (x * f64::from(k)) as f32);
+    }
+    tally.feed(&quarter_turn, &ARCFACE_TEMPLATE, "orthogonal", index);
+    for landmark in 0..LANDMARK_COUNT {
+      for axis in 0..2 {
+        for up in [true, false] {
+          let mut perturbed = quarter_turn;
+          let (x, y) = (perturbed[landmark].x(), perturbed[landmark].y());
+          perturbed[landmark] = if axis == 0 {
+            point(if up { x.next_up() } else { x.next_down() }, y)
+          } else {
+            point(x, if up { y.next_up() } else { y.next_down() })
+          };
+          tally.feed(&perturbed, &ARCFACE_TEMPLATE, "orthogonal-plus-ulp", index);
+          index += 1;
+        }
+      }
+    }
+  }
+
+  // 6. The two analytic extremes, and the reason the bounds below are exact
+  //    numbers rather than orders of magnitude: the whole `f32` range mapped
+  //    onto the smallest subnormals, and back.
+  const TINY: [Point; LANDMARK_COUNT] = [
+    Point::new(0.0, 0.0),
+    Point::new(1.4e-45, 0.0),
+    Point::new(0.0, 1.4e-45),
+    Point::new(-1.4e-45, 0.0),
+    Point::new(0.0, -1.4e-45),
+  ];
+  const HUGE: [Point; LANDMARK_COUNT] = [
+    Point::new(3.4e38, 3.4e38),
+    Point::new(-3.4e38, 3.4e38),
+    Point::new(3.4e38, -3.4e38),
+    Point::new(-3.4e38, -3.4e38),
+    Point::new(0.0, 0.0),
+  ];
+  tally.feed(&HUGE, &TINY, "huge-to-tiny", 0);
+  tally.feed(&TINY, &HUGE, "tiny-to-huge", 0);
+
+  // 7. The realistic regime, at every scale and offset a detector could emit.
+  for index in 0..15_000 {
+    let scale = 10f64.powf(rng.unit() * 12.0 - 6.0);
+    let (sin, cos) = (rng.unit() * core::f64::consts::TAU).sin_cos();
+    let ox = (rng.unit() - 0.5) * rng.choose(&[1e0, 1e3, 1e6, 1e9, 3e38]);
+    let oy = (rng.unit() - 0.5) * rng.choose(&[1e0, 1e3, 1e6, 1e9, 3e38]);
+    let mut source = origin;
+    for (slot, (x, y)) in source.iter_mut().zip(centred) {
+      *slot = point(
+        ((cos * x - sin * y) * scale + ox) as f32,
+        ((sin * x + cos * y) * scale + oy) as f32,
+      );
+    }
+    tally.feed(&source, &ARCFACE_TEMPLATE, "face-like", index);
+  }
+
   assert_eq!(
-    (inverted.a(), inverted.b()),
-    (ordinary.a() * reciprocal, ordinary.b() * -reciprocal),
-    "an in-range transform must invert through `D = 1./D` exactly as cv2.warpAffine does"
+    tally.non_finite_transform, 0,
+    "the `NonFiniteTransform` backstop fired, so the bound in \
+     `SimilarityTransform::inverse` does not hold over finite `f32` sets"
   );
+  assert!(
+    tally.sets > 45_000 && tally.ok > 40_000,
+    "the sweep must actually solve what it feeds: {} sets, {} solved, {} degenerate",
+    tally.sets,
+    tally.ok,
+    tally.degenerate
+  );
+  // Both analytic ends reached, so a sweep that stopped covering them reds.
+  assert!(
+    tally.determinant_min < 1e-160,
+    "the sweep no longer reaches the small end: min a²+b² = {:e}",
+    tally.determinant_min
+  );
+  assert!(
+    tally.determinant_max > 1e160,
+    "the sweep no longer reaches the large end: max a²+b² = {:e}",
+    tally.determinant_max
+  );
+  for (end, determinant) in [
+    ("smallest", tally.determinant_min),
+    ("largest", tally.determinant_max),
+  ] {
+    assert!(
+      determinant.is_normal() && (1.0 / determinant).is_normal(),
+      "the {end} a²+b² the sweep produced ({determinant:e}) is outside the band, so the margin \
+       claimed in `SimilarityTransform::inverse` is gone"
+    );
+  }
 }
