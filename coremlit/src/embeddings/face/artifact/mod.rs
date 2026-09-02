@@ -198,6 +198,18 @@ impl ArtifactDigest {
 ///   caller chose rather than something found inside the bundle, it is
 ///   resolved exactly once, and nothing recurses through it.
 ///
+/// # Every allocation here is bounded by a constant
+///
+/// [`crate::embeddings::face::embed`]'s rule is that a length known only at
+/// run time is reserved fallibly. Nothing on this walk has one. The entry list
+/// grows by `push` and [`MAX_ENTRIES`] refuses the 4 097th before it is
+/// reached; each `relative` path is bounded by [`MAX_DEPTH`] names the
+/// filesystem has already capped; the read buffer is exactly [`READ_CHUNK`],
+/// which is why a multi-hundred-megabyte `weight.bin` is streamed rather than
+/// read whole; and the only [`std::path::PathBuf`] built is on a refusal, from
+/// a path that already exists. So the walk allocates infallibly, and no number
+/// out of the artifact can move what it asks for.
+///
 /// # Errors
 /// [`Error::ArtifactDigest`] naming the path that failed, for any I/O failure
 /// while walking or reading, for a `root` that is neither a directory nor a

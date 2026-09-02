@@ -38,15 +38,35 @@
 //! That capacity is the ARTIFACT's number and nothing bounds it, so the buffers
 //! it sizes are the one place this door's arithmetic is over a value it did not
 //! choose. Both per-prediction element counts are `checked_mul`'d at load and
-//! carried (`TensorElements`), and EVERY buffer sized from an artifact- or
-//! manifest-controlled number is reserved fallibly: the two per-prediction
-//! tensors through `zeroed_tensor`, the per-row embedding through
-//! `embedding_buffer`, and the de-aliasing gather `Features::from_provider`
-//! may run through `MultiArray::deep_copy`. A wrap and an abort are the two
-//! ways an accepted model used to end the caller's process instead of
-//! returning an error, and a fallible reservation on some of the buffers is
-//! not a fix for either — the abort happens at whichever one is still
-//! infallible.
+//! carried (`TensorElements`).
+//!
+//! # EVERY allocation on this path is fallible
+//!
+//! Not every allocation sized by the artifact, and not every allocation sized
+//! by the manifest — every allocation between [`FaceEmbedder::embed`] and the
+//! embeddings it returns, whatever its size came from. Four reservations cover
+//! it, each `Vec::try_reserve_exact`: the result vector through
+//! `result_buffer`, the two per-prediction tensors through `zeroed_tensor`,
+//! the per-row embedding through `embedding_buffer`, and the de-aliasing
+//! gather `Features::from_provider` may run through `MultiArray::deep_copy`.
+//!
+//! There is no list of sites this class excludes, and the absence is the
+//! point. A wrap and an abort are the two ways an accepted model ends the
+//! caller's process instead of returning an error, and a fallible reservation
+//! on SOME of the buffers fixes neither — the abort simply happens at
+//! whichever site is still infallible, one step later. Twice a site was left
+//! out under an argument about where its size came from ("the caller supplied
+//! that length", "it is a cut of a buffer that already succeeded"); each such
+//! argument has to be made afresh per site, which is how one survives a sweep.
+//! The rule is the whole path instead. Between `embed` and its result, a
+//! length known only at run time is reserved fallibly, and a length fixed at
+//! compile time is not — the rank-shaped `Vec`s `input_shape`, `input_dims`
+//! and `output_dims` build are three or four elements long by their own
+//! construction, so nothing about an artifact can move them. Off that path the
+//! rule does not reach, and each site there says so where it sits rather than
+//! in a list something has to keep up to date: `feature_names` is the only
+//! run-time length in this module that is not on the path, and the digest
+//! walk's are all bounded by constants of its own.
 //!
 //! # The load contract is a value, and a type proves it was checked
 //!
@@ -101,7 +121,7 @@ use crate::{
       AllocationFailed, BatchRow, ContractMismatch, ElementCountOverflow, EmbeddingSpaceField,
       Error, IncomparableEmbeddings, NonFiniteOutput, NonFinitePreprocessing, OutputElementCount,
       OutputShape, PredictionTensor, PreprocessingField, PreprocessingMap, Result,
-      ZeroEmbeddingWidth,
+      ResultAllocationFailed, ZeroEmbeddingWidth,
     },
   },
   model::contract::{
@@ -729,14 +749,17 @@ impl FaceEmbedding {
 
   /// An owned copy of the components.
   ///
-  /// **Not part of the fallibly-reserved class, deliberately.** Every buffer
-  /// `embed` sizes from the artifact's batch or the manifest's width is
-  /// reserved through `try_reserve_exact` because the door ACCEPTED a model
-  /// whose numbers it did not choose and must not then abort. This is the
-  /// other side of that: the vector already exists, so duplicating it asks the
-  /// allocator for a length it has just served, and the same is true of this
-  /// type's derived [`Clone`]. [`Self::as_slice`] borrows the same components
-  /// and allocates nothing, for a caller that does not need the copy.
+  /// **Off the embed path rather than an exception to it.** Every allocation
+  /// between [`FaceEmbedder::embed`] and the embeddings it returns is fallible,
+  /// with no site excluded — this one is not on that path at all. It is an
+  /// accessor the caller reaches for afterwards, and it duplicates a vector
+  /// that already exists, so it asks the allocator for a length it has just
+  /// served; the same is true of this type's derived [`Clone`], which is
+  /// infallible for the same reason and could not be otherwise. It is a `Vec`
+  /// method with no fallible spelling, and giving it one would put a `Result`
+  /// on a copy of memory the caller already owns. [`Self::as_slice`] borrows
+  /// the same components and allocates nothing, for a caller that does not
+  /// need the copy.
   #[inline]
   pub fn to_vec(&self) -> Vec<f32> {
     self.values.to_vec()
@@ -1105,6 +1128,8 @@ impl FaceEmbedder {
   /// always equals `faces.len()`.
   ///
   /// # Errors
+  /// [`Error::ResultAllocationFailed`] if the returned vector itself — one
+  /// [`FaceEmbedding`] per face — is one the allocator will not give;
   /// [`Error::AllocationFailed`] if a buffer the graph's batch or the
   /// manifest's width sizes cannot be allocated — either per-prediction tensor,
   /// or any one of the per-row embeddings a chunk is cut into — an error rather
@@ -1121,16 +1146,20 @@ impl FaceEmbedder {
   /// a NaN or infinite component; [`Error::EmbeddingZero`] if a (finite)
   /// output row has zero magnitude and cannot be normalised.
   pub fn embed(&self, faces: &[AlignedFace]) -> Result<Vec<FaceEmbedding>> {
-    let mut out = Vec::with_capacity(faces.len());
+    // The ONE reservation the whole call makes for its result, and the only
+    // one: `predict_chunk` pushes its rows straight in here rather than
+    // building a chunk-sized `Vec` of its own to be extended from. Two
+    // allocations sized at run time became one, and that one is fallible.
+    let mut out = result_buffer(faces.len())?;
     let batch = self.input.batch;
     for (chunk_index, chunk) in faces.chunks(batch).enumerate() {
-      let rows = self.predict_chunk(chunk, chunk_index * batch)?;
-      out.extend(rows);
+      self.predict_chunk(chunk, chunk_index * batch, &mut out)?;
     }
     Ok(out)
   }
 
-  /// Predicts one chunk of at most [`Self::batch_capacity`] faces.
+  /// Predicts one chunk of at most [`Self::batch_capacity`] faces, APPENDING
+  /// its embeddings to `out`.
   ///
   /// `first_row` is the chunk's offset into the caller's slice, so every error
   /// names the caller's own index rather than a position inside a chunk the
@@ -1144,12 +1173,28 @@ impl FaceEmbedder {
   /// flat buffer fallibly and the rows infallibly would move the abort rather
   /// than remove it — the rows are the larger half once the chunk is full.
   ///
+  /// **The pushes cannot allocate, which is why appending is what this takes
+  /// rather than a `Vec` of its own.** [`Self::embed`] reserved exactly
+  /// `faces.len()`; `slice::chunks` PARTITIONS `faces`, so the chunk lengths
+  /// sum to that; and this appends exactly `chunk.len()` rows, because `flat`
+  /// is `batch · dim` long so `chunks_exact(dim)` yields `batch` rows and
+  /// `take(chunk.len())` cuts that to the chunk's own count. `Vec::push`
+  /// allocates only when the length has reached the capacity, which no prefix
+  /// of that sum does. Returning a chunk-sized `Vec` instead put a second
+  /// run-time-sized allocation on the path for the caller to extend from,
+  /// which is one more site than the class needs.
+  ///
   /// # Panics
   /// Never, and the one that could is `chunks_exact(dim)`, which panics on a
   /// chunk size of zero. `dim` is the MANIFEST's, so nothing about the graph
   /// bounds it; [`load_contract`] refuses a zero-width manifest before this
   /// door exists, which is what makes the split total.
-  fn predict_chunk(&self, chunk: &[AlignedFace], first_row: usize) -> Result<Vec<FaceEmbedding>> {
+  fn predict_chunk(
+    &self,
+    chunk: &[AlignedFace],
+    first_row: usize,
+    out: &mut Vec<FaceEmbedding>,
+  ) -> Result<()> {
     let dim = self.manifest.dim();
     let tensor = self.build_input(chunk)?;
     let mut outputs = self
@@ -1170,12 +1215,11 @@ impl FaceEmbedder {
 
     let mut flat = zeroed_tensor(PredictionTensor::Output, self.elements.output)?;
     features.copy_into::<f32>(&mut flat)?;
-    let mut rows = Vec::with_capacity(chunk.len());
     let space = self.space;
     for (offset, row) in flat.chunks_exact(dim).take(chunk.len()).enumerate() {
-      rows.push(normalise_row(row, first_row + offset, space)?);
+      out.push(normalise_row(row, first_row + offset, space)?);
     }
-    Ok(rows)
+    Ok(())
   }
 
   /// Builds the `[batch, …]` input tensor for one chunk, zero-padding the tail
@@ -1206,6 +1250,11 @@ impl FaceEmbedder {
 /// The rank is the CONTRACT's, not a constant. A graph that declares
 /// `[3, 112, 112]` is handed `[3, 112, 112]`; only a graph that declared the
 /// batch axis is handed one.
+///
+/// Infallible, and the shape of every site on this path that is: the `Vec` is
+/// three or four `usize`s by construction — a RANK, which both arms write out
+/// literally — so no artifact number reaches its length and there is no
+/// allocator refusal to report. See the module doc for the rule.
 fn input_shape(contract: InputContract, layout: TensorLayout) -> Vec<usize> {
   let face = match layout {
     TensorLayout::Nchw => [3, TEMPLATE_SIZE, TEMPLATE_SIZE],
@@ -1223,6 +1272,14 @@ fn input_shape(contract: InputContract, layout: TensorLayout) -> Vec<usize> {
 }
 
 /// The declared feature names, for a contract-mismatch message.
+///
+/// The one allocation in this module whose length is a run-time number and
+/// which is still infallible — how many features the description declares —
+/// for two reasons no site on the embed path can claim. It runs at LOAD, and
+/// only on a refusal; and it borrows names out of a `[FeatureInfo]` slice that
+/// is already materialised, so each `&str` it collects is 16 bytes against a
+/// `FeatureInfo` several times that. It cannot ask for memory the caller is not
+/// already holding.
 fn feature_names(features: &[crate::FeatureInfo]) -> Vec<&str> {
   features.iter().map(crate::FeatureInfo::name).collect()
 }
@@ -1668,6 +1725,9 @@ fn input_form(shape: &[usize]) -> Option<(InputRank, usize)> {
 /// The contract axes for an input feature of this rank and layout — the
 /// per-axis form of the shape [`input_shape`] later builds, so the geometry the
 /// door STATES and the geometry it FEEDS come from one pair of arms.
+///
+/// Infallible for [`input_shape`]'s reason: three or four axes, written out
+/// literally, with no artifact number in the length.
 fn input_dims(rank: InputRank, layout: TensorLayout) -> Vec<Dim> {
   let face = match layout {
     TensorLayout::Nchw => [
@@ -1725,6 +1785,9 @@ fn output_form(shape: &[usize], batch: usize) -> Option<OutputContract> {
 ///
 /// The batch axis is [`Dim::Exactly`] rather than [`Dim::AnyFixed`] because
 /// this door does more than read it back — see [`FaceEmbedder::load`].
+///
+/// Infallible for [`input_shape`]'s reason: one axis or two. The artifact's
+/// batch appears as a VALUE inside a `Dim`, never as the length.
 fn output_dims(form: OutputContract, batch: usize, dim: usize) -> Vec<Dim> {
   match form {
     OutputContract::Flat => vec![Dim::Exactly(dim)],
@@ -1914,6 +1977,31 @@ fn embedding_buffer(elements: usize) -> Result<Vec<f32>> {
     Error::AllocationFailed(AllocationFailed::new(PredictionTensor::Output, elements))
   })?;
   Ok(values)
+}
+
+/// The vector [`FaceEmbedder::embed`] returns, `faces` long, reserved FALLIBLY.
+///
+/// The last member of the class, and the one an enumeration left out: this
+/// length is the CALLER's `faces.len()` rather than a number read off the
+/// artifact, and "the caller supplied it" was taken as a reason to keep
+/// `Vec::with_capacity` here. It is not one. `with_capacity` answers a refusal
+/// by aborting the process, so the door still ended its caller's process under
+/// memory pressure — at this site rather than at the tensor buffers already
+/// converted, which is the same failure one step earlier. A caller's slice of
+/// N faces is also not a bound on N embeddings: an [`AlignedFace`] is a
+/// pointer and an optional transform, while a [`FaceEmbedding`] is a `Vec` and
+/// a whole [`EmbeddingSpace`], so the result is several times the slice that
+/// sized it before a single `dim`-wide row is allocated on top.
+///
+/// Returns an EMPTY `Vec` with the capacity secured, which is what lets
+/// `FaceEmbedder::predict_chunk` append into it: `Vec::push` allocates only on
+/// reaching the capacity, and the chunk lengths sum to exactly `faces`.
+fn result_buffer(faces: usize) -> Result<Vec<FaceEmbedding>> {
+  let mut out: Vec<FaceEmbedding> = Vec::new();
+  out
+    .try_reserve_exact(faces)
+    .map_err(|_| Error::ResultAllocationFailed(ResultAllocationFailed::new(faces)))?;
+  Ok(out)
 }
 
 #[cfg(test)]

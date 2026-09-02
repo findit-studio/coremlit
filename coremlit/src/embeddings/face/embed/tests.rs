@@ -1743,6 +1743,71 @@ fn the_embedding_row_allocator_refuses_rather_than_aborting() {
   assert!((embedding.as_slice()[1] - 0.8).abs() < 1e-6);
 }
 
+/// **FALSIFIER (red first).** The third of the class, and the site two sweeps
+/// left out: `embed` reserved its RESULT with `Vec::with_capacity(faces.len())`
+/// and `predict_chunk` its rows with `Vec::with_capacity(chunk.len())`. Both
+/// were excluded as "caller-sized" — an argument about where the length came
+/// from, made per site, which is exactly how a site survives a sweep. Neither
+/// length is bounded by the caller's slice in any case: an [`AlignedFace`] is a
+/// pointer and an optional transform, a [`FaceEmbedding`] is a `Vec` and a
+/// whole [`EmbeddingSpace`].
+///
+/// `with_capacity` answers a refusal with `handle_alloc_error`, so the door
+/// aborted its caller's process here after every artifact-sized buffer had
+/// been converted to return an error. The chunk-sized vector is gone entirely
+/// — `predict_chunk` appends into the one reserved result — so this drives the
+/// single reservation that remains, at two lengths on either side of `Vec`'s
+/// capacity arithmetic, exactly as the two gates above drive `zeroed_tensor`
+/// and `embedding_buffer`.
+#[test]
+fn the_result_allocator_refuses_rather_than_aborting() {
+  // `usize::MAX` embeddings is `usize::MAX * size_of::<FaceEmbedding>()` bytes:
+  // the length cannot even be turned into a layout, and `Vec` reports
+  // `CapacityOverflow`.
+  let error = result_buffer(usize::MAX)
+    .expect_err("a face count whose byte size leaves `usize` has no result vector");
+  assert!(
+    matches!(
+      &error,
+      Error::ResultAllocationFailed(r) if r.faces() == usize::MAX
+    ),
+    "{error}"
+  );
+
+  // `usize::MAX / 8` is a layout `Vec` will happily describe — under
+  // `isize::MAX` bytes, since one `FaceEmbedding` is well under eight — and
+  // that no allocator will satisfy, so this is the arm that reaches a real
+  // `AllocError`.
+  let beyond_memory = usize::MAX / 8;
+  let error = result_buffer(beyond_memory)
+    .expect_err("a result vector the allocator refuses is an error, not an abort");
+  assert!(
+    matches!(
+      &error,
+      Error::ResultAllocationFailed(r) if r.faces() == beyond_memory
+    ),
+    "{error}"
+  );
+  assert!(
+    error.to_string().contains(&beyond_memory.to_string()),
+    "the refusal must name the count that was asked for, got {error}"
+  );
+
+  // A count that CAN be met comes back EMPTY with the capacity secured, which
+  // is the contract `predict_chunk` appends under: it pushes exactly
+  // `faces.len()` rows in total, and `Vec::push` allocates only on reaching the
+  // capacity.
+  let out = result_buffer(9).expect("nine embeddings fit");
+  assert!(out.is_empty());
+  assert!(out.capacity() >= 9);
+
+  // Zero faces reserve nothing and still succeed, so `embed`'s documented
+  // "an empty slice yields an empty vector without touching the model" needs no
+  // arm of its own.
+  let empty = result_buffer(0).expect("no faces need no buffer");
+  assert!(empty.is_empty());
+}
+
 // ── The one gate here that loads a real artifact ───────────────────────────
 
 /// **The wiring, on a description CoreML itself produced.**

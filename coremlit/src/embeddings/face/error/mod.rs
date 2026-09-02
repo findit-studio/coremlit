@@ -1020,14 +1020,20 @@ impl ElementCountOverflow {
 /// sizes from an artifact are reserved with `Vec::try_reserve_exact` instead,
 /// and this payload is what the refusal carries.
 ///
-/// **Three buffers, one class.** Both PER-PREDICTION tensors are covered, and
-/// so is the PER-ROW buffer one embedding is normalised into: its width is the
-/// manifest's `dim`, which is half of the output tensor's own count, and it is
-/// allocated once per row — so across a full chunk the rows duplicate the
-/// output tensor while the flat gather buffer and both native tensors are
-/// still live. [`Self::tensor`] reports [`PredictionTensor::Output`] for a
-/// row, because a row IS a cut of the output tensor, and [`Self::elements`]
-/// then reports that row's width rather than the whole tensor's count.
+/// **Three buffers of `f32`, and it is not the whole class.** Both
+/// PER-PREDICTION tensors are covered, and so is the PER-ROW buffer one
+/// embedding is normalised into: its width is the manifest's `dim`, which is
+/// half of the output tensor's own count, and it is allocated once per row —
+/// so across a full chunk the rows duplicate the output tensor while the flat
+/// gather buffer and both native tensors are still live. [`Self::tensor`]
+/// reports [`PredictionTensor::Output`] for a row, because a row IS a cut of
+/// the output tensor, and [`Self::elements`] then reports that row's width
+/// rather than the whole tensor's count.
+///
+/// The fourth allocation on the path is the RESULT vector, which holds
+/// embeddings rather than `f32`s and so carries [`ResultAllocationFailed`]
+/// instead. Between them the two payloads cover every allocation `embed` makes
+/// whose length is a run-time number; nothing on that path is excluded.
 ///
 /// Payload of [`Error::AllocationFailed`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1055,6 +1061,54 @@ impl AllocationFailed {
   #[inline(always)]
   pub const fn elements(&self) -> usize {
     self.elements
+  }
+}
+
+/// The vector [`crate::embeddings::face::FaceEmbedder::embed`] returns, one
+/// [`crate::embeddings::face::FaceEmbedding`] per face, which the allocator
+/// would not give.
+///
+/// # Why this is not an [`AllocationFailed`]
+///
+/// It is a sibling rather than a third [`PredictionTensor`], because the thing
+/// being allocated is neither a tensor nor a count of `f32`s: it holds
+/// `FaceEmbedding`s, each of which owns a `dim`-wide buffer of its own, so a
+/// message naming `f32` elements would name the wrong unit and the wrong
+/// number. [`PredictionTensor`] also discriminates [`ElementCountOverflow`],
+/// where a result vector has no `batch · per_row` product to overflow — one
+/// discriminator serving two payloads must not grow a variant only one of them
+/// can mean.
+///
+/// # Why it is fallible at all
+///
+/// The length is the caller's own `faces.len()` rather than a number read off
+/// the artifact, and that is not a reason to leave it infallible.
+/// `Vec::with_capacity` answers a refusal by ABORTING the process, so a door
+/// whose every other allocation returns an error still ends its caller's
+/// process at whichever site is still infallible — and an argument about where
+/// a size came from has to be made afresh for every site, which is exactly the
+/// enumeration that left this one behind. Every allocation between `embed` and
+/// the embeddings it returns is reserved through `Vec::try_reserve_exact`;
+/// this payload is what the last of them carries.
+///
+/// Payload of [`Error::ResultAllocationFailed`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ResultAllocationFailed {
+  /// How many embeddings were asked for — the caller's face count.
+  faces: usize,
+}
+
+impl ResultAllocationFailed {
+  /// Construct from the face count that was refused.
+  #[inline(always)]
+  pub const fn new(faces: usize) -> Self {
+    Self { faces }
+  }
+
+  /// How many embeddings were asked for — the caller's face count.
+  #[inline(always)]
+  pub const fn faces(&self) -> usize {
+    self.faces
   }
 }
 
@@ -1190,6 +1244,12 @@ pub enum Error {
     .0.tensor(), .0.elements()
   )]
   AllocationFailed(AllocationFailed),
+  /// The vector `embed` returns could not be allocated.
+  #[error(
+    "could not allocate the result vector's {} embeddings",
+    .0.faces()
+  )]
+  ResultAllocationFailed(ResultAllocationFailed),
   /// Two embeddings come from different artifact, routing or preprocessing
   /// spaces.
   #[error(
