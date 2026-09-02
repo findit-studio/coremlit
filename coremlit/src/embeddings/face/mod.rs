@@ -31,7 +31,7 @@
 //!
 //! macOS only (built on [`crate`]).
 //!
-//! # Three shapes that are deliberate
+//! # The shapes that are deliberate
 //!
 //! - **Alignment is OUTSIDE the embedder.** [`FaceAlign::to_template`] is a
 //!   pure function producing an explicit [`AlignedFace`], so the 5-point
@@ -51,6 +51,14 @@
 //!   only if byte-identical weights produced them, read from the same output
 //!   feature — [`FaceEmbedding::dot`] cannot return a score across different
 //!   weights. See the [`artifact`] module.
+//! - **The load contract is a value, and a type proves it was checked.**
+//!   [`FaceEmbedder`] holds a crate-internal `Checked` model whose only
+//!   constructor runs this door's contract, so an extra required input, a
+//!   declared state buffer, a wrong element type and a flexible input shape are
+//!   all refused when the model is loaded rather than discovered at predict
+//!   time — and deleting the check does not compile. The [`embed`] module
+//!   carries the contract, and the legacy `neuralNetwork` export it refuses
+//!   deliberately.
 //!
 //! # No artifact is staged, and that is a finding rather than an omission
 //!

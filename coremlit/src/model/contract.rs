@@ -44,12 +44,16 @@ pub(crate) enum Dim {
   /// The axis admits exactly one size, whatever it is. The door READS the
   /// value back from [`FeatureInfo::shape`] after the check rather than
   /// requiring it — the shape of a door configured by a manifest.
-  // Constructed by the contract fixtures and by no door YET, so it is dead in a
-  // shipped build. Its first producer is the face door's manifest-built
-  // contract (coremlit #135 §4); the clause is specified and driven over
-  // fixtures now so that door adopts this reading rather than adding a second
-  // one. Drop the attribute when that lands.
-  #[allow(dead_code, reason = "constructed by the face door in coremlit #135 §4")]
+  //
+  // `embeddings::face` is the producer the clause was specified for: that
+  // door's geometry comes from a manifest read at load and its batch is the
+  // ARTIFACT's, so its input batch axis is this and the value is read back off
+  // the checked model. Still dead in a build without that feature, where no
+  // door reads an axis back rather than requiring it.
+  #[cfg_attr(
+    not(feature = "face"),
+    allow(dead_code, reason = "the face door is this variant's only producer")
+  )]
   AnyFixed,
   /// The axis is deliberately symbolic, over exactly this range. The door
   /// varies the size within it on purpose, so a graph that pins the axis is as
@@ -564,13 +568,14 @@ fn check_feature_contract(
 /// contract would want the opposite pair — so every forwarded method is a
 /// decision recorded here.
 ///
-/// Forwarded today: [`Self::predict_with`] alone, the borrowed-input
-/// prediction entry, which is the whole of what the identity door calls on a
-/// [`Model`] and therefore the whole of what a stateless graph needs. A door
-/// that means to read a [`Dim::AnyFixed`] axis's value back wants a
-/// `description` accessor here; it is added with its first caller rather than
-/// ahead of one, so the exposed surface never carries a method no contract has
-/// been written against.
+/// Forwarded today, each landed with the caller that needed it:
+/// [`Self::predict_with`], the borrowed-input prediction entry, which is the
+/// whole of what `audio::identity` calls on a [`Model`] and therefore the whole
+/// of what a stateless graph needs; and [`Self::description`], for a door that
+/// means to READ a [`Dim::AnyFixed`] axis's value back rather than require it
+/// — `embeddings::face`, whose batch is the artifact's and not its own. Neither
+/// was added ahead of its caller, so the exposed surface carries no method no
+/// contract has been written against.
 #[derive(Debug)]
 pub(crate) struct Checked {
   model: Model,
@@ -586,6 +591,21 @@ impl Checked {
   pub(crate) fn new(model: Model, contract: &LoadContract) -> Result<Self, ContractViolation> {
     check_load_contract(model.description(), contract)?;
     Ok(Self { model })
+  }
+
+  /// The description of the model this value's contract was checked against.
+  ///
+  /// **Why a door reads it HERE rather than off the [`Model`] before the
+  /// check.** [`Dim::AnyFixed`] is specified as an axis whose value the door
+  /// reads back AFTERWARDS, and the two moments are not the same fact. Before
+  /// the check [`FeatureInfo::shape`] can be the DEFAULT shape of a flexible
+  /// feature — a `RangeDim` or enumerated graph reports one it will happily
+  /// accept others beside. After it the feature is
+  /// [`ShapeConstraint::Fixed`], which is what an `AnyFixed` axis requires, so
+  /// the same number is a fact about the graph rather than a reading of its
+  /// declaration.
+  pub(crate) const fn description(&self) -> &ModelDescription {
+    self.model.description()
   }
 
   /// Runs a synchronous prediction from borrowed inputs.

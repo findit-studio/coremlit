@@ -898,7 +898,7 @@ impl Model {
 // stays compiled under every feature set, so a change that breaks it is caught
 // everywhere rather than only where a door happens to be on.
 #[cfg_attr(
-  not(any(feature = "identity", test)),
+  not(any(feature = "identity", feature = "face", test)),
   allow(dead_code, reason = "no door in this feature set holds a `Checked`")
 )]
 pub(crate) mod contract;

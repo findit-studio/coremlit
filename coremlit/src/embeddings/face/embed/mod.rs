@@ -29,14 +29,58 @@
 //!
 //! [`FaceEmbedder::embed`] takes a slice: a keyframe with N faces is ONE call,
 //! whatever the graph's own batch dimension turns out to be. The capacity is
-//! read off the loaded model's input contract at load
-//! ([`FaceEmbedder::batch_capacity`]) and the slice is chunked to it, so a
+//! read off the loaded model's input feature — after the load contract below
+//! has established that the feature admits exactly one shape, so it is the
+//! graph's ONLY batch and not the default a flexible one would also report
+//! ([`FaceEmbedder::batch_capacity`]) — and the slice is chunked to it, so a
 //! batch-1 export and a batch-8 export are the same call site.
+//!
+//! # The load contract is a value, and a type proves it was checked
+//!
+//! [`FaceEmbedder`] holds a `Checked` model, never a bare [`Model`]: the only
+//! constructor of that wrapper takes this door's `LoadContract` and runs it,
+//! so removing the load check is a compile error rather than a mutation that
+//! survives every test. The contract is BUILT at load rather than written down
+//! as a constant, because two of its numbers are not this module's — the
+//! embedding width is the caller's [`FaceModel::dim`], and the batch is the
+//! artifact's, read back off the checked model.
+//!
+//! Three declarations used to load clean here and then fail, or degrade, at
+//! predict time. Each is a clause now:
+//!
+//! - a graph declaring the manifest's input **plus another REQUIRED input**,
+//!   which [`FaceEmbedder::embed`] never sends;
+//! - a graph declaring an **`MLState` buffer**, which is not an input at all —
+//!   it lives in its own dictionary, so a stateful graph naming exactly these
+//!   two features cleared every check this door used to make;
+//! - a **flexible** input whose DEFAULT shape reads `[n, 3, 112, 112]`.
+//!   [`crate::FeatureInfo::shape`] reports the default of a `RangeDim` or
+//!   enumerated feature rather than a bound, so its numbers are
+//!   indistinguishable from a pinned graph's and the batch read off it would be
+//!   a default rather than a fact.
+//!
+//! ## A legacy `neuralNetwork` export is refused at load, deliberately
+//!
+//! An earlier version of this door accepted an EMPTY declared shape on either
+//! feature — the legacy `neuralnetwork` specification leaves shapes undeclared
+//! — by guessing a batch-one graph and leaving the guess to be caught at
+//! predict time. The guess is gone: a feature this door cannot read a rank off
+//! is refused when the model is loaded, and so is one whose geometry is not
+//! [`crate::ShapeConstraint::Fixed`].
+//!
+//! The refusal is wider than the empty shape it started from, and that is
+//! worth stating rather than discovering. [`crate::ShapeConstraint`]'s measured
+//! table records that **every output of a `neuralnetwork` export reports
+//! `Unspecified`, even when its input is fixed** — so no artifact in that
+//! format loads here, whatever it declares. Fail-closed is the choice: a shape
+//! this door guesses is a shape nothing measured. If a real legacy artifact
+//! ever matters it arrives as a contract variant with a measurement behind it,
+//! not as an arm with a guess in it.
 
 use std::path::Path;
 
 use crate::{
-  ComputeUnits, DataType, Model, MultiArray,
+  ComputeUnits, DataType, Model, ModelDescription, MultiArray,
   embeddings::face::{
     align::{AlignedFace, TEMPLATE_SIZE},
     artifact::{ArtifactDigest, digest_artifact},
@@ -44,6 +88,9 @@ use crate::{
       BatchRow, ContractMismatch, EmbeddingSpaceField, Error, IncomparableEmbeddings,
       NonFiniteOutput, OutputElementCount, OutputShape, Result,
     },
+  },
+  model::contract::{
+    Checked, ContractViolation, Dim, FeatureContract, LoadContract, StateContract,
   },
 };
 
@@ -523,9 +570,9 @@ impl FaceEmbedderOptions {
 ///   hashes to, and neither [`crate::embeddings::face::ArtifactDigest`] nor
 ///   [`EmbeddingSpace`] has a public constructor;
 /// - `dim` was reconciled against the artifact's own declared output width at
-///   load — **except** for a legacy `neuralNetwork` export that declares no
-///   shape, where it remains the caller's claim until the first prediction
-///   checks it;
+///   load, with no exception left: the legacy `neuralNetwork` form that used to
+///   declare no shape and carry the caller's claim to the first prediction is
+///   now refused at load (see the module doc);
 /// - the preprocessing half is caller-stated and cannot be otherwise: the
 ///   artifact does not declare its own normalisation, and the preprocessing
 ///   really is what the host did to the pixels, so comparing it is sound.
@@ -750,14 +797,20 @@ fn space_difference(left: EmbeddingSpace, right: EmbeddingSpace) -> Option<Embed
 /// matching every other kit in this crate.
 #[derive(Debug)]
 pub struct FaceEmbedder {
-  model: Model,
+  /// A [`Checked`], never a bare [`Model`]: [`load_contract`] builds the only
+  /// contract this door states and [`Checked::new`] is the only way a model is
+  /// wrapped in one, so deleting the check from [`Self::load`] does not
+  /// compile.
+  model: Checked,
   manifest: FaceModel,
   /// The space every vector this embedder produces is stamped with, built at
   /// load from the manifest AND the digest of the bytes that were read.
   space: EmbeddingSpace,
-  /// The graph's own batch dimension AND declared rank, read from the input
-  /// contract at load. The rank is carried, not just the capacity: a model
-  /// that declares the unbatched rank-3 form has to be fed a rank-3 tensor.
+  /// The graph's own batch dimension AND declared rank. The rank is what
+  /// decided the contract; the batch is READ BACK off the checked model, which
+  /// is what makes [`Dim::AnyFixed`] a fact rather than a claim. The rank is
+  /// carried, not just the capacity: a model that declares the unbatched
+  /// rank-3 form has to be fed a rank-3 tensor.
   input: InputContract,
   /// The output form the graph declared, so a predicted tensor is checked
   /// against the axes it promised and not merely against an element count.
@@ -772,11 +825,59 @@ impl FaceEmbedder {
   /// features, or claims the wrong width, fails at load rather than producing
   /// a plausible-looking wrong vector.
   ///
-  /// Both features must be `float32` MULTI-ARRAYS. Inference supplies and
-  /// extracts nothing else, so an f16 export — or an `ImageType` feature,
-  /// which carries no shape and no element type at all and is what both
-  /// third-party CoreML ArcFace builds this module's doc surveys declare — is
-  /// refused here rather than loading clean and failing every prediction.
+  /// # The contract, and where each of its numbers comes from
+  ///
+  /// The model is checked against a crate-internal `LoadContract` and held as
+  /// a `Checked` whose only constructor runs that check, so there is no
+  /// separate list of validations here to fall out of step with what the door
+  /// needs:
+  ///
+  /// ```text
+  /// input   manifest.input()   f32  [n, 3, 112, 112]  n AnyFixed, the rest Exactly
+  ///                            f32  [3, 112, 112]     the unbatched form
+  ///                     NHWC:  f32  [n, 112, 112, 3] / [112, 112, 3]
+  /// output  manifest.output()  f32  [n, dim]          n Exactly the input's batch
+  ///                            f32  [dim]             only where that batch is 1
+  /// state   none
+  /// ```
+  ///
+  /// `dim` is [`FaceModel::dim`] and the layout is
+  /// [`Preprocessing::layout`] — both the caller's. `n` is the ARTIFACT's: the
+  /// declared RANK of the input feature picks which of the two forms the
+  /// contract states, and the batch axis is an "any one fixed size" axis —
+  /// this door does not require a batch, it reads back whichever one the graph
+  /// pins. It reads it off the CHECKED model, so the number
+  /// [`Self::batch_capacity`] reports came from a description established to
+  /// admit exactly one shape, rather than from the default a flexible graph
+  /// also reports.
+  ///
+  /// The OUTPUT's batch axis is `Exactly` that same number rather than
+  /// `AnyFixed`, because this door does more than read it: [`Self::embed`]
+  /// sends `n` faces and cuts `n` rows out of what comes back, so a graph that
+  /// takes `n` and emits some other row count is one this door cannot use, and
+  /// refusing it at load is the difference between a mismatch and a batch of
+  /// silently wrong vectors.
+  ///
+  /// # What is refused, and why a list of feature checks was not enough
+  ///
+  /// The contract is complete over the three members of
+  /// [`crate::ModelDescription`] that can make an otherwise-conformant
+  /// prediction fail, not just over the two features this door names: a graph
+  /// carrying the manifest's input plus another REQUIRED input clears every
+  /// per-feature clause and then fails every prediction, and a STATE buffer is
+  /// not an input at all — it lives in its own dictionary, so a stateful graph
+  /// declaring exactly these two features clears the input set too and only
+  /// then meets [`Self::embed`], which predicts through the stateless API
+  /// CoreML does not let a stateful model be called with.
+  ///
+  /// Both features must be `float32` MULTI-ARRAYS with a PINNED shape.
+  /// Inference supplies and extracts nothing else, so an f16 export — or an
+  /// `ImageType` feature, which carries no shape and no element type at all
+  /// and is what both third-party CoreML ArcFace builds this module's doc
+  /// surveys declare — is refused here rather than loading clean and failing
+  /// every prediction. A FLEXIBLE feature is refused for a different reason,
+  /// and the module doc carries it along with the deliberate refusal of every
+  /// legacy `neuralNetwork` export.
   ///
   /// # The digest of the loaded bytes is taken here
   ///
@@ -795,11 +896,13 @@ impl FaceEmbedder {
   /// different bundles being compared as one.
   ///
   /// # Errors
-  /// [`Error::Load`] if CoreML rejects the model;
-  /// [`Error::ContractMismatch`] if the model declares no feature by the
-  /// manifest's name, if either feature is not a `float32` multi-array, or if
-  /// its input/output shapes are not a batch of `3 × 112 × 112` and a batch of
-  /// [`FaceModel::dim`];
+  /// [`Error::Load`] if CoreML rejects the model; [`Error::ContractMismatch`]
+  /// if the model declares no feature by the manifest's name, if the declared
+  /// rank of either feature is one no contract of this door's can be built
+  /// from (an undeclared shape included), or if a named feature's element
+  /// type, rank, shape flexibility or any one axis is not the contract's;
+  /// [`Error::UnsatisfiableInput`] if it requires an input this door never
+  /// sends; [`Error::UnsatisfiableState`] if it declares a state buffer;
   /// [`Error::ArtifactDigest`] if the artifact's bytes cannot be read — which
   /// fails the load rather than producing vectors with no identity.
   pub fn load(
@@ -809,62 +912,16 @@ impl FaceEmbedder {
   ) -> Result<Self> {
     let model_path = model_path.as_ref();
     let model = Model::load(model_path, options.compute())?;
-    let (input_contract, output_contract) = {
-      let description = model.description();
-      let input = description.input(manifest.input()).ok_or_else(|| {
-        Error::ContractMismatch(ContractMismatch::new(
-          manifest.input().to_string(),
-          "a declared input feature".to_string(),
-          format!("inputs {:?}", feature_names(description.inputs())),
-        ))
-      })?;
-      let contract = resolve_input_contract(
-        input.shape(),
-        input.data_type(),
-        manifest.preprocessing().layout(),
-      )
-      .ok_or_else(|| {
-        Error::ContractMismatch(ContractMismatch::new(
-          manifest.input().to_string(),
-          format!(
-            "{:?} shaped [n, 3, {TEMPLATE_SIZE}, {TEMPLATE_SIZE}] (or without the batch axis) \
-             float32",
-            manifest.preprocessing().layout()
-          ),
-          describe(input.shape(), input.data_type()),
-        ))
-      })?;
-      let batch = contract.batch();
-      let output = description.output(manifest.output()).ok_or_else(|| {
-        Error::ContractMismatch(ContractMismatch::new(
-          manifest.output().to_string(),
-          "a declared output feature".to_string(),
-          format!("outputs {:?}", feature_names(description.outputs())),
-        ))
-      })?;
-      let declared =
-        check_output_contract(output.shape(), output.data_type(), batch, manifest.dim()).map_err(
-          |actual| {
-            Error::ContractMismatch(ContractMismatch::new(
-              manifest.output().to_string(),
-              format!(
-                "[{batch}, {}] (or [{}] for a batch-one graph) float32",
-                manifest.dim(),
-                manifest.dim()
-              ),
-              actual,
-            ))
-          },
-        )?;
-      (contract, declared)
-    };
+    let (contract, rank, output) = load_contract(model.description(), &manifest)?;
+    let model = Checked::new(model, &contract).map_err(contract_violation)?;
+    let input = InputContract::read_back(model.description(), manifest.input(), rank);
     let space = EmbeddingSpace::of(digest_artifact(model_path)?, &manifest);
     Ok(Self {
       model,
       manifest,
       space,
-      input: input_contract,
-      output: output_contract,
+      input,
+      output,
     })
   }
 
@@ -894,7 +951,9 @@ impl FaceEmbedder {
     self.space
   }
 
-  /// The graph's own batch dimension, resolved from its input contract at load.
+  /// The graph's own batch dimension, read off its input feature at load —
+  /// after the load contract established that the feature admits exactly one
+  /// shape, so this is the graph's only batch rather than its default one.
   ///
   /// [`Self::embed`] chunks any slice to this, so it is a throughput fact
   /// rather than a call-site constraint.
@@ -1031,63 +1090,217 @@ struct InputContract {
 }
 
 impl InputContract {
-  /// How many faces one prediction consumes.
-  #[inline]
-  const fn batch(&self) -> usize {
-    self.batch
+  /// The contract the door runs on, taken off a model that has ALREADY been
+  /// checked against the [`LoadContract`] `rank` came from.
+  ///
+  /// # Why the batch is read here and not kept from the declaration
+  ///
+  /// [`Dim::AnyFixed`] is specified as an axis whose value the door reads back
+  /// after the check, and the two moments are not the same fact. Before it,
+  /// [`crate::FeatureInfo::shape`] can be the DEFAULT shape of a flexible
+  /// feature — a `RangeDim` or enumerated graph reports one it will accept
+  /// others beside. After it, the feature is
+  /// [`crate::ShapeConstraint::Fixed`], which is what an `AnyFixed` axis
+  /// requires, so the number is the graph's only batch rather than a reading of
+  /// its declaration. [`load_contract`] therefore returns the RANK and not the
+  /// batch: the rank is what the contract is built from, the batch is what the
+  /// door then runs on.
+  ///
+  /// # Panics
+  /// Never, for a description [`Checked::new`] accepted against that contract:
+  /// the check established that `feature` is declared and has exactly this
+  /// rank.
+  fn read_back(description: &ModelDescription, feature: &str, rank: InputRank) -> Self {
+    let batch = match rank {
+      InputRank::Unbatched => 1,
+      InputRank::Batched => description
+        .input(feature)
+        .and_then(|declared| declared.shape().first().copied())
+        .expect("the load contract established this feature and its rank"),
+    };
+    Self { batch, rank }
   }
 }
 
-/// The input contract an input feature declares, or `None` when it is not a
-/// `float32` multi-array holding a template face.
+/// The load contract this door states for `manifest`, with the two forms
+/// [`FaceEmbedder`] carries: the RANK it must feed, and the output form a
+/// predicted tensor is later measured against.
 ///
-/// Accepts three shapes, all of which real ArcFace exports use: the batched
-/// rank-4 form, the unbatched rank-3 form (batch 1), and an EMPTY shape — the
-/// legacy `neuralNetwork` specification leaves input shapes undeclared, and
-/// refusing those would refuse a whole artifact format on the strength of
-/// metadata the format does not carry. An undeclared shape resolves to a
-/// batch-one BATCHED contract — the rank an export that declares nothing
-/// overwhelmingly means — and is caught instead at predict time by the
-/// output-shape check.
+/// **Pure over a [`ModelDescription`], so every clause is drivable with no
+/// model present.** [`FaceEmbedder::load`] runs exactly this and then
+/// [`Checked::new`], which is [`crate::model::contract::check_load_contract`]
+/// over the same description; this module's fixtures run that same pair. It is
+/// the seam that lets a door staging no artifact still gate its own load path.
 ///
-/// The dtype is not decoration. `None` means the feature is not a multi-array
-/// AT ALL — an `ImageType` input reports no shape and no element type, which
-/// is what both third-party CoreML ArcFace builds the module doc surveys
-/// declare — and anything but `float32` is a tensor
-/// [`FaceEmbedder::build_input`] cannot supply. Both used to load clean and
-/// then fail every prediction.
-fn resolve_input_contract(
-  shape: &[usize],
-  dtype: Option<DataType>,
-  layout: TensorLayout,
-) -> Option<InputContract> {
-  if dtype != Some(DataType::F32) {
-    return None;
-  }
-  let (channels, height, width) = match layout {
-    TensorLayout::Nchw => (0usize, 1usize, 2usize),
-    TensorLayout::Nhwc => (2usize, 0usize, 1usize),
+/// # Why the description is read BEFORE it is checked
+///
+/// A contract cannot be checked before it exists, and this one's SHAPE comes
+/// off the artifact: the declared rank of each feature decides which of the two
+/// forms the contract states. That reading is not trusted — it is what the
+/// check then confirms. A declaration that lies about its geometry, such as a
+/// flexible input whose default shape reads exactly `[n, 3, 112, 112]`, builds
+/// a contract it then fails; the reading never becomes a fact without passing.
+///
+/// The order the clauses are checked in does not change that verdict, only
+/// which clause is named: the batch this reads off the input is used to state
+/// the OUTPUT's row count, and if the input's own declaration is not pinned,
+/// the input clause refuses the model whether it is consulted first or last.
+///
+/// # Errors
+/// [`Error::ContractMismatch`] naming the feature whose declaration no contract
+/// of this door's can be built from: absent, or of a rank that is neither the
+/// batched nor the unbatched form — an undeclared (empty) shape included.
+fn load_contract(
+  description: &ModelDescription,
+  manifest: &FaceModel,
+) -> Result<(LoadContract, InputRank, OutputContract)> {
+  let layout = manifest.preprocessing().layout();
+  let declared_input = description.input(manifest.input()).ok_or_else(|| {
+    Error::ContractMismatch(ContractMismatch::new(
+      manifest.input().to_string(),
+      "a declared input feature".to_string(),
+      format!("inputs {:?}", feature_names(description.inputs())),
+    ))
+  })?;
+  let (rank, batch) = input_form(declared_input.shape()).ok_or_else(|| {
+    Error::ContractMismatch(ContractMismatch::new(
+      manifest.input().to_string(),
+      format!(
+        "{layout:?} shaped [n, 3, {TEMPLATE_SIZE}, {TEMPLATE_SIZE}] (or without the batch axis)"
+      ),
+      format!("{:?}", declared_input.shape()),
+    ))
+  })?;
+
+  let declared_output = description.output(manifest.output()).ok_or_else(|| {
+    Error::ContractMismatch(ContractMismatch::new(
+      manifest.output().to_string(),
+      "a declared output feature".to_string(),
+      format!("outputs {:?}", feature_names(description.outputs())),
+    ))
+  })?;
+  let form = output_form(declared_output.shape(), batch).ok_or_else(|| {
+    Error::ContractMismatch(ContractMismatch::new(
+      manifest.output().to_string(),
+      format!(
+        "shaped [{batch}, {}] (or [{}] for a batch-one graph)",
+        manifest.dim(),
+        manifest.dim()
+      ),
+      format!("{:?}", declared_output.shape()),
+    ))
+  })?;
+
+  let contract = LoadContract::new(
+    vec![FeatureContract::new(
+      manifest.input(),
+      DataType::F32,
+      input_dims(rank, layout),
+    )],
+    vec![FeatureContract::new(
+      manifest.output(),
+      DataType::F32,
+      output_dims(form, batch, manifest.dim()),
+    )],
+    StateContract::None,
+  );
+  Ok((contract, rank, form))
+}
+
+/// Map a [`ContractViolation`] into this module's error vocabulary.
+///
+/// **A newtype variant over the violation itself would be the house shape, and
+/// it is not available here.** [`ContractViolation`] is `pub(crate)`, so a
+/// public [`Error`] variant carrying one would export a private type; widening
+/// the whole contract vocabulary to `pub` for one door's error message is a
+/// larger change to a shared type than this door's convenience earns. So the
+/// violation is RENDERED, the way `audio::identity` renders it: the four
+/// per-feature clauses land in [`Error::ContractMismatch`], which already
+/// carries a feature name and an expected/actual pair, and the two
+/// "unsatisfiable" clauses keep newtype variants of their own, because they are
+/// about what the door cannot SUPPLY rather than about a feature's shape.
+fn contract_violation(violation: ContractViolation) -> Error {
+  let (feature, expected, actual) = match violation {
+    ContractViolation::UnsatisfiableInput(input) => {
+      return Error::UnsatisfiableInput(input.name().to_string());
+    }
+    ContractViolation::UnsatisfiableState(state) => {
+      return Error::UnsatisfiableState(state.name().to_string());
+    }
+    ContractViolation::Missing(missing) => (
+      missing.feature(),
+      "a declared feature".to_string(),
+      "missing".to_string(),
+    ),
+    ContractViolation::DataType(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
+    }
+    ContractViolation::Rank(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
+    }
+    ContractViolation::Flexibility(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
+    }
+    ContractViolation::Axis(mismatch) => {
+      (mismatch.feature(), mismatch.expected(), mismatch.observed())
+    }
   };
-  let matches = |dims: &[usize]| {
-    dims[channels] == 3 && dims[height] == TEMPLATE_SIZE && dims[width] == TEMPLATE_SIZE
-  };
+  Error::ContractMismatch(ContractMismatch::new(feature.to_string(), expected, actual))
+}
+
+/// Which of the two forms a model's input feature declares, and the batch that
+/// form implies — or `None` for a declared rank that is neither.
+///
+/// **The RANK is all this decides**, and that is the narrowing this door's
+/// adoption of the load contract bought. The element type, and that the three
+/// trailing axes really are a `3 × 112 × 112` template face in the manifest's
+/// layout, are clauses of the contract [`load_contract`] then builds — checked
+/// once by [`Checked::new`] rather than twice in two spellings that could
+/// disagree.
+///
+/// An EMPTY shape is refused, and that is deliberate rather than an oversight:
+/// the legacy `neuralnetwork` specification declares none, and this used to
+/// resolve one to a batch-one guess. The module doc carries the argument.
+///
+/// A declared batch of ZERO is refused here rather than by the contract,
+/// because the contract cannot express it: [`Dim::AnyFixed`] asks only that the
+/// axis admit exactly one size, and zero is one size. [`FaceEmbedder::embed`]
+/// would divide its work into chunks of zero and never terminate, so it is a
+/// contract mismatch and not a capacity.
+fn input_form(shape: &[usize]) -> Option<(InputRank, usize)> {
   match shape.len() {
-    0 => Some(InputContract {
-      batch: 1,
-      rank: InputRank::Batched,
-    }),
-    3 if matches(shape) => Some(InputContract {
-      batch: 1,
-      rank: InputRank::Unbatched,
-    }),
-    // A declared batch of zero is not a batch: `embed` would divide the work
-    // into chunks of zero and never terminate, so it is a contract mismatch
-    // rather than a capacity.
-    4 if shape[0] > 0 && matches(&shape[1..]) => Some(InputContract {
-      batch: shape[0],
-      rank: InputRank::Batched,
-    }),
+    3 => Some((InputRank::Unbatched, 1)),
+    4 if shape[0] > 0 => Some((InputRank::Batched, shape[0])),
     _ => None,
+  }
+}
+
+/// The contract axes for an input feature of this rank and layout — the
+/// per-axis form of the shape [`input_shape`] later builds, so the geometry the
+/// door STATES and the geometry it FEEDS come from one pair of arms.
+fn input_dims(rank: InputRank, layout: TensorLayout) -> Vec<Dim> {
+  let face = match layout {
+    TensorLayout::Nchw => [
+      Dim::Exactly(3),
+      Dim::Exactly(TEMPLATE_SIZE),
+      Dim::Exactly(TEMPLATE_SIZE),
+    ],
+    TensorLayout::Nhwc => [
+      Dim::Exactly(TEMPLATE_SIZE),
+      Dim::Exactly(TEMPLATE_SIZE),
+      Dim::Exactly(3),
+    ],
+  };
+  match rank {
+    InputRank::Unbatched => face.to_vec(),
+    InputRank::Batched => {
+      let mut dims = Vec::with_capacity(1 + face.len());
+      // Not `Exactly`: this door does not require a batch, it reads back
+      // whichever one the graph pins.
+      dims.push(Dim::AnyFixed);
+      dims.extend_from_slice(&face);
+      dims
+    }
   }
 }
 
@@ -1099,40 +1312,34 @@ enum OutputContract {
   Batched,
   /// The model declared `[dim]`, which only a batch-one graph can mean.
   Flat,
-  /// The model declared no shape at all (a legacy `neuralNetwork`). Either
-  /// form is then legitimate at predict time — and only those two.
-  Undeclared,
 }
 
-/// Checks an output feature against the resolved contract, returning the form
-/// it declared, or the rendered actual feature on mismatch.
+/// Which output form a model's output feature declares, or `None` for a
+/// declared rank that is neither.
 ///
-/// Like [`resolve_input_contract`], an empty shape is accepted: a legacy
-/// `neuralNetwork` artifact declares none, and the predicted tensor is checked
-/// on every call regardless. A `[dim]` shape is accepted only for a batch-one
-/// graph — against a batch of 4 it is not a shorthand, it is a contradiction.
-fn check_output_contract(
-  shape: &[usize],
-  dtype: Option<DataType>,
-  batch: usize,
-  dim: usize,
-) -> core::result::Result<OutputContract, String> {
-  if dtype != Some(DataType::F32) {
-    return Err(describe(shape, dtype));
-  }
-  let resolved = match shape.len() {
-    0 => Some(OutputContract::Undeclared),
-    1 if shape[0] == dim && batch == 1 => Some(OutputContract::Flat),
-    2 if shape[0] == batch && shape[1] == dim => Some(OutputContract::Batched),
+/// A `[dim]` shape is a batch-one form. Declared against a batch of 4 it is not
+/// a shorthand, it is a contradiction, so it is refused here rather than
+/// allowed to build a contract the predicted tensor could never satisfy. An
+/// EMPTY shape is refused for the reason [`input_form`] refuses one — this is
+/// where the `Undeclared` arm used to be.
+fn output_form(shape: &[usize], batch: usize) -> Option<OutputContract> {
+  match shape.len() {
+    1 if batch == 1 => Some(OutputContract::Flat),
+    2 => Some(OutputContract::Batched),
     _ => None,
-  };
-  resolved.ok_or_else(|| describe(shape, dtype))
+  }
 }
 
-/// Human-readable `shape dtype` rendering for [`ContractMismatch`].
-fn describe(shape: &[usize], dtype: Option<DataType>) -> String {
-  let dtype = dtype.map_or("not a multi-array", |d| d.as_str());
-  format!("{shape:?} {dtype}")
+/// The contract axes for the output feature: `[batch, dim]`, or the bare
+/// `[dim]` a batch-one graph may declare instead.
+///
+/// The batch axis is [`Dim::Exactly`] rather than [`Dim::AnyFixed`] because
+/// this door does more than read it back — see [`FaceEmbedder::load`].
+fn output_dims(form: OutputContract, batch: usize, dim: usize) -> Vec<Dim> {
+  match form {
+    OutputContract::Flat => vec![Dim::Exactly(dim)],
+    OutputContract::Batched => vec![Dim::Exactly(batch), Dim::Exactly(dim)],
+  }
 }
 
 /// Checks a PREDICTED tensor against the contract resolved at load — its AXES,
@@ -1153,6 +1360,10 @@ fn describe(shape: &[usize], dtype: Option<DataType>) -> String {
 /// OWN, because it is a different failure: with the axes equal there is no
 /// shape mismatch to report, and [`Error::OutputShape`] could only report one
 /// by naming the same vector twice.
+///
+/// This is a DIFFERENT moment from the load contract, which is why it survives
+/// the adoption of [`Checked`]: the contract established what the graph
+/// DECLARES, and this measures what one prediction actually produced.
 fn check_predicted_shape(
   shape: &[usize],
   count: usize,
@@ -1165,10 +1376,6 @@ fn check_predicted_shape(
   let expected: &[usize] = match contract {
     OutputContract::Batched => &batched,
     OutputContract::Flat => &flat,
-    // The graph promised nothing, so either form is honest — but it still has
-    // to be one of the two.
-    OutputContract::Undeclared if batch == 1 && shape == flat => &flat,
-    OutputContract::Undeclared => &batched,
   };
   if shape != expected {
     return Err(Error::OutputShape(OutputShape::new(

@@ -804,6 +804,29 @@ pub enum Error {
   /// The loaded model does not match the manifest's declared contract.
   #[error("model contract mismatch on `{}`: expected {}, got {}", .0.feature(), .0.expected(), .0.actual())]
   ContractMismatch(ContractMismatch),
+  /// The loaded graph declares a REQUIRED input beyond the manifest's, so every
+  /// prediction through it would fail.
+  ///
+  /// Carries the offending feature name. An OPTIONAL extra input is not this:
+  /// CoreML runs a prediction that omits one, so only a required input the
+  /// embedder cannot fill makes the contract unsatisfiable.
+  #[error(
+    "model declares a required input `{0}` that this door never supplies; it sends the \
+     manifest's input feature and nothing else, so every prediction would fail"
+  )]
+  UnsatisfiableInput(String),
+  /// The loaded graph declares CoreML STATE buffers, and this door predicts
+  /// through the stateless API.
+  ///
+  /// Carries the offending state feature name. A stateful model must receive an
+  /// `MLState` on every prediction; a door that never makes one either fails the
+  /// prediction outright or silently discards the persistence the graph was
+  /// built around. Neither is something to discover at predict time.
+  #[error(
+    "model declares the state buffer `{0}`, and this door predicts through the stateless \
+     API; a stateful graph needs an `MLState` on every prediction"
+  )]
+  UnsatisfiableState(String),
   /// The predicted embedding tensor's shape diverges from the resolved contract.
   #[error("output shape mismatch: expected {:?}, got {:?}", .0.expected(), .0.got())]
   OutputShape(OutputShape),

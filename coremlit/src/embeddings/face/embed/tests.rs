@@ -1,19 +1,136 @@
-//! Unit gates for the manifest-driven preprocessing and the batch plumbing.
+//! Unit gates for the manifest-driven preprocessing, the load contract and the
+//! batch plumbing.
 //!
-//! No model is needed: every function these exercise is pure. That is the
-//! point of putting preprocessing in a manifest — the part that silently
-//! degrades an embedding is testable without an artifact.
+//! Almost no model is needed: every function these exercise is pure, and the
+//! load-time decision is driven over [`ModelDescription`] fixtures. That is the
+//! point of putting preprocessing in a manifest and the load contract in a
+//! value — the parts that silently degrade an embedding are testable without an
+//! artifact, which matters more here than anywhere else in the crate, because
+//! this is the one kit that stages none.
+//!
+//! One gate does load a real artifact:
+//! `the_face_door_refuses_the_vendored_silero_bundle` runs in every
+//! `cargo test`, because that bundle is committed.
 
 use super::*;
-use crate::embeddings::face::align::TEMPLATE_BYTES;
+use crate::{
+  AxisRange, FeatureInfo, ShapeConstraint,
+  embeddings::face::align::TEMPLATE_BYTES,
+  model::{RawShapeConstraint, contract::check_load_contract},
+};
 
-/// Every real face artifact declares an f32 multi-array for both features.
-const F32: Option<DataType> = Some(DataType::F32);
+/// The embedding width every ArcFace-family artifact in issue #115's census
+/// emits.
+const DIM: usize = 512;
 
 /// A manifest of the given width, standing in for the artifact an embedder
 /// would have been loaded against.
 fn model(dim: usize) -> FaceModel {
   FaceModel::new("data", "embedding", dim)
+}
+
+/// [`model`] with `layout` substituted — the only manifest field the load
+/// contract's geometry depends on.
+fn manifest(layout: TensorLayout) -> FaceModel {
+  let arcface = Preprocessing::ARCFACE;
+  model(DIM).with_preprocessing(Preprocessing::new(
+    arcface.order(),
+    layout,
+    arcface.scale(),
+    arcface.bias(),
+  ))
+}
+
+// ── Description fixtures ───────────────────────────────────────────────────
+//
+// `ModelDescription::from_parts` / `FeatureInfo::from_parts` are `pub(crate)`
+// for exactly this: a door that stages NO artifact still gates its whole load
+// path, over descriptions CoreML never produced. The shape VERDICT is never
+// stated by a fixture — `from_parts` classifies the raw contents — so a fixture
+// cannot claim a `Fixed` its own numbers do not support.
+
+/// One multi-array feature, spelled out: the constraint's raw type code, its
+/// enumerated shapes, and its per-axis ranges.
+fn multi_array(
+  name: &str,
+  shape: &[usize],
+  dtype: DataType,
+  optional: bool,
+  raw_type: isize,
+  enumerated: Vec<Vec<usize>>,
+  ranges: Vec<AxisRange>,
+) -> FeatureInfo {
+  FeatureInfo::from_parts(
+    name.to_string(),
+    shape.to_vec(),
+    Some(dtype),
+    optional,
+    Some(RawShapeConstraint::new(raw_type, enumerated, ranges)),
+  )
+}
+
+/// The per-axis ranges a PINNED shape reports.
+fn pinned(shape: &[usize]) -> Vec<AxisRange> {
+  shape.iter().map(|d| AxisRange::new(*d, 1)).collect()
+}
+
+/// A fixed-shape multi-array feature, exactly as a plain coremltools export
+/// reports one: raw type 2, its declared shape as the sole enumerated shape,
+/// and `(d, 1)` on every axis.
+fn fixed(name: &str, shape: &[usize], dtype: DataType) -> FeatureInfo {
+  multi_array(
+    name,
+    shape,
+    dtype,
+    false,
+    2,
+    vec![shape.to_vec()],
+    pinned(shape),
+  )
+}
+
+/// A feature as a legacy `neuralnetwork` export declares one: raw type 1, no
+/// enumerated shapes, no ranges and an EMPTY shape. Measured on EVERY output of
+/// that format, even when its input is fixed — see [`ShapeConstraint`]'s table.
+fn undeclared(name: &str) -> FeatureInfo {
+  multi_array(name, &[], DataType::F32, false, 1, Vec::new(), Vec::new())
+}
+
+/// A conformant artifact's description: one pinned input, one pinned output, no
+/// state.
+fn graph(input_shape: &[usize], output_shape: &[usize]) -> ModelDescription {
+  ModelDescription::from_parts(
+    vec![fixed("data", input_shape, DataType::F32)],
+    vec![fixed("embedding", output_shape, DataType::F32)],
+    Vec::new(),
+  )
+}
+
+/// The whole load-time decision, run over `description` and mapped into this
+/// module's errors — exactly the pair `FaceEmbedder::load` runs between
+/// `Model::load` and the digest, with `Checked::new`'s check spelled as the
+/// function `Checked::new` itself calls.
+fn check(
+  description: &ModelDescription,
+  manifest: &FaceModel,
+) -> Result<(InputContract, OutputContract)> {
+  let (contract, rank, output) = load_contract(description, manifest)?;
+  check_load_contract(description, &contract).map_err(contract_violation)?;
+  Ok((
+    InputContract::read_back(description, manifest.input(), rank),
+    output,
+  ))
+}
+
+/// The resolved input contract as a comparable pair, so a gate can assert the
+/// declared RANK and not only the numeric capacity. The output half is built to
+/// match whatever batch the input declares, so what these rows exercise is the
+/// input clause alone.
+fn contract_of(shape: &[usize], layout: TensorLayout) -> Option<(usize, InputRank)> {
+  let batch = if shape.len() == 4 { shape[0] } else { 1 };
+  check(&graph(shape, &[batch, DIM]), &manifest(layout))
+    .ok()
+    .map(|(input, _)| (input.batch, input.rank))
 }
 
 /// A digest standing in for one artifact's bytes.
@@ -38,12 +155,6 @@ fn space_of(tag: u8, manifest: &FaceModel) -> EmbeddingSpace {
 /// The default space: one artifact, the default manifest, the given width.
 fn space(dim: usize) -> EmbeddingSpace {
   space_of(1, &model(dim))
-}
-
-/// The resolved input contract as a comparable pair, so a gate can assert the
-/// declared RANK and not only the numeric capacity.
-fn contract_of(shape: &[usize], layout: TensorLayout) -> Option<(usize, InputRank)> {
-  resolve_input_contract(shape, F32, layout).map(|c| (c.batch(), c.rank))
 }
 
 /// An [`AlignedFace`] whose byte at `(pixel, channel)` is `pixel + channel`,
@@ -212,72 +323,415 @@ fn preprocessing_is_scale_then_bias_with_the_bias_in_the_models_channel_space() 
   }
 }
 
+/// The declarations real ArcFace exports use, and the contract each resolves
+/// to.
+///
+/// The rank is asserted alongside the capacity: the two rank-3 rows used to
+/// resolve to a bare `1`, indistinguishable from the batched `[1, 3, 112, 112]`
+/// form, and that discarded bit is what fed them a tensor their graph cannot
+/// accept. The batch is now READ BACK off a description the contract check
+/// accepted, so each of these numbers is a graph's only batch rather than the
+/// default a flexible one would also report.
 #[test]
-fn the_input_contract_accepts_the_three_shapes_real_exports_declare() {
-  // The rank is asserted alongside the capacity: the two rank-3 rows below
-  // used to resolve to a bare `1`, indistinguishable from the batched
-  // `[1, 3, 112, 112]` form, and that discarded bit is what fed them a tensor
-  // their graph cannot accept.
+fn the_contract_accepts_the_forms_real_exports_declare() {
   assert_eq!(
-    contract_of(&[], TensorLayout::Nchw),
+    contract_of(&[3, TEMPLATE_SIZE, TEMPLATE_SIZE], TensorLayout::Nchw),
+    Some((1, InputRank::Unbatched))
+  );
+  assert_eq!(
+    contract_of(&[1, 3, TEMPLATE_SIZE, TEMPLATE_SIZE], TensorLayout::Nchw),
     Some((1, InputRank::Batched))
   );
   assert_eq!(
-    contract_of(&[3, 112, 112], TensorLayout::Nchw),
-    Some((1, InputRank::Unbatched))
-  );
-  assert_eq!(
-    contract_of(&[8, 3, 112, 112], TensorLayout::Nchw),
+    contract_of(&[8, 3, TEMPLATE_SIZE, TEMPLATE_SIZE], TensorLayout::Nchw),
     Some((8, InputRank::Batched))
   );
   assert_eq!(
-    contract_of(&[112, 112, 3], TensorLayout::Nhwc),
+    contract_of(&[TEMPLATE_SIZE, TEMPLATE_SIZE, 3], TensorLayout::Nhwc),
     Some((1, InputRank::Unbatched))
   );
   assert_eq!(
-    contract_of(&[4, 112, 112, 3], TensorLayout::Nhwc),
+    contract_of(&[4, TEMPLATE_SIZE, TEMPLATE_SIZE, 3], TensorLayout::Nhwc),
     Some((4, InputRank::Batched))
   );
 }
 
+/// **The contract itself, as a value, for all three accepted forms.** It is
+/// this door's whole statement about an artifact, so it is asserted directly
+/// rather than only through what it refuses — a clause that quietly weakens
+/// (`AnyFixed` where `Exactly` was meant, or the reverse) changes no refusal
+/// this file could otherwise see.
 #[test]
-fn the_input_contract_refuses_a_shape_that_is_not_a_template_face() {
-  // The layouts must not accept each other's shapes: that swap is exactly the
-  // silent-degradation failure the manifest exists to prevent.
-  assert_eq!(contract_of(&[1, 112, 112, 3], TensorLayout::Nchw), None);
-  assert_eq!(contract_of(&[1, 3, 112, 112], TensorLayout::Nhwc), None);
-  assert_eq!(contract_of(&[1, 3, 96, 112], TensorLayout::Nchw), None);
-  assert_eq!(contract_of(&[1, 1, 3, 112, 112], TensorLayout::Nchw), None);
-  assert_eq!(contract_of(&[112, 112], TensorLayout::Nchw), None);
-  // A declared batch of zero would make `embed` chunk by zero.
-  assert_eq!(contract_of(&[0, 3, 112, 112], TensorLayout::Nchw), None);
+fn the_contract_reads_the_batch_and_requires_everything_else() {
+  let face_nchw = [
+    Dim::Exactly(3),
+    Dim::Exactly(TEMPLATE_SIZE),
+    Dim::Exactly(TEMPLATE_SIZE),
+  ];
+  let face_nhwc = [
+    Dim::Exactly(TEMPLATE_SIZE),
+    Dim::Exactly(TEMPLATE_SIZE),
+    Dim::Exactly(3),
+  ];
+
+  // Rank-4 NCHW, batch 4: the batch axis is READ (`AnyFixed`), the face axes
+  // are REQUIRED, and the output's row count is the input's batch stated as a
+  // number rather than read a second time.
+  let (contract, rank, form) = load_contract(
+    &graph(&[4, 3, TEMPLATE_SIZE, TEMPLATE_SIZE], &[4, DIM]),
+    &manifest(TensorLayout::Nchw),
+  )
+  .expect("a batch-4 NCHW export is one of the accepted forms");
+  assert_eq!((rank, form), (InputRank::Batched, OutputContract::Batched));
+  assert_eq!(
+    contract,
+    LoadContract::new(
+      vec![FeatureContract::new(
+        "data",
+        DataType::F32,
+        [Dim::AnyFixed].into_iter().chain(face_nchw).collect()
+      )],
+      vec![FeatureContract::new(
+        "embedding",
+        DataType::F32,
+        vec![Dim::Exactly(4), Dim::Exactly(DIM)]
+      )],
+      StateContract::None,
+    )
+  );
+
+  // Rank-4 NHWC: the same shape of statement, with the channel axis last.
+  let (contract, rank, form) = load_contract(
+    &graph(&[2, TEMPLATE_SIZE, TEMPLATE_SIZE, 3], &[2, DIM]),
+    &manifest(TensorLayout::Nhwc),
+  )
+  .expect("a batch-2 NHWC export is one of the accepted forms");
+  assert_eq!((rank, form), (InputRank::Batched, OutputContract::Batched));
+  assert_eq!(
+    contract,
+    LoadContract::new(
+      vec![FeatureContract::new(
+        "data",
+        DataType::F32,
+        [Dim::AnyFixed].into_iter().chain(face_nhwc).collect()
+      )],
+      vec![FeatureContract::new(
+        "embedding",
+        DataType::F32,
+        vec![Dim::Exactly(2), Dim::Exactly(DIM)]
+      )],
+      StateContract::None,
+    )
+  );
+
+  // Rank-3, with the bare `[dim]` output only a batch-one graph can declare:
+  // there is no batch axis to read, so the contract has no `AnyFixed` at all.
+  let (contract, rank, form) = load_contract(
+    &graph(&[3, TEMPLATE_SIZE, TEMPLATE_SIZE], &[DIM]),
+    &manifest(TensorLayout::Nchw),
+  )
+  .expect("the unbatched rank-3 form is one of the accepted forms");
+  assert_eq!((rank, form), (InputRank::Unbatched, OutputContract::Flat));
+  assert_eq!(
+    contract,
+    LoadContract::new(
+      vec![FeatureContract::new(
+        "data",
+        DataType::F32,
+        face_nchw.to_vec()
+      )],
+      vec![FeatureContract::new(
+        "embedding",
+        DataType::F32,
+        vec![Dim::Exactly(DIM)]
+      )],
+      StateContract::None,
+    )
+  );
 }
 
 #[test]
-fn output_shape_check_binds_batch_and_dim() {
-  // The resolved FORM is returned, not just an ok/err: it is what the
-  // predicted tensor is then measured against on every call.
+fn the_contract_refuses_a_shape_that_is_not_a_template_face() {
+  // The layouts must not accept each other's shapes: that swap is exactly the
+  // silent-degradation failure the manifest exists to prevent. These three are
+  // refused by the contract's per-axis clauses now, not by a hand-written
+  // shape match beside them.
   assert_eq!(
-    check_output_contract(&[], F32, 4, 512),
-    Ok(OutputContract::Undeclared)
+    contract_of(&[1, TEMPLATE_SIZE, TEMPLATE_SIZE, 3], TensorLayout::Nchw),
+    None
   );
   assert_eq!(
-    check_output_contract(&[512], F32, 1, 512),
-    Ok(OutputContract::Flat)
+    contract_of(&[1, 3, TEMPLATE_SIZE, TEMPLATE_SIZE], TensorLayout::Nhwc),
+    None
   );
   assert_eq!(
-    check_output_contract(&[4, 512], F32, 4, 512),
-    Ok(OutputContract::Batched)
+    contract_of(&[1, 3, 96, TEMPLATE_SIZE], TensorLayout::Nchw),
+    None
   );
-  assert!(check_output_contract(&[4, 128], F32, 4, 512).is_err());
-  assert!(check_output_contract(&[2, 512], F32, 4, 512).is_err());
-  assert!(check_output_contract(&[1, 4, 512], F32, 4, 512).is_err());
-  // A bare `[dim]` is a batch-one form. Declared against a batch of 4 it is
-  // not a shorthand, it is a contradiction, and accepting it would leave the
-  // predicted-tensor check with two incompatible shapes to allow.
+  // And these three earlier, on a rank no contract of this door's can be built
+  // from at all.
+  assert_eq!(
+    contract_of(&[1, 1, 3, TEMPLATE_SIZE, TEMPLATE_SIZE], TensorLayout::Nchw),
+    None
+  );
+  assert_eq!(
+    contract_of(&[TEMPLATE_SIZE, TEMPLATE_SIZE], TensorLayout::Nchw),
+    None
+  );
+  // A declared batch of zero would make `embed` chunk by zero. The contract
+  // cannot express that — `AnyFixed` asks only for ONE size, and zero is one —
+  // so the refusal is the door's own.
+  assert_eq!(
+    contract_of(&[0, 3, TEMPLATE_SIZE, TEMPLATE_SIZE], TensorLayout::Nchw),
+    None
+  );
+}
+
+// ── The load contract's own clauses ────────────────────────────────────────
+
+/// **A graph carrying the manifest's input plus another REQUIRED input** clears
+/// every per-feature clause and then fails on EVERY prediction, because
+/// `FaceEmbedder::embed` sends the manifest's input and nothing else.
+///
+/// This door used to look up the two features it wanted and never ask what else
+/// the graph required. A state buffer is not an input; an extra required input
+/// is not a feature this door names; neither is visible to a check written per
+/// feature, which is why the contract is complete over the description instead.
+#[test]
+fn the_contract_refuses_an_extra_required_input() {
+  let description = ModelDescription::from_parts(
+    vec![
+      fixed("data", &[4, 3, TEMPLATE_SIZE, TEMPLATE_SIZE], DataType::F32),
+      fixed("landmark_hint", &[4, 10], DataType::F32),
+    ],
+    vec![fixed("embedding", &[4, DIM], DataType::F32)],
+    Vec::new(),
+  );
+  let error = check(&description, &manifest(TensorLayout::Nchw)).unwrap_err();
   assert!(
-    check_output_contract(&[512], F32, 4, 512).is_err(),
-    "[512] must not resolve against a batch-4 graph"
+    matches!(&error, Error::UnsatisfiableInput(name) if name == "landmark_hint"),
+    "{error}"
+  );
+}
+
+/// An OPTIONAL extra input is not that: CoreML runs a prediction that omits
+/// one, so it cannot make this door's prediction fail. Optionality is exactly
+/// the distinction this needs, and a count of inputs cannot make it.
+#[test]
+fn the_contract_accepts_an_extra_optional_input() {
+  let description = ModelDescription::from_parts(
+    vec![
+      fixed("data", &[4, 3, TEMPLATE_SIZE, TEMPLATE_SIZE], DataType::F32),
+      multi_array(
+        "landmark_hint",
+        &[4, 10],
+        DataType::F32,
+        true,
+        2,
+        vec![vec![4, 10]],
+        pinned(&[4, 10]),
+      ),
+    ],
+    vec![fixed("embedding", &[4, DIM], DataType::F32)],
+    Vec::new(),
+  );
+  assert!(check(&description, &manifest(TensorLayout::Nchw)).is_ok());
+}
+
+/// **The stateful-graph refusal.** A state buffer is not an ordinary input: it
+/// lives in `stateDescriptionsByName`, so a stateful graph declaring exactly
+/// these two features clears every per-feature clause AND the input set — and
+/// only then meets `FaceEmbedder::embed`, which predicts through the STATELESS
+/// API. CoreML requires a stateful model to receive an `MLState` on every
+/// prediction, so that either fails or silently throws the persistence away.
+#[test]
+fn the_contract_refuses_a_graph_that_declares_state() {
+  let description = ModelDescription::from_parts(
+    vec![fixed(
+      "data",
+      &[1, 3, TEMPLATE_SIZE, TEMPLATE_SIZE],
+      DataType::F32,
+    )],
+    vec![fixed("embedding", &[1, DIM], DataType::F32)],
+    vec![fixed("kv_cache", &[1, 8], DataType::F32)],
+  );
+  let error = check(&description, &manifest(TensorLayout::Nchw)).unwrap_err();
+  assert!(
+    matches!(&error, Error::UnsatisfiableState(name) if name == "kv_cache"),
+    "{error}"
+  );
+}
+
+/// **The flexible input that declares this door's exact numbers.**
+/// `FeatureInfo::shape` reports the DEFAULT shape of a `RangeDim` input, and an
+/// equal-bound `RangeDim` reports `(d, 1)` on every axis too — so the numbers
+/// and the per-axis ranges are both indistinguishable from a pinned graph's,
+/// and only the whole-feature verdict separates them. It matters twice here: a
+/// flexible input is what takes a graph off the accelerator, and this door
+/// READS its batch off that shape, so accepting one would make
+/// `batch_capacity` a default rather than a fact.
+#[test]
+fn the_contract_refuses_a_flexible_input_declaring_its_exact_numbers() {
+  let shape = [4, 3, TEMPLATE_SIZE, TEMPLATE_SIZE];
+  let flexible = multi_array(
+    "data",
+    &shape,
+    DataType::F32,
+    false,
+    3,
+    Vec::new(),
+    pinned(&shape),
+  );
+  assert_eq!(
+    flexible.shape_constraint(),
+    Some(ShapeConstraint::Range),
+    "the fixture must be a flexible feature, not merely a differently spelled fixed one"
+  );
+  let description = ModelDescription::from_parts(
+    vec![flexible],
+    vec![fixed("embedding", &[4, DIM], DataType::F32)],
+    Vec::new(),
+  );
+  let error = check(&description, &manifest(TensorLayout::Nchw)).unwrap_err();
+  assert!(
+    matches!(&error, Error::ContractMismatch(m) if m.feature() == "data"),
+    "{error}"
+  );
+  assert!(error.to_string().contains("range"), "{error}");
+}
+
+/// **The arm that used to be `OutputContract::Undeclared`.** A legacy
+/// `neuralNetwork` export declares no output shape; this door accepted that,
+/// guessed a form and left the guess for the predict-time check. It is refused
+/// at load now.
+///
+/// The refusal is wider than this one fixture and that is deliberate: measured
+/// in [`ShapeConstraint`]'s table, EVERY output of a `neuralnetwork` export
+/// reports `Unspecified` even when its input is fixed, so no artifact in that
+/// format loads through this door. The module doc carries the argument.
+#[test]
+fn the_contract_refuses_an_export_that_declares_no_shape() {
+  let output = undeclared("embedding");
+  assert_eq!(
+    output.shape_constraint(),
+    Some(ShapeConstraint::Unspecified),
+    "the fixture must be what a `neuralnetwork` output actually reports"
+  );
+  let description = ModelDescription::from_parts(
+    vec![fixed(
+      "data",
+      &[1, 3, TEMPLATE_SIZE, TEMPLATE_SIZE],
+      DataType::F32,
+    )],
+    vec![output],
+    Vec::new(),
+  );
+  let error = check(&description, &manifest(TensorLayout::Nchw)).unwrap_err();
+  assert!(
+    matches!(&error, Error::ContractMismatch(m)
+      if m.feature() == "embedding" && m.actual() == "[]"),
+    "{error}"
+  );
+
+  // The same format's INPUT half, for an export that declares neither.
+  let description = ModelDescription::from_parts(
+    vec![undeclared("data")],
+    vec![fixed("embedding", &[1, DIM], DataType::F32)],
+    Vec::new(),
+  );
+  let error = check(&description, &manifest(TensorLayout::Nchw)).unwrap_err();
+  assert!(
+    matches!(&error, Error::ContractMismatch(m)
+      if m.feature() == "data" && m.actual() == "[]"),
+    "{error}"
+  );
+}
+
+/// The output's row count is the INPUT's batch, and the contract states it as a
+/// number rather than reading it back: a graph that takes 4 faces and emits 2
+/// rows is one `embed` cannot use, and `Dim::AnyFixed` on that axis would let
+/// it load and fail on the first prediction instead.
+#[test]
+fn the_contract_refuses_an_output_whose_batch_is_not_the_inputs() {
+  let error = check(
+    &graph(&[4, 3, TEMPLATE_SIZE, TEMPLATE_SIZE], &[2, DIM]),
+    &manifest(TensorLayout::Nchw),
+  )
+  .unwrap_err();
+  assert!(
+    matches!(&error, Error::ContractMismatch(m) if m.feature() == "embedding"),
+    "{error}"
+  );
+}
+
+/// The manifest's width is reconciled against the artifact rather than trusted:
+/// a 128-wide graph under a 512-wide manifest is refused, not truncated.
+#[test]
+fn the_contract_refuses_an_output_of_a_different_width() {
+  let error = check(
+    &graph(&[4, 3, TEMPLATE_SIZE, TEMPLATE_SIZE], &[4, 128]),
+    &manifest(TensorLayout::Nchw),
+  )
+  .unwrap_err();
+  assert!(
+    matches!(&error, Error::ContractMismatch(m) if m.feature() == "embedding"),
+    "{error}"
+  );
+}
+
+/// A bare `[dim]` output is a batch-one form. Declared against a batch of 4 it
+/// is not a shorthand, it is a contradiction, and accepting it would leave the
+/// predicted-tensor check with two incompatible shapes to allow.
+#[test]
+fn a_flat_output_is_a_batch_one_form_only() {
+  let nchw = manifest(TensorLayout::Nchw);
+  assert_eq!(
+    check(&graph(&[1, 3, TEMPLATE_SIZE, TEMPLATE_SIZE], &[DIM]), &nchw)
+      .expect("a batch-one graph may declare the bare form")
+      .1,
+    OutputContract::Flat
+  );
+  assert!(
+    check(&graph(&[4, 3, TEMPLATE_SIZE, TEMPLATE_SIZE], &[DIM]), &nchw).is_err(),
+    "[dim] must not resolve against a batch-4 graph"
+  );
+}
+
+/// A feature the model does not declare at all is refused BY NAME, with the
+/// names it does declare in the message.
+#[test]
+fn the_contract_refuses_a_differently_spelled_feature() {
+  let nchw = manifest(TensorLayout::Nchw);
+  let description = ModelDescription::from_parts(
+    vec![fixed(
+      "input_1",
+      &[1, 3, TEMPLATE_SIZE, TEMPLATE_SIZE],
+      DataType::F32,
+    )],
+    vec![fixed("embedding", &[1, DIM], DataType::F32)],
+    Vec::new(),
+  );
+  let error = check(&description, &nchw).unwrap_err();
+  assert!(
+    matches!(&error, Error::ContractMismatch(m)
+      if m.feature() == "data" && m.actual() == r#"inputs ["input_1"]"#),
+    "{error}"
+  );
+
+  let description = ModelDescription::from_parts(
+    vec![fixed(
+      "data",
+      &[1, 3, TEMPLATE_SIZE, TEMPLATE_SIZE],
+      DataType::F32,
+    )],
+    vec![fixed("output_1", &[1, DIM], DataType::F32)],
+    Vec::new(),
+  );
+  let error = check(&description, &nchw).unwrap_err();
+  assert!(
+    matches!(&error, Error::ContractMismatch(m)
+      if m.feature() == "embedding" && m.actual() == r#"outputs ["output_1"]"#),
+    "{error}"
   );
 }
 
@@ -653,7 +1107,8 @@ fn the_tensor_built_has_the_rank_the_model_declared() {
       TensorLayout::Nhwc,
     ),
   ] {
-    let contract = resolve_input_contract(&declared, F32, layout)
+    let batch = if declared.len() == 4 { declared[0] } else { 1 };
+    let (contract, _) = check(&graph(&declared, &[batch, DIM]), &manifest(layout))
       .expect("a shape real exports declare must load");
     assert_eq!(
       input_shape(contract, layout),
@@ -683,20 +1138,10 @@ fn a_transposed_output_tensor_is_refused() {
   assert!(check_predicted_shape(&[4, 512], 4 * 512, OutputContract::Batched, 4, 512).is_ok());
   assert!(check_predicted_shape(&[512], 512, OutputContract::Flat, 1, 512).is_ok());
 
-  // A graph that declared nothing may emit either form — and only those two.
-  assert!(check_predicted_shape(&[1, 512], 512, OutputContract::Undeclared, 1, 512).is_ok());
-  assert!(check_predicted_shape(&[512], 512, OutputContract::Undeclared, 1, 512).is_ok());
-  assert!(
-    check_predicted_shape(&[512], 512, OutputContract::Undeclared, 512, 1).is_err(),
-    "a bare [dim] tensor must not stand in for a 512-row batch"
-  );
-  assert!(
-    check_predicted_shape(&[512, 4], 4 * 512, OutputContract::Undeclared, 4, 512).is_err(),
-    "an undeclared output shape must not become a licence to accept any transposition"
-  );
-
   // And a declared form is binding: a graph that promised [batch, dim] does
-  // not get to emit [dim] instead.
+  // not get to emit [dim] instead. There is no third arm softening that any
+  // more — the `Undeclared` form these lines used to cover is refused at load,
+  // so a predicted tensor is always measured against a shape the graph named.
   assert!(check_predicted_shape(&[512], 512, OutputContract::Batched, 1, 512).is_err());
 }
 
@@ -785,49 +1230,117 @@ fn normalising_survives_components_an_f32_square_cannot_hold() {
 fn the_load_time_contract_requires_an_f32_multi_array() {
   // Names and shapes were checked; the tensor KIND and element type never
   // were, while inference always supplies and extracts `f32` multi-arrays. An
-  // f16 export therefore loaded clean and failed every prediction.
+  // f16 export therefore loaded clean and failed every prediction. Both
+  // clauses belong to the contract now, on both features, so neither is a call
+  // this door could stop making.
+  let nchw = manifest(TensorLayout::Nchw);
+  let shape = [4, 3, TEMPLATE_SIZE, TEMPLATE_SIZE];
   for wrong in [DataType::F16, DataType::F64, DataType::I32] {
-    assert_eq!(
-      resolve_input_contract(
-        &[1, 3, TEMPLATE_SIZE, TEMPLATE_SIZE],
-        Some(wrong),
-        TensorLayout::Nchw
-      ),
-      None,
-      "a {wrong} input must not load against an f32 inference path"
+    let description = ModelDescription::from_parts(
+      vec![fixed("data", &shape, wrong)],
+      vec![fixed("embedding", &[4, DIM], DataType::F32)],
+      Vec::new(),
     );
+    let error = check(&description, &nchw).unwrap_err();
     assert!(
-      check_output_contract(&[4, 512], Some(wrong), 4, 512).is_err(),
-      "a {wrong} output must not load against an f32 inference path"
+      matches!(&error, Error::ContractMismatch(m) if m.feature() == "data"),
+      "a {wrong} input must not load against an f32 inference path: {error}"
+    );
+
+    let description = ModelDescription::from_parts(
+      vec![fixed("data", &shape, DataType::F32)],
+      vec![fixed("embedding", &[4, DIM], wrong)],
+      Vec::new(),
+    );
+    let error = check(&description, &nchw).unwrap_err();
+    assert!(
+      matches!(&error, Error::ContractMismatch(m) if m.feature() == "embedding"),
+      "a {wrong} output must not load against an f32 inference path: {error}"
     );
   }
 
   // `data_type()` is `None` exactly when the feature is NOT a multi-array —
-  // which is the case the module doc's own census hits: both third-party
-  // CoreML ArcFace builds it surveys declare `ImageType` inputs, and an image
-  // feature reports no shape and no dtype at all.
-  assert_eq!(
-    resolve_input_contract(&[], None, TensorLayout::Nchw),
-    None,
-    "a feature that is not a multi-array must not resolve to batch 1"
+  // the case the module doc's own census hits, since both third-party CoreML
+  // ArcFace builds it surveys declare `ImageType` inputs. Such a feature
+  // reports no shape either, so it is refused one clause EARLIER than its
+  // dtype, by the same rank clause that refuses an undeclared shape.
+  let image = FeatureInfo::from_parts("data".to_string(), Vec::new(), None, false, None);
+  assert_eq!(image.data_type(), None);
+  assert_eq!(image.shape_constraint(), None);
+  let description = ModelDescription::from_parts(
+    vec![image],
+    vec![fixed("embedding", &[4, DIM], DataType::F32)],
+    Vec::new(),
   );
   assert!(
-    check_output_contract(&[], None, 1, 512).is_err(),
-    "a feature that is not a multi-array must not satisfy the output contract"
+    matches!(check(&description, &nchw), Err(Error::ContractMismatch(m)) if m.feature() == "data"),
+    "a feature that is not a multi-array must not resolve to batch 1"
   );
 
-  // An f32 multi-array still loads, including the undeclared-shape form a
-  // legacy `neuralNetwork` artifact leaves behind.
-  assert_eq!(
-    contract_of(&[1, 3, TEMPLATE_SIZE, TEMPLATE_SIZE], TensorLayout::Nchw),
-    Some((1, InputRank::Batched))
+  // The all-f32 description still loads.
+  assert!(check(&graph(&shape, &[4, DIM]), &nchw).is_ok());
+}
+
+// ── The one gate here that loads a real artifact ───────────────────────────
+
+/// **The wiring, on a description CoreML itself produced.**
+///
+/// Every other gate in this file drives [`load_contract`] over a fixture. This
+/// one runs [`FaceEmbedder::load`] end to end against
+/// `Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc`, which is COMMITTED
+/// — 1.1 MiB, staged by no download — so unlike everything else in this
+/// repository that loads a model it carries no `#[ignore]`. Silero is a real,
+/// fixed-shape, six-feature graph that is simply not this door's model, which
+/// is the exact shape of a mis-pointed `model_path`.
+///
+/// What it pins that the fixtures cannot: that the decision runs where `load`
+/// puts it, over a snapshot the CoreML runtime built rather than one
+/// `from_parts` assembled; and that a refused load never reaches
+/// `digest_artifact`, since the error is a contract mismatch and not a digest
+/// failure.
+///
+/// What it CANNOT pin, stated rather than implied: silero declares no rank-3 or
+/// rank-4 input, so both refusals below land in `load_contract` before
+/// [`Checked::new`] is reached, and no committed artifact is shaped like a face
+/// model. The check inside `Checked::new` therefore has no real-model gate on
+/// THIS door — what makes it undeletable here is the `Checked` field, which is
+/// a compile-time fact rather than a test. (`audio::identity`'s own silero gate
+/// does reach `Checked::new`, over the same bundle.)
+#[test]
+fn the_face_door_refuses_the_vendored_silero_bundle() {
+  let bundle = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    .join("../Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc");
+  assert!(
+    bundle.is_dir(),
+    "the vendored silero bundle is committed, so this gate is NOT model-gated; looked for {}",
+    bundle.display()
   );
-  assert_eq!(
-    contract_of(&[], TensorLayout::Nchw),
-    Some((1, InputRank::Batched))
+  let options = FaceEmbedderOptions::new().with_compute(ComputeUnits::CpuOnly);
+
+  // A manifest naming features silero does not declare: the by-name clause,
+  // with the names it DOES declare in the message.
+  let error = FaceEmbedder::load(&bundle, model(DIM), options)
+    .expect_err("silero declares no `data` feature");
+  assert!(
+    matches!(&error, Error::ContractMismatch(m)
+      if m.feature() == "data" && m.actual().contains("audio_input")),
+    "{error}"
   );
-  assert!(check_output_contract(&[4, 512], F32, 4, 512).is_ok());
-  assert!(check_output_contract(&[], F32, 4, 512).is_ok());
+
+  // A manifest naming features silero DOES declare, so the lookup succeeds and
+  // the geometry is what refuses it: `audio_input` is `[1, 4160]`, a rank no
+  // contract of this door's can be built from.
+  let error = FaceEmbedder::load(
+    &bundle,
+    FaceModel::new("audio_input", "vad_output", DIM),
+    options,
+  )
+  .expect_err("silero's audio window is not a template face");
+  assert!(
+    matches!(&error, Error::ContractMismatch(m)
+      if m.feature() == "audio_input" && m.actual() == "[1, 4160]"),
+    "{error}"
+  );
 }
 
 #[test]
