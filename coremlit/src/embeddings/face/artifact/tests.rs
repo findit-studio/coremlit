@@ -178,12 +178,26 @@ fn moving_a_files_bytes_to_another_name_changes_the_digest() {
 }
 
 #[test]
-fn a_ds_store_beside_the_weights_does_not_change_the_digest() {
-  // `.DS_Store` is written into any directory a Finder window has been opened
-  // on, and Spotlight and AppleDouble files arrive the same way. None of them
-  // are the model. A digest that moved when one appeared would refuse a
-  // caller's stored embeddings for a reason having nothing to do with the
-  // weights — and it would do it on one machine and not another.
+fn a_ds_store_beside_the_weights_changes_the_digest() {
+  // The NEGATION of the gate that used to stand here, which asserted these
+  // two bundles hashed the same because every dot-prefixed child was skipped.
+  //
+  // The exemption was a name-based enumeration of "what does not matter", and
+  // it missed a case: a CoreML ML Program may reference an external
+  // `BLOBFILE` by path, and `@model_path/.weights/weight.bin` is a legal one.
+  // Two bundles with identical visible files and different hidden weights
+  // then had ONE `ArtifactDigest`, and a hidden blob mutated during the load
+  // slipped past both brackets of `digest_around`. Widening the exemption to
+  // spare `.weights` would be the next enumeration; there is no rule over
+  // NAMES that separates the model from the noise, because the filesystem
+  // does not carry that distinction.
+  //
+  // So no name is exempt, and the consequence is stated rather than dodged: a
+  // bundle a Finder window has been opened on is a different artifact from the
+  // same bundle on a worker that never browsed it, until the `.DS_Store` is
+  // removed. That is the honest answer — the artifact is a different set of
+  // bytes — and it is the rule `MODELS_LOCK` already applies to bundle bytes
+  // everywhere else in this workspace.
   let temp = tempfile::tempdir().expect("tempdir");
   let (left, right) = (
     temp.path().join("a.mlmodelc"),
@@ -191,14 +205,45 @@ fn a_ds_store_beside_the_weights_does_not_change_the_digest() {
   );
   stage(&left);
   stage(&right);
+  let clean = digest_of(&left);
+  assert_eq!(clean, digest_of(&right), "the two bundles start identical");
+
   fs::write(right.join(".DS_Store"), b"finder junk").expect("write .DS_Store");
-  fs::write(right.join("weights/.DS_Store"), b"more junk").expect("write nested .DS_Store");
-  fs::create_dir_all(right.join(".hidden/deep")).expect("create dot-directory");
-  fs::write(right.join(".hidden/deep/blob"), b"not the model").expect("write in dot-directory");
-  assert_eq!(
-    digest_of(&left),
+  assert_ne!(
+    clean,
     digest_of(&right),
-    "dotfiles and dot-directories are excluded at every level"
+    "a dot-prefixed file at the root is part of the bytes"
+  );
+  fs::remove_file(right.join(".DS_Store")).expect("remove .DS_Store");
+  assert_eq!(
+    clean,
+    digest_of(&right),
+    "and removing it restores the identity"
+  );
+
+  fs::write(right.join("weights/.DS_Store"), b"more junk").expect("write nested .DS_Store");
+  assert_ne!(
+    clean,
+    digest_of(&right),
+    "a dot-prefixed file BELOW the root counts too"
+  );
+  fs::remove_file(right.join("weights/.DS_Store")).expect("remove nested .DS_Store");
+
+  // The case the exemption actually lost: an ML Program's external
+  // `BLOBFILE` under a dot-directory. Two bundles agreeing on every visible
+  // file and differing in the hidden weights must not share an identity.
+  fs::create_dir_all(right.join(".weights")).expect("create dot-directory");
+  fs::write(right.join(".weights/weight.bin"), b"hidden weights A").expect("write hidden weights");
+  let hidden_a = digest_of(&right);
+  assert_ne!(
+    clean, hidden_a,
+    "a dot-DIRECTORY's contents are part of the bytes"
+  );
+  fs::write(right.join(".weights/weight.bin"), b"hidden weights B").expect("rewrite");
+  assert_ne!(
+    hidden_a,
+    digest_of(&right),
+    "two bundles whose only difference is a hidden blob are two artifacts"
   );
 }
 

@@ -133,11 +133,22 @@ impl ArtifactDigest {
 ///   under it, so an empty directory is invisible; anything that is neither a
 ///   directory nor a regular file (a socket, a device node) carries no
 ///   artifact bytes and is skipped.
-/// - **dotfiles excluded, at every level.** `.DS_Store` is written into any
-///   directory a Finder window has been opened on, and Spotlight and
-///   AppleDouble files appear the same way. None of them are the model, and a
-///   digest that moved when one appeared would refuse comparisons for a reason
-///   having nothing to do with the weights.
+/// - **every regular file, with NO exemption by name.** A dot-prefixed child
+///   is hashed exactly like any other. The rule used to skip them so that a
+///   `.DS_Store` would not move the digest, and that was an enumeration of
+///   "what does not matter" with a case missing: a CoreML ML Program can name
+///   an external `BLOBFILE` by path, and `@model_path/.weights/weight.bin` is
+///   a legal one — so two bundles agreeing on every visible file and
+///   differing in their hidden weights had ONE digest, and a hidden blob
+///   mutated mid-load slipped past both brackets of [`digest_around`].
+///   Sparing `.weights` next would be the next enumeration; no rule over
+///   NAMES separates the model from the noise, because the filesystem does not
+///   record that distinction. **The consequence, stated rather than dodged:** a
+///   bundle a Finder window has been opened on is a different artifact from
+///   the same bundle on a worker that never browsed it, and their embeddings
+///   do not compare until the `.DS_Store` is removed. That is the honest
+///   answer — the artifact is a different set of bytes — and it is the rule
+///   `MODELS_LOCK` already applies to bundle bytes everywhere else here.
 /// - **symlinks followed.** `fs::metadata` rather than `symlink_metadata`, so
 ///   a bundle assembled out of links hashes as the bytes it resolves to. A
 ///   BROKEN link is an error rather than a skip: it cannot be followed, and a
@@ -264,9 +275,6 @@ fn collect(
   for entry in fs::read_dir(directory).map_err(|source| failure(directory, source))? {
     let entry = entry.map_err(|source| failure(directory, source))?;
     let name = entry.file_name();
-    if name.as_bytes().first() == Some(&b'.') {
-      continue;
-    }
     let path = entry.path();
     // `metadata`, not `symlink_metadata`: links are FOLLOWED.
     let metadata = fs::metadata(&path).map_err(|source| failure(&path, source))?;
