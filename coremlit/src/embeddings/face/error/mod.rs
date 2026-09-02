@@ -207,15 +207,19 @@ impl TransformParameter {
 /// **No route reaches it, and the doc says so rather than naming one.**
 /// [`crate::embeddings::face::SimilarityTransform::estimate`] is its only
 /// producer, and both point sets are finite by the time the solve runs, which
-/// bounds the four parameters well inside `f64` — see
-/// [`crate::embeddings::face::SimilarityTransform::inverse`] for the bound and
-/// the 860 810-set measurement behind it. That measurement counted this
-/// variant zero times. [`crate::embeddings::face::SimilarityTransform::inverse`]
-/// reports a transform it cannot invert as `None` and raises nothing; where
-/// [`crate::embeddings::face::FaceAlign::to_template`] has to turn that `None`
-/// into an error, the one it raises is [`Error::NonInvertibleTransform`].
-/// This variant is kept because the bound is an argument about the input type
-/// rather than something the compiler enforces.
+/// bounds the four parameters well inside `f64` by Cauchy–Schwarz — see that
+/// method for the bound. The 860 810-set measurement counted this variant zero
+/// times. [`crate::embeddings::face::SimilarityTransform::inverse`] reports a
+/// transform it cannot invert as `None` and raises nothing; a solved transform
+/// that has no inverse is refused at the producer instead, as
+/// [`Error::NonInvertibleTransform`]. This variant is kept because the bound is
+/// an argument about the input type rather than something the compiler
+/// enforces.
+///
+/// Its sibling's bound was an argument too, and it was WRONG — see
+/// [`NonInvertibleTransform`]. The difference is that this one is
+/// Cauchy–Schwarz, an inequality on the numerator, where that one reasoned
+/// about how small a nonzero numerator can be.
 ///
 /// Payload of [`Error::NonFiniteTransform`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,6 +245,17 @@ impl NonFiniteTransform {
 /// A solved similarity transform has no inverse, so no template pixel can be
 /// mapped back into the crop and nothing can be sampled through it.
 ///
+/// **This is a producer postcondition, and it is the whole reason
+/// [`crate::embeddings::face::SimilarityTransform::inverse`] can be one
+/// arithmetic path.** A `SimilarityTransform` exists only as a value
+/// [`crate::embeddings::face::SimilarityTransform::estimate`] returned after
+/// checking that `a² + b²` and its reciprocal are normal, or as the inverse of
+/// one. `estimate` raises this, naming the scale, for the finite `f32` inputs
+/// whose minimiser has no inverse in `cv2.warpAffine`'s arithmetic. The module
+/// once claimed no such input existed and published the argument as proven;
+/// review round 5 on #135 exhibited one, and the claim is withdrawn — the band
+/// is enforced here rather than argued about `f32`.
+///
 /// **Deliberately not [`DegenerateLandmarks`].** That one means the SOURCE
 /// points carried no spread, and
 /// [`crate::embeddings::face::SimilarityTransform::estimate`] raises it only
@@ -257,17 +272,19 @@ impl NonFiniteTransform {
 pub struct NonInvertibleTransform {
   /// The solved transform's uniform scale, `√(a² + b²)`.
   ///
-  /// Zero when the solve collapsed the plane onto a point — the only value
-  /// [`crate::embeddings::face::SimilarityTransform::estimate`] can reach this
-  /// error with, and it reaches it only for a target with no spread.
+  /// Zero when the solve collapsed the plane onto a point, which a target with
+  /// no spread reaches. Otherwise a scale outside the band
+  /// [`crate::embeddings::face::SimilarityTransform::inverse`] runs in — below
+  /// about `1.5e-154`, or above about `6.7e153`.
   ///
-  /// `f64` rather than `f32`, because the OTHER way a transform has no inverse
-  /// is a scale outside the band
-  /// [`crate::embeddings::face::SimilarityTransform::inverse`] declares — below
-  /// about `1.5e-154`, or above about `6.7e153`. The whole lower half of that
-  /// is a range `f32` flushes to zero, and reporting zero is what this payload
-  /// exists to stop doing. No public producer reaches it, so the width is a
-  /// property of the type rather than of a witness anyone can hand in.
+  /// **`f64` rather than `f32`, and a public producer DOES reach the width
+  /// that needs.** The whole lower half of that band is a range `f32` flushes
+  /// to zero, and reporting zero is what this payload exists to stop doing:
+  /// the round-5 witness on #135 is five finite `f32` landmarks whose scale is
+  /// `6.1e-168`, which `f32` cannot tell from the collapsed case and which a
+  /// reader has to be able to tell from it. When this doc said no producer
+  /// reached that half, the width was a property of the type; it is now a
+  /// property of a witness anyone can hand in.
   scale: f64,
 }
 

@@ -261,28 +261,163 @@ fn estimate_itself_rejects_landmarks_with_no_spread() {
 }
 
 #[test]
-fn estimate_can_return_a_transform_with_no_inverse() {
-  // `to_template`'s `inverse()` arm used to be commented as unreachable, on
-  // the strength of `estimate` rejecting a zero SOURCE spread. That does not
-  // follow: the solved scale is `|Σ conj(uᵢ)·vᵢ| / Σ‖uᵢ‖²` over the two
-  // CENTRED sets, so it is the TARGET side (and the relative geometry) that
-  // decides invertibility, and `estimate` is public and takes its target from
-  // the caller. A zero-spread target is the shortest witness: every solved
-  // parameter is finite, `estimate` is happy, and the result still inverts to
-  // nothing.
+fn estimate_refuses_a_target_with_no_spread() {
+  // This gate used to be `estimate_can_return_a_transform_with_no_inverse` and
+  // asserted the opposite: `estimate` returned `Ok` holding `a = b = 0`, and
+  // `to_template` raised the error one step later out of its own `inverse()`
+  // arm. The geometry behind it is unchanged and still worth stating — the
+  // solved scale is `|Σ conj(uᵢ)·vᵢ| / Σ‖uᵢ‖²` over the two CENTRED sets, so
+  // it is the TARGET side (and the relative geometry) that decides
+  // invertibility, and `estimate` is public and takes its target from the
+  // caller. What changed is WHO says so: the producer now evaluates the
+  // predicate its own inverse uses, so a minimiser with no inverse is named
+  // where it is produced.
   let flat_target = [Point::new(11.0, -4.0); LANDMARK_COUNT];
-  let solved = SimilarityTransform::estimate(&FIXTURE_LANDMARKS, &flat_target)
-    .expect("a spread source against any finite target is solvable");
-  assert_eq!((solved.a(), solved.b()), (0.0, 0.0));
-  assert_eq!(
-    (solved.tx(), solved.ty()),
-    (11.0, -4.0),
-    "the whole plane collapses onto the target point"
-  );
+  let error = SimilarityTransform::estimate(&FIXTURE_LANDMARKS, &flat_target)
+    .expect_err("a target with no spread collapses the plane onto a point");
   assert!(
-    solved.inverse().is_none(),
-    "a zero-scale transform has no inverse, so `estimate` can hand back one that does not invert"
+    matches!(&error, Error::NonInvertibleTransform(payload) if payload.scale() == 0.0),
+    "expected NonInvertibleTransform(0) from `estimate` itself, got {error:?}"
   );
+  // And NOT `DegenerateLandmarks`: the source is spread (~9.3e4), so blaming
+  // the landmarks would send a reader hunting for coincident points that do
+  // not exist.
+  assert!(
+    !error.to_string().contains("landmark"),
+    "a well-spread source must not be reported as landmarks with no spread, got {error}"
+  );
+}
+
+/// The codex round-5 witness's SOURCE: five finite `f32` landmarks whose
+/// `Σ‖uᵢ‖²` is as large as five `f32` coordinates can make it, `2.3e77`.
+///
+/// Paired with a target that differs from it only in one subnormal
+/// coordinate, the dot product is `1.4e-90` and the minimiser is `6.1e-168` —
+/// nonzero, with a finite reciprocal, and with a SQUARE that underflows `f64`
+/// to exactly zero. That is the value the published lower bound said no finite
+/// `f32` set could reach.
+const UNDERFLOWING_SOURCE: [Point; LANDMARK_COUNT] = [
+  Point::new(f32::MAX, 0.0),
+  Point::new(-f32::MAX, 0.0),
+  Point::new(f32::from_bits(1), 0.0),
+  Point::new(0.0, 0.0),
+  Point::new(0.0, 0.0),
+];
+
+/// One target coordinate, against [`UNDERFLOWING_SOURCE`]: everything else is
+/// the origin, so the whole solve rides on that one number.
+fn underflowing_target(x: f32) -> [Point; LANDMARK_COUNT] {
+  [
+    Point::new(0.0, 0.0),
+    Point::new(0.0, 0.0),
+    Point::new(x, 0.0),
+    Point::new(0.0, 0.0),
+    Point::new(0.0, 0.0),
+  ]
+}
+
+#[test]
+fn estimate_refuses_a_solve_whose_determinant_underflows() {
+  // THE witness the design turns on: `estimate` returned `Ok` here, and
+  // `inverse` refused what it returned. Reproduced from review round 5 on
+  // #135.
+  //
+  // Everything about the solve is healthy. All five source landmarks are
+  // finite `f32`, the spread guard passes with `Σ‖uᵢ‖² = 2.3e77`, all four
+  // solved parameters are finite, the scale is nonzero, and `1/a = 1.6e167` is
+  // finite — so an inverse EXISTS in exact arithmetic. What has no inverse is
+  // `cv2.warpAffine`'s own expression for it: `D = a·a + b·b` underflows `f64`
+  // to exactly zero, `D = 1./D` is `∞`, and every mapped coordinate is NaN.
+  //
+  // The module used to argue this set was unreachable — "a nonzero λ is at
+  // least one `f32` ulp of the perturbed coordinate over `Σ‖uᵢ‖²`". The
+  // argument does not survive a numerator that is a product of two
+  // subnormal-scale deviations while the denominator is near `f32::MAX²`, and
+  // the 860 810-set sweep behind the claim never visited that corner. So the
+  // band is a producer POSTCONDITION now, and this is the input that makes it
+  // fire.
+  const SCALE: f64 = 6.1049899689109305e-168;
+  let target = underflowing_target(f32::from_bits(1));
+  let error = SimilarityTransform::estimate(&UNDERFLOWING_SOURCE, &target)
+    .expect_err("the minimiser has no inverse in `cv2.warpAffine`'s arithmetic");
+  assert!(
+    matches!(&error, Error::NonInvertibleTransform(payload) if payload.scale() == SCALE),
+    "expected NonInvertibleTransform({SCALE:e}) from `estimate` itself, got {error:?}"
+  );
+
+  // The three facts that make this a witness and not a degenerate solve, each
+  // asserted rather than described: the scale is nonzero, its reciprocal is
+  // finite, and the reference's arithmetic still cannot reach that reciprocal.
+  assert_ne!(SCALE, 0.0, "a zero scale would be the already-known case");
+  assert!(
+    (1.0 / SCALE).is_finite(),
+    "the inverse scale is 1.6e167 — the transform IS invertible, just not there"
+  );
+  assert_eq!(
+    SCALE * SCALE,
+    0.0,
+    "`a·a + b·b` underflows, which is what `cv2.warpAffine` divides by"
+  );
+
+  // And the same rotation, reached through the private constructor, is refused
+  // by `inverse` — the two sides of the postcondition agreeing on the value
+  // that motivated it.
+  assert!(
+    SimilarityTransform::new(SCALE, 0.0, 0.0, 0.0)
+      .inverse()
+      .is_none(),
+    "the value `estimate` now refuses is exactly the value `inverse` refuses"
+  );
+}
+
+#[test]
+fn the_producer_and_the_inverse_ask_one_question() {
+  // The mutation this exists for: spelling `estimate`'s postcondition
+  // differently from the predicate `inverse_rotation` applies — `a·a + b·b >
+  // 0.0` instead of `is_normal`, say. On the witness above the two spellings
+  // AGREE (the determinant underflows to exactly zero, so both refuse), so
+  // that test alone cannot see the drift.
+  //
+  // This target separates them. `1e-32` is an ordinary normal `f32`, and
+  // against `UNDERFLOWING_SOURCE` it solves to `a = 4.36e-155`, whose square
+  // is `1.9e-309` — SUBNORMAL. `> 0.0` admits it; `is_normal` does not; and
+  // `1/1.9e-309` is `∞`, so admitting it would hand `warpAffine` a NaN map.
+  const SCALE: f64 = 4.3566665269975455e-155;
+  const DETERMINANT: f64 = 1.898054322746085e-309;
+  assert!(
+    DETERMINANT > 0.0 && !DETERMINANT.is_normal() && !(1.0 / DETERMINANT).is_finite(),
+    "the separating value must be one the two spellings disagree about"
+  );
+
+  let target = underflowing_target(1e-32);
+  let error = SimilarityTransform::estimate(&UNDERFLOWING_SOURCE, &target)
+    .expect_err("a subnormal determinant has no usable reciprocal either");
+  assert!(
+    matches!(&error, Error::NonInvertibleTransform(payload) if payload.scale() == SCALE),
+    "expected NonInvertibleTransform({SCALE:e}), got {error:?}"
+  );
+  assert_eq!(
+    SCALE * SCALE,
+    DETERMINANT,
+    "the refused scale is the one whose determinant is subnormal"
+  );
+
+  // One predicate, two call sites: whatever `reciprocal_determinant` says is
+  // what `inverse` does, on every value either side can meet.
+  for (a, b) in [
+    (SCALE, 0.0),
+    (6.1049899689109305e-168, 0.0),
+    (0.0, 0.0),
+    (1.7875, -0.1252),
+    (f64::MAX, f64::MAX),
+    (f64::NAN, 0.0),
+  ] {
+    assert_eq!(
+      reciprocal_determinant(a, b).is_some(),
+      SimilarityTransform::new(a, b, 0.0, 0.0).inverse().is_some(),
+      "the producer's predicate and `inverse` disagree at a={a:e} b={b:e}"
+    );
+  }
 }
 
 #[test]
@@ -295,10 +430,11 @@ fn a_transform_that_does_not_invert_reports_its_own_scale_not_a_landmark_spread(
   //
   // The witness has a scale that is NONZERO and still has no inverse, and it
   // is reached through the private `new` because no public producer reaches
-  // this arm with a nonzero scale — the domain `inverse` declares excludes it
-  // (see that method). What the payload has to get right is unchanged by
-  // that: the scale is not zero, `f32` would render it as zero, and the error
-  // must not say "the landmarks had no spread".
+  // `checked_inverse` with such a scale at all — `estimate` refuses those
+  // itself now (`estimate_refuses_a_solve_whose_determinant_underflows`). What
+  // the payload has to get right is unchanged by that: the scale is not zero,
+  // `f32` would render it as zero, and the error must not say "the landmarks
+  // had no spread".
   const SUBNORMAL: f64 = f64::from_bits(1);
   let collapsed = SimilarityTransform::new(SUBNORMAL, 0.0, 1.0, 2.0);
   assert!(collapsed.inverse().is_none(), "the witness has no inverse");
@@ -328,15 +464,14 @@ fn a_transform_that_does_not_invert_reports_its_own_scale_not_a_landmark_spread(
   );
 
   // The second witness is the one `estimate` itself reaches (see
-  // `estimate_can_return_a_transform_with_no_inverse`): a zero-spread TARGET
+  // `estimate_refuses_a_target_with_no_spread`): a zero-spread TARGET
   // collapses the plane onto a point. The source spread is ~9.3e4 — the
   // number the old payload reported as 0.0 — and the scale really is zero.
+  // Since the postcondition, this is raised BY `estimate`, and the payload it
+  // carries has to be the same one `checked_inverse` would have carried.
   let flat_target = [Point::new(11.0, -4.0); LANDMARK_COUNT];
-  let solved = SimilarityTransform::estimate(&FIXTURE_LANDMARKS, &flat_target)
-    .expect("a spread source against any finite target is solvable");
-  let error = solved
-    .checked_inverse()
-    .expect_err("a zero-scale transform has no inverse");
+  let error = SimilarityTransform::estimate(&FIXTURE_LANDMARKS, &flat_target)
+    .expect_err("a zero-scale minimiser is refused where it is produced");
   assert!(
     matches!(&error, Error::NonInvertibleTransform(payload) if payload.scale() == 0.0),
     "expected NonInvertibleTransform(0), got {error:?}"
@@ -1207,6 +1342,15 @@ struct SweepTally {
   ok: u64,
   /// Sets `estimate` refused for want of spread — a legitimate outcome.
   degenerate: u64,
+  /// Sets `estimate` refused because the minimiser has no inverse in
+  /// `cv2.warpAffine`'s arithmetic — the producer postcondition firing.
+  ///
+  /// This is the sweep's whole verdict now. The postcondition makes the
+  /// band true of everything `estimate` RETURNS by construction, so counting
+  /// band violations among the returned values proves nothing; what the sweep
+  /// can still measure is how often the refusal fires, and over these
+  /// constructions the answer is never.
+  non_invertible: u64,
   /// Sets whose solve left `f64`. The bound says this is zero.
   non_finite_transform: u64,
   /// The extremes of `a² + b²` over everything that solved.
@@ -1220,6 +1364,7 @@ impl SweepTally {
       sets: 0,
       ok: 0,
       degenerate: 0,
+      non_invertible: 0,
       non_finite_transform: 0,
       determinant_min: f64::INFINITY,
       determinant_max: 0.0,
@@ -1252,6 +1397,10 @@ impl SweepTally {
         self.degenerate += 1;
         return;
       }
+      Err(Error::NonInvertibleTransform(_)) => {
+        self.non_invertible += 1;
+        return;
+      }
       Err(Error::NonFiniteTransform(_)) => {
         self.non_finite_transform += 1;
         return;
@@ -1273,12 +1422,18 @@ impl SweepTally {
        spread should reach"
     );
 
+    // Re-derived here rather than read off the producer: `estimate`'s
+    // postcondition makes this true of everything it returns, so what this
+    // asserts is that the postcondition and the predicate spelled here — the
+    // one `SimilarityTransform::inverse` documents — have not DRIFTED apart.
+    // It cannot fire while both sides route through `reciprocal_determinant`,
+    // and it is the tripwire for the day one of them stops.
     let determinant = a * a + b * b;
     let reciprocal = 1.0 / determinant;
     assert!(
       determinant.is_normal() && reciprocal.is_normal(),
-      "{arm}#{index}: a={a:e} b={b:e} put a²+b²={determinant:e} (1/D={reciprocal:e}) outside the \
-       band `SimilarityTransform::inverse` declares — the Cauchy–Schwarz bound is wrong"
+      "{arm}#{index}: `estimate` returned a={a:e} b={b:e} with a²+b²={determinant:e} \
+       (1/D={reciprocal:e}), outside the band its own postcondition is supposed to enforce"
     );
     self.determinant_min = self.determinant_min.min(determinant);
     self.determinant_max = self.determinant_max.max(determinant);
@@ -1308,12 +1463,21 @@ fn centred_template() -> [(f64, f64); LANDMARK_COUNT] {
 }
 
 #[test]
-fn every_transform_estimate_can_produce_inverts_on_the_reference_path() {
-  // The gate behind `SimilarityTransform::inverse`'s domain, and the reason
-  // `None` there may be a DECLARATION rather than a rescue: over the whole
-  // finite `f32` range, everything `estimate` returns has `a² + b²` and its
-  // reciprocal normal, so the inverse runs `cv2.warpAffine`'s own expression
-  // on every value the type can hold.
+fn the_invertibility_postcondition_refuses_nothing_this_sweep_constructs() {
+  // **This gate is EVIDENCE, not a proof, and it used to be published as
+  // one.** It was `every_transform_estimate_can_produce_inverts_on_the_
+  // reference_path`, and it stood behind a claim that no finite `f32` point
+  // set could make `estimate` produce a transform outside the band. Review
+  // round 5 on #135 produced one
+  // (`estimate_refuses_a_solve_whose_determinant_underflows`), so what the
+  // 50 000 sets below establish is the weaker and still useful thing: over
+  // every construction anyone has thought to sweep — random bit patterns
+  // including subnormals and `±3.4e38`, ulp-spreads at twelve magnitudes,
+  // collinear and 4+1-coincident sets, rotations mirrored and not, random-bit
+  // TARGETS, the analytic extremes, and 15 000 face-like sets at every scale
+  // and offset a detector could emit — the refusal fires ZERO times. The
+  // producer postcondition is a guard on a corner of the domain, not a tax on
+  // the domain.
   //
   // A condensed, hermetic form of the 860 810-set audit sweep — same
   // constructions, same extremes, ~50 000 sets so it runs inside `cargo test`.
@@ -1323,7 +1487,8 @@ fn every_transform_estimate_can_produce_inverts_on_the_reference_path() {
   //
   // Measured here: a²+b² ∈ [5.308275955331472e-169, 7.358792257355573e165],
   // against a band of [5.6e-309, 4.5e307] — more than 140 orders of margin at
-  // each end.
+  // each end. That margin is what makes the corner a corner; it is not a lower
+  // bound, and the witness above sits 160 orders below it.
   let mut rng = Xorshift(0x9E37_79B9_7F4A_7C15);
   let mut tally = SweepTally::new();
   let point = |x: f32, y: f32| Point::new(x, y);
@@ -1511,10 +1676,21 @@ fn every_transform_estimate_can_produce_inverts_on_the_reference_path() {
     tally.feed(&source, &ARCFACE_TEMPLATE, "face-like", index);
   }
 
+  // The sweep's actual verdict: the postcondition never fired. A nonzero count
+  // here is not a bug — it is a legitimate refusal — but it would mean one of
+  // these constructions has walked into the corner, and the sentence
+  // `SimilarityTransform::estimate`'s doc makes about face-like inputs would
+  // have to be re-measured rather than reworded.
+  assert_eq!(
+    tally.non_invertible, 0,
+    "the invertibility postcondition refused {} of {} sets; it is documented as firing on no \
+     construction this sweep reaches",
+    tally.non_invertible, tally.sets
+  );
   assert_eq!(
     tally.non_finite_transform, 0,
-    "the `NonFiniteTransform` backstop fired, so the bound in \
-     `SimilarityTransform::inverse` does not hold over finite `f32` sets"
+    "the `NonFiniteTransform` backstop fired, so the Cauchy–Schwarz UPPER bound in \
+     `SimilarityTransform::estimate` does not hold over finite `f32` sets"
   );
   assert!(
     tally.sets > 45_000 && tally.ok > 40_000,
@@ -1541,7 +1717,7 @@ fn every_transform_estimate_can_produce_inverts_on_the_reference_path() {
     assert!(
       determinant.is_normal() && (1.0 / determinant).is_normal(),
       "the {end} a²+b² the sweep produced ({determinant:e}) is outside the band, so the margin \
-       claimed in `SimilarityTransform::inverse` is gone"
+       reported in `SimilarityTransform::inverse` is gone"
     );
   }
 }

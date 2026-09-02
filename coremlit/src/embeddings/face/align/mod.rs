@@ -204,15 +204,36 @@
 //!
 //! **[`SimilarityTransform::inverse`] is total a different way, and the
 //! difference is the point.** Everything above is an operation made fallible
-//! because its input set is open. The inverse's is not: the type has one
-//! producer, and its domain is a theorem about `f32` rather than a predicate
-//! someone has to get right on all of `f64⁴`. So the inverse computes
-//! `cv2.warpAffine`'s own expression on every value the type can hold, with no
-//! second association anywhere, and `None` outside the band is a declaration
-//! that the inverse is undefined there rather than an attempt to rescue one.
-//! Each earlier round instead widened the predicate and was met by the next
-//! value outside the new enumeration; [`SimilarityTransform::inverse`] carries
-//! the bound, the band and the measurement.
+//! because its input set is open. The inverse's is not, because it is closed
+//! at the PRODUCER: a [`SimilarityTransform`] exists only as a value
+//! [`SimilarityTransform::estimate`] returned after checking that `a² + b²`
+//! and its reciprocal are normal, or as the inverse of one. So the inverse
+//! computes `cv2.warpAffine`'s own expression on every value the type can
+//! hold, with no second association anywhere, and `None` outside that band is
+//! a declaration that the inverse is undefined there rather than an attempt to
+//! rescue one. Each earlier round instead widened the predicate and was met by
+//! the next value outside the new enumeration.
+//!
+//! **That band was published as a THEOREM about `f32` inputs, and the theorem
+//! was false.** Review round 5 on #135 produced five finite `f32` landmarks
+//! whose minimiser is `a = 6.1e-168` — nonzero, and with a perfectly finite
+//! `1/a = 1.6e167` — and whose `a² + b²` underflows `f64` to exactly zero, so
+//! `estimate` returned `Ok` on a transform `inverse` then refused. The
+//! lower-bound argument behind the claim ("a nonzero λ is at least one `f32`
+//! ulp of the perturbed coordinate over `Σ‖uᵢ‖²`") does not survive a
+//! numerator that is a product of two subnormal-scale deviations while the
+//! denominator is near `f32::MAX²`, and the 860 810-set sweep that measured the
+//! claim never visited that corner.
+//!
+//! So the band is **enforced rather than argued**: `estimate` evaluates the
+//! predicate `inverse` uses — the same function, not a second spelling of it —
+//! and refuses, naming the scale. The invariant "every transform this type
+//! holds inverts on the reference path" is true by construction now instead of
+//! by an argument about `f32`. Refusing is also strictly better than the
+//! reference, which computes `D = a·a + b·b = 0` here and warps on with a
+//! matrix that maps every pixel to one point. [`SimilarityTransform::estimate`]
+//! carries the postcondition, [`SimilarityTransform::inverse`] the arithmetic
+//! and what remains measured about it.
 //!
 //! What remains a clamp is `fixed_point_to_u8`'s saturation into `u8`, which
 //! is OpenCV's `FixedPtCast` and is unreachable for a `u8` source (the four
@@ -450,20 +471,32 @@ impl SimilarityTransform {
   /// Closed form rather than a general 3×3 inversion: a similarity's inverse is
   /// a similarity, and `[[a, −b], [b, a]]⁻¹ = [[a, b], [−b, a]] / (a² + b²)`.
   ///
-  /// # The domain is a theorem about `f32`, not a predicate on `f64⁴`
+  /// # The domain is closed at the PRODUCER, not argued about `f32`
   ///
-  /// A `SimilarityTransform` exists only as the least-squares minimiser
-  /// [`Self::estimate`] returns for finite `f32` point sets, or as the inverse
-  /// of one: the raw four-parameter constructor is private, and no production
-  /// code constructs a transform. That is what decides the shape of this
+  /// A `SimilarityTransform` exists only as a value [`Self::estimate`]
+  /// returned **after checking that `a² + b²` and its reciprocal are normal**,
+  /// or as the inverse of one: the raw four-parameter constructor is private,
+  /// and no production code constructs a transform. `inverse` therefore takes
+  /// `cv2.warpAffine`'s own arithmetic on every value the type can hold;
+  /// `estimate` refuses, naming the scale, the finite inputs whose minimiser
+  /// has no inverse in that arithmetic. That is what decides the shape of this
   /// function.
   ///
-  /// **The bound.** For every transform `estimate` can return, `a² + b²` and
-  /// its reciprocal are both normal. Above, Cauchy–Schwarz bounds `|a + ib|`
-  /// by `√(Σ‖vᵢ‖² ⁄ Σ‖uᵢ‖²)` over the two centred sets, whose numerator is at
-  /// most `10·f32::MAX²`; below, writing `u = λv + w` with `w` complex-
-  /// orthogonal, a nonzero `λ` is at least one `f32` ulp of the perturbed
-  /// coordinate over `Σ‖uᵢ‖²`. Swept through the **public** surface over
+  /// **It was decided by an argument instead, and the argument was wrong.**
+  /// The claim was that for every transform `estimate` can return, `a² + b²`
+  /// and its reciprocal are both normal — Cauchy–Schwarz above, and below,
+  /// writing `u = λv + w` with `w` complex-orthogonal, "a nonzero `λ` is at
+  /// least one `f32` ulp of the perturbed coordinate over `Σ‖uᵢ‖²`". The upper
+  /// half holds: the numerator is at most `10·f32::MAX²`, so `|a| ≤ 1.7e84`
+  /// and `a²` is normal. The lower half does not, and review round 5 on #135
+  /// exhibited the counterexample —
+  /// `estimate_refuses_a_solve_whose_determinant_underflows` — where the
+  /// numerator is a product of two subnormal-scale deviations (`1.4e-90`)
+  /// against a denominator near `f32::MAX²` (`2.3e77`). The 860 810-set sweep
+  /// that measured the claim did not visit that corner, and a sweep never
+  /// could have settled it.
+  ///
+  /// **What the measurement still says**, restated as what it is. Over
   /// 860 810 point sets spanning the whole finite `f32` range — random bit
   /// patterns including subnormals and `±3.4e38`, ulp-spreads at twelve
   /// magnitudes, collinear and 4+1-coincident sets, rotations 0–270° mirrored
@@ -475,9 +508,13 @@ impl SimilarityTransform {
   /// NonFiniteTransform 0   inverse None 0   band violations 0
   /// ```
   ///
-  /// More than 140 orders of margin at each end.
-  /// `every_transform_estimate_can_produce_inverts_on_the_reference_path`
-  /// pins it with a hermetic condensed sweep, and reproduces both extremes.
+  /// More than 140 orders of margin at each end — so the refusal is a guard on
+  /// a corner rather than a tax on the domain, and nothing shaped like a face
+  /// goes near it. That is evidence about which inputs reach the refusal, NOT
+  /// a proof that none can.
+  /// `the_invertibility_postcondition_refuses_nothing_this_sweep_constructs`
+  /// pins it with a hermetic condensed sweep, reproduces both extremes, and
+  /// asserts the refusal count is zero.
   ///
   /// # Outside that band the inverse is undefined BY DECLARATION
   ///
@@ -490,10 +527,16 @@ impl SimilarityTransform {
   /// public unvalidated constructor, and closing the door removes the class
   /// rather than the last witness of it.
   ///
-  /// From the public surface, therefore, `None` means `a = b = 0` — the
-  /// rotation block that collapses the plane onto a point, which
-  /// [`Self::estimate`] reaches only for a target with no spread
-  /// (`estimate_can_return_a_transform_with_no_inverse`).
+  /// Restoring a scaled reciprocal for the small end was reconsidered when the
+  /// bound fell and REJECTED again: it would re-add the arithmetic that failed
+  /// review to serve values the pipeline refuses regardless — `SourceGrid`
+  /// declines the `1e167` inverse coordinates one step later — and the
+  /// reference itself has no answer there to be exact against.
+  ///
+  /// From the public surface, therefore, `None` is unreachable on the rotation
+  /// side: [`Self::estimate`] has already refused every `(a, b)` this would
+  /// decline, and `an_out_of_band_rotation_has_no_inverse_by_declaration`
+  /// exercises it through the private constructor.
   ///
   /// # `cv2.warpAffine`'s own operation order, on every value the type holds
   ///
@@ -523,9 +566,10 @@ impl SimilarityTransform {
   ///
   /// - the **entry** guard refuses a non-finite parameter before the
   ///   determinant is formed. `a·a + b·b` is NaN or infinite for such a
-  ///   rotation anyway, so on the rotation side it duplicates the band test;
-  ///   it is kept because it states the precondition where a reader looks for
-  ///   it rather than leaving it a consequence of IEEE arithmetic;
+  ///   rotation anyway, so on the rotation side it duplicates the shared
+  ///   `reciprocal_determinant` predicate; it is kept because it states the
+  ///   precondition where a reader looks for it rather than leaving it a
+  ///   consequence of IEEE arithmetic;
   /// - the **exit** check refuses an inverse whose TRANSLATION left `f64`
   ///   while its rotation stayed in band — which no determinant can see.
   ///   `(a, b, tx, ty) = (2e-154, 0, 1e200, 0)` is in band, inverts its
@@ -555,10 +599,14 @@ impl SimilarityTransform {
   /// [`Error::DegenerateLandmarks`] said it anyway — as zero, on a path
   /// `estimate`'s spread guard has already proven it is not.
   ///
-  /// From [`FaceAlign::to_template`] the scale reported is always exactly
-  /// zero, because that is the only refusal [`Self::estimate`] can reach (see
-  /// [`Self::inverse`]); it is nonetheless the transform's own scale and not a
-  /// constant, so a caller reading it never has to know which path produced it.
+  /// **Unreachable from [`FaceAlign::to_template`] since the producer
+  /// postcondition, and kept for the half of `inverse` the postcondition does
+  /// not cover.** [`Self::estimate`] now refuses every ROTATION this would
+  /// decline, so what is left here is the exit check on the TRANSLATION —
+  /// finite `(a, b)` whose inverse carries `(tx, ty)` out of `f64` — which no
+  /// determinant can see and which no input is known to reach either. It stays
+  /// because an unreachable arm that raises the right error is worth more than
+  /// an `expect`, and because it is where the error's shape is decided.
   fn checked_inverse(&self) -> Result<Self> {
     self
       .inverse()
@@ -586,12 +634,46 @@ impl SimilarityTransform {
   /// it is not closable: the module doc measures it, and measures the wider
   /// spread the reference has between two builds of its own BLAS.
   ///
+  /// # The invertibility POSTCONDITION, and why it is here and not argued
+  ///
+  /// Before returning, `estimate` evaluates the private
+  /// `reciprocal_determinant` — `a·a + b·b` normal and its reciprocal normal,
+  /// the exact predicate [`Self::inverse`] applies — and refuses with
+  /// [`Error::NonInvertibleTransform`], naming the scale, when it fails. That
+  /// is what makes [`Self::inverse`] total on the values this type can hold
+  /// (see its doc), and it is a check rather than an argument because **the
+  /// argument was tried and was false**.
+  ///
+  /// The witness, from review round 5 on #135, is
+  /// `estimate_refuses_a_solve_whose_determinant_underflows`: five finite
+  /// `f32` landmarks, spread guard passed with `Σ‖Xᵢ‖² = 2.3e77`, a dot product
+  /// of `1.4e-90` from a single subnormal deviation, and a minimiser
+  /// `a = 6.1e-168` whose reciprocal `1.6e167` is finite while `a²` underflows
+  /// `f64` to exactly zero. Every parameter is finite; there is simply no
+  /// inverse in `cv2.warpAffine`'s arithmetic, which divides by `a·a + b·b`.
+  ///
+  /// **One function, two call sites, deliberately.** A producer that admits a
+  /// value its own inverse refuses is precisely the defect this closes, so the
+  /// predicate is not written twice —
+  /// `the_producer_and_the_inverse_ask_one_question` is the gate on that, over
+  /// a determinant that is subnormal rather than zero, where the two plausible
+  /// spellings (`is_normal` and `> 0.0`) part company.
+  ///
+  /// Nothing face-shaped goes near it: over the 50 000 sets
+  /// `the_invertibility_postcondition_refuses_nothing_this_sweep_constructs`
+  /// feeds — including 15 000 face-like ones at every scale and offset a
+  /// detector could emit — the refusal fires zero times.
+  ///
   /// # Errors
   /// [`Error::NonFiniteLandmark`] if any coordinate of EITHER point set is NaN
   /// or infinite, naming which set it came from;
   /// [`Error::DegenerateLandmarks`] if `Σ ‖Xᵢ‖²` is zero or non-finite, which
   /// is the case where no transform is determined;
-  /// [`Error::NonFiniteTransform`] if a solved parameter is not finite.
+  /// [`Error::NonInvertibleTransform`] if the minimiser is finite but has no
+  /// inverse on [`Self::inverse`]'s path — the postcondition above, which the
+  /// zero-scale case (`a = b = 0`, reached by a target with no spread) also
+  /// lands in; [`Error::NonFiniteTransform`] if a solved parameter is not
+  /// finite.
   ///
   /// **Both sets, not just `source`.** `target` reaches the centroid and the
   /// dot products exactly as `source` does, so a NaN there used to return `Ok`
@@ -605,11 +687,13 @@ impl SimilarityTransform {
   /// `√(Σ‖Yᵢ‖² / Σ‖Xᵢ‖²)` (Cauchy–Schwarz), whose numerator is at most
   /// `10·f32::MAX² ≈ 1.2e78` and whose denominator, once nonzero, is at least
   /// the square of the smallest `f32` gap — so the quotient stays far inside
-  /// `f64`. That is the upper half of the bound
-  /// [`Self::inverse`] states and measures, and the sweep behind it counted
-  /// this arm zero times over 860 810 sets. It is kept because the bound is an
-  /// argument about the input type and not something the compiler enforces,
-  /// and because `Ok` must never carry a NaN transform.
+  /// `f64`. This is the UPPER half of the old bound, and it is the half that
+  /// survived review: it is Cauchy–Schwarz and it holds. The sweep counted this
+  /// arm zero times over 860 810 sets. It is kept because the bound is an
+  /// argument about the input type and not something the compiler enforces, and
+  /// because `Ok` must never carry a NaN transform. The lower half, which did
+  /// not survive, is not argued anywhere any more — it is the postcondition
+  /// above.
   pub fn estimate(
     source: &[Point; LANDMARK_COUNT],
     target: &[Point; LANDMARK_COUNT],
@@ -639,6 +723,17 @@ impl SimilarityTransform {
     }
 
     let (a, b) = (dot / denom, cross / denom);
+    // THE POSTCONDITION. The candidate is only a `SimilarityTransform` if the
+    // arithmetic `Self::inverse` will run on it has an answer, and that is
+    // asked here — in `reciprocal_determinant`, the same function
+    // `inverse_rotation` asks it through — rather than argued about the input
+    // type. The scale is read off the candidate, so the error names the value
+    // that could not be inverted.
+    if reciprocal_determinant(a, b).is_none() {
+      return Err(Error::NonInvertibleTransform(NonInvertibleTransform::new(
+        a.hypot(b),
+      )));
+    }
     Self::checked(
       a,
       b,
@@ -652,12 +747,10 @@ impl SimilarityTransform {
 /// `1/(a + bi)`, returned as `(re, im)`.
 ///
 /// `cv2.warpAffine`'s own `D = a·a + b·b; D = 1./D;` and nothing else, in the
-/// reference's operation order, guarded by the band both quantities are normal
-/// in: about `1.5e-154` to `6.7e153` in scale. Every transform
-/// [`SimilarityTransform::estimate`] can return from finite `f32` point sets
-/// is inside that band with more than 140 orders of margin at each end — see
-/// [`SimilarityTransform::inverse`] for the bound and its measurement — so the
-/// guard refuses nothing the public surface produces except `a = b = 0`.
+/// reference's operation order, guarded by [`reciprocal_determinant`] — the
+/// band both quantities are normal in, about `1.5e-154` to `6.7e153` in scale.
+/// [`SimilarityTransform::estimate`] applies that same guard as a
+/// postcondition, so this one refuses nothing the public surface can hand it.
 ///
 /// **One expression, no fallback.** A second association for the out-of-band
 /// case was tried (Smith's scaling, `max + min·(min/max)`) and is the shape
@@ -670,9 +763,37 @@ impl SimilarityTransform {
 /// Both arguments are finite by [`SimilarityTransform::inverse`]'s entry
 /// guard; a non-finite one would fail the band test here regardless.
 fn inverse_rotation(a: f64, b: f64) -> Option<(f64, f64)> {
+  let reciprocal = reciprocal_determinant(a, b)?;
+  Some((a * reciprocal, b * -reciprocal))
+}
+
+/// `cv2.warpAffine`'s `D = a·a + b·b; D = 1./D;`, or `None` where either
+/// quantity is not normal.
+///
+/// **The single definition of "this rotation inverts", and it has TWO callers
+/// on purpose.** [`SimilarityTransform::estimate`] evaluates it as a
+/// postcondition before returning, and [`inverse_rotation`] evaluates it as
+/// the precondition of the arithmetic it is about to run. Those two have to
+/// be the same question — a producer that admits a value its own inverse
+/// refuses is exactly the defect review round 5 on #135 found — so they are
+/// one function rather than two spellings that agree today.
+///
+/// Both halves of the test are load-bearing, and neither implies the other:
+///
+/// - `determinant.is_normal()` rejects the ZERO the reference divides by
+///   (`a = b = 0`, and the underflow witness in `estimate`'s doc), and it
+///   rejects a SUBNORMAL determinant, which `> 0.0` would admit — `1e-309` is
+///   nonzero and its reciprocal is still `∞`;
+/// - `reciprocal.is_normal()` rejects the other end, where `D` is finite and
+///   normal but `1/D` has flushed to zero or a subnormal.
+///
+/// A non-finite `a` or `b` fails it too: `a·a + b·b` is then NaN or infinite,
+/// and neither is normal.
+#[inline]
+fn reciprocal_determinant(a: f64, b: f64) -> Option<f64> {
   let determinant = a * a + b * b;
   let reciprocal = 1.0 / determinant;
-  (determinant.is_normal() && reciprocal.is_normal()).then(|| (a * reciprocal, b * -reciprocal))
+  (determinant.is_normal() && reciprocal.is_normal()).then_some(reciprocal)
 }
 
 /// Rejects a NaN or infinite coordinate in one NAMED point set, so the error
@@ -858,10 +979,10 @@ impl FaceAlign {
   /// # Errors
   /// [`Error::NonFiniteLandmark`] on a NaN or infinite landmark coordinate;
   /// [`Error::DegenerateLandmarks`] if the five landmarks carry no spread;
-  /// [`Error::NonInvertibleTransform`] if the solve nonetheless produced a
-  /// transform with no inverse — a DIFFERENT geometry, and a different error,
-  /// because the landmarks are spread in that case and only the scale
-  /// collapsed; [`Error::CoordinateOverflow`] if the inverse is finite but so
+  /// [`Error::NonInvertibleTransform`] if the landmarks are spread and the
+  /// SOLVED transform still has no inverse — a DIFFERENT geometry, and a
+  /// different error, because only the scale collapsed;
+  /// [`Error::CoordinateOverflow`] if the inverse is finite but so
   /// large that a destination → source coordinate leaves the `int` fixed-point
   /// domain the sampler computes it in.
   ///
@@ -875,22 +996,23 @@ impl FaceAlign {
     landmarks5: &[Point; LANDMARK_COUNT],
   ) -> Result<AlignedFace> {
     let transform = SimilarityTransform::estimate(landmarks5, &ARCFACE_TEMPLATE)?;
-    // A real backstop, against a real geometry — NOT an impossibility, which
-    // is what the two obvious arguments for it both get wrong. The solved
-    // scale is `|Σ conj(uᵢ)·vᵢ| / Σ‖uᵢ‖²` over the two CENTRED point sets, and
-    // that vanishes when the sets are orthogonal in that inner product, which
+    // The geometry this guards against is real — the solved scale is
+    // `|Σ conj(uᵢ)·vᵢ| / Σ‖uᵢ‖²` over the two CENTRED point sets, and that
+    // vanishes when the sets are orthogonal in that inner product, which
     // neither `estimate`'s rejection of a zero SOURCE spread nor the fact that
     // [`ARCFACE_TEMPLATE`] has spread of its own rules out: a well-spread
     // source exists (`Σ‖uᵢ‖² ≈ 9.3e4`) whose exact solved scale against this
-    // very template is 5e-18. Rounding such a source through `Point`'s `f32`
-    // has always left the scale nonzero — 9e-10 for the constructed case — so
-    // no input is KNOWN to reach the arm, and it is kept because that is a
-    // failure to find one rather than a proof that none exists.
+    // very template is 5e-18 — but it is no longer THIS line that catches it.
+    // `estimate` applies the invertibility postcondition itself, so a
+    // minimiser with no inverse is refused above and never reaches here.
     //
-    // Reachable directly, though, and pinned by
-    // `estimate_can_return_a_transform_with_no_inverse`: `estimate` is public
-    // and takes its target from the caller, so a zero-spread target hands back
-    // a finite `a = b = 0` that inverts to `None`.
+    // What is left is the exit check inside `inverse`, on a TRANSLATION that
+    // leaves `f64` while the rotation stays in band. No input is known to
+    // reach that either — `|tx|` is at most ~5.8e122 for finite `f32`
+    // landmarks and the largest in-band inverse rotation is ~6.7e153, whose
+    // product is 160 orders inside `f64::MAX` — so this is a backstop kept
+    // because that is a failure to find a witness rather than a proof that
+    // none exists.
     //
     // Whichever way it is reached, the error names the SCALE. It used to name
     // a landmark spread of zero, which no execution of this line can have:
