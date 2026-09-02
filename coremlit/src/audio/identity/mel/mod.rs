@@ -77,10 +77,14 @@
 //! f64 throughout, like both of the above. The oracle these goldens come from
 //! computes the whole front end in **fp32** and uses the checkpoint's *saved*
 //! fp32 hamming window, whose taps sit up to 2.3e-7 from the exact analytic
-//! window. So agreement with it is close but not exact, the residual is
-//! dominated by the oracle's own precision rather than by this port, and the
-//! sibling `tests.rs` pins the MEASURED number and says so rather than choosing
-//! a threshold in advance.
+//! window. So agreement with it is close but not exact.
+//!
+//! On `tone_220` and `formant` the residual is dominated by the oracle's own
+//! precision rather than by this port. **On `clipped` that is over-stated**: an
+//! independent f64 reference sits 3.66e-5 from the golden where this port sits
+//! 8.54e-5, so part of that clip's gap is the port's own. The sibling
+//! `tests.rs` carries the decomposition and names which clip is which, and pins
+//! the MEASURED number rather than choosing a threshold in advance.
 
 use core::fmt;
 use std::sync::Arc;

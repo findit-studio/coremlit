@@ -467,7 +467,7 @@ fn mean_normalization_is_per_mel_bin_over_time() {
 /// this compares the Rust port against the function the graph was converted
 /// behind, with no CoreML model and no Python present.
 ///
-/// # The budget is measured, and the residual is the ORACLE's
+/// # The budget is measured, and on two clips of three the residual is the ORACLE's
 ///
 /// The two cannot agree exactly: the oracle runs the whole front end in fp32
 /// with the checkpoint's saved fp32 tables, and this port runs it in f64 from
@@ -485,11 +485,26 @@ fn mean_normalization_is_per_mel_bin_over_time() {
 ///
 /// The left column is **pure fp32-versus-f64 arithmetic** — identical tables,
 /// so nothing but precision separates the two — and on `tone_220` it is larger
-/// than the right one. That is the finding: the disagreement is dominated by
-/// the oracle's own rounding, and adopting the checkpoint's fp32 tables to
-/// "match better" would move this gate the wrong way on two clips out of three.
-/// The tables' own contributions are small and separately pinned above (window
-/// 2.3e-7, filterbank 6.3e-6).
+/// than the right one. The tables' own contributions are small and separately
+/// pinned above (window 2.3e-7, filterbank 6.3e-6).
+///
+/// **The claim holds on `tone_220` and `formant`, and is over-stated on
+/// `clipped`.** An INDEPENDENT f64 reference — the same recipe rebuilt from
+/// torchaudio's own primitives at `dtype=torch.float64`, rather than a re-run
+/// of this port's algorithm — disagrees with the golden by 8.16e-5 on
+/// `tone_220`, essentially the whole of this port's 8.15e-5: nothing there is
+/// the port's. On `clipped` the same reference disagrees by only 3.66e-5
+/// against this port's 8.54e-5, so **roughly half of that clip's gap is not
+/// explained by the oracle's rounding** and is the port's own. So the sentence
+/// is narrowed to the clips it was measured on rather than dropped or left
+/// standing over all three. (Measured in the audit recorded as coremlit #138;
+/// the reference is not committed, and an end-to-end f64 oracle with a tight
+/// pin is the follow-up it names.)
+///
+/// The gate is deliberately NOT moved for this. 1.5e-4 is ~1.8× the measured
+/// worst and every front-end mutation below clears it by orders of magnitude,
+/// so the pin's job — separating a defect from precision — is unaffected by
+/// which side owns 5e-5 on one clip.
 ///
 /// **Every front-end mutation clears it by orders of magnitude.** Measured on
 /// these same clips, in natural-log units, worst case across them: window
