@@ -3761,6 +3761,57 @@ identity = [\"dep:rustfft\"]
     );
   }
 
+  /// **CHARACTERIZATION, not a check. This records a defect, and it is
+  /// INVERTED when coremlit #139 lands.**
+  ///
+  /// Direction 1's forward loop — "every file the table names must be covered
+  /// by some row" — runs only under `if let Selection::Files(listed)`. An
+  /// `include` glob's file list exists only after a download, so a table that
+  /// stages by glob is reconciled ONLY against the rows that already exist:
+  /// **a bundle the glob stages with no `Artifact` row is never discovered.**
+  /// Nine of ten `MODELS_LOCK` tables are `include` globs, so this is the
+  /// common shape rather than the exception.
+  ///
+  /// The fixture below is that situation exactly. `vendor/one` stages
+  /// `*.mlmodelc/*`; one row covers `a.mlmodelc`, and the same glob also stages
+  /// a `b.mlmodelc` that no row covers. Because the lock names no file list for
+  /// this table, `b.mlmodelc` cannot be written into the fixture at all — which
+  /// IS the defect: it is invisible to the checker, so the fixture cannot state
+  /// it either, and the check comes back clean.
+  ///
+  /// Whose defect: **verified pre-existing on `main` `bf8b3f6`** at
+  /// `model_licences.rs:1336` — the same `if let Selection::Files(listed)`,
+  /// rows identical main→branch apart from the one new redimnet row. The
+  /// branch that added this test neither widened nor narrowed it, so per the
+  /// standing rule it is recorded here and fixed in its own issue rather than
+  /// absorbed.
+  ///
+  /// The fix, and what to do with this test: coremlit **#139** commits a
+  /// per-table manifest (`MODELS_LOCK.d/<vendor_dir>@<revision>.sha256`,
+  /// upstream's `CHECKSUMS.sha256` verbatim where one ships) and derives every
+  /// table's staged set from it, running the forward loop for ALL tables. When
+  /// that lands, this assertion becomes `!is_empty()` and the doc above becomes
+  /// the falsifier it describes. Until then it is here so the gap is a runnable
+  /// statement rather than a sentence in an issue.
+  #[test]
+  fn direction_one_does_not_enumerate_a_glob_tables_contents_forward() {
+    let tables = [globbed("vendor/one", "one", &["*.mlmodelc/*"])];
+    let rows = [covering(
+      "one/a.mlmodelc/weights/weight.bin",
+      "vendor/one",
+      &["a.mlmodelc/weights/weight.bin"],
+    )];
+
+    let failures = unmatched_coverage(&tables, &rows);
+    assert!(
+      failures.is_empty(),
+      "CHARACTERIZATION: this test records coremlit #139 (direction 1 does not enumerate an \
+       `include` table's contents forward), and asserting a clean result is how it records it. \
+       A non-empty result here means #139 landed — INVERT this assertion to `!is_empty()` and \
+       rewrite the doc comment as the falsifier it already describes. Got: {failures:?}"
+    );
+  }
+
   #[test]
   fn direction_one_passes_when_every_named_file_has_a_row() {
     let tables = [listed(
