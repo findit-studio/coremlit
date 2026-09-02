@@ -578,7 +578,7 @@ impl NonFiniteOutput {
   }
 }
 
-/// Which part of two [`crate::embeddings::face::FaceModel`] manifests first
+/// Which part of two [`crate::embeddings::face::EmbeddingSpace`]s first
 /// disagrees.
 ///
 /// Declared in the order [`crate::embeddings::face::FaceEmbedding::dot`]
@@ -586,22 +586,37 @@ impl NonFiniteOutput {
 /// first of these rather than an arbitrary one.
 ///
 /// **Every variant here is part of the FUNCTION that produced the vector**, and
-/// that is the whole membership rule. `dim` is the artifact's output width; the
-/// other four are the pixels-to-tensor map the host applied before inference.
-/// Change any of them and the numbers change, so a cosine across the difference
-/// is undefined rather than merely inaccurate.
+/// that is the whole membership rule. [`Self::Artifact`] is the trained
+/// parameters, which are most of that function; the two feature names say
+/// which tensor was written and which was read; `dim` is the artifact's output
+/// width; the rest are the pixels-to-tensor map the host applied before
+/// inference. Change any of them and the numbers change, so a cosine across
+/// the difference is undefined rather than merely inaccurate.
 ///
-/// **The feature NAMES used to be in this list and are not any more.** A
-/// feature name is the string CoreML routes a tensor by: re-exporting one set
-/// of weights under different names produces the same space, and two unrelated
-/// artifacts are free to pick the same two names. It is therefore neither
-/// necessary nor sufficient evidence about the space, and the only thing
-/// comparing it ever produced was a false refusal — see
-/// [`crate::embeddings::face::FaceEmbedding`]'s doc for what identity is bound
-/// to now and what remains unbindable.
+/// **The feature names were removed from this list once, as "IO routing", and
+/// are back.** The argument was that renaming a graph's features re-exports
+/// the same weights and produces the same numbers, so the name is not
+/// evidence. It is not evidence *about the weights* — that is what
+/// [`Self::Artifact`] is for — but for a model with two `[batch, dim]` heads
+/// the OUTPUT name selects which function produced the numbers, and the
+/// re-export the old argument worried about is now caught by the digest
+/// instead, where it belongs. The two claims that motivated the removal are
+/// both answered by adding the artifact rather than by dropping the names.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, derive_more::Display)]
 #[display("{}", self.as_str())]
 pub enum EmbeddingSpaceField {
+  /// The two embeddings came out of artifacts whose BYTES differ — a
+  /// fine-tune, a requantisation, or an unrelated export of the same width.
+  ///
+  /// First, because when this differs everything else is coincidence: the
+  /// trained parameters are most of the function, so naming a matching width
+  /// or a matching divisor would be true and misleading about the cause.
+  Artifact,
+  /// The pixels were written to differently named input features.
+  InputFeature,
+  /// The embeddings were read from differently named output features — which
+  /// for a multi-head graph means two different functions of one artifact.
+  OutputFeature,
   /// The embeddings are different widths — the one case that was previously
   /// reported as a cosine of `0.0`, a value a measured non-match also has.
   Dim,
@@ -620,6 +635,9 @@ impl EmbeddingSpaceField {
   #[inline(always)]
   pub const fn as_str(&self) -> &'static str {
     match self {
+      Self::Artifact => "artifact digest",
+      Self::InputFeature => "input feature name",
+      Self::OutputFeature => "output feature name",
       Self::Dim => "dim",
       Self::ChannelOrder => "preprocessing channel order",
       Self::TensorLayout => "preprocessing tensor layout",
@@ -633,35 +651,92 @@ impl EmbeddingSpaceField {
 /// different model or preprocessing spaces.
 ///
 /// **This is a refusal, not a score.** The widths agreeing is not enough: two
-/// 512-wide ArcFace-family artifacts, or one artifact fed BGR and RGB, put
-/// their vectors in unrelated spaces, and their dot product lands in `[−1, 1]`
-/// looking exactly like a measurement. The old return of `0.0` for a width
-/// mismatch had the same defect in its narrow case — `0.0` is a legitimate
-/// cosine, so no caller could tell an incompatible migration from a face that
-/// simply did not match.
+/// 512-wide ArcFace-family artifacts, one graph's two `[batch, dim]` heads, or
+/// one artifact fed BGR and RGB, put their vectors in unrelated spaces, and
+/// their dot product lands in `[−1, 1]` looking exactly like a measurement.
+/// The old return of `0.0` for a width mismatch had the same defect in its
+/// narrow case — `0.0` is a legitimate cosine, so no caller could tell an
+/// incompatible migration from a face that simply did not match.
 ///
 /// Payload of [`Error::IncomparableEmbeddings`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IncomparableEmbeddings {
-  /// The first manifest field found to differ.
+  /// The first space field found to differ.
   field: EmbeddingSpaceField,
 }
 
 impl IncomparableEmbeddings {
-  /// Construct from the first manifest field found to differ.
+  /// Construct from the first space field found to differ.
   #[inline(always)]
   pub const fn new(field: EmbeddingSpaceField) -> Self {
     Self { field }
   }
 
-  /// The first manifest field found to differ.
+  /// The first space field found to differ.
   ///
-  /// The FIRST, not the only: two manifests can disagree in several places at
+  /// The FIRST, not the only: two spaces can disagree in several places at
   /// once, and reporting one that is definitely wrong beats a list assembled
-  /// to look thorough.
+  /// to look thorough. When the artifacts differ that is what is named, and
+  /// everything after it is coincidence.
   #[inline(always)]
   pub const fn field(&self) -> EmbeddingSpaceField {
     self.field
+  }
+}
+
+/// The bytes of a compiled model artifact could not be read, so no
+/// [`crate::embeddings::face::ArtifactDigest`] exists for it.
+///
+/// **Fails closed, and that is the whole point of the variant.** The digest is
+/// what binds an embedding to the weights it came out of; a load that could
+/// not read some of the bundle has no identity to stamp, and a partial digest
+/// would be an identity for bytes nobody has. So a load that reaches this
+/// fails rather than producing vectors whose space is a guess.
+///
+/// Raised for an unreadable directory or file anywhere under the artifact, for
+/// a symlink that cannot be followed, for a root that is neither a directory
+/// nor a regular file, and for a tree nested past the walk's depth limit.
+///
+/// Payload of [`Error::ArtifactDigest`].
+///
+/// Like its siblings elsewhere in the workspace this one derives
+/// [`std::error::Error`] and owns both the variant's message and its
+/// `#[source]`: the variant is `#[error(transparent)]`, which forwards
+/// `Display` *and* `source()` straight through rather than inserting a link.
+///
+/// The inherent [`source`](Self::source) getter returns the concrete
+/// `&`[`std::io::Error`], and so shadows [`std::error::Error::source`] for
+/// method-call syntax; call the trait method by path
+/// (`std::error::Error::source(&e)`) to walk the chain.
+#[derive(Debug, thiserror::Error)]
+#[error("failed to hash the model artifact at `{path}`: {source}")]
+pub struct DigestFailure {
+  /// The path that could not be read — the artifact root, or the entry under
+  /// it that failed.
+  path: std::path::PathBuf,
+  /// The underlying I/O failure.
+  #[source]
+  source: std::io::Error,
+}
+
+impl DigestFailure {
+  /// Construct from the path that could not be read and the underlying I/O
+  /// failure.
+  #[inline(always)]
+  pub const fn new(path: std::path::PathBuf, source: std::io::Error) -> Self {
+    Self { path, source }
+  }
+
+  /// The path that could not be read.
+  #[inline(always)]
+  pub fn path(&self) -> &std::path::Path {
+    &self.path
+  }
+
+  /// The underlying I/O failure.
+  #[inline(always)]
+  pub const fn source(&self) -> &std::io::Error {
+    &self.source
   }
 }
 
@@ -719,6 +794,13 @@ pub enum Error {
     .0.value()
   )]
   CoordinateOverflow(CoordinateOverflow),
+  /// The compiled artifact's bytes could not be hashed, so the embedder has no
+  /// identity to stamp on the vectors it would produce.
+  ///
+  /// The message and the `source` live on [`DigestFailure`], which this variant
+  /// forwards both of through `#[error(transparent)]`.
+  #[error(transparent)]
+  ArtifactDigest(#[from] DigestFailure),
   /// The loaded model does not match the manifest's declared contract.
   #[error("model contract mismatch on `{}`: expected {}, got {}", .0.feature(), .0.expected(), .0.actual())]
   ContractMismatch(ContractMismatch),
@@ -735,10 +817,11 @@ pub enum Error {
   /// A (finite) embedding row has zero magnitude and cannot be L2-normalized.
   #[error("model output row {} has zero magnitude and cannot be normalized", .0.row())]
   EmbeddingZero(BatchRow),
-  /// Two embeddings come from different model or preprocessing spaces.
+  /// Two embeddings come from different artifact, routing or preprocessing
+  /// spaces.
   #[error(
-    "these two embeddings come from different spaces (their manifests' {} differs); no \
-     similarity between them is defined",
+    "these two embeddings come from different spaces (their {} differs); no similarity between \
+     them is defined",
     .0.field()
   )]
   IncomparableEmbeddings(IncomparableEmbeddings),

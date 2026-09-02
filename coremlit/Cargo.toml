@@ -74,9 +74,12 @@ lid = ["dep:rustfft", "dep:windit"]
 identity = ["dep:rustfft"]
 
 # The face-embedding surface (`embeddings::face`): the ArcFace 5-point
-# similarity alignment plus a manifest-driven CoreML embedder. It adds NO
-# dependency — the alignment is `f64` arithmetic and the embedder builds a
-# `MultiArray` the always-compiled runtime core already owns.
+# similarity alignment plus a manifest-driven CoreML embedder. Its ONE
+# dependency is `sha2`, already an optional workspace dep that `granite` and
+# `siglip` pull: `FaceEmbedder::load` hashes the artifact directory it loads so
+# an embedding carries the identity of the weights that produced it, not just
+# their schema (issue #138 §3). The alignment is `f64` arithmetic and the
+# embedder builds a `MultiArray` the always-compiled runtime core already owns.
 #
 # NOT `commercial-face`, and that is deliberate. This feature gates no model
 # artifact: issue #115's census found none that clears both the licence bar and
@@ -85,7 +88,7 @@ identity = ["dep:rustfft"]
 # is refused by `every_commercial_feature_gates_a_research_only_artifact`
 # (tests/model_licences.rs) precisely so a gate cannot stand as false
 # reassurance. The rename arrives with the artifact it protects.
-face = []
+face = ["dep:sha2"]
 
 [dependencies]
 objc2.workspace = true

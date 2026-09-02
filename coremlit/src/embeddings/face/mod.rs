@@ -44,6 +44,13 @@
 //!   layout are [`FaceModel`] fields, so a second artifact with different
 //!   preprocessing is a different value, not a second code path. See the
 //!   [`embed`] module for the census table that makes this non-negotiable.
+//! - **The space is produced by `load`, and it knows which bytes it came
+//!   from.** [`FaceEmbedder::load`] hashes the artifact directory it loads
+//!   into an [`ArtifactDigest`], and every [`FaceEmbedding`] carries that
+//!   alongside the feature names, width and preprocessing. Two vectors compare
+//!   only if byte-identical weights produced them, read from the same output
+//!   feature — [`FaceEmbedding::dot`] cannot return a score across different
+//!   weights. See the [`artifact`] module.
 //!
 //! # No artifact is staged, and that is a finding rather than an omission
 //!
@@ -111,11 +118,14 @@
 //! throughput number**, because there is nothing to run them against.
 
 pub mod align;
+pub mod artifact;
 pub mod embed;
 pub mod error;
 
 #[cfg(feature = "serde")]
 mod compute_units_serde;
+
+pub use artifact::ArtifactDigest;
 
 pub use align::{
   ARCFACE_TEMPLATE, AlignedFace, FaceAlign, FaceCrop, LANDMARK_COUNT, MAX_CROP_AXIS, Point,

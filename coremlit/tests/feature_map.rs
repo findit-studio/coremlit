@@ -99,10 +99,12 @@ fn expected_features() -> Vec<(&'static str, Vec<&'static str>)> {
     // engine that `ced`/`lid`/`granite` need has nothing to do here.
     ("identity", vec!["dep:rustfft"]),
     ("siglip", vec!["dep:tokenizers", "dep:pixon", "dep:sha2"]),
-    // `face` adds NO dependency: the alignment is `f64` arithmetic and the
-    // embedder builds a `MultiArray` the runtime core already owns. An empty
-    // dep set is the assertion — the day it grows one, this row reds.
-    ("face", vec![]),
+    // `face`'s only dependency is `sha2`, and it is there for one reason:
+    // `FaceEmbedder::load` hashes the artifact directory it loads, so an
+    // embedding carries the identity of the WEIGHTS that produced it rather
+    // than of a schema two unrelated artifacts could share (issue #138 §3).
+    // The exact dep set is the assertion — a second one reds this row.
+    ("face", vec!["dep:sha2"]),
   ]
 }
 

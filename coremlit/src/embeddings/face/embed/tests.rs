@@ -11,10 +11,33 @@ use crate::embeddings::face::align::TEMPLATE_BYTES;
 const F32: Option<DataType> = Some(DataType::F32);
 
 /// A manifest of the given width, standing in for the artifact an embedder
-/// would have been loaded against. Every `FaceEmbedding` carries one, so a
-/// unit gate has to name one too.
-fn space(dim: usize) -> FaceModel {
+/// would have been loaded against.
+fn model(dim: usize) -> FaceModel {
   FaceModel::new("data", "embedding", dim)
+}
+
+/// A digest standing in for one artifact's bytes.
+///
+/// `tag` names WHICH artifact, so a gate can say "these two vectors came out
+/// of the same weights" or "out of different weights" without staging two
+/// `.mlmodelc` directories. The real digests come from `digest_artifact`, and
+/// `artifact/tests.rs` is where the hash itself is gated; here only the
+/// equality matters.
+fn artifact(tag: u8) -> ArtifactDigest {
+  ArtifactDigest::from_raw([tag; 32])
+}
+
+/// The space `load` would stamp for `manifest`, read out of artifact `tag`.
+///
+/// Reached through `EmbeddingSpace::of` — the same projection `load` uses — so
+/// a gate cannot drift from what the door actually builds.
+fn space_of(tag: u8, manifest: &FaceModel) -> EmbeddingSpace {
+  EmbeddingSpace::of(artifact(tag), manifest)
+}
+
+/// The default space: one artifact, the default manifest, the given width.
+fn space(dim: usize) -> EmbeddingSpace {
+  space_of(1, &model(dim))
 }
 
 /// The resolved input contract as a comparable pair, so a gate can assert the
@@ -260,7 +283,7 @@ fn output_shape_check_binds_batch_and_dim() {
 
 #[test]
 fn normalising_produces_a_unit_vector() {
-  let embedding = normalise_row(&[3.0, 4.0], 0, space(2).space()).expect("finite and nonzero");
+  let embedding = normalise_row(&[3.0, 4.0], 0, space(2)).expect("finite and nonzero");
   assert_eq!(embedding.dim(), 2);
   assert!((embedding.as_slice()[0] - 0.6).abs() < 1e-6);
   assert!((embedding.as_slice()[1] - 0.8).abs() < 1e-6);
@@ -271,8 +294,7 @@ fn normalising_produces_a_unit_vector() {
 
 #[test]
 fn a_zero_row_is_refused_and_names_the_callers_index() {
-  let error =
-    normalise_row(&[0.0, 0.0, 0.0], 7, space(3).space()).expect_err("zero has no direction");
+  let error = normalise_row(&[0.0, 0.0, 0.0], 7, space(3)).expect_err("zero has no direction");
   assert!(
     matches!(error, Error::EmbeddingZero(payload) if payload.row() == 7),
     "expected EmbeddingZero(7), got {error:?}"
@@ -282,7 +304,7 @@ fn a_zero_row_is_refused_and_names_the_callers_index() {
 #[test]
 fn a_non_finite_row_names_the_row_and_the_component() {
   let error =
-    normalise_row(&[1.0, f32::NAN, 2.0], 5, space(3).space()).expect_err("NaN is not an embedding");
+    normalise_row(&[1.0, f32::NAN, 2.0], 5, space(3)).expect_err("NaN is not an embedding");
   assert!(
     matches!(error, Error::NonFiniteOutput(payload) if payload.row() == 5 && payload.component() == 1),
     "expected NonFiniteOutput(5, 1), got {error:?}"
@@ -291,9 +313,9 @@ fn a_non_finite_row_names_the_row_and_the_component() {
 
 #[test]
 fn cosine_is_the_dot_product_of_unit_vectors() {
-  let a = normalise_row(&[1.0, 0.0], 0, space(2).space()).expect("unit");
-  let b = normalise_row(&[0.0, 1.0], 0, space(2).space()).expect("unit");
-  let c = normalise_row(&[1.0, 0.0], 0, space(2).space()).expect("unit");
+  let a = normalise_row(&[1.0, 0.0], 0, space(2)).expect("unit");
+  let b = normalise_row(&[0.0, 1.0], 0, space(2)).expect("unit");
+  let c = normalise_row(&[1.0, 0.0], 0, space(2)).expect("unit");
   assert!(a.cosine(&b).expect("one space").abs() < 1e-6);
   assert!((a.cosine(&c).expect("one space") - 1.0).abs() < 1e-6);
   assert_eq!(
@@ -330,7 +352,7 @@ fn a_unit_vector_never_scores_above_one_against_itself() {
   // that has anything to do with the two faces. So a clamp is the correct
   // answer here and an error would be the wrong one: there is nothing to
   // report.
-  let vector = normalise_row(&OVER_UNIT_ROW, 0, space(10).space()).expect("finite and nonzero");
+  let vector = normalise_row(&OVER_UNIT_ROW, 0, space(10)).expect("finite and nonzero");
 
   // The witness is only a witness if the excess is really there. Both halves
   // are asserted, so weakening the row reds here rather than silently making
@@ -362,7 +384,7 @@ fn a_unit_vector_never_scores_above_one_against_itself() {
 
   // The other end, on the same row negated against itself.
   let opposite =
-    normalise_row(&OVER_UNIT_ROW.map(|v| -v), 0, space(10).space()).expect("finite and nonzero");
+    normalise_row(&OVER_UNIT_ROW.map(|v| -v), 0, space(10)).expect("finite and nonzero");
   let against = vector.dot(&opposite).expect("one space");
   assert!(
     against >= -1.0,
@@ -374,15 +396,17 @@ fn a_unit_vector_never_scores_above_one_against_itself() {
 fn one_space_reached_through_two_separately_built_manifests_still_compares() {
   // `&self` inference means fan-out is one embedder per worker over the same
   // artifact, so the SAME space is legitimately produced by more than one
-  // producer. A space identity minted per embedder would refuse exactly the
-  // cross-worker comparisons those workers exist to make; this pins that it
-  // does not. See `FaceEmbedding`'s doc for why the precedent's minted token
-  // was not the right shape here.
-  let a = normalise_row(&[1.0, 0.0], 0, space(2).space()).expect("unit");
+  // producer. A space identity minted per embedder — `calibrate`'s
+  // `CalibrationId` shape — would refuse exactly the cross-worker comparisons
+  // those workers exist to make. The artifact digest is what sidesteps that:
+  // it is an identity of the BYTES, not of the load, so the same bundle read
+  // twice is one value. This pins both halves — two separately built manifests
+  // over one artifact are one space.
+  let a = normalise_row(&[1.0, 0.0], 0, space(2)).expect("unit");
   let b = normalise_row(
     &[1.0, 0.0],
     0,
-    FaceModel::new("data", "embedding", 2).space(),
+    space_of(1, &FaceModel::new("data", "embedding", 2)),
   )
   .expect("unit");
   assert_eq!(
@@ -397,8 +421,8 @@ fn embeddings_of_different_widths_are_refused_rather_than_scored_zero() {
   // This used to return `0.0`, which is also what a measured orthogonal pair
   // returns — so a caller could not tell an incompatible model migration from
   // a face that did not match.
-  let a = normalise_row(&[1.0, 0.0], 0, space(2).space()).expect("unit");
-  let wide = normalise_row(&[1.0, 0.0, 0.0], 0, space(3).space()).expect("unit");
+  let a = normalise_row(&[1.0, 0.0], 0, space(2)).expect("unit");
+  let wide = normalise_row(&[1.0, 0.0, 0.0], 0, space(3)).expect("unit");
   let error = a.cosine(&wide).expect_err("two widths are two spaces");
   assert!(
     matches!(
@@ -414,15 +438,15 @@ fn embeddings_from_two_preprocessing_spaces_are_refused_not_scored() {
   // The half no width check could ever reach: identical widths, identical
   // components, unrelated spaces. Scored, this pair reads 1.0 — a perfect
   // match between two vectors that mean nothing to each other.
-  let rgb = space(2);
+  let rgb = model(2);
   let bgr = rgb.with_preprocessing(Preprocessing::from_mean_and_divisor(
     ChannelOrder::Bgr,
     TensorLayout::Nchw,
     [127.5, 127.5, 127.5],
     127.5,
   ));
-  let a = normalise_row(&[1.0, 0.0], 0, rgb.space()).expect("unit");
-  let b = normalise_row(&[1.0, 0.0], 0, bgr.space()).expect("unit");
+  let a = normalise_row(&[1.0, 0.0], 0, space_of(1, &rgb)).expect("unit");
+  let b = normalise_row(&[1.0, 0.0], 0, space_of(1, &bgr)).expect("unit");
   assert_eq!(
     a.dot(&a).expect("one space"),
     1.0,
@@ -471,7 +495,7 @@ fn embeddings_from_two_preprocessing_spaces_are_refused_not_scored() {
       )),
     ),
   ] {
-    let far = normalise_row(&[1.0, 0.0], 0, other.space()).expect("unit");
+    let far = normalise_row(&[1.0, 0.0], 0, space_of(1, &other)).expect("unit");
     let error = a
       .cosine(&far)
       .expect_err("a different manifest is a different space");
@@ -489,7 +513,7 @@ fn a_non_finite_preprocessing_scale_still_names_one_space() {
   // be refused against its own twin for a reason having nothing to do with
   // either embedding. A broken manifest is one broken manifest.
   let with_nan = |payload: f32| {
-    space(2).with_preprocessing(Preprocessing::new(
+    model(2).with_preprocessing(Preprocessing::new(
       ChannelOrder::Rgb,
       TensorLayout::Nchw,
       payload,
@@ -497,7 +521,7 @@ fn a_non_finite_preprocessing_scale_still_names_one_space() {
     ))
   };
   let nan = with_nan(f32::NAN);
-  let a = normalise_row(&[1.0, 0.0], 0, nan.space()).expect("unit");
+  let a = normalise_row(&[1.0, 0.0], 0, space_of(1, &nan)).expect("unit");
   // Deliberately a DIFFERENT NaN payload, not a second copy of the same
   // constant: a raw `to_bits` comparison passes the same-constant case and
   // fails this one, so the same-constant case alone cannot tell a canonical
@@ -505,14 +529,14 @@ fn a_non_finite_preprocessing_scale_still_names_one_space() {
   // arithmetic result may be any of them.
   let other_payload = f32::from_bits(f32::NAN.to_bits() | 1);
   assert!(other_payload.is_nan() && other_payload.to_bits() != f32::NAN.to_bits());
-  let b = normalise_row(&[1.0, 0.0], 0, with_nan(other_payload).space()).expect("unit");
+  let b = normalise_row(&[1.0, 0.0], 0, space_of(1, &with_nan(other_payload))).expect("unit");
   assert_eq!(
     a.cosine(&b)
       .expect("one manifest is one space, whatever it holds"),
     1.0
   );
   assert!(
-    a.cosine(&normalise_row(&[1.0, 0.0], 0, space(2).space()).expect("unit"))
+    a.cosine(&normalise_row(&[1.0, 0.0], 0, space(2)).expect("unit"))
       .is_err(),
     "a NaN scale is still a DIFFERENT space from a finite one"
   );
@@ -525,15 +549,15 @@ fn an_embedding_carries_the_space_that_produced_it() {
   // gate written against the default one would pass while the preprocessing
   // half — the half that decides the space and that no shape check can see —
   // was silently replaced.
-  let manifest = space(2).with_preprocessing(Preprocessing::from_mean_and_divisor(
+  let manifest = model(2).with_preprocessing(Preprocessing::from_mean_and_divisor(
     ChannelOrder::Bgr,
     TensorLayout::Nhwc,
     [104.0, 117.0, 123.0],
     58.0,
   ));
   assert_ne!(manifest.preprocessing(), Preprocessing::ARCFACE);
-  let embedding = normalise_row(&[1.0, 0.0], 0, manifest.space()).expect("unit");
-  assert_eq!(embedding.space(), manifest.space());
+  let embedding = normalise_row(&[1.0, 0.0], 0, space_of(1, &manifest)).expect("unit");
+  assert_eq!(embedding.space(), space_of(1, &manifest));
   assert_eq!(
     embedding.space().preprocessing(),
     manifest.preprocessing(),
@@ -724,8 +748,8 @@ fn normalising_survives_components_an_f32_square_cannot_hold() {
   // near unit scale.
   // Both components are finite `f32`s, and so is their norm (3.0e38); only the
   // SQUARES leave the type.
-  let big = normalise_row(&[1.8e38, 2.4e38], 0, space(2).space())
-    .expect("a large but finite row has a direction");
+  let big =
+    normalise_row(&[1.8e38, 2.4e38], 0, space(2)).expect("a large but finite row has a direction");
   assert!(
     (big.as_slice()[0] - 0.6).abs() < 1e-6,
     "got {:?}",
@@ -737,8 +761,8 @@ fn normalising_survives_components_an_f32_square_cannot_hold() {
     big.as_slice()
   );
 
-  let small = normalise_row(&[3.0e-25, 4.0e-25], 1, space(2).space())
-    .expect("a tiny but finite row has a direction");
+  let small =
+    normalise_row(&[3.0e-25, 4.0e-25], 1, space(2)).expect("a tiny but finite row has a direction");
   assert!(
     (small.as_slice()[0] - 0.6).abs() < 1e-6,
     "got {:?}",
@@ -752,7 +776,7 @@ fn normalising_survives_components_an_f32_square_cannot_hold() {
 
   // Only an EXACT zero magnitude is a genuine absence of direction.
   assert!(matches!(
-    normalise_row(&[0.0, -0.0], 2, space(2).space()).expect_err("zero has no direction"),
+    normalise_row(&[0.0, -0.0], 2, space(2)).expect_err("zero has no direction"),
     Error::EmbeddingZero(_)
   ));
 }
@@ -813,13 +837,13 @@ fn manifest_equality_and_space_identity_are_one_relation() {
   // by RAW BIT PATTERN, under which they are not. One type, two equality
   // relations, contradicting each other; and it was the space check that got
   // it wrong, refusing a pair whose preprocessing is the same function.
-  let plus = space(2).with_preprocessing(Preprocessing::new(
+  let plus = model(2).with_preprocessing(Preprocessing::new(
     ChannelOrder::Rgb,
     TensorLayout::Nchw,
     1.0 / 127.5,
     [0.0, -1.0, -1.0],
   ));
-  let minus = space(2).with_preprocessing(Preprocessing::new(
+  let minus = model(2).with_preprocessing(Preprocessing::new(
     ChannelOrder::Rgb,
     TensorLayout::Nchw,
     1.0 / 127.5,
@@ -831,15 +855,18 @@ fn manifest_equality_and_space_identity_are_one_relation() {
     "the two must differ in their BITS, or the gate proves nothing"
   );
 
-  let a = normalise_row(&[1.0, 0.0], 0, plus.space()).expect("unit");
-  let b = normalise_row(&[1.0, 0.0], 0, minus.space()).expect("unit");
+  let a = normalise_row(&[1.0, 0.0], 0, space_of(1, &plus)).expect("unit");
+  let b = normalise_row(&[1.0, 0.0], 0, space_of(1, &minus)).expect("unit");
   for (name, related) in [
     ("FaceModel: PartialEq", plus == minus),
     (
       "Preprocessing: PartialEq",
       plus.preprocessing() == minus.preprocessing(),
     ),
-    ("EmbeddingSpace: PartialEq", plus.space() == minus.space()),
+    (
+      "EmbeddingSpace: PartialEq",
+      space_of(1, &plus) == space_of(1, &minus),
+    ),
     ("FaceEmbedding::dot", a.dot(&b).is_ok()),
   ] {
     assert!(
@@ -863,15 +890,19 @@ fn manifest_equality_and_space_identity_are_one_relation() {
 
   // And the relation still SEPARATES what it must: canonicalising `±0.0` and
   // NaN must not collapse two genuinely different biases.
-  let other = space(2).with_preprocessing(Preprocessing::new(
+  let other = model(2).with_preprocessing(Preprocessing::new(
     ChannelOrder::Rgb,
     TensorLayout::Nchw,
     1.0 / 127.5,
     [1e-45, -1.0, -1.0],
   ));
-  assert_ne!(plus.space(), other.space(), "a subnormal bias is not zero");
+  assert_ne!(
+    space_of(1, &plus),
+    space_of(1, &other),
+    "a subnormal bias is not zero"
+  );
   assert!(
-    a.dot(&normalise_row(&[1.0, 0.0], 0, other.space()).expect("unit"))
+    a.dot(&normalise_row(&[1.0, 0.0], 0, space_of(1, &other)).expect("unit"))
       .is_err()
   );
 }
@@ -885,11 +916,11 @@ fn a_space_hashes_by_the_relation_it_compares_by() {
   let hash_of = |model: FaceModel| {
     use core::hash::{Hash, Hasher};
     let mut hasher = std::hash::DefaultHasher::new();
-    model.space().hash(&mut hasher);
+    space_of(1, &model).hash(&mut hasher);
     hasher.finish()
   };
   let with = |bias: [f32; 3], scale: f32| {
-    space(2).with_preprocessing(Preprocessing::new(
+    model(2).with_preprocessing(Preprocessing::new(
       ChannelOrder::Rgb,
       TensorLayout::Nchw,
       scale,
@@ -903,72 +934,229 @@ fn a_space_hashes_by_the_relation_it_compares_by() {
       with([-1.0; 3], f32::from_bits(f32::NAN.to_bits() | 1)),
     ),
   ] {
-    assert_eq!(left.space(), right.space(), "these name one space");
+    assert_eq!(
+      space_of(1, &left),
+      space_of(1, &right),
+      "these name one space"
+    );
     assert_eq!(
       hash_of(left),
       hash_of(right),
       "equal spaces must hash equal, or a map keyed by one is broken"
     );
   }
+
+  // The other direction is NOT required by the `Hash` contract — unequal
+  // values may collide — but it is the whole reason to key a map by a space,
+  // and the artifact is the field most likely to be the only difference. So
+  // the three fields that joined the relation are asserted to reach the
+  // hasher too.
+  let one = model(2);
+  let renamed = FaceModel::new("input_1", "var_9", 2);
+  for (name, left, right) in [
+    ("artifact", space_of(1, &one), space_of(2, &one)),
+    ("feature names", space_of(1, &one), space_of(1, &renamed)),
+  ] {
+    assert_ne!(left, right, "{name}: these are two spaces");
+    let digest = |space: EmbeddingSpace| {
+      use core::hash::{Hash, Hasher};
+      let mut hasher = std::hash::DefaultHasher::new();
+      space.hash(&mut hasher);
+      hasher.finish()
+    };
+    assert_ne!(
+      digest(left),
+      digest(right),
+      "{name}: two spaces that differ only here must reach the hasher, or a map keyed by a space \
+       buckets unrelated artifacts together"
+    );
+  }
 }
 
 #[test]
-fn feature_names_are_io_routing_and_do_not_decide_the_space() {
-  // A feature name is the string CoreML routes a tensor by. Renaming a
-  // graph's input and output re-exports the SAME weights, so the vectors stay
-  // in one space; and two unrelated artifacts are free to use the same two
-  // names. The name is therefore neither necessary nor sufficient evidence
-  // about the space, and comparing it only produces false refusals.
-  let renamed = FaceModel::new("input_1", "var_2011", 2);
-  let original = space(2);
-  let a = normalise_row(&[1.0, 0.0], 0, original.space()).expect("unit");
-  let b = normalise_row(&[1.0, 0.0], 0, renamed.space()).expect("unit");
+fn two_heads_of_one_artifact_are_two_spaces() {
+  // The case that makes an output feature name NOT routing. A graph with two
+  // `[batch, dim]` heads — an embedding and, say, a projection or an
+  // auxiliary logit block of the same width — is one artifact, one input, one
+  // preprocessing and one width. The output name is the only thing that says
+  // WHICH FUNCTION produced the numbers, and the two functions are unrelated.
+  //
+  // Scored, this pair reads as a face comparison. Nothing else in the space
+  // can see the difference: the digest is equal because the bytes ARE equal.
+  let one_artifact = artifact(1);
+  let embedding = FaceModel::new("data", "embedding", 2);
+  let projection = FaceModel::new("data", "projection", 2);
   assert_eq!(
-    a.dot(&b)
-      .expect("the same weights re-exported under other feature names is one space"),
+    (embedding.input(), embedding.dim()),
+    (projection.input(), projection.dim()),
+    "the two heads must differ ONLY in the output name, or this gate proves nothing"
+  );
+
+  let head =
+    normalise_row(&[1.0, 0.0], 0, EmbeddingSpace::of(one_artifact, &embedding)).expect("unit");
+  let other_head = normalise_row(
+    &[1.0, 0.0],
+    0,
+    EmbeddingSpace::of(one_artifact, &projection),
+  )
+  .expect("unit");
+
+  let error = head
+    .dot(&other_head)
+    .expect_err("two heads of one graph are two spaces");
+  assert!(
+    matches!(
+      error,
+      Error::IncomparableEmbeddings(p) if p.field() == EmbeddingSpaceField::OutputFeature
+    ),
+    "expected IncomparableEmbeddings(OutputFeature), got {error:?}"
+  );
+}
+
+#[test]
+fn two_artifacts_with_one_schema_are_two_spaces() {
+  // The residual a previous round STATED and left open: "two distinct
+  // artifacts with one schema are one space as far as this type can see".
+  // They are not one space — the trained parameters are most of the function
+  // that produced the vector — and the digest of the bytes `load` read is what
+  // closes it.
+  //
+  // A fine-tune, a requantisation, or an unrelated 512-wide ArcFace-family
+  // export all land here: same width, same feature names, same preprocessing,
+  // different weights. Scored, they read `1.0` — a perfect match between two
+  // vectors that mean nothing to each other.
+  let schema = model(2);
+  let first = normalise_row(&[1.0, 0.0], 0, space_of(1, &schema)).expect("unit");
+  let second = normalise_row(&[1.0, 0.0], 0, space_of(2, &schema)).expect("unit");
+  assert_ne!(
+    first.space().artifact(),
+    second.space().artifact(),
+    "the two artifacts must differ in their digest, or this gate proves nothing"
+  );
+  assert_eq!(
+    (first.space().dim(), first.space().preprocessing()),
+    (second.space().dim(), second.space().preprocessing()),
+    "and they must agree on everything else, or something weaker than the digest could refuse"
+  );
+
+  let error = first
+    .dot(&second)
+    .expect_err("two artifacts are two spaces whatever their schemas say");
+  assert!(
+    matches!(
+      error,
+      Error::IncomparableEmbeddings(p) if p.field() == EmbeddingSpaceField::Artifact
+    ),
+    "expected IncomparableEmbeddings(Artifact), got {error:?}"
+  );
+
+  // And the digest is not a per-LOAD token: two embedders over the same bytes
+  // are one space, which is what `&self` fan-out needs.
+  let same_bytes = normalise_row(&[1.0, 0.0], 0, space_of(1, &schema)).expect("unit");
+  assert_eq!(
+    first
+      .dot(&same_bytes)
+      .expect("the same artifact read twice is one space"),
     1.0
   );
 }
 
 #[test]
-fn the_space_a_vector_carries_is_one_its_caller_built() {
-  // Pinned because a previous round asserted the opposite — that no public
-  // `FaceModel` constructor exists — and rested the whole space guarantee on
-  // it. `FaceModel::new` and `Preprocessing::new` are both public `const fn`
-  // and `FaceEmbedder::load` takes the manifest from its caller, so every
-  // field of every stamped space is a value the caller chose. What a caller
-  // cannot do is assemble the VECTOR: that is where the guarantee actually
-  // lives, and this gate is here so the false version cannot be written back.
+fn feature_names_select_which_tensor_and_therefore_do_decide_the_space() {
+  // The INVERSE of what this gate asserted a round ago, and the reversal is
+  // the useful part. The old argument was that a feature name is the string
+  // CoreML routes a tensor by, so renaming a graph's features re-exports the
+  // same weights and the vectors stay in one space.
+  //
+  // That is right about renaming and wrong about names. For a model with two
+  // `[batch, dim]` heads the output name selects WHICH FUNCTION produced the
+  // numbers — see `two_heads_of_one_artifact_are_two_spaces` — and no other
+  // field can tell those two apart. What the old argument actually wanted was
+  // a way to see that two exports hold the same weights, and that is the
+  // artifact digest's job, not the name's.
+  let renamed = FaceModel::new("input_1", "var_2011", 2);
+  let original = model(2);
+  let a = normalise_row(&[1.0, 0.0], 0, space_of(1, &original)).expect("unit");
+  let b = normalise_row(&[1.0, 0.0], 0, space_of(1, &renamed)).expect("unit");
+
+  let error = a
+    .dot(&b)
+    .expect_err("differently routed tensors are differently produced numbers");
+  assert!(
+    matches!(
+      error,
+      Error::IncomparableEmbeddings(p) if p.field() == EmbeddingSpaceField::InputFeature
+    ),
+    "expected IncomparableEmbeddings(InputFeature) — the first field that differs — got {error:?}"
+  );
+
+  // The cost of the reversal, stated as an assertion rather than left in a
+  // paragraph: a NUMERICALLY IDENTICAL re-export under other names is now
+  // refused. Under this crate's provenance model that is loud and correct —
+  // `MODELS_LOCK` already treats bundle bytes as identity, and two files that
+  // are not the same bytes are not the same artifact — but it is a refusal
+  // where a round ago there was a score, and a caller who re-exports has to
+  // re-embed.
+  let re_exported = FaceModel::new("input_1", "var_2011", 2);
+  let same_weights_new_names =
+    normalise_row(&[1.0, 0.0], 0, space_of(1, &re_exported)).expect("unit");
+  assert!(
+    a.dot(&same_weights_new_names).is_err(),
+    "a re-export under other names is refused, not scored"
+  );
+}
+
+#[test]
+fn the_space_is_half_the_callers_and_half_the_artifacts() {
+  // Also an inversion. This gate used to assert that every field of every
+  // stamped space is a value the caller chose — which was true when the space
+  // was a projection of the manifest, and was written down precisely because
+  // an earlier round had claimed the opposite and rested the whole guarantee
+  // on it.
+  //
+  // Half of it is still true, and the half that is not is the point of the
+  // digest: a caller chooses WHICH artifact to load, not what its bytes hash
+  // to. `ArtifactDigest` has no public constructor and `EmbeddingSpace` has no
+  // public constructor, so the artifact half of a space is a fact about bytes
+  // this crate read.
   let caller_built = FaceModel::new("data", "embedding", 2).with_preprocessing(Preprocessing::new(
     ChannelOrder::Bgr,
     TensorLayout::Nhwc,
     1.0 / 128.0,
     [-1.0, -1.0, -1.0],
   ));
-  let embedding = normalise_row(&[1.0, 0.0], 0, caller_built.space()).expect("unit");
+  let space = space_of(1, &caller_built);
+  let embedding = normalise_row(&[1.0, 0.0], 0, space).expect("unit");
+
+  // The caller's half, exactly as they stated it.
+  assert_eq!(embedding.space().input(), caller_built.input());
+  assert_eq!(embedding.space().output(), caller_built.output());
+  assert_eq!(embedding.space().dim(), caller_built.dim());
   assert_eq!(
-    embedding.space(),
-    caller_built.space(),
-    "the stamped space is exactly the one the caller handed to `load`"
+    embedding.space().preprocessing(),
+    caller_built.preprocessing()
   );
 
-  // The residual, as an assertion rather than a paragraph: two DISTINCT
-  // artifacts declaring the same width and preprocessing are one space as far
-  // as this crate can see, and their cosine is returned rather than refused.
-  // Nothing short of holding the weights closes it.
-  let second_artifact =
-    FaceModel::new("input_1", "var_9", 2).with_preprocessing(Preprocessing::new(
-      ChannelOrder::Bgr,
-      TensorLayout::Nhwc,
-      1.0 / 128.0,
-      [-1.0, -1.0, -1.0],
-    ));
-  let other = normalise_row(&[1.0, 0.0], 0, second_artifact.space()).expect("unit");
-  assert_eq!(
-    embedding
-      .dot(&other)
-      .expect("one space, as far as anything here can tell"),
-    1.0,
-    "the residual: schema equality is not artifact identity, and this crate holds no weights"
+  // THE RESIDUAL THIS GATE USED TO ASSERT, NOW CLOSED. Two distinct artifacts
+  // declaring the same width and the same preprocessing used to be one space
+  // as far as this crate could see, and their cosine was returned rather than
+  // refused — "nothing short of holding the weights closes it". Hashing the
+  // weights is holding them for this purpose.
+  let second_artifact = normalise_row(&[1.0, 0.0], 0, space_of(2, &caller_built)).expect("unit");
+  let error = embedding
+    .dot(&second_artifact)
+    .expect_err("schema equality is not artifact identity, and the space now knows it");
+  assert!(
+    matches!(
+      error,
+      Error::IncomparableEmbeddings(p) if p.field() == EmbeddingSpaceField::Artifact
+    ),
+    "expected IncomparableEmbeddings(Artifact), got {error:?}"
   );
+
+  // What a caller still cannot do, and where the guarantee has always actually
+  // lived: assemble the VECTOR. `FaceEmbedding` has no public constructor, so
+  // the components came out of a real prediction by an embedder this crate
+  // loaded, and the space stamped on them is the one that embedder ran in.
+  assert_eq!(embedding.space(), space);
 }

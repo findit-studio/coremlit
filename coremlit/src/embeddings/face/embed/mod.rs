@@ -39,6 +39,7 @@ use crate::{
   ComputeUnits, DataType, Model, MultiArray,
   embeddings::face::{
     align::{AlignedFace, TEMPLATE_SIZE},
+    artifact::{ArtifactDigest, digest_artifact},
     error::{
       BatchRow, ContractMismatch, EmbeddingSpaceField, Error, IncomparableEmbeddings,
       NonFiniteOutput, OutputElementCount, OutputShape, Result,
@@ -208,31 +209,82 @@ impl Preprocessing {
   }
 }
 
-/// The space one embedder's vectors live in: the part of a [`FaceModel`] that
-/// decides what the NUMBERS are.
+/// The space one embedder's vectors live in: everything that decides what the
+/// NUMBERS are.
 ///
-/// # Why this is a type and not just "the manifest"
+/// # Which fields, and why each one is here
 ///
-/// A [`FaceModel`] carries two unrelated kinds of field. `dim` and
-/// [`Preprocessing`] are part of the function that produced the vector: change
-/// a divisor or a channel order and every component moves. The feature NAMES
-/// are not — they are the strings CoreML routes a tensor by, and re-exporting
-/// one set of weights under different names produces the same numbers.
+/// - **`artifact`** — the [`ArtifactDigest`] of the bytes
+///   [`FaceEmbedder::load`] read. The trained parameters ARE most of the
+///   function that produced a vector, and every other field is schema two
+///   unrelated exports are free to agree on.
+/// - **`output`** — the feature the tensor was read from. For a graph with two
+///   `[batch, dim]` heads the output name selects *which function produced the
+///   numbers*, so it is not routing.
+/// - **`input`** — the feature the pixels were written to, for the same
+///   reason on the other side.
+/// - **`dim`** and **`preprocessing`** — the width, and the pixels-to-tensor
+///   map the host applied before inference.
 ///
-/// Deciding a cosine on the whole manifest therefore meant one type carrying
-/// two disagreeing notions of "same": `FaceModel`'s own equality, and the walk
-/// [`FaceEmbedding::dot`] refused on. Projecting the space out makes each type
-/// carry exactly one, and makes the projection something a reader can see.
+/// A previous round removed the two names as "IO routing" and stated the
+/// remaining hole — "two distinct artifacts with one schema are one space" —
+/// as a residual. Both halves of that were the same mistake one level apart,
+/// and `artifact` closes it: **two `FaceEmbedding`s compare only if
+/// byte-identical artifacts produced them, read from the same output feature,
+/// fed through the same input feature, with the same host preprocessing.**
 ///
-/// A [`FaceEmbedding`] carries one of these, not a manifest — it has no
-/// business remembering which feature name its tensor arrived under.
+/// # Produced, never assembled
+///
+/// There is no public constructor. The only value of this type a caller can
+/// obtain came from [`FaceEmbedder::space`] or off a [`FaceEmbedding`], and in
+/// both cases it is the space an embedder this crate loaded actually ran in.
+/// A caller still chooses which artifact to load and what preprocessing to
+/// declare — but not what the loaded bytes hash to.
 #[derive(Debug, Clone, Copy)]
 pub struct EmbeddingSpace {
+  artifact: ArtifactDigest,
+  input: &'static str,
+  output: &'static str,
   dim: usize,
   preprocessing: Preprocessing,
 }
 
 impl EmbeddingSpace {
+  /// The space a loaded artifact and its manifest name together.
+  ///
+  /// **The one place the projection happens**, so "which fields are the space"
+  /// has a single answer with a single definition — and so a unit gate builds
+  /// a space exactly the way [`FaceEmbedder::load`] builds one, rather than
+  /// through a second spelling that could drift from it.
+  #[inline]
+  const fn of(artifact: ArtifactDigest, manifest: &FaceModel) -> Self {
+    Self {
+      artifact,
+      input: manifest.input,
+      output: manifest.output,
+      dim: manifest.dim,
+      preprocessing: manifest.preprocessing,
+    }
+  }
+
+  /// The SHA-256 identity of the artifact's bytes.
+  #[inline]
+  pub const fn artifact(&self) -> ArtifactDigest {
+    self.artifact
+  }
+
+  /// The input feature the pixels were written to.
+  #[inline]
+  pub const fn input(&self) -> &'static str {
+    self.input
+  }
+
+  /// The output feature the embedding was read from.
+  #[inline]
+  pub const fn output(&self) -> &'static str {
+    self.output
+  }
+
   /// The embedding width — [`FaceModel::dim`], reconciled against the
   /// artifact's declared output at load.
   #[inline]
@@ -263,6 +315,9 @@ impl Eq for EmbeddingSpace {}
 impl core::hash::Hash for EmbeddingSpace {
   #[inline]
   fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+    core::hash::Hash::hash(&self.artifact, state);
+    core::hash::Hash::hash(&self.input, state);
+    core::hash::Hash::hash(&self.output, state);
     core::hash::Hash::hash(&self.dim, state);
     core::hash::Hash::hash(&self.preprocessing, state);
   }
@@ -280,12 +335,16 @@ impl core::hash::Hash for EmbeddingSpace {
 /// artifacts — [`Preprocessing`] — is serialisable on its own.
 ///
 /// Equality here is equality of all four fields, with the floats compared by
-/// `canonical_bits` as [`Preprocessing`] compares them. That is a strictly
-/// finer relation than [`EmbeddingSpace`]'s, and deliberately a DIFFERENT type's
-/// relation: two manifests naming different features are different manifests —
-/// they load different tensors — while being the same space. Which question is
-/// being asked is settled by which type is compared, not by which of two
-/// equalities on one type happened to be reached.
+/// `canonical_bits` as [`Preprocessing`] compares them — the SAME relation
+/// [`EmbeddingSpace`] decides a cosine by, on the four fields the two types
+/// share. It is deliberately a different type's relation nonetheless, because
+/// the two types answer different questions: a manifest is what a caller
+/// declares about an artifact, and a space is what an embedder actually ran
+/// in. The space carries a fifth field a manifest cannot know — the
+/// [`ArtifactDigest`] of the bytes [`FaceEmbedder::load`] read — so two equal
+/// manifests name one space only when one artifact produced both.
+/// `manifest_equality_and_space_identity_are_one_relation` pins that they
+/// never disagree on the four they share.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct FaceModel {
   input: &'static str,
@@ -331,19 +390,6 @@ impl FaceModel {
   #[inline]
   pub const fn preprocessing(&self) -> Preprocessing {
     self.preprocessing
-  }
-
-  /// The [`EmbeddingSpace`] this manifest's vectors live in: everything here
-  /// that decides the numbers, and nothing that only routes them.
-  ///
-  /// The one place the projection happens, so "which fields are the space" has
-  /// a single answer with a single definition.
-  #[inline]
-  pub const fn space(&self) -> EmbeddingSpace {
-    EmbeddingSpace {
-      dim: self.dim,
-      preprocessing: self.preprocessing,
-    }
   }
 
   /// Builder form of [`Self::set_preprocessing`].
@@ -454,24 +500,28 @@ impl FaceEmbedderOptions {
 /// [`FaceEmbedder::embed`], which stamps the space of its own bound manifest
 /// onto every row it returns.
 ///
-/// # What that guarantee IS, and what a previous round claimed it was
+/// # What that guarantee IS, and what two previous rounds claimed it was
 ///
 /// It was written down here that "there is no public `FaceModel` constructor,
-/// so a caller-built `FaceModel` can never be stamped on a vector". **That is
-/// false.** [`FaceModel::new`] and [`Preprocessing::new`] are both public
-/// `const fn`, and [`FaceEmbedder::load`] takes the manifest from its caller —
-/// so every field of the space on every vector is a value the caller chose. A
-/// guarantee resting on that sentence was resting on nothing, and the sentence
-/// is kept here inverted rather than deleted, because the shape of the mistake
-/// is the useful part: the unforgeable thing was never the manifest, it was
-/// the VECTOR.
+/// so a caller-built `FaceModel` can never be stamped on a vector". **That was
+/// false**: [`FaceModel::new`] and [`Preprocessing::new`] are both public
+/// `const fn`. It was then written down that every field of the space is
+/// therefore a value the caller chose — **and that is false now**, which is
+/// the point of [`EmbeddingSpace::artifact`]. Both sentences are kept here
+/// inverted rather than deleted, because the shape of the mistake is the
+/// useful part: a guarantee is worth what its unforgeable half is worth, and
+/// twice the unforgeable half was named wrongly.
 ///
 /// What is actually true, stated as narrowly as it holds:
 ///
 /// - a `FaceEmbedding`'s components came out of a real prediction by an
 ///   embedder this crate loaded — no caller can assemble one;
-/// - the space stamped on it is the space that embedder actually preprocessed
-///   with, not a claim made later at the comparison site;
+/// - the space stamped on it is the space that embedder actually ran in, not a
+///   claim made later at the comparison site;
+/// - its `artifact` is the SHA-256 of the bytes [`FaceEmbedder::load`] read.
+///   A caller chooses which artifact to load; they do not choose what it
+///   hashes to, and neither [`crate::embeddings::face::ArtifactDigest`] nor
+///   [`EmbeddingSpace`] has a public constructor;
 /// - `dim` was reconciled against the artifact's own declared output width at
 ///   load — **except** for a legacy `neuralNetwork` export that declares no
 ///   shape, where it remains the caller's claim until the first prediction
@@ -479,6 +529,12 @@ impl FaceEmbedderOptions {
 /// - the preprocessing half is caller-stated and cannot be otherwise: the
 ///   artifact does not declare its own normalisation, and the preprocessing
 ///   really is what the host did to the pixels, so comparing it is sound.
+///
+/// The strongest claim the type can now make, and it makes it: **two
+/// `FaceEmbedding`s compare only if they were produced by byte-identical
+/// artifacts, read from the same output feature, fed through the same input
+/// feature, with the same host preprocessing. [`Self::dot`] cannot return a
+/// score across different weights.**
 ///
 /// # What this takes from `audio::speaker::calibrate`, and what it does not
 ///
@@ -498,39 +554,38 @@ impl FaceEmbedderOptions {
 /// legitimately produced by MORE than one producer — `&self` inference means
 /// fan-out is one [`FaceEmbedder`] per worker over the same artifact (see that
 /// type's doc), and a per-load token would refuse the cross-worker comparisons
-/// those workers exist to make. Turning a silent wrong answer into a loud
-/// wrong answer is not the precedent's cure. There is also no lookup here to
-/// remove: `calibrate`'s defect was a question that could be answered twice
+/// those workers exist to make. **The digest sidesteps that because it is an
+/// identity of the BYTES rather than of the load**: same bundle, same value,
+/// on every worker and every machine. There is also no lookup here to remove:
+/// `calibrate`'s defect was a question that could be answered twice
 /// differently, and [`Self::dot`] asks nothing of caller-owned state — it
 /// compares two values' own recorded spaces.
 ///
-/// # The residual, stated
+/// # The residuals, stated
 ///
-/// **Equality of spaces is the strongest evidence a sans-I/O crate holds, and
-/// it is strictly weaker than identity of artifacts.** `coremlit` does not hold
-/// the weights — it is handed a path, and the thing that decides an embedding
-/// space is the trained parameters behind it — so two DISTINCT artifacts loaded
-/// with the same width and the same preprocessing are one space as far as this
-/// type can see, and their cosine is returned rather than refused. No
-/// arrangement of manifest fields closes that; closing it would take a witness
-/// derived from the weights, which is a different crate's job.
+/// Three, and each is a different kind of thing:
 ///
-/// Two consequences worth being explicit about, because both were previously
-/// obscured by comparing the feature names:
+/// - **a numerically identical re-export is REFUSED.** One set of weights
+///   written out twice — recompiled, or renamed — is two artifacts by digest,
+///   so their embeddings do not compare and a caller who re-exports has to
+///   re-embed. That is loud and correct under this crate's provenance model,
+///   where `MODELS_LOCK` already treats bundle bytes as identity: two files
+///   that are not the same bytes are not the same artifact. It is a real cost,
+///   and it is the price of the guarantee above rather than an oversight;
+/// - **a caller who states the wrong preprocessing gets a consistent,
+///   off-distribution space.** That is misuse rather than conflation — the
+///   vectors are all wrong the same way, so they still compare with each other
+///   — and it is unclosable here, because the artifact declares no
+///   normalisation for this crate to check the claim against;
+/// - **[`AlignedFace::from_template_pixels`] keeps its documented hole on the
+///   pixel side.** Bring-your-own-alignment cannot be checked: pixels aligned
+///   to some other template, or not aligned at all, pass that constructor and
+///   degrade every cosine silently. See its own doc.
 ///
-/// - comparing the names caught *some* different-artifact pairs by accident,
-///   and that accident is gone. It was never evidence — two unrelated exports
-///   are free to call their features `data` and `embedding` — and it cost a
-///   false refusal every time one set of weights was re-exported under other
-///   names;
-/// - a caller who needs artifact identity has to carry it themselves, exactly
-///   as `calibrate`'s caller carries the map from their library key to a
-///   [`crate::audio::speaker::calibrate::SpeakerToken`]. That is the same shape
-///   as `calibrate`'s own stated residual: `Enrolled::new` *claims* a probe
-///   belongs to a speaker and no type in this crate can refute it.
-///
-/// [`AlignedFace::from_template_pixels`] carries the matching hole on the pixel
-/// side, and says so.
+/// What is NOT a residual any more is the one the round before last recorded
+/// here: "two distinct artifacts with one schema are one space as far as this
+/// type can see". They are two spaces, and
+/// `two_artifacts_with_one_schema_are_two_spaces` is the gate.
 #[derive(Debug, Clone, PartialEq)]
 pub struct FaceEmbedding {
   /// The unit-norm components. Always `space.dim()` of them: the only
@@ -566,11 +621,12 @@ impl FaceEmbedding {
   /// vector can be checked against a freshly loaded embedder before a batch of
   /// comparisons rather than one at a time.
   ///
-  /// **Reading it forges nothing, and stating a space forges nothing either.**
-  /// Every field here is one the caller handed to [`FaceEmbedder::load`]; what
-  /// cannot be assembled is a [`FaceEmbedding`], which has no public
-  /// constructor. See this type's doc for what that does and does not
-  /// establish.
+  /// **Reading it forges nothing, and neither does stating one.** The four
+  /// manifest fields are values the caller handed to [`FaceEmbedder::load`];
+  /// the fifth is the digest of the bytes that door read, which the caller
+  /// does not choose. And an [`EmbeddingSpace`] cannot be assembled at all —
+  /// nor can a [`FaceEmbedding`]. See this type's doc for what that does and
+  /// does not establish.
   #[inline]
   pub const fn space(&self) -> EmbeddingSpace {
     self.space
@@ -647,12 +703,26 @@ impl FaceEmbedding {
 ///
 /// Every field is compared, not short-circuited — the array is built before
 /// `find_map` walks it — so the order decides only WHICH field is named when
-/// several differ at once. `Dim` leads because it is the one a caller is most
-/// likely to have caused and the only one the old width check could see.
+/// several differ at once. [`EmbeddingSpaceField::Artifact`] leads because
+/// when the WEIGHTS differ every other agreement is coincidence: reporting a
+/// matching width or a matching divisor would be true and would point a reader
+/// at the wrong thing.
 fn space_difference(left: EmbeddingSpace, right: EmbeddingSpace) -> Option<EmbeddingSpaceField> {
   let (lp, rp) = (left.preprocessing(), right.preprocessing());
   let bias = |b: [f32; 3]| b.map(canonical_bits);
   [
+    (
+      EmbeddingSpaceField::Artifact,
+      left.artifact() != right.artifact(),
+    ),
+    (
+      EmbeddingSpaceField::InputFeature,
+      left.input() != right.input(),
+    ),
+    (
+      EmbeddingSpaceField::OutputFeature,
+      left.output() != right.output(),
+    ),
     (EmbeddingSpaceField::Dim, left.dim() != right.dim()),
     (EmbeddingSpaceField::ChannelOrder, lp.order() != rp.order()),
     (
@@ -682,6 +752,9 @@ fn space_difference(left: EmbeddingSpace, right: EmbeddingSpace) -> Option<Embed
 pub struct FaceEmbedder {
   model: Model,
   manifest: FaceModel,
+  /// The space every vector this embedder produces is stamped with, built at
+  /// load from the manifest AND the digest of the bytes that were read.
+  space: EmbeddingSpace,
   /// The graph's own batch dimension AND declared rank, read from the input
   /// contract at load. The rank is carried, not just the capacity: a model
   /// that declares the unbatched rank-3 form has to be fed a rank-3 tensor.
@@ -705,17 +778,36 @@ impl FaceEmbedder {
   /// third-party CoreML ArcFace builds this module's doc surveys declare — is
   /// refused here rather than loading clean and failing every prediction.
   ///
+  /// # The digest of the loaded bytes is taken here
+  ///
+  /// [`Self::space`] — and therefore every [`FaceEmbedding`] this embedder
+  /// produces — carries the [`ArtifactDigest`] of the directory this path
+  /// names. That is what makes the space an identity of the WEIGHTS rather
+  /// than of a schema, and it is computed here because this is the only place
+  /// that knows both the bytes and the manifest. Same bundle ⇒ same digest,
+  /// on every worker and every machine, so the cross-worker comparisons
+  /// `&self` inference exists to allow are unaffected.
+  ///
+  /// It is taken AFTER the contract is reconciled, so a manifest that does not
+  /// match the artifact costs nothing to reject. The window between the load
+  /// and the hash is not closable by a sans-I/O crate — it does not hold the
+  /// file — and it is not the failure this exists to prevent, which is two
+  /// different bundles being compared as one.
+  ///
   /// # Errors
   /// [`Error::Load`] if CoreML rejects the model;
   /// [`Error::ContractMismatch`] if the model declares no feature by the
   /// manifest's name, if either feature is not a `float32` multi-array, or if
   /// its input/output shapes are not a batch of `3 × 112 × 112` and a batch of
-  /// [`FaceModel::dim`].
+  /// [`FaceModel::dim`];
+  /// [`Error::ArtifactDigest`] if the artifact's bytes cannot be read — which
+  /// fails the load rather than producing vectors with no identity.
   pub fn load(
     model_path: impl AsRef<Path>,
     manifest: FaceModel,
     options: FaceEmbedderOptions,
   ) -> Result<Self> {
+    let model_path = model_path.as_ref();
     let model = Model::load(model_path, options.compute())?;
     let (input_contract, output_contract) = {
       let description = model.description();
@@ -766,9 +858,11 @@ impl FaceEmbedder {
         )?;
       (contract, declared)
     };
+    let space = EmbeddingSpace::of(digest_artifact(model_path)?, &manifest);
     Ok(Self {
       model,
       manifest,
+      space,
       input: input_contract,
       output: output_contract,
     })
@@ -786,6 +880,18 @@ impl FaceEmbedder {
   #[inline]
   pub const fn manifest(&self) -> &FaceModel {
     &self.manifest
+  }
+
+  /// The [`EmbeddingSpace`] every vector from this embedder is stamped with.
+  ///
+  /// **The only public producer of a space**, and the reason it is here rather
+  /// than on [`FaceModel`]: half of a space is the manifest and the other half
+  /// is the digest of the bytes that were loaded, which a manifest does not
+  /// know. Read it to group stored embeddings, or to check a stored vector
+  /// against a freshly loaded embedder once instead of on every comparison.
+  #[inline]
+  pub const fn space(&self) -> EmbeddingSpace {
+    self.space
   }
 
   /// The graph's own batch dimension, resolved from its input contract at load.
@@ -849,7 +955,7 @@ impl FaceEmbedder {
     let mut flat = vec![0.0f32; batch * dim];
     features.copy_into::<f32>(&mut flat)?;
     let mut rows = Vec::with_capacity(chunk.len());
-    let space = self.manifest.space();
+    let space = self.space;
     for (offset, row) in flat.chunks_exact(dim).take(chunk.len()).enumerate() {
       rows.push(normalise_row(row, first_row + offset, space)?);
     }

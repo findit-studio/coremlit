@@ -111,9 +111,14 @@ video face path, as `speaker` is for voices. It carries the ArcFace 5-point
 similarity alignment as an explicit, golden-tested step OUTSIDE the embedder,
 plus a CoreML embedder whose preprocessing — channel order, scale, bias,
 layout — is a per-artifact manifest value rather than a constant at a call
-site. It adds **no dependency at all**: the alignment is `f64` arithmetic and
-the embedder builds a `MultiArray` the always-compiled runtime core already
-owns. That `f64` is also where the alignment departs from InsightFace, whose
+site. Its **one dependency is `sha2`**, already optional in the workspace and
+already pulled by `granite` and `siglip`, so it adds no crate to the graph:
+`FaceEmbedder::load` hashes the artifact directory it loads, and the digest
+rides on every embedding, so a cosine cannot be returned across two different
+sets of weights that happen to share a schema (issue #138 §3). Everything else
+is dependency-free — the alignment is `f64` arithmetic and the embedder builds
+a `MultiArray` the always-compiled runtime core already owns. That `f64` is
+also where the alignment departs from InsightFace, whose
 `skimage` solve stays in `f32` — a divergence the `align` module doc measures
 and shows has no single target to be closed against, because `skimage`'s `f32`
 path delegates to a BLAS and two correct builds of it disagree by more than
