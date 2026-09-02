@@ -601,3 +601,95 @@ fn a_feature_with_no_multi_array_constraint_renders_as_none() {
   );
   assert!(error.to_string().contains("is none"), "{error}");
 }
+
+// ── The one gate here that loads a real artifact ───────────────────────────
+
+/// **FALSIFIER (red first), on a REAL model, in every `cargo test`.**
+///
+/// Every other gate in this file drives [`check_load_contract`] over a
+/// fixture. This one runs a real CoreML prediction through [`Checked`] against
+/// `Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc`, which is COMMITTED
+/// — 1.1 MiB, staged by no download — so unlike everything else in this
+/// repository that predicts through a model it carries no `#[ignore]`.
+///
+/// Silero is this crate's only committed multi-output graph: three f32 inputs,
+/// **three** f32 outputs, no state. The contract below names ONE of the three
+/// outputs, which is exactly the situation
+/// [`check_load_contract`]'s `an_extra_output_is_accepted` blesses — and
+/// [`Model::predict_with`] answered it by converting all three anyway. A door
+/// whose extra output were a string or a dictionary would have failed every
+/// prediction on it; silero's are all tensors, so what this can measure is the
+/// COUNT, which is the same fact one step before the failure.
+///
+/// Point `Checked::predict_with` back at [`Model::predict_with`] and this goes
+/// red with three names where one was asked for.
+#[test]
+fn checked_materialises_only_the_outputs_its_contract_names() {
+  let bundle = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+    .join("../Models/vadkit/silero-vad-unified-256ms-v6.2.1.mlmodelc");
+  assert!(
+    bundle.is_dir(),
+    "the vendored silero bundle is committed, so this gate is NOT model-gated; looked for {}",
+    bundle.display()
+  );
+  let model =
+    Model::load(&bundle, crate::ComputeUnits::CpuOnly).expect("the committed bundle loads");
+  assert_eq!(
+    model
+      .description()
+      .outputs()
+      .iter()
+      .map(FeatureInfo::name)
+      .collect::<Vec<_>>(),
+    vec!["new_cell_state", "new_hidden_state", "vad_output"],
+    "this gate is about a graph with MORE outputs than the contract names"
+  );
+
+  // A contract over all three REQUIRED inputs — anything less is
+  // `UnsatisfiableInput` — naming exactly one of the three outputs.
+  let contract = LoadContract::new(
+    vec![
+      FeatureContract::new(
+        "audio_input",
+        DataType::F32,
+        vec![Dim::Exactly(1), Dim::Exactly(4160)],
+      ),
+      FeatureContract::new(
+        "cell_state",
+        DataType::F32,
+        vec![Dim::Exactly(1), Dim::Exactly(128)],
+      ),
+      FeatureContract::new(
+        "hidden_state",
+        DataType::F32,
+        vec![Dim::Exactly(1), Dim::Exactly(128)],
+      ),
+    ],
+    vec![FeatureContract::new(
+      "vad_output",
+      DataType::F32,
+      vec![Dim::Exactly(1), Dim::Exactly(1), Dim::Exactly(1)],
+    )],
+    StateContract::None,
+  );
+  let checked = Checked::new(model, &contract).expect("silero satisfies this contract");
+
+  let audio = MultiArray::zeros(&[1, 4160], DataType::F32).expect("one 256 ms window");
+  let hidden = MultiArray::zeros(&[1, 128], DataType::F32).expect("the LSTM's hidden state");
+  let cell = MultiArray::zeros(&[1, 128], DataType::F32).expect("the LSTM's cell state");
+  let outputs = checked
+    .predict_with(&[
+      ("audio_input", &audio),
+      ("hidden_state", &hidden),
+      ("cell_state", &cell),
+    ])
+    .expect("a real prediction through the door's own entry point");
+
+  assert_eq!(
+    outputs.names().collect::<Vec<_>>(),
+    vec!["vad_output"],
+    "the door asked for one output; the other two must not have been materialised"
+  );
+  assert_eq!(outputs.len(), 1);
+  assert_eq!(outputs.get("vad_output").unwrap().shape(), &[1, 1, 1]);
+}

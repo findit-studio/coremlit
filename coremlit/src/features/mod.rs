@@ -138,8 +138,28 @@ impl Features {
   // buffer-backed arrays can be): `MultiArray::as_slice`/`as_slice_mut`
   // already refuse those with `TensorError::NonContiguous` rather than
   // misreading the padding, so nothing extra is needed here.
+  //
+  // `wanted` selects which advertised features are materialised at all;
+  // `None` takes every one, which is what `Model::predict`/`predict_with`
+  // pass. A caller that names its outputs (`Model::predict_with_outputs`,
+  // which is how every `Checked` door predicts) gets the rest SKIPPED rather
+  // than converted: an output that is not a multi-array — a classifier's
+  // string label, a dictionary, an image, a sequence — is legal CoreML beside
+  // a tensor head, and converting it raised `NotMultiArray` on a feature the
+  // caller had never asked for, failing every prediction through an otherwise
+  // usable model. Filtering here rather than at load is deliberate: a
+  // load-time rule would have to enumerate the output kinds this extraction
+  // can represent, and refuse artifacts that work.
+  //
+  // Skipping is sound for the aliasing above. `known_regions` is still seeded
+  // by the caller with every input's region, and every MATERIALISED output's
+  // region is still pushed, so an output aliasing an input or another
+  // extracted output is still copied. A skipped output is never retained
+  // here, so it dies with the provider and cannot alias anything that
+  // outlives this call.
   pub(crate) fn from_provider(
     provider: &ProtocolObject<dyn MLFeatureProvider>,
+    wanted: Option<&[&str]>,
     known_regions: &mut Vec<(usize, usize)>,
   ) -> Result<Self, PredictionError> {
     fn overlaps(a: (usize, usize), b: (usize, usize)) -> bool {
@@ -150,6 +170,12 @@ impl Features {
     let names = unsafe { provider.featureNames() };
     for name in names.iter() {
       let name_str = name.to_string();
+      // The filter, BEFORE the value is even asked for: a feature that is not
+      // wanted is not read, not classified and not copied, so it cannot decide
+      // whether this call succeeds. `None` wants everything.
+      if wanted.is_some_and(|wanted| !wanted.contains(&name_str.as_str())) {
+        continue;
+      }
       // SAFETY: `name` was just yielded by `provider.featureNames()`, so it
       // names a member of this same provider.
       let value = unsafe { provider.featureValueForName(&name) }

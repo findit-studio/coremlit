@@ -576,9 +576,24 @@ fn check_feature_contract(
 /// — `embeddings::face`, whose batch is the artifact's and not its own. Neither
 /// was added ahead of its caller, so the exposed surface carries no method no
 /// contract has been written against.
+///
+/// # The prediction it forwards is SELECTIVE, and that is the contract's doing
+///
+/// [`Self::predict_with`] is not [`Model::predict_with`] with a check in front
+/// of it: it materialises only the outputs the contract NAMES, by handing that
+/// list to [`Model::predict_with_outputs`]. The contract is therefore not only
+/// what was checked at load but what is asked for at every prediction, which is
+/// what keeps an extra output — legal, and correctly accepted by
+/// [`check_load_contract`] — from deciding whether a call succeeds. That method
+/// carries the defect it closes.
 #[derive(Debug)]
 pub(crate) struct Checked {
   model: Model,
+  /// The output features this value's contract NAMES — the only ones
+  /// [`Self::predict_with`] materialises. Kept from the contract at
+  /// construction, so the set the door declared and the set it reads back are
+  /// one list and cannot drift.
+  outputs: Vec<&'static str>,
 }
 
 impl Checked {
@@ -590,7 +605,10 @@ impl Checked {
   /// that the check passed.
   pub(crate) fn new(model: Model, contract: &LoadContract) -> Result<Self, ContractViolation> {
     check_load_contract(model.description(), contract)?;
-    Ok(Self { model })
+    Ok(Self {
+      model,
+      outputs: contract.outputs.iter().map(|output| output.name).collect(),
+    })
   }
 
   /// The description of the model this value's contract was checked against.
@@ -608,14 +626,32 @@ impl Checked {
     self.model.description()
   }
 
-  /// Runs a synchronous prediction from borrowed inputs.
+  /// Runs a synchronous prediction from borrowed inputs, materialising only
+  /// the outputs this value's contract NAMES.
+  ///
+  /// # The door asks for exactly what it declared
+  ///
+  /// [`check_load_contract`] accepts an EXTRA output, and correctly: it is not
+  /// a required input, so it cannot make a prediction fail — except that
+  /// [`Model::predict_with`] converted every advertised output into a
+  /// [`MultiArray`] before the door got to select its own. A graph carrying the
+  /// contract's f32 tensor head beside a string, dictionary, image or sequence
+  /// output therefore loaded clean and then failed EVERY prediction with
+  /// [`PredictionError::NotMultiArray`], on a feature no door had asked for.
+  ///
+  /// The fix is here rather than as a load-time rule, because a rule would have
+  /// to enumerate which output kinds the generic extraction path can represent
+  /// — a list that is wrong the moment CoreML grows a kind — and would refuse
+  /// artifacts that work. Asking for the contract's own names refuses nothing
+  /// and materialises nothing extra, and every door reaching CoreML through a
+  /// `Checked` gets it without a change of its own.
   ///
   /// # Errors
-  /// As [`Model::predict_with`].
+  /// As [`Model::predict_with_outputs`].
   pub(crate) fn predict_with(
     &self,
     inputs: &[(&str, &MultiArray)],
   ) -> Result<Features, PredictionError> {
-    self.model.predict_with(inputs)
+    self.model.predict_with_outputs(inputs, &self.outputs)
   }
 }
